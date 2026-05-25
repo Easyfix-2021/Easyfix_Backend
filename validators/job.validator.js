@@ -57,6 +57,27 @@ const listQuery = Joi.object({
   zonalId:    intId.optional(),
   startDate: Joi.date().iso().optional(),
   endDate: Joi.date().iso().optional(),
+  /*
+   * `quotationStatus` — filter jobs by the SPOC's action on their
+   * estimate. Powers the dashboard AttentionSummary tiles:
+   *   approved → quotation_details.status = 1 AND action_on IS NOT NULL,
+   *              job not yet executing/closed/cancelled
+   *   rejected → quotation_details.status = 0 AND action_on IS NOT NULL,
+   *              job not closed/cancelled
+   * Implemented via EXISTS subquery on quotation_details (no JOIN
+   * multiplication when a job has multiple line items).
+   */
+  quotationStatus: Joi.string().valid('approved', 'rejected').optional(),
+  /*
+   * `requestedBefore` — drives the AttentionSummary's Running Late tile.
+   *   'now' → j.requested_date_time IS NOT NULL AND j.requested_date_time < NOW()
+   * Other ISO timestamps allowed for future surfaces (e.g. "before
+   * end of today" view).
+   */
+  requestedBefore: Joi.alternatives(
+    Joi.string().valid('now'),
+    Joi.date().iso(),
+  ).optional(),
   limit: Joi.number().integer().min(1).max(500).default(50),
   offset: Joi.number().integer().min(0).default(0),
 });

@@ -350,6 +350,118 @@ async function migrateLegacyToS3({ storedValue, jobId, seq }) {
   return newKey;
 }
 
+/* ─── Notice Board image storage ───────────────────────────────────
+ *
+ * Notice images live under a distinct prefix so the S3 bucket is
+ * scannable / lifecycle-rule-able per feature:
+ *
+ *   s3://<S3_BUCKET_NAME>/Notices/<ts>_<rand8>
+ *
+ * Key shape mirrors the JobSupportings convention: no extension on
+ * the key (Content-Type metadata + original-filename header carry
+ * the real type), and the basename uses timestamp + 8 random hex
+ * chars for global uniqueness without needing a notice_id (the
+ * uploader is the Compose wizard, which hasn't yet created the
+ * tbl_notice row at upload time — images are picked first, the
+ * row is written on Save/Publish).
+ *
+ * S3 has no real concept of directories, but the prefix appears
+ * as a folder in the AWS console + in any tooling that groups by
+ * "/". No explicit create-folder step is needed; the first
+ * PutObject under `Notices/` makes the prefix visible.
+ *
+ * If S3_BUCKET_NAME is unset (local dev), this helper still throws
+ * via isEnabled() — the route handler should fall back to local
+ * disk storage in that case, see routes/admin/notices.js.
+ */
+
+function buildNoticeKey(originalName) {
+  const crypto = require('crypto');
+  const ts = Date.now();
+  const rand = crypto.randomBytes(4).toString('hex');
+  // Extension intentionally NOT appended. Content-Type metadata
+  // carries the real MIME; the original filename + extension live
+  // in object metadata for audit/recovery.
+  // (originalName retained for the assertion that we received SOMETHING
+  // semantically file-shaped — but it's not used in the key.)
+  void originalName;
+  return `Notices/${ts}_${rand}`;
+}
+
+/*
+ * Upload a notice-attached image to S3. Returns the stored key —
+ * the caller (route handler) is responsible for round-tripping the
+ * key into the BE response so the FE can request a presigned URL
+ * for display.
+ *
+ *   buffer        Buffer    — image bytes
+ *   contentType   string    — MIME type, e.g. "image/png"
+ *   originalName  string    — operator-supplied filename (kept in S3
+ *                             metadata only; not in the key)
+ *
+ * Strict guard: throws if S3 isn't configured. Use isEnabled() first
+ * to pick a fallback. Mime allowlist is enforced at the route layer
+ * (multer + file-storage.checkMime); this function trusts its caller.
+ */
+async function putNoticeImage({ buffer, contentType, originalName }) {
+  if (!isEnabled()) throw new Error('S3 is not configured (S3_BUCKET_NAME unset)');
+  const { PutObjectCommand } = require('@aws-sdk/client-s3');
+  const Key = buildNoticeKey(originalName);
+  const Metadata = {};
+  if (originalName) {
+    const safe = String(originalName).replace(/[^\x20-\x7E]/g, '_').slice(0, 200);
+    Metadata['original-filename'] = safe;
+  }
+  await client().send(new PutObjectCommand({
+    Bucket: BUCKET,
+    Key,
+    Body: buffer,
+    ContentType: contentType || 'application/octet-stream',
+    Metadata,
+  }));
+  return Key;
+}
+
+/*
+ * Resolve a stored notice-image value (either an S3 key or a local
+ * URL) to a publicly-loadable URL the FE <img> can render.
+ *
+ *   - "Notices/<ts>_<rand>"   → presigned GET URL (5-min TTL)
+ *   - "/easydoc/<filename>"   → returned as-is (local fallback)
+ *   - "https://…"             → returned as-is (external URL)
+ *
+ * Distinct from resolveImageUrl() (which is Job-Image-shaped + does
+ * an existence probe) because notice-image reads are batched on every
+ * dashboard load (up to ~20 notices × 5 images = 100 lookups). Skipping
+ * the HeadObject probe keeps the per-request signing cost flat (no
+ * network round-trip per image — getSignedUrl just signs locally).
+ *
+ * Returns null when given null/empty input, so callers can map over
+ * arrays without per-item guards.
+ */
+async function resolveNoticeImageUrl(storedValue) {
+  const stored = String(storedValue || '').trim();
+  if (!stored) return null;
+  // Already a URL — passthrough.
+  if (/^https?:\/\//i.test(stored)) return stored;
+  // Local-disk URL — passthrough.
+  if (stored.startsWith('/')) return stored;
+  // S3 key shape — sign and return.
+  if (isEnabled() && stored.startsWith('Notices/')) {
+    try {
+      return await getPresignedUrl(stored);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn('s3-storage.resolveNoticeImageUrl: presign failed', { stored, err: e?.message });
+      return null;
+    }
+  }
+  // Anything else — best-effort: assume it's a relative path under
+  // the public file base. Matches the existing job-image fallback shape.
+  const fileBase = process.env.FILE_BASE_URL || '/easydoc';
+  return `${fileBase}/${stored.replace(/^\/+/, '')}`;
+}
+
 module.exports = {
   isEnabled,
   bucketName,
@@ -360,4 +472,7 @@ module.exports = {
   resolveImageUrl,
   shouldMigrateLegacy,
   migrateLegacyToS3,
+  // Notice Board (2026-05-22):
+  putNoticeImage,
+  resolveNoticeImageUrl,
 };

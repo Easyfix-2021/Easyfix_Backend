@@ -73,6 +73,13 @@ router.use('/settings',        require('./settings'));
 router.use('/reports',         require('./reports'));
 router.use('/aux',             require('./auxiliary'));
 router.use('/legacy',          require('./legacy'));
+// Notice Board (added 2026-05-22). Three mounts:
+//   /notice-categories — admin-managed coloured chip tags
+//   /notices           — CRUD + state transitions + active feed + mark-read
+//   /holidays          — Nager.Date-backed "Upcoming Events" rail
+router.use('/notice-categories', require('./notice-categories'));
+router.use('/notices',           require('./notices'));
+router.use('/holidays',          require('./holidays'));
 // router.use('/clients',        require('./clients'));     // later
 // router.use('/users',          require('./users'));       // later
 

@@ -180,6 +180,9 @@ async function list({
   reopen,                    // bool — tbl_job.job_reopen_flag = 1
   dueTo,                     // enum — customer|client|easyfix|technician
   zonalId,                   // FK   — tbl_zone_master via tbl_zone_city_mapping
+  // Dashboard AttentionSummary tile drill-downs (2026-05-22):
+  quotationStatus,           // enum — 'approved' | 'rejected'
+  requestedBefore,           // 'now' or ISO date — Running Late tile
   startDate, endDate,
   scope,
   limit = 50, offset = 0,
@@ -316,6 +319,33 @@ async function list({
   if (zonalId != null) {
     clauses.push('EXISTS (SELECT 1 FROM tbl_zone_city_mapping zcm WHERE zcm.city_zone_id = ef.efr_zone_city_id AND zcm.zone_id = ?)');
     params.push(Number(zonalId));
+  }
+  /*
+   * quotationStatus — drives the AttentionSummary tile drill-down.
+   *   'approved' → EXISTS approved line item (status=1 + action_on set)
+   *                AND job is still actionable (not executing/closed/cancelled)
+   *   'rejected' → EXISTS rejected line item (status=0 + action_on set)
+   *                AND job is not closed/cancelled
+   * EXISTS keeps row cardinality stable when a job has multiple quotation
+   * line items.
+   */
+  if (quotationStatus === 'approved') {
+    clauses.push(
+      'EXISTS (SELECT 1 FROM quotation_details qd WHERE qd.job_id = j.job_id AND qd.status = 1 AND qd.action_on IS NOT NULL)',
+    );
+    clauses.push('j.job_status NOT IN (2, 3, 5, 6)');
+  } else if (quotationStatus === 'rejected') {
+    clauses.push(
+      'EXISTS (SELECT 1 FROM quotation_details qd WHERE qd.job_id = j.job_id AND qd.status = 0 AND qd.action_on IS NOT NULL)',
+    );
+    clauses.push('j.job_status NOT IN (3, 5, 6)');
+  }
+  // requestedBefore — Running Late tile filter.
+  if (requestedBefore === 'now') {
+    clauses.push('j.requested_date_time IS NOT NULL AND j.requested_date_time < NOW()');
+  } else if (requestedBefore) {
+    clauses.push('j.requested_date_time IS NOT NULL AND j.requested_date_time < ?');
+    params.push(requestedBefore);
   }
   // Open Due To — accepts both shapes of remark:
   //   (a) Structured tag from the AddRemarks dialog:
@@ -579,6 +609,175 @@ async function getStatusCounts({ ownerId, scope } = {}) {
   // See comment above — escalated badge is stubbed to 0 until the
   // rating-table join lands.
   return { total, byStatus, bookedUnassigned, bookedAssigned, escalated: 0 };
+}
+
+/*
+ * Attention summary — drives the dashboard's "Orders Needing Immediate
+ * Attention" card (replaces the old Recent Jobs widget).
+ *
+ * Returns 5 operator-action counts in a single round-trip. Each sub-
+ * query is run in parallel; a failure of one is logged + the metric
+ * returns 0 so a single missing column or table doesn't break the card.
+ *
+ *   runningLate         booked/scheduled jobs past requested_date_time
+ *   estimateApproved    quotations approved by SPOC, job not yet in
+ *                       execution/done — ops should align a tx
+ *   estimateRejected    quotations rejected by SPOC — ops follow-up
+ *   pendingTechAccept   tech assigned but app-ack still pending
+ *                       (proxy = bookedAssigned, status=0 + tech set)
+ *   customerUnreachable status=9 CALL_LATER bucket
+ *
+ * All counts respect req.scope just like getStatusCounts. Bypass roles
+ * (Admin/Finance) see the full count; scoped users see only their
+ * hierarchy-unioned slice.
+ */
+async function getAttentionSummary({ scope } = {}) {
+  const hasVerticalCol = await hasClientVerticalIdColumn();
+
+  // Build the scope clauses + needed joins ONCE — reused across all
+  // five queries so we don't double-scan tbl_address / tbl_client.
+  function buildScopeFragment(jobAlias = 'j') {
+    const clauses = [];
+    const params = [];
+    if (scope) {
+      const c = scope.clients, ci = scope.cities, v = scope.verticals;
+      if ((c && c.mode === 'none') || (ci && ci.mode === 'none') || (v && v.mode === 'none')) {
+        clauses.push('1=0');
+      }
+      if (c && c.mode === 'allow' && c.ids.length) {
+        clauses.push(`${jobAlias}.fk_client_id IN (${c.ids.map(() => '?').join(',')})`);
+        params.push(...c.ids);
+      }
+      if (ci && ci.mode === 'allow' && ci.ids.length) {
+        clauses.push(`ad.city_id IN (${ci.ids.map(() => '?').join(',')})`);
+        params.push(...ci.ids);
+      }
+      if (v && v.mode === 'allow' && v.ids.length && hasVerticalCol) {
+        clauses.push(`cl.vertical_id IN (${v.ids.map(() => '?').join(',')})`);
+        params.push(...v.ids);
+      }
+    }
+    const needsAd = scope?.cities?.mode === 'allow';
+    const needsCl = scope?.verticals?.mode === 'allow' && hasVerticalCol;
+    const joins = [
+      needsAd ? `LEFT JOIN tbl_address ad ON ad.address_id = ${jobAlias}.fk_address_id` : '',
+      needsCl ? `LEFT JOIN tbl_client  cl ON cl.client_id  = ${jobAlias}.fk_client_id`  : '',
+    ].filter(Boolean).join(' ');
+    return { clauses, params, joins };
+  }
+
+  // Helper: run a count safely. On any error, log + return 0 so the
+  // attention card stays usable even if a single sub-query misfires
+  // (e.g. a column rename that hasn't been caught by tests yet).
+  // Inline require — matches the existing convention in this file (the
+  // module top doesn't import the logger; each call-site requires it
+  // locally to keep the dependency surface explicit per-feature).
+  const logger = require('../logger');
+  async function safeCount(label, sql, params) {
+    try {
+      const [[row]] = await pool.query(sql, params);
+      return Number(row?.c) || 0;
+    } catch (e) {
+      logger.warn({ err: e.message, metric: label }, 'attention-summary sub-query failed; returning 0');
+      return 0;
+    }
+  }
+
+  // 1. Running Late
+  const runningLatePromise = (async () => {
+    const f = buildScopeFragment('j');
+    const where = ['j.requested_date_time IS NOT NULL',
+                   'j.requested_date_time < NOW()',
+                   'j.job_status IN (0, 1)',
+                   ...f.clauses].join(' AND ');
+    return safeCount(
+      'runningLate',
+      `SELECT COUNT(*) AS c FROM tbl_job j ${f.joins} WHERE ${where}`,
+      f.params,
+    );
+  })();
+
+  // 2. Estimate Approved (awaiting Tx)
+  //    status=1 + action_on NOT NULL = SPOC-approved (vs default 0 on insert).
+  //    job not yet in execution/closed/cancelled → ops should still act.
+  const estimateApprovedPromise = (async () => {
+    const f = buildScopeFragment('j');
+    const where = ['qd.status = 1',
+                   'qd.action_on IS NOT NULL',
+                   'j.job_status NOT IN (2, 3, 5, 6)',
+                   ...f.clauses].join(' AND ');
+    return safeCount(
+      'estimateApproved',
+      `SELECT COUNT(DISTINCT qd.job_id) AS c
+         FROM quotation_details qd
+         JOIN tbl_job j ON j.job_id = qd.job_id
+         ${f.joins}
+        WHERE ${where}`,
+      f.params,
+    );
+  })();
+
+  // 3. Estimate Rejected — SPOC rejected (action_on set + status=0).
+  //    Filtering out closed/cancelled jobs since those don't need action.
+  const estimateRejectedPromise = (async () => {
+    const f = buildScopeFragment('j');
+    const where = ['qd.status = 0',
+                   'qd.action_on IS NOT NULL',
+                   'j.job_status NOT IN (3, 5, 6)',
+                   ...f.clauses].join(' AND ');
+    return safeCount(
+      'estimateRejected',
+      `SELECT COUNT(DISTINCT qd.job_id) AS c
+         FROM quotation_details qd
+         JOIN tbl_job j ON j.job_id = qd.job_id
+         ${f.joins}
+        WHERE ${where}`,
+      f.params,
+    );
+  })();
+
+  // 4. Pending Tech Acceptance — booked (status=0) with tech assigned.
+  //    Proxy for "ack pending"; our schema doesn't have a separate
+  //    accepted_at flag yet (per dashboard comment).
+  const pendingTechAcceptPromise = (async () => {
+    const f = buildScopeFragment('j');
+    const where = ['j.job_status = 0',
+                   'j.fk_easyfixter_id IS NOT NULL',
+                   ...f.clauses].join(' AND ');
+    return safeCount(
+      'pendingTechAccept',
+      `SELECT COUNT(*) AS c FROM tbl_job j ${f.joins} WHERE ${where}`,
+      f.params,
+    );
+  })();
+
+  // 5. Customer Unreachable / Call Later — status 9
+  const customerUnreachablePromise = (async () => {
+    const f = buildScopeFragment('j');
+    const where = ['j.job_status = 9', ...f.clauses].join(' AND ');
+    return safeCount(
+      'customerUnreachable',
+      `SELECT COUNT(*) AS c FROM tbl_job j ${f.joins} WHERE ${where}`,
+      f.params,
+    );
+  })();
+
+  const [runningLate, estimateApproved, estimateRejected, pendingTechAccept, customerUnreachable] =
+    await Promise.all([
+      runningLatePromise,
+      estimateApprovedPromise,
+      estimateRejectedPromise,
+      pendingTechAcceptPromise,
+      customerUnreachablePromise,
+    ]);
+
+  return {
+    runningLate,
+    estimateApproved,
+    estimateRejected,
+    pendingTechAccept,
+    customerUnreachable,
+  };
 }
 
 // ─── Customer + Address helpers (used by create) ───────────────────
@@ -1209,7 +1408,7 @@ async function notifyAutoAssignFailure(jobId, clientId, reason) {
 
 module.exports = {
   STATUS, ALL_STATUS_VALUES, MUTABLE_COLUMNS,
-  list, getById, getStatusCounts, create, update, setStatus, assign, changeOwner,
+  list, getById, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, changeOwner,
   tryAutoAssignOnCreate,
   fireWebhook, statusToEventName,
   hasClientVerticalIdColumn,

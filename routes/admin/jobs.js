@@ -239,6 +239,32 @@ router.get('/counts', async (req, res, next) => {
 });
 
 /*
+ * GET /api/admin/jobs/attention-summary
+ *
+ * Drives the dashboard's "Orders Needing Immediate Attention" card —
+ * replaces the older Recent Jobs widget which surfaced raw activity
+ * rather than actionable items. Returns 5 operator-action counts in
+ * one round-trip (runs the 5 sub-queries in parallel):
+ *
+ *   runningLate         booked/scheduled jobs past requested_date_time
+ *   estimateApproved    quotations SPOC-approved, job not yet executing
+ *   estimateRejected    quotations SPOC-rejected, ops follow-up needed
+ *   pendingTechAccept   tech assigned but app-ack still pending
+ *   customerUnreachable status=9 CALL_LATER bucket
+ *
+ * Sub-query failures are swallowed inside the service (returning 0 for
+ * the failed metric + logging a warn) so a missing column doesn't
+ * blank-out the whole card. Each tile on the FE deep-links to the
+ * corresponding /jobs filter.
+ */
+router.get('/attention-summary', async (req, res, next) => {
+  try {
+    const data = await job.getAttentionSummary({ scope: req.scope });
+    modernOk(res, data);
+  } catch (e) { next(e); }
+});
+
+/*
  * GET /api/admin/jobs/escalated
  *
  * Ported from legacy ACD action `getEscalatedJobs` (JobDaoImpl.java:4690).
