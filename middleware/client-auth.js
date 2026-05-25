@@ -2,7 +2,7 @@ const jwt = require('jsonwebtoken');
 const { findSpocById } = require('../services/client-auth.service');
 const { modernError } = require('../utils/response');
 
-module.exports = async function requireSpocAuth(req, res, next) {
+async function requireSpocAuth(req, res, next) {
   // Accept both the new cookie name (`client_auth_token`, aligned with the
   // frontend localStorage key) and the legacy `spocToken` name during a
   // rolling deploy. Either source is acceptable.
@@ -24,4 +24,10 @@ module.exports = async function requireSpocAuth(req, res, next) {
 
   req.spoc = spoc;
   next();
-};
+}
+
+// OpenAPI introspection tag — autogen attaches the client SPOC Bearer
+// scheme to any route guarded by this middleware.
+requireSpocAuth._openapi = { security: 'bearerClient' };
+
+module.exports = requireSpocAuth;

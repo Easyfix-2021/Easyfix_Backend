@@ -34,7 +34,34 @@ app.use('/api/integration', rateLimit({ windowMs: 60_000, max: 1200, key: (req) 
 app.use('/api/mobile', rateLimit({ windowMs: 60_000, max: 600 }));
 app.use('/api/client', rateLimit({ windowMs: 60_000, max: 600 }));
 
+// ─── Swagger / OpenAPI docs (auto-generated) ──────────────────────
+// Audience: Mobile App + Client Dashboard developers consuming this
+// backend. Mounted BEFORE the main `/api` router so the docs surface
+// isn't behind requireAuth — devs read the spec without a token, then
+// paste credentials into the "Authorize" dialog to try endpoints.
+//
+// The spec is AUTO-DERIVED from the live Express + Joi setup:
+//   - openapi-autogen walks app._router.stack at first-request time
+//   - validate() middlewares carry _openapi tags so their Joi schemas
+//     become parameter / requestBody schemas in the docs
+//   - auth middlewares carry _openapi.security so the right Bearer
+//     scheme is attached automatically
+//   - Adding a new route + Joi validator is sufficient for the route
+//     to appear in /api/docs. Zero YAML to maintain.
+//
+// Strict opt-in via SWAGGER_ENABLED=true env (default OFF every env).
+const swaggerDocs = require('./docs/swagger');
+app.use('/api/docs', swaggerDocs.makeDocsMiddleware());
+app.get('/api/openapi.json', swaggerDocs.jsonSpecHandler);
+
 app.use('/api', routes);
+
+// Tell the swagger module which Express app to introspect. Called
+// AFTER `app.use('/api', routes)` so the entire router stack is
+// registered by the time the first /api/docs request triggers the
+// spec build. swaggerDocs.init() just caches the `app` reference;
+// the actual walk happens lazily on first request.
+swaggerDocs.init(app);
 
 app.use(notFound);
 app.use(errorHandler);

@@ -2,7 +2,7 @@ const jwt = require('jsonwebtoken');
 const { findById } = require('../services/tech-auth.service');
 const { modernError } = require('../utils/response');
 
-module.exports = async function requireTechAuth(req, res, next) {
+async function requireTechAuth(req, res, next) {
   const token = req.cookies?.techToken ||
     (req.headers.authorization?.startsWith('Bearer ') && req.headers.authorization.slice(7));
   if (!token) return modernError(res, 401, 'authentication required');
@@ -14,4 +14,10 @@ module.exports = async function requireTechAuth(req, res, next) {
   if (!tech) return modernError(res, 401, 'technician not found or inactive');
   req.tech = tech;
   next();
-};
+}
+
+// OpenAPI introspection tag — autogen attaches the technician Bearer
+// scheme to any route guarded by this middleware.
+requireTechAuth._openapi = { security: 'bearerTech' };
+
+module.exports = requireTechAuth;

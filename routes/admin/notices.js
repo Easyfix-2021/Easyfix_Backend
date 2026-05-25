@@ -6,14 +6,13 @@ const svc      = require('../../services/notice.service');
 const s3       = require('../../utils/s3-storage');
 const { writeBuffer } = require('../../utils/file-storage');
 const { modernOk, modernError } = require('../../utils/response');
+const makeNoticeReader = require('../../utils/notice-reader-router');
 const {
   noticeIdParam,
   noticeListQuery,
-  noticeActiveQuery,
   noticeCreate,
   noticeUpdate,
   noticePublishBody,
-  noticeMarkReadBody,
 } = require('../../validators/notice.validator');
 
 /*
@@ -62,29 +61,22 @@ router.get(
   },
 );
 
-// ─── Active feed for a surface (dashboard strip / app bell) ─────────
-// NOTE: must be declared BEFORE /:noticeId — Express matches in order
-// and `active` would otherwise be parsed as a notice id.
-router.get(
-  '/active',
-  validate(noticeActiveQuery, 'query'),
-  async (req, res, next) => {
-    try {
-      // For admin route, the reader is always the calling tbl_user. App
-      // routes (Phase 2) will pass different readerType/readerId.
-      const items = await svc.listActiveForSurface({
-        surface:    req.query.surface,
-        readerType: 'crm_user',
-        readerId:   req.user?.user_id,
-        limit:      req.query.limit,
-      });
-      modernOk(res, { items });
-    } catch (e) {
-      if (e.status) return modernError(res, e.status, e.message);
-      next(e);
-    }
-  },
-);
+// ─── Active feed + mark-read — delegated to shared factory ─────────
+// `utils/notice-reader-router.js` owns the handlers. The same factory
+// is mounted at `/api/mobile/notices` (and later `/api/client/notices`)
+// — zero handler duplication across tiers. NOTE: must be declared
+// BEFORE the `/:noticeId` route below, since Express matches in order
+// and `active` would otherwise parse as a notice id.
+//
+// The CRM-side resolver hard-codes the surface to 'crm' AND the
+// reader_type to 'crm_user'; the request's `?surface=` query param
+// (if present) is ignored here — admins consuming the strip read AS
+// CRM, never as another surface. This matches the previous behaviour.
+router.use(makeNoticeReader((req) => ({
+  surface: 'crm',
+  type:    'crm_user',
+  id:      req.user?.user_id,
+})));
 
 // ─── Detail ──────────────────────────────────────────────────────────
 router.get(
@@ -231,27 +223,7 @@ router.post(
   },
 );
 
-// ─── Mark-as-read ────────────────────────────────────────────────────
-// Open to any authenticated admin user. Idempotent — repeated calls
-// don't bump read_at.
-router.post(
-  '/:noticeId/mark-read',
-  validate(noticeIdParam, 'params'),
-  validate(noticeMarkReadBody),
-  async (req, res, next) => {
-    try {
-      await svc.markRead({
-        noticeId:   Number(req.params.noticeId),
-        surface:    req.body.surface,
-        readerType: 'crm_user',
-        readerId:   req.user?.user_id,
-      });
-      modernOk(res, { ok: true });
-    } catch (e) {
-      if (e.status) return modernError(res, e.status, e.message);
-      next(e);
-    }
-  },
-);
+// /:noticeId/mark-read was previously declared here — now handled
+// by the makeNoticeReader factory above (mounted on '/').
 
 module.exports = router;

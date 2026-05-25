@@ -62,4 +62,8 @@ async function requireAuth(req, res, next) {
   return next();
 }
 
+// OpenAPI introspection tag — autogen reads this to attach the right
+// security scheme to every route the middleware guards. See docs/openapi-autogen.js.
+requireAuth._openapi = { security: 'bearerAdmin' };
+
 module.exports = requireAuth;

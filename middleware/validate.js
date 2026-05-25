@@ -13,7 +13,7 @@ function isIntegrationRoute(req) {
 }
 
 function validate(schema, source = 'body') {
-  return (req, res, next) => {
+  const mw = (req, res, next) => {
     const { value, error } = schema.validate(req[source], {
       abortEarly: false,
       stripUnknown: true,
@@ -31,6 +31,13 @@ function validate(schema, source = 'body') {
     req[source] = value;
     return next();
   };
+  // OpenAPI introspection tag — picked up by docs/openapi-autogen.js to
+  // auto-generate request schemas. No runtime effect; pure metadata so the
+  // autogen can find the Joi schema + its source (body / query / params)
+  // by walking app._router.stack. This is how "create a route → it auto-
+  // appears in /api/docs" works without any hand-written YAML.
+  mw._openapi = { schema, source };
+  return mw;
 }
 
 module.exports = validate;

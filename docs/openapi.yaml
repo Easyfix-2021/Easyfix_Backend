@@ -1,0 +1,243 @@
+openapi: 3.0.3
+
+# ─────────────────────────────────────────────────────────────────────
+# STATIC SCAFFOLDING ONLY.
+#
+# The `paths:` section is intentionally absent — every endpoint in the
+# live Express app is auto-discovered at runtime by
+# `docs/openapi-autogen.js` (introspects `app._router.stack` + the
+# `_openapi` metadata tags on `validate()` and auth middlewares).
+#
+# This file contains only the bits the autogen cannot derive:
+#   - info       — human title + description + version
+#   - servers    — runtime base URLs
+#   - tags       — group descriptions for Swagger UI
+#   - components.securitySchemes — auth scheme definitions referenced
+#       by the autogen via the `_openapi.security` tag on each
+#       auth middleware
+#   - components.schemas — reusable response shapes that handlers
+#       reference indirectly (e.g. the Job / Notice shapes consumers
+#       look up by `$ref`). Hand-curated because Joi doesn't describe
+#       response shapes.
+# ─────────────────────────────────────────────────────────────────────
+
+info:
+  title: EasyFix Backend API
+  description: |
+    Unified backend serving three frontends + external integrations:
+
+    | Tier | Mount | Auth | Consumer |
+    |---|---|---|---|
+    | **Admin (CRM)** | `/api/admin/*` | Bearer JWT (CRM user) | Easyfix_CRM_UI |
+    | **Mobile (Technician)** | `/api/mobile/*` | Bearer JWT (tech) | Easyfix_Technician_Mobile_Application |
+    | **Client (SPOC)** | `/api/client/*` | Bearer JWT (client SPOC) | Easyfix_Client_UI |
+    | **Shared** | `/api/shared/*` | Any of the three Bearer types | All authed |
+    | **Auth** | `/api/auth/*` | Public | CRM login flow |
+    | **Integration v1** | `/api/integration/v1/*` | HTTP Basic | External clients (Decathlon etc.) — legacy contract |
+
+    ### Auto-generated
+    Endpoint paths in this document are auto-derived from the live Express
+    + Joi setup at server boot. Adding a new route + Joi validator is
+    sufficient for it to appear here on the next request — no manual
+    spec edit needed.
+
+    ### Response envelopes
+    All routes under `/admin`, `/mobile`, `/client`, `/shared`, `/auth` use the **modern** envelope:
+    `{ success: true, data: <...>, message?: <string> }` or
+    `{ success: false, error: <string>, details?: <any> }`.
+
+    `/integration/v1/*` uses the **legacy** envelope:
+    `{ status: "200", message, data }`. Do not mix.
+
+    ### Dates
+    All datetimes are IST (server-local, `Asia/Kolkata`). Format: ISO-8601
+    or `YYYY-MM-DDTHH:mm:ss`. Legacy integration routes use `DD-MM-YYYY HH:mm`.
+  version: '0.3.0'
+  contact:
+    name: EasyFix Backend Maintainers
+    email: ithelpdesk@easyfix.in
+
+servers:
+  - url: http://localhost:5100/api
+    description: Local development
+  - url: https://staging.easyfix.in/api
+    description: Staging
+  - url: https://core.easyfix.in/api
+    description: Production
+
+components:
+  securitySchemes:
+    bearerAdmin:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Bearer token issued by `POST /auth/verify-otp` for CRM users.
+        JWT signed with `JWT_SECRET`, 30-day expiry. Claims: `sub` (user_id),
+        `email`, `role`, `name`. Use for all `/admin/*` and most `/shared/*`
+        requests.
+    bearerTech:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Bearer token issued by `POST /mobile/auth/verify-otp` for technicians.
+        JWT carries `efr_id`. Use for `/mobile/*`.
+    bearerClient:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Bearer token issued by `POST /client/auth/verify-otp` for client SPOCs.
+        JWT carries `contact_id` + `client_id`. Use for `/client/*`.
+    basicIntegration:
+      type: http
+      scheme: basic
+      description: |
+        HTTP Basic Auth — for `/integration/v1/*` only. Credentials sourced
+        from the legacy `tbl_client_website` table.
+
+  schemas:
+    ModernOk:
+      type: object
+      required: [success, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        data:    { description: Payload — shape per endpoint }
+        message: { type: string, nullable: true }
+
+    ModernError:
+      type: object
+      required: [success, error]
+      properties:
+        success: { type: boolean, enum: [false] }
+        error:   { type: string, example: 'Validation failed' }
+        details:
+          type: array
+          items:
+            type: object
+            properties:
+              field:   { type: string, example: 'customer_mob_no' }
+              message: { type: string, example: 'must be exactly 10 digits' }
+
+    LegacyOk:
+      description: Legacy response envelope — `/integration/v1/*` only.
+      type: object
+      properties:
+        status:  { type: string, example: '200' }
+        message: { type: string, example: 'OK' }
+        data:    { description: Payload — legacy shape }
+
+    Job:
+      type: object
+      description: List-row projection (~24 cols, joined from 5 tables).
+      properties:
+        job_id:               { type: integer, example: 482446 }
+        job_status:           { type: integer, description: 'See Job Status codes', example: 1 }
+        job_type:             { type: string, example: 'Installation' }
+        customer_name:        { type: string, example: 'Harshit Sharma' }
+        customer_mob_no:      { type: string, description: 'Masked on /admin/*; full on /mobile/*', example: '9310••••••' }
+        client_name:          { type: string, example: 'For Testing' }
+        city_name:            { type: string, example: 'New Delhi' }
+        easyfixer_name:       { type: string, nullable: true, example: 'Ravi Kumar' }
+        fk_easyfixter_id:     { type: integer, nullable: true, description: 'NB typo preserved — easyFIXTER not easyfixer' }
+        requested_date_time:  { type: string, format: date-time, example: '2026-05-25T14:30:00' }
+        scheduled_date_time:  { type: string, format: date-time, nullable: true }
+        created_date_time:    { type: string, format: date-time }
+
+    JobDetail:
+      allOf:
+        - $ref: '#/components/schemas/Job'
+        - type: object
+          properties:
+            address:               { type: string, example: '12, Connaught Place' }
+            pin_code:              { type: string, example: '110001' }
+            gps_location:          { type: string, nullable: true, example: '28.6315,77.2167' }
+            helper_req:            { type: boolean }
+            job_desc:              { type: string }
+            efr_special_notes:     { type: string, nullable: true }
+            remarks:               { type: string, nullable: true }
+            original_appointment_date_time: { type: string, format: date-time, nullable: true }
+            checkin_date_time:     { type: string, format: date-time, nullable: true }
+            checkout_date_time:    { type: string, format: date-time, nullable: true }
+            services:
+              type: array
+              items:
+                type: object
+                properties:
+                  job_service_id:    { type: integer }
+                  service_type_id:   { type: integer }
+                  service_type_name: { type: string }
+                  amount:            { type: number, format: float }
+            images:
+              type: array
+              items: { type: string, description: 'Public URL or presigned S3 URL' }
+
+    Notice:
+      type: object
+      properties:
+        notice_id:        { type: integer, example: 42 }
+        title:            { type: string, example: 'Festive bonus is live' }
+        body:             { type: string }
+        category_id:      { type: integer, example: 1 }
+        category_name:    { type: string, example: 'Incentive' }
+        category_color:   { type: string, example: '#16a34a' }
+        target_surfaces:  { type: string, example: 'crm,technician', description: 'CSV subset of {crm,client,technician}' }
+        audience_scope:   { type: string, enum: [all, city, specific], default: all }
+        action_url:       { type: string, nullable: true }
+        image_keys:       { type: array, items: { type: string }, description: 'Raw S3 keys (round-trip on edit)' }
+        images:           { type: array, items: { type: string }, description: 'Presigned URLs (5-min TTL) for direct rendering' }
+        is_pinned:        { type: boolean }
+        status:           { type: string, enum: [draft, scheduled, published, archived] }
+        effective_status: { type: string, enum: [draft, scheduled, published, archived, expired] }
+        publish_at:       { type: string, format: date-time, nullable: true }
+        expire_at:        { type: string, format: date-time, nullable: true }
+        is_read:          { type: boolean, description: 'Per-caller; only on active-feed responses' }
+
+    NoticeCategory:
+      type: object
+      properties:
+        category_id:         { type: integer }
+        name:                { type: string, example: 'Incentive' }
+        color:               { type: string, example: '#16a34a' }
+        applies_to_surfaces: { type: string, example: 'crm,client,technician' }
+        sort_order:          { type: integer }
+        is_active:           { type: boolean }
+
+    Holiday:
+      type: object
+      properties:
+        date:         { type: string, format: date, example: '2026-05-27' }
+        name:         { type: string, example: 'Eid-ul-Zuha (Bakrid)' }
+        holiday_type: { type: string, enum: [national, regional, restricted] }
+        description:  { type: string, nullable: true }
+
+tags:
+  - name: Auth
+    description: OTP-based login flows (CRM, Technician, Client). Public endpoints; issue tier-appropriate Bearer JWTs.
+  - name: Admin
+    description: CRM staff endpoints (`/api/admin/*`). Bearer JWT from CRM auth flow.
+  - name: Mobile
+    description: Technician App endpoints (`/api/mobile/*`). Bearer JWT from `/mobile/auth/verify-otp`.
+  - name: Client
+    description: Client Dashboard SPOC endpoints (`/api/client/*`). Bearer JWT from `/client/auth/verify-otp`.
+  - name: Shared
+    description: Lookups + file upload available to any authed tier.
+  - name: Integration
+    description: External clients (Decathlon, Powermax, etc.). HTTP Basic Auth + legacy response shape — do not consume from a frontend.
+
+# ─── Job-status code reference (referenced by every Job-* schema) ───
+# | Code | Name                          | When stamped
+# |------|-------------------------------|---------------------------------------
+# |  0   | BOOKED                        | default on create
+# |  1   | SCHEDULED                     | auto on first assign
+# |  2   | IN_PROGRESS                   | tech checked in
+# |  3   | COMPLETED                     | normal completion
+# |  5   | COMPLETED_ALT                 | legacy alternative completion
+# |  6   | CANCELLED                     | stamps cancel_*
+# |  7   | ENQUIRY                       | info-only request
+# |  9   | CALL_LATER                    | deferred / unconfirmed
+# | 10   | REVISIT                       | closed-from-app / needs return
+# | 15   | ESTIMATE_PENDING_APPROVAL
+# | 20   | IN_PROGRESS_ALT
+# | 21   | ON_HOLD                       | "Orders in Followup"

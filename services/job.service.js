@@ -516,7 +516,7 @@ async function getJobMeta(jobId) {
  * side sum — we use client-side sum because MySQL 5.7's WITH ROLLUP syntax is
  * fussy and the row count is always tiny (≤ 10 status codes).
  */
-async function getStatusCounts({ ownerId, scope } = {}) {
+async function getStatusCounts({ ownerId, easyfixerId, scope } = {}) {
   /*
    * Two queries run in parallel:
    *   1. GROUP BY job_status — the raw count per code.
@@ -540,6 +540,16 @@ async function getStatusCounts({ ownerId, scope } = {}) {
   const hasVerticalCol = await hasClientVerticalIdColumn();
 
   if (ownerId) { clauses.push('j.job_owner = ?'); params.push(ownerId); }
+  // `easyfixerId` — scope counts to a single technician. Enables the
+  // Mobile App's dashboard to reuse this exact counts engine (instead
+  // of duplicating the SUM-CASE pattern in a tier-specific service).
+  // Per the no-route-duplication / single-source-of-truth rule: one
+  // status-counts implementation serves CRM dashboard, Mobile dashboard,
+  // and any future surface that needs status tallies.
+  if (easyfixerId != null) {
+    clauses.push('j.fk_easyfixter_id = ?');
+    params.push(easyfixerId);
+  }
   if (scope) {
     const c = scope.clients, ci = scope.cities, v = scope.verticals;
     if ((c && c.mode === 'none') || (ci && ci.mode === 'none') || (v && v.mode === 'none')) {
@@ -1165,7 +1175,69 @@ function statusToEventName(prevStatus, newStatus) {
  *   - Webhook + notification dispatch is fire-and-forget via setImmediate inside
  *     fireWebhook, so the HTTP response returns as soon as UPDATE commits.
  */
-async function setStatus(jobId, { status, reasonId, comment }, actor) {
+/*
+ * Whitelist of tier-specific columns the caller may stamp via the
+ * `extras` map (see setStatus signature below). The whitelist is the
+ * SQL-injection guard — only these column names ever interpolate into
+ * the UPDATE statement. New entries land here only after confirming
+ * the column exists on tbl_job + the write is genuinely a status-
+ * transition side-effect (not unrelated mutation that should go
+ * through a different endpoint).
+ *
+ * Use cases:
+ *   - Mobile /jobs/:id/checkin   → checkin_gps_location, checkin_address,
+ *                                  checkin_pincode, fk_checkin_by
+ *   - Mobile /jobs/:id/checkout  → app_checkout_date_time
+ *   - Mobile /jobs/:id/eta       → eta_status, eta_requested_time
+ *   - Mobile /jobs/:id/reschedule → reschedule_reason_id, reschedule_remarks,
+ *                                  reschedule_at_app, is_rescheduled_by_app
+ */
+const STATUS_EXTRAS_ALLOWLIST = new Set([
+  // Check-in stamps (mobile /checkin path)
+  'checkin_gps_location', 'checkin_address', 'checkin_pincode', 'fk_checkin_by',
+  // Check-out stamps (mobile /checkout path)
+  'app_checkout_date_time',
+  // ETA stamps
+  'eta_status', 'eta_requested_time',
+  // Reschedule-from-app stamps
+  'reschedule_reason_id', 'reschedule_remarks', 'reschedule_at_app',
+  'is_rescheduled_by_app', 'resch_job_count',
+  // Tech-side reassignment trigger
+  'requested_date_time',
+]);
+
+/*
+ * Cached probe for `tbl_job.send_back_to_tx` column existence. The
+ * column is referenced by the Mobile App's "Action Required" lifecycle
+ * (CRM sets `send_back_to_tx=1` + `job_status=2`; tech re-closes →
+ * resets to 0). It doesn't appear elsewhere in this codebase — likely
+ * a legacy column from the pre-migration CRM. We probe once on first
+ * setStatus call + cache the result so the UPDATE conditionally
+ * includes the reset clause only when the column actually exists.
+ *
+ * When the column lands (or is confirmed already-present), the reset
+ * happens automatically on the IN_PROGRESS → COMPLETED transition with
+ * no further code change.
+ */
+let _sendBackColumnExists = null;
+async function hasSendBackToTxColumn() {
+  if (_sendBackColumnExists != null) return _sendBackColumnExists;
+  try {
+    const [rows] = await pool.query(
+      `SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME   = 'tbl_job'
+          AND COLUMN_NAME  = 'send_back_to_tx'
+        LIMIT 1`,
+    );
+    _sendBackColumnExists = rows.length > 0;
+  } catch {
+    _sendBackColumnExists = false;
+  }
+  return _sendBackColumnExists;
+}
+
+async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
   if (!ALL_STATUS_VALUES.has(Number(status))) {
     const err = new Error(`invalid status ${status}; allowed: ${[...ALL_STATUS_VALUES].join(',')}`);
     err.status = 400; throw err;
@@ -1185,6 +1257,32 @@ async function setStatus(jobId, { status, reasonId, comment }, actor) {
   } else if (COMPLETED_STATES.has(Number(status))) {
     sets.push('checkout_date_time = COALESCE(checkout_date_time, ?)', 'fk_checkout_by = COALESCE(fk_checkout_by, ?)');
     values.push(new Date(), actorId);
+    // Sent-back lifecycle (mobile app spec): when a tech re-closes a
+    // job that was sent back from the CRM, reset the flag so the
+    // "Action Required" tile stops counting it. Conditionally
+    // included — see hasSendBackToTxColumn() rationale.
+    if (await hasSendBackToTxColumn()) {
+      sets.push('send_back_to_tx = 0');
+    }
+  }
+
+  // Tier-specific extras — caller passes a map of column→value pairs
+  // for transition side-effects that don't generalise (mobile GPS
+  // checkin, app_checkout_date_time, etc.). Whitelisted to prevent
+  // SQL injection via the column name; values bind parameterised.
+  if (extras && typeof extras === 'object') {
+    for (const [col, val] of Object.entries(extras)) {
+      if (!STATUS_EXTRAS_ALLOWLIST.has(col)) {
+        // Non-whitelisted column — silently skip (defence against
+        // accidentally-passed unrelated fields). Logged at debug
+        // level via an inline require so we don't add a module-scope
+        // logger import just for this one safety message.
+        try { require('../logger').debug?.({ col, jobId }, 'setStatus: ignoring non-whitelisted extras column'); } catch {}
+        continue;
+      }
+      sets.push(`${col} = ?`);
+      values.push(val);
+    }
   }
 
   values.push(jobId);
@@ -1245,6 +1343,87 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason }, actor)
     await conn.commit();
 
     fireWebhook(isReassign ? 'RescheduleTech' : 'TechAssigned', jobId);
+
+    return getById(jobId);
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
+}
+
+// ─── Unassign technician (mobile reject path) ───────────────────────
+/*
+ * Reverses an assign: clears `fk_easyfixter_id`, drops the job back to
+ * BOOKED, records the reason in `scheduling_history`. Used when the
+ * technician rejects an assigned job from the app — the job has to
+ * become re-claimable by ops + the auto-assign engine.
+ *
+ * Distinct from `setStatus()` (which mutates the status column +
+ * stamps audit fields per the transition map). Distinct from
+ * `assign()` (which sets the tech). Distinct from `changeOwner()`
+ * (which mutates `job_owner`, not `fk_easyfixter_id`).
+ *
+ * Why a dedicated function rather than reusing `setStatus()` with
+ * extras: this write spans two tables (UPDATE tbl_job + INSERT
+ * scheduling_history) in a transaction, AND clears fk_easyfixter_id
+ * which isn't a tier-side-effect column — it's the assignment FK
+ * itself. Keeping it as its own canonical function means CRM can
+ * later expose an admin /unassign endpoint that flows through the
+ * same code path (e.g. for "tech is sick — reset this job") without
+ * duplicating the transactional logic.
+ *
+ *   jobId  : the job to unassign
+ *   reason : free-text reason (required — written to scheduling_history.reschedule_reason)
+ *   actor  : { user_id?: number | null } — stamps `fk_scheduled_by` audit
+ *
+ * Fires the `RescheduleTech` webhook (same as a re-assignment) so
+ * client integrations downstream see the job leave the tech's queue.
+ * Returns the full getById() payload so callers can use it for
+ * response immediately.
+ */
+async function unassign(jobId, { reason }, actor) {
+  if (!reason || typeof reason !== 'string' || !reason.trim()) {
+    const err = new Error('reason is required to unassign a job'); err.status = 400; throw err;
+  }
+  const existing = await getJobMeta(jobId);
+  if (!existing) {
+    const err = new Error('job not found'); err.status = 404; throw err;
+  }
+  if (!existing.fk_easyfixter_id) {
+    // Nothing to unassign — treat as a soft no-op rather than an
+    // error so retries are idempotent.
+    return getById(jobId);
+  }
+  const techIdAtUnassign = existing.fk_easyfixter_id;
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.query(
+      `UPDATE tbl_job
+          SET fk_easyfixter_id = NULL,
+              scheduled_date_time = NULL,
+              job_status = ${STATUS.BOOKED},
+              last_update_time = ?
+        WHERE job_id = ?`,
+      [new Date(), jobId],
+    );
+    // scheduling_history row records the unassignment with the reason.
+    // `easyfixer_id` here is the tech who's being REMOVED (so the
+    // audit trail keeps the per-tech timeline coherent).
+    await conn.query(
+      `INSERT INTO scheduling_history (job_id, easyfixer_id, schedule_time, reason_id, reschedule_reason)
+       VALUES (?, ?, ?, NULL, ?)`,
+      [jobId, techIdAtUnassign, new Date(), reason.trim()],
+    );
+    await conn.commit();
+
+    // Reschedule-shaped event (job is leaving the tech's queue).
+    // Clients that already received a TechAssigned for this job will
+    // get a RescheduleTech to invalidate downstream state.
+    fireWebhook('RescheduleTech', jobId);
 
     return getById(jobId);
   } catch (e) {
@@ -1408,7 +1587,7 @@ async function notifyAutoAssignFailure(jobId, clientId, reason) {
 
 module.exports = {
   STATUS, ALL_STATUS_VALUES, MUTABLE_COLUMNS,
-  list, getById, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, changeOwner,
+  list, getById, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, unassign, changeOwner,
   tryAutoAssignOnCreate,
   fireWebhook, statusToEventName,
   hasClientVerticalIdColumn,

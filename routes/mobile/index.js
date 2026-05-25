@@ -33,21 +33,40 @@ router.post('/auth/verify-otp', validate(Joi.object({
 // ─── Protected ─────────────────────────────────────────────────────
 router.use(requireTechAuth);
 
+// Notice Board — mounted via shared factory (zero duplication with
+// /api/admin/notices). See routes/mobile/notices.js — it's a 10-line
+// wrapper around utils/notice-reader-router.js.
+router.use('/notices', require('./notices'));
+
 router.get('/me', (req, res) => modernOk(res, { tech: req.tech }));
 
-// Dashboard stats
-router.get('/dashboard', async (req, res, next) => {
-  try {
-    const [[stats]] = await pool.query(`
-      SELECT
-        SUM(CASE WHEN job_status = 0 THEN 1 ELSE 0 END) AS pending,
-        SUM(CASE WHEN job_status = 1 THEN 1 ELSE 0 END) AS scheduled,
-        SUM(CASE WHEN job_status = 2 THEN 1 ELSE 0 END) AS inProgress,
-        SUM(CASE WHEN job_status IN (3,5) THEN 1 ELSE 0 END) AS completed
-       FROM tbl_job WHERE fk_easyfixter_id = ?`, [req.tech.efr_id]);
-    modernOk(res, stats);
-  } catch (e) { next(e); }
-});
+// Dashboard — aggregated payload (2026-05-25, repointed at the new
+// orchestrator). Replaces the older 4-counts query. The orchestrator
+// composes shared services so CRM + Mobile see the same counts logic.
+//
+// Query params:
+//   noticesLimit (int 1-10, default 3) — how many notices to inline
+//     in `notices.items` for the dashboard strip / carousel.
+//
+// See services/mobile-dashboard.service.js for the full payload shape.
+const mobileDashboardService = require('../../services/mobile-dashboard.service');
+router.get(
+  '/dashboard',
+  validate(Joi.object({
+    noticesLimit: Joi.number().integer().min(1).max(10).optional(),
+  }), 'query'),
+  async (req, res, next) => {
+    try {
+      modernOk(res, await mobileDashboardService.getDashboard(
+        req.tech.efr_id,
+        { noticesLimit: req.query.noticesLimit },
+      ));
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
 
 // Jobs assigned to me
 router.get('/jobs', async (req, res, next) => {
@@ -69,41 +88,84 @@ router.get('/jobs/:id', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// Status: 0 (BOOKED) → 1 (SCHEDULED). Now flows through shared
+// jobService.setStatus(), which owns: audit-stamp logic, webhook
+// fan-out (TechStart not fired here — accept doesn't trigger a
+// client-facing webhook in the existing wiring), and any future
+// transition rules (e.g. send_back_to_tx reset on completion).
+// The "must be in status 0" guard previously enforced via WHERE
+// clause is now enforced upstream: we verify in the handler before
+// calling setStatus.
 router.post('/jobs/:id/accept', async (req, res, next) => {
   try {
     const job = await jobService.getById(Number(req.params.id));
     if (!job || job.fk_easyfixter_id !== req.tech.efr_id) return modernError(res, 404, 'job not found');
-    await pool.query('UPDATE tbl_job SET job_status = 1, last_update_time = NOW() WHERE job_id = ? AND job_status = 0', [job.job_id]);
+    if (Number(job.job_status) !== 0) return modernError(res, 409, `cannot accept job in status ${job.job_status}`);
+    await jobService.setStatus(
+      job.job_id,
+      { status: 1 /* SCHEDULED */ },
+      { user_id: req.tech.efr_id },          // semantic note: efr_id stored as actor stamp
+    );
     modernOk(res, { accepted: true });
-  } catch (e) { next(e); }
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
 });
 
+// Reject: clears fk_easyfixter_id + drops to BOOKED + writes
+// scheduling_history with the reason. Flows through shared
+// jobService.unassign() — same code path CRM will use when an admin
+// "force-unassigns" a job (e.g. tech is sick). Single transaction +
+// single webhook fan-out (RescheduleTech) live in the shared service.
 router.post('/jobs/:id/reject', validate(Joi.object({ reason: Joi.string().min(3).max(500).required() })), async (req, res, next) => {
   try {
     const job = await jobService.getById(Number(req.params.id));
     if (!job || job.fk_easyfixter_id !== req.tech.efr_id) return modernError(res, 404, 'job not found');
-    await pool.query(
-      `UPDATE tbl_job SET fk_easyfixter_id = NULL, scheduled_date_time = NULL, job_status = 0, last_update_time = NOW() WHERE job_id = ?`,
-      [job.job_id]);
-    await pool.query(
-      `INSERT INTO scheduling_history (job_id, easyfixer_id, schedule_time, reason_id, reschedule_reason)
-       VALUES (?, ?, NOW(), NULL, ?)`,
-      [job.job_id, req.tech.efr_id, req.body.reason]);
+    await jobService.unassign(job.job_id, { reason: req.body.reason }, { user_id: req.tech.efr_id });
     modernOk(res, { rejected: true });
-  } catch (e) { next(e); }
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
 });
 
-router.post('/jobs/:id/eta', async (req, res, next) => {
+// ETA: tech-side "on the way" signal. NOT a status transition — just
+// stamps `eta_status` + `eta_requested_time`. Routed through the
+// shared setStatus() extras path (no-op transition pattern) so the
+// stamps + last_update_time + any future side-effects live in one
+// canonical function. eta_status / eta_requested_time are already on
+// STATUS_EXTRAS_ALLOWLIST.
+router.post('/jobs/:id/eta', validate(Joi.object({
+  etaStatus: Joi.string().max(20).optional(),
+  etaTime:   Joi.date().iso().optional(),
+})), async (req, res, next) => {
   try {
     const job = await jobService.getById(Number(req.params.id));
     if (!job || job.fk_easyfixter_id !== req.tech.efr_id) return modernError(res, 404, 'job not found');
-    await pool.query(
-      `UPDATE tbl_job SET eta_status = ?, eta_requested_time = ?, last_update_time = NOW() WHERE job_id = ?`,
-      [req.body.etaStatus || 'OTW', new Date(req.body.etaTime || Date.now()), job.job_id]);
+    await jobService.setStatus(
+      job.job_id,
+      {
+        status: Number(job.job_status),        // no-op transition
+        extras: {
+          eta_status:         req.body.etaStatus || 'OTW',
+          eta_requested_time: new Date(req.body.etaTime || Date.now()),
+        },
+      },
+      { user_id: req.tech.efr_id },
+    );
     modernOk(res, { sent: true });
-  } catch (e) { next(e); }
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
 });
 
+// Status: → 2 (IN_PROGRESS). `setStatus` fires the TechStart webhook
+// automatically based on the transition (BOOKED|SCHEDULED → IN_PROGRESS).
+// Mobile-specific stamps (GPS, address, pincode, fk_checkin_by) ride
+// through the `extras` whitelist so the transition rules + stamps land
+// in a single shared UPDATE — no duplication of status-transition logic.
 router.post('/jobs/:id/checkin', validate(Joi.object({
   gps: Joi.string().pattern(/^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/).required(),
   address: Joi.string().max(500).optional(),
@@ -113,30 +175,61 @@ router.post('/jobs/:id/checkin', validate(Joi.object({
   try {
     const job = await jobService.getById(Number(req.params.id));
     if (!job || job.fk_easyfixter_id !== req.tech.efr_id) return modernError(res, 404, 'job not found');
-    await pool.query(
-      `UPDATE tbl_job SET checkin_date_time = NOW(), checkin_gps_location = ?, checkin_address = ?,
-          checkin_pincode = ?, fk_checkin_by = ?, job_status = 2, last_update_time = NOW()
-        WHERE job_id = ?`,
-      [req.body.gps, req.body.address || null, req.body.pincode || null, req.tech.efr_id, job.job_id]);
-    jobService.fireWebhook('TechStart', job.job_id);
+    await jobService.setStatus(
+      job.job_id,
+      {
+        status: 2 /* IN_PROGRESS */,
+        extras: {
+          checkin_gps_location: req.body.gps,
+          checkin_address:      req.body.address || null,
+          checkin_pincode:      req.body.pincode || null,
+          fk_checkin_by:        req.tech.efr_id,
+        },
+      },
+      { user_id: req.tech.efr_id },
+    );
     modernOk(res, { checkedIn: true });
-  } catch (e) { next(e); }
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
 });
 
+// Status: 2 → 3 (COMPLETED). `setStatus` fires TechVisitComplete +
+// stamps checkout_date_time + fk_checkout_by + (when the column exists)
+// resets send_back_to_tx = 0. The mobile-specific `app_checkout_date_time`
+// stamp rides through extras so all the transition side-effects land
+// in a single UPDATE. See services/job.service.js::setStatus().
 router.post('/jobs/:id/checkout', async (req, res, next) => {
   try {
     const job = await jobService.getById(Number(req.params.id));
     if (!job || job.fk_easyfixter_id !== req.tech.efr_id) return modernError(res, 404, 'job not found');
-    await pool.query(
-      `UPDATE tbl_job SET checkout_date_time = NOW(), app_checkout_date_time = NOW(),
-          fk_checkout_by = ?, job_status = 3, last_update_time = NOW()
-        WHERE job_id = ?`,
-      [req.tech.efr_id, job.job_id]);
-    jobService.fireWebhook('TechVisitComplete', job.job_id);
+    await jobService.setStatus(
+      job.job_id,
+      {
+        status: 3 /* COMPLETED */,
+        extras: { app_checkout_date_time: new Date() },
+      },
+      { user_id: req.tech.efr_id },
+    );
     modernOk(res, { checkedOut: true });
-  } catch (e) { next(e); }
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
 });
 
+// Reschedule (tech-initiated). Doesn't change job_status; just shifts
+// the appointment + stamps the reschedule audit columns. We call
+// setStatus with the EXISTING status (no transition) just to ride
+// through the extras-whitelist write path + emit the RescheduleTech
+// webhook via the same code path /admin/jobs/:id/reschedule uses.
+//
+// `resch_job_count` is incremented via a follow-up query because the
+// extras whitelist binds parameterised values — incrementing requires
+// `COALESCE(resch_job_count, 0) + 1` which is an expression, not a
+// bind. Done in a separate UPDATE; safe because both writes are on
+// the same row and idempotent if a retry lands.
 router.post('/jobs/:id/reschedule', validate(Joi.object({
   newDate: Joi.date().iso().required(),
   reasonId: Joi.number().integer().positive().required(),
@@ -145,15 +238,33 @@ router.post('/jobs/:id/reschedule', validate(Joi.object({
   try {
     const job = await jobService.getById(Number(req.params.id));
     if (!job || job.fk_easyfixter_id !== req.tech.efr_id) return modernError(res, 404, 'job not found');
+    await jobService.setStatus(
+      job.job_id,
+      {
+        status: Number(job.job_status),       // no-op transition; just rides the extras path
+        extras: {
+          requested_date_time:   new Date(req.body.newDate),
+          reschedule_reason_id:  req.body.reasonId,
+          reschedule_remarks:    req.body.remarks || null,
+          reschedule_at_app:     new Date(),
+          is_rescheduled_by_app: 1,
+        },
+      },
+      { user_id: req.tech.efr_id },
+    );
     await pool.query(
-      `UPDATE tbl_job SET requested_date_time = ?, reschedule_reason_id = ?, reschedule_remarks = ?,
-          reschedule_at_app = NOW(), is_rescheduled_by_app = 1, resch_job_count = COALESCE(resch_job_count, 0) + 1,
-          last_update_time = NOW()
-        WHERE job_id = ?`,
-      [req.body.newDate, req.body.reasonId, req.body.remarks || null, job.job_id]);
+      `UPDATE tbl_job SET resch_job_count = COALESCE(resch_job_count, 0) + 1 WHERE job_id = ?`,
+      [job.job_id],
+    );
+    // RescheduleTech webhook isn't auto-fired by setStatus on a no-op
+    // transition — fire it explicitly here. (statusToEventName only
+    // maps actual transitions; rescheduling isn't a status change.)
     jobService.fireWebhook('RescheduleTech', job.job_id);
     modernOk(res, { rescheduled: true });
-  } catch (e) { next(e); }
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
 });
 
 // Profile sub-tree — covers the legacy /profile/* endpoints
