@@ -32,7 +32,16 @@ tmp
 # Repo-only docs, scripts, migrations (the ones that need to be available
 # IN the image are explicitly named — keeping the rest out reduces context
 # size and image rebuild churn).
-docs
+#
+# Caveat on `docs/`: the directory now holds BOTH operational markdown
+# guides (AWS_DEPLOYMENT_GUIDE.md, ENV_VARS.md, GITHUB_SECRETS.md — all
+# image-irrelevant) AND **runtime code** added 2026-05-25 for the
+# Swagger autogen (`docs/swagger.js`, `docs/openapi-autogen.js`,
+# `docs/openapi.yaml`). Excluding the directory wholesale used to be
+# safe; now it'd ship a broken image because `server.js` requires
+# `./docs/swagger` at boot. Narrow the exclusion to .md files inside
+# docs/ so the JS + YAML files get included.
+docs/**/*.md
 *.md
 nodemon.json
 ecosystem.config.js
