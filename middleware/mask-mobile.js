@@ -35,11 +35,39 @@
 
 const { maskMobileInResponse } = require('../utils/mask-mobile');
 
+/*
+ * Per-route mask opt-out (2026-05-25):
+ *
+ * Some admin pages need to display the real mobile number — Manage
+ * Users in particular shows a staff roster where masking adds zero
+ * security value (operators viewing this list already see the same
+ * data in /admin/users/:id detail when they open the edit modal).
+ * Surfaces listed here bypass the masking middleware entirely.
+ *
+ * SECURITY NOTE: this is a route-level opt-out, not a global one.
+ * Customer-facing mobiles (tbl_customer, tbl_easyfixer SPOC etc.)
+ * continue to be masked everywhere else. Only the internal-staff
+ * directory route is whitelisted.
+ *
+ * Match style: `req.path` here is mounted UNDER `/api/admin` so it
+ * starts with `/users` for routes like `GET /api/admin/users`.
+ * Hierarchy + bulk-lookup + check-* sub-routes are also internal
+ * directory data — same opt-out applies.
+ */
+const UNMASKED_PATH_PREFIXES = [
+  '/users',          // list, detail, hierarchy, bulk-lookups, check-mobile/email
+];
+
+function isUnmaskedPath(reqPath) {
+  return UNMASKED_PATH_PREFIXES.some((prefix) => reqPath === prefix || reqPath.startsWith(prefix + '/'));
+}
+
 function maskMobileResponseMiddleware(req, res, next) {
   const wantsUnmasked = String(req.query?.unmasked).toLowerCase() === 'true';
-  if (wantsUnmasked) {
-    // Short-circuit: edit-form opt-out. The route's own auth + role
-    // checks already gate this; no further permission check here.
+  if (wantsUnmasked || isUnmaskedPath(req.path)) {
+    // Short-circuit: edit-form opt-out OR whitelisted internal-staff
+    // route. The route's own auth + role checks already gate this;
+    // no further permission check here.
     return next();
   }
 
