@@ -1216,6 +1216,221 @@ router.get('/:id/estimate/preview', validate(idParam, 'params'), scopedJob, asyn
   } catch (e) { next(e); }
 });
 
+/*
+ * GET /admin/jobs/:id/service-breakdown
+ *
+ * Per-service cost cascade for the Services tab tooltip. Joins
+ * tbl_job_services → tbl_client_service (where the 6 cost columns
+ * live) → tbl_service_type (for display name). Each row's totalCharge
+ * is run through `calculateCharges` (the documented Variable→Fixed
+ * cascade, see services/client-rate-cards.service.js) at per-unit
+ * level and multiplied by quantity for the line total.
+ *
+ * Performance: 1 SQL query + N synchronous JS computations (N = #
+ * services on the job; typically ≤10).
+ */
+router.get('/:id/service-breakdown', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
+  try {
+    const { calculateCharges } = require('../../services/client-rate-cards.service');
+    const jobId = Number(req.params.id);
+    const [rows] = await pool.query(
+      `SELECT js.job_service_id, js.service_id, js.quantity, js.total_charge,
+              cs.total_amount,
+              cs.easyfix_direct_fixed, cs.easyfix_direct_variable,
+              cs.overhead_fixed, cs.overhead_variable,
+              cs.client_fixed, cs.client_variable,
+              st.service_type_name,
+              sc.service_catg_name
+         FROM tbl_job_services js
+         LEFT JOIN tbl_client_service cs ON cs.client_service_id = js.service_id
+         LEFT JOIN tbl_service_type   st ON st.service_type_id   = js.service_type_id
+         LEFT JOIN tbl_service_catg   sc ON sc.service_catg_id   = js.service_category_id
+        WHERE js.job_id = ?
+          AND (js.job_service_status IS NULL OR js.job_service_status <> 0)
+        ORDER BY js.job_service_id ASC`,
+      [jobId],
+    );
+
+    const lineItems = rows.map((r) => {
+      const qty = Number(r.quantity) || 1;
+      // Per-unit cascade — uses tbl_client_service.total_amount as the
+      // single-unit total. Falls back to js.total_charge/qty if the
+      // client_service row is missing the cost cols (legacy rows).
+      const perUnitTotal = Number(r.total_amount)
+        || (Number(r.total_charge) / qty)
+        || 0;
+      const perUnit = calculateCharges({
+        totalCharge:           perUnitTotal,
+        easyfixDirectFixed:    r.easyfix_direct_fixed,
+        easyfixDirectVariable: r.easyfix_direct_variable,
+        overheadFixed:         r.overhead_fixed,
+        overheadVariable:      r.overhead_variable,
+        clientFixed:           r.client_fixed,
+        clientVariable:        r.client_variable,
+      });
+      const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+      const scale = (b) => ({
+        variableAmt: round2(b.variableAmt * qty),
+        fixedAmt:    round2(b.fixedAmt * qty),
+        total:       round2(b.total * qty),
+      });
+      return {
+        job_service_id: r.job_service_id,
+        service_id: r.service_id,
+        service_type_name: r.service_type_name,
+        service_category_name: r.service_catg_name,
+        quantity: qty,
+        perUnit,
+        lineTotal: {
+          totalCharge:   round2(perUnit.totalCharge * qty),
+          easyfixDirect: scale(perUnit.easyfixDirect),
+          overhead:      scale(perUnit.overhead),
+          clientShare:   scale(perUnit.clientShare),
+          remainder:     round2(perUnit.remainder * qty),
+        },
+      };
+    });
+
+    // Aggregate totals across all line items.
+    const totals = lineItems.reduce((acc, li) => {
+      acc.totalCharge += li.lineTotal.totalCharge;
+      acc.easyfixDirect += li.lineTotal.easyfixDirect.total;
+      acc.overhead      += li.lineTotal.overhead.total;
+      acc.clientShare   += li.lineTotal.clientShare.total;
+      acc.remainder     += li.lineTotal.remainder;
+      return acc;
+    }, { totalCharge: 0, easyfixDirect: 0, overhead: 0, clientShare: 0, remainder: 0 });
+    const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+    for (const k of Object.keys(totals)) totals[k] = round2(totals[k]);
+
+    modernOk(res, { job_id: jobId, lineItems, totals });
+  } catch (e) { next(e); }
+});
+
+/*
+ * POST /admin/jobs/:id/services/:jobServiceId/restore
+ *
+ * Soft-undelete a single tbl_job_services row by flipping its
+ * job_service_status from 0 back to 1. Mirror of the soft-delete
+ * pattern used by the services PATCH path (see job.service.js#update
+ * around line 1187). Idempotent — restoring an already-active row
+ * is a no-op (affectedRows=0) and still returns 200.
+ *
+ * No permission middleware applied — same as the rest of /admin/jobs
+ * which rely on FE permission gating + scopedJob ownership check.
+ */
+router.post('/:id/services/:jobServiceId/restore',
+  validate(require('joi').object({
+    id: require('joi').number().integer().positive().required(),
+    jobServiceId: require('joi').number().integer().positive().required(),
+  }), 'params'),
+  scopedJob,
+  async (req, res, next) => {
+    try {
+      const jobId = Number(req.params.id);
+      const jobServiceId = Number(req.params.jobServiceId);
+      if (!Number.isFinite(jobServiceId) || jobServiceId <= 0) {
+        return res.status(400).json({ error: 'Invalid jobServiceId' });
+      }
+      const [r] = await pool.query(
+        `UPDATE tbl_job_services
+            SET job_service_status = 1
+          WHERE job_id = ?
+            AND job_service_id = ?
+            AND (job_service_status IS NULL OR job_service_status = 0)`,
+        [jobId, jobServiceId],
+      );
+      modernOk(res, { restored: r.affectedRows > 0, job_id: jobId, job_service_id: jobServiceId });
+    } catch (e) { next(e); }
+  });
+
+/*
+ * DELETE /admin/jobs/:id/services/:jobServiceId
+ *
+ * Soft-delete a single tbl_job_services row (status → 0). Idempotent;
+ * pair with the /restore endpoint above to bring it back. We use
+ * soft-delete instead of a hard DELETE so the row stays visible
+ * behind the "Show Inactive" toggle and audit history is preserved.
+ */
+router.delete('/:id/services/:jobServiceId',
+  validate(require('joi').object({
+    id: require('joi').number().integer().positive().required(),
+    jobServiceId: require('joi').number().integer().positive().required(),
+  }), 'params'),
+  scopedJob,
+  async (req, res, next) => {
+    try {
+      const jobId = Number(req.params.id);
+      const jobServiceId = Number(req.params.jobServiceId);
+      if (!Number.isFinite(jobServiceId) || jobServiceId <= 0) {
+        return res.status(400).json({ error: 'Invalid jobServiceId' });
+      }
+      const [r] = await pool.query(
+        `UPDATE tbl_job_services
+            SET job_service_status = 0
+          WHERE job_id = ?
+            AND job_service_id = ?
+            AND (job_service_status IS NULL OR job_service_status = 1)`,
+        [jobId, jobServiceId],
+      );
+      modernOk(res, { removed: r.affectedRows > 0, job_id: jobId, job_service_id: jobServiceId });
+    } catch (e) { next(e); }
+  });
+
+/*
+ * POST /admin/jobs/:id/services
+ *
+ * Append a NEW service row to tbl_job_services without touching the
+ * other rows on the job. Body:
+ *   { service_id, service_type_id, service_category_id, quantity }
+ *
+ * If a soft-deleted (status=0) row for the same {job_id, service_id}
+ * already exists, we reactivate it in place (status=1 + quantity bump)
+ * instead of inserting a duplicate. The companion soft-delete endpoint
+ * above keeps the row around so the operator can re-add later via this
+ * endpoint without losing the original PK.
+ */
+router.post('/:id/services',
+  validate(idParam, 'params'),
+  validate(require('joi').object({
+    service_id:          require('joi').number().integer().positive().required(),
+    service_type_id:     require('joi').number().integer().positive().allow(null).optional(),
+    service_category_id: require('joi').number().integer().positive().allow(null).optional(),
+    quantity:            require('joi').number().integer().min(1).default(1),
+  })),
+  scopedJob,
+  async (req, res, next) => {
+    try {
+      const jobId = Number(req.params.id);
+      const { service_id, service_type_id, service_category_id, quantity } = req.body;
+      // Reactivate existing soft-deleted row if present.
+      const [existing] = await pool.query(
+        `SELECT job_service_id, job_service_status, quantity FROM tbl_job_services
+          WHERE job_id = ? AND service_id = ?
+          ORDER BY job_service_id DESC LIMIT 1`,
+        [jobId, service_id],
+      );
+      if (existing.length > 0) {
+        const row = existing[0];
+        await pool.query(
+          `UPDATE tbl_job_services
+              SET job_service_status = 1, quantity = ?
+            WHERE job_service_id = ?`,
+          [quantity, row.job_service_id],
+        );
+        return modernOk(res, { reactivated: true, job_service_id: row.job_service_id });
+      }
+      const [ins] = await pool.query(
+        `INSERT INTO tbl_job_services
+           (job_id, service_id, service_type_id, service_category_id, quantity, job_service_status)
+         VALUES (?, ?, ?, ?, ?, 1)`,
+        [jobId, service_id, service_type_id || null, service_category_id || null, quantity],
+      );
+      res.status(201);
+      modernOk(res, { added: true, job_service_id: ins.insertId });
+    } catch (e) { next(e); }
+  });
+
 router.post('/:id/estimate/send-for-approval',
   validate(idParam, 'params'),
   validate(require('joi').object({

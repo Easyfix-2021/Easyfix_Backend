@@ -99,6 +99,8 @@ const addressBlock = Joi.object({
   pin_code: pinCode.when('address_id', { is: Joi.exist(), then: Joi.optional(), otherwise: Joi.required() }),
   gps_location: gpsPair.optional(),
   mobile_number: mobile.optional(),
+  // Free-text landing notes for the technician (tbl_address.address_instruction).
+  address_instruction: Joi.string().max(1000).allow('', null).optional(),
 }).required();
 
 const serviceItem = Joi.object({
@@ -116,19 +118,54 @@ const createBody = Joi.object({
   fk_service_type_id: intId.optional(),
   fk_service_catg_id: intId.optional(),
   service_type_ids: Joi.alternatives(Joi.array().items(intId), Joi.string().max(500)).optional(),
+  // FE-name alias — JobModal.tsx historically sent `fk_service_type_ids`.
+  // Accept both names so old + new FE code paths work uniformly. The
+  // service layer prefers `service_type_ids`; we copy the alias over
+  // when only the legacy name is supplied.
+  fk_service_type_ids: Joi.alternatives(Joi.array().items(intId), Joi.string().max(500)).optional(),
   requested_date_time: Joi.date().iso().required(),
+  // Legacy column on tbl_job that stores the time portion of the
+  // requested datetime as a separate string (e.g. "14:30"). FE may
+  // send it explicitly OR we derive it server-side from
+  // requested_date_time when omitted.
+  requested_time: Joi.string().max(20).allow('', null).optional(),
   time_slot: Joi.string().max(200).optional(),
+  // Legacy `booking_cut_off_time_slot` column — written by legacy
+  // JobDaoImpl on create. Free-text or "HH:MM" slot label.
+  booking_cut_off_time_slot: Joi.string().max(50).allow('', null).optional(),
   reporting_contact_id: intId.optional(),
   job_owner: intId.optional(),
+  // Legacy `job_client_owner` column — separate from `job_owner`. The
+  // internal CRM user assigned by the client side. Tolerated null.
+  job_client_owner: intId.allow(null).optional(),
+  // Initial "01" sentinel for `eta_status` matching legacy
+  // JobDaoImpl#2387. FE may override; default applied server-side.
+  eta_status: Joi.string().max(20).allow('', null).optional(),
+  // Collected-By preference for THIS job (1=Easyfixer, 2=Easyfix,
+  // 3=Client). Legacy column `collected_by` on tbl_job.
+  collected_by: Joi.alternatives(Joi.number().integer(), Joi.string().max(20)).allow(null, '').optional(),
+  // Original-appointment snapshot — used when a job is rescheduled to
+  // preserve the original promise. Set at create time AND updated on
+  // reschedule.
+  original_appointment_date_time: Joi.date().iso().allow(null).optional(),
+  original_appointment_time:      Joi.string().max(20).allow('', null).optional(),
   client_ref_id: Joi.string().max(100).optional(),
   job_reference_id: Joi.string().max(100).optional(),
   client_spoc: Joi.string().max(200).optional(),
   client_spoc_name: Joi.string().max(200).optional(),
   client_spoc_email: Joi.string().email().max(200).optional(),
-  additional_name: Joi.string().max(200).optional(),
-  additional_number: mobile.optional(),
+  // Alternate customer contact — operator captures these alongside the
+  // primary customer at Book Call time so the technician can reach an
+  // alt person if the primary is unreachable. Both columns exist on
+  // tbl_job per legacy JobDaoImpl#2379-2383.
+  additional_name: Joi.string().max(200).allow('', null).optional(),
+  additional_number: Joi.alternatives(mobile, Joi.string().allow('', null)).optional(),
   helper_req: Joi.boolean().default(false),
   remarks: Joi.string().max(2000).optional(),
+  // Special notes for the technician — visible in mobile app job
+  // detail. Also writable via the update path; create path takes it
+  // alongside `remarks` if the operator adds notes at booking time.
+  efr_special_notes: Joi.string().max(2000).allow('', null).optional(),
   // initial_status — legacy footer-button parity. Routes the new job
   // to BOOKED (default), ENQUIRY (7), or CALL_LATER (9) at creation
   // time. Service-layer also defends against unexpected values.
@@ -163,17 +200,32 @@ const updateBody = Joi.object({
   fk_service_type_id: intId.optional(),
   fk_service_catg_id: intId.optional(),
   requested_date_time: Joi.date().iso().optional(),
+  requested_time: Joi.string().max(20).allow('', null).optional(),
   expected_date_time: Joi.date().iso().optional(),
   time_slot: Joi.string().max(200).optional(),
+  booking_cut_off_time_slot: Joi.string().max(50).allow('', null).optional(),
   reporting_contact_id: intId.optional(),
   job_owner: intId.optional(),
+  job_client_owner: intId.allow(null).optional(),
+  /*
+   * `eta_status` is intentionally NOT accepted on the update path.
+   * BE write happens ONCE at Book Call time (defaults '01'); status
+   * transitions through the dedicated mobile /eta endpoint. Adding
+   * it here would let any PATCH overwrite the value, which ops has
+   * explicitly excluded (2026-05-25).
+   */
+  collected_by: Joi.alternatives(Joi.number().integer(), Joi.string().max(20)).allow(null, '').optional(),
+  original_appointment_date_time: Joi.date().iso().allow(null).optional(),
+  original_appointment_time:      Joi.string().max(20).allow('', null).optional(),
   client_spoc: Joi.string().max(200).optional(),
   client_spoc_name: Joi.string().max(200).optional(),
   client_spoc_email: Joi.string().email().max(200).optional(),
-  additional_name: Joi.string().max(200).optional(),
-  additional_number: mobile.optional(),
+  additional_name: Joi.string().max(200).allow('', null).optional(),
+  additional_number: Joi.alternatives(mobile, Joi.string().allow('', null)).optional(),
   client_ref_id: Joi.string().max(100).optional(),
   job_reference_id: Joi.string().max(100).optional(),
+  fk_service_type_ids: Joi.alternatives(Joi.array().items(intId), Joi.string().max(500)).optional(),
+  service_type_ids: Joi.alternatives(Joi.array().items(intId), Joi.string().max(500)).optional(),
   helper_req: Joi.boolean().optional(),
   remarks: Joi.string().max(2000).optional(),
   efr_special_notes: Joi.string().max(2000).optional(),
@@ -195,6 +247,7 @@ const updateBody = Joi.object({
     address: Joi.string().max(2000).optional(),
     building: Joi.string().max(500).allow('').optional(),
     landmark: Joi.string().max(500).allow('').optional(),
+    address_instruction: Joi.string().max(1000).allow('', null).optional(),
     city_id: intId.optional(),
     pin_code: pinCode.optional(),
     gps_location: gpsPair.allow('').optional(),

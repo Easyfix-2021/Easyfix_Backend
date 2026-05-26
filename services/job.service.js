@@ -467,6 +467,10 @@ async function getById(jobId) {
       [jobId]
     ),
     pool.query(
+      // Return ALL service rows including soft-deleted (status=0). The FE
+      // hides them by default but exposes a "Show Inactive" toggle that
+      // lets the operator restore a row they removed by mistake. Filtering
+      // them out here would deny the restore path. (Updated 2026-05-26.)
       `SELECT js.job_service_id, js.service_id, js.quantity, js.total_charge,
               js.job_service_status, js.service_category_id, js.service_type_id,
               st.service_type_name, sc.service_catg_name
@@ -842,6 +846,39 @@ function composeRemarks(input) {
 }
 
 async function insertAddress(conn, customerId, addr, actor) {
+  // Column-presence probe — production tbl_address may or may not carry
+  // the `address_instruction` column depending on deploy. We branch the
+  // INSERT shape so older DBs aren't broken by an unknown column.
+  let hasInstruction = false;
+  try {
+    const [cols] = await conn.query(
+      `SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME   = 'tbl_address'
+          AND COLUMN_NAME  = 'address_instruction'
+        LIMIT 1`,
+    );
+    hasInstruction = cols.length > 0;
+  } catch (_e) { /* defensively assume absent on probe failure */ }
+
+  if (hasInstruction) {
+    const [ins] = await conn.query(
+      `INSERT INTO tbl_address
+         (customer_id, address, building, landmark, locality, city_id, pin_code, gps_location,
+          mobile_number, address_instruction, created_by, insert_date, update_date)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        customerId,
+        addr.address, addr.building || null, addr.landmark || null, addr.locality || null,
+        addr.city_id, addr.pin_code, addr.gps_location || null,
+        addr.mobile_number || null, addr.address_instruction || null,
+        actor?.user_id || null,
+        new Date(), new Date(),
+      ]
+    );
+    return ins.insertId;
+  }
+  // Fallback path (legacy DBs) — address_instruction silently dropped.
   const [ins] = await conn.query(
     `INSERT INTO tbl_address
        (customer_id, address, building, landmark, locality, city_id, pin_code, gps_location,
@@ -871,28 +908,64 @@ async function create(input, actor) {
       addressId = await insertAddress(conn, customerId, input.address, actor);
     }
 
-    const serviceTypeIds = Array.isArray(input.service_type_ids)
-      ? input.service_type_ids.join(',')
-      : (input.service_type_ids || null);
+    // service_type_ids: accept both the canonical name AND the
+    // FE-legacy alias `fk_service_type_ids` (JobModal.tsx historically
+    // sent that key). Whichever arrives, stringify as CSV for the
+    // tbl_job CSV column.
+    const rawServiceTypeIds = input.service_type_ids ?? input.fk_service_type_ids;
+    const serviceTypeIds = Array.isArray(rawServiceTypeIds)
+      ? rawServiceTypeIds.join(',')
+      : (rawServiceTypeIds || null);
+
+    // requested_time: legacy column stores the time portion as a
+    // separate string. If FE didn't send it explicitly, derive from
+    // requested_date_time so the column isn't NULL.
+    const requestedTime = input.requested_time
+      || (input.requested_date_time
+            ? new Date(input.requested_date_time).toTimeString().slice(0, 5)
+            : null);
+
+    // original_appointment_date_time/time: snapshot at create time so
+    // future reschedules can preserve the original promise. Default to
+    // the requested values when the operator hasn't overridden.
+    const originalApptDt   = input.original_appointment_date_time || input.requested_date_time || null;
+    const originalApptTime = input.original_appointment_time      || requestedTime || null;
+
+    // collected_by: per-job preference. Integer enum (1=Easyfixer,
+    // 2=Easyfix, 3=Client) — accept strings/numbers from FE and coerce.
+    let collectedBy = null;
+    if (input.collected_by != null && input.collected_by !== '') {
+      const n = Number(input.collected_by);
+      collectedBy = Number.isFinite(n) ? n : String(input.collected_by);
+    }
+
+    // eta_status: legacy default sentinel "01" per JobDaoImpl#2387.
+    // FE override permitted via input.eta_status.
+    const etaStatus = input.eta_status ?? '01';
 
     const [ins] = await conn.query(
       `INSERT INTO tbl_job (
          job_desc, fk_customer_id, fk_address_id, fk_client_id,
          fk_service_type_id, fk_service_catg_id, service_type_ids,
          reporting_contact_id,
-         requested_date_time, time_slot, created_date_time, ticket_created_date_time,
-         fk_created_by, job_status, job_owner,
+         requested_date_time, requested_time, time_slot, booking_cut_off_time_slot,
+         created_date_time, ticket_created_date_time,
+         fk_created_by, job_status, job_owner, job_client_owner,
          job_type, source_type, client_ref_id, job_reference_id,
          job_customer_name, client_spoc, client_spoc_name, client_spoc_email,
          additional_name, additional_number,
-         helper_req, remarks, branch_details, last_update_time
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         collected_by, eta_status,
+         original_appointment_date_time, original_appointment_time,
+         helper_req, remarks, efr_special_notes, branch_details, last_update_time
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         input.job_desc || '', // job_desc is NOT NULL in tbl_job; default to empty string
         customerId, addressId, input.fk_client_id,
         input.fk_service_type_id || null, input.fk_service_catg_id || null, serviceTypeIds,
         input.reporting_contact_id || null,
-        input.requested_date_time, input.time_slot || null, new Date(), new Date(),
+        input.requested_date_time, requestedTime, input.time_slot || null, input.booking_cut_off_time_slot || null,
+        new Date(), new Date(),
+        actor?.user_id || null,
         // initial_status — legacy footer-button parity. Defaults to
         // BOOKED (0); operators can pick ENQUIRY (7) or CALL_LATER (9)
         // at the booking modal's footer to route the new row to the
@@ -900,22 +973,27 @@ async function create(input, actor) {
         // call. Validation: only allow the three known codes; anything
         // else falls through to BOOKED so a typo can't accidentally
         // mark a job COMPLETED.
-        actor?.user_id || null,
         ([STATUS.ENQUIRY, STATUS.CALL_LATER].includes(Number(input.initial_status))
           ? Number(input.initial_status)
           : STATUS.BOOKED),
         input.job_owner || actor?.user_id || null,
+        input.job_client_owner ?? null,
         input.job_type || 'Installation', input.source_type || 'manual',
         input.client_ref_id || null, input.job_reference_id || null,
         input.customer?.customer_name || null,
         input.client_spoc || null, input.client_spoc_name || null, input.client_spoc_email || null,
         input.additional_name || null, input.additional_number || null,
+        collectedBy, etaStatus,
+        originalApptDt, originalApptTime,
         input.helper_req ? 1 : 0,
         // remarks: still composed via composeRemarks because
         // product_code + building_name don't exist as columns
         // (only branch_details was verified). They get folded into
         // remarks with named prefixes.
         composeRemarks(input),
+        // efr_special_notes: dedicated column for technician-facing
+        // notes; optional at booking time, also writable via update.
+        input.efr_special_notes || null,
         // branch_details: dedicated column on tbl_job.
         input.branch_details || null,
         new Date(),
@@ -997,10 +1075,13 @@ async function create(input, actor) {
 // ─── Update ─────────────────────────────────────────────────────────
 const MUTABLE_COLUMNS = [
   'job_desc', 'job_type', 'source_type',
-  'requested_date_time', 'time_slot', 'expected_date_time',
-  'job_owner', 'fk_client_id', 'fk_service_type_id', 'fk_service_catg_id',
+  'requested_date_time', 'requested_time', 'time_slot', 'expected_date_time',
+  'job_owner', 'job_client_owner',
+  'fk_client_id', 'fk_service_type_id', 'fk_service_catg_id',
   'reporting_contact_id', 'client_spoc', 'client_spoc_name', 'client_spoc_email',
   'additional_name', 'additional_number',
+  'collected_by',
+  'original_appointment_date_time', 'original_appointment_time',
   'client_ref_id', 'job_reference_id',
   'helper_req', 'remarks', 'efr_special_notes',
   // job_customer_name — Confirm-mode edits write to this job-row
@@ -1018,6 +1099,13 @@ const MUTABLE_COLUMNS = [
   // folded into the `remarks` column with named prefixes (see
   // composeRemarks above).
   'branch_details',
+  /*
+   * eta_status DELIBERATELY OMITTED — per direction 2026-05-25, the
+   * BE writes '01' only on Book Call (the create flow). Update paths
+   * must never touch it. Status transitions through the mobile /eta
+   * endpoint use STATUS_EXTRAS_ALLOWLIST separately. If you find
+   * yourself wanting to add eta_status here, talk to ops first.
+   */
 ];
 
 async function update(jobId, input, actor) {
@@ -1083,6 +1171,22 @@ async function update(jobId, input, actor) {
       if (input.address.city_id      !== undefined) { addrSets.push('city_id = ?');      addrVals.push(input.address.city_id); }
       if (input.address.pin_code     !== undefined) { addrSets.push('pin_code = ?');     addrVals.push(input.address.pin_code); }
       if (input.address.gps_location !== undefined) { addrSets.push('gps_location = ?'); addrVals.push(input.address.gps_location || null); }
+      // address_instruction is column-probed per the matching guard in
+      // insertAddress(). We skip the SET if the column doesn't exist on
+      // the deploy so the UPDATE doesn't fail with Unknown column.
+      if (input.address.address_instruction !== undefined) {
+        const [cols] = await conn.query(
+          `SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME   = 'tbl_address'
+              AND COLUMN_NAME  = 'address_instruction'
+            LIMIT 1`,
+        );
+        if (cols.length > 0) {
+          addrSets.push('address_instruction = ?');
+          addrVals.push(input.address.address_instruction || null);
+        }
+      }
       if (addrSets.length > 0) {
         addrVals.push(existing.fk_address_id);
         await conn.query(`UPDATE tbl_address SET ${addrSets.join(', ')} WHERE address_id = ?`, addrVals);
@@ -1090,26 +1194,78 @@ async function update(jobId, input, actor) {
     }
 
     /*
-     * Services replacement: wipe & re-insert in the same transaction.
-     * Rationale: ops editing an Unconfirmed order may have added/removed
-     * products from the catalog; tracking row-level diffs in the UI is
-     * overkill for a low-volume flow. Full replacement matches legacy
-     * addEditJob behaviour (which re-submits the whole service list).
-     * Empty array == clear all services (legitimate for rollback edits).
+     * Services reconciliation — SOFT-DELETE pattern (2026-05-25, per ops):
+     *
+     *   When services change on an update, we must NOT hard-delete the
+     *   removed rows. Instead:
+     *
+     *     1. Mark every existing tbl_job_services row for this job_id
+     *        as status=0 (soft-deleted).
+     *     2. For each service in the new payload, look for an existing
+     *        row matching (job_id, service_id) — including the just-
+     *        soft-deleted ones — and UPDATE status back to 1, refreshing
+     *        quantity / service_type_id / service_category_id.
+     *     3. Insert any service_id from the payload that has no
+     *        existing row.
+     *
+     *   Effect: removed services persist as status=0 (recoverable for
+     *   audit / "re-add" flows); re-added services reactivate the same
+     *   row (preserving any rate-card linkage); brand-new services land
+     *   as fresh rows. Matches the legacy "re-submit the whole list"
+     *   semantics but without losing history.
      */
     if (hasServicesEdit) {
-      await conn.query('DELETE FROM tbl_job_services WHERE job_id = ?', [jobId]);
-      if (input.services.length > 0) {
-        const rows = input.services.map((svc) => [
-          jobId, svc.service_id, svc.quantity || 1,
-          svc.service_type_id || null, svc.service_category_id || null, 1,
-        ]);
-        await conn.query(
-          `INSERT INTO tbl_job_services
-             (job_id, service_id, quantity, service_type_id, service_category_id, job_service_status)
-           VALUES ?`,
-          [rows]
-        );
+      // 1. Snapshot existing rows so we know which ones to reactivate.
+      const [existing] = await conn.query(
+        'SELECT job_service_id, service_id FROM tbl_job_services WHERE job_id = ?',
+        [jobId],
+      );
+      const existingByService = new Map();
+      for (const r of existing) {
+        // If multiple historical rows share the same service_id, keep
+        // the highest job_service_id (most recent) — that's the one we
+        // reactivate. Older duplicates stay status=0.
+        if (!existingByService.has(r.service_id) ||
+            r.job_service_id > existingByService.get(r.service_id)) {
+          existingByService.set(r.service_id, r.job_service_id);
+        }
+      }
+      // 2. Soft-delete all current rows for the job. Cheaper than a
+      //    per-row diff and matches "remove == status=0".
+      await conn.query(
+        'UPDATE tbl_job_services SET job_service_status = 0 WHERE job_id = ?',
+        [jobId],
+      );
+      // 3. Re-apply each service in the new payload — UPDATE existing
+      //    row if it was previously known, else INSERT.
+      for (const svc of input.services) {
+        const existingId = existingByService.get(svc.service_id);
+        if (existingId) {
+          await conn.query(
+            `UPDATE tbl_job_services
+                SET job_service_status = 1,
+                    quantity = ?,
+                    service_type_id = ?,
+                    service_category_id = ?
+              WHERE job_service_id = ?`,
+            [
+              svc.quantity || 1,
+              svc.service_type_id || null,
+              svc.service_category_id || null,
+              existingId,
+            ],
+          );
+        } else {
+          await conn.query(
+            `INSERT INTO tbl_job_services
+               (job_id, service_id, quantity, service_type_id, service_category_id, job_service_status)
+             VALUES (?, ?, ?, ?, ?, 1)`,
+            [
+              jobId, svc.service_id, svc.quantity || 1,
+              svc.service_type_id || null, svc.service_category_id || null,
+            ],
+          );
+        }
       }
     }
 

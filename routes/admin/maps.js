@@ -103,19 +103,26 @@ router.get('/autocomplete', validate(Joi.object({
 router.get('/geocode', validate(Joi.object({
   place_id: Joi.string().min(5).max(300).optional(),
   address:  Joi.string().min(3).max(500).optional(),
-}).or('place_id', 'address'), 'query'), async (req, res, next) => {
+  // Reverse-geocode variant — accepts "lat,lng" (CSV). Used by the
+  // draggable map marker on Book New Call / Confirm & Schedule so a
+  // pin-drop autopopulates PIN / city / formatted address.
+  latlng:   Joi.string().pattern(/^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/).optional(),
+}).or('place_id', 'address', 'latlng'), 'query'), async (req, res, next) => {
   try {
     const apiKey = process.env.GOOGLE_MAPS_API_KEY;
     if (!apiKey) return modernError(res, 503, 'Google Maps not configured');
     const placeId = req.query.place_id ? String(req.query.place_id) : null;
     const addr    = req.query.address  ? String(req.query.address)  : null;
-    const cacheKey = `gc:${placeId || addr || ''}`.toLowerCase();
+    const latlng  = req.query.latlng   ? String(req.query.latlng)   : null;
+    const cacheKey = `gc:${placeId || addr || latlng || ''}`.toLowerCase();
     const cached = cacheGet(cacheKey);
     if (cached) return modernOk(res, cached);
 
     const param = placeId
       ? `place_id=${encodeURIComponent(placeId)}`
-      : `address=${encodeURIComponent(addr || '')}&components=country:in`;
+      : latlng
+        ? `latlng=${encodeURIComponent(latlng)}`
+        : `address=${encodeURIComponent(addr || '')}&components=country:in`;
     const url = `${MAPS_BASE}/geocode/json?${param}&key=${apiKey}`;
     const r = await fetch(url);
     const data = await r.json();

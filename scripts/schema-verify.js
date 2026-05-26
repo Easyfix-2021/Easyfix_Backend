@@ -26,6 +26,21 @@ const EXPECTED = {
     'full_fillment_created_time', 'no_of_req_foh',
     'reporting_contact_id', 'client_spoc_email',
     'cancel_reason_id', 'cancel_comment', 'cancel_by', 'cancel_date_time',
+    /*
+     * Book-Call column set added 2026-05-25. These are written by
+     * `services/job.service.js#create()` + accepted on UPDATE via
+     * MUTABLE_COLUMNS. Listing them here means a missing column on
+     * any deploy fails the schema parity check at boot instead of
+     * surfacing as a runtime 500 mid-request.
+     */
+    'requested_time', 'time_slot', 'booking_cut_off_time_slot',
+    'service_type_ids', 'fk_service_type_id', 'fk_service_catg_id',
+    'job_customer_name', 'client_spoc', 'client_spoc_name',
+    'additional_name', 'additional_number',
+    'collected_by', 'eta_status', 'paid_by',
+    'original_appointment_date_time', 'original_appointment_time',
+    'job_client_owner', 'helper_req', 'remarks',
+    'efr_special_notes', 'branch_details', 'last_update_time',
   ],
   tbl_job_services: [
     'job_service_id', 'job_id', 'service_id', 'service_type_id', 'service_category_id',

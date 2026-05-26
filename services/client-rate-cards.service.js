@@ -225,10 +225,113 @@ async function deleteOne(rateCardId) {
   return r.affectedRows;
 }
 
+/*
+ * ─── Rate-Card Charge Calculation Formula ─────────────────────────
+ *
+ * Verified against legacy EasyFix_CRM "Edit Client Services" modal +
+ * ops example 2026-05-25:
+ *
+ *   Total Charge = 400
+ *   Easyfix Direct: Fixed=200, Variable=10%
+ *   Overhead:       Fixed=10,  Variable=20%
+ *   Client Share:   Fixed=0,   Variable=0%
+ *
+ *   Cascade (Variable first, then Fixed at each layer):
+ *     start          400
+ *     − 10% (E.Var)  → 360       (deducts  40)
+ *     − 200 (E.Fix)  → 160       (deducts 200)
+ *     − 20% (O.Var)  → 128       (deducts  32)
+ *     − 10  (O.Fix)  → 118       (deducts  10)
+ *     − 0%  (C.Var)  → 118       (deducts   0)
+ *     − 0   (C.Fix)  → 118       (deducts   0)
+ *
+ *   "Easyfix Direct cut" = 40 + 200 = 240
+ *   "Overhead cut"       = 32 +  10 =  42
+ *   "Client Share cut"   = remainder = 118
+ *
+ * In other words: each layer takes a % of what remains, then a flat
+ * Fixed amount. The "Client Share Fixed/Variable" line is the
+ * TRUE-UP/leftover; if its Fixed+Variable are zero, the residual IS
+ * the client's portion.
+ *
+ * Per-quantity rule:
+ *   total_cost  = single-unit total charge (rate-card row × 1)
+ *   total_charge = total_cost × quantity
+ *
+ * Returns a breakdown object:
+ *   {
+ *     totalCharge:      <input>,
+ *     easyfixDirect:    { variableAmt, fixedAmt, total },
+ *     overhead:         { variableAmt, fixedAmt, total },
+ *     clientShare:      { variableAmt, fixedAmt, total },
+ *     remainder:        <after-all-deductions>,
+ *   }
+ */
+function calculateCharges({
+  totalCharge,
+  easyfixDirectFixed = 0, easyfixDirectVariable = 0,
+  overheadFixed      = 0, overheadVariable      = 0,
+  clientFixed        = 0, clientVariable        = 0,
+}) {
+  const toN = (x) => (typeof x === 'number' && Number.isFinite(x)) ? x : Number(x) || 0;
+  let running = toN(totalCharge);
+
+  const eVar = Math.max(0, toN(easyfixDirectVariable));
+  const eFix = Math.max(0, toN(easyfixDirectFixed));
+  const oVar = Math.max(0, toN(overheadVariable));
+  const oFix = Math.max(0, toN(overheadFixed));
+  const cVar = Math.max(0, toN(clientVariable));
+  const cFix = Math.max(0, toN(clientFixed));
+
+  // Easyfix Direct cascade
+  const eVarAmt = running * (eVar / 100);
+  running -= eVarAmt;
+  const eFixAmt = Math.min(running, eFix); // never deduct more than what's left
+  running -= eFixAmt;
+
+  // Overhead cascade
+  const oVarAmt = running * (oVar / 100);
+  running -= oVarAmt;
+  const oFixAmt = Math.min(running, oFix);
+  running -= oFixAmt;
+
+  // Client Share cascade — applied last; remainder is the operator's
+  // true-up bucket (legacy semantics).
+  const cVarAmt = running * (cVar / 100);
+  running -= cVarAmt;
+  const cFixAmt = Math.min(running, cFix);
+  running -= cFixAmt;
+
+  return {
+    totalCharge: toN(totalCharge),
+    easyfixDirect: {
+      variableAmt: round2(eVarAmt),
+      fixedAmt:    round2(eFixAmt),
+      total:       round2(eVarAmt + eFixAmt),
+    },
+    overhead: {
+      variableAmt: round2(oVarAmt),
+      fixedAmt:    round2(oFixAmt),
+      total:       round2(oVarAmt + oFixAmt),
+    },
+    clientShare: {
+      variableAmt: round2(cVarAmt),
+      fixedAmt:    round2(cFixAmt),
+      total:       round2(cVarAmt + cFixAmt),
+    },
+    remainder: round2(running),
+  };
+}
+
+function round2(n) {
+  return Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+}
+
 module.exports = {
   listForClient,
   bulkUpsert,
   deleteOne,
   hasCompositeUniqueKey,
   COST_COLS,
+  calculateCharges,
 };
