@@ -1,0 +1,221 @@
+/*
+ * Client Services — which service categories + types each client buys.
+ *
+ * Backed by `tbl_client_service`:
+ *   client_service_id, client_id, service_category_id,
+ *   service_type_ids (CSV), service_ids (CSV, legacy unused here),
+ *   charge_type, total_charge, service_status
+ *
+ * Performance profile:
+ *
+ *   listForClient(clientId) → **exactly 2 queries**, regardless of how
+ *     many rows the client has. Naive impl would N+1 by re-resolving
+ *     each row's `service_type_ids` CSV one at a time; we instead:
+ *       1. LEFT JOIN tbl_service_catg in the main SELECT → grabs the
+ *          category name in the same query (no second round-trip).
+ *       2. Collect every unique service_type id across all CSVs into a
+ *          Set, run ONE `WHERE service_type_id IN (?)` lookup, build
+ *          a Map<id, name>, merge in JS.
+ *     A client with 10 service categories × 5 service types each = 50
+ *     unique ids → 1 lookup query of 50 rows, not 50 queries.
+ *
+ *   create / update / softDelete → single-statement SQL each.
+ *
+ * Why CSV columns: legacy. Splitting `service_type_ids` into a junction
+ * table would be cleaner but violates the "never alter legacy schema"
+ * rule. The CSV stays; we just handle it carefully.
+ *
+ * Concurrency safety: there's no lock on (client_id, service_category_id)
+ * — the legacy data model allows multiple rows per (client, category)
+ * with different charge_types, so a UNIQUE index would break it. The
+ * route layer doesn't try to dedupe; callers manage it.
+ */
+
+const { pool } = require('../db');
+
+/* ─── CSV helpers ─────────────────────────────────────────────────── */
+
+// Parse `"1,2,3"` (or null/empty) into a deduped sorted numeric array.
+// Tolerates whitespace + non-numeric junk by filtering at parse time.
+function parseCsvIds(raw) {
+  if (raw == null) return [];
+  const s = String(raw).trim();
+  if (!s) return [];
+  const seen = new Set();
+  for (const tok of s.split(',')) {
+    const n = Number(String(tok).trim());
+    if (Number.isInteger(n) && n > 0) seen.add(n);
+  }
+  return Array.from(seen).sort((a, b) => a - b);
+}
+
+// Numeric-array → CSV string for storage. Returns null when empty so
+// the column stores NULL not "".
+function idsToCsv(ids) {
+  if (!Array.isArray(ids) || ids.length === 0) return null;
+  const cleaned = Array.from(new Set(
+    ids.map((x) => Number(x)).filter((n) => Number.isInteger(n) && n > 0),
+  )).sort((a, b) => a - b);
+  return cleaned.length ? cleaned.join(',') : null;
+}
+
+/* ─── Reads ───────────────────────────────────────────────────────── */
+
+/*
+ * List a client's subscribed services. Exactly 2 queries regardless of
+ * row count. Returns rows with:
+ *   {
+ *     client_service_id, client_id, service_category_id,
+ *     service_category_name, service_type_ids: number[],
+ *     service_types: [{ service_type_id, service_type_name }, …],
+ *     charge_type, total_charge, service_status
+ *   }
+ *
+ * Inactive rows (service_status = 0) are filtered by default.
+ */
+async function listForClient(clientId) {
+  // Query 1: main list with category name joined.
+  // LEGACY COLUMNS (verified against ClientDaoImpl.java#670):
+  //   cs.service_catg_id   (NOT `service_category_id`)
+  //   cs.total_amount      (NOT `total_charge`)
+  //   cs.charge_type       (int FK to charge type)
+  //   cs.service_status    (0 = soft-deleted)
+  //   cs.service_type_ids  (CSV)
+  // The 6 cost columns (`easyfix_direct_fixed` etc.) ALSO live on
+  // tbl_client_service — they're surfaced by the Rate Cards tab. We
+  // skip them here to keep this projection lean; Rate Cards joins
+  // through a separate query.
+  // Result aliases preserved (`service_category_id`, `total_charge`) so
+  // FE contract stays stable while the DB stays legacy-shaped.
+  const [rows] = await pool.query(
+    `SELECT cs.client_service_id, cs.client_id,
+            cs.service_catg_id    AS service_category_id,
+            cs.service_type_ids,
+            cs.charge_type,
+            cs.total_amount       AS total_charge,
+            cs.service_status,
+            sc.service_catg_name  AS service_category_name
+       FROM tbl_client_service cs
+       LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = cs.service_catg_id
+      WHERE cs.client_id = ?
+        AND (cs.service_status IS NULL OR cs.service_status <> 0)
+      ORDER BY cs.client_service_id DESC`,
+    [clientId],
+  );
+  if (rows.length === 0) return [];
+
+  // Collect every unique service_type id across all CSVs — single Set.
+  const allTypeIds = new Set();
+  const parsed = rows.map((r) => {
+    const ids = parseCsvIds(r.service_type_ids);
+    ids.forEach((id) => allTypeIds.add(id));
+    return { row: r, ids };
+  });
+
+  // Query 2 (only if any ids to look up): bulk resolve.
+  let nameById = new Map();
+  if (allTypeIds.size > 0) {
+    const idArr = Array.from(allTypeIds);
+    const [typeRows] = await pool.query(
+      `SELECT service_type_id, service_type_name
+         FROM tbl_service_type
+        WHERE service_type_id IN (?)`,
+      [idArr],
+    );
+    nameById = new Map(typeRows.map((t) => [t.service_type_id, t.service_type_name]));
+  }
+
+  return parsed.map(({ row, ids }) => ({
+    client_service_id: row.client_service_id,
+    client_id: row.client_id,
+    service_category_id: row.service_category_id,
+    service_category_name: row.service_category_name,
+    service_type_ids: ids,
+    service_types: ids.map((id) => ({
+      service_type_id: id,
+      service_type_name: nameById.get(id) || null,
+    })),
+    charge_type: row.charge_type,
+    total_charge: row.total_charge,
+    service_status: row.service_status,
+  }));
+}
+
+/* ─── Writes ──────────────────────────────────────────────────────── */
+
+async function create(clientId, body) {
+  const csv = idsToCsv(body.serviceTypeIds);
+  // Real columns on tbl_client_service: service_catg_id + total_amount
+  // (NOT service_category_id + total_charge).
+  const [ins] = await pool.query(
+    `INSERT INTO tbl_client_service
+       (client_id, service_catg_id, service_type_ids,
+        charge_type, total_amount, service_status)
+     VALUES (?, ?, ?, ?, ?, 1)`,
+    [
+      clientId,
+      body.serviceCategoryId,
+      csv,
+      body.chargeType || null,
+      body.totalCharge ?? null,
+    ],
+  );
+  return ins.insertId;
+}
+
+// Partial update. service_type_ids accepted as array → CSV.
+async function update(clientServiceId, body) {
+  const sets = [];
+  const vals = [];
+  if (body.serviceCategoryId !== undefined) {
+    // Real column is `service_catg_id`.
+    sets.push('service_catg_id = ?');
+    vals.push(body.serviceCategoryId);
+  }
+  if (body.serviceTypeIds !== undefined) {
+    sets.push('service_type_ids = ?');
+    vals.push(idsToCsv(body.serviceTypeIds));
+  }
+  if (body.chargeType !== undefined) {
+    sets.push('charge_type = ?');
+    vals.push(body.chargeType);
+  }
+  if (body.totalCharge !== undefined) {
+    // Real column is `total_amount`.
+    sets.push('total_amount = ?');
+    vals.push(body.totalCharge);
+  }
+  if (body.serviceStatus !== undefined) {
+    sets.push('service_status = ?');
+    vals.push(body.serviceStatus);
+  }
+  if (sets.length === 0) {
+    throw Object.assign(new Error('nothing to update'), { status: 400 });
+  }
+  vals.push(clientServiceId);
+  const [r] = await pool.query(
+    `UPDATE tbl_client_service SET ${sets.join(', ')} WHERE client_service_id = ?`,
+    vals,
+  );
+  return r.affectedRows;
+}
+
+// Soft-delete — flip status to 0. Job history that references this
+// row by id stays intact; the FE filters status=0 out.
+async function softDelete(clientServiceId) {
+  const [r] = await pool.query(
+    'UPDATE tbl_client_service SET service_status = 0 WHERE client_service_id = ?',
+    [clientServiceId],
+  );
+  return r.affectedRows;
+}
+
+module.exports = {
+  listForClient,
+  create,
+  update,
+  softDelete,
+  // exported for tests + the rate-cards service which needs the parser
+  parseCsvIds,
+  idsToCsv,
+};

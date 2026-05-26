@@ -1,224 +1,670 @@
+/*
+ * Manage Clients — CRM admin routes.
+ *
+ * Thin route handlers backed by services/client.service.js. Validation
+ * via validators/client.validator.js. RBAC scope filtering via the
+ * existing lib/scope helpers.
+ *
+ * Sub-resources mounted under /:clientId:
+ *   /contacts            (SPOCs)
+ *   /billing             (billing addresses)
+ *   /custom-properties   (free-form key/value)
+ *   /collected-by-preference  (legacy collected_by code → label)
+ *
+ * Permissions:
+ *   - READ routes are open to any authenticated admin-group user
+ *     (the calling user already passed bearer + RBAC scope checks).
+ *   - WRITE routes require either `isClientAddNew` (creation) or
+ *     `isClientEdit` (updates / deletes). Matches the legacy
+ *     EasyFix_CRM permission keyspace.
+ *
+ * Note on requireAction pattern: no shared middleware factory exists
+ * yet — inline `requireClientWrite()` mirrors the pattern in
+ * routes/admin/notices.js#requireNoticeManage. If a generic
+ * `requireAction(key)` middleware lands later, these all migrate
+ * together.
+ */
+
 const router = require('express').Router();
-const Joi = require('joi');
+const multer = require('multer');
 const validate = require('../../middleware/validate');
-const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
 const { buildRequestScope, assertEntityInScope } = require('../../lib/scope');
+const svc = require('../../services/client.service');
+const verticalsSvc = require('../../services/client-verticals.service');
+const docsSvc = require('../../services/client-documents.service');
+const clientServicesSvc = require('../../services/client-services.service');
+const rateCardsSvc = require('../../services/client-rate-cards.service');
+const techMappingSvc = require('../../services/client-tech-mapping.service');
+const xlsxSvc = require('../../services/client-xlsx.service');
+const { pool } = require('../../db');
+const s3 = require('../../utils/s3-storage');
+const v = require('../../validators/client.validator');
 
-// ─── Clients CRUD ───────────────────────────────────────────────────
-router.get('/', async (req, res, next) => {
+// Multer in-memory storage for client document uploads.
+// 10MB cap — same shape as the notice-image route.
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+});
+
+const DOC_MIME = new Set([
+  'image/png', 'image/jpeg', 'image/webp', 'image/gif',
+  'application/pdf',
+]);
+
+/* ─── Permission gates ────────────────────────────────────────────── */
+
+function hasAction(req, key) {
+  const perms = req.user?.permissions?.actionPermissions || [];
+  return perms.includes(key);
+}
+
+function requireClientAdd(req, res, next) {
+  if (!hasAction(req, 'isClientAddNew')) {
+    return modernError(res, 403, 'Missing permission: isClientAddNew');
+  }
+  next();
+}
+
+function requireClientEdit(req, res, next) {
+  if (!hasAction(req, 'isClientEdit')) {
+    return modernError(res, 403, 'Missing permission: isClientEdit');
+  }
+  next();
+}
+
+/* ─── Helper: scope-guard a client by id ──────────────────────────── */
+
+async function loadAndGuardClient(req, res) {
+  const client = await svc.getClientById(req.params.clientId || req.params.id);
+  if (!client) {
+    modernError(res, 404, 'client not found');
+    return null;
+  }
+  const guard = assertEntityInScope(req, {
+    client_id: client.client_id,
+    vertical_id: client.vertical_id,
+  });
+  if (!guard.ok) {
+    modernError(res, 404, 'client not found');
+    return null;
+  }
+  return client;
+}
+
+/* ─── Clients CRUD ────────────────────────────────────────────────── */
+
+router.get('/', validate(v.listClientsQuery, 'query'), async (req, res, next) => {
   try {
-    const { q, includeInactive } = req.query;
-    const clauses = [];
-    const params = [];
+    const extraClauses = [];
+    const extraParams = [];
     // RBAC: restrict the visible client list to the caller's
     // manage_clients AND manage_verticals scope. `clients` directly
     // filters by client_id; `verticals` filters by tbl_client.vertical_id.
     const scope = buildRequestScope(req);
     if (scope?.clients) {
       const c = scope.clients;
-      if (c.mode === 'none') clauses.push('1=0');
+      if (c.mode === 'none') extraClauses.push('1=0');
       else if (c.mode === 'allow' && c.ids.length) {
-        clauses.push(`client_id IN (${c.ids.map(() => '?').join(',')})`);
-        params.push(...c.ids);
+        extraClauses.push(`client_id IN (${c.ids.map(() => '?').join(',')})`);
+        extraParams.push(...c.ids);
       }
     }
     if (scope?.verticals) {
-      const v = scope.verticals;
-      if (v.mode === 'none') clauses.push('1=0');
-      else if (v.mode === 'allow' && v.ids.length) {
-        clauses.push(`vertical_id IN (${v.ids.map(() => '?').join(',')})`);
-        params.push(...v.ids);
+      const vs = scope.verticals;
+      if (vs.mode === 'none') extraClauses.push('1=0');
+      else if (vs.mode === 'allow' && vs.ids.length) {
+        extraClauses.push(`vertical_id IN (${vs.ids.map(() => '?').join(',')})`);
+        extraParams.push(...vs.ids);
       }
     }
-    if (includeInactive !== 'true') clauses.push('client_status = 1');
-    if (q) { clauses.push('client_name LIKE ?'); params.push(`%${q}%`); }
-    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
-    const limit = Math.min(Number(req.query.limit) || 50, 500);
-    const offset = Number(req.query.offset) || 0;
-    params.push(limit, offset);
+    const { items, total } = await svc.listClients({
+      extraClauses,
+      extraParams,
+      includeInactive: req.query.includeInactive === 'true',
+      q: req.query.q,
+      cityId: req.query.cityId ? Number(req.query.cityId) : undefined,
+      limit: req.query.limit,
+      offset: req.query.offset,
+    });
+    // Modern envelope wraps `{items, total}` as the data payload — the
+    // FE reads `data.items` + `data.total`. Backwards-compat note:
+    // the previous shape was a bare array; updated FE callers consume
+    // the new shape. No other internal services consume this route.
+    modernOk(res, { items, total });
+  } catch (e) { next(e); }
+});
+
+/* ─── Exports + Reports (must come BEFORE /:id) ───────────────────── */
+
+/*
+ * GET /admin/clients/export?q=&includeInactive=
+ *
+ * Streams the full client list (no LIMIT — operators need every row
+ * in the export) as XLSX. RBAC scope is applied identically to the
+ * `GET /` list so exports never leak data the operator can't see in
+ * the UI.
+ *
+ * Why one query, no count/round-trip: we just SELECT and pipe.
+ * Operators ask for this on at most ~50k clients per tenant; an XLSX
+ * with 50k rows is ~5MB and ExcelJS produces it in <2s.
+ */
+router.get('/export', async (req, res, next) => {
+  try {
+    const extraClauses = [];
+    const extraParams = [];
+    const scope = buildRequestScope(req);
+    if (scope?.clients) {
+      const c = scope.clients;
+      if (c.mode === 'none') extraClauses.push('1=0');
+      else if (c.mode === 'allow' && c.ids.length) {
+        extraClauses.push(`client_id IN (${c.ids.map(() => '?').join(',')})`);
+        extraParams.push(...c.ids);
+      }
+    }
+    if (scope?.verticals) {
+      const vs = scope.verticals;
+      if (vs.mode === 'none') extraClauses.push('1=0');
+      else if (vs.mode === 'allow' && vs.ids.length) {
+        extraClauses.push(`vertical_id IN (${vs.ids.map(() => '?').join(',')})`);
+        extraParams.push(...vs.ids);
+      }
+    }
+    const { items } = await svc.listClients({
+      extraClauses,
+      extraParams,
+      includeInactive: req.query.includeInactive === 'true',
+      q: req.query.q,
+      limit: 100000, // export ceiling — well above current tenant scale
+      offset: 0,
+    });
+    const buf = await xlsxSvc.exportClientList(items);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="clients-${new Date().toISOString().slice(0, 10)}.xlsx"`);
+    res.send(buf);
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /admin/clients/reports/spoc-list
+ *
+ * Cross-client SPOC roster. Single JOIN — returns every active SPOC
+ * across every client the caller is scoped to see. Used by Finance/Ops
+ * to audit reporting contacts in bulk.
+ *
+ * Returns JSON by default; pass ?format=xlsx for an XLSX download.
+ */
+router.get('/reports/spoc-list', async (req, res, next) => {
+  try {
+    const extraClauses = ['(cc.status IS NULL OR cc.status = 1)'];
+    const extraParams = [];
+    const scope = buildRequestScope(req);
+    if (scope?.clients) {
+      const c = scope.clients;
+      if (c.mode === 'none') extraClauses.push('1=0');
+      else if (c.mode === 'allow' && c.ids.length) {
+        extraClauses.push(`cc.client_id IN (${c.ids.map(() => '?').join(',')})`);
+        extraParams.push(...c.ids);
+      }
+    }
+    if (scope?.verticals) {
+      const vs = scope.verticals;
+      if (vs.mode === 'none') extraClauses.push('1=0');
+      else if (vs.mode === 'allow' && vs.ids.length) {
+        extraClauses.push(`cl.vertical_id IN (${vs.ids.map(() => '?').join(',')})`);
+        extraParams.push(...vs.ids);
+      }
+    }
     const [rows] = await pool.query(
-      `SELECT client_id, client_name, client_email, client_status, client_type, reference_code, booking_cut_off, vertical_id
-         FROM tbl_client ${where} ORDER BY client_name LIMIT ? OFFSET ?`, params);
+      `SELECT cc.id AS contact_id, cc.client_id, cl.client_name,
+              cc.contact_name, cc.contact_email, cc.contact_no,
+              cc.contact_alt_no, cc.contact_desgn, cc.status
+         FROM tbl_client_contacts cc
+         LEFT JOIN tbl_client cl ON cl.client_id = cc.client_id
+        WHERE ${extraClauses.join(' AND ')}
+        ORDER BY cl.client_name ASC, cc.contact_name ASC`,
+      extraParams,
+    );
+    if (req.query.format === 'xlsx') {
+      const buf = await xlsxSvc.exportSpocList(rows);
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="client-spoc-report-${new Date().toISOString().slice(0, 10)}.xlsx"`);
+      return res.send(buf);
+    }
     modernOk(res, rows);
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /admin/clients/bulk-spoc-template
+ *
+ * Xlsx template for the bulk Primary/Secondary SPOC assignment upload.
+ * Columns: clientId, clientName (reference), primaryUserId, secondaryUserId.
+ */
+router.get('/bulk-spoc-template', async (req, res, next) => {
+  try {
+    const buf = await xlsxSvc.buildBulkSpocAssignmentTemplate();
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="client-bulk-spoc-template.xlsx"');
+    res.send(buf);
+  } catch (e) { next(e); }
+});
+
+/*
+ * POST /admin/clients/bulk-upload-spocs   multipart: file=<xlsx>
+ *
+ * Parses an Xlsx of (clientId, primaryUserId, secondaryUserId) rows
+ * and upserts each into tbl_vertical_mapping (user_type=1 for Primary,
+ * user_type=2 for Secondary). Per-row report shape:
+ *   { rowNumber, status: 'updated'|'invalid'|'skipped'|'failed', errors?, reason? }
+ *
+ * Validation per row:
+ *   1. Row shape (clientId + 2 user IDs all positive ints; Primary != Secondary)
+ *   2. Both user IDs exist as active internal users (cached lookup)
+ *
+ * Mirrors the legacy `processClientSpocExcel` semantics but with the
+ * additional dignity of running each row in a TX and returning a
+ * structured per-row report.
+ */
+router.post(
+  '/bulk-upload-spocs',
+  requireClientEdit,
+  upload.single('file'),
+  async (req, res, next) => {
+    try {
+      if (!req.file) return modernError(res, 400, 'missing "file" upload');
+      const { rows } = await xlsxSvc.parseBulkSpocAssignment(req.file.buffer);
+      const validUsers = await verticalsSvc.activeInternalUserIds();
+      const out = { total: rows.length, updated: 0, invalid: 0, skipped: 0, failed: 0 };
+      const results = [];
+      for (const r of rows) {
+        if (r.status === 'invalid') {
+          out.invalid++;
+          results.push({ rowNumber: r.rowNumber, status: 'invalid', errors: r.errors });
+          continue;
+        }
+        const { clientId, primaryUserId, secondaryUserId } = r.payload;
+        // User validity check (legacy parity)
+        const userErrors = [];
+        if (!validUsers.has(primaryUserId))   userErrors.push(`Primary user ${primaryUserId} not found / inactive`);
+        if (!validUsers.has(secondaryUserId)) userErrors.push(`Secondary user ${secondaryUserId} not found / inactive`);
+        if (userErrors.length) {
+          out.invalid++;
+          results.push({ rowNumber: r.rowNumber, status: 'invalid', errors: userErrors });
+          continue;
+        }
+        try {
+          const res2 = await verticalsSvc.upsertPrimarySecondarySpoc(clientId, primaryUserId, secondaryUserId);
+          out.updated++;
+          results.push({ rowNumber: r.rowNumber, status: 'updated', detail: res2 });
+        } catch (e) {
+          if (e.status === 404) {
+            out.skipped++;
+            results.push({ rowNumber: r.rowNumber, status: 'skipped', reason: e.message });
+          } else {
+            out.failed++;
+            results.push({ rowNumber: r.rowNumber, status: 'failed', errors: [e.message] });
+          }
+        }
+      }
+      modernOk(res, { summary: out, results });
+    } catch (e) {
+      if (e.code === 'LIMIT_FILE_SIZE') return modernError(res, 400, 'file exceeds 10MB');
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+/*
+ * GET /admin/clients/spoc-template
+ *
+ * Empty XLSX template for SPOC bulk upload — column headers + one
+ * demo row so operators can copy-edit instead of starting from scratch.
+ */
+router.get('/spoc-template', async (req, res, next) => {
+  try {
+    const buf = await xlsxSvc.buildSpocTemplate();
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="client-spoc-template.xlsx"');
+    res.send(buf);
   } catch (e) { next(e); }
 });
 
 router.get('/:id', async (req, res, next) => {
   try {
-    const [[c]] = await pool.query('SELECT * FROM tbl_client WHERE client_id = ?', [req.params.id]);
+    const c = await svc.getClientById(req.params.id);
     if (!c) return modernError(res, 404, 'client not found');
-    const guard = assertEntityInScope(req, { client_id: c.client_id, vertical_id: c.vertical_id });
+    const guard = assertEntityInScope(req, {
+      client_id: c.client_id,
+      vertical_id: c.vertical_id,
+    });
     if (!guard.ok) return modernError(res, 404, 'client not found');
     modernOk(res, c);
   } catch (e) { next(e); }
 });
 
-router.post('/', validate(Joi.object({
-  clientName: Joi.string().max(255).required(),
-  clientEmail: Joi.string().email().max(255).optional(),
-  clientAddress: Joi.string().max(500).optional(),
-  clientType: Joi.string().max(50).optional(),
-  referenceCode: Joi.string().max(50).optional(),
-  bookingCutOff: Joi.number().integer().optional(),
-})), async (req, res, next) => {
-  try {
-    const [ins] = await pool.query(
-      `INSERT INTO tbl_client (client_name, client_email, client_address, client_type, reference_code, booking_cut_off, client_status, insert_date, update_date, inserted_by)
-       VALUES (?, ?, ?, ?, ?, ?, 1, NOW(), NOW(), ?)`,
-      [req.body.clientName, req.body.clientEmail || null, req.body.clientAddress || null,
-       req.body.clientType || null, req.body.referenceCode || null, req.body.bookingCutOff || null, req.user.user_id]);
-    res.status(201);
-    modernOk(res, { client_id: ins.insertId });
-  } catch (e) { next(e); }
-});
+router.post(
+  '/',
+  requireClientAdd,
+  validate(v.createClientBody),
+  async (req, res, next) => {
+    try {
+      const id = await svc.createClient(req.body, req.user.user_id);
+      res.status(201);
+      modernOk(res, { client_id: id });
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
 
-router.put('/:id', async (req, res, next) => {
-  try {
-    const b = req.body || {};
-    const allowed = ['client_name', 'client_email', 'client_address', 'client_status', 'client_type', 'reference_code', 'booking_cut_off', 'max_orders', 'travel_distance'];
-    const sets = [], vals = [];
-    for (const k of allowed) if (b[k] !== undefined) { sets.push(`${k} = ?`); vals.push(b[k]); }
-    if (sets.length === 0) return modernError(res, 400, 'nothing to update');
-    sets.push('update_date = NOW()', 'updated_by = ?');
-    vals.push(req.user.user_id, req.params.id);
-    await pool.query(`UPDATE tbl_client SET ${sets.join(', ')} WHERE client_id = ?`, vals);
-    modernOk(res, { updated: true });
-  } catch (e) { next(e); }
-});
+router.put(
+  '/:id',
+  requireClientEdit,
+  validate(v.updateClientBody),
+  async (req, res, next) => {
+    try {
+      // Scope-check before mutating.
+      const existing = await svc.getClientById(req.params.id);
+      if (!existing) return modernError(res, 404, 'client not found');
+      const guard = assertEntityInScope(req, {
+        client_id: existing.client_id,
+        vertical_id: existing.vertical_id,
+      });
+      if (!guard.ok) return modernError(res, 404, 'client not found');
+      await svc.updateClient(req.params.id, req.body, req.user.user_id);
+      modernOk(res, { updated: true });
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
 
-// ─── Client Contacts (SPOCs) ────────────────────────────────────────
+/* ─── Client Contacts (SPOCs) ─────────────────────────────────────── */
+
 router.get('/:clientId/contacts', async (req, res, next) => {
   try {
-    const [rows] = await pool.query(
-      'SELECT * FROM tbl_client_contacts WHERE client_id = ? ORDER BY id DESC', [req.params.clientId]);
+    if (!(await loadAndGuardClient(req, res))) return;
+    const rows = await svc.listContacts(req.params.clientId);
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
 
-router.post('/:clientId/contacts', validate(Joi.object({
-  contactName: Joi.string().max(200).required(),
-  contactEmail: Joi.string().email().required(),
-  contactNo: Joi.string().pattern(/^[0-9]{10}$/).required(),
-  contactDesgn: Joi.string().max(100).optional(),
-  managerId: Joi.number().integer().optional(),
-})), async (req, res, next) => {
-  try {
-    const [ins] = await pool.query(
-      `INSERT INTO tbl_client_contacts (client_id, contact_name, contact_email, contact_no, contact_desgn, manager_id, status)
-       VALUES (?, ?, ?, ?, ?, ?, 1)`,
-      [req.params.clientId, req.body.contactName, req.body.contactEmail, req.body.contactNo, req.body.contactDesgn || null, req.body.managerId || null]);
-    res.status(201);
-    modernOk(res, { id: ins.insertId });
-  } catch (e) { next(e); }
-});
+/*
+ * GET /:clientId/contacts/check-duplicate?email=&phone=&excludeId=
+ *
+ * Lightweight dup-check for the FE's inline validation. Returns
+ * `{ duplicate: null | { id, contact_name, contact_email, contact_no } }`.
+ * Mirrors legacy `getClientContactByEmail()` but takes BOTH email and
+ * phone (legacy only took email).
+ */
+router.get(
+  '/:clientId/contacts/check-duplicate',
+  validate(v.contactDuplicateCheckQuery, 'query'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndGuardClient(req, res))) return;
+      const dup = await svc.findDuplicateContact({
+        clientId: Number(req.params.clientId),
+        email: req.query.email,
+        phone: req.query.phone,
+        excludeId: req.query.excludeId ? Number(req.query.excludeId) : undefined,
+      });
+      modernOk(res, { duplicate: dup });
+    } catch (e) { next(e); }
+  },
+);
 
-router.put('/contacts/:id', async (req, res, next) => {
-  try {
-    const b = req.body || {};
-    const allowed = ['contact_name', 'contact_email', 'contact_no', 'contact_alt_no', 'contact_desgn', 'manager_id', 'status'];
-    const sets = [], vals = [];
-    for (const k of allowed) if (b[k] !== undefined) { sets.push(`${k} = ?`); vals.push(b[k]); }
-    if (sets.length === 0) return modernError(res, 400, 'nothing to update');
-    vals.push(req.params.id);
-    await pool.query(`UPDATE tbl_client_contacts SET ${sets.join(', ')} WHERE id = ?`, vals);
-    modernOk(res, { updated: true });
-  } catch (e) { next(e); }
-});
+router.post(
+  '/:clientId/contacts',
+  requireClientEdit,
+  validate(v.createContactBody),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndGuardClient(req, res))) return;
+      const id = await svc.createContact(req.params.clientId, req.body);
+      res.status(201);
+      modernOk(res, { id });
+    } catch (e) {
+      if (e.status) {
+        // Surface the conflicting row so the FE can highlight the
+        // existing contact rather than just showing "409".
+        return modernError(res, e.status, e.message, e.conflict ? { conflict: e.conflict } : undefined);
+      }
+      next(e);
+    }
+  },
+);
 
-// ─── Client Billing ─────────────────────────────────────────────────
+router.put(
+  '/contacts/:id',
+  requireClientEdit,
+  validate(v.updateContactBody),
+  async (req, res, next) => {
+    try {
+      await svc.updateContact(req.params.id, req.body);
+      modernOk(res, { updated: true });
+    } catch (e) {
+      if (e.status) {
+        return modernError(res, e.status, e.message, e.conflict ? { conflict: e.conflict } : undefined);
+      }
+      next(e);
+    }
+  },
+);
+
+/*
+ * POST /:clientId/contacts/bulk-upload  multipart: file=<xlsx>
+ *
+ * Parses an XLSX in-memory, validates rows, attempts to insert each
+ * valid row via the existing contact-create service (which also
+ * dup-checks). Returns a per-row report:
+ *   { summary: { total, created, skipped, invalid },
+ *     results: [{ rowNumber, status, contactId?, errors?, reason? }] }
+ *
+ * No partial-success transaction wrapper — each row is its own write.
+ * Operators get visibility into which rows succeeded so they can
+ * fix the failed ones and re-upload only those.
+ */
+router.post(
+  '/:clientId/contacts/bulk-upload',
+  requireClientEdit,
+  upload.single('file'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndGuardClient(req, res))) return;
+      if (!req.file) return modernError(res, 400, 'missing "file" upload');
+      const { rows } = await xlsxSvc.parseSpocUpload(req.file.buffer);
+      const out = { total: rows.length, created: 0, skipped: 0, invalid: 0 };
+      const results = [];
+      for (const r of rows) {
+        if (r.status === 'invalid') {
+          out.invalid++;
+          results.push({ rowNumber: r.rowNumber, status: 'invalid', errors: r.errors });
+          continue;
+        }
+        try {
+          const id = await svc.createContact(req.params.clientId, r.payload);
+          out.created++;
+          results.push({ rowNumber: r.rowNumber, status: 'created', contactId: id });
+        } catch (e) {
+          // 409 (dup) is "skipped"; everything else is "failed".
+          if (e.status === 409) {
+            out.skipped++;
+            results.push({ rowNumber: r.rowNumber, status: 'skipped', reason: e.message });
+          } else {
+            out.invalid++;
+            results.push({ rowNumber: r.rowNumber, status: 'failed', errors: [e.message] });
+          }
+        }
+      }
+      modernOk(res, { summary: out, results });
+    } catch (e) {
+      if (e.code === 'LIMIT_FILE_SIZE') return modernError(res, 400, 'file exceeds 10MB');
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+router.delete(
+  '/contacts/:id',
+  requireClientEdit,
+  async (req, res, next) => {
+    try {
+      const affected = await svc.deleteContact(req.params.id);
+      if (!affected) return modernError(res, 404, 'contact not found');
+      modernOk(res, { deleted: true });
+    } catch (e) { next(e); }
+  },
+);
+
+/* ─── Client Billing ──────────────────────────────────────────────── */
+
 router.get('/:clientId/billing', async (req, res, next) => {
   try {
-    const [rows] = await pool.query('SELECT * FROM tbl_client_billing WHERE client_id = ?', [req.params.clientId]);
+    if (!(await loadAndGuardClient(req, res))) return;
+    const rows = await svc.listBilling(req.params.clientId);
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
 
-router.post('/:clientId/billing', async (req, res, next) => {
-  try {
-    const b = req.body || {};
-    const [ins] = await pool.query(
-      `INSERT INTO tbl_client_billing (client_id, c_bill_name, c_bill_address, c_bill_comm_addr, c_bill_city_id, c_bill_pin, c_bill_email, c_bill_freq_type, c_bill_payment_cycle)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [req.params.clientId, b.name, b.address, b.commAddr || null, b.cityId, b.pin, b.email || null, b.frequencyType || null, b.paymentCycle || null]);
-    res.status(201);
-    modernOk(res, { c_bill_id: ins.insertId });
-  } catch (e) { next(e); }
-});
+router.post(
+  '/:clientId/billing',
+  requireClientEdit,
+  validate(v.createBillingBody),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndGuardClient(req, res))) return;
+      const id = await svc.createBilling(req.params.clientId, req.body);
+      res.status(201);
+      modernOk(res, { c_bill_id: id });
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
 
-// ─── Client Custom Properties ──────────────────────────────────────
+router.put(
+  '/billing/:id',
+  requireClientEdit,
+  validate(v.updateBillingBody),
+  async (req, res, next) => {
+    try {
+      const affected = await svc.updateBilling(req.params.id, req.body);
+      if (!affected) return modernError(res, 404, 'billing row not found');
+      modernOk(res, { updated: true });
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+router.delete(
+  '/billing/:id',
+  requireClientEdit,
+  async (req, res, next) => {
+    try {
+      const affected = await svc.deleteBilling(req.params.id);
+      if (!affected) return modernError(res, 404, 'billing row not found');
+      modernOk(res, { deleted: true });
+    } catch (e) { next(e); }
+  },
+);
+
+/* ─── Client Custom Properties ────────────────────────────────────── */
+
 /*
- * GET /api/admin/clients/:clientId/custom-properties
+ * GET /:clientId/custom-properties
  *
- * Returns an array of the client's configured custom properties,
- * normalised to a stable shape regardless of underlying column-name
- * conventions in `tbl_client_custom_properties`.
- *
- * Response shape (per row):
- *   { name: string, label: string | null, mandatory: boolean,
- *     value: string | null, raw: <original row> }
- *
- *   - `name` is lowercased + trimmed for case-insensitive lookup
- *     on the FE. Common variants accepted: property_name / name /
- *     key / field_name.
- *   - `mandatory` accepts: is_mandatory / mandatory / required /
- *     is_required. Coerced to boolean (1/0, true/false, "1"/"0",
- *     "yes"/"no" all handled).
- *   - `label` is optional display text. Falls back to null; the FE
- *     decides the user-facing label per property name.
- *   - `value` is the configured property value (if any). May drive
- *     things like "preferred Collected By" — see the dedicated
- *     `/collected-by-preference` endpoint for that case.
- *   - `raw` is the entire DB row, kept so future fields don't need
- *     a BE change to surface — FE can drill in.
- *
- * Drives in the Book-New-Call flow:
- *   - Whether to render the "Branch Details", "Property / Building
- *     Name", "Product Code" inputs at all (only when the
- *     corresponding property row exists for this client).
- *   - Whether each rendered input is required (driven by `mandatory`).
+ * Returns the normalised shape used by Book-New-Call. See the long
+ * comment in the previous revision for the rationale — kept identical
+ * here so consumers don't break.
  */
 router.get('/:clientId/custom-properties', async (req, res, next) => {
   try {
-    const [rows] = await pool.query('SELECT * FROM tbl_client_custom_properties WHERE client_id = ?', [req.params.clientId]);
-    const truthy = (v) => {
-      if (v == null) return false;
-      if (typeof v === 'boolean') return v;
-      if (typeof v === 'number') return v !== 0;
-      const s = String(v).trim().toLowerCase();
+    if (!(await loadAndGuardClient(req, res))) return;
+    const rows = await svc.listCustomProperties(req.params.clientId);
+    const truthy = (val) => {
+      if (val == null) return false;
+      if (typeof val === 'boolean') return val;
+      if (typeof val === 'number') return val !== 0;
+      const s = String(val).trim().toLowerCase();
       return s === '1' || s === 'true' || s === 'yes' || s === 'y';
     };
     const normalised = rows.map((r) => ({
+      // legacy table has variant column names — keep the fallback chain
       name: String(r.property_name ?? r.name ?? r.key ?? r.field_name ?? '').toLowerCase().trim(),
       label: r.property_label ?? r.label ?? r.display_name ?? null,
       mandatory: truthy(r.is_mandatory ?? r.mandatory ?? r.required ?? r.is_required ?? r.is_required_field),
       value: r.property_value ?? r.value ?? r.field_value ?? null,
+      // Surface the row id so the FE edit/delete flows have a target.
+      id: r.id,
       raw: r,
     })).filter((p) => p.name);
     modernOk(res, normalised);
   } catch (e) { next(e); }
 });
 
+router.post(
+  '/:clientId/custom-properties',
+  requireClientEdit,
+  validate(v.createCustomPropertyBody),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndGuardClient(req, res))) return;
+      const id = await svc.createCustomProperty(req.params.clientId, req.body);
+      res.status(201);
+      modernOk(res, { id });
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+router.put(
+  '/custom-properties/:id',
+  requireClientEdit,
+  validate(v.updateCustomPropertyBody),
+  async (req, res, next) => {
+    try {
+      const affected = await svc.updateCustomProperty(req.params.id, req.body);
+      if (!affected) return modernError(res, 404, 'custom property not found');
+      modernOk(res, { updated: true });
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+router.delete(
+  '/custom-properties/:id',
+  requireClientEdit,
+  async (req, res, next) => {
+    try {
+      const affected = await svc.deleteCustomProperty(req.params.id);
+      if (!affected) return modernError(res, 404, 'custom property not found');
+      modernOk(res, { deleted: true });
+    } catch (e) { next(e); }
+  },
+);
+
+/* ─── Collected-By Preference ─────────────────────────────────────── */
+
 /*
- * GET /api/admin/clients/:clientId/collected-by-preference
+ * GET /:clientId/collected-by-preference
  *
- * Returns the client's preferred "Collected By" setting for new
- * bookings. Drives the lock state of the "Collected By" dropdown in
- * the Book-New-Call modal:
- *   - preferred = null                 → dropdown enabled, all options
- *   - preferred = "Easyfixer"          → preselected + disabled
- *   - preferred = "Easyfix"            → preselected + disabled
- *   - preferred = "Client"             → preselected + disabled
- *
- * Source: `tbl_client.collected_by` integer column. Confirmed by ops
- * 2026-05-18 via `SELECT DISTINCT collected_by FROM tbl_client`:
- *   0 = any  (no lock — operator picks)
- *   1 = Easyfixer
- *   2 = Easyfix
- *   3 = Client
- * Anything else (NULL, unknown value) → treated as "any" so a future
- * code value doesn't break the booking flow before this map is
- * updated.
+ * Preserves the existing endpoint contract — the Book-New-Call flow
+ * depends on this exact shape ({ preferred, source }). Code unchanged
+ * from the previous revision.
  */
 const COLLECTED_BY_MAP = {
   1: 'Easyfixer',
@@ -232,36 +678,389 @@ router.get('/:clientId/collected-by-preference', async (req, res, next) => {
     if (!Number.isInteger(clientId) || clientId <= 0) {
       return modernError(res, 400, 'invalid clientId');
     }
-
     let preferred = null;
     let source = 'default';
     try {
-      const [rows] = await pool.query(
-        'SELECT collected_by FROM tbl_client WHERE client_id = ? LIMIT 1',
-        [clientId],
-      );
-      if (rows.length) {
-        const code = Number(rows[0].collected_by);
+      const row = await svc.getClientById(clientId);
+      if (row) {
+        const code = Number(row.collected_by);
         if (Number.isFinite(code) && COLLECTED_BY_MAP[code]) {
           preferred = COLLECTED_BY_MAP[code];
           source = 'client';
         } else if (code === 0) {
-          // Explicit "any" — still a configured value, not the absence
-          // of one. Surfaced as source=client so callers can tell the
-          // difference vs. an unknown/missing field.
           preferred = null;
           source = 'client';
         }
       }
     } catch (e) {
-      // Defensive: if the `collected_by` column doesn't exist on this
-      // DB's `tbl_client`, fall back to "any" rather than 500.
+      // Defensive: if collected_by column doesn't exist on this DB,
+      // fall back to "any" rather than 500.
       // eslint-disable-next-line no-console
       console.warn('[collected-by-pref] tbl_client.collected_by read failed — falling back to "any":', e?.message);
     }
-
     modernOk(res, { preferred, source });
   } catch (e) { next(e); }
 });
+
+/* ─── Vertical Mapping (per-client) ───────────────────────────────── */
+
+/*
+ * GET /:clientId/verticals
+ *
+ * Returns the list of (vertical, user, user_type) assignments for the
+ * client, joined to tbl_vertical (name) and tbl_user (display name +
+ * email). user_type column is tolerated absent — returned as null.
+ */
+router.get('/:clientId/verticals', async (req, res, next) => {
+  try {
+    if (!(await loadAndGuardClient(req, res))) return;
+    const rows = await verticalsSvc.listForClient(req.params.clientId);
+    modernOk(res, rows);
+  } catch (e) { next(e); }
+});
+
+/*
+ * PUT /:clientId/verticals
+ * Body: { assignments: [{ verticalId, userId, userType? }] }
+ *
+ * Replace-set semantics — the legacy UI saves the whole assignment
+ * grid at once. Transactionally deletes existing rows for the client
+ * and re-inserts. Empty assignments array clears all mappings.
+ */
+/*
+ * PUT /:clientId/verticals/upsert-spoc
+ *   { primaryUserId, secondaryUserId }
+ *
+ * Upserts the (Primary, Secondary) SPOC pair for ONE client. Used by
+ * the Add Client form and the inline edit on the client detail. Backed
+ * by `verticalsSvc.upsertPrimarySecondarySpoc` — single TX, two
+ * statements (one per role) with INSERT-or-UPDATE semantics keyed on
+ * `(client_id, user_type)`.
+ */
+router.put(
+  '/:clientId/verticals/upsert-spoc',
+  requireClientEdit,
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndGuardClient(req, res))) return;
+      const primaryUserId   = Number(req.body?.primaryUserId);
+      const secondaryUserId = Number(req.body?.secondaryUserId);
+      if (!Number.isInteger(primaryUserId) || primaryUserId <= 0) {
+        return modernError(res, 400, 'primaryUserId is required');
+      }
+      if (!Number.isInteger(secondaryUserId) || secondaryUserId <= 0) {
+        return modernError(res, 400, 'secondaryUserId is required');
+      }
+      if (primaryUserId === secondaryUserId) {
+        return modernError(res, 400, 'Primary and Secondary SPOC must be different users');
+      }
+      const result = await verticalsSvc.upsertPrimarySecondarySpoc(
+        req.params.clientId, primaryUserId, secondaryUserId,
+      );
+      modernOk(res, result);
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+router.put(
+  '/:clientId/verticals',
+  requireClientEdit,
+  validate(v.replaceVerticalsBody),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndGuardClient(req, res))) return;
+      const written = await verticalsSvc.replaceForClient(req.params.clientId, req.body.assignments);
+      modernOk(res, { written });
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+/* ─── Client Services (catalog of category + service types) ───────── */
+
+/*
+ * GET /:clientId/services
+ *
+ * Returns the client's subscribed services with category name AND
+ * resolved service-type names attached per row. Designed as exactly
+ * 2 SQL queries regardless of row count — see service-layer notes.
+ */
+router.get('/:clientId/services', async (req, res, next) => {
+  try {
+    if (!(await loadAndGuardClient(req, res))) return;
+    const rows = await clientServicesSvc.listForClient(req.params.clientId);
+    modernOk(res, rows);
+  } catch (e) { next(e); }
+});
+
+router.post(
+  '/:clientId/services',
+  requireClientEdit,
+  validate(v.createClientServiceBody),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndGuardClient(req, res))) return;
+      const id = await clientServicesSvc.create(req.params.clientId, req.body);
+      res.status(201);
+      modernOk(res, { client_service_id: id });
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+router.put(
+  '/services/:id',
+  requireClientEdit,
+  validate(v.updateClientServiceBody),
+  async (req, res, next) => {
+    try {
+      const affected = await clientServicesSvc.update(req.params.id, req.body);
+      if (!affected) return modernError(res, 404, 'client service not found');
+      modernOk(res, { updated: true });
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+router.delete(
+  '/services/:id',
+  requireClientEdit,
+  async (req, res, next) => {
+    try {
+      const affected = await clientServicesSvc.softDelete(req.params.id);
+      if (!affected) return modernError(res, 404, 'client service not found');
+      modernOk(res, { deleted: true });
+    } catch (e) { next(e); }
+  },
+);
+
+/* ─── Client Rate Cards ───────────────────────────────────────────── */
+
+/*
+ * GET /:clientId/rate-cards → 1-query list.
+ * PUT /:clientId/rate-cards → bulk-upsert. Body: { rows: [...] }.
+ * DELETE /rate-cards/:id    → remove a single row.
+ *
+ * The bulk-upsert is one INSERT … ON DUPLICATE KEY UPDATE — saving the
+ * entire rate-card grid (potentially 50+ service types) costs ONE DB
+ * round-trip. See services/client-rate-cards.service.js for why we
+ * probe the composite-unique-key presence + how degradation works.
+ */
+router.get('/:clientId/rate-cards', async (req, res, next) => {
+  try {
+    if (!(await loadAndGuardClient(req, res))) return;
+    const rows = await rateCardsSvc.listForClient(req.params.clientId);
+    modernOk(res, rows);
+  } catch (e) { next(e); }
+});
+
+router.put(
+  '/:clientId/rate-cards',
+  requireClientEdit,
+  validate(v.bulkUpsertRateCardsBody),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndGuardClient(req, res))) return;
+      const affected = await rateCardsSvc.bulkUpsert(req.params.clientId, req.body.rows);
+      modernOk(res, { affected });
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+/*
+ * GET /:clientId/rate-cards/download
+ * Streams the client's rate card grid as XLSX with type names joined.
+ */
+router.get('/:clientId/rate-cards/download', async (req, res, next) => {
+  try {
+    const client = await loadAndGuardClient(req, res);
+    if (!client) return;
+    const rows = await rateCardsSvc.listForClient(req.params.clientId);
+    const buf = await xlsxSvc.exportRateCards(client.client_name, rows);
+    const safeName = String(client.client_name || `client-${client.client_id}`).replace(/[^a-z0-9_-]+/gi, '_');
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="rate-cards-${safeName}.xlsx"`);
+    res.send(buf);
+  } catch (e) { next(e); }
+});
+
+router.delete(
+  '/rate-cards/:id',
+  requireClientEdit,
+  async (req, res, next) => {
+    try {
+      const affected = await rateCardsSvc.deleteOne(req.params.id);
+      if (!affected) return modernError(res, 404, 'rate card not found');
+      modernOk(res, { deleted: true });
+    } catch (e) { next(e); }
+  },
+);
+
+/* ─── Technician Mapping (client × service_type × technician) ─────── */
+
+/*
+ * GET    /:clientId/tech-mapping
+ *   → 2-query list of mappings with tech name + city + service-type name.
+ *
+ * GET    /:clientId/tech-mapping/eligible?serviceTypeId=&cityName=…
+ *   → 1-query eligibility picker (active + verified techs by default).
+ *
+ * PUT    /:clientId/tech-mapping
+ *   → Replace-set TX for one (client, service_type) cell.
+ *     Body: { serviceTypeId, efrIds: [...] }
+ */
+router.get('/:clientId/tech-mapping', async (req, res, next) => {
+  try {
+    if (!(await loadAndGuardClient(req, res))) return;
+    const rows = await techMappingSvc.listForClient(req.params.clientId);
+    modernOk(res, rows);
+  } catch (e) { next(e); }
+});
+
+router.get(
+  '/:clientId/tech-mapping/eligible',
+  validate(v.eligibleTechsQuery, 'query'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndGuardClient(req, res))) return;
+      const techs = await techMappingSvc.eligibleTechsFor(
+        Number(req.query.serviceTypeId),
+        {
+          cityId: req.query.cityId ? Number(req.query.cityId) : undefined,
+          cityName: req.query.cityName,
+          query: req.query.query,
+          includeUnverified: req.query.includeUnverified === 'true',
+        },
+      );
+      modernOk(res, techs);
+    } catch (e) { next(e); }
+  },
+);
+
+router.put(
+  '/:clientId/tech-mapping',
+  requireClientEdit,
+  validate(v.replaceTechMappingBody),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndGuardClient(req, res))) return;
+      const n = await techMappingSvc.replaceForServiceType(
+        req.params.clientId,
+        req.body.serviceTypeId,
+        req.body.efrIds,
+      );
+      modernOk(res, { assigned: n });
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+/* ─── Client Documents (PAN / TAN / GSTIN / Aadhaar / other) ──────── */
+
+/*
+ * GET /:clientId/documents
+ *
+ * Lists active documents with presigned URLs ready for <img>/<a href>.
+ * Returns 503 with a clear message if tbl_client_document hasn't been
+ * provisioned yet (run migrations/2026-05-25-create-client-documents.sql).
+ */
+router.get('/:clientId/documents', async (req, res, next) => {
+  try {
+    if (!(await loadAndGuardClient(req, res))) return;
+    const rows = await docsSvc.listForClient(req.params.clientId);
+    modernOk(res, rows);
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
+/*
+ * POST /:clientId/documents/upload
+ *   multipart/form-data:
+ *     file      = <binary; required, PNG/JPEG/WEBP/GIF/PDF>
+ *     docType   = 'pan' | 'tan' | 'gstin' | 'aadhaar' | 'other'   (required)
+ *     docLabel  = free-form label (optional)
+ *
+ * Two-step flow:
+ *   1. Upload bytes to S3 (ClientDocs/<ts>_<rand>)
+ *   2. Record metadata in tbl_client_document
+ *
+ * Returns the inserted row's id + key + presigned URL.
+ *
+ * S3 must be configured (S3_BUCKET_NAME). Unlike notices, there's no
+ * local-disk fallback here because we expect production-only usage
+ * for sensitive docs like PAN/Aadhaar.
+ */
+router.post(
+  '/:clientId/documents/upload',
+  requireClientEdit,
+  upload.single('file'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndGuardClient(req, res))) return;
+      if (!req.file) return modernError(res, 400, 'missing "file" upload');
+      if (!DOC_MIME.has(req.file.mimetype)) {
+        return modernError(res, 400, `mimetype "${req.file.mimetype}" is not allowed; use PNG/JPEG/WEBP/GIF/PDF`);
+      }
+      const docType = String(req.body.docType || '').toLowerCase();
+      if (!['pan', 'tan', 'gstin', 'aadhaar', 'other'].includes(docType)) {
+        return modernError(res, 400, 'docType must be pan|tan|gstin|aadhaar|other');
+      }
+      if (!s3.isEnabled()) {
+        return modernError(res, 503, 'S3 storage not configured for client documents');
+      }
+      const s3Key = await s3.putClientDocument({
+        buffer: req.file.buffer,
+        contentType: req.file.mimetype,
+        originalName: req.file.originalname,
+      });
+      const documentId = await docsSvc.recordUpload(req.params.clientId, {
+        docType,
+        docLabel: req.body.docLabel || null,
+        s3Key,
+        originalFilename: req.file.originalname,
+        contentType: req.file.mimetype,
+        uploadedBy: req.user.user_id,
+      });
+      const url = await s3.resolveClientDocumentUrl(s3Key).catch(() => null);
+      res.status(201);
+      modernOk(res, { document_id: documentId, s3_key: s3Key, url });
+    } catch (e) {
+      if (e.code === 'LIMIT_FILE_SIZE') return modernError(res, 400, 'file exceeds 10MB');
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+router.delete(
+  '/documents/:id',
+  requireClientEdit,
+  async (req, res, next) => {
+    try {
+      const affected = await docsSvc.softDelete(req.params.id);
+      if (!affected) return modernError(res, 404, 'document not found');
+      modernOk(res, { deleted: true });
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
 
 module.exports = router;

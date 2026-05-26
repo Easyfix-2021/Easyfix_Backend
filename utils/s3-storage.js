@@ -462,6 +462,73 @@ async function resolveNoticeImageUrl(storedValue) {
   return `${fileBase}/${stored.replace(/^\/+/, '')}`;
 }
 
+/* ─── Client Documents (Manage Clients → Documents tab, 2026-05-25) ─── */
+
+/*
+ * Keys land under the `ClientDocs/` prefix to keep the bucket browsable
+ * by feature (Notices/, ClientDocs/, Jobs/, …). Same key shape as
+ * buildNoticeKey: timestamp + 8 hex chars, no extension (Content-Type
+ * carries the MIME, original filename lives in object metadata).
+ */
+function buildClientDocKey() {
+  const crypto = require('crypto');
+  const ts = Date.now();
+  const rand = crypto.randomBytes(4).toString('hex');
+  return `ClientDocs/${ts}_${rand}`;
+}
+
+/*
+ * Upload a client document (PAN / TAN / GSTIN / Aadhaar / other) to S3.
+ * Returns the stored key — the caller persists it into tbl_client_document.
+ *
+ * Mirrors putNoticeImage: strict guard on isEnabled(), MIME allowed at the
+ * route layer, original filename preserved in metadata for download UX.
+ */
+async function putClientDocument({ buffer, contentType, originalName }) {
+  if (!isEnabled()) throw new Error('S3 is not configured (S3_BUCKET_NAME unset)');
+  const { PutObjectCommand } = require('@aws-sdk/client-s3');
+  const Key = buildClientDocKey();
+  const Metadata = {};
+  if (originalName) {
+    const safe = String(originalName).replace(/[^\x20-\x7E]/g, '_').slice(0, 200);
+    Metadata['original-filename'] = safe;
+  }
+  await client().send(new PutObjectCommand({
+    Bucket: BUCKET,
+    Key,
+    Body: buffer,
+    ContentType: contentType || 'application/octet-stream',
+    Metadata,
+  }));
+  return Key;
+}
+
+/*
+ * Resolve a stored client-document value (S3 key, local URL, or HTTP
+ * URL) to a publicly-loadable URL. Same shape as resolveNoticeImageUrl
+ * but keyed on the ClientDocs/ prefix.
+ *
+ * Documents are typically PDFs or images; we don't probe HEAD (signing
+ * is cheap, the FE will see a 403 if the key is stale).
+ */
+async function resolveClientDocumentUrl(storedValue) {
+  const stored = String(storedValue || '').trim();
+  if (!stored) return null;
+  if (/^https?:\/\//i.test(stored)) return stored;
+  if (stored.startsWith('/')) return stored;
+  if (isEnabled() && stored.startsWith('ClientDocs/')) {
+    try {
+      return await getPresignedUrl(stored);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn('s3-storage.resolveClientDocumentUrl: presign failed', { stored, err: e?.message });
+      return null;
+    }
+  }
+  const fileBase = process.env.FILE_BASE_URL || '/easydoc';
+  return `${fileBase}/${stored.replace(/^\/+/, '')}`;
+}
+
 module.exports = {
   isEnabled,
   bucketName,
@@ -475,4 +542,7 @@ module.exports = {
   // Notice Board (2026-05-22):
   putNoticeImage,
   resolveNoticeImageUrl,
+  // Client Documents (2026-05-25):
+  putClientDocument,
+  resolveClientDocumentUrl,
 };
