@@ -1393,6 +1393,32 @@ async function hasSendBackToTxColumn() {
   return _sendBackColumnExists;
 }
 
+/*
+ * Column-presence probe for the ENQUIRY enrichment trio on tbl_job:
+ *   enquiry_reason_id, enquiry_comment, enquiry_date_time.
+ *
+ * Cached in module-scope after the first hit. Probes all three at once
+ * (single SELECT) and returns true only if ALL three are present —
+ * partial-deploy state would cause SQL "Unknown column" errors mid-
+ * UPDATE, so it's safer to treat any missing one as the legacy shape.
+ */
+let _enquiryColumnsExist = null;
+async function hasEnquiryColumns() {
+  if (_enquiryColumnsExist != null) return _enquiryColumnsExist;
+  try {
+    const [rows] = await pool.query(
+      `SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME   = 'tbl_job'
+          AND COLUMN_NAME IN ('enquiry_reason_id', 'enquiry_comment', 'enquiry_date_time')`,
+    );
+    _enquiryColumnsExist = rows[0].n === 3;
+  } catch {
+    _enquiryColumnsExist = false;
+  }
+  return _enquiryColumnsExist;
+}
+
 async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
   if (!ALL_STATUS_VALUES.has(Number(status))) {
     const err = new Error(`invalid status ${status}; allowed: ${[...ALL_STATUS_VALUES].join(',')}`);
@@ -1410,6 +1436,30 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
   if (Number(status) === STATUS.CANCELLED) {
     sets.push('cancel_date_time = ?', 'cancel_reason_id = ?', 'cancel_comment = ?', 'cancel_by = ?');
     values.push(new Date(), reasonId || null, comment || null, actorId);
+  } else if (Number(status) === STATUS.ENQUIRY) {
+    // ENQUIRY stamps a parallel set of columns to CANCELLED:
+    //   enquiry_date_time = NOW()
+    //   enquiry_reason_id  = action_taken_reason.id picked in the dialog
+    //   enquiry_comment    = the prefix string the FE built
+    //   cancel_by          = actor (same column reused — legacy ops use it
+    //                        as a generic "who actioned this" stamp for
+    //                        both ENQUIRY and CANCELLED transitions)
+    //
+    // Column-probe at runtime: enquiry_* columns may not exist on every
+    // deploy (legacy DBs without the 2024 ENQUIRY enrichment). Only
+    // append a SET when the column is actually present so the UPDATE
+    // doesn't fail with "Unknown column" — the status itself still
+    // lands even on older deploys.
+    if (await hasEnquiryColumns()) {
+      sets.push('enquiry_date_time = ?', 'enquiry_reason_id = ?', 'enquiry_comment = ?', 'cancel_by = ?');
+      values.push(new Date(), reasonId || null, comment || null, actorId);
+    } else {
+      // Older deploy: at minimum stamp `cancel_by` (the column is
+      // documented on every deploy) so audit trail still records WHO
+      // did the ENQUIRY transition.
+      sets.push('cancel_by = ?');
+      values.push(actorId);
+    }
   } else if (COMPLETED_STATES.has(Number(status))) {
     sets.push('checkout_date_time = COALESCE(checkout_date_time, ?)', 'fk_checkout_by = COALESCE(fk_checkout_by, ?)');
     values.push(new Date(), actorId);
