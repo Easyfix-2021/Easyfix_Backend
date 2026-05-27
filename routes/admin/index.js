@@ -4,6 +4,7 @@ const requireAuth = require('../../middleware/auth');
 const { role } = require('../../middleware/role');
 const { buildRequestScopeWithHierarchy } = require('../../lib/scope');
 const maskMobile = require('../../middleware/mask-mobile');
+const rejectMaskedMobile = require('../../middleware/reject-masked-mobile');
 const { pool } = require('../../db');
 
 /*
@@ -28,6 +29,12 @@ const { pool } = require('../../db');
 router.use(requireAuth);
 router.use(role(['admin']));
 router.use(maskMobile);
+// Reject any incoming POST/PATCH/PUT whose body contains a masked mobile
+// value (a string with the • bullet at a known MOBILE_FIELDS key). The
+// outbound mask wraps response data; this inbound guard prevents that
+// masked data from round-tripping into a write. See
+// middleware/reject-masked-mobile.js for the full rationale.
+router.use(rejectMaskedMobile);
 router.use(async (req, _res, next) => {
   // Hierarchy-aware scope: own manage_* ∪ every direct/indirect report's
   // manage_*. Bypass roles (Admin/Finance) get `undefined` = no row filter.

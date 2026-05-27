@@ -529,6 +529,35 @@ async function resolveClientDocumentUrl(storedValue) {
   return `${fileBase}/${stored.replace(/^\/+/, '')}`;
 }
 
+/*
+ * Generic best-effort delete by S3 key. Used by the Job Image DELETE
+ * endpoint (2026-05-28) so the operator-driven "X" on an already-
+ * uploaded image tile also reclaims storage. Soft-fails on missing
+ * object / permission errors so the DB row removal can still proceed.
+ *
+ * Accepts ONLY a key under the configured bucket — callers pass the
+ * raw `tbl_job_image.image` value verbatim. If the value happens to be
+ * a bare filename (legacy local-only row), we skip the S3 call and
+ * return `{ deleted: false, reason: 'not-s3' }` so the caller knows to
+ * unlink the local file instead.
+ */
+async function deleteObject(key) {
+  if (!isEnabled()) return { deleted: false, reason: 'disabled' };
+  const stored = String(key || '').trim();
+  if (!stored) return { deleted: false, reason: 'empty-key' };
+  // Bare filename (no `/`) means a legacy local row — not an S3 object.
+  if (!stored.includes('/')) return { deleted: false, reason: 'not-s3' };
+  try {
+    const { DeleteObjectCommand } = require('@aws-sdk/client-s3');
+    await client().send(new DeleteObjectCommand({ Bucket: BUCKET, Key: stored }));
+    return { deleted: true };
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn('s3-storage.deleteObject: failed', { key: stored, err: e?.message });
+    return { deleted: false, reason: 'error', error: e?.message };
+  }
+}
+
 module.exports = {
   isEnabled,
   bucketName,
@@ -539,6 +568,7 @@ module.exports = {
   resolveImageUrl,
   shouldMigrateLegacy,
   migrateLegacyToS3,
+  deleteObject,
   // Notice Board (2026-05-22):
   putNoticeImage,
   resolveNoticeImageUrl,

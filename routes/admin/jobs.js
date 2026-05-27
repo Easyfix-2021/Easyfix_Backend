@@ -984,6 +984,32 @@ router.post('/', validate(createBody), async (req, res, next) => {
       city_id:   req.body.address?.city_id,
     });
     if (!guard.ok) return modernError(res, 403, 'cannot create a job outside your assigned scope');
+
+    /*
+     * Services-required gate (added 2026-05-28 after Job #482453 was
+     * booked with zero services).
+     *
+     * A job created in BOOKED status (initial_status undefined or 0)
+     * MUST carry at least one service row. Without this the
+     * technician arrives on-site with no scope to execute against;
+     * legacy CRM enforced this and the migration missed it.
+     *
+     * Outcome variants (Enquiry=7, Unconfirmed/CallLater=9) are
+     * intentionally exempt — those represent pre-confirmation states
+     * where the operator hasn't collected service intent yet.
+     */
+    const isBookedStatus = req.body.initial_status === undefined || req.body.initial_status === 0;
+    const hasServices = Array.isArray(req.body.services) && req.body.services.length > 0;
+    if (isBookedStatus && !hasServices) {
+      return modernError(
+        res,
+        400,
+        'At least one service is required to create a job in BOOKED status. '
+        + 'Provide services[] in the payload, or set initial_status to 7 (Enquiry) '
+        + 'or 9 (Unconfirmed) to defer service selection.',
+      );
+    }
+
     const created = await job.create(req.body, req.user);
     res.status(201);
     modernOk(res, created, 'job created');
@@ -1007,6 +1033,34 @@ router.patch('/:id', validate(idParam, 'params'), validate(updateBody), scopedJo
 
 router.patch('/:id/status', validate(idParam, 'params'), validate(statusBody), scopedJob, async (req, res, next) => {
   try {
+    /*
+     * Services-required gate on the BOOKED transition (added 2026-05-28).
+     * When a job is being promoted to status=0 (typically 9 → 0 from the
+     * Confirm & Schedule flow), require at least one tbl_job_services row.
+     * The FE Confirm flow PATCHes services on /:id immediately before
+     * this status call, so by the time we get here the rows should be
+     * there; if not, we reject with a clear message rather than allow a
+     * service-less BOOKED row to land. Mirrors the create-flow guard
+     * above. Pairs with the FE confirmBookReady gate.
+     */
+    if (Number(req.body?.status) === 0) {
+      const { pool } = require('../../db');
+      const [rows] = await pool.query(
+        'SELECT COUNT(*) AS n FROM tbl_job_services WHERE job_id = ?',
+        [req.params.id],
+      );
+      const serviceCount = Number(rows?.[0]?.n ?? 0);
+      if (serviceCount === 0) {
+        return modernError(
+          res,
+          400,
+          'Cannot transition to BOOKED with zero services attached. '
+          + 'Add at least one service to the job (PATCH /:id with services[]) '
+          + 'before promoting the status.',
+        );
+      }
+    }
+
     const updated = await job.setStatus(req.params.id, req.body, req.user);
     modernOk(res, updated, 'job status updated');
   } catch (e) { next(e); }
@@ -1931,5 +1985,109 @@ router.get('/images/:imageId/file', async (req, res, next) => {
     return modernError(res, 404, 'image file not found in S3 or on local disk');
   } catch (e) { next(e); }
 });
+
+/*
+ * DELETE /api/admin/jobs/images/:imageId
+ *
+ * Operator-driven image removal (2026-05-28). Mirrors the staging-tile
+ * X on JobModal's Confirm/Edit picker so already-uploaded images can be
+ * removed from the Images tab in view mode too.
+ *
+ * Flow:
+ *   1. Resolve tbl_job_image row → owning job_id → scope check.
+ *   2. Best-effort remove the underlying file:
+ *        - S3 key  → s3Storage.deleteObject(key)
+ *        - Bare filename (legacy local-only) → fs.unlinkSync under
+ *          UPLOAD_JOB_FILES with path-traversal guard.
+ *      Failure here is logged but NOT fatal — orphan files are cheaper
+ *      than dangling DB rows on a half-failed delete.
+ *   3. DELETE FROM tbl_job_image WHERE image_id = ?
+ *
+ * Hard-delete on the DB side: `tbl_job_image` has no soft-delete column
+ * (verified via the INSERT shape at the POST handler above), and the
+ * row no longer being referenced anywhere makes a hard delete safe.
+ *
+ * Concurrent reads/writes: a deleted row reappearing in the same
+ * second is fine — `seq` is recomputed from COUNT(*) at next INSERT,
+ * so removing image #2 and immediately uploading a replacement gives
+ * it `seq=existing+1`, NOT the freed `_2` slot. That's intentional —
+ * the operator's intent on delete is "this file shouldn't be in the
+ * set", not "let me free a numbered slot for re-use".
+ */
+router.delete(
+  '/images/:imageId',
+  async (req, res, next) => {
+    try {
+      const imageId = Number(req.params.imageId);
+      if (!Number.isInteger(imageId) || imageId <= 0) {
+        return modernError(res, 400, 'invalid imageId');
+      }
+      const [[row]] = await imagePool.query(
+        'SELECT image_id, job_id, image FROM tbl_job_image WHERE image_id = ? LIMIT 1',
+        [imageId]
+      );
+      if (!row) return modernError(res, 404, 'image not found');
+
+      // RBAC: same per-job scope assertion the GET handler uses so the
+      // out-of-scope path 404s identically (no info leak about
+      // existence).
+      const j = await job.getById(row.job_id);
+      if (!j) return modernError(res, 404, 'image not found');
+      const guard = assertEntityInScope(req, {
+        client_id:   j.fk_client_id,
+        city_id:     j.city_id,
+        vertical_id: j.vertical_id,
+      });
+      if (!guard.ok) return modernError(res, 404, 'image not found');
+
+      const stored = String(row.image || '').trim();
+
+      // Storage cleanup — best-effort. S3-stored rows have a path-with-
+      // slash; legacy local-only rows are bare filenames.
+      if (stored) {
+        if (stored.includes('/')) {
+          // S3 path. deleteObject already soft-fails internally.
+          await s3Storage.deleteObject(stored);
+        } else {
+          // Local file path under UPLOAD_JOB_FILES. Path-traversal
+          // guarded — refuse anything that doesn't resolve inside
+          // the configured root.
+          try {
+            const fs = require('fs');
+            const path = require('path');
+            const root = process.env.UPLOAD_JOB_FILES;
+            if (root) {
+              const resolvedRoot = path.resolve(root);
+              const localPath = path.resolve(resolvedRoot, stored);
+              if (
+                localPath === resolvedRoot ||
+                localPath.startsWith(resolvedRoot + path.sep)
+              ) {
+                if (fs.existsSync(localPath)) fs.unlinkSync(localPath);
+              }
+            }
+          } catch (unlinkErr) {
+            uploadLogger.warn(
+              { imageId, jobId: row.job_id, stored, err: unlinkErr?.message },
+              'job image local unlink failed (continuing with DB delete)',
+            );
+          }
+        }
+      }
+
+      await imagePool.query(
+        'DELETE FROM tbl_job_image WHERE image_id = ?',
+        [imageId]
+      );
+
+      uploadLogger.upload(
+        { imageId, jobId: row.job_id, stored },
+        'job image deleted',
+      );
+
+      return modernOk(res, { image_id: imageId, deleted: true }, 'image deleted');
+    } catch (e) { next(e); }
+  }
+);
 
 module.exports = router;

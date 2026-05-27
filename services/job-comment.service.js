@@ -93,6 +93,48 @@ async function hasJobStageColumn() {
   return _jobStageColumnExists;
 }
 
+/*
+ * Column-probe factory for tbl_job columns the comment-mirror needs.
+ * Each probe is cached in its own module-level slot after the first hit
+ * — INFORMATION_SCHEMA.COLUMNS is cheap but a hot-path query path
+ * shouldn't repeat it once we know the answer. All four follow the same
+ * "soft-fail to false on error so legacy deploys don't break" rule.
+ *
+ *   remarks_date_time   — timestamp paired with the remarks mirror
+ *   call_later          — boolean-ish flag stamped when an Unreachable
+ *                          (comment_on=16) lands. Set elsewhere by
+ *                          setStatus → CALL_LATER; we ALSO stamp it
+ *                          here per legacy parity so callers that hit
+ *                          /comments without a status PATCH (rare but
+ *                          possible) still mark the row.
+ *   enum_reason_id      — generic reason FK the legacy CRM stamped on
+ *                          tbl_job in addition to the status-specific
+ *                          enquiry_reason_id / cancel_reason_id. Only
+ *                          stamped when the caller actually sends a
+ *                          reason — never overwritten with NULL.
+ */
+const _colCache = {};
+async function hasJobColumn(colName) {
+  if (_colCache[colName] != null) return _colCache[colName];
+  try {
+    const [rows] = await pool.query(
+      `SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME   = 'tbl_job'
+          AND COLUMN_NAME  = ?
+        LIMIT 1`,
+      [colName],
+    );
+    _colCache[colName] = rows.length > 0;
+  } catch {
+    _colCache[colName] = false;
+  }
+  return _colCache[colName];
+}
+
+// Back-compat: keep the original named helper used in addComment.
+function hasRemarksDateTimeColumn() { return hasJobColumn('remarks_date_time'); }
+
 async function addComment(jobId, { comments, comment_on, commented_by, appointment_on, enum_reason_id, efr_id, job_stage }) {
   const text = String(comments || '').trim();
   if (!text) {
@@ -138,6 +180,72 @@ async function addComment(jobId, { comments, comment_on, commented_by, appointme
     ];
   }
   const [r] = await pool.query(insertSql, insertVals);
+
+  /*
+   * Mirror the latest comment into tbl_job for legacy parity (added
+   * 2026-05-28). The legacy CRM kept the most-recent narrative on
+   * tbl_job.remarks + tbl_job.remarks_date_time so reports/exports
+   * reading off the job row directly saw the freshest context. The
+   * Node port had been INSERTing into tbl_job_comment only — fine for
+   * the History tab but a gap for every other consumer.
+   *
+   * Column-probed so deploys without remarks_date_time degrade
+   * gracefully (just skip the timestamp, still write remarks).
+   *
+   * Intentionally does NOT touch tbl_job.last_update_time — that
+   * column is reserved for STRUCTURAL edits so the "Draft" pill on
+   * the Unconfirmed jobs list stays accurate. remarks_date_time is
+   * the comment-specific timestamp.
+   *
+   * For outcome comments (16=call_later, 17=enquiry) the
+   * accompanying setStatus call already stamps the status-specific
+   * companion columns (call_later=1 / enquiry_reason_id etc.) so we
+   * don't double-write here — only mirror the narrative.
+   */
+  try {
+    // Always mirror the comment text itself.
+    const sets = ['remarks = ?'];
+    const vals = [text];
+
+    // remarks_date_time — when the column exists. Uses NOW() inline so
+    // no extra value slot is consumed.
+    if (await hasJobColumn('remarks_date_time')) {
+      sets.push('remarks_date_time = NOW()');
+    }
+
+    // call_later — stamp the flag whenever the Unreachable comment
+    // code (16) lands, IF the column exists on this deploy. setStatus
+    // also sets this on the 9 transition; doing it here too is
+    // idempotent (always 1) and protects against future call sites
+    // that hit /comments without a paired status PATCH.
+    if (stage === 16 && await hasJobColumn('call_later')) {
+      sets.push('call_later = 1');
+    }
+
+    // enum_reason_id — generic reason FK the legacy CRM mirrored on
+    // tbl_job in parallel with the status-specific enquiry_reason_id /
+    // cancel_reason_id columns. We only stamp when the caller actually
+    // sent a reason — never blindly NULL-out a previously-set value on
+    // a comment that doesn't carry one.
+    if (enum_reason_id != null && await hasJobColumn('enum_reason_id')) {
+      sets.push('enum_reason_id = ?');
+      vals.push(Number(enum_reason_id));
+    }
+
+    vals.push(jobId);
+    await pool.query(
+      `UPDATE tbl_job SET ${sets.join(', ')} WHERE job_id = ?`,
+      vals,
+    );
+  } catch (mirrorErr) {
+    // Soft-fail — the comment row landed successfully; the tbl_job
+    // mirror is a convenience, not a correctness gate. Log + continue.
+    require('../logger').warn(
+      { err: mirrorErr.message, jobId, commentId: r?.insertId },
+      'tbl_job.remarks mirror failed (comment still recorded)',
+    );
+  }
+
   const [[row]] = await pool.query(
     `SELECT c.comment_id AS id, c.job_id, c.comments, c.comment_on, c.created_on,
             c.appointment_on, c.commented_by, c.enum_reason_id, c.efr_id,

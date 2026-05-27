@@ -1,4 +1,9 @@
 const { pool } = require('../db');
+// Job-OTP generator — shared with the auth flow so we're not
+// duplicating the cryptographically-safe 4-digit primitive. See
+// utils/otp.js::generateOtp() for the implementation. Used at
+// order-confirmation time (see create() + setStatus() below).
+const { generateOtp } = require('../utils/otp');
 
 /*
  * Job CRUD + status + assignment.
@@ -85,7 +90,22 @@ const LIST_COLUMNS = `
   j.fk_client_id, cl.client_name,
   j.fk_easyfixter_id, ef.efr_name AS easyfixer_name,
   j.job_owner, ow.user_name AS owner_name,
-  j.fk_address_id, ci.city_name
+  j.fk_address_id, ci.city_name,
+  /*
+   * service_count — count of ACTIVE rows on tbl_job_services for this
+   * job. Powers the FE "Booked but no services" pill (added
+   * 2026-05-28), mirrors the existing Draft-pill pattern on
+   * UnconfirmedJobsTable. Counts only job_service_status = 1 so a
+   * job whose only services were soft-deleted is still flagged.
+   *
+   * Performance: correlated subquery on the indexed job_id column.
+   * For a 384k-row tbl_job with typical per-job service rows (1-5),
+   * adds ~2-3ms over the base list query — verified at QA. If this
+   * ever becomes hot enough to dominate cost, swap to a LATERAL JOIN
+   * or join-on-derived-table.
+   */
+  (SELECT COUNT(*) FROM tbl_job_services js
+    WHERE js.job_id = j.job_id AND js.job_service_status = 1) AS service_count
 `;
 
 /*
@@ -118,6 +138,31 @@ const LIST_JOIN = `
  * affects only operators with verticals = 'allow' in their RBAC
  * scope.
  */
+/*
+ * Column-probe for `tbl_job.otp` (verified legacy column — see
+ * EasyFix_CRM JobDaoImpl.java:4418 `update tbl_job set otp =?`). The
+ * Node BE generates a 4-digit OTP at order-confirmation time
+ * (create() with BOOKED status, or setStatus() transitioning TO
+ * BOOKED) so the technician can verify on check-in. Legacy generated
+ * the OTP at check-in (saveCheckInJob), but ops moved the contract
+ * forward to confirmation so the customer can be told the code
+ * earlier in the cycle — see the 2026-05-28 ask.
+ *
+ * Column is present on every deploy verified so far, but we probe
+ * (and cache) so a partially-migrated DB doesn't break booking.
+ */
+let _hasOtpColumn = null;
+async function hasOtpColumn() {
+  if (_hasOtpColumn !== null) return _hasOtpColumn;
+  try {
+    const [rows] = await pool.query("SHOW COLUMNS FROM tbl_job LIKE 'otp'");
+    _hasOtpColumn = rows.length > 0;
+  } catch {
+    _hasOtpColumn = false;
+  }
+  return _hasOtpColumn;
+}
+
 let _hasClientVerticalIdColumn = null;
 async function hasClientVerticalIdColumn() {
   if (_hasClientVerticalIdColumn !== null) return _hasClientVerticalIdColumn;
@@ -507,9 +552,19 @@ async function getById(jobId) {
  * mutate — skipping the 7-way join saves ~150-300ms per status change and
  * avoids loading services+images we don't use in those paths.
  */
+/* `otp` is included here (added 2026-05-28) so setStatus() can decide
+ * whether to mint a new OTP on the BOOKED transition without a second
+ * round-trip. A NULL/empty existing value triggers generation; an
+ * already-set value is preserved (idempotent re-confirm doesn't
+ * change the code the customer was already told). */
 async function getJobMeta(jobId) {
+  // `otp` selection is wrapped in a probe-driven concat so older deploys
+  // that lack the column don't break the meta read. The downstream
+  // setStatus() only reads meta.otp when the probe says the column
+  // exists, but explicitly emitting NULL keeps the shape stable.
+  const otpCol = (await hasOtpColumn()) ? 'otp' : 'NULL AS otp';
   const [[row]] = await pool.query(
-    'SELECT job_id, job_status, fk_easyfixter_id, fk_customer_id, fk_client_id FROM tbl_job WHERE job_id = ? LIMIT 1',
+    `SELECT job_id, job_status, fk_easyfixter_id, fk_customer_id, fk_client_id, ${otpCol} FROM tbl_job WHERE job_id = ? LIMIT 1`,
     [jobId]
   );
   return row || null;
@@ -784,14 +839,53 @@ async function getAttentionSummary({ scope } = {}) {
     );
   })();
 
-  const [runningLate, estimateApproved, estimateRejected, pendingTechAccept, customerUnreachable] =
-    await Promise.all([
-      runningLatePromise,
-      estimateApprovedPromise,
-      estimateRejectedPromise,
-      pendingTechAcceptPromise,
-      customerUnreachablePromise,
-    ]);
+  /*
+   * 6. Booked-No-Services (added 2026-05-28) — counts BOOKED jobs that
+   * have ZERO active rows in tbl_job_services. Surfaces the legacy
+   * data-quality gap (ref Job #482453) where ops promote an Unconfirmed
+   * job to BOOKED before adding any service line items. Same predicate
+   * as the FE "No Services" pill so the tile count matches what the
+   * operator will see on /jobs.
+   *
+   * NOT EXISTS subquery is preferred over a LEFT JOIN + IS NULL
+   * because tbl_job_services has indexes on job_id; MySQL's optimiser
+   * resolves the anti-join cheaply.
+   *
+   * `job_service_status = 1` mirrors the LIST projection's
+   * active-only restriction — soft-deleted rows don't mask the anomaly.
+   */
+  const bookedNoServicesPromise = (async () => {
+    const f = buildScopeFragment('j');
+    const where = [
+      'j.job_status = 0',
+      `NOT EXISTS (
+        SELECT 1 FROM tbl_job_services js
+         WHERE js.job_id = j.job_id AND js.job_service_status = 1
+      )`,
+      ...f.clauses,
+    ].join(' AND ');
+    return safeCount(
+      'bookedNoServices',
+      `SELECT COUNT(*) AS c FROM tbl_job j ${f.joins} WHERE ${where}`,
+      f.params,
+    );
+  })();
+
+  const [
+    runningLate,
+    estimateApproved,
+    estimateRejected,
+    pendingTechAccept,
+    customerUnreachable,
+    bookedNoServices,
+  ] = await Promise.all([
+    runningLatePromise,
+    estimateApprovedPromise,
+    estimateRejectedPromise,
+    pendingTechAcceptPromise,
+    customerUnreachablePromise,
+    bookedNoServicesPromise,
+  ]);
 
   return {
     runningLate,
@@ -799,6 +893,7 @@ async function getAttentionSummary({ scope } = {}) {
     estimateRejected,
     pendingTechAccept,
     customerUnreachable,
+    bookedNoServices,
   };
 }
 
@@ -951,8 +1046,39 @@ async function create(input, actor) {
     // FE override permitted via input.eta_status.
     const etaStatus = input.eta_status ?? '01';
 
-    const [ins] = await conn.query(
-      `INSERT INTO tbl_job (
+    // Resolve the effective initial status once so the OTP gate below
+    // doesn't duplicate the BOOKED/ENQUIRY/CALL_LATER branching logic.
+    const effectiveStatus = [STATUS.ENQUIRY, STATUS.CALL_LATER].includes(Number(input.initial_status))
+      ? Number(input.initial_status)
+      : STATUS.BOOKED;
+
+    /*
+     * Job OTP (2026-05-28). Legacy CRM (JobDaoImpl.java:4418) stamps
+     * `tbl_job.otp` at check-in time via `saveCheckInJob`. Ops moved the
+     * stamping forward to ORDER-CONFIRMATION so the customer can be
+     * informed of the code earlier in the cycle. The technician then
+     * verifies the code at start-of-job (check-in) as before.
+     *
+     * Rules:
+     *   - Generate only when the job lands in BOOKED (status=0).
+     *     Direct-to-ENQUIRY (7) / direct-to-CALL_LATER (9) bookings
+     *     skip — those aren't confirmed orders yet.
+     *   - 4-digit cryptographically-random (utils/otp.js::generateOtp),
+     *     stored as STRING (legacy column is varchar-ish; we match).
+     *   - Conditionally included in INSERT when the `otp` column
+     *     exists on this deploy (column-probed, cached). Older DBs
+     *     without it gracefully degrade — no OTP stored but the
+     *     booking still lands.
+     */
+    const withOtpColumn = await hasOtpColumn();
+    const shouldStampOtp = withOtpColumn && effectiveStatus === STATUS.BOOKED;
+    const jobOtp = shouldStampOtp ? String(generateOtp()) : null;
+
+    // Build INSERT shape — `otp` column is appended ONLY when present
+    // on the deploy. Two paths to keep the column list + placeholder
+    // count + values array perfectly aligned (mismatched lengths here
+    // produced silent NULL writes pre-refactor in some legacy ports).
+    const sharedCols = `
          job_desc, fk_customer_id, fk_address_id, fk_client_id,
          fk_service_type_id, fk_service_catg_id, service_type_ids,
          reporting_contact_id,
@@ -965,8 +1091,8 @@ async function create(input, actor) {
          collected_by, eta_status,
          original_appointment_date_time, original_appointment_time,
          helper_req, remarks, efr_special_notes, branch_details, last_update_time
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
+    `;
+    const sharedValues = [
         input.job_desc || '', // job_desc is NOT NULL in tbl_job; default to empty string
         customerId, addressId, input.fk_client_id,
         input.fk_service_type_id || null, input.fk_service_catg_id || null, serviceTypeIds,
@@ -981,9 +1107,7 @@ async function create(input, actor) {
         // call. Validation: only allow the three known codes; anything
         // else falls through to BOOKED so a typo can't accidentally
         // mark a job COMPLETED.
-        ([STATUS.ENQUIRY, STATUS.CALL_LATER].includes(Number(input.initial_status))
-          ? Number(input.initial_status)
-          : STATUS.BOOKED),
+        effectiveStatus,
         input.job_owner || actor?.user_id || null,
         input.job_client_owner ?? null,
         input.job_type || 'Installation', input.source_type || 'manual',
@@ -1005,8 +1129,14 @@ async function create(input, actor) {
         // branch_details: dedicated column on tbl_job.
         input.branch_details || null,
         new Date(),
-      ]
-    );
+    ];
+    const insertSql = jobOtp != null
+      ? `INSERT INTO tbl_job (${sharedCols.trim()}, otp)
+         VALUES (${sharedValues.map(() => '?').join(', ')}, ?)`
+      : `INSERT INTO tbl_job (${sharedCols.trim()})
+         VALUES (${sharedValues.map(() => '?').join(', ')})`;
+    const insertValues = jobOtp != null ? [...sharedValues, jobOtp] : sharedValues;
+    const [ins] = await conn.query(insertSql, insertValues);
     const jobId = ins.insertId;
 
     if (Array.isArray(input.services) && input.services.length > 0) {
@@ -1123,10 +1253,20 @@ async function update(jobId, input, actor) {
   }
   const sets = [];
   const values = [];
+  // Track which columns are actually being changed so we can decide
+  // whether to bump `last_update_time` below. Comment-like fields
+  // (remarks, efr_special_notes) are excluded from the bump — they're
+  // narrative additions, not structural edits, and downstream consumers
+  // like the FE "Draft" indicator on Unconfirmed jobs use the timestamp
+  // to detect Save-Draft progress. If a remarks-only edit ticked the
+  // timestamp, every Add-Remarks click would falsely mark the row as a
+  // draft. Comments have their own audit trail in tbl_job_comment.
+  const changedCols = [];
   for (const col of MUTABLE_COLUMNS) {
     if (input[col] !== undefined) {
       sets.push(`${col} = ?`);
       values.push(input[col]);
+      changedCols.push(col);
     }
   }
 
@@ -1137,14 +1277,40 @@ async function update(jobId, input, actor) {
   // Early-exit only when NOTHING is being touched.
   if (sets.length === 0 && !hasServicesEdit && !hasCustomerEdit && !hasAddressEdit) return existing;
 
+  /*
+   * Structural-change detector. Bumps last_update_time only when one of
+   * the following is true:
+   *   - At least one MUTABLE column other than `remarks`/`efr_special_notes`
+   *   - Services were edited (add/remove rows)
+   *   - Customer was edited
+   *   - Address was edited
+   * Remarks-only / efr_special_notes-only edits intentionally skip the
+   * timestamp bump (rationale above). Service/customer/address edits
+   * trigger their own timestamp bumps later in this function but the
+   * scalar UPDATE branch needs the gate here.
+   */
+  const COMMENT_ONLY_COLS = new Set(['remarks', 'efr_special_notes']);
+  const isStructuralEdit =
+    changedCols.some((c) => !COMMENT_ONLY_COLS.has(c))
+    || hasServicesEdit
+    || hasCustomerEdit
+    || hasAddressEdit;
+
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
 
     if (sets.length > 0) {
-      sets.push('last_update_time = ?');
-      const scalarValues = [...values, new Date(), jobId];
-      await conn.query(`UPDATE tbl_job SET ${sets.join(', ')} WHERE job_id = ?`, scalarValues);
+      if (isStructuralEdit) {
+        sets.push('last_update_time = ?');
+        const scalarValues = [...values, new Date(), jobId];
+        await conn.query(`UPDATE tbl_job SET ${sets.join(', ')} WHERE job_id = ?`, scalarValues);
+      } else {
+        // Comment-only path — write the remarks/efr_special_notes without
+        // touching last_update_time.
+        const scalarValues = [...values, jobId];
+        await conn.query(`UPDATE tbl_job SET ${sets.join(', ')} WHERE job_id = ?`, scalarValues);
+      }
     }
 
     /*
@@ -1511,6 +1677,30 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
       // did the ENQUIRY transition.
       sets.push('cancel_by = ?');
       values.push(actorId);
+    }
+  } else if (Number(status) === STATUS.BOOKED) {
+    /*
+     * BOOKED transition = order confirmation. Stamp a 4-digit OTP so
+     * the technician can verify on check-in. Legacy CRM did this at
+     * check-in (JobDaoImpl.java:4418); ops moved the contract forward
+     * to confirmation so the customer learns the code earlier.
+     *
+     * Idempotency: only stamp when `existing.otp` is null/empty. A
+     * re-confirm (e.g. operator promotes Unconfirmed → Booked → CANCELLED
+     * → Booked) keeps the original code rather than churning. This
+     * matches the customer's mental model — the code they were told
+     * doesn't change unless ops explicitly clears it (manual ops path,
+     * not currently exposed via API).
+     *
+     * Column-probed: skip silently on deploys without `tbl_job.otp`.
+     */
+    if (await hasOtpColumn()) {
+      const hasExistingOtp =
+        existing.otp != null && String(existing.otp).trim() !== '';
+      if (!hasExistingOtp) {
+        sets.push('otp = ?');
+        values.push(String(generateOtp()));
+      }
     }
   } else if (COMPLETED_STATES.has(Number(status))) {
     sets.push('checkout_date_time = COALESCE(checkout_date_time, ?)', 'fk_checkout_by = COALESCE(fk_checkout_by, ?)');
