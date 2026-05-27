@@ -74,55 +74,9 @@ info:
     **Step 3 — JWT signing.** Each tier signs a slightly DIFFERENT claim set
     because each tier authenticates a different user-table row. Same HS256
     algorithm, same `JWT_SECRET`, same default `30d` TTL across all three.
+    Click a tab below to see that tier's signing details:
 
-    **CRM Admin** — `utils/jwt.js::signUserToken()` (verify-otp on
-    `/api/auth/*`). Login accepts EITHER email OR mobile as `identifier` —
-    both resolve to the same `tbl_user` row, and the JWT always carries the
-    canonical `official_email` regardless of which one the user typed:
-
-    ```js
-    jwt.sign(
-      {
-        sub:   String(user.user_id),       // string user_id
-        email: user.official_email,        // always populated from tbl_user
-        role:  user.user_role,             // numeric role_id
-        name:  user.user_name,
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRY || '30d' }
-    );
-    ```
-
-    **Technician** — `tech-auth.service.js` (verify-otp on `/api/mobile/*`).
-    Login is mobile-only — no email path. JWT carries `mobile`, NOT `email`:
-
-    ```js
-    jwt.sign(
-      {
-        sub:    `efr:${tech.efr_id}`,      // "efr:" prefix disambiguates from user_id
-        name:   tech.efr_name,
-        mobile: tech.efr_no,               // technician's 10-digit mobile
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRY || '30d' }
-    );
-    ```
-
-    **Client SPOC** — `client-auth.service.js` (verify-otp on `/api/client/*`).
-    Login is email-only. JWT carries `email` + `clientId`:
-
-    ```js
-    jwt.sign(
-      {
-        sub:      `spoc:${spoc.id}`,        // "spoc:" prefix
-        clientId: spoc.client_id,           // which client this SPOC belongs to
-        name:     spoc.contact_name,
-        email:    spoc.contact_email,
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRY || '30d' }
-    );
-    ```
+    EF::JWT_TABS_MOUNT_POINT::
 
     **Anatomy of the token** (`header.payload.signature`, all base64url-encoded):
 
@@ -134,11 +88,7 @@ info:
 
     **Quick reference — what each tier's JWT looks like:**
 
-    | Tier | Login identifier | JWT carries | JWT does NOT carry | `sub` prefix |
-    |---|---|---|---|---|
-    | **CRM Admin** (`bearerAdmin`) | email OR mobile (either works) | `sub`, `email`, `role`, `name` | `mobile` | (none — bare user_id as string) |
-    | **Technician** (`bearerTech`) | mobile only | `sub`, `mobile`, `name` | `email`, `role` | `efr:<efr_id>` |
-    | **Client SPOC** (`bearerClient`) | email only | `sub`, `email`, `clientId`, `name` | `mobile`, `role` | `spoc:<contact_id>` |
+    EF::JWT_COMPARISON_MOUNT_POINT::
 
     All three tiers also carry `iat` (issued-at) and `exp` (expiry) — added
     automatically by `jsonwebtoken`. The `sub` prefix is how the auth

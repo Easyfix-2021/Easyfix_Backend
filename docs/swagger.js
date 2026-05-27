@@ -39,10 +39,39 @@ const QUICK_LOGIN_JS = `
   var SCHEMES = ['bearerAdmin', 'bearerTech', 'bearerClient', 'basicIntegration'];
   var BEARER_SCHEMES = ['bearerAdmin', 'bearerTech', 'bearerClient'];
 
+  // identifierField MATTERS — each tier's BE Joi validator expects a
+  // different field name in the request body:
+  //   CRM       → POST /auth/login-otp        body: { identifier, otp? }
+  //   Tech      → POST /mobile/auth/login-otp body: { mobile,     otp? }
+  //   ClientSPOC→ POST /client/auth/login-otp body: { identifier, otp? }
+  // A mismatch produces a 400 "Validation failed" — caught in production
+  // 2026-05-28 when Quick Login on Tech tier hit /mobile/auth/login-otp
+  // with { identifier: '9731446014' } and Joi rejected it.
+  //
+  // placeholder + accepts describe the input UI hint per tier; mobile-only
+  // tiers (Tech) get a numeric inputmode and a 10-digit constraint message.
   var TIERS = {
-    bearerAdmin:  { prefix: '/auth',        label: 'CRM (Admin)'         },
-    bearerTech:   { prefix: '/mobile/auth', label: 'Technician (Mobile)' },
-    bearerClient: { prefix: '/client/auth', label: 'Client SPOC'         },
+    bearerAdmin: {
+      prefix: '/auth',
+      label: 'CRM (Admin)',
+      identifierField: 'identifier',
+      placeholder: 'you@channelplay.in or 9999999999',
+      accepts: 'Email OR 10-digit Mobile',
+    },
+    bearerTech: {
+      prefix: '/mobile/auth',
+      label: 'Technician (Mobile)',
+      identifierField: 'mobile',
+      placeholder: '9999999999',
+      accepts: '10-digit Mobile only',
+    },
+    bearerClient: {
+      prefix: '/client/auth',
+      label: 'Client SPOC',
+      identifierField: 'identifier',
+      placeholder: 'you@example.com or 9999999999',
+      accepts: 'Email OR 10-digit Mobile',
+    },
   };
 
   // ── Style injection (one-time) ────────────────────────────────────
@@ -292,10 +321,16 @@ const QUICK_LOGIN_JS = `
     var errBox = el('div', { className: 'ef-error', style: 'display:none' });
     m.body.appendChild(errBox);
 
-    var lbl = el('label', { className: 'ef-label', textContent: 'Email or 10-digit Mobile' });
-    var input = el('input', { className: 'ef-input', type: 'text',
-      placeholder: 'you@channelplay.in or 9999999999',
-      onkeydown: function (e) { if (e.key === 'Enter') doSend(); } });
+    var lbl = el('label', { className: 'ef-label', textContent: t.accepts });
+    var inputOpts = { className: 'ef-input', type: 'text',
+      placeholder: t.placeholder,
+      onkeydown: function (e) { if (e.key === 'Enter') doSend(); } };
+    // Tech tier is mobile-only — surface numeric keyboard on mobile devices
+    if (t.identifierField === 'mobile') {
+      inputOpts.inputmode = 'numeric';
+      inputOpts.maxlength = '10';
+    }
+    var input = el('input', inputOpts);
     lbl.appendChild(input);
     m.body.appendChild(lbl);
 
@@ -307,12 +342,24 @@ const QUICK_LOGIN_JS = `
 
     async function doSend() {
       var v = (input.value || '').trim();
-      if (!v) { showErr(errBox, 'Please enter an email or mobile.'); return; }
+      if (!v) { showErr(errBox, 'Please enter ' + t.accepts.toLowerCase() + '.'); return; }
+      // Pre-validate tech mobile so we fail fast with a friendly message
+      // instead of getting a Joi 400 from the BE.
+      if (t.identifierField === 'mobile' && !/^[0-9]{10}$/.test(v)) {
+        showErr(errBox, 'Technician login requires exactly 10 digits — no spaces, no country code.');
+        return;
+      }
       send.disabled = true; send.textContent = 'Sending…';
       try {
+        // Build the body with the tier's expected key name. Computed
+        // property keys are ES6+ — using assignment for ES5 friendliness
+        // since this string is eval'd by the swagger-ui bundle.
+        var body = {};
+        body[t.identifierField] = v;
+
         var r = await fetch(base() + t.prefix + '/login-otp', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ identifier: v }),
+          body: JSON.stringify(body),
         });
         var b = await readBody(r);
         if (!r.ok || b.json.success === false) {
@@ -333,8 +380,9 @@ const QUICK_LOGIN_JS = `
     m.setTitle('🔑 Quick Login · Enter OTP');
     clear(m.body); clear(m.foot);
 
-    m.body.appendChild(el('div', { className: 'ef-success',
-      textContent: 'OTP sent to ' + identifier + '. Check your email/SMS (or server logs in dev: search for "DEV OTP issued").' }));
+    var sentBanner = el('div', { className: 'ef-success',
+      textContent: 'OTP sent to ' + identifier + '. Check your email/SMS — or in dev, grep BE logs for "OTP for ' + identifier + '".' });
+    m.body.appendChild(sentBanner);
 
     var errBox = el('div', { className: 'ef-error', style: 'display:none' });
     m.body.appendChild(errBox);
@@ -346,20 +394,70 @@ const QUICK_LOGIN_JS = `
     lbl.appendChild(input);
     m.body.appendChild(lbl);
 
+    // Inline "Resend OTP" link below the input. Re-hits login-otp with the
+    // same identifier — overwrites otp_details row with a fresh code. The
+    // OLD code in your inbox becomes invalid immediately; only the latest
+    // resend is verifiable. Useful when:
+    //   - 5-minute TTL elapsed
+    //   - multiple resend clicks happened and you lost track of the latest
+    //   - dev mode and you missed the first BE log line
+    var resendRow = el('div', { style: 'margin-top:10px;font-size:13px;color:#64748b' });
+    resendRow.appendChild(document.createTextNode('Didn\\'t receive it? '));
+    var resendLink = el('button', { type: 'button',
+      style: 'background:none;border:none;color:#6366f1;font-weight:700;cursor:pointer;padding:0;font-size:13px;text-decoration:underline;font-family:inherit' });
+    resendLink.textContent = 'Resend OTP';
+    resendLink.onclick = doResend;
+    resendRow.appendChild(resendLink);
+    m.body.appendChild(resendRow);
+
     var verify = el('button', { className: 'ef-btn ef-btn-primary', type: 'button', textContent: 'Verify & Login', onclick: doVerify });
     m.foot.appendChild(el('button', { className: 'ef-btn ef-btn-ghost', type: 'button', textContent: '← Back', onclick: function () { stepEnterIdentifier(m, scheme); } }));
     m.foot.appendChild(verify);
 
     setTimeout(function () { input.focus(); }, 50);
 
+    async function doResend() {
+      resendLink.disabled = true;
+      resendLink.textContent = 'Sending…';
+      errBox.style.display = 'none';
+      try {
+        var body = {};
+        body[t.identifierField] = identifier;
+        var r = await fetch(base() + t.prefix + '/login-otp', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        var b = await readBody(r);
+        if (!r.ok || b.json.success === false) {
+          showErr(errBox, 'resend failed (' + r.status + '): ' + errSnippet(b));
+          resendLink.disabled = false; resendLink.textContent = 'Resend OTP';
+          return;
+        }
+        // Refresh the green banner so the user knows the previous code is now stale.
+        sentBanner.textContent = 'Fresh OTP sent to ' + identifier + '. The previous code is no longer valid.';
+        input.value = '';
+        input.focus();
+        resendLink.textContent = 'Resend OTP';
+        resendLink.disabled = false;
+      } catch (err) {
+        showErr(errBox, 'Network error: ' + (err.message || err));
+        resendLink.disabled = false; resendLink.textContent = 'Resend OTP';
+      }
+    }
+
     async function doVerify() {
       var otp = (input.value || '').trim();
       if (!otp) { showErr(errBox, 'Please enter the OTP.'); return; }
       verify.disabled = true; verify.textContent = 'Verifying…';
       try {
+        // Same tier-aware body construction as login-otp — Tech expects
+        // 'mobile', CRM and Client expect 'identifier'.
+        var body = { otp: Number(otp) };
+        body[t.identifierField] = identifier;
+
         var r = await fetch(base() + t.prefix + '/verify-otp', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ identifier: identifier, otp: Number(otp) }),
+          body: JSON.stringify(body),
         });
         var b = await readBody(r);
         var token = b.json && b.json.data && b.json.data.token;
@@ -608,6 +706,274 @@ const QUICK_LOGIN_JS = `
     return b;
   }
 
+  // ── JWT tier content (JS-owned, sanitiser-proof) ──
+  // Last-turn iteration buried the per-tier content in markdown HTML and
+  // relied on swagger-ui's renderer preserving classes / data attributes.
+  // It doesn\'t — the sanitiser strips them inconsistently.
+  // New strategy: the YAML ships only a TEXT MARKER ("EF::JWT_TABS_MOUNT_POINT::").
+  // After render, JS finds that text node, replaces its parent element with
+  // a fully DOM-constructed tab UI sourced from the JWT_TIERS data below.
+  // Zero dependency on attribute preservation.
+  var JWT_TIERS = [
+    {
+      key: 'crm',
+      label: '🏢 CRM Admin',
+      introHtml: 'Signed by <code>utils/jwt.js::signUserToken()</code> on the verify-otp endpoint at <code>/api/auth/*</code>.<br>Login accepts <strong>EITHER email OR mobile</strong> as <code>identifier</code> — both resolve to the same <code>tbl_user</code> row, and the JWT <strong>always</strong> carries the canonical <code>official_email</code> regardless of which one the user typed.',
+      code: [
+        'jwt.sign(',
+        '  {',
+        '    sub:   String(user.user_id),       // string user_id',
+        '    email: user.official_email,        // always populated from tbl_user',
+        '    role:  user.user_role,             // numeric role_id',
+        '    name:  user.user_name,',
+        '  },',
+        '  process.env.JWT_SECRET,',
+        "  { expiresIn: process.env.JWT_EXPIRY || '30d' }",
+        ');',
+      ].join('\\n'),
+      verifyHtml: '<strong>Verification path:</strong> <code>middleware/auth.js</code> → <code>utils/jwt.js::verifyToken()</code> → looks up <code>tbl_user</code> by <code>decoded.sub</code> → stamps <code>req.user</code> with the freshest row.',
+    },
+    {
+      key: 'tech',
+      label: '🔧 Technician',
+      introHtml: 'Signed by <code>tech-auth.service.js</code> on the verify-otp endpoint at <code>/api/mobile/*</code>.<br>Login is <strong>mobile-only</strong> — there\\'s no email path. JWT carries <code>mobile</code>, NOT <code>email</code>. The <code>efr:</code> prefix on <code>sub</code> disambiguates a technician id from a CRM user id without an extra DB call.',
+      code: [
+        'jwt.sign(',
+        '  {',
+        '    sub:    \`efr:\${tech.efr_id}\`,      // "efr:" prefix disambiguates from user_id',
+        '    name:   tech.efr_name,',
+        '    mobile: tech.efr_no,               // technician\\'s 10-digit mobile',
+        '  },',
+        '  process.env.JWT_SECRET,',
+        "  { expiresIn: process.env.JWT_EXPIRY || '30d' }",
+        ');',
+      ].join('\\n'),
+      verifyHtml: '<strong>Verification path:</strong> <code>middleware/tech-auth.js</code> → checks the <code>efr:</code> prefix → looks up <code>tbl_easyfixer</code> by efr_id → stamps <code>req.tech</code>.',
+    },
+    {
+      key: 'client',
+      label: '👤 Client SPOC',
+      introHtml: 'Signed by <code>client-auth.service.js</code> on the verify-otp endpoint at <code>/api/client/*</code>.<br>Login is <strong>email-only</strong> (or 10-digit mobile resolving to a SPOC contact). JWT carries <code>email</code> + <code>clientId</code>. The <code>clientId</code> claim auto-scopes every subsequent query to this SPOC\\'s client without separate join logic.',
+      code: [
+        'jwt.sign(',
+        '  {',
+        '    sub:      \`spoc:\${spoc.id}\`,        // "spoc:" prefix',
+        '    clientId: spoc.client_id,           // which client this SPOC belongs to',
+        '    name:     spoc.contact_name,',
+        '    email:    spoc.contact_email,',
+        '  },',
+        '  process.env.JWT_SECRET,',
+        "  { expiresIn: process.env.JWT_EXPIRY || '30d' }",
+        ');',
+      ].join('\\n'),
+      verifyHtml: '<strong>Verification path:</strong> <code>middleware/client-auth.js</code> → checks the <code>spoc:</code> prefix → looks up <code>tbl_client_contacts</code> → stamps <code>req.spoc</code> + <code>req.clientId</code>.',
+    },
+  ];
+
+  // Per-tier comparison table (same JS-built approach for sanitiser
+  // resilience). Cells are inline-HTML strings; the builder uses innerHTML
+  // for cell content — safe because the content is hardcoded in this file,
+  // not user-supplied.
+  var JWT_COMPARISON = {
+    header: ['Tier', 'Login Identifier', 'JWT Carries', 'JWT Does NOT Carry', 'sub Prefix'],
+    rows: [
+      [
+        '<strong>CRM Admin</strong> <code>bearerAdmin</code>',
+        'email OR mobile (either works)',
+        '<code>sub</code>, <code>email</code>, <code>role</code>, <code>name</code>',
+        '<code>mobile</code>',
+        '(none — bare user_id as string)',
+      ],
+      [
+        '<strong>Technician</strong> <code>bearerTech</code>',
+        'mobile only',
+        '<code>sub</code>, <code>mobile</code>, <code>name</code>',
+        '<code>email</code>, <code>role</code>',
+        '<code>efr:&lt;efr_id&gt;</code>',
+      ],
+      [
+        '<strong>Client SPOC</strong> <code>bearerClient</code>',
+        'email only',
+        '<code>sub</code>, <code>email</code>, <code>clientId</code>, <code>name</code>',
+        '<code>mobile</code>, <code>role</code>',
+        '<code>spoc:&lt;contact_id&gt;</code>',
+      ],
+    ],
+  };
+
+  // ── Marker-finding helper ─────────────────────────────────────────
+  // TreeWalker walks every text node under .info. We compare textContent
+  // for an exact marker substring. Returns the FIRST matching node, or null.
+  // Cheaper + more reliable than parsing the entire DOM tree manually.
+  function findMarkerNode(infoEl, marker) {
+    if (!infoEl) return null;
+    var walker = document.createTreeWalker(infoEl, NodeFilter.SHOW_TEXT, null);
+    var n;
+    while ((n = walker.nextNode())) {
+      if (n.textContent.indexOf(marker) !== -1) return n;
+    }
+    return null;
+  }
+
+  // localStorage key for the selected tier — persists across reloads.
+  var EF_JWT_TAB_LS_KEY = 'ef-swagger-jwt-tab';
+
+  function buildJwtTabs() {
+    var container = document.createElement('div');
+    container.className = 'ef-jwt-tabs';
+
+    var bar = document.createElement('div');
+    bar.className = 'ef-jwt-tabbar';
+    container.appendChild(bar);
+
+    var panelWrap = document.createElement('div');
+    panelWrap.className = 'ef-jwt-panel-wrap';
+    container.appendChild(panelWrap);
+
+    // Restore last-selected tab from localStorage, default to first tier.
+    var savedKey;
+    try { savedKey = window.localStorage.getItem(EF_JWT_TAB_LS_KEY); } catch (e) {}
+    var startIdx = 0;
+    if (savedKey) {
+      for (var j = 0; j < JWT_TIERS.length; j++) {
+        if (JWT_TIERS[j].key === savedKey) { startIdx = j; break; }
+      }
+    }
+
+    var btns = [];
+    var panels = [];
+
+    JWT_TIERS.forEach(function (tier, i) {
+      // Tab button
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'ef-jwt-tab' + (i === startIdx ? ' ef-jwt-tab-active' : '');
+      btn.setAttribute('data-jwt-tab', tier.key);
+      btn.textContent = tier.label;
+      bar.appendChild(btn);
+      btns.push(btn);
+
+      // Panel
+      var panel = document.createElement('div');
+      panel.className = 'ef-jwt-panel' + (i === startIdx ? ' ef-jwt-panel-active' : '');
+      panel.setAttribute('data-jwt-panel', tier.key);
+
+      var intro = document.createElement('p');
+      intro.innerHTML = tier.introHtml;
+      panel.appendChild(intro);
+
+      var pre = document.createElement('pre');
+      var code = document.createElement('code');
+      code.textContent = tier.code;
+      pre.appendChild(code);
+      panel.appendChild(pre);
+
+      var verify = document.createElement('p');
+      verify.innerHTML = tier.verifyHtml;
+      panel.appendChild(verify);
+
+      panelWrap.appendChild(panel);
+      panels.push(panel);
+    });
+
+    // Wire click handlers
+    btns.forEach(function (btn, i) {
+      btn.onclick = function () {
+        btns.forEach(function (b) { b.classList.remove('ef-jwt-tab-active'); });
+        panels.forEach(function (p) { p.classList.remove('ef-jwt-panel-active'); });
+        btn.classList.add('ef-jwt-tab-active');
+        panels[i].classList.add('ef-jwt-panel-active');
+        try { window.localStorage.setItem(EF_JWT_TAB_LS_KEY, JWT_TIERS[i].key); } catch (e) {}
+      };
+    });
+
+    return container;
+  }
+
+  function buildJwtComparison() {
+    var wrapper = document.createElement('div');
+    wrapper.className = 'ef-jwt-comparison-wrap';
+    var table = document.createElement('table');
+    table.className = 'ef-jwt-comparison';
+    var thead = document.createElement('thead');
+    var headRow = document.createElement('tr');
+    JWT_COMPARISON.header.forEach(function (h) {
+      var th = document.createElement('th');
+      th.textContent = h;
+      headRow.appendChild(th);
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    var tbody = document.createElement('tbody');
+    JWT_COMPARISON.rows.forEach(function (rowData, rowIdx) {
+      var tr = document.createElement('tr');
+      tr.setAttribute('data-tier-row', JWT_TIERS[rowIdx] ? JWT_TIERS[rowIdx].key : '');
+      rowData.forEach(function (cellHtml) {
+        var td = document.createElement('td');
+        td.innerHTML = cellHtml;
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    wrapper.appendChild(table);
+    return wrapper;
+  }
+
+  // ── Mount helpers ─────────────────────────────────────────────────
+  // Find the marker text node, replace its parent (usually a <p>) with the
+  // JS-built UI. Idempotent — checks data-ef-jwt-mounted attribute on the
+  // parent so re-renders do not double-mount.
+  function mountAtMarker(infoEl, marker, buildFn, mountFlag) {
+    var markerNode = findMarkerNode(infoEl, marker);
+    if (!markerNode) return false;
+    var host = markerNode.parentElement;
+    if (!host) return false;
+    if (host.getAttribute(mountFlag) === '1') return true; // already mounted
+    var built = buildFn();
+    host.parentNode.replaceChild(built, host);
+    built.setAttribute(mountFlag, '1');
+    return true;
+  }
+
+  function initJwtTabs() {
+    var info = document.querySelector('.swagger-ui .info');
+    return mountAtMarker(info, 'EF::JWT_TABS_MOUNT_POINT::', buildJwtTabs, 'data-ef-jwt-mounted');
+  }
+
+  function initJwtComparison() {
+    var info = document.querySelector('.swagger-ui .info');
+    return mountAtMarker(info, 'EF::JWT_COMPARISON_MOUNT_POINT::', buildJwtComparison, 'data-ef-jwt-cmp-mounted');
+  }
+
+  function tryInitJwtTabs(retries) {
+    var ok1 = initJwtTabs();
+    var ok2 = initJwtComparison();
+    if (ok1 && ok2) return;
+    if (retries <= 0) return;
+    setTimeout(function () { tryInitJwtTabs(retries - 1); }, 300);
+  }
+
+  // ── MutationObserver — re-mount if Swagger UI re-renders the description ──
+  // Server-dropdown switch, locale change, or any internal state update can
+  // cause swagger-ui to re-render the .info block. When that happens, our
+  // injected DOM is wiped. The observer watches childList mutations on
+  // .swagger-ui and re-runs mount if our markers reappear.
+  function watchInfoRerenders() {
+    var root = document.querySelector('.swagger-ui');
+    if (!root || root.getAttribute('data-ef-jwt-watching') === '1') return;
+    root.setAttribute('data-ef-jwt-watching', '1');
+    var observer = new MutationObserver(function () {
+      var info = document.querySelector('.swagger-ui .info');
+      if (!info) return;
+      // Re-mount only if a marker is back in the DOM (i.e., a re-render happened).
+      if (findMarkerNode(info, 'EF::JWT_TABS_MOUNT_POINT::')) initJwtTabs();
+      if (findMarkerNode(info, 'EF::JWT_COMPARISON_MOUNT_POINT::')) initJwtComparison();
+    });
+    observer.observe(root, { childList: true, subtree: true });
+  }
+
   function ready() {
     if (!window.ui || typeof window.ui.preauthorizeApiKey !== 'function') {
       return setTimeout(ready, 300);
@@ -619,6 +985,11 @@ const QUICK_LOGIN_JS = `
     document.body.appendChild(makeBtn({ id: 'ef-quick-login-btn',  text: '🔑 Quick Login', title: 'OTP login → auto-fills Authorize',     variant: 'ef-cta-login',  right: 290, onClick: startQuickLogin }));
     document.body.appendChild(makeBtn({ id: 'ef-show-token-btn',   text: '📋 Token',       title: 'Decode and inspect the current JWT(s)', variant: 'ef-cta-token',  right: 156, onClick: startShowToken  }));
     document.body.appendChild(makeBtn({ id: 'ef-quick-logout-btn', text: '🚪 Logout',      title: 'Clear every Bearer + Basic scheme',     variant: 'ef-cta-logout', right: 24,  onClick: startLogout     }));
+
+    // Kick off the JWT-tab + comparison-table mount + observer for
+    // re-render survival. Self-bails out cleanly if markers absent.
+    tryInitJwtTabs(15);
+    watchInfoRerenders();
   }
 
   if (document.readyState === 'loading') {
@@ -750,6 +1121,44 @@ const SWAGGER_THEME_CSS = [
 
   // ── Footer cleanup ──
   '.swagger-ui .info .main hgroup>a{display:none}',
+
+  // ── JWT tier tabs (JS-built header + panels) ──
+  // Markdown sanitiser strips class attributes inconsistently, so we DON'T
+  // rely on CSS-only :checked tricks. The container ships from openapi.yaml
+  // as three sibling panels with data-jwt-key markers; initJwtTabs() in
+  // QUICK_LOGIN_JS finds them after render, inserts a tab bar at the top,
+  // hides all panels except the active one, and wires real click handlers.
+  // Active tier accent matches the Quick Login modal: CRM=indigo, Tech=orange, Client=violet.
+  '.swagger-ui .info .ef-jwt-tabs{margin:20px 0 14px;border:1px solid #e2e8f0;border-radius:14px;overflow:hidden;background:#fff;box-shadow:0 6px 20px rgba(15,23,42,.05)}',
+  '.swagger-ui .info .ef-jwt-tabbar{display:flex;background:linear-gradient(180deg,#f8fafc,#f1f5f9);border-bottom:1px solid #e2e8f0;padding:8px 8px 0 8px;gap:4px;flex-wrap:wrap}',
+  '.swagger-ui .info .ef-jwt-tab{padding:11px 22px;border:none;background:transparent;cursor:pointer;font-weight:700;font-size:13px;color:#64748b;border-bottom:3px solid transparent;margin-bottom:-1px;border-radius:9px 9px 0 0;transition:all .15s ease;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;letter-spacing:.2px;display:inline-flex;align-items:center}',
+  '.swagger-ui .info .ef-jwt-tab:hover{background:rgba(99,102,241,.06);color:#0f172a}',
+  // Active state — base styling (CRM/indigo default). Per-tier overrides below via data-jwt-tab attribute.
+  '.swagger-ui .info .ef-jwt-tab.ef-jwt-tab-active{background:linear-gradient(180deg,#fff,#eef2ff);color:#4338ca;border-bottom-color:#6366f1}',
+  '.swagger-ui .info .ef-jwt-tab.ef-jwt-tab-active[data-jwt-tab=tech]{background:linear-gradient(180deg,#fff,#fff7ed);color:#c2410c;border-bottom-color:#f97316}',
+  '.swagger-ui .info .ef-jwt-tab.ef-jwt-tab-active[data-jwt-tab=client]{background:linear-gradient(180deg,#fff,#faf5ff);color:#7c3aed;border-bottom-color:#8b5cf6}',
+  // Panels — hidden by default; initJwtTabs adds .ef-jwt-panel-active to one.
+  '.swagger-ui .info .ef-jwt-panel{padding:22px 24px 18px;display:none}',
+  '.swagger-ui .info .ef-jwt-panel.ef-jwt-panel-active{display:block;animation:efJwtFade .2s ease-out}',
+  '.swagger-ui .info .ef-jwt-panel p{margin:0 0 12px 0}',
+  '.swagger-ui .info .ef-jwt-panel pre{margin:14px 0!important}',
+  // The label spans inside each panel — initJwtTabs reads .textContent to
+  // build the tab button, then hides them so they don\'t appear as section
+  // headings inside the active panel.
+  '.swagger-ui .info .ef-jwt-panel-label{display:none}',
+  '@keyframes efJwtFade{from{opacity:0;transform:translateY(2px)}to{opacity:1;transform:translateY(0)}}',
+
+  // ── JWT comparison table (JS-built — same defensive pattern) ──
+  '.swagger-ui .info .ef-jwt-comparison-wrap{margin:18px 0;border-radius:12px;overflow:hidden;border:1px solid #e2e8f0;box-shadow:0 4px 14px rgba(15,23,42,.04)}',
+  '.swagger-ui .info .ef-jwt-comparison{width:100%;border-collapse:separate;border-spacing:0;background:#fff}',
+  '.swagger-ui .info .ef-jwt-comparison thead th{background:linear-gradient(135deg,#f8fafc,#eef2ff);color:#475569;font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.6px;padding:12px 16px;text-align:left;border-bottom:2px solid #e2e8f0;white-space:nowrap}',
+  '.swagger-ui .info .ef-jwt-comparison tbody td{padding:14px 16px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#1e293b;line-height:1.55;vertical-align:top}',
+  '.swagger-ui .info .ef-jwt-comparison tbody tr:last-child td{border-bottom:none}',
+  '.swagger-ui .info .ef-jwt-comparison tbody tr[data-tier-row=crm]    td:first-child{border-left:4px solid #6366f1}',
+  '.swagger-ui .info .ef-jwt-comparison tbody tr[data-tier-row=tech]   td:first-child{border-left:4px solid #f97316}',
+  '.swagger-ui .info .ef-jwt-comparison tbody tr[data-tier-row=client] td:first-child{border-left:4px solid #8b5cf6}',
+  '.swagger-ui .info .ef-jwt-comparison tbody tr:hover td{background:linear-gradient(135deg,#f8fafc,#f0f9ff);transition:background .15s}',
+  '.swagger-ui .info .ef-jwt-comparison strong{color:#0f172a;font-weight:800}',
 
   // ── Built-in Authorize modal (the one that opens when you click the green lock) ──
   // swagger-ui calls this the "dialog-ux" — its default styling is bare white-on-grey.

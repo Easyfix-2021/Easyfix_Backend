@@ -15,11 +15,26 @@ function splitOrigins(s) {
 const PORT = process.env.PORT || 5100;
 
 // Explicit cross-origin allowlist — frontends hosted on a DIFFERENT host
-// than the backend. CRM_URL and CLIENT_URL are different hostnames in
-// every environment, so they need env-configured overrides.
+// than the backend. CRM_URL, CLIENT_URL, and MOBILE_APP_URL are different
+// hostnames in every environment, so they need env-configured overrides.
+//
+// MOBILE_APP_URL covers the Easyfix_Technician_Mobile_Application — relevant
+// when the app is served as a web preview (Vite/Expo dev server) or wrapped
+// in a Capacitor/Cordova shell that emits an Origin header. Native React
+// Native fetches don't send Origin so they're already allow-by-default via
+// the "no Origin → allow" branch below; this entry covers the web shell.
+// Typical values:
+//   - Local web preview:  http://localhost:5182
+//   - Expo dev server:    http://localhost:8081
+//   - Capacitor shell:    capacitor://localhost
+//   - Ionic shell:        ionic://localhost
+//   - QA web preview:     https://qa.mobile.easyfix.in
+//   - Prod web preview:   https://mobile.easyfix.in
+// Comma-separated for multiple (same splitOrigins behaviour as CRM_URL).
 const allowedOrigins = [
-  ...splitOrigins(process.env.CRM_URL    || 'http://localhost:5180'),
-  ...splitOrigins(process.env.CLIENT_URL || 'http://localhost:5181'),
+  ...splitOrigins(process.env.CRM_URL        || 'http://localhost:5180'),
+  ...splitOrigins(process.env.CLIENT_URL     || 'http://localhost:5181'),
+  ...splitOrigins(process.env.MOBILE_APP_URL || 'http://localhost:5182,capacitor://localhost,ionic://localhost'),
   // SELF_URL is the optional override for unusual setups (e.g. when the
   // BE is reachable under multiple hostnames simultaneously beyond what
   // same-host autodetection covers). Default: empty — same-host
@@ -65,7 +80,8 @@ function corsDelegate(req, callback) {
   // Same-origin / curl / health probes (no Origin header) — allowed.
   if (!reqOrigin) return callback(null, { ...baseOptions, origin: true });
 
-  // Explicit allowlist match (cross-origin FE hosts: CRM_URL, CLIENT_URL).
+  // Explicit allowlist match (cross-origin FE hosts: CRM_URL, CLIENT_URL,
+  // MOBILE_APP_URL, plus optional SELF_URL).
   if (allowedOrigins.includes(reqOrigin)) {
     return callback(null, { ...baseOptions, origin: true });
   }
