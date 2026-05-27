@@ -35,6 +35,108 @@ info:
     | **Auth** | `/api/auth/*` | Public | CRM login flow |
     | **Integration v1** | `/api/integration/v1/*` | HTTP Basic | External clients (Decathlon etc.) — legacy contract |
 
+    ### 🔑 Quick Login (recommended)
+    Click the **Quick Login** button in the top-right of this page. It walks you
+    through the three-step OTP flow and auto-fills the Authorize dialog for the
+    correct tier — no manual copy-paste of tokens.
+
+    Behind the scenes:
+
+    1. `POST /auth/login-otp` (or `/mobile/auth/login-otp`, `/client/auth/login-otp`) with `{ identifier }` — issues a 4-digit OTP, TTL 5 minutes, delivered by SMS + Email. In dev (`NOTIFICATIONS_DISABLE=true`) it's logged at `warn` level with `"DEV OTP issued"`.
+    2. `POST /auth/verify-otp` with `{ identifier, otp }` — verifies and consumes the OTP (one-shot), then returns `{ token, user }`.
+    3. The button calls `ui.preauthorizeApiKey('bearerAdmin' | 'bearerTech' | 'bearerClient', token)` so every subsequent **Try it out** sends `Authorization: Bearer <token>` automatically.
+
+    Token = HS256 JWT signed with `JWT_SECRET`. Claims: `sub` (user_id as string), `email`, `role`, `name`, `iat`, `exp`. Default TTL `30d` (env `JWT_EXPIRY`). Also delivered as an httpOnly `token` cookie alongside the JSON body — Swagger UI uses the body value.
+
+    Manual flow (curl) for scripting:
+    ```bash
+    curl -X POST $BASE/auth/login-otp -H 'Content-Type: application/json' \
+         -d '{"identifier":"you@channelplay.in"}'
+    # → read OTP from email/SMS (or server logs in dev)
+    curl -X POST $BASE/auth/verify-otp -H 'Content-Type: application/json' \
+         -d '{"identifier":"you@channelplay.in","otp":1234}'
+    # → { "success": true, "data": { "token": "eyJ…", "user": { … } } }
+    ```
+
+    ### 🔐 How the JWT Auth Token Is Generated
+
+    The OTP flow above mints a **signed JSON Web Token (JWT)**. Here's the full pipeline:
+
+    **Step 1 — OTP request.** `POST /auth/login-otp` writes a 4-digit code into `otp_details` with
+    `valid_up_to = now + 5min` and dispatches it via SMS + Email (suppressed in dev when
+    `NOTIFICATIONS_DISABLE=true` — codes are logged at `warn` level: `"DEV OTP issued"`).
+
+    **Step 2 — OTP verify.** `POST /auth/verify-otp` looks up the matching row, checks
+    `is_expired = 0` and `now < valid_up_to`, then **one-shot consumes** the OTP
+    (`UPDATE otp_details SET is_expired = 1`) so the same code can never be replayed.
+    On match it calls `signUserToken(user)` from `utils/jwt.js`.
+
+    **Step 3 — JWT signing.** `utils/jwt.js::signUserToken()`:
+
+    ```js
+    jwt.sign(
+      {
+        sub:   String(user.user_id),
+        email: user.official_email,
+        role:  user.user_role,        // numeric role_id
+        name:  user.user_name,
+      },
+      process.env.JWT_SECRET,         // HS256 symmetric secret
+      { expiresIn: process.env.JWT_EXPIRY || '30d' }
+    );
+    ```
+
+    **Anatomy of the token** (`header.payload.signature`, all base64url-encoded):
+
+    | Part | Contents | Example (decoded) |
+    |---|---|---|
+    | Header | `{ alg: "HS256", typ: "JWT" }` | algorithm = HMAC-SHA256 |
+    | Payload | Claims below + auto `iat` and `exp` | `{ sub: "1234", email: "x@y", role: 2, name: "Priya", iat: …, exp: … }` |
+    | Signature | `HMACSHA256(base64url(header) + "." + base64url(payload), JWT_SECRET)` | 256-bit MAC — prevents tampering |
+
+    **Standard claims:**
+
+    | Claim | Type | Source / use |
+    |---|---|---|
+    | `sub` | string | `tbl_user.user_id`. Stamped onto `req.user.user_id` after verify |
+    | `email` | string | `tbl_user.official_email`. Visible in logs without a DB hit |
+    | `role` | integer | `tbl_user.user_role` (numeric `role_id`). Drives `role(['admin'])` / `roleByName(['Finance'])` guards |
+    | `name` | string | `tbl_user.user_name`. Display convenience for the FE |
+    | `iat` | unix seconds | Issued-at (auto, `jsonwebtoken` adds it) |
+    | `exp` | unix seconds | Expiry (auto). Default `iat + 30 days` — tunable via env `JWT_EXPIRY` |
+
+    **Delivery — server sends the token TWO ways simultaneously:**
+
+    1. **JSON body** → `data.token`. This is what Swagger UI's **🔑 Quick Login** button reads.
+    2. **httpOnly cookie** named `token` → set with `sameSite: 'lax'`, `secure` in production, `maxAge: 30 days`. Frontends on the same origin send it automatically; Swagger UI ignores it.
+
+    **Verification on every authed request** (`middleware/auth.js`):
+
+    ```js
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = {
+      user_id: decoded.sub,
+      email:   decoded.email,
+      role:    decoded.role,
+      name:    decoded.name,
+    };
+    ```
+
+    Any modification to header/payload (e.g. attempting to bump `role` from 2 → 7) breaks the
+    signature → `verify()` throws → `401`. Because the secret is **never** sent to the client,
+    tokens cannot be forged without leaking `JWT_SECRET`.
+
+    **Inspect the active token:** click **📋 Token** (top-right) — it decodes the payload of
+    every currently-active scheme, shows the claims, the expiry countdown, and lets you copy
+    the raw JWT to clipboard.
+
+    **Security caveats worth knowing:**
+
+    - `JWT_SECRET` is **not** `"esyfixsecret"` (the legacy CRM secret) — tokens are not interoperable across the coexistence window.
+    - 30-day TTL is generous. Rotating `JWT_SECRET` is the only way to revoke before expiry — there's no per-user revocation list today.
+    - The payload is base64-encoded, **not** encrypted. Don't put sensitive data in claims — anyone with the token can read `email` / `role` / `name`.
+    - Technician (`bearerTech`) and Client SPOC (`bearerClient`) tokens are issued by parallel endpoints (`/mobile/auth/verify-otp` and `/client/auth/verify-otp`) — same algorithm, same secret, same expiry, but the verification middleware looks up `tbl_easyfixer` / `tbl_client_contacts` instead of `tbl_user`.
+
     ### Auto-generated
     Endpoint paths in this document are auto-derived from the live Express
     + Joi setup at server boot. Adding a new route + Joi validator is
@@ -60,7 +162,7 @@ info:
 servers:
   - url: http://localhost:5100/api
     description: Local development
-  - url: https://staging.easyfix.in/api
+  - url: https://qa.backend.easyfix.in/api
     description: Staging
   - url: https://core.easyfix.in/api
     description: Production
@@ -72,30 +174,48 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: |
-        Bearer token issued by `POST /auth/verify-otp` for CRM users.
-        JWT signed with `JWT_SECRET`, 30-day expiry. Claims: `sub` (user_id),
-        `email`, `role`, `name`. Use for all `/admin/*` and most `/shared/*`
-        requests.
+        **CRM user Bearer token.**
+
+        - Issued by: `POST /auth/verify-otp` (after `POST /auth/login-otp`)
+        - Signing: HS256, secret = env `JWT_SECRET` (NOT interoperable with legacy `"esyfixsecret"`)
+        - TTL: env `JWT_EXPIRY` (default `30d`)
+        - Claims: `sub` (user_id as string), `email`, `role` (numeric role_id), `name`, `iat`, `exp`
+        - Verification: `middleware/auth.js` → `utils/jwt.js::verifyToken()` stamps `req.user`
+        - Use for: all `/admin/*` and most `/shared/*` requests
+        - Quick fill: use the **Quick Login** button (top-right) — picks `bearerAdmin` automatically when role_id ∈ {2, 3, 5, 7, 11, 12, 13, 15, 17, 18}
     bearerTech:
       type: http
       scheme: bearer
       bearerFormat: JWT
       description: |
-        Bearer token issued by `POST /mobile/auth/verify-otp` for technicians.
-        JWT carries `efr_id`. Use for `/mobile/*`.
+        **Technician Bearer token.**
+
+        - Issued by: `POST /mobile/auth/verify-otp` (after `POST /mobile/auth/login-otp`)
+        - JWT carries `efr_id` from `tbl_easyfixer` (technicians do not live in `tbl_user`)
+        - Same HS256 / 30-day defaults as bearerAdmin
+        - Use for: all `/mobile/*` requests
+        - Quick fill: use **Quick Login** → tier `2`
     bearerClient:
       type: http
       scheme: bearer
       bearerFormat: JWT
       description: |
-        Bearer token issued by `POST /client/auth/verify-otp` for client SPOCs.
-        JWT carries `contact_id` + `client_id`. Use for `/client/*`.
+        **Client SPOC Bearer token.**
+
+        - Issued by: `POST /client/auth/verify-otp` (after `POST /client/auth/login-otp`)
+        - JWT carries `contact_id` + `client_id` from `tbl_client_contacts`
+        - Same HS256 / 30-day defaults as bearerAdmin
+        - Use for: all `/client/*` requests
+        - Quick fill: use **Quick Login** → tier `3`
     basicIntegration:
       type: http
       scheme: basic
       description: |
-        HTTP Basic Auth — for `/integration/v1/*` only. Credentials sourced
-        from the legacy `tbl_client_website` table.
+        **HTTP Basic Auth — `/integration/v1/*` only.**
+
+        - Credentials sourced from the legacy `tbl_client_website` table (NOT `tbl_user`)
+        - Response envelope is the legacy `{status: "200", message, data}` shape — never mix with modern endpoints
+        - Quick Login does NOT cover this scheme — open the Authorize dialog and enter username/password manually
 
   schemas:
     ModernOk:
