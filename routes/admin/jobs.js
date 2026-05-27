@@ -1547,20 +1547,25 @@ const Joi = require('joi');
 /*
  * commentBody — the `comment_on` field is a legacy enum that the
  * CRM uses to classify the comment shape. Values verified against
- * legacy `tbl_job_comment` data:
- *   1 = General remark
- *   2 = Reschedule (the row also carries `appointment_on`)
- *   3 = Cancel reason
- *   4 = Mark Incomplete reason
- *  17 = Enquiry — Confirm & Schedule outcome path (added 2026-05-26).
- *       Co-stored alongside the status=7 transition.
+ * legacy `tbl_job_comment` data (full map in services/job-comment.service.js):
+ *   1  = created / schedule / approval
+ *   2  = check_in
+ *   3  = check_out
+ *   4  = in_progress (new-app addition)
+ *  16  = call_later  (Unreachable outcome)
+ *  17  = enquiry     (Enquiry outcome)
+ *
+ * `job_stage` is the human-readable label persisted alongside the
+ * numeric code on deploys that carry the column (column-probed in the
+ * service layer). Optional; legacy DBs ignore it.
  */
 const commentBody = Joi.object({
   comments:       Joi.string().trim().min(1).max(2000).required(),
-  comment_on:     Joi.number().integer().valid(1, 2, 3, 4, 17).required(),
+  comment_on:     Joi.number().integer().valid(1, 2, 3, 4, 16, 17).required(),
   appointment_on: Joi.date().iso().optional(),
   enum_reason_id: Joi.number().integer().positive().optional(),
   efr_id:         Joi.number().integer().positive().optional(),
+  job_stage:      Joi.string().max(60).allow('', null).optional(),
 });
 
 router.get('/:id/comments', validate(idParam, 'params'), scopedJob, async (req, res, next) => {

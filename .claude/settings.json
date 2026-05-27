@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '📝 Reminder: If you made structural changes, update CLAUDE.md.'"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "Before finishing, if you wrote or edited code, run all checks: (1) Code Review — error handling, response format, code reuse. (2) Security — no SQL injection, no hardcoded secrets, auth on routes, no PII in logs. (3) SQL — parameterized queries, no SELECT *, indexes on WHERE columns, no N+1. (4) Performance — parallelize independent queries, pagination, no unnecessary re-renders. (5) Conventions — no console.log in production, input validation. Report issues with file:line. Skip if no code changed."
+          }
+        ]
+      }
+    ]
+  }
+}

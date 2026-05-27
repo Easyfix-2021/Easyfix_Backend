@@ -1319,6 +1319,14 @@ function statusToEventName(prevStatus, newStatus) {
   if (COMPLETED_STATES.has(newStatus))    return 'TechVisitComplete';
   if (newStatus === STATUS.CANCELLED)     return 'CancelJob';
   if (newStatus === STATUS.REVISIT)       return 'TechVisitInComplete';
+  // Unreachable outcome → CustomerNotReachable. Legacy CRM didn't
+  // dispatch a webhook for this transition, but the same orchestrator
+  // also gates the customer-facing SMS (CUSTOMER_NOT_REACHABLE
+  // template). Returning a named event lets us hook either or both
+  // from notification-orchestrator.service.js without forking the
+  // dispatch path. Enquiry doesn't get an event because legacy CRM
+  // doesn't notify the customer when an order is marked Enquiry.
+  if (newStatus === STATUS.CALL_LATER)    return 'CustomerNotReachable';
   return null;
 }
 
@@ -1419,6 +1427,30 @@ async function hasEnquiryColumns() {
   return _enquiryColumnsExist;
 }
 
+/*
+ * Column-presence probe for `tbl_job.call_later` — flag set to 1 when
+ * the Unreachable outcome transition lands. Legacy CRM persisted this
+ * flag for downstream reports; new deploys may not have the column
+ * yet, in which case we still transition the status but skip the flag.
+ */
+let _callLaterColumnExists = null;
+async function hasCallLaterColumn() {
+  if (_callLaterColumnExists != null) return _callLaterColumnExists;
+  try {
+    const [rows] = await pool.query(
+      `SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME   = 'tbl_job'
+          AND COLUMN_NAME  = 'call_later'
+        LIMIT 1`,
+    );
+    _callLaterColumnExists = rows.length > 0;
+  } catch {
+    _callLaterColumnExists = false;
+  }
+  return _callLaterColumnExists;
+}
+
 async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
   if (!ALL_STATUS_VALUES.has(Number(status))) {
     const err = new Error(`invalid status ${status}; allowed: ${[...ALL_STATUS_VALUES].join(',')}`);
@@ -1436,6 +1468,18 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
   if (Number(status) === STATUS.CANCELLED) {
     sets.push('cancel_date_time = ?', 'cancel_reason_id = ?', 'cancel_comment = ?', 'cancel_by = ?');
     values.push(new Date(), reasonId || null, comment || null, actorId);
+  } else if (Number(status) === STATUS.CALL_LATER) {
+    // UNREACHABLE / CALL_LATER outcome — set the call_later flag (if
+    // the column exists) and stamp `cancel_by` so the audit trail
+    // captures WHO marked it. Legacy CRM also persisted reason +
+    // comment, but only on tbl_job_comment (comment_on=16) — no
+    // dedicated tbl_job columns for unreachable in the legacy schema.
+    if (await hasCallLaterColumn()) {
+      sets.push('call_later = ?');
+      values.push(1);
+    }
+    sets.push('cancel_by = ?');
+    values.push(actorId);
   } else if (Number(status) === STATUS.ENQUIRY) {
     // ENQUIRY stamps a parallel set of columns to CANCELLED:
     //   enquiry_date_time = NOW()
