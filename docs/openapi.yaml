@@ -71,39 +71,86 @@ info:
     (`UPDATE otp_details SET is_expired = 1`) so the same code can never be replayed.
     On match it calls `signUserToken(user)` from `utils/jwt.js`.
 
-    **Step 3 — JWT signing.** `utils/jwt.js::signUserToken()`:
+    **Step 3 — JWT signing.** Each tier signs a slightly DIFFERENT claim set
+    because each tier authenticates a different user-table row. Same HS256
+    algorithm, same `JWT_SECRET`, same default `30d` TTL across all three.
+
+    **CRM Admin** — `utils/jwt.js::signUserToken()` (verify-otp on
+    `/api/auth/*`). Login accepts EITHER email OR mobile as `identifier` —
+    both resolve to the same `tbl_user` row, and the JWT always carries the
+    canonical `official_email` regardless of which one the user typed:
 
     ```js
     jwt.sign(
       {
-        sub:   String(user.user_id),
-        email: user.official_email,
-        role:  user.user_role,        // numeric role_id
+        sub:   String(user.user_id),       // string user_id
+        email: user.official_email,        // always populated from tbl_user
+        role:  user.user_role,             // numeric role_id
         name:  user.user_name,
       },
-      process.env.JWT_SECRET,         // HS256 symmetric secret
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRY || '30d' }
+    );
+    ```
+
+    **Technician** — `tech-auth.service.js` (verify-otp on `/api/mobile/*`).
+    Login is mobile-only — no email path. JWT carries `mobile`, NOT `email`:
+
+    ```js
+    jwt.sign(
+      {
+        sub:    `efr:${tech.efr_id}`,      // "efr:" prefix disambiguates from user_id
+        name:   tech.efr_name,
+        mobile: tech.efr_no,               // technician's 10-digit mobile
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRY || '30d' }
+    );
+    ```
+
+    **Client SPOC** — `client-auth.service.js` (verify-otp on `/api/client/*`).
+    Login is email-only. JWT carries `email` + `clientId`:
+
+    ```js
+    jwt.sign(
+      {
+        sub:      `spoc:${spoc.id}`,        // "spoc:" prefix
+        clientId: spoc.client_id,           // which client this SPOC belongs to
+        name:     spoc.contact_name,
+        email:    spoc.contact_email,
+      },
+      process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRY || '30d' }
     );
     ```
 
     **Anatomy of the token** (`header.payload.signature`, all base64url-encoded):
 
-    | Part | Contents | Example (decoded) |
+    | Part | Contents | Example (decoded — CRM token) |
     |---|---|---|
     | Header | `{ alg: "HS256", typ: "JWT" }` | algorithm = HMAC-SHA256 |
-    | Payload | Claims below + auto `iat` and `exp` | `{ sub: "1234", email: "x@y", role: 2, name: "Priya", iat: …, exp: … }` |
+    | Payload | Tier-specific claims + auto `iat`/`exp` | `{ sub: "1234", email: "x@y", role: 2, name: "Priya", iat: …, exp: … }` |
     | Signature | `HMACSHA256(base64url(header) + "." + base64url(payload), JWT_SECRET)` | 256-bit MAC — prevents tampering |
 
-    **Standard claims:**
+    **Quick reference — what each tier's JWT looks like:**
 
-    | Claim | Type | Source / use |
-    |---|---|---|
-    | `sub` | string | `tbl_user.user_id`. Stamped onto `req.user.user_id` after verify |
-    | `email` | string | `tbl_user.official_email`. Visible in logs without a DB hit |
-    | `role` | integer | `tbl_user.user_role` (numeric `role_id`). Drives `role(['admin'])` / `roleByName(['Finance'])` guards |
-    | `name` | string | `tbl_user.user_name`. Display convenience for the FE |
-    | `iat` | unix seconds | Issued-at (auto, `jsonwebtoken` adds it) |
-    | `exp` | unix seconds | Expiry (auto). Default `iat + 30 days` — tunable via env `JWT_EXPIRY` |
+    | Tier | Login identifier | JWT carries | JWT does NOT carry | `sub` prefix |
+    |---|---|---|---|---|
+    | **CRM Admin** (`bearerAdmin`) | email OR mobile (either works) | `sub`, `email`, `role`, `name` | `mobile` | (none — bare user_id as string) |
+    | **Technician** (`bearerTech`) | mobile only | `sub`, `mobile`, `name` | `email`, `role` | `efr:<efr_id>` |
+    | **Client SPOC** (`bearerClient`) | email only | `sub`, `email`, `clientId`, `name` | `mobile`, `role` | `spoc:<contact_id>` |
+
+    All three tiers also carry `iat` (issued-at) and `exp` (expiry) — added
+    automatically by `jsonwebtoken`. The `sub` prefix is how the auth
+    middleware knows which user table (`tbl_user` / `tbl_easyfixer` /
+    `tbl_client_contacts`) to look up without a separate DB call.
+
+    **Common question — "If I log in with mobile on CRM, does the JWT have email or mobile?"**
+    For CRM, the JWT always carries `email` (resolved from the `tbl_user` row, regardless of
+    whether `identifier` was the email or the 10-digit mobile). It does NOT carry `mobile` as
+    a claim. Whatever you typed at login is just a lookup key — the JWT writes the canonical
+    `official_email` back. For Technician tokens, the JWT has `mobile` (no email). For Client
+    SPOC tokens, the JWT has `email` (no mobile). Different tiers, different shapes.
 
     **Delivery — server sends the token TWO ways simultaneously:**
 
