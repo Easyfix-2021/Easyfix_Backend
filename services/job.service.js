@@ -71,6 +71,14 @@ const LIST_COLUMNS = `
   j.created_date_time, j.requested_date_time, j.scheduled_date_time,
   j.checkin_date_time, j.checkout_date_time,
   j.ticket_created_date_time, j.time_slot,
+  /*
+   * last_update_time exposed on LIST (added 2026-05-28) so the FE can
+   * derive a "Draft" indicator for Unconfirmed (status=9) rows whose
+   * last_update_time is meaningfully later than created_date_time —
+   * a sign that an operator clicked Save Draft on the Confirm modal.
+   * No new column needed; just SELECTing an existing tbl_job column.
+   */
+  j.last_update_time,
   j.client_spoc, j.client_spoc_name,
   LEFT(j.remarks, 500) AS remarks,
   j.fk_customer_id, cu.customer_name, cu.customer_mob_no,
