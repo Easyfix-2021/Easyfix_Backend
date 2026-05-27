@@ -46,30 +46,61 @@ router.post('/auth/verify-otp', validate(Joi.object({
     const r = await techAuth.verifyLoginOtp(req.body.mobile, req.body.otp);
     if (!r.ok) return modernError(res, 401, r.reason);
 
-    // Mirror legacy device-info upsert (ACD_APIs LoginAction.verifyOtp lines
-    // ~210-260: same INSERT/ON DUPLICATE KEY shape against device_info).
-    // Only fires when the client actually sent a deviceId — keeps the modern
-    // /mobile/device endpoint usable on its own.
+    // Device-info upsert. device_info schema reality (verified 2026-05-27
+    // against QA `SHOW CREATE TABLE`):
+    //   - NO unique constraint exists on (user_id, device_id) — only PK on
+    //     `id` + a non-unique secondary key on user_id. This means
+    //     `INSERT ... ON DUPLICATE KEY UPDATE` SILENTLY FAILS to upsert
+    //     (no constraint to violate → always INSERT → row count grows
+    //     unbounded per login). Therefore we manually UPDATE-then-INSERT.
+    //   - `is_logged_in` is VARCHAR(255), not TINYINT — values are string
+    //     '1' / '0' to match legacy data shape.
+    //   - Engine is MyISAM — no transactions. The three statements below
+    //     run sequentially; a partial failure mid-sequence (rare) leaves
+    //     a benign half-state that the next login self-heals.
+    //
+    // Single-active-session policy: on every verify-otp with a deviceId,
+    // mark all OTHER device rows for this user as `is_logged_in = '0'`.
+    // The next push fan-out reads only is_logged_in='1' rows so the old
+    // phone stops receiving notifications immediately.
     const fcm = req.body.fcmToken || req.body.fireBaseToken || null;
     let deviceRegistered = false;
     if (req.body.deviceId) {
       try {
+        // 1) Kick out every OTHER device for this technician
         await pool.query(
-          `INSERT INTO device_info
-             (user_id, device_id, fire_base_token, app_version_name, language, is_logged_in, last_login_time)
-           VALUES (?, ?, ?, ?, ?, 1, NOW())
-           ON DUPLICATE KEY UPDATE
-             fire_base_token   = VALUES(fire_base_token),
-             app_version_name  = COALESCE(VALUES(app_version_name), app_version_name),
-             language          = COALESCE(VALUES(language), language),
-             is_logged_in      = 1,
-             last_login_time   = NOW()`,
-          [r.tech.efr_id, req.body.deviceId, fcm, req.body.appVersion || null, req.body.language || null],
+          "UPDATE device_info SET is_logged_in = '0' WHERE user_id = ? AND device_id <> ?",
+          [r.tech.efr_id, req.body.deviceId],
         );
+
+        // 2) Try to UPDATE the row for THIS (user_id, device_id) — refreshes
+        //    FCM token, app version, language, marks logged-in, bumps time
+        const [upd] = await pool.query(
+          `UPDATE device_info SET
+             fire_base_token   = ?,
+             app_version_name  = COALESCE(?, app_version_name),
+             language          = COALESCE(?, language),
+             is_logged_in      = '1',
+             last_login_time   = NOW()
+           WHERE user_id = ? AND device_id = ?`,
+          [fcm, req.body.appVersion || null, req.body.language || null,
+           r.tech.efr_id, req.body.deviceId],
+        );
+
+        // 3) No matching row → INSERT fresh. Matches the column set + types
+        //    used by the standalone /mobile/device endpoint.
+        if (upd.affectedRows === 0) {
+          await pool.query(
+            `INSERT INTO device_info
+               (user_id, device_id, fire_base_token, app_version_name, language, is_logged_in, last_login_time)
+             VALUES (?, ?, ?, ?, ?, '1', NOW())`,
+            [r.tech.efr_id, req.body.deviceId, fcm, req.body.appVersion || null, req.body.language || null],
+          );
+        }
         deviceRegistered = true;
       } catch (devErr) {
-        // Soft-fail on device-info issues — login still succeeds, push just
-        // won't reach this device until /mobile/device is hit explicitly.
+        // Soft-fail — login still succeeds, push just won't reach this
+        // device until /mobile/device is hit explicitly.
         require('../../logger').warn(
           { err: devErr.message, efrId: r.tech.efr_id, deviceId: req.body.deviceId },
           'device_info upsert failed during verify-otp',
