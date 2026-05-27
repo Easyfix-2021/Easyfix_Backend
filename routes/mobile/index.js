@@ -18,15 +18,78 @@ router.post('/auth/login-otp', validate(Joi.object({ mobile: mobile.required() }
   } catch (e) { next(e); }
 });
 
+// Verify OTP — mirrors legacy `POST /test-api/api/verify-otp` (UserDto) so the
+// app can upgrade in-place. Accepts the same field names the legacy controller
+// did (deviceId, fireBaseToken) plus our modern camelCase (fcmToken). If any
+// device fields are supplied, we upsert `device_info` in the SAME request so
+// the technician is push-reachable immediately after login — no second
+// /mobile/device round-trip needed (the standalone /mobile/device endpoint
+// stays for token-rotation cases).
+//
+// Legacy reference: https://qa.easyfix.in/test-api/swagger-ui/index.html#/login-controller/verifyOtpUsingPOST
+//   request: { userId, otp, deviceId, fireBaseToken, userName }
+//   response: { status, message, data: <session-with-device> }
+// Our modern envelope wraps the same fields under { success, data }.
 router.post('/auth/verify-otp', validate(Joi.object({
-  mobile: mobile.required(),
-  otp: Joi.number().integer().min(1000).max(9999).required(),
+  mobile:        mobile.required(),
+  otp:           Joi.number().integer().min(1000).max(9999).required(),
+  // Optional device fields — when present, the device is registered for push
+  // notifications inside this same call. fireBaseToken is the legacy name;
+  // fcmToken is the new one. Accept either, prefer the explicit fcmToken.
+  deviceId:      Joi.string().trim().max(255).optional(),
+  fcmToken:      Joi.string().trim().max(4096).optional(),
+  fireBaseToken: Joi.string().trim().max(4096).optional(),
+  appVersion:    Joi.string().trim().max(50).optional(),
+  language:      Joi.string().trim().max(10).optional(),
 })), async (req, res, next) => {
   try {
     const r = await techAuth.verifyLoginOtp(req.body.mobile, req.body.otp);
     if (!r.ok) return modernError(res, 401, r.reason);
+
+    // Mirror legacy device-info upsert (ACD_APIs LoginAction.verifyOtp lines
+    // ~210-260: same INSERT/ON DUPLICATE KEY shape against device_info).
+    // Only fires when the client actually sent a deviceId — keeps the modern
+    // /mobile/device endpoint usable on its own.
+    const fcm = req.body.fcmToken || req.body.fireBaseToken || null;
+    let deviceRegistered = false;
+    if (req.body.deviceId) {
+      try {
+        await pool.query(
+          `INSERT INTO device_info
+             (user_id, device_id, fire_base_token, app_version_name, language, is_logged_in, last_login_time)
+           VALUES (?, ?, ?, ?, ?, 1, NOW())
+           ON DUPLICATE KEY UPDATE
+             fire_base_token   = VALUES(fire_base_token),
+             app_version_name  = COALESCE(VALUES(app_version_name), app_version_name),
+             language          = COALESCE(VALUES(language), language),
+             is_logged_in      = 1,
+             last_login_time   = NOW()`,
+          [r.tech.efr_id, req.body.deviceId, fcm, req.body.appVersion || null, req.body.language || null],
+        );
+        deviceRegistered = true;
+      } catch (devErr) {
+        // Soft-fail on device-info issues — login still succeeds, push just
+        // won't reach this device until /mobile/device is hit explicitly.
+        require('../../logger').warn(
+          { err: devErr.message, efrId: r.tech.efr_id, deviceId: req.body.deviceId },
+          'device_info upsert failed during verify-otp',
+        );
+      }
+    }
+
     res.cookie('techToken', r.token, { httpOnly: true, sameSite: 'lax', maxAge: 30 * 86400 * 1000 });
-    modernOk(res, { token: r.token, tech: { efr_id: r.tech.efr_id, name: r.tech.efr_name } });
+    modernOk(res, {
+      token: r.token,
+      tech: {
+        efr_id: r.tech.efr_id,
+        name:   r.tech.efr_name,
+        mobile: r.tech.efr_no,
+        email:  r.tech.efr_email,
+      },
+      device: req.body.deviceId
+        ? { registered: deviceRegistered, deviceId: req.body.deviceId, fcmStored: Boolean(fcm) }
+        : { registered: false },
+    });
   } catch (e) { next(e); }
 });
 
