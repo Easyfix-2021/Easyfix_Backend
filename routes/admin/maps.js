@@ -128,7 +128,27 @@ router.get('/geocode', validate(Joi.object({
     const data = await r.json();
     if (data.status !== 'OK') {
       logger.warn({ status: data.status, error_message: String(data.error_message || '').slice(0, 200) }, 'Google geocode error');
-      return modernError(res, 502, `Google geocode failed: ${data.status}`);
+      /*
+       * Map common Google failure codes to actionable operator hints
+       * (2026-05-28). The bare `REQUEST_DENIED` we used to surface was
+       * indistinguishable from a genuine quota / outage — but in
+       * practice it almost always means "Geocoding API is not
+       * enabled on this key" because Places Autocomplete shares the
+       * same key but enables independently in GCP. Returning a
+       * specific message lets the FE toast something operators can act
+       * on instead of opening a ticket.
+       */
+      let msg;
+      if (data.status === 'REQUEST_DENIED') {
+        msg = 'Geocoding API rejected this key — enable "Geocoding API" on the same GCP key that already serves Places Autocomplete (Console → APIs & Services → Library → Geocoding API → Enable), then check API key restrictions still allow this server\'s IP / referer.';
+      } else if (data.status === 'OVER_QUERY_LIMIT' || data.status === 'OVER_DAILY_LIMIT') {
+        msg = 'Geocoding API quota/limit reached — check billing or raise the cap.';
+      } else if (data.status === 'INVALID_REQUEST') {
+        msg = 'Geocoding API rejected the request — likely empty or malformed params.';
+      } else {
+        msg = `Google geocode failed: ${data.status}`;
+      }
+      return modernError(res, 502, msg);
     }
     const first = data.results?.[0];
     if (!first) return modernError(res, 404, 'no geocode results');
@@ -151,6 +171,34 @@ router.get('/geocode', validate(Joi.object({
     cacheSet(cacheKey, out);
     modernOk(res, out);
   } catch (e) { next(e); }
+});
+
+/*
+ * GET /admin/maps/config (2026-05-28)
+ *
+ * Runtime fallback for the FE's Google Maps JS API key. Next.js bakes
+ * NEXT_PUBLIC_* env vars at BUILD time — so a QA deploy that ships
+ * without the key in its build env cannot pick it up later from a
+ * runtime env change. This endpoint lets the FE fetch the key at
+ * component mount as a backstop:
+ *
+ *   - GOOGLE_MAPS_API_KEY_PUBLIC (preferred, dedicated for FE JS API)
+ *   - GOOGLE_MAPS_API_KEY        (legacy single-key deploy)
+ *   - null                        (graceful: FE shows "Map unavailable",
+ *                                  address form still works)
+ *
+ * Security: this key is intended to be embedded in browser bundles per
+ * Google's design — it's protected by HTTP-referer restrictions on the
+ * GCP side, not by secrecy. Returning it here is no worse than baking
+ * it into the JS bundle. The endpoint sits under /admin/* so only
+ * authenticated ops users can fetch it (consistency with the rest of
+ * the FE → BE call surface).
+ */
+router.get('/config', (_req, res) => {
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY_PUBLIC
+              || process.env.GOOGLE_MAPS_API_KEY
+              || null;
+  modernOk(res, { apiKey });
 });
 
 module.exports = router;

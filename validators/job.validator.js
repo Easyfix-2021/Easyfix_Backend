@@ -26,6 +26,13 @@ const listQuery = Joi.object({
   // `isEscalated` — drives the legacy CRM header's "Escalated Jobs" filter.
   // Same accepted shape as `assigned` for URLSearchParams compatibility.
   isEscalated: Joi.alternatives(Joi.boolean(), Joi.string().valid('true', 'false')).optional(),
+  // `noServices` (2026-05-28) — narrows the list to BOOKED jobs with
+  // ZERO active rows in tbl_job_services. Used by the dashboard
+  // AttentionSummary "Booked With No Services" tile so the click-through
+  // lands ops directly on the anomaly rows rather than a generic BOOKED
+  // tab. URLSearchParams ships the value as the string 'true'/'false';
+  // accept both shapes for parity with the other boolean-ish filters.
+  noServices: Joi.alternatives(Joi.boolean(), Joi.string().valid('true', 'false')).optional(),
   clientId: intId.optional(),
   cityId: intId.optional(),
   ownerId: intId.optional(),

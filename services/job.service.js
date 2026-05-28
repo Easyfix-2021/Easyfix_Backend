@@ -236,6 +236,14 @@ async function list({
   // Dashboard AttentionSummary tile drill-downs (2026-05-22):
   quotationStatus,           // enum — 'approved' | 'rejected'
   requestedBefore,           // 'now' or ISO date — Running Late tile
+  /*
+   * `noServices` (2026-05-28) — Booked-No-Services tile drill-down.
+   * When truthy, restricts the list to BOOKED rows that have zero
+   * ACTIVE tbl_job_services entries. Mirrors the predicate used by
+   * the attention-summary count + the LIST projection's service_count
+   * subquery, so counts and rows agree by construction.
+   */
+  noServices,
   startDate, endDate,
   scope,
   limit = 50, offset = 0,
@@ -304,6 +312,20 @@ async function list({
   if (assigned !== undefined && assigned !== null && assigned !== '') {
     const wantAssigned = assigned === true || assigned === 'true' || assigned === 1 || assigned === '1';
     clauses.push(wantAssigned ? 'j.fk_easyfixter_id IS NOT NULL' : 'j.fk_easyfixter_id IS NULL');
+  }
+  /*
+   * Booked-No-Services filter (2026-05-28). Forces both job_status = 0
+   * (so callers don't need to set status separately) AND an anti-join
+   * against tbl_job_services. The implicit status pin matches the
+   * attention-summary counter's predicate exactly — a deep-link from
+   * the tile must produce the same set the tile counted, not a superset.
+   */
+  if (noServices === true || noServices === 'true' || noServices === 1 || noServices === '1') {
+    clauses.push('j.job_status = 0');
+    clauses.push(`NOT EXISTS (
+      SELECT 1 FROM tbl_job_services js
+       WHERE js.job_id = j.job_id AND js.job_service_status = 1
+    )`);
   }
   if (clientId != null)    { clauses.push('j.fk_client_id = ?');     params.push(clientId); }
   if (easyfixerId != null) { clauses.push('j.fk_easyfixter_id = ?'); params.push(easyfixerId); }
