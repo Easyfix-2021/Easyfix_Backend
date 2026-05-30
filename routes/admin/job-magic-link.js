@@ -39,6 +39,13 @@ const idParam = Joi.object({
 
 const sendBody = Joi.object({
   action: Joi.string().valid('first', 'reminder', 'resend').default('first'),
+  // Admin-only escape hatch for the per-client send cap. When `true`,
+  // the BE bypasses `magic_link_send_count < max_send_count` so an
+  // operator can keep sending past the configured limit. Route-side
+  // checks that the caller's role is Admin before honouring it;
+  // non-admin override attempts get a 403 (the FE never offers the
+  // button to non-admin users, so this is a defence-in-depth check).
+  override: Joi.boolean().default(false),
 });
 
 /*
@@ -77,7 +84,7 @@ router.post(
   async (req, res, next) => {
     try {
       const jobId = Number(req.params.id);
-      let { action } = req.body;
+      let { action, override } = req.body;
 
       // Pre-check A: job exists + is Unconfirmed
       const [[job]] = await pool.query(
@@ -114,11 +121,36 @@ router.post(
         );
       }
 
-      // Pre-check C: per-job send cap
-      const currentCount = Number(job.magic_link_send_count || 0);
-      if (currentCount >= 3) {
-        return modernError(res, 429, 'Send limit reached (3 sends max per order)');
+      // Pre-check C: admin role required when override=true.
+      // `req.userRole` is populated by the `role(['admin'])` middleware
+      // mounted at routes/admin/index.js (sets the full tbl_role row
+      // including role_name). Only the literal 'Admin' role_name can
+      // bypass the cap — broader 'admin' GROUP roles (Executive Supply,
+      // Project Manager, etc.) don't qualify. Conservative on purpose:
+      // tightening later is harder than loosening.
+      if (override === true) {
+        const roleName = (req.userRole?.role_name || '').toLowerCase();
+        if (roleName !== 'admin') {
+          return modernError(
+            res,
+            403,
+            'Override requires Admin role',
+          );
+        }
+        logger.info(
+          { jobId, userId: req.user?.user_id, role: req.userRole?.role_name },
+          'magic-link: admin override invoked',
+        );
       }
+
+      // Per-job send cap is now enforced atomically inside
+      // magicLinkService.sendForJob — including the per-client
+      // configurable max (read from tbl_client_custom_properties under
+      // c_prop_name='max_magic_link_send_count', default 3) and the
+      // override-bypass path. Removed the duplicate route-side pre-check
+      // here so the cap definition stays in one place; the service
+      // throws 429 SEND_LIMIT_REACHED with the actual numeric cap in
+      // the message when the limit is hit.
 
       // Defensive action coercion (see docblock)
       if (action === 'first' && job.magic_link_sent_at != null) {
@@ -129,7 +161,11 @@ router.post(
         action = 'resend';
       }
 
-      const result = await magicLinkService.sendForJob(jobId, { action }, pool);
+      const result = await magicLinkService.sendForJob(
+        jobId,
+        { action, override: !!override },
+        pool,
+      );
       return modernOk(res, result);
     } catch (e) {
       return next(e);

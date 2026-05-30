@@ -138,10 +138,38 @@ const LIST_COLUMNS = `
   j.magic_link_sent_at,
   j.magic_link_send_count,
   j.magic_link_last_action,
+  /*
+   * magic_link_max_send_count — per-client configurable cap on how many
+   * magic-link sends are allowed before the Trigger button locks for
+   * non-Admin operators. Read from tbl_client_custom_properties under
+   * c_prop_name='max_magic_link_send_count' (same shape pattern as the
+   * auto_process_unconfirmed_order toggle). Defaults to 3 when the
+   * client hasn't set a custom value.
+   *
+   * CAST UNSIGNED guards against ops storing the value as '3 ' or
+   * 'three' — NULL bubbles to the COALESCE, keeping the default safe.
+   */
+  COALESCE(
+    (SELECT CAST(NULLIF(ccp_max.c_prop_values, '') AS UNSIGNED)
+       FROM tbl_client_custom_properties ccp_max
+      WHERE ccp_max.client_id    = j.fk_client_id
+        /*
+         * Case-insensitive + underscore-tolerant comparison so the same
+         * row matches whether c_prop_name was stored as legacy snake_case
+         * ('max_magic_link_send_count'), lower-case-with-spaces
+         * ('max magic-link send count'), or the new Title Case canonical
+         * form ('Max Magic-Link Send Count'). Lets the FE rename rows
+         * without coordinating a BE deploy.
+         */
+        AND LOWER(REPLACE(ccp_max.c_prop_name, '_', ' ')) = LOWER('Max Magic-Link Send Count')
+        AND ccp_max.status       = 1
+      LIMIT 1),
+    3
+  ) AS magic_link_max_send_count,
   (EXISTS (
      SELECT 1 FROM tbl_client_custom_properties ccp
       WHERE ccp.client_id = j.fk_client_id
-        AND ccp.c_prop_name = 'auto_process_unconfirmed_order'
+        AND LOWER(REPLACE(ccp.c_prop_name, '_', ' ')) = LOWER('Auto Process Unconfirmed Order')
         AND LOWER(ccp.c_prop_values) = 'true'
         AND ccp.status = 1
    )) AS client_opted_in

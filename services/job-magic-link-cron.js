@@ -30,7 +30,7 @@ async function runHourlySweep() {
         FROM tbl_job j
         JOIN tbl_client_custom_properties cp
           ON cp.client_id = j.fk_client_id
-         AND cp.c_prop_name = 'auto_process_unconfirmed_order'
+         AND LOWER(REPLACE(cp.c_prop_name, '_', ' ')) = LOWER('Auto Process Unconfirmed Order')
          AND LOWER(cp.c_prop_values) = 'true'
          AND cp.status = 1
        WHERE j.job_status = 9

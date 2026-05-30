@@ -62,6 +62,15 @@ const submitBody = Joi.object({
   address_instruction: Joi.string().trim().max(500).allow('').optional(),
   job_desc: Joi.string().trim().max(500).allow('').optional(),
 
+  // Per-client custom-property fields (driven by tbl_client_custom_properties;
+  // see services/job-magic-link.service.js::fetchPrefill). The FE only renders
+  // these inputs when the client has the matching row, and only marks them
+  // required when `mandatory=true`. They're always optional at the validator
+  // level — `mandatory` is a per-CLIENT contract, not a per-route contract.
+  branch_details: Joi.string().trim().max(200).allow('').optional(),
+  building_name:  Joi.string().trim().max(200).allow('').optional(),
+  product_code:   Joi.string().trim().max(200).allow('').optional(),
+
   services: Joi.array().items(serviceLine).max(50).optional(),
 });
 

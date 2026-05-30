@@ -33,6 +33,31 @@
 
 const { pool } = require('../db');
 
+/**
+ * Probe whether tbl_client_service has a service_type_ids column.
+ *
+ * Why a runtime probe (vs assume): tbl_client_service schema has drifted
+ * across environments — most deploys carry the CSV `service_type_ids`
+ * column, but older snapshots lack it (verified after a 500 with
+ * "Unknown column 'cs.service_type_ids' in 'field list'"). We can't
+ * alter the shared schema (5-service rule), so we adapt at read/write
+ * time. Same pattern as cityHasIsActive in job-magic-link.service.js.
+ * Memoised after first call.
+ */
+let _stIdsProbed = false;
+let _hasServiceTypeIds = false;
+async function clientServiceHasTypeIds(pool) {
+  if (_stIdsProbed) return _hasServiceTypeIds;
+  try {
+    await pool.query('SELECT service_type_ids FROM tbl_client_service LIMIT 1');
+    _hasServiceTypeIds = true;
+  } catch (_e) {
+    _hasServiceTypeIds = false;
+  }
+  _stIdsProbed = true;
+  return _hasServiceTypeIds;
+}
+
 /* ─── CSV helpers ─────────────────────────────────────────────────── */
 
 // Parse `"1,2,3"` (or null/empty) into a deduped sorted numeric array.
@@ -80,17 +105,21 @@ async function listForClient(clientId) {
   //   cs.total_amount      (NOT `total_charge`)
   //   cs.charge_type       (int FK to charge type)
   //   cs.service_status    (0 = soft-deleted)
-  //   cs.service_type_ids  (CSV)
+  //   cs.service_type_ids  (CSV) — may be absent on older deploys; probed.
   // The 6 cost columns (`easyfix_direct_fixed` etc.) ALSO live on
   // tbl_client_service — they're surfaced by the Rate Cards tab. We
   // skip them here to keep this projection lean; Rate Cards joins
   // through a separate query.
   // Result aliases preserved (`service_category_id`, `total_charge`) so
   // FE contract stays stable while the DB stays legacy-shaped.
+  const hasTypeIds = await clientServiceHasTypeIds(pool);
+  const typeIdsProjection = hasTypeIds
+    ? 'cs.service_type_ids'
+    : 'NULL AS service_type_ids';
   const [rows] = await pool.query(
     `SELECT cs.client_service_id, cs.client_id,
             cs.service_catg_id    AS service_category_id,
-            cs.service_type_ids,
+            ${typeIdsProjection},
             cs.charge_type,
             cs.total_amount       AS total_charge,
             cs.service_status,
@@ -145,20 +174,23 @@ async function listForClient(clientId) {
 
 async function create(clientId, body) {
   const csv = idsToCsv(body.serviceTypeIds);
+  const hasTypeIds = await clientServiceHasTypeIds(pool);
   // Real columns on tbl_client_service: service_catg_id + total_amount
-  // (NOT service_category_id + total_charge).
+  // (NOT service_category_id + total_charge). service_type_ids may be
+  // absent on older deploys — omit it from the INSERT when missing so
+  // writes still succeed; multi-select just doesn't persist there.
+  const cols = ['client_id', 'service_catg_id'];
+  const vals = [clientId, body.serviceCategoryId];
+  if (hasTypeIds) {
+    cols.push('service_type_ids');
+    vals.push(csv);
+  }
+  cols.push('charge_type', 'total_amount', 'service_status');
+  vals.push(body.chargeType || null, body.totalCharge ?? null, 1);
+  const placeholders = cols.map(() => '?').join(', ');
   const [ins] = await pool.query(
-    `INSERT INTO tbl_client_service
-       (client_id, service_catg_id, service_type_ids,
-        charge_type, total_amount, service_status)
-     VALUES (?, ?, ?, ?, ?, 1)`,
-    [
-      clientId,
-      body.serviceCategoryId,
-      csv,
-      body.chargeType || null,
-      body.totalCharge ?? null,
-    ],
+    `INSERT INTO tbl_client_service (${cols.join(', ')}) VALUES (${placeholders})`,
+    vals,
   );
   return ins.insertId;
 }
@@ -167,12 +199,15 @@ async function create(clientId, body) {
 async function update(clientServiceId, body) {
   const sets = [];
   const vals = [];
+  const hasTypeIds = await clientServiceHasTypeIds(pool);
   if (body.serviceCategoryId !== undefined) {
     // Real column is `service_catg_id`.
     sets.push('service_catg_id = ?');
     vals.push(body.serviceCategoryId);
   }
-  if (body.serviceTypeIds !== undefined) {
+  if (body.serviceTypeIds !== undefined && hasTypeIds) {
+    // Silently skip persisting service_type_ids on deploys missing the
+    // column; the row still updates other fields successfully.
     sets.push('service_type_ids = ?');
     vals.push(idsToCsv(body.serviceTypeIds));
   }

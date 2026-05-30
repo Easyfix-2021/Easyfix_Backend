@@ -81,6 +81,66 @@ async function cityHasIsActive(pool) {
 }
 
 /**
+ * Probe whether tbl_address has an address_instruction column.
+ *
+ * Same drift story as cityHasIsActive — `address_instruction` exists on
+ * the EasyFix QA snapshot taken 2026-05-28 but is absent on older
+ * deploys (verified 2026-05-31 when fetchPrefill 500'd with
+ * "Unknown column 'ad.address_instruction' in 'field list'"). When
+ * absent, fetchPrefill returns it as NULL (so the FE form just shows
+ * an empty Address Instructions field) and acceptSubmission omits the
+ * column from the UPDATE SET clause (so customer-supplied instructions
+ * are silently dropped — degraded but non-crashing).
+ *
+ * If/when ops backfills the column on every environment, the probe
+ * returns true everywhere and behaviour upgrades automatically.
+ */
+let _addrInstrProbed = false;
+let _addrHasInstruction = false;
+async function addressHasInstruction(pool) {
+  if (_addrInstrProbed) return _addrHasInstruction;
+  try {
+    await pool.query('SELECT address_instruction FROM tbl_address LIMIT 1');
+    _addrHasInstruction = true;
+  } catch (_e) {
+    _addrHasInstruction = false;
+  }
+  _addrInstrProbed = true;
+  return _addrHasInstruction;
+}
+
+/**
+ * Probe whether tbl_job has the three Book-New-Call custom-prop columns.
+ *
+ * Per services/job.service.js (~line 1023): `branch_details` is the only
+ * column verified to exist on the prod schema. `product_code` and
+ * `building_name` are conceptually-named fields that DON'T exist as
+ * columns on most deploys; the create flow folds them into `remarks`.
+ *
+ * For the magic-link submission path we conservatively probe each column
+ * separately and only write the ones that exist. When a column is
+ * absent, the customer-supplied value is silently dropped from the
+ * UPDATE — degraded but non-crashing, mirroring `addressHasInstruction`.
+ * Memoised after first call.
+ */
+let _jobColsProbed = false;
+const _jobCols = { branch_details: false, building_name: false, product_code: false };
+async function jobHasColumn(pool, col) {
+  if (_jobColsProbed) return _jobCols[col];
+  for (const c of Object.keys(_jobCols)) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      await pool.query(`SELECT \`${c}\` FROM tbl_job LIMIT 1`);
+      _jobCols[c] = true;
+    } catch (_e) {
+      _jobCols[c] = false;
+    }
+  }
+  _jobColsProbed = true;
+  return _jobCols[col];
+}
+
+/**
  * Build the public GET prefill response for the magic-link landing page.
  *
  * Caller contract: routes/public/job-completion.js has already verified the
@@ -99,13 +159,21 @@ async function cityHasIsActive(pool) {
  * latency vs sequential.
  */
 async function fetchPrefill(jobId, pool) {
+  // Schema-drift gate: older deploys lack tbl_address.address_instruction.
+  // When absent, project NULL into the same column slot so downstream
+  // code doesn't have to branch on its presence.
+  const addrHasInstr   = await addressHasInstruction(pool);
+  const addrInstrSelect = addrHasInstr
+    ? 'ad.address_instruction'
+    : 'NULL AS address_instruction';
+
   const [jobRows] = await pool.query(
     `SELECT j.job_id, j.fk_client_id, j.fk_address_id, j.requested_date_time,
             j.time_slot, j.job_desc, j.additional_name, j.additional_number,
             COALESCE(j.job_customer_name, cu.customer_name) AS customer_name,
             cu.customer_mob_no, cu.customer_email,
             ad.address, ad.building, ad.landmark, ad.city_id, ad.pin_code,
-            ad.gps_location, ad.address_instruction,
+            ad.gps_location, ${addrInstrSelect},
             cl.client_name
        FROM tbl_job j
        LEFT JOIN tbl_customer cu ON cu.customer_id = j.fk_customer_id
@@ -125,7 +193,7 @@ async function fetchPrefill(jobId, pool) {
     ? 'SELECT city_id, city_name FROM tbl_city WHERE is_active = 1 ORDER BY city_name ASC'
     : 'SELECT city_id, city_name FROM tbl_city ORDER BY city_name ASC LIMIT 500';
 
-  const [cityResult, serviceResult, imageResult] = await Promise.all([
+  const [cityResult, serviceResult, imageResult, customPropResult] = await Promise.all([
     pool.query(citySql),
     pool.query(
       `SELECT cs.client_service_id, cs.service_type_id, cs.service_catg_id,
@@ -145,11 +213,52 @@ async function fetchPrefill(jobId, pool) {
         ORDER BY image_id ASC`,
       [jobId],
     ),
+    // Per-client custom properties (e.g. branch_details / building_name /
+    // product_code). The legacy table has loose column naming across
+    // deploys — `SELECT *` + a JS fallback chain matches what the admin
+    // CRUD endpoint at routes/admin/clients.js does for the CRM Book-New-
+    // Call flow. Surfacing the same shape on the public magic-link form
+    // lets the FE enforce the same mandatory/visibility rules without
+    // duplicating the per-client config.
+    //
+    // status filter: rows with status=1 (active) are returned; legacy
+    // rows with NULL status are also included so older configs that
+    // never set the column keep working.
+    pool.query(
+      `SELECT * FROM tbl_client_custom_properties
+        WHERE client_id = ? AND (status IS NULL OR status = 1)`,
+      [row.fk_client_id],
+    ),
   ]);
 
-  const cityRows    = cityResult[0]    || [];
-  const serviceRows = serviceResult[0] || [];
-  const imageRows   = imageResult[0]   || [];
+  const cityRows       = cityResult[0]       || [];
+  const serviceRows    = serviceResult[0]    || [];
+  const imageRows      = imageResult[0]      || [];
+  const customPropRows = customPropResult[0] || [];
+
+  // Normalise custom-property rows across the legacy column-name drift
+  // (see routes/admin/clients.js GET /:clientId/custom-properties for the
+  // canonical fallback chain). Lower-case `name` so the FE can do stable
+  // string matching regardless of which DB shape this deploy has.
+  const truthy = (val) => {
+    if (val == null) return false;
+    if (typeof val === 'boolean') return val;
+    if (typeof val === 'number') return val !== 0;
+    const s = String(val).trim().toLowerCase();
+    return s === '1' || s === 'true' || s === 'yes' || s === 'y';
+  };
+  const customProperties = customPropRows
+    .map((r) => ({
+      name: String(
+        r.property_name ?? r.c_prop_name ?? r.name ?? r.key ?? r.field_name ?? ''
+      ).toLowerCase().trim(),
+      mandatory: truthy(
+        r.is_mandatory ?? r.mandatory ?? r.required ?? r.is_required ?? r.is_required_field
+      ),
+      label: r.property_label ?? r.c_prop_label ?? r.label ?? r.display_name ?? null,
+      value: r.property_value ?? r.c_prop_values ?? r.value ?? r.field_value ?? null,
+    }))
+    .filter((p) => p.name);
 
   // Previously-submitted picks (2026-05-28 fix): the FE seeds its picker
   // from this list on round-2 visits to the magic link. Without it, a
@@ -226,6 +335,10 @@ async function fetchPrefill(jobId, pool) {
       image_id: i.image_id,
       key:      i.image,
     })),
+    // Per-client custom-property descriptors. FE canonicalises `name`
+    // (e.g. `branch | branch_details → branch_details`) before keying its
+    // input map. Empty array when the client has no rows configured.
+    custom_properties: customProperties,
   };
 }
 
@@ -250,10 +363,23 @@ async function fetchPrefill(jobId, pool) {
  *   handler — duplicating here keeps the service self-consistent for any
  *   future caller (webhook re-trigger, ops CLI, etc.).
  */
-async function sendForJob(jobId, { action } = {}, pool) {
+async function sendForJob(jobId, { action, override = false } = {}, pool) {
+  // Inline subquery pulls the per-client configurable cap so we don't
+  // need a second round-trip. NULL when no row → COALESCE → default 3.
+  // CAST UNSIGNED defends against ops storing '3 ' / 'three' — bad
+  // parses bubble to NULL → default.
   const [rows] = await pool.query(
     `SELECT j.job_id, j.fk_client_id, j.magic_link_sent_at, j.magic_link_send_count,
-            cu.customer_name, cu.customer_mob_no, cl.client_name
+            cu.customer_name, cu.customer_mob_no, cl.client_name,
+            COALESCE(
+              (SELECT CAST(NULLIF(ccp_max.c_prop_values, '') AS UNSIGNED)
+                 FROM tbl_client_custom_properties ccp_max
+                WHERE ccp_max.client_id    = j.fk_client_id
+                  AND LOWER(REPLACE(ccp_max.c_prop_name, '_', ' ')) = LOWER('Max Magic-Link Send Count')
+                  AND ccp_max.status       = 1
+                LIMIT 1),
+              3
+            ) AS max_send_count
        FROM tbl_job j
        LEFT JOIN tbl_customer cu ON cu.customer_id = j.fk_customer_id
        LEFT JOIN tbl_client   cl ON cl.client_id   = j.fk_client_id
@@ -264,11 +390,16 @@ async function sendForJob(jobId, { action } = {}, pool) {
     throw { status: 404, code: 'JOB_NOT_FOUND', message: 'Order not found' };
   }
   const row = rows[0];
+  const maxSendCount = Number(row.max_send_count) || 3;
 
   let effectiveAction = action || 'first';
   if (effectiveAction === 'first' && row.magic_link_sent_at != null) {
     effectiveAction = 'resend';
   }
+  // Override sends get a distinct audit value so the row tooltip + the
+  // status panel can flag them as "admin bypassed the cap" later. Stays
+  // within the existing varchar(20) column width.
+  if (override) effectiveAction = 'resend-override';
 
   const token = signJobToken({ jobId });
   const url   = magicLinkUrl(token);
@@ -295,17 +426,39 @@ async function sendForJob(jobId, { action } = {}, pool) {
    *     beat the double-send risk we'd otherwise inherit.
    */
   const sentAt = new Date();
-  const [reserveResult] = await pool.query(
-    `UPDATE tbl_job
-        SET magic_link_send_count   = magic_link_send_count + 1,
-            magic_link_sent_at      = ?,
-            magic_link_last_action  = ?
-      WHERE job_id = ?
-        AND magic_link_send_count < 3`,
-    [sentAt, effectiveAction, jobId],
-  );
+  // Override path: drop the `< maxSendCount` clause so a send goes
+  // through even at-cap. Route-side already verified caller is Admin
+  // before passing override=true through. Non-override: enforce the
+  // configurable per-client cap.
+  const reserveSql = override
+    ? `UPDATE tbl_job
+          SET magic_link_send_count   = magic_link_send_count + 1,
+              magic_link_sent_at      = ?,
+              magic_link_last_action  = ?
+        WHERE job_id = ?`
+    : `UPDATE tbl_job
+          SET magic_link_send_count   = magic_link_send_count + 1,
+              magic_link_sent_at      = ?,
+              magic_link_last_action  = ?
+        WHERE job_id = ?
+          AND magic_link_send_count < ?`;
+  const reserveParams = override
+    ? [sentAt, effectiveAction, jobId]
+    : [sentAt, effectiveAction, jobId, maxSendCount];
+
+  const [reserveResult] = await pool.query(reserveSql, reserveParams);
   if (!reserveResult || reserveResult.affectedRows === 0) {
-    throw { status: 429, code: 'SEND_LIMIT_REACHED', message: 'Send limit reached' };
+    throw {
+      status: 429,
+      code: 'SEND_LIMIT_REACHED',
+      message: `Send limit reached (${maxSendCount} sends max for this client). Use the Override action to send anyway.`,
+    };
+  }
+  if (override) {
+    logger.warn(
+      { jobId, prior_send_count: row.magic_link_send_count, max_send_count: maxSendCount },
+      'magic-link: override send — admin bypassed the cap',
+    );
   }
 
   let response;
@@ -437,30 +590,61 @@ async function acceptSubmission(jobId, payload, pool) {
     //    customer-supplied name is preserved in customer_submitted_payload
     //    JSON below.
     const submittedAt = new Date();
+    // Schema-drift gate for the 3 Book-New-Call custom-prop columns. Probe
+    // once (memoised) — only `branch_details` is canonically present on
+    // tbl_job (see services/job.service.js ~line 1023). On deploys where
+    // building_name / product_code do exist as columns, persist them too;
+    // otherwise the customer-supplied values live on in
+    // customer_submitted_payload JSON for audit.
+    const hasBranchCol   = await jobHasColumn(pool, 'branch_details');
+    const hasBuildingCol = await jobHasColumn(pool, 'building_name');
+    const hasProductCol  = await jobHasColumn(pool, 'product_code');
+
+    const jobSetClauses = [
+      'customer_submitted_at      = ?',
+      'customer_submitted_payload = ?',
+      'requested_date_time        = COALESCE(?, requested_date_time)',
+      'time_slot                  = COALESCE(?, time_slot)',
+      'additional_name            = COALESCE(?, additional_name)',
+      'additional_number          = COALESCE(?, additional_number)',
+      'job_desc                   = COALESCE(?, job_desc)',
+      'job_customer_name          = COALESCE(?, job_customer_name)',
+    ];
+    const jobSetParams = [
+      submittedAt,
+      JSON.stringify(payload),
+      payload.requested_date_time || null,
+      payload.time_slot || null,
+      payload.additional_name || null,
+      payload.additional_number || null,
+      (payload.job_desc && String(payload.job_desc).trim()) ? payload.job_desc : null,
+      (payload.customer_name && String(payload.customer_name).trim()) ? payload.customer_name : null,
+    ];
+    if (hasBranchCol) {
+      jobSetClauses.push('branch_details = COALESCE(?, branch_details)');
+      jobSetParams.push(
+        (payload.branch_details && String(payload.branch_details).trim()) ? payload.branch_details : null,
+      );
+    }
+    if (hasBuildingCol) {
+      jobSetClauses.push('building_name = COALESCE(?, building_name)');
+      jobSetParams.push(
+        (payload.building_name && String(payload.building_name).trim()) ? payload.building_name : null,
+      );
+    }
+    if (hasProductCol) {
+      jobSetClauses.push('product_code = COALESCE(?, product_code)');
+      jobSetParams.push(
+        (payload.product_code && String(payload.product_code).trim()) ? payload.product_code : null,
+      );
+    }
+    jobSetClauses.push('last_update_time = ?');
+    jobSetParams.push(submittedAt);
+    jobSetParams.push(jobId);
+
     await conn.query(
-      `UPDATE tbl_job
-          SET customer_submitted_at      = ?,
-              customer_submitted_payload = ?,
-              requested_date_time        = COALESCE(?, requested_date_time),
-              time_slot                  = COALESCE(?, time_slot),
-              additional_name            = COALESCE(?, additional_name),
-              additional_number          = COALESCE(?, additional_number),
-              job_desc                   = COALESCE(?, job_desc),
-              job_customer_name          = COALESCE(?, job_customer_name),
-              last_update_time           = ?
-        WHERE job_id = ?`,
-      [
-        submittedAt,
-        JSON.stringify(payload),
-        payload.requested_date_time || null,
-        payload.time_slot || null,
-        payload.additional_name || null,
-        payload.additional_number || null,
-        (payload.job_desc && String(payload.job_desc).trim()) ? payload.job_desc : null,
-        (payload.customer_name && String(payload.customer_name).trim()) ? payload.customer_name : null,
-        submittedAt,
-        jobId,
-      ],
+      `UPDATE tbl_job SET ${jobSetClauses.join(', ')} WHERE job_id = ?`,
+      jobSetParams,
     );
 
     // 3. Mirror customer email onto tbl_customer (identity-level field —
@@ -506,26 +690,32 @@ async function acceptSubmission(jobId, payload, pool) {
     const addrInstr   = payload.address_instruction && String(payload.address_instruction).length ? payload.address_instruction : null;
 
     if (addressId && addressLine) {
+      // Schema-drift gate: conditionally include the address_instruction
+      // SET clause + its parameter only when the column exists on this
+      // deploy. Without the gate, deploys missing the column would 500
+      // here with `Unknown column 'address_instruction' in 'field list'`
+      // — caught 2026-05-31 mirroring the same gate in fetchPrefill.
+      // When absent, the customer's address-instruction text is silently
+      // dropped (degraded mode); the rest of the address persists.
+      const hasAddrInstr = await addressHasInstruction(pool);
+      const setClauses = [
+        'address             = COALESCE(?, address)',
+        'building            = COALESCE(?, building)',
+        'landmark            = COALESCE(?, landmark)',
+        'city_id             = COALESCE(?, city_id)',
+        'pin_code            = COALESCE(?, pin_code)',
+        'gps_location        = COALESCE(?, gps_location)',
+      ];
+      const params = [addressLine, building, landmark, cityId, pinCode, gps];
+      if (hasAddrInstr) {
+        setClauses.push('address_instruction = COALESCE(?, address_instruction)');
+        params.push(addrInstr);
+      }
+      params.push(addressId);
+
       await conn.query(
-        `UPDATE tbl_address
-            SET address             = COALESCE(?, address),
-                building            = COALESCE(?, building),
-                landmark            = COALESCE(?, landmark),
-                city_id             = COALESCE(?, city_id),
-                pin_code            = COALESCE(?, pin_code),
-                gps_location        = COALESCE(?, gps_location),
-                address_instruction = COALESCE(?, address_instruction)
-          WHERE address_id = ?`,
-        [
-          addressLine,
-          building,
-          landmark,
-          cityId,
-          pinCode,
-          gps,
-          addrInstr,
-          addressId,
-        ],
+        `UPDATE tbl_address SET ${setClauses.join(', ')} WHERE address_id = ?`,
+        params,
       );
     }
 

@@ -616,48 +616,102 @@ async function listCustomProperties(clientId) {
   return rows;
 }
 
-const CUSTOM_PROP_UPDATE_ALLOWED = [
-  'property_name', 'property_label', 'property_value', 'is_mandatory',
-];
-
-const CUSTOM_PROP_CAMEL_TO_SNAKE = {
+/*
+ * Column-name maps for the two schema shapes of
+ * tbl_client_custom_properties. detectCustomPropsShape() (defined
+ * below) picks which set to use at write time. The legacy shape has
+ * NO label column unless the optional c_prop_label extension exists
+ * (separately probed via _customPropsHasLegacyLabel).
+ *
+ * Canonical: property_name / property_label / property_value /
+ *            is_mandatory + id PK + no status filter on writes.
+ * Legacy:    c_prop_name  / c_prop_label (optional) / c_prop_values
+ *            (PLURAL) / c_prop_mandatory + c_prop_id PK + status
+ *            column that we set to 1 on insert.
+ */
+const CUSTOM_PROP_COLS_CANONICAL = {
+  pk: 'id',
   name: 'property_name',
   label: 'property_label',
   value: 'property_value',
   mandatory: 'is_mandatory',
-  isMandatory: 'is_mandatory',
+  hasStatus: false,
+};
+const CUSTOM_PROP_COLS_LEGACY = {
+  pk: 'c_prop_id',
+  name: 'c_prop_name',
+  label: 'c_prop_label', // only used if _customPropsHasLegacyLabel
+  value: 'c_prop_values',
+  mandatory: 'c_prop_mandatory',
+  hasStatus: true,
 };
 
+async function customPropCols() {
+  const legacy = await detectCustomPropsShape();
+  const cols = legacy ? { ...CUSTOM_PROP_COLS_LEGACY } : { ...CUSTOM_PROP_COLS_CANONICAL };
+  // Legacy schema may or may not have c_prop_label. Drop the column
+  // when the probe says absent so INSERT/UPDATE doesn't reference it.
+  if (legacy && !_customPropsHasLegacyLabel) cols.label = null;
+  return cols;
+}
+
 async function createCustomProperty(clientId, body) {
-  // The legacy table has loose column naming; we write to the canonical
-  // `property_name / property_label / property_value / is_mandatory`
-  // set. The READ endpoint already falls back across variants
-  // (`name`/`key`/`field_name`, etc.) so older rows keep rendering.
+  const cols = await customPropCols();
+  // Build the column list dynamically based on what actually exists on
+  // this deploy. Label column is optional on legacy snapshots without
+  // c_prop_label — we omit it from the INSERT entirely in that case
+  // (the FE label string still lands in tbl_client_custom_properties
+  // via no avenue, so it's degraded but non-crashing).
+  const insertCols = ['client_id', cols.name];
+  const insertVals = [clientId, body.name];
+  if (cols.label) {
+    insertCols.push(cols.label);
+    insertVals.push(body.label || null);
+  }
+  insertCols.push(cols.value, cols.mandatory);
+  insertVals.push(body.value || null, body.mandatory ? 1 : 0);
+  if (cols.hasStatus) {
+    insertCols.push('status');
+    insertVals.push(1);
+  }
+  const placeholders = insertCols.map(() => '?').join(', ');
   const [ins] = await pool.query(
-    `INSERT INTO tbl_client_custom_properties
-       (client_id, property_name, property_label, property_value, is_mandatory)
-     VALUES (?, ?, ?, ?, ?)`,
-    [
-      clientId,
-      body.name,
-      body.label || null,
-      body.value || null,
-      body.mandatory ? 1 : 0,
-    ],
+    `INSERT INTO tbl_client_custom_properties (${insertCols.join(', ')}) VALUES (${placeholders})`,
+    insertVals,
   );
   return ins.insertId;
 }
 
+/*
+ * Body keys the route validator accepts. Each maps to the appropriate
+ * column name picked by customPropCols() at runtime. `mandatory` /
+ * `isMandatory` both map to the mandatory column for input flexibility.
+ */
+const CUSTOM_PROP_BODY_KEY_TO_COL_KEY = {
+  name: 'name',
+  label: 'label',
+  value: 'value',
+  mandatory: 'mandatory',
+  isMandatory: 'mandatory',
+  // Canonical column names are also accepted (legacy callers).
+  property_name: 'name',
+  property_label: 'label',
+  property_value: 'value',
+  is_mandatory: 'mandatory',
+};
+
 async function updateCustomProperty(propId, body) {
+  const cols = await customPropCols();
   const sets = [];
   const vals = [];
-  for (const [key, val] of Object.entries(body || {})) {
-    let col = CUSTOM_PROP_UPDATE_ALLOWED.includes(key) ? key : CUSTOM_PROP_CAMEL_TO_SNAKE[key];
-    if (!col || !CUSTOM_PROP_UPDATE_ALLOWED.includes(col)) continue;
-    // Coerce mandatory to 0/1
+  for (const [bodyKey, val] of Object.entries(body || {})) {
+    const colKey = CUSTOM_PROP_BODY_KEY_TO_COL_KEY[bodyKey];
+    if (!colKey) continue;
+    const dbCol = cols[colKey];
+    if (!dbCol) continue; // e.g. label on legacy without c_prop_label
     let v = val;
-    if (col === 'is_mandatory') v = val ? 1 : 0;
-    sets.push(`${col} = ?`);
+    if (colKey === 'mandatory') v = val ? 1 : 0;
+    sets.push(`${dbCol} = ?`);
     vals.push(v);
   }
   if (sets.length === 0) {
@@ -665,16 +719,116 @@ async function updateCustomProperty(propId, body) {
   }
   vals.push(propId);
   const [r] = await pool.query(
-    `UPDATE tbl_client_custom_properties SET ${sets.join(', ')} WHERE id = ?`, vals,
+    `UPDATE tbl_client_custom_properties SET ${sets.join(', ')} WHERE ${cols.pk} = ?`,
+    vals,
   );
   return r.affectedRows;
 }
 
 async function deleteCustomProperty(propId) {
+  const cols = await customPropCols();
   const [r] = await pool.query(
-    'DELETE FROM tbl_client_custom_properties WHERE id = ?', [propId],
+    `DELETE FROM tbl_client_custom_properties WHERE ${cols.pk} = ?`,
+    [propId],
   );
   return r.affectedRows;
+}
+
+/*
+ * Column-name drift probe for tbl_client_custom_properties.
+ *
+ * Some EasyFix environments have the legacy schema (c_prop_id /
+ * c_prop_name / c_prop_values [PLURAL] / c_prop_mandatory / c_prop_type
+ * / status), others have the canonical shape (property_name /
+ * property_label / property_value / is_mandatory).
+ *
+ * Crucially, the legacy schema has **no label column at all** — that's
+ * why the first cut crashed with `Unknown column 'c_prop_label'`. We
+ * probe `c_prop_name` (which is the legacy marker column) AND
+ * separately probe whether a `c_prop_label` column happens to exist
+ * (some snapshots add it as an extension). The distinct-keys query
+ * SELECTs a label column only when it's actually present.
+ *
+ * Both probes memoise per process.
+ */
+let _customPropsColsProbed = false;
+let _customPropsLegacyShape = false; // true → c_prop_* columns
+let _customPropsHasLegacyLabel = false; // true → c_prop_label exists
+async function detectCustomPropsShape() {
+  if (_customPropsColsProbed) return _customPropsLegacyShape;
+  try {
+    await pool.query('SELECT c_prop_name FROM tbl_client_custom_properties LIMIT 1');
+    _customPropsLegacyShape = true;
+  } catch (_e) {
+    _customPropsLegacyShape = false;
+  }
+  if (_customPropsLegacyShape) {
+    try {
+      await pool.query('SELECT c_prop_label FROM tbl_client_custom_properties LIMIT 1');
+      _customPropsHasLegacyLabel = true;
+    } catch (_e) {
+      _customPropsHasLegacyLabel = false;
+    }
+  }
+  _customPropsColsProbed = true;
+  return _customPropsLegacyShape;
+}
+
+/*
+ * Distinct list of custom-property keys ever used across all clients.
+ *
+ * Powers the Add Custom Property dropdown in the CRM_UI so operators can
+ * pick from previously-used keys instead of trying to remember magic
+ * strings. Merged on the FE with a hardcoded registry of "well-known"
+ * keys that carry rich descriptions (e.g. max_magic_link_send_count).
+ *
+ * Shape per row: { key, sample_label, use_count }.
+ *
+ *   key          — c_prop_name (or property_name on canonical schema)
+ *   sample_label — most-recently-set non-null label for that key (best-
+ *                  effort hint; FE can override with the registry label)
+ *   use_count    — number of DISTINCT clients with at least one row for
+ *                  this key (drives display ordering — most-popular first)
+ *
+ * Filters: only active rows. On the legacy `c_prop_*` schema we filter
+ * `status = 1`. The canonical schema has no such flag — we read all rows.
+ * 200-row cap is plenty (current QA has < 30 distinct keys cluster-wide).
+ */
+async function listDistinctCustomPropertyKeys() {
+  const legacy = await detectCustomPropsShape();
+  // Build the sample_label SELECT fragment based on what columns actually
+  // exist. Three cases:
+  //   - Canonical schema: property_label exists → MAX(property_label).
+  //   - Legacy schema + c_prop_label extension column: MAX(c_prop_label).
+  //   - Legacy schema, no label column: select NULL — the FE falls back
+  //     to displaying the bare key, no behavioural regression.
+  let labelExpr;
+  let nameCol;
+  let extraFilters = '';
+  if (legacy) {
+    labelExpr = _customPropsHasLegacyLabel ? 'MAX(c_prop_label)' : 'NULL';
+    nameCol   = 'c_prop_name';
+    extraFilters = 'AND status = 1';
+  } else {
+    labelExpr = 'MAX(property_label)';
+    nameCol   = 'property_name';
+  }
+  const sql = `SELECT LOWER(TRIM(${nameCol})) AS \`key\`,
+                      ${labelExpr}            AS sample_label,
+                      COUNT(DISTINCT client_id) AS use_count
+                 FROM tbl_client_custom_properties
+                WHERE ${nameCol} IS NOT NULL
+                  AND TRIM(${nameCol}) <> ''
+                  ${extraFilters}
+                GROUP BY LOWER(TRIM(${nameCol}))
+                ORDER BY use_count DESC, \`key\` ASC
+                LIMIT 200`;
+  const [rows] = await pool.query(sql);
+  return rows.map((r) => ({
+    key: String(r.key || '').trim(),
+    sample_label: r.sample_label ? String(r.sample_label) : null,
+    use_count: Number(r.use_count) || 0,
+  })).filter((r) => r.key);
 }
 
 module.exports = {
@@ -700,4 +854,5 @@ module.exports = {
   createCustomProperty,
   updateCustomProperty,
   deleteCustomProperty,
+  listDistinctCustomPropertyKeys,
 };

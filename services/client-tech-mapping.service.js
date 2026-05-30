@@ -37,6 +37,42 @@
 
 const { pool } = require('../db');
 
+/* ─── Column probes ───────────────────────────────────────────────── */
+
+// `tbl_easyfixer.efr_mobile` is a blueprint-era column that doesn't
+// exist on every deployment. The canonical mobile-ish column is
+// `efr_no` (per CLAUDE.md glossary). Probe once per process and pick
+// the right column literal at query-build time so the FE response
+// field name `efr_mobile` stays stable.
+let _efrMobileProbed = false;
+let _efrHasMobileCol = false;
+async function easyfixerHasMobileCol(p) {
+  if (_efrMobileProbed) return _efrHasMobileCol;
+  try {
+    await p.query('SELECT efr_mobile FROM tbl_easyfixer LIMIT 1');
+    _efrHasMobileCol = true;
+  } catch (_e) { _efrHasMobileCol = false; }
+  _efrMobileProbed = true;
+  return _efrHasMobileCol;
+}
+
+// `tbl_easyfixer.city_name` is also a blueprint-era denormalised column
+// missing on some deployments — the canonical FK is `efr_cityId` →
+// `tbl_city.city_id`. Probe once and pick column literal vs JOIN at
+// query-build time so the FE response field name `city_name` stays
+// stable.
+let _efrCityNameProbed = false;
+let _efrHasCityNameCol = false;
+async function easyfixerHasCityNameCol(p) {
+  if (_efrCityNameProbed) return _efrHasCityNameCol;
+  try {
+    await p.query('SELECT city_name FROM tbl_easyfixer LIMIT 1');
+    _efrHasCityNameCol = true;
+  } catch (_e) { _efrHasCityNameCol = false; }
+  _efrCityNameProbed = true;
+  return _efrHasCityNameCol;
+}
+
 /* ─── List ────────────────────────────────────────────────────────── */
 
 async function listForClient(clientId) {
@@ -51,14 +87,23 @@ async function listForClient(clientId) {
   // tbl_easyfixer's PK IS `efr_id` — only the mapping table's FK
   // breaks the naming pattern. The wire alias `efr_id` keeps the FE
   // contract stable.
+  // Column-name drift: some deployments lack `tbl_easyfixer.efr_mobile`.
+  // Fall back to `efr_no AS efr_mobile` so the wire shape stays stable.
+  const mobileExpr = (await easyfixerHasMobileCol(pool))
+    ? 'e.efr_mobile'
+    : 'e.efr_no AS efr_mobile';
+  const hasCityNameCol = await easyfixerHasCityNameCol(pool);
+  const cityNameExpr = hasCityNameCol ? 'e.city_name' : 'c.city_name AS city_name';
+  const cityJoin = hasCityNameCol ? '' : 'LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId';
   const [mappings] = await pool.query(
     `SELECT m.mapping_id, m.client_id, m.service_type_id,
             m.easyfixer_id AS efr_id, m.mapping_status,
             e.efr_first_name, e.efr_last_name,
-            e.efr_no, e.efr_mobile, e.city_name,
+            e.efr_no, ${mobileExpr}, ${cityNameExpr},
             e.is_technician_verified
        FROM tbl_client_easyfixer_mapping m
        LEFT JOIN tbl_easyfixer e ON e.efr_id = m.easyfixer_id
+       ${cityJoin}
       WHERE m.client_id = ?
         AND (m.mapping_status IS NULL OR m.mapping_status <> 0)
       ORDER BY m.service_type_id ASC, e.efr_first_name ASC`,
@@ -204,8 +249,148 @@ async function eligibleTechsFor(serviceTypeId, opts = {}) {
   }));
 }
 
+/* ─── Summary (lazy-load shell for the tab) ───────────────────────── */
+
+/*
+ * Returns one row per (client, service_type) pair the client is mapped
+ * against — with the technician count and a compact per-city breakdown
+ * (top 6 cities + a "+N more" rollup). This is what the Tech Mapping
+ * tab now mounts with: a single ~163-row payload instead of the full
+ * mapping list (which could be 10K+ rows for big clients and took ~4s).
+ *
+ * Wire shape:
+ *   [{
+ *     service_type_id,
+ *     service_type_name,
+ *     tech_count,
+ *     city_breakdown: [{ city_name, count }, ...]   // top 6 by count
+ *     other_cities_count: 12                         // techs not in top 6
+ *   }]
+ *
+ * Implementation: 2 round-trips.
+ *   Q1: per-service-type counts + service-type name (single JOIN + GROUP BY).
+ *   Q2: per-(service_type, city) counts, then trim to top 6 per type in JS.
+ *
+ * No SELECT *, no row-per-tech JOIN to tbl_easyfixer — that's what
+ * made the legacy list slow on large clients.
+ */
+async function summaryForClient(clientId) {
+  // Q1: total count per service_type (active mappings only).
+  //
+  // Note on duplicates: tbl_service_type can contain multiple rows with
+  // an identical service_type_name (legacy data — different service_type_id
+  // values share names like "1 - Furniture Unpack & Install/Assembly").
+  // We group by service_type_id so each id keeps its own mapping bucket
+  // (Edit Techs needs to target one id at a time). The FE renders the
+  // service_type_id as a chip next to the name so operators can tell
+  // visually-identical rows apart. Tie-break ORDER BY service_type_id
+  // makes the display order stable across reloads.
+  const [counts] = await pool.query(
+    `SELECT m.service_type_id,
+            st.service_type_name,
+            COUNT(*) AS tech_count
+       FROM tbl_client_easyfixer_mapping m
+       LEFT JOIN tbl_service_type st ON st.service_type_id = m.service_type_id
+      WHERE m.client_id = ?
+        AND (m.mapping_status IS NULL OR m.mapping_status <> 0)
+      GROUP BY m.service_type_id, st.service_type_name
+      ORDER BY st.service_type_name ASC, m.service_type_id ASC`,
+    [clientId],
+  );
+  if (counts.length === 0) return [];
+
+  // Q2: per-(service_type, city) counts. Probe city column shape once.
+  const hasCityNameCol = await easyfixerHasCityNameCol(pool);
+  const cityNameExpr = hasCityNameCol ? 'e.city_name' : 'c.city_name';
+  const cityJoin = hasCityNameCol ? '' : 'LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId';
+  const [cityRows] = await pool.query(
+    `SELECT m.service_type_id,
+            ${cityNameExpr} AS city_name,
+            COUNT(*) AS count
+       FROM tbl_client_easyfixer_mapping m
+       LEFT JOIN tbl_easyfixer e ON e.efr_id = m.easyfixer_id
+       ${cityJoin}
+      WHERE m.client_id = ?
+        AND (m.mapping_status IS NULL OR m.mapping_status <> 0)
+      GROUP BY m.service_type_id, ${cityNameExpr}
+      ORDER BY m.service_type_id ASC, COUNT(*) DESC`,
+    [clientId],
+  );
+
+  // Bucket city rows by service_type_id, keep top 6, roll up the rest.
+  const byType = new Map();
+  for (const r of cityRows) {
+    let bucket = byType.get(r.service_type_id);
+    if (!bucket) { bucket = []; byType.set(r.service_type_id, bucket); }
+    bucket.push({ city_name: r.city_name || '—', count: Number(r.count) });
+  }
+  const TOP_N = 6;
+  return counts.map((c) => {
+    const all = byType.get(c.service_type_id) ?? [];
+    const top = all.slice(0, TOP_N);
+    const other = all.slice(TOP_N).reduce((sum, x) => sum + x.count, 0);
+    return {
+      service_type_id: c.service_type_id,
+      service_type_name: c.service_type_name || null,
+      tech_count: Number(c.tech_count),
+      city_breakdown: top,
+      other_cities_count: other,
+    };
+  });
+}
+
+/* ─── Detail for one service-type (lazy expand) ───────────────────── */
+
+/*
+ * Returns the full tech-chip list for a SINGLE (client, service_type).
+ * Used when the user expands a row in the tab. Same wire shape as
+ * `listForClient` rows so the FE can reuse the chip renderer.
+ */
+async function listForClientServiceType(clientId, serviceTypeId) {
+  const mobileExpr = (await easyfixerHasMobileCol(pool))
+    ? 'e.efr_mobile'
+    : 'e.efr_no AS efr_mobile';
+  const hasCityNameCol = await easyfixerHasCityNameCol(pool);
+  const cityNameExpr = hasCityNameCol ? 'e.city_name' : 'c.city_name AS city_name';
+  const cityJoin = hasCityNameCol ? '' : 'LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId';
+  const [mappings] = await pool.query(
+    `SELECT m.mapping_id, m.client_id, m.service_type_id,
+            m.easyfixer_id AS efr_id, m.mapping_status,
+            e.efr_first_name, e.efr_last_name,
+            e.efr_no, ${mobileExpr}, ${cityNameExpr},
+            e.is_technician_verified
+       FROM tbl_client_easyfixer_mapping m
+       LEFT JOIN tbl_easyfixer e ON e.efr_id = m.easyfixer_id
+       ${cityJoin}
+      WHERE m.client_id = ?
+        AND m.service_type_id = ?
+        AND (m.mapping_status IS NULL OR m.mapping_status <> 0)
+      ORDER BY ${hasCityNameCol ? 'e.city_name' : 'c.city_name'} ASC, e.efr_first_name ASC`,
+    [clientId, serviceTypeId],
+  );
+  return mappings.map((m) => {
+    const name = [m.efr_first_name, m.efr_last_name]
+      .filter(Boolean).join(' ').trim() || null;
+    return {
+      mapping_id: m.mapping_id,
+      client_id: m.client_id,
+      service_type_id: m.service_type_id,
+      service_type_name: null, // FE already knows it from the summary.
+      efr_id: m.efr_id,
+      efr_name: name,
+      efr_no: m.efr_no,
+      efr_mobile: m.efr_mobile,
+      city_name: m.city_name,
+      is_technician_verified: !!m.is_technician_verified,
+      mapping_status: m.mapping_status,
+    };
+  });
+}
+
 module.exports = {
   listForClient,
+  summaryForClient,
+  listForClientServiceType,
   replaceForServiceType,
   eligibleTechsFor,
 };

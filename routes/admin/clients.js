@@ -320,6 +320,28 @@ router.get('/spoc-template', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+/*
+ * GET /custom-property-keys
+ *
+ * Cross-client distinct list of custom-property keys ever used. Powers
+ * the Add Custom Property dropdown in CRM_UI so operators don't need to
+ * memorise key strings — they can pick from {hardcoded "well-known"
+ * registry} ∪ {DB-discovered keys used elsewhere}, with "Other (custom
+ * key)…" as the escape hatch for net-new keys.
+ *
+ * Auth: any authed CRM user — this is just an autocomplete hint, no
+ * client-scoped data leaks (only the key names themselves).
+ *
+ * Mounted BEFORE `/:id` so the literal segment doesn't get captured as
+ * a client_id route param.
+ */
+router.get('/custom-property-keys', async (req, res, next) => {
+  try {
+    const keys = await svc.listDistinctCustomPropertyKeys();
+    modernOk(res, keys);
+  } catch (e) { next(e); }
+});
+
 router.get('/:id', async (req, res, next) => {
   try {
     const c = await svc.getClientById(req.params.id);
@@ -587,13 +609,19 @@ router.get('/:clientId/custom-properties', async (req, res, next) => {
       return s === '1' || s === 'true' || s === 'yes' || s === 'y';
     };
     const normalised = rows.map((r) => ({
-      // legacy table has variant column names — keep the fallback chain
-      name: String(r.property_name ?? r.name ?? r.key ?? r.field_name ?? '').toLowerCase().trim(),
-      label: r.property_label ?? r.label ?? r.display_name ?? null,
-      mandatory: truthy(r.is_mandatory ?? r.mandatory ?? r.required ?? r.is_required ?? r.is_required_field),
-      value: r.property_value ?? r.value ?? r.field_value ?? null,
+      // Legacy table has TWO schema variants — canonical
+      // (`property_name` / `property_value` / `is_mandatory` + `id` PK)
+      // and legacy (`c_prop_name` / `c_prop_values` PLURAL /
+      // `c_prop_mandatory` + `c_prop_id` PK). The fallback chain
+      // covers both plus a few one-off historical aliases.
+      name: String(r.property_name ?? r.c_prop_name ?? r.name ?? r.key ?? r.field_name ?? '').toLowerCase().trim(),
+      label: r.property_label ?? r.c_prop_label ?? r.label ?? r.display_name ?? null,
+      mandatory: truthy(r.is_mandatory ?? r.c_prop_mandatory ?? r.mandatory ?? r.required ?? r.is_required ?? r.is_required_field),
+      value: r.property_value ?? r.c_prop_values ?? r.value ?? r.field_value ?? null,
       // Surface the row id so the FE edit/delete flows have a target.
-      id: r.id,
+      // Legacy PK is c_prop_id; canonical is id. Either way the FE
+      // gets a `id` to bind to.
+      id: r.id ?? r.c_prop_id ?? null,
       raw: r,
     })).filter((p) => p.name);
     modernOk(res, normalised);
@@ -899,20 +927,34 @@ router.delete(
 /* ─── Technician Mapping (client × service_type × technician) ─────── */
 
 /*
- * GET    /:clientId/tech-mapping
- *   → 2-query list of mappings with tech name + city + service-type name.
+ * GET    /:clientId/tech-mapping/summary
+ *   → Lightweight per-service-type roll-up (counts + top-6 cities). The
+ *     tab mounts with this; full chip lists are lazy-loaded on expand.
+ *     Replaces the legacy 4.3s mount cost on big clients.
  *
  * GET    /:clientId/tech-mapping/eligible?serviceTypeId=&cityName=…
  *   → 1-query eligibility picker (active + verified techs by default).
  *
+ * GET    /:clientId/tech-mapping/by-service-type/:serviceTypeId
+ *   → Full chip list for ONE (client, service_type) — fired by the FE
+ *     when the user expands a service-type row.
+ *
+ * GET    /:clientId/tech-mapping
+ *   → 2-query full list of all mappings. **Legacy** — kept for back-
+ *     compat; the tab no longer calls this on mount.
+ *
  * PUT    /:clientId/tech-mapping
  *   → Replace-set TX for one (client, service_type) cell.
  *     Body: { serviceTypeId, efrIds: [...] }
+ *
+ * Route-order note: literal `/summary`, `/eligible`, `/by-service-type`
+ * are declared before the bare `/tech-mapping` so Express matches the
+ * specific paths first (same pattern as auto-assign's `/bulk` route).
  */
-router.get('/:clientId/tech-mapping', async (req, res, next) => {
+router.get('/:clientId/tech-mapping/summary', async (req, res, next) => {
   try {
     if (!(await loadAndGuardClient(req, res))) return;
-    const rows = await techMappingSvc.listForClient(req.params.clientId);
+    const rows = await techMappingSvc.summaryForClient(req.params.clientId);
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
@@ -936,6 +978,26 @@ router.get(
     } catch (e) { next(e); }
   },
 );
+
+router.get('/:clientId/tech-mapping/by-service-type/:serviceTypeId', async (req, res, next) => {
+  try {
+    if (!(await loadAndGuardClient(req, res))) return;
+    const stId = Number(req.params.serviceTypeId);
+    if (!Number.isInteger(stId) || stId <= 0) {
+      return modernError(res, 400, 'serviceTypeId must be a positive integer');
+    }
+    const rows = await techMappingSvc.listForClientServiceType(req.params.clientId, stId);
+    modernOk(res, rows);
+  } catch (e) { next(e); }
+});
+
+router.get('/:clientId/tech-mapping', async (req, res, next) => {
+  try {
+    if (!(await loadAndGuardClient(req, res))) return;
+    const rows = await techMappingSvc.listForClient(req.params.clientId);
+    modernOk(res, rows);
+  } catch (e) { next(e); }
+});
 
 router.put(
   '/:clientId/tech-mapping',
