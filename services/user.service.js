@@ -192,6 +192,10 @@ async function createUser({
       STATUS_ACTIVE, createdBy || null,
     ]
   );
+  // New active user could be a manager's direct report — invalidate so
+  // the next hierarchy resolution picks up the new edge instead of
+  // serving the pre-insert adjacency map for up to 60s.
+  invalidateHierarchyCache();
   return getUserById(r.insertId);
 }
 
@@ -322,6 +326,14 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
   params.push(updatedBy || null, userId);
 
   await pool.query(`UPDATE tbl_user SET ${sets.join(', ')} WHERE user_id = ?`, params);
+  // Per-user perms cache invalidation. A user_role change is the obvious
+  // trigger; other field edits (name, email, etc.) don't change perms but
+  // clearing one entry is cheap so we do it unconditionally.
+  roleService.invalidatePermissionsCache(userId);
+  // Hierarchy adjacency invalidation. reporting_manager / user_status /
+  // user_type_id are all reachable via this update path; rather than
+  // sniff which field changed, just clear unconditionally (rebuild ~1 ms).
+  invalidateHierarchyCache();
   return getUserById(userId);
 }
 
@@ -344,6 +356,32 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
  * so we hold a 60s cache to avoid re-scanning on every /auth/me hit.
  */
 let _hierarchyCache = { at: 0, byManager: null };
+
+/*
+ * Explicit hierarchy-adjacency cache invalidation (added 2026-05-30).
+ *
+ * Any mutation to tbl_user that could change who appears as a direct
+ * report calls this — specifically:
+ *   - createUser           — new active row that might list a manager
+ *   - updateUser           — reporting_manager / user_status / user_type_id
+ *                            could have changed; conservatively clear on
+ *                            any field-write
+ *   - deactivateUser       — user disappears from the active-only query
+ *                            inside _loadHierarchyAdjacency
+ *
+ * Without this, the cache still self-corrects within 60 seconds (the
+ * existing TTL on _loadHierarchyAdjacency), but operators reassigning a
+ * reporting manager via Manage Users would see stale "team data" reads
+ * for up to that window. Resetting `at=0` forces the next read to
+ * refetch from DB regardless of TTL.
+ *
+ * Cheap by design: this is a single object assignment; the cache rebuild
+ * is one indexed query on tbl_user, returning typically <500 rows.
+ */
+function invalidateHierarchyCache() {
+  _hierarchyCache = { at: 0, byManager: null };
+}
+
 async function _loadHierarchyAdjacency() {
   if (_hierarchyCache.byManager && Date.now() - _hierarchyCache.at < 60_000) {
     return _hierarchyCache.byManager;
@@ -530,6 +568,16 @@ async function deactivateUser(userId, updatedBy) {
       WHERE user_id = ? AND user_type_id = ?`,
     [updatedBy || null, userId, INTERNAL_USER_TYPE_ID]
   );
+  if (r.affectedRows) {
+    // Deactivated user's perms cache entry would still serve stale data
+    // until TTL; drop it now so a re-activation or any racing request
+    // immediately re-resolves against the live row.
+    roleService.invalidatePermissionsCache(userId);
+    // Hierarchy view: _loadHierarchyAdjacency queries WHERE user_status=1,
+    // so this user just disappeared from every manager's downstream list.
+    // Clear so the next read reflects the change.
+    invalidateHierarchyCache();
+  }
   return r.affectedRows > 0;
 }
 
@@ -544,6 +592,12 @@ module.exports = {
   suggestAvailableEmail,
   findDescendantUserIds,
   buildHierarchyTree,
+  // Hierarchy adjacency cache invalidation hook — call from any external
+  // write path that mutates tbl_user beyond the create/update/deactivate
+  // entrypoints here (e.g. a future bulk-import path that writes
+  // reporting_manager directly via pool.query without going through
+  // updateUser). Internal write paths already self-invalidate.
+  invalidateHierarchyCache,
   SORTABLE_COLUMNS,
   INTERNAL_USER_TYPE_ID,
 };

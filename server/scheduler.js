@@ -54,22 +54,40 @@ function init() {
   // is opted in via tbl_client_custom_properties.auto_process_unconfirmed_order
   // and dispatches the WhatsApp magic link. Eligibility query +
   // 24h cooldown + 3-send cap live in services/job-magic-link-cron.js.
-  const magicLinkCron = require('../services/job-magic-link-cron');
-  tasks.push(cron.schedule('5 * * * *', async () => {
-    const t0 = Date.now();
-    try {
-      const result = await magicLinkCron.runHourlySweep();
-      const ms = Date.now() - t0;
-      logger.info(
-        `Magic-link cron · eligible=${result.eligible} · attempted=${result.attempted} · ` +
-        `succeeded=${result.succeeded} · failed=${result.failed} · ${ms}ms`
-      );
-    } catch (err) {
-      // Cron callbacks must never throw — node-cron would silently
-      // swallow the next tick. Log + continue.
-      logger.error(`Magic-link cron crashed: ${err.message}`);
-    }
-  }, { timezone: TZ }));
+  //
+  // ENV GATE (added 2026-05-30):
+  //   MAGIC_LINK_CRON_ENABLED=true  → cron registers + runs hourly
+  //   MAGIC_LINK_CRON_ENABLED=false → cron is NOT registered (no tick)
+  //   (unset)                       → treated as false
+  //
+  // Default OFF on every environment so a fresh deploy (prod, staging,
+  // local) never accidentally starts texting customers if the env var
+  // is missing or the deployer hasn't decided yet. QA's .env explicitly
+  // opts in. When prod is ready to send for real, set the flag there
+  // and restart — no code change needed.
+  const magicLinkCronEnabled =
+    String(process.env.MAGIC_LINK_CRON_ENABLED || '').toLowerCase() === 'true';
+  if (magicLinkCronEnabled) {
+    const magicLinkCron = require('../services/job-magic-link-cron');
+    tasks.push(cron.schedule('5 * * * *', async () => {
+      const t0 = Date.now();
+      try {
+        const result = await magicLinkCron.runHourlySweep();
+        const ms = Date.now() - t0;
+        logger.info(
+          `Magic-link cron · eligible=${result.eligible} · attempted=${result.attempted} · ` +
+          `succeeded=${result.succeeded} · failed=${result.failed} · ${ms}ms`
+        );
+      } catch (err) {
+        // Cron callbacks must never throw — node-cron would silently
+        // swallow the next tick. Log + continue.
+        logger.error(`Magic-link cron crashed: ${err.message}`);
+      }
+    }, { timezone: TZ }));
+    logger.info('Magic-link cron registered (MAGIC_LINK_CRON_ENABLED=true).');
+  } else {
+    logger.info('Magic-link cron SKIPPED — set MAGIC_LINK_CRON_ENABLED=true to enable.');
+  }
 
   logger.ready(`Scheduler started — ${tasks.length} task(s) registered (tz=${TZ}).`);
 }

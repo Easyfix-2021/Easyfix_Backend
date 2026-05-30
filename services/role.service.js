@@ -230,9 +230,76 @@ async function getRoleByIdFull(roleId) {
  * arrays. The frontend treats empty-everywhere as "no UI surface" — same as
  * the legacy login (blank sidebar, all-false action map).
  */
+/*
+ * Per-user permissions cache (added 2026-05-30).
+ *
+ * Why: this function is hit on every admin endpoint that uses the
+ * `requireAction()` middleware factory (middleware/require-action.js) —
+ * which means most of /api/admin/*. Without a cache, every authed request
+ * pays for two DB round-trips: a `tbl_user` row read + a `role_menu_action
+ * × menu_action` join. With 200+ admin endpoints fronted by the gate
+ * stack, that's a measurable share of per-request latency under load.
+ *
+ * TTL choice: 60 seconds.
+ *   - Long enough to absorb the burst-of-requests pattern that the FE
+ *     produces when an operator clicks through tabs (typically 3-8
+ *     near-simultaneous requests per click).
+ *   - Short enough that a newly-granted permission from Manage Role
+ *     takes effect almost immediately — ops grants something and on
+ *     their next minute of activity it's already live. Without explicit
+ *     invalidation, this is the worst-case staleness; with explicit
+ *     invalidation (see invalidatePermissionsCache below) it's
+ *     effectively zero on write paths that call the invalidator.
+ *
+ * Single-flight: concurrent first-time requests for the same user
+ * collapse into one DB load via _permissionsInflight. Prevents the
+ * thundering-herd cache-miss pattern when N parallel requests for a
+ * brand-new (uncached) user all kick off independent loads.
+ *
+ * Invalidation: the cache is keyed by user_id. Callers that mutate
+ * permissions should call invalidatePermissionsCache(userId) — or
+ * invalidatePermissionsCache() with no args to clear the whole cache
+ * when the mutation is broad (e.g. editing role_menu_action which
+ * affects every user holding that role).
+ */
+const PERMISSIONS_CACHE_TTL_MS = 60 * 1000;
+const _permissionsCache    = new Map(); // user_id (number) → { result, expiresAt }
+const _permissionsInflight = new Map(); // user_id (number) → Promise<result>
+
 async function getEffectivePermissions(userId) {
   if (!userId) return { menuIds: [], actionPermissions: [] };
+  const key = Number(userId);
+  const now = Date.now();
 
+  const cached = _permissionsCache.get(key);
+  if (cached && cached.expiresAt > now) return cached.result;
+
+  const inflight = _permissionsInflight.get(key);
+  if (inflight) return inflight;
+
+  const promise = (async () => {
+    try {
+      const result = await _loadEffectivePermissions(key);
+      _permissionsCache.set(key, {
+        result,
+        expiresAt: Date.now() + PERMISSIONS_CACHE_TTL_MS,
+      });
+      return result;
+    } finally {
+      _permissionsInflight.delete(key);
+    }
+  })();
+  _permissionsInflight.set(key, promise);
+  return promise;
+}
+
+/*
+ * The uncached DB loader. Preserves the legacy contract from
+ * LoginAction.java lines 92-98 exactly — same column reads, same
+ * empty-result semantics on missing role / inactive role. Cache misses
+ * route through here; cache hits never touch the DB.
+ */
+async function _loadEffectivePermissions(userId) {
   const [[user]] = await pool.query(
     'SELECT user_role FROM tbl_user WHERE user_id = ? LIMIT 1',
     [userId]
@@ -254,6 +321,32 @@ async function getEffectivePermissions(userId) {
     menuIds: role.menu_ids || [],
     actionPermissions: Array.from(new Set(rows.map((r) => r.action_name).filter(Boolean))),
   };
+}
+
+/*
+ * Explicit cache invalidation for the per-user permissions cache.
+ *
+ *   invalidatePermissionsCache(userId)  — clear one user (use when only
+ *                                          their user_role changed, e.g.
+ *                                          via a user-edit endpoint).
+ *   invalidatePermissionsCache()        — clear ALL entries (use when
+ *                                          role_menu_action changed; the
+ *                                          mutation affects every user
+ *                                          holding that role, and we
+ *                                          don't track role→users
+ *                                          membership in-memory).
+ *
+ * Called from the role-CRUD + user-edit + role_menu_action upsert paths.
+ * Without invalidation calls, the cache still self-corrects within
+ * PERMISSIONS_CACHE_TTL_MS — explicit calls just shorten that staleness
+ * to zero on the affected user(s).
+ */
+function invalidatePermissionsCache(userId) {
+  if (userId == null) {
+    _permissionsCache.clear();
+  } else {
+    _permissionsCache.delete(Number(userId));
+  }
 }
 
 /*
@@ -351,6 +444,11 @@ async function createRole({ role_name, role_desc, menu_ids, menu_action_ids, cre
     }
     await conn.commit();
     await refreshCache();
+    // New role's actions may not yet be cached for any user, but a future
+    // role-reassignment could route an existing user to this role and we
+    // want their perms re-resolved fresh. Clearing the whole perms cache
+    // is the safe broad-stroke (cost: one Map.clear, μs).
+    invalidatePermissionsCache();
     return getRoleByIdFull(r.insertId);
   } catch (e) {
     await conn.rollback();
@@ -432,6 +530,12 @@ async function updateRole(roleId, fields, updatedBy) {
     conn.release();
   }
   await refreshCache();
+  // Role edits (menu_ids change, role_status flip, action grant edits via
+  // applyMenuActionIds) affect every user holding this role. We don't
+  // maintain a role→users map in memory, so clear the whole perms cache;
+  // worst-case cost is N cache misses on the next request from each
+  // affected user, each one ~2 ms.
+  invalidatePermissionsCache();
   return getRoleByIdFull(roleId);
 }
 
@@ -455,7 +559,13 @@ async function deactivateRole(roleId) {
     'UPDATE tbl_role SET role_status = 0 WHERE role_id = ?',
     [roleId]
   );
-  if (r.affectedRows) await refreshCache();
+  if (r.affectedRows) {
+    await refreshCache();
+    // Deactivated role → cached perms for those users are now wrong
+    // (getEffectivePermissions short-circuits to empty arrays when
+    // role.role_status is 0). Clear so the next request re-resolves.
+    invalidatePermissionsCache();
+  }
   return r.affectedRows > 0;
 }
 
@@ -473,4 +583,7 @@ module.exports = {
   SORTABLE_COLUMNS,
   // Permission resolution (LoginAction.java parity)
   getEffectivePermissions,
+  // Per-user perms cache invalidation hook — call from write paths that
+  // touch role_menu_action, tbl_user.user_role, or role status flips.
+  invalidatePermissionsCache,
 };
