@@ -49,6 +49,28 @@ function init() {
     }
   }, { timezone: TZ }));
 
+  // ─── Customer Magic-Link cron — hourly at :05 IST ─────────────────
+  // Added 2026-05-28. Scans Unconfirmed (status=9) jobs whose client
+  // is opted in via tbl_client_custom_properties.auto_process_unconfirmed_order
+  // and dispatches the WhatsApp magic link. Eligibility query +
+  // 24h cooldown + 3-send cap live in services/job-magic-link-cron.js.
+  const magicLinkCron = require('../services/job-magic-link-cron');
+  tasks.push(cron.schedule('5 * * * *', async () => {
+    const t0 = Date.now();
+    try {
+      const result = await magicLinkCron.runHourlySweep();
+      const ms = Date.now() - t0;
+      logger.info(
+        `Magic-link cron · eligible=${result.eligible} · attempted=${result.attempted} · ` +
+        `succeeded=${result.succeeded} · failed=${result.failed} · ${ms}ms`
+      );
+    } catch (err) {
+      // Cron callbacks must never throw — node-cron would silently
+      // swallow the next tick. Log + continue.
+      logger.error(`Magic-link cron crashed: ${err.message}`);
+    }
+  }, { timezone: TZ }));
+
   logger.ready(`Scheduler started — ${tasks.length} task(s) registered (tz=${TZ}).`);
 }
 

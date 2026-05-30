@@ -23,4 +23,103 @@ function verifyToken(token) {
   return jwt.verify(token, requireSecret());
 }
 
-module.exports = { signUserToken, verifyToken };
+/**
+ * Sign a customer-facing magic-link JWT for completing an unconfirmed order.
+ *
+ * Why a separate helper (vs reusing signUserToken):
+ *   - Distinct `type: 'job_completion'` claim guarantees a leaked job-token can
+ *     never be replayed against authenticated CRM endpoints (and vice-versa,
+ *     enforced in verifyJobToken below).
+ *   - Subject is `job:<id>` (not a user_id) so middleware that naively trusts
+ *     `sub` won't misclassify a job-token as a user identity.
+ *   - TTL comes from MAGIC_LINK_TTL_HOURS so ops can rotate without a deploy.
+ *     Default 168h = 7 days, matching the WhatsApp template's expected reach.
+ *
+ * The state-bound expiry layer lives in requireUnconfirmedJob() below — this
+ * helper only enforces the time-bound layer.
+ */
+function signJobToken({ jobId }) {
+  const ttlHours = Number(process.env.MAGIC_LINK_TTL_HOURS || 168);
+  return jwt.sign(
+    {
+      sub: 'job:' + jobId,
+      jobId: Number(jobId),
+      type: 'job_completion',
+    },
+    requireSecret(),
+    { expiresIn: `${ttlHours}h` }
+  );
+}
+
+/**
+ * Verify a customer magic-link JWT.
+ *
+ * Throws plain `{status, message}` shapes (NOT Error instances) so the public
+ * route handlers can `throw` directly and a small error mapper can translate
+ * to HTTP without sniffing instanceof chains.
+ *
+ * Defence-in-depth: we ALSO reject any token whose `type` is 'user' even
+ * though signUserToken never sets a `type` claim — this future-proofs against
+ * a leaked CRM JWT being submitted on a public endpoint by a confused client
+ * or a malicious actor probing the surface.
+ *
+ * Returns `{ jobId }` (Number) on success.
+ */
+function verifyJobToken(token) {
+  let claims;
+  try {
+    claims = jwt.verify(token, requireSecret());
+  } catch (_err) {
+    throw { status: 401, message: 'invalid or expired link' };
+  }
+  if (claims && claims.type === 'user') {
+    throw { status: 401, message: 'token type mismatch' };
+  }
+  if (!claims || claims.type !== 'job_completion') {
+    throw { status: 401, message: 'token type mismatch' };
+  }
+  return { jobId: Number(claims.jobId) };
+}
+
+/**
+ * Live state check that MUST run after verifyJobToken() on every public
+ * magic-link endpoint.
+ *
+ * Why a second layer when the JWT already has an exp:
+ *   - The token's time-bound expiry (default 7d) is independent of the
+ *     order's lifecycle. The moment ops confirms the order in CRM (status
+ *     leaves 9), the magic link MUST stop working — even if the JWT is
+ *     still cryptographically valid for hours.
+ *   - 410 GONE (vs 401) lets the FE render a friendly "this link is no
+ *     longer active" page instead of a generic auth-error message.
+ *
+ * `pool` is injected (mysql2/promise) rather than imported from server/db.js
+ * to keep utils/jwt.js free of DB-layer imports — preserves the existing
+ * separation of concerns and keeps this file unit-testable in isolation.
+ *
+ * Returns void; the live status check is the side effect.
+ */
+async function requireUnconfirmedJob(jobId, pool) {
+  const [rows] = await pool.query(
+    'SELECT job_status FROM tbl_job WHERE job_id = ? LIMIT 1',
+    [Number(jobId)]
+  );
+  if (!rows || rows.length === 0) {
+    throw { status: 404, code: 'JOB_NOT_FOUND', message: 'Order not found' };
+  }
+  if (Number(rows[0].job_status) !== 9) {
+    throw {
+      status: 410,
+      code: 'JOB_NO_LONGER_PENDING',
+      message: 'Order is no longer awaiting customer details',
+    };
+  }
+}
+
+module.exports = {
+  signUserToken,
+  verifyToken,
+  signJobToken,
+  verifyJobToken,
+  requireUnconfirmedJob,
+};

@@ -54,6 +54,14 @@ const swaggerDocs = require('./docs/swagger');
 app.use('/api/docs', swaggerDocs.makeDocsMiddleware());
 app.get('/api/openapi.json', swaggerDocs.jsonSpecHandler);
 
+// Public router — token-only auth (verifyJobToken + requireUnconfirmedJob
+// applied per-endpoint). Used by the customer magic-link form. Mounted
+// before the main /api router so no admin middleware (requireAuth /
+// maskMobile) accidentally wraps it. Express matches more-specific path
+// prefixes first, so /api/public/* lands here and never reaches the
+// authed routes aggregator.
+app.use('/api/public', require('./routes/public'));
+
 app.use('/api', routes);
 
 // Tell the swagger module which Express app to introspect. Called

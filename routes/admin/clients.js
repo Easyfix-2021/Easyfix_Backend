@@ -54,25 +54,13 @@ const DOC_MIME = new Set([
 ]);
 
 /* ─── Permission gates ────────────────────────────────────────────── */
+// Migrated 2026-05-30 from inline `req.user.permissions.actionPermissions`
+// checks (which never matched — see middleware/require-action.js header
+// for the full history) to the shared `requireAction()` factory.
 
-function hasAction(req, key) {
-  const perms = req.user?.permissions?.actionPermissions || [];
-  return perms.includes(key);
-}
-
-function requireClientAdd(req, res, next) {
-  if (!hasAction(req, 'isClientAddNew')) {
-    return modernError(res, 403, 'Missing permission: isClientAddNew');
-  }
-  next();
-}
-
-function requireClientEdit(req, res, next) {
-  if (!hasAction(req, 'isClientEdit')) {
-    return modernError(res, 403, 'Missing permission: isClientEdit');
-  }
-  next();
-}
+const requireAction = require('../../middleware/require-action');
+const requireClientAdd  = requireAction('isClientAddNew');
+const requireClientEdit = requireAction('isClientEdit');
 
 /* ─── Helper: scope-guard a client by id ──────────────────────────── */
 

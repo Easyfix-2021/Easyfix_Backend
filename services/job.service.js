@@ -105,7 +105,46 @@ const LIST_COLUMNS = `
    * or join-on-derived-table.
    */
   (SELECT COUNT(*) FROM tbl_job_services js
-    WHERE js.job_id = j.job_id AND js.job_service_status = 1) AS service_count
+    WHERE js.job_id = j.job_id AND js.job_service_status = 1) AS service_count,
+  /*
+   * Customer Magic-Link Completion (added 2026-05-28) — drives the
+   * three FE pills on the Unconfirmed Jobs list (Customer Submitted /
+   * Link Sent / none) plus the Trigger / Retrigger action button.
+   *
+   *   customer_submitted_at      — non-null once the customer hits the
+   *                                magic-link landing page and submits.
+   *   magic_link_sent_at         — last time we dispatched the link.
+   *   magic_link_send_count      — number of dispatches so far; the FE
+   *                                uses this to label the button as
+   *                                Trigger (0) vs Retrigger (>=1).
+   *   magic_link_last_action     — short string (e.g. sent, viewed,
+   *                                submitted) for tooltip / audit only.
+   *
+   * client_opted_in is derived via EXISTS on tbl_client_custom_properties
+   * with c_prop_name = auto_process_unconfirmed_order and a truthy
+   * (lowercase true) c_prop_values. Returned as 0/1 so the FE can gate
+   * the action button without a second round-trip. Correlated subquery
+   * on the indexed client_id column — cost is negligible.
+   *
+   * Schema note (2026-05-30): the live table uses the legacy c_prop_*
+   * column names — c_prop_name, c_prop_values (plural), c_prop_mandatory,
+   * plus status for soft-delete (1=active, 0=deleted). Earlier drafts of
+   * this file referenced property_name/property_value which don't exist
+   * on the schema — fixed in-place. (Note: no backticks in this comment
+   * because the surrounding LIST_COLUMNS is itself a JS template literal,
+   * so backticks would close the literal early and break parsing.)
+   */
+  j.customer_submitted_at,
+  j.magic_link_sent_at,
+  j.magic_link_send_count,
+  j.magic_link_last_action,
+  (EXISTS (
+     SELECT 1 FROM tbl_client_custom_properties ccp
+      WHERE ccp.client_id = j.fk_client_id
+        AND ccp.c_prop_name = 'auto_process_unconfirmed_order'
+        AND LOWER(ccp.c_prop_values) = 'true'
+        AND ccp.status = 1
+   )) AS client_opted_in
 `;
 
 /*

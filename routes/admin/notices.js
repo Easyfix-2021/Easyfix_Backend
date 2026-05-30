@@ -34,20 +34,17 @@ const upload = multer({
  * any admin-group user — operators consume the notice strip even
  * without authoring rights.
  *
- * Note on requireAction: we don't have a dedicated middleware factory
- * for action-key checks in this codebase yet (the existing routes
- * inline the check). Following the same pattern here keeps the
- * surface consistent. If/when an `requireAction()` middleware lands
- * we'll migrate this and the click-to-call route together.
+ * Migrated 2026-05-30 to the shared `requireAction()` middleware
+ * factory (middleware/require-action.js). The earlier inline pattern
+ * read `req.user.permissions.actionPermissions` which was always
+ * undefined — `requireAuth` only attaches the bare tbl_user row to
+ * req.user. The factory loads permissions on demand via
+ * getEffectivePermissions() and stashes them on req.user.permissions
+ * for downstream reuse within the same request.
  */
 
-function requireNoticeManage(req, res, next) {
-  const perms = req.user?.permissions?.actionPermissions || [];
-  if (!perms.includes('isNoticeManage')) {
-    return modernError(res, 403, 'Missing permission: isNoticeManage');
-  }
-  next();
-}
+const requireAction = require('../../middleware/require-action');
+const requireNoticeManage = requireAction('isNoticeManage');
 
 // ─── List ────────────────────────────────────────────────────────────
 router.get(
