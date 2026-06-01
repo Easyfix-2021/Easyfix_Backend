@@ -1432,6 +1432,51 @@ router.delete('/:id/services/:jobServiceId',
   });
 
 /*
+ * PATCH /admin/jobs/:id/services/:jobServiceId
+ *
+ * Update the quantity on a single active tbl_job_services row. Carved
+ * out of the Services tab redesign — previously the only way to fix a
+ * wrong qty was Delete + re-Add, which lost row identity (PK churn) and
+ * broke any downstream rate-card breakdown that keyed off
+ * `job_service_id`. The PATCH preserves the row and just bumps qty.
+ *
+ * Soft-deleted rows (job_service_status = 0) are explicitly NOT updatable
+ * here: they should be restored first via /restore, then edited. We
+ * return 404 in that case to make the FE flow obvious.
+ *
+ * Validator + scopedJob mirror the sibling DELETE/restore endpoints
+ * above so authz and shape behaviour stay symmetric.
+ */
+router.patch('/:id/services/:jobServiceId',
+  validate(require('joi').object({
+    id: require('joi').number().integer().positive().required(),
+    jobServiceId: require('joi').number().integer().positive().required(),
+  }), 'params'),
+  validate(require('joi').object({
+    quantity: require('joi').number().integer().min(1).max(100).required(),
+  })),
+  scopedJob,
+  async (req, res, next) => {
+    try {
+      const jobId = Number(req.params.id);
+      const jobServiceId = Number(req.params.jobServiceId);
+      const { quantity } = req.body;
+      const [r] = await pool.query(
+        `UPDATE tbl_job_services
+            SET quantity = ?
+          WHERE job_id = ?
+            AND job_service_id = ?
+            AND (job_service_status IS NULL OR job_service_status = 1)`,
+        [quantity, jobId, jobServiceId],
+      );
+      if (!r.affectedRows) {
+        return res.status(404).json({ error: 'service not found or inactive' });
+      }
+      modernOk(res, { updated: true, job_id: jobId, job_service_id: jobServiceId, quantity });
+    } catch (e) { next(e); }
+  });
+
+/*
  * POST /admin/jobs/:id/services
  *
  * Append a NEW service row to tbl_job_services without touching the
