@@ -59,6 +59,7 @@ router.use('/deep-skills',     require('./deep-skills'));
 router.use('/auto-allocation', require('./auto-allocation'));
 router.use('/jobs',          require('./jobs'));
 router.use('/jobs',          require('./job-magic-link')); // adds /:id/send-magic-link + /:id/magic-link-status under /jobs (see file for shape)
+router.use('/customer-requests', require('./customer-requests')); // ops inbox for tbl_job_customer_request (cancel/reschedule signals)
 router.use('/auto-assign',   require('./auto-assign'));
 router.use('/notifications', require('./notifications'));
 router.use('/webhooks',        require('./webhooks'));

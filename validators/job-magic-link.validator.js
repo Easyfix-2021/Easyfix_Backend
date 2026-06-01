@@ -22,8 +22,46 @@
  */
 
 const Joi = require('joi');
+const {
+  CANCEL_REASONS,
+  RESCHEDULE_REASONS,
+} = require('../services/job-magic-link.service');
 
 const intId = Joi.number().integer().positive();
+
+/*
+ * Customer cancel / reschedule request bodies.
+ *
+ * `reason` is constrained to the SAME frozen lists the prefill returns
+ * (services/job-magic-link.service.js) so the FE dropdown options and the
+ * server-side allowlist can never drift. `remarks` is an optional free-text
+ * note (capped at 1000 chars to bound storage / abuse).
+ *
+ * `preferred_datetime` (reschedule only) accepts BOTH ISO-8601 and the
+ * legacy "YYYY-MM-DD HH:mm" shape the FE date-picker emits — Joi.date()
+ * with two explicit formats parses either into a Date the route stores as
+ * a MySQL DATETIME. Absent → stored as NULL.
+ */
+const cancelRequestBody = Joi.object({
+  reason: Joi.string().valid(...CANCEL_REASONS).required(),
+  remarks: Joi.string().trim().max(1000).allow('').optional(),
+});
+
+const rescheduleRequestBody = Joi.object({
+  reason: Joi.string().valid(...RESCHEDULE_REASONS).required(),
+  remarks: Joi.string().trim().max(1000).allow('').optional(),
+  // Accept ISO-8601 OR the legacy "YYYY-MM-DD HH:mm" string. Joi.date().iso()
+  // covers the ISO case; the string pattern covers the space-separated legacy
+  // shape (Joi.date() rejects the space form). The route normalises whichever
+  // matched into a single MySQL DATETIME string before INSERT.
+  preferred_datetime: Joi.alternatives()
+    .try(
+      Joi.date().iso(),
+      Joi.string().pattern(/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?$/),
+    )
+    .optional()
+    .messages({ 'alternatives.match': 'preferred_datetime must be ISO-8601 or "YYYY-MM-DD HH:mm".' }),
+});
 
 const serviceLine = Joi.object({
   client_service_id: intId.required(),
@@ -82,4 +120,10 @@ const imageIdParam = Joi.object({
   imageId: intId.required(),
 }).unknown(true);
 
-module.exports = { submitBody, tokenParam, imageIdParam };
+module.exports = {
+  submitBody,
+  tokenParam,
+  imageIdParam,
+  cancelRequestBody,
+  rescheduleRequestBody,
+};

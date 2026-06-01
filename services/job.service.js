@@ -249,6 +249,54 @@ async function hasClientVerticalIdColumn() {
   return _hasClientVerticalIdColumn;
 }
 
+/*
+ * Probe ONCE per process for the presence of `tbl_job_customer_request`.
+ * That table only exists on deploys where migration
+ * `2026-06-02-job-customer-requests.sql` has run. The LIST projection
+ * surfaces the latest PENDING cancel/reschedule request per job via two
+ * correlated subqueries; if those reference a non-existent table EVERY
+ * unconfirmed-list query 500s. So we probe, memoise, and build the two
+ * projection columns conditionally (NULL aliases when the table is absent),
+ * making the feature a transparent no-op on un-migrated deploys.
+ * Mirrors the hasOtpColumn / hasClientVerticalIdColumn probes above.
+ */
+let _hasCustomerRequestTable = null;
+async function customerRequestTableExists() {
+  if (_hasCustomerRequestTable !== null) return _hasCustomerRequestTable;
+  try {
+    await pool.query('SELECT 1 FROM tbl_job_customer_request LIMIT 1');
+    _hasCustomerRequestTable = true;
+  } catch {
+    _hasCustomerRequestTable = false;
+  }
+  return _hasCustomerRequestTable;
+}
+
+/*
+ * Builds the two pending-customer-request projection columns for the LIST
+ * query. When the table exists, emits correlated subqueries selecting the
+ * latest PENDING request's type + reason; otherwise emits NULL aliases so
+ * the column shape stays identical. Parameterised SQL — the literal
+ * 'pending' is the only constant and it is bound as a parameter list the
+ * caller appends, but since it's a fixed string we inline it safely (no
+ * user input). Returns a leading-comma fragment ready to append after
+ * client_opted_in.
+ */
+function pendingRequestColumns(tableExists) {
+  if (!tableExists) {
+    return `,
+  NULL AS pending_request_type,
+  NULL AS pending_request_reason`;
+  }
+  return `,
+  (SELECT cr.request_type FROM tbl_job_customer_request cr
+    WHERE cr.job_id = j.job_id AND cr.request_status = 'pending'
+    ORDER BY cr.created_at DESC LIMIT 1) AS pending_request_type,
+  (SELECT cr.reason FROM tbl_job_customer_request cr
+    WHERE cr.job_id = j.job_id AND cr.request_status = 'pending'
+    ORDER BY cr.created_at DESC LIMIT 1) AS pending_request_reason`;
+}
+
 // Kept for getById(), which does select these as part of the full detail payload.
 const DETAIL_JOIN = LIST_JOIN + `
   LEFT JOIN tbl_user        cr ON cr.user_id     = j.fk_created_by
@@ -321,6 +369,13 @@ async function list({
   // Probe ONCE per process for tbl_client.vertical_id presence.
   // See declaration above for the rationale.
   const hasVerticalCol = await hasClientVerticalIdColumn();
+
+  // Probe ONCE per process for tbl_job_customer_request presence, then build
+  // the LIST projection with the pending-request columns appended (NULL
+  // aliases when the table is absent). Keeps the unconfirmed list from 500ing
+  // on un-migrated deploys. See pendingRequestColumns() above.
+  const hasCustomerRequestTable = await customerRequestTableExists();
+  const listColumns = LIST_COLUMNS + pendingRequestColumns(hasCustomerRequestTable);
 
   // Apply RBAC scope FIRST so any explicit clientId/cityId filter
   // narrows within the allowed set (caller can't widen scope by passing
@@ -564,7 +619,7 @@ async function list({
   const [[[{ total }]], [rows]] = await Promise.all([
     pool.query(`SELECT COUNT(*) AS total ${countJoin} ${where}`, params),
     pool.query(
-      `SELECT ${LIST_COLUMNS} ${LIST_JOIN} ${where}
+      `SELECT ${listColumns} ${LIST_JOIN} ${where}
        ORDER BY j.job_id DESC LIMIT ? OFFSET ?`,
       dataParams
     ),
@@ -615,10 +670,13 @@ async function getById(jobId) {
       // them out here would deny the restore path. (Updated 2026-05-26.)
       `SELECT js.job_service_id, js.service_id, js.quantity, js.total_charge,
               js.job_service_status, js.service_category_id, js.service_type_id,
-              st.service_type_name, sc.service_catg_name
+              st.service_type_name, sc.service_catg_name,
+              CR.crc_ratecard_name AS service_name
          FROM tbl_job_services js
          LEFT JOIN tbl_service_type st ON st.service_type_id = js.service_type_id
          LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = js.service_category_id
+         LEFT JOIN tbl_client_service   CS ON CS.client_service_id = js.service_id
+         LEFT JOIN tbl_client_rate_card CR ON CR.crc_id = CS.rate_card_id
         WHERE js.job_id = ?
         ORDER BY js.job_service_id ASC`,
       [jobId]

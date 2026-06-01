@@ -33,7 +33,91 @@ const { signJobToken } = require('../utils/jwt');
 // Both NOTIFICATIONS_DISABLE and TEST_MOBILE are honoured by the Gallabox wrapper.
 const whatsappService  = require('./gallabox.whatsapp.service');
 const urlShortener     = require('./url-shortener.service');
+const { maskMobile }   = require('../utils/mask-mobile');
 const logger           = require('../logger');
+
+/**
+ * Fixed customer-request reason lists.
+ *
+ * Frozen so the BE validation (routes/public/job-completion.js Joi
+ * `valid(...)`) and the prefill payload (fetchPrefill returns these verbatim
+ * so the FE dropdowns match the validator exactly) draw from a SINGLE source.
+ * If ops want new reasons, edit here — the FE picks them up from the prefill
+ * automatically and the validator accepts them in lockstep.
+ */
+const CANCEL_REASONS     = Object.freeze(['Self Assembly', 'Product Returned / Damaged']);
+const RESCHEDULE_REASONS = Object.freeze(['Product Not Delivered', 'Site Not Ready']);
+
+/**
+ * Human label for a numeric tbl_job.job_status.
+ *
+ * No shared label helper is exported from services/job.service.js (it only
+ * exports the STATUS code map), so we inline a small map here covering the
+ * codes the customer-facing surface can encounter. Status 9 (CALL_LATER /
+ * UNCONFIRMED alias) renders as "Unconfirmed" — the customer-facing name.
+ * Unknown codes fall back to "Order" so the FE never renders a bare number.
+ */
+const ORDER_STATUS_LABELS = Object.freeze({
+  0:  'Booked',
+  1:  'Scheduled',
+  2:  'In Progress',
+  3:  'Completed',
+  5:  'Completed',
+  6:  'Cancelled',
+  7:  'Enquiry',
+  9:  'Unconfirmed',
+  10: 'Revisit',
+});
+function orderStatusLabel(status) {
+  const code = Number(status);
+  return ORDER_STATUS_LABELS[code] || 'Order';
+}
+
+/**
+ * Resolve the client's PRIMARY internal EasyFix SPOC for a job.
+ *
+ * The Primary SPOC is the tbl_vertical_mapping row with user_type=1 for the
+ * job's client (Secondary=2 — see services/client-verticals.service.js and
+ * project memory "Manage Clients flow"). Joined to tbl_user for the display
+ * name + mobile. Column-name landmines confirmed against
+ * client-verticals.service.js: tbl_user uses single `user_name` + mobile on
+ * `mobile_no`.
+ *
+ * Returns { name: string|null, mobile: string|null, user_id: number|null }.
+ * `mobile` is the RAW mobile and `user_id` is the vm.user_id (tbl_user PK).
+ * Callers decide whether to mask: fetchPrefill masks it before returning to
+ * the client; the spoc-call route uses it raw to bridge the Kaleyra call
+ * (the real number is NEVER shipped to the client) AND stamps user_id as
+ * the reciever_id on the tbl_job_caller_info audit row.
+ *
+ * Schema-drift safe: if tbl_vertical_mapping lacks user_type on this deploy,
+ * we cannot identify a Primary specifically — return nulls rather than guess.
+ * LEFT JOIN + null-tolerant so a missing user row degrades to nulls.
+ */
+async function resolveJobSpoc(jobId, pool) {
+  const [rows] = await pool.query(
+    `SELECT vm.user_id AS spoc_user_id, u.user_name AS spoc_name, u.mobile_no AS spoc_mobile
+       FROM tbl_job j
+       JOIN tbl_vertical_mapping vm ON vm.client_id = j.fk_client_id AND vm.user_type = 1
+       LEFT JOIN tbl_user u         ON u.user_id    = vm.user_id
+      WHERE j.job_id = ?
+      ORDER BY vm.user_id ASC
+      LIMIT 1`,
+    [jobId],
+  ).catch((e) => {
+    // user_type column absent on this deploy (older schema) → can't pick a
+    // Primary. Treat as "no SPOC mapped" rather than 500 the public surface.
+    logger.warn({ jobId, err: e && e.message }, 'magic-link: SPOC lookup failed — treating as no SPOC');
+    return [[]];
+  });
+  const row = rows && rows[0];
+  if (!row) return { name: null, mobile: null, user_id: null };
+  return {
+    name:    row.spoc_name   || null,
+    mobile:  row.spoc_mobile || null,
+    user_id: row.spoc_user_id != null ? Number(row.spoc_user_id) : null,
+  };
+}
 
 /**
  * Time-slot enum surfaced to the customer.
@@ -171,6 +255,7 @@ async function fetchPrefill(jobId, pool) {
   const [jobRows] = await pool.query(
     `SELECT j.job_id, j.fk_client_id, j.fk_address_id, j.requested_date_time,
             j.time_slot, j.job_desc, j.additional_name, j.additional_number,
+            j.job_status,
             COALESCE(j.job_customer_name, cu.customer_name) AS customer_name,
             cu.customer_mob_no, cu.customer_email,
             ad.address, ad.building, ad.landmark, ad.city_id, ad.pin_code,
@@ -196,12 +281,32 @@ async function fetchPrefill(jobId, pool) {
 
   const [cityResult, serviceResult, imageResult, customPropResult] = await Promise.all([
     pool.query(citySql),
+    // Client rate-card services for the picker. Column model (verified
+    // against services/client-rate-cards.service.js ~line117 and the legacy
+    // ClientDaoImpl.java#666): tbl_client_service carries a SINGULAR
+    // `service_type_id` FK + a `rate_card_id` FK. The service-type name and
+    // its category both resolve THROUGH `service_type_id` (the row's own
+    // `service_catg_id` is unreliable — it's NULL on many client rows, which
+    // is why the customer-facing picker previously rendered BLANK names).
+    //   - service_type_name : from tbl_service_type via service_type_id
+    //   - service_catg_name : from tbl_service_catg via st.service_catg_id
+    //                          (the type's category, NOT cs.service_catg_id)
+    //   - service_name      : the rate-card display name (crc_ratecard_name)
+    //                          via rate_card_id → tbl_client_rate_card. This
+    //                          is the friendly per-client label the CRM
+    //                          AutoServicesTable shows as the primary line,
+    //                          so the public picker can show a real name even
+    //                          when service_type_name is generic/null.
     pool.query(
-      `SELECT cs.client_service_id, cs.service_type_id, cs.service_catg_id,
-              cs.charge_type, st.service_type_name, sc.service_catg_name
+      `SELECT cs.client_service_id, cs.service_type_id, st.service_catg_id,
+              cs.charge_type, cs.total_amount,
+              st.service_type_name,
+              sc.service_catg_name,
+              cr.crc_ratecard_name AS service_name
          FROM tbl_client_service cs
-         LEFT JOIN tbl_service_type st ON st.service_type_id = cs.service_type_id
-         LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = cs.service_catg_id
+         LEFT JOIN tbl_service_type     st ON st.service_type_id = cs.service_type_id
+         LEFT JOIN tbl_service_catg     sc ON sc.service_catg_id = st.service_catg_id
+         LEFT JOIN tbl_client_rate_card cr ON cr.crc_id          = cs.rate_card_id
         WHERE cs.client_id = ? AND cs.service_status = 1
         ORDER BY st.service_type_name ASC
         LIMIT 1000`,
@@ -236,6 +341,24 @@ async function fetchPrefill(jobId, pool) {
   const serviceRows    = serviceResult[0]    || [];
   const imageRows      = imageResult[0]      || [];
   const customPropRows = customPropResult[0] || [];
+
+  // Resolve the client's Primary internal SPOC (user_type=1). The real
+  // mobile NEVER leaves the server — we mask it before returning. The
+  // spoc-call route re-resolves the raw number server-side to bridge a
+  // Kaleyra call. Independent of the secondary lookups above, but cheap
+  // enough to run sequentially after them.
+  const spoc = await resolveJobSpoc(jobId, pool);
+
+  // Build a Google Maps link. Prefer precise GPS ("lat,lng") when present;
+  // else fall back to the URL-encoded address string; else null when we
+  // have neither.
+  let mapsLink = null;
+  const gps = row.gps_location ? String(row.gps_location).trim() : '';
+  if (/^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/.test(gps)) {
+    mapsLink = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(gps)}`;
+  } else if (row.address && String(row.address).trim()) {
+    mapsLink = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(String(row.address).trim())}`;
+  }
 
   // Normalise custom-property rows across the legacy column-name drift
   // (see routes/admin/clients.js GET /:clientId/custom-properties for the
@@ -288,6 +411,31 @@ async function fetchPrefill(jobId, pool) {
 
   return {
     jobId,
+    // Flat job_id + order-status fields for the expanded Job Completion /
+    // Order page header. `order_status` is the numeric tbl_job.job_status;
+    // `order_status_label` is the customer-facing human label.
+    job_id:             jobId,
+    order_status:       row.job_status != null ? Number(row.job_status) : null,
+    order_status_label: orderStatusLabel(row.job_status),
+    // Flat client_name (also nested under `client` below for back-compat).
+    client_name: row.client_name || '',
+    // Google Maps link for the order address (GPS-preferred). null when
+    // neither GPS nor an address string is available.
+    maps_link: mapsLink,
+    // Internal EasyFix Primary SPOC. mobile is ALWAYS masked here — the raw
+    // number is resolved server-side only inside the spoc-call bridge.
+    spoc: {
+      name:          spoc.name,
+      mobile_masked: spoc.mobile ? maskMobile(spoc.mobile) : null,
+    },
+    // Fixed reason lists — same arrays the BE validates against, so the FE
+    // dropdowns match the validator exactly.
+    cancel_reasons:     CANCEL_REASONS,
+    reschedule_reasons: RESCHEDULE_REASONS,
+    // Customer's OWN mobile, UNMASKED. It is the customer's own number on
+    // their own order; the FE renders it read-only. (Distinct from the
+    // masked `customer.mobile` kept below for back-compat.)
+    customer_mob: row.customer_mob_no || '',
     customer: {
       name:   row.customer_name   || '',
       mobile: row.customer_mob_no || '',
@@ -322,8 +470,16 @@ async function fetchPrefill(jobId, pool) {
       service_type_id:    s.service_type_id,
       service_catg_id:    s.service_catg_id,
       charge_type:        s.charge_type,
+      // service_name = rate-card display label (friendly per-client name);
+      // the FE picker prefers it over service_type_name. Empty string when
+      // the row has no rate_card_id mapped.
+      service_name:       s.service_name || '',
       service_type_name:  s.service_type_name || '',
       service_catg_name:  s.service_catg_name || '',
+      // Billing label derived per-row: 'Free' when no charge is configured
+      // (total_amount null or 0), else 'Paid'. Drives the FE's Free/Paid
+      // badge on each service line.
+      billing_label:      (s.total_amount == null || Number(s.total_amount) === 0) ? 'Free' : 'Paid',
     })),
     // FE contract: round-2 picker seed. Empty array when the customer
     // hasn't submitted yet. Keys MUST stay exactly client_service_id +
@@ -916,4 +1072,8 @@ module.exports = {
   fetchPrefill,
   sendForJob,
   acceptSubmission,
+  resolveJobSpoc,
+  orderStatusLabel,
+  CANCEL_REASONS,
+  RESCHEDULE_REASONS,
 };

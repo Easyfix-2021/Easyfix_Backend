@@ -1719,6 +1719,24 @@ router.put('/:id/feedback',
   }
 );
 
+// ─── Customer cancel / reschedule requests for ONE job ───────────────
+// Surfaces the rows a customer logged from the public magic-link page
+// (tbl_job_customer_request) so CRM ops can see them on the order detail.
+// scopedJob enforces the same row-level scope as every other /:id route.
+router.get('/:id/customer-requests', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT request_id, request_type, reason, remarks,
+              preferred_datetime, request_status, created_at
+         FROM tbl_job_customer_request
+        WHERE job_id = ?
+        ORDER BY created_at DESC`,
+      [Number(req.params.id)],
+    );
+    modernOk(res, rows);
+  } catch (e) { next(e); }
+});
+
 /*
  * ─── Job Image upload (S3 with local fallback) ─────────────────────
  *
