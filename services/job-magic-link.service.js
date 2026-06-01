@@ -32,6 +32,7 @@ const { signJobToken } = require('../utils/jwt');
 // Call shape: sendTemplate({ to, recipientName, templateName, bodyValues: { 1, 2, 3 } })
 // Both NOTIFICATIONS_DISABLE and TEST_MOBILE are honoured by the Gallabox wrapper.
 const whatsappService  = require('./gallabox.whatsapp.service');
+const urlShortener     = require('./url-shortener.service');
 const logger           = require('../logger');
 
 /**
@@ -461,6 +462,41 @@ async function sendForJob(jobId, { action, override = false } = {}, pool) {
     );
   }
 
+  // Shorten the long JWT URL for the WhatsApp body. Gallabox's
+  // `confirm_order` template variable {{3}} renders the URL in-line and
+  // long JWTs (~200 chars) blow past sensible message length + look
+  // suspicious to the customer. We mint a short URL row tagged
+  // `purpose='unconfirmed_book'` with a TTL matching the JWT's own
+  // lifetime (MAGIC_LINK_TTL_HOURS, default 168h = 7d) so an expired
+  // link returns the friendly /book/<code> 410 page rather than a stale
+  // redirect to a JWT-expired landing page.
+  //
+  // Soft fallback: if shortening fails (DB hiccup, network), we keep
+  // the long URL and proceed with the send rather than aborting — the
+  // customer MUST receive a working link. Warning logged for ops.
+  let bodyUrl = url;
+  try {
+    const ttlHours    = Number(process.env.MAGIC_LINK_TTL_HOURS) || 168;
+    const expiresAt   = new Date(Date.now() + ttlHours * 3600 * 1000);
+    // `purpose` = 'unconfirmed_book' tags this row in
+    // tbl_url_shortener as a customer Unconfirmed-Order booking link.
+    // Audit queries like "all customer-book links sent this week" or a
+    // future cleanup cron that targets just this flow filter on this
+    // exact string — keep it stable across send paths (admin manual,
+    // hourly cron, future "bulk send") so the bucket stays consistent.
+    const { short_url } = await urlShortener.shortenUrl(
+      url,
+      { purpose: 'unconfirmed_book', expiresAt },
+      pool,
+    );
+    bodyUrl = short_url;
+  } catch (err) {
+    logger.warn(
+      { jobId, err: err && err.message },
+      'magic-link: URL shortening failed — falling back to long JWT URL',
+    );
+  }
+
   let response;
   try {
     response = await whatsappService.sendTemplate({
@@ -470,7 +506,7 @@ async function sendForJob(jobId, { action, override = false } = {}, pool) {
       bodyValues: {
         1: row.customer_name || 'there',
         2: row.client_name   || '',
-        3: url,
+        3: bodyUrl,
       },
     });
   } catch (err) {

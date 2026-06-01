@@ -64,6 +64,13 @@ app.use('/api/public', require('./routes/public'));
 
 app.use('/api', routes);
 
+// Public URL shortener redirect — `GET /book/:code` → 302 to the long URL.
+// Mounted at the Express root (NOT under /api/public) so the resulting
+// short links are actually short. Lives below the /api mounts so it
+// can't accidentally shadow them; the inner router only registers
+// /book/:code so non-matching paths fall through to the 404 handler.
+app.use('/', require('./routes/public/url-shortener'));
+
 // Tell the swagger module which Express app to introspect. Called
 // AFTER `app.use('/api', routes)` so the entire router stack is
 // registered by the time the first /api/docs request triggers the
