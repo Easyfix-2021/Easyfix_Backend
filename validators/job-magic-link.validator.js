@@ -109,6 +109,19 @@ const submitBody = Joi.object({
   building_name:  Joi.string().trim().max(200).allow('').optional(),
   product_code:   Joi.string().trim().max(200).allow('').optional(),
 
+  // Generic per-client custom-property values keyed by the property's
+  // (lower-cased) name. The 3 canonical fields above keep their dedicated
+  // tbl_job columns; ALL other client-defined fields ride here and are
+  // persisted inside customer_submitted_payload JSON. Mandatory enforcement
+  // is dynamic (per-client, runtime) in acceptSubmission — see
+  // services/job-magic-link.service.js::enforceMandatoryCustomProps — so this
+  // shape stays permissive (a `mandatory` flag is a per-CLIENT contract, not a
+  // per-route one). Caps mirror the canonical fields (50 keys, 500 chars).
+  custom_properties: Joi.object()
+    .pattern(Joi.string().max(80), Joi.string().allow('').max(500))
+    .max(50)
+    .optional(),
+
   services: Joi.array().items(serviceLine).max(50).optional(),
 });
 

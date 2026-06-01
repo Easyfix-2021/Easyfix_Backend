@@ -468,7 +468,13 @@ router.post(
         return modernError(res, 422, 'No SPOC available to call');
       }
 
-      const result = await kaleyra.clickToCall({ from: customerMob, to: spoc.mobile });
+      // alwaysApplyEnvOverride: this is the OPERATOR-LESS public bridge —
+      // it resolves the REAL customer + SPOC numbers server-side, so the
+      // KALEYRA_CALL_FROM/TO test-redirect MUST apply in non-prod even when
+      // KALEYRA_CALLING_CUSTOM_NUMBER (an admin-prompt flag) is on. Prevents
+      // dialling a real customer from QA. In prod those env vars are unset
+      // → passes through to the real numbers as intended.
+      const result = await kaleyra.clickToCall({ from: customerMob, to: spoc.mobile, alwaysApplyEnvOverride: true });
       if (!result.delivered && (result.suppressed || result.disabled)) {
         // Calling disabled in this environment — mirror admin/calls: 200 OK
         // with delivered:false + suppressed:true so the FE can show
@@ -554,7 +560,10 @@ router.post(
         return modernError(res, 422, 'No customer mobile on file to bridge the call');
       }
 
-      const result = await kaleyra.clickToCall({ from: customerMob, to: supportPhone });
+      // Same operator-less rationale as spoc-call — force the
+      // KALEYRA_CALL_FROM/TO test-redirect in non-prod so QA never dials
+      // the real customer/support line.
+      const result = await kaleyra.clickToCall({ from: customerMob, to: supportPhone, alwaysApplyEnvOverride: true });
       // Support audit row: reciever_id NULL (not a staff user) + the literal
       // 'EasyFix Support' name so ops can tell a CUSTOMER → Support call apart
       // from a CUSTOMER → SPOC call. caller_id NULL marks it customer-initiated.

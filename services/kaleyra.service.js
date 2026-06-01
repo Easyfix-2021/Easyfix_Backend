@@ -70,7 +70,7 @@ function normaliseIndianPhone(raw) {
   return null;
 }
 
-async function clickToCall({ from, to }) {
+async function clickToCall({ from, to, alwaysApplyEnvOverride = false }) {
   const callerReal   = normaliseIndianPhone(from);
   const receiverReal = normaliseIndianPhone(to);
   if (!callerReal)   return { delivered: false, error: `invalid caller phone "${from}"` };
@@ -100,6 +100,17 @@ async function clickToCall({ from, to }) {
   // verifying that both legs ring requires two phones the developer can
   // answer, and a single shared TEST_MOBILE (the SMS/WhatsApp pattern)
   // can't express that.
+  //
+  // `alwaysApplyEnvOverride` (added 2026-06-02): the customNumberMode
+  // short-circuit only makes sense for the ADMIN click-to-call prompt
+  // flow, where an operator hand-enters the test numbers on the FE — so
+  // clobbering them with env vars would be wrong. The PUBLIC magic-link
+  // bridge (customer ↔ SPOC) is OPERATOR-LESS: it resolves the REAL
+  // customer + SPOC numbers server-side, so in QA it would dial real
+  // people regardless of customNumberMode. Callers on that path pass
+  // alwaysApplyEnvOverride:true so the KALEYRA_CALL_FROM/TO test-redirect
+  // ALWAYS applies in non-prod (in prod those env vars are unset, so it
+  // passes through to the real numbers as intended).
   let caller   = callerReal;
   let receiver = receiverReal;
   const overrides = [];
@@ -107,7 +118,7 @@ async function clickToCall({ from, to }) {
   const customNumberMode =
     String(process.env.KALEYRA_CALLING_CUSTOM_NUMBER).toLowerCase() === 'true';
 
-  if (!customNumberMode) {
+  if (!customNumberMode || alwaysApplyEnvOverride) {
     const envFrom = process.env.KALEYRA_CALL_FROM;
     if (envFrom && envFrom.trim()) {
       const v = normaliseIndianPhone(envFrom);
@@ -122,6 +133,35 @@ async function clickToCall({ from, to }) {
     }
     if (overrides.length) {
       logger.test(`Kaleyra dev-override · ${overrides.join(' · ')}`);
+    }
+  }
+
+  // ── OPERATOR-LESS QA SAFETY GUARD ──
+  // The PUBLIC magic-link bridge passes alwaysApplyEnvOverride:true precisely
+  // because it has NO operator to hand-enter test numbers (unlike the admin
+  // click-to-call prompt). In CRM, QA mode (KALEYRA_CALLING_CUSTOM_NUMBER=true)
+  // means "an operator will type both legs". There is no operator here, so the
+  // ONLY safe non-prod source is the KALEYRA_CALL_FROM/TO env redirect applied
+  // just above. If — in QA mode — either leg is still a REAL number (env blank,
+  // invalid, or only partially set), we must NOT dial it: that's exactly the
+  // 2026-06-02 bug where the public bridge rang the real customer + real SPOC.
+  // Suppress loudly instead. Production (customNumberMode=false, env unset) is
+  // untouched: this branch only fires when customNumberMode is on.
+  if (alwaysApplyEnvOverride && customNumberMode) {
+    const fromStillReal = caller   === callerReal;
+    const toStillReal    = receiver === receiverReal;
+    if (fromStillReal || toStillReal) {
+      const which = [fromStillReal && 'KALEYRA_CALL_FROM', toStillReal && 'KALEYRA_CALL_TO']
+        .filter(Boolean).join(' and ');
+      logger.test(
+        `Kaleyra click2call suppressed (operator-less QA, no valid test redirect) · ` +
+        `set ${which} to a valid test number to enable calls in this environment.`
+      );
+      return {
+        delivered: false,
+        suppressed: true,
+        diagnostic: 'qa_missing_test_redirect',
+      };
     }
   }
 

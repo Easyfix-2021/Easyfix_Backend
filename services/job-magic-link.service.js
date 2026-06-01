@@ -48,6 +48,188 @@ const logger           = require('../logger');
 const CANCEL_REASONS     = Object.freeze(['Self Assembly', 'Product Returned / Damaged']);
 const RESCHEDULE_REASONS = Object.freeze(['Product Not Delivered', 'Site Not Ready']);
 
+/* ─── Client custom-property helpers (shared by prefill + submit) ─────────
+ *
+ * tbl_client_custom_properties is an overloaded key/value table. Some rows are
+ * OPERATOR CONFIG (auto-send gate, send-cap, collected-by preference) — those
+ * must NEVER render on the customer-facing form nor be enforced as "mandatory"
+ * against a customer submission. Everything else is a customer-facing field.
+ *
+ * Three keys are CANONICAL — they have dedicated tbl_job columns + dedicated
+ * top-level submit-payload keys (the CRM Book-New-Call flow uses the same
+ * three). Every OTHER customer-facing field travels in the submit payload's
+ * `custom_properties` map and is persisted only inside the
+ * customer_submitted_payload JSON snapshot (no schema change needed).
+ */
+const CONFIG_PROP_KEYS = Object.freeze(new Set([
+  'auto_process_unconfirmed_order',
+  'max_magic_link_send_count',
+  'collected_by',
+]));
+
+// Raw prop name → canonical key (dedicated tbl_job column + top-level payload key).
+const CANONICAL_PROP_ALIASES = Object.freeze({
+  branch: 'branch_details', branch_details: 'branch_details',
+  building: 'building_name', building_name: 'building_name',
+  property: 'building_name', property_name: 'building_name',
+  sku: 'product_code', product_code: 'product_code',
+});
+
+// Collapse to lowercase a-z0-9 single-underscore so "Max Magic-Link Send Count",
+// "max_magic_link_send_count", "max magic link send count" all compare equal.
+function normalizePropKey(name) {
+  return String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+}
+
+/*
+ * Built-in field aliases. A client may have a custom-property row whose name
+ * duplicates a field the form ALREADY collects in a dedicated input (most
+ * commonly "Pin Code", but also City / Address / Email / Alternate contact /
+ * etc.). Rendering it again as a generic custom field is redundant and
+ * confusing (see the "Pin Code" dup under Additional Details). We therefore:
+ *   - strip these from the prefill's custom_properties so the FE never renders
+ *     a second input, AND
+ *   - still enforce a `mandatory` flag by reading the value from the matching
+ *     BUILT-IN payload field (so e.g. a mandatory "Landmark" custom prop is
+ *     satisfied by the address-section Landmark field).
+ * The map value is the submit-payload key the value lives under. `__on_file`
+ * is a sentinel for the customer's mobile, which is resolved server-side and
+ * is always present (the link can't be sent without it) — so it's always
+ * considered satisfied. NOTE: "building"/"property" intentionally map to the
+ * CANONICAL building_name custom prop (a property/building NAME), NOT the
+ * address-section "Building / Floor" field — they are different data.
+ */
+const BUILTIN_ALIAS_TO_PAYLOAD = Object.freeze({
+  pin_code: 'pin_code', pincode: 'pin_code', pin: 'pin_code', zip: 'pin_code',
+  zipcode: 'pin_code', postal_code: 'pin_code', postalcode: 'pin_code',
+  city: 'city_id', town: 'city_id', city_name: 'city_id',
+  address: 'address', complete_address: 'address', full_address: 'address',
+  landmark: 'landmark',
+  gps: 'gps_location', gps_location: 'gps_location', location: 'gps_location',
+  coordinates: 'gps_location', lat_lng: 'gps_location', latlng: 'gps_location',
+  lat_long: 'gps_location', gps_coordinates: 'gps_location',
+  email: 'customer_email', customer_email: 'customer_email', e_mail: 'customer_email', mail: 'customer_email',
+  customer_name: 'customer_name', name: 'customer_name', full_name: 'customer_name', cust_name: 'customer_name',
+  alternate_name: 'additional_name', additional_name: 'additional_name',
+  alt_name: 'additional_name', alternate_contact_name: 'additional_name',
+  alternate_number: 'additional_number', additional_number: 'additional_number',
+  alt_number: 'additional_number', secondary_number: 'additional_number',
+  alternate_contact_number: 'additional_number', alternate_mobile: 'additional_number',
+  address_instruction: 'address_instruction', address_instructions: 'address_instruction',
+  instructions: 'address_instruction', landing_notes: 'address_instruction', delivery_instructions: 'address_instruction',
+  mobile: '__on_file', phone: '__on_file', mobile_no: '__on_file', mobile_number: '__on_file',
+  phone_number: '__on_file', contact: '__on_file', contact_number: '__on_file', customer_mobile: '__on_file',
+});
+
+// True when a prop name duplicates a built-in form field (so it should not be
+// rendered as a separate generic custom input).
+function isBuiltinAliasProp(name) {
+  return Object.prototype.hasOwnProperty.call(BUILTIN_ALIAS_TO_PAYLOAD, normalizePropKey(name));
+}
+
+function propFlagTruthy(val) {
+  if (val == null) return false;
+  if (typeof val === 'boolean') return val;
+  if (typeof val === 'number') return val !== 0;
+  const s = String(val).trim().toLowerCase();
+  return s === '1' || s === 'true' || s === 'yes' || s === 'y';
+}
+
+// "branch_details" → "Branch Details" (fallback label when the client set none).
+function prettyPropName(name) {
+  return String(name || '')
+    .replace(/[_-]+/g, ' ')
+    .trim()
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+/*
+ * Normalise raw tbl_client_custom_properties rows across the legacy column-name
+ * drift into { name, mandatory, label, value } (name lower-cased + trimmed),
+ * filtering out the operator-config rows. Mirrors routes/admin/clients.js
+ * GET /:clientId/custom-properties EXACTLY — including the legacy
+ * `c_prop_mandatory` flag, which the earlier inline prefill normalisation
+ * dropped (so a legacy-schema client's mandatory flag was silently ignored).
+ */
+function normaliseCustomPropRows(rows) {
+  return (rows || [])
+    .map((r) => ({
+      name: String(
+        r.property_name ?? r.c_prop_name ?? r.name ?? r.key ?? r.field_name ?? ''
+      ).toLowerCase().trim(),
+      mandatory: propFlagTruthy(
+        r.is_mandatory ?? r.c_prop_mandatory ?? r.mandatory ?? r.required ?? r.is_required ?? r.is_required_field
+      ),
+      label: r.property_label ?? r.c_prop_label ?? r.label ?? r.display_name ?? null,
+      value: r.property_value ?? r.c_prop_values ?? r.value ?? r.field_value ?? null,
+    }))
+    .filter((p) => p.name && !CONFIG_PROP_KEYS.has(normalizePropKey(p.name)));
+}
+
+// Load + normalise a client's CUSTOMER-FACING custom properties (config rows
+// already stripped). Same status filter as the prefill query.
+async function loadCustomerFacingProps(clientId, pool) {
+  if (!clientId) return [];
+  const [rows] = await pool.query(
+    `SELECT * FROM tbl_client_custom_properties
+      WHERE client_id = ? AND (status IS NULL OR status = 1)`,
+    [clientId],
+  );
+  return normaliseCustomPropRows(rows);
+}
+
+// Resolve the value the customer submitted for a given prop. Canonical props
+// arrive as top-level payload keys; everything else lives in the
+// `custom_properties` map (matched case-insensitively to tolerate FE casing).
+function resolveSubmittedPropValue(prop, payload) {
+  const canonical = CANONICAL_PROP_ALIASES[prop.name];
+  if (canonical) {
+    const v = payload[canonical];
+    return v == null ? '' : String(v).trim();
+  }
+  // Built-in-alias props (e.g. "Pin Code") aren't rendered as a separate input
+  // — their value lives in the matching built-in payload field. The customer's
+  // mobile is server-resolved and always on file, so treat it as satisfied.
+  const builtin = BUILTIN_ALIAS_TO_PAYLOAD[normalizePropKey(prop.name)];
+  if (builtin) {
+    if (builtin === '__on_file') return 'on-file';
+    const v = payload[builtin];
+    return v == null ? '' : String(v).trim();
+  }
+  const map = (payload && payload.custom_properties) || {};
+  let v = map[prop.name];
+  if (v == null) {
+    const hit = Object.keys(map).find((k) => k.toLowerCase().trim() === prop.name);
+    if (hit != null) v = map[hit];
+  }
+  return v == null ? '' : String(v).trim();
+}
+
+/*
+ * Server-side enforcement of mandatory client custom properties — belt-and-
+ * braces over the FE gate. Throws a 400 (mapped by mapKnownError in the public
+ * route) listing the missing field labels so a tampered or older client that
+ * skips a required field is rejected before any DB write happens.
+ */
+async function enforceMandatoryCustomProps(jobId, payload, pool) {
+  const [[job]] = await pool.query(
+    'SELECT fk_client_id FROM tbl_job WHERE job_id = ? LIMIT 1',
+    [jobId],
+  );
+  if (!job) return; // acceptSubmission's own 404 covers the missing-job case
+  const props = await loadCustomerFacingProps(job.fk_client_id, pool);
+  const missing = props
+    .filter((p) => p.mandatory && !resolveSubmittedPropValue(p, payload))
+    .map((p) => p.label || prettyPropName(p.name));
+  if (missing.length) {
+    throw {
+      status: 400,
+      code: 'MANDATORY_CUSTOM_PROP_MISSING',
+      message: `Please fill the required field${missing.length > 1 ? 's' : ''}: ${missing.join(', ')}.`,
+    };
+  }
+}
+
 /**
  * Human label for a numeric tbl_job.job_status.
  *
@@ -360,29 +542,12 @@ async function fetchPrefill(jobId, pool) {
     mapsLink = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(String(row.address).trim())}`;
   }
 
-  // Normalise custom-property rows across the legacy column-name drift
-  // (see routes/admin/clients.js GET /:clientId/custom-properties for the
-  // canonical fallback chain). Lower-case `name` so the FE can do stable
-  // string matching regardless of which DB shape this deploy has.
-  const truthy = (val) => {
-    if (val == null) return false;
-    if (typeof val === 'boolean') return val;
-    if (typeof val === 'number') return val !== 0;
-    const s = String(val).trim().toLowerCase();
-    return s === '1' || s === 'true' || s === 'yes' || s === 'y';
-  };
-  const customProperties = customPropRows
-    .map((r) => ({
-      name: String(
-        r.property_name ?? r.c_prop_name ?? r.name ?? r.key ?? r.field_name ?? ''
-      ).toLowerCase().trim(),
-      mandatory: truthy(
-        r.is_mandatory ?? r.mandatory ?? r.required ?? r.is_required ?? r.is_required_field
-      ),
-      label: r.property_label ?? r.c_prop_label ?? r.label ?? r.display_name ?? null,
-      value: r.property_value ?? r.c_prop_values ?? r.value ?? r.field_value ?? null,
-    }))
-    .filter((p) => p.name);
+  // Normalise custom-property rows across the legacy column-name drift via the
+  // shared helper (see top-of-file normaliseCustomPropRows + the matching
+  // routes/admin/clients.js GET /:clientId/custom-properties chain). The helper
+  // also strips operator-config rows (auto-process / send-cap / collected_by)
+  // so they never render as customer-facing inputs.
+  const customProperties = normaliseCustomPropRows(customPropRows);
 
   // Previously-submitted picks (2026-05-28 fix): the FE seeds its picker
   // from this list on round-2 visits to the magic link. Without it, a
@@ -495,7 +660,11 @@ async function fetchPrefill(jobId, pool) {
     // Per-client custom-property descriptors. FE canonicalises `name`
     // (e.g. `branch | branch_details → branch_details`) before keying its
     // input map. Empty array when the client has no rows configured.
-    custom_properties: customProperties,
+    // Built-in-alias props (e.g. "Pin Code", "City", "Email") are stripped
+    // here so the FE never renders a second input for a field the form already
+    // collects — their `mandatory` flag is still enforced server-side against
+    // the matching built-in field (see enforceMandatoryCustomProps).
+    custom_properties: customProperties.filter((p) => !isBuiltinAliasProp(p.name)),
   };
 }
 
@@ -746,6 +915,12 @@ async function sendForJob(jobId, { action, override = false } = {}, pool) {
  * is the service_type_id.
  */
 async function acceptSubmission(jobId, payload, pool) {
+  // Server-side mandatory custom-property enforcement (belt-and-braces over the
+  // FE gate). Runs BEFORE any connection/transaction so a tampered or older
+  // client that skips a required client field is rejected with a 400 listing
+  // the missing labels — no partial write occurs.
+  await enforceMandatoryCustomProps(jobId, payload, pool);
+
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
