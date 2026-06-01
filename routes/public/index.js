@@ -23,5 +23,9 @@ const router = require('express').Router();
 
 router.use('/job-completion', require('./job-completion'));
 router.use('/maps', require('./maps'));
+// JSON resolver for the URL shortener. Reached at /api/public/book/:code
+// via the frontend's /api/* proxy — the customer-facing /book/<code>
+// short link lives on the Next.js origin and resolves through here.
+router.use('/book', require('./url-resolve'));
 
 module.exports = router;
