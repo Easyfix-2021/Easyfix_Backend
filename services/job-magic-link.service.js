@@ -665,6 +665,10 @@ async function fetchPrefill(jobId, pool) {
     // collects — their `mandatory` flag is still enforced server-side against
     // the matching built-in field (see enforceMandatoryCustomProps).
     custom_properties: customProperties.filter((p) => !isBuiltinAliasProp(p.name)),
+    // Whether a Support line is configured (SUPPORT_PHONE set). Drives the
+    // "Contact Support" affordance — hidden entirely when no support number
+    // exists, so the customer never opens a dead-end dialog.
+    support_available: !!(process.env.SUPPORT_PHONE || '').trim(),
   };
 }
 

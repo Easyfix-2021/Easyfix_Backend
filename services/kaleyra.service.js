@@ -70,51 +70,63 @@ function normaliseIndianPhone(raw) {
   return null;
 }
 
-async function clickToCall({ from, to, alwaysApplyEnvOverride = false }) {
+/*
+ * Mask a phone for user-visible display: keep the first 4 digits, bullet the
+ * rest. Mirrors the CRM convention (routes/admin/calls.js::maskFirstFour) so
+ * the public "Need Help" preview reads the same as the operator click-to-call
+ * confirm dialog. Operates on whatever digit string it's given (already
+ * normalised 91-prefixed numbers included).
+ */
+function maskForDisplay(raw) {
+  if (raw == null) return null;
+  let d = String(raw).replace(/\D/g, '');
+  if (!d) return null;
+  // Drop the +91 country code before masking. The legs are normalised to
+  // 91-prefixed (12 digits); showing them masked as-is ("9188••••••••") wastes
+  // two of the four visible digits on the country code. Strip it so the user
+  // sees the first 4 digits of the ACTUAL 10-digit number ("8801••••••").
+  if (d.length === 12 && d.startsWith('91')) d = d.slice(2);
+  if (d.length <= 4) return d;
+  return d.slice(0, 4) + '•'.repeat(d.length - 4);
+}
+
+/*
+ * Pure resolver for the EFFECTIVE caller/receiver legs Kaleyra would dial for a
+ * given (from, to) — applies the env-override waterfall + both hard guards, but
+ * does NOT check KALEYRA_CALLING_ENABLED / api_key and never performs HTTP.
+ * Single source of truth shared by clickToCall (which then places the call) and
+ * the public masked-preview route (which only displays the legs for customer
+ * visibility). Returns one of:
+ *   { ok: false, error }                                   — invalid input number
+ *   { ok: false, suppressed: true, diagnostic, real* }     — operator-less QA, no redirect
+ *   { ok: false, sameNumber: true, error, diagnostic }     — bridge-to-self
+ *   { ok: true, callerReal, receiverReal, caller, receiver, overridden }
+ *
+ * See the long-form rationale below for KALEYRA_CALL_FROM/TO, customNumberMode
+ * and alwaysApplyEnvOverride.
+ */
+function resolveCallLegs({ from, to, alwaysApplyEnvOverride = false }) {
   const callerReal   = normaliseIndianPhone(from);
   const receiverReal = normaliseIndianPhone(to);
-  if (!callerReal)   return { delivered: false, error: `invalid caller phone "${from}"` };
-  if (!receiverReal) return { delivered: false, error: `invalid receiver phone "${to}"` };
-
-  if (!callingEnabled()) {
-    logger.test(`Kaleyra click2call suppressed (KALEYRA_CALLING_ENABLED!='true') · from=${callerReal} · to=${receiverReal}`);
-    // `suppressed:true` is the canonical signal the route handler reads.
-    // Kept the legacy `disabled` alias on the same payload so any stray
-    // consumer that hadn't been updated yet still works.
-    return { delivered: false, suppressed: true, disabled: true };
-  }
-
-  const apiKey = process.env.KALEYRA_API_KEY;
-  if (!apiKey) return { delivered: false, error: 'KALEYRA_API_KEY not configured' };
+  if (!callerReal)   return { ok: false, error: `invalid caller phone "${from}"` };
+  if (!receiverReal) return { ok: false, error: `invalid receiver phone "${to}"` };
 
   // ── DEV-ONLY LEG OVERRIDES (env vars) ──
   // Each leg can be independently substituted via env. Three-tier waterfall:
-  //   1. KALEYRA_CALLING_CUSTOM_NUMBER=true → QA mode. The route handler
-  //      has ALREADY substituted from/to with the FE-supplied values, and
-  //      this service must NOT clobber those with env vars (which might be
-  //      left over from a previous dev run). We short-circuit the env
-  //      overrides for this case.
+  //   1. KALEYRA_CALLING_CUSTOM_NUMBER=true → QA mode. The admin route handler
+  //      has ALREADY substituted from/to with the FE-supplied values, so this
+  //      resolver must NOT clobber those with env vars — short-circuited unless
+  //      alwaysApplyEnvOverride is set.
   //   2. KALEYRA_CALL_FROM / KALEYRA_CALL_TO set → dev mode. Substitute.
   //   3. Neither set → production. Pass through.
-  // The overrides exist because Kaleyra click2call is a two-leg bridge —
-  // verifying that both legs ring requires two phones the developer can
-  // answer, and a single shared TEST_MOBILE (the SMS/WhatsApp pattern)
-  // can't express that.
-  //
-  // `alwaysApplyEnvOverride` (added 2026-06-02): the customNumberMode
-  // short-circuit only makes sense for the ADMIN click-to-call prompt
-  // flow, where an operator hand-enters the test numbers on the FE — so
-  // clobbering them with env vars would be wrong. The PUBLIC magic-link
-  // bridge (customer ↔ SPOC) is OPERATOR-LESS: it resolves the REAL
-  // customer + SPOC numbers server-side, so in QA it would dial real
-  // people regardless of customNumberMode. Callers on that path pass
-  // alwaysApplyEnvOverride:true so the KALEYRA_CALL_FROM/TO test-redirect
-  // ALWAYS applies in non-prod (in prod those env vars are unset, so it
-  // passes through to the real numbers as intended).
+  // `alwaysApplyEnvOverride` (2026-06-02): the OPERATOR-LESS public magic-link
+  // bridge resolves the REAL customer + SPOC numbers server-side, so in QA it
+  // would dial real people regardless of customNumberMode. Callers on that path
+  // pass true so the KALEYRA_CALL_FROM/TO test-redirect ALWAYS applies in
+  // non-prod (in prod those env vars are unset → passes through to real).
   let caller   = callerReal;
   let receiver = receiverReal;
   const overrides = [];
-
   const customNumberMode =
     String(process.env.KALEYRA_CALLING_CUSTOM_NUMBER).toLowerCase() === 'true';
 
@@ -138,15 +150,11 @@ async function clickToCall({ from, to, alwaysApplyEnvOverride = false }) {
 
   // ── OPERATOR-LESS QA SAFETY GUARD ──
   // The PUBLIC magic-link bridge passes alwaysApplyEnvOverride:true precisely
-  // because it has NO operator to hand-enter test numbers (unlike the admin
-  // click-to-call prompt). In CRM, QA mode (KALEYRA_CALLING_CUSTOM_NUMBER=true)
-  // means "an operator will type both legs". There is no operator here, so the
-  // ONLY safe non-prod source is the KALEYRA_CALL_FROM/TO env redirect applied
-  // just above. If — in QA mode — either leg is still a REAL number (env blank,
-  // invalid, or only partially set), we must NOT dial it: that's exactly the
-  // 2026-06-02 bug where the public bridge rang the real customer + real SPOC.
-  // Suppress loudly instead. Production (customNumberMode=false, env unset) is
-  // untouched: this branch only fires when customNumberMode is on.
+  // because it has NO operator to hand-enter test numbers. In QA mode the ONLY
+  // safe non-prod source is the KALEYRA_CALL_FROM/TO env redirect applied just
+  // above. If either leg is still a REAL number (env blank/invalid/partial) we
+  // must NOT dial it (the 2026-06-02 real-customer-dialed bug). Suppress.
+  // Production (customNumberMode=false, env unset) is untouched.
   if (alwaysApplyEnvOverride && customNumberMode) {
     const fromStillReal = caller   === callerReal;
     const toStillReal    = receiver === receiverReal;
@@ -157,24 +165,14 @@ async function clickToCall({ from, to, alwaysApplyEnvOverride = false }) {
         `Kaleyra click2call suppressed (operator-less QA, no valid test redirect) · ` +
         `set ${which} to a valid test number to enable calls in this environment.`
       );
-      return {
-        delivered: false,
-        suppressed: true,
-        diagnostic: 'qa_missing_test_redirect',
-      };
+      return { ok: false, suppressed: true, diagnostic: 'qa_missing_test_redirect', callerReal, receiverReal };
     }
   }
 
   // ── HARD GUARD: caller == receiver ──
-  // Kaleyra's click2call works as a bridge: it dials `caller` first; once
-  // they pick up it dials `receiver` and joins both legs. If both numbers
-  // are identical, Kaleyra silently fails the second leg — there's no
-  // line to dial since the only phone is already on the bridge. The
-  // operator sees "I picked up but the customer never rang". Refuse
-  // loudly instead of letting Kaleyra fail mysteriously.
+  // Kaleyra bridges by dialling `caller`, then `receiver`. Identical numbers
+  // silently fail the second leg — refuse loudly with a remediation message.
   if (caller === receiver) {
-    // Build a remediation message that names whichever override (if any)
-    // produced the collision so the operator knows exactly what to fix.
     const fromOverridden = caller   !== callerReal;
     const toOverridden   = receiver !== receiverReal;
     let reason;
@@ -188,12 +186,70 @@ async function clickToCall({ from, to, alwaysApplyEnvOverride = false }) {
       reason = `caller and receiver are the same number (${caller}). Kaleyra cannot bridge a line to itself.`;
     }
     logger.warn(`Kaleyra click2call refused — caller==receiver. ${reason}`);
+    return { ok: false, sameNumber: true, error: `Cannot place call — ${reason}`, diagnostic: 'caller_equals_receiver', callerReal, receiverReal };
+  }
+
+  return {
+    ok: true,
+    callerReal, receiverReal, caller, receiver,
+    overridden: caller !== callerReal || receiver !== receiverReal,
+  };
+}
+
+/*
+ * Compute the masked from→to a bridge WOULD dial, for user-visible display
+ * (the public "Need Help" confirm + the operator click-to-call dialog parity).
+ * Never performs HTTP. Returns { from, to, overridden, suppressed?, sameNumber? }
+ * with both legs masked first-4-then-bullets. On suppressed/same-number it
+ * masks the REAL legs so the customer still sees who would be involved.
+ */
+function previewCallLegs({ from, to, alwaysApplyEnvOverride = false }) {
+  const legs = resolveCallLegs({ from, to, alwaysApplyEnvOverride });
+  if (legs.ok) {
     return {
-      delivered: false,
-      error: `Cannot place call — ${reason}`,
-      diagnostic: 'caller_equals_receiver',
+      from: maskForDisplay(legs.caller),
+      to: maskForDisplay(legs.receiver),
+      overridden: legs.overridden,
     };
   }
+  // Non-ok: still surface masked real legs where we have them, plus the flag.
+  return {
+    from: maskForDisplay(legs.callerReal),
+    to: maskForDisplay(legs.receiverReal),
+    suppressed: !!legs.suppressed,
+    sameNumber: !!legs.sameNumber,
+    diagnostic: legs.diagnostic || null,
+    error: legs.error || null,
+  };
+}
+
+async function clickToCall({ from, to, alwaysApplyEnvOverride = false }) {
+  const callerReal   = normaliseIndianPhone(from);
+  const receiverReal = normaliseIndianPhone(to);
+  if (!callerReal)   return { delivered: false, error: `invalid caller phone "${from}"` };
+  if (!receiverReal) return { delivered: false, error: `invalid receiver phone "${to}"` };
+
+  if (!callingEnabled()) {
+    logger.test(`Kaleyra click2call suppressed (KALEYRA_CALLING_ENABLED!='true') · from=${callerReal} · to=${receiverReal}`);
+    // `suppressed:true` is the canonical signal the route handler reads.
+    // Kept the legacy `disabled` alias on the same payload so any stray
+    // consumer that hadn't been updated yet still works.
+    return { delivered: false, suppressed: true, disabled: true };
+  }
+
+  const apiKey = process.env.KALEYRA_API_KEY;
+  if (!apiKey) return { delivered: false, error: 'KALEYRA_API_KEY not configured' };
+
+  // Resolve the effective legs (override waterfall + QA-suppress + same-number
+  // guards) via the shared resolver so the public preview can't drift from what
+  // we actually dial. Ordering preserves the original: enabled + api_key checks
+  // above already ran, so a disabled env still short-circuits to `suppressed`
+  // before we touch the override logic.
+  const legs = resolveCallLegs({ from, to, alwaysApplyEnvOverride });
+  if (legs.suppressed) return { delivered: false, suppressed: true, diagnostic: legs.diagnostic };
+  if (legs.sameNumber) return { delivered: false, error: legs.error, diagnostic: legs.diagnostic };
+  if (!legs.ok)        return { delivered: false, error: legs.error };
+  const { caller, receiver } = legs;
 
   // Build URL with explicit URLSearchParams — handles encoding cleanly.
   const params = new URLSearchParams({
@@ -321,4 +377,4 @@ async function getCallReport({ uniqueId }) {
   }
 }
 
-module.exports = { clickToCall, getCallReport, normaliseIndianPhone };
+module.exports = { clickToCall, previewCallLegs, resolveCallLegs, getCallReport, normaliseIndianPhone };

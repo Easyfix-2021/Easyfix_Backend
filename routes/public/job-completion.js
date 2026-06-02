@@ -425,6 +425,52 @@ router.post(
   },
 );
 
+// ─── GET /:token/spoc-call/preview — masked from→to the bridge WOULD dial ──
+// Powers the "Need Help" confirmation so the customer sees exactly which two
+// numbers will be bridged (first-4-then-bullets masking, same convention as
+// the CRM operator click-to-call confirm dialog) — in ALL environments. The
+// effective legs come from kaleyra.previewCallLegs() (the SAME resolver
+// clickToCall uses), so QA test-redirects (KALEYRA_CALL_FROM/TO) and prod real
+// numbers are reflected accurately, and a QA env with no valid redirect is
+// flagged `suppressed:true`. No call is placed; no raw number leaves the server.
+router.get(
+  '/:token/spoc-call/preview',
+  peekToken,
+  tokenRateLimit,
+  async (req, res, next) => {
+    try {
+      const jobId = await verify(req);
+      const [[job]] = await pool.query(
+        `SELECT c.customer_mob_no
+           FROM tbl_job j
+      LEFT JOIN tbl_customer c ON c.customer_id = j.fk_customer_id
+          WHERE j.job_id = ? LIMIT 1`,
+        [jobId],
+      );
+      const customerMob = job && job.customer_mob_no;
+      if (!customerMob) return modernError(res, 422, 'No customer mobile on file to bridge the call');
+
+      const spoc = await magicLinkService.resolveJobSpoc(jobId, pool);
+      if (!spoc.mobile) return modernError(res, 422, 'No SPOC available to call');
+
+      // Same alwaysApplyEnvOverride:true the actual spoc-call uses → the preview
+      // reflects precisely what would be dialled.
+      const preview = kaleyra.previewCallLegs({
+        from: customerMob,
+        to: spoc.mobile,
+        alwaysApplyEnvOverride: true,
+      });
+      return modernOk(res, {
+        from: preview.from,
+        to: preview.to,
+        suppressed: !!preview.suppressed,
+      });
+    } catch (e) {
+      return mapKnownError(res, next, e);
+    }
+  },
+);
+
 // ─── POST /:token/spoc-call — bridge a click-to-call to the SPOC ────
 // Resolves the customer's own mobile (caller leg) + the client's Primary
 // SPOC real mobile (receiver leg) server-side and bridges via Kaleyra. The
@@ -516,6 +562,48 @@ router.post(
       });
       logger.info({ jobId }, 'magic-link: SPOC bridge call placed');
       return modernOk(res, { delivered: true });
+    } catch (e) {
+      return mapKnownError(res, next, e);
+    }
+  },
+);
+
+// ─── GET /:token/support-call/preview — masked from→to for the Support bridge ──
+// Parity with /spoc-call/preview, for the (currently dormant) Support click-to-
+// call path. If SUPPORT_PHONE is unset, returns support_phone:null so the FE can
+// fall back. Uses the SAME kaleyra.previewCallLegs resolver so the displayed
+// from→to matches exactly what /support-call would dial in every environment.
+router.get(
+  '/:token/support-call/preview',
+  peekToken,
+  tokenRateLimit,
+  async (req, res, next) => {
+    try {
+      const jobId = await verify(req);
+      const supportPhone = (process.env.SUPPORT_PHONE || '').trim();
+      if (!supportPhone) return modernOk(res, { from: null, to: null, suppressed: false, support_phone: null });
+
+      const [[job]] = await pool.query(
+        `SELECT c.customer_mob_no
+           FROM tbl_job j
+      LEFT JOIN tbl_customer c ON c.customer_id = j.fk_customer_id
+          WHERE j.job_id = ? LIMIT 1`,
+        [jobId],
+      );
+      const customerMob = job && job.customer_mob_no;
+      if (!customerMob) return modernError(res, 422, 'No customer mobile on file to bridge the call');
+
+      const preview = kaleyra.previewCallLegs({
+        from: customerMob,
+        to: supportPhone,
+        alwaysApplyEnvOverride: true,
+      });
+      return modernOk(res, {
+        from: preview.from,
+        to: preview.to,
+        suppressed: !!preview.suppressed,
+        support_phone: true,
+      });
     } catch (e) {
       return mapKnownError(res, next, e);
     }

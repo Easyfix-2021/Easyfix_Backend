@@ -37,20 +37,6 @@ async function requireClickToCallAction(req, res, next) {
   } catch (e) { return next(e); }
 }
 
-/*
- * First-4-digits masking helper. Used both by /preview (which masks the
- * resolved real numbers before returning them) and by error logs / audit
- * trails. Bullet character matches the FE's existing maskMobile() so the
- * visual treatment is consistent across the stack.
- */
-function maskFirstFour(raw) {
-  if (raw == null) return null;
-  const d = String(raw).replace(/\D/g, '');
-  if (!d) return null;
-  if (d.length <= 4) return d;
-  return d.slice(0, 4) + '•'.repeat(d.length - 4);
-}
-
 /* Resolve which mode the environment is in. Centralised so the constants
  * stay single-sourced across the route file. */
 function callingMode() {
@@ -148,25 +134,21 @@ router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'
       receiverReal = ct.contact_no || null;
     }
 
-    // Apply the same three-tier waterfall as the POST handler + service
-    // so the preview matches what would actually be dialled. QA mode falls
-    // through to the env defaults if they're populated (they'll be the
-    // dialog's pre-fill values); empty QA falls through to real numbers.
+    // Resolve the EXACT masked legs we'd dial via the shared resolver
+    // (kaleyra.previewCallLegs) — the SAME code path clickToCall uses — so this
+    // preview can never drift from the real call. In QA mode (customNumberMode)
+    // we pass alwaysApplyEnvOverride so the KALEYRA_CALL_FROM/TO values the
+    // dialog pre-fills are reflected; dev/prod resolve through the normal
+    // waterfall (dev substitutes env, prod passes through to real). previewCall-
+    // Legs masks first-4-then-bullets internally (same convention as before).
     const mode = callingMode();
-    const envFrom = (process.env.KALEYRA_CALL_FROM || '').trim() || null;
-    const envTo   = (process.env.KALEYRA_CALL_TO   || '').trim() || null;
-    const callerEffective = (mode === 'dev' || (mode === 'qa' && envFrom))
-      ? envFrom
-      : (req.user.mobile_no || null);
-    const receiverEffective = (mode === 'dev' || (mode === 'qa' && envTo))
-      ? envTo
-      : receiverReal;
-
-    modernOk(res, {
-      mode,
-      dialFrom: maskFirstFour(callerEffective),
-      dialTo:   maskFirstFour(receiverEffective),
+    const preview = kaleyra.previewCallLegs({
+      from: req.user.mobile_no,
+      to:   receiverReal,
+      alwaysApplyEnvOverride: mode === 'qa',
     });
+
+    modernOk(res, { mode, dialFrom: preview.from, dialTo: preview.to });
   } catch (e) { next(e); }
 });
 
