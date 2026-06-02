@@ -205,8 +205,80 @@ function getConfigKey() {
   return process.env.GOOGLE_MAPS_API_KEY_PUBLIC || null;
 }
 
+/*
+ * In-process city-name → city_id memo (1h TTL). tbl_city is small (~hundreds of
+ * rows) and effectively static, so the lookup is cheap — but the conversational
+ * WhatsApp flow can hit it many times per minute, so we cache after the first
+ * miss to avoid repeated SELECTs. Case-insensitive key.
+ */
+const CITY_TTL_MS = 60 * 60 * 1000;
+const cityIdCache = new Map(); // name(lc) → { id|null, expires }
+
+async function resolveCityIdByName(cityName, pool) {
+  const name = String(cityName || '').trim();
+  if (!name || !pool) return null;
+  const key = name.toLowerCase();
+  const hit = cityIdCache.get(key);
+  if (hit && hit.expires > Date.now()) return hit.id;
+  try {
+    // Tolerant match: exact (case-insensitive) first, then a LIKE fallback so a
+    // Google return of "New Delhi" still matches a tbl_city row stored as
+    // "New Delhi " or with trailing whitespace etc. Limit 1 keeps it deterministic.
+    const [rows] = await pool.query(
+      `SELECT city_id FROM tbl_city
+        WHERE LOWER(TRIM(city_name)) = ? OR LOWER(TRIM(city_name)) LIKE ?
+        ORDER BY (LOWER(TRIM(city_name)) = ?) DESC, city_id ASC
+        LIMIT 1`,
+      [key, `${key}%`, key],
+    );
+    const id = rows[0]?.city_id || null;
+    cityIdCache.set(key, { id, expires: Date.now() + CITY_TTL_MS });
+    return id;
+  } catch (e) {
+    logger.warn(`resolveCityIdByName failed for "${name}" — ${e && e.message ? e.message : e}`);
+    return null;
+  }
+}
+
+/*
+ * reverseGeocode(lat, lng, pool?)
+ *
+ * Thin wrapper over geocode({ latlng }) for the WhatsApp conversation flow:
+ * a customer shares a location pin → we turn it into a usable address.
+ * Returns a slim, null-safe shape the caller can write straight onto a job:
+ *   { gps_location: "lat,lng", formatted_address, pin_code, city_name, city_id }
+ *
+ * When a `pool` is supplied, also resolves `city_id` from `tbl_city` by name
+ * (case-insensitive + prefix fallback, memoised). Without a pool, city_id is
+ * always null — keeps the function pool-free for tests/admin callers.
+ *
+ * Never throws — geocode's `{status,message}` rejections are swallowed and a
+ * gps-only result is returned so a flaky Google call can't break the chat
+ * (the raw pin still persists; ops can fill the rest).
+ */
+async function reverseGeocode(lat, lng, pool = null) {
+  const latNum = Number(lat);
+  const lngNum = Number(lng);
+  const gps_location = (Number.isFinite(latNum) && Number.isFinite(lngNum)) ? `${latNum},${lngNum}` : null;
+  const out = { gps_location, formatted_address: null, pin_code: null, city_name: null, city_id: null };
+  if (!gps_location) return out;
+  try {
+    const g = await geocode({ latlng: gps_location });
+    out.formatted_address = g.formatted_address || null;
+    out.pin_code = g.address_components?.postal_code || null;
+    out.city_name = g.address_components?.city || null;
+    if (out.city_name && pool) {
+      out.city_id = await resolveCityIdByName(out.city_name, pool);
+    }
+  } catch (e) {
+    logger.warn(`reverseGeocode failed for ${gps_location} — ${e && e.message ? e.message : e}; returning gps-only`);
+  }
+  return out;
+}
+
 module.exports = {
   autocomplete,
   geocode,
+  reverseGeocode,
   getConfigKey,
 };

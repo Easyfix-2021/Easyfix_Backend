@@ -2050,6 +2050,55 @@ router.get('/images/:imageId/file', async (req, res, next) => {
 });
 
 /*
+ * GET /api/admin/jobs/videos/:mediaId/file
+ *
+ * Customer-shared video redirect (from the conversational WhatsApp flow,
+ * stored in tbl_job_media). Mirrors the /images/:imageId/file pattern but
+ * S3-only — videos are always uploaded server-side by the conversation
+ * service via putJobImage with category 'BookingVideo', so they ALWAYS have a
+ * real S3 key. RBAC: same per-job scope assertion as the image endpoint.
+ *
+ * 200 → 302 to a presigned S3 URL; the browser follows it and the <a>/<video>
+ * tag receives the bytes. 404 when the row is missing, out-of-scope, or the
+ * S3 object is gone.
+ */
+router.get('/videos/:mediaId/file', async (req, res, next) => {
+  try {
+    const mediaId = Number(req.params.mediaId);
+    if (!Number.isInteger(mediaId) || mediaId <= 0) {
+      return modernError(res, 400, 'invalid mediaId');
+    }
+    const [[row]] = await imagePool.query(
+      'SELECT media_id, job_id, s3_key FROM tbl_job_media WHERE media_id = ? LIMIT 1',
+      [mediaId],
+    );
+    if (!row || !row.s3_key) return modernError(res, 404, 'video not found');
+
+    const j = await job.getById(row.job_id);
+    if (!j) return modernError(res, 404, 'video not found');
+    const guard = assertEntityInScope(req, {
+      client_id:   j.fk_client_id,
+      city_id:     j.city_id,
+      vertical_id: j.vertical_id,
+    });
+    if (!guard.ok) return modernError(res, 404, 'video not found');
+
+    if (!s3Storage.isEnabled()) {
+      return modernError(res, 503, 'video storage not configured');
+    }
+    try {
+      if (await s3Storage.exists(row.s3_key)) {
+        const url = await s3Storage.getPresignedUrl(row.s3_key);
+        return res.redirect(url);
+      }
+    } catch (e) {
+      uploadLogger.warn({ mediaId, jobId: row.job_id, key: row.s3_key, err: e?.message }, 'video s3 lookup failed');
+    }
+    return modernError(res, 404, 'video file not found in S3');
+  } catch (e) { next(e); }
+});
+
+/*
  * DELETE /api/admin/jobs/images/:imageId
  *
  * Operator-driven image removal (2026-05-28). Mirrors the staging-tile

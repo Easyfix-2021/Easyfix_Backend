@@ -1,6 +1,7 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const magicLinkService = require('./job-magic-link.service');
+const conversationService = require('./whatsapp-conversation.service');
 
 /*
  * Hourly cron — scans Unconfirmed (status=9) jobs whose client is
@@ -26,7 +27,13 @@ async function runHourlySweep() {
 
   try {
     const [rows] = await pool.query(`
-      SELECT j.job_id, j.magic_link_sent_at, j.magic_link_send_count
+      SELECT j.job_id, j.magic_link_sent_at, j.magic_link_send_count,
+             (SELECT LOWER(REPLACE(cpm.c_prop_values, '_', ' '))
+                FROM tbl_client_custom_properties cpm
+               WHERE cpm.client_id = j.fk_client_id
+                 AND LOWER(REPLACE(cpm.c_prop_name, '_', ' ')) = LOWER('Order Confirmation Mode')
+                 AND cpm.status = 1
+               LIMIT 1) AS flow_mode
         FROM tbl_job j
         JOIN tbl_client_custom_properties cp
           ON cp.client_id = j.fk_client_id
@@ -45,16 +52,22 @@ async function runHourlySweep() {
     for (const row of rows) {
       attempted += 1;
       const action = (row.magic_link_send_count > 0) ? 'reminder' : 'first';
+      // Per-client channel: 'conversation' → in-chat AI flow; anything else
+      // (incl. unset) → the magic-link FORM. Default keeps existing clients
+      // on the form path untouched.
+      const conversational = String(row.flow_mode || '').trim() === 'conversation';
       try {
-        const result = await magicLinkService.sendForJob(row.job_id, { action }, pool);
-        if (result?.delivered) succeeded += 1;
+        const result = conversational
+          ? await conversationService.startConversation(row.job_id, { action }, pool)
+          : await magicLinkService.sendForJob(row.job_id, { action }, pool);
+        if (result?.delivered || result?.suppressed) succeeded += 1;
         else {
           failed += 1;
-          logger.warn({ jobId: row.job_id, error: result?.error }, 'magic-link cron: whatsapp not delivered');
+          logger.warn({ jobId: row.job_id, conversational, error: result?.error }, 'unconfirmed-order cron: whatsapp not delivered');
         }
       } catch (e) {
         failed += 1;
-        logger.warn({ jobId: row.job_id, err: e?.message }, 'magic-link cron: sendForJob threw');
+        logger.warn({ jobId: row.job_id, conversational, err: e?.message }, 'unconfirmed-order cron: send threw');
       }
     }
 

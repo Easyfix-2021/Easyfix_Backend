@@ -188,16 +188,36 @@ const ALLOWED_IMAGE_MIMES = new Set([
   'image/webp',
   'image/gif',
 ]);
+// Video MIMEs the customer can share through the Product Photos/Videos picker.
+// Same denylist principles as images — strict allowlist, magic-number sniffing
+// deferred to v2. mp4/quicktime/3gpp are the dominant Android/iOS WhatsApp /
+// share-sheet outputs; webm rounds out Chrome on desktop.
+const ALLOWED_VIDEO_MIMES = new Set([
+  'video/mp4',
+  'video/quicktime',
+  'video/3gpp',
+  'video/webm',
+]);
+
+// Photos are small enough to keep at 5MB. Videos need a higher ceiling — phone
+// camera defaults can clear 15 MB easily — but capped to bound S3 cost; a
+// 30-second 1080p phone clip lands well under 50 MB. Multer's `files` cap stays
+// 1 so the endpoint stays one-file-per-request (FE sequences picks).
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_VIDEO_BYTES = Number(process.env.PUBLIC_VIDEO_MAX_BYTES || 50 * 1024 * 1024);
+const MAX_PHOTOS_PER_JOB = 5;
+const MAX_VIDEOS_PER_JOB = Number(process.env.PUBLIC_VIDEO_MAX_PER_JOB || 2);
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024, files: 1 },
+  // Use the larger ceiling at the multer level; the handler enforces the
+  // per-kind ceiling below so a "5MB image limit" is still respected for image
+  // uploads even when multer would have accepted up to MAX_VIDEO_BYTES.
+  limits: { fileSize: MAX_VIDEO_BYTES, files: 1 },
   fileFilter: (_req, file, cb) => {
-    if (ALLOWED_IMAGE_MIMES.has(file.mimetype)) return cb(null, true);
-    // Reject with a multer-shaped error so the route handler's existing
-    // catch can map it to a 400 with a stable message.
-    const err = new Error('Only JPEG, PNG, WebP, or GIF images are allowed');
-    err.code = 'INVALID_IMAGE_MIME';
+    if (ALLOWED_IMAGE_MIMES.has(file.mimetype) || ALLOWED_VIDEO_MIMES.has(file.mimetype)) return cb(null, true);
+    const err = new Error('Only JPEG, PNG, WebP, GIF images or MP4/MOV/3GP/WebM videos are allowed');
+    err.code = 'INVALID_MEDIA_MIME';
     return cb(err, false);
   },
 });
@@ -239,7 +259,12 @@ router.post(
   },
 );
 
-// ─── POST /:token/images — multipart upload, max 5 images per job ───
+// ─── POST /:token/images — multipart upload (photos OR videos) ──────
+// Path kept as `/images` for FE backward compatibility — the endpoint now
+// accepts BOTH photos (→ tbl_job_image, cap 5) AND videos (→ tbl_job_media,
+// cap MAX_VIDEOS_PER_JOB). Branches on the file's mimetype after multer
+// validates membership in the combined allowlist. Response includes a `kind`
+// discriminator so the FE renders the correct tile.
 router.post(
   '/:token/images',
   peekToken,
@@ -253,63 +278,136 @@ router.post(
         return modernError(res, 400, 'missing file upload');
       }
 
-      // Defence-in-depth re-check after multer's fileFilter — the
-      // filter trusts the browser-claimed mimetype, and while we can't
-      // beat a spoofed mimetype without magic-number sniffing (v2),
-      // we at least catch the case where the filter was bypassed by
-      // future refactor or an `application/octet-stream`-style upload
-      // that an attacker tries to slip through.
-      if (!ALLOWED_IMAGE_MIMES.has(req.file.mimetype)) {
-        return modernError(res, 400, 'Only JPEG, PNG, WebP, or GIF images are allowed');
+      const mime = req.file.mimetype;
+      const isImage = ALLOWED_IMAGE_MIMES.has(mime);
+      const isVideo = ALLOWED_VIDEO_MIMES.has(mime);
+      // Defence-in-depth re-check after multer's fileFilter — magic-number
+      // sniffing is still v2; this at least catches a bypass / refactor that
+      // would have let an octet-stream slip through.
+      if (!isImage && !isVideo) {
+        return modernError(res, 400, 'Only JPEG, PNG, WebP, GIF images or MP4/MOV/3GP/WebM videos are allowed');
       }
 
-      // Hard cap at 5 customer-supplied images per job. Two concurrent
-      // uploads at exactly capacity-minus-one can both pass this check
-      // and produce 6 rows — we accept that micro-race because (a) the
-      // customer-facing form sequences uploads one at a time, and (b)
-      // the S3 key seq is a human-readable hint, not a uniqueness key.
-      const [[{ existing }]] = await pool.query(
-        'SELECT COUNT(*) AS existing FROM tbl_job_image WHERE job_id = ?',
+      // Per-kind size ceiling. multer already caps total at MAX_VIDEO_BYTES;
+      // images get a tighter limit here so a 25MB "image/jpeg" can't slip in.
+      const sizeLimit = isImage ? MAX_IMAGE_BYTES : MAX_VIDEO_BYTES;
+      if (req.file.size > sizeLimit) {
+        const mb = Math.round(sizeLimit / (1024 * 1024));
+        return modernError(res, 400, `${isImage ? 'image' : 'video'} exceeds ${mb}MB`);
+      }
+
+      if (isImage) {
+        // Photo path — unchanged behaviour. Cap of MAX_PHOTOS_PER_JOB. Two
+        // concurrent uploads at exactly capacity-minus-one can both pass this
+        // check and produce a 6th row; accepted as a micro-race because the
+        // FE sequences picks one at a time and the seq is human-readable.
+        const [[{ existing }]] = await pool.query(
+          'SELECT COUNT(*) AS existing FROM tbl_job_image WHERE job_id = ?',
+          [jobId],
+        );
+        if (Number(existing) >= MAX_PHOTOS_PER_JOB) {
+          return modernError(res, 400, `maximum ${MAX_PHOTOS_PER_JOB} images per job`);
+        }
+        const seq = Number(existing) + 1;
+
+        let imageKey;
+        try {
+          imageKey = await s3Storage.putJobImage({
+            jobId, seq,
+            buffer: req.file.buffer,
+            contentType: mime,
+            originalName: req.file.originalname,
+            category: 'Booking',
+          });
+        } catch (e) {
+          logger.warn({ err: e.message, jobId }, 'public S3 image upload failed');
+          return modernError(res, 502, 'image upload to storage failed');
+        }
+
+        const [ins] = await pool.query(
+          `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, created_date)
+           VALUES (?, ?, 'booking', 0, NOW())`,
+          [jobId, imageKey],
+        );
+        return modernOk(res, { kind: 'image', image_id: ins.insertId, key: imageKey, seq });
+      }
+
+      // Video path — writes to tbl_job_media (separate table because
+      // tbl_job_image is image-only by convention). The video file redirect
+      // endpoint at /admin/jobs/videos/:mediaId/file serves these to the CRM.
+      const [[{ vcount }]] = await pool.query(
+        'SELECT COUNT(*) AS vcount FROM tbl_job_media WHERE job_id = ?',
         [jobId],
       );
-      if (Number(existing) >= 5) {
-        return modernError(res, 400, 'maximum 5 images per job');
+      if (Number(vcount) >= MAX_VIDEOS_PER_JOB) {
+        return modernError(res, 400, `maximum ${MAX_VIDEOS_PER_JOB} videos per job`);
       }
-      const seq = Number(existing) + 1;
+      const vseq = Number(vcount) + 1;
 
-      let imageValue;
+      let videoKey;
       try {
-        imageValue = await s3Storage.putJobImage({
-          jobId,
-          seq,
+        videoKey = await s3Storage.putJobImage({
+          jobId, seq: vseq,
           buffer: req.file.buffer,
-          contentType: req.file.mimetype,
+          contentType: mime,
           originalName: req.file.originalname,
-          category: 'Booking',
+          category: 'BookingVideo',
         });
       } catch (e) {
-        logger.warn({ err: e.message, jobId }, 'public S3 upload failed');
-        return modernError(res, 502, 'image upload to storage failed');
+        logger.warn({ err: e.message, jobId }, 'public S3 video upload failed');
+        return modernError(res, 502, 'video upload to storage failed');
       }
 
-      const [ins] = await pool.query(
-        `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, created_date)
-         VALUES (?, ?, 'booking', 0, NOW())`,
-        [jobId, imageValue],
+      const [vins] = await pool.query(
+        `INSERT INTO tbl_job_media (job_id, s3_key, content_type, source)
+         VALUES (?, ?, ?, 'customer_public_form')`,
+        [jobId, videoKey, mime],
       );
-
-      return modernOk(res, {
-        image_id: ins.insertId,
-        image: imageValue,
-        seq,
-      });
+      return modernOk(res, { kind: 'video', media_id: vins.insertId, key: videoKey, seq: vseq });
     } catch (e) {
       if (e?.code === 'LIMIT_FILE_SIZE') {
-        return modernError(res, 400, 'file exceeds 5MB');
+        const mb = Math.round(MAX_VIDEO_BYTES / (1024 * 1024));
+        return modernError(res, 400, `file exceeds ${mb}MB`);
       }
-      if (e?.code === 'INVALID_IMAGE_MIME') {
-        return modernError(res, 400, 'Only JPEG, PNG, WebP, or GIF images are allowed');
+      if (e?.code === 'INVALID_MEDIA_MIME') {
+        return modernError(res, 400, 'Only JPEG, PNG, WebP, GIF images or MP4/MOV/3GP/WebM videos are allowed');
       }
+      return mapKnownError(res, next, e);
+    }
+  },
+);
+
+// ─── DELETE /:token/videos/:mediaId — remove a customer-uploaded video ─
+router.delete(
+  '/:token/videos/:mediaId',
+  peekToken,
+  tokenRateLimit,
+  async (req, res, next) => {
+    try {
+      const jobId = await verify(req);
+      const mediaId = Number(req.params.mediaId);
+      if (!Number.isInteger(mediaId) || mediaId <= 0) {
+        return modernError(res, 400, 'invalid mediaId');
+      }
+
+      const [[row]] = await pool.query(
+        'SELECT media_id, job_id, s3_key FROM tbl_job_media WHERE media_id = ? LIMIT 1',
+        [mediaId],
+      );
+      // Token-pinned, same 404 on absent or wrong-job to avoid disclosure.
+      if (!row || Number(row.job_id) !== jobId) {
+        return modernError(res, 404, 'video not found');
+      }
+
+      if (row.s3_key) {
+        try { await s3Storage.deleteObject(row.s3_key); }
+        catch (e) {
+          logger.warn({ err: e.message, mediaId: row.media_id }, 'public S3 video delete failed (continuing with DB delete)');
+        }
+      }
+      await pool.query('DELETE FROM tbl_job_media WHERE media_id = ?', [mediaId]);
+      return modernOk(res, { media_id: row.media_id, deleted: true });
+    } catch (e) {
       return mapKnownError(res, next, e);
     }
   },

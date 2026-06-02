@@ -1,19 +1,17 @@
 const logger = require('../logger');
 
 /*
- * ⚠️  STALE — no longer wired into any caller as of 2026-05-21.
+ * WhatsApp delivery via Gallabox.
  *
- * All WhatsApp delivery now flows through services/meta.whatsapp.service.js
- * (direct Meta Cloud API). This Gallabox path is retained ONLY as a
- * reference for the legacy template registry and as a fallback if the Meta
- * cutover ever needs to be reversed. The dependents that used to call
- * sendTemplate() here — orchestrator, otp-delivery, admin notifications
- * test route — have been switched over.
- *
- * If you find yourself adding a require('./gallabox.whatsapp.service')
- * somewhere, stop and use the Meta service instead unless you have an
- * explicit need to send through the BSP (e.g. a template that Meta
- * hasn't approved yet but Gallabox has).
+ * NOTE (2026-06-03): general lifecycle notifications were migrated to
+ * services/meta.whatsapp.service.js, BUT the customer Order-Confirmation
+ * flow (job-magic-link.service.js → template `confirm_order`) deliberately
+ * stays on Gallabox, and the new CONVERSATIONAL order-confirmation engine
+ * (services/whatsapp-conversation.service.js) is built on Gallabox too —
+ * it needs interactive buttons / free-text session messages / location
+ * requests and an inbound webhook, which we run through the BSP. So this
+ * module is NOT stale: it now exposes template + interactive + text +
+ * location senders plus an inbound-media fetch.
  *
  * ─────────────────────────────────────────────────────────────────────
  *
@@ -116,4 +114,150 @@ async function sendTemplate({
   }
 }
 
-module.exports = { sendTemplate, normaliseIndianPhone };
+/*
+ * Shared low-level sender for the NON-template message types used by the
+ * conversational flow (interactive buttons, free-form session text, location
+ * request). Mirrors sendTemplate's guards exactly: NOTIFICATIONS_DISABLE
+ * short-circuit + TEST_MOBILE redirect + creds check + the same Gallabox
+ * envelope. `whatsapp` is the provider-specific message object (everything
+ * under the top-level `whatsapp` key).
+ *
+ * IMPORTANT: free-form / interactive messages are only deliverable INSIDE the
+ * 24h customer-service window (i.e. after the customer has messaged us). The
+ * caller (state machine) only sends these in response to an inbound message,
+ * so the window is always open. The first business-initiated message must be a
+ * pre-approved template (use sendTemplate).
+ *
+ * Gallabox interactive/text payload shapes mirror Meta's Cloud API and should
+ * be confirmed against the Gallabox API docs / dashboard during rollout.
+ */
+async function sendWhatsappMessage({ to, recipientName, whatsapp, label }) {
+  const originalPhone = normaliseIndianPhone(to);
+  if (!originalPhone) return { delivered: false, error: `invalid phone "${to}"` };
+  if (!whatsapp || !whatsapp.type) return { delivered: false, error: 'whatsapp message payload required' };
+
+  if (disabled()) {
+    logger.test(`WhatsApp suppressed (NOTIFICATIONS_DISABLE) · to=${originalPhone} · ${label || whatsapp.type}`);
+    return { delivered: false, disabled: true };
+  }
+
+  const apiKey    = process.env.GALLABOX_API_KEY;
+  const apiSecret = process.env.GALLABOX_API_SECRET;
+  const channelId = process.env.GALLABOX_CHANNEL_ID;
+  const url       = process.env.GALLABOX_URL || 'https://server.gallabox.com/devapi/messages/whatsapp';
+  if (!apiKey || !apiSecret || !channelId) {
+    return { delivered: false, error: 'GALLABOX_API_KEY / API_SECRET / CHANNEL_ID not configured' };
+  }
+
+  let phone = originalPhone;
+  let redirected = false;
+  if (process.env.TEST_MOBILE) {
+    const test = normaliseIndianPhone(process.env.TEST_MOBILE);
+    if (test) { phone = test; redirected = true; }
+  }
+  if (redirected) {
+    logger.test(`WhatsApp redirected from ${originalPhone} → ${phone} (TEST_MOBILE) · ${label || whatsapp.type}`);
+  }
+
+  const body = {
+    channelId,
+    channelType: 'whatsapp',
+    recipient: { name: recipientName || '', phone },
+    whatsapp,
+  };
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { apiKey, apiSecret, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    const delivered = res.ok;
+    const who = redirected ? `${phone} (was ${originalPhone})` : phone;
+    if (delivered) logger.whatsapp(`sent to ${who} · ${label || whatsapp.type}`);
+    else           logger.warn(`WhatsApp rejected · to=${who} · ${label || whatsapp.type} · status=${res.status} · ${text.slice(0, 120)}`);
+    return { delivered, providerResponse: text, httpStatus: res.status, redirected, intendedTo: redirected ? originalPhone : undefined };
+  } catch (err) {
+    logger.error(`WhatsApp error · to=${phone} · ${label || whatsapp.type} · ${err.message}`);
+    return { delivered: false, error: err.message };
+  }
+}
+
+// Free-form session text (24h window). Used for prompts/confirmations.
+function sendText({ to, recipientName, body }) {
+  return sendWhatsappMessage({
+    to, recipientName, label: 'text',
+    whatsapp: { type: 'text', text: { body: String(body || '') } },
+  });
+}
+
+// Interactive reply buttons (max 3). `buttons` = [{ id, title }]. WhatsApp
+// caps title at 20 chars — we hard-trim so a long label can't get the whole
+// message rejected.
+function sendButtons({ to, recipientName, body, buttons = [] }) {
+  const replyButtons = buttons.slice(0, 3).map((b) => ({
+    type: 'reply',
+    reply: { id: String(b.id), title: String(b.title || '').slice(0, 20) },
+  }));
+  return sendWhatsappMessage({
+    to, recipientName, label: 'interactive.button',
+    whatsapp: {
+      type: 'interactive',
+      interactive: {
+        type: 'button',
+        body: { text: String(body || '') },
+        action: { buttons: replyButtons },
+      },
+    },
+  });
+}
+
+// Location-request interactive message — renders a "Send location" button in
+// WhatsApp; the customer's reply arrives as an inbound `location` message.
+function sendLocationRequest({ to, recipientName, body }) {
+  return sendWhatsappMessage({
+    to, recipientName, label: 'interactive.location_request',
+    whatsapp: {
+      type: 'interactive',
+      interactive: {
+        type: 'location_request_message',
+        body: { text: String(body || '') },
+        action: { name: 'send_location' },
+      },
+    },
+  });
+}
+
+/*
+ * Download an inbound media item (photo/video the customer sent) → buffer +
+ * contentType, for re-upload to S3. Gallabox inbound webhooks deliver media as
+ * a hosted `url` (preferred) and/or a provider `mediaId`; the exact field is
+ * confirmed at rollout. We support a direct hosted URL here (auth headers are
+ * sent in case the URL is gated). Returns { buffer, contentType } or
+ * { error }.
+ */
+async function fetchInboundMedia({ url }) {
+  if (!url) return { error: 'media url required' };
+  try {
+    const headers = {};
+    if (process.env.GALLABOX_API_KEY)    headers.apiKey = process.env.GALLABOX_API_KEY;
+    if (process.env.GALLABOX_API_SECRET) headers.apiSecret = process.env.GALLABOX_API_SECRET;
+    const res = await fetch(url, { headers });
+    if (!res.ok) return { error: `media fetch failed: HTTP ${res.status}` };
+    const contentType = res.headers.get('content-type') || 'application/octet-stream';
+    const buffer = Buffer.from(await res.arrayBuffer());
+    return { buffer, contentType };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+module.exports = {
+  sendTemplate,
+  sendText,
+  sendButtons,
+  sendLocationRequest,
+  fetchInboundMedia,
+  normaliseIndianPhone,
+};

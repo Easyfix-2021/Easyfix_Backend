@@ -5,6 +5,7 @@ const validate = require('../../middleware/validate');
 const requireAction = require('../../middleware/require-action');
 const { modernOk, modernError } = require('../../utils/response');
 const magicLinkService = require('../../services/job-magic-link.service');
+const conversationService = require('../../services/whatsapp-conversation.service');
 const logger = require('../../logger');
 
 /*
@@ -161,12 +162,23 @@ router.post(
         action = 'resend';
       }
 
-      const result = await magicLinkService.sendForJob(
-        jobId,
-        { action, override: !!override },
-        pool,
+      // Per-client channel selector: 'conversation' → in-chat AI flow;
+      // anything else (incl. unset) → the magic-link FORM (unchanged default).
+      const [[modeRow]] = await pool.query(
+        `SELECT LOWER(REPLACE(c_prop_values, '_', ' ')) AS flow_mode
+           FROM tbl_client_custom_properties
+          WHERE client_id = ?
+            AND LOWER(REPLACE(c_prop_name, '_', ' ')) = LOWER('Order Confirmation Mode')
+            AND status = 1
+          LIMIT 1`,
+        [job.fk_client_id],
       );
-      return modernOk(res, result);
+      const conversational = String(modeRow?.flow_mode || '').trim() === 'conversation';
+
+      const result = conversational
+        ? await conversationService.startConversation(jobId, { action }, pool)
+        : await magicLinkService.sendForJob(jobId, { action, override: !!override }, pool);
+      return modernOk(res, { ...result, channel: conversational ? 'conversation' : 'form' });
     } catch (e) {
       return next(e);
     }

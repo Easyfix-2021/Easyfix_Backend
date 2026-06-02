@@ -657,6 +657,22 @@ async function fetchPrefill(jobId, pool) {
       image_id: i.image_id,
       key:      i.image,
     })),
+    // Videos shared by the customer via the public Product Photos/Videos
+    // picker (or via the conversational chat flow — both write to
+    // tbl_job_media). Probe-gated so deploys without the 2026-06-03 migration
+    // applied still get `videos: []` silently (no 500). FE renders these as a
+    // distinct tile group below photos in the customer-facing picker.
+    videos: await (async () => {
+      try {
+        const [vRows] = await pool.query(
+          `SELECT media_id, s3_key FROM tbl_job_media WHERE job_id = ? ORDER BY media_id ASC`,
+          [jobId],
+        );
+        return vRows.map((v) => ({ media_id: v.media_id, key: v.s3_key }));
+      } catch (_e) {
+        return [];
+      }
+    })(),
     // Per-client custom-property descriptors. FE canonicalises `name`
     // (e.g. `branch | branch_details → branch_details`) before keying its
     // input map. Empty array when the client has no rows configured.
@@ -1247,12 +1263,108 @@ async function acceptSubmission(jobId, payload, pool) {
   }
 }
 
+/*
+ * writeCustomerOrderDetails(jobId, fields, pool)
+ *
+ * Shared finalize writer for customer-supplied order details, used by the
+ * CONVERSATIONAL WhatsApp flow (services/whatsapp-conversation.service.js).
+ * Writes the SAME tbl_job (schedule + audit) and tbl_address columns that
+ * acceptSubmission() does (steps 2 + 4 there) — minus the service
+ * reconciliation, since the chat never collects services (and must therefore
+ * NOT soft-delete a job's existing tbl_job_services rows).
+ *
+ * IMPORTANT — keep the column set here in sync with acceptSubmission()'s
+ * tbl_job / tbl_address writes above. Both stamp customer_submitted_at +
+ * customer_submitted_payload so the existing CRM "Customer Submitted" pill +
+ * the Confirm-mode prefill light up identically whether the customer used the
+ * form or the chat.
+ *
+ * `fields` (all optional except none — COALESCE preserves existing on null):
+ *   requested_date_time, time_slot, job_desc,
+ *   address, building, landmark, city_id, pin_code, gps_location, address_instruction,
+ *   payload (object — snapshot stored as customer_submitted_payload JSON).
+ */
+async function writeCustomerOrderDetails(jobId, fields, pool) {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [jobRows] = await conn.query(
+      'SELECT fk_address_id FROM tbl_job WHERE job_id = ? LIMIT 1',
+      [jobId],
+    );
+    if (!jobRows || jobRows.length === 0) {
+      throw { status: 404, code: 'JOB_NOT_FOUND', message: 'Order not found' };
+    }
+    const addressId = jobRows[0].fk_address_id;
+    const submittedAt = new Date();
+
+    await conn.query(
+      `UPDATE tbl_job SET
+         customer_submitted_at      = ?,
+         customer_submitted_payload = ?,
+         requested_date_time        = COALESCE(?, requested_date_time),
+         time_slot                  = COALESCE(?, time_slot),
+         job_desc                   = COALESCE(?, job_desc),
+         last_update_time           = ?
+       WHERE job_id = ?`,
+      [
+        submittedAt,
+        JSON.stringify(fields.payload || fields),
+        fields.requested_date_time || null,
+        fields.time_slot || null,
+        (fields.job_desc && String(fields.job_desc).trim()) ? fields.job_desc : null,
+        submittedAt,
+        jobId,
+      ],
+    );
+
+    const addressLine = (fields.address && String(fields.address).length) ? fields.address : null;
+    if (addressId && addressLine) {
+      const hasAddrInstr = await addressHasInstruction(pool);
+      const setClauses = [
+        'address      = COALESCE(?, address)',
+        'building     = COALESCE(?, building)',
+        'landmark     = COALESCE(?, landmark)',
+        'city_id      = COALESCE(?, city_id)',
+        'pin_code     = COALESCE(?, pin_code)',
+        'gps_location = COALESCE(?, gps_location)',
+      ];
+      const params = [
+        addressLine,
+        (fields.building && String(fields.building).length) ? fields.building : null,
+        (fields.landmark && String(fields.landmark).length) ? fields.landmark : null,
+        fields.city_id ?? null,
+        fields.pin_code ?? null,
+        (fields.gps_location && String(fields.gps_location).length) ? fields.gps_location : null,
+      ];
+      if (hasAddrInstr) {
+        setClauses.push('address_instruction = COALESCE(?, address_instruction)');
+        params.push((fields.address_instruction && String(fields.address_instruction).length) ? fields.address_instruction : null);
+      }
+      params.push(addressId);
+      await conn.query(`UPDATE tbl_address SET ${setClauses.join(', ')} WHERE address_id = ?`, params);
+    }
+
+    await conn.commit();
+    return { jobId, customer_submitted_at: submittedAt.toISOString() };
+  } catch (err) {
+    try { await conn.rollback(); } catch (_e) { /* connection already gone */ }
+    if (err && err.status) throw err;
+    throw { status: 500, message: err && err.message ? err.message : 'write failed' };
+  } finally {
+    conn.release();
+  }
+}
+
 module.exports = {
   fetchPrefill,
   sendForJob,
   acceptSubmission,
+  writeCustomerOrderDetails,
   resolveJobSpoc,
   orderStatusLabel,
   CANCEL_REASONS,
   RESCHEDULE_REASONS,
+  TIME_SLOTS,
 };

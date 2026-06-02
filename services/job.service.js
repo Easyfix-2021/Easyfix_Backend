@@ -272,6 +272,23 @@ async function customerRequestTableExists() {
   return _hasCustomerRequestTable;
 }
 
+// Same memoised existence probe for tbl_job_media — new EasyFix-owned table
+// (videos shared via the conversational WhatsApp flow, see
+// migrations/2026-06-03-whatsapp-conversation.sql). On deploys without that
+// migration applied, getById() returns videos:[] silently so the CRM Confirm
+// view doesn't 500.
+let _hasJobMediaTable = null;
+async function jobMediaTableExists() {
+  if (_hasJobMediaTable !== null) return _hasJobMediaTable;
+  try {
+    await pool.query('SELECT 1 FROM tbl_job_media LIMIT 1');
+    _hasJobMediaTable = true;
+  } catch {
+    _hasJobMediaTable = false;
+  }
+  return _hasJobMediaTable;
+}
+
 /*
  * Builds the two pending-customer-request projection columns for the LIST
  * query. When the table exists, emits correlated subqueries selecting the
@@ -691,7 +708,24 @@ async function getById(jobId) {
   ]);
   const job = jobRows[0][0];
   if (!job) return null;
-  return { ...job, services: services[0], images: images[0] };
+
+  // Customer-shared videos (via the WhatsApp conversational order-confirmation
+  // flow) live in tbl_job_media — a separate EasyFix-owned table because
+  // tbl_job_image is image-only by convention. Probe-gated so a deploy without
+  // the 2026-06-03 migration applied returns videos:[] silently. Same shape
+  // the FE can render with a play icon next to the photos grid.
+  let videos = [];
+  if (await jobMediaTableExists()) {
+    const [vRows] = await pool.query(
+      `SELECT media_id, s3_key, content_type, source, created_at
+         FROM tbl_job_media
+        WHERE job_id = ?
+        ORDER BY media_id ASC`,
+      [jobId],
+    );
+    videos = vRows;
+  }
+  return { ...job, services: services[0], images: images[0], videos };
 }
 
 /*

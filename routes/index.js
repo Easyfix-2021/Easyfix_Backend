@@ -40,4 +40,8 @@ router.use('/mobile', require('./mobile'));
 // Integration routes — legacy contract, HTTP Basic Auth.
 router.use('/integration', integrationRouter);
 
+// Inbound provider webhooks (Gallabox WhatsApp conversational flow, etc.).
+// No JWT — each sub-router verifies its own shared secret.
+router.use('/webhook', require('./webhook'));
+
 module.exports = router;
