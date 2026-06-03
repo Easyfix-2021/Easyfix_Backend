@@ -745,17 +745,20 @@ router.patch('/escalated/:tableId', async (req, res, next) => {
  * Route-order: declared BEFORE `/:id` (same gotcha as /transaction,
  * /action-reasons, /escalated).
  */
-const DUE_TO_USER_TYPE = { customer: 1, client: 2, easyfix: 3, technician: 4 };
+// DUE_TO_USER_TYPE + ACTION_TYPE_BY_MODE now live in services/reason-codes.js
+// — promoted from this file 2026-06-04 so cross-tier callers share one map.
+const { DUE_TO_USER_TYPE, ACTION_TYPE_BY_MODE, ACTION_TYPE } = require('../../services/reason-codes');
+
 router.get('/comment-reasons', async (req, res, next) => {
   try {
     const dueRaw = String(req.query.dueTo || '').toLowerCase().replace(/\s+/g, '');
-    const userType = DUE_TO_USER_TYPE[dueRaw] || 2; // legacy default
+    const userType = DUE_TO_USER_TYPE[dueRaw] || 2; // legacy default = Client
     const [rows] = await imagePool.query(
       `SELECT id, action_desc FROM action_taken_reason
-        WHERE action_type = 5 AND user_type = ?
+        WHERE action_type = ? AND user_type = ?
               AND (status IS NULL OR status = 1)
         ORDER BY id ASC`,
-      [userType]
+      [ACTION_TYPE.ADD_REMARKS, userType]
     );
     const items = rows
       .map((r) => ({ id: r.id, label: String(r.action_desc || '').trim() }))
@@ -924,16 +927,31 @@ router.get('/:id/transaction', validate(idParam, 'params'), scopedJob, async (re
 });
 
 /*
- * GET /api/admin/jobs/action-reasons?type=<unreachable|enquiry>
+ * GET /api/admin/jobs/action-reasons?type=<unreachable|enquiry>&dueTo=<customer|client|easyfix|technician>
  *
- * Drives the dropdown inside the Book-New-Call "Job Unreachable" /
+ * Drives the dropdown inside the Confirm & Schedule "Job Unreachable" /
  * "Job Enquiry" popup (legacy CRM parity). Reasons come from
- * `action_taken_reason` joined to `action_type`.
+ * `action_taken_reason` filtered by BOTH action_type AND user_type, so
+ * the list narrows to the operator's "Pending Due To" / "Open Due To"
+ * pick — mirrors the comment-reasons (Add Remarks) endpoint above.
  *
  * Schema (verified 2026-05-18 against easyfix DB):
  *   action_type         { id, type ("Un Reachable"|"Enquiry"|...), description }
  *   action_taken_reason { id, action_type (FK→action_type.id), action_desc,
  *                         status (1=active), user_type, is_new }
+ *
+ * action_type IDs (confirmed by ops 2026-06-04):
+ *   25 → Unreachable  (legacy `action_type.type` was 'Un Reachable')
+ *   24 → Enquiry      (legacy `action_type.type` was 'Enquiry')
+ * Previously this endpoint did a fragile LOWER(REPLACE(...)) string match
+ * against the legacy `type` column. Hardcoded integers are explicit + safe
+ * against legacy label drift; the string column stays untouched as a
+ * human-readable label only.
+ *
+ * user_type mapping is shared with the comment-reasons endpoint above —
+ * `DUE_TO_USER_TYPE` constant. Missing/unknown `dueTo` defaults to
+ * user_type=2 (Client) so older callers without the param still get a
+ * sensible list (matches the comment-reasons default).
  *
  * Route-order note: declared BEFORE `/:id` so Express doesn't try to
  * validate the literal string "action-reasons" as a numeric job id —
@@ -943,25 +961,21 @@ router.get('/action-reasons', async (req, res, next) => {
   try {
     const type = String(req.query.type || '').trim().toLowerCase();
     if (!type) return modernError(res, 400, 'type is required (unreachable|enquiry)');
+    // Strip whitespace/underscores/dashes so 'un_reachable' / 'un-reachable' /
+    // 'unreachable' / 'Un Reachable' all map to the same bucket.
+    const modeKey = type.replace(/[\s_-]/g, '');
+    const actionTypeId = ACTION_TYPE_BY_MODE[modeKey];
+    if (!actionTypeId) return modernOk(res, []);
 
-    // Strip spaces/underscores/dashes on both sides so the URL token
-    // "unreachable" matches the DB value "Un Reachable", "enquiry"
-    // matches "Enquiry", etc.
-    const needle = type.replace(/[\s_-]/g, '');
-    const [typeRows] = await pool.query(
-      `SELECT id, type FROM action_type
-        WHERE LOWER(REPLACE(REPLACE(REPLACE(type, ' ', ''), '_', ''), '-', '')) = ?
-        ORDER BY id DESC LIMIT 1`,
-      [needle],
-    );
-    if (!typeRows.length) return modernOk(res, []);
-    const typeId = typeRows[0].id;
+    const dueRaw = String(req.query.dueTo || '').toLowerCase().replace(/\s+/g, '');
+    const userType = DUE_TO_USER_TYPE[dueRaw] || 2; // legacy default = Client
 
     const [reasonRows] = await pool.query(
       `SELECT id, action_desc FROM action_taken_reason
-        WHERE action_type = ? AND (status IS NULL OR status = 1)
+        WHERE action_type = ? AND user_type = ?
+              AND (status IS NULL OR status = 1)
         ORDER BY id ASC`,
-      [typeId],
+      [actionTypeId, userType],
     );
     const items = reasonRows
       .map((r) => ({ id: r.id, label: String(r.action_desc || '').trim() }))

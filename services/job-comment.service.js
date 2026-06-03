@@ -67,7 +67,7 @@ async function listComments(jobId) {
        LEFT JOIN tbl_user u ON u.user_id = c.commented_by
        LEFT JOIN tbl_enum_reason e ON e.enum_id = c.enum_reason_id
       WHERE c.job_id = ?
-      ORDER BY c.created_on ASC, c.comment_id ASC`,
+      ORDER BY c.created_on DESC, c.comment_id DESC`,
     [jobId]
   );
   return rows.map(shapeRow);
