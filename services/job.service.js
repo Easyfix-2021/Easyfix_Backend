@@ -1398,15 +1398,29 @@ async function create(input, actor) {
     const jobId = ins.insertId;
 
     if (Array.isArray(input.services) && input.services.length > 0) {
+      // Batch-load rate-card rows for all picked services in ONE query
+      // (avoids N+1) — then compute the 5 charge columns per row via
+      // the shared cascade helper. See utils/rate-card-calc.js for the
+      // formula (sequential variable→fixed per layer; bundles overhead
+      // into easyfix_charge to preserve sum-to-total invariant).
+      const { loadRateCardRows, computeJobServiceCharges } = require('../utils/rate-card-calc');
+      const rateCardById = await loadRateCardRows(conn, input.services.map((s) => s.service_id));
+
       // Single multi-row INSERT instead of N sequential round-trips. Only wins
       // for jobs with 3+ services but costs nothing for smaller sets.
-      const values = input.services.map((svc) => [
-        jobId, svc.service_id, svc.quantity || 1,
-        svc.service_type_id || null, svc.service_category_id || null, 1,
-      ]);
+      const values = input.services.map((svc) => {
+        const ch = computeJobServiceCharges(rateCardById.get(Number(svc.service_id)), svc.quantity || 1);
+        return [
+          jobId, svc.service_id, svc.quantity || 1,
+          svc.service_type_id || null, svc.service_category_id || null, 1,
+          ch.total_charge, ch.total_cost,
+          ch.client_charge, ch.easyfix_charge, ch.easyfixer_charge,
+        ];
+      });
       await conn.query(
         `INSERT INTO tbl_job_services
-           (job_id, service_id, quantity, service_type_id, service_category_id, job_service_status)
+           (job_id, service_id, quantity, service_type_id, service_category_id, job_service_status,
+            total_charge, total_cost, client_charge, easyfix_charge, easyfixer_charge)
          VALUES ?`,
         [values]
       );
@@ -1680,9 +1694,17 @@ async function update(jobId, input, actor) {
         'UPDATE tbl_job_services SET job_service_status = 0 WHERE job_id = ?',
         [jobId],
       );
+      // Batch-load rate cards once for the whole edit — same cascade
+      // helper as create(). N+1-safe; see utils/rate-card-calc.js docs.
+      const { loadRateCardRows, computeJobServiceCharges } = require('../utils/rate-card-calc');
+      const rateCardById = await loadRateCardRows(conn, input.services.map((s) => s.service_id));
+
       // 3. Re-apply each service in the new payload — UPDATE existing
-      //    row if it was previously known, else INSERT.
+      //    row if it was previously known, else INSERT. Recompute the
+      //    5 charge columns from the rate card so quantity changes pick
+      //    up the new total_cost / shares.
       for (const svc of input.services) {
+        const ch = computeJobServiceCharges(rateCardById.get(Number(svc.service_id)), svc.quantity || 1);
         const existingId = existingByService.get(svc.service_id);
         if (existingId) {
           await conn.query(
@@ -1690,23 +1712,33 @@ async function update(jobId, input, actor) {
                 SET job_service_status = 1,
                     quantity = ?,
                     service_type_id = ?,
-                    service_category_id = ?
+                    service_category_id = ?,
+                    total_charge = ?,
+                    total_cost = ?,
+                    client_charge = ?,
+                    easyfix_charge = ?,
+                    easyfixer_charge = ?
               WHERE job_service_id = ?`,
             [
               svc.quantity || 1,
               svc.service_type_id || null,
               svc.service_category_id || null,
+              ch.total_charge, ch.total_cost,
+              ch.client_charge, ch.easyfix_charge, ch.easyfixer_charge,
               existingId,
             ],
           );
         } else {
           await conn.query(
             `INSERT INTO tbl_job_services
-               (job_id, service_id, quantity, service_type_id, service_category_id, job_service_status)
-             VALUES (?, ?, ?, ?, ?, 1)`,
+               (job_id, service_id, quantity, service_type_id, service_category_id, job_service_status,
+                total_charge, total_cost, client_charge, easyfix_charge, easyfixer_charge)
+             VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`,
             [
               jobId, svc.service_id, svc.quantity || 1,
               svc.service_type_id || null, svc.service_category_id || null,
+              ch.total_charge, ch.total_cost,
+              ch.client_charge, ch.easyfix_charge, ch.easyfixer_charge,
             ],
           );
         }

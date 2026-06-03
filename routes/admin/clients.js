@@ -805,14 +805,50 @@ router.put(
  * Returns the client's subscribed services with category name AND
  * resolved service-type names attached per row. Designed as exactly
  * 2 SQL queries regardless of row count — see service-layer notes.
+ *
+ * SHARED CHARGE CASCADE — each row carries a `charges` object computed
+ * from the rate-card columns via utils/rate-card-calc.js (the same
+ * helper used at tbl_job_services write time). See the docblock there
+ * for the formula. Per-unit values shown here; the actual job-line
+ * row in tbl_job_services multiplies by the operator's quantity.
  */
-router.get('/:clientId/services', async (req, res, next) => {
-  try {
-    if (!(await loadAndGuardClient(req, res))) return;
-    const rows = await clientServicesSvc.listForClient(req.params.clientId);
-    modernOk(res, rows);
-  } catch (e) { next(e); }
-});
+const { describe: describeRoute } = require('../../docs/openapi-autogen');
+router.get('/:clientId/services',
+  describeRoute('Get client rate-card services with charge cascade', {
+    description: [
+      'Returns the client\'s subscribed services (active only) with:',
+      '  • basic catalog (service category, service types, status)',
+      '  • the 6 rate-card cost columns (easyfix_direct_fixed, ',
+      '    easyfix_direct_variable, overhead_fixed, overhead_variable, ',
+      '    client_fixed, client_variable)',
+      '  • a per-unit `charges` object computed via the shared cascade',
+      '    (see utils/rate-card-calc.js)',
+      '',
+      '**Charge cascade formula** (variable% then fixed, per layer):',
+      '  Start with `total_charge` (unit price = tbl_client_service.total_amount).',
+      '  L1 Easyfix Direct: deduct (var% × remaining) + fixed',
+      '  L2 Overhead:       deduct (var% × remaining) + fixed',
+      '  L3 Client Share:   deduct (var% × remaining) + fixed',
+      '  L4 Easyfixer:      everything left',
+      '',
+      'Variable rates are stored as % (e.g. 10 = 10%) and divided by 100',
+      'before applying. `easyfix_charge` BUNDLES L1+L2 since tbl_job_services',
+      'has no overhead_charge column (keeps sum-to-total invariant).',
+      '',
+      '**Example**: total_amount=400, easyfix_direct_fixed=200/var=10, ',
+      'overhead_fixed=10/var=20, client=0/0 → easyfix_charge=282, ',
+      'client_charge=0, easyfixer_charge=118.',
+    ].join('\n'),
+    tags: ['Admin — Clients'],
+  }),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndGuardClient(req, res))) return;
+      const rows = await clientServicesSvc.listForClient(req.params.clientId);
+      modernOk(res, rows);
+    } catch (e) { next(e); }
+  },
+);
 
 router.post(
   '/:clientId/services',

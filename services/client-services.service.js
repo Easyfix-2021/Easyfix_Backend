@@ -106,10 +106,11 @@ async function listForClient(clientId) {
   //   cs.charge_type       (int FK to charge type)
   //   cs.service_status    (0 = soft-deleted)
   //   cs.service_type_ids  (CSV) — may be absent on older deploys; probed.
-  // The 6 cost columns (`easyfix_direct_fixed` etc.) ALSO live on
-  // tbl_client_service — they're surfaced by the Rate Cards tab. We
-  // skip them here to keep this projection lean; Rate Cards joins
-  // through a separate query.
+  // The 6 cost columns (`easyfix_direct_fixed`, `easyfix_direct_variable`,
+  // `overhead_fixed`, `overhead_variable`, `client_fixed`, `client_variable`)
+  // are now projected too (2026-06-05) so the cascade helper can compute
+  // a per-unit charge breakdown right here — Manage Clients rate-card
+  // preview + Confirm modal service breakdown both consume this shape.
   // Result aliases preserved (`service_category_id`, `total_charge`) so
   // FE contract stays stable while the DB stays legacy-shaped.
   const hasTypeIds = await clientServiceHasTypeIds(pool);
@@ -122,6 +123,12 @@ async function listForClient(clientId) {
             ${typeIdsProjection},
             cs.charge_type,
             cs.total_amount       AS total_charge,
+            cs.easyfix_direct_fixed,
+            cs.easyfix_direct_variable,
+            cs.overhead_fixed,
+            cs.overhead_variable,
+            cs.client_fixed,
+            cs.client_variable,
             cs.service_status,
             sc.service_catg_name  AS service_category_name
        FROM tbl_client_service cs
@@ -154,6 +161,17 @@ async function listForClient(clientId) {
     nameById = new Map(typeRows.map((t) => [t.service_type_id, t.service_type_name]));
   }
 
+  // Compute per-unit charge cascade for each row via the shared helper
+  // (utils/rate-card-calc.js). `charges` carries:
+  //   - total_charge (per-unit price)
+  //   - total_cost (= unit price × qty; here qty=1)
+  //   - easyfix_charge, client_charge, easyfixer_charge (the splits)
+  //   - _breakdown.{ef_direct_share_per_unit, overhead_share_per_unit, …}
+  // for consumers that want to render the layered breakdown directly.
+  // Skipping this projection-time work is safe (FE re-runs the same helper
+  // if it needs a different qty), but doing it here keeps the contract
+  // self-describing for the Swagger consumers.
+  const { computeJobServiceCharges } = require('../utils/rate-card-calc');
   return parsed.map(({ row, ids }) => ({
     client_service_id: row.client_service_id,
     client_id: row.client_id,
@@ -166,6 +184,16 @@ async function listForClient(clientId) {
     })),
     charge_type: row.charge_type,
     total_charge: row.total_charge,
+    // Rate-card cost columns — surfaced so Manage Clients / Rate Cards
+    // tab consumers don't have to re-fetch them through a separate query.
+    easyfix_direct_fixed:    row.easyfix_direct_fixed,
+    easyfix_direct_variable: row.easyfix_direct_variable,
+    overhead_fixed:          row.overhead_fixed,
+    overhead_variable:       row.overhead_variable,
+    client_fixed:            row.client_fixed,
+    client_variable:         row.client_variable,
+    // Computed cascade (per-unit; multiply by job quantity at write time).
+    charges: computeJobServiceCharges(row, 1),
     service_status: row.service_status,
   }));
 }

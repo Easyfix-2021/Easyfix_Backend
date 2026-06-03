@@ -10,6 +10,7 @@
     "build": "node scripts/build-check.js",
     "test:db": "node scripts/test-db.js",
     "test:menus": "node --test tests/lookup-menus.test.js",
+    "test:rate-card": "node --test tests/rate-card-calc.test.js",
     "verify:schema": "node scripts/schema-verify.js",
     "verify:all": "npm run build && npm run test:db && npm run verify:schema"
   },

@@ -1461,7 +1461,24 @@ router.delete('/:id/services/:jobServiceId',
  * Validator + scopedJob mirror the sibling DELETE/restore endpoints
  * above so authz and shape behaviour stay symmetric.
  */
+const { describe: describeJobsRoute } = require('../../docs/openapi-autogen');
 router.patch('/:id/services/:jobServiceId',
+  describeJobsRoute('Update quantity on a job service line (recomputes charges)', {
+    description: [
+      'Bumps the quantity on a single active tbl_job_services row AND',
+      'recomputes the 5 charge columns (total_charge, total_cost,',
+      'client_charge, easyfix_charge, easyfixer_charge) via the shared',
+      'rate-card cascade (utils/rate-card-calc.js).',
+      '',
+      'Quantity change matters because `total_cost` = per-unit × qty,',
+      'and the variable% layers cascade off the per-unit price — so a',
+      'qty bump scales all dependent shares proportionally.',
+      '',
+      'Returns the updated row\'s computed `charges` object so the FE',
+      'can render the breakdown without a refetch.',
+    ].join('\n'),
+    tags: ['Admin — Jobs'],
+  }),
   validate(require('joi').object({
     id: require('joi').number().integer().positive().required(),
     jobServiceId: require('joi').number().integer().positive().required(),
@@ -1475,18 +1492,36 @@ router.patch('/:id/services/:jobServiceId',
       const jobId = Number(req.params.id);
       const jobServiceId = Number(req.params.jobServiceId);
       const { quantity } = req.body;
+      // Quantity change → all 5 charge columns recompute via the shared
+      // cascade helper (utils/rate-card-calc.js). Look up the existing
+      // row's service_id (= client_service_id) so we can fetch the rate
+      // card and re-run the math.
+      const [existing] = await pool.query(
+        `SELECT service_id FROM tbl_job_services WHERE job_service_id = ? AND job_id = ? LIMIT 1`,
+        [jobServiceId, jobId],
+      );
+      if (!existing.length) return res.status(404).json({ error: 'service not found' });
+      const { loadRateCardRow, computeJobServiceCharges } = require('../../utils/rate-card-calc');
+      const rateCard = await loadRateCardRow(pool, existing[0].service_id);
+      const ch = computeJobServiceCharges(rateCard, quantity);
       const [r] = await pool.query(
         `UPDATE tbl_job_services
-            SET quantity = ?
+            SET quantity = ?,
+                total_charge = ?,
+                total_cost = ?,
+                client_charge = ?,
+                easyfix_charge = ?,
+                easyfixer_charge = ?
           WHERE job_id = ?
             AND job_service_id = ?
             AND (job_service_status IS NULL OR job_service_status = 1)`,
-        [quantity, jobId, jobServiceId],
+        [quantity, ch.total_charge, ch.total_cost, ch.client_charge, ch.easyfix_charge, ch.easyfixer_charge,
+         jobId, jobServiceId],
       );
       if (!r.affectedRows) {
         return res.status(404).json({ error: 'service not found or inactive' });
       }
-      modernOk(res, { updated: true, job_id: jobId, job_service_id: jobServiceId, quantity });
+      modernOk(res, { updated: true, job_id: jobId, job_service_id: jobServiceId, quantity, charges: ch });
     } catch (e) { next(e); }
   });
 
@@ -1504,6 +1539,24 @@ router.patch('/:id/services/:jobServiceId',
  * endpoint without losing the original PK.
  */
 router.post('/:id/services',
+  describeJobsRoute('Append a service line to a job (computes charges)', {
+    description: [
+      'Appends a NEW row to tbl_job_services OR reactivates a previously',
+      'soft-deleted row for the same (job_id, service_id) pair. Either way,',
+      'the 5 charge columns (total_charge, total_cost, client_charge,',
+      'easyfix_charge, easyfixer_charge) are populated from the rate-card',
+      'cascade — see utils/rate-card-calc.js for the formula.',
+      '',
+      '`service_id` is the tbl_client_service.client_service_id from the',
+      'client\'s rate card. The endpoint looks up that row to drive the',
+      'cascade; missing/invalid IDs yield all-zero charges (degenerate but',
+      'non-fatal so the row still lands).',
+      '',
+      'Returns the new/reactivated `job_service_id` + the computed',
+      '`charges` object for the FE to render without a refetch.',
+    ].join('\n'),
+    tags: ['Admin — Jobs'],
+  }),
   validate(idParam, 'params'),
   validate(require('joi').object({
     service_id:          require('joi').number().integer().positive().required(),
@@ -1523,24 +1576,40 @@ router.post('/:id/services',
           ORDER BY job_service_id DESC LIMIT 1`,
         [jobId, service_id],
       );
+      // Rate-card lookup + cascade — single source of truth for the 5
+      // charge columns (see utils/rate-card-calc.js). Applied to both the
+      // reactivate-existing path and the fresh-insert path so the row
+      // always carries up-to-date financials.
+      const { loadRateCardRow, computeJobServiceCharges } = require('../../utils/rate-card-calc');
+      const rateCard = await loadRateCardRow(pool, service_id);
+      const ch = computeJobServiceCharges(rateCard, quantity);
       if (existing.length > 0) {
         const row = existing[0];
         await pool.query(
           `UPDATE tbl_job_services
-              SET job_service_status = 1, quantity = ?
+              SET job_service_status = 1,
+                  quantity = ?,
+                  total_charge = ?,
+                  total_cost = ?,
+                  client_charge = ?,
+                  easyfix_charge = ?,
+                  easyfixer_charge = ?
             WHERE job_service_id = ?`,
-          [quantity, row.job_service_id],
+          [quantity, ch.total_charge, ch.total_cost, ch.client_charge, ch.easyfix_charge, ch.easyfixer_charge,
+           row.job_service_id],
         );
-        return modernOk(res, { reactivated: true, job_service_id: row.job_service_id });
+        return modernOk(res, { reactivated: true, job_service_id: row.job_service_id, charges: ch });
       }
       const [ins] = await pool.query(
         `INSERT INTO tbl_job_services
-           (job_id, service_id, service_type_id, service_category_id, quantity, job_service_status)
-         VALUES (?, ?, ?, ?, ?, 1)`,
-        [jobId, service_id, service_type_id || null, service_category_id || null, quantity],
+           (job_id, service_id, service_type_id, service_category_id, quantity, job_service_status,
+            total_charge, total_cost, client_charge, easyfix_charge, easyfixer_charge)
+         VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`,
+        [jobId, service_id, service_type_id || null, service_category_id || null, quantity,
+         ch.total_charge, ch.total_cost, ch.client_charge, ch.easyfix_charge, ch.easyfixer_charge],
       );
       res.status(201);
-      modernOk(res, { added: true, job_service_id: ins.insertId });
+      modernOk(res, { added: true, job_service_id: ins.insertId, charges: ch });
     } catch (e) { next(e); }
   });
 
