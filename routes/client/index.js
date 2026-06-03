@@ -17,6 +17,17 @@ const identifier = Joi.alternatives(Joi.string().email(), Joi.string().pattern(/
 router.post('/auth/login-otp', validate(Joi.object({ identifier: identifier.required() })), async (req, res, next) => {
   try {
     const r = await clientAuth.createLoginOtp(req.body.identifier);
+    // Distinguish "client deactivated" from "no such user" — operators
+    // need to see a specific message so they call EasyFix support
+    // instead of trying to self-signup.
+    if (r.reason === 'CLIENT_INACTIVE') {
+      return modernError(res, 403,
+        'Your client account is inactive. Please contact EasyFix support to reactivate it.');
+    }
+    if (!r.found) {
+      return modernError(res, 404,
+        `No User Found with given loginId: ${req.body.identifier}, please sign up`);
+    }
     modernOk(res, { delivered: r.found, expiresAt: r.expiresAt || null });
   } catch (e) { next(e); }
 });
@@ -27,7 +38,13 @@ router.post('/auth/verify-otp', validate(Joi.object({
 })), async (req, res, next) => {
   try {
     const r = await clientAuth.verifyLoginOtp(req.body.identifier, req.body.otp);
-    if (!r.ok) return modernError(res, 401, r.reason);
+    if (!r.ok) {
+      if (r.reason === 'CLIENT_INACTIVE') {
+        return modernError(res, 403,
+          'Your client account is inactive. Please contact EasyFix support to reactivate it.');
+      }
+      return modernError(res, 401, r.reason);
+    }
     // Cookie name matches the frontend localStorage key (`client_auth_token`)
     // so future refresh/CSRF flows can read either source consistently.
     res.cookie('client_auth_token', r.token, { httpOnly: true, sameSite: 'lax', maxAge: 30 * 86400 * 1000 });
@@ -38,7 +55,37 @@ router.post('/auth/verify-otp', validate(Joi.object({
 // ─── Protected ──────────────────────────────────────────────────────
 router.use(requireSpocAuth);
 
-router.get('/me', (req, res) => modernOk(res, { spoc: req.spoc }));
+/*
+ * GET /api/client/me — current SPOC + their client brand.
+ *
+ * Enriches the bare `req.spoc` payload (id, client_id, contact_name,
+ * email, client_name) with the resolved client logo URL so the sidebar
+ * can render the SPOC's own company brand at the top instead of the
+ * generic EasyFix logo. logo_id is read from tbl_client and passed
+ * through resolveClientDocumentUrl which handles S3 / absolute URLs /
+ * FILE_BASE_URL relative paths transparently.
+ *
+ * Why here (not in findSpocById): the auth middleware runs on every
+ * authenticated request — resolving an S3 presigned URL on every call
+ * would be wasteful. `/me` fires once per app boot, which is where the
+ * extra round-trip belongs.
+ */
+router.get('/me', async (req, res, next) => {
+  try {
+    let client_logo_url = null;
+    try {
+      const [[client]] = await pool.query(
+        'SELECT logo_id FROM tbl_client WHERE client_id = ? LIMIT 1',
+        [req.spoc.client_id]
+      );
+      if (client?.logo_id) {
+        const { resolveClientDocumentUrl } = require('../../utils/s3-storage');
+        client_logo_url = await resolveClientDocumentUrl(client.logo_id);
+      }
+    } catch { /* logo is best-effort — never block /me */ }
+    modernOk(res, { spoc: { ...req.spoc, client_logo_url } });
+  } catch (e) { next(e); }
+});
 
 /*
  * GET /api/client/me/custom-properties
@@ -76,23 +123,57 @@ router.get('/me/custom-properties', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// Service categories scoped to the SPOC's client. Reads tbl_client_service
-// (joined with tbl_service_catg) so each tenant sees only the categories
-// they've actually contracted for. Powers the "New Order" form dropdown
-// and keeps parity with the legacy /clients/{id}/service-categories route.
+/*
+ * GET /api/client/lookup/service-categories — ALL active service
+ * categories (not just the ones the SPOC's client has contracted).
+ *
+ * Changed 2026-05-30: previously this returned only categories with a
+ * row in tbl_client_service for the SPOC's client_id. That filter
+ * collapsed the dropdown to a handful (sometimes 1) of options, even
+ * though the legacy
+ *   /service-categories/service-category-by-status
+ * endpoint returned the entire active-category set. We now match
+ * legacy behaviour — full active list, sorted alphabetically.
+ */
 router.get('/lookup/service-categories', async (req, res, next) => {
   try {
     const lookup = require('../../services/lookup.service');
-    const services = await lookup.clientServices({ clientId: req.spoc.client_id });
-    const seen = new Map();
-    for (const s of services) {
-      if (s.service_catg_id && !seen.has(s.service_catg_id)) {
-        seen.set(s.service_catg_id, { id: s.service_catg_id, name: s.service_catg_name });
-      }
-    }
-    const items = Array.from(seen.values()).sort((a, b) =>
-      String(a.name || '').localeCompare(String(b.name || '')));
+    const rows = await lookup.serviceCategories({ includeInactive: false });
+    const items = rows.map((r) => ({
+      id: r.service_catg_id,
+      name: r.service_catg_name,
+    }));
     modernOk(res, { items });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/client/customers/mobile/:mobile — lookup existing customer
+ * by their 10-digit mobile number. Used by the New Order form to
+ * auto-fill the contact-name field as soon as the SPOC finishes
+ * typing the mobile.
+ *
+ * Legacy parity: ACD_APIs `/api/customers/mob/{mobile}`.
+ *
+ * Returns { customer: null } if no match (frontend distinguishes a
+ * 404 from this empty-result-OK shape — keeps the autofill flow
+ * non-blocking even for brand-new customers).
+ */
+router.get('/customers/mobile/:mobile', async (req, res, next) => {
+  try {
+    const mobile = String(req.params.mobile || '').trim();
+    if (!/^\d{10}$/.test(mobile)) {
+      return modernOk(res, { customer: null });
+    }
+    const [[row]] = await pool.query(
+      `SELECT customer_id, customer_name, customer_mob_no, customer_email
+         FROM tbl_customer
+        WHERE customer_mob_no = ?
+        ORDER BY customer_id DESC
+        LIMIT 1`,
+      [mobile]
+    );
+    modernOk(res, { customer: row || null });
   } catch (e) { next(e); }
 });
 
@@ -113,14 +194,755 @@ router.get('/dashboard', async (req, res, next) => {
 
 router.get('/jobs', async (req, res, next) => {
   try {
+    const ticketFlag = req.query.ticketFlag || req.query.flag || undefined;
+    let ownerIds = req.query.ownerIds || req.query.owner || undefined;
+
+    // ─── Legacy "my team's tickets" scoping ─────────────────────────
+    // ClientController.java lines 101-111: when on a My-New-Tickets-
+    // style flag and the caller didn't pre-filter ownerIds, scope the
+    // query to:
+    //   1. the logged-in SPOC themselves (req.spoc.id), AND
+    //   2. every contact whose manager_id points at the SPOC
+    //      (i.e., their direct reports — manager sees their team's
+    //       tickets).
+    //
+    // This is enforced server-side rather than trusting a `clientSpocId`
+    // body field — the legacy frontend always overwrote that field with
+    // the logged-in user's id anyway (job-status.service.ts:43-45), so
+    // pulling it from req.spoc here is more secure and behaves identically.
+    //
+    // Skipped for:
+    //   - `noResponse`  → legacy doesn't scope call-later tickets
+    //   - `otherOrders` → legacy explicitly excludes this from scoping
+    //     (ClientController.java:101 — "All Orders" shows whole client)
+    const flagLower = String(ticketFlag || '').toLowerCase();
+    const skipScope = !ticketFlag || ownerIds || flagLower === 'noresponse' || flagLower === 'otherorders';
+    if (!skipScope) {
+      const [reports] = await pool.query(
+        `SELECT id FROM tbl_client_contacts
+          WHERE client_id = ?
+            AND manager_id IS NOT NULL AND manager_id NOT IN ('', 'null')
+            AND CAST(manager_id AS UNSIGNED) = ?`,
+        [req.spoc.client_id, req.spoc.id]
+      );
+      const ids = reports.map((r) => r.id);
+      ids.push(req.spoc.id);
+      // Note: tickets aren't owned via tbl_job.job_owner in legacy —
+      // they're owned via tbl_job.reporting_contact_id. We don't have a
+      // dedicated `reportingContactIds` filter on the service yet, so
+      // we pass these IDs as a separate param the service understands.
+      // See `reportingContactIds` handling in job.service.js list().
+      req._reportingContactIds = ids;
+    }
+
     const { rows, total } = await jobService.list({
       clientId: req.spoc.client_id,
       status: req.query.status != null ? Number(req.query.status) : undefined,
+      // Filter-bar additions (2026-05-28) — match the legacy Angular
+      // order-history filter card (Ticket Created Date / Bucket / City /
+      // Client Team). All optional; absence falls back to the prior
+      // unfiltered behaviour for callers that haven't been updated.
+      statuses: req.query.statuses || req.query.bucket || undefined,
+      cityIds:  req.query.cityIds  || req.query.city   || undefined,
+      ownerIds,
+      // Server-derived from JWT — frontend cannot override (security).
+      // Mirrors legacy clientSpocId scoping to the SPOC's reports.
+      reportingContactIds: req._reportingContactIds,
+      ticketFlag,
+      startDate: req.query.startDate || undefined,
+      endDate:   req.query.endDate   || undefined,
+      // Default the date-range column to `created_date_time` — that's
+      // what the legacy filter labelled "Ticket Created Date". Callers
+      // can override via `dateType=requested|scheduled|ticket`.
+      dateType:  req.query.dateType  || 'created',
       q: req.query.q,
       limit: Math.min(Number(req.query.limit) || 50, 500),
       offset: Number(req.query.offset) || 0,
     });
     modernOk(res, { items: rows, total });
+  } catch (e) { next(e); }
+});
+
+// ─── My-New-Tickets tab counts ───────────────────────────────────────
+// Single endpoint returning all three tab counts so the Client_UI can
+// refresh the badges on a single round-trip after an Authorize action.
+// Mirrors the legacy SharedService.getBucketData([9], …) bus on the
+// Angular dashboard.
+//
+// Filters (cityIds, ownerIds, startDate/endDate, q) are respected so
+// the counts always agree with the visible table when those filters
+// are active. SQL: one SELECT, three COUNT(...) inside CASE — saves
+// two round-trips and keeps the WHERE clause identical across counts.
+router.get('/tickets/counts', async (req, res, next) => {
+  try {
+    // Shared filter clauses — NOT including the status=9 pin (legacy
+    // noResponse case doesn't pin it, so we apply per-CASE inside the
+    // SUM expressions below).
+    const where = [];
+    const params = [];
+    where.push('j.fk_client_id = ?'); params.push(req.spoc.client_id);
+
+    const toIdArr = (v) => String(v).split(',')
+      .map((s) => Number(s.trim())).filter((n) => !Number.isNaN(n));
+    if (req.query.cityIds) {
+      const arr = toIdArr(req.query.cityIds);
+      if (arr.length) { where.push(`ad.city_id IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
+    }
+    if (req.query.ownerIds) {
+      const arr = toIdArr(req.query.ownerIds);
+      if (arr.length) { where.push(`j.job_owner IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
+    }
+    if (req.query.startDate) { where.push('j.created_date_time >= ?'); params.push(req.query.startDate); }
+    if (req.query.endDate)   { where.push('j.created_date_time <= ?'); params.push(req.query.endDate); }
+    if (req.query.q) {
+      where.push('(j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ?)');
+      const v = `%${req.query.q}%`;
+      params.push(v, v, v, v);
+    }
+    // Apply the same "my team's tickets" scope as GET /jobs so the tab
+    // badges count what's actually visible inside each tab. Without
+    // this, counts would over-report (whole-client total) while the
+    // list shows only the SPOC's own + reports' rows.
+    {
+      const [reports] = await pool.query(
+        `SELECT id FROM tbl_client_contacts
+          WHERE client_id = ?
+            AND manager_id IS NOT NULL AND manager_id NOT IN ('', 'null')
+            AND CAST(manager_id AS UNSIGNED) = ?`,
+        [req.spoc.client_id, req.spoc.id]
+      );
+      const ids = reports.map((r) => r.id);
+      ids.push(req.spoc.id);
+      where.push(`j.reporting_contact_id IN (${ids.map(() => '?').join(',')})`);
+      params.push(...ids);
+    }
+
+    // Compose join set — only pull in tables WHERE references. The SUM
+    // expressions ALWAYS need ccs (for the unauthorized branch) and
+    // status pinning for the first two CASEs, so we join unconditionally.
+    const w = where.join(' AND ');
+    const needsCu = /\bcu\./.test(w);
+    const needsAd = /\bad\./.test(w);
+    const joins = `
+      FROM tbl_job j
+      ${needsCu ? 'LEFT JOIN tbl_customer cu ON cu.customer_id = j.fk_customer_id' : ''}
+      ${needsAd ? 'LEFT JOIN tbl_address  ad ON ad.address_id  = j.fk_address_id' : ''}
+      LEFT JOIN tbl_client_contacts ccs ON ccs.id = j.reporting_contact_id
+    `;
+
+    // Per-bucket CASE expressions mirror jobService.list ticketFlag SQL
+    // exactly — keep them in sync if you tweak one.
+    const [[row]] = await pool.query(
+      `SELECT
+         SUM(CASE WHEN j.job_status = 9
+                   AND j.approved_by_client = 0
+                   AND (j.call_later IS NULL OR j.call_later != 1)
+                   AND ccs.manager_id IS NOT NULL
+                   AND ccs.manager_id NOT IN ('', 'null')
+                   AND ccs.approval_by_client = 1
+                  THEN 1 ELSE 0 END) AS unauthorized,
+         SUM(CASE WHEN j.job_status = 9
+                   AND (j.approved_by_client != 0 OR j.approved_by_client IS NULL)
+                   AND (j.call_later IS NULL OR j.call_later != 1)
+                  THEN 1 ELSE 0 END) AS authorized,
+         SUM(CASE WHEN j.call_later = 1 THEN 1 ELSE 0 END) AS noResponse
+       ${joins}
+       WHERE ${w}`,
+      params
+    );
+    modernOk(res, {
+      unauthorized: Number(row.unauthorized || 0),
+      authorized:   Number(row.authorized   || 0),
+      noResponse:   Number(row.noResponse   || 0),
+    });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/client/orders/counts — tab counts for the My Order History page.
+ *
+ * Legacy parity: subscribes to bucketCountState$ on the Angular
+ * OrderHistoryComponent (ngOnInit lines 157-163) populating
+ * otherOrdersCount + completedForBillingOrdersCount.
+ *
+ * Returns:
+ *   { otherOrders: N, completedOrders: M }
+ *
+ * Filter contract identical to /jobs so badges stay in sync with the
+ * table. completedOrders is auto-scoped to the SPOC's team (matches
+ * legacy ClientController.java:101 + /jobs route).
+ */
+router.get('/orders/counts', async (req, res, next) => {
+  try {
+    // Lookup SPOC's direct reports once — used only for the
+    // completedOrders scope (otherOrders is whole-client per legacy).
+    const [reports] = await pool.query(
+      `SELECT id FROM tbl_client_contacts
+        WHERE client_id = ?
+          AND manager_id IS NOT NULL AND manager_id NOT IN ('', 'null')
+          AND CAST(manager_id AS UNSIGNED) = ?`,
+      [req.spoc.client_id, req.spoc.id]
+    );
+    const teamIds = reports.map((r) => r.id);
+    teamIds.push(req.spoc.id);
+    const teamPh = teamIds.map(() => '?').join(',');
+
+    // Shared filter clauses applied to both counts.
+    const sharedWhere = ['j.fk_client_id = ?'];
+    const sharedParams = [req.spoc.client_id];
+
+    const toIdArr = (v) => String(v).split(',')
+      .map((s) => Number(s.trim())).filter((n) => !Number.isNaN(n));
+    if (req.query.cityIds) {
+      const arr = toIdArr(req.query.cityIds);
+      if (arr.length) { sharedWhere.push(`ad.city_id IN (${arr.map(() => '?').join(',')})`); sharedParams.push(...arr); }
+    }
+    if (req.query.ownerIds) {
+      const arr = toIdArr(req.query.ownerIds);
+      if (arr.length) { sharedWhere.push(`j.job_owner IN (${arr.map(() => '?').join(',')})`); sharedParams.push(...arr); }
+    }
+    if (req.query.startDate) { sharedWhere.push('j.created_date_time >= ?'); sharedParams.push(req.query.startDate); }
+    if (req.query.endDate)   { sharedWhere.push('j.created_date_time <= ?'); sharedParams.push(req.query.endDate); }
+    if (req.query.q) {
+      sharedWhere.push('(j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ?)');
+      const v = `%${req.query.q}%`;
+      sharedParams.push(v, v, v, v);
+    }
+
+    const w = sharedWhere.join(' AND ');
+    const needsCu = /\bcu\./.test(w);
+    const needsAd = /\bad\./.test(w);
+    const joins = `
+      FROM tbl_job j
+      ${needsCu ? 'LEFT JOIN tbl_customer cu ON cu.customer_id = j.fk_customer_id' : ''}
+      ${needsAd ? 'LEFT JOIN tbl_address  ad ON ad.address_id  = j.fk_address_id' : ''}
+    `;
+
+    // Two parallel COUNTs — kept separate (rather than SUM(CASE)) because
+    // otherOrders is whole-client while completedOrders is team-scoped,
+    // so the WHERE shapes diverge.
+    const [[[other]], [[completed]]] = await Promise.all([
+      pool.query(`SELECT COUNT(*) AS n ${joins} WHERE ${w}`, sharedParams),
+      pool.query(
+        `SELECT COUNT(*) AS n ${joins}
+          WHERE ${w}
+            AND j.ready_for_billing = 'Yes'
+            AND j.sub_job_id IS NULL
+            AND j.reporting_contact_id IN (${teamPh})`,
+        [...sharedParams, ...teamIds]
+      ),
+    ]);
+
+    modernOk(res, {
+      otherOrders:     Number(other.n     || 0),
+      completedOrders: Number(completed.n || 0),
+    });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/client/appointments/counts — tab counts for the Committed
+ * Appointments page.
+ *
+ * Legacy parity: UpcomingAppointmentsComponent.ngOnInit subscribes to
+ * bucketCountState$ for unAllocatedJobsCount + allocatedJobsCount +
+ * ongoingOrders (status [0, 1]).
+ *
+ * Three tabs scoped to SPOC's team:
+ *   txUnallocated  — status=0, fk_easyfixter_id IS NULL
+ *   txAllocated    — status=0, fk_easyfixter_id IS NOT NULL
+ *   ongoingOrders  — status=1
+ */
+router.get('/appointments/counts', async (req, res, next) => {
+  try {
+    const [reports] = await pool.query(
+      `SELECT id FROM tbl_client_contacts
+        WHERE client_id = ?
+          AND manager_id IS NOT NULL AND manager_id NOT IN ('', 'null')
+          AND CAST(manager_id AS UNSIGNED) = ?`,
+      [req.spoc.client_id, req.spoc.id]
+    );
+    const teamIds = reports.map((r) => r.id);
+    teamIds.push(req.spoc.id);
+    const teamPh = teamIds.map(() => '?').join(',');
+
+    const where = ['j.fk_client_id = ?'];
+    const params = [req.spoc.client_id];
+
+    const toIdArr = (v) => String(v).split(',')
+      .map((s) => Number(s.trim())).filter((n) => !Number.isNaN(n));
+    if (req.query.cityIds) {
+      const arr = toIdArr(req.query.cityIds);
+      if (arr.length) { where.push(`ad.city_id IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
+    }
+    if (req.query.ownerIds) {
+      const arr = toIdArr(req.query.ownerIds);
+      if (arr.length) { where.push(`j.job_owner IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
+    }
+    if (req.query.startDate) { where.push('j.created_date_time >= ?'); params.push(req.query.startDate); }
+    if (req.query.endDate)   { where.push('j.created_date_time <= ?'); params.push(req.query.endDate); }
+    if (req.query.q) {
+      where.push('(j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ?)');
+      const v = `%${req.query.q}%`;
+      params.push(v, v, v, v);
+    }
+
+    const w = where.join(' AND ');
+    const needsCu = /\bcu\./.test(w);
+    const needsAd = /\bad\./.test(w);
+    const joins = `
+      FROM tbl_job j
+      ${needsCu ? 'LEFT JOIN tbl_customer cu ON cu.customer_id = j.fk_customer_id' : ''}
+      ${needsAd ? 'LEFT JOIN tbl_address  ad ON ad.address_id  = j.fk_address_id' : ''}
+    `;
+
+    // Bind order: SQL placeholders are consumed in textual order.
+    // The three SELECT CASE expressions come BEFORE the WHERE clause
+    // in the text, so their teamIds must be bound first, then the
+    // shared WHERE params.
+    const [[row]] = await pool.query(
+      `SELECT
+         SUM(CASE WHEN j.job_status = 0 AND j.fk_easyfixter_id IS NULL
+                   AND j.reporting_contact_id IN (${teamPh})
+                  THEN 1 ELSE 0 END) AS txUnallocated,
+         SUM(CASE WHEN j.job_status = 0 AND j.fk_easyfixter_id IS NOT NULL
+                   AND j.reporting_contact_id IN (${teamPh})
+                  THEN 1 ELSE 0 END) AS txAllocated,
+         SUM(CASE WHEN j.job_status = 1
+                   AND j.reporting_contact_id IN (${teamPh})
+                  THEN 1 ELSE 0 END) AS ongoingOrders
+       ${joins}
+       WHERE ${w}`,
+      [...teamIds, ...teamIds, ...teamIds, ...params]
+    );
+    modernOk(res, {
+      txUnallocated: Number(row.txUnallocated || 0),
+      txAllocated:   Number(row.txAllocated   || 0),
+      ongoingOrders: Number(row.ongoingOrders || 0),
+    });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/client/under-audit/counts — tab counts for the Under Audit page.
+ *
+ * Legacy parity: UnderAuditComponent.ngOnInit subscribes to
+ * bucketCountState$ for revisitJobsCount + txCompletedOnAppJobsCount.
+ *
+ * Two tabs scoped to SPOC's team:
+ *   revisit         — status IN (3, 5), sub_job_id NOT NULL,
+ *                     ready_for_billing = 'No'    (the "visit done" flag)
+ *   completedOnApp  — status = 10
+ */
+router.get('/under-audit/counts', async (req, res, next) => {
+  try {
+    const [reports] = await pool.query(
+      `SELECT id FROM tbl_client_contacts
+        WHERE client_id = ?
+          AND manager_id IS NOT NULL AND manager_id NOT IN ('', 'null')
+          AND CAST(manager_id AS UNSIGNED) = ?`,
+      [req.spoc.client_id, req.spoc.id]
+    );
+    const teamIds = reports.map((r) => r.id);
+    teamIds.push(req.spoc.id);
+    const teamPh = teamIds.map(() => '?').join(',');
+
+    const where = ['j.fk_client_id = ?'];
+    const params = [req.spoc.client_id];
+
+    const toIdArr = (v) => String(v).split(',')
+      .map((s) => Number(s.trim())).filter((n) => !Number.isNaN(n));
+    if (req.query.cityIds) {
+      const arr = toIdArr(req.query.cityIds);
+      if (arr.length) { where.push(`ad.city_id IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
+    }
+    if (req.query.ownerIds) {
+      const arr = toIdArr(req.query.ownerIds);
+      if (arr.length) { where.push(`j.job_owner IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
+    }
+    if (req.query.startDate) { where.push('j.created_date_time >= ?'); params.push(req.query.startDate); }
+    if (req.query.endDate)   { where.push('j.created_date_time <= ?'); params.push(req.query.endDate); }
+    if (req.query.q) {
+      where.push('(j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ?)');
+      const v = `%${req.query.q}%`;
+      params.push(v, v, v, v);
+    }
+
+    const w = where.join(' AND ');
+    const needsCu = /\bcu\./.test(w);
+    const needsAd = /\bad\./.test(w);
+    const joins = `
+      FROM tbl_job j
+      ${needsCu ? 'LEFT JOIN tbl_customer cu ON cu.customer_id = j.fk_customer_id' : ''}
+      ${needsAd ? 'LEFT JOIN tbl_address  ad ON ad.address_id  = j.fk_address_id' : ''}
+    `;
+
+    // Bind order: SELECT CASE placeholders fill before WHERE.
+    const [[row]] = await pool.query(
+      `SELECT
+         SUM(CASE WHEN j.job_status IN (3, 5)
+                   AND j.sub_job_id IS NOT NULL
+                   AND j.ready_for_billing = 'No'
+                   AND j.reporting_contact_id IN (${teamPh})
+                  THEN 1 ELSE 0 END) AS revisit,
+         SUM(CASE WHEN j.job_status = 10
+                   AND j.reporting_contact_id IN (${teamPh})
+                  THEN 1 ELSE 0 END) AS completedOnApp
+       ${joins}
+       WHERE ${w}`,
+      [...teamIds, ...teamIds, ...params]
+    );
+    modernOk(res, {
+      revisit:        Number(row.revisit        || 0),
+      completedOnApp: Number(row.completedOnApp || 0),
+    });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/client/client-delay/counts — tab counts for the Client Delay page.
+ *
+ * Legacy parity: MyApprovalsComponent.ngOnInit subscribes to
+ * bucketCountState$ for estimateJobsCount + fulfillmentJobCount +
+ * unAuthorisedJobsCount (status [15, 21, 9]).
+ *
+ * Filters: same shape as /jobs (date / city / team / search) so the
+ * badges reflect what the user will see when they click a tab.
+ *
+ * Scoping: all three tabs use "my team's tickets" scope.
+ */
+router.get('/client-delay/counts', async (req, res, next) => {
+  try {
+    // SPOC's team ids (self + direct reports)
+    const [reports] = await pool.query(
+      `SELECT id FROM tbl_client_contacts
+        WHERE client_id = ?
+          AND manager_id IS NOT NULL AND manager_id NOT IN ('', 'null')
+          AND CAST(manager_id AS UNSIGNED) = ?`,
+      [req.spoc.client_id, req.spoc.id]
+    );
+    const teamIds = reports.map((r) => r.id);
+    teamIds.push(req.spoc.id);
+    const teamPh = teamIds.map(() => '?').join(',');
+
+    const where = ['j.fk_client_id = ?'];
+    const params = [req.spoc.client_id];
+
+    const toIdArr = (v) => String(v).split(',')
+      .map((s) => Number(s.trim())).filter((n) => !Number.isNaN(n));
+    if (req.query.cityIds) {
+      const arr = toIdArr(req.query.cityIds);
+      if (arr.length) { where.push(`ad.city_id IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
+    }
+    if (req.query.ownerIds) {
+      const arr = toIdArr(req.query.ownerIds);
+      if (arr.length) { where.push(`j.job_owner IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
+    }
+    if (req.query.startDate) { where.push('j.created_date_time >= ?'); params.push(req.query.startDate); }
+    if (req.query.endDate)   { where.push('j.created_date_time <= ?'); params.push(req.query.endDate); }
+    if (req.query.q) {
+      where.push('(j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ?)');
+      const v = `%${req.query.q}%`;
+      params.push(v, v, v, v);
+    }
+    const w = where.join(' AND ');
+    const needsCu = /\bcu\./.test(w);
+    const needsAd = /\bad\./.test(w);
+    const joins = `
+      FROM tbl_job j
+      ${needsCu ? 'LEFT JOIN tbl_customer cu ON cu.customer_id = j.fk_customer_id' : ''}
+      ${needsAd ? 'LEFT JOIN tbl_address  ad ON ad.address_id  = j.fk_address_id' : ''}
+      LEFT JOIN tbl_client_contacts ccs ON ccs.id = j.reporting_contact_id
+    `;
+
+    const [[row]] = await pool.query(
+      `SELECT
+         SUM(CASE WHEN j.job_status = 15 AND j.reporting_contact_id IN (${teamPh})
+                  THEN 1 ELSE 0 END) AS approveEstimate,
+         SUM(CASE WHEN j.job_status = 21 AND j.reporting_contact_id IN (${teamPh})
+                  THEN 1 ELSE 0 END) AS fulfilmentOnHold,
+         SUM(CASE WHEN j.job_status = 9
+                   AND j.approved_by_client = 0
+                   AND (j.call_later IS NULL OR j.call_later != 1)
+                   AND ccs.manager_id IS NOT NULL
+                   AND ccs.manager_id NOT IN ('', 'null')
+                   AND ccs.approval_by_client = 1
+                   AND j.reporting_contact_id IN (${teamPh})
+                  THEN 1 ELSE 0 END) AS unauthorized
+       ${joins}
+       WHERE ${w}`,
+      // teamIds first — placeholders in SELECT CASE come before WHERE.
+      [...teamIds, ...teamIds, ...teamIds, ...params]
+    );
+    modernOk(res, {
+      approveEstimate:  Number(row.approveEstimate  || 0),
+      fulfilmentOnHold: Number(row.fulfilmentOnHold || 0),
+      unauthorized:     Number(row.unauthorized     || 0),
+    });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/client/ratecard — rate-card lines for the SPOC's client.
+ *
+ * Legacy parity: Angular RateCardComponent + RatecardServiceService
+ * (which buggy-called /clients/{id} instead of a rate-card endpoint —
+ * we expose a proper one here so the SPOC can actually see their card).
+ *
+ * Each row in tbl_client_service can have multiple service_type_ids
+ * (stored as CSV). Legacy displayed ONE row per service-type, so we
+ * expand the CSV here and emit one row per (service, service-type).
+ *
+ * Columns returned (matches legacy MyRatingCols headers):
+ *   service_category_name | service_type_name | rate_card_name | total_amount
+ *
+ * Soft-deleted rows (service_status = 0) are excluded — same rule as
+ * the admin listForClient query.
+ */
+router.get('/ratecard', async (req, res, next) => {
+  try {
+    // One row per client_service (each carries a single service_type_id —
+    // verified against the live schema). All four joins are LEFT so any
+    // missing dimension still surfaces the row with NULL — keeps the FE
+    // contract stable even on partial setup.
+    const [rows] = await pool.query(
+      `SELECT cs.client_service_id,
+              cs.total_amount,
+              cs.charge_type,
+              sc.service_catg_name  AS service_category_name,
+              st.service_type_name,
+              crc.crc_ratecard_name AS rate_card_name
+         FROM tbl_client_service cs
+         LEFT JOIN tbl_service_catg     sc  ON sc.service_catg_id  = cs.service_catg_id
+         LEFT JOIN tbl_service_type     st  ON st.service_type_id  = cs.service_type_id
+         LEFT JOIN tbl_client_rate_card crc ON crc.crc_id          = cs.rate_card_id
+        WHERE cs.client_id = ?
+          AND (cs.service_status IS NULL OR cs.service_status <> 0)
+        ORDER BY sc.service_catg_name, st.service_type_name, cs.client_service_id`,
+      [req.spoc.client_id]
+    );
+    modernOk(res, { items: rows });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/client/technicians — easyfixers mapped to the SPOC's client.
+ *
+ * Mapped via tbl_client_easyfixer_mapping (one row per (client, easyfixer,
+ * service_type)). A single tech can carry many service types per client,
+ * so we DISTINCT on efr_id and GROUP_CONCAT service-type names into a
+ * single comma-separated column the FE shows as chips.
+ *
+ * Per-row payload:
+ *   id, name, mobile, email, city, status, skill_rating, tool_rating,
+ *   service_types (CSV string), avg_rating (NULL if never rated),
+ *   total_jobs (count for this client only).
+ *
+ * Query params:
+ *   status     — "true" (active only — default), "false" (inactive),
+ *                "all" (everyone). Matches the legacy ?status= contract.
+ *   cityIds    — CSV, narrows by efr city.
+ *   q          — substring search across name / mobile / email.
+ *   limit/offset — pagination (default 50, capped at 500).
+ */
+router.get('/technicians', async (req, res, next) => {
+  try {
+    const statusParam = String(req.query.status || 'true').toLowerCase();
+    const where = ['m.client_id = ?', 'm.mapping_status = 1'];
+    const params = [req.spoc.client_id];
+
+    if (statusParam === 'true')       { where.push('e.efr_status = 1'); }
+    else if (statusParam === 'false') { where.push('(e.efr_status = 0 OR e.efr_status IS NULL)'); }
+    // 'all' → no status clause
+
+    if (req.query.cityIds) {
+      const arr = String(req.query.cityIds).split(',')
+        .map((s) => Number(s.trim())).filter((n) => !Number.isNaN(n));
+      if (arr.length) {
+        where.push(`e.efr_cityId IN (${arr.map(() => '?').join(',')})`);
+        params.push(...arr);
+      }
+    }
+    if (req.query.q) {
+      where.push('(e.efr_name LIKE ? OR e.efr_no LIKE ? OR e.efr_email LIKE ?)');
+      const v = `%${req.query.q}%`;
+      params.push(v, v, v);
+    }
+
+    const limit  = Math.min(Number(req.query.limit) || 50, 500);
+    const offset = Number(req.query.offset) || 0;
+
+    // Total distinct count for pagination
+    const [[{ total }]] = await pool.query(
+      `SELECT COUNT(DISTINCT e.efr_id) AS total
+         FROM tbl_client_easyfixer_mapping m
+         JOIN tbl_easyfixer e ON e.efr_id = m.easyfixer_id
+         LEFT JOIN tbl_city ci ON ci.city_id = e.efr_cityId
+        WHERE ${where.join(' AND ')}`,
+      params
+    );
+
+    // List query — GROUP BY collapses duplicate mapping rows per efr.
+    // service_types pulled via GROUP_CONCAT(DISTINCT) over the joined
+    // tbl_service_type — distinct so a tech mapped to the same service
+    // multiple times shows it once.
+    // avg_rating + total_jobs are correlated subqueries scoped to THIS
+    // client only (legacy parity: client should see ratings on its own
+    // jobs, not a global average).
+    const [rows] = await pool.query(
+      `SELECT e.efr_id AS id,
+              e.efr_name AS name,
+              e.efr_no AS mobile,
+              e.efr_email AS email,
+              e.efr_status AS status,
+              e.skill_rating,
+              e.tool_rating,
+              ci.city_name AS city,
+              GROUP_CONCAT(DISTINCT st.service_type_name ORDER BY st.service_type_name SEPARATOR ',') AS service_types,
+              (SELECT ROUND(AVG(r.customer_rating), 1)
+                 FROM tbl_easyfixer_rating_by_customer r
+                 JOIN tbl_job j2 ON j2.job_id = r.job_id
+                WHERE r.easyfixer_id = e.efr_id
+                  AND j2.fk_client_id = ?
+                  AND r.customer_rating IS NOT NULL
+                  AND r.customer_rating > 0
+              ) AS avg_rating,
+              (SELECT COUNT(*) FROM tbl_job j3
+                WHERE j3.fk_easyfixter_id = e.efr_id AND j3.fk_client_id = ?
+              ) AS total_jobs
+         FROM tbl_client_easyfixer_mapping m
+         JOIN tbl_easyfixer e   ON e.efr_id = m.easyfixer_id
+         LEFT JOIN tbl_city ci  ON ci.city_id = e.efr_cityId
+         LEFT JOIN tbl_service_type st ON st.service_type_id = m.service_type_id
+        WHERE ${where.join(' AND ')}
+        GROUP BY e.efr_id
+        ORDER BY e.efr_name ASC
+        LIMIT ? OFFSET ?`,
+      [req.spoc.client_id, req.spoc.client_id, ...params, limit, offset]
+    );
+
+    modernOk(res, { items: rows, total });
+  } catch (e) { next(e); }
+});
+
+// ─── Filter lookups ──────────────────────────────────────────────────
+/*
+ * GET /api/client/lookup/cities
+ *
+ * Two modes:
+ *   default      — cities the SPOC's client has actually raised jobs in
+ *                  (typically a handful; keeps filter dropdowns tight)
+ *   ?scope=all   — every active city in tbl_city (~472 rows). Used by
+ *                  the New Order form where the SPOC may book in a
+ *                  city the client hasn't operated in before.
+ */
+router.get('/lookup/cities', async (req, res, next) => {
+  try {
+    const scope = String(req.query.scope || '').toLowerCase();
+    if (scope === 'all') {
+      const [rows] = await pool.query(
+        `SELECT city_id AS id, city_name AS name
+           FROM tbl_city
+          WHERE city_status = 1
+          ORDER BY city_name ASC`
+      );
+      return modernOk(res, { items: rows });
+    }
+    const [rows] = await pool.query(
+      `SELECT DISTINCT ci.city_id AS id, ci.city_name AS name
+         FROM tbl_job j
+         LEFT JOIN tbl_address ad ON ad.address_id = j.fk_address_id
+         LEFT JOIN tbl_city    ci ON ci.city_id    = ad.city_id
+        WHERE j.fk_client_id = ? AND ci.city_id IS NOT NULL
+        ORDER BY ci.city_name ASC`,
+      [req.spoc.client_id]
+    );
+    modernOk(res, { items: rows });
+  } catch (e) { next(e); }
+});
+
+// Client team members eligible to own jobs — used by the "Client Team"
+// multi-select. Reuses tbl_client_contacts (the same table our SPOC
+// auth lives in) so the IDs returned here are job_owner-compatible.
+router.get('/team/members', async (req, res, next) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, contact_name AS name, contact_email AS email
+         FROM tbl_client_contacts
+        WHERE client_id = ? AND status = 1
+        ORDER BY contact_name ASC`,
+      [req.spoc.client_id]
+    );
+    modernOk(res, { items: rows });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/client/team — full SPOC team for the My Team page.
+ *
+ * Migrated from legacy ACD_APIs
+ *   GET /api/clients/{clientId}/contacts/managers?status=<bool>
+ * (TechniciansServiceService.getTechnicianData on the Angular dashboard).
+ *
+ * Returns every contact for the SPOC's client with the fields the page
+ * renders. The manager_id column in MySQL is `varchar(255)` and can
+ * legitimately be:
+ *    "1639" — numeric id of the manager contact
+ *    "null" — the literal four-letter string (legacy data quirk)
+ *    ""     — empty string
+ *    NULL   — actual SQL null
+ * All four cases are normalised to JS `null` so the frontend can build
+ * the hierarchy with a single `manager_id == null → root` check.
+ *
+ * Query params:
+ *   status   — "true" (active only, default), "false" (inactive only),
+ *              "all" (everyone). Mirrors the legacy contract.
+ */
+router.get('/team', async (req, res, next) => {
+  try {
+    const statusParam = String(req.query.status || 'true').toLowerCase();
+    const clauses = ['client_id = ?'];
+    const params = [req.spoc.client_id];
+    if (statusParam === 'true')       { clauses.push('status = 1'); }
+    else if (statusParam === 'false') { clauses.push('(status = 0 OR status IS NULL)'); }
+    // 'all' → no status clause
+
+    const [rows] = await pool.query(
+      `SELECT id,
+              contact_name  AS name,
+              contact_email AS email,
+              contact_no    AS mobile,
+              contact_desgn AS designation,
+              manager_id,
+              status,
+              approval_by_client
+         FROM tbl_client_contacts
+        WHERE ${clauses.join(' AND ')}
+        ORDER BY contact_name ASC`,
+      params
+    );
+
+    // Normalise manager_id ("null"/""/NULL → null; numeric strings → Number).
+    const items = rows.map((r) => {
+      const raw = r.manager_id;
+      let mid = null;
+      if (raw != null && raw !== '' && String(raw).toLowerCase() !== 'null') {
+        const n = Number(raw);
+        if (!Number.isNaN(n)) mid = n;
+      }
+      return {
+        id: r.id,
+        name: r.name,
+        email: r.email,
+        mobile: r.mobile,
+        designation: r.designation,
+        managerId: mid,
+        status: r.status,                      // 1 / 0 / null
+        approvalByClient: r.approval_by_client,// 0 / 1 / 2 / null
+      };
+    });
+
+    modernOk(res, { items });
   } catch (e) { next(e); }
 });
 
@@ -137,12 +959,110 @@ router.get('/jobs/:id', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+/*
+ * GET /api/client/jobs/:id/images/:imageId — stream a job image to the
+ * browser. Scoped to SPOC's client_id (other clients' images 404 even
+ * when the imageId is known).
+ *
+ * Resolution mirrors the admin route (routes/admin/jobs.js:1831):
+ *   1. S3 (if enabled) — 302 to a presigned URL
+ *   2. Local file under UPLOAD_JOB_FILES — res.sendFile
+ *   3. FILE_BASE_URL absolute — 302 to Nginx-served path
+ *   4. 404
+ *
+ * Powers the Jobsheet button + the gallery thumbnails on the detail page.
+ */
+router.get('/jobs/:id/images/:imageId', async (req, res, next) => {
+  try {
+    const jobId   = Number(req.params.id);
+    const imageId = Number(req.params.imageId);
+    if (!Number.isInteger(jobId) || !Number.isInteger(imageId)) {
+      return modernError(res, 400, 'invalid id');
+    }
+
+    // Scope: image must belong to a job in this SPOC's client.
+    const [[row]] = await pool.query(
+      `SELECT i.image_id, i.job_id, i.image
+         FROM tbl_job_image i
+         JOIN tbl_job j ON j.job_id = i.job_id
+        WHERE i.image_id = ? AND i.job_id = ? AND j.fk_client_id = ?
+        LIMIT 1`,
+      [imageId, jobId, req.spoc.client_id]
+    );
+    if (!row || !row.image) return modernError(res, 404, 'image not found');
+
+    const stored = String(row.image).trim();
+    const path = require('path');
+    const fs = require('fs');
+
+    // (1) S3 — presigned URL redirect
+    try {
+      const s3Storage = require('../../utils/s3-storage');
+      if (s3Storage.isEnabled && s3Storage.isEnabled()) {
+        const candidates = [stored];
+        if (!stored.startsWith('Job_Images/') && !stored.startsWith('JobSupportings/')) {
+          candidates.push(`JobSupportings/${path.basename(stored)}`);
+          candidates.push(`Job_Images/${path.basename(stored)}`);
+        }
+        for (const key of candidates) {
+          try {
+            if (await s3Storage.exists(key)) {
+              const url = await s3Storage.getPresignedUrl(key);
+              return res.redirect(url);
+            }
+          } catch { /* fall through to local */ }
+        }
+      }
+    } catch { /* s3 module not available — fall through */ }
+
+    // (2) Local file
+    const rootCandidates = [
+      process.env.UPLOAD_JOB_FILES,
+      process.env.UPLOAD_ROOT_PATH,
+      './uploads/upload_jobs',
+      './uploads',
+    ].filter(Boolean);
+    const relForms = [stored, path.basename(stored)];
+    for (const root of rootCandidates) {
+      const absRoot = path.resolve(root);
+      for (const rel of relForms) {
+        const candidate = path.resolve(absRoot, rel.replace(/^\/+/, ''));
+        if (!candidate.startsWith(absRoot + path.sep) && candidate !== absRoot) continue;
+        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+          return res.sendFile(candidate);
+        }
+      }
+    }
+
+    // (3) Absolute FILE_BASE_URL — Nginx fallback
+    const fileBase = process.env.FILE_BASE_URL || '';
+    if (/^https?:\/\//i.test(fileBase)) {
+      const url = stored.includes('/')
+        ? `${fileBase.replace(/\/+$/, '')}/${stored.replace(/^\/+/, '')}`
+        : `${fileBase.replace(/\/+$/, '')}/upload_jobs/${stored}`;
+      return res.redirect(url);
+    }
+
+    return modernError(res, 404, 'image file not found on disk');
+  } catch (e) { next(e); }
+});
+
 // Approve / reject / escalate
+//
+// Sets `approved_by_client = 1` alongside the contact + timestamp. The
+// flag is what the legacy "unauthorized" filter (My-New-Tickets page)
+// checks — without it, an authorized ticket would still appear on the
+// Un-Authorized tab after approval. See JobFilterServiceImpl.java:192.
 router.patch('/jobs/:id/approve', async (req, res, next) => {
   try {
     const job = await jobService.getById(Number(req.params.id));
     if (!job || job.fk_client_id !== req.spoc.client_id) return modernError(res, 404, 'job not found');
-    await pool.query('UPDATE tbl_job SET approved_by_client_contact = ?, approved_on_date_time = NOW() WHERE job_id = ?',
+    await pool.query(
+      `UPDATE tbl_job
+          SET approved_by_client = 1,
+              approved_by_client_contact = ?,
+              approved_on_date_time = NOW()
+        WHERE job_id = ?`,
       [req.spoc.id, job.job_id]);
     modernOk(res, await jobService.getById(job.job_id), 'approved');
   } catch (e) { next(e); }
@@ -223,10 +1143,162 @@ async function fireRejectEscalation(job, reason, spoc) {
   return emailService.send({ to, subject, text, category: 'client.reject' });
 }
 
+/*
+ * GET /api/client/lookup/reasons?actionType=N
+ *
+ * Reason dropdown source — backs the SPOC-side escalate / cancel /
+ * estimate-reject popups on the Job Detail page.
+ *
+ * Legacy ACD config (Angular `app.config.ts`):
+ *   actionType: 1   → Cancel reasons        (jobRejectedByClient)
+ *   actionType: 23  → Escalate reasons      (jobEscalatedByClient)
+ *   estimateActionType: ?  → Estimate reject
+ *
+ * userType is fixed to 3 (EasyFix vocabulary) since the SPOC-side legacy
+ * code hardcoded that value; passing a `userType` query is allowed for
+ * future flexibility but defaults to 3 for back-compat.
+ */
+router.get('/lookup/reasons', async (req, res, next) => {
+  try {
+    const actionType = Number(req.query.actionType);
+    if (!Number.isInteger(actionType) || actionType <= 0) {
+      return modernError(res, 400, 'actionType (positive integer) is required');
+    }
+    const userType = Number(req.query.userType) || 3;
+    const [rows] = await pool.query(
+      `SELECT id, action_desc
+         FROM action_taken_reason
+        WHERE action_type = ? AND user_type = ?
+          AND (status IS NULL OR status = 1)
+        ORDER BY id ASC`,
+      [actionType, userType]
+    );
+    const items = rows
+      .map((r) => ({ id: r.id, label: String(r.action_desc || '').trim() }))
+      .filter((x) => x.label);
+    modernOk(res, items);
+  } catch (e) { next(e); }
+});
+
+/*
+ * POST /api/client/jobs/:id/escalate
+ * body: { reasonId: number, comment: string }
+ *
+ * SPOC-driven escalation — replicates the legacy
+ *   PATCH /api/jobs/job/{id}/reject?flag=escalated
+ * but writes to the canonical escalation table
+ * (`tbl_easyfixer_rating_by_customer`) instead of overloading the
+ * job-reject flow. One row per job; subsequent escalations bump
+ * `no_of_escalations` and re-open the row by clearing `resolved_time`.
+ *
+ * Notification: ops mailbox + owner are emailed via the existing
+ * fireRejectEscalation helper so admins see the row immediately on the
+ * Escalated Jobs dashboard.
+ */
+router.post('/jobs/:id/escalate', validate(Joi.object({
+  reasonId: Joi.number().integer().positive().required(),
+  comment:  Joi.string().min(3).max(2000).required(),
+})), async (req, res, next) => {
+  try {
+    const job = await jobService.getById(Number(req.params.id));
+    if (!job || job.fk_client_id !== req.spoc.client_id) {
+      return modernError(res, 404, 'job not found');
+    }
+    const { reasonId, comment } = req.body;
+
+    // Resolve the human-readable reason once so the email is informative.
+    const [[reasonRow]] = await pool.query(
+      'SELECT action_desc FROM action_taken_reason WHERE id = ? LIMIT 1',
+      [reasonId]);
+    const reasonLabel = reasonRow?.action_desc || `Reason #${reasonId}`;
+
+    // Upsert escalation row — there's no unique constraint on (job_id),
+    // so we manually SELECT then UPDATE/INSERT. SPOC isn't a real
+    // tbl_user, so `escalated_by` is NULL and we tag `escalated_from`
+    // with the SPOC id for audit (legacy used the SPOC's user_id on the
+    // contact record, which most rows don't have).
+    const [[existing]] = await pool.query(
+      `SELECT table_id, no_of_escalations
+         FROM tbl_easyfixer_rating_by_customer
+        WHERE job_id = ?
+        LIMIT 1`,
+      [job.job_id]);
+    if (existing) {
+      await pool.query(
+        `UPDATE tbl_easyfixer_rating_by_customer
+            SET is_escalated      = 1,
+                escalated_time    = NOW(),
+                resolved_time     = NULL,
+                escalated_comments = ?,
+                no_of_escalations = COALESCE(no_of_escalations, 0) + 1,
+                escalated_from    = ?
+          WHERE table_id = ?`,
+        [`[${reasonLabel}] ${comment}`, `spoc:${req.spoc.id}`, existing.table_id]);
+    } else {
+      await pool.query(
+        `INSERT INTO tbl_easyfixer_rating_by_customer
+           (job_id, easyfixer_id, is_escalated, escalated_time,
+            escalated_comments, no_of_escalations, escalated_from)
+         VALUES (?, ?, 1, NOW(), ?, 1, ?)`,
+        [job.job_id, job.fk_easyfixter_id || null,
+         `[${reasonLabel}] ${comment}`, `spoc:${req.spoc.id}`]);
+    }
+
+    // Per-stage history row — mirrors what admin "Escalated Jobs"
+    // page reads via the GROUP_CONCAT(job_stage_history) subquery.
+    try {
+      await pool.query(
+        `INSERT INTO tbl_job_escalation_info
+           (job_id, escalation_time, job_stage)
+         VALUES (?, NOW(), ?)`,
+        [job.job_id, STATUS_LABELS_SAFE[job.job_status] || `Status ${job.job_status}`]);
+    } catch {
+      // History table is best-effort — don't fail the user's action if
+      // the table is missing on this environment.
+    }
+
+    // Same email shape as estimate reject, just relabelled. Best-effort.
+    fireRejectEscalation(job, `[Escalated by SPOC] ${reasonLabel}: ${comment}`, req.spoc).catch(() => {});
+
+    modernOk(res, { escalated: true }, 'Job Escalate Successfull');
+  } catch (e) { next(e); }
+});
+
+// Small status→label map used by the escalation history insert. Kept
+// local + lowercase-safe to avoid pulling the FE STATUS_LABELS over.
+const STATUS_LABELS_SAFE = {
+  0: 'Unconfirmed', 1: 'Scheduled', 2: 'In-Progress', 3: 'Completed',
+  5: 'Completed', 6: 'Cancelled', 7: 'Enquiry', 9: 'Call Later',
+  10: 'Revisit', 15: 'Awaiting Approval', 21: 'On Hold',
+};
+
 // Create job as SPOC (reuses internal service; fk_client_id locked to SPOC's client)
 router.post('/jobs', async (req, res, next) => {
   try {
-    const created = await jobService.create({ ...req.body, fk_client_id: req.spoc.client_id }, { user_id: null });
+    // Pull the SPOC's full row so we can stamp client_spoc_* / mobile
+    // / reporting_contact_id on the new job WITHOUT trusting the
+    // frontend to send them. These columns identify "which client
+    // contact raised this order" and must come from the verified JWT,
+    // not from a posted body that could spoof another SPOC.
+    const [[me]] = await pool.query(
+      `SELECT id, contact_name, contact_email, contact_no
+         FROM tbl_client_contacts WHERE id = ? LIMIT 1`,
+      [req.spoc.id]
+    );
+
+    const enriched = {
+      ...req.body,
+      fk_client_id: req.spoc.client_id,
+      // Server-trusted SPOC stamping. FE-provided values are ignored
+      // — overwriting unconditionally is correct here because these
+      // identify the AUTHOR of the booking, not the customer.
+      client_spoc:        me?.contact_no    || req.body.client_spoc       || null,
+      client_spoc_name:   me?.contact_name  || req.body.client_spoc_name  || null,
+      client_spoc_email:  me?.contact_email || req.body.client_spoc_email || null,
+      reporting_contact_id: req.spoc.id,
+    };
+
+    const created = await jobService.create(enriched, { user_id: null });
     res.status(201);
     modernOk(res, created, 'job created');
   } catch (e) {
@@ -235,26 +1307,99 @@ router.post('/jobs', async (req, res, next) => {
   }
 });
 
+/*
+ * GET /api/client/profile — SPOC's own profile.
+ *
+ * Returns every field the redesigned profile UI surfaces. manager_id is
+ * varchar in the DB and can carry "null" / "" literals (legacy data) —
+ * we normalise those to JS null so the frontend can treat it uniformly.
+ */
 router.get('/profile', async (req, res, next) => {
   try {
-    const [[profile]] = await pool.query(
-      'SELECT id, contact_name, contact_email, contact_no, contact_alt_no, contact_desgn, linkedIn_profile FROM tbl_client_contacts WHERE id = ?',
+    const [[row]] = await pool.query(
+      `SELECT id, contact_name, contact_email, contact_no,
+              contact_alt_no, contact_desgn, linkedIn_profile,
+              manager_id, email_cc, payment_mode, approval_by_client
+         FROM tbl_client_contacts
+        WHERE id = ?`,
       [req.spoc.id]);
-    modernOk(res, profile);
+    if (!row) return modernError(res, 404, 'profile not found');
+    const raw = row.manager_id;
+    let managerId = null;
+    if (raw != null && raw !== '' && String(raw).toLowerCase() !== 'null') {
+      const n = Number(raw);
+      if (!Number.isNaN(n)) managerId = n;
+    }
+    // Fetch parent client identity + logo so the profile hero card can
+    // show the client brand on the right side. logo_id stores the file
+    // path under FILE_BASE_URL (legacy convention); resolve it to a
+    // browser-loadable URL using the shared client-doc resolver so S3,
+    // local, and Nginx layouts all work transparently.
+    const [[client]] = await pool.query(
+      `SELECT client_id, client_name, logo_id
+         FROM tbl_client
+        WHERE client_id = ?`,
+      [req.spoc.client_id]);
+    let client_logo_url = null;
+    if (client?.logo_id) {
+      try {
+        const { resolveClientDocumentUrl } = require('../../utils/s3-storage');
+        client_logo_url = await resolveClientDocumentUrl(client.logo_id);
+      } catch { /* fall through; FE will show name fallback */ }
+    }
+    modernOk(res, {
+      id: row.id,
+      contact_name: row.contact_name,
+      contact_email: row.contact_email,
+      contact_no: row.contact_no,
+      contact_alt_no: row.contact_alt_no,
+      contact_desgn: row.contact_desgn,
+      linkedIn_profile: row.linkedIn_profile,
+      manager_id: managerId,
+      email_cc: row.email_cc,
+      payment_mode: row.payment_mode,
+      approval_by_client: row.approval_by_client,
+      // Client brand block — name always sent, logo URL only when set.
+      client_id: client?.client_id ?? req.spoc.client_id,
+      client_name: client?.client_name ?? null,
+      client_logo_url,
+    });
   } catch (e) { next(e); }
 });
 
+/*
+ * PUT /api/client/profile — partial update.
+ *
+ * Editable: contact_name, contact_alt_no, contact_desgn, linkedIn_profile,
+ *           manager_id, email_cc, payment_mode, approval_by_client.
+ * Read-only: contact_email, contact_no (separate change-request flow).
+ *
+ * COALESCE preserves existing values when a field is omitted — letting
+ * the FE send partial payloads (e.g. just the approval toggle).
+ */
 router.put('/profile', async (req, res, next) => {
   try {
-    const { contact_name, contact_alt_no, contact_desgn, linkedIn_profile } = req.body || {};
+    const {
+      contact_name, contact_alt_no, contact_desgn, linkedIn_profile,
+      manager_id, email_cc, payment_mode, approval_by_client,
+    } = req.body || {};
+    // manager_id is varchar in the DB; the FE sends a numeric id (or null
+    // to clear). Stringify so MySQL stores it as expected.
+    const mgrIdStr = manager_id == null ? null : String(manager_id);
     await pool.query(
       `UPDATE tbl_client_contacts
-          SET contact_name = COALESCE(?, contact_name),
-              contact_alt_no = COALESCE(?, contact_alt_no),
-              contact_desgn = COALESCE(?, contact_desgn),
-              linkedIn_profile = COALESCE(?, linkedIn_profile)
+          SET contact_name       = COALESCE(?, contact_name),
+              contact_alt_no     = COALESCE(?, contact_alt_no),
+              contact_desgn      = COALESCE(?, contact_desgn),
+              linkedIn_profile   = COALESCE(?, linkedIn_profile),
+              manager_id         = COALESCE(?, manager_id),
+              email_cc           = COALESCE(?, email_cc),
+              payment_mode       = COALESCE(?, payment_mode),
+              approval_by_client = COALESCE(?, approval_by_client)
         WHERE id = ?`,
-      [contact_name, contact_alt_no, contact_desgn, linkedIn_profile, req.spoc.id]);
+      [contact_name, contact_alt_no, contact_desgn, linkedIn_profile,
+       mgrIdStr, email_cc, payment_mode, approval_by_client,
+       req.spoc.id]);
     modernOk(res, { updated: true });
   } catch (e) { next(e); }
 });
@@ -274,41 +1419,80 @@ router.get('/contacts/managers', async (req, res, next) => {
 // preview). Column set mirrors what the SPOC sees in the dashboard table.
 // Status code is converted to legacy label so the spreadsheet reads
 // naturally to non-technical recipients.
+/*
+ * GET /api/client/export/jobs — OrderHistory.xlsx download.
+ *
+ * Migrated from legacy ACD_APIs `POST /api/jobs/exportToExcel/{clientId}`
+ * (JobController.java line 389). The legacy contract was POST with a
+ * JobFilterDto body; the new contract is GET with query params so the
+ * download can be triggered by a plain <a href> or fetch without a
+ * preflight. Same filter shape as the list endpoint — pass whatever
+ * the user has applied on the dashboard and the spreadsheet mirrors
+ * exactly what they see.
+ *
+ * Column shape matches the legacy 30-column OrderHistory.xlsx layout.
+ * Columns the new schema can't fill (Mode of Payment, Total Charge,
+ * Pending Reason action_desc, Bucket Status) are exported as blank so
+ * ops scripts that index by column position still line up.
+ */
 router.get('/export/jobs', async (req, res, next) => {
   try {
-    const { rows } = await jobService.list({
+    const rows = await jobService.listForExport({
       clientId: req.spoc.client_id,
       status: req.query.status != null ? Number(req.query.status) : undefined,
+      statuses: req.query.statuses || req.query.bucket || undefined,
+      cityIds:  req.query.cityIds  || req.query.city   || undefined,
+      ownerIds: req.query.ownerIds || req.query.owner  || undefined,
+      ticketFlag: req.query.ticketFlag || req.query.flag || undefined,
+      startDate: req.query.startDate || undefined,
+      endDate:   req.query.endDate   || undefined,
+      dateType:  req.query.dateType  || 'created',
       q: req.query.q,
-      startDate: req.query.startDate,
-      endDate: req.query.endDate,
       limit: 5000, // hard cap; SPOC exports rarely exceed a few hundred
     });
+    // Legacy stored job_status as a raw int; the spreadsheet showed the
+    // human label. Convert here using the shared STATUS_LABELS map.
     const data = rows.map((r) => ({
       ...r,
-      status_label: STATUS_LABELS[r.job_status] || 'Unknown',
+      job_status_label: STATUS_LABELS[r.job_status] || 'Unknown',
     }));
     const ts = new Date().toISOString().slice(0, 10);
-    sendXlsx(res, {
-      filename: `easyfix-jobs-${ts}.xlsx`,
-      sheetName: 'Jobs',
+    await sendXlsx(res, {
+      filename: `OrderHistory_${ts}.xlsx`,
+      sheetName: 'OrderHistory',
+      // Column order mirrors the legacy 30-column layout
+      // (JobServiceImpl.java#getManageJobDownloadListReportNew).
       columns: [
-        { key: 'job_id',              header: 'Job ID',          width: 10 },
-        { key: 'job_reference_id',    header: 'Reference',       width: 16 },
-        { key: 'client_ref_id',       header: 'Client Ref',      width: 16 },
-        { key: 'status_label',        header: 'Status',          width: 14 },
-        { key: 'job_type',            header: 'Type',            width: 14 },
-        { key: 'job_desc',            header: 'Description',     width: 40 },
-        { key: 'customer_name',       header: 'Customer',        width: 22 },
-        { key: 'customer_mob_no',     header: 'Mobile',          width: 14 },
-        { key: 'city_name',           header: 'City',            width: 14 },
-        { key: 'easyfixer_name',      header: 'Easyfixer',       width: 22 },
-        { key: 'owner_name',          header: 'Owner',           width: 18 },
-        { key: 'created_date_time',   header: 'Created',         width: 18 },
-        { key: 'requested_date_time', header: 'Requested',       width: 18 },
-        { key: 'scheduled_date_time', header: 'Scheduled',       width: 18 },
-        { key: 'checkin_date_time',   header: 'Checked In',      width: 18 },
-        { key: 'checkout_date_time',  header: 'Checked Out',     width: 18 },
+        { key: 'job_id',                          header: 'Job Id',                       width: 10 },
+        { key: 'client_ref_id',                   header: 'Client Reference Id',          width: 18 },
+        { key: 'job_desc',                        header: 'Job Description',              width: 40 },
+        { key: 'customer_name',                   header: 'Customer Name',                width: 22 },
+        { key: 'customer_mob_no',                 header: 'Customer No.',                 width: 14 },
+        { key: 'full_address',                    header: 'Complete Address',             width: 40 },
+        { key: 'pin_code',                        header: 'Pincode',                      width: 10 },
+        { key: 'city_name',                       header: 'City',                         width: 14 },
+        { key: 'state_name',                      header: 'State',                        width: 14 },
+        { key: 'aging_days',                      header: 'Aging',                        width: 8  },
+        { key: 'job_status_label',                header: 'Job Status',                   width: 16 },
+        { key: 'bucket_status',                   header: 'Bucket Status',                width: 16 },
+        { key: 'pending_due_to',                  header: 'Pending Due to',               width: 16 },
+        { key: 'pending_reason',                  header: 'Pending Reason',               width: 20 },
+        { key: 'pending_remarks',                 header: 'Pending Remarks',              width: 30 },
+        { key: 'cancel_date_time',                header: 'Cancel Date',                  width: 18 },
+        { key: 'cancel_enquiry_reason',           header: 'Cancel/Enquiry Reason',        width: 22 },
+        { key: 'cancel_enquiry_comment',          header: 'Cancel/Enquiry Comment',       width: 30 },
+        { key: 'dashboard_booking_date',          header: 'Dashboard Booking Date',       width: 18 },
+        { key: 'crm_booking_date',                header: 'CRM Booking Date',             width: 18 },
+        { key: 'original_appointment_date_time',  header: 'Original Appointment Date',    width: 18 },
+        { key: 'appointment_date',                header: 'Appointment Date',             width: 18 },
+        { key: 'app_checkout_date_time',          header: 'App Checkout Date',            width: 18 },
+        { key: 'client_comment',                  header: 'Client Comment',               width: 30 },
+        { key: 'tx_name',                         header: 'Tx Name',                      width: 22 },
+        { key: 'sda',                             header: 'SDA (Same Day Attempt)',       width: 12 },
+        { key: 'customer_rating',                 header: 'Rating',                       width: 8  },
+        { key: 'customer_review',                 header: 'Customer Review',              width: 30 },
+        { key: 'total_charge',                    header: 'Total Charge',                 width: 12 },
+        { key: 'mode_of_payment',                 header: 'Mode of payment',              width: 14 },
       ],
       rows: data,
     });

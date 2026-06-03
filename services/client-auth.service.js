@@ -9,20 +9,35 @@ const jwt = require('jsonwebtoken');
  * JWT claim `sub` is namespaced as `spoc:<id>` so auth.js can distinguish.
  */
 
+// Both lookups JOIN tbl_client and project `client_status` so callers can
+// reject login when the parent client account is inactive (status != 1).
+// Doing the JOIN here keeps the auth flow honest — every code path that
+// reads a SPOC also sees whether their client is enabled.
 async function findSpoc(identifier) {
-  const col = /@/.test(identifier) ? 'contact_email' : 'contact_no';
+  const col = /@/.test(identifier) ? 'cc.contact_email' : 'cc.contact_no';
   const [[row]] = await pool.query(
-    `SELECT id, client_id, contact_name, contact_email, contact_no
-       FROM tbl_client_contacts WHERE ${col} = ? AND status = 1 LIMIT 1`,
+    `SELECT cc.id, cc.client_id, cc.contact_name, cc.contact_email, cc.contact_no,
+            cl.client_status
+       FROM tbl_client_contacts cc
+       LEFT JOIN tbl_client cl ON cl.client_id = cc.client_id
+      WHERE ${col} = ? AND cc.status = 1
+      LIMIT 1`,
     [identifier]
   );
   return row || null;
 }
 
 async function findSpocById(id) {
+  // client_name added so the sidebar can show the company name on the
+  // Client Profile nav item without an extra round-trip. Cheap (single
+  // LEFT JOIN, indexed PK) and the row is already being assembled here.
   const [[row]] = await pool.query(
-    `SELECT id, client_id, contact_name, contact_email, contact_no
-       FROM tbl_client_contacts WHERE id = ? AND status = 1 LIMIT 1`,
+    `SELECT cc.id, cc.client_id, cc.contact_name, cc.contact_email, cc.contact_no,
+            cl.client_status, cl.client_name
+       FROM tbl_client_contacts cc
+       LEFT JOIN tbl_client cl ON cl.client_id = cc.client_id
+      WHERE cc.id = ? AND cc.status = 1
+      LIMIT 1`,
     [id]
   );
   return row || null;
@@ -31,6 +46,12 @@ async function findSpocById(id) {
 async function createLoginOtp(identifier) {
   const spoc = await findSpoc(identifier);
   if (!spoc) return { found: false };
+  // Parent client must be active. Block OTP issuance for SPOCs whose
+  // client account has been deactivated by ops — otherwise an inactive
+  // client could still receive OTPs and ride their old JWT.
+  if (Number(spoc.client_status) !== 1) {
+    return { found: false, reason: 'CLIENT_INACTIVE' };
+  }
   // SPOC identifier can be email or mobile (we accept both via findSpoc).
   // resolveLoginOtp picks 2468 for email or last 4 digits of mobile in QA;
   // real random in prod.
@@ -82,6 +103,12 @@ async function createLoginOtp(identifier) {
 async function verifyLoginOtp(identifier, otp) {
   const spoc = await findSpoc(identifier);
   if (!spoc) return { ok: false, reason: 'USER_NOT_FOUND' };
+  // Double-guard: if the client was deactivated between send-otp and
+  // verify-otp (or the SPOC managed to obtain a fresh OTP via another
+  // path), refuse to issue a JWT.
+  if (Number(spoc.client_status) !== 1) {
+    return { ok: false, reason: 'CLIENT_INACTIVE' };
+  }
   // Match the same (email, mobile, otp_type) tuple that createLoginOtp wrote.
   // AND-ing both columns ensures partial legacy rows never get returned.
   const [[row]] = await pool.query(

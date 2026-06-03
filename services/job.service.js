@@ -172,7 +172,56 @@ const LIST_COLUMNS = `
         AND LOWER(REPLACE(ccp.c_prop_name, '_', ' ')) = LOWER('Auto Process Unconfirmed Order')
         AND LOWER(ccp.c_prop_values) = 'true'
         AND ccp.status = 1
-   )) AS client_opted_in
+   )) AS client_opted_in,
+  /* Ticket-authorization fields used by the "My New Tickets" page —
+     legacy CRM equivalent of approvedByClient + callLater on the
+     Angular MyNewTicketsComponent. */
+  j.approved_by_client, j.approved_by_client_contact,
+  /* SPOC name who actioned the estimate — shown on the Estimate Status
+     card next to the date. Pulled via apc alias (joined on
+     approved_by_client_contact, see LIST_JOIN). */
+  apc.contact_name AS approved_by_contact_name,
+  j.call_later,
+  /* Order History — Completed tab fields */
+  j.ready_for_billing, j.sub_job_id, j.job_reopen_flag,
+  j.original_appointment_date_time,
+  /* Escalated Orders fields — pulled via the rating-by-customer table.
+     One job can have many rating rows over its lifetime; we surface
+     the most recent escalation row via the EXISTS-driven JOIN below.
+     Columns are NULL when the job has no rating row, which is the common
+     case (escalation_table only populates after a customer rates). */
+  rerc.is_escalated     AS is_escalated,
+  rerc.no_of_escalations AS no_of_escalations,
+  rerc.escalated_time   AS escalated_time,
+  rerc.escalated_by_name AS escalated_by_name,
+  rerc.escalated_by_user AS escalated_by_user,
+  rerc.escalated_comments AS escalated_comments,
+  /* Client Delay — "Pending Due to Client" page fields.
+     Powers the Approve-Estimate / Fulfilment-On-Hold tabs on the
+     legacy MyApprovalsComponent. Note legacy column name carries the
+     "full_fillment" misspelling — preserved verbatim because the DB
+     column is the source of truth. */
+  j.approval_sent_on_date_time,
+  j.full_fillment_created_time,
+  j.full_fillment_time,
+  j.full_fillment_reason,
+  j.fk_service_catg_id,
+  sc.service_catg_name AS service_category_name,
+  /* Committed Appointments page — show who created vs. who scheduled
+     the job (legacy MyTeamTableCols / ClientTable last-column logic).
+     Tab 1 (Unallocated, status=0) surfaces created_by; tab 2/3 (status
+     1+) surface scheduled_by. Cheap user-table joins (small lookup). */
+  j.fk_created_by, cr.user_name AS created_by_name,
+  j.fk_scheduled_by, sb.user_name AS scheduled_by_name,
+  /* Bucket-status helper fields — drive the context-aware
+     getBucketCurrentStatusForJob() on the FE (ported from legacy
+     CommonUtils.java). Estimate approve/reject timestamps + the
+     reporting-SPOC's approval flag together let the FE classify the
+     row into "Un-Authorize / Estimate Approved / Estimate Rejected /
+     etc." without a second round-trip. */
+  j.approved_on_date_time,
+  j.approval_reject_date_time,
+  ccs.approval_by_client AS spoc_approval_by_client
 `;
 
 /*
@@ -183,12 +232,45 @@ const LIST_COLUMNS = `
  */
 const LIST_JOIN = `
   FROM tbl_job j
-  LEFT JOIN tbl_customer    cu ON cu.customer_id = j.fk_customer_id
-  LEFT JOIN tbl_address     ad ON ad.address_id  = j.fk_address_id
-  LEFT JOIN tbl_city        ci ON ci.city_id     = ad.city_id
-  LEFT JOIN tbl_client      cl ON cl.client_id   = j.fk_client_id
-  LEFT JOIN tbl_easyfixer   ef ON ef.efr_id      = j.fk_easyfixter_id
-  LEFT JOIN tbl_user        ow ON ow.user_id     = j.job_owner
+  LEFT JOIN tbl_customer       cu  ON cu.customer_id = j.fk_customer_id
+  LEFT JOIN tbl_address        ad  ON ad.address_id  = j.fk_address_id
+  LEFT JOIN tbl_city           ci  ON ci.city_id     = ad.city_id
+  LEFT JOIN tbl_client         cl  ON cl.client_id   = j.fk_client_id
+  LEFT JOIN tbl_easyfixer      ef  ON ef.efr_id      = j.fk_easyfixter_id
+  LEFT JOIN tbl_user           ow  ON ow.user_id     = j.job_owner
+  /* clientContactSpoc — the SPOC who raised the ticket. Powers the
+     My-New-Tickets "unauthorized" filter (manager check). LEFT JOIN
+     so jobs with a missing/orphaned reporting_contact_id still surface
+     in unfiltered queries; the filter clause itself enforces
+     NOT NULL when the unauthorized flag is set. */
+  LEFT JOIN tbl_client_contacts ccs ON ccs.id        = j.reporting_contact_id
+  /* SPOC who approved/rejected the estimate — separate alias from ccs
+     because the FKs differ (reporting_contact_id != approved_by_client_contact).
+     Drives the "Approved By / Rejected By" line on the Estimate Status
+     card on the Job Detail page (legacy Angular job-detail.component.html
+     lines 723-771). */
+  LEFT JOIN tbl_client_contacts apc ON apc.id        = j.approved_by_client_contact
+  /* Service category — drives the Client Delay page's "Category"
+     column. Cheap to join (small lookup table) and only contributes
+     when sc.* is actually referenced. */
+  LEFT JOIN tbl_service_catg    sc  ON sc.service_catg_id = j.fk_service_catg_id
+  /* Created-by / scheduled-by user names — drives the Committed
+     Appointments table's last column (legacy ClientTable). Separate
+     aliases (cr / sb) from the existing owner alias (ow). */
+  LEFT JOIN tbl_user            cr  ON cr.user_id          = j.fk_created_by
+  LEFT JOIN tbl_user            sb  ON sb.user_id          = j.fk_scheduled_by
+  /* Escalation rating — one job can have many rating rows, surface the
+     most recent escalated one. Without DISTINCT this could duplicate
+     parent rows; the inner-row sort + LIMIT 1 is enforced via the
+     correlated subquery shape inside the table_id filter. */
+  LEFT JOIN tbl_easyfixer_rating_by_customer rerc
+         ON rerc.job_id = j.job_id
+        AND rerc.is_escalated = 1
+        AND rerc.table_id = (
+          SELECT MAX(r2.table_id)
+            FROM tbl_easyfixer_rating_by_customer r2
+           WHERE r2.job_id = j.job_id AND r2.is_escalated = 1
+        )
 `;
 
 /*
@@ -298,6 +380,12 @@ async function jobMediaTableExists() {
  * caller appends, but since it's a fixed string we inline it safely (no
  * user input). Returns a leading-comma fragment ready to append after
  * client_opted_in.
+ *
+ * NOTE: the subquery aliases the customer-request row as `jcr` (not
+ * `cr`) because LIST_JOIN already binds `cr` to tbl_user via the
+ * Committed Appointments page's created_by join. Re-using `cr` here
+ * would cause a "Not unique table/alias" parse error inside the
+ * correlated subquery's scope-resolution.
  */
 function pendingRequestColumns(tableExists) {
   if (!tableExists) {
@@ -306,18 +394,22 @@ function pendingRequestColumns(tableExists) {
   NULL AS pending_request_reason`;
   }
   return `,
-  (SELECT cr.request_type FROM tbl_job_customer_request cr
-    WHERE cr.job_id = j.job_id AND cr.request_status = 'pending'
-    ORDER BY cr.created_at DESC LIMIT 1) AS pending_request_type,
-  (SELECT cr.reason FROM tbl_job_customer_request cr
-    WHERE cr.job_id = j.job_id AND cr.request_status = 'pending'
-    ORDER BY cr.created_at DESC LIMIT 1) AS pending_request_reason`;
+  (SELECT jcr.request_type FROM tbl_job_customer_request jcr
+    WHERE jcr.job_id = j.job_id AND jcr.request_status = 'pending'
+    ORDER BY jcr.created_at DESC LIMIT 1) AS pending_request_type,
+  (SELECT jcr.reason FROM tbl_job_customer_request jcr
+    WHERE jcr.job_id = j.job_id AND jcr.request_status = 'pending'
+    ORDER BY jcr.created_at DESC LIMIT 1) AS pending_request_reason`;
 }
 
-// Kept for getById(), which does select these as part of the full detail payload.
-const DETAIL_JOIN = LIST_JOIN + `
-  LEFT JOIN tbl_user        cr ON cr.user_id     = j.fk_created_by
-`;
+// Detail join aliases LIST_JOIN directly — the cr (creator) join is
+// already in LIST_JOIN (added when Committed Appointments needed it on
+// the list projection). Main's earlier draft tried to append an extra
+// `LEFT JOIN tbl_user cr ON ...` here, but that would re-introduce a
+// duplicate `cr` alias and 500 every job-detail call. If a future
+// detail-only join (e.g. a heavy comments aggregator) needs to live
+// here, append it with a fresh alias.
+const DETAIL_JOIN = LIST_JOIN;
 
 // ─── List ───────────────────────────────────────────────────────────
 // `scope` (optional) is the parsed RBAC scope from /auth/me:
@@ -347,9 +439,22 @@ const DATE_TYPE_COLUMN = {
 };
 
 async function list({
-  q, status, statuses, assigned, clientId, cityId, ownerId, easyfixerId,
+  q, status, statuses, assigned, clientId, cityId, cityIds, ownerId, ownerIds, easyfixerId,
   customerId,
   isEscalated,
+  // Reporting-contact scoping — IDs to restrict j.reporting_contact_id
+  // to. Set server-side by the My-New-Tickets route to enforce "my
+  // team's tickets" view. Frontend cannot send this directly.
+  reportingContactIds,
+  // Ticket-authorization flag used by the My-New-Tickets page (Client_UI).
+  // Mirrors the legacy ACD_APIs JobFilterServiceImpl.java cases at line
+  // 192/199/221. One of:
+  //   'unauthorized' — status=9, approved_by_client=0, call_later != 1
+  //   'authorized'   — status=9, (approved_by_client != 0 OR IS NULL),
+  //                    call_later != 1
+  //   'noResponse'   — status=9, call_later = 1
+  // Any other value (or undefined) is a no-op.
+  ticketFlag,
   // New filter params (2026-05-19) — match the legacy CRM "Filter Job"
   // panel. See the validator + the FE filter card.
   customerQ,                 // text — separate from `q`, narrower scope
@@ -470,6 +575,112 @@ async function list({
   if (easyfixerId != null) { clauses.push('j.fk_easyfixter_id = ?'); params.push(easyfixerId); }
   if (ownerId != null)     { clauses.push('j.job_owner = ?');        params.push(ownerId); }
   if (cityId != null)      { clauses.push('ad.city_id = ?');         params.push(cityId); }
+  // Multi-value variants — same shape as `statuses` (CSV or array).
+  // Used by the Client_UI filter bar (City multi-select, Client Team
+  // multi-select). Each adds its alias prefix so the COUNT-join
+  // detection regex picks it up.
+  const toIdArr = (v) => (Array.isArray(v)
+    ? v.filter((n) => n != null && n !== '').map(Number).filter((n) => !Number.isNaN(n))
+    : String(v).split(',').map((s) => Number(s.trim())).filter((n) => !Number.isNaN(n)));
+  if (cityIds != null) {
+    const arr = toIdArr(cityIds);
+    if (arr.length) { clauses.push(`ad.city_id IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
+  }
+  if (ownerIds != null) {
+    const arr = toIdArr(ownerIds);
+    if (arr.length) { clauses.push(`j.job_owner IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
+  }
+  // reportingContactIds — server-set scope for the My-New-Tickets page.
+  // See routes/client/index.js GET /jobs handler for the source.
+  if (Array.isArray(reportingContactIds) && reportingContactIds.length) {
+    clauses.push(`j.reporting_contact_id IN (${reportingContactIds.map(() => '?').join(',')})`);
+    params.push(...reportingContactIds);
+  }
+  // ticketFlag — three discrete tab states for the My-New-Tickets page.
+  // Legacy parity: ACD_APIs JobFilterServiceImpl#getPredicates cases at
+  // lines 192/199/221.
+  //
+  // The SPOC manager check (in 'unauthorized') joins tbl_client_contacts
+  // via j.reporting_contact_id — that's where the legacy
+  // `clientContactSpoc.managerId` / `clientContactSpoc.approvalByClient`
+  // come from. manager_id is varchar in MySQL and can carry "null"/""
+  // strings (legacy data quirk), so we exclude those literals alongside
+  // SQL NULL.
+  //
+  // Adds the EXISTS-style alias `ccs` (Client Contact Spoc) — the
+  // COUNT-join detector regex picks `ccs.` up and pulls the join into
+  // the count query too.
+  if (ticketFlag) {
+    const f = String(ticketFlag).toLowerCase();
+    if (f === 'unauthorized') {
+      clauses.push('j.job_status = ?');                params.push(9);
+      clauses.push('j.approved_by_client = ?');        params.push(0);
+      clauses.push('(j.call_later IS NULL OR j.call_later != 1)');
+      clauses.push("ccs.manager_id IS NOT NULL AND ccs.manager_id NOT IN ('', 'null')");
+      clauses.push('ccs.approval_by_client = 1');
+    } else if (f === 'authorized') {
+      clauses.push('j.job_status = ?');                params.push(9);
+      clauses.push('(j.approved_by_client != 0 OR j.approved_by_client IS NULL)');
+      clauses.push('(j.call_later IS NULL OR j.call_later != 1)');
+    } else if (f === 'noresponse') {
+      // Legacy parity: noResponse does NOT pin status=9 — it surfaces
+      // ANY job with call_later=1 (some "no response" jobs may have
+      // moved beyond status 9 over time). Matches the legacy switch
+      // case at JobFilterServiceImpl.java:221.
+      clauses.push('j.call_later = 1');
+    } else if (f === 'otherorders') {
+      // "All Orders" tab on My Order History. No extra SQL beyond what
+      // the caller already passed (statuses + filters). Listed here so
+      // the route handler can treat it as a known flag value without
+      // falling through to silent no-op.
+      //   Legacy: JobFilterServiceImpl.java:45-54 routes this through
+      //   a dedicated repo method but the FILTER predicates are the
+      //   same as the caller's status/cityIds/date range.
+    } else if (f === 'completedorders') {
+      // "Completed & Under Audit" tab. Legacy adds two row-level
+      // predicates on top of the caller's status list:
+      //   ready_for_billing = 'Yes' AND sub_job_id IS NULL
+      // (JobFilterServiceImpl.java:217-219).
+      clauses.push("j.ready_for_billing = 'Yes'");
+      clauses.push('j.sub_job_id IS NULL');
+    } else if (f === 'allocated') {
+      // Committed Appointments — "Tx Allocated" tab. Legacy SQL:
+      // status=0 AND a technician has been assigned (fk_easyfixter_id
+      // IS NOT NULL). Mirrors JobFilterServiceImpl.java:206-209.
+      clauses.push('j.job_status = ?');           params.push(0);
+      clauses.push('j.fk_easyfixter_id IS NOT NULL');
+    } else if (f === 'unallocated') {
+      // Committed Appointments — "Tx Unallocated" tab. Same status=0
+      // but no technician yet (legacy JobFilterServiceImpl.java:210-213).
+      clauses.push('j.job_status = ?');           params.push(0);
+      clauses.push('j.fk_easyfixter_id IS NULL');
+    } else if (f === 'visitdone' || f === 'visit_done') {
+      // Under Audit page — "Re-Visit(s) Created" tab. Legacy SQL
+      // (JobFilterServiceImpl.java:179-182): the job has a sub-job
+      // (revisit) created AND isn't yet ready for billing. Caller
+      // already pins status to [3, 5] (Completed); this flag layers
+      // the two extra predicates.
+      clauses.push('j.sub_job_id IS NOT NULL');
+      clauses.push("j.ready_for_billing = 'No'");
+    } else if (f === 'onlocation' || f === 'txonlocation') {
+      // Tx On Location page — jobs the technician has already started
+      // on-site (status 2 = IN_PROGRESS, 20 = IN_PROGRESS_ALT). Legacy
+      // sent flag="" with status=[2,20]; we use a dedicated flag value
+      // here so the auto-scoping in the route handler still kicks in.
+      clauses.push('j.job_status IN (2, 20)');
+    } else if (f === 'escalatedjobs') {
+      // "Escalated Orders" page (legacy escalated.component). Surfaces
+      // jobs where the customer-rating row carries is_escalated=1.
+      // EXISTS keeps the row count stable — a job with multiple
+      // rating rows otherwise duplicates.
+      // Source: JobFilterServiceImpl.java:214-216.
+      clauses.push(`EXISTS (
+        SELECT 1 FROM tbl_easyfixer_rating_by_customer rerc_x
+         WHERE rerc_x.job_id = j.job_id AND rerc_x.is_escalated = 1
+      )`);
+    }
+    // Unknown values: silent no-op (matches the legacy switch fall-through).
+  }
   if (customerId != null)  { clauses.push('j.fk_customer_id = ?');   params.push(customerId); }
   if (categoryId != null)  { clauses.push('j.fk_service_catg_id = ?'); params.push(categoryId); }
   if (stateId != null)     { clauses.push('ci.state_id = ?');        params.push(stateId); }
@@ -614,12 +825,17 @@ async function list({
   // in the WHERE clause. If the filter only hits tbl_job columns (the common
   // case: status tabs, no extra filter), we can count over tbl_job alone —
   // a single-table indexed scan vs. a full 6-way join.
-  const needsCu = /\bcu\./.test(where);
-  const needsAd = /\bad\./.test(where);
-  const needsCl = /\bcl\./.test(where);
-  const needsCi = /\bci\./.test(where);
-  const needsEf = /\bef\./.test(where);
-  const needsOw = /\bow\./.test(where);
+  const needsCu  = /\bcu\./.test(where);
+  const needsAd  = /\bad\./.test(where);
+  const needsCl  = /\bcl\./.test(where);
+  const needsCi  = /\bci\./.test(where);
+  const needsEf  = /\bef\./.test(where);
+  const needsOw  = /\bow\./.test(where);
+  const needsCcs = /\bccs\./.test(where);
+  const needsRerc = /\brerc\./.test(where);
+  const needsSc   = /\bsc\./.test(where);
+  const needsCr2  = /\bcr\./.test(where);
+  const needsSb   = /\bsb\./.test(where);
   const countJoin = `
     FROM tbl_job j
     ${needsCu ? 'LEFT JOIN tbl_customer cu ON cu.customer_id = j.fk_customer_id' : ''}
@@ -628,6 +844,12 @@ async function list({
     ${needsCl ? 'LEFT JOIN tbl_client   cl ON cl.client_id   = j.fk_client_id' : ''}
     ${needsEf ? 'LEFT JOIN tbl_easyfixer ef ON ef.efr_id     = j.fk_easyfixter_id' : ''}
     ${needsOw ? 'LEFT JOIN tbl_user     ow ON ow.user_id     = j.job_owner' : ''}
+    ${needsCcs ? 'LEFT JOIN tbl_client_contacts ccs ON ccs.id = j.reporting_contact_id' : ''}
+    ${needsRerc ? `LEFT JOIN tbl_easyfixer_rating_by_customer rerc
+                          ON rerc.job_id = j.job_id AND rerc.is_escalated = 1` : ''}
+    ${needsSc ? 'LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = j.fk_service_catg_id' : ''}
+    ${needsCr2 ? 'LEFT JOIN tbl_user cr ON cr.user_id = j.fk_created_by' : ''}
+    ${needsSb ? 'LEFT JOIN tbl_user sb ON sb.user_id = j.fk_scheduled_by' : ''}
   `;
 
   // Run COUNT and data query in parallel — they're independent, no reason to
@@ -642,6 +864,92 @@ async function list({
     ),
   ]);
   return { rows, total };
+}
+
+// ─── Export ─────────────────────────────────────────────────────────
+/*
+ * listForExport — wider projection of list() for the Excel export.
+ *
+ * Mirrors the legacy ACD_APIs `JobServiceImpl#getManageJobDownloadListReportNew`
+ * 30-column shape (OrderHistory.xlsx). Same filter contract as list() —
+ * pass the same opts and you get an expanded row shape suitable for
+ * sendXlsx. No pagination params (caller decides limit; route caps it).
+ *
+ * Columns NOT in the new MySQL schema (Mode of Payment, Total Charge,
+ * Pending Reason action_desc, Bucket Status) are returned NULL so the
+ * spreadsheet still has the column for legacy compatibility and ops
+ * can populate later from a different source.
+ */
+async function listForExport(opts = {}) {
+  // Re-use list()'s filter parsing by calling it with a large limit and
+  // then re-running the WHERE clause against the wider projection. The
+  // simpler path is to inline duplicate the WHERE here, but list() is
+  // the source of truth for filter semantics and we want them in sync.
+  // Solution: call list() with limit=cap to get IDs, then fetch wide
+  // rows in a single second query. Two round-trips but the filter
+  // logic is centralised. For tens-of-thousands rows this is still
+  // sub-second.
+  const cap = Math.min(Number(opts.limit) || 5000, 10000);
+  const { rows: idRows } = await list({ ...opts, limit: cap, offset: 0 });
+  if (!idRows.length) return [];
+  const jobIds = idRows.map((r) => r.job_id);
+
+  const [rows] = await pool.query(
+    `SELECT
+       j.job_id,
+       j.client_ref_id,
+       j.job_desc,
+       cu.customer_name,
+       cu.customer_mob_no,
+       CONCAT_WS(' ', ad.building, ad.address)        AS full_address,
+       ad.pin_code,
+       ci.city_name,
+       st.state_name,
+       /* aging — days since created. NULL for null created_date. */
+       CASE WHEN j.created_date_time IS NULL THEN NULL
+            ELSE DATEDIFF(CURRENT_DATE, DATE(j.created_date_time))
+       END                                            AS aging_days,
+       j.job_status,
+       NULL                                           AS bucket_status,
+       NULL                                           AS pending_due_to,
+       NULL                                           AS pending_reason,
+       j.remarks                                      AS pending_remarks,
+       j.cancel_date_time,
+       /* Cancel reason — joined off tbl_cancel_reason (cancel_id PK,
+          cancel_reason text). tbl_enquiry_reason doesn't exist in this
+          DB, so enquiry reasons are surfaced as NULL (legacy column kept
+          for spreadsheet parity). */
+       car.cancel_reason                              AS cancel_enquiry_reason,
+       COALESCE(j.cancel_comment, j.enquiry_comment) AS cancel_enquiry_comment,
+       j.ticket_created_date_time                    AS dashboard_booking_date,
+       j.created_date_time                           AS crm_booking_date,
+       j.original_appointment_date_time,
+       j.requested_date_time                         AS appointment_date,
+       j.app_checkout_date_time,
+       j.efr_special_notes                           AS client_comment,
+       ef.efr_name                                   AS tx_name,
+       CASE
+         WHEN j.original_appointment_date_time IS NULL OR j.app_checkout_date_time IS NULL THEN NULL
+         WHEN DATE(j.original_appointment_date_time) = DATE(j.app_checkout_date_time) THEN 'Yes'
+         ELSE 'No'
+       END                                            AS sda,
+       erc.customer_rating,
+       COALESCE(erc.review_comment, erc.comment)     AS customer_review,
+       NULL                                           AS total_charge,
+       NULL                                           AS mode_of_payment
+     FROM tbl_job j
+     LEFT JOIN tbl_customer  cu ON cu.customer_id = j.fk_customer_id
+     LEFT JOIN tbl_address   ad ON ad.address_id  = j.fk_address_id
+     LEFT JOIN tbl_city      ci ON ci.city_id     = ad.city_id
+     LEFT JOIN tbl_state     st ON st.state_id    = ci.state_id
+     LEFT JOIN tbl_easyfixer ef ON ef.efr_id      = j.fk_easyfixter_id
+     LEFT JOIN tbl_cancel_reason       car ON car.cancel_id = j.cancel_reason_id
+     LEFT JOIN tbl_easyfixer_rating_by_customer erc ON erc.job_id = j.job_id
+    WHERE j.job_id IN (${jobIds.map(() => '?').join(',')})
+    ORDER BY j.job_id DESC`,
+    jobIds
+  );
+  return rows;
 }
 
 // ─── Detail ─────────────────────────────────────────────────────────
@@ -2216,7 +2524,7 @@ async function notifyAutoAssignFailure(jobId, clientId, reason) {
 
 module.exports = {
   STATUS, ALL_STATUS_VALUES, MUTABLE_COLUMNS,
-  list, getById, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, unassign, changeOwner,
+  list, listForExport, getById, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, unassign, changeOwner,
   tryAutoAssignOnCreate,
   fireWebhook, statusToEventName,
   hasClientVerticalIdColumn,

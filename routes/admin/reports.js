@@ -25,7 +25,7 @@ router.get('/completed-jobs', async (req, res, next) => {
          ORDER BY j.checkout_date_time DESC LIMIT 1000`, params);
 
     if (wantsXlsx(req)) {
-      return sendXlsx(res, {
+      return await sendXlsx(res, {
         filename: `completed-jobs-${stamp()}.xlsx`,
         sheetName: 'Completed Jobs',
         columns: [
@@ -61,7 +61,7 @@ router.get('/easyfixer', async (req, res, next) => {
          ${where} GROUP BY ef.efr_id, ef.efr_name ORDER BY completed DESC LIMIT 500`, params);
 
     if (wantsXlsx(req)) {
-      return sendXlsx(res, {
+      return await sendXlsx(res, {
         filename: `easyfixer-report-${stamp()}.xlsx`,
         sheetName: 'Easyfixers',
         columns: [
@@ -92,7 +92,7 @@ router.get('/payout-sheet', async (req, res, next) => {
         GROUP BY ef.efr_id ORDER BY jobs_completed DESC LIMIT 1000`, [from, to]);
 
     if (wantsXlsx(req)) {
-      return sendXlsx(res, {
+      return await sendXlsx(res, {
         filename: `payout-sheet-${stamp()}.xlsx`,
         sheetName: 'Payout Sheet',
         columns: [
@@ -123,7 +123,7 @@ router.get('/city-analysis', async (req, res, next) => {
         GROUP BY ci.city_id ORDER BY total_jobs DESC LIMIT 100`);
 
     if (wantsXlsx(req)) {
-      return sendXlsx(res, {
+      return await sendXlsx(res, {
         filename: `city-analysis-${stamp()}.xlsx`,
         sheetName: 'City Analysis',
         columns: [
@@ -190,7 +190,7 @@ router.get('/user-productivity', async (req, res, next) => {
     });
 
     if (wantsXlsx(req)) {
-      return sendXlsx(res, {
+      return await sendXlsx(res, {
         filename: `user-productivity-${stamp()}.xlsx`,
         sheetName: 'User Productivity',
         columns: [
