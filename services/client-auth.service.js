@@ -14,13 +14,23 @@ const jwt = require('jsonwebtoken');
 // Doing the JOIN here keeps the auth flow honest — every code path that
 // reads a SPOC also sees whether their client is enabled.
 async function findSpoc(identifier) {
+  // Login-time lookup intentionally does NOT filter on cc.status so we
+  // can tell "no such contact" apart from "contact exists but was
+  // deactivated by their client admin". The callers (createLoginOtp /
+  // verifyLoginOtp) read `contact_status` and reject with a distinct
+  // CONTACT_INACTIVE reason for the latter, giving the SPOC an
+  // actionable message instead of a generic "not registered".
+  // findSpocById (used by the auth middleware on every request) keeps
+  // the cc.status = 1 filter so an existing token instantly stops
+  // working the moment ops deactivates the contact.
   const col = /@/.test(identifier) ? 'cc.contact_email' : 'cc.contact_no';
   const [[row]] = await pool.query(
     `SELECT cc.id, cc.client_id, cc.contact_name, cc.contact_email, cc.contact_no,
-            cl.client_status
+            cc.status AS contact_status,
+            cl.client_status, cl.client_name
        FROM tbl_client_contacts cc
        LEFT JOIN tbl_client cl ON cl.client_id = cc.client_id
-      WHERE ${col} = ? AND cc.status = 1
+      WHERE ${col} = ?
       LIMIT 1`,
     [identifier]
   );
@@ -46,6 +56,13 @@ async function findSpocById(id) {
 async function createLoginOtp(identifier) {
   const spoc = await findSpoc(identifier);
   if (!spoc) return { found: false };
+  // Contact (this specific SPOC row) was deactivated by their client
+  // admin via Profile → Contacts. Distinguish from "doesn't exist" so
+  // the SPOC sees an actionable message ("contact your client to
+  // reactivate") instead of "sign up".
+  if (Number(spoc.contact_status) !== 1) {
+    return { found: false, reason: 'CONTACT_INACTIVE' };
+  }
   // Parent client must be active. Block OTP issuance for SPOCs whose
   // client account has been deactivated by ops — otherwise an inactive
   // client could still receive OTPs and ride their old JWT.
@@ -103,6 +120,12 @@ async function createLoginOtp(identifier) {
 async function verifyLoginOtp(identifier, otp) {
   const spoc = await findSpoc(identifier);
   if (!spoc) return { ok: false, reason: 'USER_NOT_FOUND' };
+  // Same two-tier inactive checks as createLoginOtp. Order matters:
+  // CONTACT_INACTIVE wins over CLIENT_INACTIVE because the SPOC's own
+  // row being disabled is the more direct issue to surface.
+  if (Number(spoc.contact_status) !== 1) {
+    return { ok: false, reason: 'CONTACT_INACTIVE' };
+  }
   // Double-guard: if the client was deactivated between send-otp and
   // verify-otp (or the SPOC managed to obtain a fresh OTP via another
   // path), refuse to issue a JWT.

@@ -17,9 +17,17 @@ const identifier = Joi.alternatives(Joi.string().email(), Joi.string().pattern(/
 router.post('/auth/login-otp', validate(Joi.object({ identifier: identifier.required() })), async (req, res, next) => {
   try {
     const r = await clientAuth.createLoginOtp(req.body.identifier);
-    // Distinguish "client deactivated" from "no such user" — operators
-    // need to see a specific message so they call EasyFix support
-    // instead of trying to self-signup.
+    // CONTACT_INACTIVE — this specific SPOC row has status=0. Their
+    // client admin (or another SPOC at the same client) needs to
+    // reactivate them via Profile → Contacts. Distinct from
+    // "no such user" so the SPOC sees the right next step instead of
+    // bouncing to sign-up.
+    if (r.reason === 'CONTACT_INACTIVE') {
+      return modernError(res, 403,
+        'Your contact has been deactivated by your client. Please contact the client to reactivate it.');
+    }
+    // CLIENT_INACTIVE — the parent tbl_client row is inactive. EasyFix
+    // ops is the right escalation here.
     if (r.reason === 'CLIENT_INACTIVE') {
       return modernError(res, 403,
         'Your client account is inactive. Please contact EasyFix support to reactivate it.');
@@ -39,6 +47,12 @@ router.post('/auth/verify-otp', validate(Joi.object({
   try {
     const r = await clientAuth.verifyLoginOtp(req.body.identifier, req.body.otp);
     if (!r.ok) {
+      // Same friendly mapping as send-otp so the message stays
+      // consistent if status changed between the two calls.
+      if (r.reason === 'CONTACT_INACTIVE') {
+        return modernError(res, 403,
+          'Your contact has been deactivated by your client. Please contact the client to reactivate it.');
+      }
       if (r.reason === 'CLIENT_INACTIVE') {
         return modernError(res, 403,
           'Your client account is inactive. Please contact EasyFix support to reactivate it.');
@@ -174,6 +188,117 @@ router.get('/customers/mobile/:mobile', async (req, res, next) => {
       [mobile]
     );
     modernOk(res, { customer: row || null });
+  } catch (e) { next(e); }
+});
+
+/*
+ * SPOC-scoped Google Maps proxy.
+ *
+ * Thin wrappers around services/maps.service.* — the same service the
+ * admin and magic-link mounts use. SPOC JWT auth is already enforced
+ * by requireSpocAuth above, so no extra token gate is needed here.
+ *
+ *   GET /maps/autocomplete?q=<text>           — Places Autocomplete
+ *   GET /maps/reverse-geocode?latlng=lat,lng  — Reverse geocode
+ *   GET /maps/geocode?place_id=... | &address=... — Forward / by-id
+ *
+ * Keeps the GOOGLE_MAPS_API_KEY server-side; the FE never sees it.
+ */
+router.get('/maps/autocomplete', async (req, res, next) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    if (q.length < 3) return modernOk(res, { suggestions: [] });
+    const mapsService = require('../../services/maps.service');
+    const out = await mapsService.autocomplete(q);
+    modernOk(res, out);
+  } catch (e) {
+    if (e && e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
+router.get('/maps/reverse-geocode', async (req, res, next) => {
+  try {
+    const latlng = String(req.query.latlng || '').trim();
+    if (!/^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/.test(latlng)) {
+      return modernError(res, 400, 'latlng must be "lat,lng"');
+    }
+    const mapsService = require('../../services/maps.service');
+    const out = await mapsService.geocode({ latlng });
+    modernOk(res, out);
+  } catch (e) {
+    if (e && e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
+/*
+ * Forward geocode — used by the Select Address autocomplete flow:
+ * SPOC picks a Place suggestion, FE sends its place_id here, we resolve
+ * lat/lng + formatted_address + address_components in one shot.
+ */
+router.get('/maps/geocode', async (req, res, next) => {
+  try {
+    const place_id = req.query.place_id ? String(req.query.place_id) : null;
+    const address  = req.query.address  ? String(req.query.address)  : null;
+    if (!place_id && !address) {
+      return modernError(res, 400, 'place_id or address required');
+    }
+    const mapsService = require('../../services/maps.service');
+    const out = await mapsService.geocode({ place_id, address });
+    modernOk(res, out);
+  } catch (e) {
+    if (e && e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
+/*
+ * GET /api/client/customers/mobile/:mobile/addresses
+ *
+ * Saved-address book for a customer. Path:
+ *   customer mobile  → tbl_customer.customer_id
+ *   → tbl_job.fk_address_id  (rows for this customer at THIS client)
+ *   → tbl_address rows (deduped)
+ *
+ * Scoped to the SPOC's own client (j.fk_client_id = req.spoc.client_id)
+ * so a customer who has booked at multiple brands doesn't leak their
+ * address from brand A into brand B's portal.
+ *
+ * Returns the latest 20 distinct addresses. Empty array if the customer
+ * has never been booked at this client.
+ */
+router.get('/customers/mobile/:mobile/addresses', async (req, res, next) => {
+  try {
+    const mobile = String(req.params.mobile || '').trim();
+    if (!/^\d{10}$/.test(mobile)) {
+      return modernOk(res, { items: [] });
+    }
+    const [[cust]] = await pool.query(
+      'SELECT customer_id FROM tbl_customer WHERE customer_mob_no = ? ORDER BY customer_id DESC LIMIT 1',
+      [mobile]
+    );
+    if (!cust) return modernOk(res, { items: [] });
+
+    // GROUP BY in MySQL 5.7+ is permissive on the non-aggregated cols
+    // we pull; LIMIT 20 keeps the wire payload small for chatty
+    // customers with hundreds of historical bookings.
+    const [rows] = await pool.query(
+      `SELECT a.address_id, a.address, a.building, a.landmark, a.locality,
+              a.city_id, a.pin_code, a.gps_location, a.mobile_number,
+              c.city_name,
+              MAX(j.job_id) AS latest_job_id
+         FROM tbl_address a
+         JOIN tbl_job     j ON j.fk_address_id = a.address_id
+         LEFT JOIN tbl_city c ON c.city_id     = a.city_id
+        WHERE j.fk_customer_id = ?
+          AND j.fk_client_id   = ?
+        GROUP BY a.address_id
+        ORDER BY latest_job_id DESC
+        LIMIT 20`,
+      [cust.customer_id, req.spoc.client_id]
+    );
+    modernOk(res, { items: rows });
   } catch (e) { next(e); }
 });
 
@@ -1561,6 +1686,196 @@ router.get('/jobs/:id/estimate-preview', async (req, res, next) => {
       already_rejected: job.approval_reject_date_time != null,
     });
   } catch (e) { next(e); }
+});
+
+/* ─── Contacts (SPOCs of the current client) ──────────────────────────
+ * SPOC-scoped mirror of /admin/clients/:clientId/contacts*. Lets a
+ * client SPOC manage their own team's contact directory directly from
+ * the Profile → Contacts tab. Re-uses the admin service layer for the
+ * heavy lifting (insert + dedupe + XLSX parser); this block only
+ * scopes everything to req.spoc.client_id so a SPOC at client A can
+ * never see or mutate client B's contacts.
+ *
+ * Endpoints:
+ *   GET    /api/client/contacts                 — list directory
+ *   POST   /api/client/contacts                 — add new contact
+ *   PUT    /api/client/contacts/:id             — edit contact
+ *   DELETE /api/client/contacts/:id             — remove contact
+ *   GET    /api/client/contacts/template        — XLSX template download
+ *   POST   /api/client/contacts/bulk-upload     — multipart XLSX import
+ */
+const multer = require('multer');
+const clientService = require('../../services/client.service');
+const clientXlsx = require('../../services/client-xlsx.service');
+const clientValidator = require('../../validators/client.validator');
+const contactUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024, files: 1 },
+});
+
+// Helper — assert the contact id belongs to the SPOC's client. Returns
+// the contact row on success, fires modernError on miss. Centralised
+// because every per-id route needs the same scope check.
+async function loadOwnedContact(req, res) {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) {
+    modernError(res, 400, 'invalid contact id');
+    return null;
+  }
+  const [[row]] = await pool.query(
+    'SELECT id, client_id FROM tbl_client_contacts WHERE id = ? LIMIT 1',
+    [id]
+  );
+  if (!row || row.client_id !== req.spoc.client_id) {
+    modernError(res, 404, 'contact not found');
+    return null;
+  }
+  return row;
+}
+
+router.get('/contacts', async (req, res, next) => {
+  try {
+    const rows = await clientService.listContacts(req.spoc.client_id);
+    // Project only the columns the FE table actually needs — keeps
+    // the wire payload small and hides legacy internal columns
+    // (manager_id, created_by, etc.) that the SPOC shouldn't see.
+    const items = rows.map((r) => ({
+      id: r.id,
+      contact_name:  r.contact_name,
+      contact_email: r.contact_email,
+      contact_no:    r.contact_no,
+      contact_alt_no: r.contact_alt_no,
+      contact_desgn: r.contact_desgn,
+      status:        r.status,
+    }));
+    modernOk(res, { items });
+  } catch (e) { next(e); }
+});
+
+router.post(
+  '/contacts',
+  validate(clientValidator.createContactBody),
+  async (req, res, next) => {
+    try {
+      // Designation is required on SPOC-side creates (the admin validator
+      // keeps it optional to tolerate legacy rows). Guard at the route
+      // layer instead of forking the shared Joi schema.
+      if (!req.body.contactDesgn || !String(req.body.contactDesgn).trim()) {
+        return modernError(res, 400, 'contactDesgn is required');
+      }
+      const id = await clientService.createContact(req.spoc.client_id, req.body);
+      res.status(201);
+      modernOk(res, { id });
+    } catch (e) {
+      if (e.status) {
+        return modernError(res, e.status, e.message, e.conflict ? { conflict: e.conflict } : undefined);
+      }
+      next(e);
+    }
+  }
+);
+
+router.put(
+  '/contacts/:id',
+  validate(clientValidator.updateContactBody),
+  async (req, res, next) => {
+    try {
+      if (!(await loadOwnedContact(req, res))) return;
+      // If designation is being explicitly changed (key present), it
+      // must be non-empty. A PUT that omits the key entirely is allowed
+      // — only the fields actually sent get updated.
+      const desgnKeys = ['contactDesgn', 'contact_desgn'];
+      const hasDesgnKey = desgnKeys.some((k) => Object.prototype.hasOwnProperty.call(req.body, k));
+      if (hasDesgnKey) {
+        const v = req.body.contactDesgn ?? req.body.contact_desgn;
+        if (!v || !String(v).trim()) {
+          return modernError(res, 400, 'designation cannot be empty');
+        }
+      }
+      // Self-deactivation guard — a SPOC trying to set their OWN row
+      // to status=0 would immediately invalidate their next request
+      // (findSpocById requires cc.status = 1). Reject with a clear
+      // message instead of letting them silently break their session.
+      const statusVal = req.body.status ?? req.body.contact_status;
+      const isDeactivating = statusVal !== undefined && Number(statusVal) === 0;
+      if (isDeactivating && Number(req.params.id) === Number(req.spoc.id)) {
+        return modernError(res, 400,
+          'You cannot deactivate your own contact — ask another SPOC at your client to do it.');
+      }
+      const affected = await clientService.updateContact(req.params.id, req.body);
+      // Surface affectedRows so the FE can tell a real update apart
+      // from a silent no-op (column mismatch, value unchanged, etc.).
+      modernOk(res, { updated: affected > 0, affected });
+    } catch (e) {
+      if (e.status) {
+        return modernError(res, e.status, e.message, e.conflict ? { conflict: e.conflict } : undefined);
+      }
+      next(e);
+    }
+  }
+);
+
+router.delete('/contacts/:id', async (req, res, next) => {
+  try {
+    if (!(await loadOwnedContact(req, res))) return;
+    const affected = await clientService.deleteContact(req.params.id);
+    if (!affected) return modernError(res, 404, 'contact not found');
+    modernOk(res, { deleted: true });
+  } catch (e) { next(e); }
+});
+
+router.get('/contacts/template', async (req, res, next) => {
+  try {
+    const buf = await clientXlsx.buildSpocTemplate();
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="contacts-template.xlsx"');
+    res.send(buf);
+  } catch (e) { next(e); }
+});
+
+router.post('/contacts/bulk-upload', contactUpload.single('file'), async (req, res, next) => {
+  try {
+    if (!req.file) return modernError(res, 400, 'missing "file" upload');
+    const { rows } = await clientXlsx.parseSpocUpload(req.file.buffer);
+    const summary = { total: rows.length, created: 0, skipped: 0, invalid: 0 };
+    const results = [];
+    for (const r of rows) {
+      if (r.status === 'invalid') {
+        summary.invalid++;
+        results.push({ rowNumber: r.rowNumber, status: 'invalid', errors: r.errors });
+        continue;
+      }
+      // SPOC-side rule: designation mandatory. The shared XLSX parser
+      // leaves it optional (admin parity), so re-validate per row here.
+      if (!r.payload?.contactDesgn || !String(r.payload.contactDesgn).trim()) {
+        summary.invalid++;
+        results.push({
+          rowNumber: r.rowNumber,
+          status: 'invalid',
+          errors: ['designation is required'],
+        });
+        continue;
+      }
+      try {
+        const id = await clientService.createContact(req.spoc.client_id, r.payload);
+        summary.created++;
+        results.push({ rowNumber: r.rowNumber, status: 'created', contactId: id });
+      } catch (e) {
+        if (e.status === 409) {
+          summary.skipped++;
+          results.push({ rowNumber: r.rowNumber, status: 'skipped', reason: e.message });
+        } else {
+          summary.invalid++;
+          results.push({ rowNumber: r.rowNumber, status: 'failed', errors: [e.message] });
+        }
+      }
+    }
+    modernOk(res, { summary, results });
+  } catch (e) {
+    if (e.code === 'LIMIT_FILE_SIZE') return modernError(res, 400, 'file exceeds 10MB');
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
 });
 
 module.exports = router;
