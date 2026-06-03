@@ -9,6 +9,7 @@
     "start": "NODE_ENV=production node server.js",
     "build": "node scripts/build-check.js",
     "test:db": "node scripts/test-db.js",
+    "test:menus": "node --test tests/lookup-menus.test.js",
     "verify:schema": "node scripts/schema-verify.js",
     "verify:all": "npm run build && npm run test:db && npm run verify:schema"
   },

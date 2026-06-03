@@ -2,9 +2,25 @@ const router = require('express').Router();
 const { pool, getPoolStats } = require('../db');
 const { modernOk, modernError } = require('../utils/response');
 const integrationRouter = require('./integration');
+const lookup = require('../services/lookup.service');
 
 router.get('/health', (_req, res) => {
-  modernOk(res, { status: 'ok', uptime: process.uptime() });
+  // Surface the new-CRM menu-visibility filter alongside basic liveness so
+  // ops can answer "why is menu X missing in prod?" with a single GET call
+  // (and our smoke tests can assert the resolved set matches expectations
+  // without DB diving). `enabled=false` means the allowlist is OFF and every
+  // menu_status=1 row reaches the sidebar.
+  const visible = lookup._test.resolveVisibleMenuIds();
+  const overrideEmails = lookup._test.resolveMenuOverrideEmails();
+  modernOk(res, {
+    status: 'ok',
+    uptime: process.uptime(),
+    menuFilter: {
+      enabled: visible !== null,
+      visibleCount: visible ? visible.size : null,
+      overrideEmailCount: overrideEmails.size,
+    },
+  });
 });
 
 router.get('/health/db', async (_req, res) => {

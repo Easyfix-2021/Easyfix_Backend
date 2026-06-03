@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const logger = require('../logger');
 
 /*
  * Read-only lookup queries powering dropdowns across CRM_UI / Client_UI / Mobile.
@@ -265,8 +266,68 @@ async function menuActions() {
  * parent-only nodes (children provide the actual navigation). We don't encode
  * per-role visibility at the DB level — consumer applies a hardcoded allowlist
  * after fetching (see Sidebar.tsx) so role changes don't need a SQL migration.
+ *
+ * Per-environment visibility filter (added 2026-06-02): some new-CRM flows are
+ * not yet 100% complete while the legacy CRM still works fine on the same data.
+ * We filter THIS endpoint only — the legacy Java CRM reads tbl_menu directly
+ * via its own DAO and is unaffected. Two env vars drive the filter:
+ *
+ *   NEW_CRM_VISIBLE_MENU_IDS=1,2,3,…   allowlist; unset/empty = show all rows
+ *   NEW_CRM_MENU_OVERRIDE_EMAILS=a@x   comma-list of emails that bypass the
+ *                                       allowlist and see every menu (super-
+ *                                       viewers — useful for QA / smoke).
+ *
+ * Allowlist is checked first; if the requesting user's email is in the override
+ * list, they see every menu_status=1 row. Remove an id from the allowlist in
+ * the same deploy that ships the underlying flow as production-ready.
  */
-async function menus() {
+function resolveVisibleMenuIds() {
+  const raw = String(process.env.NEW_CRM_VISIBLE_MENU_IDS || '').trim();
+  if (!raw) return null;                       // null = filter inactive, show all
+  const ids = raw.split(',')
+    .map((s) => Number(String(s).trim()))
+    .filter((n) => Number.isInteger(n) && n > 0);
+  return ids.length ? new Set(ids) : null;
+}
+
+function resolveMenuOverrideEmails() {
+  const raw = String(process.env.NEW_CRM_MENU_OVERRIDE_EMAILS || '').trim();
+  if (!raw) return new Set();
+  return new Set(
+    raw.split(',')
+       .map((s) => String(s).trim().toLowerCase())
+       .filter(Boolean)
+  );
+}
+
+function applyMenuFilter(rows, { userEmail } = {}) {
+  const visible = resolveVisibleMenuIds();
+  if (!visible) return rows;                   // no allowlist → all rows pass
+  const overrides = resolveMenuOverrideEmails();
+  if (userEmail && overrides.has(String(userEmail).toLowerCase())) {
+    return rows;                               // override email → bypass filter
+  }
+  return rows.filter((r) => visible.has(Number(r.menu_id)));
+}
+
+// Boot-time visibility log — fires once when this module is first required
+// (during route registration at server start). Surfaces the resolved filter
+// so "why is menu X missing in prod?" is answerable from logs without DB diving.
+(function logMenuFilterAtBoot() {
+  const visible = resolveVisibleMenuIds();
+  const overrides = resolveMenuOverrideEmails();
+  if (!visible) {
+    logger.info('menu filter disabled — /api/shared/lookup/menus returns every menu_status=1 row');
+    return;
+  }
+  const sortedIds = [...visible].sort((a, b) => a - b);
+  logger.info(
+    { visibleMenuIds: sortedIds, overrideEmails: overrides.size },
+    `menu filter active — ${sortedIds.length} id(s) allowed${overrides.size ? `, ${overrides.size} override email(s) bypass` : ''}`,
+  );
+})();
+
+async function menus({ userEmail } = {}) {
   // `menu_status` is also returned (even though we filter on it) so the
   // frontend can re-assert the active-only contract defensively — protects
   // the sidebar if a future caller forgets the WHERE clause.
@@ -276,7 +337,40 @@ async function menus() {
       WHERE menu_status = 1
       ORDER BY COALESCE(sequence, 999) ASC, menu_id ASC`
   );
-  return rows;
+  return applyMenuFilter(rows, { userEmail });
+}
+
+/*
+ * Companion lookup that returns the legacy URL slugs (raw `tbl_menu.url`)
+ * of menus that ARE hidden by the env allowlist. Used by the Next.js
+ * middleware in Easyfix_CRM_UI to server-side redirect direct navigation
+ * to those flows to /coming-soon — single source of truth so the FE
+ * guard stays in sync with the BE filter without env duplication.
+ *
+ * `enabled=false` means the allowlist is OFF; the FE treats this as
+ * "no paths to guard". Email-override doesn't apply here — the API
+ * returns the FILTER itself, not the current user's view of it.
+ */
+async function menuVisibility() {
+  const visible = resolveVisibleMenuIds();
+  if (!visible) return { enabled: false, hiddenMenuIds: [], hiddenLegacyUrls: [] };
+  const [rows] = await pool.query(
+    'SELECT menu_id, url FROM tbl_menu WHERE menu_status = 1'
+  );
+  const hiddenRows = rows.filter((r) => !visible.has(Number(r.menu_id)));
+  // hiddenMenuIds — every hidden row (including parent-only `javascript:;`
+  // placeholders). Consumed by the Manage Role tree in Easyfix_CRM_UI to
+  // render a "Hidden in new CRM" pill on each row that's currently filtered
+  // out of the sidebar — admins still need to manage those menus' role
+  // access for the legacy Java CRM.
+  // hiddenLegacyUrls — same set but limited to navigable URLs (no parents,
+  // no nulls). Consumed by Next.js middleware for direct-URL redirects to
+  // /coming-soon.
+  const hiddenMenuIds = hiddenRows.map((r) => Number(r.menu_id));
+  const hiddenLegacyUrls = hiddenRows
+    .map((r) => r.url)
+    .filter((u) => u && u !== 'javascript:;');
+  return { enabled: true, hiddenMenuIds, hiddenLegacyUrls };
 }
 
 // ─── Easyfixers (technician picker) ─────────────────────────────────
@@ -364,10 +458,13 @@ module.exports = {
   menuActions,
   easyfixers,
   menus,
+  menuVisibility,
   cancelReasons,
   rescheduleReasons,
   banks,
   documentTypes,
   verticals,
   zones,
+  // Test-only helpers (do NOT call from production code paths).
+  _test: { applyMenuFilter, resolveVisibleMenuIds, resolveMenuOverrideEmails },
 };

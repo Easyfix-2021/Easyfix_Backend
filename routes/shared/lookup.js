@@ -112,10 +112,25 @@ router.get('/easyfixers',       role(['admin']),                                
   try { modernOk(res, await lookup.easyfixers(req.query)); } catch (e) { next(e); }
 });
 
-// Sidebar menu tree — any authenticated principal gets the full tree; the
-// frontend filters per-role after the fact (no role column on tbl_menu).
-router.get('/menus',                                                                       async (_req, res, next) => {
-  try { modernOk(res, await lookup.menus()); } catch (e) { next(e); }
+// Sidebar menu tree — any authenticated principal gets the tree; the frontend
+// filters per-role after the fact (no role column on tbl_menu). Per-env
+// allowlist + email override applied inside the service (see lookup.service.js
+// docblock on `menus`) — legacy Java CRM reads tbl_menu directly and is
+// unaffected. req.user.official_email is the bypass key.
+router.get('/menus',                                                                       async (req, res, next) => {
+  try {
+    modernOk(res, await lookup.menus({ userEmail: req.user?.official_email }));
+  } catch (e) { next(e); }
+});
+
+// Companion to /menus — returns the legacy URL slugs of menus that ARE
+// being hidden by the env allowlist. Consumed by the Next.js middleware
+// in Easyfix_CRM_UI to server-side redirect direct URL navigation to
+// /coming-soon, so users can't bypass the sidebar by pasting a URL.
+// Non-sensitive payload (just slugs); the parent `/shared` mount keeps
+// the JWT requirement so the answer can't leak the WIP backlog publicly.
+router.get('/menu-visibility',                                                             async (_req, res, next) => {
+  try { modernOk(res, await lookup.menuVisibility()); } catch (e) { next(e); }
 });
 
 module.exports = router;
