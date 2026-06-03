@@ -1129,6 +1129,31 @@ function composeRemarks(input) {
   return parts.length ? parts.join('\n') : null;
 }
 
+/*
+ * Rebuild tbl_job.client_services CSV from current ACTIVE tbl_job_services
+ * rows. Called from every job-services mutator (create + update + magic-link
+ * acceptSubmission) so the flat legacy column stays in sync with the
+ * normalized table — legacy CRM reads + reports rely on it. Querying the
+ * DB rather than computing from the input payload keeps the helper robust
+ * against partial updates and soft-deleted rows.
+ */
+async function recomputeClientServicesCsv(conn, jobId) {
+  if (!jobId) return;
+  const [rows] = await conn.query(
+    `SELECT service_id FROM tbl_job_services
+      WHERE job_id = ? AND job_service_status = 1
+      ORDER BY job_service_id ASC`,
+    [jobId],
+  );
+  const ids = rows.map((r) => Number(r.service_id))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  const csv = ids.length > 0 ? ids.join(',') : null;
+  await conn.query(
+    'UPDATE tbl_job SET client_services = ? WHERE job_id = ?',
+    [csv, jobId],
+  );
+}
+
 async function insertAddress(conn, customerId, addr, actor) {
   // Column-presence probe — production tbl_address may or may not carry
   // the `address_instruction` column depending on deploy. We branch the
@@ -1145,38 +1170,55 @@ async function insertAddress(conn, customerId, addr, actor) {
     hasInstruction = cols.length > 0;
   } catch (_e) { /* defensively assume absent on probe failure */ }
 
+  // is_instruction_added — legacy "does this address carry notes?" flag.
+  // We keep it in sync with address_instruction so legacy CRM filters that
+  // gate on this flag still see new-CRM bookings correctly. Trim before
+  // comparing — a textarea full of whitespace shouldn't flip the flag on.
+  const hasInstructionText = addr.address_instruction != null
+    && String(addr.address_instruction).trim() !== '';
+
+  let addressId;
   if (hasInstruction) {
     const [ins] = await conn.query(
       `INSERT INTO tbl_address
          (customer_id, address, building, landmark, locality, city_id, pin_code, gps_location,
-          mobile_number, address_instruction, created_by, insert_date, update_date)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          mobile_number, address_instruction, is_instruction_added,
+          created_by, insert_date, update_date)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         customerId,
         addr.address, addr.building || null, addr.landmark || null, addr.locality || null,
         addr.city_id, addr.pin_code, addr.gps_location || null,
         addr.mobile_number || null, addr.address_instruction || null,
+        hasInstructionText ? 1 : 0,
         actor?.user_id || null,
         new Date(), new Date(),
       ]
     );
-    return ins.insertId;
+    addressId = ins.insertId;
+  } else {
+    // Fallback path (legacy DBs) — address_instruction silently dropped.
+    const [ins] = await conn.query(
+      `INSERT INTO tbl_address
+         (customer_id, address, building, landmark, locality, city_id, pin_code, gps_location,
+          mobile_number, created_by, insert_date, update_date)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        customerId,
+        addr.address, addr.building || null, addr.landmark || null, addr.locality || null,
+        addr.city_id, addr.pin_code, addr.gps_location || null,
+        addr.mobile_number || null, actor?.user_id || null,
+        new Date(), new Date(),
+      ]
+    );
+    addressId = ins.insertId;
   }
-  // Fallback path (legacy DBs) — address_instruction silently dropped.
-  const [ins] = await conn.query(
-    `INSERT INTO tbl_address
-       (customer_id, address, building, landmark, locality, city_id, pin_code, gps_location,
-        mobile_number, created_by, insert_date, update_date)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      customerId,
-      addr.address, addr.building || null, addr.landmark || null, addr.locality || null,
-      addr.city_id, addr.pin_code, addr.gps_location || null,
-      addr.mobile_number || null, actor?.user_id || null,
-      new Date(), new Date(),
-    ]
-  );
-  return ins.insertId;
+
+  // Free-text instruction is persisted directly on tbl_address.address_instruction
+  // via the column-probe branch above — no companion-table write needed
+  // (2026-06-04 simplification: dropped the `address_instruction` legacy
+  // table writes in favour of a single column on tbl_address).
+  return addressId;
 }
 
 // ─── Create ─────────────────────────────────────────────────────────
@@ -1255,6 +1297,41 @@ async function create(input, actor) {
     const shouldStampOtp = withOtpColumn && effectiveStatus === STATUS.BOOKED;
     const jobOtp = shouldStampOtp ? String(generateOtp()) : null;
 
+    /*
+     * job_client_owner auto-resolution (2026-06-04). When the caller
+     * doesn't pass an explicit owner, we look up the client's Primary
+     * SPOC from tbl_vertical_mapping (user_type=1 = Primary per the
+     * legacy CRM convention). Doing this server-side rather than
+     * forcing every caller (Book-New-Call, mobile, integration) to
+     * fetch + send the same value keeps the rule in one place and
+     * survives clients who don't know the SPOC model.
+     *
+     * status filter tolerates NULL (older mappings predate the column)
+     * and 1 (active). Inactive mappings are skipped.
+     */
+    let resolvedJobClientOwner = input.job_client_owner;
+    if ((resolvedJobClientOwner == null || resolvedJobClientOwner === '') && input.fk_client_id) {
+      try {
+        const [vmRows] = await conn.query(
+          `SELECT user_id FROM tbl_vertical_mapping
+            WHERE client_id = ? AND user_type = 1
+              AND (status IS NULL OR status = 1)
+            ORDER BY id ASC LIMIT 1`,
+          [input.fk_client_id]
+        );
+        if (vmRows.length > 0) {
+          const uid = Number(vmRows[0].user_id);
+          if (Number.isFinite(uid) && uid > 0) resolvedJobClientOwner = uid;
+        }
+      } catch (e) {
+        // Non-fatal — leave null and let the booking proceed.
+        require('../logger').warn(
+          { clientId: input.fk_client_id, err: e.message },
+          'Primary-SPOC lookup failed for job_client_owner (continuing with null)',
+        );
+      }
+    }
+
     // Build INSERT shape — `otp` column is appended ONLY when present
     // on the deploy. Two paths to keep the column list + placeholder
     // count + values array perfectly aligned (mismatched lengths here
@@ -1290,7 +1367,7 @@ async function create(input, actor) {
         // mark a job COMPLETED.
         effectiveStatus,
         input.job_owner || actor?.user_id || null,
-        input.job_client_owner ?? null,
+        resolvedJobClientOwner ?? null,
         input.job_type || 'Installation', input.source_type || 'manual',
         input.client_ref_id || null, input.job_reference_id || null,
         input.customer?.customer_name || null,
@@ -1333,6 +1410,9 @@ async function create(input, actor) {
          VALUES ?`,
         [values]
       );
+      // Mirror onto tbl_job.client_services CSV — single source of truth
+      // via the helper so every services mutator stays in sync.
+      await recomputeClientServicesCsv(conn, jobId);
     }
 
     /*
@@ -1528,7 +1608,10 @@ async function update(jobId, input, actor) {
       if (input.address.gps_location !== undefined) { addrSets.push('gps_location = ?'); addrVals.push(input.address.gps_location || null); }
       // address_instruction is column-probed per the matching guard in
       // insertAddress(). We skip the SET if the column doesn't exist on
-      // the deploy so the UPDATE doesn't fail with Unknown column.
+      // the deploy so the UPDATE doesn't fail with Unknown column. When
+      // the column IS present, we also flip is_instruction_added in lock-
+      // step so the legacy "has notes?" flag stays in sync with the text
+      // (legacy CRM views/reports filter on this flag).
       if (input.address.address_instruction !== undefined) {
         const [cols] = await conn.query(
           `SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
@@ -1538,8 +1621,14 @@ async function update(jobId, input, actor) {
             LIMIT 1`,
         );
         if (cols.length > 0) {
+          const trimmed = input.address.address_instruction == null
+            ? null
+            : String(input.address.address_instruction);
+          const hasText = trimmed != null && trimmed.trim() !== '';
           addrSets.push('address_instruction = ?');
           addrVals.push(input.address.address_instruction || null);
+          addrSets.push('is_instruction_added = ?');
+          addrVals.push(hasText ? 1 : 0);
         }
       }
       if (addrSets.length > 0) {
@@ -1622,6 +1711,10 @@ async function update(jobId, input, actor) {
           );
         }
       }
+      // Mirror onto tbl_job.client_services CSV — same helper as create() +
+      // magic-link acceptSubmission so every services mutator stays in sync
+      // with the normalized table. Legacy CRM reports read the flat column.
+      await recomputeClientServicesCsv(conn, jobId);
     }
 
     // Touch last_update_time if only non-scalar edits happened (services,
@@ -2216,6 +2309,10 @@ async function notifyAutoAssignFailure(jobId, clientId, reason) {
 
 module.exports = {
   STATUS, ALL_STATUS_VALUES, MUTABLE_COLUMNS,
+  // Cross-service helper — used by job-magic-link.service.js to keep the
+  // tbl_job.client_services CSV in sync after the customer's self-submit
+  // mutates tbl_job_services. Single source of truth, one helper.
+  recomputeClientServicesCsv,
   list, getById, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, unassign, changeOwner,
   tryAutoAssignOnCreate,
   fireWebhook, statusToEventName,

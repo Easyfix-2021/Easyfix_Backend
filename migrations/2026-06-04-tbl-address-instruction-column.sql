@@ -1,0 +1,25 @@
+-- tbl_address.address_instruction — free-text landing notes for the technician.
+--
+-- The new CRM, Confirm & Schedule modal, and the public magic-link customer
+-- form all capture an "Address Instructions" textarea (e.g., "back gate open
+-- after 9pm; visit between 9am-1pm; no Sundays"). The Node BE already has
+-- column-probed INSERT/UPDATE paths for this exact column on tbl_address —
+-- they're conditional on the column existing, so they silently no-op today.
+-- Adding the column here flips those paths on without any code changes:
+--   - services/job.service.js::insertAddress  (Book New Call create)
+--   - services/job.service.js::update         (Confirm & Schedule edit)
+--   - services/job-magic-link.service.js      (customer self-submit)
+--
+-- Why tbl_address and NOT the legacy `address_instruction` table (which holds
+-- structured slot/weekend availability flags): the free text and the slot
+-- structure are different concepts. Keeping the free text on tbl_address
+-- means a single read on the address row returns both the location AND the
+-- visit notes, with no extra join. The structured availability table stays
+-- untouched for any future per-address scheduling UI.
+--
+-- Safety for the four legacy Java services that share the DB:
+--   - SELECT * → returns one extra column; Java DTOs ignore unmapped fields.
+--   - INSERT (named cols) → unaffected (column is nullable).
+--   - No existing legacy code reads or writes this column.
+
+ALTER TABLE tbl_address ADD COLUMN address_instruction VARCHAR(500) NULL AFTER gps_location;

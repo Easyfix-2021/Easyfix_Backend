@@ -1097,6 +1097,17 @@ async function acceptSubmission(jobId, payload, pool) {
       if (hasAddrInstr) {
         setClauses.push('address_instruction = COALESCE(?, address_instruction)');
         params.push(addrInstr);
+        // Keep is_instruction_added in lock-step with the text — legacy CRM
+        // gates on this flag. Only touch it when the customer ACTUALLY sent
+        // a value (addrInstr != null); a COALESCE-style "do nothing if
+        // null" via NULLIF on the flag side would let the flag get out of
+        // sync with the text. So: flip the flag on submit, 1/0 reflecting
+        // emptiness, only if the customer's payload included the field.
+        if (addrInstr != null) {
+          const hasText = String(addrInstr).trim() !== '';
+          setClauses.push('is_instruction_added = ?');
+          params.push(hasText ? 1 : 0);
+        }
       }
       params.push(addressId);
 
@@ -1243,6 +1254,13 @@ async function acceptSubmission(jobId, payload, pool) {
           }
         }
       }
+      // Mirror onto tbl_job.client_services CSV — same helper as
+      // job.service.js::create + update so every services mutator stays
+      // in sync with the normalized table (legacy reports read the flat
+      // column). Inline require to avoid a circular-dep risk at module
+      // load time — only fires when the customer actually submits.
+      const { recomputeClientServicesCsv } = require('./job.service');
+      await recomputeClientServicesCsv(conn, jobId);
     }
 
     await conn.commit();
