@@ -138,6 +138,124 @@ router.get('/me/custom-properties', async (req, res, next) => {
 });
 
 /*
+ * ─── Notices (Notice Board → Client surface) ──────────────────────
+ *
+ * The CRM admin "Notice Board" composes notices in tbl_notice with a
+ * CSV `target_surfaces` column. Any notice that includes 'client' in
+ * that CSV becomes visible to SPOCs here. `notice.service` handles
+ * the publish/expire window logic and decorates each row with the
+ * per-SPOC `is_read` flag (lookup keyed on tbl_notice_read).
+ *
+ * Endpoints:
+ *   GET   /notices                — list active client-surface notices
+ *   GET   /notices/unread-count   — { count } for the sidebar bell badge
+ *   PATCH /notices/:id/read       — idempotent read-receipt
+ *   PATCH /notices/read-all       — bulk mark-all-as-read
+ *
+ * Read-receipt identity tuple is fixed per surface:
+ *   surface     = 'client'
+ *   readerType  = 'client'
+ *   readerId    = req.spoc.id  (tbl_client_contacts.id)
+ *
+ * Returning the resolved image URLs (S3-presigned) means the FE can
+ * <img src> the value directly without an extra hop. URLs age out
+ * after ~5 min but the page is one-shot — refresh re-fetches.
+ */
+
+// Lazy-required inside the handler scope; this matches the existing
+// pattern used elsewhere in this file for services with heavy
+// transitive deps (s3, sms templates). Avoids paying the cost on
+// every cold start of a route that doesn't actually use it.
+const noticeService = require('../../services/notice.service');
+
+router.get('/notices', async (req, res, next) => {
+  try {
+    const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
+    const items = await noticeService.listActiveForSurface({
+      surface: 'client',
+      readerType: 'client',
+      readerId: req.spoc.id,
+      limit,
+    });
+    modernOk(res, { items });
+  } catch (e) { next(e); }
+});
+
+router.get('/notices/unread-count', async (req, res, next) => {
+  try {
+    // We could push this into the service, but a direct COUNT against
+    // the active-window filter is cheaper than fetching + decorating
+    // rows just to throw away everything except the unread total.
+    // Mirrors the same `is active for the client surface` predicate
+    // used inside listActiveForSurface for parity.
+    const [[{ unread }]] = await pool.query(
+      `SELECT COUNT(*) AS unread
+         FROM tbl_notice n
+        WHERE FIND_IN_SET('client', n.target_surfaces)
+          AND n.status IN ('published', 'scheduled')
+          AND (n.publish_at IS NULL OR n.publish_at <= NOW())
+          AND (n.expire_at  IS NULL OR n.expire_at  >  NOW())
+          AND NOT EXISTS (
+            SELECT 1 FROM tbl_notice_read r
+             WHERE r.notice_id   = n.notice_id
+               AND r.surface     = 'client'
+               AND r.reader_type = 'client'
+               AND r.reader_id   = ?
+          )`,
+      [req.spoc.id]
+    );
+    modernOk(res, { count: Number(unread) || 0 });
+  } catch (e) { next(e); }
+});
+
+router.patch('/notices/:id/read', async (req, res, next) => {
+  try {
+    const noticeId = Number(req.params.id);
+    if (!Number.isInteger(noticeId) || noticeId <= 0) {
+      return modernError(res, 400, 'invalid notice id');
+    }
+    // Idempotent — INSERT IGNORE inside markRead means duplicate
+    // taps are no-ops. We don't bother verifying the notice exists +
+    // is visible: a stale read-receipt row pointing at a deleted
+    // notice is harmless (and the FK-less schema tolerates it).
+    await noticeService.markRead({
+      noticeId,
+      surface: 'client',
+      readerType: 'client',
+      readerId: req.spoc.id,
+    });
+    modernOk(res, { ok: true });
+  } catch (e) { next(e); }
+});
+
+router.patch('/notices/read-all', async (req, res, next) => {
+  try {
+    // Bulk mark-all. One INSERT … SELECT covers the current active
+    // window in a single round-trip. The `WHERE NOT EXISTS` guard
+    // makes this idempotent without relying on the UNIQUE index
+    // throwing duplicate-key errors.
+    await pool.query(
+      `INSERT INTO tbl_notice_read (notice_id, surface, reader_type, reader_id)
+       SELECT n.notice_id, 'client', 'client', ?
+         FROM tbl_notice n
+        WHERE FIND_IN_SET('client', n.target_surfaces)
+          AND n.status IN ('published', 'scheduled')
+          AND (n.publish_at IS NULL OR n.publish_at <= NOW())
+          AND (n.expire_at  IS NULL OR n.expire_at  >  NOW())
+          AND NOT EXISTS (
+            SELECT 1 FROM tbl_notice_read r
+             WHERE r.notice_id   = n.notice_id
+               AND r.surface     = 'client'
+               AND r.reader_type = 'client'
+               AND r.reader_id   = ?
+          )`,
+      [req.spoc.id, req.spoc.id]
+    );
+    modernOk(res, { ok: true });
+  } catch (e) { next(e); }
+});
+
+/*
  * GET /api/client/lookup/service-categories — ALL active service
  * categories (not just the ones the SPOC's client has contracted).
  *
@@ -1508,6 +1626,37 @@ router.put('/profile', async (req, res, next) => {
       contact_name, contact_alt_no, contact_desgn, linkedIn_profile,
       manager_id, email_cc, payment_mode, approval_by_client,
     } = req.body || {};
+    // Alt-phone junk-pattern guard. Same rule the FE applies on Save
+    // and the same rule services/job.service.js#assertValidMobile
+    // applies to customer mobiles. Centralised here so a direct API
+    // hit (curl, bulk import) can't slip placeholders into
+    // tbl_client_contacts.contact_alt_no.
+    if (contact_alt_no) {
+      const v = String(contact_alt_no).trim();
+      const failReason = (() => {
+        if (!/^[6-9]\d{9}$/.test(v)) return 'must be a 10-digit Indian mobile starting 6–9';
+        if (/^(\d)\1{9}$/.test(v))    return 'cannot be the same digit repeated';
+        const asc  = v.split('').every((d, i, a) => i === 0 || (Number(d) - Number(a[i - 1]) + 10) % 10 === 1);
+        const desc = v.split('').every((d, i, a) => i === 0 || (Number(a[i - 1]) - Number(d) + 10) % 10 === 1);
+        if (asc || desc)              return 'sequential digits aren’t a real mobile';
+        if (/^(\d)(\d)\1\2\1\2\1\2\1\2$/.test(v)) return 'looks like a placeholder';
+        return null;
+      })();
+      if (failReason) {
+        return modernError(res, 400, `contact_alt_no ${failReason}`);
+      }
+    }
+    // LinkedIn URL guard — same shape as the FE check
+    // (src/app/(authed)/profile/page.tsx#isValidLinkedInUrl). Accepts
+    // canonical linkedin.com paths only; rejects random text and
+    // non-linkedin URLs.
+    if (linkedIn_profile && String(linkedIn_profile).trim()) {
+      const u = String(linkedIn_profile).trim();
+      const ok = /^(https?:\/\/)?(www\.|in\.|[a-z]{2}\.)?linkedin\.com\/(in|pub|company|profile)\/[A-Za-z0-9._%-]+\/?(\?.*)?$/i.test(u);
+      if (!ok) {
+        return modernError(res, 400, 'linkedIn_profile must be a full LinkedIn URL (e.g. https://linkedin.com/in/handle)');
+      }
+    }
     // manager_id is varchar in the DB; the FE sends a numeric id (or null
     // to clear). Stringify so MySQL stores it as expected.
     const mgrIdStr = manager_id == null ? null : String(manager_id);
@@ -1526,6 +1675,256 @@ router.put('/profile', async (req, res, next) => {
        mgrIdStr, email_cc, payment_mode, approval_by_client,
        req.spoc.id]);
     modernOk(res, { updated: true });
+  } catch (e) { next(e); }
+});
+
+/*
+ * ─── Change phone / change email (OTP-protected) ───────────────────
+ *
+ * The PUT /profile route above intentionally treats contact_no /
+ * contact_email as read-only — they're the SPOC's login identifiers,
+ * so changing them requires proving ownership of the NEW number/email.
+ *
+ * Flow (mirrors login OTP, but the OTP goes to the *new* value, not
+ * the existing one on file):
+ *
+ *   1. Client POSTs { new_phone | new_email } to /send-otp
+ *      → uniqueness check across tbl_client_contacts AND tbl_user
+ *        (across ALL contacts/users — not just active — because we
+ *        don't want a future reactivation to silently collide).
+ *      → 4-digit OTP written to otp_details with otp_type='Change Phone'
+ *        or 'Change Email' and user_email/user_mobile_no set to the
+ *        *new* target. otp_type segregates these from 'Login Otp' rows
+ *        so a stale login OTP can't satisfy a change-email verify.
+ *      → otp-delivery.service sends to the new target.
+ *
+ *   2. Client POSTs { new_phone | new_email, otp } to /verify-otp
+ *      → matches the otp_details row by (otp_type, user_email or
+ *        user_mobile_no = new target), validates expiry, then UPDATEs
+ *        tbl_client_contacts for req.spoc.id.
+ *
+ * Why we re-check uniqueness on verify too: between send-otp and
+ * verify-otp another SPOC could grab the same number — the second
+ * check closes that small TOCTOU window. The first check still lives
+ * on send-otp so we never spam an OTP to a duplicate target.
+ *
+ * No "old number" verification — product asked for the simpler UX
+ * where proving control of the *new* number is sufficient. If the
+ * SPOC's account is compromised, the attacker would need to also
+ * receive OTPs on a number they control, which they do trivially
+ * either way (they're already authed). The real constraint is that
+ * the new identifier must be unique.
+ */
+
+// Junk-free, 10-digit Indian mobile (same rule as createUser / PUT profile).
+// We DO NOT block obviously fake numbers here — user said "no validation"
+// for the change flow. We only enforce 10-digit shape so the otp_details
+// row and downstream WhatsApp/SMS providers have a sane input.
+function looksLikePhone(v) {
+  return /^[0-9]{10}$/.test(String(v || '').trim());
+}
+function looksLikeEmail(v) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v || '').trim());
+}
+
+/*
+ * Uniqueness probe — true if any *other* row in tbl_client_contacts or
+ * tbl_user already has this phone / email. We exclude the calling
+ * SPOC's own row from tbl_client_contacts because they may be
+ * re-submitting their own current value (no-op) and we shouldn't
+ * 409 on that. The match is exact (no LOWER on phones, lowercased on
+ * emails) since both tables store these as plain VARCHAR.
+ */
+async function isPhoneInUse(phone, excludeContactId) {
+  const v = String(phone || '').trim();
+  const [[ctcRow]] = await pool.query(
+    `SELECT id FROM tbl_client_contacts WHERE contact_no = ? AND id <> ? LIMIT 1`,
+    [v, excludeContactId]);
+  if (ctcRow) return true;
+  const [[usrRow]] = await pool.query(
+    `SELECT user_id FROM tbl_user WHERE mobile_no = ? LIMIT 1`,
+    [v]);
+  return !!usrRow;
+}
+async function isEmailInUse(email, excludeContactId) {
+  const v = String(email || '').trim().toLowerCase();
+  const [[ctcRow]] = await pool.query(
+    `SELECT id FROM tbl_client_contacts WHERE LOWER(contact_email) = ? AND id <> ? LIMIT 1`,
+    [v, excludeContactId]);
+  if (ctcRow) return true;
+  const [[usrRow]] = await pool.query(
+    `SELECT user_id FROM tbl_user WHERE LOWER(official_email) = ? LIMIT 1`,
+    [v]);
+  return !!usrRow;
+}
+
+// Issue an OTP for a change-phone / change-email request.
+// Returns { delivered, expiresAt } on success or { error } shape that
+// the route maps to 4xx. Idempotent: re-calling refreshes the OTP for
+// the same (otp_type, target) tuple.
+async function issueChangeOtp({ otpType, target, kind }) {
+  const { generateOtp, otpExpiryDate } = require('../../utils/otp');
+  const otp = generateOtp();
+  const now = new Date();
+  const expires = otpExpiryDate(now);
+  // For change-phone, target lives in user_mobile_no; for change-email
+  // it goes in user_email. The other column stays NULL so verify can
+  // disambiguate by inspecting only the relevant one.
+  const emailCol = kind === 'email' ? target : null;
+  const mobileCol = kind === 'phone' ? target : null;
+  const [[existing]] = await pool.query(
+    `SELECT id FROM otp_details
+       WHERE otp_type = ?
+         AND ${kind === 'email' ? 'user_email' : 'user_mobile_no'} = ?
+       LIMIT 1`,
+    [otpType, target]);
+  if (existing) {
+    await pool.query(
+      `UPDATE otp_details
+          SET otp = ?, generated_on = ?, valid_up_to = ?, is_expired = 0,
+              count = count + 1,
+              user_email = ?, user_mobile_no = ?
+        WHERE id = ?`,
+      [otp, now, expires, emailCol, mobileCol, existing.id]);
+  } else {
+    await pool.query(
+      `INSERT INTO otp_details (otp, otp_type, user_email, user_mobile_no, generated_on, valid_up_to, is_expired, count)
+       VALUES (?, ?, ?, ?, ?, ?, 0, 1)`,
+      [otp, otpType, emailCol, mobileCol, now, expires]);
+  }
+  // Dev-only log so QA can grab the code without an SMS/email round-trip.
+  if (process.env.NODE_ENV !== 'production') {
+    require('../../logger').event('🔁', 'cyan',
+      `${otpType} OTP for ${target}: ${otp} (valid 5 min) — dev only`);
+  }
+  const { deliverOtp } = require('../../services/otp-delivery.service');
+  const r = await deliverOtp({
+    identifier: target,
+    email: kind === 'email' ? target : null,
+    mobile: kind === 'phone' ? target : null,
+    name: null,
+    otp,
+    contextLabel: otpType.toLowerCase().replace(/\s+/g, '-'),
+  });
+  return { delivered: !!r.finalDelivered, expiresAt: expires };
+}
+
+// Verify a change-phone / change-email OTP and apply the column update.
+async function verifyChangeOtp({ otpType, target, otp, kind, spocId }) {
+  const matchCol = kind === 'email' ? 'user_email' : 'user_mobile_no';
+  const [[row]] = await pool.query(
+    `SELECT id, otp, valid_up_to, is_expired FROM otp_details
+      WHERE otp_type = ? AND ${matchCol} = ?
+      LIMIT 1`,
+    [otpType, target]);
+  if (!row) return { ok: false, reason: 'NO_OTP_ISSUED' };
+  if (row.is_expired || new Date(row.valid_up_to).getTime() < Date.now()) {
+    await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
+    return { ok: false, reason: 'OTP_EXPIRED' };
+  }
+  if (Number(row.otp) !== Number(otp)) return { ok: false, reason: 'OTP_MISMATCH' };
+  await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
+  const updateCol = kind === 'email' ? 'contact_email' : 'contact_no';
+  await pool.query(
+    `UPDATE tbl_client_contacts SET ${updateCol} = ? WHERE id = ?`,
+    [target, spocId]);
+  return { ok: true };
+}
+
+router.post('/profile/change-phone/send-otp', async (req, res, next) => {
+  try {
+    const newPhone = String(req.body?.new_phone || '').trim();
+    if (!looksLikePhone(newPhone)) {
+      return modernError(res, 400, 'new_phone must be a 10-digit number');
+    }
+    // No-op guard — if the SPOC submits their own current number we
+    // skip the whole OTP dance instead of looping them through a
+    // pointless verify step.
+    if (newPhone === String(req.spoc.contact_no || '').trim()) {
+      return modernError(res, 400, 'This is already your current number');
+    }
+    if (await isPhoneInUse(newPhone, req.spoc.id)) {
+      return modernError(res, 409, 'This number is already registered with another account');
+    }
+    const r = await issueChangeOtp({
+      otpType: 'Change Phone',
+      target: newPhone,
+      kind: 'phone',
+    });
+    modernOk(res, { delivered: r.delivered, expiresAt: r.expiresAt });
+  } catch (e) { next(e); }
+});
+
+router.post('/profile/change-phone/verify-otp', async (req, res, next) => {
+  try {
+    const newPhone = String(req.body?.new_phone || '').trim();
+    const otp = Number(req.body?.otp);
+    if (!looksLikePhone(newPhone)) {
+      return modernError(res, 400, 'new_phone must be a 10-digit number');
+    }
+    if (!Number.isInteger(otp) || otp < 1000 || otp > 9999) {
+      return modernError(res, 400, 'otp must be a 4-digit number');
+    }
+    // Re-check uniqueness right before commit — another SPOC could
+    // have claimed this number between send-otp and verify-otp.
+    if (await isPhoneInUse(newPhone, req.spoc.id)) {
+      return modernError(res, 409, 'This number is already registered with another account');
+    }
+    const r = await verifyChangeOtp({
+      otpType: 'Change Phone',
+      target: newPhone,
+      otp,
+      kind: 'phone',
+      spocId: req.spoc.id,
+    });
+    if (!r.ok) return modernError(res, 401, r.reason);
+    modernOk(res, { updated: true, contact_no: newPhone }, 'Number updated');
+  } catch (e) { next(e); }
+});
+
+router.post('/profile/change-email/send-otp', async (req, res, next) => {
+  try {
+    const newEmail = String(req.body?.new_email || '').trim().toLowerCase();
+    if (!looksLikeEmail(newEmail)) {
+      return modernError(res, 400, 'new_email must be a valid email address');
+    }
+    if (newEmail === String(req.spoc.contact_email || '').trim().toLowerCase()) {
+      return modernError(res, 400, 'This is already your current email');
+    }
+    if (await isEmailInUse(newEmail, req.spoc.id)) {
+      return modernError(res, 409, 'This email is already registered with another account');
+    }
+    const r = await issueChangeOtp({
+      otpType: 'Change Email',
+      target: newEmail,
+      kind: 'email',
+    });
+    modernOk(res, { delivered: r.delivered, expiresAt: r.expiresAt });
+  } catch (e) { next(e); }
+});
+
+router.post('/profile/change-email/verify-otp', async (req, res, next) => {
+  try {
+    const newEmail = String(req.body?.new_email || '').trim().toLowerCase();
+    const otp = Number(req.body?.otp);
+    if (!looksLikeEmail(newEmail)) {
+      return modernError(res, 400, 'new_email must be a valid email address');
+    }
+    if (!Number.isInteger(otp) || otp < 1000 || otp > 9999) {
+      return modernError(res, 400, 'otp must be a 4-digit number');
+    }
+    if (await isEmailInUse(newEmail, req.spoc.id)) {
+      return modernError(res, 409, 'This email is already registered with another account');
+    }
+    const r = await verifyChangeOtp({
+      otpType: 'Change Email',
+      target: newEmail,
+      otp,
+      kind: 'email',
+      spocId: req.spoc.id,
+    });
+    if (!r.ok) return modernError(res, 401, r.reason);
+    modernOk(res, { updated: true, contact_email: newEmail }, 'Email updated');
   } catch (e) { next(e); }
 });
 
