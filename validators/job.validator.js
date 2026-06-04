@@ -175,6 +175,12 @@ const createBody = Joi.object({
   original_appointment_time:      Joi.string().max(20).allow('', null).optional(),
   client_ref_id: Joi.string().max(100).optional(),
   job_reference_id: Joi.string().max(100).optional(),
+  // Top-level per-job override of the customer's master name. See
+  // services/job.service.js (`job_customer_name` MUTABLE_COLUMNS
+  // comment) for why this is distinct from `customer.customer_name`.
+  // Accepted alongside the nested customer block; service layer
+  // prefers this when both are present.
+  job_customer_name: Joi.string().max(255).allow('', null).optional(),
   client_spoc: Joi.string().max(200).optional(),
   client_spoc_name: Joi.string().max(200).optional(),
   client_spoc_email: Joi.string().email().max(200).optional(),
