@@ -259,24 +259,61 @@ const updateCustomPropertyBody = Joi.object({
 /* ─── Client services (catalog) ───────────────────────────────────── */
 
 /*
+ * The 6 rate-card cost columns mirror the legacy "addEditServices.vm"
+ * modal exactly (each layer carries a Fixed AND a Variable component,
+ * independently settable — legacy JS allows both to be non-zero, see
+ * /Users/harshit/Documents/GitHub/EasyFix_CRM/.../addEditServices.vm).
+ * Variable rates are stored as percentages (e.g. 10 = 10%) and divided
+ * by 100 by utils/rate-card-calc.js before applying.
+ * Cap of 1e9 prevents float overflow on the cascade; min(0) prevents
+ * negative deductions which would invert the layer-take semantics.
+ */
+const costColumn = Joi.number().min(0).max(1e9).optional().allow(null);
+
+/*
  * Create: must specify category + at least one service type.
  *   chargeType is free-form (legacy strings: 'Fixed', 'Variable', etc.)
  *   totalCharge is a non-negative decimal.
+ *   The 6 cost columns + serviceStatus are accepted now so the legacy
+ *   "Add Client Service" modal can persist the full rate-card row in
+ *   ONE round-trip (was previously only category + types + total). The
+ *   shared util utils/rate-card-calc.js then computes the per-unit
+ *   cascade from these columns at listForClient() time.
  */
 const createClientServiceBody = Joi.object({
-  serviceCategoryId: Joi.number().integer().positive().required(),
-  serviceTypeIds:    Joi.array().items(Joi.number().integer().positive()).min(1).required(),
-  chargeType:        Joi.string().max(50).optional().allow('', null),
-  totalCharge:       Joi.number().min(0).optional(),
+  serviceCategoryId:      Joi.number().integer().positive().required(),
+  serviceTypeIds:         Joi.array().items(Joi.number().integer().positive()).min(1).required(),
+  chargeType:             Joi.string().max(50).optional().allow('', null),
+  totalCharge:            Joi.number().min(0).optional(),
+  // Layer 1 — Easyfix Direct
+  easyfixDirectFixed:     costColumn,
+  easyfixDirectVariable:  costColumn,
+  // Layer 2 — Overhead
+  overheadFixed:          costColumn,
+  overheadVariable:       costColumn,
+  // Layer 3 — Client Share
+  clientFixed:            costColumn,
+  clientVariable:         costColumn,
+  // Status — legacy form lets the operator create an inactive row
+  // (matches the dropdown on the legacy modal screenshot).
+  serviceStatus:          Joi.number().integer().valid(0, 1).optional(),
 }).options({ stripUnknown: true });
 
-// Update is partial; whitelist enforced server-side.
+// Update is partial; whitelist enforced server-side. Same 6 cost
+// columns are accepted on PUT so the "Edit Client Service" modal can
+// mutate any subset of fields in a single round-trip.
 const updateClientServiceBody = Joi.object({
-  serviceCategoryId: Joi.number().integer().positive().optional(),
-  serviceTypeIds:    Joi.array().items(Joi.number().integer().positive()).min(1).optional(),
-  chargeType:        Joi.string().max(50).optional().allow('', null),
-  totalCharge:       Joi.number().min(0).optional(),
-  serviceStatus:     Joi.number().integer().valid(0, 1).optional(),
+  serviceCategoryId:      Joi.number().integer().positive().optional(),
+  serviceTypeIds:         Joi.array().items(Joi.number().integer().positive()).min(1).optional(),
+  chargeType:             Joi.string().max(50).optional().allow('', null),
+  totalCharge:            Joi.number().min(0).optional(),
+  easyfixDirectFixed:     costColumn,
+  easyfixDirectVariable:  costColumn,
+  overheadFixed:          costColumn,
+  overheadVariable:       costColumn,
+  clientFixed:            costColumn,
+  clientVariable:         costColumn,
+  serviceStatus:          Joi.number().integer().valid(0, 1).optional(),
 }).min(1);
 
 /* ─── Rate cards (bulk upsert) ────────────────────────────────────── */
