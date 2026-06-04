@@ -1423,6 +1423,43 @@ async function getAttentionSummary({ scope } = {}) {
 }
 
 // ─── Customer + Address helpers (used by create) ───────────────────
+/*
+ * Junk-pattern guard for customer mobile. Mirrors the FE isValidMobile
+ * check in src/app/(authed)/jobs/new/page.tsx so a direct API hit (curl,
+ * bulk upload, third-party integration) can't slip placeholder numbers
+ * past the form. Throws { status: 400 } so the route handler maps it to
+ * a 400 response without leaking a stack.
+ *
+ * Rejects:
+ *   - Wrong length / non-numeric / wrong prefix (must be 6-9)
+ *   - All same digit          9999999999
+ *   - Sequential asc / desc   1234567890 / 9876543210
+ *   - Pair-repeat             9090909090, 8989898989
+ */
+function assertValidMobile(m, label = 'customer_mob_no') {
+  const v = String(m || '').trim();
+  if (!/^[6-9]\d{9}$/.test(v)) {
+    const e = new Error(`${label}: must be a 10-digit Indian mobile starting 6–9`);
+    e.status = 400; throw e;
+  }
+  if (/^(\d)\1{9}$/.test(v)) {
+    const e = new Error(`${label}: cannot be the same digit repeated`);
+    e.status = 400; throw e;
+  }
+  const allAsc = v.split('').every((d, i, a) =>
+    i === 0 || (Number(d) - Number(a[i - 1]) + 10) % 10 === 1);
+  const allDesc = v.split('').every((d, i, a) =>
+    i === 0 || (Number(a[i - 1]) - Number(d) + 10) % 10 === 1);
+  if (allAsc || allDesc) {
+    const e = new Error(`${label}: sequential digits aren't a real mobile`);
+    e.status = 400; throw e;
+  }
+  if (/^(\d)(\d)\1\2\1\2\1\2\1\2$/.test(v)) {
+    const e = new Error(`${label}: looks like a placeholder, not a real number`);
+    e.status = 400; throw e;
+  }
+}
+
 async function upsertCustomer(conn, { customer_id, customer_name, customer_mob_no, customer_email }, actor) {
   if (customer_id) {
     const [[found]] = await conn.query(
@@ -1436,6 +1473,10 @@ async function upsertCustomer(conn, { customer_id, customer_name, customer_mob_n
     }
     return customer_id;
   }
+  // Hard reject placeholder/junk numbers before they pollute
+  // tbl_customer with ghost rows that break downstream lookups.
+  assertValidMobile(customer_mob_no, 'customer_mob_no');
+
   // Lookup by mobile — reuse existing
   const [[existing]] = await conn.query(
     'SELECT customer_id FROM tbl_customer WHERE customer_mob_no = ? LIMIT 1',
