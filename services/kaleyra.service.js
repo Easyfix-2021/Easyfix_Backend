@@ -1,4 +1,5 @@
 const logger = require('../logger');
+const { getProperty } = require('./properties.service');
 
 /*
  * Kaleyra voice integration.
@@ -57,7 +58,10 @@ const logger = require('../logger');
 const BASE = (process.env.KALEYRA_BASE_URL || 'https://api-voice.kaleyra.com/v1').replace(/\/+$/, '');
 
 function callingEnabled() {
-  return String(process.env.KALEYRA_CALLING_ENABLED).toLowerCase() === 'true';
+  // 2026-06-03 per ops: easyfix_properties is now the SOLE source of
+  // truth — env fallback dropped. Missing key → calling stays off.
+  const v = getProperty('kaleyra.calling.enabled');
+  return String(v).toLowerCase() === 'true';
 }
 
 function normaliseIndianPhone(raw) {

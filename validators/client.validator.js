@@ -19,6 +19,26 @@
 
 const Joi = require('joi');
 
+/*
+ * Shared Indian-mobile regex (2026-06-03): 10 digits starting with
+ * 6/7/8/9. Tightened from `/^[0-9]{10}$/` so the BE rejects junk like
+ * `1111111111` even when the FE validation is bypassed (curl, scripts,
+ * other clients). Same rule as the FE `INDIAN_MOBILE_REGEX` constant
+ * in Easyfix_CRM_UI/src/lib/format.ts. Custom error message is
+ * actionable; default Joi message is generic.
+ *
+ * `mobile` is reused on every contact-phone field below
+ * (contactNo / contact_no, contactAltNo / contact_alt_no, duplicate-
+ * check phone) so the rule only changes in one place if it's revised
+ * again (e.g. number-range extension).
+ */
+const INDIAN_MOBILE_REGEX = /^[6-9]\d{9}$/;
+const mobile = Joi.string()
+  .pattern(INDIAN_MOBILE_REGEX)
+  .messages({
+    'string.pattern.base': 'Must be a 10-digit Indian mobile starting with 6, 7, 8, or 9',
+  });
+
 /* ─── Path params ─────────────────────────────────────────────────── */
 
 const clientIdParam = Joi.object({
@@ -161,7 +181,7 @@ const updateClientBody = Joi.object({
 const createContactBody = Joi.object({
   contactName:  Joi.string().max(200).required(),
   contactEmail: Joi.string().email().max(255).required(),
-  contactNo:    Joi.string().pattern(/^[0-9]{10}$/).required(),
+  contactNo:    mobile.required(),
   contactAltNo: Joi.string().pattern(/^[0-9]{10}$/).optional().allow('', null),
   contactDesgn: Joi.string().max(100).optional().allow('', null),
   managerId:    Joi.number().integer().positive().optional(),
@@ -172,15 +192,15 @@ const updateContactBody = Joi.object({
   contactName:  Joi.string().max(200).optional(),
   contactEmail: Joi.string().email().max(255).optional(),
   contactNo:    Joi.string().pattern(/^[0-9]{10}$/).optional(),
-  contactAltNo: Joi.string().pattern(/^[0-9]{10}$/).optional().allow('', null),
+  contactAltNo: mobile.optional().allow('', null),
   contactDesgn: Joi.string().max(100).optional().allow('', null),
   managerId:    Joi.number().integer().positive().optional(),
   status:       Joi.number().integer().valid(0, 1).optional(),
   // snake_case
   contact_name:  Joi.string().max(200).optional(),
   contact_email: Joi.string().email().max(255).optional(),
-  contact_no:    Joi.string().pattern(/^[0-9]{10}$/).optional(),
-  contact_alt_no: Joi.string().pattern(/^[0-9]{10}$/).optional().allow('', null),
+  contact_no:    mobile.optional(),
+  contact_alt_no: mobile.optional().allow('', null),
   contact_desgn: Joi.string().max(100).optional().allow('', null),
   manager_id:    Joi.number().integer().positive().optional(),
 }).min(1);
@@ -189,7 +209,7 @@ const updateContactBody = Joi.object({
 // must be present.
 const contactDuplicateCheckQuery = Joi.object({
   email:     Joi.string().email().max(255).optional(),
-  phone:     Joi.string().pattern(/^[0-9]{10}$/).optional(),
+  phone:     mobile.optional(),
   excludeId: Joi.number().integer().positive().optional(),
 }).or('email', 'phone');
 
