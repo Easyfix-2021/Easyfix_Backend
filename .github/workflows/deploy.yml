@@ -269,14 +269,30 @@ jobs:
           echo "$COMPOSE_B64" | base64 -d > /opt/easyfix/.docker-compose.yml.new
           mv /opt/easyfix/.docker-compose.yml.new /opt/easyfix/docker-compose.yml
 
-          # Hard preflight — env files MUST exist (created by bootstrap-env.sh).
-          # docker-compose.yml is no longer in this list — we just wrote it.
-          for required in /opt/easyfix/.env /opt/easyfix/backend.env; do
-            if [[ ! -f "\$required" ]]; then
-              echo "::error::\$required missing — see AWS_QA_BOOTSTRAP.md for one-time setup"
-              exit 1
-            fi
-          done
+          # Env-file convention (matches QA, formalised 2026-06-03):
+          #   /opt/easyfix/.env         → UI service runtime config
+          #                                + docker-compose image-tag
+          #                                interpolation (BACKEND_IMAGE /
+          #                                CRM_UI_IMAGE).
+          #   /opt/easyfix/backend.env  → BE service runtime config
+          #                                (DB creds, JWT, KALEYRA_*, …).
+          #
+          # The BE deploy only writes the BACKEND_IMAGE line to .env, so
+          # we touch the file if it's missing (no real UI bootstrap
+          # required for a BE-only host scenario). The UI deploy.yml
+          # DOES require .env to pre-exist because that file is its
+          # primary runtime-config source.
+          #
+          # Hard requirement: backend.env. Created by bootstrap-env.sh
+          # during one-time host setup; deploy aborts loudly if absent.
+          if [[ ! -f /opt/easyfix/backend.env ]]; then
+            echo "::error::/opt/easyfix/backend.env missing — see AWS_QA_BOOTSTRAP.md for one-time setup"
+            exit 1
+          fi
+          # Touch the shared image-tag env file so docker-compose's
+          # interpolation step always has something to read. Empty is fine —
+          # the next two lines append/overwrite BACKEND_IMAGE.
+          touch /opt/easyfix/.env
 
           # Update BACKEND_IMAGE to the new tag. Append if first run.
           if grep -q '^BACKEND_IMAGE=' /opt/easyfix/.env; then
