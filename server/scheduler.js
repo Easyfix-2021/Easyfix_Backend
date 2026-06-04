@@ -1,5 +1,6 @@
 const cron = require('node-cron');
 const logger = require('../logger');
+const { getProperty } = require('../services/properties.service');
 
 /*
  * Cron job registration. Exports init() to register all scheduled tasks
@@ -65,8 +66,10 @@ function init() {
   // is missing or the deployer hasn't decided yet. QA's .env explicitly
   // opts in. When prod is ready to send for real, set the flag there
   // and restart — no code change needed.
+  // 2026-06-03 per ops: easyfix_properties is now the SOLE source of
+  // truth — env fallback dropped.
   const magicLinkCronEnabled =
-    String(process.env.MAGIC_LINK_CRON_ENABLED || '').toLowerCase() === 'true';
+    String(getProperty('magic.link.cron.enabled') ?? '').toLowerCase() === 'true';
   if (magicLinkCronEnabled) {
     const magicLinkCron = require('../services/job-magic-link-cron');
     tasks.push(cron.schedule('5 * * * *', async () => {

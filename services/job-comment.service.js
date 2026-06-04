@@ -59,15 +59,26 @@ function shapeRow(r) {
 }
 
 async function listComments(jobId) {
+  // Reason JOIN switched from tbl_enum_reason → action_taken_reason
+  // (2026-06-03 per ops). The legacy "Reason" surfaced on the Remarks
+  // history table is the action-reason text, not the generic enum
+  // description — see action_taken_reason.action_desc, keyed on the
+  // same column (tbl_job_comment.enum_reason_id) as before.
+  //
+  // We project the joined value as `enum_desc` so the existing FE
+  // contract (shapeRow → JobComment.enum_desc) keeps working without
+  // a wider type refactor; the FE just renders whatever string the BE
+  // hands it. If `action_taken_reason` is absent on a legacy deploy
+  // the LEFT JOIN simply yields NULL and the column renders blank.
   const [rows] = await pool.query(
     `SELECT c.comment_id AS id, c.job_id, c.comments, c.comment_on, c.created_on,
             c.appointment_on, c.commented_by, c.enum_reason_id, c.efr_id,
-            u.user_name, e.enum_desc
+            u.user_name, atr.action_desc AS enum_desc
        FROM tbl_job_comment c
        LEFT JOIN tbl_user u ON u.user_id = c.commented_by
-       LEFT JOIN tbl_enum_reason e ON e.enum_id = c.enum_reason_id
+       LEFT JOIN action_taken_reason atr ON atr.id = c.enum_reason_id
       WHERE c.job_id = ?
-      ORDER BY c.created_on ASC, c.comment_id ASC`,
+      ORDER BY c.created_on DESC, c.comment_id DESC`,
     [jobId]
   );
   return rows.map(shapeRow);
@@ -148,6 +159,19 @@ async function addComment(jobId, { comments, comment_on, commented_by, appointme
     e.status = 400;
     throw e;
   }
+  // Outcome-driven job_stage override (2026-06-03 per ops):
+  //   Unreachable (comment_on=16) and Enquiry (comment_on=17) outcomes
+  //   must always stamp tbl_job_comment.job_stage = 9 (CALL_LATER)
+  //   regardless of what the FE supplied. The FE-supplied job_stage
+  //   was inconsistent across paths (sometimes the current job status,
+  //   sometimes missing) — pinning to 9 here is the single source of
+  //   truth so reports keyed on (comment_on, job_stage) stay coherent.
+  //   All other comment types keep the FE-supplied value (or null).
+  let effectiveJobStage = job_stage;
+  if (stage === 16 || stage === 17) {
+    effectiveJobStage = 9;
+  }
+
   // Conditionally include job_stage on deploys that carry the column.
   // The base INSERT shape always writes the seven legacy columns; the
   // optional job_stage is appended only when present so older DBs
@@ -165,7 +189,7 @@ async function addComment(jobId, { comments, comment_on, commented_by, appointme
       commented_by || null,
       enum_reason_id || null,
       efr_id || null,
-      job_stage || null,
+      effectiveJobStage || null,
     ];
   } else {
     insertSql = `INSERT INTO tbl_job_comment

@@ -19,6 +19,26 @@
 
 const Joi = require('joi');
 
+/*
+ * Shared Indian-mobile regex (2026-06-03): 10 digits starting with
+ * 6/7/8/9. Tightened from `/^[0-9]{10}$/` so the BE rejects junk like
+ * `1111111111` even when the FE validation is bypassed (curl, scripts,
+ * other clients). Same rule as the FE `INDIAN_MOBILE_REGEX` constant
+ * in Easyfix_CRM_UI/src/lib/format.ts. Custom error message is
+ * actionable; default Joi message is generic.
+ *
+ * `mobile` is reused on every contact-phone field below
+ * (contactNo / contact_no, contactAltNo / contact_alt_no, duplicate-
+ * check phone) so the rule only changes in one place if it's revised
+ * again (e.g. number-range extension).
+ */
+const INDIAN_MOBILE_REGEX = /^[6-9]\d{9}$/;
+const mobile = Joi.string()
+  .pattern(INDIAN_MOBILE_REGEX)
+  .messages({
+    'string.pattern.base': 'Must be a 10-digit Indian mobile starting with 6, 7, 8, or 9',
+  });
+
 /* ─── Path params ─────────────────────────────────────────────────── */
 
 const clientIdParam = Joi.object({
@@ -161,7 +181,7 @@ const updateClientBody = Joi.object({
 const createContactBody = Joi.object({
   contactName:  Joi.string().max(200).required(),
   contactEmail: Joi.string().email().max(255).required(),
-  contactNo:    Joi.string().pattern(/^[0-9]{10}$/).required(),
+  contactNo:    mobile.required(),
   contactAltNo: Joi.string().pattern(/^[0-9]{10}$/).optional().allow('', null),
   contactDesgn: Joi.string().max(100).optional().allow('', null),
   managerId:    Joi.number().integer().positive().optional(),
@@ -172,15 +192,15 @@ const updateContactBody = Joi.object({
   contactName:  Joi.string().max(200).optional(),
   contactEmail: Joi.string().email().max(255).optional(),
   contactNo:    Joi.string().pattern(/^[0-9]{10}$/).optional(),
-  contactAltNo: Joi.string().pattern(/^[0-9]{10}$/).optional().allow('', null),
+  contactAltNo: mobile.optional().allow('', null),
   contactDesgn: Joi.string().max(100).optional().allow('', null),
   managerId:    Joi.number().integer().positive().optional(),
   status:       Joi.number().integer().valid(0, 1).optional(),
   // snake_case
   contact_name:  Joi.string().max(200).optional(),
   contact_email: Joi.string().email().max(255).optional(),
-  contact_no:    Joi.string().pattern(/^[0-9]{10}$/).optional(),
-  contact_alt_no: Joi.string().pattern(/^[0-9]{10}$/).optional().allow('', null),
+  contact_no:    mobile.optional(),
+  contact_alt_no: mobile.optional().allow('', null),
   contact_desgn: Joi.string().max(100).optional().allow('', null),
   manager_id:    Joi.number().integer().positive().optional(),
 }).min(1);
@@ -189,7 +209,7 @@ const updateContactBody = Joi.object({
 // must be present.
 const contactDuplicateCheckQuery = Joi.object({
   email:     Joi.string().email().max(255).optional(),
-  phone:     Joi.string().pattern(/^[0-9]{10}$/).optional(),
+  phone:     mobile.optional(),
   excludeId: Joi.number().integer().positive().optional(),
 }).or('email', 'phone');
 
@@ -259,24 +279,61 @@ const updateCustomPropertyBody = Joi.object({
 /* ─── Client services (catalog) ───────────────────────────────────── */
 
 /*
+ * The 6 rate-card cost columns mirror the legacy "addEditServices.vm"
+ * modal exactly (each layer carries a Fixed AND a Variable component,
+ * independently settable — legacy JS allows both to be non-zero, see
+ * /Users/harshit/Documents/GitHub/EasyFix_CRM/.../addEditServices.vm).
+ * Variable rates are stored as percentages (e.g. 10 = 10%) and divided
+ * by 100 by utils/rate-card-calc.js before applying.
+ * Cap of 1e9 prevents float overflow on the cascade; min(0) prevents
+ * negative deductions which would invert the layer-take semantics.
+ */
+const costColumn = Joi.number().min(0).max(1e9).optional().allow(null);
+
+/*
  * Create: must specify category + at least one service type.
  *   chargeType is free-form (legacy strings: 'Fixed', 'Variable', etc.)
  *   totalCharge is a non-negative decimal.
+ *   The 6 cost columns + serviceStatus are accepted now so the legacy
+ *   "Add Client Service" modal can persist the full rate-card row in
+ *   ONE round-trip (was previously only category + types + total). The
+ *   shared util utils/rate-card-calc.js then computes the per-unit
+ *   cascade from these columns at listForClient() time.
  */
 const createClientServiceBody = Joi.object({
-  serviceCategoryId: Joi.number().integer().positive().required(),
-  serviceTypeIds:    Joi.array().items(Joi.number().integer().positive()).min(1).required(),
-  chargeType:        Joi.string().max(50).optional().allow('', null),
-  totalCharge:       Joi.number().min(0).optional(),
+  serviceCategoryId:      Joi.number().integer().positive().required(),
+  serviceTypeIds:         Joi.array().items(Joi.number().integer().positive()).min(1).required(),
+  chargeType:             Joi.string().max(50).optional().allow('', null),
+  totalCharge:            Joi.number().min(0).optional(),
+  // Layer 1 — Easyfix Direct
+  easyfixDirectFixed:     costColumn,
+  easyfixDirectVariable:  costColumn,
+  // Layer 2 — Overhead
+  overheadFixed:          costColumn,
+  overheadVariable:       costColumn,
+  // Layer 3 — Client Share
+  clientFixed:            costColumn,
+  clientVariable:         costColumn,
+  // Status — legacy form lets the operator create an inactive row
+  // (matches the dropdown on the legacy modal screenshot).
+  serviceStatus:          Joi.number().integer().valid(0, 1).optional(),
 }).options({ stripUnknown: true });
 
-// Update is partial; whitelist enforced server-side.
+// Update is partial; whitelist enforced server-side. Same 6 cost
+// columns are accepted on PUT so the "Edit Client Service" modal can
+// mutate any subset of fields in a single round-trip.
 const updateClientServiceBody = Joi.object({
-  serviceCategoryId: Joi.number().integer().positive().optional(),
-  serviceTypeIds:    Joi.array().items(Joi.number().integer().positive()).min(1).optional(),
-  chargeType:        Joi.string().max(50).optional().allow('', null),
-  totalCharge:       Joi.number().min(0).optional(),
-  serviceStatus:     Joi.number().integer().valid(0, 1).optional(),
+  serviceCategoryId:      Joi.number().integer().positive().optional(),
+  serviceTypeIds:         Joi.array().items(Joi.number().integer().positive()).min(1).optional(),
+  chargeType:             Joi.string().max(50).optional().allow('', null),
+  totalCharge:            Joi.number().min(0).optional(),
+  easyfixDirectFixed:     costColumn,
+  easyfixDirectVariable:  costColumn,
+  overheadFixed:          costColumn,
+  overheadVariable:       costColumn,
+  clientFixed:            costColumn,
+  clientVariable:         costColumn,
+  serviceStatus:          Joi.number().integer().valid(0, 1).optional(),
 }).min(1);
 
 /* ─── Rate cards (bulk upsert) ────────────────────────────────────── */

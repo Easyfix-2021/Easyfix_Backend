@@ -1097,6 +1097,16 @@ async function acceptSubmission(jobId, payload, pool) {
       if (hasAddrInstr) {
         setClauses.push('address_instruction = COALESCE(?, address_instruction)');
         params.push(addrInstr);
+        // 2026-06-03: per ops, `is_instruction_added` must stay 0 even
+        // when the text is non-empty. See services/job.service.js
+        // insertAddress() for the full rationale. When the customer's
+        // payload included the field at all, we still touch the column
+        // (reset to 0) so any pre-existing 1 from older code paths is
+        // cleared on submission — the invariant must hold cross-tier.
+        if (addrInstr != null) {
+          setClauses.push('is_instruction_added = ?');
+          params.push(0);
+        }
       }
       params.push(addressId);
 
@@ -1151,8 +1161,13 @@ async function acceptSubmission(jobId, payload, pool) {
         // integrity risk. Mismatched IDs are silently DROPPED (logged at
         // warn) rather than thrown — a stale or wrong ID submitted by the
         // customer shouldn't block their entire submission.
+        // Extended projection (2026-06-05) — pull all 7 rate-card columns
+        // so the cascade helper can compute the 5 charge columns at write
+        // time without a second round-trip. Same SELECT, more columns.
         const [csRows] = await conn.query(
-          `SELECT service_type_id, service_catg_id
+          `SELECT service_type_id, service_catg_id,
+                  total_amount, easyfix_direct_fixed, easyfix_direct_variable,
+                  overhead_fixed, overhead_variable, client_fixed, client_variable
              FROM tbl_client_service
             WHERE client_service_id = ? AND client_id = ? LIMIT 1`,
           [csId, clientId],
@@ -1168,12 +1183,14 @@ async function acceptSubmission(jobId, payload, pool) {
         if (serviceTypeId == null) continue;
         const quantity = pick.quantity || 1;
         // If the same type appears twice in the payload, keep the highest
-        // quantity — defensive against malformed clients.
+        // quantity — defensive against malformed clients. Carry the full
+        // rate-card row so the write step can compute charges.
         const prev = resolved.get(serviceTypeId);
         if (!prev || (quantity > prev.quantity)) {
           resolved.set(serviceTypeId, {
             service_catg_id: csRows[0].service_catg_id,
             quantity,
+            rateCard: csRows[0], // for utils/rate-card-calc.js charges cascade
           });
         }
       }
@@ -1210,19 +1227,31 @@ async function acceptSubmission(jobId, payload, pool) {
       }
 
       // d) Apply each submitted pick: UPDATE active row, or INSERT fresh
-      //    (never resurrect a soft-deleted ops removal).
+      //    (never resurrect a soft-deleted ops removal). Charges are
+      //    computed from the rate-card row captured in step (a) via the
+      //    shared cascade helper.
+      const { computeJobServiceCharges } = require('../utils/rate-card-calc');
       for (const [serviceTypeId, info] of resolved.entries()) {
+        const ch = computeJobServiceCharges(info.rateCard, info.quantity);
         const activeId = activeByService.get(serviceTypeId);
         if (activeId) {
-          // Active row already exists — refresh quantity, keep status=1.
+          // Active row already exists — refresh quantity + recompute the
+          // 5 charge columns, keep status=1.
           await conn.query(
             `UPDATE tbl_job_services
                 SET quantity            = ?,
                     job_service_status  = 1,
                     service_type_id     = ?,
-                    service_category_id = ?
+                    service_category_id = ?,
+                    total_charge        = ?,
+                    total_cost          = ?,
+                    client_charge       = ?,
+                    easyfix_charge      = ?,
+                    easyfixer_charge    = ?
               WHERE job_service_id = ?`,
-            [info.quantity, serviceTypeId, info.service_catg_id, activeId],
+            [info.quantity, serviceTypeId, info.service_catg_id,
+             ch.total_charge, ch.total_cost, ch.client_charge, ch.easyfix_charge, ch.easyfixer_charge,
+             activeId],
           );
         } else {
           // No active row. Either soft-deleted history exists (refuse to
@@ -1231,9 +1260,11 @@ async function acceptSubmission(jobId, payload, pool) {
           // fresh customer-submitted row.
           await conn.query(
             `INSERT INTO tbl_job_services
-               (job_id, service_id, quantity, service_type_id, service_category_id, job_service_status)
-             VALUES (?, ?, ?, ?, ?, 1)`,
-            [jobId, serviceTypeId, info.quantity, serviceTypeId, info.service_catg_id],
+               (job_id, service_id, quantity, service_type_id, service_category_id, job_service_status,
+                total_charge, total_cost, client_charge, easyfix_charge, easyfixer_charge)
+             VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`,
+            [jobId, serviceTypeId, info.quantity, serviceTypeId, info.service_catg_id,
+             ch.total_charge, ch.total_cost, ch.client_charge, ch.easyfix_charge, ch.easyfixer_charge],
           );
           if (softDeletedTypes.has(serviceTypeId)) {
             logger.info(
@@ -1243,6 +1274,13 @@ async function acceptSubmission(jobId, payload, pool) {
           }
         }
       }
+      // Mirror onto tbl_job.client_services CSV — same helper as
+      // job.service.js::create + update so every services mutator stays
+      // in sync with the normalized table (legacy reports read the flat
+      // column). Inline require to avoid a circular-dep risk at module
+      // load time — only fires when the customer actually submits.
+      const { recomputeClientServicesCsv } = require('./job.service');
+      await recomputeClientServicesCsv(conn, jobId);
     }
 
     await conn.commit();

@@ -805,19 +805,125 @@ router.put(
  * Returns the client's subscribed services with category name AND
  * resolved service-type names attached per row. Designed as exactly
  * 2 SQL queries regardless of row count — see service-layer notes.
+ *
+ * SHARED CHARGE CASCADE — each row carries a `charges` object computed
+ * from the rate-card columns via utils/rate-card-calc.js (the same
+ * helper used at tbl_job_services write time). See the docblock there
+ * for the formula. Per-unit values shown here; the actual job-line
+ * row in tbl_job_services multiplies by the operator's quantity.
  */
-router.get('/:clientId/services', async (req, res, next) => {
-  try {
-    if (!(await loadAndGuardClient(req, res))) return;
-    const rows = await clientServicesSvc.listForClient(req.params.clientId);
-    modernOk(res, rows);
-  } catch (e) { next(e); }
-});
+const { describe: describeRoute } = require('../../docs/openapi-autogen');
+router.get('/:clientId/services',
+  describeRoute('Get client rate-card services with charge cascade', {
+    description: [
+      'Returns the client\'s subscribed services (active only) with:',
+      '  • basic catalog (service category, service types, status)',
+      '  • the 6 rate-card cost columns (easyfix_direct_fixed, ',
+      '    easyfix_direct_variable, overhead_fixed, overhead_variable, ',
+      '    client_fixed, client_variable)',
+      '  • a per-unit `charges` object computed via the shared cascade',
+      '    (see utils/rate-card-calc.js)',
+      '',
+      '**Charge cascade formula** (variable% then fixed, per layer):',
+      '  Start with `total_charge` (unit price = tbl_client_service.total_amount).',
+      '  L1 Easyfix Direct: deduct (var% × remaining) + fixed',
+      '  L2 Overhead:       deduct (var% × remaining) + fixed',
+      '  L3 Client Share:   deduct (var% × remaining) + fixed',
+      '  L4 Easyfixer:      everything left',
+      '',
+      'Variable rates are stored as % (e.g. 10 = 10%) and divided by 100',
+      'before applying. `easyfix_charge` BUNDLES L1+L2 since tbl_job_services',
+      'has no overhead_charge column (keeps sum-to-total invariant).',
+      '',
+      '**Example**: total_amount=400, easyfix_direct_fixed=200/var=10, ',
+      'overhead_fixed=10/var=20, client=0/0 → easyfix_charge=282, ',
+      'client_charge=0, easyfixer_charge=118.',
+    ].join('\n'),
+    tags: ['Admin — Clients'],
+  }),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndGuardClient(req, res))) return;
+      // ?includeInactive=1 surfaces soft-deleted (service_status=0) rows
+      // too, matching the legacy Manage Client Services page which shows
+      // both Active and Inactive in the same paginated list. Default
+      // false preserves the existing dropdown/picker behaviour elsewhere.
+      const includeInactive = String(req.query.includeInactive || '') === '1'
+        || String(req.query.includeInactive || '') === 'true';
+      const rows = await clientServicesSvc.listForClient(
+        req.params.clientId,
+        { includeInactive },
+      );
+      modernOk(res, rows);
+    } catch (e) { next(e); }
+  },
+);
+
+/*
+ * GET /services/:id — single-row fetch with cascade `charges` attached.
+ *
+ * Why this exists in addition to the list endpoint: the legacy Edit
+ * Client Services modal needs to prefill 12 fields (category + types +
+ * charge_type + total_amount + 6 cost columns + status). Fetching just
+ * one row by id is cheaper than re-listing all of a client's services
+ * and filtering on the FE, and the response carries the per-unit
+ * cascade ready to render in the "Show Formula" expandable helper.
+ */
+router.get(
+  '/services/:id',
+  describeRoute('Get a single client rate-card service with charge cascade', {
+    description: [
+      'Single-row fetch used by the Edit Client Services modal to prefill',
+      'every field (category, service types, charge type, total amount,',
+      'and the 6 rate-card cost columns) plus the computed per-unit',
+      '`charges` breakdown from the shared cascade (utils/rate-card-calc.js).',
+      '',
+      'Returns 404 when the id does not exist or has been hard-deleted.',
+      'Soft-deleted rows (service_status=0) are STILL returned here so',
+      'operators can edit and reactivate an inactive subscription.',
+    ].join('\n'),
+    tags: ['Admin — Clients'],
+  }),
+  async (req, res, next) => {
+    try {
+      const row = await clientServicesSvc.getOne(req.params.id);
+      if (!row) return modernError(res, 404, 'client service not found');
+      modernOk(res, row);
+    } catch (e) { next(e); }
+  },
+);
 
 router.post(
   '/:clientId/services',
   requireClientEdit,
   validate(v.createClientServiceBody),
+  describeRoute('Create a client rate-card service row (full cascade)', {
+    description: [
+      'Inserts one tbl_client_service row capturing the whole legacy',
+      '"Add Client Service" modal in ONE POST. Accepts:',
+      '  • serviceCategoryId, serviceTypeIds (multi-select)',
+      '  • chargeType (free string — legacy "Fixed"/"Variable"/etc.)',
+      '  • totalCharge (per-unit price; tbl_client_service.total_amount)',
+      '  • 6 cost columns (Easyfix Direct/Overhead/Client Share × Fixed/Variable)',
+      '  • serviceStatus (defaults to 1 = Active when omitted)',
+      '',
+      'Variable rates are stored as % (e.g. 10 = 10%) — the cascade in',
+      'utils/rate-card-calc.js divides by 100 before applying. Both Fixed',
+      'AND Variable can be non-zero on the same layer (legacy form behaviour).',
+      '',
+      '**Cascade formula** (variable% then fixed, per layer):',
+      '  remaining ← totalCharge',
+      '  L1 Easyfix Direct: cut = (remaining × var%) + fixed',
+      '  L2 Overhead:       cut = (remaining × var%) + fixed',
+      '  L3 Client Share:   cut = (remaining × var%) + fixed',
+      '  L4 Easyfixer:      everything left after L1+L2+L3',
+      '',
+      '`easyfix_charge` (on tbl_job_services) BUNDLES L1+L2 since there',
+      'is no overhead_charge column — preserves the invariant',
+      '`easyfix_charge + client_charge + easyfixer_charge = total_cost`.',
+    ].join('\n'),
+    tags: ['Admin — Clients'],
+  }),
   async (req, res, next) => {
     try {
       if (!(await loadAndGuardClient(req, res))) return;
@@ -835,6 +941,22 @@ router.put(
   '/services/:id',
   requireClientEdit,
   validate(v.updateClientServiceBody),
+  describeRoute('Partial-update a client rate-card service row', {
+    description: [
+      'Partial update — any subset of these fields:',
+      '  serviceCategoryId, serviceTypeIds, chargeType, totalCharge,',
+      '  easyfixDirectFixed, easyfixDirectVariable,',
+      '  overheadFixed, overheadVariable,',
+      '  clientFixed, clientVariable,',
+      '  serviceStatus',
+      '',
+      'Fields not present in the body are LEFT UNTOUCHED. Sending null',
+      'explicitly clears a cost column (the cascade then treats it as 0).',
+      '',
+      'See POST /:clientId/services for the full cascade formula docs.',
+    ].join('\n'),
+    tags: ['Admin — Clients'],
+  }),
   async (req, res, next) => {
     try {
       const affected = await clientServicesSvc.update(req.params.id, req.body);

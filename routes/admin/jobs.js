@@ -745,17 +745,20 @@ router.patch('/escalated/:tableId', async (req, res, next) => {
  * Route-order: declared BEFORE `/:id` (same gotcha as /transaction,
  * /action-reasons, /escalated).
  */
-const DUE_TO_USER_TYPE = { customer: 1, client: 2, easyfix: 3, technician: 4 };
+// DUE_TO_USER_TYPE + ACTION_TYPE_BY_MODE now live in services/reason-codes.js
+// — promoted from this file 2026-06-04 so cross-tier callers share one map.
+const { DUE_TO_USER_TYPE, ACTION_TYPE_BY_MODE, ACTION_TYPE } = require('../../services/reason-codes');
+
 router.get('/comment-reasons', async (req, res, next) => {
   try {
     const dueRaw = String(req.query.dueTo || '').toLowerCase().replace(/\s+/g, '');
-    const userType = DUE_TO_USER_TYPE[dueRaw] || 2; // legacy default
+    const userType = DUE_TO_USER_TYPE[dueRaw] || 2; // legacy default = Client
     const [rows] = await imagePool.query(
       `SELECT id, action_desc FROM action_taken_reason
-        WHERE action_type = 5 AND user_type = ?
+        WHERE action_type = ? AND user_type = ?
               AND (status IS NULL OR status = 1)
         ORDER BY id ASC`,
-      [userType]
+      [ACTION_TYPE.ADD_REMARKS, userType]
     );
     const items = rows
       .map((r) => ({ id: r.id, label: String(r.action_desc || '').trim() }))
@@ -924,16 +927,31 @@ router.get('/:id/transaction', validate(idParam, 'params'), scopedJob, async (re
 });
 
 /*
- * GET /api/admin/jobs/action-reasons?type=<unreachable|enquiry>
+ * GET /api/admin/jobs/action-reasons?type=<unreachable|enquiry>&dueTo=<customer|client|easyfix|technician>
  *
- * Drives the dropdown inside the Book-New-Call "Job Unreachable" /
+ * Drives the dropdown inside the Confirm & Schedule "Job Unreachable" /
  * "Job Enquiry" popup (legacy CRM parity). Reasons come from
- * `action_taken_reason` joined to `action_type`.
+ * `action_taken_reason` filtered by BOTH action_type AND user_type, so
+ * the list narrows to the operator's "Pending Due To" / "Open Due To"
+ * pick — mirrors the comment-reasons (Add Remarks) endpoint above.
  *
  * Schema (verified 2026-05-18 against easyfix DB):
  *   action_type         { id, type ("Un Reachable"|"Enquiry"|...), description }
  *   action_taken_reason { id, action_type (FK→action_type.id), action_desc,
  *                         status (1=active), user_type, is_new }
+ *
+ * action_type IDs (confirmed by ops 2026-06-04):
+ *   25 → Unreachable  (legacy `action_type.type` was 'Un Reachable')
+ *   24 → Enquiry      (legacy `action_type.type` was 'Enquiry')
+ * Previously this endpoint did a fragile LOWER(REPLACE(...)) string match
+ * against the legacy `type` column. Hardcoded integers are explicit + safe
+ * against legacy label drift; the string column stays untouched as a
+ * human-readable label only.
+ *
+ * user_type mapping is shared with the comment-reasons endpoint above —
+ * `DUE_TO_USER_TYPE` constant. Missing/unknown `dueTo` defaults to
+ * user_type=2 (Client) so older callers without the param still get a
+ * sensible list (matches the comment-reasons default).
  *
  * Route-order note: declared BEFORE `/:id` so Express doesn't try to
  * validate the literal string "action-reasons" as a numeric job id —
@@ -943,25 +961,21 @@ router.get('/action-reasons', async (req, res, next) => {
   try {
     const type = String(req.query.type || '').trim().toLowerCase();
     if (!type) return modernError(res, 400, 'type is required (unreachable|enquiry)');
+    // Strip whitespace/underscores/dashes so 'un_reachable' / 'un-reachable' /
+    // 'unreachable' / 'Un Reachable' all map to the same bucket.
+    const modeKey = type.replace(/[\s_-]/g, '');
+    const actionTypeId = ACTION_TYPE_BY_MODE[modeKey];
+    if (!actionTypeId) return modernOk(res, []);
 
-    // Strip spaces/underscores/dashes on both sides so the URL token
-    // "unreachable" matches the DB value "Un Reachable", "enquiry"
-    // matches "Enquiry", etc.
-    const needle = type.replace(/[\s_-]/g, '');
-    const [typeRows] = await pool.query(
-      `SELECT id, type FROM action_type
-        WHERE LOWER(REPLACE(REPLACE(REPLACE(type, ' ', ''), '_', ''), '-', '')) = ?
-        ORDER BY id DESC LIMIT 1`,
-      [needle],
-    );
-    if (!typeRows.length) return modernOk(res, []);
-    const typeId = typeRows[0].id;
+    const dueRaw = String(req.query.dueTo || '').toLowerCase().replace(/\s+/g, '');
+    const userType = DUE_TO_USER_TYPE[dueRaw] || 2; // legacy default = Client
 
     const [reasonRows] = await pool.query(
       `SELECT id, action_desc FROM action_taken_reason
-        WHERE action_type = ? AND (status IS NULL OR status = 1)
+        WHERE action_type = ? AND user_type = ?
+              AND (status IS NULL OR status = 1)
         ORDER BY id ASC`,
-      [typeId],
+      [actionTypeId, userType],
     );
     const items = reasonRows
       .map((r) => ({ id: r.id, label: String(r.action_desc || '').trim() }))
@@ -1447,7 +1461,24 @@ router.delete('/:id/services/:jobServiceId',
  * Validator + scopedJob mirror the sibling DELETE/restore endpoints
  * above so authz and shape behaviour stay symmetric.
  */
+const { describe: describeJobsRoute } = require('../../docs/openapi-autogen');
 router.patch('/:id/services/:jobServiceId',
+  describeJobsRoute('Update quantity on a job service line (recomputes charges)', {
+    description: [
+      'Bumps the quantity on a single active tbl_job_services row AND',
+      'recomputes the 5 charge columns (total_charge, total_cost,',
+      'client_charge, easyfix_charge, easyfixer_charge) via the shared',
+      'rate-card cascade (utils/rate-card-calc.js).',
+      '',
+      'Quantity change matters because `total_cost` = per-unit × qty,',
+      'and the variable% layers cascade off the per-unit price — so a',
+      'qty bump scales all dependent shares proportionally.',
+      '',
+      'Returns the updated row\'s computed `charges` object so the FE',
+      'can render the breakdown without a refetch.',
+    ].join('\n'),
+    tags: ['Admin — Jobs'],
+  }),
   validate(require('joi').object({
     id: require('joi').number().integer().positive().required(),
     jobServiceId: require('joi').number().integer().positive().required(),
@@ -1461,18 +1492,36 @@ router.patch('/:id/services/:jobServiceId',
       const jobId = Number(req.params.id);
       const jobServiceId = Number(req.params.jobServiceId);
       const { quantity } = req.body;
+      // Quantity change → all 5 charge columns recompute via the shared
+      // cascade helper (utils/rate-card-calc.js). Look up the existing
+      // row's service_id (= client_service_id) so we can fetch the rate
+      // card and re-run the math.
+      const [existing] = await pool.query(
+        `SELECT service_id FROM tbl_job_services WHERE job_service_id = ? AND job_id = ? LIMIT 1`,
+        [jobServiceId, jobId],
+      );
+      if (!existing.length) return res.status(404).json({ error: 'service not found' });
+      const { loadRateCardRow, computeJobServiceCharges } = require('../../utils/rate-card-calc');
+      const rateCard = await loadRateCardRow(pool, existing[0].service_id);
+      const ch = computeJobServiceCharges(rateCard, quantity);
       const [r] = await pool.query(
         `UPDATE tbl_job_services
-            SET quantity = ?
+            SET quantity = ?,
+                total_charge = ?,
+                total_cost = ?,
+                client_charge = ?,
+                easyfix_charge = ?,
+                easyfixer_charge = ?
           WHERE job_id = ?
             AND job_service_id = ?
             AND (job_service_status IS NULL OR job_service_status = 1)`,
-        [quantity, jobId, jobServiceId],
+        [quantity, ch.total_charge, ch.total_cost, ch.client_charge, ch.easyfix_charge, ch.easyfixer_charge,
+         jobId, jobServiceId],
       );
       if (!r.affectedRows) {
         return res.status(404).json({ error: 'service not found or inactive' });
       }
-      modernOk(res, { updated: true, job_id: jobId, job_service_id: jobServiceId, quantity });
+      modernOk(res, { updated: true, job_id: jobId, job_service_id: jobServiceId, quantity, charges: ch });
     } catch (e) { next(e); }
   });
 
@@ -1490,6 +1539,24 @@ router.patch('/:id/services/:jobServiceId',
  * endpoint without losing the original PK.
  */
 router.post('/:id/services',
+  describeJobsRoute('Append a service line to a job (computes charges)', {
+    description: [
+      'Appends a NEW row to tbl_job_services OR reactivates a previously',
+      'soft-deleted row for the same (job_id, service_id) pair. Either way,',
+      'the 5 charge columns (total_charge, total_cost, client_charge,',
+      'easyfix_charge, easyfixer_charge) are populated from the rate-card',
+      'cascade — see utils/rate-card-calc.js for the formula.',
+      '',
+      '`service_id` is the tbl_client_service.client_service_id from the',
+      'client\'s rate card. The endpoint looks up that row to drive the',
+      'cascade; missing/invalid IDs yield all-zero charges (degenerate but',
+      'non-fatal so the row still lands).',
+      '',
+      'Returns the new/reactivated `job_service_id` + the computed',
+      '`charges` object for the FE to render without a refetch.',
+    ].join('\n'),
+    tags: ['Admin — Jobs'],
+  }),
   validate(idParam, 'params'),
   validate(require('joi').object({
     service_id:          require('joi').number().integer().positive().required(),
@@ -1509,24 +1576,40 @@ router.post('/:id/services',
           ORDER BY job_service_id DESC LIMIT 1`,
         [jobId, service_id],
       );
+      // Rate-card lookup + cascade — single source of truth for the 5
+      // charge columns (see utils/rate-card-calc.js). Applied to both the
+      // reactivate-existing path and the fresh-insert path so the row
+      // always carries up-to-date financials.
+      const { loadRateCardRow, computeJobServiceCharges } = require('../../utils/rate-card-calc');
+      const rateCard = await loadRateCardRow(pool, service_id);
+      const ch = computeJobServiceCharges(rateCard, quantity);
       if (existing.length > 0) {
         const row = existing[0];
         await pool.query(
           `UPDATE tbl_job_services
-              SET job_service_status = 1, quantity = ?
+              SET job_service_status = 1,
+                  quantity = ?,
+                  total_charge = ?,
+                  total_cost = ?,
+                  client_charge = ?,
+                  easyfix_charge = ?,
+                  easyfixer_charge = ?
             WHERE job_service_id = ?`,
-          [quantity, row.job_service_id],
+          [quantity, ch.total_charge, ch.total_cost, ch.client_charge, ch.easyfix_charge, ch.easyfixer_charge,
+           row.job_service_id],
         );
-        return modernOk(res, { reactivated: true, job_service_id: row.job_service_id });
+        return modernOk(res, { reactivated: true, job_service_id: row.job_service_id, charges: ch });
       }
       const [ins] = await pool.query(
         `INSERT INTO tbl_job_services
-           (job_id, service_id, service_type_id, service_category_id, quantity, job_service_status)
-         VALUES (?, ?, ?, ?, ?, 1)`,
-        [jobId, service_id, service_type_id || null, service_category_id || null, quantity],
+           (job_id, service_id, service_type_id, service_category_id, quantity, job_service_status,
+            total_charge, total_cost, client_charge, easyfix_charge, easyfixer_charge)
+         VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`,
+        [jobId, service_id, service_type_id || null, service_category_id || null, quantity,
+         ch.total_charge, ch.total_cost, ch.client_charge, ch.easyfix_charge, ch.easyfixer_charge],
       );
       res.status(201);
-      modernOk(res, { added: true, job_service_id: ins.insertId });
+      modernOk(res, { added: true, job_service_id: ins.insertId, charges: ch });
     } catch (e) { next(e); }
   });
 

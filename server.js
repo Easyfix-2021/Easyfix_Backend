@@ -89,6 +89,15 @@ async function start() {
     process.exit(1);
   }
 
+  // Warm the easyfix_properties cache so getProperty(...) is sync from
+  // the first request onward. Failure here is non-fatal — the service
+  // logs a warn and callers fall back to process.env.
+  try {
+    await require('./services/properties.service').preload();
+  } catch (err) {
+    logger.warn(`Properties preload failed — ${err.message}. Continuing with env-only config.`);
+  }
+
   // Schema parity check — fails the boot if any column the code touches
   // is missing from the live INFORMATION_SCHEMA. Caught 6 phantom-column
   // bugs during the final migration audit; cheap to run on every start

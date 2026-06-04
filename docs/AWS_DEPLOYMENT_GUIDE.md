@@ -1,6 +1,18 @@
 # AWS Deployment Guide — EasyFix_Backend (Node.js/Express API)
 
-This guide walks through deploying the **unified backend** (`EasyFix_Backend`) to AWS using **EC2 + Nginx + PM2**, with **GitHub Actions** auto-deploying on `QA` and `Production` branch merges.
+> ⚠️ **Canonical bootstrap doc has moved.** Both QA and Production
+> now use Docker + SSM (not the PM2/Nginx flow described below).
+> Read [`AWS_QA_BOOTSTRAP.md`](./AWS_QA_BOOTSTRAP.md) for the current
+> bootstrap + env-file conventions (`.env` vs `backend.env` split,
+> required vs auto-touched files per pipeline, etc.).
+>
+> This file is retained for historical reference + still-valid sections
+> on Nginx, DB migrations, and PM2-only nuances (in case a legacy PM2
+> host ever needs touching). Skip ahead to the section you need.
+
+This guide originally walked through deploying the **unified backend**
+(`EasyFix_Backend`) to AWS using **EC2 + Nginx + PM2**, with
+**GitHub Actions** auto-deploying on `QA` and `Production` branch merges.
 
 > **Companion guide:** the frontend (`Easyfix_CRM_UI`) has its own [AWS_DEPLOYMENT_GUIDE.md](../../Easyfix_CRM_UI/docs/AWS_DEPLOYMENT_GUIDE.md). Set them up in parallel — frontend Nginx proxies `/api/*` to this backend.
 

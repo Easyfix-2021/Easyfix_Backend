@@ -1,5 +1,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
+const { getProperty } = require('./properties.service');
 
 /*
  * Read-only lookup queries powering dropdowns across CRM_UI / Client_UI / Mobile.
@@ -282,7 +283,12 @@ async function menuActions() {
  * the same deploy that ships the underlying flow as production-ready.
  */
 function resolveVisibleMenuIds() {
-  const raw = String(process.env.NEW_CRM_VISIBLE_MENU_IDS || '').trim();
+  const raw = String(
+    // 2026-06-03 per ops: easyfix_properties is now the SOLE source of
+    // truth. Env fallback dropped so a stale env var on a pod can't
+    // override a fresh DB value.
+    getProperty('new.crm.visible.menu.ids') ?? ''
+  ).trim();
   if (!raw) return null;                       // null = filter inactive, show all
   const ids = raw.split(',')
     .map((s) => Number(String(s).trim()))
@@ -291,7 +297,10 @@ function resolveVisibleMenuIds() {
 }
 
 function resolveMenuOverrideEmails() {
-  const raw = String(process.env.NEW_CRM_MENU_OVERRIDE_EMAILS || '').trim();
+  const raw = String(
+    // easyfix_properties is the SOLE source of truth (2026-06-03).
+    getProperty('new.crm.menu.override.emails') ?? ''
+  ).trim();
   if (!raw) return new Set();
   return new Set(
     raw.split(',')

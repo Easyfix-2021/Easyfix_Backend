@@ -1107,8 +1107,13 @@ async function getStatusCounts({ ownerId, easyfixerId, scope } = {}) {
     params.push(easyfixerId);
   }
   if (scope) {
-    const c = scope.clients, ci = scope.cities, v = scope.verticals;
-    if ((c && c.mode === 'none') || (ci && ci.mode === 'none') || (v && v.mode === 'none')) {
+    const c = scope.clients, ci = scope.cities, st = scope.states, v = scope.verticals;
+    if (
+      (c  && c.mode  === 'none') ||
+      (ci && ci.mode === 'none') ||
+      (st && st.mode === 'none') ||
+      (v  && v.mode  === 'none')
+    ) {
       clauses.push('1=0');
     }
     if (c && c.mode === 'allow' && c.ids.length) {
@@ -1119,6 +1124,15 @@ async function getStatusCounts({ ownerId, easyfixerId, scope } = {}) {
       clauses.push(`ad.city_id IN (${ci.ids.map(() => '?').join(',')})`);
       params.push(...ci.ids);
     }
+    // States filter (2026-06-03) — previously dropped silently, which
+    // meant operators with state-scoped permissions saw every job in
+    // every state. Joins tbl_city via the address's city_id to read
+    // its state_id. Only fires when scope.states is set + 'allow';
+    // 'all' means the operator can see all states + no filter needed.
+    if (st && st.mode === 'allow' && st.ids.length) {
+      clauses.push(`ct.state_id IN (${st.ids.map(() => '?').join(',')})`);
+      params.push(...st.ids);
+    }
     if (v && v.mode === 'allow' && v.ids.length && hasVerticalCol) {
       clauses.push(`cl.vertical_id IN (${v.ids.map(() => '?').join(',')})`);
       params.push(...v.ids);
@@ -1126,10 +1140,15 @@ async function getStatusCounts({ ownerId, easyfixerId, scope } = {}) {
   }
 
   // Only JOIN tables we actually filter against — cheap on the indexed FKs.
-  const needsAd = scope?.cities?.mode === 'allow';
+  // tbl_address is needed whenever cities OR states is restricted (states
+  // joins through city → tbl_city). tbl_city is needed only for states.
+  // tbl_client is needed only for verticals.
+  const needsAd = scope?.cities?.mode === 'allow' || scope?.states?.mode === 'allow';
+  const needsCt = scope?.states?.mode === 'allow';
   const needsCl = scope?.verticals?.mode === 'allow' && hasVerticalCol;
   const joins = [
     needsAd ? 'LEFT JOIN tbl_address ad ON ad.address_id = j.fk_address_id' : '',
+    needsCt ? 'LEFT JOIN tbl_city    ct ON ct.city_id    = ad.city_id'      : '',
     needsCl ? 'LEFT JOIN tbl_client  cl ON cl.client_id  = j.fk_client_id'  : '',
   ].filter(Boolean).join(' ');
 
@@ -1206,8 +1225,13 @@ async function getAttentionSummary({ scope } = {}) {
     const clauses = [];
     const params = [];
     if (scope) {
-      const c = scope.clients, ci = scope.cities, v = scope.verticals;
-      if ((c && c.mode === 'none') || (ci && ci.mode === 'none') || (v && v.mode === 'none')) {
+      const c = scope.clients, ci = scope.cities, st = scope.states, v = scope.verticals;
+      if (
+        (c  && c.mode  === 'none') ||
+        (ci && ci.mode === 'none') ||
+        (st && st.mode === 'none') ||
+        (v  && v.mode  === 'none')
+      ) {
         clauses.push('1=0');
       }
       if (c && c.mode === 'allow' && c.ids.length) {
@@ -1218,15 +1242,27 @@ async function getAttentionSummary({ scope } = {}) {
         clauses.push(`ad.city_id IN (${ci.ids.map(() => '?').join(',')})`);
         params.push(...ci.ids);
       }
+      // States filter (2026-06-03) — kept in sync with getStatusCounts.
+      // Joins tbl_city via the address's city_id to read state_id.
+      if (st && st.mode === 'allow' && st.ids.length) {
+        clauses.push(`ct.state_id IN (${st.ids.map(() => '?').join(',')})`);
+        params.push(...st.ids);
+      }
       if (v && v.mode === 'allow' && v.ids.length && hasVerticalCol) {
         clauses.push(`cl.vertical_id IN (${v.ids.map(() => '?').join(',')})`);
         params.push(...v.ids);
       }
     }
-    const needsAd = scope?.cities?.mode === 'allow';
+    // Same JOIN strategy as getStatusCounts: tbl_address needed
+    // whenever cities OR states filter is on; tbl_city only for states;
+    // tbl_client only for verticals. Each is LEFT JOIN so missing FKs
+    // don't drop the row from the count.
+    const needsAd = scope?.cities?.mode === 'allow' || scope?.states?.mode === 'allow';
+    const needsCt = scope?.states?.mode === 'allow';
     const needsCl = scope?.verticals?.mode === 'allow' && hasVerticalCol;
     const joins = [
       needsAd ? `LEFT JOIN tbl_address ad ON ad.address_id = ${jobAlias}.fk_address_id` : '',
+      needsCt ? `LEFT JOIN tbl_city    ct ON ct.city_id    = ad.city_id`                : '',
       needsCl ? `LEFT JOIN tbl_client  cl ON cl.client_id  = ${jobAlias}.fk_client_id`  : '',
     ].filter(Boolean).join(' ');
     return { clauses, params, joins };
@@ -1437,6 +1473,31 @@ function composeRemarks(input) {
   return parts.length ? parts.join('\n') : null;
 }
 
+/*
+ * Rebuild tbl_job.client_services CSV from current ACTIVE tbl_job_services
+ * rows. Called from every job-services mutator (create + update + magic-link
+ * acceptSubmission) so the flat legacy column stays in sync with the
+ * normalized table — legacy CRM reads + reports rely on it. Querying the
+ * DB rather than computing from the input payload keeps the helper robust
+ * against partial updates and soft-deleted rows.
+ */
+async function recomputeClientServicesCsv(conn, jobId) {
+  if (!jobId) return;
+  const [rows] = await conn.query(
+    `SELECT service_id FROM tbl_job_services
+      WHERE job_id = ? AND job_service_status = 1
+      ORDER BY job_service_id ASC`,
+    [jobId],
+  );
+  const ids = rows.map((r) => Number(r.service_id))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  const csv = ids.length > 0 ? ids.join(',') : null;
+  await conn.query(
+    'UPDATE tbl_job SET client_services = ? WHERE job_id = ?',
+    [csv, jobId],
+  );
+}
+
 async function insertAddress(conn, customerId, addr, actor) {
   // Column-presence probe — production tbl_address may or may not carry
   // the `address_instruction` column depending on deploy. We branch the
@@ -1453,38 +1514,66 @@ async function insertAddress(conn, customerId, addr, actor) {
     hasInstruction = cols.length > 0;
   } catch (_e) { /* defensively assume absent on probe failure */ }
 
+  // is_instruction_added — legacy "does this address carry notes?" flag.
+  //
+  // 2026-06-03: per ops, this column must stay 0 even when
+  // `address_instruction` is non-empty. Previously we kept it in sync
+  // with the text content (1 when filled, 0 when blank), but that
+  // collided with downstream legacy logic that uses the flag as a
+  // gate (rule TBD). Persisting 0 unconditionally is the agreed
+  // invariant; the actual text still lives in `address_instruction`
+  // and is the canonical source for reads. We retain the `hasInstructionText`
+  // local in case future flows need it — but it no longer drives the column.
+  const hasInstructionText = addr.address_instruction != null
+    && String(addr.address_instruction).trim() !== '';
+  // Silence the unused-binding hint for the local — the comment above
+  // documents why it's kept around for future readers.
+  void hasInstructionText;
+
+  let addressId;
   if (hasInstruction) {
     const [ins] = await conn.query(
       `INSERT INTO tbl_address
          (customer_id, address, building, landmark, locality, city_id, pin_code, gps_location,
-          mobile_number, address_instruction, created_by, insert_date, update_date)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          mobile_number, address_instruction, is_instruction_added,
+          created_by, insert_date, update_date)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         customerId,
         addr.address, addr.building || null, addr.landmark || null, addr.locality || null,
         addr.city_id, addr.pin_code, addr.gps_location || null,
         addr.mobile_number || null, addr.address_instruction || null,
+        // is_instruction_added pinned to 0 per ops (2026-06-03) —
+        // see the docblock above hasInstructionText for the rationale.
+        0,
         actor?.user_id || null,
         new Date(), new Date(),
       ]
     );
-    return ins.insertId;
+    addressId = ins.insertId;
+  } else {
+    // Fallback path (legacy DBs) — address_instruction silently dropped.
+    const [ins] = await conn.query(
+      `INSERT INTO tbl_address
+         (customer_id, address, building, landmark, locality, city_id, pin_code, gps_location,
+          mobile_number, created_by, insert_date, update_date)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        customerId,
+        addr.address, addr.building || null, addr.landmark || null, addr.locality || null,
+        addr.city_id, addr.pin_code, addr.gps_location || null,
+        addr.mobile_number || null, actor?.user_id || null,
+        new Date(), new Date(),
+      ]
+    );
+    addressId = ins.insertId;
   }
-  // Fallback path (legacy DBs) — address_instruction silently dropped.
-  const [ins] = await conn.query(
-    `INSERT INTO tbl_address
-       (customer_id, address, building, landmark, locality, city_id, pin_code, gps_location,
-        mobile_number, created_by, insert_date, update_date)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      customerId,
-      addr.address, addr.building || null, addr.landmark || null, addr.locality || null,
-      addr.city_id, addr.pin_code, addr.gps_location || null,
-      addr.mobile_number || null, actor?.user_id || null,
-      new Date(), new Date(),
-    ]
-  );
-  return ins.insertId;
+
+  // Free-text instruction is persisted directly on tbl_address.address_instruction
+  // via the column-probe branch above — no companion-table write needed
+  // (2026-06-04 simplification: dropped the `address_instruction` legacy
+  // table writes in favour of a single column on tbl_address).
+  return addressId;
 }
 
 // ─── Create ─────────────────────────────────────────────────────────
@@ -1563,6 +1652,41 @@ async function create(input, actor) {
     const shouldStampOtp = withOtpColumn && effectiveStatus === STATUS.BOOKED;
     const jobOtp = shouldStampOtp ? String(generateOtp()) : null;
 
+    /*
+     * job_client_owner auto-resolution (2026-06-04). When the caller
+     * doesn't pass an explicit owner, we look up the client's Primary
+     * SPOC from tbl_vertical_mapping (user_type=1 = Primary per the
+     * legacy CRM convention). Doing this server-side rather than
+     * forcing every caller (Book-New-Call, mobile, integration) to
+     * fetch + send the same value keeps the rule in one place and
+     * survives clients who don't know the SPOC model.
+     *
+     * status filter tolerates NULL (older mappings predate the column)
+     * and 1 (active). Inactive mappings are skipped.
+     */
+    let resolvedJobClientOwner = input.job_client_owner;
+    if ((resolvedJobClientOwner == null || resolvedJobClientOwner === '') && input.fk_client_id) {
+      try {
+        const [vmRows] = await conn.query(
+          `SELECT user_id FROM tbl_vertical_mapping
+            WHERE client_id = ? AND user_type = 1
+              AND (status IS NULL OR status = 1)
+            ORDER BY id ASC LIMIT 1`,
+          [input.fk_client_id]
+        );
+        if (vmRows.length > 0) {
+          const uid = Number(vmRows[0].user_id);
+          if (Number.isFinite(uid) && uid > 0) resolvedJobClientOwner = uid;
+        }
+      } catch (e) {
+        // Non-fatal — leave null and let the booking proceed.
+        require('../logger').warn(
+          { clientId: input.fk_client_id, err: e.message },
+          'Primary-SPOC lookup failed for job_client_owner (continuing with null)',
+        );
+      }
+    }
+
     // Build INSERT shape — `otp` column is appended ONLY when present
     // on the deploy. Two paths to keep the column list + placeholder
     // count + values array perfectly aligned (mismatched lengths here
@@ -1598,9 +1722,19 @@ async function create(input, actor) {
         // mark a job COMPLETED.
         effectiveStatus,
         input.job_owner || actor?.user_id || null,
-        input.job_client_owner ?? null,
+        resolvedJobClientOwner ?? null,
         input.job_type || 'Installation', input.source_type || 'manual',
-        input.client_ref_id || null, input.job_reference_id || null,
+        // job_reference_id (2026-06-03 per ops): the legacy DB column
+        // ops queries for the family-reference id. Falls back to
+        // `client_ref_id` when the caller didn't send a dedicated
+        // `job_reference_id` — the new-CRM FE sends `client_ref_id`
+        // for the cross-job family tag, and ops want the same value
+        // reflected here so existing reports stay coherent. When the
+        // FE sends BOTH explicitly, the explicit `job_reference_id`
+        // wins (preserves backwards-compat with any caller that
+        // distinguishes them).
+        input.client_ref_id || null,
+        input.job_reference_id || input.client_ref_id || null,
         input.customer?.customer_name || null,
         input.client_spoc || null, input.client_spoc_name || null, input.client_spoc_email || null,
         input.additional_name || null, input.additional_number || null,
@@ -1629,18 +1763,35 @@ async function create(input, actor) {
     const jobId = ins.insertId;
 
     if (Array.isArray(input.services) && input.services.length > 0) {
+      // Batch-load rate-card rows for all picked services in ONE query
+      // (avoids N+1) — then compute the 5 charge columns per row via
+      // the shared cascade helper. See utils/rate-card-calc.js for the
+      // formula (sequential variable→fixed per layer; bundles overhead
+      // into easyfix_charge to preserve sum-to-total invariant).
+      const { loadRateCardRows, computeJobServiceCharges } = require('../utils/rate-card-calc');
+      const rateCardById = await loadRateCardRows(conn, input.services.map((s) => s.service_id));
+
       // Single multi-row INSERT instead of N sequential round-trips. Only wins
       // for jobs with 3+ services but costs nothing for smaller sets.
-      const values = input.services.map((svc) => [
-        jobId, svc.service_id, svc.quantity || 1,
-        svc.service_type_id || null, svc.service_category_id || null, 1,
-      ]);
+      const values = input.services.map((svc) => {
+        const ch = computeJobServiceCharges(rateCardById.get(Number(svc.service_id)), svc.quantity || 1);
+        return [
+          jobId, svc.service_id, svc.quantity || 1,
+          svc.service_type_id || null, svc.service_category_id || null, 1,
+          ch.total_charge, ch.total_cost,
+          ch.client_charge, ch.easyfix_charge, ch.easyfixer_charge,
+        ];
+      });
       await conn.query(
         `INSERT INTO tbl_job_services
-           (job_id, service_id, quantity, service_type_id, service_category_id, job_service_status)
+           (job_id, service_id, quantity, service_type_id, service_category_id, job_service_status,
+            total_charge, total_cost, client_charge, easyfix_charge, easyfixer_charge)
          VALUES ?`,
         [values]
       );
+      // Mirror onto tbl_job.client_services CSV — single source of truth
+      // via the helper so every services mutator stays in sync.
+      await recomputeClientServicesCsv(conn, jobId);
     }
 
     /*
@@ -1836,7 +1987,10 @@ async function update(jobId, input, actor) {
       if (input.address.gps_location !== undefined) { addrSets.push('gps_location = ?'); addrVals.push(input.address.gps_location || null); }
       // address_instruction is column-probed per the matching guard in
       // insertAddress(). We skip the SET if the column doesn't exist on
-      // the deploy so the UPDATE doesn't fail with Unknown column.
+      // the deploy so the UPDATE doesn't fail with Unknown column. When
+      // the column IS present, we also flip is_instruction_added in lock-
+      // step so the legacy "has notes?" flag stays in sync with the text
+      // (legacy CRM views/reports filter on this flag).
       if (input.address.address_instruction !== undefined) {
         const [cols] = await conn.query(
           `SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
@@ -1846,8 +2000,15 @@ async function update(jobId, input, actor) {
             LIMIT 1`,
         );
         if (cols.length > 0) {
+          // 2026-06-03: per ops, `is_instruction_added` must stay 0 even
+          // when the text is non-empty (see insertAddress for full
+          // rationale). We still WRITE the column on update so a row
+          // that was previously flipped to 1 by older code resets to 0
+          // — leaving stale 1s in place would defeat the invariant.
           addrSets.push('address_instruction = ?');
           addrVals.push(input.address.address_instruction || null);
+          addrSets.push('is_instruction_added = ?');
+          addrVals.push(0);
         }
       }
       if (addrSets.length > 0) {
@@ -1899,9 +2060,17 @@ async function update(jobId, input, actor) {
         'UPDATE tbl_job_services SET job_service_status = 0 WHERE job_id = ?',
         [jobId],
       );
+      // Batch-load rate cards once for the whole edit — same cascade
+      // helper as create(). N+1-safe; see utils/rate-card-calc.js docs.
+      const { loadRateCardRows, computeJobServiceCharges } = require('../utils/rate-card-calc');
+      const rateCardById = await loadRateCardRows(conn, input.services.map((s) => s.service_id));
+
       // 3. Re-apply each service in the new payload — UPDATE existing
-      //    row if it was previously known, else INSERT.
+      //    row if it was previously known, else INSERT. Recompute the
+      //    5 charge columns from the rate card so quantity changes pick
+      //    up the new total_cost / shares.
       for (const svc of input.services) {
+        const ch = computeJobServiceCharges(rateCardById.get(Number(svc.service_id)), svc.quantity || 1);
         const existingId = existingByService.get(svc.service_id);
         if (existingId) {
           await conn.query(
@@ -1909,27 +2078,41 @@ async function update(jobId, input, actor) {
                 SET job_service_status = 1,
                     quantity = ?,
                     service_type_id = ?,
-                    service_category_id = ?
+                    service_category_id = ?,
+                    total_charge = ?,
+                    total_cost = ?,
+                    client_charge = ?,
+                    easyfix_charge = ?,
+                    easyfixer_charge = ?
               WHERE job_service_id = ?`,
             [
               svc.quantity || 1,
               svc.service_type_id || null,
               svc.service_category_id || null,
+              ch.total_charge, ch.total_cost,
+              ch.client_charge, ch.easyfix_charge, ch.easyfixer_charge,
               existingId,
             ],
           );
         } else {
           await conn.query(
             `INSERT INTO tbl_job_services
-               (job_id, service_id, quantity, service_type_id, service_category_id, job_service_status)
-             VALUES (?, ?, ?, ?, ?, 1)`,
+               (job_id, service_id, quantity, service_type_id, service_category_id, job_service_status,
+                total_charge, total_cost, client_charge, easyfix_charge, easyfixer_charge)
+             VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`,
             [
               jobId, svc.service_id, svc.quantity || 1,
               svc.service_type_id || null, svc.service_category_id || null,
+              ch.total_charge, ch.total_cost,
+              ch.client_charge, ch.easyfix_charge, ch.easyfixer_charge,
             ],
           );
         }
       }
+      // Mirror onto tbl_job.client_services CSV — same helper as create() +
+      // magic-link acceptSubmission so every services mutator stays in sync
+      // with the normalized table. Legacy CRM reports read the flat column.
+      await recomputeClientServicesCsv(conn, jobId);
     }
 
     // Touch last_update_time if only non-scalar edits happened (services,
@@ -2524,6 +2707,10 @@ async function notifyAutoAssignFailure(jobId, clientId, reason) {
 
 module.exports = {
   STATUS, ALL_STATUS_VALUES, MUTABLE_COLUMNS,
+  // Cross-service helper — used by job-magic-link.service.js to keep the
+  // tbl_job.client_services CSV in sync after the customer's self-submit
+  // mutates tbl_job_services. Single source of truth, one helper.
+  recomputeClientServicesCsv,
   list, listForExport, getById, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, unassign, changeOwner,
   tryAutoAssignOnCreate,
   fireWebhook, statusToEventName,

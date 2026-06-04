@@ -1,6 +1,14 @@
-# AWS QA EC2 — Empty-Box Bootstrap (CI build → ECR → SSM pull)
+# AWS QA + Prod EC2 — Empty-Box Bootstrap (CI build → ECR → SSM pull)
 
-**Target host:** `10.30.2.30` — AWS EC2 (Easyfix-qa-appsrv-2, ARM64 Graviton)
+> **This doc covers BOTH QA and Production** — both environments use
+> the same Docker + SSM pipeline and the same `.env` / `backend.env`
+> file convention. Environment-specific values (hostnames, secret IDs)
+> are called out inline where they differ; everything else is shared.
+
+**Target hosts:**
+- QA: `10.30.2.30` — AWS EC2 (Easyfix-qa-appsrv-2, ARM64 Graviton) — shared by BE + UI
+- Prod: separate hosts for BE + UI (`PROD_BACKEND_INSTANCE_ID` / `PROD_FRONTEND_INSTANCE_ID` secrets in each repo)
+
 **Hosts:** EasyFix_Backend (port 5100) + Easyfix_CRM_UI (port 5180), both as Docker containers
 **Connectivity from CI:** AWS Systems Manager (SSM) Run-Command
 **Image registry:** AWS ECR — `902810393464.dkr.ecr.ap-south-1.amazonaws.com`
@@ -53,11 +61,43 @@ aws ssm send-command ─────────────────► SSM 
 | Variable kind | Where | When read | Examples |
 |---|---|---|---|
 | Backend runtime secrets | `/opt/easyfix/backend.env` (chmod 600) on EC2 | At container startup, mounted via `env_file:` | `DB_PASSWORD`, `JWT_SECRET`, `MS_GRAPH_*`, `SUITE_URL`, `NOTIFICATIONS_DISABLE` |
-| Image-tag pointers | `/opt/easyfix/.env` (chmod 644) on EC2 | At `docker compose pull/up` time, interpolated by compose | `BACKEND_IMAGE`, `CRM_UI_IMAGE` (workflow-managed — don't edit by hand) |
+| CRM-UI runtime config + image-tag pointers | `/opt/easyfix/.env` (chmod 644) on EC2 | At `docker compose pull/up` time — interpolated by compose AND mounted into the CRM-UI container via `env_file:` | `BACKEND_IMAGE`, `CRM_UI_IMAGE` (workflow-managed), plus any UI runtime overrides |
 | CI build-args (CRM-UI bundle) | **GitHub Environment "Organisation Level Secrets"** | At CI build time, passed as `--build-arg` | `QA_API_URL` → baked into static JS chunks |
 | CI auth + targets | **GitHub Environment "Organisation Level Secrets"** | At CI runtime | `AWS_*`, `QA_INSTANCE_ID`, `ECR_REGISTRY`, `ECR_REPOSITORY_*`, `MAIL_*` |
 
 App secrets (DB, JWT, etc.) NEVER go into GitHub. CI auth secrets (AWS keys, etc.) NEVER go onto the EC2. Each surface owns one concern.
+
+### The two env files on the EC2 host — explicit split
+
+Both QA and Prod follow the **same** convention. The deploy pipelines enforce it via preflight checks:
+
+```
+/opt/easyfix/
+├── docker-compose.yml         (rewritten by every deploy from the YAML in the repo)
+│
+├── .env                        ← CRM-UI runtime config + docker-compose image-tag
+│                                  interpolation. Contains:
+│                                    BACKEND_IMAGE=…  CRM_UI_IMAGE=…
+│                                    (+ any UI runtime overrides bootstrapped here)
+│                                  Permission: chmod 644.
+│                                  Bootstrapped once per host (the seed step below).
+│
+└── backend.env                 ← Backend service runtime secrets. Contains:
+                                   DB_HOST / DB_USER / DB_PASSWORD / JWT_SECRET /
+                                   MS_GRAPH_* / SUITE_URL / NOTIFICATIONS_DISABLE /
+                                   KALEYRA_* / ZEPTOMAIL_API_TOKEN / etc.
+                                 Permission: chmod 600.
+                                 Bootstrapped once per host via bootstrap-env.sh.
+```
+
+**Which deploy requires which file** (the preflight checks at the top of each workflow's SSM step):
+
+| Pipeline | Requires `backend.env` to pre-exist? | Requires `.env` to pre-exist? | Behaviour if `.env` missing |
+|---|:---:|:---:|---|
+| `EasyFix_Backend` deploy.yml | ✅ Yes — `set -e` aborts the deploy with `Error: /opt/easyfix/backend.env missing` | ❌ No — auto-touched | Empty `.env` is created, then `BACKEND_IMAGE=<new tag>` is appended. Subsequent UI deploys are responsible for seeding the rest of `.env`. |
+| `Easyfix_CRM_UI` deploy.yml | ✅ Yes | ✅ Yes — aborts with `Error: /opt/easyfix/.env missing` | UI runtime config lives in `.env` and the deploy does NOT auto-seed it. Operator must bootstrap `.env` before the first UI deploy. |
+
+Rationale for the asymmetry: the BE deploy only writes one line to `.env` (the `BACKEND_IMAGE` tag pointer) and never reads it for runtime config — touching the file if absent costs nothing. The UI deploy treats `.env` as its primary runtime config source, so silently creating an empty one would mask a real bootstrap mistake.
 
 ---
 

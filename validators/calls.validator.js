@@ -30,6 +30,13 @@ const clickToCallBody = Joi.object({
   customerId:         intId,
   efrId:              intId,
   reportingContactId: intId,
+  // useAlt (2026-06-03): scopes the jobId path to the customer's
+  // ALTERNATE number (tbl_job.additional_number) instead of the
+  // canonical tbl_customer.customer_mob_no. Lets ops dial the
+  // alt-contact field that was captured at Book Call time. Only
+  // meaningful when jobId is also set; the route handler validates
+  // that combination + that tbl_job.additional_number is non-empty.
+  useAlt: Joi.boolean().optional(),
   // QA-MODE ONLY — when KALEYRA_CALLING_CUSTOM_NUMBER=true the FE prompts
   // the operator for both legs and forwards them here. The route handler
   // rejects these fields when the flag is OFF, so even though Joi accepts
@@ -53,6 +60,10 @@ const callListQuery = Joi.object({
   // anchored to job/customer); /preview branches on whichever is set.
   efrId: intId.optional(),
   reportingContactId: intId.optional(),
+  // useAlt (2026-06-03): when paired with jobId, /preview returns the
+  // job's alternate number (tbl_job.additional_number) instead of the
+  // customer's master mobile. Same flag the POST /click-to-call accepts.
+  useAlt: Joi.alternatives(Joi.boolean(), Joi.string().valid('true', 'false', '1', '0')).optional(),
   dateFrom: Joi.string().max(40).optional(),
   dateTo:   Joi.string().max(40).optional(),
   page:     Joi.number().integer().min(1).default(1),

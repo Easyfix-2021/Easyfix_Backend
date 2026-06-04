@@ -91,7 +91,11 @@ router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'
     // jobId / customerId / efrId / reportingContactId / page / limit and
     // silently strips unknowns. /preview consumes whichever of the four
     // identifiers the FE supplied — matching the click-to-call branches.
-    const { jobId, customerId, efrId, reportingContactId } = req.query;
+    const { jobId, customerId, efrId, reportingContactId, useAlt } = req.query;
+    // Boolean coercion — query strings carry primitives as strings.
+    // Accept '1' or 'true' (case-insensitive) so callers don't have to
+    // remember which truthy shape we expect.
+    const useAltFlag = String(useAlt || '').toLowerCase() === 'true' || String(useAlt) === '1';
     if (!jobId && !customerId && !efrId && !reportingContactId) {
       return modernError(res, 400, 'one of jobId/customerId/efrId/reportingContactId is required');
     }
@@ -101,8 +105,12 @@ router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'
     // change both).
     let receiverReal = null;
     if (jobId) {
+      // useAltFlag mirrors the POST handler's behaviour — the preview
+      // must show what we'd ACTUALLY dial, so the column read switches
+      // when the FE intends to dial the alternate. See the POST handler
+      // for the rationale + the "kept in sync" contract.
       const [[job]] = await pool.query(
-        `SELECT c.customer_mob_no
+        `SELECT c.customer_mob_no, j.additional_number
            FROM tbl_job j
       LEFT JOIN tbl_customer c ON c.customer_id = j.fk_customer_id
           WHERE j.job_id = ?
@@ -110,7 +118,7 @@ router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'
         [jobId]
       );
       if (!job) return modernError(res, 404, `Job ${jobId} not found`);
-      receiverReal = job.customer_mob_no || null;
+      receiverReal = useAltFlag ? (job.additional_number || null) : (job.customer_mob_no || null);
     } else if (customerId) {
       const [[cust]] = await pool.query(
         `SELECT customer_mob_no FROM tbl_customer WHERE customer_id = ? LIMIT 1`,
@@ -155,7 +163,7 @@ router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'
 // ─── POST /click-to-call ─────────────────────────────────────────────
 router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody), async (req, res, next) => {
   try {
-    const { jobId, customerId, efrId, reportingContactId, callFrom, callTo } = req.body;
+    const { jobId, customerId, efrId, reportingContactId, callFrom, callTo, useAlt } = req.body;
     const agent = req.user;
 
     // Three-tier number-resolution waterfall:
@@ -204,10 +212,18 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
       // override (set during bulk uploads), which we honour over the
       // canonical tbl_customer.customer_name when present — same precedence
       // the JobModal display uses.
+      //
+      // useAlt branch (2026-06-03): when set, dial the per-job alternate
+      // contact (tbl_job.additional_number + .additional_name) instead of
+      // the customer master mobile. Same audit trail (job + customer ids
+      // still recorded); only the receiver number/name change. Rejects
+      // when additional_number is empty so a "no alt on file" misclick is
+      // a clear 400, not a silent fallthrough.
       const [[job]] = await pool.query(
         `SELECT j.job_id, j.fk_customer_id, j.fk_easyfixter_id, j.job_status,
                 COALESCE(j.job_customer_name, c.customer_name) AS customer_name,
-                c.customer_mob_no
+                c.customer_mob_no,
+                j.additional_name, j.additional_number
            FROM tbl_job j
       LEFT JOIN tbl_customer c ON c.customer_id = j.fk_customer_id
           WHERE j.job_id = ?
@@ -215,9 +231,15 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
         [jobId]
       );
       if (!job) return modernError(res, 404, `Job ${jobId} not found`);
-      if (!job.customer_mob_no) return modernError(res, 400, `Job ${jobId} has no customer mobile on file`);
-      receiverMobile      = job.customer_mob_no;
-      receiverName        = job.customer_name || null;
+      if (useAlt) {
+        if (!job.additional_number) return modernError(res, 400, `Job ${jobId} has no alternate number on file`);
+        receiverMobile = job.additional_number;
+        receiverName   = job.additional_name || job.customer_name || null;
+      } else {
+        if (!job.customer_mob_no) return modernError(res, 400, `Job ${jobId} has no customer mobile on file`);
+        receiverMobile = job.customer_mob_no;
+        receiverName   = job.customer_name || null;
+      }
       receiverCustomerId  = job.fk_customer_id || null;
       jobIdToStore        = job.job_id;
       jobStatusSnapshot   = job.job_status;

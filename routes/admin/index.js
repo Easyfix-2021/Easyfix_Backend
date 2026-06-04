@@ -43,6 +43,7 @@ router.use(async (req, _res, next) => {
   next();
 });
 
+router.use('/properties',      require('./properties'));
 router.use('/easyfixers',      require('./easyfixers'));
 router.use('/zones',           require('./zones'));
 router.use('/pincodes',        require('./pincodes'));

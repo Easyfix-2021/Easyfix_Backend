@@ -2,7 +2,24 @@ const Joi = require('joi');
 const { ALL_STATUS_VALUES } = require('../services/job.service');
 
 const intId   = Joi.number().integer().positive();
-const mobile  = Joi.string().pattern(/^[0-9]{10}$/);
+/*
+ * INDIAN_MOBILE_REGEX (2026-06-03): tightened from `/^[0-9]{10}$/` to
+ * `/^[6-9]\d{9}$/`. Matches the FE `INDIAN_MOBILE_REGEX` in
+ * Easyfix_CRM_UI/src/lib/format.ts — same rule, defence-in-depth so
+ * direct API callers (curl, scripts, other clients) can't slip
+ * non-Indian-mobile junk through. Custom error message is more useful
+ * than Joi's default "fails to match the required pattern".
+ *
+ * Centralised here as `mobile` so every callsite below
+ * (customer_mob_no, additional_number, magic-link mobile_number)
+ * picks up the change automatically.
+ */
+const INDIAN_MOBILE_REGEX = /^[6-9]\d{9}$/;
+const mobile  = Joi.string()
+  .pattern(INDIAN_MOBILE_REGEX)
+  .messages({
+    'string.pattern.base': 'Must be a 10-digit Indian mobile starting with 6, 7, 8, or 9',
+  });
 const pinCode = Joi.string().pattern(/^[0-9]{6}$/);
 const gpsPair = Joi.string().pattern(/^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/);
 
