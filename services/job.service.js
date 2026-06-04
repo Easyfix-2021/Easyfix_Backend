@@ -1580,7 +1580,16 @@ async function create(input, actor) {
         input.reporting_contact_id || null,
         requestedDateTime, requestedTime, input.time_slot || null, input.booking_cut_off_time_slot || null,
         new Date(), new Date(),
-        actor?.user_id || null,
+        // fk_created_by (2026-06-04): explicit Number() coercion. JWT
+        // claims encode `user_id` as a string (see CLAUDE.md "Auth
+        // reality") and tbl_job.fk_created_by is INT. MySQL DOES
+        // implicitly coerce numeric strings on INSERT, but if a
+        // future JWT issuer accidentally ships a non-numeric subject
+        // (or an integration caller passes `actor` from a different
+        // identity shape) the implicit coercion silently writes 0 or
+        // NULL. Number()-coerce + falsy guard makes the binding
+        // explicit and matches the runtime intent.
+        (() => { const n = Number(actor?.user_id); return Number.isFinite(n) && n > 0 ? n : null; })(),
         // initial_status — legacy footer-button parity. Defaults to
         // BOOKED (0); operators can pick ENQUIRY (7) or CALL_LATER (9)
         // at the booking modal's footer to route the new row to the

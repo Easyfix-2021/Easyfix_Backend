@@ -254,6 +254,12 @@ const updateBody = Joi.object({
   additional_number: Joi.alternatives(mobile, Joi.string().allow('', null)).optional(),
   client_ref_id: Joi.string().max(100).optional(),
   job_reference_id: Joi.string().max(100).optional(),
+  // Per-job override of the customer's master name. Mirrors the
+  // createBody entry (~line 183). Accepted on PATCH so Confirm &
+  // Schedule can backfill the column on legacy-created parent rows
+  // where it was previously NULL. See services/job.service.js
+  // MUTABLE_COLUMNS list which already whitelists it.
+  job_customer_name: Joi.string().max(255).allow('', null).optional(),
   fk_service_type_ids: Joi.alternatives(Joi.array().items(intId), Joi.string().max(500)).optional(),
   service_type_ids: Joi.alternatives(Joi.array().items(intId), Joi.string().max(500)).optional(),
   helper_req: Joi.boolean().optional(),
