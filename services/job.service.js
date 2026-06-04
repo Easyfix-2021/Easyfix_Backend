@@ -799,8 +799,13 @@ async function getStatusCounts({ ownerId, easyfixerId, scope } = {}) {
     params.push(easyfixerId);
   }
   if (scope) {
-    const c = scope.clients, ci = scope.cities, v = scope.verticals;
-    if ((c && c.mode === 'none') || (ci && ci.mode === 'none') || (v && v.mode === 'none')) {
+    const c = scope.clients, ci = scope.cities, st = scope.states, v = scope.verticals;
+    if (
+      (c  && c.mode  === 'none') ||
+      (ci && ci.mode === 'none') ||
+      (st && st.mode === 'none') ||
+      (v  && v.mode  === 'none')
+    ) {
       clauses.push('1=0');
     }
     if (c && c.mode === 'allow' && c.ids.length) {
@@ -811,6 +816,15 @@ async function getStatusCounts({ ownerId, easyfixerId, scope } = {}) {
       clauses.push(`ad.city_id IN (${ci.ids.map(() => '?').join(',')})`);
       params.push(...ci.ids);
     }
+    // States filter (2026-06-03) — previously dropped silently, which
+    // meant operators with state-scoped permissions saw every job in
+    // every state. Joins tbl_city via the address's city_id to read
+    // its state_id. Only fires when scope.states is set + 'allow';
+    // 'all' means the operator can see all states + no filter needed.
+    if (st && st.mode === 'allow' && st.ids.length) {
+      clauses.push(`ct.state_id IN (${st.ids.map(() => '?').join(',')})`);
+      params.push(...st.ids);
+    }
     if (v && v.mode === 'allow' && v.ids.length && hasVerticalCol) {
       clauses.push(`cl.vertical_id IN (${v.ids.map(() => '?').join(',')})`);
       params.push(...v.ids);
@@ -818,10 +832,15 @@ async function getStatusCounts({ ownerId, easyfixerId, scope } = {}) {
   }
 
   // Only JOIN tables we actually filter against — cheap on the indexed FKs.
-  const needsAd = scope?.cities?.mode === 'allow';
+  // tbl_address is needed whenever cities OR states is restricted (states
+  // joins through city → tbl_city). tbl_city is needed only for states.
+  // tbl_client is needed only for verticals.
+  const needsAd = scope?.cities?.mode === 'allow' || scope?.states?.mode === 'allow';
+  const needsCt = scope?.states?.mode === 'allow';
   const needsCl = scope?.verticals?.mode === 'allow' && hasVerticalCol;
   const joins = [
     needsAd ? 'LEFT JOIN tbl_address ad ON ad.address_id = j.fk_address_id' : '',
+    needsCt ? 'LEFT JOIN tbl_city    ct ON ct.city_id    = ad.city_id'      : '',
     needsCl ? 'LEFT JOIN tbl_client  cl ON cl.client_id  = j.fk_client_id'  : '',
   ].filter(Boolean).join(' ');
 
@@ -898,8 +917,13 @@ async function getAttentionSummary({ scope } = {}) {
     const clauses = [];
     const params = [];
     if (scope) {
-      const c = scope.clients, ci = scope.cities, v = scope.verticals;
-      if ((c && c.mode === 'none') || (ci && ci.mode === 'none') || (v && v.mode === 'none')) {
+      const c = scope.clients, ci = scope.cities, st = scope.states, v = scope.verticals;
+      if (
+        (c  && c.mode  === 'none') ||
+        (ci && ci.mode === 'none') ||
+        (st && st.mode === 'none') ||
+        (v  && v.mode  === 'none')
+      ) {
         clauses.push('1=0');
       }
       if (c && c.mode === 'allow' && c.ids.length) {
@@ -910,15 +934,27 @@ async function getAttentionSummary({ scope } = {}) {
         clauses.push(`ad.city_id IN (${ci.ids.map(() => '?').join(',')})`);
         params.push(...ci.ids);
       }
+      // States filter (2026-06-03) — kept in sync with getStatusCounts.
+      // Joins tbl_city via the address's city_id to read state_id.
+      if (st && st.mode === 'allow' && st.ids.length) {
+        clauses.push(`ct.state_id IN (${st.ids.map(() => '?').join(',')})`);
+        params.push(...st.ids);
+      }
       if (v && v.mode === 'allow' && v.ids.length && hasVerticalCol) {
         clauses.push(`cl.vertical_id IN (${v.ids.map(() => '?').join(',')})`);
         params.push(...v.ids);
       }
     }
-    const needsAd = scope?.cities?.mode === 'allow';
+    // Same JOIN strategy as getStatusCounts: tbl_address needed
+    // whenever cities OR states filter is on; tbl_city only for states;
+    // tbl_client only for verticals. Each is LEFT JOIN so missing FKs
+    // don't drop the row from the count.
+    const needsAd = scope?.cities?.mode === 'allow' || scope?.states?.mode === 'allow';
+    const needsCt = scope?.states?.mode === 'allow';
     const needsCl = scope?.verticals?.mode === 'allow' && hasVerticalCol;
     const joins = [
       needsAd ? `LEFT JOIN tbl_address ad ON ad.address_id = ${jobAlias}.fk_address_id` : '',
+      needsCt ? `LEFT JOIN tbl_city    ct ON ct.city_id    = ad.city_id`                : '',
       needsCl ? `LEFT JOIN tbl_client  cl ON cl.client_id  = ${jobAlias}.fk_client_id`  : '',
     ].filter(Boolean).join(' ');
     return { clauses, params, joins };
