@@ -1,31 +1,32 @@
 /*
  * utils/job-reference.js
  *
- * Auto-generator for tbl_job.job_reference_id. Used by services/job.service.js
- * when the caller does not supply an explicit `job_reference_id` AND has not
- * opted into the legacy "reuse client_ref_id" behaviour via `reuse_client_ref`.
+ * Formatter for tbl_job.job_reference_id.
  *
- * Format chosen: `JOB-YYYYMMDD-XXXXXX` where XXXXXX is 6 uppercase hex chars
- * (3 random bytes, ~16.7M space per day → collision-resistant for the volumes
- * we see). No legacy CRM convention was discoverable in the repo or
- * EasyFix Docs at the time of writing (2026-06-04), so this format was picked
- * for readability + low collision risk. If ops later confirm a different
- * legacy pattern (e.g. EFR-{seq}), swap the implementation here — every
- * caller goes through this helper.
+ * Legacy convention (confirmed by ops 2026-06-04): the column carries
+ * the value `REF-{job_id}` — e.g. job_id 482286 → `"REF-482286"`. The
+ * format is row-identity-bound (NOT a synthetic random suffix), so the
+ * value can only be computed AFTER the INSERT completes and the
+ * AUTO_INCREMENT id is known.
  *
- * Length: 19 chars. Safe for the legacy DB column which has historically
- * stored client_ref_id values up to 32 chars without truncation.
+ * Caller pattern in services/job.service.js::create():
+ *   1. INSERT tbl_job WITHOUT setting job_reference_id (leave NULL)
+ *   2. Capture `jobId = ins.insertId`
+ *   3. UPDATE tbl_job SET job_reference_id = formatJobReferenceId(jobId)
+ *      WHERE job_id = ? — same open transaction; atomic with the INSERT
+ *
+ * A caller-supplied `input.job_reference_id` short-circuits the auto-
+ * compute (preserves backwards-compat with integration callers that
+ * pass an explicit id). A caller opting into the legacy "reuse
+ * client_ref_id" behaviour via `input.reuse_client_ref = true` ALSO
+ * short-circuits, in which case `client_ref_id` is bound to
+ * job_reference_id during the original INSERT.
  */
-const crypto = require('crypto');
 
-function pad2(n) { return String(n).padStart(2, '0'); }
-
-function generateJobReferenceId(now = new Date()) {
-  const yyyy = now.getFullYear();
-  const mm   = pad2(now.getMonth() + 1);
-  const dd   = pad2(now.getDate());
-  const rand = crypto.randomBytes(3).toString('hex').toUpperCase(); // 6 chars
-  return `JOB-${yyyy}${mm}${dd}-${rand}`;
+function formatJobReferenceId(jobId) {
+  const n = Number(jobId);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return `REF-${n}`;
 }
 
-module.exports = { generateJobReferenceId };
+module.exports = { formatJobReferenceId };

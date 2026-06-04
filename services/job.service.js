@@ -1531,23 +1531,27 @@ async function create(input, actor) {
     }
 
     /*
-     * job_reference_id resolution (2026-06-04). Order:
-     *   1. Caller-provided `input.job_reference_id` — preserves
-     *      backwards compat with integration callers that mint their
-     *      own ref IDs.
-     *   2. Opt-in legacy behaviour: if caller passes
-     *      `input.reuse_client_ref = true`, fall back to client_ref_id
-     *      so existing ops reports that read job_reference_id stay
-     *      coherent.
-     *   3. Auto-generate via utils/job-reference.js
-     *      (`JOB-YYYYMMDD-XXXXXX`). Applied to every C&S-spawned
-     *      sibling so each row carries a unique, human-readable ref.
+     * job_reference_id resolution (2026-06-04, format confirmed by ops:
+     * `REF-{job_id}`).
+     *
+     * The legacy format embeds the AUTO_INCREMENT job_id, so the value
+     * can only be computed AFTER the INSERT completes. The flow:
+     *   1. Resolve a PRE-INSERT value here. If caller supplied an
+     *      explicit `input.job_reference_id` OR opted into the legacy
+     *      reuse-of-client_ref via `input.reuse_client_ref = true`,
+     *      bind that value during the original INSERT and skip the
+     *      post-INSERT formatter step.
+     *   2. Otherwise bind NULL during INSERT, capture `jobId =
+     *      ins.insertId`, then UPDATE the row with
+     *      `formatJobReferenceId(jobId)` → `REF-{jobId}`. Both writes
+     *      live inside the same open transaction so they commit
+     *      atomically.
      */
-    const { generateJobReferenceId } = require('../utils/job-reference');
-    const jobReferenceId =
+    const { formatJobReferenceId } = require('../utils/job-reference');
+    const callerProvidedRef =
       input.job_reference_id
-      || (input.reuse_client_ref && input.client_ref_id ? input.client_ref_id : null)
-      || generateJobReferenceId();
+      || (input.reuse_client_ref && input.client_ref_id ? input.client_ref_id : null);
+    const jobReferenceId = callerProvidedRef ?? null; // INSERTed as-is; null → auto-fill below
 
     // Build INSERT shape — `otp` column is appended ONLY when present
     // on the deploy. Two paths to keep the column list + placeholder
@@ -1652,6 +1656,24 @@ async function create(input, actor) {
     const insertValues = jobOtp != null ? [...sharedValues, jobOtp] : sharedValues;
     const [ins] = await conn.query(insertSql, insertValues);
     const jobId = ins.insertId;
+
+    /*
+     * job_reference_id auto-fill (2026-06-04). When the caller didn't
+     * supply an explicit ref AND didn't opt into reuse_client_ref, the
+     * INSERT above bound NULL for job_reference_id. Now that we have
+     * the AUTO_INCREMENT job_id, format the legacy `REF-{job_id}`
+     * value and patch the row in the same open transaction. The two
+     * statements commit atomically.
+     */
+    if (callerProvidedRef == null) {
+      const autoRef = formatJobReferenceId(jobId);
+      if (autoRef) {
+        await conn.query(
+          'UPDATE tbl_job SET job_reference_id = ? WHERE job_id = ?',
+          [autoRef, jobId],
+        );
+      }
+    }
 
     if (Array.isArray(input.services) && input.services.length > 0) {
       // Batch-load rate-card rows for all picked services in ONE query
