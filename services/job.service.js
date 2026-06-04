@@ -1380,7 +1380,17 @@ async function create(input, actor) {
         input.job_owner || actor?.user_id || null,
         resolvedJobClientOwner ?? null,
         input.job_type || 'Installation', input.source_type || 'manual',
-        input.client_ref_id || null, input.job_reference_id || null,
+        // job_reference_id (2026-06-03 per ops): the legacy DB column
+        // ops queries for the family-reference id. Falls back to
+        // `client_ref_id` when the caller didn't send a dedicated
+        // `job_reference_id` — the new-CRM FE sends `client_ref_id`
+        // for the cross-job family tag, and ops want the same value
+        // reflected here so existing reports stay coherent. When the
+        // FE sends BOTH explicitly, the explicit `job_reference_id`
+        // wins (preserves backwards-compat with any caller that
+        // distinguishes them).
+        input.client_ref_id || null,
+        input.job_reference_id || input.client_ref_id || null,
         input.customer?.customer_name || null,
         input.client_spoc || null, input.client_spoc_name || null, input.client_spoc_email || null,
         input.additional_name || null, input.additional_number || null,
