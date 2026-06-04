@@ -99,6 +99,28 @@ Both QA and Prod follow the **same** convention. The deploy pipelines enforce it
 
 Rationale for the asymmetry: the BE deploy only writes one line to `.env` (the `BACKEND_IMAGE` tag pointer) and never reads it for runtime config — touching the file if absent costs nothing. The UI deploy treats `.env` as its primary runtime config source, so silently creating an empty one would mask a real bootstrap mistake.
 
+### Prod topology — two EC2s, one compose file per role
+
+| EC2 | Services hosted | docker-compose.yml source |
+|---|---|---|
+| **QA shared box** | backend + crm-ui + client-ui + dozzle | `EasyFix_Backend/deploy/docker-compose.yml` |
+| **Prod BE EC2** (`PROD_BACKEND_INSTANCE_ID`) | backend + dozzle ONLY | `EasyFix_Backend/deploy/docker-compose.prod-backend.yml` |
+| **Prod UI EC2** (`PROD_FRONTEND_INSTANCE_ID`) | crm-ui + client-ui + dozzle | Shipped by the UI repos' deploy workflows |
+
+Each repo's deploy workflow picks the right compose file based on the
+`env_name` it just built for (`qa` vs `production`) and SSM-encodes it
+to the right host. No compose file ever ships to a host that wouldn't
+run the services it lists.
+
+### ECR auth on the prod BE EC2
+
+A freshly-launched EC2 has no Docker → ECR auth wiring out of the box.
+If your deploy fails with `pull access denied… no basic auth
+credentials`, the box is missing one of: the IAM ECR-read policy,
+`amazon-ecr-credential-helper`, or the `~/.docker/config.json`
+credHelpers entry. Full diagnosis + one-time fix recipe lives in
+[`ECR_AUTH_BOOTSTRAP.md`](./ECR_AUTH_BOOTSTRAP.md).
+
 ---
 
 ## Prerequisites — already done by DevOps (recap)

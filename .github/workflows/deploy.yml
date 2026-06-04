@@ -191,12 +191,33 @@ jobs:
         # Base64 → SSM avoids every shell-escape layer; same trick we use
         # for the bash script. Compose YAML has `:` and `${}` which would
         # otherwise need careful quoting through JSON → sh → bash.
+        #
+        # Topology-aware file selection (2026-06-03):
+        #   QA   → deploy/docker-compose.yml             (combined stack:
+        #                                                 backend + crm-ui +
+        #                                                 client-ui + dozzle
+        #                                                 — single shared EC2)
+        #   Prod → deploy/docker-compose.prod-backend.yml (BE + dozzle ONLY
+        #                                                 — separate BE EC2;
+        #                                                 UI containers run
+        #                                                 on the prod UI EC2,
+        #                                                 shipped by the
+        #                                                 CRM/Client UI repos).
+        # Each repo ships its OWN scoped compose so a deploy never
+        # references services it doesn't own.
         run: |
-          if [[ ! -f deploy/docker-compose.yml ]]; then
-            echo "::error::deploy/docker-compose.yml missing in the repo"
+          ENV_NAME="${{ needs.build-and-push.outputs.env_name }}"
+          if [[ "$ENV_NAME" == "qa" ]]; then
+            COMPOSE_FILE="deploy/docker-compose.yml"
+          else
+            COMPOSE_FILE="deploy/docker-compose.prod-backend.yml"
+          fi
+          if [[ ! -f "$COMPOSE_FILE" ]]; then
+            echo "::error::$COMPOSE_FILE missing in the repo"
             exit 1
           fi
-          B64=$(base64 -w0 deploy/docker-compose.yml)
+          echo "▶ Using $COMPOSE_FILE for env=$ENV_NAME"
+          B64=$(base64 -w0 "$COMPOSE_FILE")
           echo "compose_b64=$B64" >> "$GITHUB_OUTPUT"
 
       - uses: aws-actions/configure-aws-credentials@v4
