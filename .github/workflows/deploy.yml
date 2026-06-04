@@ -322,11 +322,82 @@ jobs:
             echo "BACKEND_IMAGE=$IMAGE_URI" >> /opt/easyfix/.env
           fi
 
+          # ─── ECR credential-helper auto-bootstrap (idempotent) ─────────
+          # The "pull access denied / no basic auth credentials" symptom is
+          # ALWAYS one of three causes:
+          #   1. EC2 instance role lacks the ECR pull policy (IAM — can't
+          #      self-fix; needs Console / IaC work).
+          #   2. amazon-ecr-credential-helper not installed on the host.
+          #   3. /root/.docker/config.json missing the credHelpers entry.
+          #
+          # Cause #1 needs human IAM access. Causes #2 and #3 we CAN
+          # self-fix on every deploy run — idempotently. The block below
+          # is a no-op when the helper is already installed and wired.
+          # Skipped silently on QA (the helper has been there for months);
+          # only the prod hosts hit the install path on their first run.
+          REGISTRY_HOST="${REGISTRY}"
+          BOOTSTRAP_RAN=0
+          if ! command -v docker-credential-ecr-login >/dev/null 2>&1; then
+            echo "▶ Installing amazon-ecr-credential-helper (first-time bootstrap)"
+            BOOTSTRAP_RAN=1
+            if command -v dnf >/dev/null 2>&1; then
+              sudo dnf install -y amazon-ecr-credential-helper
+            elif command -v apt-get >/dev/null 2>&1; then
+              sudo apt-get update && sudo apt-get install -y amazon-ecr-credential-helper
+            elif command -v amazon-linux-extras >/dev/null 2>&1; then
+              sudo amazon-linux-extras install -y amazon-ecr-credential-helper
+            else
+              echo "::error::No supported package manager found — install amazon-ecr-credential-helper manually. See docs/ECR_AUTH_BOOTSTRAP.md."
+              exit 1
+            fi
+          fi
+          # Write the credHelpers entry if missing. Use printf rather than
+          # a heredoc — nested heredocs inside the outer EOF block require
+          # the closing delimiter to be flush-left, which conflicts with
+          # the YAML's leading indentation here. Single-quoted bash -c
+          # body sidesteps quote-nesting issues with the printf format
+          # string; positional \$1 keeps the registry host as data, not
+          # interpolated into the script body.
+          if ! sudo grep -q "\$REGISTRY_HOST" /root/.docker/config.json 2>/dev/null; then
+            echo "▶ Wiring /root/.docker/config.json to use ecr-login helper"
+            BOOTSTRAP_RAN=1
+            sudo mkdir -p /root/.docker
+            sudo bash -c 'printf "{\n  \"credHelpers\": {\n    \"%s\": \"ecr-login\"\n  }\n}\n" "\$1" > /root/.docker/config.json' bash "\$REGISTRY_HOST"
+            sudo chmod 600 /root/.docker/config.json
+          fi
+
+          # Smoke-test ONLY when we just bootstrapped — otherwise it's
+          # a redundant pull on every deploy. The compose pull below
+          # validates auth anyway; we only need an explicit test here
+          # to print an ACTIONABLE error when bootstrap can't fully
+          # recover (i.e. when cause #1 — missing IAM role — is at play).
+          if [[ "\$BOOTSTRAP_RAN" -eq 1 ]]; then
+            echo "▶ Smoke-test ECR auth after bootstrap"
+            if ! sudo docker pull "$IMAGE_URI" >/dev/null 2>&1; then
+              cat <<MSG
+          ::error::ECR pull still fails after credential-helper bootstrap.
+
+          The amazon-ecr-credential-helper is installed + wired (verified
+          by this script). The remaining cause is the EC2 instance role
+          missing the ECR read policy. Fix:
+
+            AWS Console → EC2 → Instances → pick this host
+              → Actions → Security → Modify IAM role
+              → attach the role with the AWS managed policy
+                  AmazonEC2ContainerRegistryReadOnly
+
+          Then re-run this workflow. Full diagnosis + alternative IAM
+          paths in EasyFix_Backend/docs/ECR_AUTH_BOOTSTRAP.md.
+          MSG
+              exit 1
+            fi
+          fi
+
           # Use \$IMAGE_URI (substituted at heredoc-build time on the runner)
           # instead of \$BACKEND_IMAGE — the latter only exists in the .env
           # file consumed by docker compose, NOT as a shell variable, so
           # \`set -u\` would trip on it.
-          echo "▶ Pulling $IMAGE_URI"
+          echo "▶ Pulling $IMAGE_URI via docker compose"
           docker compose pull backend
 
           echo "▶ Recreating backend container (crm-ui untouched)"
@@ -467,7 +538,16 @@ jobs:
           [[ "$STATUS" == "Success" ]] || { aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --query 'StandardErrorContent' --output text; exit 1; }
 
       - name: Notify on failure
-        if: failure()
+        # Skip when MAIL_USERNAME isn't configured — otherwise the action
+        # itself errors with `Input required and not supplied: from`,
+        # which masks the underlying deploy failure in the log and
+        # double-fails the job (the deploy step already exited non-zero;
+        # we don't need a second red checkmark from a missing optional).
+        # MAIL_USERNAME/MAIL_PASSWORD are documented as optional in the
+        # header comment at the top of this file.
+        if: failure() && env.MAIL_USERNAME != ''
+        env:
+          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
