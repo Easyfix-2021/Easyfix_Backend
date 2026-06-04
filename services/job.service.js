@@ -1171,11 +1171,20 @@ async function insertAddress(conn, customerId, addr, actor) {
   } catch (_e) { /* defensively assume absent on probe failure */ }
 
   // is_instruction_added — legacy "does this address carry notes?" flag.
-  // We keep it in sync with address_instruction so legacy CRM filters that
-  // gate on this flag still see new-CRM bookings correctly. Trim before
-  // comparing — a textarea full of whitespace shouldn't flip the flag on.
+  //
+  // 2026-06-03: per ops, this column must stay 0 even when
+  // `address_instruction` is non-empty. Previously we kept it in sync
+  // with the text content (1 when filled, 0 when blank), but that
+  // collided with downstream legacy logic that uses the flag as a
+  // gate (rule TBD). Persisting 0 unconditionally is the agreed
+  // invariant; the actual text still lives in `address_instruction`
+  // and is the canonical source for reads. We retain the `hasInstructionText`
+  // local in case future flows need it — but it no longer drives the column.
   const hasInstructionText = addr.address_instruction != null
     && String(addr.address_instruction).trim() !== '';
+  // Silence the unused-binding hint for the local — the comment above
+  // documents why it's kept around for future readers.
+  void hasInstructionText;
 
   let addressId;
   if (hasInstruction) {
@@ -1190,7 +1199,9 @@ async function insertAddress(conn, customerId, addr, actor) {
         addr.address, addr.building || null, addr.landmark || null, addr.locality || null,
         addr.city_id, addr.pin_code, addr.gps_location || null,
         addr.mobile_number || null, addr.address_instruction || null,
-        hasInstructionText ? 1 : 0,
+        // is_instruction_added pinned to 0 per ops (2026-06-03) —
+        // see the docblock above hasInstructionText for the rationale.
+        0,
         actor?.user_id || null,
         new Date(), new Date(),
       ]
@@ -1635,14 +1646,15 @@ async function update(jobId, input, actor) {
             LIMIT 1`,
         );
         if (cols.length > 0) {
-          const trimmed = input.address.address_instruction == null
-            ? null
-            : String(input.address.address_instruction);
-          const hasText = trimmed != null && trimmed.trim() !== '';
+          // 2026-06-03: per ops, `is_instruction_added` must stay 0 even
+          // when the text is non-empty (see insertAddress for full
+          // rationale). We still WRITE the column on update so a row
+          // that was previously flipped to 1 by older code resets to 0
+          // — leaving stale 1s in place would defeat the invariant.
           addrSets.push('address_instruction = ?');
           addrVals.push(input.address.address_instruction || null);
           addrSets.push('is_instruction_added = ?');
-          addrVals.push(hasText ? 1 : 0);
+          addrVals.push(0);
         }
       }
       if (addrSets.length > 0) {

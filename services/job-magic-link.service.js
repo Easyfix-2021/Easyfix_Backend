@@ -1097,16 +1097,15 @@ async function acceptSubmission(jobId, payload, pool) {
       if (hasAddrInstr) {
         setClauses.push('address_instruction = COALESCE(?, address_instruction)');
         params.push(addrInstr);
-        // Keep is_instruction_added in lock-step with the text — legacy CRM
-        // gates on this flag. Only touch it when the customer ACTUALLY sent
-        // a value (addrInstr != null); a COALESCE-style "do nothing if
-        // null" via NULLIF on the flag side would let the flag get out of
-        // sync with the text. So: flip the flag on submit, 1/0 reflecting
-        // emptiness, only if the customer's payload included the field.
+        // 2026-06-03: per ops, `is_instruction_added` must stay 0 even
+        // when the text is non-empty. See services/job.service.js
+        // insertAddress() for the full rationale. When the customer's
+        // payload included the field at all, we still touch the column
+        // (reset to 0) so any pre-existing 1 from older code paths is
+        // cleared on submission — the invariant must hold cross-tier.
         if (addrInstr != null) {
-          const hasText = String(addrInstr).trim() !== '';
           setClauses.push('is_instruction_added = ?');
-          params.push(hasText ? 1 : 0);
+          params.push(0);
         }
       }
       params.push(addressId);
