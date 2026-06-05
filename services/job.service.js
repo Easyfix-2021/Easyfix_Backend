@@ -1939,6 +1939,44 @@ async function update(jobId, input, actor) {
     }
 
     /*
+     * job_reference_id back-fill on update (2026-06-06).
+     *
+     * Jobs created by the legacy Client Dashboard / bulk-upload /
+     * integration callers landed without a `job_reference_id` (those
+     * code paths predate the 2026-06-04 `REF-{job_id}` auto-gen
+     * convention). When ops promotes such a row to BOOKED via the
+     * Confirm & Schedule modal (the standard "Book Call" path), the
+     * caller-supplied PATCH typically doesn't include job_reference_id
+     * — so the column stays NULL forever.
+     *
+     * Fix: AFTER the scalar UPDATE lands, if the row's current
+     * job_reference_id is NULL/empty AND the caller didn't supply
+     * one in this PATCH, backfill `REF-{jobId}` in the same open
+     * transaction. The conditional WHERE clause makes this safe to
+     * run on already-populated rows (no-op).
+     *
+     * Skipped when the caller explicitly passed `job_reference_id`
+     * in `input` — preserves backward-compat with integration
+     * callers minting their own ref ids.
+     */
+    if (input.job_reference_id === undefined) {
+      const existingRef = String(existing.job_reference_id || '').trim();
+      if (!existingRef) {
+        const { formatJobReferenceId } = require('../utils/job-reference');
+        const autoRef = formatJobReferenceId(jobId);
+        if (autoRef) {
+          await conn.query(
+            `UPDATE tbl_job
+                SET job_reference_id = ?
+              WHERE job_id = ?
+                AND (job_reference_id IS NULL OR TRIM(job_reference_id) = '')`,
+            [autoRef, jobId],
+          );
+        }
+      }
+    }
+
+    /*
      * Customer update — resolves tbl_customer row from job.fk_customer_id.
      * Only the editable fields (name, email) are accepted; mobile is the
      * key and treated as immutable here (callers must use the dedicated
