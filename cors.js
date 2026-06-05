@@ -5,10 +5,21 @@ const cors = require('cors');
 //   CLIENT_URL=http://localhost:5181
 //   CLIENT_URL=http://localhost:5181,http://10.30.2.30:5181,https://corporates.qa.easyfix.in
 // Lets one VM serve dev + IP + domain requests without a code change.
+//
+// Trailing-slash normalisation (2026-06-05). A common operator paper-cut
+// is to set `CRM_URL=https://crm.easyfix.in/` (with the trailing slash
+// people normally type when copying from the address bar). But browsers
+// send the Origin header WITHOUT a trailing slash per RFC 6454
+// (Origin = scheme :// host [: port], no path component), so a literal
+// `allowedOrigins.includes(reqOrigin)` then mismatches and silently
+// denies all CORS preflights — diagnosed by an opaque "Provisional
+// headers are shown" in Chrome's network panel. Strip any trailing
+// slashes here so the env-side value is canonicalised to the same shape
+// the browser will actually send.
 function splitOrigins(s) {
   return String(s || '')
     .split(',')
-    .map((x) => x.trim())
+    .map((x) => x.trim().replace(/\/+$/, ''))
     .filter(Boolean);
 }
 
