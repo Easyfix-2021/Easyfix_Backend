@@ -30,13 +30,25 @@ const clickToCallBody = Joi.object({
   customerId:         intId,
   efrId:              intId,
   reportingContactId: intId,
-  // useAlt (2026-06-03): scopes the jobId path to the customer's
-  // ALTERNATE number (tbl_job.additional_number) instead of the
-  // canonical tbl_customer.customer_mob_no. Lets ops dial the
-  // alt-contact field that was captured at Book Call time. Only
-  // meaningful when jobId is also set; the route handler validates
-  // that combination + that tbl_job.additional_number is non-empty.
-  useAlt: Joi.boolean().optional(),
+  // useAlt (2026-06-03, alternatives 2026-06-05): scopes the jobId
+  // path to the customer's ALTERNATE number (tbl_job.additional_number)
+  // instead of the canonical tbl_customer.customer_mob_no. Lets ops
+  // dial the alt-contact field that was captured at Book Call time.
+  // Only meaningful when jobId is also set; the route handler
+  // validates that combination + that tbl_job.additional_number is
+  // non-empty.
+  //
+  // Accepts boolean OR the legacy string/number forms ('true', 'false',
+  // '1', '0', 1, 0) so accidental FE encoding mistakes don't 400 the
+  // call. Matches the shape of `callListQuery.useAlt` below — same
+  // defense-in-depth coercion both sides of the round-trip. The route
+  // handler reads `req.body.useAlt` as truthy, so all of these
+  // normalise to the same dial-alt branch.
+  useAlt: Joi.alternatives(
+    Joi.boolean(),
+    Joi.string().valid('true', 'false', '1', '0'),
+    Joi.number().valid(0, 1),
+  ).optional(),
   // QA-MODE ONLY — when KALEYRA_CALLING_CUSTOM_NUMBER=true the FE prompts
   // the operator for both legs and forwards them here. The route handler
   // rejects these fields when the flag is OFF, so even though Joi accepts
