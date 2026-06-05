@@ -1792,6 +1792,13 @@ const MUTABLE_COLUMNS = [
   'requested_date_time', 'requested_time', 'time_slot', 'expected_date_time',
   'job_owner', 'job_client_owner',
   'fk_client_id', 'fk_service_type_id', 'fk_service_catg_id',
+  // service_type_ids (2026-06-05): CSV column carrying every picked
+  // service_type_id on a multi-pick job. Kept in sync with the
+  // singular fk_service_type_id by FE call sites (Book-New-Call
+  // basePayload, C&S sibling POST, C&S parent PATCH). Array input
+  // is normalised to a comma-joined string inside the update() loop
+  // — mirrors the create()-flow serviceTypeIds normalisation.
+  'service_type_ids',
   'reporting_contact_id', 'client_spoc', 'client_spoc_name', 'client_spoc_email',
   'additional_name', 'additional_number',
   'collected_by',
@@ -1871,6 +1878,18 @@ async function update(jobId, input, actor) {
       let v = input[col];
       if (DATETIME_COLS.has(col)) v = combineDateTime(v, null);
       else if (TIME_COLS.has(col)) v = formatTimeIST(v) ?? v;
+      /*
+       * CSV columns (2026-06-05): tbl_job.service_type_ids stores a
+       * comma-separated list. FE callers may send it as either an
+       * array OR an already-joined string — coerce to string here
+       * so the SET clause binds a scalar VARCHAR. Empty array →
+       * NULL (an empty CSV is meaningless). Mirrors the
+       * `serviceTypeIds` normalisation inside create().
+       */
+      else if (col === 'service_type_ids') {
+        if (Array.isArray(v)) v = v.length > 0 ? v.join(',') : null;
+        else v = (v == null || v === '') ? null : String(v);
+      }
       values.push(v);
       changedCols.push(col);
     }
