@@ -64,11 +64,16 @@ async function create(input, actor) {
   const [ins] = await pool.query(`
     INSERT INTO tbl_deep_skill
       (category_id, service_type_id, deepskill_name, deepskill_description,
+       deepskill_tag_words,
        status, inserted_by, inserted_on, deepskill_image, skill_options)
-    VALUES (?, ?, ?, ?, 1, ?, NOW(), ?, '[]')
+    VALUES (?, ?, ?, ?, ?, 1, ?, NOW(), ?, '[]')
   `, [
     input.category_id, input.service_type_id,
     input.deepskill_name, input.deepskill_description || null,
+    // deepskill_tag_words (2026-06-06): per-skill technician-visit
+    // tag(s), max ~2 short phrases per ops file Col B. Separate
+    // semantic from the keyword search string in deepskill_description.
+    input.deepskill_tag_words || null,
     actor?.user_id || null,
     input.deepskill_image || '',
   ]);
@@ -77,7 +82,7 @@ async function create(input, actor) {
 
 async function update(deepskillId, patch) {
   const MUTABLE = ['category_id', 'service_type_id', 'deepskill_name',
-    'deepskill_description', 'deepskill_image', 'status'];
+    'deepskill_description', 'deepskill_tag_words', 'deepskill_image', 'status'];
   const sets = []; const values = [];
   for (const col of MUTABLE) {
     if (patch[col] !== undefined) { sets.push(`${col} = ?`); values.push(patch[col]); }
