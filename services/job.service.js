@@ -1464,14 +1464,14 @@ async function create(input, actor) {
 
     // eta_status: legacy 2-char sentinel. Per JobDaoImpl#2387 "01" is
     // the unconfirmed default; once a job is promoted to BOOKED via
-    // Confirm & Schedule the value should reflect "confirmed/scheduled".
-    // Legacy DB samples + repo grep don't expose a documented enum, so
-    // we default the BOOKED path to "02" — TODO(ops 2026-06-04): confirm
-    // the canonical confirmed sentinel and adjust if a different code
-    // is in use. ENQUIRY (7) and CALL_LATER (9) keep the "01" default
-    // because they are explicitly NOT confirmed orders.
-    const etaStatus = input.eta_status
-      ?? (effectiveStatus === STATUS.BOOKED ? '02' : '01');
+    // eta_status (reverted 2026-06-05 per ops): default to '01'
+    // unconditionally across every create path. Book-New-Call,
+    // C&S sibling fan-out, and direct-to-ENQUIRY all land as '01'
+    // — the legacy default that the rest of the platform expects.
+    // If a future flow needs to override (e.g. a "confirmed" sentinel
+    // like '02' for a different lifecycle stage), the caller passes
+    // input.eta_status explicitly; the BE no longer infers from status.
+    const etaStatus = input.eta_status ?? '01';
 
     /*
      * Job OTP (2026-05-28). Legacy CRM (JobDaoImpl.java:4418) stamps
@@ -1838,10 +1838,40 @@ async function update(jobId, input, actor) {
   // timestamp, every Add-Remarks click would falsely mark the row as a
   // draft. Comments have their own audit trail in tbl_job_comment.
   const changedCols = [];
+  /*
+   * Date/time projection (2026-06-05). create() runs every datetime
+   * input through combineDateTime() so the DATETIME columns land as
+   * `'YYYY-MM-DD HH:MM:SS'` IST literals (not the JS-Date default of
+   * UTC ISO with a `Z` suffix, which legacy MySQL reports parse as
+   * the wrong wall-clock). PATCH must apply the same transform —
+   * otherwise C&S confirms write the raw ISO into a DATETIME column
+   * and the time portion is lost / mis-stored. Same helper set:
+   *   - combineDateTime  → MySQL DATETIME string in IST
+   *   - formatTimeIST    → "HH:MM" string in IST for the legacy
+   *                         requested_time / original_appointment_time
+   *                         text columns
+   * `requested_time` is derived from `requested_date_time` when the
+   * caller doesn't pass it explicitly (mirrors create()).
+   */
+  const DATETIME_COLS = new Set([
+    'requested_date_time', 'expected_date_time', 'original_appointment_date_time',
+  ]);
+  const TIME_COLS = new Set([
+    'requested_time', 'original_appointment_time',
+  ]);
+  // Derive requested_time from requested_date_time if FE didn't send it
+  // alongside (legacy companion column). Only fills if requested_time
+  // is undefined in input — never overwrites an explicit value.
+  if (input.requested_date_time !== undefined && input.requested_time === undefined) {
+    input.requested_time = formatTimeIST(input.requested_date_time);
+  }
   for (const col of MUTABLE_COLUMNS) {
     if (input[col] !== undefined) {
       sets.push(`${col} = ?`);
-      values.push(input[col]);
+      let v = input[col];
+      if (DATETIME_COLS.has(col)) v = combineDateTime(v, null);
+      else if (TIME_COLS.has(col)) v = formatTimeIST(v) ?? v;
+      values.push(v);
       changedCols.push(col);
     }
   }
