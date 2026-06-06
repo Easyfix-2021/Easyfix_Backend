@@ -169,6 +169,15 @@ router.get('/me', requireAuth, async (req, res, next) => {
       }
     }
 
+    // scheduledJobsAccess (2026-06-06): mirrors the same email-allowlist
+    // check used by routes/admin/scheduled-jobs.js. The FE reads this
+    // boolean to decide whether to render the "Scheduled Jobs" entry
+    // at the bottom of the Settings sidebar. Default false — the
+    // BE is the source of truth either way (the route 403s if the
+    // FE ever sneaks in for an off-allowlist user).
+    const sj = require('../services/scheduled-jobs.service');
+    const scheduledJobsAccess = sj.isAllowedUser(req.user);
+
     modernOk(res, {
       user: req.user,
       role: role && {
@@ -183,6 +192,7 @@ router.get('/me', requireAuth, async (req, res, next) => {
         directReportsCount: hierarchy.directReports.length,
         descendantsCount: hierarchy.descendants.length,
       },
+      scheduledJobsAccess,
     });
   } catch (err) {
     next(err);

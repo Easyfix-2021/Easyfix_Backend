@@ -80,6 +80,11 @@ router.use('/rate-cards',      require('./rate-cards'));
 router.use('/quotations',      require('./quotations'));
 router.use('/questionnaires',  require('./questionnaires'));
 router.use('/settings',        require('./settings'));
+// Scheduled Jobs admin (2026-06-06) — list + manual trigger for
+// node-cron tasks. Self-gates on the email allowlist
+// (easyfix_properties.scheduled.jobs.visible.emails); no role/menu
+// permission seeded.
+router.use('/scheduled-jobs',  require('./scheduled-jobs'));
 router.use('/reports',         require('./reports'));
 router.use('/aux',             require('./auxiliary'));
 router.use('/legacy',          require('./legacy'));
