@@ -214,6 +214,54 @@ Note: this task only runs if the property "magic.link.cron.enabled" is set to "t
     logger.info('Magic-link cron registered (magic.link.cron.enabled=true).');
   }
 
+  // ─── Easyfixer Profile-Completion Reminder — daily at 10:00 IST ───
+  // Added 2026-06-06 per ops. Finds every ACTIVE easyfixer with an
+  // incomplete profile (efr_profile_perc < 100 OR final_submission != 1)
+  // and sends them a WhatsApp nudge via the Gallabox template
+  // `complete_profile_easyfixer`. No gating property — runs daily on
+  // every env where CRON_DISABLED isn't set. Per-send errors are
+  // logged + counted but don't abort the loop.
+  const profileReminderCron = require('../services/easyfixer-profile-reminder-cron');
+  const profileReminderJob = registerJob({
+    id: 'easyfixer-profile-reminder',
+    name: 'Easyfixer Profile-Completion Reminder',
+    description:
+`What this task does: Every active easyfixer (technician) in our system is expected to fill out their full profile — name, contact info, service categories they cover, documents (Aadhaar, PAN, photo), etc. When their profile is incomplete, the auto-assignment engine struggles to pick them for jobs, and ops can't verify them. This task gives those technicians a friendly daily nudge over WhatsApp.
+
+Here's how it works, step by step:
+  1. Every day at 10:00 AM IST, the task wakes up automatically.
+  2. It looks at every technician in our database whose account is ACTIVE.
+  3. From those, it picks only the ones whose profile is INCOMPLETE — meaning their profile completion percentage is below 100, OR they haven't yet pressed the "Final Submission" button (which signals "I'm done filling things in").
+  4. It also filters out anyone without a valid mobile number on file — there's no point sending a WhatsApp message if we don't know where to send it.
+  5. For each remaining technician, it asks Gallabox (our WhatsApp messaging provider) to send them a pre-approved template message called "complete_profile_easyfixer". The template is a generic, friendly nudge: "Please complete your EasyFix profile to get assigned to jobs."
+  6. The task logs how many technicians were eligible, how many messages it attempted, how many succeeded, and how many failed — visible in the server logs and on this page (Last Run details below).
+
+Why this matters: technicians often get distracted mid-signup and never finish their profile. Without this daily nudge, those incomplete profiles pile up indefinitely. The WhatsApp message lands directly on their phone and links back to the profile page — much higher conversion than email reminders.
+
+Note: this task does NOT have a per-technician cooldown. A technician with an incomplete profile receives a nudge EVERY day until they finish (or until ops marks their account inactive). If a tech reports "stop spamming me", the operator should either deactivate their record (efr_status = 0) or complete the missing fields on their behalf. Trigger Now is useful if ops just imported a batch of new technicians and wants to send the first wave of nudges immediately rather than waiting for tomorrow's 10am tick.`,
+    cron: '0 10 * * *',
+    runner: async () => {
+      const result = await profileReminderCron.runDailyReminder();
+      logger.info(
+        `Profile-reminder cron · eligible=${result.eligible} · ` +
+        `attempted=${result.attempted} · succeeded=${result.succeeded} · ` +
+        `failed=${result.failed} · skipped=${result.skipped}`
+      );
+      return result;
+    },
+  });
+  if (!cronDisabled) {
+    profileReminderJob.task = cron.schedule(
+      profileReminderJob.cron,
+      () => invokeJob(profileReminderJob, 'cron'),
+      { timezone: TZ },
+    );
+    profileReminderJob.registered = true;
+    logger.info('Easyfixer profile-reminder cron registered (daily 10:00 IST).');
+  } else {
+    profileReminderJob.skipReason = 'CRON_DISABLED=true';
+  }
+
   const registeredCount = jobs.filter((j) => j.registered).length;
   logger.ready(`Scheduler started — ${registeredCount}/${jobs.length} task(s) registered (tz=${TZ}).`);
 }
