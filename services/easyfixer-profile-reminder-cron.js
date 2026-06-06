@@ -101,4 +101,92 @@ async function runDailyReminder() {
   return summary;
 }
 
-module.exports = { runDailyReminder, TEMPLATE_NAME };
+/*
+ * Test send (2026-06-06). Fires the SAME Gallabox template the daily cron
+ * fires, but to an arbitrary operator-supplied mobile — never to the real
+ * easyfixer. Two modes:
+ *
+ *   - sourceId omitted → recipientName falls back to a dummy
+ *     ("Test Easyfixer"). Useful for verifying template approval /
+ *     Gallabox connectivity without touching any real row.
+ *
+ *   - sourceId provided (an efr_id) → we look up THAT row's display name
+ *     and use it as the WhatsApp recipientName so the test message looks
+ *     identical to what THAT easyfixer would receive. The lookup is
+ *     read-only; we do NOT update efr_status, profile_perc, anything.
+ *     The WhatsApp still goes to the operator's mobile — under no path
+ *     does it reach the real easyfixer's number.
+ *
+ * The mobile is validated to 10 Indian digits (or 12 with the 91 prefix);
+ * an invalid number throws a 400 before any provider call. Returns a
+ * structured result the route handler surfaces back to the FE for the
+ * "Last Run" panel.
+ */
+async function runTest({ mobile, sourceId } = {}) {
+  const phone = String(mobile || '').trim();
+  const cleaned = phone.replace(/\D/g, '');
+  if (!(cleaned.length === 10 || (cleaned.length === 12 && cleaned.startsWith('91')))) {
+    throw Object.assign(new Error('Mobile must be a valid 10-digit Indian number.'), {
+      status: 400, code: 'INVALID_TEST_MOBILE',
+    });
+  }
+
+  // Optional source lookup — purely for the recipientName field. Read-only.
+  let recipientName = 'Test Easyfixer';
+  let sourceUsed = null;
+  if (sourceId != null && String(sourceId).trim() !== '') {
+    const efrId = Number(String(sourceId).trim());
+    if (!Number.isInteger(efrId) || efrId <= 0) {
+      throw Object.assign(new Error('Easyfixer ID must be a positive integer.'), {
+        status: 400, code: 'INVALID_SOURCE_ID',
+      });
+    }
+    const [rows] = await pool.query(
+      `SELECT efr_id,
+              COALESCE(NULLIF(TRIM(efr_name), ''),
+                       NULLIF(TRIM(CONCAT_WS(' ', efr_first_name, efr_last_name)), ''),
+                       '') AS name
+         FROM tbl_easyfixer
+        WHERE efr_id = ? LIMIT 1`,
+      [efrId],
+    );
+    if (rows.length === 0) {
+      throw Object.assign(new Error(`No easyfixer found with id ${efrId}.`), {
+        status: 404, code: 'EASYFIXER_NOT_FOUND',
+      });
+    }
+    recipientName = rows[0].name || recipientName;
+    sourceUsed = { efr_id: rows[0].efr_id, name: rows[0].name || null };
+  }
+
+  // Send strictly to the operator's mobile. Gallabox wrapper handles
+  // NOTIFICATIONS_DISABLE + TEST_MOBILE itself (the latter would
+  // redirect even a test send if set — log either way).
+  const res = await gallabox.sendTemplate({
+    to: phone,
+    recipientName,
+    templateName: TEMPLATE_NAME,
+    bodyValues: {},
+  });
+
+  logger.info(
+    `Profile-reminder TEST · target=${phone} · recipientName="${recipientName}" · ` +
+    `efr_id=${sourceUsed?.efr_id ?? 'none'} · delivered=${!!res?.delivered}`,
+  );
+
+  return {
+    test: true,
+    target_mobile: phone,
+    recipient_name: recipientName,
+    source_used: sourceUsed,
+    delivered: !!res?.delivered,
+    disabled: !!res?.disabled,
+    redirected_to_test_mobile: !!res?.redirected,
+    intended_to: res?.intendedTo || null,
+    http_status: res?.httpStatus || null,
+    provider_response: res?.providerResponse ? String(res.providerResponse).slice(0, 240) : null,
+    error: res?.error || null,
+  };
+}
+
+module.exports = { runDailyReminder, runTest, TEMPLATE_NAME };

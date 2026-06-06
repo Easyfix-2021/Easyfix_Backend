@@ -53,11 +53,25 @@ const TZ = 'Asia/Kolkata';
  */
 const jobs = [];
 
-function registerJob({ id, name, description, cron: cronExpr, runner, skipReason }) {
+function registerJob({
+  id, name, description, cron: cronExpr, runner, skipReason,
+  // Optional "test send" support (2026-06-06). When a job exposes a
+  // `tester` fn, the admin Scheduled Jobs page renders a "Test" button
+  // alongside "Trigger Now". The tester is called with the operator-
+  // typed { mobile, sourceId } and is expected to dispatch a single
+  // test message — never to the original recipient — and return a
+  // structured result the route surfaces back to the FE.
+  // `testSourceLabel` + `testSourceHelp` drive the modal's optional
+  // source-id input copy (e.g. "Easyfixer ID" / "Unconfirmed Job ID").
+  tester, testSourceLabel, testSourceHelp,
+}) {
   const job = {
     id, name, description,
     cron: cronExpr,
     runner,
+    tester: tester || null,
+    testSourceLabel: testSourceLabel || null,
+    testSourceHelp: testSourceHelp || null,
     registered: false,
     skipReason: skipReason || null,
     task: null,
@@ -65,7 +79,7 @@ function registerJob({ id, name, description, cron: cronExpr, runner, skipReason
     lastDurationMs: null,
     lastResult: null,
     lastError: null,
-    lastTriggerKind: null,   // 'cron' | 'manual'
+    lastTriggerKind: null,   // 'cron' | 'manual' | 'test'
   };
   jobs.push(job);
   return job;
@@ -196,6 +210,17 @@ Note: this task only runs if the property "magic.link.cron.enabled" is set to "t
       );
       return result;
     },
+    // Test send (2026-06-06). Operator enters a mobile + optional unconfirmed
+    // job_id; the cron service sends the SAME `confirm_order` template to the
+    // typed mobile only (never to the real customer) using the job's
+    // customer/client names as placeholder values. No tbl_job mutation.
+    tester: ({ mobile, sourceId }) => magicLinkCron.runTest({ mobile, sourceId }),
+    testSourceLabel: 'Unconfirmed Job ID',
+    testSourceHelp:
+      'Optional. If you provide an unconfirmed job\'s ID, the customer name + client name from that job ' +
+      'are used as placeholder values in the test message. The WhatsApp itself still goes ONLY to the ' +
+      'mobile number you typed above — never to the real customer. Leave blank to use dummy details ' +
+      '("Test Customer" / "EasyFix Demo").',
   });
   const magicLinkCronEnabled =
     String(getProperty('magic.link.cron.enabled') ?? '').toLowerCase() === 'true';
@@ -249,6 +274,16 @@ Note: this task does NOT have a per-technician cooldown. A technician with an in
       );
       return result;
     },
+    // Test send (2026-06-06). Operator enters a mobile + optional easyfixer
+    // efr_id; the cron service sends the SAME `complete_profile_easyfixer`
+    // template to the typed mobile only (never to the real easyfixer) using
+    // the easyfixer's name as the recipientName. No tbl_easyfixer mutation.
+    tester: ({ mobile, sourceId }) => profileReminderCron.runTest({ mobile, sourceId }),
+    testSourceLabel: 'Easyfixer ID (efr_id)',
+    testSourceHelp:
+      'Optional. If you provide an easyfixer\'s ID, that easyfixer\'s display name is used as the ' +
+      'recipient name in the test message. The WhatsApp itself still goes ONLY to the mobile number ' +
+      'you typed above — never to the real easyfixer. Leave blank to use a dummy name ("Test Easyfixer").',
   });
   if (!cronDisabled) {
     profileReminderJob.task = cron.schedule(
@@ -295,6 +330,18 @@ function getJobs() {
     lastResult: j.lastResult,
     lastError: j.lastError,
     lastTriggerKind: j.lastTriggerKind,
+    // Test-send surface (2026-06-06). `testable` drives whether the FE
+    // renders a Test button next to Trigger Now; the label/help strings
+    // drive the modal's optional source-id input copy. The lastTest*
+    // fields mirror the lastRun* fields but for the SEPARATE test path
+    // so a test send doesn't pollute the production cron's telemetry.
+    testable: !!j.tester,
+    testSourceLabel: j.testSourceLabel,
+    testSourceHelp: j.testSourceHelp,
+    lastTestAt: j.lastTestAt || null,
+    lastTestDurationMs: j.lastTestDurationMs ?? null,
+    lastTestResult: j.lastTestResult ?? null,
+    lastTestError: j.lastTestError || null,
   }));
 }
 
@@ -316,4 +363,52 @@ async function triggerJob(id) {
   return invokeJob(job, 'manual');
 }
 
-module.exports = { init, stop, getJobs, triggerJob };
+/*
+ * Test send (2026-06-06). Invokes the job's tester closure with the
+ * operator-supplied opts ({ mobile, sourceId }). Distinct from triggerJob()
+ * because:
+ *   - It does NOT touch the job's lastRunAt / lastDurationMs telemetry.
+ *     A test send is an out-of-band probe — surfacing it as "Last Run" on
+ *     the admin page would mislead ops into thinking the cron itself ran.
+ *     Instead we stash the test outcome on `lastTestAt` / `lastTestResult`
+ *     / `lastTestError` so the FE can render a small "Last Test" line
+ *     separately without polluting the production cron telemetry.
+ *   - The tester is OPTIONAL per job — throws 400 if the targeted job
+ *     didn't register one (most jobs are too side-effect-heavy to be
+ *     safely testable; only message-dispatch crons opt in).
+ *   - Validates the route's input shape, but the per-job tester is
+ *     the source of truth for mobile / sourceId validation (so each
+ *     job can enforce its own constraints — e.g. magic-link requires
+ *     a real job_id with status=9 if sourceId is given).
+ */
+async function testJob(id, opts) {
+  const job = jobs.find((j) => j.id === id);
+  if (!job) {
+    const err = new Error(`No scheduled job with id "${id}"`);
+    err.status = 404;
+    throw err;
+  }
+  if (typeof job.tester !== 'function') {
+    const err = new Error(`Job "${id}" does not support test sends.`);
+    err.status = 400;
+    throw err;
+  }
+  const t0 = Date.now();
+  job.lastTestAt = new Date();
+  job.lastTestError = null;
+  job.lastTestResult = null;
+  job.lastTriggerKind = 'test';
+  try {
+    const result = await job.tester(opts || {});
+    job.lastTestDurationMs = Date.now() - t0;
+    job.lastTestResult = result ?? { ok: true };
+    return result;
+  } catch (err) {
+    job.lastTestDurationMs = Date.now() - t0;
+    job.lastTestError = err?.message || String(err);
+    logger.warn(`Cron job "${job.id}" TEST failed: ${job.lastTestError}`);
+    throw err;
+  }
+}
+
+module.exports = { init, stop, getJobs, triggerJob, testJob };

@@ -28,6 +28,23 @@ const idParam = Joi.object({
   id: Joi.string().min(1).max(100).pattern(/^[a-z0-9-]+$/i).required(),
 });
 
+/*
+ * Test-send body (2026-06-06). `mobile` is loose-validated (digits + a
+ * handful of separators) up to 15 chars — the per-job tester does the
+ * strict India-format check + normalisation. `sourceId` is the optional
+ * row id (efr_id / job_id depending on the job); we accept either a
+ * number or a numeric string so a paste from the URL bar works. An
+ * empty string is treated the same as omitted, so an operator who
+ * focuses the field then thinks better of it doesn't get a validator
+ * error.
+ */
+const testBody = Joi.object({
+  mobile: Joi.string().trim().min(10).max(15).pattern(/^[\d+\-\s()]+$/).required(),
+  sourceId: Joi.alternatives()
+    .try(Joi.number().integer().positive(), Joi.string().trim().allow(''))
+    .optional(),
+});
+
 function requireAllowedEmail(req, res, next) {
   if (!sj.isAllowedUser(req.user)) {
     logger.warn(
@@ -63,5 +80,50 @@ router.post('/:id/trigger', validate(idParam, 'params'), async (req, res, next) 
     next(e);
   }
 });
+
+/*
+ * Test send (2026-06-06). Operator-supplied mobile receives a single
+ * WhatsApp using the job's underlying template. Real recipient (customer
+ * for magic-link, easyfixer for profile-reminder) is NEVER contacted —
+ * the per-job tester enforces that at the service layer. Optional
+ * `sourceId` lets the operator borrow REAL details (name / client name)
+ * from an actual row so the test message renders identically; the
+ * lookup is read-only and the message still routes only to `mobile`.
+ *
+ * Surfaces all per-job validation errors (400 / 404) as proper HTTP
+ * codes so the FE modal can render them inline.
+ */
+router.post(
+  '/:id/test',
+  validate(idParam, 'params'),
+  validate(testBody, 'body'),
+  async (req, res, next) => {
+    try {
+      const sourceId = (req.body.sourceId == null || req.body.sourceId === '')
+        ? null
+        : req.body.sourceId;
+      logger.info(
+        {
+          userId: req.user?.user_id,
+          jobId: req.params.id,
+          mobile: req.body.mobile,
+          sourceId,
+        },
+        'scheduled-jobs test send',
+      );
+      const result = await sj.test(req.params.id, {
+        mobile: String(req.body.mobile).trim(),
+        sourceId,
+      });
+      modernOk(res, { id: req.params.id, result }, 'test sent');
+    } catch (e) {
+      // Service-layer errors carry status + code; surface them as-is so
+      // the FE can show e.g. "No easyfixer found with id 1234" inline
+      // rather than a generic 500.
+      if (e && e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
 
 module.exports = router;

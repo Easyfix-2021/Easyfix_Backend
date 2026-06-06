@@ -54,10 +54,22 @@ async function trigger(id) {
   return scheduler.triggerJob(id);
 }
 
+/*
+ * Pass-through to the scheduler's TEST send (2026-06-06). Distinct from
+ * trigger() because the test path dispatches a single message to an
+ * operator-typed mobile (never to the original recipient) instead of
+ * running the full eligibility loop. Throws 400 from the scheduler if
+ * the targeted job didn't register a tester closure.
+ */
+async function test(id, opts) {
+  return scheduler.testJob(id, opts);
+}
+
 module.exports = {
   PROPERTY_KEY,
   getAllowedEmails,
   isAllowedUser,
   list,
   trigger,
+  test,
 };
