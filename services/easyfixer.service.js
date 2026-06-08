@@ -162,9 +162,37 @@ async function list({
     clauses.push('EXISTS (SELECT 1 FROM tbl_efr_deepskill_mapping dsm WHERE dsm.easyfixer_id = e.efr_id AND dsm.deep_skill_id = ?)');
     params.push(deepSkillId);
   }
-  if (deepSkillMapped === 'mapped') {
+  /*
+   * Legacy parity (2026-06-08). The legacy CRM's `deepSkillMapped`
+   * filter ONLY takes effect when also scoped by serviceCategory /
+   * serviceType / deepSkillId (verified via the EasyfixerDaoImpl.java
+   * audit — the legacy SQL hard-codes `EDM.category_id = ?` /
+   * `EDM.service_type_id = ?` / `EDM.deep_skill_id = ?` inside the
+   * EXISTS subquery). Without any of those scope IDs supplied, the
+   * legacy filter is effectively a no-op — the default UI label
+   * "Mapped To DS" returns ALL active easyfixers, not just those with
+   * a row in tbl_efr_deepskill_mapping.
+   *
+   * Before this gate, the New CRM applied EXISTS unconditionally on
+   * the default page load (FE sends `deepSkillMapped: 'mapped'` as the
+   * default value), filtering out ~866 active easyfixers who have no
+   * deep-skill row → 1335 records on a QA env that legacy returns
+   * 2201 for. The gate restores numerical parity.
+   *
+   * Sane semantics WHEN scope IS supplied:
+   *   'mapped'     → EXISTS (HAS a row in tbl_efr_deepskill_mapping)
+   *   'not_mapped' → NOT EXISTS (no row)
+   * Operators picking a category + "Mapped To DS" now see actually-
+   * mapped easyfixers (natural reading), not the legacy's inverted
+   * "pending mapping" worklist. If business specifically wants the
+   * legacy inverted semantics here, flip the EXISTS/NOT-EXISTS pair.
+   */
+  const hasDeepSkillScope = serviceCategory != null
+    || serviceType != null
+    || deepSkillId != null;
+  if (deepSkillMapped === 'mapped' && hasDeepSkillScope) {
     clauses.push('EXISTS (SELECT 1 FROM tbl_efr_deepskill_mapping dsm WHERE dsm.easyfixer_id = e.efr_id)');
-  } else if (deepSkillMapped === 'not_mapped') {
+  } else if (deepSkillMapped === 'not_mapped' && hasDeepSkillScope) {
     clauses.push('NOT EXISTS (SELECT 1 FROM tbl_efr_deepskill_mapping dsm WHERE dsm.easyfixer_id = e.efr_id)');
   }
   if (activeFromDate && activeToDate) {
