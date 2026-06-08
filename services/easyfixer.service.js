@@ -18,13 +18,50 @@ const { pool } = require('../db');
  */
 
 // ─── Projections ────────────────────────────────────────────────────
+// Manage Easyfixers parity (2026-06-08): the BASE list returns a minimal
+// projection only — no expensive aggregations. Earnings/job-count/rating/
+// clients_mapped/today-attendance are now fetched lazily by the FE via:
+//   POST /admin/easyfixers/aggregates  → clients_mapped, total_earnings, job_count, avg_rating
+//   POST /admin/easyfixers/attendance  → today's attendance slots
+// EF Account label and the cheap city/state/zonal-manager joins are kept
+// here — `team` scans tiny `tbl_easyfixer`, the rest are PK lookups.
 const LIST_COLUMNS = `
   e.efr_id, e.efr_name, e.efr_first_name, e.efr_last_name,
   e.efr_no, e.efr_email, e.efr_cityId, c.city_name AS city_name,
   e.efr_status, e.efr_service_category, e.efr_service_type,
   e.efr_profile_perc, e.is_technician_verified,
   e.final_submission, e.new_easy_fixer,
-  e.efr_manager_id, e.insert_date, e.update_date
+  e.efr_manager_id, e.insert_date, e.update_date,
+  c.state_id AS state_id,
+  s.state_name AS state_name,
+  c.state_user AS zonal_manager_user_id,
+  zm.user_name AS user_mapped_to_city,
+  e.current_balance AS current_balance,
+  e.profile_activation_date_time AS profile_activation_date_time,
+  CASE
+    WHEN e.efr_manager_id IS NOT NULL AND e.efr_manager_id > 0 THEN 'Under Master'
+    WHEN team.team_count > 0 THEN 'Master'
+    ELSE 'Individual'
+  END AS ef_account
+`;
+
+// Shared FROM/JOIN block — used by both the data and the count queries so
+// any filter referencing an alias resolves. Only CHEAP joins live here:
+//   - tbl_city / tbl_state / tbl_user — PK lookups
+//   - team subquery — scans `tbl_easyfixer` (tiny table)
+// Expensive aggregations (earn/cm/rt/att) moved to the sub-resource
+// endpoints (aggregates / attendance).
+const LIST_JOINS = `
+  FROM tbl_easyfixer e
+  LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId
+  LEFT JOIN tbl_state s ON s.state_id = c.state_id
+  LEFT JOIN tbl_user zm ON zm.user_id = c.state_user
+  LEFT JOIN (
+    SELECT efr_manager_id, COUNT(*) AS team_count
+      FROM tbl_easyfixer
+     WHERE efr_manager_id IS NOT NULL AND efr_manager_id > 0
+     GROUP BY efr_manager_id
+  ) team ON team.efr_manager_id = e.efr_id
 `;
 
 const DETAIL_COLUMNS = `
@@ -40,6 +77,11 @@ async function list({
   q, cityId, serviceCategory, isVerified, status,
   scope,
   limit = 50, offset = 0, includeInactive = false,
+  // Manage Easyfixers parity filters (2026-06-08)
+  easyfixerId, name, mobileNo,
+  efAccount, stateId, serviceType, deepSkillId,
+  activeFromDate, activeToDate,
+  zonalManagerId, attendance, deepSkillMapped,
 } = {}) {
   const clauses = [];
   const params = [];
@@ -69,25 +111,128 @@ async function list({
     params.push(cityId);
   }
   if (serviceCategory) {
-    clauses.push('e.efr_service_category LIKE ?');
-    params.push(`%${serviceCategory}%`);
+    // CSV-stored column — exact-match on a single category via FIND_IN_SET
+    // when the value looks numeric (legacy ids), otherwise fall back to LIKE
+    // for callers that pass a category name fragment.
+    if (/^\d+$/.test(String(serviceCategory))) {
+      clauses.push('FIND_IN_SET(?, e.efr_service_category)');
+      params.push(String(serviceCategory));
+    } else {
+      clauses.push('e.efr_service_category LIKE ?');
+      params.push(`%${serviceCategory}%`);
+    }
   }
   if (isVerified === true)  clauses.push('e.is_technician_verified = 1');
   if (isVerified === false) clauses.push('(e.is_technician_verified = 0 OR e.is_technician_verified IS NULL)');
 
+  // ─── Manage Easyfixers filters ─────────────────────────────────────
+  if (easyfixerId != null) {
+    clauses.push('e.efr_id = ?');
+    params.push(easyfixerId);
+  }
+  if (name) {
+    clauses.push('e.efr_name LIKE ?');
+    params.push(`%${name}%`);
+  }
+  if (mobileNo) {
+    clauses.push('e.efr_no LIKE ?');
+    params.push(`%${mobileNo}%`);
+  }
+  if (efAccount === 'under_master') {
+    clauses.push('e.efr_manager_id IS NOT NULL AND e.efr_manager_id > 0');
+  } else if (efAccount === 'master') {
+    clauses.push('(e.efr_manager_id IS NULL OR e.efr_manager_id = 0) AND team.team_count > 0');
+  } else if (efAccount === 'individual') {
+    clauses.push('(e.efr_manager_id IS NULL OR e.efr_manager_id = 0) AND (team.team_count IS NULL OR team.team_count = 0)');
+  }
+  if (stateId != null) {
+    clauses.push('c.state_id = ?');
+    params.push(stateId);
+  }
+  if (serviceType) {
+    if (/^\d+$/.test(String(serviceType))) {
+      clauses.push('FIND_IN_SET(?, e.efr_service_type)');
+      params.push(String(serviceType));
+    } else {
+      clauses.push('e.efr_service_type LIKE ?');
+      params.push(`%${serviceType}%`);
+    }
+  }
+  if (deepSkillId != null) {
+    clauses.push('EXISTS (SELECT 1 FROM tbl_efr_deepskill_mapping dsm WHERE dsm.easyfixer_id = e.efr_id AND dsm.deep_skill_id = ?)');
+    params.push(deepSkillId);
+  }
+  if (deepSkillMapped === 'mapped') {
+    clauses.push('EXISTS (SELECT 1 FROM tbl_efr_deepskill_mapping dsm WHERE dsm.easyfixer_id = e.efr_id)');
+  } else if (deepSkillMapped === 'not_mapped') {
+    clauses.push('NOT EXISTS (SELECT 1 FROM tbl_efr_deepskill_mapping dsm WHERE dsm.easyfixer_id = e.efr_id)');
+  }
+  if (activeFromDate && activeToDate) {
+    clauses.push('DATE(e.profile_activation_date_time) BETWEEN ? AND ?');
+    params.push(activeFromDate, activeToDate);
+  } else if (activeFromDate) {
+    clauses.push('DATE(e.profile_activation_date_time) >= ?');
+    params.push(activeFromDate);
+  } else if (activeToDate) {
+    clauses.push('DATE(e.profile_activation_date_time) <= ?');
+    params.push(activeToDate);
+  }
+  if (zonalManagerId != null) {
+    clauses.push('c.state_user = ?');
+    params.push(zonalManagerId);
+  }
+  // Attendance filter — `att` is no longer LEFT JOINed in the base query
+  // (moved to POST /attendance sub-resource). Translate filter values to
+  // EXISTS/NOT EXISTS so we still scope correctly on today's window.
+  if (attendance === 'present') {
+    clauses.push(`EXISTS (
+      SELECT 1 FROM tbl_easyfixer_attendance att
+       WHERE att.easyfixer_id = e.efr_id
+         AND att.created_on >= CURDATE()
+         AND att.created_on <  CURDATE() + INTERVAL 1 DAY
+         AND (att.morning_slot = 1 OR att.evening_slot = 1)
+         AND (att.is_leave_marked IS NULL OR att.is_leave_marked = 0)
+    )`);
+  } else if (attendance === 'absent') {
+    clauses.push(`EXISTS (
+      SELECT 1 FROM tbl_easyfixer_attendance att
+       WHERE att.easyfixer_id = e.efr_id
+         AND att.created_on >= CURDATE()
+         AND att.created_on <  CURDATE() + INTERVAL 1 DAY
+         AND (att.morning_slot IS NULL OR att.morning_slot = 0)
+         AND (att.evening_slot IS NULL OR att.evening_slot = 0)
+         AND (att.is_leave_marked IS NULL OR att.is_leave_marked = 0)
+    )`);
+  } else if (attendance === 'on_leave') {
+    clauses.push(`EXISTS (
+      SELECT 1 FROM tbl_easyfixer_attendance att
+       WHERE att.easyfixer_id = e.efr_id
+         AND att.created_on >= CURDATE()
+         AND att.created_on <  CURDATE() + INTERVAL 1 DAY
+         AND att.is_leave_marked = 1
+    )`);
+  } else if (attendance === 'no_information') {
+    clauses.push(`NOT EXISTS (
+      SELECT 1 FROM tbl_easyfixer_attendance att
+       WHERE att.easyfixer_id = e.efr_id
+         AND att.created_on >= CURDATE()
+         AND att.created_on <  CURDATE() + INTERVAL 1 DAY
+    )`);
+  }
+
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
 
-  // Page + total count for client pagination UI
+  // Count must share the same JOINs because filters can reference aliases
+  // from joined subqueries (team, att, c, zm).
   const [[{ total }]] = await pool.query(
-    `SELECT COUNT(*) AS total FROM tbl_easyfixer e ${where}`,
+    `SELECT COUNT(*) AS total ${LIST_JOINS} ${where}`,
     params
   );
 
   params.push(Number(limit), Number(offset));
   const [rows] = await pool.query(
     `SELECT ${LIST_COLUMNS}
-       FROM tbl_easyfixer e
-       LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId
+       ${LIST_JOINS}
        ${where}
        ORDER BY e.efr_id DESC
        LIMIT ? OFFSET ?`,
@@ -223,6 +368,209 @@ async function setStatus(id, { active, reasonId, comment }, actor) {
   return getById(id);
 }
 
+// ─── Sub-resource: Transaction List ─────────────────────────────────
+// Feeds the "Transaction List" modal on the Easyfixer detail page.
+// Joins tbl_job_transaction → tbl_job (for appointment/completion timestamps
+// and customer/address lookup) → tbl_customer / tbl_address / tbl_city
+// → tbl_user (Trans. By). We project SELECT * from TJT (best-effort — the
+// table has columns not used elsewhere in this BE; see CRM legacy
+// `tbl_job_transaction` references) plus the labelled join columns the FE
+// modal needs verbatim.
+//
+// Assumptions:
+//   - tbl_job_transaction columns verified from CRM legacy DAO:
+//       fk_job_id, efr_charge, total_charge, ef_charge.
+//     Additional columns (transaction_id PK, ticket_created_date_time,
+//     amount, balance, description, created_by) are projected via SELECT *
+//     since legacy code only ever does `SELECT * from tbl_job_transaction
+//     where fk_job_id = ?` (JobDaoImpl.java#9018) without enumerating them.
+//   - Order by `TJT.transaction_id DESC` assumes that column exists; if
+//     not, the underlying error surfaces clearly.
+async function listTransactions(efrId, { limit = 10, offset = 0 } = {}) {
+  const [[{ total }]] = await pool.query(
+    `SELECT COUNT(*) AS total
+       FROM tbl_job_transaction TJT
+       JOIN tbl_job J ON J.job_id = TJT.fk_job_id
+      WHERE J.fk_easyfixter_id = ?`,
+    [efrId],
+  );
+
+  const [rows] = await pool.query(
+    `SELECT TJT.*,
+            J.job_id                AS job_id,
+            J.job_reference_id      AS job_reference_id,
+            J.scheduled_date_time   AS appointment_date_time,
+            J.checkout_date_time    AS completion_date_time,
+            J.job_status            AS job_status,
+            cu.customer_name        AS customer_name,
+            cu.customer_mob_no      AS customer_mob_no,
+            ad.address              AS customer_address,
+            ad.building             AS customer_building,
+            ad.landmark             AS customer_landmark,
+            ad.pin_code             AS customer_pin_code,
+            ci.city_name            AS location,
+            tx_user.user_name       AS trans_by
+       FROM tbl_job_transaction TJT
+       JOIN tbl_job J        ON J.job_id      = TJT.fk_job_id
+       LEFT JOIN tbl_customer cu ON cu.customer_id = J.fk_customer_id
+       LEFT JOIN tbl_address  ad ON ad.address_id  = J.fk_address_id
+       LEFT JOIN tbl_city     ci ON ci.city_id     = ad.city_id
+       LEFT JOIN tbl_user     tx_user ON tx_user.user_id = TJT.created_by
+      WHERE J.fk_easyfixter_id = ?
+      ORDER BY TJT.transaction_id DESC
+      LIMIT ? OFFSET ?`,
+    [efrId, Number(limit), Number(offset)],
+  );
+  return { rows, total };
+}
+
+// ─── Sub-resource: Mapped Clients ───────────────────────────────────
+// Feeds the "Client Mapping" modal. Joins tbl_client_easyfixer_mapping
+// (keyed by easyfixer_id, filtered mapping_status = 1) to tbl_client for
+// the display name. tbl_client_easyfixer_mapping.easyfixer_id is the FK
+// to tbl_easyfixer.efr_id (NOT efr_id — verified in client-tech-mapping
+// service comments).
+async function listMappedClients(efrId, { limit = 50, offset = 0 } = {}) {
+  const [[{ total }]] = await pool.query(
+    `SELECT COUNT(*) AS total
+       FROM tbl_client_easyfixer_mapping m
+      WHERE m.easyfixer_id = ? AND m.mapping_status = 1`,
+    [efrId],
+  );
+
+  const [rows] = await pool.query(
+    `SELECT m.mapping_id,
+            m.client_id,
+            m.easyfixer_id,
+            m.service_type_id,
+            m.mapping_status,
+            m.insert_date         AS mapped_at,
+            cl.client_name        AS client_name
+       FROM tbl_client_easyfixer_mapping m
+       LEFT JOIN tbl_client cl ON cl.client_id = m.client_id
+      WHERE m.easyfixer_id = ? AND m.mapping_status = 1
+      ORDER BY m.mapping_id DESC
+      LIMIT ? OFFSET ?`,
+    [efrId, Number(limit), Number(offset)],
+  );
+  return { rows, total };
+}
+
+// ─── Sub-resource: Aggregates (lazy column fill) ────────────────────
+// POST /admin/easyfixers/aggregates body { efrIds: [...] }
+// Returns the four expensive columns that were removed from the base list:
+// clients_mapped, total_earnings, job_count, avg_rating. The WHERE ... IN
+// inside each subquery is the critical optimisation — without it those
+// subqueries scan the full tables; with it, they hit covering indexes for
+// just the requested page (~50 ids).
+async function aggregates(efrIds, { scope } = {}) {
+  if (!Array.isArray(efrIds) || efrIds.length === 0) return { rows: [] };
+  // Cap + sanitise: integers, positive, dedupe, max 1000.
+  const ids = Array.from(new Set(
+    efrIds.slice(0, 1000).map(Number).filter((n) => Number.isInteger(n) && n > 0)
+  ));
+  if (ids.length === 0) return { rows: [] };
+
+  // RBAC scope filter — restrict the id set to easyfixers whose city is in
+  // the caller's scope. Uses the same scope shape as list().
+  const scopeClauses = [];
+  const scopeParams = [];
+  if (scope?.cities) {
+    const ci = scope.cities;
+    if (ci.mode === 'none') return { rows: [] };
+    if (ci.mode === 'allow' && ci.ids.length) {
+      scopeClauses.push(`e.efr_cityId IN (${ci.ids.map(() => '?').join(',')})`);
+      scopeParams.push(...ci.ids);
+    }
+  }
+  const scopeWhere = scopeClauses.length ? ` AND ${scopeClauses.join(' AND ')}` : '';
+
+  const placeholders = ids.map(() => '?').join(',');
+
+  const [rows] = await pool.query(
+    `SELECT
+       e.efr_id,
+       COALESCE(cm.clients_mapped, 0)    AS clients_mapped,
+       COALESCE(earn.total_earnings, 0)  AS total_earnings,
+       COALESCE(earn.job_count, 0)       AS job_count,
+       ROUND(rt.rating, 2)               AS avg_rating
+     FROM tbl_easyfixer e
+     LEFT JOIN (
+       SELECT easyfixer_id, COUNT(DISTINCT client_id) AS clients_mapped
+         FROM tbl_client_easyfixer_mapping
+        WHERE easyfixer_id IN (${placeholders}) AND mapping_status = 1
+        GROUP BY easyfixer_id
+     ) cm ON cm.easyfixer_id = e.efr_id
+     LEFT JOIN (
+       SELECT J.fk_easyfixter_id,
+              SUM(TJT.efr_charge) AS total_earnings,
+              COUNT(DISTINCT TJT.fk_job_id) AS job_count
+         FROM tbl_job_transaction TJT
+         JOIN tbl_job J ON J.job_id = TJT.fk_job_id
+        WHERE J.fk_easyfixter_id IN (${placeholders}) AND J.job_status IN (3, 5)
+        GROUP BY J.fk_easyfixter_id
+     ) earn ON earn.fk_easyfixter_id = e.efr_id
+     LEFT JOIN (
+       SELECT easyfixer_id, AVG(customer_rating) AS rating
+         FROM tbl_easyfixer_rating_by_customer
+        WHERE easyfixer_id IN (${placeholders})
+          AND easyfixer_id > 0
+          AND comment IS NOT NULL
+        GROUP BY easyfixer_id
+     ) rt ON rt.easyfixer_id = e.efr_id
+     WHERE e.efr_id IN (${placeholders})${scopeWhere}`,
+    [...ids, ...ids, ...ids, ...ids, ...scopeParams],
+  );
+
+  return { rows };
+}
+
+// ─── Sub-resource: Today's Attendance (lazy column fill) ────────────
+// POST /admin/easyfixers/attendance body { efrIds: [...] }
+// Returns today's attendance row per requested easyfixer (if any).
+// Missing rows mean "no information" — FE should treat absence accordingly.
+async function attendance(efrIds, { scope } = {}) {
+  if (!Array.isArray(efrIds) || efrIds.length === 0) return { rows: [] };
+  const ids = Array.from(new Set(
+    efrIds.slice(0, 1000).map(Number).filter((n) => Number.isInteger(n) && n > 0)
+  ));
+  if (ids.length === 0) return { rows: [] };
+
+  // RBAC scope filter — same as aggregates().
+  const scopeClauses = [];
+  const scopeParams = [];
+  if (scope?.cities) {
+    const ci = scope.cities;
+    if (ci.mode === 'none') return { rows: [] };
+    if (ci.mode === 'allow' && ci.ids.length) {
+      scopeClauses.push(`EXISTS (
+        SELECT 1 FROM tbl_easyfixer e
+         WHERE e.efr_id = att.easyfixer_id
+           AND e.efr_cityId IN (${ci.ids.map(() => '?').join(',')})
+      )`);
+      scopeParams.push(...ci.ids);
+    }
+  }
+  const scopeWhere = scopeClauses.length ? ` AND ${scopeClauses.join(' AND ')}` : '';
+
+  const placeholders = ids.map(() => '?').join(',');
+
+  const [rows] = await pool.query(
+    `SELECT att.easyfixer_id     AS efr_id,
+            att.is_leave_marked  AS att_is_leave_marked,
+            att.morning_slot     AS att_morning_slot,
+            att.evening_slot     AS att_evening_slot,
+            att.created_on       AS att_created_on
+       FROM tbl_easyfixer_attendance att
+      WHERE att.easyfixer_id IN (${placeholders})
+        AND att.created_on >= CURDATE()
+        AND att.created_on <  CURDATE() + INTERVAL 1 DAY${scopeWhere}`,
+    [...ids, ...scopeParams],
+  );
+
+  return { rows };
+}
+
 module.exports = {
   list,
   getById,
@@ -230,5 +578,9 @@ module.exports = {
   update,
   setStatus,
   findActiveByMobile,
+  listTransactions,
+  listMappedClients,
+  aggregates,
+  attendance,
   MUTABLE_COLUMNS,
 };

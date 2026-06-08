@@ -191,6 +191,24 @@ async function users({ q, roleGroup, limit = 100, offset = 0, includeInactive = 
   return rows;
 }
 
+// ─── Zonal Managers (admin-scoped) ──────────────────────────────────
+/*
+ * Zonal Managers picker — drives the Manage Easyfixers "User Mapped To City"
+ * filter. A zonal manager is a tbl_user row that's referenced by at least
+ * one tbl_city.state_user (i.e. mapped as the zonal owner of some city).
+ * Active users only.
+ */
+async function zonalManagers() {
+  const [rows] = await pool.query(`
+    SELECT DISTINCT u.user_id, u.user_name
+      FROM tbl_user u
+      JOIN tbl_city c ON c.state_user = u.user_id
+     WHERE u.user_status = 1
+     ORDER BY u.user_name ASC
+  `);
+  return rows;
+}
+
 // ─── Roles (admin-scoped) ───────────────────────────────────────────
 /*
  * Picker projection for tbl_role. The Manage Users form needs this to fill
@@ -463,6 +481,7 @@ module.exports = {
   clients,
   clientServices,
   users,
+  zonalManagers,
   roles,
   menuActions,
   easyfixers,

@@ -91,6 +91,13 @@ router.get('/users',            role(['admin']), validate(usersQuery, 'query'), 
   try { modernOk(res, await lookup.users(req.query)); } catch (e) { next(e); }
 });
 
+// Zonal Managers picker — admin-only. Returns the distinct set of users
+// referenced as tbl_city.state_user (i.e. owners of at least one city).
+// Drives the Manage Easyfixers "User Mapped To City" filter.
+router.get('/zonal-managers',   role(['admin']),                                         async (_req, res, next) => {
+  try { modernOk(res, await lookup.zonalManagers()); } catch (e) { next(e); }
+});
+
 // Roles dropdown — admin-only. Used by the Manage Users form to fill the
 // "Role" picker, and by Manage Roles itself for the picker on related
 // screens. Optional `group` filter (admin|client|mobile|default) narrows

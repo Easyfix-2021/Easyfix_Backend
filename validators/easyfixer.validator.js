@@ -20,6 +20,21 @@ const listQuery = Joi.object({
   includeInactive: Joi.boolean().default(false),
   limit: Joi.number().integer().min(1).max(500).default(50),
   offset: Joi.number().integer().min(0).default(0),
+
+  // Manage Easyfixers (parity migration) — dedicated filter params.
+  // Additive to `q`; FE may send either/both.
+  easyfixerId:      Joi.number().integer().positive().optional(),
+  name:             Joi.string().min(1).max(100).optional(),
+  mobileNo:         Joi.string().min(1).max(20).optional(),
+  efAccount:        Joi.string().valid('under_master', 'master', 'individual').optional(),
+  stateId:          Joi.number().integer().positive().optional(),
+  serviceType:      Joi.string().min(1).max(100).optional(),
+  deepSkillId:      Joi.number().integer().positive().optional(),
+  activeFromDate:   Joi.date().iso().optional(),
+  activeToDate:     Joi.date().iso().optional(),
+  zonalManagerId:   Joi.number().integer().positive().optional(),
+  attendance:       Joi.string().valid('present', 'absent', 'on_leave', 'no_information').optional(),
+  deepSkillMapped:  Joi.string().valid('mapped', 'not_mapped').optional(),
 });
 
 const createBody = Joi.object({
@@ -90,4 +105,19 @@ const idParam = Joi.object({
   id: Joi.number().integer().positive().required(),
 });
 
-module.exports = { listQuery, createBody, updateBody, statusBody, idParam };
+// Shared pagination schema for sub-resource list endpoints
+// (/admin/easyfixers/:id/transactions, /:id/mapped-clients).
+const listSubresourceQuery = Joi.object({
+  limit: Joi.number().integer().min(1).max(500).default(50),
+  offset: Joi.number().integer().min(0).default(0),
+});
+
+// Body schema for the lazy-fill sub-resource endpoints:
+//   POST /admin/easyfixers/aggregates
+//   POST /admin/easyfixers/attendance
+// The 1000-id cap matches the slice() guard in the service layer.
+const efrIdsBody = Joi.object({
+  efrIds: Joi.array().items(Joi.number().integer().positive()).min(1).max(1000).required(),
+});
+
+module.exports = { listQuery, createBody, updateBody, statusBody, idParam, listSubresourceQuery, efrIdsBody };
