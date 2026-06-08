@@ -31,6 +31,61 @@ const LIST_COLUMNS = `
   e.efr_status, e.efr_service_category, e.efr_service_type,
   e.efr_profile_perc, e.is_technician_verified,
   e.final_submission, e.new_easy_fixer,
+  e.user_id,
+  /*
+   * Column-name mapping (2026-06-08). The legacy Java DAO reads
+   * personalDetailsFilled / isIdentityDetailsVerified -- names without
+   * the _by_crm suffix. The actual DB column names ARE suffixed
+   * (is_personal_details_verified_by_crm, is_identity_details_verified_by_crm).
+   * Legacy populated the un-suffixed field names via SELECT aliases.
+   * We mirror that here so the FE / Joi validators see the un-suffixed
+   * names while the SQL targets the real columns.
+   *
+   * Schema drift gate: an earlier version of this query targeted the
+   * un-suffixed names directly. That caused "Unknown column" 500s on
+   * deploys where only the _by_crm columns exist. If a future deploy
+   * has BOTH names, the alias still wins.
+   *
+   * NOTE: this comment is INSIDE the LIST_COLUMNS template literal --
+   * do not use backtick chars in this block or they will close the
+   * template literal early and crash the module load with a parser
+   * error pointing here.
+   */
+  /*
+   * Column-source mapping (2026-06-08 v2 — corrected after legacy audit).
+   *
+   * Two legacy fields are sourced from DIFFERENT tables than the
+   * earlier guess:
+   *   - personal_details_filled       lives on tbl_user, NOT tbl_easyfixer.
+   *                                   Legacy alias U.personal_details_filled.
+   *   - is_identity_details_verified  lives on tbl_easyfixer as the
+   *                                   _by_crm-suffixed column. Aliased
+   *                                   below so downstream code reads
+   *                                   the legacy name.
+   *
+   * Without sourcing personal_details_filled from tbl_user, the
+   * "Not Eligible" bucket reads 0 rows on QA (the tbl_easyfixer column
+   * I previously targeted has no value=2 data); the missing rows pile
+   * into "Registration In Progress" instead, breaking parity counts.
+   */
+  U.personal_details_filled               AS personal_details_filled,
+  e.is_identity_details_verified_by_crm   AS is_identity_details_verified,
+  /*
+   * Derived 6-status label. Highest-priority WHEN wins, matching
+   * "last setter wins" in legacy Java EasyfixerDaoImpl.java#475-505.
+   * Priority order top-to-bottom:
+   *   Inactive > Active > Not Suitable > Not Eligible >
+   *   Registration In Progress > Idle
+   */
+  CASE
+    WHEN e.is_technician_verified = 1 AND e.efr_status = 0                       THEN 'Inactive'
+    WHEN e.is_technician_verified = 1                                            THEN 'Active'
+    WHEN (e.is_technician_verified IS NULL OR e.is_technician_verified = 0)
+         AND e.is_identity_details_verified_by_crm = 2                           THEN 'Not Suitable'
+    WHEN U.personal_details_filled = 2                                           THEN 'Not Eligible'
+    WHEN e.user_id IS NOT NULL AND e.user_id > 0                                 THEN 'Registration In Progress'
+    ELSE 'Idle'
+  END AS efr_status_label,
   e.efr_manager_id, e.insert_date, e.update_date,
   c.state_id AS state_id,
   s.state_name AS state_name,
@@ -56,6 +111,15 @@ const LIST_JOINS = `
   LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId
   LEFT JOIN tbl_state s ON s.state_id = c.state_id
   LEFT JOIN tbl_user zm ON zm.user_id = c.state_user
+  /*
+   * tbl_user JOIN (2026-06-08) — needed because the legacy "Not Eligible"
+   * / "Not Suitable" / "Registration In Progress" status signals all read
+   * tbl_user.personal_details_filled (NOT a column on tbl_easyfixer).
+   * Legacy alias U; we use the same alias here so the WHERE clauses below
+   * read identically to legacy EasyfixerDaoImpl.java lines 212-218.
+   * LEFT JOIN because Idle rows have user_id NULL — must not be filtered out.
+   */
+  LEFT JOIN tbl_user U ON U.user_id = e.user_id
   LEFT JOIN (
     SELECT efr_manager_id, COUNT(*) AS team_count
       FROM tbl_easyfixer
@@ -97,11 +161,63 @@ async function list({
     }
   }
 
-  if (!includeInactive && status == null) clauses.push('e.efr_status = 1');
-  if (status === 0 || status === 1) {
-    clauses.push('e.efr_status = ?');
-    params.push(status);
+  /*
+   * Legacy-parity status filter (2026-06-08). The Manage Easyfixers
+   * "Status" dropdown has SIX values, not two. The displayed label is
+   * derived from 4 underlying columns per the priority order used by
+   * EasyfixerDaoImpl.java#475-505 (last setter wins in Java = highest-
+   * priority WHEN-clause wins in SQL CASE):
+   *
+   *   value=1  Active                  is_technician_verified=1 AND efr_status=1
+   *   value=2  Inactive                is_technician_verified=1 AND efr_status=0
+   *   value=3  Idle                    (user_id IS NULL OR user_id=0) AND no higher-priority match
+   *   value=4  Not Eligible            personal_details_filled=2 AND no higher-priority match
+   *   value=5  Not Suitable            (tech_verified!=1) AND is_identity_details_verified=2
+   *   value=6  Registration In Progress user_id>0 AND tech_verified!=1
+   *                                    AND personal_details_filled!=2
+   *                                    AND is_identity_details_verified!=2
+   *   value=0  All (no filter)
+   *
+   * The "no higher-priority match" suffix matters: a row that satisfies
+   * BOTH the Idle base (user_id=0) AND the Not Eligible condition
+   * (personal_details_filled=2) labels as Not Eligible (higher priority),
+   * not Idle. Each filter clause below encodes its own priority guard.
+   *
+   * Default (when no status supplied AND includeInactive falsy) stays
+   * status=1 Active — matches the screenshot's "Status: Active" default.
+   */
+  if (status == null && !includeInactive) {
+    // Default: status=1 Active
+    clauses.push('e.is_technician_verified = 1 AND e.efr_status = 1');
+  } else if (status === 1) {
+    clauses.push('e.is_technician_verified = 1 AND e.efr_status = 1');
+  } else if (status === 2) {
+    clauses.push('e.is_technician_verified = 1 AND e.efr_status = 0');
+  } else if (status === 3) {
+    // Idle — per legacy Java if(rslt.getUserId() == 0) at EasyfixerDaoImpl.java#484.
+    // The legacy SQL doesn't add a WHERE clause for Idle specifically; the
+    // user_id=0 check is intrinsic. Mirror that here.
+    clauses.push('(e.user_id IS NULL OR e.user_id = 0)');
+  } else if (status === 4) {
+    // Not Eligible — legacy EasyfixerDaoImpl.java#212 verbatim:
+    //   AND U.personal_details_filled = 2
+    clauses.push('U.personal_details_filled = 2');
+  } else if (status === 5) {
+    // Not Suitable — legacy EasyfixerDaoImpl.java#215 verbatim:
+    //   AND EF.is_identity_details_verified_by_crm = 2 AND U.personal_details_filled = 1
+    clauses.push('e.is_identity_details_verified_by_crm = 2 AND U.personal_details_filled = 1');
+  } else if (status === 6) {
+    // Registration In Progress ("Active Soon") — legacy EasyfixerDaoImpl.java#218 verbatim:
+    //   AND EF.user_id > 0 AND EF.is_technician_verified IS NULL
+    //   AND (EF.is_identity_details_verified_by_crm != 2 OR EF.is_identity_details_verified_by_crm IS NULL)
+    //   AND (U.personal_details_filled = 1 OR U.personal_details_filled IS NULL)
+    // NOTE legacy uses `is_technician_verified IS NULL` strictly (not = 0).
+    clauses.push(`e.user_id > 0
+                  AND e.is_technician_verified IS NULL
+                  AND (e.is_identity_details_verified_by_crm <> 2 OR e.is_identity_details_verified_by_crm IS NULL)
+                  AND (U.personal_details_filled = 1 OR U.personal_details_filled IS NULL)`);
   }
+  // status === 0 → All → no clause added (returns every row)
   if (q) {
     clauses.push('(e.efr_name LIKE ? OR e.efr_no LIKE ? OR e.efr_email LIKE ?)');
     params.push(`%${q}%`, `%${q}%`, `%${q}%`);
@@ -599,6 +715,85 @@ async function attendance(efrIds, { scope } = {}) {
   return { rows };
 }
 
+/*
+ * Status-counts strip (2026-06-08). Single-query rollup of how many
+ * easyfixers fall into each of the 6 status buckets, used by the page
+ * subtitle ("2,635 Active · 215 Inactive · 3,449 Idle · …").
+ *
+ * Each count uses the SAME WHERE clause as the corresponding dropdown
+ * filter value in `list()` so the strip number matches what the
+ * operator sees after clicking the filter. Conditional aggregation via
+ * `SUM(CASE WHEN ... THEN 1 ELSE 0 END)` gives all 6 counts + total in
+ * ONE query — six round-trips collapsed to one.
+ *
+ * Buckets CAN overlap (e.g. a row with personal_details_filled=2 AND
+ * is_technician_verified=1 counts under both Active AND Not Eligible)
+ * because the legacy SQL WHERE clauses don't priority-guard each other.
+ * That mirrors legacy behaviour — sum > total is expected — so the
+ * displayed strip totals agree with the dropdown-filtered list page.
+ *
+ * RBAC: applies scope.cities filter so a city-scoped operator sees
+ * counts within their allowed cities. Mirrors the same gating list()
+ * uses; out-of-scope rows contribute zero.
+ */
+async function statusCounts({ scope } = {}) {
+  const clauses = [];
+  const params = [];
+
+  // Inherit the same RBAC scope-narrowing list() applies first.
+  if (scope?.cities) {
+    const ci = scope.cities;
+    if (ci.mode === 'none') {
+      // No access — short-circuit to all-zero counts.
+      return {
+        active: 0, inactive: 0, idle: 0, not_eligible: 0,
+        not_suitable: 0, reg_in_progress: 0, total: 0,
+      };
+    }
+    if (ci.mode === 'allow' && ci.ids.length) {
+      clauses.push(`e.efr_cityId IN (${ci.ids.map(() => '?').join(',')})`);
+      params.push(...ci.ids);
+    }
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+
+  const [[row]] = await pool.query(`
+    SELECT
+      SUM(CASE WHEN e.is_technician_verified = 1 AND e.efr_status = 1
+               THEN 1 ELSE 0 END) AS active,
+      SUM(CASE WHEN e.is_technician_verified = 1 AND e.efr_status = 0
+               THEN 1 ELSE 0 END) AS inactive,
+      SUM(CASE WHEN (e.user_id IS NULL OR e.user_id = 0)
+               THEN 1 ELSE 0 END) AS idle,
+      SUM(CASE WHEN U.personal_details_filled = 2
+               THEN 1 ELSE 0 END) AS not_eligible,
+      SUM(CASE WHEN e.is_identity_details_verified_by_crm = 2
+                AND U.personal_details_filled = 1
+               THEN 1 ELSE 0 END) AS not_suitable,
+      SUM(CASE WHEN e.user_id > 0
+                AND e.is_technician_verified IS NULL
+                AND (e.is_identity_details_verified_by_crm <> 2
+                     OR e.is_identity_details_verified_by_crm IS NULL)
+                AND (U.personal_details_filled = 1
+                     OR U.personal_details_filled IS NULL)
+               THEN 1 ELSE 0 END) AS reg_in_progress,
+      COUNT(*) AS total
+      FROM tbl_easyfixer e
+      LEFT JOIN tbl_user U ON U.user_id = e.user_id
+      ${where}
+  `, params);
+
+  return {
+    active:          Number(row.active)          || 0,
+    inactive:        Number(row.inactive)        || 0,
+    idle:            Number(row.idle)            || 0,
+    not_eligible:    Number(row.not_eligible)    || 0,
+    not_suitable:    Number(row.not_suitable)    || 0,
+    reg_in_progress: Number(row.reg_in_progress) || 0,
+    total:           Number(row.total)           || 0,
+  };
+}
+
 module.exports = {
   list,
   getById,
@@ -610,5 +805,6 @@ module.exports = {
   listMappedClients,
   aggregates,
   attendance,
+  statusCounts,
   MUTABLE_COLUMNS,
 };

@@ -16,7 +16,15 @@ const listQuery = Joi.object({
   cityId: Joi.number().integer().positive().optional(),
   serviceCategory: Joi.string().min(1).max(100).optional(),
   isVerified: Joi.boolean().optional(),
-  status: Joi.number().integer().valid(0, 1).optional(),
+  /*
+   * 6-status enum (2026-06-08) — matches legacy CRM dropdown:
+   *   0 All · 1 Active · 2 Inactive · 3 Idle · 4 Not Eligible
+   *   5 Not Suitable · 6 Registration In Progress
+   * See services/easyfixer.service.js list() for the per-status
+   * priority-aware WHERE clauses (the displayed label is derived from
+   * 4 underlying columns per EasyfixerDaoImpl.java#475-505).
+   */
+  status: Joi.number().integer().valid(0, 1, 2, 3, 4, 5, 6).optional(),
   includeInactive: Joi.boolean().default(false),
   limit: Joi.number().integer().min(1).max(500).default(50),
   offset: Joi.number().integer().min(0).default(0),
@@ -120,4 +128,82 @@ const efrIdsBody = Joi.object({
   efrIds: Joi.array().items(Joi.number().integer().positive()).min(1).max(1000).required(),
 });
 
-module.exports = { listQuery, createBody, updateBody, statusBody, idParam, listSubresourceQuery, efrIdsBody };
+// ─── Verification page schemas ─────────────────────────────────────
+// Section names mirror the legacy `comment_in_section` strings exactly
+// so the comments thread is interoperable with the legacy CRM during
+// the cutover window. Keep these in sync with SECTION in
+// services/easyfixer-verification.service.js.
+const VERIFICATION_SECTIONS = [
+  'Registration Details Section',
+  'Professional Details Section',
+  'Personal Details Section',
+  'Banking Details Section',
+  'Identity Details Section',
+  'Technician Activation Section',
+];
+
+const commentBody = Joi.object({
+  text:    Joi.string().min(1).max(2000).required(),
+  section: Joi.string().valid(...VERIFICATION_SECTIONS).required(),
+});
+
+const leadVerificationBody = Joi.object({
+  // 0 = Not Eligible / New Lead, 1 = Accepted, 2 = Denied (mirrors legacy)
+  personal_details_filled: Joi.number().integer().valid(0, 1, 2).required(),
+  reason:     Joi.string().max(1000).allow('', null).optional(),
+  efr_cityId: Joi.number().integer().positive().optional(),
+});
+
+const professionalBody = Joi.object({
+  skill_rating:         Joi.number().integer().min(0).max(10).optional(),
+  tool_rating:          Joi.number().integer().min(0).max(10).optional(),
+  skill_rating_comment: Joi.string().max(2000).allow('', null).optional(),
+  tool_rating_comment:  Joi.string().max(2000).allow('', null).optional(),
+  experience_id:        Joi.number().integer().valid(1, 2, 3, 4).optional(),
+  progress:             Joi.number().integer().min(0).max(100).optional(),
+}).min(1);
+
+const personalFamilyBody = Joi.object({
+  is_verified:          Joi.boolean().required(),
+  verification_comment: Joi.string().max(2000).allow('', null).optional(),
+});
+
+const bankingVerificationBody = Joi.object({
+  verification_status:  Joi.number().integer().valid(1, 2).required(), // 1=valid, 2=invalid
+  verification_comment: Joi.string().max(2000).allow('', null).when('verification_status', {
+    is: 2, then: Joi.string().min(1).max(2000).required(),
+  }),
+});
+
+const identityVerificationBody = Joi.object({
+  verification_status:  Joi.number().integer().valid(1, 2).optional(),
+  rejected_reason:      Joi.string().max(2000).allow('', null).optional(),
+  adhaar_card_number:   Joi.string().pattern(/^[0-9]{12}$/).optional(),
+  pan_card_number:      Joi.string().pattern(/^[A-Z]{5}[0-9]{4}[A-Z]$/i).optional(),
+  progress:             Joi.number().integer().min(0).max(100).optional(),
+}).min(1);
+
+const activationBody = Joi.object({
+  activate:                  Joi.boolean().optional(),
+  grade:                     Joi.string().valid('Silver', 'Gold', 'Diamond').optional(),
+  final_accept_comment:      Joi.string().max(2000).optional(),
+  is_eligible_for_offline_orders: Joi.number().integer().valid(0, 1).optional(),
+  // Banking sub-fields (Edit Finance Details)
+  easyfix_bank_name_id:      Joi.number().integer().min(0).optional(),
+  beneficiary_id:            Joi.string().max(100).allow('', null).optional(),
+}).min(1);
+
+const mapClientsBody = Joi.object({
+  client_ids: Joi.array().items(Joi.number().integer().positive()).max(500).required(),
+});
+
+const bgvReportBody = Joi.object({
+  bgv_report_img_name: Joi.string().max(500).required(),
+});
+
+module.exports = {
+  listQuery, createBody, updateBody, statusBody, idParam, listSubresourceQuery, efrIdsBody,
+  commentBody, leadVerificationBody, professionalBody, personalFamilyBody,
+  bankingVerificationBody, identityVerificationBody, activationBody,
+  mapClientsBody, bgvReportBody,
+};

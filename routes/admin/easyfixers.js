@@ -3,9 +3,13 @@ const ExcelJS = require('exceljs');
 
 const validate = require('../../middleware/validate');
 const easyfixer = require('../../services/easyfixer.service');
+const verification = require('../../services/easyfixer-verification.service');
 const { modernOk, modernError } = require('../../utils/response');
-const { listQuery, createBody, updateBody, statusBody, idParam, listSubresourceQuery, efrIdsBody } =
-  require('../../validators/easyfixer.validator');
+const {
+  listQuery, createBody, updateBody, statusBody, idParam, listSubresourceQuery, efrIdsBody,
+  commentBody, leadVerificationBody, professionalBody, personalFamilyBody,
+  bankingVerificationBody, identityVerificationBody, activationBody, mapClientsBody, bgvReportBody,
+} = require('../../validators/easyfixer.validator');
 const { buildRequestScope, assertEntityInScope } = require('../../lib/scope');
 
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
@@ -36,6 +40,26 @@ router.post('/attendance', validate(efrIdsBody, 'body'), async (req, res, next) 
     const scope = buildRequestScope(req);
     const { rows } = await easyfixer.attendance(req.body.efrIds, { scope });
     modernOk(res, { items: rows });
+  } catch (e) { next(e); }
+});
+
+/*
+ * Status counts strip (2026-06-08). Powers the page subtitle's
+ * "X Active · Y Inactive · Z Idle · …" line. One round-trip returning
+ * counts for all 6 status buckets + total. Each count matches what the
+ * operator sees after clicking the corresponding dropdown filter (buckets
+ * overlap, sum > total — mirrors legacy CRM behaviour). RBAC scope is
+ * applied per `list()`'s convention so city-scoped users see only their
+ * allowed cities.
+ *
+ * Registered BEFORE /:id so the literal `/status-counts` path wins
+ * routing — `/:id` is a catch-all that would otherwise capture this.
+ */
+router.get('/status-counts', async (req, res, next) => {
+  try {
+    const scope = buildRequestScope(req);
+    const counts = await easyfixer.statusCounts({ scope });
+    modernOk(res, counts);
   } catch (e) { next(e); }
 });
 
@@ -197,5 +221,130 @@ router.patch('/:id/status', validate(idParam, 'params'), validate(statusBody), a
     modernOk(res, updated, `easyfixer ${req.body.active ? 'activated' : 'deactivated'}`);
   } catch (e) { next(e); }
 });
+
+// ─── Verification page (eferVerification.vm parity) ─────────────────
+// All routes below scope-check on the easyfixer row's city. Returns 404
+// (not 403) on miss to avoid leaking existence of out-of-scope rows.
+async function loadAndAuthorize(req, res) {
+  const row = await easyfixer.getById(req.params.id);
+  if (!row) { modernError(res, 404, 'easyfixer not found'); return null; }
+  const guard = assertEntityInScope(req, { city_id: row.efr_cityId });
+  if (!guard.ok) { modernError(res, 404, 'easyfixer not found'); return null; }
+  return row;
+}
+
+router.get('/:id/verification',
+  validate(idParam, 'params'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndAuthorize(req, res))) return;
+      const payload = await verification.getVerificationPage(req.params.id);
+      if (!payload) return modernError(res, 404, 'easyfixer not found');
+      modernOk(res, payload);
+    } catch (e) { next(e); }
+  });
+
+router.post('/:id/verification/comments',
+  validate(idParam, 'params'), validate(commentBody, 'body'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndAuthorize(req, res))) return;
+      const comments = await verification.addComment(req.params.id, req.body, req.user);
+      modernOk(res, { section: req.body.section, comments }, 'comment added');
+    } catch (e) { next(e); }
+  });
+
+router.put('/:id/verification/lead',
+  validate(idParam, 'params'), validate(leadVerificationBody, 'body'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndAuthorize(req, res))) return;
+      const data = await verification.setLeadVerification(req.params.id, req.body, req.user);
+      modernOk(res, data, 'lead status updated');
+    } catch (e) { next(e); }
+  });
+
+router.put('/:id/verification/professional',
+  validate(idParam, 'params'), validate(professionalBody, 'body'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndAuthorize(req, res))) return;
+      const data = await verification.saveProfessional(req.params.id, req.body, req.user);
+      modernOk(res, data, 'professional details saved');
+    } catch (e) { next(e); }
+  });
+
+router.put('/:id/verification/personal-family',
+  validate(idParam, 'params'), validate(personalFamilyBody, 'body'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndAuthorize(req, res))) return;
+      const data = await verification.savePersonalFamily(req.params.id, req.body, req.user);
+      modernOk(res, data, 'personal & family details saved');
+    } catch (e) { next(e); }
+  });
+
+router.put('/:id/verification/banking',
+  validate(idParam, 'params'), validate(bankingVerificationBody, 'body'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndAuthorize(req, res))) return;
+      const data = await verification.saveBanking(req.params.id, req.body, req.user);
+      modernOk(res, data, 'banking details saved');
+    } catch (e) { next(e); }
+  });
+
+router.put('/:id/verification/identity',
+  validate(idParam, 'params'), validate(identityVerificationBody, 'body'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndAuthorize(req, res))) return;
+      const data = await verification.saveIdentity(req.params.id, req.body, req.user);
+      modernOk(res, data, 'identity details saved');
+    } catch (e) { next(e); }
+  });
+
+router.post('/:id/verification/proceed-to-activation',
+  validate(idParam, 'params'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndAuthorize(req, res))) return;
+      const data = await verification.proceedToActivation(req.params.id);
+      modernOk(res, data, 'proceed allowed');
+    } catch (e) {
+      if (e.status === 409) return modernError(res, 409, e.message, e.details);
+      next(e);
+    }
+  });
+
+router.put('/:id/verification/activation',
+  validate(idParam, 'params'), validate(activationBody, 'body'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndAuthorize(req, res))) return;
+      const data = await verification.saveActivation(req.params.id, req.body, req.user);
+      modernOk(res, data, 'activation saved');
+    } catch (e) { next(e); }
+  });
+
+router.put('/:id/verification/map-clients',
+  validate(idParam, 'params'), validate(mapClientsBody, 'body'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndAuthorize(req, res))) return;
+      const data = await verification.mapClients(req.params.id, req.body.client_ids, req.user);
+      modernOk(res, data, 'clients mapped');
+    } catch (e) { next(e); }
+  });
+
+router.post('/:id/verification/bgv-report',
+  validate(idParam, 'params'), validate(bgvReportBody, 'body'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndAuthorize(req, res))) return;
+      const data = await verification.saveBgvReport(req.params.id, req.body, req.user);
+      modernOk(res, data, 'BGV report saved');
+    } catch (e) { next(e); }
+  });
 
 module.exports = router;

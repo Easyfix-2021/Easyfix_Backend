@@ -1,0 +1,598 @@
+const { pool } = require('../db');
+
+/*
+ * Easyfixer Verification — service backing the "Self-Registration
+ * verification and profile activation" page (rebuild of legacy
+ * EasyFix_CRM/pages/easyfixers/eferVerification.vm).
+ *
+ * Source of truth for column names + flows:
+ *   - Legacy VM: EasyFix_CRM/src/main/webapp/pages/easyfixers/eferVerification.vm
+ *   - Legacy DAO: EasyFix_CRM/.../dao/EasyfixerDaoImpl.java
+ *
+ * Tables touched (all already exist on tbl_easyfixer / easyfixer_comments
+ * / tbl_easyfixer_bank_details / tbl_user). No schema migration required —
+ * the legacy schema is authoritative and the existing /admin/easyfixers/:id
+ * endpoint already projects e.* so every column below is reachable.
+ *
+ * Section-name constants match the legacy `comment_in_section` strings
+ * exactly so the comments thread is interoperable with the legacy CRM
+ * during the cutover window.
+ */
+
+const SECTION = {
+  LEAD:         'Registration Details Section',
+  PROFESSIONAL: 'Professional Details Section',
+  PERSONAL:     'Personal Details Section',
+  BANKING:      'Banking Details Section',
+  IDENTITY:     'Identity Details Section',
+  ACTIVATION:   'Technician Activation Section',
+};
+
+// ─── Helpers ────────────────────────────────────────────────────────
+function pct(v) {
+  const n = Number(v || 0);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(100, Math.round(n)));
+}
+
+function bool(v) {
+  if (v === null || v === undefined) return false;
+  if (typeof v === 'boolean') return v;
+  if (Buffer.isBuffer(v)) return v[0] === 1;
+  return Number(v) === 1;
+}
+
+// Fetch easyfixer + user/city/state/experience joins required by the
+// verification page. Mirrors the legacy getEasyfixerDetailsById query
+// shape, projected through the existing tbl_easyfixer + side tables.
+async function getEasyfixerForVerification(efrId) {
+  const [[row]] = await pool.query(
+    `SELECT
+        E.*,
+        C.city_name                     AS city_name,
+        S.state_name                    AS state_name,
+        U.user_name                     AS tx_full_name,
+        U.city                          AS app_city_name,
+        U.state                         AS app_state_name,
+        U.pin_code                      AS app_pincode,
+        U.district                      AS user_district,
+        U.personal_details_filled       AS personal_details_filled,
+        U.is_personal_detail_filled     AS is_personal_detail_filled,
+        U.update_date                   AS user_update_date,
+        UB.user_name                    AS approved_by_user,
+        UU.user_name                    AS update_details_by_user,
+        ZM.user_name                    AS state_user,
+        EX.name                         AS experience_name
+       FROM tbl_easyfixer E
+       LEFT JOIN tbl_city  C  ON C.city_id  = E.efr_cityId
+       LEFT JOIN tbl_state S  ON S.state_id = C.state_id
+       LEFT JOIN tbl_user  ZM ON ZM.user_id = C.state_user
+       LEFT JOIN tbl_user  U  ON U.user_id  = E.user_id
+       LEFT JOIN tbl_user  UB ON UB.user_id = U.updated_by
+       LEFT JOIN tbl_user  UU ON UU.user_id = E.updated_by
+       LEFT JOIN experience EX ON EX.id     = E.experience_id
+      WHERE E.efr_id = ?
+      LIMIT 1`,
+    [efrId]
+  );
+  return row || null;
+}
+
+async function getBanking(efrId) {
+  const [[row]] = await pool.query(
+    `SELECT tb.*, eb.bank_name AS easyfix_bank_name, U.user_name AS updated_by_name
+       FROM tbl_easyfixer_bank_details tb
+       LEFT JOIN tbl_easyfix_bank eb ON eb.id = tb.easyfix_bank_name_id
+       LEFT JOIN tbl_user U          ON U.user_id = tb.updated_by
+      WHERE tb.efr_id = ? LIMIT 1`,
+    [efrId]
+  ).catch(() => [[null]]);
+  return row || null;
+}
+
+async function getCommentsBySection(efrId, section) {
+  const [rows] = await pool.query(
+    `SELECT id, comment, commented_by, comment_in_section,
+            commented_on, commented_by_id
+       FROM easyfixer_comments
+      WHERE easyfixer_id = ? AND comment_in_section = ?
+      ORDER BY id DESC`,
+    [efrId, section]
+  ).catch(() => [[]]);
+  return rows.map((r) => ({
+    id: r.id,
+    text: r.comment,
+    author: r.commented_by,
+    authorId: r.commented_by_id,
+    section: r.comment_in_section,
+    createdAt: r.commented_on,
+  }));
+}
+
+async function listEasyfixBanks() {
+  const [rows] = await pool.query(
+    `SELECT id, bank_name FROM tbl_easyfix_bank WHERE bank_status = 1 ORDER BY bank_name`
+  ).catch(() => [[]]);
+  return rows;
+}
+
+async function listCitiesForLookup() {
+  const [rows] = await pool.query(
+    `SELECT city_id, city_name FROM tbl_city WHERE city_status = 1 ORDER BY city_name`
+  );
+  return rows;
+}
+
+// Legacy progress-bar calculations live on tbl_easyfixer as
+// efr_professional_details_perc / efr_personal_details_perc /
+// efr_bank_details_perc / efr_identity_details_perc — populated by the
+// technician mobile app + legacy CRM writes. We surface them verbatim.
+// efr_profile_perc is the overall registration-verification roll-up.
+
+// ─── Public: full page payload ──────────────────────────────────────
+async function getVerificationPage(efrId) {
+  const e = await getEasyfixerForVerification(efrId);
+  if (!e) return null;
+
+  const [banking, banks, cities,
+    leadComments, profComments, persComments,
+    bankComments, idComments, actComments] = await Promise.all([
+    getBanking(efrId),
+    listEasyfixBanks(),
+    listCitiesForLookup(),
+    getCommentsBySection(efrId, SECTION.LEAD),
+    getCommentsBySection(efrId, SECTION.PROFESSIONAL),
+    getCommentsBySection(efrId, SECTION.PERSONAL),
+    getCommentsBySection(efrId, SECTION.BANKING),
+    getCommentsBySection(efrId, SECTION.IDENTITY),
+    getCommentsBySection(efrId, SECTION.ACTIVATION),
+  ]);
+
+  const fullName = e.tx_full_name || e.efr_name || '';
+  const personalDetailsFilled = e.personal_details_filled; // 0 | 1 | 2
+
+  // Verification gate (mirrors legacy isIdentityDetailsVerified == 1).
+  const proceedAllowed = Number(e.is_identity_details_verified_by_crm) === 1;
+
+  // Registration age (days since app login_date / insert_date on tbl_user).
+  let registrationAgeDays = null;
+  if (e.user_update_date || e.insert_date) {
+    const start = new Date(e.user_update_date || e.insert_date).getTime();
+    if (!Number.isNaN(start)) {
+      registrationAgeDays = Math.floor((Date.now() - start) / 86400000);
+    }
+  }
+
+  return {
+    // Header
+    header: {
+      efr_id: e.efr_id,
+      first_name: e.efr_first_name,
+      last_name:  e.efr_last_name,
+      full_name:  fullName,
+      city_name:  e.city_name,
+      is_active:  Number(e.efr_status) === 1,
+      is_technician_verified: bool(e.is_technician_verified),
+      is_existing_easyfixer:  bool(e.is_existing_easyfixer),
+      mobile: e.efr_no,
+    },
+
+    // ─ Section 1: New Technician Lead ─
+    lead: {
+      eligibility: {
+        primary_mobile:  e.efr_no,
+        first_name:      e.efr_first_name,
+        last_name:       e.efr_last_name,
+        pincode:         e.app_pincode || e.efr_pin_no,
+        state_name:      e.app_state_name || e.state_name,
+        district:        e.user_district,
+        city_name:       e.app_city_name || e.city_name,
+        efr_cityId:      e.efr_cityId,
+      },
+      gps_location:     e.efr_base_gps,
+      registration: {
+        tx_id:           e.efr_id,
+        tx_applied_on:   e.insert_date,
+        state_user:      e.state_user,
+        approved_by:     e.approved_by_user,
+        approved_on:     e.user_update_date,
+      },
+      status: {
+        personal_details_filled: personalDetailsFilled, // 0=new, 1=accepted, 2=denied
+        progress: pct(personalDetailsFilled === 1 ? 100 : 0),
+      },
+      comments: leadComments,
+    },
+
+    // ─ Section 2: Registration Verification (4 sub-sections) ─
+    registrationVerification: {
+      overall_progress: pct(e.efr_profile_perc),
+      is_verified: Number(e.is_identity_details_verified_by_crm) === 1,
+      proceed_allowed: proceedAllowed,
+
+      professional: {
+        progress:               pct(e.efr_professional_details_perc),
+        is_verified:            Number(e.efr_professional_details_perc) === 100 && Number(e.tool_rating || 0) > 0,
+        // Editable
+        experience_id:          e.experience_id,
+        experience_name:        e.experience_name,
+        skill_rating:           e.skill_rating,
+        tool_rating:            e.tool_rating,
+        skill_rating_comment:   e.skill_rating_comment_from_crm,
+        tool_rating_comment:    e.tool_rating_comment_from_crm,
+        // Readonly badges
+        service_category:       e.efr_service_category,
+        service_type:           e.efr_service_type,
+        have_bike:              bool(e.have_bike),
+        use_whatsapp:           bool(e.use_whatsapp),
+        // Readonly audit
+        updated_by_name:        e.update_details_by_user,
+        update_date:            e.update_date,
+        comments: profComments,
+      },
+
+      personal: {
+        progress:               pct(e.efr_personal_details_perc),
+        is_verified:            Number(e.is_personal_details_verified_by_crm) === 1,
+        // Readonly
+        date_of_birth:          e.date_of_birth,
+        marital_status:         e.efr_marital_status,
+        children_count:         e.efr_children,
+        emergency_mobile:       e.efr_alt_no,
+        // Insurance flags (readonly + lightbox of attached photos — TODO photos)
+        health_insurance:       bool(e.health_insurance),
+        accidental_insurance:   bool(e.accidental_insurance),
+        hobbies:                e.about_yourself2 || e.about_yourself,
+        email:                  e.efr_email,
+        is_email_verified:      bool(e.is_email_verified),
+        verification_comment:   e.personal_details_verification_comment_crm,
+        updated_by_name:        e.update_details_by_user,
+        update_date:            e.update_date,
+        comments: persComments,
+      },
+
+      banking: {
+        progress:               pct(e.efr_bank_details_perc),
+        is_verified:            Number(e.is_bank_details_verified_by_crm) === 1,
+        verification_status:    e.is_bank_details_verified_by_crm, // 0/1/2
+        bank_name:              banking?.bank_name,
+        account_number:         banking?.efr_bank_acc_num,
+        account_holder_name:    banking?.efr_bank_acc_name,
+        ifsc_code:              banking?.efr_bank_ifsc,
+        mode_of_payment:        banking?.mode_of_payment,
+        is_verified_by_app:     bool(banking?.is_verified_by_app),
+        cancelled_cheque_img:   e.cancelled_chq_img_name,
+        verification_comment:   e.bank_details_verification_comment,
+        updated_by_name:        e.update_details_by_user,
+        update_date:            e.update_date,
+        comments: bankComments,
+      },
+
+      identity: {
+        progress:               pct(e.efr_identity_details_perc),
+        is_verified:            Number(e.is_identity_details_verified_by_crm) === 1,
+        verification_status:    e.is_identity_details_verified_by_crm, // 0/1/2
+        adhaar_card_number:     e.adhaar_card_number,
+        pan_card_number:        e.pan_card_number,
+        // TODO: aadhaar front/back/pancard photo URLs come from
+        // tbl_easyfixer_documents — wire once a document-listing endpoint
+        // lands. Frontend currently shows the numbers + "not uploaded" hints.
+        driving_lisence_img:    e.driving_lisence_img_name,
+        rejected_reason:        e.send_back_to_tx_reason_crm,
+        updated_by_name:        e.update_details_by_user,
+        update_date:            e.update_date,
+        comments: idComments,
+      },
+    },
+
+    // ─ Section 3: Technician Activation ─
+    activation: {
+      progress: pct(
+        bool(e.is_technician_verified) ? 100 :
+        (proceedAllowed ? 50 : 0)
+      ),
+      is_activated:           bool(e.is_technician_verified),
+      payment: {
+        easyfix_bank_name_id: banking?.easyfix_bank_name_id || 0,
+        easyfix_bank_name:    banking?.easyfix_bank_name,
+        beneficiary_id:       banking?.beneficiary_id,
+        // Disabled when already populated (matches legacy condition)
+        is_locked:            Boolean(banking?.beneficiary_id && banking?.easyfix_bank_name_id && bool(e.is_technician_verified)),
+      },
+      bgv: {
+        is_done:              !!e.bgv_report_img_name,   // proxy until tbl_easyfixer_documents tie-in
+        // TODO: file picker upload — wire to S3 once decision is made on
+        // bucket key (see project_easyfix_job_image_uploads convention; BGV
+        // is technician-scoped, not job-scoped).
+      },
+      sidebar: {
+        profile_img:          e.efr_profile_img,
+        registration_age_days: registrationAgeDays,
+        ec_date:              e.user_update_date,
+        bgv_report_done:      !!e.bgv_report_img_name,
+        finance_updated_by:   banking?.updated_by_name,
+        finance_updated_on:   banking?.update_date,
+      },
+      comments: actComments,
+    },
+
+    // Lookup data the page needs inline (cheap):
+    lookups: {
+      cities,
+      easyfix_banks: banks,
+    },
+  };
+}
+
+// ─── Comments ───────────────────────────────────────────────────────
+async function addComment(efrId, { text, section }, actor) {
+  if (!Object.values(SECTION).includes(section)) {
+    const err = new Error('invalid section');
+    err.status = 400;
+    throw err;
+  }
+  const author = actor?.user_name || actor?.name || 'system';
+  const authorId = actor?.user_id || null;
+  await pool.query(
+    `INSERT INTO easyfixer_comments
+       (comment, commented_by, comment_in_section, commented_on, commented_by_id, easyfixer_id)
+     VALUES (?, ?, ?, NOW(), ?, ?)`,
+    [text, author, section, authorId, efrId]
+  );
+  return getCommentsBySection(efrId, section);
+}
+
+// ─── Section savers (Section 2 sub-sections) ────────────────────────
+async function saveProfessional(efrId, body, actor) {
+  const fields = [];
+  const params = [];
+  for (const [col, val] of [
+    ['skill_rating',                  body.skill_rating],
+    ['tool_rating',                   body.tool_rating],
+    ['skill_rating_comment_from_crm', body.skill_rating_comment],
+    ['tool_rating_comment_from_crm',  body.tool_rating_comment],
+    ['experience_id',                 body.experience_id],
+    ['efr_professional_details_perc', body.progress],
+  ]) {
+    if (val !== undefined) { fields.push(`${col} = ?`); params.push(val); }
+  }
+  if (!fields.length) return getVerificationPage(efrId);
+  fields.push('updated_by = ?', 'update_date = NOW()');
+  params.push(actor?.user_id || null, efrId);
+  await pool.query(`UPDATE tbl_easyfixer SET ${fields.join(', ')} WHERE efr_id = ?`, params);
+  return getVerificationPage(efrId);
+}
+
+// Personal details verification (matches updatepersonalDetailsVerificationById).
+async function savePersonalFamily(efrId, body, actor) {
+  await pool.query(
+    `UPDATE tbl_easyfixer
+        SET is_personal_details_verified_by_crm = ?,
+            personal_details_verification_comment_crm = ?,
+            updated_by = ?,
+            update_date = NOW()
+      WHERE efr_id = ?`,
+    [
+      body.is_verified ? 1 : 0,
+      body.verification_comment || null,
+      actor?.user_id || null,
+      efrId,
+    ]
+  );
+  return getVerificationPage(efrId);
+}
+
+// Banking details verification (matches updateBankDetailsVerificationStatusById).
+async function saveBanking(efrId, body, actor) {
+  if (Number(body.verification_status) === 1) {
+    await pool.query(
+      `UPDATE tbl_easyfixer
+          SET is_bank_details_verified_by_crm = 1,
+              updated_by = ?, update_date = NOW()
+        WHERE efr_id = ?`,
+      [actor?.user_id || null, efrId]
+    );
+  } else if (Number(body.verification_status) === 2) {
+    await pool.query(
+      `UPDATE tbl_easyfixer
+          SET is_bank_details_verified_by_crm = 2,
+              bank_details_verification_comment = ?,
+              updated_by = ?, update_date = NOW()
+        WHERE efr_id = ?`,
+      [body.verification_comment || null, actor?.user_id || null, efrId]
+    );
+  }
+  return getVerificationPage(efrId);
+}
+
+// Identity verification (matches updateIdentityDetailsVerificationStatusById).
+async function saveIdentity(efrId, body, actor) {
+  // Allow updating Aadhaar/Pan numbers inline.
+  if (body.adhaar_card_number !== undefined || body.pan_card_number !== undefined) {
+    const sets = [];
+    const params = [];
+    if (body.adhaar_card_number !== undefined) { sets.push('adhaar_card_number = ?'); params.push(body.adhaar_card_number); }
+    if (body.pan_card_number    !== undefined) { sets.push('pan_card_number = ?');    params.push(body.pan_card_number); }
+    sets.push('updated_by = ?', 'update_date = NOW()');
+    params.push(actor?.user_id || null, efrId);
+    await pool.query(`UPDATE tbl_easyfixer SET ${sets.join(', ')} WHERE efr_id = ?`, params);
+  }
+
+  const status = Number(body.verification_status);
+  if (status === 1) {
+    await pool.query(
+      `UPDATE tbl_easyfixer
+          SET is_identity_details_verified_by_crm = 1,
+              send_back_to_tx_reason_crm = NULL,
+              efr_identity_details_perc = COALESCE(?, efr_identity_details_perc),
+              updated_by = ?, update_date = NOW(),
+              send_to_finance_date_time = NOW()
+        WHERE efr_id = ?`,
+      [body.progress ?? null, actor?.user_id || null, efrId]
+    );
+  } else if (status === 2 && body.rejected_reason) {
+    await pool.query(
+      `UPDATE tbl_easyfixer
+          SET is_identity_details_verified_by_crm = 2,
+              send_back_to_tx_reason_crm = ?,
+              updated_by = ?, update_date = NOW()
+        WHERE efr_id = ?`,
+      [body.rejected_reason, actor?.user_id || null, efrId]
+    );
+  }
+  return getVerificationPage(efrId);
+}
+
+// ─── Lead step: Accept / Deny / Send back ───────────────────────────
+// Mirrors legacy technicianVerification(id, personalDetailsfilled).
+//   personalDetailsFilled = 0 → not eligible (new lead)
+//                          1 → accepted
+//                          2 → denied
+async function setLeadVerification(efrId, body, actor) {
+  const v = Number(body.personal_details_filled);
+  if (![0, 1, 2].includes(v)) { const e = new Error('invalid personal_details_filled'); e.status = 400; throw e; }
+
+  // Resolve user_id via tbl_easyfixer.user_id (needed to update tbl_user row).
+  const [[row]] = await pool.query(`SELECT user_id FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1`, [efrId]);
+  if (!row) { const e = new Error('easyfixer not found'); e.status = 404; throw e; }
+
+  if (v === 1 && body.efr_cityId) {
+    await pool.query(`UPDATE tbl_easyfixer SET efr_cityId = ?, updated_by = ?, update_date = NOW() WHERE efr_id = ?`,
+      [body.efr_cityId, actor?.user_id || null, efrId]);
+  }
+  await pool.query(
+    `UPDATE tbl_user
+        SET personal_details_filled = ?, updated_by = ?, user_status = 1,
+            released_on_date_time = NOW(), update_date = NOW()
+      WHERE user_id = ?`,
+    [v, actor?.user_id || null, row.user_id]
+  );
+
+  // Auto-append the comment line that mirrors legacy "Accepted / Denied / ..."
+  const statusText = v === 1 ? 'Accepted' : v === 2 ? 'Denied' : 'Not Eligible To New Lead';
+  const comment = `${statusText}${body.reason ? ' <br> ' + body.reason : ''}`;
+  await addComment(efrId, { text: comment, section: SECTION.LEAD }, actor);
+
+  return getVerificationPage(efrId);
+}
+
+// ─── Proceed to Tx Activation gate ──────────────────────────────────
+// Replicates legacy condition: identity verified == 1.
+async function proceedToActivation(efrId) {
+  const e = await getEasyfixerForVerification(efrId);
+  if (!e) { const err = new Error('easyfixer not found'); err.status = 404; throw err; }
+
+  // Gate checks — all 4 sub-sections plus identity verified flag.
+  const ok =
+    Number(e.is_identity_details_verified_by_crm) === 1 &&
+    Number(e.efr_profile_perc || 0) >= 100;
+
+  if (!ok) {
+    const err = new Error('cannot proceed: identity not verified or profile incomplete');
+    err.status = 409;
+    err.details = {
+      efr_profile_perc: Number(e.efr_profile_perc || 0),
+      is_identity_verified: Number(e.is_identity_details_verified_by_crm) === 1,
+    };
+    throw err;
+  }
+  // Idempotent — the next step (activate) is where state actually changes.
+  return { proceed: true };
+}
+
+// ─── Activation save (Section 3) ────────────────────────────────────
+async function saveActivation(efrId, body, actor) {
+  // Banking: easyfix_bank_name_id + beneficiary_id (Edit Finance Details).
+  if (body.easyfix_bank_name_id !== undefined || body.beneficiary_id !== undefined) {
+    const [[existing]] = await pool.query(
+      `SELECT id FROM tbl_easyfixer_bank_details WHERE efr_id = ? LIMIT 1`,
+      [efrId]
+    ).catch(() => [[null]]);
+    if (existing) {
+      const sets = [];
+      const params = [];
+      if (body.easyfix_bank_name_id !== undefined) { sets.push('easyfix_bank_name_id = ?'); params.push(body.easyfix_bank_name_id || null); }
+      if (body.beneficiary_id        !== undefined) { sets.push('beneficiary_id = ?');        params.push(body.beneficiary_id || null); }
+      sets.push('updated_by = ?', 'update_date = NOW()');
+      params.push(actor?.user_id || null, efrId);
+      await pool.query(`UPDATE tbl_easyfixer_bank_details SET ${sets.join(', ')} WHERE efr_id = ?`, params);
+    }
+  }
+
+  // Final activation toggle — replicates updateEasyfixerFinalAcceptComment.
+  if (body.activate === true) {
+    await pool.query(
+      `UPDATE tbl_easyfixer
+          SET final_accept_comment = ?,
+              efr_type = COALESCE(?, efr_type),
+              is_technician_verified = 1,
+              profile_crm_activation_by = ?,
+              profile_activation_date_time = NOW(),
+              efr_status = 1,
+              is_eligible_for_offline_orders = COALESCE(?, is_eligible_for_offline_orders)
+        WHERE efr_id = ?`,
+      [
+        body.final_accept_comment || null,
+        body.grade || null,
+        actor?.user_id || null,
+        body.is_eligible_for_offline_orders ?? null,
+        efrId,
+      ]
+    );
+  }
+  return getVerificationPage(efrId);
+}
+
+// ─── Client mapping (Activation: Allocate Clients + Map clients) ────
+// `client_ids` is the FINAL list (set semantics) — we INSERT/UPDATE active
+// mappings and soft-disable any not in the list (mapping_status=0).
+async function mapClients(efrId, clientIds, actor) {
+  const ids = Array.isArray(clientIds) ? clientIds.map(Number).filter((n) => Number.isInteger(n) && n > 0) : [];
+  // Soft-disable mappings not in the list.
+  await pool.query(
+    `UPDATE tbl_client_easyfixer_mapping
+        SET mapping_status = 0, updated_by = ?, update_date = NOW()
+      WHERE easyfixer_id = ? ${ids.length ? `AND client_id NOT IN (${ids.map(() => '?').join(',')})` : ''}`,
+    [actor?.user_id || null, efrId, ...ids]
+  ).catch(() => {});
+  // Upsert each id (mapping_status=1).
+  for (const cid of ids) {
+    await pool.query(
+      `INSERT INTO tbl_client_easyfixer_mapping
+         (client_id, easyfixer_id, mapping_status, inserted_by, insert_date, update_date)
+       VALUES (?, ?, 1, ?, NOW(), NOW())
+       ON DUPLICATE KEY UPDATE mapping_status = 1, updated_by = VALUES(inserted_by), update_date = NOW()`,
+      [cid, efrId, actor?.user_id || null]
+    ).catch(() => {});
+  }
+  return getVerificationPage(efrId);
+}
+
+// ─── BGV upload (stub) ──────────────────────────────────────────────
+// TODO: wire to S3 once the bucket key is finalised. The legacy stores the
+// document in tbl_easyfixer_documents with document_type = 'BGV Report'.
+// For now we just persist the supplied URL/key if the caller provides one.
+async function saveBgvReport(efrId, body, actor) {
+  if (body.bgv_report_img_name) {
+    await pool.query(
+      `UPDATE tbl_easyfixer SET bgv_report_img_name = ?, updated_by = ?, update_date = NOW() WHERE efr_id = ?`,
+      [body.bgv_report_img_name, actor?.user_id || null, efrId]
+    ).catch(() => {});
+  }
+  return getVerificationPage(efrId);
+}
+
+module.exports = {
+  SECTION,
+  getVerificationPage,
+  addComment,
+  saveProfessional,
+  savePersonalFamily,
+  saveBanking,
+  saveIdentity,
+  setLeadVerification,
+  proceedToActivation,
+  saveActivation,
+  mapClients,
+  saveBgvReport,
+};
