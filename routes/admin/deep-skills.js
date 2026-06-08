@@ -78,6 +78,15 @@ const optionPatchBody = Joi.object({
   status:       Joi.number().integer().valid(0, 1).optional(),
 }).min(1);
 
+// Pagination schema for the mapped-easyfixers sub-resource. Default 10
+// keeps the modal's initial paint dense; cap of 500 matches the rest of
+// the platform's sub-resource list endpoints (see
+// validators/easyfixer.validator.js listSubresourceQuery).
+const mappedEasyfixersQuery = Joi.object({
+  limit:  Joi.number().integer().min(1).max(500).default(10),
+  offset: Joi.number().integer().min(0).default(0),
+});
+
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
   try { modernOk(res, await ds.list(req.query)); } catch (e) { next(e); }
 });
@@ -89,6 +98,50 @@ router.get('/:id', validate(idParam, 'params'), async (req, res, next) => {
     modernOk(res, data);
   } catch (e) { next(e); }
 });
+
+// ─── Mapped Easyfixers (sub-resource, read-only) ────────────────────
+// Feeds the "View Mapped Easyfixers" modal on the Manage Deep Skills page.
+// Aggregates all option-level mapping rows under the deep skill into one
+// row per easyfixer (multiple option mappings for the same tech under
+// the same deep skill collapse via GROUP BY easyfixer_id in the service).
+// RBAC inherits the admin-group guard from routes/admin/index.js.
+router.get('/:id/mapped-easyfixers',
+  validate(idParam, 'params'),
+  validate(mappedEasyfixersQuery, 'query'),
+  async (req, res, next) => {
+    try {
+      const existing = await ds.getById(req.params.id);
+      if (!existing) return modernError(res, 404, 'deep skill not found');
+      const { rows, total } = await ds.listMappedEasyfixers(req.params.id, req.query);
+      modernOk(res, { items: rows, total, limit: req.query.limit, offset: req.query.offset });
+    } catch (e) { next(e); }
+  });
+
+/*
+ * Bulk mapped-easyfixer counts (2026-06-08). Drives the "Mapped
+ * Easyfixers" aggregate column on the Manage Deep Skills list page.
+ * One round-trip returning counts for every skill_id on the current
+ * page. FE caches results client-side for 30s.
+ *
+ * POST + body (not GET + querystring) so the FE can pass ~50-500 ids
+ * without bumping the URL-length ceiling. Hard cap of 500 ids per
+ * call is enforced inside the service.
+ *
+ * Registered as a LITERAL path BEFORE the `/:id` catch-alls below so
+ * Express picks this route, not the parameterised ones, when the
+ * caller hits POST /admin/deep-skills/mapped-easyfixer-counts.
+ */
+const mappedEasyfixerCountsBody = Joi.object({
+  deepSkillIds: Joi.array().items(Joi.number().integer().positive()).min(1).max(500).required(),
+});
+router.post('/mapped-easyfixer-counts',
+  validate(mappedEasyfixerCountsBody, 'body'),
+  async (req, res, next) => {
+    try {
+      const { rows } = await ds.mappedEasyfixerCounts(req.body.deepSkillIds);
+      modernOk(res, { items: rows });
+    } catch (e) { next(e); }
+  });
 
 router.post('/', validate(createBody), async (req, res, next) => {
   try {

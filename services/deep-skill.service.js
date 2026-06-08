@@ -150,7 +150,100 @@ async function deleteOption(deepskillId, optionId) {
   return { ok: true };
 }
 
+// ─── Sub-resource: Mapped Easyfixers ────────────────────────────────
+/*
+ * Feeds the "View Mapped Easyfixers" modal on the Manage Deep Skills page.
+ *
+ * Schema reality (legacy column naming inversion — preserved, do NOT
+ * "correct" these names; see services/candidate-ranking.service.js:120-141):
+ *
+ *   tbl_efr_deepskill_mapping
+ *     easyfixer_id      → FK to tbl_easyfixer.efr_id
+ *     parent_skill_id   → legacy: actually holds deep_skill_id (3rd-level)
+ *     deep_skill_id     → legacy: actually holds option_id (tbl_deepskill_options.id)
+ *     is_repairing      → active flag (1 active / 0 inactive)
+ *     insert_date       → audit timestamp (column attested in
+ *                         easyfixer.service.js:591 — `m.insert_date AS mapped_at`)
+ *
+ * A single easyfixer can map to MULTIPLE options under the same deep skill,
+ * so we GROUP BY easyfixer_id and GROUP_CONCAT the option labels.
+ */
+async function listMappedEasyfixers(deepSkillId, { limit = 10, offset = 0 } = {}) {
+  const [[{ total }]] = await pool.query(`
+    SELECT COUNT(DISTINCT m.easyfixer_id) AS total
+      FROM tbl_efr_deepskill_mapping m
+     WHERE m.parent_skill_id = ?
+       AND m.is_repairing = 1
+  `, [deepSkillId]);
+
+  const [rows] = await pool.query(`
+    SELECT e.efr_id,
+           e.efr_name,
+           e.efr_no,
+           e.efr_email,
+           c.city_name,
+           COUNT(DISTINCT o.id) AS option_count,
+           GROUP_CONCAT(DISTINCT o.skill_option ORDER BY o.skill_option SEPARATOR ', ') AS mapped_options,
+           e.efr_status,
+           e.is_technician_verified,
+           MAX(m.insert_date) AS last_mapped_at
+      FROM tbl_efr_deepskill_mapping m
+      JOIN tbl_easyfixer e              ON e.efr_id = m.easyfixer_id
+      LEFT JOIN tbl_city c              ON c.city_id = e.efr_cityId
+      LEFT JOIN tbl_deepskill_options o ON o.id = m.deep_skill_id
+     WHERE m.parent_skill_id = ?
+       AND m.is_repairing = 1
+     GROUP BY e.efr_id, e.efr_name, e.efr_no, e.efr_email, c.city_name, e.efr_status, e.is_technician_verified
+     ORDER BY e.efr_name ASC
+     LIMIT ? OFFSET ?
+  `, [deepSkillId, Number(limit), Number(offset)]);
+
+  return { rows, total };
+}
+
+/*
+ * Bulk mapped-easyfixer counts (2026-06-08). Drives the new "Mapped
+ * Easyfixers" aggregate column on the Manage Deep Skills list page —
+ * one count per skill_id passed in, returned as a flat array of
+ * { deepskill_id, count } pairs.
+ *
+ * Same JOIN/filter logic as listMappedEasyfixers above, but rolled up
+ * by parent_skill_id instead of paginating one skill's easyfixers.
+ * Single round-trip for the whole page (typically 10-50 skill ids per
+ * call); GROUP BY uses the legacy-named `parent_skill_id` (which
+ * actually holds the deep_skill_id per the column-inversion docblock
+ * at the top of this file).
+ *
+ * Hard cap of 500 ids per call — mirrors the aggregates endpoint cap
+ * on /admin/easyfixers and is well above any realistic page size.
+ * Empty / non-positive ids are silently dropped.
+ */
+async function mappedEasyfixerCounts(deepSkillIds) {
+  if (!Array.isArray(deepSkillIds) || deepSkillIds.length === 0) {
+    return { rows: [] };
+  }
+  const ids = deepSkillIds
+    .slice(0, 500)
+    .map(Number)
+    .filter((n) => Number.isInteger(n) && n > 0);
+  if (ids.length === 0) return { rows: [] };
+
+  const placeholders = ids.map(() => '?').join(',');
+  const [rows] = await pool.query(`
+    SELECT m.parent_skill_id              AS deepskill_id,
+           COUNT(DISTINCT m.easyfixer_id) AS count
+      FROM tbl_efr_deepskill_mapping m
+     WHERE m.parent_skill_id IN (${placeholders})
+       AND m.is_repairing = 1
+     GROUP BY m.parent_skill_id
+  `, ids);
+
+  return { rows };
+}
+
 module.exports = {
   list, getById, create, update, setStatus,
   addOption, updateOption, deleteOption,
+  listMappedEasyfixers,
+  mappedEasyfixerCounts,
 };
