@@ -103,24 +103,31 @@ router.post(
         );
       }
 
-      // Pre-check B: client opted in (mandatory even for the manual button)
-      // Schema note: tbl_client_custom_properties uses legacy `c_prop_*` cols
-      // (c_prop_name / c_prop_values plural). Earlier draft referenced
-      // property_name/property_value which don't exist on the schema.
-      const [[optIn]] = await pool.query(
-        `SELECT c_prop_values AS property_value FROM tbl_client_custom_properties
-          WHERE client_id = ? AND c_prop_name = 'auto_process_unconfirmed_order'
-            AND status = 1
-          LIMIT 1`,
-        [job.fk_client_id],
-      );
-      if (!optIn || String(optIn.property_value || '').toLowerCase() !== 'true') {
-        return modernError(
-          res,
-          403,
-          'Client is not opted in to auto-process Unconfirmed Orders',
-        );
-      }
+      /*
+       * Pre-check B removed (2026-06-08).
+       *
+       * Previously this block 403-rejected manual sends for clients
+       * without `auto_process_unconfirmed_order='true'` in their custom
+       * properties. That conflated TWO different concerns:
+       *   - The auto_process flag's purpose is to gate the CRON's
+       *     automatic magic-link dispatch (see services/job-magic-link-cron.js
+       *     where the flag IS correctly enforced — opted-in clients
+       *     get auto-sends, opted-out clients don't).
+       *   - The MANUAL operator-triggered send is a separate flow.
+       *     Operators with `isJobMagicLinkSend` permission should be
+       *     able to send magic links to any client's unconfirmed orders
+       *     regardless of the auto-process opt-in — that's the explicit
+       *     manual override the permission exists to enable.
+       *
+       * The cron path keeps its opt-in gate. This route's only remaining
+       * gates are: status==9 (still Unconfirmed), per-job send cap
+       * (enforced atomically inside sendForJob), and the override-Admin
+       * check below.
+       *
+       * The BE response continues to include `client_opted_in` so the
+       * FE can render an informational badge ("Manual only — auto cron
+       * not enabled for this client") without using it as a gate.
+       */
 
       // Pre-check C: admin role required when override=true.
       // `req.userRole` is populated by the `role(['admin'])` middleware
