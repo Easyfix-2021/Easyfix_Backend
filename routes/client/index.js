@@ -1026,9 +1026,21 @@ router.get('/technicians', async (req, res, next) => {
     );
 
     // List query — GROUP BY collapses duplicate mapping rows per efr.
-    // service_types pulled via GROUP_CONCAT(DISTINCT) over the joined
-    // tbl_service_type — distinct so a tech mapped to the same service
-    // multiple times shows it once.
+    //
+    // Chips on the FE card now show CATEGORIES (Carpentry, Electrician,
+    // …) instead of individual service types — a tech mapped to 8
+    // service types under "Carpentry" used to render 8 chips + "+5 more";
+    // collapsed to category-level it's just 1–2 chips, far cleaner.
+    //
+    // service_categories pulled via GROUP_CONCAT(DISTINCT) joining
+    // tbl_service_type → tbl_service_catg through service_catg_id.
+    // DISTINCT dedupes naturally so "Carpentry" appears once even when
+    // a tech has 10 carpentry-bucket service types.
+    //
+    // service_types is kept for callers that still need the granular
+    // list (e.g. potential future detail panel) — same field name as
+    // before, no breaking change.
+    //
     // avg_rating + total_jobs are correlated subqueries scoped to THIS
     // client only (legacy parity: client should see ratings on its own
     // jobs, not a global average).
@@ -1042,6 +1054,7 @@ router.get('/technicians', async (req, res, next) => {
               e.tool_rating,
               ci.city_name AS city,
               GROUP_CONCAT(DISTINCT st.service_type_name ORDER BY st.service_type_name SEPARATOR ',') AS service_types,
+              GROUP_CONCAT(DISTINCT sc.service_catg_name ORDER BY sc.service_catg_name SEPARATOR ',') AS service_categories,
               (SELECT ROUND(AVG(r.customer_rating), 1)
                  FROM tbl_easyfixer_rating_by_customer r
                  JOIN tbl_job j2 ON j2.job_id = r.job_id
@@ -1057,6 +1070,7 @@ router.get('/technicians', async (req, res, next) => {
          JOIN tbl_easyfixer e   ON e.efr_id = m.easyfixer_id
          LEFT JOIN tbl_city ci  ON ci.city_id = e.efr_cityId
          LEFT JOIN tbl_service_type st ON st.service_type_id = m.service_type_id
+         LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = st.service_catg_id
         WHERE ${where.join(' AND ')}
         GROUP BY e.efr_id
         ORDER BY e.efr_name ASC
