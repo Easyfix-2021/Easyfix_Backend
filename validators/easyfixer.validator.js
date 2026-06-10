@@ -201,9 +201,42 @@ const bgvReportBody = Joi.object({
   bgv_report_img_name: Joi.string().max(500).required(),
 });
 
+/*
+ * Deep-skill OPTION mappings (4-level: catg → type → deep skill → option).
+ * Body shape mirrors the FE tree picker — one entry per option the
+ * easyfixer should be mapped to. Set-semantics, so the service replaces
+ * the active set atomically (soft-delete-then-insert in one txn).
+ *
+ * `deep_skill_id` and `option_id` use their SEMANTIC names here — the
+ * service layer is responsible for mapping them to the inverted physical
+ * columns on tbl_efr_deepskill_mapping (parent_skill_id / deep_skill_id).
+ * See the docblock in services/easyfixer-verification.service.js.
+ */
+const optionMappingsBody = Joi.object({
+  items: Joi.array().items(Joi.object({
+    category_id:     Joi.number().integer().positive().required(),
+    service_type_id: Joi.number().integer().positive().required(),
+    deep_skill_id:   Joi.number().integer().positive().required(),
+    option_id:       Joi.number().integer().positive().required(),
+  })).max(500).required(),
+});
+
+/*
+ * Serviceable pincodes — per-easyfixer set persisted to
+ * tbl_efr_serviceable_pincodes (single row per efr, CSV of pincode
+ * strings). The 2000 cap is generous; a tech covering 2000 pincodes is
+ * rare but not impossible.
+ */
+const serviceablePincodesBody = Joi.object({
+  pincodeIds: Joi.array()
+    .items(Joi.number().integer().positive())
+    .max(2000)
+    .required(),
+});
+
 module.exports = {
   listQuery, createBody, updateBody, statusBody, idParam, listSubresourceQuery, efrIdsBody,
   commentBody, leadVerificationBody, professionalBody, personalFamilyBody,
   bankingVerificationBody, identityVerificationBody, activationBody,
-  mapClientsBody, bgvReportBody,
+  mapClientsBody, bgvReportBody, optionMappingsBody, serviceablePincodesBody,
 };

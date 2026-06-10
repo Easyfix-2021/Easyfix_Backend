@@ -17,8 +17,12 @@ const listQuery = Joi.object({
   status:  Joi.string().valid('LOCAL', 'TRAVEL').optional(),
   cityId:  Joi.number().integer().positive().optional(),
   includeInactive: Joi.boolean().default(false),
-  limit:   Joi.number().integer().min(1).max(500).default(100),
+  limit:   Joi.number().integer().min(1).max(200000).default(100),
   offset:  Joi.number().integer().min(0).default(0),
+});
+
+const lookupManyBody = Joi.object({
+  pincodes: Joi.array().items(Joi.string().pattern(/^\d{6}$/)).min(1).max(500).required(),
 });
 
 const createBody = Joi.object({
@@ -59,6 +63,19 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
     return modernOk(res, data);
   } catch (err) { return next(err); }
 });
+
+// Bulk lookup by codes — used by the CRM verification page's bulk-paste
+// "Add All Matching Pincodes" flow. Declared BEFORE /:pincodeId so the
+// dynamic param matcher doesn't swallow "lookup-many".
+router.post('/lookup-many',
+  validate(lookupManyBody, 'body'),
+  async (req, res, next) => {
+    try {
+      const result = await pin.lookupManyByCode(req.body.pincodes);
+      return modernOk(res, result);
+    } catch (err) { return next(err); }
+  }
+);
 
 router.get('/:pincodeId', validate(idParam, 'params'), async (req, res, next) => {
   try {

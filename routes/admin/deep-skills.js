@@ -4,9 +4,7 @@ const validate = require('../../middleware/validate');
 const ds = require('../../services/deep-skill.service');
 const dsBulk = require('../../services/deep-skill-bulk.service');
 const { modernOk, modernError } = require('../../utils/response');
-const s3Storage = require('../../utils/s3-storage');
 const multer = require('multer');
-const { pool } = require('../../db');
 const logger = require('../../logger');
 
 /*
@@ -17,9 +15,25 @@ const logger = require('../../logger');
  * routes/admin/jobs.js:1851. 10MB cap is the same; deep-skill images
  * are decorative and shouldn't need more than a standard product photo.
  */
+/*
+ * Allowlist for skill thumbnails (2026-06-10) — the editor only ever
+ * shows small product-style images, so we hard-cap MIME types here
+ * rather than trusting whatever the browser sent.
+ */
+const SKILL_IMAGE_MIMETYPES = new Set([
+  'image/png', 'image/jpeg', 'image/webp', 'image/gif',
+]);
 const imageUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024, files: 1 },
+  // 2MB cap — skill images are thumbnails, never full-bleed assets.
+  limits: { fileSize: 2 * 1024 * 1024, files: 1 },
+  fileFilter(req, file, cb) {
+    if (SKILL_IMAGE_MIMETYPES.has(file.mimetype)) return cb(null, true);
+    cb(Object.assign(
+      new Error('unsupported image type — use PNG / JPEG / WEBP / GIF'),
+      { status: 400 },
+    ));
+  },
 });
 
 /*
@@ -89,6 +103,56 @@ const mappedEasyfixersQuery = Joi.object({
 
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
   try { modernOk(res, await ds.list(req.query)); } catch (e) { next(e); }
+});
+
+/*
+ * Route-ordering fix (2026-06-10 v2 — proper fix).
+ *
+ * The earlier `next('route')` stub did NOT work — Express's `next('route')`
+ * SKIPS the remaining handlers on the matched route and continues to the
+ * NEXT route that matches the URL. The next matching route is `/:id`,
+ * which still rejects 'upload-template' as non-numeric → 400.
+ *
+ * Right fix: handle the literal path here, ABOVE `/:id`. The template-
+ * generation logic is delegated to the original handler at the bottom
+ * of the file — we just re-export it as a function so this top-level
+ * route can call it directly. (Or: just inline a forwarding stub that
+ * calls the handler function exported below.)
+ *
+ * Implementation: keeping the actual XLSX-generation block at the
+ * bottom (it's 80 lines), we make the bottom handler EXPORT-equivalent
+ * via a closure variable and invoke it from here.
+ */
+let uploadTemplateHandler = null; // assigned at bottom of file
+router.get('/upload-template', async (req, res, next) => {
+  if (!uploadTemplateHandler) return next(new Error('upload-template handler not registered'));
+  return uploadTemplateHandler(req, res, next);
+});
+
+/*
+ * GET /api/admin/deep-skills/download (2026-06-10).
+ *
+ * Streams an XLSX of the full catalogue (every skill + joined
+ * category/type, options comma-joined, raw image filename, IST
+ * created date). Inherits the admin-group guard from
+ * routes/admin/index.js.
+ *
+ * Routed BEFORE `/:id` to avoid being shadowed (same trick as
+ * /upload-template — `next('route')` lets us declare the real
+ * handler further down without reordering this block).
+ */
+router.get('/download', async (_req, res, next) => {
+  try {
+    const buffer = await ds.downloadXlsx();
+    const fname = `deep-skills-${new Date().toISOString().slice(0, 10)}.xlsx`;
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    );
+    res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
+    res.setHeader('Content-Length', String(buffer.byteLength));
+    return res.end(Buffer.from(buffer));
+  } catch (e) { return next(e); }
 });
 
 router.get('/:id', validate(idParam, 'params'), async (req, res, next) => {
@@ -195,59 +259,102 @@ router.delete('/:id/options/:optionId', validate(optIdParam, 'params'), async (r
  * disk fallback by design — the legacy `easyfixer_documents` path was
  * never the canonical home for them.
  */
+/*
+ * Image upload handler (2026-06-10).
+ *
+ * Single handler serves both the canonical `/upload-image` path and
+ * the legacy `/image` alias (kept so older FE bundles don't 404 mid-
+ * rollout). Delegates to `services/deep-skill.service.replaceImage`
+ * which:
+ *   - puts the new object at `Skills/Skill_<id>_<seq>`
+ *   - UPDATEs tbl_deep_skill.deepskill_image
+ *   - best-effort deletes the previous S3 object
+ *   - returns a short-TTL presigned URL the FE can render immediately
+ *
+ * NOTE: the previous version of this handler queried `tbl_deepskill`
+ * (no underscore) and wrote with the same broken name, so every
+ * upload silently 404'd. Routing through the service helper now uses
+ * the correct `tbl_deep_skill` table.
+ */
+async function handleImageUpload(req, res, next) {
+  const skillId = Number(req.params.id);
+  try {
+    if (!req.file) return modernError(res, 400, 'missing "file" upload');
+    logger.upload({
+      skillId,
+      originalName: req.file.originalname,
+      mimeType: req.file.mimetype,
+      bytes: req.file.size,
+    }, 'deep skill image upload received');
+
+    const result = await ds.replaceImage(skillId, {
+      buffer: req.file.buffer,
+      contentType: req.file.mimetype,
+      originalName: req.file.originalname,
+    });
+    modernOk(res, result, 'deep skill image uploaded');
+  } catch (e) {
+    if (e?.status && e.status >= 400 && e.status < 500) {
+      return modernError(res, e.status, e.message);
+    }
+    next(e);
+  }
+}
+
+router.post(
+  '/:id/upload-image',
+  validate(idParam, 'params'),
+  imageUpload.single('file'),
+  handleImageUpload,
+);
+
+// Legacy alias (kept so older FE bundles keep working during rollout).
 router.post(
   '/:id/image',
   validate(idParam, 'params'),
   imageUpload.single('file'),
+  handleImageUpload,
+);
+
+/*
+ * Resolve the stored S3 key to a short-TTL presigned GET URL. Used
+ * by the editor modal's Edit mode to render the existing image
+ * preview without exposing the bucket publicly.
+ */
+router.get(
+  '/:id/image-url',
+  validate(idParam, 'params'),
   async (req, res, next) => {
-    const skillId = Number(req.params.id);
     try {
-      if (!req.file) {
-        return modernError(res, 400, 'missing "file" upload');
+      const data = await ds.getImageUrl(req.params.id);
+      modernOk(res, data);
+    } catch (e) {
+      if (e?.status && e.status >= 400 && e.status < 500) {
+        return modernError(res, e.status, e.message);
       }
-      if (!s3Storage.isEnabled()) {
-        return modernError(res, 503,
-          'S3 is not configured on this deploy (set S3_BUCKET_NAME in backend.env)');
+      next(e);
+    }
+  },
+);
+
+/*
+ * Clear the image — null out the DB column AND best-effort delete
+ * the underlying S3 object so we don't accumulate orphans.
+ */
+router.delete(
+  '/:id/image',
+  validate(idParam, 'params'),
+  async (req, res, next) => {
+    try {
+      const data = await ds.clearImage(req.params.id);
+      modernOk(res, data, 'deep skill image cleared');
+    } catch (e) {
+      if (e?.status && e.status >= 400 && e.status < 500) {
+        return modernError(res, e.status, e.message);
       }
-
-      // Resolve current row → derive next seq from existing key's tail.
-      const [[row]] = await pool.query(
-        'SELECT deepskill_image FROM tbl_deepskill WHERE deepskill_id = ?',
-        [skillId]
-      );
-      if (!row) return modernError(res, 404, 'deep skill not found');
-
-      const prev = String(row.deepskill_image || '');
-      const match = prev.match(/^Skills\/Skill_\d+_(\d+)$/);
-      const seq = match ? Number(match[1]) + 1 : 1;
-
-      logger.upload({
-        skillId, seq,
-        originalName: req.file.originalname,
-        mimeType: req.file.mimetype,
-        bytes: req.file.size,
-      }, 'deep skill image upload received');
-
-      const Key = await s3Storage.putSkillImage({
-        skillId, seq,
-        buffer: req.file.buffer,
-        contentType: req.file.mimetype,
-        originalName: req.file.originalname,
-      });
-
-      // Persist the new key. Single UPDATE; the existing
-      // ds.update() applies its own diff logic for textual fields,
-      // but here we only touch this one column so a direct UPDATE is
-      // both simpler and avoids the full update() path's audit trail
-      // (image swap is a logically-distinct operation).
-      await pool.query(
-        'UPDATE tbl_deepskill SET deepskill_image = ? WHERE deepskill_id = ?',
-        [Key, skillId]
-      );
-
-      modernOk(res, { image: Key }, 'deep skill image uploaded');
-    } catch (e) { next(e); }
-  }
+      next(e);
+    }
+  },
 );
 
 /*
@@ -329,7 +436,13 @@ router.post(
  * exfiltrate a template (low-sensitivity but matches the rest of the
  * route group).
  */
-router.get('/upload-template', async (_req, res, next) => {
+/*
+ * Implementation moved to a top-level variable so the literal-path
+ * route registered ABOVE `/:id` can invoke it without re-declaring
+ * the 80-line XLSX-generation block. See the `uploadTemplateHandler`
+ * declaration near the top of this file (2026-06-10 route-ordering fix).
+ */
+uploadTemplateHandler = async (_req, res, next) => {
   try {
     const ExcelJS = require('exceljs');
     const wb = new ExcelJS.Workbook();
@@ -349,21 +462,22 @@ router.get('/upload-template', async (_req, res, next) => {
       { width: 22 }, { width: 22 }, { width: 22 }, { width: 22 },
     ];
 
-    // Row 1 — decorative section labels (matches ops files; ignored by
-    // the parser via the row-1-skip rule).
-    const decor = [
-      'Screenshot 1',
-      'Screenshot 2 - Left Column',
-      'Screenshot 2 - Selection Details',
-      'SCREEN SHOT 3',
-      'deep skill segregation added',
-      'deep skill segregation added',
-      'deep skill segregation added', 'deep skill segregation added',
-      'deep skill segregation added', 'deep skill segregation added',
-      'deep skill segregation added', 'deep skill segregation added',
-      'deep skill segregation added', 'deep skill segregation added',
-    ];
-    ws.addRow(decor);
+    /*
+     * Row 1 — intentionally LEFT BLANK (2026-06-10 fix).
+     *
+     * The bulk-upload parser anchors on row 2 as the header row (see
+     * `HEADER_ROW_INDEX = 2` in services/deep-skill-bulk.service.js
+     * and the comment "Row 1: decorative section headers — SKIP"),
+     * so this template must leave row 1 reserved. Previously it was
+     * filled with placeholder text ("Screenshot 1", "deep skill
+     * segregation added", etc) that matched legacy ops files but
+     * looked like junk to operators downloading a fresh template.
+     *
+     * Now blank-celled. Backward compat: the parser's row-1-skip
+     * rule still applies regardless of cell content, so files
+     * uploaded with the OLD placeholder text continue to work.
+     */
+    ws.addRow(['', '', '', '', '', '', '', '', '', '', '', '', '', '']);
 
     // Row 2 — REAL column headers (parser anchors). Keep these strings
     // in lock-step with the header-validation regexes in
@@ -410,6 +524,6 @@ router.get('/upload-template', async (_req, res, next) => {
     res.setHeader('Content-Length', String(buffer.byteLength));
     return res.end(Buffer.from(buffer));
   } catch (e) { return next(e); }
-});
+};
 
 module.exports = router;

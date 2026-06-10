@@ -602,11 +602,17 @@ async function listMappedClients(efrId, { limit = 50, offset = 0 } = {}) {
 
 // ─── Sub-resource: Aggregates (lazy column fill) ────────────────────
 // POST /admin/easyfixers/aggregates body { efrIds: [...] }
-// Returns the four expensive columns that were removed from the base list:
-// clients_mapped, total_earnings, job_count, avg_rating. The WHERE ... IN
+// Returns the six expensive columns that were removed from the base list:
+// clients_mapped, total_earnings, job_count, avg_rating, options_mapped_count,
+// serviceable_pincodes_csv.
+// The WHERE ... IN
 // inside each subquery is the critical optimisation — without it those
 // subqueries scan the full tables; with it, they hit covering indexes for
 // just the requested page (~50 ids).
+//
+// `serviceable_pincodes_csv` comes from tbl_efr_serviceable_pincodes which
+// stores the CSV directly in a `pincodes` TEXT column (one row per efr) —
+// no GROUP_CONCAT needed; a simple LEFT JOIN suffices.
 async function aggregates(efrIds, { scope } = {}) {
   if (!Array.isArray(efrIds) || efrIds.length === 0) return { rows: [] };
   // Cap + sanitise: integers, positive, dedupe, max 1000.
@@ -634,10 +640,12 @@ async function aggregates(efrIds, { scope } = {}) {
   const [rows] = await pool.query(
     `SELECT
        e.efr_id,
-       COALESCE(cm.clients_mapped, 0)    AS clients_mapped,
-       COALESCE(earn.total_earnings, 0)  AS total_earnings,
-       COALESCE(earn.job_count, 0)       AS job_count,
-       ROUND(rt.rating, 2)               AS avg_rating
+       COALESCE(cm.clients_mapped, 0)         AS clients_mapped,
+       COALESCE(earn.total_earnings, 0)       AS total_earnings,
+       COALESCE(earn.job_count, 0)            AS job_count,
+       ROUND(rt.rating, 2)                    AS avg_rating,
+       COALESCE(optmap.options_mapped_count, 0) AS options_mapped_count,
+       COALESCE(sp.pincodes, '')              AS serviceable_pincodes_csv
      FROM tbl_easyfixer e
      LEFT JOIN (
        SELECT easyfixer_id, COUNT(DISTINCT client_id) AS clients_mapped
@@ -662,8 +670,22 @@ async function aggregates(efrIds, { scope } = {}) {
           AND comment IS NOT NULL
         GROUP BY easyfixer_id
      ) rt ON rt.easyfixer_id = e.efr_id
+     LEFT JOIN (
+       /*
+        * Options-mapped rollup (2026-06-10). Counts DISTINCT options each
+        * easyfixer is mapped to in tbl_efr_deepskill_mapping where
+        * is_repairing = 1 (the "active" mapping flag). Covered by the
+        * composite index added in
+        * migrations/2026-06-10-add-efr-deepskill-mapping-composite-index.sql.
+        */
+       SELECT easyfixer_id, COUNT(*) AS options_mapped_count
+         FROM tbl_efr_deepskill_mapping
+        WHERE easyfixer_id IN (${placeholders}) AND is_repairing = 1
+        GROUP BY easyfixer_id
+     ) optmap ON optmap.easyfixer_id = e.efr_id
+     LEFT JOIN tbl_efr_serviceable_pincodes sp ON sp.easyfixer_id = e.efr_id
      WHERE e.efr_id IN (${placeholders})${scopeWhere}`,
-    [...ids, ...ids, ...ids, ...ids, ...scopeParams],
+    [...ids, ...ids, ...ids, ...ids, ...ids, ...scopeParams],
   );
 
   return { rows };

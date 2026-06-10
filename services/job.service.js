@@ -727,8 +727,18 @@ async function list({
   if (startDate)           { clauses.push(`${dateCol} >= ?`); params.push(startDate); }
   if (endDate)             { clauses.push(`${dateCol} <= ?`); params.push(endDate); }
   if (q) {
-    clauses.push('(j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ?)');
-    params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
+    /*
+     * `j.job_id` added (2026-06-10 fix) — operators routinely search by
+     * the numeric job id on the Unconfirmed tab to triage a specific
+     * order. Earlier this clause only matched against text fields
+     * (reference id, client ref, customer name + mobile), so a search
+     * like "12345" returned zero rows even when job_id=12345 was on
+     * the very page being viewed. Now job_id is a CAST AS CHAR + LIKE
+     * so partial numeric matches (e.g. "1234" → 12340..12349) work,
+     * matching operator expectations.
+     */
+    clauses.push('(CAST(j.job_id AS CHAR) LIKE ? OR j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ?)');
+    params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
   }
 
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';

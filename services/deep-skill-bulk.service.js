@@ -176,6 +176,11 @@ async function resolveCategory(conn, cache, name, { create }) {
     [name],
   );
   if (row) {
+    // 2026-06-10: audit log so ops can spot reuse vs. fresh-create
+    // patterns post-bulk-upload.
+    logger.info(
+      `deep-skill: matched existing service_catg_id=${row.service_catg_id} for name="${name}" (case-insensitive)`,
+    );
     const out = { id: row.service_catg_id, name: row.service_catg_name, isNew: false };
     cache.cats.set(lc, out);
     return out;
@@ -216,6 +221,10 @@ async function resolveType(conn, cache, catId, name, { create }) {
       [name, catId],
     );
     if (row) {
+      // 2026-06-10: audit log so ops can spot reuse vs. fresh-create.
+      logger.info(
+        `deep-skill: matched existing service_type_id=${row.service_type_id} for name="${name}" (case-insensitive, catg=${catId})`,
+      );
       const out = { id: row.service_type_id, name: row.service_type_name, catId, isNew: false };
       cache.types.set(lc, out);
       return out;
@@ -368,7 +377,13 @@ async function processBuffer(buffer, { commit = false, actor = null } = {}) {
         if (commit && r.options.length) {
           const have = await listExistingOptions(conn, existingSkillId);
           for (const opt of r.options) {
-            if (have.has(opt.toLowerCase())) continue;
+            if (have.has(opt.toLowerCase())) {
+              // 2026-06-10: audit log so ops can spot option reuse.
+              logger.info(
+                `deep-skill: matched existing skill_option name="${opt}" (case-insensitive, skill=${existingSkillId})`,
+              );
+              continue;
+            }
             await conn.query(
               `INSERT INTO tbl_deepskill_options (deepskill_id, skill_option, status)
                VALUES (?, ?, 1)`,

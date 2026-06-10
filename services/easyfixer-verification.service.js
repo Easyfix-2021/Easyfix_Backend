@@ -134,9 +134,19 @@ async function getVerificationPage(efrId) {
   const e = await getEasyfixerForVerification(efrId);
   if (!e) return null;
 
+  /*
+   * Additional Details counts (2026-06-11) — Deep Skill Option Mapping
+   * + Serviceable Pincodes. These drive the section's progress bar so
+   * it paints correctly on first render without waiting for child
+   * components to mount + fetch their own data. 50% per child:
+   *   - deep-skill mappings > 0   → +50
+   *   - serviceable pincodes > 0  → +50
+   * Both queries are cheap (covering index / single PK lookup).
+   */
   const [banking, banks, cities,
     leadComments, profComments, persComments,
-    bankComments, idComments, actComments] = await Promise.all([
+    bankComments, idComments, actComments,
+    deepSkillCountRow, serviceablePincodesRow] = await Promise.all([
     getBanking(efrId),
     listEasyfixBanks(),
     listCitiesForLookup(),
@@ -146,7 +156,22 @@ async function getVerificationPage(efrId) {
     getCommentsBySection(efrId, SECTION.BANKING),
     getCommentsBySection(efrId, SECTION.IDENTITY),
     getCommentsBySection(efrId, SECTION.ACTIVATION),
+    pool.query(
+      `SELECT COUNT(*) AS cnt FROM tbl_efr_deepskill_mapping
+        WHERE easyfixer_id = ? AND is_repairing = 1`,
+      [efrId],
+    ).then(([rows]) => rows[0] || { cnt: 0 }).catch(() => ({ cnt: 0 })),
+    pool.query(
+      'SELECT pincodes FROM tbl_efr_serviceable_pincodes WHERE easyfixer_id = ?',
+      [efrId],
+    ).then(([rows]) => rows[0] || { pincodes: '' }).catch(() => ({ pincodes: '' })),
   ]);
+
+  const deepSkillsCount = Number(deepSkillCountRow.cnt || 0);
+  const pincodeCsv = String(serviceablePincodesRow.pincodes || '').trim();
+  const serviceablePincodesCount = pincodeCsv
+    ? pincodeCsv.split(',').map((p) => p.trim()).filter(Boolean).length
+    : 0;
 
   const fullName = e.tx_full_name || e.efr_name || '';
   const personalDetailsFilled = e.personal_details_filled; // 0 | 1 | 2
@@ -314,6 +339,14 @@ async function getVerificationPage(efrId) {
         finance_updated_on:   banking?.update_date,
       },
       comments: actComments,
+    },
+
+    // ─ Section 4: Additional Details (Skill & Service Area Mapping) ─
+    additional: {
+      deep_skills_count: deepSkillsCount,
+      serviceable_pincodes_count: serviceablePincodesCount,
+      progress: (deepSkillsCount > 0 ? 50 : 0) + (serviceablePincodesCount > 0 ? 50 : 0),
+      is_complete: deepSkillsCount > 0 && serviceablePincodesCount > 0,
     },
 
     // Lookup data the page needs inline (cheap):
@@ -568,6 +601,184 @@ async function mapClients(efrId, clientIds, actor) {
   return getVerificationPage(efrId);
 }
 
+// ─── Deep Skill Option Mappings (tbl_efr_deepskill_mapping) ─────────
+/*
+ * Mapping tier 4 (Service Category → Service Type → Deep Skill →
+ * Deep-skill Option) onto a single easyfixer. Persisted in
+ * tbl_efr_deepskill_mapping, one row per (easyfixer × option).
+ *
+ * Schema quirk — see docblock in services/deep-skill.service.js for
+ * the full story. TL;DR the two id columns on this table are inverted
+ * relative to their names:
+ *
+ *   physical column     ACTUALLY holds                  semantic name
+ *   ─────────────────   ─────────────────────────────   ─────────────────
+ *   m.parent_skill_id   tbl_deep_skill.deepskill_id     deep_skill_id
+ *   m.deep_skill_id     tbl_deepskill_options.id        option_id
+ *
+ * SELECTs in this file ALWAYS alias the columns through to their
+ * semantic names so the FE consumes readable shapes; WHERE / JOIN /
+ * INSERT clauses keep the physical names (MySQL aliases aren't allowed
+ * there) with an inline comment marking the inversion.
+ *
+ * `is_repairing` doubles as the active flag (1 = active, 0 = soft-
+ * deleted). We never hard-delete so a re-toggle re-uses the original
+ * row instead of creating a duplicate.
+ */
+async function listOptionMappings(efrId) {
+  const [rows] = await pool.query(
+    `SELECT m.category_id,
+            sc.service_catg_name        AS category_name,
+            m.service_type_id,
+            st.service_type_name        AS service_type_name,
+            m.parent_skill_id           AS deep_skill_id, -- physical column m.parent_skill_id holds the deep_skill_id
+            ds.deepskill_name           AS deep_skill_name,
+            m.deep_skill_id             AS option_id,     -- physical column m.deep_skill_id holds the option id
+            o.skill_option              AS option_name
+       FROM tbl_efr_deepskill_mapping m
+       LEFT JOIN tbl_service_catg     sc ON sc.service_catg_id = m.category_id
+       LEFT JOIN tbl_service_type     st ON st.service_type_id = m.service_type_id
+       LEFT JOIN tbl_deep_skill       ds ON ds.deepskill_id    = m.parent_skill_id -- parent_skill_id is the deep_skill FK
+       LEFT JOIN tbl_deepskill_options o ON o.id               = m.deep_skill_id   -- deep_skill_id is the option FK
+      WHERE m.easyfixer_id = ? AND m.is_repairing = 1
+      ORDER BY sc.service_catg_name, st.service_type_name, ds.deepskill_name, o.skill_option`,
+    [efrId]
+  );
+  return rows;
+}
+
+async function replaceOptionMappings(efrId, items, actor) {
+  const list = Array.isArray(items) ? items : [];
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // 1) Soft-delete every active row for this easyfixer.
+    await conn.query(
+      `UPDATE tbl_efr_deepskill_mapping
+          SET is_repairing = 0
+        WHERE easyfixer_id = ?`,
+      [efrId]
+    );
+
+    // 2) For each desired item: try reactivate, INSERT if no matching row.
+    let updated = 0;
+    for (const it of list) {
+      const categoryId    = Number(it.category_id);
+      const serviceTypeId = Number(it.service_type_id);
+      const deepSkillId   = Number(it.deep_skill_id);  // semantic name; goes into the physical column `parent_skill_id`
+      const optionId      = Number(it.option_id);      // semantic name; goes into the physical column `deep_skill_id`
+      if (![categoryId, serviceTypeId, deepSkillId, optionId].every((n) => Number.isInteger(n) && n > 0)) {
+        continue;
+      }
+      const [r] = await conn.query(
+        `UPDATE tbl_efr_deepskill_mapping
+            SET is_repairing = 1
+          WHERE easyfixer_id    = ?
+            AND category_id     = ?
+            AND service_type_id = ?
+            AND parent_skill_id = ?    -- holds deep_skill_id (inversion, see docblock)
+            AND deep_skill_id   = ?`,  /* holds option_id (inversion, see docblock) */
+        [efrId, categoryId, serviceTypeId, deepSkillId, optionId]
+      );
+      if (r.affectedRows === 0) {
+        await conn.query(
+          `INSERT INTO tbl_efr_deepskill_mapping
+             (easyfixer_id, category_id, service_type_id,
+              parent_skill_id, -- physical column name; holds deep_skill_id
+              deep_skill_id,   -- physical column name; holds option_id
+              is_repairing)
+           VALUES (?, ?, ?, ?, ?, 1)`,
+          [efrId, categoryId, serviceTypeId, deepSkillId, optionId]
+        );
+      }
+      updated += 1;
+    }
+
+    await conn.commit();
+    // actor is accepted for future audit columns; today the table has no
+    // updated_by / updated_on columns so we just log the actor for trail.
+    void actor;
+    return { updated };
+  } catch (e) {
+    try { await conn.rollback(); } catch (_) { /* swallow rollback failure */ }
+    throw e;
+  } finally {
+    conn.release();
+  }
+}
+
+// ─── Serviceable Pincodes (tbl_efr_serviceable_pincodes) ───────────
+/*
+ * Per-easyfixer set of pincodes the technician will accept jobs in.
+ * Schema (2026-06-10): single row per easyfixer with a `pincodes` TEXT
+ * column holding the CSV of pincode strings directly. PK is easyfixer_id —
+ * so INSERT … ON DUPLICATE KEY UPDATE is atomic and needs no transaction.
+ *
+ * The FE still talks in pincode IDs (it sources them from the
+ * /shared/lookup/pincodes catalogue). On write we resolve IDs → pincode
+ * strings via tbl_pincode and persist the CSV. On read we split the CSV
+ * back into the joined detail shape the FE expects.
+ *
+ * EasyFix-owned table — no legacy Java service references it — so adding
+ * it via migrations/2026-06-10-create-tbl-efr-serviceable-pincodes.sql is
+ * safe under the CLAUDE.md shared-DB carve-out.
+ */
+async function listServiceablePincodes(efrId) {
+  const [[row]] = await pool.query(
+    `SELECT pincodes FROM tbl_efr_serviceable_pincodes WHERE easyfixer_id = ? LIMIT 1`,
+    [efrId]
+  );
+  const csv = row?.pincodes;
+  if (!csv) return { items: [] };
+  const pins = String(csv).split(',').map((s) => s.trim()).filter(Boolean);
+  if (pins.length === 0) return { items: [] };
+  const placeholders = pins.map(() => '?').join(',');
+  const [items] = await pool.query(
+    `SELECT p.pincode_id,
+            p.pincode,
+            p.location           AS pincode_location,
+            p.city_id,
+            c.city_name,
+            c.state_id,
+            s.state_name
+       FROM tbl_pincode p
+       LEFT JOIN tbl_city  c ON c.city_id  = p.city_id
+       LEFT JOIN tbl_state s ON s.state_id = c.state_id
+      WHERE p.pincode IN (${placeholders})
+      ORDER BY p.pincode ASC`,
+    pins
+  );
+  return { items };
+}
+
+async function replaceServiceablePincodes(efrId, pincodeIds, actor) {
+  const list = Array.isArray(pincodeIds)
+    ? Array.from(new Set(pincodeIds.map(Number).filter((n) => Number.isInteger(n) && n > 0)))
+    : [];
+  const userId = actor?.user_id || null;
+  // Resolve pincode IDs → pincode strings (the schema stores CSV of strings,
+  // not IDs). Dedupe + join. Empty list ⇒ persist empty CSV.
+  let csv = '';
+  if (list.length) {
+    const placeholders = list.map(() => '?').join(',');
+    const [rows] = await pool.query(
+      `SELECT pincode FROM tbl_pincode WHERE pincode_id IN (${placeholders})`,
+      list
+    );
+    csv = Array.from(new Set(rows.map((r) => String(r.pincode)).filter(Boolean))).join(',');
+  }
+  // Single-statement atomic upsert keyed on easyfixer_id (PK).
+  await pool.query(
+    `INSERT INTO tbl_efr_serviceable_pincodes
+       (easyfixer_id, pincodes, created_by, updated_by)
+     VALUES (?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE pincodes = VALUES(pincodes), updated_by = VALUES(updated_by)`,
+    [efrId, csv, userId, userId]
+  );
+  return { updated: list.length };
+}
+
 // ─── BGV upload (stub) ──────────────────────────────────────────────
 // TODO: wire to S3 once the bucket key is finalised. The legacy stores the
 // document in tbl_easyfixer_documents with document_type = 'BGV Report'.
@@ -595,4 +806,8 @@ module.exports = {
   saveActivation,
   mapClients,
   saveBgvReport,
+  listOptionMappings,
+  replaceOptionMappings,
+  listServiceablePincodes,
+  replaceServiceablePincodes,
 };

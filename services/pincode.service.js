@@ -53,9 +53,11 @@ function deriveStatus(activeEfrCount) {
 
 // ─── List with filters + computed status ─────────────────────────────
 async function listPincodes({ q, status, cityId, includeInactive = false, limit = 100, offset = 0 } = {}) {
-  // Cap limit defensively — table is expected to grow but a buggy client
-  // shouldn't ever stream the full catalog in one shot.
-  limit  = Math.min(Math.max(Number(limit)  || 100, 1), 500);
+  // Cap limit defensively. Bumped from 500 → 200000 to support the CRM
+  // verification page's "load-all" dropdown (~155k rows post-seed). The
+  // query is indexed on `pincode` (PK) and runs sub-second; pagination
+  // is preserved for callers that still want page-size LIMITs.
+  limit  = Math.min(Math.max(Number(limit)  || 100, 1), 200000);
   offset = Math.max(Number(offset) || 0, 0);
 
   const where = ['1=1'];
@@ -154,6 +156,39 @@ async function getPincodeById(pincodeId) {
   };
 }
 
+/*
+ * Bulk lookup by 6-digit code. Used by the CRM verification page's
+ * "Add All Matching Pincodes" bulk-paste flow. De-dupes + sanitises input,
+ * caps at 500, runs a single indexed IN(...) scan. Returns
+ *   { items: [...], notFound: ['110099', ...] }
+ * so the FE can toast the unmatched codes.
+ */
+async function lookupManyByCode(pincodes) {
+  if (!Array.isArray(pincodes) || pincodes.length === 0) {
+    return { items: [], notFound: [] };
+  }
+  const clean = Array.from(new Set(
+    pincodes.map((p) => String(p).trim()).filter((p) => /^\d{6}$/.test(p))
+  )).slice(0, 500);
+  if (clean.length === 0) return { items: [], notFound: pincodes };
+
+  const placeholders = clean.map(() => '?').join(',');
+  const [items] = await pool.query(
+    `SELECT p.pincode_id, p.pincode, p.location AS pincode_location,
+            p.city_id, c.city_name, c.state_id, s.state_name
+       FROM tbl_pincode    p
+       LEFT JOIN tbl_city  c ON c.city_id  = p.city_id
+       LEFT JOIN tbl_state s ON s.state_id = c.state_id
+      WHERE p.pincode IN (${placeholders})
+        AND p.pincode_status = 1`,
+    clean
+  );
+
+  const foundSet = new Set(items.map((i) => String(i.pincode)));
+  const notFound = clean.filter((p) => !foundSet.has(p));
+  return { items, notFound };
+}
+
 async function getPincodeByValue(pincode) {
   const [[row]] = await pool.query(
     'SELECT pincode_id FROM tbl_pincode WHERE pincode = ? LIMIT 1', [String(pincode)]
@@ -237,6 +272,7 @@ module.exports = {
   listPincodes,
   getPincodeById,
   getPincodeByValue,
+  lookupManyByCode,
   createPincode,
   updatePincode,
   deletePincode,

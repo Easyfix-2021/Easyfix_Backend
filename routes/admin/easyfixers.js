@@ -9,6 +9,7 @@ const {
   listQuery, createBody, updateBody, statusBody, idParam, listSubresourceQuery, efrIdsBody,
   commentBody, leadVerificationBody, professionalBody, personalFamilyBody,
   bankingVerificationBody, identityVerificationBody, activationBody, mapClientsBody, bgvReportBody,
+  optionMappingsBody, serviceablePincodesBody,
 } = require('../../validators/easyfixer.validator');
 const { buildRequestScope, assertEntityInScope } = require('../../lib/scope');
 
@@ -85,6 +86,8 @@ const EXPORT_COLUMNS = [
   { header: 'Clients Mapped',         key: 'clients_mapped',               width: 15 },
   { header: 'Total Earnings',         key: 'total_earnings',               width: 16 },
   { header: 'Job Count',              key: 'job_count',                    width: 12 },
+  { header: 'DeepSkills Mapped',      key: 'options_mapped_count',         width: 15 },
+  { header: 'Serviceable Pincodes',   key: 'serviceable_pincodes_csv',     width: 40 },
   { header: 'Avg Rating',             key: 'avg_rating',                   width: 12 },
   { header: 'Profile Activated On',   key: 'profile_activation_date_time', width: 22 },
   { header: 'Status',                 key: 'efr_status',                   width: 10 },
@@ -334,6 +337,58 @@ router.put('/:id/verification/map-clients',
       if (!(await loadAndAuthorize(req, res))) return;
       const data = await verification.mapClients(req.params.id, req.body.client_ids, req.user);
       modernOk(res, data, 'clients mapped');
+    } catch (e) { next(e); }
+  });
+
+// ─── Deep Skill Option Mappings (tbl_efr_deepskill_mapping) ─────────
+// GET returns ALL active option mappings for the easyfixer with the full
+// 4-level hierarchy joined for display. PUT replaces the active set
+// atomically (soft-delete-then-insert in one txn). Same scope guard +
+// 404-on-miss convention as the other verification endpoints.
+router.get('/:id/option-mappings',
+  validate(idParam, 'params'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndAuthorize(req, res))) return;
+      const items = await verification.listOptionMappings(req.params.id);
+      modernOk(res, { items });
+    } catch (e) { next(e); }
+  });
+
+router.put('/:id/option-mappings',
+  validate(idParam, 'params'), validate(optionMappingsBody, 'body'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndAuthorize(req, res))) return;
+      const result = await verification.replaceOptionMappings(req.params.id, req.body.items, req.user);
+      modernOk(res, result, 'option mappings updated');
+    } catch (e) { next(e); }
+  });
+
+// ─── Serviceable Pincodes (tbl_efr_serviceable_pincodes) ────────────
+// Per-easyfixer set of pincodes the technician will accept jobs in.
+// GET returns active pincodes with display labels joined from tbl_pincode/
+// tbl_city/tbl_state; PUT replaces the active set atomically. Same scope
+// guard + 404-on-miss convention as the other verification endpoints.
+router.get('/:id/serviceable-pincodes',
+  validate(idParam, 'params'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndAuthorize(req, res))) return;
+      const data = await verification.listServiceablePincodes(req.params.id);
+      modernOk(res, data);
+    } catch (e) { next(e); }
+  });
+
+router.put('/:id/serviceable-pincodes',
+  validate(idParam, 'params'), validate(serviceablePincodesBody, 'body'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndAuthorize(req, res))) return;
+      const result = await verification.replaceServiceablePincodes(
+        req.params.id, req.body.pincodeIds, req.user
+      );
+      modernOk(res, result, 'serviceable pincodes updated');
     } catch (e) { next(e); }
   });
 

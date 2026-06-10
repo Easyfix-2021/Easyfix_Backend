@@ -1,4 +1,7 @@
+const ExcelJS = require('exceljs');
 const { pool } = require('../db');
+const logger   = require('../logger');
+const s3Storage = require('../utils/s3-storage');
 
 /*
  * Deep-skill catalogue management.
@@ -17,7 +20,135 @@ const { pool } = require('../db');
  *   efr_dskill_status         — verification state per (tech, category)
  *   tx_category_skill_status  — empty bigint-keyed shadow (newer schema, not in use)
  *   tbl_skill_master          — legacy L1/L2 skill tiers, unrelated
+ *
+ * ─── tbl_efr_deepskill_mapping COLUMN-NAME INVERSION (2026-06-10) ───
+ *
+ * CRITICAL — read before touching any query that references this table.
+ *
+ * The legacy schema has a long-standing naming drift where the two id
+ * columns store the OPPOSITE of what their names suggest:
+ *
+ *   physical column      ACTUALLY holds                  semantic name
+ *   ─────────────────    ─────────────────────────────   ─────────────────
+ *   m.parent_skill_id    tbl_deep_skill.deep_skill_id    deep_skill_id
+ *   m.deep_skill_id      tbl_deepskill_options.id        option_id
+ *
+ * In other words: the column NAMED `deep_skill_id` actually carries
+ * the OPTION id, and the column NAMED `parent_skill_id` carries the
+ * actual deep_skill_id. This was verified against the legacy Java
+ * `@Entity` for tbl_efr_deepskill_mapping in API_AngularClientDashboard.
+ *
+ * Implication: each row in this table represents ONE (easyfixer × option)
+ * mapping. An easyfixer with 3 options under "Electrical" has 3 rows,
+ * all sharing the same parent_skill_id (Electrical) but with distinct
+ * deep_skill_id values (one per option).
+ *
+ * Schema can't be renamed (legacy CRM Java + 5 other services read these
+ * columns by their physical names). Convention going forward:
+ *
+ *   - EVERY new query that touches tbl_efr_deepskill_mapping projects
+ *     the columns through SELECT aliases with the semantically-correct
+ *     names: `m.parent_skill_id AS deep_skill_id, m.deep_skill_id AS
+ *     option_id`. Downstream code reads the readable names.
+ *   - WHERE / JOIN clauses still use the physical names (m.parent_skill_id,
+ *     m.deep_skill_id) because aliases aren't allowed there in MySQL.
+ *   - Comments next to non-aliased usage explicitly mark "the field
+ *     named deep_skill_id actually holds option_id" to defuse the trap.
  */
+
+// ─── Case-insensitive resolvers (2026-06-10) ────────────────────────
+/*
+ * Lookup category/type/option by name (case- and whitespace-insensitive)
+ * before falling through to an INSERT. Prevents duplicate-by-casing
+ * rows like "Plumbing" / "plumbing" / "PLUMBING" that the previous
+ * always-create path produced.
+ *
+ * Returns `{ id, name, isNew }`. `isNew === false` means we reused an
+ * existing row; logged at info-level so ops can audit cleanup work.
+ * `runner` is either `pool` or a transaction connection — keeps these
+ * helpers reusable from both single-Add and bulk-upload paths.
+ */
+async function resolveCategoryByName(runner, name) {
+  const trimmed = String(name || '').trim();
+  if (!trimmed) throw Object.assign(new Error('category name required'), { status: 400 });
+  const [[row]] = await runner.query(
+    `SELECT service_catg_id, service_catg_name
+       FROM tbl_service_catg
+      WHERE LOWER(TRIM(service_catg_name)) = LOWER(TRIM(?))
+        AND service_catg_status <> 3
+      LIMIT 1`,
+    [trimmed],
+  );
+  if (row) {
+    logger.info(
+      `deep-skill: matched existing service_catg_id=${row.service_catg_id} for name="${trimmed}" (case-insensitive)`,
+    );
+    return { id: row.service_catg_id, name: row.service_catg_name, isNew: false };
+  }
+  const [ins] = await runner.query(
+    `INSERT INTO tbl_service_catg (service_catg_name, service_catg_status) VALUES (?, 1)`,
+    [trimmed],
+  );
+  return { id: ins.insertId, name: trimmed, isNew: true };
+}
+
+async function resolveServiceTypeByName(runner, categoryId, name) {
+  const trimmed = String(name || '').trim();
+  if (!trimmed) throw Object.assign(new Error('service type name required'), { status: 400 });
+  const [[row]] = await runner.query(
+    `SELECT service_type_id, service_type_name
+       FROM tbl_service_type
+      WHERE LOWER(TRIM(service_type_name)) = LOWER(TRIM(?))
+        AND service_catg_id = ?
+        AND service_type_status <> 3
+      LIMIT 1`,
+    [trimmed, categoryId],
+  );
+  if (row) {
+    logger.info(
+      `deep-skill: matched existing service_type_id=${row.service_type_id} for name="${trimmed}" (case-insensitive, catg=${categoryId})`,
+    );
+    return { id: row.service_type_id, name: row.service_type_name, isNew: false };
+  }
+  const [ins] = await runner.query(
+    `INSERT INTO tbl_service_type
+       (service_type_name, service_catg_id, display, service_type_status)
+     VALUES (?, ?, 1, 1)`,
+    [trimmed, categoryId],
+  );
+  return { id: ins.insertId, name: trimmed, isNew: true };
+}
+
+async function resolveSkillOptionByName(runner, deepskillId, name) {
+  const trimmed = String(name || '').trim();
+  if (!trimmed) throw Object.assign(new Error('skill option name required'), { status: 400 });
+  const [[row]] = await runner.query(
+    `SELECT id, skill_option, status
+       FROM tbl_deepskill_options
+      WHERE deepskill_id = ?
+        AND LOWER(TRIM(skill_option)) = LOWER(TRIM(?))
+      LIMIT 1`,
+    [deepskillId, trimmed],
+  );
+  if (row) {
+    logger.info(
+      `deep-skill: matched existing skill_option id=${row.id} for name="${trimmed}" (case-insensitive, skill=${deepskillId})`,
+    );
+    // Reactivate if it was soft-deleted.
+    if (Number(row.status) === 0) {
+      await runner.query(
+        'UPDATE tbl_deepskill_options SET status = 1 WHERE id = ?',
+        [row.id],
+      );
+    }
+    return { id: row.id, name: row.skill_option, isNew: false };
+  }
+  const [ins] = await runner.query(
+    'INSERT INTO tbl_deepskill_options (deepskill_id, skill_option, status) VALUES (?, ?, 1)',
+    [deepskillId, trimmed],
+  );
+  return { id: ins.insertId, name: trimmed, isNew: true };
+}
 
 // ─── Deep-skill CRUD ────────────────────────────────────────────────
 async function list({ categoryId, serviceTypeId, includeInactive = false } = {}) {
@@ -61,6 +192,24 @@ async function getById(deepskillId) {
 }
 
 async function create(input, actor) {
+  /*
+   * Case-insensitive resolution (2026-06-10). If the caller passes a
+   * `category_name` / `service_type_name` instead of (or in addition to)
+   * the numeric id, look up the existing row by name (case +
+   * whitespace insensitive) before creating a new one. Numeric ids
+   * still take precedence when both are provided. Prevents duplicate
+   * "Plumbing" / "plumbing" rows from the legacy always-create flow.
+   */
+  let categoryId    = input.category_id;
+  let serviceTypeId = input.service_type_id;
+  if (!categoryId && input.category_name) {
+    const cat = await resolveCategoryByName(pool, input.category_name);
+    categoryId = cat.id;
+  }
+  if (!serviceTypeId && input.service_type_name && categoryId) {
+    const typ = await resolveServiceTypeByName(pool, categoryId, input.service_type_name);
+    serviceTypeId = typ.id;
+  }
   const [ins] = await pool.query(`
     INSERT INTO tbl_deep_skill
       (category_id, service_type_id, deepskill_name, deepskill_description,
@@ -68,7 +217,7 @@ async function create(input, actor) {
        status, inserted_by, inserted_on, deepskill_image, skill_options)
     VALUES (?, ?, ?, ?, ?, 1, ?, NOW(), ?, '[]')
   `, [
-    input.category_id, input.service_type_id,
+    categoryId, serviceTypeId,
     input.deepskill_name, input.deepskill_description || null,
     // deepskill_tag_words (2026-06-06): per-skill technician-visit
     // tag(s), max ~2 short phrases per ops file Col B. Separate
@@ -81,11 +230,37 @@ async function create(input, actor) {
 }
 
 async function update(deepskillId, patch) {
+  /*
+   * Case-insensitive resolution mirrors create(): if the patch supplies
+   * a `category_name` / `service_type_name` (no id), resolve to an
+   * existing row first. Numeric ids in the patch still win.
+   */
+  const next = { ...patch };
+  if (next.category_id === undefined && next.category_name) {
+    const cat = await resolveCategoryByName(pool, next.category_name);
+    next.category_id = cat.id;
+  }
+  if (next.service_type_id === undefined && next.service_type_name) {
+    // Need a category to scope the type lookup — fall back to the
+    // current category on the row if the patch didn't change it.
+    let catId = next.category_id;
+    if (catId === undefined) {
+      const [[curr]] = await pool.query(
+        'SELECT category_id FROM tbl_deep_skill WHERE deepskill_id = ? LIMIT 1',
+        [deepskillId],
+      );
+      catId = curr?.category_id;
+    }
+    if (catId) {
+      const typ = await resolveServiceTypeByName(pool, catId, next.service_type_name);
+      next.service_type_id = typ.id;
+    }
+  }
   const MUTABLE = ['category_id', 'service_type_id', 'deepskill_name',
     'deepskill_description', 'deepskill_tag_words', 'deepskill_image', 'status'];
   const sets = []; const values = [];
   for (const col of MUTABLE) {
-    if (patch[col] !== undefined) { sets.push(`${col} = ?`); values.push(patch[col]); }
+    if (next[col] !== undefined) { sets.push(`${col} = ?`); values.push(next[col]); }
   }
   if (sets.length === 0) return getById(deepskillId);
   values.push(deepskillId);
@@ -117,12 +292,15 @@ async function syncSkillOptionsJson(deepskillId) {
 }
 
 async function addOption(deepskillId, { skill_option }) {
-  const [ins] = await pool.query(
-    'INSERT INTO tbl_deepskill_options (deepskill_id, skill_option, status) VALUES (?, ?, 1)',
-    [deepskillId, skill_option]
-  );
+  /*
+   * Case-insensitive reuse (2026-06-10) — if an option with the same
+   * name (case + whitespace insensitive) already exists for this skill,
+   * return its id instead of inserting a duplicate. Soft-deleted
+   * matches get reactivated so the chip reappears in the UI.
+   */
+  const resolved = await resolveSkillOptionByName(pool, deepskillId, skill_option);
   await syncSkillOptionsJson(deepskillId);
-  return { id: ins.insertId };
+  return { id: resolved.id };
 }
 
 async function updateOption(deepskillId, optionId, patch) {
@@ -241,9 +419,238 @@ async function mappedEasyfixerCounts(deepSkillIds) {
   return { rows };
 }
 
+// ─── XLSX Download (2026-06-10) ─────────────────────────────────────
+/*
+ * Build a populated workbook of every deep skill in the catalogue.
+ * Columns: Deep Skill ID, Name, Description, Tag Words, Service
+ * Category, Service Type, Skill Options (comma-joined active options),
+ * Image Filename (raw S3 key), Status, Created Date (IST).
+ *
+ * Returns a Buffer ready to stream as
+ * `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`.
+ */
+async function downloadXlsx() {
+  // One round-trip — GROUP_CONCAT keeps the option list inline so we
+  // don't N+1 the options table per skill. COALESCE ensures the field
+  // is at least an empty string for skills with no active options.
+  const [rows] = await pool.query(`
+    SELECT ds.deepskill_id,
+           ds.deepskill_name,
+           ds.deepskill_description,
+           ds.deepskill_tag_words,
+           ds.deepskill_image,
+           ds.status,
+           ds.inserted_on,
+           ds.category_id,
+           ds.service_type_id,
+           sc.service_catg_name AS category_name,
+           st.service_type_name,
+           COALESCE(
+             (SELECT GROUP_CONCAT(o.skill_option ORDER BY o.id SEPARATOR ', ')
+                FROM tbl_deepskill_options o
+               WHERE o.deepskill_id = ds.deepskill_id
+                 AND o.status = 1),
+             ''
+           ) AS skill_options_csv
+      FROM tbl_deep_skill ds
+      LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = ds.category_id
+      LEFT JOIN tbl_service_type st ON st.service_type_id = ds.service_type_id
+      ORDER BY ds.deepskill_id ASC
+  `);
+
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'EasyFix CRM';
+  wb.created = new Date();
+  const ws = wb.addWorksheet('Deep Skills');
+
+  /*
+   * Column order (2026-06-10): Service Category and Service Type each
+   * get their FK Id right next to the name so operators can map raw
+   * IDs back to display names without a lookup. Mirrors the format
+   * the Bulk Upload page now uses for "New Categories: Name (Id: X)".
+   */
+  ws.columns = [
+    { header: 'Deep Skill ID',         key: 'id',          width: 14 },
+    { header: 'Deep Skill Name',       key: 'name',        width: 36 },
+    { header: 'Description',           key: 'description', width: 50 },
+    { header: 'Tag Words',             key: 'tagWords',    width: 30 },
+    { header: 'Service Category Id',   key: 'categoryId',  width: 18 },
+    { header: 'Service Category',      key: 'category',    width: 24 },
+    { header: 'Service Type Id',       key: 'typeId',      width: 18 },
+    { header: 'Service Type',          key: 'type',        width: 24 },
+    { header: 'Skill Options',         key: 'options',     width: 40 },
+    { header: 'Image Filename',        key: 'image',       width: 40 },
+    { header: 'Status',                key: 'status',      width: 12 },
+    { header: 'Created Date',          key: 'created',     width: 22 },
+  ];
+  ws.getRow(1).font = { bold: true };
+
+  for (const r of rows) {
+    ws.addRow({
+      id:          r.deepskill_id,
+      name:        r.deepskill_name || '',
+      description: r.deepskill_description || '',
+      tagWords:    r.deepskill_tag_words || '',
+      categoryId:  r.category_id || '',
+      category:    r.category_name || '',
+      typeId:      r.service_type_id || '',
+      type:        r.service_type_name || '',
+      options:     r.skill_options_csv || '',
+      image:       r.deepskill_image || '',
+      status:      Number(r.status) ? 'Active' : 'Inactive',
+      // Format as IST `dd MMM yyyy HH:mm`. The DB stores DATETIME in
+      // server-local; toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
+      // gives us a stable IST rendering regardless of host TZ.
+      created:     r.inserted_on ? formatInsertedOnIST(r.inserted_on) : '',
+    });
+  }
+
+  return await wb.xlsx.writeBuffer();
+}
+
+function formatInsertedOnIST(value) {
+  try {
+    const d = value instanceof Date ? value : new Date(value);
+    if (Number.isNaN(d.getTime())) return '';
+    // dd MMM yyyy HH:mm — short month name to keep the column scannable.
+    const parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Kolkata',
+      day:    '2-digit',
+      month:  'short',
+      year:   'numeric',
+      hour:   '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).formatToParts(d);
+    const get = (t) => parts.find((p) => p.type === t)?.value || '';
+    return `${get('day')} ${get('month')} ${get('year')} ${get('hour')}:${get('minute')}`;
+  } catch {
+    return '';
+  }
+}
+
+// ─── Image replace + S3 cleanup (2026-06-10) ─────────────────────────
+/*
+ * Upload a new image to S3 at `Skills/Skill_<id>_<seq>`, persist the
+ * key on `tbl_deep_skill.deepskill_image`, and best-effort delete the
+ * previous S3 object. Returns `{ image, url }` where `url` is a
+ * short-TTL presigned URL the FE can render immediately.
+ */
+async function replaceImage(skillId, { buffer, contentType, originalName }) {
+  if (!s3Storage.isEnabled()) {
+    const err = new Error('S3 is not configured (set S3_BUCKET_NAME in backend.env)');
+    err.status = 503;
+    throw err;
+  }
+  const [[row]] = await pool.query(
+    'SELECT deepskill_image FROM tbl_deep_skill WHERE deepskill_id = ?',
+    [skillId],
+  );
+  if (!row) {
+    const err = new Error('deep skill not found');
+    err.status = 404;
+    throw err;
+  }
+  const prev = String(row.deepskill_image || '');
+  // Seq increments off the previous canonical key when present so old
+  // versions stay distinct in S3 (audit + accidental-delete recovery).
+  const match = prev.match(/^Skills\/Skill_\d+_(\d+)$/);
+  const seq = match ? Number(match[1]) + 1 : 1;
+
+  const Key = await s3Storage.putSkillImage({
+    skillId, seq, buffer, contentType, originalName,
+  });
+  await pool.query(
+    'UPDATE tbl_deep_skill SET deepskill_image = ? WHERE deepskill_id = ?',
+    [Key, skillId],
+  );
+
+  // Fire-and-forget cleanup of the prior object. Best-effort — a stale
+  // image in S3 is a cost annoyance, not a correctness issue, so we
+  // log and move on rather than failing the upload.
+  if (prev && prev !== Key && prev.startsWith('Skills/')) {
+    try {
+      const result = await s3Storage.deleteObject(prev);
+      if (!result.deleted) {
+        logger.warn(`deep-skill: previous image cleanup non-fatal: ${result.reason}`, { prev, reason: result.reason });
+      }
+    } catch (e) {
+      logger.warn({ err: e, prev }, 'deep-skill: previous image cleanup threw (non-fatal)');
+    }
+  }
+
+  let url = null;
+  try { url = await s3Storage.getPresignedUrl(Key); } catch { /* presign optional */ }
+  return { image: Key, url };
+}
+
+/*
+ * Clear the image: delete the S3 object (best-effort) and null out
+ * the DB column. No-op if the column is already empty.
+ */
+async function clearImage(skillId) {
+  const [[row]] = await pool.query(
+    'SELECT deepskill_image FROM tbl_deep_skill WHERE deepskill_id = ?',
+    [skillId],
+  );
+  if (!row) {
+    const err = new Error('deep skill not found');
+    err.status = 404;
+    throw err;
+  }
+  const prev = String(row.deepskill_image || '');
+  if (prev) {
+    await pool.query(
+      'UPDATE tbl_deep_skill SET deepskill_image = ? WHERE deepskill_id = ?',
+      ['', skillId],
+    );
+    if (s3Storage.isEnabled() && prev.startsWith('Skills/')) {
+      try { await s3Storage.deleteObject(prev); }
+      catch (e) { logger.warn({ err: e, prev }, 'deep-skill: clearImage S3 delete non-fatal'); }
+    }
+  }
+  return { image: '' };
+}
+
+/*
+ * Resolve a stored deep-skill image key to a short-TTL presigned GET
+ * URL. Returns null when the column is empty or S3 isn't enabled.
+ */
+async function getImageUrl(skillId) {
+  const [[row]] = await pool.query(
+    'SELECT deepskill_image FROM tbl_deep_skill WHERE deepskill_id = ?',
+    [skillId],
+  );
+  if (!row) {
+    const err = new Error('deep skill not found');
+    err.status = 404;
+    throw err;
+  }
+  const key = String(row.deepskill_image || '').trim();
+  if (!key) return { image: '', url: null };
+  if (!s3Storage.isEnabled() || !key.startsWith('Skills/')) {
+    return { image: key, url: null };
+  }
+  try {
+    const url = await s3Storage.getPresignedUrl(key);
+    return { image: key, url };
+  } catch (e) {
+    logger.warn({ err: e, key }, 'deep-skill: getImageUrl presign failed');
+    return { image: key, url: null };
+  }
+}
+
 module.exports = {
   list, getById, create, update, setStatus,
   addOption, updateOption, deleteOption,
   listMappedEasyfixers,
   mappedEasyfixerCounts,
+  // 2026-06-10:
+  downloadXlsx,
+  replaceImage,
+  clearImage,
+  getImageUrl,
+  resolveCategoryByName,
+  resolveServiceTypeByName,
+  resolveSkillOptionByName,
 };
