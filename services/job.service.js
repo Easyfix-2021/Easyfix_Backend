@@ -935,7 +935,27 @@ async function listForExport(opts = {}) {
        END                                            AS sda,
        erc.customer_rating,
        COALESCE(erc.review_comment, erc.comment)     AS customer_review,
-       NULL                                           AS total_charge,
+       /* Total Charge — mirrors legacy ACD_APIs JobServiceImpl
+          getAllJobsWithFiltersApplied (line 1786-1795). The legacy
+          billed value is:
+            SUM(job_services.total_charge × quantity)              ← services
+            + SUM(job_material.client_charge)                       ← materials
+          Sub-queries are correlated on j.job_id; each table has an
+          index on job_id (FK) so per-row cost stays cheap. COALESCE
+          turns "no services / no materials" rows into 0 rather than
+          NULL so the spreadsheet shows "0" instead of an empty cell.
+          The legacy further guards this on status IN (3, 5) — we
+          DON'T replicate that here so in-progress jobs show their
+          accrued billing too (more informative; tabular reports
+          typically want the value-so-far rather than just terminal). */
+       (
+         COALESCE((SELECT SUM(js.total_charge * js.quantity)
+                     FROM tbl_job_services js
+                    WHERE js.job_id = j.job_id), 0)
+         + COALESCE((SELECT SUM(jm.client_charge)
+                       FROM job_material jm
+                      WHERE jm.job_id = j.job_id), 0)
+       )                                              AS total_charge,
        NULL                                           AS mode_of_payment
      FROM tbl_job j
      LEFT JOIN tbl_customer  cu ON cu.customer_id = j.fk_customer_id
