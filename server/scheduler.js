@@ -239,13 +239,22 @@ Note: this task only runs if the property "magic.link.cron.enabled" is set to "t
     logger.info('Magic-link cron registered (magic.link.cron.enabled=true).');
   }
 
-  // ─── Easyfixer Profile-Completion Reminder — daily at 10:00 IST ───
-  // Added 2026-06-06 per ops. Finds every ACTIVE easyfixer with an
-  // incomplete profile (efr_profile_perc < 100 OR final_submission != 1)
-  // and sends them a WhatsApp nudge via the Gallabox template
-  // `complete_profile_easyfixer`. No gating property — runs daily on
-  // every env where CRON_DISABLED isn't set. Per-send errors are
-  // logged + counted but don't abort the loop.
+  // ─── Easyfixer Profile-Completion Reminder — Wed + Sat at 19:00 IST ───
+  // Added 2026-06-06 per ops. Finds every ACTIVE + IN-PROGRESS easyfixer
+  // (efr_status = 1, INCLUDES technicians whose verification is mid-flow)
+  // with an incomplete profile (efr_profile_perc < 100 OR
+  // final_submission != 1) and sends them a WhatsApp nudge via the
+  // Gallabox template `complete_profile_easyfixer`.
+  //
+  // 2026-06-11 schedule change: was daily at 10:00 IST, now
+  // Wed + Sat at 19:00 IST (cron `0 19 * * 3,6`). Twice-weekly cadence
+  // avoids fatigue; 19:00 catches technicians at end-of-day when they're
+  // winding down + checking phones (vs. busy with jobs during the day).
+  // Plus the existing 7-day per-tech cooldown means even within the
+  // twice-weekly window each tech gets at most one nudge per week.
+  //
+  // Property gate `easyfixer.profile_reminder.enabled` must be 'true' for
+  // autonomous firing. Per-send errors logged + counted, never abort the loop.
   const profileReminderCron = require('../services/easyfixer-profile-reminder-cron');
   const profileReminderJob = registerJob({
     id: 'easyfixer-profile-reminder',
@@ -254,8 +263,8 @@ Note: this task only runs if the property "magic.link.cron.enabled" is set to "t
 `What this task does: Every active easyfixer (technician) in our system is expected to fill out their full profile — name, contact info, service categories they cover, documents (Aadhaar, PAN, photo), etc. When their profile is incomplete, the auto-assignment engine struggles to pick them for jobs, and ops can't verify them. This task gives those technicians a friendly daily nudge over WhatsApp.
 
 Here's how it works, step by step:
-  1. Every day at 10:00 AM IST, the task wakes up automatically.
-  2. It looks at every technician in our database whose account is ACTIVE.
+  1. Every Wednesday and Saturday at 7:00 PM IST, the task wakes up automatically. Twice-weekly cadence catches technicians at end-of-day attention while avoiding daily-nudge fatigue.
+  2. It looks at every technician in our database whose account is ACTIVE OR whose registration is still in progress. Both groups need the nudge — the former to finalize their submission, the latter to actually finish registration.
   3. From those, it picks only the ones whose profile is INCOMPLETE — meaning their profile completion percentage is below 100, OR they haven't yet pressed the "Final Submission" button (which signals "I'm done filling things in").
   4. It also filters out anyone without a valid mobile number on file — there's no point sending a WhatsApp message if we don't know where to send it.
   5. For each remaining technician, it asks Gallabox (our WhatsApp messaging provider) to send them a pre-approved template message called "complete_profile_easyfixer". The template is a generic, friendly nudge: "Please complete your EasyFix profile to get assigned to jobs."
@@ -266,7 +275,7 @@ Why this matters: technicians often get distracted mid-signup and never finish t
 Note: this task DOES have a per-technician 7-day cooldown — once we send a profile-update WhatsApp (from any source: this cron, the skill+pincode cron, or a manual operator "Send Profile Update Link" action), we don't nudge that technician again for 7 days. Prevents nudge fatigue.
 
 This task only runs automatically if the property "easyfixer.profile_reminder.enabled" is set to "true" in easyfix_properties. If unset or "false", the schedule is OFF — but Trigger Now still works for manual sweeps. Trigger Now is useful if ops just imported a batch of new technicians and wants to send the first wave of nudges immediately rather than waiting for tomorrow's 10am tick.`,
-    cron: '0 10 * * *',
+    cron: '0 19 * * 3,6',
     runner: async () => {
       const result = await profileReminderCron.runDailyReminder();
       logger.info(
