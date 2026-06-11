@@ -1,9 +1,14 @@
 const router = require('express').Router();
 const ExcelJS = require('exceljs');
+const Joi = require('joi');
 
 const validate = require('../../middleware/validate');
 const easyfixer = require('../../services/easyfixer.service');
 const verification = require('../../services/easyfixer-verification.service');
+const profileUpdateLink = require('../../services/easyfixer-profile-update-link.service');
+const { signEasyfixerProfileToken } = require('../../utils/jwt');
+const requireAction = require('../../middleware/require-action');
+const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
 const {
   listQuery, createBody, updateBody, statusBody, idParam, listSubresourceQuery, efrIdsBody,
@@ -12,6 +17,34 @@ const {
   optionMappingsBody, serviceablePincodesBody,
 } = require('../../validators/easyfixer.validator');
 const { buildRequestScope, assertEntityInScope } = require('../../lib/scope');
+
+// Local Joi schema for the profile-update-link send action. Mirrors
+// the `sendBody` shape used by routes/admin/job-magic-link.js so the
+// FE can reuse the same client-side helper across both flows.
+//
+// `override_mobile` (2026-06-10): non-prod-only operator override of the
+// WhatsApp destination, used by the CRM "Send To" confirmation dialog
+// so QA / staging testers can ping their own number without hitting the
+// real technician. The custom `production-block` rule rejects the field
+// outright in production (NODE_ENV === 'production') so a tampered FE
+// payload can never bypass the masked-mobile UX. In non-prod it just
+// enforces the digit-format pattern.
+const profileUpdateSendBody = Joi.object({
+  action: Joi.string().valid('first', 'reminder', 'resend').default('first'),
+  override_mobile: Joi.string()
+    .pattern(/^\d{10,15}$/)
+    .optional()
+    .custom((value, helpers) => {
+      if (process.env.NODE_ENV === 'production') {
+        return helpers.error('any.invalid');
+      }
+      return value;
+    }, 'production-block')
+    .messages({
+      'any.invalid': 'override_mobile is not allowed in production',
+      'string.pattern.base': 'override_mobile must be 10-15 digits',
+    }),
+});
 
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
   try {
@@ -89,9 +122,25 @@ const EXPORT_COLUMNS = [
   { header: 'DeepSkills Mapped',      key: 'options_mapped_count',         width: 15 },
   { header: 'Serviceable Pincodes',   key: 'serviceable_pincodes_csv',     width: 40 },
   { header: 'Avg Rating',             key: 'avg_rating',                   width: 12 },
+  { header: 'Last Link Sent',         key: 'profile_update_sent_at',       width: 22 },
+  { header: 'Profile Link Send Count',key: 'profile_update_send_count',    width: 18 },
   { header: 'Profile Activated On',   key: 'profile_activation_date_time', width: 22 },
   { header: 'Status',                 key: 'efr_status',                   width: 10 },
 ];
+
+/*
+ * Format a DATETIME / Date value for XLSX export. Aggregates() returns
+ * `profile_update_sent_at` as a Date object (mysql2 default) or raw string;
+ * either way we render an ISO-like "YYYY-MM-DD HH:mm" so operators can sort
+ * lexicographically inside the sheet. Null → "—".
+ */
+function formatDateTimeForXlsx(v) {
+  if (v == null) return '—';
+  const d = v instanceof Date ? v : new Date(v);
+  if (Number.isNaN(d.getTime())) return '—';
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
 
 router.get('/download', validate(listQuery, 'query'), async (req, res, next) => {
   try {
@@ -136,6 +185,10 @@ router.get('/download', validate(listQuery, 'query'), async (req, res, next) => 
         ...att,
         is_technician_verified: r.is_technician_verified ? 'Yes' : 'No',
         efr_status: r.efr_status === 1 ? 'Active' : 'Inactive',
+        // Format the magic-link timestamp inline — agg.profile_update_sent_at
+        // is a Date | string | null per mysql2's DATETIME handling.
+        profile_update_sent_at: formatDateTimeForXlsx(agg.profile_update_sent_at),
+        profile_update_send_count: agg.profile_update_send_count ?? 0,
       });
     }
 
@@ -400,6 +453,112 @@ router.post('/:id/verification/bgv-report',
       const data = await verification.saveBgvReport(req.params.id, req.body, req.user);
       modernOk(res, data, 'BGV report saved');
     } catch (e) { next(e); }
+  });
+
+// ─── Profile Update Magic-Link send ─────────────────────────────────
+// Operator-triggered WhatsApp send of the public profile-update self-serve
+// link. Gated by:
+//   • the standard scope guard (easyfixer row must be in the caller's city
+//     scope — 404 on miss to avoid leaking out-of-scope existence)
+//   • the `isProfileUpdateLinkSend` action permission (seeded by
+//     migrations/2026-06-11-easyfixer-profile-update-magic-link.sql; granted
+//     to Admin (2), Executive Supply (3), Call Flow + Quality (11))
+// The send + audit logic lives in
+// services/easyfixer-profile-update-link.service.js to keep this route
+// thin — same split pattern as the customer magic-link admin route at
+// routes/admin/job-magic-link.js.
+router.post('/:id/profile-update-link/send',
+  validate(idParam, 'params'),
+  validate(profileUpdateSendBody, 'body'),
+  requireAction('isProfileUpdateLinkSend'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndAuthorize(req, res))) return;
+      const result = await profileUpdateLink.sendForEasyfixer(
+        Number(req.params.id),
+        req.body,
+        req.user,
+        pool,
+      );
+      modernOk(res, result, 'Profile update link sent on WhatsApp');
+    } catch (e) {
+      if (e && typeof e.status === 'number') {
+        return modernError(res, e.status, e.message || 'request failed');
+      }
+      next(e);
+    }
+  });
+
+/*
+ * Dev-only sibling of /profile-update-link/send (2026-06-11). Mints the
+ * SAME JWT + URL the WhatsApp path would generate but returns it in the
+ * response instead of dispatching a message. Lets engineers copy-paste
+ * the link straight from a curl response (or DevTools Network panel)
+ * during local development — no WhatsApp template approval, no number-
+ * provisioning, no log-scraping for shortUrls.
+ *
+ * Hard-gated behind `NODE_ENV !== 'production'`. In prod the route
+ * returns 404 to avoid leaking the existence of the endpoint, matching
+ * the "production should look like the endpoint doesn't exist at all"
+ * convention used elsewhere in this codebase. The 404 fires BEFORE Joi
+ * validation + scope guard + permission check, so the prod surface
+ * really is identical to "no such route" — same status code, same
+ * response shape.
+ *
+ * In non-prod, the standard ladder still applies:
+ *   • idParam Joi validation (`:id` must be a positive integer)
+ *   • entity-scope guard (out-of-scope efr → 404, consistent with send)
+ *   • isProfileUpdateLinkSend permission (the same gate as send, so a
+ *     dev tester who can't trigger sends can't bypass that via this
+ *     shortcut)
+ *
+ * Returns the URL deterministically — no shortener call (skipped to
+ * keep the route synchronous + cheap for dev iteration; the long URL
+ * works identically in a browser).
+ */
+router.get('/:id/profile-update-link/dev-url',
+  /*
+   * Dev gate (2026-06-11). The route is open when EITHER:
+   *   • NODE_ENV is not 'production' (the default dev/test path), OR
+   *   • ENABLE_DEV__PROFILE_URL=true is set (explicit opt-in for ops
+   *     who need the affordance on a prod-flagged BE — e.g. a staging
+   *     deployment that runs with NODE_ENV=production for parity
+   *     testing, or a locally-run BE where NODE_ENV gets accidentally
+   *     inlined as 'production' by npm start).
+   *
+   * Default-closed in true production: leaving both signals at their
+   * defaults (NODE_ENV=production, no ENABLE_DEV__PROFILE_URL or it
+   * set to 'false') preserves the "endpoint doesn't exist" surface.
+   * Operators have to explicitly opt-in to expose the dev URL.
+   *
+   * 2026-06-11 rename: ENABLE_DEV_URL → ENABLE_DEV__PROFILE_URL for a
+   * more specific name; old check accepted '1', new check accepts the
+   * literal string 'true' so the env file reads as a clear boolean.
+   */
+  (req, res, next) => {
+    const isProd = process.env.NODE_ENV === 'production';
+    const explicitlyEnabled = String(process.env.ENABLE_DEV__PROFILE_URL || '').toLowerCase() === 'true';
+    if (isProd && !explicitlyEnabled) {
+      return modernError(res, 404, 'Not Found');
+    }
+    next();
+  },
+  validate(idParam, 'params'),
+  requireAction('isProfileUpdateLinkSend'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndAuthorize(req, res))) return;
+      const efrId = Number(req.params.id);
+      const token = signEasyfixerProfileToken(efrId);
+      const base = (process.env.CRM_PUBLIC_BASE_URL || 'http://localhost:5180').replace(/\/$/, '');
+      const url = `${base}/profile-update/${token}`;
+      modernOk(res, { efrId, token, url }, 'Dev profile-update link minted (no WhatsApp send)');
+    } catch (e) {
+      if (e && typeof e.status === 'number') {
+        return modernError(res, e.status, e.message || 'request failed');
+      }
+      next(e);
+    }
   });
 
 module.exports = router;

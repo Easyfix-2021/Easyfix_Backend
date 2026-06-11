@@ -172,7 +172,12 @@ async function list({ categoryId, serviceTypeId, includeInactive = false } = {})
       ${where}
       ORDER BY ds.deepskill_name ASC
   `, params);
-  return rows;
+  // Fan out presigner calls for non-empty image keys. Promise.all keeps
+  // latency O(1) for the typical batch size (<=500 skills per category).
+  const urls = await Promise.all(
+    rows.map((r) => resolveImageUrlFromKey(r.deepskill_image)),
+  );
+  return rows.map((r, i) => ({ ...r, deep_skill_image_url: urls[i] }));
 }
 
 async function getById(deepskillId) {
@@ -210,23 +215,89 @@ async function create(input, actor) {
     const typ = await resolveServiceTypeByName(pool, categoryId, input.service_type_name);
     serviceTypeId = typ.id;
   }
-  const [ins] = await pool.query(`
-    INSERT INTO tbl_deep_skill
-      (category_id, service_type_id, deepskill_name, deepskill_description,
-       deepskill_tag_words,
-       status, inserted_by, inserted_on, deepskill_image, skill_options)
-    VALUES (?, ?, ?, ?, ?, 1, ?, NOW(), ?, '[]')
-  `, [
-    categoryId, serviceTypeId,
-    input.deepskill_name, input.deepskill_description || null,
-    // deepskill_tag_words (2026-06-06): per-skill technician-visit
-    // tag(s), max ~2 short phrases per ops file Col B. Separate
-    // semantic from the keyword search string in deepskill_description.
-    input.deepskill_tag_words || null,
-    actor?.user_id || null,
-    input.deepskill_image || '',
-  ]);
-  return getById(ins.insertId);
+
+  /*
+   * Mandatory options (2026-06-11). Joi guarantees the array exists +
+   * has at least one item, but we still de-duplicate by case-insensitive
+   * trimmed name here so the operator can paste ["Foo", "foo", " Foo "]
+   * and get one row, matching the legacy resolveSkillOptionByName
+   * semantics used by the add-after-create flow.
+   */
+  const rawOptions = Array.isArray(input.options) ? input.options : [];
+  const seen = new Set();
+  const optionNames = [];
+  for (const o of rawOptions) {
+    const trimmed = String(o?.skill_option || '').trim();
+    if (!trimmed) continue;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    optionNames.push(trimmed);
+  }
+  if (optionNames.length === 0) {
+    // Should never reach here (Joi enforces min(1)) but defend in depth.
+    const e = new Error('At least one Deep Skill option is required');
+    e.status = 400;
+    throw e;
+  }
+
+  /*
+   * Transactional create (CLAUDE.md §2.5: multi-step writes use
+   * beginTransaction). If any option fails to insert we roll back the
+   * deep-skill row too, so the catalog never has a half-built entry.
+   * skill_options JSON denormalisation runs AFTER commit because the
+   * sync helper uses the pool directly — keeping it out of the
+   * transaction avoids hold-lock-during-second-pool-call deadlocks.
+   */
+  const conn = await pool.getConnection();
+  let deepSkillId;
+  try {
+    await conn.beginTransaction();
+    const [ins] = await conn.query(`
+      INSERT INTO tbl_deep_skill
+        (category_id, service_type_id, deepskill_name, deepskill_description,
+         deepskill_tag_words,
+         status, inserted_by, inserted_on, deepskill_image, skill_options)
+      VALUES (?, ?, ?, ?, ?, 1, ?, NOW(), ?, '[]')
+    `, [
+      categoryId, serviceTypeId,
+      input.deepskill_name, input.deepskill_description || null,
+      // deepskill_tag_words (2026-06-06): per-skill technician-visit
+      // tag(s), max ~2 short phrases per ops file Col B. Separate
+      // semantic from the keyword search string in deepskill_description.
+      input.deepskill_tag_words || null,
+      actor?.user_id || null,
+      input.deepskill_image || '',
+    ]);
+    deepSkillId = ins.insertId;
+
+    // Bulk-insert the options on the same connection. One round-trip.
+    const placeholders = optionNames.map(() => '(?, ?, 1)').join(', ');
+    const params = [];
+    for (const name of optionNames) {
+      params.push(deepSkillId, name);
+    }
+    await conn.query(
+      `INSERT INTO tbl_deepskill_options (deepskill_id, skill_option, status)
+       VALUES ${placeholders}`,
+      params,
+    );
+
+    await conn.commit();
+  } catch (e) {
+    try { await conn.rollback(); } catch (_) { /* swallow rollback failure */ }
+    throw e;
+  } finally {
+    conn.release();
+  }
+
+  // Sync the legacy denormalised JSON blob on tbl_deep_skill.skill_options
+  // (post-commit so a sync failure doesn't leave the row uncreated).
+  await syncSkillOptionsJson(deepSkillId).catch((err) => {
+    logger.warn({ err, deepSkillId }, 'deep-skill: syncSkillOptionsJson failed post-create (non-fatal)');
+  });
+
+  return getById(deepSkillId);
 }
 
 async function update(deepskillId, patch) {
@@ -613,8 +684,40 @@ async function clearImage(skillId) {
 }
 
 /*
+ * Resolve an in-memory S3 key (as stored in tbl_deep_skill.deepskill_image)
+ * to a short-TTL presigned GET URL. Returns null for empty / non-canonical
+ * keys or when S3 isn't enabled — callers should render a fallback in
+ * that case. Mirrors the guards used by getImageUrl() so all catalog
+ * paths agree on what counts as a resolvable key.
+ *
+ * Use this whenever you already hold the key (catalog/list/options
+ * builders) — avoids the extra round-trip getImageUrl() does to refetch
+ * the row by deepskill_id.
+ */
+async function resolveImageUrlFromKey(key) {
+  const trimmed = String(key || '').trim();
+  if (!trimmed) return null;
+  if (!s3Storage.isEnabled() || !trimmed.startsWith('Skills/')) return null;
+  try {
+    return await s3Storage.getPresignedUrl(trimmed);
+  } catch (e) {
+    logger.warn({ err: e, key: trimmed }, 'deep-skill: resolveImageUrlFromKey presign failed');
+    return null;
+  }
+}
+
+/*
  * Resolve a stored deep-skill image key to a short-TTL presigned GET
  * URL. Returns null when the column is empty or S3 isn't enabled.
+ *
+ * 2026-06-11 refactor: the per-key null-/prefix-/S3-disabled-/presign-
+ * error guards are now centralised in `resolveImageUrlFromKey()` above.
+ * This function keeps its existing wrapper responsibilities:
+ *   1. Look up the skill row by id (404 if missing).
+ *   2. Surface BOTH the raw `image` key AND the resolved `url` so the
+ *      FE editor's "current image" preview + "Replace…"/"Clear" actions
+ *      can reference the key directly.
+ * Single source of truth for presign logic; no more divergent copies.
  */
 async function getImageUrl(skillId) {
   const [[row]] = await pool.query(
@@ -627,17 +730,8 @@ async function getImageUrl(skillId) {
     throw err;
   }
   const key = String(row.deepskill_image || '').trim();
-  if (!key) return { image: '', url: null };
-  if (!s3Storage.isEnabled() || !key.startsWith('Skills/')) {
-    return { image: key, url: null };
-  }
-  try {
-    const url = await s3Storage.getPresignedUrl(key);
-    return { image: key, url };
-  } catch (e) {
-    logger.warn({ err: e, key }, 'deep-skill: getImageUrl presign failed');
-    return { image: key, url: null };
-  }
+  const url = await resolveImageUrlFromKey(key);
+  return { image: key, url };
 }
 
 module.exports = {
@@ -650,6 +744,7 @@ module.exports = {
   replaceImage,
   clearImage,
   getImageUrl,
+  resolveImageUrlFromKey,
   resolveCategoryByName,
   resolveServiceTypeByName,
   resolveSkillOptionByName,

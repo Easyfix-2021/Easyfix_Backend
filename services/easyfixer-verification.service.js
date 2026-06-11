@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const deepSkillService = require('./deep-skill.service');
 
 /*
  * Easyfixer Verification — service backing the "Self-Registration
@@ -633,6 +634,7 @@ async function listOptionMappings(efrId) {
             st.service_type_name        AS service_type_name,
             m.parent_skill_id           AS deep_skill_id, -- physical column m.parent_skill_id holds the deep_skill_id
             ds.deepskill_name           AS deep_skill_name,
+            ds.deepskill_image          AS deep_skill_image,
             m.deep_skill_id             AS option_id,     -- physical column m.deep_skill_id holds the option id
             o.skill_option              AS option_name
        FROM tbl_efr_deepskill_mapping m
@@ -644,7 +646,30 @@ async function listOptionMappings(efrId) {
       ORDER BY sc.service_catg_name, st.service_type_name, ds.deepskill_name, o.skill_option`,
     [efrId]
   );
-  return rows;
+  // Resolve image keys once per distinct deep_skill_id — option rows for
+  // the same skill share the URL. Skips empty keys so we only presign for
+  // skills that actually have an image.
+  const urlByDeepSkillId = new Map();
+  const distinctSkills = [];
+  for (const r of rows) {
+    const id = r.deep_skill_id;
+    if (id == null || urlByDeepSkillId.has(id)) continue;
+    const key = String(r.deep_skill_image || '').trim();
+    if (!key) { urlByDeepSkillId.set(id, null); continue; }
+    distinctSkills.push({ id, key });
+    urlByDeepSkillId.set(id, null); // placeholder; overwritten below
+  }
+  const resolved = await Promise.all(
+    distinctSkills.map((s) => deepSkillService.resolveImageUrlFromKey(s.key)),
+  );
+  for (let i = 0; i < distinctSkills.length; i += 1) {
+    urlByDeepSkillId.set(distinctSkills[i].id, resolved[i]);
+  }
+  return rows.map((r) => {
+    const { deep_skill_image, ...rest } = r; // drop raw key from response
+    void deep_skill_image;
+    return { ...rest, deep_skill_image_url: urlByDeepSkillId.get(r.deep_skill_id) || null };
+  });
 }
 
 async function replaceOptionMappings(efrId, items, actor) {

@@ -645,7 +645,20 @@ async function aggregates(efrIds, { scope } = {}) {
        COALESCE(earn.job_count, 0)            AS job_count,
        ROUND(rt.rating, 2)                    AS avg_rating,
        COALESCE(optmap.options_mapped_count, 0) AS options_mapped_count,
-       COALESCE(sp.pincodes, '')              AS serviceable_pincodes_csv
+       COALESCE(sp.pincodes, '')              AS serviceable_pincodes_csv,
+       /*
+        * Profile-update magic-link audit columns (2026-06-11). Added by
+        * migrations/2026-06-11-easyfixer-profile-update-magic-link.sql
+        * directly on tbl_easyfixer -- no JOIN needed. profile_update_sent_at
+        * is nullable (never sent -> NULL); profile_update_send_count
+        * defaults to 0 NOT NULL. Surfaces "Last Link Sent" column on the
+        * Manage Easyfixers list so operators see who has been pinged and
+        * how many times. (No backticks in this comment -- inside a JS
+        * template literal they close the string early; see LIST_COLUMNS
+        * comment block at the top of this file for context.)
+        */
+       e.profile_update_sent_at                AS profile_update_sent_at,
+       COALESCE(e.profile_update_send_count, 0) AS profile_update_send_count
      FROM tbl_easyfixer e
      LEFT JOIN (
        SELECT easyfixer_id, COUNT(DISTINCT client_id) AS clients_mapped

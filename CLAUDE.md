@@ -23,6 +23,18 @@ Unified Node.js/Express backend. Replaces 5 legacy services: CRM, Dropwizard :80
 - Joi for validation, custom human-readable logger (see `logger.js` + `middleware/http-log.js`)
 - Shared DB: `easyfix_core` on port 3306 — **never alter schema, never add tables** (the rule protects the five legacy services that share the DB; an EasyFix-owned new table no legacy service references is an explicit exception, e.g. `tbl_pincode` from `migrations/2026-05-01-create-tbl-pincode.sql` for the generic Manage Pincodes feature, distinct from firefox-client `pincode_firefox_city_mapping`).
 
+## Important — EasyFix is a standalone product
+
+EasyFix is NOT part of the 1Office portfolio. Any references in shared
+infrastructure docs, naming conventions, or sample env-var lists that
+group EasyFix with 1Office services are coincidental — the codebases
+do not share auth, do not share databases, and do not share deployment
+pipelines beyond what happens to use the same provider accounts. When
+in doubt, treat EasyFix as fully independent: no Suite SSO, no
+`{SUITE_URL}/api/auth/validate-token` calls, no `{project_slug}_auth_token`
+localStorage convention. EasyFix has its own auth (OTP-based JWT
+issued by this backend) and its own DB (`easyfix_core` MySQL).
+
 ## Route groups and their response contracts
 
 Two response shapes exist. Never mix. See `utils/response.js`.
@@ -30,12 +42,29 @@ Two response shapes exist. Never mix. See `utils/response.js`.
 | Route group | Mount | Auth | Response formatter |
 |---|---|---|---|
 | `/api/auth/*`       | public | varies | **modern** `{success, data, error}` |
+| `/api/public/*`     | **truly unauthenticated** — no JWT, no Basic, accessible from any browser / app / external system | none | modern |
 | `/api/admin/*`      | CRM staff | JWT | modern |
 | `/api/client/*`     | client SPOC | JWT | modern |
 | `/api/mobile/*`     | technician | JWT | modern |
 | `/api/shared/*`     | all authed | JWT | modern |
 | `/api/webhook/*`    | internal | API key | modern |
 | `/api/integration/v1/*` | external (Decathlon etc.) | **HTTP Basic** | **legacy** `{status:"200", message, data}` |
+
+### `/api/shared/*` token contract
+
+`/api/shared/*` accepts ANY JWT signed by this backend — admin, client, or
+mobile group all work. The token is verified against `process.env.JWT_SECRET`
+(NOT the legacy Java CRM secret `"esyfixsecret"`), so:
+
+- ✅ New EasyFix_Backend admin / client / mobile bearers work
+- ❌ Legacy Java `EasyFix_CRM` bearers do NOT work (different signing secret)
+- ❌ Legacy Client Dashboard / Legacy Mobile bearers do NOT work (same reason)
+
+For surfaces where ANY user (including legacy systems + open browsers)
+should be able to read non-sensitive data — e.g. deep-skill thumbnails
+referenced from skill-picker components in legacy UIs — use `/api/public/*`
+instead. That route group is truly unauthenticated and produces the same
+short-TTL presigned URLs that `/api/shared/*` does.
 
 ## THE NO-CLIENT-CHANGE RULE (integration routes)
 

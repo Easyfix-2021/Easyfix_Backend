@@ -6,6 +6,17 @@ const dsBulk = require('../../services/deep-skill-bulk.service');
 const { modernOk, modernError } = require('../../utils/response');
 const multer = require('multer');
 const logger = require('../../logger');
+/*
+ * Deep-skill catalog cache invalidation (2026-06-11). The public
+ * profile-update form bundles the full tree into its prefill response
+ * and caches it for 5 minutes (see services/easyfixer-profile-update-link.service.js).
+ * Any mutation here — create / update / soft-delete a skill, add /
+ * update / delete an option, bulk-upload — needs to drop that cache
+ * so the next prefill build picks up the change. Image-only mutations
+ * (upload-image / image-url / clear-image) DON'T trigger this because
+ * the tree shape is unchanged; image is a separate FE concern.
+ */
+const { invalidateCatalogCaches } = require('../../services/easyfixer-profile-update-link.service');
 
 /*
  * Image upload (2026-06-05).
@@ -76,6 +87,29 @@ const createBody = Joi.object({
   // technician-visit tags (max ~2 short phrases per ops convention).
   deepskill_tag_words:    Joi.string().max(255).allow('', null).optional(),
   deepskill_image:        Joi.string().max(500).allow('', null).optional(),
+  /*
+   * options (2026-06-11): mandatory at creation time. The public
+   * profile-update form's prefill catalog prunes deep-skills that
+   * have zero active options (they'd render as empty leaves in the
+   * picker), so creating a skill without an option means the skill
+   * silently doesn't appear in the public form. Requiring at least
+   * one option here closes that gap at the point of creation rather
+   * than letting operators add a skill that's invisible to its
+   * intended consumers.
+   *
+   * Duplicates (case-insensitive) in the input array are tolerated
+   * — the service layer de-duplicates before inserting. Empty
+   * strings are rejected by Joi `min(1)` on the option string.
+   */
+  options: Joi.array()
+    .items(Joi.object({ skill_option: Joi.string().min(1).max(500).required() }))
+    .min(1)
+    .required()
+    .messages({
+      'array.min':      'At least one Deep Skill option is required',
+      'any.required':   'At least one Deep Skill option is required',
+      'array.base':     'options must be an array of objects with a skill_option string',
+    }),
 });
 const updateBody = Joi.object({
   category_id:            Joi.number().integer().optional(),
@@ -210,32 +244,53 @@ router.post('/mapped-easyfixer-counts',
 router.post('/', validate(createBody), async (req, res, next) => {
   try {
     const created = await ds.create(req.body, req.user);
+    invalidateCatalogCaches();
     res.status(201);
     modernOk(res, created, 'deep skill created');
   } catch (e) { next(e); }
 });
 
 router.patch('/:id', validate(idParam, 'params'), validate(updateBody), async (req, res, next) => {
-  try { modernOk(res, await ds.update(req.params.id, req.body), 'deep skill updated'); } catch (e) { next(e); }
+  try {
+    const updated = await ds.update(req.params.id, req.body);
+    invalidateCatalogCaches();
+    modernOk(res, updated, 'deep skill updated');
+  } catch (e) { next(e); }
 });
 
 // Soft-delete / deactivate — we never hard-delete because tbl_efr_deepskill_mapping
 // holds FKs back to deepskill_id for every technician who ever had this skill.
 router.delete('/:id', validate(idParam, 'params'), async (req, res, next) => {
-  try { modernOk(res, await ds.setStatus(req.params.id, false), 'deep skill deactivated'); } catch (e) { next(e); }
+  try {
+    const result = await ds.setStatus(req.params.id, false);
+    invalidateCatalogCaches();
+    modernOk(res, result, 'deep skill deactivated');
+  } catch (e) { next(e); }
 });
 
 // ─── Options (nested under a deep skill) ────────────────────────────
 router.post('/:id/options', validate(idParam, 'params'), validate(optionBody), async (req, res, next) => {
-  try { modernOk(res, await ds.addOption(req.params.id, req.body), 'option added'); } catch (e) { next(e); }
+  try {
+    const added = await ds.addOption(req.params.id, req.body);
+    invalidateCatalogCaches();
+    modernOk(res, added, 'option added');
+  } catch (e) { next(e); }
 });
 
 router.patch('/:id/options/:optionId', validate(optIdParam, 'params'), validate(optionPatchBody), async (req, res, next) => {
-  try { modernOk(res, await ds.updateOption(req.params.id, req.params.optionId, req.body), 'option updated'); } catch (e) { next(e); }
+  try {
+    const updated = await ds.updateOption(req.params.id, req.params.optionId, req.body);
+    invalidateCatalogCaches();
+    modernOk(res, updated, 'option updated');
+  } catch (e) { next(e); }
 });
 
 router.delete('/:id/options/:optionId', validate(optIdParam, 'params'), async (req, res, next) => {
-  try { modernOk(res, await ds.deleteOption(req.params.id, req.params.optionId), 'option removed'); } catch (e) { next(e); }
+  try {
+    const removed = await ds.deleteOption(req.params.id, req.params.optionId);
+    invalidateCatalogCaches();
+    modernOk(res, removed, 'option removed');
+  } catch (e) { next(e); }
 });
 
 /*
@@ -397,6 +452,9 @@ router.post(
         commit,
         actor: req.user,
       });
+      // Only commit writes to the catalog — dry-runs leave the tree
+      // untouched and don't need to drop the prefill cache.
+      if (commit) invalidateCatalogCaches();
       return modernOk(res, result,
         commit ? 'deep skills bulk-uploaded' : 'deep skills preview generated');
     } catch (e) {

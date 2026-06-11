@@ -22,10 +22,24 @@
 const router = require('express').Router();
 
 router.use('/job-completion', require('./job-completion'));
+// Easyfixer-facing profile-update magic-link surface. Token lives in the
+// query string (?token=…) rather than the URL path because the FE keeps the
+// path stable (/profile-update/<jwt>) and proxies the JWT through to the BE
+// as a query param — keeps URL shapes consistent with the customer
+// job-completion flow's prefill+save POSTs.
+router.use('/easyfixer-profile-update', require('./easyfixer-profile-update'));
 router.use('/maps', require('./maps'));
 // JSON resolver for the URL shortener. Reached at /api/public/book/:code
 // via the frontend's /api/* proxy — the customer-facing /book/<code>
 // short link lives on the Next.js origin and resolves through here.
 router.use('/book', require('./url-resolve'));
+/*
+ * Public deep-skill image resolver (2026-06-11). UNAUTHENTICATED — exposes
+ * presigned URLs to deep-skill thumbnails so legacy Java CRM / Client
+ * Dashboard / Mobile app (none of which carry modern EasyFix JWTs) can
+ * render the same skill images the new CRM does. Non-sensitive data;
+ * see routes/public/deep-skills.js for the security rationale.
+ */
+router.use('/deep-skills', require('./deep-skills'));
 
 module.exports = router;

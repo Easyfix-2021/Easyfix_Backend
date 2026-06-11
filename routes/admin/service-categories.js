@@ -5,6 +5,16 @@ const validate = require('../../middleware/validate');
 const { roleByName } = require('../../middleware/role');
 const svc = require('../../services/service-category.service');
 const { modernOk, modernError } = require('../../utils/response');
+/*
+ * Deep-skill catalog cache invalidation (2026-06-11). The public
+ * profile-update form bundles the full Category → Type → Skill →
+ * Option tree into its prefill response with a 5-minute cache. Adding
+ * / renaming / deactivating a Service Category changes that tree's
+ * top-level display so the cache must be dropped on each successful
+ * mutation here — same pattern applied to routes/admin/deep-skills.js
+ * and routes/admin/service-types.js.
+ */
+const { invalidateCatalogCaches } = require('../../services/easyfixer-profile-update-link.service');
 
 const idParam = Joi.object({ id: Joi.number().integer().positive().required() });
 
@@ -43,6 +53,7 @@ router.get('/:id', validate(idParam, 'params'), async (req, res, next) => {
 router.post('/', roleByName(['Admin']), validate(createBody), async (req, res, next) => {
   try {
     const created = await svc.createCategory(req.body);
+    invalidateCatalogCaches();
     res.status(201); modernOk(res, created, 'Service Category added');
   } catch (e) { if (e.status) return modernError(res, e.status, e.message); next(e); }
 });
@@ -51,6 +62,7 @@ router.patch('/:id', roleByName(['Admin']), validate(idParam, 'params'), validat
   try {
     const updated = await svc.updateCategory(Number(req.params.id), req.body);
     if (!updated) return modernError(res, 404, 'Service Category not found');
+    invalidateCatalogCaches();
     modernOk(res, updated, 'Service Category updated');
   } catch (e) { if (e.status) return modernError(res, e.status, e.message); next(e); }
 });
@@ -59,6 +71,7 @@ router.delete('/:id', roleByName(['Admin']), validate(idParam, 'params'), async 
   try {
     const ok = await svc.deactivateCategory(Number(req.params.id));
     if (!ok) return modernError(res, 404, 'Service Category not found');
+    invalidateCatalogCaches();
     modernOk(res, { deactivated: true });
   } catch (e) { if (e.status) return modernError(res, e.status, e.message); next(e); }
 });

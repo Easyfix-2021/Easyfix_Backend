@@ -38,6 +38,16 @@ async function runDailyReminder() {
   // Find every active easyfixer with an incomplete profile + a
   // usable mobile. Curated projection — we only need id / name /
   // mobile for the send loop; rest of the row is ignored.
+  /*
+   * 7-day per-easyfixer cooldown (2026-06-11). Treat ALL profile-related
+   * nudges as one channel — if any magic-link / reminder went out in the
+   * last week we don't pile on. `profile_update_sent_at` is stamped by
+   * sendForEasyfixer (skill+pincode cron + manual operator sends); this
+   * cron currently doesn't stamp it, so the cooldown is one-directional
+   * (this cron suppresses if recently magic-link'd, but a recent
+   * profile-completion nudge doesn't suppress a magic-link send). Good
+   * enough for ant-spam — symmetric stamping is a follow-up if needed.
+   */
   const [rows] = await pool.query(`
     SELECT efr_id,
            COALESCE(NULLIF(TRIM(efr_name), ''),
@@ -52,6 +62,8 @@ async function runDailyReminder() {
        )
        AND efr_no IS NOT NULL
        AND TRIM(efr_no) <> ''
+       AND (profile_update_sent_at IS NULL
+            OR profile_update_sent_at < NOW() - INTERVAL 7 DAY)
   `);
 
   const summary = {
