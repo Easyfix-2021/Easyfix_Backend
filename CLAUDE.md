@@ -9,7 +9,7 @@ Unified Node.js/Express backend. Replaces 5 legacy services: CRM, Dropwizard :80
 | When working on… | Read |
 |---|---|
 | `tbl_job` / `tbl_easyfixer` columns, status codes, create/assign flows, lookup tables, BIT(1) casting | [`docs/claude-reference/SCHEMA.md`](docs/claude-reference/SCHEMA.md) |
-| Excel bulk upload, auto-assignment engine, file storage, notifications, webhook delivery | [`docs/claude-reference/FEATURES.md`](docs/claude-reference/FEATURES.md) |
+| Excel bulk upload, auto-assignment engine, file storage, notifications, webhook delivery, scheduled crons (visible + hidden) | [`docs/claude-reference/FEATURES.md`](docs/claude-reference/FEATURES.md) |
 | Migration phase history / what each phase covered | [`docs/claude-reference/PHASES.md`](docs/claude-reference/PHASES.md) |
 
 > **Migration status**: ✅ COMPLETE 2026-05-12 (phases 1–13 done & adversarially verified; 14–15 operational, deferred by design). Details in PHASES.md.

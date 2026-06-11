@@ -413,6 +413,50 @@ router.delete(
 );
 
 /*
+ * POST /api/admin/deep-skills/:id/regenerate-image (2026-06-12)
+ *
+ * Manual retry trigger for the DALL-E auto-generation pipeline. Used by
+ * the "Retry Image" button the FE renders next to rows whose
+ * image_gen_status = 'failed', and as the explicit "Regenerate" action
+ * for any row whose admin wants a fresh image.
+ *
+ * Behaviour:
+ *   - 409 if status is already 'pending' (don't re-queue concurrent gen)
+ *   - else marks status 'pending', dispatches via setImmediate, and
+ *     returns immediately — the actual generation happens out-of-band.
+ *
+ * Permission gating matches the existing upload-image route — inherits
+ * the admin group guard from routes/admin/index.js. No extra per-action
+ * key (kept consistent with the manual image upload flow above).
+ */
+router.post(
+  '/:id/regenerate-image',
+  validate(idParam, 'params'),
+  async (req, res, next) => {
+    const skillId = Number(req.params.id);
+    try {
+      const [[row]] = await require('../../db').pool.query(
+        `SELECT image_gen_status, status
+           FROM tbl_deep_skill
+          WHERE deepskill_id = ? LIMIT 1`,
+        [skillId],
+      );
+      if (!row) return modernError(res, 404, 'deep skill not found');
+      if (row.image_gen_status === 'pending') {
+        return modernError(res, 409, 'Image generation already in progress');
+      }
+      await require('../../db').pool.query(
+        'UPDATE tbl_deep_skill SET image_gen_status = ? WHERE deepskill_id = ?',
+        ['pending', skillId],
+      );
+      const dsImageGen = require('../../services/deep-skill-image-gen.service');
+      dsImageGen.dispatch(skillId);
+      return modernOk(res, { status: 'pending' }, 'image regeneration queued');
+    } catch (e) { return next(e); }
+  },
+);
+
+/*
  * POST /api/admin/deep-skills/bulk-upload
  *
  * Multipart upload: field `file`, single .xlsx, max 10MB.

@@ -144,3 +144,60 @@ Dispatch is **fire-and-forget via `setImmediate`** — the job API returns befor
 **Per-client authorization**: `webhook_client_url_mapping.authorization` holds bearer tokens (Decathlon's lives here: `c52aeadf5f8a4dae828e88bf508ea2b9a`). Dispatcher sets this as outbound `Authorization` header literally — the column value is used verbatim so clients can include `Bearer ` prefix or not as they prefer.
 
 **Dev guard**: `WEBHOOKS_DISABLE=true` env short-circuits `dispatch()` without hitting providers. Unlike notifications, webhook dispatch is NOT disabled in `.env` by default — events to real clients fire in dev only if mappings exist for the scratch client you're using. When testing, register a local receiver.
+
+## Scheduled crons (`server/scheduler.js`)
+
+All cron registrations live in `server/scheduler.js::init()`. Time zone is `Asia/Kolkata` for every job — cron expressions evaluate in IST, not UTC. The dev kill switch is `CRON_DISABLED=true` (env), which short-circuits the entire init.
+
+There are **two distinct registration patterns** — the right one depends on whether the cron is operator-facing or pure infrastructure.
+
+### Pattern 1 — Registered via `registerJob({...})` (visible to operators)
+
+These appear on the **Scheduled Jobs** admin page (`/api/admin/scheduled-jobs` → CRM_UI Scheduled Jobs route). Each entry exposes:
+
+- Last-run telemetry (`lastRunAt`, `lastDurationMs`, `lastResult`, `lastError`).
+- A "Trigger Now" button (out-of-band manual run via `triggerJob(id)`).
+- Optionally a "Test" button when the job exports a `tester` callback (e.g. magic-link, profile reminder, skill+pincode reminder — these dispatch a single WhatsApp to a typed mobile, never to the real recipient).
+- A skip reason (`skipReason: 'CRON_DISABLED=true'` or `"property 'X' is not 'true'"`) when an env/property gate kept it from registering. The row still appears so operators can see what *would* have run.
+
+Currently registered visible jobs (IDs match the admin route):
+
+| id | name | cron | gate | description |
+|---|---|---|---|---|
+| `kaleyra-call-report-sync` | Kaleyra Call-Report Sync | `0 */4 * * *` | always-on | Pulls call records from Kaleyra and writes to `tbl_kaleyra_call_log`. |
+| `magic-link-sweep` | Customer Magic-Link Sweep | (see scheduler.js) | `magic.link.cron.enabled` | Sweeps eligible customers and sends magic-link WhatsApp. |
+| `easyfixer-profile-reminder` | Easyfixer Profile-Completion Reminder | `0 19 * * 3,6` | `easyfixer.profile_reminder.enabled` | Wed + Sat 19:00 IST. Nudges easyfixers with incomplete profiles. |
+| `easyfixer-skill-pincode-reminder` | Easyfixer Skill+Pincode Reminder | `30 12 * * *` | `easyfixer.skill_pincode_reminder.enabled` | Daily 12:30 IST. Nudges easyfixers missing deep-skill or pincode coverage. |
+
+To add a new visible cron: call `registerJob({id, name, description, cron, runner, tester?, testSourceLabel?, testSourceHelp?})` inside `init()`, then either `cron.schedule(job.cron, () => invokeJob(job, 'cron'), {timezone: TZ})` or set `job.skipReason` when a gate is off. Read access to the admin page is allowlisted by email via the `scheduled.jobs.visible.emails` property (see `services/scheduled-jobs.service.js::isAllowedUser`).
+
+### Pattern 2 — Standalone `cron.schedule(...)` (hidden infrastructure)
+
+When a cron is **infrastructure plumbing** rather than an operator-facing scheduled task, register it directly via `cron.schedule(...)` WITHOUT going through `registerJob()`. The result:
+
+- Does NOT appear on the Scheduled Jobs admin page.
+- No "Trigger Now" / Test buttons exposed.
+- No in-memory telemetry on the job registry.
+- Still honors `CRON_DISABLED=true` (must be gated inline).
+- Still runs on the `Asia/Kolkata` timezone constant.
+
+This pattern is appropriate when the cron exists to keep the system internally consistent and operators have no meaningful action to take. They wouldn't trigger it manually; they don't need last-run telemetry; surfacing it on the page would create noise without value.
+
+Currently registered hidden crons:
+
+#### `deep-skill image-gen orphan reset` — every 5 min
+
+Wired in `server/scheduler.js` at the tail of `init()`. Calls `services/deep-skill-image-gen.service.js::resetOrphanedPendingImageGens()`.
+
+- **Why it exists**: deep-skill auto-image-generation dispatches via `setImmediate` (fire-and-forget). The in-memory `inflightImageGen: Set<number>` guards against double-dispatch, but a server restart kills the in-flight worker before `generateImage()` can write the final image OR mark the row `'failed'`. The row stays `image_gen_status = 'pending'` forever, the FE polling loop spins, the operator has no Retry path.
+- **Reset criterion**: `WHERE image_gen_status = 'pending' AND image_gen_attempted_at < NOW() - INTERVAL 10 MINUTE`. Real DALL-E generations finish well under 60 seconds — 10 minutes is a comfortable buffer that won't race a legitimate in-flight call.
+- **Effect**: flips status to `'failed'`. Leaves `image_gen_attempted_at` unchanged so the FE displays "Failed at <original pending stamp>" accurately. The operator's Retry button then re-stamps the timestamp + re-dispatches.
+- **Why hidden**: pure infrastructure. Operators don't trigger orphan resets manually; they don't care about telemetry; the visible alternative would be UI clutter for zero ops value.
+- **Why no property gate**: cost is one tiny UPDATE per 5 minutes. The alternative (gate disabled → orphans accumulate) is strictly worse than always-on.
+- **Telemetry**: silent in steady state (no rows match). When it does reset, logs at `warn` level: `deep-skill-image-gen: reset orphaned pending rows to failed`. Discoverable via log grep, not via UI.
+- **Linked code**:
+  - Cron registration: `server/scheduler.js` at the end of `init()` (after the visible jobs).
+  - Reset function: `services/deep-skill-image-gen.service.js::resetOrphanedPendingImageGens()`.
+  - Pending stamp: `services/deep-skill.service.js::create()` and `::update()` — both stamp `image_gen_attempted_at = NOW()` when marking `'pending'`, which is what makes orphan detection possible.
+
+When adding new hidden crons later, document each in this subsection with the same headings (Why it exists, criterion, effect, why hidden, telemetry, linked code) so future Claude sessions or engineers reviewing "what's running" have a single discoverable home.

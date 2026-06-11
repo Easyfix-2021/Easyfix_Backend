@@ -162,6 +162,7 @@ async function list({ categoryId, serviceTypeId, includeInactive = false } = {})
     SELECT ds.deepskill_id, ds.category_id, ds.service_type_id,
            ds.deepskill_name, ds.deepskill_description, ds.status,
            ds.deepskill_image, ds.inserted_on, ds.inserted_by,
+           ds.image_gen_status, ds.image_gen_attempted_at,
            sc.service_catg_name AS category_name,
            st.service_type_name,
            (SELECT COUNT(*) FROM tbl_deepskill_options o
@@ -181,8 +182,23 @@ async function list({ categoryId, serviceTypeId, includeInactive = false } = {})
 }
 
 async function getById(deepskillId) {
+  /*
+   * Explicit projection (2026-06-12). Previously `SELECT ds.*` — that
+   * was convenient when new columns were added (they flowed through to
+   * the response automatically) but it's a small API-stability foot-
+   * gun: any future schema addition silently leaks to consumers. The
+   * list of columns below mirrors the `list()` query above PLUS
+   * `deepskill_tag_words` (2026-06-06 addition) and `skill_options`
+   * (legacy denormalised JSON column). Keep this in sync with list().
+   */
   const [[row]] = await pool.query(`
-    SELECT ds.*, sc.service_catg_name AS category_name, st.service_type_name
+    SELECT ds.deepskill_id, ds.category_id, ds.service_type_id,
+           ds.deepskill_name, ds.deepskill_description, ds.deepskill_tag_words,
+           ds.status, ds.deepskill_image, ds.skill_options,
+           ds.inserted_on, ds.inserted_by,
+           ds.image_gen_status, ds.image_gen_attempted_at,
+           sc.service_catg_name AS category_name,
+           st.service_type_name
       FROM tbl_deep_skill ds
       LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = ds.category_id
       LEFT JOIN tbl_service_type st ON st.service_type_id = ds.service_type_id
@@ -297,6 +313,28 @@ async function create(input, actor) {
     logger.warn({ err, deepSkillId }, 'deep-skill: syncSkillOptionsJson failed post-create (non-fatal)');
   });
 
+  // ── Auto-generate image (2026-06-12) ────────────────────────────────
+  // Fire-and-forget DALL-E pipeline when the operator skipped the image
+  // upload. require() is late-bound here to avoid any circular-import
+  // surprises (the gen service requires us back for cache invalidation).
+  // Failures are tracked on the row via image_gen_status='failed' — they
+  // do NOT bubble up to the caller; create() still returns the row.
+  try {
+    const dsImageGen = require('./deep-skill-image-gen.service');
+    if (!input.deepskill_image && await dsImageGen.isAutoGenEnabled()) {
+      // Stamp image_gen_attempted_at = NOW() so the 5-min orphan-reset
+      // cron can detect rows whose dispatch was killed by a server
+      // restart (status='pending' + age > 10 min ⇒ flip to 'failed').
+      await pool.query(
+        'UPDATE tbl_deep_skill SET image_gen_status = ?, image_gen_attempted_at = NOW() WHERE deepskill_id = ?',
+        ['pending', deepSkillId],
+      );
+      dsImageGen.dispatch(deepSkillId);
+    }
+  } catch (err) {
+    logger.warn({ err, deepSkillId }, 'deep-skill: auto-gen dispatch failed post-create (non-fatal)');
+  }
+
   return getById(deepSkillId);
 }
 
@@ -336,6 +374,42 @@ async function update(deepskillId, patch) {
   if (sets.length === 0) return getById(deepskillId);
   values.push(deepskillId);
   await pool.query(`UPDATE tbl_deep_skill SET ${sets.join(', ')} WHERE deepskill_id = ?`, values);
+
+  // ── Auto-generate image on update (2026-06-12) ──────────────────────
+  // Re-read the post-patch state so the trigger reflects what's
+  // actually on the row (not what the patch CLAIMED to set). Guards:
+  //   - skip if image is now non-empty (operator EXPLICITLY set one,
+  //     either via this patch or it was already there).
+  //   - skip if the skill is soft-deleted (status !== 1).
+  //   - skip if feature flag or OPENAI_API_KEY is off.
+  // Patch path doesn't include the manual image-upload route — that
+  // goes through replaceImage() — so we're safe to trigger from any
+  // update() call that leaves deepskill_image empty.
+  try {
+    const dsImageGen = require('./deep-skill-image-gen.service');
+    if (await dsImageGen.isAutoGenEnabled()) {
+      const [[curr]] = await pool.query(
+        `SELECT deepskill_image, status, image_gen_status
+           FROM tbl_deep_skill WHERE deepskill_id = ? LIMIT 1`,
+        [deepskillId],
+      );
+      const imgEmpty = !curr?.deepskill_image || !String(curr.deepskill_image).trim();
+      const isActive = Number(curr?.status) === 1;
+      const notInflight = curr?.image_gen_status !== 'pending';
+      if (curr && imgEmpty && isActive && notInflight) {
+        // Stamp image_gen_attempted_at so orphan-reset cron can find
+        // restart-stuck rows. See matching comment in create() above.
+        await pool.query(
+          'UPDATE tbl_deep_skill SET image_gen_status = ?, image_gen_attempted_at = NOW() WHERE deepskill_id = ?',
+          ['pending', deepskillId],
+        );
+        dsImageGen.dispatch(deepskillId);
+      }
+    }
+  } catch (err) {
+    logger.warn({ err, deepskillId }, 'deep-skill: auto-gen dispatch failed post-update (non-fatal)');
+  }
+
   return getById(deepskillId);
 }
 

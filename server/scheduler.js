@@ -395,6 +395,36 @@ Note: this task only runs automatically if the property "easyfixer.skill_pincode
     logger.info('Easyfixer skill+pincode reminder cron registered (easyfixer.skill_pincode_reminder.enabled=true, daily 12:30 IST).');
   }
 
+  // ─── Deep Skill Image-Gen orphan reset — every 5 minutes ─────────────
+  // Standalone cron (NOT registered via registerJob()). Deliberately
+  // absent from the Scheduled Jobs admin page — this is infrastructure
+  // plumbing, not an operator-facing task. Flips status='pending' rows
+  // older than 10 minutes to 'failed' so the FE polling loop can stop
+  // spinning on rows whose dispatcher was killed by a server restart.
+  // See services/deep-skill-image-gen.service.js::resetOrphanedPendingImageGens
+  // for the full rationale.
+  //
+  // No property gate — the cost is one tiny UPDATE per 5 min, and the
+  // alternative (gate disabled, orphans accumulate) is strictly worse.
+  // CRON_DISABLED still short-circuits it (we already returned above
+  // when cronDisabled is true) — wait, we didn't return. Re-check the
+  // gate inline so dev environments stay quiet.
+  if (!cronDisabled) {
+    const dsImageGen = require('../services/deep-skill-image-gen.service');
+    cron.schedule(
+      '*/5 * * * *',
+      async () => {
+        try {
+          await dsImageGen.resetOrphanedPendingImageGens();
+        } catch (err) {
+          logger.warn({ err }, 'deep-skill orphan-reset tick failed');
+        }
+      },
+      { timezone: TZ },
+    );
+    logger.info('Deep-skill image-gen orphan reset cron registered (every 5 min, hidden from admin page).');
+  }
+
   const registeredCount = jobs.filter((j) => j.registered).length;
   logger.ready(`Scheduler started — ${registeredCount}/${jobs.length} task(s) registered (tz=${TZ}).`);
 }
