@@ -251,13 +251,36 @@ async function fetchPrefill(efrId, pool) {
   // header strip's photo URL doesn't add a serial round-trip.
   // `deep_skill_catalog` powers the editable picker on the public form;
   // typical node count is 100–500, so it's safe to bundle inline.
-  const [deepSkillMappings, serviceablePincodes, deepSkillCatalog, profileImageUrl, serviceCategories] = await Promise.all([
+  const [deepSkillMappings, serviceablePincodes, fullDeepSkillCatalog, profileImageUrl, serviceCategories, mappedCategoryIds] = await Promise.all([
     verification.listOptionMappings(efrId),
     verification.listServiceablePincodes(efrId),
     fetchDeepSkillCatalog(pool),
     presignProfileImage(row.profile_image_key),
     resolveServiceCategories(row.service_category_raw, pool),
+    fetchEasyfixerMappedCategoryIds(efrId, pool),
   ]);
+
+  /*
+   * Per-easyfixer category filter (2026-06-11). The deep-skill picker's
+   * Service Category list must only surface categories this technician is
+   * mapped to via `easyfixer_service_type` (legacy table, NO `tbl_` prefix
+   * — verified against EasyFix_CRM/EasyfixerServiceType.java). The cached
+   * `fullDeepSkillCatalog` covers every active category in the system, so
+   * we filter it in JS against a tiny per-efr_id ID set.
+   *
+   * Cache decision: option (c) — keep the shared global catalog cache
+   * (5-min TTL, 1 query batch shared across all easyfixers) and intersect
+   * with a per-call ~1ms query of `easyfixer_service_type`. Avoids cache
+   * fragmentation per efr_id (~30k easyfixers) AND avoids bypassing the
+   * cache entirely on the public hot path.
+   *
+   * Empty-list semantics: if the easyfixer has zero mapped categories
+   * (brand-new, admin missed the setup step), the picker shows nothing —
+   * that's the correct UX signal per spec.
+   */
+  const deepSkillCatalog = mappedCategoryIds.size === 0
+    ? []
+    : fullDeepSkillCatalog.filter((c) => mappedCategoryIds.has(c.category_id));
 
   return {
     header: {
@@ -410,6 +433,78 @@ function invalidateServiceCategoriesCache() {
 function invalidateCatalogCaches() {
   deepSkillCatalogCache = { data: null, expires: 0, inflight: null };
   invalidateServiceCategoriesCache();
+}
+
+/**
+ * Return the set of category-id values this easyfixer is mapped to,
+ * unioning THREE source tables to mirror the legacy CRM Java query
+ * (shared by the user 2026-06-11).
+ *
+ * Why three tables: a single easyfixer can be associated with a service
+ * category through any of these legacy surfaces, and the deep-skill
+ * picker on the public profile-update form must surface a category if
+ * ANY of them claims it. Limiting to `easyfixer_service_type` (as the
+ * prior version did) missed technicians whose category mapping lives
+ * exclusively on the verification-state surface.
+ *
+ *   easyfixer_service_type       — legacy CRM "service type" mapping; the
+ *                                  category id lives in `service_category_id`,
+ *                                  has a soft-delete flag `is_deleted`.
+ *                                  Verified: EasyFix_CRM EasyfixerDaoImpl.java
+ *                                  (e.g. INSERT INTO easyfixer_service_type
+ *                                  ... service_category_id ...) and
+ *                                  EasyfixerServiceType.java entity.
+ *   tbl_efr_deepskill_mapping    — option-level deep-skill assignments; one
+ *                                  row per (efr × option). Category id is
+ *                                  the column literally named `category_id`
+ *                                  (NOT the inverted parent_skill_id /
+ *                                  deep_skill_id columns — those carry
+ *                                  deep_skill / option ids respectively;
+ *                                  see top-of-file docblock in
+ *                                  deep-skill.service.js). Verified:
+ *                                  EasyFix_CRM DeepSkillDaoImpl.java
+ *                                  (INSERT INTO tbl_efr_deepskill_mapping
+ *                                  ... category_id ...). No `is_deleted`
+ *                                  on this table — rows are hard-deleted
+ *                                  on unassignment.
+ *   efr_dskill_status            — verification-state per (tech × category);
+ *                                  category column is `category_id`, owner
+ *                                  is `easyfixer_id` (per the user's legacy
+ *                                  Java query shared 2026-06-11). Not
+ *                                  referenced elsewhere in this backend, so
+ *                                  schema is taken on faith from the legacy
+ *                                  query; defensive `category_id IS NOT NULL`
+ *                                  filter keeps the union safe.
+ *
+ * Soft-delete filter is applied ONLY on `easyfixer_service_type`. The other
+ * two tables don't carry an `is_deleted` column (verified by greps against
+ * EasyFix_CRM DAOs), so adding the predicate would fail at runtime.
+ *
+ * Used to filter the (globally cached) deep-skill catalog tree to only the
+ * categories this easyfixer is mapped to.
+ */
+async function fetchEasyfixerMappedCategoryIds(efrId, pool) {
+  const [rows] = await pool.query(
+    `SELECT DISTINCT category_id FROM (
+       SELECT service_category_id AS category_id
+         FROM easyfixer_service_type
+        WHERE easyfixer_id = ?
+          AND (is_deleted IS NULL OR is_deleted = 0)
+          AND service_category_id IS NOT NULL
+       UNION
+       SELECT category_id
+         FROM tbl_efr_deepskill_mapping
+        WHERE easyfixer_id = ?
+          AND category_id IS NOT NULL
+       UNION
+       SELECT category_id
+         FROM efr_dskill_status
+        WHERE easyfixer_id = ?
+          AND category_id IS NOT NULL
+     ) AS unioned`,
+    [efrId, efrId, efrId],
+  );
+  return new Set(rows.map((r) => Number(r.category_id)).filter((n) => Number.isFinite(n)));
 }
 
 async function fetchDeepSkillCatalog(pool) {

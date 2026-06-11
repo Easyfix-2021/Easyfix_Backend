@@ -1,6 +1,7 @@
 const ExcelJS = require('exceljs');
 const { pool } = require('../db');
 const logger   = require('../logger');
+const deepSkillService = require('./deep-skill.service');
 
 /*
  * Manage Deep Skills — bulk upload from ops .xlsx (2026-06-05).
@@ -444,6 +445,10 @@ async function processBuffer(buffer, { commit = false, actor = null } = {}) {
     if (inTxn) {
       await conn.commit();
       inTxn = false;
+      // invalidate the 24h getAllDeepSkillImages cache — image just changed
+      // (called ONCE at end of bulk commit; partial-success still invalidates
+      //  since over-invalidation is safer than serving stale entries)
+      deepSkillService.invalidateAllDeepSkillImagesCache();
     }
 
     const summary = {

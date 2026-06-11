@@ -652,6 +652,8 @@ async function replaceImage(skillId, { buffer, contentType, originalName }) {
 
   let url = null;
   try { url = await s3Storage.getPresignedUrl(Key); } catch { /* presign optional */ }
+  // invalidate the 24h getAllDeepSkillImages cache — image just changed
+  invalidateAllDeepSkillImagesCache();
   return { image: Key, url };
 }
 
@@ -679,6 +681,8 @@ async function clearImage(skillId) {
       try { await s3Storage.deleteObject(prev); }
       catch (e) { logger.warn({ err: e, prev }, 'deep-skill: clearImage S3 delete non-fatal'); }
     }
+    // invalidate the 24h getAllDeepSkillImages cache — image just changed
+    invalidateAllDeepSkillImagesCache();
   }
   return { image: '' };
 }
@@ -734,6 +738,139 @@ async function getImageUrl(skillId) {
   return { image: key, url };
 }
 
+/*
+ * Bulk catalog image resolver (2026-06-11).
+ *
+ * Resolves EVERY non-empty deepskill_image key on `tbl_deep_skill` (active
+ * AND inactive — the catalog endpoint exposes only what the public
+ * consumers actually need: { deep_skill_id, image_url }, and stale rows
+ * with images are still legitimate to render in legacy CRM/Mobile UIs
+ * that pin to an older deep-skill id).
+ *
+ * Why a dedicated bulk path instead of looping `getImageUrl` on the
+ * caller side:
+ *   1. ~hundreds of skills × per-call SQL lookup = wasteful when the
+ *      caller only needs a flat list.
+ *   2. Long-lived presigned URLs (25h, see below) blow up the default
+ *      module-level PRESIGN_TTL_SEC, so we bypass `getPresignedUrl`
+ *      and re-mint each URL with an explicit `expiresIn` here.
+ *
+ * Presigned-URL TTL: 25 hours (90_000 seconds).
+ *   The response is wrapped in a 24h in-memory cache (see
+ *   `getAllDeepSkillImages` below). At the cache-window's tail end a
+ *   served URL must STILL be valid for the receiving browser, so the
+ *   per-URL TTL has to outlive the cache TTL by a safe margin. 25h
+ *   gives a 1h headroom over the 24h cache TTL — comfortably bigger
+ *   than any clock skew or rendering delay we'd see in practice.
+ *   AWS SigV4 caps presign TTL at 7 days, so 25h is well within spec.
+ *
+ * Returns Promise<{deep_skill_id:number, image_url:string|null}[]>.
+ * Skills whose key is empty / non-`Skills/` / unpresignable are
+ * filtered OUT of the response (caller spec: only include rows with
+ * a non-null/non-empty image).
+ */
+const BULK_IMAGE_PRESIGN_TTL_SEC = 25 * 60 * 60; // 25h — must outlive 24h cache TTL.
+
+async function buildAllDeepSkillImages() {
+  const [rows] = await pool.query(
+    `SELECT deepskill_id AS deep_skill_id,
+            deepskill_image AS image_key
+       FROM tbl_deep_skill
+      WHERE deepskill_image IS NOT NULL
+        AND deepskill_image <> ''`,
+  );
+  if (!s3Storage.isEnabled() || rows.length === 0) return [];
+
+  // Inline presign with explicit 25h expiry — `s3Storage.getPresignedUrl`
+  // bakes in the 5-min module default and we deliberately don't widen its
+  // signature for a single bulk-cache use case.
+  const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
+  const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+  const bucket = s3Storage.bucketName();
+  const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'ap-south-1';
+  const s3 = new S3Client({ region });
+
+  const presigned = await Promise.all(rows.map(async (r) => {
+    const key = String(r.image_key || '').trim();
+    if (!key || !key.startsWith('Skills/')) return null;
+    try {
+      const url = await getSignedUrl(
+        s3,
+        new GetObjectCommand({ Bucket: bucket, Key: key }),
+        { expiresIn: BULK_IMAGE_PRESIGN_TTL_SEC },
+      );
+      return { deep_skill_id: Number(r.deep_skill_id), image_url: url };
+    } catch (e) {
+      logger.warn(
+        { err: e && e.message, key, deep_skill_id: r.deep_skill_id },
+        'deep-skill: bulk image presign failed — skipping row',
+      );
+      return null;
+    }
+  }));
+  return presigned.filter(Boolean);
+}
+
+/*
+ * Module-scope 24h cache for getAllDeepSkillImages (2026-06-11).
+ *
+ * Mirrors the `deepSkillCatalogCache` / single-flight pattern in
+ * services/easyfixer-profile-update-link.service.js: a `{ data,
+ * expires, inflight }` record updated atomically. Single-flight is
+ * enforced by storing the in-flight Promise on the cache record —
+ * concurrent cache-miss callers await the SAME promise instead of
+ * racing N parallel builds.
+ *
+ * Pure in-memory, single process. A multi-instance deploy gets one
+ * cache per instance; acceptable because the underlying data is
+ * read-only catalog material and the worst-case extra work is a few
+ * SELECTs + presigns per instance per day.
+ *
+ * 24h chosen because:
+ *   - Deep-skill image edits are rare (a few per month).
+ *   - Presigned-URL TTL is 25h, so a URL served from the very tail
+ *     of the cache window is still valid for ~1h on the client.
+ *   - Process restarts (CI deploys) drop the cache cleanly.
+ */
+const ALL_DEEP_SKILL_IMAGES_TTL_MS = 24 * 60 * 60 * 1000; // 24h
+let allDeepSkillImagesCache = { data: null, expires: 0, inflight: null };
+
+async function getAllDeepSkillImages() {
+  const now = Date.now();
+  if (allDeepSkillImagesCache.data && now < allDeepSkillImagesCache.expires) {
+    return allDeepSkillImagesCache.data;
+  }
+  if (allDeepSkillImagesCache.inflight) {
+    return allDeepSkillImagesCache.inflight;
+  }
+  const promise = buildAllDeepSkillImages();
+  allDeepSkillImagesCache = { data: null, expires: 0, inflight: promise };
+  try {
+    const payload = await promise;
+    allDeepSkillImagesCache = {
+      data: payload,
+      expires: Date.now() + ALL_DEEP_SKILL_IMAGES_TTL_MS,
+      inflight: null,
+    };
+    return payload;
+  } catch (e) {
+    // Don't poison the cache on failure — next call retries fresh.
+    allDeepSkillImagesCache = { data: null, expires: 0, inflight: null };
+    throw e;
+  }
+}
+
+/*
+ * Stub invalidator. Wire this into any future admin surface that
+ * mutates `tbl_deep_skill.deepskill_image` (replaceImage / clearImage
+ * / bulk upload) so the public bulk endpoint reflects the change
+ * within the same request. No callers wired yet — kept exported so
+ * the wire-up is a one-line require + call.
+ */
+function invalidateAllDeepSkillImagesCache() {
+  allDeepSkillImagesCache = { data: null, expires: 0, inflight: null };
+}
+
 module.exports = {
   list, getById, create, update, setStatus,
   addOption, updateOption, deleteOption,
@@ -748,4 +885,7 @@ module.exports = {
   resolveCategoryByName,
   resolveServiceTypeByName,
   resolveSkillOptionByName,
+  // 2026-06-11:
+  getAllDeepSkillImages,
+  invalidateAllDeepSkillImagesCache,
 };
