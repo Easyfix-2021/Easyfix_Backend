@@ -104,6 +104,36 @@ function setCdnCacheHeaders(_req, res, next) {
   next();
 }
 
+/*
+ * Bulk deep-skill image catalog (2026-06-11).
+ *
+ * Mounted at GET /api/public/deep-skills/getAllDeepSkillImages.
+ * camelCase path is deliberate — matches the literal spec from the
+ * consumer that needs the list. Registered ABOVE the `/:id/image-url`
+ * route as defence-in-depth so Express's first-match router can't
+ * route a single-segment GET into the param route.
+ *
+ * Returns a flat array of every deep-skill with a non-null image,
+ * each wrapped with a 25h presigned URL. The service layer caches
+ * the whole payload for 24h with single-flight de-duplication —
+ * 100/IP/min rate limit + 5-min CDN cache headers reuse the same
+ * helpers as the single-id endpoint below.
+ *
+ * Response: 200 { success:true, data:[{deep_skill_id, image_url}, …] }
+ */
+router.get('/getAllDeepSkillImages',
+  rateLimitByIp,
+  setCdnCacheHeaders,
+  async (req, res, next) => {
+    try {
+      const data = await ds.getAllDeepSkillImages();
+      modernOk(res, data);
+    } catch (e) {
+      next(e);
+    }
+  },
+);
+
 router.get('/:id/image-url',
   rateLimitByIp,
   setCdnCacheHeaders,
