@@ -1,5 +1,6 @@
 const { pool } = require('../db');
 const deepSkillService = require('./deep-skill.service');
+const logger = require('../logger');
 
 /*
  * Easyfixer Verification — service backing the "Self-Registration
@@ -87,7 +88,7 @@ async function getBanking(efrId) {
        LEFT JOIN tbl_user U          ON U.user_id = tb.updated_by
       WHERE tb.efr_id = ? LIMIT 1`,
     [efrId]
-  ).catch(() => [[null]]);
+  );
   return row || null;
 }
 
@@ -99,7 +100,7 @@ async function getCommentsBySection(efrId, section) {
       WHERE easyfixer_id = ? AND comment_in_section = ?
       ORDER BY id DESC`,
     [efrId, section]
-  ).catch(() => [[]]);
+  );
   return rows.map((r) => ({
     id: r.id,
     text: r.comment,
@@ -113,7 +114,7 @@ async function getCommentsBySection(efrId, section) {
 async function listEasyfixBanks() {
   const [rows] = await pool.query(
     `SELECT id, bank_name FROM tbl_easyfix_bank WHERE bank_status = 1 ORDER BY bank_name`
-  ).catch(() => [[]]);
+  );
   return rows;
 }
 
@@ -161,11 +162,11 @@ async function getVerificationPage(efrId) {
       `SELECT COUNT(*) AS cnt FROM tbl_efr_deepskill_mapping
         WHERE easyfixer_id = ? AND is_repairing = 1`,
       [efrId],
-    ).then(([rows]) => rows[0] || { cnt: 0 }).catch(() => ({ cnt: 0 })),
+    ).then(([rows]) => rows[0] || { cnt: 0 }).catch((e) => { logger.warn({ efrId, err: e }, 'verification: deep-skill mapping count read failed — rendering 0'); return { cnt: 0 }; }),
     pool.query(
       'SELECT pincodes FROM tbl_efr_serviceable_pincodes WHERE easyfixer_id = ?',
       [efrId],
-    ).then(([rows]) => rows[0] || { pincodes: '' }).catch(() => ({ pincodes: '' })),
+    ).then(([rows]) => rows[0] || { pincodes: '' }).catch((e) => { logger.warn({ efrId, err: e }, 'verification: serviceable pincodes read failed — rendering empty'); return { pincodes: '' }; }),
   ]);
 
   const deepSkillsCount = Number(deepSkillCountRow.cnt || 0);
@@ -489,23 +490,48 @@ async function setLeadVerification(efrId, body, actor) {
   // Resolve user_id via tbl_easyfixer.user_id (needed to update tbl_user row).
   const [[row]] = await pool.query(`SELECT user_id FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1`, [efrId]);
   if (!row) { const e = new Error('easyfixer not found'); e.status = 404; throw e; }
-
-  if (v === 1 && body.efr_cityId) {
-    await pool.query(`UPDATE tbl_easyfixer SET efr_cityId = ?, updated_by = ?, update_date = NOW() WHERE efr_id = ?`,
-      [body.efr_cityId, actor?.user_id || null, efrId]);
-  }
-  await pool.query(
-    `UPDATE tbl_user
-        SET personal_details_filled = ?, updated_by = ?, user_status = 1,
-            released_on_date_time = NOW(), update_date = NOW()
-      WHERE user_id = ?`,
-    [v, actor?.user_id || null, row.user_id]
-  );
+  // Idle bucket is user_id IS NULL OR = 0 — with no linked user account there's
+  // no tbl_user row to flip, so the lead-status write would silently no-op.
+  if (!row.user_id) { const e = new Error('easyfixer has no linked user account — lead status cannot be set'); e.status = 422; throw e; }
 
   // Auto-append the comment line that mirrors legacy "Accepted / Denied / ..."
   const statusText = v === 1 ? 'Accepted' : v === 2 ? 'Denied' : 'Not Eligible To New Lead';
   const comment = `${statusText}${body.reason ? ' <br> ' + body.reason : ''}`;
-  await addComment(efrId, { text: comment, section: SECTION.LEAD }, actor);
+
+  // All three writes are atomic on one connection — a partial apply would leave
+  // tbl_easyfixer / tbl_user / the comment thread inconsistent.
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    if (v === 1 && body.efr_cityId) {
+      await conn.query(`UPDATE tbl_easyfixer SET efr_cityId = ?, updated_by = ?, update_date = NOW() WHERE efr_id = ?`,
+        [body.efr_cityId, actor?.user_id || null, efrId]);
+    }
+    await conn.query(
+      `UPDATE tbl_user
+          SET personal_details_filled = ?, updated_by = ?, user_status = 1,
+              released_on_date_time = NOW(), update_date = NOW()
+        WHERE user_id = ?`,
+      [v, actor?.user_id || null, row.user_id]
+    );
+
+    // Inline the comment INSERT on conn (addComment uses pool + returns a
+    // list, so it can't enroll in this txn). Mirrors addComment's columns.
+    await conn.query(
+      `INSERT INTO easyfixer_comments
+         (comment, commented_by, comment_in_section, commented_on, commented_by_id, easyfixer_id)
+       VALUES (?, ?, ?, NOW(), ?, ?)`,
+      [comment, actor?.user_name || actor?.name || 'system', SECTION.LEAD, actor?.user_id || null, efrId]
+    );
+
+    await conn.commit();
+  } catch (e) {
+    await conn.rollback().catch(() => {});
+    throw e;
+  } finally {
+    conn.release();
+  }
 
   return getVerificationPage(efrId);
 }
@@ -541,7 +567,7 @@ async function saveActivation(efrId, body, actor) {
     const [[existing]] = await pool.query(
       `SELECT id FROM tbl_easyfixer_bank_details WHERE efr_id = ? LIMIT 1`,
       [efrId]
-    ).catch(() => [[null]]);
+    );
     if (existing) {
       const sets = [];
       const params = [];
@@ -582,22 +608,32 @@ async function saveActivation(efrId, body, actor) {
 // mappings and soft-disable any not in the list (mapping_status=0).
 async function mapClients(efrId, clientIds, actor) {
   const ids = Array.isArray(clientIds) ? clientIds.map(Number).filter((n) => Number.isInteger(n) && n > 0) : [];
-  // Soft-disable mappings not in the list.
-  await pool.query(
-    `UPDATE tbl_client_easyfixer_mapping
-        SET mapping_status = 0, updated_by = ?, update_date = NOW()
-      WHERE easyfixer_id = ? ${ids.length ? `AND client_id NOT IN (${ids.map(() => '?').join(',')})` : ''}`,
-    [actor?.user_id || null, efrId, ...ids]
-  ).catch(() => {});
-  // Upsert each id (mapping_status=1).
-  for (const cid of ids) {
-    await pool.query(
-      `INSERT INTO tbl_client_easyfixer_mapping
-         (client_id, easyfixer_id, mapping_status, inserted_by, insert_date, update_date)
-       VALUES (?, ?, 1, ?, NOW(), NOW())
-       ON DUPLICATE KEY UPDATE mapping_status = 1, updated_by = VALUES(inserted_by), update_date = NOW()`,
-      [cid, efrId, actor?.user_id || null]
-    ).catch(() => {});
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    // Soft-disable mappings not in the list.
+    await conn.query(
+      `UPDATE tbl_client_easyfixer_mapping
+          SET mapping_status = 0, updated_by = ?, update_date = NOW()
+        WHERE easyfixer_id = ? ${ids.length ? `AND client_id NOT IN (${ids.map(() => '?').join(',')})` : ''}`,
+      [actor?.user_id || null, efrId, ...ids]
+    );
+    // Upsert each id (mapping_status=1).
+    for (const cid of ids) {
+      await conn.query(
+        `INSERT INTO tbl_client_easyfixer_mapping
+           (client_id, easyfixer_id, mapping_status, inserted_by, insert_date, update_date)
+         VALUES (?, ?, 1, ?, NOW(), NOW())
+         ON DUPLICATE KEY UPDATE mapping_status = 1, updated_by = VALUES(inserted_by), update_date = NOW()`,
+        [cid, efrId, actor?.user_id || null]
+      );
+    }
+    await conn.commit();
+  } catch (e) {
+    await conn.rollback().catch(() => {});
+    throw e;
+  } finally {
+    conn.release();
   }
   return getVerificationPage(efrId);
 }
@@ -672,11 +708,14 @@ async function listOptionMappings(efrId) {
   });
 }
 
-async function replaceOptionMappings(efrId, items, actor) {
+async function replaceOptionMappings(efrId, items, actor, externalConn = null) {
   const list = Array.isArray(items) ? items : [];
-  const conn = await pool.getConnection();
+  // When an external connection is injected (e.g. acceptSubmission's txn) we
+  // enroll in the caller's transaction and leave begin/commit/release to them.
+  const conn = externalConn || await pool.getConnection();
+  const ownTxn = !externalConn;
   try {
-    await conn.beginTransaction();
+    if (ownTxn) await conn.beginTransaction();
 
     // 1) Soft-delete every active row for this easyfixer.
     await conn.query(
@@ -720,16 +759,16 @@ async function replaceOptionMappings(efrId, items, actor) {
       updated += 1;
     }
 
-    await conn.commit();
+    if (ownTxn) await conn.commit();
     // actor is accepted for future audit columns; today the table has no
     // updated_by / updated_on columns so we just log the actor for trail.
     void actor;
     return { updated };
   } catch (e) {
-    try { await conn.rollback(); } catch (_) { /* swallow rollback failure */ }
+    if (ownTxn) { try { await conn.rollback(); } catch (_) { /* swallow rollback failure */ } }
     throw e;
   } finally {
-    conn.release();
+    if (ownTxn) conn.release();
   }
 }
 
@@ -777,24 +816,27 @@ async function listServiceablePincodes(efrId) {
   return { items };
 }
 
-async function replaceServiceablePincodes(efrId, pincodeIds, actor) {
+async function replaceServiceablePincodes(efrId, pincodeIds, actor, externalConn = null) {
   const list = Array.isArray(pincodeIds)
     ? Array.from(new Set(pincodeIds.map(Number).filter((n) => Number.isInteger(n) && n > 0)))
     : [];
   const userId = actor?.user_id || null;
+  // Single-statement upsert — no begin/commit here. When an external
+  // connection is injected we run on it so the write joins the caller's txn.
+  const db = externalConn || pool;
   // Resolve pincode IDs → pincode strings (the schema stores CSV of strings,
   // not IDs). Dedupe + join. Empty list ⇒ persist empty CSV.
   let csv = '';
   if (list.length) {
     const placeholders = list.map(() => '?').join(',');
-    const [rows] = await pool.query(
+    const [rows] = await db.query(
       `SELECT pincode FROM tbl_pincode WHERE pincode_id IN (${placeholders})`,
       list
     );
     csv = Array.from(new Set(rows.map((r) => String(r.pincode)).filter(Boolean))).join(',');
   }
   // Single-statement atomic upsert keyed on easyfixer_id (PK).
-  await pool.query(
+  await db.query(
     `INSERT INTO tbl_efr_serviceable_pincodes
        (easyfixer_id, pincodes, created_by, updated_by)
      VALUES (?, ?, ?, ?)

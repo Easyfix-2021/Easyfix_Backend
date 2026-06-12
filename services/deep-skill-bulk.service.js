@@ -31,9 +31,11 @@ const deepSkillService = require('./deep-skill.service');
  *   - Skill match key = (category_id, service_type_id, LOWER(TRIM(name))).
  *     A row that already exists → status = "skip" (no duplicate insert).
  *   - Option chips: inserted only if not already present for the skill (case-
- *     insensitive). After all chip inserts for a skill, the denormalised
- *     `tbl_deep_skill.skill_options` JSON is refreshed via the existing
- *     syncSkillOptionsJson() helper in deep-skill.service.js.
+ *     insensitive); soft-deleted (status=0) matches are reactivated. After all
+ *     chip inserts for a skill, the denormalised `tbl_deep_skill.skill_options`
+ *     JSON is refreshed via the existing syncSkillOptionsJson() helper in
+ *     deep-skill.service.js. Preview reports the would-merge option count for
+ *     existing skills without writing anything.
  *
  * Data-quality quirks observed in the 4 ops sample files
  *   - Electrician Col C is "Electrician Services'" (trailing apostrophe).
@@ -125,10 +127,10 @@ function validateHeaderRow(sheet) {
 function parseWorkbook(workbook) {
   const parsed = [];
   workbook.eachSheet((sheet) => {
-    if (sheet.actualRowCount < FIRST_DATA_ROW) return; // empty sheet
+    if (sheet.rowCount < FIRST_DATA_ROW) return; // empty sheet
     validateHeaderRow(sheet);
 
-    for (let r = FIRST_DATA_ROW; r <= sheet.actualRowCount; r++) {
+    for (let r = FIRST_DATA_ROW; r <= sheet.rowCount; r++) {
       const row = sheet.getRow(r);
       const keyWords = normaliseCell(row.getCell(1).value);
       const tagWords = normaliseCell(row.getCell(2).value);
@@ -136,13 +138,23 @@ function parseWorkbook(workbook) {
       const type     = stripTrailingPunctuation(normaliseCell(row.getCell(4).value));
       const skill    = normaliseCell(row.getCell(5).value);
 
-      // Collect options from Col F onward — actualColumnCount tells us how
-      // many columns the sheet actually used (excluding fully empty cols).
+      // Collect options from Col F onward — columnCount is the last used
+      // column number, so chips past empty gap columns are still scanned.
+      // Dedupe case-insensitively (keep first occurrence's casing) so a row
+      // with repeated chips can't double-insert.
       const options  = [];
-      for (let c = FIRST_OPTION_COL; c <= Math.max(sheet.actualColumnCount, FIRST_OPTION_COL); c++) {
+      const seenOpts = new Set();
+      for (let c = FIRST_OPTION_COL; c <= Math.max(sheet.columnCount, FIRST_OPTION_COL); c++) {
         const v = normaliseCell(row.getCell(c).value);
-        if (v) options.push(v);
+        if (v && !seenOpts.has(v.toLowerCase())) {
+          seenOpts.add(v.toLowerCase());
+          options.push(v);
+        }
       }
+
+      // Blank separator/padding rows (now reachable via the rowCount bound)
+      // carry no data — skip without counting them in summary.totalRows.
+      if (!keyWords && !tagWords && !category && !type && !skill && options.length === 0) continue;
 
       parsed.push({
         sheet:     sheet.name,
@@ -264,12 +276,14 @@ async function findExistingSkill(conn, catId, typeId, skillName) {
 }
 
 async function listExistingOptions(conn, deepskillId) {
+  // Map keyed by lowercase name → { id, status } so the merge loop can
+  // reactivate soft-deleted (status=0) matches instead of skipping them.
   const [rows] = await conn.query(
-    `SELECT skill_option FROM tbl_deepskill_options
+    `SELECT id, skill_option, status FROM tbl_deepskill_options
       WHERE deepskill_id = ?`,
     [deepskillId],
   );
-  return new Set(rows.map((r) => r.skill_option.toLowerCase()));
+  return new Map(rows.map((r) => [r.skill_option.toLowerCase(), { id: r.id, status: Number(r.status) }]));
 }
 
 async function syncSkillOptionsJsonInTxn(conn, deepskillId) {
@@ -374,33 +388,59 @@ async function processBuffer(buffer, { commit = false, actor = null } = {}) {
       const existingSkillId = await findExistingSkill(conn, cat.id, typ.id, r.skill);
       if (existingSkillId) {
         // Even an existing skill may be missing some option chips — merge.
+        // The would-merge count is computed in BOTH modes so the preview
+        // report matches what a commit would do; writes are commit-only.
         let optionsInsertedHere = 0;
-        if (commit && r.options.length) {
-          const have = await listExistingOptions(conn, existingSkillId);
+        if (r.options.length) {
+          const have = await listExistingOptions(conn, existingSkillId); // read-only SELECT, safe in preview
           for (const opt of r.options) {
-            if (have.has(opt.toLowerCase())) {
-              // 2026-06-10: audit log so ops can spot option reuse.
-              logger.info(
-                `deep-skill: matched existing skill_option name="${opt}" (case-insensitive, skill=${existingSkillId})`,
-              );
+            const hit = have.get(opt.toLowerCase());
+            if (hit && hit.status === 1) {
+              if (commit) {
+                // 2026-06-10: audit log so ops can spot option reuse.
+                logger.info(
+                  `deep-skill: matched existing skill_option name="${opt}" (case-insensitive, skill=${existingSkillId})`,
+                );
+              }
               continue;
             }
-            await conn.query(
-              `INSERT INTO tbl_deepskill_options (deepskill_id, skill_option, status)
-               VALUES (?, ?, 1)`,
-              [existingSkillId, opt],
-            );
-            have.add(opt.toLowerCase());
+            if (hit && hit.status === 0) {
+              // Soft-deleted match — reactivate instead of skipping, mirroring
+              // resolveSkillOptionByName() in deep-skill.service.js.
+              if (commit) {
+                await conn.query(
+                  `UPDATE tbl_deepskill_options SET status = 1 WHERE id = ?`,
+                  [hit.id],
+                );
+                logger.info(
+                  `deep-skill: reactivated soft-deleted skill_option name="${opt}" (skill=${existingSkillId})`,
+                );
+              }
+              hit.status = 1;
+              optionsInsertedHere++;
+              created.optionsCreated++;
+              continue;
+            }
+            if (commit) {
+              await conn.query(
+                `INSERT INTO tbl_deepskill_options (deepskill_id, skill_option, status)
+                 VALUES (?, ?, 1)`,
+                [existingSkillId, opt],
+              );
+            }
+            have.set(opt.toLowerCase(), { id: null, status: 1 });
             optionsInsertedHere++;
             created.optionsCreated++;
           }
-          if (optionsInsertedHere > 0) await syncSkillOptionsJsonInTxn(conn, existingSkillId);
+          if (commit && optionsInsertedHere > 0) await syncSkillOptionsJsonInTxn(conn, existingSkillId);
         }
         report.push({
           ...base,
           status: 'skip',
           errors: optionsInsertedHere
-            ? [`skill already exists — merged ${optionsInsertedHere} new option(s)`]
+            ? [commit
+                ? `skill already exists — merged ${optionsInsertedHere} new option(s)`
+                : `skill already exists — would merge ${optionsInsertedHere} new option(s)`]
             : ['skill already exists'],
         });
         continue;

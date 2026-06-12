@@ -7,6 +7,7 @@ const { modernOk, modernError } = require('../../utils/response');
 const magicLinkService = require('../../services/job-magic-link.service');
 const conversationService = require('../../services/whatsapp-conversation.service');
 const logger = require('../../logger');
+const { scopedJob } = require('./jobs');
 
 /*
  * Customer Magic-Link Completion for Unconfirmed Orders — admin endpoints.
@@ -82,6 +83,7 @@ router.post(
   requireJobMagicLinkSend,
   validate(idParam, 'params'),
   validate(sendBody),
+  scopedJob,
   async (req, res, next) => {
     try {
       const jobId = Number(req.params.id);
@@ -196,8 +198,9 @@ router.post(
  * GET /jobs/:id/magic-link-status
  *
  * No additional action gate — any admin-group user with scope on the job
- * can view send/submit telemetry. The scope guard from the parent mount
- * still applies for who can reach /api/admin/* in the first place.
+ * can view send/submit telemetry. The `scopedJob` middleware enforces
+ * row-level scope (client/city/vertical within the caller's manage_* scope),
+ * returning 404 for out-of-scope job_ids so existence isn't leaked.
  *
  * Response shape (modernOk):
  *   {
@@ -216,6 +219,7 @@ router.post(
 router.get(
   '/:id/magic-link-status',
   validate(idParam, 'params'),
+  scopedJob,
   async (req, res, next) => {
     try {
       const jobId = Number(req.params.id);

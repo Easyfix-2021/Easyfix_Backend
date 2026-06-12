@@ -18,6 +18,14 @@ async function jobScopeFields(jobId) {
   return row || null;
 }
 
+async function quotationScopeGuard(req, quotationId) {
+  const [[q]] = await pool.query('SELECT job_id FROM quotation_details WHERE id = ? LIMIT 1', [quotationId]);
+  if (!q) return { ok: false };
+  const jf = await jobScopeFields(q.job_id);
+  if (!jf) return { ok: false };
+  return assertEntityInScope(req, jf);
+}
+
 /*
  * Quotations admin CRUD + validator + expiry countdown.
  *
@@ -125,6 +133,8 @@ router.patch('/:id/approve', validate(Joi.object({
   approvedCharge: Joi.number().min(0).required(),
 })), async (req, res, next) => {
   try {
+    const guard = await quotationScopeGuard(req, req.params.id);
+    if (!guard.ok) return modernError(res, 404, 'quotation not found');
     const [r] = await pool.query(
       `UPDATE quotation_details
           SET approved_charge = ?, action_by = ?, action_on = NOW(), status = 1
@@ -138,6 +148,8 @@ router.patch('/:id/approve', validate(Joi.object({
 
 router.patch('/:id/reject', async (req, res, next) => {
   try {
+    const guard = await quotationScopeGuard(req, req.params.id);
+    if (!guard.ok) return modernError(res, 404, 'quotation not found');
     const [r] = await pool.query(
       `UPDATE quotation_details
           SET status = 0, action_by = ?, action_on = NOW()
@@ -151,7 +163,10 @@ router.patch('/:id/reject', async (req, res, next) => {
 
 router.delete('/:id', async (req, res, next) => {
   try {
-    await pool.query('DELETE FROM quotation_details WHERE id = ?', [req.params.id]);
+    const guard = await quotationScopeGuard(req, req.params.id);
+    if (!guard.ok) return modernError(res, 404, 'quotation not found');
+    const [r] = await pool.query('DELETE FROM quotation_details WHERE id = ?', [req.params.id]);
+    if (r.affectedRows === 0) return modernError(res, 404, 'quotation not found');
     modernOk(res, { deleted: true });
   } catch (e) { next(e); }
 });

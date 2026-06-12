@@ -426,32 +426,57 @@ const MUTABLE_COLUMNS = [
 ];
 
 async function create(input, actor) {
-  const existing = await findActiveByMobile(input.efr_no);
-  if (existing) {
-    const err = new Error(`an active easyfixer with efr_no=${input.efr_no} already exists (efr_id=${existing.efr_id})`);
-    err.status = 409;
-    err.details = { existingId: existing.efr_id };
-    throw err;
-  }
-
-  const columns = [];
-  const values = [];
-  for (const col of MUTABLE_COLUMNS) {
-    if (input[col] !== undefined) {
-      columns.push(col);
-      values.push(input[col]);
+  // efr_no has NO unique index (duplicates exist in prod data — see header
+  // note), so the duplicate check below is a check-then-insert race under
+  // concurrency (e.g. a double-clicked create button). Serialise per efr_no
+  // with a MySQL named lock. GET_LOCK/RELEASE_LOCK are connection-scoped,
+  // so both must run on the SAME pinned connection — never via pool.query().
+  const conn = await pool.getConnection();
+  const lockName = `easyfixer_create_${input.efr_no}`; // < 64 chars, efr_no is a mobile number
+  try {
+    const [[lock]] = await conn.query('SELECT GET_LOCK(?, 5) AS got', [lockName]);
+    if (!lock || lock.got !== 1) {
+      const err = new Error('could not acquire create lock for this mobile number, please retry');
+      err.status = 409;
+      throw err;
     }
-  }
-  // Audit + defaults
-  columns.push('efr_status', 'inserted_by', 'insert_date', 'update_date');
-  values.push(1, actor?.user_id || null, new Date(), new Date());
 
-  const placeholders = columns.map(() => '?').join(', ');
-  const [result] = await pool.query(
-    `INSERT INTO tbl_easyfixer (${columns.join(', ')}) VALUES (${placeholders})`,
-    values
-  );
-  return getById(result.insertId);
+    // Duplicate check — same logic as findActiveByMobile, but on the pinned
+    // connection so it runs under the lock.
+    const [[existing]] = await conn.query(
+      `SELECT efr_id, efr_name FROM tbl_easyfixer
+        WHERE efr_no = ? AND efr_status = 1 LIMIT 1`,
+      [input.efr_no]
+    );
+    if (existing) {
+      const err = new Error(`an active easyfixer with efr_no=${input.efr_no} already exists (efr_id=${existing.efr_id})`);
+      err.status = 409;
+      err.details = { existingId: existing.efr_id };
+      throw err;
+    }
+
+    const columns = [];
+    const values = [];
+    for (const col of MUTABLE_COLUMNS) {
+      if (input[col] !== undefined) {
+        columns.push(col);
+        values.push(input[col]);
+      }
+    }
+    // Audit + defaults
+    columns.push('efr_status', 'inserted_by', 'insert_date', 'update_date');
+    values.push(1, actor?.user_id || null, new Date(), new Date());
+
+    const placeholders = columns.map(() => '?').join(', ');
+    const [result] = await conn.query(
+      `INSERT INTO tbl_easyfixer (${columns.join(', ')}) VALUES (${placeholders})`,
+      values
+    );
+    return getById(result.insertId);
+  } finally {
+    try { await conn.query('SELECT RELEASE_LOCK(?)', [lockName]); } catch (_) { /* connection teardown releases it anyway */ }
+    conn.release();
+  }
 }
 
 // ─── Update ─────────────────────────────────────────────────────────

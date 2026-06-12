@@ -146,6 +146,22 @@ async function processUpload(buffer, { dryRun = false, userId = null } = {}) {
   let skipCount = 0;
   let failedCount = 0;
 
+  // Chunked multi-row INSERTs — one round-trip per 500 rows instead of
+  // one per Excel row. Must go through pool.query (text protocol): the
+  // mysql2 bulk `VALUES ?` expansion doesn't work with pool.execute.
+  const BATCH_SIZE = 500;
+  let pendingRows = [];
+  async function flushBatch() {
+    if (!pendingRows.length) return;
+    await pool.query(
+      `INSERT INTO tbl_pincode
+         (pincode, location, city_id, district, pincode_status, created_by, updated_by)
+       VALUES ?`,
+      [pendingRows]
+    );
+    pendingRows = [];
+  }
+
   for (let i = 0; i < records.length; i++) {
     const rowNumber = i + 2; // +2 to align with Excel row numbers (header at row 1)
     const r = records[i];
@@ -179,19 +195,17 @@ async function processUpload(buffer, { dryRun = false, userId = null } = {}) {
     }
 
     if (!dryRun) {
-      await pool.query(
-        `INSERT INTO tbl_pincode
-           (pincode, location, city_id, district, pincode_status, created_by, updated_by)
-         VALUES (?, ?, ?, ?, 1, ?, ?)`,
-        [pincode, location, cityId, district, userId, userId]
-      );
+      pendingRows.push([pincode, location, cityId, district, 1, userId, userId]);
       // Track in-memory so a duplicate WITHIN the same upload doesn't
       // produce two INSERTs that succeed (would violate uniq_pincode).
       existingPins.add(pincode);
+      if (pendingRows.length >= BATCH_SIZE) await flushBatch();
     }
     results.push({ rowNumber, status: 'created', pincode });
     createdCount++;
   }
+
+  await flushBatch();
 
   return {
     summary: {

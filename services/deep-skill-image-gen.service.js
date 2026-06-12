@@ -11,8 +11,12 @@
  *   2. Build a DALL-E prompt from name + option list.
  *   3. POST to OpenAI /v1/images/generations (model = `getModel()`).
  *   4. Download the returned URL into a Buffer.
- *   5. Upload via `s3Storage.putSkillImage` (Skills/Skill_<id>_<seq>).
- *   6. UPDATE the row's `deepskill_image` + clear `image_gen_status`.
+ *   5. Claim the DB row (guarded UPDATE — only while `deepskill_image`
+ *      is still empty) with the computed key Skills/Skill_<id>_<seq>.
+ *      affectedRows === 0 means a manual upload landed mid-generation:
+ *      manual wins, the auto-gen result is discarded (no S3 write).
+ *   6. Upload via `s3Storage.putSkillImage`; on failure the claim is
+ *      reverted so the row never points at a nonexistent object.
  *   7. Invalidate the catalog + bulk-image caches.
  *   8. Bump the success counter; fire a budget-alert email if a
  *      milestone was just crossed.
@@ -128,10 +132,10 @@ const inflightImageGen = new Set();
 
 function dispatch(skillId) {
   const id = Number(skillId);
-  if (!Number.isInteger(id) || id <= 0) return;
+  if (!Number.isInteger(id) || id <= 0) return false;
   if (inflightImageGen.has(id)) {
     logger.info(`deep-skill-image-gen: dispatch skipped — already in-flight skillId=${id}`);
-    return;
+    return false;
   }
   inflightImageGen.add(id);
   setImmediate(() => {
@@ -146,6 +150,7 @@ function dispatch(skillId) {
         inflightImageGen.delete(id);
       });
   });
+  return true;
 }
 
 /*
@@ -273,31 +278,50 @@ async function generateImage(skillId) {
     return;
   }
 
+  let claimedKey = null;
   try {
     // 4. Compute next seq off the previous canonical key (mirrors
     //    replaceImage in deep-skill.service.js).
     const prev = String(skillRow.deepskill_image || '');
     const match = prev.match(/^Skills\/Skill_\d+_(\d+)$/);
     const seq = match ? Number(match[1]) + 1 : 1;
+    const Key = s3Storage.keyForSkill(id, seq);
 
-    // 5. S3 upload.
-    const Key = await s3Storage.putSkillImage({
+    // 5. Claim the DB row FIRST (guarded — only while the image is still
+    //    empty). This makes a manual upload that landed mid-generation
+    //    win, and removes the S3 key collision: a concurrent replaceImage
+    //    running after the claim reads the claimed key and computes the
+    //    next seq, producing a different key.
+    const [claim] = await pool.query(
+      `UPDATE tbl_deep_skill
+          SET deepskill_image = ?,
+              image_gen_status = NULL,
+              image_gen_attempted_at = NOW()
+        WHERE deepskill_id = ?
+          AND (deepskill_image = '' OR deepskill_image IS NULL)`,
+      [Key, id],
+    );
+    if (!claim || claim.affectedRows === 0) {
+      // Manual upload landed mid-generation — discard the auto-gen
+      // result. No S3 write, no cache invalidation, no counter bump.
+      logger.info(`deep-skill-image-gen: skill=${id} image set concurrently — discarding auto-gen result`);
+      // Clear any leftover pending badge so the FE spinner disappears.
+      await pool.query(
+        `UPDATE tbl_deep_skill SET image_gen_status = NULL WHERE deepskill_id = ? AND image_gen_status = 'pending'`,
+        [id],
+      );
+      return;
+    }
+    claimedKey = Key;
+
+    // 6. S3 upload (row already points at this key).
+    await s3Storage.putSkillImage({
       skillId: id,
       seq,
       buffer: imageBuffer,
       contentType: imageContentType,
       originalName: 'auto-generated.png',
     });
-
-    // 6. Persist key + clear status.
-    await pool.query(
-      `UPDATE tbl_deep_skill
-          SET deepskill_image = ?,
-              image_gen_status = NULL,
-              image_gen_attempted_at = NOW()
-        WHERE deepskill_id = ?`,
-      [Key, id],
-    );
 
     // 7. Invalidate caches so consumers see the new image immediately.
     try { deepSkillService.invalidateAllDeepSkillImagesCache(); } catch (_) { /* defensive */ }
@@ -311,6 +335,20 @@ async function generateImage(skillId) {
         'deep-skill-image-gen: bumpCounterAndMaybeNotify failed (non-fatal)');
     });
   } catch (e) {
+    if (claimedKey) {
+      // The claim landed but the S3 upload failed — revert so the row
+      // doesn't point at a nonexistent object (markFailed only touches
+      // image_gen_status / attempted_at, not deepskill_image).
+      try {
+        await pool.query(
+          `UPDATE tbl_deep_skill SET deepskill_image = '' WHERE deepskill_id = ? AND deepskill_image = ?`,
+          [id, claimedKey],
+        );
+      } catch (revertErr) {
+        logger.warn({ err: revertErr && revertErr.message, skillId: id },
+          'deep-skill-image-gen: claim revert failed (non-fatal)');
+      }
+    }
     await markFailed(id, e);
   }
 }
@@ -318,32 +356,44 @@ async function generateImage(skillId) {
 /*
  * Counter increment + budget-alert email.
  *
- * Atomic UPDATE on easyfix_properties.total_count, then re-read the
- * new value and compare floor(total/T) vs floor((total-1)/T) to detect
- * crossing each Nth multiple. Robust to operators changing T mid-flight.
+ * Atomic UPDATE on easyfix_properties.total_count using
+ * LAST_INSERT_ID(expr) so the post-increment value is captured on the
+ * SAME pooled connection — each worker sees exactly the total its own
+ * bump produced (a separate read-back could return a later value under
+ * concurrency and miss the crossing entirely). Then compare
+ * floor(total/T) vs floor((total-1)/T) to detect crossing each Nth
+ * multiple. Robust to operators changing T mid-flight.
  *
  * Email send failures DO NOT roll back the counter — counter integrity
  * is more important than notification reliability (the next crossing
  * still fires).
  */
 async function bumpCounterAndMaybeNotify() {
-  // 1. Atomic increment.
-  await pool.query(
-    `UPDATE easyfix_properties
-        SET property_value = CAST(property_value AS UNSIGNED) + 1
-      WHERE property_key = 'deep.skill.image.gen.total_count'`,
-  );
+  // 1. Atomic increment + same-connection capture of the new value.
+  //    LAST_INSERT_ID(expr) stores the incremented value AND stages it
+  //    in the connection's LAST_INSERT_ID, so the read in step 2 is
+  //    immune to interleaved bumps from concurrent workers.
+  let total;
+  const conn = await pool.getConnection();
+  try {
+    const [upd] = await conn.query(
+      `UPDATE easyfix_properties
+          SET property_value = LAST_INSERT_ID(CAST(property_value AS UNSIGNED) + 1)
+        WHERE property_key = 'deep.skill.image.gen.total_count'`,
+    );
+    if (!upd || upd.affectedRows !== 1) {
+      // Seed row absent — graceful no-op (do NOT read LAST_INSERT_ID
+      // here; it would return a stale per-connection value).
+      logger.warn('deep-skill-image-gen: counter row missing — skipping milestone check');
+      return;
+    }
 
-  // 2. Read back fresh total + threshold. We don't use the cached
-  //    propertiesService snapshot here because it'd be stale by
-  //    seconds — we just bumped the row.
-  const [[totalRow]] = await pool.query(
-    `SELECT CAST(property_value AS UNSIGNED) AS v
-       FROM easyfix_properties
-      WHERE property_key = 'deep.skill.image.gen.total_count'
-      LIMIT 1`,
-  );
-  const total = Number(totalRow?.v || 0);
+    // 2. Read back this worker's own post-increment total.
+    const [[row]] = await conn.query('SELECT LAST_INSERT_ID() AS v');
+    total = Number(row?.v || 0);
+  } finally {
+    conn.release();
+  }
   if (!total) return;
 
   // Flush the in-memory properties cache so other readers don't see a

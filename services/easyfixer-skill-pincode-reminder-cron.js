@@ -219,7 +219,13 @@ async function runTest({ mobile, sourceId } = {}) {
   const longUrl = `${base}/profile-update/${token}`;
   let shortUrl = longUrl;
   try {
-    shortUrl = await urlShortener.shortenUrl(longUrl, { purpose: 'easyfixer_profile_update', ttlDays: 30 });
+    const expiresAt = new Date(Date.now() + 30 * 24 * 3600 * 1000); // match 30d JWT TTL
+    const { short_url } = await urlShortener.shortenUrl(
+      longUrl,
+      { purpose: 'easyfixer_profile_update', expiresAt, createdBy: null },
+      pool,
+    );
+    shortUrl = short_url;
   } catch (e) {
     logger.warn({ err: e?.message }, 'skill-pincode-reminder TEST: shorten failed, using long URL');
   }

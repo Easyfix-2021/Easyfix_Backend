@@ -261,14 +261,15 @@ async function upsertPrimarySecondarySpoc(clientId, primaryUserId, secondaryUser
  * Validate one user_id exists + is internal (in tbl_user, not soft-deleted).
  * Cached set per process to avoid round-trip per row in bulk uploads.
  *
- * Refresh: invoke `clearActiveUserCache()` after any user create/edit
- * to drop the cache. For the bulk-upload flow's lifespan (~30s) the
- * cache is fine without active invalidation.
+ * Refresh: the cache self-expires after 60s, so user create/edit is
+ * picked up automatically with bounded staleness. `clearActiveUserCache()`
+ * remains available for explicit invalidation.
  */
-let _activeUsersPromise = null;
+const ACTIVE_USERS_CACHE_TTL_MS = 60 * 1000; // 60s — bounded staleness for bulk SPOC validation
+let _activeUsersCache = null; // { promise, expiresAt }
 async function activeInternalUserIds() {
-  if (!_activeUsersPromise) {
-    _activeUsersPromise = (async () => {
+  if (!_activeUsersCache || _activeUsersCache.expiresAt <= Date.now()) {
+    const promise = (async () => {
       const [rows] = await pool.query(
         // legacy `userDao.getActiveInternalUsers()` was role-status agnostic;
         // we err on the side of "any tbl_user row whose status != 0".
@@ -276,12 +277,15 @@ async function activeInternalUserIds() {
       );
       return new Set(rows.map((r) => r.user_id));
     })();
+    _activeUsersCache = { promise, expiresAt: Date.now() + ACTIVE_USERS_CACHE_TTL_MS };
+    // Don't cache a failed lookup for the full TTL.
+    promise.catch(() => { if (_activeUsersCache && _activeUsersCache.promise === promise) _activeUsersCache = null; });
   }
-  return _activeUsersPromise;
+  return _activeUsersCache.promise;
 }
 
 function clearActiveUserCache() {
-  _activeUsersPromise = null;
+  _activeUsersCache = null;
 }
 
 module.exports = {

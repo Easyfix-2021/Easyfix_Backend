@@ -216,8 +216,13 @@ async function statsForCandidates(efrIds, job, clientId) {
   // sized the pool at 20). Tail-latency for the 7-query batch is
   // max(query_i), not sum(query_i) — typically ~150ms vs ~600ms sequential
   // on the 384k-row tbl_job.
+  // dateStrings:true (db.js) delivers requested_date_time as the IST
+  // literal 'YYYY-MM-DD HH:mm:ss' — take the date prefix directly.
+  // Round-tripping through new Date().toISOString() is server-TZ-dependent
+  // and shifts the day on non-UTC servers (violates the TZ-agnostic
+  // invariant documented in job.service.js IST helpers).
   const reqDate = job.requested_date_time
-    ? new Date(job.requested_date_time).toISOString().slice(0, 10)
+    ? String(job.requested_date_time).slice(0, 10)
     : null;
 
   const [

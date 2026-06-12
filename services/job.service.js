@@ -2194,6 +2194,11 @@ function fireNotification(eventName, jobId) {
 
 function statusToEventName(prevStatus, newStatus) {
   // Map tbl_job.job_status transition → webhook event name.
+  // No-op re-submit (same status) is not a transition — never re-fire
+  // webhooks/SMS. Mobile /eta and /reschedule deliberately call
+  // setStatus with the existing status to ride the extras path and
+  // rely on NO event firing (see routes/mobile/index.js).
+  if (Number(prevStatus) === Number(newStatus)) return null;
   if (newStatus === STATUS.IN_PROGRESS)   return 'TechStart';
   if (COMPLETED_STATES.has(newStatus))    return 'TechVisitComplete';
   if (newStatus === STATUS.CANCELLED)     return 'CancelJob';

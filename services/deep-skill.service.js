@@ -166,7 +166,10 @@ async function list({ categoryId, serviceTypeId, includeInactive = false } = {})
            sc.service_catg_name AS category_name,
            st.service_type_name,
            (SELECT COUNT(*) FROM tbl_deepskill_options o
-             WHERE o.deepskill_id = ds.deepskill_id AND o.status = 1) AS option_count
+             WHERE o.deepskill_id = ds.deepskill_id AND o.status = 1) AS option_count,
+           (SELECT GROUP_CONCAT(o.skill_option ORDER BY o.id SEPARATOR '||')
+              FROM tbl_deepskill_options o
+             WHERE o.deepskill_id = ds.deepskill_id AND o.status = 1) AS option_labels
       FROM tbl_deep_skill ds
       LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = ds.category_id
       LEFT JOIN tbl_service_type st ON st.service_type_id = ds.service_type_id
@@ -329,7 +332,13 @@ async function create(input, actor) {
         'UPDATE tbl_deep_skill SET image_gen_status = ?, image_gen_attempted_at = NOW() WHERE deepskill_id = ?',
         ['pending', deepSkillId],
       );
-      dsImageGen.dispatch(deepSkillId);
+      // A fresh AUTO_INCREMENT id can't already be in the single-flight
+      // Set, so a false return here would be surprising — log it but DON'T
+      // revert (no prior state worth restoring on a just-created row).
+      const queued = dsImageGen.dispatch(deepSkillId);
+      if (!queued) {
+        logger.warn({ deepSkillId }, 'deep-skill: auto-gen dispatch unexpectedly skipped on fresh create');
+      }
     }
   } catch (err) {
     logger.warn({ err, deepSkillId }, 'deep-skill: auto-gen dispatch failed post-create (non-fatal)');
@@ -389,7 +398,7 @@ async function update(deepskillId, patch) {
     const dsImageGen = require('./deep-skill-image-gen.service');
     if (await dsImageGen.isAutoGenEnabled()) {
       const [[curr]] = await pool.query(
-        `SELECT deepskill_image, status, image_gen_status
+        `SELECT deepskill_image, status, image_gen_status, image_gen_attempted_at
            FROM tbl_deep_skill WHERE deepskill_id = ? LIMIT 1`,
         [deepskillId],
       );
@@ -403,7 +412,20 @@ async function update(deepskillId, patch) {
           'UPDATE tbl_deep_skill SET image_gen_status = ?, image_gen_attempted_at = NOW() WHERE deepskill_id = ?',
           ['pending', deepskillId],
         );
-        dsImageGen.dispatch(deepskillId);
+        const queued = dsImageGen.dispatch(deepskillId);
+        if (!queued) {
+          // Single-flight rejected the dispatch (already in-flight). Revert
+          // BOTH stamped columns to their prior values so the row isn't
+          // left orphaned in 'pending' with no worker behind it.
+          await pool.query(
+            'UPDATE tbl_deep_skill SET image_gen_status = ?, image_gen_attempted_at = ? WHERE deepskill_id = ?',
+            [curr.image_gen_status, curr.image_gen_attempted_at, deepskillId],
+          );
+          logger.info(
+            { deepskillId },
+            'deep-skill: auto-gen dispatch skipped (already in-flight) — reverted pending stamp',
+          );
+        }
       }
     }
   } catch (err) {

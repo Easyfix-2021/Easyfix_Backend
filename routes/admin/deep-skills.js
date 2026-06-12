@@ -450,7 +450,17 @@ router.post(
         ['pending', skillId],
       );
       const dsImageGen = require('../../services/deep-skill-image-gen.service');
-      dsImageGen.dispatch(skillId);
+      const queued = dsImageGen.dispatch(skillId);
+      if (!queued) {
+        // Single-flight rejected the dispatch (already in-flight). Revert
+        // the caller-stamped 'pending' to the prior value so the row isn't
+        // left orphaned, then surface the same 409 the status guard uses.
+        await require('../../db').pool.query(
+          'UPDATE tbl_deep_skill SET image_gen_status = ? WHERE deepskill_id = ?',
+          [row.image_gen_status, skillId],
+        );
+        return modernError(res, 409, 'Image generation already in progress');
+      }
       return modernOk(res, { status: 'pending' }, 'image regeneration queued');
     } catch (e) { return next(e); }
   },

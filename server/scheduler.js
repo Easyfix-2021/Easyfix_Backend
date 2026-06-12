@@ -52,6 +52,7 @@ const TZ = 'Asia/Kolkata';
  * project a public-safe view (omits the runner closure + task handle).
  */
 const jobs = [];
+let orphanResetTask = null;
 
 function registerJob({
   id, name, description, cron: cronExpr, runner, skipReason,
@@ -200,7 +201,7 @@ Here's how it works, step by step:
 
 Why this matters: without this task, "auto-confirm" clients would have to call every customer manually, defeating the whole point of opting in. Trigger Now is useful when a new client just opted in and ops wants to dispatch the first wave of confirmations immediately rather than waiting for the next hourly tick.
 
-Note: this task only runs if the property "magic.link.cron.enabled" is set to "true" in easyfix_properties. If it's set to "false" (or unset), the automatic schedule is OFF — but Trigger Now still works for manual one-off sweeps.`,
+Note: this task only runs if the property "magic.link.cron.enabled" is set to "true" in easyfix_properties. The property is checked once at server start — after changing it, a server restart (redeploy) is required for the schedule to turn on or off. If it's set to "false" (or unset), the automatic schedule is OFF — but Trigger Now still works for manual one-off sweeps.`,
     cron: '5 * * * *',
     runner: async () => {
       const result = await magicLinkCron.runHourlySweep();
@@ -227,8 +228,8 @@ Note: this task only runs if the property "magic.link.cron.enabled" is set to "t
   if (cronDisabled) {
     magicLinkJob.skipReason = 'CRON_DISABLED=true';
   } else if (!magicLinkCronEnabled) {
-    magicLinkJob.skipReason = "property 'magic.link.cron.enabled' is not 'true'";
-    logger.info('Magic-link cron SKIPPED — set magic.link.cron.enabled=true in easyfix_properties to enable.');
+    magicLinkJob.skipReason = "property 'magic.link.cron.enabled' was not 'true' at server start — flip it to 'true' and restart the server to enable";
+    logger.info('Magic-link cron SKIPPED — set magic.link.cron.enabled=true in easyfix_properties to enable (takes effect after restart).');
   } else {
     magicLinkJob.task = cron.schedule(
       magicLinkJob.cron,
@@ -260,7 +261,7 @@ Note: this task only runs if the property "magic.link.cron.enabled" is set to "t
     id: 'easyfixer-profile-reminder',
     name: 'Easyfixer Profile-Completion Reminder',
     description:
-`What this task does: Every active easyfixer (technician) in our system is expected to fill out their full profile — name, contact info, service categories they cover, documents (Aadhaar, PAN, photo), etc. When their profile is incomplete, the auto-assignment engine struggles to pick them for jobs, and ops can't verify them. This task gives those technicians a friendly daily nudge over WhatsApp.
+`What this task does: Every active easyfixer (technician) in our system is expected to fill out their full profile — name, contact info, service categories they cover, documents (Aadhaar, PAN, photo), etc. When their profile is incomplete, the auto-assignment engine struggles to pick them for jobs, and ops can't verify them. This task gives those technicians a friendly twice-weekly nudge over WhatsApp.
 
 Here's how it works, step by step:
   1. Every Wednesday and Saturday at 7:00 PM IST, the task wakes up automatically. Twice-weekly cadence catches technicians at end-of-day attention while avoiding daily-nudge fatigue.
@@ -270,11 +271,11 @@ Here's how it works, step by step:
   5. For each remaining technician, it asks Gallabox (our WhatsApp messaging provider) to send them a pre-approved template message called "complete_profile_easyfixer". The template is a generic, friendly nudge: "Please complete your EasyFix profile to get assigned to jobs."
   6. The task logs how many technicians were eligible, how many messages it attempted, how many succeeded, and how many failed — visible in the server logs and on this page (Last Run details below).
 
-Why this matters: technicians often get distracted mid-signup and never finish their profile. Without this daily nudge, those incomplete profiles pile up indefinitely. The WhatsApp message lands directly on their phone and links back to the profile page — much higher conversion than email reminders.
+Why this matters: technicians often get distracted mid-signup and never finish their profile. Without this nudge, those incomplete profiles pile up indefinitely. The WhatsApp message lands directly on their phone and links back to the profile page — much higher conversion than email reminders.
 
 Note: this task DOES have a per-technician 7-day cooldown — once we send a profile-update WhatsApp (from any source: this cron, the skill+pincode cron, or a manual operator "Send Profile Update Link" action), we don't nudge that technician again for 7 days. Prevents nudge fatigue.
 
-This task only runs automatically if the property "easyfixer.profile_reminder.enabled" is set to "true" in easyfix_properties. If unset or "false", the schedule is OFF — but Trigger Now still works for manual sweeps. Trigger Now is useful if ops just imported a batch of new technicians and wants to send the first wave of nudges immediately rather than waiting for tomorrow's 10am tick.`,
+This task only runs automatically if the property "easyfixer.profile_reminder.enabled" is set to "true" in easyfix_properties. The property is checked once at server start — after changing it, a server restart (redeploy) is required for the schedule to turn on or off. If unset or "false", the schedule is OFF — but Trigger Now still works for manual sweeps. Trigger Now is useful if ops just imported a batch of new technicians and wants to send the first wave of nudges immediately rather than waiting for the next Wednesday/Saturday 7 PM tick.`,
     cron: '0 19 * * 3,6',
     runner: async () => {
       const result = await profileReminderCron.runDailyReminder();
@@ -309,8 +310,8 @@ This task only runs automatically if the property "easyfixer.profile_reminder.en
   if (cronDisabled) {
     profileReminderJob.skipReason = 'CRON_DISABLED=true';
   } else if (!profileReminderEnabled) {
-    profileReminderJob.skipReason = "property 'easyfixer.profile_reminder.enabled' is not 'true'";
-    logger.info("Easyfixer profile-reminder cron SKIPPED — set easyfixer.profile_reminder.enabled=true in easyfix_properties to enable.");
+    profileReminderJob.skipReason = "property 'easyfixer.profile_reminder.enabled' was not 'true' at server start — flip it to 'true' and restart the server to enable";
+    logger.info("Easyfixer profile-reminder cron SKIPPED — set easyfixer.profile_reminder.enabled=true in easyfix_properties to enable (takes effect after restart).");
   } else {
     profileReminderJob.task = cron.schedule(
       profileReminderJob.cron,
@@ -318,20 +319,20 @@ This task only runs automatically if the property "easyfixer.profile_reminder.en
       { timezone: TZ },
     );
     profileReminderJob.registered = true;
-    logger.info('Easyfixer profile-reminder cron registered (easyfixer.profile_reminder.enabled=true, daily 10:00 IST).');
+    logger.info('Easyfixer profile-reminder cron registered (easyfixer.profile_reminder.enabled=true, Wed + Sat 19:00 IST).');
   }
 
   // ─── Easyfixer Skill+Pincode Reminder — daily at 12:30 IST ────────
   // Added 2026-06-11. Sister cron to the profile-completion reminder
   // above, but targets a different incompleteness signal: ACTIVE
   // easyfixers whose profile shell is filled in (so they don't show up
-  // for the 10:00 nudge) but who are missing deep-skill mappings
+  // for the profile-completion nudge) but who are missing deep-skill mappings
   // (tbl_efr_deepskill_mapping with is_repairing=1) OR serviceable
   // pincodes (tbl_efr_serviceable_pincodes.pincodes empty/null) — both
   // of which the auto-assignment engine actually USES to pick them.
   // 12:30 IST puts the WhatsApp in the lunch-break attention window
   // (highest action-completion for a 2-min form) without stacking on
-  // top of the 10:00 profile-completion cron. Reuses the magic-link
+  // top of the profile-completion cron. Reuses the magic-link
   // sender (sendForEasyfixer) so JWT, short URL, Gallabox template
   // send, and audit-column updates are all handled downstream.
   const skillPincodeReminderCron = require('../services/easyfixer-skill-pincode-reminder-cron');
@@ -339,7 +340,7 @@ This task only runs automatically if the property "easyfixer.profile_reminder.en
     id: 'easyfixer-skill-pincode-reminder',
     name: 'Easyfixer Skill+Pincode Reminder',
     description:
-`What this task does: Active easyfixers whose profile shell is filled in (so the 10:00 profile-completion cron skips them) but who are missing the two structured datasets the dispatcher actually USES to pick them — deep-skill mappings AND/OR serviceable pincodes — won't show up in any job auto-assignment. This cron nudges them to fill in those two surfaces via the same WhatsApp magic-link the "Send Profile Update Link" admin action sends.
+`What this task does: Active easyfixers whose profile shell is filled in (so the profile-completion cron — Wed + Sat 19:00 IST — skips them) but who are missing the two structured datasets the dispatcher actually USES to pick them — deep-skill mappings AND/OR serviceable pincodes — won't show up in any job auto-assignment. This cron nudges them to fill in those two surfaces via the same WhatsApp magic-link the "Send Profile Update Link" admin action sends.
 
 Step by step:
   1. Daily at 12:30 IST — lunch-break attention window, the highest-conversion slot for a 2-minute mobile form.
@@ -348,7 +349,7 @@ Step by step:
   4. For each remaining tech, reuses the sendForEasyfixer service (same code path the manual "Send Profile Update Link" admin action uses), so JWT minting, URL shortening, Gallabox template send, and audit-column updates (profile_update_sent_at / send_count / last_action) all flow through one place. The audit's last_action is stamped 'reminder' so operators can distinguish cron sends from manual sends.
   5. Per-row send failures (invalid number, opt-out, template render error) are logged + counted but never abort the loop — the rest of the queue still drains.
 
-Note: this task only runs automatically if the property "easyfixer.skill_pincode_reminder.enabled" is set to "true" in easyfix_properties. If unset or "false", the schedule is OFF — but Trigger Now still works for manual sweeps. Test sends a real Gallabox template to whatever mobile you type — never to a real easyfixer's number.`,
+Note: this task only runs automatically if the property "easyfixer.skill_pincode_reminder.enabled" is set to "true" in easyfix_properties. The property is checked once at server start — after changing it, a server restart (redeploy) is required for the schedule to turn on or off. If unset or "false", the schedule is OFF — but Trigger Now still works for manual sweeps. Test sends a real Gallabox template to whatever mobile you type — never to a real easyfixer's number.`,
     cron: '30 12 * * *',
     runner: async () => {
       const result = await skillPincodeReminderCron.runDailyReminder();
@@ -383,8 +384,8 @@ Note: this task only runs automatically if the property "easyfixer.skill_pincode
   if (cronDisabled) {
     skillPincodeReminderJob.skipReason = 'CRON_DISABLED=true';
   } else if (!skillPincodeReminderEnabled) {
-    skillPincodeReminderJob.skipReason = "property 'easyfixer.skill_pincode_reminder.enabled' is not 'true'";
-    logger.info("Skill+pincode reminder cron SKIPPED — set easyfixer.skill_pincode_reminder.enabled=true in easyfix_properties to enable.");
+    skillPincodeReminderJob.skipReason = "property 'easyfixer.skill_pincode_reminder.enabled' was not 'true' at server start — flip it to 'true' and restart the server to enable";
+    logger.info("Skill+pincode reminder cron SKIPPED — set easyfixer.skill_pincode_reminder.enabled=true in easyfix_properties to enable (takes effect after restart).");
   } else {
     skillPincodeReminderJob.task = cron.schedule(
       skillPincodeReminderJob.cron,
@@ -406,12 +407,10 @@ Note: this task only runs automatically if the property "easyfixer.skill_pincode
   //
   // No property gate — the cost is one tiny UPDATE per 5 min, and the
   // alternative (gate disabled, orphans accumulate) is strictly worse.
-  // CRON_DISABLED still short-circuits it (we already returned above
-  // when cronDisabled is true) — wait, we didn't return. Re-check the
-  // gate inline so dev environments stay quiet.
+  // init() has no early return for CRON_DISABLED — gate inline so dev environments stay quiet.
   if (!cronDisabled) {
     const dsImageGen = require('../services/deep-skill-image-gen.service');
-    cron.schedule(
+    orphanResetTask = cron.schedule(
       '*/5 * * * *',
       async () => {
         try {
@@ -436,6 +435,8 @@ function stop() {
     j.registered = false;
   }
   jobs.length = 0;
+  try { orphanResetTask?.stop(); } catch { /* ignore */ }
+  orphanResetTask = null;
 }
 
 /*

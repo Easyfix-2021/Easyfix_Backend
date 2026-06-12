@@ -302,10 +302,12 @@ async function menuActions() {
  */
 function resolveVisibleMenuIds() {
   const raw = String(
-    // 2026-06-03 per ops: easyfix_properties is now the SOLE source of
-    // truth. Env fallback dropped so a stale env var on a pod can't
-    // override a fresh DB value.
-    getProperty('new.crm.visible.menu.ids') ?? ''
+    // easyfix_properties is the primary source of truth (2026-06-03 per
+    // ops) — a fresh DB value always wins over the env var. The env var
+    // is the FALLBACK when the property is absent (pre-migration deploys,
+    // DB outage, and the hermetic test suite, which runs without MySQL).
+    getProperty('new.crm.visible.menu.ids') ??
+      process.env.NEW_CRM_VISIBLE_MENU_IDS ?? ''
   ).trim();
   if (!raw) return null;                       // null = filter inactive, show all
   const ids = raw.split(',')
@@ -316,8 +318,10 @@ function resolveVisibleMenuIds() {
 
 function resolveMenuOverrideEmails() {
   const raw = String(
-    // easyfix_properties is the SOLE source of truth (2026-06-03).
-    getProperty('new.crm.menu.override.emails') ?? ''
+    // easyfix_properties primary, env fallback (same contract as
+    // resolveVisibleMenuIds above).
+    getProperty('new.crm.menu.override.emails') ??
+      process.env.NEW_CRM_MENU_OVERRIDE_EMAILS ?? ''
   ).trim();
   if (!raw) return new Set();
   return new Set(

@@ -14,6 +14,8 @@
  *   (c) Time-bound expiry only. Unlike a job (which transitions out of
  *       status=9 to invalidate the link), an easyfixer profile is always
  *       editable, so there is no equivalent state gate.
+ *   (d) Per-token rate limiting, 60 req / 10 min, keyed on verified efrId
+ *       with IP fallback.
  *
  * All responses use the modern `{success, data, error}` shape via utils/response.
  */
@@ -26,6 +28,7 @@ const { verifyEasyfixerProfileToken } = require('../../utils/jwt');
 const profileUpdateLink = require('../../services/easyfixer-profile-update-link.service');
 const { modernOk, modernError } = require('../../utils/response');
 const validate = require('../../middleware/validate');
+const { rateLimit } = require('../../middleware/rate-limit');
 const logger = require('../../logger');
 
 // ─── Joi schemas ────────────────────────────────────────────────────
@@ -113,9 +116,25 @@ function verifyTokenFromQuery(req) {
   return verifyEasyfixerProfileToken(token);
 }
 
+// Per-token rate limit (mirrors routes/public/maps.js): 60 req / 10 min keyed
+// on the verified efrId; falls back to IP for malformed/expired tokens so a
+// forged token can't share one anonymous bucket with all other callers.
+const tokenRateLimit = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 60,
+  key: (req) => {
+    try {
+      return `efr:${verifyEasyfixerProfileToken(String((req.query && req.query.token) || ''))}`;
+    } catch (_e) {
+      return `ip:${req.ip}`;
+    }
+  },
+});
+
 // ─── GET /prefill?token=<jwt> ───────────────────────────────────────
 router.get(
   '/prefill',
+  tokenRateLimit,
   validate(tokenQuery, 'query'),
   async (req, res, next) => {
     try {
@@ -132,6 +151,7 @@ router.get(
 // ─── PUT /save?token=<jwt> ──────────────────────────────────────────
 router.put(
   '/save',
+  tokenRateLimit,
   validate(tokenQuery, 'query'),
   validate(saveBody, 'body'),
   async (req, res, next) => {
@@ -155,6 +175,7 @@ router.put(
 // used by /prefill + /save) — there's no token caching on the BE side.
 router.get(
   '/pincodes',
+  tokenRateLimit,
   validate(pincodeSearchQuery, 'query'),
   async (req, res, next) => {
     try {

@@ -202,10 +202,10 @@ router.post('/:id/ops-approve', validate(Joi.object({
               ops_remarks = ?,
               updated_on = NOW(),
               updated_by = ?
-        WHERE advance_id = ?`,
+        WHERE advance_id = ? AND adv_status = 0`,
       [req.user.user_id, req.body.remarks || null, req.user.user_id, id]
     );
-    if (r.affectedRows === 0) return modernError(res, 404, 'advance not found');
+    if (r.affectedRows === 0) return modernError(res, 409, 'advance is not pending (state changed concurrently)');
     modernOk(res, { approvedBy: 'ops', status: 1 });
   } catch (e) { next(e); }
 });
@@ -234,7 +234,7 @@ router.post('/:id/fin-approve', validate(Joi.object({
               transaction_id = ?,
               updated_on = NOW(),
               updated_by = ?
-        WHERE advance_id = ?`,
+        WHERE advance_id = ? AND adv_status = 1`,
       [
         req.user.user_id,
         req.body.remarks || null,
@@ -243,7 +243,7 @@ router.post('/:id/fin-approve', validate(Joi.object({
         id,
       ]
     );
-    if (r.affectedRows === 0) return modernError(res, 404, 'advance not found');
+    if (r.affectedRows === 0) return modernError(res, 409, 'advance is not in ops-approved state (state changed concurrently)');
     modernOk(res, { approvedBy: 'finance', status: 2 });
   } catch (e) { next(e); }
 });
@@ -274,7 +274,7 @@ router.post('/:id/reject', validate(Joi.object({
                 ops_remarks = ?,
                 updated_on = NOW(),
                 updated_by = ?
-          WHERE advance_id = ?`
+          WHERE advance_id = ? AND adv_status = 0`
       : `UPDATE tbl_efr_advance_payment
             SET adv_status = 3,
                 fin_action_on = NOW(),
@@ -282,14 +282,14 @@ router.post('/:id/reject', validate(Joi.object({
                 fin_remarks = ?,
                 updated_on = NOW(),
                 updated_by = ?
-          WHERE advance_id = ?`;
+          WHERE advance_id = ? AND adv_status = 1`;
     const [r] = await pool.query(sql, [
       req.user.user_id,
       req.body.remarks || null,
       req.user.user_id,
       id,
     ]);
-    if (r.affectedRows === 0) return modernError(res, 404, 'advance not found');
+    if (r.affectedRows === 0) return modernError(res, 409, 'advance cannot be rejected (state changed concurrently)');
     modernOk(res, { rejected: true, rejectedBy: current === 0 ? 'ops' : 'finance', status: 3 });
   } catch (e) { next(e); }
 });

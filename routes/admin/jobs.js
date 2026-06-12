@@ -2286,3 +2286,4 @@ router.delete(
 );
 
 module.exports = router;
+module.exports.scopedJob = scopedJob;

@@ -40,6 +40,7 @@ const xlsxSvc = require('../../services/client-xlsx.service');
 const { pool } = require('../../db');
 const s3 = require('../../utils/s3-storage');
 const v = require('../../validators/client.validator');
+const logger = require('../../logger');
 
 // Multer in-memory storage for client document uploads.
 // 10MB cap — same shape as the notice-image route.
@@ -79,6 +80,37 @@ async function loadAndGuardClient(req, res) {
     return null;
   }
   return client;
+}
+
+/*
+ * Scope-guard a flat id-based sub-resource by its owning client_id.
+ *
+ * The flat /contacts/:id, /billing/:id, /custom-properties/:id,
+ * /services/:id and /documents/:id routes are keyed on the sub-resource
+ * PK, not on a /:clientId path segment — so they skip
+ * loadAndGuardClient(). Without this check a scoped operator could
+ * mutate sub-resources of clients OUTSIDE their manage_clients scope by
+ * enumerating integer ids. We resolve the owning client_id (via the
+ * service read-helpers), re-load the client, and run the SAME scope
+ * assertion the nested routes use.
+ *
+ * Anti-enumeration: every failure path returns the handler's own
+ * not-found message + 404, so "out of scope" is indistinguishable from
+ * "does not exist".
+ *
+ * Returns true when the caller is allowed to proceed; false (and has
+ * already written the 404 response) otherwise.
+ */
+async function guardRowByClientId(req, res, clientId, notFoundMsg) {
+  if (clientId == null) { modernError(res, 404, notFoundMsg); return false; }
+  const client = await svc.getClientById(clientId);
+  if (!client) { modernError(res, 404, notFoundMsg); return false; }
+  const guard = assertEntityInScope(req, {
+    client_id: client.client_id,
+    vertical_id: client.vertical_id,
+  });
+  if (!guard.ok) { modernError(res, 404, notFoundMsg); return false; }
+  return true;
 }
 
 /* ─── Clients CRUD ────────────────────────────────────────────────── */
@@ -456,6 +488,7 @@ router.put(
   validate(v.updateContactBody),
   async (req, res, next) => {
     try {
+      if (!(await guardRowByClientId(req, res, await svc.getContactClientId(req.params.id), 'contact not found'))) return;
       await svc.updateContact(req.params.id, req.body);
       modernOk(res, { updated: true });
     } catch (e) {
@@ -526,6 +559,7 @@ router.delete(
   requireClientEdit,
   async (req, res, next) => {
     try {
+      if (!(await guardRowByClientId(req, res, await svc.getContactClientId(req.params.id), 'contact not found'))) return;
       const affected = await svc.deleteContact(req.params.id);
       if (!affected) return modernError(res, 404, 'contact not found');
       modernOk(res, { deleted: true });
@@ -566,6 +600,7 @@ router.put(
   validate(v.updateBillingBody),
   async (req, res, next) => {
     try {
+      if (!(await guardRowByClientId(req, res, await svc.getBillingClientId(req.params.id), 'billing row not found'))) return;
       const affected = await svc.updateBilling(req.params.id, req.body);
       if (!affected) return modernError(res, 404, 'billing row not found');
       modernOk(res, { updated: true });
@@ -581,6 +616,7 @@ router.delete(
   requireClientEdit,
   async (req, res, next) => {
     try {
+      if (!(await guardRowByClientId(req, res, await svc.getBillingClientId(req.params.id), 'billing row not found'))) return;
       const affected = await svc.deleteBilling(req.params.id);
       if (!affected) return modernError(res, 404, 'billing row not found');
       modernOk(res, { deleted: true });
@@ -651,6 +687,7 @@ router.put(
   validate(v.updateCustomPropertyBody),
   async (req, res, next) => {
     try {
+      if (!(await guardRowByClientId(req, res, await svc.getCustomPropertyClientId(req.params.id), 'custom property not found'))) return;
       const affected = await svc.updateCustomProperty(req.params.id, req.body);
       if (!affected) return modernError(res, 404, 'custom property not found');
       modernOk(res, { updated: true });
@@ -666,6 +703,7 @@ router.delete(
   requireClientEdit,
   async (req, res, next) => {
     try {
+      if (!(await guardRowByClientId(req, res, await svc.getCustomPropertyClientId(req.params.id), 'custom property not found'))) return;
       const affected = await svc.deleteCustomProperty(req.params.id);
       if (!affected) return modernError(res, 404, 'custom property not found');
       modernOk(res, { deleted: true });
@@ -711,8 +749,7 @@ router.get('/:clientId/collected-by-preference', async (req, res, next) => {
     } catch (e) {
       // Defensive: if collected_by column doesn't exist on this DB,
       // fall back to "any" rather than 500.
-      // eslint-disable-next-line no-console
-      console.warn('[collected-by-pref] tbl_client.collected_by read failed — falling back to "any":', e?.message);
+      logger.warn({ err: e }, 'collected-by-pref: tbl_client.collected_by read failed — falling back to "any"');
     }
     modernOk(res, { preferred, source });
   } catch (e) { next(e); }
@@ -886,6 +923,7 @@ router.get(
   }),
   async (req, res, next) => {
     try {
+      if (!(await guardRowByClientId(req, res, await svc.getServiceClientId(req.params.id), 'client service not found'))) return;
       const row = await clientServicesSvc.getOne(req.params.id);
       if (!row) return modernError(res, 404, 'client service not found');
       modernOk(res, row);
@@ -959,6 +997,7 @@ router.put(
   }),
   async (req, res, next) => {
     try {
+      if (!(await guardRowByClientId(req, res, await svc.getServiceClientId(req.params.id), 'client service not found'))) return;
       const affected = await clientServicesSvc.update(req.params.id, req.body);
       if (!affected) return modernError(res, 404, 'client service not found');
       modernOk(res, { updated: true });
@@ -974,6 +1013,7 @@ router.delete(
   requireClientEdit,
   async (req, res, next) => {
     try {
+      if (!(await guardRowByClientId(req, res, await svc.getServiceClientId(req.params.id), 'client service not found'))) return;
       const affected = await clientServicesSvc.softDelete(req.params.id);
       if (!affected) return modernError(res, 404, 'client service not found');
       modernOk(res, { deleted: true });
@@ -1225,6 +1265,7 @@ router.delete(
   requireClientEdit,
   async (req, res, next) => {
     try {
+      if (!(await guardRowByClientId(req, res, await svc.getDocumentClientId(req.params.id), 'document not found'))) return;
       const affected = await docsSvc.softDelete(req.params.id);
       if (!affected) return modernError(res, 404, 'document not found');
       modernOk(res, { deleted: true });

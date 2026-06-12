@@ -520,15 +520,23 @@ async function fetchDeepSkillCatalog(pool) {
   deepSkillCatalogCache = { data: null, expires: 0, inflight: promise };
   try {
     const tree = await promise;
-    deepSkillCatalogCache = {
-      data: tree,
-      expires: Date.now() + DEEP_SKILL_CATALOG_TTL_MS,
-      inflight: null,
-    };
+    // Commit only if this build is still current — invalidateCatalogCaches()
+    // (or a competing build) may have replaced the cache object while we
+    // were in flight; a pre-mutation tree must not overwrite that.
+    if (deepSkillCatalogCache.inflight === promise) {
+      deepSkillCatalogCache = {
+        data: tree,
+        expires: Date.now() + DEEP_SKILL_CATALOG_TTL_MS,
+        inflight: null,
+      };
+    }
     return tree;
   } catch (e) {
     // Don't poison the cache on failure — next call retries fresh.
-    deepSkillCatalogCache = { data: null, expires: 0, inflight: null };
+    // Same guard: don't clobber a newer build's inflight handle.
+    if (deepSkillCatalogCache.inflight === promise) {
+      deepSkillCatalogCache = { data: null, expires: 0, inflight: null };
+    }
     throw e;
   }
 }
@@ -918,17 +926,12 @@ async function sendForEasyfixer(efrId, { action = 'first', override_mobile } = {
  *
  * Reuse strategy: the deep-skill + pincode replace helpers in
  * services/easyfixer-verification.service.js already implement the exact
- * soft-delete-then-insert pattern we need. But they use the imported
- * `pool` directly (not a connection), so they cannot enroll in this
- * function's transaction. To keep the spec's transactional guarantee
- * AND avoid duplicating the logic, we run the easyfixer-row UPDATE
- * inside a conn/transaction and call the verification helpers AFTER
- * the easyfixer UPDATE commits — if a sub-resource step then fails we
- * surface the error to the caller, but the easyfixer-row update is
- * already durable. Acceptable trade-off: the basic-field write is the
- * cheapest + lowest-risk step, the sub-resource writes are themselves
- * transactional inside the verification helpers, and the failure
- * window is tiny (a single network round-trip between the two).
+ * soft-delete-then-insert pattern we need. They now accept an optional
+ * injected connection, so we run the easyfixer-row UPDATE and both
+ * sub-resource replacements on ONE connection inside a single
+ * transaction — all three writes commit or roll back together, closing
+ * the previous partial-apply window where a failed sub-resource step
+ * left a durable basic-field update behind.
  *
  * Payload shape (Joi-validated by routes/public/easyfixer-profile-update.js):
  *   {
@@ -992,23 +995,22 @@ async function acceptSubmission(efrId, payload, pool) {
       );
     }
 
+    // 3. Sub-resource replacements — run on the SAME connection inside this
+    //    transaction so all three writes are atomic. The verification helpers
+    //    enroll in our txn when handed a connection (no own begin/commit).
+    if (Array.isArray(payload?.deep_skill_items)) {
+      await verification.replaceOptionMappings(efrId, payload.deep_skill_items, null, conn);
+    }
+    if (Array.isArray(payload?.serviceable_pincode_ids)) {
+      await verification.replaceServiceablePincodes(efrId, payload.serviceable_pincode_ids, null, conn);
+    }
+
     await conn.commit();
   } catch (e) {
     try { await conn.rollback(); } catch (_e) { /* swallow */ }
     throw e;
   } finally {
     conn.release();
-  }
-
-  // 3. Sub-resource replacements — run AFTER the easyfixer-row UPDATE
-  //    commits so the verification helpers (which talk to the imported
-  //    pool, not our conn) can operate normally. Each helper is itself
-  //    transactional.
-  if (Array.isArray(payload?.deep_skill_items)) {
-    await verification.replaceOptionMappings(efrId, payload.deep_skill_items, null);
-  }
-  if (Array.isArray(payload?.serviceable_pincode_ids)) {
-    await verification.replaceServiceablePincodes(efrId, payload.serviceable_pincode_ids, null);
   }
 
   // 4. Return the current state so the FE can render "Saved at X" without

@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const { pool } = require('../db');
 const { legacyError } = require('../utils/response');
 
@@ -18,14 +19,41 @@ module.exports = async function basicAuth(req, res, next) {
   // Pull client_name in the same query — Decathlon-only branches in
   // /v1/easyfixers/availability-status-check gate on the literal name.
   const [[row]] = await pool.query(
-    `SELECT cw.client_login_id, cw.client_id, cw.login_name, c.client_name
+    `SELECT cw.client_login_id, cw.client_id, cw.login_name, cw.login_password, c.client_name
        FROM tbl_client_website cw
        LEFT JOIN tbl_client c ON c.client_id = cw.client_id
-      WHERE cw.login_name = ? AND cw.login_password = ? AND cw.status = 1
+      WHERE cw.login_name = ? AND cw.status = 1
       LIMIT 1`,
-    [user, pass]
+    [user]
   );
-  if (!row) return legacyError(res, 401, 'Invalid credentials');
+
+  /*
+   * Password compared in Node (timing-safe) rather than in SQL — keeps the
+   * secret out of the query text (no slow-query / error-log leak) and avoids
+   * the DB's non-constant-time string comparison.
+   *
+   * Storage stays PLAINTEXT, deliberately. The legacy Dropwizard :8090 service
+   * still serves /v1/* during coexistence (confirmed 2026-06-12) and does a
+   * plaintext String.equals() against this same tbl_client_website.login_password
+   * column. Hashing it now would (a) break legacy auth for every integration
+   * partner and (b) buy no real security — a dump of this shared table exposes
+   * the plaintext regardless of any hash column sitting beside it.
+   *
+   * ─── DECOMMISSION RUNBOOK (do this when, and only when, legacy /v1/* is fully
+   *     cut over to this backend and the Dropwizard service is retired) ───
+   *   1. Add `login_password_hash VARCHAR(100) NULL` to tbl_client_website
+   *      (new migration file; the shared-schema rule is lifted once no legacy
+   *      service reads the table).
+   *   2. Add bcryptjs; on each successful plaintext login, lazily backfill the
+   *      hash. After a coexistence window, every ACTIVE partner has a hash.
+   *   3. Switch this compare to: verify against login_password_hash if present,
+   *      else plaintext + backfill. Then NULL/drop login_password.
+   * Until step 1's precondition holds, leave this exactly as it is.
+   */
+  const supplied = Buffer.from(String(pass), 'utf8');
+  const stored = Buffer.from(String(row?.login_password ?? ''), 'utf8');
+  const ok = !!row && supplied.length === stored.length && crypto.timingSafeEqual(supplied, stored);
+  if (!ok) return legacyError(res, 401, 'Invalid credentials');
 
   req.integrationClient = {
     id: row.client_id,
