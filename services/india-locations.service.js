@@ -27,8 +27,6 @@
 
 const fs = require('fs');
 const path = require('path');
-const readline = require('readline');
-const { Readable } = require('stream');
 const { randomUUID } = require('crypto');
 
 const { pool } = require('../db');
@@ -194,6 +192,30 @@ class CancelledError extends Error {
 }
 
 /*
+ * Map a raw internal error to a short, actionable, operator-facing
+ * message for the Seed India Locations modal. The raw error is still
+ * logged + stored on job.error_detail for engineers; this is only what
+ * the non-technical operator sees in the UI. Keep messages calm and
+ * action-oriented ("retry", "check X") — never leak Node/SQL internals.
+ */
+function friendlyJobError(e) {
+  const raw = e && e.message ? e.message : String(e);
+  if (/readline was closed|ERR_USE_AFTER_CLOSE/i.test(raw)) {
+    return 'The seed file could not be read all the way through. Please retry — if it keeps happening, the source CSV may be malformed.';
+  }
+  if (/ECONNREFUSED|ETIMEDOUT|PROTOCOL_CONNECTION_LOST|ER_LOCK|ER_|Deadlock|pool|connection lost|connect ETIMEDOUT/i.test(raw)) {
+    return 'Lost the database connection while seeding. Please check the database and retry.';
+  }
+  if (/Failed to fetch CSV|HTTP \d{3}|fetch failed|ENOTFOUND|getaddrinfo/i.test(raw)) {
+    return 'Could not download the source pincode CSV. Check the network / source URL and retry.';
+  }
+  if (/ENOENT|no such file/i.test(raw)) {
+    return 'The seed CSV file was not found at the configured path.';
+  }
+  return 'Seeding failed unexpectedly. Please retry; if it continues, share the time of this run with engineering.';
+}
+
+/*
  * `startSeedJob` (2026-06-10): now accepts `csvUrl` alongside the
  * existing buffer / path inputs. When neither buffer nor path is
  * supplied, runSeed itself falls through to the URL fetch (env
@@ -231,6 +253,8 @@ function startSeedJob({
       cities_created: 0,
       pincodes_inserted: 0,
       pincodes_skipped_dupe: 0,
+      batches_failed: 0,
+      pincodes_failed: 0,
     },
     started_at: new Date().toISOString(),
     finished_at: null,
@@ -275,7 +299,12 @@ function startSeedJob({
         job.error = e.message;
       } else {
         job.status = 'failed';
-        job.error = e && e.message ? e.message : String(e);
+        // Operator-facing message (the modal renders job.error). The raw
+        // technical error goes to the logs via error_detail + logger.error
+        // so engineers can still diagnose, but ops sees something
+        // actionable instead of e.g. "readline was closed".
+        job.error = friendlyJobError(e);
+        job.error_detail = e && e.message ? e.message : String(e);
         logger.error({ err: e, jobId }, 'india-seed: job failed');
       }
     } finally {
@@ -450,39 +479,80 @@ async function runSeed({
     cities_created: 0,
     pincodes_inserted: 0,
     pincodes_skipped_dupe: 0,
+    batches_failed: 0,
+    pincodes_failed: 0,
   };
 
-  // Buffer takes precedence — used by the upload-from-modal flow.
-  // Falling back to fs.createReadStream preserves the CLI + env-path flow.
-  const stream = csvBuffer
-    ? Readable.from(csvBuffer)
-    : fs.createReadStream(csvPath, { encoding: 'utf-8' });
-  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  /*
+   * In-memory line iteration (2026-06-12 fix for "readline was closed").
+   *
+   * Previously this streamed the CSV through `readline.createInterface`
+   * + `for await (const line of rl)`. That async iterator races against
+   * a fast, FINITE input: `Readable.from(csvBuffer)` pushes the whole
+   * ~10MB in-memory buffer almost instantly, so the interface emits
+   * 'close' while the slow per-row DB work (~30-50ms/row against the
+   * remote DB) is still draining buffered lines. Node's readline async
+   * iterator then rejects the next `.next()` with
+   * `ERR_USE_AFTER_CLOSE: readline was closed`, surfacing as a spurious
+   * "job failed" partway through a large seed (observed ~10k+ rows in).
+   *
+   * The CSV is ALREADY fully in RAM for the buffer/URL path (fetched
+   * whole + 24h-cached), so streaming never bought the bounded-memory
+   * benefit it implies. We split the full text into a line array and
+   * iterate synchronously — no stream, no readline interface, no async
+   * iterator to race. The CLI file path is read fully too (a pincode CSV
+   * is ~10MB, same order as the URL buffer we already load whole),
+   * keeping a single code path.
+   */
+  const csvText = csvBuffer
+    ? csvBuffer.toString('utf-8')
+    : await fs.promises.readFile(csvPath, 'utf-8');
+  // Split on LF or CRLF — matches the old `crlfDelay: Infinity` line
+  // boundaries. A trailing newline yields a final '' element, already
+  // skipped by the blank-line guard below.
+  const lines = csvText.split(/\r?\n/);
 
   let colMap = null;
   let pincodeBuffer = [];
   let lineNo = 0;
 
   const checkCancel = () => {
-    if (isCancelled()) {
-      rl.close();
-      stream.destroy();
-      throw new CancelledError();
+    if (isCancelled()) throw new CancelledError();
+  };
+
+  /*
+   * Batch-isolation (2026-06-12). A single bad batch (a transient DB
+   * deadlock, one malformed pincode tripping a constraint, etc.) used to
+   * throw straight out of the loop and fail the ENTIRE multi-minute seed,
+   * losing all progress. Now each flush is isolated: a failed batch is
+   * logged + counted (stats.batches_failed / pincodes_failed) and the
+   * seed continues with the next batch. The operator gets a completed run
+   * with a non-zero failed count rather than an all-or-nothing abort.
+   * Cancellation (CancelledError) is NOT swallowed here — it has its own
+   * path via checkCancel() and must still abort.
+   */
+  const flushBatchSafely = async (buf) => {
+    if (dryRun) { stats.pincodes_inserted += buf.length; return; }
+    try {
+      await flushPincodes(buf, stats);
+    } catch (err) {
+      stats.batches_failed += 1;
+      stats.pincodes_failed += buf.length;
+      logger.warn(
+        { err: err && err.message, batchSize: buf.length, rows_seen: stats.rows_seen },
+        'india-seed: batch flush failed — skipping this batch, continuing seed',
+      );
     }
   };
 
-  for await (const rawLineRaw of rl) {
+  for (const rawLine of lines) {
     /*
-     * Cancel-responsiveness fix (2026-06-10). Earlier this loop only
-     * checked `isCancelled()` between 500-row batch flushes — with
-     * each row taking ~30-50ms (state/city ensure + cache lookups),
-     * a cancel signal could sit unprocessed for up to 25s while the
-     * loop drained the in-flight batch. Now we check every 100 rows
-     * at the TOP of the loop so cancellation drains within ~3-5s of
-     * the Stop button click. Cheap (1 boolean check per call).
+     * Cancel-responsiveness (2026-06-10). Each row takes ~30-50ms
+     * (state/city ensure + cache lookups), so we check `isCancelled()`
+     * every 100 rows at the TOP of the loop — cancellation drains
+     * within ~3-5s of the Stop click. Cheap (1 boolean check per call).
      */
     if (lineNo > 0 && stats.rows_seen % 100 === 0) checkCancel();
-    const rawLine = Buffer.isBuffer(rawLineRaw) ? rawLineRaw.toString('utf-8') : rawLineRaw;
     lineNo += 1;
     if (lineNo === 1) {
       colMap = buildColMap(rawLine.replace(/^﻿/, ''));
@@ -536,8 +606,7 @@ async function runSeed({
     ]);
     if (pincodeBuffer.length >= BATCH) {
       checkCancel();
-      if (!dryRun) await flushPincodes(pincodeBuffer, stats);
-      else stats.pincodes_inserted += pincodeBuffer.length;
+      await flushBatchSafely(pincodeBuffer);
       pincodeBuffer = [];
       onProgress({ ...stats });
     }
@@ -552,8 +621,7 @@ async function runSeed({
   }
   if (pincodeBuffer.length) {
     checkCancel();
-    if (!dryRun) await flushPincodes(pincodeBuffer, stats);
-    else stats.pincodes_inserted += pincodeBuffer.length;
+    await flushBatchSafely(pincodeBuffer);
     pincodeBuffer = [];
     onProgress({ ...stats });
   }

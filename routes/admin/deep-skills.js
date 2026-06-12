@@ -250,6 +250,47 @@ router.post('/', validate(createBody), async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+/*
+ * POST /api/admin/deep-skills/generate-image (2026-06-12)
+ *
+ * Synchronous DALL-E preview for a NEW (unsaved) skill. The operator
+ * clicks "Generate Image" in the create modal BEFORE saving; we stage
+ * the result at `Skills/staging/<uuid>` and return its key + presigned
+ * URL. The FE then submits that key as `deepskill_image` on create.
+ *
+ * Registered as a LITERAL path BEFORE the `/:id`-style routes so Express
+ * can't shadow it (there is no bare `POST /:id`, but the create-adjacent
+ * placement keeps it unambiguous). Same permission gate as the create
+ * route above — inherits the admin group guard from routes/admin/index.js.
+ *
+ * A thrown OpenAI/S3 failure → 502 (raw upstream body is logged, never
+ * leaked to the client); err.status=400 (blank name) → that status.
+ */
+const generatePreviewBody = Joi.object({
+  deepskill_name: Joi.string().min(1).max(255).required(),
+  options: Joi.array().items(Joi.string().min(1).max(100)).optional(),
+});
+router.post(
+  '/generate-image',
+  validate(generatePreviewBody),
+  async (req, res, next) => {
+    try {
+      const dsImageGen = require('../../services/deep-skill-image-gen.service');
+      const result = await dsImageGen.generatePreview({
+        name: req.body.deepskill_name,
+        options: req.body.options,
+      });
+      return modernOk(res, result, 'image generated');
+    } catch (e) {
+      if (e?.status && e.status >= 400 && e.status < 500) {
+        return modernError(res, e.status, e.message);
+      }
+      logger.warn({ err: e && e.message }, 'deep-skill generate-image (preview) failed');
+      return modernError(res, 502, 'Image generation failed — please retry');
+    }
+  },
+);
+
 router.patch('/:id', validate(idParam, 'params'), validate(updateBody), async (req, res, next) => {
   try {
     const updated = await ds.update(req.params.id, req.body);
@@ -463,6 +504,51 @@ router.post(
       }
       return modernOk(res, { status: 'pending' }, 'image regeneration queued');
     } catch (e) { return next(e); }
+  },
+);
+
+/*
+ * POST /api/admin/deep-skills/:id/generate-image (2026-06-12)
+ *
+ * Synchronous DALL-E regenerate/replace for an EXISTING skill. The
+ * operator clicks "Generate Image" (or "Regenerate") in the edit modal;
+ * we await the round-trip and UNCONDITIONALLY replace the row's image
+ * (explicit user action, not the guarded auto path). The request can
+ * pass the current (possibly unsaved) modal `deepskill_name`/`options`
+ * to drive the prompt; both optional — when omitted the persisted name
+ * + active options are used.
+ *
+ * Returns { image, url }. err.status (404 missing skill / 400 bad input)
+ * maps straight through; any OpenAI/S3 failure → 502 with a generic
+ * message (raw upstream body is logged, never leaked).
+ *
+ * Same permission gate as the upload-image route — inherits the admin
+ * group guard from routes/admin/index.js.
+ */
+const generateForSkillBody = Joi.object({
+  deepskill_name: Joi.string().max(255).optional(),
+  options: Joi.array().items(Joi.string().min(1).max(100)).optional(),
+});
+router.post(
+  '/:id/generate-image',
+  validate(idParam, 'params'),
+  validate(generateForSkillBody),
+  async (req, res, next) => {
+    try {
+      const dsImageGen = require('../../services/deep-skill-image-gen.service');
+      const result = await dsImageGen.generateForSkill(Number(req.params.id), {
+        name: req.body.deepskill_name,
+        options: req.body.options,
+      });
+      return modernOk(res, result, 'image generated');
+    } catch (e) {
+      if (e?.status && e.status >= 400 && e.status < 500) {
+        return modernError(res, e.status, e.message);
+      }
+      logger.warn({ err: e && e.message, skillId: Number(req.params.id) },
+        'deep-skill generate-image (existing) failed');
+      return modernError(res, 502, 'Image generation failed — please retry');
+    }
   },
 );
 

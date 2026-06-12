@@ -130,6 +130,75 @@ function buildPrompt(skill, options) {
  */
 const inflightImageGen = new Set();
 
+/*
+ * OpenAI POST + image download core (extracted 2026-06-12). Steps 2-3
+ * of the original generateImage flow, made reusable so both the async
+ * background pipeline and the two synchronous on-demand endpoints
+ * (generateForSkill / generatePreview) share identical fetch + download
+ * + content-type handling.
+ *
+ * A 60s AbortSignal bounds BOTH the OpenAI generation call and the
+ * image download — a hung upstream fails cleanly instead of holding a
+ * request (or background worker) open forever. Throws on any failure;
+ * the caller decides whether to markFailed (background) or surface a
+ * 502 (sync routes).
+ */
+async function fetchGeneratedImageBuffer(prompt) {
+  const model = getModel();
+  const size = '1024x1024';
+  const quality = 'standard';
+
+  // 2. OpenAI HTTP call — mirrors the fetch shape in ai.service.js.
+  const genController = new AbortController();
+  const genTimer = setTimeout(() => genController.abort(), 60000);
+  let res;
+  try {
+    res = await fetch(OPENAI_IMAGES_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model,
+        prompt,
+        n: 1,
+        size,
+        quality,
+        response_format: 'url',
+      }),
+      signal: genController.signal,
+    });
+  } finally {
+    clearTimeout(genTimer);
+  }
+  if (!res.ok) {
+    const body = (await res.text()).slice(0, 300);
+    throw new Error(`OpenAI images HTTP ${res.status}: ${body}`);
+  }
+  const data = await res.json();
+  const url = data?.data?.[0]?.url;
+  if (!url) throw new Error('OpenAI images response missing data[0].url');
+
+  // 3. Download to buffer (also bounded by a 60s timeout).
+  const dlController = new AbortController();
+  const dlTimer = setTimeout(() => dlController.abort(), 60000);
+  let dl;
+  try {
+    dl = await fetch(url, { signal: dlController.signal });
+  } finally {
+    clearTimeout(dlTimer);
+  }
+  if (!dl.ok) throw new Error(`Image download HTTP ${dl.status}`);
+  let contentType = 'image/png';
+  const ct = dl.headers.get('content-type');
+  if (ct && /^image\//i.test(ct)) contentType = ct.split(';')[0].trim();
+  const ab = await dl.arrayBuffer();
+  const buffer = Buffer.from(ab);
+  if (!buffer.length) throw new Error('Downloaded image buffer empty');
+  return { buffer, contentType };
+}
+
 function dispatch(skillId) {
   const id = Number(skillId);
   if (!Number.isInteger(id) || id <= 0) return false;
@@ -233,46 +302,16 @@ async function generateImage(skillId) {
   }
 
   const model = getModel();
-  const size = '1024x1024';
-  const quality = 'standard';
   const prompt = buildPrompt(skillRow, options);
 
   let imageBuffer;
   let imageContentType = 'image/png';
   try {
-    // 2. OpenAI HTTP call — mirrors the fetch shape in ai.service.js.
+    // Steps 2-3 (OpenAI POST + download) now live in the shared helper.
     logger.info(`deep-skill-image-gen: skill=${id} model=${model} requesting`);
-    const res = await fetch(OPENAI_IMAGES_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model,
-        prompt,
-        n: 1,
-        size,
-        quality,
-        response_format: 'url',
-      }),
-    });
-    if (!res.ok) {
-      const body = (await res.text()).slice(0, 300);
-      throw new Error(`OpenAI images HTTP ${res.status}: ${body}`);
-    }
-    const data = await res.json();
-    const url = data?.data?.[0]?.url;
-    if (!url) throw new Error('OpenAI images response missing data[0].url');
-
-    // 3. Download to buffer.
-    const dl = await fetch(url);
-    if (!dl.ok) throw new Error(`Image download HTTP ${dl.status}`);
-    const ct = dl.headers.get('content-type');
-    if (ct && /^image\//i.test(ct)) imageContentType = ct.split(';')[0].trim();
-    const ab = await dl.arrayBuffer();
-    imageBuffer = Buffer.from(ab);
-    if (!imageBuffer.length) throw new Error('Downloaded image buffer empty');
+    const out = await fetchGeneratedImageBuffer(prompt);
+    imageBuffer = out.buffer;
+    imageContentType = out.contentType;
   } catch (e) {
     await markFailed(id, e);
     return;
@@ -639,11 +678,182 @@ async function resetOrphanedPendingImageGens() {
   return { resetCount: count };
 }
 
+/*
+ * Synchronous "Generate Image" for an EXISTING skill (2026-06-12).
+ *
+ * Operator-driven regenerate/replace — distinct from the guarded auto
+ * path (generateImage). This is an explicit user action, so the row's
+ * image is replaced UNCONDITIONALLY (no claim-guard). The request awaits
+ * the DALL-E round-trip; the 60s AbortSignal in fetchGeneratedImageBuffer
+ * bounds the worst case.
+ *
+ *   name / options : when supplied (current modal form, possibly with
+ *                    unsaved edits) they drive the prompt; otherwise we
+ *                    SELECT the persisted name + active options.
+ *
+ * Throws err.status=404 when the skill row doesn't exist. OpenAI / S3
+ * failures bubble as plain errors for the route to map to a 502.
+ */
+async function generateForSkill(skillId, { name, options } = {}) {
+  const id = Number(skillId);
+  if (!Number.isInteger(id) || id <= 0) {
+    const err = new Error('invalid skillId');
+    err.status = 400;
+    throw err;
+  }
+
+  // Load the row regardless — we need deepskill_image for the seq calc,
+  // and (when name/options weren't passed) the persisted name + options.
+  const [[row]] = await pool.query(
+    `SELECT deepskill_id, deepskill_name, deepskill_image
+       FROM tbl_deep_skill
+      WHERE deepskill_id = ? LIMIT 1`,
+    [id],
+  );
+  if (!row) {
+    const err = new Error('deep skill not found');
+    err.status = 404;
+    throw err;
+  }
+
+  let resolvedName = name;
+  let resolvedOptions = Array.isArray(options) ? options : null;
+  if (resolvedName === undefined || resolvedName === null || String(resolvedName).trim() === '') {
+    resolvedName = row.deepskill_name;
+  }
+  if (!resolvedOptions) {
+    const [optRows] = await pool.query(
+      `SELECT skill_option
+         FROM tbl_deepskill_options
+        WHERE deepskill_id = ? AND status = 1
+        ORDER BY id`,
+      [id],
+    );
+    resolvedOptions = optRows.map((o) => o.skill_option);
+  }
+  resolvedOptions = resolvedOptions
+    .map((o) => String(o ?? '').trim())
+    .filter(Boolean);
+  // Same rule as generatePreview: a meaningful thumbnail needs ≥1 option.
+  // Covers the edit-modal case where the operator cleared all options (or
+  // a skill genuinely has none) — a clear 400 beats the generic 502.
+  if (resolvedOptions.length === 0) {
+    const err = new Error('Please select at least one skill option to generate an image.');
+    err.status = 400;
+    throw err;
+  }
+
+  const prompt = buildPrompt(
+    { deepskill_name: resolvedName },
+    resolvedOptions.map((o) => ({ skill_option: o })),
+  );
+
+  const { buffer, contentType } = await fetchGeneratedImageBuffer(prompt);
+
+  // Next seq off the current canonical key (mirrors generateImage).
+  const prev = String(row.deepskill_image || '');
+  const match = prev.match(/^Skills\/Skill_\d+_(\d+)$/);
+  const seq = match ? Number(match[1]) + 1 : 1;
+  const Key = s3Storage.keyForSkill(id, seq);
+
+  await s3Storage.putSkillImage({
+    skillId: id,
+    seq,
+    buffer,
+    contentType,
+    originalName: 'generated.png',
+  });
+
+  // Unconditional replace — explicit operator action, NOT the guarded
+  // auto path. Clear any pending/failed badge in the same statement.
+  await pool.query(
+    `UPDATE tbl_deep_skill
+        SET deepskill_image = ?,
+            image_gen_status = NULL,
+            image_gen_attempted_at = NOW()
+      WHERE deepskill_id = ?`,
+    [Key, id],
+  );
+
+  try { deepSkillService.invalidateAllDeepSkillImagesCache(); } catch (_) { /* defensive */ }
+  try { invalidateCatalogCaches(); } catch (_) { /* defensive */ }
+
+  // Real DALL-E spend counts toward the budget.
+  await bumpCounterAndMaybeNotify().catch((e) => {
+    logger.warn({ err: e && e.message },
+      'deep-skill-image-gen: bumpCounterAndMaybeNotify failed (non-fatal)');
+  });
+
+  const url = await s3Storage.getPresignedUrl(Key);
+  logger.info(`deep-skill-image-gen: sync regenerate skill=${id} key=${Key}`);
+  return { image: Key, url };
+}
+
+/*
+ * Synchronous preview for a NEW (unsaved) skill (2026-06-12).
+ *
+ * No skill row exists yet, so the generated image lands at a STAGING
+ * key (`Skills/staging/<uuid>`). The FE passes the returned `image` as
+ * `deepskill_image` on create; the existing create() persists it and
+ * skips auto-gen because the image field is non-empty. No DB row is
+ * touched here.
+ *
+ * Requires a non-empty name (throws err.status=400 otherwise).
+ */
+async function generatePreview({ name, options } = {}) {
+  const resolvedName = name == null ? '' : String(name).trim();
+  if (!resolvedName) {
+    const err = new Error('deepskill_name required');
+    err.status = 400;
+    throw err;
+  }
+  const resolvedOptions = (Array.isArray(options) ? options : [])
+    .map((o) => String(o ?? '').trim())
+    .filter(Boolean);
+  // At least one skill option is required — a name-only prompt yields a
+  // weak/ambiguous thumbnail (and DALL-E may reject it). Surface a clear,
+  // specific 400 so the FE shows "add a skill option" instead of the
+  // generic "Image generation failed — please retry".
+  if (resolvedOptions.length === 0) {
+    const err = new Error('Please select at least one skill option to generate an image.');
+    err.status = 400;
+    throw err;
+  }
+
+  const prompt = buildPrompt(
+    { deepskill_name: resolvedName },
+    resolvedOptions.map((o) => ({ skill_option: o })),
+  );
+
+  const { buffer, contentType } = await fetchGeneratedImageBuffer(prompt);
+
+  const Key = 'Skills/staging/' + require('crypto').randomUUID();
+  await s3Storage.putAtKey({
+    key: Key,
+    buffer,
+    contentType,
+    originalName: 'generated.png',
+  });
+
+  // Real DALL-E spend counts toward the budget.
+  await bumpCounterAndMaybeNotify().catch((e) => {
+    logger.warn({ err: e && e.message },
+      'deep-skill-image-gen: bumpCounterAndMaybeNotify failed (non-fatal)');
+  });
+
+  const url = await s3Storage.getPresignedUrl(Key);
+  logger.info(`deep-skill-image-gen: sync preview key=${Key}`);
+  return { image: Key, url };
+}
+
 module.exports = {
   getModel,
   isAutoGenEnabled,
   buildPrompt,
   generateImage,
+  fetchGeneratedImageBuffer,
+  generateForSkill,
+  generatePreview,
   dispatch,
   markFailed,
   bumpCounterAndMaybeNotify,
