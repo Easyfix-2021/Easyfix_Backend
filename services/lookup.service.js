@@ -209,6 +209,38 @@ async function zonalManagers() {
   return rows;
 }
 
+/*
+ * Project Managers picker — drives the QuickSight report "Project Manager"
+ * filter. A project manager is a tbl_user row referenced by at least one
+ * tbl_vertical_mapping row at the requested user_type (the SPOC role on a
+ * client+vertical):
+ *   user_type = 1 → Primary SPOC   (Client Performance PM filter)
+ *   user_type = 2 → Secondary SPOC (Open Orders pmlist)
+ * DISTINCT internal active users, returned as {user_id, user_name}.
+ *
+ * NOTE: tbl_vertical_mapping.user_type is DISTINCT from tbl_user.user_type_id
+ * — do not conflate. When `userType` is omitted, both 1 and 2 are returned.
+ */
+async function projectManagers({ userType } = {}) {
+  const clauses = ['u.user_status = 1'];
+  const params = [];
+  if (userType != null) {
+    clauses.push('vm.user_type = ?');
+    params.push(userType);
+  } else {
+    clauses.push('vm.user_type IN (1, 2)');
+  }
+  const [rows] = await pool.query(
+    `SELECT DISTINCT u.user_id, u.user_name
+       FROM tbl_vertical_mapping vm
+       JOIN tbl_user u ON u.user_id = vm.user_id
+      WHERE ${clauses.join(' AND ')}
+      ORDER BY u.user_name ASC`,
+    params
+  );
+  return rows;
+}
+
 // ─── Roles (admin-scoped) ───────────────────────────────────────────
 /*
  * Picker projection for tbl_role. The Manage Users form needs this to fill
@@ -486,6 +518,7 @@ module.exports = {
   clientServices,
   users,
   zonalManagers,
+  projectManagers,
   roles,
   menuActions,
   easyfixers,

@@ -42,6 +42,12 @@ const simpleIncludeInactive = Joi.object({
   includeInactive: Joi.boolean().default(false),
 });
 
+// Project Managers picker — optional user_type narrows to Primary (1) or
+// Secondary (2) SPOC; omitted returns both. (tbl_vertical_mapping.user_type)
+const projectManagersQuery = Joi.object({
+  userType: Joi.number().integer().valid(1, 2).optional(),
+});
+
 module.exports = {
   citiesQuery,
   serviceTypesQuery,
@@ -50,4 +56,5 @@ module.exports = {
   usersQuery,
   banksQuery,
   simpleIncludeInactive,
+  projectManagersQuery,
 };

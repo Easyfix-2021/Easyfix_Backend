@@ -9,7 +9,7 @@ const { pool } = require('../../db');
 const { buildRequestScopeWithHierarchy } = require('../../lib/scope');
 const {
   citiesQuery, serviceTypesQuery, clientsQuery, clientServicesQuery,
-  usersQuery, banksQuery, simpleIncludeInactive,
+  usersQuery, banksQuery, simpleIncludeInactive, projectManagersQuery,
 } = require('../../validators/lookup.validator');
 
 /*
@@ -96,6 +96,15 @@ router.get('/users',            role(['admin']), validate(usersQuery, 'query'), 
 // Drives the Manage Easyfixers "User Mapped To City" filter.
 router.get('/zonal-managers',   role(['admin']),                                         async (_req, res, next) => {
   try { modernOk(res, await lookup.zonalManagers()); } catch (e) { next(e); }
+});
+
+// Project Managers picker — admin-only. Returns DISTINCT internal users
+// mapped as SPOCs in tbl_vertical_mapping. Optional ?userType=1|2 narrows
+// to Primary / Secondary SPOC (QuickSight Open Orders uses user_type=2;
+// Client Performance uses user_type=1). Drives the QuickSight report
+// "Project Manager" filter dropdown.
+router.get('/project-managers', role(['admin']), validate(projectManagersQuery, 'query'), async (req, res, next) => {
+  try { modernOk(res, await lookup.projectManagers(req.query)); } catch (e) { next(e); }
 });
 
 // Roles dropdown — admin-only. Used by the Manage Users form to fill the
