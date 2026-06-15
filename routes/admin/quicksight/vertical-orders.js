@@ -31,6 +31,7 @@ const validate = require('../../../middleware/validate');
 const { modernOk, modernError } = require('../../../utils/response');
 const { streamStyledXlsx } = require('../../../utils/xlsx-styled-export');
 const logger = require('../../../logger');
+const { fileStamp, displayStamp, FMT } = require('../../../services/quicksight/_shared');
 const {
   getVerticalOpenOrders,
   buildExportRows,
@@ -40,16 +41,6 @@ const {
 // Per-report QuickSight gate on every route in this sub-router.
 router.use(requireQuickSight('isQuickSightVerticalOrdersView'));
 
-// Human-friendly generated-on stamp for the meta band (e.g. "15 Jun 2026").
-const DISPLAY_STAMP = () =>
-  new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
-
-// Filename-safe date stamp (e.g. "2026-06-15").
-const FILE_STAMP = () => new Date().toISOString().slice(0, 10);
-
-// Counts → thousands-grouped integers.
-const FMT_COUNT = '#,##0';
-
 // ── Styled XLSX column set (Title Case headers) ──────────────────────
 // Keys/headers/widths are UNCHANGED from the service's EXPORT_COLUMNS; only
 // display polish (align / numFmt / data bars) is layered on. The 4 age-bucket
@@ -58,11 +49,11 @@ const FMT_COUNT = '#,##0';
 // the per-vertical Total Count column is formatted but bar-free.
 const STYLED_COLUMNS = [
   { key: 'verticalCategory', header: 'Vertical Category', width: 22, align: 'left' },
-  { key: 'Today', header: 'Today', width: 12, align: 'right', numFmt: FMT_COUNT, dataBar: true, dataBarColor: 'FF10B981' },
-  { key: 'Yesterday', header: 'Yesterday', width: 12, align: 'right', numFmt: FMT_COUNT, dataBar: true, dataBarColor: 'FF2E86DE' },
-  { key: 'TwoToSeven', header: '2-7 Days', width: 12, align: 'right', numFmt: FMT_COUNT, dataBar: true, dataBarColor: 'FFF59E0B' },
-  { key: 'MoreThanSeven', header: 'More Than 7 Days', width: 18, align: 'right', numFmt: FMT_COUNT, dataBar: true, dataBarColor: 'FFEF4444' },
-  { key: 'TotalCount', header: 'Total Count', width: 14, align: 'right', numFmt: FMT_COUNT },
+  { key: 'Today', header: 'Today', width: 12, align: 'right', numFmt: FMT.COUNT, dataBar: true, dataBarColor: 'FF10B981' },
+  { key: 'Yesterday', header: 'Yesterday', width: 12, align: 'right', numFmt: FMT.COUNT, dataBar: true, dataBarColor: 'FF2E86DE' },
+  { key: 'TwoToSeven', header: '2-7 Days', width: 12, align: 'right', numFmt: FMT.COUNT, dataBar: true, dataBarColor: 'FFF59E0B' },
+  { key: 'MoreThanSeven', header: 'More Than 7 Days', width: 18, align: 'right', numFmt: FMT.COUNT, dataBar: true, dataBarColor: 'FFEF4444' },
+  { key: 'TotalCount', header: 'Total Count', width: 14, align: 'right', numFmt: FMT.COUNT },
 ];
 
 /*
@@ -136,9 +127,9 @@ router.get('/', validate(verticalOrdersQuery, 'query'), async (req, res, next) =
         { label: 'Unconfirmed Orders', value: result.countOfUnconfirmedOrders, accent: 'FFF59E0B' },
       ];
 
-      const meta = `Flags: ${flags.join(', ')} · Generated ${DISPLAY_STAMP()}`;
+      const meta = `Flags: ${flags.join(', ')} · Generated ${displayStamp()}`;
 
-      await streamStyledXlsx(res, `vertical-orders-${FILE_STAMP()}.xlsx`, {
+      await streamStyledXlsx(res, `vertical-orders-${fileStamp()}.xlsx`, {
         title: 'EasyFix · Vertical Orders',
         meta,
         sheetName: 'Vertical Orders',

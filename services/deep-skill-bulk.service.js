@@ -354,8 +354,20 @@ async function processBuffer(buffer, { commit = false, actor = null } = {}) {
         tagWords:  r.tagWords,
       };
 
+      // A row with no skill name (column E "Services" empty) cannot create a
+      // deep skill — but REPORT it as a skip-with-reason rather than dropping
+      // it silently, so the per-row report reconciles to the full sheet. (E.g.
+      // a Service Type row like "Welding Work" with no Services/skill name:
+      // the operator must see why it produced no skill.)
+      if (!r.skill) {
+        report.push({
+          ...base,
+          status: 'skip',
+          errors: ['No Skill Name (Column E "Services" is empty)'],
+        });
+        continue;
+      }
       // ── silent skips ──
-      if (!r.skill) continue;
       if (looksLikeSchemaLiteral(r.category) ||
           looksLikeSchemaLiteral(r.type) ||
           looksLikeSchemaLiteral(r.skill)) {

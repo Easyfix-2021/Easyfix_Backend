@@ -34,6 +34,7 @@ const validate = require('../../../middleware/validate');
 const { modernOk, modernError } = require('../../../utils/response');
 const { streamStyledXlsx } = require('../../../utils/xlsx-styled-export');
 const { getRoleById } = require('../../../services/role.service');
+const { fileStamp, displayStamp, FMT, decorateColumns } = require('../../../services/quicksight/_shared');
 const service = require('../../../services/quicksight/quicksight-admin-dashboard.service');
 
 const ADMIN_ROLE_ID = 2; // legacy loginToFloorDiscipline gate: roleId == 2.
@@ -93,18 +94,29 @@ const rmTeamUsersQuerySchema = Joi.object({
 });
 
 // ── XLSX column set for the Employee Productivity export ──────────────────
-// numFmt: counts → '#,##0'; revenue is rupees → '"₹"#,##0' (no % columns).
+// numFmt: counts → FMT.COUNT; revenue is rupees → FMT.RUPEE (no % columns).
 // dataBar on the three volume columns (Booked / Scheduled / Closed) — never
-// on the employee name or the rupee/audit columns.
-const PRODUCTIVITY_XLSX_COLUMNS = [
-  { key: 'userName', header: 'Employee', width: 28, align: 'left' },
-  { key: 'booked', header: 'Booked', numFmt: '#,##0', dataBar: true, dataBarColor: 'FF6366F1' },
-  { key: 'scheduled', header: 'Scheduled', numFmt: '#,##0', dataBar: true, dataBarColor: 'FF0EA5E9' },
-  { key: 'audit', header: 'Audit', numFmt: '#,##0' },
-  { key: 'closedCount', header: 'Closed', numFmt: '#,##0', dataBar: true, dataBarColor: 'FF10B981' },
-  { key: 'revenue', header: 'Revenue', numFmt: '"₹"#,##0' },
-  { key: 'cancelCount', header: 'Cancelled', numFmt: '#,##0' },
-];
+// on the employee name or the rupee/audit columns. Hints applied via the
+// shared decorateColumns() (first-match-wins rules; keys/headers unchanged).
+const PRODUCTIVITY_XLSX_COLUMNS = decorateColumns(
+  [
+    { key: 'userName', header: 'Employee', width: 28 },
+    { key: 'booked', header: 'Booked' },
+    { key: 'scheduled', header: 'Scheduled' },
+    { key: 'audit', header: 'Audit' },
+    { key: 'closedCount', header: 'Closed' },
+    { key: 'revenue', header: 'Revenue' },
+    { key: 'cancelCount', header: 'Cancelled' },
+  ],
+  [
+    { match: (key) => key === 'userName', hints: { align: 'left' } },
+    { match: (key) => key === 'booked', hints: { numFmt: FMT.COUNT, dataBar: true, dataBarColor: 'FF6366F1' } },
+    { match: (key) => key === 'scheduled', hints: { numFmt: FMT.COUNT, dataBar: true, dataBarColor: 'FF0EA5E9' } },
+    { match: (key) => key === 'closedCount', hints: { numFmt: FMT.COUNT, dataBar: true, dataBarColor: 'FF10B981' } },
+    { match: (key) => key === 'revenue', hints: { numFmt: FMT.RUPEE } },
+    { match: (key) => key === 'audit' || key === 'cancelCount', hints: { numFmt: FMT.COUNT } },
+  ]
+);
 
 // ── GET /access — mirrors loginToFloorDiscipline (isAdmin probe) ──────────
 // Reaching here means requireAdmin already passed (role_id==2), so isAdmin=true.
@@ -129,10 +141,14 @@ router.post(
   async (req, res, next) => {
     try {
       const { page, size } = req.query;
-      const result = await service.employeeProductivity(req.body, page, size);
 
       if (req.body.format === 'xlsx') {
-        const rows = result.data || [];
+        // XLSX reflects the FULL filtered set, not one page: fetch at the
+        // BE safety cap (USER_LIST_LIMIT=5000) so KPI cards, totalRow, and
+        // data rows aggregate every matching employee. The JSON branch +
+        // on-screen pagination below stay unchanged.
+        const fullResult = await service.employeeProductivity(req.body, 1, 5000);
+        const rows = fullResult.data || [];
         const sum = (key) => rows.reduce((a, r) => a + (Number(r[key]) || 0), 0);
         const totalBooked = sum('booked');
         const totalScheduled = sum('scheduled');
@@ -153,12 +169,9 @@ router.post(
         }
         if (Number(req.body.userId) > 0) filterBits.push(`User ${req.body.userId}`);
         filterBits.push(`Based On ${req.body.findByDateType || 'requested'}`);
-        const generated = new Date().toLocaleDateString('en-GB', {
-          day: '2-digit', month: 'short', year: 'numeric',
-        });
-        const meta = `${filterBits.join(' · ')} · ${rows.length} Employees · Generated ${generated}`;
+        const meta = `${filterBits.join(' · ')} · ${rows.length} Employees · Generated ${displayStamp()}`;
 
-        await streamStyledXlsx(res, 'employee-productivity.xlsx', {
+        await streamStyledXlsx(res, `employee-productivity-${fileStamp()}.xlsx`, {
           title: 'EasyFix · Employee Productivity',
           meta,
           sheetName: 'Productivity',
@@ -168,7 +181,7 @@ router.post(
             { label: 'Total Booked', value: totalBooked, accent: 'FF6366F1' },
             { label: 'Total Scheduled', value: totalScheduled, accent: 'FF0EA5E9' },
             { label: 'Total Closed', value: totalClosed, accent: 'FF10B981' },
-            { label: 'Total Revenue', value: totalRevenue, accent: 'FFF59E0B', numFmt: '"₹"#,##0' },
+            { label: 'Total Revenue', value: totalRevenue, accent: 'FFF59E0B', numFmt: FMT.RUPEE },
           ],
           totalRow: {
             userName: 'Total',
@@ -183,6 +196,7 @@ router.post(
         });
         return;
       }
+      const result = await service.employeeProductivity(req.body, page, size);
       return modernOk(res, result);
     } catch (err) {
       if (err && err.status) return modernError(res, err.status, err.message);

@@ -35,6 +35,12 @@ const { roleByName } = require('../../../middleware/role');
 const { modernOk, modernError } = require('../../../utils/response');
 const { streamStyledXlsx } = require('../../../utils/xlsx-styled-export');
 const { extendJobFilter } = require('../../../validators/quicksight.validator');
+const {
+  fileStamp,
+  displayStamp,
+  FMT,
+  decorateColumns,
+} = require('../../../services/quicksight/_shared');
 const service = require('../../../services/quicksight/quicksight-client-performance.service');
 
 const ACTION_KEY = 'isQuickSightClientPerformanceView';
@@ -55,51 +61,37 @@ const querySchema = extendJobFilter({
   period: Joi.string().valid('monthly', 'weekly').default('monthly'),
 });
 
-const stamp = () => new Date().toISOString().slice(0, 10);
-
-// Pretty "15 Jun 2026" generation stamp for the meta band.
-const prettyStamp = () =>
-  new Date().toLocaleDateString('en-GB', {
-    day: '2-digit', month: 'short', year: 'numeric',
-  });
-
-// Number formats per column family (CHECK the service value shape):
-//   counts          -> '#,##0'
-//   rupees          -> '"₹"#,##0'
-//   percentages are WHOLE numbers (e.g. 86 = 86%, computed as r0((x/y)*100))
-//                   -> '0.0"%"'  (NOT 0.0% which would render 8600%)
-const FMT_COUNT = '#,##0';
-const FMT_RUPEE = '"₹"#,##0';
-const FMT_PCT = '0.0"%"';
-
 /*
- * Decorate the service-built flat columns with align / numFmt / dataBar.
- * We MUST NOT rename keys/headers — only add presentation hints. The keys
- * follow the toXlsx() shape: `projectManager`, `clientName`, then per period
- * `p{i}_{field}`. Data bars go ONLY on the per-period `ticketCreated` volume
- * columns (the headline count) — never on IDs/names/percentages/rupees.
+ * Column decoration rules for this report — passed to the shared
+ * decorateColumns(columns, rules). We MUST NOT rename keys/headers — only add
+ * presentation hints. Keys follow the toXlsx() shape: `projectManager`,
+ * `clientName`, then per period `p{i}_{field}`. FIRST matching rule wins;
+ * unmatched columns pass through unchanged. Data bars go ONLY on the per-period
+ * `ticketCreated` volume columns (the headline count) — never on IDs/names/
+ * percentages/rupees. Percentages here are WHOLE numbers → FMT.PCT.
  */
-function decorateColumns(columns) {
-  return columns.map((col) => {
-    const { key } = col;
-    if (key === 'projectManager' || key === 'clientName') {
-      return { ...col, align: 'left' };
-    }
-    if (/_ticketCreated$/.test(key)) {
-      return { ...col, align: 'right', numFmt: FMT_COUNT, dataBar: true, dataBarColor: 'FF2E86DE' };
-    }
-    if (/_cancellationAfterAllocation$/.test(key) || /_averageTat$/.test(key)) {
-      return { ...col, align: 'right', numFmt: FMT_COUNT };
-    }
-    if (/_enquiryPercentage$/.test(key) || /_escalationPercentage$/.test(key)) {
-      return { ...col, align: 'right', numFmt: FMT_PCT };
-    }
-    if (/_averageTicketSize$/.test(key) || /_sumOfTotalCharge$/.test(key)) {
-      return { ...col, align: 'right', numFmt: FMT_RUPEE };
-    }
-    return col;
-  });
-}
+const COLUMN_RULES = [
+  {
+    match: (key) => key === 'projectManager' || key === 'clientName',
+    hints: { align: 'left' },
+  },
+  {
+    match: (key) => /_ticketCreated$/.test(key),
+    hints: { align: 'right', numFmt: FMT.COUNT, dataBar: true, dataBarColor: 'FF2E86DE' },
+  },
+  {
+    match: (key) => /_cancellationAfterAllocation$/.test(key) || /_averageTat$/.test(key),
+    hints: { align: 'right', numFmt: FMT.COUNT },
+  },
+  {
+    match: (key) => /_enquiryPercentage$/.test(key) || /_escalationPercentage$/.test(key),
+    hints: { align: 'right', numFmt: FMT.PCT },
+  },
+  {
+    match: (key) => /_averageTicketSize$/.test(key) || /_sumOfTotalCharge$/.test(key),
+    hints: { align: 'right', numFmt: FMT.RUPEE },
+  },
+];
 
 // Headline KPIs from the grouped rows — totals for the MOST-RECENT period
 // (index 0 of each client's periods array), the period the title reflects.
@@ -114,7 +106,7 @@ function buildKpis(rows) {
   }
   return [
     { label: 'Tickets Received', value: tickets },
-    { label: 'Revenue', value: revenue, numFmt: FMT_RUPEE, accent: 'FF10B981' },
+    { label: 'Revenue', value: revenue, numFmt: FMT.RUPEE, accent: 'FF10B981' },
     { label: 'Clients', value: rows.length, accent: 'FFF59E0B' },
   ];
 }
@@ -139,12 +131,12 @@ router.get('/', validate(querySchema, 'query'), async (req, res, next) => {
       // toggle word when there are no rows.
       const activeLabel = rows[0]?.periods?.[0]?.label || period;
       const periodWord = period === 'weekly' ? 'Weekly' : 'Monthly';
-      const filename = `client-performance-${period}-${stamp()}.xlsx`;
+      const filename = `client-performance-${period}-${fileStamp()}.xlsx`;
       await streamStyledXlsx(res, filename, {
         title: 'EasyFix · Client Performance',
-        meta: `Period: ${periodWord} (${activeLabel}) · ${rows.length} Clients · Generated ${prettyStamp()}`,
+        meta: `Period: ${periodWord} (${activeLabel}) · ${rows.length} Clients · Generated ${displayStamp()}`,
         sheetName: 'Client Performance',
-        columns: decorateColumns(columns),
+        columns: decorateColumns(columns, COLUMN_RULES),
         rows: flatRows,
         kpis: buildKpis(rows),
         emptyMessage: 'No Client Performance Data For This Period.',

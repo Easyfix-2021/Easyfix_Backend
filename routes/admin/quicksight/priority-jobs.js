@@ -31,6 +31,7 @@ const requireQuickSight = require('../../../middleware/require-quicksight');
 const validate = require('../../../middleware/validate');
 const { modernOk, modernError } = require('../../../utils/response');
 const { streamStyledXlsx } = require('../../../utils/xlsx-styled-export');
+const { fileStamp, displayStamp } = require('../../../services/quicksight/_shared');
 const service = require('../../../services/quicksight/quicksight-priority-jobs.service');
 const { extendJobFilter, idArray } = require('../../../validators/quicksight.validator');
 
@@ -110,18 +111,20 @@ router.post('/export', validate(exportSchema), async (req, res, next) => {
 
     if (req.body.format === 'xlsx') {
       // KPIs derived from the exported job-level rows (closed-jobs set —
-      // see copyData() legacy-quirk comment). Title Case labels, plain
-      // numbers. Escalated/Unconfirmed are grid-only metrics not present in
-      // this row set, so the cards reflect what the export actually carries.
+      // see copyData() legacy-quirk comment). service.copyData() is NOT
+      // paginated (the export schema carries no page params; the service
+      // fetches the whole filtered set bounded only by its EXPORT_LIMIT
+      // safety cap), so these cards already reflect the FULL filtered set,
+      // not one page. Title Case labels, plain numbers. Escalated/Unconfirmed
+      // are grid-only metrics not present in this row set, so the cards
+      // reflect what the export actually carries.
       const totalJobs = rows.length;
       const unallocated = rows.filter((r) => r.jobStatus === 'unallocated').length;
       const upCountry = rows.filter((r) => r.cityType === 'Up Country').length;
 
-      const generatedOn = new Date().toLocaleDateString('en-IN', {
-        day: '2-digit', month: 'short', year: 'numeric',
-      });
+      const generatedOn = displayStamp();
 
-      await streamStyledXlsx(res, 'priority-jobs.xlsx', {
+      await streamStyledXlsx(res, `priority-jobs-${fileStamp()}.xlsx`, {
         title: 'EasyFix · Priority Jobs',
         meta: `Hotspot Job Data · ${totalJobs} jobs · Generated ${generatedOn}`,
         sheetName: 'Hotspot Job Data',

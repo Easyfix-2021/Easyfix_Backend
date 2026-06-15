@@ -35,6 +35,7 @@ const requireQuickSight = require('../../../middleware/require-quicksight');
 const { modernOk, modernError } = require('../../../utils/response');
 const { streamStyledXlsx } = require('../../../utils/xlsx-styled-export');
 const { extendJobFilter } = require('../../../validators/quicksight.validator');
+const { fileStamp, displayStamp, FMT, decorateColumns } = require('../../../services/quicksight/_shared');
 const service = require('../../../services/quicksight/quicksight-city-performance.service');
 
 const ACTION_KEY = 'isQuickSightCityPerformanceView';
@@ -72,12 +73,6 @@ const tatSummarySchema = Joi.object({
   format: Joi.string().valid('json', 'xlsx').default('json'),
 });
 
-const stamp = () => new Date().toISOString().slice(0, 10);
-
-// Human-friendly generated-on stamp for the meta band (e.g. "15 Jun 2026").
-const DISPLAY_STAMP = () =>
-  new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
-
 // Period label (most-recent period) for the KPI card captions, taken from
 // the flattened header set so it matches the on-screen "current period".
 const recentLabel = (columns) => {
@@ -111,32 +106,45 @@ router.get('/', validate(tableSchema, 'query'), async (req, res, next) => {
       // from the service flattener, so they carry no numFmt/dataBar (a
       // dataBar on a % column would be meaningless, and a numFmt only
       // applies to numeric cells anyway). Keys/headers are left untouched.
-      const styledColumns = columns.map((col) => {
-        if (/_tkt$/.test(col.key)) {
-          // Ticket Created — primary volume metric → blue data bar.
-          return { ...col, align: 'right', numFmt: '#,##0', dataBar: true, dataBarColor: 'FF2E86DE' };
-        }
-        if (/_open$/.test(col.key)) {
-          // Open Orders — secondary volume metric → amber data bar.
-          return { ...col, align: 'right', numFmt: '#,##0', dataBar: true, dataBarColor: 'FFF59E0B' };
-        }
-        if (/_sda$|_tat$/.test(col.key)) {
-          // Pre-stringified percentages — keep centered, no numFmt/dataBar.
-          return { ...col, align: 'center' };
-        }
-        // State / City text columns → left aligned.
-        return { ...col, align: 'left' };
-      });
+      const styledColumns = decorateColumns(columns, [
+        // Ticket Created — primary volume metric → blue data bar.
+        {
+          match: (key) => /_tkt$/.test(key),
+          hints: { align: 'right', numFmt: FMT.COUNT, dataBar: true, dataBarColor: 'FF2E86DE' },
+        },
+        // Open Orders — secondary volume metric → amber data bar.
+        {
+          match: (key) => /_open$/.test(key),
+          hints: { align: 'right', numFmt: FMT.COUNT, dataBar: true, dataBarColor: 'FFF59E0B' },
+        },
+        // Pre-stringified percentages — keep centered, no numFmt/dataBar.
+        { match: (key) => /_sda$|_tat$/.test(key), hints: { align: 'center' } },
+        // State / City text columns → left aligned (catch-all).
+        { match: () => true, hints: { align: 'left' } },
+      ]);
 
-      // Headline KPIs from the MOST-RECENT period (p0) across the exported
-      // page of cities: total Tickets Created, total Open Orders, and the
-      // number of cities clearing the 85% TAT bar (TAT% cells are "NN%"
-      // strings; "-" / non-numeric are skipped).
+      // Headline KPIs must reflect the FULL filtered result set, NOT just the
+      // exported page. Re-fetch the whole filtered set (page 1, page size up to
+      // the BE/Joi safety ceiling of 200 cities = the service CITY_PAGE_CAP),
+      // then flatten it for aggregation. The exported TABLE body stays the
+      // requested page (`rows`); only the KPI cards span every city.
+      const fullPayload = await service.getCityPerformance({
+        flag,
+        page: 1,
+        pageSize: Math.max(payload?.totalRecords || 0, pageSize),
+        filters,
+      });
+      const fullRows = service.toXlsx(fullPayload, flag).rows;
+
+      // KPIs from the MOST-RECENT period (p0) across the FULL filtered set:
+      // total Tickets Created, total Open Orders, and the number of cities
+      // clearing the 85% TAT bar (TAT% cells are "NN%" strings; "-" /
+      // non-numeric are skipped).
       const lbl = recentLabel(columns);
       let totalTkt = 0;
       let totalOpen = 0;
       let citiesAtTat = 0;
-      for (const row of rows) {
+      for (const row of fullRows) {
         totalTkt += Number(row.p0_tkt) || 0;
         totalOpen += Number(row.p0_open) || 0;
         const tatNum = parseFloat(String(row.p0_tat));
@@ -152,9 +160,9 @@ router.get('/', validate(tableSchema, 'query'), async (req, res, next) => {
       const cityCount = payload?.totalRecords ?? rows.length;
       const meta =
         `Period: ${flagLabel} · ${cityCount} ${cityCount === 1 ? 'City' : 'Cities'} · ` +
-        `Generated ${DISPLAY_STAMP()}`;
+        `Generated ${displayStamp()}`;
 
-      const filename = `city-performance-${flag}-${stamp()}.xlsx`;
+      const filename = `city-performance-${flag}-${fileStamp()}.xlsx`;
       await streamStyledXlsx(res, filename, {
         title: 'EasyFix · City Performance',
         meta,

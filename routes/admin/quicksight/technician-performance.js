@@ -35,9 +35,21 @@ const validate = require('../../../middleware/validate');
 const { modernOk, modernError } = require('../../../utils/response');
 const { streamStyledXlsx } = require('../../../utils/xlsx-styled-export');
 const { extendJobFilter } = require('../../../validators/quicksight.validator');
+const {
+  fileStamp,
+  displayStamp,
+  FMT,
+  decorateColumns,
+} = require('../../../services/quicksight/_shared');
 const service = require('../../../services/quicksight/quicksight-technician-performance.service');
 
 const ACTION_KEY = 'isQuickSightTechnicianPerformanceView';
+
+// Full-set page size for ?format=xlsx — sized to the service's distinct-tech
+// safety cap (TECH_LIST_CAP = 50000) so a single page covers every matching
+// technician and the export's rows/KPIs/totals span the whole filtered set,
+// not just the on-screen page. The service logger.warns if its cap is hit.
+const FULL_SET_PAGE_SIZE = 50000;
 
 // Per-report access gate: ef-QuickSight family key + this report's own key.
 router.use(requireQuickSight(ACTION_KEY));
@@ -68,32 +80,28 @@ const categoryQuery = Joi.object({
   format: Joi.string().valid('json', 'xlsx').default('json'),
 });
 
-const stamp = () => new Date().toISOString().slice(0, 10);
-
-// Human-readable generated date for the styled meta band (e.g. "15-Jun-2026").
-const MONTH_ABBR = [
-  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
-];
-function generatedStamp() {
-  const d = new Date();
-  return `${String(d.getDate()).padStart(2, '0')}-${MONTH_ABBR[d.getMonth()]}-${d.getFullYear()}`;
-}
-
 // ── XLSX column set for the category drill-down (flat one-row-per-category-
 // per-period; period label prefixes keep the 3 blocks distinguishable). Title
-// Case headers, corrected label/field alignment. Counts get the #,##0 format;
-// SDA%/TAT% are WHOLE numbers from pct() (86 = 86%) so use 0.0"%" — NOT 0.0%
-// which would render 8600%. Data bars on the two volume columns only.
-const CATEGORY_XLSX_COLUMNS = [
+// Case headers, corrected label/field alignment. Counts get the FMT.COUNT
+// format; SDA%/TAT% are WHOLE numbers from pct() (86 = 86%) so use FMT.PCT
+// (0.0"%") — NOT 0.0% which would render 8600%. Data bars on the two volume
+// columns only. Hints are applied via the shared decorateColumns() decorator
+// (exact-key rules; first match wins) rather than baked inline.
+const CATEGORY_XLSX_BASE_COLUMNS = [
   { key: 'detailsFor', header: 'Period', width: 16, align: 'left' },
   { key: 'categoryName', header: 'Category Name', width: 24, align: 'left' },
-  { key: 'tktCount', header: 'Ticket Allocated', width: 16, numFmt: '#,##0', dataBar: true, dataBarColor: 'FF2E86DE' },
-  { key: 'tktCompleted', header: 'Completed', width: 12, numFmt: '#,##0', dataBar: true, dataBarColor: 'FF10B981' },
-  { key: 'sdaPercentage', header: 'SDA%', width: 10, numFmt: '0.0"%"' },
-  { key: 'tatPercentage', header: 'TAT%', width: 10, numFmt: '0.0"%"' },
-  { key: 'txOpenOrderOnApp', header: 'Open Order In App', width: 18, numFmt: '#,##0' },
+  { key: 'tktCount', header: 'Ticket Allocated', width: 16 },
+  { key: 'tktCompleted', header: 'Completed', width: 12 },
+  { key: 'sdaPercentage', header: 'SDA%', width: 10 },
+  { key: 'tatPercentage', header: 'TAT%', width: 10 },
+  { key: 'txOpenOrderOnApp', header: 'Open Order In App', width: 18 },
 ];
+const CATEGORY_XLSX_COLUMNS = decorateColumns(CATEGORY_XLSX_BASE_COLUMNS, [
+  { match: (k) => k === 'tktCount', hints: { numFmt: FMT.COUNT, dataBar: true, dataBarColor: 'FF2E86DE' } },
+  { match: (k) => k === 'tktCompleted', hints: { numFmt: FMT.COUNT, dataBar: true, dataBarColor: 'FF10B981' } },
+  { match: (k) => k === 'sdaPercentage' || k === 'tatPercentage', hints: { numFmt: FMT.PCT } },
+  { match: (k) => k === 'txOpenOrderOnApp', hints: { numFmt: FMT.COUNT } },
+]);
 
 // ── GET / — main Technician Performance list (paginated over technicians) ──
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
@@ -108,29 +116,33 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
       reportingManagerId: req.query.reportingManagerId,
     };
 
-    const payload = await service.getTechnicianPerformance({ flag, page, pageSize, filters });
-
     if (format === 'xlsx') {
+      // The download must reflect the FULL filtered technician set, not just
+      // the on-screen page. Re-run the service as a single full-set page
+      // (page 1, pageSize = the full-set cap below) so rows, KPI cards and
+      // totals all aggregate every matching technician. The JSON branch +
+      // pagination below are untouched.
+      const payload = await service.getTechnicianPerformance({
+        flag, page: 1, pageSize: FULL_SET_PAGE_SIZE, filters,
+      });
       const { columns, rows } = service.toXlsx(payload);
 
-      // Enrich the flat columns with number formats / alignment / data bars.
-      // Keys are dynamic (p{i}_ticketAssigned|sda|tat|openApp) so match by key:
-      //   counts (Ticket Assigned / Open Order In App) → #,##0 + data bar on
-      //   the allocation volume; SDA%/TAT% are WHOLE numbers (86 = 86%) → 0.0"%".
-      const styledColumns = columns.map((c) => {
-        if (c.key === 'txId') return { ...c, align: 'center' };
-        if (c.key === 'txCurrentBalance') return { ...c, numFmt: '#,##0.00', align: 'right' };
-        if (/_ticketAssigned$/.test(c.key)) {
-          return { ...c, numFmt: '#,##0', align: 'right', dataBar: true, dataBarColor: 'FF2E86DE' };
-        }
-        if (/_openApp$/.test(c.key)) return { ...c, numFmt: '#,##0', align: 'right' };
-        if (/_sda$/.test(c.key) || /_tat$/.test(c.key)) return { ...c, numFmt: '0.0"%"', align: 'right' };
-        if (c.key === 'stateName' || c.key === 'txCity' || c.key === 'txName') return { ...c, align: 'left' };
-        return c;
-      });
+      // Enrich the flat columns with number formats / alignment / data bars via
+      // the shared decorateColumns() decorator (first matching rule wins). Keys
+      // are dynamic (p{i}_ticketAssigned|sda|tat|openApp) so match by key:
+      //   counts (Ticket Assigned / Open Order In App) → FMT.COUNT + data bar on
+      //   the allocation volume; SDA%/TAT% are WHOLE numbers (86 = 86%) → FMT.PCT.
+      const styledColumns = decorateColumns(columns, [
+        { match: (k) => k === 'txId', hints: { align: 'center' } },
+        { match: (k) => k === 'txCurrentBalance', hints: { numFmt: '#,##0.00', align: 'right' } },
+        { match: (k) => /_ticketAssigned$/.test(k), hints: { numFmt: FMT.COUNT, align: 'right', dataBar: true, dataBarColor: 'FF2E86DE' } },
+        { match: (k) => /_openApp$/.test(k), hints: { numFmt: FMT.COUNT, align: 'right' } },
+        { match: (k) => /_sda$/.test(k) || /_tat$/.test(k), hints: { numFmt: FMT.PCT, align: 'right' } },
+        { match: (k) => k === 'stateName' || k === 'txCity' || k === 'txName', hints: { align: 'left' } },
+      ]);
 
-      // KPIs — totals across the page, summed from the most-recent period
-      // (last bucket; periods are oldest→newest) so the cards reflect the
+      // KPIs — totals across the FULL filtered set, summed from the most-recent
+      // period (last bucket; periods are oldest→newest) so the cards reflect the
       // current window the user is looking at.
       const list = (payload && payload.data) || [];
       let totalAllocated = 0;
@@ -148,15 +160,15 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
       const sampleLatest =
         list[0]?.technicianPerformanceDataDateWise?.slice(-1)[0]?.detailsFor || '';
 
-      await streamStyledXlsx(res, `technician-performance-${flag}-${stamp()}.xlsx`, {
+      await streamStyledXlsx(res, `technician-performance-${flag}-${fileStamp()}.xlsx`, {
         title: 'EasyFix · Technician Performance',
-        meta: `Flag: ${flag}${sampleLatest ? ` · Latest Period: ${sampleLatest}` : ''} · ${rows.length} Technicians · Generated ${generatedStamp()}`,
+        meta: `Flag: ${flag}${sampleLatest ? ` · Latest Period: ${sampleLatest}` : ''} · ${rows.length} Technicians · Generated ${displayStamp()}`,
         sheetName: 'Technician Performance',
         kpis: [
           { label: 'Technicians', value: rows.length },
           { label: 'Total Allocated', value: totalAllocated },
           { label: 'Total Completed', value: totalCompleted, accent: 'FF10B981' },
-          { label: 'Completion %', value: completionPct, numFmt: '0.0"%"', accent: 'FFF59E0B' },
+          { label: 'Completion %', value: completionPct, numFmt: FMT.PCT, accent: 'FFF59E0B' },
         ],
         columns: styledColumns,
         rows,
@@ -165,6 +177,8 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
       return;
     }
 
+    // JSON branch — paginated page as requested (unchanged contract).
+    const payload = await service.getTechnicianPerformance({ flag, page, pageSize, filters });
     return modernOk(res, payload);
   } catch (err) {
     if (err && err.status) return modernError(res, err.status, err.message || 'Request failed');
@@ -215,15 +229,15 @@ router.get(
 
         await streamStyledXlsx(
           res,
-          `technician-performance-category-${txId}-${flag}-${stamp()}.xlsx`,
+          `technician-performance-category-${txId}-${flag}-${fileStamp()}.xlsx`,
           {
             title: 'EasyFix · Technician Performance — By Category',
-            meta: `Flag: ${flag} · Technician #${txId} · ${rows.length} Rows · Generated ${generatedStamp()}`,
+            meta: `Flag: ${flag} · Technician #${txId} · ${rows.length} Rows · Generated ${displayStamp()}`,
             sheetName: 'Category Performance',
             kpis: [
               { label: 'Total Allocated', value: totalAllocated },
               { label: 'Total Completed', value: totalCompleted, accent: 'FF10B981' },
-              { label: 'Completion %', value: completionPct, numFmt: '0.0"%"', accent: 'FFF59E0B' },
+              { label: 'Completion %', value: completionPct, numFmt: FMT.PCT, accent: 'FFF59E0B' },
             ],
             columns: CATEGORY_XLSX_COLUMNS,
             rows,

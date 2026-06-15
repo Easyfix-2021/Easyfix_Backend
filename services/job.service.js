@@ -88,6 +88,7 @@ const LIST_COLUMNS = `
   LEFT(j.remarks, 500) AS remarks,
   j.fk_customer_id, cu.customer_name, cu.customer_mob_no,
   j.fk_client_id, cl.client_name,
+  j.fk_service_catg_id, sc.service_catg_name AS service_category,
   j.fk_easyfixter_id, ef.efr_name AS easyfixer_name,
   j.job_owner, ow.user_name AS owner_name,
   j.fk_address_id, ci.city_name,
@@ -189,6 +190,7 @@ const LIST_JOIN = `
   LEFT JOIN tbl_client      cl ON cl.client_id   = j.fk_client_id
   LEFT JOIN tbl_easyfixer   ef ON ef.efr_id      = j.fk_easyfixter_id
   LEFT JOIN tbl_user        ow ON ow.user_id     = j.job_owner
+  LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = j.fk_service_catg_id
 `;
 
 /*

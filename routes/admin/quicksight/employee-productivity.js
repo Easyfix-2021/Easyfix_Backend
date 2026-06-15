@@ -36,7 +36,13 @@ const requireQuickSight = require('../../../middleware/require-quicksight');
 const validate = require('../../../middleware/validate');
 const { modernOk, modernError } = require('../../../utils/response');
 const { streamStyledXlsx } = require('../../../utils/xlsx-styled-export');
+const { fileStamp, displayStamp, FMT } = require('../../../services/quicksight/_shared');
 const service = require('../../../services/quicksight/quicksight-employee-productivity.service');
+
+// XLSX export fetches the FULL filtered set (not one page). High ceiling so the
+// download reflects every matching employee; aligns with the service's own
+// MAX_PAGE_SIZE warn threshold for grouped rows.
+const XLSX_EXPORT_SIZE = 5000;
 
 // Per-report access gate: ef-QuickSight family key + this report's own key.
 router.use(requireQuickSight('isQuickSightEmployeeProductivityView'));
@@ -84,44 +90,44 @@ const rmTeamUsersSchema = Joi.object({
 // Closed) — never on the name column or the rupee column.
 const PRODUCTIVITY_XLSX_COLUMNS = [
   { key: 'userName', header: 'Employee', width: 28, align: 'left' },
-  { key: 'booked', header: 'Booked', numFmt: '#,##0', align: 'right', dataBar: true, dataBarColor: 'FF6366F1' },
-  { key: 'scheduled', header: 'Scheduled', numFmt: '#,##0', align: 'right', dataBar: true, dataBarColor: 'FF0EA5E9' },
-  { key: 'audit', header: 'Audit', numFmt: '#,##0', align: 'right' },
-  { key: 'closedCount', header: 'Closed', numFmt: '#,##0', align: 'right', dataBar: true, dataBarColor: 'FF10B981' },
-  { key: 'revenue', header: 'Revenue', width: 14, numFmt: '"₹"#,##0', align: 'right' },
-  { key: 'cancelCount', header: 'Cancelled', numFmt: '#,##0', align: 'right' },
+  { key: 'booked', header: 'Booked', numFmt: FMT.COUNT, align: 'right', dataBar: true, dataBarColor: 'FF6366F1' },
+  { key: 'scheduled', header: 'Scheduled', numFmt: FMT.COUNT, align: 'right', dataBar: true, dataBarColor: 'FF0EA5E9' },
+  { key: 'audit', header: 'Audit', numFmt: FMT.COUNT, align: 'right' },
+  { key: 'closedCount', header: 'Closed', numFmt: FMT.COUNT, align: 'right', dataBar: true, dataBarColor: 'FF10B981' },
+  { key: 'revenue', header: 'Revenue', width: 14, numFmt: FMT.RUPEE, align: 'right' },
+  { key: 'cancelCount', header: 'Cancelled', numFmt: FMT.COUNT, align: 'right' },
 ];
 
 /*
  * GET /employee-productivity — paginated per-employee productivity table.
- * ?format=xlsx streams ALL rows of the CURRENT filter/page (legacy Copy-Data
- * copied per page; the xlsx mirrors that — one page per download — to keep
- * parity, while the FE Copy Data button can still walk all pages client-side).
+ * ?format=xlsx streams the FULL filtered set (KPIs + totalRow + rows aggregate
+ * every matching employee, not just the on-screen page). The JSON branch keeps
+ * server-side pagination for the table view.
  */
 router.get('/employee-productivity', validate(productivitySchema, 'query'), async (req, res, next) => {
   try {
     const pf = await service.processFloorFilters(req.query);
-    const result = await service.getEmployeeProductivity({
-      pf,
-      page: req.query.page,
-      size: req.query.size,
-    });
 
     if (req.query.format === 'xlsx') {
-      const exportRows = result.data || [];
-      // Headline KPIs from the exported page rows (plain numbers, Title Case).
+      // Export reflects the FULL filtered set, not the on-screen page: fetch
+      // page 1 at the high export ceiling so KPIs / totalRow / rows aggregate
+      // every matching employee. JSON branch below keeps real pagination.
+      const fullResult = await service.getEmployeeProductivity({
+        pf,
+        page: 1,
+        size: XLSX_EXPORT_SIZE,
+      });
+      const exportRows = fullResult.data || [];
+      // Headline KPIs over the full filtered set (plain numbers, Title Case).
       const sumOf = (k) => exportRows.reduce((a, r) => a + (Number(r[k]) || 0), 0);
       const totalBooked = sumOf('booked');
       const totalScheduled = sumOf('scheduled');
       const totalClosed = sumOf('closedCount');
       const totalRevenue = sumOf('revenue');
 
-      const generatedOn = new Date().toLocaleDateString('en-GB', {
-        day: '2-digit', month: 'short', year: 'numeric',
-      });
-      const meta = `${exportRows.length} Employees · Generated ${generatedOn}`;
+      const meta = `${exportRows.length} Employees · Generated ${displayStamp()}`;
 
-      await streamStyledXlsx(res, 'employee-productivity.xlsx', {
+      await streamStyledXlsx(res, `employee-productivity-${fileStamp()}.xlsx`, {
         title: 'EasyFix · Employee Productivity',
         meta,
         sheetName: 'Productivity',
@@ -131,7 +137,7 @@ router.get('/employee-productivity', validate(productivitySchema, 'query'), asyn
           { label: 'Total Booked', value: totalBooked, accent: 'FF6366F1' },
           { label: 'Total Scheduled', value: totalScheduled, accent: 'FF0EA5E9' },
           { label: 'Total Closed', value: totalClosed, accent: 'FF10B981' },
-          { label: 'Total Revenue', value: totalRevenue, accent: 'FFF59E0B', numFmt: '"₹"#,##0' },
+          { label: 'Total Revenue', value: totalRevenue, accent: 'FFF59E0B', numFmt: FMT.RUPEE },
         ],
         totalRow: {
           userName: 'Total',
@@ -146,6 +152,13 @@ router.get('/employee-productivity', validate(productivitySchema, 'query'), asyn
       });
       return;
     }
+
+    // JSON branch — server-side pagination unchanged.
+    const result = await service.getEmployeeProductivity({
+      pf,
+      page: req.query.page,
+      size: req.query.size,
+    });
     return modernOk(res, result);
   } catch (err) {
     if (err && err.status) return modernError(res, err.status, err.message);

@@ -36,43 +36,38 @@ const requireQuickSight = require('../../../middleware/require-quicksight');
 const validate = require('../../../middleware/validate');
 const { modernOk, modernError } = require('../../../utils/response');
 const { streamStyledXlsx } = require('../../../utils/xlsx-styled-export');
+const {
+  fileStamp,
+  displayStamp,
+  FMT,
+  decorateColumns,
+} = require('../../../services/quicksight/_shared');
 const service = require('../../../services/quicksight/quicksight-supply-gap.service');
 
-// Number format for count/identifier columns (registry convention).
-const FMT_COUNT = '#,##0';
-
-// Pretty "15 Jun 2026" generation stamp for the meta band.
-const prettyStamp = () =>
-  new Date().toLocaleDateString('en-GB', {
-    day: '2-digit', month: 'short', year: 'numeric',
-  });
-
-// yyyy-mm-dd stamp for the download filename.
-const fileStamp = () => new Date().toISOString().slice(0, 10);
-
 /*
- * Decorate the service-built XLSX_COLUMNS with align / numFmt / dataBar
- * WITHOUT renaming any key/header (only ADD presentation hints):
+ * Column-hint rules for the service-built XLSX_COLUMNS — passed to the shared
+ * decorateColumns(columns, rules). FIRST match wins; unmatched columns pass
+ * through unchanged (text columns keep the helper's centered default). No key
+ * or header is renamed; only presentation hints are added:
  *   - Gap Days  -> count format + AMBER data bar (gap severity headline).
  *   - Added Count -> count format + BLUE data bar (supplies allocated).
  *   - GapId / Job Id / PinCode -> count format, right-aligned, NO data bar
  *     (identifiers — a bar would be meaningless / misleading on city names).
- * Text columns keep the helper's default (centered, no format).
  */
-function decorateColumns(columns) {
-  return columns.map((col) => {
-    if (col.key === 'gapDays') {
-      return { ...col, align: 'right', numFmt: FMT_COUNT, dataBar: true, dataBarColor: 'FFF59E0B' };
-    }
-    if (col.key === 'addedCount') {
-      return { ...col, align: 'right', numFmt: FMT_COUNT, dataBar: true, dataBarColor: 'FF2E86DE' };
-    }
-    if (col.key === 'gapId' || col.key === 'jobId' || col.key === 'pinCode') {
-      return { ...col, align: 'right', numFmt: FMT_COUNT };
-    }
-    return col;
-  });
-}
+const COLUMN_RULES = [
+  {
+    match: (key) => key === 'gapDays',
+    hints: { align: 'right', numFmt: FMT.COUNT, dataBar: true, dataBarColor: 'FFF59E0B' },
+  },
+  {
+    match: (key) => key === 'addedCount',
+    hints: { align: 'right', numFmt: FMT.COUNT, dataBar: true, dataBarColor: 'FF2E86DE' },
+  },
+  {
+    match: (key) => key === 'gapId' || key === 'jobId' || key === 'pinCode',
+    hints: { align: 'right', numFmt: FMT.COUNT },
+  },
+];
 
 /*
  * Headline KPIs from the export rows:
@@ -151,9 +146,9 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
       const filename = `supply-gap-analysis-${fileStamp()}.xlsx`;
       await streamStyledXlsx(res, filename, {
         title: 'EasyFix · Supply Gap Analysis',
-        meta: `${cities.size} Cities · ${rows.length} Supply Requests · Generated ${prettyStamp()}`,
+        meta: `${cities.size} Cities · ${rows.length} Supply Requests · Generated ${displayStamp()}`,
         sheetName: 'Supply Requests',
-        columns: decorateColumns(service.XLSX_COLUMNS),
+        columns: decorateColumns(service.XLSX_COLUMNS, COLUMN_RULES),
         rows,
         kpis: buildKpis(rows),
         totalRow: buildTotalRow(rows),

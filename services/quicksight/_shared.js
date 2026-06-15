@@ -181,11 +181,59 @@ const JOB_STATUS = {
   CANCELLED: 6,
 };
 
+/* ── XLSX export helpers (shared by the QuickSight ?format=xlsx branches) ──
+ * Hoisted 2026-06-15 from per-route duplicates (DISPLAY_STAMP / FILE_STAMP /
+ * FMT_COUNT / decorateColumns had drifted across files). All reports stream
+ * via utils/xlsx-styled-export.js — these standardise the date stamps,
+ * number formats, and the column-hint decorator so every report's download
+ * reads as one family. */
+
+// yyyy-mm-dd stamp for download filenames (e.g. "2026-06-15").
+const fileStamp = () => new Date().toISOString().slice(0, 10);
+
+// Human "15 Jun 2026" stamp for the meta band.
+const displayStamp = () =>
+  new Date().toLocaleDateString('en-GB', {
+    day: '2-digit', month: 'short', year: 'numeric',
+  });
+
+// Number formats for streamStyledXlsx column hints. CHECK the service value
+// shape before picking a percentage format:
+//   COUNT  -> thousands-grouped integer
+//   RUPEE  -> ₹ integer
+//   PCT    -> WHOLE-number percent (86 -> "86.0%"); NOT a 0..1 fraction
+//             (a fraction needs '0.0%', which would render 86 as 8600%)
+const FMT = Object.freeze({
+  COUNT: '#,##0',
+  RUPEE: '"₹"#,##0',
+  PCT: '0.0"%"',
+});
+
+/*
+ * Decorate streamStyledXlsx columns with align / numFmt / dataBar hints
+ * WITHOUT renaming any key/header. `rules` is an ordered list of
+ *   { match: (key) => boolean, hints: { align?, numFmt?, dataBar?, dataBarColor? } }
+ * The FIRST matching rule wins; unmatched columns pass through unchanged.
+ * Report-specific rules stay at the call site; only the map/merge boilerplate
+ * is hoisted here.
+ */
+function decorateColumns(columns, rules = []) {
+  return columns.map((col) => {
+    const rule = rules.find((r) => r.match(col.key));
+    return rule ? { ...col, ...rule.hints } : col;
+  });
+}
+
 module.exports = {
   buildInFilter,
   computeLastThreeWeeks,
   computeLastThreeMonths,
   JOB_STATUS,
+  // Shared XLSX export helpers (QuickSight report downloads).
+  fileStamp,
+  displayStamp,
+  FMT,
+  decorateColumns,
   // Exposed for reuse/tests; report code rarely needs these directly.
   _dateHelpers: { istToday, fmt, addDays },
 };
