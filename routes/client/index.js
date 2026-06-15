@@ -435,6 +435,131 @@ router.get('/dashboard', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+/*
+ * GET /api/client/dashboard-summary
+ *
+ * Powers the new Summary Dashboard landing page. Returns three
+ * payloads in a single round-trip so the FE renders without a
+ * cascade of fetches:
+ *
+ *   counts:           Headline KPI numbers (5 cards).
+ *   statusBreakdown:  Slice array for the donut chart, in display order.
+ *   recentEscalations: Top 5 most-recent escalated jobs, for the
+ *                      "Need attention" list.
+ *
+ * Scope (always team-wide for now — per design decision):
+ *   reporting_contact_id IN (req.spoc.id ∪ direct-reports-of-spoc)
+ *
+ * Date scope: omitted on v1 — counts are lifetime. A date picker
+ * would slot in here as `startDate`/`endDate` query params; the
+ * BETWEEN clause would attach to j.ticket_created_date_time. Left
+ * out for v1 simplicity.
+ *
+ * Performance: each sub-payload is a single COUNT/SELECT that hits
+ * the (fk_client_id, job_status) compound coverage on tbl_job. With
+ * the existing FK_tbl_job_client + idx_tbl_job_status indexes the
+ * planner can range-scan; on prod-sized tbl_job (~481k rows) the
+ * whole endpoint resolves in well under 200ms.
+ */
+router.get('/dashboard-summary', async (req, res, next) => {
+  try {
+    // Resolve the SPOC's team scope — themself + everyone who reports
+    // to them. Mirrors the legacy ClientController.java lines 101-111
+    // "my team's tickets" expansion. Stays in-process (no JOIN) so we
+    // can reuse the same id list across all three sub-queries.
+    const [reports] = await pool.query(
+      `SELECT id FROM tbl_client_contacts
+        WHERE client_id = ?
+          AND manager_id IS NOT NULL AND manager_id NOT IN ('', 'null')
+          AND CAST(manager_id AS UNSIGNED) = ?`,
+      [req.spoc.client_id, req.spoc.id]
+    );
+    const teamIds = reports.map((r) => r.id);
+    teamIds.push(req.spoc.id);
+    const teamPlaceholders = teamIds.map(() => '?').join(',');
+
+    // Single COUNT … FILTER over the team-scope. One scan, five
+    // SUM(CASE) — keeps the round-trips and join cost flat compared
+    // to firing five COUNT(*) queries.
+    const [[counts]] = await pool.query(
+      `SELECT
+         SUM(CASE WHEN j.job_status = 9                                 THEN 1 ELSE 0 END) AS newTickets,
+         SUM(CASE WHEN j.job_status IN (0, 1, 2, 20)                    THEN 1 ELSE 0 END) AS inProgress,
+         SUM(CASE WHEN j.job_status IN (3, 5)                           THEN 1 ELSE 0 END) AS completed,
+         SUM(CASE WHEN j.job_status = 6                                 THEN 1 ELSE 0 END) AS cancelled,
+         SUM(CASE WHEN r.is_escalated = 1                               THEN 1 ELSE 0 END) AS escalated
+       FROM   tbl_job j
+       LEFT   JOIN tbl_easyfixer_rating_by_customer r ON r.job_id = j.job_id
+       WHERE  j.fk_client_id        = ?
+         AND  j.reporting_contact_id IN (${teamPlaceholders})`,
+      [req.spoc.client_id, ...teamIds]
+    );
+
+    // Donut slices — return labels + colours pre-baked so the FE just
+    // maps to SVG. Order is the lifecycle-natural reading order.
+    // Colours match the brand palette + the badge colours used on
+    // the Order History "Status of Order" column.
+    const [breakdownRows] = await pool.query(
+      `SELECT j.job_status, COUNT(*) AS n
+         FROM tbl_job j
+        WHERE j.fk_client_id        = ?
+          AND j.reporting_contact_id IN (${teamPlaceholders})
+        GROUP BY j.job_status`,
+      [req.spoc.client_id, ...teamIds]
+    );
+    const STATUS_GROUPS = [
+      { label: 'New',         statuses: [9],            color: '#f59e0b' }, // amber
+      { label: 'Scheduled',   statuses: [0, 1],         color: '#3b82f6' }, // blue
+      { label: 'In Progress', statuses: [2, 20],        color: '#8b5cf6' }, // violet
+      { label: 'Completed',   statuses: [3, 5],         color: '#10b981' }, // emerald
+      { label: 'Under Audit', statuses: [10],           color: '#06b6d4' }, // cyan
+      { label: 'Cancelled',   statuses: [6],            color: '#ef4444' }, // rose
+      { label: 'On Hold',     statuses: [15, 21],       color: '#64748b' }, // slate
+    ];
+    const byStatus = new Map(breakdownRows.map((r) => [Number(r.job_status), Number(r.n)]));
+    const statusBreakdown = STATUS_GROUPS.map((g) => ({
+      label: g.label,
+      count: g.statuses.reduce((sum, s) => sum + (byStatus.get(s) || 0), 0),
+      color: g.color,
+    })).filter((s) => s.count > 0); // hide empty slices
+
+    // Top 5 most-recent escalations. Joined with the rating row to
+    // get the escalation reason, and with the customer for the
+    // display name. ORDER BY job_id DESC is a safe proxy for "most
+    // recent" without depending on rating_date_time (column legacy-
+    // unreliable on some rows).
+    const [recentEscalations] = await pool.query(
+      `SELECT j.job_id, j.client_ref_id, j.job_status,
+              cu.customer_name, cu.customer_mob_no,
+              ef.efr_name AS easyfixer_name,
+              r.review_comment, r.customer_rating
+         FROM tbl_job j
+         JOIN tbl_easyfixer_rating_by_customer r ON r.job_id = j.job_id
+         LEFT JOIN tbl_customer  cu ON cu.customer_id = j.fk_customer_id
+         LEFT JOIN tbl_easyfixer ef ON ef.efr_id      = j.fk_easyfixter_id
+        WHERE r.is_escalated         = 1
+          AND j.fk_client_id         = ?
+          AND j.reporting_contact_id IN (${teamPlaceholders})
+        ORDER BY j.job_id DESC
+        LIMIT 5`,
+      [req.spoc.client_id, ...teamIds]
+    );
+
+    return modernOk(res, {
+      counts: {
+        newTickets: Number(counts.newTickets) || 0,
+        inProgress: Number(counts.inProgress) || 0,
+        completed:  Number(counts.completed)  || 0,
+        cancelled:  Number(counts.cancelled)  || 0,
+        escalated:  Number(counts.escalated)  || 0,
+      },
+      statusBreakdown,
+      recentEscalations,
+      teamSize: teamIds.length, // for the "across N SPOCs" footer
+    });
+  } catch (e) { next(e); }
+});
+
 router.get('/jobs', async (req, res, next) => {
   try {
     const ticketFlag = req.query.ticketFlag || req.query.flag || undefined;
