@@ -312,6 +312,129 @@ async function hasOtpColumn() {
   return _hasOtpColumn;
 }
 
+/*
+ * Probe for tbl_job_services.created_by / fk_created_by. Older deploys may
+ * not have either column; we conditionally stamp the actor's user_id when
+ * the column exists so audit fields are populated without breaking inserts
+ * on un-migrated DBs. Returns the resolved column name or null.
+ * Memoised once per process. Mirrors the hasOtpColumn pattern above.
+ */
+let _jobServicesCreatedByCol = undefined; // undefined=unprobed, null=absent
+async function jobServicesCreatedByColumn() {
+  if (_jobServicesCreatedByCol !== undefined) return _jobServicesCreatedByCol;
+  try {
+    const [rows] = await pool.query(
+      "SHOW COLUMNS FROM tbl_job_services WHERE Field IN ('created_by', 'fk_created_by')"
+    );
+    if (rows.length === 0) { _jobServicesCreatedByCol = null; return null; }
+    // Prefer fk_created_by when both exist (matches tbl_job convention).
+    const names = rows.map((r) => r.Field);
+    _jobServicesCreatedByCol = names.includes('fk_created_by') ? 'fk_created_by'
+                              : names.includes('created_by')   ? 'created_by'
+                              : null;
+  } catch {
+    _jobServicesCreatedByCol = null;
+  }
+  return _jobServicesCreatedByCol;
+}
+
+/*
+ * IST timezone helpers (2026-06-04).
+ *
+ * Platform convention (CLAUDE.md "Coding rules" §7):
+ *   "Dates stored as MySQL DATETIME, displayed IST on frontend."
+ *
+ * That means tbl_job.requested_date_time / original_appointment_date_time
+ * must land as a NATIVE MySQL DATETIME literal — `'YYYY-MM-DD HH:MM:SS'`
+ * — and the wall-clock time MUST be IST. Otherwise mysql2 default-binds a
+ * JS Date as an ISO 8601 UTC string with a Z suffix
+ * (e.g. `'2026-06-15T15:00:00.000Z'`) which (a) MySQL stores as the UTC
+ * wall-clock not IST, and (b) breaks downstream legacy reports that parse
+ * the column as the IST literal.
+ *
+ * IST is a fixed +05:30 offset (no DST), so we shift the parsed UTC
+ * instant by +330 minutes and then read the resulting Date's UTC getters
+ * (which now represent IST clock time). Bypasses JS Date's local-tz
+ * sensitivity entirely — same output regardless of whether the server
+ * runs in UTC, IST, or any other TZ.
+ */
+const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
+function _toIstDate(d) {
+  const date = (d instanceof Date) ? d : new Date(d);
+  if (Number.isNaN(+date)) return null;
+  return new Date(date.getTime() + IST_OFFSET_MS);
+}
+function _pad(n) { return String(n).padStart(2, '0'); }
+
+/*
+ * formatMysqlDateTimeIST(d) → 'YYYY-MM-DD HH:MM:SS' (IST clock time)
+ * Returns null on falsy / unparseable input.
+ */
+function formatMysqlDateTimeIST(d) {
+  if (!d) return null;
+  const ist = _toIstDate(d);
+  if (!ist) return null;
+  return (
+    ist.getUTCFullYear() + '-' +
+    _pad(ist.getUTCMonth() + 1) + '-' +
+    _pad(ist.getUTCDate()) + ' ' +
+    _pad(ist.getUTCHours()) + ':' +
+    _pad(ist.getUTCMinutes()) + ':' +
+    _pad(ist.getUTCSeconds())
+  );
+}
+
+/*
+ * formatTimeIST(d) → 'HH:MM' (IST clock time)
+ * Used for the legacy `requested_time` / `original_appointment_time`
+ * columns which store the time portion separately from the DATETIME.
+ */
+function formatTimeIST(d) {
+  if (!d) return null;
+  const ist = _toIstDate(d);
+  if (!ist) return null;
+  return _pad(ist.getUTCHours()) + ':' + _pad(ist.getUTCMinutes());
+}
+
+/*
+ * combineDateTime(dt, timeStr) → 'YYYY-MM-DD HH:MM:SS' (IST)
+ *
+ * Returns the IST-formatted MySQL DATETIME literal for `dt`.
+ *
+ * Bonus behaviour: if the parsed instant is UTC midnight (the common
+ * "FE sent a date-only ISO" sentinel — e.g. `'2026-06-15T00:00:00.000Z'`
+ * with the actual time-of-day shipped separately in `timeStr`), splice
+ * the timeStr in as IST clock time. We pull the date portion from the
+ * IST-shifted projection of `dt` and concatenate with the explicit
+ * timeStr — bypasses any JS Date `setHours` (which is local-tz-dependent
+ * and produces inconsistent results across server timezones).
+ *
+ * Used by create() to repair Book-New-Call payloads where
+ * `requested_date_time` arrived without a real time portion and the
+ * time was sent separately in `requested_time`.
+ */
+function combineDateTime(dt, timeStr) {
+  if (!dt) return null;
+  const d = (dt instanceof Date) ? dt : new Date(dt);
+  if (Number.isNaN(+d)) return null;
+
+  const isUtcMidnight =
+    d.getUTCHours() === 0 && d.getUTCMinutes() === 0 && d.getUTCSeconds() === 0;
+  if (isUtcMidnight && timeStr && /^\d{1,2}:\d{2}/.test(timeStr)) {
+    const ist = _toIstDate(d);
+    const [hh, mm, ss = '0'] = String(timeStr).split(':');
+    return (
+      ist.getUTCFullYear() + '-' +
+      _pad(ist.getUTCMonth() + 1) + '-' +
+      _pad(ist.getUTCDate()) + ' ' +
+      _pad(Number(hh) || 0) + ':' +
+      _pad(Number(mm) || 0) + ':' +
+      _pad(Number(ss) || 0)
+    );
+  }
+  return formatMysqlDateTimeIST(d);
+}
+
 let _hasClientVerticalIdColumn = null;
 async function hasClientVerticalIdColumn() {
   if (_hasClientVerticalIdColumn !== null) return _hasClientVerticalIdColumn;
@@ -1662,15 +1785,36 @@ async function create(input, actor) {
     // requested_time: legacy column stores the time portion as a
     // separate string. If FE didn't send it explicitly, derive from
     // requested_date_time so the column isn't NULL.
+    //
+    // IST-aware (2026-06-04). The previous implementation used
+    // `new Date(...).toTimeString().slice(0,5)` which returns the
+    // server's local-tz clock time — UTC inside our Docker
+    // containers, which produced the wrong "HH:MM" (e.g. 15:00 instead
+    // of the user-intended 20:30 IST). formatTimeIST() shifts to IST
+    // first.
     const requestedTime = input.requested_time
-      || (input.requested_date_time
-            ? new Date(input.requested_date_time).toTimeString().slice(0, 5)
-            : null);
+      || (input.requested_date_time ? formatTimeIST(input.requested_date_time) : null);
+
+    // requested_date_time + original_appointment_date_time time-repair
+    // (2026-06-04). FE callers (Book-New-Call) sometimes send the date
+    // portion as `YYYY-MM-DDT00:00:00.000Z` with the actual appointment
+    // time-of-day in a separate `requested_time` field. Without this
+    // combining step the DATETIME column lands as midnight which breaks
+    // every downstream "running late" / scheduling calculation.
+    // combineDateTime() only stitches the time in when the parsed date
+    // is exactly local midnight (so an operator who DID send a real
+    // time isn't silently overwritten).
+    const requestedDateTime = combineDateTime(input.requested_date_time, requestedTime);
 
     // original_appointment_date_time/time: snapshot at create time so
     // future reschedules can preserve the original promise. Default to
-    // the requested values when the operator hasn't overridden.
-    const originalApptDt   = input.original_appointment_date_time || input.requested_date_time || null;
+    // the requested values when the operator hasn't overridden. Apply
+    // the same time-repair so both columns carry the actual appointment
+    // time, not midnight.
+    const originalApptDt   = combineDateTime(
+      input.original_appointment_date_time || input.requested_date_time || null,
+      input.original_appointment_time || requestedTime,
+    );
     const originalApptTime = input.original_appointment_time      || requestedTime || null;
 
     // collected_by: per-job preference. Integer enum (1=Easyfixer,
@@ -1681,15 +1825,22 @@ async function create(input, actor) {
       collectedBy = Number.isFinite(n) ? n : String(input.collected_by);
     }
 
-    // eta_status: legacy default sentinel "01" per JobDaoImpl#2387.
-    // FE override permitted via input.eta_status.
-    const etaStatus = input.eta_status ?? '01';
-
     // Resolve the effective initial status once so the OTP gate below
-    // doesn't duplicate the BOOKED/ENQUIRY/CALL_LATER branching logic.
+    // and the eta_status default both branch off the same value.
     const effectiveStatus = [STATUS.ENQUIRY, STATUS.CALL_LATER].includes(Number(input.initial_status))
       ? Number(input.initial_status)
       : STATUS.BOOKED;
+
+    // eta_status: legacy 2-char sentinel. Per JobDaoImpl#2387 "01" is
+    // the unconfirmed default; once a job is promoted to BOOKED via
+    // Confirm & Schedule the value should reflect "confirmed/scheduled".
+    // Legacy DB samples + repo grep don't expose a documented enum, so
+    // we default the BOOKED path to "02" — TODO(ops 2026-06-04): confirm
+    // the canonical confirmed sentinel and adjust if a different code
+    // is in use. ENQUIRY (7) and CALL_LATER (9) keep the "01" default
+    // because they are explicitly NOT confirmed orders.
+    const etaStatus = input.eta_status
+      ?? (effectiveStatus === STATUS.BOOKED ? '02' : '01');
 
     /*
      * Job OTP (2026-05-28). Legacy CRM (JobDaoImpl.java:4418) stamps
@@ -1748,6 +1899,29 @@ async function create(input, actor) {
       }
     }
 
+    /*
+     * job_reference_id resolution (2026-06-04, format confirmed by ops:
+     * `REF-{job_id}`).
+     *
+     * The legacy format embeds the AUTO_INCREMENT job_id, so the value
+     * can only be computed AFTER the INSERT completes. The flow:
+     *   1. Resolve a PRE-INSERT value here. If caller supplied an
+     *      explicit `input.job_reference_id` OR opted into the legacy
+     *      reuse-of-client_ref via `input.reuse_client_ref = true`,
+     *      bind that value during the original INSERT and skip the
+     *      post-INSERT formatter step.
+     *   2. Otherwise bind NULL during INSERT, capture `jobId =
+     *      ins.insertId`, then UPDATE the row with
+     *      `formatJobReferenceId(jobId)` → `REF-{jobId}`. Both writes
+     *      live inside the same open transaction so they commit
+     *      atomically.
+     */
+    const { formatJobReferenceId } = require('../utils/job-reference');
+    const callerProvidedRef =
+      input.job_reference_id
+      || (input.reuse_client_ref && input.client_ref_id ? input.client_ref_id : null);
+    const jobReferenceId = callerProvidedRef ?? null; // INSERTed as-is; null → auto-fill below
+
     // Build INSERT shape — `otp` column is appended ONLY when present
     // on the deploy. Two paths to keep the column list + placeholder
     // count + values array perfectly aligned (mismatched lengths here
@@ -1764,16 +1938,27 @@ async function create(input, actor) {
          additional_name, additional_number,
          collected_by, eta_status,
          original_appointment_date_time, original_appointment_time,
-         helper_req, remarks, efr_special_notes, branch_details, last_update_time
+         helper_req, remarks, efr_special_notes, branch_details,
+         custom_property,
+         last_update_time
     `;
     const sharedValues = [
         input.job_desc || '', // job_desc is NOT NULL in tbl_job; default to empty string
         customerId, addressId, input.fk_client_id,
         input.fk_service_type_id || null, input.fk_service_catg_id || null, serviceTypeIds,
         input.reporting_contact_id || null,
-        input.requested_date_time, requestedTime, input.time_slot || null, input.booking_cut_off_time_slot || null,
+        requestedDateTime, requestedTime, input.time_slot || null, input.booking_cut_off_time_slot || null,
         new Date(), new Date(),
-        actor?.user_id || null,
+        // fk_created_by (2026-06-04): explicit Number() coercion. JWT
+        // claims encode `user_id` as a string (see CLAUDE.md "Auth
+        // reality") and tbl_job.fk_created_by is INT. MySQL DOES
+        // implicitly coerce numeric strings on INSERT, but if a
+        // future JWT issuer accidentally ships a non-numeric subject
+        // (or an integration caller passes `actor` from a different
+        // identity shape) the implicit coercion silently writes 0 or
+        // NULL. Number()-coerce + falsy guard makes the binding
+        // explicit and matches the runtime intent.
+        (() => { const n = Number(actor?.user_id); return Number.isFinite(n) && n > 0 ? n : null; })(),
         // initial_status — legacy footer-button parity. Defaults to
         // BOOKED (0); operators can pick ENQUIRY (7) or CALL_LATER (9)
         // at the booking modal's footer to route the new row to the
@@ -1795,8 +1980,21 @@ async function create(input, actor) {
         // wins (preserves backwards-compat with any caller that
         // distinguishes them).
         input.client_ref_id || null,
-        input.job_reference_id || input.client_ref_id || null,
-        input.customer?.customer_name || null,
+        jobReferenceId,
+        // job_customer_name (2026-06-04): prefer the top-level
+        // `job_customer_name` when the caller explicitly supplies it,
+        // falling back to the nested customer.customer_name.
+        //
+        // Why both: tbl_job.job_customer_name is a per-job override of
+        // tbl_customer.customer_name (see UPDATE-flow comment at the
+        // 'job_customer_name' entry in MUTABLE_COLUMNS). Some FE flows
+        // pass the per-job name distinct from the customer-master
+        // name; routing both through `customer.customer_name` would
+        // silently overwrite the master. Accepting both shapes keeps
+        // siblings created from Confirm & Schedule (which now sends
+        // an explicit top-level job_customer_name) from landing as
+        // NULL when the form state happens to clear customer.customer_name.
+        input.job_customer_name ?? input.customer?.customer_name ?? null,
         input.client_spoc || null, input.client_spoc_name || null, input.client_spoc_email || null,
         input.additional_name || null, input.additional_number || null,
         collectedBy, etaStatus,
@@ -1812,6 +2010,20 @@ async function create(input, actor) {
         input.efr_special_notes || null,
         // branch_details: dedicated column on tbl_job.
         input.branch_details || null,
+        // custom_property (2026-06-04): legacy varchar(510) column.
+        // The schema carries a DEFAULT of the literal 4-char string
+        // 'null' (a relic of legacy Java's `String.valueOf(null)` →
+        // "null" stringification path). Omitting the column from the
+        // INSERT lets that bad default land, producing the
+        // operator-visible "null text instead of NULL" symptom. We
+        // bind explicit SQL NULL here so mysql2 overrides the schema
+        // default. Accept caller-supplied input.custom_property for
+        // forwards-compat with any integration that legitimately uses
+        // the field (none do today), still coercing falsy/string
+        // "null" to real NULL.
+        (input.custom_property && input.custom_property !== 'null')
+          ? input.custom_property
+          : null,
         new Date(),
     ];
     const insertSql = jobOtp != null
@@ -1823,6 +2035,24 @@ async function create(input, actor) {
     const [ins] = await conn.query(insertSql, insertValues);
     const jobId = ins.insertId;
 
+    /*
+     * job_reference_id auto-fill (2026-06-04). When the caller didn't
+     * supply an explicit ref AND didn't opt into reuse_client_ref, the
+     * INSERT above bound NULL for job_reference_id. Now that we have
+     * the AUTO_INCREMENT job_id, format the legacy `REF-{job_id}`
+     * value and patch the row in the same open transaction. The two
+     * statements commit atomically.
+     */
+    if (callerProvidedRef == null) {
+      const autoRef = formatJobReferenceId(jobId);
+      if (autoRef) {
+        await conn.query(
+          'UPDATE tbl_job SET job_reference_id = ? WHERE job_id = ?',
+          [autoRef, jobId],
+        );
+      }
+    }
+
     if (Array.isArray(input.services) && input.services.length > 0) {
       // Batch-load rate-card rows for all picked services in ONE query
       // (avoids N+1) — then compute the 5 charge columns per row via
@@ -1832,22 +2062,36 @@ async function create(input, actor) {
       const { loadRateCardRows, computeJobServiceCharges } = require('../utils/rate-card-calc');
       const rateCardById = await loadRateCardRows(conn, input.services.map((s) => s.service_id));
 
+      /*
+       * Stamp audit `created_by` (or legacy `fk_created_by`) on every
+       * tbl_job_services row so post-mortems can trace who booked the
+       * line item. Probed once per process — older deploys without
+       * either column degrade gracefully to the unaugmented column set
+       * (no failure, just no audit field).
+       */
+      const createdByCol = await jobServicesCreatedByColumn();
+      const actorId = actor?.user_id || null;
+
       // Single multi-row INSERT instead of N sequential round-trips. Only wins
       // for jobs with 3+ services but costs nothing for smaller sets.
       const values = input.services.map((svc) => {
         const ch = computeJobServiceCharges(rateCardById.get(Number(svc.service_id)), svc.quantity || 1);
-        return [
+        const row = [
           jobId, svc.service_id, svc.quantity || 1,
           svc.service_type_id || null, svc.service_category_id || null, 1,
           ch.total_charge, ch.total_cost,
           ch.client_charge, ch.easyfix_charge, ch.easyfixer_charge,
         ];
+        if (createdByCol) row.push(actorId);
+        return row;
       });
+      const insertCols = createdByCol
+        ? `(job_id, service_id, quantity, service_type_id, service_category_id, job_service_status,
+            total_charge, total_cost, client_charge, easyfix_charge, easyfixer_charge, ${createdByCol})`
+        : `(job_id, service_id, quantity, service_type_id, service_category_id, job_service_status,
+            total_charge, total_cost, client_charge, easyfix_charge, easyfixer_charge)`;
       await conn.query(
-        `INSERT INTO tbl_job_services
-           (job_id, service_id, quantity, service_type_id, service_category_id, job_service_status,
-            total_charge, total_cost, client_charge, easyfix_charge, easyfixer_charge)
-         VALUES ?`,
+        `INSERT INTO tbl_job_services ${insertCols} VALUES ?`,
         [values]
       );
       // Mirror onto tbl_job.client_services CSV — single source of truth

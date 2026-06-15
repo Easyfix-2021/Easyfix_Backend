@@ -115,7 +115,7 @@ router.get('/me', requireAuth, async (req, res, next) => {
     // menuIds as the sidebar allowlist and actionPermissions as the
     // button-gating Set.
     const { getEffectivePermissions } = require('../services/role.service');
-    const { parseScope, bypassesScope, mergeScope } = require('../lib/scope');
+    const { parseScope, bypassesScope, mergeScopeRespectingCap } = require('../lib/scope');
     const { findDescendantUserIds } = require('../services/user.service');
     const { pool } = require('../db');
     const permissions = await getEffectivePermissions(req.user.user_id);
@@ -153,11 +153,18 @@ router.get('/me', requireAuth, async (req, res, next) => {
              FROM tbl_user WHERE user_id IN (${placeholders})`,
           hierarchy.descendants
         );
+        // Cap each dimension at the caller's OWN explicit list. A direct
+        // or indirect report with broader access must NOT widen the
+        // manager's visibility on a dimension where they were
+        // deliberately restricted (e.g. Priyanka with manage_clients
+        // = "10,17" must stay scoped to those 2 clients even if one of
+        // her reports has manage_clients = "0"). See
+        // lib/scope.js::mergeScopeRespectingCap for the full rationale.
         for (const r of rows) {
-          scope.clients   = mergeScope(scope.clients,   parseScope(r.manage_clients));
-          scope.cities    = mergeScope(scope.cities,    parseScope(r.manage_cities));
-          scope.states    = mergeScope(scope.states,    parseScope(r.manage_states));
-          scope.verticals = mergeScope(scope.verticals, parseScope(r.manage_verticals));
+          scope.clients   = mergeScopeRespectingCap(scope.clients,   parseScope(r.manage_clients));
+          scope.cities    = mergeScopeRespectingCap(scope.cities,    parseScope(r.manage_cities));
+          scope.states    = mergeScopeRespectingCap(scope.states,    parseScope(r.manage_states));
+          scope.verticals = mergeScopeRespectingCap(scope.verticals, parseScope(r.manage_verticals));
         }
       }
     }

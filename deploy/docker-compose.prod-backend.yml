@@ -1,0 +1,78 @@
+# EasyFix PROD — Backend-only stack
+#
+# Runs on the prod BE EC2 at /opt/easyfix/docker-compose.yml. Topology:
+#
+#   QA (one shared EC2)      — full combined stack (backend + crm-ui +
+#                              client-ui + dozzle) per deploy/docker-compose.yml
+#   PROD (two EC2s)
+#     • PROD_BACKEND_INSTANCE_ID  ← THIS file: backend + dozzle ONLY
+#     • PROD_FRONTEND_INSTANCE_ID ← UI repos' compose (crm-ui + client-ui + dozzle)
+#
+# Why split: the prod BE EC2 doesn't run the UI containers, so listing
+# them here would (a) waste compose-pull cycles, (b) churn the
+# /opt/easyfix/.env file every UI deploy via image-tag writes that
+# nothing on this host consumes, and (c) confuse anyone reading
+# `docker ps` ("why are UI services declared but not running?").
+#
+# Image tag comes from /opt/easyfix/.env:
+#   BACKEND_IMAGE=902810393464.dkr.ecr.ap-south-1.amazonaws.com/easyfix/backend:production-<sha>
+#
+# Updated by .github/workflows/deploy.yml on every prod deploy (sed-in-place).
+#
+# ECR pull authenticates via the EC2 instance profile's
+# AmazonEC2ContainerRegistryReadOnly policy + the
+# amazon-ecr-credential-helper installed on the box. No `docker login`
+# is ever required — IF the helper + IAM policy are present. If you see
+# `pull access denied… no basic auth credentials`, the helper is NOT
+# installed on this host; see ECR_AUTH_BOOTSTRAP.md.
+
+services:
+  backend:
+    image: ${BACKEND_IMAGE}
+    container_name: easyfix-backend
+    restart: unless-stopped
+    env_file:
+      # Real secrets live HERE on the host filesystem (chmod 600).
+      # Managed via deploy/bootstrap-env.sh — never in any image, never
+      # in git, never in GitHub Secrets.
+      - /opt/easyfix/backend.env
+    ports:
+      - "5100:5100"
+    networks:
+      - easyfix-net
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5100/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # Dozzle — log viewer at :8888. Same trust model as QA: network-only
+  # auth, Docker socket mounted read-only, VPN-gated. Kept on the BE
+  # host because that's where the highest-volume logs originate.
+  dozzle:
+    image: amir20/dozzle:latest
+    container_name: easyfix-dozzle
+    restart: unless-stopped
+    environment:
+      DOZZLE_HOSTNAME: "EasyFix Prod-BE"
+    ports:
+      - "8888:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - easyfix-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+networks:
+  easyfix-net:
+    driver: bridge
