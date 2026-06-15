@@ -33,7 +33,7 @@ const Joi = require('joi');
 const validate = require('../../../middleware/validate');
 const requireQuickSight = require('../../../middleware/require-quicksight');
 const { modernOk, modernError } = require('../../../utils/response');
-const { sendXlsx } = require('../../../utils/xlsx-export');
+const { streamStyledXlsx } = require('../../../utils/xlsx-styled-export');
 const { extendJobFilter } = require('../../../validators/quicksight.validator');
 const service = require('../../../services/quicksight/quicksight-city-performance.service');
 
@@ -74,6 +74,18 @@ const tatSummarySchema = Joi.object({
 
 const stamp = () => new Date().toISOString().slice(0, 10);
 
+// Human-friendly generated-on stamp for the meta band (e.g. "15 Jun 2026").
+const DISPLAY_STAMP = () =>
+  new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+
+// Period label (most-recent period) for the KPI card captions, taken from
+// the flattened header set so it matches the on-screen "current period".
+const recentLabel = (columns) => {
+  const tkt = columns.find((c) => c.key === 'p0_tkt');
+  // headers look like "JUNE · Ticket Created" — strip the metric suffix.
+  return tkt ? String(tkt.header).split('·')[0].trim() : '';
+};
+
 // ── GET / — paginated per-city scorecard ─────────────────────────────
 router.get('/', validate(tableSchema, 'query'), async (req, res, next) => {
   try {
@@ -91,12 +103,68 @@ router.get('/', validate(tableSchema, 'query'), async (req, res, next) => {
 
     if (format === 'xlsx') {
       const { columns, rows } = service.toXlsx(payload, flag);
-      return sendXlsx(res, {
-        filename: `city-performance-${flag}-${stamp()}.xlsx`,
-        sheetName: 'City Performance',
-        columns,
-        rows,
+
+      // Enrich the service-built columns with display polish: thousands
+      // formatting + in-cell data bars on the VOLUME columns only (Ticket
+      // Created / Open Orders), and right alignment on every numeric column.
+      // Percentage columns arrive PRE-FORMATTED as strings ("86%" / "-")
+      // from the service flattener, so they carry no numFmt/dataBar (a
+      // dataBar on a % column would be meaningless, and a numFmt only
+      // applies to numeric cells anyway). Keys/headers are left untouched.
+      const styledColumns = columns.map((col) => {
+        if (/_tkt$/.test(col.key)) {
+          // Ticket Created — primary volume metric → blue data bar.
+          return { ...col, align: 'right', numFmt: '#,##0', dataBar: true, dataBarColor: 'FF2E86DE' };
+        }
+        if (/_open$/.test(col.key)) {
+          // Open Orders — secondary volume metric → amber data bar.
+          return { ...col, align: 'right', numFmt: '#,##0', dataBar: true, dataBarColor: 'FFF59E0B' };
+        }
+        if (/_sda$|_tat$/.test(col.key)) {
+          // Pre-stringified percentages — keep centered, no numFmt/dataBar.
+          return { ...col, align: 'center' };
+        }
+        // State / City text columns → left aligned.
+        return { ...col, align: 'left' };
       });
+
+      // Headline KPIs from the MOST-RECENT period (p0) across the exported
+      // page of cities: total Tickets Created, total Open Orders, and the
+      // number of cities clearing the 85% TAT bar (TAT% cells are "NN%"
+      // strings; "-" / non-numeric are skipped).
+      const lbl = recentLabel(columns);
+      let totalTkt = 0;
+      let totalOpen = 0;
+      let citiesAtTat = 0;
+      for (const row of rows) {
+        totalTkt += Number(row.p0_tkt) || 0;
+        totalOpen += Number(row.p0_open) || 0;
+        const tatNum = parseFloat(String(row.p0_tat));
+        if (Number.isFinite(tatNum) && tatNum >= 85) citiesAtTat += 1;
+      }
+      const kpis = [
+        { label: lbl ? `${lbl} · Tickets Created` : 'Tickets Created', value: totalTkt, accent: 'FF2E86DE' },
+        { label: lbl ? `${lbl} · Open Orders` : 'Open Orders', value: totalOpen, accent: 'FFF59E0B' },
+        { label: 'Cities ≥ 85% TAT', value: citiesAtTat, accent: 'FF10B981' },
+      ];
+
+      const flagLabel = flag === 'weekly' ? 'Weekly' : 'Monthly';
+      const cityCount = payload?.totalRecords ?? rows.length;
+      const meta =
+        `Period: ${flagLabel} · ${cityCount} ${cityCount === 1 ? 'City' : 'Cities'} · ` +
+        `Generated ${DISPLAY_STAMP()}`;
+
+      const filename = `city-performance-${flag}-${stamp()}.xlsx`;
+      await streamStyledXlsx(res, filename, {
+        title: 'EasyFix · City Performance',
+        meta,
+        sheetName: 'City Performance',
+        columns: styledColumns,
+        rows,
+        kpis,
+        emptyMessage: 'No Cities Found.',
+      });
+      return;
     }
 
     return modernOk(res, payload);

@@ -35,8 +35,79 @@ const Joi = require('joi');
 const requireQuickSight = require('../../../middleware/require-quicksight');
 const validate = require('../../../middleware/validate');
 const { modernOk, modernError } = require('../../../utils/response');
-const { sendXlsx } = require('../../../utils/xlsx-export');
+const { streamStyledXlsx } = require('../../../utils/xlsx-styled-export');
 const service = require('../../../services/quicksight/quicksight-supply-gap.service');
+
+// Number format for count/identifier columns (registry convention).
+const FMT_COUNT = '#,##0';
+
+// Pretty "15 Jun 2026" generation stamp for the meta band.
+const prettyStamp = () =>
+  new Date().toLocaleDateString('en-GB', {
+    day: '2-digit', month: 'short', year: 'numeric',
+  });
+
+// yyyy-mm-dd stamp for the download filename.
+const fileStamp = () => new Date().toISOString().slice(0, 10);
+
+/*
+ * Decorate the service-built XLSX_COLUMNS with align / numFmt / dataBar
+ * WITHOUT renaming any key/header (only ADD presentation hints):
+ *   - Gap Days  -> count format + AMBER data bar (gap severity headline).
+ *   - Added Count -> count format + BLUE data bar (supplies allocated).
+ *   - GapId / Job Id / PinCode -> count format, right-aligned, NO data bar
+ *     (identifiers — a bar would be meaningless / misleading on city names).
+ * Text columns keep the helper's default (centered, no format).
+ */
+function decorateColumns(columns) {
+  return columns.map((col) => {
+    if (col.key === 'gapDays') {
+      return { ...col, align: 'right', numFmt: FMT_COUNT, dataBar: true, dataBarColor: 'FFF59E0B' };
+    }
+    if (col.key === 'addedCount') {
+      return { ...col, align: 'right', numFmt: FMT_COUNT, dataBar: true, dataBarColor: 'FF2E86DE' };
+    }
+    if (col.key === 'gapId' || col.key === 'jobId' || col.key === 'pinCode') {
+      return { ...col, align: 'right', numFmt: FMT_COUNT };
+    }
+    return col;
+  });
+}
+
+/*
+ * Headline KPIs from the export rows:
+ *   - Total Supply Requests : one row per supply gap.
+ *   - Total Open Cities     : distinct non-blank city names.
+ *   - Total Gap Days        : sum of gapDays (cumulative open-gap age).
+ *   - Total Supplies Added  : sum of addedCount (allocations made).
+ */
+function buildKpis(rows) {
+  const cities = new Set();
+  let totalGap = 0;
+  let totalAdded = 0;
+  for (const r of rows) {
+    if (r.city != null && String(r.city).trim() !== '') cities.add(String(r.city).trim());
+    totalGap += Number(r.gapDays) || 0;
+    totalAdded += Number(r.addedCount) || 0;
+  }
+  return [
+    { label: 'Total Supply Requests', value: rows.length },
+    { label: 'Total Open Cities', value: cities.size, accent: 'FFF59E0B' },
+    { label: 'Total Gap Days', value: totalGap, accent: 'FFEF4444' },
+    { label: 'Total Supplies Added', value: totalAdded, accent: 'FF10B981' },
+  ];
+}
+
+// Bold footer totals for the two numeric count columns.
+function buildTotalRow(rows) {
+  let totalGap = 0;
+  let totalAdded = 0;
+  for (const r of rows) {
+    totalGap += Number(r.gapDays) || 0;
+    totalAdded += Number(r.addedCount) || 0;
+  }
+  return { gapId: 'Total', gapDays: totalGap, addedCount: totalAdded };
+}
 
 // Per-report access gate: ef-QuickSight family key + this report's own key.
 router.use(requireQuickSight('isQuickSightSupplyGapView'));
@@ -74,12 +145,21 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
   try {
     if (req.query.format === 'xlsx') {
       const rows = await service.exportRows(req.query);
-      return sendXlsx(res, {
-        filename: 'supply-gap-analysis.xlsx',
+      const cities = new Set(
+        rows.map((r) => (r.city != null ? String(r.city).trim() : '')).filter(Boolean),
+      );
+      const filename = `supply-gap-analysis-${fileStamp()}.xlsx`;
+      await streamStyledXlsx(res, filename, {
+        title: 'EasyFix · Supply Gap Analysis',
+        meta: `${cities.size} Cities · ${rows.length} Supply Requests · Generated ${prettyStamp()}`,
         sheetName: 'Supply Requests',
-        columns: service.XLSX_COLUMNS,
+        columns: decorateColumns(service.XLSX_COLUMNS),
         rows,
+        kpis: buildKpis(rows),
+        totalRow: buildTotalRow(rows),
+        emptyMessage: 'No Supply Gap Data Found.',
       });
+      return;
     }
     const result = await service.list(req.query);
     return modernOk(res, result);

@@ -35,7 +35,7 @@ const Joi = require('joi');
 const requireQuickSight = require('../../../middleware/require-quicksight');
 const validate = require('../../../middleware/validate');
 const { modernOk, modernError } = require('../../../utils/response');
-const { sendXlsx } = require('../../../utils/xlsx-export');
+const { streamStyledXlsx } = require('../../../utils/xlsx-styled-export');
 const service = require('../../../services/quicksight/quicksight-employee-productivity.service');
 
 // Per-report access gate: ef-QuickSight family key + this report's own key.
@@ -79,14 +79,17 @@ const rmTeamUsersSchema = Joi.object({
 });
 
 // ── XLSX column set (Title Case headers; corrected field alignment) ───
+// Counts → '#,##0'; revenue (rupees) → '"₹"#,##0'. In-cell DATA BARS on the
+// three most meaningful productivity VOLUME columns (Booked / Scheduled /
+// Closed) — never on the name column or the rupee column.
 const PRODUCTIVITY_XLSX_COLUMNS = [
-  { key: 'userName', header: 'Employee', width: 28 },
-  { key: 'booked', header: 'Booked' },
-  { key: 'scheduled', header: 'Scheduled' },
-  { key: 'audit', header: 'Audit' },
-  { key: 'closedCount', header: 'Closed' },
-  { key: 'revenue', header: 'Revenue', width: 14 },
-  { key: 'cancelCount', header: 'Cancelled' },
+  { key: 'userName', header: 'Employee', width: 28, align: 'left' },
+  { key: 'booked', header: 'Booked', numFmt: '#,##0', align: 'right', dataBar: true, dataBarColor: 'FF6366F1' },
+  { key: 'scheduled', header: 'Scheduled', numFmt: '#,##0', align: 'right', dataBar: true, dataBarColor: 'FF0EA5E9' },
+  { key: 'audit', header: 'Audit', numFmt: '#,##0', align: 'right' },
+  { key: 'closedCount', header: 'Closed', numFmt: '#,##0', align: 'right', dataBar: true, dataBarColor: 'FF10B981' },
+  { key: 'revenue', header: 'Revenue', width: 14, numFmt: '"₹"#,##0', align: 'right' },
+  { key: 'cancelCount', header: 'Cancelled', numFmt: '#,##0', align: 'right' },
 ];
 
 /*
@@ -105,12 +108,43 @@ router.get('/employee-productivity', validate(productivitySchema, 'query'), asyn
     });
 
     if (req.query.format === 'xlsx') {
-      return sendXlsx(res, {
-        filename: 'employee-productivity.xlsx',
+      const exportRows = result.data || [];
+      // Headline KPIs from the exported page rows (plain numbers, Title Case).
+      const sumOf = (k) => exportRows.reduce((a, r) => a + (Number(r[k]) || 0), 0);
+      const totalBooked = sumOf('booked');
+      const totalScheduled = sumOf('scheduled');
+      const totalClosed = sumOf('closedCount');
+      const totalRevenue = sumOf('revenue');
+
+      const generatedOn = new Date().toLocaleDateString('en-GB', {
+        day: '2-digit', month: 'short', year: 'numeric',
+      });
+      const meta = `${exportRows.length} Employees · Generated ${generatedOn}`;
+
+      await streamStyledXlsx(res, 'employee-productivity.xlsx', {
+        title: 'EasyFix · Employee Productivity',
+        meta,
         sheetName: 'Productivity',
         columns: PRODUCTIVITY_XLSX_COLUMNS,
-        rows: result.data,
+        rows: exportRows,
+        kpis: [
+          { label: 'Total Booked', value: totalBooked, accent: 'FF6366F1' },
+          { label: 'Total Scheduled', value: totalScheduled, accent: 'FF0EA5E9' },
+          { label: 'Total Closed', value: totalClosed, accent: 'FF10B981' },
+          { label: 'Total Revenue', value: totalRevenue, accent: 'FFF59E0B', numFmt: '"₹"#,##0' },
+        ],
+        totalRow: {
+          userName: 'Total',
+          booked: totalBooked,
+          scheduled: totalScheduled,
+          audit: sumOf('audit'),
+          closedCount: totalClosed,
+          revenue: totalRevenue,
+          cancelCount: sumOf('cancelCount'),
+        },
+        emptyMessage: 'No Employees Found.',
       });
+      return;
     }
     return modernOk(res, result);
   } catch (err) {

@@ -29,17 +29,41 @@ const Joi = require('joi');
 const requireQuickSight = require('../../../middleware/require-quicksight');
 const validate = require('../../../middleware/validate');
 const { modernOk, modernError } = require('../../../utils/response');
-const { sendXlsx } = require('../../../utils/xlsx-export');
+const { streamStyledXlsx } = require('../../../utils/xlsx-styled-export');
 const logger = require('../../../logger');
 const {
   getVerticalOpenOrders,
   buildExportRows,
-  EXPORT_COLUMNS,
   FLAGS,
 } = require('../../../services/quicksight/quicksight-vertical-orders.service');
 
 // Per-report QuickSight gate on every route in this sub-router.
 router.use(requireQuickSight('isQuickSightVerticalOrdersView'));
+
+// Human-friendly generated-on stamp for the meta band (e.g. "15 Jun 2026").
+const DISPLAY_STAMP = () =>
+  new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+
+// Filename-safe date stamp (e.g. "2026-06-15").
+const FILE_STAMP = () => new Date().toISOString().slice(0, 10);
+
+// Counts → thousands-grouped integers.
+const FMT_COUNT = '#,##0';
+
+// ── Styled XLSX column set (Title Case headers) ──────────────────────
+// Keys/headers/widths are UNCHANGED from the service's EXPORT_COLUMNS; only
+// display polish (align / numFmt / data bars) is layered on. The 4 age-bucket
+// COUNT columns each carry a data bar (varied colors so newer vs. older
+// buckets read distinctly); the vertical label column never gets one, and
+// the per-vertical Total Count column is formatted but bar-free.
+const STYLED_COLUMNS = [
+  { key: 'verticalCategory', header: 'Vertical Category', width: 22, align: 'left' },
+  { key: 'Today', header: 'Today', width: 12, align: 'right', numFmt: FMT_COUNT, dataBar: true, dataBarColor: 'FF10B981' },
+  { key: 'Yesterday', header: 'Yesterday', width: 12, align: 'right', numFmt: FMT_COUNT, dataBar: true, dataBarColor: 'FF2E86DE' },
+  { key: 'TwoToSeven', header: '2-7 Days', width: 12, align: 'right', numFmt: FMT_COUNT, dataBar: true, dataBarColor: 'FFF59E0B' },
+  { key: 'MoreThanSeven', header: 'More Than 7 Days', width: 18, align: 'right', numFmt: FMT_COUNT, dataBar: true, dataBarColor: 'FFEF4444' },
+  { key: 'TotalCount', header: 'Total Count', width: 14, align: 'right', numFmt: FMT_COUNT },
+];
 
 /*
  * Inline Joi schema (kept here so the shared validator is never edited).
@@ -89,17 +113,42 @@ router.get('/', validate(verticalOrdersQuery, 'query'), async (req, res, next) =
     const result = await getVerticalOpenOrders(flags);
 
     if (req.query.format === 'xlsx') {
-      const rows = buildExportRows(result.openOrderByGroup);
+      // buildExportRows appends the synthetic pivot Total as the LAST row.
+      // Split it off so it renders as the styled bold footer (totalRow)
+      // instead of a normal data row.
+      const allRows = buildExportRows(result.openOrderByGroup);
+      const totalRow =
+        allRows.length && allRows[allRows.length - 1].verticalCategory === 'Total'
+          ? allRows[allRows.length - 1]
+          : undefined;
+      const rows = totalRow ? allRows.slice(0, -1) : allRows;
+
       logger.info(
         { report: 'quicksight-vertical-orders', flags, rows: rows.length },
         'QuickSight Vertical Orders xlsx export',
       );
-      return sendXlsx(res, {
-        filename: 'vertical-orders.xlsx',
+
+      // Headline KPIs — the unconditional counts the report always exposes
+      // (run regardless of selected flags), as plain Title-Case numbers.
+      const kpis = [
+        { label: 'Open Orders', value: result.countOfOpenOrders, accent: 'FF2E86DE' },
+        { label: 'Escalated Orders', value: result.countOfEscalatedOrders, accent: 'FFEF4444' },
+        { label: 'Unconfirmed Orders', value: result.countOfUnconfirmedOrders, accent: 'FFF59E0B' },
+      ];
+
+      const meta = `Flags: ${flags.join(', ')} · Generated ${DISPLAY_STAMP()}`;
+
+      await streamStyledXlsx(res, `vertical-orders-${FILE_STAMP()}.xlsx`, {
+        title: 'EasyFix · Vertical Orders',
+        meta,
         sheetName: 'Vertical Orders',
-        columns: EXPORT_COLUMNS,
+        columns: STYLED_COLUMNS,
         rows,
+        kpis,
+        totalRow,
+        emptyMessage: 'No Vertical Orders Found.',
       });
+      return;
     }
 
     return modernOk(res, result);

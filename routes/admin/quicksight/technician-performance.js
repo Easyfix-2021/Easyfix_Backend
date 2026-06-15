@@ -33,7 +33,7 @@ const Joi = require('joi');
 const requireQuickSight = require('../../../middleware/require-quicksight');
 const validate = require('../../../middleware/validate');
 const { modernOk, modernError } = require('../../../utils/response');
-const { sendXlsx } = require('../../../utils/xlsx-export');
+const { streamStyledXlsx } = require('../../../utils/xlsx-styled-export');
 const { extendJobFilter } = require('../../../validators/quicksight.validator');
 const service = require('../../../services/quicksight/quicksight-technician-performance.service');
 
@@ -70,17 +70,29 @@ const categoryQuery = Joi.object({
 
 const stamp = () => new Date().toISOString().slice(0, 10);
 
+// Human-readable generated date for the styled meta band (e.g. "15-Jun-2026").
+const MONTH_ABBR = [
+  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+];
+function generatedStamp() {
+  const d = new Date();
+  return `${String(d.getDate()).padStart(2, '0')}-${MONTH_ABBR[d.getMonth()]}-${d.getFullYear()}`;
+}
+
 // ── XLSX column set for the category drill-down (flat one-row-per-category-
 // per-period; period label prefixes keep the 3 blocks distinguishable). Title
-// Case headers, corrected label/field alignment.
+// Case headers, corrected label/field alignment. Counts get the #,##0 format;
+// SDA%/TAT% are WHOLE numbers from pct() (86 = 86%) so use 0.0"%" — NOT 0.0%
+// which would render 8600%. Data bars on the two volume columns only.
 const CATEGORY_XLSX_COLUMNS = [
-  { key: 'detailsFor', header: 'Period', width: 16 },
-  { key: 'categoryName', header: 'Category Name', width: 24 },
-  { key: 'tktCount', header: 'Ticket Allocated', width: 16 },
-  { key: 'tktCompleted', header: 'Completed', width: 12 },
-  { key: 'sdaPercentage', header: 'SDA%', width: 10 },
-  { key: 'tatPercentage', header: 'TAT%', width: 10 },
-  { key: 'txOpenOrderOnApp', header: 'Open Order In App', width: 18 },
+  { key: 'detailsFor', header: 'Period', width: 16, align: 'left' },
+  { key: 'categoryName', header: 'Category Name', width: 24, align: 'left' },
+  { key: 'tktCount', header: 'Ticket Allocated', width: 16, numFmt: '#,##0', dataBar: true, dataBarColor: 'FF2E86DE' },
+  { key: 'tktCompleted', header: 'Completed', width: 12, numFmt: '#,##0', dataBar: true, dataBarColor: 'FF10B981' },
+  { key: 'sdaPercentage', header: 'SDA%', width: 10, numFmt: '0.0"%"' },
+  { key: 'tatPercentage', header: 'TAT%', width: 10, numFmt: '0.0"%"' },
+  { key: 'txOpenOrderOnApp', header: 'Open Order In App', width: 18, numFmt: '#,##0' },
 ];
 
 // ── GET / — main Technician Performance list (paginated over technicians) ──
@@ -100,12 +112,57 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
 
     if (format === 'xlsx') {
       const { columns, rows } = service.toXlsx(payload);
-      return sendXlsx(res, {
-        filename: `technician-performance-${flag}-${stamp()}.xlsx`,
-        sheetName: 'Technician Performance',
-        columns,
-        rows,
+
+      // Enrich the flat columns with number formats / alignment / data bars.
+      // Keys are dynamic (p{i}_ticketAssigned|sda|tat|openApp) so match by key:
+      //   counts (Ticket Assigned / Open Order In App) → #,##0 + data bar on
+      //   the allocation volume; SDA%/TAT% are WHOLE numbers (86 = 86%) → 0.0"%".
+      const styledColumns = columns.map((c) => {
+        if (c.key === 'txId') return { ...c, align: 'center' };
+        if (c.key === 'txCurrentBalance') return { ...c, numFmt: '#,##0.00', align: 'right' };
+        if (/_ticketAssigned$/.test(c.key)) {
+          return { ...c, numFmt: '#,##0', align: 'right', dataBar: true, dataBarColor: 'FF2E86DE' };
+        }
+        if (/_openApp$/.test(c.key)) return { ...c, numFmt: '#,##0', align: 'right' };
+        if (/_sda$/.test(c.key) || /_tat$/.test(c.key)) return { ...c, numFmt: '0.0"%"', align: 'right' };
+        if (c.key === 'stateName' || c.key === 'txCity' || c.key === 'txName') return { ...c, align: 'left' };
+        return c;
       });
+
+      // KPIs — totals across the page, summed from the most-recent period
+      // (last bucket; periods are oldest→newest) so the cards reflect the
+      // current window the user is looking at.
+      const list = (payload && payload.data) || [];
+      let totalAllocated = 0;
+      let totalCompleted = 0;
+      for (const tx of list) {
+        const dw = tx.technicianPerformanceDataDateWise || [];
+        const latest = dw[dw.length - 1];
+        if (!latest || tx.txId == null) continue; // skip synthetic "No Technician" row
+        totalAllocated += Number(latest.txTktCreated) || 0;
+        totalCompleted += Number(latest.txCompletedOrder) || 0;
+      }
+      const completionPct = totalAllocated > 0
+        ? Math.round((totalCompleted / totalAllocated) * 1000) / 10
+        : 0;
+      const sampleLatest =
+        list[0]?.technicianPerformanceDataDateWise?.slice(-1)[0]?.detailsFor || '';
+
+      await streamStyledXlsx(res, `technician-performance-${flag}-${stamp()}.xlsx`, {
+        title: 'EasyFix · Technician Performance',
+        meta: `Flag: ${flag}${sampleLatest ? ` · Latest Period: ${sampleLatest}` : ''} · ${rows.length} Technicians · Generated ${generatedStamp()}`,
+        sheetName: 'Technician Performance',
+        kpis: [
+          { label: 'Technicians', value: rows.length },
+          { label: 'Total Allocated', value: totalAllocated },
+          { label: 'Total Completed', value: totalCompleted, accent: 'FF10B981' },
+          { label: 'Completion %', value: completionPct, numFmt: '0.0"%"', accent: 'FFF59E0B' },
+        ],
+        columns: styledColumns,
+        rows,
+        emptyMessage: 'No Technicians Found.',
+      });
+      return;
     }
 
     return modernOk(res, payload);
@@ -143,12 +200,43 @@ router.get(
             });
           }
         }
-        return sendXlsx(res, {
-          filename: `technician-performance-category-${txId}-${flag}-${stamp()}.xlsx`,
-          sheetName: 'Category Performance',
-          columns: CATEGORY_XLSX_COLUMNS,
-          rows,
-        });
+        // KPIs + total footer summed across every period × category row.
+        let totalAllocated = 0;
+        let totalCompleted = 0;
+        let totalOpenApp = 0;
+        for (const r of rows) {
+          totalAllocated += Number(r.tktCount) || 0;
+          totalCompleted += Number(r.tktCompleted) || 0;
+          totalOpenApp += Number(r.txOpenOrderOnApp) || 0;
+        }
+        const completionPct = totalAllocated > 0
+          ? Math.round((totalCompleted / totalAllocated) * 1000) / 10
+          : 0;
+
+        await streamStyledXlsx(
+          res,
+          `technician-performance-category-${txId}-${flag}-${stamp()}.xlsx`,
+          {
+            title: 'EasyFix · Technician Performance — By Category',
+            meta: `Flag: ${flag} · Technician #${txId} · ${rows.length} Rows · Generated ${generatedStamp()}`,
+            sheetName: 'Category Performance',
+            kpis: [
+              { label: 'Total Allocated', value: totalAllocated },
+              { label: 'Total Completed', value: totalCompleted, accent: 'FF10B981' },
+              { label: 'Completion %', value: completionPct, numFmt: '0.0"%"', accent: 'FFF59E0B' },
+            ],
+            columns: CATEGORY_XLSX_COLUMNS,
+            rows,
+            totalRow: {
+              detailsFor: 'Total',
+              tktCount: totalAllocated,
+              tktCompleted: totalCompleted,
+              txOpenOrderOnApp: totalOpenApp,
+            },
+            emptyMessage: 'No Category Data Found.',
+          },
+        );
+        return;
       }
 
       return modernOk(res, payload);

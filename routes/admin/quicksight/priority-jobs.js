@@ -30,7 +30,7 @@ const Joi = require('joi');
 const requireQuickSight = require('../../../middleware/require-quicksight');
 const validate = require('../../../middleware/validate');
 const { modernOk, modernError } = require('../../../utils/response');
-const { sendXlsx } = require('../../../utils/xlsx-export');
+const { streamStyledXlsx } = require('../../../utils/xlsx-styled-export');
 const service = require('../../../services/quicksight/quicksight-priority-jobs.service');
 const { extendJobFilter, idArray } = require('../../../validators/quicksight.validator');
 
@@ -60,24 +60,24 @@ const exportSchema = extendJobFilter({ ownerId: idArray });
 // ── XLSX column set — 18 cols, exact legacy "Hotspot_Job_Data" order ──
 // (corrected label/field alignment per registry decision; Title Case headers).
 const EXPORT_XLSX_COLUMNS = [
-  { key: 'job_id', header: 'Job ID' },
-  { key: 'jobAge', header: 'Job Age' },
-  { key: 'jobCurrentOwner', header: 'Job Owner', width: 24 },
-  { key: 'clientName', header: 'Client Name', width: 24 },
-  { key: 'jobDescription', header: 'Job Description', width: 30 },
-  { key: 'cityName', header: 'City Name', width: 18 },
-  { key: 'zonalManager', header: 'Zonal Manager', width: 22 },
-  { key: 'cityType', header: 'City Type' },
-  { key: 'jobStatus', header: 'Job Status', width: 18 },
-  { key: 'efr_id', header: 'EFR ID' },
-  { key: 'efr_name', header: 'EFR Name', width: 22 },
-  { key: 'catgName', header: 'Category', width: 22 },
-  { key: 'appointmentDateTime', header: 'Appointment DateTime', width: 22 },
-  { key: 'originalAppointmentDateTime', header: 'Original Appointment', width: 22 },
-  { key: 'pendingDueTo', header: 'Pending Due To', width: 16 },
-  { key: 'reason', header: 'Reason', width: 24 },
-  { key: 'remarks', header: 'Remarks', width: 30 },
-  { key: 'lastUpdatedRemarksDateTime', header: 'Last Updated Remarks', width: 22 },
+  { key: 'job_id', header: 'Job ID', numFmt: '#,##0', align: 'center' },
+  { key: 'jobAge', header: 'Job Age', numFmt: '#,##0', align: 'center', dataBar: true, dataBarColor: 'FFEF4444' },
+  { key: 'jobCurrentOwner', header: 'Job Owner', width: 24, align: 'left' },
+  { key: 'clientName', header: 'Client Name', width: 24, align: 'left' },
+  { key: 'jobDescription', header: 'Job Description', width: 30, align: 'left' },
+  { key: 'cityName', header: 'City Name', width: 18, align: 'left' },
+  { key: 'zonalManager', header: 'Zonal Manager', width: 22, align: 'left' },
+  { key: 'cityType', header: 'City Type', align: 'center' },
+  { key: 'jobStatus', header: 'Job Status', width: 18, align: 'left' },
+  { key: 'efr_id', header: 'EFR ID', numFmt: '#,##0', align: 'center' },
+  { key: 'efr_name', header: 'EFR Name', width: 22, align: 'left' },
+  { key: 'catgName', header: 'Category', width: 22, align: 'left' },
+  { key: 'appointmentDateTime', header: 'Appointment DateTime', width: 22, align: 'center' },
+  { key: 'originalAppointmentDateTime', header: 'Original Appointment', width: 22, align: 'center' },
+  { key: 'pendingDueTo', header: 'Pending Due To', width: 16, align: 'center' },
+  { key: 'reason', header: 'Reason', width: 24, align: 'left' },
+  { key: 'remarks', header: 'Remarks', width: 30, align: 'left' },
+  { key: 'lastUpdatedRemarksDateTime', header: 'Last Updated Remarks', width: 22, align: 'center' },
 ];
 
 // ── POST /grid — main Priority Jobs city-aging grid + KPIs ────────────
@@ -109,12 +109,32 @@ router.post('/export', validate(exportSchema), async (req, res, next) => {
     const rows = await service.copyData(req.user, req.body);
 
     if (req.body.format === 'xlsx') {
-      return sendXlsx(res, {
-        filename: 'priority-jobs.xlsx',
+      // KPIs derived from the exported job-level rows (closed-jobs set —
+      // see copyData() legacy-quirk comment). Title Case labels, plain
+      // numbers. Escalated/Unconfirmed are grid-only metrics not present in
+      // this row set, so the cards reflect what the export actually carries.
+      const totalJobs = rows.length;
+      const unallocated = rows.filter((r) => r.jobStatus === 'unallocated').length;
+      const upCountry = rows.filter((r) => r.cityType === 'Up Country').length;
+
+      const generatedOn = new Date().toLocaleDateString('en-IN', {
+        day: '2-digit', month: 'short', year: 'numeric',
+      });
+
+      await streamStyledXlsx(res, 'priority-jobs.xlsx', {
+        title: 'EasyFix · Priority Jobs',
+        meta: `Hotspot Job Data · ${totalJobs} jobs · Generated ${generatedOn}`,
         sheetName: 'Hotspot Job Data',
         columns: EXPORT_XLSX_COLUMNS,
         rows,
+        kpis: [
+          { label: 'Total Jobs', value: totalJobs, accent: 'FF6366F1' },
+          { label: 'Unallocated', value: unallocated, accent: 'FFF59E0B' },
+          { label: 'Up Country', value: upCountry, accent: 'FF10B981' },
+        ],
+        emptyMessage: 'No Priority Jobs Found.',
       });
+      return;
     }
     return modernOk(res, rows);
   } catch (err) {

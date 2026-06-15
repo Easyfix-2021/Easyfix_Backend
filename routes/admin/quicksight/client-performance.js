@@ -22,7 +22,8 @@
  *   - Read-only report (legacy used POST only to carry an array body; we
  *     accept repeatable/scalar query params via Joi `.single()`).
  *   - period defaults to monthly (mirrors the legacy else-branch).
- *   - format=xlsx streams the workbook via utils/xlsx-export.sendXlsx.
+ *   - format=xlsx streams a branded, KPI + data-bar styled workbook via
+ *     utils/xlsx-styled-export.streamStyledXlsx.
  */
 
 const router = require('express').Router();
@@ -32,7 +33,7 @@ const validate = require('../../../middleware/validate');
 const requireQuickSight = require('../../../middleware/require-quicksight');
 const { roleByName } = require('../../../middleware/role');
 const { modernOk, modernError } = require('../../../utils/response');
-const { sendXlsx } = require('../../../utils/xlsx-export');
+const { streamStyledXlsx } = require('../../../utils/xlsx-styled-export');
 const { extendJobFilter } = require('../../../validators/quicksight.validator');
 const service = require('../../../services/quicksight/quicksight-client-performance.service');
 
@@ -56,6 +57,68 @@ const querySchema = extendJobFilter({
 
 const stamp = () => new Date().toISOString().slice(0, 10);
 
+// Pretty "15 Jun 2026" generation stamp for the meta band.
+const prettyStamp = () =>
+  new Date().toLocaleDateString('en-GB', {
+    day: '2-digit', month: 'short', year: 'numeric',
+  });
+
+// Number formats per column family (CHECK the service value shape):
+//   counts          -> '#,##0'
+//   rupees          -> '"₹"#,##0'
+//   percentages are WHOLE numbers (e.g. 86 = 86%, computed as r0((x/y)*100))
+//                   -> '0.0"%"'  (NOT 0.0% which would render 8600%)
+const FMT_COUNT = '#,##0';
+const FMT_RUPEE = '"₹"#,##0';
+const FMT_PCT = '0.0"%"';
+
+/*
+ * Decorate the service-built flat columns with align / numFmt / dataBar.
+ * We MUST NOT rename keys/headers — only add presentation hints. The keys
+ * follow the toXlsx() shape: `projectManager`, `clientName`, then per period
+ * `p{i}_{field}`. Data bars go ONLY on the per-period `ticketCreated` volume
+ * columns (the headline count) — never on IDs/names/percentages/rupees.
+ */
+function decorateColumns(columns) {
+  return columns.map((col) => {
+    const { key } = col;
+    if (key === 'projectManager' || key === 'clientName') {
+      return { ...col, align: 'left' };
+    }
+    if (/_ticketCreated$/.test(key)) {
+      return { ...col, align: 'right', numFmt: FMT_COUNT, dataBar: true, dataBarColor: 'FF2E86DE' };
+    }
+    if (/_cancellationAfterAllocation$/.test(key) || /_averageTat$/.test(key)) {
+      return { ...col, align: 'right', numFmt: FMT_COUNT };
+    }
+    if (/_enquiryPercentage$/.test(key) || /_escalationPercentage$/.test(key)) {
+      return { ...col, align: 'right', numFmt: FMT_PCT };
+    }
+    if (/_averageTicketSize$/.test(key) || /_sumOfTotalCharge$/.test(key)) {
+      return { ...col, align: 'right', numFmt: FMT_RUPEE };
+    }
+    return col;
+  });
+}
+
+// Headline KPIs from the grouped rows — totals for the MOST-RECENT period
+// (index 0 of each client's periods array), the period the title reflects.
+function buildKpis(rows) {
+  let tickets = 0;
+  let revenue = 0;
+  for (const r of rows) {
+    const recent = r.periods && r.periods[0];
+    if (!recent) continue;
+    tickets += Number(recent.ticketCreated) || 0;
+    revenue += Number(recent.sumOfTotalCharge) || 0;
+  }
+  return [
+    { label: 'Tickets Received', value: tickets },
+    { label: 'Revenue', value: revenue, numFmt: FMT_RUPEE, accent: 'FF10B981' },
+    { label: 'Clients', value: rows.length, accent: 'FFF59E0B' },
+  ];
+}
+
 router.get('/', validate(querySchema, 'query'), async (req, res, next) => {
   try {
     const { period, format } = req.query;
@@ -71,12 +134,22 @@ router.get('/', validate(querySchema, 'query'), async (req, res, next) => {
 
     if (format === 'xlsx') {
       const { columns, rows: flatRows } = service.toXlsx(rows, period);
-      return sendXlsx(res, {
-        filename: `client-performance-${period}-${stamp()}.xlsx`,
+      // Active period drives the title/meta (this report compares 3 periods;
+      // the most-recent label is the headline one). Fall back to the period
+      // toggle word when there are no rows.
+      const activeLabel = rows[0]?.periods?.[0]?.label || period;
+      const periodWord = period === 'weekly' ? 'Weekly' : 'Monthly';
+      const filename = `client-performance-${period}-${stamp()}.xlsx`;
+      await streamStyledXlsx(res, filename, {
+        title: 'EasyFix · Client Performance',
+        meta: `Period: ${periodWord} (${activeLabel}) · ${rows.length} Clients · Generated ${prettyStamp()}`,
         sheetName: 'Client Performance',
-        columns,
+        columns: decorateColumns(columns),
         rows: flatRows,
+        kpis: buildKpis(rows),
+        emptyMessage: 'No Client Performance Data For This Period.',
       });
+      return;
     }
 
     return modernOk(res, rows);

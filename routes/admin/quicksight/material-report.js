@@ -37,7 +37,7 @@ const Joi = require('joi');
 const requireQuickSight = require('../../../middleware/require-quicksight');
 const validate = require('../../../middleware/validate');
 const { modernOk, modernError } = require('../../../utils/response');
-const { sendXlsx } = require('../../../utils/xlsx-export');
+const { streamStyledXlsx } = require('../../../utils/xlsx-styled-export');
 const logger = require('../../../logger');
 const s3Storage = require('../../../utils/s3-storage');
 const { materialReport } = require('../../../services/quicksight/quicksight-material-report.service');
@@ -95,7 +95,7 @@ const materialReportQuery = Joi.object({
  * keys here read the pre-formatted shape produced by toXlsxRows() below.
  */
 const XLSX_COLUMNS = [
-  { key: 'jobId', header: 'Job Id' },
+  { key: 'jobId', header: 'Job Id', align: 'right', numFmt: '#,##0' },
   { key: 'clientRefId', header: 'Ref Id' },
   { key: 'branchDetails', header: 'Branch', width: 18 },
   { key: 'customerName', header: 'Customer Name', width: 22 },
@@ -111,9 +111,12 @@ const XLSX_COLUMNS = [
   { key: 'jobDesc', header: 'Job Desc', width: 28 },
   { key: 'serviceType', header: 'Service Type' },
   { key: 'serviceName', header: 'Element Deployed', width: 24 },
-  { key: 'unit', header: 'Qty /sqrft/nos' },
-  { key: 'cxCharge', header: 'Rate' },
-  { key: 'totalCost', header: 'Total Amount' },
+  // Quantity — real numeric magnitude → count format + teal in-cell data bar.
+  { key: 'unit', header: 'Qty /sqrft/nos', align: 'right', numFmt: '#,##0', dataBar: true, dataBarColor: 'FF14B8A6' },
+  // Rate — per-unit rupee price (not a magnitude to bar) → rupee format only.
+  { key: 'cxCharge', header: 'Rate', align: 'right', numFmt: '"₹"#,##0' },
+  // Total Amount — rupee magnitude → rupee format + amber in-cell data bar.
+  { key: 'totalCost', header: 'Total Amount', align: 'right', numFmt: '"₹"#,##0', dataBar: true, dataBarColor: 'FFF59E0B' },
   { key: 'clientSpocName', header: 'Client SPOC', width: 20 },
   { key: 'cityName', header: 'City', width: 16 },
   { key: 'stateName', header: 'State', width: 16 },
@@ -180,12 +183,35 @@ router.get('/', validate(materialReportQuery, 'query'), async (req, res, next) =
         { report: 'quicksight-material-report', clientId, from, to, rows: rows.length },
         'QuickSight Material Report xlsx export',
       );
-      return sendXlsx(res, {
-        filename: `material-report-${to}.xlsx`,
+
+      // KPI summary — derived from the SAME rows already streamed. Each row is
+      // one element-deployed line, so row count = elements; distinct jobIds =
+      // jobs; unit/totalCost are summable numeric magnitudes.
+      const distinctJobs = new Set(rows.map((r) => r.jobId)).size;
+      const totalQuantity = rows.reduce((s, r) => s + (Number(r.unit) || 0), 0);
+      const totalAmount = rows.reduce((s, r) => s + (Number(r.totalCost) || 0), 0);
+
+      const filename = `material-report-${to}.xlsx`;
+      await streamStyledXlsx(res, filename, {
+        title: 'EasyFix · Material Report',
+        meta: `Client #${clientId} · ${from} → ${to} · ${rows.length} Rows`,
         sheetName: 'ClientProductDeployedList',
+        kpis: [
+          { label: 'Total Jobs', value: distinctJobs, accent: 'FF6366F1' },
+          { label: 'Total Elements', value: rows.length, accent: 'FF0EA5E9' },
+          { label: 'Total Quantity', value: totalQuantity, accent: 'FF14B8A6' },
+          { label: 'Total Amount', value: totalAmount, accent: 'FFF59E0B', numFmt: '"₹"#,##0' },
+        ],
         columns: XLSX_COLUMNS,
         rows: toXlsxRows(rows),
+        totalRow: {
+          serviceName: 'Total',
+          unit: totalQuantity,
+          totalCost: totalAmount,
+        },
+        emptyMessage: 'No Material Lines Found.',
       });
+      return;
     }
 
     return modernOk(res, rows);

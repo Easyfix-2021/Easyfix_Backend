@@ -32,7 +32,7 @@ const Joi = require('joi');
 const requireQuickSight = require('../../../middleware/require-quicksight');
 const validate = require('../../../middleware/validate');
 const { modernOk, modernError } = require('../../../utils/response');
-const { sendXlsx } = require('../../../utils/xlsx-export');
+const { streamStyledXlsx } = require('../../../utils/xlsx-styled-export');
 const { getRoleById } = require('../../../services/role.service');
 const service = require('../../../services/quicksight/quicksight-admin-dashboard.service');
 
@@ -93,14 +93,17 @@ const rmTeamUsersQuerySchema = Joi.object({
 });
 
 // ── XLSX column set for the Employee Productivity export ──────────────────
+// numFmt: counts → '#,##0'; revenue is rupees → '"₹"#,##0' (no % columns).
+// dataBar on the three volume columns (Booked / Scheduled / Closed) — never
+// on the employee name or the rupee/audit columns.
 const PRODUCTIVITY_XLSX_COLUMNS = [
-  { key: 'userName', header: 'Employee', width: 28 },
-  { key: 'booked', header: 'Booked' },
-  { key: 'scheduled', header: 'Scheduled' },
-  { key: 'audit', header: 'Audit' },
-  { key: 'closedCount', header: 'Closed' },
-  { key: 'revenue', header: 'Revenue' },
-  { key: 'cancelCount', header: 'Cancelled' },
+  { key: 'userName', header: 'Employee', width: 28, align: 'left' },
+  { key: 'booked', header: 'Booked', numFmt: '#,##0', dataBar: true, dataBarColor: 'FF6366F1' },
+  { key: 'scheduled', header: 'Scheduled', numFmt: '#,##0', dataBar: true, dataBarColor: 'FF0EA5E9' },
+  { key: 'audit', header: 'Audit', numFmt: '#,##0' },
+  { key: 'closedCount', header: 'Closed', numFmt: '#,##0', dataBar: true, dataBarColor: 'FF10B981' },
+  { key: 'revenue', header: 'Revenue', numFmt: '"₹"#,##0' },
+  { key: 'cancelCount', header: 'Cancelled', numFmt: '#,##0' },
 ];
 
 // ── GET /access — mirrors loginToFloorDiscipline (isAdmin probe) ──────────
@@ -129,12 +132,56 @@ router.post(
       const result = await service.employeeProductivity(req.body, page, size);
 
       if (req.body.format === 'xlsx') {
-        return sendXlsx(res, {
-          filename: 'employee-productivity.xlsx',
+        const rows = result.data || [];
+        const sum = (key) => rows.reduce((a, r) => a + (Number(r[key]) || 0), 0);
+        const totalBooked = sum('booked');
+        const totalScheduled = sum('scheduled');
+        const totalClosed = sum('closedCount');
+        const totalRevenue = sum('revenue');
+
+        // Filter context for the meta band (only non-default filters shown).
+        const filterBits = [];
+        if (req.body.startDate || req.body.endDate) {
+          filterBits.push(`Dates: ${req.body.startDate || '…'} → ${req.body.endDate || '…'}`);
+        }
+        if (Number(req.body.verticalId) > 0) filterBits.push(`Vertical ${req.body.verticalId}`);
+        if (Number(req.body.reportingManagerId) > 0) {
+          filterBits.push(`RM ${req.body.reportingManagerId}`);
+        }
+        if (Number(req.body.zonalManagerId) > 0) {
+          filterBits.push(`Zonal ${req.body.zonalManagerId}`);
+        }
+        if (Number(req.body.userId) > 0) filterBits.push(`User ${req.body.userId}`);
+        filterBits.push(`Based On ${req.body.findByDateType || 'requested'}`);
+        const generated = new Date().toLocaleDateString('en-GB', {
+          day: '2-digit', month: 'short', year: 'numeric',
+        });
+        const meta = `${filterBits.join(' · ')} · ${rows.length} Employees · Generated ${generated}`;
+
+        await streamStyledXlsx(res, 'employee-productivity.xlsx', {
+          title: 'EasyFix · Employee Productivity',
+          meta,
           sheetName: 'Productivity',
           columns: PRODUCTIVITY_XLSX_COLUMNS,
-          rows: result.data,
+          rows,
+          kpis: [
+            { label: 'Total Booked', value: totalBooked, accent: 'FF6366F1' },
+            { label: 'Total Scheduled', value: totalScheduled, accent: 'FF0EA5E9' },
+            { label: 'Total Closed', value: totalClosed, accent: 'FF10B981' },
+            { label: 'Total Revenue', value: totalRevenue, accent: 'FFF59E0B', numFmt: '"₹"#,##0' },
+          ],
+          totalRow: {
+            userName: 'Total',
+            booked: totalBooked,
+            scheduled: totalScheduled,
+            audit: sum('audit'),
+            closedCount: totalClosed,
+            revenue: totalRevenue,
+            cancelCount: sum('cancelCount'),
+          },
+          emptyMessage: 'No employees found for the selected filters.',
         });
+        return;
       }
       return modernOk(res, result);
     } catch (err) {
