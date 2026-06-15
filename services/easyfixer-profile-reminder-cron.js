@@ -1,6 +1,7 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const gallabox = require('./gallabox.whatsapp.service');
+const profileUpdateLink = require('./easyfixer-profile-update-link.service');
 
 /*
  * Easyfixer Profile-Completion Reminder cron service (2026-06-06).
@@ -79,31 +80,16 @@ async function runDailyReminder() {
     if (!phone) { summary.skipped += 1; continue; }
     summary.attempted += 1;
     try {
-      const res = await gallabox.sendTemplate({
-        to: phone,
-        recipientName: row.name || 'EasyFixer',
-        templateName: TEMPLATE_NAME,
-        // Template has no body placeholders; the generic nudge stands
-        // on its own. If Gallabox later requires named variables (e.g.
-        // {{1}} for technician's first name), add them here.
-        bodyValues: {},
-      });
-      if (res?.delivered) {
-        summary.succeeded += 1;
-      } else if (res?.disabled) {
-        // NOTIFICATIONS_DISABLE was set — count as skipped, not failed,
-        // because the suppression is intentional (dev / staging).
-        summary.skipped += 1;
-      } else {
-        summary.failed += 1;
-        logger.warn(
-          `profile-reminder · efr_id=${row.efr_id} · phone=${phone} · ` +
-          `rejected: ${res?.error || 'unknown'}`
-        );
-      }
+      await profileUpdateLink.sendForEasyfixer(
+        row.efr_id,
+        { action: 'reminder' },
+        null,  // actor: null — system-triggered, no human operator
+        pool,
+      );
+      summary.succeeded += 1;
     } catch (err) {
       summary.failed += 1;
-      logger.error(
+      logger.warn(
         `profile-reminder · efr_id=${row.efr_id} · phone=${phone} · ` +
         `crashed: ${err.message}`
       );
@@ -171,15 +157,24 @@ async function runTest({ mobile, sourceId } = {}) {
     sourceUsed = { efr_id: rows[0].efr_id, name: rows[0].name || null };
   }
 
-  // Send strictly to the operator's mobile. Gallabox wrapper handles
-  // NOTIFICATIONS_DISABLE + TEST_MOBILE itself (the latter would
-  // redirect even a test send if set — log either way).
-  const res = await gallabox.sendTemplate({
-    to: phone,
-    recipientName,
-    templateName: TEMPLATE_NAME,
-    bodyValues: {},
-  });
+  // Delegate to sendForEasyfixer with override_mobile so the message
+  // goes to the operator's number (not the real easyfixer's). This
+  // ensures the test send uses the same template + bodyValues as the
+  // daily cron — including the profile-update magic link.
+  // sourceId=0 (dummy) is accepted; sendForEasyfixer mints a JWT for
+  // efr_id=0 which lands on a non-functional but structurally valid link.
+  const testEfrId = sourceUsed?.efr_id ?? 0;
+  let res;
+  try {
+    res = await profileUpdateLink.sendForEasyfixer(
+      testEfrId,
+      { action: 'reminder', override_mobile: phone },
+      null,
+      pool,
+    );
+  } catch (err) {
+    res = { delivered: false, error: err.message };
+  }
 
   logger.info(
     `Profile-reminder TEST · target=${phone} · recipientName="${recipientName}" · ` +

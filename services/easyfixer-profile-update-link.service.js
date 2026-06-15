@@ -825,10 +825,11 @@ async function sendForEasyfixer(efrId, { action = 'first', override_mobile } = {
     response = await whatsappService.sendTemplate({
       to: destinationMobile,
       recipientName: fullName,
-      templateName: 'easyfixer_profile_update_link',
+      templateName: 'tx_complete_profile',
       bodyValues: {
         1: fullName,
-        2: shortUrl,
+        2: String(efrId),
+        3: shortUrl,
       },
     });
   } catch (err) {

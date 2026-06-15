@@ -228,4 +228,19 @@ router.get('/rm-team-users', validate(rmTeamUsersSchema, 'query'), async (req, r
   }
 });
 
+// GET /spoc-revenue — revenue + completed-job counts aggregated by Primary SPOC.
+// Uses the same windowed filter schema as kra-metrics. Primary SPOC =
+// tbl_vertical_mapping rows with user_type=1; window = checkout_date_time BETWEEN
+// processFloorFilters start/end; completed = job_status IN (3, 5).
+router.get('/spoc-revenue', validate(windowedSchema, 'query'), async (req, res, next) => {
+  try {
+    const pf = await service.processFloorFilters(req.query);
+    const data = await service.getSpocRevenue({ pf });
+    return modernOk(res, data);
+  } catch (err) {
+    if (err && err.status) return modernError(res, err.status, err.message);
+    return next(err);
+  }
+});
+
 module.exports = router;

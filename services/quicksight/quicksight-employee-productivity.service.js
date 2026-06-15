@@ -941,6 +941,96 @@ async function getRmTeamUsers({ verticalId, reportingManagerId }) {
   }));
 }
 
+/* ───────────────────────── 7. spoc-revenue ───────────────────────── */
+
+/*
+ * getSpocRevenue — revenue and completed-job count aggregated by Primary SPOC.
+ *
+ * Primary SPOC = tbl_vertical_mapping rows with user_type = 1, joined to
+ * tbl_user (user_status = 1) for the name. A job maps to its SPOC via
+ * tbl_job.fk_client_id = tbl_vertical_mapping.client_id.
+ *
+ * Completed = job_status IN (3, 5).
+ * Window    = checkout_date_time BETWEEN pf.startDate AND pf.endDate
+ *             (endDate already +1 day from processFloorFilters).
+ * Revenue   = COALESCE(SUM(tbl_job_transaction.total_charge), 0) — pre-tax,
+ *             matching the KRA Revenue tile.
+ * Scope guards replicated verbatim from getKraMetrics:
+ *   - vertical   : (? IS NULL) OR TCL.vertical_id = ?
+ *   - zonal      : (? IS NULL) OR TC.state_user = ?
+ *   - clientGuard: applyClientFilter OR fk_client_id IN (managedClientIds)
+ */
+async function getSpocRevenue({ pf }) {
+  const params = [];
+
+  // Build the client guard fragment (pushes managed-client ids into params).
+  const clientFrag = clientGuard('TJ.fk_client_id', pf, params);
+
+  // Scope-guard params pushed BEFORE the window params (mirrors getKraMetrics
+  // param order: vertical ×2, zonal ×2, then client ids already in params).
+  // We build params incrementally here so the order is explicit.
+  const verticalParams = [pf.verticalId, pf.verticalId];
+  const zonalParams    = [pf.zonalManagerId, pf.zonalManagerId];
+  // window params
+  const windowParams   = [pf.startDate, pf.endDate];
+
+  // Final param array: window, vertical, zonal, client ids (same fragment
+  // pattern as getKraMetrics — clientFrag is already in the string and its
+  // ids were pushed into the `params` array above via clientGuard).
+  const finalParams = [
+    ...windowParams,    // checkout_date_time BETWEEN ? AND ?
+    ...verticalParams,  // (? IS NULL) OR TCL.vertical_id = ?
+    ...zonalParams,     // (? IS NULL) OR TC.state_user = ?
+    ...params,          // client guard ids (may be empty when applyClientFilter=false)
+  ];
+
+  const sql =
+    `SELECT
+        TU.user_id                           AS userId,
+        TU.user_name                         AS userName,
+        COUNT(DISTINCT TJ.job_id)            AS jobs_completed,
+        COALESCE(SUM(TJT.total_charge), 0)   AS revenue
+     FROM tbl_vertical_mapping TVM
+     INNER JOIN tbl_user   TU  ON TU.user_id  = TVM.user_id
+                               AND TU.user_status = 1
+     INNER JOIN tbl_job    TJ  ON TJ.fk_client_id = TVM.client_id
+     LEFT  JOIN tbl_job_transaction TJT ON TJT.fk_job_id = TJ.job_id
+     LEFT  JOIN tbl_address         TA  ON TA.address_id = TJ.fk_address_id
+     LEFT  JOIN tbl_city            TC  ON TC.city_id    = TA.city_id
+     LEFT  JOIN tbl_client          TCL ON TCL.client_id = TJ.fk_client_id
+     WHERE TVM.user_type = 1
+       AND TJ.job_status IN (3, 5)
+       AND TJ.checkout_date_time BETWEEN ? AND ?
+       AND ((? IS NULL) OR TCL.vertical_id = ?)
+       AND ((? IS NULL) OR TC.state_user = ?)${clientFrag}
+     GROUP BY TU.user_id, TU.user_name
+     ORDER BY revenue DESC
+     LIMIT ${GROUPED_CAP}`;
+
+  const [rows] = await pool.query(sql, finalParams);
+
+  if (rows.length >= GROUPED_CAP) {
+    logger.warn(
+      { report: 'spoc-revenue', returned: rows.length, cap: GROUPED_CAP },
+      'SPOC Revenue hit the grouped-rows cap — verify date range',
+    );
+  }
+
+  const spocs = rows.map((r) => ({
+    userId:        Number(r.userId),
+    userName:      r.userName || '',
+    jobsCompleted: Number(r.jobs_completed) || 0,
+    revenue:       Number(r.revenue)        || 0,
+  }));
+
+  const spocCount    = spocs.length;
+  const totalRevenue = spocs.reduce((sum, s) => sum + s.revenue, 0);
+  const totalJobs    = spocs.reduce((sum, s) => sum + s.jobsCompleted, 0);
+  const avgRevenue   = spocCount > 0 ? Math.round(totalRevenue / spocCount) : 0;
+
+  return { spocs, totalRevenue, avgRevenue, totalJobs, spocCount };
+}
+
 module.exports = {
   processFloorFilters,
   getEmployeeProductivity,
@@ -949,6 +1039,7 @@ module.exports = {
   getCancellationDetails,
   getReportingManagers,
   getRmTeamUsers,
+  getSpocRevenue,
   // Cap surfaced so the route's xlsx export can request the full set
   // symbolically (avoids a hardcoded 5000 literal drifting from this cap).
   GROUPED_CAP,

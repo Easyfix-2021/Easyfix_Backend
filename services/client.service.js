@@ -72,7 +72,7 @@ async function getClientColumns() {
           'client_id', 'client_name', 'client_email', 'client_address',
           'client_type', 'reference_code', 'booking_cut_off', 'client_status',
           'insert_date', 'update_date', 'inserted_by', 'updated_by',
-          'vertical_id', 'collected_by',
+          'vertical_id', 'collected_by', 'monthly_revenue',
         ]);
       }
     })();
@@ -156,7 +156,8 @@ async function listClients({ extraClauses = [], extraParams = [], includeInactiv
     // EasyFix_CRM ClientDaoImpl.java#75.
     `SELECT cl.client_id, cl.client_name, cl.client_email, cl.client_status, cl.client_type,
             cl.reference_code, cl.booking_cut_off, cl.vertical_id, cl.collected_by,
-            cl.client_city_id AS city_id, ct.city_name
+            cl.client_city_id AS city_id, ct.city_name,
+            cl.monthly_revenue
        FROM tbl_client cl
        LEFT JOIN tbl_city ct ON ct.city_id = cl.client_city_id
        ${where}
@@ -265,6 +266,8 @@ const CLIENT_INSERT_MAP = {
   reporting_contact_ids: (b) => (Array.isArray(b.reportingContactIds)
                                   ? b.reportingContactIds.join(',')
                                   : (b.reportingContactIds ?? null)),
+  // commercial metrics
+  monthly_revenue:    (b) => b.monthlyRevenue ?? null,
   // audit
   inserted_by:        (_, actorId) => actorId,
   updated_by:         (_, actorId) => actorId,
@@ -322,6 +325,8 @@ const UPDATE_ALLOWED = [
   'logo_id',
   // mapping refs
   'vertical_id', 'reporting_contact_ids',
+  // commercial metrics
+  'monthly_revenue',
 ];
 
 // Map common camelCase shapes the FE might send onto the snake_case columns.
@@ -361,6 +366,8 @@ const CAMEL_TO_SNAKE = {
   // mapping refs
   verticalId: 'vertical_id',
   reportingContactIds: 'reporting_contact_ids',
+  // commercial metrics
+  monthlyRevenue: 'monthly_revenue',
 };
 
 async function updateClient(clientId, body, actorId) {

@@ -12,6 +12,12 @@ const idParam = Joi.object({
   pincodeId: Joi.number().integer().positive().required(),
 });
 
+const techniciansQuery = Joi.object({
+  q:      Joi.string().allow('', null).optional(),
+  limit:  Joi.number().integer().min(1).max(200).default(20),
+  offset: Joi.number().integer().min(0).default(0),
+});
+
 const listQuery = Joi.object({
   q:       Joi.string().allow('', null).optional(),
   status:  Joi.string().valid('LOCAL', 'TRAVEL').optional(),
@@ -84,6 +90,29 @@ router.get('/:pincodeId', validate(idParam, 'params'), async (req, res, next) =>
     return modernOk(res, row);
   } catch (err) { return next(err); }
 });
+
+// GET /admin/pincodes/:pincodeId/technicians?q=&limit=&offset=
+// Returns active+verified technicians whose serviceable pincodes include
+// this pincode. Powers the clickable-count modal on Manage Pincodes.
+router.get('/:pincodeId/technicians',
+  validate(idParam, 'params'),
+  validate(techniciansQuery, 'query'),
+  async (req, res, next) => {
+    try {
+      const row = await pin.getPincodeById(Number(req.params.pincodeId));
+      if (!row) return modernError(res, 404, 'Pincode not found');
+      const result = await pin.listTechniciansForPincode(
+        Number(req.params.pincodeId),
+        {
+          q:      req.query.q,
+          limit:  req.query.limit,
+          offset: req.query.offset,
+        }
+      );
+      return modernOk(res, result);
+    } catch (err) { return next(err); }
+  }
+);
 
 // ─── CREATE / UPDATE / DELETE ────────────────────────────────────────
 router.post('/', validate(createBody), async (req, res, next) => {

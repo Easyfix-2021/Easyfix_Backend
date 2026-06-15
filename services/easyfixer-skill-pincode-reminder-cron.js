@@ -5,7 +5,7 @@ const { signEasyfixerProfileToken } = require('../utils/jwt');
 const whatsappService = require('./gallabox.whatsapp.service');
 const urlShortener = require('./url-shortener.service');
 
-const TEMPLATE_NAME = 'easyfixer_profile_update_link';
+const TEMPLATE_NAME = 'tx_complete_profile';
 
 /*
  * Easyfixer Skill+Pincode Reminder cron service (2026-06-11).
@@ -234,7 +234,7 @@ async function runTest({ mobile, sourceId } = {}) {
     to: phone,
     recipientName,
     templateName: TEMPLATE_NAME,
-    bodyValues: { 1: recipientName, 2: shortUrl },
+    bodyValues: { 1: recipientName, 2: String(efrId), 3: shortUrl },
   });
 
   logger.info(

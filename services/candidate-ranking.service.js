@@ -861,8 +861,13 @@ async function rankCandidatesForJob(jobId, {
    * the job needs (not just a service_category_id). Single round-trip
    * with two scalar subqueries — both are PK lookups, sub-ms each.
    * Returns nulls if the job has no assigned category/type.
+   *
+   * Also resolves the service_type_name via a scalar subquery since the
+   * getById JOIN only adds tbl_service_type on tbl_job_services (not on
+   * the job row itself for fk_service_type_id).
    */
   let deepSkillLabel = null;
+  let serviceTypeName = null;
   if (job.fk_service_catg_id || job.fk_service_type_id) {
     const [[labels]] = await pool.query(
       `SELECT
@@ -872,7 +877,34 @@ async function rankCandidatesForJob(jobId, {
     );
     // "Carpentry > Wood Repair" if both present, else whichever's set.
     deepSkillLabel = [labels?.catg_name, labels?.type_name].filter(Boolean).join(' › ') || null;
+    serviceTypeName = labels?.type_name ?? null;
   }
+
+  // Pre-build the enriched job payload used in ALL return paths (early-exit
+  // on zero-eligible and the normal ranked return).
+  const enrichedJob = {
+    job_id:            job.job_id,
+    fk_client_id:      job.fk_client_id,
+    customer_name:     job.customer_name    ?? null,
+    customer_mob_no:   job.customer_mob_no  ?? null,
+    client_name:       job.client_name      ?? null,
+    client_ref_id:     job.client_ref_id    ?? null,
+    address:           job.address          ?? null,
+    city_id:           job.city_id          ?? null,
+    city_name:         job.city_name        ?? null,
+    pin_code:          job.pin_code         ?? null,
+    service_category:  job.service_category ?? null,
+    service_type:      serviceTypeName      ?? null,
+    deep_skill_label:  deepSkillLabel       ?? null,
+    job_type:          job.job_type         ?? null,
+    payment_mode:      paidByLabel(job.paid_by),
+    requested_date_time: job.requested_date_time ?? null,
+    time_slot:         job.time_slot        ?? null,
+    job_desc:          job.job_desc         ?? null,
+    paid_by:           job.paid_by          ?? null,
+    paid_by_label:     paidByLabel(job.paid_by),
+    assigned_efr_id:   assignedEfrId,
+  };
 
   // L1 with deep-skill on; fallback if 0.
   let eligible = await l1Eligibility(job, { applyDeepSkill: true });
@@ -884,7 +916,7 @@ async function rankCandidatesForJob(jobId, {
 
   if (eligible.length === 0) {
     return {
-      job, alreadyAssigned, note: note ?? 'no_eligible_techs',
+      job: enrichedJob, alreadyAssigned, note: note ?? 'no_eligible_techs',
       l1Count: 0, l2Count: 0, candidates: [], rejected: [],
       config: { weights: SCORE_WEIGHTS, performance_sub: PERFORMANCE_SUB },
     };
@@ -940,20 +972,7 @@ async function rankCandidatesForJob(jobId, {
   }
 
   return {
-    job: {
-      job_id: job.job_id,
-      fk_client_id: job.fk_client_id,
-      city_id: job.city_id,
-      city_name: job.city_name,
-      pin_code: job.pin_code,
-      service_category: job.service_categories_dashboard,
-      requested_date_time: job.requested_date_time,
-      time_slot: job.time_slot,
-      paid_by: job.paid_by ?? null,
-      paid_by_label: paidByLabel(job.paid_by),
-      assigned_efr_id: assignedEfrId,
-      deep_skill_label: deepSkillLabel,
-    },
+    job: enrichedJob,
     alreadyAssigned,
     note,
     l1Count: eligible.length,
@@ -1100,7 +1119,7 @@ async function searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit =
   if (timeSlot !== undefined && timeSlot !== null && timeSlot !== '') job.time_slot = timeSlot;
 
   const q = String(term ?? '').trim();
-  if (!q) return { job: searchJobHeader(job), candidates: [], capped: false };
+  if (!q) return { job: await searchJobHeader(job), candidates: [], capped: false };
 
   // Match by name / mobile (efr_no) always; by efr_id only when the term is
   // a pure integer. capLookup = cap + 1 so we can detect "hit the cap".
@@ -1127,26 +1146,56 @@ async function searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit =
     logger.warn({ jobId, term: q, cap }, 'searchTechniciansForJob: result set hit the cap — term too broad');
   }
   const rows = techRows.slice(0, cap);
-  if (rows.length === 0) return { job: searchJobHeader(job), candidates: [], capped };
+  if (rows.length === 0) return { job: await searchJobHeader(job), candidates: [], capped };
 
   const stats = await statsForCandidates(rows.map((r) => r.efr_id), job, job.fk_client_id);
   const candidates = rows.map((r) => buildCandidateRow(r, stats.get(r.efr_id), job));
 
-  return { job: searchJobHeader(job), candidates, capped };
+  return { job: await searchJobHeader(job), candidates, capped };
 }
 
-// Compact job header reused by the search response.
-function searchJobHeader(job) {
+/*
+ * Enriched job header reused by the search response.
+ * The job object comes from jobService.getById (j.* + LIST_JOIN/DETAIL_JOIN
+ * so all customer/client/address/service_category fields are present).
+ * service_type_name requires a separate scalar subquery since getById only
+ * JOINs tbl_service_type against tbl_job_services, not against the job row's
+ * own fk_service_type_id — we do that inline here.
+ */
+async function searchJobHeader(job) {
+  let serviceTypeName = null;
+  if (job.fk_service_type_id) {
+    const [[st]] = await pool.query(
+      'SELECT service_type_name FROM tbl_service_type WHERE service_type_id = ? LIMIT 1',
+      [job.fk_service_type_id]
+    );
+    serviceTypeName = st?.service_type_name ?? null;
+  }
+  let deepSkillLabel = null;
+  if (job.fk_service_catg_id || job.fk_service_type_id) {
+    deepSkillLabel = [job.service_category, serviceTypeName].filter(Boolean).join(' › ') || null;
+  }
   return {
-    job_id: job.job_id,
-    fk_client_id: job.fk_client_id,
-    city_id: job.city_id,
-    city_name: job.city_name,
-    pin_code: job.pin_code,
-    requested_date_time: job.requested_date_time,
-    time_slot: job.time_slot,
-    paid_by: job.paid_by ?? null,
-    paid_by_label: paidByLabel(job.paid_by),
+    job_id:            job.job_id,
+    fk_client_id:      job.fk_client_id,
+    customer_name:     job.customer_name    ?? null,
+    customer_mob_no:   job.customer_mob_no  ?? null,
+    client_name:       job.client_name      ?? null,
+    client_ref_id:     job.client_ref_id    ?? null,
+    address:           job.address          ?? null,
+    city_id:           job.city_id          ?? null,
+    city_name:         job.city_name        ?? null,
+    pin_code:          job.pin_code         ?? null,
+    service_category:  job.service_category ?? null,
+    service_type:      serviceTypeName      ?? null,
+    deep_skill_label:  deepSkillLabel       ?? null,
+    job_type:          job.job_type         ?? null,
+    payment_mode:      paidByLabel(job.paid_by),
+    requested_date_time: job.requested_date_time ?? null,
+    time_slot:         job.time_slot        ?? null,
+    job_desc:          job.job_desc         ?? null,
+    paid_by:           job.paid_by          ?? null,
+    paid_by_label:     paidByLabel(job.paid_by),
   };
 }
 

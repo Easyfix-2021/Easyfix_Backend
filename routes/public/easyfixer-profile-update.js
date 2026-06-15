@@ -26,6 +26,7 @@ const Joi = require('joi');
 const { pool } = require('../../db');
 const { verifyEasyfixerProfileToken } = require('../../utils/jwt');
 const profileUpdateLink = require('../../services/easyfixer-profile-update-link.service');
+const otpSvc = require('../../services/easyfixer-profile-otp.service');
 const { modernOk, modernError } = require('../../utils/response');
 const validate = require('../../middleware/validate');
 const { rateLimit } = require('../../middleware/rate-limit');
@@ -76,6 +77,10 @@ const pincodeSearchQuery = Joi.object({
 }).unknown(true);
 
 const saveBody = Joi.object({
+  // 4-digit OTP the technician received via WhatsApp — required to gate the
+  // save and prevent unauthorised profile mutations even if the magic link
+  // is forwarded or replayed.
+  otp:                     Joi.number().integer().min(1000).max(9999).required(),
   basic:                   basicSchema.optional(),
   // The CAP matches the optionMappingsBody validator in
   // validators/easyfixer.validator.js (500) so the public surface can't
@@ -86,7 +91,7 @@ const saveBody = Joi.object({
     .items(Joi.number().integer().positive())
     .max(2000)
     .optional(),
-}).min(1);
+}).min(2); // otp + at least one data block
 
 // Centralised error mapper. verifyEasyfixerProfileToken throws Error
 // instances with a `status` property; fetchPrefill / sendForEasyfixer /
@@ -148,7 +153,31 @@ router.get(
   },
 );
 
+// ─── POST /send-otp?token=<jwt> ─────────────────────────────────────
+// Generates a 4-digit OTP, stores it on tbl_easyfixer (profile_update_otp
+// + profile_update_otp_valid_up_to), and sends it via Gallabox WhatsApp (template
+// `profile_update_otp`). The OTP is NOT returned in the response — it
+// travels only through the WhatsApp channel.
+router.post(
+  '/send-otp',
+  tokenRateLimit,
+  validate(tokenQuery, 'query'),
+  async (req, res, next) => {
+    try {
+      const efrId = verifyTokenFromQuery(req);
+      const result = await otpSvc.sendOtp(efrId, pool);
+      logger.info({ efrId }, 'easyfixer-profile-update: OTP send requested');
+      return modernOk(res, result, 'OTP sent');
+    } catch (e) {
+      return mapKnownError(res, next, e);
+    }
+  },
+);
+
 // ─── PUT /save?token=<jwt> ──────────────────────────────────────────
+// OTP gate: the technician must supply the 4-digit code they received via
+// WhatsApp. verifyOtp() consumes the code on success (one-shot) so a
+// replayed save body cannot reuse a previously-valid OTP.
 router.put(
   '/save',
   tokenRateLimit,
@@ -157,6 +186,14 @@ router.put(
   async (req, res, next) => {
     try {
       const efrId = verifyTokenFromQuery(req);
+
+      // OTP gate — runs before acceptSubmission to avoid partial writes on
+      // an invalid code.
+      const { valid } = await otpSvc.verifyOtp(efrId, req.body.otp, pool);
+      if (!valid) {
+        return modernError(res, 400, 'Invalid or expired OTP');
+      }
+
       const result = await profileUpdateLink.acceptSubmission(efrId, req.body, pool);
       logger.info({ efrId }, 'easyfixer-profile-update: profile saved');
       return modernOk(res, result, 'Profile updated');

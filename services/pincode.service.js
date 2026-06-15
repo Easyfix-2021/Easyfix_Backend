@@ -25,19 +25,32 @@ const { pool } = require('../db');
 
 const STATUS = Object.freeze({ LOCAL: 'LOCAL', TRAVEL: 'TRAVEL', UNZONED: 'UNZONED' });
 
-// Active+verified easyfixer count per pincode, batched. The chain is the
-// same as the firefox flow but keyed off tbl_pincode.city_id (FK-style)
-// instead of pincode_firefox_city_mapping.city_name (string join).
+// Active+verified easyfixer count per pincode, batched.
+//
+// Changed from the zone-chain join (tbl_pincode → tbl_zone_city_mapping →
+// tbl_easyfixer.efr_zone_city_id) to a SERVICEABLE-PINCODE count:
+// technicians whose tbl_efr_serviceable_pincodes row explicitly lists the
+// pincode value (CSV TEXT column, matched with FIND_IN_SET). This matches
+// the exact pattern used by candidate-ranking.service.js to identify
+// serviceable technicians for a job pincode — so LOCAL/TRAVEL status now
+// directly reflects "can a tech actually service this pincode" rather than
+// "is a tech in the same city zone".
+//
+// Performance: per-page call is ~100 rows; bounded by WHERE p.pincode_id IN (?)
+// + FIND_IN_SET scans only the serviceable_pincodes rows, not the full
+// tbl_easyfixer table. Acceptable for an ops settings page.
 async function pincodeIdToActiveEfrCount(pincodeIds) {
   if (!pincodeIds.length) return new Map();
   const placeholders = pincodeIds.map(() => '?').join(',');
   const [rows] = await pool.query(
     `SELECT p.pincode_id, COUNT(DISTINCT e.efr_id) AS active_efr_count
-       FROM tbl_pincode              p
-       LEFT JOIN tbl_zone_city_mapping zcm ON zcm.city_id = p.city_id
-       LEFT JOIN tbl_easyfixer       e   ON e.efr_zone_city_id = zcm.city_zone_id
-                                          AND e.efr_status = 1
-                                          AND e.is_technician_verified = 1
+       FROM tbl_pincode p
+       LEFT JOIN tbl_efr_serviceable_pincodes sp
+              ON FIND_IN_SET(p.pincode, sp.pincodes) > 0
+       LEFT JOIN tbl_easyfixer e
+              ON e.efr_id = sp.easyfixer_id
+             AND e.efr_status = 1
+             AND e.is_technician_verified = 1
       WHERE p.pincode_id IN (${placeholders})
       GROUP BY p.pincode_id`,
     pincodeIds
@@ -45,6 +58,86 @@ async function pincodeIdToActiveEfrCount(pincodeIds) {
   const map = new Map();
   for (const r of rows) map.set(Number(r.pincode_id), Number(r.active_efr_count) || 0);
   return map;
+}
+
+/*
+ * List active+verified technicians who explicitly service a pincode.
+ *
+ * Reuses the same FIND_IN_SET match as pincodeIdToActiveEfrCount and
+ * candidate-ranking.service.js's serviceable-pincodes query. Supports
+ * free-text search (q) over efr_name / efr_id / efr_no (mobile).
+ *
+ * Returns { items: [...], total } where each item has:
+ *   efr_id, efr_name, efr_no, zone_name, city_name
+ */
+async function listTechniciansForPincode(pincodeId, { q = '', limit = 20, offset = 0 } = {}) {
+  limit  = Math.min(Math.max(Number(limit)  || 20, 1), 200);
+  offset = Math.max(Number(offset) || 0, 0);
+
+  // Resolve the 6-digit pincode string from the id — needed for FIND_IN_SET.
+  const [[pinRow]] = await pool.query(
+    'SELECT pincode FROM tbl_pincode WHERE pincode_id = ? LIMIT 1',
+    [pincodeId]
+  );
+  if (!pinRow) return { items: [], total: 0 };
+  const pincodeVal = String(pinRow.pincode);
+
+  const searchWhere = [];
+  const searchParams = [];
+  const term = String(q || '').trim();
+  if (term) {
+    const like = `%${term}%`;
+    if (/^[0-9]+$/.test(term)) {
+      searchWhere.push('(e.efr_name LIKE ? OR e.efr_no LIKE ? OR e.efr_id = ?)');
+      searchParams.push(like, like, Number(term));
+    } else {
+      searchWhere.push('(e.efr_name LIKE ? OR e.efr_no LIKE ?)');
+      searchParams.push(like, like);
+    }
+  }
+  const extraWhere = searchWhere.length ? ` AND ${searchWhere.join(' AND ')}` : '';
+
+  const baseParams = [pincodeVal, ...searchParams];
+
+  const [[{ total }]] = await pool.query(
+    `SELECT COUNT(DISTINCT e.efr_id) AS total
+       FROM tbl_efr_serviceable_pincodes sp
+       JOIN tbl_easyfixer e ON e.efr_id = sp.easyfixer_id
+                           AND e.efr_status = 1
+                           AND e.is_technician_verified = 1
+      WHERE FIND_IN_SET(?, sp.pincodes) > 0${extraWhere}`,
+    baseParams
+  );
+
+  const [rows] = await pool.query(
+    `SELECT e.efr_id,
+            e.efr_name,
+            e.efr_no,
+            MAX(c.city_name)  AS city_name,
+            MAX(zm.zone_name) AS zone_name
+       FROM tbl_efr_serviceable_pincodes sp
+       JOIN tbl_easyfixer e ON e.efr_id = sp.easyfixer_id
+                           AND e.efr_status = 1
+                           AND e.is_technician_verified = 1
+       LEFT JOIN tbl_city              c   ON c.city_id = e.efr_cityId
+       LEFT JOIN tbl_zone_city_mapping zcm ON zcm.city_zone_id = e.efr_zone_city_id
+       LEFT JOIN tbl_zone_master       zm  ON zm.zone_id = zcm.zone_id
+      WHERE FIND_IN_SET(?, sp.pincodes) > 0${extraWhere}
+      GROUP BY e.efr_id, e.efr_name, e.efr_no
+      ORDER BY e.efr_name ASC
+      LIMIT ? OFFSET ?`,
+    [...baseParams, limit, offset]
+  );
+
+  const items = rows.map((r) => ({
+    efr_id:    r.efr_id,
+    efr_name:  r.efr_name  ?? null,
+    efr_no:    r.efr_no    ?? null,
+    city_name: r.city_name ?? null,
+    zone_name: r.zone_name ?? null,
+  }));
+
+  return { items, total: Number(total) || 0 };
 }
 
 function deriveStatus(activeEfrCount) {
@@ -81,7 +174,9 @@ async function listPincodes({ q, status, cityId, includeInactive = false, limit 
         c.city_name,
         COALESCE(p.district, c.district) AS district,
         s.state_name,
-        p.pincode_status
+        p.pincode_status,
+        p.lat,
+        p.lng
        FROM tbl_pincode    p
        LEFT JOIN tbl_city  c ON c.city_id  = p.city_id
        LEFT JOIN tbl_state s ON s.state_id = c.state_id
@@ -114,6 +209,8 @@ async function listPincodes({ q, status, cityId, includeInactive = false, limit 
       is_active:        Number(r.pincode_status) === 1,
       status:           deriveStatus(activeCount),
       active_efr_count: activeCount,
+      lat:              r.lat != null ? Number(r.lat) : null,
+      lng:              r.lng != null ? Number(r.lng) : null,
     };
   });
 
@@ -276,4 +373,5 @@ module.exports = {
   createPincode,
   updatePincode,
   deletePincode,
+  listTechniciansForPincode,
 };
