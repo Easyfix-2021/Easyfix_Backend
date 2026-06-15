@@ -46,10 +46,11 @@ const service = require('../../../services/quicksight/quicksight-technician-perf
 const ACTION_KEY = 'isQuickSightTechnicianPerformanceView';
 
 // Full-set page size for ?format=xlsx — sized to the service's distinct-tech
-// safety cap (TECH_LIST_CAP = 50000) so a single page covers every matching
-// technician and the export's rows/KPIs/totals span the whole filtered set,
-// not just the on-screen page. The service logger.warns if its cap is hit.
-const FULL_SET_PAGE_SIZE = 50000;
+// safety cap (TECH_LIST_CAP) so a single page covers every matching technician
+// and the export's rows/KPIs/totals span the whole filtered set, not just the
+// on-screen page. Referenced symbolically so it can't drift from the cap; the
+// service logger.warns if its cap is hit.
+const FULL_SET_PAGE_SIZE = service.TECH_LIST_CAP;
 
 // Per-report access gate: ef-QuickSight family key + this report's own key.
 router.use(requireQuickSight(ACTION_KEY));

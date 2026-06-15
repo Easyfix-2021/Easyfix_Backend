@@ -793,6 +793,9 @@ module.exports = {
   managerTeam,
   verticalManagers,
   rmTeamUsers,
+  // Cap surfaced so the route's xlsx export can request the full set
+  // symbolically (avoids a hardcoded 5000 literal drifting from this cap).
+  USER_LIST_LIMIT,
   // exposed for testing / reuse
   _internals: { percentage, average, marginPercent, resolveDateMode, resolveClientScope },
 };

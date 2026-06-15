@@ -767,6 +767,9 @@ module.exports = {
   getTechnicianPerformance,
   getTxPerformanceCategoryWise,
   toXlsx,
+  // Cap surfaced so the route's xlsx export can request the full set
+  // symbolically (avoids a hardcoded 50000 literal drifting from this cap).
+  TECH_LIST_CAP,
   // Exposed for tests / reuse.
   buildPeriods,
   resolveRmScoping,

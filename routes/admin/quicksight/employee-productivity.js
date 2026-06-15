@@ -39,10 +39,10 @@ const { streamStyledXlsx } = require('../../../utils/xlsx-styled-export');
 const { fileStamp, displayStamp, FMT } = require('../../../services/quicksight/_shared');
 const service = require('../../../services/quicksight/quicksight-employee-productivity.service');
 
-// XLSX export fetches the FULL filtered set (not one page). High ceiling so the
-// download reflects every matching employee; aligns with the service's own
-// MAX_PAGE_SIZE warn threshold for grouped rows.
-const XLSX_EXPORT_SIZE = 5000;
+// XLSX export fetches the FULL filtered set (not one page). Sized to the
+// service's grouped-rows cap (GROUPED_CAP) so the download reflects every
+// matching employee — referenced symbolically so it can't drift from the cap.
+const XLSX_EXPORT_SIZE = service.GROUPED_CAP;
 
 // Per-report access gate: ef-QuickSight family key + this report's own key.
 router.use(requireQuickSight('isQuickSightEmployeeProductivityView'));

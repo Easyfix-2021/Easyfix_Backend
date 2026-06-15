@@ -8,7 +8,7 @@ const gallabox = require('./gallabox.whatsapp.service');
  * Runs once per day at 10:00 IST (see server/scheduler.js). For every
  * ACTIVE easyfixer whose profile is incomplete, sends a Gallabox
  * WhatsApp message using the pre-approved template
- * `complete_profile_easyfixer`. The template is a generic nudge — no
+ * `tx_complete_profile`. The template is a generic nudge — no
  * dynamic body values required from our side.
  *
  * "Incomplete profile" definition (verified against tbl_easyfixer
@@ -32,7 +32,7 @@ const gallabox = require('./gallabox.whatsapp.service');
  * still get their nudge.
  */
 
-const TEMPLATE_NAME = 'complete_profile_easyfixer';
+const TEMPLATE_NAME = 'tx_complete_profile';
 
 async function runDailyReminder() {
   // Find every active easyfixer with an incomplete profile + a

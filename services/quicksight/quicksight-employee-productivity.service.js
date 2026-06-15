@@ -949,4 +949,7 @@ module.exports = {
   getCancellationDetails,
   getReportingManagers,
   getRmTeamUsers,
+  // Cap surfaced so the route's xlsx export can request the full set
+  // symbolically (avoids a hardcoded 5000 literal drifting from this cap).
+  GROUPED_CAP,
 };

@@ -299,13 +299,14 @@ async function cityJobs(reqUser, filters = {}) {
 /*
  * copyData(reqUser, filters) — EXCEL export (job-level rows).
  *
- * !!! CRITICAL LEGACY QUIRK (PRESERVED VERBATIM, flagged to user) !!!
- * This query filters job_status IN (3,5,6,9) — COMPLETED(3,5), CANCELLED(6),
- * CALL_LATER(9) — i.e. CLOSED jobs. That is the OPPOSITE of the grid /
- * drill-down which show OPEN jobs (NOT IN 3,5,6,7,9). So the "Download Data"
- * Excel does NOT match the grid it sits under. This is almost certainly a
- * legacy bug, but per the migration faithfulness rule it is replicated
- * EXACTLY. See openQuestions in /tmp/qs/report-priorityJobs.json.
+ * Filter (CORRECTED 2026-06-15): job_status NOT IN (3,5,6,7,9) — i.e. OPEN
+ * jobs, matching the grid / drill-down exactly. The legacy query filtered
+ * job_status IN (3,5,6,9) (CLOSED jobs), so "Download Data" exported the
+ * OPPOSITE of the grid it sits under — a legacy bug. It was initially
+ * replicated verbatim under the migration-faithfulness rule, then corrected
+ * on user request so the export reflects the same OPEN jobs as the report.
+ * (The status_message CASE below already labels the OPEN statuses 0/1, which
+ * only now actually apply.)
  *
  * Age via FLOOR(TIMESTAMPDIFF(MINUTE, ...) / 1440.0). Appointment columns
  * combine date + time parts server-side, formatted dd-MM-yyyy HH:mm (IST).
@@ -367,7 +368,7 @@ async function copyData(reqUser, filters = {}) {
     LEFT JOIN tbl_user TU ON TU.user_id = TCY.state_user
     LEFT JOIN tbl_user TU1 ON TU1.user_id = TJ.job_client_owner
     LEFT JOIN tbl_client TC ON TC.client_id = TJ.fk_client_id
-    WHERE TJ.job_status IN (3, 5, 6, 9)${dim}${owner}
+    WHERE TJ.job_status NOT IN (3, 5, 6, 7, 9)${dim}${owner}
     ORDER BY TJ.job_id DESC
     LIMIT ?
   `;

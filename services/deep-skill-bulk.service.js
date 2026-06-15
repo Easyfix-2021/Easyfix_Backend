@@ -49,7 +49,9 @@ const deepSkillService = require('./deep-skill.service');
  *   - Plumbing row 3 is a literal template-noise row with cells equal to
  *     the schema column names ("service_catg_name" etc.). Detected and
  *     silently skipped.
- *   - Empty E (skill name) cells → silently skipped.
+ *   - Empty E (skill name) cells → reported as a "skip" row with reason "No
+ *     Skill Name" (2026-06-15; previously silently dropped, which made the
+ *     dry-run per-row count not reconcile to the sheet — e.g. 58 rows → 47).
  *   - Missing C or D when E is present → row reports a validation error.
  */
 

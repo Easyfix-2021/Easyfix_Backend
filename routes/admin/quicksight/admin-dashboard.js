@@ -147,7 +147,7 @@ router.post(
         // BE safety cap (USER_LIST_LIMIT=5000) so KPI cards, totalRow, and
         // data rows aggregate every matching employee. The JSON branch +
         // on-screen pagination below stay unchanged.
-        const fullResult = await service.employeeProductivity(req.body, 1, 5000);
+        const fullResult = await service.employeeProductivity(req.body, 1, service.USER_LIST_LIMIT);
         const rows = fullResult.data || [];
         const sum = (key) => rows.reduce((a, r) => a + (Number(r[key]) || 0), 0);
         const totalBooked = sum('booked');
