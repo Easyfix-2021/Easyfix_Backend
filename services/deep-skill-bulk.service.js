@@ -26,8 +26,14 @@ const deepSkillService = require('./deep-skill.service');
  *     transaction insert any missing categories / types / skills / options.
  *
  * Idempotency rules
- *   - Category & type lookups are case/whitespace-insensitive
- *     (LOWER(TRIM(...))). New rows only when no canonical match.
+ *   - Category lookup is case/whitespace-insensitive (LOWER(TRIM(...))).
+ *     Categories are NEVER auto-created from a bulk row (2026-06-15): a
+ *     row whose category does not already exist is SKIPPED with a clear
+ *     reason — we do not create the category, its service type, or the
+ *     deep skill. Ops must create categories explicitly via the catalogue
+ *     UI before bulk-uploading skills under them.
+ *   - Type lookup is case/whitespace-insensitive (LOWER(TRIM(...))). New
+ *     types ARE auto-created (only under an already-existing category).
  *   - Skill match key = (category_id, service_type_id, LOWER(TRIM(name))).
  *     A row that already exists → status = "skip" (no duplicate insert).
  *   - Option chips: inserted only if not already present for the skill (case-
@@ -176,7 +182,18 @@ function makeResolver() {
   return { cats, types };
 }
 
-async function resolveCategory(conn, cache, name, { create }) {
+/*
+ * Bulk category resolver (2026-06-15): EXISTING-ONLY.
+ *
+ * Unlike the single-add resolveCategoryByName() in deep-skill.service.js,
+ * the bulk path NEVER creates a category. A row referencing a category that
+ * doesn't already exist (case/whitespace-insensitive, not soft-deleted) is
+ * skipped by the caller with a clear reason — see the category-existence
+ * gate in the main loop. Returns `{ id, name }` on a hit, or `null` when no
+ * canonical match exists. Cached by LOWER(TRIM(name)); a miss caches `null`
+ * so repeat rows for the same bad name don't re-query.
+ */
+async function resolveExistingCategory(conn, cache, name) {
   const lc = name.toLowerCase();
   if (cache.cats.has(lc)) return cache.cats.get(lc);
 
@@ -189,31 +206,18 @@ async function resolveCategory(conn, cache, name, { create }) {
     [name],
   );
   if (row) {
-    // 2026-06-10: audit log so ops can spot reuse vs. fresh-create
-    // patterns post-bulk-upload.
+    // 2026-06-10: audit log so ops can spot reuse patterns post-bulk-upload.
     logger.info(
       `deep-skill: matched existing service_catg_id=${row.service_catg_id} for name="${name}" (case-insensitive)`,
     );
-    const out = { id: row.service_catg_id, name: row.service_catg_name, isNew: false };
+    const out = { id: row.service_catg_id, name: row.service_catg_name };
     cache.cats.set(lc, out);
     return out;
   }
 
-  if (!create) {
-    // Preview mode — record a synthetic pending id so the rest of the parse
-    // can keep referencing it, but mark it new and don't write.
-    const out = { id: null, name, isNew: true };
-    cache.cats.set(lc, out);
-    return out;
-  }
-
-  const [ins] = await conn.query(
-    `INSERT INTO tbl_service_catg (service_catg_name, service_catg_status) VALUES (?, 1)`,
-    [name],
-  );
-  const out = { id: ins.insertId, name, isNew: true };
-  cache.cats.set(lc, out);
-  return out;
+  // No match — cache the miss so the same bad name short-circuits.
+  cache.cats.set(lc, null);
+  return null;
 }
 
 async function resolveType(conn, cache, catId, name, { create }) {
@@ -367,14 +371,20 @@ async function processBuffer(buffer, { commit = false, actor = null } = {}) {
         continue;
       }
 
-      // Resolve / create category & type.
-      const cat = await resolveCategory(conn, cache, r.category, { create: commit });
-      if (cat.isNew) {
-        if (!created.categoriesNew.has(cat.name.toLowerCase())) {
-          created.categoriesNew.add(cat.name.toLowerCase());
-          if (commit) created.committedCategories.push({ id: cat.id, name: cat.name });
-        }
+      // Category-existence gate (2026-06-15). Bulk upload NEVER creates a
+      // category. A row whose category doesn't already exist is SKIPPED —
+      // we don't create the category, its service type, or the deep skill.
+      const cat = await resolveExistingCategory(conn, cache, r.category);
+      if (!cat) {
+        report.push({
+          ...base,
+          status: 'error',
+          errors: [`Category does not exist: "${r.category}"`],
+        });
+        continue;
       }
+
+      // Resolve / create service type (only under the existing category).
       const typ = await resolveType(conn, cache, cat.id, r.type, { create: commit });
       if (typ.isNew) {
         const tKey = `${cat.name.toLowerCase()}::${typ.name.toLowerCase()}`;

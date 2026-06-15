@@ -1,6 +1,8 @@
 const { pool } = require('../db');
+const logger = require('../logger');
 const settings = require('./settings.service');
 const jobService = require('./job.service');
+const geocode = require('./pincode-geocode.service');
 
 /*
  * Candidate ranking — single shared pipeline used by both:
@@ -115,6 +117,82 @@ async function resolveJSON(clientId, key) {
   } catch { return null; }
 }
 
+/*
+ * Resolve the job-pincode context used by the distance/tier computation:
+ *   { jobPin: '110001'|null, jobZoneId: <int>|null }
+ * jobZoneId comes from tbl_pincode.zone_id for the job PIN. Fail-soft —
+ * a missing PIN / unzoned PIN simply yields nulls (tier degrades to
+ * out_of_zone/unknown). Memo-light: called once per rank/search request.
+ */
+async function resolveJobPincodeContext(job) {
+  const jobPin = job.pin_code != null && /^[0-9]{6}$/.test(String(job.pin_code).trim())
+    ? String(job.pin_code).trim()
+    : null;
+  let jobZoneId = null;
+  if (jobPin) {
+    try {
+      const [[row]] = await pool.query(
+        'SELECT zone_id FROM tbl_pincode WHERE pincode = ? LIMIT 1',
+        [jobPin],
+      );
+      jobZoneId = row?.zone_id ?? null;
+    } catch (e) {
+      logger.warn({ err: e.message, jobPin }, 'candidate-ranking: job-pincode zone lookup failed');
+    }
+  }
+  return { jobPin, jobZoneId };
+}
+
+/*
+ * Compute distance_tier + the reference pincode used for the km calc.
+ *
+ *   Tier1 "same_pincode"    — a serviceable pincode == job pincode.
+ *                             Reference PIN = job pincode (km ≈ 0).
+ *   Tier2 "current_pincode" — efr_pin_no is set + comparable to job pincode.
+ *                             Reference PIN = efr_pin_no.
+ *   Tier3 "in_zone"         — a serviceable pincode sits in the job's zone.
+ *                             Reference PIN = that serviceable pincode.
+ *   else  "out_of_zone"     — none of the above but we have SOME reference
+ *                             PIN (efr_pin_no) to measure from.
+ *   "unknown"               — no comparable reference PIN at all.
+ *
+ * Returns { tier, refPin }. refPin is the tech-side PIN to geocode against
+ * the job pincode for the km value (null when unknown).
+ */
+function computeTierAndRefPin({ jobPin, jobZoneId, currentPincode, servPins, servPinZoneIds }) {
+  // Tier1 — serviceable contains the job pincode.
+  if (jobPin && servPins.includes(jobPin)) {
+    return { tier: 'same_pincode', refPin: jobPin };
+  }
+  // Tier2 — current pincode comparable to job pincode.
+  if (jobPin && currentPincode) {
+    return { tier: 'current_pincode', refPin: currentPincode };
+  }
+  // Tier3 — a serviceable pincode in the job's zone.
+  if (jobZoneId != null) {
+    const inZonePin = servPins.find((p) => servPinZoneIds.get(p) === jobZoneId);
+    if (inZonePin) return { tier: 'in_zone', refPin: inZonePin };
+  }
+  // Fallback — have a reference PIN but no tier match.
+  if (currentPincode) return { tier: 'out_of_zone', refPin: currentPincode };
+  if (servPins.length) return { tier: 'out_of_zone', refPin: servPins[0] };
+  return { tier: 'unknown', refPin: null };
+}
+
+/*
+ * Deep-skill 3-state. job-level skill requirement decides applicability.
+ *   - job has NO skill requirement      → 'both_available' (not-applicable).
+ *   - tech has ZERO active mappings      → 'easyfixer_skills_not_available'.
+ *   - tech has mappings but none match   → 'job_skill_not_available'.
+ *   - tech matches the job skill         → 'both_available'.
+ */
+function deepSkillStatus({ jobHasSkillReq, hasAnySkill, matchesJobSkill }) {
+  if (!jobHasSkillReq) return 'both_available';
+  if (!hasAnySkill) return 'easyfixer_skills_not_available';
+  if (!matchesJobSkill) return 'job_skill_not_available';
+  return 'both_available';
+}
+
 // ─── Layer 1: SQL eligibility ────────────────────────────────────────
 /*
  * Returns rows from tbl_easyfixer that pass active + verified + reject-history
@@ -195,8 +273,9 @@ async function statsForCandidates(efrIds, job, clientId) {
   // this as a per-candidate `has_deep_skill` flag so the modal can show
   // a check/X icon. Even when the fallback fires (zero matches), the
   // query still returns 0 rows — every candidate gets has_deep_skill=false.
+  const jobHasSkillReq = !!(job.fk_service_catg_id || job.fk_service_type_id);
   let deepSkillQuery;
-  if (job.fk_service_catg_id || job.fk_service_type_id) {
+  if (jobHasSkillReq) {
     let sql = `SELECT DISTINCT m.easyfixer_id AS efr_id
                  FROM tbl_efr_deepskill_mapping m
                 WHERE m.easyfixer_id IN (${placeholders})
@@ -209,6 +288,20 @@ async function statsForCandidates(efrIds, job, clientId) {
     // No skill criteria on the job — every tech trivially "matches".
     deepSkillQuery = Promise.resolve([efrIds.map((id) => ({ efr_id: id }))]);
   }
+
+  // For the 3-state deep_skill_status we also need to know which techs have
+  // ANY active deep-skill mapping at all (independent of THIS job's skill) —
+  // that separates "easyfixer has no skills on file" from "has skills, but
+  // none match this job".
+  const anySkillQuery = jobHasSkillReq
+    ? pool.query(
+        `SELECT DISTINCT m.easyfixer_id AS efr_id
+           FROM tbl_efr_deepskill_mapping m
+          WHERE m.easyfixer_id IN (${placeholders})
+            AND m.is_repairing = 1`,
+        [...efrIds],
+      )
+    : Promise.resolve([[]]);
 
   // Resolved settings + ALL per-tech stat queries fire in parallel.
   // Each query is independently `WHERE fk_easyfixter_id IN (...)` shaped, so
@@ -240,6 +333,11 @@ async function statsForCandidates(efrIds, job, clientId) {
     workedVerticalRowsResult,
     attRowsResult,
     deepSkillResult,
+    anySkillResult,
+    baseRowsResult,
+    servPinRowsResult,
+    concurrentRowsResult,
+    techZoneRowsResult,
   ] = await Promise.all([
     resolveInt(clientId,  'max_concurrent_jobs',  DEFAULTS.MAX_CONCURRENT_JOBS),
     resolveInt(clientId,  'default_rating_value', DEFAULTS.DEFAULT_RATING),
@@ -257,7 +355,8 @@ async function statsForCandidates(efrIds, job, clientId) {
       efrIds
     ),
 
-    // Time-slot conflicts (only if we have date+slot)
+    // Same-day + same-slot conflict (the HARD-FILTER signal). Scoped to the
+    // PROPOSED job date (reqDate) + slot, regardless of Max-Concurrent.
     reqDate && job.time_slot
       ? pool.query(
           `SELECT DISTINCT fk_easyfixter_id AS efr_id
@@ -333,17 +432,78 @@ async function statsForCandidates(efrIds, job, clientId) {
         )
       : Promise.resolve([[]]),
 
-    // Attendance marked today? Fail-soft if the table name differs.
-    pool.query(
-      `SELECT efr_id
-         FROM tbl_easyfixer_attendance
-        WHERE efr_id IN (${placeholders})
-          AND DATE(attendance_date) = CURDATE()`,
-      efrIds
-    ).catch(() => [[]]),
+    // Attendance for the JOB DATE — green tick ONLY when a row exists for
+    // DATE(jobDate) that marks the tech present. Canonical "present" def
+    // (matches services/easyfixer.service.js, verified against live DB):
+    //   (morning_slot = 1 OR evening_slot = 1) AND NOT on leave.
+    // FK is `easyfixer_id` and the date column is `created_on` (NOT
+    // efr_id/attendance_date — those don't exist on the live table). When
+    // reqDate is null (no schedule at all) nobody can be present → []. Future
+    // dates with no row also return [] → red cross, per the locked decision.
+    // Fail-soft: a schema/table mismatch yields [] (everyone red) rather than
+    // erroring the whole list.
+    reqDate
+      ? pool.query(
+          `SELECT DISTINCT easyfixer_id AS efr_id
+             FROM tbl_easyfixer_attendance
+            WHERE easyfixer_id IN (${placeholders})
+              AND DATE(created_on) = ?
+              AND (morning_slot = 1 OR evening_slot = 1)
+              AND (is_leave_marked IS NULL OR is_leave_marked = 0)`,
+          [...efrIds, reqDate]
+        ).catch((e) => { logger.warn({ err: e.message }, 'candidate-ranking: attendance-for-job-date query failed; treating all as absent'); return [[]]; })
+      : Promise.resolve([[]]),
 
     // Deep-skill match per tech (built above so the SQL stays readable).
     deepSkillQuery,
+
+    // Has ANY active deep-skill mapping (for the 3-state status).
+    anySkillQuery,
+
+    // Tech base fields — current pincode (efr_pin_no) + zone FK
+    // (efr_zone_city_id). efr_pin_no EXISTS on the physical table even
+    // though it's absent from the Java entity subset (locked decision).
+    pool.query(
+      `SELECT e.efr_id, e.efr_pin_no, e.efr_zone_city_id
+         FROM tbl_easyfixer e
+        WHERE e.efr_id IN (${placeholders})`,
+      efrIds
+    ),
+
+    // Serviceable pincodes — comma-separated TEXT per tech. Split to array
+    // by the caller. Fail-soft if the table is absent on this deploy.
+    pool.query(
+      `SELECT easyfixer_id AS efr_id, pincodes
+         FROM tbl_efr_serviceable_pincodes
+        WHERE easyfixer_id IN (${placeholders})`,
+      efrIds
+    ).catch((e) => { logger.warn({ err: e.message }, 'candidate-ranking: serviceable-pincodes query failed'); return [[]]; }),
+
+    // Concurrent jobs scoped to the PROPOSED job date (active statuses only).
+    reqDate
+      ? pool.query(
+          `SELECT fk_easyfixter_id AS efr_id, COUNT(*) AS cnt
+             FROM tbl_job
+            WHERE fk_easyfixter_id IN (${placeholders})
+              AND DATE(requested_date_time) = ?
+              AND job_status IN (0, 1, 2)
+            GROUP BY fk_easyfixter_id`,
+          [...efrIds, reqDate]
+        )
+      : Promise.resolve([[]]),
+
+    // Tech zone name via the canonical chain:
+    //   efr_zone_city_id → tbl_zone_city_mapping.city_zone_id → zone_id
+    //   → tbl_zone_master.zone_name.
+    // (Job-pincode zone is resolved separately in resolveJobPincodeContext.)
+    pool.query(
+      `SELECT e.efr_id, zm.zone_id, zm.zone_name
+         FROM tbl_easyfixer e
+         LEFT JOIN tbl_zone_city_mapping zcm ON zcm.city_zone_id = e.efr_zone_city_id
+         LEFT JOIN tbl_zone_master zm        ON zm.zone_id = zcm.zone_id
+        WHERE e.efr_id IN (${placeholders})`,
+      efrIds
+    ).catch((e) => { logger.warn({ err: e.message }, 'candidate-ranking: tech-zone query failed'); return [[]]; }),
   ]);
 
   // Build maps from the parallel results.
@@ -365,6 +525,79 @@ async function statsForCandidates(efrIds, job, clientId) {
   for (const r of (workedVerticalRowsResult[0] || [])) workedVerticalMap.set(r.efr_id, true);
   const attendanceMap = new Map((attRowsResult[0] || []).map((r) => [r.efr_id, true]));
   const deepSkillMap  = new Map((deepSkillResult[0] || []).map((r) => [r.efr_id, true]));
+  const anySkillMap   = new Map((anySkillResult[0] || []).map((r) => [r.efr_id, true]));
+
+  // Tech base fields — current pincode + zone FK.
+  const baseMap = new Map();
+  for (const r of (baseRowsResult[0] || [])) {
+    baseMap.set(r.efr_id, {
+      current_pincode: r.efr_pin_no != null && String(r.efr_pin_no).trim() !== '' ? String(r.efr_pin_no).trim() : null,
+      zone_city_id:    r.efr_zone_city_id ?? null,
+    });
+  }
+
+  // Serviceable pincodes — comma-separated TEXT → de-duped array of strings.
+  const servPinMap = new Map();
+  for (const r of (servPinRowsResult[0] || [])) {
+    const arr = String(r.pincodes ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => /^[0-9]{6}$/.test(s));
+    servPinMap.set(r.efr_id, [...new Set(arr)]);
+  }
+
+  // Concurrent jobs scoped to the proposed job date.
+  const concurrentMap = new Map((concurrentRowsResult[0] || []).map((r) => [r.efr_id, Number(r.cnt)]));
+
+  // Tech zone name (via efr_zone_city_id chain).
+  const techZoneMap = new Map();
+  for (const r of (techZoneRowsResult[0] || [])) {
+    techZoneMap.set(r.efr_id, { zone_id: r.zone_id ?? null, zone_name: r.zone_name ?? null });
+  }
+
+  // ── Distance / tier prep (job-level, computed once) ──────────────
+  // 1. Job-pincode context: job PIN + its zone_id (for Tier3 "in_zone").
+  const { jobPin, jobZoneId } = await resolveJobPincodeContext(job);
+
+  // 2. Zone_id for every distinct serviceable pincode across all techs — used
+  //    to decide Tier3. One batched lookup against tbl_pincode.
+  const allServPins = new Set();
+  for (const arr of servPinMap.values()) for (const p of arr) allServPins.add(p);
+  const servPinZoneIds = new Map(); // pincode → zone_id
+  if (allServPins.size) {
+    try {
+      const pins = [...allServPins];
+      const [rows] = await pool.query(
+        `SELECT pincode, zone_id FROM tbl_pincode WHERE pincode IN (${pins.map(() => '?').join(',')})`,
+        pins,
+      );
+      for (const r of rows) servPinZoneIds.set(String(r.pincode), r.zone_id ?? null);
+    } catch (e) {
+      logger.warn({ err: e.message }, 'candidate-ranking: serviceable-pincode zone batch lookup failed');
+    }
+  }
+
+  // 3. Pre-compute per-tech tier + reference PIN, then batch-geocode the job
+  //    PIN + every distinct reference PIN so the haversine has centroids.
+  const tierByTech = new Map();   // efr_id → { tier, refPin }
+  const pinsToGeocode = new Set();
+  if (jobPin) pinsToGeocode.add(jobPin);
+  for (const id of efrIds) {
+    const base = baseMap.get(id) || {};
+    const servPins = servPinMap.get(id) || [];
+    const tr = computeTierAndRefPin({
+      jobPin, jobZoneId,
+      currentPincode: base.current_pincode ?? null,
+      servPins,
+      servPinZoneIds,
+    });
+    tierByTech.set(id, tr);
+    if (tr.refPin) pinsToGeocode.add(tr.refPin);
+  }
+  // Batch geocode (cache-first; never blocks the list — missing centroids
+  // just yield distance_km = null).
+  const centroids = await geocode.getCentroids([...pinsToGeocode]);
+  const jobCentroid = jobPin ? (centroids.get(jobPin) ?? null) : null;
 
   // TAT target for THIS job — looks up tat_service_catg_tier JSON by
   // (service_catg_id, city tier). Shape expected (lenient parsing):
@@ -390,6 +623,29 @@ async function statsForCandidates(efrIds, job, clientId) {
   for (const id of efrIds) {
     const tatRow = tatMap.get(id);
     const sdaRow = sdaMap.get(id);
+    const base = baseMap.get(id) || {};
+    const servPins = servPinMap.get(id) || [];
+    const tr = tierByTech.get(id) || { tier: 'unknown', refPin: null };
+
+    // distance_km: haversine between job centroid + reference-PIN centroid.
+    // same_pincode collapses to ~0 (same PIN). Any missing centroid → null.
+    let distanceKm = null;
+    if (jobCentroid && tr.refPin) {
+      if (tr.tier === 'same_pincode') {
+        distanceKm = 0;
+      } else {
+        const refCentroid = centroids.get(tr.refPin) ?? null;
+        distanceKm = geocode.haversineKm(jobCentroid, refCentroid);
+      }
+    }
+
+    // Deep-skill 3-state + bool.
+    const matchesJobSkill = deepSkillMap.get(id) === true;
+    const hasAnySkill = jobHasSkillReq ? (anySkillMap.get(id) === true) : true;
+    const skillStatus = deepSkillStatus({ jobHasSkillReq, hasAnySkill, matchesJobSkill });
+
+    const techZone = techZoneMap.get(id) || {};
+
     out.set(id, {
       active_jobs:        activeMap.get(id) ?? 0,
       has_conflict:       conflictMap.get(id) === true,
@@ -401,12 +657,25 @@ async function statsForCandidates(efrIds, job, clientId) {
       worked_for_client:  workedClientMap.get(id) === true,
       worked_for_vertical:workedVerticalMap.get(id) === true,
       attendance_marked:  attendanceMap.get(id) === true,
-      has_deep_skill:     deepSkillMap.get(id) === true,
+      has_deep_skill:     matchesJobSkill,
       tat_target_hours:   tatTargetHours,
       max_concurrent:     maxConcurrent,
       // Defaults travel through to scoreOne so per-job overrides work.
       default_tat_score:  Number(defaultTatScore) || DEFAULTS.DEFAULT_TAT_SCORE,
       default_sda_score:  Number(defaultSdaScore) || DEFAULTS.DEFAULT_SDA_SCORE,
+
+      // ── Schedule & Assign widened fields ──
+      current_pincode:        base.current_pincode ?? null,
+      serviceable_pincodes:   servPins,
+      zone_name:              techZone.zone_name ?? null,
+      distance_km:            distanceKm == null ? null : Number(distanceKm.toFixed(1)),
+      distance_tier:          tr.tier,
+      attendance_for_job_date: attendanceMap.get(id) === true,
+      deep_skill_status:      skillStatus,
+      deep_skill_match:       matchesJobSkill,
+      worked_in_category:     workedVerticalMap.get(id) === true,
+      concurrent_jobs_count:  concurrentMap.get(id) ?? 0,
+      same_slot_conflict:     conflictMap.get(id) === true,
     });
   }
   return out;
@@ -467,6 +736,70 @@ function scoreOne({ avg_rating, avg_tat_hours, tat_history,
   };
 }
 
+// ─── Shared candidate-row builder ─────────────────────────────────────
+/*
+ * Builds ONE widened candidate row from a tech profile + its stats entry.
+ * Used by BOTH rankCandidatesForJob (top-10) and searchTechniciansForJob
+ * (match-anyone) so the column shape is identical across the two surfaces.
+ *
+ *   tech  — { efr_id, efr_name, efr_no, efr_email, city_name, current_balance }
+ *   s     — the stats entry from statsForCandidates() for this efr_id
+ *   job   — the job row (for payment_mode label)
+ */
+function buildCandidateRow(tech, s, job) {
+  const out = scoreOne({
+    avg_rating:          s.avg_rating,
+    avg_tat_hours:       s.avg_tat_hours,
+    tat_history:         s.tat_history,
+    sda_rate:            s.sda_rate,
+    sda_history:         s.sda_history,
+    worked_for_client:   s.worked_for_client,
+    worked_for_vertical: s.worked_for_vertical,
+    attendance_marked:   s.attendance_marked,
+    tat_target_hours:    s.tat_target_hours,
+    default_tat_score:   s.default_tat_score,
+    default_sda_score:   s.default_sda_score,
+  });
+  return {
+    efr_id:        tech.efr_id,
+    efr_name:      tech.efr_name,
+    efr_no:        tech.efr_no,
+    // `mobile` mirrors efr_no — masked automatically by middleware/mask-mobile.
+    mobile:        tech.efr_no,
+    efr_email:     tech.efr_email,
+    city_name:     tech.city_name,
+    current_balance: Number(tech.current_balance ?? 0),
+    account_balance: Number(tech.current_balance ?? 0),
+    active_jobs:   s.active_jobs,
+    avg_rating:    Number((s.avg_rating ?? 0).toFixed(2)),
+    avg_tat_hours: s.avg_tat_hours == null ? null : Number(s.avg_tat_hours.toFixed(1)),
+    tat_history:   s.tat_history,
+    sda_rate:      s.sda_rate == null ? null : Number(s.sda_rate.toFixed(2)),
+    sda_history:   s.sda_history,
+    worked_for_client:   s.worked_for_client,
+    worked_for_vertical: s.worked_for_vertical,
+    has_deep_skill:      s.has_deep_skill,
+    // ── Schedule & Assign widened columns ──
+    current_pincode:        s.current_pincode ?? null,
+    zone_name:              s.zone_name ?? null,
+    serviceable_pincodes:   s.serviceable_pincodes ?? [],
+    distance_km:            s.distance_km ?? null,
+    distance_tier:          s.distance_tier ?? 'unknown',
+    attendance_for_job_date: s.attendance_for_job_date === true,
+    deep_skill_status:      s.deep_skill_status ?? 'both_available',
+    deep_skill_match:       s.deep_skill_match === true,
+    worked_in_category:     s.worked_in_category === true,
+    payment_mode:           paidByLabel(job.paid_by),
+    concurrent_jobs_count:  s.concurrent_jobs_count ?? 0,
+    same_slot_conflict:     s.same_slot_conflict === true,
+    // ── Existing score/grade fields ──
+    score:        Number(out.total.toFixed(4)),
+    performance:  Number(out.performance.toFixed(4)),
+    grade:        out.grade,
+    breakdown:    Object.fromEntries(Object.entries(out.breakdown).map(([k, v]) => [k, Number(Number(v).toFixed(3))])),
+  };
+}
+
 // ─── Public entrypoint ───────────────────────────────────────────────
 /*
  * Returns:
@@ -481,14 +814,46 @@ function scoreOne({ avg_rating, avg_tat_hours, tat_history,
  *
  * Each candidate row carries everything the modal needs: name, location,
  * active_jobs, efr_balance, per-signal sub-scores, total score, grade.
+ *
+ * Options:
+ *   limit     — top-N cap (default 10 for the Schedule & Assign modal).
+ *   jobDate   — ISO override of the job's requested_date_time. When the ops
+ *               user edits the schedule in section (a), the FE re-requests
+ *               with the proposed date so attendance / concurrent / same-slot
+ *               recompute against the PROPOSED schedule.
+ *   timeSlot  — slot override (paired with jobDate).
+ * Both default to the job row's requested_date_time / time_slot when omitted.
+ *
+ *   enforceMaxConcurrent — hard-exclude techs at/over Max-Concurrent-Jobs.
+ *                          DEFAULT true (preserves legacy auto-assign
+ *                          behaviour). The Schedule & Assign modal passes
+ *                          FALSE — per the contract, concurrent count is a
+ *                          DISPLAYED column there, not a hard filter.
+ *   enforceCodBalance    — hard-exclude techs with balance <= floor when the
+ *                          job is COD. DEFAULT false (legacy auto-assign
+ *                          applies the floor POST-rank via
+ *                          pickAutoAssignCandidate, not as a ranked-list
+ *                          exclude). The Schedule & Assign modal passes TRUE.
+ * The same-day + same-slot conflict is ALWAYS a hard exclude (unchanged).
  */
-async function rankCandidatesForJob(jobId, { limit = 50 } = {}) {
+async function rankCandidatesForJob(jobId, {
+  limit = 10, jobDate, timeSlot,
+  enforceMaxConcurrent = true, enforceCodBalance = false,
+} = {}) {
   const job = await jobService.getById(jobId);
   if (!job) {
     const err = new Error('job not found'); err.status = 404; throw err;
   }
   const alreadyAssigned = !!job.fk_easyfixter_id;
   const assignedEfrId = alreadyAssigned ? Number(job.fk_easyfixter_id) : null;
+
+  // Apply proposed-schedule overrides so attendance / concurrent / same-slot
+  // (computed in statsForCandidates against job.requested_date_time +
+  // job.time_slot) recompute against what the ops user is about to set. When
+  // omitted, fall back to the job's current schedule. dateStrings:true keeps
+  // the value as the IST literal; slice to date-only for DATE() comparisons.
+  if (jobDate) job.requested_date_time = jobDate;
+  if (timeSlot !== undefined && timeSlot !== null && timeSlot !== '') job.time_slot = timeSlot;
 
   /*
    * Resolve human labels for the job's service category + type so the
@@ -527,62 +892,35 @@ async function rankCandidatesForJob(jobId, { limit = 50 } = {}) {
 
   const stats = await statsForCandidates(eligible.map((e) => e.efr_id), job, job.fk_client_id);
 
+  // COD = customer pays the tech on-site (paid_by = Customer). Such techs
+  // need cash on hand → optionally hard-filter balance > floor.
+  const isCod = paidByIsCustomer(job.paid_by);
+  const balanceFloor = DEFAULTS.ACCOUNT_BALANCE_FLOOR;
+
+  // ── HARD FILTERS (exclude before ranking) ──
+  //   1. active + verified                 (already enforced by l1Eligibility)
+  //   2. NOT same-day + same-slot booked    (ALWAYS — regardless of options)
+  //   3. at/over Max-Concurrent             (only when enforceMaxConcurrent)
+  //   4. COD → account balance > floor      (only when enforceCodBalance)
+  // The Schedule & Assign modal passes enforceMaxConcurrent:false +
+  // enforceCodBalance:true (so concurrent is a displayed column + COD is a
+  // hard floor); auto-assign keeps the legacy defaults.
   const scored = [];
   const rejected = [];
   for (const e of eligible) {
     const s = stats.get(e.efr_id);
 
-    // L2 — availability
-    if (s.active_jobs >= s.max_concurrent) {
+    if (s.same_slot_conflict) {
+      rejected.push({ efr_id: e.efr_id, efr_name: e.efr_name, reason: 'already booked same day + same slot' }); continue;
+    }
+    if (enforceMaxConcurrent && s.active_jobs >= s.max_concurrent) {
       rejected.push({ efr_id: e.efr_id, efr_name: e.efr_name, reason: `saturated (${s.active_jobs} active jobs)` }); continue;
     }
-    if (s.has_conflict) {
-      rejected.push({ efr_id: e.efr_id, efr_name: e.efr_name, reason: 'time-slot conflict on requested date' }); continue;
+    if (enforceCodBalance && isCod && Number(e.current_balance ?? 0) <= balanceFloor) {
+      rejected.push({ efr_id: e.efr_id, efr_name: e.efr_name, reason: `COD job: balance ${Number(e.current_balance ?? 0)} <= ${balanceFloor}` }); continue;
     }
 
-    // Workload removed from scoring — Max Concurrent Jobs already filters
-    // saturated techs at L2, so a workload kicker would double-count.
-    const out = scoreOne({
-      avg_rating:          s.avg_rating,
-      avg_tat_hours:       s.avg_tat_hours,
-      tat_history:         s.tat_history,
-      sda_rate:            s.sda_rate,
-      sda_history:         s.sda_history,
-      worked_for_client:   s.worked_for_client,
-      worked_for_vertical: s.worked_for_vertical,
-      attendance_marked:   s.attendance_marked,
-      tat_target_hours:    s.tat_target_hours,
-      default_tat_score:   s.default_tat_score,
-      default_sda_score:   s.default_sda_score,
-    });
-
-    // Balance is informational — NOT used to sort or filter the ranked list.
-    // pickAutoAssignCandidate() applies the floor at commit time when the
-    // job's paid_by = 'customer'; manual operators see the value and decide.
-    const balance = Number(e.current_balance ?? 0);
-
-    scored.push({
-      efr_id:        e.efr_id,
-      efr_name:      e.efr_name,
-      efr_no:        e.efr_no,
-      efr_email:     e.efr_email,
-      city_name:     e.city_name,
-      current_balance: balance,
-      active_jobs:   s.active_jobs,
-      avg_rating:    Number((s.avg_rating ?? 0).toFixed(2)),
-      avg_tat_hours: s.avg_tat_hours == null ? null : Number(s.avg_tat_hours.toFixed(1)),
-      tat_history:   s.tat_history,
-      sda_rate:      s.sda_rate == null ? null : Number(s.sda_rate.toFixed(2)),
-      sda_history:   s.sda_history,
-      worked_for_client:   s.worked_for_client,
-      worked_for_vertical: s.worked_for_vertical,
-      attendance_marked:   s.attendance_marked,
-      has_deep_skill:      s.has_deep_skill,
-      score:        Number(out.total.toFixed(4)),
-      performance:  Number(out.performance.toFixed(4)),
-      grade:        out.grade,
-      breakdown:    Object.fromEntries(Object.entries(out.breakdown).map(([k, v]) => [k, Number(Number(v).toFixed(3))])),
-    });
+    scored.push(buildCandidateRow(e, s, job));
   }
 
   // Pure ranking sort: highest score first. Balance is shown as a column;
@@ -665,43 +1003,7 @@ async function ensureAssignedFirst(candidatesList, assignedEfrId, job, scoredAll
 
   const stats = await statsForCandidates([assignedEfrId], job, job.fk_client_id);
   const s = stats.get(assignedEfrId);
-  const out = scoreOne({
-    avg_rating:          s.avg_rating,
-    avg_tat_hours:       s.avg_tat_hours,
-    tat_history:         s.tat_history,
-    sda_rate:            s.sda_rate,
-    sda_history:         s.sda_history,
-    worked_for_client:   s.worked_for_client,
-    worked_for_vertical: s.worked_for_vertical,
-    attendance_marked:   s.attendance_marked,
-    tat_target_hours:    s.tat_target_hours,
-    default_tat_score:   s.default_tat_score,
-    default_sda_score:   s.default_sda_score,
-  });
-
-  const assignedRow = {
-    efr_id:        techRow.efr_id,
-    efr_name:      techRow.efr_name,
-    efr_no:        techRow.efr_no,
-    efr_email:     techRow.efr_email,
-    city_name:     techRow.city_name,
-    current_balance: Number(techRow.current_balance ?? 0),
-    active_jobs:   s.active_jobs,
-    avg_rating:    Number((s.avg_rating ?? 0).toFixed(2)),
-    avg_tat_hours: s.avg_tat_hours == null ? null : Number(s.avg_tat_hours.toFixed(1)),
-    tat_history:   s.tat_history,
-    sda_rate:      s.sda_rate == null ? null : Number(s.sda_rate.toFixed(2)),
-    sda_history:   s.sda_history,
-    worked_for_client:   s.worked_for_client,
-    worked_for_vertical: s.worked_for_vertical,
-    attendance_marked:   s.attendance_marked,
-    has_deep_skill:      s.has_deep_skill,
-    score:        Number(out.total.toFixed(4)),
-    performance:  Number(out.performance.toFixed(4)),
-    grade:        out.grade,
-    breakdown:    Object.fromEntries(Object.entries(out.breakdown).map(([k, v]) => [k, Number(Number(v).toFixed(3))])),
-    is_current:   true,
-  };
+  const assignedRow = { ...buildCandidateRow(techRow, s, job), is_current: true };
   return [assignedRow, ...candidatesList];
 }
 
@@ -772,8 +1074,85 @@ function pickAutoAssignCandidate(rankResult, { paidBy, balanceFloor = DEFAULTS.A
   return { candidate: list[0], reason: 'top_rank_low_balance', low_balance: true };
 }
 
+// ─── Search anyone (assign-anyone path) ───────────────────────────────
+/*
+ * searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit })
+ *
+ * Powers GET /api/admin/jobs/:id/candidates/search. Matches ANY technician
+ * by efr_id / efr_name / efr_no(mobile) — NO top-10 hard filters, NO
+ * ranking-based exclusion — so ops can assign anyone. Returns the SAME
+ * widened row shape as the ranked list (reuses statsForCandidates +
+ * buildCandidateRow), so every computed column (distance, attendance,
+ * concurrent, skill state, …) is consistent across both surfaces.
+ *
+ * Cap (default 50) + logger.warn when the raw match count hits the cap, so
+ * a too-broad term is observable in logs (the operator should refine).
+ */
+async function searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit = 50 } = {}) {
+  const job = await jobService.getById(jobId);
+  if (!job) {
+    const err = new Error('job not found'); err.status = 404; throw err;
+  }
+  const cap = Math.min(Math.max(Number(limit) || 50, 1), 50);
+
+  // Proposed-schedule overrides (same contract as rankCandidatesForJob).
+  if (jobDate) job.requested_date_time = jobDate;
+  if (timeSlot !== undefined && timeSlot !== null && timeSlot !== '') job.time_slot = timeSlot;
+
+  const q = String(term ?? '').trim();
+  if (!q) return { job: searchJobHeader(job), candidates: [], capped: false };
+
+  // Match by name / mobile (efr_no) always; by efr_id only when the term is
+  // a pure integer. capLookup = cap + 1 so we can detect "hit the cap".
+  const like = `%${q}%`;
+  const params = [like, like];
+  let idClause = '';
+  if (/^[0-9]+$/.test(q)) {
+    idClause = ' OR e.efr_id = ?';
+    params.push(Number(q));
+  }
+  const [techRows] = await pool.query(
+    `SELECT e.efr_id, e.efr_name, e.efr_no, e.efr_email,
+            e.efr_cityId, c.city_name, e.current_balance
+       FROM tbl_easyfixer e
+       LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId
+      WHERE (e.efr_name LIKE ? OR e.efr_no LIKE ?${idClause})
+      ORDER BY e.efr_name ASC
+      LIMIT ?`,
+    [...params, cap + 1],
+  );
+
+  const capped = techRows.length > cap;
+  if (capped) {
+    logger.warn({ jobId, term: q, cap }, 'searchTechniciansForJob: result set hit the cap — term too broad');
+  }
+  const rows = techRows.slice(0, cap);
+  if (rows.length === 0) return { job: searchJobHeader(job), candidates: [], capped };
+
+  const stats = await statsForCandidates(rows.map((r) => r.efr_id), job, job.fk_client_id);
+  const candidates = rows.map((r) => buildCandidateRow(r, stats.get(r.efr_id), job));
+
+  return { job: searchJobHeader(job), candidates, capped };
+}
+
+// Compact job header reused by the search response.
+function searchJobHeader(job) {
+  return {
+    job_id: job.job_id,
+    fk_client_id: job.fk_client_id,
+    city_id: job.city_id,
+    city_name: job.city_name,
+    pin_code: job.pin_code,
+    requested_date_time: job.requested_date_time,
+    time_slot: job.time_slot,
+    paid_by: job.paid_by ?? null,
+    paid_by_label: paidByLabel(job.paid_by),
+  };
+}
+
 module.exports = {
   rankCandidatesForJob,
+  searchTechniciansForJob,
   pickAutoAssignCandidate,
   SCORE_WEIGHTS,
   PERFORMANCE_SUB,

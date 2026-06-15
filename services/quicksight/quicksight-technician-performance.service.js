@@ -433,7 +433,7 @@ async function getAttendance(txIds) {
             is_leave_marked,
             morning_slot,
             evening_slot
-       FROM tbl_attendance
+       FROM tbl_easyfixer_attendance
       WHERE easyfixer_id IN (${inFrag})
         AND created_on >= CURDATE()
         AND created_on < DATE_ADD(CURDATE(), INTERVAL 2 DAY)`;

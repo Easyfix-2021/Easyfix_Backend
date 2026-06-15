@@ -92,6 +92,28 @@ async function resolveCategoryByName(runner, name) {
   return { id: ins.insertId, name: trimmed, isNew: true };
 }
 
+/*
+ * Existing-only category lookup (2026-06-15). Like resolveCategoryByName
+ * but NEVER inserts — returns `{ id, name }` on a case/whitespace-
+ * insensitive match (status <> 3), or `null` when no canonical row
+ * exists. Used by the single-add create() path, which rejects unknown
+ * categories with a 400 instead of silently creating one.
+ */
+async function resolveExistingCategoryByName(runner, name) {
+  const trimmed = String(name || '').trim();
+  if (!trimmed) throw Object.assign(new Error('category name required'), { status: 400 });
+  const [[row]] = await runner.query(
+    `SELECT service_catg_id, service_catg_name
+       FROM tbl_service_catg
+      WHERE LOWER(TRIM(service_catg_name)) = LOWER(TRIM(?))
+        AND service_catg_status <> 3
+      LIMIT 1`,
+    [trimmed],
+  );
+  if (!row) return null;
+  return { id: row.service_catg_id, name: row.service_catg_name };
+}
+
 async function resolveServiceTypeByName(runner, categoryId, name) {
   const trimmed = String(name || '').trim();
   if (!trimmed) throw Object.assign(new Error('service type name required'), { status: 400 });
@@ -217,22 +239,73 @@ async function getById(deepskillId) {
 
 async function create(input, actor) {
   /*
-   * Case-insensitive resolution (2026-06-10). If the caller passes a
-   * `category_name` / `service_type_name` instead of (or in addition to)
-   * the numeric id, look up the existing row by name (case +
-   * whitespace insensitive) before creating a new one. Numeric ids
-   * still take precedence when both are provided. Prevents duplicate
-   * "Plumbing" / "plumbing" rows from the legacy always-create flow.
+   * Category must already EXIST (2026-06-15). Single-add no longer
+   * auto-creates a category. The modal sends `category_id` straight from
+   * the lookup dropdown (existing categories only), so the common path
+   * just validates that the id resolves to a live (status <> 3) row. The
+   * legacy name-based create-category fallback is intentionally REMOVED
+   * here — passing a `category_name` that doesn't match an existing row is
+   * a 400, not a silent create. (Bulk upload skips such rows; see
+   * deep-skill-bulk.service.js.)
+   *
+   * Service type may still be resolved-or-created by name under the
+   * existing category — that auto-create behaviour is unchanged.
    */
   let categoryId    = input.category_id;
   let serviceTypeId = input.service_type_id;
   if (!categoryId && input.category_name) {
-    const cat = await resolveCategoryByName(pool, input.category_name);
+    const cat = await resolveExistingCategoryByName(pool, input.category_name);
+    if (!cat) {
+      const e = new Error('Service category does not exist');
+      e.status = 400;
+      throw e;
+    }
     categoryId = cat.id;
+  }
+  if (categoryId) {
+    const [[catRow]] = await pool.query(
+      `SELECT service_catg_id FROM tbl_service_catg
+        WHERE service_catg_id = ? AND service_catg_status <> 3 LIMIT 1`,
+      [categoryId],
+    );
+    if (!catRow) {
+      const e = new Error('Service category does not exist');
+      e.status = 400;
+      throw e;
+    }
   }
   if (!serviceTypeId && input.service_type_name && categoryId) {
     const typ = await resolveServiceTypeByName(pool, categoryId, input.service_type_name);
     serviceTypeId = typ.id;
+  }
+
+  /*
+   * Duplicate-name UPSERT (2026-06-15). If a deep skill with the SAME
+   * name already exists under the SAME natural key (category_id +
+   * service_type_id + LOWER(TRIM(name))), this is treated as an edit:
+   * route to update() instead of inserting a second row. update()
+   * already handles description / tag_words / status / image plus the
+   * auto-gen pipeline; options are synced below via the same per-option
+   * resolver the add-after-create flow uses (case-insensitive reuse,
+   * reactivates soft-deleted matches). Logged at info level so the
+   * implicit update is auditable.
+   */
+  if (categoryId && serviceTypeId && input.deepskill_name) {
+    const [[dupe]] = await pool.query(
+      `SELECT deepskill_id FROM tbl_deep_skill
+        WHERE category_id = ?
+          AND service_type_id = ?
+          AND LOWER(TRIM(deepskill_name)) = LOWER(TRIM(?))
+        LIMIT 1`,
+      [categoryId, serviceTypeId, input.deepskill_name],
+    );
+    if (dupe) {
+      logger.info(
+        { deepskillId: dupe.deepskill_id, categoryId, serviceTypeId },
+        `deep-skill: duplicate name "${String(input.deepskill_name).trim()}" under same category+type — updating existing skill id=${dupe.deepskill_id} instead of inserting`,
+      );
+      return updateExistingDuplicate(dupe.deepskill_id, input);
+    }
   }
 
   /*
@@ -430,6 +503,57 @@ async function update(deepskillId, patch) {
     }
   } catch (err) {
     logger.warn({ err, deepskillId }, 'deep-skill: auto-gen dispatch failed post-update (non-fatal)');
+  }
+
+  return getById(deepskillId);
+}
+
+/*
+ * Duplicate-name UPSERT tail (2026-06-15). Called from create() when a
+ * skill with the same name already exists under the same category+type.
+ * Reuses update() for the scalar columns (description / tag_words /
+ * image / status) — which also drives the auto-gen pipeline — then syncs
+ * the option set via the same case-insensitive resolver the add-after-
+ * create flow uses (reactivates soft-deleted matches; never inserts a
+ * duplicate chip). Returns the refreshed record exactly like create().
+ *
+ * Only patches columns the caller actually supplied: an upsert that omits
+ * `deepskill_description` must NOT blank an existing one, so we forward a
+ * field only when it's present on the input. status is forced to 1 — a
+ * re-add of an existing (possibly soft-deleted) skill reactivates it,
+ * mirroring the option reactivation below and the status=1 default a
+ * fresh insert would get.
+ */
+async function updateExistingDuplicate(deepskillId, input) {
+  const patch = { status: 1 };
+  if (input.deepskill_description !== undefined) {
+    patch.deepskill_description = input.deepskill_description || null;
+  }
+  if (input.deepskill_tag_words !== undefined) {
+    patch.deepskill_tag_words = input.deepskill_tag_words || null;
+  }
+  // Only forward a canonical image key; the modal sends '' / a placeholder
+  // when nothing was picked, and we must not wipe an existing image then.
+  if (input.deepskill_image) {
+    patch.deepskill_image = input.deepskill_image;
+  }
+  await update(deepskillId, patch);
+
+  // Sync options — case-insensitive reuse, reactivates soft-deleted chips.
+  const rawOptions = Array.isArray(input.options) ? input.options : [];
+  const seen = new Set();
+  for (const o of rawOptions) {
+    const trimmed = String(o?.skill_option || '').trim();
+    if (!trimmed) continue;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    await resolveSkillOptionByName(pool, deepskillId, trimmed);
+  }
+  if (seen.size > 0) {
+    await syncSkillOptionsJson(deepskillId).catch((err) => {
+      logger.warn({ err, deepskillId }, 'deep-skill: syncSkillOptionsJson failed on duplicate-name update (non-fatal)');
+    });
   }
 
   return getById(deepskillId);
@@ -979,6 +1103,7 @@ module.exports = {
   getImageUrl,
   resolveImageUrlFromKey,
   resolveCategoryByName,
+  resolveExistingCategoryByName,
   resolveServiceTypeByName,
   resolveSkillOptionByName,
   // 2026-06-11:

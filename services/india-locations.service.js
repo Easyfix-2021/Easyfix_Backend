@@ -582,6 +582,7 @@ async function runSeed({
         office_name: place || null,
         district:    place || null,
         state_name:  state,
+        ...parseLatLng(cells, colMap),
       };
     } else {
       row = {
@@ -589,6 +590,7 @@ async function runSeed({
         office_name: colMap.office_name != null ? (cells[colMap.office_name] || '').trim() : null,
         district:    colMap.district    != null ? (cells[colMap.district]    || '').trim() : null,
         state_name:  (cells[colMap.state_name] || '').trim(),
+        ...parseLatLng(cells, colMap),
       };
     }
     if (!isValidRow(row)) { stats.rows_invalid += 1; continue; }
@@ -603,6 +605,8 @@ async function runSeed({
       cityId,
       row.district || null,
       1,
+      row.lat,
+      row.lng,
     ]);
     if (pincodeBuffer.length >= BATCH) {
       checkCancel();
@@ -936,6 +940,21 @@ function computeRemark(createdDate, seededAt, updatedDate = null, viewBaselineAt
  *      `place_name` as both office_name AND district (since this CSV
  *      doesn't carry a district column). `admin_name1` is the state.
  */
+/*
+ * Parse latitude/longitude cells into finite numbers (or null). India lat
+ * is ~6–37, lng ~68–97 — we accept any finite value and let bad rows fall
+ * to null rather than rejecting (lat/lng is optional metadata, never the
+ * reason to skip a pincode). Returns { lat, lng }.
+ */
+function parseLatLng(cells, colMap) {
+  const lat = colMap.latitude  != null ? parseFloat(cells[colMap.latitude])  : NaN;
+  const lng = colMap.longitude != null ? parseFloat(cells[colMap.longitude]) : NaN;
+  return {
+    lat: Number.isFinite(lat) ? lat : null,
+    lng: Number.isFinite(lng) ? lng : null,
+  };
+}
+
 function buildColMap(headerLine) {
   const headers = parseCsvLine(headerLine).map(
     (h) => h.trim().toLowerCase().replace(/[^a-z]/g, ''),
@@ -951,6 +970,12 @@ function buildColMap(headerLine) {
     else if (map.key == null && h === 'key') map.key = i;
     else if (map.place_name == null && (h === 'placename' || h === 'place')) map.place_name = i;
     else if (map.admin_name1 == null && (h === 'adminname' || h === 'adminname')) map.admin_name1 = i;
+    // Geo coordinates (GeoNames CSV ships `latitude`,`longitude`; some
+    // other sources use lat/lng/lon). Captured to populate tbl_pincode
+    // lat/lng for the Schedule & Assign distance feature — no Google
+    // geocoding needed for seeded pincodes.
+    else if (map.latitude == null && (h === 'latitude' || h === 'lat')) map.latitude = i;
+    else if (map.longitude == null && (h === 'longitude' || h === 'lng' || h === 'lon' || h === 'long')) map.longitude = i;
   }
   // Be tolerant of `admin_name1` (with the digit) — `replace(/[^a-z]/g, '')`
   // strips the trailing 1, so the literal lookup is already covered above.
@@ -1176,16 +1201,18 @@ async function flushPincodes(buf, stats) {
    * So: updates = changedRows, inserts = affectedRows - 2*updates,
    *     unchanged_dupes = buf.length - inserts - updates.
    */
-  const placeholders = buf.map(() => '(?,?,?,?,?)').join(',');
+  const placeholders = buf.map(() => '(?,?,?,?,?,?,?)').join(',');
   const flat = [];
   for (const r of buf) flat.push(...r);
   const [r] = await pool.query(
-    `INSERT INTO tbl_pincode (pincode, location, city_id, district, pincode_status)
+    `INSERT INTO tbl_pincode (pincode, location, city_id, district, pincode_status, lat, lng)
        VALUES ${placeholders}
      ON DUPLICATE KEY UPDATE
        location = IF(COALESCE(tbl_pincode.location, '') = '', VALUES(location), tbl_pincode.location),
        city_id  = IF(COALESCE(tbl_pincode.city_id,  0)  = 0,   VALUES(city_id),  tbl_pincode.city_id),
-       district = IF(COALESCE(tbl_pincode.district, '') = '', VALUES(district), tbl_pincode.district)`,
+       district = IF(COALESCE(tbl_pincode.district, '') = '', VALUES(district), tbl_pincode.district),
+       lat      = IF(tbl_pincode.lat IS NULL, VALUES(lat), tbl_pincode.lat),
+       lng      = IF(tbl_pincode.lng IS NULL, VALUES(lng), tbl_pincode.lng)`,
     flat,
   );
   /*

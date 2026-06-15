@@ -2453,7 +2453,22 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
 }
 
 // ─── Assign / Reassign technician ───────────────────────────────────
-async function assign(jobId, { easyfixerId, reasonId, rescheduleReason }, actor) {
+/*
+ * assign(jobId, body, actor)
+ *
+ * body:
+ *   easyfixerId       — tech to assign (required)
+ *   reasonId          — reschedule reason FK (reassign only)
+ *   rescheduleReason  — free-text reschedule reason (reassign only)
+ *   requestedDateTime — OPTIONAL new requested datetime. When present, the
+ *                       job's schedule is edited IN THE SAME TRANSACTION as
+ *                       the assign (the "Schedule & Assign" atomic flow).
+ *   timeSlot          — OPTIONAL new time slot, paired with requestedDateTime.
+ *
+ * When requestedDateTime/timeSlot are omitted the assign behaviour + webhooks
+ * are unchanged.
+ */
+async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requestedDateTime, timeSlot }, actor) {
   // Check tech + job in parallel — they're independent lookups. Fails either
   // way with the right 400/404, same as before, but cuts one round-trip.
   const [[[tech]], existing] = await Promise.all([
@@ -2473,6 +2488,27 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason }, actor)
     const err = new Error('job not found'); err.status = 404; throw err;
   }
 
+  // Normalise the optional schedule edit. Only when requestedDateTime is
+  // supplied do we touch the job's date/time columns. time_slot is paired
+  // (only written when a non-empty value is provided).
+  const editSchedule = requestedDateTime != null && requestedDateTime !== '';
+  // requestedDateTime is an IST WALL-CLOCK string (datetime-local
+  // "YYYY-MM-DDTHH:mm" or date-only). Store it as the DB's literal
+  // "YYYY-MM-DD HH:mm:ss" — do NOT pass a JS Date (new Date() of a
+  // tz-less datetime-local is read as server-local and shifts hours on a
+  // UTC host; mysql2 then re-converts). This matches how create() stores
+  // requested_date_time as an IST literal.
+  let newRequested = null;
+  if (editSchedule) {
+    const m = String(requestedDateTime).match(/^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2})(:\d{2})?)?$/);
+    if (!m) {
+      const err = new Error('requestedDateTime is not a valid date'); err.status = 400; throw err;
+    }
+    const timePart = m[2] ? `${m[2]}${m[3] || ':00'}` : '00:00:00';
+    newRequested = `${m[1]} ${timePart}`;
+  }
+  const hasSlot = timeSlot !== undefined && timeSlot !== null && timeSlot !== '';
+
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
@@ -2480,20 +2516,39 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason }, actor)
     const isReassign = existing.fk_easyfixter_id && existing.fk_easyfixter_id !== easyfixerId;
     const now = new Date();
 
+    // Build the SET list. The schedule edit (requested_date_time + time_slot)
+    // rides along in the SAME UPDATE so "Schedule & Assign" is atomic.
+    const sets = [
+      'fk_easyfixter_id = ?',
+      'scheduled_date_time = ?',
+      'fk_scheduled_by = ?',
+      `job_status = CASE WHEN job_status = ${STATUS.BOOKED} THEN ${STATUS.SCHEDULED} ELSE job_status END`,
+      'first_scheduled_by = COALESCE(first_scheduled_by, ?)',
+      'last_update_time = ?',
+    ];
+    const values = [easyfixerId, now, actor?.user_id || null, actor?.user_id || null, now];
+    if (editSchedule) {
+      sets.push('requested_date_time = ?');
+      values.push(newRequested);
+    }
+    if (hasSlot) {
+      sets.push('time_slot = ?');
+      values.push(String(timeSlot));
+    }
+    values.push(jobId);
+
     await conn.query(
-      `UPDATE tbl_job
-          SET fk_easyfixter_id = ?, scheduled_date_time = ?, fk_scheduled_by = ?,
-              job_status = CASE WHEN job_status = ${STATUS.BOOKED} THEN ${STATUS.SCHEDULED} ELSE job_status END,
-              first_scheduled_by = COALESCE(first_scheduled_by, ?),
-              last_update_time = ?
-        WHERE job_id = ?`,
-      [easyfixerId, now, actor?.user_id || null, actor?.user_id || null, now, jobId]
+      `UPDATE tbl_job SET ${sets.join(', ')} WHERE job_id = ?`,
+      values
     );
 
     await conn.query(
       `INSERT INTO scheduling_history (job_id, easyfixer_id, schedule_time, reason_id, reschedule_reason)
        VALUES (?, ?, ?, ?, ?)`,
-      [jobId, easyfixerId, now,
+      // When the schedule is being edited, schedule_history captures the NEW
+      // requested time as the schedule_time so the audit trail reflects the
+      // promised appointment, not just the commit instant.
+      [jobId, easyfixerId, editSchedule ? newRequested : now,
        isReassign ? (reasonId || null) : null,
        isReassign ? (rescheduleReason || null) : null]
     );
