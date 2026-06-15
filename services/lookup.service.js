@@ -85,7 +85,7 @@ async function serviceTypes({ categoryId, includeInactive = false } = {}) {
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   const [rows] = await pool.query(
     `SELECT service_type_id, service_type_name, service_type_desc,
-            service_type_status, service_catg_id
+            service_type_status, service_catg_id, display
        FROM tbl_service_type ${where}
        ORDER BY service_type_name ASC`,
     params

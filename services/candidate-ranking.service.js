@@ -119,28 +119,35 @@ async function resolveJSON(clientId, key) {
 
 /*
  * Resolve the job-pincode context used by the distance/tier computation:
- *   { jobPin: '110001'|null, jobZoneId: <int>|null }
- * jobZoneId comes from tbl_pincode.zone_id for the job PIN. Fail-soft —
- * a missing PIN / unzoned PIN simply yields nulls (tier degrades to
- * out_of_zone/unknown). Memo-light: called once per rank/search request.
+ *   { jobPin: '110001'|null, jobZoneIds: Set<int> }
+ * jobZoneIds is the SET of zone ids the job PIN belongs to, read from the
+ * many-to-many junction tbl_zone_pincode_mapping (a pincode may sit in
+ * MULTIPLE zones; the vestigial scalar tbl_pincode.zone_id is NOT read).
+ * Fail-soft — a missing PIN / unzoned PIN simply yields an empty set (tier
+ * degrades to out_of_zone/unknown). Memo-light: called once per rank/search
+ * request.
  */
 async function resolveJobPincodeContext(job) {
   const jobPin = job.pin_code != null && /^[0-9]{6}$/.test(String(job.pin_code).trim())
     ? String(job.pin_code).trim()
     : null;
-  let jobZoneId = null;
+  const jobZoneIds = new Set();
   if (jobPin) {
     try {
-      const [[row]] = await pool.query(
-        'SELECT zone_id FROM tbl_pincode WHERE pincode = ? LIMIT 1',
+      const [rows] = await pool.query(
+        `SELECT DISTINCT zpm.zone_id
+           FROM tbl_pincode p
+           JOIN tbl_zone_pincode_mapping zpm ON zpm.pincode_id = p.pincode_id
+           JOIN tbl_zone_master zm ON zm.zone_id = zpm.zone_id AND zm.zone_status = 1
+          WHERE p.pincode = ?`,
         [jobPin],
       );
-      jobZoneId = row?.zone_id ?? null;
+      for (const r of rows) if (r.zone_id != null) jobZoneIds.add(r.zone_id);
     } catch (e) {
       logger.warn({ err: e.message, jobPin }, 'candidate-ranking: job-pincode zone lookup failed');
     }
   }
-  return { jobPin, jobZoneId };
+  return { jobPin, jobZoneIds };
 }
 
 /*
@@ -159,7 +166,7 @@ async function resolveJobPincodeContext(job) {
  * Returns { tier, refPin }. refPin is the tech-side PIN to geocode against
  * the job pincode for the km value (null when unknown).
  */
-function computeTierAndRefPin({ jobPin, jobZoneId, currentPincode, servPins, servPinZoneIds }) {
+function computeTierAndRefPin({ jobPin, jobZoneIds, currentPincode, servPins, servPinZoneIds }) {
   // Tier1 — serviceable contains the job pincode.
   if (jobPin && servPins.includes(jobPin)) {
     return { tier: 'same_pincode', refPin: jobPin };
@@ -168,9 +175,15 @@ function computeTierAndRefPin({ jobPin, jobZoneId, currentPincode, servPins, ser
   if (jobPin && currentPincode) {
     return { tier: 'current_pincode', refPin: currentPincode };
   }
-  // Tier3 — a serviceable pincode in the job's zone.
-  if (jobZoneId != null) {
-    const inZonePin = servPins.find((p) => servPinZoneIds.get(p) === jobZoneId);
+  // Tier3 — a serviceable pincode whose zone-set intersects the job's
+  // zone-set (pincodes are many-to-many with zones via the junction).
+  if (jobZoneIds && jobZoneIds.size) {
+    const inZonePin = servPins.find((p) => {
+      const zoneSet = servPinZoneIds.get(p);
+      if (!zoneSet) return false;
+      for (const z of zoneSet) if (jobZoneIds.has(z)) return true;
+      return false;
+    });
     if (inZonePin) return { tier: 'in_zone', refPin: inZonePin };
   }
   // Fallback — have a reference PIN but no tier match.
@@ -556,22 +569,34 @@ async function statsForCandidates(efrIds, job, clientId) {
   }
 
   // ── Distance / tier prep (job-level, computed once) ──────────────
-  // 1. Job-pincode context: job PIN + its zone_id (for Tier3 "in_zone").
-  const { jobPin, jobZoneId } = await resolveJobPincodeContext(job);
+  // 1. Job-pincode context: job PIN + its zone-set (for Tier3 "in_zone").
+  const { jobPin, jobZoneIds } = await resolveJobPincodeContext(job);
 
-  // 2. Zone_id for every distinct serviceable pincode across all techs — used
-  //    to decide Tier3. One batched lookup against tbl_pincode.
+  // 2. Zone-set for every distinct serviceable pincode across all techs — used
+  //    to decide Tier3. One batched lookup against the many-to-many junction
+  //    tbl_zone_pincode_mapping (a pincode may belong to MULTIPLE zones; the
+  //    vestigial scalar tbl_pincode.zone_id is NOT read).
   const allServPins = new Set();
   for (const arr of servPinMap.values()) for (const p of arr) allServPins.add(p);
-  const servPinZoneIds = new Map(); // pincode → zone_id
+  const servPinZoneIds = new Map(); // pincode → Set<zone_id>
   if (allServPins.size) {
     try {
       const pins = [...allServPins];
       const [rows] = await pool.query(
-        `SELECT pincode, zone_id FROM tbl_pincode WHERE pincode IN (${pins.map(() => '?').join(',')})`,
+        `SELECT p.pincode, zpm.zone_id
+           FROM tbl_pincode p
+           JOIN tbl_zone_pincode_mapping zpm ON zpm.pincode_id = p.pincode_id
+           JOIN tbl_zone_master zm ON zm.zone_id = zpm.zone_id AND zm.zone_status = 1
+          WHERE p.pincode IN (${pins.map(() => '?').join(',')})`,
         pins,
       );
-      for (const r of rows) servPinZoneIds.set(String(r.pincode), r.zone_id ?? null);
+      for (const r of rows) {
+        if (r.zone_id == null) continue;
+        const key = String(r.pincode);
+        let set = servPinZoneIds.get(key);
+        if (!set) { set = new Set(); servPinZoneIds.set(key, set); }
+        set.add(r.zone_id);
+      }
     } catch (e) {
       logger.warn({ err: e.message }, 'candidate-ranking: serviceable-pincode zone batch lookup failed');
     }
@@ -586,7 +611,7 @@ async function statsForCandidates(efrIds, job, clientId) {
     const base = baseMap.get(id) || {};
     const servPins = servPinMap.get(id) || [];
     const tr = computeTierAndRefPin({
-      jobPin, jobZoneId,
+      jobPin, jobZoneIds,
       currentPincode: base.current_pincode ?? null,
       servPins,
       servPinZoneIds,

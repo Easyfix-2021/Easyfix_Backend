@@ -182,7 +182,7 @@ async function list({ categoryId, serviceTypeId, includeInactive = false } = {})
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   const [rows] = await pool.query(`
     SELECT ds.deepskill_id, ds.category_id, ds.service_type_id,
-           ds.deepskill_name, ds.deepskill_description, ds.status,
+           ds.deepskill_name, ds.deepskill_description, ds.deepskill_tag_words, ds.status,
            ds.deepskill_image, ds.inserted_on, ds.inserted_by,
            ds.image_gen_status, ds.image_gen_attempted_at,
            sc.service_catg_name AS category_name,

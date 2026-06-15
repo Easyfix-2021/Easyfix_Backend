@@ -140,6 +140,32 @@ async function listTechniciansForPincode(pincodeId, { q = '', limit = 20, offset
   return { items, total: Number(total) || 0 };
 }
 
+// Active-zone count per pincode, batched. Mirrors pincodeIdToActiveEfrCount.
+//
+// A pincode is now MANY-TO-MANY with zones via tbl_zone_pincode_mapping
+// (the scalar tbl_pincode.zone_id is vestigial and deliberately NOT read
+// here). We count DISTINCT active zones (tbl_zone_master.zone_status = 1)
+// that include each pincode. Pincodes absent from the junction return 0.
+//
+// Performance: bounded by WHERE zpm.pincode_id IN (?) which hits the
+// KEY(pincode_id) index; one query per page regardless of page size.
+async function pincodeIdToZoneCount(pincodeIds) {
+  if (!pincodeIds.length) return new Map();
+  const placeholders = pincodeIds.map(() => '?').join(',');
+  const [rows] = await pool.query(
+    `SELECT zpm.pincode_id, COUNT(DISTINCT zpm.zone_id) AS zone_count
+       FROM tbl_zone_pincode_mapping zpm
+       JOIN tbl_zone_master z ON z.zone_id = zpm.zone_id
+                             AND z.zone_status = 1
+      WHERE zpm.pincode_id IN (${placeholders})
+      GROUP BY zpm.pincode_id`,
+    pincodeIds
+  );
+  const map = new Map();
+  for (const r of rows) map.set(Number(r.pincode_id), Number(r.zone_count) || 0);
+  return map;
+}
+
 function deriveStatus(activeEfrCount) {
   return activeEfrCount > 0 ? STATUS.LOCAL : STATUS.TRAVEL;
 }
@@ -194,8 +220,11 @@ async function listPincodes({ q, status, cityId, includeInactive = false, limit 
     params
   );
 
-  // Batch-compute LOCAL/TRAVEL status (one query, regardless of page size).
-  const activeMap = await pincodeIdToActiveEfrCount(rows.map((r) => Number(r.pincode_id)));
+  // Batch-compute LOCAL/TRAVEL status + zone count (one query each,
+  // regardless of page size).
+  const pincodeIds = rows.map((r) => Number(r.pincode_id));
+  const activeMap = await pincodeIdToActiveEfrCount(pincodeIds);
+  const zoneMap   = await pincodeIdToZoneCount(pincodeIds);
   const items = rows.map((r) => {
     const activeCount = activeMap.get(Number(r.pincode_id)) || 0;
     return {
@@ -209,6 +238,7 @@ async function listPincodes({ q, status, cityId, includeInactive = false, limit 
       is_active:        Number(r.pincode_status) === 1,
       status:           deriveStatus(activeCount),
       active_efr_count: activeCount,
+      zone_count:       zoneMap.get(Number(r.pincode_id)) || 0,
       lat:              r.lat != null ? Number(r.lat) : null,
       lng:              r.lng != null ? Number(r.lng) : null,
     };
@@ -238,6 +268,7 @@ async function getPincodeById(pincodeId) {
   );
   if (!row) return null;
   const activeMap = await pincodeIdToActiveEfrCount([Number(row.pincode_id)]);
+  const zoneMap   = await pincodeIdToZoneCount([Number(row.pincode_id)]);
   const activeCount = activeMap.get(Number(row.pincode_id)) || 0;
   return {
     pincode_id:       row.pincode_id,
@@ -250,6 +281,7 @@ async function getPincodeById(pincodeId) {
     is_active:        Number(row.pincode_status) === 1,
     status:           deriveStatus(activeCount),
     active_efr_count: activeCount,
+    zone_count:       zoneMap.get(Number(row.pincode_id)) || 0,
   };
 }
 

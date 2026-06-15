@@ -825,15 +825,37 @@ async function replaceServiceablePincodes(efrId, pincodeIds, actor, externalConn
   // connection is injected we run on it so the write joins the caller's txn.
   const db = externalConn || pool;
   // Resolve pincode IDs → pincode strings (the schema stores CSV of strings,
-  // not IDs). Dedupe + join. Empty list ⇒ persist empty CSV.
+  // not IDs). Dedupe + join. Empty list ⇒ persist empty CSV (legitimate clear).
+  // The WHERE clause matches on EITHER pincode_id PK (normal FE path) OR the
+  // 6-digit pincode value itself (Swagger / direct-API callers), so both
+  // representations resolve correctly.
   let csv = '';
+  let resolvedCount = 0;
   if (list.length) {
     const placeholders = list.map(() => '?').join(',');
     const [rows] = await db.query(
-      `SELECT pincode FROM tbl_pincode WHERE pincode_id IN (${placeholders})`,
-      list
+      `SELECT pincode FROM tbl_pincode WHERE pincode_id IN (${placeholders}) OR pincode IN (${placeholders})`,
+      [...list, ...list]
     );
-    csv = Array.from(new Set(rows.map((r) => String(r.pincode)).filter(Boolean))).join(',');
+    const resolved = Array.from(new Set(rows.map((r) => String(r.pincode)).filter(Boolean)));
+    csv = resolved.join(',');
+    resolvedCount = resolved.length;
+    // Guard: non-empty input that resolves to zero rows means every supplied id
+    // is unrecognised. Return 400 rather than silently writing an empty CSV —
+    // this is the mechanism that caused blank pincodes for easyfixer_id 1736.
+    if (csv === '') {
+      const err = new Error('No valid pincodes resolved from the provided ids');
+      err.statusCode = 400;
+      throw err;
+    }
+    // Partial resolution: some supplied ids matched no pincode (by PK or value).
+    // Persist the ones that did, but warn so catalogue drift stays visible.
+    if (resolvedCount < list.length) {
+      logger.warn(
+        { efrId, requested: list.length, resolved: resolvedCount },
+        'serviceable-pincodes: partial id resolution — some supplied ids matched no pincode',
+      );
+    }
   }
   // Single-statement atomic upsert keyed on easyfixer_id (PK).
   await db.query(
@@ -843,7 +865,7 @@ async function replaceServiceablePincodes(efrId, pincodeIds, actor, externalConn
      ON DUPLICATE KEY UPDATE pincodes = VALUES(pincodes), updated_by = VALUES(updated_by)`,
     [efrId, csv, userId, userId]
   );
-  return { updated: list.length };
+  return { updated: resolvedCount };
 }
 
 // ─── BGV upload (stub) ──────────────────────────────────────────────

@@ -398,6 +398,21 @@ async function processBuffer(buffer, { commit = false, actor = null } = {}) {
         continue;
       }
 
+      // At least one option required — mirrors the single-add create() rule
+      // (deep-skill.service.js: "At least one Deep Skill option is required").
+      // A row whose option columns (Col F onward) are all empty would create an
+      // option-less deep skill that's pruned from the public picker, so reject
+      // it instead of inserting it. Runs before any write (no service-type
+      // auto-create, no skill insert).
+      if (r.options.length === 0) {
+        report.push({
+          ...base,
+          status: 'error',
+          errors: ['At least one option required'],
+        });
+        continue;
+      }
+
       // Resolve / create service type (only under the existing category).
       const typ = await resolveType(conn, cache, cat.id, r.type, { create: commit });
       if (typ.isNew) {

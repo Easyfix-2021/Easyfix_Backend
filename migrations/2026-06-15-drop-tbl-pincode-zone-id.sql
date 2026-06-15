@@ -1,0 +1,16 @@
+-- 2026-06-15 — Drop the now-vestigial tbl_pincode.zone_id column.
+--
+-- The many-to-many junction tbl_zone_pincode_mapping (created in
+-- 2026-06-15-create-zone-pincode-junction.sql) is the SOLE source of truth for
+-- zone coverage; no application code reads tbl_pincode.zone_id anymore
+-- (zone.service.js, zone-upload.service.js, candidate-ranking.service.js and
+-- pincode.service.js were all migrated to the junction).
+--
+-- ⚠️ RUN ORDER: this MUST run AFTER 2026-06-15-create-zone-pincode-junction.sql,
+-- which backfills the junction FROM this column. Applying it first would lose
+-- the existing zone assignments. (Filenames sort "create-" before "drop-", so a
+-- standard alphabetical migration runner applies them in the correct order.)
+--
+-- Dropping the column also removes its single-column index idx_pincode_zone
+-- (MySQL drops such indexes automatically when the column is dropped).
+ALTER TABLE tbl_pincode DROP COLUMN zone_id;
