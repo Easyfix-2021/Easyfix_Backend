@@ -731,7 +731,7 @@ async function searchPincodes(q, limit, pool) {
  *   { jobId, action, shortUrl, sentAt, sendCount }
  * Note `jobId` is named for spec parity — it carries the efr_id value.
  */
-async function sendForEasyfixer(efrId, { action = 'first', override_mobile } = {}, actor, pool) {
+async function sendForEasyfixer(efrId, { action = 'first', override_mobile, bypassTestRedirect = false } = {}, actor, pool) {
   const [[row]] = await pool.query(
     `SELECT efr_id, efr_no, efr_name, efr_first_name, efr_last_name,
             profile_update_sent_at, profile_update_send_count
@@ -765,12 +765,17 @@ async function sendForEasyfixer(efrId, { action = 'first', override_mobile } = {
    * the destination actually messaged.
    */
   const isProd = process.env.NODE_ENV === 'production';
-  const destinationMobile =
-    !isProd && override_mobile ? String(override_mobile) : row.efr_no;
-  if (!isProd && override_mobile) {
+  // Honour an operator-supplied override in non-prod, OR whenever this is the
+  // explicit Scheduled Jobs → Test flow (bypassTestRedirect=true) — the
+  // operator typed the number deliberately, so it must win on ALL envs
+  // (matching the other Test flows, which pass the typed number straight to
+  // `to`). Normal prod sends (no bypass) still ignore override → real efr_no.
+  const allowOverride = !!override_mobile && (!isProd || bypassTestRedirect);
+  const destinationMobile = allowOverride ? String(override_mobile) : row.efr_no;
+  if (allowOverride) {
     logger.info(
-      { efrId, override: destinationMobile },
-      'profile-update-link: sent with override mobile (non-prod)',
+      { efrId, override: destinationMobile, bypassTestRedirect },
+      'profile-update-link: sent with override mobile',
     );
   }
 
@@ -826,6 +831,7 @@ async function sendForEasyfixer(efrId, { action = 'first', override_mobile } = {
       to: destinationMobile,
       recipientName: fullName,
       templateName: 'tx_complete_profile',
+      bypassTestRedirect,
       // Gallabox `tx_complete_profile` uses NAMED body variables
       // ({{Name}}, {{efr_id}}, {{profile_link}}) — positional keys (1/2/3)
       // don't bind and arrive empty. Keys must match the template var names.
@@ -853,6 +859,7 @@ async function sendForEasyfixer(efrId, { action = 'first', override_mobile } = {
       const fallback = await whatsappService.sendText({
         to: destinationMobile,
         recipientName: fullName,
+        bypassTestRedirect,
         body:
           `Hi ${fullName}, please update your EasyFix profile using this link: ${shortUrl} `
           + `(valid for 30 days). – Team EasyFix`,

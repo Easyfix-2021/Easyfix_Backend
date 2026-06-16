@@ -234,6 +234,8 @@ async function runTest({ mobile, sourceId } = {}) {
     to: phone,
     recipientName,
     templateName: TEMPLATE_NAME,
+    // Scheduled Jobs → Test: honour the operator's typed number on every env.
+    bypassTestRedirect: true,
     // Named body vars (Name/efr_id/profile_link) — positional 1/2/3 don't bind.
     bodyValues: { Name: recipientName, efr_id: String(efrId), profile_link: shortUrl },
   });

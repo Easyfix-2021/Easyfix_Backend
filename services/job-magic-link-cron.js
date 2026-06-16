@@ -185,6 +185,9 @@ async function runTest({ mobile, sourceId } = {}) {
     to: phone,
     recipientName: customerName,
     templateName: 'confirm_order',
+    // Scheduled Jobs → Test: honour the operator's typed number on every env
+    // (skip the TEST_MOBILE redirect).
+    bypassTestRedirect: true,
     bodyValues: {
       1: customerName,
       2: clientName,

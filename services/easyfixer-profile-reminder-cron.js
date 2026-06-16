@@ -168,7 +168,9 @@ async function runTest({ mobile, sourceId } = {}) {
   try {
     res = await profileUpdateLink.sendForEasyfixer(
       testEfrId,
-      { action: 'reminder', override_mobile: phone },
+      // Scheduled Jobs → Test: honour the typed number on every env (bypasses
+      // both the prod override-mobile gate and the TEST_MOBILE redirect).
+      { action: 'reminder', override_mobile: phone, bypassTestRedirect: true },
       null,
       pool,
     );
