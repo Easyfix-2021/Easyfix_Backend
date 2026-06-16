@@ -8,6 +8,7 @@
 
 const { verifyToken } = require('../utils/jwt');
 const { findUserById } = require('../services/auth.service');
+const techAuth = require('../services/tech-auth.service');
 const { modernError } = require('../utils/response');
 
 /*
@@ -54,8 +55,38 @@ async function requireAuth(req, res, next) {
     return modernError(res, 401, reason);
   }
 
-  const user = await findUserById(payload.sub);
-  if (!user) return modernError(res, 401, 'user not found or inactive');
+  // Subject discrimination. Admin/client bearers carry a numeric tbl_user
+  // PK in `sub`; technician bearers (issued by tech-auth.service) carry the
+  // prefixed form `efr:<efr_id>` and live in tbl_easyfixer, NOT tbl_user.
+  // The shared `/api/shared/*` contract (CLAUDE.md) promises mobile bearers
+  // work here — resolve them against tbl_easyfixer so the documented
+  // contract actually holds. This branch is purely additive: numeric subs
+  // take the unchanged tbl_user path below.
+  let user;
+  const sub = String(payload.sub == null ? '' : payload.sub);
+  if (sub.startsWith('efr:')) {
+    const efrId = Number(sub.slice('efr:'.length));
+    const tech = Number.isInteger(efrId) ? await techAuth.findById(efrId) : null;
+    if (!tech) return modernError(res, 401, 'user not found or inactive');
+    // Shape a synthetic principal whose `user_role` classifies to the
+    // 'mobile' group (role_id 19) in ROLE_ID_TO_GROUP. Effect: technician
+    // bearers pass open `/api/shared/*` reads but are denied (403, fail
+    // closed) by any `role(['admin'])` / `role(['client'])` group guard —
+    // e.g. the admin-router mount and the admin-sensitive lookups.
+    user = {
+      user_id: `efr:${tech.efr_id}`,
+      efr_id: tech.efr_id,
+      user_name: tech.efr_name,
+      official_email: tech.efr_email,
+      user_role: 19, // Technician → 'mobile' group
+      user_type_id: null,
+      user_status: 1,
+      __principal: 'mobile',
+    };
+  } else {
+    user = await findUserById(payload.sub);
+    if (!user) return modernError(res, 401, 'user not found or inactive');
+  }
 
   req.user = user;
   req.tokenPayload = payload;

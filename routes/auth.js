@@ -110,6 +110,35 @@ router.post('/verify-otp', validate(verifyOtpRequest), async (req, res, next) =>
 router.get('/me', requireAuth, async (req, res, next) => {
   try {
     const role = await getRoleById(req.user.user_role);
+
+    // Technician (mobile) principals authenticate against tbl_easyfixer and
+    // carry no tbl_user permission/scope columns. Their `user_id` is the
+    // non-numeric `efr:<id>` form, so the tbl_user permission/scope resolution
+    // below would coerce it to NaN and emit `WHERE user_id = NaN` (a 500). The
+    // CRM RBAC/scope model does not apply to technicians — the mobile app gates
+    // itself via /api/mobile/*. Return a clean, empty-permission identity so a
+    // mobile bearer is a first-class /api/shared principal without the 500.
+    if (req.user.__principal === 'mobile') {
+      return modernOk(res, {
+        user: req.user,
+        role: role && {
+          role_id: role.role_id,
+          role_name: role.role_name,
+          group: role.group,
+          active: role.role_status,
+        },
+        permissions: { menuIds: [], actionPermissions: [] },
+        scope: {
+          clients:   { mode: 'none', ids: [] },
+          cities:    { mode: 'none', ids: [] },
+          states:    { mode: 'none', ids: [] },
+          verticals: { mode: 'none', ids: [] },
+        },
+        hierarchy: { directReportsCount: 0, descendantsCount: 0 },
+        scheduledJobsAccess: false,
+      });
+    }
+
     // Resolve menu_ids + action permissions in the same shape the legacy
     // session map exposed (LoginAction.java lines 92–98). Frontend treats
     // menuIds as the sidebar allowlist and actionPermissions as the

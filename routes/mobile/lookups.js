@@ -1,0 +1,36 @@
+const router = require('express').Router();
+
+const { modernOk, modernError } = require('../../utils/response');
+const lookupsService = require('../../services/mobile-lookups.service');
+
+/*
+ * Technician lookup/dropdown sub-router.
+ *
+ * Mounted at the mobile ROOT (no path prefix) in routes/mobile/index.js:
+ *   router.use(require('./lookups'));
+ * so the full path it declares below resolves to:
+ *   GET /api/mobile/experience
+ *
+ * DUPLICATES REMOVED: `service-categories`, `banks`, and `job-reasons`
+ * were removed — they duplicate /api/shared/lookup/service-categories,
+ * /api/shared/lookup/banks, and /api/shared/lookup/cancel-reasons +
+ * /reschedule-reasons. Only `/experience` (no existing equivalent) remains.
+ *
+ * Auth: requireTechAuth is applied UPSTREAM in routes/mobile/index.js
+ * BEFORE this sub-router is mounted, so `req.tech` is populated. This
+ * lookup is technician-scoped only in that it requires a valid tech
+ * token; the list itself is a global master (no per-tech filtering).
+ */
+
+// ─── GET /experience — experience options ──────────────────────────────
+//   → [ { id, name, description } ]
+router.get('/experience', async (_req, res, next) => {
+  try {
+    modernOk(res, await lookupsService.experience());
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
+module.exports = router;

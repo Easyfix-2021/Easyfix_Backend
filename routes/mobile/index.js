@@ -132,6 +132,15 @@ router.use(requireTechAuth);
 // wrapper around utils/notice-reader-router.js.
 router.use('/notices', require('./notices'));
 
+// Technician order-lifecycle + estimate sub-routers (NEW 2026-06-15, mobile-only
+// — no CRM overlap). MOUNTED BEFORE the inline `/jobs` + `/jobs/:id` handlers
+// below so the literal paths (`/jobs/search`, `/jobs/:id/rate-card`,
+// `/jobs/:id/cancel`, …) win over the `/jobs/:id` param route. These sub-routers
+// do NOT define `GET /jobs` or `GET /jobs/:id`, so the existing list + detail
+// handlers still resolve by fall-through.
+router.use('/jobs', require('./jobs-lifecycle'));
+router.use('/jobs', require('./jobs-estimate'));
+
 router.get('/me', (req, res) => modernOk(res, { tech: req.tech }));
 
 // Dashboard — aggregated payload (2026-05-25, repointed at the new
@@ -482,5 +491,23 @@ router.get('/customers/mobile/:mobile', async (req, res, next) => {
     modernOk(res, cust || null);
   } catch (e) { next(e); }
 });
+
+// ─── Net-new technician sub-routers (2026-06-15, mobile-only) ───────
+// Mounted AFTER the inline routes above so they can never shadow an existing
+// handler — they only own paths the inline routes don't define. All are
+// requireTechAuth-scoped (inherited from line 128) and touch only mobile/legacy
+// shared tables for READ/WRITE — zero CRM route overlap.
+//   /deepskill/hierarchy/:categoryId · /deepskill/skills
+router.use('/deepskill', require('./deepskill'));
+//   /registration/status · /remaining · /personal-details · /language
+router.use('/registration', require('./registration'));
+//   /attendance · /leave · /leave/unmark
+router.use(require('./attendance'));
+//   /experience
+router.use(require('./lookups'));
+//   /profile/name · /profile/image · /profile/performance/weekly
+//   /earnings · /icard · /ratings · /training-videos/percentage · /app-version
+//   /logout · /upi-details · /kyc/aadhaar-pan-exists/:number
+router.use(require('./profile-extra'));
 
 module.exports = router;
