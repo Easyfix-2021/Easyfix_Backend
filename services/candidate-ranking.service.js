@@ -227,9 +227,13 @@ async function l1Eligibility(job, { applyDeepSkill = true } = {}) {
    *
    * The legacy auto-assign.service.js had a `JOIN tbl_deep_skill ds`
    * referencing `m.deepskill_id` — that column doesn't exist on the
-   * mapping table; it failed at request time. Since the mapping row
-   * already carries `category_id` + `service_type_id` directly, the
-   * JOIN through tbl_deep_skill is unnecessary — we filter inline.
+   * mapping table; it failed at request time. The category/service-type
+   * match is done inline from the mapping row's own columns. We DO touch
+   * tbl_deep_skill, but only to EXCLUDE mappings whose deep skill is
+   * INACTIVE (status=0) — via the CORRECT column `m.parent_skill_id`
+   * (which holds the deepskill_id). `NOT EXISTS(status=0)` keeps active +
+   * any orphan rows, so a deactivated/deleted deep skill stops crediting
+   * technicians without over-pruning legacy data.
    */
   const skillClauses = [];
   const skillParams  = [];
@@ -238,7 +242,11 @@ async function l1Eligibility(job, { applyDeepSkill = true } = {}) {
       SELECT 1
         FROM tbl_efr_deepskill_mapping m
        WHERE m.easyfixer_id = e.efr_id
-         AND m.is_repairing = 1`;
+         AND m.is_repairing = 1
+         AND NOT EXISTS (
+           SELECT 1 FROM tbl_deep_skill ds
+            WHERE ds.deepskill_id = m.parent_skill_id AND ds.status = 0
+         )`;
     if (job.fk_service_catg_id) { predicate += ' AND m.category_id = ?';     skillParams.push(job.fk_service_catg_id); }
     if (job.fk_service_type_id) { predicate += ' AND m.service_type_id = ?'; skillParams.push(job.fk_service_type_id); }
     predicate += ')';
@@ -292,7 +300,11 @@ async function statsForCandidates(efrIds, job, clientId) {
     let sql = `SELECT DISTINCT m.easyfixer_id AS efr_id
                  FROM tbl_efr_deepskill_mapping m
                 WHERE m.easyfixer_id IN (${placeholders})
-                  AND m.is_repairing = 1`;
+                  AND m.is_repairing = 1
+                  AND NOT EXISTS (
+                    SELECT 1 FROM tbl_deep_skill ds
+                     WHERE ds.deepskill_id = m.parent_skill_id AND ds.status = 0
+                  )`;
     const params = [...efrIds];
     if (job.fk_service_catg_id) { sql += ' AND m.category_id = ?';     params.push(job.fk_service_catg_id); }
     if (job.fk_service_type_id) { sql += ' AND m.service_type_id = ?'; params.push(job.fk_service_type_id); }
@@ -311,7 +323,11 @@ async function statsForCandidates(efrIds, job, clientId) {
         `SELECT DISTINCT m.easyfixer_id AS efr_id
            FROM tbl_efr_deepskill_mapping m
           WHERE m.easyfixer_id IN (${placeholders})
-            AND m.is_repairing = 1`,
+            AND m.is_repairing = 1
+            AND NOT EXISTS (
+              SELECT 1 FROM tbl_deep_skill ds
+               WHERE ds.deepskill_id = m.parent_skill_id AND ds.status = 0
+            )`,
         [...efrIds],
       )
     : Promise.resolve([[]]);
@@ -513,7 +529,7 @@ async function statsForCandidates(efrIds, job, clientId) {
       `SELECT e.efr_id, zm.zone_id, zm.zone_name
          FROM tbl_easyfixer e
          LEFT JOIN tbl_zone_city_mapping zcm ON zcm.city_zone_id = e.efr_zone_city_id
-         LEFT JOIN tbl_zone_master zm        ON zm.zone_id = zcm.zone_id
+         LEFT JOIN tbl_zone_master zm        ON zm.zone_id = zcm.zone_id AND zm.zone_status = 1
         WHERE e.efr_id IN (${placeholders})`,
       efrIds
     ).catch((e) => { logger.warn({ err: e.message }, 'candidate-ranking: tech-zone query failed'); return [[]]; }),

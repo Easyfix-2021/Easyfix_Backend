@@ -826,10 +826,13 @@ async function sendForEasyfixer(efrId, { action = 'first', override_mobile } = {
       to: destinationMobile,
       recipientName: fullName,
       templateName: 'tx_complete_profile',
+      // Gallabox `tx_complete_profile` uses NAMED body variables
+      // ({{Name}}, {{efr_id}}, {{profile_link}}) — positional keys (1/2/3)
+      // don't bind and arrive empty. Keys must match the template var names.
       bodyValues: {
-        1: fullName,
-        2: String(efrId),
-        3: shortUrl,
+        Name:         fullName,
+        efr_id:       String(efrId),
+        profile_link: shortUrl,
       },
     });
   } catch (err) {

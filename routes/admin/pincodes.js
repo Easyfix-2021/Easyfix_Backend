@@ -45,6 +45,10 @@ const updateBody = Joi.object({
   is_active: Joi.boolean().optional(),
 }).min(1);
 
+const setZonesBody = Joi.object({
+  zoneIds: Joi.array().items(Joi.number().integer().positive()).default([]),
+});
+
 const uploadQuery = Joi.object({
   dryRun: Joi.boolean().default(false),
 });
@@ -133,6 +137,27 @@ router.patch('/:pincodeId',
       const updated = await pin.updatePincode(Number(req.params.pincodeId), req.body, { userId: userIdOf(req) });
       if (!updated) return modernError(res, 404, 'Pincode not found');
       return modernOk(res, updated, 'Pincode updated');
+    } catch (err) {
+      if (err.status) return modernError(res, err.status, err.message);
+      return next(err);
+    }
+  }
+);
+
+// PUT /admin/pincodes/:pincodeId/zones — body { zoneIds: number[] }
+// Reverse of the zone editor's pincode-set: assign THIS pincode to zone(s).
+// Wipe-and-reinsert this pincode's tbl_zone_pincode_mapping rows to match.
+router.put('/:pincodeId/zones',
+  validate(idParam, 'params'),
+  validate(setZonesBody),
+  async (req, res, next) => {
+    try {
+      const result = await pin.setZonesForPincode(
+        Number(req.params.pincodeId),
+        req.body.zoneIds,
+        { userId: userIdOf(req) }
+      );
+      return modernOk(res, result, 'Zones updated');
     } catch (err) {
       if (err.status) return modernError(res, err.status, err.message);
       return next(err);

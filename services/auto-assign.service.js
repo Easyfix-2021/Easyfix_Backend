@@ -142,7 +142,9 @@ async function eligibleCandidates(job) {
          FROM pincode_firefox_city_mapping p
          JOIN tbl_city                  c   ON c.city_name      = p.city_name
          JOIN tbl_zone_city_mapping     zcm ON zcm.city_id      = c.city_id
-        WHERE p.pincode = ?`,
+         LEFT JOIN tbl_zone_master      zm  ON zm.zone_id       = zcm.zone_id
+        WHERE p.pincode = ?
+          AND (zm.zone_id IS NULL OR zm.zone_status = 1)`,
       [customerPincode]
     );
     cityZoneIds = zoneRows.map((r) => r.city_zone_id);

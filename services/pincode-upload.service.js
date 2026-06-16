@@ -195,7 +195,7 @@ async function processUpload(buffer, { dryRun = false, userId = null } = {}) {
     }
 
     if (!dryRun) {
-      pendingRows.push([pincode, location, cityId, district, 1, userId, userId]);
+      pendingRows.push([pincode, location, cityId, district, 1, userId, userId]); // 1 = Serviceable (pincode_status)
       // Track in-memory so a duplicate WITHIN the same upload doesn't
       // produce two INSERTs that succeed (would violate uniq_pincode).
       existingPins.add(pincode);

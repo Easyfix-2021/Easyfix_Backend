@@ -146,7 +146,10 @@ async function processUpload(buffer, { dryRun = false, userId = null } = {}) {
 
     const [[cities], [zones], [pincodes], [mappings]] = await Promise.all([
       conn.query('SELECT city_id, city_name FROM tbl_city'),
-      conn.query('SELECT zone_id, zone_name, city_id FROM tbl_zone_master WHERE zone_status = 1'),
+      // ALL zones (incl. inactive) so an existing inactive zone with the same
+      // (city, name) is RECOGNISED rather than silently duplicated; rows that
+      // target an inactive zone are rejected below (reactivate it first).
+      conn.query('SELECT zone_id, zone_name, city_id, zone_status FROM tbl_zone_master'),
       conn.query('SELECT pincode_id, pincode, city_id FROM tbl_pincode WHERE pincode_status = 1'),
       conn.query('SELECT zone_id, pincode_id FROM tbl_zone_pincode_mapping'),
     ]);
@@ -193,9 +196,17 @@ async function processUpload(buffer, { dryRun = false, userId = null } = {}) {
       // Resolve or create zone (within this city).
       const zoneKey = `${cityId}::${zoneName.toLowerCase()}`;
       let zone = zoneByCityName.get(zoneKey);
+      // Existing INACTIVE zone: don't duplicate it and don't map pincodes to an
+      // inactive zone (preserves the "inactive zone ⟹ 0 pincodes" invariant).
+      // The operator must reactivate it from Manage Zones first.
+      if (zone && Number(zone.zone_status) !== 1) {
+        results.push({ rowNumber, status: 'failed', errors: [`Zone "${zoneName}" exists in ${cityName} but is inactive — reactivate it before uploading pincodes`] });
+        failedCount++;
+        continue;
+      }
       if (!zone) {
         if (dryRun) {
-          zone = { zone_id: -(createdZones + 1), zone_name: zoneName, city_id: cityId };
+          zone = { zone_id: -(createdZones + 1), zone_name: zoneName, city_id: cityId, zone_status: 1 };
           zoneByCityName.set(zoneKey, zone);
         } else {
           const [zr] = await conn.query(
@@ -207,7 +218,7 @@ async function processUpload(buffer, { dryRun = false, userId = null } = {}) {
             'INSERT INTO tbl_zone_city_mapping (zone_id, city_id) VALUES (?, ?)',
             [zr.insertId, cityId]
           );
-          zone = { zone_id: zr.insertId, zone_name: zoneName, city_id: cityId };
+          zone = { zone_id: zr.insertId, zone_name: zoneName, city_id: cityId, zone_status: 1 };
           zoneByCityName.set(zoneKey, zone);
         }
         createdZones++;

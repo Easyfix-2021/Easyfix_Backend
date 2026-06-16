@@ -604,7 +604,7 @@ async function runSeed({
       row.office_name || null,
       cityId,
       row.district || null,
-      1,
+      1, // pincode_status = 1 (Serviceable) — Seed India Locations always seeds Serviceable
       row.lat,
       row.lng,
     ]);

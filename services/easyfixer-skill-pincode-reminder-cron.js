@@ -234,7 +234,8 @@ async function runTest({ mobile, sourceId } = {}) {
     to: phone,
     recipientName,
     templateName: TEMPLATE_NAME,
-    bodyValues: { 1: recipientName, 2: String(efrId), 3: shortUrl },
+    // Named body vars (Name/efr_id/profile_link) — positional 1/2/3 don't bind.
+    bodyValues: { Name: recipientName, efr_id: String(efrId), profile_link: shortUrl },
   });
 
   logger.info(

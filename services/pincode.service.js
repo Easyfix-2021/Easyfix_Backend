@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const logger = require('../logger');
 
 /*
  * Generic pincode catalog — `tbl_pincode` (created in
@@ -152,11 +153,16 @@ async function listTechniciansForPincode(pincodeId, { q = '', limit = 20, offset
 async function pincodeIdToZoneCount(pincodeIds) {
   if (!pincodeIds.length) return new Map();
   const placeholders = pincodeIds.map(() => '?').join(',');
+  // Count ALL zones a pincode is mapped to (active OR inactive). This is a
+  // management/inventory view and MUST match the zone-side pincode_count
+  // (zone.service.js), which also doesn't filter zone_status — otherwise a
+  // pincode mapped only to an inactive zone shows Zones=0 here while the zone
+  // shows pincode_count>=1. zone_status is binary (1/0, no "deleted"
+  // tombstone) so nothing needs excluding. candidate-ranking does its own
+  // active-only zone filtering separately and is unaffected.
   const [rows] = await pool.query(
     `SELECT zpm.pincode_id, COUNT(DISTINCT zpm.zone_id) AS zone_count
        FROM tbl_zone_pincode_mapping zpm
-       JOIN tbl_zone_master z ON z.zone_id = zpm.zone_id
-                             AND z.zone_status = 1
       WHERE zpm.pincode_id IN (${placeholders})
       GROUP BY zpm.pincode_id`,
     pincodeIds
@@ -270,6 +276,25 @@ async function getPincodeById(pincodeId) {
   const activeMap = await pincodeIdToActiveEfrCount([Number(row.pincode_id)]);
   const zoneMap   = await pincodeIdToZoneCount([Number(row.pincode_id)]);
   const activeCount = activeMap.get(Number(row.pincode_id)) || 0;
+
+  // The pincode's CURRENT ACTIVE zones — powers the reverse Pincode→Zones
+  // mapping modal's pre-checked state. Intentionally active-only (UNLIKE
+  // zone_count above, which now counts ALL mapped zones): the modal can only
+  // map a pincode to ACTIVE zones — setZonesForPincode() validates + replaces
+  // against active zones, so pre-checking an inactive zone would be a row the
+  // Save path can't preserve (it would be deleted). Net result: zone_count may
+  // exceed this list when a pincode is also mapped to inactive zones — that
+  // divergence is expected, do not "fix" it by dropping the filter here.
+  const [zoneRows] = await pool.query(
+    `SELECT z.zone_id, z.zone_name
+       FROM tbl_zone_pincode_mapping zpm
+       JOIN tbl_zone_master z ON z.zone_id = zpm.zone_id
+                             AND z.zone_status = 1
+      WHERE zpm.pincode_id = ?
+      ORDER BY z.zone_name ASC`,
+    [Number(row.pincode_id)]
+  );
+
   return {
     pincode_id:       row.pincode_id,
     pincode:          String(row.pincode),
@@ -282,6 +307,7 @@ async function getPincodeById(pincodeId) {
     status:           deriveStatus(activeCount),
     active_efr_count: activeCount,
     zone_count:       zoneMap.get(Number(row.pincode_id)) || 0,
+    zones:            zoneRows.map((z) => ({ zone_id: Number(z.zone_id), zone_name: z.zone_name })),
   };
 }
 
@@ -351,6 +377,8 @@ async function createPincode({ pincode, location, city_id, district }, { userId 
     throw err;
   }
 
+  // pincode_status hard-set to 1 (Serviceable) on create; mark Non-Serviceable
+  // later via updatePincode({ is_active: false }) → pincode_status = 0.
   const [result] = await pool.query(
     `INSERT INTO tbl_pincode
        (pincode, location, city_id, district, pincode_status, created_by, updated_by)
@@ -369,6 +397,7 @@ async function updatePincode(pincodeId, fields, { userId = null } = {}) {
   if (fields.location !== undefined)       { sets.push('location = ?');       params.push(fields.location || null); }
   if (fields.city_id !== undefined)        { sets.push('city_id = ?');        params.push(Number(fields.city_id)); await assertCityExists(fields.city_id); }
   if (fields.district !== undefined)       { sets.push('district = ?');       params.push(fields.district || null); }
+  // is_active true → pincode_status 1 (Serviceable); false → 0 (Non-Serviceable).
   if (fields.is_active !== undefined)      { sets.push('pincode_status = ?'); params.push(fields.is_active ? 1 : 0); }
   if (!sets.length) throw badReq('No mutable fields supplied');
   sets.push('updated_by = ?');
@@ -396,6 +425,85 @@ async function deletePincode(pincodeId, { userId = null } = {}) {
   return result.affectedRows > 0;
 }
 
+// ─── Replace a pincode's zone set (reverse of zone.setPincodeMapping) ──
+/*
+ * Reverse of zone.service.js::setPincodeMapping — the Manage Pincodes page
+ * maps ONE pincode to many zones. The editor sends the WHOLE zone-id list it
+ * wants this pincode to belong to; we make this pincode's
+ * tbl_zone_pincode_mapping rows exactly equal the accepted set: DELETE the
+ * pincode's rows whose zone is not in the set, then INSERT IGNORE the wanted
+ * (zone_id, pincode_id) rows. Other pincodes' rows are never touched
+ * (many-to-many is allowed). Zone ids that don't exist are reported back as
+ * `rejected` rather than failing the whole call.
+ */
+async function setZonesForPincode(pincodeId, zoneIds, { userId = null } = {}) {
+  const ids = Array.from(new Set((zoneIds || []).map(Number).filter(Number.isFinite)));
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [[pinRow]] = await conn.query(
+      'SELECT pincode_id FROM tbl_pincode WHERE pincode_id = ? LIMIT 1', [pincodeId]
+    );
+    if (!pinRow) { const e = new Error('Pincode not found'); e.status = 404; throw e; }
+
+    const rejected = [];
+    const acceptable = [];
+    if (ids.length) {
+      // Validate every requested zone id: must exist as an active zone.
+      const placeholders = ids.map(() => '?').join(',');
+      const [rows] = await conn.query(
+        `SELECT zone_id FROM tbl_zone_master
+          WHERE zone_id IN (${placeholders}) AND zone_status = 1`,
+        ids
+      );
+      const valid = new Set(rows.map((r) => Number(r.zone_id)));
+      for (const id of ids) {
+        if (valid.has(id)) acceptable.push(id);
+        else rejected.push({ zone_id: id, reason: 'Zone not found or inactive' });
+      }
+    }
+
+    // Make this pincode's junction rows exactly = acceptable set.
+    if (acceptable.length) {
+      const ph = acceptable.map(() => '?').join(',');
+      // Drop this pincode's rows whose zone is no longer wanted (other
+      // pincodes untouched).
+      await conn.query(
+        `DELETE FROM tbl_zone_pincode_mapping
+          WHERE pincode_id = ? AND zone_id NOT IN (${ph})`,
+        [pincodeId, ...acceptable]
+      );
+      // Idempotently add the wanted rows for THIS pincode.
+      const values = acceptable.map(() => '(?, ?, NOW(), ?)').join(', ');
+      const params = [];
+      for (const id of acceptable) params.push(id, pincodeId, userId);
+      await conn.query(
+        `INSERT IGNORE INTO tbl_zone_pincode_mapping
+           (zone_id, pincode_id, created_on, created_by)
+         VALUES ${values}`,
+        params
+      );
+    } else {
+      // Empty/all-rejected list = clear THIS pincode's junction rows only.
+      await conn.query(
+        'DELETE FROM tbl_zone_pincode_mapping WHERE pincode_id = ?', [pincodeId]
+      );
+    }
+
+    await conn.commit();
+    const detail = await getPincodeById(pincodeId);
+    return { ...detail, rejected };
+  } catch (e) {
+    await conn.rollback();
+    logger.error({ err: e.message, pincodeId }, 'setZonesForPincode failed; rolled back');
+    throw e;
+  } finally {
+    conn.release();
+  }
+}
+
 module.exports = {
   STATUS,
   listPincodes,
@@ -406,4 +514,5 @@ module.exports = {
   updatePincode,
   deletePincode,
   listTechniciansForPincode,
+  setZonesForPincode,
 };

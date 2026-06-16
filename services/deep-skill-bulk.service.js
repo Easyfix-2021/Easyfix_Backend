@@ -256,10 +256,13 @@ async function resolveType(conn, cache, catId, name, { create }) {
     return out;
   }
 
+  // Service type auto-created during deep-skill BULK upload → display = 2
+  // (deep-skill type) so it appears in the Manage Deep Skills "display = 2"
+  // Service Type dropdown.
   const [ins] = await conn.query(
     `INSERT INTO tbl_service_type
        (service_type_name, service_catg_id, display, service_type_status)
-     VALUES (?, ?, 1, 1)`,
+     VALUES (?, ?, 2, 1)`,
     [name, catId],
   );
   const out = { id: ins.insertId, name, catId, isNew: true };

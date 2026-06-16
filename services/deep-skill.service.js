@@ -132,10 +132,13 @@ async function resolveServiceTypeByName(runner, categoryId, name) {
     );
     return { id: row.service_type_id, name: row.service_type_name, isNew: false };
   }
+  // New service type auto-created for a deep skill → display = 2 (deep-skill
+  // type) so future single-add deep skills surface in the Manage Deep Skills
+  // "display = 2" Service Type dropdown.
   const [ins] = await runner.query(
     `INSERT INTO tbl_service_type
        (service_type_name, service_catg_id, display, service_type_status)
-     VALUES (?, ?, 1, 1)`,
+     VALUES (?, ?, 2, 1)`,
     [trimmed, categoryId],
   );
   return { id: ins.insertId, name: trimmed, isNew: true };
@@ -457,6 +460,16 @@ async function update(deepskillId, patch) {
   values.push(deepskillId);
   await pool.query(`UPDATE tbl_deep_skill SET ${sets.join(', ')} WHERE deepskill_id = ?`, values);
 
+  // If this patch deactivates/deletes the skill (status → 0), hard-delete its
+  // option definitions (product rule: an inactive/deleted deep skill drops its
+  // mapped options) and re-sync the denormalised skill_options JSON.
+  if (Number(next.status) === 0) {
+    await pool.query('DELETE FROM tbl_deepskill_options WHERE deepskill_id = ?', [deepskillId]);
+    await syncSkillOptionsJson(deepskillId).catch((err) => {
+      logger.warn({ err, deepskillId }, 'deep-skill: syncSkillOptionsJson failed after deactivate option-purge (non-fatal)');
+    });
+  }
+
   // ── Auto-generate image on update (2026-06-12) ──────────────────────
   // Re-read the post-patch state so the trigger reflects what's
   // actually on the row (not what the patch CLAIMED to set). Guards:
@@ -560,8 +573,31 @@ async function updateExistingDuplicate(deepskillId, input) {
 }
 
 async function setStatus(deepskillId, active) {
-  await pool.query('UPDATE tbl_deep_skill SET status = ? WHERE deepskill_id = ?',
-    [active ? 1 : 0, deepskillId]);
+  // Transactional: when a deep skill is deactivated/deleted (active=false), the
+  // status flip and the hard-delete of its option definitions must be atomic
+  // (product rule: an inactive/deleted deep skill drops its mapped options).
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.query('UPDATE tbl_deep_skill SET status = ? WHERE deepskill_id = ?',
+      [active ? 1 : 0, deepskillId]);
+    if (!active) {
+      await conn.query('DELETE FROM tbl_deepskill_options WHERE deepskill_id = ?', [deepskillId]);
+    }
+    await conn.commit();
+  } catch (e) {
+    try { await conn.rollback(); } catch (_) { /* ignore rollback failure */ }
+    throw e;
+  } finally {
+    conn.release();
+  }
+  // Re-sync the denormalised skill_options JSON so it reflects the now-empty
+  // option set (legacy consumers read that blob). Non-fatal if it fails.
+  if (!active) {
+    await syncSkillOptionsJson(deepskillId).catch((err) => {
+      logger.warn({ err, deepskillId }, 'deep-skill: syncSkillOptionsJson failed after deactivate option-purge (non-fatal)');
+    });
+  }
   return getById(deepskillId);
 }
 

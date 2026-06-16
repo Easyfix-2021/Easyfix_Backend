@@ -82,10 +82,13 @@ async function getEasyfixerForVerification(efrId) {
 
 async function getBanking(efrId) {
   const [[row]] = await pool.query(
+    // Bank-name lookup lives in `bank_name` (id, bank_name, is_easyfix_bank) —
+    // the legacy `tbl_easyfix_bank` table does not exist on the live DB
+    // (confirmed 2026-06-16; same table the /shared/lookup/banks endpoint reads).
     `SELECT tb.*, eb.bank_name AS easyfix_bank_name, U.user_name AS updated_by_name
        FROM tbl_easyfixer_bank_details tb
-       LEFT JOIN tbl_easyfix_bank eb ON eb.id = tb.easyfix_bank_name_id
-       LEFT JOIN tbl_user U          ON U.user_id = tb.updated_by
+       LEFT JOIN bank_name eb ON eb.id = tb.easyfix_bank_name_id
+       LEFT JOIN tbl_user U   ON U.user_id = tb.updated_by
       WHERE tb.efr_id = ? LIMIT 1`,
     [efrId]
   );
@@ -112,8 +115,11 @@ async function getCommentsBySection(efrId, section) {
 }
 
 async function listEasyfixBanks() {
+  // `bank_name` is the unified bank table; the EasyFix-curated subset is
+  // flagged by `is_easyfix_bank = 1` (there is no `bank_status` column here —
+  // that belonged to the non-existent legacy `tbl_easyfix_bank`).
   const [rows] = await pool.query(
-    `SELECT id, bank_name FROM tbl_easyfix_bank WHERE bank_status = 1 ORDER BY bank_name`
+    `SELECT id, bank_name FROM bank_name WHERE is_easyfix_bank = 1 ORDER BY bank_name`
   );
   return rows;
 }

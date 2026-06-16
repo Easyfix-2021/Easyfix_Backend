@@ -35,8 +35,34 @@ const logger = require('../logger');
  * "No. of pincodes"    = COUNT of tbl_zone_pincode_mapping rows for the zone.
  */
 
-// ─── List ────────────────────────────────────────────────────────────
-async function listZones() {
+// ─── List (server-side paginated) ────────────────────────────────────
+/*
+ * Returns { items, total }. `q` matches zone name or city name. Pagination
+ * is server-side (LIMIT/OFFSET); `total` is the unpaginated row count for
+ * the same filter so the shared TablePagination can compute page count.
+ * Default limit is generous (1000) so the FE "All" sentinel maps cleanly.
+ */
+async function listZones({ q, limit = 1000, offset = 0, includeInactive = false } = {}) {
+  const lim = Math.min(Math.max(Number(limit) || 1000, 1), 5000);
+  const off = Math.max(Number(offset) || 0, 0);
+
+  // WHERE built once and shared by the page + COUNT queries so filtered
+  // `total` always matches the rows actually returned.
+  const where = [];
+  const whereParams = [];
+  // Active-by-default: the Manage Zones list hides inactive zones unless the
+  // operator opts in via "Show Inactive Zones" (so they can reactivate them).
+  if (!(includeInactive === true || includeInactive === 'true')) {
+    where.push('z.zone_status = 1');
+  }
+  const term = (q || '').trim();
+  if (term) {
+    where.push('(z.zone_name LIKE ? OR c.city_name LIKE ?)');
+    const like = `%${term}%`;
+    whereParams.push(like, like);
+  }
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
   const [rows] = await pool.query(`
     SELECT
       z.zone_id,
@@ -56,9 +82,19 @@ async function listZones() {
         WHERE zpm.zone_id = z.zone_id) AS technician_count
       FROM tbl_zone_master z
       LEFT JOIN tbl_city   c ON c.city_id = z.city_id
+      ${whereSql}
      ORDER BY c.city_name ASC, z.zone_name ASC
-  `);
-  return rows;
+     LIMIT ? OFFSET ?
+  `, [...whereParams, lim, off]);
+
+  const [[{ total }]] = await pool.query(`
+    SELECT COUNT(*) AS total
+      FROM tbl_zone_master z
+      LEFT JOIN tbl_city c ON c.city_id = z.city_id
+      ${whereSql}
+  `, whereParams);
+
+  return { items: rows, total: Number(total) };
 }
 
 // ─── Detail (zone + assigned pincodes) ───────────────────────────────
@@ -105,29 +141,67 @@ async function getZoneDetail(zoneId) {
 
 // ─── Pincodes available for assigning to this zone ───────────────────
 /*
- * Eligible = ALL active pincodes in the zone's city. Multi-zone membership
- * is now allowed, so a pincode already on another zone is still assignable
- * here. Each row carries `in_this_zone` (boolean) — EXISTS a junction row
- * for (zoneId, pincode_id) — so the FE can pre-tick current membership.
+ * Eligible = ALL active pincodes anywhere (the zone-city restriction is
+ * GONE — a zone may now contain pincodes from any city, and a zone with
+ * "No City" must still be able to map pincodes). `q` searches across
+ * pincode / location / city_name / district. Results are paginated
+ * (capped ~200 per page) so the editor stays usable against the full
+ * catalog. Each row carries `in_this_zone` (boolean) — EXISTS a junction
+ * row for (zoneId, pincode_id) — so the FE pre-ticks current membership.
+ *
+ * `total` is the unpaginated count for the same filter; the FE shows it
+ * and can drive a "load more" / paging affordance if needed.
  */
-async function listAssignablePincodes(zoneId) {
-  const [[zone]] = await pool.query(
-    'SELECT city_id FROM tbl_zone_master WHERE zone_id = ? LIMIT 1', [zoneId]
-  );
-  if (!zone || !zone.city_id) return [];
+async function listAssignablePincodes(zoneId, { q, limit = 50, offset = 0, inZoneOnly = false } = {}) {
+  const lim = Math.min(Math.max(Number(limit) || 50, 1), 200);
+  const off = Math.max(Number(offset) || 0, 0);
+  const onlyInZone = inZoneOnly === true || inZoneOnly === 'true';
+
+  // Shared WHERE for page + COUNT. Only the active catalog is offered.
+  const where = ['p.pincode_status = 1'];
+  const whereParams = [];
+  const term = (q || '').trim();
+  if (term) {
+    where.push('(p.pincode LIKE ? OR p.location LIKE ? OR c.city_name LIKE ? OR p.district LIKE ?)');
+    const like = `%${term}%`;
+    whereParams.push(like, like, like, like);
+  }
+  // "Show In Zone Only" — restrict to pincodes already mapped to THIS zone.
+  // Appended AFTER the LIKE params so it lines up with the shared whereParams
+  // order consumed by BOTH the page query (zoneId, ...whereParams, lim, off)
+  // and the COUNT query (whereParams).
+  if (onlyInZone) {
+    where.push('EXISTS (SELECT 1 FROM tbl_zone_pincode_mapping zpm2 WHERE zpm2.zone_id = ? AND zpm2.pincode_id = p.pincode_id)');
+    whereParams.push(zoneId);
+  }
+  const whereSql = `WHERE ${where.join(' AND ')}`;
+
   const [rows] = await pool.query(
-    `SELECT p.pincode_id, p.pincode, p.location, p.district,
+    `SELECT p.pincode_id, p.pincode, p.location, p.district, c.city_name,
             EXISTS (
               SELECT 1 FROM tbl_zone_pincode_mapping zpm
                WHERE zpm.zone_id = ? AND zpm.pincode_id = p.pincode_id
             ) AS in_this_zone
        FROM tbl_pincode p
-      WHERE p.city_id = ?
-        AND p.pincode_status = 1
-      ORDER BY p.pincode ASC`,
-    [zoneId, zone.city_id]
+       LEFT JOIN tbl_city c ON c.city_id = p.city_id
+       ${whereSql}
+      ORDER BY p.pincode ASC
+      LIMIT ? OFFSET ?`,
+    [zoneId, ...whereParams, lim, off]
   );
-  return rows.map((r) => ({ ...r, in_this_zone: !!r.in_this_zone }));
+
+  const [[{ total }]] = await pool.query(
+    `SELECT COUNT(*) AS total
+       FROM tbl_pincode p
+       LEFT JOIN tbl_city c ON c.city_id = p.city_id
+       ${whereSql}`,
+    whereParams
+  );
+
+  return {
+    items: rows.map((r) => ({ ...r, in_this_zone: !!r.in_this_zone })),
+    total: Number(total),
+  };
 }
 
 // ─── Easyfixers in a zone (with search) ──────────────────────────────
@@ -283,7 +357,23 @@ async function updateZone(zoneId, { zone_name, zone_status }) {
 
     sets.push('zone_name = ?'); vals.push(trimmed);
   }
-  if (zone_status !== undefined) { sets.push('zone_status = ?'); vals.push(zone_status ? 1 : 0); }
+  if (zone_status !== undefined) {
+    // Restrict deactivation: a zone that still has pincodes mapped to it must
+    // not be deactivated. This keeps the invariant "inactive zone ⟹ 0 mapped
+    // pincodes" (the pincode side already refuses to map a pincode to an
+    // inactive zone), so candidate-ranking's active-zone filter never silently
+    // drops a pincode that operators believe is covered.
+    if (!zone_status) {
+      const [[{ cnt }]] = await pool.query(
+        'SELECT COUNT(*) AS cnt FROM tbl_zone_pincode_mapping WHERE zone_id = ?',
+        [zoneId]
+      );
+      if (Number(cnt) > 0) {
+        throw mkErr(409, `Cannot deactivate this zone — ${cnt} pincode(s) are still mapped to it. Remove all its pincodes first.`);
+      }
+    }
+    sets.push('zone_status = ?'); vals.push(zone_status ? 1 : 0);
+  }
   if (sets.length === 0) return getZoneDetail(zoneId);
 
   vals.push(zoneId);
@@ -300,8 +390,9 @@ async function updateZone(zoneId, { zone_name, zone_status }) {
  * rows. Other zones' rows are never touched (multi-zone is allowed), and we
  * no longer reject pincodes that belong to a different zone.
  *
- * Cross-city safety: only pincodes belonging to this zone's city are
- * accepted. Non-existent or other-city ids are reported as `rejected`.
+ * City is NO LONGER a constraint: a zone may contain pincodes from any city
+ * (including a zone with "No City"). The ONLY rejection is not-found — an id
+ * that doesn't exist in tbl_pincode. Such ids are reported as `rejected`.
  */
 async function setPincodeMapping(zoneId, pincodeIds, { userId = null } = {}) {
   const ids = Array.from(new Set((pincodeIds || []).map(Number).filter(Number.isFinite)));
@@ -318,11 +409,12 @@ async function setPincodeMapping(zoneId, pincodeIds, { userId = null } = {}) {
     const rejected = [];
     const acceptable = [];
     if (ids.length) {
-      // Validate every requested id: must exist and must belong to this
-      // zone's city. Membership in OTHER zones is now irrelevant.
+      // Validate every requested id: it must EXIST in tbl_pincode. City and
+      // other-zone membership are no longer constraints (multi-city,
+      // multi-zone are both allowed).
       const placeholders = ids.map(() => '?').join(',');
       const [rows] = await conn.query(
-        `SELECT pincode_id, pincode, city_id
+        `SELECT pincode_id, pincode
            FROM tbl_pincode WHERE pincode_id IN (${placeholders})`,
         ids
       );
@@ -331,8 +423,6 @@ async function setPincodeMapping(zoneId, pincodeIds, { userId = null } = {}) {
         const r = byId.get(id);
         if (!r) {
           rejected.push({ pincode_id: id, reason: 'Pincode not found' });
-        } else if (Number(r.city_id) !== Number(zone.city_id)) {
-          rejected.push({ pincode_id: id, pincode: r.pincode, reason: 'Different city than this zone' });
         } else {
           acceptable.push(id);
         }

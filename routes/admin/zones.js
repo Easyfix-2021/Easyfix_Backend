@@ -29,6 +29,22 @@ const searchQuery  = Joi.object({
   limit:      Joi.number().integer().min(1).max(500).default(200),
   activeOnly: Joi.boolean().default(true),
 });
+
+// List filter/pagination — `q` matches zone or city name.
+const listQuery = Joi.object({
+  q:      Joi.string().allow('', null).optional(),
+  limit:  Joi.number().integer().min(1).max(5000).default(1000),
+  offset: Joi.number().integer().min(0).default(0),
+  includeInactive: Joi.boolean().truthy('true').falsy('false').default(false),
+});
+
+// Assignable-pincode search/pagination — `q` matches pincode/location/city/district.
+const assignableQuery = Joi.object({
+  q:      Joi.string().allow('', null).optional(),
+  limit:  Joi.number().integer().min(1).max(200).default(50),
+  offset: Joi.number().integer().min(0).default(0),
+  inZoneOnly: Joi.boolean().truthy('true').falsy('false').optional(),
+});
 const pincodeQuery = Joi.object({
   pincode: Joi.string().pattern(/^\d{6}$/).required(),
   limit:   Joi.number().integer().min(1).max(500).default(200),
@@ -50,8 +66,8 @@ const upload = multer({
 const userIdOf = (req) => (req.user && req.user.user_id) || null;
 
 // ─── READ ────────────────────────────────────────────────────────────
-router.get('/', async (_req, res, next) => {
-  try { modernOk(res, await zone.listZones()); } catch (e) { next(e); }
+router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
+  try { modernOk(res, await zone.listZones(req.query)); } catch (e) { next(e); }
 });
 
 // `/by-pincode` and `/template` listed BEFORE `/:id` to avoid Express
@@ -80,13 +96,18 @@ router.get('/:id', validate(idParam, 'params'), async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// Pincodes the zone editor can pick from (current + unzoned in same city).
-router.get('/:id/assignable-pincodes', validate(idParam, 'params'), async (req, res, next) => {
-  try {
-    const items = await zone.listAssignablePincodes(Number(req.params.id));
-    modernOk(res, items);
-  } catch (e) { next(e); }
-});
+// Pincodes the zone editor can pick from — ALL active pincodes (any city),
+// searchable + paginated. Returns { items, total }.
+router.get('/:id/assignable-pincodes',
+  validate(idParam, 'params'),
+  validate(assignableQuery, 'query'),
+  async (req, res, next) => {
+    try {
+      const result = await zone.listAssignablePincodes(Number(req.params.id), req.query);
+      modernOk(res, result);
+    } catch (e) { next(e); }
+  }
+);
 
 router.get('/:id/easyfixers', validate(idParam, 'params'), validate(searchQuery, 'query'), async (req, res, next) => {
   try {

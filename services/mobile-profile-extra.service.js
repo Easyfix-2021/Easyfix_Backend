@@ -527,88 +527,61 @@ async function logout(efrId, deviceId) {
 /*
  * UPI details — legacy `upi-details` (get/add).
  *
- * STATUS (2026-06-16): DEFERRED to the alteration pass — do NOT re-point here.
- * `tbl_easyfixer_upi` does NOT exist. The real legacy table is
- * `upi_details (id PK, upi_or_mobile_number VARCHAR(255), user_id INT)` — no
- * is_primary, no timestamp (the multi-UPI/primary model below does not apply).
+ * Backed by the efr-keyed `tbl_easyfixer_bank_details.upi_or_mobile_number`
+ * (decision 2026-06-16). `efr_Id` is UNIQUE → exactly ONE UPI per technician
+ * (not a list), so the read returns a 0-or-1-item list to preserve the app's
+ * `UpiData[]` contract, and the write upserts that single field.
  *
- * Crucially, `upi_details.user_id` is the legacy `tbl_user.user_id`, NOT
- * `efr_id` (live count 2026-06-16: 431/431 rows match a tbl_user.user_id vs
- * only 393/431 an efr_id — a real FK matches ~100%; the 91% is id-space
- * overlap). Technicians were tbl_user role-19 rows in the legacy system; the
- * new backend re-based mobile identity onto tbl_easyfixer.efr_id, so the
- * mobile token carries efr_id and CANNOT key this table without an
- * efr_id → tbl_user.user_id bridge (the unreliable ghost-row mapping —
- * ~4,753 role-19 rows). That bridge, OR switching the app to an efr-keyed
- * store (tbl_easyfixer_bank_details.upi_or_mobile_number, which is CRM-shared),
- * is a cross-tier WRITE decision for the alteration iteration — out of the
- * zero-risk pass.
+ * Why NOT the legacy `upi_details` table: its `user_id` is the legacy
+ * `tbl_user.user_id` (role-19 ghost), not `efr_id`, so an efr-based mobile
+ * token can't key it without a fragile ghost-row bridge (431/431 rows matched
+ * tbl_user vs 393/431 efr_id — verified 2026-06-16).
  *
- * Until then the queries below intentionally target the non-existent
- * `tbl_easyfixer_upi`: getUpiDetails degrades to {items:[]}, addUpiDetail
- * 503s (see its catch) — both safe, neither mis-files data.
+ * CRM-SHARED caveat: `tbl_easyfixer_bank_details` is read by the CRM
+ * easyfixer-verification flow. This write is scoped to the caller's OWN row
+ * (`efr_Id = req.tech.efr_id`) and touches ONLY `upi_or_mobile_number`
+ * (+ timestamps) — never the bank-account / mode_of_payment / verification
+ * columns the CRM owns.
  */
 async function getUpiDetails(efrId) {
   let items = [];
   try {
-    const [rows] = await pool.query(
-      `SELECT id, upi_id, is_primary
-         FROM tbl_easyfixer_upi
-        WHERE efr_id = ?
-        ORDER BY is_primary DESC, id DESC`,
+    const [[row]] = await pool.query(
+      `SELECT efr_bank_id, upi_or_mobile_number
+         FROM tbl_easyfixer_bank_details
+        WHERE efr_Id = ? LIMIT 1`,
       [efrId],
     );
-    items = rows.map((r) => ({
-      id: r.id,
-      upiId: r.upi_id ?? null,
-      isPrimary: Boolean(r.is_primary),
-    }));
+    const upi = row && row.upi_or_mobile_number != null
+      ? String(row.upi_or_mobile_number).trim() : '';
+    if (upi) items = [{ id: row.efr_bank_id, upiId: upi, isPrimary: true }];
   } catch (e) {
-    logger.warn({ err: e.message, efrId }, 'getUpiDetails query failed (VERIFY tbl_easyfixer_upi columns)');
+    logger.warn({ err: e.message, efrId }, 'getUpiDetails query failed');
   }
   return { items };
 }
 
 /*
- * Add a UPI id. When `isPrimary` is requested, demote any existing
- * primary in the SAME transaction so exactly one stays primary.
- * Multi-step write → pool connection + begin/commit/rollback per the
- * coding rules.
+ * Set the technician's UPI. Single-row-per-tech upsert on the UNIQUE `efr_Id`
+ * (one UPI, no is_primary concept). The route passes `isPrimary` but it is
+ * ignored here — there is only ever one UPI. The INSERT...ON DUPLICATE KEY
+ * UPDATE is a single atomic statement (the UNIQUE `efr_Id` drives the upsert),
+ * so no transaction is needed. On a first-time insert it creates a UPI-only
+ * bank row (other columns default/NULL); the CRM verification read LEFT-JOINs
+ * the bank-name lookup, so a partial row is handled gracefully.
  */
-async function addUpiDetail(efrId, upiId, isPrimary) {
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-    if (isPrimary) {
-      await conn.query(
-        'UPDATE tbl_easyfixer_upi SET is_primary = 0 WHERE efr_id = ?',
-        [efrId],
-      );
-    }
-    const [ins] = await conn.query(
-      `INSERT INTO tbl_easyfixer_upi (efr_id, upi_id, is_primary, created_date_time)
-       VALUES (?, ?, ?, NOW())`,
-      [efrId, upiId, isPrimary ? 1 : 0],
-    );
-    await conn.commit();
-    return { id: ins.insertId, upiId, isPrimary: Boolean(isPrimary) };
-  } catch (e) {
-    try { await conn.rollback(); } catch (_) { /* swallow rollback failure */ }
-    // Storage table not provisioned yet (real table is `upi_details`, pending
-    // a column-confirmed re-point). Degrade a missing-table error to a clean
-    // 503 rather than a raw 500 — and crucially NOT a fake success, so the app
-    // knows the UPI was not saved. Mirrors getUpiDetails' defensive posture
-    // for the write path.
-    if (e && (e.code === 'ER_NO_SUCH_TABLE' || e.errno === 1146)) {
-      logger.warn({ err: e.message, efrId }, 'addUpiDetail: UPI storage not available yet — degrading to 503');
-      const err = new Error('UPI storage is not available yet');
-      err.status = 503;
-      throw err;
-    }
-    throw e;
-  } finally {
-    conn.release();
-  }
+async function addUpiDetail(efrId, upiId) {
+  await pool.query(
+    `INSERT INTO tbl_easyfixer_bank_details (efr_Id, upi_or_mobile_number, insert_date, update_date)
+     VALUES (?, ?, NOW(), NOW())
+     ON DUPLICATE KEY UPDATE upi_or_mobile_number = ?, update_date = NOW()`,
+    [efrId, upiId, upiId],
+  );
+  const [[row]] = await pool.query(
+    'SELECT efr_bank_id FROM tbl_easyfixer_bank_details WHERE efr_Id = ? LIMIT 1',
+    [efrId],
+  );
+  return { id: row ? row.efr_bank_id : null, upiId, isPrimary: true };
 }
 
 // ─────────────────────────────────────────────────────────────────────
