@@ -505,9 +505,18 @@ router.use('/registration', require('./registration'));
 router.use(require('./attendance'));
 //   /experience
 router.use(require('./lookups'));
-//   /profile/name · /profile/image · /profile/performance/weekly
-//   /earnings · /icard · /ratings · /training-videos/percentage · /app-version
-//   /logout · /upi-details · /kyc/aadhaar-pan-exists/:number
+//   /profile/name · /profile/image · /earnings · /icard · /ratings
+//   /training-videos/percentage · /app-version · /logout · /upi-details
+//   /kyc/aadhaar-pan-exists/:number
 router.use(require('./profile-extra'));
+//   /performance/weekly  (live OTA/SDA weekly chart — net-new GAP #5)
+router.use('/performance', require('./performance'));
+//   /kyc/digilocker/* · /kyc/pan-ocr · /kyc/aadhaar/* · /kyc/bank/verify · /kyc/upi/verify
+//   (3rd-party KYC server-proxy — net-new GAP #2; needs SUREPASS_VERIFICATION_KEY)
+router.use('/kyc', require('./kyc'));
+//   /email/exists · /email/send-verification · /email/status  (net-new GAP #4)
+router.use('/email', require('./email-verify'));
+//   /uploads  (generic S3 multipart upload primitive — net-new GAP #1)
+router.use('/uploads', require('./uploads'));
 
 module.exports = router;

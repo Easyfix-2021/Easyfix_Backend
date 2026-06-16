@@ -1,5 +1,7 @@
 const router = require('express').Router();
+const Joi = require('joi');
 
+const validate = require('../../middleware/validate');
 const { modernOk, modernError } = require('../../utils/response');
 const lookupsService = require('../../services/mobile-lookups.service');
 
@@ -32,5 +34,22 @@ router.get('/experience', async (_req, res, next) => {
     next(e);
   }
 });
+
+// ─── GET /lookups/pincode/:pincode — resolve a pincode to city/district/state ──
+//   → { pincode, cityId, city, district, state }  (404 when not seeded)
+router.get(
+  '/lookups/pincode/:pincode',
+  validate(Joi.object({ pincode: Joi.string().trim().pattern(/^\d{6}$/).required() }), 'params'),
+  async (req, res, next) => {
+    try {
+      const result = await lookupsService.resolvePincode(req.params.pincode);
+      if (!result) return modernError(res, 404, 'pincode not found');
+      modernOk(res, result);
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
 
 module.exports = router;

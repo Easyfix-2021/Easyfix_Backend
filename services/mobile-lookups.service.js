@@ -37,6 +37,32 @@ async function experience() {
   }));
 }
 
+// ── Pincode → city / district / state ──────────────────────────────────
+/*
+ * Resolve a 6-digit pincode to its city + district + state for the
+ * registration / edit-profile address forms (legacy Flutter GetCityStateBloc).
+ *
+ * Pure DB — NO Google/Mappls call needed: tbl_pincode.city_id → tbl_city →
+ * tbl_state already carries city + state (the geocode service is lat/lng-only).
+ * Reuses the canonical resolver services/pincode.service.getPincodeByValue,
+ * which returns { city_name, district, state_name, ... }. Returns null when the
+ * pincode isn't seeded in tbl_pincode (caller surfaces "enter manually").
+ */
+async function resolvePincode(pincode) {
+  // eslint-disable-next-line global-require
+  const pincodeService = require('./pincode.service');
+  const row = await pincodeService.getPincodeByValue(pincode);
+  if (!row) return null;
+  return {
+    pincode: row.pincode,
+    cityId: row.city_id ?? null,
+    city: row.city_name ?? null,
+    district: row.district ?? null,
+    state: row.state_name ?? null,
+  };
+}
+
 module.exports = {
   experience,
+  resolvePincode,
 };

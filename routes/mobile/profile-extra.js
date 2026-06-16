@@ -1,9 +1,28 @@
 const router = require('express').Router();
 const Joi = require('joi');
+const multer = require('multer');
 
 const validate = require('../../middleware/validate');
 const { modernOk, modernError } = require('../../utils/response');
 const svc = require('../../services/mobile-profile-extra.service');
+
+// Profile-image multipart upload — memory storage, single image ≤10MB.
+// Images-only allowlist mirrors routes/mobile/uploads.js + admin job images.
+const profileImageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024, files: 1 },
+  fileFilter: (_req, file, cb) => {
+    const ok = ['image/png', 'image/jpeg', 'image/jpg', 'image/webp'].includes(
+      String(file.mimetype || '').toLowerCase(),
+    );
+    if (!ok) {
+      const e = new Error('only png/jpg/jpeg/webp images are allowed');
+      e.code = 'LIMIT_UNEXPECTED_FILE';
+      return cb(e);
+    }
+    return cb(null, true);
+  },
+});
 
 /*
  * /api/mobile/profile-extra/* — Technician-app "profile extras" surface.
@@ -51,32 +70,41 @@ router.patch('/profile/name', validate(Joi.object({
 });
 
 /*
- * Set the profile image. The binary is uploaded via the generic
- * doc/image upload endpoint first; this call persists the resulting
- * reference (`imageId` = S3 key / file id).
+ * Set the profile image — direct multipart byte upload.
  *
- * VERIFY: the RN app may instead POST the file as multipart directly to
- * this route. If so, swap this JSON body for a multer single-file
- * handler + job-upload.service. For now we take the already-uploaded
- * `imageId` (the simpler, upload-then-link flow).
+ * The RN screen POSTs the image file as multipart/form-data under the
+ * `file` field. We upload it to S3 at `EasyfixerProfile/<efrId>_<ts>`
+ * (no extension on the key — Content-Type + original-filename carry the
+ * real type), persist that key onto tbl_easyfixer.efr_profile_img, and
+ * return { url, imageId } (imageId == the stored key). When S3 is
+ * disabled (local dev) the service falls back to local disk.
  */
-router.post('/profile/image', validate(Joi.object({
-  imageId: Joi.string().trim().min(1).max(1024).required(),
-})), async (req, res, next) => {
+router.post('/profile/image', profileImageUpload.single('file'), async (req, res, next) => {
   try {
-    modernOk(res, await svc.setProfileImage(req.tech.efr_id, req.body.imageId));
-  } catch (e) { next(e); }
+    if (!req.file) {
+      return modernError(res, 400, 'missing "file" upload');
+    }
+    return modernOk(res, await svc.setProfileImageFromUpload(
+      req.tech.efr_id,
+      req.file.buffer,
+      req.file.mimetype,
+      req.file.originalname,
+    ));
+  } catch (e) {
+    if (e?.code === 'LIMIT_FILE_SIZE') {
+      return modernError(res, 400, 'file exceeds 10MB');
+    }
+    if (e?.code === 'LIMIT_UNEXPECTED_FILE') {
+      return modernError(res, 400, e.message || 'unsupported file');
+    }
+    return next(e);
+  }
 });
 
-// Weekly performance chart.
-router.get('/profile/performance/weekly', validate(dateWindow, 'query'), async (req, res, next) => {
-  try {
-    modernOk(res, await svc.getWeeklyPerformance(req.tech.efr_id, {
-      from: req.query.from,
-      to: req.query.to,
-    }));
-  } catch (e) { next(e); }
-});
+// Weekly performance chart — MOVED to routes/mobile/performance.js
+// (`GET /api/mobile/performance/weekly`), which the RN app actually calls and
+// which fixes the tbl_job_transaction JOIN fan-out the old aggregate had. The
+// old `/profile/performance/weekly` path was never reached by the app.
 
 // ─────────────────────────────────────────────────────────────────────
 // Earnings

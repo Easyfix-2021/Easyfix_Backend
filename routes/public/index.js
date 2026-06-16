@@ -41,5 +41,14 @@ router.use('/book', require('./url-resolve'));
  * see routes/public/deep-skills.js for the security rationale.
  */
 router.use('/deep-skills', require('./deep-skills'));
+/*
+ * Technician email-verification landing (2026-06-16). UNAUTHENTICATED — this
+ * is the link the technician's mail client opens directly in a browser. The
+ * :token path segment is the sole authority (single-use, 24h TTL); it consumes
+ * the token and flips is_email_verified on that technician's own row, then
+ * renders a self-contained HTML confirmation page (not the JSON envelope).
+ * See routes/public/email-verify.js for the security rationale.
+ */
+router.use('/email-verify', require('./email-verify'));
 
 module.exports = router;

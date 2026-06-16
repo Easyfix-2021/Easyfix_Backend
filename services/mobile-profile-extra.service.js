@@ -1,5 +1,7 @@
 const { pool } = require('../db');
 const logger = require('../logger');
+const s3Storage = require('../utils/s3-storage');
+const { writeBuffer } = require('../utils/file-storage');
 
 /*
  * mobile-profile-extra.service — backing logic for routes/mobile/profile-extra.js.
@@ -110,7 +112,43 @@ async function setProfileImage(efrId, imageId) {
     'UPDATE tbl_easyfixer SET efr_profile_img = ? WHERE efr_id = ?',
     [imageId, efrId],
   );
-  return { url: imageId };
+  return { url: await s3Storage.resolveImageUrl(imageId), imageId };
+}
+
+/*
+ * Set the profile image from a multipart byte upload — the direct path
+ * the RN profile screen uses (POST /profile/image with a `file` part).
+ *
+ * Uploads the bytes to S3 at the canonical key `EasyfixerProfile/<efrId>_<ts>`
+ * (no extension on the key — Content-Type + original-filename carry the real
+ * type, mirroring the JobSupportings / Notices / ClientDocs conventions),
+ * persists that key onto tbl_easyfixer.efr_profile_img, and returns
+ * { url, imageId } where imageId == the stored key.
+ *
+ * When S3 is disabled (local dev, no S3_BUCKET_NAME) it falls back to local
+ * disk via file-storage.writeBuffer('general', …) and stores that filename
+ * as the key — resolveImageUrl reads either shape back correctly.
+ */
+async function setProfileImageFromUpload(efrId, buffer, contentType, originalName) {
+  let key;
+  if (s3Storage.isEnabled()) {
+    key = await s3Storage.putAtKey({
+      key: `EasyfixerProfile/${Number(efrId)}_${Date.now()}`,
+      buffer,
+      contentType,
+      originalName,
+    });
+  } else {
+    const saved = writeBuffer('general', buffer, originalName, contentType);
+    key = saved.filename;
+  }
+
+  await pool.query(
+    'UPDATE tbl_easyfixer SET efr_profile_img = ? WHERE efr_id = ?',
+    [key, efrId],
+  );
+
+  return { url: await s3Storage.resolveImageUrl(key), imageId: key };
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -613,6 +651,7 @@ async function aadhaarPanExists(number, excludeEfrId) {
 module.exports = {
   updateName,
   setProfileImage,
+  setProfileImageFromUpload,
   getWeeklyPerformance,
   getEarnings,
   getICard,
