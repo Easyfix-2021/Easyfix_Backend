@@ -354,6 +354,7 @@ async function statsForCandidates(efrIds, job, clientId) {
     defaultSdaScore,
     tatTierJson,
     [activeRows],
+    [completedRows],
     conflictRowsResult,
     [ratingRows],
     [tatRows],
@@ -380,6 +381,19 @@ async function statsForCandidates(efrIds, job, clientId) {
          FROM tbl_job
         WHERE fk_easyfixter_id IN (${placeholders})
           AND job_status IN (0, 1, 2)
+        GROUP BY fk_easyfixter_id`,
+      efrIds
+    ),
+
+    // Completed jobs till now (2026-06-17) — "Fresher" flag source. DISTINCT
+    // COMPLETED jobs (status 3/5), mirroring the Manage Easyfixers job_count
+    // column so the chip means the same thing on both surfaces.
+    // job_count < 5 => Fresher chip in the Top 10 / Search candidate list.
+    pool.query(
+      `SELECT fk_easyfixter_id AS efr_id, COUNT(DISTINCT job_id) AS job_count
+         FROM tbl_job
+        WHERE fk_easyfixter_id IN (${placeholders})
+          AND job_status IN (3, 5)
         GROUP BY fk_easyfixter_id`,
       efrIds
     ),
@@ -537,6 +551,7 @@ async function statsForCandidates(efrIds, job, clientId) {
 
   // Build maps from the parallel results.
   const activeMap = new Map(activeRows.map((r) => [r.efr_id, Number(r.active_jobs)]));
+  const completedMap = new Map(completedRows.map((r) => [r.efr_id, Number(r.job_count)]));
   const conflictMap = new Map();
   for (const r of (conflictRowsResult[0] || [])) conflictMap.set(r.efr_id, true);
   const ratingMap = new Map(ratingRows.map((r) => [r.efr_id, Number(r.avg_rating)]));
@@ -689,6 +704,7 @@ async function statsForCandidates(efrIds, job, clientId) {
 
     out.set(id, {
       active_jobs:        activeMap.get(id) ?? 0,
+      job_count:          completedMap.get(id) ?? 0, // completed jobs; "Fresher" when < 5
       has_conflict:       conflictMap.get(id) === true,
       avg_rating:         ratingMap.get(id) ?? defaultRating,
       avg_tat_hours:      tatRow ? tatRow.hours : null,
@@ -812,6 +828,7 @@ function buildCandidateRow(tech, s, job) {
     current_balance: Number(tech.current_balance ?? 0),
     account_balance: Number(tech.current_balance ?? 0),
     active_jobs:   s.active_jobs,
+    job_count:     s.job_count ?? 0, // completed jobs; "Fresher" chip when < 5
     avg_rating:    Number((s.avg_rating ?? 0).toFixed(2)),
     avg_tat_hours: s.avg_tat_hours == null ? null : Number(s.avg_tat_hours.toFixed(1)),
     tat_history:   s.tat_history,

@@ -43,6 +43,19 @@ const listQuery = Joi.object({
   zonalManagerId:   Joi.number().integer().positive().optional(),
   attendance:       Joi.string().valid('present', 'absent', 'on_leave', 'no_information').optional(),
   deepSkillMapped:  Joi.string().valid('mapped', 'not_mapped').optional(),
+
+  // Server-side sort (2026-06-17) — column click sorts the COMPLETE filtered
+  // list, not just the current page. Whitelist mirrors the MAIN_SORT + AGG_SORT
+  // maps in easyfixer.service.js list(); the service also falls back to efr_id
+  // for anything unknown (defence in depth).
+  sortBy: Joi.string().valid(
+    'efr_id', 'efr_name', 'efr_no', 'efr_email', 'state_name', 'city_name',
+    'efr_service_category', 'efr_service_type', 'user_mapped_to_city',
+    'current_balance', 'efr_profile_perc', 'is_technician_verified',
+    'profile_update_sent_at', 'insert_date', 'efr_status_label',
+    'clients_mapped', 'total_earnings', 'job_count', 'avg_rating', 'options_mapped_count',
+  ).default('efr_id'),
+  sortDir: Joi.string().valid('asc', 'desc').insensitive().default('desc'),
 });
 
 const createBody = Joi.object({
