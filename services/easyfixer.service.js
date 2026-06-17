@@ -710,16 +710,33 @@ async function aggregates(efrIds, { scope } = {}) {
      ) rt ON rt.easyfixer_id = e.efr_id
      LEFT JOIN (
        /*
-        * Options-mapped rollup (2026-06-10). Counts DISTINCT options each
-        * easyfixer is mapped to in tbl_efr_deepskill_mapping where
-        * is_repairing = 1 (the "active" mapping flag). Covered by the
-        * composite index added in
+        * Mapped-deep-skill rollup. Counts DISTINCT DEEP SKILLS each easyfixer
+        * is actively mapped to. NEW CRM convention (confirmed 2026-06-17):
+        * physical parent_skill_id holds the deepskill_id (L3) and
+        * deep_skill_id holds the option id (L4) — so DISTINCT parent_skill_id
+        * = number of distinct deep skills (not option rows). The CRM column
+        * reads "Mapped Deep Skill"; alias kept as options_mapped_count for
+        * FE-key stability. is_repairing = 1 is the active flag. Covered by the
+        * composite index in
         * migrations/2026-06-10-add-efr-deepskill-mapping-composite-index.sql.
+        *
+        * EXISTS guard: count a deep skill only when parent_skill_id resolves to
+        * a tbl_deep_skill row that EXISTS and is not inactive (status <> 0) —
+        * mirrors candidate-ranking's exclusion of deactivated skills so "Mapped
+        * Deep Skill" means the same across the list, the detail modal and job
+        * ranking. Orphaned legacy rows (old-catalog ids with no surviving deep
+        * skill) fall out here too; per plan they're cleaned + re-uploaded via
+        * the new CRM.
         */
-       SELECT easyfixer_id, COUNT(*) AS options_mapped_count
-         FROM tbl_efr_deepskill_mapping
-        WHERE easyfixer_id IN (${placeholders}) AND is_repairing = 1
-        GROUP BY easyfixer_id
+       SELECT m.easyfixer_id, COUNT(DISTINCT m.parent_skill_id) AS options_mapped_count
+         FROM tbl_efr_deepskill_mapping m
+        WHERE m.easyfixer_id IN (${placeholders}) AND m.is_repairing = 1
+          AND EXISTS (
+            SELECT 1 FROM tbl_deep_skill ds
+             WHERE ds.deepskill_id = m.parent_skill_id
+               AND (ds.status IS NULL OR ds.status <> 0)
+          )
+        GROUP BY m.easyfixer_id
      ) optmap ON optmap.easyfixer_id = e.efr_id
      LEFT JOIN tbl_efr_serviceable_pincodes sp ON sp.easyfixer_id = e.efr_id
      WHERE e.efr_id IN (${placeholders})${scopeWhere}`,

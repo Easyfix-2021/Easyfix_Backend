@@ -670,7 +670,8 @@ async function mapClients(efrId, clientIds, actor) {
  */
 async function listOptionMappings(efrId) {
   const [rows] = await pool.query(
-    `SELECT m.category_id,
+    `SELECT m.id                        AS mapping_id,
+            m.category_id,
             sc.service_catg_name        AS category_name,
             m.service_type_id,
             st.service_type_name        AS service_type_name,
@@ -682,7 +683,15 @@ async function listOptionMappings(efrId) {
        FROM tbl_efr_deepskill_mapping m
        LEFT JOIN tbl_service_catg     sc ON sc.service_catg_id = m.category_id
        LEFT JOIN tbl_service_type     st ON st.service_type_id = m.service_type_id
-       LEFT JOIN tbl_deep_skill       ds ON ds.deepskill_id    = m.parent_skill_id -- parent_skill_id is the deep_skill FK
+       -- INNER JOIN: only deep-skill mappings whose deep skill RESOLVES and is
+       -- active. NEW CRM convention: parent_skill_id holds the deepskill_id;
+       -- requiring it to match an existing, non-inactive (status <> 0)
+       -- tbl_deep_skill row keeps this modal consistent with the "Mapped Deep
+       -- Skill" count and candidate-ranking. Orphaned legacy rows (old-catalog
+       -- ids, no surviving deep skill) fall out here — to be cleaned and
+       -- re-uploaded via the new CRM.
+       INNER JOIN tbl_deep_skill      ds ON ds.deepskill_id = m.parent_skill_id
+                                        AND (ds.status IS NULL OR ds.status <> 0) -- active, resolvable deep skill only
        LEFT JOIN tbl_deepskill_options o ON o.id               = m.deep_skill_id   -- deep_skill_id is the option FK
       WHERE m.easyfixer_id = ? AND m.is_repairing = 1
       ORDER BY sc.service_catg_name, st.service_type_name, ds.deepskill_name, o.skill_option`,
@@ -712,6 +721,28 @@ async function listOptionMappings(efrId) {
     void deep_skill_image;
     return { ...rest, deep_skill_image_url: urlByDeepSkillId.get(r.deep_skill_id) || null };
   });
+}
+
+/*
+ * Unmap a SINGLE deep-skill option mapping (the X action on the Manage
+ * Easyfixers "Mapped Deep Skill" detail modal). Soft-delete by row id —
+ * consistent with the no-hard-delete convention in this file; candidate-ranking
+ * filters is_repairing=1 so the skill drops from matching immediately. The
+ * easyfixer_id guard prevents unmapping a row owned by a different technician.
+ */
+async function unmapDeepSkill(efrId, rowId) {
+  const [result] = await pool.query(
+    `UPDATE tbl_efr_deepskill_mapping
+        SET is_repairing = 0
+      WHERE id = ? AND easyfixer_id = ? AND is_repairing = 1`,
+    [rowId, efrId]
+  );
+  if (result.affectedRows === 0) {
+    const err = new Error('Deep-skill mapping not found or already removed');
+    err.status = 404;
+    throw err;
+  }
+  return { unmapped: true };
 }
 
 async function replaceOptionMappings(efrId, items, actor, externalConn = null) {
@@ -902,6 +933,7 @@ module.exports = {
   mapClients,
   saveBgvReport,
   listOptionMappings,
+  unmapDeepSkill,
   replaceOptionMappings,
   listServiceablePincodes,
   replaceServiceablePincodes,

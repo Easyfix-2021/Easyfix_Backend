@@ -418,6 +418,24 @@ router.put('/:id/option-mappings',
     } catch (e) { next(e); }
   });
 
+// Unmap a single deep-skill option mapping (X action on the Manage Easyfixers
+// "Mapped Deep Skill" detail modal). Soft-deletes the row (is_repairing=0).
+router.delete('/:id/option-mappings/:rowId',
+  validate(Joi.object({
+    id:    Joi.number().integer().positive().required(),
+    rowId: Joi.number().integer().positive().required(),
+  }), 'params'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndAuthorize(req, res))) return;
+      const result = await verification.unmapDeepSkill(Number(req.params.id), Number(req.params.rowId));
+      modernOk(res, result, 'deep skill mapping removed');
+    } catch (e) {
+      if (e && typeof e.status === 'number') return modernError(res, e.status, e.message);
+      next(e);
+    }
+  });
+
 // ─── Serviceable Pincodes (tbl_efr_serviceable_pincodes) ────────────
 // Per-easyfixer set of pincodes the technician will accept jobs in.
 // GET returns active pincodes with display labels joined from tbl_pincode/
@@ -550,7 +568,7 @@ router.get('/:id/profile-update-link/dev-url',
       if (!(await loadAndAuthorize(req, res))) return;
       const efrId = Number(req.params.id);
       const token = signEasyfixerProfileToken(efrId);
-      const base = (process.env.CRM_PUBLIC_BASE_URL || 'http://localhost:5180').replace(/\/$/, '');
+      const base = (process.env.CRM_PUBLIC_BASE_URL || process.env.MAGIC_LINK_BASE_URL || 'http://localhost:5180').replace(/\/$/, '');
       const url = `${base}/profile-update/${token}`;
       modernOk(res, { efrId, token, url }, 'Dev profile-update link minted (no WhatsApp send)');
     } catch (e) {
