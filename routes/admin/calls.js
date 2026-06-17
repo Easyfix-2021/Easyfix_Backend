@@ -4,6 +4,7 @@ const logger = require('../../logger');
 const validate = require('../../middleware/validate');
 const { modernOk, modernError } = require('../../utils/response');
 const kaleyra = require('../../services/kaleyra.service');
+const voice = require('../../services/voice.service');
 const { getEffectivePermissions } = require('../../services/role.service');
 const { clickToCallBody, callListQuery } = require('../../validators/calls.validator');
 
@@ -71,7 +72,16 @@ router.get('/config', requireClickToCallAction, (req, res) => {
     if (envFrom || envTo) qaDefaults = { from: envFrom || null, to: envTo || null };
   }
 
-  modernOk(res, { mode, promptForNumbers, qaDefaults });
+  // enabledProviders/defaultProvider drive the FE provider radio: it shows the
+  // picker only when more than one provider is enabled; otherwise the call is
+  // one-click as before, dialling defaultProvider.
+  modernOk(res, {
+    mode,
+    promptForNumbers,
+    qaDefaults,
+    enabledProviders: voice.enabledProviders(),
+    defaultProvider: voice.defaultProvider(),
+  });
 });
 
 // ─── GET /preview ────────────────────────────────────────────────────
@@ -91,7 +101,7 @@ router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'
     // jobId / customerId / efrId / reportingContactId / page / limit and
     // silently strips unknowns. /preview consumes whichever of the four
     // identifiers the FE supplied — matching the click-to-call branches.
-    const { jobId, customerId, efrId, reportingContactId, useAlt } = req.query;
+    const { jobId, customerId, efrId, reportingContactId, useAlt, provider } = req.query;
     // Boolean coercion — query strings carry primitives as strings.
     // Accept '1' or 'true' (case-insensitive) so callers don't have to
     // remember which truthy shape we expect.
@@ -142,28 +152,32 @@ router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'
       receiverReal = ct.contact_no || null;
     }
 
-    // Resolve the EXACT masked legs we'd dial via the shared resolver
-    // (kaleyra.previewCallLegs) — the SAME code path clickToCall uses — so this
-    // preview can never drift from the real call. In QA mode (customNumberMode)
-    // we pass alwaysApplyEnvOverride so the KALEYRA_CALL_FROM/TO values the
-    // dialog pre-fills are reflected; dev/prod resolve through the normal
-    // waterfall (dev substitutes env, prod passes through to real). previewCall-
-    // Legs masks first-4-then-bullets internally (same convention as before).
+    // Resolve the EXACT masked legs we'd dial via the shared voice factory
+    // (voice.previewCallLegs) — the SAME code path clickToCall uses — so this
+    // preview can never drift from the real call. The factory resolves the
+    // provider (honouring the optional ?provider= when enabled, else the
+    // configured default) and delegates to that provider's previewCallLegs.
+    // In QA mode (customNumberMode) we pass alwaysApplyEnvOverride so the
+    // *_CALL_FROM/TO values the dialog pre-fills are reflected; dev/prod resolve
+    // through the normal waterfall. previewCallLegs masks first-4-then-bullets
+    // internally (same convention as before). The resolved provider is echoed
+    // back so the FE can label which line will dial.
     const mode = callingMode();
-    const preview = kaleyra.previewCallLegs({
+    const preview = voice.previewCallLegs({
+      provider,
       from: req.user.mobile_no,
       to:   receiverReal,
       alwaysApplyEnvOverride: mode === 'qa',
     });
 
-    modernOk(res, { mode, dialFrom: preview.from, dialTo: preview.to });
+    modernOk(res, { mode, dialFrom: preview.from, dialTo: preview.to, provider: preview.provider });
   } catch (e) { next(e); }
 });
 
 // ─── POST /click-to-call ─────────────────────────────────────────────
 router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody), async (req, res, next) => {
   try {
-    const { jobId, customerId, efrId, reportingContactId, callFrom, callTo, useAlt } = req.body;
+    const { jobId, customerId, efrId, reportingContactId, callFrom, callTo, useAlt, provider } = req.body;
     const agent = req.user;
 
     // Three-tier number-resolution waterfall:
@@ -289,63 +303,34 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
       receiverCustomerId = null;
     }
 
-    // ── Place the Kaleyra call ──
+    // ── Resolve the dial legs ──
     // In QA mode the operator typed both numbers; everywhere else we use
     // the resolved real values. The service layer's env-var overrides
-    // (KALEYRA_CALL_FROM / KALEYRA_CALL_TO) also fire here — but only
-    // when KALEYRA_CALLING_CUSTOM_NUMBER is OFF (the service has its own
-    // short-circuit so the FE-supplied values aren't clobbered).
+    // (per-provider *_CALL_FROM / *_CALL_TO) also fire — but only when that
+    // provider's CUSTOM_NUMBER flag is OFF (the service short-circuits so the
+    // FE-supplied values aren't clobbered).
     const dialFrom = isCustomNumberMode ? callFrom : agent.mobile_no;
     const dialTo   = isCustomNumberMode ? callTo   : receiverMobile;
-    const callResult = await kaleyra.clickToCall({
-      from: dialFrom,
-      to:   dialTo,
-    });
 
-    if (!callResult.delivered) {
-      // Suppressed-mode dev convenience: still return 200 so the UI can
-      // show "would have called" feedback. Distinct from real failures,
-      // which bubble as 4xx/5xx below.
-      if (callResult.suppressed || callResult.disabled) {
-        return modernOk(res, {
-          delivered: false,
-          suppressed: true,
-          message: 'Outbound calling is disabled in this environment (set KALEYRA_CALLING_ENABLED=true to enable).',
-        });
-      }
-
-      // Hand the FE the EXACT reason so the toast is actionable. The
-      // service layer already classified the failure via the
-      // `diagnostic` field so we don't have to re-parse strings here.
-      //   - caller_equals_receiver  → 400 (config issue, caller can fix
-      //                                    by changing TEST_MOBILE)
-      //   - kaleyra_soft_fail_no_id → 502 (provider accepted HTTP but
-      //                                    didn't dispatch a call leg)
-      //   - kaleyra_http_error      → 502 (provider returned non-2xx)
-      //   - network_error           → 502 (couldn't reach Kaleyra)
-      const status = callResult.diagnostic === 'caller_equals_receiver' ? 400 : 502;
-      const baseMsg = callResult.error
-        || callResult.providerError
-        || `Kaleyra rejected the call${callResult.providerStatus ? ` (status=${callResult.providerStatus})` : ''}`;
-      return modernError(res, status, baseMsg, {
-        diagnostic: callResult.diagnostic,
-        providerStatus: callResult.providerStatus,
-        providerError: callResult.providerError,
-      });
-    }
-
-    // ── Persist to tbl_job_caller_info ──
-    // Column-name typos `reciever*` preserved verbatim per backend CLAUDE.md.
-    // is_updated=0 → flagged for the cron to fill in metadata.
+    // ── Insert-first audit row ──
+    // We persist BEFORE placing the call so a live provider (Plivo) whose
+    // ring/answer/hangup callbacks may fire near-instantly has a row to update
+    // by jobCallerInfoId (the signed call token carries this id). caller_status
+    // starts at 'initiated' and unique_id is NULL until the provider returns a
+    // call id. provider is the resolved provider (honours the optional request
+    // value only when enabled, else the configured default). Column-name typos
+    // `reciever*` preserved verbatim per backend CLAUDE.md. is_updated=0 → the
+    // Kaleyra report cron will fill metadata (Plivo rows are excluded there).
+    const resolvedProvider = voice.resolveProvider(provider);
     const [insertResult] = await pool.query(
       `INSERT INTO tbl_job_caller_info
          (job_id, unique_id, caller, caller_id, caller_name,
           reciever, reciever_id, reciever_name,
-          job_status, job_efr_id, call_type, inserted_by, is_updated)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OUT', ?, 0)`,
+          job_status, job_efr_id, call_type, inserted_by, is_updated,
+          provider, caller_status)
+       VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 'OUT', ?, 0, ?, 'initiated')`,
       [
         jobIdToStore,
-        callResult.callId || null,
         kaleyra.normaliseIndianPhone(agent.mobile_no),
         agent.user_id,
         agent.user_name,
@@ -355,23 +340,213 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
         jobStatusSnapshot,
         jobEfrId,
         agent.user_id,
+        resolvedProvider,
       ]
     );
+    const jci = insertResult.insertId;
 
-    logger.info(`Click-to-call placed · agent=${agent.user_name}(#${agent.user_id}) → ${receiverName || receiverCustomerId || 'customer'} · row=${insertResult.insertId} · uniqueId=${callResult.callId || '—'}`);
+    // ── Place the call via the provider factory ──
+    // voice.clickToCall resolves the provider, stamps it on the result, and
+    // (for Plivo) signs jobCallerInfoId into the callback token so the
+    // webhooks can find this exact row.
+    const callResult = await voice.clickToCall({
+      provider,
+      from: dialFrom,
+      to:   dialTo,
+      jobCallerInfoId: jci,
+    });
+
+    if (!callResult.delivered) {
+      // Suppressed-mode dev convenience: still return 200 so the UI can
+      // show "would have called" feedback. Distinct from real failures,
+      // which bubble as 4xx/5xx below. We mark the row 'suppressed' so the
+      // history reflects it was never actually dispatched.
+      if (callResult.suppressed || callResult.disabled) {
+        await pool.query(
+          `UPDATE tbl_job_caller_info SET caller_status = 'suppressed' WHERE job_caller_info = ?`,
+          [jci]
+        );
+        return modernOk(res, {
+          delivered: false,
+          suppressed: true,
+          jobCallerInfoId: jci,
+          provider: callResult.provider || resolvedProvider,
+          message: 'Outbound calling is disabled in this environment (enable the provider via <provider>.calling.enabled=true).',
+        });
+      }
+
+      // Real failure — mark the row 'failed' (stamp the resolved provider from
+      // the result), then hand the FE the EXACT reason so the toast is
+      // actionable. The service already classified the failure via `diagnostic`
+      // so we don't re-parse strings here.
+      //   - caller_equals_receiver  → 400 (config issue, caller can fix)
+      //   - kaleyra_soft_fail_no_id → 502 (provider accepted HTTP, no leg)
+      //   - kaleyra_http_error / plivo_http_error → 502 (non-2xx)
+      //   - network_error           → 502 (couldn't reach provider)
+      await pool.query(
+        `UPDATE tbl_job_caller_info
+            SET caller_status = 'failed', provider = ?
+          WHERE job_caller_info = ?`,
+        [callResult.provider || resolvedProvider, jci]
+      );
+      const status = callResult.diagnostic === 'caller_equals_receiver' ? 400 : 502;
+      const baseMsg = callResult.error
+        || callResult.providerError
+        || `Provider rejected the call${callResult.providerStatus ? ` (status=${callResult.providerStatus})` : ''}`;
+      return modernError(res, status, baseMsg, {
+        diagnostic: callResult.diagnostic,
+        providerStatus: callResult.providerStatus,
+        providerError: callResult.providerError,
+      });
+    }
+
+    // ── Stamp the placed call onto the row ──
+    // unique_id = the provider's call id (Plivo request_uuid / Kaleyra
+    // uniqueId); provider = the resolved provider; status flips to 'placed'.
+    // Guard on caller_status='initiated' so we don't stomp a provider callback
+    // that already advanced the row (a Plivo ring/answer webhook can land while
+    // voice.clickToCall above is still awaiting). If a callback already moved it
+    // to 'ringing'/'answered' (and set unique_id=CallUUID), this no-ops and the
+    // live state is preserved.
+    await pool.query(
+      `UPDATE tbl_job_caller_info
+          SET unique_id = ?, provider = ?, caller_status = 'placed'
+        WHERE job_caller_info = ? AND caller_status = 'initiated'`,
+      [callResult.callId || null, callResult.provider || resolvedProvider, jci]
+    );
+
+    logger.info(`Click-to-call placed · agent=${agent.user_name}(#${agent.user_id}) → ${receiverName || receiverCustomerId || 'customer'} · row=${jci} · provider=${callResult.provider} · uniqueId=${callResult.callId || '—'}`);
     return modernOk(res, {
       delivered: true,
-      jobCallerInfoId: insertResult.insertId,
+      jobCallerInfoId: jci,
       callId: callResult.callId || null,
-      // `overridden` is the new field — true when either KALEYRA_CALL_FROM
-      // or KALEYRA_CALL_TO substituted a leg. Kept the `redirected` alias
-      // so any FE that hadn't been updated yet still reads truthy.
+      provider: callResult.provider,
+      // supportsLiveStatus tells the FE whether to open the live status panel
+      // (Plivo) or just toast (Kaleyra, post-call report only).
+      supportsLiveStatus: !!callResult.supportsLiveStatus,
+      // `overridden` is true when either *_CALL_FROM or *_CALL_TO substituted a
+      // leg. Kept the `redirected` alias so any FE not yet updated still reads
+      // truthy.
       overridden: callResult.overridden || false,
       redirected: callResult.overridden || false,
       message: callResult.overridden
-        ? 'Dev override active — one or both legs routed to a KALEYRA_CALL_* test number instead of the real participant.'
+        ? 'Dev override active — one or both legs routed to a *_CALL_* test number instead of the real participant.'
         : 'Calling — your phone will ring shortly.',
     });
+  } catch (e) { next(e); }
+});
+
+// Terminal normalized statuses — once the row reaches one of these the FE can
+// stop polling. Mirrors the webhook's CallStatus→status mapping (plus the
+// operator-driven 'hungup'). Kept in sync with routes/webhook/plivo.js.
+const TERMINAL_STATUSES = new Set(['completed', 'busy', 'no_answer', 'failed', 'hungup']);
+
+// Parse + validate a positive-integer :id path param. Returns null on a bad
+// shape so the handler can 400 cleanly (no dedicated id-param validator
+// exists for /admin/calls — same inline guard pattern as job-completion.js).
+function parseRowId(raw) {
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+// ─── GET /:id/status — live status of one call (FE polling) ────────────
+// Returns the normalized caller_status + timestamps so the FE live panel can
+// poll a Plivo call to completion. Authorised to the operator who placed it
+// (caller_id match) OR any Admin-group user (kept simple). `terminal` lets the
+// FE stop polling. answered_at = start_time, ended_at = end_time.
+router.get('/:id/status', requireClickToCallAction, async (req, res, next) => {
+  try {
+    const id = parseRowId(req.params.id);
+    if (!id) return modernError(res, 400, 'invalid call id');
+
+    const [[row]] = await pool.query(
+      `SELECT job_caller_info AS id, caller_id, caller_status,
+              start_time, end_time, duration, provider
+         FROM tbl_job_caller_info
+        WHERE job_caller_info = ?
+        LIMIT 1`,
+      [id]
+    );
+    if (!row) return modernError(res, 404, 'call not found');
+
+    // Authorize: the operator who placed it, or an Admin. role group is on the
+    // parent router (role(['admin'])); the Admin role_id is 2. Anyone else may
+    // only read their own call rows.
+    const isOwner = row.caller_id != null && Number(row.caller_id) === Number(req.user.user_id);
+    const isAdmin = Number(req.user.user_role) === 2; // role_id 2 = Admin (CLAUDE.md role model)
+    if (!isOwner && !isAdmin) {
+      return modernError(res, 403, 'You can only view the status of calls you placed');
+    }
+
+    const status = row.caller_status || null;
+    return modernOk(res, {
+      status,
+      ringing_at: null,                 // Plivo ring callback only flips status;
+                                        // no dedicated column — surface via status.
+      answered_at: row.start_time || null,
+      ended_at: row.end_time || null,
+      duration: row.duration ?? null,
+      terminal: status ? TERMINAL_STATUSES.has(status) : false,
+      provider: row.provider || null,
+    });
+  } catch (e) { next(e); }
+});
+
+// ─── POST /:id/hangup — terminate a live call from the UI ──────────────
+// Only meaningful for providers that support hangup (Plivo). Loads the row,
+// asks the provider factory to terminate by stored unique_id (CallUUID), and
+// on success stamps caller_status='hungup' + end_time=NOW(). Kaleyra returns
+// unsupported → 409.
+router.post('/:id/hangup', requireClickToCallAction, async (req, res, next) => {
+  try {
+    const id = parseRowId(req.params.id);
+    if (!id) return modernError(res, 400, 'invalid call id');
+
+    const [[row]] = await pool.query(
+      `SELECT job_caller_info AS id, caller_id, provider, unique_id, caller_status
+         FROM tbl_job_caller_info
+        WHERE job_caller_info = ?
+        LIMIT 1`,
+      [id]
+    );
+    if (!row) return modernError(res, 404, 'call not found');
+
+    const isOwner = row.caller_id != null && Number(row.caller_id) === Number(req.user.user_id);
+    const isAdmin = Number(req.user.user_role) === 2; // role_id 2 = Admin (CLAUDE.md role model)
+    if (!isOwner && !isAdmin) {
+      return modernError(res, 403, 'You can only hang up calls you placed');
+    }
+
+    // Already finished → idempotent success (the FE poll will reflect the real
+    // terminal state anyway).
+    const status = row.caller_status || null;
+    if (status && TERMINAL_STATUSES.has(status)) {
+      return modernOk(res, { success: true, alreadyEnded: true });
+    }
+    // Before a provider callback lands, `unique_id` is the call-request handle
+    // (Plivo request_uuid), NOT the CallUUID the hangup API needs — firing
+    // DELETE with it would 404. Refuse gracefully until ring/answer captures the
+    // CallUUID. The FE surfaces this 409 inline; the operator retries in a beat.
+    if (!status || status === 'initiated' || status === 'placed') {
+      return modernError(res, 409, 'Call is still connecting — please try hangup again in a moment.');
+    }
+
+    const r = await voice.hangup({ provider: row.provider, callUuid: row.unique_id });
+    if (r.unsupported) {
+      return modernError(res, 409, 'Provider does not support hangup');
+    }
+    if (!r.ok) {
+      return modernError(res, 502, r.error || 'Failed to hang up the call');
+    }
+
+    await pool.query(
+      `UPDATE tbl_job_caller_info
+          SET caller_status = 'hungup', end_time = NOW(), is_updated = 1
+        WHERE job_caller_info = ?`,
+      [id]
+    );
+    logger.info(`Click-to-call hung up · row=${id} · provider=${row.provider} · by=${req.user.user_id}`);
+    return modernOk(res, { success: true });
   } catch (e) { next(e); }
 });
 

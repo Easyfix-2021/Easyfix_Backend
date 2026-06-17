@@ -56,6 +56,12 @@ const clickToCallBody = Joi.object({
   // Pattern matches the rest of the codebase: 10-12 digit Indian numbers.
   callFrom: Joi.string().pattern(/^[0-9]{10,12}$/),
   callTo:   Joi.string().pattern(/^[0-9]{10,12}$/),
+  // Optional voice-provider selector (2026-06-17). Whitelisted to the two
+  // wired providers; the service layer (voice.resolveProvider) further
+  // ignores a disabled provider and falls back to the configured default,
+  // so an explicit value here can never dial through a disabled provider.
+  // Omitted → service uses voice.default.provider.
+  provider: Joi.string().valid('kaleyra', 'plivo').optional(),
 }).xor('jobId', 'customerId', 'efrId', 'reportingContactId');
 
 /*
@@ -76,6 +82,10 @@ const callListQuery = Joi.object({
   // job's alternate number (tbl_job.additional_number) instead of the
   // customer's master mobile. Same flag the POST /click-to-call accepts.
   useAlt: Joi.alternatives(Joi.boolean(), Joi.string().valid('true', 'false', '1', '0')).optional(),
+  // Optional voice-provider selector for /preview — mirrors the click-to-call
+  // body so the masked preview reflects the legs the chosen provider WOULD
+  // dial. /list ignores it (history is provider-agnostic). Same whitelist.
+  provider: Joi.string().valid('kaleyra', 'plivo').optional(),
   dateFrom: Joi.string().max(40).optional(),
   dateTo:   Joi.string().max(40).optional(),
   page:     Joi.number().integer().min(1).default(1),

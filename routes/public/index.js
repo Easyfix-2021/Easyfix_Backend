@@ -50,5 +50,13 @@ router.use('/deep-skills', require('./deep-skills'));
  * See routes/public/email-verify.js for the security rationale.
  */
 router.use('/email-verify', require('./email-verify'));
+/*
+ * Plivo answer_url callback (2026-06-17). UNAUTHENTICATED — Plivo GETs this the
+ * moment the agent leg answers, and we return call-control XML bridging to the
+ * customer. Authorisation is the signed `t` JWT (carries the destination +
+ * tbl_job_caller_info id), not a Bearer/Basic credential. Full path becomes
+ * /api/public/plivo/answer. See routes/public/plivo-answer.js.
+ */
+router.use('/plivo', require('./plivo-answer'));
 
 module.exports = router;

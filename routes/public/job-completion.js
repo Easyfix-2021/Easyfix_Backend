@@ -34,6 +34,7 @@ const { pool } = require('../../db');
 const { verifyJobToken, requireUnconfirmedJob } = require('../../utils/jwt');
 const magicLinkService = require('../../services/job-magic-link.service');
 const kaleyra = require('../../services/kaleyra.service');
+const voice = require('../../services/voice.service');
 const {
   submitBody,
   imageIdParam,
@@ -146,15 +147,15 @@ async function dailyBridgeCapReached(jobId) {
 // throws — a failed audit write must not fail the call response.
 async function persistBridgeCall({
   jobId, callId, customerMob, customerName,
-  receiverMob, receiverId, receiverName, jobStatus, jobEfrId,
+  receiverMob, receiverId, receiverName, jobStatus, jobEfrId, provider,
 }) {
   try {
     await pool.query(
       `INSERT INTO tbl_job_caller_info
          (job_id, unique_id, caller, caller_id, caller_name,
           reciever, reciever_id, reciever_name,
-          job_status, job_efr_id, call_type, inserted_by, is_updated)
-       VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 'OUT', NULL, 0)`,
+          job_status, job_efr_id, call_type, inserted_by, is_updated, provider)
+       VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 'OUT', NULL, 0, ?)`,
       [
         jobId,
         callId || null,
@@ -165,6 +166,7 @@ async function persistBridgeCall({
         receiverName,
         jobStatus ?? null,
         jobEfrId ?? null,
+        provider || 'kaleyra',
       ],
     );
   } catch (e) {
@@ -552,8 +554,9 @@ router.get(
       if (!spoc.mobile) return modernError(res, 422, 'No SPOC available to call');
 
       // Same alwaysApplyEnvOverride:true the actual spoc-call uses → the preview
-      // reflects precisely what would be dialled.
-      const preview = kaleyra.previewCallLegs({
+      // reflects precisely what would be dialled. voice.previewCallLegs resolves
+      // through the default provider (no explicit provider on the public flow).
+      const preview = voice.previewCallLegs({
         from: customerMob,
         to: spoc.mobile,
         alwaysApplyEnvOverride: true,
@@ -618,7 +621,7 @@ router.post(
       // KALEYRA_CALLING_CUSTOM_NUMBER (an admin-prompt flag) is on. Prevents
       // dialling a real customer from QA. In prod those env vars are unset
       // → passes through to the real numbers as intended.
-      const result = await kaleyra.clickToCall({ from: customerMob, to: spoc.mobile, alwaysApplyEnvOverride: true });
+      const result = await voice.clickToCall({ from: customerMob, to: spoc.mobile, alwaysApplyEnvOverride: true });
       if (!result.delivered && (result.suppressed || result.disabled)) {
         // Calling disabled in this environment — mirror admin/calls: 200 OK
         // with delivered:false + suppressed:true so the FE can show
@@ -634,6 +637,7 @@ router.post(
           receiverName: spoc.name,
           jobStatus: job.job_status,
           jobEfrId: job.fk_easyfixter_id,
+          provider: result.provider,
         });
         return modernOk(res, { delivered: false, suppressed: true });
       }
@@ -657,6 +661,7 @@ router.post(
         receiverName: spoc.name,
         jobStatus: job.job_status,
         jobEfrId: job.fk_easyfixter_id,
+        provider: result.provider,
       });
       logger.info({ jobId }, 'magic-link: SPOC bridge call placed');
       return modernOk(res, { delivered: true });
@@ -691,7 +696,7 @@ router.get(
       const customerMob = job && job.customer_mob_no;
       if (!customerMob) return modernError(res, 422, 'No customer mobile on file to bridge the call');
 
-      const preview = kaleyra.previewCallLegs({
+      const preview = voice.previewCallLegs({
         from: customerMob,
         to: supportPhone,
         alwaysApplyEnvOverride: true,
@@ -749,7 +754,7 @@ router.post(
       // Same operator-less rationale as spoc-call — force the
       // KALEYRA_CALL_FROM/TO test-redirect in non-prod so QA never dials
       // the real customer/support line.
-      const result = await kaleyra.clickToCall({ from: customerMob, to: supportPhone, alwaysApplyEnvOverride: true });
+      const result = await voice.clickToCall({ from: customerMob, to: supportPhone, alwaysApplyEnvOverride: true });
       // Support audit row: reciever_id NULL (not a staff user) + the literal
       // 'EasyFix Support' name so ops can tell a CUSTOMER → Support call apart
       // from a CUSTOMER → SPOC call. caller_id NULL marks it customer-initiated.
@@ -763,6 +768,7 @@ router.post(
         receiverName: 'EasyFix Support',
         jobStatus: job.job_status,
         jobEfrId: job.fk_easyfixter_id,
+        provider: result.provider,
       });
 
       if (!result.delivered && (result.suppressed || result.disabled)) {
