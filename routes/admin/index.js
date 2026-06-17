@@ -47,7 +47,6 @@ router.use('/properties',      require('./properties'));
 router.use('/easyfixers',      require('./easyfixers'));
 router.use('/zones',           require('./zones'));
 router.use('/pincodes',        require('./pincodes'));
-router.use('/india-locations', require('./india-locations'));
 router.use('/cities',          require('./cities'));
 router.use('/service-categories', require('./service-categories'));
 router.use('/service-types',      require('./service-types'));
