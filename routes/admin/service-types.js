@@ -29,7 +29,7 @@ const createBody = Joi.object({
   service_type_name:        Joi.string().trim().min(2).max(200).required(),
   service_type_desc:        Joi.string().trim().max(500).allow('', null).optional(),
   service_catg_id:          Joi.number().integer().positive().required(),
-  display:                  Joi.number().integer().valid(0, 1).default(1),
+  display:                  Joi.number().integer().valid(0, 1, 2).default(1),
   service_type_tools:       Joi.string().allow('', null).optional(),
   service_type_tool_names:  Joi.string().allow('', null).optional(),
 });
@@ -38,7 +38,7 @@ const updateBody = Joi.object({
   service_type_name:        Joi.string().trim().min(2).max(200).optional(),
   service_type_desc:        Joi.string().trim().max(500).allow('', null).optional(),
   service_catg_id:          Joi.number().integer().positive().optional(),
-  display:                  Joi.number().integer().valid(0, 1).optional(),
+  display:                  Joi.number().integer().valid(0, 1, 2).optional(),
   service_type_tools:       Joi.string().allow('', null).optional(),
   service_type_tool_names:  Joi.string().allow('', null).optional(),
   is_active:                Joi.boolean().optional(),

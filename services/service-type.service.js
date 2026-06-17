@@ -5,7 +5,7 @@ const { pool } = require('../db');
  *
  * Schema columns in use:
  *   service_type_id, service_type_name, service_type_desc, service_type_status,
- *   service_catg_id (FK → tbl_service_catg), display (1=show to all, 0=CRM only),
+ *   service_catg_id (FK → tbl_service_catg), display (1=Display to All, 0=CRM rate-card, 2=Tx App deep-skill),
  *   service_type_tools (CSV of tool_ids), service_type_tool_names (display CSV).
  *
  * Soft-delete: status flips to 0; legacy =3 rows stay hidden.
@@ -107,7 +107,9 @@ async function createType({ service_type_name, service_type_desc, service_catg_i
       name,
       service_type_desc ? String(service_type_desc).trim() : null,
       Number(service_catg_id),
-      display === 0 ? 0 : 1,
+      // display: 0=CRM rate-card · 1=Display to All · 2=Tx App deep-skill.
+      // Store the raw whitelisted value (default 1) — no 0/1 coercion.
+      [0, 1, 2].includes(Number(display)) ? Number(display) : 1,
       service_type_tools || null,
       service_type_tool_names || null,
     ]
@@ -142,7 +144,8 @@ async function updateType(id, fields) {
     sets.push('service_catg_id = ?'); params.push(Number(fields.service_catg_id));
   }
   if (fields.display !== undefined) {
-    sets.push('display = ?'); params.push(fields.display ? 1 : 0);
+    // Store the raw whitelisted value (0/1/2) — no 0/1 coercion.
+    sets.push('display = ?'); params.push([0, 1, 2].includes(Number(fields.display)) ? Number(fields.display) : 1);
   }
   if (fields.service_type_tools !== undefined) {
     sets.push('service_type_tools = ?'); params.push(fields.service_type_tools || null);

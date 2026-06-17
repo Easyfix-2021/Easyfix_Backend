@@ -215,7 +215,9 @@ async function runTest({ mobile, sourceId } = {}) {
 
   // Build the SAME shape sendForEasyfixer would build — JWT + short URL.
   const token = signEasyfixerProfileToken(efrId);
-  const base = (process.env.CRM_PUBLIC_BASE_URL || 'https://crm.easyfix.in').replace(/\/$/, '');
+  // Env-aware: fall back to MAGIC_LINK_BASE_URL (per-env CRM_UI host) before
+  // the prod hardcode so QA links don't silently point at prod.
+  const base = (process.env.CRM_PUBLIC_BASE_URL || process.env.MAGIC_LINK_BASE_URL || 'https://crm.easyfix.in').replace(/\/$/, '');
   const longUrl = `${base}/profile-update/${token}`;
   let shortUrl = longUrl;
   try {

@@ -190,7 +190,10 @@ const EDITABLE_BASIC_COLUMNS = Object.freeze([
  * intercept in the WhatsApp layer mitigates the customer-facing risk).
  */
 function profileUpdateUrl(token) {
-  const base = process.env.CRM_PUBLIC_BASE_URL || 'https://crm.easyfix.in';
+  // Env-aware base: CRM_PUBLIC_BASE_URL wins; else fall back to
+  // MAGIC_LINK_BASE_URL (set per-env to the CRM_UI host — qa.crm.easyfix.in on
+  // QA) so the link never silently defaults to prod on QA; prod hardcode last.
+  const base = process.env.CRM_PUBLIC_BASE_URL || process.env.MAGIC_LINK_BASE_URL || 'https://crm.easyfix.in';
   return `${base.replace(/\/$/, '')}/profile-update/${token}`;
 }
 
