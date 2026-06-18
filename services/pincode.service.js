@@ -1,5 +1,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
+const geocode = require('./pincode-geocode.service');
 
 /*
  * Generic pincode catalog — `tbl_pincode` (created in
@@ -177,7 +178,7 @@ function deriveStatus(activeEfrCount) {
 }
 
 // ─── List with filters + computed status ─────────────────────────────
-async function listPincodes({ q, status, cityId, includeInactive = false, limit = 100, offset = 0 } = {}) {
+async function listPincodes({ q, status, cityId, includeInactive = false, limit = 100, offset = 0, sortBy, sortDir = 'asc' } = {}) {
   // Cap limit defensively. Bumped from 500 → 200000 to support the CRM
   // verification page's "load-all" dropdown (~155k rows post-seed). The
   // query is indexed on `pincode` (PK) and runs sub-second; pagination
@@ -188,14 +189,51 @@ async function listPincodes({ q, status, cityId, includeInactive = false, limit 
   const where = ['1=1'];
   const params = [];
   if (!includeInactive) where.push('p.pincode_status = 1');
-  if (q) {
-    where.push('(p.pincode LIKE ? OR c.city_name LIKE ? OR p.location LIKE ?)');
-    params.push(`%${q}%`, `%${q}%`, `%${q}%`);
+  // Field-aware search (#8): an all-digits term targets the pincode column as a
+  // PREFIX (`pincode LIKE 'q%'`) so MySQL can seek the index (a leading `%`
+  // would force a full scan); a non-numeric term matches city_name OR district
+  // (LIKE). district falls back to the city's district via COALESCE so rows
+  // whose own p.district is NULL still match by their city.
+  const term = String(q || '').trim();
+  if (term) {
+    if (/^\d+$/.test(term)) {
+      where.push('p.pincode LIKE ?');
+      params.push(`${term}%`);
+    } else {
+      where.push('(c.city_name LIKE ? OR COALESCE(p.district, c.district) LIKE ?)');
+      params.push(`%${term}%`, `%${term}%`);
+    }
   }
   if (cityId) {
     where.push('p.city_id = ?');
     params.push(Number(cityId));
   }
+
+  // Whitelisted sort. Only map-resolved column literals + an ASC/DESC literal
+  // are ever spliced into SQL — `sortBy`/`sortDir` are never interpolated raw
+  // (MySQL can't parameterise identifiers). Unknown keys fall back to pincode.
+  //
+  // NOTE: the LOCAL/TRAVEL "Mapping" value (deriveStatus(active_efr_count)) is
+  // intentionally NOT a sort key here. It is a virtual value computed in JS
+  // AFTER pagination (see below), so it can't be ORDER BY'd in this query shape
+  // without pushing active_efr_count into SQL as a derived column. The CRM page
+  // sorts "Mapping" client-side instead. Mapping it to p.pincode_status (the
+  // unrelated Serviceable/Non-Serviceable flag) would silently order by the
+  // wrong column, so it's omitted on purpose.
+  const SORT_MAP = {
+    pincode:       'p.pincode',
+    location:      'p.location',
+    zonal_manager: 'zm.user_name',
+    // Status column = Serviceable / Non-Serviceable. Unlike the virtual
+    // LOCAL/TRAVEL "Mapping" value above, this is a real column (pincode_status,
+    // 1/0), so it CAN be ordered server-side across the whole result set.
+    is_active:     'p.pincode_status',
+  };
+  const dir     = String(sortDir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+  const sortCol = SORT_MAP[sortBy] || 'p.pincode';
+  // Zonal manager comes from a LEFT JOIN on c.state_user, which is NULL for
+  // many cities — keep those rows at the bottom in BOTH directions.
+  const nullClause = sortBy === 'zonal_manager' ? '(zm.user_name IS NULL), ' : '';
 
   const [rows] = await pool.query(
     `SELECT
@@ -208,12 +246,14 @@ async function listPincodes({ q, status, cityId, includeInactive = false, limit 
         s.state_name,
         p.pincode_status,
         p.lat,
-        p.lng
+        p.lng,
+        zm.user_name AS zonal_manager_name
        FROM tbl_pincode    p
        LEFT JOIN tbl_city  c ON c.city_id  = p.city_id
        LEFT JOIN tbl_state s ON s.state_id = c.state_id
+       LEFT JOIN tbl_user  zm ON zm.user_id = c.state_user
       WHERE ${where.join(' AND ')}
-      ORDER BY p.pincode ASC
+      ORDER BY ${nullClause}${sortCol} ${dir}, p.pincode ASC
       LIMIT ? OFFSET ?`,
     [...params, limit, offset]
   );
@@ -247,6 +287,9 @@ async function listPincodes({ q, status, cityId, includeInactive = false, limit 
       zone_count:       zoneMap.get(Number(r.pincode_id)) || 0,
       lat:              r.lat != null ? Number(r.lat) : null,
       lng:              r.lng != null ? Number(r.lng) : null,
+      // Each pincode → city → city.state_user (zonal/city manager). Blank for
+      // a new city (state_user not yet assigned). Display-only column.
+      zonal_manager_name: r.zonal_manager_name || null,
     };
   });
 
@@ -264,10 +307,11 @@ async function getPincodeById(pincodeId) {
   const [[row]] = await pool.query(
     `SELECT p.pincode_id, p.pincode, p.location, p.city_id, c.city_name,
             COALESCE(p.district, c.district) AS district, s.state_name,
-            p.pincode_status
+            p.pincode_status, p.lat, p.lng, zm.user_name AS zonal_manager_name
        FROM tbl_pincode    p
        LEFT JOIN tbl_city  c ON c.city_id  = p.city_id
        LEFT JOIN tbl_state s ON s.state_id = c.state_id
+       LEFT JOIN tbl_user  zm ON zm.user_id = c.state_user
       WHERE p.pincode_id = ?
       LIMIT 1`,
     [pincodeId]
@@ -303,6 +347,12 @@ async function getPincodeById(pincodeId) {
     city_name:        row.city_name || null,
     district:         row.district || null,
     state_name:       row.state_name || null,
+    // lat/lng + zonal_manager_name added for shape-parity with the list payload
+    // so the auto-open-existing Edit path shows coordinates + distance-ranked
+    // zone suggestions identically to a row-launched Edit.
+    lat:              row.lat != null ? Number(row.lat) : null,
+    lng:              row.lng != null ? Number(row.lng) : null,
+    zonal_manager_name: row.zonal_manager_name || null,
     is_active:        Number(row.pincode_status) === 1,
     status:           deriveStatus(activeCount),
     active_efr_count: activeCount,
@@ -363,10 +413,69 @@ async function assertCityExists(cityId) {
   if (!row) throw badReq(`Unknown city_id ${cityId}`);
 }
 
-async function createPincode({ pincode, location, city_id, district }, { userId = null } = {}) {
+// India is the only country EasyFix operates in; resolve its country_id for
+// new-state creation. Defensive: name-match first, fall back to the first
+// country row. Returns null only if tbl_country is empty/unreadable — the
+// caller treats null as a hard 400 since tbl_state.country_id is NOT NULL.
+async function indiaCountryId() {
+  try {
+    const [[row]] = await pool.query(
+      "SELECT country_id FROM tbl_country WHERE LOWER(country_name) LIKE '%india%' ORDER BY country_id ASC LIMIT 1"
+    );
+    if (row) return Number(row.country_id);
+  } catch (e) { logger.warn({ err: e.message }, 'indiaCountryId by-name lookup failed'); }
+  try {
+    const [[any]] = await pool.query('SELECT country_id FROM tbl_country ORDER BY country_id ASC LIMIT 1');
+    return any ? Number(any.country_id) : null;
+  } catch (e) { logger.warn({ err: e.message }, 'indiaCountryId fallback lookup failed'); return null; }
+}
+
+// Find a state by name (case-insensitive, trimmed) or create it. Dedup-first
+// so an auto-fetch that returns an existing state never makes a duplicate row.
+async function findOrCreateStateByName(stateName, { userId = null } = {}) {
+  void userId;
+  const name = String(stateName || '').trim();
+  if (!name) throw badReq('State name is required to create a new state');
+  const [[existing]] = await pool.query(
+    'SELECT state_id FROM tbl_state WHERE LOWER(TRIM(state_name)) = LOWER(?) LIMIT 1', [name]
+  );
+  if (existing) return { state_id: Number(existing.state_id), created: false };
+  const countryId = await indiaCountryId();
+  if (countryId == null) throw badReq('Cannot create a new state — no country configured in tbl_country');
+  const [r] = await pool.query(
+    'INSERT INTO tbl_state (state_name, country_id) VALUES (?, ?)', [name, countryId]
+  );
+  return { state_id: r.insertId, created: true };
+}
+
+// Find a city by (state, name) or create it. NEW cities get a NULL state_user
+// (zonal manager) per spec — the Manage Pincodes table shows it blank.
+async function findOrCreateCityByName(cityName, stateId, { district = null } = {}) {
+  const name = String(cityName || '').trim();
+  if (!name) throw badReq('City name is required to create a new city');
+  if (!stateId) throw badReq('A state is required to create a new city');
+  const [[existing]] = await pool.query(
+    'SELECT city_id FROM tbl_city WHERE state_id = ? AND LOWER(TRIM(city_name)) = LOWER(?) LIMIT 1',
+    [Number(stateId), name]
+  );
+  if (existing) return { city_id: Number(existing.city_id), created: false };
+  const [r] = await pool.query(
+    'INSERT INTO tbl_city (city_name, state_id, district, city_status) VALUES (?, ?, ?, 1)',
+    [name, Number(stateId), district || null]
+  );
+  return { city_id: r.insertId, created: true };
+}
+
+/*
+ * Create a pincode. Accepts EITHER an existing `city_id`, OR a `newCity`
+ * ({ city_name, state_id? , state_name? }) which is find-or-created (state
+ * first if new, then city). Persists geocoded lat/lng. Optionally maps the new
+ * pincode to `zoneIds` (the chosen zone suggestions). Duplicate pincode → 409.
+ */
+async function createPincode(
+  { pincode, location, city_id, district, lat, lng, newCity, zoneIds, is_active = true }, { userId = null } = {}
+) {
   if (!/^\d{6}$/.test(String(pincode))) throw badReq('Pincode must be exactly 6 digits');
-  if (!city_id) throw badReq('city_id is required');
-  await assertCityExists(city_id);
 
   const [[existing]] = await pool.query(
     'SELECT pincode_id FROM tbl_pincode WHERE pincode = ? LIMIT 1', [String(pincode)]
@@ -377,15 +486,204 @@ async function createPincode({ pincode, location, city_id, district }, { userId 
     throw err;
   }
 
-  // pincode_status hard-set to 1 (Serviceable) on create; mark Non-Serviceable
-  // later via updatePincode({ is_active: false }) → pincode_status = 0.
+  // ── Resolve the city ──
+  let resolvedCityId = city_id ? Number(city_id) : null;
+  if (resolvedCityId) {
+    await assertCityExists(resolvedCityId);
+  } else if (newCity && String(newCity.city_name || '').trim()) {
+    let stateId = newCity.state_id ? Number(newCity.state_id) : null;
+    if (stateId) {
+      const [[srow]] = await pool.query('SELECT state_id FROM tbl_state WHERE state_id = ? LIMIT 1', [stateId]);
+      if (!srow) throw badReq(`Unknown state_id ${stateId}`);
+    } else {
+      stateId = (await findOrCreateStateByName(newCity.state_name, { userId })).state_id;
+    }
+    resolvedCityId = (await findOrCreateCityByName(newCity.city_name, stateId, { district })).city_id;
+  } else {
+    throw badReq('Either city_id or newCity (city_name + state) is required');
+  }
+
+  const latN = (lat != null && lat !== '') ? Number(lat) : null;
+  const lngN = (lng != null && lng !== '') ? Number(lng) : null;
+
+  // pincode_status from the Add form's Status toggle (defaults Serviceable).
+  const statusVal = is_active === false ? 0 : 1;
   const [result] = await pool.query(
     `INSERT INTO tbl_pincode
-       (pincode, location, city_id, district, pincode_status, created_by, updated_by)
-     VALUES (?, ?, ?, ?, 1, ?, ?)`,
-    [String(pincode), location || null, Number(city_id), district || null, userId, userId]
+       (pincode, location, city_id, district, lat, lng, pincode_status, created_by, updated_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [String(pincode), location || null, resolvedCityId, district || null, latN, lngN, statusVal, userId, userId]
   );
-  return getPincodeById(result.insertId);
+  const pincodeId = result.insertId;
+
+  // Map the chosen suggested zones (optional). Reuses the validated junction
+  // writer (its own txn); a zone-map hiccup leaves the pincode created.
+  const zoneList = Array.isArray(zoneIds) ? zoneIds.map(Number).filter(Number.isFinite) : [];
+  if (zoneList.length) {
+    // The pincode IS already created; a zone-map hiccup must not fail the whole
+    // create (operator can map zones later via the zones editor). Log + proceed.
+    try {
+      await setZonesForPincode(pincodeId, zoneList, { userId });
+    } catch (e) {
+      logger.warn({ err: e.message, pincodeId }, 'createPincode: zone mapping failed (pincode kept)');
+    }
+  }
+  return getPincodeById(pincodeId);
+}
+
+/*
+ * ensurePincode — admin/public "on-the-fly" pincode creation.
+ *
+ * Idempotent: if the pincode already exists, returns the existing row with
+ * `created:false` (no geocode, no write). Otherwise it geocodes via Google,
+ * HARD-REJECTS (400) any result that isn't a geocodable INDIA pincode,
+ * find-or-creates the matched state + city, inserts the row, and returns it
+ * with `created:true`.
+ *
+ * India guard: geocodeAndMatch pins `|country:IN` in the geocode URL AND now
+ * surfaces the returned country/country_code. We reject when the result is not
+ * geocodable OR the resolved country is anything other than India — belt and
+ * braces over the URL component.
+ *
+ * Return shape (both branches):
+ *   { pincode_id, pincode, city_id, city_name, state_name, lat, lng, created }
+ */
+async function ensurePincode(pincodeRaw, { userId = null } = {}) {
+  const pin = String(pincodeRaw || '').trim();
+  if (!/^\d{6}$/.test(pin)) throw badReq('Pincode must be exactly 6 digits');
+
+  // ── Dedup-first: existing row → created:false, no geocode/write ──
+  const existing = await getPincodeByValue(pin);
+  if (existing) {
+    return {
+      pincode_id: existing.pincode_id,
+      pincode:    existing.pincode,
+      city_id:    existing.city_id,
+      city_name:  existing.city_name,
+      state_name: existing.state_name,
+      lat:        existing.lat,
+      lng:        existing.lng,
+      created:    false,
+    };
+  }
+
+  // ── Geocode + India gate ──
+  const match = await geocodeAndMatch(pin);
+  // geocodeAndMatch can race-detect a duplicate created between the lookup
+  // above and the geocode call — honour it as the idempotent branch.
+  if (match.duplicate) {
+    const dupDetail = await getPincodeById(match.duplicate.pincode_id);
+    return {
+      pincode_id: dupDetail.pincode_id,
+      pincode:    dupDetail.pincode,
+      city_id:    dupDetail.city_id,
+      city_name:  dupDetail.city_name,
+      state_name: dupDetail.state_name,
+      lat:        dupDetail.lat,
+      lng:        dupDetail.lng,
+      created:    false,
+    };
+  }
+  if (!match.geocoded) {
+    throw badReq(`Pincode ${pin} is not a valid Indian pincode (could not be located)`);
+  }
+  // India-only: accept ISO short_code 'IN' or a long_name containing "india".
+  const code = String(match.country_code || '').trim().toUpperCase();
+  const name = String(match.country || '').trim().toLowerCase();
+  const isIndia = code === 'IN' || name.includes('india');
+  if (!isIndia) {
+    throw badReq(`Pincode ${pin} is not a valid Indian pincode`);
+  }
+
+  // ── Resolve state + city (find-or-create) ──
+  // geocodeAndMatch only fills city.name when it also matched a state, so use
+  // the google.* blocks for the create-from-scratch path.
+  const stateName = match.google?.state || match.state?.name;
+  const cityName  = match.google?.city  || match.city?.name;
+  if (!stateName) throw badReq(`Pincode ${pin} geocoded without a resolvable state`);
+  if (!cityName)  throw badReq(`Pincode ${pin} geocoded without a resolvable city`);
+
+  const stateId = match.state?.state_id
+    || (await findOrCreateStateByName(stateName, { userId })).state_id;
+  const cityId  = match.city?.city_id
+    || (await findOrCreateCityByName(cityName, stateId, { district: match.district })).city_id;
+
+  const detail = await createPincode(
+    {
+      pincode:  pin,
+      location: cityName,
+      city_id:  cityId,
+      district: match.district,
+      lat:      match.lat,
+      lng:      match.lng,
+      is_active: true,
+    },
+    { userId },
+  );
+
+  return {
+    pincode_id: detail.pincode_id,
+    pincode:    detail.pincode,
+    city_id:    detail.city_id,
+    city_name:  detail.city_name,
+    state_name: detail.state_name,
+    lat:        detail.lat,
+    lng:        detail.lng,
+    created:    true,
+  };
+}
+
+/*
+ * recomputeServiceableStatus — bulk refresh of tbl_pincode.pincode_status.
+ *
+ * A pincode is "Serviceable" (status=1) iff it is covered by at least one
+ * ACTIVE + VERIFIED technician, where coverage = the union of
+ *   (a) tbl_efr_serviceable_pincodes.pincodes (CSV TEXT, FIND_IN_SET match), and
+ *   (b) the tech's own tbl_easyfixer.efr_pin_no (current pincode).
+ *
+ * Single transaction: reset ALL rows to 0, then set the covered union to 1.
+ * Returns { serviceableCount, total } reflecting post-recompute state.
+ */
+async function recomputeServiceableStatus({ userId = null } = {}) {
+  void userId;
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // 1. Everything → Non-Serviceable.
+    await conn.query('UPDATE tbl_pincode SET pincode_status = 0');
+
+    // 2. Union of (serviceable CSV ∪ efr_pin_no) for active+verified techs → 1.
+    //    EXISTS keeps it set-based (no JS CSV split); FIND_IN_SET matches the
+    //    CSV column, the efr_pin_no equality catches the current pincode.
+    const [upd] = await conn.query(
+      `UPDATE tbl_pincode p
+          SET p.pincode_status = 1
+        WHERE EXISTS (
+          SELECT 1
+            FROM tbl_easyfixer e
+            LEFT JOIN tbl_efr_serviceable_pincodes sp
+                   ON sp.easyfixer_id = e.efr_id
+           WHERE e.efr_status = 1
+             AND e.is_technician_verified = 1
+             AND ( (sp.pincodes IS NOT NULL AND FIND_IN_SET(p.pincode, sp.pincodes) > 0)
+                   OR (e.efr_pin_no IS NOT NULL AND e.efr_pin_no = p.pincode) )
+        )`,
+    );
+
+    const [[{ total }]] = await conn.query('SELECT COUNT(*) AS total FROM tbl_pincode');
+
+    await conn.commit();
+    const serviceableCount = Number(upd.affectedRows) || 0;
+    logger.info({ serviceableCount, total }, 'recomputeServiceableStatus: pincode status refreshed');
+    return { serviceableCount, total: Number(total) || 0 };
+  } catch (e) {
+    await conn.rollback();
+    logger.error({ err: e.message }, 'recomputeServiceableStatus failed; rolled back');
+    throw e;
+  } finally {
+    conn.release();
+  }
 }
 
 async function updatePincode(pincodeId, fields, { userId = null } = {}) {
@@ -504,6 +802,165 @@ async function setZonesForPincode(pincodeId, zoneIds, { userId = null } = {}) {
   }
 }
 
+/*
+ * Auto-fetch flow for the Add-Pincode modal. Geocodes the PIN via Google
+ * (lat/lng + state/city/district from address_components), checks for a
+ * duplicate, and maps the Google state/city to our tbl_state/tbl_city
+ * (case-insensitive). Returns matched ids + `isNew` flags so the FE can show
+ * the 'New' chip and warn on Save. Never throws on geocode failure (returns
+ * nulls + geocoded:false).
+ */
+async function geocodeAndMatch(pincodeRaw) {
+  const pin = String(pincodeRaw || '').trim();
+  if (!/^\d{6}$/.test(pin)) throw badReq('Pincode must be exactly 6 digits');
+
+  const [[dup]] = await pool.query(
+    `SELECT p.pincode_id, p.location, c.city_name, s.state_name, p.pincode_status
+       FROM tbl_pincode p
+       LEFT JOIN tbl_city  c ON c.city_id  = p.city_id
+       LEFT JOIN tbl_state s ON s.state_id = c.state_id
+      WHERE p.pincode = ? LIMIT 1`,
+    [pin]
+  );
+
+  const detail = await geocode.geocodePincodeDetail(pin); // {lat,lng,state,district,city,geocoded}
+
+  let matchedState = null;
+  if (detail?.state) {
+    const [[srow]] = await pool.query(
+      'SELECT state_id, state_name FROM tbl_state WHERE LOWER(TRIM(state_name)) = LOWER(?) LIMIT 1',
+      [detail.state.trim()]
+    );
+    if (srow) matchedState = { state_id: Number(srow.state_id), state_name: srow.state_name };
+  }
+
+  // Only match the city WITHIN the matched state — never name-only across all
+  // states (that could bind the PIN to a same-named city in a different state).
+  // If the state is new/unmatched, the city is treated as new too.
+  let matchedCity = null;
+  if (detail?.city && matchedState) {
+    const [[crow]] = await pool.query(
+      'SELECT city_id, city_name, state_id FROM tbl_city WHERE state_id = ? AND LOWER(TRIM(city_name)) = LOWER(?) LIMIT 1',
+      [matchedState.state_id, detail.city.trim()]
+    );
+    if (crow) matchedCity = { city_id: Number(crow.city_id), city_name: crow.city_name, state_id: Number(crow.state_id) };
+  }
+
+  return {
+    pincode: pin,
+    duplicate: dup ? {
+      pincode_id: Number(dup.pincode_id),
+      location:   dup.location || null,
+      city_name:  dup.city_name || null,
+      state_name: dup.state_name || null,
+      is_active:  Number(dup.pincode_status) === 1,
+    } : null,
+    geocoded: !!detail?.geocoded,
+    lat: detail?.lat ?? null,
+    lng: detail?.lng ?? null,
+    district: detail?.district ?? null,
+    country: detail?.country ?? null,
+    country_code: detail?.country_code ?? null,
+    google: { state: detail?.state ?? null, city: detail?.city ?? null, district: detail?.district ?? null, country: detail?.country ?? null },
+    state: {
+      state_id: matchedState?.state_id ?? null,
+      name:     detail?.state ?? null,
+      isNew:    !!(detail?.state && !matchedState),
+    },
+    city: {
+      city_id:  matchedCity?.city_id ?? null,
+      name:     detail?.city ?? null,
+      state_id: matchedCity?.state_id ?? matchedState?.state_id ?? null,
+      isNew:    !!(detail?.city && !matchedCity),
+    },
+  };
+}
+
+/*
+ * Suggest the top-N (default 3) zones a new pincode could belong to.
+ * Relevance is derived ENTIRELY from each zone's already-mapped pincodes (the
+ * tbl_zone_pincode_mapping junction — the source of truth; tbl_zone_master
+ * .city_id is NOT consulted). Ranking (per the chosen spec):
+ *   1. zones that already contain a pincode in the SAME city as the new PIN;
+ *   2. among those (and as fill), nearest by haversine from the new PIN's
+ *      lat/lng to the zone's closest mapped pincode.
+ * One query loads active zones' mapped pincodes (city + lat/lng); grouping +
+ * distance run in JS (zone set is CRM-managed and small).
+ */
+async function suggestZonesForLocation({ cityId = null, lat = null, lng = null, limit = 3 } = {}) {
+  const n = Math.min(Math.max(Number(limit) || 3, 1), 10);
+  const point = (lat != null && lat !== '' && lng != null && lng !== '')
+    ? { lat: Number(lat), lng: Number(lng) } : null;
+  const cid = cityId ? Number(cityId) : null;
+
+  let ranked = [];
+  // Relevance ranking runs only when we have a city or a geocoded point;
+  // otherwise we skip straight to the random fill below (and never scan the
+  // whole junction). Bounded scan: only pincodes in the SAME city, or within a
+  // ~1.5° (~165 km) bounding box of the new PIN.
+  if (cid || point) {
+    const conds = [];
+    const params = [];
+    if (cid) { conds.push('p.city_id = ?'); params.push(cid); }
+    if (point) {
+      const D = 1.5;
+      conds.push('(p.lat BETWEEN ? AND ? AND p.lng BETWEEN ? AND ?)');
+      params.push(point.lat - D, point.lat + D, point.lng - D, point.lng + D);
+    }
+    const [rows] = await pool.query(
+      `SELECT z.zone_id, z.zone_name, p.city_id AS p_city_id, p.lat, p.lng
+         FROM tbl_zone_master z
+         JOIN tbl_zone_pincode_mapping zpm ON zpm.zone_id = z.zone_id
+         JOIN tbl_pincode p ON p.pincode_id = zpm.pincode_id
+        WHERE z.zone_status = 1 AND (${conds.join(' OR ')})`,
+      params
+    );
+    const zones = new Map();
+    for (const r of rows) {
+      const id = Number(r.zone_id);
+      let z = zones.get(id);
+      if (!z) { z = { zone_id: id, zone_name: r.zone_name, sameCity: false, minDist: null }; zones.set(id, z); }
+      if (cid && Number(r.p_city_id) === cid) z.sameCity = true;
+      if (point && r.lat != null && r.lng != null) {
+        const d = geocode.haversineKm(point, { lat: Number(r.lat), lng: Number(r.lng) });
+        if (d != null && (z.minDist == null || d < z.minDist)) z.minDist = d;
+      }
+    }
+    ranked = [...zones.values()].sort((a, b) => {
+      if (a.sameCity !== b.sameCity) return a.sameCity ? -1 : 1; // same-city first
+      const ad = a.minDist == null ? Infinity : a.minDist;
+      const bd = b.minDist == null ? Infinity : b.minDist;
+      if (ad !== bd) return ad - bd;                              // then nearest
+      return String(a.zone_name).localeCompare(String(b.zone_name));
+    }).slice(0, n).map((z) => ({
+      zone_id: z.zone_id,
+      zone_name: z.zone_name,
+      reason: z.sameCity ? 'same_city' : 'nearby',
+      distance_km: z.minDist == null ? null : Number(z.minDist.toFixed(1)),
+    }));
+  }
+
+  // ALWAYS return n suggestions: pad with RANDOM active zones (excluding the
+  // already-ranked ones) when fewer than n relevant zones exist — including the
+  // no-signal case (brand-new city with no nearby zones). Padded rows carry
+  // reason:'random' so the FE can label them. tbl_zone_master is small, so
+  // ORDER BY RAND() is fine here.
+  if (ranked.length < n) {
+    const have = ranked.map((z) => z.zone_id);
+    const notIn = have.length ? `AND zone_id NOT IN (${have.map(() => '?').join(',')})` : '';
+    const [randRows] = await pool.query(
+      `SELECT zone_id, zone_name FROM tbl_zone_master
+        WHERE zone_status = 1 ${notIn}
+        ORDER BY RAND() LIMIT ?`,
+      [...have, n - ranked.length]
+    );
+    for (const r of randRows) {
+      ranked.push({ zone_id: Number(r.zone_id), zone_name: r.zone_name, reason: 'random', distance_km: null });
+    }
+  }
+  return ranked;
+}
+
 module.exports = {
   STATUS,
   listPincodes,
@@ -511,8 +968,12 @@ module.exports = {
   getPincodeByValue,
   lookupManyByCode,
   createPincode,
+  ensurePincode,
+  recomputeServiceableStatus,
   updatePincode,
   deletePincode,
   listTechniciansForPincode,
   setZonesForPincode,
+  geocodeAndMatch,
+  suggestZonesForLocation,
 };

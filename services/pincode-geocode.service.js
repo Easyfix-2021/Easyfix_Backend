@@ -192,6 +192,73 @@ async function persistCentroid(pin, { lat, lng }) {
   }
 }
 
+// Pull a named component's long_name out of a Google address_components[].
+function pickComponent(components, type) {
+  const c = (components || []).find((x) => Array.isArray(x.types) && x.types.includes(type));
+  return c ? c.long_name : null;
+}
+
+/*
+ * geocodePincodeDetail(pincode) — for the Manage Pincodes "auto-fetch" flow.
+ * Unlike getCentroid (lat/lng only), this ALSO parses address_components to
+ * return the Google state / district / city so the FE can map them to our
+ * tbl_state / tbl_city (or flag 'New'). Fresh Google call (we need the
+ * components, which the lat/lng cache doesn't store), but still memo+persists
+ * the centroid. Fail-soft: returns nulls + geocoded:false on any failure.
+ * Returns { lat, lng, state, district, city, country, country_code, geocoded }.
+ *
+ * `country` / `country_code` are surfaced so callers (ensurePincode) can
+ * hard-reject non-India results at the service layer. The geocode request URL
+ * already pins `|country:IN`, so a well-behaved Google response is India-only —
+ * but the explicit country field lets the caller enforce that contract instead
+ * of trusting the URL component implicitly.
+ */
+async function geocodePincodeDetail(pincode) {
+  const pin = normalisePin(pincode);
+  if (!pin) return null;
+  const empty = { lat: null, lng: null, state: null, district: null, city: null, country: null, country_code: null, geocoded: false };
+  const apiKey = serverApiKey();
+  if (!apiKey) {
+    logger.warn('pincode-geocode: GOOGLE_MAPS_API_KEY unset — cannot auto-fetch pincode detail');
+    return empty;
+  }
+  try {
+    const url = `${GEOCODE_URL}?components=${encodeURIComponent(`postal_code:${pin}|country:IN`)}&key=${apiKey}`;
+    const r = await fetch(url);
+    const data = await r.json();
+    if (data.status !== 'OK' || !data.results?.length) {
+      logger.warn({ pin, status: data.status }, 'pincode-geocode: detail geocode non-OK');
+      return empty;
+    }
+    const res = data.results[0];
+    const lat = toNum(res.geometry?.location?.lat);
+    const lng = toNum(res.geometry?.location?.lng);
+    const comps = res.address_components || [];
+    const state = pickComponent(comps, 'administrative_area_level_1');
+    const district = pickComponent(comps, 'administrative_area_level_2');
+    // City: prefer the most specific place name, falling back to the district.
+    const city = pickComponent(comps, 'locality')
+      || pickComponent(comps, 'postal_town')
+      || pickComponent(comps, 'sublocality_level_1')
+      || district;
+    // Country long_name ("India") + the ISO short_code ("IN") so callers can
+    // reject non-India results regardless of localised long_name spelling.
+    const country = pickComponent(comps, 'country');
+    const countryComp = (comps || []).find(
+      (x) => Array.isArray(x.types) && x.types.includes('country'),
+    );
+    const country_code = countryComp ? countryComp.short_name : null;
+    if (lat != null && lng != null) {
+      memCache.set(pin, { value: { lat, lng }, expires: Date.now() + MEM_TTL_MS });
+      await persistCentroid(pin, { lat, lng }); // no-op if the pincode row doesn't exist yet
+    }
+    return { lat, lng, state, district, city, country, country_code, geocoded: true };
+  } catch (e) {
+    logger.warn({ pin, err: e.message }, 'pincode-geocode: detail geocode threw');
+    return empty;
+  }
+}
+
 /*
  * haversineKm(a, b) — great-circle distance in kilometres between two
  * {lat,lng} points. Returns null when either point is missing/invalid.
@@ -215,5 +282,6 @@ function haversineKm(a, b) {
 module.exports = {
   getCentroid,
   getCentroids,
+  geocodePincodeDetail,
   haversineKm,
 };

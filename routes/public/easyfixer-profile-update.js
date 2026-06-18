@@ -26,6 +26,7 @@ const Joi = require('joi');
 const { pool } = require('../../db');
 const { verifyEasyfixerProfileToken } = require('../../utils/jwt');
 const profileUpdateLink = require('../../services/easyfixer-profile-update-link.service');
+const pincodeService = require('../../services/pincode.service');
 const otpSvc = require('../../services/easyfixer-profile-otp.service');
 const { modernOk, modernError } = require('../../utils/response');
 const validate = require('../../middleware/validate');
@@ -75,6 +76,16 @@ const pincodeSearchQuery = Joi.object({
   q:     Joi.string().allow('').max(50).default(''),
   limit: Joi.number().integer().min(1).max(200).default(50),
 }).unknown(true);
+
+// Body schema for POST /ensure-pincode — the operator searched and found no
+// match, so they're creating the pincode on the fly. The token still lives in
+// the query string (?token=…, validated by tokenQuery via the same
+// verifyTokenFromQuery gate the search route uses); the body carries only the
+// 6-digit Indian pincode. We pin it to exactly 6 digits here so a malformed
+// value 400s at the edge rather than reaching the geocoder.
+const ensurePincodeBody = Joi.object({
+  pincode: Joi.string().pattern(/^\d{6}$/).required(),
+});
 
 const saveBody = Joi.object({
   // 4-digit OTP the technician received via WhatsApp — required to gate the
@@ -225,6 +236,41 @@ router.get(
       const items = await profileUpdateLink.searchPincodes(q, limit, pool);
       logger.info({ q, limit, count: items.length }, 'easyfixer-profile-update: pincode search');
       return modernOk(res, { items });
+    } catch (e) {
+      return mapKnownError(res, next, e);
+    }
+  },
+);
+
+// ─── POST /ensure-pincode?token=<jwt>  body { pincode } ─────────────
+// On-the-fly pincode creation for the serviceable-pincode picker. When the
+// technician's search ("/pincodes") returns no match, the FE lets them create
+// the pincode here and immediately add it as a serviceable chip — so the
+// catalog never blocks a real Indian pincode the seed happened to miss.
+//
+// Token-gated exactly like the search route (same tokenRateLimit bucket + the
+// shared verifyTokenFromQuery gate). The body is just the 6-digit pincode; we
+// delegate to pincode.service.ensurePincode, which is idempotent: it geocodes
+// (Google country must be India) and either returns the existing row
+// (created:false) or inserts a new one (created:true), throwing a 400 for a
+// non-Indian / non-geocodable value.
+router.post(
+  '/ensure-pincode',
+  tokenRateLimit,
+  validate(tokenQuery, 'query'),
+  validate(ensurePincodeBody, 'body'),
+  async (req, res, next) => {
+    try {
+      // Token verification only — the pincode catalog is identical for every
+      // easyfixer, so we don't need the efrId; the call still gates access to
+      // authenticated link holders.
+      verifyTokenFromQuery(req);
+      const row = await pincodeService.ensurePincode(req.body.pincode);
+      logger.info(
+        { pincode: req.body.pincode, pincode_id: row && row.pincode_id, created: row && row.created },
+        'easyfixer-profile-update: ensure-pincode',
+      );
+      return modernOk(res, row);
     } catch (e) {
       return mapKnownError(res, next, e);
     }

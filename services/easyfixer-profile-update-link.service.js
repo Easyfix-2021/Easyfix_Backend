@@ -643,10 +643,13 @@ async function buildDeepSkillCatalog(pool) {
  * Search the active pincode catalog. Used by the public profile-update form
  * to lazily lookup pincodes without bundling the full ~155k-row table.
  *
- * Search modes:
+ * Field-aware search (#8 — same rule as listPincodes in pincode.service.js):
  *   - empty `q`      → top `limit` recent pincodes (pincode_id DESC)
- *   - numeric `q`    → prefix match on pincode (`pincode LIKE 'q%'`)
- *   - non-numeric q  → fuzzy match on pincode / location / city_name
+ *   - ALL-digits `q` → prefix match on pincode (`pincode LIKE 'q%'`)
+ *   - otherwise      → match city_name OR district (LIKE)
+ *
+ * `city_name` is always returned so the FE can render the picker option /
+ * chip label as "<pincode> - <city_name>" (e.g. "110002 - New Delhi").
  *
  * Only `pincode_status = 1` rows are returned. Parameterised throughout.
  * Result shape matches CatalogPincode in the FE.
@@ -654,11 +657,15 @@ async function buildDeepSkillCatalog(pool) {
 async function searchPincodes(q, limit, pool) {
   const cap = Math.min(Math.max(Number(limit) || 50, 1), 200);
   const term = (q == null ? '' : String(q)).trim();
+  // district lives on tbl_pincode (per-pincode override) OR tbl_city (the
+  // city-level default) — COALESCE mirrors pincode.service.js so both the
+  // text-search OR and any future label can read a single `district` value.
   const SELECT = `
     SELECT p.pincode_id,
            p.pincode,
            p.location,
            c.city_name,
+           COALESCE(p.district, c.district) AS district,
            s.state_name
       FROM tbl_pincode p
       LEFT JOIN tbl_city  c ON c.city_id  = p.city_id
@@ -673,7 +680,8 @@ async function searchPincodes(q, limit, pool) {
        LIMIT ?`,
       [cap],
     );
-  } else if (/^\d{1,6}$/.test(term)) {
+  } else if (/^\d+$/.test(term)) {
+    // ALL-digits → treat as a pincode prefix.
     [rows] = await pool.query(
       `${SELECT}
        WHERE p.pincode_status = 1
@@ -684,24 +692,20 @@ async function searchPincodes(q, limit, pool) {
     );
   } else {
     /*
-     * Prefix match instead of mid-string fuzzy (2026-06-11). Per the
-     * user's UX/perf review: "%foo%" is unusable against BTREE indexes
-     * (leading wildcard kills index seek), forcing a full scan of
-     * ~155k rows on every keystroke. "foo%" lets MySQL hit the new
-     * `idx_pincode_location` + `idx_city_name` indexes, and matches
-     * the typical typing pattern (operators start with the first
-     * letter of the city / location name).
-     *
-     * The pincode column also uses prefix — but the numeric-prefix
-     * branch above already handles that path, so this fallback is for
-     * pure text queries. We still OR across three text columns so a
-     * partial city ("Mum") or location ("Andh") both work.
+     * Non-numeric → match city_name OR district (#8). Prefix match
+     * instead of mid-string fuzzy (2026-06-11): "%foo%" is unusable
+     * against BTREE indexes (leading wildcard kills index seek),
+     * forcing a full scan of ~155k rows on every keystroke. "foo%"
+     * lets MySQL hit the city/district indexes and matches the typical
+     * typing pattern (operators start with the first letter of the
+     * city / district name). The pincode column is handled by the
+     * all-digits branch above, so this fallback is for pure text.
      */
     const prefix = `${term}%`;
     [rows] = await pool.query(
       `${SELECT}
        WHERE p.pincode_status = 1
-         AND (p.location LIKE ? OR c.city_name LIKE ?)
+         AND (c.city_name LIKE ? OR COALESCE(p.district, c.district) LIKE ?)
        ORDER BY p.pincode ASC
        LIMIT ?`,
       [prefix, prefix, cap],
@@ -712,6 +716,7 @@ async function searchPincodes(q, limit, pool) {
     pincode: String(r.pincode),
     location: r.location || null,
     city_name: r.city_name || null,
+    district: r.district || null,
     state_name: r.state_name || null,
   }));
 }
@@ -768,12 +773,15 @@ async function sendForEasyfixer(efrId, { action = 'first', override_mobile, bypa
    * the destination actually messaged.
    */
   const isProd = process.env.NODE_ENV === 'production';
-  // Honour an operator-supplied override in non-prod, OR whenever this is the
-  // explicit Scheduled Jobs → Test flow (bypassTestRedirect=true) — the
-  // operator typed the number deliberately, so it must win on ALL envs
-  // (matching the other Test flows, which pass the typed number straight to
-  // `to`). Normal prod sends (no bypass) still ignore override → real efr_no.
-  const allowOverride = !!override_mobile && (!isProd || bypassTestRedirect);
+  // The same ENABLE_DEV_PROFILE_URL opt-in that exposes the dev-url also lets a
+  // prod-flagged staging/parity backend honor a test override (kept in lockstep
+  // with the route-layer Joi gate above).
+  const devOptIn = String(process.env.ENABLE_DEV_PROFILE_URL || '').toLowerCase() === 'true';
+  // Honour an operator-supplied override in non-prod, OR the explicit Scheduled
+  // Jobs → Test flow (bypassTestRedirect=true), OR a prod-flagged env that opted
+  // in via ENABLE_DEV_PROFILE_URL — the operator typed the number deliberately.
+  // TRUE production (no opt-in, no bypass) still ignores override → real efr_no.
+  const allowOverride = !!override_mobile && (!isProd || bypassTestRedirect || devOptIn);
   const destinationMobile = allowOverride ? String(override_mobile) : row.efr_no;
   if (allowOverride) {
     logger.info(

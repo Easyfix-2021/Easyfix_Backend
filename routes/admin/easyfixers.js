@@ -35,7 +35,13 @@ const profileUpdateSendBody = Joi.object({
     .pattern(/^\d{10,15}$/)
     .optional()
     .custom((value, helpers) => {
-      if (process.env.NODE_ENV === 'production') {
+      // Block override_mobile in TRUE production, but honor the explicit
+      // ENABLE_DEV_PROFILE_URL opt-in (the same flag that exposes the dev-url)
+      // so a staging/parity backend running NODE_ENV=production can still test
+      // sends to an operator's own number.
+      const isProd = process.env.NODE_ENV === 'production';
+      const devOptIn = String(process.env.ENABLE_DEV_PROFILE_URL || '').toLowerCase() === 'true';
+      if (isProd && !devOptIn) {
         return helpers.error('any.invalid');
       }
       return value;
@@ -538,24 +544,24 @@ router.get('/:id/profile-update-link/dev-url',
   /*
    * Dev gate (2026-06-11). The route is open when EITHER:
    *   • NODE_ENV is not 'production' (the default dev/test path), OR
-   *   • ENABLE_DEV__PROFILE_URL=true is set (explicit opt-in for ops
+   *   • ENABLE_DEV_PROFILE_URL=true is set (explicit opt-in for ops
    *     who need the affordance on a prod-flagged BE — e.g. a staging
    *     deployment that runs with NODE_ENV=production for parity
    *     testing, or a locally-run BE where NODE_ENV gets accidentally
    *     inlined as 'production' by npm start).
    *
    * Default-closed in true production: leaving both signals at their
-   * defaults (NODE_ENV=production, no ENABLE_DEV__PROFILE_URL or it
+   * defaults (NODE_ENV=production, no ENABLE_DEV_PROFILE_URL or it
    * set to 'false') preserves the "endpoint doesn't exist" surface.
    * Operators have to explicitly opt-in to expose the dev URL.
    *
-   * 2026-06-11 rename: ENABLE_DEV_URL → ENABLE_DEV__PROFILE_URL for a
+   * 2026-06-11 rename: ENABLE_DEV_URL → ENABLE_DEV_PROFILE_URL for a
    * more specific name; old check accepted '1', new check accepts the
    * literal string 'true' so the env file reads as a clear boolean.
    */
   (req, res, next) => {
     const isProd = process.env.NODE_ENV === 'production';
-    const explicitlyEnabled = String(process.env.ENABLE_DEV__PROFILE_URL || '').toLowerCase() === 'true';
+    const explicitlyEnabled = String(process.env.ENABLE_DEV_PROFILE_URL || '').toLowerCase() === 'true';
     if (isProd && !explicitlyEnabled) {
       return modernError(res, 404, 'Not Found');
     }

@@ -902,6 +902,21 @@ async function replaceServiceablePincodes(efrId, pincodeIds, actor, externalConn
      ON DUPLICATE KEY UPDATE pincodes = VALUES(pincodes), updated_by = VALUES(updated_by)`,
     [efrId, csv, userId, userId]
   );
+  // Immediate-serviceable hook: flip the just-added pincodes to Serviceable
+  // (pincode_status = 1) right away so a technician/ops updating their set
+  // sees them go live without waiting for the full nightly recompute. We only
+  // ACTIVATE here — deactivation of pincodes no longer in anyone's set is the
+  // exclusive responsibility of the full recompute, so we never set status = 0.
+  // Runs on `db` (externalConn or pool) to stay inside the caller's txn.
+  if (list.length) {
+    const placeholders = list.map(() => '?').join(',');
+    await db.query(
+      `UPDATE tbl_pincode SET pincode_status = 1
+         WHERE (pincode_id IN (${placeholders}) OR pincode IN (${placeholders}))
+           AND pincode_status = 0`,
+      [...list, ...list]
+    );
+  }
   return { updated: resolvedCount };
 }
 
