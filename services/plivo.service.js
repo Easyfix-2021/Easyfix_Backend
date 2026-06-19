@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const logger = require('../logger');
 const { getProperty } = require('./properties.service');
@@ -249,6 +250,74 @@ async function hangupCall({ callUuid }) {
   }
 }
 
+// ── Web (browser / WebRTC) calling ───────────────────────────────────────────
+// The Plivo Browser SDK logs in as a Plivo ENDPOINT (username/password) and
+// places calls into our Voice Application; the app's Answer URL then bridges to
+// the customer. To preserve the masking invariant — the real customer number
+// must NEVER reach the browser — the FE dials an OPAQUE one-time id; the public
+// answer route (/api/public/plivo/web-answer) resolves it back to the real
+// number server-side and returns the Dial XML.
+function webEndpoint() {
+  const username = (process.env.PLIVO_ENDPOINT_USERNAME || '').trim();
+  const password = process.env.PLIVO_ENDPOINT_PASSWORD || '';
+  if (!username || !password) return null;
+  return { username, password, appId: (process.env.PLIVO_WEB_APP_ID || '').trim() || null };
+}
+
+/*
+ * Per-operator Plivo access token (replaces handing the endpoint password to the
+ * browser). A short-lived JWT (HS256, signed with the Auth Token) the Browser
+ * SDK logs in with via client.loginWithAccessToken(). Each operator gets their
+ * own 1-hour token (unique jti) on the shared endpoint — no shared password
+ * crosses the wire, tokens expire, and the jti ties a session to an operator.
+ * Plivo token spec: header carries cty='plivo;v=1'; payload iss=AuthID,
+ * sub=endpoint, nbf/exp, per.voice grants, app=AppID. Outgoing-only.
+ */
+function webAccessToken({ operatorId } = {}) {
+  const authId = (process.env.PLIVO_AUTH_ID || '').trim();
+  const authToken = process.env.PLIVO_AUTH_TOKEN || '';
+  const endpoint = (process.env.PLIVO_ENDPOINT_USERNAME || '').trim();
+  if (!authId || !authToken || !endpoint) return null;
+  const now = Math.floor(Date.now() / 1000);
+  const payload = {
+    iss: authId,
+    sub: endpoint,
+    nbf: now - 5,
+    exp: now + 3600,                 // 1 hour
+    jti: `efweb-${operatorId || 'op'}-${now}-${crypto.randomBytes(4).toString('hex')}`,
+    per: { voice: { incoming_allow: false, outgoing_allow: true } },
+  };
+  const appId = (process.env.PLIVO_WEB_APP_ID || '').trim();
+  if (appId) payload.app = appId;
+  return jwt.sign(payload, authToken, {
+    algorithm: 'HS256',
+    header: { cty: 'plivo;v=1', typ: 'JWT' },
+  });
+}
+
+// In-process one-time dial store: dialId → { number, jci, expires }. Single-
+// process only — a multi-replica deploy needs Redis here (same caveat as the
+// live-status SSE follow-up). 2-min TTL spans click→answer; consumed on first
+// resolve so a guessed/replayed dialId can neither re-trigger a dial nor leak a
+// number.
+const WEB_DIAL_TTL_MS = 2 * 60 * 1000;
+const _webDials = new Map();
+function stashWebDial({ number, jci }) {
+  const now = Date.now();
+  for (const [k, v] of _webDials) if (v.expires <= now) _webDials.delete(k); // sweep
+  const id = crypto.randomBytes(16).toString('hex');
+  _webDials.set(id, { number, jci, expires: now + WEB_DIAL_TTL_MS });
+  return id;
+}
+function resolveWebDial(id) {
+  const key = String(id || '');
+  const v = _webDials.get(key);
+  if (!v) return null;
+  _webDials.delete(key); // one-time use
+  if (v.expires <= Date.now()) return null;
+  return { number: v.number, jci: v.jci };
+}
+
 module.exports = {
   clickToCall,
   previewCallLegs,
@@ -259,4 +328,9 @@ module.exports = {
   verifyCallToken,
   buildAnswerXml,
   callingEnabled,
+  maskForDisplay,
+  webEndpoint,
+  webAccessToken,
+  stashWebDial,
+  resolveWebDial,
 };

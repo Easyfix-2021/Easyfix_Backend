@@ -35,6 +35,12 @@ const SUREPASS_BASE = 'https://kyc-api.surepass.io';
 // VENDOR: aadhaarkyc.io (PAN OCR, Aadhaar OTP, bank + UPI verification)
 const AADHAARKYC_BASE = 'https://kyc-api.aadhaarkyc.io';
 
+// Hard ceiling on every outbound vendor call. KYC vendors can hang; without a
+// timeout a slow vendor ties up the Express worker AND the app's poll loop.
+// `AbortSignal.timeout` (Node 18+) aborts the fetch and throws a DOMException
+// with name 'TimeoutError', which unreachableError() maps to a clean 504.
+const VENDOR_TIMEOUT_MS = 15000;
+
 // ─── Auth / config ──────────────────────────────────────────────────
 function verificationKey() {
   return process.env.SUREPASS_VERIFICATION_KEY || '';
@@ -73,6 +79,20 @@ function vendorError(body, fallback) {
   return e;
 }
 
+// Maps a thrown fetch/transport error to a clean status: a vendor timeout
+// (AbortSignal.timeout → DOMException 'TimeoutError') becomes a 504; any other
+// transport failure stays a 502 ("vendor unreachable" from the app's POV).
+function unreachableError(err) {
+  if (err && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+    const e = new Error('KYC vendor timed out');
+    e.status = 504;
+    return e;
+  }
+  const e = new Error('KYC vendor is unreachable');
+  e.status = 502;
+  return e;
+}
+
 /*
  * Core JSON call. `label` is used for log correlation only. On a non-2xx HTTP
  * status or a non-OK vendor envelope it throws `.status=502`. Network/parse
@@ -86,13 +106,12 @@ async function callVendorJson(efrId, label, url, body) {
       method: 'POST',
       headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(VENDOR_TIMEOUT_MS),
     });
     parsed = await res.json().catch(() => null);
   } catch (err) {
     logger.warn({ efrId, label, err: err.message }, 'mobile-kyc: vendor call threw');
-    const e = new Error('KYC vendor is unreachable');
-    e.status = 502;
-    throw e;
+    throw unreachableError(err);
   }
   if (!isOk(parsed)) {
     logger.warn(
@@ -149,13 +168,15 @@ async function digilockerDownloadAadhaar(efrId, clientId) {
   let res;
   let parsed;
   try {
-    res = await fetch(url, { method: 'GET', headers: authHeaders() });
+    res = await fetch(url, {
+      method: 'GET',
+      headers: authHeaders(),
+      signal: AbortSignal.timeout(VENDOR_TIMEOUT_MS),
+    });
     parsed = await res.json().catch(() => null);
   } catch (err) {
     logger.warn({ efrId, clientId, err: err.message }, 'mobile-kyc: digilocker download threw');
-    const e = new Error('KYC vendor is unreachable');
-    e.status = 502;
-    throw e;
+    throw unreachableError(err);
   }
 
   // Consent not yet given → still pending, app should keep polling.
@@ -209,13 +230,16 @@ async function panOcr(efrId, file) {
   try {
     // NOTE: do NOT set Content-Type manually — fetch/FormData sets the
     // multipart boundary itself. Only the Authorization header is forwarded.
-    res = await fetch(url, { method: 'POST', headers: authHeaders(), body: form });
+    res = await fetch(url, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: form,
+      signal: AbortSignal.timeout(VENDOR_TIMEOUT_MS),
+    });
     parsed = await res.json().catch(() => null);
   } catch (err) {
     logger.warn({ efrId, err: err.message }, 'mobile-kyc: PAN OCR threw');
-    const e = new Error('KYC vendor is unreachable');
-    e.status = 502;
-    throw e;
+    throw unreachableError(err);
   }
   if (!isOk(parsed)) {
     logger.warn(

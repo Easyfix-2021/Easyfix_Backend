@@ -152,9 +152,33 @@ async function flushCache() {
   return _cache ? _cache.size : 0;
 }
 
+/**
+ * Upsert a single property (UPDATE-then-INSERT so it works whether or not
+ * property_key carries a unique constraint) and keep the in-process cache hot
+ * so the change is visible to this process immediately. Other replicas pick it
+ * up on their next TTL refresh / flush. Used by admin toggles like the
+ * Web↔Mobile calling switch (voice.call.mode).
+ */
+async function setProperty(key, value) {
+  const v = String(value);
+  const [r] = await pool.query(
+    'UPDATE easyfix_properties SET property_value = ? WHERE property_key = ?',
+    [v, key],
+  );
+  if (!r.affectedRows) {
+    await pool.query(
+      'INSERT INTO easyfix_properties (property_key, property_value) VALUES (?, ?)',
+      [key, v],
+    );
+  }
+  if (_cache) _cache.set(key, v);
+  return true;
+}
+
 module.exports = {
   preload,
   getProperty,
   getAllProperties,
   flushCache,
+  setProperty,
 };

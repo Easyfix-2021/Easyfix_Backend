@@ -85,6 +85,32 @@ async function hangup({ provider, callUuid }) {
   return svc.hangupCall({ callUuid });
 }
 
+// Call topology toggle: 'web' = operator talks from the browser (Plivo WebRTC,
+// customer dialled directly) · 'mobile' = phone bridge (operator's phone rung
+// first, then customer — today's default). Runtime-switchable via the
+// easyfix_properties key `voice.call.mode` (Setting → Admin Actions). Defaults
+// to 'mobile' so nothing changes until an admin opts in. Web mode is Plivo-only.
+function callMode() {
+  return String(getProperty('voice.call.mode') || 'mobile').toLowerCase() === 'web' ? 'web' : 'mobile';
+}
+
+// ── Per-provider QA / dev env overrides ──────────────────────────────────────
+// These read process.env LIVE (env vars — NOT the cached easyfix_properties
+// store). `<PROVIDER>_CALLING_CUSTOM_NUMBER=true` puts THAT provider in QA mode
+// (the FE prompts for both legs); `<PROVIDER>_CALL_FROM` / `<PROVIDER>_CALL_TO`
+// are the dev/QA test numbers the prompt pre-fills with. Keyed per provider so a
+// Kaleyra test pair never bleeds into a Plivo call (and vice-versa) — the bug
+// where the Place-Call modal always pre-filled KALEYRA_CALL_FROM/TO.
+function customNumberMode(name) {
+  return String(process.env[`${String(name).toUpperCase()}_CALLING_CUSTOM_NUMBER`]).toLowerCase() === 'true';
+}
+function qaDefaults(name) {
+  const u = String(name).toUpperCase();
+  const from = (process.env[`${u}_CALL_FROM`] || '').trim();
+  const to   = (process.env[`${u}_CALL_TO`]   || '').trim();
+  return (from || to) ? { from: from || null, to: to || null } : null;
+}
+
 module.exports = {
   clickToCall,
   previewCallLegs,
@@ -94,4 +120,7 @@ module.exports = {
   enabledProviders,
   isProviderEnabled,
   supportsLiveStatus,
+  customNumberMode,
+  qaDefaults,
+  callMode,
 };

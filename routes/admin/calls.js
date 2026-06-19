@@ -4,7 +4,21 @@ const logger = require('../../logger');
 const validate = require('../../middleware/validate');
 const { modernOk, modernError } = require('../../utils/response');
 const kaleyra = require('../../services/kaleyra.service');
+const plivo = require('../../services/plivo.service');
 const voice = require('../../services/voice.service');
+const plivoLog = require('../../services/plivo-call-log.service');
+const propertiesSvc = require('../../services/properties.service');
+
+// Coarse "Call From Flow" when the FE doesn't send an explicit one — derived
+// from which receiver identifier was used.
+function coarseFlow(body) {
+  if (body.flow) return String(body.flow).slice(0, 64);
+  if (body.jobId) return 'job';
+  if (body.customerId) return 'customer';
+  if (body.efrId) return 'technician';
+  if (body.reportingContactId) return 'spoc';
+  return null;
+}
 const { getEffectivePermissions } = require('../../services/role.service');
 const { clickToCallBody, callListQuery } = require('../../validators/calls.validator');
 
@@ -38,16 +52,6 @@ async function requireClickToCallAction(req, res, next) {
   } catch (e) { return next(e); }
 }
 
-/* Resolve which mode the environment is in. Centralised so the constants
- * stay single-sourced across the route file. */
-function callingMode() {
-  if (String(process.env.KALEYRA_CALLING_CUSTOM_NUMBER).toLowerCase() === 'true') return 'qa';
-  const f = (process.env.KALEYRA_CALL_FROM || '').trim();
-  const t = (process.env.KALEYRA_CALL_TO   || '').trim();
-  if (f && t) return 'dev';
-  return 'prod';
-}
-
 // ─── GET /config ─────────────────────────────────────────────────────
 // Tells the FE which calling mode the environment is in so it can render
 // the right confirmation flow:
@@ -59,28 +63,33 @@ function callingMode() {
 // operator-managed config, not user PII) so the dialog can pre-fill.
 // Permission-gated on isClickToCall so unauthorised operators can't probe.
 router.get('/config', requireClickToCallAction, (req, res) => {
-  const mode = callingMode();
-  const promptForNumbers = mode === 'qa';
+  const enabled = voice.enabledProviders();
+  const def = voice.defaultProvider();
 
-  // qaDefaults is ONLY populated in QA mode (we don't want the dev-env
-  // override values leaking to a production FE; in dev/prod the FE
-  // already uses /preview to get masked previews instead).
-  let qaDefaults = null;
-  if (promptForNumbers) {
-    const envFrom = (process.env.KALEYRA_CALL_FROM || '').trim();
-    const envTo   = (process.env.KALEYRA_CALL_TO   || '').trim();
-    if (envFrom || envTo) qaDefaults = { from: envFrom || null, to: envTo || null };
+  // Per-provider QA config so the FE prompts for + pre-fills the SELECTED
+  // provider's *_CALL_FROM / *_CALL_TO (not always Kaleyra's). qaDefaults are
+  // exposed ONLY for a provider that's in its own QA mode — we never leak a
+  // provider's dev-override numbers to a production FE.
+  const providers = {};
+  for (const name of enabled) {
+    const qa = voice.customNumberMode(name);
+    providers[name] = { promptForNumbers: qa, qaDefaults: qa ? voice.qaDefaults(name) : null };
   }
 
-  // enabledProviders/defaultProvider drive the FE provider radio: it shows the
-  // picker only when more than one provider is enabled; otherwise the call is
-  // one-click as before, dialling defaultProvider.
+  // Top-level fields mirror the DEFAULT provider so any consumer that doesn't
+  // read the per-provider `providers` map still behaves sensibly. The FE radio
+  // shows when >1 provider is enabled; the QA dialog reads `providers[<chosen>]`.
+  const dp = providers[def] || { promptForNumbers: false, qaDefaults: null };
   modernOk(res, {
-    mode,
-    promptForNumbers,
-    qaDefaults,
-    enabledProviders: voice.enabledProviders(),
-    defaultProvider: voice.defaultProvider(),
+    mode: dp.promptForNumbers ? 'qa' : 'prod',
+    promptForNumbers: dp.promptForNumbers,
+    qaDefaults: dp.qaDefaults,
+    enabledProviders: enabled,
+    defaultProvider: def,
+    providers,
+    // 'web' = operator talks from the browser (Plivo WebRTC); 'mobile' = phone
+    // bridge (today's default). The FE branches its calling flow on this.
+    callMode: voice.callMode(),
   });
 });
 
@@ -162,7 +171,10 @@ router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'
     // through the normal waterfall. previewCallLegs masks first-4-then-bullets
     // internally (same convention as before). The resolved provider is echoed
     // back so the FE can label which line will dial.
-    const mode = callingMode();
+    // Per-provider mode: whether the chosen/resolved provider is in QA custom
+    // mode decides if its *_CALL_FROM/TO override is reflected in the preview.
+    const resolvedForPreview = voice.resolveProvider(provider);
+    const mode = voice.customNumberMode(resolvedForPreview) ? 'qa' : 'prod';
     const preview = voice.previewCallLegs({
       provider,
       from: req.user.mobile_no,
@@ -174,6 +186,68 @@ router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'
   } catch (e) { next(e); }
 });
 
+// Resolve the receiver (customer / technician / SPOC) identically for BOTH
+// POST /click-to-call and POST /web-start — single source so the two never
+// drift. The FE never supplies the customer mobile; it's always looked up
+// server-side here. Returns { ok:true, receiverMobile, receiverName,
+// receiverCustomerId, jobIdToStore, jobStatusSnapshot, jobEfrId } on success,
+// or { ok:false, status, message } the caller turns into a modernError.
+async function resolveReceiver({ jobId, customerId, efrId, reportingContactId, useAlt }) {
+  if (jobId) {
+    const [[job]] = await pool.query(
+      `SELECT j.job_id, j.fk_customer_id, j.fk_easyfixter_id, j.job_status,
+              COALESCE(j.job_customer_name, c.customer_name) AS customer_name,
+              c.customer_mob_no, j.additional_name, j.additional_number
+         FROM tbl_job j
+    LEFT JOIN tbl_customer c ON c.customer_id = j.fk_customer_id
+        WHERE j.job_id = ? LIMIT 1`,
+      [jobId]
+    );
+    if (!job) return { ok: false, status: 404, message: `Job ${jobId} not found` };
+    let receiverMobile; let receiverName;
+    if (useAlt) {
+      if (!job.additional_number) return { ok: false, status: 400, message: `Job ${jobId} has no alternate number on file` };
+      receiverMobile = job.additional_number;
+      receiverName   = job.additional_name || job.customer_name || null;
+    } else {
+      if (!job.customer_mob_no) return { ok: false, status: 400, message: `Job ${jobId} has no customer mobile on file` };
+      receiverMobile = job.customer_mob_no;
+      receiverName   = job.customer_name || null;
+    }
+    return {
+      ok: true, receiverMobile, receiverName,
+      receiverCustomerId: job.fk_customer_id || null,
+      jobIdToStore: job.job_id, jobStatusSnapshot: job.job_status,
+      jobEfrId: job.fk_easyfixter_id || null,
+    };
+  }
+  if (customerId) {
+    const [[cust]] = await pool.query(
+      `SELECT customer_id, customer_name, customer_mob_no FROM tbl_customer WHERE customer_id = ? LIMIT 1`,
+      [customerId]
+    );
+    if (!cust) return { ok: false, status: 404, message: `Customer ${customerId} not found` };
+    if (!cust.customer_mob_no) return { ok: false, status: 400, message: `Customer ${customerId} has no mobile on file` };
+    return { ok: true, receiverMobile: cust.customer_mob_no, receiverName: cust.customer_name || null, receiverCustomerId: cust.customer_id, jobIdToStore: null, jobStatusSnapshot: null, jobEfrId: null };
+  }
+  if (efrId) {
+    const [[efr]] = await pool.query(
+      `SELECT efr_id, efr_first_name, efr_last_name, efr_no FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1`,
+      [efrId]
+    );
+    if (!efr) return { ok: false, status: 404, message: `Easyfixer ${efrId} not found` };
+    if (!efr.efr_no) return { ok: false, status: 400, message: `Easyfixer ${efrId} has no mobile on file` };
+    return { ok: true, receiverMobile: efr.efr_no, receiverName: [efr.efr_first_name, efr.efr_last_name].filter(Boolean).join(' ').trim() || null, receiverCustomerId: null, jobIdToStore: null, jobStatusSnapshot: null, jobEfrId: null };
+  }
+  const [[ct]] = await pool.query(
+    `SELECT id, contact_name, contact_no FROM tbl_client_contacts WHERE id = ? LIMIT 1`,
+    [reportingContactId]
+  );
+  if (!ct) return { ok: false, status: 404, message: `Contact ${reportingContactId} not found` };
+  if (!ct.contact_no) return { ok: false, status: 400, message: `Contact ${reportingContactId} has no mobile on file` };
+  return { ok: true, receiverMobile: ct.contact_no, receiverName: ct.contact_name || null, receiverCustomerId: null, jobIdToStore: null, jobStatusSnapshot: null, jobEfrId: null };
+}
+
 // ─── POST /click-to-call ─────────────────────────────────────────────
 router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody), async (req, res, next) => {
   try {
@@ -184,8 +258,12 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
     //   1. QA prompt mode → FE MUST supply both callFrom + callTo, BE uses them.
     //   2. Flag OFF + FE sent override numbers → 400 (anti-spoofing).
     //   3. Otherwise → resolve real numbers (req.user.mobile_no + customer lookup).
-    const isCustomNumberMode =
-      String(process.env.KALEYRA_CALLING_CUSTOM_NUMBER).toLowerCase() === 'true';
+    // Custom-number (QA) mode is PER-PROVIDER: the operator's chosen provider
+    // (resolved here, reused for the audit row below) decides whether the
+    // FE-supplied callFrom/callTo are honoured — so a Plivo call reads
+    // PLIVO_CALLING_CUSTOM_NUMBER, not the Kaleyra flag.
+    const resolvedProvider = voice.resolveProvider(provider);
+    const isCustomNumberMode = voice.customNumberMode(resolvedProvider);
 
     if (!isCustomNumberMode && (callFrom || callTo)) {
       // Defence in depth: even though the FE shouldn't send these when the
@@ -208,100 +286,14 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
     }
 
     // ── Resolve receiver mobile + name + (optional) job context ──
-    // FE never sends the customer mobile — we always look it up server-side
-    // (even in QA mode, we still record the canonical customer ref in
-    // tbl_job_caller_info; the Call To the FE supplied is only used as the
-    // actual dial target, not as the persisted "this is who we called"
-    // value).
-    let receiverMobile;
-    let receiverName;
-    let receiverCustomerId = null;
-    let jobIdToStore       = null;
-    let jobStatusSnapshot  = null;
-    let jobEfrId           = null;
-
-    if (jobId) {
-      // Customer mobile lives ONLY on tbl_customer; tbl_job does not have a
-      // mobile column. tbl_job DOES carry an optional job_customer_name
-      // override (set during bulk uploads), which we honour over the
-      // canonical tbl_customer.customer_name when present — same precedence
-      // the JobModal display uses.
-      //
-      // useAlt branch (2026-06-03): when set, dial the per-job alternate
-      // contact (tbl_job.additional_number + .additional_name) instead of
-      // the customer master mobile. Same audit trail (job + customer ids
-      // still recorded); only the receiver number/name change. Rejects
-      // when additional_number is empty so a "no alt on file" misclick is
-      // a clear 400, not a silent fallthrough.
-      const [[job]] = await pool.query(
-        `SELECT j.job_id, j.fk_customer_id, j.fk_easyfixter_id, j.job_status,
-                COALESCE(j.job_customer_name, c.customer_name) AS customer_name,
-                c.customer_mob_no,
-                j.additional_name, j.additional_number
-           FROM tbl_job j
-      LEFT JOIN tbl_customer c ON c.customer_id = j.fk_customer_id
-          WHERE j.job_id = ?
-          LIMIT 1`,
-        [jobId]
-      );
-      if (!job) return modernError(res, 404, `Job ${jobId} not found`);
-      if (useAlt) {
-        if (!job.additional_number) return modernError(res, 400, `Job ${jobId} has no alternate number on file`);
-        receiverMobile = job.additional_number;
-        receiverName   = job.additional_name || job.customer_name || null;
-      } else {
-        if (!job.customer_mob_no) return modernError(res, 400, `Job ${jobId} has no customer mobile on file`);
-        receiverMobile = job.customer_mob_no;
-        receiverName   = job.customer_name || null;
-      }
-      receiverCustomerId  = job.fk_customer_id || null;
-      jobIdToStore        = job.job_id;
-      jobStatusSnapshot   = job.job_status;
-      jobEfrId            = job.fk_easyfixter_id || null;
-    } else if (customerId) {
-      // customerId path — customer-only call, no associated job row
-      const [[cust]] = await pool.query(
-        `SELECT customer_id, customer_name, customer_mob_no
-           FROM tbl_customer WHERE customer_id = ? LIMIT 1`,
-        [customerId]
-      );
-      if (!cust) return modernError(res, 404, `Customer ${customerId} not found`);
-      if (!cust.customer_mob_no) return modernError(res, 400, `Customer ${customerId} has no mobile on file`);
-      receiverMobile     = cust.customer_mob_no;
-      receiverName       = cust.customer_name || null;
-      receiverCustomerId = cust.customer_id;
-    } else if (efrId) {
-      // Technician dial. efr_no is the canonical mobile column on
-      // tbl_easyfixer (despite the field name — see backend CLAUDE.md
-      // "tbl_easyfixer glossary"). receiverCustomerId stays null since
-      // a tech is not a customer; the audit row's reciever_id will
-      // capture the efr_id-as-int instead via the persistence layer.
-      const [[efr]] = await pool.query(
-        `SELECT efr_id, efr_first_name, efr_last_name, efr_no
-           FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1`,
-        [efrId]
-      );
-      if (!efr) return modernError(res, 404, `Easyfixer ${efrId} not found`);
-      if (!efr.efr_no) return modernError(res, 400, `Easyfixer ${efrId} has no mobile on file`);
-      receiverMobile     = efr.efr_no;
-      receiverName       = [efr.efr_first_name, efr.efr_last_name].filter(Boolean).join(' ').trim() || null;
-      receiverCustomerId = null;
-    } else {
-      // reportingContactId path — call a client SPOC directly. Resolves
-      // mobile from tbl_client_contacts (the canonical SPOC table). The
-      // legacy tbl_job.client_spoc text column duplicates this number but
-      // we prefer the FK source for accuracy.
-      const [[ct]] = await pool.query(
-        `SELECT id, contact_name, contact_no
-           FROM tbl_client_contacts WHERE id = ? LIMIT 1`,
-        [reportingContactId]
-      );
-      if (!ct) return modernError(res, 404, `Contact ${reportingContactId} not found`);
-      if (!ct.contact_no) return modernError(res, 400, `Contact ${reportingContactId} has no mobile on file`);
-      receiverMobile     = ct.contact_no;
-      receiverName       = ct.contact_name || null;
-      receiverCustomerId = null;
-    }
+    // Shared with POST /web-start via resolveReceiver() so the two paths can't
+    // drift. FE never sends the customer mobile — always looked up server-side.
+    const rr = await resolveReceiver({ jobId, customerId, efrId, reportingContactId, useAlt });
+    if (!rr.ok) return modernError(res, rr.status, rr.message);
+    const {
+      receiverMobile, receiverName, receiverCustomerId,
+      jobIdToStore, jobStatusSnapshot, jobEfrId,
+    } = rr;
 
     // ── Resolve the dial legs ──
     // In QA mode the operator typed both numbers; everywhere else we use
@@ -321,7 +313,7 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
     // value only when enabled, else the configured default). Column-name typos
     // `reciever*` preserved verbatim per backend CLAUDE.md. is_updated=0 → the
     // Kaleyra report cron will fill metadata (Plivo rows are excluded there).
-    const resolvedProvider = voice.resolveProvider(provider);
+    // resolvedProvider computed above (drives both the QA-mode check + this row).
     const [insertResult] = await pool.query(
       `INSERT INTO tbl_job_caller_info
          (job_id, unique_id, caller, caller_id, caller_name,
@@ -415,6 +407,18 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
       [callResult.callId || null, callResult.provider || resolvedProvider, jci]
     );
 
+    // Dedicated Plivo call log (fail-soft) — bridge/mobile Plivo calls only.
+    if ((callResult.provider || resolvedProvider) === 'plivo') {
+      await plivoLog.record({
+        job_caller_info_id: jci, job_id: jobIdToStore, call_mode: 'mobile', call_flow: coarseFlow(req.body),
+        caller_user_id: agent.user_id, caller_name: agent.user_name, receiver_name: receiverName || null,
+        receiver_number: kaleyra.normaliseIndianPhone(receiverMobile),
+        dialed_number: kaleyra.normaliseIndianPhone(dialTo),
+        is_qa_redirect: callResult.overridden ? 1 : 0,
+        request_uuid: callResult.callId || null, status: 'placed',
+      });
+    }
+
     logger.info(`Click-to-call placed · agent=${agent.user_name}(#${agent.user_id}) → ${receiverName || receiverCustomerId || 'customer'} · row=${jci} · provider=${callResult.provider} · uniqueId=${callResult.callId || '—'}`);
     return modernOk(res, {
       delivered: true,
@@ -433,6 +437,123 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
         ? 'Dev override active — one or both legs routed to a *_CALL_* test number instead of the real participant.'
         : 'Calling — your phone will ring shortly.',
     });
+  } catch (e) { next(e); }
+});
+
+// ─── GET /web-credentials — Plivo Browser SDK login (Web Call mode) ────
+// Returns a PER-OPERATOR, short-lived Plivo access token (no shared endpoint
+// password crosses the wire) + the caller-id the browser dials. The SDK logs in
+// via client.loginWithAccessToken(). Gated by the click-to-call permission;
+// served ONLY when Web mode is on, Plivo is enabled, and the endpoint is set.
+router.get('/web-credentials', requireClickToCallAction, (req, res) => {
+  if (voice.callMode() !== 'web') return modernError(res, 409, 'Web calling is not enabled (voice.call.mode != web).');
+  if (!plivo.callingEnabled()) return modernError(res, 409, 'Plivo is not enabled.');
+  const token = plivo.webAccessToken({ operatorId: req.user.user_id });
+  if (!token) return modernError(res, 500, 'Plivo web calling is not configured (PLIVO_AUTH_ID/AUTH_TOKEN/ENDPOINT_USERNAME).');
+  // callerId is the company DID the browser dials INTO (a valid phone number —
+  // the SDK requires a real number as the destination); the answer URL ignores
+  // it and bridges to the customer resolved from the X-PH-Dialid header.
+  return modernOk(res, { token, callerId: process.env.PLIVO_CALLER_ID || null });
+});
+
+// ─── POST /web-start — begin a Web (browser WebRTC) call ───────────────
+// Web mode: the operator's browser IS the first leg. We resolve the receiver
+// server-side (masking preserved — the real number NEVER reaches the browser),
+// insert the audit row, and return an OPAQUE one-time dialId. The FE calls
+// client.call(dialId); /api/public/plivo/web-answer resolves the id → real
+// number and bridges. Reuses resolveReceiver() so it can't drift from /click-to-call.
+router.post('/web-start', requireClickToCallAction, validate(clickToCallBody), async (req, res, next) => {
+  try {
+    if (voice.callMode() !== 'web') return modernError(res, 409, 'Web calling is not enabled.');
+    if (!plivo.callingEnabled()) return modernError(res, 409, 'Plivo is not enabled.');
+
+    const { jobId, customerId, efrId, reportingContactId, useAlt } = req.body;
+    const agent = req.user;
+
+    const rr = await resolveReceiver({ jobId, customerId, efrId, reportingContactId, useAlt });
+    if (!rr.ok) return modernError(res, rr.status, rr.message);
+
+    const receiver = plivo.normaliseIndianPhone(rr.receiverMobile);
+    if (!receiver) return modernError(res, 400, 'Receiver number is not a valid Indian mobile.');
+
+    // QA SAFETY: in custom-number/QA mode the operator is PROMPTED for the number
+    // to dial (the FE prefills it from PLIVO_CALL_TO) — we dial EXACTLY what they
+    // supplied via callTo, NEVER the real customer. The audit/log row still
+    // records the real intended customer. callTo is required in QA so a real
+    // customer can't be reached even if the FE prompt is bypassed.
+    let dialNumber = receiver;
+    if (voice.customNumberMode('plivo')) {
+      const supplied = plivo.normaliseIndianPhone(req.body.callTo);
+      if (!supplied) return modernError(res, 400, 'QA mode: "Call To" (the number to dial) is required.');
+      dialNumber = supplied;
+      logger.test(`Web call QA · real=${plivo.maskForDisplay(receiver)} → operator-supplied ${plivo.maskForDisplay(dialNumber)}`);
+    }
+
+    // Insert-first audit row (provider=plivo; the browser endpoint is the caller).
+    const [ins] = await pool.query(
+      `INSERT INTO tbl_job_caller_info
+         (job_id, unique_id, caller, caller_id, caller_name,
+          reciever, reciever_id, reciever_name,
+          job_status, job_efr_id, call_type, inserted_by, is_updated,
+          provider, caller_status)
+       VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 'OUT', ?, 0, 'plivo', 'initiated')`,
+      [
+        rr.jobIdToStore,
+        plivo.normaliseIndianPhone(agent.mobile_no) || 'web',
+        agent.user_id,
+        agent.user_name,
+        receiver,
+        rr.receiverCustomerId,
+        rr.receiverName,
+        rr.jobStatusSnapshot,
+        rr.jobEfrId,
+        agent.user_id,
+      ]
+    );
+    const jci = ins.insertId;
+
+    // Opaque, one-time id the browser dials; the answer route maps it → number.
+    // In QA this is the TEST number; the audit row above kept the real customer.
+    const dialId = plivo.stashWebDial({ number: dialNumber, jci });
+
+    // Dedicated Plivo call log (fail-soft) — for Plivo-only reconciliation.
+    await plivoLog.record({
+      job_caller_info_id: jci, job_id: rr.jobIdToStore, call_mode: 'web', call_flow: coarseFlow(req.body),
+      caller_user_id: agent.user_id, caller_name: agent.user_name, receiver_name: rr.receiverName || null,
+      receiver_number: receiver, dialed_number: dialNumber, is_qa_redirect: dialNumber !== receiver ? 1 : 0,
+      status: 'initiated',
+    });
+
+    logger.info(`Web call started · agent=${agent.user_name}(#${agent.user_id}) → ${rr.receiverName || rr.receiverCustomerId || 'customer'} · row=${jci}`);
+    return modernOk(res, {
+      jobCallerInfoId: jci,
+      dialId,
+      toMasked: plivo.maskForDisplay(receiver),
+      receiverName: rr.receiverName || null,
+    });
+  } catch (e) { next(e); }
+});
+
+// ─── POST /mode — switch Web Call ⇄ Mobile Call (Setting → Admin Actions) ──
+// Admin-only. Persists voice.call.mode in easyfix_properties + flushes the cache
+// so it takes effect immediately (no restart). Web mode is Plivo-only, so it
+// refuses to switch to 'web' unless Plivo is enabled.
+router.post('/mode', requireClickToCallAction, async (req, res, next) => {
+  try {
+    if (Number(req.user.user_role) !== 2) {
+      return modernError(res, 403, 'Only an Admin can change the calling mode.');
+    }
+    const mode = String(req.body.mode || '').toLowerCase();
+    if (mode !== 'web' && mode !== 'mobile') {
+      return modernError(res, 400, "mode must be 'web' or 'mobile'.");
+    }
+    if (mode === 'web' && !plivo.callingEnabled()) {
+      return modernError(res, 409, 'Enable Plivo (plivo.calling.enabled=true) before switching to Web calling.');
+    }
+    await propertiesSvc.setProperty('voice.call.mode', mode);
+    await propertiesSvc.flushCache();
+    logger.info(`Calling mode set to '${mode}' by user #${req.user.user_id}`);
+    return modernOk(res, { callMode: voice.callMode() });
   } catch (e) { next(e); }
 });
 

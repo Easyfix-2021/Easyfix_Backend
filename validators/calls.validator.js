@@ -62,6 +62,9 @@ const clickToCallBody = Joi.object({
   // so an explicit value here can never dial through a disabled provider.
   // Omitted → service uses voice.default.provider.
   provider: Joi.string().valid('kaleyra', 'plivo').optional(),
+  // Optional "Call From Flow" label (which screen started the call) for the
+  // dedicated Plivo call log. Falls back to a coarse identifier-derived flow.
+  flow: Joi.string().max(64).optional(),
 }).xor('jobId', 'customerId', 'efrId', 'reportingContactId');
 
 /*

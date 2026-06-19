@@ -2,6 +2,7 @@ const router = require('express').Router();
 const logger = require('../../logger');
 const { pool } = require('../../db');
 const plivo = require('../../services/plivo.service');
+const plivoLog = require('../../services/plivo-call-log.service');
 
 /*
  * Plivo voice status callbacks (Plivo → us). Mounted at /api/webhook/plivo.
@@ -72,6 +73,7 @@ router.post('/ring', async (req, res) => {
   } catch (err) {
     logger.warn({ jci: claims.jci, err: err && err.message }, 'plivo ring webhook: update failed');
   }
+  await plivoLog.markRinging(claims.jci, req.body.CallUUID || null);
   return res.json({ ok: true });
 });
 
@@ -100,6 +102,41 @@ router.post('/hangup', async (req, res) => {
   } catch (err) {
     logger.warn({ jci: claims.jci, err: err && err.message }, 'plivo hangup webhook: update failed');
   }
+  await plivoLog.markTerminalByJci(claims.jci, {
+    status, duration, hangupCause: req.body.HangupCause || null, callUuid: req.body.CallUUID || null,
+  });
+  return res.json({ ok: true });
+});
+
+// ─── POST /web-hangup — Web (browser WebRTC) call ended (audit) ────────
+// The Web Call Voice Application's Hangup URL. There's no signed `t` token on
+// this path (the opaque dialId was one-time-consumed at web-answer), so we
+// correlate by CallUUID — which web-answer stamped onto the row's unique_id when
+// it bridged. Best-effort; never overwrites an already-terminal row; always 200.
+router.post('/web-hangup', async (req, res) => {
+  const callUuid = req.body.CallUUID || null;
+  if (!callUuid) return res.json({ ok: true });
+
+  const status = mapPlivoStatus(req.body.CallStatus, req.body.HangupCause);
+  const durRaw = req.body.Duration;
+  const duration = durRaw != null && durRaw !== '' && Number.isFinite(parseInt(durRaw, 10))
+    ? parseInt(durRaw, 10)
+    : null;
+
+  try {
+    await pool.query(
+      `UPDATE tbl_job_caller_info
+          SET caller_status = ?, end_time = NOW(), duration = ?, is_updated = 1
+        WHERE unique_id = ?
+          AND caller_status NOT IN ('completed','busy','no_answer','failed','hungup')`,
+      [status, duration, callUuid]
+    );
+  } catch (err) {
+    logger.warn({ callUuid, err: err && err.message }, 'plivo web-hangup webhook: update failed');
+  }
+  await plivoLog.markTerminalByCallUuid(callUuid, {
+    status, duration, hangupCause: req.body.HangupCause || null,
+  });
   return res.json({ ok: true });
 });
 
