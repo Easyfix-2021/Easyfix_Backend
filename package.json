@@ -11,7 +11,6 @@
     "test:db": "node scripts/test-db.js",
     "test:menus": "node --test --test-force-exit tests/lookup-menus.test.js",
     "test:rate-card": "node --test tests/rate-card-calc.test.js",
-    "backfill:pincode-latlng": "node scripts/backfill-pincode-latlng.js",
     "verify:schema": "node scripts/schema-verify.js",
     "verify:env": "node scripts/env-verify.js",
     "verify:all": "npm run build && npm run test:db && npm run verify:schema && npm run verify:env"

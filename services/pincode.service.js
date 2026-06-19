@@ -686,6 +686,28 @@ async function recomputeServiceableStatus({ userId = null } = {}) {
   }
 }
 
+/*
+ * Lazy geocode-on-edit. If a pincode row has no coordinates, fetch + persist
+ * them now as a side-effect of an edit. This is how lat/lng get backfilled — on
+ * demand, one row at a time, as pincodes are touched in Manage Pincodes —
+ * instead of a manual bulk run (avoids the bulk Google cost + key throttling).
+ * getCentroid() does an India-pinned Google lookup and writes the centroid onto
+ * tbl_pincode via persistCentroid; it is fail-soft (returns null, logs a warn,
+ * never throws), so a geocode miss or Google outage can never fail the edit.
+ * Rows Google can't resolve (ZERO_RESULTS — e.g. some rural sub-localities)
+ * stay blank and are retried on the next edit. Pass the already-loaded row
+ * ({pincode, lat, lng}) so the no-op case (coords present) costs nothing.
+ * Returns {lat,lng} when present/just-filled, else null.
+ */
+async function ensureCoordsForPincode({ pincode, lat, lng } = {}) {
+  if (lat != null && lng != null) return { lat: Number(lat), lng: Number(lng) };
+  if (!pincode) return null;
+  const centroid = await geocode.getCentroid(pincode);
+  return (centroid && centroid.lat != null && centroid.lng != null)
+    ? { lat: centroid.lat, lng: centroid.lng }
+    : null;
+}
+
 async function updatePincode(pincodeId, fields, { userId = null } = {}) {
   // Whitelist of mutable fields. `pincode` is intentionally excluded — the
   // value is the user-meaningful key; changing it would orphan downstream
@@ -706,7 +728,14 @@ async function updatePincode(pincodeId, fields, { userId = null } = {}) {
     [...params, pincodeId]
   );
   if (!result.affectedRows) return null;
-  return getPincodeById(pincodeId);
+
+  const updated = await getPincodeById(pincodeId);
+  // Lazy geocode-on-edit (see ensureCoordsForPincode): fill coords if missing.
+  if (updated) {
+    const coords = await ensureCoordsForPincode(updated);
+    if (coords) { updated.lat = coords.lat; updated.lng = coords.lng; }
+  }
+  return updated;
 }
 
 /*
@@ -792,6 +821,18 @@ async function setZonesForPincode(pincodeId, zoneIds, { userId = null } = {}) {
 
     await conn.commit();
     const detail = await getPincodeById(pincodeId);
+    // Lazy geocode-on-edit: mapping zones is also an edit — fill coords if
+    // missing. Runs AFTER commit on the pool (not the txn conn). Wrapped so a
+    // freak geocode/DB error here can NEVER reach the catch below and "roll back"
+    // the already-committed zone mapping; geocoding is strictly best-effort.
+    if (detail) {
+      try {
+        const coords = await ensureCoordsForPincode(detail);
+        if (coords) { detail.lat = coords.lat; detail.lng = coords.lng; }
+      } catch (geoErr) {
+        logger.warn({ err: geoErr.message, pincodeId }, 'lazy geocode after zone-map failed (non-fatal)');
+      }
+    }
     return { ...detail, rejected };
   } catch (e) {
     await conn.rollback();

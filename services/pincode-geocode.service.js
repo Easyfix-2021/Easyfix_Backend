@@ -48,6 +48,11 @@ function normalisePin(pin) {
 }
 
 function toNum(v) {
+  // NB: Number(null) === 0 and Number('') === 0 (not NaN) — without this guard a
+  // SQL-NULL lat/lng read from tbl_pincode would coerce to 0 and be mistaken for a
+  // valid cached centroid, so the row would never be treated as a cache-miss and
+  // never get geocoded. Treat null/undefined/'' as "absent".
+  if (v === null || v === undefined || v === '') return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 }
