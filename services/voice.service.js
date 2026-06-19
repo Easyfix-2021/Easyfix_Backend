@@ -24,8 +24,13 @@ function isProviderEnabled(name) {
 }
 
 function defaultProvider() {
-  const p = String(getProperty('voice.default.provider') || 'kaleyra').toLowerCase();
-  return PROVIDERS[p] ? p : 'kaleyra';
+  const configured = String(getProperty('voice.default.provider') || '').toLowerCase();
+  if (PROVIDERS[configured]) return configured;
+  // Blank / invalid setting: prefer a currently-enabled provider so the default
+  // never silently resolves to a DISABLED one (which would suppress every call —
+  // exactly the bug when voice.default.provider='' fell back to a disabled Kaleyra).
+  const [firstEnabled] = enabledProviders();
+  return firstEnabled || 'kaleyra';
 }
 
 // Providers the operator may pick from. The FE shows the radio only when
@@ -43,7 +48,13 @@ function enabledProviders() {
 function resolveProvider(requested) {
   const r = requested && String(requested).toLowerCase();
   if (r && PROVIDERS[r] && isProviderEnabled(r)) return r;
-  return defaultProvider();
+  // Requested is unset or points at a disabled provider. Use the configured
+  // default if it's enabled; otherwise fall back to ANY enabled provider so we
+  // never dial through a disabled one (the cause of the silent-suppression bug).
+  const def = defaultProvider();
+  if (isProviderEnabled(def)) return def;
+  const [firstEnabled] = enabledProviders();
+  return firstEnabled || def;
 }
 
 // Whether this provider can show live mid-call status + be hung up from the UI.
