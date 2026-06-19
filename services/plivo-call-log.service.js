@@ -18,7 +18,7 @@ const logger = require('../logger');
 const RECORD_COLS = [
   'job_caller_info_id', 'job_id', 'call_mode', 'call_flow', 'caller_user_id',
   'caller_name', 'receiver_name', 'receiver_number', 'dialed_number',
-  'is_qa_redirect', 'request_uuid', 'call_uuid', 'status',
+  'call_uuid', 'status',
 ];
 
 // Insert one row at call start (initiated_on = NOW()). Returns id or null.

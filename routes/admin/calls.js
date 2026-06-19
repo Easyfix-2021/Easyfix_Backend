@@ -414,8 +414,7 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
         caller_user_id: agent.user_id, caller_name: agent.user_name, receiver_name: receiverName || null,
         receiver_number: kaleyra.normaliseIndianPhone(receiverMobile),
         dialed_number: kaleyra.normaliseIndianPhone(dialTo),
-        is_qa_redirect: callResult.overridden ? 1 : 0,
-        request_uuid: callResult.callId || null, status: 'placed',
+        status: 'placed',
       });
     }
 
@@ -520,7 +519,7 @@ router.post('/web-start', requireClickToCallAction, validate(clickToCallBody), a
     await plivoLog.record({
       job_caller_info_id: jci, job_id: rr.jobIdToStore, call_mode: 'web', call_flow: coarseFlow(req.body),
       caller_user_id: agent.user_id, caller_name: agent.user_name, receiver_name: rr.receiverName || null,
-      receiver_number: receiver, dialed_number: dialNumber, is_qa_redirect: dialNumber !== receiver ? 1 : 0,
+      receiver_number: receiver, dialed_number: dialNumber,
       status: 'initiated',
     });
 

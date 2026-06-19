@@ -15,17 +15,14 @@ CREATE TABLE IF NOT EXISTS tbl_plivo_call_log (
   caller_name        VARCHAR(255) NULL,
   receiver_name      VARCHAR(255) NULL,
   receiver_number    VARCHAR(20) NULL,         -- the REAL intended customer number
-  dialed_number      VARCHAR(20) NULL,         -- what was actually dialed (test number in QA)
-  is_qa_redirect     TINYINT(1) NOT NULL DEFAULT 0,
-  request_uuid       VARCHAR(64) NULL,         -- Plivo request_uuid (create handle)
-  call_uuid          VARCHAR(64) NULL,         -- Plivo CallUUID (callbacks)
+  dialed_number      VARCHAR(20) NULL,         -- what was actually dialed (the QA test number when in QA mode)
+  call_uuid          VARCHAR(64) NULL,         -- Plivo CallUUID (from callbacks; the correlation key)
   status             VARCHAR(16) NULL,         -- initiated/placed/ringing/answered/completed/busy/no_answer/failed/hungup/suppressed
   hangup_cause       VARCHAR(64) NULL,
   initiated_on       DATETIME NULL,
   answered_on        DATETIME NULL,
   ended_on           DATETIME NULL,
   duration           INT NULL,
-  provider           VARCHAR(16) NOT NULL DEFAULT 'plivo',
   created_on         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_on         DATETIME NULL,
   KEY idx_plivo_log_jci (job_caller_info_id),

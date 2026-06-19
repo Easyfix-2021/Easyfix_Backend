@@ -78,17 +78,22 @@ async function webAnswer(req, res) {
     return xml('<?xml version="1.0" encoding="UTF-8"?>\n<Response><Hangup/></Response>');
   }
   logger.info(`plivo web-answer: bridging row=${resolved.jci}`);
+  // NOTE: this fires when the BROWSER endpoint is bridged and the customer is
+  // about to be DIALED — NOT when the customer answers. So mark 'ringing' (and
+  // stamp the CallUUID for hangup correlation); do NOT set start_time/answered_on
+  // (else a no-answer call would wrongly look answered). The terminal hangup
+  // callback sets the final status + duration.
   try {
     await pool.query(
       `UPDATE tbl_job_caller_info
-          SET caller_status = 'answered', start_time = NOW(), unique_id = COALESCE(?, unique_id)
+          SET caller_status = 'ringing', unique_id = COALESCE(?, unique_id)
         WHERE job_caller_info = ?`,
       [src.CallUUID || null, resolved.jci]
     );
   } catch (err) {
     logger.warn({ jci: resolved.jci, err: err && err.message }, 'plivo web-answer: audit update failed (returning XML anyway)');
   }
-  await plivoLog.markAnswered(resolved.jci, src.CallUUID || null);
+  await plivoLog.markRinging(resolved.jci, src.CallUUID || null);
   return xml(plivo.buildAnswerXml(resolved.number));
 }
 router.post('/web-answer', express.urlencoded({ extended: false }), webAnswer);
