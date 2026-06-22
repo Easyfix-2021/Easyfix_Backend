@@ -86,6 +86,9 @@ router.get('/config', requireClickToCallAction, (req, res) => {
     qaDefaults: dp.qaDefaults,
     enabledProviders: enabled,
     defaultProvider: def,
+    // RAW stored value ('' = No Default | 'plivo' | 'kaleyra') so the Admin
+    // toggle can show 'No Default' distinctly from an explicit pick.
+    defaultProviderRaw: voice.rawDefaultProvider(),
     providers,
     // 'web' = operator talks from the browser (Plivo WebRTC); 'mobile' = phone
     // bridge (today's default). The FE branches its calling flow on this.
@@ -553,6 +556,27 @@ router.post('/mode', requireClickToCallAction, async (req, res, next) => {
     await propertiesSvc.flushCache();
     logger.info(`Calling mode set to '${mode}' by user #${req.user.user_id}`);
     return modernOk(res, { callMode: voice.callMode() });
+  } catch (e) { next(e); }
+});
+
+// ─── POST /default-provider — set voice.default.provider (Admin Action) ──────
+// Admin-only. Mobile mode lets the admin choose Plivo / Kaleyra / No Default
+// (blank). Web mode is Plivo-only so the FE doesn't expose this there.
+// '' (No Default) is stored blank → defaultProvider() then resolves to the first
+// enabled provider and the per-call radio drives the choice when >1 is enabled.
+router.post('/default-provider', requireClickToCallAction, async (req, res, next) => {
+  try {
+    if (Number(req.user.user_role) !== 2) {
+      return modernError(res, 403, 'Only an Admin can change the default calling provider.');
+    }
+    const provider = String(req.body.provider ?? '').toLowerCase().trim();
+    if (provider !== '' && provider !== 'plivo' && provider !== 'kaleyra') {
+      return modernError(res, 400, "provider must be 'plivo', 'kaleyra', or '' (No Default).");
+    }
+    await propertiesSvc.setProperty('voice.default.provider', provider);
+    await propertiesSvc.flushCache();
+    logger.info(`voice.default.provider set to '${provider || '(none)'}' by user #${req.user.user_id}`);
+    return modernOk(res, { defaultProvider: voice.defaultProvider(), defaultProviderRaw: voice.rawDefaultProvider() });
   } catch (e) { next(e); }
 });
 

@@ -155,15 +155,18 @@ const LIST_COLUMNS = `
        FROM tbl_client_custom_properties ccp_max
       WHERE ccp_max.client_id    = j.fk_client_id
         /*
-         * Case-insensitive + underscore-tolerant comparison so the same
-         * row matches whether c_prop_name was stored as legacy snake_case
-         * ('max_magic_link_send_count'), lower-case-with-spaces
-         * ('max magic-link send count'), or the new Title Case canonical
-         * form ('Max Magic-Link Send Count'). Lets the FE rename rows
-         * without coordinating a BE deploy.
+         * Case-insensitive comparison that normalises BOTH '_' and '-' to
+         * spaces on both sides, so the same row matches whether c_prop_name was
+         * stored as legacy snake_case ('max_magic_link_send_count'),
+         * lower-case-with-spaces ('max magic-link send count'), or the Title
+         * Case canonical form ('Max Magic-Link Send Count'). MUST stay identical
+         * to the copy in services/job-magic-link.service.js or the FE-displayed
+         * cap and the BE-enforced cap will diverge. (Was '_'-only — the hyphen
+         * in the literal never matched snake_case rows → cap fell back to 3.)
          */
-        AND LOWER(REPLACE(ccp_max.c_prop_name, '_', ' ')) = LOWER('Max Magic-Link Send Count')
-        AND ccp_max.status       = 1
+        AND LOWER(REPLACE(REPLACE(ccp_max.c_prop_name, '_', ' '), '-', ' '))
+            = LOWER(REPLACE('Max Magic-Link Send Count', '-', ' '))
+        AND (ccp_max.status IS NULL OR ccp_max.status = 1)
       LIMIT 1),
     3
   ) AS magic_link_max_send_count,

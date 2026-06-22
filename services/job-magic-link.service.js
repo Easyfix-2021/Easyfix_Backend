@@ -724,8 +724,14 @@ async function sendForJob(jobId, { action, override = false } = {}, pool) {
               (SELECT CAST(NULLIF(ccp_max.c_prop_values, '') AS UNSIGNED)
                  FROM tbl_client_custom_properties ccp_max
                 WHERE ccp_max.client_id    = j.fk_client_id
-                  AND LOWER(REPLACE(ccp_max.c_prop_name, '_', ' ')) = LOWER('Max Magic-Link Send Count')
-                  AND ccp_max.status       = 1
+                  -- Normalise BOTH '_' and '-' to spaces on both sides so the
+                  -- snake_case legacy name (max_magic_link_send_count) and the
+                  -- Title-Case 'Max Magic-Link Send Count' both match. (Was '_'
+                  -- only, so the hyphenated literal never matched snake_case rows
+                  -- → cap silently fell back to 3 and blocked resends.)
+                  AND LOWER(REPLACE(REPLACE(ccp_max.c_prop_name, '_', ' '), '-', ' '))
+                      = LOWER(REPLACE('Max Magic-Link Send Count', '-', ' '))
+                  AND (ccp_max.status IS NULL OR ccp_max.status = 1)
                 LIMIT 1),
               3
             ) AS max_send_count

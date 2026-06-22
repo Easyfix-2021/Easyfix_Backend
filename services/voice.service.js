@@ -85,6 +85,14 @@ async function hangup({ provider, callUuid }) {
   return svc.hangupCall({ callUuid });
 }
 
+// The RAW configured default — '' (No Default) | 'plivo' | 'kaleyra' — unlike
+// defaultProvider() which RESOLVES '' to an enabled provider. The Admin
+// Click-to-Call-Mode control needs the raw value to show 'No Default' vs an
+// explicit pick.
+function rawDefaultProvider() {
+  return String(getProperty('voice.default.provider') || '').toLowerCase();
+}
+
 // Call topology toggle: 'web' = operator talks from the browser (Plivo WebRTC,
 // customer dialled directly) · 'mobile' = phone bridge (operator's phone rung
 // first, then customer — today's default). Runtime-switchable via the
@@ -123,4 +131,5 @@ module.exports = {
   customNumberMode,
   qaDefaults,
   callMode,
+  rawDefaultProvider,
 };

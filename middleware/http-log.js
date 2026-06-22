@@ -48,6 +48,16 @@ function quickHint(status) {
   return '';
 }
 
+// Prefer a per-request reason stamped by the handler (res.locals.logHint, set by
+// modernError/legacyError + the notFound handler) so the line says WHAT failed —
+// e.g. " · Job 123 not found" / " · no matching route" — falling back to the
+// generic status hint when no handler reason was recorded.
+function hintFor(res, status) {
+  const custom = res.locals && res.locals.logHint;
+  if (custom) return ` · ${custom}`;
+  return quickHint(status);
+}
+
 module.exports = function httpLog(req, res, next) {
   const started = Date.now();
   const path = req.originalUrl;
@@ -74,7 +84,7 @@ module.exports = function httpLog(req, res, next) {
       (req.integrationClient?.loginName ? `api:${req.integrationClient.loginName}` : null) ||
       'guest';
 
-    const sentence = `${status} ${methodStr} ${path}  (${duration} ms) · ${who}${quickHint(status)}`;
+    const sentence = `${status} ${methodStr} ${path}  (${duration} ms) · ${who}${hintFor(res, status)}`;
 
     if (status === 429)                        logger.rate(sentence);
     else if (status === 401 || status === 403) logger.security(sentence);

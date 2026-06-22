@@ -20,6 +20,9 @@ function modernOk(res, data, message) {
 }
 
 function modernError(res, status, error, details) {
+  // Surface the actual reason in the one-line HTTP log (middleware/http-log.js
+  // reads res.locals.logHint) so a 4xx/5xx says WHAT failed, not just "not found".
+  if (res.locals && typeof error === 'string') res.locals.logHint = error.slice(0, 140);
   const body = { success: false, error };
   if (details) body.details = details;
   return res.status(status).json(body);
@@ -30,6 +33,7 @@ function legacyOk(res, data, message = 'OK') {
 }
 
 function legacyError(res, httpStatus, message, data = null) {
+  if (res.locals && typeof message === 'string') res.locals.logHint = message.slice(0, 140);
   return res.status(httpStatus).json({
     status: String(httpStatus),
     message,
