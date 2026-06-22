@@ -6,9 +6,13 @@ const { pool } = require('../db');
  * Schema columns in use:
  *   service_type_id, service_type_name, service_type_desc, service_type_status,
  *   service_catg_id (FK → tbl_service_catg), display (1=Display to All, 0=CRM rate-card, 2=Tx App deep-skill),
- *   service_type_tools (CSV of tool_ids), service_type_tool_names (display CSV).
+ *   service_type_tools (CSV of tool_ids), service_type_tool_names (display CSV),
+ *   service_type_image (uploaded filename — legacy column, served from /easydoc).
  *
- * Soft-delete: status flips to 0; legacy =3 rows stay hidden.
+ * Delete: status flips to 3 (the legacy delete sentinel) — the row leaves every
+ * list. This mirrors the legacy CRM trash action. Distinct from Deactivate (the
+ * Active/Inactive toggle, status 1↔0) — inactive rows still surface under
+ * "include inactive". Legacy =3 rows stay hidden everywhere.
  * Required FK: service_catg_id. Validated against tbl_service_catg.
  * Tools are stored as the legacy CSV pair (ids + names) to match
  * how the legacy CRM persists them and how tbl_easyfixer queries join.
@@ -48,7 +52,8 @@ async function listTypes({
   const [rows] = await pool.query(
     `SELECT st.service_type_id, st.service_type_name, st.service_type_desc,
             st.service_type_status, st.service_catg_id, sc.service_catg_name,
-            st.display, st.service_type_tools, st.service_type_tool_names
+            st.display, st.service_type_tools, st.service_type_tool_names,
+            st.service_type_image
        FROM tbl_service_type st
        LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = st.service_catg_id
       WHERE ${where.join(' AND ')}
@@ -69,7 +74,8 @@ async function getTypeById(id) {
   const [[row]] = await pool.query(
     `SELECT st.service_type_id, st.service_type_name, st.service_type_desc,
             st.service_type_status, st.service_catg_id, sc.service_catg_name,
-            st.display, st.service_type_tools, st.service_type_tool_names
+            st.display, st.service_type_tools, st.service_type_tool_names,
+            st.service_type_image
        FROM tbl_service_type st
        LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = st.service_catg_id
       WHERE st.service_type_id = ? AND st.service_type_status <> 3
@@ -79,7 +85,7 @@ async function getTypeById(id) {
   return row || null;
 }
 
-async function createType({ service_type_name, service_type_desc, service_catg_id, display, service_type_tools, service_type_tool_names }) {
+async function createType({ service_type_name, service_type_desc, service_catg_id, display, service_type_tools, service_type_tool_names, service_type_image }) {
   const name = String(service_type_name || '').trim();
   if (!name)             throw mkErr(400, 'service_type_name is required');
   if (!service_catg_id)  throw mkErr(400, 'service_catg_id is required');
@@ -101,8 +107,8 @@ async function createType({ service_type_name, service_type_desc, service_catg_i
   const [r] = await pool.query(
     `INSERT INTO tbl_service_type
        (service_type_name, service_type_desc, service_catg_id, display,
-        service_type_tools, service_type_tool_names, service_type_status)
-     VALUES (?, ?, ?, ?, ?, ?, 1)`,
+        service_type_tools, service_type_tool_names, service_type_image, service_type_status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
     [
       name,
       service_type_desc ? String(service_type_desc).trim() : null,
@@ -112,6 +118,7 @@ async function createType({ service_type_name, service_type_desc, service_catg_i
       [0, 1, 2].includes(Number(display)) ? Number(display) : 1,
       service_type_tools || null,
       service_type_tool_names || null,
+      service_type_image ? String(service_type_image).trim() : null,
     ]
   );
   return getTypeById(r.insertId);
@@ -153,6 +160,10 @@ async function updateType(id, fields) {
   if (fields.service_type_tool_names !== undefined) {
     sets.push('service_type_tool_names = ?'); params.push(fields.service_type_tool_names || null);
   }
+  if (fields.service_type_image !== undefined) {
+    sets.push('service_type_image = ?');
+    params.push(fields.service_type_image ? String(fields.service_type_image).trim() : null);
+  }
   if (fields.is_active !== undefined) {
     sets.push('service_type_status = ?'); params.push(fields.is_active ? 1 : 0);
   }
@@ -163,9 +174,13 @@ async function updateType(id, fields) {
   return getTypeById(id);
 }
 
-async function deactivateType(id) {
+async function deleteType(id) {
+  // Legacy "delete" = soft-delete to status 3 (row leaves every list). This
+  // mirrors the legacy CRM trash action (UPDATE ... SET service_type_status=3).
+  // Distinct from Deactivate (is_active toggle → status 0), which keeps the row
+  // listable under "include inactive".
   const [r] = await pool.query(
-    'UPDATE tbl_service_type SET service_type_status = 0 WHERE service_type_id = ? AND service_type_status <> 3',
+    'UPDATE tbl_service_type SET service_type_status = 3 WHERE service_type_id = ? AND service_type_status <> 3',
     [id]
   );
   return r.affectedRows > 0;
@@ -176,6 +191,6 @@ module.exports = {
   getTypeById,
   createType,
   updateType,
-  deactivateType,
+  deleteType,
   SORTABLE_COLUMNS,
 };

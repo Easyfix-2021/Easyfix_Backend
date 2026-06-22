@@ -27,20 +27,24 @@ const listQuery = Joi.object({
 
 const createBody = Joi.object({
   service_type_name:        Joi.string().trim().min(2).max(200).required(),
-  service_type_desc:        Joi.string().trim().max(500).allow('', null).optional(),
+  // Required for strict legacy parity (the legacy form marks Desc with a *).
+  service_type_desc:        Joi.string().trim().min(1).max(500).required(),
   service_catg_id:          Joi.number().integer().positive().required(),
   display:                  Joi.number().integer().valid(0, 1, 2).default(1),
   service_type_tools:       Joi.string().allow('', null).optional(),
   service_type_tool_names:  Joi.string().allow('', null).optional(),
+  service_type_image:       Joi.string().trim().max(255).allow('', null).optional(),
 });
 
 const updateBody = Joi.object({
   service_type_name:        Joi.string().trim().min(2).max(200).optional(),
-  service_type_desc:        Joi.string().trim().max(500).allow('', null).optional(),
+  // Optional on PATCH (partial update), but cannot be blanked once set.
+  service_type_desc:        Joi.string().trim().min(1).max(500).optional(),
   service_catg_id:          Joi.number().integer().positive().optional(),
   display:                  Joi.number().integer().valid(0, 1, 2).optional(),
   service_type_tools:       Joi.string().allow('', null).optional(),
   service_type_tool_names:  Joi.string().allow('', null).optional(),
+  service_type_image:       Joi.string().trim().max(255).allow('', null).optional(),
   is_active:                Joi.boolean().optional(),
 }).min(1);
 
@@ -72,10 +76,10 @@ router.patch('/:id', roleByName(['Admin']), validate(idParam, 'params'), validat
 });
 router.delete('/:id', roleByName(['Admin']), validate(idParam, 'params'), async (req, res, next) => {
   try {
-    const ok = await svc.deactivateType(Number(req.params.id));
+    const ok = await svc.deleteType(Number(req.params.id));
     if (!ok) return modernError(res, 404, 'Service Type not found');
     invalidateCatalogCaches();
-    modernOk(res, { deactivated: true });
+    modernOk(res, { deleted: true });
   } catch (e) { if (e.status) return modernError(res, e.status, e.message); next(e); }
 });
 

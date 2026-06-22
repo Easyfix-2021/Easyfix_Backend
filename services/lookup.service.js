@@ -69,7 +69,10 @@ async function zones() {
 
 // ─── Services ───────────────────────────────────────────────────────
 async function serviceCategories({ includeInactive = false } = {}) {
-  const where = includeInactive ? '' : 'WHERE service_catg_status = 1';
+  // Default: active only (status 1). includeInactive widens to active+inactive
+  // but ALWAYS excludes soft-deleted (status 3) so deleted categories never
+  // leak into any dropdown/filter that feeds Service Type pickers.
+  const where = includeInactive ? 'WHERE service_catg_status <> 3' : 'WHERE service_catg_status = 1';
   const [rows] = await pool.query(
     `SELECT service_catg_id, service_catg_name, service_catg_desc, service_catg_status
        FROM tbl_service_catg ${where}
