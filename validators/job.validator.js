@@ -246,7 +246,13 @@ const updateBody = Joi.object({
    */
   collected_by: Joi.alternatives(Joi.number().integer(), Joi.string().max(20)).allow(null, '').optional(),
   original_appointment_date_time: Joi.date().iso().allow(null).optional(),
-  original_appointment_time:      Joi.string().max(20).allow('', null).optional(),
+  // Confirm & Schedule sends this as a FULL ISO datetime
+  // (new Date(requested_date_time).toISOString(), ~24 chars) and lets the
+  // server own the projection: update() reduces it to "HH:MM" via
+  // formatTimeIST before the DB write (TIME_COLS in services/job.service.js).
+  // So this validator must accept the pre-projection ISO, not the 20-char
+  // stored form — the persisted value is always <=5 chars regardless.
+  original_appointment_time:      Joi.string().max(40).allow('', null).optional(),
   client_spoc: Joi.string().max(200).optional(),
   client_spoc_name: Joi.string().max(200).optional(),
   client_spoc_email: Joi.string().email().max(200).optional(),
