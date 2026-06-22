@@ -55,6 +55,10 @@ const DEFAULTS = {
   DEFAULT_RATING:          3.0,
   STATS_LOOKBACK_DAYS:     90,
   ACCOUNT_BALANCE_FLOOR:   500,
+  // Zone-widening fallback threshold — if fewer than this many candidates
+  // survive the city-scoped pass, re-run eligibility widened to the job
+  // pincode's zone(s) and re-apply the same filters (spec: "less than 10").
+  MIN_CANDIDATES_BEFORE_WIDEN: 10,
   // Default sub-scores for technicians with NO completed-job history in
   // the lookback window. Used as a neutral midpoint so new joiners aren't
   // pegged at 0 (unfair) or 1 (gaming). Settings keys
@@ -63,28 +67,17 @@ const DEFAULTS = {
   DEFAULT_SDA_SCORE:       0.5,
 };
 
-// Top-level weight buckets — must sum to 1.00.
-//
-//   Performance bucket          = 0.70  (Rating 30 + TAT 20 + SDA 20)
-//   Worked for Client           = 0.10
-//   Worked in Vertical          = 0.10
-//   Attendance Marked Today     = 0.10
-//                                 ────
-//                                 1.00
-//
-// No workload term — the Max Concurrent Jobs check already prevents
-// saturated technicians from being scored at all (L2 filter), so a second
-// workload kicker on top would double-count the same signal. The earlier
-// 0.60 / 4×0.10 split was both a math error (0.60 + 0.40 = 1.0 superficially
-// but Performance was meant to be 70 internal points = 0.70 share) and a
-// modelling error (workload as both filter and ranker).
-const SCORE_WEIGHTS = Object.freeze({
-  performance:          0.70,
-  worked_for_client:    0.10,
-  worked_for_vertical:  0.10,
-  attendance:           0.10,
-});
-// Inside performance: 30 / 20 / 20 split per spec, normalised to sum 1.0.
+// Ranking model — PRIORITY ORDER, not a weighted score (2026-06-22).
+// After candidates clear every hard filter, order them by:
+//   1. Worked in this Vertical (service category) before  — existing-tech preference
+//   2. Worked for this Client before                       — existing-tech preference
+//   3. Past Performance (tiebreaker only)                  — Rating 30 / TAT 20 / SDA 20
+// Attendance is a FILTER ONLY (present for the job date); it is NOT a ranking
+// signal. New technicians (no history) carry neutral default performance
+// sub-scores so they still rank fairly within the non-preferred group.
+const RANKING_ORDER = Object.freeze(['worked_for_vertical', 'worked_for_client', 'performance']);
+// Performance composite (tiebreaker only + letter grade): Rating 30 / TAT 20 /
+// SDA 20, normalised to sum 1.0.
 const PERFORMANCE_SUB = Object.freeze({
   rating: 30 / 70,
   tat:    20 / 70,
@@ -213,54 +206,83 @@ function deepSkillStatus({ jobHasSkillReq, hasAnySkill, matchesJobSkill }) {
  * "no-skill-match fallback": first call with true; if zero rows return,
  * caller re-invokes with false and tags the result.
  */
-async function l1Eligibility(job, { applyDeepSkill = true } = {}) {
+async function l1Eligibility(job, { applyDeepSkill = true, zoneIds = null, excludeEfrIds = null } = {}) {
   /*
+   * Layer-1 eligibility, scoped EITHER to the job's city (default pass) OR —
+   * for the zone-widening fallback — to the job pincode's zone(s).
+   *
+   * Legacy-canonical predicates (confirmed across every legacy candidate /
+   * availability / assign query; activation sets efr_status=1):
+   *   efr_status = 1            → ACTIVE  (do NOT invert to 0)
+   *   is_technician_verified=1  → verified profile
+   *   NOT IN scheduling_history(reschedule_reason <> '')  → not rejected/
+   *                              rescheduled off THIS job earlier
+   *
    * Deep-skill match — actual schema (verified against the legacy Java
-   * @Entity for tbl_efr_deepskill_mapping in API_AngularClientDashboard):
+   * @Entity for tbl_efr_deepskill_mapping):
+   *   easyfixer_id (FK→tbl_easyfixer.efr_id), category_id, service_type_id,
+   *   parent_skill_id (= deepskill_id), is_repairing (1 = active mapping).
+   * We touch tbl_deep_skill only to EXCLUDE mappings whose deep skill is
+   * INACTIVE (status=0) via the correct column m.parent_skill_id;
+   * NOT EXISTS(status=0) keeps active + orphan rows.
    *
-   *   easyfixer_id       FK to tbl_easyfixer.efr_id (NOT named "efr_id")
-   *   category_id        service category for THIS mapping row
-   *   service_type_id    service type for THIS mapping row
-   *   parent_skill_id    legacy: deep_skill_id (semantic name confusion)
-   *   deep_skill_id      legacy: option_id     (semantic name confusion)
-   *   is_repairing       active flag (1 = active, 0 = inactive)
-   *
-   * The legacy auto-assign.service.js had a `JOIN tbl_deep_skill ds`
-   * referencing `m.deepskill_id` — that column doesn't exist on the
-   * mapping table; it failed at request time. The category/service-type
-   * match is done inline from the mapping row's own columns. We DO touch
-   * tbl_deep_skill, but only to EXCLUDE mappings whose deep skill is
-   * INACTIVE (status=0) — via the CORRECT column `m.parent_skill_id`
-   * (which holds the deepskill_id). `NOT EXISTS(status=0)` keeps active +
-   * any orphan rows, so a deactivated/deleted deep skill stops crediting
-   * technicians without over-pruning legacy data.
+   * Params are pushed in WHERE order (scope → skill → exclude → history) so
+   * the positional placeholders bind correctly.
    */
-  const skillClauses = [];
-  const skillParams  = [];
+  const where = ['e.efr_status = 1', 'e.is_technician_verified = 1'];
+  const params = [];
+
+  // ── Geographic scope ──
+  if (Array.isArray(zoneIds) && zoneIds.length > 0) {
+    // Zone-widening pass: technicians whose home zone (efr_zone_city_id →
+    // tbl_zone_city_mapping.zone_id) is one of the job pincode's zones.
+    // Mirrors the tech-zone chain used elsewhere in this service. Legacy had
+    // no pincode→zone scoping; this is built on the new-CRM zone model.
+    where.push(`e.efr_zone_city_id IN (
+          SELECT zcm.city_zone_id FROM tbl_zone_city_mapping zcm
+           WHERE zcm.zone_id IN (${zoneIds.map(() => '?').join(',')})
+        )`);
+    params.push(...zoneIds);
+  } else {
+    // City-scoped pass (default) — same city as the job.
+    where.push('e.efr_cityId = ?');
+    params.push(job.city_id);
+  }
+
+  // ── Deep-skill (exact category + type match, active mappings only) ──
   if (applyDeepSkill && (job.fk_service_catg_id || job.fk_service_type_id)) {
     let predicate = `EXISTS (
-      SELECT 1
-        FROM tbl_efr_deepskill_mapping m
-       WHERE m.easyfixer_id = e.efr_id
-         AND m.is_repairing = 1
-         AND NOT EXISTS (
-           SELECT 1 FROM tbl_deep_skill ds
-            WHERE ds.deepskill_id = m.parent_skill_id AND ds.status = 0
-         )`;
-    if (job.fk_service_catg_id) { predicate += ' AND m.category_id = ?';     skillParams.push(job.fk_service_catg_id); }
-    if (job.fk_service_type_id) { predicate += ' AND m.service_type_id = ?'; skillParams.push(job.fk_service_type_id); }
+          SELECT 1
+            FROM tbl_efr_deepskill_mapping m
+           WHERE m.easyfixer_id = e.efr_id
+             AND m.is_repairing = 1
+             AND NOT EXISTS (
+               SELECT 1 FROM tbl_deep_skill ds
+                WHERE ds.deepskill_id = m.parent_skill_id AND ds.status = 0
+             )`;
+    if (job.fk_service_catg_id) { predicate += ' AND m.category_id = ?';     params.push(job.fk_service_catg_id); }
+    if (job.fk_service_type_id) { predicate += ' AND m.service_type_id = ?'; params.push(job.fk_service_type_id); }
     predicate += ')';
-    skillClauses.push(predicate);
+    where.push(predicate);
   }
-  const skillSql = skillClauses.length ? ` AND ${skillClauses.join(' AND ')}` : '';
 
-  // City filter — same city as the job. Zone-distance L2 (Local/Travel km
-  // cap) is deferred per spec; we keep the city scope so cross-country
-  // assignments don't appear by mistake.
-  //
-  // Column note: balance lives on `tbl_easyfixer.current_balance` (legacy
-  // schema; same column the Finance dashboard reads). The earlier draft of
-  // this service named it `efr_balance` and 500'd at request time — fixed.
+  // ── Exclude already-considered techs (zone pass excludes the city pool) ──
+  if (Array.isArray(excludeEfrIds) && excludeEfrIds.length > 0) {
+    where.push(`e.efr_id NOT IN (${excludeEfrIds.map(() => '?').join(',')})`);
+    params.push(...excludeEfrIds);
+  }
+
+  // ── Already rejected / rescheduled-off THIS job ──
+  where.push(`e.efr_id NOT IN (
+          SELECT sh.easyfixer_id FROM scheduling_history sh
+           WHERE sh.job_id = ?
+             AND sh.reschedule_reason IS NOT NULL
+             AND sh.reschedule_reason <> ''
+        )`);
+  params.push(job.job_id);
+
+  // Column note: balance lives on tbl_easyfixer.current_balance (legacy
+  // schema; same column the Finance dashboard reads).
   const [rows] = await pool.query(
     `SELECT e.efr_id, e.efr_name, e.efr_no, e.efr_email,
             e.efr_cityId, c.city_name,
@@ -268,17 +290,8 @@ async function l1Eligibility(job, { applyDeepSkill = true } = {}) {
             e.is_technician_verified
        FROM tbl_easyfixer e
        LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId
-      WHERE e.efr_status = 1
-        AND e.is_technician_verified = 1
-        AND e.efr_cityId = ?
-        ${skillSql}
-        AND e.efr_id NOT IN (
-          SELECT sh.easyfixer_id FROM scheduling_history sh
-           WHERE sh.job_id = ?
-             AND sh.reschedule_reason IS NOT NULL
-             AND sh.reschedule_reason <> ''
-        )`,
-    [job.city_id, ...skillParams, job.job_id]
+      WHERE ${where.join('\n        AND ')}`,
+    params
   );
   return rows;
 }
@@ -741,7 +754,6 @@ async function statsForCandidates(efrIds, job, clientId) {
 // ─── Per-signal scoring ──────────────────────────────────────────────
 function scoreOne({ avg_rating, avg_tat_hours, tat_history,
                     sda_rate, sda_history,
-                    worked_for_client, worked_for_vertical, attendance_marked,
                     tat_target_hours, default_tat_score, default_sda_score }) {
   // Rating: 0–5 → 0–1.
   const rating = Math.max(0, Math.min(1, (avg_rating ?? 3.0) / 5));
@@ -759,18 +771,16 @@ function scoreOne({ avg_rating, avg_tat_hours, tat_history,
   // SDA: configured default if no completed-job history; else the actual rate.
   const sda = sda_history ? (sda_rate ?? 0) : default_sda_score;
 
+  // Performance composite (0–1) — used ONLY as the ranking tiebreaker (after
+  // worked-vertical / worked-client preference) and to derive the letter grade.
+  // Worked-for-client/vertical are higher-priority SORT keys (not part of this
+  // score); attendance is a hard filter (not scored).
   const performance =
     PERFORMANCE_SUB.rating * rating +
     PERFORMANCE_SUB.tat    * tat +
     PERFORMANCE_SUB.sda    * sda;
 
-  const total =
-    SCORE_WEIGHTS.performance         * performance +
-    SCORE_WEIGHTS.worked_for_client   * (worked_for_client   ? 1 : 0) +
-    SCORE_WEIGHTS.worked_for_vertical * (worked_for_vertical ? 1 : 0) +
-    SCORE_WEIGHTS.attendance          * (attendance_marked   ? 1 : 0);
-
-  // Letter grade per spec.
+  // Letter grade from the performance composite.
   const pct = Math.round(performance * 100);
   let grade;
   if (pct >= 95) grade = 'A+';
@@ -781,15 +791,9 @@ function scoreOne({ avg_rating, avg_tat_hours, tat_history,
   else grade = 'E';
 
   return {
-    total,
     grade,
     performance,
-    breakdown: {
-      rating, tat, sda,
-      worked_for_client:   worked_for_client   ? 1 : 0,
-      worked_for_vertical: worked_for_vertical ? 1 : 0,
-      attendance:          attendance_marked   ? 1 : 0,
-    },
+    breakdown: { rating, tat, sda },
   };
 }
 
@@ -810,9 +814,6 @@ function buildCandidateRow(tech, s, job) {
     tat_history:         s.tat_history,
     sda_rate:            s.sda_rate,
     sda_history:         s.sda_history,
-    worked_for_client:   s.worked_for_client,
-    worked_for_vertical: s.worked_for_vertical,
-    attendance_marked:   s.attendance_marked,
     tat_target_hours:    s.tat_target_hours,
     default_tat_score:   s.default_tat_score,
     default_sda_score:   s.default_sda_score,
@@ -850,12 +851,60 @@ function buildCandidateRow(tech, s, job) {
     payment_mode:           paidByLabel(job.paid_by),
     concurrent_jobs_count:  s.concurrent_jobs_count ?? 0,
     same_slot_conflict:     s.same_slot_conflict === true,
-    // ── Existing score/grade fields ──
-    score:        Number(out.total.toFixed(4)),
+    // ── Ranking fields ── `score` mirrors the performance composite (the
+    // tiebreaker). The actual ORDER is the priority sort in rankCandidatesForJob:
+    // worked_for_vertical → worked_for_client → performance.
+    score:        Number(out.performance.toFixed(4)),
     performance:  Number(out.performance.toFixed(4)),
     grade:        out.grade,
     breakdown:    Object.fromEntries(Object.entries(out.breakdown).map(([k, v]) => [k, Number(Number(v).toFixed(3))])),
   };
+}
+
+// ─── Shared hard-filter + score step ─────────────────────────────────
+/*
+ * Applies the hard filters (spec priority order) to an eligible set and
+ * builds scored rows for the survivors. Reused by BOTH the city-scoped pass
+ * and the zone-widening fallback so the gates stay identical across both.
+ *
+ * Hard filters:
+ *   - same-day + same-slot booking conflict    (ALWAYS)
+ *   - attendance present for the job date       (when enforceAttendance)
+ *   - at/over Max Concurrent Jobs               (when enforceMaxConcurrent)
+ *   - COD job + balance <= floor                (when enforceCodBalance)
+ */
+function filterAndScore(eligible, stats, job, opts) {
+  const { enforceMaxConcurrent, enforceCodBalance, enforceAttendance, isCod, balanceFloor } = opts;
+  const scored = [];
+  const rejected = [];
+  for (const e of eligible) {
+    const s = stats.get(e.efr_id);
+    if (!s) continue;
+
+    if (s.same_slot_conflict) {
+      rejected.push({ efr_id: e.efr_id, efr_name: e.efr_name, reason: 'already booked same day + same slot' }); continue;
+    }
+    // Attendance HARD FILTER: only technicians marked present for the job date
+    // pass. The `enforceAttendance` flag here is already WINDOW-GATED by the
+    // caller (rankCandidatesForJob) to jobs scheduled TODAY/TOMORROW — the only
+    // dates a technician can mark attendance for — so later/past/unscheduled
+    // jobs never hit this gate. DIVERGES from legacy (legacy used attendance
+    // only for display + a soft confidence-score weight, never a gate). Present-
+    // definition matches legacy (tbl_easyfixer_attendance: NOT is_leave_marked
+    // AND (morning_slot OR evening_slot), DATE(created_on) = job date).
+    if (enforceAttendance && !s.attendance_for_job_date) {
+      rejected.push({ efr_id: e.efr_id, efr_name: e.efr_name, reason: 'not present (attendance not marked) for job date' }); continue;
+    }
+    if (enforceMaxConcurrent && s.active_jobs >= s.max_concurrent) {
+      rejected.push({ efr_id: e.efr_id, efr_name: e.efr_name, reason: `saturated (${s.active_jobs} active jobs)` }); continue;
+    }
+    if (enforceCodBalance && isCod && Number(e.current_balance ?? 0) <= balanceFloor) {
+      rejected.push({ efr_id: e.efr_id, efr_name: e.efr_name, reason: `COD job: balance ${Number(e.current_balance ?? 0)} <= ${balanceFloor}` }); continue;
+    }
+
+    scored.push(buildCandidateRow(e, s, job));
+  }
+  return { scored, rejected };
 }
 
 // ─── Public entrypoint ───────────────────────────────────────────────
@@ -866,7 +915,7 @@ function buildCandidateRow(tech, s, job) {
  *     alreadyAssigned: bool,
  *     note: 'no_deep_skill_match' | null,
  *     l1Count, l2Count, candidates: [...],
- *     config: { weights, max_concurrent, … },
+ *     config: { ranking_order, max_concurrent, … },
  *     rejected: [{ efr_id, reason }]
  *   }
  *
@@ -892,11 +941,26 @@ function buildCandidateRow(tech, s, job) {
  *                          applies the floor POST-rank via
  *                          pickAutoAssignCandidate, not as a ranked-list
  *                          exclude). The Schedule & Assign modal passes TRUE.
+ *   enforceAttendance    — hard-exclude techs NOT marked present for the job
+ *                          date. DEFAULT true, but INTERNALLY WINDOW-GATED: it
+ *                          only applies when the job is scheduled TODAY or
+ *                          TOMORROW (the dates a technician can mark attendance
+ *                          for). Jobs scheduled later/past/unscheduled ignore
+ *                          attendance entirely — so far-future on-create auto-
+ *                          assign is never starved. DIVERGES from legacy (which
+ *                          gated on attendance NOWHERE — display + soft score
+ *                          only). Pass false to disable the gate completely.
  * The same-day + same-slot conflict is ALWAYS a hard exclude (unchanged).
+ *
+ * Zone-widening fallback: when fewer than DEFAULTS.MIN_CANDIDATES_BEFORE_WIDEN
+ * (10) candidates survive the CITY-scoped pass, eligibility is re-run widened
+ * to the job pincode's zone(s) (resolveJobPincodeContext → tbl_zone_city_mapping
+ * → efr_zone_city_id), excluding the city pool, and the same filters re-applied;
+ * results merge and `note` is tagged 'zone_widened'. Net-new vs legacy.
  */
 async function rankCandidatesForJob(jobId, {
   limit = 10, jobDate, timeSlot,
-  enforceMaxConcurrent = true, enforceCodBalance = false,
+  enforceMaxConcurrent = true, enforceCodBalance = false, enforceAttendance = true,
 } = {}) {
   const job = await jobService.getById(jobId);
   if (!job) {
@@ -964,66 +1028,111 @@ async function rankCandidatesForJob(jobId, {
     assigned_efr_id:   assignedEfrId,
   };
 
-  // L1 with deep-skill on; fallback if 0.
-  let eligible = await l1Eligibility(job, { applyDeepSkill: true });
-  let note = null;
-  if (eligible.length === 0 && (job.fk_service_catg_id || job.fk_service_type_id)) {
-    eligible = await l1Eligibility(job, { applyDeepSkill: false });
-    if (eligible.length > 0) note = 'no_deep_skill_match';
-  }
-
-  if (eligible.length === 0) {
-    return {
-      job: enrichedJob, alreadyAssigned, note: note ?? 'no_eligible_techs',
-      l1Count: 0, l2Count: 0, candidates: [], rejected: [],
-      config: { weights: SCORE_WEIGHTS, performance_sub: PERFORMANCE_SUB },
-    };
-  }
-
-  const stats = await statsForCandidates(eligible.map((e) => e.efr_id), job, job.fk_client_id);
-
   // COD = customer pays the tech on-site (paid_by = Customer). Such techs
   // need cash on hand → optionally hard-filter balance > floor.
   const isCod = paidByIsCustomer(job.paid_by);
   const balanceFloor = DEFAULTS.ACCOUNT_BALANCE_FLOOR;
 
-  // ── HARD FILTERS (exclude before ranking) ──
-  //   1. active + verified                 (already enforced by l1Eligibility)
-  //   2. NOT same-day + same-slot booked    (ALWAYS — regardless of options)
-  //   3. at/over Max-Concurrent             (only when enforceMaxConcurrent)
-  //   4. COD → account balance > floor      (only when enforceCodBalance)
-  // The Schedule & Assign modal passes enforceMaxConcurrent:false +
-  // enforceCodBalance:true (so concurrent is a displayed column + COD is a
-  // hard floor); auto-assign keeps the legacy defaults.
-  const scored = [];
-  const rejected = [];
-  for (const e of eligible) {
-    const s = stats.get(e.efr_id);
+  // Attendance window — technicians can only mark attendance for TODAY and
+  // TOMORROW, so the attendance hard filter is meaningful ONLY for jobs
+  // scheduled on those two dates; for any other date (later, past, or
+  // unscheduled) we ignore attendance entirely. This also makes far-future
+  // on-create auto-assign safe (no empty pool from a gate that can't be
+  // satisfied yet). IST today/tomorrow via Intl (server-TZ-agnostic); the
+  // job's scheduled date is the IST wall-clock prefix of requested_date_time.
+  const reqDateForWindow = job.requested_date_time ? String(job.requested_date_time).slice(0, 10) : null;
+  const istToday = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date());
+  const istTomorrow = (() => {
+    const d = new Date(istToday + 'T00:00:00Z');
+    d.setUTCDate(d.getUTCDate() + 1);
+    return d.toISOString().slice(0, 10);
+  })();
+  const attendanceWindowActive = !!reqDateForWindow && (reqDateForWindow === istToday || reqDateForWindow === istTomorrow);
 
-    if (s.same_slot_conflict) {
-      rejected.push({ efr_id: e.efr_id, efr_name: e.efr_name, reason: 'already booked same day + same slot' }); continue;
-    }
-    if (enforceMaxConcurrent && s.active_jobs >= s.max_concurrent) {
-      rejected.push({ efr_id: e.efr_id, efr_name: e.efr_name, reason: `saturated (${s.active_jobs} active jobs)` }); continue;
-    }
-    if (enforceCodBalance && isCod && Number(e.current_balance ?? 0) <= balanceFloor) {
-      rejected.push({ efr_id: e.efr_id, efr_name: e.efr_name, reason: `COD job: balance ${Number(e.current_balance ?? 0)} <= ${balanceFloor}` }); continue;
-    }
+  const filterOpts = {
+    enforceMaxConcurrent, enforceCodBalance,
+    // Hard-filter attendance only inside the today/tomorrow marking window.
+    enforceAttendance: enforceAttendance && attendanceWindowActive,
+    isCod, balanceFloor,
+  };
 
-    scored.push(buildCandidateRow(e, s, job));
+  // Job-pincode zone-set — drives the zone-widening fallback below. Cheap
+  // single query; fail-soft to an empty set (no zones → no widening).
+  const { jobZoneIds } = await resolveJobPincodeContext(job);
+
+  // ── Pass 1: CITY-scoped eligibility (+ skill-drop fallback if zero) ──
+  let appliedDeepSkill = true;
+  let eligible = await l1Eligibility(job, { applyDeepSkill: true });
+  let note = null;
+  if (eligible.length === 0 && (job.fk_service_catg_id || job.fk_service_type_id)) {
+    eligible = await l1Eligibility(job, { applyDeepSkill: false });
+    if (eligible.length > 0) { note = 'no_deep_skill_match'; appliedDeepSkill = false; }
   }
 
-  // Pure ranking sort: highest score first. Balance is shown as a column;
-  // not factored into the sort.
-  scored.sort((a, b) => b.score - a.score);
+  let scored = [];
+  let rejected = [];
+  let totalEligible = eligible.length;
+  let cfgMaxConcurrent = DEFAULTS.MAX_CONCURRENT_JOBS;
 
-  // If the job already has an assigned technician (Reassign mode), pin
-  // them at the top of the list so operators can compare current vs.
-  // potential replacements side-by-side. The assigned tech may have been
-  // filtered out by L1 (e.g. they already rescheduled this job earlier)
-  // or L2 (saturated since the original assignment) — in either case we
-  // re-fetch their stats and present them with `is_current = true` so the
-  // UI can render the row distinctly.
+  if (eligible.length > 0) {
+    const stats = await statsForCandidates(eligible.map((e) => e.efr_id), job, job.fk_client_id);
+    cfgMaxConcurrent = stats.values().next().value?.max_concurrent ?? cfgMaxConcurrent;
+    const r = filterAndScore(eligible, stats, job, filterOpts);
+    scored = r.scored;
+    rejected = r.rejected;
+  }
+
+  // ── Pass 2: ZONE-WIDENING fallback (spec: "less than 10 after filters") ──
+  // Re-run eligibility widened to the job pincode's zone(s), excluding the
+  // city pool already considered, and re-apply the SAME filters. Mirrors the
+  // city pass's deep-skill state (if the city pass dropped the skill predicate
+  // because nothing matched, so does the widened pass). Net-new vs legacy
+  // (legacy never scoped by zone); built on the new-CRM zone model.
+  if (scored.length < DEFAULTS.MIN_CANDIDATES_BEFORE_WIDEN && jobZoneIds.size > 0) {
+    const zoneIds = [...jobZoneIds];
+    const excludeEfrIds = eligible.map((e) => e.efr_id);
+    let zoneEligible = await l1Eligibility(job, { applyDeepSkill: appliedDeepSkill, zoneIds, excludeEfrIds });
+    if (zoneEligible.length === 0 && appliedDeepSkill && (job.fk_service_catg_id || job.fk_service_type_id)) {
+      zoneEligible = await l1Eligibility(job, { applyDeepSkill: false, zoneIds, excludeEfrIds });
+      if (zoneEligible.length > 0 && !note) note = 'no_deep_skill_match';
+    }
+    if (zoneEligible.length > 0) {
+      totalEligible += zoneEligible.length;
+      const zStats = await statsForCandidates(zoneEligible.map((e) => e.efr_id), job, job.fk_client_id);
+      if (cfgMaxConcurrent === DEFAULTS.MAX_CONCURRENT_JOBS) {
+        cfgMaxConcurrent = zStats.values().next().value?.max_concurrent ?? cfgMaxConcurrent;
+      }
+      const zr = filterAndScore(zoneEligible, zStats, job, filterOpts);
+      rejected = rejected.concat(zr.rejected);
+      if (zr.scored.length > 0) {
+        scored = scored.concat(zr.scored);
+        note = note ? `${note},zone_widened` : 'zone_widened';
+      }
+    }
+  }
+
+  if (scored.length === 0 && totalEligible === 0) {
+    return {
+      job: enrichedJob, alreadyAssigned, note: note ?? 'no_eligible_techs',
+      l1Count: 0, l2Count: 0, candidates: [], rejected: [],
+      config: { ranking_order: RANKING_ORDER, performance_sub: PERFORMANCE_SUB },
+    };
+  }
+
+  // Priority-order ranking (NOT a weighted score): existing-tech preference
+  // first — worked in this Vertical, then worked for this Client — then past
+  // performance (Rating/TAT/SDA) as the tiebreaker. Attendance is a filter, not
+  // a ranker. Balance is shown as a column, never a sort input.
+  scored.sort((a, b) => {
+    if (a.worked_for_vertical !== b.worked_for_vertical) return a.worked_for_vertical ? -1 : 1;
+    if (a.worked_for_client   !== b.worked_for_client)   return a.worked_for_client   ? -1 : 1;
+    return b.performance - a.performance;
+  });
+
+  // If the job already has an assigned technician (Reassign mode), pin them
+  // first so operators can compare current vs. potential replacements. The
+  // assigned tech may have been filtered out — ensureAssignedFirst re-fetches
+  // + scores them so they still render with is_current=true.
   let candidatesList = scored.slice(0, limit);
   if (assignedEfrId) {
     candidatesList = await ensureAssignedFirst(candidatesList, assignedEfrId, job, scored);
@@ -1033,15 +1142,16 @@ async function rankCandidatesForJob(jobId, {
     job: enrichedJob,
     alreadyAssigned,
     note,
-    l1Count: eligible.length,
+    l1Count: totalEligible,
     l2Count: scored.length,
     candidates: candidatesList,
     rejected: rejected.slice(0, 20),
     config: {
-      weights: SCORE_WEIGHTS,
+      ranking_order: RANKING_ORDER,
       performance_sub: PERFORMANCE_SUB,
-      max_concurrent: stats.values().next().value?.max_concurrent ?? DEFAULTS.MAX_CONCURRENT_JOBS,
+      max_concurrent: cfgMaxConcurrent,
       account_balance_floor: DEFAULTS.ACCOUNT_BALANCE_FLOOR,
+      min_candidates_before_widen: DEFAULTS.MIN_CANDIDATES_BEFORE_WIDEN,
     },
   };
 }
@@ -1261,7 +1371,7 @@ module.exports = {
   rankCandidatesForJob,
   searchTechniciansForJob,
   pickAutoAssignCandidate,
-  SCORE_WEIGHTS,
+  RANKING_ORDER,
   PERFORMANCE_SUB,
   DEFAULTS,
 };

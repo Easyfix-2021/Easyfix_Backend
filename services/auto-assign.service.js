@@ -450,6 +450,10 @@ async function getCandidates(jobId, { limit = 10, ignoreDistance = false } = {})
 const candidateRanking = require('./candidate-ranking.service');
 
 async function assignTopCandidate(jobId, actor) {
+  // Attendance is hard-filtered only for jobs scheduled TODAY/TOMORROW (the
+  // window technicians can mark attendance for) — the ranking service
+  // window-gates it internally — so far-future on-create auto-assign is
+  // unaffected. Keep the default (no per-caller override needed).
   const result = await candidateRanking.rankCandidatesForJob(jobId, { limit: 50 });
 
   if (result.alreadyAssigned) {
@@ -500,6 +504,8 @@ async function bulkAssignUnassigned({ limit = 50, dryRun = false } = {}, actor) 
   let assignedCount = 0;
   for (const { job_id } of unassigned) {
     try {
+      // Attendance gate is window-limited to today/tomorrow in the ranking
+      // service, so far-future on-create jobs are unaffected. Keep the default.
       const ranked = await candidateRanking.rankCandidatesForJob(job_id, { limit: 50 });
       if (!ranked.candidates.length) {
         results.push({

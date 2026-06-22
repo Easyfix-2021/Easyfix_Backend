@@ -7,11 +7,24 @@ const { pool } = require('../../db');
 const techAuth = require('../../services/tech-auth.service');
 const jobService = require('../../services/job.service');
 const { modernOk, modernError } = require('../../utils/response');
+const { rateLimit } = require('../../middleware/rate-limit');
 
 const mobile = Joi.string().pattern(/^[0-9]{10}$/);
 
+// Abuse guard for the public login-otp surface (it now self-onboards unknown
+// numbers, so each hit can create a tbl_user + tbl_easyfixer row + send an OTP).
+// Keyed by mobile when present, else IP. The threshold is deliberately GENEROUS
+// — 20 requests / 10 min — so it curbs scripted abuse without ever biting active
+// QA testing (incl. QA_DETERMINISTIC_OTP=true loops). In-memory per-process;
+// swap for a Redis store if/when this runs multi-instance (see rate-limit.js).
+const loginOtpRateLimit = rateLimit({
+  windowMs: 10 * 60_000,
+  max: 20,
+  key: (req) => req.body?.mobile || req.ip,
+});
+
 // ─── Auth (public) ─────────────────────────────────────────────────
-router.post('/auth/login-otp', validate(Joi.object({ mobile: mobile.required() })), async (req, res, next) => {
+router.post('/auth/login-otp', loginOtpRateLimit, validate(Joi.object({ mobile: mobile.required() })), async (req, res, next) => {
   try {
     const r = await techAuth.createLoginOtp(req.body.mobile);
     modernOk(res, { delivered: r.found, expiresAt: r.expiresAt || null });
@@ -126,6 +139,11 @@ router.post('/auth/verify-otp', validate(Joi.object({
 
 // ─── Protected ─────────────────────────────────────────────────────
 router.use(requireTechAuth);
+
+// Idempotency layer (offline outbox) — keyed off req.tech (set above by
+// requireTechAuth). Retries of a same-keyed write replay the stored response
+// instead of re-running the side-effect. No-op when no Idempotency-Key header.
+router.use(require('../../middleware/idempotency')());
 
 // Notice Board — mounted via shared factory (zero duplication with
 // /api/admin/notices). See routes/mobile/notices.js — it's a 10-line
