@@ -230,7 +230,12 @@ const updateBody = Joi.object({
   fk_service_type_id: intId.optional(),
   fk_service_catg_id: intId.optional(),
   requested_date_time: Joi.date().iso().optional(),
-  requested_time: Joi.string().max(20).allow('', null).optional(),
+  // Companion time text col (stored as "HH:MM"). Like original_appointment_time
+  // above, update() projects this via formatTimeIST before the DB write, so the
+  // validator must accept the pre-projection shape — a caller that sends the
+  // full ISO (~24 chars) instead of HH:MM must not be 400'd here. max(40) covers
+  // ISO + offset variants; the persisted value is always <=5 chars.
+  requested_time: Joi.string().max(40).allow('', null).optional(),
   expected_date_time: Joi.date().iso().optional(),
   time_slot: Joi.string().max(200).optional(),
   booking_cut_off_time_slot: Joi.string().max(50).allow('', null).optional(),
