@@ -545,7 +545,59 @@ router.get('/dashboard-summary', async (req, res, next) => {
       [req.spoc.client_id, ...teamIds]
     );
 
+    // ─── Home-page KPI boxes ──────────────────────────────────────────
+    // New Tickets / Waiting for Allocation / Running Late — all derived
+    // from tbl_job over the same team scope (no rating join here, so a
+    // job with multiple rating rows can't double-count).
+    //   waitingForAllocation : requested time passed, still scheduled/
+    //                          unconfirmed (0,1), NO technician assigned.
+    //   runningLate          : same, but a technician IS assigned and the
+    //                          job still hasn't progressed.
+    const [[jobBoxes]] = await pool.query(
+      `SELECT
+         SUM(CASE WHEN j.job_status = 9 THEN 1 ELSE 0 END) AS newTickets,
+         SUM(CASE WHEN j.job_status IN (0,1)
+                   AND j.requested_date_time <= NOW()
+                   AND j.fk_easyfixter_id IS NULL     THEN 1 ELSE 0 END) AS waitingForAllocation,
+         SUM(CASE WHEN j.job_status IN (0,1)
+                   AND j.requested_date_time <= NOW()
+                   AND j.fk_easyfixter_id IS NOT NULL THEN 1 ELSE 0 END) AS runningLate
+         FROM tbl_job j
+        WHERE j.fk_client_id        = ?
+          AND j.reporting_contact_id IN (${teamPlaceholders})`,
+      [req.spoc.client_id, ...teamIds]
+    );
+
+    // Estimate Approved / Rejected — count the LATEST estimate per job
+    // (greatest sent_on, id as tie-breaker) whose job is still live
+    // (not completed/cancelled/enquiry: 3,5,6,7), team-scoped.
+    // tbl_estimate_details.status: 1 = Approved, 2 = Rejected (0 = Sent).
+    const [[estBoxes]] = await pool.query(
+      `SELECT
+         SUM(CASE WHEN ed.status = 1 THEN 1 ELSE 0 END) AS estimateApproved,
+         SUM(CASE WHEN ed.status = 2 THEN 1 ELSE 0 END) AS estimateRejected
+         FROM tbl_estimate_details ed
+         JOIN tbl_job j ON j.job_id = ed.job_id
+        WHERE j.fk_client_id        = ?
+          AND j.reporting_contact_id IN (${teamPlaceholders})
+          AND j.job_status NOT IN (3,5,6,7)
+          AND NOT EXISTS (
+            SELECT 1 FROM tbl_estimate_details e2
+             WHERE e2.job_id = ed.job_id
+               AND (e2.sent_on > ed.sent_on
+                    OR (e2.sent_on = ed.sent_on AND e2.id > ed.id))
+          )`,
+      [req.spoc.client_id, ...teamIds]
+    );
+
     return modernOk(res, {
+      boxes: {
+        newTickets:           Number(jobBoxes.newTickets)           || 0,
+        waitingForAllocation: Number(jobBoxes.waitingForAllocation) || 0,
+        runningLate:          Number(jobBoxes.runningLate)          || 0,
+        estimateApproved:     Number(estBoxes.estimateApproved)     || 0,
+        estimateRejected:     Number(estBoxes.estimateRejected)     || 0,
+      },
       counts: {
         newTickets: Number(counts.newTickets) || 0,
         inProgress: Number(counts.inProgress) || 0,

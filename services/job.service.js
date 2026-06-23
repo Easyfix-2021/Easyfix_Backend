@@ -225,6 +225,36 @@ const LIST_COLUMNS = `
 `;
 
 /*
+ * LEAN projection for the Order History tabs (flag = otherOrders /
+ * completedOrders). The OH table renders only these ~28 plain tbl_job
+ * columns (see Client_UI history/page.tsx `Job` type) — it does NOT use
+ * the magic-link / service_count / client_opted_in / pending-request
+ * correlated SUBQUERIES or the owner/scheduler/category/client joins that
+ * LIST_COLUMNS carries. Selecting just this set lets the data query skip 4
+ * per-row subqueries and ~5 joins → markedly faster OH rendering on the
+ * 380k-row tbl_job. All columns here are a strict subset of LIST_COLUMNS,
+ * so the FE contract is unchanged. (job_stage / job_age / client_spoc_name
+ * are intentionally omitted — the OH table doesn't display them.)
+ */
+const LIST_COLUMNS_LEAN = `
+  j.job_id, j.job_reference_id, j.client_ref_id,
+  j.job_status, j.source_type,
+  j.created_date_time, j.requested_date_time, j.scheduled_date_time,
+  j.checkin_date_time, j.checkout_date_time,
+  j.ticket_created_date_time, j.time_slot,
+  j.original_appointment_date_time,
+  cu.customer_name, cu.customer_mob_no,
+  ci.city_name,
+  j.fk_easyfixter_id, ef.efr_name AS easyfixer_name,
+  j.approved_by_client, j.call_later,
+  j.ready_for_billing, j.sub_job_id, j.job_reopen_flag,
+  rerc.is_escalated AS is_escalated,
+  j.approval_sent_on_date_time, j.full_fillment_created_time,
+  j.approved_on_date_time, j.approval_reject_date_time,
+  ccs.approval_by_client AS spoc_approval_by_client
+`;
+
+/*
  * Join map — the LIST data query pulls these for display columns. For COUNT
  * queries we include only the joins that the actual WHERE clause references,
  * which on a 384k-row table is the difference between a 6-way join full-scan
@@ -975,13 +1005,43 @@ async function list({
     ${needsSb ? 'LEFT JOIN tbl_user sb ON sb.user_id = j.fk_scheduled_by' : ''}
   `;
 
+  // ─── Order History fast path ────────────────────────────────────────
+  // OH tabs (flag = otherOrders / completedOrders) render only the lean
+  // projection, so we drop 4 per-row correlated subqueries (service_count,
+  // magic_link_max_send_count, client_opted_in, pending-request) and the
+  // owner/scheduler/category/client/approver joins. The lean join ALWAYS
+  // includes the joins the lean columns reference (cu, ad, ci, ef, ccs,
+  // rerc) and conditionally re-adds any the WHERE references, so no alias
+  // can ever be missing. All other callers keep the full projection.
+  const needsApc = /\bapc\./.test(where);
+  const isOrderHistory = ticketFlag === 'otherOrders' || ticketFlag === 'completedOrders';
+  const dataColumns = isOrderHistory ? LIST_COLUMNS_LEAN : listColumns;
+  const dataJoin = isOrderHistory
+    ? `
+      FROM tbl_job j
+      LEFT JOIN tbl_customer        cu  ON cu.customer_id = j.fk_customer_id
+      LEFT JOIN tbl_address         ad  ON ad.address_id  = j.fk_address_id
+      LEFT JOIN tbl_city            ci  ON ci.city_id     = ad.city_id
+      LEFT JOIN tbl_easyfixer       ef  ON ef.efr_id      = j.fk_easyfixter_id
+      LEFT JOIN tbl_client_contacts ccs ON ccs.id         = j.reporting_contact_id
+      LEFT JOIN tbl_easyfixer_rating_by_customer rerc
+                ON rerc.job_id = j.job_id AND rerc.is_escalated = 1
+      ${needsCl  ? 'LEFT JOIN tbl_client       cl  ON cl.client_id   = j.fk_client_id' : ''}
+      ${needsOw  ? 'LEFT JOIN tbl_user         ow  ON ow.user_id     = j.job_owner' : ''}
+      ${needsSc  ? 'LEFT JOIN tbl_service_catg sc  ON sc.service_catg_id = j.fk_service_catg_id' : ''}
+      ${needsCr2 ? 'LEFT JOIN tbl_user         cr  ON cr.user_id     = j.fk_created_by' : ''}
+      ${needsSb  ? 'LEFT JOIN tbl_user         sb  ON sb.user_id     = j.fk_scheduled_by' : ''}
+      ${needsApc ? 'LEFT JOIN tbl_client_contacts apc ON apc.id      = j.approved_by_client_contact' : ''}
+    `
+    : LIST_JOIN;
+
   // Run COUNT and data query in parallel — they're independent, no reason to
   // serialize. Roughly halves wall-clock time on cold caches.
   const dataParams = [...params, Number(limit), Number(offset)];
   const [[[{ total }]], [rows]] = await Promise.all([
     pool.query(`SELECT COUNT(*) AS total ${countJoin} ${where}`, params),
     pool.query(
-      `SELECT ${listColumns} ${LIST_JOIN} ${where}
+      `SELECT ${dataColumns} ${dataJoin} ${where}
        ORDER BY j.job_id DESC LIMIT ? OFFSET ?`,
       dataParams
     ),
