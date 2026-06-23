@@ -1,6 +1,7 @@
 const { pool } = require('../db');
 const deepSkillService = require('./deep-skill.service');
 const logger = require('../logger');
+const registrationStatusPush = require('./registration-status-push.service');
 
 /*
  * Easyfixer Verification — service backing the "Self-Registration
@@ -481,6 +482,12 @@ async function saveIdentity(efrId, body, actor) {
       [body.rejected_reason, actor?.user_id || null, efrId]
     );
   }
+  // Identity verify/reject flips is_identity_details_verified_by_crm, which
+  // changes the registration-status gate (→ rejected, or clears it). Push
+  // the technician's app to re-fetch. Best-effort — never blocks the save.
+  if (status === 1 || status === 2) {
+    registrationStatusPush.notifyRegistrationStatusChanged(efrId).catch(() => {});
+  }
   return getVerificationPage(efrId);
 }
 
@@ -538,6 +545,11 @@ async function setLeadVerification(efrId, body, actor) {
   } finally {
     conn.release();
   }
+
+  // Lead accept/deny changes tbl_user.personal_details_filled, which drives
+  // the registration-status gate (under_verification / not_eligible /
+  // in_progress). Nudge the app to re-fetch. Best-effort — never blocks.
+  registrationStatusPush.notifyRegistrationStatusChanged(efrId).catch(() => {});
 
   return getVerificationPage(efrId);
 }
@@ -605,6 +617,10 @@ async function saveActivation(efrId, body, actor) {
         efrId,
       ]
     );
+    // Final activation sets is_technician_verified = 1 → gate flips to
+    // `active`. Push the technician's app so it leaves the onboarding gate
+    // immediately. Best-effort — never blocks the activation.
+    registrationStatusPush.notifyRegistrationStatusChanged(efrId, { status: 'active' }).catch(() => {});
   }
   return getVerificationPage(efrId);
 }

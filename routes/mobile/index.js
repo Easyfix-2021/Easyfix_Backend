@@ -23,6 +23,37 @@ const loginOtpRateLimit = rateLimit({
   key: (req) => req.body?.mobile || req.ip,
 });
 
+// Mirror the FCM token into tbl_easyfixer_app.device_id — the CANONICAL
+// per-technician push target (legacy EasyFix_API targeted exactly this
+// column: Easyfixer @Column(name="device_id", table="tbl_easyfixer_app")).
+// The historical Node write path only filled device_info.fire_base_token,
+// leaving the canonical column empty so registration-status fan-out had
+// nothing to read. We additively keep tbl_easyfixer_app.device_id in sync
+// WITHOUT changing the existing device_info behaviour. UPDATE-then-INSERT
+// (same defensive upsert setLanguage uses — tbl_easyfixer_app has no usable
+// unique constraint beyond the efr_id PK). Best-effort: a failure here must
+// never break login/registration, so callers wrap it in try/catch.
+async function upsertEasyfixerAppToken(efrId, fcmToken) {
+  if (!efrId) return;
+  // Empty token → CLEAR the canonical column (single-active-device): on a fresh
+  // login the active device may have no push token yet, and the previously
+  // stored token belongs to a now-logged-out phone — never leave it pointing
+  // there. This mirrors the device_info row, whose fire_base_token is likewise
+  // NULLed on a tokenless login. POST /mobile/device fills it when it arrives.
+  const token = fcmToken ? String(fcmToken).trim() : null;
+  const [upd] = await pool.query(
+    'UPDATE tbl_easyfixer_app SET device_id = ?, last_login_time = NOW() WHERE efr_id = ?',
+    [token, efrId],
+  );
+  // Only create a row when there's an actual token to store.
+  if (upd.affectedRows === 0 && token) {
+    await pool.query(
+      'INSERT INTO tbl_easyfixer_app (efr_id, device_id, last_login_time) VALUES (?, ?, NOW())',
+      [efrId, token],
+    );
+  }
+}
+
 // ─── Auth (public) ─────────────────────────────────────────────────
 router.post('/auth/login-otp', loginOtpRateLimit, validate(Joi.object({ mobile: mobile.required() })), async (req, res, next) => {
   try {
@@ -110,6 +141,11 @@ router.post('/auth/verify-otp', validate(Joi.object({
             [r.tech.efr_id, req.body.deviceId, fcm, req.body.appVersion || null, req.body.language || null],
           );
         }
+        // Mirror the active device's token into the canonical push target
+        // (tbl_easyfixer_app.device_id) — unconditionally, so a login with no
+        // token CLEARS it rather than leaving the just-logged-out device's token
+        // there. Single-active-device, in lockstep with the device_info sweep.
+        await upsertEasyfixerAppToken(r.tech.efr_id, fcm);
         deviceRegistered = true;
       } catch (devErr) {
         // Soft-fail — login still succeeds, push just won't reach this
@@ -480,11 +516,28 @@ router.post('/device', validate(Joi.object({
   language: Joi.string().max(10).optional(),
 })), async (req, res, next) => {
   try {
+    // Single-active-session: log out every OTHER device for this technician
+    // (mirrors the verify-otp sweep) so push fan-out targets only this device.
+    await pool.query(
+      "UPDATE device_info SET is_logged_in = '0' WHERE user_id = ? AND device_id <> ?",
+      [req.tech.efr_id, req.body.deviceId],
+    );
     await pool.query(
       `INSERT INTO device_info (user_id, device_id, fire_base_token, app_version_name, language, is_logged_in, last_login_time)
        VALUES (?, ?, ?, ?, ?, 1, NOW())
        ON DUPLICATE KEY UPDATE fire_base_token = VALUES(fire_base_token), is_logged_in = 1, last_login_time = NOW()`,
       [req.tech.efr_id, req.body.deviceId, req.body.fcmToken, req.body.appVersion || null, req.body.language || 'en']);
+    // Keep the canonical push target (tbl_easyfixer_app.device_id) in sync so
+    // registration-status fan-out can reach this device. Best-effort — a
+    // failure here must not fail the device registration.
+    try {
+      await upsertEasyfixerAppToken(req.tech.efr_id, req.body.fcmToken);
+    } catch (appErr) {
+      require('../../logger').warn(
+        { err: appErr.message, efrId: req.tech.efr_id },
+        'tbl_easyfixer_app.device_id sync failed during /device',
+      );
+    }
     modernOk(res, { registered: true });
   } catch (e) { next(e); }
 });

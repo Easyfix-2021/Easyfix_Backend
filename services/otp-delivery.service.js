@@ -1,7 +1,12 @@
 const logger = require('../logger');
 const smsService = require('./sms.service');
 const emailService = require('./email.service');
-const whatsappService = require('./meta.whatsapp.service');
+// WhatsApp provider is switchable via WHATSAPP_PROVIDER: default 'gallabox' for
+// now; set it to 'meta' once the Meta Cloud API OTP template is fully approved.
+const whatsappService =
+  String(process.env.WHATSAPP_PROVIDER || 'gallabox').toLowerCase() === 'meta'
+    ? require('./meta.whatsapp.service')
+    : require('./gallabox.whatsapp.service');
 const smsTemplate = require('./sms-template.service');
 
 /*
@@ -116,7 +121,11 @@ async function tryWhatsApp({ mobile, name, otp }) {
       to: mobile,
       recipientName: name || '',
       templateName: WA_TEMPLATE,
+      // Pass BOTH shapes so either provider works: Meta reads `variables`
+      // (positional {{1}}); Gallabox reads `bodyValues` (named "1"). Each
+      // service destructures only the key it needs and ignores the other.
       variables: { 1: String(otp) },
+      bodyValues: { 1: String(otp) },
     });
   } catch (e) { return { delivered: false, error: e.message }; }
 }
