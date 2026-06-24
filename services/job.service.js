@@ -2417,6 +2417,19 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
         values.push(String(generateOtp()));
       }
     }
+    // Stamp fk_created_by on confirmation when the row has none yet — e.g. an
+    // Unconfirmed/integration job, or one created by a technician (no tbl_user
+    // creator). COALESCE preserves a real creator already set by create()
+    // (Book-New-Call). fk_created_by is a tbl_user FK, so coerce the actor id
+    // the same way create() does: a technician actor ("efr:NNN" → NaN) resolves
+    // to null rather than corrupting the column. This also fixes the legacy
+    // "Booking Confirmed" window, which shows the name via
+    // fk_created_by → tbl_user.user_name (so a NULL left the name blank).
+    const bookedActorId = (() => { const n = Number(actorId); return Number.isFinite(n) && n > 0 ? n : null; })();
+    if (bookedActorId) {
+      sets.push('fk_created_by = COALESCE(fk_created_by, ?)');
+      values.push(bookedActorId);
+    }
   } else if (COMPLETED_STATES.has(Number(status))) {
     sets.push('checkout_date_time = COALESCE(checkout_date_time, ?)', 'fk_checkout_by = COALESCE(fk_checkout_by, ?)');
     values.push(new Date(), actorId);

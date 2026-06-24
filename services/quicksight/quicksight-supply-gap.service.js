@@ -151,8 +151,13 @@ function normaliseFilters(q, { exportDefaults = false } = {}) {
   const zonalManager = nullIfZero(q.zonalManager);
   const requestFor = nullIfZero(q.requestFor);
 
-  const startStr = q.startDate ? String(q.startDate).slice(0, 10) : null;
-  const endStr = q.endDate ? String(q.endDate).slice(0, 10) : null;
+  // The route validates these with Joi.date().iso(), so Joi hands us a Date
+  // OBJECT — String(dateObj) yields a locale string ("Sun Jun 24 2026 …") whose
+  // first 10 chars are garbage ("Sun Jun 24"), so the date filter never matched
+  // any DATETIME. Normalise through the Date → ISO calendar date instead.
+  // (new Date(x) is robust whether x is already a Date or an ISO string.)
+  const startStr = q.startDate ? new Date(q.startDate).toISOString().slice(0, 10) : null;
+  const endStr = q.endDate ? new Date(q.endDate).toISOString().slice(0, 10) : null;
 
   let start;
   let endExclusive;
