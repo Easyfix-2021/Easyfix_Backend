@@ -442,20 +442,119 @@ router.get('/profile/percentage', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.post('/profile/personal-details', async (req, res, next) => {
+// Upsert per-document rows into tbl_easyfixer_document (one row per efr_doc_type_id;
+// `rows` = array of [docTypeId, key], null/empty keys skipped). The table has NO
+// UNIQUE(efr_id, efr_doc_type_id) and schema changes are forbidden here, so callers
+// MUST hold a per-technician GET_LOCK across the surrounding transaction (see the
+// personal/identity handlers) — otherwise two concurrent SELECT-then-INSERT saves
+// (e.g. an offline-retry racing the live save) can insert duplicate (efr_id, type)
+// rows that the CRM doc view can't disambiguate.
+async function upsertEasyfixerDocuments(conn, efrId, rows) {
+  for (const [typeId, key] of rows) {
+    if (!key) continue;
+    const [[ex]] = await conn.query(
+      'SELECT efr_doc_id FROM tbl_easyfixer_document WHERE efr_id = ? AND efr_doc_type_id = ? LIMIT 1',
+      [efrId, typeId]);
+    if (ex) {
+      await conn.query('UPDATE tbl_easyfixer_document SET efr_document_name = ? WHERE efr_doc_id = ?', [key, ex.efr_doc_id]);
+    } else {
+      await conn.query(
+        'INSERT INTO tbl_easyfixer_document (efr_id, efr_doc_type_id, efr_document_name, created_date, created_by) VALUES (?, ?, ?, NOW(), ?)',
+        [efrId, typeId, key, efrId]);
+    }
+  }
+}
+
+// Personal-details — the profile-progression "personal" section (Flutter
+// `profilePersonalDetails`). Widened from the original name/marital-only save to
+// the full legacy contract: first/last name, DOB, marital status, no. of
+// children, email, emergency contact, the two insurance flags + one insurance
+// photo each (tbl_easyfixer_document type 10=Health, 11=Accidental).
+//
+// Emergency contact is written to tbl_easyfixer.efr_alt_no — the column the CRM
+// verification screen reads (services/easyfixer-verification.service.js). The
+// per-address emergency_contact_number on tbl_address is owned by the separate
+// contact-info/address save, NOT here. Legacy `aboutYourSelf2` interest chips are
+// intentionally dropped (placeholder content). Accepts the app's camelCase plus
+// the legacy aliases (`martialStatus` misspelling, `noOfChild`, `aboutYourself`).
+router.post('/profile/personal-details', validate(Joi.object({
+  firstName: Joi.string().trim().max(255).optional(),
+  lastName: Joi.string().trim().max(255).optional(),
+  dateOfBirth: Joi.string().trim().max(40).optional(),
+  maritalStatus: Joi.string().trim().max(50).optional(),
+  martialStatus: Joi.string().trim().max(50).optional(),                  // legacy misspelling alias
+  children: Joi.alternatives(Joi.number().integer().min(0), Joi.string().pattern(/^[0-9]{1,3}$/)).optional(),
+  noOfChild: Joi.alternatives(Joi.number().integer().min(0), Joi.string().pattern(/^[0-9]{1,3}$/)).optional(),
+  email: Joi.string().trim().email().max(255).optional(),
+  emergencyContactNumber: Joi.string().trim().pattern(/^[0-9]{10}$/).optional(),
+  about: Joi.string().trim().max(1000).allow('', null).optional(),
+  aboutYourself: Joi.string().trim().max(1000).allow('', null).optional(),
+  healthInsurance: Joi.boolean().optional(),
+  accidentalInsurance: Joi.boolean().optional(),
+  docs: Joi.object({
+    healthInsurance: Joi.string().trim().max(255).optional(),
+    accidentalInsurance: Joi.string().trim().max(255).optional(),
+  }).optional(),
+}).min(1)), async (req, res, next) => {
+  const efrId = req.tech.efr_id;
+  const lockKey = `efr_doc:${efrId}`;                 // serialize doc upserts per tech (no UNIQUE in schema)
+  const conn = await pool.getConnection();
   try {
-    const b = req.body || {};
-    await pool.query(
+    const b = req.body;
+    const marital = b.maritalStatus || b.martialStatus || null;
+    const childrenRaw = b.children !== undefined ? b.children : b.noOfChild;
+    const children =
+      childrenRaw === undefined || childrenRaw === null || childrenRaw === '' ? null : Number(childrenRaw);
+    const about = b.about !== undefined ? b.about : b.aboutYourself;
+    const health = b.healthInsurance === undefined ? null : (b.healthInsurance ? 1 : 0);
+    const accidental = b.accidentalInsurance === undefined ? null : (b.accidentalInsurance ? 1 : 0);
+    // Flip the section to 100% ONLY when every mandatory family field is present in
+    // THIS request (matches the app's full-form submit). A partial save leaves the
+    // existing perc untouched (COALESCE(null, …)) instead of falsely marking it done.
+    const personalComplete = !!(
+      b.firstName && b.lastName && b.dateOfBirth && b.email && marital &&
+      children !== null && !Number.isNaN(children) && b.emergencyContactNumber
+    );
+
+    // Hold the per-tech lock across the WHOLE txn (released only after commit) so a
+    // concurrent save sees this txn's committed doc rows before it SELECTs.
+    await conn.query('SELECT GET_LOCK(?, 10)', [lockKey]);
+    await conn.beginTransaction();
+    await conn.query(
       `UPDATE tbl_easyfixer SET
-        efr_marital_status = COALESCE(?, efr_marital_status),
-        efr_children = COALESCE(?, efr_children),
-        date_of_birth = COALESCE(?, date_of_birth),
-        about_yourself = COALESCE(?, about_yourself),
-        efr_personal_details_perc = 100
+         efr_first_name       = COALESCE(?, efr_first_name),
+         efr_last_name        = COALESCE(?, efr_last_name),
+         date_of_birth        = COALESCE(?, date_of_birth),
+         efr_marital_status   = COALESCE(?, efr_marital_status),
+         efr_children         = COALESCE(?, efr_children),
+         efr_email            = COALESCE(?, efr_email),
+         efr_alt_no           = COALESCE(?, efr_alt_no),
+         about_yourself       = COALESCE(?, about_yourself),
+         health_insurance     = COALESCE(?, health_insurance),
+         accidental_insurance = COALESCE(?, accidental_insurance),
+         efr_personal_details_perc = COALESCE(?, efr_personal_details_perc)
        WHERE efr_id = ?`,
-      [b.maritalStatus, b.children, b.dateOfBirth, b.about, req.tech.efr_id]);
+      [
+        b.firstName || null, b.lastName || null, b.dateOfBirth || null, marital,
+        children === null || Number.isNaN(children) ? null : children,
+        b.email || null, b.emergencyContactNumber || null,
+        about === undefined ? null : about, health, accidental,
+        personalComplete ? 100 : null, efrId,
+      ]);
+
+    // Insurance photos → tbl_easyfixer_document (10=Health, 11=Accidental).
+    const docs = b.docs || {};
+    await upsertEasyfixerDocuments(conn, efrId, [[10, docs.healthInsurance], [11, docs.accidentalInsurance]]);
+
+    await conn.commit();
     modernOk(res, { updated: true });
-  } catch (e) { next(e); }
+  } catch (e) {
+    try { await conn.rollback(); } catch (_) { /* connection already gone */ }
+    next(e);
+  } finally {
+    try { await conn.query('SELECT RELEASE_LOCK(?)', [lockKey]); } catch (_) { /* lock auto-frees on release */ }
+    conn.release();
+  }
 });
 
 router.post('/profile/professional-details', async (req, res, next) => {
@@ -469,18 +568,69 @@ router.post('/profile/professional-details', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// Identity step. Persists Aadhaar/PAN numbers + (on DigiLocker mismatch-accept)
+// name/DOB + the driving-licence flag on tbl_easyfixer, and the uploaded doc
+// keys as tbl_easyfixer_document rows. Doc-type ids (tbl_document_type): 13=Aadhaar
+// Front, 14=Aadhaar Back, 3=PAN, 12=Driving Licence. NEVER sets
+// is_identity_details_verified_by_crm — that is CRM-owned. Accepts both the app's
+// `aadhaarNumber/panNumber` and the legacy `aadhaar/pan` aliases.
 router.post('/profile/identity-details', validate(Joi.object({
+  aadhaarNumber: Joi.string().pattern(/^[0-9]{12}$/).optional(),
   aadhaar: Joi.string().pattern(/^[0-9]{12}$/).optional(),
-  pan: Joi.string().pattern(/^[A-Z]{5}[0-9]{4}[A-Z]$/i).optional(),
+  panNumber: Joi.string().pattern(/^[A-Za-z]{5}[0-9]{4}[A-Za-z]$/).optional(),
+  pan: Joi.string().pattern(/^[A-Za-z]{5}[0-9]{4}[A-Za-z]$/).optional(),
+  firstName: Joi.string().trim().max(255).optional(),
+  lastName: Joi.string().trim().max(255).optional(),
+  dob: Joi.string().trim().max(40).optional(),
+  haveDrivingLicence: Joi.boolean().optional(),
+  docs: Joi.object({
+    aadhaarFront: Joi.string().trim().max(255).optional(),
+    aadhaarBack: Joi.string().trim().max(255).optional(),
+    pan: Joi.string().trim().max(255).optional(),
+    drivingLicence: Joi.string().trim().max(255).optional(),
+  }).optional(),
 }).min(1)), async (req, res, next) => {
+  const efrId = req.tech.efr_id;
+  const lockKey = `efr_doc:${efrId}`;                 // serialize doc upserts per tech (no UNIQUE in schema)
+  const conn = await pool.getConnection();
   try {
-    await pool.query(
-      `UPDATE tbl_easyfixer SET adhaar_card_number = COALESCE(?, adhaar_card_number),
-          pan_card_number = COALESCE(?, pan_card_number),
-          efr_identity_details_perc = 100 WHERE efr_id = ?`,
-      [req.body.aadhaar, req.body.pan, req.tech.efr_id]);
+    const b = req.body;
+    const aadhaar = b.aadhaarNumber || b.aadhaar || null;
+    const pan = (b.panNumber || b.pan) ? String(b.panNumber || b.pan).toUpperCase() : null;
+    const dl = b.haveDrivingLicence === undefined ? null : (b.haveDrivingLicence ? 1 : 0);
+    // Identity is "complete" once the Aadhaar number is captured (PAN is optional on
+    // the app). A name/DOB-only save (DigiLocker mismatch-accept before the number
+    // lands) must NOT flip the section to 100%.
+    const identityComplete = !!aadhaar;
+
+    await conn.query('SELECT GET_LOCK(?, 10)', [lockKey]);
+    await conn.beginTransaction();
+    await conn.query(
+      `UPDATE tbl_easyfixer
+          SET adhaar_card_number    = COALESCE(?, adhaar_card_number),
+              pan_card_number       = COALESCE(?, pan_card_number),
+              efr_first_name        = COALESCE(?, efr_first_name),
+              efr_last_name         = COALESCE(?, efr_last_name),
+              date_of_birth         = COALESCE(?, date_of_birth),
+              have_driving_lisence  = COALESCE(?, have_driving_lisence),
+              efr_identity_details_perc = COALESCE(?, efr_identity_details_perc)
+        WHERE efr_id = ?`,
+      [aadhaar, pan, b.firstName || null, b.lastName || null, b.dob || null, dl,
+       identityComplete ? 100 : null, efrId]);
+
+    const docs = b.docs || {};
+    await upsertEasyfixerDocuments(conn, efrId,
+      [[13, docs.aadhaarFront], [14, docs.aadhaarBack], [3, docs.pan], [12, docs.drivingLicence]]);
+
+    await conn.commit();
     modernOk(res, { updated: true });
-  } catch (e) { next(e); }
+  } catch (e) {
+    try { await conn.rollback(); } catch (_) { /* ignore */ }
+    next(e);
+  } finally {
+    try { await conn.query('SELECT RELEASE_LOCK(?)', [lockKey]); } catch (_) { /* lock auto-frees on release */ }
+    conn.release();
+  }
 });
 
 router.get('/bank-details', async (req, res, next) => {
@@ -490,19 +640,39 @@ router.get('/bank-details', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.post('/bank-details', async (req, res, next) => {
+// Persist bank details. Columns verified against tbl_easyfixer_bank_details:
+// efr_bank_acc_num, efr_bank_acc_name (holder), efr_bank_ifsc, bank (numeric
+// bank id), is_verified_by_app (bit — READ by easyfixer-verification.service on
+// the CRM side). The old `is_bank_details_filled` write referenced a NON-EXISTENT
+// column (silent failure); completion is signalled by efr_bank_details_perc=100.
+router.post('/bank-details', validate(Joi.object({
+  accountNumber: Joi.string().trim().pattern(/^[0-9]{9,18}$/).required(),
+  ifsc: Joi.string().trim().pattern(/^[A-Za-z]{4}0[A-Za-z0-9]{6}$/).required(),
+  bankId: Joi.number().integer().positive().optional(),
+  bankName: Joi.string().trim().max(255).optional(),
+  accountHolderName: Joi.string().trim().max(255).allow('', null).optional(),
+  isVerified: Joi.boolean().optional(),
+})), async (req, res, next) => {
   try {
-    const b = req.body || {};
+    const b = req.body;
+    const ifsc = String(b.ifsc).toUpperCase();
+    const holder = b.accountHolderName ? String(b.accountHolderName).trim() : null;
+    const verified = b.isVerified ? 1 : 0;
+    const bankId = b.bankId || null;
     const [[existing]] = await pool.query('SELECT efr_bank_id FROM tbl_easyfixer_bank_details WHERE efr_id = ?', [req.tech.efr_id]);
     if (existing) {
       await pool.query(
-        `UPDATE tbl_easyfixer_bank_details SET efr_bank_acc_num = ?, efr_bank_ifsc = ?, bank = ?, is_bank_details_filled = 1 WHERE efr_id = ?`,
-        [b.accountNumber, b.ifsc, b.bankId || null, req.tech.efr_id]);
+        `UPDATE tbl_easyfixer_bank_details
+            SET efr_bank_acc_num = ?, efr_bank_acc_name = COALESCE(?, efr_bank_acc_name),
+                efr_bank_ifsc = ?, bank = COALESCE(?, bank), is_verified_by_app = ?
+          WHERE efr_id = ?`,
+        [b.accountNumber, holder, ifsc, bankId, verified, req.tech.efr_id]);
     } else {
       await pool.query(
-        `INSERT INTO tbl_easyfixer_bank_details (efr_bank_acc_num, efr_bank_ifsc, bank, efr_id, is_bank_details_filled)
-         VALUES (?, ?, ?, ?, 1)`,
-        [b.accountNumber, b.ifsc, b.bankId || null, req.tech.efr_id]);
+        `INSERT INTO tbl_easyfixer_bank_details
+           (efr_bank_acc_num, efr_bank_acc_name, efr_bank_ifsc, bank, is_verified_by_app, efr_id)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [b.accountNumber, holder, ifsc, bankId, verified, req.tech.efr_id]);
     }
     await pool.query('UPDATE tbl_easyfixer SET efr_bank_details_perc = 100 WHERE efr_id = ?', [req.tech.efr_id]);
     modernOk(res, { saved: true });

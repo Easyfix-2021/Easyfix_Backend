@@ -147,24 +147,32 @@ async function fetchTrainingCompletedTime(efrId) {
  *                           isn't finished.
  *   verification_pending  — everything submitted, awaiting final CRM
  *                           activation (is_technician_verified != 1).
- *   active                — is_technician_verified = 1.
+ *   active                — fully onboarded AND CRM-activated: lead accepted
+ *                           + profile 100% + training done + is_technician_
+ *                           verified = 1. Checked LAST so a premature flag
+ *                           can't bypass the profile-completion gate.
  */
 function deriveStatus(flags) {
-  if (flags.isTechnicianVerified) return 'active';
   // Denied lead — terminal until CRM re-accepts.
   if (Number(flags.personalDetailsFilled) === 2) return 'not_eligible';
   // Identity rejected by CRM — show the reason, let the tech resubmit.
   if (Number(flags.identityVerifiedByCrm) === 2) return 'rejected';
   // Hasn't even submitted the personal step.
   if (!flags.isPersonalDetailFilled) return 'personal_pending';
-  // Submitted but lead not yet accepted by CRM (filled != 1).
+  // Submitted but lead not yet accepted by CRM (filled != 1) → Under Verification.
   if (Number(flags.personalDetailsFilled) !== 1) return 'under_verification';
-  // Accepted lead, but profile still incomplete.
+  // Accepted lead, but profile still incomplete → Profile Progress (the 4 sections).
   if (flags.profilePercentage < 100) return 'in_progress';
   // Profile complete, training not finished.
   if (!flags.trainingCompletedTime) return 'training_pending';
-  // All done from the tech side — awaiting final CRM activation.
-  return 'verification_pending';
+  // Tech side fully done, but CRM hasn't activated yet → awaiting activation.
+  if (!flags.isTechnicianVerified) return 'verification_pending';
+  // Released into the app ONLY when verified AND profile-complete AND trained.
+  // is_technician_verified is checked LAST (not first) so a premature / out-of-
+  // order flag can never leak a half-onboarded tech straight into the app — this
+  // mirrors the legacy router, which only reaches the Dashboard from inside the
+  // lead-accepted branch after all prerequisites.
+  return 'active';
 }
 
 async function getStatus(efrId) {
