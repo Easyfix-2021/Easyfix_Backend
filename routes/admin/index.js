@@ -76,6 +76,10 @@ router.use('/menus',           require('./menus'));
 router.use('/products',        require('./products'));
 router.use('/users',           require('./users'));
 router.use('/roles',           require('./roles'));
+// Admin Actions → OTP-gated Delete Easyfixer/User + Restore (tombstone + full
+// JSON archive). Each route self-gates via requireAction(isEasyfixerDelete /
+// isUserDelete / isDeletedRecordsRestore). See routes/admin/entity-deletion.js.
+router.use('/entity-deletion', require('./entity-deletion'));
 router.use('/rate-cards',      require('./rate-cards'));
 router.use('/quotations',      require('./quotations'));
 router.use('/questionnaires',  require('./questionnaires'));
