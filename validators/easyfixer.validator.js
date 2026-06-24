@@ -247,8 +247,30 @@ const serviceablePincodesBody = Joi.object({
     .required(),
 });
 
+/*
+ * Registered Easyfixers queue (parity port of legacy efer-registration).
+ *   registrationStatus: 1 New Lead · 2 In Progress · 3 Details Not Available ·
+ *     5 Not Eligible · 6 Send To Finance · 7 Activation Pending ·
+ *     8 Not Suitable · 9 Pending Member Verification (4 "Completed" unused).
+ *   easyfixerType: 0 all · 1 already-existing · 2 new.
+ *   q: length-routed search (6→pincode, 10→mobile, ≤4 digits→id, else name/mobile).
+ * Default page size 20 (legacy parity); default sort registered_date DESC.
+ */
+const registeredListQuery = Joi.object({
+  q:                  Joi.string().max(100).optional().allow(''),
+  registrationStatus: Joi.number().integer().valid(1, 2, 3, 5, 6, 7, 8, 9).optional(),
+  easyfixerType:      Joi.number().integer().valid(0, 1, 2).optional(),
+  dateFrom:           Joi.date().iso().optional(),
+  dateTo:             Joi.date().iso().optional(),
+  ndmId:              Joi.number().integer().positive().optional(),
+  limit:              Joi.number().integer().min(1).max(500).default(20),
+  offset:             Joi.number().integer().min(0).default(0),
+  sortBy:             Joi.string().valid('efr_id', 'registered_date', 'name', 'city').default('registered_date'),
+  sortDir:            Joi.string().valid('asc', 'desc').insensitive().default('desc'),
+});
+
 module.exports = {
-  listQuery, createBody, updateBody, statusBody, idParam, listSubresourceQuery, efrIdsBody,
+  listQuery, registeredListQuery, createBody, updateBody, statusBody, idParam, listSubresourceQuery, efrIdsBody,
   commentBody, leadVerificationBody, professionalBody, personalFamilyBody,
   bankingVerificationBody, identityVerificationBody, activationBody,
   mapClientsBody, bgvReportBody, optionMappingsBody, serviceablePincodesBody,

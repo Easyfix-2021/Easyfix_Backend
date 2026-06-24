@@ -929,8 +929,262 @@ async function statusCounts({ scope } = {}) {
   };
 }
 
+// ─── Registered Easyfixers (onboarding / approval queue) ─────────────
+/*
+ * Parity port of the legacy CRM "EasyFixers → Registered Easyfixers" page
+ * (struts efer-registration / getAllRegisteredEasyfixer →
+ * EasyfixerDaoImpl.getAllRegisteredEasyfixer). This is the ONBOARDING queue,
+ * distinct from the verified-roster list() above.
+ *
+ * "Registered" = an easyfixer who STARTED self-registration / re-onboarding
+ * (new_easy_fixer OR is_existing_easyfixer set) AND is NOT yet finally
+ * technician-verified (is_technician_verified IS NULL). Once verified they
+ * graduate out of this queue into the roster.
+ *
+ * Location fields come from tbl_user (U.city/U.state/U.pin_code) exactly like
+ * legacy — during onboarding the canonical location lives on the login row,
+ * not yet on tbl_easyfixer.efr_cityId.
+ *
+ * Legacy quirks deliberately FIXED (documented for the migration):
+ *   - parameterised SQL (legacy string-concatenated → injection-prone);
+ *   - COUNT(*) for total (legacy materialised every row + counted in Java);
+ *   - easyfixer_watched_video.video_id unified to 3 (legacy used 6 in the list
+ *     query but 3 in count/export — a silent inconsistency);
+ *   - PIN search unified to U.pin_code (legacy diverged list vs count);
+ *   - State-User (zonal manager) name via a scalar subquery, not the legacy
+ *     per-row DAO call (N+1).
+ */
+
+// Legacy registration-status label cascade (LAST-MATCH-WINS), replicating the
+// EasyfixerDaoImpl RowMapper. `r` carries the raw columns selected below.
+function registrationStatusLabel(r) {
+  const pdf = r.personal_details_filled == null ? null : Number(r.personal_details_filled);
+  const idv = r.is_identity_details_verified == null ? null : Number(r.is_identity_details_verified);
+  const hasSb = r.send_back_to_tx_reason_crm != null && String(r.send_back_to_tx_reason_crm).trim() !== '';
+  const hasLoc = r.name != null && r.city != null && r.pincode != null;
+  const wv = r.watched_percentage == null ? null : Number(r.watched_percentage);
+  const pp = r.profile_perc == null ? null : Number(r.profile_perc);
+
+  let label = 'Details Not Available';
+  if (hasLoc && (pdf === 0 || pdf === null)) label = 'New Lead';
+  if (r.pincode == null || r.name == null || r.city == null) label = 'Details Not Available';
+  if (pdf === 2) label = 'Not Eligible';
+  if (hasLoc && pdf === 1) label = 'Self Registration In Progress';
+  if (idv === 1) label = 'Send To Finance';
+  if (hasSb && idv === 2) label = 'Not Suitable';
+  if (hasSb && pdf === 0 && idv === 0) label = 'Send Back To Tx EC';
+  if (hasSb && pdf === 1 && idv === 0) label = 'Send Back To Tx Identity Section';
+  if (r.efr_profile_img != null && wv === 100 && pp === 100) label = 'Pending Member Verification';
+  if (r.beneficiary_id != null && String(r.beneficiary_id) !== '' && r.easyfix_bank_name_id != null && idv === 1) label = 'Activation Pending';
+  return label;
+}
+
+// Legacy IsEligibleForEarlyActivation — all key profile fields present + a
+// city + some training watched (drives the "unlock" row highlight in the UI).
+function earlyActivationEligible(r) {
+  return !!(
+    r.name && r.adhaar_card_number && r.efr_bank_acc_num &&
+    r.efr_service_category && r.efr_service_type && r.efr_profile_img && r.efr_pin_no &&
+    Number(r.efr_cityId) > 0 && Number(r.watched_percentage) > 0
+  );
+}
+
+const REGISTERED_JOINS = `
+  FROM tbl_easyfixer e
+  LEFT JOIN tbl_user U ON U.user_id = e.user_id
+  /* One bank row per easyfixer. tbl_easyfixer_bank_details can hold >1 row per
+     efr, so a plain LEFT JOIN would FAN OUT (dupe list rows + inflate COUNT).
+     The table has NO id PK, so we pre-aggregate by efr_id with MAX() over the
+     presence-checked columns — the registered-status logic only tests presence/
+     equality (not row identity), so collapsing to one row per efr is correct. */
+  LEFT JOIN (
+    SELECT efr_id,
+           MAX(beneficiary_id)       AS beneficiary_id,
+           MAX(easyfix_bank_name_id) AS easyfix_bank_name_id,
+           MAX(efr_bank_acc_num)     AS efr_bank_acc_num
+      FROM tbl_easyfixer_bank_details
+     GROUP BY efr_id
+  ) tb ON tb.efr_id = e.efr_id
+  /* video_id=3 is unique per easyfixer (easyfixer_id+video_id key) → no fan-out. */
+  LEFT JOIN easyfixer_watched_video wvd ON wvd.easyfixer_id = e.efr_id AND wvd.video_id = 3
+`;
+
+const REGISTERED_SORTS = Object.freeze({
+  efr_id:          'e.efr_id',
+  registered_date: 'U.insert_date',
+  name:            'U.user_name',
+  city:            'U.city',
+});
+
+// Shared WHERE builder for the registered queue (list + count + export).
+function buildRegisteredWhere(f = {}, scope) {
+  const clauses = [
+    '(e.new_easy_fixer IS NOT NULL OR e.is_existing_easyfixer IS NOT NULL)',
+    'e.is_technician_verified IS NULL',
+  ];
+  const params = [];
+
+  // RBAC city scope — same convention as list().
+  if (scope?.cities) {
+    const ci = scope.cities;
+    if (ci.mode === 'none') clauses.push('1=0');
+    else if (ci.mode === 'allow' && ci.ids.length) {
+      clauses.push(`e.efr_cityId IN (${ci.ids.map(() => '?').join(',')})`);
+      params.push(...ci.ids);
+    }
+  }
+
+  // Search — length-routed like legacy (6→pincode, 10→mobile, ≤4 digits→id);
+  // other text falls back to name/mobile (legacy matched nothing for 7-9 digit
+  // / free text — improved here).
+  if (f.q) {
+    const s = String(f.q).trim();
+    if (/^\d{6}$/.test(s))       { clauses.push('U.pin_code LIKE ?'); params.push(`%${s}%`); }
+    else if (/^\d{10}$/.test(s)) { clauses.push('e.efr_no LIKE ?');   params.push(`%${s}%`); }
+    else if (/^\d{1,4}$/.test(s)){ clauses.push('e.efr_id = ?');      params.push(Number(s)); }
+    else                         { clauses.push('(U.user_name LIKE ? OR e.efr_no LIKE ?)'); params.push(`%${s}%`, `%${s}%`); }
+  }
+
+  // Registration-status dropdown (legacy values 1-3, 5-9; 4 unused). Predicates
+  // verbatim from EasyfixerDaoImpl.getAllRegisteredEasyfixer.
+  switch (Number(f.registrationStatus)) {
+    case 1: clauses.push("U.pin_code IS NOT NULL AND U.user_name IS NOT NULL AND U.personal_details_filled IS NULL AND e.is_identity_details_verified_by_crm IS NULL AND U.city IS NOT NULL"); break;
+    case 2: clauses.push("U.personal_details_filled = 1 AND U.pin_code IS NOT NULL AND U.user_name IS NOT NULL AND U.city IS NOT NULL AND (e.is_identity_details_verified_by_crm IS NULL OR e.is_identity_details_verified_by_crm = 0)"); break;
+    case 3: clauses.push("(U.pin_code IS NULL OR U.user_name IS NULL OR U.city IS NULL) AND U.personal_details_filled IS NULL"); break;
+    case 5: clauses.push("U.personal_details_filled = 2 AND (e.is_identity_details_verified_by_crm IS NULL OR e.is_identity_details_verified_by_crm = 0)"); break;
+    case 6: clauses.push("e.is_identity_details_verified_by_crm = 1 AND tb.beneficiary_id IS NULL AND tb.easyfix_bank_name_id IS NULL"); break;
+    case 7: clauses.push("tb.beneficiary_id IS NOT NULL AND tb.beneficiary_id <> '' AND tb.easyfix_bank_name_id IS NOT NULL AND e.is_identity_details_verified_by_crm = 1"); break;
+    case 8: clauses.push("e.send_back_to_tx_reason_crm IS NOT NULL AND e.is_identity_details_verified_by_crm = 2"); break;
+    case 9: clauses.push("wvd.watched_percentage = 100 AND e.efr_profile_perc = 100 AND e.efr_profile_img IS NOT NULL AND e.is_identity_details_verified_by_crm IS NULL AND tb.beneficiary_id IS NULL AND tb.easyfix_bank_name_id IS NULL"); break;
+    default: break;
+  }
+
+  // Easyfixer type: 1 = already-existing, 2 = new.
+  if (Number(f.easyfixerType) === 1) clauses.push('e.is_existing_easyfixer = 1');
+  else if (Number(f.easyfixerType) === 2) clauses.push('e.new_easy_fixer = 1');
+
+  // Applied-on date range (on the login insert_date).
+  if (f.dateFrom) { clauses.push('DATE(U.insert_date) >= ?'); params.push(String(f.dateFrom).slice(0, 10)); }
+  if (f.dateTo)   { clauses.push('DATE(U.insert_date) <= ?'); params.push(String(f.dateTo).slice(0, 10)); }
+
+  // NDM / state-user: the (login) city is an active city managed by ndmId.
+  if (f.ndmId != null) {
+    clauses.push('EXISTS (SELECT 1 FROM tbl_city rc WHERE rc.city_name = U.city AND rc.city_status = 1 AND rc.state_user = ?)');
+    params.push(f.ndmId);
+  }
+
+  return { where: `WHERE ${clauses.join(' AND ')}`, params };
+}
+
+async function listRegistered(f = {}, scope) {
+  const { where, params } = buildRegisteredWhere(f, scope);
+  const sortCol = REGISTERED_SORTS[f.sortBy] || 'U.insert_date';
+  const sortDir = String(f.sortDir).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+  // Page-size ceiling: 500 for the interactive list (matches the Joi cap).
+  // The export path passes an explicit higher `maxLimit` so /download is NOT
+  // silently truncated to 500 rows.
+  const ceiling = Math.max(Number(f.maxLimit) || 500, 1);
+  const limit = Math.min(Math.max(Number(f.limit) || 20, 1), ceiling);
+  const offset = Math.max(Number(f.offset) || 0, 0);
+
+  const [rows] = await pool.query(`
+    SELECT
+      e.efr_id,
+      U.insert_date                          AS registered_date,
+      U.user_name                            AS name,
+      e.efr_no                               AS mobile,
+      U.city                                 AS city,
+      U.pin_code                             AS pincode,
+      U.state                                AS state_name,
+      (SELECT u2.user_name FROM tbl_city rc JOIN tbl_user u2 ON u2.user_id = rc.state_user
+        WHERE rc.city_name = U.city AND rc.city_status = 1 LIMIT 1) AS state_user_name,
+      e.efr_profile_perc                     AS profile_perc,
+      e.is_existing_easyfixer                AS is_existing_easyfixer,
+      e.new_easy_fixer                       AS new_easy_fixer,
+      U.personal_details_filled              AS personal_details_filled,
+      e.is_identity_details_verified_by_crm  AS is_identity_details_verified,
+      e.send_back_to_tx_reason_crm           AS send_back_to_tx_reason_crm,
+      e.efr_profile_img                      AS efr_profile_img,
+      e.adhaar_card_number                   AS adhaar_card_number,
+      e.efr_service_category                 AS efr_service_category,
+      e.efr_service_type                     AS efr_service_type,
+      e.efr_pin_no                           AS efr_pin_no,
+      e.efr_cityId                           AS efr_cityId,
+      e.profile_activation_date_time         AS profile_activation_date_time,
+      wvd.watched_percentage                 AS watched_percentage,
+      tb.beneficiary_id                      AS beneficiary_id,
+      tb.easyfix_bank_name_id                AS easyfix_bank_name_id,
+      tb.efr_bank_acc_num                    AS efr_bank_acc_num
+    ${REGISTERED_JOINS}
+    ${where}
+    ORDER BY ${sortCol} ${sortDir}, e.efr_id DESC
+    LIMIT ? OFFSET ?
+  `, [...params, limit, offset]);
+
+  const [[{ total }]] = await pool.query(
+    `SELECT COUNT(*) AS total ${REGISTERED_JOINS} ${where}`,
+    params
+  );
+
+  const items = rows.map((r) => ({
+    ...r,
+    registration_status_label: registrationStatusLabel(r),
+    early_activation_eligible: earlyActivationEligible(r),
+  }));
+  return { rows: items, total: Number(total) || 0 };
+}
+
+// Full (filtered) export set, no pagination — caller streams to xlsx.
+async function listRegisteredForExport(f = {}, scope, cap = 10000) {
+  // maxLimit:cap lifts the interactive 500 ceiling so the export streams the
+  // full (filtered) set up to the hard cap instead of being clamped to 500.
+  const { rows } = await listRegistered({ ...f, limit: cap, maxLimit: cap, offset: 0 }, scope);
+  return rows;
+}
+
+// Status-count strip for the registered queue (clickable triage header,
+// mirrors statusCounts() for the roster). One SUM(CASE) pass over the base
+// registered set + RBAC scope (no status filter). Buckets OVERLAP by design
+// (sum may exceed total) — same as the legacy registration-status predicates.
+// Keys map to the registrationStatus filter values:
+//   new_lead=1 · in_progress=2 · details_not_available=3 · not_eligible=5 ·
+//   send_to_finance=6 · activation_pending=7 · not_suitable=8 ·
+//   pending_member_verification=9.
+async function registeredStatusCounts(scope) {
+  const { where, params } = buildRegisteredWhere({}, scope);
+  const [[row]] = await pool.query(`
+    SELECT
+      SUM(CASE WHEN U.pin_code IS NOT NULL AND U.user_name IS NOT NULL AND U.personal_details_filled IS NULL AND e.is_identity_details_verified_by_crm IS NULL AND U.city IS NOT NULL THEN 1 ELSE 0 END) AS new_lead,
+      SUM(CASE WHEN U.personal_details_filled = 1 AND U.pin_code IS NOT NULL AND U.user_name IS NOT NULL AND U.city IS NOT NULL AND (e.is_identity_details_verified_by_crm IS NULL OR e.is_identity_details_verified_by_crm = 0) THEN 1 ELSE 0 END) AS in_progress,
+      SUM(CASE WHEN (U.pin_code IS NULL OR U.user_name IS NULL OR U.city IS NULL) AND U.personal_details_filled IS NULL THEN 1 ELSE 0 END) AS details_not_available,
+      SUM(CASE WHEN U.personal_details_filled = 2 AND (e.is_identity_details_verified_by_crm IS NULL OR e.is_identity_details_verified_by_crm = 0) THEN 1 ELSE 0 END) AS not_eligible,
+      SUM(CASE WHEN e.is_identity_details_verified_by_crm = 1 AND tb.beneficiary_id IS NULL AND tb.easyfix_bank_name_id IS NULL THEN 1 ELSE 0 END) AS send_to_finance,
+      SUM(CASE WHEN tb.beneficiary_id IS NOT NULL AND tb.beneficiary_id <> '' AND tb.easyfix_bank_name_id IS NOT NULL AND e.is_identity_details_verified_by_crm = 1 THEN 1 ELSE 0 END) AS activation_pending,
+      SUM(CASE WHEN e.send_back_to_tx_reason_crm IS NOT NULL AND e.is_identity_details_verified_by_crm = 2 THEN 1 ELSE 0 END) AS not_suitable,
+      SUM(CASE WHEN wvd.watched_percentage = 100 AND e.efr_profile_perc = 100 AND e.efr_profile_img IS NOT NULL AND e.is_identity_details_verified_by_crm IS NULL AND tb.beneficiary_id IS NULL AND tb.easyfix_bank_name_id IS NULL THEN 1 ELSE 0 END) AS pending_member_verification,
+      COUNT(*) AS total
+    ${REGISTERED_JOINS}
+    ${where}
+  `, params);
+  return {
+    new_lead:                    Number(row.new_lead) || 0,
+    in_progress:                 Number(row.in_progress) || 0,
+    details_not_available:       Number(row.details_not_available) || 0,
+    not_eligible:                Number(row.not_eligible) || 0,
+    send_to_finance:             Number(row.send_to_finance) || 0,
+    activation_pending:          Number(row.activation_pending) || 0,
+    not_suitable:                Number(row.not_suitable) || 0,
+    pending_member_verification: Number(row.pending_member_verification) || 0,
+    total:                       Number(row.total) || 0,
+  };
+}
+
 module.exports = {
   list,
+  listRegistered,
+  listRegisteredForExport,
+  registeredStatusCounts,
+  registrationStatusLabel,
   getById,
   create,
   update,

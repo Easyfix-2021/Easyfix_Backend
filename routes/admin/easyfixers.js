@@ -11,7 +11,7 @@ const requireAction = require('../../middleware/require-action');
 const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
 const {
-  listQuery, createBody, updateBody, statusBody, idParam, listSubresourceQuery, efrIdsBody,
+  listQuery, registeredListQuery, createBody, updateBody, statusBody, idParam, listSubresourceQuery, efrIdsBody,
   commentBody, leadVerificationBody, professionalBody, personalFamilyBody,
   bankingVerificationBody, identityVerificationBody, activationBody, mapClientsBody, bgvReportBody,
   optionMappingsBody, serviceablePincodesBody,
@@ -202,6 +202,72 @@ router.get('/download', validate(listQuery, 'query'), async (req, res, next) => 
     const buffer = await wb.xlsx.writeBuffer();
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="easyfixers-${today}.xlsx"`);
+    res.send(Buffer.from(buffer));
+  } catch (e) { next(e); }
+});
+
+// ─── Registered Easyfixers (onboarding / approval queue) ────────────
+// Parity port of legacy efer-registration / getAllRegisteredEasyfixer.
+// REGISTERED BEFORE `/:id` so the literal `/registered` path wins routing —
+// `/:id` is a catch-all that would otherwise capture `/registered`.
+router.get('/registered', validate(registeredListQuery, 'query'), async (req, res, next) => {
+  try {
+    const scope = buildRequestScope(req);
+    const { rows, total } = await easyfixer.listRegistered(req.query, scope);
+    modernOk(res, { items: rows, total, limit: req.query.limit, offset: req.query.offset });
+  } catch (e) { next(e); }
+});
+
+// Registration-status count strip (clickable triage header for the queue).
+// Scope-filtered; buckets overlap (sum may exceed total) — legacy parity.
+router.get('/registered/status-counts', async (req, res, next) => {
+  try {
+    const scope = buildRequestScope(req);
+    const counts = await easyfixer.registeredStatusCounts(scope);
+    modernOk(res, counts);
+  } catch (e) { next(e); }
+});
+
+const REGISTERED_EXPORT_COLUMNS = [
+  { header: 'Easyfixer ID',         key: 'efr_id',                       width: 14 },
+  { header: 'Name',                 key: 'name',                         width: 28 },
+  { header: 'Mobile',               key: 'mobile',                       width: 16 },
+  { header: 'City',                 key: 'city',                         width: 20 },
+  { header: 'Pincode',              key: 'pincode',                      width: 12 },
+  { header: 'State',                key: 'state_name',                   width: 18 },
+  { header: 'State User',           key: 'state_user_name',              width: 22 },
+  { header: 'Applied On',           key: 'registered_date',              width: 20 },
+  { header: 'Registration Status',  key: 'registration_status_label',    width: 26 },
+  { header: 'Profile %',            key: 'profile_perc',                 width: 11 },
+  { header: 'Service Category',     key: 'efr_service_category',         width: 22 },
+  { header: 'Is New/Existing',      key: 'new_or_existing',              width: 16 },
+  { header: 'Profile Activated On', key: 'profile_activation_date_time', width: 22 },
+];
+
+// Export respects the SAME filters as the list (legacy exported the full
+// unfiltered set — improved here, matching the main /download behaviour).
+router.get('/registered/download', validate(registeredListQuery, 'query'), async (req, res, next) => {
+  try {
+    const scope = buildRequestScope(req);
+    const rows = await easyfixer.listRegisteredForExport(req.query, scope, EXPORT_HARD_CAP);
+
+    const wb = new ExcelJS.Workbook();
+    const sheet = wb.addWorksheet('Registered Easyfixers');
+    sheet.columns = REGISTERED_EXPORT_COLUMNS;
+    sheet.getRow(1).font = { bold: true };
+    for (const r of rows) {
+      sheet.addRow({
+        ...r,
+        registered_date: formatDateTimeForXlsx(r.registered_date),
+        profile_activation_date_time: formatDateTimeForXlsx(r.profile_activation_date_time),
+        new_or_existing: r.is_existing_easyfixer ? 'Existing' : (r.new_easy_fixer ? 'New' : '—'),
+      });
+    }
+
+    const today = new Date().toISOString().slice(0, 10);
+    const buffer = await wb.xlsx.writeBuffer();
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="registered-easyfixers-${today}.xlsx"`);
     res.send(Buffer.from(buffer));
   } catch (e) { next(e); }
 });
