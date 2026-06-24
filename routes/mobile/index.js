@@ -155,6 +155,23 @@ router.post('/auth/verify-otp', validate(Joi.object({
           'device_info upsert failed during verify-otp',
         );
       }
+    } else if (fcm) {
+      // No deviceId in the payload (some app builds send only the FCM token on
+      // login) — we can't run the device_info single-session sweep (it keys on
+      // device_id), but the registration/status push fan-out reads
+      // tbl_easyfixer_app.device_id FIRST. Without mirroring the token there the
+      // technician is unreachable ("registration-push: no device tokens — skipping").
+      // Best-effort, never breaks login. Guarded on `fcm` so a deviceId-less
+      // re-auth that carries no token never clears a still-live token.
+      try {
+        await upsertEasyfixerAppToken(r.tech.efr_id, fcm);
+        deviceRegistered = true;
+      } catch (devErr) {
+        require('../../logger').warn(
+          { err: devErr.message, efrId: r.tech.efr_id },
+          'tbl_easyfixer_app token sync failed during verify-otp (no deviceId)',
+        );
+      }
     }
 
     res.cookie('techToken', r.token, { httpOnly: true, sameSite: 'lax', maxAge: 30 * 86400 * 1000 });
@@ -166,9 +183,17 @@ router.post('/auth/verify-otp', validate(Joi.object({
         mobile: r.tech.efr_no,
         email:  r.tech.efr_email,
       },
-      device: req.body.deviceId
-        ? { registered: deviceRegistered, deviceId: req.body.deviceId, fcmStored: Boolean(fcm) }
-        : { registered: false },
+      // `registered` = the device was registered for push this login, via the
+      // device_info session AND/OR the canonical tbl_easyfixer_app token. True
+      // for: deviceId+token, deviceId-only (session created, token cleared), and
+      // the deviceId-less `else if (fcm)` path that still synced the FCM token.
+      // `deviceId` is null when the client sent none; `fcmStored` reflects
+      // whether a push token was actually persisted on this request.
+      device: {
+        registered: deviceRegistered,
+        deviceId: req.body.deviceId || null,
+        fcmStored: Boolean(fcm),
+      },
     });
   } catch (e) { next(e); }
 });
