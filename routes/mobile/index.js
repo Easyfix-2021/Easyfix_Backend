@@ -593,9 +593,13 @@ router.post('/profile/professional-details', validate(Joi.object({
   experienceId: Joi.number().integer().positive().optional(),
   useWhatsapp: Joi.boolean().optional(),
   toolIds: Joi.array().items(Joi.number().integer().positive()).optional(),
+  // Per-tool photos (proof of possession): one entry per selected tool.
+  tools: Joi.array().items(Joi.object({
+    toolId: Joi.number().integer().positive().required(),
+    photoKey: Joi.string().trim().max(255).optional(),
+  })).optional(),
   docs: Joi.object({
     education: Joi.string().trim().max(255).optional(),
-    tools: Joi.string().trim().max(255).optional(),
     toolBag: Joi.string().trim().max(255).optional(),
   }).optional(),
 }).min(1).unknown(true)), async (req, res, next) => {
@@ -605,7 +609,11 @@ router.post('/profile/professional-details', validate(Joi.object({
   try {
     const b = req.body;
     const useWhatsapp = b.useWhatsapp === undefined ? null : (b.useWhatsapp ? 1 : 0);
-    const toolsCsv = Array.isArray(b.toolIds) && b.toolIds.length ? b.toolIds.join(',') : null;
+    // Selected tool ids — prefer the rich per-tool `tools[]`, else the flat toolIds.
+    const toolIdList = Array.isArray(b.tools) && b.tools.length
+      ? b.tools.map((t) => t.toolId)
+      : (Array.isArray(b.toolIds) ? b.toolIds : []);
+    const toolsCsv = toolIdList.length ? toolIdList.join(',') : null;
     // Mark the section complete only once an experience level is chosen (the one
     // mandatory field here); a partial save leaves the prior perc untouched.
     const professionalComplete = !!b.experienceId;
@@ -621,9 +629,45 @@ router.post('/profile/professional-details', validate(Joi.object({
        WHERE efr_id = ?`,
       [b.experienceId || null, toolsCsv, useWhatsapp, professionalComplete ? 100 : null, efrId]);
 
+    // Per-tool photos → tbl_easyfixer_document type 8, one row per tool with the
+    // tool id stamped in efr_doc_text (schema-safe; no tool↔doc junction needed).
+    // DIFF within the lock (the app only knows hasPhoto, not the stored key, so a
+    // kept-but-not-re-picked tool sends NO photoKey and must NOT lose its photo):
+    //   • delete photos for tools no longer in the selected set;
+    //   • upsert a photo only for tools that supplied a new photoKey;
+    //   • tools kept without a new key keep their existing row untouched.
+    if (Array.isArray(b.tools)) {
+      const desiredIds = b.tools.map((t) => Number(t.toolId)).filter((n) => Number.isInteger(n) && n > 0);
+      if (desiredIds.length) {
+        const ph = desiredIds.map(() => '?').join(',');
+        await conn.query(
+          `DELETE FROM tbl_easyfixer_document
+            WHERE efr_id = ? AND efr_doc_type_id = 8
+              AND (efr_doc_text IS NULL OR efr_doc_text NOT IN (${ph}))`,
+          // efr_doc_text is VARCHAR (we store String(toolId)) — bind STRINGS so
+          // the NOT IN is a string-vs-string compare, not an implicit numeric cast.
+          [efrId, ...desiredIds.map(String)]);
+      } else {
+        await conn.query('DELETE FROM tbl_easyfixer_document WHERE efr_id = ? AND efr_doc_type_id = 8', [efrId]);
+      }
+      for (const tp of b.tools) {
+        if (!tp || !tp.photoKey) continue;
+        const [[ex]] = await conn.query(
+          'SELECT efr_doc_id FROM tbl_easyfixer_document WHERE efr_id = ? AND efr_doc_type_id = 8 AND efr_doc_text = ? LIMIT 1',
+          [efrId, String(tp.toolId)]);
+        if (ex) {
+          await conn.query('UPDATE tbl_easyfixer_document SET efr_document_name = ? WHERE efr_doc_id = ?', [tp.photoKey, ex.efr_doc_id]);
+        } else {
+          await conn.query(
+            `INSERT INTO tbl_easyfixer_document (efr_id, efr_doc_type_id, efr_document_name, efr_doc_text, created_date, created_by)
+             VALUES (?, 8, ?, ?, NOW(), ?)`,
+            [efrId, tp.photoKey, String(tp.toolId), efrId]);
+        }
+      }
+    }
+    // Education (7) + Tool Bag (9) — single photo each.
     const docs = b.docs || {};
-    await upsertEasyfixerDocuments(conn, efrId,
-      [[7, docs.education], [8, docs.tools], [9, docs.toolBag]]);
+    await upsertEasyfixerDocuments(conn, efrId, [[7, docs.education], [9, docs.toolBag]]);
 
     await conn.commit();
     modernOk(res, { updated: true });
@@ -634,6 +678,51 @@ router.post('/profile/professional-details', validate(Joi.object({
     try { await conn.query('SELECT RELEASE_LOCK(?)', [lockKey]); } catch (_) { /* lock auto-frees */ }
     conn.release();
   }
+});
+
+// Professional prefill — experience level, WhatsApp flag, the selected tools
+// (with name + whether a photo is already on file), and the selected service
+// categories (with the count of chosen deep-skill options). The per-category
+// deep-skill DETAIL loads on demand via GET /deepskill/hierarchy/:categoryId.
+router.get('/profile/professional', async (req, res, next) => {
+  try {
+    const efrId = req.tech.efr_id;
+    const [[ef]] = await pool.query(
+      'SELECT experience_id, efr_tools, use_whatsapp FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1', [efrId]);
+
+    const toolIds = String(ef && ef.efr_tools ? ef.efr_tools : '')
+      .split(',').map((s) => parseInt(s, 10)).filter((n) => Number.isInteger(n) && n > 0);
+    let tools = [];
+    if (toolIds.length) {
+      const ph = toolIds.map(() => '?').join(',');
+      const [nameRows] = await pool.query(
+        `SELECT tool_id, tool_name FROM tbl_tools WHERE tool_id IN (${ph})`, toolIds);
+      const nameById = new Map(nameRows.map((r) => [Number(r.tool_id), r.tool_name]));
+      const [photoRows] = await pool.query(
+        'SELECT efr_doc_text FROM tbl_easyfixer_document WHERE efr_id = ? AND efr_doc_type_id = 8', [efrId]);
+      const withPhoto = new Set(
+        photoRows.map((r) => parseInt(r.efr_doc_text, 10)).filter((n) => !Number.isNaN(n)));
+      tools = toolIds.map((id) => ({ toolId: id, toolName: nameById.get(id) || null, hasPhoto: withPhoto.has(id) }));
+    }
+
+    const [catRows] = await pool.query(
+      `SELECT m.category_id AS categoryId, c.service_catg_name AS categoryName, COUNT(*) AS skillCount
+         FROM tbl_efr_deepskill_mapping m
+         JOIN tbl_service_catg c ON c.service_catg_id = m.category_id
+        WHERE m.easyfixer_id = ? AND m.is_repairing = 1
+        GROUP BY m.category_id, c.service_catg_name
+        ORDER BY c.service_catg_name ASC`, [efrId]);
+
+    const wa = ef ? ef.use_whatsapp : null;
+    modernOk(res, {
+      experienceId: ef ? ef.experience_id : null,
+      useWhatsapp: Buffer.isBuffer(wa) ? wa[0] === 1 : Number(wa) === 1,
+      tools,
+      categories: catRows.map((c) => ({
+        categoryId: Number(c.categoryId), categoryName: c.categoryName, skillCount: Number(c.skillCount),
+      })),
+    });
+  } catch (e) { next(e); }
 });
 
 // Identity step. Persists Aadhaar/PAN numbers + (on DigiLocker mismatch-accept)
