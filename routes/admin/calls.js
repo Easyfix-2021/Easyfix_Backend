@@ -150,7 +150,7 @@ router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'
       receiverReal = cust.customer_mob_no || null;
     } else if (efrId) {
       const [[efr]] = await pool.query(
-        `SELECT efr_no FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1`,
+        `SELECT efr_no FROM tbl_easyfixer WHERE efr_id = ? AND NOT (tbl_easyfixer.efr_status <=> 3) LIMIT 1`,
         [efrId]
       );
       if (!efr) return modernError(res, 404, `Easyfixer ${efrId} not found`);
@@ -235,7 +235,7 @@ async function resolveReceiver({ jobId, customerId, efrId, reportingContactId, u
   }
   if (efrId) {
     const [[efr]] = await pool.query(
-      `SELECT efr_id, efr_first_name, efr_last_name, efr_no FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1`,
+      `SELECT efr_id, efr_first_name, efr_last_name, efr_no FROM tbl_easyfixer WHERE efr_id = ? AND NOT (tbl_easyfixer.efr_status <=> 3) LIMIT 1`,
       [efrId]
     );
     if (!efr) return { ok: false, status: 404, message: `Easyfixer ${efrId} not found` };

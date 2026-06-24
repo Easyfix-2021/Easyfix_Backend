@@ -190,7 +190,7 @@ async function verifyToken(token) {
  */
 async function getStatus(efrId) {
   const [rows] = await pool.query(
-    `SELECT is_email_verified FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1`,
+    `SELECT is_email_verified FROM tbl_easyfixer WHERE efr_id = ? AND NOT (tbl_easyfixer.efr_status <=> 3) LIMIT 1`,
     [efrId],
   );
   if (!rows.length) return { verified: false };

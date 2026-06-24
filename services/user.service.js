@@ -79,6 +79,7 @@ async function listUsers({
   const where  = [`u.user_type_id = ${INTERNAL_USER_TYPE_ID}`];
   const params = [];
   if (!includeInactive) where.push('u.user_status = 1');
+  else where.push('NOT (u.user_status <=> 3)'); // never surface admin-deleted (tombstoned) users — NULL-safe
   if (q) {
     where.push('(u.user_name LIKE ? OR u.official_email LIKE ? OR u.mobile_no LIKE ? OR u.user_code LIKE ?)');
     params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);

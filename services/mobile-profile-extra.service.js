@@ -272,7 +272,7 @@ async function getEarnings(efrId, { from, to } = {}) {
   let currentBalance = 0;
   try {
     const [[walletRow]] = await pool.query(
-      'SELECT current_balance FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1',
+      'SELECT current_balance FROM tbl_easyfixer WHERE efr_id = ? AND NOT (tbl_easyfixer.efr_status <=> 3) LIMIT 1',
       [efrId],
     );
     currentBalance = Number(walletRow?.current_balance ?? 0);
@@ -365,6 +365,7 @@ async function getICard(efrId) {
          FROM tbl_easyfixer e
          LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId
         WHERE e.efr_id = ?
+          AND NOT (e.efr_status <=> 3)
         LIMIT 1`,
       [efrId],
     );
@@ -642,7 +643,8 @@ async function aadhaarPanExists(number, excludeEfrId) {
     `SELECT COUNT(*) AS cnt
        FROM tbl_easyfixer
       WHERE (adhaar_card_number = ? OR pan_card_number = ?)
-        AND efr_id <> ?`,
+        AND efr_id <> ?
+        AND NOT (tbl_easyfixer.efr_status <=> 3)`,
     [number, number, excludeEfrId || 0],
   );
   return { exists: Number(row?.cnt ?? 0) > 0 };

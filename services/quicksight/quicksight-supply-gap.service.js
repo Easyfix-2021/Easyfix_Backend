@@ -284,7 +284,7 @@ async function resolveSupplyStatusBatch(mobileNumbers) {
 
   // 2) tbl_easyfixer keyed by efr_no (for the no-user "Invite Sent / Idle" branch).
   const [efrsByNo] = await pool.query(
-    `SELECT efr_no FROM tbl_easyfixer WHERE efr_no IN (${ph})`,
+    `SELECT efr_no FROM tbl_easyfixer WHERE efr_no IN (${ph}) AND NOT (tbl_easyfixer.efr_status <=> 3)`,
     distinct,
   );
   const efrNoSet = new Set(efrsByNo.map((e) => String(e.efr_no)));
@@ -297,7 +297,7 @@ async function resolveSupplyStatusBatch(mobileNumbers) {
       `SELECT user_id, city, user_name, pin_code, is_personal_detail_filled,
               personal_detail_filled_verified_by_crm, is_technician_Verified,
               is_identity_details_verified_by_crm, status
-         FROM tbl_easyfixer WHERE user_id IN (${uph})`,
+         FROM tbl_easyfixer WHERE user_id IN (${uph}) AND NOT (tbl_easyfixer.efr_status <=> 3)`,
       userIds,
     );
     for (const e of efrsByUser) efrByUserId.set(e.user_id, e);
@@ -800,7 +800,7 @@ async function txDetails(efrId, catgId) {
     FROM tbl_easyfixer TE
     LEFT JOIN tbl_job TJ ON TJ.fk_easyfixter_id = TE.efr_id
     LEFT JOIN tbl_city TCI ON TCI.city_id = TE.efr_cityId
-    WHERE TE.efr_id = ?
+    WHERE TE.efr_id = ? AND NOT (TE.efr_status <=> 3)
     GROUP BY TE.efr_id, TE.efr_name, TCI.city_name, TE.efr_status, TE.is_technician_verified
   `;
   const [rows] = await pool.query(sql, [catgId, efrId]);

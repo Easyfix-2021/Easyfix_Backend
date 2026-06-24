@@ -452,7 +452,7 @@ router.post('/jobs/:id/reschedule', validate(Joi.object({
 // Profile sub-tree — covers the legacy /profile/* endpoints
 router.get('/profile', async (req, res, next) => {
   try {
-    const [[tech]] = await pool.query('SELECT * FROM tbl_easyfixer WHERE efr_id = ?', [req.tech.efr_id]);
+    const [[tech]] = await pool.query('SELECT * FROM tbl_easyfixer WHERE efr_id = ? AND NOT (tbl_easyfixer.efr_status <=> 3)', [req.tech.efr_id]);
     modernOk(res, tech);
   } catch (e) { next(e); }
 });
@@ -462,7 +462,7 @@ router.get('/profile/percentage', async (req, res, next) => {
     const [[p]] = await pool.query(
       `SELECT efr_profile_perc, efr_personal_details_perc, efr_professional_details_perc,
               efr_bank_details_perc, efr_identity_details_perc
-         FROM tbl_easyfixer WHERE efr_id = ?`, [req.tech.efr_id]);
+         FROM tbl_easyfixer WHERE efr_id = ? AND NOT (tbl_easyfixer.efr_status <=> 3)`, [req.tech.efr_id]);
     modernOk(res, p);
   } catch (e) { next(e); }
 });
@@ -582,15 +582,58 @@ router.post('/profile/personal-details', validate(Joi.object({
   }
 });
 
-router.post('/profile/professional-details', async (req, res, next) => {
+// Professional section. Persists experience level (experience_id FK), the
+// selected tool ids (CSV → efr_tools), the use_whatsapp flag, and the three
+// uploaded photos → tbl_easyfixer_document (7=Education Certificate, 8=Tools,
+// 9=Bag Your Tools). Categories/skills themselves persist via the separate
+// deep-skill flow (POST /profile/skills), NOT here. `unknown(true)` keeps the
+// handler tolerant of legacy/extra fields the app may still send (hasTools,
+// serviceTypeIds, hasBike) during the screen transition.
+router.post('/profile/professional-details', validate(Joi.object({
+  experienceId: Joi.number().integer().positive().optional(),
+  useWhatsapp: Joi.boolean().optional(),
+  toolIds: Joi.array().items(Joi.number().integer().positive()).optional(),
+  docs: Joi.object({
+    education: Joi.string().trim().max(255).optional(),
+    tools: Joi.string().trim().max(255).optional(),
+    toolBag: Joi.string().trim().max(255).optional(),
+  }).optional(),
+}).min(1).unknown(true)), async (req, res, next) => {
+  const efrId = req.tech.efr_id;
+  const lockKey = `efr_doc:${efrId}`;
+  const conn = await pool.getConnection();
   try {
-    const b = req.body || {};
-    await pool.query(
-      `UPDATE tbl_easyfixer SET experience_id = COALESCE(?, experience_id), efr_tools = COALESCE(?, efr_tools),
-          efr_professional_details_perc = 100 WHERE efr_id = ?`,
-      [b.experienceId, b.tools, req.tech.efr_id]);
+    const b = req.body;
+    const useWhatsapp = b.useWhatsapp === undefined ? null : (b.useWhatsapp ? 1 : 0);
+    const toolsCsv = Array.isArray(b.toolIds) && b.toolIds.length ? b.toolIds.join(',') : null;
+    // Mark the section complete only once an experience level is chosen (the one
+    // mandatory field here); a partial save leaves the prior perc untouched.
+    const professionalComplete = !!b.experienceId;
+
+    await conn.query('SELECT GET_LOCK(?, 10)', [lockKey]);
+    await conn.beginTransaction();
+    await conn.query(
+      `UPDATE tbl_easyfixer SET
+         experience_id = COALESCE(?, experience_id),
+         efr_tools     = COALESCE(?, efr_tools),
+         use_whatsapp  = COALESCE(?, use_whatsapp),
+         efr_professional_details_perc = COALESCE(?, efr_professional_details_perc)
+       WHERE efr_id = ?`,
+      [b.experienceId || null, toolsCsv, useWhatsapp, professionalComplete ? 100 : null, efrId]);
+
+    const docs = b.docs || {};
+    await upsertEasyfixerDocuments(conn, efrId,
+      [[7, docs.education], [8, docs.tools], [9, docs.toolBag]]);
+
+    await conn.commit();
     modernOk(res, { updated: true });
-  } catch (e) { next(e); }
+  } catch (e) {
+    try { await conn.rollback(); } catch (_) { /* connection already gone */ }
+    next(e);
+  } finally {
+    try { await conn.query('SELECT RELEASE_LOCK(?)', [lockKey]); } catch (_) { /* lock auto-frees */ }
+    conn.release();
+  }
 });
 
 // Identity step. Persists Aadhaar/PAN numbers + (on DigiLocker mismatch-accept)
@@ -675,7 +718,7 @@ router.post('/bank-details', validate(Joi.object({
   ifsc: Joi.string().trim().pattern(/^[A-Za-z]{4}0[A-Za-z0-9]{6}$/).required(),
   bankId: Joi.number().integer().positive().optional(),
   bankName: Joi.string().trim().max(255).optional(),
-  accountHolderName: Joi.string().trim().max(255).allow('', null).optional(),
+  accountHolderName: Joi.string().trim().min(1).max(255).required(),  // mandatory — name as per bank records
   isVerified: Joi.boolean().optional(),
 })), async (req, res, next) => {
   try {

@@ -187,6 +187,11 @@ async function list({
    * Default (when no status supplied AND includeInactive falsy) stays
    * status=1 Active — matches the screenshot's "Status: Active" default.
    */
+  // Admin-deleted tombstones carry efr_status = 3 (deleted sentinel). Exclude
+  // them from EVERY roster view regardless of the selected status filter
+  // (the Idle / Not-Eligible filters below don't otherwise constrain efr_status).
+  // NOT (… <=> 3) is NULL-safe — genuine NULL-status rows are NOT dropped.
+  clauses.push('NOT (e.efr_status <=> 3)');
   if (status == null && !includeInactive) {
     // Default: status=1 Active
     clauses.push('e.is_technician_verified = 1 AND e.efr_status = 1');
@@ -449,7 +454,7 @@ async function getById(id) {
     `SELECT ${DETAIL_COLUMNS}
        FROM tbl_easyfixer e
        LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId
-      WHERE e.efr_id = ? LIMIT 1`,
+      WHERE e.efr_id = ? AND NOT (e.efr_status <=> 3) LIMIT 1`,
     [id]
   );
   return row || null;

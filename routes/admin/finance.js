@@ -42,7 +42,7 @@ async function scopedInvoice(req, res, next) {
 async function assertEfrInScope(req, efrId) {
   if (!efrId) return { ok: true }; // dimension absent
   const [[e]] = await pool.query(
-    'SELECT efr_cityId FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1',
+    'SELECT efr_cityId FROM tbl_easyfixer WHERE efr_id = ? AND NOT (tbl_easyfixer.efr_status <=> 3) LIMIT 1',
     [efrId]
   );
   if (!e) return { ok: false, reason: 'easyfixer not found' };
@@ -654,7 +654,7 @@ router.post('/purchase-orders', validate(Joi.object({
 router.get('/easyfixer/:id/payout', async (req, res, next) => {
   try {
     const [[balance]] = await pool.query(
-      'SELECT efr_id, efr_cityId, current_balance FROM tbl_easyfixer WHERE efr_id = ?',
+      'SELECT efr_id, efr_cityId, current_balance FROM tbl_easyfixer WHERE efr_id = ? AND NOT (tbl_easyfixer.efr_status <=> 3)',
       [req.params.id]
     );
     if (!balance) return modernError(res, 404, 'easyfixer not found');
@@ -912,7 +912,7 @@ router.get('/ndm-recharges', async (req, res, next) => {
       if (efrIds.length === 0) return modernOk(res, []);
       const placeholders = efrIds.map(() => '?').join(',');
       const [efrCityRows] = await pool.query(
-        `SELECT efr_id, efr_cityId FROM tbl_easyfixer WHERE efr_id IN (${placeholders})`,
+        `SELECT efr_id, efr_cityId FROM tbl_easyfixer WHERE efr_id IN (${placeholders}) AND NOT (tbl_easyfixer.efr_status <=> 3)`,
         efrIds
       );
       const cityByEfr = new Map(efrCityRows.map((r) => [r.efr_id, r.efr_cityId]));
@@ -1028,7 +1028,7 @@ router.post('/easyfixer/:id/recharge', validate(Joi.object({
         return modernError(res, 404, 'easyfixer not found');
       }
       const [[bal]] = await conn.query(
-        'SELECT current_balance FROM tbl_easyfixer WHERE efr_id = ?',
+        'SELECT current_balance FROM tbl_easyfixer WHERE efr_id = ? AND NOT (tbl_easyfixer.efr_status <=> 3)',
         [efrId]);
       // Audit ledger row for the manual admin credit (transaction_type=1 = credit).
       // TODO confirm legacy 'source' convention for manual admin credits against existing tbl_easyfixer_transaction rows

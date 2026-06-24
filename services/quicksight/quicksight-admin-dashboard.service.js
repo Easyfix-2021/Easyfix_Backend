@@ -694,7 +694,7 @@ async function managerTeam() {
 
   // QUERY B — root user (getUserById, ManagerTeamRepository:50-52).
   const [[rootRow]] = await pool.query(
-    'SELECT user_id, user_name FROM tbl_user WHERE user_id = ?',
+    'SELECT user_id, user_name FROM tbl_user WHERE user_id = ? AND NOT (user_status <=> 3)',
     [ORG_ROOT_USER_ID]
   );
 

@@ -239,6 +239,7 @@ async function fetchPrefill(efrId, pool) {
        LEFT JOIN tbl_user u ON u.user_id = e.user_id
        LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId
       WHERE e.efr_id = ?
+        AND NOT (e.efr_status <=> 3)
       LIMIT 1`,
     [efrId],
   );
@@ -745,6 +746,7 @@ async function sendForEasyfixer(efrId, { action = 'first', override_mobile, bypa
             profile_update_sent_at, profile_update_send_count
        FROM tbl_easyfixer
       WHERE efr_id = ?
+        AND NOT (tbl_easyfixer.efr_status <=> 3)
       LIMIT 1`,
     [efrId],
   );
@@ -990,7 +992,7 @@ async function acceptSubmission(efrId, payload, pool) {
     // 1. Verify the easyfixer exists inside the transaction so we can
     //    surface a clean 404 before any write happens.
     const [[exists]] = await conn.query(
-      'SELECT efr_id FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1',
+      'SELECT efr_id FROM tbl_easyfixer WHERE efr_id = ? AND NOT (tbl_easyfixer.efr_status <=> 3) LIMIT 1',
       [efrId],
     );
     if (!exists) {

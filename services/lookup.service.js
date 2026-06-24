@@ -170,6 +170,7 @@ async function users({ q, roleGroup, limit = 100, offset = 0, includeInactive = 
   const clauses = [];
   const params = [];
   if (!includeInactive) clauses.push('u.user_status = 1');
+  else clauses.push('NOT (u.user_status <=> 3)'); // never surface tombstoned (deleted) users — NULL-safe
   if (q) {
     clauses.push('(u.user_name LIKE ? OR u.official_email LIKE ? OR u.mobile_no LIKE ?)');
     params.push(`%${q}%`, `%${q}%`, `%${q}%`);
@@ -450,6 +451,7 @@ async function easyfixers({ q, limit = 5000, includeInactive = false } = {}) {
   const clauses = [];
   const params = [];
   if (!includeInactive) clauses.push('e.efr_status = 1');
+  else clauses.push('NOT (e.efr_status <=> 3)'); // never surface tombstoned (deleted) easyfixers — NULL-safe (keeps NULL-status leads)
   if (q) {
     clauses.push('(e.efr_name LIKE ? OR e.efr_no LIKE ? OR e.efr_email LIKE ?)');
     const like = `%${q}%`;

@@ -63,6 +63,17 @@ router.get('/banks',              validate(banksQuery, 'query'),           async
   try { modernOk(res, await lookup.banks(req.query)); } catch (e) { next(e); }
 });
 
+// Active tools master (tbl_tools) — the technician app's "Your Tools" picker
+// selects from this list. Reuses the Manage-Tools service (admin owns writes);
+// this is a read-only lookup, mounted under /shared so the mobile JWT is accepted.
+router.get('/tools', async (req, res, next) => {
+  try {
+    const toolService = require('../../services/tool.service');
+    const { items } = await toolService.listTools({ q: req.query.q, includeInactive: false, limit: 1000 });
+    modernOk(res, items.map((t) => ({ id: t.tool_id, name: t.tool_name, img: t.tool_img || null })));
+  } catch (e) { next(e); }
+});
+
 router.get('/document-types',     validate(simpleIncludeInactive, 'query'), async (req, res, next) => {
   try { modernOk(res, await lookup.documentTypes(req.query)); } catch (e) { next(e); }
 });

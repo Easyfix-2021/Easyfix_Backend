@@ -13,7 +13,7 @@ async function loadAdvanceForScope(advanceId) {
        FROM tbl_efr_advance_payment a
        LEFT JOIN tbl_client    cl ON cl.client_id = a.client_id
        LEFT JOIN tbl_easyfixer e  ON e.efr_id     = a.efr_id
-      WHERE a.advance_id = ? LIMIT 1`,
+      WHERE a.advance_id = ? AND NOT (e.efr_status <=> 3) LIMIT 1`,
     [advanceId]
   );
   return row || null;
@@ -148,7 +148,7 @@ router.post('/', validate(Joi.object({
     }
     // RBAC: caller's scope must cover the client + the efr's city.
     const [[efr]] = await pool.query(
-      'SELECT efr_cityId FROM tbl_easyfixer WHERE efr_id = ?',
+      'SELECT efr_cityId FROM tbl_easyfixer WHERE efr_id = ? AND NOT (efr_status <=> 3)',
       [b.efrId]
     );
     const guard = assertEntityInScope(req, {
