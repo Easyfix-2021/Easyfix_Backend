@@ -1,6 +1,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
-const { generateOtp, otpExpiryDate } = require('../utils/otp');
+const { resolveMobileOtp, otpExpiryDate } = require('../utils/otp');
 
 /*
  * Action-OTP service — sends a one-time code to the CURRENTLY logged-in
@@ -12,7 +12,9 @@ const { generateOtp, otpExpiryDate } = require('../utils/otp');
  *     (same as services/auth.service.js createLoginOtp/verifyLoginOtp), but
  *     with a DISTINCT otp_type so an action code never collides with the
  *     admin's own login OTP row.
- *   - utils/otp.js generateOtp() + otpExpiryDate() (5-min TTL).
+ *   - utils/otp.js resolveMobileOtp() (prod = random generateOtp(); QA with
+ *     QA_DETERMINISTIC_OTP=true = last 4 digits of the admin's mobile) +
+ *     otpExpiryDate() (5-min TTL).
  *   - services/otp-delivery.service.js deliverOtp() — the generic channel
  *     dispatcher (mobile → WhatsApp then SMS fallback; email → Email then
  *     WhatsApp). No new delivery code.
@@ -47,7 +49,10 @@ async function sendActionOtp(admin, action) {
     throw e;
   }
 
-  const otp = generateOtp();
+  // Prod → random; QA (QA_DETERMINISTIC_OTP=true) → last 4 digits of the
+  // admin's registered mobile. Email-only admins (no mobile) fall back to
+  // random even on QA — read that from the dev log below.
+  const otp = resolveMobileOtp(mobile);
   const now = new Date();
   const expires = otpExpiryDate(now);
 

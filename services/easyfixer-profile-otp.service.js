@@ -12,7 +12,7 @@
 
 'use strict';
 
-const { generateOtp, otpExpiryDate } = require('../utils/otp');
+const { resolveMobileOtp, otpExpiryDate } = require('../utils/otp');
 const gallabox = require('./gallabox.whatsapp.service');
 const logger = require('../logger');
 
@@ -49,7 +49,9 @@ async function sendOtp(efrId, pool) {
   }
 
   // 2. Generate OTP + expiry (5 min window).
-  const otp = generateOtp();
+  //    Prod → random; QA (QA_DETERMINISTIC_OTP=true) → last 4 digits of the
+  //    easyfixer's mobile, so QA can complete the flow without WhatsApp/DB.
+  const otp = resolveMobileOtp(mobile);
   const validUpTo = otpExpiryDate();
 
   // 3. Persist directly on tbl_easyfixer — overwrites any prior pending OTP.
