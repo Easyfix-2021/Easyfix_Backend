@@ -5,12 +5,29 @@ const { role } = require('../../middleware/role');
 const validate = require('../../middleware/validate');
 const lookup = require('../../services/lookup.service');
 const { modernOk } = require('../../utils/response');
+const { cached } = require('../../utils/ttl-cache');
 const { pool } = require('../../db');
 const { buildRequestScopeWithHierarchy } = require('../../lib/scope');
 const {
   citiesQuery, serviceTypesQuery, clientsQuery, clientServicesQuery,
   usersQuery, banksQuery, simpleIncludeInactive, projectManagersQuery,
 } = require('../../validators/lookup.validator');
+
+/*
+ * Short-TTL in-memory cache for NON-personalized master lists (see
+ * utils/ttl-cache.js). Wrapped here are ONLY truly identical-for-everyone
+ * reads — static masters (5 min) and the no-arg variants of the two
+ * free-text lookups (banks, tools). Cache keys encode EVERY query arg that
+ * varies the result so different queries can't collide.
+ *
+ * NOTHING role-scoped / req.scope-filtered / per-user is cached: cities
+ * (unbounded free-text q), clients (req.scope), client-services, users,
+ * zonal-managers, project-managers, roles, menu-actions, easyfixers, menus
+ * (varies by userEmail), and menu-visibility all bypass the cache and run
+ * per-request. Free-text search variants of banks/tools (q present) also
+ * bypass to bound key cardinality.
+ */
+const TTL_STATIC = 300000; // 5 min — static master lists
 
 /*
  * All routes under /api/shared/lookup require a valid JWT.
@@ -28,55 +45,67 @@ router.get('/cities',             validate(citiesQuery, 'query'),          async
 });
 
 router.get('/states',             async (_req, res, next) => {
-  try { modernOk(res, await lookup.states()); } catch (e) { next(e); }
+  try { modernOk(res, await cached('lookup:states', TTL_STATIC, () => lookup.states())); } catch (e) { next(e); }
 });
 
 // Verticals — drives the Manage Users Verticals picker for RBAC scope.
 router.get('/verticals',          async (_req, res, next) => {
-  try { modernOk(res, await lookup.verticals()); } catch (e) { next(e); }
+  try { modernOk(res, await cached('lookup:verticals', TTL_STATIC, () => lookup.verticals())); } catch (e) { next(e); }
 });
 
 // Zones — drives the Manage Jobs "Zonal" filter dropdown. Lives here
 // (not under /admin) because the Manage Jobs page calls /shared/lookup/*
 // for all its filter options and consistency is cheap.
 router.get('/zones',              async (_req, res, next) => {
-  try { modernOk(res, await lookup.zones()); } catch (e) { next(e); }
+  try { modernOk(res, await cached('lookup:zones', TTL_STATIC, () => lookup.zones())); } catch (e) { next(e); }
 });
 
 router.get('/service-categories', validate(simpleIncludeInactive, 'query'), async (req, res, next) => {
-  try { modernOk(res, await lookup.serviceCategories(req.query)); } catch (e) { next(e); }
+  try {
+    const inc = req.query.includeInactive ? 1 : 0;
+    modernOk(res, await cached(`lookup:service-categories:inc=${inc}`, TTL_STATIC, () => lookup.serviceCategories(req.query)));
+  } catch (e) { next(e); }
 });
 
 router.get('/service-types',      validate(serviceTypesQuery, 'query'),    async (req, res, next) => {
-  try { modernOk(res, await lookup.serviceTypes(req.query)); } catch (e) { next(e); }
+  try {
+    const inc = req.query.includeInactive ? 1 : 0;
+    const cat = req.query.categoryId != null ? req.query.categoryId : '';
+    modernOk(res, await cached(`lookup:service-types:cat=${cat}:inc=${inc}`, TTL_STATIC, () => lookup.serviceTypes(req.query)));
+  } catch (e) { next(e); }
 });
 
 router.get('/cancel-reasons',     async (_req, res, next) => {
-  try { modernOk(res, await lookup.cancelReasons()); } catch (e) { next(e); }
+  try { modernOk(res, await cached('lookup:cancel-reasons', TTL_STATIC, () => lookup.cancelReasons())); } catch (e) { next(e); }
 });
 
 router.get('/reschedule-reasons', async (_req, res, next) => {
-  try { modernOk(res, await lookup.rescheduleReasons()); } catch (e) { next(e); }
+  try { modernOk(res, await cached('lookup:reschedule-reasons', TTL_STATIC, () => lookup.rescheduleReasons())); } catch (e) { next(e); }
 });
 
 router.get('/reject-reasons',     async (_req, res, next) => {
-  try { modernOk(res, await lookup.rejectReasons()); } catch (e) { next(e); }
+  try { modernOk(res, await cached('lookup:reject-reasons', TTL_STATIC, () => lookup.rejectReasons())); } catch (e) { next(e); }
 });
 
 router.get('/problem-reasons',    async (_req, res, next) => {
-  try { modernOk(res, await lookup.problemReasons()); } catch (e) { next(e); }
+  try { modernOk(res, await cached('lookup:problem-reasons', TTL_STATIC, () => lookup.problemReasons())); } catch (e) { next(e); }
 });
 
 router.get('/collect-cash-reasons', async (_req, res, next) => {
-  try { modernOk(res, await lookup.collectCashReasons()); } catch (e) { next(e); }
+  try { modernOk(res, await cached('lookup:collect-cash-reasons', TTL_STATIC, () => lookup.collectCashReasons())); } catch (e) { next(e); }
 });
 
 router.get('/revisit-reasons',    async (_req, res, next) => {
-  try { modernOk(res, await lookup.revisitReasons()); } catch (e) { next(e); }
+  try { modernOk(res, await cached('lookup:revisit-reasons', TTL_STATIC, () => lookup.revisitReasons())); } catch (e) { next(e); }
 });
 
 router.get('/banks',              validate(banksQuery, 'query'),           async (req, res, next) => {
-  try { modernOk(res, await lookup.banks(req.query)); } catch (e) { next(e); }
+  try {
+    // Cache ONLY the full list (no q). Free-text search has unbounded key
+    // cardinality, so it bypasses the cache to keep memory bounded.
+    if (req.query.q) { modernOk(res, await lookup.banks(req.query)); return; }
+    modernOk(res, await cached('lookup:banks', TTL_STATIC, () => lookup.banks(req.query)));
+  } catch (e) { next(e); }
 });
 
 // Active tools master (tbl_tools) — the technician app's "Your Tools" picker
@@ -85,13 +114,22 @@ router.get('/banks',              validate(banksQuery, 'query'),           async
 router.get('/tools', async (req, res, next) => {
   try {
     const toolService = require('../../services/tool.service');
-    const { items } = await toolService.listTools({ q: req.query.q, includeInactive: false, limit: 1000 });
-    modernOk(res, items.map((t) => ({ id: t.tool_id, name: t.tool_name, img: t.tool_img || null })));
+    const fetchTools = async () => {
+      const { items } = await toolService.listTools({ q: req.query.q, includeInactive: false, limit: 1000 });
+      return items.map((t) => ({ id: t.tool_id, name: t.tool_name, img: t.tool_img || null }));
+    };
+    // Cache ONLY the full active list (no q). Free-text search bypasses the
+    // cache (unbounded key cardinality).
+    if (req.query.q) { modernOk(res, await fetchTools()); return; }
+    modernOk(res, await cached('lookup:tools', TTL_STATIC, fetchTools));
   } catch (e) { next(e); }
 });
 
 router.get('/document-types',     validate(simpleIncludeInactive, 'query'), async (req, res, next) => {
-  try { modernOk(res, await lookup.documentTypes(req.query)); } catch (e) { next(e); }
+  try {
+    const inc = req.query.includeInactive ? 1 : 0;
+    modernOk(res, await cached(`lookup:document-types:inc=${inc}`, TTL_STATIC, () => lookup.documentTypes(req.query)));
+  } catch (e) { next(e); }
 });
 
 // ─── Admin-only ─────────────────────────────────────────────────────

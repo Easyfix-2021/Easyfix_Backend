@@ -74,6 +74,11 @@ async function getDashboard(efrId, opts = {}) {
     MAX_NOTICES_LIMIT,
   );
 
+  // Resolve the IST day once so the "Today's Jobs" SQL range and the
+  // defensive same-day slice below read a single consistent day even if
+  // the request straddles midnight.
+  const today = todayRange();
+
   // Parallelise everything that doesn't depend on previous results.
   // 8-query fan-out + one cross-pool wait — sub-50ms on the dev DB.
   const [
@@ -93,7 +98,22 @@ async function getDashboard(efrId, opts = {}) {
     }),
     fetchIdentity(efrId),
     jobService.list({ easyfixerId: efrId, status: 0, limit: NEW_REQUEST_LIMIT }).catch(() => ({ rows: [], total: 0 })),
-    jobService.list({ easyfixerId: efrId, statuses: '1,2,20', limit: ACTIVE_LIMIT }).catch(() => ({ rows: [], total: 0 })),
+    // "Today's Jobs" preview — constrain to jobs whose REQUESTED
+    // (appointment) date is today so the home-screen section doesn't
+    // preview overdue/carried-over jobs (those are summarised by the
+    // `delayed` count). `list()` supports a date range via
+    // dateType:'requested' + startDate/endDate; we bound it to the IST
+    // day so it agrees with the activeToday count (CURDATE()) under the
+    // platform's "display IST" convention. The defensive same-day slice
+    // below is a belt-and-braces guard on the already-constrained rows.
+    jobService.list({
+      easyfixerId: efrId,
+      statuses: '1,2,20',
+      dateType: 'requested',
+      startDate: today.start,
+      endDate: today.end,
+      limit: ACTIVE_LIMIT,
+    }).catch(() => ({ rows: [], total: 0 })),
     fetchAttendance(efrId),
     performanceService.getForTech(efrId),
     noticeService.listActiveForSurface({
@@ -123,6 +143,11 @@ async function getDashboard(efrId, opts = {}) {
     counts: {
       newRequests:    Number(counts.byStatus?.['0'] ?? 0),
       activeJobs:     dateCounts.activeToday,
+      // `delayed` — same active statuses but appointment date is BEFORE
+      // today (overdue/carried-over). Split out of `activeJobs` so the
+      // home screen can badge "Today's Jobs" without inflating it with
+      // jobs the tech was supposed to finish on a prior day.
+      delayed:        dateCounts.delayed,
       overdue:        dateCounts.overdue,
       upcoming:       dateCounts.upcoming,
       // `send_back_to_tx` column confirmed present on tbl_job (live-DB
@@ -132,7 +157,14 @@ async function getDashboard(efrId, opts = {}) {
       actionRequired: dateCounts.actionRequired,
     },
     newRequests: (newRequestsList.rows || []).map(mapJobForMobile),
-    activeJobs:  (activeJobsList.rows  || []).map(mapJobForMobile),
+    // Defensive same-IST-day filter on top of the SQL date range, then
+    // slice to the preview size — guards against rows whose
+    // requested_date_time falls outside the intended day (e.g. NULL or
+    // a boundary edge) so "Today's Jobs" only ever previews today.
+    activeJobs:  (activeJobsList.rows  || [])
+      .filter(isRequestedToday)
+      .slice(0, ACTIVE_LIMIT)
+      .map(mapJobForMobile),
     performance,
     notices: {
       // `items` — the top-N active notices for THIS technician
@@ -153,6 +185,27 @@ async function getDashboard(efrId, opts = {}) {
 }
 
 // ─── Identity row ────────────────────────────────────────────────────
+/*
+ * Returns ONE technician identity row as a plain object (or {} when the
+ * efr_id is unknown / the query fails). Exported + reused by the
+ * profile-details service. Result schema (snake_case, straight from the
+ * SELECT — `efr_profile_img` absent when the column doesn't exist on the
+ * DB, see the fallback branch):
+ *
+ *   {
+ *     efr_id:               number,
+ *     efr_name:             string | null,
+ *     efr_first_name:       string | null,
+ *     efr_no:               string | null,   // mobile
+ *     efr_profile_img?:     string | null,   // omitted on legacy DBs
+ *     efr_cityId:           number | null,
+ *     city_name:            string | null,   // joined from tbl_city
+ *     current_balance:      number | null,   // wallet balance
+ *     efr_service_category: string | null,   // CSV/pipe-delimited
+ *   }
+ *
+ * Always resolves (never rejects) — callers can read fields defensively.
+ */
 async function fetchIdentity(efrId) {
   // First try with `efr_profile_img` — the column might not exist on
   // this DB (see backend-changes.md Q1). On "Unknown column" error,
@@ -251,6 +304,40 @@ function attendanceStatus(row) {
   return row.morning_slot ? 'present' : 'absent';
 }
 
+// ─── IST "today" helpers ─────────────────────────────────────────────
+/*
+ * The platform stores DATETIME and displays IST (see CLAUDE.md coding
+ * rule 7 + job-location.service.js). "Today" for the technician's home
+ * screen is therefore the IST calendar day, derived with the same
+ * `Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' })` idiom
+ * candidate-ranking.service.js uses — robust regardless of the Node
+ * process timezone.
+ */
+function istTodayString() {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date());
+}
+
+// Inclusive datetime bounds for the IST day, in the literal string form
+// jobService.list() compares against requested_date_time (>= start,
+// <= end). Returned fresh each call so a request that straddles
+// midnight still reads a single consistent day.
+function todayRange() {
+  const d = istTodayString();
+  return { start: `${d} 00:00:00`, end: `${d} 23:59:59` };
+}
+
+// Defensive guard for the preview slice: true when the row's
+// requested_date_time falls on the IST "today" date. Compares date
+// strings (YYYY-MM-DD) so it stays correct irrespective of the value's
+// time portion or the server timezone.
+function isRequestedToday(j) {
+  if (!j || j.requested_date_time == null) return false;
+  const today = istTodayString();
+  const rowDay = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' })
+    .format(new Date(j.requested_date_time));
+  return rowDay === today;
+}
+
 // ─── Date-sliced counts ──────────────────────────────────────────────
 /*
  * Four counts that go BEYOND what getStatusCounts() returns —
@@ -260,9 +347,19 @@ function attendanceStatus(row) {
  * `fk_easyfixter_id = ?` filter.
  *
  *   activeToday    — IN_PROGRESS / SCHEDULED / IN_PROGRESS_ALT jobs
- *                    whose appointment is today or earlier
+ *                    whose appointment is TODAY (requested date =
+ *                    CURDATE()). Earlier the `<= CURDATE()` window
+ *                    wrongly folded overdue (before-today) jobs into
+ *                    this "today" count; those now surface in `delayed`.
  *                    (excludes sent-back jobs — those surface in
  *                    `actionRequired` instead).
+ *   delayed        — same statuses, requested date is BEFORE today
+ *                    (DATE(requested_date_time) < CURDATE()) — i.e.
+ *                    overdue/carried-over jobs the tech still owns.
+ *                    Distinct from `overdue` below, which is a
+ *                    finer-grained "appointment instant already passed"
+ *                    (NOW()) signal that can include today's earlier
+ *                    slots.
  *   overdue        — same statuses, requested_date_time already
  *                    passed.
  *   upcoming       — same statuses, requested_date_time in the future.
@@ -276,7 +373,9 @@ async function fetchDateCounts(efrId) {
     const [[row]] = await pool.query(
       `SELECT
          SUM(job_status IN (1,2,20) AND (send_back_to_tx = 0 OR send_back_to_tx IS NULL)
-             AND DATE(requested_date_time) <= CURDATE())            AS activeToday,
+             AND DATE(requested_date_time) = CURDATE())             AS activeToday,
+         SUM(job_status IN (1,2,20) AND (send_back_to_tx = 0 OR send_back_to_tx IS NULL)
+             AND DATE(requested_date_time) < CURDATE())             AS delayed,
          SUM(job_status IN (1,2,20) AND (send_back_to_tx = 0 OR send_back_to_tx IS NULL)
              AND requested_date_time < NOW())                       AS overdue,
          SUM(job_status IN (1,2,20)
@@ -288,13 +387,14 @@ async function fetchDateCounts(efrId) {
     );
     return {
       activeToday:    Number(row?.activeToday ?? 0),
+      delayed:        Number(row?.delayed ?? 0),
       overdue:        Number(row?.overdue ?? 0),
       upcoming:       Number(row?.upcoming ?? 0),
       actionRequired: Number(row?.actionRequired ?? 0),
     };
   } catch (e) {
     logger.warn({ err: e.message, efrId }, 'fetchDateCounts failed; returning zeros');
-    return { activeToday: 0, overdue: 0, upcoming: 0, actionRequired: 0 };
+    return { activeToday: 0, delayed: 0, overdue: 0, upcoming: 0, actionRequired: 0 };
   }
 }
 
@@ -324,4 +424,8 @@ function mapJobForMobile(j) {
   };
 }
 
-module.exports = { getDashboard };
+// `fetchIdentity` is exported so the profile-details service can reuse
+// the exact same identity row + defensive efr_profile_img fallback
+// WITHOUT duplicating the SQL. Behaviour is unchanged for getDashboard's
+// internal use.
+module.exports = { getDashboard, fetchIdentity };

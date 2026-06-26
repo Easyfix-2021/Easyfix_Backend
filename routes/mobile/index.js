@@ -505,6 +505,22 @@ router.get('/profile', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// Composed profile view for the app's profile screen — identity + rating +
+// grade + completedJobs, assembled by the orchestrator from the SAME shared
+// services that power the dashboard (NO duplicated SQL). The legacy GET /profile
+// above returns the raw tbl_easyfixer row; the app's ApiProfileService.
+// getProfileDetails wants this enriched shape, so it GETs /profile/details.
+const mobileProfileDetailsService = require('../../services/mobile-profile-details.service');
+router.get('/profile/details', async (req, res, next) => {
+  try {
+    const result = await mobileProfileDetailsService.getProfileDetails(req.tech.efr_id);
+    modernOk(res, result);
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
 router.get('/profile/percentage', async (req, res, next) => {
   try {
     const [[p]] = await pool.query(
