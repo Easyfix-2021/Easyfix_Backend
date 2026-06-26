@@ -968,8 +968,8 @@ async function list({
   if (startDate)           { clauses.push(`${dateCol} >= ?`); params.push(startDate); }
   if (endDate)             { clauses.push(`${dateCol} <= ?`); params.push(endDate); }
   if (q) {
-    clauses.push('(j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ?)');
-    params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
+    clauses.push('(j.job_id LIKE ? OR j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ?)');
+    params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
   }
 
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';

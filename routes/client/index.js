@@ -1557,6 +1557,82 @@ router.patch('/jobs/:id/reject', validate(Joi.object({ reason: Joi.string().min(
   } catch (e) { next(e); }
 });
 
+// Upload a booking image / video for a job (SPOC). Reuses the SAME storage
+// (s3Storage → local writeBuffer fallback) + tbl_job_image insert as
+// POST /admin/jobs/:id/images — image_category 'booking', stage 0. The admin
+// surface is image-only; SPOC bookings additionally allow short videos.
+const jobImgMulter = require('multer');
+const { writeBuffer: writeJobMedia } = require('../../utils/file-storage');
+const s3JobStorage = require('../../utils/s3-storage');
+const jobMediaUpload = jobImgMulter({ storage: jobImgMulter.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024, files: 1 } });
+
+router.post('/jobs/:id/images', jobMediaUpload.single('file'), async (req, res, next) => {
+  const jobId = Number(req.params.id);
+  try {
+    const job = await jobService.getById(jobId);
+    if (!job || job.fk_client_id !== req.spoc.client_id) return modernError(res, 404, 'job not found');
+    if (!req.file) return modernError(res, 400, 'missing "file" upload');
+
+    const [[{ existing }]] = await pool.query(
+      'SELECT COUNT(*) AS existing FROM tbl_job_image WHERE job_id = ?', [jobId]);
+    const seq = Number(existing || 0) + 1;
+
+    let imageValue;
+    if (s3JobStorage.isEnabled && s3JobStorage.isEnabled()) {
+      try {
+        imageValue = await s3JobStorage.putJobImage({
+          jobId, seq, buffer: req.file.buffer,
+          contentType: req.file.mimetype, originalName: req.file.originalname,
+          category: 'Booking',
+        });
+      } catch {
+        imageValue = writeJobMedia('job_files', req.file.buffer, req.file.originalname, req.file.mimetype).filename;
+      }
+    } else {
+      imageValue = writeJobMedia('job_files', req.file.buffer, req.file.originalname, req.file.mimetype).filename;
+    }
+
+    const [ins] = await pool.query(
+      `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, status, created_by, created_date)
+       VALUES (?, ?, 'booking', 0, 1, ?, NOW())`,
+      [jobId, imageValue, req.spoc.id]);
+
+    modernOk(res, { image_id: ins.insertId, job_id: jobId, image: imageValue }, 'image uploaded');
+  } catch (e) {
+    if (e?.code === 'LIMIT_FILE_SIZE') return modernError(res, 400, 'file exceeds 25MB');
+    next(e);
+  }
+});
+
+// Cancel an order (SPOC). Reuses jobService.setStatus → status 6 (CANCELLED),
+// which already stamps cancel_date_time / cancel_reason_id / cancel_comment /
+// cancel_by. Guarded against terminal states so completed/cancelled/enquiry
+// orders can't be flipped.
+router.post('/jobs/:id/cancel',
+  validate(Joi.object({
+    reasonId: Joi.number().integer().positive().optional(),
+    comment: Joi.string().max(2000).allow('', null).optional(),
+  })),
+  async (req, res, next) => {
+    try {
+      const jobId = Number(req.params.id);
+      const job = await jobService.getById(jobId);
+      if (!job || job.fk_client_id !== req.spoc.client_id) return modernError(res, 404, 'job not found');
+      if ([3, 5, 6, 7].includes(Number(job.job_status))) {
+        return modernError(res, 400, 'This order can no longer be cancelled.');
+      }
+      await jobService.setStatus(
+        jobId,
+        { status: 6, reasonId: req.body.reasonId || null, comment: req.body.comment || null },
+        { user_id: req.spoc.id },
+      );
+      modernOk(res, await jobService.getById(jobId), 'cancelled');
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  });
+
 // Estimate approve/reject — legacy stored in approve_job_doc workflow.
 // Refuse approval on terminal states (cancelled / completed) and on
 // estimates already responded to. Mirrors legacy idempotency guards.

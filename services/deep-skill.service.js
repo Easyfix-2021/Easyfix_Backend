@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const { resolveDeepSkillImageUrl } = require('../utils/s3-storage');
 
 /*
  * Deep-skill catalogue management.
@@ -41,6 +42,12 @@ async function list({ categoryId, serviceTypeId, includeInactive = false } = {})
       ${where}
       ORDER BY ds.deepskill_name ASC
   `, params);
+  // Resolve the bare filename in deepskill_image to a renderable URL
+  // (S3 presigned if present, else /easydoc/upload_jobs/ disk URL). Raw
+  // value is preserved so the legacy CRM contract is unaffected.
+  await Promise.all(rows.map(async (r) => {
+    r.deepskill_image_url = await resolveDeepSkillImageUrl(r.deepskill_image);
+  }));
   return rows;
 }
 
@@ -57,6 +64,7 @@ async function getById(deepskillId) {
     'SELECT id, skill_option, status FROM tbl_deepskill_options WHERE deepskill_id = ? ORDER BY id',
     [deepskillId]
   );
+  row.deepskill_image_url = await resolveDeepSkillImageUrl(row.deepskill_image);
   return { ...row, options };
 }
 

@@ -8,6 +8,12 @@ uploads/
 *.log
 npm-debug.log*
 
+# Deep-skill image bulk-upload working data (large binaries — not code).
+# Source images extracted from the OneDrive zip + the renamed copies the
+# upload script produces. Generated locally, pushed to S3/server directly.
+deepskill-images/
+deepskill-renamed/
+
 .DS_Store
 .vscode/
 .idea/
