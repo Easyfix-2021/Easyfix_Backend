@@ -960,18 +960,37 @@ async function resolveImageUrlFromKey(key) {
   // Legacy rows may store an absolute URL — pass it through unchanged.
   if (/^https?:\/\//i.test(trimmed)) return trimmed;
   if (!s3Storage.isEnabled()) return null;
-  // Presign WHATEVER key the DB holds — the canonical `Skills/Skill_<id>_<seq>`
-  // OR a legacy bare filename (e.g. `1002_hydraulic-office-gaming-chair.png`).
-  // The `Skills/` prefix is a WRITE-path convention, not a read boundary: the
-  // value is trusted (DB column, not user input) and presign is a read-only GET,
-  // so the prefix check only blocked legacy rows from rendering. A missing object
-  // yields a URL that 404s (blank image) — no worse than returning null — while
-  // legacy images that DO exist under their stored name now resolve. New uploads
-  // still standardise on `Skills/` (the writers are unchanged).
+
+  // Canonical key we wrote ourselves (`Skills/Skill_<id>_<seq>`) → presign
+  // directly; the object is assumed present (we put it there) so we skip the
+  // existence probe to keep this hot path fast.
+  if (trimmed.startsWith('Skills/')) {
+    try {
+      return await s3Storage.getPresignedUrl(trimmed);
+    } catch (e) {
+      logger.warn({ err: e, key: trimmed }, 'deep-skill: presign failed for canonical key');
+      return null;
+    }
+  }
+
+  // Legacy / non-canonical key (e.g. `1002_hydraulic-office-gaming-chair.png`).
+  // The `Skills/` prefix is a WRITE convention, not a read boundary, so we DO
+  // resolve legacy-named images — but since we didn't write them, VERIFY the
+  // object exists before handing out a URL. Otherwise the app renders a broken
+  // (blank-grey) thumbnail for a key that 404s. The HEAD probe also gives a
+  // precise, actionable log line that distinguishes "missing object" (access
+  // issue) from "blank name" (the empty-string check above already returns null).
   try {
-    return await s3Storage.getPresignedUrl(trimmed);
+    if (await s3Storage.exists(trimmed)) {
+      return await s3Storage.getPresignedUrl(trimmed);
+    }
+    logger.warn(
+      { key: trimmed },
+      'deep-skill: legacy image key has no S3 object — not in bucket (run scripts/upload-deepskill-images.js to migrate, or re-key the row)',
+    );
+    return null;
   } catch (e) {
-    logger.warn({ err: e, key: trimmed }, 'deep-skill: resolveImageUrlFromKey presign failed');
+    logger.warn({ err: e && e.message, key: trimmed }, 'deep-skill: legacy image existence probe failed');
     return null;
   }
 }
