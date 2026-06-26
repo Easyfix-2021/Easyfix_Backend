@@ -635,45 +635,6 @@ async function deleteObject(key) {
   }
 }
 
-/* ─── Deep-skill catalogue images (2026-06-25) ─────────────────────────────
- *
- * Deep-skill images use the SAME bare-filename contract the legacy Java CRM
- * relies on, so a single `tbl_deep_skill.deepskill_image` value works for BOTH
- * consumers:
- *
- *   - Dashboard API (API_AngularClientDashboard) builds the deep-skill URL as
- *       <host>/easydoc/easyfixer_documents/<filename>  off disk
- *       (EASYFIXER_FILE_BASE_PATH=/easydoc/easyfixer_documents).
- *   - New backend : this resolver presigns  s3://<bucket>/DeepSkills/<filename>
- *                   when the object exists, else falls back to the same
- *                   /easydoc/easyfixer_documents/<filename> disk URL.
- *
- * So `deepskill_image` is stored as a bare filename (e.g. "1002_metal-chair.png"),
- * the file is copied to the server disk AND uploaded to S3 under DeepSkills/,
- * and whichever consumer reads it can render it.
- */
-async function resolveDeepSkillImageUrl(storedValue) {
-  const stored = String(storedValue || '').trim();
-  if (!stored) return null;
-  if (/^https?:\/\//i.test(stored)) return stored;            // already a URL
-
-  const fileBase = process.env.FILE_BASE_URL || '/easydoc';
-  const diskUrl = stored.includes('/')
-    ? `${fileBase}/${stored.replace(/^\/+/, '')}`             // already a relative path
-    : `${fileBase}/easyfixer_documents/${stored}`;            // bare filename → dashboard layout
-
-  if (!isEnabled()) return diskUrl;
-
-  const key = stored.startsWith('DeepSkills/') ? stored : `DeepSkills/${path.basename(stored)}`;
-  try {
-    if (await exists(key)) return await getPresignedUrl(key);
-  } catch (e) {
-    // eslint-disable-next-line no-console
-    console.warn('s3-storage.resolveDeepSkillImageUrl: S3 lookup failed, falling back to disk', { key, err: e?.message });
-  }
-  return diskUrl;
-}
-
 module.exports = {
   isEnabled,
   bucketName,
@@ -691,8 +652,6 @@ module.exports = {
   // Client Documents (2026-05-25):
   putClientDocument,
   resolveClientDocumentUrl,
-  // Deep-skill images (2026-06-25):
-  resolveDeepSkillImageUrl,
   // Deep Skill images (2026-06-05) — `Skills/Skill_<id>_<seq>`:
   keyForSkill,
   putSkillImage,

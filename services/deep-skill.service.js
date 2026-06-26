@@ -1,6 +1,5 @@
 const ExcelJS = require('exceljs');
 const { pool } = require('../db');
-const { resolveDeepSkillImageUrl } = require('../utils/s3-storage');
 const logger   = require('../logger');
 const s3Storage = require('../utils/s3-storage');
 
@@ -204,21 +203,11 @@ async function list({ categoryId, serviceTypeId, includeInactive = false } = {})
   `, params);
   // Fan out presigner calls for non-empty image keys. Promise.all keeps
   // latency O(1) for the typical batch size (<=500 skills per category).
-  // MERGE NOTE (MobileApp ∪ ClientDashboard): deep-skill image URL was
-  // implemented on both branches with different field names/resolvers.
-  // We populate BOTH so neither consumer breaks — `deep_skill_image_url`
-  // (MobileApp, via the canonical resolveImageUrlFromKey) and
-  // `deepskill_image_url` (ClientDashboard, via resolveDeepSkillImageUrl).
-  // TODO: consolidate onto resolveImageUrlFromKey + one field name.
-  const [urls, urlsAlt] = await Promise.all([
-    Promise.all(rows.map((r) => resolveImageUrlFromKey(r.deepskill_image))),
-    Promise.all(rows.map((r) => resolveDeepSkillImageUrl(r.deepskill_image))),
-  ]);
-  return rows.map((r, i) => ({
-    ...r,
-    deep_skill_image_url: urls[i],
-    deepskill_image_url: urlsAlt[i],
-  }));
+  // Canonical resolver: resolveImageUrlFromKey (Skills/ prefix) -> deep_skill_image_url.
+  const urls = await Promise.all(
+    rows.map((r) => resolveImageUrlFromKey(r.deepskill_image)),
+  );
+  return rows.map((r, i) => ({ ...r, deep_skill_image_url: urls[i] }));
 }
 
 async function getById(deepskillId) {
@@ -249,14 +238,7 @@ async function getById(deepskillId) {
     'SELECT id, skill_option, status FROM tbl_deepskill_options WHERE deepskill_id = ? ORDER BY id',
     [deepskillId]
   );
-  // Both field names (see list() merge note): deep_skill_image_url
-  // (MobileApp) + deepskill_image_url (ClientDashboard).
-  const [ourUrl, theirUrl] = await Promise.all([
-    resolveImageUrlFromKey(row.deepskill_image),
-    resolveDeepSkillImageUrl(row.deepskill_image),
-  ]);
-  row.deep_skill_image_url = ourUrl;
-  row.deepskill_image_url = theirUrl;
+  row.deep_skill_image_url = await resolveImageUrlFromKey(row.deepskill_image);
   return { ...row, options };
 }
 
