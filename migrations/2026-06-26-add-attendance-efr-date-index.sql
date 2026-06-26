@@ -1,0 +1,25 @@
+-- 2026-06-26 — composite index on tbl_easyfixer_attendance(easyfixer_id, created_on).
+--
+-- PROPOSAL ONLY — DO NOT auto-apply. `tbl_easyfixer_attendance` is a
+-- LEGACY shared table (the ACD_APIs / Dropwizard attendance flow writes
+-- to it too). A DBA must review the live table's existing indexes and
+-- write volume before applying. Keep this file in migrations/ (pending)
+-- — do NOT move it to migrations/executed/ until a DBA has reviewed and
+-- run it against the live DB.
+--
+-- WHY:
+--   Two hot reads filter on (easyfixer_id, created_on):
+--     - mobile-dashboard.service.fetchAttendance():
+--         WHERE easyfixer_id = ? AND created_on = CURDATE()   (today's row)
+--     - mobile-attendance.service.getAttendance() range reads + the
+--         upsert match (easyfixer_id = ? AND created_on = ?).
+--   `created_on` is a DATE column (the attendance "day" key), so a
+--   composite (easyfixer_id, created_on) BTREE lets both the equality
+--   and the day-range queries do an index seek instead of scanning the
+--   technician's whole attendance history.
+--
+-- NOTE: plain CREATE INDEX (no MariaDB-only IF NOT EXISTS). The DBA
+-- should confirm an equivalent index does not already exist before
+-- running, e.g.:
+--   SHOW INDEX FROM tbl_easyfixer_attendance WHERE Column_name = 'easyfixer_id';
+CREATE INDEX idx_efr_attendance_efr_date ON tbl_easyfixer_attendance (easyfixer_id, created_on);

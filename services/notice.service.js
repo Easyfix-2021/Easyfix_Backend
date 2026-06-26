@@ -547,6 +547,72 @@ async function archiveNotice(noticeId) {
   return getNoticeById(noticeId);
 }
 
+// ─── Scheduled → published flip + push (cron) ───────────────────────
+/*
+ * Promote every 'scheduled' notice whose publish_at has arrived to
+ * 'published', and fire the technician push for each real transition.
+ *
+ * Read-time effectiveStatus() already SHOWS scheduled-now-eligible
+ * notices in every feed (see top-of-file note), but it never PERSISTS
+ * the flip nor fires a push — so a notice scheduled for the future was
+ * silently visible without ever notifying technicians. This cron closes
+ * that gap: it's the only place that durably writes scheduled→published
+ * and the only place that pushes a *scheduled* notice at its publish_at.
+ *
+ * Atomicity: the UPDATE carries `AND status = 'scheduled'` so it acts as
+ * a transition guard — exactly one tick can win the flip; a later tick
+ * (or a concurrent publishNotice) sees affectedRows=0 and skips the push.
+ * That guard is what makes the push fire-exactly-once per transition.
+ *
+ * Per-row work is wrapped in try/catch so one bad row never aborts the
+ * batch. Returns { checked, published, pushed }.
+ */
+async function publishDueScheduled() {
+  const [due] = await pool.query(
+    `SELECT notice_id, created_by, published_by, target_surfaces
+       FROM tbl_notice
+      WHERE status = 'scheduled'
+        AND publish_at IS NOT NULL
+        AND publish_at <= NOW()`,
+  );
+
+  const summary = { checked: due.length, published: 0, pushed: 0 };
+
+  for (const n of due) {
+    try {
+      // Atomic guard: only the tick that flips status='scheduled' → 'published'
+      // gets affectedRows=1. published_by is COALESCE'd to created_by so a
+      // scheduled notice (no human publisher) still records an author.
+      const [res] = await pool.query(
+        `UPDATE tbl_notice
+            SET status = 'published',
+                published_by = COALESCE(published_by, created_by)
+          WHERE notice_id = ?
+            AND status = 'scheduled'`,
+        [n.notice_id],
+      );
+      if (res.affectedRows !== 1) continue;   // lost the race / already flipped
+      summary.published += 1;
+
+      // Only push when the (now-published) notice targets technicians.
+      if (surfacesInclude(n.target_surfaces, 'technician')) {
+        const row = await getNoticeById(n.notice_id);
+        if (row) {
+          // Lazy require mirrors createNotice/publishNotice — avoids any
+          // circular-require risk. Fire-and-forget: never block the batch.
+          const { pushNoticeToTechnicians } = require('./notice-push.service');
+          pushNoticeToTechnicians(row).catch(() => {});
+          summary.pushed += 1;
+        }
+      }
+    } catch (err) {
+      logger.warn({ err, notice_id: n.notice_id }, 'publishDueScheduled: row failed; skipping');
+    }
+  }
+
+  return summary;
+}
+
 // ─── Active feed (dashboard strip + future app screens) ─────────────
 /*
  * Returns active notices for the given surface, with per-row `is_read`
@@ -653,6 +719,7 @@ module.exports = {
   updateNotice,
   publishNotice,
   archiveNotice,
+  publishDueScheduled,
   // Consumer
   listActiveForSurface,
   countUnreadForSurface,

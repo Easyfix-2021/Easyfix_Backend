@@ -1,0 +1,24 @@
+-- 2026-06-26 — index on scheduling_history(easyfixer_id).
+--
+-- PROPOSAL ONLY — DO NOT auto-apply. `scheduling_history` is a LEGACY
+-- shared table touched by the five legacy services (CRM, Dropwizard,
+-- ACD_APIs, etc.). A DBA must review the live table's existing indexes
+-- and current row/write profile before applying; adding an index here
+-- affects every service that writes to it. Keep this file in
+-- migrations/ (pending) — do NOT move it to migrations/executed/ until
+-- a DBA has reviewed and run it against the live DB.
+--
+-- WHY:
+--   performance.service.computeAcceptance() — now called per mobile
+--   dashboard load and per Performance-screen render — runs
+--     SELECT COUNT(DISTINCT job_id) ... FROM scheduling_history
+--      WHERE easyfixer_id = ?
+--   With no index on easyfixer_id this full-scans scheduling_history on
+--   every dashboard fetch (one per active technician). A plain BTREE on
+--   easyfixer_id turns the scan into a seek.
+--
+-- NOTE: plain CREATE INDEX (no MariaDB-only IF NOT EXISTS). The DBA
+-- should confirm an equivalent index does not already exist before
+-- running, e.g.:
+--   SHOW INDEX FROM scheduling_history WHERE Column_name = 'easyfixer_id';
+CREATE INDEX idx_sched_hist_efr ON scheduling_history (easyfixer_id);

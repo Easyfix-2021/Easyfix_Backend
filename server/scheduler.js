@@ -396,6 +396,56 @@ Note: this task only runs automatically if the property "easyfixer.skill_pincode
     logger.info('Easyfixer skill+pincode reminder cron registered (easyfixer.skill_pincode_reminder.enabled=true, daily 12:30 IST).');
   }
 
+  // ─── Notice scheduled → published flip + push — every minute ─────────
+  // Added 2026-06-26. Notices created with a future publish_at sit in
+  // status='scheduled'. The notice feeds already SHOW them once NOW()
+  // passes publish_at (read-time effectiveStatus derivation), but nothing
+  // ever PERSISTED the flip to 'published' nor fired the technician push —
+  // so a scheduled notice went live silently, never notifying anyone.
+  //
+  // This cron is the durable transition: every minute it promotes every
+  // due 'scheduled' notice to 'published' (atomic per-row guard) and fires
+  // the technician push exactly once per real transition. No property gate
+  // and no CRON_DISABLED skip-reason gymnastics needed beyond the standard
+  // inline guard — the cost is one indexed SELECT per minute and the
+  // alternative (notices never durably publishing / never pushing) is
+  // strictly worse.
+  const noticeService = require('../services/notice.service');
+  const noticePublishJob = registerJob({
+    id: 'notice-publish-scheduled',
+    name: 'Notice Scheduled → Published Flip',
+    description:
+`What this task does: When someone writes a notice on the Notice Board and sets it to go live at a FUTURE date/time, the notice waits in a "scheduled" state until that moment arrives. This task is what actually flips it live — and, just as importantly, sends the push notification to technicians the instant it goes live.
+
+Here's how it works, step by step:
+  1. Every minute, the task wakes up automatically.
+  2. It looks for every notice that is still "scheduled" AND whose go-live time (publish_at) has now passed.
+  3. For each one, it flips the notice's status to "published" — durably, in the database. (A built-in guard means even if two ticks overlap, only one wins the flip, so a notice can never be double-published or double-pushed.)
+  4. If that notice targets technicians, it fires the technician push notification right then — so technicians are alerted the moment a scheduled notice goes live, not whenever they next happen to open the app.
+  5. It logs how many scheduled notices it checked, how many it published, and how many pushes it fired — visible in the server logs and on this page (Last Run details below).
+
+Why this matters: before this task existed, the notice feeds would already DISPLAY a scheduled notice once its go-live time passed (computed on the fly when someone loads the feed), but the database never recorded it as published and no push ever went out. That meant technicians were never actively notified about scheduled notices — they'd only see them if they happened to open the Notice screen. This task closes that gap. Trigger Now is useful if ops just scheduled a notice for "a minute ago" and wants it published + pushed immediately rather than waiting for the next minute tick.`,
+    cron: '* * * * *',
+    runner: async () => {
+      const result = await noticeService.publishDueScheduled();
+      logger.info(
+        `Notice publish cron · checked=${result.checked} · ` +
+        `published=${result.published} · pushed=${result.pushed}`
+      );
+      return result;
+    },
+  });
+  if (!cronDisabled) {
+    noticePublishJob.task = cron.schedule(
+      noticePublishJob.cron,
+      () => invokeJob(noticePublishJob, 'cron'),
+      { timezone: TZ },
+    );
+    noticePublishJob.registered = true;
+  } else {
+    noticePublishJob.skipReason = 'CRON_DISABLED=true';
+  }
+
   // ─── Deep Skill Image-Gen orphan reset — every 5 minutes ─────────────
   // Standalone cron (NOT registered via registerJob()). Deliberately
   // absent from the Scheduled Jobs admin page — this is infrastructure

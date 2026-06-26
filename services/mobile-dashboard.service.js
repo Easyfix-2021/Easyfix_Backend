@@ -218,11 +218,20 @@ async function fetchAttendance(efrId) {
   // confirmation against the live DB (see backend-changes.md Q1). Use
   // SELECT * + defensive property reads so the call doesn't crash if
   // column names differ from the mobile-dev spec.
+  //
+  // `created_on` is a DATE column (the attendance "day" key — see
+  // mobile-attendance.service.js, which upserts on
+  // `easyfixer_id = ? AND created_on = ?`). Because it's already a bare
+  // date, the old `DATE(created_on) = CURDATE()` wrapper was redundant
+  // AND non-sargable — wrapping the column in a function defeats any
+  // index on it. Comparing the column directly to CURDATE() is
+  // identical in result but index-friendly (lets idx_efr_attendance_efr_date
+  // do an index seek instead of a scan).
   try {
     const [[row]] = await pool.query(
       `SELECT *
          FROM tbl_easyfixer_attendance
-        WHERE easyfixer_id = ? AND DATE(created_on) = CURDATE()
+        WHERE easyfixer_id = ? AND created_on = CURDATE()
         LIMIT 1`,
       [efrId],
     );
