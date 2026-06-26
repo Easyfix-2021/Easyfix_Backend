@@ -8,6 +8,8 @@ const plivo = require('../../services/plivo.service');
 const voice = require('../../services/voice.service');
 const plivoLog = require('../../services/plivo-call-log.service');
 const propertiesSvc = require('../../services/properties.service');
+const { requirePropertyAllowlist } = require('../../middleware/require-property-allowlist');
+const { FEATURES } = require('../../services/feature-access.service');
 
 // Coarse "Call From Flow" when the FE doesn't send an explicit one — derived
 // from which receiver identifier was used.
@@ -540,11 +542,8 @@ router.post('/web-start', requireClickToCallAction, validate(clickToCallBody), a
 // Admin-only. Persists voice.call.mode in easyfix_properties + flushes the cache
 // so it takes effect immediately (no restart). Web mode is Plivo-only, so it
 // refuses to switch to 'web' unless Plivo is enabled.
-router.post('/mode', requireClickToCallAction, async (req, res, next) => {
+router.post('/mode', requirePropertyAllowlist(FEATURES.canSwitchCallMode, { label: 'Switch Call Mode' }), async (req, res, next) => {
   try {
-    if (Number(req.user.user_role) !== 2) {
-      return modernError(res, 403, 'Only an Admin can change the calling mode.');
-    }
     const mode = String(req.body.mode || '').toLowerCase();
     if (mode !== 'web' && mode !== 'mobile') {
       return modernError(res, 400, "mode must be 'web' or 'mobile'.");
@@ -564,11 +563,8 @@ router.post('/mode', requireClickToCallAction, async (req, res, next) => {
 // (blank). Web mode is Plivo-only so the FE doesn't expose this there.
 // '' (No Default) is stored blank → defaultProvider() then resolves to the first
 // enabled provider and the per-call radio drives the choice when >1 is enabled.
-router.post('/default-provider', requireClickToCallAction, async (req, res, next) => {
+router.post('/default-provider', requirePropertyAllowlist(FEATURES.canSwitchCallMode, { label: 'Switch Call Mode' }), async (req, res, next) => {
   try {
-    if (Number(req.user.user_role) !== 2) {
-      return modernError(res, 403, 'Only an Admin can change the default calling provider.');
-    }
     const provider = String(req.body.provider ?? '').toLowerCase().trim();
     if (provider !== '' && provider !== 'plivo' && provider !== 'kaleyra') {
       return modernError(res, 400, "provider must be 'plivo', 'kaleyra', or '' (No Default).");

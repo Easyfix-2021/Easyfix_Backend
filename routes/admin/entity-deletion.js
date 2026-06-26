@@ -2,7 +2,8 @@ const router = require('express').Router();
 const Joi = require('joi');
 
 const validate = require('../../middleware/validate');
-const { roleByName } = require('../../middleware/role');
+const { requirePropertyAllowlist } = require('../../middleware/require-property-allowlist');
+const { FEATURES } = require('../../services/feature-access.service');
 const { modernOk, modernError } = require('../../utils/response');
 const logger = require('../../logger');
 
@@ -15,10 +16,11 @@ const emailService = require('../../services/email.service');
  * Admin Actions → Delete Easyfixer/User + Restore (OTP-gated, tombstone).
  *
  * Mounted at /api/admin/entity-deletion (requireAuth + role(['admin']) already
- * applied by the parent admin router). This whole sub-router is HARD-GATED to
- * the Admin role (role_name='Admin', role_id 2) via roleByName below — the
- * delete/restore flow is intentionally Admin-only, NOT exposed via per-action
- * RBAC grants. Never trust the FE's button-hiding.
+ * applied by the parent admin router). This whole sub-router is gated PER-USER
+ * by an easyfix_properties email allowlist (FEATURES.canDeleteEntities) via
+ * requirePropertyAllowlist below — the delete/restore flow is restricted to
+ * named operators and is NOT grantable from Manage Role / RBAC (it has no
+ * menu_action rows). Never trust the FE's button-hiding.
  *
  * Flow:
  *   POST /impact            { entityType, id }            → eligibility + blockers (read-only)
@@ -34,10 +36,11 @@ const intId = Joi.number().integer().positive();
 // OTP arrives as a 4-digit code; accept number or numeric string.
 const otp = Joi.alternatives(Joi.number().integer(), Joi.string().trim().pattern(/^\d{3,6}$/));
 
-// HARD admin-only gate for the ENTIRE sub-router. The delete/restore flow is
-// restricted to the Admin role itself (role_name='Admin'), NOT the broader
-// 'admin' group — so it is gated by role_name, not per-action RBAC grants.
-router.use(roleByName(['Admin']));
+// Per-USER gate for the ENTIRE sub-router: access is restricted to the emails
+// on the easyfix_properties allowlist (access.entitydelete.emails), NOT a role
+// or RBAC grant — so it can't be granted from Manage Role. The parent admin
+// router's role(['admin']) group gate still applies as a floor.
+router.use(requirePropertyAllowlist(FEATURES.canDeleteEntities, { label: 'Delete / Restore Easyfixer-User' }));
 
 // ─── Impact (read-only) ─────────────────────────────────────────────
 router.post(

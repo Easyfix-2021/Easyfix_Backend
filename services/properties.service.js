@@ -175,10 +175,24 @@ async function setProperty(key, value) {
   return true;
 }
 
+/**
+ * Parse an easyfix_properties value holding a CSV of emails into a lowercased
+ * Set for O(1) membership checks. Empty/missing → empty Set, so callers using
+ * this as an ACCESS allowlist fail CLOSED (deny-all until the key is populated).
+ * Centralises the long-standing scheduled.jobs.visible.emails parser so every
+ * property-allowlist gate shares one implementation.
+ */
+function parseEmailAllowlist(key) {
+  const raw = String(getProperty(key) ?? '').trim();
+  if (!raw) return new Set();
+  return new Set(raw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean));
+}
+
 module.exports = {
   preload,
   getProperty,
   getAllProperties,
   flushCache,
   setProperty,
+  parseEmailAllowlist,
 };

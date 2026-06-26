@@ -474,6 +474,20 @@ router.get('/profile/percentage', async (req, res, next) => {
 // personal/identity handlers) — otherwise two concurrent SELECT-then-INSERT saves
 // (e.g. an offline-retry racing the live save) can insert duplicate (efr_id, type)
 // rows that the CRM doc view can't disambiguate.
+// tbl_address is a SHARED/polymorphic table (job rows + technician-personal rows)
+// and its column set can drift across deploys, so we probe the live columns once
+// and only ever write the ones that actually exist (mirrors job-magic-link's
+// addressHasInstruction). Resolves the `city` vs `city1` ambiguity automatically.
+let _addressColumnsCache = null;
+async function addressColumns() {
+  if (_addressColumnsCache) return _addressColumnsCache;
+  const [rows] = await pool.query(
+    `SELECT COLUMN_NAME FROM information_schema.columns
+      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tbl_address'`);
+  _addressColumnsCache = new Set(rows.map((r) => r.COLUMN_NAME));
+  return _addressColumnsCache;
+}
+
 async function upsertEasyfixerDocuments(conn, efrId, rows) {
   for (const [typeId, key] of rows) {
     if (!key) continue;
@@ -722,6 +736,111 @@ router.get('/profile/professional', async (req, res, next) => {
         categoryId: Number(c.categoryId), categoryName: c.categoryName, skillCount: Number(c.skillCount),
       })),
     });
+  } catch (e) { next(e); }
+});
+
+// Personal prefill — the family/insurance fields written by POST /profile/personal-details
+// (Step 2 "Family" + "Insurance" cards). DOB formatted yyyy-MM-dd for the native
+// DateField; BIT flags cast to bool. Emergency comes from efr_alt_no.
+router.get('/profile/personal', async (req, res, next) => {
+  try {
+    const [[p]] = await pool.query(
+      `SELECT efr_first_name, efr_last_name,
+              DATE_FORMAT(date_of_birth, '%Y-%m-%d') AS date_of_birth,
+              efr_marital_status, efr_children, efr_email, efr_alt_no, about_yourself,
+              health_insurance, accidental_insurance, is_email_verified
+         FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1`, [req.tech.efr_id]);
+    if (!p) return modernOk(res, null);
+    const bit = (v) => (Buffer.isBuffer(v) ? v[0] === 1 : Number(v) === 1);
+    modernOk(res, {
+      firstName:              p.efr_first_name || null,
+      lastName:               p.efr_last_name || null,
+      dateOfBirth:            p.date_of_birth || null,
+      maritalStatus:          p.efr_marital_status || null,
+      children:               p.efr_children == null ? null : Number(p.efr_children),
+      email:                  p.efr_email || null,
+      emergencyContactNumber: p.efr_alt_no || null,
+      about:                  p.about_yourself || null,
+      healthInsurance:        bit(p.health_insurance),
+      accidentalInsurance:    bit(p.accidental_insurance),
+      emailVerified:          bit(p.is_email_verified),
+    });
+  } catch (e) { next(e); }
+});
+
+// Contact-info — the technician's SINGLE address (Step 2). Legacy never typed
+// technician addresses (tbl_address.address_type is NULL for all ~21.6k tech
+// rows), so the Home/Permanent/Other 3-tab model is dropped: one row keyed by
+// tbl_easyfixer.user_id (the role-19 ghost user — the bridge populated at
+// creation). Emergency contact lives on tbl_easyfixer.efr_alt_no (written by
+// personal-details), NOT here. Column-probed (tbl_address is shared/polymorphic).
+router.get('/profile/contact-info', async (req, res, next) => {
+  try {
+    const [[ef]] = await pool.query('SELECT user_id FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1', [req.tech.efr_id]);
+    if (!ef || !ef.user_id) return modernOk(res, null);
+    // SELECT * so a drifted/absent column never errors the read.
+    const [[row]] = await pool.query(
+      'SELECT * FROM tbl_address WHERE user_id = ? ORDER BY address_id DESC LIMIT 1', [ef.user_id]);
+    if (!row) return modernOk(res, null);
+    modernOk(res, {
+      houseNo:        row.house_no ?? null,
+      areaOrLocation: row.locality ?? null,
+      landMark:       row.landmark ?? null,
+      pinCode:        row.pin_code ?? null,
+      city:           row.city1 ?? row.city ?? null,
+      district:       row.district ?? null,
+      state:          row.state ?? null,
+      cityId:         row.city_id ?? null,
+    });
+  } catch (e) { next(e); }
+});
+
+router.post('/profile/contact-info', validate(Joi.object({
+  houseNo:        Joi.string().trim().max(255).allow('', null).optional(),
+  areaOrLocation: Joi.string().trim().max(255).allow('', null).optional(),
+  landMark:       Joi.string().trim().max(255).allow('', null).optional(),
+  pinCode:        Joi.string().trim().pattern(/^[0-9]{6}$/).allow('', null).optional(),
+  city:           Joi.string().trim().max(255).allow('', null).optional(),
+  cityId:         Joi.number().integer().positive().allow(null).optional(),
+  district:       Joi.string().trim().max(255).allow('', null).optional(),
+  state:          Joi.string().trim().max(255).allow('', null).optional(),
+}).min(1)), async (req, res, next) => {
+  try {
+    const b = req.body;
+    const [[ef]] = await pool.query('SELECT user_id FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1', [req.tech.efr_id]);
+    if (!ef || !ef.user_id) return modernError(res, 409, 'Technician has no linked user account');
+    const userId = ef.user_id;
+    const cols = await addressColumns();
+    // Candidate column → value; only columns that exist on the live table are written.
+    // Both city1 + city are offered (whichever exists wins) to span schema drift.
+    const candidates = {
+      house_no:                   b.houseNo ?? null,
+      locality:                   b.areaOrLocation ?? null,
+      landmark:                   b.landMark ?? null,
+      pin_code:                   b.pinCode ?? null,
+      district:                   b.district ?? null,
+      state:                      b.state ?? null,
+      city_id:                    b.cityId ?? null,
+      city1:                      b.city ?? null,
+      city:                       b.city ?? null,
+      is_address_details_filled:  1,
+    };
+    const present = Object.entries(candidates).filter(([c]) => cols.has(c));
+    if (!present.length) return modernOk(res, { updated: false });
+
+    const [[existing]] = await pool.query(
+      'SELECT address_id FROM tbl_address WHERE user_id = ? ORDER BY address_id DESC LIMIT 1', [userId]);
+    if (existing) {
+      const sets = present.map(([c]) => `${c} = ?`).join(', ');
+      await pool.query(`UPDATE tbl_address SET ${sets} WHERE address_id = ?`,
+        [...present.map(([, v]) => v), existing.address_id]);
+    } else {
+      const colNames = ['user_id', ...present.map(([c]) => c)];
+      const ph = colNames.map(() => '?').join(', ');
+      await pool.query(`INSERT INTO tbl_address (${colNames.join(', ')}) VALUES (${ph})`,
+        [userId, ...present.map(([, v]) => v)]);
+    }
+    modernOk(res, { updated: true });
   } catch (e) { next(e); }
 });
 

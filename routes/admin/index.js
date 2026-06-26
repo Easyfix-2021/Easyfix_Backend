@@ -76,9 +76,13 @@ router.use('/menus',           require('./menus'));
 router.use('/products',        require('./products'));
 router.use('/users',           require('./users'));
 router.use('/roles',           require('./roles'));
+// Per-user property-gated capability flags for the FE (canSwitchCallMode,
+// canDeleteEntities) — display-only; the gated routes enforce the allowlist
+// themselves. See routes/admin/access.js + services/feature-access.service.js.
+router.use('/access',          require('./access'));
 // Admin Actions → OTP-gated Delete Easyfixer/User + Restore (tombstone + full
-// JSON archive). Each route self-gates via requireAction(isEasyfixerDelete /
-// isUserDelete / isDeletedRecordsRestore). See routes/admin/entity-deletion.js.
+// JSON archive). Gated PER-USER by the easyfix_properties allowlist
+// (access.entitydelete.emails) — NOT RBAC. See routes/admin/entity-deletion.js.
 router.use('/entity-deletion', require('./entity-deletion'));
 router.use('/rate-cards',      require('./rate-cards'));
 router.use('/quotations',      require('./quotations'));
