@@ -194,7 +194,7 @@ function profileUpdateUrl(token) {
   // MAGIC_LINK_BASE_URL (set per-env to the CRM_UI host — qa.crm.easyfix.in on
   // QA) so the link never silently defaults to prod on QA; prod hardcode last.
   const base = process.env.CRM_PUBLIC_BASE_URL || process.env.MAGIC_LINK_BASE_URL || 'https://crm.easyfix.in';
-  return `${base.replace(/\/$/, '')}/profile-update/${token}`;
+  return `${base.replace(/\/$/, '')}/public/profile-update/${token}`;
 }
 
 // ─── 1. fetchPrefill ────────────────────────────────────────────────

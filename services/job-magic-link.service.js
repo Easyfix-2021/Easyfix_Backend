@@ -322,7 +322,7 @@ const TIME_SLOTS = ['9 AM – 12 PM', '12 PM – 3 PM', '3 PM – 7 PM', 'After 
  */
 function magicLinkUrl(token) {
   const base = process.env.MAGIC_LINK_BASE_URL || 'https://qa.easyfix.in';
-  return `${base.replace(/\/$/, '')}/job-completion/${token}`;
+  return `${base.replace(/\/$/, '')}/public/job-completion/${token}`;
 }
 
 /**

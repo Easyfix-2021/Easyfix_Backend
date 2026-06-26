@@ -218,7 +218,7 @@ async function runTest({ mobile, sourceId } = {}) {
   // Env-aware: fall back to MAGIC_LINK_BASE_URL (per-env CRM_UI host) before
   // the prod hardcode so QA links don't silently point at prod.
   const base = (process.env.CRM_PUBLIC_BASE_URL || process.env.MAGIC_LINK_BASE_URL || 'https://crm.easyfix.in').replace(/\/$/, '');
-  const longUrl = `${base}/profile-update/${token}`;
+  const longUrl = `${base}/public/profile-update/${token}`;
   let shortUrl = longUrl;
   try {
     const expiresAt = new Date(Date.now() + 30 * 24 * 3600 * 1000); // match 30d JWT TTL

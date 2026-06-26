@@ -92,14 +92,18 @@ async function shortenUrl(longUrl, opts = {}, pool) {
          VALUES (?, ?, ?, ?, ?)`,
         [code, longUrl, purpose, expiresAt || null, createdBy || null],
       );
+      // Flow-relevant short path under /public so the WhatsApp link reads for
+      // its flow (e.g. /public/profile/<code> for a profile update, not the
+      // generic /book/). The /public/* prefix also lets ops VPN-gate the CRM
+      // while leaving every public link reachable. Resolution itself is
+      // purpose-agnostic — the prefix only drives readability + the matching FE
+      // resolver route (app/public/<flow>/[code]). Old /book/<code> links keep
+      // working via the next.config back-compat redirect.
+      const flow = /profile/i.test(purpose || '') ? 'profile' : 'book';
+      const shortPath = `/public/${flow}/${code}`;
       return {
         short_code: code,
-        // Path is `/book/<code>` — chosen over a generic `/s/` so
-        // the URL is self-describing in WhatsApp previews ("looks
-        // like a booking link, not random shortened spam"). Update
-        // the matching `router.get` in routes/public/url-shortener.js
-        // if this is ever renamed.
-        short_url:  base ? `${base}/book/${code}` : `/book/${code}`,
+        short_url: base ? `${base}${shortPath}` : shortPath,
       };
     } catch (err) {
       // ER_DUP_ENTRY = 1062. Retry with a fresh code. Anything else

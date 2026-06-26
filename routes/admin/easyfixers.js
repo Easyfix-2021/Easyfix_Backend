@@ -641,7 +641,7 @@ router.get('/:id/profile-update-link/dev-url',
       const efrId = Number(req.params.id);
       const token = signEasyfixerProfileToken(efrId);
       const base = (process.env.CRM_PUBLIC_BASE_URL || process.env.MAGIC_LINK_BASE_URL || 'http://localhost:5180').replace(/\/$/, '');
-      const url = `${base}/profile-update/${token}`;
+      const url = `${base}/public/profile-update/${token}`;
       modernOk(res, { efrId, token, url }, 'Dev profile-update link minted (no WhatsApp send)');
     } catch (e) {
       if (e && typeof e.status === 'number') {

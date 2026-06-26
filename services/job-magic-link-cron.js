@@ -170,13 +170,13 @@ async function runTest({ mobile, sourceId } = {}) {
     try {
       const token = signJobToken({ jobId: jobIdForToken });
       const base = process.env.MAGIC_LINK_BASE_URL || 'https://qa.easyfix.in';
-      testUrl = `${base.replace(/\/$/, '')}/job-completion/${token}`;
+      testUrl = `${base.replace(/\/$/, '')}/public/job-completion/${token}`;
     } catch (e) {
       logger.warn({ err: e?.message }, 'magic-link TEST: token mint failed, falling back to sentinel URL');
-      testUrl = `${(process.env.MAGIC_LINK_BASE_URL || 'https://qa.easyfix.in').replace(/\/$/, '')}/job-completion/test-link-please-ignore`;
+      testUrl = `${(process.env.MAGIC_LINK_BASE_URL || 'https://qa.easyfix.in').replace(/\/$/, '')}/public/job-completion/test-link-please-ignore`;
     }
   } else {
-    testUrl = `${(process.env.MAGIC_LINK_BASE_URL || 'https://qa.easyfix.in').replace(/\/$/, '')}/job-completion/test-link-please-ignore`;
+    testUrl = `${(process.env.MAGIC_LINK_BASE_URL || 'https://qa.easyfix.in').replace(/\/$/, '')}/public/job-completion/test-link-please-ignore`;
   }
 
   // Send strictly to the operator's mobile. Bypasses sendForJob entirely so
