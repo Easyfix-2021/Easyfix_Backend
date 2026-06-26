@@ -4,6 +4,20 @@ const { pool } = require('../db');
 // utils/otp.js::generateOtp() for the implementation. Used at
 // order-confirmation time (see create() + setStatus() below).
 const { generateOtp } = require('../utils/otp');
+// Property-flag reader for THE OFFER MODEL toggle (`job.offer.flow.enabled`).
+// Synchronous, cache-backed — see services/properties.service.js::getProperty.
+const { getProperty } = require('./properties.service');
+
+/*
+ * THE OFFER MODEL feature flag. ON by default — only the literal string
+ * "false" (case-insensitive) in easyfix_properties disables it. When ON *and*
+ * tbl_job_offer exists, a CRM/auto assign offers the job (stays BOOKED + push)
+ * instead of hard-scheduling it. Kept as a tiny helper so assign() and the
+ * accept/reject paths share one source of truth.
+ */
+function offerFlowEnabled() {
+  return String(getProperty('job.offer.flow.enabled') ?? 'true').toLowerCase() !== 'false';
+}
 
 /*
  * Job CRUD + status + assignment.
@@ -417,6 +431,23 @@ async function jobMediaTableExists() {
   return _hasJobMediaTable;
 }
 
+// Same memoised existence probe for tbl_job_offer — new EasyFix-owned table
+// (migrations/2026-06-27-create-tbl-job-offer.sql) backing THE OFFER MODEL.
+// On deploys without that migration applied, the LIST projection emits NULL
+// is_offered / offered_efr_name aliases and assign() falls back to the legacy
+// bump-to-SCHEDULED behaviour — so the offer flow is a transparent no-op.
+let _hasJobOfferTable = null;
+async function jobOfferTableExists() {
+  if (_hasJobOfferTable !== null) return _hasJobOfferTable;
+  try {
+    await pool.query('SELECT 1 FROM tbl_job_offer LIMIT 1');
+    _hasJobOfferTable = true;
+  } catch {
+    _hasJobOfferTable = false;
+  }
+  return _hasJobOfferTable;
+}
+
 /*
  * Builds the two pending-customer-request projection columns for the LIST
  * query. When the table exists, emits correlated subqueries selecting the
@@ -440,6 +471,22 @@ function pendingRequestColumns(tableExists) {
   (SELECT cr.reason FROM tbl_job_customer_request cr
     WHERE cr.job_id = j.job_id AND cr.request_status = 'pending'
     ORDER BY cr.created_at DESC LIMIT 1) AS pending_request_reason`;
+}
+
+/*
+ * Builds the two job-offer projection columns for the LIST query. When the
+ * tbl_job_offer table exists, emits correlated subqueries reporting whether the
+ * job currently has an OPEN offer (offer_status = 0) and the offered
+ * technician's name; otherwise emits NULL aliases so the column shape stays
+ * identical on un-migrated deploys. Correlated subqueries (NOT a JOIN) — a job
+ * can accrue many historical offer rows, so a JOIN would fan-out the LIST.
+ * Returns a LEADING-COMMA fragment ready to append after pendingRequestColumns().
+ */
+function offerColumns(tableExists) {
+  if (!tableExists) {
+    return `, NULL AS is_offered, NULL AS offered_efr_name`;
+  }
+  return `, (EXISTS(SELECT 1 FROM tbl_job_offer jo WHERE jo.job_id = j.job_id AND jo.offer_status = 0)) AS is_offered, (SELECT ef2.efr_name FROM tbl_job_offer jo2 JOIN tbl_easyfixer ef2 ON ef2.efr_id = jo2.fk_easyfixter_id WHERE jo2.job_id = j.job_id AND jo2.offer_status = 0 ORDER BY jo2.job_offer_id DESC LIMIT 1) AS offered_efr_name`;
 }
 
 // Kept for getById(), which does select these as part of the full detail payload.
@@ -520,7 +567,11 @@ async function list({
   // aliases when the table is absent). Keeps the unconfirmed list from 500ing
   // on un-migrated deploys. See pendingRequestColumns() above.
   const hasCustomerRequestTable = await customerRequestTableExists();
-  const listColumns = LIST_COLUMNS + pendingRequestColumns(hasCustomerRequestTable);
+  // Probe ONCE for tbl_job_offer presence too, appending the offer projection
+  // (is_offered / offered_efr_name, or NULL aliases). See offerColumns() above.
+  const hasJobOffer = await jobOfferTableExists();
+  const listColumns =
+    LIST_COLUMNS + pendingRequestColumns(hasCustomerRequestTable) + offerColumns(hasJobOffer);
 
   // Apply RBAC scope FIRST so any explicit clientId/cityId filter
   // narrows within the allowed set (caller can't widen scope by passing
@@ -2532,6 +2583,13 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
   }
   const hasSlot = timeSlot !== undefined && timeSlot !== null && timeSlot !== '';
 
+  // THE OFFER MODEL: when the flag is ON *and* tbl_job_offer exists, this
+  // assign OFFERS the job rather than hard-scheduling it. In offer mode the
+  // job stays at its current status (BOOKED/0) with only fk_easyfixter_id set;
+  // a tbl_job_offer row + FCM push are written AFTER the assign transaction
+  // commits. When offer mode is off, legacy bump-to-SCHEDULED is unchanged.
+  const offerMode = offerFlowEnabled() && (await jobOfferTableExists());
+
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
@@ -2545,7 +2603,12 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
       'fk_easyfixter_id = ?',
       'scheduled_date_time = ?',
       'fk_scheduled_by = ?',
-      `job_status = CASE WHEN job_status = ${STATUS.BOOKED} THEN ${STATUS.SCHEDULED} ELSE job_status END`,
+      // In offer mode the job stays at its current status (BOOKED/0) until the
+      // tech ACCEPTS — only acceptOffer() bumps it to SCHEDULED. In legacy mode
+      // a BOOKED job is hard-scheduled here as before.
+      offerMode
+        ? 'job_status = job_status'
+        : `job_status = CASE WHEN job_status = ${STATUS.BOOKED} THEN ${STATUS.SCHEDULED} ELSE job_status END`,
       'first_scheduled_by = COALESCE(first_scheduled_by, ?)',
       'last_update_time = ?',
     ];
@@ -2576,9 +2639,36 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
        isReassign ? (rescheduleReason || null) : null]
     );
 
+    // THE OFFER MODEL — when offering, expire any prior OPEN offer on this job
+    // (a reassign supersedes the previous tech's pending offer) and write a
+    // fresh OFFERED row, both inside the assign transaction. Wrapped so an
+    // offer-write failure never aborts the assignment itself.
+    if (offerMode) {
+      try {
+        await conn.query(
+          'UPDATE tbl_job_offer SET offer_status = 3 WHERE job_id = ? AND offer_status = 0',
+          [jobId],
+        );
+        await conn.query(
+          'INSERT INTO tbl_job_offer (job_id, fk_easyfixter_id, offer_status, offered_at) VALUES (?, ?, 0, NOW())',
+          [jobId, easyfixerId],
+        );
+      } catch (e) {
+        require('../logger').warn({ jobId, easyfixerId, err: e.message }, 'assign: tbl_job_offer write failed (swallowed)');
+      }
+    }
+
     await conn.commit();
 
     fireWebhook(isReassign ? 'RescheduleTech' : 'TechAssigned', jobId);
+
+    // Fire-and-forget offer push AFTER commit so the tech only ever sees an
+    // offer that actually persisted. Never throws into the assign path.
+    if (offerMode) {
+      require('./job-offer-push.service')
+        .sendJobOfferPush(easyfixerId, { jobId })
+        .catch(() => {});
+    }
 
     return getById(jobId);
   } catch (e) {
@@ -2619,7 +2709,7 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
  * Returns the full getById() payload so callers can use it for
  * response immediately.
  */
-async function unassign(jobId, { reason }, actor) {
+async function unassign(jobId, { reason, reasonId }, actor) {
   if (!reason || typeof reason !== 'string' || !reason.trim()) {
     const err = new Error('reason is required to unassign a job'); err.status = 400; throw err;
   }
@@ -2654,12 +2744,81 @@ async function unassign(jobId, { reason }, actor) {
        VALUES (?, ?, ?, NULL, ?)`,
       [jobId, techIdAtUnassign, new Date(), reason.trim()],
     );
+
+    // THE OFFER MODEL — a tech REJECTing an offered job flows through here.
+    // Close that tech's OPEN offer as REJECTED (2) with the reason, inside the
+    // same transaction. Wrapped + table-probed so legacy unassign (no offer
+    // table / offer flow off) and any non-offer unassign are unaffected.
+    try {
+      if (await jobOfferTableExists()) {
+        await conn.query(
+          `UPDATE tbl_job_offer
+              SET offer_status = 2, reject_reason = ?, reject_reason_id = ?, responded_at = NOW()
+            WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = 0`,
+          [reason.trim(), reasonId != null ? reasonId : null, jobId, techIdAtUnassign],
+        );
+      }
+    } catch (e) {
+      require('../logger').warn({ jobId, efrId: techIdAtUnassign, err: e.message }, 'unassign: tbl_job_offer reject write failed (swallowed)');
+    }
+
     await conn.commit();
 
     // Reschedule-shaped event (job is leaving the tech's queue).
     // Clients that already received a TechAssigned for this job will
     // get a RescheduleTech to invalidate downstream state.
     fireWebhook('RescheduleTech', jobId);
+
+    return getById(jobId);
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
+}
+
+// ─── Accept a job offer (mobile accept path) ────────────────────────
+/*
+ * THE OFFER MODEL accept side: the technician taps "Accept" on an offered job.
+ * Marks their OPEN tbl_job_offer row ACCEPTED (1) and bumps the job BOOKED(0)
+ * → SCHEDULED(1) — the status promotion that assign() deliberately deferred in
+ * offer mode. Transactional so the offer flip and the status bump commit
+ * together (or not at all).
+ *
+ * Tolerant of the offer table being absent: if tbl_job_offer doesn't exist
+ * (un-migrated deploy), the offer UPDATE is skipped and only the status bump
+ * runs — so the endpoint still does the useful half of the work.
+ *
+ * The status UPDATE is guarded `AND job_status = 0`, so accepting a job that
+ * already advanced (or was never BOOKED) is a safe no-op on the status column.
+ *
+ *   jobId : the offered job
+ *   efrId : the accepting technician (tbl_easyfixer.efr_id)
+ *
+ * Returns the full getById() payload.
+ */
+async function acceptOffer(jobId, efrId) {
+  const hasOfferTable = await jobOfferTableExists();
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    if (hasOfferTable) {
+      await conn.query(
+        `UPDATE tbl_job_offer
+            SET offer_status = 1, responded_at = NOW()
+          WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = 0`,
+        [jobId, efrId],
+      );
+    }
+
+    await conn.query(
+      `UPDATE tbl_job SET job_status = ${STATUS.SCHEDULED} WHERE job_id = ? AND job_status = ${STATUS.BOOKED}`,
+      [jobId],
+    );
+
+    await conn.commit();
 
     return getById(jobId);
   } catch (e) {
@@ -2827,7 +2986,7 @@ module.exports = {
   // tbl_job.client_services CSV in sync after the customer's self-submit
   // mutates tbl_job_services. Single source of truth, one helper.
   recomputeClientServicesCsv,
-  list, getById, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, unassign, changeOwner,
+  list, getById, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, unassign, acceptOffer, changeOwner,
   tryAutoAssignOnCreate,
   fireWebhook, statusToEventName,
   hasClientVerticalIdColumn,

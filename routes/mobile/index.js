@@ -265,6 +265,47 @@ router.get('/jobs', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// Rejected offers history — the jobs THIS technician declined (offer_status=2
+// REJECTED on tbl_job_offer). MOUNTED BEFORE `GET /jobs/:id` so the literal
+// `rejected` segment wins over the `:id` param route. Intentionally a LIMITED
+// projection: just enough to render a "rejected" history card (who/what/when/
+// where-city), with NONE of the sensitive operational fields — no address /
+// pincode / GPS / customer name / customer mobile / easyfixer mobile / amount.
+// Joins mirror job.service.js LIST_COLUMNS / LIST_JOIN conventions: city is
+// reached via tbl_address (j.fk_address_id) → tbl_city, client via
+// j.fk_client_id, category via j.fk_service_catg_id, type via
+// j.fk_service_type_id. Scoped to req.tech.efr_id. If tbl_job_offer isn't yet
+// provisioned (offer model rolling out), return an empty list instead of 500ing.
+router.get('/jobs/rejected', async (req, res, next) => {
+  try {
+    const [items] = await pool.query(
+      `SELECT jo.job_id, jo.reject_reason, jo.responded_at,
+              cl.client_name,
+              sc.service_catg_name AS service_category,
+              st.service_type_name AS service_type,
+              ci.city_name,
+              j.requested_date_time
+         FROM tbl_job_offer jo
+         JOIN tbl_job j           ON j.job_id            = jo.job_id
+         LEFT JOIN tbl_client cl  ON cl.client_id        = j.fk_client_id
+         LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = j.fk_service_catg_id
+         LEFT JOIN tbl_service_type st ON st.service_type_id = j.fk_service_type_id
+         LEFT JOIN tbl_address ad ON ad.address_id       = j.fk_address_id
+         LEFT JOIN tbl_city ci    ON ci.city_id          = ad.city_id
+        WHERE jo.fk_easyfixter_id = ? AND jo.offer_status = 2
+        ORDER BY jo.responded_at DESC
+        LIMIT 100`,
+      [req.tech.efr_id],
+    );
+    modernOk(res, { items });
+  } catch (e) {
+    // Offer model may not be provisioned on every DB yet — don't 500 the
+    // history screen just because tbl_job_offer doesn't exist.
+    if (e?.code === 'ER_NO_SUCH_TABLE') return modernOk(res, { items: [] });
+    next(e);
+  }
+});
+
 router.get('/jobs/:id', async (req, res, next) => {
   try {
     const job = await jobService.getById(Number(req.params.id));
@@ -273,41 +314,49 @@ router.get('/jobs/:id', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// Status: 0 (BOOKED) → 1 (SCHEDULED). Now flows through shared
-// jobService.setStatus(), which owns: audit-stamp logic, webhook
-// fan-out (TechStart not fired here — accept doesn't trigger a
-// client-facing webhook in the existing wiring), and any future
-// transition rules (e.g. send_back_to_tx reset on completion).
-// The "must be in status 0" guard previously enforced via WHERE
-// clause is now enforced upstream: we verify in the handler before
-// calling setStatus.
+// Accept the job OFFER. Under THE OFFER MODEL a freshly-(auto/CRM-)assigned
+// job stays status 0 (BOOKED) with fk_easyfixter_id set and an OFFERED row on
+// tbl_job_offer; the tech accepting it flips offer_status 0→1 (ACCEPTED) AND
+// bumps job_status 0 (BOOKED) → 1 (SCHEDULED) — transactionally, in one shared
+// service call. jobService.acceptOffer() owns that two-table write (offer row +
+// status bump + audit stamps). We keep the not-found / wrong-tech guards here;
+// the "must be in an offerable state" check lives inside acceptOffer, which
+// throws a status-bearing error we surface as a clear 409.
 router.post('/jobs/:id/accept', async (req, res, next) => {
   try {
     const job = await jobService.getById(Number(req.params.id));
     if (!job || job.fk_easyfixter_id !== req.tech.efr_id) return modernError(res, 404, 'job not found');
-    if (Number(job.job_status) !== 0) return modernError(res, 409, `cannot accept job in status ${job.job_status}`);
-    await jobService.setStatus(
-      job.job_id,
-      { status: 1 /* SCHEDULED */ },
-      { user_id: req.tech.efr_id },          // semantic note: efr_id stored as actor stamp
-    );
+    await jobService.acceptOffer(Number(job.job_id), req.tech.efr_id);
     modernOk(res, { accepted: true });
   } catch (e) {
+    // acceptOffer throws a status-bearing error when the job isn't in an
+    // offerable state (e.g. offer already accepted/rejected/expired, or the
+    // job has moved past BOOKED) — surface it verbatim. Default such conflicts
+    // to 409 so the app shows a clear "offer no longer available" message.
     if (e.status) return modernError(res, e.status, e.message);
     next(e);
   }
 });
 
-// Reject: clears fk_easyfixter_id + drops to BOOKED + writes
-// scheduling_history with the reason. Flows through shared
-// jobService.unassign() — same code path CRM will use when an admin
-// "force-unassigns" a job (e.g. tech is sick). Single transaction +
-// single webhook fan-out (RescheduleTech) live in the shared service.
-router.post('/jobs/:id/reject', validate(Joi.object({ reason: Joi.string().min(3).max(500).required() })), async (req, res, next) => {
+// Reject the job OFFER: nulls fk_easyfixter_id + drops to BOOKED + writes
+// scheduling_history AND stamps the offer row REJECTED (offer_status=2) with
+// the reason. Flows through shared jobService.unassign() — same code path CRM
+// uses when an admin "force-unassigns" a job (e.g. tech is sick). Single
+// transaction + single webhook fan-out (RescheduleTech) live in the shared
+// service. `reasonId` (a tbl-reason lookup id) is recorded on the offer row
+// alongside the free-text `reason`, so the rejection carries both.
+router.post('/jobs/:id/reject', validate(Joi.object({
+  reason: Joi.string().min(3).max(500).required(),
+  reasonId: Joi.number().integer().optional(),
+})), async (req, res, next) => {
   try {
     const job = await jobService.getById(Number(req.params.id));
     if (!job || job.fk_easyfixter_id !== req.tech.efr_id) return modernError(res, 404, 'job not found');
-    await jobService.unassign(job.job_id, { reason: req.body.reason }, { user_id: req.tech.efr_id });
+    await jobService.unassign(
+      job.job_id,
+      { reason: req.body.reason, reasonId: req.body.reasonId },
+      { user_id: req.tech.efr_id },
+    );
     modernOk(res, { rejected: true });
   } catch (e) {
     if (e.status) return modernError(res, e.status, e.message);
