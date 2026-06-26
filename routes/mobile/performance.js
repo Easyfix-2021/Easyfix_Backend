@@ -4,6 +4,7 @@ const Joi = require('joi');
 const validate = require('../../middleware/validate');
 const { modernOk } = require('../../utils/response');
 const svc = require('../../services/mobile-performance.service');
+const grade = require('../../services/grade.service');
 
 /*
  * /api/mobile/performance/* — Technician-app weekly-performance surface.
@@ -68,6 +69,19 @@ router.get('/weekly', validate(weeklyQuery, 'query'), async (req, res, next) => 
     const from = toYmd(req.query.from);
     const to = toYmd(req.query.to);
     modernOk(res, await svc.getWeeklyPerformance(req.tech.efr_id, from, to));
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/mobile/performance/grade-advice
+ *
+ * "How to improve your grade" — the technician's current grade, the next band,
+ * points to it, and 2-3 concrete, causally-correct actions (each maps to a real
+ * grade lever). Deterministic + cheap (no per-request LLM); safe to poll.
+ */
+router.get('/grade-advice', async (req, res, next) => {
+  try {
+    modernOk(res, await grade.getGradeAdvice(req.tech.efr_id));
   } catch (e) { next(e); }
 });
 

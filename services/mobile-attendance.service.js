@@ -203,6 +203,27 @@ async function markDay(efrId, { date, morningSlot, eveningSlot }) {
  */
 async function markLeave(efrId, { startDate, endDate }) {
   if (!efrId) throw mkErr(400, 'efrId is required');
+
+  // Block going unavailable on a day that already has an assigned, not-yet-
+  // finished job. Attendance feeds the Candidate Ranking + auto-allocation, so
+  // silently freeing up a tech who's committed to a job would unfairly reshuffle
+  // other technicians and force ops to reassign by hand. The tech must get the
+  // job reassigned (via support) first. 409 → the app shows a "contact support"
+  // popup. (status 3/5 completed, 6 cancelled are excluded — those are done.)
+  const [[clash]] = await pool.query(
+    `SELECT COUNT(*) AS n FROM tbl_job
+      WHERE fk_easyfixter_id = ?
+        AND job_status NOT IN (3, 5, 6)
+        AND DATE(scheduled_date_time) BETWEEN ? AND ?`,
+    [efrId, toDayKey(startDate), toDayKey(endDate)],
+  );
+  if (clash && Number(clash.n) > 0) {
+    throw mkErr(
+      409,
+      'You have a job assigned on this date. Please contact support to get it reassigned before marking yourself unavailable.',
+    );
+  }
+
   const days = enumerateDays(startDate, endDate);
 
   const conn = await pool.getConnection();

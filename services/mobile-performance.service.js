@@ -1,5 +1,7 @@
 const { pool } = require('../db');
 const logger = require('../logger');
+const gradeService = require('./grade.service');
+const performanceService = require('./performance.service');
 
 /*
  * Mobile weekly-performance reader — backs `GET /api/mobile/performance/weekly`.
@@ -57,13 +59,13 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000;
 async function getWeeklyPerformance(efrId, from, to) {
   if (!efrId) {
     return {
-      ota: 0, sda: 0, grade: 'A', rating: 0,
+      ota: 0, sda: 0, grade: 'C', rating: 0,
       totalJobs: 0, totalEarnings: 0,
       weeks: buildWeekSkeleton(from, to),
     };
   }
 
-  const [buckets, rating] = await Promise.all([
+  const [buckets, rating, accept] = await Promise.all([
     queryWeeklyBuckets(efrId, from, to).catch((e) => {
       logger.warn({ err: e.message, efrId }, 'mobile-performance weekly buckets failed');
       return [];
@@ -71,6 +73,13 @@ async function getWeeklyPerformance(efrId, from, to) {
     computeRating(efrId).catch((e) => {
       logger.warn({ err: e.message, efrId }, 'mobile-performance rating failed');
       return 0;
+    }),
+    // Acceptance rate (jobs accepted / offered) — reuses performance.service's
+    // scheduling_history definition so the Performance screen stays consistent
+    // with the dashboard ring. Omitted when the tech has no offer history yet.
+    performanceService.computeAcceptance(efrId).catch((e) => {
+      logger.warn({ err: e.message, efrId }, 'mobile-performance acceptance failed');
+      return { acceptanceRate: undefined };
     }),
   ]);
 
@@ -117,10 +126,11 @@ async function getWeeklyPerformance(efrId, from, to) {
   return {
     ota: aggSample ? Math.round((aggOnTime / aggSample) * 100) : 0,
     sda: aggSample ? Math.round((aggSameDay / aggSample) * 100) : 0,
-    // STATIC until analytics confirms the grading formula — kept in sync
-    // with performance.service.js (which also hardcodes 'A' for v1).
-    grade: 'A',
+    // Real computed grade (snapshot-cached) — replaces the old static 'A'.
+    grade: await gradeService.getGradeLetter(efrId),
     rating: Number(rating.toFixed(1)),
+    // Acceptance rate is omitted (not 0) when the tech has no offer history.
+    ...(accept.acceptanceRate !== undefined ? { acceptanceRate: accept.acceptanceRate } : {}),
     totalJobs,
     totalEarnings,
     weeks,

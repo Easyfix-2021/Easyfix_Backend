@@ -76,6 +76,15 @@ module.exports = function httpLog(req, res, next) {
       return;
     }
 
+    // High-frequency location telemetry (POST /jobs/:id/location — one ping every
+    // few seconds per active job, across many technicians) would flood the log.
+    // Keep SUCCESSFUL pings at debug so everyday logs stay readable; failures
+    // (4xx/5xx) fall through to the normal warn/error path below.
+    if (status < 400 && req.method === 'POST' && /\/jobs\/\d+\/location(?:[/?]|$)/.test(path)) {
+      logger.debug(`${status} POST ${path} (${duration} ms)`);
+      return;
+    }
+
     const methodStr = paint(METHOD_COLOR[req.method] || 'gray', req.method.padEnd(6));
     const who =
       req.user?.official_email ||

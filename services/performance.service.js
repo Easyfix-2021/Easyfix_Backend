@@ -1,5 +1,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
+const gradeService = require('./grade.service');
 
 /*
  * Performance metrics — canonical reader for OTA/SDA/grade/rating.
@@ -63,9 +64,9 @@ const RATING_WINDOW_DAYS = 90;
  * Returns a stable shape even if the tech has no history yet.
  */
 async function getForTech(efrId) {
-  if (!efrId) return { ota: 0, sda: 0, grade: 'A', rating: 0 };
+  if (!efrId) return { ota: 0, sda: 0, grade: 'C', rating: 0 };
 
-  const [otaSda, ratingAvg] = await Promise.all([
+  const [otaSda, ratingAvg, accept] = await Promise.all([
     computeOtaSda(efrId).catch((e) => {
       logger.warn({ err: e.message, efrId }, 'performance.computeOtaSda failed');
       return { ota: 0, sda: 0, sampleSize: 0 };
@@ -74,15 +75,22 @@ async function getForTech(efrId) {
       logger.warn({ err: e.message, efrId }, 'performance.computeRating failed');
       return 0;
     }),
+    computeAcceptance(efrId).catch((e) => {
+      logger.warn({ err: e.message, efrId }, 'performance.computeAcceptance failed');
+      return { acceptanceRate: undefined };
+    }),
   ]);
 
   return {
     ota:    otaSda.ota,
     sda:    otaSda.sda,
     rating: Number(ratingAvg.toFixed(1)),
-    // STATIC until analytics confirms the grading formula. The mobile
-    // app spec said "Static A for v1" — kept that promise.
-    grade:  'A',
+    // Real computed grade (snapshot-cached) — replaces the old static 'A'.
+    // Drives the mobile dashboard + profile grade pill via performance.grade.
+    grade: await gradeService.getGradeLetter(efrId),
+    // Acceptance rate is omitted (not 0) when the tech has no offer history
+    // yet, so the app can fall back to OTA for brand-new technicians.
+    ...(accept.acceptanceRate !== undefined ? { acceptanceRate: accept.acceptanceRate } : {}),
   };
 }
 
@@ -121,6 +129,39 @@ async function computeOtaSda(efrId) {
     sda:        Math.round((sameDay / sampleSize) * 100),
     sampleSize,
   };
+}
+
+/*
+ * Compute Acceptance Rate = jobs ACCEPTED / jobs OFFERED for one
+ * technician, from the legacy `scheduling_history` table. Every
+ * assignment/offer to a tech inserts a row; a tech DECLINE (or admin
+ * unassign) inserts a row carrying a NON-EMPTY `reschedule_reason`.
+ * We treat a non-empty `reschedule_reason` as the canonical 'declined'
+ * signal — the exact definition candidate-ranking.service.js already
+ * trusts for its rejection filter.
+ *
+ * CAVEAT: scheduling_history's unassign path is shared by a tech
+ * self-reject AND an admin force-unassign (there is no column that
+ * distinguishes the two), so `declined` may slightly over-count — this
+ * is the same proxy candidate-ranking already relies on.
+ *
+ * Returns { acceptanceRate: undefined } when the tech has never been
+ * offered a job, so callers can omit the field and fall back to OTA for
+ * brand-new technicians.
+ */
+async function computeAcceptance(efrId) {
+  const [[row]] = await pool.query(
+    `SELECT COUNT(DISTINCT job_id) AS offered,
+            COUNT(DISTINCT CASE WHEN reschedule_reason IS NOT NULL AND reschedule_reason <> '' THEN job_id END) AS declined
+       FROM scheduling_history
+      WHERE easyfixer_id = ?`,
+    [efrId],
+  );
+  const offered = Number(row?.offered) || 0;
+  const declined = Number(row?.declined) || 0;
+  if (offered === 0) return { acceptanceRate: undefined };
+  const rate = Math.round(((offered - declined) / offered) * 100);
+  return { acceptanceRate: Math.max(0, Math.min(100, rate)) };
 }
 
 /*
@@ -168,4 +209,4 @@ async function getForTechs(efrIds) {
   return map;
 }
 
-module.exports = { getForTech, getForTechs };
+module.exports = { getForTech, getForTechs, computeAcceptance };

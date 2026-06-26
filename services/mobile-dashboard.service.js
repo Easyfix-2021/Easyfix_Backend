@@ -84,6 +84,7 @@ async function getDashboard(efrId, opts = {}) {
     attendance,
     performance,
     notices,
+    noticesUnread,
     dateCounts,
   ] = await Promise.all([
     jobService.getStatusCounts({ easyfixerId: efrId }).catch((e) => {
@@ -98,6 +99,11 @@ async function getDashboard(efrId, opts = {}) {
     noticeService.listActiveForSurface({
       surface: 'technician', readerType: 'efr', readerId: efrId, limit: noticesLimit,
     }).catch(() => []),
+    // Accurate unread total across ALL active notices (not bounded by the
+    // limited items batch above) — drives the home-screen bell badge.
+    noticeService.countUnreadForSurface({
+      surface: 'technician', readerType: 'efr', readerId: efrId,
+    }).catch(() => 0),
     fetchDateCounts(efrId),
   ]);
 
@@ -135,11 +141,13 @@ async function getDashboard(efrId, opts = {}) {
       // `latest` — convenience alias for items[0]; lets callers that
       //   only need "show the most recent notice" skip the items
       //   array indexing.
-      // `unreadCount` — bounded by the fetched batch; useful for the
-      //   "2 new" badge on the home-screen bell.
+      // `unreadCount` — ACCURATE total of unread active notices for this
+      //   technician (counted server-side across ALL active notices, not
+      //   bounded by the limited `items` batch). Drives the "N new" badge
+      //   on the home-screen bell.
       items:       notices || [],
       latest:      (notices || [])[0] || null,
-      unreadCount: (notices || []).filter((n) => !n.is_read).length,
+      unreadCount: Number(noticesUnread) || 0,
     },
   };
 }

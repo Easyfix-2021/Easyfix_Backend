@@ -125,4 +125,73 @@ router.get(
   },
 );
 
+// ─── Real-time location ping ────────────────────────────────────────
+// POST /jobs/:id/location { latitude, longitude, accuracy? } → append a GPS fix
+// to the job's live track (tbl_job_location_track) for the CRM map. Sent
+// periodically by the app while a job is in progress; ownership-guarded.
+router.post(
+  '/:id/location',
+  validate(idParam, 'params'),
+  validate(Joi.object({
+    latitude:  Joi.number().min(-90).max(90).required(),
+    longitude: Joi.number().min(-180).max(180).required(),
+    accuracy:  Joi.number().min(0).optional().allow(null),
+  })),
+  async (req, res, next) => {
+    try {
+      const data = await lifecycle.recordLocationPing(
+        Number(req.params.id), req.tech.efr_id, req.body,
+      );
+      modernOk(res, data);
+    } catch (e) { handleErr(res, next, e); }
+  },
+);
+
+// ─── Questionnaire (recce checklist) ────────────────────────────────
+// GET /jobs/:id/questionnaire → { items:[{id,question,mandatory,answer?,remark?}] }
+router.get(
+  '/:id/questionnaire',
+  validate(idParam, 'params'),
+  async (req, res, next) => {
+    try {
+      const items = await lifecycle.getQuestionnaire(Number(req.params.id), req.tech.efr_id);
+      modernOk(res, { items });
+    } catch (e) { handleErr(res, next, e); }
+  },
+);
+
+// POST /jobs/:id/questionnaire { answers:[{questionId, answer(bool), remark?}] }
+router.post(
+  '/:id/questionnaire',
+  validate(idParam, 'params'),
+  validate(Joi.object({
+    answers: Joi.array().items(Joi.object({
+      questionId: Joi.number().integer().positive().required(),
+      answer:     Joi.boolean().required(),
+      remark:     Joi.string().max(1000).allow('', null).optional(),
+    })).min(1).required(),
+  })),
+  async (req, res, next) => {
+    try {
+      const data = await lifecycle.submitQuestionnaire(
+        Number(req.params.id), req.tech.efr_id, req.body.answers,
+      );
+      modernOk(res, data);
+    } catch (e) { handleErr(res, next, e); }
+  },
+);
+
+// ─── Work progress ──────────────────────────────────────────────────
+// GET /jobs/:id/work-progress → the completion-stage snapshot (problem/cash/revisit).
+router.get(
+  '/:id/work-progress',
+  validate(idParam, 'params'),
+  async (req, res, next) => {
+    try {
+      const data = await lifecycle.getWorkProgress(Number(req.params.id), req.tech.efr_id);
+      modernOk(res, data);
+    } catch (e) { handleErr(res, next, e); }
+  },
+);
+
 module.exports = router;

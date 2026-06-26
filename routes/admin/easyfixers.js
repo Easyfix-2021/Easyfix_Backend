@@ -9,6 +9,7 @@ const profileUpdateLink = require('../../services/easyfixer-profile-update-link.
 const { signEasyfixerProfileToken } = require('../../utils/jwt');
 const requireAction = require('../../middleware/require-action');
 const { pool } = require('../../db');
+const jobLocation = require('../../services/job-location.service');
 const { modernOk, modernError } = require('../../utils/response');
 const {
   listQuery, registeredListQuery, createBody, updateBody, statusBody, idParam, listSubresourceQuery, efrIdsBody,
@@ -321,6 +322,26 @@ router.get('/:id/transactions',
       if (!guard.ok) return modernError(res, 404, 'easyfixer not found');
       const { rows, total } = await easyfixer.listTransactions(req.params.id, req.query);
       modernOk(res, { items: rows, total, limit: req.query.limit, offset: req.query.offset });
+    } catch (e) { next(e); }
+  });
+
+// ─── Live location (Manage Easyfixers pin) ──────────────────────────
+/*
+ * GET /api/admin/easyfixers/:id/location — the technician's latest known GPS
+ * fix (across whatever job they're on), for the Manage Easyfixers live-location
+ * pin. Single indexed row, so it's cheap to poll. `{ latest: null }` when the
+ * tech has no ping yet (GPS off / no active job). Scoped by city like the rest.
+ */
+router.get('/:id/location',
+  validate(idParam, 'params'),
+  async (req, res, next) => {
+    try {
+      const row = await easyfixer.getById(req.params.id);
+      if (!row) return modernError(res, 404, 'easyfixer not found');
+      const guard = assertEntityInScope(req, { city_id: row.efr_cityId });
+      if (!guard.ok) return modernError(res, 404, 'easyfixer not found');
+      const latest = await jobLocation.getLatestByEfr(req.params.id);
+      modernOk(res, { latest });
     } catch (e) { next(e); }
   });
 

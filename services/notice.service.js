@@ -34,6 +34,15 @@ function mkErr(status, message) {
 
 const SURFACES = ['crm', 'client', 'technician'];
 
+// `target_surfaces` is a CSV (e.g. "technician,client"). Returns true when
+// `surface` is one of its members.
+function surfacesInclude(targetSurfaces, surface) {
+  return String(targetSurfaces || '')
+    .split(',')
+    .map((s) => s.trim())
+    .includes(surface);
+}
+
 // Returns rough audience-reach count for each surface. Used by the
 // All-Notices table's "Reach" column and the Review & Send step's
 // "≈ N technicians" hint. Computed per request; small/fast (single
@@ -390,7 +399,23 @@ async function createNotice(body, createdBy) {
       createdBy, resolvedPublishedBy,
     ],
   );
-  return getNoticeById(r.insertId);
+
+  const created = await getNoticeById(r.insertId);
+
+  // Same fire-and-forget push as publishNotice — only when the notice was
+  // created already-published (publish intent with no future publish_at)
+  // and targets the technician surface. Scheduled/future notices are NOT
+  // pushed here (no scheduler fires them at publish_at yet).
+  if (
+    created
+    && status === 'published'
+    && surfacesInclude(created.target_surfaces, 'technician')
+  ) {
+    const { pushNoticeToTechnicians } = require('./notice-push.service');
+    pushNoticeToTechnicians(created).catch(() => {});
+  }
+
+  return created;
 }
 
 // ─── Update (drafts and scheduled only) ─────────────────────────────
@@ -485,7 +510,26 @@ async function publishNotice(noticeId, { publish_at, expire_at }, publishedBy) {
     `UPDATE tbl_notice SET ${sets.join(', ')} WHERE notice_id = ?`,
     params,
   );
-  return getNoticeById(noticeId);
+
+  const row = await getNoticeById(noticeId);
+
+  // Fire the technician push only for notices that went LIVE now (not
+  // scheduled for the future) and that target the technician surface.
+  // Scheduled notices won't push until a scheduler exists to fire them at
+  // their publish_at — no cron does that yet.
+  if (
+    row
+    && newStatus === 'published'
+    && surfacesInclude(row.target_surfaces, 'technician')
+  ) {
+    // Lazy require avoids any circular-require risk (mirrors how
+    // job.service.js lazily requires its orchestrator). Fire-and-forget:
+    // never block the HTTP response on the fan-out.
+    const { pushNoticeToTechnicians } = require('./notice-push.service');
+    pushNoticeToTechnicians(row).catch(() => {});
+  }
+
+  return row;
 }
 
 // ─── Archive ────────────────────────────────────────────────────────
@@ -556,6 +600,36 @@ async function listActiveForSurface({
   }));
 }
 
+// ─── Unread count (accurate total, no LIMIT) ────────────────────────
+/*
+ * Total number of currently-active notices for `surface` that the reader
+ * (readerType, readerId) has NOT read. Same active predicate as
+ * listActiveForSurface (published/scheduled-now-eligible, within the
+ * publish/expire window, for this surface) plus a NOT EXISTS read-receipt
+ * check — but NO LIMIT, so callers (e.g. the mobile dashboard bell badge)
+ * get the true unread total rather than a count bounded by a fetched batch.
+ */
+async function countUnreadForSurface({ surface, readerType = 'crm_user', readerId }) {
+  if (!SURFACES.includes(surface)) throw mkErr(400, 'Invalid surface');
+  const [[{ unread }]] = await pool.query(
+    `SELECT COUNT(*) AS unread
+       FROM tbl_notice n
+      WHERE FIND_IN_SET(?, n.target_surfaces)
+        AND n.status IN ('published', 'scheduled')
+        AND (n.publish_at IS NULL OR n.publish_at <= NOW())
+        AND (n.expire_at  IS NULL OR n.expire_at  >  NOW())
+        AND NOT EXISTS(
+              SELECT 1 FROM tbl_notice_read r
+               WHERE r.notice_id   = n.notice_id
+                 AND r.surface     = ?
+                 AND r.reader_type = ?
+                 AND r.reader_id   = ?
+            )`,
+    [surface, surface, readerType, readerId || 0],
+  );
+  return Number(unread) || 0;
+}
+
 // ─── Mark-read (idempotent upsert into tbl_notice_read) ─────────────
 async function markRead({ noticeId, surface, readerType, readerId }) {
   if (!SURFACES.includes(surface)) throw mkErr(400, 'Invalid surface');
@@ -581,8 +655,10 @@ module.exports = {
   archiveNotice,
   // Consumer
   listActiveForSurface,
+  countUnreadForSurface,
   markRead,
   // Helpers (exposed for tests)
   effectiveStatus,
   getSurfaceReachMap,
+  surfacesInclude,
 };

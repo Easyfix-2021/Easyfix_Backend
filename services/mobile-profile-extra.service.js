@@ -188,7 +188,7 @@ async function getWeeklyPerformance(efrId, { from, to } = {}) {
     .getForTech(efrId)
     .catch((e) => {
       logger.warn({ err: e.message, efrId }, 'weekly headline perf failed');
-      return { ota: 0, sda: 0, grade: 'A', rating: 0 };
+      return { ota: 0, sda: 0, grade: 'C', rating: 0 };
     });
 
   // Per-week aggregation. Bind the window only when supplied so an
@@ -280,48 +280,51 @@ async function getEarnings(efrId, { from, to } = {}) {
     logger.warn({ err: e.message, efrId }, 'getEarnings balance read failed');
   }
 
-  const params = [efrId, COMPLETED_STATUSES];
+  const params = [efrId];
   let windowSql = '';
-  if (b.hasFrom) { windowSql += ' AND j.checkin_date_time >= ?'; params.push(b.from); }
-  if (b.hasTo) { windowSql += ' AND j.checkin_date_time < DATE_ADD(?, INTERVAL 1 DAY)'; params.push(b.to); }
+  if (b.hasFrom) { windowSql += ' AND et.transaction_date >= ?'; params.push(b.from); }
+  if (b.hasTo) { windowSql += ' AND et.transaction_date < DATE_ADD(?, INTERVAL 1 DAY)'; params.push(b.to); }
 
   let items = [];
   let totalEarnings = 0;
+  let creditCount = 0;
   try {
-    // Category-name join mirrors job.service.js::LIST exactly:
-    //   LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = j.fk_service_catg_id
-    // (note: table is `tbl_service_catg`, NOT `tbl_service_category`).
-    // LEFT JOIN keeps the line even if the category is missing.
+    // The earnings statement IS the wallet ledger (legacy parity: the live app
+    // read GET easyfixers/transactions → tbl_easyfixer_transaction, NOT a job
+    // margin). transaction_type 1=debit / 2=credit (legacy Java DAO authoritative).
+    // Amount is SIGNED for the app (debits negative); totalEarnings sums credits.
     const [rows] = await pool.query(
-      `SELECT j.job_id AS jobId,
-              sc.service_catg_name AS title,
-              j.checkin_date_time AS jobDate,
-              COALESCE(tjt.efr_charge, 0) AS amount
-         FROM tbl_job j
-         LEFT JOIN tbl_job_transaction tjt ON tjt.fk_job_id = j.job_id
-         LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = j.fk_service_catg_id
-        WHERE j.fk_easyfixter_id = ?
-          AND j.job_status IN (?)
+      `SELECT et.transaction_id   AS txId,
+              et.job_id           AS jobId,
+              et.description       AS title,
+              et.transaction_date  AS txDate,
+              et.amount            AS amount,
+              et.transaction_type  AS txType,
+              et.balance           AS balance
+         FROM tbl_easyfixer_transaction et
+        WHERE et.easyfixer_id = ?
           ${windowSql}
-        ORDER BY j.checkin_date_time DESC`,
+        ORDER BY et.transaction_id DESC`,
       params,
     );
     items = rows.map((r) => {
-      const amt = Number(r.amount ?? 0);
-      totalEarnings += amt;
+      const mag = Math.abs(Number(r.amount ?? 0));
+      const isCredit = Number(r.txType) === 2;
+      if (isCredit) { totalEarnings += mag; creditCount += 1; }
       return {
-        jobId: r.jobId,
-        title: r.title || 'Service',
-        date: r.jobDate ?? null,
-        amount: amt,
-        type: 'earning',
+        jobId: r.jobId ? Number(r.jobId) : undefined,
+        title: r.title || (isCredit ? 'Credit' : 'Debit'),
+        date: r.txDate ?? null,
+        amount: isCredit ? mag : -mag,
+        type: isCredit ? 'Credit' : 'Debit',
+        balance: r.balance != null ? Number(r.balance) : undefined,
       };
     });
   } catch (e) {
     logger.warn({ err: e.message, efrId }, 'getEarnings items query failed');
   }
 
-  const averageEarning = items.length ? Number((totalEarnings / items.length).toFixed(2)) : 0;
+  const averageEarning = creditCount ? Number((totalEarnings / creditCount).toFixed(2)) : 0;
   return {
     totalEarnings: Number(totalEarnings.toFixed(2)),
     currentBalance,

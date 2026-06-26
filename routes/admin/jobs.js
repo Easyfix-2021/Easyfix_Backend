@@ -3,6 +3,7 @@ const router = require('express').Router();
 const validate = require('../../middleware/validate');
 const job = require('../../services/job.service');
 const candidateRanking = require('../../services/candidate-ranking.service');
+const jobLocation = require('../../services/job-location.service');
 const { modernOk, modernError } = require('../../utils/response');
 const {
   listQuery, createBody, updateBody, statusBody, assignBody, ownerBody, idParam,
@@ -53,6 +54,28 @@ router.use(require('./jobs-upload'));
  * Listed BEFORE `/:id/assign` and other `/:id/*` so Express matches the
  * literal `candidates` segment first.
  */
+/*
+ * GET /api/admin/jobs/:id/location[?limit=] — real-time technician location for
+ * the CRM live view. Returns the latest fix + a recent breadcrumb trail from
+ * tbl_job_location_track (posted by the tech app during the job). scopedJob
+ * enforces the operator's manage_* scope (404 out-of-scope).
+ */
+router.get('/:id/location',
+  validate(idParam, 'params'),
+  scopedJob,
+  async (req, res, next) => {
+    try {
+      const [latest, track] = await Promise.all([
+        jobLocation.getLatest(req.params.id),
+        jobLocation.getTrack(req.params.id, { limit: req.query.limit }),
+      ]);
+      modernOk(res, { latest, track });
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  });
+
 router.get('/:id/candidates',
   validate(idParam, 'params'),
   validate(candidatesQuery, 'query'),

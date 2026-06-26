@@ -1,6 +1,7 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const jobService = require('./job.service');
+const jobLocation = require('./job-location.service');
 const smsService = require('./sms.service');
 const smsTemplate = require('./sms-template.service');
 
@@ -284,9 +285,169 @@ async function searchByJobId(jobId, efrId) {
   };
 }
 
+/*
+ * POST /jobs/:id/location { latitude, longitude, accuracy? }
+ *
+ * Append a real-time GPS ping to the job's live track (tbl_job_location_track)
+ * for the CRM map. getOwnedJob 404s if it isn't this tech's job, so a tech can
+ * only post locations for their own active jobs. The point-in-time
+ * checkin_gps_location on tbl_job is unaffected — this is the continuous trail.
+ */
+async function recordLocationPing(jobId, efrId, ping) {
+  const job = await getOwnedJob(jobId, efrId); // 404 if not the tech's job
+  // Only accept pings while the job is IN_PROGRESS (status 2). Once it leaves
+  // that state (completed/revisit/cancelled), return 409 — the app's background
+  // tracking task treats a 409 as "stop tracking", so it self-terminates the
+  // moment the job ends even if the app is backgrounded with no screen mounted.
+  if (Number(job.job_status) !== 2) {
+    const e = new Error('job not in progress'); e.status = 409; throw e;
+  }
+  return jobLocation.addPing(jobId, efrId, ping);
+}
+
+// ─── Questionnaire (recce checklist) ────────────────────────────────
+/*
+ * GET /jobs/:id/questionnaire — the yes/no checklist for a job, with any saved
+ * answers pre-filled. tbl_job.fk_questionaire_id picks the questionnaire;
+ * tbl_questionaire_details holds the questions (status=1, ordered by seq);
+ * tbl_questionaire_answer holds this job's answers. Returns [] when the job has
+ * no questionnaire assigned. Answers fetched separately + last-write-wins so
+ * legacy duplicate answer rows collapse cleanly.
+ */
+async function getQuestionnaire(jobId, efrId) {
+  const [[job]] = await pool.query(
+    `SELECT fk_questionaire_id, fk_easyfixter_id FROM tbl_job WHERE job_id = ? LIMIT 1`,
+    [jobId],
+  );
+  if (!job || Number(job.fk_easyfixter_id) !== Number(efrId)) {
+    const e = new Error('job not found'); e.status = 404; throw e;
+  }
+  const qid = job.fk_questionaire_id;
+  if (!qid) return [];
+
+  const [questions] = await pool.query(
+    `SELECT c_qd_id, c_qd_text, c_qd_mandatory, c_qd_seq
+       FROM tbl_questionaire_details
+      WHERE c_questionaire_id = ? AND status = 1
+      ORDER BY c_qd_seq ASC`,
+    [qid],
+  );
+  const [answers] = await pool.query(
+    `SELECT c_qd_id, c_qd_ans, c_qd_comments
+       FROM tbl_questionaire_answer
+      WHERE job_id = ?
+      ORDER BY c_qd_ans_id ASC`,
+    [jobId],
+  );
+  const ansByQ = new Map();
+  for (const a of answers) ansByQ.set(Number(a.c_qd_id), a); // ASC → last wins
+  const yes = (v) => /^(1|yes|y|true)$/i.test(String(v == null ? '' : v).trim());
+  return questions.map((q) => {
+    const a = ansByQ.get(Number(q.c_qd_id));
+    return {
+      id:        q.c_qd_id,
+      question:  q.c_qd_text,
+      mandatory: Number(q.c_qd_mandatory) === 1,
+      answer:    a && a.c_qd_ans != null ? yes(a.c_qd_ans) : undefined,
+      remark:    a && a.c_qd_comments ? a.c_qd_comments : undefined,
+    };
+  });
+}
+
+/*
+ * POST /jobs/:id/questionnaire { answers:[{questionId, answer(bool), remark?}] }
+ * Upsert by (job_id, c_qd_id) — re-submitting overwrites instead of duplicating
+ * (legacy did a plain INSERT). Answer stored as '1'/'0'; both NOT-NULL text
+ * columns are always supplied. inserted_by left 0 (the column default) — efr_id
+ * is a tbl_easyfixer id, not the tbl_user id inserted_by may key on, so we don't
+ * stamp it to avoid a wrong-table reference.
+ */
+async function submitQuestionnaire(jobId, efrId, answers) {
+  const [[job]] = await pool.query(
+    `SELECT fk_questionaire_id, fk_easyfixter_id FROM tbl_job WHERE job_id = ? LIMIT 1`,
+    [jobId],
+  );
+  if (!job || Number(job.fk_easyfixter_id) !== Number(efrId)) {
+    const e = new Error('job not found'); e.status = 404; throw e;
+  }
+  const qid = job.fk_questionaire_id;
+  if (!qid) { const e = new Error('no questionnaire for this job'); e.status = 409; throw e; }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    for (const a of answers) {
+      const ansStr = a.answer ? '1' : '0';
+      const remark = a.remark || '';
+      const [[existing]] = await conn.query(
+        `SELECT c_qd_ans_id FROM tbl_questionaire_answer WHERE job_id = ? AND c_qd_id = ? LIMIT 1`,
+        [jobId, a.questionId],
+      );
+      if (existing) {
+        await conn.query(
+          `UPDATE tbl_questionaire_answer SET c_qd_ans = ?, c_qd_comments = ?, update_date = NOW()
+            WHERE c_qd_ans_id = ?`,
+          [ansStr, remark, existing.c_qd_ans_id],
+        );
+      } else {
+        await conn.query(
+          `INSERT INTO tbl_questionaire_answer (c_qd_id, job_id, c_questionaire_id, c_qd_ans, c_qd_comments, inserted_by)
+           VALUES (?, ?, ?, ?, ?, 0)`,
+          [a.questionId, jobId, qid, ansStr, remark],
+        );
+      }
+    }
+    await conn.commit();
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
+  return { ok: true };
+}
+
+// ─── Work progress ──────────────────────────────────────────────────
+/*
+ * GET /jobs/:id/work-progress — the completion-stage snapshot the app renders
+ * (problem / cash / revisit). All fields read straight off tbl_job. There is no
+ * is_next_visit column → isNextVisit is derived from job_status === 10 (REVISIT).
+ */
+async function getWorkProgress(jobId, efrId) {
+  const [[r]] = await pool.query(
+    `SELECT job_id, job_status, problem_reason_id, is_collected_cash_by_app,
+            material_charge, collect_cash_reason_id, revisit_reason_id,
+            revisit_date, revisit_time_slot, fk_easyfixter_id
+       FROM tbl_job WHERE job_id = ? LIMIT 1`,
+    [jobId],
+  );
+  if (!r || Number(r.fk_easyfixter_id) !== Number(efrId)) {
+    const e = new Error('job not found'); e.status = 404; throw e;
+  }
+  const cashBit = Buffer.isBuffer(r.is_collected_cash_by_app)
+    ? r.is_collected_cash_by_app[0] === 1
+    : Number(r.is_collected_cash_by_app) === 1;
+  return {
+    jobId:           r.job_id,
+    haveProblem:     Number(r.problem_reason_id) > 0,
+    problemReasonId: r.problem_reason_id || undefined,
+    isCashCollected: cashBit,
+    collectedAmount: r.material_charge || undefined,
+    cashReasonId:    r.collect_cash_reason_id || undefined,
+    isNextVisit:     Number(r.job_status) === 10,
+    revisitDateTime: r.revisit_date || undefined,
+    revisitTime:     r.revisit_time_slot || undefined,
+    revisitReasonId: r.revisit_reason_id || undefined,
+  };
+}
+
 module.exports = {
   cancel,
   sendCheckinSms,
   saveSelfie,
   searchByJobId,
+  recordLocationPing,
+  getQuestionnaire,
+  submitQuestionnaire,
+  getWorkProgress,
 };

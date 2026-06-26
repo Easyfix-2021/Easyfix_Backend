@@ -211,6 +211,9 @@ router.use(require('../../middleware/idempotency')());
 // wrapper around utils/notice-reader-router.js.
 router.use('/notices', require('./notices'));
 
+// My Team — the authed technician's downline (efr_manager_id). Mobile-only.
+router.use('/team', require('./team'));
+
 // Technician order-lifecycle + estimate sub-routers (NEW 2026-06-15, mobile-only
 // — no CRM overlap). MOUNTED BEFORE the inline `/jobs` + `/jobs/:id` handlers
 // below so the literal paths (`/jobs/search`, `/jobs/:id/rate-card`,
@@ -357,6 +360,15 @@ router.post('/jobs/:id/checkin', validate(Joi.object({
   try {
     const job = await jobService.getById(Number(req.params.id));
     if (!job || job.fk_easyfixter_id !== req.tech.efr_id) return modernError(res, 404, 'job not found');
+    // Verify the customer check-in PIN (tbl_job.otp, the 4-digit code SMS'd to
+    // the customer). When the job carries a PIN it MUST match — a wrong PIN can
+    // never start the job (legacy parity: the dedicated verify-otp-customer step).
+    // Jobs without a PIN (empty otp) skip the check so existing flows don't break.
+    const jobPin = job.otp == null ? '' : String(job.otp).trim();
+    const submittedOtp = req.body.otp == null ? '' : String(req.body.otp).trim();
+    if (jobPin && jobPin !== submittedOtp) {
+      return modernError(res, 409, 'Incorrect check-in PIN. Ask the customer for the PIN sent to them.');
+    }
     await jobService.setStatus(
       job.job_id,
       {
@@ -377,24 +389,60 @@ router.post('/jobs/:id/checkin', validate(Joi.object({
   }
 });
 
-// Status: 2 → 3 (COMPLETED). `setStatus` fires TechVisitComplete +
-// stamps checkout_date_time + fk_checkout_by + (when the column exists)
-// resets send_back_to_tx = 0. The mobile-specific `app_checkout_date_time`
-// stamp rides through extras so all the transition side-effects land
-// in a single UPDATE. See services/job.service.js::setStatus().
-router.post('/jobs/:id/checkout', async (req, res, next) => {
+// Checkout — completion with the full problem / cash / revisit capture.
+//   isNextVisit=true  → job_status 10 REVISIT (comes back for another visit)
+//   else              → job_status 3  COMPLETED
+// `setStatus` fires the transition webhook + stamps checkout_date_time +
+// fk_checkout_by; the cash/problem/revisit columns ride through the extras
+// allowlist so everything lands in one UPDATE. (otherRemark has no tbl_job
+// column today, so it's accepted but not persisted — a future job-comment hook.)
+router.post('/jobs/:id/checkout',
+  validate(Joi.object({
+    haveProblemWithJob:       Joi.boolean().default(false),
+    problemReasonId:          Joi.number().integer().positive().optional().allow(null),
+    otherRemark:              Joi.string().max(1000).optional().allow('', null),
+    isCashCollected:          Joi.boolean().default(false),
+    collectedAmount:          Joi.number().min(0).optional().allow(null),
+    collectCashReasonId:      Joi.number().integer().positive().optional().allow(null),
+    isNextVisit:              Joi.boolean().default(false),
+    // wall-clock ISO 'yyyy-MM-ddTHH:mm:ss' — kept as a STRING and projected
+    // verbatim to 'YYYY-MM-DD HH:mm:ss' (never new Date()'d) to dodge the IST shift.
+    requestedDateTime:        Joi.string().max(40).optional().allow('', null),
+    easyfixerRevisitReasonId: Joi.number().integer().positive().optional().allow(null),
+  })),
+  async (req, res, next) => {
   try {
     const job = await jobService.getById(Number(req.params.id));
     if (!job || job.fk_easyfixter_id !== req.tech.efr_id) return modernError(res, 404, 'job not found');
+    const b = req.body;
+    const isRevisit = b.isNextVisit === true;
+    const extras = {
+      app_checkout_date_time: new Date(),
+      is_collected_cash_by_app: b.isCashCollected ? 1 : 0,
+    };
+    if (b.isCashCollected) {
+      if (b.collectedAmount != null)     extras.material_charge = b.collectedAmount;
+      if (b.collectCashReasonId != null) extras.collect_cash_reason_id = b.collectCashReasonId;
+    }
+    if (b.haveProblemWithJob && b.problemReasonId != null) {
+      extras.problem_reason_id = b.problemReasonId;
+    }
+    if (isRevisit) {
+      if (b.easyfixerRevisitReasonId != null) extras.revisit_reason_id = b.easyfixerRevisitReasonId;
+      if (b.requestedDateTime) {
+        extras.revisit_date = String(b.requestedDateTime).replace('T', ' ').slice(0, 19);
+      }
+    }
     await jobService.setStatus(
       job.job_id,
-      {
-        status: 3 /* COMPLETED */,
-        extras: { app_checkout_date_time: new Date() },
-      },
+      { status: isRevisit ? 10 /* REVISIT */ : 3 /* COMPLETED */, extras },
       { user_id: req.tech.efr_id },
     );
-    modernOk(res, { checkedOut: true });
+    modernOk(res, {
+      jobId: job.job_id,
+      completedAt: extras.app_checkout_date_time,
+      collectedAmount: extras.material_charge,
+    });
   } catch (e) {
     if (e.status) return modernError(res, e.status, e.message);
     next(e);

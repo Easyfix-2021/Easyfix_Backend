@@ -2250,6 +2250,11 @@ const STATUS_EXTRAS_ALLOWLIST = new Set([
   'checkin_gps_location', 'checkin_address', 'checkin_pincode', 'fk_checkin_by',
   // Check-out stamps (mobile /checkout path)
   'app_checkout_date_time',
+  // Check-out completion details — cash / problem / revisit (mobile /checkout
+  // extended body). All exist on tbl_job; a revisit flips job_status to 10
+  // (handled by setStatus), and these stamp the accompanying reason/amount cols.
+  'is_collected_cash_by_app', 'material_charge', 'collect_cash_reason_id',
+  'problem_reason_id', 'revisit_reason_id', 'revisit_date', 'revisit_time_slot',
   // ETA stamps
   'eta_status', 'eta_requested_time',
   // Reschedule-from-app stamps

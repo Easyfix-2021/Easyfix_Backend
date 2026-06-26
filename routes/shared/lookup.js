@@ -59,6 +59,22 @@ router.get('/reschedule-reasons', async (_req, res, next) => {
   try { modernOk(res, await lookup.rescheduleReasons()); } catch (e) { next(e); }
 });
 
+router.get('/reject-reasons',     async (_req, res, next) => {
+  try { modernOk(res, await lookup.rejectReasons()); } catch (e) { next(e); }
+});
+
+router.get('/problem-reasons',    async (_req, res, next) => {
+  try { modernOk(res, await lookup.problemReasons()); } catch (e) { next(e); }
+});
+
+router.get('/collect-cash-reasons', async (_req, res, next) => {
+  try { modernOk(res, await lookup.collectCashReasons()); } catch (e) { next(e); }
+});
+
+router.get('/revisit-reasons',    async (_req, res, next) => {
+  try { modernOk(res, await lookup.revisitReasons()); } catch (e) { next(e); }
+});
+
 router.get('/banks',              validate(banksQuery, 'query'),           async (req, res, next) => {
   try { modernOk(res, await lookup.banks(req.query)); } catch (e) { next(e); }
 });

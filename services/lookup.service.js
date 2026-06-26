@@ -491,6 +491,44 @@ async function rescheduleReasons() {
   return rows;
 }
 
+// Reject reasons live in the unified action_taken_reason table (the legacy CRM
+// EnumReasonDaoImpl source-of-truth), discriminated by action_type + user_type.
+// App reasons are user_type 4; reject = action_type 31 (confirmed against the
+// live table). status=1 + is_new=1 mirror the legacy active filter.
+async function rejectReasons() {
+  const [rows] = await pool.query(
+    `SELECT id, action_desc AS reason
+       FROM action_taken_reason
+      WHERE action_type = 31 AND user_type = 4 AND status = 1 AND is_new = 1
+      ORDER BY action_desc ASC`
+  );
+  return rows;
+}
+
+// Checkout-flow reasons each live in their own thin (id, reason) table — no
+// status column, so every row is active. FK targets: tbl_job.problem_reason_id,
+// .collect_cash_reason_id, .revisit_reason_id respectively.
+async function problemReasons() {
+  const [rows] = await pool.query(
+    `SELECT id, reason FROM problem_with_job_reason ORDER BY id ASC`
+  );
+  return rows;
+}
+
+async function collectCashReasons() {
+  const [rows] = await pool.query(
+    `SELECT id, reason FROM collect_cash_reason_by_app ORDER BY id ASC`
+  );
+  return rows;
+}
+
+async function revisitReasons() {
+  const [rows] = await pool.query(
+    `SELECT id, reason FROM revisit_reason_by_app ORDER BY id ASC`
+  );
+  return rows;
+}
+
 async function banks({ q } = {}) {
   // Actual table is bank_name (blueprint's tbl_bank doesn't exist).
   const clauses = [];
@@ -532,6 +570,10 @@ module.exports = {
   menuVisibility,
   cancelReasons,
   rescheduleReasons,
+  rejectReasons,
+  problemReasons,
+  collectCashReasons,
+  revisitReasons,
   banks,
   documentTypes,
   verticals,
