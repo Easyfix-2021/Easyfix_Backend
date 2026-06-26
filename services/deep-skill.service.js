@@ -957,7 +957,17 @@ async function clearImage(skillId) {
 async function resolveImageUrlFromKey(key) {
   const trimmed = String(key || '').trim();
   if (!trimmed) return null;
-  if (!s3Storage.isEnabled() || !trimmed.startsWith('Skills/')) return null;
+  // Legacy rows may store an absolute URL — pass it through unchanged.
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  if (!s3Storage.isEnabled()) return null;
+  // Presign WHATEVER key the DB holds — the canonical `Skills/Skill_<id>_<seq>`
+  // OR a legacy bare filename (e.g. `1002_hydraulic-office-gaming-chair.png`).
+  // The `Skills/` prefix is a WRITE-path convention, not a read boundary: the
+  // value is trusted (DB column, not user input) and presign is a read-only GET,
+  // so the prefix check only blocked legacy rows from rendering. A missing object
+  // yields a URL that 404s (blank image) — no worse than returning null — while
+  // legacy images that DO exist under their stored name now resolve. New uploads
+  // still standardise on `Skills/` (the writers are unchanged).
   try {
     return await s3Storage.getPresignedUrl(trimmed);
   } catch (e) {
@@ -1021,9 +1031,10 @@ async function getImageUrl(skillId) {
  *   AWS SigV4 caps presign TTL at 7 days, so 25h is well within spec.
  *
  * Returns Promise<{deep_skill_id:number, image_url:string|null}[]>.
- * Skills whose key is empty / non-`Skills/` / unpresignable are
- * filtered OUT of the response (caller spec: only include rows with
- * a non-null/non-empty image).
+ * Skills whose key is empty / unpresignable are filtered OUT of the
+ * response (caller spec: only include rows with a non-null/non-empty
+ * image). Legacy non-`Skills/` keys are now presigned too (read path),
+ * so legacy-named images resolve — see resolveImageUrlFromKey().
  */
 const BULK_IMAGE_PRESIGN_TTL_SEC = 25 * 60 * 60; // 25h — must outlive 24h cache TTL.
 
@@ -1048,7 +1059,14 @@ async function buildAllDeepSkillImages() {
 
   const presigned = await Promise.all(rows.map(async (r) => {
     const key = String(r.image_key || '').trim();
-    if (!key || !key.startsWith('Skills/')) return null;
+    if (!key) return null;
+    // Legacy absolute URL → passthrough. Otherwise presign whatever key the DB
+    // holds (canonical `Skills/...` OR a legacy bare filename) — same read-path
+    // reasoning as resolveImageUrlFromKey(): the prefix is a write convention,
+    // not a read boundary, so legacy rows render instead of being filtered out.
+    if (/^https?:\/\//i.test(key)) {
+      return { deep_skill_id: Number(r.deep_skill_id), image_url: key };
+    }
     try {
       const url = await getSignedUrl(
         s3,
