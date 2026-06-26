@@ -60,6 +60,39 @@ function resolveLoginOtp(identifier) {
   return parseInt(digits.slice(-4), 10);
 }
 
+/**
+ * QA-deterministic OTP for NON-login action flows that deliver a code to a
+ * KNOWN mobile number (e.g. the easyfixer Update-Profile form).
+ *
+ * Default (production — QA_DETERMINISTIC_OTP unset): cryptographically random
+ *   4-digit code via generateOtp(). No behaviour change.
+ *
+ * QA override (QA_DETERMINISTIC_OTP=true): the last 4 digits of the supplied
+ *   mobile, so the QA team can complete the flow without reading WhatsApp or
+ *   the DB. Mirrors resolveLoginOtp()'s mobile branch.
+ *
+ * Same hard env gate as resolveLoginOtp() — the var MUST be unset on prod.
+ * Setting it on prod would make any action OTP guessable from the target's
+ * mobile alone (e.g. anyone could pass the profile-edit OTP knowing just the
+ * technician's phone). Deploy pipelines do NOT inject it; it is set only on
+ * the QA EC2 via bootstrap-env.sh.
+ *
+ * @param {string|number} mobile  the destination mobile the OTP is sent to
+ * @returns {number}              4-digit OTP (random on prod, last-4 on QA)
+ */
+function resolveMobileOtp(mobile) {
+  if (process.env.QA_DETERMINISTIC_OTP !== 'true') {
+    return generateOtp();
+  }
+  const digits = String(mobile || '').replace(/\D/g, '');
+  if (digits.length < 4) {
+    // Pathologically short / missing mobile — fall back to random rather than
+    // emit a 1-3 digit OTP the INT column can't round-trip cleanly.
+    return generateOtp();
+  }
+  return parseInt(digits.slice(-4), 10);
+}
+
 function otpExpiryDate(fromDate = new Date()) {
   return new Date(fromDate.getTime() + OTP_TTL_MINUTES * 60 * 1000);
 }
@@ -67,6 +100,7 @@ function otpExpiryDate(fromDate = new Date()) {
 module.exports = {
   generateOtp,
   resolveLoginOtp,
+  resolveMobileOtp,
   otpExpiryDate,
   OTP_TTL_MINUTES,
   OTP_MAX_ATTEMPTS,

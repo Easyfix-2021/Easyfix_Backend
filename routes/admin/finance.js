@@ -42,7 +42,7 @@ async function scopedInvoice(req, res, next) {
 async function assertEfrInScope(req, efrId) {
   if (!efrId) return { ok: true }; // dimension absent
   const [[e]] = await pool.query(
-    'SELECT efr_cityId FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1',
+    'SELECT efr_cityId FROM tbl_easyfixer WHERE efr_id = ? AND NOT (tbl_easyfixer.efr_status <=> 3) LIMIT 1',
     [efrId]
   );
   if (!e) return { ok: false, reason: 'easyfixer not found' };
@@ -244,18 +244,19 @@ router.post('/invoices/:id/payment', validate(Joi.object({
 })), scopedInvoice, async (req, res, next) => {
   try {
     const invId = Number(req.params.id);
-    // scopedInvoice loaded the basic row already; re-fetch the totals fields.
-    const [[inv]] = await pool.query(
-      `SELECT fk_client_id, total_invoice_amount,
-              COALESCE(total_paid_amount, 0) AS total_paid_amount,
-              COALESCE(total_tds_deducted, 0) AS total_tds_deducted
-         FROM tbl_client_invoice WHERE id = ?`,
-      [invId]
-    );
-    if (!inv) return modernError(res, 404, 'invoice not found');
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();
+      // Read totals inside the tx with a row lock so concurrent payments
+      // can't compute newPaid/newTds off a stale pre-tx snapshot.
+      const [[inv]] = await conn.query(
+        `SELECT fk_client_id, total_invoice_amount,
+                COALESCE(total_paid_amount, 0) AS total_paid_amount,
+                COALESCE(total_tds_deducted, 0) AS total_tds_deducted
+           FROM tbl_client_invoice WHERE id = ? FOR UPDATE`,
+        [invId]
+      );
+      if (!inv) { await conn.rollback(); return modernError(res, 404, 'invoice not found'); }
       await conn.query(
         `INSERT INTO tbl_client_invoice_paid
            (fk_invoice_id, fk_client_id, paid_amount, paid_date, paid_by, comments, upload_documents)
@@ -575,16 +576,30 @@ router.post('/transactions', validate(Joi.object({
     // RBAC: caller must have scope over the target client.
     const guard = assertEntityInScope(req, { client_id: req.body.clientId });
     if (!guard.ok) return modernError(res, 403, 'client outside your scope');
-    const [[prior]] = await pool.query(
-      'SELECT balance FROM tbl_client_transaction WHERE client_id = ? ORDER BY client_trans_id DESC LIMIT 1',
-      [req.body.clientId]);
-    const newBalance = (prior?.balance || 0) + req.body.amount;
-    const [ins] = await pool.query(
-      `INSERT INTO tbl_client_transaction (client_id, job_id, transaction_type, amount, balance, description, transaction_date, created_date, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW(), ?)`,
-      [req.body.clientId, req.body.jobId || null, req.body.transactionType, req.body.amount, newBalance, req.body.description || null, req.user.user_id]);
-    res.status(201);
-    modernOk(res, { transactionId: ins.insertId, newBalance });
+    const conn = await pool.getConnection();
+    try {
+      // Per-client advisory lock serialises concurrent ledger writes so the
+      // read-prior-balance / insert-new-balance pair is race-free.
+      const [[lk]] = await conn.query(
+        "SELECT GET_LOCK(CONCAT('client_ledger_', ?), 5) AS got",
+        [req.body.clientId]);
+      if (lk.got !== 1) return modernError(res, 503, 'ledger busy, retry');
+      await conn.beginTransaction();
+      const [[prior]] = await conn.query(
+        'SELECT balance FROM tbl_client_transaction WHERE client_id = ? ORDER BY client_trans_id DESC LIMIT 1',
+        [req.body.clientId]);
+      const newBalance = Number(prior?.balance || 0) + Number(req.body.amount); // DECIMAL arrives as string — coerce
+      const [ins] = await conn.query(
+        `INSERT INTO tbl_client_transaction (client_id, job_id, transaction_type, amount, balance, description, transaction_date, created_date, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW(), ?)`,
+        [req.body.clientId, req.body.jobId || null, req.body.transactionType, req.body.amount, newBalance, req.body.description || null, req.user.user_id]);
+      await conn.commit();
+      res.status(201);
+      modernOk(res, { transactionId: ins.insertId, newBalance });
+    } catch (e) { await conn.rollback(); throw e; } finally {
+      await conn.query("SELECT RELEASE_LOCK(CONCAT('client_ledger_', ?))", [req.body.clientId]);
+      conn.release();
+    }
   } catch (e) { next(e); }
 });
 
@@ -612,7 +627,14 @@ router.get('/purchase-orders', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.post('/purchase-orders', async (req, res, next) => {
+router.post('/purchase-orders', validate(Joi.object({
+  clientId: Joi.number().integer().positive().required(),
+  poNumber: Joi.string().max(100).required(),
+  description: Joi.string().max(500).allow('', null).optional(),
+  startDate: Joi.date().iso().raw().required(),
+  endDate: Joi.date().iso().raw().required(),
+  totalAmount: Joi.number().min(0).required(),
+})), async (req, res, next) => {
   try {
     const b = req.body || {};
     // RBAC: caller must have scope over the target client.
@@ -632,7 +654,7 @@ router.post('/purchase-orders', async (req, res, next) => {
 router.get('/easyfixer/:id/payout', async (req, res, next) => {
   try {
     const [[balance]] = await pool.query(
-      'SELECT efr_id, efr_cityId, current_balance FROM tbl_easyfixer WHERE efr_id = ?',
+      'SELECT efr_id, efr_cityId, current_balance FROM tbl_easyfixer WHERE efr_id = ? AND NOT (tbl_easyfixer.efr_status <=> 3)',
       [req.params.id]
     );
     if (!balance) return modernError(res, 404, 'easyfixer not found');
@@ -775,6 +797,8 @@ router.post('/payouts/bulk-ops-approve', validate(Joi.object({
   try {
     const results = await Promise.all(req.body.items.map(async (it) => {
       try {
+        const guard = await assertEfrInScope(req, it.efrId);
+        if (!guard.ok) return { payoutId: it.payoutId, ok: false, error: 'payout not found' };
         await pool.query(
           'CALL sp_ef_approve_payout_by_ops(?, ?, ?, ?, ?)',
           [it.payoutId, it.efrId, it.opsApprovedAmount, req.user.user_id, 1]
@@ -888,7 +912,7 @@ router.get('/ndm-recharges', async (req, res, next) => {
       if (efrIds.length === 0) return modernOk(res, []);
       const placeholders = efrIds.map(() => '?').join(',');
       const [efrCityRows] = await pool.query(
-        `SELECT efr_id, efr_cityId FROM tbl_easyfixer WHERE efr_id IN (${placeholders})`,
+        `SELECT efr_id, efr_cityId FROM tbl_easyfixer WHERE efr_id IN (${placeholders}) AND NOT (tbl_easyfixer.efr_status <=> 3)`,
         efrIds
       );
       const cityByEfr = new Map(efrCityRows.map((r) => [r.efr_id, r.efr_cityId]));
@@ -996,9 +1020,23 @@ router.post('/easyfixer/:id/recharge', validate(Joi.object({
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();
-      await conn.query(
+      const [bump] = await conn.query(
         `UPDATE tbl_easyfixer SET current_balance = COALESCE(current_balance, 0) + ?, balance_updated = NOW() WHERE efr_id = ?`,
         [req.body.amount, efrId]);
+      if (bump.affectedRows === 0) {
+        await conn.rollback();
+        return modernError(res, 404, 'easyfixer not found');
+      }
+      const [[bal]] = await conn.query(
+        'SELECT current_balance FROM tbl_easyfixer WHERE efr_id = ? AND NOT (tbl_easyfixer.efr_status <=> 3)',
+        [efrId]);
+      // Audit ledger row for the manual admin credit (transaction_type=1 = credit).
+      // TODO confirm legacy 'source' convention for manual admin credits against existing tbl_easyfixer_transaction rows
+      await conn.query(
+        `INSERT INTO tbl_easyfixer_transaction
+           (easyfixer_id, source, description, transaction_type, transaction_date, amount, balance, created_date, created_by)
+         VALUES (?, ?, ?, 1, NOW(), ?, ?, NOW(), ?)`,
+        [efrId, 'ADMIN_RECHARGE', req.body.reference || null, req.body.amount, bal.current_balance, req.user.user_id]);
       await conn.commit();
       modernOk(res, { applied: req.body.amount });
     } catch (e) { await conn.rollback(); throw e; } finally { conn.release(); }

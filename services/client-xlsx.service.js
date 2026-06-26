@@ -199,6 +199,117 @@ async function parseSpocUpload(buffer) {
 }
 
 /* ─── 6. Bulk SPOC ASSIGNMENT (Primary + Secondary internal users) ── */
+/* ─── 7. Bulk Monthly Revenue template + parser ──────────────────── */
+
+/*
+ * Pre-seeded XLSX template for the bulk monthly-revenue upload.
+ *
+ * Column layout:
+ *   A: Client ID         (pre-filled, locked for reference)
+ *   B: Client Name       (pre-filled, locked for reference)
+ *   C: Monthly Revenue (INR)  (blank — operator fills in)
+ *
+ * `clients` is an array of { client_id, client_name } rows returned by
+ * a targeted SELECT for the chosen clientIds.
+ */
+async function buildBulkMonthlyRevenueTemplate(clients = []) {
+  const { wb, ws } = newWorkbook('Monthly Revenue');
+  applyHeader(ws, [
+    'Client ID', 'Client Name (reference)', 'Monthly Revenue (INR)',
+  ]);
+  // Lock header cells explicitly (belt-and-suspenders — they're locked by
+  // default under sheet protection, but being explicit aids code clarity).
+  for (let col = 1; col <= 3; col++) {
+    ws.getRow(1).getCell(col).protection = { locked: true };
+  }
+  for (const c of clients) {
+    const row = ws.addRow([c.client_id, c.client_name ?? '', null]);
+    // Shade the reference columns so operators know they're read-only.
+    row.getCell(1).font = { italic: true, color: { argb: 'FF888888' } };
+    row.getCell(2).font = { italic: true, color: { argb: 'FF888888' } };
+    // Lock Client ID (A) and Client Name (B) — default under protection, set
+    // explicitly for clarity.
+    row.getCell(1).protection = { locked: true };
+    row.getCell(2).protection = { locked: true };
+    // UNLOCK Monthly Revenue (C) so the operator can type into it.
+    row.getCell(3).protection = { locked: false };
+  }
+  // Enable sheet protection with an empty password. Every cell is locked by
+  // default once protection is active; only column C data cells are unlocked
+  // (set above). The operator can click into unlocked cells and type, but
+  // cannot edit Client ID or Client Name.
+  await ws.protect('', {
+    selectLockedCells:   true,
+    selectUnlockedCells: true,
+    formatCells:         false,
+    formatColumns:       false,
+    formatRows:          false,
+    insertRows:          false,
+    insertColumns:       false,
+    deleteRows:          false,
+    deleteColumns:       false,
+    sort:                false,
+    autoFilter:          false,
+  });
+  return toBuffer(wb);
+}
+
+/*
+ * Parse a bulk monthly-revenue upload buffer.
+ *
+ * Column layout (same as template):
+ *   A: Client ID         (number, required, positive int)
+ *   B: Client Name       (ignored — reference only)
+ *   C: Monthly Revenue   (number, required, >= 0)
+ *
+ * Returns:
+ *   { rows: [{ rowNumber, status: 'valid'|'invalid', payload?, errors? }] }
+ *
+ *   payload shape: { clientId, monthlyRevenue }
+ */
+async function parseBulkMonthlyRevenue(buffer) {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buffer);
+  const ws = wb.worksheets[0];
+  if (!ws) {
+    throw Object.assign(new Error('Workbook is empty'), { status: 400 });
+  }
+  const results = [];
+  ws.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+    if (rowNumber === 1) return; // header
+    const cells = Array.isArray(row.values) ? row.values.slice(1) : [];
+    const [clientIdRaw, /* clientName */, revenueRaw] = cells;
+    const errors = [];
+
+    const clientId = toInt(clientIdRaw);
+    if (!clientId) errors.push('Client ID is required and must be a positive integer (column A)');
+
+    const revenueStr = revenueRaw == null ? '' : String(revenueRaw).trim();
+    const revenue = Number(revenueStr);
+    let validRevenue = null;
+    if (revenueStr === '') {
+      errors.push('Monthly Revenue is required (column C)');
+    } else if (!Number.isFinite(revenue) || revenue < 0) {
+      errors.push('Monthly Revenue must be a non-negative number (column C)');
+    } else {
+      validRevenue = revenue;
+    }
+
+    if (errors.length > 0) {
+      results.push({ rowNumber, status: 'invalid', errors });
+      return;
+    }
+    results.push({
+      rowNumber,
+      status: 'valid',
+      payload: { clientId, monthlyRevenue: validRevenue },
+    });
+  });
+  return { rows: results };
+}
+
+// (Section break — old section 6 header retained for readability)
+
 
 /*
  * The legacy "Upload Clients" page is actually a Primary/Secondary
@@ -265,18 +376,66 @@ function toInt(v) {
 }
 
 /*
- * Template for the bulk SPOC assignment upload — header + a clarifying
- * second row in muted italics so operators see the column shape at a
- * glance.
+ * Template for the bulk SPOC assignment upload.
+ *
+ * When `clients` is provided (array of { client_id, client_name }), each
+ * client becomes a pre-seeded row with the SPOC id columns left blank.
+ * This is the new pre-seeded variant used by POST /bulk-template.
+ *
+ * When called with no arguments (backward compat — existing
+ * GET /bulk-spoc-template route), we fall back to the original example
+ * row so the endpoint keeps its existing behaviour unchanged.
  */
-async function buildBulkSpocAssignmentTemplate() {
+async function buildBulkSpocAssignmentTemplate(clients) {
   const { wb, ws } = newWorkbook('SPOC Assignment');
   applyHeader(ws, [
-    'Client ID (number)', 'Client Name (for reference)',
+    'Client ID', 'Client Name (reference)',
     'Primary SPOC User ID', 'Secondary SPOC User ID',
   ]);
-  ws.addRow([113, 'A10 Design (example)', 42, 17]);
-  ws.getRow(2).font = { italic: true, color: { argb: 'FF888888' } };
+  // Lock header cells explicitly (belt-and-suspenders — locked by default under
+  // sheet protection, but being explicit aids code clarity).
+  for (let col = 1; col <= 4; col++) {
+    ws.getRow(1).getCell(col).protection = { locked: true };
+  }
+  if (clients && clients.length > 0) {
+    for (const c of clients) {
+      const row = ws.addRow([c.client_id, c.client_name ?? '', null, null]);
+      // Shade the reference columns so operators know they're read-only.
+      row.getCell(1).font = { italic: true, color: { argb: 'FF888888' } };
+      row.getCell(2).font = { italic: true, color: { argb: 'FF888888' } };
+      // Lock Client ID (A) and Client Name (B).
+      row.getCell(1).protection = { locked: true };
+      row.getCell(2).protection = { locked: true };
+      // UNLOCK Primary SPOC User ID (C) and Secondary SPOC User ID (D).
+      row.getCell(3).protection = { locked: false };
+      row.getCell(4).protection = { locked: false };
+    }
+  } else {
+    // Backward-compat: example row (same as before)
+    const exRow = ws.addRow([113, 'A10 Design (example)', 42, 17]);
+    exRow.font = { italic: true, color: { argb: 'FF888888' } };
+    exRow.getCell(1).protection = { locked: true };
+    exRow.getCell(2).protection = { locked: true };
+    exRow.getCell(3).protection = { locked: false };
+    exRow.getCell(4).protection = { locked: false };
+  }
+  // Enable sheet protection with an empty password. Every cell is locked by
+  // default once protection is active; only columns C + D data cells are
+  // unlocked (set above). The operator can click into unlocked cells and type,
+  // but cannot edit Client ID or Client Name.
+  await ws.protect('', {
+    selectLockedCells:   true,
+    selectUnlockedCells: true,
+    formatCells:         false,
+    formatColumns:       false,
+    formatRows:          false,
+    insertRows:          false,
+    insertColumns:       false,
+    deleteRows:          false,
+    deleteColumns:       false,
+    sort:                false,
+    autoFilter:          false,
+  });
   return toBuffer(wb);
 }
 
@@ -302,4 +461,6 @@ module.exports = {
   buildSpocTemplate,
   parseBulkSpocAssignment,
   buildBulkSpocAssignmentTemplate,
+  buildBulkMonthlyRevenueTemplate,
+  parseBulkMonthlyRevenue,
 };

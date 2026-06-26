@@ -40,6 +40,7 @@ const xlsxSvc = require('../../services/client-xlsx.service');
 const { pool } = require('../../db');
 const s3 = require('../../utils/s3-storage');
 const v = require('../../validators/client.validator');
+const logger = require('../../logger');
 
 // Multer in-memory storage for client document uploads.
 // 10MB cap — same shape as the notice-image route.
@@ -79,6 +80,37 @@ async function loadAndGuardClient(req, res) {
     return null;
   }
   return client;
+}
+
+/*
+ * Scope-guard a flat id-based sub-resource by its owning client_id.
+ *
+ * The flat /contacts/:id, /billing/:id, /custom-properties/:id,
+ * /services/:id and /documents/:id routes are keyed on the sub-resource
+ * PK, not on a /:clientId path segment — so they skip
+ * loadAndGuardClient(). Without this check a scoped operator could
+ * mutate sub-resources of clients OUTSIDE their manage_clients scope by
+ * enumerating integer ids. We resolve the owning client_id (via the
+ * service read-helpers), re-load the client, and run the SAME scope
+ * assertion the nested routes use.
+ *
+ * Anti-enumeration: every failure path returns the handler's own
+ * not-found message + 404, so "out of scope" is indistinguishable from
+ * "does not exist".
+ *
+ * Returns true when the caller is allowed to proceed; false (and has
+ * already written the 404 response) otherwise.
+ */
+async function guardRowByClientId(req, res, clientId, notFoundMsg) {
+  if (clientId == null) { modernError(res, 404, notFoundMsg); return false; }
+  const client = await svc.getClientById(clientId);
+  if (!client) { modernError(res, 404, notFoundMsg); return false; }
+  const guard = assertEntityInScope(req, {
+    client_id: client.client_id,
+    vertical_id: client.vertical_id,
+  });
+  if (!guard.ok) { modernError(res, 404, notFoundMsg); return false; }
+  return true;
 }
 
 /* ─── Clients CRUD ────────────────────────────────────────────────── */
@@ -321,6 +353,236 @@ router.get('/spoc-template', async (req, res, next) => {
 });
 
 /*
+ * POST /admin/clients/bulk-template
+ *
+ * Body: { action: 'spoc' | 'monthly_revenue', clientIds: number[] }
+ *
+ * Downloads a pre-seeded XLSX template. Each selected client becomes
+ * one pre-filled row (Client ID + Client Name in reference columns).
+ * For 'spoc': adds empty Primary SPOC User ID + Secondary SPOC User ID.
+ * For 'monthly_revenue': adds an empty Monthly Revenue (INR) column.
+ *
+ * Registration: BEFORE /:id catch-all so the literal segment is matched.
+ */
+router.post(
+  '/bulk-template',
+  requireClientEdit,
+  validate(v.bulkTemplateBody),
+  async (req, res, next) => {
+    try {
+      const { action, clientIds } = req.body;
+      // Scope-filter: only return clients visible to this operator.
+      const scope = require('../../lib/scope').buildRequestScope(req);
+      const scopeClauses = [];
+      const scopeParams = [];
+      if (scope?.clients) {
+        const c = scope.clients;
+        if (c.mode === 'none') {
+          return modernError(res, 403, 'no clients in scope');
+        } else if (c.mode === 'allow' && c.ids.length) {
+          scopeClauses.push(`client_id IN (${c.ids.map(() => '?').join(',')})`);
+          scopeParams.push(...c.ids);
+        }
+      }
+      if (scope?.verticals) {
+        const vs = scope.verticals;
+        if (vs.mode === 'none') {
+          return modernError(res, 403, 'no verticals in scope');
+        } else if (vs.mode === 'allow' && vs.ids.length) {
+          scopeClauses.push(`vertical_id IN (${vs.ids.map(() => '?').join(',')})`);
+          scopeParams.push(...vs.ids);
+        }
+      }
+      // Build the final WHERE for the requested clientIds + scope.
+      const idPlaceholders = clientIds.map(() => '?').join(',');
+      const where = scopeClauses.length
+        ? `client_id IN (${idPlaceholders}) AND ${scopeClauses.join(' AND ')}`
+        : `client_id IN (${idPlaceholders})`;
+      const [clients] = await pool.query(
+        `SELECT client_id, client_name FROM tbl_client WHERE ${where} ORDER BY client_name`,
+        [...clientIds, ...scopeParams],
+      );
+      let buf;
+      let filename;
+      if (action === 'spoc') {
+        buf = await xlsxSvc.buildBulkSpocAssignmentTemplate(clients);
+        filename = 'bulk-spoc-template.xlsx';
+      } else {
+        buf = await xlsxSvc.buildBulkMonthlyRevenueTemplate(clients);
+        filename = 'bulk-monthly-revenue-template.xlsx';
+      }
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.send(buf);
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+/*
+ * POST /admin/clients/bulk-upload
+ *
+ * multipart/form-data:  file=<xlsx>  action=<'spoc'|'monthly_revenue'>
+ *                       [dryRun=<'true'|'false'>]
+ *
+ * Returns: { summary: {...}, results: [{ rowNumber, status, ... }], dryRun: bool }
+ *
+ * When dryRun=true → parse + validate + build the same {summary, results}
+ * WITHOUT any writes. When dryRun=false (default) → commit (current behaviour).
+ *
+ * For 'spoc':
+ *   - Delegates to the same parseBulkSpocAssignment + upsertPrimarySecondarySpoc
+ *     path that /bulk-upload-spocs uses. Summary: { total, updated, invalid,
+ *     skipped, failed }; per-row status: 'updated'|'invalid'|'skipped'|'failed'.
+ *
+ * For 'monthly_revenue':
+ *   - Parses Client ID + Monthly Revenue from the template.
+ *   - Validates: clientId is a positive int that exists AND is in scope.
+ *   - Updates tbl_client SET monthly_revenue = ? WHERE client_id = ?.
+ *   - Summary: { total, updated, invalid, failed }.
+ *   - Per-row status: 'updated'|'invalid'|'failed'.
+ *
+ * Registration: BEFORE /:id catch-all.
+ */
+router.post(
+  '/bulk-upload',
+  requireClientEdit,
+  upload.single('file'),
+  validate(v.bulkUploadBody),
+  async (req, res, next) => {
+    try {
+      if (!req.file) return modernError(res, 400, 'missing "file" upload');
+      const { action } = req.body;
+      // dryRun arrives as a FormData text field ("true"/"false") or Joi-coerced bool.
+      const dryRun = req.body.dryRun === true || req.body.dryRun === 'true';
+
+      if (action === 'spoc') {
+        // ── Delegate to existing SPOC assignment path ──────────────
+        const { rows } = await xlsxSvc.parseBulkSpocAssignment(req.file.buffer);
+        const validUsers = await verticalsSvc.activeInternalUserIds();
+        // Resolve client names once (single query) so the per-row report's
+        // Client column shows the name — for both the dry-run preview and commit.
+        const spocClientIds = [...new Set(rows.map((r) => r.payload?.clientId).filter(Boolean))];
+        const spocNameMap = new Map();
+        if (spocClientIds.length) {
+          const [crows] = await pool.query(
+            `SELECT client_id, client_name FROM tbl_client WHERE client_id IN (${spocClientIds.map(() => '?').join(',')})`,
+            spocClientIds,
+          );
+          for (const c of crows) spocNameMap.set(Number(c.client_id), c.client_name);
+        }
+        const out = { total: rows.length, updated: 0, invalid: 0, skipped: 0, failed: 0 };
+        const results = [];
+        for (const r of rows) {
+          if (r.status === 'invalid') {
+            out.invalid++;
+            results.push({ rowNumber: r.rowNumber, status: 'invalid', errors: r.errors });
+            continue;
+          }
+          const { clientId, primaryUserId, secondaryUserId } = r.payload;
+          const userErrors = [];
+          if (!validUsers.has(primaryUserId))   userErrors.push(`Primary user ${primaryUserId} not found / inactive`);
+          if (!validUsers.has(secondaryUserId)) userErrors.push(`Secondary user ${secondaryUserId} not found / inactive`);
+          if (userErrors.length) {
+            out.invalid++;
+            results.push({ rowNumber: r.rowNumber, status: 'invalid', clientId, clientName: spocNameMap.get(clientId) ?? null, errors: userErrors });
+            continue;
+          }
+          if (dryRun) {
+            // Dry-run: validation passed — mark as would-be-updated without writing.
+            out.updated++;
+            results.push({ rowNumber: r.rowNumber, status: 'updated', clientId, clientName: spocNameMap.get(clientId) ?? null, primaryUserId, secondaryUserId });
+          } else {
+            try {
+              const detail = await verticalsSvc.upsertPrimarySecondarySpoc(clientId, primaryUserId, secondaryUserId);
+              out.updated++;
+              results.push({ rowNumber: r.rowNumber, status: 'updated', clientId, clientName: spocNameMap.get(clientId) ?? null, detail });
+            } catch (e) {
+              if (e.status === 404) {
+                out.skipped++;
+                results.push({ rowNumber: r.rowNumber, status: 'skipped', reason: e.message });
+              } else {
+                out.failed++;
+                results.push({ rowNumber: r.rowNumber, status: 'failed', errors: [e.message] });
+              }
+            }
+          }
+        }
+        return modernOk(res, { summary: out, results, dryRun });
+      }
+
+      // ── Monthly Revenue path ─────────────────────────────────────
+      const { rows } = await xlsxSvc.parseBulkMonthlyRevenue(req.file.buffer);
+      const scope = require('../../lib/scope').buildRequestScope(req);
+      const out = { total: rows.length, updated: 0, invalid: 0, skipped: 0, failed: 0 };
+      const results = [];
+
+      for (const r of rows) {
+        if (r.status === 'invalid') {
+          out.invalid++;
+          results.push({ rowNumber: r.rowNumber, status: 'invalid', errors: r.errors });
+          continue;
+        }
+        const { clientId, monthlyRevenue } = r.payload;
+
+        // Validate client exists AND is in caller's scope (anti-enumeration:
+        // out-of-scope → same "not found" message as truly missing).
+        let client = null;
+        try {
+          client = await svc.getClientById(clientId);
+        } catch (e) {
+          // DB error on this row — count as failed
+          out.failed++;
+          results.push({ rowNumber: r.rowNumber, status: 'failed', errors: [`DB error: ${e.message}`] });
+          continue;
+        }
+        if (!client) {
+          out.invalid++;
+          results.push({ rowNumber: r.rowNumber, status: 'invalid', errors: [`Client ID ${clientId} not found`] });
+          continue;
+        }
+        const { assertEntityInScope } = require('../../lib/scope');
+        const guard = assertEntityInScope(req, {
+          client_id: client.client_id,
+          vertical_id: client.vertical_id,
+        });
+        if (!guard.ok) {
+          out.invalid++;
+          results.push({ rowNumber: r.rowNumber, status: 'invalid', errors: [`Client ID ${clientId} not found`] });
+          continue;
+        }
+
+        if (dryRun) {
+          // Dry-run: validation passed — mark as would-be-updated without writing.
+          out.updated++;
+          results.push({ rowNumber: r.rowNumber, status: 'updated', clientId, clientName: client.client_name, monthlyRevenue });
+        } else {
+          try {
+            await pool.query(
+              'UPDATE tbl_client SET monthly_revenue = ?, update_date = NOW() WHERE client_id = ?',
+              [monthlyRevenue, clientId],
+            );
+            out.updated++;
+            results.push({ rowNumber: r.rowNumber, status: 'updated', clientId, clientName: client.client_name, monthlyRevenue });
+          } catch (e) {
+            logger.error({ err: e?.message, clientId }, '[bulk-upload] monthly_revenue update failed');
+            out.failed++;
+            results.push({ rowNumber: r.rowNumber, status: 'failed', errors: [e.message] });
+          }
+        }
+      }
+      return modernOk(res, { summary: out, results, dryRun });
+    } catch (e) {
+      if (e.code === 'LIMIT_FILE_SIZE') return modernError(res, 400, 'file exceeds 10MB');
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+/*
  * GET /custom-property-keys
  *
  * Cross-client distinct list of custom-property keys ever used. Powers
@@ -456,6 +718,7 @@ router.put(
   validate(v.updateContactBody),
   async (req, res, next) => {
     try {
+      if (!(await guardRowByClientId(req, res, await svc.getContactClientId(req.params.id), 'contact not found'))) return;
       await svc.updateContact(req.params.id, req.body);
       modernOk(res, { updated: true });
     } catch (e) {
@@ -526,6 +789,7 @@ router.delete(
   requireClientEdit,
   async (req, res, next) => {
     try {
+      if (!(await guardRowByClientId(req, res, await svc.getContactClientId(req.params.id), 'contact not found'))) return;
       const affected = await svc.deleteContact(req.params.id);
       if (!affected) return modernError(res, 404, 'contact not found');
       modernOk(res, { deleted: true });
@@ -566,6 +830,7 @@ router.put(
   validate(v.updateBillingBody),
   async (req, res, next) => {
     try {
+      if (!(await guardRowByClientId(req, res, await svc.getBillingClientId(req.params.id), 'billing row not found'))) return;
       const affected = await svc.updateBilling(req.params.id, req.body);
       if (!affected) return modernError(res, 404, 'billing row not found');
       modernOk(res, { updated: true });
@@ -581,6 +846,7 @@ router.delete(
   requireClientEdit,
   async (req, res, next) => {
     try {
+      if (!(await guardRowByClientId(req, res, await svc.getBillingClientId(req.params.id), 'billing row not found'))) return;
       const affected = await svc.deleteBilling(req.params.id);
       if (!affected) return modernError(res, 404, 'billing row not found');
       modernOk(res, { deleted: true });
@@ -651,6 +917,7 @@ router.put(
   validate(v.updateCustomPropertyBody),
   async (req, res, next) => {
     try {
+      if (!(await guardRowByClientId(req, res, await svc.getCustomPropertyClientId(req.params.id), 'custom property not found'))) return;
       const affected = await svc.updateCustomProperty(req.params.id, req.body);
       if (!affected) return modernError(res, 404, 'custom property not found');
       modernOk(res, { updated: true });
@@ -666,6 +933,7 @@ router.delete(
   requireClientEdit,
   async (req, res, next) => {
     try {
+      if (!(await guardRowByClientId(req, res, await svc.getCustomPropertyClientId(req.params.id), 'custom property not found'))) return;
       const affected = await svc.deleteCustomProperty(req.params.id);
       if (!affected) return modernError(res, 404, 'custom property not found');
       modernOk(res, { deleted: true });
@@ -711,8 +979,7 @@ router.get('/:clientId/collected-by-preference', async (req, res, next) => {
     } catch (e) {
       // Defensive: if collected_by column doesn't exist on this DB,
       // fall back to "any" rather than 500.
-      // eslint-disable-next-line no-console
-      console.warn('[collected-by-pref] tbl_client.collected_by read failed — falling back to "any":', e?.message);
+      logger.warn({ err: e }, 'collected-by-pref: tbl_client.collected_by read failed — falling back to "any"');
     }
     modernOk(res, { preferred, source });
   } catch (e) { next(e); }
@@ -886,6 +1153,7 @@ router.get(
   }),
   async (req, res, next) => {
     try {
+      if (!(await guardRowByClientId(req, res, await svc.getServiceClientId(req.params.id), 'client service not found'))) return;
       const row = await clientServicesSvc.getOne(req.params.id);
       if (!row) return modernError(res, 404, 'client service not found');
       modernOk(res, row);
@@ -959,6 +1227,7 @@ router.put(
   }),
   async (req, res, next) => {
     try {
+      if (!(await guardRowByClientId(req, res, await svc.getServiceClientId(req.params.id), 'client service not found'))) return;
       const affected = await clientServicesSvc.update(req.params.id, req.body);
       if (!affected) return modernError(res, 404, 'client service not found');
       modernOk(res, { updated: true });
@@ -974,6 +1243,7 @@ router.delete(
   requireClientEdit,
   async (req, res, next) => {
     try {
+      if (!(await guardRowByClientId(req, res, await svc.getServiceClientId(req.params.id), 'client service not found'))) return;
       const affected = await clientServicesSvc.softDelete(req.params.id);
       if (!affected) return modernError(res, 404, 'client service not found');
       modernOk(res, { deleted: true });
@@ -1225,6 +1495,7 @@ router.delete(
   requireClientEdit,
   async (req, res, next) => {
     try {
+      if (!(await guardRowByClientId(req, res, await svc.getDocumentClientId(req.params.id), 'document not found'))) return;
       const affected = await docsSvc.softDelete(req.params.id);
       if (!affected) return modernError(res, 404, 'document not found');
       modernOk(res, { deleted: true });

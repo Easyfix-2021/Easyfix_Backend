@@ -48,6 +48,16 @@ function quickHint(status) {
   return '';
 }
 
+// Prefer a per-request reason stamped by the handler (res.locals.logHint, set by
+// modernError/legacyError + the notFound handler) so the line says WHAT failed —
+// e.g. " · Job 123 not found" / " · no matching route" — falling back to the
+// generic status hint when no handler reason was recorded.
+function hintFor(res, status) {
+  const custom = res.locals && res.locals.logHint;
+  if (custom) return ` · ${custom}`;
+  return quickHint(status);
+}
+
 module.exports = function httpLog(req, res, next) {
   const started = Date.now();
   const path = req.originalUrl;
@@ -66,6 +76,15 @@ module.exports = function httpLog(req, res, next) {
       return;
     }
 
+    // High-frequency location telemetry (POST /jobs/:id/location — one ping every
+    // few seconds per active job, across many technicians) would flood the log.
+    // Keep SUCCESSFUL pings at debug so everyday logs stay readable; failures
+    // (4xx/5xx) fall through to the normal warn/error path below.
+    if (status < 400 && req.method === 'POST' && /\/jobs\/\d+\/location(?:[/?]|$)/.test(path)) {
+      logger.debug(`${status} POST ${path} (${duration} ms)`);
+      return;
+    }
+
     const methodStr = paint(METHOD_COLOR[req.method] || 'gray', req.method.padEnd(6));
     const who =
       req.user?.official_email ||
@@ -74,7 +93,7 @@ module.exports = function httpLog(req, res, next) {
       (req.integrationClient?.loginName ? `api:${req.integrationClient.loginName}` : null) ||
       'guest';
 
-    const sentence = `${status} ${methodStr} ${path}  (${duration} ms) · ${who}${quickHint(status)}`;
+    const sentence = `${status} ${methodStr} ${path}  (${duration} ms) · ${who}${hintFor(res, status)}`;
 
     if (status === 429)                        logger.rate(sentence);
     else if (status === 401 || status === 403) logger.security(sentence);

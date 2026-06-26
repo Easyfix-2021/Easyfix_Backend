@@ -11,6 +11,9 @@ const { pool } = require('../db');
  *            Each row = "this pincode belongs to this zone in this city."
  *            Zones are created on the fly if (city_name, zone_name) doesn't
  *            exist; pincodes must already be in tbl_pincode for that city.
+ *            Coverage is many-to-many (tbl_zone_pincode_mapping): a pincode
+ *            may belong to multiple zones, so rows are never skipped for
+ *            "already in another zone".
  *   Sheet 2: "Cities (Master)" — locked; (city_id, city_name).
  *   Sheet 3: "Existing Zones"  — locked; (zone_id, zone_name, city_name).
  *   Sheet 4: "Read me"         — locked; format notes.
@@ -106,8 +109,8 @@ async function generateTemplate() {
     '   the zone is created on commit and the pincode is assigned to it.',
     '3. The pincode must already be present in Manage Pincodes (tbl_pincode) for the',
     '   given city. Add missing pincodes there first.',
-    '4. A pincode can only belong to ONE zone. Rows that try to move a pincode from',
-    '   one zone to another are rejected — deassign in the source zone first.',
+    '4. A pincode may belong to MULTIPLE zones. Re-uploading a (zone, pincode) pair',
+    '   that already exists is a harmless no-op (reported as "unchanged").',
     '5. Run a Dry-run from the upload modal to see what would happen before committing.',
   ].forEach((line, i) => {
     const c = notes.getCell(`A${i + 1}`);
@@ -141,15 +144,25 @@ async function processUpload(buffer, { dryRun = false, userId = null } = {}) {
   try {
     await conn.beginTransaction();
 
-    const [[cities], [zones], [pincodes]] = await Promise.all([
+    const [[cities], [zones], [pincodes], [mappings]] = await Promise.all([
       conn.query('SELECT city_id, city_name FROM tbl_city'),
-      conn.query('SELECT zone_id, zone_name, city_id FROM tbl_zone_master'),
-      conn.query('SELECT pincode_id, pincode, city_id, zone_id FROM tbl_pincode WHERE pincode_status = 1'),
+      // ALL zones (incl. inactive) so an existing inactive zone with the same
+      // (city, name) is RECOGNISED rather than silently duplicated; rows that
+      // target an inactive zone are rejected below (reactivate it first).
+      conn.query('SELECT zone_id, zone_name, city_id, zone_status FROM tbl_zone_master'),
+      conn.query('SELECT pincode_id, pincode, city_id FROM tbl_pincode WHERE pincode_status = 1'),
+      conn.query('SELECT zone_id, pincode_id FROM tbl_zone_pincode_mapping'),
     ]);
     const cityByName = new Map(cities.map((c) => [String(c.city_name).trim().toLowerCase(), c.city_id]));
     const zoneByCityName = new Map();
     for (const z of zones) zoneByCityName.set(`${z.city_id}::${String(z.zone_name).trim().toLowerCase()}`, z);
     const pincodeByValue = new Map(pincodes.map((p) => [String(p.pincode), p]));
+    // Existing zone<->pincode coverage, for idempotent dry-run prediction.
+    const mappedPincodeIdsByZone = new Map();
+    for (const m of mappings) {
+      if (!mappedPincodeIdsByZone.has(m.zone_id)) mappedPincodeIdsByZone.set(m.zone_id, new Set());
+      mappedPincodeIdsByZone.get(m.zone_id).add(m.pincode_id);
+    }
 
     const results = [];
     let createdZones = 0;
@@ -183,9 +196,17 @@ async function processUpload(buffer, { dryRun = false, userId = null } = {}) {
       // Resolve or create zone (within this city).
       const zoneKey = `${cityId}::${zoneName.toLowerCase()}`;
       let zone = zoneByCityName.get(zoneKey);
+      // Existing INACTIVE zone: don't duplicate it and don't map pincodes to an
+      // inactive zone (preserves the "inactive zone ⟹ 0 pincodes" invariant).
+      // The operator must reactivate it from Manage Zones first.
+      if (zone && Number(zone.zone_status) !== 1) {
+        results.push({ rowNumber, status: 'failed', errors: [`Zone "${zoneName}" exists in ${cityName} but is inactive — reactivate it before uploading pincodes`] });
+        failedCount++;
+        continue;
+      }
       if (!zone) {
         if (dryRun) {
-          zone = { zone_id: -(createdZones + 1), zone_name: zoneName, city_id: cityId };
+          zone = { zone_id: -(createdZones + 1), zone_name: zoneName, city_id: cityId, zone_status: 1 };
           zoneByCityName.set(zoneKey, zone);
         } else {
           const [zr] = await conn.query(
@@ -197,7 +218,7 @@ async function processUpload(buffer, { dryRun = false, userId = null } = {}) {
             'INSERT INTO tbl_zone_city_mapping (zone_id, city_id) VALUES (?, ?)',
             [zr.insertId, cityId]
           );
-          zone = { zone_id: zr.insertId, zone_name: zoneName, city_id: cityId };
+          zone = { zone_id: zr.insertId, zone_name: zoneName, city_id: cityId, zone_status: 1 };
           zoneByCityName.set(zoneKey, zone);
         }
         createdZones++;
@@ -215,26 +236,36 @@ async function processUpload(buffer, { dryRun = false, userId = null } = {}) {
         failedCount++;
         continue;
       }
-      if (p.zone_id != null && Number(p.zone_id) !== Number(zone.zone_id)) {
-        results.push({ rowNumber, status: 'skipped', reason: `Pincode ${pincode} is already in another zone (id ${p.zone_id})` });
-        skipCount++;
-        continue;
-      }
-      if (Number(p.zone_id) === Number(zone.zone_id)) {
-        results.push({ rowNumber, status: 'skipped', reason: `Pincode ${pincode} already in this zone` });
-        skipCount++;
+      // Multi-zone is allowed (many-to-many via tbl_zone_pincode_mapping).
+      // INSERT IGNORE is idempotent: a brand-new (zone_id, pincode_id) pair is
+      // an assignment; an existing pair is a no-op (affectedRows === 0).
+      if (dryRun) {
+        // Predict the outcome without writing.
+        if (!mappedPincodeIdsByZone.has(zone.zone_id)) mappedPincodeIdsByZone.set(zone.zone_id, new Set());
+        const zoneSet = mappedPincodeIdsByZone.get(zone.zone_id);
+        if (zoneSet.has(p.pincode_id)) {
+          results.push({ rowNumber, status: 'skipped', reason: `Pincode ${pincode} already in this zone` });
+          skipCount++;
+        } else {
+          zoneSet.add(p.pincode_id);
+          results.push({ rowNumber, status: 'assigned', pincode, zone_name: zoneName, city_name: cityName });
+          assignedPincodes++;
+        }
         continue;
       }
 
-      if (!dryRun) {
-        await conn.query(
-          'UPDATE tbl_pincode SET zone_id = ?, updated_by = ? WHERE pincode_id = ?',
-          [zone.zone_id, userId, p.pincode_id]
-        );
-        p.zone_id = zone.zone_id;
+      const [ins] = await conn.query(
+        `INSERT IGNORE INTO tbl_zone_pincode_mapping (zone_id, pincode_id, created_on, created_by)
+         VALUES (?, ?, NOW(), ?)`,
+        [zone.zone_id, p.pincode_id, userId]
+      );
+      if (ins.affectedRows > 0) {
+        results.push({ rowNumber, status: 'assigned', pincode, zone_name: zoneName, city_name: cityName });
+        assignedPincodes++;
+      } else {
+        results.push({ rowNumber, status: 'skipped', reason: `Pincode ${pincode} already in this zone` });
+        skipCount++;
       }
-      results.push({ rowNumber, status: 'assigned', pincode, zone_name: zoneName, city_name: cityName });
-      assignedPincodes++;
     }
 
     if (dryRun) await conn.rollback(); else await conn.commit();

@@ -6,8 +6,13 @@ const logger = require('./logger');
  *
  * Why these knobs matter:
  *   connectionLimit  — hard ceiling on open sockets to MySQL. Too low = client queues;
- *                      too high = MySQL's own `max_connections` rejects. 20 suits a
- *                      single-node Node process; scale horizontally instead of raising.
+ *                      too high = MySQL's own `max_connections` rejects. Bumped 20 → 30
+ *                      because this one process serves BOTH the CRM and the EasyFixer app
+ *                      off the same pool, and a single dashboard load fans out ~15 parallel
+ *                      queries (Promise.all in mobile-dashboard.service.js); at 20, two
+ *                      concurrent dashboard loads alone could saturate the pool and queue
+ *                      everything else. 30 gives headroom without approaching MySQL's
+ *                      `max_connections`. Scale horizontally before raising further.
  *   queueLimit       — how many pending acquires we hold in memory before failing fast.
  *                      Unbounded (0) lets a traffic spike pile up requests that will
  *                      eventually time-out anyway; we prefer quick "pool saturated".
@@ -33,7 +38,7 @@ const pool = mysql.createPool({
   user:     process.env.DB_USER,
   password: process.env.DB_PASSWORD,
 
-  connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT || '20', 10),
+  connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT || '30', 10),
   queueLimit:      parseInt(process.env.DB_QUEUE_LIMIT      || '50', 10),
   maxIdle:         parseInt(process.env.DB_MAX_IDLE         || '10', 10),
   idleTimeout:     parseInt(process.env.DB_IDLE_TIMEOUT     || '60000', 10),
@@ -79,7 +84,7 @@ pool.on('enqueue',    () => {
 });
 
 function getPoolStats() {
-  const limit    = parseInt(process.env.DB_CONNECTION_LIMIT || '20', 10);
+  const limit    = parseInt(process.env.DB_CONNECTION_LIMIT || '30', 10);
   const queueMax = parseInt(process.env.DB_QUEUE_LIMIT      || '50', 10);
   return {
     limit,

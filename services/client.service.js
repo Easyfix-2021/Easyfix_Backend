@@ -72,7 +72,7 @@ async function getClientColumns() {
           'client_id', 'client_name', 'client_email', 'client_address',
           'client_type', 'reference_code', 'booking_cut_off', 'client_status',
           'insert_date', 'update_date', 'inserted_by', 'updated_by',
-          'vertical_id', 'collected_by',
+          'vertical_id', 'collected_by', 'monthly_revenue',
         ]);
       }
     })();
@@ -156,7 +156,8 @@ async function listClients({ extraClauses = [], extraParams = [], includeInactiv
     // EasyFix_CRM ClientDaoImpl.java#75.
     `SELECT cl.client_id, cl.client_name, cl.client_email, cl.client_status, cl.client_type,
             cl.reference_code, cl.booking_cut_off, cl.vertical_id, cl.collected_by,
-            cl.client_city_id AS city_id, ct.city_name
+            cl.client_city_id AS city_id, ct.city_name,
+            cl.monthly_revenue
        FROM tbl_client cl
        LEFT JOIN tbl_city ct ON ct.city_id = cl.client_city_id
        ${where}
@@ -203,8 +204,7 @@ async function listClients({ extraClauses = [], extraParams = [], includeInactiv
     }
   } catch (e) {
     // Defensive: never let SPOC resolution failure kill the list.
-    // eslint-disable-next-line no-console
-    console.warn('[client.service.listClients] SPOC resolve failed:', e?.message);
+    logger.warn({ err: e?.message }, '[client.service.listClients] SPOC resolve failed');
   }
 
   const items = rows.map((r) => ({
@@ -266,6 +266,8 @@ const CLIENT_INSERT_MAP = {
   reporting_contact_ids: (b) => (Array.isArray(b.reportingContactIds)
                                   ? b.reportingContactIds.join(',')
                                   : (b.reportingContactIds ?? null)),
+  // commercial metrics
+  monthly_revenue:    (b) => b.monthlyRevenue ?? null,
   // audit
   inserted_by:        (_, actorId) => actorId,
   updated_by:         (_, actorId) => actorId,
@@ -323,6 +325,8 @@ const UPDATE_ALLOWED = [
   'logo_id',
   // mapping refs
   'vertical_id', 'reporting_contact_ids',
+  // commercial metrics
+  'monthly_revenue',
 ];
 
 // Map common camelCase shapes the FE might send onto the snake_case columns.
@@ -362,6 +366,8 @@ const CAMEL_TO_SNAKE = {
   // mapping refs
   verticalId: 'vertical_id',
   reportingContactIds: 'reporting_contact_ids',
+  // commercial metrics
+  monthlyRevenue: 'monthly_revenue',
 };
 
 async function updateClient(clientId, body, actorId) {
@@ -410,9 +416,12 @@ async function listContacts(clientId) {
  *
  * `excludeId` lets the edit form skip the row being edited from the
  * duplicate set.
+ *
+ * Soft-deleted contacts (status = 0) are excluded so a deleted SPOC's
+ * email/phone can be re-added.
  */
 async function findDuplicateContact({ clientId, email, phone, excludeId }) {
-  const clauses = ['client_id = ?'];
+  const clauses = ['client_id = ?', 'status = 1'];
   const params  = [clientId];
   const orClauses = [];
   if (email) { orClauses.push('contact_email = ?'); params.push(email); }
@@ -514,6 +523,18 @@ async function updateContact(contactId, body) {
   return r.affectedRows;
 }
 
+/*
+ * Scope helper — resolve the owning client_id for a contact row.
+ * Used by the route layer to scope-guard flat /contacts/:id mutations
+ * (the mutation SQL itself stays bare-PK by design).
+ */
+async function getContactClientId(contactId) {
+  const [[row]] = await pool.query(
+    'SELECT client_id FROM tbl_client_contacts WHERE id = ? LIMIT 1', [contactId],
+  );
+  return row ? row.client_id : null;
+}
+
 // Soft-delete: flip status to 0 rather than DELETE so legacy joins
 // against tbl_client_contacts.id don't dangle. Matches the legacy
 // `addUpdateClientContact` behaviour when status was set to 0.
@@ -598,6 +619,17 @@ async function deleteBilling(billingId) {
     'DELETE FROM tbl_client_billing WHERE c_bill_id = ?', [billingId],
   );
   return r.affectedRows;
+}
+
+/*
+ * Scope helper — resolve the owning client_id for a billing row.
+ * Used by the route layer to scope-guard flat /billing/:id mutations.
+ */
+async function getBillingClientId(billingId) {
+  const [[row]] = await pool.query(
+    'SELECT client_id FROM tbl_client_billing WHERE c_bill_id = ? LIMIT 1', [billingId],
+  );
+  return row ? row.client_id : null;
 }
 
 /* ─── Client Custom Properties ────────────────────────────────────── */
@@ -735,6 +767,20 @@ async function deleteCustomProperty(propId) {
 }
 
 /*
+ * Scope helper — resolve the owning client_id for a custom-property row.
+ * Reuses the customPropCols() PK probe (the PK drifts between `id` and
+ * `c_prop_id` across deploys) rather than hardcoding the column name.
+ */
+async function getCustomPropertyClientId(propId) {
+  const cols = await customPropCols();
+  const [[row]] = await pool.query(
+    `SELECT client_id FROM tbl_client_custom_properties WHERE ${cols.pk} = ? LIMIT 1`,
+    [propId],
+  );
+  return row ? row.client_id : null;
+}
+
+/*
  * Column-name drift probe for tbl_client_custom_properties.
  *
  * Some EasyFix environments have the legacy schema (c_prop_id /
@@ -772,6 +818,28 @@ async function detectCustomPropsShape() {
   }
   _customPropsColsProbed = true;
   return _customPropsLegacyShape;
+}
+
+/*
+ * Scope helper — resolve the owning client_id for a client-service row.
+ * Used by the route layer to scope-guard flat /services/:id reads/mutations.
+ */
+async function getServiceClientId(serviceId) {
+  const [[row]] = await pool.query(
+    'SELECT client_id FROM tbl_client_service WHERE client_service_id = ? LIMIT 1', [serviceId],
+  );
+  return row ? row.client_id : null;
+}
+
+/*
+ * Scope helper — resolve the owning client_id for a client-document row.
+ * Used by the route layer to scope-guard flat /documents/:id mutations.
+ */
+async function getDocumentClientId(docId) {
+  const [[row]] = await pool.query(
+    'SELECT client_id FROM tbl_client_document WHERE document_id = ? LIMIT 1', [docId],
+  );
+  return row ? row.client_id : null;
 }
 
 /*
@@ -844,15 +912,21 @@ module.exports = {
   createContact,
   updateContact,
   deleteContact,
+  getContactClientId,
   // billing
   listBilling,
   createBilling,
   updateBilling,
   deleteBilling,
+  getBillingClientId,
   // custom properties
   listCustomProperties,
   createCustomProperty,
   updateCustomProperty,
   deleteCustomProperty,
+  getCustomPropertyClientId,
   listDistinctCustomPropertyKeys,
+  // scope helpers for flat id-based sub-resource routes
+  getServiceClientId,
+  getDocumentClientId,
 };

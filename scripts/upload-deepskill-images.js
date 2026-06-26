@@ -1,398 +1,267 @@
 #!/usr/bin/env node
 /*
- * upload-deepskill-images.js
- * ──────────────────────────────────────────────────────────────────────────
- * Bulk-publish deep-skill images: match local image files to tbl_deep_skill
- * rows by name, upload the matched copies to S3, and update each row's
- * `deepskill_image` column to point at the uploaded object.
+ * upload-deepskill-images.js — ONE-TIME, self-contained bulk loader for the
+ * deep-skill images in the SharePoint "Deepskill image" tree → S3 + the legacy
+ * AWS server, with a DB rename of tbl_deep_skill.deepskill_image.
+ * ===========================================================================
+ * SHAREPOINT TREE (download it locally first → CONFIG.IMAGES_DIR):
+ *     Deepskill image/<Category>/<Type>/<DeepSkill>/<skill> <action>.png
+ *   e.g. Carpenter/Chair & Hydrolic System/Motorised Recliners/Motorised Recliners instalation.png
+ *        Carpenter/Chair & Hydrolic System/Motorised Recliners/Motorised Recliners repair.png
+ *   Some images sit directly under a <Type> folder (e.g. "metal chair instalation .png").
  *
- * It is deliberately a TWO-PHASE tool:
+ * WHAT IT DOES (per deep skill):
+ *   1. Walks the tree; the deep skill is the image's LEAF FOLDER name, falling
+ *      back to the filename with action words (instalation/repair/…) stripped.
+ *   2. MATCHES it to a tbl_deep_skill row by normalised name (DB the CONFIG.DB
+ *      points at — point it at PROD to identify+update prod deep skills).
+ *   3. Picks a PRIMARY image per skill (prefers the "instal…" one) → becomes
+ *      deepskill_image; any extras (repair, …) are uploaded too (seq 2,3…) so
+ *      nothing is lost, but only the primary is written to the DB.
+ *   4. RENAMES → canonical S3 key  Skills/Skill_<deepskill_id>_<seq>  (no
+ *      extension; the original filename is kept in S3 object metadata).
+ *   5. UPLOADS to S3, writes a canonically-named copy under CONFIG.OUT_DIR/Skills/,
+ *      optionally rsyncs that to the LEGACY server, and UPDATEs deepskill_image.
  *
- *   DRY RUN (default — no --run flag)
- *     - Reads the image folder + the deep-skill rows from the DB pointed at
- *       by .env. Matches each image to a deepskill_id by name (fuzzy).
- *     - Writes a review report:  deepskill-renamed/deepskill-image-mapping.csv
- *     - Uploads NOTHING. Touches NO database rows. 100% read-only.
+ * SAFETY: DRY RUN is the default — it matches + prints the plan + writes a
+ * mapping CSV (matched / extra / ambiguous / unmatched / already-have-image) with
+ * ZERO S3/DB/legacy writes. Review the CSV, fix stragglers with a --map file,
+ * then re-run with --run. Rows that already have an image are skipped unless
+ * --overwrite (which bumps the seq so presigned reads bust).
  *
- *   REAL RUN (--run)
- *     - Re-does the match (applying any --map fixups.csv overrides), then for
- *       every MATCHED image:
- *         1. writes a canonical renamed copy under deepskill-renamed/Skills/
- *            (this is what step 5's rsync ships to the legacy server)
- *         2. uploads it to s3://<S3_BUCKET_NAME>/<S3_PREFIX>/<id>_<slug>
- *         3. UPDATE tbl_deep_skill SET deepskill_image = <key> WHERE deepskill_id = <id>
+ * FILL THE CONFIG BLOCK BELOW (AWS + LEGACY + DB creds) — placeholders marked <…>.
+ * Each can also come from the matching env var (so `dotenv` / your shell works too).
  *
- * ⚠️  The DB + bucket are whatever .env says. Point .env at PROD only when you
- *     mean to update PROD. The banner below prints the live target every run.
+ * USAGE:
+ *   node scripts/upload-deepskill-images.js                 # DRY RUN
+ *   node scripts/upload-deepskill-images.js --run           # execute (S3 + DB [+ legacy if enabled])
+ *   node scripts/upload-deepskill-images.js --run --overwrite
+ *   node scripts/upload-deepskill-images.js --map fixups.csv --run
  *
- * Usage:
- *   node scripts/upload-deepskill-images.js --dir ./deepskill-images
- *   node scripts/upload-deepskill-images.js --dir ./deepskill-images --map fixups.csv --run
- *
- * Flags:
- *   --dir  <path>   (required) root folder to scan recursively for images
- *   --map  <path>   (optional) fixups CSV with header `filename,deepskill_id`
- *                   — forces a specific match for the named file (basename),
- *                     overriding/resolving fuzzy or ambiguous results
- *   --run           actually upload + update the DB (omit = dry run)
- *   --threshold <n> fuzzy-match acceptance score 0..1 (default 0.86)
+ * FLAGS (override CONFIG): --run  --overwrite  --pick-first  --keep-ext
+ *   --dir D  --out D  --map F.csv
  */
 
 require('dotenv').config();
-const fs = require('node:fs');
-const path = require('node:path');
-const crypto = require('node:crypto');
-const { pool, closePool } = require('../db');
+const fs = require('fs');
+const path = require('path');
+const { execFileSync } = require('child_process');
 
-// ─── Config (review before a PROD --run) ────────────────────────────────────
-const S3_PREFIX = 'DeepSkills';          // bucket prefix for deepskill images
-const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
-const CONTENT_TYPE = {
-  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
-  '.webp': 'image/webp', '.gif': 'image/gif',
+const logger = require('../logger');
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  CONFIG — fill the <…> placeholders (or set the env vars). Don't commit creds.
+// ═══════════════════════════════════════════════════════════════════════════
+const CONFIG = {
+  IMAGES_DIR: process.env.DSI_DIR || './deepskill-images',   // local copy of the SharePoint tree
+  OUT_DIR:    process.env.DSI_OUT || './deepskill-renamed',  // canonical copies (for legacy rsync)
+
+  // Deep skills are READ here and deepskill_image UPDATED here. Point at PROD.
+  DB: {
+    host:     process.env.DB_HOST     || '<DB_HOST>',
+    port:     Number(process.env.DB_PORT || 3306),
+    user:     process.env.DB_USER     || '<DB_USER>',
+    password: process.env.DB_PASSWORD || '<DB_PASSWORD>',
+    database: process.env.DB_NAME     || '<DB_NAME>',
+  },
+
+  // S3 — deep-skill images live at key  Skills/Skill_<id>_<seq>. Use the PROD bucket.
+  AWS: {
+    bucket:          process.env.S3_BUCKET_NAME       || '<PROD_S3_BUCKET>',
+    region:          process.env.AWS_REGION           || 'ap-south-1',
+    accessKeyId:     process.env.AWS_ACCESS_KEY_ID    || '<AWS_ACCESS_KEY_ID>',
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '<AWS_SECRET_ACCESS_KEY>',
+    keyPrefix:       'Skills',
+  },
+
+  // Legacy AWS server (Legacy CRM serves the same images off disk). When enabled,
+  // the canonical copies are rsync'd over SSH. Leave disabled until creds are set.
+  LEGACY: {
+    enabled:    false,
+    host:       '<LEGACY_HOST>',                 // e.g. ec2-xx.ap-south-1.compute.amazonaws.com
+    user:       '<LEGACY_SSH_USER>',             // e.g. ubuntu
+    sshKeyPath: '<PATH_TO_SSH_PEM>',             // e.g. ~/.ssh/easyfix-legacy.pem
+    remoteDir:  '<LEGACY_DEEPSKILL_IMAGE_ROOT>', // a Skills/ subfolder is created under it
+  },
+
+  DRY_RUN: true, OVERWRITE: false, PICK_FIRST: false, KEEP_EXT: false,
 };
-const OUT_DIR = path.resolve('deepskill-renamed');
-const CSV_PATH = path.join(OUT_DIR, 'deepskill-image-mapping.csv');
-const SKILLS_DIR = path.join(OUT_DIR, 'Skills');
+// ═══════════════════════════════════════════════════════════════════════════
 
-// ─── Arg parsing ────────────────────────────────────────────────────────────
-function parseArgs(argv) {
-  const a = { dir: null, map: null, run: false, threshold: 0.86 };
-  for (let i = 2; i < argv.length; i++) {
-    const t = argv[i];
-    if (t === '--dir') a.dir = argv[++i];
-    else if (t === '--map') a.map = argv[++i];
-    else if (t === '--run') a.run = true;
-    else if (t === '--threshold') a.threshold = Number(argv[++i]);
-    else throw new Error(`unknown argument: ${t}`);
-  }
-  if (!a.dir) throw new Error('missing required --dir <path>');
-  if (!Number.isFinite(a.threshold) || a.threshold <= 0 || a.threshold > 1) {
-    throw new Error('--threshold must be between 0 and 1');
-  }
-  return a;
+const EXT_CT = {
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp', '.gif': 'image/gif', '.bmp': 'image/bmp',
+};
+const ACTION_RX = /\b(instal+ation|installation|install|repair|service|fitting|fix|works?)\b/gi;
+
+function applyFlags() {
+  const a = process.argv.slice(2);
+  if (a.includes('--run')) CONFIG.DRY_RUN = false;
+  if (a.includes('--overwrite')) CONFIG.OVERWRITE = true;
+  if (a.includes('--pick-first')) CONFIG.PICK_FIRST = true;
+  if (a.includes('--keep-ext')) CONFIG.KEEP_EXT = true;
+  const val = (flag) => { const i = a.indexOf(flag); return i >= 0 ? a[i + 1] : null; };
+  CONFIG.IMAGES_DIR = val('--dir') || CONFIG.IMAGES_DIR;
+  CONFIG.OUT_DIR = val('--out') || CONFIG.OUT_DIR;
+  CONFIG.MAP = val('--map') || null;
 }
 
-// ─── Name normalisation + fuzzy match ───────────────────────────────────────
-// Lowercase, drop extension/dup markers, &→and, strip punctuation, collapse ws.
-function normalize(s) {
-  return String(s || '')
-    .toLowerCase()
-    .replace(/\.[a-z0-9]+$/i, '')      // trailing extension if present
-    .replace(/\(\d+\)\s*$/, '')        // "name (1)" duplicate markers
-    .replace(/&/g, ' and ')
-    .replace(/[^a-z0-9]+/g, ' ')       // punctuation/underscores → space
-    .replace(/\s+/g, ' ')
-    .trim();
-}
+const norm = (s) => String(s || '').toLowerCase().replace(/\.[a-z0-9]+$/i, '').replace(/[^a-z0-9]+/g, '');
+const stripActions = (s) => String(s || '').replace(/\.[a-z0-9]+$/i, '').replace(ACTION_RX, '').replace(/\s+/g, ' ').trim();
+const nextSeq = (k) => { const m = String(k || '').match(/_(\d+)$/); return m ? Number(m[1]) + 1 : 1; };
 
-function slugify(s) {
-  return normalize(s).replace(/\s+/g, '-');
-}
-
-// Trailing "action" words that distinguish images of the SAME skill
-// (Installation / Repair / …). We only ever strip these AFTER a full-name
-// match has failed, so legit skills that genuinely end in an action word
-// (e.g. "Door Installation", "Wardrobe installation") still match on the full
-// name first and are never over-stripped.
-const ACTION_WORDS = new Set([
-  'installation', 'instalation', 'install', 'installing',
-  'uninstallation', 'unistallation', 'uninstall', 'uninstall-',
-  'repair', 'repairing', 'repairs',
-  'servicing', 'service', 'serviced',
-  'cleaning', 'clean',
-  'replacement', 'replace',
-  'demo', 'fitment',
-]);
-
-// Drop trailing action tokens (one or more) from a normalized name.
-// Never strips the last remaining token, so a name that is ONLY an action
-// word survives intact.
-function stripActions(name) {
-  const toks = normalize(name).split(' ').filter(Boolean);
-  while (toks.length > 1 && ACTION_WORDS.has(toks[toks.length - 1])) toks.pop();
-  return toks.join(' ');
-}
-
-// Classic Levenshtein distance (iterative, O(n*m) — fine at this scale).
-function levenshtein(a, b) {
-  if (a === b) return 0;
-  if (!a.length) return b.length;
-  if (!b.length) return a.length;
-  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
-  for (let i = 1; i <= a.length; i++) {
-    let cur = [i];
-    for (let j = 1; j <= b.length; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
-    }
-    prev = cur;
-  }
-  return prev[b.length];
-}
-
-// Similarity in [0,1]; 1 = identical normalized strings.
-function similarity(a, b) {
-  const na = normalize(a);
-  const nb = normalize(b);
-  if (!na || !nb) return 0;
-  if (na === nb) return 1;
-  const dist = levenshtein(na, nb);
-  return 1 - dist / Math.max(na.length, nb.length);
-}
-
-// ─── Filesystem walk ────────────────────────────────────────────────────────
 function walkImages(root) {
   const out = [];
-  (function recur(dir) {
-    for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
-      const full = path.join(dir, ent.name);
-      if (ent.isDirectory()) recur(full);
-      else if (ent.isFile() && IMAGE_EXTS.has(path.extname(ent.name).toLowerCase())) {
-        out.push(full);
-      }
+  (function rec(dir, rel) {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (e.name.startsWith('.')) continue;
+      const full = path.join(dir, e.name);
+      const r = rel ? path.join(rel, e.name) : e.name;
+      if (e.isDirectory()) rec(full, r);
+      else if (EXT_CT[path.extname(e.name).toLowerCase()]) out.push({ full, rel: r, parent: path.basename(dir), file: e.name });
     }
-  })(root);
+  })(root, '');
   return out;
 }
 
-function loadFixups(mapPath) {
-  // Map basename(filename) → deepskill_id. Tolerates a header row and quotes.
-  const fixups = new Map();
-  if (!mapPath) return fixups;
-  const raw = fs.readFileSync(mapPath, 'utf8');
-  for (const line of raw.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    const cells = line.split(',').map((c) => c.trim().replace(/^"|"$/g, ''));
-    const [file, idStr] = cells;
-    if (!file || file.toLowerCase() === 'filename') continue; // header / blank
-    const id = Number(idStr);
-    if (!Number.isInteger(id) || id <= 0) continue;
-    fixups.set(path.basename(file), id);
+function loadMap(file) {
+  const m = new Map(); // norm(filename or relpath) → deepskill_id
+  if (!file) return m;
+  for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+    const [k, id] = line.split(',').map((x) => x && x.trim());
+    if (k && id && /^\d+$/.test(id)) m.set(norm(k), Number(id));
   }
-  return fixups;
+  return m;
 }
 
-function csvCell(v) {
-  const s = v == null ? '' : String(v);
-  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+function s3Client() {
+  const { S3Client } = require('@aws-sdk/client-s3');
+  return new S3Client({
+    region: CONFIG.AWS.region,
+    credentials: { accessKeyId: CONFIG.AWS.accessKeyId, secretAccessKey: CONFIG.AWS.secretAccessKey },
+  });
 }
 
-// ─── Main ───────────────────────────────────────────────────────────────────
-(async () => {
-  const args = parseArgs(process.argv);
-  const imageRoot = path.resolve(args.dir);
-  if (!fs.existsSync(imageRoot)) throw new Error(`--dir not found: ${imageRoot}`);
+async function main() {
+  applyFlags();
+  if (!fs.existsSync(CONFIG.IMAGES_DIR)) { logger.error(`IMAGES_DIR not found: ${CONFIG.IMAGES_DIR}`); process.exitCode = 1; return; }
 
-  const [[{ db }]] = await pool.query('SELECT DATABASE() AS db');
-  const bucket = process.env.S3_BUCKET_NAME || '(unset)';
-  console.log('═'.repeat(72));
-  console.log(`  MODE     : ${args.run ? '🔴 REAL RUN (will upload + update DB)' : '🟢 DRY RUN (read-only)'}`);
-  console.log(`  DB       : ${db} @ ${process.env.DB_HOST}`);
-  console.log(`  S3 bucket: ${bucket}   prefix: ${S3_PREFIX}/`);
-  console.log(`  Images   : ${imageRoot}`);
-  console.log(`  Fixups   : ${args.map ? path.resolve(args.map) : '(none)'}`);
-  console.log('═'.repeat(72));
+  const images = walkImages(CONFIG.IMAGES_DIR);
+  if (!images.length) { logger.error(`No images under ${CONFIG.IMAGES_DIR}`); process.exitCode = 1; return; }
 
-  // 1. Load deep-skill rows (the match targets).
-  const [skills] = await pool.query(
-    `SELECT deepskill_id, deepskill_name, categoryName, deepskill_image
-       FROM tbl_deep_skill`,
-  );
-  console.log(`Loaded ${skills.length} deep-skill rows; scanning images…`);
-  if (skills.length === 0) {
-    console.warn('⚠️  No deep-skill rows in this DB — every image will be UNMATCHED.');
-  }
+  // DB — own connection from CONFIG (self-contained; doesn't touch the app pool).
+  const mysql = require('mysql2/promise');
+  const conn = await mysql.createConnection({
+    host: CONFIG.DB.host, port: CONFIG.DB.port, user: CONFIG.DB.user,
+    password: CONFIG.DB.password, database: CONFIG.DB.database,
+  });
+  const [skills] = await conn.query('SELECT deepskill_id, deepskill_name, deepskill_image, status FROM tbl_deep_skill');
+  const byName = new Map();   // normName → [rows]
+  for (const r of skills) { const k = norm(r.deepskill_name); if (k) (byName.get(k) || byName.set(k, []).get(k)).push(r); }
+  const byId = new Map(skills.map((r) => [Number(r.deepskill_id), r]));
+  const manual = loadMap(CONFIG.MAP);
 
-  // Index by normalized name for fast exact lookup.
-  const byNorm = new Map();
-  for (const s of skills) {
-    const k = normalize(s.deepskill_name);
-    if (!byNorm.has(k)) byNorm.set(k, []);
-    byNorm.get(k).push(s);
-  }
+  logger.info({ images: images.length, deepSkills: skills.length, db: CONFIG.DB.database, host: CONFIG.DB.host, mode: CONFIG.DRY_RUN ? 'DRY-RUN' : 'RUN' },
+    `deep-skill image upload — ${images.length} image(s) vs ${skills.length} deep skill(s)`);
 
-  // Helpers closing over `skills` / `byNorm`.
-  function bestExact(name) {
-    const arr = byNorm.get(normalize(name));
-    if (!arr) return { skill: null, multi: false };
-    if (arr.length === 1) return { skill: arr[0], multi: false };
-    return { skill: null, multi: true };          // same name on >1 skill
-  }
-  function bestFuzzy(name) {
-    let best = null; let bestScore = 0;
-    for (const s of skills) {
-      const sc = similarity(name, s.deepskill_name);
-      if (sc > bestScore) { bestScore = sc; best = s; }
-    }
-    return { skill: best, score: bestScore };
-  }
-  // Staged match: full-name first (exact → fuzzy), then action-stripped stem
-  // (exact → fuzzy). Full always wins, so "Wardrobe installation" matches its
-  // own row before we'd ever strip "installation".
-  function matchName(derived) {
-    const ex = bestExact(derived);
-    if (ex.skill) return { skill: ex.skill, type: 'exact', score: 1 };
-    if (ex.multi) return { skill: null, type: 'ambiguous', score: 1 };
-
-    const fz = bestFuzzy(derived);
-    if (fz.skill && fz.score >= args.threshold) return { skill: fz.skill, type: 'fuzzy', score: fz.score };
-
-    const stem = stripActions(derived);
-    if (stem && stem !== normalize(derived)) {
-      const exs = bestExact(stem);
-      if (exs.skill) return { skill: exs.skill, type: 'stem-exact', score: 0.99 };
-      if (exs.multi) return { skill: null, type: 'ambiguous', score: 0.99 };
-      const fzs = bestFuzzy(stem);
-      if (fzs.skill && fzs.score >= args.threshold) return { skill: fzs.skill, type: 'stem-fuzzy', score: fzs.score };
-    }
-    return { skill: null, type: 'unmatched', score: 0 };
-  }
-
-  // 2. Match each image. Sort first so "prefer first" is deterministic
-  //    (alphabetical by relative path) when several images hit one skill.
-  const images = walkImages(imageRoot).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-  const fixups = loadFixups(args.map);
-
-  const rows = [];
-  for (const file of images) {
-    const rel = path.relative(imageRoot, file);
-    const parts = rel.split(path.sep);
-    const trade = parts.length > 1 ? parts[1] : '';   // parts[0] = "Deepskill image"
-    const base = path.basename(file);
-    const derived = path.basename(file, path.extname(file));
-
-    let matchType; let score; let skill;
-    if (fixups.has(base)) {
-      const id = fixups.get(base);
-      skill = skills.find((s) => s.deepskill_id === id) || null;
-      matchType = skill ? 'fixup' : 'unmatched';
-      score = skill ? 1 : 0;
+  // ── Match each image to a deep skill ──────────────────────────────────────
+  const unmatched = []; const ambiguous = [];
+  const bySkill = new Map(); // deepskill_id → { row, images:[{file, full}] }
+  for (const img of images) {
+    let row = null;
+    if (manual.has(norm(img.rel)) || manual.has(norm(img.file))) {
+      row = byId.get(manual.get(norm(img.rel)) ?? manual.get(norm(img.file))) || null;
+      if (!row) { unmatched.push({ img, reason: 'map id not in tbl_deep_skill' }); continue; }
     } else {
-      const m = matchName(derived);
-      skill = m.skill; matchType = m.type; score = m.score;
+      // try leaf-folder name, then filename minus action words, then raw stem
+      const cands = [img.parent, stripActions(img.file), img.file];
+      let rows = [];
+      for (const c of cands) { rows = byName.get(norm(c)) || []; if (rows.length) break; }
+      if (!rows.length) { unmatched.push({ img, reason: 'no deep skill name match' }); continue; }
+      if (rows.length > 1) {
+        if (!CONFIG.PICK_FIRST) { ambiguous.push({ img, ids: rows.map((r) => r.deepskill_id) }); continue; }
+        rows = [...rows].sort((a, b) => a.deepskill_id - b.deepskill_id);
+      }
+      row = rows[0];
     }
+    const id = Number(row.deepskill_id);
+    (bySkill.get(id) || bySkill.set(id, { row, images: [] }).get(id)).images.push(img);
+  }
 
-    rows.push({
-      source: rel,
-      filename: base,
-      trade,
-      derived_name: derived,
-      match_type: matchType,
-      score: Number(score).toFixed(3),
-      deepskill_id: skill ? skill.deepskill_id : '',
-      deepskill_name: skill ? skill.deepskill_name : '',
-      canonical: skill ? `${skill.deepskill_id}_${slugify(skill.deepskill_name)}${path.extname(file)}` : '',
-      _abspath: file,
-      _ext: path.extname(file).toLowerCase(),
-      _skill: skill,
-      _winner: false,
+  // ── Build the upload plan: primary (prefers "instal…") = seq 1 → DB; extras seq 2.. → S3 only ──
+  const plan = []; const skipped = [];
+  for (const { row, images: imgs } of bySkill.values()) {
+    if (row.deepskill_image && String(row.deepskill_image).trim() && !CONFIG.OVERWRITE) {
+      skipped.push({ id: row.deepskill_id, existing: row.deepskill_image, count: imgs.length });
+      continue;
+    }
+    const ordered = [...imgs].sort((a, b) => (/(instal)/i.test(b.file) ? 1 : 0) - (/(instal)/i.test(a.file) ? 1 : 0));
+    let seq = CONFIG.OVERWRITE ? nextSeq(row.deepskill_image) : 1;
+    ordered.forEach((img, i) => {
+      plan.push({ row, img, seq: seq + i, key: `${CONFIG.AWS.keyPrefix}/Skill_${row.deepskill_id}_${seq + i}`, primary: i === 0 });
     });
   }
 
-  // 2b. One image per skill — keep the FIRST matched file for each
-  //     deepskill_id; demote the rest to "duplicate" (won't upload).
-  const claimed = new Set();
-  for (const r of rows) {
-    if (!r._skill) continue;
-    if (claimed.has(r._skill.deepskill_id)) { r.match_type = 'duplicate'; }
-    else { claimed.add(r._skill.deepskill_id); r._winner = true; }
+  // ── Report (always) ───────────────────────────────────────────────────────
+  fs.mkdirSync(CONFIG.OUT_DIR, { recursive: true });
+  const csv = ['relpath,deepskill_id,deepskill_name,key,role'];
+  for (const p of plan) csv.push(`"${p.img.rel}",${p.row.deepskill_id},"${String(p.row.deepskill_name).replace(/"/g, '""')}",${p.key},${p.primary ? 'PRIMARY(deepskill_image)' : 'extra(S3 only)'}`);
+  for (const a of ambiguous) csv.push(`"${a.img.rel}",,,"AMBIGUOUS ids=${a.ids.join('|')}",skip`);
+  for (const u of unmatched) csv.push(`"${u.img.rel}",,,"${u.reason}",skip`);
+  for (const s of skipped) csv.push(`,${s.id},,${s.existing},already-has-image(${s.count} files)`);
+  const reportPath = path.join(CONFIG.OUT_DIR, 'deepskill-image-mapping.csv');
+  fs.writeFileSync(reportPath, csv.join('\n'));
+  logger.info({ skillsMatched: bySkill.size, toUpload: plan.length, primaries: plan.filter((p) => p.primary).length, ambiguous: ambiguous.length, unmatched: unmatched.length, alreadyHave: skipped.length, report: reportPath },
+    `plan: ${plan.length} file(s) across ${bySkill.size} skill(s) · ${ambiguous.length} ambiguous · ${unmatched.length} unmatched`);
+
+  if (CONFIG.DRY_RUN) {
+    logger.info('DRY RUN — no S3/DB/legacy writes. Review the CSV; resolve ambiguous/unmatched via --map "relpath_or_filename,deepskill_id", then --run.');
+    await conn.end(); return;
   }
 
-  // Tally from final state.
-  const tally = { exact: 0, fuzzy: 0, 'stem-exact': 0, 'stem-fuzzy': 0, fixup: 0, ambiguous: 0, duplicate: 0, unmatched: 0 };
-  for (const r of rows) tally[r.match_type] = (tally[r.match_type] || 0) + 1;
+  // ── Execute ────────────────────────────────────────────────────────────────
+  if (CONFIG.AWS.bucket.startsWith('<')) { logger.error('CONFIG.AWS.bucket is a placeholder — fill it (or set S3_BUCKET_NAME).'); await conn.end(); process.exitCode = 1; return; }
+  const { PutObjectCommand } = require('@aws-sdk/client-s3');
+  const s3 = s3Client();
+  const legacyDir = path.join(CONFIG.OUT_DIR, 'Skills');
+  fs.mkdirSync(legacyDir, { recursive: true });
 
-  // 3. Write the review CSV (always).
-  fs.mkdirSync(OUT_DIR, { recursive: true });
-  const header = ['source', 'filename', 'trade', 'derived_name', 'match_type', 'score', 'deepskill_id', 'deepskill_name', 'canonical'];
-  const csv = [header.join(',')]
-    .concat(rows.map((r) => header.map((h) => csvCell(r[h])).join(',')))
-    .join('\n');
-  fs.writeFileSync(CSV_PATH, csv, 'utf8');
-
-  const willUpload = rows.filter((r) => r._skill && r._winner);
-  console.log('\n── Match summary ───────────────────────────');
-  console.log(`  exact      : ${tally.exact}`);
-  console.log(`  fuzzy      : ${tally.fuzzy}   (review in CSV)`);
-  console.log(`  stem-exact : ${tally['stem-exact']}   (action suffix stripped)`);
-  console.log(`  stem-fuzzy : ${tally['stem-fuzzy']}   (stripped + fuzzy → review in CSV)`);
-  console.log(`  fixup      : ${tally.fixup}`);
-  console.log(`  ambiguous  : ${tally.ambiguous}  (same name on >1 skill → add to fixups.csv)`);
-  console.log(`  duplicate  : ${tally.duplicate}  (skill already has a chosen image → skipped)`);
-  console.log(`  unmatched  : ${tally.unmatched}  (option-level / no row → add to fixups.csv if needed)`);
-  console.log(`  ─────────────────────────────────────────`);
-  console.log(`  TOTAL      : ${rows.length} images`);
-  console.log(`  → will set images on ${willUpload.length} of ${skills.length} deep-skill rows`);
-  console.log(`\n📄 Mapping written: ${CSV_PATH}`);
-
-  const matched = willUpload;
-
-  if (!args.run) {
-    console.log('\n🟢 DRY RUN complete — nothing uploaded, no DB rows changed.');
-    console.log('   Review the CSV, resolve ambiguous/unmatched in fixups.csv');
-    console.log('   (columns: filename,deepskill_id), then re-run with --map fixups.csv --run');
-    await closePool();
-    return;
-  }
-
-  // ── REAL RUN ──────────────────────────────────────────────────────────────
-  if (matched.length === 0) {
-    console.log('\n🔴 REAL RUN: 0 matched images — nothing to do.');
-    await closePool();
-    return;
-  }
-  if (bucket === '(unset)') throw new Error('S3_BUCKET_NAME is unset — cannot upload. Set it in .env first.');
-
-  const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
-  const s3 = new S3Client({ region: process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'ap-south-1' });
-
-  fs.mkdirSync(SKILLS_DIR, { recursive: true });
-  console.log(`\n🔴 REAL RUN: ${matched.length} images → S3 (new backend) + disk-copy staging + DB…`);
-
-  // "BOTH must work" storage model:
-  //   - deepskill_image = the BARE FILENAME  (e.g. 1002_metal-chair.png)
-  //       → dashboard API serves <host>/easydoc/easyfixer_documents/<filename>
-  //   - the same file is copied to deepskill-renamed/Skills/  (scp → server disk
-  //       at /var/www/html/easydoc/easyfixer_documents/)
-  //   - and uploaded to S3 at DeepSkills/<filename>  (extension kept so the
-  //       new-backend resolver can find it by the stored filename and serve a
-  //       presigned URL; falls back to the /easydoc disk URL otherwise)
-  let ok = 0; const failures = [];
-  for (const r of matched) {
-    const filename = r.canonical;                 // <id>_<slug>.<ext>
-    const key = `${S3_PREFIX}/${filename}`;        // extension kept on purpose
+  let ok = 0; let fail = 0;
+  for (const p of plan) {
     try {
-      const buffer = fs.readFileSync(r._abspath);
-      // 1. canonical renamed copy → scp this folder to the server disk
-      fs.copyFileSync(r._abspath, path.join(SKILLS_DIR, filename));
-      // 2. upload to S3 for the new backend
-      const safeName = path.basename(r._abspath).replace(/[^\x20-\x7E]/g, '_').slice(0, 200);
+      const buffer = fs.readFileSync(p.img.full);
+      const ct = EXT_CT[path.extname(p.img.file).toLowerCase()] || 'application/octet-stream';
       await s3.send(new PutObjectCommand({
-        Bucket: bucket,
-        Key: key,
-        Body: buffer,
-        ContentType: CONTENT_TYPE[r._ext] || 'application/octet-stream',
-        Metadata: { 'original-filename': safeName },
+        Bucket: CONFIG.AWS.bucket, Key: p.key, Body: buffer, ContentType: ct,
+        Metadata: { 'original-filename': p.img.file.replace(/[^\x20-\x7E]/g, '_').slice(0, 200) },
       }));
-      // 3. store the BARE FILENAME (works for both consumers)
-      await pool.query('UPDATE tbl_deep_skill SET deepskill_image = ? WHERE deepskill_id = ?',
-        [filename, r._skill.deepskill_id]);
-      ok += 1;
+      const base = path.basename(p.key);                       // Skill_<id>_<seq>
+      fs.writeFileSync(path.join(legacyDir, CONFIG.KEEP_EXT ? base + path.extname(p.img.file).toLowerCase() : base), buffer);
+      if (p.primary) await conn.query('UPDATE tbl_deep_skill SET deepskill_image = ? WHERE deepskill_id = ?', [p.key, p.row.deepskill_id]);
+      ok++;
     } catch (e) {
-      failures.push({ file: r.filename, id: r._skill.deepskill_id, err: e.message });
+      fail++;
+      logger.warn({ rel: p.img.rel, id: p.row.deepskill_id, err: e.message }, 'upload failed for this image');
     }
   }
+  await conn.end();
 
-  console.log(`\n✅ Uploaded to S3 + DB updated (bare filename): ${ok}/${matched.length}`);
-  if (failures.length) {
-    console.log(`❌ Failures: ${failures.length}`);
-    for (const f of failures) console.log(`   - ${f.file} (id ${f.id}): ${f.err}`);
+  // ── Push to the legacy AWS server (optional) ───────────────────────────────
+  if (CONFIG.LEGACY.enabled) {
+    if (CONFIG.LEGACY.host.startsWith('<')) {
+      logger.warn('LEGACY.enabled but creds are placeholders — skipping rsync. Fill CONFIG.LEGACY.');
+    } else {
+      const dest = `${CONFIG.LEGACY.user}@${CONFIG.LEGACY.host}:${CONFIG.LEGACY.remoteDir.replace(/\/+$/, '')}/Skills/`;
+      logger.info(`rsync ${legacyDir}/ → ${dest}`);
+      execFileSync('rsync', ['-avz', '-e', `ssh -i ${CONFIG.LEGACY.sshKeyPath} -o StrictHostKeyChecking=accept-new`, `${legacyDir}/`, dest], { stdio: 'inherit' });
+    }
+  } else {
+    logger.info(`LEGACY disabled — canonical copies are in ${legacyDir}/. rsync them to the legacy server, or set CONFIG.LEGACY.enabled=true.`);
   }
-  console.log(`📁 Canonical copies to scp to the server: ${SKILLS_DIR}`);
-  console.log('   → copy these into /var/www/html/easydoc/easyfixer_documents/ on the QA host');
-  await closePool();
-})().catch((e) => {
-  console.error('\n💥', e.message);
-  closePool().finally(() => process.exit(1));
-});
+
+  logger.info({ uploaded: ok, failed: fail }, `done — ${ok} uploaded, ${fail} failed.`);
+}
+
+main()
+  .then(() => process.exit(process.exitCode || 0))
+  .catch((err) => { logger.error({ code: err.code, msg: err.message }, 'deep-skill image upload failed'); process.exit(1); });

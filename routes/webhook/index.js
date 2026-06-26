@@ -6,5 +6,8 @@ const router = require('express').Router();
  * shared JWT auth on this group (providers can't carry our tokens).
  */
 router.use('/', require('./whatsapp'));
+// Plivo voice status callbacks (ring / hangup). Self-authorised via the signed
+// `t` token on each request — see routes/webhook/plivo.js.
+router.use('/plivo', require('./plivo'));
 
 module.exports = router;

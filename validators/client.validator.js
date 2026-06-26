@@ -118,6 +118,7 @@ const createClientBody = Joi.object({
   maxOrders:         Joi.number().integer().min(0).optional(),
   minOrders:         Joi.number().integer().min(0).optional(),
   couponCode:        Joi.string().max(50).optional().allow('', null),
+  monthlyRevenue:    Joi.number().min(0).allow(null).optional(),
   // KYC + logo (text fields + already-uploaded S3 keys)
   cinNumber:         Joi.string().max(100).optional().allow('', null),
   cinDocKey:         Joi.string().max(500).optional().allow('', null),
@@ -162,6 +163,7 @@ const updateClientBody = Joi.object({
   mouDocKey:     Joi.string().max(500).optional().allow('', null),
   logoKey:       Joi.string().max(500).optional().allow('', null),
   reportingContactIds: Joi.array().items(Joi.number().integer().positive()).optional(),
+  monthlyRevenue: Joi.number().min(0).allow(null).optional(),
   // snake_case fallback (legacy clients)
   client_name:    Joi.string().max(255).optional(),
   client_email:   Joi.string().email().max(255).optional().allow('', null),
@@ -371,6 +373,31 @@ const eligibleTechsQuery = Joi.object({
   includeUnverified: Joi.string().valid('true', 'false').optional(),
 });
 
+/* ─── Bulk template / upload (new 2026-06-15) ─────────────────────── */
+
+/*
+ * POST /bulk-template  body: { action: 'spoc'|'monthly_revenue', clientIds: [...] }
+ *
+ * `clientIds` must be a non-empty array of positive integers so the
+ * service can look up names and pre-seed the template rows.
+ */
+const bulkTemplateBody = Joi.object({
+  action:    Joi.string().valid('spoc', 'monthly_revenue').required(),
+  clientIds: Joi.array().items(Joi.number().integer().positive()).min(1).required(),
+}).options({ stripUnknown: true });
+
+/*
+ * POST /bulk-upload  multipart: file=<xlsx> + action=<string> [+ dryRun=<bool>]
+ *
+ * `action` and `dryRun` arrive as text body fields (FormData); Joi validates
+ * them before the route processes the file. When `dryRun` is "true" / true,
+ * the route parses + validates but does NOT write any data.
+ */
+const bulkUploadBody = Joi.object({
+  action:  Joi.string().valid('spoc', 'monthly_revenue').required(),
+  dryRun:  Joi.boolean().optional(),
+}).options({ stripUnknown: true });
+
 /* ─── Vertical mapping ────────────────────────────────────────────── */
 
 /*
@@ -418,4 +445,7 @@ module.exports = {
   // tech mapping
   replaceTechMappingBody,
   eligibleTechsQuery,
+  // bulk template + upload
+  bulkTemplateBody,
+  bulkUploadBody,
 };

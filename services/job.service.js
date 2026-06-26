@@ -88,6 +88,7 @@ const LIST_COLUMNS = `
   LEFT(j.remarks, 500) AS remarks,
   j.fk_customer_id, cu.customer_name, cu.customer_mob_no,
   j.fk_client_id, cl.client_name,
+  j.fk_service_catg_id, sc.service_catg_name AS service_category,
   j.fk_easyfixter_id, ef.efr_name AS easyfixer_name,
   j.job_owner, ow.user_name AS owner_name,
   j.fk_address_id, ci.city_name,
@@ -154,15 +155,18 @@ const LIST_COLUMNS = `
        FROM tbl_client_custom_properties ccp_max
       WHERE ccp_max.client_id    = j.fk_client_id
         /*
-         * Case-insensitive + underscore-tolerant comparison so the same
-         * row matches whether c_prop_name was stored as legacy snake_case
-         * ('max_magic_link_send_count'), lower-case-with-spaces
-         * ('max magic-link send count'), or the new Title Case canonical
-         * form ('Max Magic-Link Send Count'). Lets the FE rename rows
-         * without coordinating a BE deploy.
+         * Case-insensitive comparison that normalises BOTH '_' and '-' to
+         * spaces on both sides, so the same row matches whether c_prop_name was
+         * stored as legacy snake_case ('max_magic_link_send_count'),
+         * lower-case-with-spaces ('max magic-link send count'), or the Title
+         * Case canonical form ('Max Magic-Link Send Count'). MUST stay identical
+         * to the copy in services/job-magic-link.service.js or the FE-displayed
+         * cap and the BE-enforced cap will diverge. (Was '_'-only — the hyphen
+         * in the literal never matched snake_case rows → cap fell back to 3.)
          */
-        AND LOWER(REPLACE(ccp_max.c_prop_name, '_', ' ')) = LOWER('Max Magic-Link Send Count')
-        AND ccp_max.status       = 1
+        AND LOWER(REPLACE(REPLACE(ccp_max.c_prop_name, '_', ' '), '-', ' '))
+            = LOWER(REPLACE('Max Magic-Link Send Count', '-', ' '))
+        AND (ccp_max.status IS NULL OR ccp_max.status = 1)
       LIMIT 1),
     3
   ) AS magic_link_max_send_count,
@@ -968,7 +972,17 @@ async function list({
   if (startDate)           { clauses.push(`${dateCol} >= ?`); params.push(startDate); }
   if (endDate)             { clauses.push(`${dateCol} <= ?`); params.push(endDate); }
   if (q) {
-    clauses.push('(j.job_id LIKE ? OR j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ?)');
+    /*
+     * `j.job_id` added (2026-06-10 fix) — operators routinely search by
+     * the numeric job id on the Unconfirmed tab to triage a specific
+     * order. Earlier this clause only matched against text fields
+     * (reference id, client ref, customer name + mobile), so a search
+     * like "12345" returned zero rows even when job_id=12345 was on
+     * the very page being viewed. Now job_id is a CAST AS CHAR + LIKE
+     * so partial numeric matches (e.g. "1234" → 12340..12349) work,
+     * matching operator expectations.
+     */
+    clauses.push('(CAST(j.job_id AS CHAR) LIKE ? OR j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ?)');
     params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
   }
 
@@ -1893,14 +1907,14 @@ async function create(input, actor) {
 
     // eta_status: legacy 2-char sentinel. Per JobDaoImpl#2387 "01" is
     // the unconfirmed default; once a job is promoted to BOOKED via
-    // Confirm & Schedule the value should reflect "confirmed/scheduled".
-    // Legacy DB samples + repo grep don't expose a documented enum, so
-    // we default the BOOKED path to "02" — TODO(ops 2026-06-04): confirm
-    // the canonical confirmed sentinel and adjust if a different code
-    // is in use. ENQUIRY (7) and CALL_LATER (9) keep the "01" default
-    // because they are explicitly NOT confirmed orders.
-    const etaStatus = input.eta_status
-      ?? (effectiveStatus === STATUS.BOOKED ? '02' : '01');
+    // eta_status (reverted 2026-06-05 per ops): default to '01'
+    // unconditionally across every create path. Book-New-Call,
+    // C&S sibling fan-out, and direct-to-ENQUIRY all land as '01'
+    // — the legacy default that the rest of the platform expects.
+    // If a future flow needs to override (e.g. a "confirmed" sentinel
+    // like '02' for a different lifecycle stage), the caller passes
+    // input.eta_status explicitly; the BE no longer infers from status.
+    const etaStatus = input.eta_status ?? '01';
 
     /*
      * Job OTP (2026-05-28). Legacy CRM (JobDaoImpl.java:4418) stamps
@@ -2221,6 +2235,13 @@ const MUTABLE_COLUMNS = [
   'requested_date_time', 'requested_time', 'time_slot', 'expected_date_time',
   'job_owner', 'job_client_owner',
   'fk_client_id', 'fk_service_type_id', 'fk_service_catg_id',
+  // service_type_ids (2026-06-05): CSV column carrying every picked
+  // service_type_id on a multi-pick job. Kept in sync with the
+  // singular fk_service_type_id by FE call sites (Book-New-Call
+  // basePayload, C&S sibling POST, C&S parent PATCH). Array input
+  // is normalised to a comma-joined string inside the update() loop
+  // — mirrors the create()-flow serviceTypeIds normalisation.
+  'service_type_ids',
   'reporting_contact_id', 'client_spoc', 'client_spoc_name', 'client_spoc_email',
   'additional_name', 'additional_number',
   'collected_by',
@@ -2267,10 +2288,52 @@ async function update(jobId, input, actor) {
   // timestamp, every Add-Remarks click would falsely mark the row as a
   // draft. Comments have their own audit trail in tbl_job_comment.
   const changedCols = [];
+  /*
+   * Date/time projection (2026-06-05). create() runs every datetime
+   * input through combineDateTime() so the DATETIME columns land as
+   * `'YYYY-MM-DD HH:MM:SS'` IST literals (not the JS-Date default of
+   * UTC ISO with a `Z` suffix, which legacy MySQL reports parse as
+   * the wrong wall-clock). PATCH must apply the same transform —
+   * otherwise C&S confirms write the raw ISO into a DATETIME column
+   * and the time portion is lost / mis-stored. Same helper set:
+   *   - combineDateTime  → MySQL DATETIME string in IST
+   *   - formatTimeIST    → "HH:MM" string in IST for the legacy
+   *                         requested_time / original_appointment_time
+   *                         text columns
+   * `requested_time` is derived from `requested_date_time` when the
+   * caller doesn't pass it explicitly (mirrors create()).
+   */
+  const DATETIME_COLS = new Set([
+    'requested_date_time', 'expected_date_time', 'original_appointment_date_time',
+  ]);
+  const TIME_COLS = new Set([
+    'requested_time', 'original_appointment_time',
+  ]);
+  // Derive requested_time from requested_date_time if FE didn't send it
+  // alongside (legacy companion column). Only fills if requested_time
+  // is undefined in input — never overwrites an explicit value.
+  if (input.requested_date_time !== undefined && input.requested_time === undefined) {
+    input.requested_time = formatTimeIST(input.requested_date_time);
+  }
   for (const col of MUTABLE_COLUMNS) {
     if (input[col] !== undefined) {
       sets.push(`${col} = ?`);
-      values.push(input[col]);
+      let v = input[col];
+      if (DATETIME_COLS.has(col)) v = combineDateTime(v, null);
+      else if (TIME_COLS.has(col)) v = formatTimeIST(v) ?? v;
+      /*
+       * CSV columns (2026-06-05): tbl_job.service_type_ids stores a
+       * comma-separated list. FE callers may send it as either an
+       * array OR an already-joined string — coerce to string here
+       * so the SET clause binds a scalar VARCHAR. Empty array →
+       * NULL (an empty CSV is meaningless). Mirrors the
+       * `serviceTypeIds` normalisation inside create().
+       */
+      else if (col === 'service_type_ids') {
+        if (Array.isArray(v)) v = v.length > 0 ? v.join(',') : null;
+        else v = (v == null || v === '') ? null : String(v);
+      }
+      values.push(v);
       changedCols.push(col);
     }
   }
@@ -2315,6 +2378,44 @@ async function update(jobId, input, actor) {
         // touching last_update_time.
         const scalarValues = [...values, jobId];
         await conn.query(`UPDATE tbl_job SET ${sets.join(', ')} WHERE job_id = ?`, scalarValues);
+      }
+    }
+
+    /*
+     * job_reference_id back-fill on update (2026-06-06).
+     *
+     * Jobs created by the legacy Client Dashboard / bulk-upload /
+     * integration callers landed without a `job_reference_id` (those
+     * code paths predate the 2026-06-04 `REF-{job_id}` auto-gen
+     * convention). When ops promotes such a row to BOOKED via the
+     * Confirm & Schedule modal (the standard "Book Call" path), the
+     * caller-supplied PATCH typically doesn't include job_reference_id
+     * — so the column stays NULL forever.
+     *
+     * Fix: AFTER the scalar UPDATE lands, if the row's current
+     * job_reference_id is NULL/empty AND the caller didn't supply
+     * one in this PATCH, backfill `REF-{jobId}` in the same open
+     * transaction. The conditional WHERE clause makes this safe to
+     * run on already-populated rows (no-op).
+     *
+     * Skipped when the caller explicitly passed `job_reference_id`
+     * in `input` — preserves backward-compat with integration
+     * callers minting their own ref ids.
+     */
+    if (input.job_reference_id === undefined) {
+      const existingRef = String(existing.job_reference_id || '').trim();
+      if (!existingRef) {
+        const { formatJobReferenceId } = require('../utils/job-reference');
+        const autoRef = formatJobReferenceId(jobId);
+        if (autoRef) {
+          await conn.query(
+            `UPDATE tbl_job
+                SET job_reference_id = ?
+              WHERE job_id = ?
+                AND (job_reference_id IS NULL OR TRIM(job_reference_id) = '')`,
+            [autoRef, jobId],
+          );
+        }
       }
     }
 
@@ -2526,6 +2627,11 @@ function fireNotification(eventName, jobId) {
 
 function statusToEventName(prevStatus, newStatus) {
   // Map tbl_job.job_status transition → webhook event name.
+  // No-op re-submit (same status) is not a transition — never re-fire
+  // webhooks/SMS. Mobile /eta and /reschedule deliberately call
+  // setStatus with the existing status to ride the extras path and
+  // rely on NO event firing (see routes/mobile/index.js).
+  if (Number(prevStatus) === Number(newStatus)) return null;
   if (newStatus === STATUS.IN_PROGRESS)   return 'TechStart';
   if (COMPLETED_STATES.has(newStatus))    return 'TechVisitComplete';
   if (newStatus === STATUS.CANCELLED)     return 'CancelJob';
@@ -2572,6 +2678,11 @@ const STATUS_EXTRAS_ALLOWLIST = new Set([
   'checkin_gps_location', 'checkin_address', 'checkin_pincode', 'fk_checkin_by',
   // Check-out stamps (mobile /checkout path)
   'app_checkout_date_time',
+  // Check-out completion details — cash / problem / revisit (mobile /checkout
+  // extended body). All exist on tbl_job; a revisit flips job_status to 10
+  // (handled by setStatus), and these stamp the accompanying reason/amount cols.
+  'is_collected_cash_by_app', 'material_charge', 'collect_cash_reason_id',
+  'problem_reason_id', 'revisit_reason_id', 'revisit_date', 'revisit_time_slot',
   // ETA stamps
   'eta_status', 'eta_requested_time',
   // Reschedule-from-app stamps
@@ -2739,6 +2850,19 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
         values.push(String(generateOtp()));
       }
     }
+    // Stamp fk_created_by on confirmation when the row has none yet — e.g. an
+    // Unconfirmed/integration job, or one created by a technician (no tbl_user
+    // creator). COALESCE preserves a real creator already set by create()
+    // (Book-New-Call). fk_created_by is a tbl_user FK, so coerce the actor id
+    // the same way create() does: a technician actor ("efr:NNN" → NaN) resolves
+    // to null rather than corrupting the column. This also fixes the legacy
+    // "Booking Confirmed" window, which shows the name via
+    // fk_created_by → tbl_user.user_name (so a NULL left the name blank).
+    const bookedActorId = (() => { const n = Number(actorId); return Number.isFinite(n) && n > 0 ? n : null; })();
+    if (bookedActorId) {
+      sets.push('fk_created_by = COALESCE(fk_created_by, ?)');
+      values.push(bookedActorId);
+    }
   } else if (COMPLETED_STATES.has(Number(status))) {
     sets.push('checkout_date_time = COALESCE(checkout_date_time, ?)', 'fk_checkout_by = COALESCE(fk_checkout_by, ?)');
     values.push(new Date(), actorId);
@@ -2780,7 +2904,22 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
 }
 
 // ─── Assign / Reassign technician ───────────────────────────────────
-async function assign(jobId, { easyfixerId, reasonId, rescheduleReason }, actor) {
+/*
+ * assign(jobId, body, actor)
+ *
+ * body:
+ *   easyfixerId       — tech to assign (required)
+ *   reasonId          — reschedule reason FK (reassign only)
+ *   rescheduleReason  — free-text reschedule reason (reassign only)
+ *   requestedDateTime — OPTIONAL new requested datetime. When present, the
+ *                       job's schedule is edited IN THE SAME TRANSACTION as
+ *                       the assign (the "Schedule & Assign" atomic flow).
+ *   timeSlot          — OPTIONAL new time slot, paired with requestedDateTime.
+ *
+ * When requestedDateTime/timeSlot are omitted the assign behaviour + webhooks
+ * are unchanged.
+ */
+async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requestedDateTime, timeSlot }, actor) {
   // Check tech + job in parallel — they're independent lookups. Fails either
   // way with the right 400/404, same as before, but cuts one round-trip.
   const [[[tech]], existing] = await Promise.all([
@@ -2800,6 +2939,27 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason }, actor)
     const err = new Error('job not found'); err.status = 404; throw err;
   }
 
+  // Normalise the optional schedule edit. Only when requestedDateTime is
+  // supplied do we touch the job's date/time columns. time_slot is paired
+  // (only written when a non-empty value is provided).
+  const editSchedule = requestedDateTime != null && requestedDateTime !== '';
+  // requestedDateTime is an IST WALL-CLOCK string (datetime-local
+  // "YYYY-MM-DDTHH:mm" or date-only). Store it as the DB's literal
+  // "YYYY-MM-DD HH:mm:ss" — do NOT pass a JS Date (new Date() of a
+  // tz-less datetime-local is read as server-local and shifts hours on a
+  // UTC host; mysql2 then re-converts). This matches how create() stores
+  // requested_date_time as an IST literal.
+  let newRequested = null;
+  if (editSchedule) {
+    const m = String(requestedDateTime).match(/^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2})(:\d{2})?)?$/);
+    if (!m) {
+      const err = new Error('requestedDateTime is not a valid date'); err.status = 400; throw err;
+    }
+    const timePart = m[2] ? `${m[2]}${m[3] || ':00'}` : '00:00:00';
+    newRequested = `${m[1]} ${timePart}`;
+  }
+  const hasSlot = timeSlot !== undefined && timeSlot !== null && timeSlot !== '';
+
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
@@ -2807,20 +2967,39 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason }, actor)
     const isReassign = existing.fk_easyfixter_id && existing.fk_easyfixter_id !== easyfixerId;
     const now = new Date();
 
+    // Build the SET list. The schedule edit (requested_date_time + time_slot)
+    // rides along in the SAME UPDATE so "Schedule & Assign" is atomic.
+    const sets = [
+      'fk_easyfixter_id = ?',
+      'scheduled_date_time = ?',
+      'fk_scheduled_by = ?',
+      `job_status = CASE WHEN job_status = ${STATUS.BOOKED} THEN ${STATUS.SCHEDULED} ELSE job_status END`,
+      'first_scheduled_by = COALESCE(first_scheduled_by, ?)',
+      'last_update_time = ?',
+    ];
+    const values = [easyfixerId, now, actor?.user_id || null, actor?.user_id || null, now];
+    if (editSchedule) {
+      sets.push('requested_date_time = ?');
+      values.push(newRequested);
+    }
+    if (hasSlot) {
+      sets.push('time_slot = ?');
+      values.push(String(timeSlot));
+    }
+    values.push(jobId);
+
     await conn.query(
-      `UPDATE tbl_job
-          SET fk_easyfixter_id = ?, scheduled_date_time = ?, fk_scheduled_by = ?,
-              job_status = CASE WHEN job_status = ${STATUS.BOOKED} THEN ${STATUS.SCHEDULED} ELSE job_status END,
-              first_scheduled_by = COALESCE(first_scheduled_by, ?),
-              last_update_time = ?
-        WHERE job_id = ?`,
-      [easyfixerId, now, actor?.user_id || null, actor?.user_id || null, now, jobId]
+      `UPDATE tbl_job SET ${sets.join(', ')} WHERE job_id = ?`,
+      values
     );
 
     await conn.query(
       `INSERT INTO scheduling_history (job_id, easyfixer_id, schedule_time, reason_id, reschedule_reason)
        VALUES (?, ?, ?, ?, ?)`,
-      [jobId, easyfixerId, now,
+      // When the schedule is being edited, schedule_history captures the NEW
+      // requested time as the schedule_time so the audit trail reflects the
+      // promised appointment, not just the commit instant.
+      [jobId, easyfixerId, editSchedule ? newRequested : now,
        isReassign ? (reasonId || null) : null,
        isReassign ? (rescheduleReason || null) : null]
     );

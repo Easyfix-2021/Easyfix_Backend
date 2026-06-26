@@ -23,26 +23,129 @@ async function findById(id) {
   return row || null;
 }
 
+// Technician role_id in tbl_role (see CLAUDE.md role model — role 19 "Technician").
+const TECH_ROLE_ID = 19;
+
+/*
+ * Self-onboarding for an unknown mobile.
+ *
+ * Creates the legacy-parity stub for a technician who has never existed in the
+ * system, so an unknown number can still receive a login OTP and walk the
+ * onboarding stepper (the mobile-registration gate derives `personal_pending`
+ * from a fresh stub — is_personal_detail_filled = 0). Two rows, one TXN:
+ *
+ *   tbl_user      — role 19 (Technician), is_personal_detail_filled = 0,
+ *                   user_status = 0 (un-vetted lead — matches the legacy
+ *                   createUser default and keeps the ghost out of active-user
+ *                   queries). FK target that mobile-registration.service.js
+ *                   LEFT JOINs for the gate.
+ *   tbl_easyfixer — efr_no = mobile, new_easy_fixer = 1, efr_status = 1,
+ *                   insert/update_date = NOW(), user_id FK → the new tbl_user.
+ *                   is_technician_verified + the *_verified_by_crm flags are
+ *                   left NULL (un-vetted lead — CRM stamps them later).
+ *
+ * Concurrency: two simultaneous login-otp hits for the same new number would
+ * race to create the stub. efr_no is NOT DB-unique in production (dup active
+ * mobiles exist — see SCHEMA.md), so the real guard is the same MySQL
+ * named-lock pattern easyfixer.service.create() uses: serialise per-mobile,
+ * then re-check findByMobile INSIDE the lock and return the existing row if a
+ * concurrent request already created it. The ON DUPLICATE KEY UPDATE on the
+ * INSERT is defensive only — inert today, but keeps this race-safe (no 500)
+ * if a unique index is ever added on efr_no per the SCHEMA.md backfill note.
+ * Returns the new (or concurrently-created) tech row in findByMobile's shape.
+ */
+async function createStubTechnician(mobile) {
+  const conn = await pool.getConnection();
+  // GET_LOCK / RELEASE_LOCK are connection-scoped — both must run on the SAME
+  // pinned connection (never via pool.query). Mirrors easyfixer.service.create().
+  const lockName = `tech_stub_create_${mobile}`; // < 64 chars, mobile is 10 digits
+  try {
+    const [[lock]] = await conn.query('SELECT GET_LOCK(?, 5) AS got', [lockName]);
+    if (!lock || lock.got !== 1) {
+      const err = new Error('could not acquire onboarding lock for this mobile number, please retry');
+      err.status = 409;
+      throw err;
+    }
+
+    // Re-check under the lock — another request may have created the stub
+    // between findByMobile() and acquiring the lock.
+    const [[existing]] = await conn.query(
+      `SELECT efr_id, efr_name, efr_no, efr_email FROM tbl_easyfixer
+        WHERE efr_no = ? AND efr_status = 1 LIMIT 1`,
+      [mobile]);
+    if (existing) return existing;
+
+    await conn.beginTransaction();
+    try {
+      // Columns mirror user.service.create()'s canonical INSERT. login_status is
+      // intentionally omitted (not set by the canonical CRM insert either — let
+      // the DB default apply). user_status = 0: an un-vetted lead, matching the
+      // legacy createUser default and keeping the ghost out of active-user
+      // queries (e.g. client-verticals' "user_status <> 0" SPOC lookup).
+      const [userRes] = await conn.query(
+        `INSERT INTO tbl_user (mobile_no, user_role, is_personal_detail_filled, user_status, insert_date)
+         VALUES (?, ?, 0, 0, NOW())`,
+        [mobile, TECH_ROLE_ID]);
+      const userId = userRes.insertId;
+
+      // efr_no is NOT DB-unique today (dup active mobiles exist — see SCHEMA.md
+      // + the lock comment above), so this ON DUPLICATE KEY clause is inert
+      // defense-in-depth; the GET_LOCK is the real race guard. It becomes active
+      // automatically if a UNIQUE index is ever added on efr_no.
+      await conn.query(
+        `INSERT INTO tbl_easyfixer (efr_no, new_easy_fixer, efr_status, user_id, insert_date, update_date)
+         VALUES (?, 1, 1, ?, NOW(), NOW())
+         ON DUPLICATE KEY UPDATE efr_id = efr_id`,
+        [mobile, userId]);
+
+      await conn.commit();
+    } catch (e) {
+      await conn.rollback();
+      throw e;
+    }
+
+    // Re-fetch on the pinned connection so the new (or concurrently-created)
+    // row is returned in findByMobile's shape regardless of which insert won.
+    const [[row]] = await conn.query(
+      `SELECT efr_id, efr_name, efr_no, efr_email FROM tbl_easyfixer
+        WHERE efr_no = ? AND efr_status = 1 LIMIT 1`,
+      [mobile]);
+    return row || null;
+  } finally {
+    try { await conn.query('SELECT RELEASE_LOCK(?)', [lockName]); } catch (_) { /* connection teardown releases it anyway */ }
+    conn.release();
+  }
+}
+
 async function createLoginOtp(mobile) {
-  const tech = await findByMobile(mobile);
-  if (!tech) return { found: false };
+  // Unknown number → self-onboard a stub technician, then fall through to the
+  // normal OTP generate/deliver path so the new tech gets their first OTP.
+  let tech = await findByMobile(mobile);
+  if (!tech) {
+    tech = await createStubTechnician(mobile);
+    if (!tech) return { found: false };
+    if (process.env.NODE_ENV !== 'production') {
+      logger.event('🆕', 'green',
+        `self-onboarded new technician for ${mobile} (efr_id=${tech.efr_id}) — dev only`);
+    }
+  }
   // Tech logins are always mobile-based, so resolveLoginOtp will return
   // the last 4 digits of the mobile in QA mode (env QA_DETERMINISTIC_OTP=true).
   // In prod the env var is unset → real random OTP. Same gate as auth-service.
   const otp = resolveLoginOtp(mobile);
   const now = new Date();
   const expires = otpExpiryDate(now);
-  // Single-row-per-(email, mobile, otp_type) upsert. We always write BOTH
-  // tech.efr_email and mobile so the (email, mobile, otp_type) tuple stays
-  // meaningful — if a technician's mobile is later reassigned to a different
-  // efr (with different email), this tuple is naturally distinct.
-  // Legacy partial rows (only mobile, no email) cannot satisfy the AND query
-  // in verify, so they stay safely out of the auth flow.
+  // Single-row-per-(mobile, otp_type) upsert keyed on the mobile number — the
+  // real login identity for technicians. efr_email is written informationally
+  // (and may be NULL). Keying the upsert on mobile (not email) keeps exactly one
+  // live OTP row per technician and matches verifyLoginOtp's lookup, so techs
+  // with no efr_email on file can still receive and verify an OTP.
   const [[existing]] = await pool.query(
     `SELECT id FROM otp_details
-      WHERE user_email = ? AND user_mobile_no = ? AND otp_type = 'Mobile App Otp'
+      WHERE user_mobile_no = ? AND otp_type = 'Mobile App Otp'
+      ORDER BY id DESC
       LIMIT 1`,
-    [tech.efr_email, mobile]
+    [mobile]
   );
   if (existing) {
     await pool.query(
@@ -83,13 +186,19 @@ async function createLoginOtp(mobile) {
 async function verifyLoginOtp(mobile, otp) {
   const tech = await findByMobile(mobile);
   if (!tech) return { ok: false, reason: 'USER_NOT_FOUND' };
-  // Match the same (email, mobile, otp_type) tuple createLoginOtp wrote.
-  // Both columns AND-ed → legacy mobile-only rows can't bleed into auth.
+  // Match on (mobile, otp_type) ALONE. The mobile number is the real login
+  // identity for technicians; user_email is stored purely informationally
+  // (and is NULL for techs with no efr_email on file). Including user_email in
+  // this predicate was a correctness bug: when efr_email is NULL the createLoginOtp
+  // INSERT writes user_email = NULL, and `WHERE user_email = NULL` can never
+  // match (SQL NULL semantics) → such technicians could never verify. Dropping
+  // the email predicate fixes that without changing OTP generation.
   const [[row]] = await pool.query(
     `SELECT id, otp, valid_up_to, is_expired FROM otp_details
-      WHERE user_email = ? AND user_mobile_no = ? AND otp_type = 'Mobile App Otp'
+      WHERE user_mobile_no = ? AND otp_type = 'Mobile App Otp'
+      ORDER BY id DESC
       LIMIT 1`,
-    [tech.efr_email, mobile]);
+    [mobile]);
   if (!row) return { ok: false, reason: 'NO_OTP_ISSUED' };
   if (row.is_expired || new Date(row.valid_up_to).getTime() < Date.now()) {
     await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
@@ -103,4 +212,4 @@ async function verifyLoginOtp(mobile, otp) {
   return { ok: true, token, tech };
 }
 
-module.exports = { findByMobile, findById, createLoginOtp, verifyLoginOtp };
+module.exports = { findByMobile, findById, createStubTechnician, createLoginOtp, verifyLoginOtp };

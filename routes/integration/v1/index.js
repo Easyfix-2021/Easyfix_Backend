@@ -126,6 +126,33 @@ router.get('/jobs/jobStatus', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ─── /v1/jobs/tracking — search ─────────────────────────────────────
+router.get('/jobs/tracking', async (req, res, next) => {
+  try {
+    const { rows } = await jobService.list({
+      clientId: req.integrationClient.id,
+      status: req.query.status != null ? Number(req.query.status) : undefined,
+      limit: Math.min(Number(req.query.limit) || 50, 500),
+    });
+    legacyOk(res, rows.map((j) => ({
+      jobId: j.job_id, status: statusLabel(j.job_status),
+      jobType: j.job_type, requestedDateTime: formatLegacyDate(j.requested_date_time),
+    })));
+  } catch (e) { next(e); }
+});
+
+// ─── /v1/jobs/history — date range ──────────────────────────────────
+router.get('/jobs/history', async (req, res, next) => {
+  try {
+    const { rows } = await jobService.list({
+      clientId: req.integrationClient.id,
+      startDate: req.query.startDate, endDate: req.query.endDate,
+      limit: 500,
+    });
+    legacyOk(res, rows);
+  } catch (e) { next(e); }
+});
+
 router.get('/jobs/:id', async (req, res, next) => {
   try {
     const job = await jobService.getById(Number(req.params.id));
@@ -168,33 +195,6 @@ router.delete('/jobs/:id', async (req, res, next) => {
     if (!job || job.fk_client_id !== req.integrationClient.id) return legacyError(res, 404, 'Not Found');
     await jobService.setStatus(job.job_id, { status: 6, comment: 'cancelled via /v1 API' }, { user_id: null });
     legacyOk(res, { jobId: job.job_id, status: 'Cancelled' });
-  } catch (e) { next(e); }
-});
-
-// ─── /v1/jobs/tracking — search ─────────────────────────────────────
-router.get('/jobs/tracking', async (req, res, next) => {
-  try {
-    const { rows } = await jobService.list({
-      clientId: req.integrationClient.id,
-      status: req.query.status != null ? Number(req.query.status) : undefined,
-      limit: Math.min(Number(req.query.limit) || 50, 500),
-    });
-    legacyOk(res, rows.map((j) => ({
-      jobId: j.job_id, status: statusLabel(j.job_status),
-      jobType: j.job_type, requestedDateTime: formatLegacyDate(j.requested_date_time),
-    })));
-  } catch (e) { next(e); }
-});
-
-// ─── /v1/jobs/history — date range ──────────────────────────────────
-router.get('/jobs/history', async (req, res, next) => {
-  try {
-    const { rows } = await jobService.list({
-      clientId: req.integrationClient.id,
-      startDate: req.query.startDate, endDate: req.query.endDate,
-      limit: 500,
-    });
-    legacyOk(res, rows);
   } catch (e) { next(e); }
 });
 
@@ -312,6 +312,7 @@ router.post('/utils/uploadFile', upload.single('file'), async (req, res, next) =
 router.get('/clients', async (req, res) => legacyOk(res, []));
 router.get('/clients/:id', async (req, res, next) => {
   try {
+    if (Number(req.params.id) !== req.integrationClient.id) return legacyError(res, 404, 'Not Found');
     const [[c]] = await pool.query('SELECT client_id, client_name, client_email FROM tbl_client WHERE client_id = ?', [req.params.id]);
     legacyOk(res, c || null);
   } catch (e) { next(e); }
@@ -329,9 +330,9 @@ router.get('/customer/getCustomer', async (req, res, next) => {
     if (!mobile && !id) return legacyError(res, 400, 'mobile or id required');
     const [[cust]] = await pool.query(
       mobile
-        ? 'SELECT customer_id AS id, customer_name AS name, customer_mob_no AS mobile, customer_email AS email FROM tbl_customer WHERE customer_mob_no = ? LIMIT 1'
-        : 'SELECT customer_id AS id, customer_name AS name, customer_mob_no AS mobile, customer_email AS email FROM tbl_customer WHERE customer_id = ? LIMIT 1',
-      [mobile || id]
+        ? 'SELECT customer_id AS id, customer_name AS name, customer_mob_no AS mobile, customer_email AS email FROM tbl_customer c WHERE c.customer_mob_no = ? AND EXISTS (SELECT 1 FROM tbl_job j WHERE j.fk_customer_id = c.customer_id AND j.fk_client_id = ?) LIMIT 1'
+        : 'SELECT customer_id AS id, customer_name AS name, customer_mob_no AS mobile, customer_email AS email FROM tbl_customer c WHERE c.customer_id = ? AND EXISTS (SELECT 1 FROM tbl_job j WHERE j.fk_customer_id = c.customer_id AND j.fk_client_id = ?) LIMIT 1',
+      [mobile || id, req.integrationClient.id]
     );
     legacyOk(res, cust || null);
   } catch (e) { next(e); }
@@ -358,7 +359,7 @@ router.put('/customer', async (req, res, next) => {
 router.get('/customer/jobs', async (req, res, next) => {
   try {
     const custId = Number(req.query.customerId);
-    const [rows] = await pool.query('SELECT job_id, job_status, created_date_time FROM tbl_job WHERE fk_customer_id = ? ORDER BY job_id DESC LIMIT 100', [custId]);
+    const [rows] = await pool.query('SELECT job_id, job_status, created_date_time FROM tbl_job WHERE fk_customer_id = ? AND fk_client_id = ? ORDER BY job_id DESC LIMIT 100', [custId, req.integrationClient.id]);
     legacyOk(res, rows.map((j) => ({ ...j, status: statusLabel(j.job_status) })));
   } catch (e) { next(e); }
 });

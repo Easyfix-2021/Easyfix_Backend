@@ -152,9 +152,47 @@ async function flushCache() {
   return _cache ? _cache.size : 0;
 }
 
+/**
+ * Upsert a single property (UPDATE-then-INSERT so it works whether or not
+ * property_key carries a unique constraint) and keep the in-process cache hot
+ * so the change is visible to this process immediately. Other replicas pick it
+ * up on their next TTL refresh / flush. Used by admin toggles like the
+ * Web↔Mobile calling switch (voice.call.mode).
+ */
+async function setProperty(key, value) {
+  const v = String(value);
+  const [r] = await pool.query(
+    'UPDATE easyfix_properties SET property_value = ? WHERE property_key = ?',
+    [v, key],
+  );
+  if (!r.affectedRows) {
+    await pool.query(
+      'INSERT INTO easyfix_properties (property_key, property_value) VALUES (?, ?)',
+      [key, v],
+    );
+  }
+  if (_cache) _cache.set(key, v);
+  return true;
+}
+
+/**
+ * Parse an easyfix_properties value holding a CSV of emails into a lowercased
+ * Set for O(1) membership checks. Empty/missing → empty Set, so callers using
+ * this as an ACCESS allowlist fail CLOSED (deny-all until the key is populated).
+ * Centralises the long-standing scheduled.jobs.visible.emails parser so every
+ * property-allowlist gate shares one implementation.
+ */
+function parseEmailAllowlist(key) {
+  const raw = String(getProperty(key) ?? '').trim();
+  if (!raw) return new Set();
+  return new Set(raw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean));
+}
+
 module.exports = {
   preload,
   getProperty,
   getAllProperties,
   flushCache,
+  setProperty,
+  parseEmailAllowlist,
 };

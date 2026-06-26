@@ -43,7 +43,20 @@ function buildOpenApiPaths(app) {
   const paths = {};
   for (const r of routes) {
     if (shouldSkipRoute(r)) continue;
-    const apiPath = expressToOpenApiPath(r.path);
+    /*
+     * Strip the leading `/api` mount prefix from the emitted path key.
+     * OpenAPI concatenates `servers[].url` + path, and the server base
+     * already carries `/api` (see openapi.yaml `servers:` + the runtime
+     * patch in swagger.js). The router stack walk produces full paths
+     * like `/api/public/deep-skills/getAllDeepSkillImages` because the
+     * app mounts at `app.use('/api', …)` / `app.use('/api/public', …)`,
+     * so without this strip "Try it out" hits `/api/api/...` and fails
+     * with a spurious "Failed to fetch" / 404. The `(?=\/|$)` lookahead
+     * only strips a whole `/api` segment; non-/api roots (e.g. the
+     * url-shortener mounted at `/`) are left untouched. Mirrors the same
+     * strip the tag-inference logic already applies below.
+     */
+    const apiPath = expressToOpenApiPath(r.path).replace(/^\/api(?=\/|$)/, '') || '/';
     if (!paths[apiPath]) paths[apiPath] = {};
     paths[apiPath][r.method.toLowerCase()] = buildOperation(r);
   }

@@ -3,9 +3,11 @@ const router = require('express').Router();
 const validate = require('../../middleware/validate');
 const job = require('../../services/job.service');
 const candidateRanking = require('../../services/candidate-ranking.service');
+const jobLocation = require('../../services/job-location.service');
 const { modernOk, modernError } = require('../../utils/response');
 const {
   listQuery, createBody, updateBody, statusBody, assignBody, ownerBody, idParam,
+  candidatesQuery, candidatesSearchQuery,
 } = require('../../validators/job.validator');
 const { assertEntityInScope } = require('../../lib/scope');
 const { streamStyledXlsx } = require('../../utils/xlsx-styled-export');
@@ -52,16 +54,88 @@ router.use(require('./jobs-upload'));
  * Listed BEFORE `/:id/assign` and other `/:id/*` so Express matches the
  * literal `candidates` segment first.
  */
-router.get('/:id/candidates', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
-  try {
-    const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
-    const result = await candidateRanking.rankCandidatesForJob(req.params.id, { limit });
-    modernOk(res, result);
-  } catch (e) {
-    if (e.status) return modernError(res, e.status, e.message);
-    next(e);
-  }
-});
+/*
+ * GET /api/admin/jobs/:id/location[?limit=] — real-time technician location for
+ * the CRM live view. Returns the latest fix + a recent breadcrumb trail from
+ * tbl_job_location_track (posted by the tech app during the job). scopedJob
+ * enforces the operator's manage_* scope (404 out-of-scope).
+ */
+router.get('/:id/location',
+  validate(idParam, 'params'),
+  scopedJob,
+  async (req, res, next) => {
+    try {
+      const [latest, track] = await Promise.all([
+        jobLocation.getLatest(req.params.id),
+        jobLocation.getTrack(req.params.id, { limit: req.query.limit }),
+      ]);
+      modernOk(res, { latest, track });
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  });
+
+router.get('/:id/candidates',
+  validate(idParam, 'params'),
+  validate(candidatesQuery, 'query'),
+  scopedJob,
+  async (req, res, next) => {
+    try {
+      const { limit, jobDate, timeSlot } = req.query;
+      const result = await candidateRanking.rankCandidatesForJob(req.params.id, {
+        limit,
+        // jobDate is a validated IST wall-clock string — pass it through
+        // verbatim. The service slices the date-only prefix for DATE()
+        // comparisons; do NOT new Date()/toISOString() it (UTC↔IST shift).
+        jobDate: jobDate || undefined,
+        timeSlot,
+        // Schedule & Assign top-10 hard filters per the API contract:
+        // concurrent is a displayed column (not a hard filter), COD enforces
+        // the balance floor.
+        enforceMaxConcurrent: false,
+        enforceCodBalance: true,
+      });
+      modernOk(res, result);
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  });
+
+/*
+ * GET /api/admin/jobs/:id/candidates/search?term=<q>&jobDate=&timeSlot=
+ *
+ * Match-anyone variant of /:id/candidates — finds technicians by
+ * efr_id / efr_name / efr_no(mobile) with NO top-10 hard filters and NO
+ * ranking exclusion, returning the same widened row shape (distance,
+ * attendance, concurrent, skill state, …) so ops can assign anyone.
+ * Capped at 50; the service logger.warns when the cap is hit.
+ *
+ * Declared BEFORE `/:id/assign` and `/:id` so Express matches the literal
+ * `candidates/search` segments first.
+ */
+router.get('/:id/candidates/search',
+  validate(idParam, 'params'),
+  validate(candidatesSearchQuery, 'query'),
+  scopedJob,
+  async (req, res, next) => {
+    try {
+      const { term, limit, jobDate, timeSlot } = req.query;
+      const result = await candidateRanking.searchTechniciansForJob(req.params.id, {
+        term,
+        limit,
+        // Pass the validated IST wall-clock string through verbatim (no UTC
+        // round-trip) — the service slices the date prefix for DATE() math.
+        jobDate: jobDate || undefined,
+        timeSlot,
+      });
+      modernOk(res, result);
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  });
 
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
   try {
@@ -2286,3 +2360,4 @@ router.delete(
 );
 
 module.exports = router;
+module.exports.scopedJob = scopedJob;

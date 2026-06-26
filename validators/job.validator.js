@@ -230,7 +230,12 @@ const updateBody = Joi.object({
   fk_service_type_id: intId.optional(),
   fk_service_catg_id: intId.optional(),
   requested_date_time: Joi.date().iso().optional(),
-  requested_time: Joi.string().max(20).allow('', null).optional(),
+  // Companion time text col (stored as "HH:MM"). Like original_appointment_time
+  // above, update() projects this via formatTimeIST before the DB write, so the
+  // validator must accept the pre-projection shape — a caller that sends the
+  // full ISO (~24 chars) instead of HH:MM must not be 400'd here. max(40) covers
+  // ISO + offset variants; the persisted value is always <=5 chars.
+  requested_time: Joi.string().max(40).allow('', null).optional(),
   expected_date_time: Joi.date().iso().optional(),
   time_slot: Joi.string().max(200).optional(),
   booking_cut_off_time_slot: Joi.string().max(50).allow('', null).optional(),
@@ -246,7 +251,13 @@ const updateBody = Joi.object({
    */
   collected_by: Joi.alternatives(Joi.number().integer(), Joi.string().max(20)).allow(null, '').optional(),
   original_appointment_date_time: Joi.date().iso().allow(null).optional(),
-  original_appointment_time:      Joi.string().max(20).allow('', null).optional(),
+  // Confirm & Schedule sends this as a FULL ISO datetime
+  // (new Date(requested_date_time).toISOString(), ~24 chars) and lets the
+  // server own the projection: update() reduces it to "HH:MM" via
+  // formatTimeIST before the DB write (TIME_COLS in services/job.service.js).
+  // So this validator must accept the pre-projection ISO, not the 20-char
+  // stored form — the persisted value is always <=5 chars regardless.
+  original_appointment_time:      Joi.string().max(40).allow('', null).optional(),
   client_spoc: Joi.string().max(200).optional(),
   client_spoc_name: Joi.string().max(200).optional(),
   client_spoc_email: Joi.string().email().max(200).optional(),
@@ -300,6 +311,40 @@ const assignBody = Joi.object({
   easyfixerId: intId.required(),
   reasonId: intId.optional(),
   rescheduleReason: Joi.string().max(500).optional(),
+  // Schedule & Assign — optional schedule edit applied atomically with the
+  // assign. When provided, the job's requested_date_time (+ time_slot when
+  // also supplied) is updated in the same transaction as the assignment.
+  // IST WALL-CLOCK string (datetime-local "YYYY-MM-DDTHH:mm" or date-only),
+  // NOT Joi.date() — coercing to a JS Date and round-tripping through
+  // toISOString() shifts the day/time across the UTC↔IST boundary (the DB
+  // stores IST wall-clock literals). Keep it a string end-to-end.
+  requestedDateTime: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$/).max(40).optional(),
+  timeSlot: Joi.string().max(200).allow('', null).optional(),
+});
+
+/*
+ * Query schema for GET /:id/candidates (ranked top-N) — limit + optional
+ * proposed-schedule overrides so the modal can recompute attendance /
+ * concurrent / same-slot against the date/slot the ops user is editing.
+ */
+const candidatesQuery = Joi.object({
+  limit: Joi.number().integer().min(1).max(200).default(10),
+  // Wall-clock string (see requestedDateTime note) — service slices to the
+  // date-only prefix for DATE() comparisons; must NOT be UTC-converted.
+  jobDate: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$/).max(40).optional(),
+  timeSlot: Joi.string().max(200).optional(),
+});
+
+/*
+ * Query schema for GET /:id/candidates/search (match-anyone). `term` is
+ * required (matches efr_id / efr_name / efr_no). Same optional schedule
+ * overrides as the ranked list.
+ */
+const candidatesSearchQuery = Joi.object({
+  term: Joi.string().trim().min(1).max(100).required(),
+  limit: Joi.number().integer().min(1).max(50).default(50),
+  jobDate: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$/).max(40).optional(),
+  timeSlot: Joi.string().max(200).optional(),
 });
 
 const ownerBody = Joi.object({
@@ -309,4 +354,7 @@ const ownerBody = Joi.object({
 
 const idParam = Joi.object({ id: intId.required() });
 
-module.exports = { listQuery, createBody, updateBody, statusBody, assignBody, ownerBody, idParam };
+module.exports = {
+  listQuery, createBody, updateBody, statusBody, assignBody, ownerBody, idParam,
+  candidatesQuery, candidatesSearchQuery,
+};

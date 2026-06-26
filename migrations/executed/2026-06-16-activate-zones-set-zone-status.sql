@@ -1,0 +1,11 @@
+-- Existing tbl_zone_master rows have zone_status = NULL (legacy rows never set
+-- it). Effect: the CRM renders every zone as "Inactive", and the active-zone
+-- filters across the app (candidate-ranking `AND zm.zone_status = 1`,
+-- pincode->zone count/detail, city zone_count, zone-upload matching) all
+-- exclude these zones because `NULL = 1` is never true.
+--
+-- Activate all existing zones (NULL means "never set", not "intentionally
+-- off"). New zones already insert zone_status = 1 explicitly
+-- (services/zone.service.js createZone + services/zone-upload.service.js), so
+-- no NULLs are introduced going forward.
+UPDATE tbl_zone_master SET zone_status = 1 WHERE zone_status IS NULL;

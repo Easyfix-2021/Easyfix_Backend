@@ -12,20 +12,65 @@ const idParam = Joi.object({
   pincodeId: Joi.number().integer().positive().required(),
 });
 
+const techniciansQuery = Joi.object({
+  q:      Joi.string().allow('', null).optional(),
+  limit:  Joi.number().integer().min(1).max(200).default(20),
+  offset: Joi.number().integer().min(0).default(0),
+});
+
 const listQuery = Joi.object({
   q:       Joi.string().allow('', null).optional(),
   status:  Joi.string().valid('LOCAL', 'TRAVEL').optional(),
   cityId:  Joi.number().integer().positive().optional(),
   includeInactive: Joi.boolean().default(false),
-  limit:   Joi.number().integer().min(1).max(500).default(100),
+  limit:   Joi.number().integer().min(1).max(200000).default(100),
   offset:  Joi.number().integer().min(0).default(0),
+  // 'is_active' sorts the Serviceable/Non-Serviceable "Status" column (real
+  // pincode_status column). The virtual LOCAL/TRAVEL "Mapping" value is NOT a
+  // sort key — it's derived post-pagination and sorted client-side by the CRM
+  // page. See SORT_MAP note in services/pincode.service.js.
+  sortBy:  Joi.string().valid('pincode', 'location', 'zonal_manager', 'is_active').optional(),
+  sortDir: Joi.string().valid('asc', 'desc').default('asc'),
+});
+
+const lookupManyBody = Joi.object({
+  pincodes: Joi.array().items(Joi.string().pattern(/^\d{6}$/)).min(1).max(500).required(),
 });
 
 const createBody = Joi.object({
   pincode:  Joi.string().pattern(/^\d{6}$/).required(),
   location: Joi.string().trim().max(255).allow('', null).optional(),
-  city_id:  Joi.number().integer().positive().required(),
+  city_id:  Joi.number().integer().positive().optional(),
   district: Joi.string().trim().max(100).allow('', null).optional(),
+  lat:      Joi.number().min(-90).max(90).optional(),
+  lng:      Joi.number().min(-180).max(180).optional(),
+  // When the geocoded city/state isn't in our DB, the FE sends `newCity` so the
+  // service find-or-creates it on save (state first if new). Inside it, a
+  // matched state_id OR a new state_name is required.
+  newCity:  Joi.object({
+    city_name:  Joi.string().trim().max(255).required(),
+    state_id:   Joi.number().integer().positive().optional(),
+    state_name: Joi.string().trim().max(255).optional(),
+  }).or('state_id', 'state_name').optional(),
+  // Chosen zone suggestions to map the new pincode to on create.
+  zoneIds:  Joi.array().items(Joi.number().integer().positive()).default([]),
+  // Serviceable toggle from the Add form (defaults Serviceable).
+  is_active: Joi.boolean().default(true),
+}).or('city_id', 'newCity');
+
+const geocodeQuery = Joi.object({
+  pincode: Joi.string().pattern(/^\d{6}$/).required(),
+});
+
+const ensureBody = Joi.object({
+  pincode: Joi.string().pattern(/^\d{6}$/).required(),
+});
+
+const suggestZonesQuery = Joi.object({
+  cityId: Joi.number().integer().positive().optional(),
+  lat:    Joi.number().min(-90).max(90).optional(),
+  lng:    Joi.number().min(-180).max(180).optional(),
+  limit:  Joi.number().integer().min(1).max(10).default(3),
 });
 
 const updateBody = Joi.object({
@@ -34,6 +79,10 @@ const updateBody = Joi.object({
   district:  Joi.string().trim().max(100).allow('', null).optional(),
   is_active: Joi.boolean().optional(),
 }).min(1);
+
+const setZonesBody = Joi.object({
+  zoneIds: Joi.array().items(Joi.number().integer().positive()).default([]),
+});
 
 const uploadQuery = Joi.object({
   dryRun: Joi.boolean().default(false),
@@ -60,6 +109,70 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
   } catch (err) { return next(err); }
 });
 
+// Bulk lookup by codes — used by the CRM verification page's bulk-paste
+// "Add All Matching Pincodes" flow. Declared BEFORE /:pincodeId so the
+// dynamic param matcher doesn't swallow "lookup-many".
+router.post('/lookup-many',
+  validate(lookupManyBody, 'body'),
+  async (req, res, next) => {
+    try {
+      const result = await pin.lookupManyByCode(req.body.pincodes);
+      return modernOk(res, result);
+    } catch (err) { return next(err); }
+  }
+);
+
+// Auto-fetch: geocode a PIN (Google) + match its state/city to our DB + dup
+// check. Declared BEFORE /:pincodeId so the dynamic matcher doesn't swallow
+// "geocode".
+router.get('/geocode', validate(geocodeQuery, 'query'), async (req, res, next) => {
+  try {
+    const data = await pin.geocodeAndMatch(req.query.pincode);
+    return modernOk(res, data);
+  } catch (err) {
+    if (err.status) return modernError(res, err.status, err.message);
+    return next(err);
+  }
+});
+
+// POST /admin/pincodes/ensure — idempotent "on-the-fly" pincode creation used
+// by the Book New Call / Confirm & Schedule address picker. If the pincode
+// already exists it returns the existing row (created:false, no write); else it
+// geocodes (India-only), find-or-creates the matched state+city, inserts the
+// row, and returns it (created:true). A non-India/ungeocodable pincode is a 400
+// (badReq → err.status) which the FE surfaces inline WITHOUT blocking the form.
+// Declared BEFORE /:pincodeId so the dynamic matcher doesn't swallow "ensure".
+router.post('/ensure', validate(ensureBody, 'body'), async (req, res, next) => {
+  try {
+    const data = await pin.ensurePincode(req.body.pincode, { userId: userIdOf(req) });
+    return modernOk(res, data, data.created ? 'Pincode added' : 'Pincode already present');
+  } catch (err) {
+    if (err.status) return modernError(res, err.status, err.message);
+    return next(err);
+  }
+});
+
+// POST /admin/pincodes/refresh-status — bulk-recompute pincode_status from the
+// union of (serviceable CSV ∪ efr_pin_no) of ACTIVE + VERIFIED technicians, in
+// ONE transaction (all→0 then union→1). Returns { serviceableCount, total }.
+// No body. Declared BEFORE /:pincodeId so the dynamic matcher doesn't swallow
+// "refresh-status".
+router.post('/refresh-status', async (req, res, next) => {
+  try {
+    const data = await pin.recomputeServiceableStatus({ userId: userIdOf(req) });
+    return modernOk(res, data, 'Pincode status refreshed');
+  } catch (err) { return next(err); }
+});
+
+// Suggest the top-3 most relevant zones for a (new) pincode, ranked same-city
+// first then nearest (computed from each zone's already-mapped pincodes).
+router.get('/suggest-zones', validate(suggestZonesQuery, 'query'), async (req, res, next) => {
+  try {
+    const suggestions = await pin.suggestZonesForLocation(req.query);
+    return modernOk(res, { suggestions });
+  } catch (err) { return next(err); }
+});
+
 router.get('/:pincodeId', validate(idParam, 'params'), async (req, res, next) => {
   try {
     const row = await pin.getPincodeById(Number(req.params.pincodeId));
@@ -67,6 +180,29 @@ router.get('/:pincodeId', validate(idParam, 'params'), async (req, res, next) =>
     return modernOk(res, row);
   } catch (err) { return next(err); }
 });
+
+// GET /admin/pincodes/:pincodeId/technicians?q=&limit=&offset=
+// Returns active+verified technicians whose serviceable pincodes include
+// this pincode. Powers the clickable-count modal on Manage Pincodes.
+router.get('/:pincodeId/technicians',
+  validate(idParam, 'params'),
+  validate(techniciansQuery, 'query'),
+  async (req, res, next) => {
+    try {
+      const row = await pin.getPincodeById(Number(req.params.pincodeId));
+      if (!row) return modernError(res, 404, 'Pincode not found');
+      const result = await pin.listTechniciansForPincode(
+        Number(req.params.pincodeId),
+        {
+          q:      req.query.q,
+          limit:  req.query.limit,
+          offset: req.query.offset,
+        }
+      );
+      return modernOk(res, result);
+    } catch (err) { return next(err); }
+  }
+);
 
 // ─── CREATE / UPDATE / DELETE ────────────────────────────────────────
 router.post('/', validate(createBody), async (req, res, next) => {
@@ -87,6 +223,27 @@ router.patch('/:pincodeId',
       const updated = await pin.updatePincode(Number(req.params.pincodeId), req.body, { userId: userIdOf(req) });
       if (!updated) return modernError(res, 404, 'Pincode not found');
       return modernOk(res, updated, 'Pincode updated');
+    } catch (err) {
+      if (err.status) return modernError(res, err.status, err.message);
+      return next(err);
+    }
+  }
+);
+
+// PUT /admin/pincodes/:pincodeId/zones — body { zoneIds: number[] }
+// Reverse of the zone editor's pincode-set: assign THIS pincode to zone(s).
+// Wipe-and-reinsert this pincode's tbl_zone_pincode_mapping rows to match.
+router.put('/:pincodeId/zones',
+  validate(idParam, 'params'),
+  validate(setZonesBody),
+  async (req, res, next) => {
+    try {
+      const result = await pin.setZonesForPincode(
+        Number(req.params.pincodeId),
+        req.body.zoneIds,
+        { userId: userIdOf(req) }
+      );
+      return modernOk(res, result, 'Zones updated');
     } catch (err) {
       if (err.status) return modernError(res, err.status, err.message);
       return next(err);

@@ -5,6 +5,16 @@ const validate = require('../../middleware/validate');
 const { roleByName } = require('../../middleware/role');
 const svc = require('../../services/service-category.service');
 const { modernOk, modernError } = require('../../utils/response');
+/*
+ * Deep-skill catalog cache invalidation (2026-06-11). The public
+ * profile-update form bundles the full Category → Type → Skill →
+ * Option tree into its prefill response with a 5-minute cache. Adding
+ * / renaming / deactivating a Service Category changes that tree's
+ * top-level display so the cache must be dropped on each successful
+ * mutation here — same pattern applied to routes/admin/deep-skills.js
+ * and routes/admin/service-types.js.
+ */
+const { invalidateCatalogCaches } = require('../../services/easyfixer-profile-update-link.service');
 
 const idParam = Joi.object({ id: Joi.number().integer().positive().required() });
 
@@ -17,14 +27,18 @@ const listQuery = Joi.object({
   sortDir:         Joi.string().lowercase().valid('asc', 'desc').default('asc'),
 });
 
+// Legacy parity (addEditServicesCategory.vm + validate-servicecategory.js):
+// BOTH name and description are required with minlength 2. On create we mirror
+// that. On partial update either may be omitted, but a supplied value must
+// still satisfy min 2 (service layer rejects a blank).
 const createBody = Joi.object({
   service_catg_name: Joi.string().trim().min(2).max(200).required(),
-  service_catg_desc: Joi.string().trim().max(500).allow('', null).optional(),
+  service_catg_desc: Joi.string().trim().min(2).max(500).required(),
 });
 
 const updateBody = Joi.object({
   service_catg_name: Joi.string().trim().min(2).max(200).optional(),
-  service_catg_desc: Joi.string().trim().max(500).allow('', null).optional(),
+  service_catg_desc: Joi.string().trim().min(2).max(500).optional(),
   is_active:         Joi.boolean().optional(),
 }).min(1);
 
@@ -43,6 +57,7 @@ router.get('/:id', validate(idParam, 'params'), async (req, res, next) => {
 router.post('/', roleByName(['Admin']), validate(createBody), async (req, res, next) => {
   try {
     const created = await svc.createCategory(req.body);
+    invalidateCatalogCaches();
     res.status(201); modernOk(res, created, 'Service Category added');
   } catch (e) { if (e.status) return modernError(res, e.status, e.message); next(e); }
 });
@@ -51,15 +66,20 @@ router.patch('/:id', roleByName(['Admin']), validate(idParam, 'params'), validat
   try {
     const updated = await svc.updateCategory(Number(req.params.id), req.body);
     if (!updated) return modernError(res, 404, 'Service Category not found');
+    invalidateCatalogCaches();
     modernOk(res, updated, 'Service Category updated');
   } catch (e) { if (e.status) return modernError(res, e.status, e.message); next(e); }
 });
 
+// DELETE = legacy "trash" (status=3). Matches the legacy /addDeleteServiceCatg
+// action and the Manage Service Type sibling. The Active toggle (status 0↔1)
+// is handled via PATCH { is_active }, not here.
 router.delete('/:id', roleByName(['Admin']), validate(idParam, 'params'), async (req, res, next) => {
   try {
-    const ok = await svc.deactivateCategory(Number(req.params.id));
+    const ok = await svc.deleteCategory(Number(req.params.id));
     if (!ok) return modernError(res, 404, 'Service Category not found');
-    modernOk(res, { deactivated: true });
+    invalidateCatalogCaches();
+    modernOk(res, { deleted: true });
   } catch (e) { if (e.status) return modernError(res, e.status, e.message); next(e); }
 });
 

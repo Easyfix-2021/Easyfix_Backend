@@ -322,7 +322,7 @@ const TIME_SLOTS = ['9 AM – 12 PM', '12 PM – 3 PM', '3 PM – 7 PM', 'After 
  */
 function magicLinkUrl(token) {
   const base = process.env.MAGIC_LINK_BASE_URL || 'https://qa.easyfix.in';
-  return `${base.replace(/\/$/, '')}/job-completion/${token}`;
+  return `${base.replace(/\/$/, '')}/public/job-completion/${token}`;
 }
 
 /**
@@ -699,9 +699,12 @@ async function fetchPrefill(jobId, pool) {
  *   429 SEND_LIMIT_REACHED back. See the inline comment in sendForJob.
  *
  *   Increment happens BEFORE the provider call so two callers can't each
- *   reserve send #3. If the provider rejects (delivered:false) or throws,
- *   we decrement the slot via another atomic UPDATE — failed attempts
- *   don't burn a slot, but in-flight reservations always do.
+ *   reserve send #3. Only the counter is reserved up front — sent_at and
+ *   last_action are stamped AFTER confirmed delivery, so a failed send
+ *   never leaves audit columns claiming a dispatch. If the provider
+ *   rejects (delivered:false) or throws, we decrement the slot via
+ *   another atomic UPDATE — failed attempts don't burn a slot, but
+ *   in-flight reservations always do.
  *
  * Action coercion:
  *   Defensive: if caller passes 'first' but a link was already sent, we
@@ -721,8 +724,14 @@ async function sendForJob(jobId, { action, override = false } = {}, pool) {
               (SELECT CAST(NULLIF(ccp_max.c_prop_values, '') AS UNSIGNED)
                  FROM tbl_client_custom_properties ccp_max
                 WHERE ccp_max.client_id    = j.fk_client_id
-                  AND LOWER(REPLACE(ccp_max.c_prop_name, '_', ' ')) = LOWER('Max Magic-Link Send Count')
-                  AND ccp_max.status       = 1
+                  -- Normalise BOTH '_' and '-' to spaces on both sides so the
+                  -- snake_case legacy name (max_magic_link_send_count) and the
+                  -- Title-Case 'Max Magic-Link Send Count' both match. (Was '_'
+                  -- only, so the hyphenated literal never matched snake_case rows
+                  -- → cap silently fell back to 3 and blocked resends.)
+                  AND LOWER(REPLACE(REPLACE(ccp_max.c_prop_name, '_', ' '), '-', ' '))
+                      = LOWER(REPLACE('Max Magic-Link Send Count', '-', ' '))
+                  AND (ccp_max.status IS NULL OR ccp_max.status = 1)
                 LIMIT 1),
               3
             ) AS max_send_count
@@ -766,10 +775,15 @@ async function sendForJob(jobId, { action, override = false } = {}, pool) {
    *   - Reserving the slot first prevents two callers from each thinking
    *     they own send #3. If Meta then fails, we DECREMENT the slot
    *     (single atomic UPDATE) so the slot isn't permanently burned.
+   *   - Only the COUNTER is reserved here. sent_at / last_action are
+   *     stamped after confirmed delivery — a failed send must not light
+   *     the "Link Sent" pill or coerce later first-sends to 'resend'.
    *   - Trade-off: if the process crashes between increment and Meta
-   *     response, one slot is lost. Acceptable — the cap is 3 attempts,
-   *     not 3 deliveries, and a hard crash mid-call is rare enough to
-   *     beat the double-send risk we'd otherwise inherit.
+   *     response, one slot is lost; a crash between provider success and
+   *     the post-delivery stamp leaves count incremented without sent_at
+   *     (cron may retry within 24h — benign). Acceptable — the cap is 3
+   *     attempts, not 3 deliveries, and a hard crash mid-call is rare
+   *     enough to beat the double-send risk we'd otherwise inherit.
    */
   const sentAt = new Date();
   // Override path: drop the `< maxSendCount` clause so a send goes
@@ -778,19 +792,15 @@ async function sendForJob(jobId, { action, override = false } = {}, pool) {
   // configurable per-client cap.
   const reserveSql = override
     ? `UPDATE tbl_job
-          SET magic_link_send_count   = magic_link_send_count + 1,
-              magic_link_sent_at      = ?,
-              magic_link_last_action  = ?
+          SET magic_link_send_count = magic_link_send_count + 1
         WHERE job_id = ?`
     : `UPDATE tbl_job
-          SET magic_link_send_count   = magic_link_send_count + 1,
-              magic_link_sent_at      = ?,
-              magic_link_last_action  = ?
+          SET magic_link_send_count = magic_link_send_count + 1
         WHERE job_id = ?
           AND magic_link_send_count < ?`;
   const reserveParams = override
-    ? [sentAt, effectiveAction, jobId]
-    : [sentAt, effectiveAction, jobId, maxSendCount];
+    ? [jobId]
+    : [jobId, maxSendCount];
 
   const [reserveResult] = await pool.query(reserveSql, reserveParams);
   if (!reserveResult || reserveResult.affectedRows === 0) {
@@ -893,6 +903,15 @@ async function sendForJob(jobId, { action, override = false } = {}, pool) {
       magic_link_sent_at:  sentAt.toISOString(),
     };
   }
+
+  // Delivery confirmed — stamp the audit columns now. Stamping after
+  // success (rather than in the reservation UPDATE) means a failed send
+  // never leaves sent_at / last_action claiming a dispatch that didn't
+  // happen, and a failed FIRST send can't flip later attempts to 'resend'.
+  await pool.query(
+    `UPDATE tbl_job SET magic_link_sent_at = ?, magic_link_last_action = ? WHERE job_id = ?`,
+    [sentAt, effectiveAction, jobId],
+  );
 
   return {
     delivered:           true,
@@ -1150,36 +1169,56 @@ async function acceptSubmission(jobId, payload, pool) {
       //    service_type_id / service_catg_id. Dedupe by service_type_id
       //    in case the customer's picks collapse onto the same type.
       const resolved = new Map(); // service_type_id -> { service_catg_id, quantity }
-      for (const pick of payload.services) {
-        const csId = pick.client_service_id;
-        if (!csId) continue;
-        // SECURITY (2026-05-28 fix): scope the lookup to THIS job's client.
-        // Without the `AND client_id = ?` filter, a hostile customer holding
-        // a valid magic-link token for job-100 (client A) could POST
-        // client_service_ids belonging to clients B / C / D and have them
-        // resolved + inserted into tbl_job_services — billing data
-        // integrity risk. Mismatched IDs are silently DROPPED (logged at
-        // warn) rather than thrown — a stale or wrong ID submitted by the
-        // customer shouldn't block their entire submission.
-        // Extended projection (2026-06-05) — pull all 7 rate-card columns
-        // so the cascade helper can compute the 5 charge columns at write
-        // time without a second round-trip. Same SELECT, more columns.
+      // SECURITY (2026-05-28 fix): scope the lookup to THIS job's client.
+      // Without the `AND client_id = ?` filter, a hostile customer holding
+      // a valid magic-link token for job-100 (client A) could POST
+      // client_service_ids belonging to clients B / C / D and have them
+      // resolved + inserted into tbl_job_services — billing data
+      // integrity risk. Mismatched IDs are silently DROPPED (logged at
+      // warn) rather than thrown — a stale or wrong ID submitted by the
+      // customer shouldn't block their entire submission.
+      // Extended projection (2026-06-05) — pull all 7 rate-card columns
+      // so the cascade helper can compute the 5 charge columns at write
+      // time without a second round-trip.
+      // PERF (2026-06-12) — batch the resolution into ONE query keyed by
+      // client_service_id IN (?). Previously this ran N sequential SELECTs
+      // (Joi caps services at 50) inside the open transaction, extending
+      // row-lock time on a public endpoint. The `AND client_id = ?` scope
+      // is retained verbatim — it is the cross-client-injection guard and
+      // must not be dropped. (We deliberately do NOT reuse loadRateCardRows
+      // from utils/rate-card-calc.js: it lacks this client scope and the
+      // service_type_id / service_catg_id columns we classify on.)
+      const csIds = [...new Set(
+        payload.services
+          .map((p) => Number(p.client_service_id))
+          .filter((n) => Number.isFinite(n) && n > 0),
+      )];
+      const csById = new Map(); // Number(client_service_id) -> rate-card row
+      if (csIds.length > 0) {
         const [csRows] = await conn.query(
-          `SELECT service_type_id, service_catg_id,
+          `SELECT client_service_id, service_type_id, service_catg_id,
                   total_amount, easyfix_direct_fixed, easyfix_direct_variable,
                   overhead_fixed, overhead_variable, client_fixed, client_variable
              FROM tbl_client_service
-            WHERE client_service_id = ? AND client_id = ? LIMIT 1`,
-          [csId, clientId],
+            WHERE client_service_id IN (?) AND client_id = ?`,
+          [csIds, clientId],
         );
-        if (!csRows || csRows.length === 0) {
+        for (const row of csRows) {
+          csById.set(Number(row.client_service_id), row);
+        }
+      }
+      for (const pick of payload.services) {
+        const csId = pick.client_service_id;
+        if (!csId) continue;
+        const row = csById.get(Number(csId));
+        if (!row) {
           logger.warn(
             { jobId, clientId, client_service_id: csId },
             'magic-link: dropping client_service_id that does not belong to job\'s client (possible cross-client injection or stale picker state)',
           );
           continue;
         }
-        const serviceTypeId = csRows[0].service_type_id;
+        const serviceTypeId = row.service_type_id;
         if (serviceTypeId == null) continue;
         const quantity = pick.quantity || 1;
         // If the same type appears twice in the payload, keep the highest
@@ -1188,9 +1227,9 @@ async function acceptSubmission(jobId, payload, pool) {
         const prev = resolved.get(serviceTypeId);
         if (!prev || (quantity > prev.quantity)) {
           resolved.set(serviceTypeId, {
-            service_catg_id: csRows[0].service_catg_id,
+            service_catg_id: row.service_catg_id,
             quantity,
-            rateCard: csRows[0], // for utils/rate-card-calc.js charges cascade
+            rateCard: row, // for utils/rate-card-calc.js charges cascade
           });
         }
       }
@@ -1214,16 +1253,19 @@ async function acceptSubmission(jobId, payload, pool) {
 
       // c) Soft-delete any ACTIVE row whose service_type_id is NOT in the
       //    customer's submitted set. This is the missing direction that
-      //    caused the billing leak.
-      for (const [serviceTypeId, jobServiceId] of activeByService.entries()) {
-        if (!resolved.has(serviceTypeId)) {
-          await conn.query(
-            `UPDATE tbl_job_services
-                SET job_service_status = 0
-              WHERE job_service_id = ?`,
-            [jobServiceId],
-          );
-        }
+      //    caused the billing leak. PERF (2026-06-12) — batch into ONE
+      //    UPDATE ... WHERE job_service_id IN (?) instead of N per-row
+      //    statements inside the open transaction.
+      const dropIds = [...activeByService.entries()]
+        .filter(([t]) => !resolved.has(t))
+        .map(([, id]) => id);
+      if (dropIds.length > 0) {
+        await conn.query(
+          `UPDATE tbl_job_services
+              SET job_service_status = 0
+            WHERE job_service_id IN (?)`,
+          [dropIds],
+        );
       }
 
       // d) Apply each submitted pick: UPDATE active row, or INSERT fresh

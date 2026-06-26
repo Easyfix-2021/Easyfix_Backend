@@ -6,8 +6,7 @@ const { modernOk, modernError } = require('../../utils/response');
 
 /*
  * Auxiliary admin endpoints — attendance, training videos, materials,
- * Aadhaar uniqueness, geocoding proxy, email-verify callback, bulk
- * job reassignment.
+ * Aadhaar uniqueness, geocoding proxy, bulk job reassignment.
  *
  * VERIFIED 2026-05-12 against legacy entity classes:
  *   tbl_easyfixer_attendance (ACD_APIs/Attendance.java):
@@ -17,10 +16,6 @@ const { modernOk, modernError } = require('../../utils/response');
  *
  *   training_videos (TrainingVideo.java):
  *     id (PK), title, description, sub_title, sub_description
- *
- *   confirmation_token (ConfirmationToken.java):
- *     id (PK), token, login_id, is_verified, client_id, easyfixer_id,
- *     is_token_expired
  *
  *   tbl_easyfixer aadhaar/PAN: adhaar_card_number (NOT `aadhaar` — DB
  *   spelling has "adhaar" — preserve), pan_card_number.
@@ -269,31 +264,6 @@ router.get('/marital-status', async (req, res) => {
     { id: 1, name: 'Single' }, { id: 2, name: 'Married' },
     { id: 3, name: 'Divorced' }, { id: 4, name: 'Widowed' },
   ]);
-});
-
-// ─── Email verification callback ────────────────────────────────────
-// VERIFIED confirmation_token columns: id, token, login_id, is_verified,
-// client_id, easyfixer_id, is_token_expired. Lookup on `token`, then
-// mark is_verified=1 + is_token_expired=1 (single-use semantics).
-router.get('/verify-email', async (req, res, next) => {
-  try {
-    const token = req.query.token;
-    if (!token) return res.status(400).send('<html><body><h2>Missing token</h2></body></html>');
-    const [[row]] = await pool.query(
-      `SELECT id, login_id, client_id, easyfixer_id, is_verified, is_token_expired
-         FROM confirmation_token
-        WHERE token = ? LIMIT 1`,
-      [String(token)]
-    );
-    res.set('Content-Type', 'text/html');
-    if (!row) return res.status(404).send('<html><body><h2>Invalid token</h2></body></html>');
-    if (row.is_token_expired) return res.send('<html><body><h2>Link already used or expired</h2></body></html>');
-    await pool.query(
-      'UPDATE confirmation_token SET is_verified = 1, is_token_expired = 1 WHERE id = ?',
-      [row.id]
-    );
-    res.send('<html><body><h2>Email Verified</h2><p>Thank you. You may close this window.</p></body></html>');
-  } catch (e) { next(e); }
 });
 
 // ─── Bulk job reassign ──────────────────────────────────────────────

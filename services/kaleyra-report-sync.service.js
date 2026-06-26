@@ -33,11 +33,17 @@ const MAX_PER_RUN = 200;   // safety belt — if 200 rows piled up between runs
 async function syncPendingReports() {
   // Fetch the work list. ORDER BY oldest-first so a row that has been
   // pending the longest gets attention first if MAX_PER_RUN clips us.
+  // provider filter (2026-06-17): only reconcile Kaleyra rows here. Plivo rows
+  // carry a Plivo CallUUID in unique_id and are kept current by the Plivo
+  // status webhooks (ring/answer/hangup) — querying Kaleyra's report endpoint
+  // with a Plivo uuid would always miss. `provider IS NULL` covers legacy rows
+  // written before the provider column was populated (all Kaleyra historically).
   const [rows] = await pool.query(
     `SELECT job_caller_info, unique_id, inserted_time
        FROM tbl_job_caller_info
       WHERE is_updated = 0
         AND unique_id IS NOT NULL
+        AND (provider = 'kaleyra' OR provider IS NULL)
         AND inserted_time >= NOW() - INTERVAL ? DAY
       ORDER BY inserted_time ASC
       LIMIT ?`,
@@ -93,7 +99,9 @@ async function applyReportToRow(jobCallerInfoId, report) {
             reciever_status = ?,
             recording       = ?,
             location        = ?,
-            provider        = ?,
+            -- COALESCE so a Kaleyra report (which carries no provider field)
+            -- never NULLs out the 'kaleyra' value the route stamps at insert.
+            provider        = COALESCE(?, provider),
             is_updated      = 1
       WHERE job_caller_info = ?`,
     [startTime, endTime, duration, callerSt, receiverSt, recording, location, provider, jobCallerInfoId]

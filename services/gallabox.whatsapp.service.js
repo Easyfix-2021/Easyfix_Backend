@@ -56,6 +56,7 @@ function normaliseIndianPhone(raw) {
 async function sendTemplate({
   to, recipientName,
   templateName, bodyValues = {}, headerValues, buttonValues,
+  bypassTestRedirect = false,
 }) {
   const originalPhone = normaliseIndianPhone(to);
   if (!originalPhone) return { delivered: false, error: `invalid phone "${to}"` };
@@ -75,9 +76,12 @@ async function sendTemplate({
   }
 
   // ── TEST-MODE INTERCEPTION (last point before Gallabox call) ──
+  // `bypassTestRedirect` is set ONLY by the Scheduled Jobs → Test flow, so an
+  // operator's typed number is honoured on every env. Every other send keeps
+  // the TEST_MOBILE safety redirect (which has no NODE_ENV gate by design).
   let phone = originalPhone;
   let redirected = false;
-  if (process.env.TEST_MOBILE) {
+  if (!bypassTestRedirect && process.env.TEST_MOBILE) {
     const test = normaliseIndianPhone(process.env.TEST_MOBILE);
     if (test) { phone = test; redirected = true; }
   }
@@ -131,7 +135,7 @@ async function sendTemplate({
  * Gallabox interactive/text payload shapes mirror Meta's Cloud API and should
  * be confirmed against the Gallabox API docs / dashboard during rollout.
  */
-async function sendWhatsappMessage({ to, recipientName, whatsapp, label }) {
+async function sendWhatsappMessage({ to, recipientName, whatsapp, label, bypassTestRedirect = false }) {
   const originalPhone = normaliseIndianPhone(to);
   if (!originalPhone) return { delivered: false, error: `invalid phone "${to}"` };
   if (!whatsapp || !whatsapp.type) return { delivered: false, error: 'whatsapp message payload required' };
@@ -151,7 +155,7 @@ async function sendWhatsappMessage({ to, recipientName, whatsapp, label }) {
 
   let phone = originalPhone;
   let redirected = false;
-  if (process.env.TEST_MOBILE) {
+  if (!bypassTestRedirect && process.env.TEST_MOBILE) {
     const test = normaliseIndianPhone(process.env.TEST_MOBILE);
     if (test) { phone = test; redirected = true; }
   }
@@ -185,9 +189,9 @@ async function sendWhatsappMessage({ to, recipientName, whatsapp, label }) {
 }
 
 // Free-form session text (24h window). Used for prompts/confirmations.
-function sendText({ to, recipientName, body }) {
+function sendText({ to, recipientName, body, bypassTestRedirect = false }) {
   return sendWhatsappMessage({
-    to, recipientName, label: 'text',
+    to, recipientName, label: 'text', bypassTestRedirect,
     whatsapp: { type: 'text', text: { body: String(body || '') } },
   });
 }

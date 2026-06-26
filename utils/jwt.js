@@ -196,6 +196,61 @@ function signEstimateToken({ jobId, clientContactId }) {
   );
 }
 
+/**
+ * Sign an easyfixer-facing magic-link JWT for the profile-update self-serve
+ * page.
+ *
+ * Mirrors signJobToken's design notes:
+ *   - Distinct `type: 'easyfixer_profile_update'` claim so a leaked token can
+ *     never replay against authenticated CRM endpoints, against the
+ *     customer job-completion magic-link surface, or vice versa
+ *     (verifyEasyfixerProfileToken below rejects every other `type`).
+ *   - Subject is `String(efrId)` (not the easyfixer's user_id) so middleware
+ *     that naively trusts `sub` won't misclassify a profile-update token as a
+ *     user identity.
+ *   - 30-day TTL — operators may schedule reminders weeks apart, and the
+ *     server-side audit columns (profile_update_send_count / _sent_at) give
+ *     ops a separate handle to coordinate cadence outside the token's life.
+ *
+ * No `requireXxx` live-state companion exists for this flow: unlike a job
+ * that transitions out of status=9, an easyfixer profile is always
+ * editable. The token's time-bound exp is the only expiry layer.
+ */
+function signEasyfixerProfileToken(efrId) {
+  return jwt.sign(
+    { sub: String(efrId), type: 'easyfixer_profile_update' },
+    requireSecret(),
+    { expiresIn: '30d' },
+  );
+}
+
+/**
+ * Verify a profile-update magic-link JWT.
+ *
+ * Returns the numeric efrId on success; throws an Error with a `status`
+ * property (NOT a plain object — the public route's existing
+ * mapKnownError-style handler still picks it up via the status check) on
+ * any failure. The `type` mismatch path is a defence-in-depth guard so
+ * a customer job-completion token or an arbitrary CRM JWT can never
+ * cross-pollinate this surface.
+ */
+function verifyEasyfixerProfileToken(token) {
+  let decoded;
+  try {
+    decoded = jwt.verify(token, requireSecret());
+  } catch (_err) {
+    const e = new Error('invalid or expired link');
+    e.status = 401;
+    throw e;
+  }
+  if (!decoded || decoded.type !== 'easyfixer_profile_update') {
+    const e = new Error('invalid token type');
+    e.status = 401;
+    throw e;
+  }
+  return Number(decoded.sub);
+}
+
 module.exports = {
   signUserToken,
   verifyToken,
@@ -204,4 +259,6 @@ module.exports = {
   requireUnconfirmedJob,
   verifyEstimateToken,
   signEstimateToken,
+  signEasyfixerProfileToken,
+  verifyEasyfixerProfileToken,
 };

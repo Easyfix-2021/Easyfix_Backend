@@ -110,6 +110,35 @@ router.post('/verify-otp', validate(verifyOtpRequest), async (req, res, next) =>
 router.get('/me', requireAuth, async (req, res, next) => {
   try {
     const role = await getRoleById(req.user.user_role);
+
+    // Technician (mobile) principals authenticate against tbl_easyfixer and
+    // carry no tbl_user permission/scope columns. Their `user_id` is the
+    // non-numeric `efr:<id>` form, so the tbl_user permission/scope resolution
+    // below would coerce it to NaN and emit `WHERE user_id = NaN` (a 500). The
+    // CRM RBAC/scope model does not apply to technicians — the mobile app gates
+    // itself via /api/mobile/*. Return a clean, empty-permission identity so a
+    // mobile bearer is a first-class /api/shared principal without the 500.
+    if (req.user.__principal === 'mobile') {
+      return modernOk(res, {
+        user: req.user,
+        role: role && {
+          role_id: role.role_id,
+          role_name: role.role_name,
+          group: role.group,
+          active: role.role_status,
+        },
+        permissions: { menuIds: [], actionPermissions: [] },
+        scope: {
+          clients:   { mode: 'none', ids: [] },
+          cities:    { mode: 'none', ids: [] },
+          states:    { mode: 'none', ids: [] },
+          verticals: { mode: 'none', ids: [] },
+        },
+        hierarchy: { directReportsCount: 0, descendantsCount: 0 },
+        scheduledJobsAccess: false,
+      });
+    }
+
     // Resolve menu_ids + action permissions in the same shape the legacy
     // session map exposed (LoginAction.java lines 92–98). Frontend treats
     // menuIds as the sidebar allowlist and actionPermissions as the
@@ -169,6 +198,15 @@ router.get('/me', requireAuth, async (req, res, next) => {
       }
     }
 
+    // scheduledJobsAccess (2026-06-06): mirrors the same email-allowlist
+    // check used by routes/admin/scheduled-jobs.js. The FE reads this
+    // boolean to decide whether to render the "Scheduled Jobs" entry
+    // at the bottom of the Settings sidebar. Default false — the
+    // BE is the source of truth either way (the route 403s if the
+    // FE ever sneaks in for an off-allowlist user).
+    const sj = require('../services/scheduled-jobs.service');
+    const scheduledJobsAccess = sj.isAllowedUser(req.user);
+
     modernOk(res, {
       user: req.user,
       role: role && {
@@ -183,6 +221,7 @@ router.get('/me', requireAuth, async (req, res, next) => {
         directReportsCount: hierarchy.directReports.length,
         descendantsCount: hierarchy.descendants.length,
       },
+      scheduledJobsAccess,
     });
   } catch (err) {
     next(err);

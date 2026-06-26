@@ -53,14 +53,15 @@ async function verticals() {
   return rows;
 }
 
-// Zones — drives the Manage Jobs "Zonal" filter. tbl_zone_master has
-// no canonical active flag, but legacy convention treats every row as
-// usable. tbl_zone_city_mapping does the actual zone↔city resolution
-// at filter time; this endpoint is purely for the dropdown options.
+// Zones — drives the Manage Jobs "Zonal" filter. Only ACTIVE zones
+// (zone_status = 1) are offered as filter options; inactive zones are hidden
+// from the dropdown. tbl_zone_city_mapping does the actual zone↔city
+// resolution at filter time; this endpoint is purely for the dropdown options.
 async function zones() {
   const [rows] = await pool.query(
     `SELECT zone_id, zone_name
        FROM tbl_zone_master
+      WHERE zone_status = 1
       ORDER BY zone_name ASC`
   );
   return rows;
@@ -68,7 +69,10 @@ async function zones() {
 
 // ─── Services ───────────────────────────────────────────────────────
 async function serviceCategories({ includeInactive = false } = {}) {
-  const where = includeInactive ? '' : 'WHERE service_catg_status = 1';
+  // Default: active only (status 1). includeInactive widens to active+inactive
+  // but ALWAYS excludes soft-deleted (status 3) so deleted categories never
+  // leak into any dropdown/filter that feeds Service Type pickers.
+  const where = includeInactive ? 'WHERE service_catg_status <> 3' : 'WHERE service_catg_status = 1';
   const [rows] = await pool.query(
     `SELECT service_catg_id, service_catg_name, service_catg_desc, service_catg_status
        FROM tbl_service_catg ${where}
@@ -85,7 +89,7 @@ async function serviceTypes({ categoryId, includeInactive = false } = {}) {
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   const [rows] = await pool.query(
     `SELECT service_type_id, service_type_name, service_type_desc,
-            service_type_status, service_catg_id
+            service_type_status, service_catg_id, display
        FROM tbl_service_type ${where}
        ORDER BY service_type_name ASC`,
     params
@@ -166,6 +170,7 @@ async function users({ q, roleGroup, limit = 100, offset = 0, includeInactive = 
   const clauses = [];
   const params = [];
   if (!includeInactive) clauses.push('u.user_status = 1');
+  else clauses.push('NOT (u.user_status <=> 3)'); // never surface tombstoned (deleted) users — NULL-safe
   if (q) {
     clauses.push('(u.user_name LIKE ? OR u.official_email LIKE ? OR u.mobile_no LIKE ?)');
     params.push(`%${q}%`, `%${q}%`, `%${q}%`);
@@ -186,6 +191,56 @@ async function users({ q, roleGroup, limit = 100, offset = 0, includeInactive = 
        LEFT JOIN tbl_role r ON r.role_id = u.user_role
       ${where}
       ORDER BY u.user_name ASC LIMIT ? OFFSET ?`,
+    params
+  );
+  return rows;
+}
+
+// ─── Zonal Managers (admin-scoped) ──────────────────────────────────
+/*
+ * Zonal Managers picker — drives the Manage Easyfixers "User Mapped To City"
+ * filter. A zonal manager is a tbl_user row that's referenced by at least
+ * one tbl_city.state_user (i.e. mapped as the zonal owner of some city).
+ * Active users only.
+ */
+async function zonalManagers() {
+  const [rows] = await pool.query(`
+    SELECT DISTINCT u.user_id, u.user_name
+      FROM tbl_user u
+      JOIN tbl_city c ON c.state_user = u.user_id
+     WHERE u.user_status = 1
+     ORDER BY u.user_name ASC
+  `);
+  return rows;
+}
+
+/*
+ * Project Managers picker — drives the QuickSight report "Project Manager"
+ * filter. A project manager is a tbl_user row referenced by at least one
+ * tbl_vertical_mapping row at the requested user_type (the SPOC role on a
+ * client+vertical):
+ *   user_type = 1 → Primary SPOC   (Client Performance PM filter)
+ *   user_type = 2 → Secondary SPOC (Open Orders pmlist)
+ * DISTINCT internal active users, returned as {user_id, user_name}.
+ *
+ * NOTE: tbl_vertical_mapping.user_type is DISTINCT from tbl_user.user_type_id
+ * — do not conflate. When `userType` is omitted, both 1 and 2 are returned.
+ */
+async function projectManagers({ userType } = {}) {
+  const clauses = ['u.user_status = 1'];
+  const params = [];
+  if (userType != null) {
+    clauses.push('vm.user_type = ?');
+    params.push(userType);
+  } else {
+    clauses.push('vm.user_type IN (1, 2)');
+  }
+  const [rows] = await pool.query(
+    `SELECT DISTINCT u.user_id, u.user_name
+       FROM tbl_vertical_mapping vm
+       JOIN tbl_user u ON u.user_id = vm.user_id
+      WHERE ${clauses.join(' AND ')}
+      ORDER BY u.user_name ASC`,
     params
   );
   return rows;
@@ -284,10 +339,12 @@ async function menuActions() {
  */
 function resolveVisibleMenuIds() {
   const raw = String(
-    // 2026-06-03 per ops: easyfix_properties is now the SOLE source of
-    // truth. Env fallback dropped so a stale env var on a pod can't
-    // override a fresh DB value.
-    getProperty('new.crm.visible.menu.ids') ?? ''
+    // easyfix_properties is the primary source of truth (2026-06-03 per
+    // ops) — a fresh DB value always wins over the env var. The env var
+    // is the FALLBACK when the property is absent (pre-migration deploys,
+    // DB outage, and the hermetic test suite, which runs without MySQL).
+    getProperty('new.crm.visible.menu.ids') ??
+      process.env.NEW_CRM_VISIBLE_MENU_IDS ?? ''
   ).trim();
   if (!raw) return null;                       // null = filter inactive, show all
   const ids = raw.split(',')
@@ -298,8 +355,10 @@ function resolveVisibleMenuIds() {
 
 function resolveMenuOverrideEmails() {
   const raw = String(
-    // easyfix_properties is the SOLE source of truth (2026-06-03).
-    getProperty('new.crm.menu.override.emails') ?? ''
+    // easyfix_properties primary, env fallback (same contract as
+    // resolveVisibleMenuIds above).
+    getProperty('new.crm.menu.override.emails') ??
+      process.env.NEW_CRM_MENU_OVERRIDE_EMAILS ?? ''
   ).trim();
   if (!raw) return new Set();
   return new Set(
@@ -392,6 +451,7 @@ async function easyfixers({ q, limit = 5000, includeInactive = false } = {}) {
   const clauses = [];
   const params = [];
   if (!includeInactive) clauses.push('e.efr_status = 1');
+  else clauses.push('NOT (e.efr_status <=> 3)'); // never surface tombstoned (deleted) easyfixers — NULL-safe (keeps NULL-status leads)
   if (q) {
     clauses.push('(e.efr_name LIKE ? OR e.efr_no LIKE ? OR e.efr_email LIKE ?)');
     const like = `%${q}%`;
@@ -431,6 +491,44 @@ async function rescheduleReasons() {
   return rows;
 }
 
+// Reject reasons live in the unified action_taken_reason table (the legacy CRM
+// EnumReasonDaoImpl source-of-truth), discriminated by action_type + user_type.
+// App reasons are user_type 4; reject = action_type 31 (confirmed against the
+// live table). status=1 + is_new=1 mirror the legacy active filter.
+async function rejectReasons() {
+  const [rows] = await pool.query(
+    `SELECT id, action_desc AS reason
+       FROM action_taken_reason
+      WHERE action_type = 31 AND user_type = 4 AND status = 1 AND is_new = 1
+      ORDER BY action_desc ASC`
+  );
+  return rows;
+}
+
+// Checkout-flow reasons each live in their own thin (id, reason) table — no
+// status column, so every row is active. FK targets: tbl_job.problem_reason_id,
+// .collect_cash_reason_id, .revisit_reason_id respectively.
+async function problemReasons() {
+  const [rows] = await pool.query(
+    `SELECT id, reason FROM problem_with_job_reason ORDER BY id ASC`
+  );
+  return rows;
+}
+
+async function collectCashReasons() {
+  const [rows] = await pool.query(
+    `SELECT id, reason FROM collect_cash_reason_by_app ORDER BY id ASC`
+  );
+  return rows;
+}
+
+async function revisitReasons() {
+  const [rows] = await pool.query(
+    `SELECT id, reason FROM revisit_reason_by_app ORDER BY id ASC`
+  );
+  return rows;
+}
+
 async function banks({ q } = {}) {
   // Actual table is bank_name (blueprint's tbl_bank doesn't exist).
   const clauses = [];
@@ -463,6 +561,8 @@ module.exports = {
   clients,
   clientServices,
   users,
+  zonalManagers,
+  projectManagers,
   roles,
   menuActions,
   easyfixers,
@@ -470,6 +570,10 @@ module.exports = {
   menuVisibility,
   cancelReasons,
   rescheduleReasons,
+  rejectReasons,
+  problemReasons,
+  collectCashReasons,
+  revisitReasons,
   banks,
   documentTypes,
   verticals,

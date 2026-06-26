@@ -1,4 +1,5 @@
 const router = require('express').Router();
+const crypto = require('crypto');
 const logger = require('../../logger');
 const { modernOk, modernError } = require('../../utils/response');
 const { pool } = require('../../db');
@@ -27,7 +28,9 @@ function secretOk(req) {
   const expected = process.env.GALLABOX_WEBHOOK_SECRET;
   if (!expected) return false; // fail closed
   const got = req.get('x-webhook-secret') || req.query.secret || '';
-  return String(got) === String(expected);
+  const a = Buffer.from(String(got));
+  const b = Buffer.from(String(expected));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 // Best-effort normaliser: Gallabox wraps the WhatsApp message in an event

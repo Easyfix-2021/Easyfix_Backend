@@ -1,0 +1,133 @@
+const router = require('express').Router();
+const multer = require('multer');
+const crypto = require('crypto');
+
+const { modernOk, modernError } = require('../../utils/response');
+const s3Storage = require('../../utils/s3-storage');
+const { writeBuffer } = require('../../utils/file-storage');
+const uploadLogger = require('../../logger');
+
+/*
+ * /api/mobile/uploads — generic Technician-app image-upload primitive.
+ *
+ * Mounted UNDER /uploads in routes/mobile/index.js, AFTER
+ * `router.use(requireTechAuth)`, so `req.tech.efr_id` is always populated.
+ *
+ * REQUIRED MOUNT (add to routes/mobile/index.js, alongside the other
+ *   sub-router mounts, e.g. after `router.use('/notices', …)`):
+ *
+ *     router.use('/uploads', require('./uploads'));
+ *
+ * Mounting under /uploads means the path below resolves to:
+ *   POST /api/mobile/uploads
+ *
+ * CONTRACT
+ *   multipart/form-data:
+ *     file   (required) — the image bytes (png/jpg/jpeg/webp)
+ *     kind   (optional) — 'kyc' | 'job' | 'profile' | 'general'
+ *                         (cosmetic key prefix hint; defaults to 'general')
+ *   →  modernOk { key, url, imageId }
+ *
+ * `imageId` is ALIASED to `key` so the RN's loose `{ url, imageId }` mapper
+ * is satisfied. The RN flow is: call THIS endpoint first to upload the
+ * bytes, then pass the returned `key` (== imageId) as the ref/id to the
+ * downstream endpoints — job-images (`refs[]`), selfie, saveIdentity (KYC).
+ *
+ * Storage: S3 when configured (key `MobileUploads/<efrId>_<ts>_<rand8>`,
+ * no extension on the key — Content-Type + original-filename carry the
+ * real type, mirroring the JobSupportings/Notices conventions). When S3 is
+ * disabled (local dev, no S3_BUCKET_NAME) it falls back to the local disk
+ * via file-storage.writeBuffer('general', …) and returns that filename as
+ * the key + its public URL.
+ */
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024, files: 1 },
+  // Images only — same allowlist the admin job-image upload enforces.
+  fileFilter: (_req, file, cb) => {
+    const ok = ['image/png', 'image/jpeg', 'image/jpg', 'image/webp'].includes(
+      String(file.mimetype || '').toLowerCase(),
+    );
+    if (!ok) {
+      const e = new Error('only png/jpg/jpeg/webp images are allowed');
+      e.code = 'LIMIT_UNEXPECTED_FILE';
+      return cb(e);
+    }
+    return cb(null, true);
+  },
+});
+
+// Build a collision-resistant S3 key. Mirrors buildNoticeKey's id style
+// (<ts>_<rand8>) but namespaced under MobileUploads/ and prefixed with the
+// technician's efr_id for at-a-glance ownership in the bucket. crypto
+// randomness (NOT Math.random) keeps the suffix unguessable.
+function buildKey(efrId) {
+  const ts = Date.now();
+  const rand = crypto.randomBytes(4).toString('hex');
+  return `MobileUploads/${Number(efrId)}_${ts}_${rand}`;
+}
+
+router.post('/', upload.single('file'), async (req, res, next) => {
+  const efrId = req.tech.efr_id;
+  try {
+    if (!req.file) {
+      return modernError(res, 400, 'missing "file" upload');
+    }
+    const kind = String(req.body?.kind || 'general').trim() || 'general';
+
+    let key;
+    let url;
+    let storage;
+
+    if (s3Storage.isEnabled()) {
+      key = await s3Storage.putAtKey({
+        key: buildKey(efrId),
+        buffer: req.file.buffer,
+        contentType: req.file.mimetype,
+        originalName: req.file.originalname,
+      });
+      url = await s3Storage.resolveImageUrl(key);
+      storage = 's3';
+    } else {
+      // Local fallback — return the bare filename as the key so the
+      // downstream consumers persist a value resolveImageUrl can read back.
+      const saved = writeBuffer(
+        'general',
+        req.file.buffer,
+        req.file.originalname,
+        req.file.mimetype,
+      );
+      key = saved.filename;
+      url = saved.url;
+      storage = 'local';
+    }
+
+    uploadLogger.upload(
+      {
+        efrId,
+        kind,
+        key,
+        storage,
+        originalName: req.file.originalname,
+        mimeType: req.file.mimetype,
+        bytes: req.file.size,
+      },
+      'mobile upload stored',
+    );
+
+    // `imageId` aliases `key` for the RN's loose { url, imageId } mapper.
+    return modernOk(res, { key, url, imageId: key });
+  } catch (e) {
+    if (e?.code === 'LIMIT_FILE_SIZE') {
+      return modernError(res, 400, 'file exceeds 10MB');
+    }
+    if (e?.code === 'LIMIT_UNEXPECTED_FILE') {
+      return modernError(res, 400, e.message || 'unsupported file');
+    }
+    uploadLogger.error({ efrId, err: e }, 'mobile upload failed');
+    return next(e);
+  }
+});
+
+module.exports = router;

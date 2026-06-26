@@ -149,6 +149,83 @@ async function putJobImage({ jobId, seq, buffer, contentType, originalName, cate
 }
 
 /*
+ * Build the canonical S3 key for a Manage Deep Skills image.
+ *   keyForSkill(42, 1)
+ *     →  "Skills/Skill_42_1"
+ *
+ * Mirrors `keyFor()` (jobs) — same shape constraints, separate prefix.
+ * The legacy convention requested by ops 2026-06-05: every deep-skill
+ * picture lands under the `Skills/` prefix so audit + lifecycle policies
+ * can target the directory without touching JobSupportings.
+ *
+ * NB: no file extension on the key. Real extension/MIME is carried via
+ * the object's Content-Type and the `original-filename` Metadata field.
+ */
+function keyForSkill(skillId, seq) {
+  if (!Number.isInteger(Number(skillId)) || Number(skillId) <= 0) {
+    throw new Error('keyForSkill: invalid skillId');
+  }
+  if (!Number.isInteger(Number(seq)) || Number(seq) <= 0) {
+    throw new Error('keyForSkill: invalid seq');
+  }
+  return `Skills/Skill_${Number(skillId)}_${Number(seq)}`;
+}
+
+/*
+ * Upload a Deep Skill image buffer to S3. Returns the stored key
+ * (caller persists on `tbl_deepskill.deepskill_image`). Same
+ * upload-then-record-key pattern as `putJobImage`.
+ */
+async function putSkillImage({ skillId, seq, buffer, contentType, originalName }) {
+  if (!isEnabled()) throw new Error('S3 is not configured (S3_BUCKET_NAME unset)');
+  const { PutObjectCommand } = require('@aws-sdk/client-s3');
+  const Key = keyForSkill(skillId, seq);
+  const Metadata = {};
+  if (originalName) {
+    const safe = String(originalName).replace(/[^\x20-\x7E]/g, '_').slice(0, 200);
+    Metadata['original-filename'] = safe;
+  }
+  await client().send(new PutObjectCommand({
+    Bucket: BUCKET,
+    Key,
+    Body: buffer,
+    ContentType: contentType || 'application/octet-stream',
+    Metadata,
+  }));
+  return Key;
+}
+
+/*
+ * Generic put-at-arbitrary-key helper (2026-06-12). Mirrors
+ * putSkillImage's internal PutObjectCommand (same Content-Type +
+ * original-filename metadata handling) but takes a caller-supplied
+ * Key instead of deriving one from an id/seq. Used by the Deep Skill
+ * preview generator, which stages an image under `Skills/staging/<uuid>`
+ * before any skill row exists. Returns the stored key.
+ *
+ * Strict guard: throws if S3 isn't configured. Use isEnabled() first.
+ */
+async function putAtKey({ key, buffer, contentType, originalName }) {
+  if (!isEnabled()) throw new Error('S3 is not configured (S3_BUCKET_NAME unset)');
+  const k = String(key || '').trim();
+  if (!k) throw new Error('putAtKey: missing key');
+  const { PutObjectCommand } = require('@aws-sdk/client-s3');
+  const Metadata = {};
+  if (originalName) {
+    const safe = String(originalName).replace(/[^\x20-\x7E]/g, '_').slice(0, 200);
+    Metadata['original-filename'] = safe;
+  }
+  await client().send(new PutObjectCommand({
+    Bucket: BUCKET,
+    Key: k,
+    Body: buffer,
+    ContentType: contentType || 'application/octet-stream',
+    Metadata,
+  }));
+  return k;
+}
+
+/*
  * Check whether an object exists at `key`. Returns true/false; any
  * error other than NotFound bubbles so the caller can log it (S3
  * outages shouldn't be silently treated as "file missing").
@@ -616,4 +693,9 @@ module.exports = {
   resolveClientDocumentUrl,
   // Deep-skill images (2026-06-25):
   resolveDeepSkillImageUrl,
+  // Deep Skill images (2026-06-05) — `Skills/Skill_<id>_<seq>`:
+  keyForSkill,
+  putSkillImage,
+  // Generic arbitrary-key put (2026-06-12) — used by Deep Skill preview staging:
+  putAtKey,
 };

@@ -29,9 +29,9 @@
 const router = require('express').Router();
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
-const { modernOk, modernError } = require('../../utils/response');
-const { getEffectivePermissions } = require('../../services/role.service');
-const logger = require('../../logger');
+const { modernOk, modernError } = require('../../../utils/response');
+const { getEffectivePermissions } = require('../../../services/role.service');
+const logger = require('../../../logger');
 
 /*
  * Build the QuickSight session-bridge JWT for the current user.
