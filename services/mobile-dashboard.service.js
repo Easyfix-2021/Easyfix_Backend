@@ -452,7 +452,7 @@ async function fetchDateCounts(efrId) {
                      AND DATE(requested_date_time) = CURDATE() THEN 1 END) AS activeToday,
          COUNT(CASE WHEN job_status IN (1,2,20)
                      AND (send_back_to_tx = 0 OR send_back_to_tx IS NULL)
-                     AND DATE(requested_date_time) < CURDATE() THEN 1 END) AS delayed,
+                     AND DATE(requested_date_time) < CURDATE() THEN 1 END) AS \`delayed\`,
          COUNT(CASE WHEN job_status IN (1,2,20)
                      AND requested_date_time < NOW() THEN 1 END)           AS overdue,
          COUNT(CASE WHEN job_status IN (1,2,20)
