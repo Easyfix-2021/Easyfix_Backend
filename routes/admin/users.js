@@ -5,6 +5,7 @@ const validate = require('../../middleware/validate');
 const { roleByName } = require('../../middleware/role');
 const userService = require('../../services/user.service');
 const { modernOk, modernError } = require('../../utils/response');
+const logger = require('../../logger');
 
 /*
  * /api/admin/users — Manage Users settings surface.
@@ -81,6 +82,7 @@ const checkMobileQuery = Joi.object({
   excludeUserId: Joi.number().integer().positive().optional(),
 });
 router.get('/check-mobile', validate(checkMobileQuery, 'query'), async (req, res, next) => {
+  logger.info('Check mobile uniqueness · excludeUserId=' + (req.query.excludeUserId || ''));
   try {
     const result = await userService.isMobileTakenByAnother(
       req.query.mobile, req.query.excludeUserId
@@ -100,6 +102,7 @@ const checkEmailQuery = Joi.object({
   name:          Joi.string().trim().max(200).allow('', null).optional(),
 });
 router.get('/check-email', validate(checkEmailQuery, 'query'), async (req, res, next) => {
+  logger.info('Check email uniqueness · excludeUserId=' + (req.query.excludeUserId || '') + ' withSuggestion=' + Boolean(req.query.name));
   try {
     const result = await userService.isEmailTakenByAnother(
       req.query.email, req.query.excludeUserId, req.query.name
@@ -110,6 +113,7 @@ router.get('/check-email', validate(checkEmailQuery, 'query'), async (req, res, 
 
 // ─── READ ────────────────────────────────────────────────────────────
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
+  logger.info('List users · q=' + (req.query.q || '') + ' roleId=' + (req.query.roleId || '') + ' cityId=' + (req.query.cityId || '') + ' includeInactive=' + req.query.includeInactive + ' limit=' + req.query.limit + ' offset=' + req.query.offset);
   try {
     const data = await userService.listUsers(req.query);
     modernOk(res, data);
@@ -117,6 +121,7 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
 });
 
 router.get('/:userId', validate(idParam, 'params'), async (req, res, next) => {
+  logger.info('Get user · userId=' + req.params.userId);
   try {
     const row = await userService.getUserById(Number(req.params.userId));
     if (!row) return modernError(res, 404, 'User not found');
@@ -131,6 +136,7 @@ router.get('/:userId', validate(idParam, 'params'), async (req, res, next) => {
 // graph view. The user can be looked up by id or by official_email
 // before hitting this endpoint via the standard list filter.
 router.get('/:userId/hierarchy', validate(idParam, 'params'), async (req, res, next) => {
+  logger.info('Build user hierarchy tree · userId=' + req.params.userId);
   try {
     const tree = await userService.buildHierarchyTree(Number(req.params.userId));
     if (!tree) return modernError(res, 404, 'User not found');
@@ -140,12 +146,14 @@ router.get('/:userId/hierarchy', validate(idParam, 'params'), async (req, res, n
 
 // ─── WRITE ───────────────────────────────────────────────────────────
 router.post('/', roleByName(['Admin']), validate(createBody), async (req, res, next) => {
+  logger.info('Create user · role=' + req.body.user_role + ' cityId=' + (req.body.city_id || ''));
   try {
     const created = await userService.createUser({
       ...req.body,
       createdBy: req.user?.user_id,
     });
     res.status(201);
+    logger.info('User created · userId=' + (created && (created.user_id || created.id)));
     modernOk(res, created, 'User added');
   } catch (e) {
     if (e.status) return modernError(res, e.status, e.message);
@@ -158,11 +166,13 @@ router.patch('/:userId',
   validate(idParam, 'params'),
   validate(updateBody),
   async (req, res, next) => {
+    logger.info('Update user · userId=' + req.params.userId + ' fields=' + Object.keys(req.body).join(','));
     try {
       const updated = await userService.updateUser(
         Number(req.params.userId), req.body, req.user?.user_id
       );
       if (!updated) return modernError(res, 404, 'User not found');
+      logger.info('User updated · userId=' + req.params.userId);
       modernOk(res, updated, 'User updated');
     } catch (e) {
       if (e.status) return modernError(res, e.status, e.message);
@@ -216,6 +226,7 @@ const bulkUpdateBody = Joi.object({
 router.post('/bulk-update', roleByName(['Admin']), validate(bulkUpdateBody), async (req, res, next) => {
   try {
     const { userIds, fields } = req.body;
+    logger.info('Bulk-update users · userIds=' + userIds.length + ' fields=' + Object.keys(fields).join(','));
 
     // Vertical-without-client guard. `manage_verticals` being touched
     // requires `manage_clients` to be co-supplied (any value, including
@@ -250,6 +261,7 @@ router.post('/bulk-update', roleByName(['Admin']), validate(bulkUpdateBody), asy
         });
       }
     }
+    logger.info('Bulk-update complete · updated=' + updated + ' unchanged=' + unchanged + ' failed=' + failed + ' total=' + userIds.length);
     modernOk(res, {
       summary: { total: userIds.length, updated, unchanged, failed },
       results,
@@ -261,9 +273,11 @@ router.post('/bulk-update', roleByName(['Admin']), validate(bulkUpdateBody), asy
 });
 
 router.delete('/:userId', roleByName(['Admin']), validate(idParam, 'params'), async (req, res, next) => {
+  logger.info('Deactivate user · userId=' + req.params.userId);
   try {
     const ok = await userService.deactivateUser(Number(req.params.userId), req.user?.user_id);
     if (!ok) return modernError(res, 404, 'User not found');
+    logger.info('User deactivated · userId=' + req.params.userId);
     modernOk(res, { deactivated: true });
   } catch (e) { next(e); }
 });

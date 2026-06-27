@@ -86,6 +86,7 @@ async function resolveRecipientTokens() {
       const t = r.token ? String(r.token).trim() : '';
       if (t) tokens.add(t);
     }
+    logger.info('Resolved ' + tokens.size + ' device tokens for notice push');
     return Array.from(tokens);
   } catch (e) {
     logger.warn({ err: e.message }, 'notice-push: recipient token resolution failed');
@@ -105,6 +106,7 @@ async function pushNoticeToTechnicians(notice) {
       return { delivered: false, reason: 'no notice' };
     }
 
+    logger.info('Push notice to technicians · noticeId=' + notice.notice_id);
     const tokens = await resolveRecipientTokens();
     if (!tokens.length) {
       logger.info({ noticeId: notice.notice_id }, 'notice-push: no device tokens — skipping');

@@ -19,6 +19,7 @@
 const router = require('express').Router();
 const Joi = require('joi');
 
+const logger = require('../../../logger');
 const requireQuickSight = require('../../../middleware/require-quicksight');
 const validate = require('../../../middleware/validate');
 const { modernOk, modernError } = require('../../../utils/response');
@@ -75,7 +76,9 @@ const BY_OWNER_XLSX_COLUMNS = [
 // ── POST /summary — main Open Orders summary table ───────────────────
 router.post('/summary', validate(summarySchema), async (req, res, next) => {
   try {
+    logger.info('Open Orders summary · format=' + (req.body.format || 'json'));
     const rows = await service.summary(req.body);
+    logger.info('Found ' + rows.length + ' job owners');
 
     if (req.body.format === 'xlsx') {
       // Per-column SUM footer + headline KPI totals across all Job Owners.
@@ -113,11 +116,17 @@ router.post('/summary', validate(summarySchema), async (req, res, next) => {
         totalRow,
         emptyMessage: 'No Open Orders Found.',
       });
+      logger.info('Streamed Open Orders summary xlsx · ' + rows.length + ' job owners');
       return;
     }
+    logger.info('Returning ' + rows.length + ' job owners');
     return modernOk(res, rows);
   } catch (err) {
-    if (err && err.status) return modernError(res, err.status, err.message);
+    if (err && err.status) {
+      logger.warn('Open Orders summary failed · ' + err.message);
+      return modernError(res, err.status, err.message);
+    }
+    logger.error('Open Orders summary error · ' + err.message);
     return next(err);
   }
 });
@@ -126,7 +135,9 @@ router.post('/summary', validate(summarySchema), async (req, res, next) => {
 router.post('/by-owner', validate(byOwnerSchema), async (req, res, next) => {
   try {
     const { pmUserId, ...filters } = req.body;
+    logger.info('Open Orders by owner · pmUserId=' + pmUserId + ' format=' + (req.body.format || 'json'));
     const rows = await service.byOwner(pmUserId, filters);
+    logger.info('Found ' + rows.length + ' open jobs for owner #' + pmUserId);
 
     if (req.body.format === 'xlsx') {
       // Job-level drill-down — KPIs summarise this owner's open jobs. (The
@@ -154,11 +165,17 @@ router.post('/by-owner', validate(byOwnerSchema), async (req, res, next) => {
         kpis,
         emptyMessage: 'No Open Orders Found.',
       });
+      logger.info('Streamed Open Orders by-owner xlsx · ' + rows.length + ' jobs · owner #' + pmUserId);
       return;
     }
+    logger.info('Returning ' + rows.length + ' open jobs for owner #' + pmUserId);
     return modernOk(res, rows);
   } catch (err) {
-    if (err && err.status) return modernError(res, err.status, err.message);
+    if (err && err.status) {
+      logger.warn('Open Orders by-owner failed · ' + err.message);
+      return modernError(res, err.status, err.message);
+    }
+    logger.error('Open Orders by-owner error · ' + err.message);
     return next(err);
   }
 });

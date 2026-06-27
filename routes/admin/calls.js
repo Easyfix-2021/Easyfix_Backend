@@ -65,6 +65,7 @@ async function requireClickToCallAction(req, res, next) {
 // operator-managed config, not user PII) so the dialog can pre-fill.
 // Permission-gated on isClickToCall so unauthorised operators can't probe.
 router.get('/config', requireClickToCallAction, (req, res) => {
+  logger.info('Get calling config');
   const enabled = voice.enabledProviders();
   const def = voice.defaultProvider();
 
@@ -116,11 +117,13 @@ router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'
     // silently strips unknowns. /preview consumes whichever of the four
     // identifiers the FE supplied — matching the click-to-call branches.
     const { jobId, customerId, efrId, reportingContactId, useAlt, provider } = req.query;
+    logger.info('Preview call legs · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · efrId=' + (efrId ?? '—') + ' · contactId=' + (reportingContactId ?? '—') + ' · provider=' + (provider || 'default'));
     // Boolean coercion — query strings carry primitives as strings.
     // Accept '1' or 'true' (case-insensitive) so callers don't have to
     // remember which truthy shape we expect.
     const useAltFlag = String(useAlt || '').toLowerCase() === 'true' || String(useAlt) === '1';
     if (!jobId && !customerId && !efrId && !reportingContactId) {
+      logger.warn('Preview rejected · no receiver identifier supplied');
       return modernError(res, 400, 'one of jobId/customerId/efrId/reportingContactId is required');
     }
 
@@ -187,6 +190,7 @@ router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'
       alwaysApplyEnvOverride: mode === 'qa',
     });
 
+    logger.info('Preview resolved · mode=' + mode + ' · provider=' + preview.provider);
     modernOk(res, { mode, dialFrom: preview.from, dialTo: preview.to, provider: preview.provider });
   } catch (e) { next(e); }
 });
@@ -198,6 +202,7 @@ router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'
 // receiverCustomerId, jobIdToStore, jobStatusSnapshot, jobEfrId } on success,
 // or { ok:false, status, message } the caller turns into a modernError.
 async function resolveReceiver({ jobId, customerId, efrId, reportingContactId, useAlt }) {
+  logger.info('Resolve call receiver · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · efrId=' + (efrId ?? '—') + ' · contactId=' + (reportingContactId ?? '—') + ' · useAlt=' + !!useAlt);
   if (jobId) {
     const [[job]] = await pool.query(
       `SELECT j.job_id, j.fk_customer_id, j.fk_easyfixter_id, j.job_status,
@@ -208,13 +213,16 @@ async function resolveReceiver({ jobId, customerId, efrId, reportingContactId, u
         WHERE j.job_id = ? LIMIT 1`,
       [jobId]
     );
+    if (!job) logger.warn('Resolve receiver · job not found · jobId=' + jobId);
     if (!job) return { ok: false, status: 404, message: `Job ${jobId} not found` };
     let receiverMobile; let receiverName;
     if (useAlt) {
+      if (!job.additional_number) logger.warn('Resolve receiver · no alternate number · jobId=' + jobId);
       if (!job.additional_number) return { ok: false, status: 400, message: `Job ${jobId} has no alternate number on file` };
       receiverMobile = job.additional_number;
       receiverName   = job.additional_name || job.customer_name || null;
     } else {
+      if (!job.customer_mob_no) logger.warn('Resolve receiver · no customer mobile · jobId=' + jobId);
       if (!job.customer_mob_no) return { ok: false, status: 400, message: `Job ${jobId} has no customer mobile on file` };
       receiverMobile = job.customer_mob_no;
       receiverName   = job.customer_name || null;
@@ -231,7 +239,9 @@ async function resolveReceiver({ jobId, customerId, efrId, reportingContactId, u
       `SELECT customer_id, customer_name, customer_mob_no FROM tbl_customer WHERE customer_id = ? LIMIT 1`,
       [customerId]
     );
+    if (!cust) logger.warn('Resolve receiver · customer not found · customerId=' + customerId);
     if (!cust) return { ok: false, status: 404, message: `Customer ${customerId} not found` };
+    if (!cust.customer_mob_no) logger.warn('Resolve receiver · no customer mobile · customerId=' + customerId);
     if (!cust.customer_mob_no) return { ok: false, status: 400, message: `Customer ${customerId} has no mobile on file` };
     return { ok: true, receiverMobile: cust.customer_mob_no, receiverName: cust.customer_name || null, receiverCustomerId: cust.customer_id, jobIdToStore: null, jobStatusSnapshot: null, jobEfrId: null };
   }
@@ -240,7 +250,9 @@ async function resolveReceiver({ jobId, customerId, efrId, reportingContactId, u
       `SELECT efr_id, efr_first_name, efr_last_name, efr_no FROM tbl_easyfixer WHERE efr_id = ? AND NOT (tbl_easyfixer.efr_status <=> 3) LIMIT 1`,
       [efrId]
     );
+    if (!efr) logger.warn('Resolve receiver · easyfixer not found · efrId=' + efrId);
     if (!efr) return { ok: false, status: 404, message: `Easyfixer ${efrId} not found` };
+    if (!efr.efr_no) logger.warn('Resolve receiver · no easyfixer mobile · efrId=' + efrId);
     if (!efr.efr_no) return { ok: false, status: 400, message: `Easyfixer ${efrId} has no mobile on file` };
     return { ok: true, receiverMobile: efr.efr_no, receiverName: [efr.efr_first_name, efr.efr_last_name].filter(Boolean).join(' ').trim() || null, receiverCustomerId: null, jobIdToStore: null, jobStatusSnapshot: null, jobEfrId: null };
   }
@@ -248,7 +260,9 @@ async function resolveReceiver({ jobId, customerId, efrId, reportingContactId, u
     `SELECT id, contact_name, contact_no FROM tbl_client_contacts WHERE id = ? LIMIT 1`,
     [reportingContactId]
   );
+  if (!ct) logger.warn('Resolve receiver · contact not found · contactId=' + reportingContactId);
   if (!ct) return { ok: false, status: 404, message: `Contact ${reportingContactId} not found` };
+  if (!ct.contact_no) logger.warn('Resolve receiver · no contact mobile · contactId=' + reportingContactId);
   if (!ct.contact_no) return { ok: false, status: 400, message: `Contact ${reportingContactId} has no mobile on file` };
   return { ok: true, receiverMobile: ct.contact_no, receiverName: ct.contact_name || null, receiverCustomerId: null, jobIdToStore: null, jobStatusSnapshot: null, jobEfrId: null };
 }
@@ -258,6 +272,7 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
   try {
     const { jobId, customerId, efrId, reportingContactId, callFrom, callTo, useAlt, provider } = req.body;
     const agent = req.user;
+    logger.info('Click-to-call request · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · efrId=' + (efrId ?? '—') + ' · contactId=' + (reportingContactId ?? '—') + ' · provider=' + (provider || 'default') + ' · useAlt=' + !!useAlt);
 
     // Three-tier number-resolution waterfall:
     //   1. QA prompt mode → FE MUST supply both callFrom + callTo, BE uses them.
@@ -275,9 +290,11 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
       // flag is off (it queries /config first), any user crafting their own
       // POST could try. Reject explicitly so privilege escalation isn't
       // silently accepted via stripUnknown.
+      logger.warn('Click-to-call rejected · custom numbers not allowed in this environment');
       return modernError(res, 400, 'Custom caller/receiver numbers are not allowed in this environment.');
     }
     if (isCustomNumberMode && (!callFrom || !callTo)) {
+      logger.warn('Click-to-call rejected · QA mode requires both Call From and Call To');
       return modernError(res, 400, 'Both Call From and Call To are required in QA mode.');
     }
 
@@ -287,6 +304,7 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
     // in QA. Production / dev-env-override modes still require it.
     if (!isCustomNumberMode &&
         (!agent.mobile_no || String(agent.mobile_no).replace(/\D/g, '').length < 10)) {
+      logger.warn('Click-to-call rejected · agent has no valid profile mobile');
       return modernError(res, 400, 'Your profile does not have a valid mobile number. Update your profile before placing calls.');
     }
 
@@ -341,6 +359,7 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
       ]
     );
     const jci = insertResult.insertId;
+    logger.info('Call audit row inserted · row=' + jci + ' · provider=' + resolvedProvider);
 
     // ── Place the call via the provider factory ──
     // voice.clickToCall resolves the provider, stamps it on the result, and
@@ -359,6 +378,7 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
       // which bubble as 4xx/5xx below. We mark the row 'suppressed' so the
       // history reflects it was never actually dispatched.
       if (callResult.suppressed || callResult.disabled) {
+        logger.warn('Click-to-call suppressed · row=' + jci + ' · provider=' + (callResult.provider || resolvedProvider));
         await pool.query(
           `UPDATE tbl_job_caller_info SET caller_status = 'suppressed' WHERE job_caller_info = ?`,
           [jci]
@@ -390,6 +410,7 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
       const baseMsg = callResult.error
         || callResult.providerError
         || `Provider rejected the call${callResult.providerStatus ? ` (status=${callResult.providerStatus})` : ''}`;
+      logger.warn('Click-to-call failed · row=' + jci + ' · diagnostic=' + (callResult.diagnostic || '—') + ' · providerStatus=' + (callResult.providerStatus ?? '—'));
       return modernError(res, status, baseMsg, {
         diagnostic: callResult.diagnostic,
         providerStatus: callResult.providerStatus,
@@ -450,9 +471,13 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
 // via client.loginWithAccessToken(). Gated by the click-to-call permission;
 // served ONLY when Web mode is on, Plivo is enabled, and the endpoint is set.
 router.get('/web-credentials', requireClickToCallAction, (req, res) => {
+  logger.info('Get Plivo web credentials');
+  if (voice.callMode() !== 'web') logger.warn('Web credentials denied · web calling not enabled');
   if (voice.callMode() !== 'web') return modernError(res, 409, 'Web calling is not enabled (voice.call.mode != web).');
+  if (!plivo.callingEnabled()) logger.warn('Web credentials denied · Plivo not enabled');
   if (!plivo.callingEnabled()) return modernError(res, 409, 'Plivo is not enabled.');
   const token = plivo.webAccessToken({ operatorId: req.user.user_id });
+  if (!token) logger.error('Web credentials failed · Plivo web calling not configured');
   if (!token) return modernError(res, 500, 'Plivo web calling is not configured (PLIVO_AUTH_ID/AUTH_TOKEN/ENDPOINT_USERNAME).');
   // callerId is the company DID the browser dials INTO (a valid phone number —
   // the SDK requires a real number as the destination); the answer URL ignores
@@ -468,7 +493,10 @@ router.get('/web-credentials', requireClickToCallAction, (req, res) => {
 // number and bridges. Reuses resolveReceiver() so it can't drift from /click-to-call.
 router.post('/web-start', requireClickToCallAction, validate(clickToCallBody), async (req, res, next) => {
   try {
+    logger.info('Web call start request · jobId=' + (req.body.jobId ?? '—') + ' · customerId=' + (req.body.customerId ?? '—') + ' · efrId=' + (req.body.efrId ?? '—') + ' · contactId=' + (req.body.reportingContactId ?? '—'));
+    if (voice.callMode() !== 'web') logger.warn('Web call rejected · web calling not enabled');
     if (voice.callMode() !== 'web') return modernError(res, 409, 'Web calling is not enabled.');
+    if (!plivo.callingEnabled()) logger.warn('Web call rejected · Plivo not enabled');
     if (!plivo.callingEnabled()) return modernError(res, 409, 'Plivo is not enabled.');
 
     const { jobId, customerId, efrId, reportingContactId, useAlt } = req.body;
@@ -478,6 +506,7 @@ router.post('/web-start', requireClickToCallAction, validate(clickToCallBody), a
     if (!rr.ok) return modernError(res, rr.status, rr.message);
 
     const receiver = plivo.normaliseIndianPhone(rr.receiverMobile);
+    if (!receiver) logger.warn('Web call rejected · receiver is not a valid Indian mobile');
     if (!receiver) return modernError(res, 400, 'Receiver number is not a valid Indian mobile.');
 
     // QA SAFETY: in custom-number/QA mode the operator is PROMPTED for the number
@@ -488,6 +517,7 @@ router.post('/web-start', requireClickToCallAction, validate(clickToCallBody), a
     let dialNumber = receiver;
     if (voice.customNumberMode('plivo')) {
       const supplied = plivo.normaliseIndianPhone(req.body.callTo);
+      if (!supplied) logger.warn('Web call rejected · QA mode requires Call To');
       if (!supplied) return modernError(res, 400, 'QA mode: "Call To" (the number to dial) is required.');
       dialNumber = supplied;
       logger.test(`Web call QA · real=${plivo.maskForDisplay(receiver)} → operator-supplied ${plivo.maskForDisplay(dialNumber)}`);
@@ -515,6 +545,7 @@ router.post('/web-start', requireClickToCallAction, validate(clickToCallBody), a
       ]
     );
     const jci = ins.insertId;
+    logger.info('Web call audit row inserted · row=' + jci);
 
     // Opaque, one-time id the browser dials; the answer route maps it → number.
     // In QA this is the TEST number; the audit row above kept the real customer.
@@ -545,10 +576,13 @@ router.post('/web-start', requireClickToCallAction, validate(clickToCallBody), a
 router.post('/mode', requirePropertyAllowlist(FEATURES.canSwitchCallMode, { label: 'Switch Call Mode' }), async (req, res, next) => {
   try {
     const mode = String(req.body.mode || '').toLowerCase();
+    logger.info('Set calling mode · mode=' + (mode || '—'));
     if (mode !== 'web' && mode !== 'mobile') {
+      logger.warn('Set calling mode rejected · invalid mode');
       return modernError(res, 400, "mode must be 'web' or 'mobile'.");
     }
     if (mode === 'web' && !plivo.callingEnabled()) {
+      logger.warn('Set calling mode rejected · Plivo not enabled for web');
       return modernError(res, 409, 'Enable Plivo (plivo.calling.enabled=true) before switching to Web calling.');
     }
     await propertiesSvc.setProperty('voice.call.mode', mode);
@@ -566,7 +600,9 @@ router.post('/mode', requirePropertyAllowlist(FEATURES.canSwitchCallMode, { labe
 router.post('/default-provider', requirePropertyAllowlist(FEATURES.canSwitchCallMode, { label: 'Switch Call Mode' }), async (req, res, next) => {
   try {
     const provider = String(req.body.provider ?? '').toLowerCase().trim();
+    logger.info('Set default provider · provider=' + (provider || '(none)'));
     if (provider !== '' && provider !== 'plivo' && provider !== 'kaleyra') {
+      logger.warn('Set default provider rejected · invalid provider');
       return modernError(res, 400, "provider must be 'plivo', 'kaleyra', or '' (No Default).");
     }
     await propertiesSvc.setProperty('voice.default.provider', provider);
@@ -597,7 +633,9 @@ function parseRowId(raw) {
 router.get('/:id/status', requireClickToCallAction, async (req, res, next) => {
   try {
     const id = parseRowId(req.params.id);
+    if (!id) logger.warn('Call status rejected · invalid call id');
     if (!id) return modernError(res, 400, 'invalid call id');
+    logger.info('Get call status · row=' + id);
 
     const [[row]] = await pool.query(
       `SELECT job_caller_info AS id, caller_id, caller_status,
@@ -607,6 +645,7 @@ router.get('/:id/status', requireClickToCallAction, async (req, res, next) => {
         LIMIT 1`,
       [id]
     );
+    if (!row) logger.warn('Call status · row not found · row=' + id);
     if (!row) return modernError(res, 404, 'call not found');
 
     // Authorize: the operator who placed it, or an Admin. role group is on the
@@ -615,10 +654,12 @@ router.get('/:id/status', requireClickToCallAction, async (req, res, next) => {
     const isOwner = row.caller_id != null && Number(row.caller_id) === Number(req.user.user_id);
     const isAdmin = Number(req.user.user_role) === 2; // role_id 2 = Admin (CLAUDE.md role model)
     if (!isOwner && !isAdmin) {
+      logger.warn('Call status denied · not owner/admin · row=' + id);
       return modernError(res, 403, 'You can only view the status of calls you placed');
     }
 
     const status = row.caller_status || null;
+    logger.info('Call status · row=' + id + ' · status=' + (status || '—') + ' · terminal=' + (status ? TERMINAL_STATUSES.has(status) : false));
     return modernOk(res, {
       status,
       ringing_at: null,                 // Plivo ring callback only flips status;
@@ -640,7 +681,9 @@ router.get('/:id/status', requireClickToCallAction, async (req, res, next) => {
 router.post('/:id/hangup', requireClickToCallAction, async (req, res, next) => {
   try {
     const id = parseRowId(req.params.id);
+    if (!id) logger.warn('Hangup rejected · invalid call id');
     if (!id) return modernError(res, 400, 'invalid call id');
+    logger.info('Hangup call · row=' + id);
 
     const [[row]] = await pool.query(
       `SELECT job_caller_info AS id, caller_id, provider, unique_id, caller_status
@@ -649,11 +692,13 @@ router.post('/:id/hangup', requireClickToCallAction, async (req, res, next) => {
         LIMIT 1`,
       [id]
     );
+    if (!row) logger.warn('Hangup · row not found · row=' + id);
     if (!row) return modernError(res, 404, 'call not found');
 
     const isOwner = row.caller_id != null && Number(row.caller_id) === Number(req.user.user_id);
     const isAdmin = Number(req.user.user_role) === 2; // role_id 2 = Admin (CLAUDE.md role model)
     if (!isOwner && !isAdmin) {
+      logger.warn('Hangup denied · not owner/admin · row=' + id);
       return modernError(res, 403, 'You can only hang up calls you placed');
     }
 
@@ -661,6 +706,7 @@ router.post('/:id/hangup', requireClickToCallAction, async (req, res, next) => {
     // terminal state anyway).
     const status = row.caller_status || null;
     if (status && TERMINAL_STATUSES.has(status)) {
+      logger.info('Hangup no-op · already ended · row=' + id + ' · status=' + status);
       return modernOk(res, { success: true, alreadyEnded: true });
     }
     // Before a provider callback lands, `unique_id` is the call-request handle
@@ -668,14 +714,17 @@ router.post('/:id/hangup', requireClickToCallAction, async (req, res, next) => {
     // DELETE with it would 404. Refuse gracefully until ring/answer captures the
     // CallUUID. The FE surfaces this 409 inline; the operator retries in a beat.
     if (!status || status === 'initiated' || status === 'placed') {
+      logger.warn('Hangup deferred · still connecting · row=' + id + ' · status=' + (status || '—'));
       return modernError(res, 409, 'Call is still connecting — please try hangup again in a moment.');
     }
 
     const r = await voice.hangup({ provider: row.provider, callUuid: row.unique_id });
     if (r.unsupported) {
+      logger.warn('Hangup unsupported · row=' + id + ' · provider=' + row.provider);
       return modernError(res, 409, 'Provider does not support hangup');
     }
     if (!r.ok) {
+      logger.warn('Hangup failed · row=' + id + ' · ' + (r.error || 'provider error'));
       return modernError(res, 502, r.error || 'Failed to hang up the call');
     }
 
@@ -694,6 +743,7 @@ router.post('/:id/hangup', requireClickToCallAction, async (req, res, next) => {
 router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
   try {
     const { jobId, customerId, dateFrom, dateTo, page, limit } = req.query;
+    logger.info('List call history · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · from=' + (dateFrom || '—') + ' · to=' + (dateTo || '—') + ' · page=' + page + ' · limit=' + limit);
     const where = [];
     const params = [];
     if (jobId)      { where.push('jci.job_id = ?');      params.push(jobId); }
@@ -735,6 +785,7 @@ router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
       [...params, limit, offset]
     );
 
+    logger.info('Returning ' + rows.length + ' call history rows · total=' + total);
     return modernOk(res, { total, page, limit, items: rows });
   } catch (e) { next(e); }
 });

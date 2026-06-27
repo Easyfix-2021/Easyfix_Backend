@@ -228,6 +228,7 @@ function previewCallLegs({ from, to, alwaysApplyEnvOverride = false }) {
 }
 
 async function clickToCall({ from, to, alwaysApplyEnvOverride = false }) {
+  logger.info(`Kaleyra click2call requested · alwaysApplyEnvOverride=${alwaysApplyEnvOverride}`);
   const callerReal   = normaliseIndianPhone(from);
   const receiverReal = normaliseIndianPhone(to);
   if (!callerReal)   return { delivered: false, error: `invalid caller phone "${from}"` };
@@ -354,6 +355,7 @@ async function getCallReport({ uniqueId }) {
   if (!uniqueId) return { ok: false, error: 'uniqueId required' };
   const apiKey = process.env.KALEYRA_API_KEY;
   if (!apiKey) return { ok: false, error: 'KALEYRA_API_KEY not configured' };
+  logger.info(`Kaleyra fetch call report · uniqueId=${uniqueId}`);
 
   const params = new URLSearchParams({
     method:  'dial.callreports',
@@ -368,6 +370,7 @@ async function getCallReport({ uniqueId }) {
     const text = await res.text();
     let parsed;
     try { parsed = JSON.parse(text); } catch { /* leave undefined */ }
+    logger.info(`Kaleyra call report · uniqueId=${uniqueId} · http=${res.status} · hasReport=${!!(parsed?.data?.[0])}`);
     return {
       ok: res.ok,
       httpStatus: res.status,
@@ -377,6 +380,7 @@ async function getCallReport({ uniqueId }) {
       raw: text,
     };
   } catch (err) {
+    logger.warn(`Kaleyra call report fetch failed · uniqueId=${uniqueId} · ${err.message}`);
     return { ok: false, error: err.message };
   }
 }

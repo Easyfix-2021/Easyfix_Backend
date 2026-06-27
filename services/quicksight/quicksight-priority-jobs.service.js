@@ -126,7 +126,9 @@ function buildOwnerFilter(scope, params) {
  *     escalatedCount, unconfirmedCount }
  */
 async function grid(reqUser, filters = {}, { pageNo = 1, pageSize = 10 } = {}) {
+  logger.info('Priority Jobs grid · pageNo=' + pageNo + ' pageSize=' + pageSize);
   const scope = resolveOwnerScope(reqUser, filters.ownerId);
+  logger.info('Owner scope resolved · applyOwnerFilter=' + scope.applyOwnerFilter + ' ownerIds=' + JSON.stringify(scope.ownerIds));
   const offset = (pageNo - 1) * pageSize;
 
   // ── GRID rows (JobRepository.java:849-887) ────────────────────────────
@@ -201,6 +203,7 @@ async function grid(reqUser, filters = {}, { pageNo = 1, pageSize = 10 } = {}) {
   }
 
   const totalRecords = Number((sizeRow && sizeRow.total) || 0);
+  logger.info('Found ' + gridRows.length + ' city rows · totalCities=' + totalRecords + ' escalated=' + Number((escRow && escRow.cnt) || 0) + ' unconfirmed=' + Number((uncRow && uncRow.cnt) || 0));
 
   const data = gridRows.map((r) => ({
     cityId: r.city_id == null ? 0 : r.city_id,
@@ -235,6 +238,7 @@ async function grid(reqUser, filters = {}, { pageNo = 1, pageSize = 10 } = {}) {
  * NOT paginated (legacy returns the full list); native adds a safety cap.
  */
 async function cityJobs(reqUser, filters = {}) {
+  logger.info('Priority Jobs city drill-down · cityId=' + JSON.stringify(filters.cityId || []));
   const scope = resolveOwnerScope(reqUser, filters.ownerId);
 
   const params = [];
@@ -271,6 +275,7 @@ async function cityJobs(reqUser, filters = {}) {
   `;
 
   const [rows] = await pool.query(sql, params);
+  logger.info('Found ' + rows.length + ' open jobs for city');
 
   if (rows.length >= LIST_LIMIT) {
     logger.warn(
@@ -313,6 +318,7 @@ async function cityJobs(reqUser, filters = {}) {
  * Returns rows shaped to the 18-column legacy "Hotspot_Job_Data" sheet.
  */
 async function copyData(reqUser, filters = {}) {
+  logger.info('Priority Jobs export · serviceCategoryId=' + JSON.stringify(filters.serviceCategoryId || []) + ' stateId=' + JSON.stringify(filters.stateId || []) + ' cityId=' + JSON.stringify(filters.cityId || []));
   const scope = resolveOwnerScope(reqUser, filters.ownerId);
 
   const params = [];
@@ -374,6 +380,7 @@ async function copyData(reqUser, filters = {}) {
   `;
 
   const [rows] = await pool.query(sql, params);
+  logger.info('Found ' + rows.length + ' export rows');
 
   if (rows.length >= EXPORT_LIMIT) {
     logger.warn(
@@ -410,6 +417,7 @@ async function copyData(reqUser, filters = {}) {
       logger.warn(`QuickSight Priority Jobs export: skipping bad row job_id=${r && r.job_id}: ${err.message}`);
     }
   }
+  logger.info('Returning ' + out.length + ' export rows');
   return out;
 }
 

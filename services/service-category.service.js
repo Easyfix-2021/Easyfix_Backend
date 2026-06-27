@@ -41,6 +41,7 @@ async function listCategories({
   limit = 200, offset = 0,
   sortBy = 'service_catg_name', sortDir = 'asc',
 } = {}) {
+  logger.info('List service categories · q=' + (q || '') + ' includeInactive=' + includeInactive + ' limit=' + limit + ' offset=' + offset);
   limit  = Math.min(Math.max(Number(limit) || 200, 1), 1000);
   offset = Math.max(Number(offset) || 0, 0);
 
@@ -69,15 +70,19 @@ async function listCategories({
     [...params, limit, offset]
   );
 
+  logger.info('Found ' + rows.length + ' service categories');
+
   const [[{ total }]] = await pool.query(
     `SELECT COUNT(*) AS total FROM tbl_service_catg c WHERE ${where.join(' AND ')}`,
     params
   );
 
+  logger.info('Returning ' + rows.length + ' service categories · total=' + total);
   return { items: rows, total };
 }
 
 async function getCategoryById(id) {
+  logger.info('Get service category · id=' + id);
   const [[row]] = await pool.query(
     `SELECT service_catg_id, service_catg_name, service_catg_desc, service_catg_status
        FROM tbl_service_catg
@@ -89,6 +94,7 @@ async function getCategoryById(id) {
 }
 
 async function createCategory({ service_catg_name, service_catg_desc }) {
+  logger.info('Create service category · name=' + String(service_catg_name || '').trim());
   const name = String(service_catg_name || '').trim();
   if (!name) throw mkErr(400, 'service_catg_name is required');
   if (name.length < 2) throw mkErr(400, 'service_catg_name is too short (min 2)');
@@ -118,6 +124,7 @@ async function createCategory({ service_catg_name, service_catg_desc }) {
 }
 
 async function updateCategory(id, fields) {
+  logger.info('Update service category · id=' + id + ' fields=' + Object.keys(fields || {}).join(','));
   const [[me]] = await pool.query(
     'SELECT service_catg_id FROM tbl_service_catg WHERE service_catg_id = ? AND service_catg_status <> 3 LIMIT 1',
     [id]
@@ -155,6 +162,7 @@ async function updateCategory(id, fields) {
     if (fields.is_active === false) {
       const n = await activeTypeCount(id);
       if (n > 0) {
+        logger.warn('Deactivate service category blocked · id=' + id + ' activeTypes=' + n);
         throw mkErr(409,
           `Cannot deactivate — ${n} active service type(s) still reference this category. Deactivate or reassign them first.`);
       }
@@ -181,9 +189,11 @@ async function activeTypeCount(id) {
 }
 
 async function deactivateCategory(id) {
+  logger.info('Deactivate service category · id=' + id);
   // Guard: don't deactivate while active service types reference this category.
   const n = await activeTypeCount(id);
   if (n > 0) {
+    logger.warn('Deactivate service category blocked · id=' + id + ' activeTypes=' + n);
     throw mkErr(409,
       `Cannot deactivate — ${n} active service type(s) still reference this category. Deactivate or reassign them first.`);
   }
@@ -203,8 +213,10 @@ async function deactivateCategory(id) {
 // "include inactive". We keep the active-type guard the legacy lacked so a
 // delete can't orphan live service types.
 async function deleteCategory(id) {
+  logger.info('Delete service category · id=' + id);
   const n = await activeTypeCount(id);
   if (n > 0) {
+    logger.warn('Delete service category blocked · id=' + id + ' activeTypes=' + n);
     throw mkErr(409,
       `Cannot delete — ${n} active service type(s) still reference this category. Deactivate or reassign them first.`);
   }

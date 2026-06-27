@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const logger = require('../logger');
 // Job-OTP generator — shared with the auth flow so we're not
 // duplicating the cryptographically-safe 4-digit primitive. See
 // utils/otp.js::generateOtp() for the implementation. Used at
@@ -561,6 +562,7 @@ async function list({
   scope,
   limit = 50, offset = 0,
 } = {}) {
+  logger.info('List jobs · status=' + (status ?? statuses ?? 'any') + ' · clientId=' + (clientId ?? '-') + ' · easyfixerId=' + (easyfixerId ?? '-') + ' · limit=' + limit + ' · offset=' + offset);
   const clauses = [];
   const params = [];
 
@@ -852,6 +854,7 @@ async function list({
       dataParams
     ),
   ]);
+  logger.info('Found ' + rows.length + ' jobs (total=' + total + ')');
   return { rows, total };
 }
 
@@ -867,6 +870,7 @@ async function list({
  * for those lookups when we're about to 404.
  */
 async function getById(jobId) {
+  logger.info('Get job detail · id=' + jobId);
   // Gate `cl.vertical_id` in the SELECT projection on column presence.
   // When the column isn't on this DB's tbl_client, fall back to a NULL
   // alias so the projection stays stable for downstream consumers
@@ -918,6 +922,7 @@ async function getById(jobId) {
     ),
   ]);
   const job = jobRows[0][0];
+  if (!job) logger.warn('Job detail not found · id=' + jobId);
   if (!job) return null;
 
   // Customer-shared videos (via the WhatsApp conversational order-confirmation
@@ -976,6 +981,7 @@ async function getJobMeta(jobId) {
  * fussy and the row count is always tiny (≤ 10 status codes).
  */
 async function getStatusCounts({ ownerId, easyfixerId, scope } = {}) {
+  logger.info('Compute job status counts · ownerId=' + (ownerId ?? '-') + ' · easyfixerId=' + (easyfixerId ?? '-'));
   /*
    * Two queries run in parallel:
    *   1. GROUP BY job_status — the raw count per code.
@@ -1106,6 +1112,7 @@ async function getStatusCounts({ ownerId, easyfixerId, scope } = {}) {
   }
   // See comment above — escalated badge is stubbed to 0 until the
   // rating-table join lands.
+  logger.info('Status counts ready · total=' + total + ' · bookedUnassigned=' + bookedUnassigned + ' · bookedAssigned=' + bookedAssigned);
   return { total, byStatus, bookedUnassigned, bookedAssigned, escalated: 0 };
 }
 
@@ -1192,6 +1199,7 @@ async function getAttentionSummary({ scope } = {}) {
   // module top doesn't import the logger; each call-site requires it
   // locally to keep the dependency surface explicit per-feature).
   const logger = require('../logger');
+  logger.info('Compute attention summary · scoped=' + (scope ? 'yes' : 'no'));
   async function safeCount(label, sql, params) {
     try {
       const [[row]] = await pool.query(sql, params);
@@ -1335,6 +1343,7 @@ async function getAttentionSummary({ scope } = {}) {
     bookedNoServicesPromise,
   ]);
 
+  logger.info('Attention summary ready · runningLate=' + runningLate + ' · estApproved=' + estimateApproved + ' · estRejected=' + estimateRejected + ' · pendingTechAccept=' + pendingTechAccept + ' · unreachable=' + customerUnreachable + ' · bookedNoServices=' + bookedNoServices);
   return {
     runningLate,
     estimateApproved,
@@ -1501,6 +1510,7 @@ async function insertAddress(conn, customerId, addr, actor) {
 
 // ─── Create ─────────────────────────────────────────────────────────
 async function create(input, actor) {
+  logger.info('Create job · clientId=' + (input.fk_client_id ?? '-') + ' · jobType=' + (input.job_type || 'Installation') + ' · initialStatus=' + (input.initial_status ?? 0) + ' · source=' + (input.source_type || 'manual') + ' · services=' + (Array.isArray(input.services) ? input.services.length : 0));
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
@@ -1861,6 +1871,7 @@ async function create(input, actor) {
     }
 
     await conn.commit();
+    logger.info('Job created · id=' + jobId + ' · status=' + effectiveStatus);
 
     /*
      * Flag-based auto-assignment on job creation.
@@ -1888,6 +1899,7 @@ async function create(input, actor) {
     return getById(jobId);
   } catch (e) {
     await conn.rollback();
+    logger.error('Create job failed, rolled back · ' + e.message);
     throw e;
   } finally {
     conn.release();
@@ -1938,8 +1950,10 @@ const MUTABLE_COLUMNS = [
 ];
 
 async function update(jobId, input, actor) {
+  logger.info('Update job · id=' + jobId + ' · services=' + (Array.isArray(input.services) ? 'yes' : 'no') + ' · customer=' + (input.customer ? 'yes' : 'no') + ' · address=' + (input.address ? 'yes' : 'no'));
   const existing = await getById(jobId);
   if (!existing) {
+    logger.warn('Update job not found · id=' + jobId);
     const err = new Error('job not found'); err.status = 404; throw err;
   }
   const sets = [];
@@ -2254,8 +2268,10 @@ async function update(jobId, input, actor) {
     }
 
     await conn.commit();
+    logger.info('Job updated · id=' + jobId);
   } catch (err) {
     await conn.rollback();
+    logger.error('Update job failed, rolled back · id=' + jobId + ' · ' + err.message);
     throw err;
   } finally {
     conn.release();
@@ -2439,12 +2455,15 @@ async function hasCallLaterColumn() {
 }
 
 async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
+  logger.info('Set job status · id=' + jobId + ' · status=' + status + (reasonId != null ? ' · reasonId=' + reasonId : ''));
   if (!ALL_STATUS_VALUES.has(Number(status))) {
+    logger.warn('Set status rejected, invalid status · id=' + jobId + ' · status=' + status);
     const err = new Error(`invalid status ${status}; allowed: ${[...ALL_STATUS_VALUES].join(',')}`);
     err.status = 400; throw err;
   }
   const existing = await getJobMeta(jobId);
   if (!existing) {
+    logger.warn('Set status job not found · id=' + jobId);
     const err = new Error('job not found'); err.status = 404; throw err;
   }
 
@@ -2563,6 +2582,7 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
   await pool.query(`UPDATE tbl_job SET ${sets.join(', ')} WHERE job_id = ?`, values);
 
   const eventName = statusToEventName(existing.job_status, Number(status));
+  logger.info('Job status updated · id=' + jobId + ' · ' + existing.job_status + '->' + Number(status) + (eventName ? ' · event=' + eventName : ''));
   if (eventName) fireWebhook(eventName, jobId);
 
   return getById(jobId);
@@ -2595,12 +2615,15 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
   const ids = Array.from(new Set((Array.isArray(efrIds) ? efrIds : [efrIds])
     .map((v) => Number(v))
     .filter((n) => Number.isInteger(n) && n > 0)));
+  logger.info('Offer job to technicians · id=' + jobId + ' · techCount=' + ids.length + (requestedDateTime ? ' · reschedule=yes' : ''));
   if (!ids.length) {
+    logger.warn('Offer rejected, no valid easyfixer · id=' + jobId);
     const err = new Error('at least one easyfixer is required to offer a job'); err.status = 400; throw err;
   }
 
   const existing = await getJobMeta(jobId);
   if (!existing) {
+    logger.warn('Offer job not found · id=' + jobId);
     const err = new Error('job not found'); err.status = 404; throw err;
   }
 
@@ -2671,11 +2694,13 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
     await conn.commit();
   } catch (e) {
     await conn.rollback();
+    logger.error('Offer job failed, rolled back · id=' + jobId + ' · ' + e.message);
     throw e;
   } finally {
     conn.release();
   }
 
+  logger.info('Job offered · id=' + jobId + ' · newOffers=' + offeredIds.length);
   // Fire-and-forget offer pushes AFTER commit — only to techs we actually
   // inserted a fresh offer for. Never throws into the offer path.
   for (const efrId of offeredIds) {
@@ -2709,6 +2734,7 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
  * auto-assign.service.js calls assign() unchanged and transparently offers.
  */
 async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requestedDateTime, timeSlot }, actor) {
+  logger.info('Assign job to technician · id=' + jobId + ' · easyfixerId=' + easyfixerId + (requestedDateTime ? ' · reschedule=yes' : ''));
   // Check tech + job in parallel — they're independent lookups. Fails either
   // way with the right 400/404, same as before, but cuts one round-trip.
   const [[[tech]], existing] = await Promise.all([
@@ -2719,12 +2745,15 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
     getJobMeta(jobId),
   ]);
   if (!tech) {
+    logger.warn('Assign rejected, easyfixer not found · id=' + jobId + ' · easyfixerId=' + easyfixerId);
     const err = new Error(`easyfixer ${easyfixerId} not found`); err.status = 400; throw err;
   }
   if (!tech.efr_status) {
+    logger.warn('Assign rejected, easyfixer inactive · id=' + jobId + ' · easyfixerId=' + easyfixerId);
     const err = new Error(`easyfixer ${easyfixerId} is inactive`); err.status = 400; throw err;
   }
   if (!existing) {
+    logger.warn('Assign job not found · id=' + jobId);
     const err = new Error('job not found'); err.status = 404; throw err;
   }
 
@@ -2803,12 +2832,14 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
     );
 
     await conn.commit();
+    logger.info('Job ' + (isReassign ? 'reassigned' : 'assigned') + ' · id=' + jobId + ' · easyfixerId=' + easyfixerId);
 
     fireWebhook(isReassign ? 'RescheduleTech' : 'TechAssigned', jobId);
 
     return getById(jobId);
   } catch (e) {
     await conn.rollback();
+    logger.error('Assign job failed, rolled back · id=' + jobId + ' · ' + e.message);
     throw e;
   } finally {
     conn.release();
@@ -2846,16 +2877,20 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
  * response immediately.
  */
 async function unassign(jobId, { reason, reasonId }, actor) {
+  logger.info('Unassign job · id=' + jobId + (reasonId != null ? ' · reasonId=' + reasonId : ''));
   if (!reason || typeof reason !== 'string' || !reason.trim()) {
+    logger.warn('Unassign rejected, reason required · id=' + jobId);
     const err = new Error('reason is required to unassign a job'); err.status = 400; throw err;
   }
   const existing = await getJobMeta(jobId);
   if (!existing) {
+    logger.warn('Unassign job not found · id=' + jobId);
     const err = new Error('job not found'); err.status = 404; throw err;
   }
   if (!existing.fk_easyfixter_id) {
     // Nothing to unassign — treat as a soft no-op rather than an
     // error so retries are idempotent.
+    logger.info('Unassign no-op, job has no technician · id=' + jobId);
     return getById(jobId);
   }
   const techIdAtUnassign = existing.fk_easyfixter_id;
@@ -2899,6 +2934,7 @@ async function unassign(jobId, { reason, reasonId }, actor) {
     }
 
     await conn.commit();
+    logger.info('Job unassigned · id=' + jobId + ' · removedTech=' + techIdAtUnassign);
 
     // Reschedule-shaped event (job is leaving the tech's queue).
     // Clients that already received a TechAssigned for this job will
@@ -2908,6 +2944,7 @@ async function unassign(jobId, { reason, reasonId }, actor) {
     return getById(jobId);
   } catch (e) {
     await conn.rollback();
+    logger.error('Unassign job failed, rolled back · id=' + jobId + ' · ' + e.message);
     throw e;
   } finally {
     conn.release();
@@ -2940,6 +2977,7 @@ async function unassign(jobId, { reason, reasonId }, actor) {
  * another technician already accepted.
  */
 async function acceptOffer(jobId, efrId) {
+  logger.info('Accept job offer · id=' + jobId + ' · efrId=' + efrId);
   const hasOfferTable = await jobOfferTableExists();
   const conn = await pool.getConnection();
   // `committed` guards the catch so a post-commit throw (the 409 path) doesn't
@@ -2983,6 +3021,7 @@ async function acceptOffer(jobId, efrId) {
       );
       await conn.commit();
       committed = true;
+      logger.info('Job offer accepted (won race) · id=' + jobId + ' · efrId=' + efrId);
       return getById(jobId);
     }
 
@@ -2997,12 +3036,14 @@ async function acceptOffer(jobId, efrId) {
     committed = true;
   } catch (e) {
     if (!committed) await conn.rollback();
+    logger.error('Accept offer failed · id=' + jobId + ' · efrId=' + efrId + ' · ' + e.message);
     throw e;
   } finally {
     conn.release();
   }
 
   // Reached only on the lost-race path (the success paths returned inside try).
+  logger.warn('Job offer lost race, already accepted by another technician · id=' + jobId + ' · efrId=' + efrId);
   throw Object.assign(new Error('This job was already accepted by another technician'), { status: 409 });
 }
 
@@ -3033,6 +3074,7 @@ async function techHasOpenOffer(jobId, efrId) {
  * offer table) it falls back to the shared unassign() single-assign reject.
  */
 async function rejectOffer(jobId, efrId, { reason, reasonId } = {}) {
+  logger.info('Reject job offer · id=' + jobId + ' · efrId=' + efrId + (reasonId != null ? ' · reasonId=' + reasonId : ''));
   if (!(await jobOfferTableExists())) {
     return unassign(jobId, { reason, reasonId }, { user_id: efrId });
   }
@@ -3057,6 +3099,7 @@ async function rejectOffer(jobId, efrId, { reason, reasonId } = {}) {
  * Each row: { efr_id, efr_name, offered_at }.
  */
 async function listOffers(jobId) {
+  logger.info('List open offers for job · id=' + jobId);
   if (!(await jobOfferTableExists())) return [];
   const [rows] = await pool.query(
     `SELECT jo.fk_easyfixter_id AS efr_id, ef.efr_name, jo.offered_at
@@ -3066,6 +3109,7 @@ async function listOffers(jobId) {
       ORDER BY jo.offered_at DESC`,
     [jobId],
   );
+  logger.info('Found ' + rows.length + ' open offers · jobId=' + jobId);
   return rows;
 }
 
@@ -3083,6 +3127,7 @@ async function listOffers(jobId) {
  * Returns { items } — [] when tbl_job_offer is absent.
  */
 async function listOfferedForTech(efrId, { limit = 50 } = {}) {
+  logger.info('List offered jobs for technician · efrId=' + efrId + ' · limit=' + limit);
   if (!(await jobOfferTableExists())) return { items: [] };
   // Most-recent open offers first; cap before hydrating the full preview.
   const [offerRows] = await pool.query(
@@ -3100,6 +3145,7 @@ async function listOfferedForTech(efrId, { limit = 50 } = {}) {
   const { rows } = await list({ jobIds: ids, limit: ids.length });
   const order = new Map(ids.map((id, i) => [id, i]));
   rows.sort((a, b) => (order.get(Number(a.job_id)) ?? 0) - (order.get(Number(b.job_id)) ?? 0));
+  logger.info('Returning ' + rows.length + ' offered jobs · efrId=' + efrId);
   return { items: rows };
 }
 
@@ -3108,15 +3154,18 @@ async function listOfferedForTech(efrId, { limit = 50 } = {}) {
 // This endpoint changes job_owner (the internal PM/user who runs the job).
 // Always captures reason + timestamp + actor for the audit trail.
 async function changeOwner(jobId, { newOwnerId, reason }, actor) {
+  logger.info('Change job owner · id=' + jobId + ' · newOwnerId=' + newOwnerId);
   // Skip the full detail load — we only need job_owner for the no-op check.
   const [[existing]] = await pool.query(
     'SELECT job_id, job_owner FROM tbl_job WHERE job_id = ? LIMIT 1',
     [jobId]
   );
   if (!existing) {
+    logger.warn('Change owner job not found · id=' + jobId);
     const err = new Error('job not found'); err.status = 404; throw err;
   }
   if (existing.job_owner === newOwnerId) {
+    logger.warn('Change owner no-op, already owned · id=' + jobId + ' · ownerId=' + newOwnerId);
     const err = new Error(`job ${jobId} is already owned by user ${newOwnerId}`);
     err.status = 400; throw err;
   }
@@ -3151,6 +3200,7 @@ async function changeOwner(jobId, { newOwnerId, reason }, actor) {
     [newOwnerId, actor?.user_id || null, reason, new Date(), new Date(), jobId]
   );
 
+  logger.info('Job owner changed · id=' + jobId + ' · newOwnerId=' + newOwnerId);
   return getById(jobId);
 }
 

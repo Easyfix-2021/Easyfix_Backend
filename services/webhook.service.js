@@ -40,11 +40,13 @@ const IMAGE_URL_BASE = process.env.WEBHOOK_IMAGE_URL_BASE || 'https://qa.easyfix
 
 // ─── Registry: events ───────────────────────────────────────────────
 async function listEvents({ includeInactive = false } = {}) {
+  logger.info('Listing webhook events · includeInactive=' + includeInactive);
   const where = includeInactive ? "WHERE name IS NOT NULL"
                                 : "WHERE status = 'active' AND name IS NOT NULL";
   const [rows] = await pool.query(
     `SELECT id, name, \`desc\`, status, createdAt, updatedAt FROM webhook_events ${where} ORDER BY id ASC`
   );
+  logger.info('Found ' + rows.length + ' webhook events');
   return rows;
 }
 
@@ -58,15 +60,18 @@ async function getEventByName(name) {
 }
 
 async function createEvent({ name, desc }, actor) {
+  logger.info('Creating webhook event · name=' + name);
   const [r] = await pool.query(
     `INSERT INTO webhook_events (name, \`desc\`, status, createdAt, updatedAt, createdBy)
      VALUES (?, ?, 'active', ?, ?, ?)`,
     [name, desc || null, new Date(), new Date(), actor?.user_id || null]
   );
+  logger.info('Webhook event created · id=' + r.insertId);
   return { id: r.insertId, name, desc, status: 'active' };
 }
 
 async function updateEvent(id, { desc, status }, actor) {
+  logger.info('Updating webhook event · id=' + id + (status !== undefined ? ' · status=' + status : ''));
   const sets = [], vals = [];
   if (desc !== undefined)   { sets.push('`desc` = ?'); vals.push(desc); }
   if (status !== undefined) { sets.push('status = ?'); vals.push(status); }
@@ -75,11 +80,13 @@ async function updateEvent(id, { desc, status }, actor) {
   vals.push(new Date(), actor?.user_id || null, id);
   await pool.query(`UPDATE webhook_events SET ${sets.join(', ')} WHERE id = ?`, vals);
   const [[row]] = await pool.query('SELECT * FROM webhook_events WHERE id = ?', [id]);
+  logger.info('Webhook event updated · id=' + id);
   return row;
 }
 
 // ─── Registry: mappings ─────────────────────────────────────────────
 async function listMappings({ clientId, eventId, includeInactive = false } = {}) {
+  logger.info('Listing webhook mappings · clientId=' + (clientId ?? 'any') + ' · eventId=' + (eventId ?? 'any') + ' · includeInactive=' + includeInactive);
   const clauses = [];
   const params = [];
   if (!includeInactive) clauses.push("m.status = 'active'");
@@ -96,6 +103,7 @@ async function listMappings({ clientId, eventId, includeInactive = false } = {})
        ${where} ORDER BY m.id ASC`,
     params
   );
+  logger.info('Found ' + rows.length + ' webhook mappings');
   return rows;
 }
 
@@ -110,16 +118,19 @@ async function activeMappingsFor(clientId, eventId) {
 }
 
 async function createMapping({ clientId, eventId, callBackUrl, authorization }) {
+  logger.info('Creating webhook mapping · clientId=' + clientId + ' · eventId=' + eventId);
   const [r] = await pool.query(
     `INSERT INTO webhook_client_url_mapping
        (client_id, event_id, call_back_url, authorization, status, createdAt, updatedAt)
      VALUES (?, ?, ?, ?, 'active', ?, ?)`,
     [clientId, eventId, callBackUrl, authorization || null, new Date(), new Date()]
   );
+  logger.info('Webhook mapping created · id=' + r.insertId);
   return { id: r.insertId };
 }
 
 async function updateMapping(id, { callBackUrl, authorization, status }) {
+  logger.info('Updating webhook mapping · id=' + id + (status !== undefined ? ' · status=' + status : ''));
   const sets = [], vals = [];
   if (callBackUrl !== undefined)   { sets.push('call_back_url = ?'); vals.push(callBackUrl); }
   if (authorization !== undefined) { sets.push('authorization = ?'); vals.push(authorization); }
@@ -129,13 +140,16 @@ async function updateMapping(id, { callBackUrl, authorization, status }) {
   vals.push(new Date(), id);
   await pool.query(`UPDATE webhook_client_url_mapping SET ${sets.join(', ')} WHERE id = ?`, vals);
   const [[row]] = await pool.query('SELECT * FROM webhook_client_url_mapping WHERE id = ?', [id]);
+  logger.info('Webhook mapping updated · id=' + id);
   return row;
 }
 
 async function deleteMapping(id) {
+  logger.info('Soft-deleting webhook mapping · id=' + id);
   // Soft-delete: flip status to 'inactive' rather than DELETE. Audit-friendly.
   await pool.query("UPDATE webhook_client_url_mapping SET status = 'inactive', updatedAt = ? WHERE id = ?",
     [new Date(), id]);
+  logger.info('Webhook mapping deleted · id=' + id);
 }
 
 // ─── Enrichment: build the payload exactly as legacy did ────────────
@@ -362,6 +376,7 @@ async function deliverWithRetry(context, attempt = 1) {
  * scheduled, not when it completes. Retries run async in the background.
  */
 async function dispatch({ eventName, jobId }) {
+  logger.info('Dispatching webhook · event=' + eventName + ' · job=' + jobId);
   if (String(process.env.WEBHOOKS_DISABLE).toLowerCase() === 'true') {
     logger.test(`Webhook suppressed (WEBHOOKS_DISABLE) · event=${eventName} · job=${jobId}`);
     return { disabled: true };
@@ -388,6 +403,7 @@ async function dispatch({ eventName, jobId }) {
 
   const mappings = await activeMappingsFor(clientId, event.id);
   if (mappings.length === 0) {
+    logger.info('No active webhook mapping · client=' + clientId + ' · event=' + eventName + ' · job=' + jobId);
     return { dispatched: 0, reason: 'no active mapping' };
   }
 
@@ -395,6 +411,7 @@ async function dispatch({ eventName, jobId }) {
     // Fire-and-forget: deliverWithRetry swallows errors internally.
     setImmediate(() => deliverWithRetry({ mapping, event, jobId, payload }));
   }
+  logger.info('Scheduled ' + mappings.length + ' webhook deliveries · event=' + eventName + ' · job=' + jobId);
   return { dispatched: mappings.length };
 }
 
@@ -403,9 +420,12 @@ async function dispatch({ eventName, jobId }) {
  * reconciliation when a client complains "didn't get the webhook".
  */
 async function manualDispatch({ eventName, jobId, mappingId }) {
+  logger.info('Manual webhook dispatch · event=' + eventName + ' · job=' + jobId + ' · mapping=' + mappingId);
   const event = await getEventByName(eventName);
+  if (!event) logger.warn('Manual webhook dispatch skipped · unknown event "' + eventName + '"');
   if (!event) throw Object.assign(new Error('event not found'), { status: 404 });
   const payload = await buildJobPayload(jobId);
+  if (!payload) logger.warn('Manual webhook dispatch skipped · job ' + jobId + ' not found');
   if (!payload) throw Object.assign(new Error('job not found'), { status: 404 });
   delete payload._fk_client_id;
 
@@ -413,6 +433,7 @@ async function manualDispatch({ eventName, jobId, mappingId }) {
     'SELECT id, client_id, event_id, call_back_url, authorization FROM webhook_client_url_mapping WHERE id = ?',
     [mappingId]
   );
+  if (!mapping) logger.warn('Manual webhook dispatch skipped · mapping ' + mappingId + ' not found');
   if (!mapping) throw Object.assign(new Error('mapping not found'), { status: 404 });
 
   return new Promise((resolve) => {
@@ -425,6 +446,7 @@ async function manualDispatch({ eventName, jobId, mappingId }) {
 
 // ─── Logs query ─────────────────────────────────────────────────────
 async function listLogs({ clientId, eventId, jobId, limit = 50, offset = 0 } = {}) {
+  logger.info('Listing webhook logs · clientId=' + (clientId ?? 'any') + ' · eventId=' + (eventId ?? 'any') + ' · jobId=' + (jobId ?? 'any') + ' · limit=' + limit + ' · offset=' + offset);
   const clauses = [];
   const params = [];
   if (clientId != null) { clauses.push('client_id = ?'); params.push(clientId); }
@@ -439,6 +461,7 @@ async function listLogs({ clientId, eventId, jobId, limit = 50, offset = 0 } = {
        ORDER BY id DESC LIMIT ? OFFSET ?`,
     params
   );
+  logger.info('Found ' + rows.length + ' webhook logs');
   return rows;
 }
 

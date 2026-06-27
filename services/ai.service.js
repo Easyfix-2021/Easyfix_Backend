@@ -66,6 +66,7 @@ async function interpretReply({ step, text, timeSlots = [] }) {
 
   const today = istTodayContext();
   const model = process.env.OPENAI_NLU_MODEL || 'gpt-4o-mini';
+  logger.info('Interpret reply · step=' + step + ' · model=' + model + ' · slots=' + timeSlots.length);
 
   const system = [
     'You are an NLU parser for an Indian home-services WhatsApp assistant.',
@@ -116,6 +117,7 @@ async function interpretReply({ step, text, timeSlots = [] }) {
     const ALLOWED = new Set(['datetime', 'no_service', 'address', 'affirm', 'decline', 'unclear']);
     if (!ALLOWED.has(parsed.intent)) parsed.intent = 'unclear';
     if (parsed.time_slot && timeSlots.length && !timeSlots.includes(parsed.time_slot)) delete parsed.time_slot;
+    logger.info('Interpreted reply · intent=' + parsed.intent);
     return parsed;
   } catch (err) {
     logger.warn(`AI NLU error · ${err.message}`);

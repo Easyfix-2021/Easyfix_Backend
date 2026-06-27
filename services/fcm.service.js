@@ -70,6 +70,7 @@ async function getAccessToken() {
 
 async function sendPush({ token, title, body, data = {} }) {
   const originalToken = token;
+  logger.info('Send push · title="' + (title || '') + '" · dataKeys=' + Object.keys(data || {}).length);
   if (!token) return { delivered: false, error: 'token required' };
   if (!title && !body) return { delivered: false, error: 'title or body required' };
 

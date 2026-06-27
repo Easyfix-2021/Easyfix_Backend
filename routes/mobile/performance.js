@@ -5,6 +5,7 @@ const validate = require('../../middleware/validate');
 const { modernOk } = require('../../utils/response');
 const svc = require('../../services/mobile-performance.service');
 const grade = require('../../services/grade.service');
+const logger = require('../../logger');
 
 /*
  * /api/mobile/performance/* — Technician-app weekly-performance surface.
@@ -68,6 +69,7 @@ router.get('/weekly', validate(weeklyQuery, 'query'), async (req, res, next) => 
   try {
     const from = toYmd(req.query.from);
     const to = toYmd(req.query.to);
+    logger.info(`Weekly performance requested · ${from} → ${to}`);
     modernOk(res, await svc.getWeeklyPerformance(req.tech.efr_id, from, to));
   } catch (e) { next(e); }
 });
@@ -81,6 +83,7 @@ router.get('/weekly', validate(weeklyQuery, 'query'), async (req, res, next) => 
  */
 router.get('/grade-advice', async (req, res, next) => {
   try {
+    logger.info('Grade advice requested');
     modernOk(res, await grade.getGradeAdvice(req.tech.efr_id));
   } catch (e) { next(e); }
 });
@@ -98,7 +101,9 @@ router.get('/grade-advice', async (req, res, next) => {
  */
 router.get('/offer-stats', async (req, res, next) => {
   try {
+    logger.info('Offer stats requested');
     const stats = await svc.getOfferStats(req.tech.efr_id);
+    logger.info(`Offer stats · offered=${stats.offered} accepted=${stats.accepted} rejected=${stats.rejected} missed=${stats.missed}`);
     modernOk(res, stats);
   } catch (e) { next(e); }
 });

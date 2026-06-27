@@ -86,10 +86,12 @@ function splitCategories(raw) {
  * (name slice only). Single-column UPDATE, parameterised.
  */
 async function updateName(efrId, name) {
+  logger.info('Update technician name');
   await pool.query(
     'UPDATE tbl_easyfixer SET efr_name = ? WHERE efr_id = ?',
     [name, efrId],
   );
+  logger.info('Technician name updated · efrId=' + efrId);
   return { ok: true };
 }
 
@@ -108,10 +110,12 @@ async function updateName(efrId, name) {
  * fetch → Blob, so a bare key is fine.
  */
 async function setProfileImage(efrId, imageId) {
+  logger.info('Set profile image by reference · imageId=' + imageId);
   await pool.query(
     'UPDATE tbl_easyfixer SET efr_profile_img = ? WHERE efr_id = ?',
     [imageId, efrId],
   );
+  logger.info('Profile image set · efrId=' + efrId);
   return { url: await s3Storage.resolveImageUrl(imageId), imageId };
 }
 
@@ -130,6 +134,7 @@ async function setProfileImage(efrId, imageId) {
  * as the key — resolveImageUrl reads either shape back correctly.
  */
 async function setProfileImageFromUpload(efrId, buffer, contentType, originalName) {
+  logger.info('Upload profile image · contentType=' + contentType + ' bytes=' + (buffer ? buffer.length : 0));
   let key;
   if (s3Storage.isEnabled()) {
     key = await s3Storage.putAtKey({
@@ -148,6 +153,7 @@ async function setProfileImageFromUpload(efrId, buffer, contentType, originalNam
     [key, efrId],
   );
 
+  logger.info('Profile image uploaded · efrId=' + efrId + ' key=' + key);
   return { url: await s3Storage.resolveImageUrl(key), imageId: key };
 }
 
@@ -179,6 +185,8 @@ async function setProfileImageFromUpload(efrId, buffer, contentType, originalNam
  */
 async function getWeeklyPerformance(efrId, { from, to } = {}) {
   const b = dateBounds(from, to);
+
+  logger.info('Weekly performance · from=' + (from || '-') + ' to=' + (to || '-'));
 
   // Headline OTA/SDA/grade/rating from the shared performance service —
   // avoids duplicating the on-time / same-day definitions.
@@ -236,7 +244,10 @@ async function getWeeklyPerformance(efrId, { from, to } = {}) {
     });
   } catch (e) {
     logger.warn({ err: e.message, efrId }, 'getWeeklyPerformance aggregation failed');
+    logger.warn('Weekly performance aggregation failed · ' + e.message);
   }
+
+  logger.info('Returning ' + weeks.length + ' week(s) · totalJobs=' + totalJobs);
 
   return {
     ota: headline.ota,
@@ -267,6 +278,8 @@ async function getWeeklyPerformance(efrId, { from, to } = {}) {
  */
 async function getEarnings(efrId, { from, to } = {}) {
   const b = dateBounds(from, to);
+
+  logger.info('Earnings statement · from=' + (from || '-') + ' to=' + (to || '-'));
 
   // current_balance is a simple per-tech read.
   let currentBalance = 0;
@@ -362,6 +375,7 @@ async function getEarnings(efrId, { from, to } = {}) {
  *     legacy endpoint left empty; returned as [].
  */
 async function getICard(efrId) {
+  logger.info('Build I-Card · efrId=' + efrId);
   let row = {};
   try {
     const [[r]] = await pool.query(
@@ -395,6 +409,7 @@ async function getICard(efrId) {
   }
 
   const hasInsurance = Boolean(row.health_insurance) || Boolean(row.accidental_insurance);
+  logger.info('Returning I-Card · rating=' + rating);
   return {
     id: row.efr_id ?? efrId,
     name: row.efr_name ?? null,
@@ -422,6 +437,7 @@ async function getICard(efrId) {
  * RC.customer_rating, escalated_*).
  */
 async function getRatings(efrId, { from, to } = {}) {
+  logger.info('List customer ratings · from=' + (from || '-') + ' to=' + (to || '-'));
   const b = dateBounds(from, to);
   const params = [efrId];
   let windowSql = '';
@@ -449,7 +465,9 @@ async function getRatings(efrId, { from, to } = {}) {
     }));
   } catch (e) {
     logger.warn({ err: e.message, efrId }, 'getRatings query failed');
+    logger.warn('Ratings query failed · ' + e.message);
   }
+  logger.info('Returning ' + items.length + ' rating(s)');
   return { items };
 }
 
@@ -463,6 +481,7 @@ async function getRatings(efrId, { from, to } = {}) {
  * EasyfixerDaoImpl: easyfixer_id, video_id, watched_percentage, update_date.
  */
 async function getTrainingPercentages(efrId) {
+  logger.info('List training watched-% · efrId=' + efrId);
   let items = [];
   try {
     const [rows] = await pool.query(
@@ -478,7 +497,9 @@ async function getTrainingPercentages(efrId) {
     }));
   } catch (e) {
     logger.warn({ err: e.message, efrId }, 'getTrainingPercentages query failed');
+    logger.warn('Training watched-% query failed · ' + e.message);
   }
+  logger.info('Returning ' + items.length + ' training video(s)');
   return { items };
 }
 
@@ -492,6 +513,7 @@ async function getTrainingPercentages(efrId) {
  * upsert uses in routes/mobile/index.js). `update_date` is stamped NOW().
  */
 async function setTrainingPercentage(efrId, videoId, watchedPercentage) {
+  logger.info('Upsert training watched-% · videoId=' + videoId + ' watched=' + watchedPercentage);
   const [upd] = await pool.query(
     `UPDATE easyfixer_watched_video
         SET watched_percentage = ?, update_date = NOW()
@@ -505,6 +527,7 @@ async function setTrainingPercentage(efrId, videoId, watchedPercentage) {
       [efrId, videoId, watchedPercentage],
     );
   }
+  logger.info('Training watched-% saved · videoId=' + videoId + ' inserted=' + (upd.affectedRows === 0));
   return { videoId, watchedPercentage };
 }
 
@@ -531,6 +554,7 @@ const MIN_SUPPORTED_VERSION = '1.0.0';
 const FORCE_UPDATE = false;
 
 function getAppVersion() {
+  logger.info('App version requested · latest=' + LATEST_VERSION + ' forceUpdate=' + FORCE_UPDATE);
   return {
     latestVersion: LATEST_VERSION,
     minSupportedVersion: MIN_SUPPORTED_VERSION,
@@ -552,6 +576,7 @@ function getAppVersion() {
  * we scope to that row; otherwise we log out ALL of this tech's devices.
  */
 async function logout(efrId, deviceId) {
+  logger.info('Logout · scope=' + (deviceId ? 'single-device' : 'all-devices'));
   if (deviceId) {
     await pool.query(
       "UPDATE device_info SET is_logged_in = '0' WHERE user_id = ? AND device_id = ?",
@@ -563,6 +588,7 @@ async function logout(efrId, deviceId) {
       [efrId],
     );
   }
+  logger.info('Device(s) deregistered · efrId=' + efrId);
   return { ok: true };
 }
 
@@ -590,6 +616,7 @@ async function logout(efrId, deviceId) {
  * columns the CRM owns.
  */
 async function getUpiDetails(efrId) {
+  logger.info('Read UPI details · efrId=' + efrId);
   let items = [];
   try {
     const [[row]] = await pool.query(
@@ -603,7 +630,9 @@ async function getUpiDetails(efrId) {
     if (upi) items = [{ id: row.efr_bank_id, upiId: upi, isPrimary: true }];
   } catch (e) {
     logger.warn({ err: e.message, efrId }, 'getUpiDetails query failed');
+    logger.warn('UPI details read failed · ' + e.message);
   }
+  logger.info('Returning ' + items.length + ' UPI record(s)');
   return { items };
 }
 
@@ -617,6 +646,7 @@ async function getUpiDetails(efrId) {
  * the bank-name lookup, so a partial row is handled gracefully.
  */
 async function addUpiDetail(efrId, upiId) {
+  logger.info('Upsert UPI detail · efrId=' + efrId);
   await pool.query(
     `INSERT INTO tbl_easyfixer_bank_details (efr_Id, upi_or_mobile_number, insert_date, update_date)
      VALUES (?, ?, NOW(), NOW())
@@ -627,6 +657,7 @@ async function addUpiDetail(efrId, upiId) {
     'SELECT efr_bank_id FROM tbl_easyfixer_bank_details WHERE efr_Id = ? LIMIT 1',
     [efrId],
   );
+  logger.info('UPI detail saved · id=' + (row ? row.efr_bank_id : null));
   return { id: row ? row.efr_bank_id : null, upiId, isPrimary: true };
 }
 
@@ -646,6 +677,7 @@ async function addUpiDetail(efrId, upiId) {
  * `adhaar` spelling), pan_card_number.
  */
 async function aadhaarPanExists(number, excludeEfrId) {
+  logger.info('Aadhaar/PAN duplicate-check · excludeEfrId=' + (excludeEfrId || 0));
   const [[row]] = await pool.query(
     `SELECT COUNT(*) AS cnt
        FROM tbl_easyfixer
@@ -654,6 +686,7 @@ async function aadhaarPanExists(number, excludeEfrId) {
         AND NOT (tbl_easyfixer.efr_status <=> 3)`,
     [number, number, excludeEfrId || 0],
   );
+  logger.info('Aadhaar/PAN duplicate-check result · exists=' + (Number(row?.cnt ?? 0) > 0));
   return { exists: Number(row?.cnt ?? 0) > 0 };
 }
 

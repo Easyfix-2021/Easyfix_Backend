@@ -27,6 +27,7 @@ const fcmService = require('./fcm.service');
  * whatever was gathered (possibly []).
  */
 async function resolveTokens(efrId) {
+  logger.info('Resolving FCM tokens for offer push · efrId=' + efrId);
   const tokens = new Set();
 
   // 1) Canonical: tbl_easyfixer_app.device_id (one row per technician).
@@ -58,6 +59,7 @@ async function resolveTokens(efrId) {
     logger.warn({ efrId, err: e.message }, 'job-offer-push: device_info token lookup failed');
   }
 
+  logger.info('Resolved ' + tokens.size + ' device tokens · efrId=' + efrId);
   return Array.from(tokens);
 }
 
@@ -68,6 +70,7 @@ async function resolveTokens(efrId) {
  */
 async function pruneDeadToken(efrId, token) {
   if (!efrId || !token) return;
+  logger.info('Pruning dead FCM token · efrId=' + efrId);
   try {
     await pool.query(
       "UPDATE device_info SET fire_base_token = NULL, is_logged_in = '0' WHERE user_id = ? AND fire_base_token = ?",
@@ -90,6 +93,7 @@ async function pruneDeadToken(efrId, token) {
  */
 async function sendJobOfferPush(efrId, { jobId } = {}) {
   try {
+    logger.info('Sending job-offer push · efrId=' + efrId + ' · jobId=' + jobId);
     if (!efrId) return { delivered: false, reason: 'no efrId' };
 
     const tokens = await resolveTokens(efrId);
@@ -115,6 +119,7 @@ async function sendJobOfferPush(efrId, { jobId } = {}) {
 
     const deliveredCount = results.filter((r) => r && r.delivered).length;
     logger.push(`job-offer · efr=${efrId} · job=${jobId} · ${deliveredCount}/${tokens.length} devices`);
+    logger.info('Job-offer push delivered to ' + deliveredCount + '/' + tokens.length + ' devices · jobId=' + jobId);
     return { delivered: deliveredCount > 0, deliveredCount, tokenCount: tokens.length };
   } catch (e) {
     // Absolute backstop — called best-effort from assign() and must never throw.

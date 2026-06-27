@@ -3,6 +3,7 @@ const router = require('express').Router();
 // In-app inbox sub-routes (list, mark-read, count, templates)
 router.use(require('./notifications-inbox'));
 
+const logger = require('../../logger');
 const validate = require('../../middleware/validate');
 const sms = require('../../services/sms.service');
 const email = require('../../services/email.service');
@@ -26,6 +27,7 @@ const { testBody } = require('../../validators/notification.validator');
 router.post('/test', validate(testBody), async (req, res, next) => {
   try {
     const { channel, to } = req.body;
+    logger.info('Test outbound notification · channel=' + channel);
     let result;
     switch (channel) {
       case 'sms':
@@ -60,8 +62,10 @@ router.post('/test', validate(testBody), async (req, res, next) => {
         });
         break;
       default:
+        logger.warn('Test notification rejected · unknown channel=' + channel);
         return modernError(res, 400, `unknown channel "${channel}"`);
     }
+    logger.info('Test notification dispatched · channel=' + channel);
     modernOk(res, { channel, ...result });
   } catch (e) { next(e); }
 });
@@ -88,10 +92,12 @@ router.post('/bulk-sms', validate(Joi.object({
   // `mobileNumbers` instead — admin must supply the list explicitly.
   try {
     const numbers = req.body.mobileNumbers;
+    logger.info('Bulk SMS blast · recipients=' + numbers.length);
     const results = await Promise.all(numbers.map((n) => sms.send({ to: n, message: req.body.message })
       .then((r) => ({ to: n, delivered: !!r.delivered, error: r.error || null }))
       .catch((err) => ({ to: n, delivered: false, error: err.message }))));
     const deliveredCount = results.filter((r) => r.delivered).length;
+    logger.info('Bulk SMS complete · delivered=' + deliveredCount + ' failed=' + (results.length - deliveredCount) + ' of ' + results.length);
     modernOk(res, {
       total: results.length,
       deliveredCount,
@@ -111,6 +117,7 @@ router.post('/bulk-sms', validate(Joi.object({
 // ota_yes, cx_revisit_yes, eta_sent_clone_clone, pm_txreschedule,
 // cancel_order, cx_revisit_no, qa_cx_order_confirm.
 router.get('/whatsapp-templates', (_req, res) => {
+  logger.info('List WhatsApp lifecycle templates');
   modernOk(res, [
     { event: 'job.assigned',          templateName: 'accepted_on_app',        recipient: 'client' },
     { event: 'job.accepted_by_tech',  templateName: 'tx_accepted_client',     recipient: 'client' },

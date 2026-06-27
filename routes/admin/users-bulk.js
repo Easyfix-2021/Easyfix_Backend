@@ -9,6 +9,7 @@ const { pool } = require('../../db');
 const userService = require('../../services/user.service');
 const roleService = require('../../services/role.service');
 const { modernOk, modernError } = require('../../utils/response');
+const logger = require('../../logger');
 
 /*
  * Bulk-update sub-router for Manage Users. Three endpoints:
@@ -61,6 +62,7 @@ const upload = multer({
  */
 router.get('/bulk-lookups', async (req, res, next) => {
   try {
+    logger.info('Fetch bulk-update lookups');
     const [verticals, clients, states, cities, users, roles] = await Promise.all([
       pool.query(
         `SELECT vertical_id AS id, vertical_name AS name
@@ -136,6 +138,7 @@ router.get('/bulk-lookups', async (req, res, next) => {
         (row) => roleService.ROLE_ID_TO_GROUP[row.id] === 'admin'
       )),
     ]);
+    logger.info('Returning bulk-update lookups · verticals=' + verticals.length + ' clients=' + clients.length + ' states=' + states.length + ' cities=' + cities.length + ' users=' + users.length + ' roles=' + roles.length);
     modernOk(res, { verticals, clients, states, cities, users, roles });
   } catch (e) { next(e); }
 });
@@ -163,6 +166,7 @@ router.get('/bulk-lookups', async (req, res, next) => {
  */
 router.get('/bulk-upload-template', async (req, res, next) => {
   try {
+    logger.info('Build bulk-upload template · userIds=' + (req.query.userIds || ''));
     const wb = new ExcelJS.Workbook();
     wb.creator = 'EasyFix';
     wb.created = new Date();
@@ -202,6 +206,7 @@ router.get('/bulk-upload-template', async (req, res, next) => {
           ORDER BY u.user_id ASC`,
         userIds,
       );
+      logger.info('Found ' + rows.length + ' users to pre-populate template');
 
       // Decode scope CSVs from id-CSV → name-CSV for display. Loads
       // master maps once; "0" stays as the "All" sentinel.
@@ -585,6 +590,7 @@ router.get('/bulk-upload-template', async (req, res, next) => {
     }
 
     const buf = await wb.xlsx.writeBuffer();
+    logger.info('Returning bulk-upload template xlsx · bytes=' + buf.byteLength);
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', 'attachment; filename="easyfix-users-bulk-update-template.xlsx"');
     res.setHeader('Cache-Control', 'no-store');
@@ -613,6 +619,7 @@ router.post('/bulk-upload',
     try {
       if (!req.file) return modernError(res, 400, 'missing "file" upload');
       const dryRun = String(req.query.dryRun || '').toLowerCase() === 'true';
+      logger.info('Bulk-upload users · file=' + req.file.originalname + ' dryRun=' + dryRun);
 
       const wb = new ExcelJS.Workbook();
       // .csv and .xlsx are read via different methods on exceljs.
@@ -628,6 +635,7 @@ router.post('/bulk-upload',
           await wb.xlsx.load(buf);
         }
       } catch (parseErr) {
+        logger.warn('Bulk-upload parse failed · ' + parseErr.message);
         return modernError(res, 400, `could not parse upload: ${parseErr.message}`);
       }
       const ws = wb.worksheets[0];
@@ -695,6 +703,7 @@ router.post('/bulk-upload',
 
       // Row 1 is header — iterate from row 2.
       const lastRow = ws.actualRowCount || ws.rowCount;
+      logger.info('Processing bulk-upload rows · dataRows=' + Math.max(0, lastRow - 1));
       for (let rIdx = 2; rIdx <= lastRow; rIdx++) {
         const row = ws.getRow(rIdx);
         // Cell values come back as the raw type — number for user_id,
@@ -787,6 +796,7 @@ router.post('/bulk-upload',
         }
       }
 
+      logger.info('Bulk-upload complete · dryRun=' + dryRun + ' updated=' + updated + ' unchanged=' + unchanged + ' failed=' + failed + ' skipped=' + skipCount);
       modernOk(res, {
         summary: { updated, unchanged, failed, skipCount, dryRun },
         results,

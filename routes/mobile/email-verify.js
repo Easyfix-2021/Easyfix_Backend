@@ -17,6 +17,7 @@ const router = require('express').Router();
 const Joi = require('joi');
 
 const validate = require('../../middleware/validate');
+const logger = require('../../logger');
 const { modernOk } = require('../../utils/response');
 const emailVerify = require('../../services/mobile-email-verify.service');
 
@@ -26,7 +27,9 @@ router.get(
   validate(Joi.object({ email: Joi.string().trim().email().max(255).required() }), 'query'),
   async (req, res, next) => {
     try {
+      logger.info('Check email collision against other technicians');
       const result = await emailVerify.checkEmailExists(req.tech.efr_id, req.query.email);
+      logger.info('Email collision check · exists=' + (result && result.exists));
       modernOk(res, result);
     } catch (e) { next(e); }
   },
@@ -41,7 +44,9 @@ router.post(
       // Origin is the fallback base for the public link when PUBLIC_API_BASE_URL
       // is unset — protocol + host of the inbound request.
       const origin = `${req.protocol}://${req.get('host')}`;
+      logger.info('Send email verification link');
       const result = await emailVerify.sendVerification(req.tech.efr_id, req.body.email, { origin });
+      logger.info('Email verification link sent · sent=' + (result && result.sent));
       modernOk(res, result);
     } catch (e) { next(e); }
   },
@@ -50,7 +55,9 @@ router.post(
 // GET /status — current is_email_verified flag for the authed technician.
 router.get('/status', async (req, res, next) => {
   try {
+    logger.info('Poll email verification status');
     const result = await emailVerify.getStatus(req.tech.efr_id);
+    logger.info('Email verification status · verified=' + (result && result.verified));
     modernOk(res, result);
   } catch (e) { next(e); }
 });

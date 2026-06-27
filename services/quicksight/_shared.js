@@ -14,6 +14,8 @@
  * by buildInFilter pushing every value onto the caller's `params` array.
  */
 
+const logger = require('../../logger');
+
 /*
  * ── buildInFilter(col, values, params) ──────────────────────────────
  *
@@ -33,6 +35,7 @@
  */
 function buildInFilter(col, values, params) {
   if (!Array.isArray(values) || values.length === 0) return '';
+  logger.info('QuickSight IN-filter applied · col=' + col + ' · values=' + values.length);
   const placeholders = values.map(() => '?').join(',');
   for (const v of values) params.push(v);
   return ` AND ${col} IN (${placeholders})`;
@@ -101,6 +104,7 @@ function computeLastThreeWeeks() {
     const start = addDays(end, -6);
     weeks.push({ start: fmt(start), end: fmt(end) });
   }
+  logger.info('Computed last 3 weeks · ' + weeks.map((w) => w.start + '..' + w.end).join(', '));
   return weeks;
 }
 
@@ -136,6 +140,7 @@ function computeLastThreeMonths() {
     }
     months.push({ start: fmt(start), end: fmt(end) });
   }
+  logger.info('Computed last 3 months · ' + months.map((m2) => m2.start + '..' + m2.end).join(', '));
   return months;
 }
 

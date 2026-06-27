@@ -61,6 +61,7 @@ function unavailableError() {
  * (the FE shows a stale-link badge in that case).
  */
 async function listForClient(clientId) {
+  logger.info('List client documents · clientId=' + clientId);
   if (!(await hasTable())) throw unavailableError();
   const [rows] = await pool.query(
     `SELECT document_id, client_id, doc_type, doc_label, s3_key,
@@ -70,10 +71,12 @@ async function listForClient(clientId) {
       ORDER BY uploaded_at DESC`,
     [clientId],
   );
+  logger.info('Found ' + rows.length + ' client documents · clientId=' + clientId);
   const withUrls = await Promise.all(rows.map(async (r) => ({
     ...r,
     url: await s3.resolveClientDocumentUrl(r.s3_key).catch(() => null),
   })));
+  logger.info('Returning ' + withUrls.length + ' client documents · clientId=' + clientId);
   return withUrls;
 }
 
@@ -87,6 +90,7 @@ async function listForClient(clientId) {
 async function recordUpload(clientId, {
   docType, docLabel, s3Key, originalFilename, contentType, uploadedBy,
 }) {
+  logger.info('Record client document upload · clientId=' + clientId + ' docType=' + (docType || 'other') + ' contentType=' + (contentType || '-'));
   if (!(await hasTable())) throw unavailableError();
   const [ins] = await pool.query(
     `INSERT INTO tbl_client_document
@@ -102,15 +106,18 @@ async function recordUpload(clientId, {
       uploadedBy ?? null,
     ],
   );
+  logger.info('Client document recorded · id=' + ins.insertId + ' clientId=' + clientId);
   return ins.insertId;
 }
 
 async function softDelete(documentId) {
+  logger.info('Soft-delete client document · id=' + documentId);
   if (!(await hasTable())) throw unavailableError();
   const [r] = await pool.query(
     'UPDATE tbl_client_document SET is_deleted = 1 WHERE document_id = ?',
     [documentId],
   );
+  logger.info('Client document deleted · id=' + documentId + ' affected=' + r.affectedRows);
   return r.affectedRows;
 }
 

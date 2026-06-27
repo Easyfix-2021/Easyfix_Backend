@@ -4,6 +4,7 @@ const Joi = require('joi');
 const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
 const validate = require('../../middleware/validate');
+const logger = require('../../logger');
 
 /*
  * Customer cancel / reschedule request ops inbox.
@@ -31,6 +32,7 @@ const inboxQuery = Joi.object({
 router.get('/', validate(inboxQuery, 'query'), async (req, res, next) => {
   try {
     const { status, limit, offset } = req.query;
+    logger.info('List customer cancel/reschedule requests · status=' + status + ' limit=' + limit + ' offset=' + offset);
 
     const [[{ total }]] = await pool.query(
       'SELECT COUNT(*) AS total FROM tbl_job_customer_request WHERE request_status = ?',
@@ -52,6 +54,7 @@ router.get('/', validate(inboxQuery, 'query'), async (req, res, next) => {
       [status, limit, offset],
     );
 
+    logger.info('Returning ' + items.length + ' customer requests · total=' + total);
     modernOk(res, { items, total });
   } catch (e) { next(e); }
 });
@@ -66,13 +69,16 @@ const patchBody = Joi.object({
 
 router.patch('/:id', validate(idParam, 'params'), validate(patchBody), async (req, res, next) => {
   try {
+    logger.info('Update customer request status · id=' + Number(req.params.id) + ' request_status=' + req.body.request_status);
     const [result] = await pool.query(
       'UPDATE tbl_job_customer_request SET request_status = ? WHERE request_id = ?',
       [req.body.request_status, Number(req.params.id)],
     );
     if (!result || result.affectedRows === 0) {
+      logger.warn('Customer request not found · id=' + Number(req.params.id));
       return modernError(res, 404, 'Customer request not found');
     }
+    logger.info('Customer request updated · id=' + Number(req.params.id) + ' request_status=' + req.body.request_status);
     modernOk(res, { updated: true });
   } catch (e) { next(e); }
 });

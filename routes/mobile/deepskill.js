@@ -2,6 +2,7 @@ const router = require('express').Router();
 const Joi = require('joi');
 
 const validate = require('../../middleware/validate');
+const logger = require('../../logger');
 const { modernOk, modernError } = require('../../utils/response');
 const deepSkillMobile = require('../../services/mobile-deepskill.service');
 
@@ -28,13 +29,18 @@ router.get(
   }), 'params'),
   async (req, res, next) => {
     try {
+      logger.info('Load deep-skill hierarchy · categoryId=' + req.params.categoryId);
       const data = await deepSkillMobile.getHierarchy(
         req.tech.efr_id,
         Number(req.params.categoryId),
       );
+      logger.info('Returning deep-skill hierarchy · categoryId=' + req.params.categoryId);
       modernOk(res, data);
     } catch (e) {
-      if (e.status) return modernError(res, e.status, e.message);
+      if (e.status) {
+        logger.warn('Load deep-skill hierarchy failed · ' + e.message);
+        return modernError(res, e.status, e.message);
+      }
       next(e);
     }
   },
@@ -58,10 +64,15 @@ router.post(
   })),
   async (req, res, next) => {
     try {
+      logger.info('Apply deep-skill selections · categoryId=' + req.body.categoryId + ' · serviceTypes=' + (Array.isArray(req.body.serviceTypes) ? req.body.serviceTypes.length : 0));
       const result = await deepSkillMobile.applySkills(req.tech.efr_id, req.body);
+      logger.info('Deep-skill selections applied · categoryId=' + req.body.categoryId);
       modernOk(res, result);
     } catch (e) {
-      if (e.status) return modernError(res, e.status, e.message);
+      if (e.status) {
+        logger.warn('Apply deep-skill selections failed · ' + e.message);
+        return modernError(res, e.status, e.message);
+      }
       next(e);
     }
   },

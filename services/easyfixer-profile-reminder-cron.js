@@ -36,6 +36,7 @@ const profileUpdateLink = require('./easyfixer-profile-update-link.service');
 const TEMPLATE_NAME = 'tx_complete_profile';
 
 async function runDailyReminder() {
+  logger.info('Run daily profile-completion reminder · template=' + TEMPLATE_NAME);
   // Find every active easyfixer with an incomplete profile + a
   // usable mobile. Curated projection — we only need id / name /
   // mobile for the send loop; rest of the row is ignored.
@@ -67,6 +68,8 @@ async function runDailyReminder() {
             OR profile_update_sent_at < NOW() - INTERVAL 7 DAY)
   `);
 
+  logger.info('Found ' + rows.length + ' eligible easyfixers for reminder');
+
   const summary = {
     eligible: rows.length,
     attempted: 0,
@@ -96,6 +99,8 @@ async function runDailyReminder() {
     }
   }
 
+  logger.info('Daily reminder done · eligible=' + summary.eligible + ' · attempted=' + summary.attempted + ' · succeeded=' + summary.succeeded + ' · failed=' + summary.failed + ' · skipped=' + summary.skipped);
+
   return summary;
 }
 
@@ -121,9 +126,11 @@ async function runDailyReminder() {
  * "Last Run" panel.
  */
 async function runTest({ mobile, sourceId } = {}) {
+  logger.info('Run profile-reminder TEST · sourceId=' + (sourceId != null && String(sourceId).trim() !== '' ? sourceId : 'none'));
   const phone = String(mobile || '').trim();
   const cleaned = phone.replace(/\D/g, '');
   if (!(cleaned.length === 10 || (cleaned.length === 12 && cleaned.startsWith('91')))) {
+    logger.warn('Profile-reminder TEST rejected · invalid test mobile');
     throw Object.assign(new Error('Mobile must be a valid 10-digit Indian number.'), {
       status: 400, code: 'INVALID_TEST_MOBILE',
     });
@@ -135,6 +142,7 @@ async function runTest({ mobile, sourceId } = {}) {
   if (sourceId != null && String(sourceId).trim() !== '') {
     const efrId = Number(String(sourceId).trim());
     if (!Number.isInteger(efrId) || efrId <= 0) {
+      logger.warn('Profile-reminder TEST rejected · invalid sourceId=' + sourceId);
       throw Object.assign(new Error('Easyfixer ID must be a positive integer.'), {
         status: 400, code: 'INVALID_SOURCE_ID',
       });
@@ -149,6 +157,7 @@ async function runTest({ mobile, sourceId } = {}) {
       [efrId],
     );
     if (rows.length === 0) {
+      logger.warn('Profile-reminder TEST rejected · no easyfixer found · efrId=' + efrId);
       throw Object.assign(new Error(`No easyfixer found with id ${efrId}.`), {
         status: 404, code: 'EASYFIXER_NOT_FOUND',
       });

@@ -73,6 +73,7 @@ async function pincodeIdToActiveEfrCount(pincodeIds) {
  *   efr_id, efr_name, efr_no, zone_name, city_name
  */
 async function listTechniciansForPincode(pincodeId, { q = '', limit = 20, offset = 0 } = {}) {
+  logger.info('Listing technicians for pincode · pincodeId=' + pincodeId + ' q=' + (q || '') + ' limit=' + limit + ' offset=' + offset);
   limit  = Math.min(Math.max(Number(limit)  || 20, 1), 200);
   offset = Math.max(Number(offset) || 0, 0);
 
@@ -139,6 +140,7 @@ async function listTechniciansForPincode(pincodeId, { q = '', limit = 20, offset
     zone_name: r.zone_name ?? null,
   }));
 
+  logger.info('Returning ' + items.length + ' technicians · total=' + (Number(total) || 0));
   return { items, total: Number(total) || 0 };
 }
 
@@ -179,6 +181,7 @@ function deriveStatus(activeEfrCount) {
 
 // ─── List with filters + computed status ─────────────────────────────
 async function listPincodes({ q, status, cityId, includeInactive = false, limit = 100, offset = 0, sortBy, sortDir = 'asc' } = {}) {
+  logger.info('Listing pincodes · q=' + (q || '') + ' status=' + (status || '') + ' cityId=' + (cityId || '') + ' includeInactive=' + includeInactive + ' limit=' + limit + ' offset=' + offset);
   // Cap limit defensively. Bumped from 500 → 200000 to support the CRM
   // verification page's "load-all" dropdown (~155k rows post-seed). The
   // query is indexed on `pincode` (PK) and runs sub-second; pagination
@@ -300,10 +303,12 @@ async function listPincodes({ q, status, cityId, includeInactive = false, limit 
     ? items.filter((it) => it.status === String(status).toUpperCase())
     : items;
 
+  logger.info('Returning ' + filtered.length + ' pincodes · total=' + total);
   return { items: filtered, total };
 }
 
 async function getPincodeById(pincodeId) {
+  logger.info('Fetching pincode by id · pincodeId=' + pincodeId);
   const [[row]] = await pool.query(
     `SELECT p.pincode_id, p.pincode, p.location, p.city_id, c.city_name,
             COALESCE(p.district, c.district) AS district, s.state_name,
@@ -316,7 +321,7 @@ async function getPincodeById(pincodeId) {
       LIMIT 1`,
     [pincodeId]
   );
-  if (!row) return null;
+  if (!row) { logger.warn('Pincode not found · pincodeId=' + pincodeId); return null; }
   const activeMap = await pincodeIdToActiveEfrCount([Number(row.pincode_id)]);
   const zoneMap   = await pincodeIdToZoneCount([Number(row.pincode_id)]);
   const activeCount = activeMap.get(Number(row.pincode_id)) || 0;
@@ -369,6 +374,7 @@ async function getPincodeById(pincodeId) {
  * so the FE can toast the unmatched codes.
  */
 async function lookupManyByCode(pincodes) {
+  logger.info('Bulk pincode lookup by code · input=' + (Array.isArray(pincodes) ? pincodes.length : 0));
   if (!Array.isArray(pincodes) || pincodes.length === 0) {
     return { items: [], notFound: [] };
   }
@@ -391,6 +397,7 @@ async function lookupManyByCode(pincodes) {
 
   const foundSet = new Set(items.map((i) => String(i.pincode)));
   const notFound = clean.filter((p) => !foundSet.has(p));
+  logger.info('Bulk lookup matched ' + items.length + ' pincodes · notFound=' + notFound.length);
   return { items, notFound };
 }
 
@@ -475,12 +482,14 @@ async function findOrCreateCityByName(cityName, stateId, { district = null } = {
 async function createPincode(
   { pincode, location, city_id, district, lat, lng, newCity, zoneIds, is_active = true }, { userId = null } = {}
 ) {
+  logger.info('Creating pincode · pincode=' + pincode + ' city_id=' + (city_id || '') + ' is_active=' + is_active);
   if (!/^\d{6}$/.test(String(pincode))) throw badReq('Pincode must be exactly 6 digits');
 
   const [[existing]] = await pool.query(
     'SELECT pincode_id FROM tbl_pincode WHERE pincode = ? LIMIT 1', [String(pincode)]
   );
   if (existing) {
+    logger.warn('Create pincode rejected — already exists · pincode=' + pincode);
     const err = new Error(`Pincode ${pincode} already exists`);
     err.status = 409;
     throw err;
@@ -515,6 +524,7 @@ async function createPincode(
     [String(pincode), location || null, resolvedCityId, district || null, latN, lngN, statusVal, userId, userId]
   );
   const pincodeId = result.insertId;
+  logger.info('Pincode created · id=' + pincodeId + ' pincode=' + pincode);
 
   // Map the chosen suggested zones (optional). Reuses the validated junction
   // writer (its own txn); a zone-map hiccup leaves the pincode created.
@@ -550,11 +560,13 @@ async function createPincode(
  */
 async function ensurePincode(pincodeRaw, { userId = null } = {}) {
   const pin = String(pincodeRaw || '').trim();
+  logger.info('Ensuring pincode · pincode=' + pin);
   if (!/^\d{6}$/.test(pin)) throw badReq('Pincode must be exactly 6 digits');
 
   // ── Dedup-first: existing row → created:false, no geocode/write ──
   const existing = await getPincodeByValue(pin);
   if (existing) {
+    logger.info('Pincode already exists · id=' + existing.pincode_id + ' pincode=' + pin);
     return {
       pincode_id: existing.pincode_id,
       pincode:    existing.pincode,
@@ -585,6 +597,7 @@ async function ensurePincode(pincodeRaw, { userId = null } = {}) {
     };
   }
   if (!match.geocoded) {
+    logger.warn('Ensure pincode failed — not geocodable · pincode=' + pin);
     throw badReq(`Pincode ${pin} is not a valid Indian pincode (could not be located)`);
   }
   // India-only: accept ISO short_code 'IN' or a long_name containing "india".
@@ -592,6 +605,7 @@ async function ensurePincode(pincodeRaw, { userId = null } = {}) {
   const name = String(match.country || '').trim().toLowerCase();
   const isIndia = code === 'IN' || name.includes('india');
   if (!isIndia) {
+    logger.warn('Ensure pincode rejected — non-India result · pincode=' + pin + ' country_code=' + (code || '-'));
     throw badReq(`Pincode ${pin} is not a valid Indian pincode`);
   }
 
@@ -621,6 +635,7 @@ async function ensurePincode(pincodeRaw, { userId = null } = {}) {
     { userId },
   );
 
+  logger.info('Pincode ensured (created) · id=' + detail.pincode_id + ' pincode=' + pin);
   return {
     pincode_id: detail.pincode_id,
     pincode:    detail.pincode,
@@ -645,6 +660,7 @@ async function ensurePincode(pincodeRaw, { userId = null } = {}) {
  * Returns { serviceableCount, total } reflecting post-recompute state.
  */
 async function recomputeServiceableStatus({ userId = null } = {}) {
+  logger.info('Recomputing serviceable pincode status');
   void userId;
   const conn = await pool.getConnection();
   try {
@@ -709,6 +725,7 @@ async function ensureCoordsForPincode({ pincode, lat, lng } = {}) {
 }
 
 async function updatePincode(pincodeId, fields, { userId = null } = {}) {
+  logger.info('Updating pincode · pincodeId=' + pincodeId + ' fields=' + Object.keys(fields || {}).join(','));
   // Whitelist of mutable fields. `pincode` is intentionally excluded — the
   // value is the user-meaningful key; changing it would orphan downstream
   // job rows that reference it. Delete + re-add is the explicit path.
@@ -727,7 +744,8 @@ async function updatePincode(pincodeId, fields, { userId = null } = {}) {
     `UPDATE tbl_pincode SET ${sets.join(', ')} WHERE pincode_id = ?`,
     [...params, pincodeId]
   );
-  if (!result.affectedRows) return null;
+  if (!result.affectedRows) { logger.warn('Update pincode no-op — row not found · pincodeId=' + pincodeId); return null; }
+  logger.info('Pincode updated · id=' + pincodeId);
 
   const updated = await getPincodeById(pincodeId);
   // Lazy geocode-on-edit (see ensureCoordsForPincode): fill coords if missing.
@@ -745,10 +763,13 @@ async function updatePincode(pincodeId, fields, { userId = null } = {}) {
  * lists while preserving join integrity.
  */
 async function deletePincode(pincodeId, { userId = null } = {}) {
+  logger.info('Soft-deleting pincode · pincodeId=' + pincodeId);
   const [result] = await pool.query(
     'UPDATE tbl_pincode SET pincode_status = 0, updated_by = ? WHERE pincode_id = ?',
     [userId, pincodeId]
   );
+  if (result.affectedRows > 0) logger.info('Pincode deactivated · id=' + pincodeId);
+  else logger.warn('Delete pincode no-op — row not found · pincodeId=' + pincodeId);
   return result.affectedRows > 0;
 }
 
@@ -765,6 +786,7 @@ async function deletePincode(pincodeId, { userId = null } = {}) {
  */
 async function setZonesForPincode(pincodeId, zoneIds, { userId = null } = {}) {
   const ids = Array.from(new Set((zoneIds || []).map(Number).filter(Number.isFinite)));
+  logger.info('Setting zones for pincode · pincodeId=' + pincodeId + ' zoneCount=' + ids.length);
 
   const conn = await pool.getConnection();
   try {
@@ -820,6 +842,7 @@ async function setZonesForPincode(pincodeId, zoneIds, { userId = null } = {}) {
     }
 
     await conn.commit();
+    logger.info('Pincode zones updated · pincodeId=' + pincodeId + ' accepted=' + acceptable.length + ' rejected=' + rejected.length);
     const detail = await getPincodeById(pincodeId);
     // Lazy geocode-on-edit: mapping zones is also an edit — fill coords if
     // missing. Runs AFTER commit on the pool (not the txn conn). Wrapped so a
@@ -853,6 +876,7 @@ async function setZonesForPincode(pincodeId, zoneIds, { userId = null } = {}) {
  */
 async function geocodeAndMatch(pincodeRaw) {
   const pin = String(pincodeRaw || '').trim();
+  logger.info('Geocoding + matching pincode · pincode=' + pin);
   if (!/^\d{6}$/.test(pin)) throw badReq('Pincode must be exactly 6 digits');
 
   const [[dup]] = await pool.query(
@@ -887,6 +911,7 @@ async function geocodeAndMatch(pincodeRaw) {
     if (crow) matchedCity = { city_id: Number(crow.city_id), city_name: crow.city_name, state_id: Number(crow.state_id) };
   }
 
+  logger.info('Pincode geocode-match done · pincode=' + pin + ' geocoded=' + (!!detail?.geocoded) + ' duplicate=' + (!!dup) + ' stateMatched=' + (!!matchedState) + ' cityMatched=' + (!!matchedCity));
   return {
     pincode: pin,
     duplicate: dup ? {
@@ -929,6 +954,7 @@ async function geocodeAndMatch(pincodeRaw) {
  * distance run in JS (zone set is CRM-managed and small).
  */
 async function suggestZonesForLocation({ cityId = null, lat = null, lng = null, limit = 3 } = {}) {
+  logger.info('Suggesting zones for location · cityId=' + (cityId || '') + ' hasPoint=' + (lat != null && lng != null) + ' limit=' + limit);
   const n = Math.min(Math.max(Number(limit) || 3, 1), 10);
   const point = (lat != null && lat !== '' && lng != null && lng !== '')
     ? { lat: Number(lat), lng: Number(lng) } : null;
@@ -999,6 +1025,7 @@ async function suggestZonesForLocation({ cityId = null, lat = null, lng = null, 
       ranked.push({ zone_id: Number(r.zone_id), zone_name: r.zone_name, reason: 'random', distance_km: null });
     }
   }
+  logger.info('Returning ' + ranked.length + ' suggested zones');
   return ranked;
 }
 

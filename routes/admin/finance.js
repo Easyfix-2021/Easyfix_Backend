@@ -3,6 +3,7 @@ const Joi = require('joi');
 const validate = require('../../middleware/validate');
 const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
+const logger = require('../../logger');
 const { sendXlsx } = require('../../utils/xlsx-export');
 const { renderInvoicePdf } = require('../../utils/pdf-invoice');
 const archiver = require('archiver');
@@ -52,6 +53,7 @@ async function assertEfrInScope(req, efrId) {
 // Shared helper: load the invoice + client + flat line items used by
 // both /excel and /pdf. Keeps the two endpoints in lock-step.
 async function loadInvoiceArtifactData(invoiceId) {
+  logger.info('Load invoice artifact data · invoiceId=' + invoiceId);
   const [[inv]] = await pool.query(
     `SELECT id, fk_client_id, invoice_number, invoice_date,
             billing_from_date, billing_to_date, total_invoice_amount,
@@ -154,6 +156,7 @@ async function loadInvoiceArtifactData(invoiceId) {
     }
   }
 
+  logger.info('Invoice artifact built · invoiceId=' + invoiceId + ' jobs=' + jobs.length + ' lines=' + lines.length);
   return { inv, client: client || { client_name: '—' }, lines };
 }
 
@@ -161,6 +164,7 @@ async function loadInvoiceArtifactData(invoiceId) {
 router.get('/invoices', async (req, res, next) => {
   try {
     const { clientId, isPaid, from, to } = req.query;
+    logger.info('List invoices · clientId=' + (clientId ?? 'all') + ' isPaid=' + (isPaid ?? 'all') + ' from=' + (from || '') + ' to=' + (to || ''));
     const clauses = [], params = [];
     // RBAC: limit visible invoices to the caller's manage_clients scope.
     const scope = buildRequestScope(req);
@@ -186,14 +190,17 @@ router.get('/invoices', async (req, res, next) => {
               total_paid_amount, is_paid, is_raised, amount_due_date, file_path_pdf
          FROM tbl_client_invoice ${where} ORDER BY id DESC LIMIT ? OFFSET ?`,
       params);
+    logger.info('Found ' + rows.length + ' invoices');
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
 
 router.get('/invoices/:id', scopedInvoice, async (req, res, next) => {
   try {
+    logger.info('Get invoice · id=' + req.params.id);
     const [[full]] = await pool.query('SELECT * FROM tbl_client_invoice WHERE id = ?', [req.params.id]);
     const [payments] = await pool.query('SELECT * FROM tbl_client_invoice_paid WHERE fk_invoice_id = ?', [req.params.id]);
+    logger.info('Found ' + payments.length + ' payments for invoice · id=' + req.params.id);
     modernOk(res, { ...full, payments });
   } catch (e) { next(e); }
 });
@@ -204,6 +211,7 @@ router.post('/invoices/generate', validate(Joi.object({
 })), async (req, res, next) => {
   try {
     const { clientId, from, to } = req.body;
+    logger.info('Generate invoice · clientId=' + clientId + ' from=' + from + ' to=' + to);
     // RBAC: caller can only generate invoices for clients in their scope.
     const guard = assertEntityInScope(req, { client_id: clientId });
     if (!guard.ok) return modernError(res, 403, 'client outside your scope');
@@ -223,6 +231,7 @@ router.post('/invoices/generate', validate(Joi.object({
        VALUES (?, ?, ?, ?, ?, 0, 1, 0, NOW())`,
       [clientId, from, to, sum.total, sum.total]);
     res.status(201);
+    logger.info('Invoice generated · id=' + ins.insertId + ' clientId=' + clientId + ' jobCount=' + sum.jobCount);
     modernOk(res, { invoiceId: ins.insertId, jobCount: sum.jobCount, totalAmount: sum.total }, 'invoice generated');
   } catch (e) { next(e); }
 });
@@ -244,6 +253,7 @@ router.post('/invoices/:id/payment', validate(Joi.object({
 })), scopedInvoice, async (req, res, next) => {
   try {
     const invId = Number(req.params.id);
+    logger.info('Record invoice payment · invoiceId=' + invId + ' amount=' + req.body.amount);
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();
@@ -279,6 +289,7 @@ router.post('/invoices/:id/payment', validate(Joi.object({
         [newPaid, newTds, fullyPaid, invId]
       );
       await conn.commit();
+      logger.info('Invoice payment recorded · invoiceId=' + invId + ' totalPaid=' + newPaid + ' isPaid=' + !!fullyPaid);
       modernOk(res, {
         recorded: true,
         totalPaid: newPaid,
@@ -298,6 +309,7 @@ router.patch('/invoices/:id/status', validate(Joi.object({
   comments: Joi.string().max(500).optional(),
 }).min(1)), scopedInvoice, async (req, res, next) => {
   try {
+    logger.info('Update invoice status · id=' + req.params.id + ' isRaised=' + req.body.isRaised + ' isPaid=' + req.body.isPaid);
     const sets = [], vals = [];
     if (req.body.isRaised !== undefined) { sets.push('is_raised = ?'); vals.push(req.body.isRaised ? 1 : 0); }
     if (req.body.isPaid !== undefined)   { sets.push('is_paid = ?');   vals.push(req.body.isPaid ? 1 : 0); }
@@ -305,6 +317,7 @@ router.patch('/invoices/:id/status', validate(Joi.object({
     if (sets.length === 0) return modernError(res, 400, 'nothing to update');
     vals.push(req.params.id);
     await pool.query(`UPDATE tbl_client_invoice SET ${sets.join(', ')} WHERE id = ?`, vals);
+    logger.info('Invoice status updated · id=' + req.params.id);
     modernOk(res, { updated: true });
   } catch (e) { next(e); }
 });
@@ -332,6 +345,7 @@ router.patch('/invoices/:id/status', validate(Joi.object({
 // instead (legacy ops sometimes hand-picks which jobs go in).
 router.get('/invoices/:id/excel', scopedInvoice, async (req, res, next) => {
   try {
+    logger.info('Export invoice master sheet XLSX · id=' + req.params.id);
     const data = await loadInvoiceArtifactData(Number(req.params.id));
     if (!data) return modernError(res, 404, 'invoice not found');
     const { inv, lines } = data;
@@ -362,6 +376,7 @@ router.get('/invoices/:id/excel', scopedInvoice, async (req, res, next) => {
 // facing artifact (mirrors legacy `file_path_pdf` / `invoicePdf`).
 router.get('/invoices/:id/pdf', scopedInvoice, async (req, res, next) => {
   try {
+    logger.info('Render invoice PDF · id=' + req.params.id);
     const data = await loadInvoiceArtifactData(Number(req.params.id));
     if (!data) return modernError(res, 404, 'invoice not found');
     const { inv, client, lines } = data;
@@ -380,6 +395,7 @@ router.get('/invoices/:id/pdf', scopedInvoice, async (req, res, next) => {
 router.get('/invoices/zip', async (req, res, next) => {
   try {
     const { clientId, from, to } = req.query;
+    logger.info('Bulk zip invoices · clientId=' + (clientId ?? 'all') + ' from=' + (from || '') + ' to=' + (to || ''));
     const clauses = [], params = [];
     // RBAC: only zip invoices for clients in the caller's scope.
     const scope = buildRequestScope(req);
@@ -401,6 +417,7 @@ router.get('/invoices/zip', async (req, res, next) => {
       params
     );
     if (rows.length === 0) return modernError(res, 404, 'no invoices match');
+    logger.info('Zipping ' + rows.length + ' invoices');
 
     const ts = new Date().toISOString().slice(0, 10);
     res.setHeader('Content-Type', 'application/zip');
@@ -439,6 +456,7 @@ router.post('/email-statement', validate(Joi.object({
   ccOps: Joi.boolean().default(true),
 })), async (req, res, next) => {
   try {
+    logger.info('Email invoice statement · invoiceId=' + req.body.invoiceId + ' ccOps=' + req.body.ccOps);
     const data = await loadInvoiceArtifactData(Number(req.body.invoiceId));
     if (!data) return modernError(res, 404, 'invoice not found');
     const { inv, client, lines } = data;
@@ -456,6 +474,7 @@ router.post('/email-statement', validate(Joi.object({
       recipients = contacts.map((c) => c.contact_email);
     }
     if (recipients.length === 0) {
+      logger.warn('Email invoice statement — no recipients found · invoiceId=' + req.body.invoiceId);
       return modernError(res, 400, 'no recipients found for this client');
     }
 
@@ -490,6 +509,7 @@ router.post('/email-statement', validate(Joi.object({
         { filename: `invoice-${inv.invoice_number || inv.id}.pdf`, content: buf, contentType: 'application/pdf' },
       ],
     });
+    logger.info('Invoice statement emailed · invoiceId=' + (inv.id) + ' recipients=' + recipients.length);
     modernOk(res, { sent: true, recipients });
   } catch (e) { next(e); }
 });
@@ -506,6 +526,7 @@ router.post('/email-statement', validate(Joi.object({
 router.get('/efr-transactions', async (req, res, next) => {
   try {
     const { efrId, type, from, to } = req.query;
+    logger.info('List easyfixer transactions · efrId=' + (efrId ?? 'all') + ' type=' + (type ?? 'all') + ' from=' + (from || '') + ' to=' + (to || ''));
     const clauses = [], params = [];
     // RBAC city scope — filter rows by the easyfixer's city
     const scope = buildRequestScope(req);
@@ -535,6 +556,7 @@ router.get('/efr-transactions', async (req, res, next) => {
         LIMIT ?`,
       [...params, limit]
     );
+    logger.info('Found ' + rows.length + ' easyfixer transactions');
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
@@ -543,6 +565,7 @@ router.get('/efr-transactions', async (req, res, next) => {
 router.get('/transactions', async (req, res, next) => {
   try {
     const { clientId, jobId } = req.query;
+    logger.info('List client transactions · clientId=' + (clientId ?? 'all') + ' jobId=' + (jobId ?? 'all'));
     const clauses = [], params = [];
     // RBAC: filter by manage_clients
     const scope = buildRequestScope(req);
@@ -561,6 +584,7 @@ router.get('/transactions', async (req, res, next) => {
     params.push(limit);
     const [rows] = await pool.query(
       `SELECT * FROM tbl_client_transaction ${where} ORDER BY client_trans_id DESC LIMIT ?`, params);
+    logger.info('Found ' + rows.length + ' client transactions');
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
@@ -573,6 +597,7 @@ router.post('/transactions', validate(Joi.object({
   description: Joi.string().max(500).optional(),
 })), async (req, res, next) => {
   try {
+    logger.info('Create client transaction · clientId=' + req.body.clientId + ' type=' + req.body.transactionType + ' amount=' + req.body.amount);
     // RBAC: caller must have scope over the target client.
     const guard = assertEntityInScope(req, { client_id: req.body.clientId });
     if (!guard.ok) return modernError(res, 403, 'client outside your scope');
@@ -583,7 +608,7 @@ router.post('/transactions', validate(Joi.object({
       const [[lk]] = await conn.query(
         "SELECT GET_LOCK(CONCAT('client_ledger_', ?), 5) AS got",
         [req.body.clientId]);
-      if (lk.got !== 1) return modernError(res, 503, 'ledger busy, retry');
+      if (lk.got !== 1) { logger.warn('Client ledger busy · clientId=' + req.body.clientId); return modernError(res, 503, 'ledger busy, retry'); }
       await conn.beginTransaction();
       const [[prior]] = await conn.query(
         'SELECT balance FROM tbl_client_transaction WHERE client_id = ? ORDER BY client_trans_id DESC LIMIT 1',
@@ -595,6 +620,7 @@ router.post('/transactions', validate(Joi.object({
         [req.body.clientId, req.body.jobId || null, req.body.transactionType, req.body.amount, newBalance, req.body.description || null, req.user.user_id]);
       await conn.commit();
       res.status(201);
+      logger.info('Client transaction created · id=' + ins.insertId + ' clientId=' + req.body.clientId + ' newBalance=' + newBalance);
       modernOk(res, { transactionId: ins.insertId, newBalance });
     } catch (e) { await conn.rollback(); throw e; } finally {
       await conn.query("SELECT RELEASE_LOCK(CONCAT('client_ledger_', ?))", [req.body.clientId]);
@@ -607,6 +633,7 @@ router.post('/transactions', validate(Joi.object({
 router.get('/purchase-orders', async (req, res, next) => {
   try {
     const { clientId } = req.query;
+    logger.info('List purchase orders · clientId=' + (clientId ?? 'all'));
     const clauses = [], params = [];
     // RBAC: filter by manage_clients
     const scope = buildRequestScope(req);
@@ -623,6 +650,7 @@ router.get('/purchase-orders', async (req, res, next) => {
     const [rows] = await pool.query(
       `SELECT * FROM tbl_client_purchase_order_details ${where} ORDER BY inv_po_id DESC LIMIT 500`,
       params);
+    logger.info('Found ' + rows.length + ' purchase orders');
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
@@ -637,6 +665,7 @@ router.post('/purchase-orders', validate(Joi.object({
 })), async (req, res, next) => {
   try {
     const b = req.body || {};
+    logger.info('Create purchase order · clientId=' + b.clientId + ' poNumber=' + b.poNumber);
     // RBAC: caller must have scope over the target client.
     const guard = assertEntityInScope(req, { client_id: b.clientId });
     if (!guard.ok) return modernError(res, 403, 'client outside your scope');
@@ -646,6 +675,7 @@ router.post('/purchase-orders', validate(Joi.object({
        VALUES (?, ?, ?, ?, ?, ?, NOW())`,
       [b.clientId, b.poNumber, b.description || null, b.startDate, b.endDate, b.totalAmount]);
     res.status(201);
+    logger.info('Purchase order created · id=' + ins.insertId + ' clientId=' + b.clientId);
     modernOk(res, { poId: ins.insertId });
   } catch (e) { next(e); }
 });
@@ -653,6 +683,7 @@ router.post('/purchase-orders', validate(Joi.object({
 // ─── Easyfixer payout ledger ───────────────────────────────────────
 router.get('/easyfixer/:id/payout', async (req, res, next) => {
   try {
+    logger.info('Get easyfixer payout balance · id=' + req.params.id);
     const [[balance]] = await pool.query(
       'SELECT efr_id, efr_cityId, current_balance FROM tbl_easyfixer WHERE efr_id = ? AND NOT (tbl_easyfixer.efr_status <=> 3)',
       [req.params.id]
@@ -696,6 +727,7 @@ router.get('/easyfixer/:id/payout', async (req, res, next) => {
 router.get('/payouts', async (req, res, next) => {
   try {
     const { efrId, status } = req.query;
+    logger.info('List payouts · efrId=' + (efrId ?? 'all') + ' status=' + (status ?? 'all'));
     const clauses = [], params = [];
     // RBAC: filter by easyfixer's city
     const scope = buildRequestScope(req);
@@ -725,6 +757,7 @@ router.get('/payouts', async (req, res, next) => {
         LIMIT 500`,
       params
     );
+    logger.info('Found ' + rows.length + ' payouts');
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
@@ -747,6 +780,7 @@ router.get('/payouts/eligible', async (req, res, next) => {
   try {
     const cityList = String(req.query.cityList || '').trim();
     const payoutId = Number(req.query.payoutId || 0);
+    logger.info('List payout-eligible easyfixers · cityList=' + (cityList || 'all') + ' payoutId=' + payoutId);
     const [rows] = await pool.query(
       'CALL sp_ef_get_easyfixer_list_for_payout2(?, ?)',
       [cityList, payoutId]
@@ -754,6 +788,7 @@ router.get('/payouts/eligible', async (req, res, next) => {
     // mysql2 returns SP results as [resultSets[], okPacket]; the first
     // entry of resultSets is our row array.
     const data = Array.isArray(rows) && Array.isArray(rows[0]) ? rows[0] : [];
+    logger.info('Found ' + data.length + ' payout-eligible easyfixers');
     modernOk(res, data);
   } catch (e) { next(e); }
 });
@@ -769,6 +804,7 @@ router.post('/payouts', validate(Joi.object({
   pmRequestAmount: Joi.number().min(0).required(),
 })), async (req, res, next) => {
   try {
+    logger.info('Create payout · efrId=' + req.body.efrId + ' pmRequestAmount=' + req.body.pmRequestAmount);
     const efrGuard = await assertEfrInScope(req, req.body.efrId);
     if (!efrGuard.ok) return modernError(res, 403, 'easyfixer outside your scope');
     const [ins] = await pool.query(
@@ -779,6 +815,7 @@ router.post('/payouts', validate(Joi.object({
        req.user.user_id, req.body.efrId]
     );
     res.status(201);
+    logger.info('Payout created · id=' + ins.insertId + ' efrId=' + req.body.efrId + ' status=0');
     modernOk(res, { payoutId: ins.insertId, status: 0 }, 'payout created');
   } catch (e) { next(e); }
 });
@@ -795,6 +832,7 @@ router.post('/payouts/bulk-ops-approve', validate(Joi.object({
   })).min(1).required(),
 })), async (req, res, next) => {
   try {
+    logger.info('Bulk ops-approve payouts · items=' + req.body.items.length);
     const results = await Promise.all(req.body.items.map(async (it) => {
       try {
         const guard = await assertEfrInScope(req, it.efrId);
@@ -809,6 +847,7 @@ router.post('/payouts/bulk-ops-approve', validate(Joi.object({
       }
     }));
     const okCount = results.filter((r) => r.ok).length;
+    logger.info('Bulk ops-approve done · approved=' + okCount + ' failed=' + (results.length - okCount));
     modernOk(res, { results, approvedCount: okCount, failedCount: results.length - okCount });
   } catch (e) { next(e); }
 });
@@ -819,12 +858,14 @@ router.post('/payouts/:id/ops-approve', validate(Joi.object({
   opsApprovedAmount: Joi.number().min(0).required(),
 })), async (req, res, next) => {
   try {
+    logger.info('Ops-approve payout · id=' + req.params.id + ' efrId=' + req.body.efrId + ' amount=' + req.body.opsApprovedAmount);
     const efrGuard = await assertEfrInScope(req, req.body.efrId);
     if (!efrGuard.ok) return modernError(res, 404, 'payout not found');
     await pool.query(
       'CALL sp_ef_approve_payout_by_ops(?, ?, ?, ?, ?)',
       [Number(req.params.id), req.body.efrId, req.body.opsApprovedAmount, req.user.user_id, 1]
     );
+    logger.info('Payout ops-approved · id=' + req.params.id + ' status=1');
     modernOk(res, { approvedBy: 'ops', status: 1 });
   } catch (e) { next(e); }
 });
@@ -837,6 +878,7 @@ router.post('/payouts/:id/fin-approve', validate(Joi.object({
   payoutDoc: Joi.string().max(255).allow('', null).optional(),
 })), async (req, res, next) => {
   try {
+    logger.info('Finance-approve payout · id=' + req.params.id + ' efrId=' + req.body.efrId + ' amount=' + req.body.finApprovedAmount);
     const efrGuard = await assertEfrInScope(req, req.body.efrId);
     if (!efrGuard.ok) return modernError(res, 404, 'payout not found');
     await pool.query(
@@ -851,6 +893,7 @@ router.post('/payouts/:id/fin-approve', validate(Joi.object({
         2,
       ]
     );
+    logger.info('Payout finance-approved · id=' + req.params.id + ' status=2');
     modernOk(res, { approvedBy: 'finance', status: 2 });
   } catch (e) { next(e); }
 });
@@ -862,6 +905,7 @@ router.post('/payouts/:id/fin-reject', validate(Joi.object({
   efrId: Joi.number().integer().positive().required(),
 })), async (req, res, next) => {
   try {
+    logger.info('Finance-reject payout · id=' + req.params.id + ' efrId=' + req.body.efrId);
     const efrGuard = await assertEfrInScope(req, req.body.efrId);
     if (!efrGuard.ok) return modernError(res, 404, 'payout not found');
     const [r] = await pool.query(
@@ -873,6 +917,7 @@ router.post('/payouts/:id/fin-reject', validate(Joi.object({
       [req.user.user_id, Number(req.params.id), req.body.efrId]
     );
     if (r.affectedRows === 0) return modernError(res, 404, 'payout not found');
+    logger.info('Payout finance-rejected · id=' + req.params.id + ' status=3');
     modernOk(res, { rejected: true, status: 3 });
   } catch (e) { next(e); }
 });
@@ -896,11 +941,13 @@ router.get('/ndm-recharges', async (req, res, next) => {
     const efrId = Number(req.query.efrId || 0);
     const ndmId = Number(req.query.ndmId || 0);
     const flag = Number(req.query.flag || 4); // default to "pending approval"
+    logger.info('List NDM recharges · efrId=' + efrId + ' ndmId=' + ndmId + ' flag=' + flag);
     const [rows] = await pool.query(
       'CALL sp_ef_finance_efr_recharge(?, ?, ?)',
       [efrId, ndmId, flag]
     );
     const data = Array.isArray(rows) && Array.isArray(rows[0]) ? rows[0] : [];
+    logger.info('Found ' + data.length + ' NDM recharges (pre-scope filter)');
     // RBAC: post-filter the SP result by easyfixer city scope. SP doesn't
     // accept a scope param so we filter in-memory; volume is bounded
     // (pending-approval rows ≤ low hundreds).
@@ -933,6 +980,7 @@ router.post('/ndm-recharges', validate(Joi.object({
   referenceId: Joi.string().max(100).allow('', null).optional(),
 })), async (req, res, next) => {
   try {
+    logger.info('Log NDM recharge · efrId=' + req.body.efrId + ' amount=' + req.body.rechargeAmount);
     const efrGuard = await assertEfrInScope(req, req.body.efrId);
     if (!efrGuard.ok) return modernError(res, 403, 'easyfixer outside your scope');
     const [ins] = await pool.query(
@@ -946,6 +994,7 @@ router.post('/ndm-recharges', validate(Joi.object({
        req.body.referenceId || null]
     );
     res.status(201);
+    logger.info('NDM recharge logged · id=' + ins.insertId + ' efrId=' + req.body.efrId);
     modernOk(res, { rechargeId: ins.insertId }, 'NDM recharge logged');
   } catch (e) { next(e); }
 });
@@ -953,12 +1002,13 @@ router.post('/ndm-recharges', validate(Joi.object({
 router.post('/ndm-recharges/:id/approve', async (req, res, next) => {
   try {
     const id = Number(req.params.id);
+    logger.info('Approve NDM recharge · id=' + id);
     const [[r]] = await pool.query(
       'SELECT efr_id, recharge_amount, approved_by_finance FROM tbl_ndm_recharge WHERE recharge_id = ?',
       [id]
     );
     if (!r) return modernError(res, 404, 'recharge not found');
-    if (r.approved_by_finance === 1) return modernError(res, 409, 'already approved');
+    if (r.approved_by_finance === 1) { logger.warn('NDM recharge already approved · id=' + id); return modernError(res, 409, 'already approved'); }
     const efrGuard = await assertEfrInScope(req, r.efr_id);
     if (!efrGuard.ok) return modernError(res, 404, 'recharge not found');
 
@@ -984,9 +1034,11 @@ router.post('/ndm-recharges/:id/approve', async (req, res, next) => {
       );
       if (bumpResult.affectedRows === 0) {
         await conn.rollback();
+        logger.warn('NDM recharge approval refused — easyfixer not found · id=' + id + ' efrId=' + r.efr_id);
         return modernError(res, 409, `easyfixer ${r.efr_id} not found — approval refused to avoid orphan credit`);
       }
       await conn.commit();
+      logger.info('NDM recharge approved · id=' + id + ' efrId=' + r.efr_id + ' credited=' + r.recharge_amount);
       modernOk(res, { approved: true, balanceCredited: r.recharge_amount });
     } catch (err) { await conn.rollback(); throw err; } finally { conn.release(); }
   } catch (e) { next(e); }
@@ -995,6 +1047,7 @@ router.post('/ndm-recharges/:id/approve', async (req, res, next) => {
 router.post('/ndm-recharges/:id/reject', async (req, res, next) => {
   try {
     const id = Number(req.params.id);
+    logger.info('Reject NDM recharge · id=' + id);
     const [[r]] = await pool.query(
       'SELECT efr_id FROM tbl_ndm_recharge WHERE recharge_id = ? AND approved_by_finance = 0',
       [id]
@@ -1005,6 +1058,7 @@ router.post('/ndm-recharges/:id/reject', async (req, res, next) => {
     // Legacy `updateFinanceRejected` simply DELETES the row. Preserving
     // that behaviour — there's no audit table to soft-delete to.
     await pool.query('DELETE FROM tbl_ndm_recharge WHERE recharge_id = ?', [id]);
+    logger.info('NDM recharge rejected (deleted) · id=' + id);
     modernOk(res, { rejected: true });
   } catch (e) { next(e); }
 });
@@ -1015,6 +1069,7 @@ router.post('/easyfixer/:id/recharge', validate(Joi.object({
 })), async (req, res, next) => {
   try {
     const efrId = Number(req.params.id);
+    logger.info('Admin recharge easyfixer · efrId=' + efrId + ' amount=' + req.body.amount);
     const efrGuard = await assertEfrInScope(req, efrId);
     if (!efrGuard.ok) return modernError(res, 404, 'easyfixer not found');
     const conn = await pool.getConnection();
@@ -1038,6 +1093,7 @@ router.post('/easyfixer/:id/recharge', validate(Joi.object({
          VALUES (?, ?, ?, 1, NOW(), ?, ?, NOW(), ?)`,
         [efrId, 'ADMIN_RECHARGE', req.body.reference || null, req.body.amount, bal.current_balance, req.user.user_id]);
       await conn.commit();
+      logger.info('Admin recharge applied · efrId=' + efrId + ' amount=' + req.body.amount + ' newBalance=' + bal.current_balance);
       modernOk(res, { applied: req.body.amount });
     } catch (e) { await conn.rollback(); throw e; } finally { conn.release(); }
   } catch (e) { next(e); }

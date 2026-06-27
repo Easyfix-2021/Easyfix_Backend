@@ -75,6 +75,7 @@ async function hasUserTypeColumn() {
  * — falls back to `user_type: null, user_type_label: 'Member'`.
  */
 async function listForClient(clientId) {
+  logger.info('List client vertical assignments · clientId=' + clientId);
   const hasUT = await hasUserTypeColumn();
   // Column lists differ by schema variant — kept explicit so the
   // shape on the wire is stable.
@@ -93,6 +94,7 @@ async function listForClient(clientId) {
       ORDER BY v.vertical_name ASC, vm.user_id ASC`,
     [clientId],
   );
+  logger.info('Found ' + rows.length + ' vertical assignments');
   return rows.map((r) => {
     const ut = r.user_type;
     return {
@@ -132,7 +134,9 @@ async function listForClient(clientId) {
  * so the TX is cheap.
  */
 async function replaceForClient(clientId, assignments) {
+  logger.info('Replace vertical assignments · clientId=' + clientId + ' submitted=' + (Array.isArray(assignments) ? assignments.length : 'n/a'));
   if (!Array.isArray(assignments)) {
+    logger.warn('Replace vertical assignments rejected · assignments must be an array · clientId=' + clientId);
     throw Object.assign(new Error('assignments must be an array'), { status: 400 });
   }
   // Dedupe (clientId, verticalId, userId) up front — defensive against
@@ -178,8 +182,10 @@ async function replaceForClient(clientId, assignments) {
       }
     }
     await conn.commit();
+    logger.info('Vertical assignments replaced · clientId=' + clientId + ' inserted=' + cleaned.length);
     return cleaned.length;
   } catch (e) {
+    logger.error('Replace vertical assignments failed · clientId=' + clientId + ' · ' + e.message);
     try { await conn.rollback(); } catch (_) { /* swallow rollback failure */ }
     throw e;
   } finally {
@@ -209,8 +215,10 @@ async function replaceForClient(clientId, assignments) {
  *   { primary: 'inserted'|'updated', secondary: 'inserted'|'updated' }
  */
 async function upsertPrimarySecondarySpoc(clientId, primaryUserId, secondaryUserId) {
+  logger.info('Upsert SPOC · clientId=' + clientId + ' primaryUserId=' + primaryUserId + ' secondaryUserId=' + secondaryUserId);
   const hasUT = await hasUserTypeColumn();
   if (!hasUT) {
+    logger.warn('Upsert SPOC aborted · user_type column missing · clientId=' + clientId);
     throw Object.assign(
       new Error('tbl_vertical_mapping.user_type column missing — cannot record Primary/Secondary SPOC'),
       { status: 503 },
@@ -221,6 +229,7 @@ async function upsertPrimarySecondarySpoc(clientId, primaryUserId, secondaryUser
     'SELECT vertical_id FROM tbl_client WHERE client_id = ? LIMIT 1', [clientId],
   );
   if (!clientRow) {
+    logger.warn('Upsert SPOC aborted · client not found · clientId=' + clientId);
     throw Object.assign(new Error(`Client ${clientId} not found`), { status: 404 });
   }
   const verticalId = clientRow.vertical_id || 0;
@@ -248,8 +257,10 @@ async function upsertPrimarySecondarySpoc(clientId, primaryUserId, secondaryUser
       }
     }
     await conn.commit();
+    logger.info('SPOC upserted · clientId=' + clientId + ' primary=' + out.primary + ' secondary=' + out.secondary);
     return out;
   } catch (e) {
+    logger.error('Upsert SPOC failed · clientId=' + clientId + ' · ' + e.message);
     try { await conn.rollback(); } catch (_) { /* swallow */ }
     throw e;
   } finally {
@@ -275,6 +286,7 @@ async function activeInternalUserIds() {
         // we err on the side of "any tbl_user row whose status != 0".
         `SELECT user_id FROM tbl_user WHERE user_status IS NULL OR user_status <> 0`,
       );
+      logger.info('Loaded ' + rows.length + ' active internal users into cache');
       return new Set(rows.map((r) => r.user_id));
     })();
     _activeUsersCache = { promise, expiresAt: Date.now() + ACTIVE_USERS_CACHE_TTL_MS };

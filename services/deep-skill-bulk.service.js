@@ -318,16 +318,19 @@ async function syncSkillOptionsJsonInTxn(conn, deepskillId) {
  * the whole batch so a failure halfway leaves the catalogue untouched.
  */
 async function processBuffer(buffer, { commit = false, actor = null } = {}) {
+  logger.info('Bulk deep-skill upload · mode=' + (commit ? 'commit' : 'preview'));
   const workbook = new ExcelJS.Workbook();
   try {
     await workbook.xlsx.load(buffer);
   } catch (e) {
+    logger.warn('Bulk deep-skill .xlsx parse failed · ' + e.message);
     const err = new Error(`Failed to parse .xlsx: ${e.message}`);
     err.status = 400;
     throw err;
   }
 
   const rows = parseWorkbook(workbook);
+  logger.info('Parsed ' + rows.length + ' data rows from workbook');
 
   const conn = await pool.getConnection();
   let inTxn = false;
@@ -557,6 +560,11 @@ async function processBuffer(buffer, { commit = false, actor = null } = {}) {
         optionsCreated:    created.optionsCreated,
       };
     }
+    logger.info(
+      'Bulk ' + (commit ? 'commit' : 'preview') + ' done · create=' + summary.willCreate +
+      ' skip=' + summary.willSkip + ' errors=' + summary.errors +
+      ' skillsNew=' + summary.skillsNew + ' optionsNew=' + summary.optionsNew,
+    );
     return result;
   } catch (e) {
     if (inTxn) {
@@ -564,6 +572,7 @@ async function processBuffer(buffer, { commit = false, actor = null } = {}) {
         logger.error({ err: rbErr }, 'deep-skill bulk: rollback failed');
       }
     }
+    logger.error('Bulk deep-skill upload failed · ' + e.message);
     throw e;
   } finally {
     conn.release();

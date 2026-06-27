@@ -11,6 +11,7 @@ const requireAction = require('../../middleware/require-action');
 const { pool } = require('../../db');
 const jobLocation = require('../../services/job-location.service');
 const { modernOk, modernError } = require('../../utils/response');
+const logger = require('../../logger');
 const {
   listQuery, registeredListQuery, createBody, updateBody, statusBody, idParam, listSubresourceQuery, efrIdsBody,
   commentBody, leadVerificationBody, professionalBody, personalFamilyBody,
@@ -55,8 +56,10 @@ const profileUpdateSendBody = Joi.object({
 
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
   try {
+    logger.info('List easyfixers · status=' + (req.query.status ?? 'all') + ' q=' + (req.query.q || '') + ' limit=' + req.query.limit + ' offset=' + req.query.offset);
     const scope = buildRequestScope(req);
     const { rows, total } = await easyfixer.list({ ...req.query, scope });
+    logger.info('Found ' + rows.length + ' easyfixers (total=' + total + ')');
     modernOk(res, { items: rows, total, limit: req.query.limit, offset: req.query.offset });
   } catch (e) { next(e); }
 });
@@ -70,16 +73,20 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
 // the caller's scope are silently filtered.
 router.post('/aggregates', validate(efrIdsBody, 'body'), async (req, res, next) => {
   try {
+    logger.info('Fetch easyfixer aggregates · efrIds=' + (req.body.efrIds || []).length);
     const scope = buildRequestScope(req);
     const { rows } = await easyfixer.aggregates(req.body.efrIds, { scope });
+    logger.info('Found ' + rows.length + ' aggregate rows');
     modernOk(res, { items: rows });
   } catch (e) { next(e); }
 });
 
 router.post('/attendance', validate(efrIdsBody, 'body'), async (req, res, next) => {
   try {
+    logger.info('Fetch easyfixer attendance · efrIds=' + (req.body.efrIds || []).length);
     const scope = buildRequestScope(req);
     const { rows } = await easyfixer.attendance(req.body.efrIds, { scope });
+    logger.info('Found ' + rows.length + ' attendance rows');
     modernOk(res, { items: rows });
   } catch (e) { next(e); }
 });
@@ -98,6 +105,7 @@ router.post('/attendance', validate(efrIdsBody, 'body'), async (req, res, next) 
  */
 router.get('/status-counts', async (req, res, next) => {
   try {
+    logger.info('Fetch easyfixer status counts');
     const scope = buildRequestScope(req);
     const counts = await easyfixer.statusCounts({ scope });
     modernOk(res, counts);
@@ -151,6 +159,7 @@ function formatDateTimeForXlsx(v) {
 
 router.get('/download', validate(listQuery, 'query'), async (req, res, next) => {
   try {
+    logger.info('Export easyfixers XLSX · status=' + (req.query.status ?? 'all') + ' q=' + (req.query.q || ''));
     const scope = buildRequestScope(req);
     const { rows } = await easyfixer.list({
       ...req.query, scope,
@@ -203,6 +212,7 @@ router.get('/download', validate(listQuery, 'query'), async (req, res, next) => 
     const buffer = await wb.xlsx.writeBuffer();
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="easyfixers-${today}.xlsx"`);
+    logger.info('Returning ' + rows.length + ' easyfixers in XLSX export');
     res.send(Buffer.from(buffer));
   } catch (e) { next(e); }
 });
@@ -213,8 +223,10 @@ router.get('/download', validate(listQuery, 'query'), async (req, res, next) => 
 // `/:id` is a catch-all that would otherwise capture `/registered`.
 router.get('/registered', validate(registeredListQuery, 'query'), async (req, res, next) => {
   try {
+    logger.info('List registered easyfixers · status=' + (req.query.status ?? 'all') + ' limit=' + req.query.limit + ' offset=' + req.query.offset);
     const scope = buildRequestScope(req);
     const { rows, total } = await easyfixer.listRegistered(req.query, scope);
+    logger.info('Found ' + rows.length + ' registered easyfixers (total=' + total + ')');
     modernOk(res, { items: rows, total, limit: req.query.limit, offset: req.query.offset });
   } catch (e) { next(e); }
 });
@@ -223,6 +235,7 @@ router.get('/registered', validate(registeredListQuery, 'query'), async (req, re
 // Scope-filtered; buckets overlap (sum may exceed total) — legacy parity.
 router.get('/registered/status-counts', async (req, res, next) => {
   try {
+    logger.info('Fetch registered easyfixer status counts');
     const scope = buildRequestScope(req);
     const counts = await easyfixer.registeredStatusCounts(scope);
     modernOk(res, counts);
@@ -249,6 +262,7 @@ const REGISTERED_EXPORT_COLUMNS = [
 // unfiltered set — improved here, matching the main /download behaviour).
 router.get('/registered/download', validate(registeredListQuery, 'query'), async (req, res, next) => {
   try {
+    logger.info('Export registered easyfixers XLSX · status=' + (req.query.status ?? 'all'));
     const scope = buildRequestScope(req);
     const rows = await easyfixer.listRegisteredForExport(req.query, scope, EXPORT_HARD_CAP);
 
@@ -269,12 +283,14 @@ router.get('/registered/download', validate(registeredListQuery, 'query'), async
     const buffer = await wb.xlsx.writeBuffer();
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="registered-easyfixers-${today}.xlsx"`);
+    logger.info('Returning ' + rows.length + ' registered easyfixers in XLSX export');
     res.send(Buffer.from(buffer));
   } catch (e) { next(e); }
 });
 
 router.get('/:id', validate(idParam, 'params'), async (req, res, next) => {
   try {
+    logger.info('Get easyfixer · id=' + req.params.id);
     const row = await easyfixer.getById(req.params.id);
     if (!row) return modernError(res, 404, 'easyfixer not found');
     // Row-level guard — return 404 (not 403) to avoid leaking existence
@@ -287,22 +303,26 @@ router.get('/:id', validate(idParam, 'params'), async (req, res, next) => {
 
 router.post('/', validate(createBody), async (req, res, next) => {
   try {
+    logger.info('Create easyfixer · cityId=' + req.body.efr_cityId);
     // On create, the new row's city must be within the caller's scope.
     const guard = assertEntityInScope(req, { city_id: req.body.efr_cityId });
     if (!guard.ok) return modernError(res, 403, 'cannot create easyfixer in a city outside your scope');
     const created = await easyfixer.create(req.body, req.user);
     res.status(201);
+    logger.info('Easyfixer created · id=' + (created && created.efr_id));
     modernOk(res, created, 'easyfixer created');
   } catch (e) { next(e); }
 });
 
 router.put('/:id', validate(idParam, 'params'), validate(updateBody), async (req, res, next) => {
   try {
+    logger.info('Update easyfixer · id=' + req.params.id);
     const existing = await easyfixer.getById(req.params.id);
     if (!existing) return modernError(res, 404, 'easyfixer not found');
     const guard = assertEntityInScope(req, { city_id: existing.efr_cityId });
     if (!guard.ok) return modernError(res, 404, 'easyfixer not found');
     const updated = await easyfixer.update(req.params.id, req.body, req.user);
+    logger.info('Easyfixer updated · id=' + req.params.id);
     modernOk(res, updated, 'easyfixer updated');
   } catch (e) { next(e); }
 });
@@ -316,11 +336,13 @@ router.get('/:id/transactions',
   validate(listSubresourceQuery, 'query'),
   async (req, res, next) => {
     try {
+      logger.info('List easyfixer transactions · id=' + req.params.id + ' limit=' + req.query.limit + ' offset=' + req.query.offset);
       const row = await easyfixer.getById(req.params.id);
       if (!row) return modernError(res, 404, 'easyfixer not found');
       const guard = assertEntityInScope(req, { city_id: row.efr_cityId });
       if (!guard.ok) return modernError(res, 404, 'easyfixer not found');
       const { rows, total } = await easyfixer.listTransactions(req.params.id, req.query);
+      logger.info('Found ' + rows.length + ' transactions (total=' + total + ')');
       modernOk(res, { items: rows, total, limit: req.query.limit, offset: req.query.offset });
     } catch (e) { next(e); }
   });
@@ -336,6 +358,7 @@ router.get('/:id/location',
   validate(idParam, 'params'),
   async (req, res, next) => {
     try {
+      logger.info('Get easyfixer live location · id=' + req.params.id);
       const row = await easyfixer.getById(req.params.id);
       if (!row) return modernError(res, 404, 'easyfixer not found');
       const guard = assertEntityInScope(req, { city_id: row.efr_cityId });
@@ -351,22 +374,26 @@ router.get('/:id/mapped-clients',
   validate(listSubresourceQuery, 'query'),
   async (req, res, next) => {
     try {
+      logger.info('List easyfixer mapped clients · id=' + req.params.id + ' limit=' + req.query.limit + ' offset=' + req.query.offset);
       const row = await easyfixer.getById(req.params.id);
       if (!row) return modernError(res, 404, 'easyfixer not found');
       const guard = assertEntityInScope(req, { city_id: row.efr_cityId });
       if (!guard.ok) return modernError(res, 404, 'easyfixer not found');
       const { rows, total } = await easyfixer.listMappedClients(req.params.id, req.query);
+      logger.info('Found ' + rows.length + ' mapped clients (total=' + total + ')');
       modernOk(res, { items: rows, total, limit: req.query.limit, offset: req.query.offset });
     } catch (e) { next(e); }
   });
 
 router.patch('/:id/status', validate(idParam, 'params'), validate(statusBody), async (req, res, next) => {
   try {
+    logger.info('Set easyfixer status · id=' + req.params.id + ' active=' + req.body.active);
     const existing = await easyfixer.getById(req.params.id);
     if (!existing) return modernError(res, 404, 'easyfixer not found');
     const guard = assertEntityInScope(req, { city_id: existing.efr_cityId });
     if (!guard.ok) return modernError(res, 404, 'easyfixer not found');
     const updated = await easyfixer.setStatus(req.params.id, req.body, req.user);
+    logger.info('Easyfixer ' + (req.body.active ? 'activated' : 'deactivated') + ' · id=' + req.params.id);
     modernOk(res, updated, `easyfixer ${req.body.active ? 'activated' : 'deactivated'}`);
   } catch (e) { next(e); }
 });
@@ -386,6 +413,7 @@ router.get('/:id/verification',
   validate(idParam, 'params'),
   async (req, res, next) => {
     try {
+      logger.info('Get easyfixer verification page · id=' + req.params.id);
       if (!(await loadAndAuthorize(req, res))) return;
       const payload = await verification.getVerificationPage(req.params.id);
       if (!payload) return modernError(res, 404, 'easyfixer not found');
@@ -397,8 +425,10 @@ router.post('/:id/verification/comments',
   validate(idParam, 'params'), validate(commentBody, 'body'),
   async (req, res, next) => {
     try {
+      logger.info('Add verification comment · id=' + req.params.id + ' section=' + req.body.section);
       if (!(await loadAndAuthorize(req, res))) return;
       const comments = await verification.addComment(req.params.id, req.body, req.user);
+      logger.info('Verification comment added · id=' + req.params.id + ' section=' + req.body.section);
       modernOk(res, { section: req.body.section, comments }, 'comment added');
     } catch (e) { next(e); }
   });
@@ -407,8 +437,10 @@ router.put('/:id/verification/lead',
   validate(idParam, 'params'), validate(leadVerificationBody, 'body'),
   async (req, res, next) => {
     try {
+      logger.info('Save lead verification · id=' + req.params.id);
       if (!(await loadAndAuthorize(req, res))) return;
       const data = await verification.setLeadVerification(req.params.id, req.body, req.user);
+      logger.info('Lead verification updated · id=' + req.params.id);
       modernOk(res, data, 'lead status updated');
     } catch (e) { next(e); }
   });
@@ -417,8 +449,10 @@ router.put('/:id/verification/professional',
   validate(idParam, 'params'), validate(professionalBody, 'body'),
   async (req, res, next) => {
     try {
+      logger.info('Save professional details · id=' + req.params.id);
       if (!(await loadAndAuthorize(req, res))) return;
       const data = await verification.saveProfessional(req.params.id, req.body, req.user);
+      logger.info('Professional details saved · id=' + req.params.id);
       modernOk(res, data, 'professional details saved');
     } catch (e) { next(e); }
   });
@@ -427,8 +461,10 @@ router.put('/:id/verification/personal-family',
   validate(idParam, 'params'), validate(personalFamilyBody, 'body'),
   async (req, res, next) => {
     try {
+      logger.info('Save personal & family details · id=' + req.params.id);
       if (!(await loadAndAuthorize(req, res))) return;
       const data = await verification.savePersonalFamily(req.params.id, req.body, req.user);
+      logger.info('Personal & family details saved · id=' + req.params.id);
       modernOk(res, data, 'personal & family details saved');
     } catch (e) { next(e); }
   });
@@ -437,8 +473,10 @@ router.put('/:id/verification/banking',
   validate(idParam, 'params'), validate(bankingVerificationBody, 'body'),
   async (req, res, next) => {
     try {
+      logger.info('Save banking details · id=' + req.params.id);
       if (!(await loadAndAuthorize(req, res))) return;
       const data = await verification.saveBanking(req.params.id, req.body, req.user);
+      logger.info('Banking details saved · id=' + req.params.id);
       modernOk(res, data, 'banking details saved');
     } catch (e) { next(e); }
   });
@@ -447,8 +485,10 @@ router.put('/:id/verification/identity',
   validate(idParam, 'params'), validate(identityVerificationBody, 'body'),
   async (req, res, next) => {
     try {
+      logger.info('Save identity details · id=' + req.params.id);
       if (!(await loadAndAuthorize(req, res))) return;
       const data = await verification.saveIdentity(req.params.id, req.body, req.user);
+      logger.info('Identity details saved · id=' + req.params.id);
       modernOk(res, data, 'identity details saved');
     } catch (e) { next(e); }
   });
@@ -457,11 +497,13 @@ router.post('/:id/verification/proceed-to-activation',
   validate(idParam, 'params'),
   async (req, res, next) => {
     try {
+      logger.info('Proceed to activation check · id=' + req.params.id);
       if (!(await loadAndAuthorize(req, res))) return;
       const data = await verification.proceedToActivation(req.params.id);
+      logger.info('Proceed to activation allowed · id=' + req.params.id);
       modernOk(res, data, 'proceed allowed');
     } catch (e) {
-      if (e.status === 409) return modernError(res, 409, e.message, e.details);
+      if (e.status === 409) { logger.warn('Proceed to activation blocked · id=' + req.params.id + ' · ' + e.message); return modernError(res, 409, e.message, e.details); }
       next(e);
     }
   });
@@ -470,8 +512,10 @@ router.put('/:id/verification/activation',
   validate(idParam, 'params'), validate(activationBody, 'body'),
   async (req, res, next) => {
     try {
+      logger.info('Save easyfixer activation · id=' + req.params.id);
       if (!(await loadAndAuthorize(req, res))) return;
       const data = await verification.saveActivation(req.params.id, req.body, req.user);
+      logger.info('Easyfixer activation saved · id=' + req.params.id);
       modernOk(res, data, 'activation saved');
     } catch (e) { next(e); }
   });
@@ -480,8 +524,10 @@ router.put('/:id/verification/map-clients',
   validate(idParam, 'params'), validate(mapClientsBody, 'body'),
   async (req, res, next) => {
     try {
+      logger.info('Map clients to easyfixer · id=' + req.params.id + ' clients=' + (req.body.client_ids || []).length);
       if (!(await loadAndAuthorize(req, res))) return;
       const data = await verification.mapClients(req.params.id, req.body.client_ids, req.user);
+      logger.info('Clients mapped · id=' + req.params.id + ' clients=' + (req.body.client_ids || []).length);
       modernOk(res, data, 'clients mapped');
     } catch (e) { next(e); }
   });
@@ -495,8 +541,10 @@ router.get('/:id/option-mappings',
   validate(idParam, 'params'),
   async (req, res, next) => {
     try {
+      logger.info('List deep-skill option mappings · id=' + req.params.id);
       if (!(await loadAndAuthorize(req, res))) return;
       const items = await verification.listOptionMappings(req.params.id);
+      logger.info('Found ' + items.length + ' option mappings');
       modernOk(res, { items });
     } catch (e) { next(e); }
   });
@@ -505,8 +553,10 @@ router.put('/:id/option-mappings',
   validate(idParam, 'params'), validate(optionMappingsBody, 'body'),
   async (req, res, next) => {
     try {
+      logger.info('Replace deep-skill option mappings · id=' + req.params.id + ' items=' + (req.body.items || []).length);
       if (!(await loadAndAuthorize(req, res))) return;
       const result = await verification.replaceOptionMappings(req.params.id, req.body.items, req.user);
+      logger.info('Option mappings updated · id=' + req.params.id + ' items=' + (req.body.items || []).length);
       modernOk(res, result, 'option mappings updated');
     } catch (e) { next(e); }
   });
@@ -520,11 +570,13 @@ router.delete('/:id/option-mappings/:rowId',
   }), 'params'),
   async (req, res, next) => {
     try {
+      logger.info('Unmap deep-skill option · id=' + req.params.id + ' rowId=' + req.params.rowId);
       if (!(await loadAndAuthorize(req, res))) return;
       const result = await verification.unmapDeepSkill(Number(req.params.id), Number(req.params.rowId));
+      logger.info('Deep skill mapping removed · id=' + req.params.id + ' rowId=' + req.params.rowId);
       modernOk(res, result, 'deep skill mapping removed');
     } catch (e) {
-      if (e && typeof e.status === 'number') return modernError(res, e.status, e.message);
+      if (e && typeof e.status === 'number') { logger.warn('Unmap deep-skill failed · ' + e.message); return modernError(res, e.status, e.message); }
       next(e);
     }
   });
@@ -538,6 +590,7 @@ router.get('/:id/serviceable-pincodes',
   validate(idParam, 'params'),
   async (req, res, next) => {
     try {
+      logger.info('List serviceable pincodes · id=' + req.params.id);
       if (!(await loadAndAuthorize(req, res))) return;
       const data = await verification.listServiceablePincodes(req.params.id);
       modernOk(res, data);
@@ -548,10 +601,12 @@ router.put('/:id/serviceable-pincodes',
   validate(idParam, 'params'), validate(serviceablePincodesBody, 'body'),
   async (req, res, next) => {
     try {
+      logger.info('Replace serviceable pincodes · id=' + req.params.id + ' pincodes=' + (req.body.pincodeIds || []).length);
       if (!(await loadAndAuthorize(req, res))) return;
       const result = await verification.replaceServiceablePincodes(
         req.params.id, req.body.pincodeIds, req.user
       );
+      logger.info('Serviceable pincodes updated · id=' + req.params.id + ' pincodes=' + (req.body.pincodeIds || []).length);
       modernOk(res, result, 'serviceable pincodes updated');
     } catch (e) { next(e); }
   });
@@ -560,8 +615,10 @@ router.post('/:id/verification/bgv-report',
   validate(idParam, 'params'), validate(bgvReportBody, 'body'),
   async (req, res, next) => {
     try {
+      logger.info('Save BGV report · id=' + req.params.id);
       if (!(await loadAndAuthorize(req, res))) return;
       const data = await verification.saveBgvReport(req.params.id, req.body, req.user);
+      logger.info('BGV report saved · id=' + req.params.id);
       modernOk(res, data, 'BGV report saved');
     } catch (e) { next(e); }
   });
@@ -584,6 +641,7 @@ router.post('/:id/profile-update-link/send',
   requireAction('isProfileUpdateLinkSend'),
   async (req, res, next) => {
     try {
+      logger.info('Send profile-update link · id=' + req.params.id + ' action=' + (req.body.action || 'first'));
       if (!(await loadAndAuthorize(req, res))) return;
       const result = await profileUpdateLink.sendForEasyfixer(
         Number(req.params.id),
@@ -591,9 +649,11 @@ router.post('/:id/profile-update-link/send',
         req.user,
         pool,
       );
+      logger.info('Profile-update link sent on WhatsApp · id=' + req.params.id);
       modernOk(res, result, 'Profile update link sent on WhatsApp');
     } catch (e) {
       if (e && typeof e.status === 'number') {
+        logger.warn('Send profile-update link failed · id=' + req.params.id + ' · ' + e.message);
         return modernError(res, e.status, e.message || 'request failed');
       }
       next(e);
@@ -658,14 +718,17 @@ router.get('/:id/profile-update-link/dev-url',
   requireAction('isProfileUpdateLinkSend'),
   async (req, res, next) => {
     try {
+      logger.info('Mint dev profile-update link · id=' + req.params.id);
       if (!(await loadAndAuthorize(req, res))) return;
       const efrId = Number(req.params.id);
       const token = signEasyfixerProfileToken(efrId);
       const base = (process.env.CRM_PUBLIC_BASE_URL || process.env.MAGIC_LINK_BASE_URL || 'http://localhost:5180').replace(/\/$/, '');
       const url = `${base}/public/profile-update/${token}`;
+      logger.info('Dev profile-update link minted · efrId=' + efrId);
       modernOk(res, { efrId, token, url }, 'Dev profile-update link minted (no WhatsApp send)');
     } catch (e) {
       if (e && typeof e.status === 'number') {
+        logger.warn('Mint dev profile-update link failed · id=' + req.params.id + ' · ' + e.message);
         return modernError(res, e.status, e.message || 'request failed');
       }
       next(e);

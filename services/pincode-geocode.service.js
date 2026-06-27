@@ -67,6 +67,7 @@ function toNum(v) {
  * yields null for that PIN so one bad PIN can't blank the whole column.
  */
 async function getCentroids(pincodes) {
+  logger.info('Resolving pincode centroids · count=' + (Array.isArray(pincodes) ? pincodes.length : 0));
   const result = new Map();
   const wanted = [];
   const seen = new Set();
@@ -115,6 +116,7 @@ async function getCentroids(pincodes) {
     }
   }
   if (misses.length === 0) return result;
+  logger.info('Pincode centroid cache misses · geocoding ' + misses.length);
 
   // ── 2. Google geocode for cache-misses ───────────────────────────
   const apiKey = serverApiKey();
@@ -221,6 +223,7 @@ function pickComponent(components, type) {
 async function geocodePincodeDetail(pincode) {
   const pin = normalisePin(pincode);
   if (!pin) return null;
+  logger.info('Geocoding pincode detail · pincode=' + pin);
   const empty = { lat: null, lng: null, state: null, district: null, city: null, country: null, country_code: null, geocoded: false };
   const apiKey = serverApiKey();
   if (!apiKey) {
@@ -257,6 +260,7 @@ async function geocodePincodeDetail(pincode) {
       memCache.set(pin, { value: { lat, lng }, expires: Date.now() + MEM_TTL_MS });
       await persistCentroid(pin, { lat, lng }); // no-op if the pincode row doesn't exist yet
     }
+    logger.info('Pincode detail geocoded · pincode=' + pin + ' state=' + (state || '-') + ' city=' + (city || '-'));
     return { lat, lng, state, district, city, country, country_code, geocoded: true };
   } catch (e) {
     logger.warn({ pin, err: e.message }, 'pincode-geocode: detail geocode threw');

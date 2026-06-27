@@ -333,6 +333,7 @@ async function resolveSupplyStatus(mobileNo) {
 
 // ── 1) list() — primary report endpoint (paginated) ───────────────────────
 async function list(q) {
+  logger.info('Supply Gap list · page=' + q.page + ' pageSize=' + q.pageSize + ' supplyStatus=' + q.supplyStatus);
   const page = q.page;
   const pageSize = q.pageSize;
   const offset = (page - 1) * pageSize;
@@ -387,6 +388,7 @@ async function list(q) {
   `;
   listF.params.push(pageSize, offset);
   const [rows] = await pool.query(listSql, listF.params);
+  logger.info('Found ' + rows.length + ' supply-gap rows · totalRecords=' + totalRecords);
 
   if (rows.length >= LIST_LIMIT) {
     logger.warn(
@@ -488,6 +490,7 @@ const XLSX_COLUMNS = [
  * anyway and an empty column is pure data loss.
  */
 async function exportRows(q) {
+  logger.info('Supply Gap export · supplyStatus=' + q.supplyStatus + ' startDate=' + (q.startDate || null) + ' endDate=' + (q.endDate || null));
   const f = normaliseFilters(q, { exportDefaults: true });
   const ef = buildFilters(f);
 
@@ -530,6 +533,7 @@ async function exportRows(q) {
     LIMIT ${LIST_LIMIT}
   `;
   const [rows] = await pool.query(sql, ef.params);
+  logger.info('Found ' + rows.length + ' supply-gap export rows');
 
   if (rows.length >= LIST_LIMIT) {
     logger.warn(
@@ -577,6 +581,7 @@ async function exportRows(q) {
 
 // ── 2) detail() — findBySupplyID (eye-icon modal) ─────────────────────────
 async function detail(openCityId) {
+  logger.info('Supply Gap detail · openCityId=' + openCityId);
   const sql = `
     SELECT DISTINCT
       TC.client_name,
@@ -601,6 +606,7 @@ async function detail(openCityId) {
   `;
   const [rows] = await pool.query(sql, [openCityId]);
   if (rows.length === 0) {
+    logger.warn('Supply gap not found · openCityId=' + openCityId);
     const e = new Error('Supply gap not found');
     e.status = 404;
     throw e;
@@ -639,6 +645,7 @@ async function detail(openCityId) {
 
 // ── 3) allocations() — getAllocatedTxList ("Added Tx :N" popup) ───────────
 async function allocations(srId) {
+  logger.info('Supply Gap allocations · srId=' + srId);
   const sql = `
     SELECT TU.user_name, SRA.*
     FROM tbl_supply_request_allocation SRA
@@ -648,6 +655,7 @@ async function allocations(srId) {
     LIMIT ${GROUPED_LIMIT}
   `;
   const [rows] = await pool.query(sql, [srId, srId]);
+  logger.info('Found ' + rows.length + ' allocations');
 
   const statusMap = await resolveSupplyStatusBatch(rows.map((r) => r.supply_no));
 
@@ -665,6 +673,7 @@ async function allocations(srId) {
 
 // ── 4) history() — getActionHistoryBySupplyRequestID (detail-modal timeline) ──
 async function history(srId) {
+  logger.info('Supply Gap history · srId=' + srId);
   const sql = `
     SELECT SRL.*, TU.user_name
     FROM supply_request_log SRL
@@ -674,6 +683,7 @@ async function history(srId) {
     LIMIT ${GROUPED_LIMIT}
   `;
   const [rows] = await pool.query(sql, [srId]);
+  logger.info('Found ' + rows.length + ' history entries');
 
   // Enrich efrCurrentStatus when tx_details encodes "name_mobile".
   const mobiles = [];
@@ -707,6 +717,7 @@ async function history(srId) {
 
 // ── 5) jobDetail() — getJobDetailById ("New Supply Request (Job ID)" prefill) ──
 async function jobDetail(jobId) {
+  logger.info('Supply Gap job detail prefill · jobId=' + jobId);
   // Pre-check: an open request for this job already exists → short-circuit.
   const [openRows] = await pool.query(
     `SELECT TOC.id FROM tbl_open_city TOC
@@ -715,6 +726,7 @@ async function jobDetail(jobId) {
     [jobId],
   );
   if (openRows.length > 0) {
+    logger.info('Open request already exists · requestId=' + openRows[0].id);
     return {
       id: openRows[0].id,
       referenceId: jobId,
@@ -761,6 +773,7 @@ async function jobDetail(jobId) {
   `;
   const [rows] = await pool.query(sql, [jobId]);
   if (rows.length === 0) {
+    logger.warn('Job ID does not exist · jobId=' + jobId);
     const e = new Error('This job ID does not exist.');
     e.status = 404;
     throw e;
@@ -768,6 +781,7 @@ async function jobDetail(jobId) {
   const r = rows[0];
   // Reject closed / cancelled / completed / enquiry jobs.
   if ([3, 5, 6, 7].includes(r.job_status)) {
+    logger.info('Job not open for supply request · jobId=' + jobId + ' job_status=' + r.job_status);
     return { comments: 'This Job is either closed or cancelled' };
   }
   return {
@@ -790,6 +804,7 @@ async function jobDetail(jobId) {
 
 // ── 6) txDetails() — getAllocateTxDetails ("Add Existing Technician" checklist) ──
 async function txDetails(efrId, catgId) {
+  logger.info('Supply Gap tx details · efrId=' + efrId + ' catgId=' + catgId);
   const sql = `
     SELECT
       TE.efr_id AS efr_id,
@@ -810,6 +825,7 @@ async function txDetails(efrId, catgId) {
   `;
   const [rows] = await pool.query(sql, [catgId, efrId]);
   if (rows.length === 0) {
+    logger.warn('Tx details not found · efrId=' + efrId);
     const e = new Error('No record found.');
     e.status = 404;
     throw e;
@@ -828,11 +844,13 @@ async function txDetails(efrId, catgId) {
 
 // ── 7) txStatus() — getEasyfixerStatusByMobileNo ──────────────────────────
 async function txStatus(mobileNo) {
+  logger.info('Supply Gap tx status lookup');
   return resolveSupplyStatus(mobileNo);
 }
 
 // ── 8) txCount() — getActiveTxCountByCityAndCategory ──────────────────────
 async function txCount(cityId, catgId) {
+  logger.info('Supply Gap active-tx count · cityId=' + cityId + ' catgId=' + catgId);
   const sql = `
     SELECT COUNT(DISTINCT(easyfixer_id)) AS cnt
     FROM easyfixer_service_type EST

@@ -120,6 +120,8 @@ async function getProfileDetails(efrId) {
     throw err;
   }
 
+  logger.info('Compose profile-details · efrId=' + efrId);
+
   const [ident, performance, counts, extra, skillCount] = await Promise.all([
     readIdentity(efrId),
     performanceService.getForTech(efrId).catch((e) => {
@@ -136,6 +138,8 @@ async function getProfileDetails(efrId) {
 
   const completedJobs =
     Number(counts.byStatus?.['3'] ?? 0) + Number(counts.byStatus?.['5'] ?? 0);
+
+  logger.info('Returning profile-details · completedJobs=' + completedJobs + ' skillCount=' + (skillCount ?? 0));
 
   return {
     efrId:          ident?.efr_id ?? efrId,

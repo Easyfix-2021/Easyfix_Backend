@@ -29,6 +29,7 @@ async function record(fields = {}) {
     const sql = `INSERT INTO tbl_plivo_call_log (${cols.concat('initiated_on').join(', ')}) `
       + `VALUES (${cols.map(() => '?').concat('NOW()').join(', ')})`;
     const [r] = await pool.query(sql, params);
+    logger.info('Plivo call-log row recorded · jci=' + fields.job_caller_info_id + ' · job=' + fields.job_id + ' · id=' + r.insertId);
     return r.insertId;
   } catch (e) {
     logger.warn({ err: e.message, jci: fields.job_caller_info_id }, 'plivo-call-log: record failed (non-fatal)');
@@ -38,6 +39,7 @@ async function record(fields = {}) {
 
 async function markRinging(jci, callUuid) {
   if (jci == null) return;
+  logger.info('Plivo call-log mark ringing · jci=' + jci);
   try {
     await pool.query(
       `UPDATE tbl_plivo_call_log
@@ -50,6 +52,7 @@ async function markRinging(jci, callUuid) {
 
 async function markAnswered(jci, callUuid) {
   if (jci == null) return;
+  logger.info('Plivo call-log mark answered · jci=' + jci);
   try {
     await pool.query(
       `UPDATE tbl_plivo_call_log
@@ -63,6 +66,7 @@ async function markAnswered(jci, callUuid) {
 
 async function markTerminalByJci(jci, { status, duration = null, hangupCause = null, callUuid = null } = {}) {
   if (jci == null) return;
+  logger.info('Plivo call-log mark terminal by jci · jci=' + jci + ' · status=' + status + ' · duration=' + duration);
   try {
     await pool.query(
       `UPDATE tbl_plivo_call_log
@@ -76,6 +80,7 @@ async function markTerminalByJci(jci, { status, duration = null, hangupCause = n
 
 async function markTerminalByCallUuid(callUuid, { status, duration = null, hangupCause = null } = {}) {
   if (!callUuid) return;
+  logger.info('Plivo call-log mark terminal by CallUUID · status=' + status + ' · duration=' + duration);
   try {
     await pool.query(
       `UPDATE tbl_plivo_call_log

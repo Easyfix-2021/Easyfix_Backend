@@ -4,6 +4,7 @@ const Joi = require('joi');
 const validate = require('../../middleware/validate');
 const { modernOk, modernError } = require('../../utils/response');
 const lookupsService = require('../../services/mobile-lookups.service');
+const logger = require('../../logger');
 
 /*
  * Technician lookup/dropdown sub-router.
@@ -28,8 +29,12 @@ const lookupsService = require('../../services/mobile-lookups.service');
 //   → [ { id, name, description } ]
 router.get('/experience', async (_req, res, next) => {
   try {
-    modernOk(res, await lookupsService.experience());
+    logger.info('Fetch experience options');
+    const out = await lookupsService.experience();
+    logger.info('Returning ' + (Array.isArray(out) ? out.length : 0) + ' experience options');
+    modernOk(res, out);
   } catch (e) {
+    logger.warn('Fetch experience options failed · ' + e.message);
     if (e.status) return modernError(res, e.status, e.message);
     next(e);
   }
@@ -42,10 +47,13 @@ router.get(
   validate(Joi.object({ pincode: Joi.string().trim().pattern(/^\d{6}$/).required() }), 'params'),
   async (req, res, next) => {
     try {
+      logger.info('Resolve pincode · pincode=' + req.params.pincode);
       const result = await lookupsService.resolvePincode(req.params.pincode);
-      if (!result) return modernError(res, 404, 'pincode not found');
+      if (!result) { logger.warn('Pincode not found · pincode=' + req.params.pincode); return modernError(res, 404, 'pincode not found'); }
+      logger.info('Pincode resolved · pincode=' + req.params.pincode);
       modernOk(res, result);
     } catch (e) {
+      logger.warn('Resolve pincode failed · pincode=' + req.params.pincode + ' · ' + e.message);
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
     }

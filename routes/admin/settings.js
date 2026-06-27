@@ -3,6 +3,7 @@ const Joi = require('joi');
 const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
 const validate = require('../../middleware/validate');
+const logger = require('../../logger');
 
 /*
  * Admin CRUD for master/lookup tables.
@@ -28,6 +29,7 @@ function crudFactory(table, pk, nameCol, statusCol, allowedCols, fieldSchemas) {
   r.get('/', async (req, res, next) => {
     try {
       const { includeInactive, q } = req.query;
+      logger.info('List ' + table + ' · q=' + (q || '') + ' includeInactive=' + (includeInactive || 'false'));
       const clauses = [], params = [];
       if (includeInactive !== 'true' && statusCol) clauses.push(`${statusCol} = 1`);
       if (q && nameCol) { clauses.push(`${nameCol} LIKE ?`); params.push(`%${q}%`); }
@@ -35,49 +37,66 @@ function crudFactory(table, pk, nameCol, statusCol, allowedCols, fieldSchemas) {
       const limit = Math.min(Number(req.query.limit) || 200, 1000);
       params.push(limit);
       const [rows] = await pool.query(`SELECT * FROM ${table} ${where} ORDER BY ${pk} DESC LIMIT ?`, params);
+      logger.info('Found ' + rows.length + ' ' + table + ' rows');
       modernOk(res, rows);
-    } catch (e) { next(e); }
+    } catch (e) { logger.error('List ' + table + ' failed · ' + e.message); next(e); }
   });
 
   r.get('/:id', async (req, res, next) => {
     try {
+      logger.info('Get ' + table + ' · id=' + req.params.id);
       const [[row]] = await pool.query(`SELECT * FROM ${table} WHERE ${pk} = ?`, [req.params.id]);
-      if (!row) return modernError(res, 404, 'not found');
+      if (!row) {
+        logger.warn(table + ' not found · id=' + req.params.id);
+        return modernError(res, 404, 'not found');
+      }
       modernOk(res, row);
-    } catch (e) { next(e); }
+    } catch (e) { logger.error('Get ' + table + ' failed · id=' + req.params.id + ' · ' + e.message); next(e); }
   });
 
   r.post('/', validate(postSchema), async (req, res, next) => {
     try {
       const b = req.body || {};
+      logger.info('Create ' + table + ' · fields=' + Object.keys(b).join(','));
       const cols = [], vals = [];
       for (const c of allowedCols) if (b[c] !== undefined) { cols.push(c); vals.push(b[c]); }
-      if (cols.length === 0) return modernError(res, 400, 'body required');
+      if (cols.length === 0) {
+        logger.warn('Create ' + table + ' rejected · no allowed columns supplied');
+        return modernError(res, 400, 'body required');
+      }
       if (statusCol && b[statusCol] === undefined) { cols.push(statusCol); vals.push(1); }
       const [ins] = await pool.query(`INSERT INTO ${table} (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')})`, vals);
+      logger.info(table + ' created · id=' + ins.insertId);
       res.status(201);
       modernOk(res, { id: ins.insertId });
-    } catch (e) { next(e); }
+    } catch (e) { logger.error('Create ' + table + ' failed · ' + e.message); next(e); }
   });
 
   r.put('/:id', validate(putSchema), async (req, res, next) => {
     try {
       const b = req.body || {};
+      logger.info('Update ' + table + ' · id=' + req.params.id + ' fields=' + Object.keys(b).join(','));
       const sets = [], vals = [];
       for (const c of allowedCols) if (b[c] !== undefined) { sets.push(`${c} = ?`); vals.push(b[c]); }
-      if (sets.length === 0) return modernError(res, 400, 'nothing to update');
+      if (sets.length === 0) {
+        logger.warn('Update ' + table + ' rejected · id=' + req.params.id + ' · no allowed columns supplied');
+        return modernError(res, 400, 'nothing to update');
+      }
       vals.push(req.params.id);
       await pool.query(`UPDATE ${table} SET ${sets.join(', ')} WHERE ${pk} = ?`, vals);
+      logger.info(table + ' updated · id=' + req.params.id);
       modernOk(res, { updated: true });
-    } catch (e) { next(e); }
+    } catch (e) { logger.error('Update ' + table + ' failed · id=' + req.params.id + ' · ' + e.message); next(e); }
   });
 
   if (statusCol) {
     r.delete('/:id', async (req, res, next) => {
       try {
+        logger.info('Deactivate ' + table + ' · id=' + req.params.id);
         await pool.query(`UPDATE ${table} SET ${statusCol} = 0 WHERE ${pk} = ?`, [req.params.id]);
+        logger.info(table + ' deactivated · id=' + req.params.id);
         modernOk(res, { deactivated: true });
-      } catch (e) { next(e); }
+      } catch (e) { logger.error('Deactivate ' + table + ' failed · id=' + req.params.id + ' · ' + e.message); next(e); }
     });
   }
   return r;

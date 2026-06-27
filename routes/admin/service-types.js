@@ -5,6 +5,7 @@ const validate = require('../../middleware/validate');
 const { roleByName } = require('../../middleware/role');
 const svc = require('../../services/service-type.service');
 const { modernOk, modernError } = require('../../utils/response');
+const logger = require('../../logger');
 /*
  * Deep-skill catalog cache invalidation (2026-06-11). Mirrors the
  * pattern from routes/admin/deep-skills.js + routes/admin/service-categories.js
@@ -49,38 +50,57 @@ const updateBody = Joi.object({
 }).min(1);
 
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
-  try { modernOk(res, await svc.listTypes(req.query)); } catch (e) { next(e); }
+  try {
+    logger.info('List service types · q=' + (req.query.q || '') + ' categoryId=' + (req.query.categoryId || '') + ' includeInactive=' + req.query.includeInactive + ' limit=' + req.query.limit + ' offset=' + req.query.offset);
+    modernOk(res, await svc.listTypes(req.query));
+  } catch (e) { logger.error('List service types failed · ' + e.message); next(e); }
 });
 router.get('/:id', validate(idParam, 'params'), async (req, res, next) => {
   try {
+    logger.info('Get service type · id=' + req.params.id);
     const row = await svc.getTypeById(Number(req.params.id));
-    if (!row) return modernError(res, 404, 'Service Type not found');
+    if (!row) {
+      logger.warn('Service type not found · id=' + req.params.id);
+      return modernError(res, 404, 'Service Type not found');
+    }
     modernOk(res, row);
-  } catch (e) { next(e); }
+  } catch (e) { logger.error('Get service type failed · id=' + req.params.id + ' · ' + e.message); next(e); }
 });
 router.post('/', roleByName(['Admin']), validate(createBody), async (req, res, next) => {
   try {
+    logger.info('Create service type · name=' + req.body.service_type_name + ' categoryId=' + req.body.service_catg_id);
     const created = await svc.createType(req.body);
     invalidateCatalogCaches();
+    logger.info('Service type created · id=' + (created && created.service_type_id));
     res.status(201); modernOk(res, created, 'Service Type added');
   }
-  catch (e) { if (e.status) return modernError(res, e.status, e.message); next(e); }
+  catch (e) { if (e.status) { logger.warn('Create service type rejected · status=' + e.status + ' · ' + e.message); return modernError(res, e.status, e.message); } logger.error('Create service type failed · ' + e.message); next(e); }
 });
 router.patch('/:id', roleByName(['Admin']), validate(idParam, 'params'), validate(updateBody), async (req, res, next) => {
   try {
+    logger.info('Update service type · id=' + req.params.id + ' fields=' + Object.keys(req.body).join(','));
     const updated = await svc.updateType(Number(req.params.id), req.body);
-    if (!updated) return modernError(res, 404, 'Service Type not found');
+    if (!updated) {
+      logger.warn('Service type not found for update · id=' + req.params.id);
+      return modernError(res, 404, 'Service Type not found');
+    }
     invalidateCatalogCaches();
+    logger.info('Service type updated · id=' + req.params.id);
     modernOk(res, updated, 'Service Type updated');
-  } catch (e) { if (e.status) return modernError(res, e.status, e.message); next(e); }
+  } catch (e) { if (e.status) { logger.warn('Update service type rejected · id=' + req.params.id + ' · status=' + e.status + ' · ' + e.message); return modernError(res, e.status, e.message); } logger.error('Update service type failed · id=' + req.params.id + ' · ' + e.message); next(e); }
 });
 router.delete('/:id', roleByName(['Admin']), validate(idParam, 'params'), async (req, res, next) => {
   try {
+    logger.info('Delete service type · id=' + req.params.id);
     const ok = await svc.deleteType(Number(req.params.id));
-    if (!ok) return modernError(res, 404, 'Service Type not found');
+    if (!ok) {
+      logger.warn('Service type not found for delete · id=' + req.params.id);
+      return modernError(res, 404, 'Service Type not found');
+    }
     invalidateCatalogCaches();
+    logger.info('Service type deleted · id=' + req.params.id);
     modernOk(res, { deleted: true });
-  } catch (e) { if (e.status) return modernError(res, e.status, e.message); next(e); }
+  } catch (e) { if (e.status) { logger.warn('Delete service type rejected · id=' + req.params.id + ' · status=' + e.status + ' · ' + e.message); return modernError(res, e.status, e.message); } logger.error('Delete service type failed · id=' + req.params.id + ' · ' + e.message); next(e); }
 });
 
 module.exports = router;

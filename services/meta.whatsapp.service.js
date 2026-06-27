@@ -84,6 +84,7 @@ async function sendTemplate({
   recipientName,            // accepted for log-shape parity with Gallabox call sites; not sent
 }) {
   void recipientName;       // intentional no-op so unused-var linters stay quiet
+  logger.info('Send WhatsApp template · template=' + templateName);
   const originalPhone = normaliseIndianPhone(to);
   if (!originalPhone) return { delivered: false, error: `invalid phone "${to}"` };
   if (!templateName) return { delivered: false, error: 'templateName required' };
@@ -98,6 +99,7 @@ async function sendTemplate({
   const apiVersion    = process.env.META_WHATSAPP_API_VERSION || 'v20.0';
   const lang          = languageCode || process.env.META_WHATSAPP_DEFAULT_LANG || 'en';
   if (!phoneNumberId || !accessToken) {
+    logger.warn('WhatsApp send aborted · Meta credentials not configured · template=' + templateName);
     return {
       delivered: false,
       error: 'META_WHATSAPP_PHONE_NUMBER_ID / META_WHATSAPP_ACCESS_TOKEN not configured',

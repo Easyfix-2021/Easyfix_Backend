@@ -5,6 +5,7 @@ const job = require('../../services/job.service');
 const candidateRanking = require('../../services/candidate-ranking.service');
 const jobLocation = require('../../services/job-location.service');
 const { modernOk, modernError } = require('../../utils/response');
+const logger = require('../../logger');
 const {
   listQuery, createBody, updateBody, statusBody, assignBody, offerBody, ownerBody, idParam,
   candidatesQuery, candidatesSearchQuery,
@@ -65,10 +66,12 @@ router.get('/:id/location',
   scopedJob,
   async (req, res, next) => {
     try {
+      logger.info('Fetch job location · jobId=' + req.params.id + ' limit=' + req.query.limit);
       const [latest, track] = await Promise.all([
         jobLocation.getLatest(req.params.id),
         jobLocation.getTrack(req.params.id, { limit: req.query.limit }),
       ]);
+      logger.info('Returning job location · jobId=' + req.params.id + ' trackPoints=' + (track ? track.length : 0));
       modernOk(res, { latest, track });
     } catch (e) {
       if (e.status) return modernError(res, e.status, e.message);
@@ -83,6 +86,7 @@ router.get('/:id/candidates',
   async (req, res, next) => {
     try {
       const { limit, jobDate, timeSlot } = req.query;
+      logger.info('Rank candidates for job · jobId=' + req.params.id + ' limit=' + limit + ' jobDate=' + (jobDate || '-') + ' timeSlot=' + (timeSlot || '-'));
       const result = await candidateRanking.rankCandidatesForJob(req.params.id, {
         limit,
         // jobDate is a validated IST wall-clock string — pass it through
@@ -96,6 +100,7 @@ router.get('/:id/candidates',
         enforceMaxConcurrent: false,
         enforceCodBalance: true,
       });
+      logger.info('Returning ' + (result?.candidates?.length || 0) + ' ranked candidates · jobId=' + req.params.id + (result?.note ? ' note=' + result.note : ''));
       modernOk(res, result);
     } catch (e) {
       if (e.status) return modernError(res, e.status, e.message);
@@ -122,6 +127,7 @@ router.get('/:id/candidates/search',
   async (req, res, next) => {
     try {
       const { term, limit, jobDate, timeSlot } = req.query;
+      logger.info('Search technicians for job · jobId=' + req.params.id + ' term="' + (term || '') + '" limit=' + limit);
       const result = await candidateRanking.searchTechniciansForJob(req.params.id, {
         term,
         limit,
@@ -130,6 +136,7 @@ router.get('/:id/candidates/search',
         jobDate: jobDate || undefined,
         timeSlot,
       });
+      logger.info('Returning ' + (result?.candidates?.length || 0) + ' matched technicians · jobId=' + req.params.id);
       modernOk(res, result);
     } catch (e) {
       if (e.status) return modernError(res, e.status, e.message);
@@ -145,8 +152,10 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
     // list in lib/scope.js.
     const { buildRequestScopeWithHierarchy } = require('../../lib/scope');
     const { pool } = require('../../db');
+    logger.info('List jobs · status=' + (req.query.status ?? '-') + ' clientId=' + (req.query.clientId ?? '-') + ' cityId=' + (req.query.cityId ?? '-') + ' limit=' + req.query.limit + ' offset=' + req.query.offset);
     const scope = await buildRequestScopeWithHierarchy(req, pool);
     const { rows, total } = await job.list({ ...req.query, scope });
+    logger.info('Returning ' + rows.length + ' jobs (total=' + total + ')');
     modernOk(res, { items: rows, total, limit: req.query.limit, offset: req.query.offset });
   } catch (e) { next(e); }
 });
@@ -178,6 +187,7 @@ router.get('/export.xlsx', validate(listQuery, 'query'), async (req, res, next) 
   try {
     const { buildRequestScopeWithHierarchy } = require('../../lib/scope');
     const { pool } = require('../../db');
+    logger.info('Export jobs xlsx · status=' + (req.query.status ?? '-') + ' clientId=' + (req.query.clientId ?? '-') + ' from=' + (req.query.startDate || '-') + ' to=' + (req.query.endDate || '-'));
     const scope = await buildRequestScopeWithHierarchy(req, pool);
 
     // Reuse the list() builder. Strip pagination — we want the
@@ -190,6 +200,7 @@ router.get('/export.xlsx', validate(listQuery, 'query'), async (req, res, next) 
       scope,
     });
     const truncated = total > EXPORT_CAP;
+    logger.info('Streaming jobs export · ' + rows.length + ' rows (total=' + total + ', truncated=' + truncated + ')');
 
     // Status enum → human label. Mirrors STATUS_LABEL in
     // /escalated/export.xlsx + the FE statusLabel utility.
@@ -301,6 +312,7 @@ router.get('/export.xlsx', validate(listQuery, 'query'), async (req, res, next) 
 router.get('/counts', async (req, res, next) => {
   try {
     const ownerId = req.query.ownerId ? Number(req.query.ownerId) : undefined;
+    logger.info('Fetch job status counts · ownerId=' + (Number.isFinite(ownerId) ? ownerId : '-'));
     // Dashboard cards must respect the caller's RBAC scope (hierarchy-
     // unioned). req.scope is attached by the global admin middleware
     // (routes/admin/index.js). Admin/Finance get undefined → no row filter.
@@ -333,6 +345,7 @@ router.get('/counts', async (req, res, next) => {
  */
 router.get('/attention-summary', async (req, res, next) => {
   try {
+    logger.info('Fetch attention summary');
     const data = await job.getAttentionSummary({ scope: req.scope });
     modernOk(res, data);
   } catch (e) { next(e); }
@@ -374,6 +387,7 @@ router.get('/escalated', async (req, res, next) => {
     const q = String(req.query.q || '').trim();
     const limit = Math.max(1, Math.min(500, Number(req.query.limit) || 100));
     const offset = Math.max(0, Number(req.query.offset) || 0);
+    logger.info('List escalated jobs · status=' + status + ' q="' + q + '" limit=' + limit + ' offset=' + offset);
 
     const clauses = ['e.is_escalated = 1', 'e.escalated_time IS NOT NULL'];
     const params = [];
@@ -473,6 +487,7 @@ router.get('/escalated', async (req, res, next) => {
     const [[{ total }]] = await pool.query(
       `SELECT COUNT(*) AS total ${baseFrom} ${where}`, params
     );
+    logger.info('Returning ' + rows.length + ' escalated jobs (total=' + total + ')');
     modernOk(res, { items: rows, total, limit, offset });
   } catch (e) { next(e); }
 });
@@ -500,6 +515,7 @@ router.get('/escalated', async (req, res, next) => {
 router.get('/escalated/export.xlsx', async (req, res, next) => {
   try {
     const status = String(req.query.status || 'open').toLowerCase();
+    logger.info('Export escalated jobs xlsx · status=' + status);
 
     const clauses = ['e.is_escalated = 1', 'e.escalated_time IS NOT NULL'];
     const params = [];
@@ -588,6 +604,7 @@ router.get('/escalated/export.xlsx', async (req, res, next) => {
        LIMIT 5000`,
       params
     );
+    logger.info('Found ' + rows.length + ' escalated jobs for export · status=' + status);
 
     // Enum-to-label maps mirror the FE's TEAM_ACTIONS / COMPLETED_ACTIONS /
     // CLOSED_ACTIONS in EscalatedJobsModal.tsx. If either list changes,
@@ -727,6 +744,7 @@ router.patch('/escalated/:tableId', async (req, res, next) => {
     if (!Number.isInteger(tableId) || tableId <= 0) {
       return modernError(res, 400, 'invalid tableId');
     }
+    logger.info('Update escalation row · tableId=' + tableId);
     const sets = [];
     const params = [];
     const b = req.body || {};
@@ -783,8 +801,10 @@ router.patch('/escalated/:tableId', async (req, res, next) => {
       params
     );
     if (r.affectedRows === 0) {
+      logger.warn('Escalation row not found · tableId=' + tableId);
       return modernError(res, 404, 'escalation row not found');
     }
+    logger.info('Escalation updated · tableId=' + tableId + ' fields=' + sets.length);
     modernOk(res, { updated: true });
   } catch (e) { next(e); }
 });
@@ -827,6 +847,7 @@ router.get('/comment-reasons', async (req, res, next) => {
   try {
     const dueRaw = String(req.query.dueTo || '').toLowerCase().replace(/\s+/g, '');
     const userType = DUE_TO_USER_TYPE[dueRaw] || 2; // legacy default = Client
+    logger.info('Fetch comment reasons · dueTo=' + (dueRaw || '-') + ' userType=' + userType);
     const [rows] = await imagePool.query(
       `SELECT id, action_desc FROM action_taken_reason
         WHERE action_type = ? AND user_type = ?
@@ -837,6 +858,7 @@ router.get('/comment-reasons', async (req, res, next) => {
     const items = rows
       .map((r) => ({ id: r.id, label: String(r.action_desc || '').trim() }))
       .filter((x) => x.label);
+    logger.info('Returning ' + items.length + ' comment reasons');
     modernOk(res, items);
   } catch (e) { next(e); }
 });
@@ -872,6 +894,7 @@ router.get('/comment-reasons', async (req, res, next) => {
 router.get('/:id/transaction', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
   const jobId = Number(req.params.id);
   try {
+    logger.info('Fetch job transaction view · jobId=' + jobId);
     const detail = req.scopedJob; // populated by `scopedJob` middleware
 
     // Image-stage bucketing key. Prefer the text `image_category`
@@ -986,6 +1009,7 @@ router.get('/:id/transaction', validate(idParam, 'params'), scopedJob, async (re
       images_by_stage[k].push(r);
     }
 
+    logger.info('Returning job transaction view · jobId=' + jobId + ' comments=' + comments.length + ' quotations=' + quotations.length + ' images=' + imageRows.length + ' history=' + historyRows.length);
     modernOk(res, {
       job: detail,
       feedback,
@@ -1034,6 +1058,7 @@ router.get('/:id/transaction', validate(idParam, 'params'), scopedJob, async (re
 router.get('/action-reasons', async (req, res, next) => {
   try {
     const type = String(req.query.type || '').trim().toLowerCase();
+    logger.info('Fetch action reasons · type=' + (type || '-') + ' dueTo=' + (req.query.dueTo || '-'));
     if (!type) return modernError(res, 400, 'type is required (unreachable|enquiry)');
     // Strip whitespace/underscores/dashes so 'un_reachable' / 'un-reachable' /
     // 'unreachable' / 'Un Reachable' all map to the same bucket.
@@ -1054,16 +1079,19 @@ router.get('/action-reasons', async (req, res, next) => {
     const items = reasonRows
       .map((r) => ({ id: r.id, label: String(r.action_desc || '').trim() }))
       .filter((x) => x.label);
+    logger.info('Returning ' + items.length + ' action reasons · type=' + type);
     modernOk(res, items);
   } catch (e) { next(e); }
 });
 
 router.get('/:id', validate(idParam, 'params'), scopedJob, async (req, res) => {
+  logger.info('Fetch job detail · jobId=' + req.params.id);
   modernOk(res, req.scopedJob);
 });
 
 router.post('/', validate(createBody), async (req, res, next) => {
   try {
+    logger.info('Create job · clientId=' + req.body.fk_client_id + ' cityId=' + (req.body.address?.city_id ?? '-') + ' initialStatus=' + (req.body.initial_status ?? 0) + ' services=' + (Array.isArray(req.body.services) ? req.body.services.length : 0));
     // Scope check on create: caller can only create jobs for a client/city
     // within their manage_* scope. Same guard runs on subsequent edits via
     // the `scopedJob` middleware.
@@ -1071,7 +1099,10 @@ router.post('/', validate(createBody), async (req, res, next) => {
       client_id: req.body.fk_client_id,
       city_id:   req.body.address?.city_id,
     });
-    if (!guard.ok) return modernError(res, 403, 'cannot create a job outside your assigned scope');
+    if (!guard.ok) {
+      logger.warn('Create job denied · clientId=' + req.body.fk_client_id + ' out of scope');
+      return modernError(res, 403, 'cannot create a job outside your assigned scope');
+    }
 
     /*
      * Services-required gate (added 2026-05-28 after Job #482453 was
@@ -1089,6 +1120,7 @@ router.post('/', validate(createBody), async (req, res, next) => {
     const isBookedStatus = req.body.initial_status === undefined || req.body.initial_status === 0;
     const hasServices = Array.isArray(req.body.services) && req.body.services.length > 0;
     if (isBookedStatus && !hasServices) {
+      logger.warn('Create job rejected · BOOKED status with zero services · clientId=' + req.body.fk_client_id);
       return modernError(
         res,
         400,
@@ -1099,6 +1131,7 @@ router.post('/', validate(createBody), async (req, res, next) => {
     }
 
     const created = await job.create(req.body, req.user);
+    logger.info('Job created · id=' + (created?.job_id ?? created?.id ?? '?'));
     res.status(201);
     modernOk(res, created, 'job created');
   } catch (e) { next(e); }
@@ -1112,7 +1145,9 @@ router.post('/', validate(createBody), async (req, res, next) => {
  */
 const updateHandler = async (req, res, next) => {
   try {
+    logger.info('Update job · jobId=' + req.params.id + ' fields=' + Object.keys(req.body || {}).join(','));
     const updated = await job.update(req.params.id, req.body, req.user);
+    logger.info('Job updated · id=' + req.params.id);
     modernOk(res, updated, 'job updated');
   } catch (e) { next(e); }
 };
@@ -1121,6 +1156,7 @@ router.patch('/:id', validate(idParam, 'params'), validate(updateBody), scopedJo
 
 router.patch('/:id/status', validate(idParam, 'params'), validate(statusBody), scopedJob, async (req, res, next) => {
   try {
+    logger.info('Change job status · jobId=' + req.params.id + ' status=' + req.body?.status);
     /*
      * Services-required gate on the BOOKED transition (added 2026-05-28).
      * When a job is being promoted to status=0 (typically 9 → 0 from the
@@ -1139,6 +1175,7 @@ router.patch('/:id/status', validate(idParam, 'params'), validate(statusBody), s
       );
       const serviceCount = Number(rows?.[0]?.n ?? 0);
       if (serviceCount === 0) {
+        logger.warn('Status change to BOOKED rejected · jobId=' + req.params.id + ' zero services');
         return modernError(
           res,
           400,
@@ -1150,13 +1187,16 @@ router.patch('/:id/status', validate(idParam, 'params'), validate(statusBody), s
     }
 
     const updated = await job.setStatus(req.params.id, req.body, req.user);
+    logger.info('Job status updated · jobId=' + req.params.id + ' status=' + req.body?.status);
     modernOk(res, updated, 'job status updated');
   } catch (e) { next(e); }
 });
 
 router.patch('/:id/assign', validate(idParam, 'params'), validate(assignBody), scopedJob, async (req, res, next) => {
   try {
+    logger.info('Assign technician · jobId=' + req.params.id + ' efrId=' + (req.body?.easyfixerId ?? req.body?.efr_id ?? '-'));
     const updated = await job.assign(req.params.id, req.body, req.user);
+    logger.info('Technician assigned · jobId=' + req.params.id);
     modernOk(res, updated, 'technician assigned');
   } catch (e) { next(e); }
 });
@@ -1180,10 +1220,12 @@ router.patch('/:id/assign', validate(idParam, 'params'), validate(assignBody), s
 router.post('/:id/offer', validate(idParam, 'params'), validate(offerBody), scopedJob, async (req, res, next) => {
   try {
     const { easyfixerIds, requestedDateTime, timeSlot } = req.body;
+    logger.info('Offer job to technicians · jobId=' + req.params.id + ' count=' + (Array.isArray(easyfixerIds) ? easyfixerIds.length : 0));
     const opts = {};
     if (requestedDateTime !== undefined) opts.requestedDateTime = requestedDateTime;
     if (timeSlot !== undefined) opts.timeSlot = timeSlot;
     const result = await job.offerToTechnicians(Number(req.params.id), easyfixerIds, req.user, opts);
+    logger.info('Job offered to technicians · jobId=' + req.params.id + ' offered=' + (Array.isArray(easyfixerIds) ? easyfixerIds.length : 0));
     modernOk(res, result, 'job offered to technicians');
   } catch (e) {
     if (e.status) return modernError(res, e.status, e.message);
@@ -1203,7 +1245,9 @@ router.post('/:id/offer', validate(idParam, 'params'), validate(offerBody), scop
  */
 router.get('/:id/offers', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
   try {
+    logger.info('List job offers · jobId=' + req.params.id);
     const items = await job.listOffers(Number(req.params.id));
+    logger.info('Returning ' + items.length + ' job offers · jobId=' + req.params.id);
     modernOk(res, { items });
   } catch (e) {
     if (e.status) return modernError(res, e.status, e.message);
@@ -1213,7 +1257,9 @@ router.get('/:id/offers', validate(idParam, 'params'), scopedJob, async (req, re
 
 router.patch('/:id/owner', validate(idParam, 'params'), validate(ownerBody), scopedJob, async (req, res, next) => {
   try {
+    logger.info('Change job owner · jobId=' + req.params.id + ' newOwnerId=' + (req.body?.newOwnerId ?? '-'));
     const updated = await job.changeOwner(req.params.id, req.body, req.user);
+    logger.info('Job owner changed · jobId=' + req.params.id);
     modernOk(res, updated, 'job owner changed');
   } catch (e) { next(e); }
 });
@@ -1254,7 +1300,9 @@ router.post('/bulk-owner-transfer',
   async (req, res, next) => {
     try {
       const { fromOwnerId, toOwnerId, reason, jobIds, filters: bodyFilters } = req.body;
+      logger.info('Bulk owner transfer · fromOwnerId=' + fromOwnerId + ' toOwnerId=' + toOwnerId + ' mode=' + (Array.isArray(jobIds) && jobIds.length ? 'explicit(' + jobIds.length + ')' : 'filters'));
       if (fromOwnerId === toOwnerId) {
+        logger.warn('Bulk owner transfer rejected · from and to owner identical (' + fromOwnerId + ')');
         return modernError(res, 400, 'fromOwnerId and toOwnerId cannot be the same');
       }
 
@@ -1277,6 +1325,7 @@ router.post('/bulk-owner-transfer',
         });
         targetIds = rows.map((r) => r.job_id);
       }
+      logger.info('Bulk owner transfer resolved ' + targetIds.length + ' target jobs');
 
       if (targetIds.length === 0) {
         return modernOk(res, {
@@ -1318,6 +1367,7 @@ router.post('/bulk-owner-transfer',
         }
       }
 
+      logger.info('Bulk owner transfer complete · total=' + targetIds.length + ' transferred=' + transferred + ' failed=' + failed + ' skipped=' + skipped);
       modernOk(res, {
         summary: { total: targetIds.length, transferred, failed, skipped },
         results,
@@ -1347,6 +1397,7 @@ const holdBody = require('joi').object({
 });
 router.put('/:id/hold', validate(idParam, 'params'), validate(holdBody), scopedJob, async (req, res, next) => {
   try {
+    logger.info('Place fulfillment hold · jobId=' + req.params.id);
     await pool.query(
       `UPDATE tbl_job
           SET job_status = 21,
@@ -1358,12 +1409,15 @@ router.put('/:id/hold', validate(idParam, 'params'), validate(holdBody), scopedJ
         WHERE job_id = ?`,
       [req.body.reason, req.body.appointment_time, req.user.user_id, req.params.id]
     );
+    logger.info('Fulfillment hold placed · jobId=' + req.params.id + ' status=21');
     modernOk(res, { on_hold: true, status: 21 });
   } catch (e) { next(e); }
 });
 router.post('/:id/hold/release', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
   try {
+    logger.info('Release fulfillment hold · jobId=' + req.params.id);
     await pool.query('UPDATE tbl_job SET job_status = 10 WHERE job_id = ?', [req.params.id]);
+    logger.info('Fulfillment hold released · jobId=' + req.params.id + ' status=10');
     modernOk(res, { released: true, status: 10 });
   } catch (e) { next(e); }
 });
@@ -1389,6 +1443,7 @@ const emailServiceForJobs = require('../../services/email.service');
 router.get('/:id/estimate/preview', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
   try {
     const jobId = Number(req.params.id);
+    logger.info('Preview estimate · jobId=' + jobId);
     const [services] = await pool.query(
       `SELECT js.job_service_id, js.quantity, js.total_charge, js.material_charge,
               CR.crc_ratecard_name AS service_name
@@ -1404,6 +1459,7 @@ router.get('/:id/estimate/preview', validate(idParam, 'params'), scopedJob, asyn
       line_total: Number(s.total_charge || 0) * Number(s.quantity || 1) + Number(s.material_charge || 0),
     }));
     const grand_total = lines.reduce((sum, l) => sum + l.line_total, 0);
+    logger.info('Returning estimate preview · jobId=' + jobId + ' services=' + lines.length + ' grandTotal=' + grand_total);
     modernOk(res, { job_id: jobId, services: lines, grand_total });
   } catch (e) { next(e); }
 });
@@ -1425,6 +1481,7 @@ router.get('/:id/service-breakdown', validate(idParam, 'params'), scopedJob, asy
   try {
     const { calculateCharges } = require('../../services/client-rate-cards.service');
     const jobId = Number(req.params.id);
+    logger.info('Compute service breakdown · jobId=' + jobId);
     const [rows] = await pool.query(
       `SELECT js.job_service_id, js.service_id, js.quantity, js.total_charge,
               cs.total_amount,
@@ -1495,6 +1552,7 @@ router.get('/:id/service-breakdown', validate(idParam, 'params'), scopedJob, asy
     const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
     for (const k of Object.keys(totals)) totals[k] = round2(totals[k]);
 
+    logger.info('Returning service breakdown · jobId=' + jobId + ' lineItems=' + lineItems.length);
     modernOk(res, { job_id: jobId, lineItems, totals });
   } catch (e) { next(e); }
 });
@@ -1521,6 +1579,7 @@ router.post('/:id/services/:jobServiceId/restore',
     try {
       const jobId = Number(req.params.id);
       const jobServiceId = Number(req.params.jobServiceId);
+      logger.info('Restore job service · jobId=' + jobId + ' jobServiceId=' + jobServiceId);
       if (!Number.isFinite(jobServiceId) || jobServiceId <= 0) {
         return res.status(400).json({ error: 'Invalid jobServiceId' });
       }
@@ -1532,6 +1591,7 @@ router.post('/:id/services/:jobServiceId/restore',
             AND (job_service_status IS NULL OR job_service_status = 0)`,
         [jobId, jobServiceId],
       );
+      logger.info('Job service restore · jobServiceId=' + jobServiceId + ' restored=' + (r.affectedRows > 0));
       modernOk(res, { restored: r.affectedRows > 0, job_id: jobId, job_service_id: jobServiceId });
     } catch (e) { next(e); }
   });
@@ -1554,6 +1614,7 @@ router.delete('/:id/services/:jobServiceId',
     try {
       const jobId = Number(req.params.id);
       const jobServiceId = Number(req.params.jobServiceId);
+      logger.info('Soft-delete job service · jobId=' + jobId + ' jobServiceId=' + jobServiceId);
       if (!Number.isFinite(jobServiceId) || jobServiceId <= 0) {
         return res.status(400).json({ error: 'Invalid jobServiceId' });
       }
@@ -1565,6 +1626,7 @@ router.delete('/:id/services/:jobServiceId',
             AND (job_service_status IS NULL OR job_service_status = 1)`,
         [jobId, jobServiceId],
       );
+      logger.info('Job service soft-delete · jobServiceId=' + jobServiceId + ' removed=' + (r.affectedRows > 0));
       modernOk(res, { removed: r.affectedRows > 0, job_id: jobId, job_service_id: jobServiceId });
     } catch (e) { next(e); }
   });
@@ -1616,6 +1678,7 @@ router.patch('/:id/services/:jobServiceId',
       const jobId = Number(req.params.id);
       const jobServiceId = Number(req.params.jobServiceId);
       const { quantity } = req.body;
+      logger.info('Update job service quantity · jobId=' + jobId + ' jobServiceId=' + jobServiceId + ' quantity=' + quantity);
       // Quantity change → all 5 charge columns recompute via the shared
       // cascade helper (utils/rate-card-calc.js). Look up the existing
       // row's service_id (= client_service_id) so we can fetch the rate
@@ -1624,7 +1687,10 @@ router.patch('/:id/services/:jobServiceId',
         `SELECT service_id FROM tbl_job_services WHERE job_service_id = ? AND job_id = ? LIMIT 1`,
         [jobServiceId, jobId],
       );
-      if (!existing.length) return res.status(404).json({ error: 'service not found' });
+      if (!existing.length) {
+        logger.warn('Update job service quantity · jobServiceId=' + jobServiceId + ' not found');
+        return res.status(404).json({ error: 'service not found' });
+      }
       const { loadRateCardRow, computeJobServiceCharges } = require('../../utils/rate-card-calc');
       const rateCard = await loadRateCardRow(pool, existing[0].service_id);
       const ch = computeJobServiceCharges(rateCard, quantity);
@@ -1643,8 +1709,10 @@ router.patch('/:id/services/:jobServiceId',
          jobId, jobServiceId],
       );
       if (!r.affectedRows) {
+        logger.warn('Update job service quantity · jobServiceId=' + jobServiceId + ' not found or inactive');
         return res.status(404).json({ error: 'service not found or inactive' });
       }
+      logger.info('Job service quantity updated · jobServiceId=' + jobServiceId + ' quantity=' + quantity);
       modernOk(res, { updated: true, job_id: jobId, job_service_id: jobServiceId, quantity, charges: ch });
     } catch (e) { next(e); }
   });
@@ -1693,6 +1761,7 @@ router.post('/:id/services',
     try {
       const jobId = Number(req.params.id);
       const { service_id, service_type_id, service_category_id, quantity } = req.body;
+      logger.info('Append job service · jobId=' + jobId + ' serviceId=' + service_id + ' quantity=' + quantity);
       // Reactivate existing soft-deleted row if present.
       const [existing] = await pool.query(
         `SELECT job_service_id, job_service_status, quantity FROM tbl_job_services
@@ -1722,6 +1791,7 @@ router.post('/:id/services',
           [quantity, ch.total_charge, ch.total_cost, ch.client_charge, ch.easyfix_charge, ch.easyfixer_charge,
            row.job_service_id],
         );
+        logger.info('Job service reactivated · jobId=' + jobId + ' jobServiceId=' + row.job_service_id);
         return modernOk(res, { reactivated: true, job_service_id: row.job_service_id, charges: ch });
       }
       const [ins] = await pool.query(
@@ -1732,6 +1802,7 @@ router.post('/:id/services',
         [jobId, service_id, service_type_id || null, service_category_id || null, quantity,
          ch.total_charge, ch.total_cost, ch.client_charge, ch.easyfix_charge, ch.easyfixer_charge],
       );
+      logger.info('Job service added · jobId=' + jobId + ' jobServiceId=' + ins.insertId);
       res.status(201);
       modernOk(res, { added: true, job_service_id: ins.insertId, charges: ch });
     } catch (e) { next(e); }
@@ -1746,6 +1817,7 @@ router.post('/:id/estimate/send-for-approval',
   async (req, res, next) => {
     try {
       const jobId = Number(req.params.id);
+      logger.info('Send estimate for approval · jobId=' + jobId);
       const conn = await pool.getConnection();
       try {
         await conn.beginTransaction();
@@ -1764,6 +1836,7 @@ router.post('/:id/estimate/send-for-approval',
       // Fire email asynchronously — failure shouldn't roll back the
       // state transition. Reporting contact email lives on tbl_client_contacts.
       sendEstimateEmail(jobId, req.user.user_id).catch(() => {});
+      logger.info('Estimate sent for approval · jobId=' + jobId + ' status=15');
       modernOk(res, { sent: true, status: 15 });
     } catch (e) { next(e); }
   }
@@ -1782,7 +1855,10 @@ async function sendEstimateEmail(jobId, userId) {
       WHERE j.job_id = ? LIMIT 1`,
     [jobId]
   );
-  if (!j) return;
+  if (!j) {
+    logger.warn('Estimate email skipped — job not found · jobId=' + jobId);
+    return;
+  }
   const [services] = await pool.query(
     `SELECT js.quantity, js.total_charge, js.material_charge,
             CR.crc_ratecard_name AS service_name
@@ -1845,6 +1921,7 @@ async function sendEstimateEmail(jobId, userId) {
       + `Kindly approve via the client portal.\n\nRegards,\nEasyFix`,
     category: 'estimate.send-for-approval',
   });
+  logger.info('Estimate email sent · jobId=' + jobId + ' recipients=' + recipients.size);
 }
 
 // ─── Job Comments sub-resource (legacy tbl_job_comment) ──────────────
@@ -1875,8 +1952,12 @@ const commentBody = Joi.object({
 });
 
 router.get('/:id/comments', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
-  try { modernOk(res, await jobComments.listComments(req.params.id)); }
-  catch (e) { next(e); }
+  try {
+    logger.info('List job comments · jobId=' + req.params.id);
+    const comments = await jobComments.listComments(req.params.id);
+    logger.info('Returning ' + comments.length + ' job comments · jobId=' + req.params.id);
+    modernOk(res, comments);
+  } catch (e) { next(e); }
 });
 
 router.post('/:id/comments',
@@ -1885,10 +1966,12 @@ router.post('/:id/comments',
   scopedJob,
   async (req, res, next) => {
     try {
+      logger.info('Add job comment · jobId=' + req.params.id + ' commentOn=' + req.body?.comment_on);
       const created = await jobComments.addComment(req.params.id, {
         ...req.body,
         commented_by: req.user?.user_id,
       });
+      logger.info('Job comment added · jobId=' + req.params.id);
       res.status(201);
       modernOk(res, created, 'Comment added');
     } catch (e) {
@@ -1910,8 +1993,10 @@ const feedbackBody = Joi.object({
 }).min(1);
 
 router.get('/:id/feedback', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
-  try { modernOk(res, await jobFeedback.getFeedback(req.params.id)); }
-  catch (e) { next(e); }
+  try {
+    logger.info('Fetch job feedback · jobId=' + req.params.id);
+    modernOk(res, await jobFeedback.getFeedback(req.params.id));
+  } catch (e) { next(e); }
 });
 
 router.put('/:id/feedback',
@@ -1920,7 +2005,9 @@ router.put('/:id/feedback',
   scopedJob,
   async (req, res, next) => {
     try {
+      logger.info('Save job feedback · jobId=' + req.params.id);
       const row = await jobFeedback.upsertFeedback(Number(req.params.id), req.body);
+      logger.info('Job feedback saved · jobId=' + req.params.id);
       modernOk(res, row, 'Feedback saved');
     } catch (e) { next(e); }
   }
@@ -1932,6 +2019,7 @@ router.put('/:id/feedback',
 // scopedJob enforces the same row-level scope as every other /:id route.
 router.get('/:id/customer-requests', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
   try {
+    logger.info('List customer requests · jobId=' + req.params.id);
     const [rows] = await pool.query(
       `SELECT request_id, request_type, reason, remarks,
               preferred_datetime, request_status, created_at
@@ -1940,6 +2028,7 @@ router.get('/:id/customer-requests', validate(idParam, 'params'), scopedJob, asy
         ORDER BY created_at DESC`,
       [Number(req.params.id)],
     );
+    logger.info('Returning ' + rows.length + ' customer requests · jobId=' + req.params.id);
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
@@ -2104,6 +2193,7 @@ router.get('/images/:imageId/file', async (req, res, next) => {
     if (!Number.isInteger(imageId) || imageId <= 0) {
       return modernError(res, 400, 'invalid imageId');
     }
+    logger.info('Serve job image file · imageId=' + imageId);
     const [[row]] = await imagePool.query(
       'SELECT image_id, job_id, image FROM tbl_job_image WHERE image_id = ? LIMIT 1',
       [imageId]
@@ -2275,6 +2365,7 @@ router.get('/videos/:mediaId/file', async (req, res, next) => {
     if (!Number.isInteger(mediaId) || mediaId <= 0) {
       return modernError(res, 400, 'invalid mediaId');
     }
+    logger.info('Serve job video file · mediaId=' + mediaId);
     const [[row]] = await imagePool.query(
       'SELECT media_id, job_id, s3_key FROM tbl_job_media WHERE media_id = ? LIMIT 1',
       [mediaId],

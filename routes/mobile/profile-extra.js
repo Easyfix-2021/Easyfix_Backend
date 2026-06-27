@@ -66,6 +66,7 @@ router.patch('/profile/name', validate(Joi.object({
   name: Joi.string().trim().min(1).max(255).required(),
 })), async (req, res, next) => {
   try {
+    logger.info('Update profile name');
     modernOk(res, await svc.updateName(req.tech.efr_id, req.body.name));
   } catch (e) { next(e); }
 });
@@ -83,8 +84,10 @@ router.patch('/profile/name', validate(Joi.object({
 router.post('/profile/image', profileImageUpload.single('file'), async (req, res, next) => {
   try {
     if (!req.file) {
+      logger.warn('Profile image upload rejected · missing "file" field');
       return modernError(res, 400, 'missing "file" upload');
     }
+    logger.info(`Profile image upload · type=${req.file.mimetype} bytes=${req.file.size}`);
     return modernOk(res, await svc.setProfileImageFromUpload(
       req.tech.efr_id,
       req.file.buffer,
@@ -93,9 +96,11 @@ router.post('/profile/image', profileImageUpload.single('file'), async (req, res
     ));
   } catch (e) {
     if (e?.code === 'LIMIT_FILE_SIZE') {
+      logger.warn('Profile image upload rejected · file exceeds 10MB');
       return modernError(res, 400, 'file exceeds 10MB');
     }
     if (e?.code === 'LIMIT_UNEXPECTED_FILE') {
+      logger.warn(`Profile image upload rejected · ${e.message}`);
       return modernError(res, 400, e.message || 'unsupported file');
     }
     return next(e);
@@ -130,6 +135,7 @@ router.get('/earnings', validate(dateWindow, 'query'), async (req, res, next) =>
 
 router.get('/icard', async (req, res, next) => {
   try {
+    logger.info('I-Card requested');
     modernOk(res, await svc.getICard(req.tech.efr_id));
   } catch (e) { next(e); }
 });
@@ -140,6 +146,7 @@ router.get('/icard', async (req, res, next) => {
 
 router.get('/ratings', validate(dateWindow, 'query'), async (req, res, next) => {
   try {
+    logger.info(`Ratings requested · ${req.query.from || 'all'} → ${req.query.to || 'all'}`);
     modernOk(res, await svc.getRatings(req.tech.efr_id, {
       from: req.query.from,
       to: req.query.to,
@@ -153,6 +160,7 @@ router.get('/ratings', validate(dateWindow, 'query'), async (req, res, next) => 
 
 router.get('/training-videos/percentage', async (req, res, next) => {
   try {
+    logger.info('Training video percentages requested');
     modernOk(res, await svc.getTrainingPercentages(req.tech.efr_id));
   } catch (e) { next(e); }
 });
@@ -162,6 +170,7 @@ router.post('/training-videos/percentage', validate(Joi.object({
   watchedPercentage: Joi.number().integer().min(0).max(100).required(),
 })), async (req, res, next) => {
   try {
+    logger.info(`Set training video percentage · videoId=${req.body.videoId} watched=${req.body.watchedPercentage}%`);
     modernOk(res, await svc.setTrainingPercentage(
       req.tech.efr_id,
       req.body.videoId,
@@ -176,6 +185,7 @@ router.post('/training-videos/percentage', validate(Joi.object({
 
 router.get('/app-version', (_req, res, next) => {
   try {
+    logger.info('App version requested');
     modernOk(res, svc.getAppVersion());
   } catch (e) { next(e); }
 });
@@ -188,6 +198,7 @@ router.post('/logout', validate(Joi.object({
   deviceId: Joi.string().trim().max(255).optional(),
 })), async (req, res, next) => {
   try {
+    logger.info(`Logout · deviceId ${req.body.deviceId ? 'provided' : 'absent'}`);
     modernOk(res, await svc.logout(req.tech.efr_id, req.body.deviceId || null));
   } catch (e) { next(e); }
 });
@@ -198,6 +209,7 @@ router.post('/logout', validate(Joi.object({
 
 router.get('/upi-details', async (req, res, next) => {
   try {
+    logger.info('UPI details requested');
     modernOk(res, await svc.getUpiDetails(req.tech.efr_id));
   } catch (e) { next(e); }
 });
@@ -207,6 +219,7 @@ router.post('/upi-details', validate(Joi.object({
   isPrimary: Joi.boolean().optional(),
 })), async (req, res, next) => {
   try {
+    logger.info(`Add UPI detail · isPrimary=${req.body.isPrimary === true}`);
     modernOk(res, await svc.addUpiDetail(
       req.tech.efr_id,
       req.body.upiId,
@@ -228,6 +241,7 @@ router.get('/kyc/aadhaar-pan-exists/:number', validate(Joi.object({
   number: Joi.string().trim().pattern(/^([0-9]{12}|[A-Za-z]{5}[0-9]{4}[A-Za-z])$/).required(),
 }), 'params'), async (req, res, next) => {
   try {
+    logger.info(`KYC duplicate-check · type=${/^[0-9]{12}$/.test(req.params.number) ? 'aadhaar' : 'pan'}`);
     modernOk(res, await svc.aadhaarPanExists(req.params.number, req.tech.efr_id));
   } catch (e) { next(e); }
 });

@@ -111,6 +111,7 @@ async function getOwnedJob(jobId, efrId) {
  * gated) so the CRM "cancelled by app" reporting keeps working.
  */
 async function cancel(jobId, efrId, { reason, reasonId }) {
+  logger.info('Cancel job · jobId=' + jobId + ' reasonId=' + (reasonId ?? '-'));
   await getOwnedJob(jobId, efrId);
 
   await jobService.setStatus(
@@ -140,9 +141,11 @@ async function cancel(jobId, efrId, { reason, reasonId }) {
       );
     }
   } catch (mirrorErr) {
+    logger.warn('Cancel app-reason mirror failed (job already cancelled) · jobId=' + jobId + ' · ' + mirrorErr.message);
     logger.warn({ err: mirrorErr.message, jobId, efrId }, 'cancel: app-reason mirror failed (job already cancelled)');
   }
 
+  logger.info('Job cancelled · jobId=' + jobId);
   return { cancelled: true };
 }
 
@@ -161,6 +164,7 @@ async function cancel(jobId, efrId, { reason, reasonId }) {
  * notification-orchestrator fallback pattern) + sms.service.send.
  */
 async function sendCheckinSms(jobId, efrId) {
+  logger.info('Send check-in PIN SMS · jobId=' + jobId);
   await getOwnedJob(jobId, efrId);
 
   // Pull the customer's mobile + the PIN in one indexed join.
@@ -191,6 +195,7 @@ async function sendCheckinSms(jobId, efrId) {
     const tpl = await smsTemplate.getTemplate('CHECK_IN', { clientId: row.fk_client_id || 1 });
     if (tpl) message = smsTemplate.fill(tpl, [pin]);
   } catch (tplErr) {
+    logger.warn('Check-in SMS template lookup failed, using inline text · jobId=' + jobId + ' · ' + tplErr.message);
     logger.warn({ err: tplErr.message, jobId }, 'checkin-sms: template lookup failed, using inline text');
   }
   if (!message) {
@@ -198,6 +203,7 @@ async function sendCheckinSms(jobId, efrId) {
   }
 
   await smsService.send({ to: row.customer_mob_no, message });
+  logger.info('Check-in PIN SMS sent · jobId=' + jobId);
   return { sent: true };
 }
 
@@ -214,6 +220,7 @@ async function sendCheckinSms(jobId, efrId) {
  * Not a status transition — a plain owned-row UPDATE.
  */
 async function saveSelfie(jobId, efrId, { selfieImageId }) {
+  logger.info('Save reached-location selfie · jobId=' + jobId + ' selfieImageId=' + selfieImageId);
   await getOwnedJob(jobId, efrId);
 
   if (!(await hasJobColumn('tx_selfie_id'))) {
@@ -230,6 +237,7 @@ async function saveSelfie(jobId, efrId, { selfieImageId }) {
       WHERE job_id = ? AND fk_easyfixter_id = ?`,
     [Number(selfieImageId), new Date(), jobId, efrId],
   );
+  logger.info('Selfie ref saved · jobId=' + jobId);
   return { ok: true };
 }
 
@@ -244,6 +252,7 @@ async function saveSelfie(jobId, efrId, { selfieImageId }) {
  * to "not found", so a tech can't enumerate other techs' jobs.
  */
 async function searchByJobId(jobId, efrId) {
+  logger.info('Search job by id · jobId=' + jobId);
   const [[row]] = await pool.query(
     `SELECT j.job_id, j.job_reference_id, j.client_ref_id, j.job_status,
             j.job_type, j.requested_date_time, j.time_slot, j.otp,
@@ -262,7 +271,9 @@ async function searchByJobId(jobId, efrId) {
       LIMIT 1`,
     [jobId, efrId],
   );
+  if (!row) logger.info('Search found no job · jobId=' + jobId);
   if (!row) return null;
+  logger.info('Search matched job · jobId=' + jobId + ' status=' + row.job_status);
   return {
     jobId:           row.job_id,
     jobReferenceId:  row.job_reference_id,
@@ -294,12 +305,14 @@ async function searchByJobId(jobId, efrId) {
  * checkin_gps_location on tbl_job is unaffected — this is the continuous trail.
  */
 async function recordLocationPing(jobId, efrId, ping) {
+  logger.info('Record location ping · jobId=' + jobId);
   const job = await getOwnedJob(jobId, efrId); // 404 if not the tech's job
   // Only accept pings while the job is IN_PROGRESS (status 2). Once it leaves
   // that state (completed/revisit/cancelled), return 409 — the app's background
   // tracking task treats a 409 as "stop tracking", so it self-terminates the
   // moment the job ends even if the app is backgrounded with no screen mounted.
   if (Number(job.job_status) !== 2) {
+    logger.warn('Location ping rejected, job not in progress · jobId=' + jobId + ' status=' + job.job_status);
     const e = new Error('job not in progress'); e.status = 409; throw e;
   }
   return jobLocation.addPing(jobId, efrId, ping);
@@ -315,6 +328,7 @@ async function recordLocationPing(jobId, efrId, ping) {
  * legacy duplicate answer rows collapse cleanly.
  */
 async function getQuestionnaire(jobId, efrId) {
+  logger.info('Get questionnaire · jobId=' + jobId);
   const [[job]] = await pool.query(
     `SELECT fk_questionaire_id, fk_easyfixter_id FROM tbl_job WHERE job_id = ? LIMIT 1`,
     [jobId],
@@ -323,6 +337,7 @@ async function getQuestionnaire(jobId, efrId) {
     const e = new Error('job not found'); e.status = 404; throw e;
   }
   const qid = job.fk_questionaire_id;
+  if (!qid) logger.info('No questionnaire assigned · jobId=' + jobId);
   if (!qid) return [];
 
   const [questions] = await pool.query(
@@ -339,6 +354,7 @@ async function getQuestionnaire(jobId, efrId) {
       ORDER BY c_qd_ans_id ASC`,
     [jobId],
   );
+  logger.info('Found ' + questions.length + ' questions, ' + answers.length + ' saved answers · jobId=' + jobId);
   const ansByQ = new Map();
   for (const a of answers) ansByQ.set(Number(a.c_qd_id), a); // ASC → last wins
   const yes = (v) => /^(1|yes|y|true)$/i.test(String(v == null ? '' : v).trim());
@@ -363,6 +379,7 @@ async function getQuestionnaire(jobId, efrId) {
  * stamp it to avoid a wrong-table reference.
  */
 async function submitQuestionnaire(jobId, efrId, answers) {
+  logger.info('Submit questionnaire · jobId=' + jobId + ' answers=' + (Array.isArray(answers) ? answers.length : 0));
   const [[job]] = await pool.query(
     `SELECT fk_questionaire_id, fk_easyfixter_id FROM tbl_job WHERE job_id = ? LIMIT 1`,
     [jobId],
@@ -400,10 +417,12 @@ async function submitQuestionnaire(jobId, efrId, answers) {
     await conn.commit();
   } catch (e) {
     await conn.rollback();
+    logger.warn('Submit questionnaire failed, rolled back · jobId=' + jobId + ' · ' + e.message);
     throw e;
   } finally {
     conn.release();
   }
+  logger.info('Questionnaire saved · jobId=' + jobId);
   return { ok: true };
 }
 
@@ -414,6 +433,7 @@ async function submitQuestionnaire(jobId, efrId, answers) {
  * is_next_visit column → isNextVisit is derived from job_status === 10 (REVISIT).
  */
 async function getWorkProgress(jobId, efrId) {
+  logger.info('Get work progress · jobId=' + jobId);
   const [[r]] = await pool.query(
     `SELECT job_id, job_status, problem_reason_id, is_collected_cash_by_app,
             material_charge, collect_cash_reason_id, revisit_reason_id,

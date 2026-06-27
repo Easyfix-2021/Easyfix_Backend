@@ -39,6 +39,7 @@ function customerNotReachableVars(jobCtx) {
 
 async function onJobEvent(eventName, jobCtx) {
   // jobCtx expected: { job_id, customer_mob_no, easyfixer_name, job_owner, job_type, ...}
+  logger.info('Notification event · event=' + eventName + ' jobId=' + (jobCtx && jobCtx.job_id));
   try {
     switch (eventName) {
       case 'TechAssigned':
@@ -98,6 +99,7 @@ async function onJobEvent(eventName, jobCtx) {
             logger.warn({ err: e.message, jobId: jobCtx.job_id }, 'CUSTOMER_NOT_REACHABLE template lookup failed');
           }
           if (!message) {
+            logger.warn('CUSTOMER_NOT_REACHABLE template empty — using inline fallback · jobId=' + jobCtx.job_id);
             message = `EasyFix: We tried calling you about your ${jobCtx.job_type || 'service'} request but couldn't reach. We'll try again soon — please call us back at your convenience.`;
           }
           smsService.send({ to: jobCtx.customer_mob_no, message });
@@ -110,6 +112,7 @@ async function onJobEvent(eventName, jobCtx) {
       default:
         logger.debug({ eventName }, 'orchestrator: no mapping for event');
     }
+    logger.info('Notification event handled · event=' + eventName + ' jobId=' + (jobCtx && jobCtx.job_id));
   } catch (err) {
     logger.warn({ eventName, jobId: jobCtx.job_id, err: err.message }, 'notification orchestrator error');
   }

@@ -43,6 +43,7 @@ const Joi = require('joi');
 const validate = require('../../middleware/validate');
 const ds = require('../../services/deep-skill.service');
 const { modernOk, modernError } = require('../../utils/response');
+const logger = require('../../logger');
 
 const idParam = Joi.object({
   id: Joi.number().integer().positive().required(),
@@ -126,9 +127,12 @@ router.get('/getAllDeepSkillImages',
   setCdnCacheHeaders,
   async (req, res, next) => {
     try {
+      logger.info('Fetching all deep-skill images');
       const data = await ds.getAllDeepSkillImages();
+      logger.info('Returning ' + (Array.isArray(data) ? data.length : 0) + ' deep-skill images');
       modernOk(res, data);
     } catch (e) {
+      logger.error('Deep-skill image catalog failed · ' + e.message);
       next(e);
     }
   },
@@ -140,12 +144,15 @@ router.get('/:id/image-url',
   validate(idParam, 'params'),
   async (req, res, next) => {
     try {
+      logger.info('Resolving deep-skill image URL · id=' + req.params.id);
       const data = await ds.getImageUrl(req.params.id);
       modernOk(res, data);
     } catch (e) {
       if (e?.status && e.status >= 400 && e.status < 500) {
+        logger.warn('Deep-skill image lookup rejected · id=' + req.params.id + ' · ' + e.message);
         return modernError(res, e.status, e.message);
       }
+      logger.error('Deep-skill image lookup failed · id=' + req.params.id + ' · ' + e.message);
       next(e);
     }
   },

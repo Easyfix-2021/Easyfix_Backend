@@ -2,6 +2,7 @@ const router = require('express').Router();
 const Joi = require('joi');
 const validate = require('../../middleware/validate');
 const { pool } = require('../../db');
+const logger = require('../../logger');
 const { modernOk, modernError } = require('../../utils/response');
 
 /*
@@ -25,6 +26,7 @@ const { modernOk, modernError } = require('../../utils/response');
 router.get('/attendance', async (req, res, next) => {
   try {
     const { easyfixerId, from, to } = req.query;
+    logger.info('List attendance · easyfixerId=' + (easyfixerId ?? 'all') + ' · from=' + (from || '—') + ' · to=' + (to || '—'));
     const clauses = [], params = [];
     if (easyfixerId != null) { clauses.push('easyfixer_id = ?'); params.push(easyfixerId); }
     if (from && to) {
@@ -41,6 +43,7 @@ router.get('/attendance', async (req, res, next) => {
         LIMIT 500`,
       params
     );
+    logger.info('Found ' + rows.length + ' attendance rows');
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
@@ -52,6 +55,7 @@ router.post('/attendance', validate(Joi.object({
   isLeaveMarked: Joi.number().integer().valid(0, 1).default(0),
 })), async (req, res, next) => {
   try {
+    logger.info('Mark attendance · easyfixerId=' + req.body.easyfixerId + ' · isLeaveMarked=' + req.body.isLeaveMarked);
     const [ins] = await pool.query(
       `INSERT INTO tbl_easyfixer_attendance
          (easyfixer_id, morning_slot, evening_slot, is_leave_marked, created_on, insert_date)
@@ -59,6 +63,7 @@ router.post('/attendance', validate(Joi.object({
       [req.body.easyfixerId, req.body.morningSlot || null,
        req.body.eveningSlot || null, req.body.isLeaveMarked]
     );
+    logger.info('Attendance created · id=' + ins.insertId);
     res.status(201);
     modernOk(res, { id: ins.insertId });
   } catch (e) { next(e); }
@@ -76,6 +81,7 @@ router.post('/attendance', validate(Joi.object({
 // client sends.
 router.get('/materials/job/:jobId', async (req, res, next) => {
   try {
+    logger.info('List materials for job · jobId=' + req.params.jobId);
     const [rows] = await pool.query(
       `SELECT id, job_id, name AS material_name, description, sku,
               unit, unit_price, total_price
@@ -84,6 +90,7 @@ router.get('/materials/job/:jobId', async (req, res, next) => {
         ORDER BY id DESC`,
       [req.params.jobId]
     );
+    logger.info('Found ' + rows.length + ' materials');
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
@@ -91,6 +98,7 @@ router.get('/materials/job/:jobId', async (req, res, next) => {
 router.post('/materials', async (req, res, next) => {
   try {
     const b = req.body || {};
+    logger.info('Add material · jobId=' + (b.jobId ?? '—') + ' · sku=' + (b.sku ?? '—'));
     // Explicit per-field validation — return the missing-field list so the
     // frontend can highlight the corresponding inputs rather than showing
     // a generic "Internal Server Error". Matches the legacy CRM's
@@ -105,6 +113,7 @@ router.post('/materials', async (req, res, next) => {
     if (!Number.isFinite(unitPrice) || unitPrice <= 0) missing.push('unitPrice');
     if (!Number.isFinite(quantity)  || quantity  <= 0) missing.push('quantity');
     if (missing.length) {
+      logger.warn('Add material rejected · missing=' + missing.join(','));
       return modernError(res, 400, `Missing required fields: ${missing.join(', ')}`, { missing });
     }
     // Legacy `job_material.unit` is INT (Material.unit Java field). The new
@@ -124,6 +133,7 @@ router.post('/materials', async (req, res, next) => {
         String(b.sku).trim(), unitInt, unitPrice, totalPrice,
       ]
     );
+    logger.info('Material created · id=' + ins.insertId + ' · totalPrice=' + totalPrice);
     res.status(201);
     modernOk(res, { id: ins.insertId, total_price: totalPrice });
   } catch (e) { next(e); }
@@ -131,7 +141,9 @@ router.post('/materials', async (req, res, next) => {
 
 router.delete('/materials/:id', async (req, res, next) => {
   try {
+    logger.info('Delete material · id=' + req.params.id);
     await pool.query('DELETE FROM job_material WHERE id = ?', [req.params.id]);
+    logger.info('Material deleted · id=' + req.params.id);
     modernOk(res, { deleted: true });
   } catch (e) { next(e); }
 });
@@ -139,9 +151,11 @@ router.delete('/materials/:id', async (req, res, next) => {
 // ─── Training videos ────────────────────────────────────────────────
 router.get('/training-videos', async (req, res, next) => {
   try {
+    logger.info('List training videos');
     const [rows] = await pool.query(
       'SELECT id, title, description, sub_title, sub_description FROM training_videos ORDER BY id DESC'
     );
+    logger.info('Found ' + rows.length + ' training videos');
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
@@ -153,12 +167,14 @@ router.post('/training-videos', validate(Joi.object({
   sub_description: Joi.string().max(2000).allow('', null).optional(),
 })), async (req, res, next) => {
   try {
+    logger.info('Add training video · title=' + req.body.title);
     const [ins] = await pool.query(
       `INSERT INTO training_videos (title, description, sub_title, sub_description)
        VALUES (?, ?, ?, ?)`,
       [req.body.title, req.body.description || null,
        req.body.sub_title || null, req.body.sub_description || null]
     );
+    logger.info('Training video created · id=' + ins.insertId);
     res.status(201);
     modernOk(res, { id: ins.insertId });
   } catch (e) { next(e); }
@@ -166,8 +182,11 @@ router.post('/training-videos', validate(Joi.object({
 
 router.delete('/training-videos/:id', async (req, res, next) => {
   try {
+    logger.info('Delete training video · id=' + req.params.id);
     const [r] = await pool.query('DELETE FROM training_videos WHERE id = ?', [req.params.id]);
+    if (r.affectedRows === 0) logger.warn('Training video not found · id=' + req.params.id);
     if (r.affectedRows === 0) return modernError(res, 404, 'video not found');
+    logger.info('Training video deleted · id=' + req.params.id);
     modernOk(res, { deleted: true });
   } catch (e) { next(e); }
 });
@@ -178,12 +197,14 @@ router.delete('/training-videos/:id', async (req, res, next) => {
 router.get('/aadhaar-check/:number', async (req, res, next) => {
   try {
     const n = req.params.number;
+    logger.info('Aadhaar/PAN uniqueness check');
     const [[r]] = await pool.query(
       `SELECT COUNT(*) AS n, MIN(efr_id) AS existing_efr_id
          FROM tbl_easyfixer
         WHERE adhaar_card_number = ? OR pan_card_number = ?`,
       [n, n]
     );
+    logger.info('Aadhaar/PAN check result · exists=' + (r.n > 0) + ' · existingEfrId=' + (r.existing_efr_id ?? '—'));
     modernOk(res, { exists: r.n > 0, existing_efr_id: r.existing_efr_id });
   } catch (e) { next(e); }
 });
@@ -194,6 +215,7 @@ router.get('/aadhaar-check/:number', async (req, res, next) => {
 // "I recognise this person" pre-fill flow.
 router.get('/aadhaar-prefill/:number', async (req, res, next) => {
   try {
+    logger.info('Aadhaar prefill lookup');
     const [[r]] = await pool.query(
       `SELECT efr_id, efr_name, date_of_birth AS dob, adhaar_card_number, pan_card_number
          FROM tbl_easyfixer
@@ -201,7 +223,9 @@ router.get('/aadhaar-prefill/:number', async (req, res, next) => {
         LIMIT 1`,
       [req.params.number]
     );
+    if (!r) logger.warn('Aadhaar prefill · no easyfixer matched');
     if (!r) return modernError(res, 404, 'no easyfixer with this aadhaar');
+    logger.info('Aadhaar prefill matched · efr_id=' + r.efr_id);
     modernOk(res, r);
   } catch (e) { next(e); }
 });
@@ -236,8 +260,10 @@ async function getMmiToken() {
 
 router.get('/geocode/:pincode', async (req, res, next) => {
   try {
+    logger.info('Geocode pincode · pincode=' + req.params.pincode);
     const token = await getMmiToken();
     if (!token) {
+      logger.warn('Geocode skipped · MMI credentials not configured');
       return modernOk(res, {
         pincode: req.params.pincode,
         note: 'MMI credentials not configured (MMI_TOKEN_URL/MMI_CLIENT_ID/MMI_CLIENT_SECRET)',
@@ -245,8 +271,10 @@ router.get('/geocode/:pincode', async (req, res, next) => {
     }
     const url = `${process.env.MMI_CITY_DETAILS_URL}?pincode=${encodeURIComponent(req.params.pincode)}`;
     const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!r.ok) logger.warn('Geocode upstream failed · status=' + r.status);
     if (!r.ok) return modernError(res, r.status, await r.text());
     const data = await r.json();
+    logger.info('Geocode resolved · pincode=' + req.params.pincode);
     modernOk(res, data);
   } catch (e) { next(e); }
 });
@@ -254,7 +282,9 @@ router.get('/geocode/:pincode', async (req, res, next) => {
 // ─── Experience catalog ─────────────────────────────────────────────
 router.get('/experience', async (req, res, next) => {
   try {
+    logger.info('List experience catalog');
     const [rows] = await pool.query('SELECT * FROM experience ORDER BY id').catch(() => [[]]);
+    logger.info('Found ' + rows.length + ' experience entries');
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
@@ -277,6 +307,7 @@ router.post('/bulk-reassign', validate(Joi.object({
   limit: Joi.number().integer().min(1).max(5000).default(500),
 })), async (req, res, next) => {
   try {
+    logger.info('Bulk reassign jobs · userCount=' + req.body.userIds.length + ' · statuses=[' + req.body.statuses.join(',') + '] · limit=' + req.body.limit);
     const placeholders = req.body.statuses.map(() => '?').join(',');
     const [jobs] = await pool.query(
       `SELECT job_id FROM tbl_job
@@ -285,6 +316,7 @@ router.post('/bulk-reassign', validate(Joi.object({
         LIMIT ?`,
       [...req.body.statuses, req.body.limit]
     );
+    logger.info('Found ' + jobs.length + ' jobs to reassign');
     const conn = await pool.getConnection();
     let reassigned = 0;
     try {
@@ -299,6 +331,7 @@ router.post('/bulk-reassign', validate(Joi.object({
       }
       await conn.commit();
     } catch (err) { await conn.rollback(); throw err; } finally { conn.release(); }
+    logger.info('Bulk reassign done · reassigned=' + reassigned);
     modernOk(res, { reassigned, userCount: req.body.userIds.length });
   } catch (e) { next(e); }
 });

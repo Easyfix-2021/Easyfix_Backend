@@ -22,21 +22,27 @@
 const express = require('express');
 const propertiesSvc = require('../../services/properties.service');
 const { modernOk, modernError } = require('../../utils/response');
+const logger = require('../../logger');
 
 const router = express.Router();
 
 router.get('/', async (_req, res, next) => {
   try {
+    logger.info('List cached properties');
     const all = await propertiesSvc.getAllProperties();
+    logger.info('Returning ' + Object.keys(all).length + ' properties');
     modernOk(res, { count: Object.keys(all).length, properties: all });
   } catch (e) { next(e); }
 });
 
 router.post('/reload', async (_req, res, next) => {
   try {
+    logger.info('Reload properties cache');
     const count = await propertiesSvc.flushCache();
+    logger.info('Properties cache reloaded · count=' + count);
     modernOk(res, { reloaded: true, count });
   } catch (e) {
+    logger.error('Properties reload failed · ' + e.message);
     return modernError(res, 500, e.message || 'reload failed');
   }
 });

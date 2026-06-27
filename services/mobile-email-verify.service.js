@@ -71,6 +71,7 @@ function resolveBaseUrl(origin) {
  * false collision. Trim+lowercase compare on both sides.
  */
 async function checkEmailExists(efrId, email) {
+  logger.info('Check email exists (collision vs other techs)');
   const normalized = normalizeEmail(email);
   if (!normalized) return { exists: false };
   const [rows] = await pool.query(
@@ -79,6 +80,7 @@ async function checkEmailExists(efrId, email) {
       LIMIT 1`,
     [normalized, efrId],
   );
+  logger.info('Email collision check · exists=' + (rows.length > 0));
   return { exists: rows.length > 0 };
 }
 
@@ -90,6 +92,7 @@ async function checkEmailExists(efrId, email) {
  * MS-Graph email service (which self-guards NOTIFICATIONS_DISABLE / TEST_EMAILS).
  */
 async function sendVerification(efrId, email, { origin } = {}) {
+  logger.info('Send email verification link · ttlHours=24');
   const normalized = normalizeEmail(email);
   const token = crypto.randomBytes(24).toString('hex'); // 48 hex chars
   const validUpTo = new Date(Date.now() + TOKEN_TTL_MS);
@@ -142,6 +145,7 @@ async function sendVerification(efrId, email, { origin } = {}) {
  * `verified_at IS NULL` predicate — a second open returns { ok:false }.
  */
 async function verifyToken(token) {
+  logger.info('Verify email token (public consume)');
   if (!token) return { ok: false };
 
   const conn = await pool.getConnection();
@@ -156,6 +160,7 @@ async function verifyToken(token) {
       [token],
     );
     if (!rows.length) {
+      logger.warn('Email token invalid, expired or already used');
       await conn.rollback();
       return { ok: false };
     }
@@ -175,6 +180,7 @@ async function verifyToken(token) {
     logger.info({ efrId }, 'email-verify: email verified');
     return { ok: true, efrId };
   } catch (err) {
+    logger.error('Verify email token failed, rolled back · ' + err.message);
     await conn.rollback();
     throw err;
   } finally {
@@ -189,6 +195,7 @@ async function verifyToken(token) {
  * app polls this every 30s after sending a verification link.
  */
 async function getStatus(efrId) {
+  logger.info('Get email verification status');
   const [rows] = await pool.query(
     `SELECT is_email_verified FROM tbl_easyfixer WHERE efr_id = ? AND NOT (tbl_easyfixer.efr_status <=> 3) LIMIT 1`,
     [efrId],

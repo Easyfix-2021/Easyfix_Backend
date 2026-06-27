@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const logger = require('../logger');
 
 /*
  * Manage Document Type — master for tbl_document_type.
@@ -28,6 +29,8 @@ async function listDocTypes({
   limit  = Math.min(Math.max(Number(limit) || 200, 1), 1000);
   offset = Math.max(Number(offset) || 0, 0);
 
+  logger.info('List document types · q=' + (q || '') + ' · includeInactive=' + includeInactive + ' · limit=' + limit + ' · offset=' + offset + ' · sortBy=' + sortBy + ' · sortDir=' + sortDir);
+
   const sortExpr = SORTABLE_COLUMNS[sortBy] || SORTABLE_COLUMNS.document_name;
   const dir      = String(sortDir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
   const orderBy  = `${sortExpr} ${dir}, document_type_id ASC`;
@@ -54,10 +57,13 @@ async function listDocTypes({
     params
   );
 
+  logger.info('Found ' + rows.length + ' document types (total=' + total + ')');
+
   return { items: rows, total };
 }
 
 async function getDocTypeById(id) {
+  logger.info('Get document type · id=' + id);
   const [[row]] = await pool.query(
     `SELECT document_type_id, document_name, document_mandatory, document_type_status, document_catg_id
        FROM tbl_document_type
@@ -68,6 +74,7 @@ async function getDocTypeById(id) {
 }
 
 async function createDocType({ document_name, document_mandatory, document_catg_id }) {
+  logger.info('Create document type · name=' + (document_name || '') + ' · mandatory=' + document_mandatory + ' · catgId=' + (document_catg_id || ''));
   const name = String(document_name || '').trim();
   if (!name) throw mkErr(400, 'document_name is required');
   if (document_mandatory !== 'Yes' && document_mandatory !== 'No') {
@@ -87,10 +94,12 @@ async function createDocType({ document_name, document_mandatory, document_catg_
      VALUES (?, ?, ?, 1)`,
     [name, document_mandatory, document_catg_id ? Number(document_catg_id) : null]
   );
+  logger.info('Document type created · id=' + r.insertId);
   return getDocTypeById(r.insertId);
 }
 
 async function updateDocType(id, fields) {
+  logger.info('Update document type · id=' + id + ' · fields=' + Object.keys(fields || {}).join(','));
   const [[me]] = await pool.query(
     'SELECT document_type_id FROM tbl_document_type WHERE document_type_id = ? LIMIT 1',
     [id]
@@ -117,14 +126,17 @@ async function updateDocType(id, fields) {
 
   params.push(id);
   await pool.query(`UPDATE tbl_document_type SET ${sets.join(', ')} WHERE document_type_id = ?`, params);
+  logger.info('Document type updated · id=' + id);
   return getDocTypeById(id);
 }
 
 async function deactivateDocType(id) {
+  logger.info('Deactivate document type · id=' + id);
   const [r] = await pool.query(
     'UPDATE tbl_document_type SET document_type_status = 0 WHERE document_type_id = ?',
     [id]
   );
+  logger.info('Document type deactivated · id=' + id + ' · affected=' + r.affectedRows);
   return r.affectedRows > 0;
 }
 

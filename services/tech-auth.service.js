@@ -55,6 +55,7 @@ const TECH_ROLE_ID = 19;
  * Returns the new (or concurrently-created) tech row in findByMobile's shape.
  */
 async function createStubTechnician(mobile) {
+  logger.info('Self-onboard stub technician for unknown mobile');
   const conn = await pool.getConnection();
   // GET_LOCK / RELEASE_LOCK are connection-scoped — both must run on the SAME
   // pinned connection (never via pool.query). Mirrors easyfixer.service.create().
@@ -62,6 +63,7 @@ async function createStubTechnician(mobile) {
   try {
     const [[lock]] = await conn.query('SELECT GET_LOCK(?, 5) AS got', [lockName]);
     if (!lock || lock.got !== 1) {
+      logger.warn('Could not acquire onboarding lock for stub technician create');
       const err = new Error('could not acquire onboarding lock for this mobile number, please retry');
       err.status = 409;
       throw err;
@@ -73,7 +75,10 @@ async function createStubTechnician(mobile) {
       `SELECT efr_id, efr_name, efr_no, efr_email FROM tbl_easyfixer
         WHERE efr_no = ? AND efr_status = 1 LIMIT 1`,
       [mobile]);
-    if (existing) return existing;
+    if (existing) {
+      logger.info('Stub already created concurrently · efr_id=' + existing.efr_id);
+      return existing;
+    }
 
     await conn.beginTransaction();
     try {
@@ -99,7 +104,9 @@ async function createStubTechnician(mobile) {
         [mobile, userId]);
 
       await conn.commit();
+      logger.info('Stub technician created · efr_id=' + (userId ? '(user_id=' + userId + ')' : '?'));
     } catch (e) {
+      logger.error('Stub technician create failed · ' + e.message);
       await conn.rollback();
       throw e;
     }
@@ -118,12 +125,16 @@ async function createStubTechnician(mobile) {
 }
 
 async function createLoginOtp(mobile) {
+  logger.info('Create technician login OTP');
   // Unknown number → self-onboard a stub technician, then fall through to the
   // normal OTP generate/deliver path so the new tech gets their first OTP.
   let tech = await findByMobile(mobile);
   if (!tech) {
     tech = await createStubTechnician(mobile);
-    if (!tech) return { found: false };
+    if (!tech) {
+      logger.warn('No technician resolved after stub onboarding');
+      return { found: false };
+    }
     if (process.env.NODE_ENV !== 'production') {
       logger.event('🆕', 'green',
         `self-onboarded new technician for ${mobile} (efr_id=${tech.efr_id}) — dev only`);
@@ -180,12 +191,17 @@ async function createLoginOtp(mobile) {
     contextLabel: 'technician',
   });
 
+  logger.info('Technician login OTP issued · efr_id=' + tech.efr_id);
   return { found: true, expiresAt: expires };
 }
 
 async function verifyLoginOtp(mobile, otp) {
+  logger.info('Verify technician login OTP');
   const tech = await findByMobile(mobile);
-  if (!tech) return { ok: false, reason: 'USER_NOT_FOUND' };
+  if (!tech) {
+    logger.warn('OTP verify failed · reason=USER_NOT_FOUND');
+    return { ok: false, reason: 'USER_NOT_FOUND' };
+  }
   // Match on (mobile, otp_type) ALONE. The mobile number is the real login
   // identity for technicians; user_email is stored purely informationally
   // (and is NULL for techs with no efr_email on file). Including user_email in
@@ -199,16 +215,24 @@ async function verifyLoginOtp(mobile, otp) {
       ORDER BY id DESC
       LIMIT 1`,
     [mobile]);
-  if (!row) return { ok: false, reason: 'NO_OTP_ISSUED' };
+  if (!row) {
+    logger.warn('OTP verify failed · reason=NO_OTP_ISSUED · efr_id=' + tech.efr_id);
+    return { ok: false, reason: 'NO_OTP_ISSUED' };
+  }
   if (row.is_expired || new Date(row.valid_up_to).getTime() < Date.now()) {
     await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
+    logger.warn('OTP verify failed · reason=OTP_EXPIRED · efr_id=' + tech.efr_id);
     return { ok: false, reason: 'OTP_EXPIRED' };
   }
-  if (Number(row.otp) !== Number(otp)) return { ok: false, reason: 'OTP_MISMATCH' };
+  if (Number(row.otp) !== Number(otp)) {
+    logger.warn('OTP verify failed · reason=OTP_MISMATCH · efr_id=' + tech.efr_id);
+    return { ok: false, reason: 'OTP_MISMATCH' };
+  }
   await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
   const token = jwt.sign(
     { sub: `efr:${tech.efr_id}`, name: tech.efr_name, mobile: tech.efr_no },
     process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRY || '30d' });
+  logger.info('Technician OTP verified · token issued · efr_id=' + tech.efr_id);
   return { ok: true, token, tech };
 }
 

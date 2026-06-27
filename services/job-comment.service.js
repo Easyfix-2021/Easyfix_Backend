@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const logger = require('../logger');
 
 /*
  * Job Comments — VERIFIED port of legacy `tbl_job_comment`.
@@ -59,6 +60,7 @@ function shapeRow(r) {
 }
 
 async function listComments(jobId) {
+  logger.info('List job comments · job_id=' + jobId);
   // Reason JOIN switched from tbl_enum_reason → action_taken_reason
   // (2026-06-03 per ops). The legacy "Reason" surfaced on the Remarks
   // history table is the action-reason text, not the generic enum
@@ -81,6 +83,7 @@ async function listComments(jobId) {
       ORDER BY c.created_on DESC, c.comment_id DESC`,
     [jobId]
   );
+  logger.info('Found ' + rows.length + ' comments');
   return rows.map(shapeRow);
 }
 
@@ -171,6 +174,7 @@ async function addComment(jobId, { comments, comment_on, commented_by, appointme
   if (stage === 16 || stage === 17) {
     effectiveJobStage = 9;
   }
+  logger.info('Add job comment · job_id=' + jobId + ' · comment_on=' + stage + ' (' + (STAGES[stage] || 'unknown') + ') · job_stage=' + (effectiveJobStage ?? 'null'));
 
   // Conditionally include job_stage on deploys that carry the column.
   // The base INSERT shape always writes the seven legacy columns; the
@@ -204,6 +208,7 @@ async function addComment(jobId, { comments, comment_on, commented_by, appointme
     ];
   }
   const [r] = await pool.query(insertSql, insertVals);
+  logger.info('Comment created · id=' + r.insertId + ' · job_id=' + jobId);
 
   /*
    * Mirror the latest comment into tbl_job for legacy parity (added

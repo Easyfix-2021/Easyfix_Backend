@@ -28,6 +28,7 @@ const logger = require('../logger');
  * @returns {Promise<{ sent: boolean }>}  — NEVER includes the OTP value
  */
 async function sendOtp(efrId, pool) {
+  logger.info('Send profile-update OTP · efrId=' + efrId);
   // 1. Load name + mobile, then write the new OTP in a single round-trip.
   const [[row]] = await pool.query(
     `SELECT efr_name, efr_no
@@ -37,12 +38,14 @@ async function sendOtp(efrId, pool) {
     [efrId],
   );
   if (!row) {
+    logger.warn('Send profile-update OTP failed · easyfixer not found · efrId=' + efrId);
     const e = new Error('Easyfixer not found');
     e.status = 404;
     throw e;
   }
   const { efr_name: name, efr_no: mobile } = row;
   if (!mobile) {
+    logger.warn('Send profile-update OTP failed · no registered mobile · efrId=' + efrId);
     const e = new Error('Easyfixer has no registered mobile number');
     e.status = 422;
     throw e;
@@ -100,6 +103,7 @@ async function sendOtp(efrId, pool) {
  * @returns {Promise<{ valid: boolean }>}
  */
 async function verifyOtp(efrId, otp, pool) {
+  logger.info('Verify profile-update OTP · efrId=' + efrId);
   const [[row]] = await pool.query(
     `SELECT profile_update_otp, profile_update_otp_valid_up_to
        FROM tbl_easyfixer

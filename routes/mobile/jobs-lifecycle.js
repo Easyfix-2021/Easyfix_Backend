@@ -4,6 +4,7 @@ const Joi = require('joi');
 const validate = require('../../middleware/validate');
 const { modernOk, modernError } = require('../../utils/response');
 const lifecycle = require('../../services/mobile-job-lifecycle.service');
+const logger = require('../../logger');
 
 /*
  * /api/mobile/jobs/* — Technician-app order lifecycle sub-router.
@@ -49,13 +50,15 @@ router.post(
   })),
   async (req, res, next) => {
     try {
+      logger.info('Cancel job · jobId=' + req.params.id + ' · reasonId=' + req.body.reasonId);
       const out = await lifecycle.cancel(
         Number(req.params.id),
         req.tech.efr_id,
         { reason: req.body.reason || null, reasonId: req.body.reasonId },
       );
+      logger.info('Job cancelled · id=' + req.params.id);
       modernOk(res, out);
-    } catch (e) { handleErr(res, next, e); }
+    } catch (e) { logger.warn('Cancel job failed · jobId=' + req.params.id + ' · ' + e.message); handleErr(res, next, e); }
   },
 );
 
@@ -72,9 +75,11 @@ router.post(
   validate(idParam, 'params'),
   async (req, res, next) => {
     try {
+      logger.info('Send check-in PIN SMS · jobId=' + req.params.id);
       const out = await lifecycle.sendCheckinSms(Number(req.params.id), req.tech.efr_id);
+      logger.info('Check-in PIN SMS dispatched · jobId=' + req.params.id);
       modernOk(res, out);
-    } catch (e) { handleErr(res, next, e); }
+    } catch (e) { logger.warn('Send check-in SMS failed · jobId=' + req.params.id + ' · ' + e.message); handleErr(res, next, e); }
   },
 );
 
@@ -88,13 +93,15 @@ router.post(
   })),
   async (req, res, next) => {
     try {
+      logger.info('Save reached-location selfie · jobId=' + req.params.id + ' · selfieImageId=' + req.body.selfieImageId);
       const out = await lifecycle.saveSelfie(
         Number(req.params.id),
         req.tech.efr_id,
         { selfieImageId: req.body.selfieImageId },
       );
+      logger.info('Selfie saved · jobId=' + req.params.id);
       modernOk(res, out);
-    } catch (e) { handleErr(res, next, e); }
+    } catch (e) { logger.warn('Save selfie failed · jobId=' + req.params.id + ' · ' + e.message); handleErr(res, next, e); }
   },
 );
 
@@ -118,10 +125,12 @@ router.get(
   }), 'query'),
   async (req, res, next) => {
     try {
+      logger.info('Search job by id · jobId=' + req.query.jobId);
       const job = await lifecycle.searchByJobId(Number(req.query.jobId), req.tech.efr_id);
-      if (!job) return modernError(res, 404, 'job not found');
+      if (!job) { logger.warn('Search job not found · jobId=' + req.query.jobId); return modernError(res, 404, 'job not found'); }
+      logger.info('Returning job summary · jobId=' + req.query.jobId);
       modernOk(res, job);
-    } catch (e) { handleErr(res, next, e); }
+    } catch (e) { logger.warn('Search job failed · jobId=' + req.query.jobId + ' · ' + e.message); handleErr(res, next, e); }
   },
 );
 
@@ -139,11 +148,12 @@ router.post(
   })),
   async (req, res, next) => {
     try {
+      logger.info('Record location ping · jobId=' + req.params.id + ' · accuracy=' + (req.body.accuracy != null ? req.body.accuracy : 'n/a'));
       const data = await lifecycle.recordLocationPing(
         Number(req.params.id), req.tech.efr_id, req.body,
       );
       modernOk(res, data);
-    } catch (e) { handleErr(res, next, e); }
+    } catch (e) { logger.warn('Record location ping failed · jobId=' + req.params.id + ' · ' + e.message); handleErr(res, next, e); }
   },
 );
 
@@ -154,9 +164,11 @@ router.get(
   validate(idParam, 'params'),
   async (req, res, next) => {
     try {
+      logger.info('Fetch recce questionnaire · jobId=' + req.params.id);
       const items = await lifecycle.getQuestionnaire(Number(req.params.id), req.tech.efr_id);
+      logger.info('Returning ' + (items ? items.length : 0) + ' questionnaire items');
       modernOk(res, { items });
-    } catch (e) { handleErr(res, next, e); }
+    } catch (e) { logger.warn('Fetch recce questionnaire failed · jobId=' + req.params.id + ' · ' + e.message); handleErr(res, next, e); }
   },
 );
 
@@ -173,11 +185,13 @@ router.post(
   })),
   async (req, res, next) => {
     try {
+      logger.info('Submit recce questionnaire · jobId=' + req.params.id + ' · answers=' + ((req.body.answers && req.body.answers.length) || 0));
       const data = await lifecycle.submitQuestionnaire(
         Number(req.params.id), req.tech.efr_id, req.body.answers,
       );
+      logger.info('Recce questionnaire submitted · jobId=' + req.params.id);
       modernOk(res, data);
-    } catch (e) { handleErr(res, next, e); }
+    } catch (e) { logger.warn('Submit recce questionnaire failed · jobId=' + req.params.id + ' · ' + e.message); handleErr(res, next, e); }
   },
 );
 
@@ -188,9 +202,10 @@ router.get(
   validate(idParam, 'params'),
   async (req, res, next) => {
     try {
+      logger.info('Fetch work-progress snapshot · jobId=' + req.params.id);
       const data = await lifecycle.getWorkProgress(Number(req.params.id), req.tech.efr_id);
       modernOk(res, data);
-    } catch (e) { handleErr(res, next, e); }
+    } catch (e) { logger.warn('Fetch work-progress snapshot failed · jobId=' + req.params.id + ' · ' + e.message); handleErr(res, next, e); }
   },
 );
 

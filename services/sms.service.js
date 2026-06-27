@@ -24,10 +24,23 @@ function normaliseMobile(raw) {
   return null;
 }
 
+// Mask a mobile for logging — keep only the last 4 digits, never log the full number.
+function maskMobile(m) {
+  const s = String(m || '');
+  return s.length <= 4 ? '****' : '******' + s.slice(-4);
+}
+
 async function send({ to, message }) {
   const originalMobile = normaliseMobile(to);
-  if (!originalMobile) return { delivered: false, error: `invalid mobile "${to}"` };
-  if (!message) return { delivered: false, error: 'message is empty' };
+  if (!originalMobile) {
+    logger.warn('SMS send rejected, invalid mobile');
+    return { delivered: false, error: `invalid mobile "${to}"` };
+  }
+  if (!message) {
+    logger.warn('SMS send rejected, empty message · to=' + maskMobile(originalMobile));
+    return { delivered: false, error: 'message is empty' };
+  }
+  logger.info('Sending SMS · to=' + maskMobile(originalMobile) + ' · ' + message.length + ' chars');
 
   if (disabled()) {
     logger.test(`SMS suppressed (NOTIFICATIONS_DISABLE) · to=${originalMobile} · ${message.length} chars`);
@@ -38,6 +51,7 @@ async function send({ to, message }) {
   const password   = process.env.SMS_PASSWORD;
   const senderId   = process.env.SMS_SENDER_ID || 'EsyFix';
   if (!username || !password) {
+    logger.error('SMS send aborted, SMS_USERNAME/SMS_PASSWORD not configured · to=' + maskMobile(originalMobile));
     return { delivered: false, error: 'SMS_USERNAME/SMS_PASSWORD not configured' };
   }
 

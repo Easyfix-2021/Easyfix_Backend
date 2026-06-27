@@ -4,6 +4,7 @@ const validate = require('../../middleware/validate');
 const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
 const { buildRequestScope, assertEntityInScope } = require('../../lib/scope');
+const logger = require('../../logger');
 
 // Helper: given a jobId, return {client_id, city_id, vertical_id} for scope check.
 async function jobScopeFields(jobId) {
@@ -45,12 +46,16 @@ async function quotationScopeGuard(req, quotationId) {
 router.get('/', async (req, res, next) => {
   try {
     const { jobId } = req.query;
+    logger.info('List quotations · jobId=' + jobId);
     if (!jobId) return modernError(res, 400, 'jobId required');
     // RBAC: caller must have scope over the job's client/city/vertical.
     const jf = await jobScopeFields(Number(jobId));
     if (!jf) return modernOk(res, []);
     const guard = assertEntityInScope(req, jf);
-    if (!guard.ok) return modernOk(res, []);
+    if (!guard.ok) {
+      logger.warn('Quotations list blocked · job out of scope · jobId=' + jobId);
+      return modernOk(res, []);
+    }
     const [rows] = await pool.query(
       `SELECT id, type, name, unit, unit_price,
               tx_charge, client_charge, approved_charge, margin,
@@ -61,8 +66,9 @@ router.get('/', async (req, res, next) => {
         ORDER BY id DESC`,
       [jobId]
     );
+    logger.info('Found ' + rows.length + ' quotations');
     modernOk(res, rows);
-  } catch (e) { next(e); }
+  } catch (e) { logger.error('List quotations failed · ' + e.message); next(e); }
 });
 
 const productBody = Joi.object({
@@ -79,6 +85,7 @@ const productBody = Joi.object({
 
 router.post('/product', validate(productBody), async (req, res, next) => {
   try {
+    logger.info('Add product quotation · jobId=' + req.body.jobId + ' · unit=' + req.body.unit);
     const jf = await jobScopeFields(req.body.jobId);
     if (!jf) return modernError(res, 404, 'job not found');
     const guard = assertEntityInScope(req, jf);
@@ -97,14 +104,16 @@ router.post('/product', validate(productBody), async (req, res, next) => {
         req.body.jobServiceId || null,
       ]
     );
+    logger.info('Product quotation created · id=' + ins.insertId);
     res.status(201);
     modernOk(res, { id: ins.insertId });
-  } catch (e) { next(e); }
+  } catch (e) { logger.error('Add product quotation failed · ' + e.message); next(e); }
 });
 
 router.post('/material', validate(productBody.fork(['name'], (s) => s)
     .keys({ materialId: Joi.number().integer().positive().optional() })), async (req, res, next) => {
   try {
+    logger.info('Add material quotation · jobId=' + req.body.jobId + ' · unit=' + req.body.unit);
     const jf = await jobScopeFields(req.body.jobId);
     if (!jf) return modernError(res, 404, 'job not found');
     const guard = assertEntityInScope(req, jf);
@@ -123,9 +132,10 @@ router.post('/material', validate(productBody.fork(['name'], (s) => s)
         req.body.jobServiceId || null,
       ]
     );
+    logger.info('Material quotation created · id=' + ins.insertId);
     res.status(201);
     modernOk(res, { id: ins.insertId });
-  } catch (e) { next(e); }
+  } catch (e) { logger.error('Add material quotation failed · ' + e.message); next(e); }
 });
 
 // SPOC approval / rejection — sets approved_charge and action_*
@@ -133,6 +143,7 @@ router.patch('/:id/approve', validate(Joi.object({
   approvedCharge: Joi.number().min(0).required(),
 })), async (req, res, next) => {
   try {
+    logger.info('Approve quotation · id=' + req.params.id);
     const guard = await quotationScopeGuard(req, req.params.id);
     if (!guard.ok) return modernError(res, 404, 'quotation not found');
     const [r] = await pool.query(
@@ -142,12 +153,14 @@ router.patch('/:id/approve', validate(Joi.object({
       [req.body.approvedCharge, req.user.user_id, req.params.id]
     );
     if (r.affectedRows === 0) return modernError(res, 404, 'quotation not found');
+    logger.info('Quotation approved · id=' + req.params.id);
     modernOk(res, { approved: true });
-  } catch (e) { next(e); }
+  } catch (e) { logger.error('Approve quotation failed · ' + e.message); next(e); }
 });
 
 router.patch('/:id/reject', async (req, res, next) => {
   try {
+    logger.info('Reject quotation · id=' + req.params.id);
     const guard = await quotationScopeGuard(req, req.params.id);
     if (!guard.ok) return modernError(res, 404, 'quotation not found');
     const [r] = await pool.query(
@@ -157,18 +170,21 @@ router.patch('/:id/reject', async (req, res, next) => {
       [req.user.user_id, req.params.id]
     );
     if (r.affectedRows === 0) return modernError(res, 404, 'quotation not found');
+    logger.info('Quotation rejected · id=' + req.params.id);
     modernOk(res, { rejected: true });
-  } catch (e) { next(e); }
+  } catch (e) { logger.error('Reject quotation failed · ' + e.message); next(e); }
 });
 
 router.delete('/:id', async (req, res, next) => {
   try {
+    logger.info('Delete quotation · id=' + req.params.id);
     const guard = await quotationScopeGuard(req, req.params.id);
     if (!guard.ok) return modernError(res, 404, 'quotation not found');
     const [r] = await pool.query('DELETE FROM quotation_details WHERE id = ?', [req.params.id]);
     if (r.affectedRows === 0) return modernError(res, 404, 'quotation not found');
+    logger.info('Quotation deleted · id=' + req.params.id);
     modernOk(res, { deleted: true });
-  } catch (e) { next(e); }
+  } catch (e) { logger.error('Delete quotation failed · ' + e.message); next(e); }
 });
 
 // ─── Rate-card tolerance validator ──────────────────────────────────
@@ -185,6 +201,7 @@ router.post('/validate', validate(Joi.object({
 })), async (req, res, next) => {
   try {
     const { jobId, tolerancePct } = req.body;
+    logger.info('Validate quotations vs rate-card · jobId=' + jobId + ' · tolerancePct=' + tolerancePct);
     const [rows] = await pool.query(
       `SELECT q.id, q.type, q.name, q.unit, q.unit_price, q.client_charge,
               q.client_service_id,
@@ -194,6 +211,7 @@ router.post('/validate', validate(Joi.object({
         WHERE q.job_id = ?`,
       [jobId]
     );
+    logger.info('Found ' + rows.length + ' quotation lines to validate');
     const flagged = [];
     for (const r of rows) {
       if (r.client_service_id && r.rate_card_total != null) {
@@ -216,13 +234,14 @@ router.post('/validate', validate(Joi.object({
         });
       }
     }
+    logger.info('Returning ' + flagged.length + ' flagged quotation lines');
     modernOk(res, {
       total: rows.length,
       flaggedCount: flagged.length,
       tolerancePct,
       flagged,
     });
-  } catch (e) { next(e); }
+  } catch (e) { logger.error('Validate quotations failed · ' + e.message); next(e); }
 });
 
 // ─── Recce checklist (structured recce per category) ────────────────
@@ -232,6 +251,7 @@ router.post('/validate', validate(Joi.object({
 // tbl_questionaire_details (already category-scoped via c_qd_category).
 router.get('/recce-checklist/:serviceCatgId', async (req, res, next) => {
   try {
+    logger.info('Get recce checklist · serviceCatgId=' + req.params.serviceCatgId);
     const [rows] = await pool.query(
       `SELECT qd.c_qd_id, qd.c_qd_text, qd.c_qd_mandatory, qd.c_qd_type,
               qd.c_qd_values, qd.c_qd_category, qd.c_qd_seq
@@ -242,8 +262,9 @@ router.get('/recce-checklist/:serviceCatgId', async (req, res, next) => {
         ORDER BY qd.c_qd_seq, qd.c_qd_id`,
       [String(req.params.serviceCatgId)]
     );
+    logger.info('Found ' + rows.length + ' recce checklist items');
     modernOk(res, rows);
-  } catch (e) { next(e); }
+  } catch (e) { logger.error('Get recce checklist failed · ' + e.message); next(e); }
 });
 
 // ─── Estimate expiry countdown ──────────────────────────────────────
@@ -258,6 +279,7 @@ router.get('/recce-checklist/:serviceCatgId', async (req, res, next) => {
 // (Phase 6 notification orchestrator) consumes a list view.
 router.get('/expiry/:jobId', async (req, res, next) => {
   try {
+    logger.info('Get estimate expiry · jobId=' + req.params.jobId);
     const [[j]] = await pool.query(
       `SELECT job_id, approval_sent_on_date_time, approved_on_date_time,
               approval_reject_date_time, no_of_req_approval
@@ -278,6 +300,7 @@ router.get('/expiry/:jobId', async (req, res, next) => {
       hoursRemaining = Math.max(0, EXPIRY_HOURS - hoursElapsed);
       status = hoursElapsed > EXPIRY_HOURS ? 'expired' : 'awaiting';
     }
+    logger.info('Estimate expiry · jobId=' + j.job_id + ' · status=' + status);
     modernOk(res, {
       job_id: j.job_id,
       status,
@@ -286,12 +309,13 @@ router.get('/expiry/:jobId', async (req, res, next) => {
       hours_remaining: hoursRemaining != null ? Number(hoursRemaining.toFixed(2)) : null,
       attempts: j.no_of_req_approval,
     });
-  } catch (e) { next(e); }
+  } catch (e) { logger.error('Get estimate expiry failed · ' + e.message); next(e); }
 });
 
 // List all expired pending estimates — drives the escalation queue.
 router.get('/expired', async (req, res, next) => {
   try {
+    logger.info('List expired pending estimates');
     const clauses = [
       'j.approval_sent_on_date_time IS NOT NULL',
       'j.approved_on_date_time IS NULL',
@@ -323,8 +347,9 @@ router.get('/expired', async (req, res, next) => {
         LIMIT 500`,
       params
     );
+    logger.info('Found ' + rows.length + ' expired pending estimates');
     modernOk(res, rows);
-  } catch (e) { next(e); }
+  } catch (e) { logger.error('List expired estimates failed · ' + e.message); next(e); }
 });
 
 module.exports = router;

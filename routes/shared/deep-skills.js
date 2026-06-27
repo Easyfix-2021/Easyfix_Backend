@@ -34,6 +34,7 @@ const Joi = require('joi');
 const validate = require('../../middleware/validate');
 const ds = require('../../services/deep-skill.service');
 const { modernOk, modernError } = require('../../utils/response');
+const logger = require('../../logger');
 
 const idParam = Joi.object({
   id: Joi.number().integer().positive().required(),
@@ -43,12 +44,16 @@ router.get('/:id/image-url',
   validate(idParam, 'params'),
   async (req, res, next) => {
     try {
+      logger.info('Get deep-skill image url · id=' + req.params.id);
       const data = await ds.getImageUrl(req.params.id);
+      logger.info('Returning deep-skill image url · id=' + req.params.id + ' hasUrl=' + Boolean(data && data.url));
       modernOk(res, data);
     } catch (e) {
       if (e?.status && e.status >= 400 && e.status < 500) {
+        logger.warn('Deep-skill image url not available · id=' + req.params.id + ' · ' + e.message);
         return modernError(res, e.status, e.message);
       }
+      logger.error('Deep-skill image url failed · id=' + req.params.id + ' · ' + e.message);
       next(e);
     }
   },

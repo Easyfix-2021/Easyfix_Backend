@@ -1,5 +1,6 @@
 const router = require('express').Router();
 const { pool } = require('../../db');
+const logger = require('../../logger');
 const { modernOk, modernError } = require('../../utils/response');
 
 /*
@@ -36,10 +37,13 @@ router.get('/', async (req, res, next) => {
   try {
     const fromDate = String(req.query.fromDate || '').trim();
     const toDate   = String(req.query.toDate || '').trim();
+    logger.info('List call info · from=' + fromDate + ' · to=' + toDate + ' · filtered=' + !!req.query.callTo);
     if (!DATE_RE.test(fromDate) || !DATE_RE.test(toDate)) {
+      logger.warn('Call info rejected · invalid date range');
       return modernError(res, 400, 'fromDate and toDate are required (YYYY-MM-DD)');
     }
     if (fromDate > toDate) {
+      logger.warn('Call info rejected · fromDate after toDate');
       return modernError(res, 400, 'fromDate must be on or before toDate');
     }
     const callTo = req.query.callTo ? String(req.query.callTo).trim() : '';
@@ -66,11 +70,13 @@ router.get('/', async (req, res, next) => {
         LIMIT 500`,
       params
     );
+    logger.info('Returning ' + rows.length + ' call records');
     modernOk(res, { items: rows, total: rows.length, fromDate, toDate, callTo: callTo || null });
   } catch (e) {
     // Be friendly if the table isn't provisioned on a dev DB — UI
     // shouldn't 500 just because a local schema is incomplete.
     if (e?.code === 'ER_NO_SUCH_TABLE') {
+      logger.warn('Call info · call-record table not provisioned');
       return modernOk(res, { items: [], total: 0, note: 'call-record table not provisioned' });
     }
     next(e);
@@ -102,10 +108,13 @@ router.get('/export.xlsx', async (req, res, next) => {
   try {
     const fromDate = String(req.query.fromDate || '').trim();
     const toDate   = String(req.query.toDate || '').trim();
+    logger.info('Export call info xlsx · from=' + fromDate + ' · to=' + toDate + ' · filtered=' + !!req.query.callTo);
     if (!DATE_RE.test(fromDate) || !DATE_RE.test(toDate)) {
+      logger.warn('Call info export rejected · invalid date range');
       return modernError(res, 400, 'fromDate and toDate are required (YYYY-MM-DD)');
     }
     if (fromDate > toDate) {
+      logger.warn('Call info export rejected · fromDate after toDate');
       return modernError(res, 400, 'fromDate must be on or before toDate');
     }
     const callTo = req.query.callTo ? String(req.query.callTo).trim() : '';
@@ -135,10 +144,12 @@ router.get('/export.xlsx', async (req, res, next) => {
         params
       );
       rawRows = r;
+      logger.info('Found ' + rawRows.length + ' call records for export');
     } catch (e) {
       // Missing table on a dev DB → still produce a (empty) workbook
       // so the download UX doesn't dead-end.
       if (e?.code !== 'ER_NO_SUCH_TABLE') throw e;
+      logger.warn('Call info export · call-record table not provisioned');
       rawRows = [];
     }
 
@@ -169,6 +180,7 @@ router.get('/export.xlsx', async (req, res, next) => {
       `Total: ${xlsxRows.length} call${xlsxRows.length === 1 ? '' : 's'}`,
     ].filter(Boolean).join('    ·    ');
 
+    logger.info('Streaming call-history xlsx · rows=' + xlsxRows.length);
     await streamStyledXlsx(res, `call-history_${fromDate}_to_${toDate}.xlsx`, {
       title: 'EasyFix  ·  Call History',
       meta,

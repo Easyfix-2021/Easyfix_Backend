@@ -108,6 +108,7 @@ async function updateConversation(id, fields, pool) {
  * Returns { delivered, conversationId } or { error }.
  */
 async function startConversation(jobId, { action = 'first' } = {}, pool) {
+  logger.info('Starting WhatsApp conversation · job=' + jobId + ' · action=' + action);
   const [[job]] = await pool.query(
     `SELECT j.job_id, j.job_status,
             c.customer_mob_no,
@@ -119,8 +120,11 @@ async function startConversation(jobId, { action = 'first' } = {}, pool) {
       WHERE j.job_id = ? LIMIT 1`,
     [jobId],
   );
+  if (!job) logger.warn('Start conversation skipped · job ' + jobId + ' not found');
   if (!job) return { error: 'job not found' };
+  if (Number(job.job_status) !== 9) logger.warn('Start conversation skipped · job=' + jobId + ' not Unconfirmed · status=' + job.job_status);
   if (Number(job.job_status) !== 9) return { error: 'job is not Unconfirmed (status != 9)' };
+  if (!job.customer_mob_no) logger.warn('Start conversation skipped · job=' + jobId + ' has no customer mobile on file');
   if (!job.customer_mob_no) return { error: 'no customer mobile on file' };
 
   const result = await gallabox.sendTemplate({
@@ -179,16 +183,20 @@ async function startConversation(jobId, { action = 'first' } = {}, pool) {
  * Returns { handled: boolean, step?, reason? }.
  */
 async function handleInbound(inbound, pool) {
+  logger.info('Handling inbound WhatsApp message · type=' + (inbound && inbound.type));
   const convo = await getActiveByMobile(inbound.from, pool);
+  if (!convo) logger.info('No active WhatsApp conversation for inbound message');
   if (!convo) return { handled: false, reason: 'no_active_conversation' };
 
   // Dedupe provider retries.
   if (inbound.messageId && convo.last_inbound_msg_id === inbound.messageId) {
+    logger.info('Ignoring duplicate inbound message · job=' + convo.job_id);
     return { handled: false, reason: 'duplicate' };
   }
 
   // Session expiry — free-form replies are only valid inside the 24h window.
   if (convo.expires_at && new Date(convo.expires_at).getTime() < Date.now()) {
+    logger.info('WhatsApp conversation expired · job=' + convo.job_id);
     await updateConversation(convo.conversation_id, { status: 'expired' }, pool);
     return { handled: false, reason: 'expired' };
   }
@@ -201,6 +209,7 @@ async function handleInbound(inbound, pool) {
   const ctx = parseContext(convo);
   const to = convo.customer_mob_no;
 
+  logger.info('Routing WhatsApp inbound · job=' + convo.job_id + ' · step=' + convo.current_step + ' · type=' + inbound.type);
   try {
     switch (convo.current_step) {
       case STEP.DATETIME:       return await stepDatetime(convo, ctx, inbound, to, pool);
@@ -278,6 +287,7 @@ async function stepDatetime(convo, ctx, inbound, to, pool) {
       return { handled: true, step: STEP.DATETIME };
     }
     const nextCtx = { ...ctx, requested_date_time: mysqlDt, time_slot: nlu.time_slot || null };
+    logger.info('Captured requested date/time · job=' + convo.job_id + ' · when=' + mysqlDt);
     await updateConversation(convo.conversation_id, { current_step: STEP.MEDIA_PICK, context: nextCtx }, pool);
     const human = nlu.datetime.replace('T', ' ');
     await gallabox.sendText({ to, body: `Thanks! We’ve noted ${human}${nlu.time_slot ? ` (${nlu.time_slot})` : ''} for the visit.` });
@@ -374,6 +384,7 @@ async function stepMedia(convo, ctx, inbound, to, pool) {
         `INSERT INTO tbl_job_media (job_id, s3_key, content_type, source) VALUES (?, ?, ?, 'customer_whatsapp')`,
         [convo.job_id, key, dl.contentType || null],
       );
+      logger.info('Saved customer WhatsApp video · job=' + convo.job_id + ' · seq=' + seq);
       const nextCtx = { ...ctx, video_count: (ctx.video_count || 0) + 1 };
       await updateConversation(convo.conversation_id, { context: nextCtx }, pool);
     } else {
@@ -395,6 +406,7 @@ async function stepMedia(convo, ctx, inbound, to, pool) {
          VALUES (?, ?, 'booking', 0, NOW())`,
         [convo.job_id, key],
       );
+      logger.info('Saved customer WhatsApp photo · job=' + convo.job_id + ' · seq=' + seq);
       const nextCtx = { ...ctx, photo_count: (ctx.photo_count || 0) + 1 };
       await updateConversation(convo.conversation_id, { context: nextCtx }, pool);
     }

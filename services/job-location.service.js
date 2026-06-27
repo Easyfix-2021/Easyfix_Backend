@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const logger = require('../logger');
 
 /*
  * Job location track — the real-time GPS trail a technician's app posts while a
@@ -20,6 +21,7 @@ const { pool } = require('../db');
  * and not trusting a client timestamp avoids tampering + the IST-parse trap.
  */
 async function addPing(jobId, efrId, { latitude, longitude, accuracy }) {
+  logger.info('Add GPS ping · job_id=' + jobId + ' · efr_id=' + efrId + ' · accuracy=' + (accuracy == null ? 'null' : accuracy));
   await pool.query(
     `INSERT INTO tbl_job_location_track (job_id, efr_id, latitude, longitude, accuracy, captured_at)
      VALUES (?, ?, ?, ?, ?, NOW())`,
@@ -30,6 +32,7 @@ async function addPing(jobId, efrId, { latitude, longitude, accuracy }) {
 
 /* Latest known location for a job (CRM "locate now"). Null when no ping yet. */
 async function getLatest(jobId) {
+  logger.info('Get latest job location · job_id=' + jobId);
   const [[row]] = await pool.query(
     `SELECT id, job_id, efr_id, latitude, longitude, accuracy, captured_at
        FROM tbl_job_location_track
@@ -47,6 +50,7 @@ async function getLatest(jobId) {
  * for the efr — null when the tech has never sent one (GPS off / no active job).
  */
 async function getLatestByEfr(efrId) {
+  logger.info('Get latest technician location · efr_id=' + efrId);
   const [[row]] = await pool.query(
     `SELECT id, job_id, efr_id, latitude, longitude, accuracy, captured_at
        FROM tbl_job_location_track
@@ -61,6 +65,7 @@ async function getLatestByEfr(efrId) {
 /* Recent breadcrumb trail for a job (CRM map), newest-first, capped at 1000. */
 async function getTrack(jobId, { limit } = {}) {
   const cap = Math.min(Math.max(Number(limit) || 200, 1), 1000);
+  logger.info('Get job location track · job_id=' + jobId + ' · cap=' + cap);
   const [rows] = await pool.query(
     `SELECT id, latitude, longitude, accuracy, captured_at
        FROM tbl_job_location_track
@@ -69,6 +74,7 @@ async function getTrack(jobId, { limit } = {}) {
       LIMIT ?`,
     [jobId, cap],
   );
+  logger.info('Found ' + rows.length + ' location pings');
   return rows;
 }
 

@@ -5,6 +5,7 @@ const validate = require('../../middleware/validate');
 const { roleByName } = require('../../middleware/role');
 const roleService = require('../../services/role.service');
 const { modernOk, modernError } = require('../../utils/response');
+const logger = require('../../logger');
 
 /*
  * /api/admin/roles — Manage Roles settings surface.
@@ -58,15 +59,18 @@ const updateBody = Joi.object({
 // ─── READ ────────────────────────────────────────────────────────────
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
   try {
+    logger.info('List roles · q=' + (req.query.q ?? '-') + ' includeInactive=' + req.query.includeInactive + ' limit=' + req.query.limit + ' offset=' + req.query.offset);
     const data = await roleService.listRoles(req.query);
+    logger.info('Returning ' + (data?.items?.length ?? data?.length ?? 0) + ' roles');
     modernOk(res, data);
   } catch (e) { next(e); }
 });
 
 router.get('/:roleId', validate(idParam, 'params'), async (req, res, next) => {
   try {
+    logger.info('Get role · roleId=' + req.params.roleId);
     const row = await roleService.getRoleByIdFull(Number(req.params.roleId));
-    if (!row) return modernError(res, 404, 'Role not found');
+    if (!row) { logger.warn('Role not found · roleId=' + req.params.roleId); return modernError(res, 404, 'Role not found'); }
     modernOk(res, row);
   } catch (e) { next(e); }
 });
@@ -74,14 +78,16 @@ router.get('/:roleId', validate(idParam, 'params'), async (req, res, next) => {
 // ─── WRITE ───────────────────────────────────────────────────────────
 router.post('/', roleByName(['Admin']), validate(createBody), async (req, res, next) => {
   try {
+    logger.info('Create role · name=' + req.body.role_name + ' menus=' + (req.body.menu_ids?.length ?? 0) + ' actions=' + (req.body.menu_action_ids?.length ?? 0));
     const created = await roleService.createRole({
       ...req.body,
       createdBy: req.user?.user_id,
     });
+    logger.info('Role created · roleId=' + (created?.role_id ?? created?.id ?? '-'));
     res.status(201);
     modernOk(res, created, 'Role added');
   } catch (e) {
-    if (e.status) return modernError(res, e.status, e.message);
+    if (e.status) { logger.warn('Create role failed · ' + e.message); return modernError(res, e.status, e.message); }
     next(e);
   }
 });
@@ -92,13 +98,15 @@ router.patch('/:roleId',
   validate(updateBody),
   async (req, res, next) => {
     try {
+      logger.info('Update role · roleId=' + req.params.roleId + ' fields=' + Object.keys(req.body).join(','));
       const updated = await roleService.updateRole(
         Number(req.params.roleId), req.body, req.user?.user_id
       );
-      if (!updated) return modernError(res, 404, 'Role not found');
+      if (!updated) { logger.warn('Role not found · roleId=' + req.params.roleId); return modernError(res, 404, 'Role not found'); }
+      logger.info('Role updated · roleId=' + req.params.roleId);
       modernOk(res, updated, 'Role updated');
     } catch (e) {
-      if (e.status) return modernError(res, e.status, e.message);
+      if (e.status) { logger.warn('Update role failed · roleId=' + req.params.roleId + ' · ' + e.message); return modernError(res, e.status, e.message); }
       next(e);
     }
   }
@@ -106,11 +114,13 @@ router.patch('/:roleId',
 
 router.delete('/:roleId', roleByName(['Admin']), validate(idParam, 'params'), async (req, res, next) => {
   try {
+    logger.info('Deactivate role · roleId=' + req.params.roleId);
     const ok = await roleService.deactivateRole(Number(req.params.roleId));
-    if (!ok) return modernError(res, 404, 'Role not found');
+    if (!ok) { logger.warn('Role not found · roleId=' + req.params.roleId); return modernError(res, 404, 'Role not found'); }
+    logger.info('Role deactivated · roleId=' + req.params.roleId);
     modernOk(res, { deactivated: true });
   } catch (e) {
-    if (e.status) return modernError(res, e.status, e.message);
+    if (e.status) { logger.warn('Deactivate role failed · roleId=' + req.params.roleId + ' · ' + e.message); return modernError(res, e.status, e.message); }
     next(e);
   }
 });

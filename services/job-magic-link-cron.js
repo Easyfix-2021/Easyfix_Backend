@@ -31,6 +31,7 @@ const { signJobToken } = require('../utils/jwt');
 async function runHourlySweep() {
   const startedAt = Date.now();
   let eligible = 0, attempted = 0, succeeded = 0, failed = 0, skipped = 0;
+  logger.info('Magic-link cron sweep start · status=9 · limit=500');
 
   try {
     const [rows] = await pool.query(`
@@ -55,6 +56,7 @@ async function runHourlySweep() {
        LIMIT 500
     `);
     eligible = rows.length;
+    logger.info('Found ' + eligible + ' eligible unconfirmed jobs');
 
     for (const row of rows) {
       attempted += 1;
@@ -113,9 +115,11 @@ async function runHourlySweep() {
  * "Last Run" panel.
  */
 async function runTest({ mobile, sourceId } = {}) {
+  logger.info('Magic-link TEST send · sourceId=' + (sourceId != null && String(sourceId).trim() !== '' ? String(sourceId).trim() : 'none'));
   const phone = String(mobile || '').trim();
   const cleaned = phone.replace(/\D/g, '');
   if (!(cleaned.length === 10 || (cleaned.length === 12 && cleaned.startsWith('91')))) {
+    logger.warn('Magic-link TEST rejected · invalid mobile');
     throw Object.assign(new Error('Mobile must be a valid 10-digit Indian number.'), {
       status: 400, code: 'INVALID_TEST_MOBILE',
     });
@@ -147,10 +151,12 @@ async function runTest({ mobile, sourceId } = {}) {
       [jobId],
     );
     if (rows.length === 0) {
+      logger.warn('Magic-link TEST source job not found · job_id=' + jobId);
       throw Object.assign(new Error(`No job found with id ${jobId}.`), {
         status: 404, code: 'JOB_NOT_FOUND',
       });
     }
+    logger.info('Magic-link TEST source job resolved · job_id=' + rows[0].job_id + ' · job_status=' + rows[0].job_status);
     customerName  = rows[0].customer_name || customerName;
     clientName    = rows[0].client_name   || clientName;
     jobIdForToken = rows[0].job_id;

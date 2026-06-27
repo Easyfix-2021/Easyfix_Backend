@@ -43,6 +43,7 @@ const logger = require('../logger');
  * Default limit is generous (1000) so the FE "All" sentinel maps cleanly.
  */
 async function listZones({ q, limit = 1000, offset = 0, includeInactive = false } = {}) {
+  logger.info('Listing zones · q=' + (q || '') + ' limit=' + limit + ' offset=' + offset + ' includeInactive=' + includeInactive);
   const lim = Math.min(Math.max(Number(limit) || 1000, 1), 5000);
   const off = Math.max(Number(offset) || 0, 0);
 
@@ -94,11 +95,13 @@ async function listZones({ q, limit = 1000, offset = 0, includeInactive = false 
       ${whereSql}
   `, whereParams);
 
+  logger.info('Returning ' + rows.length + ' zones (total=' + Number(total) + ')');
   return { items: rows, total: Number(total) };
 }
 
 // ─── Detail (zone + assigned pincodes) ───────────────────────────────
 async function getZoneDetail(zoneId) {
+  logger.info('Fetching zone detail · id=' + zoneId);
   const [[zone]] = await pool.query(
     `SELECT z.zone_id, z.zone_name, z.zone_status, z.created_date,
             z.city_id, c.city_name
@@ -108,6 +111,7 @@ async function getZoneDetail(zoneId) {
       LIMIT 1`,
     [zoneId]
   );
+  if (!zone) logger.warn('Zone not found · id=' + zoneId);
   if (!zone) return null;
 
   // Pincodes assigned to this zone (source of truth: the junction).
@@ -136,6 +140,7 @@ async function getZoneDetail(zoneId) {
     [zoneId, zoneId]
   );
 
+  logger.info('Found ' + pincodes.length + ' pincodes for zone · id=' + zoneId);
   return { ...zone, pincodes, ...counts };
 }
 
@@ -153,6 +158,7 @@ async function getZoneDetail(zoneId) {
  * and can drive a "load more" / paging affordance if needed.
  */
 async function listAssignablePincodes(zoneId, { q, limit = 50, offset = 0, inZoneOnly = false } = {}) {
+  logger.info('Listing assignable pincodes · zoneId=' + zoneId + ' q=' + (q || '') + ' limit=' + limit + ' offset=' + offset + ' inZoneOnly=' + inZoneOnly);
   const lim = Math.min(Math.max(Number(limit) || 50, 1), 200);
   const off = Math.max(Number(offset) || 0, 0);
   const onlyInZone = inZoneOnly === true || inZoneOnly === 'true';
@@ -198,6 +204,7 @@ async function listAssignablePincodes(zoneId, { q, limit = 50, offset = 0, inZon
     whereParams
   );
 
+  logger.info('Found ' + rows.length + ' assignable pincodes (total=' + Number(total) + ')');
   return {
     items: rows.map((r) => ({ ...r, in_this_zone: !!r.in_this_zone })),
     total: Number(total),
@@ -212,6 +219,7 @@ async function listAssignablePincodes(zoneId, { q, limit = 50, offset = 0, inZon
  * candidate-ranking / auto-assign keep their own separate membership queries.
  */
 async function searchEasyfixersInZone(zoneId, { q, limit = 200, activeOnly = true } = {}) {
+  logger.info('Searching easyfixers in zone · zoneId=' + zoneId + ' q=' + (q || '') + ' limit=' + limit + ' activeOnly=' + activeOnly);
   // Base filters applied directly in the JOIN ON clause (literal SQL, no params).
   const efClauses = ['e.efr_status = 1', 'e.is_technician_verified = 1'];
   if (!activeOnly) efClauses.length = 0; // caller opted out — return all who service the zone
@@ -247,6 +255,7 @@ async function searchEasyfixersInZone(zoneId, { q, limit = 200, activeOnly = tru
      ORDER BY e.efr_name ASC
      LIMIT ?
   `, params);
+  logger.info('Found ' + rows.length + ' easyfixers in zone · zoneId=' + zoneId);
   return rows;
 }
 
@@ -258,6 +267,7 @@ async function searchEasyfixersInZone(zoneId, { q, limit = 200, activeOnly = tru
  * more than one of those zones to a single row).
  */
 async function searchEasyfixersByPincode(pincode, { limit = 200 } = {}) {
+  logger.info('Searching easyfixers by pincode · pincode=' + pincode + ' limit=' + limit);
   const [rows] = await pool.query(`
     SELECT DISTINCT
       e.efr_id, e.efr_name, e.efr_no, e.efr_email,
@@ -275,6 +285,7 @@ async function searchEasyfixersByPincode(pincode, { limit = 200 } = {}) {
      ORDER BY e.efr_name ASC
      LIMIT ?
   `, [String(pincode), Number(limit)]);
+  logger.info('Found ' + rows.length + ' easyfixers for pincode · pincode=' + pincode);
   return rows;
 }
 
@@ -292,6 +303,7 @@ async function assertCityExists(conn, cityId) {
  * (city_id, lower(zone_name)).
  */
 async function createZone({ zone_name, city_id }) {
+  logger.info('Creating zone · zone_name=' + (zone_name || '') + ' city_id=' + city_id);
   const trimmed = String(zone_name || '').trim();
   if (!trimmed) throw mkErr(400, 'zone_name required');
   if (!city_id) throw mkErr(400, 'city_id required');
@@ -306,6 +318,7 @@ async function createZone({ zone_name, city_id }) {
         WHERE city_id = ? AND LOWER(zone_name) = LOWER(?) LIMIT 1`,
       [city_id, trimmed]
     );
+    if (dup) logger.warn('Zone create rejected · duplicate name in city · city_id=' + city_id);
     if (dup) throw mkErr(409, `Zone "${trimmed}" already exists in this city`);
 
     const [r] = await conn.query(
@@ -323,9 +336,11 @@ async function createZone({ zone_name, city_id }) {
     );
 
     await conn.commit();
+    logger.info('Zone created · id=' + zoneId);
     return getZoneDetail(zoneId);
   } catch (e) {
     await conn.rollback();
+    logger.warn('Zone create failed · rolled back · ' + e.message);
     throw e;
   } finally {
     conn.release();
@@ -339,6 +354,7 @@ async function createZone({ zone_name, city_id }) {
  * delete and re-create.
  */
 async function updateZone(zoneId, { zone_name, zone_status }) {
+  logger.info('Updating zone · id=' + zoneId + ' zone_name=' + (zone_name === undefined ? '(unchanged)' : zone_name) + ' zone_status=' + (zone_status === undefined ? '(unchanged)' : zone_status));
   const sets = [];
   const vals = [];
   if (zone_name !== undefined) {
@@ -369,6 +385,7 @@ async function updateZone(zoneId, { zone_name, zone_status }) {
         [zoneId]
       );
       if (Number(cnt) > 0) {
+        logger.warn('Zone deactivation blocked · id=' + zoneId + ' mappedPincodes=' + cnt);
         throw mkErr(409, `Cannot deactivate this zone — ${cnt} pincode(s) are still mapped to it. Remove all its pincodes first.`);
       }
     }
@@ -378,6 +395,7 @@ async function updateZone(zoneId, { zone_name, zone_status }) {
 
   vals.push(zoneId);
   await pool.query(`UPDATE tbl_zone_master SET ${sets.join(', ')} WHERE zone_id = ?`, vals);
+  logger.info('Zone updated · id=' + zoneId);
   return getZoneDetail(zoneId);
 }
 
@@ -396,6 +414,7 @@ async function updateZone(zoneId, { zone_name, zone_status }) {
  */
 async function setPincodeMapping(zoneId, pincodeIds, { userId = null } = {}) {
   const ids = Array.from(new Set((pincodeIds || []).map(Number).filter(Number.isFinite)));
+  logger.info('Replacing zone pincode mapping · zoneId=' + zoneId + ' requested=' + ids.length);
 
   const conn = await pool.getConnection();
   try {
@@ -456,6 +475,7 @@ async function setPincodeMapping(zoneId, pincodeIds, { userId = null } = {}) {
     }
 
     await conn.commit();
+    logger.info('Zone pincode mapping replaced · zoneId=' + zoneId + ' accepted=' + acceptable.length + ' rejected=' + rejected.length);
     const detail = await getZoneDetail(zoneId);
     return { ...detail, rejected };
   } catch (e) {

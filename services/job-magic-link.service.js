@@ -426,6 +426,7 @@ async function jobHasColumn(pool, col) {
  * latency vs sequential.
  */
 async function fetchPrefill(jobId, pool) {
+  logger.info('Build magic-link prefill · jobId=' + jobId);
   // Schema-drift gate: older deploys lack tbl_address.address_instruction.
   // When absent, project NULL into the same column slot so downstream
   // code doesn't have to branch on its presence.
@@ -523,6 +524,7 @@ async function fetchPrefill(jobId, pool) {
   const serviceRows    = serviceResult[0]    || [];
   const imageRows      = imageResult[0]      || [];
   const customPropRows = customPropResult[0] || [];
+  logger.info('Loaded prefill lookups · services=' + serviceRows.length + ' images=' + imageRows.length + ' cities=' + cityRows.length + ' customProps=' + customPropRows.length);
 
   // Resolve the client's Primary internal SPOC (user_type=1). The real
   // mobile NEVER leaves the server — we mask it before returning. The
@@ -573,6 +575,8 @@ async function fetchPrefill(jobId, pool) {
         AND js.job_service_status = 1`,
     [row.fk_client_id, jobId],
   );
+
+  logger.info('Returning prefill · jobId=' + jobId + ' status=' + (row.job_status != null ? Number(row.job_status) : null) + ' preselectedServices=' + selectedRows.length);
 
   return {
     jobId,
@@ -713,6 +717,7 @@ async function fetchPrefill(jobId, pool) {
  *   future caller (webhook re-trigger, ops CLI, etc.).
  */
 async function sendForJob(jobId, { action, override = false } = {}, pool) {
+  logger.info('Send magic-link WhatsApp · jobId=' + jobId + ' action=' + (action || 'first') + ' override=' + !!override);
   // Inline subquery pulls the per-client configurable cap so we don't
   // need a second round-trip. NULL when no row → COALESCE → default 3.
   // CAST UNSIGNED defends against ops storing '3 ' / 'three' — bad
@@ -913,6 +918,8 @@ async function sendForJob(jobId, { action, override = false } = {}, pool) {
     [sentAt, effectiveAction, jobId],
   );
 
+  logger.info('Magic-link sent · jobId=' + jobId + ' action=' + effectiveAction + ' sendCount=' + ((row.magic_link_send_count || 0) + 1));
+
   return {
     delivered:           true,
     error:               null,
@@ -954,6 +961,7 @@ async function sendForJob(jobId, { action, override = false } = {}, pool) {
  * is the service_type_id.
  */
 async function acceptSubmission(jobId, payload, pool) {
+  logger.info('Accept customer submission · jobId=' + jobId + ' services=' + (Array.isArray(payload && payload.services) ? payload.services.length : 0));
   // Server-side mandatory custom-property enforcement (belt-and-braces over the
   // FE gate). Runs BEFORE any connection/transaction so a tampered or older
   // client that skips a required client field is rejected with a 400 listing
@@ -1267,6 +1275,7 @@ async function acceptSubmission(jobId, payload, pool) {
           [dropIds],
         );
       }
+      logger.info('Reconciling job services · keep=' + resolved.size + ' softDeleted=' + dropIds.length);
 
       // d) Apply each submitted pick: UPDATE active row, or INSERT fresh
       //    (never resurrect a soft-deleted ops removal). Charges are
@@ -1327,6 +1336,8 @@ async function acceptSubmission(jobId, payload, pool) {
 
     await conn.commit();
 
+    logger.info('Customer submission committed · jobId=' + jobId);
+
     return {
       ok: true,
       jobId,
@@ -1334,6 +1345,7 @@ async function acceptSubmission(jobId, payload, pool) {
     };
   } catch (err) {
     try { await conn.rollback(); } catch (_e) { /* connection already gone */ }
+    logger[(err && err.status && err.status < 500) ? 'warn' : 'error']('Customer submission ' + ((err && err.status && err.status < 500) ? 'rejected' : 'failed') + ' · jobId=' + jobId + ' · ' + (err && (err.message || err.code) ? (err.message || err.code) : 'unknown'));
     // Re-throw shaped errors verbatim (they carry status/code already);
     // wrap unknown errors with a 500 envelope for the public route layer.
     if (err && err.status) throw err;
@@ -1365,6 +1377,7 @@ async function acceptSubmission(jobId, payload, pool) {
  *   payload (object — snapshot stored as customer_submitted_payload JSON).
  */
 async function writeCustomerOrderDetails(jobId, fields, pool) {
+  logger.info('Write customer order details (chat flow) · jobId=' + jobId);
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
@@ -1427,9 +1440,11 @@ async function writeCustomerOrderDetails(jobId, fields, pool) {
     }
 
     await conn.commit();
+    logger.info('Customer order details written · jobId=' + jobId);
     return { jobId, customer_submitted_at: submittedAt.toISOString() };
   } catch (err) {
     try { await conn.rollback(); } catch (_e) { /* connection already gone */ }
+    logger[(err && err.status && err.status < 500) ? 'warn' : 'error']('Customer order details write ' + ((err && err.status && err.status < 500) ? 'rejected' : 'failed') + ' · jobId=' + jobId + ' · ' + (err && (err.message || err.code) ? (err.message || err.code) : 'unknown'));
     if (err && err.status) throw err;
     throw { status: 500, message: err && err.message ? err.message : 'write failed' };
   } finally {

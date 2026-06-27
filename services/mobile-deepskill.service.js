@@ -1,5 +1,6 @@
 const { pool } = require('../db');
 const deepSkillService = require('./deep-skill.service');
+const logger = require('../logger');
 
 /*
  * Mobile Deep-Skill flow — technician-facing read + write of the
@@ -58,6 +59,7 @@ const deepSkillService = require('./deep-skill.service');
  *   } ] }
  */
 async function getHierarchy(efrId, categoryId) {
+  logger.info('Get deep-skill hierarchy · categoryId=' + categoryId);
   // 1) Category name (404 if the category doesn't exist / is deleted).
   const [[cat]] = await pool.query(
     `SELECT service_catg_id, service_catg_name
@@ -67,6 +69,7 @@ async function getHierarchy(efrId, categoryId) {
     [categoryId],
   );
   if (!cat) {
+    logger.warn('Get deep-skill hierarchy failed · service category not found · categoryId=' + categoryId);
     const err = new Error('service category not found');
     err.status = 404;
     throw err;
@@ -92,6 +95,7 @@ async function getHierarchy(efrId, categoryId) {
       ORDER BY deepskill_name ASC`,
     [categoryId],
   );
+  logger.info('Found ' + serviceTypes.length + ' service types and ' + deepSkills.length + ' deep skills');
 
   // 4) Active options for those deep skills (single round-trip).
   let options = [];
@@ -182,6 +186,7 @@ async function getHierarchy(efrId, categoryId) {
     };
   });
 
+  logger.info('Returning hierarchy · ' + serviceTypeNodes.length + ' service types · ' + selectedOptionIds.size + ' selected options');
   return {
     categoryId:   cat.service_catg_id,
     categoryName: cat.service_catg_name,
@@ -217,7 +222,9 @@ async function getHierarchy(efrId, categoryId) {
  */
 async function applySkills(efrId, payload) {
   const categoryId = Number(payload.categoryId);
+  logger.info('Apply deep skills · categoryId=' + categoryId + ' · serviceTypes=' + ((payload.serviceTypes || []).length));
   if (!Number.isInteger(categoryId) || categoryId <= 0) {
+    logger.warn('Apply deep skills rejected · categoryId is required');
     const err = new Error('categoryId is required');
     err.status = 400;
     throw err;
@@ -230,6 +237,7 @@ async function applySkills(efrId, payload) {
     [categoryId],
   );
   if (!cat) {
+    logger.warn('Apply deep skills failed · service category not found · categoryId=' + categoryId);
     const err = new Error('service category not found');
     err.status = 404;
     throw err;
@@ -338,6 +346,7 @@ async function applySkills(efrId, payload) {
     }
 
     await conn.commit();
+    logger.info('Deep skills applied · categoryId=' + categoryId + ' · added=' + totalNewMappingsAdded + ' · deleted=' + totalMappingsDeleted + ' · unchanged=' + totalExistingMappings);
     return {
       totalNewMappingsAdded,
       totalMappingsDeleted,
@@ -345,6 +354,7 @@ async function applySkills(efrId, payload) {
       success: true,
     };
   } catch (e) {
+    logger.error('Apply deep skills failed, rolled back · categoryId=' + categoryId + ' · ' + e.message);
     try { await conn.rollback(); } catch (_) { /* swallow rollback failure */ }
     throw e;
   } finally {

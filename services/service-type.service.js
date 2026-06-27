@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const logger = require('../logger');
 
 /*
  * Manage Service Type — master for tbl_service_type.
@@ -33,6 +34,7 @@ async function listTypes({
   limit = 200, offset = 0,
   sortBy = 'service_type_name', sortDir = 'asc',
 } = {}) {
+  logger.info('List service types · q=' + (q || '') + ' categoryId=' + (categoryId || '') + ' includeInactive=' + includeInactive + ' limit=' + limit + ' offset=' + offset);
   limit  = Math.min(Math.max(Number(limit) || 200, 1), 1000);
   offset = Math.max(Number(offset) || 0, 0);
 
@@ -62,15 +64,19 @@ async function listTypes({
     [...params, limit, offset]
   );
 
+  logger.info('Found ' + rows.length + ' service types');
+
   const [[{ total }]] = await pool.query(
     `SELECT COUNT(*) AS total FROM tbl_service_type st WHERE ${where.join(' AND ')}`,
     params
   );
 
+  logger.info('Returning ' + rows.length + ' service types · total=' + total);
   return { items: rows, total };
 }
 
 async function getTypeById(id) {
+  logger.info('Get service type · id=' + id);
   const [[row]] = await pool.query(
     `SELECT st.service_type_id, st.service_type_name, st.service_type_desc,
             st.service_type_status, st.service_catg_id, sc.service_catg_name,
@@ -86,6 +92,7 @@ async function getTypeById(id) {
 }
 
 async function createType({ service_type_name, service_type_desc, service_catg_id, display, service_type_tools, service_type_tool_names, service_type_image }) {
+  logger.info('Create service type · name=' + String(service_type_name || '').trim() + ' service_catg_id=' + service_catg_id + ' display=' + display);
   const name = String(service_type_name || '').trim();
   if (!name)             throw mkErr(400, 'service_type_name is required');
   if (!service_catg_id)  throw mkErr(400, 'service_catg_id is required');
@@ -121,10 +128,12 @@ async function createType({ service_type_name, service_type_desc, service_catg_i
       service_type_image ? String(service_type_image).trim() : null,
     ]
   );
+  logger.info('Service Type created · id=' + r.insertId);
   return getTypeById(r.insertId);
 }
 
 async function updateType(id, fields) {
+  logger.info('Update service type · id=' + id + ' fields=' + Object.keys(fields || {}).join(','));
   const [[me]] = await pool.query(
     'SELECT service_type_id FROM tbl_service_type WHERE service_type_id = ? AND service_type_status <> 3 LIMIT 1',
     [id]
@@ -171,10 +180,12 @@ async function updateType(id, fields) {
 
   params.push(id);
   await pool.query(`UPDATE tbl_service_type SET ${sets.join(', ')} WHERE service_type_id = ?`, params);
+  logger.info('Service Type updated · id=' + id);
   return getTypeById(id);
 }
 
 async function deleteType(id) {
+  logger.info('Delete service type · id=' + id);
   // Legacy "delete" = soft-delete to status 3 (row leaves every list). This
   // mirrors the legacy CRM trash action (UPDATE ... SET service_type_status=3).
   // Distinct from Deactivate (is_active toggle → status 0), which keeps the row
@@ -183,6 +194,7 @@ async function deleteType(id) {
     'UPDATE tbl_service_type SET service_type_status = 3 WHERE service_type_id = ? AND service_type_status <> 3',
     [id]
   );
+  if (r.affectedRows > 0) logger.info('Service Type deleted (status=3) · id=' + id);
   return r.affectedRows > 0;
 }
 

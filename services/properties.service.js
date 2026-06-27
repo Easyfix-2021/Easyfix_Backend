@@ -145,6 +145,7 @@ async function getAllProperties() {
  *     directly and wants the BE to pick up the change immediately
  */
 async function flushCache() {
+  logger.info('Flushing easyfix_properties cache (operator reload)');
   _cache = null;
   _loadedAt = 0;
   _loadPromise = _load();
@@ -160,6 +161,7 @@ async function flushCache() {
  * Web↔Mobile calling switch (voice.call.mode).
  */
 async function setProperty(key, value) {
+  logger.info('Upserting easyfix_property · key=' + key);
   const v = String(value);
   const [r] = await pool.query(
     'UPDATE easyfix_properties SET property_value = ? WHERE property_key = ?',
@@ -170,6 +172,9 @@ async function setProperty(key, value) {
       'INSERT INTO easyfix_properties (property_key, property_value) VALUES (?, ?)',
       [key, v],
     );
+    logger.info('Property inserted (new key) · key=' + key);
+  } else {
+    logger.info('Property updated · key=' + key);
   }
   if (_cache) _cache.set(key, v);
   return true;

@@ -278,6 +278,10 @@ async function listNotices({
   limit  = Math.min(Math.max(Number(limit) || 25, 1), 200);
   offset = Math.max(Number(offset) || 0, 0);
 
+  logger.info('List notices · status=' + (status || 'any') + ' · surface=' + (surface || 'any')
+    + ' · category_id=' + (category_id || 'any') + ' · q=' + (q ? 'yes' : 'no')
+    + ' · limit=' + limit + ' · offset=' + offset);
+
   const where = ['1=1'];
   const params = [];
 
@@ -318,6 +322,7 @@ async function listNotices({
 
   const reachMap = await getSurfaceReachMap();
   const items = await decorate(rows, reachMap);
+  logger.info('Returning ' + items.length + ' notices · total=' + total);
   return { items, total };
 }
 
@@ -342,13 +347,22 @@ async function createNotice(body, createdBy) {
     status_intent = 'draft',
   } = body;
 
+  logger.info('Create notice · category_id=' + category_id + ' · surfaces=' + target_surfaces
+    + ' · status_intent=' + status_intent);
+
   // Validate category exists + active
   const [[cat]] = await pool.query(
     'SELECT category_id, is_active FROM tbl_notice_category WHERE category_id = ?',
     [category_id],
   );
-  if (!cat) throw mkErr(400, 'Invalid category_id');
-  if (!cat.is_active) throw mkErr(400, 'Category is inactive');
+  if (!cat) {
+    logger.warn('Create notice rejected · invalid category_id=' + category_id);
+    throw mkErr(400, 'Invalid category_id');
+  }
+  if (!cat.is_active) {
+    logger.warn('Create notice rejected · inactive category_id=' + category_id);
+    throw mkErr(400, 'Category is inactive');
+  }
 
   // v1 supports only audience_scope='all'. Schema accepts the other
   // values for forward-compat but the service rejects them until the
@@ -401,6 +415,7 @@ async function createNotice(body, createdBy) {
   );
 
   const created = await getNoticeById(r.insertId);
+  logger.info('Notice created · id=' + r.insertId + ' · status=' + status);
 
   // Same fire-and-forget push as publishNotice — only when the notice was
   // created already-published (publish intent with no future publish_at)
@@ -420,12 +435,14 @@ async function createNotice(body, createdBy) {
 
 // ─── Update (drafts and scheduled only) ─────────────────────────────
 async function updateNotice(noticeId, fields) {
+  logger.info('Update notice · id=' + noticeId + ' · fields=' + Object.keys(fields || {}).join(','));
   const [[existing]] = await pool.query(
     'SELECT notice_id, status FROM tbl_notice WHERE notice_id = ?',
     [noticeId],
   );
   if (!existing) return null;
   if (existing.status === 'published' || existing.status === 'archived') {
+    logger.warn('Update notice rejected · id=' + noticeId + ' · status=' + existing.status + ' not editable');
     throw mkErr(409,
       'Published or archived notices cannot be edited. Archive and recreate to make changes.');
   }
@@ -472,21 +489,25 @@ async function updateNotice(noticeId, fields) {
     `UPDATE tbl_notice SET ${sets.join(', ')} WHERE notice_id = ?`,
     params,
   );
+  logger.info('Notice updated · id=' + noticeId);
   return getNoticeById(noticeId);
 }
 
 // ─── Publish (transition draft → scheduled/published) ───────────────
 async function publishNotice(noticeId, { publish_at, expire_at }, publishedBy) {
+  logger.info('Publish notice · id=' + noticeId);
   const [[existing]] = await pool.query(
     'SELECT notice_id, status, publish_at FROM tbl_notice WHERE notice_id = ?',
     [noticeId],
   );
   if (!existing) return null;
   if (existing.status === 'archived') {
+    logger.warn('Publish notice rejected · id=' + noticeId + ' · already archived');
     throw mkErr(409, 'Cannot publish an archived notice');
   }
   if (existing.status === 'published') {
     // Idempotent — return the row as-is.
+    logger.info('Publish notice no-op · id=' + noticeId + ' · already published');
     return getNoticeById(noticeId);
   }
 
@@ -510,6 +531,7 @@ async function publishNotice(noticeId, { publish_at, expire_at }, publishedBy) {
     `UPDATE tbl_notice SET ${sets.join(', ')} WHERE notice_id = ?`,
     params,
   );
+  logger.info('Notice ' + newStatus + ' · id=' + noticeId);
 
   const row = await getNoticeById(noticeId);
 
@@ -534,6 +556,7 @@ async function publishNotice(noticeId, { publish_at, expire_at }, publishedBy) {
 
 // ─── Archive ────────────────────────────────────────────────────────
 async function archiveNotice(noticeId) {
+  logger.info('Archive notice · id=' + noticeId);
   const [[existing]] = await pool.query(
     'SELECT notice_id, status FROM tbl_notice WHERE notice_id = ?',
     [noticeId],
@@ -544,6 +567,7 @@ async function archiveNotice(noticeId) {
     `UPDATE tbl_notice SET status = 'archived' WHERE notice_id = ?`,
     [noticeId],
   );
+  logger.info('Notice archived · id=' + noticeId);
   return getNoticeById(noticeId);
 }
 
@@ -577,6 +601,7 @@ async function publishDueScheduled() {
   );
 
   const summary = { checked: due.length, published: 0, pushed: 0 };
+  logger.info('Promote due scheduled notices · found ' + due.length + ' due');
 
   for (const n of due) {
     try {
@@ -606,10 +631,12 @@ async function publishDueScheduled() {
         }
       }
     } catch (err) {
+      logger.warn('Promote due scheduled notice failed · id=' + n.notice_id + ' · ' + err.message);
       logger.warn({ err, notice_id: n.notice_id }, 'publishDueScheduled: row failed; skipping');
     }
   }
 
+  logger.info('Promoted ' + summary.published + ' notices · pushed=' + summary.pushed);
   return summary;
 }
 
@@ -632,6 +659,8 @@ async function listActiveForSurface({
   if (!SURFACES.includes(surface)) throw mkErr(400, 'Invalid surface');
   limit = Math.min(Math.max(Number(limit) || 20, 1), 50);
 
+  logger.info('List active notices · surface=' + surface + ' · readerType=' + readerType + ' · limit=' + limit);
+
   const [rows] = await pool.query(
     `SELECT ${ROW_SELECT},
             EXISTS(
@@ -652,6 +681,8 @@ async function listActiveForSurface({
       LIMIT ?`,
     [surface, readerType, readerId || 0, surface, limit],
   );
+
+  logger.info('Found ' + rows.length + ' active notices · surface=' + surface);
 
   return await Promise.all(rows.map(async (r) => {
     const imageKeys = normaliseImages(r.images);
@@ -677,6 +708,7 @@ async function listActiveForSurface({
  */
 async function countUnreadForSurface({ surface, readerType = 'crm_user', readerId }) {
   if (!SURFACES.includes(surface)) throw mkErr(400, 'Invalid surface');
+  logger.info('Count unread notices · surface=' + surface + ' · readerType=' + readerType);
   const [[{ unread }]] = await pool.query(
     `SELECT COUNT(*) AS unread
        FROM tbl_notice n
@@ -693,12 +725,14 @@ async function countUnreadForSurface({ surface, readerType = 'crm_user', readerI
             )`,
     [surface, surface, readerType, readerId || 0],
   );
+  logger.info('Unread notices count=' + (Number(unread) || 0) + ' · surface=' + surface);
   return Number(unread) || 0;
 }
 
 // ─── Mark-read (idempotent upsert into tbl_notice_read) ─────────────
 async function markRead({ noticeId, surface, readerType, readerId }) {
   if (!SURFACES.includes(surface)) throw mkErr(400, 'Invalid surface');
+  logger.info('Mark notice read · noticeId=' + noticeId + ' · surface=' + surface + ' · readerType=' + readerType);
   // Insert and tolerate duplicates — UNIQUE index makes this idempotent.
   // We do NOT update read_at on duplicate; first read sticks (matches
   // the spec's "first time you opened it" semantics).

@@ -1,5 +1,6 @@
 const router = require('express').Router();
 
+const logger = require('../../logger');
 const requireAuth = require('../../middleware/auth');
 const { role } = require('../../middleware/role');
 const validate = require('../../middleware/validate');
@@ -41,28 +42,34 @@ router.use(requireAuth);
 
 // ─── Open to any authenticated principal ────────────────────────────
 router.get('/cities',             validate(citiesQuery, 'query'),          async (req, res, next) => {
-  try { modernOk(res, await lookup.cities(req.query)); } catch (e) { next(e); }
+  try {
+    logger.info('Lookup cities · q=' + (req.query.q || ''));
+    const rows = await lookup.cities(req.query);
+    logger.info('Found ' + rows.length + ' cities');
+    modernOk(res, rows);
+  } catch (e) { next(e); }
 });
 
 router.get('/states',             async (_req, res, next) => {
-  try { modernOk(res, await cached('lookup:states', TTL_STATIC, () => lookup.states())); } catch (e) { next(e); }
+  try { logger.info('Lookup states'); modernOk(res, await cached('lookup:states', TTL_STATIC, () => lookup.states())); } catch (e) { next(e); }
 });
 
 // Verticals — drives the Manage Users Verticals picker for RBAC scope.
 router.get('/verticals',          async (_req, res, next) => {
-  try { modernOk(res, await cached('lookup:verticals', TTL_STATIC, () => lookup.verticals())); } catch (e) { next(e); }
+  try { logger.info('Lookup verticals'); modernOk(res, await cached('lookup:verticals', TTL_STATIC, () => lookup.verticals())); } catch (e) { next(e); }
 });
 
 // Zones — drives the Manage Jobs "Zonal" filter dropdown. Lives here
 // (not under /admin) because the Manage Jobs page calls /shared/lookup/*
 // for all its filter options and consistency is cheap.
 router.get('/zones',              async (_req, res, next) => {
-  try { modernOk(res, await cached('lookup:zones', TTL_STATIC, () => lookup.zones())); } catch (e) { next(e); }
+  try { logger.info('Lookup zones'); modernOk(res, await cached('lookup:zones', TTL_STATIC, () => lookup.zones())); } catch (e) { next(e); }
 });
 
 router.get('/service-categories', validate(simpleIncludeInactive, 'query'), async (req, res, next) => {
   try {
     const inc = req.query.includeInactive ? 1 : 0;
+    logger.info('Lookup service-categories · includeInactive=' + inc);
     modernOk(res, await cached(`lookup:service-categories:inc=${inc}`, TTL_STATIC, () => lookup.serviceCategories(req.query)));
   } catch (e) { next(e); }
 });
@@ -71,36 +78,38 @@ router.get('/service-types',      validate(serviceTypesQuery, 'query'),    async
   try {
     const inc = req.query.includeInactive ? 1 : 0;
     const cat = req.query.categoryId != null ? req.query.categoryId : '';
+    logger.info('Lookup service-types · categoryId=' + cat + ' includeInactive=' + inc);
     modernOk(res, await cached(`lookup:service-types:cat=${cat}:inc=${inc}`, TTL_STATIC, () => lookup.serviceTypes(req.query)));
   } catch (e) { next(e); }
 });
 
 router.get('/cancel-reasons',     async (_req, res, next) => {
-  try { modernOk(res, await cached('lookup:cancel-reasons', TTL_STATIC, () => lookup.cancelReasons())); } catch (e) { next(e); }
+  try { logger.info('Lookup cancel-reasons'); modernOk(res, await cached('lookup:cancel-reasons', TTL_STATIC, () => lookup.cancelReasons())); } catch (e) { next(e); }
 });
 
 router.get('/reschedule-reasons', async (_req, res, next) => {
-  try { modernOk(res, await cached('lookup:reschedule-reasons', TTL_STATIC, () => lookup.rescheduleReasons())); } catch (e) { next(e); }
+  try { logger.info('Lookup reschedule-reasons'); modernOk(res, await cached('lookup:reschedule-reasons', TTL_STATIC, () => lookup.rescheduleReasons())); } catch (e) { next(e); }
 });
 
 router.get('/reject-reasons',     async (_req, res, next) => {
-  try { modernOk(res, await cached('lookup:reject-reasons', TTL_STATIC, () => lookup.rejectReasons())); } catch (e) { next(e); }
+  try { logger.info('Lookup reject-reasons'); modernOk(res, await cached('lookup:reject-reasons', TTL_STATIC, () => lookup.rejectReasons())); } catch (e) { next(e); }
 });
 
 router.get('/problem-reasons',    async (_req, res, next) => {
-  try { modernOk(res, await cached('lookup:problem-reasons', TTL_STATIC, () => lookup.problemReasons())); } catch (e) { next(e); }
+  try { logger.info('Lookup problem-reasons'); modernOk(res, await cached('lookup:problem-reasons', TTL_STATIC, () => lookup.problemReasons())); } catch (e) { next(e); }
 });
 
 router.get('/collect-cash-reasons', async (_req, res, next) => {
-  try { modernOk(res, await cached('lookup:collect-cash-reasons', TTL_STATIC, () => lookup.collectCashReasons())); } catch (e) { next(e); }
+  try { logger.info('Lookup collect-cash-reasons'); modernOk(res, await cached('lookup:collect-cash-reasons', TTL_STATIC, () => lookup.collectCashReasons())); } catch (e) { next(e); }
 });
 
 router.get('/revisit-reasons',    async (_req, res, next) => {
-  try { modernOk(res, await cached('lookup:revisit-reasons', TTL_STATIC, () => lookup.revisitReasons())); } catch (e) { next(e); }
+  try { logger.info('Lookup revisit-reasons'); modernOk(res, await cached('lookup:revisit-reasons', TTL_STATIC, () => lookup.revisitReasons())); } catch (e) { next(e); }
 });
 
 router.get('/banks',              validate(banksQuery, 'query'),           async (req, res, next) => {
   try {
+    logger.info('Lookup banks · q=' + (req.query.q || ''));
     // Cache ONLY the full list (no q). Free-text search has unbounded key
     // cardinality, so it bypasses the cache to keep memory bounded.
     if (req.query.q) { modernOk(res, await lookup.banks(req.query)); return; }
@@ -113,6 +122,7 @@ router.get('/banks',              validate(banksQuery, 'query'),           async
 // this is a read-only lookup, mounted under /shared so the mobile JWT is accepted.
 router.get('/tools', async (req, res, next) => {
   try {
+    logger.info('Lookup tools · q=' + (req.query.q || ''));
     const toolService = require('../../services/tool.service');
     const fetchTools = async () => {
       const { items } = await toolService.listTools({ q: req.query.q, includeInactive: false, limit: 1000 });
@@ -128,6 +138,7 @@ router.get('/tools', async (req, res, next) => {
 router.get('/document-types',     validate(simpleIncludeInactive, 'query'), async (req, res, next) => {
   try {
     const inc = req.query.includeInactive ? 1 : 0;
+    logger.info('Lookup document-types · includeInactive=' + inc);
     modernOk(res, await cached(`lookup:document-types:inc=${inc}`, TTL_STATIC, () => lookup.documentTypes(req.query)));
   } catch (e) { next(e); }
 });
@@ -143,24 +154,27 @@ router.get('/clients',          role(['admin']), validate(clientsQuery, 'query')
     // reporting manager's picker shows the union of own + downstream
     // reports' manage_clients. Lookup-permissive default — see
     // services/lookup.service.js::clients for the NULL/empty rule.
+    logger.info('Lookup clients · q=' + (req.query.q || ''));
     const scope = await buildRequestScopeWithHierarchy(req, pool);
-    modernOk(res, await lookup.clients({ ...req.query, scope }));
+    const rows = await lookup.clients({ ...req.query, scope });
+    logger.info('Found ' + rows.length + ' clients');
+    modernOk(res, rows);
   } catch (e) { next(e); }
 });
 
 router.get('/client-services',  role(['admin']), validate(clientServicesQuery, 'query'), async (req, res, next) => {
-  try { modernOk(res, await lookup.clientServices(req.query)); } catch (e) { next(e); }
+  try { logger.info('Lookup client-services · clientId=' + (req.query.clientId != null ? req.query.clientId : '')); modernOk(res, await lookup.clientServices(req.query)); } catch (e) { next(e); }
 });
 
 router.get('/users',            role(['admin']), validate(usersQuery, 'query'),          async (req, res, next) => {
-  try { modernOk(res, await lookup.users(req.query)); } catch (e) { next(e); }
+  try { logger.info('Lookup users · q=' + (req.query.q || '')); modernOk(res, await lookup.users(req.query)); } catch (e) { next(e); }
 });
 
 // Zonal Managers picker — admin-only. Returns the distinct set of users
 // referenced as tbl_city.state_user (i.e. owners of at least one city).
 // Drives the Manage Easyfixers "User Mapped To City" filter.
 router.get('/zonal-managers',   role(['admin']),                                         async (_req, res, next) => {
-  try { modernOk(res, await lookup.zonalManagers()); } catch (e) { next(e); }
+  try { logger.info('Lookup zonal-managers'); modernOk(res, await lookup.zonalManagers()); } catch (e) { next(e); }
 });
 
 // Project Managers picker — admin-only. Returns DISTINCT internal users
@@ -169,7 +183,7 @@ router.get('/zonal-managers',   role(['admin']),                                
 // Client Performance uses user_type=1). Drives the QuickSight report
 // "Project Manager" filter dropdown.
 router.get('/project-managers', role(['admin']), validate(projectManagersQuery, 'query'), async (req, res, next) => {
-  try { modernOk(res, await lookup.projectManagers(req.query)); } catch (e) { next(e); }
+  try { logger.info('Lookup project-managers · userType=' + (req.query.userType != null ? req.query.userType : '')); modernOk(res, await lookup.projectManagers(req.query)); } catch (e) { next(e); }
 });
 
 // Roles dropdown — admin-only. Used by the Manage Users form to fill the
@@ -177,20 +191,20 @@ router.get('/project-managers', role(['admin']), validate(projectManagersQuery, 
 // screens. Optional `group` filter (admin|client|mobile|default) narrows
 // the list to roles valid for a specific user type.
 router.get('/roles',            role(['admin']),                                         async (req, res, next) => {
-  try { modernOk(res, await lookup.roles(req.query)); } catch (e) { next(e); }
+  try { logger.info('Lookup roles · group=' + (req.query.group || '')); modernOk(res, await lookup.roles(req.query)); } catch (e) { next(e); }
 });
 
 // Menu-action catalogue — drives the per-menu action checkboxes on the
 // Manage Roles edit form. Admin-only since exposing the full action key
 // list reveals every gated capability in the CRM.
 router.get('/menu-actions',     role(['admin']),                                         async (_req, res, next) => {
-  try { modernOk(res, await lookup.menuActions()); } catch (e) { next(e); }
+  try { logger.info('Lookup menu-actions'); modernOk(res, await lookup.menuActions()); } catch (e) { next(e); }
 });
 
 // Compact easyfixer picker for "Assign Technician" dropdowns. Admin-only: client
 // SPOCs and technicians themselves have no business enumerating the full bench.
 router.get('/easyfixers',       role(['admin']),                                          async (req, res, next) => {
-  try { modernOk(res, await lookup.easyfixers(req.query)); } catch (e) { next(e); }
+  try { logger.info('Lookup easyfixers · q=' + (req.query.q || '')); modernOk(res, await lookup.easyfixers(req.query)); } catch (e) { next(e); }
 });
 
 // Sidebar menu tree — any authenticated principal gets the tree; the frontend
@@ -200,6 +214,7 @@ router.get('/easyfixers',       role(['admin']),                                
 // unaffected. req.user.official_email is the bypass key.
 router.get('/menus',                                                                       async (req, res, next) => {
   try {
+    logger.info('Lookup sidebar menus');
     modernOk(res, await lookup.menus({ userEmail: req.user?.official_email }));
   } catch (e) { next(e); }
 });
@@ -211,7 +226,7 @@ router.get('/menus',                                                            
 // Non-sensitive payload (just slugs); the parent `/shared` mount keeps
 // the JWT requirement so the answer can't leak the WIP backlog publicly.
 router.get('/menu-visibility',                                                             async (_req, res, next) => {
-  try { modernOk(res, await lookup.menuVisibility()); } catch (e) { next(e); }
+  try { logger.info('Lookup menu-visibility'); modernOk(res, await lookup.menuVisibility()); } catch (e) { next(e); }
 });
 
 module.exports = router;

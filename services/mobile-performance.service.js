@@ -57,7 +57,9 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000;
  *                    weekStart, gaps filled with zeros.
  */
 async function getWeeklyPerformance(efrId, from, to) {
+  logger.info('Weekly performance · from=' + from + ' to=' + to);
   if (!efrId) {
+    logger.info('Weekly performance returning empty (no efrId)');
     return {
       ota: 0, sda: 0, grade: 'C', rating: 0,
       totalJobs: 0, totalEarnings: 0,
@@ -83,6 +85,7 @@ async function getWeeklyPerformance(efrId, from, to) {
     }),
   ]);
 
+  logger.info('Found ' + buckets.length + ' weekly buckets');
   // Index the DB rows by their ISO week key so we can merge them onto the
   // dense skeleton (every Monday in the requested range).
   const byKey = new Map();
@@ -123,6 +126,7 @@ async function getWeeklyPerformance(efrId, from, to) {
     };
   });
 
+  logger.info('Returning ' + weeks.length + ' weeks · totalJobs=' + totalJobs + ' totalEarnings=' + totalEarnings);
   return {
     ota: aggSample ? Math.round((aggOnTime / aggSample) * 100) : 0,
     sda: aggSample ? Math.round((aggSameDay / aggSample) * 100) : 0,
@@ -187,6 +191,7 @@ async function queryWeeklyBuckets(efrId, from, to) {
  * (or any other error) we degrade to all-zeros rather than 500.
  */
 async function getOfferStats(efrId) {
+  logger.info('Get offer stats');
   try {
     const [[row]] = await pool.query(
       `SELECT COUNT(*) AS offered,
@@ -197,6 +202,7 @@ async function getOfferStats(efrId) {
         WHERE fk_easyfixter_id = ?`,
       [efrId],
     );
+    logger.info('Offer stats · offered=' + Number(row?.offered ?? 0) + ' accepted=' + Number(row?.accepted ?? 0) + ' rejected=' + Number(row?.rejected ?? 0) + ' missed=' + Number(row?.missed ?? 0));
     return {
       offered: Number(row?.offered ?? 0),
       accepted: Number(row?.accepted ?? 0),

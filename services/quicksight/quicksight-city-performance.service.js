@@ -227,6 +227,7 @@ async function getCityList({ filters, overallStart, overallEndInclusive, limit, 
   params.push(limit, offset);
 
   const [rows] = await pool.query(sql, params);
+  logger.info('Found ' + rows.length + ' cities for performance page');
   if (rows.length >= CITY_PAGE_CAP) {
     logger.warn(
       { report: 'city-performance', cap: CITY_PAGE_CAP, returned: rows.length },
@@ -392,6 +393,7 @@ function zeroBucket(period) {
  * stateId:null, stateName:'No state', 3 zeroed periods } (legacy 4699-4729).
  */
 async function getCityPerformance({ flag = 'monthly', page = 1, pageSize = 10, filters = {} } = {}) {
+  logger.info('City performance scorecard · flag=' + flag + ' page=' + page + ' pageSize=' + pageSize);
   const periods = buildPeriods(flag); // most-recent first, length 3
   const overallStart = periods[periods.length - 1].startDate; // oldest period start
   // Outer-window upper bound: legacy passes endDate.plusDays(1) as the value
@@ -408,6 +410,7 @@ async function getCityPerformance({ flag = 'monthly', page = 1, pageSize = 10, f
 
   // Empty → synthetic "No city / No state" row with 3 zeroed periods.
   if (cities.length === 0) {
+    logger.info('No cities in window · returning synthetic No-city row (totalRecords=0)');
     const syntheticPeriods = periods.map((p) => zeroBucket(p));
     return {
       data: [
@@ -487,6 +490,7 @@ async function getCityPerformance({ flag = 'monthly', page = 1, pageSize = 10, f
   });
 
   const totalPages = pageSize > 0 ? Math.ceil(totalRecords / pageSize) : 0;
+  logger.info('Returning ' + data.length + ' city rows · totalRecords=' + totalRecords);
   return { data, page, pageSize, totalRecords, totalPages };
 }
 
@@ -561,6 +565,7 @@ async function getCityTatSummaryPeriod({ filters, start, endInclusive }) {
  *   - failedOrderPercentage = 0 (legacy never populates it meaningfully).
  */
 async function getCityTatSummary({ flag = 'monthly', filters = {} } = {}) {
+  logger.info('City TAT summary widget · flag=' + flag);
   const periods = buildPeriods(flag); // most-recent first, length 3
 
   const periodSummaries = await Promise.all(
@@ -605,6 +610,7 @@ async function getCityTatSummary({ flag = 'monthly', filters = {} } = {}) {
     }),
   );
 
+  logger.info('Returning ' + periodSummaries.length + ' TAT period summaries');
   return { periodSummaries };
 }
 

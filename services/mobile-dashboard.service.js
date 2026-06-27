@@ -75,6 +75,7 @@ async function getDashboard(efrId, opts = {}) {
     Math.max(Number(opts.noticesLimit) || DEFAULT_NOTICES_LIMIT, 1),
     MAX_NOTICES_LIMIT,
   );
+  logger.info('Build mobile dashboard · noticesLimit=' + noticesLimit);
 
   // Resolve the IST day once so the "Today's Jobs" SQL range and the
   // defensive same-day slice below read a single consistent day even if
@@ -139,6 +140,7 @@ async function getDashboard(efrId, opts = {}) {
     fetchDateCounts(efrId),
   ]);
 
+  logger.info('Dashboard composed · newRequests=' + newRequests.count + ' · activeToday=' + dateCounts.activeToday + ' · allJobs=' + dateCounts.allJobs + ' · notices=' + (notices || []).length);
   return {
     // Identity + grade/rating merged into one object per the mobile-app
     // spec — the technician card on the home screen renders all of
@@ -262,6 +264,7 @@ async function fetchIdentity(efrId) {
         WHERE e.efr_id = ? LIMIT 1`,
       [efrId],
     );
+    if (!row) logger.info('Technician identity not found · efrId=' + efrId);
     return row || {};
   } catch (e) {
     if (e.code === 'ER_BAD_FIELD_ERROR') {
@@ -525,6 +528,7 @@ async function fetchNewRequests(efrId) {
       const offered = await jobService.listOfferedForTech(efrId);
       const items = (offered && offered.items) || [];
       if (items.length) {
+        logger.info('New requests from open offers · count=' + items.length);
         return {
           items: items.slice(0, NEW_REQUEST_LIMIT).map(toMobilePreview),
           count: items.length,

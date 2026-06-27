@@ -37,6 +37,7 @@ const { streamStyledXlsx } = require('../../../utils/xlsx-styled-export');
 const { extendJobFilter } = require('../../../validators/quicksight.validator');
 const { fileStamp, displayStamp, FMT, decorateColumns } = require('../../../services/quicksight/_shared');
 const service = require('../../../services/quicksight/quicksight-city-performance.service');
+const logger = require('../../../logger');
 
 const ACTION_KEY = 'isQuickSightCityPerformanceView';
 
@@ -85,6 +86,7 @@ const recentLabel = (columns) => {
 router.get('/', validate(tableSchema, 'query'), async (req, res, next) => {
   try {
     const { flag, page, pageSize, format } = req.query;
+    logger.info('City Performance scorecard · flag=' + flag + ' page=' + page + ' pageSize=' + pageSize + ' format=' + (format || 'json'));
     const filters = {
       clientId: req.query.clientId,
       zonalManagerId: req.query.zonalManagerId,
@@ -95,6 +97,7 @@ router.get('/', validate(tableSchema, 'query'), async (req, res, next) => {
     };
 
     const payload = await service.getCityPerformance({ flag, page, pageSize, filters });
+    logger.info('Found ' + (payload && payload.totalRecords != null ? payload.totalRecords : 0) + ' cities');
 
     if (format === 'xlsx') {
       const { columns, rows } = service.toXlsx(payload, flag);
@@ -163,6 +166,7 @@ router.get('/', validate(tableSchema, 'query'), async (req, res, next) => {
         `Generated ${displayStamp()}`;
 
       const filename = `city-performance-${flag}-${fileStamp()}.xlsx`;
+      logger.info('Streaming City Performance xlsx · ' + rows.length + ' rows · ' + cityCount + ' cities');
       await streamStyledXlsx(res, filename, {
         title: 'EasyFix · City Performance',
         meta,
@@ -175,11 +179,14 @@ router.get('/', validate(tableSchema, 'query'), async (req, res, next) => {
       return;
     }
 
+    logger.info('Returning ' + (payload && payload.totalRecords != null ? payload.totalRecords : 0) + ' cities');
     return modernOk(res, payload);
   } catch (err) {
     if (err && err.status) {
+      logger.warn('City Performance scorecard failed · ' + err.message);
       return modernError(res, err.status, err.message || 'Request failed');
     }
+    logger.error('City Performance scorecard error · ' + err.message);
     return next(err);
   }
 });
@@ -188,6 +195,7 @@ router.get('/', validate(tableSchema, 'query'), async (req, res, next) => {
 router.get('/tat-summary', validate(tatSummarySchema, 'query'), async (req, res, next) => {
   try {
     const { flag } = req.query;
+    logger.info('City TAT summary widget · flag=' + flag);
     const filters = {
       clientId: req.query.clientId,
       zonalManagerId: req.query.zonalManagerId,
@@ -196,11 +204,14 @@ router.get('/tat-summary', validate(tatSummarySchema, 'query'), async (req, res,
     };
 
     const summary = await service.getCityTatSummary({ flag, filters });
+    logger.info('Returning City TAT summary');
     return modernOk(res, summary);
   } catch (err) {
     if (err && err.status) {
+      logger.warn('City TAT summary failed · ' + err.message);
       return modernError(res, err.status, err.message || 'Request failed');
     }
+    logger.error('City TAT summary error · ' + err.message);
     return next(err);
   }
 });

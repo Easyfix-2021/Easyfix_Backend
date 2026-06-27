@@ -109,6 +109,7 @@ async function ratingScore(efrId) {
 // ─── Compute + cache ────────────────────────────────────────────────
 
 async function computeGrade(efrId) {
+  logger.info('Compute technician grade · efrId=' + efrId);
   const [training, row, completed, rating] = await Promise.all([
     trainingScore(efrId), easyfixerRow(efrId), completedJobCount(efrId), ratingScore(efrId),
   ]);
@@ -130,6 +131,7 @@ async function computeGrade(efrId) {
       rating: rating == null ? null : Number(rating.toFixed(4)),
     },
   };
+  logger.info('Computed grade=' + detail.grade + ' · basis=' + detail.basis + ' · completed_jobs=' + completed);
   return detail;
 }
 
@@ -154,6 +156,7 @@ async function saveSnapshot(efrId, d) {
  * signal AND the snapshot read fail). Safe to call from any hot mobile path.
  */
 async function getGrade(efrId) {
+  logger.info('Get technician grade · efrId=' + efrId);
   try {
     const [[snap]] = await pool.query(
       `SELECT grade, composite, onboarding_score, performance_score, completed_jobs, basis, computed_at
@@ -161,6 +164,7 @@ async function getGrade(efrId) {
       [efrId],
     );
     if (snap && snap.computed_at && Date.now() - new Date(snap.computed_at).getTime() < SNAPSHOT_TTL_MS) {
+      logger.info('Returning cached grade=' + snap.grade + ' · basis=' + snap.basis);
       return snap;
     }
   } catch (e) { logger.warn({ err: e.message, efrId }, 'grade: snapshot read failed'); }
@@ -192,6 +196,7 @@ const NEXT_FLOOR = { E: 60, D: 70, C: 80, B: 90, A: 95, 'A+': 100 };
  * engine is the reliable, zero-cost, no-hallucination baseline + fallback.)
  */
 async function getGradeAdvice(efrId) {
+  logger.info('Build grade-improvement advice · efrId=' + efrId);
   const d = await computeGrade(efrId);
   const b = d._breakdown || {};
   const pct = Math.round((d.composite || 0) * 100);
@@ -225,6 +230,7 @@ async function getGradeAdvice(efrId) {
     actions.push({ title: 'You’re doing great', why: 'Keep up your ratings and on-time check-ins to stay at the top.' });
   }
 
+  logger.info('Returning grade advice · currentGrade=' + d.grade + ' · nextGrade=' + nextGrade + ' · ' + actions.length + ' actions');
   return {
     currentGrade: d.grade,
     nextGrade,

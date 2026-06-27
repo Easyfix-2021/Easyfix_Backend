@@ -999,8 +999,10 @@ async function rankCandidatesForJob(jobId, {
   limit = 10, jobDate, timeSlot,
   enforceMaxConcurrent = true, enforceCodBalance = false, enforceAttendance = true,
 } = {}) {
+  logger.info('Rank candidates for job · jobId=' + jobId + ' limit=' + limit + (jobDate ? ' jobDate=' + jobDate : '') + (timeSlot != null && timeSlot !== '' ? ' timeSlot=' + timeSlot : ''));
   const job = await jobService.getById(jobId);
   if (!job) {
+    logger.warn('Rank candidates failed · job not found · jobId=' + jobId);
     const err = new Error('job not found'); err.status = 404; throw err;
   }
   const alreadyAssigned = !!job.fk_easyfixter_id;
@@ -1101,9 +1103,11 @@ async function rankCandidatesForJob(jobId, {
   let appliedDeepSkill = true;
   let eligible = await l1Eligibility(job, { applyDeepSkill: true });
   let note = null;
+  logger.info('City-scoped eligibility · found ' + eligible.length + ' eligible techs');
   if (eligible.length === 0 && (job.fk_service_catg_id || job.fk_service_type_id)) {
     eligible = await l1Eligibility(job, { applyDeepSkill: false });
     if (eligible.length > 0) { note = 'no_deep_skill_match'; appliedDeepSkill = false; }
+    logger.info('Deep-skill fallback eligibility · found ' + eligible.length + ' eligible techs');
   }
 
   let scored = [];
@@ -1126,6 +1130,7 @@ async function rankCandidatesForJob(jobId, {
   // because nothing matched, so does the widened pass). Net-new vs legacy
   // (legacy never scoped by zone); built on the new-CRM zone model.
   if (scored.length < DEFAULTS.MIN_CANDIDATES_BEFORE_WIDEN && jobZoneIds.size > 0) {
+    logger.info('Zone-widening fallback · scored=' + scored.length + ' below threshold ' + DEFAULTS.MIN_CANDIDATES_BEFORE_WIDEN + ' · widening to ' + jobZoneIds.size + ' zone(s)');
     const zoneIds = [...jobZoneIds];
     const excludeEfrIds = eligible.map((e) => e.efr_id);
     let zoneEligible = await l1Eligibility(job, { applyDeepSkill: appliedDeepSkill, zoneIds, excludeEfrIds });
@@ -1149,6 +1154,7 @@ async function rankCandidatesForJob(jobId, {
   }
 
   if (scored.length === 0 && totalEligible === 0) {
+    logger.info('Returning 0 candidates · no eligible techs · jobId=' + jobId);
     return {
       job: enrichedJob, alreadyAssigned, note: note ?? 'no_eligible_techs',
       l1Count: 0, l2Count: 0, candidates: [], rejected: [],
@@ -1175,6 +1181,7 @@ async function rankCandidatesForJob(jobId, {
     candidatesList = await ensureAssignedFirst(candidatesList, assignedEfrId, job, scored);
   }
 
+  logger.info('Returning ' + candidatesList.length + ' candidates · eligible=' + totalEligible + ' scored=' + scored.length + ' rejected=' + rejected.length + (note ? ' note=' + note : ''));
   return {
     job: enrichedJob,
     alreadyAssigned,
@@ -1280,14 +1287,20 @@ function paidByIsCustomer(raw) {
  */
 function pickAutoAssignCandidate(rankResult, { paidBy, balanceFloor = DEFAULTS.ACCOUNT_BALANCE_FLOOR } = {}) {
   const list = rankResult?.candidates ?? [];
-  if (!list.length) return null;
+  logger.info('Pick auto-assign candidate · paymentMode=' + paidByLabel(paidBy) + ' candidates=' + list.length);
+  if (!list.length) {
+    logger.info('Auto-assign pick · none available');
+    return null;
+  }
 
   if (!paidByIsCustomer(paidBy)) {
+    logger.info('Auto-assign picked top rank · efr_id=' + list[0].efr_id);
     return { candidate: list[0], reason: 'top_rank', low_balance: false };
   }
 
   const eligible = list.find((c) => Number(c.current_balance ?? 0) >= balanceFloor);
   if (eligible) {
+    logger.info('Auto-assign picked (COD, balance >= ' + balanceFloor + ') · efr_id=' + eligible.efr_id);
     return {
       candidate: eligible,
       reason: eligible === list[0] ? 'top_rank' : 'top_rank_with_balance',
@@ -1295,6 +1308,7 @@ function pickAutoAssignCandidate(rankResult, { paidBy, balanceFloor = DEFAULTS.A
     };
   }
   // No one meets the cash floor — fall back to the top-ranked tech but flag.
+  logger.warn('Auto-assign pick · no candidate meets COD balance floor ' + balanceFloor + ' · returning top rank efr_id=' + list[0].efr_id + ' with low_balance flag');
   return { candidate: list[0], reason: 'top_rank_low_balance', low_balance: true };
 }
 
@@ -1313,8 +1327,10 @@ function pickAutoAssignCandidate(rankResult, { paidBy, balanceFloor = DEFAULTS.A
  * a too-broad term is observable in logs (the operator should refine).
  */
 async function searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit = 50 } = {}) {
+  logger.info('Search technicians for job · jobId=' + jobId + ' termLen=' + String(term ?? '').trim().length + ' limit=' + limit);
   const job = await jobService.getById(jobId);
   if (!job) {
+    logger.warn('Search technicians failed · job not found · jobId=' + jobId);
     const err = new Error('job not found'); err.status = 404; throw err;
   }
   const cap = Math.min(Math.max(Number(limit) || 50, 1), 50);
@@ -1324,7 +1340,10 @@ async function searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit =
   if (timeSlot !== undefined && timeSlot !== null && timeSlot !== '') job.time_slot = timeSlot;
 
   const q = String(term ?? '').trim();
-  if (!q) return { job: await searchJobHeader(job), candidates: [], capped: false };
+  if (!q) {
+    logger.info('Search technicians · empty term · returning 0 candidates');
+    return { job: await searchJobHeader(job), candidates: [], capped: false };
+  }
 
   // Match by name / mobile (efr_no) always; by efr_id only when the term is
   // a pure integer. capLookup = cap + 1 so we can detect "hit the cap".
@@ -1351,11 +1370,13 @@ async function searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit =
     logger.warn({ jobId, term: q, cap }, 'searchTechniciansForJob: result set hit the cap — term too broad');
   }
   const rows = techRows.slice(0, cap);
+  logger.info('Found ' + rows.length + ' matching technicians' + (capped ? ' (capped)' : ''));
   if (rows.length === 0) return { job: await searchJobHeader(job), candidates: [], capped };
 
   const stats = await statsForCandidates(rows.map((r) => r.efr_id), job, job.fk_client_id);
   const candidates = rows.map((r) => buildCandidateRow(r, stats.get(r.efr_id), job));
 
+  logger.info('Returning ' + candidates.length + ' technician candidates');
   return { job: await searchJobHeader(job), candidates, capped };
 }
 

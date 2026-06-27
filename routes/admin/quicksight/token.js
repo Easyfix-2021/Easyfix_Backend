@@ -70,16 +70,19 @@ function pruneExpired() {
 
 router.get('/token', async (req, res, next) => {
   try {
+    logger.info('Mint QuickSight session-bridge token');
     // Action-permission gate. Without this, any admin-group role could
     // mint a QuickSight token even if Manage Roles revoked their
     // ef-QuickSight access.
     const perms = await getEffectivePermissions(req.user.user_id);
     if (!perms.actionPermissions.includes('ef-QuickSight')) {
+      logger.warn('QuickSight token denied · missing ef-QuickSight permission');
       return modernError(res, 403, 'You do not have QuickSight access');
     }
 
     const secret = process.env.QUICKSIGHT_JWT_SECRET;
     if (!secret) {
+      logger.warn('QuickSight not configured · QUICKSIGHT_JWT_SECRET missing');
       // Surfaced as a 503 so the frontend can show a "QuickSight not
       // configured" toast instead of a generic crash.
       return modernError(res, 503, 'QuickSight is not configured (QUICKSIGHT_JWT_SECRET missing)');
@@ -87,6 +90,7 @@ router.get('/token', async (req, res, next) => {
 
     const userEmail = req.user.official_email;
     if (!userEmail) {
+      logger.warn('QuickSight token blocked · current user has no email');
       return modernError(res, 400, 'Current user has no email — QuickSight requires an email-keyed session_proof');
     }
 
@@ -143,8 +147,12 @@ router.get('/token', async (req, res, next) => {
       ? `${baseUrl.replace(/\/+$/, '')}/EF-QuickSight/openOrders/${token}`
       : null;
 
+    logger.info('QuickSight token returned · env=' + envName + ' · hasUrl=' + Boolean(fullUrl));
     return modernOk(res, { token, baseUrl, fullUrl, env: envName });
-  } catch (e) { next(e); }
+  } catch (e) {
+    logger.error('QuickSight token mint failed · ' + e.message);
+    next(e);
+  }
 });
 
 module.exports = router;

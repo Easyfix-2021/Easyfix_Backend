@@ -42,6 +42,7 @@ const {
   decorateColumns,
 } = require('../../../services/quicksight/_shared');
 const service = require('../../../services/quicksight/quicksight-client-performance.service');
+const logger = require('../../../logger');
 
 const ACTION_KEY = 'isQuickSightClientPerformanceView';
 
@@ -114,6 +115,7 @@ function buildKpis(rows) {
 router.get('/', validate(querySchema, 'query'), async (req, res, next) => {
   try {
     const { period, format } = req.query;
+    logger.info('Client Performance report · period=' + period + ' format=' + (format || 'json'));
     const filters = {
       clientId: req.query.clientId,
       zonalManagerId: req.query.zonalManagerId,
@@ -123,8 +125,10 @@ router.get('/', validate(querySchema, 'query'), async (req, res, next) => {
     };
 
     const rows = await service.getClientPerformance({ period, filters });
+    logger.info('Found ' + rows.length + ' clients');
 
     if (format === 'xlsx') {
+      logger.info('Streaming Client Performance xlsx · ' + rows.length + ' clients');
       const { columns, rows: flatRows } = service.toXlsx(rows, period);
       // Active period drives the title/meta (this report compares 3 periods;
       // the most-recent label is the headline one). Fall back to the period
@@ -144,11 +148,14 @@ router.get('/', validate(querySchema, 'query'), async (req, res, next) => {
       return;
     }
 
+    logger.info('Returning ' + rows.length + ' clients');
     return modernOk(res, rows);
   } catch (err) {
     if (err && err.status) {
+      logger.warn('Client Performance report failed · ' + err.message);
       return modernError(res, err.status, err.message || 'Request failed');
     }
+    logger.error('Client Performance report error · ' + err.message);
     return next(err);
   }
 });

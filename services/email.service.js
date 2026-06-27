@@ -98,6 +98,7 @@ function toRecipientArray(input) {
 
 async function send({ to, subject, text, html, cc, bcc, category, attachments }) {
   const originalTo = to;
+  logger.info('Send email · subject="' + subject + '"' + (category ? ' · category=' + category : '') + (Array.isArray(attachments) && attachments.length ? ' · attachments=' + attachments.length : ''));
   if (!to)             return { delivered: false, error: 'to is required' };
   if (!subject)        return { delivered: false, error: 'subject is required' };
   if (!text && !html)  return { delivered: false, error: 'text or html body required' };
@@ -197,6 +198,7 @@ async function send({ to, subject, text, html, cc, bcc, category, attachments })
     // Graph returns 202 Accepted with an empty body on success.
     if (res.status === 202) {
       const who = Array.isArray(to) ? to.join(',') : to;
+      logger.info('Email accepted by Graph (202) · subject="' + subject + '"' + (redirected ? ' · redirected (TEST_EMAILS)' : ''));
       logger.email(`sent to ${who} · "${subject}"${redirected ? ` · was "${originalTo}"` : ''}`);
       return {
         delivered: true,

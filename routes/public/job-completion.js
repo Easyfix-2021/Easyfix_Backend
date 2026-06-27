@@ -236,9 +236,11 @@ router.get(
   async (req, res, next) => {
     try {
       const jobId = await verify(req);
+      logger.info('Fetch magic-link prefill · jobId=' + jobId);
       const payload = await magicLinkService.fetchPrefill(jobId, pool);
       return modernOk(res, payload);
     } catch (e) {
+      logger.warn('Magic-link prefill failed · ' + e.message);
       return mapKnownError(res, next, e);
     }
   },
@@ -253,9 +255,12 @@ router.post(
   async (req, res, next) => {
     try {
       const jobId = await verify(req);
+      logger.info('Accept magic-link submission · jobId=' + jobId);
       const result = await magicLinkService.acceptSubmission(jobId, req.body, pool);
+      logger.info('Magic-link submission accepted · jobId=' + jobId);
       return modernOk(res, result);
     } catch (e) {
+      logger.warn('Magic-link submission failed · ' + e.message);
       return mapKnownError(res, next, e);
     }
   },
@@ -275,6 +280,7 @@ router.post(
   async (req, res, next) => {
     try {
       const jobId = await verify(req);
+      logger.info('Magic-link media upload · jobId=' + jobId + ' · mime=' + (req.file && req.file.mimetype));
 
       if (!req.file) {
         return modernError(res, 400, 'missing file upload');
@@ -331,6 +337,7 @@ router.post(
            VALUES (?, ?, 'booking', 0, NOW())`,
           [jobId, imageKey],
         );
+        logger.info('Job image uploaded · jobId=' + jobId + ' · image_id=' + ins.insertId + ' · seq=' + seq);
         return modernOk(res, { kind: 'image', image_id: ins.insertId, key: imageKey, seq });
       }
 
@@ -365,6 +372,7 @@ router.post(
          VALUES (?, ?, ?, 'customer_public_form')`,
         [jobId, videoKey, mime],
       );
+      logger.info('Job video uploaded · jobId=' + jobId + ' · media_id=' + vins.insertId + ' · seq=' + vseq);
       return modernOk(res, { kind: 'video', media_id: vins.insertId, key: videoKey, seq: vseq });
     } catch (e) {
       if (e?.code === 'LIMIT_FILE_SIZE') {
@@ -388,6 +396,7 @@ router.delete(
     try {
       const jobId = await verify(req);
       const mediaId = Number(req.params.mediaId);
+      logger.info('Delete magic-link video · jobId=' + jobId + ' · mediaId=' + mediaId);
       if (!Number.isInteger(mediaId) || mediaId <= 0) {
         return modernError(res, 400, 'invalid mediaId');
       }
@@ -408,6 +417,7 @@ router.delete(
         }
       }
       await pool.query('DELETE FROM tbl_job_media WHERE media_id = ?', [mediaId]);
+      logger.info('Job video deleted · media_id=' + row.media_id);
       return modernOk(res, { media_id: row.media_id, deleted: true });
     } catch (e) {
       return mapKnownError(res, next, e);
@@ -425,6 +435,7 @@ router.delete(
     try {
       const jobId = await verify(req);
       const imageId = Number(req.params.imageId);
+      logger.info('Delete magic-link image · jobId=' + jobId + ' · imageId=' + imageId);
 
       const [[row]] = await pool.query(
         'SELECT image_id, job_id, image FROM tbl_job_image WHERE image_id = ? LIMIT 1',
@@ -455,6 +466,7 @@ router.delete(
 
       await pool.query('DELETE FROM tbl_job_image WHERE image_id = ?', [imageId]);
 
+      logger.info('Job image deleted · image_id=' + row.image_id);
       return modernOk(res, { image_id: row.image_id, deleted: true });
     } catch (e) {
       return mapKnownError(res, next, e);
@@ -485,6 +497,7 @@ router.post(
   async (req, res, next) => {
     try {
       const jobId = await verify(req);
+      logger.info('Log customer cancel request · jobId=' + jobId + ' · reason=' + req.body.reason);
       const [ins] = await pool.query(
         `INSERT INTO tbl_job_customer_request
            (job_id, request_type, reason, remarks)
@@ -510,6 +523,7 @@ router.post(
   async (req, res, next) => {
     try {
       const jobId = await verify(req);
+      logger.info('Log customer reschedule request · jobId=' + jobId + ' · reason=' + req.body.reason);
       const preferred = toMysqlDatetime(req.body.preferred_datetime);
       const [ins] = await pool.query(
         `INSERT INTO tbl_job_customer_request
@@ -540,6 +554,7 @@ router.get(
   async (req, res, next) => {
     try {
       const jobId = await verify(req);
+      logger.info('Preview SPOC bridge call legs · jobId=' + jobId);
       const [[job]] = await pool.query(
         `SELECT c.customer_mob_no
            FROM tbl_job j
@@ -584,6 +599,7 @@ router.post(
   async (req, res, next) => {
     try {
       const jobId = await verify(req);
+      logger.info('Place SPOC bridge call · jobId=' + jobId);
 
       // Hard per-job daily ceiling on customer-initiated bridge calls — a
       // leaked token can't spam-dial beyond this even within the rate-limit
@@ -683,6 +699,7 @@ router.get(
   async (req, res, next) => {
     try {
       const jobId = await verify(req);
+      logger.info('Preview Support bridge call legs · jobId=' + jobId);
       const supportPhone = (process.env.SUPPORT_PHONE || '').trim();
       if (!supportPhone) return modernOk(res, { from: null, to: null, suppressed: false, support_phone: null });
 
@@ -724,6 +741,7 @@ router.post(
   async (req, res, next) => {
     try {
       const jobId = await verify(req);
+      logger.info('Place Support bridge call · jobId=' + jobId);
 
       const supportPhone = (process.env.SUPPORT_PHONE || '').trim();
       if (!supportPhone) {

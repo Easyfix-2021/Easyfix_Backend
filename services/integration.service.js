@@ -3,6 +3,8 @@
  * Job status codes → human-readable strings EXACTLY as the Dropwizard service returned.
  */
 
+const logger = require('../logger');
+
 const STATUS_LABELS = {
   0: 'Unconfirmed', 1: 'Scheduled', 2: 'In-Progress',
   3: 'Completed', 5: 'Completed', 6: 'Cancelled',
@@ -47,7 +49,11 @@ function formatLegacyDate(d) {
  * Returns boolean availability. Caller wraps in legacy `{isAvailabil: "Yes"|"No"}`.
  */
 async function checkFirefoxAvailability(pool, { pincode, requestedDate, timeSlot }) {
-  if (!pincode) return false;
+  logger.info('Check firefox availability · pincode=' + pincode + ' · timeSlot=' + (timeSlot || ''));
+  if (!pincode) {
+    logger.warn('Firefox availability · no pincode supplied');
+    return false;
+  }
 
   // Look up the firefox-city mapping for this pincode.
   const [[fcm]] = await pool.query(
@@ -58,13 +64,19 @@ async function checkFirefoxAvailability(pool, { pincode, requestedDate, timeSlot
       LIMIT 1`,
     [String(pincode)]
   );
-  if (!fcm || fcm.city_id == null || fcm.no_of_slot == null) return false;
+  if (!fcm || fcm.city_id == null || fcm.no_of_slot == null) {
+    logger.info('Firefox availability · no city mapping for pincode');
+    return false;
+  }
 
   // requestedDate from legacy contract is "DD-MM-YYYY" or full datetime.
   // The legacy SQL uses DATEDIFF(requested_date_time, :requestedDate) so we
   // need a date string; coerce input to a Date then format YYYY-MM-DD for MySQL.
   const dt = parseLegacyDate(requestedDate);
-  if (!dt) return false;
+  if (!dt) {
+    logger.warn('Firefox availability · unparseable requestedDate');
+    return false;
+  }
   const pad = (n) => String(n).padStart(2, '0');
   const dateOnly = `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}`;
 
@@ -79,6 +91,7 @@ async function checkFirefoxAvailability(pool, { pincode, requestedDate, timeSlot
     [dateOnly, String(timeSlot || ''), fcm.city_id]
   );
 
+  logger.info('Firefox availability=' + (Number(cnt) < Number(fcm.no_of_slot) ? 'Yes' : 'No') + ' · booked=' + cnt + ' · slots=' + fcm.no_of_slot + ' · date=' + dateOnly);
   return Number(cnt) < Number(fcm.no_of_slot);
 }
 
@@ -92,8 +105,15 @@ async function checkFirefoxAvailability(pool, { pincode, requestedDate, timeSlot
  * `clientName` is supplied by the basic-auth client lookup (tbl_client_website).
  */
 async function checkDecathlonServiceability(pool, { pincode, clientName }) {
-  if (!pincode) return null; // legacy returned null isAvailabil on missing pincode
-  if (clientName !== 'Decathlon Sports India Private Limited') return null;
+  logger.info('Check Decathlon serviceability · pincode=' + pincode);
+  if (!pincode) {
+    logger.info('Decathlon serviceability · no pincode supplied');
+    return null; // legacy returned null isAvailabil on missing pincode
+  }
+  if (clientName !== 'Decathlon Sports India Private Limited') {
+    logger.info('Decathlon serviceability · non-Decathlon client, skipping');
+    return null;
+  }
   // Live-DB-verified 2026-05-12: `pincode_decathlon` table does NOT exist
   // in the production `easyfix` schema. The legacy EasyFix_API code
   // referenced it but the table was never created. Catch the ER_NO_SUCH_TABLE
@@ -104,9 +124,13 @@ async function checkDecathlonServiceability(pool, { pincode, clientName }) {
       'SELECT id FROM pincode_decathlon WHERE pincode = ? LIMIT 1',
       [String(pincode)]
     );
+    logger.info('Decathlon serviceability=' + (row ? 'Yes' : 'No'));
     return !!row;
   } catch (err) {
-    if (err.code === 'ER_NO_SUCH_TABLE') return null;
+    if (err.code === 'ER_NO_SUCH_TABLE') {
+      logger.warn('Decathlon serviceability · pincode_decathlon table missing, returning null');
+      return null;
+    }
     throw err;
   }
 }

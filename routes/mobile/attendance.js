@@ -4,6 +4,7 @@ const Joi = require('joi');
 const validate = require('../../middleware/validate');
 const { modernOk, modernError } = require('../../utils/response');
 const attendanceService = require('../../services/mobile-attendance.service');
+const logger = require('../../logger');
 
 /*
  * Technician attendance + leave sub-router.
@@ -41,12 +42,18 @@ router.get(
   }), 'query'),
   async (req, res, next) => {
     try {
-      modernOk(res, await attendanceService.getAttendance(req.tech.efr_id, {
+      logger.info('Fetch attendance · from=' + req.query.from + ' to=' + req.query.to);
+      const result = await attendanceService.getAttendance(req.tech.efr_id, {
         from: req.query.from,
         to: req.query.to,
-      }));
+      });
+      logger.info('Returning ' + (result.days ? result.days.length : 0) + ' attendance days');
+      modernOk(res, result);
     } catch (e) {
-      if (e.status) return modernError(res, e.status, e.message);
+      if (e.status) {
+        logger.warn('Fetch attendance rejected · ' + e.message);
+        return modernError(res, e.status, e.message);
+      }
       next(e);
     }
   },
@@ -65,13 +72,19 @@ router.post(
   }).or('morningSlot', 'eveningSlot')),
   async (req, res, next) => {
     try {
-      modernOk(res, await attendanceService.markDay(req.tech.efr_id, {
+      logger.info('Mark attendance · date=' + req.body.date + ' morning=' + req.body.morningSlot + ' evening=' + req.body.eveningSlot);
+      const result = await attendanceService.markDay(req.tech.efr_id, {
         date: req.body.date,
         morningSlot: req.body.morningSlot,
         eveningSlot: req.body.eveningSlot,
-      }));
+      });
+      logger.info('Attendance marked · date=' + req.body.date);
+      modernOk(res, result);
     } catch (e) {
-      if (e.status) return modernError(res, e.status, e.message);
+      if (e.status) {
+        logger.warn('Mark attendance rejected · ' + e.message);
+        return modernError(res, e.status, e.message);
+      }
       next(e);
     }
   },
@@ -87,12 +100,18 @@ router.post(
   })),
   async (req, res, next) => {
     try {
-      modernOk(res, await attendanceService.markLeave(req.tech.efr_id, {
+      logger.info('Mark leave · startDate=' + req.body.startDate + ' endDate=' + req.body.endDate);
+      const result = await attendanceService.markLeave(req.tech.efr_id, {
         startDate: req.body.startDate,
         endDate: req.body.endDate,
-      }));
+      });
+      logger.info('Leave marked · ' + req.body.startDate + ' → ' + req.body.endDate);
+      modernOk(res, result);
     } catch (e) {
-      if (e.status) return modernError(res, e.status, e.message);
+      if (e.status) {
+        logger.warn('Mark leave rejected · ' + e.message);
+        return modernError(res, e.status, e.message);
+      }
       next(e);
     }
   },
@@ -108,12 +127,18 @@ router.post(
   })),
   async (req, res, next) => {
     try {
-      modernOk(res, await attendanceService.unmarkLeave(req.tech.efr_id, {
+      logger.info('Unmark leave · startDate=' + req.body.startDate + ' endDate=' + req.body.endDate);
+      const result = await attendanceService.unmarkLeave(req.tech.efr_id, {
         startDate: req.body.startDate,
         endDate: req.body.endDate,
-      }));
+      });
+      logger.info('Leave unmarked · ' + req.body.startDate + ' → ' + req.body.endDate);
+      modernOk(res, result);
     } catch (e) {
-      if (e.status) return modernError(res, e.status, e.message);
+      if (e.status) {
+        logger.warn('Unmark leave rejected · ' + e.message);
+        return modernError(res, e.status, e.message);
+      }
       next(e);
     }
   },

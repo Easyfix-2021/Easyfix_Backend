@@ -1,6 +1,7 @@
 const { getProperty } = require('./properties.service');
 const kaleyra = require('./kaleyra.service');
 const plivo = require('./plivo.service');
+const logger = require('../logger');
 
 /*
  * Voice-provider factory (2026-06-17). Single branch point so routes never
@@ -65,7 +66,9 @@ function supportsLiveStatus(name) {
 
 async function clickToCall({ provider, ...rest } = {}) {
   const name = resolveProvider(provider);
+  logger.info('Placing click-to-call · requested=' + (provider || 'default') + ' · resolved=' + name);
   const result = await PROVIDERS[name].clickToCall(rest);
+  logger.info('Click-to-call placed · provider=' + name + ' · liveStatus=' + supportsLiveStatus(name));
   // Stamp the resolved provider so the route records it on the audit row and
   // the FE knows whether to open the live panel (Plivo) or just toast (Kaleyra).
   return { ...result, provider: name, supportsLiveStatus: supportsLiveStatus(name) };
@@ -78,8 +81,10 @@ function previewCallLegs({ provider, ...rest } = {}) {
 
 async function hangup({ provider, callUuid }) {
   const name = (provider && String(provider).toLowerCase()) || defaultProvider();
+  logger.info('Hanging up call · provider=' + name);
   const svc = PROVIDERS[name];
   if (!svc || typeof svc.hangupCall !== 'function') {
+    logger.warn('Hangup unsupported · provider=' + name);
     return { ok: false, unsupported: true, error: `${name} does not support hangup` };
   }
   return svc.hangupCall({ callUuid });

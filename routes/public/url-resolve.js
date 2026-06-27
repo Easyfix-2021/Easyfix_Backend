@@ -34,6 +34,7 @@ const router = require('express').Router();
 const { pool } = require('../../db');
 const urlShortener = require('../../services/url-shortener.service');
 const { modernOk } = require('../../utils/response');
+const logger = require('../../logger');
 
 // Same strict allowlist the redirect route uses — short-circuits any
 // funky path content to a clean "not found" rather than a DB lookup.
@@ -42,12 +43,15 @@ const CODE_REGEX = /^[A-Za-z0-9]{4,16}$/;
 router.get('/:code', async (req, res, next) => {
   try {
     const code = String(req.params.code || '');
+    logger.info('Resolve short code (JSON) · code=' + code);
     if (!CODE_REGEX.test(code)) {
+      logger.info('Short code failed regex · code=' + code);
       return modernOk(res, { found: false, expired: false, longUrl: null });
     }
 
     const resolved = await urlShortener.resolveCode(code, pool);
     if (!resolved) {
+      logger.info('Short code not found · code=' + code);
       return modernOk(res, { found: false, expired: false, longUrl: null });
     }
 
@@ -57,6 +61,7 @@ router.get('/:code', async (req, res, next) => {
       urlShortener.recordClick(code, pool);
     }
 
+    logger.info('Returning resolved short code · code=' + code + ' expired=' + resolved.expired);
     return modernOk(res, {
       found: true,
       expired: resolved.expired,

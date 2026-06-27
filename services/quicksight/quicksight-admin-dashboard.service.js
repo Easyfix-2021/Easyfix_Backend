@@ -152,6 +152,11 @@ function inPlaceholders(list) {
  * 1) openOrders — three bucket tiles (Open Orders / Call Later / Escalation)
  * ════════════════════════════════════════════════════════════════════════ */
 async function openOrders(filters = {}, actingUserId = null) {
+  logger.info(
+    'Admin dashboard open-orders tiles · verticalId=' + (filters.verticalId || 0) +
+    ' zonalManagerId=' + (filters.zonalManagerId || 0) +
+    ' dateType=' + (filters.findByDateType || 'original')
+  );
   const { verticalId, zonalManagerId, applyClientFilter, clientIds } =
     await resolveAggregateFilters(filters, actingUserId);
   const dateMode = resolveDateMode(filters.findByDateType);
@@ -268,6 +273,12 @@ async function openOrders(filters = {}, actingUserId = null) {
 
   const sum = (buckets) => buckets.reduce((a, b) => a + (b.count || 0), 0);
 
+  logger.info(
+    'Returning open-orders tiles · open=' + openBuckets.length +
+    ' callLater=' + callLaterBuckets.length +
+    ' escalation=' + escalationBuckets.length + ' buckets'
+  );
+
   return {
     dashboardDate: new Date().toISOString(),
     tiles: [
@@ -318,6 +329,13 @@ async function resolveRmTeamUserIds(reportingManagerId) {
 }
 
 async function employeeProductivity(filters = {}, page = 1, size = 10) {
+  logger.info(
+    'Admin dashboard employee-productivity · page=' + page + ' size=' + size +
+    ' verticalId=' + (filters.verticalId || 0) +
+    ' zonalManagerId=' + (filters.zonalManagerId || 0) +
+    ' reportingManagerId=' + (filters.reportingManagerId || 0) +
+    ' userId=' + (filters.userId || 0)
+  );
   const verticalId = Number(filters.verticalId) > 0 ? Number(filters.verticalId) : null;
   const zonalManagerId =
     Number(filters.zonalManagerId) > 0 ? Number(filters.zonalManagerId) : null;
@@ -349,6 +367,7 @@ async function employeeProductivity(filters = {}, page = 1, size = 10) {
   ];
   const [[countRow]] = await pool.query(countSql, countParams);
   const totalRecords = Number(countRow && countRow.total) || 0;
+  logger.info('Found ' + totalRecords + ' productivity users (total)');
 
   if (totalRecords === 0) {
     return {
@@ -480,6 +499,8 @@ async function employeeProductivity(filters = {}, page = 1, size = 10) {
     };
   });
 
+  logger.info('Returning ' + data.length + ' productivity rows (page ' + pageNo + ')');
+
   return {
     totalRecords,
     pageNumber: pageNo,
@@ -493,6 +514,11 @@ async function employeeProductivity(filters = {}, page = 1, size = 10) {
  * 3) kraMetrics — single aggregate KPI row.
  * ════════════════════════════════════════════════════════════════════════ */
 async function kraMetrics(filters = {}, actingUserId = null) {
+  logger.info(
+    'Admin dashboard KRA metrics · verticalId=' + (filters.verticalId || 0) +
+    ' zonalManagerId=' + (filters.zonalManagerId || 0) +
+    ' from=' + (filters.startDate || '-') + ' to=' + (filters.endDate || '-')
+  );
   const { verticalId, zonalManagerId, applyClientFilter, clientIds } =
     await resolveAggregateFilters(filters, actingUserId);
   const clientList = applyClientFilter === 1 ? clientIds : [-1];
@@ -558,6 +584,8 @@ async function kraMetrics(filters = {}, actingUserId = null) {
   const unconfirmed = Number(row && row.unconfirmed) || 0;
   const callLater = Number(row && row.call_later) || 0;
 
+  logger.info('Returning KRA metrics · totalJobs=' + totalJobs + ' revenue=' + revenue);
+
   return {
     sdaPercentage: percentage(sdaCount, totalJobs),
     otaPercentage: percentage(otaCount, totalJobs),
@@ -580,6 +608,11 @@ async function kraMetrics(filters = {}, actingUserId = null) {
  * 4) cancellationDetails — time buckets + before/after allocation summary.
  * ════════════════════════════════════════════════════════════════════════ */
 async function cancellationDetails(filters = {}, actingUserId = null) {
+  logger.info(
+    'Admin dashboard cancellation details · verticalId=' + (filters.verticalId || 0) +
+    ' zonalManagerId=' + (filters.zonalManagerId || 0) +
+    ' from=' + (filters.startDate || '-') + ' to=' + (filters.endDate || '-')
+  );
   const { verticalId, zonalManagerId, applyClientFilter, clientIds } =
     await resolveAggregateFilters(filters, actingUserId);
   const clientList = applyClientFilter === 1 ? clientIds : [-1];
@@ -651,6 +684,11 @@ async function cancellationDetails(filters = {}, actingUserId = null) {
     totalJobs: byLabel.get(label) || 0,
   }));
 
+  logger.info(
+    'Returning cancellation details · totalCancelled=' +
+    (Number(summaryRow && summaryRow.total_cancelled) || 0)
+  );
+
   return {
     summary: {
       totalOrderCancelled: Number(summaryRow && summaryRow.total_cancelled) || 0,
@@ -665,6 +703,7 @@ async function cancellationDetails(filters = {}, actingUserId = null) {
  * 5) managerTeam — org-chart tree rooted at user_id=3 ('CEO').
  * ════════════════════════════════════════════════════════════════════════ */
 async function managerTeam() {
+  logger.info('Admin dashboard manager-team org chart · root=' + ORG_ROOT_USER_ID);
   // QUERY A — all users hierarchy (getAllUsersHierarchy, ManagerTeamRepository:30-47).
   const hierarchySql = `
     SELECT
@@ -685,6 +724,7 @@ async function managerTeam() {
     ORDER BY TU.reporting_manager
     LIMIT ${HIERARCHY_LIMIT}`;
   const [rows] = await pool.query(hierarchySql);
+  logger.info('Found ' + rows.length + ' hierarchy rows for org chart');
 
   if (rows.length >= HIERARCHY_LIMIT) {
     logger.warn(
@@ -698,6 +738,7 @@ async function managerTeam() {
     [ORG_ROOT_USER_ID]
   );
 
+  if (rows.length === 0) logger.info('No organization data found for org chart');
   if (rows.length === 0) return null; // 204 'No organization data found'
 
   // Build manager → [children] adjacency. Self-loop guard (managerId==userId).
@@ -738,6 +779,7 @@ async function managerTeam() {
  * 6) verticalManagers — reporting managers for a vertical (dropdown lookup).
  * ════════════════════════════════════════════════════════════════════════ */
 async function verticalManagers(verticalId) {
+  logger.info('Admin dashboard vertical managers lookup · verticalId=' + (verticalId || 0));
   const vId = Number(verticalId) || 0;
   // getReportingManagersByVertical (repo:411-424).
   const sql = `
@@ -751,6 +793,7 @@ async function verticalManagers(verticalId) {
       AND ( ? = 0 OR TU1.manage_verticals = '0' OR FIND_IN_SET(?, TU1.manage_verticals) > 0 )
     order by TU1.user_name asc`;
   const [rows] = await pool.query(sql, [vId, vId]);
+  logger.info('Found ' + rows.length + ' vertical managers');
   // Only obj[0],obj[1] mapped (userId, userName).
   return rows
     .filter((r) => r.reporting_manager != null)
@@ -761,6 +804,10 @@ async function verticalManagers(verticalId) {
  * 7) rmTeamUsers — users under an RM in a vertical (dropdown lookup).
  * ════════════════════════════════════════════════════════════════════════ */
 async function rmTeamUsers(verticalId, reportingManagerId) {
+  logger.info(
+    'Admin dashboard RM team users lookup · verticalId=' + (verticalId || 0) +
+    ' reportingManagerId=' + (reportingManagerId || 0)
+  );
   const vId = Number(verticalId) || 0;
   const rmId = Number(reportingManagerId) || 0;
   // getRmTeamUserList (repo:426-450).
@@ -775,6 +822,7 @@ async function rmTeamUsers(verticalId, reportingManagerId) {
       AND ( ? = 0 OR TU.reporting_manager = ? )
     ORDER BY TU.user_name ASC`;
   const [rows] = await pool.query(sql, [vId, vId, rmId, rmId]);
+  logger.info('Found ' + rows.length + ' RM team users');
   // obj[0],[1],[2],[4] mapped (userId, userName, manageVerticals, rmName);
   // obj[3] reporting_manager skipped.
   return rows.map((r) => ({

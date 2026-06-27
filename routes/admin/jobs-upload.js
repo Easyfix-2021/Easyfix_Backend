@@ -11,16 +11,19 @@
  * The matching client SPOC counterpart is routes/client/jobs-upload.js.
  */
 const { createJobsUploadRouter } = require('../../utils/jobs-upload-router');
+const logger = require('../../logger');
 
 module.exports = createJobsUploadRouter({
   resolveClientId(req) {
     const id = Number(req.body.clientId);
     if (!Number.isInteger(id) || id <= 0) {
+      logger.warn('Bulk job upload rejected · invalid clientId=' + req.body.clientId);
       throw Object.assign(
         new Error('clientId is required — pick a client on the upload form'),
         { status: 400 }
       );
     }
+    logger.info('Resolved bulk job upload client · clientId=' + id);
     return id;
   },
   resolveActor(req) {

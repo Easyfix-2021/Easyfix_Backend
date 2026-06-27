@@ -5,6 +5,7 @@ const validate = require('../../middleware/validate');
 const { roleByName } = require('../../middleware/role');
 const svc = require('../../services/service-category.service');
 const { modernOk, modernError } = require('../../utils/response');
+const logger = require('../../logger');
 /*
  * Deep-skill catalog cache invalidation (2026-06-11). The public
  * profile-update form bundles the full Category → Type → Skill →
@@ -43,32 +44,46 @@ const updateBody = Joi.object({
 }).min(1);
 
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
-  try { modernOk(res, await svc.listCategories(req.query)); } catch (e) { next(e); }
+  try {
+    logger.info('List service categories · q=' + (req.query.q || '') + ' includeInactive=' + req.query.includeInactive + ' limit=' + req.query.limit + ' offset=' + req.query.offset);
+    modernOk(res, await svc.listCategories(req.query));
+  } catch (e) { logger.error('List service categories failed · ' + e.message); next(e); }
 });
 
 router.get('/:id', validate(idParam, 'params'), async (req, res, next) => {
   try {
+    logger.info('Get service category · id=' + req.params.id);
     const row = await svc.getCategoryById(Number(req.params.id));
-    if (!row) return modernError(res, 404, 'Service Category not found');
+    if (!row) {
+      logger.warn('Service category not found · id=' + req.params.id);
+      return modernError(res, 404, 'Service Category not found');
+    }
     modernOk(res, row);
-  } catch (e) { next(e); }
+  } catch (e) { logger.error('Get service category failed · id=' + req.params.id + ' · ' + e.message); next(e); }
 });
 
 router.post('/', roleByName(['Admin']), validate(createBody), async (req, res, next) => {
   try {
+    logger.info('Create service category · name=' + req.body.service_catg_name);
     const created = await svc.createCategory(req.body);
     invalidateCatalogCaches();
+    logger.info('Service category created · id=' + (created && created.service_catg_id));
     res.status(201); modernOk(res, created, 'Service Category added');
-  } catch (e) { if (e.status) return modernError(res, e.status, e.message); next(e); }
+  } catch (e) { if (e.status) { logger.warn('Create service category rejected · status=' + e.status + ' · ' + e.message); return modernError(res, e.status, e.message); } logger.error('Create service category failed · ' + e.message); next(e); }
 });
 
 router.patch('/:id', roleByName(['Admin']), validate(idParam, 'params'), validate(updateBody), async (req, res, next) => {
   try {
+    logger.info('Update service category · id=' + req.params.id + ' fields=' + Object.keys(req.body).join(','));
     const updated = await svc.updateCategory(Number(req.params.id), req.body);
-    if (!updated) return modernError(res, 404, 'Service Category not found');
+    if (!updated) {
+      logger.warn('Service category not found for update · id=' + req.params.id);
+      return modernError(res, 404, 'Service Category not found');
+    }
     invalidateCatalogCaches();
+    logger.info('Service category updated · id=' + req.params.id);
     modernOk(res, updated, 'Service Category updated');
-  } catch (e) { if (e.status) return modernError(res, e.status, e.message); next(e); }
+  } catch (e) { if (e.status) { logger.warn('Update service category rejected · id=' + req.params.id + ' · status=' + e.status + ' · ' + e.message); return modernError(res, e.status, e.message); } logger.error('Update service category failed · id=' + req.params.id + ' · ' + e.message); next(e); }
 });
 
 // DELETE = legacy "trash" (status=3). Matches the legacy /addDeleteServiceCatg
@@ -76,11 +91,16 @@ router.patch('/:id', roleByName(['Admin']), validate(idParam, 'params'), validat
 // is handled via PATCH { is_active }, not here.
 router.delete('/:id', roleByName(['Admin']), validate(idParam, 'params'), async (req, res, next) => {
   try {
+    logger.info('Delete service category · id=' + req.params.id);
     const ok = await svc.deleteCategory(Number(req.params.id));
-    if (!ok) return modernError(res, 404, 'Service Category not found');
+    if (!ok) {
+      logger.warn('Service category not found for delete · id=' + req.params.id);
+      return modernError(res, 404, 'Service Category not found');
+    }
     invalidateCatalogCaches();
+    logger.info('Service category deleted · id=' + req.params.id);
     modernOk(res, { deleted: true });
-  } catch (e) { if (e.status) return modernError(res, e.status, e.message); next(e); }
+  } catch (e) { if (e.status) { logger.warn('Delete service category rejected · id=' + req.params.id + ' · status=' + e.status + ' · ' + e.message); return modernError(res, e.status, e.message); } logger.error('Delete service category failed · id=' + req.params.id + ' · ' + e.message); next(e); }
 });
 
 module.exports = router;
