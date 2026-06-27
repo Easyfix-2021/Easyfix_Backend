@@ -27,6 +27,9 @@
  * stdout) we skip colour but keep structure. Timestamps are local HH:MM:SS.
  */
 
+const { current } = require('./utils/request-context');
+const { contextLine, methodTag } = require('./utils/log-format');
+
 const isTTY = process.stdout.isTTY;
 
 const ANSI = {
@@ -36,6 +39,12 @@ const ANSI = {
 };
 const paint = (color, s) => (isTTY ? `${ANSI[color]}${s}${ANSI.reset}` : String(s));
 const now = () => new Date().toLocaleTimeString('en-GB', { hour12: false });
+
+// Core-level icons → log LEVEL label. A line emitted INSIDE a request renders in
+// the contextual `[time] [surface] identity → [LEVEL] msg` shape; the semantic
+// emoji helpers (📱 📧 🔑 …) aren't core levels, so their icon is kept inline so
+// the event type still reads at a glance.
+const CORE_LEVEL = { 'ℹ': 'INFO', '⚠': 'WARN', '✗': 'ERROR', '·': 'DEBUG' };
 
 function splitArgs(arg1, arg2) {
   if (typeof arg1 === 'string') return { obj: arg2 && typeof arg2 === 'object' ? arg2 : null, msg: arg1 };
@@ -60,9 +69,30 @@ function renderExtras(obj) {
   return pairs.length ? `  ${paint('dim', pairs.join(' '))}` : '';
 }
 
+// The FIRST app-log of a request prints a header line (the request's
+// method + path) so the endpoint heads its group of logs; the access line at
+// finish then collapses to a compact `↳ <status> (<ms>)` (see http-log.js).
+// Requests with NO app logs never call this → they get a single full access line.
+function maybeHeader(req) {
+  if (req._logHeaderEmitted) return;
+  req._logHeaderEmitted = true;
+  console.log(contextLine(req, 'INFO', `${methodTag(req.method)} ${req.originalUrl}`));
+}
+
 function line(icon, color, arg1, arg2) {
   const { obj, msg } = splitArgs(arg1, arg2);
-  console.log(`${paint('gray', now())}  ${paint(color, icon)}  ${msg}${renderExtras(obj)}`);
+  const body = `${msg}${renderExtras(obj)}`;
+  const req = current();
+  if (req) {
+    // Inside a request → contextual line. Core levels map to a [LEVEL] tag;
+    // semantic-emoji events keep their icon inline so the type still shows.
+    maybeHeader(req);
+    const level = CORE_LEVEL[icon] || 'INFO';
+    const message = CORE_LEVEL[icon] ? body : `${icon} ${body}`;
+    console.log(contextLine(req, level, message));
+  } else {
+    console.log(`${paint('gray', now())}  ${paint(color, icon)}  ${body}`);
+  }
 }
 
 const logger = {
@@ -90,6 +120,11 @@ const logger = {
 
   // Escape hatch for one-off icons
   event:    (icon, color, a, b) => line(icon, color, a, b),
+
+  // Pre-formatted passthrough — the caller owns the ENTIRE line layout. Used by
+  // middleware/http-log.js, whose `[Surface] [Identity] [Time] …` prefix doesn't
+  // fit the standard `<time> <icon> <msg>` shape; emitted verbatim.
+  http:     (s) => console.log(String(s)),
 };
 
 module.exports = logger;

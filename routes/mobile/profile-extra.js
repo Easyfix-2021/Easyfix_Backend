@@ -5,6 +5,7 @@ const multer = require('multer');
 const validate = require('../../middleware/validate');
 const { modernOk, modernError } = require('../../utils/response');
 const svc = require('../../services/mobile-profile-extra.service');
+const logger = require('../../logger');
 
 // Profile-image multipart upload — memory storage, single image ≤10MB.
 // Images-only allowlist mirrors routes/mobile/uploads.js + admin job images.
@@ -112,10 +113,14 @@ router.post('/profile/image', profileImageUpload.single('file'), async (req, res
 
 router.get('/earnings', validate(dateWindow, 'query'), async (req, res, next) => {
   try {
-    modernOk(res, await svc.getEarnings(req.tech.efr_id, {
-      from: req.query.from,
-      to: req.query.to,
-    }));
+    const { from, to } = req.query;
+    const window = `${from || 'all'} → ${to || 'all'}`;
+    // Surface + identity are auto-stamped by the contextual logger (ALS), so the
+    // message only needs the request-specific bits (the date window / counts).
+    logger.info(`Earnings requested · ${window}`);
+    const data = await svc.getEarnings(req.tech.efr_id, { from, to });
+    logger.info(`Returning ${data.items.length} earning record(s) · ${window}`);
+    modernOk(res, data);
   } catch (e) { next(e); }
 });
 

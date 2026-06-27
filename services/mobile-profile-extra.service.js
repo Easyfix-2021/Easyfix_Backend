@@ -324,6 +324,10 @@ async function getEarnings(efrId, { from, to } = {}) {
     logger.warn({ err: e.message, efrId }, 'getEarnings items query failed');
   }
 
+  // Logged from the service (no `req` here) — the contextual logger still stamps
+  // the request's surface + identity via AsyncLocalStorage.
+  logger.info(`Found ${items.length} earning transaction(s) (${creditCount} credit)`);
+
   const averageEarning = creditCount ? Number((totalEarnings / creditCount).toFixed(2)) : 0;
   return {
     totalEarnings: Number(totalEarnings.toFixed(2)),
