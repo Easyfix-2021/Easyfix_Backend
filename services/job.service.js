@@ -3006,6 +3006,45 @@ async function acceptOffer(jobId, efrId) {
   throw Object.assign(new Error('This job was already accepted by another technician'), { status: 409 });
 }
 
+/*
+ * True when this technician has a LIVE (open, status=0) offer on the job. Under
+ * the offer-pool model a job stays fk_easyfixter_id=NULL until accepted, so the
+ * "is this my job" fk check would 404 a job that's merely OFFERED to the tech —
+ * this lets the mobile detail GET + reject allow an offered (not-yet-accepted)
+ * tech through. Returns false when tbl_job_offer is absent (legacy deploy), so
+ * callers fall back to the fk-ownership check.
+ */
+async function techHasOpenOffer(jobId, efrId) {
+  try {
+    if (!(await jobOfferTableExists())) return false;
+    const [[row]] = await pool.query(
+      'SELECT 1 AS ok FROM tbl_job_offer WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = 0 LIMIT 1',
+      [jobId, efrId],
+    );
+    return !!row;
+  } catch { return false; }
+}
+
+/*
+ * Reject just THIS tech's offer on a pool-offered job: stamps their open offer
+ * REJECTED (status=2) + reason WITHOUT touching tbl_job — the job stays BOOKED
+ * and offered to the other technicians (candidate-ranking already excludes any
+ * tech with an offer row, so they won't be re-offered). On a legacy deploy (no
+ * offer table) it falls back to the shared unassign() single-assign reject.
+ */
+async function rejectOffer(jobId, efrId, { reason, reasonId } = {}) {
+  if (!(await jobOfferTableExists())) {
+    return unassign(jobId, { reason, reasonId }, { user_id: efrId });
+  }
+  await pool.query(
+    `UPDATE tbl_job_offer
+        SET offer_status = 2, reject_reason = ?, reject_reason_id = ?, responded_at = NOW()
+      WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = 0`,
+    [reason || null, reasonId != null ? reasonId : null, jobId, efrId],
+  );
+  return getById(jobId);
+}
+
 // ─── List the techs currently offered a job (CRM "Offered to N") ────
 /*
  * Returns every technician with a LIVE (open, status=0) offer on the given
@@ -3224,7 +3263,7 @@ module.exports = {
   list, getById, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, unassign, acceptOffer, changeOwner,
   // THE OFFER MODEL (pool offers): offer one job to many techs, list a job's
   // open offers, and list a tech's open offers.
-  offerToTechnicians, listOffers, listOfferedForTech,
+  offerToTechnicians, listOffers, listOfferedForTech, techHasOpenOffer, rejectOffer,
   tryAutoAssignOnCreate,
   fireWebhook, statusToEventName,
   hasClientVerticalIdColumn,

@@ -325,7 +325,14 @@ router.get('/jobs/offered', async (req, res, next) => {
 router.get('/jobs/:id', async (req, res, next) => {
   try {
     const job = await jobService.getById(Number(req.params.id));
-    if (!job || job.fk_easyfixter_id !== req.tech.efr_id) return modernError(res, 404, 'job not found');
+    if (!job) return modernError(res, 404, 'job not found');
+    // Owner (accepted the job) OR a tech who currently has an OPEN offer on it
+    // may view it — under the offer-pool model an offered job stays
+    // fk_easyfixter_id=NULL until accepted, so the offered tech must be allowed
+    // to open it to review + Accept/Reject.
+    const canView = job.fk_easyfixter_id === req.tech.efr_id
+      || (await jobService.techHasOpenOffer(job.job_id, req.tech.efr_id));
+    if (!canView) return modernError(res, 404, 'job not found');
     modernOk(res, job);
   } catch (e) { next(e); }
 });
@@ -372,11 +379,18 @@ router.post('/jobs/:id/reject', validate(Joi.object({
 })), async (req, res, next) => {
   try {
     const job = await jobService.getById(Number(req.params.id));
-    if (!job || job.fk_easyfixter_id !== req.tech.efr_id) return modernError(res, 404, 'job not found');
-    await jobService.unassign(
+    if (!job) return modernError(res, 404, 'job not found');
+    // Allow the rejecting tech through if they own the job OR have an open offer
+    // on it (offered jobs are fk-NULL until accepted).
+    const canReject = job.fk_easyfixter_id === req.tech.efr_id
+      || (await jobService.techHasOpenOffer(job.job_id, req.tech.efr_id));
+    if (!canReject) return modernError(res, 404, 'job not found');
+    // Pool reject: mark ONLY this tech's offer REJECTED (the job stays offered
+    // to the others). Legacy (no offer table) falls back to unassign() inside.
+    await jobService.rejectOffer(
       job.job_id,
+      req.tech.efr_id,
       { reason: req.body.reason, reasonId: req.body.reasonId },
-      { user_id: req.tech.efr_id },
     );
     modernOk(res, { rejected: true });
   } catch (e) {
@@ -1123,13 +1137,50 @@ router.post('/device', validate(Joi.object({
 });
 
 // VERIFIED 2026-05-12 against ACD_APIs TrainingVideo.java:
-//   training_videos columns: id, title, description, sub_title, sub_description
+//   training_videos columns: id, title, description, sub_title, sub_description,
+//   training_video_id (FK → document.id).
+// The PLAYABLE url is NOT a column on training_videos — the legacy DTO exposed it
+// as the joined document's url (TrainingVideoTitleDescriptionDto:29 →
+// getTrainingVideo().getUrl()). Earlier this endpoint returned no url at all, so
+// the app's VideoPlayer got an empty source and nothing played. We LEFT JOIN
+// `document` and return document.url as `url`.
+//
+// URL normalization: legacy document.url rows use a cleartext `http://` scheme
+// (Android's New Architecture blocks cleartext) and some carry a malformed host
+// (`core.easyfix_core.in`). The files all serve from the canonical static host
+// over https, so we rebuild from the `/easydoc/...` path.
+// Verified: https://core.easyfix.in/easydoc/... → 206 video/mp4 (range-supported).
+const TRAINING_VIDEO_HOST = 'https://core.easyfix.in';
+function normalizeTrainingVideoUrl(raw) {
+  if (!raw) return '';
+  const s = String(raw).trim();
+  const i = s.indexOf('/easydoc');
+  if (i >= 0) return TRAINING_VIDEO_HOST + s.slice(i);
+  return s.replace(/^http:\/\//i, 'https://'); // already-https / non-legacy paths pass through
+}
 router.get('/training-videos', async (_req, res, next) => {
   try {
+    // document_type_id = 2 is the "Video / Training Videos" type in `document_type`
+    // (NOT tbl_document_type, where 2 = Ration Card). Kept in the JOIN ON clause
+    // so it's a guard, not a row filter — a training_videos row whose doc is
+    // missing/mistyped still returns (with url=''), rather than vanishing.
     const [rows] = await pool.query(
-      'SELECT id, title, description, sub_title, sub_description FROM training_videos ORDER BY id DESC'
+      `SELECT tv.id, tv.title, tv.description, tv.sub_title, tv.sub_description,
+              d.url AS doc_url
+         FROM training_videos tv
+         LEFT JOIN document d
+           ON d.id = tv.training_video_id AND d.document_type_id = 2
+         ORDER BY tv.id DESC`
     );
-    modernOk(res, rows);
+    const items = rows.map((r) => ({
+      id: r.id,
+      title: r.title,
+      description: r.description,
+      sub_title: r.sub_title,
+      sub_description: r.sub_description,
+      url: normalizeTrainingVideoUrl(r.doc_url),
+    }));
+    modernOk(res, items);
   } catch (e) { next(e); }
 });
 
