@@ -2,11 +2,13 @@
  * Shared log formatting — the contextual line shape used by BOTH the per-request
  * access log (middleware/http-log.js) and request-scoped app logs (logger.js):
  *
- *   [HH:MM:SS] [Surface]  identity              → [LEVEL]  message
+ *   [HH:MM:SS] [reqId] [Surface]  identity              → [LEVEL]  message
  *
- * Columns are fixed-width (timestamp + surface tag + identity all padded) so the
- * `→ [LEVEL]` marker — and the message after it — start at the SAME column on
- * every line, whatever the surface or identity length.
+ * Columns are fixed-width (timestamp + reqId + surface tag + identity all padded)
+ * so the `→ [LEVEL]` marker — and the message after it — start at the SAME column
+ * on every line, whatever the surface or identity length. `reqId` is a 4-hex
+ * per-request token (utils/request-context.js) so the lines of ONE request can be
+ * grouped even when concurrent requests from the same tech/user interleave.
  *
  *   Surface  = the calling frontend / principal (Mobile / CRM / Client / API …).
  *   identity = tech mobile number (efr_no) or the logged-in user's email.
@@ -88,12 +90,13 @@ const LEVEL_W = 7; //    '[ERROR]'
 // colouring so ANSI escape codes never throw off column alignment.
 function contextLine(req, level, message) {
   const ts = paint('gray', `[${stamp()}]`, { bold: false });
+  const rid = paint('magenta', `[${(req && req.reqId) || '····'}]`, { bold: false });
   const surface = surfaceOf(req);
   const tag = paint(SURFACE_COLOR[surface] || 'gray', `[${surface}]`.padEnd(SURFACE_W));
   const id = paint('dim', String(identityOf(req)).padEnd(IDENTITY_W), { bold: false });
   const arrow = paint('gray', '→', { bold: false });
   const lvl = paint(LEVEL_COLOR[level] || 'gray', `[${level}]`.padEnd(LEVEL_W));
-  return `${ts} ${tag} ${id} ${arrow} ${lvl} ${message}`;
+  return `${ts} ${rid} ${tag} ${id} ${arrow} ${lvl} ${message}`;
 }
 
 module.exports = { paint, ANSI, surfaceOf, identityOf, levelFromStatus, methodTag, contextLine, stamp };
