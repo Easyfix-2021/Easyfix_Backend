@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const logger = require('../logger');
 
 /*
  * Per-client settings with global fallback — REALTIME reads (no cache).
@@ -37,11 +38,15 @@ function coerce(raw, dataType) {
 }
 
 async function getClientSetting(clientId, key) {
+  logger.info('Resolving client setting · key=' + key + ' · clientId=' + (clientId || 'global'));
   const [[meta]] = await pool.query(
     'SELECT id, `key`, default_value, data_type FROM tbl_autoallocation_setting WHERE `key` = ? LIMIT 1',
     [key]
   );
-  if (!meta) return null;
+  if (!meta) {
+    logger.warn('No setting defined for key=' + key);
+    return null;
+  }
 
   let raw = meta.default_value;
   if (clientId) {
@@ -62,9 +67,11 @@ async function getClientSetting(clientId, key) {
  * default). Used by the Settings UI to render all knobs at once.
  */
 async function getAllForClient(clientId) {
+  logger.info('Loading all settings for client · clientId=' + (clientId || 'global'));
   const [rows] = await pool.query(
     'SELECT id, `key`, default_value, description, data_type FROM tbl_autoallocation_setting ORDER BY id'
   );
+  logger.info('Found ' + rows.length + ' settings');
   const [overrides] = clientId
     ? await pool.query(
         `SELECT setting_id, value FROM tbl_client_setting
@@ -72,6 +79,7 @@ async function getAllForClient(clientId) {
         [clientId])
     : [[]];
   const overrideById = new Map(overrides.map((o) => [o.setting_id, o.value]));
+  logger.info('Returning ' + rows.length + ' settings · ' + overrideById.size + ' overridden');
 
   return rows.map((r) => {
     const hasOverride = overrideById.has(r.id);

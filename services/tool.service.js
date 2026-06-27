@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const logger = require('../logger');
 
 /*
  * Manage Tools — master for tbl_tools (legacy /tool screen).
@@ -24,6 +25,8 @@ async function listTools({
   limit  = Math.min(Math.max(Number(limit) || 200, 1), 1000);
   offset = Math.max(Number(offset) || 0, 0);
 
+  logger.info('List tools · q=' + (q || '') + ' · includeInactive=' + includeInactive + ' · limit=' + limit + ' · offset=' + offset);
+
   const sortExpr = SORTABLE_COLUMNS[sortBy] || SORTABLE_COLUMNS.tool_name;
   const dir      = String(sortDir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
   const orderBy  = `${sortExpr} ${dir}, tool_id ASC`;
@@ -48,10 +51,12 @@ async function listTools({
     `SELECT COUNT(*) AS total FROM tbl_tools WHERE ${where.join(' AND ')}`,
     params
   );
+  logger.info('Found ' + rows.length + ' tools (total=' + total + ')');
   return { items: rows, total };
 }
 
 async function getToolById(id) {
+  logger.info('Get tool by id · id=' + id);
   const [[row]] = await pool.query(
     'SELECT tool_id, tool_name, tool_desc, tool_status, tool_img FROM tbl_tools WHERE tool_id = ? LIMIT 1',
     [id]
@@ -60,6 +65,7 @@ async function getToolById(id) {
 }
 
 async function createTool({ tool_name, tool_desc, tool_img }) {
+  logger.info('Create tool · name=' + (tool_name || ''));
   const name = String(tool_name || '').trim();
   if (!name) throw mkErr(400, 'tool_name is required');
 
@@ -67,18 +73,26 @@ async function createTool({ tool_name, tool_desc, tool_img }) {
     'SELECT tool_id FROM tbl_tools WHERE LOWER(tool_name) = LOWER(?) LIMIT 1',
     [name]
   );
-  if (dup) throw mkErr(409, `Tool "${name}" already exists`);
+  if (dup) {
+    logger.warn('Create tool rejected · duplicate name=' + name);
+    throw mkErr(409, `Tool "${name}" already exists`);
+  }
 
   const [r] = await pool.query(
     `INSERT INTO tbl_tools (tool_name, tool_desc, tool_status, tool_img) VALUES (?, ?, '1', ?)`,
     [name, tool_desc ? String(tool_desc).trim() : null, tool_img || null]
   );
+  logger.info('Tool created · id=' + r.insertId);
   return getToolById(r.insertId);
 }
 
 async function updateTool(id, fields) {
+  logger.info('Update tool · id=' + id);
   const [[me]] = await pool.query('SELECT tool_id FROM tbl_tools WHERE tool_id = ? LIMIT 1', [id]);
-  if (!me) throw mkErr(404, 'Tool not found');
+  if (!me) {
+    logger.warn('Update tool rejected · not found · id=' + id);
+    throw mkErr(404, 'Tool not found');
+  }
 
   const sets = [];
   const params = [];
@@ -101,11 +115,14 @@ async function updateTool(id, fields) {
 
   params.push(id);
   await pool.query(`UPDATE tbl_tools SET ${sets.join(', ')} WHERE tool_id = ?`, params);
+  logger.info('Tool updated · id=' + id + ' · fields=' + sets.length);
   return getToolById(id);
 }
 
 async function deactivateTool(id) {
+  logger.info('Deactivate tool · id=' + id);
   const [r] = await pool.query("UPDATE tbl_tools SET tool_status = '0' WHERE tool_id = ?", [id]);
+  logger.info('Tool deactivated · id=' + id + ' · affected=' + r.affectedRows);
   return r.affectedRows > 0;
 }
 

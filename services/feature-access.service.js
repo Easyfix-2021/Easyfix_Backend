@@ -1,4 +1,5 @@
 const { parseEmailAllowlist } = require('./properties.service');
+const logger = require('../logger');
 
 /*
  * Property-gated admin CAPABILITIES — a per-user allowlist keyed in
@@ -31,6 +32,7 @@ function featuresForUser(user) {
   const email = user && user.official_email;
   const out = {};
   for (const [flag, key] of Object.entries(FEATURES)) out[flag] = emailAllowed(key, email);
+  logger.info('Resolve gated features · enabled=[' + Object.keys(out).filter((f) => out[f]).join(', ') + ']');
   return out;
 }
 

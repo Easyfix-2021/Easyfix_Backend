@@ -67,14 +67,14 @@ async function readIdentity(efrId) {
   }
 }
 
-// `insert_date` (technician's join date) + `efr_email` — neither is carried by
-// the dashboard identity projection (fetchIdentity selects no email and no
-// insert_date), so a focused two-column read fills them. Best-effort: degrade to
-// empty object so each field falls back to null.
+// `insert_date` (technician's join date) + `efr_email` + `efr_pin_no` — none is
+// carried by the dashboard identity projection (fetchIdentity selects no email,
+// no insert_date, no pincode), so a focused single read fills them. Best-effort:
+// degrade to empty object so each field falls back to null.
 async function fetchExtraProfileFields(efrId) {
   try {
     const [[row]] = await pool.query(
-      'SELECT insert_date, efr_email FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1',
+      'SELECT insert_date, efr_email, efr_pin_no FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1',
       [efrId],
     );
     return row || {};
@@ -84,10 +84,30 @@ async function fetchExtraProfileFields(efrId) {
   }
 }
 
+// DISTINCT mapped deep-skill count for the technician. Documented column
+// inversion: the physical `parent_skill_id` column actually holds the
+// deepskill_id, so counting DISTINCT parent_skill_id yields distinct deep
+// skills. Best-effort: any failure (incl. missing table) degrades to 0.
+async function fetchSkillCount(efrId) {
+  try {
+    const [[row]] = await pool.query(
+      `SELECT COUNT(DISTINCT m.parent_skill_id) AS skill_count
+         FROM tbl_efr_deepskill_mapping m
+        WHERE m.easyfixer_id = ? AND m.is_repairing = 1`,
+      [efrId],
+    );
+    return Number(row?.skill_count ?? 0);
+  } catch (e) {
+    logger.info({ err: e.message, efrId }, 'fetchSkillCount failed; returning 0');
+    return 0;
+  }
+}
+
 /*
  * Compose the profile-details payload the app expects:
  *   { efrId, name, mobile, email, city, photoUrl, rating, grade,
- *     completedJobs, membershipType, memberSince, categories }
+ *     completedJobs, skillCount, pincode, membershipType, memberSince,
+ *     categories }
  *
  * The three independent reads (identity, performance, counts) plus the tiny
  * memberSince read run in a single Promise.all fan-out. Each is wrapped so one
@@ -100,7 +120,9 @@ async function getProfileDetails(efrId) {
     throw err;
   }
 
-  const [ident, performance, counts, extra] = await Promise.all([
+  logger.info('Compose profile-details · efrId=' + efrId);
+
+  const [ident, performance, counts, extra, skillCount] = await Promise.all([
     readIdentity(efrId),
     performanceService.getForTech(efrId).catch((e) => {
       logger.warn({ err: e.message, efrId }, 'profile-details performance failed');
@@ -111,10 +133,13 @@ async function getProfileDetails(efrId) {
       return { byStatus: {} };
     }),
     fetchExtraProfileFields(efrId),
+    fetchSkillCount(efrId),
   ]);
 
   const completedJobs =
     Number(counts.byStatus?.['3'] ?? 0) + Number(counts.byStatus?.['5'] ?? 0);
+
+  logger.info('Returning profile-details · completedJobs=' + completedJobs + ' skillCount=' + (skillCount ?? 0));
 
   return {
     efrId:          ident?.efr_id ?? efrId,
@@ -128,6 +153,8 @@ async function getProfileDetails(efrId) {
     rating:         performance.rating ?? 0,
     grade:          performance.grade ?? null,
     completedJobs,
+    skillCount:     skillCount ?? 0,
+    pincode:        extra?.efr_pin_no ?? null,
     membershipType: null,           // no such column on tbl_easyfixer
     memberSince:    extra?.insert_date ?? null,
     categories:     ident?.efr_service_category

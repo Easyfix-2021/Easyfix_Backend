@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const logger = require('../logger');
 
 /*
  * Manage B2B Rate Cards — master for tbl_client_rate_card.
@@ -41,6 +42,8 @@ async function listRateCards({
   limit  = Math.min(Math.max(Number(limit) || 200, 1), 1000);
   offset = Math.max(Number(offset) || 0, 0);
 
+  logger.info('List B2B rate cards · q=' + (q || '-') + ' · serviceTypeId=' + (serviceTypeId || '-') + ' · serviceCatgId=' + (serviceCatgId || '-') + ' · includeInactive=' + includeInactive + ' · limit=' + limit + ' · offset=' + offset);
+
   const sortExpr = SORTABLE_COLUMNS[sortBy] || SORTABLE_COLUMNS.crc_ratecard_name;
   const dir      = String(sortDir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
   const orderBy  = `${sortExpr} ${dir}, rc.crc_id ASC`;
@@ -76,6 +79,7 @@ async function listRateCards({
     params
   );
 
+  logger.info('Found ' + rows.length + ' B2B rate cards · total=' + total);
   return { items: rows, total };
 }
 
@@ -94,6 +98,7 @@ async function getRateCardById(id) {
 
 async function createRateCard({ crc_ratecard_name, crc_servicetype_id, createdBy }) {
   const name = String(crc_ratecard_name || '').trim();
+  logger.info('Create B2B rate card · name="' + name + '" · serviceTypeId=' + (crc_servicetype_id || '-'));
   if (!name)                throw mkErr(400, 'crc_ratecard_name is required');
   if (!crc_servicetype_id)  throw mkErr(400, 'crc_servicetype_id is required');
 
@@ -123,10 +128,12 @@ async function createRateCard({ crc_ratecard_name, crc_servicetype_id, createdBy
      VALUES (?, ?, 1, NOW(), NOW(), ?)`,
     [Number(crc_servicetype_id), name, createdBy || null]
   );
+  logger.info('B2B rate card created · id=' + r.insertId);
   return getRateCardById(r.insertId);
 }
 
 async function updateRateCard(id, fields, updatedBy) {
+  logger.info('Update B2B rate card · id=' + id + ' · fields=' + Object.keys(fields || {}).join(','));
   const [[me]] = await pool.query(
     'SELECT crc_id FROM tbl_client_rate_card WHERE crc_id = ? AND status <> 3 LIMIT 1',
     [id]
@@ -156,10 +163,12 @@ async function updateRateCard(id, fields, updatedBy) {
   sets.push('update_date = NOW()', 'updated_by = ?');
   params.push(updatedBy || null, id);
   await pool.query(`UPDATE tbl_client_rate_card SET ${sets.join(', ')} WHERE crc_id = ?`, params);
+  logger.info('B2B rate card updated · id=' + id);
   return getRateCardById(id);
 }
 
 async function deactivateRateCard(id, updatedBy) {
+  logger.info('Delete (soft) B2B rate card · id=' + id);
   // Soft-delete via status=3 (legacy "removed" — fully hidden) rather than
   // status=0 (inactive). Matches the legacy ClientRateCardDaoImpl
   // addDeleteClientRateCard which sets status=3 directly.
@@ -169,6 +178,7 @@ async function deactivateRateCard(id, updatedBy) {
       WHERE crc_id = ? AND status <> 3`,
     [updatedBy || null, id]
   );
+  logger.info('B2B rate card deleted · id=' + id + ' · affected=' + r.affectedRows);
   return r.affectedRows > 0;
 }
 

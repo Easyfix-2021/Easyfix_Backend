@@ -140,8 +140,12 @@ async function listCitiesForLookup() {
 
 // ─── Public: full page payload ──────────────────────────────────────
 async function getVerificationPage(efrId) {
+  logger.info('Load easyfixer verification page · efrId=' + efrId);
   const e = await getEasyfixerForVerification(efrId);
-  if (!e) return null;
+  if (!e) {
+    logger.warn('Verification page not found · efrId=' + efrId);
+    return null;
+  }
 
   /*
    * Additional Details counts (2026-06-11) — Deep Skill Option Mapping
@@ -368,7 +372,9 @@ async function getVerificationPage(efrId) {
 
 // ─── Comments ───────────────────────────────────────────────────────
 async function addComment(efrId, { text, section }, actor) {
+  logger.info('Add verification comment · efrId=' + efrId + ' · section=' + section);
   if (!Object.values(SECTION).includes(section)) {
+    logger.warn('Add comment rejected · invalid section=' + section + ' · efrId=' + efrId);
     const err = new Error('invalid section');
     err.status = 400;
     throw err;
@@ -381,11 +387,13 @@ async function addComment(efrId, { text, section }, actor) {
      VALUES (?, ?, ?, NOW(), ?, ?)`,
     [text, author, section, authorId, efrId]
   );
+  logger.info('Comment added · efrId=' + efrId + ' · section=' + section);
   return getCommentsBySection(efrId, section);
 }
 
 // ─── Section savers (Section 2 sub-sections) ────────────────────────
 async function saveProfessional(efrId, body, actor) {
+  logger.info('Save professional details · efrId=' + efrId);
   const fields = [];
   const params = [];
   for (const [col, val] of [
@@ -398,15 +406,20 @@ async function saveProfessional(efrId, body, actor) {
   ]) {
     if (val !== undefined) { fields.push(`${col} = ?`); params.push(val); }
   }
-  if (!fields.length) return getVerificationPage(efrId);
+  if (!fields.length) {
+    logger.info('Professional details unchanged (no fields) · efrId=' + efrId);
+    return getVerificationPage(efrId);
+  }
   fields.push('updated_by = ?', 'update_date = NOW()');
   params.push(actor?.user_id || null, efrId);
   await pool.query(`UPDATE tbl_easyfixer SET ${fields.join(', ')} WHERE efr_id = ?`, params);
+  logger.info('Professional details updated · efrId=' + efrId + ' · fields=' + (fields.length - 2));
   return getVerificationPage(efrId);
 }
 
 // Personal details verification (matches updatepersonalDetailsVerificationById).
 async function savePersonalFamily(efrId, body, actor) {
+  logger.info('Save personal details verification · efrId=' + efrId + ' · is_verified=' + (body.is_verified ? 1 : 0));
   await pool.query(
     `UPDATE tbl_easyfixer
         SET is_personal_details_verified_by_crm = ?,
@@ -421,11 +434,13 @@ async function savePersonalFamily(efrId, body, actor) {
       efrId,
     ]
   );
+  logger.info('Personal details verification updated · efrId=' + efrId);
   return getVerificationPage(efrId);
 }
 
 // Banking details verification (matches updateBankDetailsVerificationStatusById).
 async function saveBanking(efrId, body, actor) {
+  logger.info('Save banking verification · efrId=' + efrId + ' · verification_status=' + body.verification_status);
   if (Number(body.verification_status) === 1) {
     await pool.query(
       `UPDATE tbl_easyfixer
@@ -444,11 +459,13 @@ async function saveBanking(efrId, body, actor) {
       [body.verification_comment || null, actor?.user_id || null, efrId]
     );
   }
+  logger.info('Banking verification updated · efrId=' + efrId + ' · verification_status=' + body.verification_status);
   return getVerificationPage(efrId);
 }
 
 // Identity verification (matches updateIdentityDetailsVerificationStatusById).
 async function saveIdentity(efrId, body, actor) {
+  logger.info('Save identity verification · efrId=' + efrId + ' · verification_status=' + body.verification_status);
   // Allow updating Aadhaar/Pan numbers inline.
   if (body.adhaar_card_number !== undefined || body.pan_card_number !== undefined) {
     const sets = [];
@@ -488,6 +505,7 @@ async function saveIdentity(efrId, body, actor) {
   if (status === 1 || status === 2) {
     registrationStatusPush.notifyRegistrationStatusChanged(efrId).catch(() => {});
   }
+  logger.info('Identity verification updated · efrId=' + efrId + ' · status=' + status);
   return getVerificationPage(efrId);
 }
 
@@ -497,15 +515,16 @@ async function saveIdentity(efrId, body, actor) {
 //                          1 → accepted
 //                          2 → denied
 async function setLeadVerification(efrId, body, actor) {
+  logger.info('Set lead verification · efrId=' + efrId + ' · personal_details_filled=' + body.personal_details_filled);
   const v = Number(body.personal_details_filled);
-  if (![0, 1, 2].includes(v)) { const e = new Error('invalid personal_details_filled'); e.status = 400; throw e; }
+  if (![0, 1, 2].includes(v)) { logger.warn('Lead verification rejected · invalid personal_details_filled=' + body.personal_details_filled + ' · efrId=' + efrId); const e = new Error('invalid personal_details_filled'); e.status = 400; throw e; }
 
   // Resolve user_id via tbl_easyfixer.user_id (needed to update tbl_user row).
   const [[row]] = await pool.query(`SELECT user_id FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1`, [efrId]);
-  if (!row) { const e = new Error('easyfixer not found'); e.status = 404; throw e; }
+  if (!row) { logger.warn('Lead verification failed · easyfixer not found · efrId=' + efrId); const e = new Error('easyfixer not found'); e.status = 404; throw e; }
   // Idle bucket is user_id IS NULL OR = 0 — with no linked user account there's
   // no tbl_user row to flip, so the lead-status write would silently no-op.
-  if (!row.user_id) { const e = new Error('easyfixer has no linked user account — lead status cannot be set'); e.status = 422; throw e; }
+  if (!row.user_id) { logger.warn('Lead verification failed · no linked user account · efrId=' + efrId); const e = new Error('easyfixer has no linked user account — lead status cannot be set'); e.status = 422; throw e; }
 
   // Auto-append the comment line that mirrors legacy "Accepted / Denied / ..."
   const statusText = v === 1 ? 'Accepted' : v === 2 ? 'Denied' : 'Not Eligible To New Lead';
@@ -541,10 +560,13 @@ async function setLeadVerification(efrId, body, actor) {
     await conn.commit();
   } catch (e) {
     await conn.rollback().catch(() => {});
+    logger.error('Lead verification transaction failed · efrId=' + efrId + ' · ' + e.message);
     throw e;
   } finally {
     conn.release();
   }
+
+  logger.info('Lead verification set · efrId=' + efrId + ' · status=' + statusText);
 
   // Lead accept/deny changes tbl_user.personal_details_filled, which drives
   // the registration-status gate (under_verification / not_eligible /
@@ -557,8 +579,9 @@ async function setLeadVerification(efrId, body, actor) {
 // ─── Proceed to Tx Activation gate ──────────────────────────────────
 // Replicates legacy condition: identity verified == 1.
 async function proceedToActivation(efrId) {
+  logger.info('Check proceed-to-activation gate · efrId=' + efrId);
   const e = await getEasyfixerForVerification(efrId);
-  if (!e) { const err = new Error('easyfixer not found'); err.status = 404; throw err; }
+  if (!e) { logger.warn('Proceed-to-activation failed · easyfixer not found · efrId=' + efrId); const err = new Error('easyfixer not found'); err.status = 404; throw err; }
 
   // Gate checks — all 4 sub-sections plus identity verified flag.
   const ok =
@@ -566,6 +589,7 @@ async function proceedToActivation(efrId) {
     Number(e.efr_profile_perc || 0) >= 100;
 
   if (!ok) {
+    logger.warn('Proceed-to-activation blocked · efrId=' + efrId + ' · profile_perc=' + Number(e.efr_profile_perc || 0) + ' · identity_verified=' + (Number(e.is_identity_details_verified_by_crm) === 1));
     const err = new Error('cannot proceed: identity not verified or profile incomplete');
     err.status = 409;
     err.details = {
@@ -574,12 +598,14 @@ async function proceedToActivation(efrId) {
     };
     throw err;
   }
+  logger.info('Proceed-to-activation allowed · efrId=' + efrId);
   // Idempotent — the next step (activate) is where state actually changes.
   return { proceed: true };
 }
 
 // ─── Activation save (Section 3) ────────────────────────────────────
 async function saveActivation(efrId, body, actor) {
+  logger.info('Save activation · efrId=' + efrId + ' · activate=' + (body.activate === true));
   // Banking: easyfix_bank_name_id + beneficiary_id (Edit Finance Details).
   if (body.easyfix_bank_name_id !== undefined || body.beneficiary_id !== undefined) {
     const [[existing]] = await pool.query(
@@ -621,6 +647,7 @@ async function saveActivation(efrId, body, actor) {
     // `active`. Push the technician's app so it leaves the onboarding gate
     // immediately. Best-effort — never blocks the activation.
     registrationStatusPush.notifyRegistrationStatusChanged(efrId, { status: 'active' }).catch(() => {});
+    logger.info('Technician activated · efrId=' + efrId);
   }
   return getVerificationPage(efrId);
 }
@@ -630,6 +657,7 @@ async function saveActivation(efrId, body, actor) {
 // mappings and soft-disable any not in the list (mapping_status=0).
 async function mapClients(efrId, clientIds, actor) {
   const ids = Array.isArray(clientIds) ? clientIds.map(Number).filter((n) => Number.isInteger(n) && n > 0) : [];
+  logger.info('Map clients to easyfixer · efrId=' + efrId + ' · clients=' + ids.length);
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
@@ -653,10 +681,12 @@ async function mapClients(efrId, clientIds, actor) {
     await conn.commit();
   } catch (e) {
     await conn.rollback().catch(() => {});
+    logger.error('Map clients transaction failed · efrId=' + efrId + ' · ' + e.message);
     throw e;
   } finally {
     conn.release();
   }
+  logger.info('Clients mapped · efrId=' + efrId + ' · clients=' + ids.length);
   return getVerificationPage(efrId);
 }
 
@@ -685,6 +715,7 @@ async function mapClients(efrId, clientIds, actor) {
  * row instead of creating a duplicate.
  */
 async function listOptionMappings(efrId) {
+  logger.info('List deep-skill option mappings · efrId=' + efrId);
   const [rows] = await pool.query(
     `SELECT m.id                        AS mapping_id,
             m.category_id,
@@ -713,6 +744,7 @@ async function listOptionMappings(efrId) {
       ORDER BY sc.service_catg_name, st.service_type_name, ds.deepskill_name, o.skill_option`,
     [efrId]
   );
+  logger.info('Found ' + rows.length + ' deep-skill option mappings');
   // Resolve image keys once per distinct deep_skill_id — option rows for
   // the same skill share the URL. Skips empty keys so we only presign for
   // skills that actually have an image.
@@ -747,6 +779,7 @@ async function listOptionMappings(efrId) {
  * easyfixer_id guard prevents unmapping a row owned by a different technician.
  */
 async function unmapDeepSkill(efrId, rowId) {
+  logger.info('Unmap deep-skill mapping · efrId=' + efrId + ' · mappingId=' + rowId);
   const [result] = await pool.query(
     `UPDATE tbl_efr_deepskill_mapping
         SET is_repairing = 0
@@ -754,15 +787,18 @@ async function unmapDeepSkill(efrId, rowId) {
     [rowId, efrId]
   );
   if (result.affectedRows === 0) {
+    logger.warn('Unmap deep-skill failed · not found or already removed · efrId=' + efrId + ' · mappingId=' + rowId);
     const err = new Error('Deep-skill mapping not found or already removed');
     err.status = 404;
     throw err;
   }
+  logger.info('Deep-skill mapping unmapped · efrId=' + efrId + ' · mappingId=' + rowId);
   return { unmapped: true };
 }
 
 async function replaceOptionMappings(efrId, items, actor, externalConn = null) {
   const list = Array.isArray(items) ? items : [];
+  logger.info('Replace deep-skill option mappings · efrId=' + efrId + ' · items=' + list.length);
   // When an external connection is injected (e.g. acceptSubmission's txn) we
   // enroll in the caller's transaction and leave begin/commit/release to them.
   const conn = externalConn || await pool.getConnection();
@@ -816,9 +852,11 @@ async function replaceOptionMappings(efrId, items, actor, externalConn = null) {
     // actor is accepted for future audit columns; today the table has no
     // updated_by / updated_on columns so we just log the actor for trail.
     void actor;
+    logger.info('Deep-skill option mappings replaced · efrId=' + efrId + ' · updated=' + updated);
     return { updated };
   } catch (e) {
     if (ownTxn) { try { await conn.rollback(); } catch (_) { /* swallow rollback failure */ } }
+    logger.error('Replace deep-skill option mappings failed · efrId=' + efrId + ' · ' + e.message);
     throw e;
   } finally {
     if (ownTxn) conn.release();
@@ -842,6 +880,7 @@ async function replaceOptionMappings(efrId, items, actor, externalConn = null) {
  * safe under the CLAUDE.md shared-DB carve-out.
  */
 async function listServiceablePincodes(efrId) {
+  logger.info('List serviceable pincodes · efrId=' + efrId);
   const [[row]] = await pool.query(
     `SELECT pincodes FROM tbl_efr_serviceable_pincodes WHERE easyfixer_id = ? LIMIT 1`,
     [efrId]
@@ -850,6 +889,7 @@ async function listServiceablePincodes(efrId) {
   if (!csv) return { items: [] };
   const pins = String(csv).split(',').map((s) => s.trim()).filter(Boolean);
   if (pins.length === 0) return { items: [] };
+  logger.info('Found ' + pins.length + ' serviceable pincodes');
   const placeholders = pins.map(() => '?').join(',');
   const [items] = await pool.query(
     `SELECT p.pincode_id,
@@ -873,6 +913,7 @@ async function replaceServiceablePincodes(efrId, pincodeIds, actor, externalConn
   const list = Array.isArray(pincodeIds)
     ? Array.from(new Set(pincodeIds.map(Number).filter((n) => Number.isInteger(n) && n > 0)))
     : [];
+  logger.info('Replace serviceable pincodes · efrId=' + efrId + ' · requested=' + list.length);
   const userId = actor?.user_id || null;
   // Single-statement upsert — no begin/commit here. When an external
   // connection is injected we run on it so the write joins the caller's txn.
@@ -897,6 +938,7 @@ async function replaceServiceablePincodes(efrId, pincodeIds, actor, externalConn
     // is unrecognised. Return 400 rather than silently writing an empty CSV —
     // this is the mechanism that caused blank pincodes for easyfixer_id 1736.
     if (csv === '') {
+      logger.warn('Replace serviceable pincodes rejected · no valid pincodes resolved · efrId=' + efrId + ' · requested=' + list.length);
       const err = new Error('No valid pincodes resolved from the provided ids');
       err.statusCode = 400;
       throw err;
@@ -933,6 +975,7 @@ async function replaceServiceablePincodes(efrId, pincodeIds, actor, externalConn
       [...list, ...list]
     );
   }
+  logger.info('Serviceable pincodes replaced · efrId=' + efrId + ' · updated=' + resolvedCount);
   return { updated: resolvedCount };
 }
 
@@ -941,11 +984,13 @@ async function replaceServiceablePincodes(efrId, pincodeIds, actor, externalConn
 // document in tbl_easyfixer_documents with document_type = 'BGV Report'.
 // For now we just persist the supplied URL/key if the caller provides one.
 async function saveBgvReport(efrId, body, actor) {
+  logger.info('Save BGV report · efrId=' + efrId + ' · hasReport=' + !!body.bgv_report_img_name);
   if (body.bgv_report_img_name) {
     await pool.query(
       `UPDATE tbl_easyfixer SET bgv_report_img_name = ?, updated_by = ?, update_date = NOW() WHERE efr_id = ?`,
       [body.bgv_report_img_name, actor?.user_id || null, efrId]
     ).catch(() => {});
+    logger.info('BGV report saved · efrId=' + efrId);
   }
   return getVerificationPage(efrId);
 }

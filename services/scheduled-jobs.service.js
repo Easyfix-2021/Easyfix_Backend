@@ -1,5 +1,6 @@
 const scheduler = require('../server/scheduler');
 const { getProperty } = require('./properties.service');
+const logger = require('../logger');
 
 /*
  * Scheduled Jobs admin surface (2026-06-06).
@@ -46,11 +47,13 @@ function isAllowedUser(user) {
 
 /* Pass-through to the scheduler's public projection. */
 function list() {
+  logger.info('List scheduled jobs');
   return scheduler.getJobs();
 }
 
 /* Pass-through to the scheduler's manual trigger. */
 async function trigger(id) {
+  logger.info('Trigger scheduled job · id=' + id);
   return scheduler.triggerJob(id);
 }
 
@@ -62,6 +65,7 @@ async function trigger(id) {
  * the targeted job didn't register a tester closure.
  */
 async function test(id, opts) {
+  logger.info('Test scheduled job (single send) · id=' + id);
   return scheduler.testJob(id, opts);
 }
 

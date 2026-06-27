@@ -109,6 +109,7 @@ async function getClientColumns() {
  * filter assembly. Pagination is enforced here (max 500 per page).
  */
 async function listClients({ extraClauses = [], extraParams = [], includeInactive, q, limit, offset, cityId }) {
+  logger.info('List clients · q=' + (q || '') + ' cityId=' + (cityId || '') + ' includeInactive=' + !!includeInactive + ' limit=' + (limit || '') + ' offset=' + (offset || ''));
   const clauses = [...extraClauses];
   const params  = [...extraParams];
   if (!includeInactive) clauses.push('cl.client_status = 1');
@@ -165,6 +166,7 @@ async function listClients({ extraClauses = [], extraParams = [], includeInactiv
        LIMIT ? OFFSET ?`,
     pageParams,
   );
+  logger.info('Found ' + rows.length + ' clients (total=' + Number(total) + ')');
   if (rows.length === 0) return { items: [], total: Number(total) };
 
   // Query 3 — bulk-resolve Primary/Secondary SPOC per client in ONE
@@ -216,6 +218,7 @@ async function listClients({ extraClauses = [], extraParams = [], includeInactiv
 }
 
 async function getClientById(clientId) {
+  logger.info('Get client by id · clientId=' + clientId);
   const [[row]] = await pool.query(
     'SELECT * FROM tbl_client WHERE client_id = ?', [clientId],
   );
@@ -274,6 +277,7 @@ const CLIENT_INSERT_MAP = {
 };
 
 async function createClient(body, actorId) {
+  logger.info('Create client · name=' + (body && body.clientName));
   const cols = await getClientColumns();
   const insertCols = [];
   const placeholders = [];
@@ -298,6 +302,7 @@ async function createClient(body, actorId) {
 
   const sql = `INSERT INTO tbl_client (${insertCols.join(', ')}) VALUES (${placeholders.join(', ')})`;
   const [ins] = await pool.query(sql, values);
+  logger.info('Client created · id=' + ins.insertId);
   return ins.insertId;
 }
 
@@ -371,6 +376,7 @@ const CAMEL_TO_SNAKE = {
 };
 
 async function updateClient(clientId, body, actorId) {
+  logger.info('Update client · clientId=' + clientId);
   const cols = await getClientColumns();
   const sets = [];
   const vals = [];
@@ -396,16 +402,19 @@ async function updateClient(clientId, body, actorId) {
   const [r] = await pool.query(
     `UPDATE tbl_client SET ${sets.join(', ')} WHERE client_id = ?`, vals,
   );
+  logger.info('Client updated · clientId=' + clientId + ' affected=' + r.affectedRows);
   return r.affectedRows;
 }
 
 /* ─── Client Contacts (SPOCs) ─────────────────────────────────────── */
 
 async function listContacts(clientId) {
+  logger.info('List client contacts · clientId=' + clientId);
   const [rows] = await pool.query(
     'SELECT * FROM tbl_client_contacts WHERE client_id = ? ORDER BY id DESC',
     [clientId],
   );
+  logger.info('Found ' + rows.length + ' contacts');
   return rows;
 }
 
@@ -440,6 +449,7 @@ async function findDuplicateContact({ clientId, email, phone, excludeId }) {
 }
 
 async function createContact(clientId, body) {
+  logger.info('Create client contact · clientId=' + clientId);
   // Pre-flight dedupe: surface a 409 with the conflicting row rather
   // than relying on a generic SQL unique-index violation.
   const dup = await findDuplicateContact({
@@ -448,6 +458,7 @@ async function createContact(clientId, body) {
     phone: body.contactNo,
   });
   if (dup) {
+    logger.warn('Create contact rejected · duplicate email/phone · clientId=' + clientId + ' conflictId=' + dup.id);
     throw Object.assign(new Error('contact with this email or phone already exists'), {
       status: 409,
       conflict: dup,
@@ -468,6 +479,7 @@ async function createContact(clientId, body) {
       body.managerId ?? null,
     ],
   );
+  logger.info('Contact created · id=' + ins.insertId + ' clientId=' + clientId);
   return ins.insertId;
 }
 
@@ -486,6 +498,7 @@ const CONTACT_CAMEL_TO_SNAKE = {
 };
 
 async function updateContact(contactId, body) {
+  logger.info('Update client contact · contactId=' + contactId);
   // If email/phone are being changed, dedupe-check against the same
   // client's other contacts.
   if (body.contactEmail || body.contactNo) {
@@ -500,6 +513,7 @@ async function updateContact(contactId, body) {
       excludeId: contactId,
     });
     if (dup) {
+      logger.warn('Update contact rejected · duplicate email/phone · contactId=' + contactId + ' conflictId=' + dup.id);
       throw Object.assign(new Error('contact with this email or phone already exists'), {
         status: 409, conflict: dup,
       });
@@ -520,6 +534,7 @@ async function updateContact(contactId, body) {
   const [r] = await pool.query(
     `UPDATE tbl_client_contacts SET ${sets.join(', ')} WHERE id = ?`, vals,
   );
+  logger.info('Contact updated · contactId=' + contactId + ' affected=' + r.affectedRows);
   return r.affectedRows;
 }
 
@@ -539,23 +554,28 @@ async function getContactClientId(contactId) {
 // against tbl_client_contacts.id don't dangle. Matches the legacy
 // `addUpdateClientContact` behaviour when status was set to 0.
 async function deleteContact(contactId) {
+  logger.info('Soft-delete client contact · contactId=' + contactId);
   const [r] = await pool.query(
     'UPDATE tbl_client_contacts SET status = 0 WHERE id = ?', [contactId],
   );
+  logger.info('Contact deleted · contactId=' + contactId + ' affected=' + r.affectedRows);
   return r.affectedRows;
 }
 
 /* ─── Client Billing ──────────────────────────────────────────────── */
 
 async function listBilling(clientId) {
+  logger.info('List client billing · clientId=' + clientId);
   const [rows] = await pool.query(
     'SELECT * FROM tbl_client_billing WHERE client_id = ? ORDER BY c_bill_id DESC',
     [clientId],
   );
+  logger.info('Found ' + rows.length + ' billing rows');
   return rows;
 }
 
 async function createBilling(clientId, body) {
+  logger.info('Create client billing · clientId=' + clientId);
   const [ins] = await pool.query(
     `INSERT INTO tbl_client_billing
        (client_id, c_bill_name, c_bill_address, c_bill_comm_addr,
@@ -574,6 +594,7 @@ async function createBilling(clientId, body) {
       body.paymentCycle ?? null,
     ],
   );
+  logger.info('Billing created · id=' + ins.insertId + ' clientId=' + clientId);
   return ins.insertId;
 }
 
@@ -594,6 +615,7 @@ const BILLING_CAMEL_TO_SNAKE = {
 };
 
 async function updateBilling(billingId, body) {
+  logger.info('Update client billing · billingId=' + billingId);
   const sets = [];
   const vals = [];
   for (const [key, val] of Object.entries(body || {})) {
@@ -609,15 +631,18 @@ async function updateBilling(billingId, body) {
   const [r] = await pool.query(
     `UPDATE tbl_client_billing SET ${sets.join(', ')} WHERE c_bill_id = ?`, vals,
   );
+  logger.info('Billing updated · billingId=' + billingId + ' affected=' + r.affectedRows);
   return r.affectedRows;
 }
 
 async function deleteBilling(billingId) {
+  logger.info('Delete client billing · billingId=' + billingId);
   // Hard-delete is acceptable here — billing addresses aren't referenced
   // by historical jobs (jobs snapshot their billing into the job row).
   const [r] = await pool.query(
     'DELETE FROM tbl_client_billing WHERE c_bill_id = ?', [billingId],
   );
+  logger.info('Billing deleted · billingId=' + billingId + ' affected=' + r.affectedRows);
   return r.affectedRows;
 }
 
@@ -641,10 +666,12 @@ async function getBillingClientId(billingId) {
  * FE needs the exact row to populate an edit form.
  */
 async function listCustomProperties(clientId) {
+  logger.info('List client custom properties · clientId=' + clientId);
   const [rows] = await pool.query(
     'SELECT * FROM tbl_client_custom_properties WHERE client_id = ?',
     [clientId],
   );
+  logger.info('Found ' + rows.length + ' custom properties');
   return rows;
 }
 
@@ -688,6 +715,7 @@ async function customPropCols() {
 }
 
 async function createCustomProperty(clientId, body) {
+  logger.info('Create client custom property · clientId=' + clientId + ' name=' + (body && body.name));
   const cols = await customPropCols();
   // Build the column list dynamically based on what actually exists on
   // this deploy. Label column is optional on legacy snapshots without
@@ -711,6 +739,7 @@ async function createCustomProperty(clientId, body) {
     `INSERT INTO tbl_client_custom_properties (${insertCols.join(', ')}) VALUES (${placeholders})`,
     insertVals,
   );
+  logger.info('Custom property created · id=' + ins.insertId + ' clientId=' + clientId);
   return ins.insertId;
 }
 
@@ -733,6 +762,7 @@ const CUSTOM_PROP_BODY_KEY_TO_COL_KEY = {
 };
 
 async function updateCustomProperty(propId, body) {
+  logger.info('Update client custom property · propId=' + propId);
   const cols = await customPropCols();
   const sets = [];
   const vals = [];
@@ -754,15 +784,18 @@ async function updateCustomProperty(propId, body) {
     `UPDATE tbl_client_custom_properties SET ${sets.join(', ')} WHERE ${cols.pk} = ?`,
     vals,
   );
+  logger.info('Custom property updated · propId=' + propId + ' affected=' + r.affectedRows);
   return r.affectedRows;
 }
 
 async function deleteCustomProperty(propId) {
+  logger.info('Delete client custom property · propId=' + propId);
   const cols = await customPropCols();
   const [r] = await pool.query(
     `DELETE FROM tbl_client_custom_properties WHERE ${cols.pk} = ?`,
     [propId],
   );
+  logger.info('Custom property deleted · propId=' + propId + ' affected=' + r.affectedRows);
   return r.affectedRows;
 }
 
@@ -863,6 +896,7 @@ async function getDocumentClientId(docId) {
  * 200-row cap is plenty (current QA has < 30 distinct keys cluster-wide).
  */
 async function listDistinctCustomPropertyKeys() {
+  logger.info('List distinct custom-property keys');
   const legacy = await detectCustomPropsShape();
   // Build the sample_label SELECT fragment based on what columns actually
   // exist. Three cases:
@@ -892,6 +926,7 @@ async function listDistinctCustomPropertyKeys() {
                 ORDER BY use_count DESC, \`key\` ASC
                 LIMIT 200`;
   const [rows] = await pool.query(sql);
+  logger.info('Found ' + rows.length + ' distinct custom-property keys');
   return rows.map((r) => ({
     key: String(r.key || '').trim(),
     sample_label: r.sample_label ? String(r.sample_label) : null,

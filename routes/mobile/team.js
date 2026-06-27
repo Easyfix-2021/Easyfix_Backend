@@ -2,6 +2,7 @@ const router = require('express').Router();
 
 const { modernOk } = require('../../utils/response');
 const team = require('../../services/mobile-team.service');
+const logger = require('../../logger');
 
 /*
  * /api/mobile/team — the authed technician's downline ("My Team").
@@ -17,9 +18,14 @@ const team = require('../../services/mobile-team.service');
  */
 router.get('/', async (req, res, next) => {
   try {
+    logger.info('Fetching My Team downline');
     const members = await team.getMyTeam(req.tech.efr_id);
+    logger.info('Found ' + members.length + ' team members');
     modernOk(res, { items: members, total: members.length });
-  } catch (e) { next(e); }
+  } catch (e) {
+    logger.warn('My Team fetch failed · ' + e.message);
+    next(e);
+  }
 });
 
 module.exports = router;

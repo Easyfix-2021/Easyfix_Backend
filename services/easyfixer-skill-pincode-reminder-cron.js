@@ -67,6 +67,8 @@ const TEMPLATE_NAME = 'tx_complete_profile';
 async function runDailyReminder() {
   const t0 = Date.now();
 
+  logger.info('Run daily skill+pincode reminder cron');
+
   /*
    * Find every FULLY-ACTIVE easyfixer with a usable mobile who has
    * BOTH datasets empty (2026-06-11, narrowed):
@@ -117,6 +119,8 @@ async function runDailyReminder() {
      ORDER BY e.efr_id
     `,
   );
+
+  logger.info('Found ' + rows.length + ' eligible easyfixers (missing skills + pincodes)');
 
   const stats = {
     candidates: rows.length,
@@ -184,6 +188,8 @@ async function runTest({ mobile, sourceId } = {}) {
       status: 400, code: 'INVALID_TEST_MOBILE',
     });
   }
+
+  logger.info('Send test skill+pincode reminder · sourceId=' + (sourceId != null && String(sourceId).trim() !== '' ? String(sourceId).trim() : 'none'));
 
   let recipientName = 'Test Easyfixer';
   let sourceUsed = null;

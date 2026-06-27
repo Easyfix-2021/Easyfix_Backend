@@ -130,6 +130,7 @@ async function callVendorJson(efrId, label, url, body) {
  * in a webview, plus the client_id used to poll for the Aadhaar download.
  */
 async function digilockerInitialize(efrId) {
+  logger.info('KYC DigiLocker initialize');
   assertConfigured();
   // VENDOR: POST https://kyc-api.surepass.io/api/v1/digilocker/initialize
   const url = `${SUREPASS_BASE}/api/v1/digilocker/initialize`;
@@ -145,6 +146,7 @@ async function digilockerInitialize(efrId) {
   };
   const out = await callVendorJson(efrId, 'digilocker/initialize', url, body);
   const d = out.data || {};
+  logger.info('KYC DigiLocker session created · clientId=' + (d.client_id || '-'));
   return {
     clientId: d.client_id || null,
     url: d.url || null,
@@ -162,6 +164,7 @@ async function digilockerInitialize(efrId) {
  * and the router maps it to a 202-style response.
  */
 async function digilockerDownloadAadhaar(efrId, clientId) {
+  logger.info('KYC DigiLocker download Aadhaar · clientId=' + (clientId || '-'));
   assertConfigured();
   // VENDOR: GET https://kyc-api.surepass.io/api/v1/digilocker/download-aadhaar/{client_id}
   const url = `${SUREPASS_BASE}/api/v1/digilocker/download-aadhaar/${encodeURIComponent(clientId)}`;
@@ -181,10 +184,12 @@ async function digilockerDownloadAadhaar(efrId, clientId) {
 
   // Consent not yet given → still pending, app should keep polling.
   if (parsed && parsed.message_code === 'aadhaar_consent_missing') {
+    logger.info('KYC DigiLocker Aadhaar still pending (consent missing) · clientId=' + (clientId || '-'));
     return { pending: true };
   }
 
   if (!isOk(parsed)) {
+    logger.warn('KYC DigiLocker download non-OK · clientId=' + (clientId || '-') + ' httpStatus=' + res.status);
     logger.warn(
       { efrId, clientId, httpStatus: res.status, messageCode: parsed?.message_code },
       'mobile-kyc: digilocker download non-OK',
@@ -192,6 +197,7 @@ async function digilockerDownloadAadhaar(efrId, clientId) {
     throw vendorError(parsed, 'DigiLocker Aadhaar download failed');
   }
 
+  logger.info('KYC DigiLocker Aadhaar downloaded · clientId=' + (clientId || '-'));
   const d = parsed.data || {};
   return {
     aadhaarNumber: d.aadhaar_number || d.masked_aadhaar || null,
@@ -212,6 +218,7 @@ async function digilockerDownloadAadhaar(efrId, clientId) {
  * using the Node 18 global FormData + Blob (no form-data npm dep).
  */
 async function panOcr(efrId, file) {
+  logger.info('KYC PAN OCR · bytes=' + (file && file.buffer ? file.buffer.length : 0));
   assertConfigured();
   if (!file || !file.buffer) {
     const e = new Error('PAN image file is required (multipart field "file")');
@@ -249,6 +256,7 @@ async function panOcr(efrId, file) {
     throw vendorError(parsed, 'PAN OCR failed');
   }
 
+  logger.info('KYC PAN OCR completed');
   const fields = (parsed.data && parsed.data.ocr_fields && parsed.data.ocr_fields[0]) || {};
   return {
     panNumber: fields.pan_number?.value || null,
@@ -265,6 +273,7 @@ async function panOcr(efrId, file) {
  * to submit the OTP) plus whether the OTP was actually dispatched.
  */
 async function aadhaarGenerateOtp(efrId, aadhaarNumber) {
+  logger.info('KYC Aadhaar generate OTP');
   assertConfigured();
   // VENDOR: POST https://kyc-api.aadhaarkyc.io/api/v1/aadhaar-v2/generate-otp
   const url = `${AADHAARKYC_BASE}/api/v1/aadhaar-v2/generate-otp`;
@@ -272,6 +281,7 @@ async function aadhaarGenerateOtp(efrId, aadhaarNumber) {
     id_number: aadhaarNumber,
   });
   const d = out.data || {};
+  logger.info('KYC Aadhaar OTP requested · clientId=' + (d.client_id || '-') + ' otpSent=' + (d.otp_sent ?? '-'));
   return {
     clientId: d.client_id || null,
     otpSent: d.otp_sent ?? null,
@@ -282,6 +292,7 @@ async function aadhaarGenerateOtp(efrId, aadhaarNumber) {
  * Submit the OTP the user received. On success returns the verified KYC data.
  */
 async function aadhaarSubmitOtp(efrId, clientId, otp) {
+  logger.info('KYC Aadhaar submit OTP · clientId=' + (clientId || '-'));
   assertConfigured();
   // VENDOR: POST https://kyc-api.aadhaarkyc.io/api/v1/aadhaar-v2/submit-otp
   const url = `${AADHAARKYC_BASE}/api/v1/aadhaar-v2/submit-otp`;
@@ -290,6 +301,7 @@ async function aadhaarSubmitOtp(efrId, clientId, otp) {
     otp,
   });
   const d = out.data || {};
+  logger.info('KYC Aadhaar verified · clientId=' + (clientId || '-'));
   return {
     verified: true,
     name: d.full_name || null,
@@ -302,6 +314,7 @@ async function aadhaarSubmitOtp(efrId, clientId, otp) {
 // ─── 4. Bank verification (aadhaarkyc.io) ───────────────────────────
 
 async function bankVerify(efrId, accountNumber, ifsc) {
+  logger.info('KYC bank verify');
   assertConfigured();
   // VENDOR: POST https://kyc-api.aadhaarkyc.io/api/v1/bank-verification/
   const url = `${AADHAARKYC_BASE}/api/v1/bank-verification/`;
@@ -311,6 +324,7 @@ async function bankVerify(efrId, accountNumber, ifsc) {
     ifsc_details: true,
   });
   const d = out.data || {};
+  logger.info('KYC bank account verified');
   return {
     verified: true,
     accountHolderName: d.full_name || d.account_holder_name || null,
@@ -321,6 +335,7 @@ async function bankVerify(efrId, accountNumber, ifsc) {
 // ─── 5. UPI verification (aadhaarkyc.io) ────────────────────────────
 
 async function upiVerify(efrId, upiId) {
+  logger.info('KYC UPI verify');
   assertConfigured();
   // VENDOR: POST https://kyc-api.aadhaarkyc.io/api/v1/bank-verification/upi-verification
   const url = `${AADHAARKYC_BASE}/api/v1/bank-verification/upi-verification`;
@@ -328,6 +343,7 @@ async function upiVerify(efrId, upiId) {
     upi_id: upiId,
   });
   const d = out.data || {};
+  logger.info('KYC UPI verified');
   return {
     verified: true,
     name: d.name || d.full_name || null,

@@ -72,9 +72,11 @@ router.post('/', upload.single('file'), async (req, res, next) => {
   const efrId = req.tech.efr_id;
   try {
     if (!req.file) {
+      uploadLogger.warn('Mobile upload rejected · missing file');
       return modernError(res, 400, 'missing "file" upload');
     }
     const kind = String(req.body?.kind || 'general').trim() || 'general';
+    uploadLogger.info('Mobile upload received · kind=' + kind + ' bytes=' + req.file.size);
 
     let key;
     let url;
@@ -117,14 +119,18 @@ router.post('/', upload.single('file'), async (req, res, next) => {
     );
 
     // `imageId` aliases `key` for the RN's loose { url, imageId } mapper.
+    uploadLogger.info('Mobile upload stored · kind=' + kind + ' storage=' + storage + ' key=' + key);
     return modernOk(res, { key, url, imageId: key });
   } catch (e) {
     if (e?.code === 'LIMIT_FILE_SIZE') {
+      uploadLogger.warn('Mobile upload rejected · file exceeds 10MB · ' + e.message);
       return modernError(res, 400, 'file exceeds 10MB');
     }
     if (e?.code === 'LIMIT_UNEXPECTED_FILE') {
+      uploadLogger.warn('Mobile upload rejected · unsupported file · ' + e.message);
       return modernError(res, 400, e.message || 'unsupported file');
     }
+    uploadLogger.error('Mobile upload failed · ' + e.message);
     uploadLogger.error({ efrId, err: e }, 'mobile upload failed');
     return next(e);
   }

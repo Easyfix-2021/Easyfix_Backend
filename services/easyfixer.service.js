@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const logger = require('../logger');
 
 /*
  * Easyfixer (technician) CRUD.
@@ -148,6 +149,7 @@ async function list({
   zonalManagerId, attendance, deepSkillMapped,
   sortBy = 'efr_id', sortDir = 'desc',
 } = {}) {
+  logger.info('List easyfixers · status=' + status + ' cityId=' + cityId + ' q=' + (q || '') + ' limit=' + limit + ' offset=' + offset + ' sortBy=' + sortBy);
   const clauses = [];
   const params = [];
 
@@ -445,11 +447,13 @@ async function list({
        LIMIT ? OFFSET ?`,
     params
   );
+  logger.info('Returning ' + rows.length + ' easyfixers · total=' + total);
   return { rows, total };
 }
 
 // ─── Detail ─────────────────────────────────────────────────────────
 async function getById(id) {
+  logger.info('Fetch easyfixer detail · id=' + id);
   const [[row]] = await pool.query(
     `SELECT ${DETAIL_COLUMNS}
        FROM tbl_easyfixer e
@@ -462,6 +466,7 @@ async function getById(id) {
 
 // ─── Create ─────────────────────────────────────────────────────────
 async function findActiveByMobile(efrNo) {
+  logger.info('Lookup active easyfixer by mobile');
   const [[row]] = await pool.query(
     `SELECT efr_id, efr_name FROM tbl_easyfixer
       WHERE efr_no = ? AND efr_status = 1 LIMIT 1`,
@@ -489,6 +494,7 @@ const MUTABLE_COLUMNS = [
 ];
 
 async function create(input, actor) {
+  logger.info('Create easyfixer · name=' + (input.efr_name || '') + ' cityId=' + input.efr_cityId);
   // efr_no has NO unique index (duplicates exist in prod data — see header
   // note), so the duplicate check below is a check-then-insert race under
   // concurrency (e.g. a double-clicked create button). Serialise per efr_no
@@ -499,6 +505,7 @@ async function create(input, actor) {
   try {
     const [[lock]] = await conn.query('SELECT GET_LOCK(?, 5) AS got', [lockName]);
     if (!lock || lock.got !== 1) {
+      logger.warn('Create easyfixer blocked · could not acquire mobile-number lock');
       const err = new Error('could not acquire create lock for this mobile number, please retry');
       err.status = 409;
       throw err;
@@ -512,6 +519,7 @@ async function create(input, actor) {
       [input.efr_no]
     );
     if (existing) {
+      logger.warn('Create easyfixer rejected · active duplicate exists · efr_id=' + existing.efr_id);
       const err = new Error(`an active easyfixer with efr_no=${input.efr_no} already exists (efr_id=${existing.efr_id})`);
       err.status = 409;
       err.details = { existingId: existing.efr_id };
@@ -535,6 +543,7 @@ async function create(input, actor) {
       `INSERT INTO tbl_easyfixer (${columns.join(', ')}) VALUES (${placeholders})`,
       values
     );
+    logger.info('Easyfixer created · id=' + result.insertId);
     return getById(result.insertId);
   } finally {
     try { await conn.query('SELECT RELEASE_LOCK(?)', [lockName]); } catch (_) { /* connection teardown releases it anyway */ }
@@ -544,8 +553,10 @@ async function create(input, actor) {
 
 // ─── Update ─────────────────────────────────────────────────────────
 async function update(id, input, actor) {
+  logger.info('Update easyfixer · id=' + id);
   const existing = await getById(id);
   if (!existing) {
+    logger.warn('Update easyfixer failed · not found · id=' + id);
     const err = new Error('easyfixer not found');
     err.status = 404;
     throw err;
@@ -569,13 +580,16 @@ async function update(id, input, actor) {
     `UPDATE tbl_easyfixer SET ${sets.join(', ')} WHERE efr_id = ?`,
     values
   );
+  logger.info('Easyfixer updated · id=' + id + ' fields=' + sets.length);
   return getById(id);
 }
 
 // ─── Status toggle ──────────────────────────────────────────────────
 async function setStatus(id, { active, reasonId, comment }, actor) {
+  logger.info('Toggle easyfixer status · id=' + id + ' active=' + active + ' reasonId=' + (reasonId || ''));
   const existing = await getById(id);
   if (!existing) {
+    logger.warn('Toggle easyfixer status failed · not found · id=' + id);
     const err = new Error('easyfixer not found');
     err.status = 404;
     throw err;
@@ -597,6 +611,7 @@ async function setStatus(id, { active, reasonId, comment }, actor) {
     `UPDATE tbl_easyfixer SET ${sets.join(', ')} WHERE efr_id = ?`,
     values
   );
+  logger.info('Easyfixer status updated · id=' + id + ' active=' + active);
   return getById(id);
 }
 
@@ -619,6 +634,7 @@ async function setStatus(id, { active, reasonId, comment }, actor) {
 //   - Order by `TJT.transaction_id DESC` assumes that column exists; if
 //     not, the underlying error surfaces clearly.
 async function listTransactions(efrId, { limit = 10, offset = 0 } = {}) {
+  logger.info('List easyfixer transactions · efrId=' + efrId + ' limit=' + limit + ' offset=' + offset);
   const [[{ total }]] = await pool.query(
     `SELECT COUNT(*) AS total
        FROM tbl_job_transaction TJT
@@ -653,6 +669,7 @@ async function listTransactions(efrId, { limit = 10, offset = 0 } = {}) {
       LIMIT ? OFFSET ?`,
     [efrId, Number(limit), Number(offset)],
   );
+  logger.info('Returning ' + rows.length + ' transactions · total=' + total);
   return { rows, total };
 }
 
@@ -663,6 +680,7 @@ async function listTransactions(efrId, { limit = 10, offset = 0 } = {}) {
 // to tbl_easyfixer.efr_id (NOT efr_id — verified in client-tech-mapping
 // service comments).
 async function listMappedClients(efrId, { limit = 50, offset = 0 } = {}) {
+  logger.info('List mapped clients for easyfixer · efrId=' + efrId + ' limit=' + limit + ' offset=' + offset);
   const [[{ total }]] = await pool.query(
     `SELECT COUNT(*) AS total
        FROM tbl_client_easyfixer_mapping m
@@ -685,6 +703,7 @@ async function listMappedClients(efrId, { limit = 50, offset = 0 } = {}) {
       LIMIT ? OFFSET ?`,
     [efrId, Number(limit), Number(offset)],
   );
+  logger.info('Returning ' + rows.length + ' mapped clients · total=' + total);
   return { rows, total };
 }
 
@@ -702,6 +721,7 @@ async function listMappedClients(efrId, { limit = 50, offset = 0 } = {}) {
 // stores the CSV directly in a `pincodes` TEXT column (one row per efr) —
 // no GROUP_CONCAT needed; a simple LEFT JOIN suffices.
 async function aggregates(efrIds, { scope } = {}) {
+  logger.info('Compute easyfixer aggregates · requested=' + (Array.isArray(efrIds) ? efrIds.length : 0));
   if (!Array.isArray(efrIds) || efrIds.length === 0) return { rows: [] };
   // Cap + sanitise: integers, positive, dedupe, max 1000.
   const ids = Array.from(new Set(
@@ -806,6 +826,7 @@ async function aggregates(efrIds, { scope } = {}) {
     [...ids, ...ids, ...ids, ...ids, ...ids, ...scopeParams],
   );
 
+  logger.info('Returning aggregates for ' + rows.length + ' easyfixers');
   return { rows };
 }
 
@@ -814,6 +835,7 @@ async function aggregates(efrIds, { scope } = {}) {
 // Returns today's attendance row per requested easyfixer (if any).
 // Missing rows mean "no information" — FE should treat absence accordingly.
 async function attendance(efrIds, { scope } = {}) {
+  logger.info("Fetch today's attendance · requested=" + (Array.isArray(efrIds) ? efrIds.length : 0));
   if (!Array.isArray(efrIds) || efrIds.length === 0) return { rows: [] };
   const ids = Array.from(new Set(
     efrIds.slice(0, 1000).map(Number).filter((n) => Number.isInteger(n) && n > 0)
@@ -852,6 +874,7 @@ async function attendance(efrIds, { scope } = {}) {
     [...ids, ...scopeParams],
   );
 
+  logger.info('Returning attendance for ' + rows.length + ' easyfixers');
   return { rows };
 }
 
@@ -877,6 +900,7 @@ async function attendance(efrIds, { scope } = {}) {
  * uses; out-of-scope rows contribute zero.
  */
 async function statusCounts({ scope } = {}) {
+  logger.info('Compute easyfixer status counts');
   const clauses = [];
   const params = [];
 
@@ -923,6 +947,7 @@ async function statusCounts({ scope } = {}) {
       ${where}
   `, params);
 
+  logger.info('Status counts ready · total=' + (Number(row.total) || 0));
   return {
     active:          Number(row.active)          || 0,
     inactive:        Number(row.inactive)        || 0,
@@ -1082,6 +1107,7 @@ function buildRegisteredWhere(f = {}, scope) {
 }
 
 async function listRegistered(f = {}, scope) {
+  logger.info('List registered easyfixers · registrationStatus=' + (f.registrationStatus || '') + ' q=' + (f.q || '') + ' limit=' + (f.limit || 20) + ' offset=' + (f.offset || 0));
   const { where, params } = buildRegisteredWhere(f, scope);
   const sortCol = REGISTERED_SORTS[f.sortBy] || 'U.insert_date';
   const sortDir = String(f.sortDir).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
@@ -1136,11 +1162,13 @@ async function listRegistered(f = {}, scope) {
     registration_status_label: registrationStatusLabel(r),
     early_activation_eligible: earlyActivationEligible(r),
   }));
+  logger.info('Returning ' + items.length + ' registered easyfixers · total=' + (Number(total) || 0));
   return { rows: items, total: Number(total) || 0 };
 }
 
 // Full (filtered) export set, no pagination — caller streams to xlsx.
 async function listRegisteredForExport(f = {}, scope, cap = 10000) {
+  logger.info('Export registered easyfixers · cap=' + cap);
   // maxLimit:cap lifts the interactive 500 ceiling so the export streams the
   // full (filtered) set up to the hard cap instead of being clamped to 500.
   const { rows } = await listRegistered({ ...f, limit: cap, maxLimit: cap, offset: 0 }, scope);
@@ -1156,6 +1184,7 @@ async function listRegisteredForExport(f = {}, scope, cap = 10000) {
 //   send_to_finance=6 · activation_pending=7 · not_suitable=8 ·
 //   pending_member_verification=9.
 async function registeredStatusCounts(scope) {
+  logger.info('Compute registered easyfixer status counts');
   const { where, params } = buildRegisteredWhere({}, scope);
   const [[row]] = await pool.query(`
     SELECT
@@ -1171,6 +1200,7 @@ async function registeredStatusCounts(scope) {
     ${REGISTERED_JOINS}
     ${where}
   `, params);
+  logger.info('Registered status counts ready · total=' + (Number(row.total) || 0));
   return {
     new_lead:                    Number(row.new_lead) || 0,
     in_progress:                 Number(row.in_progress) || 0,

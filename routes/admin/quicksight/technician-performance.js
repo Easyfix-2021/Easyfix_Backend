@@ -30,6 +30,7 @@
 const router = require('express').Router();
 const Joi = require('joi');
 
+const logger = require('../../../logger');
 const requireQuickSight = require('../../../middleware/require-quicksight');
 const validate = require('../../../middleware/validate');
 const { modernOk, modernError } = require('../../../utils/response');
@@ -108,6 +109,7 @@ const CATEGORY_XLSX_COLUMNS = decorateColumns(CATEGORY_XLSX_BASE_COLUMNS, [
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
   try {
     const { flag, page, pageSize, format } = req.query;
+    logger.info('Technician Performance list · flag=' + flag + ' page=' + page + ' pageSize=' + pageSize + ' format=' + (format || 'json'));
     const filters = {
       clientId: req.query.clientId,
       zonalManagerId: req.query.zonalManagerId,
@@ -127,6 +129,7 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
         flag, page: 1, pageSize: FULL_SET_PAGE_SIZE, filters,
       });
       const { columns, rows } = service.toXlsx(payload);
+      logger.info('Found ' + rows.length + ' technicians for export');
 
       // Enrich the flat columns with number formats / alignment / data bars via
       // the shared decorateColumns() decorator (first matching rule wins). Keys
@@ -175,14 +178,20 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
         rows,
         emptyMessage: 'No Technicians Found.',
       });
+      logger.info('Streamed Technician Performance xlsx · ' + rows.length + ' technicians · flag=' + flag);
       return;
     }
 
     // JSON branch — paginated page as requested (unchanged contract).
     const payload = await service.getTechnicianPerformance({ flag, page, pageSize, filters });
+    logger.info('Returning Technician Performance · ' + (payload && payload.totalRecords != null ? payload.totalRecords : (payload && payload.data ? payload.data.length : 0)) + ' technicians');
     return modernOk(res, payload);
   } catch (err) {
-    if (err && err.status) return modernError(res, err.status, err.message || 'Request failed');
+    if (err && err.status) {
+      logger.warn('Technician Performance list failed · ' + err.message);
+      return modernError(res, err.status, err.message || 'Request failed');
+    }
+    logger.error('Technician Performance list error · ' + err.message);
     return next(err);
   }
 });
@@ -196,6 +205,7 @@ router.get(
     try {
       const { txId } = req.params;
       const { flag, format } = req.query;
+      logger.info('Technician Performance by category · txId=' + txId + ' flag=' + flag + ' format=' + (format || 'json'));
 
       const payload = await service.getTxPerformanceCategoryWise({ flag, txId });
 
@@ -251,12 +261,18 @@ router.get(
             emptyMessage: 'No Category Data Found.',
           },
         );
+        logger.info('Streamed Technician Performance category xlsx · ' + rows.length + ' rows · txId=' + txId);
         return;
       }
 
+      logger.info('Returning Technician Performance categories · ' + ((payload && payload.performanceData ? payload.performanceData.length : 0)) + ' periods · txId=' + txId);
       return modernOk(res, payload);
     } catch (err) {
-      if (err && err.status) return modernError(res, err.status, err.message || 'Request failed');
+      if (err && err.status) {
+        logger.warn('Technician Performance by category failed · ' + err.message);
+        return modernError(res, err.status, err.message || 'Request failed');
+      }
+      logger.error('Technician Performance by category error · ' + err.message);
       return next(err);
     }
   },

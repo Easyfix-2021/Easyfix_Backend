@@ -10,13 +10,16 @@ const { modernOk, modernError } = require('../../utils/response');
 const { sendXlsx } = require('../../utils/xlsx-export');
 const { STATUS_LABELS } = require('../../services/integration.service');
 const emailService = require('../../services/email.service');
+const logger = require('../../logger');
 
 // ─── Public: SPOC OTP login ─────────────────────────────────────────
 const identifier = Joi.alternatives(Joi.string().email(), Joi.string().pattern(/^[0-9]{10}$/));
 
 router.post('/auth/login-otp', validate(Joi.object({ identifier: identifier.required() })), async (req, res, next) => {
   try {
+    logger.info('SPOC login-OTP requested');
     const r = await clientAuth.createLoginOtp(req.body.identifier);
+    logger.info('SPOC login-OTP result · delivered=' + (r.found ? 'yes' : 'no'));
     // CONTACT_INACTIVE — this specific SPOC row has status=0. Their
     // client admin (or another SPOC at the same client) needs to
     // reactivate them via Profile → Contacts. Distinct from
@@ -37,7 +40,7 @@ router.post('/auth/login-otp', validate(Joi.object({ identifier: identifier.requ
         `No User Found with given loginId: ${req.body.identifier}, please sign up`);
     }
     modernOk(res, { delivered: r.found, expiresAt: r.expiresAt || null });
-  } catch (e) { next(e); }
+  } catch (e) { logger.error('SPOC login-OTP failed · ' + e.message); next(e); }
 });
 
 router.post('/auth/verify-otp', validate(Joi.object({
@@ -45,6 +48,7 @@ router.post('/auth/verify-otp', validate(Joi.object({
   otp: Joi.number().integer().min(1000).max(9999).required(),
 })), async (req, res, next) => {
   try {
+    logger.info('SPOC verify-OTP attempt');
     const r = await clientAuth.verifyLoginOtp(req.body.identifier, req.body.otp);
     if (!r.ok) {
       // Same friendly mapping as send-otp so the message stays
@@ -57,13 +61,15 @@ router.post('/auth/verify-otp', validate(Joi.object({
         return modernError(res, 403,
           'Your client account is inactive. Please contact EasyFix support to reactivate it.');
       }
+      logger.warn('SPOC verify-OTP rejected · ' + r.reason);
       return modernError(res, 401, r.reason);
     }
+    logger.info('SPOC verify-OTP ok · spocId=' + r.spoc.id + ' clientId=' + r.spoc.client_id);
     // Cookie name matches the frontend localStorage key (`client_auth_token`)
     // so future refresh/CSRF flows can read either source consistently.
     res.cookie('client_auth_token', r.token, { httpOnly: true, sameSite: 'lax', maxAge: 30 * 86400 * 1000 });
     modernOk(res, { token: r.token, spoc: { id: r.spoc.id, name: r.spoc.contact_name, client_id: r.spoc.client_id } });
-  } catch (e) { next(e); }
+  } catch (e) { logger.error('SPOC verify-OTP failed · ' + e.message); next(e); }
 });
 
 // ─── Protected ──────────────────────────────────────────────────────
@@ -117,10 +123,12 @@ router.get('/me', async (req, res, next) => {
  */
 router.get('/me/custom-properties', async (req, res, next) => {
   try {
+    logger.info('Fetch client custom-properties · clientId=' + req.spoc.client_id);
     const [rows] = await pool.query(
       'SELECT * FROM tbl_client_custom_properties WHERE client_id = ?',
       [req.spoc.client_id]
     );
+    logger.info('Found ' + rows.length + ' custom-property rows');
     const truthy = (v) => {
       if (v == null) return false;
       if (typeof v === 'boolean') return v;
@@ -133,6 +141,7 @@ router.get('/me/custom-properties', async (req, res, next) => {
       label: r.property_label ?? r.label ?? r.display_name ?? r.property_name ?? null,
       mandatory: truthy(r.is_mandatory ?? r.mandatory ?? r.required ?? r.is_required ?? r.is_required_field),
     })).filter((p) => p.name);
+    logger.info('Returning ' + items.length + ' custom-properties');
     modernOk(res, { items });
   } catch (e) { next(e); }
 });
@@ -269,12 +278,14 @@ router.patch('/notices/read-all', async (req, res, next) => {
  */
 router.get('/lookup/service-categories', async (req, res, next) => {
   try {
+    logger.info('Fetch client service-categories · clientId=' + req.spoc.client_id);
     const lookup = require('../../services/lookup.service');
     const rows = await lookup.serviceCategories({ includeInactive: false });
     const items = rows.map((r) => ({
       id: r.service_catg_id,
       name: r.service_catg_name,
     }));
+    logger.info('Returning ' + items.length + ' service-categories');
     modernOk(res, { items });
   } catch (e) { next(e); }
 });
@@ -422,6 +433,7 @@ router.get('/customers/mobile/:mobile/addresses', async (req, res, next) => {
 
 router.get('/dashboard', async (req, res, next) => {
   try {
+    logger.info('Fetch client dashboard stats · clientId=' + req.spoc.client_id);
     const [[stats]] = await pool.query(`
       SELECT
         SUM(CASE WHEN job_status IN (0,7,9) THEN 1 ELSE 0 END) AS open,
@@ -616,6 +628,7 @@ router.get('/jobs', async (req, res, next) => {
   try {
     const ticketFlag = req.query.ticketFlag || req.query.flag || undefined;
     let ownerIds = req.query.ownerIds || req.query.owner || undefined;
+    logger.info('List client jobs · status=' + (req.query.status ?? 'all') + ' q=' + (req.query.q || '-') + ' limit=' + (Math.min(Number(req.query.limit) || 50, 500)) + ' offset=' + (Number(req.query.offset) || 0));
 
     // ─── Legacy "my team's tickets" scoping ─────────────────────────
     // ClientController.java lines 101-111: when on a My-New-Tickets-
@@ -679,6 +692,7 @@ router.get('/jobs', async (req, res, next) => {
       limit: Math.min(Number(req.query.limit) || 50, 500),
       offset: Number(req.query.offset) || 0,
     });
+    logger.info('Returning ' + rows.length + ' jobs (total=' + total + ')');
     modernOk(res, { items: rows, total });
   } catch (e) { next(e); }
 });
@@ -1427,8 +1441,12 @@ router.use('/jobs', require('./jobs-upload'));
 
 router.get('/jobs/:id', async (req, res, next) => {
   try {
+    logger.info('Fetch client job · id=' + req.params.id);
     const job = await jobService.getById(Number(req.params.id));
-    if (!job || job.fk_client_id !== req.spoc.client_id) return modernError(res, 404, 'job not found');
+    if (!job || job.fk_client_id !== req.spoc.client_id) {
+      logger.warn('Client job not found / not owned · id=' + req.params.id);
+      return modernError(res, 404, 'job not found');
+    }
     modernOk(res, job);
   } catch (e) { next(e); }
 });
@@ -1529,8 +1547,12 @@ router.get('/jobs/:id/images/:imageId', async (req, res, next) => {
 // Un-Authorized tab after approval. See JobFilterServiceImpl.java:192.
 router.patch('/jobs/:id/approve', async (req, res, next) => {
   try {
+    logger.info('SPOC approve job · id=' + req.params.id);
     const job = await jobService.getById(Number(req.params.id));
-    if (!job || job.fk_client_id !== req.spoc.client_id) return modernError(res, 404, 'job not found');
+    if (!job || job.fk_client_id !== req.spoc.client_id) {
+      logger.warn('Approve target not found / not owned · id=' + req.params.id);
+      return modernError(res, 404, 'job not found');
+    }
     await pool.query(
       `UPDATE tbl_job
           SET approved_by_client = 1,
@@ -1538,14 +1560,19 @@ router.patch('/jobs/:id/approve', async (req, res, next) => {
               approved_on_date_time = NOW()
         WHERE job_id = ?`,
       [req.spoc.id, job.job_id]);
+    logger.info('Job approved by client · id=' + job.job_id);
     modernOk(res, await jobService.getById(job.job_id), 'approved');
   } catch (e) { next(e); }
 });
 
 router.patch('/jobs/:id/reject', validate(Joi.object({ reason: Joi.string().min(3).max(500).required() })), async (req, res, next) => {
   try {
+    logger.info('SPOC reject job · id=' + req.params.id);
     const job = await jobService.getById(Number(req.params.id));
-    if (!job || job.fk_client_id !== req.spoc.client_id) return modernError(res, 404, 'job not found');
+    if (!job || job.fk_client_id !== req.spoc.client_id) {
+      logger.warn('Reject target not found / not owned · id=' + req.params.id);
+      return modernError(res, 404, 'job not found');
+    }
     await pool.query(
       'UPDATE tbl_job SET approval_reject_reason = ?, approval_reject_date_time = NOW() WHERE job_id = ?',
       [req.body.reason, job.job_id]);
@@ -1553,6 +1580,7 @@ router.patch('/jobs/:id/reject', validate(Joi.object({ reason: Joi.string().min(
     // sendemailClitoClientUrgentRequest replacement). Non-blocking —
     // failure here must not block the API response.
     fireRejectEscalation(job, req.body.reason, req.spoc).catch(() => {});
+    logger.info('Job rejected by client · id=' + job.job_id);
     modernOk(res, await jobService.getById(job.job_id), 'rejected');
   } catch (e) { next(e); }
 });
@@ -1638,33 +1666,57 @@ router.post('/jobs/:id/cancel',
 // estimates already responded to. Mirrors legacy idempotency guards.
 router.patch('/jobs/:id/estimate/approve', async (req, res, next) => {
   try {
+    logger.info('SPOC approve estimate · id=' + req.params.id);
     const job = await jobService.getById(Number(req.params.id));
-    if (!job || job.fk_client_id !== req.spoc.client_id) return modernError(res, 404, 'job not found');
+    if (!job || job.fk_client_id !== req.spoc.client_id) {
+      logger.warn('Estimate-approve target not found / not owned · id=' + req.params.id);
+      return modernError(res, 404, 'job not found');
+    }
     if ([3, 5, 6].includes(job.job_status)) {
+      logger.warn('Estimate-approve blocked · id=' + job.job_id + ' status=' + job.job_status);
       return modernError(res, 409, `cannot approve estimate on a ${job.job_status === 6 ? 'cancelled' : 'completed'} job`);
     }
-    if (job.approved_on_date_time) return modernError(res, 409, 'estimate already approved');
-    if (job.approval_reject_date_time) return modernError(res, 409, 'estimate already rejected; cannot approve');
+    if (job.approved_on_date_time) {
+      logger.warn('Estimate-approve blocked · already approved · id=' + job.job_id);
+      return modernError(res, 409, 'estimate already approved');
+    }
+    if (job.approval_reject_date_time) {
+      logger.warn('Estimate-approve blocked · already rejected · id=' + job.job_id);
+      return modernError(res, 409, 'estimate already rejected; cannot approve');
+    }
     await pool.query(
       'UPDATE tbl_job SET approved_by_client_contact = ?, approved_on_date_time = NOW() WHERE job_id = ?',
       [req.spoc.id, job.job_id]);
+    logger.info('Estimate approved · id=' + job.job_id);
     modernOk(res, { approved: true });
   } catch (e) { next(e); }
 });
 
 router.patch('/jobs/:id/estimate/reject', validate(Joi.object({ reason: Joi.string().min(3).max(500).required() })), async (req, res, next) => {
   try {
+    logger.info('SPOC reject estimate · id=' + req.params.id);
     const job = await jobService.getById(Number(req.params.id));
-    if (!job || job.fk_client_id !== req.spoc.client_id) return modernError(res, 404, 'job not found');
+    if (!job || job.fk_client_id !== req.spoc.client_id) {
+      logger.warn('Estimate-reject target not found / not owned · id=' + req.params.id);
+      return modernError(res, 404, 'job not found');
+    }
     if ([3, 5, 6].includes(job.job_status)) {
+      logger.warn('Estimate-reject blocked · id=' + job.job_id + ' status=' + job.job_status);
       return modernError(res, 409, `cannot reject estimate on a ${job.job_status === 6 ? 'cancelled' : 'completed'} job`);
     }
-    if (job.approved_on_date_time) return modernError(res, 409, 'estimate already approved; cannot reject');
-    if (job.approval_reject_date_time) return modernError(res, 409, 'estimate already rejected');
+    if (job.approved_on_date_time) {
+      logger.warn('Estimate-reject blocked · already approved · id=' + job.job_id);
+      return modernError(res, 409, 'estimate already approved; cannot reject');
+    }
+    if (job.approval_reject_date_time) {
+      logger.warn('Estimate-reject blocked · already rejected · id=' + job.job_id);
+      return modernError(res, 409, 'estimate already rejected');
+    }
     await pool.query(
       'UPDATE tbl_job SET approval_reject_reason = ?, approval_reject_date_time = NOW() WHERE job_id = ?',
       [req.body.reason, job.job_id]);
     fireRejectEscalation(job, req.body.reason, req.spoc).catch(() => {});
+    logger.info('Estimate rejected · id=' + job.job_id);
     modernOk(res, { rejected: true });
   } catch (e) { next(e); }
 });
@@ -1690,6 +1742,7 @@ async function fireRejectEscalation(job, reason, spoc) {
     + `Customer: ${job.customer_name || ''} (${job.customer_mob_no || ''})\n\n`
     + `Reason given: ${reason}\n\n`
     + `Please follow up.`;
+  logger.info('Sending reject-escalation email · jobId=' + job.job_id + ' recipients=' + to.length);
   return emailService.send({ to, subject, text, category: 'client.reject' });
 }
 
@@ -1825,6 +1878,7 @@ const STATUS_LABELS_SAFE = {
 // Create job as SPOC (reuses internal service; fk_client_id locked to SPOC's client)
 router.post('/jobs', async (req, res, next) => {
   try {
+    logger.info('SPOC create job · clientId=' + req.spoc.client_id + ' type=' + (req.body?.job_type || '-'));
     // Pull the SPOC's full row so we can stamp client_spoc_* / mobile
     // / reporting_contact_id on the new job WITHOUT trusting the
     // frontend to send them. These columns identify "which client
@@ -1849,10 +1903,14 @@ router.post('/jobs', async (req, res, next) => {
     };
 
     const created = await jobService.create(enriched, { user_id: null });
+    logger.info('Job created · id=' + created.job_id);
     res.status(201);
     modernOk(res, created, 'job created');
   } catch (e) {
-    if (e.status) return modernError(res, e.status, e.message);
+    if (e.status) {
+      logger.warn('SPOC create job rejected · ' + e.message);
+      return modernError(res, e.status, e.message);
+    }
     next(e);
   }
 });
@@ -1866,6 +1924,7 @@ router.post('/jobs', async (req, res, next) => {
  */
 router.get('/profile', async (req, res, next) => {
   try {
+    logger.info('Fetch SPOC profile · spocId=' + req.spoc.id);
     const [[row]] = await pool.query(
       `SELECT id, contact_name, contact_email, contact_no,
               contact_alt_no, contact_desgn, linkedIn_profile,
@@ -1929,6 +1988,7 @@ router.get('/profile', async (req, res, next) => {
  */
 router.put('/profile', async (req, res, next) => {
   try {
+    logger.info('Update SPOC profile · spocId=' + req.spoc.id);
     const {
       contact_name, contact_alt_no, contact_desgn, linkedIn_profile,
       manager_id, email_cc, payment_mode, approval_by_client,
@@ -1981,6 +2041,7 @@ router.put('/profile', async (req, res, next) => {
       [contact_name, contact_alt_no, contact_desgn, linkedIn_profile,
        mgrIdStr, email_cc, payment_mode, approval_by_client,
        req.spoc.id]);
+    logger.info('SPOC profile updated · spocId=' + req.spoc.id);
     modernOk(res, { updated: true });
   } catch (e) { next(e); }
 });
@@ -2237,10 +2298,12 @@ router.post('/profile/change-email/verify-otp', async (req, res, next) => {
 
 router.get('/contacts/managers', async (req, res, next) => {
   try {
+    logger.info('List client contact-managers · clientId=' + req.spoc.client_id);
     const [rows] = await pool.query(
       `SELECT id, contact_name, contact_email, contact_no
          FROM tbl_client_contacts WHERE client_id = ? AND status = 1 ORDER BY contact_name`,
       [req.spoc.client_id]);
+    logger.info('Returning ' + rows.length + ' contact-managers');
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
@@ -2268,6 +2331,7 @@ router.get('/contacts/managers', async (req, res, next) => {
  */
 router.get('/export/jobs', async (req, res, next) => {
   try {
+    logger.info('Export client jobs to xlsx · status=' + (req.query.status ?? 'all') + ' from=' + (req.query.startDate || '-') + ' to=' + (req.query.endDate || '-'));
     const rows = await jobService.listForExport({
       clientId: req.spoc.client_id,
       status: req.query.status != null ? Number(req.query.status) : undefined,
@@ -2297,6 +2361,7 @@ router.get('/export/jobs', async (req, res, next) => {
         'No data matches the selected filters. Adjust the date range or filters and try again.');
     }
 
+    logger.info('Exporting ' + rows.length + ' jobs to xlsx');
     // Legacy stored job_status as a raw int; the spreadsheet showed the
     // human label. Convert here using the shared STATUS_LABELS map.
     const data = rows.map((r) => ({
@@ -2369,8 +2434,12 @@ router.get('/export/jobs', async (req, res, next) => {
 router.get('/jobs/:id/estimate-preview', async (req, res, next) => {
   try {
     const jobId = Number(req.params.id);
+    logger.info('Build estimate-preview · jobId=' + jobId);
     const job = await jobService.getById(jobId);
-    if (!job || job.fk_client_id !== req.spoc.client_id) return modernError(res, 404, 'job not found');
+    if (!job || job.fk_client_id !== req.spoc.client_id) {
+      logger.warn('Estimate-preview target not found / not owned · id=' + req.params.id);
+      return modernError(res, 404, 'job not found');
+    }
 
     const [services] = await pool.query(
       `SELECT js.job_service_id, js.job_id, js.service_id,
@@ -2386,6 +2455,7 @@ router.get('/jobs/:id/estimate-preview', async (req, res, next) => {
         ORDER BY js.job_service_id ASC`,
       [jobId]
     );
+    logger.info('Found ' + services.length + ' approval-pending services');
 
     // Legacy formula: per-row total = (total_charge × quantity) + material_charge
     const lines = services.map((s) => {

@@ -32,6 +32,7 @@
 const router = require('express').Router();
 const Joi = require('joi');
 
+const logger = require('../../../logger');
 const requireQuickSight = require('../../../middleware/require-quicksight');
 const validate = require('../../../middleware/validate');
 const { modernOk, modernError } = require('../../../utils/response');
@@ -138,8 +139,10 @@ const txCountQuery = Joi.object({
 // ── GET / — primary report list (paginated) + ?format=xlsx export ────────
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
   try {
+    logger.info('Supply Gap list · page=' + req.query.page + ' pageSize=' + req.query.pageSize + ' supplyStatus=' + req.query.supplyStatus + ' format=' + (req.query.format || 'json'));
     if (req.query.format === 'xlsx') {
       const rows = await service.exportRows(req.query);
+      logger.info('Found ' + rows.length + ' supply requests to export');
       const cities = new Set(
         rows.map((r) => (r.city != null ? String(r.city).trim() : '')).filter(Boolean),
       );
@@ -154,12 +157,18 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
         totalRow: buildTotalRow(rows),
         emptyMessage: 'No Supply Gap Data Found.',
       });
+      logger.info('Streamed Supply Gap xlsx · ' + rows.length + ' supply requests');
       return;
     }
     const result = await service.list(req.query);
+    logger.info('Returning Supply Gap list · ' + (result && result.totalRecords != null ? result.totalRecords : (result && result.data ? result.data.length : 0)) + ' supply requests');
     return modernOk(res, result);
   } catch (err) {
-    if (err && err.status) return modernError(res, err.status, err.message);
+    if (err && err.status) {
+      logger.warn('Supply Gap list failed · ' + err.message);
+      return modernError(res, err.status, err.message);
+    }
+    logger.error('Supply Gap list error · ' + err.message);
     return next(err);
   }
 });
@@ -168,10 +177,15 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
 //    static "job" segment isn't captured by the :id param) ──────────────
 router.get('/job/:jobId', validate(jobIdParam, 'params'), async (req, res, next) => {
   try {
+    logger.info('Supply Gap job detail · jobId=' + req.params.jobId);
     const data = await service.jobDetail(Number(req.params.jobId));
     return modernOk(res, data);
   } catch (err) {
-    if (err && err.status) return modernError(res, err.status, err.message);
+    if (err && err.status) {
+      logger.warn('Supply Gap job detail failed · ' + err.message);
+      return modernError(res, err.status, err.message);
+    }
+    logger.error('Supply Gap job detail error · ' + err.message);
     return next(err);
   }
 });
@@ -179,10 +193,15 @@ router.get('/job/:jobId', validate(jobIdParam, 'params'), async (req, res, next)
 // ── GET /tx-status?mobileNo= — live TX status label ──────────────────────
 router.get('/tx-status', validate(txStatusQuery, 'query'), async (req, res, next) => {
   try {
+    logger.info('Supply Gap TX status lookup by mobile');
     const data = await service.txStatus(req.query.mobileNo);
     return modernOk(res, data);
   } catch (err) {
-    if (err && err.status) return modernError(res, err.status, err.message);
+    if (err && err.status) {
+      logger.warn('Supply Gap TX status failed · ' + err.message);
+      return modernError(res, err.status, err.message);
+    }
+    logger.error('Supply Gap TX status error · ' + err.message);
     return next(err);
   }
 });
@@ -190,10 +209,15 @@ router.get('/tx-status', validate(txStatusQuery, 'query'), async (req, res, next
 // ── GET /tx-count?cityId=&catgId= — active TX count for a city+category ───
 router.get('/tx-count', validate(txCountQuery, 'query'), async (req, res, next) => {
   try {
+    logger.info('Supply Gap TX count · cityId=' + req.query.cityId + ' catgId=' + req.query.catgId);
     const data = await service.txCount(Number(req.query.cityId), Number(req.query.catgId));
     return modernOk(res, data);
   } catch (err) {
-    if (err && err.status) return modernError(res, err.status, err.message);
+    if (err && err.status) {
+      logger.warn('Supply Gap TX count failed · ' + err.message);
+      return modernError(res, err.status, err.message);
+    }
+    logger.error('Supply Gap TX count error · ' + err.message);
     return next(err);
   }
 });
@@ -201,10 +225,15 @@ router.get('/tx-count', validate(txCountQuery, 'query'), async (req, res, next) 
 // ── GET /tx/:efrId?catgId= — "Add Existing Technician" eligibility ───────
 router.get('/tx/:efrId', validate(txParam, 'params'), validate(txQuery, 'query'), async (req, res, next) => {
   try {
+    logger.info('Supply Gap TX eligibility · efrId=' + req.params.efrId + ' catgId=' + req.query.catgId);
     const data = await service.txDetails(Number(req.params.efrId), Number(req.query.catgId));
     return modernOk(res, data);
   } catch (err) {
-    if (err && err.status) return modernError(res, err.status, err.message);
+    if (err && err.status) {
+      logger.warn('Supply Gap TX eligibility failed · ' + err.message);
+      return modernError(res, err.status, err.message);
+    }
+    logger.error('Supply Gap TX eligibility error · ' + err.message);
     return next(err);
   }
 });
@@ -212,10 +241,15 @@ router.get('/tx/:efrId', validate(txParam, 'params'), validate(txQuery, 'query')
 // ── GET /:id/allocations — "Added Tx :N" popup ───────────────────────────
 router.get('/:id/allocations', validate(idParam, 'params'), async (req, res, next) => {
   try {
+    logger.info('Supply Gap allocations · id=' + req.params.id);
     const data = await service.allocations(Number(req.params.id));
     return modernOk(res, data);
   } catch (err) {
-    if (err && err.status) return modernError(res, err.status, err.message);
+    if (err && err.status) {
+      logger.warn('Supply Gap allocations failed · ' + err.message);
+      return modernError(res, err.status, err.message);
+    }
+    logger.error('Supply Gap allocations error · ' + err.message);
     return next(err);
   }
 });
@@ -223,10 +257,15 @@ router.get('/:id/allocations', validate(idParam, 'params'), async (req, res, nex
 // ── GET /:id/history — action/remark timeline ────────────────────────────
 router.get('/:id/history', validate(idParam, 'params'), async (req, res, next) => {
   try {
+    logger.info('Supply Gap history · id=' + req.params.id);
     const data = await service.history(Number(req.params.id));
     return modernOk(res, data);
   } catch (err) {
-    if (err && err.status) return modernError(res, err.status, err.message);
+    if (err && err.status) {
+      logger.warn('Supply Gap history failed · ' + err.message);
+      return modernError(res, err.status, err.message);
+    }
+    logger.error('Supply Gap history error · ' + err.message);
     return next(err);
   }
 });
@@ -234,10 +273,15 @@ router.get('/:id/history', validate(idParam, 'params'), async (req, res, next) =
 // ── GET /:id — row detail (eye-icon modal) ───────────────────────────────
 router.get('/:id', validate(idParam, 'params'), async (req, res, next) => {
   try {
+    logger.info('Supply Gap row detail · id=' + req.params.id);
     const data = await service.detail(Number(req.params.id));
     return modernOk(res, data);
   } catch (err) {
-    if (err && err.status) return modernError(res, err.status, err.message);
+    if (err && err.status) {
+      logger.warn('Supply Gap row detail failed · ' + err.message);
+      return modernError(res, err.status, err.message);
+    }
+    logger.error('Supply Gap row detail error · ' + err.message);
     return next(err);
   }
 });

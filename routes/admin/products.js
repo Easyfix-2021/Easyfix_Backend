@@ -3,6 +3,7 @@ const Joi = require('joi');
 const validate = require('../../middleware/validate');
 const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
+const logger = require('../../logger');
 
 /*
  * Client product catalog CRUD. A "product" is a SKU offered for a
@@ -30,6 +31,7 @@ const { modernOk, modernError } = require('../../utils/response');
 router.get('/', async (req, res, next) => {
   try {
     const serviceId = req.query.serviceId ? Number(req.query.serviceId) : null;
+    logger.info('List products · serviceId=' + serviceId);
     if (!serviceId) return modernError(res, 400, 'serviceId required');
     const [rows] = await pool.query(
       `SELECT p.id, p.name, p.created_on, p.service_id, p.primary_img_id,
@@ -44,6 +46,7 @@ router.get('/', async (req, res, next) => {
         ORDER BY p.id DESC`,
       [serviceId]
     );
+    logger.info('Found ' + rows.length + ' products');
 
     // Eager-load codes per product (avoid N+1)
     const ids = rows.map((r) => r.id);
@@ -65,6 +68,7 @@ router.get('/', async (req, res, next) => {
 
 router.get('/:id', async (req, res, next) => {
   try {
+    logger.info('Get product · id=' + req.params.id);
     const [[p]] = await pool.query(
       `SELECT p.id, p.name, p.created_on, p.service_id, p.primary_img_id,
               st.service_type_name, sc.service_catg_name,
@@ -109,6 +113,7 @@ const createBody = Joi.object({
 router.post('/', validate(createBody), async (req, res, next) => {
   const conn = await pool.getConnection();
   try {
+    logger.info('Create product · service_id=' + req.body.service_id + ' codes=' + req.body.product_codes.length);
     await conn.beginTransaction();
     const [ins] = await conn.query(
       'INSERT INTO product (name, created_on, service_id, primary_img_id) VALUES (?, NOW(), ?, ?)',
@@ -123,9 +128,10 @@ router.post('/', validate(createBody), async (req, res, next) => {
         [productId, imgId]);
     }
     await conn.commit();
+    logger.info('Product created · id=' + productId);
     res.status(201);
     modernOk(res, { id: productId }, 'product created');
-  } catch (e) { await conn.rollback(); next(e); } finally { conn.release(); }
+  } catch (e) { await conn.rollback(); logger.error('Create product failed · ' + e.message); next(e); } finally { conn.release(); }
 });
 
 router.patch('/:id', validate(Joi.object({
@@ -137,6 +143,7 @@ router.patch('/:id', validate(Joi.object({
 }).min(1)), async (req, res, next) => {
   const conn = await pool.getConnection();
   try {
+    logger.info('Update product · id=' + req.params.id + ' fields=' + Object.keys(req.body).join(','));
     await conn.beginTransaction();
     const sets = [], vals = [];
     if (req.body.name)            { sets.push('name = ?');           vals.push(req.body.name); }
@@ -162,8 +169,9 @@ router.patch('/:id', validate(Joi.object({
       }
     }
     await conn.commit();
+    logger.info('Product updated · id=' + req.params.id);
     modernOk(res, { updated: true });
-  } catch (e) { await conn.rollback(); next(e); } finally { conn.release(); }
+  } catch (e) { await conn.rollback(); logger.error('Update product failed · id=' + req.params.id + ' · ' + e.message); next(e); } finally { conn.release(); }
 });
 
 router.delete('/:id', async (req, res, next) => {
@@ -172,14 +180,16 @@ router.delete('/:id', async (req, res, next) => {
   // are FK children with no audit value beyond the parent row.
   const conn = await pool.getConnection();
   try {
+    logger.info('Delete product · id=' + req.params.id);
     await conn.beginTransaction();
     await conn.query('DELETE FROM product_code WHERE product_id = ?', [req.params.id]);
     await conn.query('DELETE FROM product_additional_image WHERE product_id = ?', [req.params.id]);
     const [r] = await conn.query('DELETE FROM product WHERE id = ?', [req.params.id]);
     if (r.affectedRows === 0) { await conn.rollback(); return modernError(res, 404, 'product not found'); }
     await conn.commit();
+    logger.info('Product deleted · id=' + req.params.id);
     modernOk(res, { deleted: true });
-  } catch (e) { await conn.rollback(); next(e); } finally { conn.release(); }
+  } catch (e) { await conn.rollback(); logger.error('Delete product failed · id=' + req.params.id + ' · ' + e.message); next(e); } finally { conn.release(); }
 });
 
 module.exports = router;

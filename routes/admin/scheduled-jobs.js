@@ -63,8 +63,9 @@ router.use(requireAllowedEmail);
 
 router.get('/', async (_req, res, next) => {
   try {
+    logger.info('List scheduled jobs');
     modernOk(res, { jobs: sj.list() });
-  } catch (e) { next(e); }
+  } catch (e) { logger.error('List scheduled jobs failed · ' + e.message); next(e); }
 });
 
 router.post('/:id/trigger', validate(idParam, 'params'), async (req, res, next) => {
@@ -73,10 +74,16 @@ router.post('/:id/trigger', validate(idParam, 'params'), async (req, res, next) 
       { userId: req.user?.user_id, jobId: req.params.id },
       'scheduled-jobs manual trigger',
     );
+    logger.info('Trigger scheduled job · id=' + req.params.id);
     const result = await sj.trigger(req.params.id);
+    logger.info('Scheduled job triggered · id=' + req.params.id);
     modernOk(res, { id: req.params.id, result }, 'job triggered');
   } catch (e) {
-    if (e && e.status === 404) return modernError(res, 404, e.message);
+    if (e && e.status === 404) {
+      logger.warn('Scheduled job not found · id=' + req.params.id + ' · ' + e.message);
+      return modernError(res, 404, e.message);
+    }
+    logger.error('Trigger scheduled job failed · id=' + req.params.id + ' · ' + e.message);
     next(e);
   }
 });
@@ -111,16 +118,22 @@ router.post(
         },
         'scheduled-jobs test send',
       );
+      logger.info('Test send scheduled job · id=' + req.params.id + ' · sourceId=' + sourceId);
       const result = await sj.test(req.params.id, {
         mobile: String(req.body.mobile).trim(),
         sourceId,
       });
+      logger.info('Scheduled job test sent · id=' + req.params.id);
       modernOk(res, { id: req.params.id, result }, 'test sent');
     } catch (e) {
       // Service-layer errors carry status + code; surface them as-is so
       // the FE can show e.g. "No easyfixer found with id 1234" inline
       // rather than a generic 500.
-      if (e && e.status) return modernError(res, e.status, e.message);
+      if (e && e.status) {
+        logger.warn('Scheduled job test send rejected · id=' + req.params.id + ' · status=' + e.status + ' · ' + e.message);
+        return modernError(res, e.status, e.message);
+      }
+      logger.error('Scheduled job test send failed · id=' + req.params.id + ' · ' + e.message);
       next(e);
     }
   },

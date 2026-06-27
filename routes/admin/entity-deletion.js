@@ -48,10 +48,12 @@ router.post(
   validate(Joi.object({ entityType: entityType.required(), id: intId.required() })),
   async (req, res, next) => {
     try {
+      logger.info('Delete impact check · entityType=' + req.body.entityType + ' id=' + req.body.id);
       const impact = await deletion.getImpact(req.body.entityType, req.body.id);
+      logger.info('Delete impact · id=' + req.body.id + ' eligible=' + impact.eligible);
       return modernOk(res, impact);
     } catch (err) {
-      if (err.status) return modernError(res, err.status, err.message);
+      if (err.status) { logger.warn('Delete impact check failed · ' + err.message); return modernError(res, err.status, err.message); }
       return next(err);
     }
   },
@@ -63,21 +65,24 @@ router.post(
   validate(Joi.object({ entityType: entityType.required(), id: intId.required() })),
   async (req, res, next) => {
     try {
+      logger.info('Request delete OTP · entityType=' + req.body.entityType + ' id=' + req.body.id);
       // Re-check eligibility BEFORE sending an OTP — never let an operator OTP
       // their way into deleting an entity with operational history.
       const impact = await deletion.getImpact(req.body.entityType, req.body.id);
       if (!impact.eligible) {
+        logger.warn('Delete OTP refused — record has operational history · id=' + req.body.id);
         return modernError(res, 409,
           'This record has operational history and cannot be deleted — deactivate it instead.',
           impact.blockedBy);
       }
       const { delivered, expiresAt } = await actionOtp.sendActionOtp(req.user, 'delete');
+      logger.info('Delete OTP sent · id=' + req.body.id + ' delivered=' + delivered);
       return modernOk(res, {
         delivered, expiresAt, label: impact.label,
         message: 'An OTP has been sent to your registered mobile.',
       });
     } catch (err) {
-      if (err.status) return modernError(res, err.status, err.message, err.details);
+      if (err.status) { logger.warn('Request delete OTP failed · ' + err.message); return modernError(res, err.status, err.message, err.details); }
       return next(err);
     }
   },
@@ -94,12 +99,14 @@ router.post(
   })),
   async (req, res, next) => {
     try {
+      logger.info('Confirm delete · entityType=' + req.body.entityType + ' id=' + req.body.id);
       const { valid, reason: otpReason } = await actionOtp.verifyActionOtp(req.user, 'delete', req.body.otp);
-      if (!valid) return modernError(res, 401, `OTP verification failed: ${otpReason}`);
+      if (!valid) { logger.warn('Confirm delete — OTP verification failed · id=' + req.body.id + ' · ' + otpReason); return modernError(res, 401, `OTP verification failed: ${otpReason}`); }
 
       const result = await deletion.tombstoneDelete(
         req.body.entityType, req.body.id, req.body.reason, req.user,
       );
+      logger.info(req.body.entityType + ' deleted · id=' + result.id);
 
       // Best-effort notification — the delete is already committed; an email
       // failure must never surface as a delete failure.
@@ -108,7 +115,7 @@ router.post(
 
       return modernOk(res, { ...result, message: 'Record deleted and archived for restore.' });
     } catch (err) {
-      if (err.status) return modernError(res, err.status, err.message, err.details);
+      if (err.status) { logger.warn('Confirm delete failed · id=' + req.body.id + ' · ' + err.message); return modernError(res, err.status, err.message, err.details); }
       return next(err);
     }
   },
@@ -122,7 +129,9 @@ router.get(
       const type = req.query.type === 'easyfixer' || req.query.type === 'user' ? req.query.type : undefined;
       const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
       const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+      logger.info('List deleted records · type=' + (type || 'all') + ' limit=' + limit + ' offset=' + offset);
       const data = await deletion.listDeleted({ type, limit, offset });
+      logger.info('Found ' + (data.items ? data.items.length : 0) + ' deleted records');
       return modernOk(res, { ...data, limit, offset });
     } catch (err) {
       return next(err);
@@ -136,10 +145,12 @@ router.post(
   validate(Joi.object({ archiveId: intId.required() })),
   async (req, res, next) => {
     try {
+      logger.info('Request restore OTP · archiveId=' + req.body.archiveId);
       const { delivered, expiresAt } = await actionOtp.sendActionOtp(req.user, 'restore');
+      logger.info('Restore OTP sent · archiveId=' + req.body.archiveId + ' delivered=' + delivered);
       return modernOk(res, { delivered, expiresAt, message: 'An OTP has been sent to your registered mobile.' });
     } catch (err) {
-      if (err.status) return modernError(res, err.status, err.message);
+      if (err.status) { logger.warn('Request restore OTP failed · ' + err.message); return modernError(res, err.status, err.message); }
       return next(err);
     }
   },
@@ -151,12 +162,14 @@ router.post(
   validate(Joi.object({ archiveId: intId.required(), otp: otp.required() })),
   async (req, res, next) => {
     try {
+      logger.info('Confirm restore · archiveId=' + req.body.archiveId);
       const { valid, reason: otpReason } = await actionOtp.verifyActionOtp(req.user, 'restore', req.body.otp);
-      if (!valid) return modernError(res, 401, `OTP verification failed: ${otpReason}`);
+      if (!valid) { logger.warn('Confirm restore — OTP verification failed · archiveId=' + req.body.archiveId + ' · ' + otpReason); return modernError(res, 401, `OTP verification failed: ${otpReason}`); }
       const result = await deletion.restore(req.body.archiveId, req.user);
+      logger.info((result.entityType || 'record') + ' restored · id=' + result.id);
       return modernOk(res, { ...result, message: 'Record restored on its original id.' });
     } catch (err) {
-      if (err.status) return modernError(res, err.status, err.message, err.details);
+      if (err.status) { logger.warn('Confirm restore failed · archiveId=' + req.body.archiveId + ' · ' + err.message); return modernError(res, err.status, err.message, err.details); }
       return next(err);
     }
   },
@@ -174,6 +187,7 @@ async function sendDeletionNotice(entType, result, reason, admin) {
     logger.warn('deletion-notice: no recipients configured (easyfix_properties deletion.notice.recipient.emails)');
     return;
   }
+  logger.info('Sending deletion notice · entityType=' + entType + ' id=' + result.id + ' recipients=' + recipients.length);
   const label = (entType === 'user' ? 'User' : 'Easyfixer');
   const subject = `EasyFix · ${label} Deleted — ${result.label}`;
   const when = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });

@@ -46,8 +46,10 @@ function page({ ok }) {
 }
 
 router.get('/:token', async (req, res) => {
+  logger.info('Public email-verify landing opened');
   try {
     const result = await emailVerify.verifyToken(req.params.token);
+    logger.info('Email-verify token consumed · ok=' + (!!result.ok));
     res.status(200).send(page({ ok: !!result.ok }));
   } catch (err) {
     // Never leak internals to the browser — render the friendly failure page.

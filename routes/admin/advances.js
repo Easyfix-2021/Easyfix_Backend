@@ -1,5 +1,6 @@
 const router = require('express').Router();
 const Joi = require('joi');
+const logger = require('../../logger');
 const validate = require('../../middleware/validate');
 const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
@@ -22,13 +23,19 @@ async function loadAdvanceForScope(advanceId) {
 async function scopedAdvance(req, res, next) {
   try {
     const row = await loadAdvanceForScope(req.params.id);
-    if (!row) return modernError(res, 404, 'advance not found');
+    if (!row) {
+      logger.warn('Advance scope check · advance not found · id=' + req.params.id);
+      return modernError(res, 404, 'advance not found');
+    }
     const guard = assertEntityInScope(req, {
       client_id: row.client_id,
       city_id: row.city_id,
       vertical_id: row.vertical_id,
     });
-    if (!guard.ok) return modernError(res, 404, 'advance not found');
+    if (!guard.ok) {
+      logger.warn('Advance scope check · advance outside scope · id=' + req.params.id);
+      return modernError(res, 404, 'advance not found');
+    }
     req.scopedAdvance = row;
     return next();
   } catch (e) { next(e); }
@@ -58,6 +65,7 @@ async function scopedAdvance(req, res, next) {
 router.get('/', async (req, res, next) => {
   try {
     const { status, efrId } = req.query;
+    logger.info('Listing advance payments · status=' + (status ?? 'all') + ' efrId=' + (efrId ?? 'any'));
     const clauses = [];
     const params = [];
     // RBAC: scope by client (manage_clients) + city (manage_cities via
@@ -106,6 +114,7 @@ router.get('/', async (req, res, next) => {
         LIMIT ? OFFSET ?`,
       params
     );
+    logger.info('Found ' + rows.length + ' advance payments');
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
@@ -113,6 +122,7 @@ router.get('/', async (req, res, next) => {
 // ─── GET /admin/advances/:id — detail ───────────────────────────────
 router.get('/:id', scopedAdvance, async (req, res, next) => {
   try {
+    logger.info('Fetching advance detail · id=' + req.params.id);
     const [[row]] = await pool.query(
       `SELECT a.*, e.efr_name, e.efr_no, c.client_name
          FROM tbl_efr_advance_payment a
@@ -138,6 +148,7 @@ router.post('/', validate(Joi.object({
 })), async (req, res, next) => {
   try {
     const b = req.body;
+    logger.info('Initiating advance · jobId=' + b.jobId + ' efrId=' + b.efrId + ' advanceAmt=' + b.advanceAmt);
     let clientId = b.clientId;
     if (clientId == null) {
       const [[job]] = await pool.query(
@@ -155,7 +166,10 @@ router.post('/', validate(Joi.object({
       client_id: clientId,
       city_id: efr?.efr_cityId,
     });
-    if (!guard.ok) return modernError(res, 403, 'client or easyfixer outside your scope');
+    if (!guard.ok) {
+      logger.warn('Advance initiate blocked · client or easyfixer outside scope · efrId=' + b.efrId);
+      return modernError(res, 403, 'client or easyfixer outside your scope');
+    }
     const [ins] = await pool.query(
       `INSERT INTO tbl_efr_advance_payment
          (client_id, job_id, efr_id, adv_status,
@@ -175,6 +189,7 @@ router.post('/', validate(Joi.object({
         req.user.user_id,
       ]
     );
+    logger.info('Advance created · id=' + ins.insertId + ' status=0');
     res.status(201);
     modernOk(res, { advanceId: ins.insertId, status: 0 }, 'advance initiated');
   } catch (e) { next(e); }
@@ -186,12 +201,14 @@ router.post('/:id/ops-approve', validate(Joi.object({
 })), scopedAdvance, async (req, res, next) => {
   try {
     const id = Number(req.params.id);
+    logger.info('Ops-approving advance · id=' + id);
     const [[row]] = await pool.query(
       'SELECT adv_status FROM tbl_efr_advance_payment WHERE advance_id = ?',
       [id]
     );
     if (!row) return modernError(res, 404, 'advance not found');
     if (Number(row.adv_status) !== 0) {
+      logger.warn('Ops-approve rejected · advance not pending · id=' + id + ' status=' + row.adv_status);
       return modernError(res, 409, `advance is not pending (current status ${row.adv_status})`);
     }
     const [r] = await pool.query(
@@ -205,7 +222,11 @@ router.post('/:id/ops-approve', validate(Joi.object({
         WHERE advance_id = ? AND adv_status = 0`,
       [req.user.user_id, req.body.remarks || null, req.user.user_id, id]
     );
-    if (r.affectedRows === 0) return modernError(res, 409, 'advance is not pending (state changed concurrently)');
+    if (r.affectedRows === 0) {
+      logger.warn('Ops-approve lost race · advance no longer pending · id=' + id);
+      return modernError(res, 409, 'advance is not pending (state changed concurrently)');
+    }
+    logger.info('Advance updated · id=' + id + ' status=1 (ops approved)');
     modernOk(res, { approvedBy: 'ops', status: 1 });
   } catch (e) { next(e); }
 });
@@ -217,12 +238,14 @@ router.post('/:id/fin-approve', validate(Joi.object({
 })), scopedAdvance, async (req, res, next) => {
   try {
     const id = Number(req.params.id);
+    logger.info('Finance-approving advance · id=' + id);
     const [[row]] = await pool.query(
       'SELECT adv_status FROM tbl_efr_advance_payment WHERE advance_id = ?',
       [id]
     );
     if (!row) return modernError(res, 404, 'advance not found');
     if (Number(row.adv_status) !== 1) {
+      logger.warn('Finance-approve rejected · advance not ops-approved · id=' + id + ' status=' + row.adv_status);
       return modernError(res, 409, `advance is not in ops-approved state (current status ${row.adv_status})`);
     }
     const [r] = await pool.query(
@@ -243,7 +266,11 @@ router.post('/:id/fin-approve', validate(Joi.object({
         id,
       ]
     );
-    if (r.affectedRows === 0) return modernError(res, 409, 'advance is not in ops-approved state (state changed concurrently)');
+    if (r.affectedRows === 0) {
+      logger.warn('Finance-approve lost race · advance no longer ops-approved · id=' + id);
+      return modernError(res, 409, 'advance is not in ops-approved state (state changed concurrently)');
+    }
+    logger.info('Advance updated · id=' + id + ' status=2 (finance approved)');
     modernOk(res, { approvedBy: 'finance', status: 2 });
   } catch (e) { next(e); }
 });
@@ -257,6 +284,7 @@ router.post('/:id/reject', validate(Joi.object({
 })), scopedAdvance, async (req, res, next) => {
   try {
     const id = Number(req.params.id);
+    logger.info('Rejecting advance · id=' + id);
     const [[row]] = await pool.query(
       'SELECT adv_status FROM tbl_efr_advance_payment WHERE advance_id = ?',
       [id]
@@ -264,6 +292,7 @@ router.post('/:id/reject', validate(Joi.object({
     if (!row) return modernError(res, 404, 'advance not found');
     const current = Number(row.adv_status);
     if (current !== 0 && current !== 1) {
+      logger.warn('Reject blocked · advance is terminal · id=' + id + ' status=' + current);
       return modernError(res, 409, `advance cannot be rejected from current status ${current}`);
     }
     const sql = current === 0
@@ -289,7 +318,11 @@ router.post('/:id/reject', validate(Joi.object({
       req.user.user_id,
       id,
     ]);
-    if (r.affectedRows === 0) return modernError(res, 409, 'advance cannot be rejected (state changed concurrently)');
+    if (r.affectedRows === 0) {
+      logger.warn('Reject lost race · advance state changed concurrently · id=' + id);
+      return modernError(res, 409, 'advance cannot be rejected (state changed concurrently)');
+    }
+    logger.info('Advance updated · id=' + id + ' status=3 (rejected by ' + (current === 0 ? 'ops' : 'finance') + ')');
     modernOk(res, { rejected: true, rejectedBy: current === 0 ? 'ops' : 'finance', status: 3 });
   } catch (e) { next(e); }
 });

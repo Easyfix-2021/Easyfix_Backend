@@ -56,6 +56,7 @@ function bodyForStatus(status) {
  * whatever was gathered (possibly []).
  */
 async function resolveTokens(efrId) {
+  logger.info('Resolve registration-push tokens · efr=' + efrId);
   const tokens = new Set();
 
   // 1) Canonical: tbl_easyfixer_app.device_id (one row per technician).
@@ -87,6 +88,7 @@ async function resolveTokens(efrId) {
     logger.warn({ efrId, err: e.message }, 'registration-push: device_info token lookup failed');
   }
 
+  logger.info('Found ' + tokens.size + ' device tokens · efr=' + efrId);
   return Array.from(tokens);
 }
 
@@ -124,6 +126,7 @@ async function pruneDeadToken(efrId, token) {
  */
 async function notifyRegistrationStatusChanged(efrId, opts = {}) {
   try {
+    logger.info('Notify registration status changed · efr=' + efrId + ' · status=' + (opts.status || 'derive'));
     if (!efrId) return { delivered: false, reason: 'no efrId' };
 
     let status = opts.status;

@@ -1,6 +1,7 @@
 const ExcelJS = require('exceljs');
 const XLSX    = require('xlsx');
 const { pool } = require('../db');
+const logger = require('../logger');
 
 /*
  * Bulk upload for spec-aligned Manage Zones.
@@ -23,6 +24,7 @@ const TEMPLATE_PASSWORD = 'easyfix-zones';
 const MAX_DATA_ROWS = 5000;
 
 async function generateTemplate() {
+  logger.info('Generating Manage Zones upload template');
   const wb = new ExcelJS.Workbook();
   wb.creator = 'EasyFix CRM';
   wb.created = new Date();
@@ -34,6 +36,7 @@ async function generateTemplate() {
                   LEFT JOIN tbl_city c ON c.city_id = z.city_id
                  ORDER BY c.city_name, z.zone_name`),
   ]);
+  logger.info('Loaded ' + cities.length + ' cities and ' + zones.length + ' zones for template');
 
   // ── Editable sheet first (default-active tab) ──
   const sheet = wb.addWorksheet('Zone Pincodes');
@@ -130,15 +133,18 @@ async function generateTemplate() {
 
 // ─── Upload parser ───────────────────────────────────────────────────
 async function processUpload(buffer, { dryRun = false, userId = null } = {}) {
+  logger.info('Processing zone bulk upload · dryRun=' + dryRun);
   const wb = XLSX.read(buffer, { type: 'buffer' });
   const sheet = wb.Sheets['Zone Pincodes'] || wb.Sheets[wb.SheetNames[0]];
   if (!sheet) {
+    logger.warn('Zone upload aborted · no "Zone Pincodes" sheet found');
     return {
       summary: { totalRows: 0, createdZones: 0, assignedPincodes: 0, failedCount: 0, skipCount: 0, dryRun },
       results: [{ rowNumber: null, status: 'failed', errors: ['No "Zone Pincodes" sheet found'] }],
     };
   }
   const records = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
+  logger.info('Parsed ' + records.length + ' rows from upload');
 
   const conn = await pool.getConnection();
   try {
@@ -269,6 +275,7 @@ async function processUpload(buffer, { dryRun = false, userId = null } = {}) {
     }
 
     if (dryRun) await conn.rollback(); else await conn.commit();
+    logger.info('Zone upload ' + (dryRun ? 'dry-run' : 'committed') + ' · createdZones=' + createdZones + ' assigned=' + assignedPincodes + ' skipped=' + skipCount + ' failed=' + failedCount);
 
     return {
       summary: {
@@ -283,6 +290,7 @@ async function processUpload(buffer, { dryRun = false, userId = null } = {}) {
     };
   } catch (e) {
     await conn.rollback();
+    logger.error('Zone upload failed · rolled back · ' + e.message);
     throw e;
   } finally {
     conn.release();

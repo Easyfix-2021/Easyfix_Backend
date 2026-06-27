@@ -64,6 +64,7 @@ const RATING_WINDOW_DAYS = 90;
  * Returns a stable shape even if the tech has no history yet.
  */
 async function getForTech(efrId) {
+  logger.info('Get tech performance · efrId=' + efrId);
   if (!efrId) return { ota: 0, sda: 0, grade: 'C', rating: 0 };
 
   const [otaSda, ratingAvg, accept] = await Promise.all([
@@ -81,6 +82,7 @@ async function getForTech(efrId) {
     }),
   ]);
 
+  logger.info('Tech performance computed · efrId=' + efrId + ' ota=' + otaSda.ota + ' sda=' + otaSda.sda + ' sample=' + otaSda.sampleSize);
   return {
     ota:    otaSda.ota,
     sda:    otaSda.sda,
@@ -159,6 +161,7 @@ async function computeAcceptance(efrId) {
   );
   const offered = Number(row?.offered) || 0;
   const declined = Number(row?.declined) || 0;
+  logger.info('Acceptance computed · efrId=' + efrId + ' offered=' + offered + ' declined=' + declined);
   if (offered === 0) return { acceptanceRate: undefined };
   const rate = Math.round(((offered - declined) / offered) * 100);
   return { acceptanceRate: Math.max(0, Math.min(100, rate)) };
@@ -196,6 +199,7 @@ async function computeRating(efrId) {
  * ~50 techs. For a hundred-tech report, pre-aggregate via cron.
  */
 async function getForTechs(efrIds) {
+  logger.info('Get bulk tech performance · count=' + (Array.isArray(efrIds) ? efrIds.length : 0));
   const map = new Map();
   if (!Array.isArray(efrIds) || efrIds.length === 0) return map;
   // Parallel fan-out, capped at 25 concurrent. Small batch keeps the
@@ -206,6 +210,7 @@ async function getForTechs(efrIds) {
     const results = await Promise.all(slice.map((id) => getForTech(id)));
     slice.forEach((id, idx) => map.set(Number(id), results[idx]));
   }
+  logger.info('Returning ' + map.size + ' tech performance records');
   return map;
 }
 

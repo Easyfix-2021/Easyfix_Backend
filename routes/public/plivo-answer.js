@@ -26,10 +26,13 @@ const plivoLog = require('../../services/plivo-call-log.service');
 router.get('/answer', async (req, res) => {
   const xml = (body) => res.type('text/xml').send(body);
 
+  logger.info('Plivo answer callback · CallUUID=' + (req.query.CallUUID || 'none'));
+
   const claims = plivo.verifyCallToken(req.query.t);
   if (!claims) {
     // Invalid / expired token → return a no-op Response so Plivo doesn't choke,
     // but we cannot (and must not) bridge to an unknown destination.
+    logger.warn('Plivo answer: invalid/expired call token · returning empty Response');
     return xml('<?xml version="1.0" encoding="UTF-8"?>\n<Response></Response>');
   }
 
@@ -50,6 +53,7 @@ router.get('/answer', async (req, res) => {
   }
   await plivoLog.markAnswered(claims.jci, req.query.CallUUID || null);
 
+  logger.info('Plivo answer: bridging to customer · jci=' + claims.jci);
   return xml(plivo.buildAnswerXml(claims.dest));
 });
 
@@ -72,6 +76,7 @@ async function webAnswer(req, res) {
   // to To in case a future caller dials the id directly.
   const dialIdKey = Object.keys(src).find((k) => /dialid/i.test(k));
   const dialId = (dialIdKey && src[dialIdKey]) || src.To;
+  logger.info('Plivo web-answer callback · CallUUID=' + (src.CallUUID || 'none'));
   const resolved = plivo.resolveWebDial(dialId);
   if (!resolved) {
     logger.warn({ keys: Object.keys(src) }, 'plivo web-answer: unknown/expired/replayed dialId — hanging up');

@@ -1,6 +1,7 @@
 const router = require('express').Router();
 const multer = require('multer');
 
+const logger   = require('../../logger');
 const validate = require('../../middleware/validate');
 const svc      = require('../../services/notice.service');
 const s3       = require('../../utils/s3-storage');
@@ -52,7 +53,9 @@ router.get(
   validate(noticeListQuery, 'query'),
   async (req, res, next) => {
     try {
+      logger.info('List notices · status=' + (req.query.status || 'all') + ' limit=' + req.query.limit + ' offset=' + req.query.offset);
       const data = await svc.listNotices(req.query);
+      logger.info('Returning ' + (Array.isArray(data?.items) ? data.items.length : (Array.isArray(data) ? data.length : 0)) + ' notices');
       modernOk(res, data);
     } catch (e) { next(e); }
   },
@@ -81,8 +84,12 @@ router.get(
   validate(noticeIdParam, 'params'),
   async (req, res, next) => {
     try {
+      logger.info('Get notice detail · id=' + req.params.noticeId);
       const row = await svc.getNoticeById(Number(req.params.noticeId));
-      if (!row) return modernError(res, 404, 'Notice not found');
+      if (!row) {
+        logger.warn('Notice not found · id=' + req.params.noticeId);
+        return modernError(res, 404, 'Notice not found');
+      }
       modernOk(res, row);
     } catch (e) { next(e); }
   },
@@ -95,11 +102,16 @@ router.post(
   validate(noticeCreate),
   async (req, res, next) => {
     try {
+      logger.info('Create notice · title=' + (req.body?.title ? '"' + String(req.body.title).slice(0, 60) + '"' : 'untitled'));
       const row = await svc.createNotice(req.body, req.user?.user_id);
+      logger.info('Notice created · id=' + (row?.id ?? row?.noticeId));
       res.status(201);
       modernOk(res, row, 'Notice saved');
     } catch (e) {
-      if (e.status) return modernError(res, e.status, e.message);
+      if (e.status) {
+        logger.warn('Notice create rejected · ' + e.message);
+        return modernError(res, e.status, e.message);
+      }
       next(e);
     }
   },
@@ -113,11 +125,19 @@ router.patch(
   validate(noticeUpdate),
   async (req, res, next) => {
     try {
+      logger.info('Update notice · id=' + req.params.noticeId);
       const row = await svc.updateNotice(Number(req.params.noticeId), req.body);
-      if (!row) return modernError(res, 404, 'Notice not found');
+      if (!row) {
+        logger.warn('Notice not found for update · id=' + req.params.noticeId);
+        return modernError(res, 404, 'Notice not found');
+      }
+      logger.info('Notice updated · id=' + req.params.noticeId);
       modernOk(res, row, 'Notice updated');
     } catch (e) {
-      if (e.status) return modernError(res, e.status, e.message);
+      if (e.status) {
+        logger.warn('Notice update rejected · id=' + req.params.noticeId + ' · ' + e.message);
+        return modernError(res, e.status, e.message);
+      }
       next(e);
     }
   },
@@ -131,15 +151,23 @@ router.post(
   validate(noticePublishBody),
   async (req, res, next) => {
     try {
+      logger.info('Publish notice · id=' + req.params.noticeId);
       const row = await svc.publishNotice(
         Number(req.params.noticeId),
         req.body,
         req.user?.user_id,
       );
-      if (!row) return modernError(res, 404, 'Notice not found');
+      if (!row) {
+        logger.warn('Notice not found for publish · id=' + req.params.noticeId);
+        return modernError(res, 404, 'Notice not found');
+      }
+      logger.info('Notice ' + (row.status === 'scheduled' ? 'scheduled' : 'published') + ' · id=' + req.params.noticeId);
       modernOk(res, row, row.status === 'scheduled' ? 'Notice scheduled' : 'Notice published');
     } catch (e) {
-      if (e.status) return modernError(res, e.status, e.message);
+      if (e.status) {
+        logger.warn('Notice publish rejected · id=' + req.params.noticeId + ' · ' + e.message);
+        return modernError(res, e.status, e.message);
+      }
       next(e);
     }
   },
@@ -152,11 +180,19 @@ router.post(
   validate(noticeIdParam, 'params'),
   async (req, res, next) => {
     try {
+      logger.info('Archive notice · id=' + req.params.noticeId);
       const row = await svc.archiveNotice(Number(req.params.noticeId));
-      if (!row) return modernError(res, 404, 'Notice not found');
+      if (!row) {
+        logger.warn('Notice not found for archive · id=' + req.params.noticeId);
+        return modernError(res, 404, 'Notice not found');
+      }
+      logger.info('Notice archived · id=' + req.params.noticeId);
       modernOk(res, row, 'Notice archived');
     } catch (e) {
-      if (e.status) return modernError(res, e.status, e.message);
+      if (e.status) {
+        logger.warn('Notice archive rejected · id=' + req.params.noticeId + ' · ' + e.message);
+        return modernError(res, e.status, e.message);
+      }
       next(e);
     }
   },
@@ -189,8 +225,10 @@ router.post(
   upload.single('file'),
   async (req, res, next) => {
     try {
+      logger.info('Upload notice image · mime=' + (req.file?.mimetype || 'none') + ' size=' + (req.file?.size ?? 0));
       if (!req.file) return modernError(res, 400, 'missing "file" upload');
       if (!IMAGE_MIME.has(req.file.mimetype)) {
+        logger.warn('Notice image rejected · disallowed mime=' + req.file.mimetype);
         return modernError(res, 400, `mimetype "${req.file.mimetype}" is not allowed; use PNG/JPEG/WEBP/GIF`);
       }
       if (s3.isEnabled()) {
@@ -200,6 +238,7 @@ router.post(
           originalName: req.file.originalname,
         });
         const url = await s3.getPresignedUrl(key);
+        logger.info('Notice image stored on S3 · key=' + key);
         return modernOk(res, { key, url }, 'image uploaded');
       }
       // Local fallback — store under the `general` category. The FE
@@ -211,10 +250,17 @@ router.post(
         req.file.originalname,
         req.file.mimetype,
       );
+      logger.info('Notice image stored locally · key=' + result.url);
       return modernOk(res, { key: result.url, url: result.url }, 'image uploaded');
     } catch (e) {
-      if (e.code === 'LIMIT_FILE_SIZE') return modernError(res, 400, 'file exceeds 10MB');
-      if (e.status) return modernError(res, e.status, e.message);
+      if (e.code === 'LIMIT_FILE_SIZE') {
+        logger.warn('Notice image upload failed · file exceeds 10MB');
+        return modernError(res, 400, 'file exceeds 10MB');
+      }
+      if (e.status) {
+        logger.warn('Notice image upload rejected · ' + e.message);
+        return modernError(res, e.status, e.message);
+      }
       next(e);
     }
   },

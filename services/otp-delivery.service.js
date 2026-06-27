@@ -166,6 +166,7 @@ async function tryEmail({ email, otp }) {
 async function deliverOtp({ identifier, email, mobile, name, otp, contextLabel = 'login' }) {
   const identifierIsEmail = /@/.test(String(identifier || ''));
   const attempts = [];
+  logger.info('Deliver OTP · context=' + contextLabel + ' via=' + (identifierIsEmail ? 'email' : 'mobile'));
 
   if (identifierIsEmail) {
     // Primary: Email → Fallback: WhatsApp

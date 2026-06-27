@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const logger = require('../logger');
 
 /*
  * Job Feedback — VERIFIED port of legacy `tbl_customer_feedback`.
@@ -21,6 +22,7 @@ const { pool } = require('../db');
  */
 
 async function getFeedback(jobId) {
+  logger.info('Get job feedback · job_id=' + jobId);
   const [[row]] = await pool.query(
     // VERIFIED 2026-05-12 against live INFORMATION_SCHEMA:
     //   tbl_customer_feedback PK is `feedback_id` (not `id`).
@@ -31,6 +33,7 @@ async function getFeedback(jobId) {
 }
 
 async function upsertFeedback(jobId, { easyfixerRating, easyfixRating, happyWithService }) {
+  logger.info('Upsert job feedback · job_id=' + jobId);
   // Try update first; if no row, insert. One row per job_id by convention.
   const [existing] = await pool.query(
     'SELECT feedback_id FROM tbl_customer_feedback WHERE job_id = ? LIMIT 1',
@@ -52,6 +55,7 @@ async function upsertFeedback(jobId, { easyfixerRating, easyfixRating, happyWith
       [jobId, easyfixerRating ?? null, easyfixRating ?? null, happyWithService ?? null]
     );
   }
+  logger.info('Feedback ' + (existing.length > 0 ? 'updated' : 'created') + ' · job_id=' + jobId);
   return getFeedback(jobId);
 }
 

@@ -24,32 +24,38 @@ async function cities({ stateId, q, limit = 500, includeInactive = false } = {})
   if (q)                { clauses.push('city_name LIKE ?'); params.push(`%${q}%`); }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   params.push(Number(limit));
+  logger.info(`Lookup cities · stateId=${stateId ?? '—'} · q=${q ?? '—'} · limit=${limit} · includeInactive=${includeInactive}`);
   const [rows] = await pool.query(
     `SELECT city_id, city_name, state_id, city_status, tier, district, reference_pincode
        FROM tbl_city ${where}
        ORDER BY city_name ASC LIMIT ?`,
     params
   );
+  logger.info(`Found ${rows.length} cities`);
   return rows;
 }
 
 async function states() {
+  logger.info('Lookup states');
   const [rows] = await pool.query(
     `SELECT state_id, state_code, state_name, country_id
        FROM tbl_state ORDER BY state_name ASC`
   );
+  logger.info(`Found ${rows.length} states`);
   return rows;
 }
 
 // Verticals — drives the Manage Users "Verticals" picker for RBAC
 // scope. Only active rows; the master CRUD lives at /admin/verticals.
 async function verticals() {
+  logger.info('Lookup verticals');
   const [rows] = await pool.query(
     `SELECT vertical_id, vertical_name, vertical_desc, status
        FROM tbl_vertical
       WHERE status = 1
       ORDER BY vertical_name ASC`
   );
+  logger.info(`Found ${rows.length} verticals`);
   return rows;
 }
 
@@ -58,12 +64,14 @@ async function verticals() {
 // from the dropdown. tbl_zone_city_mapping does the actual zone↔city
 // resolution at filter time; this endpoint is purely for the dropdown options.
 async function zones() {
+  logger.info('Lookup zones');
   const [rows] = await pool.query(
     `SELECT zone_id, zone_name
        FROM tbl_zone_master
       WHERE zone_status = 1
       ORDER BY zone_name ASC`
   );
+  logger.info(`Found ${rows.length} zones`);
   return rows;
 }
 
@@ -73,11 +81,13 @@ async function serviceCategories({ includeInactive = false } = {}) {
   // but ALWAYS excludes soft-deleted (status 3) so deleted categories never
   // leak into any dropdown/filter that feeds Service Type pickers.
   const where = includeInactive ? 'WHERE service_catg_status <> 3' : 'WHERE service_catg_status = 1';
+  logger.info(`Lookup service categories · includeInactive=${includeInactive}`);
   const [rows] = await pool.query(
     `SELECT service_catg_id, service_catg_name, service_catg_desc, service_catg_status
        FROM tbl_service_catg ${where}
        ORDER BY service_catg_name ASC`
   );
+  logger.info(`Found ${rows.length} service categories`);
   return rows;
 }
 
@@ -87,6 +97,7 @@ async function serviceTypes({ categoryId, includeInactive = false } = {}) {
   if (!includeInactive) clauses.push('service_type_status = 1');
   if (categoryId != null) { clauses.push('service_catg_id = ?'); params.push(categoryId); }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  logger.info(`Lookup service types · categoryId=${categoryId ?? '—'} · includeInactive=${includeInactive}`);
   const [rows] = await pool.query(
     `SELECT service_type_id, service_type_name, service_type_desc,
             service_type_status, service_catg_id, display
@@ -94,6 +105,7 @@ async function serviceTypes({ categoryId, includeInactive = false } = {}) {
        ORDER BY service_type_name ASC`,
     params
   );
+  logger.info(`Found ${rows.length} service types`);
   return rows;
 }
 
@@ -133,6 +145,7 @@ async function clients({ q, limit = 100, offset = 0, includeInactive = false, sc
   }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   params.push(Number(limit), Number(offset));
+  logger.info(`Lookup clients · q=${q ?? '—'} · limit=${limit} · offset=${offset} · includeInactive=${includeInactive} · scoped=${!!(scope && scope.clients && scope.clients.mode === 'allow' && scope.clients.ids.length > 0)}`);
   const [rows] = await pool.query(
     `SELECT client_id, client_name, client_email, client_status,
             client_city_id, client_type, reference_code,
@@ -141,11 +154,13 @@ async function clients({ q, limit = 100, offset = 0, includeInactive = false, sc
        ORDER BY client_name ASC LIMIT ? OFFSET ?`,
     params
   );
+  logger.info(`Found ${rows.length} clients`);
   return rows;
 }
 
 async function clientServices({ clientId, includeInactive = false }) {
   if (clientId == null) throw Object.assign(new Error('clientId is required'), { status: 400 });
+  logger.info(`Lookup client services · clientId=${clientId} · includeInactive=${includeInactive}`);
   const clauses = ['cs.client_id = ?'];
   const params = [clientId];
   if (!includeInactive) clauses.push('cs.service_status = 1');
@@ -162,11 +177,13 @@ async function clientServices({ clientId, includeInactive = false }) {
       LIMIT 1000`,
     params
   );
+  logger.info(`Found ${rows.length} client services`);
   return rows;
 }
 
 // ─── Users (admin-scoped) ───────────────────────────────────────────
 async function users({ q, roleGroup, limit = 100, offset = 0, includeInactive = false } = {}) {
+  logger.info(`Lookup users · q=${q ?? '—'} · roleGroup=${roleGroup ?? '—'} · limit=${limit} · offset=${offset} · includeInactive=${includeInactive}`);
   const clauses = [];
   const params = [];
   if (!includeInactive) clauses.push('u.user_status = 1');
@@ -193,6 +210,7 @@ async function users({ q, roleGroup, limit = 100, offset = 0, includeInactive = 
       ORDER BY u.user_name ASC LIMIT ? OFFSET ?`,
     params
   );
+  logger.info(`Found ${rows.length} users`);
   return rows;
 }
 
@@ -204,6 +222,7 @@ async function users({ q, roleGroup, limit = 100, offset = 0, includeInactive = 
  * Active users only.
  */
 async function zonalManagers() {
+  logger.info('Lookup zonal managers');
   const [rows] = await pool.query(`
     SELECT DISTINCT u.user_id, u.user_name
       FROM tbl_user u
@@ -211,6 +230,7 @@ async function zonalManagers() {
      WHERE u.user_status = 1
      ORDER BY u.user_name ASC
   `);
+  logger.info(`Found ${rows.length} zonal managers`);
   return rows;
 }
 
@@ -227,6 +247,7 @@ async function zonalManagers() {
  * — do not conflate. When `userType` is omitted, both 1 and 2 are returned.
  */
 async function projectManagers({ userType } = {}) {
+  logger.info(`Lookup project managers · userType=${userType ?? '—'}`);
   const clauses = ['u.user_status = 1'];
   const params = [];
   if (userType != null) {
@@ -243,6 +264,7 @@ async function projectManagers({ userType } = {}) {
       ORDER BY u.user_name ASC`,
     params
   );
+  logger.info(`Found ${rows.length} project managers`);
   return rows;
 }
 
@@ -256,6 +278,7 @@ async function projectManagers({ userType } = {}) {
  * `includeInactive=true` when the operator toggles "Include inactive".
  */
 async function roles({ q, includeInactive = false, group } = {}) {
+  logger.info(`Lookup roles · q=${q ?? '—'} · group=${group ?? '—'} · includeInactive=${includeInactive}`);
   const { ROLE_ID_TO_GROUP } = require('./role.service');
   const clauses = [];
   const params = [];
@@ -282,6 +305,7 @@ async function roles({ q, includeInactive = false, group } = {}) {
       ORDER BY r.role_name ASC`,
     params
   );
+  logger.info(`Found ${rows.length} roles`);
   return rows.map((r) => ({
     ...r,
     role_status: r.role_status === 1 || r.role_status === true ? 1 : 0,
@@ -304,6 +328,7 @@ async function roles({ q, includeInactive = false, group } = {}) {
  * prod), so we return everything and let the frontend filter by menu.
  */
 async function menuActions() {
+  logger.info('Lookup menu actions');
   const [rows] = await pool.query(
     `SELECT ma.id, ma.menu_id, m.menu_name, ma.name, ma.action_name
        FROM menu_action ma
@@ -312,6 +337,7 @@ async function menuActions() {
         AND (ma.delete_status IS NULL OR ma.delete_status = 0)
       ORDER BY m.sequence ASC, m.menu_name ASC, ma.name ASC`
   );
+  logger.info(`Found ${rows.length} menu actions`);
   return rows;
 }
 
@@ -396,6 +422,7 @@ function applyMenuFilter(rows, { userEmail } = {}) {
 })();
 
 async function menus({ userEmail } = {}) {
+  logger.info('Lookup menus');
   // `menu_status` is also returned (even though we filter on it) so the
   // frontend can re-assert the active-only contract defensively — protects
   // the sidebar if a future caller forgets the WHERE clause.
@@ -405,6 +432,7 @@ async function menus({ userEmail } = {}) {
       WHERE menu_status = 1
       ORDER BY COALESCE(sequence, 999) ASC, menu_id ASC`
   );
+  logger.info(`Found ${rows.length} active menus before filter`);
   return applyMenuFilter(rows, { userEmail });
 }
 
@@ -420,6 +448,7 @@ async function menus({ userEmail } = {}) {
  * returns the FILTER itself, not the current user's view of it.
  */
 async function menuVisibility() {
+  logger.info('Lookup menu visibility filter');
   const visible = resolveVisibleMenuIds();
   if (!visible) return { enabled: false, hiddenMenuIds: [], hiddenLegacyUrls: [] };
   const [rows] = await pool.query(
@@ -438,6 +467,7 @@ async function menuVisibility() {
   const hiddenLegacyUrls = hiddenRows
     .map((r) => r.url)
     .filter((u) => u && u !== 'javascript:;');
+  logger.info(`Menu visibility · ${hiddenMenuIds.length} hidden menu id(s) · ${hiddenLegacyUrls.length} hidden legacy url(s)`);
   return { enabled: true, hiddenMenuIds, hiddenLegacyUrls };
 }
 
@@ -448,6 +478,7 @@ async function menuVisibility() {
  * single lookup response. Search by name / mobile / email for typeahead.
  */
 async function easyfixers({ q, limit = 5000, includeInactive = false } = {}) {
+  logger.info(`Lookup easyfixers · q=${q ?? '—'} · limit=${limit} · includeInactive=${includeInactive}`);
   const clauses = [];
   const params = [];
   if (!includeInactive) clauses.push('e.efr_status = 1');
@@ -470,24 +501,29 @@ async function easyfixers({ q, limit = 5000, includeInactive = false } = {}) {
       LIMIT ?`,
     params
   );
+  logger.info(`Found ${rows.length} easyfixers`);
   return rows;
 }
 
 // ─── Small lookups ──────────────────────────────────────────────────
 async function cancelReasons() {
+  logger.info('Lookup cancel reasons');
   const [rows] = await pool.query(
     `SELECT cancel_id AS id, cancel_reason AS reason, status
        FROM tbl_cancel_reason WHERE status = 1
        ORDER BY cancel_reason ASC`
   );
+  logger.info(`Found ${rows.length} cancel reasons`);
   return rows;
 }
 
 async function rescheduleReasons() {
+  logger.info('Lookup reschedule reasons');
   // Actual table is reschedule_reason_app (blueprint's tbl_reschedule_reason doesn't exist).
   const [rows] = await pool.query(
     `SELECT id, reschedule_reason AS reason FROM reschedule_reason_app ORDER BY id ASC`
   );
+  logger.info(`Found ${rows.length} reschedule reasons`);
   return rows;
 }
 
@@ -496,12 +532,14 @@ async function rescheduleReasons() {
 // App reasons are user_type 4; reject = action_type 31 (confirmed against the
 // live table). status=1 + is_new=1 mirror the legacy active filter.
 async function rejectReasons() {
+  logger.info('Lookup reject reasons');
   const [rows] = await pool.query(
     `SELECT id, action_desc AS reason
        FROM action_taken_reason
       WHERE action_type = 31 AND user_type = 4 AND status = 1 AND is_new = 1
       ORDER BY action_desc ASC`
   );
+  logger.info(`Found ${rows.length} reject reasons`);
   return rows;
 }
 
@@ -509,27 +547,34 @@ async function rejectReasons() {
 // status column, so every row is active. FK targets: tbl_job.problem_reason_id,
 // .collect_cash_reason_id, .revisit_reason_id respectively.
 async function problemReasons() {
+  logger.info('Lookup problem reasons');
   const [rows] = await pool.query(
     `SELECT id, reason FROM problem_with_job_reason ORDER BY id ASC`
   );
+  logger.info(`Found ${rows.length} problem reasons`);
   return rows;
 }
 
 async function collectCashReasons() {
+  logger.info('Lookup collect cash reasons');
   const [rows] = await pool.query(
     `SELECT id, reason FROM collect_cash_reason_by_app ORDER BY id ASC`
   );
+  logger.info(`Found ${rows.length} collect cash reasons`);
   return rows;
 }
 
 async function revisitReasons() {
+  logger.info('Lookup revisit reasons');
   const [rows] = await pool.query(
     `SELECT id, reason FROM revisit_reason_by_app ORDER BY id ASC`
   );
+  logger.info(`Found ${rows.length} revisit reasons`);
   return rows;
 }
 
 async function banks({ q } = {}) {
+  logger.info(`Lookup banks · q=${q ?? '—'}`);
   // Actual table is bank_name (blueprint's tbl_bank doesn't exist).
   const clauses = [];
   const params = [];
@@ -539,10 +584,12 @@ async function banks({ q } = {}) {
     `SELECT id, bank_name, is_easyfix_bank FROM bank_name ${where} ORDER BY bank_name ASC`,
     params
   );
+  logger.info(`Found ${rows.length} banks`);
   return rows;
 }
 
 async function documentTypes({ includeInactive = false } = {}) {
+  logger.info(`Lookup document types · includeInactive=${includeInactive}`);
   const where = includeInactive ? '' : 'WHERE document_type_status = 1';
   const [rows] = await pool.query(
     `SELECT document_type_id, document_name, document_mandatory,
@@ -550,6 +597,7 @@ async function documentTypes({ includeInactive = false } = {}) {
        FROM tbl_document_type ${where}
        ORDER BY document_name ASC`
   );
+  logger.info(`Found ${rows.length} document types`);
   return rows;
 }
 

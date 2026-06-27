@@ -133,6 +133,7 @@ async function listRoles({
   limit = 200, offset = 0,
   sortBy = 'role_name', sortDir = 'asc',
 } = {}) {
+  logger.info('List roles · q=' + (q || '') + ' includeInactive=' + includeInactive + ' limit=' + limit + ' offset=' + offset + ' sortBy=' + sortBy + ' sortDir=' + sortDir);
   limit  = Math.min(Math.max(Number(limit)  || 200, 1), 1000);
   offset = Math.max(Number(offset) || 0, 0);
 
@@ -174,15 +175,19 @@ async function listRoles({
     group: ROLE_ID_TO_GROUP[r.role_id] ?? 'unknown',
   }));
 
+  logger.info('Found ' + rows.length + ' roles');
+
   const [[{ total }]] = await pool.query(
     `SELECT COUNT(*) AS total FROM tbl_role r WHERE ${where.join(' AND ')}`,
     params
   );
 
+  logger.info('Returning ' + decorated.length + ' roles · total=' + total);
   return { items: decorated, total };
 }
 
 async function getRoleByIdFull(roleId) {
+  logger.info('Get role detail · roleId=' + roleId);
   const [[row]] = await pool.query(
     `SELECT r.role_id, r.role_name, r.role_desc, r.role_status, r.menu_ids,
             (SELECT COUNT(*) FROM tbl_user u
@@ -203,6 +208,8 @@ async function getRoleByIdFull(roleId) {
       WHERE rma.role_id = ? AND rma.isDeleted = 0`,
     [roleId]
   );
+
+  logger.info('Found ' + actionRows.length + ' action permissions for role · roleId=' + roleId);
 
   return {
     ...row,
@@ -405,6 +412,7 @@ function toMenuIdsCsv(menuIds) {
 }
 
 async function createRole({ role_name, role_desc, menu_ids, menu_action_ids, createdBy }) {
+  logger.info('Create role · name=' + String(role_name || '').trim() + ' menuActionCount=' + (Array.isArray(menu_action_ids) ? menu_action_ids.length : 0));
   const name = String(role_name || '').trim();
   if (!name)         throw mkErr(400, 'role_name is required');
   if (name.length > 100) throw mkErr(400, 'role_name is too long (max 100)');
@@ -443,6 +451,7 @@ async function createRole({ role_name, role_desc, menu_ids, menu_action_ids, cre
       await applyMenuActionIds(conn, r.insertId, menu_action_ids);
     }
     await conn.commit();
+    logger.info('Role created · id=' + r.insertId);
     await refreshCache();
     // New role's actions may not yet be cached for any user, but a future
     // role-reassignment could route an existing user to this role and we
@@ -451,6 +460,7 @@ async function createRole({ role_name, role_desc, menu_ids, menu_action_ids, cre
     invalidatePermissionsCache();
     return getRoleByIdFull(r.insertId);
   } catch (e) {
+    logger.error('Create role failed, rolled back · ' + e.message);
     await conn.rollback();
     throw e;
   } finally {
@@ -459,6 +469,7 @@ async function createRole({ role_name, role_desc, menu_ids, menu_action_ids, cre
 }
 
 async function updateRole(roleId, fields, updatedBy) {
+  logger.info('Update role · roleId=' + roleId + ' fields=' + Object.keys(fields || {}).join(','));
   const [[me]] = await pool.query(
     'SELECT role_id, role_name FROM tbl_role WHERE role_id = ? LIMIT 1',
     [roleId]
@@ -523,7 +534,9 @@ async function updateRole(roleId, fields, updatedBy) {
       await applyMenuActionIds(conn, roleId, fields.menu_action_ids || []);
     }
     await conn.commit();
+    logger.info('Role updated · id=' + roleId);
   } catch (e) {
+    logger.error('Update role failed, rolled back · roleId=' + roleId + ' · ' + e.message);
     await conn.rollback();
     throw e;
   } finally {
@@ -540,6 +553,7 @@ async function updateRole(roleId, fields, updatedBy) {
 }
 
 async function deactivateRole(roleId) {
+  logger.info('Deactivate role · roleId=' + roleId);
   // Guard: don't soft-delete a role that's actively assigned. Forcing the
   // operator to reassign first prevents the ghost-role-on-user-row state.
   const [[row]] = await pool.query(
@@ -549,6 +563,7 @@ async function deactivateRole(roleId) {
     [roleId]
   );
   if (row.active_users > 0) {
+    logger.warn('Deactivate role blocked · roleId=' + roleId + ' activeUsers=' + row.active_users);
     throw mkErr(
       409,
       `Cannot deactivate — ${row.active_users} active user(s) still assigned to this role. Reassign them first.`
@@ -560,6 +575,7 @@ async function deactivateRole(roleId) {
     [roleId]
   );
   if (r.affectedRows) {
+    logger.info('Role deactivated · id=' + roleId);
     await refreshCache();
     // Deactivated role → cached perms for those users are now wrong
     // (getEffectivePermissions short-circuits to empty arrays when

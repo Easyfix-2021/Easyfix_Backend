@@ -11,6 +11,7 @@ const routes = require('./routes');
 const { notFound, errorHandler } = require('./middleware/error-handler');
 const { rateLimit } = require('./middleware/rate-limit');
 const httpLog = require('./middleware/http-log');
+const requestContext = require('./utils/request-context');
 const scheduler = require('./server/scheduler');
 
 const app = express();
@@ -26,6 +27,16 @@ app.use(compression({ threshold: 1024 }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(cookieParser());
+
+// Bind the request into AsyncLocalStorage so every log line emitted while
+// handling it (logger.* in handlers/services) is auto-stamped with the request's
+// surface + identity. Mounted AFTER the body parsers ON PURPOSE: those read the
+// request stream (created before our middleware) and the handler continuation
+// chains off the stream's 'end' event, which would drop an als.run() established
+// earlier. From here on the chain is sync-dispatch + promise-awaits, which
+// AsyncLocalStorage preserves. (httpLog above doesn't need this — it reads `req`
+// directly.) Verified: context survives the parser + awaited DB calls.
+app.use((req, res, next) => requestContext.run(req, next));
 
 // Phase 14 — per-tier rate limits. Integration + mobile + client get their own
 // bucket; admin is uncapped to avoid self-DoSing a data-entry spree.

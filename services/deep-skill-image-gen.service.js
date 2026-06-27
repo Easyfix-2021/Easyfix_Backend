@@ -254,6 +254,7 @@ async function generateImage(skillId) {
   if (!Number.isInteger(id) || id <= 0) {
     throw new Error(`generateImage: invalid skillId=${skillId}`);
   }
+  logger.info('Auto-generating deep-skill image · skillId=' + id);
 
   let skillRow;
   let options;
@@ -664,6 +665,7 @@ function renderBudgetAlertHtml({
  * Returns the count of rows reset for telemetry.
  */
 async function resetOrphanedPendingImageGens() {
+  logger.info('Resetting orphaned pending deep-skill image generations');
   const [result] = await pool.query(
     `UPDATE tbl_deep_skill
         SET image_gen_status = 'failed'
@@ -701,6 +703,7 @@ async function generateForSkill(skillId, { name, options } = {}) {
     err.status = 400;
     throw err;
   }
+  logger.info('Regenerating deep-skill image (sync) · skillId=' + id);
 
   // Load the row regardless — we need deepskill_image for the seq calc,
   // and (when name/options weren't passed) the persisted name + options.
@@ -807,6 +810,7 @@ async function generatePreview({ name, options } = {}) {
     err.status = 400;
     throw err;
   }
+  logger.info('Generating deep-skill image preview (unsaved skill)');
   const resolvedOptions = (Array.isArray(options) ? options : [])
     .map((o) => String(o ?? '').trim())
     .filter(Boolean);

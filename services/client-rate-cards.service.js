@@ -98,6 +98,7 @@ async function hasCompositeUniqueKey() {
 /* ─── List ────────────────────────────────────────────────────────── */
 
 async function listForClient(clientId) {
+  logger.info('List client rate cards · clientId=' + clientId);
   // **Correction (2026-05-25 audit)**: the 6 cost columns are on
   // `tbl_client_service`, NOT `tbl_client_rate_card`. Verified
   // against legacy ClientDaoImpl.java#672-677. So:
@@ -135,6 +136,7 @@ async function listForClient(clientId) {
       ORDER BY st.service_type_name ASC`,
     [clientId],
   );
+  logger.info('Found ' + rows.length + ' client rate cards · clientId=' + clientId);
   return rows;
 }
 
@@ -153,6 +155,8 @@ async function listForClient(clientId) {
  * is 1 for INSERT, 2 for UPDATE; we report total touched).
  */
 async function bulkUpsert(clientId, rows) {
+  logger.info('Bulk upsert client rate cards · clientId=' + clientId + ' rows=' + (Array.isArray(rows) ? rows.length : 0));
+  logger.warn('Bulk upsert client rate cards · deferred path — returning 503 (use Upload Rate Card Xlsx)');
   // DEFERRED PATH — see file-header comment. Under the corrected
   // catalog model, the per-client write is "link/unlink a catalog
   // rate_card_id onto a tbl_client_service row", not an upsert into
@@ -218,10 +222,12 @@ async function bulkUpsert(clientId, rows) {
 }
 
 async function deleteOne(rateCardId) {
+  logger.info('Delete client rate card · crc_id=' + rateCardId);
   const [r] = await pool.query(
     // Column-name landmine — PK is `crc_id` on tbl_client_rate_card.
     'DELETE FROM tbl_client_rate_card WHERE crc_id = ?', [rateCardId],
   );
+  logger.info('Client rate card deleted · crc_id=' + rateCardId + ' affected=' + r.affectedRows);
   return r.affectedRows;
 }
 
@@ -273,6 +279,7 @@ function calculateCharges({
   overheadFixed      = 0, overheadVariable      = 0,
   clientFixed        = 0, clientVariable        = 0,
 }) {
+  logger.info('Calculate rate-card charges · totalCharge=' + totalCharge);
   const toN = (x) => (typeof x === 'number' && Number.isFinite(x)) ? x : Number(x) || 0;
   let running = toN(totalCharge);
 

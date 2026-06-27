@@ -31,6 +31,7 @@ const MAX_PER_RUN = 200;   // safety belt — if 200 rows piled up between runs
                            // we still finish in ~40s rather than minutes
 
 async function syncPendingReports() {
+  logger.info(`Kaleyra report sync starting · windowDays=${WINDOW_DAYS} · maxPerRun=${MAX_PER_RUN}`);
   // Fetch the work list. ORDER BY oldest-first so a row that has been
   // pending the longest gets attention first if MAX_PER_RUN clips us.
   // provider filter (2026-06-17): only reconcile Kaleyra rows here. Plivo rows
@@ -50,6 +51,7 @@ async function syncPendingReports() {
     [WINDOW_DAYS, MAX_PER_RUN]
   );
 
+  logger.info(`Found ${rows.length} pending caller-info rows to reconcile`);
   let updated = 0;
   let failed = 0;
   for (const row of rows) {
@@ -73,6 +75,7 @@ async function syncPendingReports() {
     // of an early-exit guard.
     await sleep(THROTTLE_MS);
   }
+  logger.info(`Kaleyra report sync done · checked=${rows.length} · updated=${updated} · failed=${failed}`);
   return { checked: rows.length, updated, failed };
 }
 
@@ -106,6 +109,7 @@ async function applyReportToRow(jobCallerInfoId, report) {
       WHERE job_caller_info = ?`,
     [startTime, endTime, duration, callerSt, receiverSt, recording, location, provider, jobCallerInfoId]
   );
+  logger.info(`Caller-info updated · id=${jobCallerInfoId} · duration=${duration ?? '—'}`);
 }
 
 function pickInt(...values) {

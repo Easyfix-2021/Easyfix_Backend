@@ -1,5 +1,6 @@
 const router = require('express').Router();
 const Joi = require('joi');
+const logger = require('../../logger');
 const { pool } = require('../../db');
 const validate = require('../../middleware/validate');
 const { getAllForClient, invalidate } = require('../../services/settings.service');
@@ -39,7 +40,9 @@ const defaultBody = Joi.object({
 // Returns every setting row with its effective value (override or default).
 router.get('/', validate(clientIdQuery, 'query'), async (req, res, next) => {
   try {
+    logger.info('Listing auto-allocation settings · clientId=' + (req.query.clientId || 'default'));
     const data = await getAllForClient(req.query.clientId ? Number(req.query.clientId) : null);
+    logger.info('Returning ' + (Array.isArray(data) ? data.length : 0) + ' auto-allocation settings');
     modernOk(res, data);
   } catch (e) { next(e); }
 });
@@ -54,6 +57,7 @@ router.get('/', validate(clientIdQuery, 'query'), async (req, res, next) => {
 router.put('/override', validate(overrideBody), async (req, res, next) => {
   try {
     const { clientId, settingId, value } = req.body;
+    logger.info('Upserting auto-allocation override · clientId=' + clientId + ' settingId=' + settingId);
     const [[existing]] = await pool.query(
       'SELECT id, deleted FROM tbl_client_setting WHERE client_id = ? AND setting_id = ? LIMIT 1',
       [clientId, settingId]
@@ -71,6 +75,7 @@ router.put('/override', validate(overrideBody), async (req, res, next) => {
       );
     }
     invalidate(clientId);
+    logger.info('Auto-allocation override saved · clientId=' + clientId + ' settingId=' + settingId);
     modernOk(res, { ok: true });
   } catch (e) { next(e); }
 });
@@ -84,12 +89,17 @@ router.delete('/override', validate(clearBody, 'query'), async (req, res, next) 
   try {
     const clientId  = Number(req.query.clientId);
     const settingId = Number(req.query.settingId);
+    logger.info('Clearing auto-allocation override · clientId=' + clientId + ' settingId=' + settingId);
     const [r] = await pool.query(
       'UPDATE tbl_client_setting SET deleted = 1, endtimestamp = NOW() WHERE client_id = ? AND setting_id = ?',
       [clientId, settingId]
     );
     invalidate(clientId);
-    if (r.affectedRows === 0) return modernError(res, 404, 'override not found');
+    if (r.affectedRows === 0) {
+      logger.warn('Auto-allocation override clear · override not found · clientId=' + clientId + ' settingId=' + settingId);
+      return modernError(res, 404, 'override not found');
+    }
+    logger.info('Auto-allocation override cleared · clientId=' + clientId + ' settingId=' + settingId);
     modernOk(res, { ok: true });
   } catch (e) { next(e); }
 });
@@ -104,11 +114,16 @@ router.delete('/override', validate(clearBody, 'query'), async (req, res, next) 
 router.patch('/default', validate(defaultBody), async (req, res, next) => {
   try {
     const { settingId, value } = req.body;
+    logger.info('Updating auto-allocation default · settingId=' + settingId);
     const [r] = await pool.query(
       'UPDATE tbl_autoallocation_setting SET default_value = ? WHERE id = ?',
       [value, settingId]
     );
-    if (r.affectedRows === 0) return modernError(res, 404, 'setting not found');
+    if (r.affectedRows === 0) {
+      logger.warn('Auto-allocation default update · setting not found · settingId=' + settingId);
+      return modernError(res, 404, 'setting not found');
+    }
+    logger.info('Auto-allocation default updated · settingId=' + settingId);
     // No cache to bust — settings service reads realtime.
     modernOk(res, { ok: true });
   } catch (e) { next(e); }
@@ -120,6 +135,7 @@ router.patch('/default', validate(defaultBody), async (req, res, next) => {
 // existing override without paging through every client).
 router.get('/clients-with-overrides', async (_req, res, next) => {
   try {
+    logger.info('Listing clients with auto-allocation overrides');
     const [rows] = await pool.query(`
       SELECT DISTINCT cs.client_id, c.client_name
         FROM tbl_client_setting cs
@@ -128,6 +144,7 @@ router.get('/clients-with-overrides', async (_req, res, next) => {
          AND cs.setting_id IN (SELECT id FROM tbl_autoallocation_setting)
        ORDER BY c.client_name ASC
     `);
+    logger.info('Found ' + rows.length + ' clients with overrides');
     modernOk(res, rows);
   } catch (e) { next(e); }
 });

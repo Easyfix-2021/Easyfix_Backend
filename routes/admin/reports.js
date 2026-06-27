@@ -2,6 +2,7 @@ const router = require('express').Router();
 const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
 const { sendXlsx } = require('../../utils/xlsx-export');
+const logger = require('../../logger');
 
 const wantsXlsx = (req) => String(req.query.format || '').toLowerCase() === 'xlsx';
 const stamp = () => new Date().toISOString().slice(0, 10);
@@ -9,7 +10,8 @@ const stamp = () => new Date().toISOString().slice(0, 10);
 router.get('/completed-jobs', async (req, res, next) => {
   try {
     const { from, to, clientId } = req.query;
-    if (!from || !to) return modernError(res, 400, 'from and to required');
+    logger.info('Completed-jobs report · from=' + from + ' to=' + to + ' clientId=' + (clientId ?? '-') + ' format=' + (req.query.format || 'json'));
+    if (!from || !to) { logger.warn('Completed-jobs report rejected · from and to required'); return modernError(res, 400, 'from and to required'); }
     const clauses = ['j.job_status IN (3,5)', 'j.checkout_date_time BETWEEN ? AND ?'];
     const params = [from, to];
     if (clientId != null) { clauses.push('j.fk_client_id = ?'); params.push(clientId); }
@@ -23,8 +25,10 @@ router.get('/completed-jobs', async (req, res, next) => {
          LEFT JOIN tbl_city      ci ON ci.city_id = ad.city_id
          WHERE ${clauses.join(' AND ')}
          ORDER BY j.checkout_date_time DESC LIMIT 1000`, params);
+    logger.info('Found ' + rows.length + ' completed jobs');
 
     if (wantsXlsx(req)) {
+      logger.info('Exporting ' + rows.length + ' completed jobs as xlsx');
       return await sendXlsx(res, {
         filename: `completed-jobs-${stamp()}.xlsx`,
         sheetName: 'Completed Jobs',
@@ -48,6 +52,7 @@ router.get('/completed-jobs', async (req, res, next) => {
 router.get('/easyfixer', async (req, res, next) => {
   try {
     const { from, to, efrId } = req.query;
+    logger.info('Easyfixer report · from=' + (from ?? '-') + ' to=' + (to ?? '-') + ' efrId=' + (efrId ?? '-') + ' format=' + (req.query.format || 'json'));
     const clauses = [], params = [];
     if (efrId != null) { clauses.push('j.fk_easyfixter_id = ?'); params.push(efrId); }
     if (from && to)    { clauses.push('j.checkout_date_time BETWEEN ? AND ?'); params.push(from, to); }
@@ -59,6 +64,7 @@ router.get('/easyfixer', async (req, res, next) => {
               COUNT(j.job_id) AS total_jobs
          FROM tbl_easyfixer ef LEFT JOIN tbl_job j ON j.fk_easyfixter_id = ef.efr_id
          ${where} GROUP BY ef.efr_id, ef.efr_name ORDER BY completed DESC LIMIT 500`, params);
+    logger.info('Found ' + rows.length + ' easyfixers');
 
     if (wantsXlsx(req)) {
       return await sendXlsx(res, {
@@ -81,7 +87,8 @@ router.get('/easyfixer', async (req, res, next) => {
 router.get('/payout-sheet', async (req, res, next) => {
   try {
     const { from, to } = req.query;
-    if (!from || !to) return modernError(res, 400, 'from and to required');
+    logger.info('Payout-sheet report · from=' + from + ' to=' + to + ' format=' + (req.query.format || 'json'));
+    if (!from || !to) { logger.warn('Payout-sheet report rejected · from and to required'); return modernError(res, 400, 'from and to required'); }
     const [rows] = await pool.query(
       `SELECT ef.efr_id, ef.efr_name, ef.efr_no, ef.current_balance,
               COUNT(j.job_id) AS jobs_completed
@@ -90,6 +97,7 @@ router.get('/payout-sheet', async (req, res, next) => {
            AND j.job_status IN (3,5) AND j.checkout_date_time BETWEEN ? AND ?
         WHERE ef.efr_status = 1
         GROUP BY ef.efr_id ORDER BY jobs_completed DESC LIMIT 1000`, [from, to]);
+    logger.info('Found ' + rows.length + ' payout rows');
 
     if (wantsXlsx(req)) {
       return await sendXlsx(res, {
@@ -111,6 +119,7 @@ router.get('/payout-sheet', async (req, res, next) => {
 
 router.get('/city-analysis', async (req, res, next) => {
   try {
+    logger.info('City-analysis report · format=' + (req.query.format || 'json'));
     const [rows] = await pool.query(
       `SELECT ci.city_id, ci.city_name,
               COUNT(j.job_id) AS total_jobs,
@@ -121,6 +130,7 @@ router.get('/city-analysis', async (req, res, next) => {
          LEFT JOIN tbl_job j ON j.fk_address_id = ad.address_id
         WHERE ci.city_status = 1
         GROUP BY ci.city_id ORDER BY total_jobs DESC LIMIT 100`);
+    logger.info('Found ' + rows.length + ' cities');
 
     if (wantsXlsx(req)) {
       return await sendXlsx(res, {
@@ -143,11 +153,13 @@ router.get('/city-analysis', async (req, res, next) => {
 router.get('/job-tracking', async (req, res, next) => {
   try {
     const { jobId } = req.query;
-    if (!jobId) return modernError(res, 400, 'jobId required');
+    logger.info('Job-tracking report · jobId=' + (jobId ?? '-'));
+    if (!jobId) { logger.warn('Job-tracking report rejected · jobId required'); return modernError(res, 400, 'jobId required'); }
     const [history] = await pool.query(
       `SELECT sh.id, sh.easyfixer_id, ef.efr_name, sh.schedule_time, sh.reason_id, sh.reschedule_reason
          FROM scheduling_history sh LEFT JOIN tbl_easyfixer ef ON ef.efr_id = sh.easyfixer_id
         WHERE sh.job_id = ? ORDER BY sh.id ASC`, [jobId]);
+    logger.info('Found ' + history.length + ' scheduling-history entries');
     modernOk(res, history);
   } catch (e) { next(e); }
 });
@@ -160,7 +172,8 @@ router.get('/job-tracking', async (req, res, next) => {
 router.get('/user-productivity', async (req, res, next) => {
   try {
     const { from, to, userId, roleId } = req.query;
-    if (!from || !to) return modernError(res, 400, 'from and to required');
+    logger.info('User-productivity report · from=' + from + ' to=' + to + ' userId=' + (userId ?? '-') + ' roleId=' + (roleId ?? '-') + ' format=' + (req.query.format || 'json'));
+    if (!from || !to) { logger.warn('User-productivity report rejected · from and to required'); return modernError(res, 400, 'from and to required'); }
     const clauses = ['l.login_date_time BETWEEN ? AND ?'];
     const params = [from, to];
     if (userId != null) { clauses.push('l.user_id = ?'); params.push(userId); }
@@ -177,6 +190,7 @@ router.get('/user-productivity', async (req, res, next) => {
         GROUP BY u.user_id, u.user_name, u.user_code, u.official_email, r.role_name
         ORDER BY active_seconds DESC
         LIMIT 1000`, params);
+    logger.info('Found ' + rows.length + ' user-productivity rows');
 
     const enriched = rows.map(r => {
       const secs = Number(r.active_seconds) || 0;
@@ -213,6 +227,7 @@ router.get('/user-productivity', async (req, res, next) => {
 router.get('/user-hours', async (req, res, next) => {
   try {
     const { from, to, userId } = req.query;
+    logger.info('User-hours report · from=' + (from ?? '-') + ' to=' + (to ?? '-') + ' userId=' + (userId ?? '-'));
     const [rows] = await pool.query(
       `SELECT user_id, DATE(created_date_time) AS date, COUNT(*) AS actions
          FROM tbl_user_login_logout_logs
@@ -220,6 +235,7 @@ router.get('/user-hours', async (req, res, next) => {
            ${userId != null ? 'AND user_id = ?' : ''}
          GROUP BY user_id, DATE(created_date_time) ORDER BY date DESC LIMIT 500`,
       userId != null ? [from || '2020-01-01', to || new Date(), userId] : [from || '2020-01-01', to || new Date()]).catch(() => [[]]);
+    logger.info('Found ' + rows.length + ' user-hours rows');
     modernOk(res, rows);
   } catch (e) { next(e); }
 });

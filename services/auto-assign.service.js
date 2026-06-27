@@ -331,6 +331,7 @@ function score({ activeJobs, rating, completion }, weights) {
  * callers in the wild don't break.
  */
 async function getCandidates(jobId, { limit = 10, ignoreDistance = false } = {}) { // eslint-disable-line no-unused-vars
+  logger.info('Get auto-assign candidates · jobId=' + jobId + ' · limit=' + limit);
   const job = await jobService.getById(jobId);
   if (!job) {
     const err = new Error('job not found'); err.status = 404; throw err;
@@ -345,6 +346,7 @@ async function getCandidates(jobId, { limit = 10, ignoreDistance = false } = {})
   }
 
   const eligible = await eligibleCandidates(job);
+  logger.info('Found ' + eligible.length + ' L1-eligible candidates · jobId=' + jobId);
   if (eligible.length === 0) {
     return {
       job,
@@ -401,6 +403,7 @@ async function getCandidates(jobId, { limit = 10, ignoreDistance = false } = {})
 
   scored.sort((a, b) => b.score - a.score);
 
+  logger.info('Returning ' + Math.min(scored.length, limit) + ' scored candidates · jobId=' + jobId + ' · rejected=' + rejected.length);
   return {
     job: {
       job_id: job.job_id,
@@ -450,6 +453,7 @@ async function getCandidates(jobId, { limit = 10, ignoreDistance = false } = {})
 const candidateRanking = require('./candidate-ranking.service');
 
 async function assignTopCandidate(jobId, actor) {
+  logger.info('Auto-assign top candidate · jobId=' + jobId);
   // Attendance is hard-filtered only for jobs scheduled TODAY/TOMORROW (the
   // window technicians can mark attendance for) — the ranking service
   // window-gates it internally — so far-future on-create auto-assign is
@@ -479,6 +483,7 @@ async function assignTopCandidate(jobId, actor) {
   const top = pick.candidate;
 
   const assigned = await jobService.assign(jobId, { easyfixerId: top.efr_id }, actor);
+  logger.info('Job auto-assigned · jobId=' + jobId + ' · efrId=' + top.efr_id + ' · pick=' + pick.reason);
   return {
     job: assigned,
     chosen: top,
@@ -492,6 +497,7 @@ async function assignTopCandidate(jobId, actor) {
 
 // ─── Bulk auto-assign for all unassigned booked jobs ────────────────
 async function bulkAssignUnassigned({ limit = 50, dryRun = false } = {}, actor) {
+  logger.info('Bulk auto-assign unassigned · limit=' + limit + ' · dryRun=' + dryRun);
   const [unassigned] = await pool.query(
     `SELECT job_id FROM tbl_job
       WHERE fk_easyfixter_id IS NULL
@@ -499,6 +505,7 @@ async function bulkAssignUnassigned({ limit = 50, dryRun = false } = {}, actor) 
       ORDER BY job_id ASC LIMIT ?`,
     [Number(limit)]
   );
+  logger.info('Found ' + unassigned.length + ' unassigned booked jobs');
 
   const results = [];
   let assignedCount = 0;
@@ -535,6 +542,7 @@ async function bulkAssignUnassigned({ limit = 50, dryRun = false } = {}, actor) 
       results.push({ jobId: job_id, status: 'failed', error: e.message });
     }
   }
+  logger.info('Bulk auto-assign done · examined=' + unassigned.length + ' · assigned=' + assignedCount + ' · dryRun=' + dryRun);
   return { summary: { examined: unassigned.length, assignedCount, dryRun }, results };
 }
 

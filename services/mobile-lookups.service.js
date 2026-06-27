@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const logger = require('../logger');
 
 /*
  * Mobile Lookups service — backs the Technician App dropdown/picker
@@ -25,11 +26,13 @@ const { pool } = require('../db');
  *   [ { id, name, description } ]
  */
 async function experience() {
+  logger.info('List experience options');
   const [rows] = await pool.query(
     `SELECT id, name, description
        FROM experience
       ORDER BY id ASC`,
   );
+  logger.info('Found ' + rows.length + ' experience options');
   return rows.map((r) => ({
     id: r.id,
     name: r.name,
@@ -49,10 +52,13 @@ async function experience() {
  * pincode isn't seeded in tbl_pincode (caller surfaces "enter manually").
  */
 async function resolvePincode(pincode) {
+  logger.info('Resolve pincode · pincode=' + pincode);
   // eslint-disable-next-line global-require
   const pincodeService = require('./pincode.service');
   const row = await pincodeService.getPincodeByValue(pincode);
+  if (!row) logger.info('Pincode not seeded · pincode=' + pincode);
   if (!row) return null;
+  logger.info('Pincode resolved · pincode=' + pincode + ' cityId=' + (row.city_id ?? '-'));
   return {
     pincode: row.pincode,
     cityId: row.city_id ?? null,

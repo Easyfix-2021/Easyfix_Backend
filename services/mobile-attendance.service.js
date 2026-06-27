@@ -129,6 +129,7 @@ async function getAttendance(efrId, { from, to } = {}) {
   if (!efrId) throw mkErr(400, 'efrId is required');
   const fromKey = toDayKey(from);
   const toKey = toDayKey(to);
+  logger.info('Get attendance · from=' + fromKey + ' · to=' + toKey);
   if (toKey < fromKey) throw mkErr(400, 'to must be on or after from');
 
   const [rows] = await pool.query(
@@ -140,6 +141,7 @@ async function getAttendance(efrId, { from, to } = {}) {
     [efrId, fromKey, toKey],
   );
 
+  logger.info('Found ' + rows.length + ' marked attendance days');
   const dayKeys = rows.map((r) => toDayKey(r.created_on));
   const counts = await fetchSlotCountsForDays(efrId, dayKeys);
 
@@ -157,6 +159,7 @@ async function getAttendance(efrId, { from, to } = {}) {
     };
   });
 
+  logger.info('Returning ' + days.length + ' attendance days');
   return { days };
 }
 
@@ -173,6 +176,7 @@ async function markDay(efrId, { date, morningSlot, eveningSlot }) {
   const dayKey = toDayKey(date);
   const morning = morningSlot ? 1 : 0;
   const evening = eveningSlot ? 1 : 0;
+  logger.info('Mark attendance day · date=' + dayKey + ' · morning=' + morning + ' · evening=' + evening);
 
   const [upd] = await pool.query(
     `UPDATE tbl_easyfixer_attendance
@@ -189,6 +193,7 @@ async function markDay(efrId, { date, morningSlot, eveningSlot }) {
       [efrId, morning, evening, dayKey],
     );
   }
+  logger.info('Attendance ' + (upd.affectedRows === 0 ? 'inserted' : 'updated') + ' · date=' + dayKey);
   return { marked: true };
 }
 
@@ -203,6 +208,7 @@ async function markDay(efrId, { date, morningSlot, eveningSlot }) {
  */
 async function markLeave(efrId, { startDate, endDate }) {
   if (!efrId) throw mkErr(400, 'efrId is required');
+  logger.info('Mark leave · from=' + toDayKey(startDate) + ' · to=' + toDayKey(endDate));
 
   // Block going unavailable on a day that already has an assigned, not-yet-
   // finished job. Attendance feeds the Candidate Ranking + auto-allocation, so
@@ -218,6 +224,7 @@ async function markLeave(efrId, { startDate, endDate }) {
     [efrId, toDayKey(startDate), toDayKey(endDate)],
   );
   if (clash && Number(clash.n) > 0) {
+    logger.warn('Mark leave blocked · ' + Number(clash.n) + ' assigned job(s) in range');
     throw mkErr(
       409,
       'You have a job assigned on this date. Please contact support to get it reassigned before marking yourself unavailable.',
@@ -225,6 +232,7 @@ async function markLeave(efrId, { startDate, endDate }) {
   }
 
   const days = enumerateDays(startDate, endDate);
+  logger.info('Marking leave across ' + days.length + ' days');
 
   const conn = await pool.getConnection();
   try {
@@ -247,9 +255,11 @@ async function markLeave(efrId, { startDate, endDate }) {
       }
     }
     await conn.commit();
+    logger.info('Leave marked · ' + days.length + ' days');
     return { marked: true };
   } catch (e) {
     await conn.rollback();
+    logger.warn('Mark leave failed; rolled back · ' + e.message);
     throw e;
   } finally {
     conn.release();
@@ -269,6 +279,7 @@ async function unmarkLeave(efrId, { startDate, endDate }) {
   if (!efrId) throw mkErr(400, 'efrId is required');
   const startKey = toDayKey(startDate);
   const endKey = toDayKey(endDate);
+  logger.info('Unmark leave · from=' + startKey + ' · to=' + endKey);
   if (endKey < startKey) throw mkErr(400, 'endDate must be on or after startDate');
 
   const conn = await pool.getConnection();
@@ -283,9 +294,11 @@ async function unmarkLeave(efrId, { startDate, endDate }) {
       [efrId, startKey, endKey],
     );
     await conn.commit();
+    logger.info('Leave unmarked · range ' + startKey + '..' + endKey);
     return { unmarked: true };
   } catch (e) {
     await conn.rollback();
+    logger.warn('Unmark leave failed; rolled back · ' + e.message);
     throw e;
   } finally {
     conn.release();

@@ -1,4 +1,5 @@
 const router = require('express').Router();
+const logger = require('../../logger');
 const { modernOk } = require('../../utils/response');
 const { featuresForUser } = require('../../services/feature-access.service');
 
@@ -11,6 +12,11 @@ const { featuresForUser } = require('../../services/feature-access.service');
  * requirePropertyAllowlist, so a forged flag buys nothing. Mounted under
  * /api/admin (requireAuth + role(['admin']) already applied upstream).
  */
-router.get('/features', (req, res) => modernOk(res, featuresForUser(req.user)));
+router.get('/features', (req, res) => {
+  logger.info('Resolving property-gated feature flags for current admin');
+  const features = featuresForUser(req.user);
+  logger.info('Returning ' + Object.keys(features || {}).length + ' feature flags');
+  return modernOk(res, features);
+});
 
 module.exports = router;

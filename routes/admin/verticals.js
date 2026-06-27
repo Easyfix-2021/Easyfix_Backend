@@ -5,6 +5,7 @@ const validate = require('../../middleware/validate');
 const { roleByName } = require('../../middleware/role');
 const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
+const logger = require('../../logger');
 
 /*
  * Manage Vertical — master for tbl_vertical.
@@ -62,6 +63,7 @@ async function getById(id) {
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
   try {
     let { q, includeInactive, limit, offset, sortBy, sortDir } = req.query;
+    logger.info('List verticals · q=' + (q || '') + ' includeInactive=' + includeInactive + ' limit=' + limit + ' offset=' + offset + ' sortBy=' + sortBy + ' sortDir=' + sortDir);
     limit  = Math.min(Math.max(Number(limit) || 200, 1), 1000);
     offset = Math.max(Number(offset) || 0, 0);
 
@@ -86,16 +88,19 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
         LIMIT ? OFFSET ?`,
       [...params, limit, offset]
     );
+    logger.info('Found ' + rows.length + ' verticals');
     const [[{ total }]] = await pool.query(
       `SELECT COUNT(*) AS total FROM tbl_vertical WHERE ${where.join(' AND ')}`,
       params
     );
+    logger.info('Returning ' + rows.length + ' verticals · total=' + total);
     modernOk(res, { items: rows, total });
   } catch (e) { next(e); }
 });
 
 router.get('/:id', validate(idParam, 'params'), async (req, res, next) => {
   try {
+    logger.info('Get vertical · id=' + req.params.id);
     const row = await getById(Number(req.params.id));
     if (!row) return modernError(res, 404, 'Vertical not found');
     modernOk(res, row);
@@ -107,6 +112,7 @@ router.post('/', roleByName(['Admin']), validate(createBody), async (req, res, n
     const name = String(req.body.vertical_name).trim();
     const desc = req.body.vertical_desc ? String(req.body.vertical_desc).trim() : null;
     const userId = req.user && req.user.user_id ? req.user.user_id : null;
+    logger.info('Create vertical · name=' + name);
 
     const [[dup]] = await pool.query(
       'SELECT vertical_id FROM tbl_vertical WHERE LOWER(vertical_name) = LOWER(?) LIMIT 1',
@@ -121,9 +127,11 @@ router.post('/', roleByName(['Admin']), validate(createBody), async (req, res, n
       [name, desc, userId, userId]
     );
     const created = await getById(r.insertId);
+    logger.info('Vertical created · id=' + r.insertId);
     res.status(201);
     modernOk(res, created, 'Vertical added');
   } catch (e) {
+    if (e.status) logger.warn('Create vertical failed · ' + e.message);
     if (e.status) return modernError(res, e.status, e.message);
     next(e);
   }
@@ -132,6 +140,7 @@ router.post('/', roleByName(['Admin']), validate(createBody), async (req, res, n
 router.patch('/:id', roleByName(['Admin']), validate(idParam, 'params'), validate(updateBody), async (req, res, next) => {
   try {
     const id = Number(req.params.id);
+    logger.info('Update vertical · id=' + id);
     const existing = await getById(id);
     if (!existing) return modernError(res, 404, 'Vertical not found');
 
@@ -164,8 +173,10 @@ router.patch('/:id', roleByName(['Admin']), validate(idParam, 'params'), validat
     params.push(id);
     await pool.query(`UPDATE tbl_vertical SET ${sets.join(', ')} WHERE vertical_id = ?`, params);
     const updated = await getById(id);
+    logger.info('Vertical updated · id=' + id);
     modernOk(res, updated, 'Vertical updated');
   } catch (e) {
+    if (e.status) logger.warn('Update vertical failed · ' + e.message);
     if (e.status) return modernError(res, e.status, e.message);
     next(e);
   }
@@ -174,14 +185,17 @@ router.patch('/:id', roleByName(['Admin']), validate(idParam, 'params'), validat
 router.delete('/:id', roleByName(['Admin']), validate(idParam, 'params'), async (req, res, next) => {
   try {
     const id = Number(req.params.id);
+    logger.info('Deactivate vertical · id=' + id);
     const userId = req.user && req.user.user_id ? req.user.user_id : null;
     const [r] = await pool.query(
       'UPDATE tbl_vertical SET status = 0, updated_on = NOW(), updated_by = ? WHERE vertical_id = ?',
       [userId, id]
     );
     if (r.affectedRows === 0) return modernError(res, 404, 'Vertical not found');
+    logger.info('Vertical deleted · id=' + id);
     modernOk(res, { deactivated: true });
   } catch (e) {
+    if (e.status) logger.warn('Deactivate vertical failed · ' + e.message);
     if (e.status) return modernError(res, e.status, e.message);
     next(e);
   }

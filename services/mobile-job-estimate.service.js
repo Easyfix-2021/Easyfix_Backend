@@ -48,6 +48,7 @@
  */
 
 const { pool } = require('../db');
+const logger = require('../logger');
 
 // Job status codes (mirror services/job.service.js STATUS — duplicated as a
 // local const so this service has no circular dependency on job.service.js,
@@ -96,7 +97,9 @@ async function jobForTech(jobId, efrId) {
  * product line (verified in deepskill add_product_bottom_sheet.dart:699).
  */
 async function getRateCard(jobId, efrId) {
+  logger.info('Get job rate card · jobId=' + jobId);
   const job = await jobForTech(jobId, efrId);
+  if (!job) logger.warn('Get rate card failed · job not found or not owned · jobId=' + jobId);
   if (!job) { const e = new Error('job not found'); e.status = 404; throw e; }
 
   const [rows] = await pool.query(
@@ -112,6 +115,7 @@ async function getRateCard(jobId, efrId) {
       ORDER BY name ASC`,
     [job.fk_client_id],
   );
+  logger.info('Returning ' + rows.length + ' rate-card items · jobId=' + jobId);
 
   return {
     items: rows.map((r) => ({
@@ -141,7 +145,9 @@ async function getRateCard(jobId, efrId) {
  * Returns { lineId }.
  */
 async function addQuotationLine(jobId, efrId, { type, itemId, name, quantity, amount }) {
+  logger.info('Add quotation line · jobId=' + jobId + ' · type=' + type + ' · itemId=' + (itemId || null) + ' · qty=' + quantity);
   const job = await jobForTech(jobId, efrId);
+  if (!job) logger.warn('Add quotation line failed · job not found or not owned · jobId=' + jobId);
   if (!job) { const e = new Error('job not found'); e.status = 404; throw e; }
 
   const isProduct = type === 'product';
@@ -162,6 +168,7 @@ async function addQuotationLine(jobId, efrId, { type, itemId, name, quantity, am
       jobId, clientServiceId, materialId,
     ],
   );
+  logger.info('Quotation line created · id=' + ins.insertId + ' · jobId=' + jobId);
   return { lineId: ins.insertId };
 }
 
@@ -173,7 +180,9 @@ async function addQuotationLine(jobId, efrId, { type, itemId, name, quantity, am
  * line doesn't exist or isn't this tech's.
  */
 async function deleteQuotationLine(jobId, efrId, lineId) {
+  logger.info('Delete quotation line · jobId=' + jobId + ' · lineId=' + lineId);
   const job = await jobForTech(jobId, efrId);
+  if (!job) logger.warn('Delete quotation line failed · job not found or not owned · jobId=' + jobId);
   if (!job) { const e = new Error('job not found'); e.status = 404; throw e; }
 
   // Ensure the line belongs to THIS job (defends against cross-job ids).
@@ -182,9 +191,11 @@ async function deleteQuotationLine(jobId, efrId, lineId) {
     [lineId],
   );
   if (!line || Number(line.job_id) !== Number(jobId)) {
+    logger.warn('Delete quotation line failed · line not found for job · jobId=' + jobId + ' · lineId=' + lineId);
     const e = new Error('quotation line not found'); e.status = 404; throw e;
   }
   await pool.query('DELETE FROM quotation_details WHERE id = ? AND job_id = ?', [lineId, jobId]);
+  logger.info('Quotation line deleted · id=' + lineId + ' · jobId=' + jobId);
   return { deleted: true };
 }
 
@@ -203,7 +214,9 @@ async function deleteQuotationLine(jobId, efrId, lineId) {
  * Returns { sent: true }.
  */
 async function sendForApproval(jobId, efrId, { checkInImageRefs } = {}) {
+  logger.info('Send estimate for approval · jobId=' + jobId + ' · checkInImageRefs=' + ((Array.isArray(checkInImageRefs) ? checkInImageRefs : []).length));
   const job = await jobForTech(jobId, efrId);
+  if (!job) logger.warn('Send for approval failed · job not found or not owned · jobId=' + jobId);
   if (!job) { const e = new Error('job not found'); e.status = 404; throw e; }
 
   const conn = await pool.getConnection();
@@ -232,8 +245,10 @@ async function sendForApproval(jobId, efrId, { checkInImageRefs } = {}) {
     }
 
     await conn.commit();
+    logger.info('Estimate sent for approval · jobId=' + jobId + ' · status=' + STATUS_ESTIMATE_PENDING_APPROVAL);
     return { sent: true };
   } catch (e) {
+    logger.error('Send for approval failed, rolled back · jobId=' + jobId + ' · ' + e.message);
     await conn.rollback();
     throw e;
   } finally {
@@ -255,9 +270,12 @@ async function sendForApproval(jobId, efrId, { checkInImageRefs } = {}) {
  * Returns { ok: true, inserted: <n> }.
  */
 async function recordImages(jobId, efrId, { category, refs }) {
+  logger.info('Record job images · jobId=' + jobId + ' · category=' + category + ' · refs=' + ((Array.isArray(refs) ? refs : []).length));
   const job = await jobForTech(jobId, efrId);
+  if (!job) logger.warn('Record images failed · job not found or not owned · jobId=' + jobId);
   if (!job) { const e = new Error('job not found'); e.status = 404; throw e; }
   if (!IMAGE_CATEGORIES.has(category)) {
+    logger.warn('Record images rejected · invalid image category · category=' + category);
     const e = new Error('invalid image category'); e.status = 400; throw e;
   }
   const jobStage = category === 'Completion' ? 5 : 0;
@@ -277,8 +295,10 @@ async function recordImages(jobId, efrId, { category, refs }) {
       );
     }
     await conn.commit();
+    logger.info('Recorded ' + cleaned.length + ' job images · jobId=' + jobId + ' · category=' + category);
     return { ok: true, inserted: cleaned.length };
   } catch (e) {
+    logger.error('Record images failed, rolled back · jobId=' + jobId + ' · ' + e.message);
     await conn.rollback();
     throw e;
   } finally {
@@ -301,7 +321,9 @@ async function recordImages(jobId, efrId, { category, refs }) {
  *                   values, answer, comments }] }
  */
 async function getQuestionnaire(jobId, efrId) {
+  logger.info('Get job questionnaire · jobId=' + jobId);
   const job = await jobForTech(jobId, efrId);
+  if (!job) logger.warn('Get questionnaire failed · job not found or not owned · jobId=' + jobId);
   if (!job) { const e = new Error('job not found'); e.status = 404; throw e; }
 
   const [rows] = await pool.query(
@@ -326,6 +348,7 @@ async function getQuestionnaire(jobId, efrId) {
       ORDER BY qd.c_qd_seq, qd.c_qd_id`,
     [job.fk_client_id, jobId],
   );
+  logger.info('Returning ' + rows.length + ' questionnaire questions · jobId=' + jobId);
 
   return {
     questions: rows.map((r) => ({
@@ -357,7 +380,9 @@ async function getQuestionnaire(jobId, efrId) {
  * Returns { submitted: true, count: <n> }.
  */
 async function submitQuestionnaire(jobId, efrId, answers) {
+  logger.info('Submit questionnaire answers · jobId=' + jobId + ' · answers=' + ((Array.isArray(answers) ? answers : []).length));
   const job = await jobForTech(jobId, efrId);
+  if (!job) logger.warn('Submit questionnaire failed · job not found or not owned · jobId=' + jobId);
   if (!job) { const e = new Error('job not found'); e.status = 404; throw e; }
 
   const list = Array.isArray(answers) ? answers : [];
@@ -407,8 +432,10 @@ async function submitQuestionnaire(jobId, efrId, answers) {
       count += 1;
     }
     await conn.commit();
+    logger.info('Questionnaire answers saved · count=' + count + ' · jobId=' + jobId);
     return { submitted: true, count };
   } catch (e) {
+    logger.error('Submit questionnaire failed, rolled back · jobId=' + jobId + ' · ' + e.message);
     await conn.rollback();
     throw e;
   } finally {
@@ -429,7 +456,9 @@ async function submitQuestionnaire(jobId, efrId, answers) {
  * Returns { stages: [{ key, label, done, at }] }.
  */
 async function getWorkProgress(jobId, efrId) {
+  logger.info('Get job work progress timeline · jobId=' + jobId);
   const job = await jobForTech(jobId, efrId);
+  if (!job) logger.warn('Get work progress failed · job not found or not owned · jobId=' + jobId);
   if (!job) { const e = new Error('job not found'); e.status = 404; throw e; }
 
   // Pull the audit-stamp columns + one derived quotation-action timestamp.
@@ -459,6 +488,7 @@ async function getWorkProgress(jobId, efrId) {
     { key: 'completed',         label: 'Completed',          at: row.checkout_date_time || null },
   ].map((s) => ({ ...s, done: Boolean(s.at) }));
 
+  logger.info('Returning ' + stages.length + ' work-progress stages · jobId=' + jobId + ' · status=' + row.job_status);
   return { stages };
 }
 

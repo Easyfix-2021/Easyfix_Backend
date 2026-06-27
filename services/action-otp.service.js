@@ -38,6 +38,7 @@ const OTP_TYPES = {
  * truly-missing contact (no mobile AND no email) is a hard 422.
  */
 async function sendActionOtp(admin, action) {
+  logger.info('Send action OTP · action=' + action);
   const otpType = OTP_TYPES[action];
   if (!otpType) throw new Error(`unknown action-otp type: ${action}`);
 
@@ -105,6 +106,7 @@ async function sendActionOtp(admin, action) {
     logger.warn({ err: e.message, action }, 'action-otp: delivery failed (row persisted, verify still works)');
   }
 
+  logger.info('Action OTP issued · action=' + action + ' · delivered=' + delivered);
   return { delivered, expiresAt: expires };
 }
 
@@ -114,6 +116,7 @@ async function sendActionOtp(admin, action) {
  * consume (is_expired = 1) so it is single-use.
  */
 async function verifyActionOtp(admin, action, otp) {
+  logger.info('Verify action OTP · action=' + action);
   const otpType = OTP_TYPES[action];
   if (!otpType) return { valid: false, reason: 'UNKNOWN_ACTION' };
   if (otp === undefined || otp === null || String(otp).trim() === '') {
@@ -139,6 +142,7 @@ async function verifyActionOtp(admin, action, otp) {
   if (Number(row.otp) !== Number(otp)) return { valid: false, reason: 'OTP_MISMATCH' };
 
   await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
+  logger.info('Action OTP verified · action=' + action);
   return { valid: true };
 }
 

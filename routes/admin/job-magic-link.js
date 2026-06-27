@@ -88,6 +88,7 @@ router.post(
     try {
       const jobId = Number(req.params.id);
       let { action, override } = req.body;
+      logger.info('Send magic link · jobId=' + jobId + ' action=' + action + ' override=' + !!override);
 
       // Pre-check A: job exists + is Unconfirmed
       const [[job]] = await pool.query(
@@ -95,9 +96,11 @@ router.post(
         [jobId],
       );
       if (!job) {
+        logger.warn('Send magic link aborted · jobId=' + jobId + ' not found');
         return modernError(res, 404, 'job not found');
       }
       if (job.job_status !== 9) {
+        logger.warn('Send magic link aborted · jobId=' + jobId + ' status=' + job.job_status + ' not Unconfirmed');
         return modernError(
           res,
           400,
@@ -141,6 +144,7 @@ router.post(
       if (override === true) {
         const roleName = (req.userRole?.role_name || '').toLowerCase();
         if (roleName !== 'admin') {
+          logger.warn('Send magic link override denied · jobId=' + jobId + ' requires Admin role');
           return modernError(
             res,
             403,
@@ -187,8 +191,10 @@ router.post(
       const result = conversational
         ? await conversationService.startConversation(jobId, { action }, pool)
         : await magicLinkService.sendForJob(jobId, { action, override: !!override }, pool);
+      logger.info('Magic link sent · jobId=' + jobId + ' action=' + action + ' channel=' + (conversational ? 'conversation' : 'form'));
       return modernOk(res, { ...result, channel: conversational ? 'conversation' : 'form' });
     } catch (e) {
+      logger.warn('Send magic link failed · jobId=' + req.params.id + ' · ' + e.message);
       return next(e);
     }
   },
@@ -223,6 +229,7 @@ router.get(
   async (req, res, next) => {
     try {
       const jobId = Number(req.params.id);
+      logger.info('Read magic-link status · jobId=' + jobId);
       const [[row]] = await pool.query(
         `SELECT
             j.magic_link_sent_at,
@@ -243,10 +250,13 @@ router.get(
         [jobId],
       );
       if (!row) {
+        logger.warn('Magic-link status not found · jobId=' + jobId);
         return modernError(res, 404, 'job not found');
       }
+      logger.info('Returning magic-link status · jobId=' + jobId + ' sendCount=' + row.magic_link_send_count);
       return modernOk(res, row);
     } catch (e) {
+      logger.warn('Read magic-link status failed · jobId=' + req.params.id + ' · ' + e.message);
       return next(e);
     }
   },

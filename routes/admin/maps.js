@@ -20,6 +20,7 @@ const Joi = require('joi');
 const validate = require('../../middleware/validate');
 const { modernOk, modernError } = require('../../utils/response');
 const mapsService = require('../../services/maps.service');
+const logger = require('../../logger');
 
 /*
  * GET /admin/maps/autocomplete?q=<text>
@@ -31,7 +32,9 @@ router.get('/autocomplete', validate(Joi.object({
   q: Joi.string().min(3).max(200).required(),
 }), 'query'), async (req, res, next) => {
   try {
+    logger.info('Maps autocomplete · q=' + String(req.query.q).trim());
     const out = await mapsService.autocomplete(String(req.query.q).trim());
+    logger.info('Returning ' + out.items.length + ' autocomplete suggestions');
     modernOk(res, out);
   } catch (e) {
     if (e && e.status) return modernError(res, e.status, e.message);
@@ -55,11 +58,14 @@ router.get('/geocode', validate(Joi.object({
   latlng:   Joi.string().pattern(/^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/).optional(),
 }).or('place_id', 'address', 'latlng'), 'query'), async (req, res, next) => {
   try {
+    const mode = req.query.place_id ? 'place_id' : req.query.latlng ? 'latlng' : 'address';
+    logger.info('Maps geocode · mode=' + mode);
     const out = await mapsService.geocode({
       place_id: req.query.place_id ? String(req.query.place_id) : null,
       address:  req.query.address  ? String(req.query.address)  : null,
       latlng:   req.query.latlng   ? String(req.query.latlng)   : null,
     });
+    logger.info('Geocode resolved · hasCoords=' + (out.lat != null && out.lng != null));
     modernOk(res, out);
   } catch (e) {
     if (e && e.status) return modernError(res, e.status, e.message);
@@ -76,6 +82,7 @@ router.get('/geocode', validate(Joi.object({
  * /api/public/maps/config for the customer-facing token-gated mirror.
  */
 router.get('/config', (_req, res) => {
+  logger.info('Fetching Maps public API key config · configured=' + (mapsService.getConfigKey() != null));
   modernOk(res, { apiKey: mapsService.getConfigKey() });
 });
 

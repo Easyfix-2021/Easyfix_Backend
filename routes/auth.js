@@ -7,6 +7,7 @@ const { createLoginOtp, verifyLoginOtp } = require('../services/auth.service');
 const { getRoleById } = require('../services/role.service');
 const { signUserToken } = require('../utils/jwt');
 const { modernOk, modernError } = require('../utils/response');
+const logger = require('../logger');
 
 /*
  * POST /api/auth/login
@@ -17,6 +18,7 @@ const { modernOk, modernError } = require('../utils/response');
  * can clearly route to /login-otp.
  */
 router.post('/login', (_req, res) => {
+  logger.info('Password login attempt rejected · not supported (use login-otp)');
   modernError(
     res,
     501,
@@ -41,14 +43,17 @@ router.post('/login', (_req, res) => {
 router.post('/login-otp', validate(loginOtpRequest), async (req, res, next) => {
   try {
     const { identifier } = req.body;
+    logger.info('Login OTP requested');
     const result = await createLoginOtp(identifier);
     if (!result.found) {
+      logger.warn('Login OTP request failed · account not registered');
       return modernError(
         res,
         404,
         'This account is not registered in the CRM. Please check the email / mobile or contact your admin.'
       );
     }
+    logger.info('Login OTP issued · delivered');
     return modernOk(
       res,
       { delivered: true, expiresAt: result.expiresAt ?? null },
@@ -67,6 +72,7 @@ router.post('/login-otp', validate(loginOtpRequest), async (req, res, next) => {
 router.post('/verify-otp', validate(verifyOtpRequest), async (req, res, next) => {
   try {
     const { identifier, otp } = req.body;
+    logger.info('Verify OTP attempt');
     const result = await verifyLoginOtp(identifier, otp);
 
     if (!result.ok) {
@@ -77,8 +83,10 @@ router.post('/verify-otp', validate(verifyOtpRequest), async (req, res, next) =>
         OTP_MISMATCH:  [401, 'incorrect OTP'],
       };
       const [status, message] = map[result.reason] || [401, 'authentication failed'];
+      logger.warn('Verify OTP failed · reason=' + (result.reason || 'UNKNOWN') + ' status=' + status);
       return modernError(res, status, message);
     }
+    logger.info('OTP verified · token issued · user_id=' + (result.user && result.user.user_id) + ' role=' + (result.user && result.user.user_role));
 
     res.cookie('token', result.token, {
       httpOnly: true,
@@ -109,6 +117,7 @@ router.post('/verify-otp', validate(verifyOtpRequest), async (req, res, next) =>
  */
 router.get('/me', requireAuth, async (req, res, next) => {
   try {
+    logger.info('Resolve current identity (me) · principal=' + (req.user.__principal || 'crm') + ' role=' + req.user.user_role);
     const role = await getRoleById(req.user.user_role);
 
     // Technician (mobile) principals authenticate against tbl_easyfixer and
@@ -119,6 +128,7 @@ router.get('/me', requireAuth, async (req, res, next) => {
     // itself via /api/mobile/*. Return a clean, empty-permission identity so a
     // mobile bearer is a first-class /api/shared principal without the 500.
     if (req.user.__principal === 'mobile') {
+      logger.info('Returning mobile identity · empty CRM permissions/scope');
       return modernOk(res, {
         user: req.user,
         role: role && {
@@ -207,6 +217,7 @@ router.get('/me', requireAuth, async (req, res, next) => {
     const sj = require('../services/scheduled-jobs.service');
     const scheduledJobsAccess = sj.isAllowedUser(req.user);
 
+    logger.info('Returning identity · bypassScope=' + !!bypass + ' menuIds=' + ((permissions && permissions.menuIds && permissions.menuIds.length) || 0) + ' directReports=' + hierarchy.directReports.length + ' descendants=' + hierarchy.descendants.length + ' scheduledJobsAccess=' + scheduledJobsAccess);
     modernOk(res, {
       user: req.user,
       role: role && {
@@ -233,6 +244,7 @@ router.get('/me', requireAuth, async (req, res, next) => {
  * Issues a new JWT based on the currently valid one. Extends session.
  */
 router.post('/refresh', requireAuth, (req, res) => {
+  logger.info('Refresh token · user_id=' + (req.user && req.user.user_id));
   const token = signUserToken(req.user);
   res.cookie('token', token, {
     httpOnly: true,
@@ -253,6 +265,7 @@ router.post('/refresh', requireAuth, (req, res) => {
  * Frontends are still responsible for wiping their own localStorage tokens.
  */
 router.post('/logout', (_req, res) => {
+  logger.info('Logout · clearing auth cookies');
   res.clearCookie('token');
   res.clearCookie('client_auth_token');
   res.clearCookie('spocToken');

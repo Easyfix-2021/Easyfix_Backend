@@ -194,6 +194,10 @@ async function processFloorFilters(raw) {
   out.applyClientFilter =
     Array.isArray(out.managedClientIds) && out.managedClientIds.length > 0;
 
+  logger.info('Resolved floor filters · dateMode=' + out.dateMode + ' verticalId=' + out.verticalId
+    + ' zonalManagerId=' + out.zonalManagerId + ' userId=' + out.userId
+    + ' reportingManagerId=' + out.reportingManagerId + ' applyClientFilter=' + out.applyClientFilter);
+
   // Empty rmTeam → [-1] sentinel.
   if (!Array.isArray(out.rmTeamUserIds) || out.rmTeamUserIds.length === 0) {
     out.rmTeamUserIds = [-1];
@@ -249,6 +253,7 @@ function clientGuard(col, pf, params) {
  * every STEP1 user appears, with 0s when they have no STEP3 row.
  */
 async function getEmployeeProductivity({ pf, page, size }) {
+  logger.info('Building Employee Productivity · page=' + page + ' size=' + size + ' dateMode=' + pf.dateMode);
   const offset = (page - 1) * size;
 
   // ── STEP1 — getActiveUserList (FloorDisciplineRepository:182-204) ──
@@ -276,6 +281,7 @@ async function getEmployeeProductivity({ pf, page, size }) {
     size, offset,
   ];
   const [userRows] = await pool.query(userListSql, userListParams);
+  logger.info('Found ' + userRows.length + ' users on this page');
 
   if (userRows.length >= MAX_PAGE_SIZE) {
     logger.warn(
@@ -311,6 +317,7 @@ async function getEmployeeProductivity({ pf, page, size }) {
 
   // No users on this page → empty data with the real totals.
   if (userIds.length === 0) {
+    logger.info('No users on page · totalRecords=' + totalRecords);
     return {
       totalRecords,
       pageNumber: page,
@@ -480,6 +487,7 @@ async function getEmployeeProductivity({ pf, page, size }) {
     };
   });
 
+  logger.info('Returning ' + data.length + ' productivity rows · totalRecords=' + totalRecords);
   return {
     totalRecords,
     pageNumber: page,
@@ -504,6 +512,7 @@ function placeholders(arr) {
  * JS exactly per MetricsUtil.
  */
 async function getKraMetrics({ pf }) {
+  logger.info('Computing KRA metrics · window=' + pf.startDate + '..' + pf.endDate);
   const params = [];
   // filtered_jobs window + scope. checkout_date_time BETWEEN start AND end.
   params.push(pf.startDate, pf.endDate);     // status IN (3,5) checkout window
@@ -578,6 +587,8 @@ async function getKraMetrics({ pf }) {
   const revenue = num(raw.revenue);
   const txShare = num(raw.tx_share);
 
+  logger.info('KRA metrics computed · totalJobs=' + totalJobs + ' revenue=' + revenue);
+
   // MetricsUtil maths (verbatim semantics; strings preserved as legacy "xx %").
   return {
     sdaPercentage: pct(sdaCount, totalJobs),
@@ -628,12 +639,16 @@ function num(v) {
  * (requested|original) for its aging buckets.
  */
 async function getDashboardCounts({ pf }) {
+  logger.info('Building dashboard counts · dateMode=' + pf.dateMode);
   const [open, callLater, escalation] = await Promise.all([
     fetchOpenOrders(pf),
     fetchCallLaterOrders(pf),
     fetchEscalationOrders(pf),
   ]);
 
+  logger.info('Dashboard tiles ready · open=' + open.reduce((a, b) => a + b.count, 0)
+    + ' callLater=' + callLater.reduce((a, b) => a + b.count, 0)
+    + ' escalation=' + escalation.reduce((a, b) => a + b.count, 0));
   return {
     dashboardDate: new Date().toISOString(),
     tiles: [
@@ -823,6 +838,7 @@ function zeroFill(rows, order, labelKey = 'date_range', countKey = 'job_count') 
  * picked end day. Buckets zero-filled to the canonical 4.
  */
 async function getCancellationDetails({ pf }) {
+  logger.info('Building cancellation details · window=' + pf.startDate + '..' + pf.endDate);
   // The legacy queries use `>= :startDate AND < :endDate`; endDate is already
   // +1 day (inclusive of the picked last day). Both share the same params.
   const bucketParams = [pf.startDate, pf.endDate, pf.verticalId, pf.verticalId, pf.zonalManagerId, pf.zonalManagerId];
@@ -871,6 +887,7 @@ async function getCancellationDetails({ pf }) {
   const [summaryRows] = await pool.query(summarySql, summaryParams);
   const sr = summaryRows[0] || {};
 
+  logger.info('Cancellation details ready · buckets=' + bucketRows.length + ' totalCancelled=' + (num(sr.total_cancelled)));
   // FE snake_case shape (legacy JobCancellationResponseDTO).
   return {
     bucketData: zeroFill(bucketRows, ['0-1 days', '2-3 days', '4-5 days', '>5 days'], 'time_bucket', 'total_jobs')
@@ -890,6 +907,7 @@ async function getCancellationDetails({ pf }) {
  * (verticalId=0 = all). Mirrors getReportingManagersByVertical (411-424).
  */
 async function getReportingManagers({ verticalId }) {
+  logger.info('Listing reporting managers · verticalId=' + (verticalId != null ? Number(verticalId) : 0));
   const v = verticalId != null ? Number(verticalId) : 0;
   const sql =
     `SELECT DISTINCT TU.reporting_manager AS user_id, TU1.user_name
@@ -905,6 +923,7 @@ async function getReportingManagers({ verticalId }) {
       ORDER BY TU1.user_name ASC
       LIMIT ${GROUPED_CAP}`;
   const [rows] = await pool.query(sql, [v, v]);
+  logger.info('Found ' + rows.length + ' reporting managers');
   return rows.map((r) => ({ user_id: Number(r.user_id), user_name: r.user_name || '' }));
 }
 
@@ -917,6 +936,7 @@ async function getReportingManagers({ verticalId }) {
 async function getRmTeamUsers({ verticalId, reportingManagerId }) {
   const v = verticalId != null ? Number(verticalId) : 0;
   const rm = reportingManagerId != null ? Number(reportingManagerId) : 0;
+  logger.info('Listing RM team users · verticalId=' + v + ' reportingManagerId=' + rm);
   const sql =
     `SELECT TU.user_id, TU.user_name, TU.manage_verticals, TU.reporting_manager, TU1.user_name AS rm_name
        FROM tbl_user TU
@@ -932,6 +952,7 @@ async function getRmTeamUsers({ verticalId, reportingManagerId }) {
       ORDER BY TU.user_name ASC
       LIMIT ${GROUPED_CAP}`;
   const [rows] = await pool.query(sql, [v, v, rm, rm]);
+  logger.info('Found ' + rows.length + ' RM team users');
   return rows.map((r) => ({
     user_id: Number(r.user_id),
     user_name: r.user_name || '',
@@ -961,6 +982,7 @@ async function getRmTeamUsers({ verticalId, reportingManagerId }) {
  *   - clientGuard: applyClientFilter OR fk_client_id IN (managedClientIds)
  */
 async function getSpocRevenue({ pf }) {
+  logger.info('Building SPOC revenue · window=' + pf.startDate + '..' + pf.endDate);
   const params = [];
 
   // Build the client guard fragment (pushes managed-client ids into params).
@@ -1008,6 +1030,7 @@ async function getSpocRevenue({ pf }) {
      LIMIT ${GROUPED_CAP}`;
 
   const [rows] = await pool.query(sql, finalParams);
+  logger.info('Found ' + rows.length + ' SPOCs with revenue');
 
   if (rows.length >= GROUPED_CAP) {
     logger.warn(

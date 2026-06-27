@@ -84,21 +84,25 @@ function normaliseInbound(body) {
 
 // Optional GET verify handshake (some BSPs ping the URL with the secret).
 router.get('/whatsapp', (req, res) => {
-  if (!secretOk(req)) return modernError(res, 401, 'unauthorized');
+  if (!secretOk(req)) { logger.warn('WhatsApp verify handshake · bad secret, refused'); return modernError(res, 401, 'unauthorized'); }
+  logger.info('WhatsApp verify handshake · ok');
   return modernOk(res, { ok: true });
 });
 
 router.post('/whatsapp', async (req, res) => {
-  if (!secretOk(req)) return modernError(res, 401, 'unauthorized');
+  if (!secretOk(req)) { logger.warn('WhatsApp inbound webhook · bad secret, refused'); return modernError(res, 401, 'unauthorized'); }
 
   const inbound = normaliseInbound(req.body);
   if (!inbound) {
     // Not a customer message we can act on (status callback, unparseable, etc.).
+    logger.info('WhatsApp inbound · not actionable, ignored');
     return modernOk(res, { received: true, handled: false });
   }
 
+  logger.info('WhatsApp inbound · type=' + inbound.type + ' messageId=' + (inbound.messageId || 'n/a'));
   try {
     const result = await convo.handleInbound(inbound, pool);
+    logger.info('WhatsApp inbound handled · type=' + inbound.type + ' handled=' + (result && result.handled !== undefined ? result.handled : 'n/a'));
     return modernOk(res, { received: true, ...result });
   } catch (err) {
     logger.error({ err: err && err.message }, 'whatsapp inbound webhook failed');

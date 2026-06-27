@@ -176,8 +176,10 @@ router.get('/', validate(materialReportQuery, 'query'), async (req, res, next) =
   try {
     // from/to are validated yyyy-mm-dd strings — bound directly to SQL.
     const { clientId, from, to } = req.query;
+    logger.info('Material Report · clientId=' + clientId + ' ' + from + '→' + to + ' format=' + (req.query.format || 'json'));
 
     const rows = await materialReport(clientId, from, to);
+    logger.info('Found ' + rows.length + ' material lines');
 
     if (req.query.format === 'xlsx') {
       logger.info(
@@ -215,10 +217,13 @@ router.get('/', validate(materialReportQuery, 'query'), async (req, res, next) =
       return;
     }
 
+    logger.info('Returning ' + rows.length + ' material lines');
     return modernOk(res, rows);
   } catch (err) {
     // Map a thrown service error carrying an explicit HTTP status to a modern
     // error; otherwise defer to the global error handler.
+    if (err && err.status) logger.warn('Material Report failed · ' + err.message);
+    else logger.error('Material Report error · ' + err.message);
     if (err && err.status) return modernError(res, err.status, err.message);
     return next(err);
   }
@@ -254,9 +259,13 @@ const imageUrlQuery = Joi.object({
 router.get('/image-url', validate(imageUrlQuery, 'query'), async (req, res, next) => {
   try {
     const { key } = req.query;
+    logger.info('Material Report image-url presign · key=' + key);
     const url = await s3Storage.resolveImageUrl(key);
+    logger.info('Returning presigned image url · resolved=' + (url ? 'yes' : 'no'));
     return modernOk(res, { url });
   } catch (err) {
+    if (err && err.status) logger.warn('Material Report image-url failed · ' + err.message);
+    else logger.error('Material Report image-url error · ' + err.message);
     if (err && err.status) return modernError(res, err.status, err.message);
     return next(err);
   }

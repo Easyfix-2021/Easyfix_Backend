@@ -177,6 +177,7 @@ async function resolveSkillOptionByName(runner, deepskillId, name) {
 
 // ─── Deep-skill CRUD ────────────────────────────────────────────────
 async function list({ categoryId, serviceTypeId, includeInactive = false } = {}) {
+  logger.info('List deep skills · categoryId=' + categoryId + ' serviceTypeId=' + serviceTypeId + ' includeInactive=' + includeInactive);
   const clauses = [];
   const params = [];
   if (!includeInactive) clauses.push('ds.status = 1');
@@ -204,13 +205,16 @@ async function list({ categoryId, serviceTypeId, includeInactive = false } = {})
   // Fan out presigner calls for non-empty image keys. Promise.all keeps
   // latency O(1) for the typical batch size (<=500 skills per category).
   // Canonical resolver: resolveImageUrlFromKey (Skills/ prefix) -> deep_skill_image_url.
+  logger.info('Found ' + rows.length + ' deep skills');
   const urls = await Promise.all(
     rows.map((r) => resolveImageUrlFromKey(r.deepskill_image)),
   );
+  logger.info('Returning ' + rows.length + ' deep skills');
   return rows.map((r, i) => ({ ...r, deep_skill_image_url: urls[i] }));
 }
 
 async function getById(deepskillId) {
+  logger.info('Get deep skill by id · id=' + deepskillId);
   /*
    * Explicit projection (2026-06-12). Previously `SELECT ds.*` — that
    * was convenient when new columns were added (they flowed through to
@@ -256,6 +260,7 @@ async function create(input, actor) {
    * Service type may still be resolved-or-created by name under the
    * existing category — that auto-create behaviour is unchanged.
    */
+  logger.info('Create deep skill · name="' + (input.deepskill_name || '') + '" categoryId=' + input.category_id + ' serviceTypeId=' + input.service_type_id);
   let categoryId    = input.category_id;
   let serviceTypeId = input.service_type_id;
   if (!categoryId && input.category_name) {
@@ -381,7 +386,9 @@ async function create(input, actor) {
     );
 
     await conn.commit();
+    logger.info('Deep skill created · id=' + deepSkillId + ' with ' + optionNames.length + ' options');
   } catch (e) {
+    logger.error('Deep skill create failed · rolled back · ' + e.message);
     try { await conn.rollback(); } catch (_) { /* swallow rollback failure */ }
     throw e;
   } finally {
@@ -431,6 +438,7 @@ async function update(deepskillId, patch) {
    * a `category_name` / `service_type_name` (no id), resolve to an
    * existing row first. Numeric ids in the patch still win.
    */
+  logger.info('Update deep skill · id=' + deepskillId + ' fields=' + Object.keys(patch || {}).join(','));
   const next = { ...patch };
   if (next.category_id === undefined && next.category_name) {
     const cat = await resolveCategoryByName(pool, next.category_name);
@@ -461,6 +469,7 @@ async function update(deepskillId, patch) {
   if (sets.length === 0) return getById(deepskillId);
   values.push(deepskillId);
   await pool.query(`UPDATE tbl_deep_skill SET ${sets.join(', ')} WHERE deepskill_id = ?`, values);
+  logger.info('Deep skill updated · id=' + deepskillId);
 
   // If this patch deactivates/deletes the skill (status → 0), hard-delete its
   // option definitions (product rule: an inactive/deleted deep skill drops its
@@ -575,6 +584,7 @@ async function updateExistingDuplicate(deepskillId, input) {
 }
 
 async function setStatus(deepskillId, active) {
+  logger.info('Set deep skill status · id=' + deepskillId + ' active=' + (active ? 1 : 0));
   // Transactional: when a deep skill is deactivated/deleted (active=false), the
   // status flip and the hard-delete of its option definitions must be atomic
   // (product rule: an inactive/deleted deep skill drops its mapped options).
@@ -587,7 +597,9 @@ async function setStatus(deepskillId, active) {
       await conn.query('DELETE FROM tbl_deepskill_options WHERE deepskill_id = ?', [deepskillId]);
     }
     await conn.commit();
+    logger.info('Deep skill status changed · id=' + deepskillId + ' active=' + (active ? 1 : 0));
   } catch (e) {
+    logger.error('Set deep skill status failed · rolled back · ' + e.message);
     try { await conn.rollback(); } catch (_) { /* ignore rollback failure */ }
     throw e;
   } finally {
@@ -627,12 +639,15 @@ async function addOption(deepskillId, { skill_option }) {
    * return its id instead of inserting a duplicate. Soft-deleted
    * matches get reactivated so the chip reappears in the UI.
    */
+  logger.info('Add skill option · skillId=' + deepskillId + ' option="' + String(skill_option || '').trim() + '"');
   const resolved = await resolveSkillOptionByName(pool, deepskillId, skill_option);
   await syncSkillOptionsJson(deepskillId);
+  logger.info('Skill option added · skillId=' + deepskillId + ' optionId=' + resolved.id);
   return { id: resolved.id };
 }
 
 async function updateOption(deepskillId, optionId, patch) {
+  logger.info('Update skill option · skillId=' + deepskillId + ' optionId=' + optionId + ' fields=' + Object.keys(patch || {}).join(','));
   const sets = []; const values = [];
   if (patch.skill_option !== undefined) { sets.push('skill_option = ?'); values.push(patch.skill_option); }
   if (patch.status       !== undefined) { sets.push('status = ?');       values.push(patch.status ? 1 : 0); }
@@ -647,6 +662,7 @@ async function updateOption(deepskillId, optionId, patch) {
 }
 
 async function deleteOption(deepskillId, optionId) {
+  logger.info('Delete skill option · skillId=' + deepskillId + ' optionId=' + optionId);
   // Soft delete — set status=0 and refresh the JSON blob. Hard delete would
   // break historical tbl_efr_deepskill_mapping rows that reference the option.
   await pool.query(
@@ -676,6 +692,7 @@ async function deleteOption(deepskillId, optionId) {
  * so we GROUP BY easyfixer_id and GROUP_CONCAT the option labels.
  */
 async function listMappedEasyfixers(deepSkillId, { limit = 10, offset = 0 } = {}) {
+  logger.info('List mapped easyfixers · skillId=' + deepSkillId + ' limit=' + limit + ' offset=' + offset);
   const [[{ total }]] = await pool.query(`
     SELECT COUNT(DISTINCT m.easyfixer_id) AS total
       FROM tbl_efr_deepskill_mapping m
@@ -705,6 +722,7 @@ async function listMappedEasyfixers(deepSkillId, { limit = 10, offset = 0 } = {}
      LIMIT ? OFFSET ?
   `, [deepSkillId, Number(limit), Number(offset)]);
 
+  logger.info('Found ' + rows.length + ' mapped easyfixers (total=' + total + ')');
   return { rows, total };
 }
 
@@ -735,6 +753,7 @@ async function mappedEasyfixerCounts(deepSkillIds) {
     .filter((n) => Number.isInteger(n) && n > 0);
   if (ids.length === 0) return { rows: [] };
 
+  logger.info('Mapped easyfixer counts · ids=' + ids.length);
   const placeholders = ids.map(() => '?').join(',');
   const [rows] = await pool.query(`
     SELECT m.parent_skill_id              AS deepskill_id,
@@ -745,6 +764,7 @@ async function mappedEasyfixerCounts(deepSkillIds) {
      GROUP BY m.parent_skill_id
   `, ids);
 
+  logger.info('Returning counts for ' + rows.length + ' deep skills');
   return { rows };
 }
 
@@ -759,6 +779,7 @@ async function mappedEasyfixerCounts(deepSkillIds) {
  * `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`.
  */
 async function downloadXlsx() {
+  logger.info('Build deep skills XLSX export');
   // One round-trip — GROUP_CONCAT keeps the option list inline so we
   // don't N+1 the options table per skill. COALESCE ensures the field
   // is at least an empty string for skills with no active options.
@@ -787,6 +808,7 @@ async function downloadXlsx() {
       ORDER BY ds.deepskill_id ASC
   `);
 
+  logger.info('Found ' + rows.length + ' deep skills for export');
   const wb = new ExcelJS.Workbook();
   wb.creator = 'EasyFix CRM';
   wb.created = new Date();
@@ -866,6 +888,7 @@ function formatInsertedOnIST(value) {
  * short-TTL presigned URL the FE can render immediately.
  */
 async function replaceImage(skillId, { buffer, contentType, originalName }) {
+  logger.info('Replace deep skill image · skillId=' + skillId + ' contentType=' + contentType);
   if (!s3Storage.isEnabled()) {
     const err = new Error('S3 is not configured (set S3_BUCKET_NAME in backend.env)');
     err.status = 503;
@@ -912,6 +935,7 @@ async function replaceImage(skillId, { buffer, contentType, originalName }) {
   try { url = await s3Storage.getPresignedUrl(Key); } catch { /* presign optional */ }
   // invalidate the 24h getAllDeepSkillImages cache — image just changed
   invalidateAllDeepSkillImagesCache();
+  logger.info('Deep skill image replaced · skillId=' + skillId + ' key=' + Key);
   return { image: Key, url };
 }
 
@@ -920,6 +944,7 @@ async function replaceImage(skillId, { buffer, contentType, originalName }) {
  * the DB column. No-op if the column is already empty.
  */
 async function clearImage(skillId) {
+  logger.info('Clear deep skill image · skillId=' + skillId);
   const [[row]] = await pool.query(
     'SELECT deepskill_image FROM tbl_deep_skill WHERE deepskill_id = ?',
     [skillId],
@@ -941,6 +966,7 @@ async function clearImage(skillId) {
     }
     // invalidate the 24h getAllDeepSkillImages cache — image just changed
     invalidateAllDeepSkillImagesCache();
+    logger.info('Deep skill image cleared · skillId=' + skillId);
   }
   return { image: '' };
 }
@@ -1011,6 +1037,7 @@ async function resolveImageUrlFromKey(key) {
  * Single source of truth for presign logic; no more divergent copies.
  */
 async function getImageUrl(skillId) {
+  logger.info('Get deep skill image URL · skillId=' + skillId);
   const [[row]] = await pool.query(
     'SELECT deepskill_image FROM tbl_deep_skill WHERE deepskill_id = ?',
     [skillId],
@@ -1060,6 +1087,7 @@ async function getImageUrl(skillId) {
 const BULK_IMAGE_PRESIGN_TTL_SEC = 25 * 60 * 60; // 25h — must outlive 24h cache TTL.
 
 async function buildAllDeepSkillImages() {
+  logger.info('Build all deep skill image URLs (bulk)');
   const [rows] = await pool.query(
     `SELECT deepskill_id AS deep_skill_id,
             deepskill_image AS image_key
@@ -1067,6 +1095,7 @@ async function buildAllDeepSkillImages() {
       WHERE deepskill_image IS NOT NULL
         AND deepskill_image <> ''`,
   );
+  logger.info('Found ' + rows.length + ' deep skills with images');
   if (!s3Storage.isEnabled() || rows.length === 0) return [];
 
   // Inline presign with explicit 25h expiry — `s3Storage.getPresignedUrl`
@@ -1103,6 +1132,7 @@ async function buildAllDeepSkillImages() {
       return null;
     }
   }));
+  logger.info('Returning ' + presigned.filter(Boolean).length + ' deep skill image URLs');
   return presigned.filter(Boolean);
 }
 

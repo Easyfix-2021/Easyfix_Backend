@@ -105,6 +105,7 @@ function monthName(isoDate) {
  * entirely when a filter list is empty). Window = overall start .. overall end.
  */
 async function getClientDriverSet({ filters, overallStart, overallEnd }) {
+  logger.info('Resolving client driver set · window=' + overallStart + '..' + overallEnd);
   const params = [];
   let where = ' WHERE 1=1';
   where += buildInFilter('TJ.fk_client_id', filters.clientId, params);
@@ -133,6 +134,7 @@ async function getClientDriverSet({ filters, overallStart, overallEnd }) {
        LIMIT ${CLIENT_CAP}`;
 
   const [rows] = await pool.query(sql, params);
+  logger.info('Found ' + rows.length + ' clients in performance driver set');
   if (rows.length >= CLIENT_CAP) {
     logger.warn(
       { report: 'client-performance', cap: CLIENT_CAP, returned: rows.length },
@@ -304,11 +306,13 @@ const r0 = (n) => Math.round(n);
  * (client_id DESC), then PM name for the FE rowspan grouping (FE sorts).
  */
 async function getClientPerformance({ period = 'monthly', filters = {} } = {}) {
+  logger.info('Building Client Performance report · period=' + period);
   const periods = buildPeriods(period); // most-recent first, length 3
   const overallStart = periods[periods.length - 1].startDate; // oldest start
   const overallEnd = periods[0].endDate; // most-recent end
 
   const clientIds = await getClientDriverSet({ filters, overallStart, overallEnd });
+  if (clientIds.length === 0) logger.info('No clients matched · returning 0 rows');
   if (clientIds.length === 0) return [];
 
   // One aggregate set per period (counts + revenue + escalations), plus the
@@ -325,6 +329,7 @@ async function getClientPerformance({ period = 'monthly', filters = {} } = {}) {
   );
   const meta = await getClientMeta(clientIds);
 
+  logger.info('Returning ' + clientIds.length + ' client performance rows · periods=' + periods.length);
   return clientIds.map((id) => {
     const m = meta.get(id) || { clientName: '', projectManager: '' };
     const buckets = perPeriod.map(({ p, counts, revenue, escalations }) => {

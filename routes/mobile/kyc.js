@@ -30,6 +30,7 @@ const multer = require('multer');
 const validate = require('../../middleware/validate');
 const { modernOk, modernError } = require('../../utils/response');
 const kyc = require('../../services/mobile-kyc.service');
+const logger = require('../../logger');
 
 // PAN OCR upload — in-memory, images only, 10 MB cap.
 const upload = multer({
@@ -56,8 +57,11 @@ function handleErr(res, next, e) {
 // POST /digilocker/initialize → { clientId, url, token, expirySeconds }
 router.post('/digilocker/initialize', async (req, res, next) => {
   try {
-    modernOk(res, await kyc.digilockerInitialize(req.tech.efr_id));
-  } catch (e) { handleErr(res, next, e); }
+    logger.info('Initialize DigiLocker session');
+    const out = await kyc.digilockerInitialize(req.tech.efr_id);
+    logger.info('DigiLocker session initialized');
+    modernOk(res, out);
+  } catch (e) { logger.warn('DigiLocker initialize failed · ' + e.message); handleErr(res, next, e); }
 });
 
 // GET /digilocker/aadhaar/:clientId
@@ -68,10 +72,12 @@ router.get(
   validate(Joi.object({ clientId: Joi.string().trim().min(1).max(128).required() }), 'params'),
   async (req, res, next) => {
     try {
+      logger.info('Download DigiLocker Aadhaar · clientId=' + req.params.clientId);
       const out = await kyc.digilockerDownloadAadhaar(req.tech.efr_id, req.params.clientId);
-      if (out && out.pending) return res.status(202).json({ success: true, data: out });
+      if (out && out.pending) { logger.info('DigiLocker consent still pending · clientId=' + req.params.clientId); return res.status(202).json({ success: true, data: out }); }
+      logger.info('DigiLocker Aadhaar downloaded · clientId=' + req.params.clientId);
       modernOk(res, out);
-    } catch (e) { handleErr(res, next, e); }
+    } catch (e) { logger.warn('DigiLocker Aadhaar download failed · clientId=' + req.params.clientId + ' · ' + e.message); handleErr(res, next, e); }
   },
 );
 
@@ -81,10 +87,14 @@ router.get(
 router.post('/pan-ocr', upload.single('file'), async (req, res, next) => {
   try {
     if (!req.file || !req.file.buffer) {
+      logger.warn('PAN OCR rejected · missing image file');
       return modernError(res, 400, 'PAN image is required (multipart field "file")');
     }
-    modernOk(res, await kyc.panOcr(req.tech.efr_id, req.file));
-  } catch (e) { handleErr(res, next, e); }
+    logger.info('PAN OCR · imageBytes=' + req.file.size);
+    const out = await kyc.panOcr(req.tech.efr_id, req.file);
+    logger.info('PAN OCR completed');
+    modernOk(res, out);
+  } catch (e) { logger.warn('PAN OCR failed · ' + e.message); handleErr(res, next, e); }
 });
 
 // ─── 3. Aadhaar OTP ─────────────────────────────────────────────────
@@ -97,8 +107,11 @@ router.post(
   })),
   async (req, res, next) => {
     try {
-      modernOk(res, await kyc.aadhaarGenerateOtp(req.tech.efr_id, req.body.aadhaarNumber));
-    } catch (e) { handleErr(res, next, e); }
+      logger.info('Aadhaar OTP requested');
+      const out = await kyc.aadhaarGenerateOtp(req.tech.efr_id, req.body.aadhaarNumber);
+      logger.info('Aadhaar OTP dispatched');
+      modernOk(res, out);
+    } catch (e) { logger.warn('Aadhaar OTP request failed · ' + e.message); handleErr(res, next, e); }
   },
 );
 
@@ -111,8 +124,11 @@ router.post(
   })),
   async (req, res, next) => {
     try {
-      modernOk(res, await kyc.aadhaarSubmitOtp(req.tech.efr_id, req.body.clientId, req.body.otp));
-    } catch (e) { handleErr(res, next, e); }
+      logger.info('Verify Aadhaar OTP · clientId=' + req.body.clientId);
+      const out = await kyc.aadhaarSubmitOtp(req.tech.efr_id, req.body.clientId, req.body.otp);
+      logger.info('Aadhaar OTP verified · clientId=' + req.body.clientId);
+      modernOk(res, out);
+    } catch (e) { logger.warn('Aadhaar OTP verification failed · clientId=' + req.body.clientId + ' · ' + e.message); handleErr(res, next, e); }
   },
 );
 
@@ -127,8 +143,11 @@ router.post(
   })),
   async (req, res, next) => {
     try {
-      modernOk(res, await kyc.bankVerify(req.tech.efr_id, req.body.accountNumber, req.body.ifsc));
-    } catch (e) { handleErr(res, next, e); }
+      logger.info('Verify bank account');
+      const out = await kyc.bankVerify(req.tech.efr_id, req.body.accountNumber, req.body.ifsc);
+      logger.info('Bank account verification completed');
+      modernOk(res, out);
+    } catch (e) { logger.warn('Bank account verification failed · ' + e.message); handleErr(res, next, e); }
   },
 );
 
@@ -142,8 +161,11 @@ router.post(
   })),
   async (req, res, next) => {
     try {
-      modernOk(res, await kyc.upiVerify(req.tech.efr_id, req.body.upiId));
-    } catch (e) { handleErr(res, next, e); }
+      logger.info('Verify UPI id');
+      const out = await kyc.upiVerify(req.tech.efr_id, req.body.upiId);
+      logger.info('UPI verification completed');
+      modernOk(res, out);
+    } catch (e) { logger.warn('UPI verification failed · ' + e.message); handleErr(res, next, e); }
   },
 );
 

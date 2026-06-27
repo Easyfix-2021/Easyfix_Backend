@@ -15,16 +15,19 @@
  * The matching admin counterpart is routes/admin/jobs-upload.js.
  */
 const { createJobsUploadRouter } = require('../../utils/jobs-upload-router');
+const logger = require('../../logger');
 
 module.exports = createJobsUploadRouter({
   resolveClientId(req) {
     const id = req.spoc?.client_id;
     if (!Number.isInteger(id) || id <= 0) {
+      logger.warn('SPOC bulk-upload blocked · missing client_id');
       throw Object.assign(
         new Error('SPOC has no associated client_id — re-authenticate'),
         { status: 401 }
       );
     }
+    logger.info('SPOC bulk-job-upload scoped · clientId=' + id);
     return id;
   },
   resolveActor() {

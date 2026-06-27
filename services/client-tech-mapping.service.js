@@ -36,6 +36,7 @@
  */
 
 const { pool } = require('../db');
+const logger = require('../logger');
 
 /* ─── Column probes ───────────────────────────────────────────────── */
 
@@ -76,6 +77,7 @@ async function easyfixerHasCityNameCol(p) {
 /* ─── List ────────────────────────────────────────────────────────── */
 
 async function listForClient(clientId) {
+  logger.info('List client tech mappings · clientId=' + clientId);
   // Query 1: mappings + technician info in one JOIN. We deliberately
   // skip the service_type JOIN here to avoid a row-blow-up if a future
   // schema makes service_types many-to-many on a mapping (unlikely
@@ -109,6 +111,7 @@ async function listForClient(clientId) {
       ORDER BY m.service_type_id ASC, e.efr_first_name ASC`,
     [clientId],
   );
+  logger.info('Found ' + mappings.length + ' tech mappings');
   if (mappings.length === 0) return [];
 
   // Query 2: bulk resolve service_type names.
@@ -157,6 +160,7 @@ async function replaceForServiceType(clientId, serviceTypeId, efrIds) {
   const cleaned = Array.from(new Set(
     (efrIds || []).map((x) => Number(x)).filter((n) => Number.isInteger(n) && n > 0),
   ));
+  logger.info('Replace tech mappings · clientId=' + clientId + ' serviceTypeId=' + serviceTypeId + ' techCount=' + cleaned.length);
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
@@ -188,8 +192,10 @@ async function replaceForServiceType(clientId, serviceTypeId, efrIds) {
       );
     }
     await conn.commit();
+    logger.info('Tech mappings replaced · clientId=' + clientId + ' serviceTypeId=' + serviceTypeId + ' assigned=' + cleaned.length);
     return cleaned.length;
   } catch (e) {
+    logger.error('Replace tech mappings failed · clientId=' + clientId + ' serviceTypeId=' + serviceTypeId + ' · ' + e.message);
     try { await conn.rollback(); } catch (_) { /* swallow */ }
     throw e;
   } finally {
@@ -213,6 +219,7 @@ async function replaceForServiceType(clientId, serviceTypeId, efrIds) {
  * gate that behind a column probe).
  */
 async function eligibleTechsFor(serviceTypeId, opts = {}) {
+  logger.info('List eligible techs · serviceTypeId=' + serviceTypeId + ' includeUnverified=' + (opts.includeUnverified === true) + (opts.cityId ? ' cityId=' + opts.cityId : '') + (opts.cityName ? ' cityName=' + opts.cityName : ''));
   const clauses = ['(e.efr_status IS NULL OR e.efr_status = 1)'];
   const params = [];
   if (opts.includeUnverified !== true) clauses.push('e.is_technician_verified = 1');
@@ -240,6 +247,7 @@ async function eligibleTechsFor(serviceTypeId, opts = {}) {
       LIMIT 500`,
     params,
   );
+  logger.info('Found ' + rows.length + ' eligible techs');
   return rows.map((r) => ({
     efr_id: r.efr_id,
     efr_name: [r.efr_first_name, r.efr_last_name].filter(Boolean).join(' ').trim() || null,
@@ -275,6 +283,7 @@ async function eligibleTechsFor(serviceTypeId, opts = {}) {
  * made the legacy list slow on large clients.
  */
 async function summaryForClient(clientId) {
+  logger.info('Tech mapping summary · clientId=' + clientId);
   // Q1: total count per service_type (active mappings only).
   //
   // Note on duplicates: tbl_service_type can contain multiple rows with
@@ -297,6 +306,7 @@ async function summaryForClient(clientId) {
       ORDER BY st.service_type_name ASC, m.service_type_id ASC`,
     [clientId],
   );
+  logger.info('Found ' + counts.length + ' service-type buckets');
   if (counts.length === 0) return [];
 
   // Q2: per-(service_type, city) counts. Probe city column shape once.
@@ -347,6 +357,7 @@ async function summaryForClient(clientId) {
  * `listForClient` rows so the FE can reuse the chip renderer.
  */
 async function listForClientServiceType(clientId, serviceTypeId) {
+  logger.info('List tech mappings for service-type · clientId=' + clientId + ' serviceTypeId=' + serviceTypeId);
   const mobileExpr = (await easyfixerHasMobileCol(pool))
     ? 'e.efr_mobile'
     : 'e.efr_no AS efr_mobile';
@@ -368,6 +379,7 @@ async function listForClientServiceType(clientId, serviceTypeId) {
       ORDER BY ${hasCityNameCol ? 'e.city_name' : 'c.city_name'} ASC, e.efr_first_name ASC`,
     [clientId, serviceTypeId],
   );
+  logger.info('Found ' + mappings.length + ' tech mappings · serviceTypeId=' + serviceTypeId);
   return mappings.map((m) => {
     const name = [m.efr_first_name, m.efr_last_name]
       .filter(Boolean).join(' ').trim() || null;

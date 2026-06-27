@@ -1,18 +1,23 @@
 const logger = require('../logger');
 
 /*
- * One line per HTTP request, in plain English, with emoji signals.
+ * Per HTTP request, sharing the contextual format with app logs (see
+ * utils/log-format.js). Two shapes depending on whether the request emitted
+ * app logs:
  *
- * Format:
- *   12:34:56  ✓  200 GET    /api/auth/me         (6 ms) · harshit@channelplay.in
- *   12:34:57  🔒 401 POST   /api/auth/verify-otp (24 ms) · guest · authentication required
- *   12:34:58  🛑 429 GET    /api/integration/v1/services (0 ms) · api:decathlon · rate limit
- *   12:34:59  💥 500 POST   /api/admin/jobs      (1204 ms) · harshit@channelplay.in · server error
+ *   NO app logs → one full standalone line:
+ *     [12:34:56] [Mobile]  9310992052  → [INFO]  GET    /api/mobile/team  304 (310 ms)
+ *     [12:34:59] [CRM]     harshit@…   → [ERROR] POST   /api/admin/jobs  500 (1204 ms) · server error
  *
- * Icons by status class:
- *   2xx ✓ (green)    3xx ↪ (magenta)    4xx generic ⚠
- *   401/403 🔒       404 ⚠              429 🛑       5xx 💥
+ *   WITH app logs → the logger prints a METHOD-path HEADER on the first app log
+ *   (so the endpoint heads its group), then the access line collapses to a
+ *   compact `↳ <status> (<ms>)` outcome at the bottom:
+ *     [12:34:56] [Mobile]  9310992052  → [INFO]  GET    /api/mobile/earnings?from=…&to=…
+ *     [12:34:56] [Mobile]  9310992052  → [INFO]  Earnings requested · …
+ *     [12:34:56] [Mobile]  9310992052  → [INFO]  Returning 0 earning record(s) · …
+ *     [12:34:56] [Mobile]  9310992052  → [INFO]  ↳ 200 (167 ms)
  *
+ * LEVEL by status class: 2xx/3xx INFO · 4xx WARN · 5xx ERROR.
  * Method is tinted so the eye can find it fast:
  *   GET cyan · POST green · PATCH/PUT yellow · DELETE red · OPTIONS gray
  *
@@ -26,18 +31,7 @@ const logger = require('../logger');
  * other reasons).
  */
 
-const isTTY = process.stdout.isTTY;
-const ANSI = {
-  reset: '\x1b[0m', bold: '\x1b[1m',
-  red: '\x1b[31m', green: '\x1b[32m', yellow: '\x1b[33m',
-  cyan: '\x1b[36m', gray: '\x1b[90m',
-};
-const paint = (color, s) => (isTTY ? `${ANSI[color]}${ANSI.bold}${s}${ANSI.reset}` : String(s));
-
-const METHOD_COLOR = {
-  GET: 'cyan', POST: 'green', PATCH: 'yellow', PUT: 'yellow',
-  DELETE: 'red', OPTIONS: 'gray',
-};
+const { levelFromStatus, contextLine, methodTag } = require('../utils/log-format');
 
 function quickHint(status) {
   if (status === 429) return ' · rate limit';
@@ -85,22 +79,17 @@ module.exports = function httpLog(req, res, next) {
       return;
     }
 
-    const methodStr = paint(METHOD_COLOR[req.method] || 'gray', req.method.padEnd(6));
-    const who =
-      req.user?.official_email ||
-      req.spoc?.contact_email ||
-      (req.tech?.efr_no ? `tech:${req.tech.efr_no}` : null) ||
-      (req.integrationClient?.loginName ? `api:${req.integrationClient.loginName}` : null) ||
-      'guest';
-
-    const sentence = `${status} ${methodStr} ${path}  (${duration} ms) · ${who}${hintFor(res, status)}`;
-
-    if (status === 429)                        logger.rate(sentence);
-    else if (status === 401 || status === 403) logger.security(sentence);
-    else if (status >= 500)                    logger.error(sentence);
-    else if (status >= 400)                    logger.warn(sentence);
-    else if (status >= 300)                    logger.event('↪', 'magenta', sentence);
-    else                                       logger.event('✓', 'green', sentence);
+    // Access line, same `[time] [surface] identity → [LEVEL] …` shape as app
+    // logs. If the request emitted app logs, the logger already printed a header
+    // (METHOD path) ABOVE them, so here we only need the compact outcome
+    // `↳ <status> (<ms>)`. Otherwise we print the full standalone line.
+    // LEVEL follows the status class (2xx/3xx INFO · 4xx WARN · 5xx ERROR).
+    const level = levelFromStatus(status);
+    const hint = hintFor(res, status);
+    const summary = req._logHeaderEmitted
+      ? `↳ ${status} (${duration} ms)${hint}`
+      : `${methodTag(req.method)} ${path}  ${status} (${duration} ms)${hint}`;
+    logger.http(contextLine(req, level, summary));
   });
 
   next();

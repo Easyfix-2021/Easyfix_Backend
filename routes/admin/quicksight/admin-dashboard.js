@@ -36,6 +36,7 @@ const { streamStyledXlsx } = require('../../../utils/xlsx-styled-export');
 const { getRoleById } = require('../../../services/role.service');
 const { fileStamp, displayStamp, FMT, decorateColumns } = require('../../../services/quicksight/_shared');
 const service = require('../../../services/quicksight/quicksight-admin-dashboard.service');
+const logger = require('../../../logger');
 
 const ADMIN_ROLE_ID = 2; // legacy loginToFloorDiscipline gate: roleId == 2.
 
@@ -125,10 +126,11 @@ router.get('/access', (req, res) => modernOk(res, { isAdmin: true }));
 // ── POST /open-orders — three bucket tiles ───────────────────────────────
 router.post('/open-orders', validate(filterSchema), async (req, res, next) => {
   try {
+    logger.info('Admin dashboard open-orders · ' + (req.body.startDate || '…') + '→' + (req.body.endDate || '…') + ' verticalId=' + req.body.verticalId + ' basedOn=' + req.body.findByDateType);
     const data = await service.openOrders(req.body, req.user.user_id);
     return modernOk(res, data);
   } catch (err) {
-    if (err && err.status) return modernError(res, err.status, err.message);
+    if (err && err.status) { logger.warn('Open-orders failed · ' + err.message); return modernError(res, err.status, err.message); }
     return next(err);
   }
 });
@@ -141,6 +143,7 @@ router.post(
   async (req, res, next) => {
     try {
       const { page, size } = req.query;
+      logger.info('Admin dashboard employee-productivity · ' + (req.body.startDate || '…') + '→' + (req.body.endDate || '…') + ' format=' + req.body.format + ' page=' + page + ' size=' + size);
 
       if (req.body.format === 'xlsx') {
         // XLSX reflects the FULL filtered set, not one page: fetch at the
@@ -149,6 +152,7 @@ router.post(
         // on-screen pagination below stay unchanged.
         const fullResult = await service.employeeProductivity(req.body, 1, service.USER_LIST_LIMIT);
         const rows = fullResult.data || [];
+        logger.info('Exporting ' + rows.length + ' employee-productivity rows to xlsx');
         const sum = (key) => rows.reduce((a, r) => a + (Number(r[key]) || 0), 0);
         const totalBooked = sum('booked');
         const totalScheduled = sum('scheduled');
@@ -197,9 +201,10 @@ router.post(
         return;
       }
       const result = await service.employeeProductivity(req.body, page, size);
+      logger.info('Returning ' + ((result.data && result.data.length) || 0) + ' employee-productivity rows');
       return modernOk(res, result);
     } catch (err) {
-      if (err && err.status) return modernError(res, err.status, err.message);
+      if (err && err.status) { logger.warn('Employee-productivity failed · ' + err.message); return modernError(res, err.status, err.message); }
       return next(err);
     }
   }
@@ -208,10 +213,11 @@ router.post(
 // ── POST /kra-metrics — single aggregate KPI row ─────────────────────────
 router.post('/kra-metrics', validate(filterSchema), async (req, res, next) => {
   try {
+    logger.info('Admin dashboard kra-metrics · ' + (req.body.startDate || '…') + '→' + (req.body.endDate || '…') + ' verticalId=' + req.body.verticalId);
     const data = await service.kraMetrics(req.body, req.user.user_id);
     return modernOk(res, data);
   } catch (err) {
-    if (err && err.status) return modernError(res, err.status, err.message);
+    if (err && err.status) { logger.warn('Kra-metrics failed · ' + err.message); return modernError(res, err.status, err.message); }
     return next(err);
   }
 });
@@ -219,10 +225,11 @@ router.post('/kra-metrics', validate(filterSchema), async (req, res, next) => {
 // ── POST /cancellation-details — buckets + before/after summary ───────────
 router.post('/cancellation-details', validate(filterSchema), async (req, res, next) => {
   try {
+    logger.info('Admin dashboard cancellation-details · ' + (req.body.startDate || '…') + '→' + (req.body.endDate || '…') + ' verticalId=' + req.body.verticalId);
     const data = await service.cancellationDetails(req.body, req.user.user_id);
     return modernOk(res, data);
   } catch (err) {
-    if (err && err.status) return modernError(res, err.status, err.message);
+    if (err && err.status) { logger.warn('Cancellation-details failed · ' + err.message); return modernError(res, err.status, err.message); }
     return next(err);
   }
 });
@@ -230,11 +237,12 @@ router.post('/cancellation-details', validate(filterSchema), async (req, res, ne
 // ── GET /manager-team — org-chart tree rooted at user_id=3 ('CEO') ────────
 router.get('/manager-team', async (req, res, next) => {
   try {
+    logger.info('Admin dashboard manager-team tree');
     const tree = await service.managerTeam();
     if (!tree) return modernError(res, 404, 'No organization data found');
     return modernOk(res, tree);
   } catch (err) {
-    if (err && err.status) return modernError(res, err.status, err.message);
+    if (err && err.status) { logger.warn('Manager-team failed · ' + err.message); return modernError(res, err.status, err.message); }
     return next(err);
   }
 });
@@ -245,10 +253,11 @@ router.get(
   validate(verticalManagersQuerySchema, 'query'),
   async (req, res, next) => {
     try {
+      logger.info('Admin dashboard vertical-managers · verticalId=' + req.query.verticalId);
       const data = await service.verticalManagers(req.query.verticalId);
       return modernOk(res, data);
     } catch (err) {
-      if (err && err.status) return modernError(res, err.status, err.message);
+      if (err && err.status) { logger.warn('Vertical-managers failed · ' + err.message); return modernError(res, err.status, err.message); }
       return next(err);
     }
   }
@@ -260,13 +269,14 @@ router.get(
   validate(rmTeamUsersQuerySchema, 'query'),
   async (req, res, next) => {
     try {
+      logger.info('Admin dashboard rm-team-users · verticalId=' + req.query.verticalId + ' reportingManagerId=' + req.query.reportingManagerId);
       const data = await service.rmTeamUsers(
         req.query.verticalId,
         req.query.reportingManagerId
       );
       return modernOk(res, data);
     } catch (err) {
-      if (err && err.status) return modernError(res, err.status, err.message);
+      if (err && err.status) { logger.warn('Rm-team-users failed · ' + err.message); return modernError(res, err.status, err.message); }
       return next(err);
     }
   }

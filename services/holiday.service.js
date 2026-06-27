@@ -117,6 +117,7 @@ function getYear(year) {
  * safe — when `days` spans Dec→Jan we read both years and merge.
  */
 function getUpcoming({ days = 7 } = {}) {
+  logger.info('Get upcoming holidays · days=' + days);
   days = Math.max(1, Math.min(Number(days) || 7, 30));
 
   // Compare against today's date in LOCAL time (server TZ assumed IST
@@ -153,6 +154,7 @@ function getUpcoming({ days = 7 } = {}) {
   // Stable sort by date then name (matters when two holidays share a
   // date — e.g. 2 Oct 2025 had both Gandhi Jayanti and Dussehra).
   merged.sort((a, b) => a.date.localeCompare(b.date) || a.name.localeCompare(b.name));
+  logger.info('Returning ' + merged.length + ' upcoming holidays · window ' + todayStr + '..' + endStr);
   return Promise.resolve(merged);                      // keep async signature
 }
 

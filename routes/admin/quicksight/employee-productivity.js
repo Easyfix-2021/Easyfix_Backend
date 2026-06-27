@@ -38,6 +38,7 @@ const { modernOk, modernError } = require('../../../utils/response');
 const { streamStyledXlsx } = require('../../../utils/xlsx-styled-export');
 const { fileStamp, displayStamp, FMT } = require('../../../services/quicksight/_shared');
 const service = require('../../../services/quicksight/quicksight-employee-productivity.service');
+const logger = require('../../../logger');
 
 // XLSX export fetches the FULL filtered set (not one page). Sized to the
 // service's grouped-rows cap (GROUPED_CAP) so the download reflects every
@@ -106,6 +107,7 @@ const PRODUCTIVITY_XLSX_COLUMNS = [
  */
 router.get('/employee-productivity', validate(productivitySchema, 'query'), async (req, res, next) => {
   try {
+    logger.info('Employee Productivity table · ' + req.query.startDate + '→' + req.query.endDate + ' verticalId=' + req.query.verticalId + ' zonalManagerId=' + req.query.zonalManagerId + ' reportingManagerId=' + req.query.reportingManagerId + ' userId=' + req.query.userId + ' page=' + req.query.page + ' size=' + req.query.size + ' format=' + (req.query.format || 'json'));
     const pf = await service.processFloorFilters(req.query);
 
     if (req.query.format === 'xlsx') {
@@ -118,6 +120,7 @@ router.get('/employee-productivity', validate(productivitySchema, 'query'), asyn
         size: XLSX_EXPORT_SIZE,
       });
       const exportRows = fullResult.data || [];
+      logger.info('Streaming Employee Productivity xlsx · ' + exportRows.length + ' employees');
       // Headline KPIs over the full filtered set (plain numbers, Title Case).
       const sumOf = (k) => exportRows.reduce((a, r) => a + (Number(r[k]) || 0), 0);
       const totalBooked = sumOf('booked');
@@ -159,8 +162,11 @@ router.get('/employee-productivity', validate(productivitySchema, 'query'), asyn
       page: req.query.page,
       size: req.query.size,
     });
+    logger.info('Returning ' + ((result && result.data ? result.data.length : 0)) + ' employees · total=' + (result && result.total != null ? result.total : 'n/a'));
     return modernOk(res, result);
   } catch (err) {
+    if (err && err.status) logger.warn('Employee Productivity table failed · ' + err.message);
+    else logger.error('Employee Productivity table error · ' + err.message);
     if (err && err.status) return modernError(res, err.status, err.message);
     return next(err);
   }
@@ -170,10 +176,13 @@ router.get('/employee-productivity', validate(productivitySchema, 'query'), asyn
 // rating/unconfirmed/call-later).
 router.get('/kra-metrics', validate(windowedSchema, 'query'), async (req, res, next) => {
   try {
+    logger.info('KRA metrics · ' + req.query.startDate + '→' + req.query.endDate + ' verticalId=' + req.query.verticalId + ' userId=' + req.query.userId);
     const pf = await service.processFloorFilters(req.query);
     const data = await service.getKraMetrics({ pf });
     return modernOk(res, data);
   } catch (err) {
+    if (err && err.status) logger.warn('KRA metrics failed · ' + err.message);
+    else logger.error('KRA metrics error · ' + err.message);
     if (err && err.status) return modernError(res, err.status, err.message);
     return next(err);
   }
@@ -182,10 +191,13 @@ router.get('/kra-metrics', validate(windowedSchema, 'query'), async (req, res, n
 // GET /dashboard-counts — 3 open-order tiles (open / call-later / escalation).
 router.get('/dashboard-counts', validate(windowedSchema, 'query'), async (req, res, next) => {
   try {
+    logger.info('Open-order dashboard counts · ' + req.query.startDate + '→' + req.query.endDate + ' verticalId=' + req.query.verticalId + ' userId=' + req.query.userId);
     const pf = await service.processFloorFilters(req.query);
     const data = await service.getDashboardCounts({ pf });
     return modernOk(res, data);
   } catch (err) {
+    if (err && err.status) logger.warn('Dashboard counts failed · ' + err.message);
+    else logger.error('Dashboard counts error · ' + err.message);
     if (err && err.status) return modernError(res, err.status, err.message);
     return next(err);
   }
@@ -194,10 +206,13 @@ router.get('/dashboard-counts', validate(windowedSchema, 'query'), async (req, r
 // GET /cancellation-details — 4 cancellation aging buckets + before/after summary.
 router.get('/cancellation-details', validate(windowedSchema, 'query'), async (req, res, next) => {
   try {
+    logger.info('Cancellation details · ' + req.query.startDate + '→' + req.query.endDate + ' verticalId=' + req.query.verticalId + ' userId=' + req.query.userId);
     const pf = await service.processFloorFilters(req.query);
     const data = await service.getCancellationDetails({ pf });
     return modernOk(res, data);
   } catch (err) {
+    if (err && err.status) logger.warn('Cancellation details failed · ' + err.message);
+    else logger.error('Cancellation details error · ' + err.message);
     if (err && err.status) return modernError(res, err.status, err.message);
     return next(err);
   }
@@ -206,9 +221,13 @@ router.get('/cancellation-details', validate(windowedSchema, 'query'), async (re
 // GET /reporting-managers — RM picker, filtered by vertical (0 = all).
 router.get('/reporting-managers', validate(reportingManagersSchema, 'query'), async (req, res, next) => {
   try {
+    logger.info('Reporting managers lookup · verticalId=' + req.query.verticalId);
     const data = await service.getReportingManagers({ verticalId: req.query.verticalId });
+    logger.info('Returning ' + (Array.isArray(data) ? data.length : 0) + ' reporting managers');
     return modernOk(res, data);
   } catch (err) {
+    if (err && err.status) logger.warn('Reporting managers lookup failed · ' + err.message);
+    else logger.error('Reporting managers lookup error · ' + err.message);
     if (err && err.status) return modernError(res, err.status, err.message);
     return next(err);
   }
@@ -217,12 +236,16 @@ router.get('/reporting-managers', validate(reportingManagersSchema, 'query'), as
 // GET /rm-team-users — user picker, filtered by vertical + RM (0 = all).
 router.get('/rm-team-users', validate(rmTeamUsersSchema, 'query'), async (req, res, next) => {
   try {
+    logger.info('RM team users lookup · verticalId=' + req.query.verticalId + ' reportingManagerId=' + req.query.reportingManagerId);
     const data = await service.getRmTeamUsers({
       verticalId: req.query.verticalId,
       reportingManagerId: req.query.reportingManagerId,
     });
+    logger.info('Returning ' + (Array.isArray(data) ? data.length : 0) + ' team users');
     return modernOk(res, data);
   } catch (err) {
+    if (err && err.status) logger.warn('RM team users lookup failed · ' + err.message);
+    else logger.error('RM team users lookup error · ' + err.message);
     if (err && err.status) return modernError(res, err.status, err.message);
     return next(err);
   }
@@ -234,10 +257,14 @@ router.get('/rm-team-users', validate(rmTeamUsersSchema, 'query'), async (req, r
 // processFloorFilters start/end; completed = job_status IN (3, 5).
 router.get('/spoc-revenue', validate(windowedSchema, 'query'), async (req, res, next) => {
   try {
+    logger.info('SPOC revenue · ' + req.query.startDate + '→' + req.query.endDate + ' verticalId=' + req.query.verticalId + ' userId=' + req.query.userId);
     const pf = await service.processFloorFilters(req.query);
     const data = await service.getSpocRevenue({ pf });
+    logger.info('Returning ' + (Array.isArray(data) ? data.length : 0) + ' SPOC revenue rows');
     return modernOk(res, data);
   } catch (err) {
+    if (err && err.status) logger.warn('SPOC revenue failed · ' + err.message);
+    else logger.error('SPOC revenue error · ' + err.message);
     if (err && err.status) return modernError(res, err.status, err.message);
     return next(err);
   }

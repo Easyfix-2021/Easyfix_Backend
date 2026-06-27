@@ -60,8 +60,9 @@ function mapPlivoStatus(callStatus, hangupCause) {
 // ─── POST /ring — agent leg ringing ────────────────────────────────────
 router.post('/ring', async (req, res) => {
   const claims = plivo.verifyCallToken(req.query.t);
-  if (!claims) return res.json({ ok: true }); // expired/invalid token → no-op
+  if (!claims) { logger.warn('Plivo ring webhook · invalid/expired token, no-op'); return res.json({ ok: true }); } // expired/invalid token → no-op
 
+  logger.info('Plivo ring webhook · jci=' + claims.jci);
   try {
     await pool.query(
       `UPDATE tbl_job_caller_info
@@ -74,13 +75,14 @@ router.post('/ring', async (req, res) => {
     logger.warn({ jci: claims.jci, err: err && err.message }, 'plivo ring webhook: update failed');
   }
   await plivoLog.markRinging(claims.jci, req.body.CallUUID || null);
+  logger.info('Plivo ring recorded · jci=' + claims.jci);
   return res.json({ ok: true });
 });
 
 // ─── POST /hangup — call ended (final status) ──────────────────────────
 router.post('/hangup', async (req, res) => {
   const claims = plivo.verifyCallToken(req.query.t);
-  if (!claims) return res.json({ ok: true }); // expired/invalid token → no-op
+  if (!claims) { logger.warn('Plivo hangup webhook · invalid/expired token, no-op'); return res.json({ ok: true }); } // expired/invalid token → no-op
 
   const status = mapPlivoStatus(req.body.CallStatus, req.body.HangupCause);
   const durRaw = req.body.Duration;
@@ -88,6 +90,7 @@ router.post('/hangup', async (req, res) => {
     ? parseInt(durRaw, 10)
     : null;
 
+  logger.info('Plivo hangup webhook · jci=' + claims.jci + ' status=' + status + ' duration=' + (duration != null ? duration : 'n/a'));
   try {
     await pool.query(
       `UPDATE tbl_job_caller_info
@@ -105,6 +108,7 @@ router.post('/hangup', async (req, res) => {
   await plivoLog.markTerminalByJci(claims.jci, {
     status, duration, hangupCause: req.body.HangupCause || null, callUuid: req.body.CallUUID || null,
   });
+  logger.info('Plivo call finalized · jci=' + claims.jci + ' status=' + status);
   return res.json({ ok: true });
 });
 
@@ -115,7 +119,7 @@ router.post('/hangup', async (req, res) => {
 // it bridged. Best-effort; never overwrites an already-terminal row; always 200.
 router.post('/web-hangup', async (req, res) => {
   const callUuid = req.body.CallUUID || null;
-  if (!callUuid) return res.json({ ok: true });
+  if (!callUuid) { logger.warn('Plivo web-hangup webhook · missing CallUUID, no-op'); return res.json({ ok: true }); }
 
   const status = mapPlivoStatus(req.body.CallStatus, req.body.HangupCause);
   const durRaw = req.body.Duration;
@@ -123,6 +127,7 @@ router.post('/web-hangup', async (req, res) => {
     ? parseInt(durRaw, 10)
     : null;
 
+  logger.info('Plivo web-hangup webhook · callUuid=' + callUuid + ' status=' + status + ' duration=' + (duration != null ? duration : 'n/a'));
   try {
     await pool.query(
       `UPDATE tbl_job_caller_info
@@ -137,6 +142,7 @@ router.post('/web-hangup', async (req, res) => {
   await plivoLog.markTerminalByCallUuid(callUuid, {
     status, duration, hangupCause: req.body.HangupCause || null,
   });
+  logger.info('Plivo web call finalized · callUuid=' + callUuid + ' status=' + status);
   return res.json({ ok: true });
 });
 

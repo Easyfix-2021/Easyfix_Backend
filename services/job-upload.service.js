@@ -54,6 +54,7 @@ function composeRemarks(parsed) {
 
 async function bulkUpload({ rows, skipCount, totalRows }, actor, opts = {}) {
   const { dryRun = false, clientId = null } = opts;
+  logger.info('Bulk job upload · clientId=' + clientId + ' · totalRows=' + totalRows + ' · skipCount=' + skipCount + ' · dryRun=' + dryRun);
 
   if (!clientId) {
     const err = new Error('clientId is required — pick a client on the upload form');
@@ -142,6 +143,7 @@ async function bulkUpload({ rows, skipCount, totalRows }, actor, opts = {}) {
     }
   }
 
+  logger.info('Bulk upload done · created=' + createdCount + ' · failed=' + failedCount + ' · skipped=' + skipCount + ' · totalRows=' + totalRows + ' · dryRun=' + dryRun);
   return {
     summary: {
       totalRows, createdCount, failedCount, skipCount,

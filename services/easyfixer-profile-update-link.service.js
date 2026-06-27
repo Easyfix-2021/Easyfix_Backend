@@ -213,6 +213,7 @@ function profileUpdateUrl(token) {
  * page render the same data).
  */
 async function fetchPrefill(efrId, pool) {
+  logger.info('Fetch profile-update prefill · efrId=' + efrId);
   // Header + basic editable fields. Join tbl_user so the FE can render the
   // canonical full name + display email/pincode the technician sees in the
   // mobile app, even if the per-easyfixer fields drift.
@@ -244,6 +245,7 @@ async function fetchPrefill(efrId, pool) {
     [efrId],
   );
   if (!row) {
+    logger.warn('Fetch profile-update prefill failed · easyfixer not found · efrId=' + efrId);
     const err = new Error('easyfixer not found');
     err.status = 404;
     throw err;
@@ -285,6 +287,8 @@ async function fetchPrefill(efrId, pool) {
   const deepSkillCatalog = mappedCategoryIds.size === 0
     ? []
     : fullDeepSkillCatalog.filter((c) => mappedCategoryIds.has(c.category_id));
+
+  logger.info('Returning prefill · efrId=' + efrId + ' · deepSkillMappings=' + deepSkillMappings.length + ' · catalogCategories=' + deepSkillCatalog.length + ' · mappedCategoryIds=' + mappedCategoryIds.size);
 
   return {
     header: {
@@ -658,6 +662,7 @@ async function buildDeepSkillCatalog(pool) {
 async function searchPincodes(q, limit, pool) {
   const cap = Math.min(Math.max(Number(limit) || 50, 1), 200);
   const term = (q == null ? '' : String(q)).trim();
+  logger.info('Search pincodes · q=' + term + ' · limit=' + cap);
   // district lives on tbl_pincode (per-pincode override) OR tbl_city (the
   // city-level default) — COALESCE mirrors pincode.service.js so both the
   // text-search OR and any future label can read a single `district` value.
@@ -712,6 +717,8 @@ async function searchPincodes(q, limit, pool) {
       [prefix, prefix, cap],
     );
   }
+  logger.info('Found ' + rows.length + ' pincodes');
+
   return rows.map((r) => ({
     pincode_id: Number(r.pincode_id),
     pincode: String(r.pincode),
@@ -741,6 +748,7 @@ async function searchPincodes(q, limit, pool) {
  * Note `jobId` is named for spec parity — it carries the efr_id value.
  */
 async function sendForEasyfixer(efrId, { action = 'first', override_mobile, bypassTestRedirect = false } = {}, actor, pool) {
+  logger.info('Send profile-update link · efrId=' + efrId + ' · action=' + action);
   const [[row]] = await pool.query(
     `SELECT efr_id, efr_no, efr_name, efr_first_name, efr_last_name,
             profile_update_sent_at, profile_update_send_count
@@ -751,11 +759,13 @@ async function sendForEasyfixer(efrId, { action = 'first', override_mobile, bypa
     [efrId],
   );
   if (!row) {
+    logger.warn('Send profile-update link failed · easyfixer not found · efrId=' + efrId);
     const err = new Error('easyfixer not found');
     err.status = 404;
     throw err;
   }
   if (!row.efr_no) {
+    logger.warn('Send profile-update link failed · no mobile on file · efrId=' + efrId);
     const err = new Error('easyfixer has no mobile on file — cannot send WhatsApp link');
     err.status = 422;
     throw err;
@@ -914,6 +924,8 @@ async function sendForEasyfixer(efrId, { action = 'first', override_mobile, bypa
     'easyfixer-profile-update: send attempted',
   );
 
+  logger.info('Profile-update link sent · efrId=' + efrId + ' · action=' + effectiveAction + ' · delivered=' + (!!response.delivered) + ' · sendCount=' + ((Number(row.profile_update_send_count) || 0) + 1));
+
   return {
     // `jobId` field name kept for cross-flow parity with job-magic-link's
     // send response shape (and called out in the spec). It carries the
@@ -970,6 +982,10 @@ async function sendForEasyfixer(efrId, { action = 'first', override_mobile, bypa
  * paint a "Saved at X" confirmation without a second round-trip.
  */
 async function acceptSubmission(efrId, payload, pool) {
+  logger.info('Accept profile-update submission · efrId=' + efrId
+    + ' · hasBasic=' + !!(payload && payload.basic)
+    + ' · deepSkillItems=' + (Array.isArray(payload?.deep_skill_items) ? payload.deep_skill_items.length : 0)
+    + ' · pincodeIds=' + (Array.isArray(payload?.serviceable_pincode_ids) ? payload.serviceable_pincode_ids.length : 0));
   // Map payload field names → tbl_easyfixer column names. Only columns in
   // EDITABLE_BASIC_COLUMNS are written — anything else is silently dropped
   // (column-allowlist defence; see EDITABLE_BASIC_COLUMNS docblock).
@@ -996,6 +1012,7 @@ async function acceptSubmission(efrId, payload, pool) {
       [efrId],
     );
     if (!exists) {
+      logger.warn('Accept profile-update submission failed · easyfixer not found · efrId=' + efrId);
       throw Object.assign(new Error('easyfixer not found'), { status: 404 });
     }
 
@@ -1030,7 +1047,9 @@ async function acceptSubmission(efrId, payload, pool) {
     }
 
     await conn.commit();
+    logger.info('Profile-update submission committed · efrId=' + efrId + ' · basicFieldsUpdated=' + sets.length);
   } catch (e) {
+    logger.warn('Profile-update submission rolled back · efrId=' + efrId + ' · ' + e.message);
     try { await conn.rollback(); } catch (_e) { /* swallow */ }
     throw e;
   } finally {

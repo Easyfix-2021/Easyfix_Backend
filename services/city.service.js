@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const logger = require('../logger');
 
 /*
  * Manage Cities — generic master.
@@ -48,6 +49,8 @@ async function listCities({
   limit  = Math.min(Math.max(Number(limit)  || 200, 1), 1000);
   offset = Math.max(Number(offset) || 0, 0);
 
+  logger.info('List cities · q=' + (q || '-') + ' stateId=' + (stateId || '-') + ' includeInactive=' + includeInactive + ' sortBy=' + sortBy + ' sortDir=' + sortDir + ' limit=' + limit + ' offset=' + offset);
+
   const sortExpr = SORTABLE_COLUMNS[sortBy] || SORTABLE_COLUMNS.city_name;
   const dir      = String(sortDir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
   // Stable secondary sort on city_id keeps row order deterministic when
@@ -88,15 +91,19 @@ async function listCities({
     [...params, limit, offset]
   );
 
+  logger.info('Found ' + rows.length + ' cities');
+
   const [[{ total }]] = await pool.query(
     `SELECT COUNT(*) AS total FROM tbl_city c WHERE ${where.join(' AND ')}`,
     params
   );
 
+  logger.info('Returning ' + rows.length + ' cities · total=' + total);
   return { items: rows, total };
 }
 
 async function getCityById(cityId) {
+  logger.info('Get city by id · id=' + cityId);
   const [[row]] = await pool.query(
     `SELECT c.city_id, c.city_name, c.state_id, s.state_name,
             c.district, c.tier, c.reference_pincode, c.city_status,
@@ -116,6 +123,7 @@ async function getCityById(cityId) {
 
 // ─── Create ──────────────────────────────────────────────────────────
 async function createCity({ city_name, state_id, district, tier, reference_pincode }) {
+  logger.info('Create city · city_name=' + (city_name || '-') + ' state_id=' + (state_id || '-') + ' district=' + (district || '-') + ' tier=' + (tier || '-'));
   const trimmed = String(city_name || '').trim();
   if (!trimmed) throw mkErr(400, 'city_name is required');
   if (!state_id) throw mkErr(400, 'state_id is required');
@@ -147,11 +155,13 @@ async function createCity({ city_name, state_id, district, tier, reference_pinco
       STATUS_ACTIVE,
     ]
   );
+  logger.info('City created · id=' + r.insertId);
   return getCityById(r.insertId);
 }
 
 // ─── Update ──────────────────────────────────────────────────────────
 async function updateCity(cityId, fields) {
+  logger.info('Update city · id=' + cityId + ' fields=[' + Object.keys(fields || {}).join(',') + ']');
   const sets = [];
   const params = [];
 
@@ -185,6 +195,7 @@ async function updateCity(cityId, fields) {
   params.push(cityId);
   const [r] = await pool.query(`UPDATE tbl_city SET ${sets.join(', ')} WHERE city_id = ?`, params);
   if (!r.affectedRows) return null;
+  logger.info('City updated · id=' + cityId);
   return getCityById(cityId);
 }
 
@@ -196,10 +207,12 @@ async function updateCity(cityId, fields) {
  * default lists while preserving every historical reference.
  */
 async function deactivateCity(cityId) {
+  logger.info('Deactivate city · id=' + cityId);
   const [r] = await pool.query(
     'UPDATE tbl_city SET city_status = 0 WHERE city_id = ?',
     [cityId]
   );
+  logger.info('City deactivated · id=' + cityId + ' affected=' + r.affectedRows);
   return r.affectedRows > 0;
 }
 

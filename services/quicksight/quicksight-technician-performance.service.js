@@ -498,6 +498,7 @@ function pct(count, denom) {
  * from. period startDate/endDate are the DISPLAY dates (sqlEnd - 1).
  */
 async function getTechnicianPerformance({ flag = 'monthly', page = 1, pageSize = 10, filters = {} } = {}) {
+  logger.info('Technician Performance · flag=' + flag + ' page=' + page + ' pageSize=' + pageSize);
   const periods = buildPeriods(flag); // oldest→newest, length 3
 
   const reportingManagerId = filters.reportingManagerId;
@@ -514,9 +515,11 @@ async function getTechnicianPerformance({ flag = 'monthly', page = 1, pageSize =
   });
 
   const totalPages = pageSize > 0 ? Math.ceil(totalRecords / pageSize) : 0;
+  logger.info('Found ' + txIds.length + ' technicians on page · totalRecords=' + totalRecords);
 
   // Empty-list synthetic "No Technician" row (legacy parity).
   if (txIds.length === 0) {
+    logger.info('Returning synthetic No-Technician row · 0 technicians');
     const zeroed = periods.map((p) => zeroPeriod(p));
     return {
       data: [{
@@ -593,6 +596,7 @@ async function getTechnicianPerformance({ flag = 'monthly', page = 1, pageSize =
     };
   });
 
+  logger.info('Returning ' + data.length + ' technicians · totalRecords=' + totalRecords);
   return { data, page, pageSize, totalRecords, totalPages };
 }
 
@@ -632,6 +636,7 @@ function zeroPeriod(p) {
  * }
  */
 async function getTxPerformanceCategoryWise({ flag = 'monthly', txId } = {}) {
+  logger.info('Technician category-wise performance · flag=' + flag + ' txId=' + txId);
   const periods = buildPeriods(flag); // oldest→newest, length 3
 
   const performanceData = await Promise.all(
@@ -665,6 +670,7 @@ async function getTxPerformanceCategoryWise({ flag = 'monthly', txId } = {}) {
     }),
   );
 
+  logger.info('Returning category-wise performance · txId=' + txId + ' periods=' + performanceData.length);
   return { technicianId: txId, performanceData };
 }
 

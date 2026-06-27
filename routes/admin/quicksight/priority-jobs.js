@@ -27,6 +27,7 @@
 const router = require('express').Router();
 const Joi = require('joi');
 
+const logger = require('../../../logger');
 const requireQuickSight = require('../../../middleware/require-quicksight');
 const validate = require('../../../middleware/validate');
 const { modernOk, modernError } = require('../../../utils/response');
@@ -85,10 +86,16 @@ const EXPORT_XLSX_COLUMNS = [
 router.post('/grid', validate(gridSchema), async (req, res, next) => {
   try {
     const { pageNo, pageSize, ...filters } = req.body;
+    logger.info('Priority Jobs grid · pageNo=' + pageNo + ' pageSize=' + pageSize);
     const result = await service.grid(req.user, filters, { pageNo, pageSize });
+    logger.info('Returning Priority Jobs grid · ' + (result && result.paginatedData && result.paginatedData.totalRecords != null ? result.paginatedData.totalRecords : 0) + ' cities');
     return modernOk(res, result);
   } catch (err) {
-    if (err && err.status) return modernError(res, err.status, err.message);
+    if (err && err.status) {
+      logger.warn('Priority Jobs grid failed · ' + err.message);
+      return modernError(res, err.status, err.message);
+    }
+    logger.error('Priority Jobs grid error · ' + err.message);
     return next(err);
   }
 });
@@ -96,10 +103,16 @@ router.post('/grid', validate(gridSchema), async (req, res, next) => {
 // ── POST /city-jobs — drill-down for the clicked city ─────────────────
 router.post('/city-jobs', validate(cityJobsSchema), async (req, res, next) => {
   try {
+    logger.info('Priority Jobs city drill-down · cityId=' + JSON.stringify(req.body.cityId));
     const rows = await service.cityJobs(req.user, req.body);
+    logger.info('Returning ' + rows.length + ' city jobs');
     return modernOk(res, rows);
   } catch (err) {
-    if (err && err.status) return modernError(res, err.status, err.message);
+    if (err && err.status) {
+      logger.warn('Priority Jobs city drill-down failed · ' + err.message);
+      return modernError(res, err.status, err.message);
+    }
+    logger.error('Priority Jobs city drill-down error · ' + err.message);
     return next(err);
   }
 });
@@ -107,7 +120,9 @@ router.post('/city-jobs', validate(cityJobsSchema), async (req, res, next) => {
 // ── POST /export — job-level XLSX (closed-jobs quirk preserved in service) ──
 router.post('/export', validate(exportSchema), async (req, res, next) => {
   try {
+    logger.info('Priority Jobs export · format=' + (req.body.format || 'json'));
     const rows = await service.copyData(req.user, req.body);
+    logger.info('Found ' + rows.length + ' jobs to export');
 
     if (req.body.format === 'xlsx') {
       // KPIs derived from the exported job-level rows (closed-jobs set —
@@ -137,11 +152,17 @@ router.post('/export', validate(exportSchema), async (req, res, next) => {
         ],
         emptyMessage: 'No Priority Jobs Found.',
       });
+      logger.info('Streamed Priority Jobs xlsx · ' + rows.length + ' jobs');
       return;
     }
+    logger.info('Returning ' + rows.length + ' jobs');
     return modernOk(res, rows);
   } catch (err) {
-    if (err && err.status) return modernError(res, err.status, err.message);
+    if (err && err.status) {
+      logger.warn('Priority Jobs export failed · ' + err.message);
+      return modernError(res, err.status, err.message);
+    }
+    logger.error('Priority Jobs export error · ' + err.message);
     return next(err);
   }
 });

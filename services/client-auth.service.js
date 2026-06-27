@@ -54,7 +54,9 @@ async function findSpocById(id) {
 }
 
 async function createLoginOtp(identifier) {
+  logger.info('Create client SPOC login OTP');
   const spoc = await findSpoc(identifier);
+  if (!spoc) logger.warn('Create login OTP · SPOC not found');
   if (!spoc) return { found: false };
   // Contact (this specific SPOC row) was deactivated by their client
   // admin via Profile → Contacts. Distinguish from "doesn't exist" so
@@ -114,11 +116,14 @@ async function createLoginOtp(identifier) {
     contextLabel: 'spoc',
   });
 
+  logger.info('Client SPOC login OTP issued · spocId=' + spoc.id + ' clientId=' + spoc.client_id);
   return { found: true, expiresAt: expires };
 }
 
 async function verifyLoginOtp(identifier, otp) {
+  logger.info('Verify client SPOC login OTP');
   const spoc = await findSpoc(identifier);
+  if (!spoc) logger.warn('Verify login OTP · reason=USER_NOT_FOUND');
   if (!spoc) return { ok: false, reason: 'USER_NOT_FOUND' };
   // Same two-tier inactive checks as createLoginOtp. Order matters:
   // CONTACT_INACTIVE wins over CLIENT_INACTIVE because the SPOC's own
@@ -140,11 +145,14 @@ async function verifyLoginOtp(identifier, otp) {
       LIMIT 1`,
     [spoc.contact_email, spoc.contact_no]
   );
+  if (!row) logger.warn('Verify login OTP · reason=NO_OTP_ISSUED · spocId=' + spoc.id);
   if (!row) return { ok: false, reason: 'NO_OTP_ISSUED' };
   if (row.is_expired || new Date(row.valid_up_to).getTime() < Date.now()) {
     await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
+    logger.warn('Verify login OTP · reason=OTP_EXPIRED · spocId=' + spoc.id);
     return { ok: false, reason: 'OTP_EXPIRED' };
   }
+  if (Number(row.otp) !== Number(otp)) logger.warn('Verify login OTP · reason=OTP_MISMATCH · spocId=' + spoc.id);
   if (Number(row.otp) !== Number(otp)) return { ok: false, reason: 'OTP_MISMATCH' };
   await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
 
@@ -153,6 +161,7 @@ async function verifyLoginOtp(identifier, otp) {
     process.env.JWT_SECRET,
     { expiresIn: process.env.JWT_EXPIRY || '30d' }
   );
+  logger.info('Client SPOC login OTP verified · spocId=' + spoc.id + ' clientId=' + spoc.client_id);
   return { ok: true, token, spoc };
 }
 

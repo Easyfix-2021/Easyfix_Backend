@@ -79,6 +79,7 @@ function buildSharedFilters(filters, params) {
  * pmName null→'NA' and numeric nulls→0.
  */
 async function summary(filters = {}) {
+  logger.info('Open Orders summary · clientId=' + JSON.stringify(filters.clientId || []) + ' serviceCategoryId=' + JSON.stringify(filters.serviceCategoryId || []) + ' verticalId=' + JSON.stringify(filters.verticalId || []) + ' zonalManagerId=' + JSON.stringify(filters.zonalManagerId || []));
   const params = [];
   const filterWhere = buildSharedFilters(filters, params);
 
@@ -121,6 +122,7 @@ async function summary(filters = {}) {
   `;
 
   const [rows] = await pool.query(sql, params);
+  logger.info('Found ' + rows.length + ' job-owner summary rows');
 
   if (rows.length >= SUMMARY_LIMIT) {
     logger.warn(
@@ -150,6 +152,7 @@ async function summary(filters = {}) {
  * Sorted escalated-first then newest job_id.
  */
 async function byOwner(pmUserId, filters = {}) {
+  logger.info('Open Orders drill-down · pmUserId=' + pmUserId);
   const params = [pmUserId];
   const filterWhere = buildSharedFilters(filters, params);
 
@@ -195,6 +198,7 @@ async function byOwner(pmUserId, filters = {}) {
   `;
 
   const [rows] = await pool.query(sql, params);
+  logger.info('Found ' + rows.length + ' open jobs for owner');
 
   if (rows.length >= DRILLDOWN_LIMIT) {
     logger.warn(

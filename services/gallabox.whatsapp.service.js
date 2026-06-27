@@ -58,9 +58,16 @@ async function sendTemplate({
   templateName, bodyValues = {}, headerValues, buttonValues,
   bypassTestRedirect = false,
 }) {
+  logger.info('Send WhatsApp template via Gallabox · template=' + templateName);
   const originalPhone = normaliseIndianPhone(to);
-  if (!originalPhone) return { delivered: false, error: `invalid phone "${to}"` };
-  if (!templateName) return { delivered: false, error: 'templateName required' };
+  if (!originalPhone) {
+    logger.warn('WhatsApp template aborted · invalid phone');
+    return { delivered: false, error: `invalid phone "${to}"` };
+  }
+  if (!templateName) {
+    logger.warn('WhatsApp template aborted · templateName required');
+    return { delivered: false, error: 'templateName required' };
+  }
 
   if (disabled()) {
     logger.test(`WhatsApp suppressed (NOTIFICATIONS_DISABLE) · to=${originalPhone} · template=${templateName}`);
@@ -72,6 +79,7 @@ async function sendTemplate({
   const channelId = process.env.GALLABOX_CHANNEL_ID;
   const url       = process.env.GALLABOX_URL || 'https://server.gallabox.com/devapi/messages/whatsapp';
   if (!apiKey || !apiSecret || !channelId) {
+    logger.warn('WhatsApp template aborted · Gallabox creds not configured · template=' + templateName);
     return { delivered: false, error: 'GALLABOX_API_KEY / API_SECRET / CHANNEL_ID not configured' };
   }
 
@@ -136,9 +144,16 @@ async function sendTemplate({
  * be confirmed against the Gallabox API docs / dashboard during rollout.
  */
 async function sendWhatsappMessage({ to, recipientName, whatsapp, label, bypassTestRedirect = false }) {
+  logger.info('Send WhatsApp message via Gallabox · ' + (label || (whatsapp && whatsapp.type) || 'message'));
   const originalPhone = normaliseIndianPhone(to);
-  if (!originalPhone) return { delivered: false, error: `invalid phone "${to}"` };
-  if (!whatsapp || !whatsapp.type) return { delivered: false, error: 'whatsapp message payload required' };
+  if (!originalPhone) {
+    logger.warn('WhatsApp message aborted · invalid phone');
+    return { delivered: false, error: `invalid phone "${to}"` };
+  }
+  if (!whatsapp || !whatsapp.type) {
+    logger.warn('WhatsApp message aborted · payload required');
+    return { delivered: false, error: 'whatsapp message payload required' };
+  }
 
   if (disabled()) {
     logger.test(`WhatsApp suppressed (NOTIFICATIONS_DISABLE) · to=${originalPhone} · ${label || whatsapp.type}`);
@@ -242,17 +257,26 @@ function sendLocationRequest({ to, recipientName, body }) {
  * { error }.
  */
 async function fetchInboundMedia({ url }) {
-  if (!url) return { error: 'media url required' };
+  logger.info('Fetch inbound WhatsApp media');
+  if (!url) {
+    logger.warn('Inbound media fetch aborted · media url required');
+    return { error: 'media url required' };
+  }
   try {
     const headers = {};
     if (process.env.GALLABOX_API_KEY)    headers.apiKey = process.env.GALLABOX_API_KEY;
     if (process.env.GALLABOX_API_SECRET) headers.apiSecret = process.env.GALLABOX_API_SECRET;
     const res = await fetch(url, { headers });
-    if (!res.ok) return { error: `media fetch failed: HTTP ${res.status}` };
+    if (!res.ok) {
+      logger.warn('Inbound media fetch failed · status=' + res.status);
+      return { error: `media fetch failed: HTTP ${res.status}` };
+    }
     const contentType = res.headers.get('content-type') || 'application/octet-stream';
     const buffer = Buffer.from(await res.arrayBuffer());
+    logger.info('Fetched inbound media · ' + buffer.length + ' bytes · contentType=' + contentType);
     return { buffer, contentType };
   } catch (err) {
+    logger.warn('Inbound media fetch error · ' + err.message);
     return { error: err.message };
   }
 }

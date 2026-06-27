@@ -76,8 +76,10 @@ function pageHtml(title, message) {
 
 router.get('/book/:code', async (req, res) => {
   const code = req.params.code || '';
+  logger.info('Short link redirect · code=' + code);
 
   if (!CODE_REGEX.test(code)) {
+    logger.info('Short link failed regex · code=' + code);
     return res
       .status(404)
       .type('html')
@@ -96,6 +98,7 @@ router.get('/book/:code', async (req, res) => {
   }
 
   if (!row) {
+    logger.info('Short link not found · code=' + code);
     return res
       .status(404)
       .type('html')
@@ -103,6 +106,7 @@ router.get('/book/:code', async (req, res) => {
   }
 
   if (row.expired) {
+    logger.info('Short link expired · code=' + code);
     return res
       .status(410)
       .type('html')
@@ -115,6 +119,7 @@ router.get('/book/:code', async (req, res) => {
   // Fire-and-forget click bump — the customer's browser must not wait.
   urlShortener.recordClick(code, pool);
 
+  logger.info('Redirecting short link · code=' + code);
   return res.redirect(302, row.longUrl);
 });
 

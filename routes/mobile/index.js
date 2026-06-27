@@ -2,6 +2,7 @@ const router = require('express').Router();
 const Joi = require('joi');
 
 const validate = require('../../middleware/validate');
+const logger = require('../../logger');
 const requireTechAuth = require('../../middleware/tech-auth');
 const { pool } = require('../../db');
 const techAuth = require('../../services/tech-auth.service');
@@ -57,7 +58,9 @@ async function upsertEasyfixerAppToken(efrId, fcmToken) {
 // ─── Auth (public) ─────────────────────────────────────────────────
 router.post('/auth/login-otp', loginOtpRateLimit, validate(Joi.object({ mobile: mobile.required() })), async (req, res, next) => {
   try {
+    logger.info('Login OTP requested');
     const r = await techAuth.createLoginOtp(req.body.mobile);
+    logger.info('Login OTP processed · delivered=' + r.found);
     modernOk(res, { delivered: r.found, expiresAt: r.expiresAt || null });
   } catch (e) { next(e); }
 });
@@ -87,8 +90,12 @@ router.post('/auth/verify-otp', validate(Joi.object({
   language:      Joi.string().trim().max(10).optional(),
 })), async (req, res, next) => {
   try {
+    logger.info('Verify login OTP · hasDeviceId=' + Boolean(req.body.deviceId));
     const r = await techAuth.verifyLoginOtp(req.body.mobile, req.body.otp);
-    if (!r.ok) return modernError(res, 401, r.reason);
+    if (!r.ok) {
+      logger.warn('Login OTP verification failed · ' + r.reason);
+      return modernError(res, 401, r.reason);
+    }
 
     // Device-info upsert. device_info schema reality (verified 2026-05-27
     // against QA `SHOW CREATE TABLE`):
@@ -174,6 +181,7 @@ router.post('/auth/verify-otp', validate(Joi.object({
       }
     }
 
+    logger.info('Login OTP verified · deviceRegistered=' + deviceRegistered + ' · fcmStored=' + Boolean(fcm));
     res.cookie('techToken', r.token, { httpOnly: true, sameSite: 'lax', maxAge: 30 * 86400 * 1000 });
     modernOk(res, {
       token: r.token,
@@ -242,6 +250,7 @@ router.get(
   }), 'query'),
   async (req, res, next) => {
     try {
+      logger.info('Load dashboard · noticesLimit=' + (req.query.noticesLimit != null ? req.query.noticesLimit : 'default'));
       modernOk(res, await mobileDashboardService.getDashboard(
         req.tech.efr_id,
         { noticesLimit: req.query.noticesLimit },
@@ -256,61 +265,165 @@ router.get(
 // Jobs assigned to me
 router.get('/jobs', async (req, res, next) => {
   try {
+    logger.info('List my jobs · status=' + (req.query.status != null ? req.query.status : 'any') + ' · limit=' + (req.query.limit != null ? req.query.limit : 50));
     const { rows, total } = await jobService.list({
       easyfixerId: req.tech.efr_id,
       status: req.query.status != null ? Number(req.query.status) : undefined,
       limit: Math.min(Number(req.query.limit) || 50, 200),
     });
+    logger.info('Found ' + rows.length + ' jobs · total=' + total);
     modernOk(res, { items: rows, total });
+  } catch (e) { next(e); }
+});
+
+// Rejected offers history — the jobs THIS technician declined (offer_status=2
+// REJECTED on tbl_job_offer). MOUNTED BEFORE `GET /jobs/:id` so the literal
+// `rejected` segment wins over the `:id` param route. Intentionally a LIMITED
+// projection: just enough to render a "rejected" history card (who/what/when/
+// where-city), with NONE of the sensitive operational fields — no address /
+// pincode / GPS / customer name / customer mobile / easyfixer mobile / amount.
+// Joins mirror job.service.js LIST_COLUMNS / LIST_JOIN conventions: city is
+// reached via tbl_address (j.fk_address_id) → tbl_city, client via
+// j.fk_client_id, category via j.fk_service_catg_id, type via
+// j.fk_service_type_id. Scoped to req.tech.efr_id. If tbl_job_offer isn't yet
+// provisioned (offer model rolling out), return an empty list instead of 500ing.
+router.get('/jobs/rejected', async (req, res, next) => {
+  try {
+    logger.info('List rejected job offers history');
+    const [items] = await pool.query(
+      `SELECT jo.job_id, jo.reject_reason, jo.responded_at,
+              cl.client_name,
+              sc.service_catg_name AS service_category,
+              st.service_type_name AS service_type,
+              ci.city_name,
+              j.requested_date_time
+         FROM tbl_job_offer jo
+         JOIN tbl_job j           ON j.job_id            = jo.job_id
+         LEFT JOIN tbl_client cl  ON cl.client_id        = j.fk_client_id
+         LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = j.fk_service_catg_id
+         LEFT JOIN tbl_service_type st ON st.service_type_id = j.fk_service_type_id
+         LEFT JOIN tbl_address ad ON ad.address_id       = j.fk_address_id
+         LEFT JOIN tbl_city ci    ON ci.city_id          = ad.city_id
+        WHERE jo.fk_easyfixter_id = ? AND jo.offer_status = 2
+        ORDER BY jo.responded_at DESC
+        LIMIT 100`,
+      [req.tech.efr_id],
+    );
+    logger.info('Found ' + items.length + ' rejected offers');
+    modernOk(res, { items });
+  } catch (e) {
+    // Offer model may not be provisioned on every DB yet — don't 500 the
+    // history screen just because tbl_job_offer doesn't exist.
+    if (e?.code === 'ER_NO_SUCH_TABLE') {
+      logger.warn('Rejected offers unavailable · ' + e.message);
+      return modernOk(res, { items: [] });
+    }
+    next(e);
+  }
+});
+
+// Offers currently EXTENDED to this technician — the OPEN offers on
+// tbl_job_offer (offer_status=0 OFFERED) under the offer-pool model. Returns
+// full job previews so the app can render them with the SAME mapper it already
+// uses for GET /jobs (opportunities): jobService.listOfferedForTech() yields
+// `{ items: JobPreview[] }` in that identical shape. MOUNTED BEFORE
+// `GET /jobs/:id` so the literal `offered` segment wins over the `:id` param
+// route. Tolerant of the offer table being absent (offer model rolling out) —
+// listOfferedForTech() returns `{ items: [] }` rather than throwing, so a DB
+// without tbl_job_offer simply shows no offers.
+router.get('/jobs/offered', async (req, res, next) => {
+  try {
+    logger.info('List open job offers extended to me');
+    const result = await jobService.listOfferedForTech(req.tech.efr_id);
+    logger.info('Found ' + ((result && result.items ? result.items.length : 0)) + ' open offers');
+    modernOk(res, result);
   } catch (e) { next(e); }
 });
 
 router.get('/jobs/:id', async (req, res, next) => {
   try {
+    logger.info('View job detail · id=' + req.params.id);
     const job = await jobService.getById(Number(req.params.id));
-    if (!job || job.fk_easyfixter_id !== req.tech.efr_id) return modernError(res, 404, 'job not found');
+    if (!job) return modernError(res, 404, 'job not found');
+    // Owner (accepted the job) OR a tech who currently has an OPEN offer on it
+    // may view it — under the offer-pool model an offered job stays
+    // fk_easyfixter_id=NULL until accepted, so the offered tech must be allowed
+    // to open it to review + Accept/Reject.
+    const canView = job.fk_easyfixter_id === req.tech.efr_id
+      || (await jobService.techHasOpenOffer(job.job_id, req.tech.efr_id));
+    if (!canView) return modernError(res, 404, 'job not found');
     modernOk(res, job);
   } catch (e) { next(e); }
 });
 
-// Status: 0 (BOOKED) → 1 (SCHEDULED). Now flows through shared
-// jobService.setStatus(), which owns: audit-stamp logic, webhook
-// fan-out (TechStart not fired here — accept doesn't trigger a
-// client-facing webhook in the existing wiring), and any future
-// transition rules (e.g. send_back_to_tx reset on completion).
-// The "must be in status 0" guard previously enforced via WHERE
-// clause is now enforced upstream: we verify in the handler before
-// calling setStatus.
+// Accept the job OFFER. Under THE OFFER-POOL MODEL a job can be offered to
+// MULTIPLE technicians at once; while offered it stays job_status 0 (BOOKED)
+// with fk_easyfixter_id NULL (no single owner), and each offered tech has an
+// OFFERED row on tbl_job_offer. So there is NO "this job belongs to me" check
+// to do here — fk_easyfixter_id is deliberately NULL until someone wins the
+// race. We only guard that the job exists; eligibility (does this tech have an
+// open offer? is the job still BOOKED+unowned?) is enforced inside
+// jobService.acceptOffer(), which performs the race-safe first-wins claim
+// (UPDATE … WHERE job_status=0 AND fk_easyfixter_id IS NULL): the winner's
+// offer flips to ACCEPTED and all other open offers EXPIRE; a loser gets a
+// status-bearing 409 ('already accepted by another technician'), surfaced
+// verbatim below.
 router.post('/jobs/:id/accept', async (req, res, next) => {
   try {
+    logger.info('Accept job offer · id=' + req.params.id);
     const job = await jobService.getById(Number(req.params.id));
-    if (!job || job.fk_easyfixter_id !== req.tech.efr_id) return modernError(res, 404, 'job not found');
-    if (Number(job.job_status) !== 0) return modernError(res, 409, `cannot accept job in status ${job.job_status}`);
-    await jobService.setStatus(
-      job.job_id,
-      { status: 1 /* SCHEDULED */ },
-      { user_id: req.tech.efr_id },          // semantic note: efr_id stored as actor stamp
-    );
+    if (!job) return modernError(res, 404, 'job not found');
+    await jobService.acceptOffer(Number(job.job_id), req.tech.efr_id);
+    logger.info('Job offer accepted · id=' + job.job_id);
     modernOk(res, { accepted: true });
   } catch (e) {
-    if (e.status) return modernError(res, e.status, e.message);
+    // acceptOffer throws a status-bearing error when this tech can't claim the
+    // offer (race lost — already accepted by another technician, offer already
+    // rejected/expired, or the job has moved past BOOKED) — surface it verbatim.
+    // The lost-race case is a 409 so the app shows a clear "offer no longer
+    // available" message.
+    if (e.status) {
+      logger.warn('Accept job offer failed · id=' + req.params.id + ' · ' + e.message);
+      return modernError(res, e.status, e.message);
+    }
     next(e);
   }
 });
 
-// Reject: clears fk_easyfixter_id + drops to BOOKED + writes
-// scheduling_history with the reason. Flows through shared
-// jobService.unassign() — same code path CRM will use when an admin
-// "force-unassigns" a job (e.g. tech is sick). Single transaction +
-// single webhook fan-out (RescheduleTech) live in the shared service.
-router.post('/jobs/:id/reject', validate(Joi.object({ reason: Joi.string().min(3).max(500).required() })), async (req, res, next) => {
+// Reject the job OFFER: nulls fk_easyfixter_id + drops to BOOKED + writes
+// scheduling_history AND stamps the offer row REJECTED (offer_status=2) with
+// the reason. Flows through shared jobService.unassign() — same code path CRM
+// uses when an admin "force-unassigns" a job (e.g. tech is sick). Single
+// transaction + single webhook fan-out (RescheduleTech) live in the shared
+// service. `reasonId` (a tbl-reason lookup id) is recorded on the offer row
+// alongside the free-text `reason`, so the rejection carries both.
+router.post('/jobs/:id/reject', validate(Joi.object({
+  reason: Joi.string().min(3).max(500).required(),
+  reasonId: Joi.number().integer().optional(),
+})), async (req, res, next) => {
   try {
+    logger.info('Reject job offer · id=' + req.params.id + ' · reasonId=' + (req.body.reasonId != null ? req.body.reasonId : 'none'));
     const job = await jobService.getById(Number(req.params.id));
-    if (!job || job.fk_easyfixter_id !== req.tech.efr_id) return modernError(res, 404, 'job not found');
-    await jobService.unassign(job.job_id, { reason: req.body.reason }, { user_id: req.tech.efr_id });
+    if (!job) return modernError(res, 404, 'job not found');
+    // Allow the rejecting tech through if they own the job OR have an open offer
+    // on it (offered jobs are fk-NULL until accepted).
+    const canReject = job.fk_easyfixter_id === req.tech.efr_id
+      || (await jobService.techHasOpenOffer(job.job_id, req.tech.efr_id));
+    if (!canReject) return modernError(res, 404, 'job not found');
+    // Pool reject: mark ONLY this tech's offer REJECTED (the job stays offered
+    // to the others). Legacy (no offer table) falls back to unassign() inside.
+    await jobService.rejectOffer(
+      job.job_id,
+      req.tech.efr_id,
+      { reason: req.body.reason, reasonId: req.body.reasonId },
+    );
+    logger.info('Job offer rejected · id=' + job.job_id);
     modernOk(res, { rejected: true });
   } catch (e) {
-    if (e.status) return modernError(res, e.status, e.message);
+    if (e.status) {
+      logger.warn('Reject job offer failed · id=' + req.params.id + ' · ' + e.message);
+      return modernError(res, e.status, e.message);
+    }
     next(e);
   }
 });
@@ -326,6 +439,7 @@ router.post('/jobs/:id/eta', validate(Joi.object({
   etaTime:   Joi.date().iso().optional(),
 })), async (req, res, next) => {
   try {
+    logger.info('Send ETA on-the-way signal · id=' + req.params.id + ' · etaStatus=' + (req.body.etaStatus || 'OTW'));
     const job = await jobService.getById(Number(req.params.id));
     if (!job || job.fk_easyfixter_id !== req.tech.efr_id) return modernError(res, 404, 'job not found');
     await jobService.setStatus(
@@ -339,9 +453,13 @@ router.post('/jobs/:id/eta', validate(Joi.object({
       },
       { user_id: req.tech.efr_id },
     );
+    logger.info('ETA signal stamped · id=' + job.job_id);
     modernOk(res, { sent: true });
   } catch (e) {
-    if (e.status) return modernError(res, e.status, e.message);
+    if (e.status) {
+      logger.warn('Send ETA signal failed · id=' + req.params.id + ' · ' + e.message);
+      return modernError(res, e.status, e.message);
+    }
     next(e);
   }
 });
@@ -358,6 +476,7 @@ router.post('/jobs/:id/checkin', validate(Joi.object({
   otp: Joi.string().optional(),
 })), async (req, res, next) => {
   try {
+    logger.info('Check in to job · id=' + req.params.id);
     const job = await jobService.getById(Number(req.params.id));
     if (!job || job.fk_easyfixter_id !== req.tech.efr_id) return modernError(res, 404, 'job not found');
     // Verify the customer check-in PIN (tbl_job.otp, the 4-digit code SMS'd to
@@ -367,6 +486,7 @@ router.post('/jobs/:id/checkin', validate(Joi.object({
     const jobPin = job.otp == null ? '' : String(job.otp).trim();
     const submittedOtp = req.body.otp == null ? '' : String(req.body.otp).trim();
     if (jobPin && jobPin !== submittedOtp) {
+      logger.warn('Check-in blocked · id=' + req.params.id + ' · PIN mismatch');
       return modernError(res, 409, 'Incorrect check-in PIN. Ask the customer for the PIN sent to them.');
     }
     await jobService.setStatus(
@@ -382,9 +502,13 @@ router.post('/jobs/:id/checkin', validate(Joi.object({
       },
       { user_id: req.tech.efr_id },
     );
+    logger.info('Checked in · id=' + job.job_id + ' · status->IN_PROGRESS');
     modernOk(res, { checkedIn: true });
   } catch (e) {
-    if (e.status) return modernError(res, e.status, e.message);
+    if (e.status) {
+      logger.warn('Check in failed · id=' + req.params.id + ' · ' + e.message);
+      return modernError(res, e.status, e.message);
+    }
     next(e);
   }
 });
@@ -412,6 +536,7 @@ router.post('/jobs/:id/checkout',
   })),
   async (req, res, next) => {
   try {
+    logger.info('Check out of job · id=' + req.params.id + ' · isNextVisit=' + (req.body.isNextVisit === true) + ' · cashCollected=' + (req.body.isCashCollected === true));
     const job = await jobService.getById(Number(req.params.id));
     if (!job || job.fk_easyfixter_id !== req.tech.efr_id) return modernError(res, 404, 'job not found');
     const b = req.body;
@@ -438,13 +563,17 @@ router.post('/jobs/:id/checkout',
       { status: isRevisit ? 10 /* REVISIT */ : 3 /* COMPLETED */, extras },
       { user_id: req.tech.efr_id },
     );
+    logger.info('Checked out · id=' + job.job_id + ' · status->' + (isRevisit ? 'REVISIT' : 'COMPLETED'));
     modernOk(res, {
       jobId: job.job_id,
       completedAt: extras.app_checkout_date_time,
       collectedAmount: extras.material_charge,
     });
   } catch (e) {
-    if (e.status) return modernError(res, e.status, e.message);
+    if (e.status) {
+      logger.warn('Check out failed · id=' + req.params.id + ' · ' + e.message);
+      return modernError(res, e.status, e.message);
+    }
     next(e);
   }
 });
@@ -466,6 +595,7 @@ router.post('/jobs/:id/reschedule', validate(Joi.object({
   remarks: Joi.string().max(500).optional(),
 })), async (req, res, next) => {
   try {
+    logger.info('Reschedule job · id=' + req.params.id + ' · reasonId=' + req.body.reasonId);
     const job = await jobService.getById(Number(req.params.id));
     if (!job || job.fk_easyfixter_id !== req.tech.efr_id) return modernError(res, 404, 'job not found');
     await jobService.setStatus(
@@ -490,9 +620,13 @@ router.post('/jobs/:id/reschedule', validate(Joi.object({
     // transition — fire it explicitly here. (statusToEventName only
     // maps actual transitions; rescheduling isn't a status change.)
     jobService.fireWebhook('RescheduleTech', job.job_id);
+    logger.info('Job rescheduled · id=' + job.job_id);
     modernOk(res, { rescheduled: true });
   } catch (e) {
-    if (e.status) return modernError(res, e.status, e.message);
+    if (e.status) {
+      logger.warn('Reschedule job failed · id=' + req.params.id + ' · ' + e.message);
+      return modernError(res, e.status, e.message);
+    }
     next(e);
   }
 });
@@ -500,6 +634,7 @@ router.post('/jobs/:id/reschedule', validate(Joi.object({
 // Profile sub-tree — covers the legacy /profile/* endpoints
 router.get('/profile', async (req, res, next) => {
   try {
+    logger.info('Load raw technician profile');
     const [[tech]] = await pool.query('SELECT * FROM tbl_easyfixer WHERE efr_id = ? AND NOT (tbl_easyfixer.efr_status <=> 3)', [req.tech.efr_id]);
     modernOk(res, tech);
   } catch (e) { next(e); }
@@ -513,6 +648,7 @@ router.get('/profile', async (req, res, next) => {
 const mobileProfileDetailsService = require('../../services/mobile-profile-details.service');
 router.get('/profile/details', async (req, res, next) => {
   try {
+    logger.info('Load composed profile details');
     const result = await mobileProfileDetailsService.getProfileDetails(req.tech.efr_id);
     modernOk(res, result);
   } catch (e) {
@@ -523,6 +659,7 @@ router.get('/profile/details', async (req, res, next) => {
 
 router.get('/profile/percentage', async (req, res, next) => {
   try {
+    logger.info('Load profile completion percentages');
     const [[p]] = await pool.query(
       `SELECT efr_profile_perc, efr_personal_details_perc, efr_professional_details_perc,
               efr_bank_details_perc, efr_identity_details_perc
@@ -603,6 +740,7 @@ router.post('/profile/personal-details', validate(Joi.object({
   const lockKey = `efr_doc:${efrId}`;                 // serialize doc upserts per tech (no UNIQUE in schema)
   const conn = await pool.getConnection();
   try {
+    logger.info('Save personal-details profile section');
     const b = req.body;
     const marital = b.maritalStatus || b.martialStatus || null;
     const childrenRaw = b.children !== undefined ? b.children : b.noOfChild;
@@ -650,8 +788,10 @@ router.post('/profile/personal-details', validate(Joi.object({
     await upsertEasyfixerDocuments(conn, efrId, [[10, docs.healthInsurance], [11, docs.accidentalInsurance]]);
 
     await conn.commit();
+    logger.info('Personal-details saved · complete=' + personalComplete);
     modernOk(res, { updated: true });
   } catch (e) {
+    logger.warn('Save personal-details failed · ' + e.message);
     try { await conn.rollback(); } catch (_) { /* connection already gone */ }
     next(e);
   } finally {
@@ -685,6 +825,7 @@ router.post('/profile/professional-details', validate(Joi.object({
   const lockKey = `efr_doc:${efrId}`;
   const conn = await pool.getConnection();
   try {
+    logger.info('Save professional-details profile section');
     const b = req.body;
     const useWhatsapp = b.useWhatsapp === undefined ? null : (b.useWhatsapp ? 1 : 0);
     // Selected tool ids — prefer the rich per-tool `tools[]`, else the flat toolIds.
@@ -748,8 +889,10 @@ router.post('/profile/professional-details', validate(Joi.object({
     await upsertEasyfixerDocuments(conn, efrId, [[7, docs.education], [9, docs.toolBag]]);
 
     await conn.commit();
+    logger.info('Professional-details saved · tools=' + toolIdList.length + ' · complete=' + professionalComplete);
     modernOk(res, { updated: true });
   } catch (e) {
+    logger.warn('Save professional-details failed · ' + e.message);
     try { await conn.rollback(); } catch (_) { /* connection already gone */ }
     next(e);
   } finally {
@@ -764,6 +907,7 @@ router.post('/profile/professional-details', validate(Joi.object({
 // deep-skill DETAIL loads on demand via GET /deepskill/hierarchy/:categoryId.
 router.get('/profile/professional', async (req, res, next) => {
   try {
+    logger.info('Load professional prefill');
     const efrId = req.tech.efr_id;
     const [[ef]] = await pool.query(
       'SELECT experience_id, efr_tools, use_whatsapp FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1', [efrId]);
@@ -791,6 +935,7 @@ router.get('/profile/professional', async (req, res, next) => {
         GROUP BY m.category_id, c.service_catg_name
         ORDER BY c.service_catg_name ASC`, [efrId]);
 
+    logger.info('Professional prefill · tools=' + tools.length + ' · categories=' + catRows.length);
     const wa = ef ? ef.use_whatsapp : null;
     modernOk(res, {
       experienceId: ef ? ef.experience_id : null,
@@ -808,6 +953,7 @@ router.get('/profile/professional', async (req, res, next) => {
 // DateField; BIT flags cast to bool. Emergency comes from efr_alt_no.
 router.get('/profile/personal', async (req, res, next) => {
   try {
+    logger.info('Load personal prefill');
     const [[p]] = await pool.query(
       `SELECT efr_first_name, efr_last_name,
               DATE_FORMAT(date_of_birth, '%Y-%m-%d') AS date_of_birth,
@@ -840,6 +986,7 @@ router.get('/profile/personal', async (req, res, next) => {
 // personal-details), NOT here. Column-probed (tbl_address is shared/polymorphic).
 router.get('/profile/contact-info', async (req, res, next) => {
   try {
+    logger.info('Load contact-info address');
     const [[ef]] = await pool.query('SELECT user_id FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1', [req.tech.efr_id]);
     if (!ef || !ef.user_id) return modernOk(res, null);
     // SELECT * so a drifted/absent column never errors the read.
@@ -870,6 +1017,7 @@ router.post('/profile/contact-info', validate(Joi.object({
   state:          Joi.string().trim().max(255).allow('', null).optional(),
 }).min(1)), async (req, res, next) => {
   try {
+    logger.info('Save contact-info address');
     const b = req.body;
     const [[ef]] = await pool.query('SELECT user_id FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1', [req.tech.efr_id]);
     if (!ef || !ef.user_id) return modernError(res, 409, 'Technician has no linked user account');
@@ -890,7 +1038,10 @@ router.post('/profile/contact-info', validate(Joi.object({
       is_address_details_filled:  1,
     };
     const present = Object.entries(candidates).filter(([c]) => cols.has(c));
-    if (!present.length) return modernOk(res, { updated: false });
+    if (!present.length) {
+      logger.warn('Contact-info save skipped · no matching address columns');
+      return modernOk(res, { updated: false });
+    }
 
     const [[existing]] = await pool.query(
       'SELECT address_id FROM tbl_address WHERE user_id = ? ORDER BY address_id DESC LIMIT 1', [userId]);
@@ -904,6 +1055,7 @@ router.post('/profile/contact-info', validate(Joi.object({
       await pool.query(`INSERT INTO tbl_address (${colNames.join(', ')}) VALUES (${ph})`,
         [userId, ...present.map(([, v]) => v)]);
     }
+    logger.info('Contact-info address saved · mode=' + (existing ? 'update' : 'insert'));
     modernOk(res, { updated: true });
   } catch (e) { next(e); }
 });
@@ -934,6 +1086,7 @@ router.post('/profile/identity-details', validate(Joi.object({
   const lockKey = `efr_doc:${efrId}`;                 // serialize doc upserts per tech (no UNIQUE in schema)
   const conn = await pool.getConnection();
   try {
+    logger.info('Save identity-details profile section');
     const b = req.body;
     const aadhaar = b.aadhaarNumber || b.aadhaar || null;
     const pan = (b.panNumber || b.pan) ? String(b.panNumber || b.pan).toUpperCase() : null;
@@ -963,8 +1116,10 @@ router.post('/profile/identity-details', validate(Joi.object({
       [[13, docs.aadhaarFront], [14, docs.aadhaarBack], [3, docs.pan], [12, docs.drivingLicence]]);
 
     await conn.commit();
+    logger.info('Identity-details saved · complete=' + identityComplete);
     modernOk(res, { updated: true });
   } catch (e) {
+    logger.warn('Save identity-details failed · ' + e.message);
     try { await conn.rollback(); } catch (_) { /* ignore */ }
     next(e);
   } finally {
@@ -975,6 +1130,7 @@ router.post('/profile/identity-details', validate(Joi.object({
 
 router.get('/bank-details', async (req, res, next) => {
   try {
+    logger.info('Load bank details');
     const [[b]] = await pool.query('SELECT * FROM tbl_easyfixer_bank_details WHERE efr_id = ? LIMIT 1', [req.tech.efr_id]);
     modernOk(res, b || null);
   } catch (e) { next(e); }
@@ -994,6 +1150,7 @@ router.post('/bank-details', validate(Joi.object({
   isVerified: Joi.boolean().optional(),
 })), async (req, res, next) => {
   try {
+    logger.info('Save bank details · bankId=' + (req.body.bankId != null ? req.body.bankId : 'none') + ' · verified=' + (req.body.isVerified === true));
     const b = req.body;
     const ifsc = String(b.ifsc).toUpperCase();
     const holder = b.accountHolderName ? String(b.accountHolderName).trim() : null;
@@ -1015,6 +1172,7 @@ router.post('/bank-details', validate(Joi.object({
         [b.accountNumber, holder, ifsc, bankId, verified, req.tech.efr_id]);
     }
     await pool.query('UPDATE tbl_easyfixer SET efr_bank_details_perc = 100 WHERE efr_id = ?', [req.tech.efr_id]);
+    logger.info('Bank details saved · mode=' + (existing ? 'update' : 'insert'));
     modernOk(res, { saved: true });
   } catch (e) { next(e); }
 });
@@ -1026,6 +1184,7 @@ router.post('/device', validate(Joi.object({
   language: Joi.string().max(10).optional(),
 })), async (req, res, next) => {
   try {
+    logger.info('Register push device');
     // Single-active-session: log out every OTHER device for this technician
     // (mirrors the verify-otp sweep) so push fan-out targets only this device.
     await pool.query(
@@ -1048,27 +1207,69 @@ router.post('/device', validate(Joi.object({
         'tbl_easyfixer_app.device_id sync failed during /device',
       );
     }
+    logger.info('Push device registered');
     modernOk(res, { registered: true });
   } catch (e) { next(e); }
 });
 
 // VERIFIED 2026-05-12 against ACD_APIs TrainingVideo.java:
-//   training_videos columns: id, title, description, sub_title, sub_description
+//   training_videos columns: id, title, description, sub_title, sub_description,
+//   training_video_id (FK → document.id).
+// The PLAYABLE url is NOT a column on training_videos — the legacy DTO exposed it
+// as the joined document's url (TrainingVideoTitleDescriptionDto:29 →
+// getTrainingVideo().getUrl()). Earlier this endpoint returned no url at all, so
+// the app's VideoPlayer got an empty source and nothing played. We LEFT JOIN
+// `document` and return document.url as `url`.
+//
+// URL normalization: legacy document.url rows use a cleartext `http://` scheme
+// (Android's New Architecture blocks cleartext) and some carry a malformed host
+// (`core.easyfix_core.in`). The files all serve from the canonical static host
+// over https, so we rebuild from the `/easydoc/...` path.
+// Verified: https://core.easyfix.in/easydoc/... → 206 video/mp4 (range-supported).
+const TRAINING_VIDEO_HOST = 'https://core.easyfix.in';
+function normalizeTrainingVideoUrl(raw) {
+  if (!raw) return '';
+  const s = String(raw).trim();
+  const i = s.indexOf('/easydoc');
+  if (i >= 0) return TRAINING_VIDEO_HOST + s.slice(i);
+  return s.replace(/^http:\/\//i, 'https://'); // already-https / non-legacy paths pass through
+}
 router.get('/training-videos', async (_req, res, next) => {
   try {
+    logger.info('List training videos');
+    // document_type_id = 2 is the "Video / Training Videos" type in `document_type`
+    // (NOT tbl_document_type, where 2 = Ration Card). Kept in the JOIN ON clause
+    // so it's a guard, not a row filter — a training_videos row whose doc is
+    // missing/mistyped still returns (with url=''), rather than vanishing.
     const [rows] = await pool.query(
-      'SELECT id, title, description, sub_title, sub_description FROM training_videos ORDER BY id DESC'
+      `SELECT tv.id, tv.title, tv.description, tv.sub_title, tv.sub_description,
+              d.url AS doc_url
+         FROM training_videos tv
+         LEFT JOIN document d
+           ON d.id = tv.training_video_id AND d.document_type_id = 2
+         ORDER BY tv.id DESC`
     );
-    modernOk(res, rows);
+    const items = rows.map((r) => ({
+      id: r.id,
+      title: r.title,
+      description: r.description,
+      sub_title: r.sub_title,
+      sub_description: r.sub_description,
+      url: normalizeTrainingVideoUrl(r.doc_url),
+    }));
+    logger.info('Returning ' + items.length + ' training videos');
+    modernOk(res, items);
   } catch (e) { next(e); }
 });
 
 // Customer lookup by mobile (from tech app for OTP flows)
 router.get('/customers/mobile/:mobile', async (req, res, next) => {
   try {
+    logger.info('Lookup customer by mobile');
     const [[cust]] = await pool.query(
       'SELECT customer_id, customer_name, customer_mob_no, customer_email FROM tbl_customer WHERE customer_mob_no = ? LIMIT 1',
       [req.params.mobile]);
+    logger.info('Customer lookup · found=' + Boolean(cust));
     modernOk(res, cust || null);
   } catch (e) { next(e); }
 });

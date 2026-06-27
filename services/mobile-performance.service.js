@@ -57,7 +57,9 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000;
  *                    weekStart, gaps filled with zeros.
  */
 async function getWeeklyPerformance(efrId, from, to) {
+  logger.info('Weekly performance · from=' + from + ' to=' + to);
   if (!efrId) {
+    logger.info('Weekly performance returning empty (no efrId)');
     return {
       ota: 0, sda: 0, grade: 'C', rating: 0,
       totalJobs: 0, totalEarnings: 0,
@@ -83,6 +85,7 @@ async function getWeeklyPerformance(efrId, from, to) {
     }),
   ]);
 
+  logger.info('Found ' + buckets.length + ' weekly buckets');
   // Index the DB rows by their ISO week key so we can merge them onto the
   // dense skeleton (every Monday in the requested range).
   const byKey = new Map();
@@ -123,6 +126,7 @@ async function getWeeklyPerformance(efrId, from, to) {
     };
   });
 
+  logger.info('Returning ' + weeks.length + ' weeks · totalJobs=' + totalJobs + ' totalEarnings=' + totalEarnings);
   return {
     ota: aggSample ? Math.round((aggOnTime / aggSample) * 100) : 0,
     sda: aggSample ? Math.round((aggSameDay / aggSample) * 100) : 0,
@@ -171,6 +175,44 @@ async function queryWeeklyBuckets(efrId, from, to) {
     [ON_TIME_WINDOW_MIN, efrId, COMPLETED_STATUSES, from, to],
   );
   return rows;
+}
+
+/*
+ * Per-technician offer stats over `tbl_job_offer` — backs
+ * `GET /api/mobile/performance/offer-stats`. Lets the app show how many
+ * jobs were offered to this tech, how many they accepted, and how many
+ * they missed (offer_status 3 EXPIRED = someone else accepted first OR
+ * the tech never acted) plus self-rejections (offer_status 2).
+ *
+ * offer_status: 0 OFFERED · 1 ACCEPTED · 2 REJECTED · 3 EXPIRED.
+ *
+ * tbl_job_offer is feature-flag-gated and may not exist in every
+ * environment yet, so the whole read is wrapped: on ER_NO_SUCH_TABLE
+ * (or any other error) we degrade to all-zeros rather than 500.
+ */
+async function getOfferStats(efrId) {
+  logger.info('Get offer stats');
+  try {
+    const [[row]] = await pool.query(
+      `SELECT COUNT(*) AS offered,
+              COUNT(CASE WHEN offer_status = 1 THEN 1 END) AS accepted,
+              COUNT(CASE WHEN offer_status = 2 THEN 1 END) AS rejected,
+              COUNT(CASE WHEN offer_status = 3 THEN 1 END) AS missed
+         FROM tbl_job_offer
+        WHERE fk_easyfixter_id = ?`,
+      [efrId],
+    );
+    logger.info('Offer stats · offered=' + Number(row?.offered ?? 0) + ' accepted=' + Number(row?.accepted ?? 0) + ' rejected=' + Number(row?.rejected ?? 0) + ' missed=' + Number(row?.missed ?? 0));
+    return {
+      offered: Number(row?.offered ?? 0),
+      accepted: Number(row?.accepted ?? 0),
+      rejected: Number(row?.rejected ?? 0),
+      missed: Number(row?.missed ?? 0),
+    };
+  } catch (e) {
+    logger.warn({ err: e.message, efrId }, 'mobile-performance offer-stats failed');
+    return { offered: 0, accepted: 0, rejected: 0, missed: 0 };
+  }
 }
 
 /*
@@ -252,4 +294,4 @@ function buildWeekSkeleton(from, to) {
   return weeks;
 }
 
-module.exports = { getWeeklyPerformance };
+module.exports = { getWeeklyPerformance, getOfferStats };

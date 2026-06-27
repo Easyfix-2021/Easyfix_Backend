@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const logger = require('../logger');
 const roleService = require('./role.service');
 
 /*
@@ -70,6 +71,8 @@ async function listUsers({
   limit  = Math.min(Math.max(Number(limit)  || 200, 1), 1000);
   offset = Math.max(Number(offset) || 0, 0);
 
+  logger.info('List users · q=' + (q || '') + ' · roleId=' + (roleId || '') + ' · cityId=' + (cityId || '') + ' · includeInactive=' + includeInactive + ' · limit=' + limit + ' · offset=' + offset);
+
   const sortExpr = SORTABLE_COLUMNS[sortBy] || SORTABLE_COLUMNS.user_name;
   const dir      = String(sortDir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
   // Stable secondary sort on user_id — guarantees deterministic pagination
@@ -109,10 +112,12 @@ async function listUsers({
     params
   );
 
+  logger.info('Found ' + rows.length + ' users (total=' + total + ')');
   return { items: rows, total };
 }
 
 async function getUserById(userId) {
+  logger.info('Get user by id · userId=' + userId);
   const [[row]] = await pool.query(
     `SELECT u.user_id, u.user_code, u.user_name, u.official_email, u.mobile_no,
             u.alternate_no, u.user_role, r.role_name,
@@ -146,6 +151,7 @@ async function createUser({
   reporting_manager,
   createdBy,
 }) {
+  logger.info('Create user · role=' + (user_role || '') + ' · cityId=' + (city_id || ''));
   const name  = String(user_name || '').trim();
   const email = String(official_email || '').trim().toLowerCase();
   const mob   = String(mobile_no || '').trim();
@@ -167,7 +173,10 @@ async function createUser({
       LIMIT 1`,
     [email, INTERNAL_USER_TYPE_ID]
   );
-  if (dupEmail) throw mkErr(409, `An active user with email "${email}" already exists`);
+  if (dupEmail) {
+    logger.warn('Create user rejected · duplicate active email');
+    throw mkErr(409, `An active user with email "${email}" already exists`);
+  }
 
   const [[dupMob]] = await pool.query(
     `SELECT user_id FROM tbl_user
@@ -175,7 +184,10 @@ async function createUser({
       LIMIT 1`,
     [mob, INTERNAL_USER_TYPE_ID]
   );
-  if (dupMob) throw mkErr(409, `An active user with mobile "${mob}" already exists`);
+  if (dupMob) {
+    logger.warn('Create user rejected · duplicate active mobile');
+    throw mkErr(409, `An active user with mobile "${mob}" already exists`);
+  }
 
   const [r] = await pool.query(
     `INSERT INTO tbl_user
@@ -197,6 +209,7 @@ async function createUser({
   // the next hierarchy resolution picks up the new edge instead of
   // serving the pre-insert adjacency map for up to 60s.
   invalidateHierarchyCache();
+  logger.info('User created · id=' + r.insertId + ' · role=' + Number(user_role));
   return getUserById(r.insertId);
 }
 
@@ -236,6 +249,7 @@ function normaliseForCompare(key, val) {
 
 async function updateUser(userId, fields, updatedBy, opts = {}) {
   const { dryRun = false } = opts;
+  logger.info('Update user · userId=' + userId + ' · dryRun=' + dryRun);
 
   // Load every column we might compare against. The single round-trip
   // replaces the older mobile-only SELECT and unlocks the "skip-on-no-
@@ -250,8 +264,12 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
        FROM tbl_user WHERE user_id = ? LIMIT 1`,
     [userId]
   );
-  if (!me) throw mkErr(404, 'User not found');
+  if (!me) {
+    logger.warn('Update user rejected · not found · userId=' + userId);
+    throw mkErr(404, 'User not found');
+  }
   if (me.user_type_id !== INTERNAL_USER_TYPE_ID) {
+    logger.warn('Update user rejected · not an internal CRM user · userId=' + userId);
     throw mkErr(403, 'This user is not an internal CRM user and can\'t be edited here');
   }
 
@@ -288,7 +306,10 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
             AND user_id <> ? LIMIT 1`,
         [mob, INTERNAL_USER_TYPE_ID, userId]
       );
-      if (dup) throw mkErr(409, `Another active user already uses mobile "${mob}"`);
+      if (dup) {
+        logger.warn('Update user rejected · mobile already used by another active user · userId=' + userId);
+        throw mkErr(409, `Another active user already uses mobile "${mob}"`);
+      }
       val = mob;
     }
     sets.push(`${key} = ?`);
@@ -308,6 +329,7 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
   // values that all match" (no-op, return unchanged sentinel).
   if (suppliedCount === 0) throw mkErr(400, 'No mutable fields supplied');
   if (!sets.length) {
+    logger.info('Update user no-op · userId=' + userId + ' · all supplied values match');
     const row = await getUserById(userId);
     if (row) row.__unchanged = true;
     return row;
@@ -318,6 +340,7 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
   // bulk-upload route uses to report 'valid' (vs 'unchanged') so the
   // operator gets an accurate preview.
   if (dryRun) {
+    logger.info('Update user dry-run · userId=' + userId + ' · wouldChange fields=' + sets.length);
     const row = await getUserById(userId);
     if (row) row.__wouldUpdate = true;
     return row;
@@ -327,6 +350,7 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
   params.push(updatedBy || null, userId);
 
   await pool.query(`UPDATE tbl_user SET ${sets.join(', ')} WHERE user_id = ?`, params);
+  logger.info('User updated · id=' + userId + ' · fields=' + sets.length);
   // Per-user perms cache invalidation. A user_role change is the obvious
   // trigger; other field edits (name, email, etc.) don't change perms but
   // clearing one entry is cheap so we do it unconditionally.
@@ -428,6 +452,7 @@ async function findDescendantUserIds(rootUserId) {
  * the chain of ancestors so the UI can show "this person reports up to".
  */
 async function buildHierarchyTree(rootUserId) {
+  logger.info('Build hierarchy tree · rootUserId=' + rootUserId);
   const adj = await _loadHierarchyAdjacency();
   const [[root]] = await pool.query(
     `SELECT u.user_id, u.user_name, u.official_email, u.mobile_no,
@@ -436,7 +461,10 @@ async function buildHierarchyTree(rootUserId) {
       WHERE u.user_id = ? AND u.user_type_id = ?`,
     [rootUserId, INTERNAL_USER_TYPE_ID]
   );
-  if (!root) return null;
+  if (!root) {
+    logger.warn('Build hierarchy tree · root user not found · rootUserId=' + rootUserId);
+    return null;
+  }
 
   // Collect every user_id we'll need in one query (root + descendants + ancestors).
   const { descendants } = await findDescendantUserIds(rootUserId);
@@ -475,6 +503,7 @@ async function buildHierarchyTree(rootUserId) {
   }
   const tree = attach(Number(rootUserId));
   const ancestorChain = ancestors.map((id) => byId.get(id)).filter(Boolean);
+  logger.info('Hierarchy tree built · rootUserId=' + rootUserId + ' · descendants=' + descendants.length + ' · ancestors=' + ancestorChain.length);
   return { tree, ancestors: ancestorChain };
 }
 
@@ -487,6 +516,7 @@ async function buildHierarchyTree(rootUserId) {
  * gate used on create/update — historical inactive duplicates don't count.
  */
 async function isMobileTakenByAnother(mobile, excludeUserId) {
+  logger.info('Check mobile availability · excludeUserId=' + (excludeUserId || ''));
   const mob = String(mobile || '').trim();
   if (!/^[0-9]{10}$/.test(mob)) return { available: false, reason: 'invalid' };
   const params = [mob, INTERNAL_USER_TYPE_ID];
@@ -496,6 +526,7 @@ async function isMobileTakenByAnother(mobile, excludeUserId) {
   sql += ' LIMIT 1';
   const [[row]] = await pool.query(sql, params);
   if (!row) return { available: true };
+  logger.info('Mobile already taken · takenByUserId=' + row.user_id);
   return { available: false, takenBy: { user_id: row.user_id, user_name: row.user_name } };
 }
 
@@ -508,6 +539,7 @@ async function isMobileTakenByAnother(mobile, excludeUserId) {
  * single `WHERE official_email IN (...)` query to avoid an N+1 loop).
  */
 async function isEmailTakenByAnother(email, excludeUserId, name) {
+  logger.info('Check email availability · excludeUserId=' + (excludeUserId || ''));
   const e = String(email || '').trim().toLowerCase();
   if (!/^\S+@\S+\.\S+$/.test(e)) return { available: false, reason: 'invalid' };
   const params = [e, INTERNAL_USER_TYPE_ID];
@@ -524,6 +556,7 @@ async function isEmailTakenByAnother(email, excludeUserId, name) {
   }
 
   if (!taken) return { available: true };
+  logger.info('Email already taken · takenByUserId=' + row.user_id + ' · hasSuggestion=' + !!suggestion);
   return {
     available: false,
     takenBy: { user_id: row.user_id, user_name: row.user_name },
@@ -542,6 +575,7 @@ async function isEmailTakenByAnother(email, excludeUserId, name) {
  *      candidate not in the result.
  */
 async function suggestAvailableEmail(name, excludeUserId) {
+  logger.info('Suggest available email · excludeUserId=' + (excludeUserId || ''));
   const sanitise = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const toks = String(name).trim().split(/\s+/).filter(Boolean).map(sanitise).filter(Boolean);
   if (toks.length === 0) return null;
@@ -563,12 +597,14 @@ async function suggestAvailableEmail(name, excludeUserId) {
 }
 
 async function deactivateUser(userId, updatedBy) {
+  logger.info('Deactivate user · userId=' + userId);
   const [r] = await pool.query(
     `UPDATE tbl_user
         SET user_status = 0, update_date = NOW(), updated_by = ?
       WHERE user_id = ? AND user_type_id = ?`,
     [updatedBy || null, userId, INTERNAL_USER_TYPE_ID]
   );
+  logger.info('User deactivated · userId=' + userId + ' · affected=' + r.affectedRows);
   if (r.affectedRows) {
     // Deactivated user's perms cache entry would still serve stale data
     // until TTL; drop it now so a re-activation or any racing request

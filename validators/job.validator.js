@@ -323,6 +323,20 @@ const assignBody = Joi.object({
 });
 
 /*
+ * Offer body — POST /:id/offer. The offer-pool model fans a single job out to
+ * MULTIPLE technicians at once, so the payload carries an `easyfixerIds` array
+ * (1..50) rather than the single `easyfixerId` that legacy direct-assign uses.
+ * `requestedDateTime` + `timeSlot` reuse assignBody's definitions verbatim so
+ * the optional schedule edit rides along with the offer exactly as it does on
+ * /assign (IST wall-clock string — see the assignBody note above).
+ */
+const offerBody = Joi.object({
+  easyfixerIds: Joi.array().items(intId).min(1).max(50).required(),
+  requestedDateTime: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$/).max(40).optional(),
+  timeSlot: Joi.string().max(200).allow('', null).optional(),
+});
+
+/*
  * Query schema for GET /:id/candidates (ranked top-N) — limit + optional
  * proposed-schedule overrides so the modal can recompute attendance /
  * concurrent / same-slot against the date/slot the ops user is editing.
@@ -355,6 +369,6 @@ const ownerBody = Joi.object({
 const idParam = Joi.object({ id: intId.required() });
 
 module.exports = {
-  listQuery, createBody, updateBody, statusBody, assignBody, ownerBody, idParam,
+  listQuery, createBody, updateBody, statusBody, assignBody, offerBody, ownerBody, idParam,
   candidatesQuery, candidatesSearchQuery,
 };

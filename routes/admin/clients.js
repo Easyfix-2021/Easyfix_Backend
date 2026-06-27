@@ -117,6 +117,7 @@ async function guardRowByClientId(req, res, clientId, notFoundMsg) {
 
 router.get('/', validate(v.listClientsQuery, 'query'), async (req, res, next) => {
   try {
+    logger.info('List clients · q=' + (req.query.q || '') + ' cityId=' + (req.query.cityId || '') + ' includeInactive=' + (req.query.includeInactive || 'false') + ' limit=' + req.query.limit + ' offset=' + req.query.offset);
     const extraClauses = [];
     const extraParams = [];
     // RBAC: restrict the visible client list to the caller's
@@ -152,6 +153,7 @@ router.get('/', validate(v.listClientsQuery, 'query'), async (req, res, next) =>
     // FE reads `data.items` + `data.total`. Backwards-compat note:
     // the previous shape was a bare array; updated FE callers consume
     // the new shape. No other internal services consume this route.
+    logger.info('Returning ' + items.length + ' clients · total=' + total);
     modernOk(res, { items, total });
   } catch (e) { next(e); }
 });
@@ -172,6 +174,7 @@ router.get('/', validate(v.listClientsQuery, 'query'), async (req, res, next) =>
  */
 router.get('/export', async (req, res, next) => {
   try {
+    logger.info('Export clients XLSX · q=' + (req.query.q || '') + ' includeInactive=' + (req.query.includeInactive || 'false'));
     const extraClauses = [];
     const extraParams = [];
     const scope = buildRequestScope(req);
@@ -199,6 +202,7 @@ router.get('/export', async (req, res, next) => {
       limit: 100000, // export ceiling — well above current tenant scale
       offset: 0,
     });
+    logger.info('Exporting ' + items.length + ' clients to XLSX');
     const buf = await xlsxSvc.exportClientList(items);
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="clients-${new Date().toISOString().slice(0, 10)}.xlsx"`);
@@ -217,6 +221,7 @@ router.get('/export', async (req, res, next) => {
  */
 router.get('/reports/spoc-list', async (req, res, next) => {
   try {
+    logger.info('SPOC roster report · format=' + (req.query.format || 'json'));
     const extraClauses = ['(cc.status IS NULL OR cc.status = 1)'];
     const extraParams = [];
     const scope = buildRequestScope(req);
@@ -246,6 +251,7 @@ router.get('/reports/spoc-list', async (req, res, next) => {
         ORDER BY cl.client_name ASC, cc.contact_name ASC`,
       extraParams,
     );
+    logger.info('Found ' + rows.length + ' SPOC contacts');
     if (req.query.format === 'xlsx') {
       const buf = await xlsxSvc.exportSpocList(rows);
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -264,6 +270,7 @@ router.get('/reports/spoc-list', async (req, res, next) => {
  */
 router.get('/bulk-spoc-template', async (req, res, next) => {
   try {
+    logger.info('Download bulk SPOC assignment template');
     const buf = await xlsxSvc.buildBulkSpocAssignmentTemplate();
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', 'attachment; filename="client-bulk-spoc-template.xlsx"');
@@ -293,8 +300,10 @@ router.post(
   upload.single('file'),
   async (req, res, next) => {
     try {
+      logger.info('Bulk upload SPOC assignments');
       if (!req.file) return modernError(res, 400, 'missing "file" upload');
       const { rows } = await xlsxSvc.parseBulkSpocAssignment(req.file.buffer);
+      logger.info('Parsed ' + rows.length + ' SPOC assignment rows');
       const validUsers = await verticalsSvc.activeInternalUserIds();
       const out = { total: rows.length, updated: 0, invalid: 0, skipped: 0, failed: 0 };
       const results = [];
@@ -328,9 +337,12 @@ router.post(
           }
         }
       }
+      logger.info('SPOC bulk upload done · updated=' + out.updated + ' invalid=' + out.invalid + ' skipped=' + out.skipped + ' failed=' + out.failed);
       modernOk(res, { summary: out, results });
     } catch (e) {
+      if (e.code === 'LIMIT_FILE_SIZE') logger.warn('SPOC bulk upload failed · ' + e.message);
       if (e.code === 'LIMIT_FILE_SIZE') return modernError(res, 400, 'file exceeds 10MB');
+      if (e.status) logger.warn('SPOC bulk upload failed · ' + e.message);
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
     }
@@ -345,6 +357,7 @@ router.post(
  */
 router.get('/spoc-template', async (req, res, next) => {
   try {
+    logger.info('Download SPOC upload template');
     const buf = await xlsxSvc.buildSpocTemplate();
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', 'attachment; filename="client-spoc-template.xlsx"');
@@ -371,6 +384,7 @@ router.post(
   async (req, res, next) => {
     try {
       const { action, clientIds } = req.body;
+      logger.info('Build bulk template · action=' + action + ' clientIds=' + (clientIds ? clientIds.length : 0));
       // Scope-filter: only return clients visible to this operator.
       const scope = require('../../lib/scope').buildRequestScope(req);
       const scopeClauses = [];
@@ -411,10 +425,12 @@ router.post(
         buf = await xlsxSvc.buildBulkMonthlyRevenueTemplate(clients);
         filename = 'bulk-monthly-revenue-template.xlsx';
       }
+      logger.info('Built ' + action + ' template for ' + clients.length + ' clients');
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
       res.send(buf);
     } catch (e) {
+      if (e.status) logger.warn('Build bulk template failed · ' + e.message);
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
     }
@@ -457,10 +473,12 @@ router.post(
       const { action } = req.body;
       // dryRun arrives as a FormData text field ("true"/"false") or Joi-coerced bool.
       const dryRun = req.body.dryRun === true || req.body.dryRun === 'true';
+      logger.info('Bulk upload · action=' + action + ' dryRun=' + dryRun);
 
       if (action === 'spoc') {
         // ── Delegate to existing SPOC assignment path ──────────────
         const { rows } = await xlsxSvc.parseBulkSpocAssignment(req.file.buffer);
+        logger.info('Parsed ' + rows.length + ' SPOC rows');
         const validUsers = await verticalsSvc.activeInternalUserIds();
         // Resolve client names once (single query) so the per-row report's
         // Client column shows the name — for both the dry-run preview and commit.
@@ -510,11 +528,13 @@ router.post(
             }
           }
         }
+        logger.info('SPOC bulk upload done · updated=' + out.updated + ' invalid=' + out.invalid + ' skipped=' + out.skipped + ' failed=' + out.failed + ' dryRun=' + dryRun);
         return modernOk(res, { summary: out, results, dryRun });
       }
 
       // ── Monthly Revenue path ─────────────────────────────────────
       const { rows } = await xlsxSvc.parseBulkMonthlyRevenue(req.file.buffer);
+      logger.info('Parsed ' + rows.length + ' monthly-revenue rows');
       const scope = require('../../lib/scope').buildRequestScope(req);
       const out = { total: rows.length, updated: 0, invalid: 0, skipped: 0, failed: 0 };
       const results = [];
@@ -573,9 +593,12 @@ router.post(
           }
         }
       }
+      logger.info('Monthly-revenue bulk upload done · updated=' + out.updated + ' invalid=' + out.invalid + ' failed=' + out.failed + ' dryRun=' + dryRun);
       return modernOk(res, { summary: out, results, dryRun });
     } catch (e) {
+      if (e.code === 'LIMIT_FILE_SIZE') logger.warn('Bulk upload failed · ' + e.message);
       if (e.code === 'LIMIT_FILE_SIZE') return modernError(res, 400, 'file exceeds 10MB');
+      if (e.status) logger.warn('Bulk upload failed · ' + e.message);
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
     }
@@ -599,19 +622,23 @@ router.post(
  */
 router.get('/custom-property-keys', async (req, res, next) => {
   try {
+    logger.info('List distinct custom-property keys');
     const keys = await svc.listDistinctCustomPropertyKeys();
+    logger.info('Found ' + keys.length + ' custom-property keys');
     modernOk(res, keys);
   } catch (e) { next(e); }
 });
 
 router.get('/:id', async (req, res, next) => {
   try {
+    logger.info('Get client · id=' + req.params.id);
     const c = await svc.getClientById(req.params.id);
     if (!c) return modernError(res, 404, 'client not found');
     const guard = assertEntityInScope(req, {
       client_id: c.client_id,
       vertical_id: c.vertical_id,
     });
+    if (!guard.ok) logger.warn('Client out of scope · id=' + req.params.id);
     if (!guard.ok) return modernError(res, 404, 'client not found');
     modernOk(res, c);
   } catch (e) { next(e); }
@@ -623,10 +650,13 @@ router.post(
   validate(v.createClientBody),
   async (req, res, next) => {
     try {
+      logger.info('Create client · name=' + (req.body.client_name || req.body.clientName || ''));
       const id = await svc.createClient(req.body, req.user.user_id);
+      logger.info('Client created · id=' + id);
       res.status(201);
       modernOk(res, { client_id: id });
     } catch (e) {
+      if (e.status) logger.warn('Create client failed · ' + e.message);
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
     }
@@ -639,6 +669,7 @@ router.put(
   validate(v.updateClientBody),
   async (req, res, next) => {
     try {
+      logger.info('Update client · id=' + req.params.id);
       // Scope-check before mutating.
       const existing = await svc.getClientById(req.params.id);
       if (!existing) return modernError(res, 404, 'client not found');
@@ -646,10 +677,13 @@ router.put(
         client_id: existing.client_id,
         vertical_id: existing.vertical_id,
       });
+      if (!guard.ok) logger.warn('Client out of scope · id=' + req.params.id);
       if (!guard.ok) return modernError(res, 404, 'client not found');
       await svc.updateClient(req.params.id, req.body, req.user.user_id);
+      logger.info('Client updated · id=' + req.params.id);
       modernOk(res, { updated: true });
     } catch (e) {
+      if (e.status) logger.warn('Update client failed · ' + e.message);
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
     }
@@ -660,8 +694,10 @@ router.put(
 
 router.get('/:clientId/contacts', async (req, res, next) => {
   try {
+    logger.info('List client contacts · clientId=' + req.params.clientId);
     if (!(await loadAndGuardClient(req, res))) return;
     const rows = await svc.listContacts(req.params.clientId);
+    logger.info('Found ' + rows.length + ' contacts');
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
@@ -679,6 +715,7 @@ router.get(
   validate(v.contactDuplicateCheckQuery, 'query'),
   async (req, res, next) => {
     try {
+      logger.info('Check contact duplicate · clientId=' + req.params.clientId);
       if (!(await loadAndGuardClient(req, res))) return;
       const dup = await svc.findDuplicateContact({
         clientId: Number(req.params.clientId),
@@ -686,6 +723,7 @@ router.get(
         phone: req.query.phone,
         excludeId: req.query.excludeId ? Number(req.query.excludeId) : undefined,
       });
+      logger.info('Duplicate contact ' + (dup ? 'found · id=' + dup.id : 'not found'));
       modernOk(res, { duplicate: dup });
     } catch (e) { next(e); }
   },
@@ -697,14 +735,17 @@ router.post(
   validate(v.createContactBody),
   async (req, res, next) => {
     try {
+      logger.info('Create client contact · clientId=' + req.params.clientId);
       if (!(await loadAndGuardClient(req, res))) return;
       const id = await svc.createContact(req.params.clientId, req.body);
+      logger.info('Contact created · id=' + id);
       res.status(201);
       modernOk(res, { id });
     } catch (e) {
       if (e.status) {
         // Surface the conflicting row so the FE can highlight the
         // existing contact rather than just showing "409".
+        logger.warn('Create contact failed · ' + e.message);
         return modernError(res, e.status, e.message, e.conflict ? { conflict: e.conflict } : undefined);
       }
       next(e);
@@ -718,11 +759,14 @@ router.put(
   validate(v.updateContactBody),
   async (req, res, next) => {
     try {
+      logger.info('Update client contact · id=' + req.params.id);
       if (!(await guardRowByClientId(req, res, await svc.getContactClientId(req.params.id), 'contact not found'))) return;
       await svc.updateContact(req.params.id, req.body);
+      logger.info('Contact updated · id=' + req.params.id);
       modernOk(res, { updated: true });
     } catch (e) {
       if (e.status) {
+        logger.warn('Update contact failed · ' + e.message);
         return modernError(res, e.status, e.message, e.conflict ? { conflict: e.conflict } : undefined);
       }
       next(e);
@@ -749,9 +793,11 @@ router.post(
   upload.single('file'),
   async (req, res, next) => {
     try {
+      logger.info('Bulk upload client contacts · clientId=' + req.params.clientId);
       if (!(await loadAndGuardClient(req, res))) return;
       if (!req.file) return modernError(res, 400, 'missing "file" upload');
       const { rows } = await xlsxSvc.parseSpocUpload(req.file.buffer);
+      logger.info('Parsed ' + rows.length + ' contact rows');
       const out = { total: rows.length, created: 0, skipped: 0, invalid: 0 };
       const results = [];
       for (const r of rows) {
@@ -775,9 +821,12 @@ router.post(
           }
         }
       }
+      logger.info('Contact bulk upload done · created=' + out.created + ' skipped=' + out.skipped + ' invalid=' + out.invalid);
       modernOk(res, { summary: out, results });
     } catch (e) {
+      if (e.code === 'LIMIT_FILE_SIZE') logger.warn('Contact bulk upload failed · ' + e.message);
       if (e.code === 'LIMIT_FILE_SIZE') return modernError(res, 400, 'file exceeds 10MB');
+      if (e.status) logger.warn('Contact bulk upload failed · ' + e.message);
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
     }
@@ -789,9 +838,11 @@ router.delete(
   requireClientEdit,
   async (req, res, next) => {
     try {
+      logger.info('Delete client contact · id=' + req.params.id);
       if (!(await guardRowByClientId(req, res, await svc.getContactClientId(req.params.id), 'contact not found'))) return;
       const affected = await svc.deleteContact(req.params.id);
       if (!affected) return modernError(res, 404, 'contact not found');
+      logger.info('Contact deleted · id=' + req.params.id);
       modernOk(res, { deleted: true });
     } catch (e) { next(e); }
   },
@@ -801,8 +852,10 @@ router.delete(
 
 router.get('/:clientId/billing', async (req, res, next) => {
   try {
+    logger.info('List client billing · clientId=' + req.params.clientId);
     if (!(await loadAndGuardClient(req, res))) return;
     const rows = await svc.listBilling(req.params.clientId);
+    logger.info('Found ' + rows.length + ' billing rows');
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
@@ -813,11 +866,14 @@ router.post(
   validate(v.createBillingBody),
   async (req, res, next) => {
     try {
+      logger.info('Create client billing · clientId=' + req.params.clientId);
       if (!(await loadAndGuardClient(req, res))) return;
       const id = await svc.createBilling(req.params.clientId, req.body);
+      logger.info('Billing created · id=' + id);
       res.status(201);
       modernOk(res, { c_bill_id: id });
     } catch (e) {
+      if (e.status) logger.warn('Create billing failed · ' + e.message);
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
     }
@@ -830,11 +886,14 @@ router.put(
   validate(v.updateBillingBody),
   async (req, res, next) => {
     try {
+      logger.info('Update client billing · id=' + req.params.id);
       if (!(await guardRowByClientId(req, res, await svc.getBillingClientId(req.params.id), 'billing row not found'))) return;
       const affected = await svc.updateBilling(req.params.id, req.body);
       if (!affected) return modernError(res, 404, 'billing row not found');
+      logger.info('Billing updated · id=' + req.params.id);
       modernOk(res, { updated: true });
     } catch (e) {
+      if (e.status) logger.warn('Update billing failed · ' + e.message);
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
     }
@@ -846,9 +905,11 @@ router.delete(
   requireClientEdit,
   async (req, res, next) => {
     try {
+      logger.info('Delete client billing · id=' + req.params.id);
       if (!(await guardRowByClientId(req, res, await svc.getBillingClientId(req.params.id), 'billing row not found'))) return;
       const affected = await svc.deleteBilling(req.params.id);
       if (!affected) return modernError(res, 404, 'billing row not found');
+      logger.info('Billing deleted · id=' + req.params.id);
       modernOk(res, { deleted: true });
     } catch (e) { next(e); }
   },
@@ -865,6 +926,7 @@ router.delete(
  */
 router.get('/:clientId/custom-properties', async (req, res, next) => {
   try {
+    logger.info('List client custom properties · clientId=' + req.params.clientId);
     if (!(await loadAndGuardClient(req, res))) return;
     const rows = await svc.listCustomProperties(req.params.clientId);
     const truthy = (val) => {
@@ -890,6 +952,7 @@ router.get('/:clientId/custom-properties', async (req, res, next) => {
       id: r.id ?? r.c_prop_id ?? null,
       raw: r,
     })).filter((p) => p.name);
+    logger.info('Returning ' + normalised.length + ' custom properties');
     modernOk(res, normalised);
   } catch (e) { next(e); }
 });
@@ -900,11 +963,14 @@ router.post(
   validate(v.createCustomPropertyBody),
   async (req, res, next) => {
     try {
+      logger.info('Create custom property · clientId=' + req.params.clientId + ' name=' + (req.body.name || req.body.property_name || ''));
       if (!(await loadAndGuardClient(req, res))) return;
       const id = await svc.createCustomProperty(req.params.clientId, req.body);
+      logger.info('Custom property created · id=' + id);
       res.status(201);
       modernOk(res, { id });
     } catch (e) {
+      if (e.status) logger.warn('Create custom property failed · ' + e.message);
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
     }
@@ -917,11 +983,14 @@ router.put(
   validate(v.updateCustomPropertyBody),
   async (req, res, next) => {
     try {
+      logger.info('Update custom property · id=' + req.params.id);
       if (!(await guardRowByClientId(req, res, await svc.getCustomPropertyClientId(req.params.id), 'custom property not found'))) return;
       const affected = await svc.updateCustomProperty(req.params.id, req.body);
       if (!affected) return modernError(res, 404, 'custom property not found');
+      logger.info('Custom property updated · id=' + req.params.id);
       modernOk(res, { updated: true });
     } catch (e) {
+      if (e.status) logger.warn('Update custom property failed · ' + e.message);
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
     }
@@ -933,9 +1002,11 @@ router.delete(
   requireClientEdit,
   async (req, res, next) => {
     try {
+      logger.info('Delete custom property · id=' + req.params.id);
       if (!(await guardRowByClientId(req, res, await svc.getCustomPropertyClientId(req.params.id), 'custom property not found'))) return;
       const affected = await svc.deleteCustomProperty(req.params.id);
       if (!affected) return modernError(res, 404, 'custom property not found');
+      logger.info('Custom property deleted · id=' + req.params.id);
       modernOk(res, { deleted: true });
     } catch (e) { next(e); }
   },
@@ -958,6 +1029,7 @@ const COLLECTED_BY_MAP = {
 
 router.get('/:clientId/collected-by-preference', async (req, res, next) => {
   try {
+    logger.info('Get collected-by preference · clientId=' + req.params.clientId);
     const clientId = Number(req.params.clientId);
     if (!Number.isInteger(clientId) || clientId <= 0) {
       return modernError(res, 400, 'invalid clientId');
@@ -996,8 +1068,10 @@ router.get('/:clientId/collected-by-preference', async (req, res, next) => {
  */
 router.get('/:clientId/verticals', async (req, res, next) => {
   try {
+    logger.info('List client verticals · clientId=' + req.params.clientId);
     if (!(await loadAndGuardClient(req, res))) return;
     const rows = await verticalsSvc.listForClient(req.params.clientId);
+    logger.info('Found ' + rows.length + ' vertical mappings');
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
@@ -1025,6 +1099,7 @@ router.put(
   requireClientEdit,
   async (req, res, next) => {
     try {
+      logger.info('Upsert client SPOC pair · clientId=' + req.params.clientId);
       if (!(await loadAndGuardClient(req, res))) return;
       const primaryUserId   = Number(req.body?.primaryUserId);
       const secondaryUserId = Number(req.body?.secondaryUserId);
@@ -1040,8 +1115,10 @@ router.put(
       const result = await verticalsSvc.upsertPrimarySecondarySpoc(
         req.params.clientId, primaryUserId, secondaryUserId,
       );
+      logger.info('SPOC pair upserted · clientId=' + req.params.clientId);
       modernOk(res, result);
     } catch (e) {
+      if (e.status) logger.warn('Upsert SPOC pair failed · ' + e.message);
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
     }
@@ -1054,10 +1131,13 @@ router.put(
   validate(v.replaceVerticalsBody),
   async (req, res, next) => {
     try {
+      logger.info('Replace client verticals · clientId=' + req.params.clientId + ' assignments=' + (req.body.assignments ? req.body.assignments.length : 0));
       if (!(await loadAndGuardClient(req, res))) return;
       const written = await verticalsSvc.replaceForClient(req.params.clientId, req.body.assignments);
+      logger.info('Vertical mappings written · count=' + written);
       modernOk(res, { written });
     } catch (e) {
+      if (e.status) logger.warn('Replace verticals failed · ' + e.message);
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
     }
@@ -1110,6 +1190,7 @@ router.get('/:clientId/services',
   }),
   async (req, res, next) => {
     try {
+      logger.info('List client services · clientId=' + req.params.clientId + ' includeInactive=' + (req.query.includeInactive || 'false'));
       if (!(await loadAndGuardClient(req, res))) return;
       // ?includeInactive=1 surfaces soft-deleted (service_status=0) rows
       // too, matching the legacy Manage Client Services page which shows
@@ -1121,6 +1202,7 @@ router.get('/:clientId/services',
         req.params.clientId,
         { includeInactive },
       );
+      logger.info('Found ' + rows.length + ' client services');
       modernOk(res, rows);
     } catch (e) { next(e); }
   },
@@ -1153,6 +1235,7 @@ router.get(
   }),
   async (req, res, next) => {
     try {
+      logger.info('Get client service · id=' + req.params.id);
       if (!(await guardRowByClientId(req, res, await svc.getServiceClientId(req.params.id), 'client service not found'))) return;
       const row = await clientServicesSvc.getOne(req.params.id);
       if (!row) return modernError(res, 404, 'client service not found');
@@ -1194,11 +1277,14 @@ router.post(
   }),
   async (req, res, next) => {
     try {
+      logger.info('Create client service · clientId=' + req.params.clientId + ' serviceCategoryId=' + (req.body.serviceCategoryId || ''));
       if (!(await loadAndGuardClient(req, res))) return;
       const id = await clientServicesSvc.create(req.params.clientId, req.body);
+      logger.info('Client service created · id=' + id);
       res.status(201);
       modernOk(res, { client_service_id: id });
     } catch (e) {
+      if (e.status) logger.warn('Create client service failed · ' + e.message);
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
     }
@@ -1227,11 +1313,14 @@ router.put(
   }),
   async (req, res, next) => {
     try {
+      logger.info('Update client service · id=' + req.params.id);
       if (!(await guardRowByClientId(req, res, await svc.getServiceClientId(req.params.id), 'client service not found'))) return;
       const affected = await clientServicesSvc.update(req.params.id, req.body);
       if (!affected) return modernError(res, 404, 'client service not found');
+      logger.info('Client service updated · id=' + req.params.id);
       modernOk(res, { updated: true });
     } catch (e) {
+      if (e.status) logger.warn('Update client service failed · ' + e.message);
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
     }
@@ -1243,9 +1332,11 @@ router.delete(
   requireClientEdit,
   async (req, res, next) => {
     try {
+      logger.info('Delete client service · id=' + req.params.id);
       if (!(await guardRowByClientId(req, res, await svc.getServiceClientId(req.params.id), 'client service not found'))) return;
       const affected = await clientServicesSvc.softDelete(req.params.id);
       if (!affected) return modernError(res, 404, 'client service not found');
+      logger.info('Client service deleted · id=' + req.params.id);
       modernOk(res, { deleted: true });
     } catch (e) { next(e); }
   },
@@ -1265,8 +1356,10 @@ router.delete(
  */
 router.get('/:clientId/rate-cards', async (req, res, next) => {
   try {
+    logger.info('List client rate cards · clientId=' + req.params.clientId);
     if (!(await loadAndGuardClient(req, res))) return;
     const rows = await rateCardsSvc.listForClient(req.params.clientId);
+    logger.info('Found ' + rows.length + ' rate-card rows');
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
@@ -1277,10 +1370,13 @@ router.put(
   validate(v.bulkUpsertRateCardsBody),
   async (req, res, next) => {
     try {
+      logger.info('Bulk-upsert client rate cards · clientId=' + req.params.clientId + ' rows=' + (req.body.rows ? req.body.rows.length : 0));
       if (!(await loadAndGuardClient(req, res))) return;
       const affected = await rateCardsSvc.bulkUpsert(req.params.clientId, req.body.rows);
+      logger.info('Rate cards upserted · affected=' + affected);
       modernOk(res, { affected });
     } catch (e) {
+      if (e.status) logger.warn('Bulk-upsert rate cards failed · ' + e.message);
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
     }
@@ -1293,9 +1389,11 @@ router.put(
  */
 router.get('/:clientId/rate-cards/download', async (req, res, next) => {
   try {
+    logger.info('Download client rate cards XLSX · clientId=' + req.params.clientId);
     const client = await loadAndGuardClient(req, res);
     if (!client) return;
     const rows = await rateCardsSvc.listForClient(req.params.clientId);
+    logger.info('Exporting ' + rows.length + ' rate-card rows to XLSX');
     const buf = await xlsxSvc.exportRateCards(client.client_name, rows);
     const safeName = String(client.client_name || `client-${client.client_id}`).replace(/[^a-z0-9_-]+/gi, '_');
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -1309,8 +1407,10 @@ router.delete(
   requireClientEdit,
   async (req, res, next) => {
     try {
+      logger.info('Delete client rate card · id=' + req.params.id);
       const affected = await rateCardsSvc.deleteOne(req.params.id);
       if (!affected) return modernError(res, 404, 'rate card not found');
+      logger.info('Rate card deleted · id=' + req.params.id);
       modernOk(res, { deleted: true });
     } catch (e) { next(e); }
   },
@@ -1345,8 +1445,10 @@ router.delete(
  */
 router.get('/:clientId/tech-mapping/summary', async (req, res, next) => {
   try {
+    logger.info('Tech-mapping summary · clientId=' + req.params.clientId);
     if (!(await loadAndGuardClient(req, res))) return;
     const rows = await techMappingSvc.summaryForClient(req.params.clientId);
+    logger.info('Found ' + rows.length + ' service-type roll-ups');
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
@@ -1356,6 +1458,7 @@ router.get(
   validate(v.eligibleTechsQuery, 'query'),
   async (req, res, next) => {
     try {
+      logger.info('List eligible techs · clientId=' + req.params.clientId + ' serviceTypeId=' + (req.query.serviceTypeId || '') + ' cityId=' + (req.query.cityId || ''));
       if (!(await loadAndGuardClient(req, res))) return;
       const techs = await techMappingSvc.eligibleTechsFor(
         Number(req.query.serviceTypeId),
@@ -1366,6 +1469,7 @@ router.get(
           includeUnverified: req.query.includeUnverified === 'true',
         },
       );
+      logger.info('Found ' + techs.length + ' eligible techs');
       modernOk(res, techs);
     } catch (e) { next(e); }
   },
@@ -1373,20 +1477,24 @@ router.get(
 
 router.get('/:clientId/tech-mapping/by-service-type/:serviceTypeId', async (req, res, next) => {
   try {
+    logger.info('Tech-mapping by service type · clientId=' + req.params.clientId + ' serviceTypeId=' + req.params.serviceTypeId);
     if (!(await loadAndGuardClient(req, res))) return;
     const stId = Number(req.params.serviceTypeId);
     if (!Number.isInteger(stId) || stId <= 0) {
       return modernError(res, 400, 'serviceTypeId must be a positive integer');
     }
     const rows = await techMappingSvc.listForClientServiceType(req.params.clientId, stId);
+    logger.info('Found ' + rows.length + ' mapped techs');
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
 
 router.get('/:clientId/tech-mapping', async (req, res, next) => {
   try {
+    logger.info('List tech mappings · clientId=' + req.params.clientId);
     if (!(await loadAndGuardClient(req, res))) return;
     const rows = await techMappingSvc.listForClient(req.params.clientId);
+    logger.info('Found ' + rows.length + ' tech mappings');
     modernOk(res, rows);
   } catch (e) { next(e); }
 });
@@ -1397,14 +1505,17 @@ router.put(
   validate(v.replaceTechMappingBody),
   async (req, res, next) => {
     try {
+      logger.info('Replace tech mapping · clientId=' + req.params.clientId + ' serviceTypeId=' + req.body.serviceTypeId + ' efrIds=' + (req.body.efrIds ? req.body.efrIds.length : 0));
       if (!(await loadAndGuardClient(req, res))) return;
       const n = await techMappingSvc.replaceForServiceType(
         req.params.clientId,
         req.body.serviceTypeId,
         req.body.efrIds,
       );
+      logger.info('Tech mapping replaced · assigned=' + n);
       modernOk(res, { assigned: n });
     } catch (e) {
+      if (e.status) logger.warn('Replace tech mapping failed · ' + e.message);
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
     }
@@ -1422,10 +1533,13 @@ router.put(
  */
 router.get('/:clientId/documents', async (req, res, next) => {
   try {
+    logger.info('List client documents · clientId=' + req.params.clientId);
     if (!(await loadAndGuardClient(req, res))) return;
     const rows = await docsSvc.listForClient(req.params.clientId);
+    logger.info('Found ' + rows.length + ' documents');
     modernOk(res, rows);
   } catch (e) {
+    if (e.status) logger.warn('List documents failed · ' + e.message);
     if (e.status) return modernError(res, e.status, e.message);
     next(e);
   }
@@ -1454,6 +1568,7 @@ router.post(
   upload.single('file'),
   async (req, res, next) => {
     try {
+      logger.info('Upload client document · clientId=' + req.params.clientId + ' docType=' + String(req.body.docType || '').toLowerCase());
       if (!(await loadAndGuardClient(req, res))) return;
       if (!req.file) return modernError(res, 400, 'missing "file" upload');
       if (!DOC_MIME.has(req.file.mimetype)) {
@@ -1480,10 +1595,13 @@ router.post(
         uploadedBy: req.user.user_id,
       });
       const url = await s3.resolveClientDocumentUrl(s3Key).catch(() => null);
+      logger.info('Client document uploaded · id=' + documentId);
       res.status(201);
       modernOk(res, { document_id: documentId, s3_key: s3Key, url });
     } catch (e) {
+      if (e.code === 'LIMIT_FILE_SIZE') logger.warn('Document upload failed · ' + e.message);
       if (e.code === 'LIMIT_FILE_SIZE') return modernError(res, 400, 'file exceeds 10MB');
+      if (e.status) logger.warn('Document upload failed · ' + e.message);
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
     }
@@ -1495,11 +1613,14 @@ router.delete(
   requireClientEdit,
   async (req, res, next) => {
     try {
+      logger.info('Delete client document · id=' + req.params.id);
       if (!(await guardRowByClientId(req, res, await svc.getDocumentClientId(req.params.id), 'document not found'))) return;
       const affected = await docsSvc.softDelete(req.params.id);
       if (!affected) return modernError(res, 404, 'document not found');
+      logger.info('Client document deleted · id=' + req.params.id);
       modernOk(res, { deleted: true });
     } catch (e) {
+      if (e.status) logger.warn('Delete document failed · ' + e.message);
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
     }

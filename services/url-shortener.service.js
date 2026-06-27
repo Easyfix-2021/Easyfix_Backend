@@ -83,6 +83,8 @@ async function shortenUrl(longUrl, opts = {}, pool) {
   const { purpose = null, expiresAt = null, createdBy = null } = opts;
   const base = resolveShortBase();
 
+  logger.info('Shorten URL · purpose=' + (purpose || 'none') + ' · hasExpiry=' + !!expiresAt);
+
   for (let attempt = 0; attempt < 5; attempt++) {
     const code = generateShortCode(8);
     try {
@@ -101,6 +103,7 @@ async function shortenUrl(longUrl, opts = {}, pool) {
       // working via the next.config back-compat redirect.
       const flow = /profile/i.test(purpose || '') ? 'profile' : 'book';
       const shortPath = `/public/${flow}/${code}`;
+      logger.info('Short link created · code=' + code + ' · flow=' + flow);
       return {
         short_code: code,
         short_url: base ? `${base}${shortPath}` : shortPath,
@@ -115,6 +118,7 @@ async function shortenUrl(longUrl, opts = {}, pool) {
       throw err;
     }
   }
+  logger.error('Short link creation failed · exhausted retries generating unique short_code');
   throw new Error('url-shortener: exhausted retries generating a unique short_code');
 }
 
@@ -128,6 +132,7 @@ async function shortenUrl(longUrl, opts = {}, pool) {
  * decides whether to redirect or render the expired-link page.
  */
 async function resolveCode(code, pool) {
+  logger.info('Resolve short code · code=' + code);
   const [rows] = await pool.query(
     `SELECT long_url, expires_at
        FROM tbl_url_shortener
@@ -135,10 +140,14 @@ async function resolveCode(code, pool) {
       LIMIT 1`,
     [code],
   );
-  if (!rows || rows.length === 0) return null;
+  if (!rows || rows.length === 0) {
+    logger.warn('Short code not found · code=' + code);
+    return null;
+  }
   const row = rows[0];
   const expiresAt = row.expires_at ? new Date(row.expires_at) : null;
   const expired = !!(expiresAt && expiresAt.getTime() < Date.now());
+  logger.info('Short code resolved · code=' + code + ' · expired=' + expired);
   return {
     longUrl: row.long_url,
     expired,
@@ -154,6 +163,7 @@ async function resolveCode(code, pool) {
  * legitimate redirect on an analytics write failing.
  */
 function recordClick(code, pool) {
+  logger.info('Record short-link click · code=' + code);
   setImmediate(() => {
     pool.query(
       `UPDATE tbl_url_shortener

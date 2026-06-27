@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const logger = require('../logger');
 
 /*
  * Mobile "My Team" — a master technician's downline: the technicians whose
@@ -12,6 +13,7 @@ const { pool } = require('../db');
  * the app's Avatar falls back to initials when it isn't directly renderable.
  */
 async function getMyTeam(masterEfrId) {
+  logger.info('Fetch my-team downline · masterEfrId=' + masterEfrId);
   const [rows] = await pool.query(
     `SELECT e.efr_id          AS efr_id,
             e.efr_name        AS efr_name,
@@ -25,6 +27,7 @@ async function getMyTeam(masterEfrId) {
       ORDER BY e.efr_name ASC`,
     [masterEfrId],
   );
+  logger.info('Found ' + rows.length + ' team members');
   return rows.map((r) => ({
     efr_id:          r.efr_id,
     efr_name:        r.efr_name,

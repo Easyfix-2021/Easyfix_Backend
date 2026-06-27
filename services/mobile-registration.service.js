@@ -176,8 +176,10 @@ function deriveStatus(flags) {
 }
 
 async function getStatus(efrId) {
+  logger.info('Registration status · efrId=' + efrId);
   const e = await fetchGateRow(efrId);
   if (!e) {
+    logger.warn('Registration status: technician not found · efrId=' + efrId);
     const err = new Error('technician not found');
     err.status = 404;
     throw err;
@@ -204,6 +206,8 @@ async function getStatus(efrId) {
 
   const status = deriveStatus(flags);
 
+  logger.info('Returning registration status · status=' + status + ' profilePct=' + pct(e.efr_profile_perc));
+
   return {
     status,
     profilePercentage:    pct(e.efr_profile_perc),
@@ -225,8 +229,10 @@ async function getStatus(efrId) {
  * account number → IFSC → bank name).
  */
 async function getRemaining(efrId) {
+  logger.info('Registration remaining-fields · efrId=' + efrId);
   const e = await fetchGateRow(efrId);
   if (!e) {
+    logger.warn('Registration remaining-fields: technician not found · efrId=' + efrId);
     const err = new Error('technician not found');
     err.status = 404;
     throw err;
@@ -261,6 +267,7 @@ async function getRemaining(efrId) {
   if (!(Number(e.efr_cityId) > 0))      missing.push('City');
   if (!present(e.efr_pin_no))           missing.push('Pincode');
 
+  logger.info('Returning ' + missing.length + ' remaining field(s)');
   return missing;
 }
 
@@ -279,6 +286,7 @@ async function getRemaining(efrId) {
  * a previously-saved value.
  */
 async function savePersonalDetails(efrId, body) {
+  logger.info('Save personal details · hasName=' + Boolean(body.name) + ' hasPincode=' + (body.pincode != null) + ' hasAddress=' + Boolean(body.addressLine1 || body.addressLine2));
   const fullName  = String(body.name || '').trim();
   const firstName = fullName ? fullName.split(/\s+/)[0] : null;
   const lastName  = fullName && fullName.includes(' ')
@@ -324,6 +332,7 @@ async function savePersonalDetails(efrId, body) {
     );
   }
 
+  logger.info('Personal details saved · efrId=' + efrId + ' personalStepMarked=' + Boolean(row?.user_id));
   return { ok: true };
 }
 
@@ -342,7 +351,9 @@ async function savePersonalDetails(efrId, body) {
  */
 async function setLanguage(efrId, language) {
   const lang = String(language || '').trim();
+  logger.info('Set preferred language · language=' + (lang || '-'));
   if (!lang) {
+    logger.warn('Set language rejected · language is required');
     const err = new Error('language is required');
     err.status = 400;
     throw err;
@@ -362,6 +373,7 @@ async function setLanguage(efrId, language) {
     );
   }
 
+  logger.info('Preferred language saved · language=' + lang + ' inserted=' + (upd.affectedRows === 0));
   return { ok: true };
 }
 

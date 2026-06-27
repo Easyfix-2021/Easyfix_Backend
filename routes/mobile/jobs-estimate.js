@@ -4,6 +4,7 @@ const Joi = require('joi');
 const validate = require('../../middleware/validate');
 const { modernOk, modernError } = require('../../utils/response');
 const estimateService = require('../../services/mobile-job-estimate.service');
+const logger = require('../../logger');
 
 /*
  * /api/mobile/jobs/* — Technician-App "Estimate / Quotation" sub-router.
@@ -55,8 +56,11 @@ function fail(res, next, e) {
 // { items: [{ clientRateCardId, name, price, serviceTypeId }] }
 router.get('/:id/rate-card', validate(idParam, 'params'), async (req, res, next) => {
   try {
-    modernOk(res, await estimateService.getRateCard(Number(req.params.id), req.tech.efr_id));
-  } catch (e) { fail(res, next, e); }
+    logger.info('Fetch rate-card for job · jobId=' + req.params.id);
+    const out = await estimateService.getRateCard(Number(req.params.id), req.tech.efr_id);
+    logger.info('Returning ' + (out.items ? out.items.length : 0) + ' rate-card items');
+    modernOk(res, out);
+  } catch (e) { logger.warn('Fetch rate-card failed · jobId=' + req.params.id + ' · ' + e.message); fail(res, next, e); }
 });
 
 // ─── Quotation: add a line ─────────────────────────────────────────────
@@ -84,10 +88,12 @@ const quotationBody = Joi.object({
 
 router.post('/:id/quotation', validate(idParam, 'params'), validate(quotationBody), async (req, res, next) => {
   try {
+    logger.info('Add quotation line · jobId=' + req.params.id + ' · type=' + req.body.type + ' · qty=' + req.body.quantity + ' · amount=' + req.body.amount);
     const out = await estimateService.addQuotationLine(Number(req.params.id), req.tech.efr_id, req.body);
+    logger.info('Quotation line created · id=' + out.lineId);
     res.status(201);
     modernOk(res, out);
-  } catch (e) { fail(res, next, e); }
+  } catch (e) { logger.warn('Add quotation line failed · jobId=' + req.params.id + ' · ' + e.message); fail(res, next, e); }
 });
 
 // ─── Quotation: delete a line ──────────────────────────────────────────
@@ -100,10 +106,13 @@ const lineParam = Joi.object({
 
 async function handleDeleteLine(req, res, next) {
   try {
-    modernOk(res, await estimateService.deleteQuotationLine(
+    logger.info('Delete quotation line · jobId=' + req.params.id + ' · lineId=' + req.params.lineId);
+    const out = await estimateService.deleteQuotationLine(
       Number(req.params.id), req.tech.efr_id, Number(req.params.lineId),
-    ));
-  } catch (e) { fail(res, next, e); }
+    );
+    logger.info('Quotation line deleted · id=' + req.params.lineId);
+    modernOk(res, out);
+  } catch (e) { logger.warn('Delete quotation line failed · lineId=' + req.params.lineId + ' · ' + e.message); fail(res, next, e); }
 }
 
 router.post('/:id/quotation/:lineId', validate(lineParam, 'params'), handleDeleteLine);
@@ -115,10 +124,13 @@ router.post('/:id/send-for-approval', validate(idParam, 'params'), validate(Joi.
   checkInImageRefs: Joi.array().items(Joi.string().trim().max(512)).optional(),
 })), async (req, res, next) => {
   try {
-    modernOk(res, await estimateService.sendForApproval(
+    logger.info('Send estimate for approval · jobId=' + req.params.id + ' · checkInImageRefs=' + ((req.body.checkInImageRefs && req.body.checkInImageRefs.length) || 0));
+    const out = await estimateService.sendForApproval(
       Number(req.params.id), req.tech.efr_id, { checkInImageRefs: req.body.checkInImageRefs },
-    ));
-  } catch (e) { fail(res, next, e); }
+    );
+    logger.info('Estimate sent for approval · jobId=' + req.params.id);
+    modernOk(res, out);
+  } catch (e) { logger.warn('Send for approval failed · jobId=' + req.params.id + ' · ' + e.message); fail(res, next, e); }
 });
 
 // ─── Job images ────────────────────────────────────────────────────────
@@ -135,11 +147,14 @@ router.post(
   validate(Joi.object({ refs: Joi.array().items(Joi.string().trim().max(512)).default([]) })),
   async (req, res, next) => {
     try {
-      modernOk(res, await estimateService.recordImages(
+      logger.info('Record job images · jobId=' + req.params.id + ' · category=' + req.query.category + ' · refs=' + ((req.body.refs && req.body.refs.length) || 0));
+      const out = await estimateService.recordImages(
         Number(req.params.id), req.tech.efr_id,
         { category: req.query.category, refs: req.body.refs },
-      ));
-    } catch (e) { fail(res, next, e); }
+      );
+      logger.info('Recorded ' + (out.inserted || 0) + ' job images · jobId=' + req.params.id);
+      modernOk(res, out);
+    } catch (e) { logger.warn('Record job images failed · jobId=' + req.params.id + ' · ' + e.message); fail(res, next, e); }
   },
 );
 
@@ -147,8 +162,11 @@ router.post(
 // GET  /:id/questionnaire → { questions: [...] }
 router.get('/:id/questionnaire', validate(idParam, 'params'), async (req, res, next) => {
   try {
-    modernOk(res, await estimateService.getQuestionnaire(Number(req.params.id), req.tech.efr_id));
-  } catch (e) { fail(res, next, e); }
+    logger.info('Fetch questionnaire · jobId=' + req.params.id);
+    const out = await estimateService.getQuestionnaire(Number(req.params.id), req.tech.efr_id);
+    logger.info('Returning ' + (out.questions ? out.questions.length : 0) + ' questions');
+    modernOk(res, out);
+  } catch (e) { logger.warn('Fetch questionnaire failed · jobId=' + req.params.id + ' · ' + e.message); fail(res, next, e); }
 });
 
 // POST /:id/questionnaire { answers: [{ questionId, answer, comments? }] }
@@ -161,18 +179,24 @@ router.post('/:id/questionnaire', validate(idParam, 'params'), validate(Joi.obje
   })).default([]),
 })), async (req, res, next) => {
   try {
-    modernOk(res, await estimateService.submitQuestionnaire(
+    logger.info('Submit questionnaire · jobId=' + req.params.id + ' · answers=' + ((req.body.answers && req.body.answers.length) || 0));
+    const out = await estimateService.submitQuestionnaire(
       Number(req.params.id), req.tech.efr_id, req.body.answers,
-    ));
-  } catch (e) { fail(res, next, e); }
+    );
+    logger.info('Questionnaire submitted · jobId=' + req.params.id + ' · saved=' + (out.count || 0));
+    modernOk(res, out);
+  } catch (e) { logger.warn('Submit questionnaire failed · jobId=' + req.params.id + ' · ' + e.message); fail(res, next, e); }
 });
 
 // ─── Work progress (lifecycle timeline) ────────────────────────────────
 // GET /:id/work-progress → { stages: [{ key, label, done, at }] }
 router.get('/:id/work-progress', validate(idParam, 'params'), async (req, res, next) => {
   try {
-    modernOk(res, await estimateService.getWorkProgress(Number(req.params.id), req.tech.efr_id));
-  } catch (e) { fail(res, next, e); }
+    logger.info('Fetch work-progress timeline · jobId=' + req.params.id);
+    const out = await estimateService.getWorkProgress(Number(req.params.id), req.tech.efr_id);
+    logger.info('Returning ' + (out.stages ? out.stages.length : 0) + ' lifecycle stages');
+    modernOk(res, out);
+  } catch (e) { logger.warn('Fetch work-progress failed · jobId=' + req.params.id + ' · ' + e.message); fail(res, next, e); }
 });
 
 module.exports = router;

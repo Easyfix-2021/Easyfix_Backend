@@ -157,6 +157,7 @@ async function queryOn(conn, sql, params) {
  * operational blockers (with counts) + own-data row counts. Read-only.
  */
 async function getImpact(entityType, id) {
+  logger.info('Compute delete impact · entityType=' + entityType + ' · id=' + id);
   const g = graphFor(entityType);
   const [[parent]] = await pool.query(
     `SELECT * FROM \`${g.parentTable}\` WHERE \`${g.pk}\` = ? LIMIT 1`,
@@ -193,6 +194,7 @@ async function getImpact(entityType, id) {
     }
   }
 
+  logger.info('Delete impact computed · entityType=' + entityType + ' · id=' + id + ' · eligible=' + (blockedBy.length === 0) + ' · blockers=' + blockedBy.length);
   return {
     entityType,
     id: Number(id),
@@ -210,6 +212,7 @@ async function getImpact(entityType, id) {
  * and writes the archive row. Returns { archiveId, label }.
  */
 async function tombstoneDelete(entityType, id, reason, admin) {
+  logger.info('Tombstone-delete · entityType=' + entityType + ' · id=' + id);
   const g = graphFor(entityType);
   const conn = await pool.getConnection();
   try {
@@ -243,6 +246,7 @@ async function tombstoneDelete(entityType, id, reason, admin) {
       }
     }
     if (blockedBy.length) {
+      logger.warn('Tombstone-delete blocked · entityType=' + entityType + ' · id=' + id + ' · blockers=' + blockedBy.length);
       const e = new Error('Entity has operational history and cannot be deleted — deactivate it instead.');
       e.status = 409;
       e.details = blockedBy;
@@ -299,11 +303,13 @@ async function tombstoneDelete(entityType, id, reason, admin) {
     );
 
     await conn.commit();
+    logger.info(entityType + ' tombstoned · id=' + id + ' · archiveId=' + ins.insertId);
     logger.event('🗑️', 'yellow',
       `admin-delete: tombstoned ${entityType} ${id} (archive #${ins.insertId}) by ${admin.user_name || admin.user_id}`);
     return { archiveId: ins.insertId, label, entityType, id: Number(id) };
   } catch (err) {
     await conn.rollback();
+    logger.warn('Tombstone-delete failed · entityType=' + entityType + ' · id=' + id + ' · ' + err.message);
     throw err;
   } finally {
     conn.release();
@@ -314,6 +320,7 @@ async function tombstoneDelete(entityType, id, reason, admin) {
  * List archived (deleted, not-yet-restored) entities. Paginated, newest first.
  */
 async function listDeleted({ type, limit = 50, offset = 0 } = {}) {
+  logger.info('List deleted archive · type=' + (type || 'all') + ' · limit=' + limit + ' · offset=' + offset);
   const where = ["status = 'deleted'"];
   const params = [];
   if (type) { where.push('entity_type = ?'); params.push(type); }
@@ -330,6 +337,7 @@ async function listDeleted({ type, limit = 50, offset = 0 } = {}) {
       LIMIT ? OFFSET ?`,
     [...params, Math.min(Math.max(Number(limit) || 50, 1), 200), Math.max(Number(offset) || 0, 0)],
   );
+  logger.info('Found ' + items.length + ' deleted records (total=' + total + ')');
   return { items, total };
 }
 
@@ -347,6 +355,7 @@ function buildInsert(table, row) {
  * purged child row. Idempotent per child table (delete-then-insert).
  */
 async function restore(archiveId, admin) {
+  logger.info('Restore archived entity · archiveId=' + archiveId);
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
@@ -402,11 +411,13 @@ async function restore(archiveId, admin) {
     );
 
     await conn.commit();
+    logger.info(arch.entity_type + ' restored · id=' + arch.entity_id + ' · archiveId=' + archiveId);
     logger.event('♻️', 'green',
       `admin-restore: restored ${arch.entity_type} ${arch.entity_id} (archive #${archiveId}) by ${admin.user_name || admin.user_id}`);
     return { entityType: arch.entity_type, id: arch.entity_id, label: arch.entity_label };
   } catch (err) {
     await conn.rollback();
+    logger.warn('Restore failed · archiveId=' + archiveId + ' · ' + err.message);
     throw err;
   } finally {
     conn.release();

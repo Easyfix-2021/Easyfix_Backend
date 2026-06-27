@@ -4,6 +4,7 @@ const Joi = require('joi');
 const validate = require('../../middleware/validate');
 const { modernOk, modernError } = require('../../utils/response');
 const registration = require('../../services/mobile-registration.service');
+const logger = require('../../logger');
 
 /*
  * /api/mobile/registration/* — Technician onboarding gate machine.
@@ -26,6 +27,7 @@ const registration = require('../../services/mobile-registration.service');
 // GET /registration/status — derived onboarding status + flags.
 router.get('/status', async (req, res, next) => {
   try {
+    logger.info('Onboarding status requested');
     modernOk(res, await registration.getStatus(req.tech.efr_id));
   } catch (e) {
     if (e.status) return modernError(res, e.status, e.message);
@@ -36,6 +38,7 @@ router.get('/status', async (req, res, next) => {
 // GET /registration/remaining — labels of the still-missing profile fields.
 router.get('/remaining', async (req, res, next) => {
   try {
+    logger.info('Remaining profile fields requested');
     modernOk(res, await registration.getRemaining(req.tech.efr_id));
   } catch (e) {
     if (e.status) return modernError(res, e.status, e.message);
@@ -56,7 +59,9 @@ router.post(
   })),
   async (req, res, next) => {
     try {
+      logger.info(`Save personal details · pincode=${req.body.pincode}`);
       modernOk(res, await registration.savePersonalDetails(req.tech.efr_id, req.body));
+      logger.info('Personal details saved');
     } catch (e) {
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
@@ -72,6 +77,7 @@ router.patch(
   })),
   async (req, res, next) => {
     try {
+      logger.info(`Set language · ${req.body.language}`);
       modernOk(res, await registration.setLanguage(req.tech.efr_id, req.body.language));
     } catch (e) {
       if (e.status) return modernError(res, e.status, e.message);

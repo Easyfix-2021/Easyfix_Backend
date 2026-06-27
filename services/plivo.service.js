@@ -165,6 +165,7 @@ async function clickToCall({ from, to, jobCallerInfoId, alwaysApplyEnvOverride =
   if (!callerReal) return { delivered: false, error: `invalid caller phone "${from}"` };
   if (!receiverReal) return { delivered: false, error: `invalid receiver phone "${to}"` };
 
+  logger.info('Plivo click-to-call · jci=' + jobCallerInfoId + ' · agent=' + maskForDisplay(callerReal) + ' · customer=' + maskForDisplay(receiverReal));
   if (!callingEnabled()) {
     logger.test(`Plivo call suppressed (plivo.calling.enabled!='true') · from=${callerReal} · to=${receiverReal}`);
     return { delivered: false, suppressed: true, disabled: true };
@@ -235,6 +236,7 @@ async function clickToCall({ from, to, jobCallerInfoId, alwaysApplyEnvOverride =
 // Terminate a live call. Plivo hangup is by CallUUID (captured from the first
 // ring/answer/hangup callback and stored on the audit row).
 async function hangupCall({ callUuid }) {
+  logger.info('Plivo hangup requested · uuid=' + callUuid);
   if (!callUuid) return { ok: false, error: 'callUuid required' };
   const auth = authHeader();
   if (!auth || !process.env.PLIVO_AUTH_ID) return { ok: false, error: 'PLIVO_AUTH_ID / PLIVO_AUTH_TOKEN not configured' };
@@ -243,6 +245,7 @@ async function hangupCall({ callUuid }) {
     const res = await fetch(url, { method: 'DELETE', headers: { Authorization: auth } });
     const ok = res.status === 204 || res.ok;
     if (!ok) logger.warn(`Plivo hangup FAIL · uuid=${callUuid} · http=${res.status}`);
+    else logger.info('Plivo call terminated · uuid=' + callUuid + ' · http=' + res.status);
     return { ok, httpStatus: res.status };
   } catch (err) {
     logger.error(`Plivo hangup network error · uuid=${callUuid} · ${err.message}`);
@@ -277,7 +280,11 @@ function webAccessToken({ operatorId } = {}) {
   const authId = (process.env.PLIVO_AUTH_ID || '').trim();
   const authToken = process.env.PLIVO_AUTH_TOKEN || '';
   const endpoint = (process.env.PLIVO_ENDPOINT_USERNAME || '').trim();
-  if (!authId || !authToken || !endpoint) return null;
+  if (!authId || !authToken || !endpoint) {
+    logger.warn('Plivo web access token unavailable · Plivo endpoint credentials not configured');
+    return null;
+  }
+  logger.info('Issuing Plivo web access token · operatorId=' + (operatorId || 'op'));
   const now = Math.floor(Date.now() / 1000);
   const payload = {
     iss: authId,

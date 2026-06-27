@@ -41,6 +41,7 @@ const { verifyJobToken, requireUnconfirmedJob } = require('../../utils/jwt');
 const { pool } = require('../../db');
 const { rateLimit } = require('../../middleware/rate-limit');
 const mapsService = require('../../services/maps.service');
+const logger = require('../../logger');
 
 /*
  * Per-token rate limit applied to ALL maps routes below. Key derives
@@ -93,10 +94,12 @@ router.get('/autocomplete', tokenRateLimit, validate(Joi.object({
   q:     Joi.string().min(3).max(200).required(),
 }), 'query'), async (req, res, next) => {
   if (!await verifyTokenAndState(req, res)) return;
+  logger.info('Public maps autocomplete · q=' + String(req.query.q).trim());
   try {
     const out = await mapsService.autocomplete(String(req.query.q).trim());
     modernOk(res, out);
   } catch (e) {
+    logger.warn('Public maps autocomplete failed · ' + e.message);
     if (e && e.status) return modernError(res, e.status, e.message);
     next(e);
   }
@@ -112,6 +115,7 @@ router.get('/geocode', tokenRateLimit, validate(Joi.object({
   latlng:   Joi.string().pattern(/^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/).optional(),
 }).or('place_id', 'address', 'latlng'), 'query'), async (req, res, next) => {
   if (!await verifyTokenAndState(req, res)) return;
+  logger.info('Public maps geocode · by=' + (req.query.place_id ? 'place_id' : req.query.address ? 'address' : 'latlng'));
   try {
     const out = await mapsService.geocode({
       place_id: req.query.place_id ? String(req.query.place_id) : null,
@@ -120,6 +124,7 @@ router.get('/geocode', tokenRateLimit, validate(Joi.object({
     });
     modernOk(res, out);
   } catch (e) {
+    logger.warn('Public maps geocode failed · ' + e.message);
     if (e && e.status) return modernError(res, e.status, e.message);
     next(e);
   }
@@ -135,6 +140,7 @@ router.get('/config', tokenRateLimit, validate(Joi.object({
   token: Joi.string().required(),
 }), 'query'), async (req, res) => {
   if (!await verifyTokenAndState(req, res)) return;
+  logger.info('Public maps config requested');
   modernOk(res, { apiKey: mapsService.getConfigKey() });
 });
 

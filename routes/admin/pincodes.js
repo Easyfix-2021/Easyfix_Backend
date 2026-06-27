@@ -2,6 +2,7 @@ const router  = require('express').Router();
 const Joi     = require('joi');
 const multer  = require('multer');
 
+const logger      = require('../../logger');
 const validate    = require('../../middleware/validate');
 const pin         = require('../../services/pincode.service');
 const pinUpload   = require('../../services/pincode-upload.service');
@@ -104,7 +105,9 @@ const userIdOf = (req) => (req.user && req.user.user_id) || null;
 // ─── READ ────────────────────────────────────────────────────────────
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
   try {
+    logger.info('List pincodes · q=' + (req.query.q || '') + ' status=' + (req.query.status || 'all') + ' cityId=' + (req.query.cityId || '') + ' limit=' + req.query.limit + ' offset=' + req.query.offset);
     const data = await pin.listPincodes(req.query);
+    logger.info('Returning ' + (Array.isArray(data?.items) ? data.items.length : (Array.isArray(data) ? data.length : 0)) + ' pincodes');
     return modernOk(res, data);
   } catch (err) { return next(err); }
 });
@@ -116,6 +119,7 @@ router.post('/lookup-many',
   validate(lookupManyBody, 'body'),
   async (req, res, next) => {
     try {
+      logger.info('Bulk lookup pincodes · count=' + (req.body.pincodes?.length ?? 0));
       const result = await pin.lookupManyByCode(req.body.pincodes);
       return modernOk(res, result);
     } catch (err) { return next(err); }
@@ -127,10 +131,14 @@ router.post('/lookup-many',
 // "geocode".
 router.get('/geocode', validate(geocodeQuery, 'query'), async (req, res, next) => {
   try {
+    logger.info('Geocode pincode · pincode=' + req.query.pincode);
     const data = await pin.geocodeAndMatch(req.query.pincode);
     return modernOk(res, data);
   } catch (err) {
-    if (err.status) return modernError(res, err.status, err.message);
+    if (err.status) {
+      logger.warn('Geocode pincode failed · pincode=' + req.query.pincode + ' · ' + err.message);
+      return modernError(res, err.status, err.message);
+    }
     return next(err);
   }
 });
@@ -144,10 +152,15 @@ router.get('/geocode', validate(geocodeQuery, 'query'), async (req, res, next) =
 // Declared BEFORE /:pincodeId so the dynamic matcher doesn't swallow "ensure".
 router.post('/ensure', validate(ensureBody, 'body'), async (req, res, next) => {
   try {
+    logger.info('Ensure pincode · pincode=' + req.body.pincode);
     const data = await pin.ensurePincode(req.body.pincode, { userId: userIdOf(req) });
+    logger.info('Pincode ' + (data.created ? 'created' : 'already present') + ' · pincode=' + req.body.pincode + ' id=' + (data.id ?? data.pincode_id));
     return modernOk(res, data, data.created ? 'Pincode added' : 'Pincode already present');
   } catch (err) {
-    if (err.status) return modernError(res, err.status, err.message);
+    if (err.status) {
+      logger.warn('Ensure pincode rejected · pincode=' + req.body.pincode + ' · ' + err.message);
+      return modernError(res, err.status, err.message);
+    }
     return next(err);
   }
 });
@@ -159,7 +172,9 @@ router.post('/ensure', validate(ensureBody, 'body'), async (req, res, next) => {
 // "refresh-status".
 router.post('/refresh-status', async (req, res, next) => {
   try {
+    logger.info('Refresh pincode serviceable status (bulk recompute)');
     const data = await pin.recomputeServiceableStatus({ userId: userIdOf(req) });
+    logger.info('Pincode status refreshed · serviceable=' + data.serviceableCount + ' of ' + data.total);
     return modernOk(res, data, 'Pincode status refreshed');
   } catch (err) { return next(err); }
 });
@@ -168,15 +183,21 @@ router.post('/refresh-status', async (req, res, next) => {
 // first then nearest (computed from each zone's already-mapped pincodes).
 router.get('/suggest-zones', validate(suggestZonesQuery, 'query'), async (req, res, next) => {
   try {
+    logger.info('Suggest zones for location · cityId=' + (req.query.cityId || '') + ' limit=' + req.query.limit);
     const suggestions = await pin.suggestZonesForLocation(req.query);
+    logger.info('Found ' + (Array.isArray(suggestions) ? suggestions.length : 0) + ' zone suggestions');
     return modernOk(res, { suggestions });
   } catch (err) { return next(err); }
 });
 
 router.get('/:pincodeId', validate(idParam, 'params'), async (req, res, next) => {
   try {
+    logger.info('Get pincode detail · id=' + req.params.pincodeId);
     const row = await pin.getPincodeById(Number(req.params.pincodeId));
-    if (!row) return modernError(res, 404, 'Pincode not found');
+    if (!row) {
+      logger.warn('Pincode not found · id=' + req.params.pincodeId);
+      return modernError(res, 404, 'Pincode not found');
+    }
     return modernOk(res, row);
   } catch (err) { return next(err); }
 });
@@ -189,8 +210,12 @@ router.get('/:pincodeId/technicians',
   validate(techniciansQuery, 'query'),
   async (req, res, next) => {
     try {
+      logger.info('List technicians for pincode · id=' + req.params.pincodeId + ' q=' + (req.query.q || '') + ' limit=' + req.query.limit + ' offset=' + req.query.offset);
       const row = await pin.getPincodeById(Number(req.params.pincodeId));
-      if (!row) return modernError(res, 404, 'Pincode not found');
+      if (!row) {
+        logger.warn('Pincode not found for technicians lookup · id=' + req.params.pincodeId);
+        return modernError(res, 404, 'Pincode not found');
+      }
       const result = await pin.listTechniciansForPincode(
         Number(req.params.pincodeId),
         {
@@ -199,6 +224,7 @@ router.get('/:pincodeId/technicians',
           offset: req.query.offset,
         }
       );
+      logger.info('Returning ' + (Array.isArray(result?.items) ? result.items.length : (Array.isArray(result) ? result.length : 0)) + ' technicians');
       return modernOk(res, result);
     } catch (err) { return next(err); }
   }
@@ -207,10 +233,15 @@ router.get('/:pincodeId/technicians',
 // ─── CREATE / UPDATE / DELETE ────────────────────────────────────────
 router.post('/', validate(createBody), async (req, res, next) => {
   try {
+    logger.info('Create pincode · pincode=' + req.body.pincode + ' cityId=' + (req.body.city_id || (req.body.newCity ? 'new' : '')) + ' zones=' + ((req.body.zoneIds || []).length));
     const created = await pin.createPincode(req.body, { userId: userIdOf(req) });
+    logger.info('Pincode created · pincode=' + req.body.pincode + ' id=' + (created?.id ?? created?.pincode_id));
     return modernOk(res, created, 'Pincode added');
   } catch (err) {
-    if (err.status) return modernError(res, err.status, err.message);
+    if (err.status) {
+      logger.warn('Create pincode rejected · pincode=' + req.body.pincode + ' · ' + err.message);
+      return modernError(res, err.status, err.message);
+    }
     return next(err);
   }
 });
@@ -220,11 +251,19 @@ router.patch('/:pincodeId',
   validate(updateBody),
   async (req, res, next) => {
     try {
+      logger.info('Update pincode · id=' + req.params.pincodeId + ' fields=' + Object.keys(req.body || {}).join(','));
       const updated = await pin.updatePincode(Number(req.params.pincodeId), req.body, { userId: userIdOf(req) });
-      if (!updated) return modernError(res, 404, 'Pincode not found');
+      if (!updated) {
+        logger.warn('Pincode not found for update · id=' + req.params.pincodeId);
+        return modernError(res, 404, 'Pincode not found');
+      }
+      logger.info('Pincode updated · id=' + req.params.pincodeId);
       return modernOk(res, updated, 'Pincode updated');
     } catch (err) {
-      if (err.status) return modernError(res, err.status, err.message);
+      if (err.status) {
+        logger.warn('Update pincode rejected · id=' + req.params.pincodeId + ' · ' + err.message);
+        return modernError(res, err.status, err.message);
+      }
       return next(err);
     }
   }
@@ -238,14 +277,19 @@ router.put('/:pincodeId/zones',
   validate(setZonesBody),
   async (req, res, next) => {
     try {
+      logger.info('Set zones for pincode · id=' + req.params.pincodeId + ' zones=' + ((req.body.zoneIds || []).length));
       const result = await pin.setZonesForPincode(
         Number(req.params.pincodeId),
         req.body.zoneIds,
         { userId: userIdOf(req) }
       );
+      logger.info('Pincode zones updated · id=' + req.params.pincodeId);
       return modernOk(res, result, 'Zones updated');
     } catch (err) {
-      if (err.status) return modernError(res, err.status, err.message);
+      if (err.status) {
+        logger.warn('Set zones rejected · id=' + req.params.pincodeId + ' · ' + err.message);
+        return modernError(res, err.status, err.message);
+      }
       return next(err);
     }
   }
@@ -253,8 +297,13 @@ router.put('/:pincodeId/zones',
 
 router.delete('/:pincodeId', validate(idParam, 'params'), async (req, res, next) => {
   try {
+    logger.info('Delete pincode · id=' + req.params.pincodeId);
     const ok = await pin.deletePincode(Number(req.params.pincodeId), { userId: userIdOf(req) });
-    if (!ok) return modernError(res, 404, 'Pincode not found');
+    if (!ok) {
+      logger.warn('Pincode not found for delete · id=' + req.params.pincodeId);
+      return modernError(res, 404, 'Pincode not found');
+    }
+    logger.info('Pincode deleted · id=' + req.params.pincodeId);
     return modernOk(res, { deleted: true });
   } catch (err) { return next(err); }
 });
@@ -262,6 +311,7 @@ router.delete('/:pincodeId', validate(idParam, 'params'), async (req, res, next)
 // ─── Bulk upload (Excel) ─────────────────────────────────────────────
 router.get('/template/download', async (_req, res, next) => {
   try {
+    logger.info('Download pincode upload template');
     const buffer = await pinUpload.generateTemplate();
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', 'attachment; filename="manage-pincodes-template.xlsx"');
@@ -274,11 +324,16 @@ router.post('/upload',
   upload.single('file'),
   async (req, res, next) => {
     try {
-      if (!req.file?.buffer) return modernError(res, 400, 'No file uploaded (field name "file" required)');
+      logger.info('Bulk pincode upload · dryRun=' + (!!req.query.dryRun) + ' size=' + (req.file?.size ?? 0));
+      if (!req.file?.buffer) {
+        logger.warn('Bulk pincode upload rejected · no file');
+        return modernError(res, 400, 'No file uploaded (field name "file" required)');
+      }
       const report = await pinUpload.processUpload(req.file.buffer, {
         dryRun: !!req.query.dryRun,
         userId: userIdOf(req),
       });
+      logger.info('Bulk pincode upload ' + (report.summary.dryRun ? 'dry-run' : 'complete') + ' · ' + JSON.stringify(report.summary));
       return modernOk(res, report, report.summary.dryRun ? 'Dry-run complete' : 'Upload complete');
     } catch (err) { return next(err); }
   }

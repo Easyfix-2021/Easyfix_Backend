@@ -136,7 +136,10 @@ const mappedEasyfixersQuery = Joi.object({
 });
 
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
-  try { modernOk(res, await ds.list(req.query)); } catch (e) { next(e); }
+  try {
+    logger.info('List deep skills · categoryId=' + (req.query.categoryId ?? 'any') + ' serviceTypeId=' + (req.query.serviceTypeId ?? 'any') + ' includeInactive=' + req.query.includeInactive);
+    modernOk(res, await ds.list(req.query));
+  } catch (e) { next(e); }
 });
 
 /*
@@ -177,6 +180,7 @@ router.get('/upload-template', async (req, res, next) => {
  */
 router.get('/download', async (_req, res, next) => {
   try {
+    logger.info('Download deep-skills catalogue XLSX');
     const buffer = await ds.downloadXlsx();
     const fname = `deep-skills-${new Date().toISOString().slice(0, 10)}.xlsx`;
     res.setHeader(
@@ -191,8 +195,12 @@ router.get('/download', async (_req, res, next) => {
 
 router.get('/:id', validate(idParam, 'params'), async (req, res, next) => {
   try {
+    logger.info('Get deep skill · id=' + req.params.id);
     const data = await ds.getById(req.params.id);
-    if (!data) return modernError(res, 404, 'deep skill not found');
+    if (!data) {
+      logger.warn('Deep skill not found · id=' + req.params.id);
+      return modernError(res, 404, 'deep skill not found');
+    }
     modernOk(res, data);
   } catch (e) { next(e); }
 });
@@ -208,9 +216,14 @@ router.get('/:id/mapped-easyfixers',
   validate(mappedEasyfixersQuery, 'query'),
   async (req, res, next) => {
     try {
+      logger.info('List mapped easyfixers for deep skill · id=' + req.params.id + ' limit=' + req.query.limit + ' offset=' + req.query.offset);
       const existing = await ds.getById(req.params.id);
-      if (!existing) return modernError(res, 404, 'deep skill not found');
+      if (!existing) {
+        logger.warn('Deep skill not found · id=' + req.params.id);
+        return modernError(res, 404, 'deep skill not found');
+      }
       const { rows, total } = await ds.listMappedEasyfixers(req.params.id, req.query);
+      logger.info('Returning ' + rows.length + ' mapped easyfixers · total=' + total);
       modernOk(res, { items: rows, total, limit: req.query.limit, offset: req.query.offset });
     } catch (e) { next(e); }
   });
@@ -236,15 +249,19 @@ router.post('/mapped-easyfixer-counts',
   validate(mappedEasyfixerCountsBody, 'body'),
   async (req, res, next) => {
     try {
+      logger.info('Bulk mapped-easyfixer counts · ids=' + req.body.deepSkillIds.length);
       const { rows } = await ds.mappedEasyfixerCounts(req.body.deepSkillIds);
+      logger.info('Returning counts for ' + rows.length + ' deep skills');
       modernOk(res, { items: rows });
     } catch (e) { next(e); }
   });
 
 router.post('/', validate(createBody), async (req, res, next) => {
   try {
+    logger.info('Create deep skill · name=' + req.body.deepskill_name + ' categoryId=' + req.body.category_id + ' serviceTypeId=' + req.body.service_type_id + ' options=' + (req.body.options ? req.body.options.length : 0));
     const created = await ds.create(req.body, req.user);
     invalidateCatalogCaches();
+    logger.info('Deep skill created · id=' + (created && created.deepskill_id));
     res.status(201);
     modernOk(res, created, 'deep skill created');
   } catch (e) { next(e); }
@@ -275,14 +292,17 @@ router.post(
   validate(generatePreviewBody),
   async (req, res, next) => {
     try {
+      logger.info('Generate deep-skill image preview · name=' + req.body.deepskill_name);
       const dsImageGen = require('../../services/deep-skill-image-gen.service');
       const result = await dsImageGen.generatePreview({
         name: req.body.deepskill_name,
         options: req.body.options,
       });
+      logger.info('Deep-skill image preview generated');
       return modernOk(res, result, 'image generated');
     } catch (e) {
       if (e?.status && e.status >= 400 && e.status < 500) {
+        logger.warn('Deep-skill image preview rejected · ' + e.message);
         return modernError(res, e.status, e.message);
       }
       logger.warn({ err: e && e.message }, 'deep-skill generate-image (preview) failed');
@@ -293,8 +313,10 @@ router.post(
 
 router.patch('/:id', validate(idParam, 'params'), validate(updateBody), async (req, res, next) => {
   try {
+    logger.info('Update deep skill · id=' + req.params.id + ' fields=' + Object.keys(req.body).join(','));
     const updated = await ds.update(req.params.id, req.body);
     invalidateCatalogCaches();
+    logger.info('Deep skill updated · id=' + req.params.id);
     modernOk(res, updated, 'deep skill updated');
   } catch (e) { next(e); }
 });
@@ -303,8 +325,10 @@ router.patch('/:id', validate(idParam, 'params'), validate(updateBody), async (r
 // holds FKs back to deepskill_id for every technician who ever had this skill.
 router.delete('/:id', validate(idParam, 'params'), async (req, res, next) => {
   try {
+    logger.info('Deactivate deep skill · id=' + req.params.id);
     const result = await ds.setStatus(req.params.id, false);
     invalidateCatalogCaches();
+    logger.info('Deep skill deactivated · id=' + req.params.id);
     modernOk(res, result, 'deep skill deactivated');
   } catch (e) { next(e); }
 });
@@ -312,24 +336,30 @@ router.delete('/:id', validate(idParam, 'params'), async (req, res, next) => {
 // ─── Options (nested under a deep skill) ────────────────────────────
 router.post('/:id/options', validate(idParam, 'params'), validate(optionBody), async (req, res, next) => {
   try {
+    logger.info('Add deep-skill option · skillId=' + req.params.id);
     const added = await ds.addOption(req.params.id, req.body);
     invalidateCatalogCaches();
+    logger.info('Deep-skill option added · skillId=' + req.params.id + ' optionId=' + (added && added.id));
     modernOk(res, added, 'option added');
   } catch (e) { next(e); }
 });
 
 router.patch('/:id/options/:optionId', validate(optIdParam, 'params'), validate(optionPatchBody), async (req, res, next) => {
   try {
+    logger.info('Update deep-skill option · skillId=' + req.params.id + ' optionId=' + req.params.optionId + ' fields=' + Object.keys(req.body).join(','));
     const updated = await ds.updateOption(req.params.id, req.params.optionId, req.body);
     invalidateCatalogCaches();
+    logger.info('Deep-skill option updated · skillId=' + req.params.id + ' optionId=' + req.params.optionId);
     modernOk(res, updated, 'option updated');
   } catch (e) { next(e); }
 });
 
 router.delete('/:id/options/:optionId', validate(optIdParam, 'params'), async (req, res, next) => {
   try {
+    logger.info('Delete deep-skill option · skillId=' + req.params.id + ' optionId=' + req.params.optionId);
     const removed = await ds.deleteOption(req.params.id, req.params.optionId);
     invalidateCatalogCaches();
+    logger.info('Deep-skill option removed · skillId=' + req.params.id + ' optionId=' + req.params.optionId);
     modernOk(res, removed, 'option removed');
   } catch (e) { next(e); }
 });
@@ -375,7 +405,10 @@ router.delete('/:id/options/:optionId', validate(optIdParam, 'params'), async (r
 async function handleImageUpload(req, res, next) {
   const skillId = Number(req.params.id);
   try {
-    if (!req.file) return modernError(res, 400, 'missing "file" upload');
+    if (!req.file) {
+      logger.warn('Deep-skill image upload rejected · missing file · skillId=' + skillId);
+      return modernError(res, 400, 'missing "file" upload');
+    }
     logger.upload({
       skillId,
       originalName: req.file.originalname,
@@ -388,9 +421,11 @@ async function handleImageUpload(req, res, next) {
       contentType: req.file.mimetype,
       originalName: req.file.originalname,
     });
+    logger.info('Deep-skill image uploaded · skillId=' + skillId);
     modernOk(res, result, 'deep skill image uploaded');
   } catch (e) {
     if (e?.status && e.status >= 400 && e.status < 500) {
+      logger.warn('Deep-skill image upload failed · skillId=' + skillId + ' · ' + e.message);
       return modernError(res, e.status, e.message);
     }
     next(e);
@@ -422,10 +457,12 @@ router.get(
   validate(idParam, 'params'),
   async (req, res, next) => {
     try {
+      logger.info('Resolve deep-skill image URL · id=' + req.params.id);
       const data = await ds.getImageUrl(req.params.id);
       modernOk(res, data);
     } catch (e) {
       if (e?.status && e.status >= 400 && e.status < 500) {
+        logger.warn('Resolve deep-skill image URL failed · id=' + req.params.id + ' · ' + e.message);
         return modernError(res, e.status, e.message);
       }
       next(e);
@@ -442,10 +479,13 @@ router.delete(
   validate(idParam, 'params'),
   async (req, res, next) => {
     try {
+      logger.info('Clear deep-skill image · id=' + req.params.id);
       const data = await ds.clearImage(req.params.id);
+      logger.info('Deep-skill image cleared · id=' + req.params.id);
       modernOk(res, data, 'deep skill image cleared');
     } catch (e) {
       if (e?.status && e.status >= 400 && e.status < 500) {
+        logger.warn('Clear deep-skill image failed · id=' + req.params.id + ' · ' + e.message);
         return modernError(res, e.status, e.message);
       }
       next(e);
@@ -476,14 +516,19 @@ router.post(
   async (req, res, next) => {
     const skillId = Number(req.params.id);
     try {
+      logger.info('Regenerate deep-skill image (queue) · id=' + skillId);
       const [[row]] = await require('../../db').pool.query(
         `SELECT image_gen_status, status
            FROM tbl_deep_skill
           WHERE deepskill_id = ? LIMIT 1`,
         [skillId],
       );
-      if (!row) return modernError(res, 404, 'deep skill not found');
+      if (!row) {
+        logger.warn('Deep skill not found · id=' + skillId);
+        return modernError(res, 404, 'deep skill not found');
+      }
       if (row.image_gen_status === 'pending') {
+        logger.warn('Deep-skill image regeneration already in progress · id=' + skillId);
         return modernError(res, 409, 'Image generation already in progress');
       }
       await require('../../db').pool.query(
@@ -500,8 +545,10 @@ router.post(
           'UPDATE tbl_deep_skill SET image_gen_status = ? WHERE deepskill_id = ?',
           [row.image_gen_status, skillId],
         );
+        logger.warn('Deep-skill image regeneration dispatch rejected (in-flight) · id=' + skillId);
         return modernError(res, 409, 'Image generation already in progress');
       }
+      logger.info('Deep-skill image regeneration queued · id=' + skillId);
       return modernOk(res, { status: 'pending' }, 'image regeneration queued');
     } catch (e) { return next(e); }
   },
@@ -535,14 +582,17 @@ router.post(
   validate(generateForSkillBody),
   async (req, res, next) => {
     try {
+      logger.info('Generate deep-skill image (existing) · id=' + Number(req.params.id));
       const dsImageGen = require('../../services/deep-skill-image-gen.service');
       const result = await dsImageGen.generateForSkill(Number(req.params.id), {
         name: req.body.deepskill_name,
         options: req.body.options,
       });
+      logger.info('Deep-skill image generated · id=' + Number(req.params.id));
       return modernOk(res, result, 'image generated');
     } catch (e) {
       if (e?.status && e.status >= 400 && e.status < 500) {
+        logger.warn('Deep-skill image generate (existing) rejected · id=' + Number(req.params.id) + ' · ' + e.message);
         return modernError(res, e.status, e.message);
       }
       logger.warn({ err: e && e.message, skillId: Number(req.params.id) },
@@ -573,7 +623,10 @@ router.post(
   '/bulk-upload',
   bulkUpload.single('file'),
   async (req, res, next) => {
-    if (!req.file) return modernError(res, 400, 'missing "file" upload');
+    if (!req.file) {
+      logger.warn('Deep-skill bulk upload rejected · missing file');
+      return modernError(res, 400, 'missing "file" upload');
+    }
 
     const commit =
       String(req.query.commit || '').toLowerCase() === 'true' ||
@@ -595,10 +648,12 @@ router.post(
       // Only commit writes to the catalog — dry-runs leave the tree
       // untouched and don't need to drop the prefill cache.
       if (commit) invalidateCatalogCaches();
+      logger.info('Deep-skill bulk upload ' + (commit ? 'committed' : 'previewed') + ' · rows=' + (result.summary && result.summary.totalRows) + ' willCreate=' + (result.summary && result.summary.willCreate) + ' errors=' + (result.summary && result.summary.errors));
       return modernOk(res, result,
         commit ? 'deep skills bulk-uploaded' : 'deep skills preview generated');
     } catch (e) {
       if (e.status && e.status >= 400 && e.status < 500) {
+        logger.warn('Deep-skill bulk upload rejected · ' + e.message);
         return modernError(res, e.status, e.message);
       }
       return next(e);
@@ -642,6 +697,7 @@ router.post(
  */
 uploadTemplateHandler = async (_req, res, next) => {
   try {
+    logger.info('Download deep-skills bulk-upload template XLSX');
     const ExcelJS = require('exceljs');
     const wb = new ExcelJS.Workbook();
     wb.creator = 'EasyFix CRM';

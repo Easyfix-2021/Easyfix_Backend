@@ -32,6 +32,7 @@
  */
 
 const { pool } = require('../db');
+const logger = require('../logger');
 
 /**
  * Probe whether tbl_client_service has a service_type_ids column.
@@ -149,6 +150,7 @@ function idsToCsv(ids) {
  * relies on only-active rows.
  */
 async function listForClient(clientId, { includeInactive = false } = {}) {
+  logger.info('List client services · clientId=' + clientId + ' includeInactive=' + includeInactive);
   // Query 1: main list with category name joined.
   // LEGACY COLUMNS (verified against ClientDaoImpl.java#670):
   //   cs.service_catg_id   (NOT `service_category_id`)
@@ -197,6 +199,7 @@ async function listForClient(clientId, { includeInactive = false } = {}) {
       ORDER BY cs.client_service_id DESC`,
     [clientId],
   );
+  logger.info('Found ' + rows.length + ' client service rows');
   if (rows.length === 0) return [];
 
   // Collect every unique service_type id across all rows — single Set.
@@ -233,6 +236,7 @@ async function listForClient(clientId, { includeInactive = false } = {}) {
   // if it needs a different qty), but doing it here keeps the contract
   // self-describing for the Swagger consumers.
   const { computeJobServiceCharges } = require('../utils/rate-card-calc');
+  logger.info('Returning ' + parsed.length + ' client services · clientId=' + clientId);
   return parsed.map(({ row, ids }) => ({
     client_service_id: row.client_service_id,
     client_id: row.client_id,
@@ -281,6 +285,7 @@ const COST_COLUMN_MAP = [
 ];
 
 async function create(clientId, body) {
+  logger.info('Create client service · clientId=' + clientId + ' categoryId=' + body.serviceCategoryId + ' chargeType=' + (body.chargeType ?? 'null'));
   const csv = idsToCsv(body.serviceTypeIds);
   const hasTypeIds = await clientServiceHasTypeIds(pool);
   const hasTypeIdSingular = await clientServiceHasTypeIdSingular(pool);
@@ -333,11 +338,13 @@ async function create(clientId, body) {
     `INSERT INTO tbl_client_service (${cols.join(', ')}) VALUES (${placeholders})`,
     vals,
   );
+  logger.info('Client service created · id=' + ins.insertId);
   return ins.insertId;
 }
 
 // Partial update. service_type_ids accepted as array → CSV.
 async function update(clientServiceId, body) {
+  logger.info('Update client service · id=' + clientServiceId);
   const sets = [];
   const vals = [];
   const hasTypeIds = await clientServiceHasTypeIds(pool);
@@ -393,6 +400,7 @@ async function update(clientServiceId, body) {
     vals.push(body.serviceStatus);
   }
   if (sets.length === 0) {
+    logger.warn('Update client service skipped · nothing to update · id=' + clientServiceId);
     throw Object.assign(new Error('nothing to update'), { status: 400 });
   }
   vals.push(clientServiceId);
@@ -400,6 +408,7 @@ async function update(clientServiceId, body) {
     `UPDATE tbl_client_service SET ${sets.join(', ')} WHERE client_service_id = ?`,
     vals,
   );
+  logger.info('Client service updated · id=' + clientServiceId + ' affected=' + r.affectedRows);
   return r.affectedRows;
 }
 
@@ -412,6 +421,7 @@ async function update(clientServiceId, body) {
  * Returns `null` if not found — callers map this to a 404.
  */
 async function getOne(clientServiceId) {
+  logger.info('Get client service · id=' + clientServiceId);
   const hasTypeIds = await clientServiceHasTypeIds(pool);
   const hasTypeIdSingular = await clientServiceHasTypeIdSingular(pool);
   const typeIdsProjection = hasTypeIds
@@ -486,10 +496,12 @@ async function getOne(clientServiceId) {
 // Soft-delete — flip status to 0. Job history that references this
 // row by id stays intact; the FE filters status=0 out.
 async function softDelete(clientServiceId) {
+  logger.info('Soft-delete client service · id=' + clientServiceId);
   const [r] = await pool.query(
     'UPDATE tbl_client_service SET service_status = 0 WHERE client_service_id = ?',
     [clientServiceId],
   );
+  logger.info('Client service deleted · id=' + clientServiceId + ' affected=' + r.affectedRows);
   return r.affectedRows;
 }
 

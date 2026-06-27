@@ -62,8 +62,10 @@ async function findUserById(userId) {
 }
 
 async function createLoginOtp(identifier) {
+  logger.info('Create login OTP requested');
   const user = await findActiveUserByIdentifier(identifier);
   if (!user) {
+    logger.warn('Create login OTP · no active internal user matched identifier');
     return { found: false };
   }
 
@@ -143,10 +145,12 @@ async function createLoginOtp(identifier) {
     contextLabel: 'staff',
   });
 
+  logger.info('Login OTP issued and dispatched · user_id=' + user.user_id);
   return { found: true, userId: user.user_id, email: user.official_email, expiresAt: expires };
 }
 
 async function verifyLoginOtp(identifier, otp) {
+  logger.info('Verify login OTP requested');
   const user = await findActiveUserByIdentifier(identifier);
   if (!user) return { ok: false, reason: 'USER_NOT_FOUND' };
 
@@ -175,6 +179,7 @@ async function verifyLoginOtp(identifier, otp) {
   await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
 
   const token = signUserToken(user);
+  logger.info('Login OTP verified · token issued · user_id=' + user.user_id);
   return { ok: true, token, user };
 }
 

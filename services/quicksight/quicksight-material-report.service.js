@@ -95,6 +95,7 @@ function buildImageLink(imageKey) {
  * repeated), jobs with zero elements excluded — matching the legacy Excel.
  */
 async function materialReport(clientId, from, to) {
+  logger.info('Building Material Report · clientId=' + clientId + ' from=' + from + ' to=' + to);
   // ── QUERY 1 — main job rows (VERBATIM legacy columns + typos preserved) ──
   const jobsSql = `
     SELECT
@@ -137,6 +138,7 @@ async function materialReport(clientId, from, to) {
     LIMIT ${JOBS_LIMIT}
   `;
   const [jobRows] = await pool.query(jobsSql, [clientId, from, to]);
+  logger.info('Found ' + jobRows.length + ' completed jobs');
 
   if (jobRows.length >= JOBS_LIMIT) {
     logger.warn(
@@ -168,6 +170,7 @@ async function materialReport(clientId, from, to) {
     LIMIT ${ELEMENTS_LIMIT}
   `;
   const [elementRows] = await pool.query(elementsSql, [...jobIds, ...jobIds]);
+  logger.info('Found ' + elementRows.length + ' element-deployed lines');
 
   if (elementRows.length >= ELEMENTS_LIMIT) {
     logger.warn(
@@ -281,6 +284,7 @@ async function materialReport(clientId, from, to) {
     }
   }
 
+  logger.info('Returning ' + out.length + ' material report rows');
   return out;
 }
 

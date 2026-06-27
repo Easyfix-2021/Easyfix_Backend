@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const logger = require('../logger');
 
 /*
  * Notice categories — coloured-chip tags on every notice. Admin-managed
@@ -15,6 +16,7 @@ function mkErr(status, message) {
 }
 
 async function listCategories({ includeInactive = false } = {}) {
+  logger.info('List notice categories · includeInactive=' + includeInactive);
   const where = includeInactive ? '1=1' : 'is_active = 1';
   const [rows] = await pool.query(
     `SELECT category_id, name, color, applies_to_surfaces, sort_order, is_active,
@@ -23,6 +25,7 @@ async function listCategories({ includeInactive = false } = {}) {
       WHERE ${where}
       ORDER BY sort_order ASC, name ASC`,
   );
+  logger.info('Found ' + rows.length + ' notice categories');
   return rows;
 }
 
@@ -38,6 +41,7 @@ async function getCategoryById(categoryId) {
 }
 
 async function createCategory({ name, color, applies_to_surfaces, sort_order }) {
+  logger.info('Create notice category · name=' + name + ' · color=' + color);
   // Name uniqueness is enforced by the UNIQUE INDEX, but we catch and
   // translate the error so callers see a friendly 409 instead of a raw
   // mysql ER_DUP_ENTRY.
@@ -48,9 +52,11 @@ async function createCategory({ name, color, applies_to_surfaces, sort_order }) 
        VALUES (?, ?, ?, ?, 1)`,
       [name, color, applies_to_surfaces, sort_order],
     );
+    logger.info('Notice category created · id=' + r.insertId);
     return getCategoryById(r.insertId);
   } catch (e) {
     if (e.code === 'ER_DUP_ENTRY') {
+      logger.warn('Create notice category rejected (duplicate name) · ' + e.message);
       throw mkErr(409, `Category "${name}" already exists`);
     }
     throw e;
@@ -58,6 +64,7 @@ async function createCategory({ name, color, applies_to_surfaces, sort_order }) 
 }
 
 async function updateCategory(categoryId, fields) {
+  logger.info('Update notice category · id=' + categoryId + ' · fields=' + Object.keys(fields || {}).join(','));
   const allowed = ['name', 'color', 'applies_to_surfaces', 'sort_order', 'is_active'];
   const sets = [];
   const params = [];
@@ -75,9 +82,13 @@ async function updateCategory(categoryId, fields) {
       params,
     );
   } catch (e) {
-    if (e.code === 'ER_DUP_ENTRY') throw mkErr(409, `Category name already in use`);
+    if (e.code === 'ER_DUP_ENTRY') {
+      logger.warn('Update notice category rejected (duplicate name) · id=' + categoryId + ' · ' + e.message);
+      throw mkErr(409, `Category name already in use`);
+    }
     throw e;
   }
+  logger.info('Notice category updated · id=' + categoryId);
   return getCategoryById(categoryId);
 }
 

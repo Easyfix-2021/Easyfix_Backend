@@ -14,6 +14,7 @@ const {
   checkDecathlonServiceability,
 } = require('../../../services/integration.service');
 const { writeBuffer } = require('../../../utils/file-storage');
+const logger = require('../../../logger');
 
 // All /v1/* routes require HTTP Basic Auth against tbl_client_website
 router.use(basicAuth);
@@ -23,8 +24,10 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 
 // ─── /v1/services — Get service catalog ─────────────────────────────
 router.get('/services', async (req, res, next) => {
   try {
+    logger.info('Integration: fetch service catalog');
     const cats = await lookupService.serviceCategories();
     const types = await lookupService.serviceTypes();
+    logger.info('Found ' + cats.length + ' categories, ' + types.length + ' service-types');
     const byCatg = new Map();
     for (const c of cats) {
       byCatg.set(c.service_catg_id, {
@@ -52,7 +55,9 @@ router.get('/services', async (req, res, next) => {
 // ─── /v1/cities — Active cities ─────────────────────────────────────
 router.get('/cities', async (req, res, next) => {
   try {
+    logger.info('Integration: fetch active cities');
     const cities = await lookupService.cities({ limit: 1000 });
+    logger.info('Found ' + cities.length + ' cities');
     legacyOk(res, cities.map((c) => ({
       city_id: c.city_id, city_name: c.city_name, state_id: c.state_id,
     })));
@@ -60,7 +65,10 @@ router.get('/cities', async (req, res, next) => {
 });
 
 router.get('/serviceType', async (req, res, next) => {
-  try { legacyOk(res, await lookupService.serviceTypes()); } catch (e) { next(e); }
+  try {
+    logger.info('Integration: fetch service-types');
+    legacyOk(res, await lookupService.serviceTypes());
+  } catch (e) { next(e); }
 });
 
 // ─── /v1/jobs — CREATE ───────────────────────────────────────────────
@@ -71,6 +79,7 @@ router.post(['/jobs', '/jobs/newJob'], async (req, res, next) => {
     const customer = b.customer || {};
     const addr = b.address || {};
     const serviceIds = b.service_type?.services?.map((s) => Number(s.service_id)) || [];
+    logger.info('Integration: create job · ref=' + (b.reference_id || '-') + ' type=' + (b.jobType || 'Installation') + ' services=' + serviceIds.length);
 
     // Convert requested_date from "DD-MM-YYYY HH:mm" to JS Date
     const reqDt = parseLegacyDate(b.requested_date);
@@ -105,9 +114,13 @@ router.post(['/jobs', '/jobs/newJob'], async (req, res, next) => {
       services: serviceIds.map((id) => ({ service_id: id, quantity: 1 })),
     }, { user_id: null });
 
+    logger.info('Integration: job created · id=' + created.job_id + ' ref=' + (created.client_ref_id || '-'));
     legacyOk(res, { jobId: created.job_id, reference_id: created.client_ref_id });
   } catch (e) {
-    if (e.status) return legacyError(res, e.status, e.message);
+    if (e.status) {
+      logger.warn('Integration: create job rejected · ' + e.message);
+      return legacyError(res, e.status, e.message);
+    }
     next(e);
   }
 });
@@ -116,10 +129,15 @@ router.post(['/jobs', '/jobs/newJob'], async (req, res, next) => {
 router.get('/jobs/jobStatus', async (req, res, next) => {
   try {
     const jobId = Number(req.query.jobId);
+    logger.info('Integration: fetch job status · jobId=' + (req.query.jobId || '-'));
     if (!jobId) return legacyError(res, 400, 'jobId required');
     const job = await jobService.getById(jobId);
-    if (!job) return legacyError(res, 404, 'Not Found');
+    if (!job) {
+      logger.warn('Integration: job status not found · jobId=' + jobId);
+      return legacyError(res, 404, 'Not Found');
+    }
     if (job.fk_client_id !== req.integrationClient.id) {
+      logger.warn('Integration: job status forbidden · jobId=' + jobId);
       return legacyError(res, 403, 'Forbidden');
     }
     legacyOk(res, { jobId: job.job_id, currentStatus: statusLabel(job.job_status) });
@@ -129,11 +147,13 @@ router.get('/jobs/jobStatus', async (req, res, next) => {
 // ─── /v1/jobs/tracking — search ─────────────────────────────────────
 router.get('/jobs/tracking', async (req, res, next) => {
   try {
+    logger.info('Integration: track jobs · status=' + (req.query.status ?? 'all') + ' limit=' + (Math.min(Number(req.query.limit) || 50, 500)));
     const { rows } = await jobService.list({
       clientId: req.integrationClient.id,
       status: req.query.status != null ? Number(req.query.status) : undefined,
       limit: Math.min(Number(req.query.limit) || 50, 500),
     });
+    logger.info('Returning ' + rows.length + ' tracked jobs');
     legacyOk(res, rows.map((j) => ({
       jobId: j.job_id, status: statusLabel(j.job_status),
       jobType: j.job_type, requestedDateTime: formatLegacyDate(j.requested_date_time),
@@ -144,19 +164,23 @@ router.get('/jobs/tracking', async (req, res, next) => {
 // ─── /v1/jobs/history — date range ──────────────────────────────────
 router.get('/jobs/history', async (req, res, next) => {
   try {
+    logger.info('Integration: job history · from=' + (req.query.startDate || '-') + ' to=' + (req.query.endDate || '-'));
     const { rows } = await jobService.list({
       clientId: req.integrationClient.id,
       startDate: req.query.startDate, endDate: req.query.endDate,
       limit: 500,
     });
+    logger.info('Returning ' + rows.length + ' history jobs');
     legacyOk(res, rows);
   } catch (e) { next(e); }
 });
 
 router.get('/jobs/:id', async (req, res, next) => {
   try {
+    logger.info('Integration: fetch job · id=' + req.params.id);
     const job = await jobService.getById(Number(req.params.id));
     if (!job || job.fk_client_id !== req.integrationClient.id) {
+      logger.warn('Integration: job not found / not owned · id=' + req.params.id);
       return legacyError(res, 404, 'Not Found');
     }
     legacyOk(res, {
@@ -175,15 +199,23 @@ router.get('/jobs/:id', async (req, res, next) => {
 router.patch('/jobs', async (req, res, next) => {
   try {
     const { jobId, action } = req.body || {};
+    logger.info('Integration: update job · jobId=' + (jobId || '-') + ' action=' + (action || '-'));
     if (!jobId || !action) return legacyError(res, 400, 'jobId and action required');
     const job = await jobService.getById(jobId);
-    if (!job || job.fk_client_id !== req.integrationClient.id) return legacyError(res, 404, 'Not Found');
+    if (!job || job.fk_client_id !== req.integrationClient.id) {
+      logger.warn('Integration: update target not found / not owned · jobId=' + jobId);
+      return legacyError(res, 404, 'Not Found');
+    }
 
     const map = { schedule: 1, checkin: 2, checkout: 3, reject: 6, reschedule: 1 };
     const newStatus = map[action];
-    if (newStatus == null) return legacyError(res, 400, `unknown action "${action}"`);
+    if (newStatus == null) {
+      logger.warn('Integration: unknown action · "' + action + '"');
+      return legacyError(res, 400, `unknown action "${action}"`);
+    }
 
     const updated = await jobService.setStatus(jobId, { status: newStatus, comment: req.body.comment }, { user_id: null });
+    logger.info('Integration: job status updated · id=' + updated.job_id + ' status=' + updated.job_status);
     legacyOk(res, { jobId: updated.job_id, status: statusLabel(updated.job_status) });
   } catch (e) { next(e); }
 });
@@ -191,9 +223,14 @@ router.patch('/jobs', async (req, res, next) => {
 // ─── /v1/jobs/{id} — DELETE (cancel) ────────────────────────────────
 router.delete('/jobs/:id', async (req, res, next) => {
   try {
+    logger.info('Integration: cancel job · id=' + req.params.id);
     const job = await jobService.getById(Number(req.params.id));
-    if (!job || job.fk_client_id !== req.integrationClient.id) return legacyError(res, 404, 'Not Found');
+    if (!job || job.fk_client_id !== req.integrationClient.id) {
+      logger.warn('Integration: cancel target not found / not owned · id=' + req.params.id);
+      return legacyError(res, 404, 'Not Found');
+    }
     await jobService.setStatus(job.job_id, { status: 6, comment: 'cancelled via /v1 API' }, { user_id: null });
+    logger.info('Integration: job cancelled · id=' + job.job_id);
     legacyOk(res, { jobId: job.job_id, status: 'Cancelled' });
   } catch (e) { next(e); }
 });
@@ -201,11 +238,15 @@ router.delete('/jobs/:id', async (req, res, next) => {
 // ─── /v1/jobImage/addJobImages — multipart upload ───────────────────
 router.post('/jobImage/addJobImages', upload.single('file'), async (req, res, next) => {
   try {
+    logger.info('Integration: add job image · jobId=' + (req.body.JobId || req.body.jobId || '-'));
     if (!req.file) return legacyError(res, 400, 'file required');
     const jobId = Number(req.body.JobId || req.body.jobId);
     if (!jobId) return legacyError(res, 400, 'JobId required');
     const job = await jobService.getById(jobId);
-    if (!job || job.fk_client_id !== req.integrationClient.id) return legacyError(res, 404, 'Not Found');
+    if (!job || job.fk_client_id !== req.integrationClient.id) {
+      logger.warn('Integration: image upload target not found / not owned · jobId=' + jobId);
+      return legacyError(res, 404, 'Not Found');
+    }
 
     const saved = writeBuffer('job_files', req.file.buffer, req.file.originalname, req.file.mimetype);
     const [ins] = await pool.query(
@@ -213,6 +254,7 @@ router.post('/jobImage/addJobImages', upload.single('file'), async (req, res, ne
        VALUES (?, ?, 'unconfirmed', 0, 1, NOW())`,
       [jobId, saved.filename]
     );
+    logger.info('Integration: job image saved · jobId=' + jobId + ' imageId=' + ins.insertId);
     legacyOk(res, {
       imageId: ins.insertId, jobStage: 0, image: saved.filename,
       status: 1, createdTimestamp: formatLegacyDate(new Date()),
@@ -231,11 +273,13 @@ router.post('/jobImage/addJobImages', upload.single('file'), async (req, res, ne
 // rely on it literally).
 router.get('/easyfixers/availability-status', async (req, res, next) => {
   try {
+    logger.info('Integration: check availability · pincode=' + (req.query.pincode || '-') + ' date=' + (req.query.requestedDate || '-') + ' slot=' + (req.query.timeSlot || '-'));
     const available = await checkFirefoxAvailability(pool, {
       pincode: req.query.pincode,
       requestedDate: req.query.requestedDate,
       timeSlot: req.query.timeSlot,
     });
+    logger.info('Integration: availability result · isAvailabil=' + (available ? 'Yes' : 'No'));
     legacyOk(res, { isAvailabil: available ? 'Yes' : 'No' });
   } catch (e) { next(e); }
 });
@@ -246,11 +290,13 @@ router.get('/easyfixers/availability-status', async (req, res, next) => {
 // Returns legacy shape with `null` when not applicable (matches legacy).
 router.get('/easyfixers/availability-status-check', async (req, res, next) => {
   try {
+    logger.info('Integration: Decathlon serviceability check · pincode=' + (req.query.pincode || '-'));
     const result = await checkDecathlonServiceability(pool, {
       pincode: req.query.pincode,
       clientName: req.integrationClient.name,
     });
     if (result === null) return legacyOk(res, null);
+    logger.info('Integration: Decathlon serviceability result · isAvailabil=' + (result ? 'Yes' : 'No'));
     legacyOk(res, { isAvailabil: result ? 'Yes' : 'No' });
   } catch (e) { next(e); }
 });
@@ -302,8 +348,10 @@ router.get('/utils/validateOtp', async (_req, res) => legacyError(res, 501, 'Not
 router.post('/utils/notification', async (_req, res) => legacyOk(res, { sent: true }));
 router.post('/utils/uploadFile', upload.single('file'), async (req, res, next) => {
   try {
+    logger.info('Integration: upload general file');
     if (!req.file) return legacyError(res, 400, 'file required');
     const saved = writeBuffer('general', req.file.buffer, req.file.originalname, req.file.mimetype);
+    logger.info('Integration: file saved · ' + saved.filename);
     legacyOk(res, { filename: saved.filename, url: saved.url });
   } catch (e) { next(e); }
 });
@@ -312,7 +360,11 @@ router.post('/utils/uploadFile', upload.single('file'), async (req, res, next) =
 router.get('/clients', async (req, res) => legacyOk(res, []));
 router.get('/clients/:id', async (req, res, next) => {
   try {
-    if (Number(req.params.id) !== req.integrationClient.id) return legacyError(res, 404, 'Not Found');
+    logger.info('Integration: fetch client · id=' + req.params.id);
+    if (Number(req.params.id) !== req.integrationClient.id) {
+      logger.warn('Integration: client id mismatch · id=' + req.params.id);
+      return legacyError(res, 404, 'Not Found');
+    }
     const [[c]] = await pool.query('SELECT client_id, client_name, client_email FROM tbl_client WHERE client_id = ?', [req.params.id]);
     legacyOk(res, c || null);
   } catch (e) { next(e); }
@@ -327,6 +379,7 @@ router.post('/clients/saveQuestionaireAnswers', async (_req, res) => legacyOk(re
 router.get('/customer/getCustomer', async (req, res, next) => {
   try {
     const { mobile, id } = req.query;
+    logger.info('Integration: lookup customer · by=' + (mobile ? 'mobile' : (id ? 'id' : 'none')));
     if (!mobile && !id) return legacyError(res, 400, 'mobile or id required');
     const [[cust]] = await pool.query(
       mobile
@@ -340,26 +393,32 @@ router.get('/customer/getCustomer', async (req, res, next) => {
 router.post('/customer/addCustomer', async (req, res, next) => {
   try {
     const { name, mobile, email } = req.body || {};
+    logger.info('Integration: add customer');
     if (!name || !mobile) return legacyError(res, 400, 'name and mobile required');
     const [ins] = await pool.query(
       'INSERT INTO tbl_customer (customer_name, customer_mob_no, customer_email, is_active, insert_date, update_date) VALUES (?, ?, ?, 1, NOW(), NOW())',
       [name, mobile, email || null]
     );
+    logger.info('Integration: customer created · id=' + ins.insertId);
     legacyOk(res, { id: ins.insertId });
   } catch (e) { next(e); }
 });
 router.put('/customer', async (req, res, next) => {
   try {
     const { id, name, email } = req.body || {};
+    logger.info('Integration: update customer · id=' + (id || '-'));
     if (!id) return legacyError(res, 400, 'id required');
     await pool.query('UPDATE tbl_customer SET customer_name = COALESCE(?, customer_name), customer_email = COALESCE(?, customer_email), update_date = NOW() WHERE customer_id = ?', [name, email, id]);
+    logger.info('Integration: customer updated · id=' + id);
     legacyOk(res, { updated: true });
   } catch (e) { next(e); }
 });
 router.get('/customer/jobs', async (req, res, next) => {
   try {
     const custId = Number(req.query.customerId);
+    logger.info('Integration: list customer jobs · customerId=' + (req.query.customerId || '-'));
     const [rows] = await pool.query('SELECT job_id, job_status, created_date_time FROM tbl_job WHERE fk_customer_id = ? AND fk_client_id = ? ORDER BY job_id DESC LIMIT 100', [custId, req.integrationClient.id]);
+    logger.info('Found ' + rows.length + ' customer jobs');
     legacyOk(res, rows.map((j) => ({ ...j, status: statusLabel(j.job_status) })));
   } catch (e) { next(e); }
 });
@@ -384,7 +443,9 @@ router.get('/clientInvoice', async (req, res, next) => {
   try {
     const callerClientId = req.integrationClient.id;
     const requestedClientId = req.query.clientId ? Number(req.query.clientId) : callerClientId;
+    logger.info('Integration: list client invoices · from=' + (req.query.startDate || '-') + ' to=' + (req.query.endDate || '-'));
     if (requestedClientId !== callerClientId) {
+      logger.warn('Integration: invoice clientId mismatch · requested=' + requestedClientId);
       return legacyError(res, 403, 'Forbidden');
     }
     const { startDate, endDate } = req.query;
@@ -403,6 +464,7 @@ router.get('/clientInvoice', async (req, res, next) => {
         ORDER BY billing_to_date DESC`,
       args
     );
+    logger.info('Found ' + rows.length + ' client invoices');
     const data = rows.map((r) => ({
       invoiceId: r.id,
       client: { clientId: r.fk_client_id },

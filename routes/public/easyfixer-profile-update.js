@@ -154,11 +154,14 @@ router.get(
   validate(tokenQuery, 'query'),
   async (req, res, next) => {
     try {
+      logger.info('Easyfixer profile prefill requested');
       const efrId = verifyTokenFromQuery(req);
       const payload = await profileUpdateLink.fetchPrefill(efrId, pool);
       logger.info({ efrId }, 'easyfixer-profile-update: prefill served');
+      logger.info('Easyfixer profile prefill served');
       return modernOk(res, payload);
     } catch (e) {
+      logger.warn('Easyfixer profile prefill failed · ' + e.message);
       return mapKnownError(res, next, e);
     }
   },
@@ -175,11 +178,14 @@ router.post(
   validate(tokenQuery, 'query'),
   async (req, res, next) => {
     try {
+      logger.info('Easyfixer profile OTP send requested');
       const efrId = verifyTokenFromQuery(req);
       const result = await otpSvc.sendOtp(efrId, pool);
       logger.info({ efrId }, 'easyfixer-profile-update: OTP send requested');
+      logger.info('Easyfixer profile OTP dispatched');
       return modernOk(res, result, 'OTP sent');
     } catch (e) {
+      logger.warn('Easyfixer profile OTP send failed · ' + e.message);
       return mapKnownError(res, next, e);
     }
   },
@@ -196,19 +202,25 @@ router.put(
   validate(saveBody, 'body'),
   async (req, res, next) => {
     try {
+      logger.info('Easyfixer profile save requested · hasBasic=' + (!!req.body.basic)
+        + ' deepSkills=' + ((req.body.deep_skill_items && req.body.deep_skill_items.length) || 0)
+        + ' pincodes=' + ((req.body.serviceable_pincode_ids && req.body.serviceable_pincode_ids.length) || 0));
       const efrId = verifyTokenFromQuery(req);
 
       // OTP gate — runs before acceptSubmission to avoid partial writes on
       // an invalid code.
       const { valid } = await otpSvc.verifyOtp(efrId, req.body.otp, pool);
       if (!valid) {
+        logger.warn('Easyfixer profile save rejected · invalid or expired OTP');
         return modernError(res, 400, 'Invalid or expired OTP');
       }
 
       const result = await profileUpdateLink.acceptSubmission(efrId, req.body, pool);
       logger.info({ efrId }, 'easyfixer-profile-update: profile saved');
+      logger.info('Easyfixer profile saved · efr_id=' + efrId);
       return modernOk(res, result, 'Profile updated');
     } catch (e) {
+      logger.warn('Easyfixer profile save failed · ' + e.message);
       return mapKnownError(res, next, e);
     }
   },
@@ -233,10 +245,13 @@ router.get(
       verifyTokenFromQuery(req);
       const q     = req.query.q || '';
       const limit = Number(req.query.limit) || 50;
+      logger.info('Searching pincodes · q="' + q + '" limit=' + limit);
       const items = await profileUpdateLink.searchPincodes(q, limit, pool);
       logger.info({ q, limit, count: items.length }, 'easyfixer-profile-update: pincode search');
+      logger.info('Found ' + items.length + ' pincodes');
       return modernOk(res, { items });
     } catch (e) {
+      logger.warn('Pincode search failed · ' + e.message);
       return mapKnownError(res, next, e);
     }
   },
@@ -265,13 +280,16 @@ router.post(
       // easyfixer, so we don't need the efrId; the call still gates access to
       // authenticated link holders.
       verifyTokenFromQuery(req);
+      logger.info('Ensuring pincode · pincode=' + req.body.pincode);
       const row = await pincodeService.ensurePincode(req.body.pincode);
       logger.info(
         { pincode: req.body.pincode, pincode_id: row && row.pincode_id, created: row && row.created },
         'easyfixer-profile-update: ensure-pincode',
       );
+      logger.info('Pincode ensured · pincode_id=' + (row && row.pincode_id) + ' created=' + (row && row.created));
       return modernOk(res, row);
     } catch (e) {
+      logger.warn('Ensure-pincode failed · ' + e.message);
       return mapKnownError(res, next, e);
     }
   },

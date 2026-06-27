@@ -30,8 +30,12 @@ const cache = new Map(); // key: `${job_stage}:${client_id}` → { body, expires
 
 async function getTemplate(jobStage, { clientId = 1 } = {}) {
   const key = `${jobStage}:${clientId}`;
+  logger.info('Resolving SMS template · job_stage=' + jobStage + ' · clientId=' + clientId);
   const hit = cache.get(key);
-  if (hit && hit.expiresAt > Date.now()) return hit.body;
+  if (hit && hit.expiresAt > Date.now()) {
+    logger.info('SMS template cache hit · job_stage=' + jobStage + ' · clientId=' + clientId);
+    return hit.body;
+  }
 
   // Prefer exact (stage, client). Fall back to (stage, 0 = default). Fall back to any active.
   const [rows] = await pool.query(
@@ -44,6 +48,7 @@ async function getTemplate(jobStage, { clientId = 1 } = {}) {
   const body = rows[0]?.sms || null;
   cache.set(key, { body, expiresAt: Date.now() + CACHE_TTL_MS });
   if (!body) logger.warn(`No active SMS template for job_stage="${jobStage}" — falling back to inline text (DLT filtering will likely drop this message).`);
+  else logger.info('Resolved SMS template · job_stage=' + jobStage + ' · matchedClientId=' + rows[0].client_id);
   return body;
 }
 
@@ -67,6 +72,7 @@ function fill(template, vars = []) {
 }
 
 function invalidate(jobStage, clientId) {
+  logger.info('Invalidating SMS template cache · job_stage=' + (jobStage == null ? 'ALL' : jobStage) + ' · clientId=' + (clientId == null ? 'ALL' : clientId));
   if (jobStage == null) { cache.clear(); return; }
   if (clientId == null) {
     for (const k of cache.keys()) if (k.startsWith(`${jobStage}:`)) cache.delete(k);

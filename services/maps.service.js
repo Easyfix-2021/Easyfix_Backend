@@ -69,6 +69,7 @@ function cacheSet(key, value) {
  *   - 502 when Google returns a non-OK / non-ZERO_RESULTS status
  */
 async function autocomplete(q) {
+  logger.info('Maps autocomplete · qLen=' + String(q || '').length);
   const apiKey = process.env.GOOGLE_MAPS_API_KEY;
   if (!apiKey) throw { status: 503, message: 'Google Maps not configured (GOOGLE_MAPS_API_KEY missing)' };
   const cacheKey = `ac:${q.toLowerCase()}`;
@@ -82,6 +83,7 @@ async function autocomplete(q) {
     // Don't log the full error_message at info level — it may include
     // the API key on quota errors. Trimmed to a few hundred chars.
     logger.warn({ status: data.status, error_message: String(data.error_message || '').slice(0, 200) }, 'Google autocomplete error');
+    logger.warn('Maps autocomplete failed · status=' + data.status);
     throw { status: 502, message: `Google autocomplete failed: ${data.status}` };
   }
   const items = (data.predictions || []).map((p) => ({
@@ -92,6 +94,7 @@ async function autocomplete(q) {
   }));
   const out = { items };
   cacheSet(cacheKey, out);
+  logger.info('Returning ' + items.length + ' autocomplete predictions');
   return out;
 }
 
@@ -119,6 +122,7 @@ async function geocode({ place_id, address, latlng }) {
   const placeId = place_id || null;
   const addr    = address  || null;
   const ll      = latlng   || null;
+  logger.info('Maps geocode · mode=' + (placeId ? 'place_id' : ll ? 'latlng' : 'address'));
   const cacheKey = `gc:${placeId || addr || ll || ''}`.toLowerCase();
   const cached = cacheGet(cacheKey);
   if (cached) return cached;
@@ -133,6 +137,7 @@ async function geocode({ place_id, address, latlng }) {
   const data = await r.json();
   if (data.status !== 'OK') {
     logger.warn({ status: data.status, error_message: String(data.error_message || '').slice(0, 200) }, 'Google geocode error');
+    logger.warn('Maps geocode failed · status=' + data.status);
     /*
      * Map common Google failure codes to actionable operator hints
      * (2026-05-28). The bare `REQUEST_DENIED` we used to surface was
@@ -174,6 +179,7 @@ async function geocode({ place_id, address, latlng }) {
     address_components: components,
   };
   cacheSet(cacheKey, out);
+  logger.info('Geocode resolved · pin=' + (components.postal_code || 'n/a') + ' · city=' + (components.city || 'n/a'));
   return out;
 }
 
@@ -202,6 +208,7 @@ async function geocode({ place_id, address, latlng }) {
  * back to a key with broader privileges.
  */
 function getConfigKey() {
+  logger.info('Maps config key requested · configured=' + Boolean(process.env.GOOGLE_MAPS_API_KEY_PUBLIC));
   return process.env.GOOGLE_MAPS_API_KEY_PUBLIC || null;
 }
 
@@ -260,6 +267,7 @@ async function reverseGeocode(lat, lng, pool = null) {
   const latNum = Number(lat);
   const lngNum = Number(lng);
   const gps_location = (Number.isFinite(latNum) && Number.isFinite(lngNum)) ? `${latNum},${lngNum}` : null;
+  logger.info('Reverse geocode · hasCoords=' + Boolean(gps_location));
   const out = { gps_location, formatted_address: null, pin_code: null, city_name: null, city_id: null };
   if (!gps_location) return out;
   try {
@@ -270,6 +278,7 @@ async function reverseGeocode(lat, lng, pool = null) {
     if (out.city_name && pool) {
       out.city_id = await resolveCityIdByName(out.city_name, pool);
     }
+    logger.info('Reverse geocode resolved · pin=' + (out.pin_code || 'n/a') + ' · cityId=' + (out.city_id || 'n/a'));
   } catch (e) {
     logger.warn(`reverseGeocode failed for ${gps_location} — ${e && e.message ? e.message : e}; returning gps-only`);
   }

@@ -231,6 +231,7 @@ const KPI_OPEN_SQL = `
  * Field names match the legacy DTO 1:1 so the FE can pivot identically.
  */
 async function getVerticalOpenOrders(flags) {
+  logger.info('Vertical Orders · flags=' + (Array.isArray(flags) ? flags.join(',') : flags));
   // jobCountsMap[vertical][age] = summed count; verticalSums / ageCategorySums
   // are the per-vertical and per-age-column grand totals (replicates the Java
   // merge() accumulation across multiple selected flags).
@@ -306,6 +307,7 @@ async function getVerticalOpenOrders(flags) {
     ? Math.round((countOfEscalatedOrders / countOfOpenOrders) * 100)
     : 0;
 
+  logger.info('Returning ' + openOrderByGroup.length + ' vertical/age cells · openOrders=' + countOfOpenOrders + ' escalated=' + countOfEscalatedOrders + ' unconfirmed=' + countOfUnconfirmedOrders);
   return {
     openOrderByGroup,
     countOfEscalatedOrders,

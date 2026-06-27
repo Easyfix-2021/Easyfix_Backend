@@ -25,6 +25,7 @@
  */
 
 const ExcelJS = require('exceljs');
+const logger = require('../logger');
 
 /* ─── Shared workbook setup ───────────────────────────────────────── */
 
@@ -56,6 +57,7 @@ async function toBuffer(wb) {
  * we don't re-query, we just project. Operators get one tidy sheet.
  */
 async function exportClientList(rows) {
+  logger.info('Export client list to XLSX · rows=' + (rows ? rows.length : 0));
   const { wb, ws } = newWorkbook('Clients');
   // Columns mirror the UI list order (ID/Name/Email/City/Primary SPOC/
   // Secondary SPOC) + audit metadata for ops reporting.
@@ -83,12 +85,14 @@ async function exportClientList(rows) {
       r.client_status === 1 ? 'Active' : 'Inactive',
     ]);
   }
+  logger.info('Returning client list XLSX · rows=' + rows.length);
   return toBuffer(wb);
 }
 
 /* ─── 2. Rate card export ─────────────────────────────────────────── */
 
 async function exportRateCards(clientName, rateCards) {
+  logger.info('Export rate cards to XLSX · rateCards=' + (rateCards ? rateCards.length : 0));
   const { wb, ws } = newWorkbook('Rate Cards');
   applyHeader(ws, [
     'Service Type ID', 'Service Type Name',
@@ -112,12 +116,14 @@ async function exportRateCards(clientName, rateCards) {
   // keep the file CSV-parseable; client name lives in the filename
   // instead.
   void clientName;
+  logger.info('Returning rate cards XLSX · rateCards=' + rateCards.length);
   return toBuffer(wb);
 }
 
 /* ─── 3. SPOC list export (cross-client report) ───────────────────── */
 
 async function exportSpocList(rows) {
+  logger.info('Export SPOC list to XLSX · rows=' + (rows ? rows.length : 0));
   const { wb, ws } = newWorkbook('SPOC Report');
   applyHeader(ws, [
     'Client ID', 'Client Name',
@@ -133,6 +139,7 @@ async function exportSpocList(rows) {
       r.status === 1 ? 'Active' : 'Inactive',
     ]);
   }
+  logger.info('Returning SPOC list XLSX · rows=' + rows.length);
   return toBuffer(wb);
 }
 
@@ -156,10 +163,12 @@ async function exportSpocList(rows) {
  * folds the results back into the operator-visible report.
  */
 async function parseSpocUpload(buffer) {
+  logger.info('Parse SPOC bulk upload');
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(buffer);
   const ws = wb.worksheets[0];
   if (!ws) {
+    logger.warn('SPOC upload rejected · Workbook is empty');
     throw Object.assign(new Error('Workbook is empty'), { status: 400 });
   }
   const results = [];
@@ -195,6 +204,7 @@ async function parseSpocUpload(buffer) {
       },
     });
   });
+  logger.info('Parsed SPOC upload · rows=' + results.length);
   return { rows: results };
 }
 
@@ -213,6 +223,7 @@ async function parseSpocUpload(buffer) {
  * a targeted SELECT for the chosen clientIds.
  */
 async function buildBulkMonthlyRevenueTemplate(clients = []) {
+  logger.info('Build bulk monthly-revenue template · clients=' + clients.length);
   const { wb, ws } = newWorkbook('Monthly Revenue');
   applyHeader(ws, [
     'Client ID', 'Client Name (reference)', 'Monthly Revenue (INR)',
@@ -268,10 +279,12 @@ async function buildBulkMonthlyRevenueTemplate(clients = []) {
  *   payload shape: { clientId, monthlyRevenue }
  */
 async function parseBulkMonthlyRevenue(buffer) {
+  logger.info('Parse bulk monthly-revenue upload');
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(buffer);
   const ws = wb.worksheets[0];
   if (!ws) {
+    logger.warn('Bulk monthly-revenue upload rejected · Workbook is empty');
     throw Object.assign(new Error('Workbook is empty'), { status: 400 });
   }
   const results = [];
@@ -305,6 +318,7 @@ async function parseBulkMonthlyRevenue(buffer) {
       payload: { clientId, monthlyRevenue: validRevenue },
     });
   });
+  logger.info('Parsed bulk monthly-revenue upload · rows=' + results.length);
   return { rows: results };
 }
 
@@ -334,10 +348,12 @@ async function parseBulkMonthlyRevenue(buffer) {
  * single TX per row.
  */
 async function parseBulkSpocAssignment(buffer) {
+  logger.info('Parse bulk SPOC assignment upload');
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(buffer);
   const ws = wb.worksheets[0];
   if (!ws) {
+    logger.warn('Bulk SPOC assignment upload rejected · Workbook is empty');
     throw Object.assign(new Error('Workbook is empty'), { status: 400 });
   }
   const results = [];
@@ -366,6 +382,7 @@ async function parseBulkSpocAssignment(buffer) {
       payload: { clientId, primaryUserId: primaryId, secondaryUserId: secondId },
     });
   });
+  logger.info('Parsed bulk SPOC assignment upload · rows=' + results.length);
   return { rows: results };
 }
 
@@ -387,6 +404,7 @@ function toInt(v) {
  * row so the endpoint keeps its existing behaviour unchanged.
  */
 async function buildBulkSpocAssignmentTemplate(clients) {
+  logger.info('Build bulk SPOC assignment template · clients=' + (clients ? clients.length : 0));
   const { wb, ws } = newWorkbook('SPOC Assignment');
   applyHeader(ws, [
     'Client ID', 'Client Name (reference)',
@@ -442,6 +460,7 @@ async function buildBulkSpocAssignmentTemplate(clients) {
 /* ─── 5. SPOC bulk-upload template ────────────────────────────────── */
 
 async function buildSpocTemplate() {
+  logger.info('Build SPOC bulk-upload template');
   const { wb, ws } = newWorkbook('SPOCs');
   applyHeader(ws, [
     'Contact Name', 'Email', 'Phone (10 digits)',

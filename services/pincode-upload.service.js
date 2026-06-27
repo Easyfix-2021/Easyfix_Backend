@@ -22,6 +22,7 @@ const MAX_DATA_ROWS = 5000;
 
 // ─── Template generator ──────────────────────────────────────────────
 async function generateTemplate() {
+  logger.info('Generating pincode bulk-upload template');
   const wb = new ExcelJS.Workbook();
   wb.creator = 'EasyFix CRM';
   wb.created = new Date();
@@ -29,6 +30,7 @@ async function generateTemplate() {
   const [cities] = await pool.query(
     'SELECT city_id, city_name FROM tbl_city ORDER BY city_name ASC'
   );
+  logger.info('Found ' + cities.length + ' cities for template dropdown');
 
   // ── Pincodes sheet (editable) — added FIRST so Excel opens this tab
   //    by default (most spreadsheet apps honor the first-added sheet as
@@ -123,6 +125,7 @@ async function generateTemplate() {
 
 // ─── Upload parser ───────────────────────────────────────────────────
 async function processUpload(buffer, { dryRun = false, userId = null } = {}) {
+  logger.info('Processing pincode bulk upload · dryRun=' + dryRun);
   const wb = XLSX.read(buffer, { type: 'buffer' });
   const sheet = wb.Sheets['Pincodes'] || wb.Sheets[wb.SheetNames[0]];
   if (!sheet) {
@@ -135,6 +138,7 @@ async function processUpload(buffer, { dryRun = false, userId = null } = {}) {
   }
 
   const records = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
+  logger.info('Parsed ' + records.length + ' rows from upload');
 
   // ── Header validation ─────────────────────────────────────────────
   // sheet_to_json keys each row object off the sheet's FIRST-ROW header
@@ -275,12 +279,14 @@ async function processUpload(buffer, { dryRun = false, userId = null } = {}) {
     if (conn) await conn.commit();
   } catch (err) {
     if (conn) await conn.rollback();
+    logger.error('Pincode bulk upload insert failed; rolled back · ' + err.message);
     logger.error({ err, dryRun, userId }, 'Pincode bulk upload: insert transaction rolled back');
     throw err;
   } finally {
     if (conn) conn.release();
   }
 
+  logger.info('Pincode upload done · dryRun=' + dryRun + ' total=' + records.length + ' created=' + createdCount + ' skipped=' + skipCount + ' failed=' + failedCount);
   return {
     summary: {
       totalRows: records.length,

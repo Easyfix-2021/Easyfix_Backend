@@ -101,7 +101,9 @@ const verticalOrdersQuery = Joi.object({
 router.get('/', validate(verticalOrdersQuery, 'query'), async (req, res, next) => {
   try {
     const flags = req.query.flag; // normalised array (Joi custom rule)
+    logger.info('Vertical Orders report · flags=' + flags.join(',') + ' · format=' + req.query.format);
     const result = await getVerticalOpenOrders(flags);
+    logger.info('Found ' + (result.openOrderByGroup ? result.openOrderByGroup.length : 0) + ' vertical groups');
 
     if (req.query.format === 'xlsx') {
       // buildExportRows appends the synthetic pivot Total as the LAST row.
@@ -142,13 +144,16 @@ router.get('/', validate(verticalOrdersQuery, 'query'), async (req, res, next) =
       return;
     }
 
+    logger.info('Returning vertical orders JSON');
     return modernOk(res, result);
   } catch (err) {
     // Map a thrown service error carrying an explicit HTTP status to a
     // modern error; otherwise defer to the global error handler.
     if (err && err.status) {
+      logger.warn('Vertical Orders report failed · ' + err.message);
       return modernError(res, err.status, err.message);
     }
+    logger.error('Vertical Orders report errored · ' + err.message);
     return next(err);
   }
 });
