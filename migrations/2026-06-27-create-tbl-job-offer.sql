@@ -1,11 +1,13 @@
 -- 2026-06-27 — Job-offer ledger for the technician offer/accept flow (EasyFix-owned).
 --
--- Backs THE OFFER MODEL: when the offer flow is enabled, a CRM/auto assign no
--- longer hard-schedules the job. Instead the job stays BOOKED (status 0) with
--- fk_easyfixter_id set and a row is written here in OFFERED state, plus an FCM
--- data-push (type='job_offer') nudges the technician. The technician then
--- ACCEPTS (offer_status 0->1, job 0->1 SCHEDULED) or REJECTS (offer_status
--- 0->2, job unassigned back to BOOKED) from the app.
+-- Backs THE OFFER MODEL (pool offers): when the offer flow is enabled, a CRM/auto
+-- assign no longer hard-schedules the job. Instead the job stays BOOKED (status 0)
+-- and tbl_job.fk_easyfixter_id stays NULL (no single owner yet) while one OFFERED
+-- row per offered technician is written here, each with an FCM data-push
+-- (type='job_offer'). A job may be offered to MANY technicians at once. The first
+-- to ACCEPT wins a race-safe claim (offer_status 0->1, job 0->1 SCHEDULED, fk set
+-- to the winner, all sibling open offers -> EXPIRED 3); late accepters get a 409
+-- "already accepted". REJECT marks only that tech's offer 0->2 with a reason.
 --
 -- tbl_job_offer is EasyFix-owned and referenced by NO legacy service, so a new
 -- owned table is the sanctioned route under the CLAUDE.md shared-DB carve-out

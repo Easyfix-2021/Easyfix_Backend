@@ -306,6 +306,22 @@ router.get('/jobs/rejected', async (req, res, next) => {
   }
 });
 
+// Offers currently EXTENDED to this technician — the OPEN offers on
+// tbl_job_offer (offer_status=0 OFFERED) under the offer-pool model. Returns
+// full job previews so the app can render them with the SAME mapper it already
+// uses for GET /jobs (opportunities): jobService.listOfferedForTech() yields
+// `{ items: JobPreview[] }` in that identical shape. MOUNTED BEFORE
+// `GET /jobs/:id` so the literal `offered` segment wins over the `:id` param
+// route. Tolerant of the offer table being absent (offer model rolling out) —
+// listOfferedForTech() returns `{ items: [] }` rather than throwing, so a DB
+// without tbl_job_offer simply shows no offers.
+router.get('/jobs/offered', async (req, res, next) => {
+  try {
+    const result = await jobService.listOfferedForTech(req.tech.efr_id);
+    modernOk(res, result);
+  } catch (e) { next(e); }
+});
+
 router.get('/jobs/:id', async (req, res, next) => {
   try {
     const job = await jobService.getById(Number(req.params.id));
@@ -314,25 +330,30 @@ router.get('/jobs/:id', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// Accept the job OFFER. Under THE OFFER MODEL a freshly-(auto/CRM-)assigned
-// job stays status 0 (BOOKED) with fk_easyfixter_id set and an OFFERED row on
-// tbl_job_offer; the tech accepting it flips offer_status 0→1 (ACCEPTED) AND
-// bumps job_status 0 (BOOKED) → 1 (SCHEDULED) — transactionally, in one shared
-// service call. jobService.acceptOffer() owns that two-table write (offer row +
-// status bump + audit stamps). We keep the not-found / wrong-tech guards here;
-// the "must be in an offerable state" check lives inside acceptOffer, which
-// throws a status-bearing error we surface as a clear 409.
+// Accept the job OFFER. Under THE OFFER-POOL MODEL a job can be offered to
+// MULTIPLE technicians at once; while offered it stays job_status 0 (BOOKED)
+// with fk_easyfixter_id NULL (no single owner), and each offered tech has an
+// OFFERED row on tbl_job_offer. So there is NO "this job belongs to me" check
+// to do here — fk_easyfixter_id is deliberately NULL until someone wins the
+// race. We only guard that the job exists; eligibility (does this tech have an
+// open offer? is the job still BOOKED+unowned?) is enforced inside
+// jobService.acceptOffer(), which performs the race-safe first-wins claim
+// (UPDATE … WHERE job_status=0 AND fk_easyfixter_id IS NULL): the winner's
+// offer flips to ACCEPTED and all other open offers EXPIRE; a loser gets a
+// status-bearing 409 ('already accepted by another technician'), surfaced
+// verbatim below.
 router.post('/jobs/:id/accept', async (req, res, next) => {
   try {
     const job = await jobService.getById(Number(req.params.id));
-    if (!job || job.fk_easyfixter_id !== req.tech.efr_id) return modernError(res, 404, 'job not found');
+    if (!job) return modernError(res, 404, 'job not found');
     await jobService.acceptOffer(Number(job.job_id), req.tech.efr_id);
     modernOk(res, { accepted: true });
   } catch (e) {
-    // acceptOffer throws a status-bearing error when the job isn't in an
-    // offerable state (e.g. offer already accepted/rejected/expired, or the
-    // job has moved past BOOKED) — surface it verbatim. Default such conflicts
-    // to 409 so the app shows a clear "offer no longer available" message.
+    // acceptOffer throws a status-bearing error when this tech can't claim the
+    // offer (race lost — already accepted by another technician, offer already
+    // rejected/expired, or the job has moved past BOOKED) — surface it verbatim.
+    // The lost-race case is a 409 so the app shows a clear "offer no longer
+    // available" message.
     if (e.status) return modernError(res, e.status, e.message);
     next(e);
   }

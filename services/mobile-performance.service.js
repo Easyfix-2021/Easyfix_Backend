@@ -174,6 +174,42 @@ async function queryWeeklyBuckets(efrId, from, to) {
 }
 
 /*
+ * Per-technician offer stats over `tbl_job_offer` — backs
+ * `GET /api/mobile/performance/offer-stats`. Lets the app show how many
+ * jobs were offered to this tech, how many they accepted, and how many
+ * they missed (offer_status 3 EXPIRED = someone else accepted first OR
+ * the tech never acted) plus self-rejections (offer_status 2).
+ *
+ * offer_status: 0 OFFERED · 1 ACCEPTED · 2 REJECTED · 3 EXPIRED.
+ *
+ * tbl_job_offer is feature-flag-gated and may not exist in every
+ * environment yet, so the whole read is wrapped: on ER_NO_SUCH_TABLE
+ * (or any other error) we degrade to all-zeros rather than 500.
+ */
+async function getOfferStats(efrId) {
+  try {
+    const [[row]] = await pool.query(
+      `SELECT COUNT(*) AS offered,
+              COUNT(CASE WHEN offer_status = 1 THEN 1 END) AS accepted,
+              COUNT(CASE WHEN offer_status = 2 THEN 1 END) AS rejected,
+              COUNT(CASE WHEN offer_status = 3 THEN 1 END) AS missed
+         FROM tbl_job_offer
+        WHERE fk_easyfixter_id = ?`,
+      [efrId],
+    );
+    return {
+      offered: Number(row?.offered ?? 0),
+      accepted: Number(row?.accepted ?? 0),
+      rejected: Number(row?.rejected ?? 0),
+      missed: Number(row?.missed ?? 0),
+    };
+  } catch (e) {
+    logger.warn({ err: e.message, efrId }, 'mobile-performance offer-stats failed');
+    return { offered: 0, accepted: 0, rejected: 0, missed: 0 };
+  }
+}
+
+/*
  * 90-day average customer rating — replicates performance.service.js's
  * computeRating (column is `insert_date_time`, NOT `created_date`).
  */
@@ -252,4 +288,4 @@ function buildWeekSkeleton(from, to) {
   return weeks;
 }
 
-module.exports = { getWeeklyPerformance };
+module.exports = { getWeeklyPerformance, getOfferStats };

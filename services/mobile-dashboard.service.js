@@ -12,8 +12,10 @@ const performanceService = require('./performance.service');
  * duplication of business logic — every count, list, and metric comes
  * from a function that's also consumed by CRM:
  *
- *   - `jobService.getStatusCounts({ easyfixerId })`   (CRM dashboard
- *     uses the same function with `{ scope, ownerId }`)
+ *   - `jobService.listOfferedForTech(efrId)`           ("New Requests" =
+ *     the tech's OPEN OFFERS under the offer-pool model; gated by
+ *     jobOfferTableExists() inside job.service, with a legacy status-0
+ *     fallback — see fetchNewRequests)
  *   - `jobService.list({ easyfixerId, ... })`         (CRM /admin/jobs
  *     uses the same function with admin scope filters)
  *   - `noticeService.listActiveForSurface(...)`        (CRM dashboard
@@ -80,11 +82,17 @@ async function getDashboard(efrId, opts = {}) {
   const today = todayRange();
 
   // Parallelise everything that doesn't depend on previous results.
-  // 8-query fan-out + one cross-pool wait — sub-50ms on the dev DB.
+  // Cross-pool fan-out + one wait — sub-50ms on the dev DB.
+  //
+  // NOTE: the tech-scoped getStatusCounts() call was dropped from this
+  // fan-out because the only field it fed — the "New Requests" count
+  // (byStatus['0']) — is now sourced from the tech's OPEN OFFERS via
+  // fetchNewRequests (see below). Under the offer-pool model that
+  // byStatus['0'] reads 0 anyway (it keys off fk_easyfixter_id, NULL while
+  // offered), so it was actively wrong here, not just redundant.
   const [
-    counts,
     ident,
-    newRequestsList,
+    newRequests,
     activeJobsList,
     attendance,
     performance,
@@ -92,12 +100,16 @@ async function getDashboard(efrId, opts = {}) {
     noticesUnread,
     dateCounts,
   ] = await Promise.all([
-    jobService.getStatusCounts({ easyfixerId: efrId }).catch((e) => {
-      logger.warn({ err: e.message, efrId }, 'getStatusCounts failed; returning empty');
-      return { total: 0, byStatus: {}, bookedUnassigned: 0, bookedAssigned: 0 };
-    }),
     fetchIdentity(efrId),
-    jobService.list({ easyfixerId: efrId, status: 0, limit: NEW_REQUEST_LIMIT }).catch(() => ({ rows: [], total: 0 })),
+    // "New Requests" — the technician's OPEN OFFERS under the offer-pool
+    // model. While a job is offered to multiple techs it stays
+    // job_status=0 with tbl_job.fk_easyfixter_id = NULL (no single owner),
+    // so the legacy `list({ easyfixerId, status: 0 })` (which infers the
+    // tech's jobs from fk_easyfixter_id) returns EMPTY and the tech can't
+    // see their offers on Home. Source from the tech's open offers instead;
+    // fall back to the legacy status-0 list when the offer table / function
+    // is absent so legacy deploys are unchanged. See fetchNewRequests.
+    fetchNewRequests(efrId),
     // "Today's Jobs" preview — constrain to jobs whose REQUESTED
     // (appointment) date is today so the home-screen section doesn't
     // preview overdue/carried-over jobs (those are summarised by the
@@ -139,9 +151,24 @@ async function getDashboard(efrId, opts = {}) {
       rating: performance.rating,
     },
     wallet: { balance: Number(ident?.current_balance ?? 0) },
-    attendance: { status: attendanceStatus(attendance) },
+    // `status` — TODAY's marked attendance. `tomorrow` — the NEXT day's
+    // marked status, which seeds the home "Tomorrow" availability toggle
+    // (the tech may have pre-marked leave/availability for tomorrow). Both
+    // use the same 'present'|'absent'|'on_leave'|'not_marked' enum;
+    // 'not_marked' when that day's row is absent. fetchAttendance reads
+    // both days in one indexed query.
+    attendance: {
+      status:   attendanceStatus(attendance.today),
+      tomorrow: attendanceStatus(attendance.tomorrow),
+    },
     counts: {
-      newRequests:    Number(counts.byStatus?.['0'] ?? 0),
+      // Under the offer-pool model the "New Requests" tile counts the
+      // tech's OPEN OFFERS (jobs offered to them but not yet owned by
+      // anyone), NOT status-0 jobs keyed off fk_easyfixter_id — which is
+      // NULL while offered, so getStatusCounts.byStatus['0'] (a tech-scoped
+      // count) would read 0. fetchNewRequests resolves the offer-aware
+      // count and falls back to the status-0 count on legacy deploys.
+      newRequests:    newRequests.count,
       activeJobs:     dateCounts.activeToday,
       // `delayed` — same active statuses but appointment date is BEFORE
       // today (overdue/carried-over). Split out of `activeJobs` so the
@@ -150,13 +177,26 @@ async function getDashboard(efrId, opts = {}) {
       delayed:        dateCounts.delayed,
       overdue:        dateCounts.overdue,
       upcoming:       dateCounts.upcoming,
+      // `allJobs` — the tech's TOTAL non-completed (active) jobs across
+      // ALL dates, i.e. everything BEFORE Completed. It is exactly the
+      // sum of the three date buckets (activeToday + delayed + upcoming),
+      // which together partition the tech's active-status jobs (statuses
+      // 1,2,20) by requested date into today / before-today / after-today.
+      // Drives the home "All Jobs" tile, which previously mis-read the
+      // future-only `upcoming` count. (`overdue` is a NOW()-based finer
+      // slice that overlaps activeToday/delayed, so it is intentionally
+      // NOT part of this sum.)
+      allJobs:        dateCounts.allJobs,
       // `send_back_to_tx` column confirmed present on tbl_job (live-DB
       // probe 2026-05-25, type tinyint). Count = jobs CRM has sent
       // back to the tech that are now back in IN_PROGRESS — surfaces
       // as the "Action Required" tile on the home screen.
       actionRequired: dateCounts.actionRequired,
     },
-    newRequests: (newRequestsList.rows || []).map(mapJobForMobile),
+    // Offer-aware "New Requests" preview list (the tech's open offers),
+    // already shaped for mobile by fetchNewRequests. Legacy fallback maps
+    // the status-0 list rows the same way, so the FE contract is identical.
+    newRequests: newRequests.items,
     // Defensive same-IST-day filter on top of the SQL date range, then
     // slice to the preview size — guards against rows whose
     // requested_date_time falls outside the intended day (e.g. NULL or
@@ -265,34 +305,56 @@ function shapeTechnician(ident) {
 }
 
 // ─── Attendance ──────────────────────────────────────────────────────
+/*
+ * Reads the technician's marked attendance for BOTH today and tomorrow in
+ * a single indexed round-trip and returns { today, tomorrow } rows (each
+ * the raw tbl_easyfixer_attendance row or null when unmarked). The home
+ * screen renders today's attendance status AND seeds a "Tomorrow"
+ * availability toggle from the next day's marked status, so both are
+ * needed.
+ *
+ * `tbl_easyfixer_attendance` confirmed in routes/admin/auxiliary.js;
+ * exact column names for morning_slot / is_leave_marked are pending
+ * confirmation against the live DB (see backend-changes.md Q1). Use
+ * SELECT * + defensive property reads so the call doesn't crash if
+ * column names differ from the mobile-dev spec.
+ *
+ * `created_on` is a DATE column (the attendance "day" key — see
+ * mobile-attendance.service.js, which upserts on
+ * `easyfixer_id = ? AND created_on = ?`). Because it's already a bare
+ * date, comparing the column directly to CURDATE() / CURDATE() + INTERVAL
+ * 1 DAY (rather than wrapping it in DATE(...)) stays sargable — lets
+ * idx_efr_attendance_efr_date do an index seek over the two-day range
+ * instead of a scan. One query covers both days; we sort the (≤2) rows
+ * back into today / tomorrow in JS.
+ */
 async function fetchAttendance(efrId) {
-  // `tbl_easyfixer_attendance` confirmed in routes/admin/auxiliary.js;
-  // exact column names for morning_slot / is_leave_marked are pending
-  // confirmation against the live DB (see backend-changes.md Q1). Use
-  // SELECT * + defensive property reads so the call doesn't crash if
-  // column names differ from the mobile-dev spec.
-  //
-  // `created_on` is a DATE column (the attendance "day" key — see
-  // mobile-attendance.service.js, which upserts on
-  // `easyfixer_id = ? AND created_on = ?`). Because it's already a bare
-  // date, the old `DATE(created_on) = CURDATE()` wrapper was redundant
-  // AND non-sargable — wrapping the column in a function defeats any
-  // index on it. Comparing the column directly to CURDATE() is
-  // identical in result but index-friendly (lets idx_efr_attendance_efr_date
-  // do an index seek instead of a scan).
   try {
-    const [[row]] = await pool.query(
+    const [rows] = await pool.query(
       `SELECT *
          FROM tbl_easyfixer_attendance
-        WHERE easyfixer_id = ? AND created_on = CURDATE()
-        LIMIT 1`,
-      [efrId],
+        WHERE easyfixer_id = ?
+          AND created_on IN (?, ?)`,
+      [efrId, istTodayString(), istTomorrowString()],
     );
-    return row || null;
+    const todayStr    = istTodayString();
+    const tomorrowStr = istTomorrowString();
+    const onDay = (target) => (rows || []).find((r) => attendanceRowDay(r) === target) || null;
+    return { today: onDay(todayStr), tomorrow: onDay(tomorrowStr) };
   } catch (e) {
     logger.info({ err: e.message, efrId }, 'fetchAttendance failed; treating as not-marked');
-    return null;
+    return { today: null, tomorrow: null };
   }
+}
+
+// Normalise a tbl_easyfixer_attendance row's `created_on` DATE to the
+// IST YYYY-MM-DD string so it can be matched against istTodayString() /
+// istTomorrowString() regardless of how the driver hands back the DATE
+// value (Date object vs string).
+function attendanceRowDay(row) {
+  if (!row || row.created_on == null) return null;
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' })
+    .format(new Date(row.created_on));
 }
 
 function attendanceStatus(row) {
@@ -315,6 +377,14 @@ function attendanceStatus(row) {
  */
 function istTodayString() {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date());
+}
+
+// IST calendar day AFTER today (YYYY-MM-DD), used to match the tomorrow
+// attendance row. Adds 24h to "now" then formats in IST so it stays
+// correct across DST-free IST and the Node process timezone.
+function istTomorrowString() {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' })
+    .format(new Date(Date.now() + 86_400_000));
 }
 
 // Inclusive datetime bounds for the IST day, in the literal string form
@@ -363,6 +433,11 @@ function isRequestedToday(j) {
  *   overdue        — same statuses, requested_date_time already
  *                    passed.
  *   upcoming       — same statuses, requested_date_time in the future.
+ *   allJobs        — DERIVED (no extra SQL): activeToday + delayed +
+ *                    upcoming — the tech's TOTAL non-completed/active jobs
+ *                    across all dates (everything before Completed). The
+ *                    three requested-date buckets partition the active
+ *                    statuses by date, so their sum is the all-jobs count.
  *   actionRequired — CRM has flagged a returned job for the tech to
  *                    re-handle (`send_back_to_tx = 1` AND `job_status
  *                    = 2`). Confirmed against live DB 2026-05-25 —
@@ -372,30 +447,122 @@ async function fetchDateCounts(efrId) {
   try {
     const [[row]] = await pool.query(
       `SELECT
-         SUM(job_status IN (1,2,20) AND (send_back_to_tx = 0 OR send_back_to_tx IS NULL)
-             AND DATE(requested_date_time) = CURDATE())             AS activeToday,
-         SUM(job_status IN (1,2,20) AND (send_back_to_tx = 0 OR send_back_to_tx IS NULL)
-             AND DATE(requested_date_time) < CURDATE())             AS delayed,
-         SUM(job_status IN (1,2,20) AND (send_back_to_tx = 0 OR send_back_to_tx IS NULL)
-             AND requested_date_time < NOW())                       AS overdue,
-         SUM(job_status IN (1,2,20)
-             AND DATE(requested_date_time) > CURDATE())             AS upcoming,
-         SUM(send_back_to_tx = 1 AND job_status = 2)                AS actionRequired
+         COUNT(CASE WHEN job_status IN (1,2,20)
+                     AND (send_back_to_tx = 0 OR send_back_to_tx IS NULL)
+                     AND DATE(requested_date_time) = CURDATE() THEN 1 END) AS activeToday,
+         COUNT(CASE WHEN job_status IN (1,2,20)
+                     AND (send_back_to_tx = 0 OR send_back_to_tx IS NULL)
+                     AND DATE(requested_date_time) < CURDATE() THEN 1 END) AS delayed,
+         COUNT(CASE WHEN job_status IN (1,2,20)
+                     AND requested_date_time < NOW() THEN 1 END)           AS overdue,
+         COUNT(CASE WHEN job_status IN (1,2,20)
+                     AND DATE(requested_date_time) > CURDATE() THEN 1 END) AS upcoming,
+         COUNT(CASE WHEN send_back_to_tx = 1 AND job_status = 2 THEN 1 END) AS actionRequired
        FROM tbl_job
        WHERE fk_easyfixter_id = ?`,
       [efrId],
     );
+    const activeToday = Number(row?.activeToday ?? 0);
+    const delayed     = Number(row?.delayed ?? 0);
+    const upcoming    = Number(row?.upcoming ?? 0);
     return {
-      activeToday:    Number(row?.activeToday ?? 0),
-      delayed:        Number(row?.delayed ?? 0),
+      activeToday,
+      delayed,
       overdue:        Number(row?.overdue ?? 0),
-      upcoming:       Number(row?.upcoming ?? 0),
+      upcoming,
+      // Total non-completed (active-status) jobs across all dates — the
+      // three requested-date buckets together partition the tech's
+      // statuses 1,2,20, so their sum is the "All Jobs" count.
+      allJobs:        activeToday + delayed + upcoming,
       actionRequired: Number(row?.actionRequired ?? 0),
     };
   } catch (e) {
     logger.warn({ err: e.message, efrId }, 'fetchDateCounts failed; returning zeros');
-    return { activeToday: 0, delayed: 0, overdue: 0, upcoming: 0, actionRequired: 0 };
+    return { activeToday: 0, delayed: 0, overdue: 0, upcoming: 0, allJobs: 0, actionRequired: 0 };
   }
+}
+
+// ─── "New Requests" — offer-pool aware ───────────────────────────────
+/*
+ * Resolves the home-screen "New Requests" section under THE OFFER MODEL.
+ *
+ * In the offer-pool model a job can be offered to MULTIPLE technicians at
+ * once. While offered it stays job_status=0 (BOOKED) and
+ * tbl_job.fk_easyfixter_id STAYS NULL (no single owner) — so the legacy
+ * source `jobService.list({ easyfixerId, status: 0 })`, which infers the
+ * tech's jobs from fk_easyfixter_id, returns EMPTY and the tech can't see
+ * the requests offered to them. The correct source is the tech's OPEN
+ * OFFERS: `jobService.listOfferedForTech(efrId)` → { items: JobPreview[] }.
+ *
+ * GATED on the offer flow — falls back to the legacy status-0 list so
+ * legacy deploys are unchanged — when ANY of these hold:
+ *   - jobService doesn't expose listOfferedForTech (older module on a
+ *     coexisting deploy), or
+ *   - the tbl_job_offer table is absent (jobOfferTableExists() === false), or
+ *   - listOfferedForTech yields nothing usable (no items / it throws).
+ *
+ * Always resolves (never rejects). Returns the shape the orchestrator
+ * spreads into the payload:
+ *   { items: <mobile-shaped preview[]>, count: <number> }
+ *   - items: preview rows shaped by mapJobForMobile, capped at
+ *            NEW_REQUEST_LIMIT (the home-screen preview size).
+ *   - count: number of open offers for the tech (full list length, NOT the
+ *            previewed slice) — drives the "New Requests" tile badge. On the
+ *            legacy path this mirrors the old status-0 count.
+ */
+async function fetchNewRequests(efrId) {
+  // Primary gate is whether the offer-list function is wired in at all —
+  // `listOfferedForTech` is itself gated by jobOfferTableExists() inside
+  // job.service, so it returns nothing on deploys without the table. We
+  // ALSO consult jobOfferTableExists() here (when exported) to tell two
+  // empty cases apart: "table present, zero open offers" → render an empty
+  // section (correct truth); "table absent" → fall back to the legacy
+  // status-0 list. If the probe isn't exported, an empty offer result is
+  // treated as the legacy fallback signal, which is safe — the status-0
+  // list is empty too while jobs are offered (fk_easyfixter_id NULL).
+  if (typeof jobService.listOfferedForTech === 'function') {
+    try {
+      const offered = await jobService.listOfferedForTech(efrId);
+      const items = (offered && offered.items) || [];
+      if (items.length) {
+        return {
+          items: items.slice(0, NEW_REQUEST_LIMIT).map(toMobilePreview),
+          count: items.length,
+        };
+      }
+      // Empty offer set. Only short-circuit to an empty section when we can
+      // positively confirm the offer table exists (offer flow live, the
+      // tech simply has no open offers). Otherwise fall through to legacy.
+      const offerTableLive = typeof jobService.jobOfferTableExists === 'function'
+        ? await jobService.jobOfferTableExists().catch(() => false)
+        : false;
+      if (offerTableLive) return { items: [], count: 0 };
+    } catch (e) {
+      logger.warn({ err: e.message, efrId }, 'listOfferedForTech failed; falling back to status-0 list');
+      // fall through to legacy path
+    }
+  }
+
+  // Legacy fallback — offer table/function absent (or errored): preview the
+  // tech's status-0 jobs (owner-keyed) exactly as before. Count comes from
+  // the same query's `total` so the tile badge isn't capped by the preview.
+  const legacy = await jobService
+    .list({ easyfixerId: efrId, status: 0, limit: NEW_REQUEST_LIMIT })
+    .catch(() => ({ rows: [], total: 0 }));
+  return {
+    items: (legacy.rows || []).map(mapJobForMobile),
+    count: Number(legacy.total ?? (legacy.rows || []).length),
+  };
+}
+
+// Normalise a JobPreview from listOfferedForTech into the mobile preview
+// shape. The offer-pool list may already emit camelCase mobile previews
+// (a `jobId` present) — pass those through untouched; otherwise it's a raw
+// snake_case job row, so reshape it via mapJobForMobile. Keeps this file
+// correct regardless of which shape the offer-list producer returns.
+function toMobilePreview(p) {
+  if (p && p.jobId != null) return p;
+  return mapJobForMobile(p || {});
 }
 
 // ─── Job row shape for the mobile preview lists ──────────────────────

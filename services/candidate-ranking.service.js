@@ -201,10 +201,31 @@ function deepSkillStatus({ jobHasSkillReq, hasAnySkill, matchesJobSkill }) {
 
 // ─── Layer 1: SQL eligibility ────────────────────────────────────────
 /*
+ * Memoised existence probe for tbl_job_offer — the new EasyFix-owned table
+ * (migrations/2026-06-27-create-tbl-job-offer.sql) backing THE OFFER MODEL.
+ * Mirrors job.service.js's jobOfferTableExists() (kept local so this service
+ * doesn't depend on that helper being exported). When the table is absent the
+ * offer-history exclusion below is skipped entirely, so eligibility behaviour
+ * is byte-identical to the pre-offer-model pipeline on un-migrated deploys.
+ */
+let _hasJobOfferTable = null;
+async function jobOfferTableExists() {
+  if (_hasJobOfferTable !== null) return _hasJobOfferTable;
+  try {
+    await pool.query('SELECT 1 FROM tbl_job_offer LIMIT 1');
+    _hasJobOfferTable = true;
+  } catch {
+    _hasJobOfferTable = false;
+  }
+  return _hasJobOfferTable;
+}
+
+/*
  * Returns rows from tbl_easyfixer that pass active + verified + reject-history
- * + (optionally) deep-skill. The `applyDeepSkill` flag is the lever for the
- * "no-skill-match fallback": first call with true; if zero rows return,
- * caller re-invokes with false and tags the result.
+ * + already-offered (offer-pool model) + (optionally) deep-skill. The
+ * `applyDeepSkill` flag is the lever for the "no-skill-match fallback": first
+ * call with true; if zero rows return, caller re-invokes with false and tags
+ * the result.
  */
 async function l1Eligibility(job, { applyDeepSkill = true, zoneIds = null, excludeEfrIds = null } = {}) {
   /*
@@ -280,6 +301,22 @@ async function l1Eligibility(job, { applyDeepSkill = true, zoneIds = null, exclu
              AND sh.reschedule_reason <> ''
         )`);
   params.push(job.job_id);
+
+  // ── Already OFFERED this job (offer-pool model) ──
+  // In THE OFFER MODEL a job is offered to MANY technicians at once; each open
+  // offer is a tbl_job_offer row with offer_status = 0 (OFFERED). Suppress any
+  // tech who currently holds an open offer for THIS job so the Top-10 / search
+  // candidate list never re-surfaces someone already offered. Gated by the
+  // memoised existence probe — when tbl_job_offer is absent this clause is
+  // omitted and eligibility is identical to the pre-offer-model behaviour.
+  if (await jobOfferTableExists()) {
+    where.push(`e.efr_id NOT IN (
+          SELECT jo.fk_easyfixter_id FROM tbl_job_offer jo
+           WHERE jo.job_id = ?
+             AND jo.offer_status = 0
+        )`);
+    params.push(job.job_id);
+  }
 
   // Column note: balance lives on tbl_easyfixer.current_balance (legacy
   // schema; same column the Finance dashboard reads).

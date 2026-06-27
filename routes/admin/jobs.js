@@ -6,7 +6,7 @@ const candidateRanking = require('../../services/candidate-ranking.service');
 const jobLocation = require('../../services/job-location.service');
 const { modernOk, modernError } = require('../../utils/response');
 const {
-  listQuery, createBody, updateBody, statusBody, assignBody, ownerBody, idParam,
+  listQuery, createBody, updateBody, statusBody, assignBody, offerBody, ownerBody, idParam,
   candidatesQuery, candidatesSearchQuery,
 } = require('../../validators/job.validator');
 const { assertEntityInScope } = require('../../lib/scope');
@@ -1159,6 +1159,56 @@ router.patch('/:id/assign', validate(idParam, 'params'), validate(assignBody), s
     const updated = await job.assign(req.params.id, req.body, req.user);
     modernOk(res, updated, 'technician assigned');
   } catch (e) { next(e); }
+});
+
+/*
+ * POST /api/admin/jobs/:id/offer
+ *
+ * Offer-pool model: fans a single job out to MULTIPLE technicians at once.
+ * Unlike /:id/assign (legacy single direct-assign, kept unchanged above), the
+ * job stays BOOKED (job_status=0, fk_easyfixter_id NULL — no single owner)
+ * while each offered tech gets a tbl_job_offer row (OFFERED) + an FCM push.
+ * First tech to ACCEPT wins the job (race-safe in the service). All
+ * offer-aware behaviour is gated by jobOfferTableExists() inside the service.
+ *
+ * The optional schedule edit (requestedDateTime + timeSlot) rides along with
+ * the offer exactly as it does on /assign — passed through only when present.
+ *
+ * Literal-segment route under `/:id/`; its distinct second segment ("offer")
+ * keeps it from colliding with the bare `/:id` wildcard.
+ */
+router.post('/:id/offer', validate(idParam, 'params'), validate(offerBody), scopedJob, async (req, res, next) => {
+  try {
+    const { easyfixerIds, requestedDateTime, timeSlot } = req.body;
+    const opts = {};
+    if (requestedDateTime !== undefined) opts.requestedDateTime = requestedDateTime;
+    if (timeSlot !== undefined) opts.timeSlot = timeSlot;
+    const result = await job.offerToTechnicians(Number(req.params.id), easyfixerIds, req.user, opts);
+    modernOk(res, result, 'job offered to technicians');
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
+/*
+ * GET /api/admin/jobs/:id/offers
+ *
+ * Lists the technicians a job has been offered to (the "Offered to Tx" panel
+ * on My Orders). Each item: { efr_id, efr_name, offered_at }. Returns an empty
+ * list when the offer table is absent (service falls back to legacy behaviour).
+ *
+ * Literal-segment route under `/:id/` — second segment "offers" disambiguates
+ * it from `/:id` and from the sibling POST `/:id/offer`.
+ */
+router.get('/:id/offers', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
+  try {
+    const items = await job.listOffers(Number(req.params.id));
+    modernOk(res, { items });
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
 });
 
 router.patch('/:id/owner', validate(idParam, 'params'), validate(ownerBody), scopedJob, async (req, res, next) => {
