@@ -113,13 +113,19 @@ async function serviceCategories({ includeInactive = false } = {}) {
   return rows;
 }
 
-async function serviceTypes({ categoryId, includeInactive = false } = {}) {
+async function serviceTypes({ categoryId, includeInactive = false, display } = {}) {
   const clauses = [];
   const params = [];
   if (!includeInactive) clauses.push('service_type_status = 1');
   if (categoryId != null) { clauses.push('service_catg_id = ?'); params.push(categoryId); }
+  // OPT-IN display filter. tbl_service_type.display: 1=All, 0=CRM-only, 2=Tx-app.
+  // Deep-skill pickers pass display=2 so only Tx-app/deep-skill types surface
+  // (matches mobile-deepskill.service.js getHierarchy). Omitted ⇒ ALL display
+  // types returned — required by rate cards, client tabs, and the external
+  // Decathlon /v1 integration (NO-CLIENT-CHANGE rule), so NEVER hard-code it.
+  if (display != null) { clauses.push('display = ?'); params.push(display); }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
-  logger.info(`Lookup service types · categoryId=${categoryId ?? '—'} · includeInactive=${includeInactive}`);
+  logger.info(`Lookup service types · categoryId=${categoryId ?? '—'} · includeInactive=${includeInactive} · display=${display ?? '—'}`);
   const [rows] = await pool.query(
     `SELECT service_type_id, service_type_name, service_type_desc,
             service_type_status, service_catg_id, display

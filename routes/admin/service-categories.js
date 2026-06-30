@@ -16,6 +16,12 @@ const logger = require('../../logger');
  * and routes/admin/service-types.js.
  */
 const { invalidateCatalogCaches } = require('../../services/easyfixer-profile-update-link.service');
+// Short-TTL lookup cache (utils/ttl-cache.js) backs /shared/lookup/service-categories
+// under keys lookup:service-categories:inc=*. invalidateCatalogCaches() above only
+// drops the deep-skill tree cache, NOT these — so a category deactivation/rename
+// would keep serving the old list. Drop the whole family on every mutation.
+const { clearPrefix } = require('../../utils/ttl-cache');
+const SERVICE_CATG_LOOKUP_PREFIX = 'lookup:service-categories:';
 
 const idParam = Joi.object({ id: Joi.number().integer().positive().required() });
 
@@ -67,6 +73,7 @@ router.post('/', roleByName(['Admin']), validate(createBody), async (req, res, n
     logger.info('Create service category · name=' + req.body.service_catg_name);
     const created = await svc.createCategory(req.body);
     invalidateCatalogCaches();
+    clearPrefix(SERVICE_CATG_LOOKUP_PREFIX);
     logger.info('Service category created · id=' + (created && created.service_catg_id));
     res.status(201); modernOk(res, created, 'Service Category added');
   } catch (e) { if (e.status) { logger.warn('Create service category rejected · status=' + e.status + ' · ' + e.message); return modernError(res, e.status, e.message); } logger.error('Create service category failed · ' + e.message); next(e); }
@@ -81,6 +88,7 @@ router.patch('/:id', roleByName(['Admin']), validate(idParam, 'params'), validat
       return modernError(res, 404, 'Service Category not found');
     }
     invalidateCatalogCaches();
+    clearPrefix(SERVICE_CATG_LOOKUP_PREFIX);
     logger.info('Service category updated · id=' + req.params.id);
     modernOk(res, updated, 'Service Category updated');
   } catch (e) { if (e.status) { logger.warn('Update service category rejected · id=' + req.params.id + ' · status=' + e.status + ' · ' + e.message); return modernError(res, e.status, e.message); } logger.error('Update service category failed · id=' + req.params.id + ' · ' + e.message); next(e); }
@@ -98,6 +106,7 @@ router.delete('/:id', roleByName(['Admin']), validate(idParam, 'params'), async 
       return modernError(res, 404, 'Service Category not found');
     }
     invalidateCatalogCaches();
+    clearPrefix(SERVICE_CATG_LOOKUP_PREFIX);
     logger.info('Service category deleted · id=' + req.params.id);
     modernOk(res, { deleted: true });
   } catch (e) { if (e.status) { logger.warn('Delete service category rejected · id=' + req.params.id + ' · status=' + e.status + ' · ' + e.message); return modernError(res, e.status, e.message); } logger.error('Delete service category failed · id=' + req.params.id + ' · ' + e.message); next(e); }

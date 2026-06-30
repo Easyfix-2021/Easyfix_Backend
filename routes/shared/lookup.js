@@ -78,8 +78,9 @@ router.get('/service-types',      validate(serviceTypesQuery, 'query'),    async
   try {
     const inc = req.query.includeInactive ? 1 : 0;
     const cat = req.query.categoryId != null ? req.query.categoryId : '';
-    logger.info('Lookup service-types · categoryId=' + cat + ' includeInactive=' + inc);
-    modernOk(res, await cached(`lookup:service-types:cat=${cat}:inc=${inc}`, TTL_STATIC, () => lookup.serviceTypes(req.query)));
+    const disp = req.query.display != null ? req.query.display : '';
+    logger.info('Lookup service-types · categoryId=' + cat + ' includeInactive=' + inc + ' display=' + disp);
+    modernOk(res, await cached(`lookup:service-types:cat=${cat}:inc=${inc}:disp=${disp}`, TTL_STATIC, () => lookup.serviceTypes(req.query)));
   } catch (e) { next(e); }
 });
 

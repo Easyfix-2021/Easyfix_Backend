@@ -16,6 +16,8 @@ const citiesQuery = Joi.object({
 const serviceTypesQuery = Joi.object({
   categoryId: intId.optional(),
   includeInactive: Joi.boolean().default(false),
+  // 1=All, 0=CRM-only, 2=Tx-app. Deep-skill pickers pass display=2.
+  display: Joi.number().integer().valid(0, 1, 2).optional(),
 });
 
 const clientsQuery = Joi.object({

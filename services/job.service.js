@@ -3353,6 +3353,67 @@ async function notifyAutoAssignFailure(jobId, clientId, reason) {
   }
 }
 
+/*
+ * Customer "Unreachable" SMS — direct port of legacy EasyFix_CRM
+ * JobAction.sendSmsToNotReachableCustomer(). Fired when an operator marks a job
+ * Unreachable from the Confirm modal (CRM POST /admin/jobs/:id/notify-unreachable).
+ *
+ * Parity with the legacy:
+ *   - body comes from the DLT row tbl_sms_transational_meta
+ *     (job_stage='customerNotReachable', client_id=1) — read via the shared
+ *     sms-template service so the 5-min cache + per-client fallback are reused;
+ *   - the legacy placeholders {#client#} / {#vertical#} / {#var#} are substituted
+ *     (client name / vertical-or-"Order Id-<id>" / the wame.pro helpdesk link);
+ *   - the customer mobile is tbl_customer.customer_mob_no via tbl_job.fk_customer_id;
+ *   - sent through services/sms.service.js (sender id env SMS_SENDER_ID='EsyFix',
+ *     SMSCountry), which already honours NOTIFICATIONS_DISABLE / TEST_MOBILE.
+ *
+ * Differences from legacy, by design: we do NOT replicate the obscure
+ * `clientSetting == null` send-gate (it suppressed the SMS for every client that
+ * had a settings row, which is counter-intuitive) — every Unreachable submit
+ * notifies. The inline fallback below is a dev/safety net; in prod the carrier
+ * delivers ONLY the DLT-registered template body. Caller treats this as
+ * fire-and-forget / non-fatal — a provider failure must not fail the outcome.
+ */
+const UNREACHABLE_HELPDESK_LINK = 'https://wame.pro/helpdesk';
+async function notifyCustomerNotReachable(jobId) {
+  const smsService  = require('./sms.service');
+  const smsTemplate = require('./sms-template.service');
+  const [rows] = await pool.query(
+    `SELECT j.job_id, cu.customer_mob_no, cl.client_name
+       FROM tbl_job j
+       LEFT JOIN tbl_customer cu ON cu.customer_id = j.fk_customer_id
+       LEFT JOIN tbl_client   cl ON cl.client_id   = j.fk_client_id
+      WHERE j.job_id = ?`,
+    [jobId],
+  );
+  const job = rows && rows[0];
+  if (!job) { logger.warn('Unreachable SMS skipped · job not found · jobId=' + jobId); return { sent: false, reason: 'job_not_found' }; }
+  if (!job.customer_mob_no) { logger.warn('Unreachable SMS skipped · no customer mobile · jobId=' + jobId); return { sent: false, reason: 'no_mobile' }; }
+
+  const clientName = job.client_name || 'EasyFix';
+  const verticalName = 'Order Id- ' + jobId; // legacy fallback when no vertical
+
+  let message = null;
+  try {
+    const tpl = await smsTemplate.getTemplate('customerNotReachable', { clientId: 1 });
+    if (tpl) {
+      message = String(tpl)
+        .replace(/\{#client#\}/g, clientName)
+        .replace(/\{#vertical#\}/g, verticalName)
+        .replace(/\{#var#\}/g, UNREACHABLE_HELPDESK_LINK);
+    }
+  } catch (e) { logger.warn('Unreachable SMS · template load failed · ' + e.message); }
+  if (!message) {
+    message = 'Dear Customer, You are not REACHABLE. On behalf of ' + clientName
+      + ' service of "Easyfix". Connect with us on this link - ' + UNREACHABLE_HELPDESK_LINK + '. Team EasyFix';
+  }
+
+  const result = await smsService.send({ to: job.customer_mob_no, message });
+  logger.info('Unreachable SMS · jobId=' + jobId + ' delivered=' + !!(result && result.delivered));
+  return { sent: !!(result && result.delivered), provider: result };
+}
+
 module.exports = {
   STATUS, ALL_STATUS_VALUES, MUTABLE_COLUMNS,
   // Cross-service helper — used by job-magic-link.service.js to keep the
@@ -3367,4 +3428,5 @@ module.exports = {
   tryAutoAssignOnCreate,
   fireWebhook, statusToEventName,
   hasClientVerticalIdColumn,
+  notifyCustomerNotReachable,
 };

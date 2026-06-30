@@ -581,11 +581,15 @@ async function buildDeepSkillCatalog(pool) {
       ORDER BY service_catg_name ASC`,
   );
   const [serviceTypes] = await pool.query(
+    // display = 2 ⇒ only Tx-app / deep-skill service types (matches the tech app's
+    // mobile-deepskill.service.js getHierarchy and the CRM deep-skill picker), so
+    // CRM-only booking types like "Amazon" (display=0) never appear in the
+    // technician self-service magic-link tree.
     `SELECT service_type_id,
             service_catg_id   AS category_id,
             service_type_name
        FROM tbl_service_type
-      WHERE service_type_status = 1
+      WHERE service_type_status = 1 AND display = 2
       ORDER BY service_type_name ASC`,
   );
   const [deepSkills] = await pool.query(

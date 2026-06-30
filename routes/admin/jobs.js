@@ -1987,6 +1987,19 @@ router.post('/:id/comments',
   }
 );
 
+// Customer "Unreachable" SMS — legacy parity with EasyFix_CRM
+// sendSmsToNotReachableCustomer. Fired by the Confirm modal's "Unreachable"
+// submit (after the status + comment writes). scopedJob ensures the job is in
+// the caller's scope. Non-fatal on the FE: a provider failure must not fail the
+// operator's outcome, so the FE wraps this call in try/catch.
+router.post('/:id/notify-unreachable', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
+  try {
+    logger.info('Notify customer unreachable · jobId=' + req.params.id);
+    const result = await job.notifyCustomerNotReachable(req.params.id);
+    modernOk(res, result, result.sent ? 'Customer notified' : 'SMS not sent');
+  } catch (e) { logger.error('Notify unreachable failed · jobId=' + req.params.id + ' · ' + e.message); next(e); }
+});
+
 // ─── Job Feedback sub-resource (legacy tbl_customer_feedback) ─────────
 const jobFeedback = require('../../services/job-feedback.service');
 // VERIFIED against tbl_customer_feedback (see services/job-feedback.service.js).
