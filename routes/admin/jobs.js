@@ -100,8 +100,14 @@ router.get('/:id/candidates',
         enforceMaxConcurrent: false,
         enforceCodBalance: true,
       });
-      logger.info('Returning ' + (result?.candidates?.length || 0) + ' ranked candidates · jobId=' + req.params.id + (result?.note ? ' note=' + result.note : ''));
-      modernOk(res, result);
+      // Tell the CRM modal which commit mode to render: offer-pool (multi-select
+      // + "Offer to N") when the offer flow is effectively active, else single
+      // direct-assign ("Assign"). Mirrors the BE's own assign-vs-offer gate so
+      // the UI never lies about what the commit will do. The candidate LIST is
+      // unchanged — this only flags the commit mode.
+      const offerFlowEnabled = await job.isOfferFlowActive();
+      logger.info('Returning ' + (result?.candidates?.length || 0) + ' ranked candidates · jobId=' + req.params.id + ' offerFlow=' + offerFlowEnabled + (result?.note ? ' note=' + result.note : ''));
+      modernOk(res, { ...result, offerFlowEnabled });
     } catch (e) {
       if (e.status) return modernError(res, e.status, e.message);
       next(e);

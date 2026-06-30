@@ -21,6 +21,19 @@ function offerFlowEnabled() {
 }
 
 /*
+ * EFFECTIVE offer-flow state = the property flag AND tbl_job_offer actually
+ * existing (the real activation gate). This is the SAME condition assign() /
+ * offerToTechnicians() use to choose offer-vs-direct-assign, exposed so the CRM
+ * Schedule & Assign modal can MIRROR it: offer-pool (multi-select + "Offer to N")
+ * when active, single direct-assign (single-select + "Assign") when not. Async
+ * because the table-existence check is. jobOfferTableExists() is a hoisted
+ * function declaration (defined below), so referencing it here is safe.
+ */
+async function isOfferFlowActive() {
+  return offerFlowEnabled() && (await jobOfferTableExists());
+}
+
+/*
  * Job CRUD + status + assignment.
  *
  * Schema notes (tbl_job, 141 cols, ~384k rows as of 2026-04-17):
@@ -3314,6 +3327,7 @@ module.exports = {
   // THE OFFER MODEL (pool offers): offer one job to many techs, list a job's
   // open offers, and list a tech's open offers.
   offerToTechnicians, listOffers, listOfferedForTech, techHasOpenOffer, rejectOffer,
+  isOfferFlowActive,
   tryAutoAssignOnCreate,
   fireWebhook, statusToEventName,
   hasClientVerticalIdColumn,
