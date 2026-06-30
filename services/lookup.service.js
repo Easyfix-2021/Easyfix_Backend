@@ -15,6 +15,28 @@ const { getProperty } = require('./properties.service');
  * pass includeInactive=true for admin tooling that needs the full list.
  */
 
+/*
+ * ── Local query helpers (parameterised) ─────────────────────────────
+ * toIdArray  — normalise an optional id filter (Joi .single() may hand us
+ *              a scalar OR an array) to a clean positive-integer array.
+ * inFilter   — build a safe ` AND col IN (?,?)` fragment, pushing each
+ *              value onto `params`; returns '' for an empty list so the
+ *              clause simply vanishes (unset filter = no restriction).
+ * Same contract as services/quicksight/_shared.js::buildInFilter, kept
+ * local so this generic lookup layer needn't depend on report code. `col`
+ * is ALWAYS a trusted identifier from this file — never user input.
+ */
+function toIdArray(v) {
+  if (v == null) return [];
+  const arr = Array.isArray(v) ? v : [v];
+  return arr.map(Number).filter((n) => Number.isInteger(n) && n > 0);
+}
+function inFilter(col, values, params) {
+  if (!Array.isArray(values) || values.length === 0) return '';
+  for (const v of values) params.push(v);
+  return ` AND ${col} IN (${values.map(() => '?').join(',')})`;
+}
+
 // ─── Cities / States ─────────────────────────────────────────────────
 async function cities({ stateId, q, limit = 500, includeInactive = false } = {}) {
   const clauses = [];
@@ -216,21 +238,54 @@ async function users({ q, roleGroup, limit = 100, offset = 0, includeInactive = 
 
 // ─── Zonal Managers (admin-scoped) ──────────────────────────────────
 /*
- * Zonal Managers picker — drives the Manage Easyfixers "User Mapped To City"
- * filter. A zonal manager is a tbl_user row that's referenced by at least
- * one tbl_city.state_user (i.e. mapped as the zonal owner of some city).
- * Active users only.
+ * Zonal Managers picker. A zonal manager is a tbl_user row referenced by at
+ * least one tbl_city.state_user (the zonal owner of some city). Active users
+ * only. TWO modes:
+ *
+ *  • UNSCOPED (no clientId/verticalId) → every zonal manager platform-wide.
+ *    Back-compat path for the Manage Easyfixers "User Mapped To City" filter,
+ *    which calls this with no args.
+ *
+ *  • SCOPED (clientId and/or verticalId) → only zonal owners of cities that
+ *    actually back jobs for the selected client(s)/vertical(s). Drives the
+ *    QuickSight Open Orders / City Performance / Client Performance "Zonal
+ *    Managers" dropdowns so the picker narrows to owners present in the report
+ *    once a client/vertical is chosen. Mirrors those reports' own row-scoping
+ *    chain exactly: job → address → city.state_user, and client → vertical.
  */
-async function zonalManagers() {
-  logger.info('Lookup zonal managers');
+async function zonalManagers({ clientId, verticalId } = {}) {
+  const clients   = toIdArray(clientId);
+  const verticals = toIdArray(verticalId);
+
+  if (!clients.length && !verticals.length) {
+    logger.info('Lookup zonal managers · global');
+    const [rows] = await pool.query(`
+      SELECT DISTINCT u.user_id, u.user_name
+        FROM tbl_user u
+        JOIN tbl_city c ON c.state_user = u.user_id
+       WHERE u.user_status = 1
+       ORDER BY u.user_name ASC
+    `);
+    logger.info(`Found ${rows.length} zonal managers`);
+    return rows;
+  }
+
+  const params = [];
+  let where = 'WHERE u.user_status = 1';
+  where += inFilter('j.fk_client_id', clients, params);
+  where += inFilter('c.vertical_id', verticals, params);
+  logger.info(`Lookup zonal managers · scoped · clients=${clients.length} verticals=${verticals.length}`);
   const [rows] = await pool.query(`
     SELECT DISTINCT u.user_id, u.user_name
-      FROM tbl_user u
-      JOIN tbl_city c ON c.state_user = u.user_id
-     WHERE u.user_status = 1
-     ORDER BY u.user_name ASC
-  `);
-  logger.info(`Found ${rows.length} zonal managers`);
+      FROM tbl_job j
+      JOIN tbl_address a ON a.address_id = j.fk_address_id
+      JOIN tbl_city cy ON cy.city_id = a.city_id
+      JOIN tbl_user u ON u.user_id = cy.state_user
+      LEFT JOIN tbl_client c ON c.client_id = j.fk_client_id
+    ${where}
+    ORDER BY u.user_name ASC
+  `, params);
+  logger.info(`Found ${rows.length} zonal managers (scoped)`);
   return rows;
 }
 
@@ -246,8 +301,10 @@ async function zonalManagers() {
  * NOTE: tbl_vertical_mapping.user_type is DISTINCT from tbl_user.user_type_id
  * — do not conflate. When `userType` is omitted, both 1 and 2 are returned.
  */
-async function projectManagers({ userType } = {}) {
-  logger.info(`Lookup project managers · userType=${userType ?? '—'}`);
+async function projectManagers({ userType, clientId, verticalId } = {}) {
+  const clients   = toIdArray(clientId);
+  const verticals = toIdArray(verticalId);
+  logger.info(`Lookup project managers · userType=${userType ?? '—'} · clients=${clients.length} verticals=${verticals.length}`);
   const clauses = ['u.user_status = 1'];
   const params = [];
   if (userType != null) {
@@ -256,11 +313,17 @@ async function projectManagers({ userType } = {}) {
   } else {
     clauses.push('vm.user_type IN (1, 2)');
   }
+  // SCOPED: narrow the SPOC picker to the selected client(s)/vertical(s) using
+  // the mapping's own keys (tbl_vertical_mapping carries client_id + vertical_id).
+  // Empty list ⇒ no clause ⇒ unchanged global behaviour (back-compat).
+  let where = `WHERE ${clauses.join(' AND ')}`;
+  where += inFilter('vm.client_id', clients, params);
+  where += inFilter('vm.vertical_id', verticals, params);
   const [rows] = await pool.query(
     `SELECT DISTINCT u.user_id, u.user_name
        FROM tbl_vertical_mapping vm
        JOIN tbl_user u ON u.user_id = vm.user_id
-      WHERE ${clauses.join(' AND ')}
+      ${where}
       ORDER BY u.user_name ASC`,
     params
   );

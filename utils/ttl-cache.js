@@ -70,4 +70,18 @@ function clear(key) {
   else store.delete(key);
 }
 
-module.exports = { cached, clear };
+/**
+ * Evict every key that starts with `prefix`. Use to drop a whole FAMILY of
+ * cached lookups at once — e.g. all `lookup:service-types:*` entries (which
+ * vary by category + includeInactive) when a service type is created/edited/
+ * deactivated, so the dropdowns reading that lookup don't serve a stale type.
+ * @param {string} prefix
+ */
+function clearPrefix(prefix) {
+  if (!prefix) return;
+  for (const k of store.keys()) {
+    if (typeof k === 'string' && k.startsWith(prefix)) store.delete(k);
+  }
+}
+
+module.exports = { cached, clear, clearPrefix };

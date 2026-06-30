@@ -13,6 +13,13 @@ const logger = require('../../logger');
  * change the tree's display so the cache must drop.
  */
 const { invalidateCatalogCaches } = require('../../services/easyfixer-profile-update-link.service');
+// Short-TTL lookup cache (utils/ttl-cache.js) backs /shared/lookup/service-types,
+// which feeds the active-only Service Type dropdowns (e.g. Manage Deep Skills).
+// Those keys (lookup:service-types:cat=*:inc=*) are NOT touched by the catalog
+// cache above, so a deactivation would keep serving the old type until TTL.
+// Drop the whole family on every type mutation so the dropdown reflects it now.
+const { clearPrefix } = require('../../utils/ttl-cache');
+const SERVICE_TYPE_LOOKUP_PREFIX = 'lookup:service-types:';
 
 const idParam = Joi.object({ id: Joi.number().integer().positive().required() });
 
@@ -71,6 +78,7 @@ router.post('/', roleByName(['Admin']), validate(createBody), async (req, res, n
     logger.info('Create service type · name=' + req.body.service_type_name + ' categoryId=' + req.body.service_catg_id);
     const created = await svc.createType(req.body);
     invalidateCatalogCaches();
+    clearPrefix(SERVICE_TYPE_LOOKUP_PREFIX);
     logger.info('Service type created · id=' + (created && created.service_type_id));
     res.status(201); modernOk(res, created, 'Service Type added');
   }
@@ -85,6 +93,7 @@ router.patch('/:id', roleByName(['Admin']), validate(idParam, 'params'), validat
       return modernError(res, 404, 'Service Type not found');
     }
     invalidateCatalogCaches();
+    clearPrefix(SERVICE_TYPE_LOOKUP_PREFIX);
     logger.info('Service type updated · id=' + req.params.id);
     modernOk(res, updated, 'Service Type updated');
   } catch (e) { if (e.status) { logger.warn('Update service type rejected · id=' + req.params.id + ' · status=' + e.status + ' · ' + e.message); return modernError(res, e.status, e.message); } logger.error('Update service type failed · id=' + req.params.id + ' · ' + e.message); next(e); }
@@ -98,6 +107,7 @@ router.delete('/:id', roleByName(['Admin']), validate(idParam, 'params'), async 
       return modernError(res, 404, 'Service Type not found');
     }
     invalidateCatalogCaches();
+    clearPrefix(SERVICE_TYPE_LOOKUP_PREFIX);
     logger.info('Service type deleted · id=' + req.params.id);
     modernOk(res, { deleted: true });
   } catch (e) { if (e.status) { logger.warn('Delete service type rejected · id=' + req.params.id + ' · status=' + e.status + ' · ' + e.message); return modernError(res, e.status, e.message); } logger.error('Delete service type failed · id=' + req.params.id + ' · ' + e.message); next(e); }

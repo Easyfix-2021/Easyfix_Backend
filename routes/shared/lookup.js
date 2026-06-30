@@ -11,7 +11,7 @@ const { pool } = require('../../db');
 const { buildRequestScopeWithHierarchy } = require('../../lib/scope');
 const {
   citiesQuery, serviceTypesQuery, clientsQuery, clientServicesQuery,
-  usersQuery, banksQuery, simpleIncludeInactive, projectManagersQuery,
+  usersQuery, banksQuery, simpleIncludeInactive, projectManagersQuery, zonalManagersQuery,
 } = require('../../validators/lookup.validator');
 
 /*
@@ -172,9 +172,11 @@ router.get('/users',            role(['admin']), validate(usersQuery, 'query'), 
 
 // Zonal Managers picker — admin-only. Returns the distinct set of users
 // referenced as tbl_city.state_user (i.e. owners of at least one city).
-// Drives the Manage Easyfixers "User Mapped To City" filter.
-router.get('/zonal-managers',   role(['admin']),                                         async (_req, res, next) => {
-  try { logger.info('Lookup zonal-managers'); modernOk(res, await lookup.zonalManagers()); } catch (e) { next(e); }
+// Drives the Manage Easyfixers "User Mapped To City" filter. Optional
+// ?clientId=&verticalId= scope the list to owners of cities backing jobs for
+// the selected client(s)/vertical(s) — used by the QuickSight report filters.
+router.get('/zonal-managers',   role(['admin']), validate(zonalManagersQuery, 'query'),  async (req, res, next) => {
+  try { logger.info('Lookup zonal-managers'); modernOk(res, await lookup.zonalManagers(req.query)); } catch (e) { next(e); }
 });
 
 // Project Managers picker — admin-only. Returns DISTINCT internal users
