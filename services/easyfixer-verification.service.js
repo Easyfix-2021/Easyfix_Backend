@@ -796,6 +796,31 @@ async function unmapDeepSkill(efrId, rowId) {
   return { unmapped: true };
 }
 
+// Legacy audit-column discovery for tbl_efr_deepskill_mapping. The table
+// predates the Node migrations and isn't created here, so its audit-column
+// NAMES aren't known statically — and the live DB can be unreachable at probe
+// time. We SHOW COLUMNS once (cached) and pick the first matching candidate for
+// the "inserted date" + "inserted by" columns across the conventions this
+// codebase uses elsewhere (insert_date / inserted_by on tbl_easyfixer,
+// tbl_client, tbl_customer …). A missing probe / absent column → null → that
+// column is simply omitted from the write (graceful degrade, never a crash).
+let _deepskillMappingAudit = null;
+async function deepskillMappingAuditCols() {
+  if (_deepskillMappingAudit !== null) return _deepskillMappingAudit;
+  let names = new Set();
+  try {
+    const [cols] = await pool.query('SHOW COLUMNS FROM tbl_efr_deepskill_mapping');
+    names = new Set(cols.map((c) => c.Field));
+  } catch (_e) { /* DB unreachable / table absent → no audit stamping */ }
+  const pick = (cands) => cands.find((c) => names.has(c)) || null;
+  _deepskillMappingAudit = {
+    dateCol: pick(['insert_date', 'inserted_on', 'created_date', 'created_on', 'created_at']),
+    byCol:   pick(['inserted_by', 'insert_by', 'created_by']),
+  };
+  logger.info('tbl_efr_deepskill_mapping audit cols · date=' + (_deepskillMappingAudit.dateCol || '-') + ' · by=' + (_deepskillMappingAudit.byCol || '-'));
+  return _deepskillMappingAudit;
+}
+
 async function replaceOptionMappings(efrId, items, actor, externalConn = null) {
   const list = Array.isArray(items) ? items : [];
   logger.info('Replace deep-skill option mappings · efrId=' + efrId + ' · items=' + list.length);
@@ -803,6 +828,11 @@ async function replaceOptionMappings(efrId, items, actor, externalConn = null) {
   // enroll in the caller's transaction and leave begin/commit/release to them.
   const conn = externalConn || await pool.getConnection();
   const ownTxn = !externalConn;
+  // Audit stamping: WHO + WHEN. CRM passes a staff `actor` (its user_id); the
+  // PUBLIC profile-update form has no logged-in user (actor=null), so the
+  // easyfixer self-acts → stamp their efr_id. Columns discovered defensively.
+  const byId = actor?.user_id || efrId;
+  const audit = await deepskillMappingAuditCols();
   try {
     if (ownTxn) await conn.beginTransaction();
 
@@ -824,35 +854,42 @@ async function replaceOptionMappings(efrId, items, actor, externalConn = null) {
       if (![categoryId, serviceTypeId, deepSkillId, optionId].every((n) => Number.isInteger(n) && n > 0)) {
         continue;
       }
+      // Reactivate a soft-deleted identical row. Also REFRESH the audit stamp
+      // (date=NOW, by=actor) so a re-saved mapping carries the current values
+      // instead of a stale/NULL one — this is why existing rows showed NULL.
+      // parent_skill_id holds deep_skill_id; deep_skill_id holds option_id (inversion).
+      const reSets = ['is_repairing = 1'];
+      const reParams = [];
+      if (audit.dateCol) reSets.push('`' + audit.dateCol + '` = NOW()');
+      if (audit.byCol)   { reSets.push('`' + audit.byCol + '` = ?'); reParams.push(byId); }
       const [r] = await conn.query(
         `UPDATE tbl_efr_deepskill_mapping
-            SET is_repairing = 1
+            SET ${reSets.join(', ')}
           WHERE easyfixer_id    = ?
             AND category_id     = ?
             AND service_type_id = ?
-            AND parent_skill_id = ?    -- holds deep_skill_id (inversion, see docblock)
-            AND deep_skill_id   = ?`,  /* holds option_id (inversion, see docblock) */
-        [efrId, categoryId, serviceTypeId, deepSkillId, optionId]
+            AND parent_skill_id = ?
+            AND deep_skill_id   = ?`,
+        [...reParams, efrId, categoryId, serviceTypeId, deepSkillId, optionId]
       );
       if (r.affectedRows === 0) {
+        // INSERT new mapping, stamping the discovered audit columns when present.
+        const insCols = ['easyfixer_id', 'category_id', 'service_type_id', 'parent_skill_id', 'deep_skill_id', 'is_repairing'];
+        const insVals = ['?', '?', '?', '?', '?', '1'];
+        const insParams = [efrId, categoryId, serviceTypeId, deepSkillId, optionId];
+        if (audit.dateCol) { insCols.push('`' + audit.dateCol + '`'); insVals.push('NOW()'); }
+        if (audit.byCol)   { insCols.push('`' + audit.byCol + '`'); insVals.push('?'); insParams.push(byId); }
         await conn.query(
-          `INSERT INTO tbl_efr_deepskill_mapping
-             (easyfixer_id, category_id, service_type_id,
-              parent_skill_id, -- physical column name; holds deep_skill_id
-              deep_skill_id,   -- physical column name; holds option_id
-              is_repairing)
-           VALUES (?, ?, ?, ?, ?, 1)`,
-          [efrId, categoryId, serviceTypeId, deepSkillId, optionId]
+          // parent_skill_id holds deep_skill_id; deep_skill_id holds option_id (inversion).
+          `INSERT INTO tbl_efr_deepskill_mapping (${insCols.join(', ')}) VALUES (${insVals.join(', ')})`,
+          insParams
         );
       }
       updated += 1;
     }
 
     if (ownTxn) await conn.commit();
-    // actor is accepted for future audit columns; today the table has no
-    // updated_by / updated_on columns so we just log the actor for trail.
-    void actor;
-    logger.info('Deep-skill option mappings replaced · efrId=' + efrId + ' · updated=' + updated);
+    logger.info('Deep-skill option mappings replaced · efrId=' + efrId + ' · updated=' + updated + ' · by=' + byId);
     return { updated };
   } catch (e) {
     if (ownTxn) { try { await conn.rollback(); } catch (_) { /* swallow rollback failure */ } }
@@ -914,7 +951,12 @@ async function replaceServiceablePincodes(efrId, pincodeIds, actor, externalConn
     ? Array.from(new Set(pincodeIds.map(Number).filter((n) => Number.isInteger(n) && n > 0)))
     : [];
   logger.info('Replace serviceable pincodes · efrId=' + efrId + ' · requested=' + list.length);
-  const userId = actor?.user_id || null;
+  // created_by / updated_by: the CRM path passes a staff `actor` (its user_id);
+  // the PUBLIC profile-update form has no logged-in user (actor=null), so the
+  // easyfixer is acting on their own behalf — stamp their efr_id. (created_by/
+  // updated_by are plain INT NULL with no FK, so an efr_id is safe here; the
+  // created_date/updated_date columns auto-populate via DB defaults.)
+  const userId = actor?.user_id || efrId;
   // Single-statement upsert — no begin/commit here. When an external
   // connection is injected we run on it so the write joins the caller's txn.
   const db = externalConn || pool;

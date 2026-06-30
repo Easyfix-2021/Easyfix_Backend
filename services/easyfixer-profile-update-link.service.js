@@ -40,6 +40,19 @@ const verification    = require('./easyfixer-verification.service');
 const deepSkillService = require('./deep-skill.service');
 const s3Storage        = require('../utils/s3-storage');
 const logger          = require('../logger');
+const { getProperty } = require('./properties.service');
+
+/*
+ * OTP kill-switch for the public profile-update SAVE. Default ON (codebase
+ * convention — only the literal string 'false' disables it, same as
+ * job.offer.flow.enabled). Migration 2026-06-30 seeds the property to 'false'
+ * to disable OTP for this form per product. Exported so the route gates
+ * verifyOtp on it AND fetchPrefill surfaces it to the FE as `otp_required`, so
+ * the BE gate and the FE OtpGate render from ONE source of truth.
+ */
+function profileOtpRequired() {
+  return String(getProperty('profile_update.otp.enabled') ?? 'true').toLowerCase() !== 'false';
+}
 
 /**
  * Resolve an `efr_profile_img` S3 key to a short-TTL presigned GET URL.
@@ -335,6 +348,10 @@ async function fetchPrefill(efrId, pool) {
       ? serviceablePincodes
       : (serviceablePincodes?.items ?? []),
     deep_skill_catalog: deepSkillCatalog,
+    // Whether the FE must collect a WhatsApp OTP before saving. Mirrors the
+    // BE save gate (profile_update.otp.enabled) so the form renders the OtpGate
+    // only when the BE will actually require it.
+    otp_required: profileOtpRequired(),
   };
 }
 
@@ -484,12 +501,19 @@ function invalidateCatalogCaches() {
  *                                  query; defensive `category_id IS NOT NULL`
  *                                  filter keeps the union safe.
  *
- * Soft-delete filter is applied ONLY on `easyfixer_service_type`. The other
- * two tables don't carry an `is_deleted` column (verified by greps against
- * EasyFix_CRM DAOs), so adding the predicate would fail at runtime.
+ * NO is_deleted filter (2026-06-30): the reference query (the user's source of
+ * truth) unions all three tables WITHOUT filtering easyfixer_service_type's
+ * is_deleted, and expects every category the technician is associated with to
+ * appear. An earlier is_deleted=0 predicate here DROPPED categories whose only
+ * association is a soft-deleted easyfixer_service_type row (e.g. efr 1736's
+ * "Cycle & Fitness" category), so a tech could not map skills under a category
+ * they service. We now include them to match the reference query. (Trade-off:
+ * a soft-deleted service-type association still counts toward the tech's
+ * mappable categories — intended per the reference query; to instead hide a
+ * specific stale association, fix its row data rather than re-adding the filter.)
  *
  * Used to filter the (globally cached) deep-skill catalog tree to only the
- * categories this easyfixer is mapped to.
+ * categories this easyfixer is associated with.
  */
 async function fetchEasyfixerMappedCategoryIds(efrId, pool) {
   const [rows] = await pool.query(
@@ -497,7 +521,6 @@ async function fetchEasyfixerMappedCategoryIds(efrId, pool) {
        SELECT service_category_id AS category_id
          FROM easyfixer_service_type
         WHERE easyfixer_id = ?
-          AND (is_deleted IS NULL OR is_deleted = 0)
           AND service_category_id IS NOT NULL
        UNION
        SELECT category_id
@@ -1069,6 +1092,7 @@ module.exports = {
   fetchPrefill,
   sendForEasyfixer,
   acceptSubmission,
+  profileOtpRequired,
   searchPincodes,
   invalidateCatalogCaches,
   invalidateServiceCategoriesCache,

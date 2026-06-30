@@ -88,21 +88,25 @@ const ensurePincodeBody = Joi.object({
 });
 
 const saveBody = Joi.object({
-  // 4-digit OTP the technician received via WhatsApp — required to gate the
-  // save and prevent unauthorised profile mutations even if the magic link
-  // is forwarded or replayed.
-  otp:                     Joi.number().integer().min(1000).max(9999).required(),
+  // 4-digit OTP from WhatsApp. OPTIONAL at the schema level because the
+  // requirement is RUNTIME-gated by the property `profile_update.otp.enabled`
+  // (the handler enforces "present + valid" only when OTP is enabled, and the
+  // FE learns the same flag via /prefill `otp_required`). When OTP is disabled
+  // the body omits it entirely.
+  otp:                     Joi.number().integer().min(1000).max(9999).optional(),
   basic:                   basicSchema.optional(),
-  // The CAP matches the optionMappingsBody validator in
-  // validators/easyfixer.validator.js (500) so the public surface can't
-  // bypass that cap.
-  deep_skill_items:        Joi.array().items(deepSkillItemSchema).max(500).optional(),
-  // 2000 matches serviceablePincodesBody's cap.
+  // SINGLE-SUBMIT form (2026-06-30): the FE now saves Skills + Service Area in
+  // ONE PUT via a single "Save Profile" button, and BOTH are mandatory — so
+  // both arrays are REQUIRED and non-empty (.min(1)). The technician cannot
+  // save with either section empty. (CAP 500 mirrors optionMappingsBody; 2000
+  // mirrors serviceablePincodesBody.)
+  deep_skill_items:        Joi.array().items(deepSkillItemSchema).min(1).max(500).required(),
   serviceable_pincode_ids: Joi.array()
     .items(Joi.number().integer().positive())
+    .min(1)
     .max(2000)
-    .optional(),
-}).min(2); // otp + at least one data block
+    .required(),
+});
 
 // Centralised error mapper. verifyEasyfixerProfileToken throws Error
 // instances with a `status` property; fetchPrefill / sendForEasyfixer /
@@ -207,12 +211,19 @@ router.put(
         + ' pincodes=' + ((req.body.serviceable_pincode_ids && req.body.serviceable_pincode_ids.length) || 0));
       const efrId = verifyTokenFromQuery(req);
 
-      // OTP gate — runs before acceptSubmission to avoid partial writes on
-      // an invalid code.
-      const { valid } = await otpSvc.verifyOtp(efrId, req.body.otp, pool);
-      if (!valid) {
-        logger.warn('Easyfixer profile save rejected · invalid or expired OTP');
-        return modernError(res, 400, 'Invalid or expired OTP');
+      // OTP gate — only when enabled (property profile_update.otp.enabled,
+      // surfaced to the FE via /prefill `otp_required`). Runs before
+      // acceptSubmission to avoid partial writes on an invalid code.
+      if (profileUpdateLink.profileOtpRequired()) {
+        if (req.body.otp == null) {
+          logger.warn('Easyfixer profile save rejected · OTP required but missing');
+          return modernError(res, 400, 'OTP is required');
+        }
+        const { valid } = await otpSvc.verifyOtp(efrId, req.body.otp, pool);
+        if (!valid) {
+          logger.warn('Easyfixer profile save rejected · invalid or expired OTP');
+          return modernError(res, 400, 'Invalid or expired OTP');
+        }
       }
 
       const result = await profileUpdateLink.acceptSubmission(efrId, req.body, pool);

@@ -33,6 +33,30 @@ async function isOfferFlowActive() {
   return offerFlowEnabled() && (await jobOfferTableExists());
 }
 
+// Open offers auto-expire after this many minutes. ONE source of truth shared
+// by the scheduler sweep (expireStaleOffers) and acceptOffer()'s freshness gate
+// so the two can never drift. See server/scheduler.js 'job-offer-expiry'.
+const OFFER_TTL_MINUTES = 30;
+
+/*
+ * Bulk-expire OPEN offers older than OFFER_TTL_MINUTES (offer_status 0 → 3
+ * EXPIRED). Reuses acceptOffer()'s exact expire shape (status=3 + responded_at).
+ * Touches ONLY tbl_job_offer — the job legitimately stays BOOKED/owner-less
+ * (fk_easyfixter_id NULL) so it remains re-offerable. Tolerant of a missing
+ * table (no-op on un-migrated deploys). Driven by the every-2-min scheduler cron.
+ */
+async function expireStaleOffers(maxAgeMinutes = OFFER_TTL_MINUTES) {
+  if (!(await jobOfferTableExists())) return { skipped: true, expired: 0 };
+  const [r] = await pool.query(
+    `UPDATE tbl_job_offer
+        SET offer_status = 3, responded_at = NOW()
+      WHERE offer_status = 0
+        AND offered_at < NOW() - INTERVAL ? MINUTE`,
+    [maxAgeMinutes],
+  );
+  return { expired: r.affectedRows || 0 };
+}
+
 /*
  * Job CRUD + status + assignment.
  *
@@ -3012,12 +3036,21 @@ async function acceptOffer(jobId, efrId) {
     }
 
     // Race-safe claim. Only succeeds while the job is still BOOKED *and* owner-
-    // less — the atomic gate that makes accept first-wins across the pool.
+    // less — the atomic gate that makes accept first-wins across the pool. The
+    // EXISTS clause adds a FRESHNESS gate: this tech's OWN open offer must still
+    // be within OFFER_TTL_MINUTES, closing the window where a tech could accept
+    // a >30-min stale offer in the gap between expiry-cron ticks.
     const [r] = await conn.query(
       `UPDATE tbl_job
           SET job_status = ${STATUS.SCHEDULED}, fk_easyfixter_id = ?
-        WHERE job_id = ? AND job_status = ${STATUS.BOOKED} AND fk_easyfixter_id IS NULL`,
-      [efrId, jobId],
+        WHERE job_id = ? AND job_status = ${STATUS.BOOKED} AND fk_easyfixter_id IS NULL
+          AND EXISTS (
+            SELECT 1 FROM tbl_job_offer jo
+             WHERE jo.job_id = ? AND jo.fk_easyfixter_id = ?
+               AND jo.offer_status = 0
+               AND jo.offered_at >= NOW() - INTERVAL ? MINUTE
+          )`,
+      [efrId, jobId, jobId, efrId, OFFER_TTL_MINUTES],
     );
 
     if (r.affectedRows === 1) {
@@ -3056,8 +3089,11 @@ async function acceptOffer(jobId, efrId) {
   }
 
   // Reached only on the lost-race path (the success paths returned inside try).
-  logger.warn('Job offer lost race, already accepted by another technician · id=' + jobId + ' · efrId=' + efrId);
-  throw Object.assign(new Error('This job was already accepted by another technician'), { status: 409 });
+  // affectedRows=0 means one of: another tech won, the job moved on, OR this
+  // tech's offer expired (>30 min / cron-expired) — so the message is neutral
+  // rather than asserting another tech necessarily took it.
+  logger.warn('Job offer no longer available (lost race or expired) · id=' + jobId + ' · efrId=' + efrId);
+  throw Object.assign(new Error('This job offer is no longer available'), { status: 409 });
 }
 
 /*
@@ -3327,7 +3363,7 @@ module.exports = {
   // THE OFFER MODEL (pool offers): offer one job to many techs, list a job's
   // open offers, and list a tech's open offers.
   offerToTechnicians, listOffers, listOfferedForTech, techHasOpenOffer, rejectOffer,
-  isOfferFlowActive,
+  isOfferFlowActive, expireStaleOffers,
   tryAutoAssignOnCreate,
   fireWebhook, statusToEventName,
   hasClientVerticalIdColumn,

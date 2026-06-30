@@ -446,6 +446,114 @@ Why this matters: before this task existed, the notice feeds would already DISPL
     noticePublishJob.skipReason = 'CRON_DISABLED=true';
   }
 
+  // ─── Job-offer auto-expiry — every 2 minutes ────────────────────────
+  // Added 2026-06-30. Open offers (tbl_job_offer.offer_status=0) that no tech
+  // ever accepted should not linger forever. This cron expires every open offer
+  // older than 30 minutes (status → 3 EXPIRED), clearing the "Offered to Tx"
+  // chip + freeing the pool; the job stays BOOKED/owner-less so ops can re-offer
+  // it. No property gate — one small UPDATE every 2 min, the alternative (stale
+  // offers piling up) is worse. acceptOffer() enforces the same 30-min TTL so a
+  // tech can't accept a stale offer between ticks.
+  const jobOfferSvc = require('../services/job.service');
+  const offerExpiryJob = registerJob({
+    id: 'job-offer-expiry',
+    name: 'Job Offer Auto-Expiry',
+    description:
+`What this task does: When the CRM offers a job to one or more technicians, each technician gets a limited window to accept it on their app. This task enforces that window. Step by step:
+  1. Every 2 minutes, the task wakes up automatically.
+  2. It finds every job offer that is still waiting for a response (nobody has accepted or rejected it) AND was sent more than 30 minutes ago.
+  3. It marks each of those offers as "expired", so it no longer shows up as a live offer to the technician or as "Offered to Tx" in the CRM.
+  4. The job itself is left untouched and owner-less, so the CRM can simply offer it again to a fresh set of technicians.
+  5. It logs how many stale offers it expired — visible in the server logs and on this page (Last Run details below).
+
+Why this matters: without this, a job offered to technicians who never respond would sit "offered" forever, blocking a clean re-offer and cluttering the CRM. A technician also cannot accept an offer older than 30 minutes (the accept path enforces the same limit), so this keeps the live state and what technicians can act on in sync.`,
+    cron: '*/2 * * * *',
+    runner: async () => {
+      // No literal — defaults to job.service.js OFFER_TTL_MINUTES (the single
+      // source of truth shared with acceptOffer's freshness gate).
+      const result = await jobOfferSvc.expireStaleOffers();
+      logger.info(`Job-offer expiry cron · expired=${result.expired}` + (result.skipped ? ' (skipped: no tbl_job_offer)' : ''));
+      return result;
+    },
+  });
+  if (!cronDisabled) {
+    offerExpiryJob.task = cron.schedule(
+      offerExpiryJob.cron,
+      () => invokeJob(offerExpiryJob, 'cron'),
+      { timezone: TZ },
+    );
+    offerExpiryJob.registered = true;
+  } else {
+    offerExpiryJob.skipReason = 'CRON_DISABLED=true';
+  }
+
+  // ─── Attendance reminder — daily at 9:00 IST ─────────────────────────
+  // (Added 2026-06-28) Pushes a "mark your attendance" FCM reminder to every
+  // active + verified technician who has NOT marked attendance for TODAY (IST).
+  // Companion to the in-app popup the technician app shows on open — both read
+  // the same "unmarked for the IST day" predicate. Property-gated so ops can
+  // disable the daily fan-out (a few-thousand-tech send) without a deploy.
+  const attendanceReminderCron = require('../services/attendance-reminder-cron');
+  // Schedule is configurable via property `attendance.reminder.cron` (default
+  // 09:00 IST). An empty/invalid value falls back to the default, so a
+  // fat-fingered property can't crash cron registration. Checked once at start.
+  const attendanceCronExpr = (() => {
+    const raw = String(getProperty('attendance.reminder.cron') ?? '').trim();
+    return raw && cron.validate(raw) ? raw : '0 9 * * *';
+  })();
+  const attendanceReminderJob = registerJob({
+    id: 'attendance-reminder-daily',
+    name: 'Technician Attendance Reminder',
+    description:
+`What this task does: Every morning at 9:00 AM IST, technicians who have not yet marked their attendance for today receive a push notification on their phone reminding them to do so. Marking attendance is what tells the auto-assignment engine a technician is available, so a forgotten attendance silently removes them from the day's job pool.
+
+Here's how it works, step by step:
+  1. Every day at 9:00 AM IST, the task wakes up automatically.
+  2. It looks at every technician whose account is ACTIVE and VERIFIED and who has a usable mobile number.
+  3. For each one, it checks whether they have already acted on today's attendance — marked themselves present (morning and/or evening) OR marked themselves on leave. If they have, we skip them.
+  4. Everyone left (no attendance action for today) is sent a push notification: "Mark Your Attendance — you haven't marked your attendance for today. Tap to mark it and keep receiving jobs."
+  5. Tapping the notification opens the app, where the technician marks attendance for today (and tomorrow if they wish).
+  6. The task logs how many technicians were eligible, how many the push reached, how many failed, and how many were skipped (no registered device) — visible in the server logs and on this page (Last Run details below).
+
+Why this matters: technicians frequently forget to mark daily attendance, which quietly blocks job auto-assignment and leaves ops with an incomplete availability picture. A gentle morning nudge significantly increases attendance compliance, and it pairs with the in-app popup the technician sees when they open the app.
+
+Note: this task only runs automatically if the property "attendance.reminder.enabled" is set to "true" in easyfix_properties. The SEND TIME is configurable via the property "attendance.reminder.cron" (a cron expression, e.g. "0 9 * * *" for 9:00 AM IST; defaults to 9:00 AM if unset/invalid). Both properties are checked once at server start — after changing either, a server restart (redeploy) is required. If the enable flag is unset or "false", the schedule is OFF — but Trigger Now still works for manual testing.`,
+    cron: attendanceCronExpr,
+    runner: async () => {
+      const result = await attendanceReminderCron.runDailyReminder();
+      logger.info(
+        `Attendance-reminder cron · eligible=${result.eligible} · succeeded=${result.succeeded} · ` +
+        `failed=${result.failed} · skipped=${result.skipped}`
+      );
+      return result;
+    },
+    tester: ({ sourceId }) => attendanceReminderCron.runTest({ sourceId }),
+    testSourceLabel: 'Easyfixer ID (efr_id)',
+    testSourceHelp:
+      'Required. The reminder push is sent to THIS easyfixer\'s registered device(s). In a test environment with TEST_FCM_TOKEN set, every send is redirected to the operator token — so it lands on your test device, never the real technician.',
+  });
+  /*
+   * Property gate — mirror of the magic-link / profile-reminder pattern. Lets
+   * ops kill the daily fan-out without a deploy. Default-off (unset OR not
+   * 'true' → unregistered) so adding the cron is a no-op until ops turns it on.
+   */
+  const attendanceReminderEnabled =
+    String(getProperty('attendance.reminder.enabled') ?? '').toLowerCase() === 'true';
+  if (cronDisabled) {
+    attendanceReminderJob.skipReason = 'CRON_DISABLED=true';
+  } else if (!attendanceReminderEnabled) {
+    attendanceReminderJob.skipReason = "property 'attendance.reminder.enabled' was not 'true' at server start — flip it to 'true' and restart the server to enable";
+    logger.info("Attendance-reminder cron SKIPPED — set attendance.reminder.enabled=true in easyfix_properties to enable (takes effect after restart).");
+  } else {
+    attendanceReminderJob.task = cron.schedule(
+      attendanceReminderJob.cron,
+      () => invokeJob(attendanceReminderJob, 'cron'),
+      { timezone: TZ },
+    );
+    attendanceReminderJob.registered = true;
+    logger.info(`Attendance-reminder cron registered (attendance.reminder.enabled=true, schedule="${attendanceCronExpr}" IST).`);
+  }
+
   // ─── Deep Skill Image-Gen orphan reset — every 5 minutes ─────────────
   // Standalone cron (NOT registered via registerJob()). Deliberately
   // absent from the Scheduled Jobs admin page — this is infrastructure
