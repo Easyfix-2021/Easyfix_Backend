@@ -1,0 +1,16 @@
+-- 2026-06-30 — Covering index for the Manage Easyfixers -> Additional Details
+-- deep-skill option-grid LOAD (easyfixer-verification.service.js listOptionMappings).
+--
+-- The load query drives on (easyfixer_id, is_repairing) then joins/sorts by
+-- category/service-type/deep-skill/option. The existing index
+-- idx_efr_deepskill_mapping_easyfixer_active (easyfixer_id, is_repairing) makes
+-- the optimizer re-read every matching row ("Using temporary; Using filesort")
+-- for heavier technicians (up to ~199 rows). This superset index lets MySQL
+-- satisfy the active filter AND supply the join keys straight from the index,
+-- shrinking the driving row set feeding the (joined-name) sort.
+--
+-- Additive / non-breaking. tbl_efr_deepskill_mapping is EasyFix-owned-usage
+-- (~35k rows); index build is fast, no schema/column change. The new index is a
+-- strict superset of idx_efr_deepskill_mapping_easyfixer_active, which could be
+-- dropped later as a SEPARATE DBA-signed-off change (intentionally not bundled).
+CREATE INDEX idx_efr_dsm_efr_active_cover ON tbl_efr_deepskill_mapping (easyfixer_id, is_repairing, category_id, service_type_id, parent_skill_id, deep_skill_id);

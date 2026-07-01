@@ -821,6 +821,10 @@ async function deepskillMappingAuditCols() {
   return _deepskillMappingAudit;
 }
 
+// Chunk size for the bulk reactivate (PK IN) + bulk INSERT statements. Keeps
+// placeholder counts well under MySQL limits even at the Joi cap of 500 items.
+const MAPPING_WRITE_CHUNK = 200;
+
 async function replaceOptionMappings(efrId, items, actor, externalConn = null) {
   const list = Array.isArray(items) ? items : [];
   logger.info('Replace deep-skill option mappings · efrId=' + efrId + ' · items=' + list.length);
@@ -833,10 +837,29 @@ async function replaceOptionMappings(efrId, items, actor, externalConn = null) {
   // easyfixer self-acts → stamp their efr_id. Columns discovered defensively.
   const byId = actor?.user_id || efrId;
   const audit = await deepskillMappingAuditCols();
+
+  // Normalise + dedupe the desired set into PHYSICAL-column tuples. INVERSION
+  // (preserved verbatim): semantic deep_skill_id → physical parent_skill_id;
+  // semantic option_id → physical deep_skill_id. Getting this backwards corrupts
+  // candidate-ranking, which filters is_repairing=1 on these columns.
+  const seen = new Set();
+  const desired = []; // { categoryId, serviceTypeId, parentSkillId, deepSkillId }
+  for (const it of list) {
+    const categoryId    = Number(it.category_id);
+    const serviceTypeId = Number(it.service_type_id);
+    const parentSkillId = Number(it.deep_skill_id); // → physical parent_skill_id
+    const deepSkillId   = Number(it.option_id);     // → physical deep_skill_id
+    if (![categoryId, serviceTypeId, parentSkillId, deepSkillId].every((n) => Number.isInteger(n) && n > 0)) continue;
+    const k = categoryId + '|' + serviceTypeId + '|' + parentSkillId + '|' + deepSkillId;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    desired.push({ categoryId, serviceTypeId, parentSkillId, deepSkillId });
+  }
+
   try {
     if (ownTxn) await conn.beginTransaction();
 
-    // 1) Soft-delete every active row for this easyfixer.
+    // 1) Soft-delete every active row for this easyfixer (one statement).
     await conn.query(
       `UPDATE tbl_efr_deepskill_mapping
           SET is_repairing = 0
@@ -844,51 +867,78 @@ async function replaceOptionMappings(efrId, items, actor, externalConn = null) {
       [efrId]
     );
 
-    // 2) For each desired item: try reactivate, INSERT if no matching row.
-    let updated = 0;
-    for (const it of list) {
-      const categoryId    = Number(it.category_id);
-      const serviceTypeId = Number(it.service_type_id);
-      const deepSkillId   = Number(it.deep_skill_id);  // semantic name; goes into the physical column `parent_skill_id`
-      const optionId      = Number(it.option_id);      // semantic name; goes into the physical column `deep_skill_id`
-      if (![categoryId, serviceTypeId, deepSkillId, optionId].every((n) => Number.isInteger(n) && n > 0)) {
-        continue;
-      }
-      // Reactivate a soft-deleted identical row. Also REFRESH the audit stamp
-      // (date=NOW, by=actor) so a re-saved mapping carries the current values
-      // instead of a stale/NULL one — this is why existing rows showed NULL.
-      // parent_skill_id holds deep_skill_id; deep_skill_id holds option_id (inversion).
+    if (desired.length === 0) {
+      if (ownTxn) await conn.commit();
+      logger.info('Deep-skill option mappings replaced · efrId=' + efrId + ' · updated=0 · by=' + byId);
+      return { updated: 0 };
+    }
+
+    // 2) One read of this easyfixer's existing rows → map natural key → PK id.
+    //    Replaces the per-item reactivate probe with a single round-trip.
+    const [existingRows] = await conn.query(
+      `SELECT id, category_id, service_type_id, parent_skill_id, deep_skill_id
+         FROM tbl_efr_deepskill_mapping
+        WHERE easyfixer_id = ?`,
+      [efrId]
+    );
+    const idByKey = new Map();
+    for (const row of existingRows) {
+      idByKey.set(row.category_id + '|' + row.service_type_id + '|' + row.parent_skill_id + '|' + row.deep_skill_id, row.id);
+    }
+
+    // 3) Partition: existing rows reactivate (by PK); the rest INSERT.
+    const reactivateIds = [];
+    const toInsert = [];
+    for (const d of desired) {
+      const id = idByKey.get(d.categoryId + '|' + d.serviceTypeId + '|' + d.parentSkillId + '|' + d.deepSkillId);
+      if (id != null) reactivateIds.push(id);
+      else toInsert.push(d);
+    }
+
+    // 4) Bulk reactivate via PK IN (+ refresh audit stamp). One statement per
+    //    chunk — turns up to ~43 single-row UPDATEs into ~1 round-trip. PK seek.
+    if (reactivateIds.length) {
       const reSets = ['is_repairing = 1'];
-      const reParams = [];
+      const auditParams = [];
       if (audit.dateCol) reSets.push('`' + audit.dateCol + '` = NOW()');
-      if (audit.byCol)   { reSets.push('`' + audit.byCol + '` = ?'); reParams.push(byId); }
-      const [r] = await conn.query(
-        `UPDATE tbl_efr_deepskill_mapping
-            SET ${reSets.join(', ')}
-          WHERE easyfixer_id    = ?
-            AND category_id     = ?
-            AND service_type_id = ?
-            AND parent_skill_id = ?
-            AND deep_skill_id   = ?`,
-        [...reParams, efrId, categoryId, serviceTypeId, deepSkillId, optionId]
-      );
-      if (r.affectedRows === 0) {
-        // INSERT new mapping, stamping the discovered audit columns when present.
-        const insCols = ['easyfixer_id', 'category_id', 'service_type_id', 'parent_skill_id', 'deep_skill_id', 'is_repairing'];
-        const insVals = ['?', '?', '?', '?', '?', '1'];
-        const insParams = [efrId, categoryId, serviceTypeId, deepSkillId, optionId];
-        if (audit.dateCol) { insCols.push('`' + audit.dateCol + '`'); insVals.push('NOW()'); }
-        if (audit.byCol)   { insCols.push('`' + audit.byCol + '`'); insVals.push('?'); insParams.push(byId); }
+      if (audit.byCol)   { reSets.push('`' + audit.byCol + '` = ?'); auditParams.push(byId); }
+      for (let i = 0; i < reactivateIds.length; i += MAPPING_WRITE_CHUNK) {
+        const chunk = reactivateIds.slice(i, i + MAPPING_WRITE_CHUNK);
         await conn.query(
+          `UPDATE tbl_efr_deepskill_mapping
+              SET ${reSets.join(', ')}
+            WHERE id IN (${chunk.map(() => '?').join(',')})`,
+          [...auditParams, ...chunk]
+        );
+      }
+    }
+
+    // 5) Bulk INSERT the new mappings — one multi-row INSERT per chunk.
+    if (toInsert.length) {
+      const insCols = ['easyfixer_id', 'category_id', 'service_type_id', 'parent_skill_id', 'deep_skill_id', 'is_repairing'];
+      if (audit.dateCol) insCols.push('`' + audit.dateCol + '`');
+      if (audit.byCol)   insCols.push('`' + audit.byCol + '`');
+      for (let i = 0; i < toInsert.length; i += MAPPING_WRITE_CHUNK) {
+        const chunk = toInsert.slice(i, i + MAPPING_WRITE_CHUNK);
+        const rowSql = [];
+        const insParams = [];
+        for (const d of chunk) {
           // parent_skill_id holds deep_skill_id; deep_skill_id holds option_id (inversion).
-          `INSERT INTO tbl_efr_deepskill_mapping (${insCols.join(', ')}) VALUES (${insVals.join(', ')})`,
+          const vals = ['?', '?', '?', '?', '?', '1'];
+          insParams.push(efrId, d.categoryId, d.serviceTypeId, d.parentSkillId, d.deepSkillId);
+          if (audit.dateCol) vals.push('NOW()');
+          if (audit.byCol)   { vals.push('?'); insParams.push(byId); }
+          rowSql.push('(' + vals.join(', ') + ')');
+        }
+        await conn.query(
+          `INSERT INTO tbl_efr_deepskill_mapping (${insCols.join(', ')}) VALUES ${rowSql.join(', ')}`,
           insParams
         );
       }
-      updated += 1;
     }
 
     if (ownTxn) await conn.commit();
+    const updated = reactivateIds.length + toInsert.length;
     logger.info('Deep-skill option mappings replaced · efrId=' + efrId + ' · updated=' + updated + ' · by=' + byId);
     return { updated };
   } catch (e) {
@@ -931,7 +981,7 @@ async function listServiceablePincodes(efrId) {
   const [items] = await pool.query(
     `SELECT p.pincode_id,
             p.pincode,
-            p.location           AS pincode_location,
+            p.location           AS location,
             p.city_id,
             c.city_name,
             c.state_id,

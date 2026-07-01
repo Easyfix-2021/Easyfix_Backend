@@ -203,8 +203,10 @@ async function listPincodes({ q, status, cityId, includeInactive = false, limit 
       where.push('p.pincode LIKE ?');
       params.push(`${term}%`);
     } else {
-      where.push('(c.city_name LIKE ? OR COALESCE(p.district, c.district) LIKE ?)');
-      params.push(`%${term}%`, `%${term}%`);
+      // Match LOCATION (area label), CITY, or district so a pincode is findable
+      // by any of Pincode / Location / City.
+      where.push('(p.location LIKE ? OR c.city_name LIKE ? OR COALESCE(p.district, c.district) LIKE ?)');
+      params.push(`%${term}%`, `%${term}%`, `%${term}%`);
     }
   }
   if (cityId) {
@@ -385,7 +387,7 @@ async function lookupManyByCode(pincodes) {
 
   const placeholders = clean.map(() => '?').join(',');
   const [items] = await pool.query(
-    `SELECT p.pincode_id, p.pincode, p.location AS pincode_location,
+    `SELECT p.pincode_id, p.pincode, p.location AS location,
             p.city_id, c.city_name, c.state_id, s.state_name
        FROM tbl_pincode    p
        LEFT JOIN tbl_city  c ON c.city_id  = p.city_id

@@ -276,7 +276,7 @@ async function fetchPrefill(efrId, pool) {
     fetchDeepSkillCatalog(pool),
     presignProfileImage(row.profile_image_key),
     resolveServiceCategories(row.service_category_raw, pool),
-    fetchEasyfixerMappedCategoryIds(efrId, pool),
+    fetchEasyfixerMappedCategoryIds(efrId, pool, row.service_category_raw),
   ]);
 
   /*
@@ -458,6 +458,10 @@ function invalidateServiceCategoriesCache() {
 function invalidateCatalogCaches() {
   deepSkillCatalogCache = { data: null, expires: 0, inflight: null };
   invalidateServiceCategoriesCache();
+  // Also drop the deep-skill legacy-image existence memo (deep-skill.service.js)
+  // so a re-uploaded / migrated image reflects immediately rather than in ≤5 min.
+  // Lazy require + guard: non-fatal and avoids any load-order coupling.
+  try { require('../utils/ttl-cache').clearPrefix('deepskill:imgexists:'); } catch (_) { /* non-fatal */ }
 }
 
 /**
@@ -515,7 +519,7 @@ function invalidateCatalogCaches() {
  * Used to filter the (globally cached) deep-skill catalog tree to only the
  * categories this easyfixer is associated with.
  */
-async function fetchEasyfixerMappedCategoryIds(efrId, pool) {
+async function fetchEasyfixerMappedCategoryIds(efrId, pool, serviceCategoryRaw = null) {
   const [rows] = await pool.query(
     `SELECT DISTINCT category_id FROM (
        SELECT service_category_id AS category_id
@@ -535,7 +539,39 @@ async function fetchEasyfixerMappedCategoryIds(efrId, pool) {
      ) AS unioned`,
     [efrId, efrId, efrId],
   );
-  return new Set(rows.map((r) => Number(r.category_id)).filter((n) => Number.isFinite(n)));
+  const ids = new Set(rows.map((r) => Number(r.category_id)).filter((n) => Number.isFinite(n)));
+
+  /*
+   * 4th source (2026-07-01): the technician's OWN service category(ies) from
+   * tbl_easyfixer.efr_service_category — the SAME column the profile header
+   * shows via resolveServiceCategories(). That CSV holds category IDs and/or
+   * literal names; resolve BOTH to ids so a tech whose category lives ONLY on
+   * tbl_easyfixer (no easyfixer_service_type / mapping / dskill_status row yet)
+   * can still map the deep skills of the categories assigned to them.
+   * Bug it fixes: efr 2334 "Plumbing Services" appeared in the header but the
+   * picker fell back to the read-only "contact CRM" state (empty catalog).
+   */
+  const raw = String(serviceCategoryRaw || '').trim();
+  if (raw) {
+    const parts = raw.split(',').map((s) => s.trim()).filter(Boolean);
+    const names = [];
+    for (const p of parts) {
+      if (/^\d+$/.test(p)) ids.add(Number(p));
+      else names.push(p);
+    }
+    if (names.length > 0) {
+      const placeholders = names.map(() => '?').join(',');
+      const [nameRows] = await pool.query(
+        `SELECT service_catg_id FROM tbl_service_catg WHERE service_catg_name IN (${placeholders})`,
+        names,
+      );
+      for (const r of nameRows) {
+        const n = Number(r.service_catg_id);
+        if (Number.isFinite(n)) ids.add(n);
+      }
+    }
+  }
+  return ids;
 }
 
 async function fetchDeepSkillCatalog(pool) {
@@ -735,13 +771,16 @@ async function searchPincodes(q, limit, pool) {
      * all-digits branch above, so this fallback is for pure text.
      */
     const prefix = `${term}%`;
+    // Match on LOCATION (area label), CITY, or district — so the technician can
+    // find a pincode by any of Pincode / Location / City (the pincode itself is
+    // handled by the all-digits branch above).
     [rows] = await pool.query(
       `${SELECT}
        WHERE p.pincode_status = 1
-         AND (c.city_name LIKE ? OR COALESCE(p.district, c.district) LIKE ?)
+         AND (p.location LIKE ? OR c.city_name LIKE ? OR COALESCE(p.district, c.district) LIKE ?)
        ORDER BY p.pincode ASC
        LIMIT ?`,
-      [prefix, prefix, cap],
+      [prefix, prefix, prefix, cap],
     );
   }
   logger.info('Found ' + rows.length + ' pincodes');
