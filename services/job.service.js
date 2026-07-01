@@ -906,32 +906,50 @@ async function list({
  * Services + images default to [] if the main row is missing — no point paying
  * for those lookups when we're about to 404.
  */
-async function getById(jobId) {
-  logger.info('Get job detail · id=' + jobId);
+/*
+ * getByIdCore — the job's DETAIL_JOIN scalar row ONLY (no services / images /
+ * videos sub-fetches). Callers that need just the job's own fields (scope
+ * assertion, candidate-ranking's enrichedJob, status/label reads) should use
+ * this: it skips the tbl_job_image lookup, which — with no index on
+ * tbl_job_image.job_id — full-scans ~1.4M rows (~1.1s) for images those paths
+ * never render. `getById` composes this with the three child lookups for the
+ * full detail payload.
+ *
+ * Returns null if the job row doesn't exist (same contract as getById's row).
+ */
+async function getByIdCore(jobId) {
   // Gate `cl.vertical_id` in the SELECT projection on column presence.
   // When the column isn't on this DB's tbl_client, fall back to a NULL
   // alias so the projection stays stable for downstream consumers
   // (image redirect endpoint reads `j.vertical_id` for scope assert).
-  // Without this gate, getById() throws "Unknown column" and EVERY
+  // Without this gate, the query throws "Unknown column" and EVERY
   // job-detail-dependent flow (view modal, image redirect, etc.)
   // 500s for this DB.
   const hasVerticalCol = await hasClientVerticalIdColumn();
   const verticalSelect = hasVerticalCol ? 'cl.vertical_id' : 'NULL AS vertical_id';
+  const [jobRows] = await pool.query(
+    `SELECT j.*,
+            cu.customer_name, cu.customer_mob_no, cu.customer_email,
+            ad.address, ad.building, ad.landmark, ad.locality, ad.pin_code,
+            ad.gps_location, ad.city_id, ci.city_name,
+            cl.client_name, cl.client_email, ${verticalSelect},
+            ef.efr_name AS easyfixer_name, ef.efr_no AS easyfixer_mobile,
+            ow.user_name AS owner_name,
+            cr.user_name AS created_by_name
+     ${DETAIL_JOIN}
+     WHERE j.job_id = ? LIMIT 1`,
+    [jobId]
+  );
+  const job = jobRows[0];
+  if (!job) { logger.warn('Job detail not found · id=' + jobId); return null; }
+  return job;
+}
 
-  const [jobRows, services, images] = await Promise.all([
-    pool.query(
-      `SELECT j.*,
-              cu.customer_name, cu.customer_mob_no, cu.customer_email,
-              ad.address, ad.building, ad.landmark, ad.locality, ad.pin_code,
-              ad.gps_location, ad.city_id, ci.city_name,
-              cl.client_name, cl.client_email, ${verticalSelect},
-              ef.efr_name AS easyfixer_name, ef.efr_no AS easyfixer_mobile,
-              ow.user_name AS owner_name,
-              cr.user_name AS created_by_name
-       ${DETAIL_JOIN}
-       WHERE j.job_id = ? LIMIT 1`,
-      [jobId]
-    ),
+async function getById(jobId) {
+  logger.info('Get job detail · id=' + jobId);
+
+  const [job, services, images] = await Promise.all([
+    getByIdCore(jobId),
     pool.query(
       // Return ALL service rows including soft-deleted (status=0). The FE
       // hides them by default but exposes a "Show Inactive" toggle that
@@ -958,8 +976,8 @@ async function getById(jobId) {
       [jobId]
     ),
   ]);
-  const job = jobRows[0][0];
-  if (!job) logger.warn('Job detail not found · id=' + jobId);
+  // getByIdCore already logged the not-found warn; bail before the child
+  // lookups (services/images were fetched in parallel but are discarded).
   if (!job) return null;
 
   // Customer-shared videos (via the WhatsApp conversational order-confirmation
@@ -3420,7 +3438,7 @@ module.exports = {
   // tbl_job.client_services CSV in sync after the customer's self-submit
   // mutates tbl_job_services. Single source of truth, one helper.
   recomputeClientServicesCsv,
-  list, getById, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, unassign, acceptOffer, changeOwner,
+  list, getById, getByIdCore, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, unassign, acceptOffer, changeOwner,
   // THE OFFER MODEL (pool offers): offer one job to many techs, list a job's
   // open offers, and list a tech's open offers.
   offerToTechnicians, listOffers, listOfferedForTech, techHasOpenOffer, rejectOffer,

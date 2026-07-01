@@ -998,9 +998,15 @@ function filterAndScore(eligible, stats, job, opts) {
 async function rankCandidatesForJob(jobId, {
   limit = 10, jobDate, timeSlot,
   enforceMaxConcurrent = true, enforceCodBalance = false, enforceAttendance = true,
+  preloadedJob = null,
 } = {}) {
   logger.info('Rank candidates for job · jobId=' + jobId + ' limit=' + limit + (jobDate ? ' jobDate=' + jobDate : '') + (timeSlot != null && timeSlot !== '' ? ' timeSlot=' + timeSlot : ''));
-  const job = await jobService.getById(jobId);
+  // Reuse the job the route already loaded (req.scopedJob) when provided — the
+  // /candidates route runs scopedJob → getById first, so re-fetching here is a
+  // redundant second getById (full detail incl. the ~1.1s tbl_job_image scan).
+  // Standalone callers (on-create auto-assign) pass nothing → getByIdCore
+  // fetches ONLY the scalar detail row this pipeline reads (no images/services).
+  const job = preloadedJob || await jobService.getByIdCore(jobId);
   if (!job) {
     logger.warn('Rank candidates failed · job not found · jobId=' + jobId);
     const err = new Error('job not found'); err.status = 404; throw err;
@@ -1326,9 +1332,11 @@ function pickAutoAssignCandidate(rankResult, { paidBy, balanceFloor = DEFAULTS.A
  * Cap (default 50) + logger.warn when the raw match count hits the cap, so
  * a too-broad term is observable in logs (the operator should refine).
  */
-async function searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit = 50 } = {}) {
+async function searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit = 50, preloadedJob = null } = {}) {
   logger.info('Search technicians for job · jobId=' + jobId + ' termLen=' + String(term ?? '').trim().length + ' limit=' + limit);
-  const job = await jobService.getById(jobId);
+  // Reuse the route's already-loaded job (req.scopedJob); else fetch only the
+  // scalar detail row (getByIdCore skips the expensive tbl_job_image scan).
+  const job = preloadedJob || await jobService.getByIdCore(jobId);
   if (!job) {
     logger.warn('Search technicians failed · job not found · jobId=' + jobId);
     const err = new Error('job not found'); err.status = 404; throw err;

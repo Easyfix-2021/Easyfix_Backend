@@ -1,0 +1,32 @@
+-- 2026-07-01 — index on tbl_job_image(job_id).
+--
+-- PROPOSAL ONLY — DO NOT auto-apply. tbl_job_image is a large (~1.4M row)
+-- image table in the shared easyfix_core DB. The index is ADDITIVE and
+-- non-breaking (no column/shape change), but a CREATE INDEX on a table
+-- this size rebuilds/locks — a DBA should apply it in a low-traffic
+-- window (or online, see below). Keep this file in migrations/ (pending)
+-- — do NOT move it to migrations/executed/ until a DBA has run it.
+--
+-- WHY:
+--   job.service.getById() fetches a job's images with
+--     SELECT ... FROM tbl_job_image WHERE job_id = ? ORDER BY image_id
+--   tbl_job_image has ONLY PRIMARY(image_id) — NO index on job_id. EXPLAIN
+--   shows type=ALL, key=NULL, rows≈1.38M, Extra="Using where" → a FULL
+--   TABLE SCAN on every getById. Measured on live QA: ~1.1s per call.
+--   getById is on the Schedule & Assign hot path (scopedJob middleware),
+--   the job-detail modal, the transaction view, and every status/assign
+--   flow — all pay this ~1.1s scan for images most of them never render.
+--   (The sibling table tbl_job_media already has idx_jm_job(job_id); this
+--   table simply missed the equivalent index.)
+--
+--   A plain BTREE on job_id turns the full scan into a seek (a job has a
+--   handful of images), cutting getById's image lookup from ~1.1s to ~1ms.
+--
+-- NOTE: plain CREATE INDEX (no MariaDB-only IF NOT EXISTS). Confirm no
+-- equivalent index exists first:
+--   SHOW INDEX FROM tbl_job_image WHERE Column_name = 'job_id';
+-- and prefer an online build:
+--   ALTER TABLE tbl_job_image
+--     ADD INDEX idx_job_image_job (job_id),
+--     ALGORITHM=INPLACE, LOCK=NONE;
+CREATE INDEX idx_job_image_job ON tbl_job_image (job_id);

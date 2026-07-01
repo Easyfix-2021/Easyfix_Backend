@@ -1,0 +1,43 @@
+-- 2026-07-01 — composite index on scheduling_history(job_id, easyfixer_id, reschedule_reason).
+--
+-- PROPOSAL ONLY — DO NOT auto-apply. `scheduling_history` is a LEGACY
+-- shared table touched by the five legacy services (CRM, Dropwizard,
+-- ACD_APIs, etc.). A DBA must review the live table's existing indexes
+-- and current row/write profile before applying; adding an index here
+-- affects every service that writes to it. Keep this file in
+-- migrations/ (pending) — do NOT move it to migrations/executed/ until
+-- a DBA has reviewed and run it against the live DB.
+--
+-- WHY:
+--   candidate-ranking.service.l1Eligibility() (the Schedule & Assign
+--   Top-10 / on-create auto-assign hot path) excludes technicians who
+--   already rejected/rescheduled off THIS job:
+--     e.efr_id NOT IN (
+--       SELECT sh.easyfixer_id FROM scheduling_history sh
+--        WHERE sh.job_id = ?
+--          AND sh.reschedule_reason IS NOT NULL
+--          AND sh.reschedule_reason <> '' )
+--   scheduling_history has ONLY idx_sched_hist_efr(easyfixer_id) — there is
+--   NO index on job_id. EXPLAIN of the job_id filter shows type=index,
+--   key=idx_sched_hist_efr, rows≈488k, Extra="Using where" → a full index
+--   scan of ~570k rows. Measured on live QA: the same L1 query is ~40ms
+--   WITHOUT this exclusion vs ~2.5s WITH it, and L1 runs 2–4× per request
+--   (city + skill-drop fallback + zone pass + zone fallback). A LEFT JOIN
+--   anti-join rewrite does NOT help (~1.6s) — no query shape avoids the
+--   full scan while job_id is unindexed.
+--
+--   Selectivity: scheduling_history holds ~342k distinct job_ids over
+--   ~570k rows = avg 1.7 rows/job (max 45). A job_id index turns the
+--   ~488k-row scan into a 1–2 row seek (>99.9% reduction). Leading with
+--   job_id and covering easyfixer_id + reschedule_reason lets the whole
+--   exclusion resolve from the index (no table touch).
+--
+-- NOTE: plain CREATE INDEX (no MariaDB-only IF NOT EXISTS). The DBA
+-- should confirm an equivalent index does not already exist before
+-- running, e.g.:
+--   SHOW INDEX FROM scheduling_history WHERE Column_name = 'job_id';
+-- and prefer an online build on the live table, e.g.:
+--   ALTER TABLE scheduling_history
+--     ADD INDEX idx_sched_hist_job (job_id, easyfixer_id, reschedule_reason),
+--     ALGORITHM=INPLACE, LOCK=NONE;
+CREATE INDEX idx_sched_hist_job ON scheduling_history (job_id, easyfixer_id, reschedule_reason);

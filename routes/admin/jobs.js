@@ -99,6 +99,9 @@ router.get('/:id/candidates',
         // the balance floor.
         enforceMaxConcurrent: false,
         enforceCodBalance: true,
+        // scopedJob already loaded this job — hand it over so the service
+        // doesn't run a second (redundant) getById on the hot path.
+        preloadedJob: req.scopedJob,
       });
       // Tell the CRM modal which commit mode to render: offer-pool (multi-select
       // + "Offer to N") when the offer flow is effectively active, else single
@@ -141,6 +144,8 @@ router.get('/:id/candidates/search',
         // round-trip) — the service slices the date prefix for DATE() math.
         jobDate: jobDate || undefined,
         timeSlot,
+        // Reuse scopedJob's already-loaded job row (skip the redundant getById).
+        preloadedJob: req.scopedJob,
       });
       logger.info('Returning ' + (result?.candidates?.length || 0) + ' matched technicians · jobId=' + req.params.id);
       modernOk(res, result);
