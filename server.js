@@ -145,6 +145,11 @@ async function start() {
     if (String(process.env.NOTIFICATIONS_DISABLE).toLowerCase() === 'true') {
       logger.test(`Notifications DISABLED — no real SMS / email / WhatsApp / push will be sent.`);
     }
+    // Fail loud if the FCM v1 service account is missing — otherwise every push
+    // silently returns not-delivered (the prod incident on 2026-07-02).
+    if (!require('./services/fcm.service').isConfigured()) {
+      logger.warn('FCM v1 NOT configured — push notifications will NOT be sent. Set FCM_PROJECT_ID, FCM_CLIENT_EMAIL, FCM_PRIVATE_KEY.');
+    }
     // Register cron jobs only AFTER the HTTP listener is up — guarantees
     // a job can't fire before the app is healthy enough to serve dependent
     // queries. CRON_DISABLED=true env flag short-circuits inside init().

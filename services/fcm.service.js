@@ -43,6 +43,10 @@ function configured() {
 // Cached OAuth2 access token (≈1h TTL); refreshed when within 60s of expiry.
 let cachedToken = null; // { token, exp } — exp in epoch seconds
 
+// Latches after the first "not configured" warning so a misconfigured deploy
+// surfaces the cause once (not on every push attempt).
+let warnedUnconfigured = false;
+
 async function getAccessToken() {
   const now = Math.floor(Date.now() / 1000);
   if (cachedToken && cachedToken.exp > now + 60) return cachedToken.token;
@@ -78,7 +82,17 @@ async function sendPush({ token, title, body, data = {} }) {
     logger.test(`Push suppressed (NOTIFICATIONS_DISABLE) · token=${token.slice(0, 12)}… · "${title}"`);
     return { delivered: false, disabled: true };
   }
-  if (!configured()) return { delivered: false, error: 'FCM v1 not configured' };
+  if (!configured()) {
+    // Fail loud (once per process). The #1 silent-push cause is a deploy that
+    // never received the FCM v1 service-account env vars — previously this just
+    // returned not-delivered with no signal (prod incident 2026-07-02). The
+    // boot-time check in server.js catches it even earlier, at startup.
+    if (!warnedUnconfigured) {
+      warnedUnconfigured = true;
+      logger.warn('Push NOT sent — FCM v1 not configured (missing FCM_PROJECT_ID / FCM_CLIENT_EMAIL / FCM_PRIVATE_KEY). Suppressing further occurrences this run.');
+    }
+    return { delivered: false, error: 'FCM v1 not configured' };
+  }
 
   // ── TEST-MODE INTERCEPTION (unchanged contract from the legacy sender) ──
   let redirected = false;
@@ -137,4 +151,4 @@ async function sendPush({ token, title, body, data = {} }) {
   }
 }
 
-module.exports = { sendPush };
+module.exports = { sendPush, isConfigured: configured };

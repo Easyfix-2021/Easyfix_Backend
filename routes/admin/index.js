@@ -93,6 +93,7 @@ router.use('/settings',        require('./settings'));
 // (easyfix_properties.scheduled.jobs.visible.emails); no role/menu
 // permission seeded.
 router.use('/scheduled-jobs',  require('./scheduled-jobs'));
+router.use('/validate',        require('./validate')); // Validate Flows — property-gated test-push (validate.flows.emails)
 router.use('/reports',         require('./reports'));
 router.use('/aux',             require('./auxiliary'));
 router.use('/legacy',          require('./legacy'));

@@ -147,6 +147,7 @@ async function resolveJobPincodeContext(job) {
     ? String(job.pin_code).trim()
     : null;
   const jobZoneIds = new Set();
+  const jobZonePincodes = new Set();
   if (jobPin) {
     try {
       const [rows] = await pool.query(
@@ -161,8 +162,30 @@ async function resolveJobPincodeContext(job) {
     } catch (e) {
       logger.warn({ err: e.message, jobPin }, 'candidate-ranking: job-pincode zone lookup failed');
     }
+    if (jobZoneIds.size > 0) {
+      // Every pincode sharing a zone with the job pincode — the search space for
+      // widening by a tech's CURRENT pincode (efr_pin_no) or SERVICEABLE pincode,
+      // not just their home zone_city.
+      try {
+        const [pinRows] = await pool.query(
+          `SELECT DISTINCT p.pincode
+             FROM tbl_zone_pincode_mapping zpm
+             JOIN tbl_pincode p ON p.pincode_id = zpm.pincode_id
+            WHERE zpm.zone_id IN (${[...jobZoneIds].map(() => '?').join(',')})`,
+          [...jobZoneIds],
+        );
+        for (const r of pinRows) if (r.pincode != null) jobZonePincodes.add(String(r.pincode).trim());
+      } catch (e) {
+        logger.warn({ err: e.message, jobPin }, 'candidate-ranking: zone-pincode set lookup failed');
+      }
+    } else {
+      // NOT silent: an unmapped job pincode is exactly why zone-widening can't
+      // fire (see the pincode→zone population gap) — surface it so ops can map
+      // the pincode in Manage Pincodes rather than wonder why the pool is thin.
+      logger.warn('Job pincode is not mapped to any zone — zone-widening unavailable · jobPin=' + jobPin + ' (map it in Manage Pincodes → Zones to enable widening)');
+    }
   }
-  return { jobPin, jobZoneIds };
+  return { jobPin, jobZoneIds, jobZonePincodes };
 }
 
 /*
@@ -249,7 +272,7 @@ async function jobOfferTableExists() {
  * call with true; if zero rows return, caller re-invokes with false and tags
  * the result.
  */
-async function l1Eligibility(job, { applyDeepSkill = true, zoneIds = null, excludeEfrIds = null } = {}) {
+async function l1Eligibility(job, { applyDeepSkill = true, zoneIds = null, zonePincodes = null, excludeEfrIds = null } = {}) {
   /*
    * Layer-1 eligibility, scoped EITHER to the job's city (default pass) OR —
    * for the zone-widening fallback — to the job pincode's zone(s).
@@ -277,15 +300,31 @@ async function l1Eligibility(job, { applyDeepSkill = true, zoneIds = null, exclu
 
   // ── Geographic scope ──
   if (Array.isArray(zoneIds) && zoneIds.length > 0) {
-    // Zone-widening pass: technicians whose home zone (efr_zone_city_id →
-    // tbl_zone_city_mapping.zone_id) is one of the job pincode's zones.
-    // Mirrors the tech-zone chain used elsewhere in this service. Legacy had
-    // no pincode→zone scoping; this is built on the new-CRM zone model.
-    where.push(`e.efr_zone_city_id IN (
+    // Zone-widening pass — a technician qualifies if they operate in the job
+    // pincode's zone(s) by ANY of:
+    //   (1) HOME zone  — efr_zone_city_id → tbl_zone_city_mapping.zone_id
+    //   (2) CURRENT pincode — efr_pin_no is one of the zone's pincodes
+    //   (3) SERVICEABLE pincode — a pincode in their serviceable CSV is in the
+    //       zone (REPLACE strips spaces so FIND_IN_SET matches "122001, 122002")
+    // (2)/(3) need the zone's pincode set (zonePincodes); without it we fall
+    // back to home-zone only. Built on the new-CRM zone model (legacy had none).
+    const zoneClauses = [`e.efr_zone_city_id IN (
           SELECT zcm.city_zone_id FROM tbl_zone_city_mapping zcm
            WHERE zcm.zone_id IN (${zoneIds.map(() => '?').join(',')})
-        )`);
+        )`];
     params.push(...zoneIds);
+    const zonePins = Array.isArray(zonePincodes) ? zonePincodes.filter(Boolean) : [];
+    if (zonePins.length > 0) {
+      zoneClauses.push(`e.efr_pin_no IN (${zonePins.map(() => '?').join(',')})`);
+      params.push(...zonePins);
+      zoneClauses.push(`EXISTS (
+            SELECT 1 FROM tbl_efr_serviceable_pincodes sp
+             WHERE sp.easyfixer_id = e.efr_id
+               AND (${zonePins.map(() => `FIND_IN_SET(?, REPLACE(sp.pincodes, ' ', ''))`).join(' OR ')})
+          )`);
+      params.push(...zonePins);
+    }
+    where.push(`(${zoneClauses.join('\n          OR ')})`);
   } else {
     // City-scoped pass (default) — same city as the job.
     where.push('e.efr_cityId = ?');
@@ -930,7 +969,7 @@ function buildCandidateRow(tech, s, job) {
  *   - COD job + balance <= floor                (when enforceCodBalance)
  */
 function filterAndScore(eligible, stats, job, opts) {
-  const { enforceMaxConcurrent, enforceCodBalance, enforceAttendance, isCod, balanceFloor } = opts;
+  const { enforceMaxConcurrent, enforceCodBalance, enforceAttendance, softAttendance, isCod, balanceFloor } = opts;
   const scored = [];
   const rejected = [];
   for (const e of eligible) {
@@ -948,9 +987,15 @@ function filterAndScore(eligible, stats, job, opts) {
     // only for display + a soft confidence-score weight, never a gate). Present-
     // definition matches legacy (tbl_easyfixer_attendance: NOT is_leave_marked
     // AND (morning_slot OR evening_slot), DATE(created_on) = job date).
-    if (enforceAttendance && !s.attendance_for_job_date) {
+    if (enforceAttendance && !s.attendance_for_job_date && !softAttendance) {
       rejected.push({ efr_id: e.efr_id, efr_name: e.efr_name, reason: 'not present (attendance not marked) for job date' }); continue;
     }
+    // SOFT attendance (manual Schedule & Assign): absent techs are NOT excluded
+    // here — they stay in `scored` and the present-first sort in
+    // rankCandidatesForJob demotes them below present techs, so the top-N slice
+    // keeps present techs as a priority and only BACKFILLS with absent ones to
+    // fill the list. HARD mode (auto-assign-on-create) already `continue`d above.
+    // (same-slot / max-concurrent / COD gates below still apply to everyone.)
     if (enforceMaxConcurrent && s.active_jobs >= s.max_concurrent) {
       rejected.push({ efr_id: e.efr_id, efr_name: e.efr_name, reason: `saturated (${s.active_jobs} active jobs)` }); continue;
     }
@@ -1017,6 +1062,7 @@ function filterAndScore(eligible, stats, job, opts) {
 async function rankCandidatesForJob(jobId, {
   limit = 10, jobDate, timeSlot,
   enforceMaxConcurrent = true, enforceCodBalance = false, enforceAttendance = true,
+  softAttendance = false,
   preloadedJob = null,
 } = {}) {
   logger.info('Rank candidates for job · jobId=' + jobId + ' limit=' + limit + (jobDate ? ' jobDate=' + jobDate : '') + (timeSlot != null && timeSlot !== '' ? ' timeSlot=' + timeSlot : ''));
@@ -1123,12 +1169,17 @@ async function rankCandidatesForJob(jobId, {
     enforceMaxConcurrent, enforceCodBalance,
     // Hard-filter attendance only inside the today/tomorrow marking window.
     enforceAttendance: enforceAttendance && attendanceWindowActive,
+    // SOFT attendance (manual Schedule & Assign): keep absent techs in the list
+    // (present-first sort + backfill) instead of excluding them → the list is
+    // never empty while present techs keep priority. Auto-assign leaves this
+    // false so attendance stays a HARD gate.
+    softAttendance,
     isCod, balanceFloor,
   };
 
   // Job-pincode zone-set — drives the zone-widening fallback below. Cheap
   // single query; fail-soft to an empty set (no zones → no widening).
-  const { jobZoneIds } = await resolveJobPincodeContext(job);
+  const { jobZoneIds, jobZonePincodes } = await resolveJobPincodeContext(job);
 
   // ── Pass 1: CITY-scoped eligibility (+ skill-drop fallback if zero) ──
   let appliedDeepSkill = true;
@@ -1168,10 +1219,11 @@ async function rankCandidatesForJob(jobId, {
   if (scored.length < DEFAULTS.MIN_CANDIDATES_BEFORE_WIDEN && jobZoneIds.size > 0) {
     logger.info('Zone-widening fallback · scored=' + scored.length + ' below threshold ' + DEFAULTS.MIN_CANDIDATES_BEFORE_WIDEN + ' · widening to ' + jobZoneIds.size + ' zone(s)');
     const zoneIds = [...jobZoneIds];
+    const zonePincodes = [...jobZonePincodes];
     const excludeEfrIds = eligible.map((e) => e.efr_id);
-    let zoneEligible = await l1Eligibility(job, { applyDeepSkill: appliedDeepSkill, zoneIds, excludeEfrIds });
+    let zoneEligible = await l1Eligibility(job, { applyDeepSkill: appliedDeepSkill, zoneIds, zonePincodes, excludeEfrIds });
     if (zoneEligible.length === 0 && appliedDeepSkill && (job.fk_service_catg_id || job.fk_service_type_id)) {
-      zoneEligible = await l1Eligibility(job, { applyDeepSkill: false, zoneIds, excludeEfrIds });
+      zoneEligible = await l1Eligibility(job, { applyDeepSkill: false, zoneIds, zonePincodes, excludeEfrIds });
       if (zoneEligible.length > 0 && !note) note = 'no_deep_skill_match';
     }
     if (zoneEligible.length > 0) {
@@ -1199,11 +1251,16 @@ async function rankCandidatesForJob(jobId, {
     };
   }
 
-  // Priority-order ranking (NOT a weighted score): existing-tech preference
-  // first — worked in this Vertical, then worked for this Client — then past
-  // performance (Rating/TAT/SDA) as the tiebreaker. Attendance is a filter, not
-  // a ranker. Balance is shown as a column, never a sort input.
+  // Priority-order ranking (NOT a weighted score): PRESENT-for-job-date techs
+  // first (so soft-attendance backfill can never bury a present tech below an
+  // absent one, and the top-N slice keeps present techs as the priority), then
+  // existing-tech preference — worked in this Vertical, then worked for this
+  // Client — then past performance (Rating/TAT/SDA) as the tiebreaker. In HARD
+  // attendance mode every scored tech is present, so the attendance key is a
+  // no-op (no behaviour change for auto-assign). Balance is a column, never a
+  // sort input.
   scored.sort((a, b) => {
+    if (a.attendance_for_job_date !== b.attendance_for_job_date) return a.attendance_for_job_date ? -1 : 1;
     if (a.worked_for_vertical !== b.worked_for_vertical) return a.worked_for_vertical ? -1 : 1;
     if (a.worked_for_client   !== b.worked_for_client)   return a.worked_for_client   ? -1 : 1;
     return b.performance - a.performance;

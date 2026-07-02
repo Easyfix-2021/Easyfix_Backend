@@ -19,6 +19,7 @@ const logger = require('../logger');
 const FEATURES = {
   canSwitchCallMode: 'access.callmode.emails',
   canDeleteEntities: 'access.entitydelete.emails',
+  canValidateFlows: 'validate.flows.emails',
 };
 
 // Is `email` on the allowlist held in easyfix_properties[propertyKey]?

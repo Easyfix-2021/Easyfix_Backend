@@ -452,6 +452,27 @@ async function getCandidates(jobId, { limit = 10, ignoreDistance = false } = {})
  */
 const candidateRanking = require('./candidate-ranking.service');
 
+/*
+ * Aggregate the ranker's per-tech rejection reasons into a compact
+ * "reason ×count" summary for logs + API details, so an empty auto-assign
+ * explains WHY (mirrors the Schedule & Assign modal's per-tech reasons).
+ * Variable parenthetical detail (active-job counts, balances) is normalised so
+ * like reasons group together. Empty string when there's nothing to summarise.
+ */
+function summariseRejections(rejected) {
+  const counts = new Map();
+  for (const r of rejected || []) {
+    const raw = String(r.reason || 'unknown');
+    let key = raw;
+    if (raw.includes('attendance')) key = 'attendance not marked for job date';
+    else if (raw.includes('same slot')) key = 'same-day + same-slot conflict';
+    else if (raw.startsWith('saturated')) key = 'max concurrent jobs reached';
+    else if (raw.startsWith('COD')) key = 'COD balance below floor';
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  return [...counts.entries()].map(([k, n]) => `${k} ×${n}`).join('; ');
+}
+
 async function assignTopCandidate(jobId, actor) {
   logger.info('Auto-assign top candidate · jobId=' + jobId);
   // Attendance is hard-filtered only for jobs scheduled TODAY/TOMORROW (the
@@ -466,13 +487,28 @@ async function assignTopCandidate(jobId, actor) {
     throw err;
   }
   if (!result.candidates.length) {
+    // Surface WHY nothing was assignable (mirrors the Schedule & Assign modal):
+    // l1Count>0 with reasons ⇒ techs matched but every one failed a hard gate
+    // (attendance / same-slot / balance); l1Count 0 ⇒ genuine supply gap.
+    const reasonSummary = summariseRejections(result.rejected);
+    logger.warn(
+      'Auto-assign found no assignable candidate · jobId=' + jobId
+      + ' · l1Eligible=' + result.l1Count + ' · rejected=' + result.rejected.length
+      + (result.note ? ' · note=' + result.note : '')
+      + (reasonSummary ? ' · reasons: ' + reasonSummary : '')
+    );
     const err = new Error(
       result.note === 'no_deep_skill_match'
         ? 'no candidate matched the deep-skill required for this job'
         : 'no eligible candidate found'
     );
     err.status = 422;
-    err.details = { l1Count: result.l1Count, rejectedCount: result.rejected.length, note: result.note };
+    err.details = {
+      l1Count: result.l1Count,
+      rejectedCount: result.rejected.length,
+      note: result.note,
+      rejectedReasons: reasonSummary,
+    };
     throw err;
   }
 
@@ -515,10 +551,15 @@ async function bulkAssignUnassigned({ limit = 50, dryRun = false } = {}, actor) 
       // service, so far-future on-create jobs are unaffected. Keep the default.
       const ranked = await candidateRanking.rankCandidatesForJob(job_id, { limit: 50 });
       if (!ranked.candidates.length) {
+        const reasonSummary = summariseRejections(ranked.rejected);
+        logger.warn('Bulk auto-assign · no candidate · jobId=' + job_id
+          + ' · l1Eligible=' + ranked.l1Count + ' · rejected=' + ranked.rejected.length
+          + (ranked.note ? ' · note=' + ranked.note : '')
+          + (reasonSummary ? ' · reasons: ' + reasonSummary : ''));
         results.push({
           jobId: job_id, status: 'no_candidate',
           l1Count: ranked.l1Count, rejectedCount: ranked.rejected.length,
-          note: ranked.note,
+          note: ranked.note, rejectedReasons: reasonSummary,
         });
         continue;
       }

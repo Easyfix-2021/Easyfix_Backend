@@ -3320,11 +3320,25 @@ async function tryAutoAssignOnCreate(jobId, clientId, actor) {
       logger.info(`Auto-assign skipped for job ${jobId} — already assigned (likely manual race): ${err.message}`);
       return;
     }
+    // err.details (from assignTopCandidate) carries the ranker diagnostics:
+    // { l1Count, rejectedCount, note, rejectedReasons }. Surface them in BOTH
+    // the log and the ops email so "no technician" is explained, not opaque.
+    const details = err.details || {};
     const reason =
-      err.status === 422 ? 'No eligible technician was found for this job.' :
-      err.status === 404 ? `Job could not be resolved (${err.message}).` :
-      `Auto-assignment errored before the technician could be saved: ${err.message}`;
-    logger.warn(`Auto-assign failed for job ${jobId}: ${err.message} (status=${err.status ?? 'unknown'})`);
+      err.status === 422
+        ? (details.l1Count > 0 && details.rejectedReasons
+            ? `${details.l1Count} technician(s) matched the skill & area, but none were available: ${details.rejectedReasons}.`
+            : 'No active, verified technician with the required skill was found for this job.')
+      : err.status === 404 ? `Job could not be resolved (${err.message}).`
+      : `Auto-assignment errored before the technician could be saved: ${err.message}`;
+    logger.warn(
+      `Auto-assign failed for job ${jobId}: ${err.message} (status=${err.status ?? 'unknown'})`
+      + (err.status === 422
+          ? ` · l1Eligible=${details.l1Count ?? '?'} · rejected=${details.rejectedCount ?? '?'}`
+            + (details.note ? ` · note=${details.note}` : '')
+            + (details.rejectedReasons ? ` · reasons: ${details.rejectedReasons}` : '')
+          : '')
+    );
     await notifyAutoAssignFailure(jobId, clientId, reason);
   }
 }

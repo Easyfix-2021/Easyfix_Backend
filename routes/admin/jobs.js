@@ -99,6 +99,11 @@ router.get('/:id/candidates',
         // the balance floor.
         enforceMaxConcurrent: false,
         enforceCodBalance: true,
+        // Manual picker: attendance is SOFT — present techs rank first, absent
+        // techs (shown with the ✗ column) backfill the list to `limit` instead
+        // of being excluded, so the Top-10 is never empty when eligible techs
+        // exist. (Auto-assign keeps attendance a HARD gate — it omits this.)
+        softAttendance: true,
         // scopedJob already loaded this job — hand it over so the service
         // doesn't run a second (redundant) getById on the hot path.
         preloadedJob: req.scopedJob,

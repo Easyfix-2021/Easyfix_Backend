@@ -102,7 +102,11 @@ async function sendJobOfferPush(efrId, { jobId } = {}) {
       return { delivered: false, reason: 'no tokens' };
     }
 
-    const data = { type: 'job_offer', job_id: String(jobId) };
+    // `type`/`job_id` route the NEW Expo app; `screen`/`key` mirror the LEGACY
+    // Flutter app's push contract (it routes on data.screen==='NewTicket' and reads
+    // data.key) so an offered job deep-links to the accept screen on BOTH apps
+    // during coexistence.
+    const data = { type: 'job_offer', job_id: String(jobId), key: String(jobId), screen: 'NewTicket' };
 
     const results = await Promise.all(
       tokens.map(async (token) => {
