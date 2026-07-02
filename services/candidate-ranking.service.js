@@ -84,30 +84,52 @@ const PERFORMANCE_SUB = Object.freeze({
   sda:    20 / 70,
 });
 
-// ─── Setting resolvers (with safe fallbacks) ─────────────────────────
+// ─── Ranking config resolver (batched, with safe fallbacks) ──────────
 /*
- * Settings precedence (delegated to settings.getClientSetting):
+ * Settings precedence (same as settings.getClientSetting):
  *   1. Per-client override   — tbl_client_setting row for (client_id, setting_id)
  *   2. Global default        — tbl_autoallocation_setting.default_value
- *   3. Built-in fallback     — the `fallback` argument in resolveInt below
+ *   3. Built-in fallback     — the DEFAULTS constant below
  *
  * The candidate-ranking pipeline always passes `job.fk_client_id` so step 1
  * fires whenever the job has a client. Cross-client jobs (fk_client_id IS NULL)
  * skip step 1 and resolve directly to global → built-in.
+ *
+ * getRankingConfig batches the FIVE static ranking keys into ONE round-trip:
+ * settings.getAllForClient runs 2 queries (master list + this client's
+ * overrides) and returns every key already coerced to its data_type. That
+ * replaces the previous 5× getClientSetting (10 sequential queries) — and,
+ * because rankCandidatesForJob resolves it once and hands it to BOTH the city
+ * and zone-widening stats passes, it drops from ~20 settings round-trips per
+ * request to 2. REALTIME (no cache): the two queries hit tiny tables
+ * (tbl_autoallocation_setting=30 rows, tbl_client_setting per-client), so an
+ * ops toggle still takes effect on the very next request — preserving
+ * settings.service's deliberate no-cache contract.
  */
-async function resolveInt(clientId, key, fallback) {
+async function getRankingConfig(clientId) {
+  let byKey = new Map();
   try {
-    const v = await settings.getClientSetting(clientId, key);
-    const n = Number(v);
+    const rows = await settings.getAllForClient(clientId || null);
+    byKey = new Map(rows.map((r) => [r.key, r.effective_value]));
+  } catch { /* fall through to built-in DEFAULTS below */ }
+  const int = (key, fallback) => {
+    const n = Number(byKey.get(key));
     return Number.isFinite(n) ? n : fallback;
-  } catch { return fallback; }
-}
-async function resolveJSON(clientId, key) {
-  try {
-    const v = await settings.getClientSetting(clientId, key);
-    if (v == null || v === '') return null;
-    return typeof v === 'object' ? v : JSON.parse(v);
-  } catch { return null; }
+  };
+  // getAllForClient coerces 'json' data_type to an object already; tolerate a
+  // raw string too (belt-and-braces) so a mis-declared data_type still parses.
+  let tatTier = null;
+  const rawTier = byKey.get('tat_service_catg_tier');
+  if (rawTier != null && rawTier !== '') {
+    try { tatTier = typeof rawTier === 'object' ? rawTier : JSON.parse(rawTier); } catch { tatTier = null; }
+  }
+  return {
+    maxConcurrent:   int('max_concurrent_jobs',  DEFAULTS.MAX_CONCURRENT_JOBS),
+    defaultRating:   int('default_rating_value', DEFAULTS.DEFAULT_RATING),
+    defaultTatScore: int('default_tat_score',    DEFAULTS.DEFAULT_TAT_SCORE),
+    defaultSdaScore: int('default_sda_score',    DEFAULTS.DEFAULT_SDA_SCORE),
+    tatTier,
+  };
 }
 
 /*
@@ -334,7 +356,7 @@ async function l1Eligibility(job, { applyDeepSkill = true, zoneIds = null, exclu
 }
 
 // ─── Layer 2 + ranking stats ─────────────────────────────────────────
-async function statsForCandidates(efrIds, job, clientId) {
+async function statsForCandidates(efrIds, job, clientId, cfg = null) {
   if (efrIds.length === 0) return new Map();
   const placeholders = efrIds.map(() => '?').join(',');
   const lookback = DEFAULTS.STATS_LOOKBACK_DAYS;
@@ -397,12 +419,15 @@ async function statsForCandidates(efrIds, job, clientId) {
     ? String(job.requested_date_time).slice(0, 10)
     : null;
 
+  // Static ranking config — ONE batched round-trip (getRankingConfig →
+  // settings.getAllForClient) instead of the 5× getClientSetting that used to
+  // sit in this Promise.all. Resolved once per request and passed in as `cfg`
+  // (city + zone-widening passes share it); falls back to its own resolve when
+  // a caller doesn't supply it.
+  const { maxConcurrent, defaultRating, defaultTatScore, defaultSdaScore, tatTier: tatTierJson } =
+    cfg || (await getRankingConfig(clientId));
+
   const [
-    maxConcurrent,
-    defaultRating,
-    defaultTatScore,
-    defaultSdaScore,
-    tatTierJson,
     [activeRows],
     [completedRows],
     conflictRowsResult,
@@ -419,12 +444,6 @@ async function statsForCandidates(efrIds, job, clientId) {
     concurrentRowsResult,
     techZoneRowsResult,
   ] = await Promise.all([
-    resolveInt(clientId,  'max_concurrent_jobs',  DEFAULTS.MAX_CONCURRENT_JOBS),
-    resolveInt(clientId,  'default_rating_value', DEFAULTS.DEFAULT_RATING),
-    resolveInt(clientId,  'default_tat_score',    DEFAULTS.DEFAULT_TAT_SCORE),
-    resolveInt(clientId,  'default_sda_score',    DEFAULTS.DEFAULT_SDA_SCORE),
-    resolveJSON(clientId, 'tat_service_catg_tier'),
-
     // Active jobs (status 0/1/2)
     pool.query(
       `SELECT fk_easyfixter_id AS efr_id, COUNT(*) AS active_jobs
@@ -1035,6 +1054,7 @@ async function rankCandidatesForJob(jobId, {
    */
   let deepSkillLabel = null;
   let serviceTypeName = null;
+  let serviceCatgName = null;
   if (job.fk_service_catg_id || job.fk_service_type_id) {
     const [[labels]] = await pool.query(
       `SELECT
@@ -1045,6 +1065,7 @@ async function rankCandidatesForJob(jobId, {
     // "Carpentry > Wood Repair" if both present, else whichever's set.
     deepSkillLabel = [labels?.catg_name, labels?.type_name].filter(Boolean).join(' › ') || null;
     serviceTypeName = labels?.type_name ?? null;
+    serviceCatgName = labels?.catg_name ?? null;
   }
 
   // Pre-build the enriched job payload used in ALL return paths (early-exit
@@ -1060,9 +1081,13 @@ async function rankCandidatesForJob(jobId, {
     city_id:           job.city_id          ?? null,
     city_name:         job.city_name        ?? null,
     pin_code:          job.pin_code         ?? null,
-    service_category:  job.service_category ?? null,
+    // Prefer the RESOLVED category name (from fk_service_catg_id) over the
+    // legacy free-text job.service_category column, which is NULL on most
+    // client-imported jobs (why the modal header showed "—").
+    service_category:  serviceCatgName ?? job.service_category ?? null,
     service_type:      serviceTypeName      ?? null,
     deep_skill_label:  deepSkillLabel       ?? null,
+    services:          mapJobServices(job),
     job_type:          job.job_type         ?? null,
     payment_mode:      paidByLabel(job.paid_by),
     requested_date_time: job.requested_date_time ?? null,
@@ -1120,9 +1145,14 @@ async function rankCandidatesForJob(jobId, {
   let rejected = [];
   let totalEligible = eligible.length;
   let cfgMaxConcurrent = DEFAULTS.MAX_CONCURRENT_JOBS;
+  // Batched ranking config — resolved at most ONCE (only when there are
+  // eligible techs to score) and shared by the city + zone stats passes so we
+  // don't pay the settings round-trip twice.
+  let rankingCfg = null;
 
   if (eligible.length > 0) {
-    const stats = await statsForCandidates(eligible.map((e) => e.efr_id), job, job.fk_client_id);
+    rankingCfg = await getRankingConfig(job.fk_client_id);
+    const stats = await statsForCandidates(eligible.map((e) => e.efr_id), job, job.fk_client_id, rankingCfg);
     cfgMaxConcurrent = stats.values().next().value?.max_concurrent ?? cfgMaxConcurrent;
     const r = filterAndScore(eligible, stats, job, filterOpts);
     scored = r.scored;
@@ -1146,7 +1176,8 @@ async function rankCandidatesForJob(jobId, {
     }
     if (zoneEligible.length > 0) {
       totalEligible += zoneEligible.length;
-      const zStats = await statsForCandidates(zoneEligible.map((e) => e.efr_id), job, job.fk_client_id);
+      rankingCfg = rankingCfg || (await getRankingConfig(job.fk_client_id));
+      const zStats = await statsForCandidates(zoneEligible.map((e) => e.efr_id), job, job.fk_client_id, rankingCfg);
       if (cfgMaxConcurrent === DEFAULTS.MAX_CONCURRENT_JOBS) {
         cfgMaxConcurrent = zStats.values().next().value?.max_concurrent ?? cfgMaxConcurrent;
       }
@@ -1256,6 +1287,25 @@ async function ensureAssignedFirst(candidatesList, assignedEfrId, job, scoredAll
  * is the single source of truth for the customer-paid customer-balance gate
  * applied in pickAutoAssignCandidate — accepts both 2 and 'Customer'/'customer'.
  */
+/*
+ * Compact per-service breakdown (service name / category / type / qty / charge)
+ * for the Schedule & Assign modal header. Source rows come from job.services
+ * (populated only on the full-getById path — i.e. the route's req.scopedJob
+ * preloadedJob); the getByIdCore / auto-assign path carries no services → [].
+ * Active rows only (job_service_status !== 0 hides soft-deleted lines).
+ */
+function mapJobServices(job) {
+  return (Array.isArray(job.services) ? job.services : [])
+    .filter((s) => s.job_service_status !== 0)
+    .map((s) => ({
+      service_name: s.service_name      ?? null,
+      service_catg: s.service_catg_name ?? null,
+      service_type: s.service_type_name ?? null,
+      quantity:     s.quantity          ?? null,
+      total_charge: s.total_charge      ?? null,
+    }));
+}
+
 function paidByLabel(raw) {
   const n = Number(raw);
   if (Number.isFinite(n)) {
@@ -1362,12 +1412,23 @@ async function searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit =
     idClause = ' OR e.efr_id = ?';
     params.push(Number(q));
   }
+  // Search is a "match-anyone" override so ops can bypass the RANKING filters
+  // (deep-skill match, distance, serviceable pincode, attendance, same-slot
+  // conflict, max-concurrent, COD balance, scheduling_history rejection) and
+  // assign a specific tech. But it must still enforce the two IDENTITY gates
+  // that make a row an assignable technician at all — the same hard gates
+  // l1Eligibility applies: efr_status = 1 (ACTIVE — canonical, do NOT invert to
+  // 0) AND is_technician_verified = 1 (verified profile). Without these, search
+  // surfaced inactive / unverified / incomplete-profile ghosts (e.g. a NULL
+  // is_technician_verified row with no efr_name) that can never be assigned.
   const [techRows] = await pool.query(
     `SELECT e.efr_id, e.efr_name, e.efr_no, e.efr_email,
             e.efr_cityId, c.city_name, e.current_balance
        FROM tbl_easyfixer e
        LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId
-      WHERE (e.efr_name LIKE ? OR e.efr_no LIKE ?${idClause})
+      WHERE e.efr_status = 1
+        AND e.is_technician_verified = 1
+        AND (e.efr_name LIKE ? OR e.efr_no LIKE ?${idClause})
       ORDER BY e.efr_name ASC
       LIMIT ?`,
     [...params, cap + 1],
@@ -1397,18 +1458,22 @@ async function searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit =
  * own fk_service_type_id — we do that inline here.
  */
 async function searchJobHeader(job) {
+  // Resolve BOTH category + type names from the job's FK ids (same as the
+  // ranked header) — job.service_category is a legacy free-text column that is
+  // NULL on most client-imported jobs.
   let serviceTypeName = null;
-  if (job.fk_service_type_id) {
-    const [[st]] = await pool.query(
-      'SELECT service_type_name FROM tbl_service_type WHERE service_type_id = ? LIMIT 1',
-      [job.fk_service_type_id]
-    );
-    serviceTypeName = st?.service_type_name ?? null;
-  }
-  let deepSkillLabel = null;
+  let serviceCatgName = null;
   if (job.fk_service_catg_id || job.fk_service_type_id) {
-    deepSkillLabel = [job.service_category, serviceTypeName].filter(Boolean).join(' › ') || null;
+    const [[labels]] = await pool.query(
+      `SELECT
+         (SELECT service_catg_name FROM tbl_service_catg WHERE service_catg_id = ?) AS catg_name,
+         (SELECT service_type_name FROM tbl_service_type WHERE service_type_id = ?) AS type_name`,
+      [job.fk_service_catg_id || 0, job.fk_service_type_id || 0]
+    );
+    serviceTypeName = labels?.type_name ?? null;
+    serviceCatgName = labels?.catg_name ?? null;
   }
+  const deepSkillLabel = [serviceCatgName, serviceTypeName].filter(Boolean).join(' › ') || null;
   return {
     job_id:            job.job_id,
     fk_client_id:      job.fk_client_id,
@@ -1420,9 +1485,10 @@ async function searchJobHeader(job) {
     city_id:           job.city_id          ?? null,
     city_name:         job.city_name        ?? null,
     pin_code:          job.pin_code         ?? null,
-    service_category:  job.service_category ?? null,
+    service_category:  serviceCatgName ?? job.service_category ?? null,
     service_type:      serviceTypeName      ?? null,
     deep_skill_label:  deepSkillLabel       ?? null,
+    services:          mapJobServices(job),
     job_type:          job.job_type         ?? null,
     payment_mode:      paidByLabel(job.paid_by),
     requested_date_time: job.requested_date_time ?? null,
