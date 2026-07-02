@@ -21,6 +21,33 @@ function offerFlowEnabled() {
 }
 
 /*
+ * Auto-ensure a job's pincode exists in tbl_pincode (geocoded + state/city) so
+ * distance ranking works and an admin can zone-map it — closes the gap where
+ * jobs are created with pincodes absent from the pincode catalog. Reuses the
+ * idempotent pincode.service.ensurePincode (existing pincode ⇒ one indexed
+ * SELECT, no geocode/write). Best-effort + fire-and-forget: called AFTER the
+ * job txn commits and NEVER throws — a bad / non-India pincode, a Google
+ * outage, or a missing API key just logs. Does NOT create zone mappings (those
+ * stay admin-curated). Gated by easyfix_properties 'job.ensure.pincode.enabled'
+ * (DEFAULT OFF — flip to 'true' to enable after monitoring).
+ */
+function ensurePincodeEnabled() {
+  return String(getProperty('job.ensure.pincode.enabled') ?? 'false').toLowerCase() === 'true';
+}
+async function ensureJobPincode(pincode, actor) {
+  if (!ensurePincodeEnabled()) return;
+  const pin = String(pincode ?? '').trim();
+  if (!/^\d{6}$/.test(pin)) return;
+  try {
+    const { ensurePincode } = require('./pincode.service');
+    const res = await ensurePincode(pin, { userId: actor?.user_id ?? null });
+    logger.info('Job pincode ensured · pincode=' + pin + ' · ' + (res?.created ? 'created+geocoded' : 'already existed'));
+  } catch (e) {
+    logger.warn('Job pincode auto-ensure failed (non-fatal) · pincode=' + pin + ' · ' + e.message);
+  }
+}
+
+/*
  * EFFECTIVE offer-flow state = the property flag AND tbl_job_offer actually
  * existing (the real activation gate). This is the SAME condition assign() /
  * offerToTechnicians() use to choose offer-vs-direct-assign, exposed so the CRM
@@ -1949,6 +1976,9 @@ async function create(input, actor) {
         const logger = require('../logger');
         logger.warn(`Auto-assign on create failed for job ${jobId}: ${err.message}`);
       });
+      // Best-effort, post-commit: add this job's pincode to the pincode catalog
+      // (geocoded) if it's new. Idempotent + never throws — see ensureJobPincode.
+      ensureJobPincode(input.address?.pin_code, actor);
     });
 
     return getById(jobId);
@@ -2331,6 +2361,10 @@ async function update(jobId, input, actor) {
   } finally {
     conn.release();
   }
+  // Post-commit, best-effort: ensure a newly-set/changed pincode is in the
+  // pincode catalog (geocoded). Only when the address — including a pincode —
+  // was part of this edit (e.g. the bulk-upload Confirm & Schedule step).
+  if (hasAddressEdit && input.address?.pin_code) ensureJobPincode(input.address.pin_code, actor);
   return getById(jobId);
 }
 
