@@ -334,6 +334,12 @@ const offerBody = Joi.object({
   easyfixerIds: Joi.array().items(intId).min(1).max(50).required(),
   requestedDateTime: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$/).max(40).optional(),
   timeSlot: Joi.string().max(200).allow('', null).optional(),
+  // Where the offer was made from — the CRM sends `source` when the whole batch
+  // shares one origin (Top-10 list vs Search Result), or `sourceByEfr` to tag
+  // each tech individually when a selection mixes both lists. Stored on
+  // tbl_job_offer.offer_source. `sourceByEfr` overrides `source` per tech.
+  source: Joi.string().valid('top10', 'search', 'auto').optional(),
+  sourceByEfr: Joi.object().pattern(/^\d+$/, Joi.string().valid('top10', 'search', 'auto')).optional(),
 });
 
 /*

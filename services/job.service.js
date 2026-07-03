@@ -2700,7 +2700,7 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
  *
  * Returns the full getById() payload.
  */
-async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, timeSlot } = {}) {
+async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, timeSlot, source, sourceByEfr } = {}) {
   const ids = Array.from(new Set((Array.isArray(efrIds) ? efrIds : [efrIds])
     .map((v) => Number(v))
     .filter((n) => Number.isInteger(n) && n > 0)));
@@ -2761,22 +2761,46 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
       await conn.query(`UPDATE tbl_job SET ${sets.join(', ')} WHERE job_id = ?`, values);
     }
 
-    // Find which of the requested techs already have a live offer, so we skip
-    // re-inserting (avoids duplicate OPEN offers on a re-offer). One query.
-    const [openRows] = await conn.query(
-      `SELECT fk_easyfixter_id FROM tbl_job_offer
-        WHERE job_id = ? AND offer_status = 0
-          AND fk_easyfixter_id IN (${ids.map(() => '?').join(',')})`,
-      [jobId, ...ids],
-    );
-    const alreadyOpen = new Set(openRows.map((r) => Number(r.fk_easyfixter_id)));
-
+    // RE-OFFER SEMANTICS — ONE row per (job, tech) carrying the offer history:
+    //   offer_count = times (re)offered · created_on = FIRST offer · updated_on =
+    //   LAST offer · offered_at = LAST offer (drives the 30-min accept window).
+    // A manual re-offer (e.g. from Search Results) bumps the count + timestamps and
+    // REOPENS the offer so the tech can accept again within 30 min — whether the
+    // prior offer was stale-open, expired, or rejected. First-ever offer INSERTs.
+    // Any older stray open rows for the tech are collapsed so exactly one stays open.
     for (const efrId of ids) {
-      if (alreadyOpen.has(efrId)) continue;
-      await conn.query(
-        'INSERT INTO tbl_job_offer (job_id, fk_easyfixter_id, offer_status, offered_at) VALUES (?, ?, 0, NOW())',
+      // Per-tech offer source (top10 / search / auto): sourceByEfr wins, else the
+      // batch-wide source, else null. COALESCE on re-offer keeps the prior source
+      // when this offer didn't specify one.
+      const src = (sourceByEfr && sourceByEfr[efrId]) || source || null;
+      const [[latest]] = await conn.query(
+        `SELECT job_offer_id FROM tbl_job_offer
+          WHERE job_id = ? AND fk_easyfixter_id = ?
+          ORDER BY job_offer_id DESC LIMIT 1`,
         [jobId, efrId],
       );
+      if (latest) {
+        await conn.query(
+          `UPDATE tbl_job_offer
+              SET offer_status = 0, offered_at = NOW(), updated_on = NOW(),
+                  offer_count = offer_count + 1, offer_source = COALESCE(?, offer_source),
+                  responded_at = NULL, reject_reason = NULL, reject_reason_id = NULL
+            WHERE job_offer_id = ?`,
+          [src, latest.job_offer_id],
+        );
+        await conn.query(
+          `UPDATE tbl_job_offer SET offer_status = 3, responded_at = NOW()
+            WHERE job_id = ? AND fk_easyfixter_id = ? AND job_offer_id <> ? AND offer_status = 0`,
+          [jobId, efrId, latest.job_offer_id],
+        );
+      } else {
+        await conn.query(
+          `INSERT INTO tbl_job_offer
+             (job_id, fk_easyfixter_id, offer_status, offered_at, created_on, updated_on, offer_count, offer_source)
+           VALUES (?, ?, 0, NOW(), NOW(), NOW(), 1, ?)`,
+          [jobId, efrId, src],
+        );
+      }
       offeredIds.push(efrId);
     }
 

@@ -94,6 +94,7 @@ router.use('/settings',        require('./settings'));
 // permission seeded.
 router.use('/scheduled-jobs',  require('./scheduled-jobs'));
 router.use('/validate',        require('./validate')); // Validate Flows — property-gated test-push (validate.flows.emails)
+router.use('/skill-matrix',    require('./skill-matrix')); // Build Skill Matrix — property-gated AI build (skill.matrix.emails)
 router.use('/reports',         require('./reports'));
 router.use('/aux',             require('./auxiliary'));
 router.use('/legacy',          require('./legacy'));

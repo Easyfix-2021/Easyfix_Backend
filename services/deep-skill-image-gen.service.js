@@ -90,7 +90,7 @@ function getModel() {
  * so the kill switch is instant.
  */
 async function isAutoGenEnabled() {
-  if (!process.env.OPENAI_API_KEY) return false;
+  if (!process.env.OPENAI_API_KEY_DEEPSKILL_IMAGE) return false;
   const raw = propertiesService.getProperty('deep_skill.auto_generate_image.enabled');
   // Cold-cache reads return undefined — treat as disabled until preload
   // resolves. Subsequent calls pick up the actual value.
@@ -157,7 +157,7 @@ async function fetchGeneratedImageBuffer(prompt) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY_DEEPSKILL_IMAGE}`,
       },
       body: JSON.stringify({
         model,

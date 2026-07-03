@@ -492,7 +492,7 @@ async function update(deepskillId, patch) {
   //   - skip if image is now non-empty (operator EXPLICITLY set one,
   //     either via this patch or it was already there).
   //   - skip if the skill is soft-deleted (status !== 1).
-  //   - skip if feature flag or OPENAI_API_KEY is off.
+  //   - skip if feature flag or OPENAI_API_KEY_DEEPSKILL_IMAGE is off.
   // Patch path doesn't include the manual image-upload route — that
   // goes through replaceImage() — so we're safe to trigger from any
   // update() call that leaves deepskill_image empty.

@@ -20,6 +20,7 @@ const FEATURES = {
   canSwitchCallMode: 'access.callmode.emails',
   canDeleteEntities: 'access.entitydelete.emails',
   canValidateFlows: 'validate.flows.emails',
+  canBuildSkillMatrix: 'skill.matrix.emails',
 };
 
 // Is `email` on the allowlist held in easyfix_properties[propertyKey]?

@@ -15,7 +15,7 @@ const logger = require('../logger');
  * other provider in this repo is called via fetch too). JSON mode + temp 0 for
  * stable, parseable output.
  *
- * Gating: AI_CONVERSATION_ENABLED must be 'true' AND OPENAI_API_KEY must be
+ * Gating: AI_CONVERSATION_ENABLED must be 'true' AND OPENAI_API_KEY_CONVERSATION must be
  * set; otherwise interpretReply returns { intent: 'unclear', disabled: true }
  * so the caller falls back to a re-prompt (never crashes the conversation).
  */
@@ -24,7 +24,7 @@ const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
 
 function aiEnabled() {
   return String(process.env.AI_CONVERSATION_ENABLED).toLowerCase() === 'true'
-    && !!process.env.OPENAI_API_KEY;
+    && !!process.env.OPENAI_API_KEY_CONVERSATION;
 }
 
 // IST "today" context so the model can resolve relative dates ("tomorrow",
@@ -90,7 +90,7 @@ async function interpretReply({ step, text, timeSlots = [] }) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY_CONVERSATION}`,
       },
       body: JSON.stringify({
         model,

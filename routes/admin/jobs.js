@@ -1235,11 +1235,13 @@ router.patch('/:id/assign', validate(idParam, 'params'), validate(assignBody), s
  */
 router.post('/:id/offer', validate(idParam, 'params'), validate(offerBody), scopedJob, async (req, res, next) => {
   try {
-    const { easyfixerIds, requestedDateTime, timeSlot } = req.body;
+    const { easyfixerIds, requestedDateTime, timeSlot, source, sourceByEfr } = req.body;
     logger.info('Offer job to technicians · jobId=' + req.params.id + ' count=' + (Array.isArray(easyfixerIds) ? easyfixerIds.length : 0));
     const opts = {};
     if (requestedDateTime !== undefined) opts.requestedDateTime = requestedDateTime;
     if (timeSlot !== undefined) opts.timeSlot = timeSlot;
+    if (source !== undefined) opts.source = source;
+    if (sourceByEfr !== undefined) opts.sourceByEfr = sourceByEfr;
     const result = await job.offerToTechnicians(Number(req.params.id), easyfixerIds, req.user, opts);
     logger.info('Job offered to technicians · jobId=' + req.params.id + ' offered=' + (Array.isArray(easyfixerIds) ? easyfixerIds.length : 0));
     modernOk(res, result, 'job offered to technicians');
