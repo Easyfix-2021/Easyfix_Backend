@@ -91,6 +91,10 @@ const callListQuery = Joi.object({
   provider: Joi.string().valid('kaleyra', 'plivo').optional(),
   dateFrom: Joi.string().max(40).optional(),
   dateTo:   Joi.string().max(40).optional(),
+  // Scope history to a single phone number (matches either call leg). Used by
+  // the My Orders "call history for this number" popup so it shows only calls
+  // to/from the clicked customer mobile for the given job.
+  mobile:   Joi.string().max(20).optional(),
   page:     Joi.number().integer().min(1).default(1),
   limit:    Joi.number().integer().min(1).max(200).default(20),
 });

@@ -115,7 +115,10 @@ async function pushNoticeToTechnicians(notice) {
 
     const title = notice.title || 'EasyFix';
     const body = bodyExcerpt(notice.body);
-    const data = { type: 'notice', noticeId: String(notice.notice_id) };
+    // `screen:'notices'` is what the new Expo app's tap router matches (→ /notices);
+    // `type`/`noticeId` are kept for foreground handlers + any future per-notice link.
+    // (The old Flutter app has no notices screen, so it shows the notification only.)
+    const data = { type: 'notice', screen: 'notices', noticeId: String(notice.notice_id) };
 
     let delivered = 0;
     // Bounded concurrency — process tokens in fixed-size chunks; the

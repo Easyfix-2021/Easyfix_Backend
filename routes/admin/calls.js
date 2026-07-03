@@ -742,14 +742,26 @@ router.post('/:id/hangup', requireClickToCallAction, async (req, res, next) => {
 // ─── GET / — paginated call history ───────────────────────────────────
 router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
   try {
-    const { jobId, customerId, dateFrom, dateTo, page, limit } = req.query;
-    logger.info('List call history · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · from=' + (dateFrom || '—') + ' · to=' + (dateTo || '—') + ' · page=' + page + ' · limit=' + limit);
+    const { jobId, customerId, dateFrom, dateTo, mobile, page, limit } = req.query;
+    logger.info('List call history · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · mobile=' + (mobile ? '***' : '—') + ' · from=' + (dateFrom || '—') + ' · to=' + (dateTo || '—') + ' · page=' + page + ' · limit=' + limit);
     const where = [];
     const params = [];
     if (jobId)      { where.push('jci.job_id = ?');      params.push(jobId); }
     if (customerId) { where.push('jci.reciever_id = ?'); params.push(customerId); }
     if (dateFrom)   { where.push('jci.inserted_time >= ?'); params.push(dateFrom); }
     if (dateTo)     { where.push('jci.inserted_time < ?');  params.push(dateTo); }
+    // Number scope: match the last 10 digits against EITHER call leg (outbound
+    // → reciever = customer; inbound → caller = customer), robust to the +91 /
+    // space formatting variations stored in the legacy columns. Combined with
+    // jobId this yields exactly "calls on THIS number for THIS job" and, by
+    // construction, excludes calls on the same number for other jobs.
+    if (mobile) {
+      const digits = String(mobile).replace(/\D/g, '').slice(-10);
+      if (digits.length === 10) {
+        where.push("(RIGHT(REPLACE(REPLACE(jci.reciever, '+', ''), ' ', ''), 10) = ? OR RIGHT(REPLACE(REPLACE(jci.caller, '+', ''), ' ', ''), 10) = ?)");
+        params.push(digits, digits);
+      }
+    }
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
     const offset = (page - 1) * limit;
 
