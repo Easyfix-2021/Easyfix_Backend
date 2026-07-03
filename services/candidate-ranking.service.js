@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const { OFFER_STATUS } = require('./offer-status');
 const logger = require('../logger');
 const settings = require('./settings.service');
 const jobService = require('./job.service');
@@ -374,7 +375,7 @@ async function l1Eligibility(job, { applyDeepSkill = true, zoneIds = null, zoneP
     where.push(`e.efr_id NOT IN (
           SELECT jo.fk_easyfixter_id FROM tbl_job_offer jo
            WHERE jo.job_id = ?
-             AND jo.offer_status = 0
+             AND jo.offer_status = ${OFFER_STATUS.OFFERED}
         )`);
     params.push(job.job_id);
   }

@@ -65,6 +65,10 @@ async function isOfferFlowActive() {
 // so the two can never drift. See server/scheduler.js 'job-offer-expiry'.
 const OFFER_TTL_MINUTES = 30;
 
+// Named tbl_job_offer.offer_status codes (see services/offer-status.js) — every
+// query below interpolates ${OFFER_STATUS.X} instead of a bare 0/1/2/3.
+const { OFFER_STATUS } = require('./offer-status');
+
 /*
  * Bulk-expire OPEN offers older than OFFER_TTL_MINUTES (offer_status 0 → 3
  * EXPIRED). Reuses acceptOffer()'s exact expire shape (status=3 + responded_at).
@@ -76,8 +80,8 @@ async function expireStaleOffers(maxAgeMinutes = OFFER_TTL_MINUTES) {
   if (!(await jobOfferTableExists())) return { skipped: true, expired: 0 };
   const [r] = await pool.query(
     `UPDATE tbl_job_offer
-        SET offer_status = 3, responded_at = NOW()
-      WHERE offer_status = 0
+        SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
+      WHERE offer_status = ${OFFER_STATUS.OFFERED}
         AND offered_at < NOW() - INTERVAL ? MINUTE`,
     [maxAgeMinutes],
   );
@@ -541,7 +545,7 @@ function pendingRequestColumns(tableExists) {
 /*
  * Builds the two job-offer projection columns for the LIST query. When the
  * tbl_job_offer table exists, emits correlated subqueries reporting whether the
- * job currently has an OPEN offer (offer_status = 0) and the offered
+ * job currently has an OPEN offer (offer_status = OFFERED) and the offered
  * technician's name; otherwise emits NULL aliases so the column shape stays
  * identical on un-migrated deploys. Correlated subqueries (NOT a JOIN) — a job
  * can accrue many historical offer rows, so a JOIN would fan-out the LIST.
@@ -556,7 +560,7 @@ function offerColumns(tableExists) {
   // list. Correlated COUNT subquery on the indexed job_id column. Kept beside
   // is_offered / offered_efr_name (the latter shows the most-recent offeree's
   // name for the single-offer common case).
-  return `, (EXISTS(SELECT 1 FROM tbl_job_offer jo WHERE jo.job_id = j.job_id AND jo.offer_status = 0)) AS is_offered, (SELECT ef2.efr_name FROM tbl_job_offer jo2 JOIN tbl_easyfixer ef2 ON ef2.efr_id = jo2.fk_easyfixter_id WHERE jo2.job_id = j.job_id AND jo2.offer_status = 0 ORDER BY jo2.job_offer_id DESC LIMIT 1) AS offered_efr_name, (SELECT COUNT(*) FROM tbl_job_offer jo3 WHERE jo3.job_id = j.job_id AND jo3.offer_status = 0) AS offered_count`;
+  return `, (EXISTS(SELECT 1 FROM tbl_job_offer jo WHERE jo.job_id = j.job_id AND jo.offer_status = ${OFFER_STATUS.OFFERED})) AS is_offered, (SELECT ef2.efr_name FROM tbl_job_offer jo2 JOIN tbl_easyfixer ef2 ON ef2.efr_id = jo2.fk_easyfixter_id WHERE jo2.job_id = j.job_id AND jo2.offer_status = ${OFFER_STATUS.OFFERED} ORDER BY jo2.job_offer_id DESC LIMIT 1) AS offered_efr_name, (SELECT COUNT(*) FROM tbl_job_offer jo3 WHERE jo3.job_id = j.job_id AND jo3.offer_status = ${OFFER_STATUS.OFFERED}) AS offered_count`;
 }
 
 // Kept for getById(), which does select these as part of the full detail payload.
@@ -1354,7 +1358,7 @@ async function getAttentionSummary({ scope } = {}) {
     // than a set fk. Fall back to the legacy fk-NOT-NULL proxy on un-migrated
     // deploys (offer table absent).
     const acceptClause = hasJobOffer
-      ? 'EXISTS (SELECT 1 FROM tbl_job_offer jo WHERE jo.job_id = j.job_id AND jo.offer_status = 0)'
+      ? `EXISTS (SELECT 1 FROM tbl_job_offer jo WHERE jo.job_id = j.job_id AND jo.offer_status = ${OFFER_STATUS.OFFERED})`
       : 'j.fk_easyfixter_id IS NOT NULL';
     const where = ['j.job_status = 0',
                    acceptClause,
@@ -2782,15 +2786,15 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
       if (latest) {
         await conn.query(
           `UPDATE tbl_job_offer
-              SET offer_status = 0, offered_at = NOW(), updated_on = NOW(),
+              SET offer_status = ${OFFER_STATUS.OFFERED}, offered_at = NOW(), updated_on = NOW(),
                   offer_count = offer_count + 1, offer_source = COALESCE(?, offer_source),
                   responded_at = NULL, reject_reason = NULL, reject_reason_id = NULL
             WHERE job_offer_id = ?`,
           [src, latest.job_offer_id],
         );
         await conn.query(
-          `UPDATE tbl_job_offer SET offer_status = 3, responded_at = NOW()
-            WHERE job_id = ? AND fk_easyfixter_id = ? AND job_offer_id <> ? AND offer_status = 0`,
+          `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
+            WHERE job_id = ? AND fk_easyfixter_id = ? AND job_offer_id <> ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
           [jobId, efrId, latest.job_offer_id],
         );
       } else {
@@ -3037,8 +3041,8 @@ async function unassign(jobId, { reason, reasonId }, actor) {
       if (await jobOfferTableExists()) {
         await conn.query(
           `UPDATE tbl_job_offer
-              SET offer_status = 2, reject_reason = ?, reject_reason_id = ?, responded_at = NOW()
-            WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = 0`,
+              SET offer_status = ${OFFER_STATUS.REJECTED}, reject_reason = ?, reject_reason_id = ?, responded_at = NOW()
+            WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
           [reason.trim(), reasonId != null ? reasonId : null, jobId, techIdAtUnassign],
         );
       }
@@ -3123,7 +3127,7 @@ async function acceptOffer(jobId, efrId) {
           AND EXISTS (
             SELECT 1 FROM tbl_job_offer jo
              WHERE jo.job_id = ? AND jo.fk_easyfixter_id = ?
-               AND jo.offer_status = 0
+               AND jo.offer_status = ${OFFER_STATUS.OFFERED}
                AND jo.offered_at >= NOW() - INTERVAL ? MINUTE
           )`,
       [efrId, jobId, jobId, efrId, OFFER_TTL_MINUTES],
@@ -3132,13 +3136,13 @@ async function acceptOffer(jobId, efrId) {
     if (r.affectedRows === 1) {
       // This tech claimed it: accept their offer, expire all sibling offers.
       await conn.query(
-        `UPDATE tbl_job_offer SET offer_status = 1, responded_at = NOW()
-          WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = 0`,
+        `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.ACCEPTED}, responded_at = NOW()
+          WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
         [jobId, efrId],
       );
       await conn.query(
-        `UPDATE tbl_job_offer SET offer_status = 3, responded_at = NOW()
-          WHERE job_id = ? AND offer_status = 0`,
+        `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
+          WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
         [jobId],
       );
       await conn.commit();
@@ -3150,8 +3154,8 @@ async function acceptOffer(jobId, efrId) {
     // Lost the race (someone else won, or the job already moved on). Expire this
     // tech's own open offer, commit that, and flag a 409 to throw post-finally.
     await conn.query(
-      `UPDATE tbl_job_offer SET offer_status = 3, responded_at = NOW()
-        WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = 0`,
+      `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
+        WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
       [jobId, efrId],
     );
     await conn.commit();
@@ -3184,7 +3188,7 @@ async function techHasOpenOffer(jobId, efrId) {
   try {
     if (!(await jobOfferTableExists())) return false;
     const [[row]] = await pool.query(
-      'SELECT 1 AS ok FROM tbl_job_offer WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = 0 LIMIT 1',
+      `SELECT 1 AS ok FROM tbl_job_offer WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = ${OFFER_STATUS.OFFERED} LIMIT 1`,
       [jobId, efrId],
     );
     return !!row;
@@ -3205,8 +3209,8 @@ async function rejectOffer(jobId, efrId, { reason, reasonId } = {}) {
   }
   await pool.query(
     `UPDATE tbl_job_offer
-        SET offer_status = 2, reject_reason = ?, reject_reason_id = ?, responded_at = NOW()
-      WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = 0`,
+        SET offer_status = ${OFFER_STATUS.REJECTED}, reject_reason = ?, reject_reason_id = ?, responded_at = NOW()
+      WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
     [reason || null, reasonId != null ? reasonId : null, jobId, efrId],
   );
   return getById(jobId);
@@ -3227,10 +3231,11 @@ async function listOffers(jobId) {
   logger.info('List open offers for job · id=' + jobId);
   if (!(await jobOfferTableExists())) return [];
   const [rows] = await pool.query(
-    `SELECT jo.fk_easyfixter_id AS efr_id, ef.efr_name, jo.offered_at
+    `SELECT jo.fk_easyfixter_id AS efr_id, ef.efr_name, jo.offered_at,
+            jo.offer_status_label, jo.offer_count, jo.offer_source
        FROM tbl_job_offer jo
        JOIN tbl_easyfixer ef ON ef.efr_id = jo.fk_easyfixter_id
-      WHERE jo.job_id = ? AND jo.offer_status = 0
+      WHERE jo.job_id = ? AND jo.offer_status = ${OFFER_STATUS.OFFERED}
       ORDER BY jo.offered_at DESC`,
     [jobId],
   );
@@ -3257,7 +3262,7 @@ async function listOfferedForTech(efrId, { limit = 50 } = {}) {
   // Most-recent open offers first; cap before hydrating the full preview.
   const [offerRows] = await pool.query(
     `SELECT job_id FROM tbl_job_offer
-      WHERE fk_easyfixter_id = ? AND offer_status = 0
+      WHERE fk_easyfixter_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}
       ORDER BY offered_at DESC
       LIMIT ?`,
     [efrId, Number(limit)],

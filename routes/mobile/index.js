@@ -1,5 +1,6 @@
 const router = require('express').Router();
 const Joi = require('joi');
+const { OFFER_STATUS } = require('../../services/offer-status');
 
 const validate = require('../../middleware/validate');
 const logger = require('../../logger');
@@ -304,7 +305,7 @@ router.get('/jobs/rejected', async (req, res, next) => {
          LEFT JOIN tbl_service_type st ON st.service_type_id = j.fk_service_type_id
          LEFT JOIN tbl_address ad ON ad.address_id       = j.fk_address_id
          LEFT JOIN tbl_city ci    ON ci.city_id          = ad.city_id
-        WHERE jo.fk_easyfixter_id = ? AND jo.offer_status = 2
+        WHERE jo.fk_easyfixter_id = ? AND jo.offer_status = ${OFFER_STATUS.REJECTED}
         ORDER BY jo.responded_at DESC
         LIMIT 100`,
       [req.tech.efr_id],

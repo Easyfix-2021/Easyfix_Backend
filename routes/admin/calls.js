@@ -201,7 +201,7 @@ router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'
 // server-side here. Returns { ok:true, receiverMobile, receiverName,
 // receiverCustomerId, jobIdToStore, jobStatusSnapshot, jobEfrId } on success,
 // or { ok:false, status, message } the caller turns into a modernError.
-async function resolveReceiver({ jobId, customerId, efrId, reportingContactId, useAlt }) {
+async function resolveReceiver({ jobId, customerId, efrId, reportingContactId, useAlt, jobContextId }) {
   logger.info('Resolve call receiver · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · efrId=' + (efrId ?? '—') + ' · contactId=' + (reportingContactId ?? '—') + ' · useAlt=' + !!useAlt);
   if (jobId) {
     const [[job]] = await pool.query(
@@ -243,7 +243,7 @@ async function resolveReceiver({ jobId, customerId, efrId, reportingContactId, u
     if (!cust) return { ok: false, status: 404, message: `Customer ${customerId} not found` };
     if (!cust.customer_mob_no) logger.warn('Resolve receiver · no customer mobile · customerId=' + customerId);
     if (!cust.customer_mob_no) return { ok: false, status: 400, message: `Customer ${customerId} has no mobile on file` };
-    return { ok: true, receiverMobile: cust.customer_mob_no, receiverName: cust.customer_name || null, receiverCustomerId: cust.customer_id, jobIdToStore: null, jobStatusSnapshot: null, jobEfrId: null };
+    return { ok: true, receiverMobile: cust.customer_mob_no, receiverName: cust.customer_name || null, receiverCustomerId: cust.customer_id, jobIdToStore: jobContextId || null, jobStatusSnapshot: null, jobEfrId: null };
   }
   if (efrId) {
     const [[efr]] = await pool.query(
@@ -254,7 +254,7 @@ async function resolveReceiver({ jobId, customerId, efrId, reportingContactId, u
     if (!efr) return { ok: false, status: 404, message: `Easyfixer ${efrId} not found` };
     if (!efr.efr_no) logger.warn('Resolve receiver · no easyfixer mobile · efrId=' + efrId);
     if (!efr.efr_no) return { ok: false, status: 400, message: `Easyfixer ${efrId} has no mobile on file` };
-    return { ok: true, receiverMobile: efr.efr_no, receiverName: [efr.efr_first_name, efr.efr_last_name].filter(Boolean).join(' ').trim() || null, receiverCustomerId: null, jobIdToStore: null, jobStatusSnapshot: null, jobEfrId: null };
+    return { ok: true, receiverMobile: efr.efr_no, receiverName: [efr.efr_first_name, efr.efr_last_name].filter(Boolean).join(' ').trim() || null, receiverCustomerId: null, jobIdToStore: jobContextId || null, jobStatusSnapshot: null, jobEfrId: null };
   }
   const [[ct]] = await pool.query(
     `SELECT id, contact_name, contact_no FROM tbl_client_contacts WHERE id = ? LIMIT 1`,
@@ -264,13 +264,13 @@ async function resolveReceiver({ jobId, customerId, efrId, reportingContactId, u
   if (!ct) return { ok: false, status: 404, message: `Contact ${reportingContactId} not found` };
   if (!ct.contact_no) logger.warn('Resolve receiver · no contact mobile · contactId=' + reportingContactId);
   if (!ct.contact_no) return { ok: false, status: 400, message: `Contact ${reportingContactId} has no mobile on file` };
-  return { ok: true, receiverMobile: ct.contact_no, receiverName: ct.contact_name || null, receiverCustomerId: null, jobIdToStore: null, jobStatusSnapshot: null, jobEfrId: null };
+  return { ok: true, receiverMobile: ct.contact_no, receiverName: ct.contact_name || null, receiverCustomerId: null, jobIdToStore: jobContextId || null, jobStatusSnapshot: null, jobEfrId: null };
 }
 
 // ─── POST /click-to-call ─────────────────────────────────────────────
 router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody), async (req, res, next) => {
   try {
-    const { jobId, customerId, efrId, reportingContactId, callFrom, callTo, useAlt, provider } = req.body;
+    const { jobId, customerId, efrId, reportingContactId, callFrom, callTo, useAlt, provider, jobContextId } = req.body;
     const agent = req.user;
     logger.info('Click-to-call request · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · efrId=' + (efrId ?? '—') + ' · contactId=' + (reportingContactId ?? '—') + ' · provider=' + (provider || 'default') + ' · useAlt=' + !!useAlt);
 
@@ -311,7 +311,7 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
     // ── Resolve receiver mobile + name + (optional) job context ──
     // Shared with POST /web-start via resolveReceiver() so the two paths can't
     // drift. FE never sends the customer mobile — always looked up server-side.
-    const rr = await resolveReceiver({ jobId, customerId, efrId, reportingContactId, useAlt });
+    const rr = await resolveReceiver({ jobId, customerId, efrId, reportingContactId, useAlt, jobContextId });
     if (!rr.ok) return modernError(res, rr.status, rr.message);
     const {
       receiverMobile, receiverName, receiverCustomerId,
@@ -499,10 +499,10 @@ router.post('/web-start', requireClickToCallAction, validate(clickToCallBody), a
     if (!plivo.callingEnabled()) logger.warn('Web call rejected · Plivo not enabled');
     if (!plivo.callingEnabled()) return modernError(res, 409, 'Plivo is not enabled.');
 
-    const { jobId, customerId, efrId, reportingContactId, useAlt } = req.body;
+    const { jobId, customerId, efrId, reportingContactId, useAlt, jobContextId } = req.body;
     const agent = req.user;
 
-    const rr = await resolveReceiver({ jobId, customerId, efrId, reportingContactId, useAlt });
+    const rr = await resolveReceiver({ jobId, customerId, efrId, reportingContactId, useAlt, jobContextId });
     if (!rr.ok) return modernError(res, rr.status, rr.message);
 
     const receiver = plivo.normaliseIndianPhone(rr.receiverMobile);
@@ -739,6 +739,49 @@ router.post('/:id/hangup', requireClickToCallAction, async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// Last-10-digits key for phone-number comparison — strips +91 / spaces /
+// punctuation so the legacy-formatted `caller`/`reciever` columns compare
+// cleanly against a job's stored party numbers. Empty string when < 10 digits.
+function last10(v) {
+  const d = String(v ?? '').replace(/\D/g, '');
+  return d.length >= 10 ? d.slice(-10) : '';
+}
+
+/*
+ * resolveJobParties — for a single job, return every known counterparty the
+ * operator might have called, keyed by last-10-digits, so a job-scoped call
+ * list can label each row with WHO the call was with (Customer / Alternate /
+ * Client SPOC / Technician). All numbers live on tbl_job (+ two joins), so
+ * this is a single query. Priority order matters: the classifier keeps the
+ * FIRST role a number matches, so Customer wins over a duplicate Alternate.
+ */
+async function resolveJobParties(jobId) {
+  const [[j]] = await pool.query(
+    `SELECT cu.customer_mob_no,
+            COALESCE(j.job_customer_name, cu.customer_name) AS customer_name,
+            j.additional_number, j.additional_name,
+            j.client_spoc, j.client_spoc_name,
+            ef.efr_no   AS technician_mob,
+            ef.efr_name AS technician_name
+       FROM tbl_job j
+       LEFT JOIN tbl_customer  cu ON cu.customer_id = j.fk_customer_id
+       LEFT JOIN tbl_easyfixer ef ON ef.efr_id      = j.fk_easyfixter_id
+      WHERE j.job_id = ? LIMIT 1`,
+    [jobId]
+  );
+  if (!j) return [];
+  const parties = [];
+  const push = (num, role, name) => {
+    const d = last10(num);
+    if (d) parties.push({ digits: d, role, name: name || null });
+  };
+  push(j.customer_mob_no,   'Customer',    j.customer_name);
+  push(j.additional_number, 'Alternate',   j.additional_name || j.customer_name);
+  push(j.client_spoc,       'Client SPOC', j.client_spoc_name);
+  push(j.technician_mob,    'Technician',  j.technician_name);
+  return parties;
+}
+
 // ─── GET / — paginated call history ───────────────────────────────────
 router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
   try {
@@ -796,6 +839,27 @@ router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
          LIMIT ? OFFSET ?`,
       [...params, limit, offset]
     );
+
+    // When scoped to ONE job, label each row with the party the operator was
+    // on the call with. The counterparty is the non-operator leg: reciever on
+    // OUT calls (operator dialled out), caller on IN calls. We match its last-10
+    // digits against the job's known numbers so the UI can show "Customer" /
+    // "Client SPOC" / "Technician" instead of a bare number. Falls back to the
+    // name stamped on the row at call time, then 'Other' for anything unmatched
+    // (e.g. a number that has since changed on the job).
+    if (jobId && rows.length) {
+      const byDigits = new Map();
+      for (const p of await resolveJobParties(jobId)) {
+        if (p.digits && !byDigits.has(p.digits)) byDigits.set(p.digits, p);
+      }
+      for (const r of rows) {
+        const isOut = String(r.call_type || '').toUpperCase() === 'OUT';
+        const counterparty = isOut ? r.receiver : r.caller;
+        const hit = byDigits.get(last10(counterparty));
+        r.party_role = hit ? hit.role : 'Other';
+        r.party_name = hit ? hit.name : (isOut ? r.receiver_name : r.caller_name) || null;
+      }
+    }
 
     logger.info('Returning ' + rows.length + ' call history rows · total=' + total);
     return modernOk(res, { total, page, limit, items: rows });

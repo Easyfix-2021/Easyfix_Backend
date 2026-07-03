@@ -30,6 +30,14 @@ const clickToCallBody = Joi.object({
   customerId:         intId,
   efrId:              intId,
   reportingContactId: intId,
+  // jobContextId (2026-07-03) — optional JOB the call belongs to, WITHOUT
+  // being the receiver. When an operator dials a technician (efrId) or client
+  // SPOC (reportingContactId) FROM a job, pass the job here so the call is
+  // stamped with tbl_job_caller_info.job_id and surfaces in that job's call
+  // history. NOT part of the .xor() below (which picks the receiver) — it's a
+  // context tag layered on top. Redundant/ignored on the jobId path (that path
+  // already stamps the job it dials).
+  jobContextId:       intId.optional(),
   // useAlt (2026-06-03, alternatives 2026-06-05): scopes the jobId
   // path to the customer's ALTERNATE number (tbl_job.additional_number)
   // instead of the canonical tbl_customer.customer_mob_no. Lets ops
