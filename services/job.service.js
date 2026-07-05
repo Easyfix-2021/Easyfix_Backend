@@ -461,6 +461,29 @@ async function hasClientVerticalIdColumn() {
 }
 
 /*
+ * job_primary_spoc — a denormalised snapshot of the JOB OWNER's phone, shown to
+ * the customer on the confirmation landing page. It's a PROD-only legacy column
+ * (absent on some DBs incl. QA), so probe once + no-op where missing. Re-stamped
+ * on every job_owner write (create + owner change) so it can't go stale after a
+ * reassignment. Pending migration: migrations/2026-07-03-add-job-primary-spoc.sql.
+ */
+let _hasJobPrimarySpocColumn = null;
+async function hasJobPrimarySpocColumn() {
+  if (_hasJobPrimarySpocColumn !== null) return _hasJobPrimarySpocColumn;
+  try {
+    const [rows] = await pool.query("SHOW COLUMNS FROM tbl_job LIKE 'job_primary_spoc'");
+    _hasJobPrimarySpocColumn = rows.length > 0;
+  } catch (_e) { _hasJobPrimarySpocColumn = false; }
+  return _hasJobPrimarySpocColumn;
+}
+async function stampJobPrimarySpoc(jobId, ownerUserId, conn) {
+  if (!jobId || !(await hasJobPrimarySpocColumn())) return;
+  const db = conn || pool;
+  const [[u]] = await db.query('SELECT mobile_no FROM tbl_user WHERE user_id = ? LIMIT 1', [ownerUserId || 0]);
+  await db.query('UPDATE tbl_job SET job_primary_spoc = ? WHERE job_id = ?', [u?.mobile_no || null, jobId]);
+}
+
+/*
  * Probe ONCE per process for the presence of `tbl_job_customer_request`.
  * That table only exists on deploys where migration
  * `2026-06-02-job-customer-requests.sql` has run. The LIST projection
@@ -1893,6 +1916,10 @@ async function create(input, actor) {
       }
     }
 
+    // Snapshot the owner's phone into job_primary_spoc (legacy-compat; no-op
+    // where the column is absent). Owner = explicit input else the operator.
+    await stampJobPrimarySpoc(jobId, input.job_owner || actor?.user_id || null, conn);
+
     if (Array.isArray(input.services) && input.services.length > 0) {
       // Batch-load rate-card rows for all picked services in ONE query
       // (avoids N+1) — then compute the 5 charge columns per row via
@@ -2251,6 +2278,26 @@ async function update(jobId, input, actor) {
         }
       }
       if (addrSets.length > 0) {
+        // Preserve the CLIENT-ENTERED address BEFORE we overwrite tbl_address in
+        // place. tbl_job.client_entered_address is a pending EasyFix column, so
+        // guard on its presence (no-op where the migration hasn't run). Capture
+        // only on the FIRST edit (IS NULL) so later edits don't clobber the
+        // original the client/portal booked with. No change needed in the old
+        // Client Dashboard — we snapshot at the moment the new CRM edits.
+        const [ceCols] = await conn.query(
+          `SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tbl_job'
+              AND COLUMN_NAME = 'client_entered_address' LIMIT 1`
+        );
+        if (ceCols.length > 0) {
+          await conn.query(
+            `UPDATE tbl_job j
+               JOIN tbl_address a ON a.address_id = j.fk_address_id
+                SET j.client_entered_address = a.address
+              WHERE j.job_id = ? AND j.client_entered_address IS NULL AND a.address IS NOT NULL`,
+            [existing.job_id]
+          );
+        }
         addrVals.push(existing.fk_address_id);
         await conn.query(`UPDATE tbl_address SET ${addrSets.join(', ')} WHERE address_id = ?`, addrVals);
       }
@@ -3334,6 +3381,9 @@ async function changeOwner(jobId, { newOwnerId, reason }, actor) {
       WHERE job_id = ?`,
     [newOwnerId, actor?.user_id || null, reason, new Date(), new Date(), jobId]
   );
+
+  // Keep the denormalised owner-phone snapshot correct on reassignment.
+  await stampJobPrimarySpoc(jobId, newOwnerId);
 
   logger.info('Job owner changed · id=' + jobId + ' · newOwnerId=' + newOwnerId);
   return getById(jobId);

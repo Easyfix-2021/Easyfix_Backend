@@ -635,10 +635,21 @@ async function deleteObject(key) {
   }
 }
 
+/*
+ * Call recording key (2026-07-03) — STABLE per call row so a recording is
+ * stored exactly once and every replay hits the same object (exists() short-
+ * circuits the Plivo re-fetch). No extension; Content-Type carries audio/mpeg.
+ */
+function buildCallRecordingKey(jobCallerInfoId) {
+  return `CallRecordings/call_${jobCallerInfoId}`;
+}
+
 module.exports = {
   isEnabled,
   bucketName,
   keyFor,
+  // Call recordings (2026-07-03) — lazy Plivo→S3 on first play:
+  buildCallRecordingKey,
   putJobImage,
   exists,
   getPresignedUrl,

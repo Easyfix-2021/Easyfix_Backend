@@ -673,6 +673,75 @@ router.get('/:id/status', requireClickToCallAction, async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ─── GET /:id/recording — lazy Plivo→S3 call-recording play URL ────────
+// On first play we fetch the recording from Plivo (by CallUUID), store it once
+// on our S3 under a stable key, persist that key on the row, and return a
+// short-lived presigned URL. Every later play is a cheap S3 cache hit (no Plivo
+// round-trip), so we only ever spend S3 on recordings someone actually listens
+// to. Recording must be enabled on the Plivo side (plivo.recording.enabled) and
+// only exists for calls placed AFTER that was turned on.
+router.get('/:id/recording', requireClickToCallAction, async (req, res, next) => {
+  try {
+    const s3 = require('../../utils/s3-storage');
+    const id = parseRowId(req.params.id);
+    if (!id) return modernError(res, 400, 'invalid call id');
+    logger.info('Get call recording · row=' + id);
+
+    const [[row]] = await pool.query(
+      `SELECT job_caller_info AS id, caller_id, provider, unique_id, recording
+         FROM tbl_job_caller_info WHERE job_caller_info = ? LIMIT 1`,
+      [id]
+    );
+    if (!row) return modernError(res, 404, 'call not found');
+
+    // Authorize: the operator who placed it, or an Admin (role_id 2). Same rule
+    // as GET /:id/status.
+    const isOwner = row.caller_id != null && Number(row.caller_id) === Number(req.user.user_id);
+    const isAdmin = Number(req.user.user_role) === 2;
+    if (!isOwner && !isAdmin) {
+      return modernError(res, 403, 'You can only listen to recordings of calls you placed');
+    }
+
+    // A Kaleyra row stores an https:// recording URL directly — hand it back.
+    if (row.recording && /^https?:\/\//i.test(String(row.recording))) {
+      return modernOk(res, { url: row.recording, source: 'external' });
+    }
+
+    if (!s3.isEnabled()) {
+      logger.warn('Call recording · S3 not configured · row=' + id);
+      return modernError(res, 409, 'Recording storage is not configured in this environment.');
+    }
+
+    // Cache hit: our S3 key already persisted → just re-presign (never cache the
+    // presigned URL itself — 5-min TTL).
+    if (row.recording && String(row.recording).startsWith('CallRecordings/') && await s3.exists(row.recording)) {
+      return modernOk(res, { url: await s3.getPresignedUrl(row.recording), source: 's3' });
+    }
+
+    // Cache miss: fetch from Plivo (keyed by the stored CallUUID = unique_id).
+    if (row.provider !== 'plivo' || !row.unique_id) {
+      return modernError(res, 404, 'No recording available for this call');
+    }
+    const meta = await plivo.fetchRecordingMeta({ callUuid: row.unique_id });
+    if (!meta.ok || !meta.url) {
+      // Plivo can lag a few seconds after hangup, or recording was off.
+      return modernError(res, 404, 'No recording available yet — if the call just ended, try again shortly.');
+    }
+    const dl = await plivo.downloadRecording(meta.url);
+    if (!dl.ok || !dl.buffer) {
+      return modernError(res, 502, 'Failed to fetch the recording from the provider.');
+    }
+    const key = s3.buildCallRecordingKey(id);
+    await s3.putAtKey({ key, buffer: dl.buffer, contentType: dl.contentType || 'audio/mpeg' });
+    await pool.query(
+      'UPDATE tbl_job_caller_info SET recording = ? WHERE job_caller_info = ?',
+      [key, id]
+    );
+    logger.info('Call recording cached to S3 · row=' + id + ' · key=' + key);
+    return modernOk(res, { url: await s3.getPresignedUrl(key), source: 's3', fetched: true });
+  } catch (e) { next(e); }
+});
+
 // ─── POST /:id/hangup — terminate a live call from the UI ──────────────
 // Only meaningful for providers that support hangup (Plivo). Loads the row,
 // asks the provider factory to terminate by stored unique_id (CallUUID), and

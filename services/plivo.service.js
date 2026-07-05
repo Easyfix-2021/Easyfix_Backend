@@ -38,6 +38,14 @@ function callingEnabled() {
   return String(getProperty('plivo.calling.enabled')).toLowerCase() === 'true';
 }
 
+// Whether to record the bridged conversation. OFF by default — flip the
+// easyfix_properties key `plivo.recording.enabled` to 'true' ONLY after
+// compliance/consent sign-off (recording customer calls). No redeploy needed
+// (properties are DB-backed). See buildAnswerXml + GET /admin/calls/:id/recording.
+function recordingEnabled() {
+  return String(getProperty('plivo.recording.enabled')).toLowerCase() === 'true';
+}
+
 // The publicly-reachable BACKEND base URL Plivo will call back on (NOT the CRM
 // UI). Must terminate at this Express app, e.g. https://core.easyfix.in.
 function callbackBase() {
@@ -140,10 +148,21 @@ function verifyCallToken(t) {
 
 // Plivo call-control XML the public answer route returns when the agent picks
 // up — bridges to the customer leg. callerId is the Plivo DID.
-function buildAnswerXml(dest) {
+//
+// Recording (2026-07-03): `record="true"` on <Dial> records the bridged
+// conversation server-side at Plivo (dual-channel mp3). We do NOT set a
+// recordingCallbackUrl — the recording is fetched LAZILY on demand (only when
+// an operator plays it) via the Plivo Recording API keyed by CallUUID, then
+// cached to our S3, so we don't store audio nobody listens to. Gated on
+// `plivo.recording.enabled` by the caller so it can be turned off without a
+// deploy. ⚠️ Recording customer calls needs compliance/consent sign-off.
+function buildAnswerXml(dest, { record = false } = {}) {
   const callerId = process.env.PLIVO_CALLER_ID || '';
   const num = String(dest || '').replace(/[^0-9]/g, '');
-  return `<?xml version="1.0" encoding="UTF-8"?>\n<Response><Dial callerId="${callerId}"><Number>${num}</Number></Dial></Response>`;
+  const dialAttrs = record
+    ? ` callerId="${callerId}" record="true" recordFileFormat="mp3"`
+    : ` callerId="${callerId}"`;
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<Response><Dial${dialAttrs}><Number>${num}</Number></Dial></Response>`;
 }
 
 function authHeader() {
@@ -253,6 +272,61 @@ async function hangupCall({ callUuid }) {
   }
 }
 
+/*
+ * Look up a call's recording by CallUUID via the Plivo Recording API
+ * (GET /Account/{id}/Recording/?call_uuid=…). Returns the first recording's
+ * hosted URL + duration/id, or { url: null } when none exists yet (Plivo may
+ * lag a few seconds after hangup, or recording was off for this call).
+ */
+async function fetchRecordingMeta({ callUuid }) {
+  if (!callUuid) return { ok: false, error: 'callUuid required', url: null };
+  const auth = authHeader();
+  if (!auth || !process.env.PLIVO_AUTH_ID) {
+    return { ok: false, error: 'PLIVO_AUTH_ID / PLIVO_AUTH_TOKEN not configured', url: null };
+  }
+  const url = `${BASE}/Account/${encodeURIComponent(process.env.PLIVO_AUTH_ID)}/Recording/?call_uuid=${encodeURIComponent(callUuid)}`;
+  try {
+    const res = await fetch(url, { headers: { Authorization: auth } });
+    if (!res.ok) {
+      logger.warn(`Plivo recording lookup FAIL · uuid=${callUuid} · http=${res.status}`);
+      return { ok: false, httpStatus: res.status, url: null };
+    }
+    const body = await res.json();
+    const first = Array.isArray(body?.objects) ? body.objects[0] : null;
+    return {
+      ok: true,
+      url: first?.recording_url || null,
+      recordingId: first?.recording_id || null,
+      duration: first?.recording_duration != null ? Number(first.recording_duration) : null,
+    };
+  } catch (err) {
+    logger.error(`Plivo recording lookup network error · uuid=${callUuid} · ${err.message}`);
+    return { ok: false, error: err.message, url: null };
+  }
+}
+
+/*
+ * Download the recording bytes from a Plivo-hosted recording URL. Plivo
+ * recording URLs sit on api.plivo.com and require the same HTTP Basic auth as
+ * every other call. Returns the raw Buffer + content-type for S3 upload.
+ */
+async function downloadRecording(recordingUrl) {
+  if (!recordingUrl) return { ok: false, error: 'recordingUrl required' };
+  const auth = authHeader();
+  try {
+    const res = await fetch(recordingUrl, { headers: auth ? { Authorization: auth } : {} });
+    if (!res.ok) {
+      logger.warn(`Plivo recording download FAIL · http=${res.status}`);
+      return { ok: false, httpStatus: res.status };
+    }
+    const buffer = Buffer.from(await res.arrayBuffer());
+    return { ok: true, buffer, contentType: res.headers.get('content-type') || 'audio/mpeg' };
+  } catch (err) {
+    logger.error(`Plivo recording download network error · ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
 // ── Web (browser / WebRTC) calling ───────────────────────────────────────────
 // The Plivo Browser SDK logs in as a Plivo ENDPOINT (username/password) and
 // places calls into our Voice Application; the app's Answer URL then bridges to
@@ -330,6 +404,9 @@ module.exports = {
   previewCallLegs,
   resolveCallLegs,
   hangupCall,
+  recordingEnabled,
+  fetchRecordingMeta,
+  downloadRecording,
   normaliseIndianPhone,
   signCallToken,
   verifyCallToken,

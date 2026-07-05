@@ -54,7 +54,7 @@ router.get('/answer', async (req, res) => {
   await plivoLog.markAnswered(claims.jci, req.query.CallUUID || null);
 
   logger.info('Plivo answer: bridging to customer · jci=' + claims.jci);
-  return xml(plivo.buildAnswerXml(claims.dest));
+  return xml(plivo.buildAnswerXml(claims.dest, { record: plivo.recordingEnabled() }));
 });
 
 /*
@@ -99,7 +99,7 @@ async function webAnswer(req, res) {
     logger.warn({ jci: resolved.jci, err: err && err.message }, 'plivo web-answer: audit update failed (returning XML anyway)');
   }
   await plivoLog.markRinging(resolved.jci, src.CallUUID || null);
-  return xml(plivo.buildAnswerXml(resolved.number));
+  return xml(plivo.buildAnswerXml(resolved.number, { record: plivo.recordingEnabled() }));
 }
 router.post('/web-answer', express.urlencoded({ extended: false }), webAnswer);
 router.get('/web-answer', webAnswer);

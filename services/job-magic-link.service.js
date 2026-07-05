@@ -443,11 +443,13 @@ async function fetchPrefill(jobId, pool) {
             cu.customer_mob_no, cu.customer_email,
             ad.address, ad.building, ad.landmark, ad.city_id, ad.pin_code,
             ad.gps_location, ${addrInstrSelect},
-            cl.client_name
+            cl.client_name,
+            ow.user_name AS owner_name, ow.mobile_no AS owner_mobile
        FROM tbl_job j
        LEFT JOIN tbl_customer cu ON cu.customer_id = j.fk_customer_id
        LEFT JOIN tbl_address  ad ON ad.address_id  = j.fk_address_id
        LEFT JOIN tbl_client   cl ON cl.client_id   = j.fk_client_id
+       LEFT JOIN tbl_user     ow ON ow.user_id     = j.job_owner
       WHERE j.job_id = ? LIMIT 1`,
     [jobId],
   );
@@ -596,6 +598,14 @@ async function fetchPrefill(jobId, pool) {
     spoc: {
       name:          spoc.name,
       mobile_masked: spoc.mobile ? maskMobile(spoc.mobile) : null,
+    },
+    // The job OWNER (the customer's EasyFix coordinator). Surfaced UNMASKED so
+    // the customer can call their coordinator once the booking is confirmed.
+    // Resolved LIVE from job_owner → tbl_user (independent of the prod-only
+    // tbl_job.job_primary_spoc snapshot column).
+    job_owner: {
+      name:   row.owner_name || null,
+      mobile: row.owner_mobile || null,
     },
     // Fixed reason lists — same arrays the BE validates against, so the FE
     // dropdowns match the validator exactly.
