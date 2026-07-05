@@ -457,8 +457,46 @@ async function findOrCreateStateByName(stateName, { userId = null } = {}) {
   return { state_id: r.insertId, created: true };
 }
 
-// Find a city by (state, name) or create it. NEW cities get a NULL state_user
-// (zonal manager) per spec — the Manage Pincodes table shows it blank.
+/*
+ * A newly-created city's zonal manager (tbl_city.state_user) can NEVER be
+ * derived from a geocode — it's a manual business assignment. But every
+ * zonal-scoped report (QuickSight admin-dashboard / supply-gap / city- /
+ * client- / technician-performance / employee-productivity) AND technician
+ * scoping filters on `c.state_user`, so a NULL-manager city's pincodes and
+ * jobs silently vanish from all of those views. To avoid orphaning a new city,
+ * inherit the manager from an existing city in the SAME district (preferred),
+ * else the SAME state — picking the MOST COMMON assigned manager (mode), which
+ * is that area's real zonal owner. Returns null only when the state has no
+ * assigned manager at all (nothing to inherit — the city stays NULL and should
+ * be flagged for manual assignment).
+ */
+async function resolveInheritedStateUser(stateId, district = null) {
+  if (!stateId) return null;
+  const d = String(district || '').trim();
+  if (d) {
+    const [[byDistrict]] = await pool.query(
+      `SELECT state_user FROM tbl_city
+        WHERE state_user IS NOT NULL AND state_id = ? AND LOWER(TRIM(district)) = LOWER(?)
+        GROUP BY state_user ORDER BY COUNT(*) DESC LIMIT 1`,
+      [Number(stateId), d]
+    );
+    if (byDistrict) return Number(byDistrict.state_user);
+  }
+  const [[byState]] = await pool.query(
+    `SELECT state_user FROM tbl_city
+      WHERE state_user IS NOT NULL AND state_id = ?
+      GROUP BY state_user ORDER BY COUNT(*) DESC LIMIT 1`,
+    [Number(stateId)]
+  );
+  return byState ? Number(byState.state_user) : null;
+}
+
+// Find a city by (state, name) or create it. A newly-created city INHERITS a
+// zonal manager (state_user) from the same district/state so it isn't orphaned
+// from zonal-scoped reporting — see resolveInheritedStateUser above.
+// (NOTE: the legacy `stateId` camelCase column is intentionally left NULL — it
+// holds inconsistent legacy values and NO CRM/QuickSight filter reads it; every
+// filter keys on `state_id`.)
 async function findOrCreateCityByName(cityName, stateId, { district = null } = {}) {
   const name = String(cityName || '').trim();
   if (!name) throw badReq('City name is required to create a new city');
@@ -468,11 +506,14 @@ async function findOrCreateCityByName(cityName, stateId, { district = null } = {
     [Number(stateId), name]
   );
   if (existing) return { city_id: Number(existing.city_id), created: false };
+  const inheritedStateUser = await resolveInheritedStateUser(stateId, district);
   const [r] = await pool.query(
-    'INSERT INTO tbl_city (city_name, state_id, district, city_status) VALUES (?, ?, ?, 1)',
-    [name, Number(stateId), district || null]
+    'INSERT INTO tbl_city (city_name, state_id, district, city_status, state_user) VALUES (?, ?, ?, 1, ?)',
+    [name, Number(stateId), district || null, inheritedStateUser]
   );
-  return { city_id: r.insertId, created: true };
+  logger.info('Created city · id=' + r.insertId + ' name="' + name + '" state_id=' + stateId
+    + ' inherited_state_user=' + (inheritedStateUser ?? 'none'));
+  return { city_id: r.insertId, created: true, state_user: inheritedStateUser };
 }
 
 /*
