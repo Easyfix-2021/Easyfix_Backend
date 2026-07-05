@@ -41,5 +41,6 @@ router.use('/technician-performance', require('./technician-performance'));
 router.use('/supply-gap',             require('./supply-gap'));
 router.use('/employee-productivity',  require('./employee-productivity'));
 router.use('/admin-dashboard',        require('./admin-dashboard'));
+router.use('/offer-acceptance',       require('./offer-acceptance'));
 
 module.exports = router;

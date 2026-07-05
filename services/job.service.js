@@ -885,8 +885,13 @@ async function list({
      * so partial numeric matches (e.g. "1234" → 12340..12349) work,
      * matching operator expectations.
      */
-    clauses.push('(CAST(j.job_id AS CHAR) LIKE ? OR j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ?)');
-    params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
+    // Search covers every field the client-side filter (job-tabs.ts filterJobRows)
+    // matches, so the two layers agree: job id / reference / client ref /
+    // customer name+mobile PLUS client name, city, technician, and owner. The
+    // cl/ci/ef/ow aliases are already in the data-query LIST_JOIN, and the COUNT
+    // query's alias-detection below auto-adds their joins once they appear here.
+    clauses.push('(CAST(j.job_id AS CHAR) LIKE ? OR j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ? OR cl.client_name LIKE ? OR ci.city_name LIKE ? OR ef.efr_name LIKE ? OR ow.user_name LIKE ?)');
+    params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
   }
 
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
