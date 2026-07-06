@@ -45,7 +45,16 @@ const { modernOk, modernError } = require('../../utils/response');
 const s3Storage = require('../../utils/s3-storage');
 const validate = require('../../middleware/validate');
 const { rateLimit } = require('../../middleware/rate-limit');
+const { getProperty } = require('../../services/properties.service');
 const logger = require('../../logger');
+
+// Global map-clickability toggle (easyfix_properties). Absent/'true' →
+// clickable; 'false' → the customer's map is rendered non-interactive.
+function mapClickableFlag() {
+  const raw = getProperty('ui.map.clickable');
+  if (raw == null || String(raw).trim() === '') return true;
+  return String(raw).trim().toLowerCase() !== 'false';
+}
 
 // Peek-the-token middleware. Runs verifyJobToken() only (NOT the DB state
 // check) so the rate limiter can key its bucket on the verified jobId. If the
@@ -238,6 +247,8 @@ router.get(
       const jobId = await verify(req);
       logger.info('Fetch magic-link prefill · jobId=' + jobId);
       const payload = await magicLinkService.fetchPrefill(jobId, pool);
+      // Global UI toggle so the customer page can render its map read-only.
+      payload.mapClickable = mapClickableFlag();
       return modernOk(res, payload);
     } catch (e) {
       logger.warn('Magic-link prefill failed · ' + e.message);

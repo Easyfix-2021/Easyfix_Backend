@@ -80,6 +80,10 @@ router.use('/roles',           require('./roles'));
 // canDeleteEntities) — display-only; the gated routes enforce the allowlist
 // themselves. See routes/admin/access.js + services/feature-access.service.js.
 router.use('/access',          require('./access'));
+// Global (non-per-user) runtime UI toggles the CRM reads at render time:
+// customer-number visibility + map clickability. Read-only; flipped via
+// easyfix_properties. See routes/admin/config.js.
+router.use('/config',          require('./config'));
 // Admin Actions → OTP-gated Delete Easyfixer/User + Restore (tombstone + full
 // JSON archive). Gated PER-USER by the easyfix_properties allowlist
 // (access.entitydelete.emails) — NOT RBAC. See routes/admin/entity-deletion.js.
