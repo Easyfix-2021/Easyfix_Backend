@@ -460,6 +460,21 @@ async function hasClientVerticalIdColumn() {
   return _hasClientVerticalIdColumn;
 }
 
+// tbl_address.address_instruction is column-probed (present per deploy — same
+// guard the write path uses in insertAddress/update). getByIdCore must branch
+// the SELECT so DBs without the column don't 500 on job-detail reads.
+let _hasAddressInstructionColumn = null;
+async function hasAddressInstructionColumn() {
+  if (_hasAddressInstructionColumn !== null) return _hasAddressInstructionColumn;
+  try {
+    const [rows] = await pool.query("SHOW COLUMNS FROM tbl_address LIKE 'address_instruction'");
+    _hasAddressInstructionColumn = rows.length > 0;
+  } catch (_e) {
+    _hasAddressInstructionColumn = false;
+  }
+  return _hasAddressInstructionColumn;
+}
+
 /*
  * job_primary_spoc — a denormalised snapshot of the JOB OWNER's phone, shown to
  * the customer on the confirmation landing page. It's a PROD-only legacy column
@@ -986,11 +1001,13 @@ async function getByIdCore(jobId) {
   // 500s for this DB.
   const hasVerticalCol = await hasClientVerticalIdColumn();
   const verticalSelect = hasVerticalCol ? 'cl.vertical_id' : 'NULL AS vertical_id';
+  const hasAddrInstr = await hasAddressInstructionColumn();
+  const addrInstrSelect = hasAddrInstr ? 'ad.address_instruction' : 'NULL AS address_instruction';
   const [jobRows] = await pool.query(
     `SELECT j.*,
             cu.customer_name, cu.customer_mob_no, cu.customer_email,
             ad.address, ad.building, ad.landmark, ad.locality, ad.pin_code,
-            ad.gps_location, ad.city_id, ci.city_name,
+            ad.gps_location, ${addrInstrSelect}, ad.city_id, ci.city_name,
             cl.client_name, cl.client_email, ${verticalSelect},
             ef.efr_name AS easyfixer_name, ef.efr_no AS easyfixer_mobile,
             ow.user_name AS owner_name,
@@ -1001,6 +1018,13 @@ async function getByIdCore(jobId) {
   );
   const job = jobRows[0];
   if (!job) { logger.warn('Job detail not found · id=' + jobId); return null; }
+  // Decode the custom-property fields folded into `remarks` on write so the
+  // Book-New-Call form repopulates them when a draft/job reopens (product_code
+  // + building_name are NOT tbl_job columns). branch_details is a real column
+  // and already present on the row.
+  const decodedProps = decomposeRemarks(job.remarks);
+  if (job.product_code == null) job.product_code = decodedProps.product_code || null;
+  if (job.building_name == null) job.building_name = decodedProps.building_name || null;
   return job;
 }
 
@@ -1517,6 +1541,28 @@ function composeRemarks(input) {
   if (input.product_code)   parts.push(`[Product Code] ${input.product_code}`);
   if (input.building_name)  parts.push(`[Building / Property] ${input.building_name}`);
   return parts.length ? parts.join('\n') : null;
+}
+
+/*
+ * decomposeRemarks — inverse of composeRemarks. Pulls product_code +
+ * building_name back OUT of the `remarks` prefix lines so the Book-New-Call
+ * form can repopulate those fields when a draft reopens (they aren't real
+ * tbl_job columns, so SELECT j.* can't surface them). Non-destructive: we do
+ * NOT strip the prefixes from `remarks` here — the write paths keep the
+ * composed string intact, so re-saving a reopened job never loses or
+ * double-encodes the values.
+ */
+function decomposeRemarks(raw) {
+  const s = raw == null ? '' : String(raw);
+  let product_code = '';
+  let building_name = '';
+  for (const line of s.split('\n')) {
+    let m = line.match(/^\[Product Code\]\s?(.*)$/);
+    if (m) { product_code = m[1].trim(); continue; }
+    m = line.match(/^\[Building \/ Property\]\s?(.*)$/);
+    if (m) { building_name = m[1].trim(); continue; }
+  }
+  return { product_code, building_name };
 }
 
 /*

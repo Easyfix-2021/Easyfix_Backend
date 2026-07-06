@@ -46,6 +46,13 @@ function recordingEnabled() {
   return String(getProperty('plivo.recording.enabled')).toLowerCase() === 'true';
 }
 
+// Gate for the lazy call-transcription fetch (default off — opt-in AFTER the
+// Plivo Transcription API is verified for the account + transcription is turned
+// on for recordings). Read the same way as recordingEnabled.
+function transcriptionEnabled() {
+  return String(getProperty('plivo.transcription.enabled')).toLowerCase() === 'true';
+}
+
 // The publicly-reachable BACKEND base URL Plivo will call back on (NOT the CRM
 // UI). Must terminate at this Express app, e.g. https://core.easyfix.in.
 function callbackBase() {
@@ -327,6 +334,42 @@ async function downloadRecording(recordingUrl) {
   }
 }
 
+/*
+ * Fetch a recording's transcription from the Plivo Transcription API
+ * (GET /Account/{id}/Transcription/{recording_id}/). Returns { ok, text } —
+ * `text` is null when Plivo has no transcription for that recording yet (404 —
+ * transcription must be requested at record time / is still processing).
+ *
+ * ⚠️ VERIFY against current Plivo docs for your account before enabling
+ * plivo.transcription.enabled: confirm the endpoint path + that the transcript
+ * text arrives under `transcription` in the JSON body. Same HTTP Basic auth as
+ * the Recording API.
+ */
+async function fetchTranscription({ recordingId }) {
+  if (!recordingId) return { ok: false, error: 'recordingId required', text: null };
+  const auth = authHeader();
+  if (!auth || !process.env.PLIVO_AUTH_ID) {
+    return { ok: false, error: 'PLIVO_AUTH_ID / PLIVO_AUTH_TOKEN not configured', text: null };
+  }
+  const url = `${BASE}/Account/${encodeURIComponent(process.env.PLIVO_AUTH_ID)}/Transcription/${encodeURIComponent(recordingId)}/`;
+  try {
+    const res = await fetch(url, { headers: { Authorization: auth } });
+    // 404 = no transcription generated for this recording (not requested at
+    // record time, or still processing) — a normal "not available", not an error.
+    if (res.status === 404) return { ok: true, text: null, notAvailable: true };
+    if (!res.ok) {
+      logger.warn(`Plivo transcription lookup FAIL · recId=${recordingId} · http=${res.status}`);
+      return { ok: false, httpStatus: res.status, text: null };
+    }
+    const body = await res.json();
+    const text = typeof body?.transcription === 'string' ? body.transcription : null;
+    return { ok: true, text, transcriptionId: body?.transcription_id || null };
+  } catch (err) {
+    logger.error(`Plivo transcription lookup network error · recId=${recordingId} · ${err.message}`);
+    return { ok: false, error: err.message, text: null };
+  }
+}
+
 // ── Web (browser / WebRTC) calling ───────────────────────────────────────────
 // The Plivo Browser SDK logs in as a Plivo ENDPOINT (username/password) and
 // places calls into our Voice Application; the app's Answer URL then bridges to
@@ -407,6 +450,8 @@ module.exports = {
   recordingEnabled,
   fetchRecordingMeta,
   downloadRecording,
+  fetchTranscription,
+  transcriptionEnabled,
   normaliseIndianPhone,
   signCallToken,
   verifyCallToken,

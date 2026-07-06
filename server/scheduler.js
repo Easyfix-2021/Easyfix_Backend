@@ -554,6 +554,48 @@ Note: this task only runs automatically if the property "attendance.reminder.ena
     logger.info(`Attendance-reminder cron registered (attendance.reminder.enabled=true, schedule="${attendanceCronExpr}" IST).`);
   }
 
+  // ── Transcription backfill — fetch Plivo transcripts for EVERY completed
+  //    call (not just ones whose recording someone played), so Call Analytics
+  //    has a transcript per call. Gated by plivo.transcription.enabled. ──
+  const callTranscriptionCron = require('../services/call-transcription-cron');
+  const transcriptionBackfillJob = registerJob({
+    id: 'transcription-backfill',
+    name: 'Call Transcription Backfill',
+    description:
+`What this task does: Every 30 minutes it fetches + stores the Plivo transcription for completed Plivo calls that don't have one yet, so Settings → Call Analytics has a transcript for each call to analyse.
+
+Step by step:
+  1. Every 30 minutes the task wakes up.
+  2. It finds completed Plivo calls (last 7 days) that already have a call-log row but no transcription yet.
+  3. For each, it looks up the call's recording on Plivo, then fetches that recording's transcription and stores it on the call-log row.
+  4. Calls whose recording isn't ready yet are left pending and retried on a later run.
+  5. It logs how many were eligible / completed / not-available / pending / failed (visible below under Last Run).
+
+Note: only runs automatically if easyfix_properties "plivo.transcription.enabled" = "true" (checked once at server start — restart after flipping). Trigger Now still works for manual testing. Transcriptions are customer PII — ensure a retention policy.`,
+    cron: '*/30 * * * *',
+    runner: async () => {
+      const result = await callTranscriptionCron.runTranscriptionBackfill({ limit: 50 });
+      logger.info('Transcription-backfill cron · ' + JSON.stringify(result));
+      return result;
+    },
+  });
+  const transcriptionBackfillEnabled =
+    String(getProperty('plivo.transcription.enabled') ?? '').toLowerCase() === 'true';
+  if (cronDisabled) {
+    transcriptionBackfillJob.skipReason = 'CRON_DISABLED=true';
+  } else if (!transcriptionBackfillEnabled) {
+    transcriptionBackfillJob.skipReason = "property 'plivo.transcription.enabled' was not 'true' at server start — flip it to 'true' and restart to enable";
+    logger.info("Transcription-backfill cron SKIPPED — set plivo.transcription.enabled=true in easyfix_properties to enable (takes effect after restart).");
+  } else {
+    transcriptionBackfillJob.task = cron.schedule(
+      transcriptionBackfillJob.cron,
+      () => invokeJob(transcriptionBackfillJob, 'cron'),
+      { timezone: TZ },
+    );
+    transcriptionBackfillJob.registered = true;
+    logger.info('Transcription-backfill cron registered (plivo.transcription.enabled=true, every 30 min IST).');
+  }
+
   // ─── Deep Skill Image-Gen orphan reset — every 5 minutes ─────────────
   // Standalone cron (NOT registered via registerJob()). Deliberately
   // absent from the Scheduled Jobs admin page — this is infrastructure

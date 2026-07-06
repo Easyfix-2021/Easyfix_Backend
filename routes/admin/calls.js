@@ -7,6 +7,7 @@ const kaleyra = require('../../services/kaleyra.service');
 const plivo = require('../../services/plivo.service');
 const voice = require('../../services/voice.service');
 const plivoLog = require('../../services/plivo-call-log.service');
+const callAnalysis = require('../../services/call-analysis.service');
 const propertiesSvc = require('../../services/properties.service');
 const { requirePropertyAllowlist } = require('../../middleware/require-property-allowlist');
 const { FEATURES } = require('../../services/feature-access.service');
@@ -673,6 +674,59 @@ router.get('/:id/status', requireClickToCallAction, async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// Column-presence probe for the transcription columns on tbl_plivo_call_log
+// (EasyFix-owned). Cached; lets the store step no-op until the
+// 2026-07-06-add-plivo-transcription migration runs.
+let _hasTranscriptionCol = null;
+async function hasTranscriptionColumn() {
+  if (_hasTranscriptionCol !== null) return _hasTranscriptionCol;
+  try {
+    const [rows] = await pool.query("SHOW COLUMNS FROM tbl_plivo_call_log LIKE 'transcription'");
+    _hasTranscriptionCol = rows.length > 0;
+  } catch (_e) { _hasTranscriptionCol = false; }
+  return _hasTranscriptionCol;
+}
+
+// Probe for the call-analysis columns on tbl_plivo_call_log (2026-07-06-add-
+// call-analysis migration). Cached; the analysis route no-ops until it runs.
+let _hasAnalysisCol = null;
+async function hasAnalysisColumn() {
+  if (_hasAnalysisCol !== null) return _hasAnalysisCol;
+  try {
+    const [rows] = await pool.query("SHOW COLUMNS FROM tbl_plivo_call_log LIKE 'call_analysis'");
+    _hasAnalysisCol = rows.length > 0;
+  } catch (_e) { _hasAnalysisCol = false; }
+  return _hasAnalysisCol;
+}
+
+// Best-effort: pull the Plivo transcription for a recording and store it on the
+// call's tbl_plivo_call_log row for later quality analysis. Gated by
+// plivo.transcription.enabled + column presence; NEVER throws + never blocks the
+// caller (recording playback must not wait on transcription).
+async function storeTranscriptionBestEffort({ jobCallerInfoId, recordingId }) {
+  try {
+    if (!recordingId || !plivo.transcriptionEnabled()) return;
+    if (!(await hasTranscriptionColumn())) return;
+    const tx = await plivo.fetchTranscription({ recordingId });
+    if (tx.ok && tx.text) {
+      await pool.query(
+        `UPDATE tbl_plivo_call_log
+            SET transcription = ?, transcription_status = 'completed', transcription_fetched_at = NOW()
+          WHERE job_caller_info_id = ?`,
+        [tx.text, jobCallerInfoId]
+      );
+      logger.info('Call transcription stored · jci=' + jobCallerInfoId);
+    } else {
+      await pool.query(
+        "UPDATE tbl_plivo_call_log SET transcription_status = 'not_available' WHERE job_caller_info_id = ?",
+        [jobCallerInfoId]
+      );
+    }
+  } catch (e) {
+    logger.warn('Transcription store failed · jci=' + jobCallerInfoId + ' · ' + e.message);
+  }
+}
+
 // ─── GET /:id/recording — lazy Plivo→S3 call-recording play URL ────────
 // On first play we fetch the recording from Plivo (by CallUUID), store it once
 // on our S3 under a stable key, persist that key on the row, and return a
@@ -738,7 +792,52 @@ router.get('/:id/recording', requireClickToCallAction, async (req, res, next) =>
       [key, id]
     );
     logger.info('Call recording cached to S3 · row=' + id + ' · key=' + key);
+    // Best-effort background: also pull + store the transcription for later
+    // quality analysis. Fire-and-forget so playback isn't delayed.
+    void storeTranscriptionBestEffort({ jobCallerInfoId: id, recordingId: meta.recordingId });
     return modernOk(res, { url: await s3.getPresignedUrl(key), source: 's3', fetched: true });
+  } catch (e) { next(e); }
+});
+
+// ─── GET /:id/analysis — LLM coaching analysis of the call transcript ──
+// On-demand (Call Analytics → View Analysis): returns the cached analysis, else
+// generates it from the stored transcript + caches it. Needs an OpenAI key + the
+// transcription/analysis columns (2026-07-06 migrations); degrades gracefully.
+router.get('/:id/analysis', requireClickToCallAction, async (req, res, next) => {
+  try {
+    const id = parseRowId(req.params.id);
+    if (!id) return modernError(res, 400, 'invalid call id');
+    if (!(await hasAnalysisColumn())) {
+      return modernOk(res, { status: 'unavailable', reason: 'Call analytics is not enabled in this environment.' });
+    }
+    const [[row]] = await pool.query(
+      `SELECT transcription, transcription_status, call_analysis
+         FROM tbl_plivo_call_log WHERE job_caller_info_id = ? ORDER BY id DESC LIMIT 1`,
+      [id]
+    );
+    if (!row) return modernOk(res, { status: 'no_transcript' });
+    // Cache hit — return the stored analysis (parse-guarded).
+    if (row.call_analysis) {
+      try { return modernOk(res, { status: 'ready', analysis: JSON.parse(row.call_analysis) }); }
+      catch (_e) { /* corrupt cache — fall through + regenerate */ }
+    }
+    if (!row.transcription || String(row.transcription).trim().length < 10) {
+      return modernOk(res, { status: 'no_transcript' });
+    }
+    if (!callAnalysis.llmEnabled()) {
+      return modernOk(res, { status: 'llm_disabled', reason: 'Call-analysis AI is not configured in this environment.' });
+    }
+    logger.info('Generate call analysis · row=' + id);
+    const analysis = await callAnalysis.analyzeTranscript(row.transcription);
+    if (!analysis) {
+      await pool.query("UPDATE tbl_plivo_call_log SET call_analysis_status = 'failed' WHERE job_caller_info_id = ?", [id]);
+      return modernOk(res, { status: 'failed', reason: 'Analysis could not be generated.' });
+    }
+    await pool.query(
+      "UPDATE tbl_plivo_call_log SET call_analysis = ?, call_analysis_status = 'ready', call_analysis_generated_at = NOW() WHERE job_caller_info_id = ?",
+      [JSON.stringify(analysis), id]
+    );
+    return modernOk(res, { status: 'ready', analysis });
   } catch (e) { next(e); }
 });
 
@@ -877,6 +976,15 @@ router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
     const offset = (page - 1) * limit;
 
+    // Surface transcription_status from tbl_plivo_call_log when the columns
+    // exist (2026-07-06-add-plivo-transcription migration). Guarded so the list
+    // keeps working pre-migration. 1:1 with the call via job_caller_info_id.
+    const hasTx = await hasTranscriptionColumn();
+    const txSelect = hasTx ? ',\n              pcl.transcription_status' : '';
+    const txJoin = hasTx
+      ? 'LEFT JOIN tbl_plivo_call_log pcl ON pcl.job_caller_info_id = jci.job_caller_info'
+      : '';
+
     const [[{ total }]] = await pool.query(
       `SELECT COUNT(*) AS total FROM tbl_job_caller_info jci ${whereSql}`,
       params
@@ -901,8 +1009,9 @@ router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
               jci.location,
               jci.provider,
               jci.inserted_time,
-              jci.is_updated
+              jci.is_updated${txSelect}
          FROM tbl_job_caller_info jci
+         ${txJoin}
          ${whereSql}
          ORDER BY jci.inserted_time DESC
          LIMIT ? OFFSET ?`,
