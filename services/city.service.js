@@ -41,8 +41,19 @@ const SORTABLE_COLUMNS = Object.freeze({
 });
 
 // ─── List ────────────────────────────────────────────────────────────
+// Creator-audit tracking columns on tbl_city (created_by / created_by_type /
+// created_date) are a pending migration — probe once + guard so this query
+// stays valid where it's unrun.
+let _hasCityCreatorCol = null;
+async function hasCityCreatorCol() {
+  if (_hasCityCreatorCol !== null) return _hasCityCreatorCol;
+  try { const [r] = await pool.query("SHOW COLUMNS FROM tbl_city LIKE 'created_by_type'"); _hasCityCreatorCol = r.length > 0; }
+  catch { _hasCityCreatorCol = false; }
+  return _hasCityCreatorCol;
+}
+
 async function listCities({
-  q, stateId, includeInactive = false,
+  q, stateId, createdByTech = false, includeInactive = false,
   limit = 200, offset = 0,
   sortBy = 'city_name', sortDir = 'asc',
 } = {}) {
@@ -67,6 +78,17 @@ async function listCities({
   }
   if (stateId) { where.push('c.state_id = ?'); params.push(Number(stateId)); }
 
+  // Creator-audit projection + filter, gated on the pending migration.
+  const hasCreator = await hasCityCreatorCol();
+  const creatorSelect = hasCreator
+    ? "c.created_by, c.created_by_type, c.created_date, COALESCE(cbe.efr_name, cbu.user_name) AS created_by_name"
+    : 'NULL AS created_by, NULL AS created_by_type, NULL AS created_date, NULL AS created_by_name';
+  const creatorJoin = hasCreator
+    ? `LEFT JOIN tbl_easyfixer cbe ON (c.created_by_type = 'technician' AND cbe.efr_id = c.created_by)
+       LEFT JOIN tbl_user      cbu ON (c.created_by_type = 'user'       AND cbu.user_id = c.created_by)`
+    : '';
+  if (createdByTech && hasCreator) where.push("c.created_by_type = 'technician'");
+
   const [rows] = await pool.query(
     `SELECT
         c.city_id,
@@ -77,6 +99,7 @@ async function listCities({
         c.tier,
         c.reference_pincode,
         c.city_status,
+        ${creatorSelect},
         (SELECT COUNT(*) FROM tbl_zone_master z
           WHERE z.city_id = c.city_id AND z.zone_status = 1)        AS zone_count,
         (SELECT COUNT(*) FROM tbl_pincode p
@@ -85,6 +108,7 @@ async function listCities({
           WHERE e.efr_cityId = c.city_id AND e.efr_status = 1)      AS technician_count
        FROM tbl_city  c
        LEFT JOIN tbl_state s ON s.state_id = c.state_id
+       ${creatorJoin}
       WHERE ${where.join(' AND ')}
       ORDER BY ${orderBy}
       LIMIT ? OFFSET ?`,

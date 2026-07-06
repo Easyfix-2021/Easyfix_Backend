@@ -23,6 +23,8 @@ const listQuery = Joi.object({
   q:       Joi.string().allow('', null).optional(),
   status:  Joi.string().valid('LOCAL', 'TRAVEL').optional(),
   cityId:  Joi.number().integer().positive().optional(),
+  // Show only pincodes a technician created on the fly (created_by_efr_id set).
+  createdByTech: Joi.boolean().default(false),
   includeInactive: Joi.boolean().default(false),
   limit:   Joi.number().integer().min(1).max(200000).default(100),
   offset:  Joi.number().integer().min(0).default(0),

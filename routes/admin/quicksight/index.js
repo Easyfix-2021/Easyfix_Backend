@@ -42,5 +42,6 @@ router.use('/supply-gap',             require('./supply-gap'));
 router.use('/employee-productivity',  require('./employee-productivity'));
 router.use('/admin-dashboard',        require('./admin-dashboard'));
 router.use('/offer-acceptance',       require('./offer-acceptance'));
+router.use('/profile-update-requests', require('./profile-update-requests'));
 
 module.exports = router;

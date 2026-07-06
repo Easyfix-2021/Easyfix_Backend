@@ -97,15 +97,17 @@ const saveBody = Joi.object({
   basic:                   basicSchema.optional(),
   // SINGLE-SUBMIT form (2026-06-30): the FE now saves Skills + Service Area in
   // ONE PUT via a single "Save Profile" button, and BOTH are mandatory — so
-  // both arrays are REQUIRED and non-empty (.min(1)). The technician cannot
-  // save with either section empty. (CAP 500 mirrors optionMappingsBody; 2000
+  // both arrays are REQUIRED. Deep skills need >=1; serviceable pincodes need
+  // >=3 (a technician must serve at least three areas — the FE enforces the same
+  // floor, keep them in lock-step). (CAP 500 mirrors optionMappingsBody; 2000
   // mirrors serviceablePincodesBody.)
   deep_skill_items:        Joi.array().items(deepSkillItemSchema).min(1).max(500).required(),
   serviceable_pincode_ids: Joi.array()
     .items(Joi.number().integer().positive())
-    .min(1)
+    .min(3)
     .max(2000)
-    .required(),
+    .required()
+    .messages({ 'array.min': 'Select at least 3 serviceable pincodes.' }),
 });
 
 // Centralised error mapper. verifyEasyfixerProfileToken throws Error
@@ -287,12 +289,11 @@ router.post(
   validate(ensurePincodeBody, 'body'),
   async (req, res, next) => {
     try {
-      // Token verification only — the pincode catalog is identical for every
-      // easyfixer, so we don't need the efrId; the call still gates access to
-      // authenticated link holders.
-      verifyTokenFromQuery(req);
-      logger.info('Ensuring pincode · pincode=' + req.body.pincode);
-      const row = await pincodeService.ensurePincode(req.body.pincode);
+      // The verified efrId is the CREATOR — we track which pincodes/cities a
+      // technician mints on the fly (created_by_efr_id) so ops can review them.
+      const efrId = verifyTokenFromQuery(req);
+      logger.info('Ensuring pincode · pincode=' + req.body.pincode + ' · efrId=' + efrId);
+      const row = await pincodeService.ensurePincode(req.body.pincode, { createdByEfrId: efrId });
       logger.info(
         { pincode: req.body.pincode, pincode_id: row && row.pincode_id, created: row && row.created },
         'easyfixer-profile-update: ensure-pincode',
