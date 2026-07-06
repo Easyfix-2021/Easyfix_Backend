@@ -699,6 +699,18 @@ async function hasAnalysisColumn() {
   return _hasAnalysisCol;
 }
 
+// Probe for the Transcribe Call Analytics metric columns on tbl_plivo_call_log
+// (2026-07-06-add-call-metrics migration). Cached.
+let _hasMetricsCol = null;
+async function hasMetricsColumn() {
+  if (_hasMetricsCol !== null) return _hasMetricsCol;
+  try {
+    const [rows] = await pool.query("SHOW COLUMNS FROM tbl_plivo_call_log LIKE 'call_metrics'");
+    _hasMetricsCol = rows.length > 0;
+  } catch (_e) { _hasMetricsCol = false; }
+  return _hasMetricsCol;
+}
+
 // Best-effort: pull the Plivo transcription for a recording and store it on the
 // call's tbl_plivo_call_log row for later quality analysis. Gated by
 // plivo.transcription.enabled + column presence; NEVER throws + never blocks the
@@ -807,37 +819,56 @@ router.get('/:id/analysis', requireClickToCallAction, async (req, res, next) => 
   try {
     const id = parseRowId(req.params.id);
     if (!id) return modernError(res, 400, 'invalid call id');
-    if (!(await hasAnalysisColumn())) {
+    // Transcription columns are the base surface; analysis (LLM) + metrics
+    // (Transcribe) are each conditionally present per their own migration.
+    if (!(await hasTranscriptionColumn())) {
       return modernOk(res, { status: 'unavailable', reason: 'Call analytics is not enabled in this environment.' });
     }
+    const hasAnalysis = await hasAnalysisColumn();
+    const hasMetrics = await hasMetricsColumn();
+    const analysisCol = hasAnalysis ? 'call_analysis' : 'NULL AS call_analysis';
+    const metricsSelect = hasMetrics ? ', call_metrics, call_metrics_status' : '';
     const [[row]] = await pool.query(
-      `SELECT transcription, transcription_status, call_analysis
+      `SELECT transcription, transcription_status, ${analysisCol}${metricsSelect}
          FROM tbl_plivo_call_log WHERE job_caller_info_id = ? ORDER BY id DESC LIMIT 1`,
       [id]
     );
-    if (!row) return modernOk(res, { status: 'no_transcript' });
-    // Cache hit — return the stored analysis (parse-guarded).
+
+    // Objective metrics (Transcribe Call Analytics), precomputed by the
+    // call-metrics cron. Attached to EVERY response so the modal can show the
+    // metrics half even when the LLM coaching half isn't ready.
+    let metrics = null;
+    if (hasMetrics && row && row.call_metrics) {
+      try { metrics = JSON.parse(row.call_metrics); } catch (_e) { metrics = null; }
+    }
+    const metricsStatus = (hasMetrics && row) ? (row.call_metrics_status || null) : null;
+    const withMetrics = (obj) => ({ ...obj, metrics, metricsStatus });
+
+    if (!row) return modernOk(res, withMetrics({ status: 'no_transcript' }));
+    // Cache hit — return the stored coaching (parse-guarded).
     if (row.call_analysis) {
-      try { return modernOk(res, { status: 'ready', analysis: JSON.parse(row.call_analysis) }); }
+      try { return modernOk(res, withMetrics({ status: 'ready', analysis: JSON.parse(row.call_analysis) })); }
       catch (_e) { /* corrupt cache — fall through + regenerate */ }
     }
     if (!row.transcription || String(row.transcription).trim().length < 10) {
-      return modernOk(res, { status: 'no_transcript' });
+      return modernOk(res, withMetrics({ status: 'no_transcript' }));
     }
     if (!callAnalysis.llmEnabled()) {
-      return modernOk(res, { status: 'llm_disabled', reason: 'Call-analysis AI is not configured in this environment.' });
+      return modernOk(res, withMetrics({ status: 'llm_disabled', reason: 'Call-analysis AI is not configured in this environment.' }));
     }
     logger.info('Generate call analysis · row=' + id);
     const analysis = await callAnalysis.analyzeTranscript(row.transcription);
     if (!analysis) {
-      await pool.query("UPDATE tbl_plivo_call_log SET call_analysis_status = 'failed' WHERE job_caller_info_id = ?", [id]);
-      return modernOk(res, { status: 'failed', reason: 'Analysis could not be generated.' });
+      if (hasAnalysis) await pool.query("UPDATE tbl_plivo_call_log SET call_analysis_status = 'failed' WHERE job_caller_info_id = ?", [id]);
+      return modernOk(res, withMetrics({ status: 'failed', reason: 'Analysis could not be generated.' }));
     }
-    await pool.query(
-      "UPDATE tbl_plivo_call_log SET call_analysis = ?, call_analysis_status = 'ready', call_analysis_generated_at = NOW() WHERE job_caller_info_id = ?",
-      [JSON.stringify(analysis), id]
-    );
-    return modernOk(res, { status: 'ready', analysis });
+    if (hasAnalysis) {
+      await pool.query(
+        "UPDATE tbl_plivo_call_log SET call_analysis = ?, call_analysis_status = 'ready', call_analysis_generated_at = NOW() WHERE job_caller_info_id = ?",
+        [JSON.stringify(analysis), id]
+      );
+    }
+    return modernOk(res, withMetrics({ status: 'ready', analysis }));
   } catch (e) { next(e); }
 });
 

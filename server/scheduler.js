@@ -596,6 +596,39 @@ Note: only runs automatically if easyfix_properties "plivo.transcription.enabled
     logger.info('Transcription-backfill cron registered (plivo.transcription.enabled=true, every 30 min IST).');
   }
 
+  // ── Call-metrics (Amazon Transcribe Call Analytics) — start + retrieve jobs
+  //    for completed calls. Gated by transcribe.analytics.enabled + AWS config. ──
+  const callMetricsCron = require('../services/call-metrics-cron');
+  const transcribeSvc = require('../services/transcribe-call-analytics.service');
+  const callMetricsJob = registerJob({
+    id: 'call-metrics-transcribe',
+    name: 'Call Metrics (Transcribe Call Analytics)',
+    description:
+`What this task does: Every 10 minutes it drives Amazon Transcribe Call Analytics for completed Plivo calls — it starts an analytics job on each call's recording (caching the recording in S3 first if needed) and, on later runs, retrieves the finished result (sentiment, agent/customer talk-time, interruptions) and stores it for Settings → Call Analytics.
+
+Note: only runs automatically when easyfix_properties "transcribe.analytics.enabled" = "true" AND the AWS config is present (S3_BUCKET_NAME + TRANSCRIBE_DATA_ACCESS_ROLE_ARN). Checked at server start — restart after changing. Transcribe Call Analytics needs 2-channel recordings + a region that supports it.`,
+    cron: '*/10 * * * *',
+    runner: async () => {
+      const r = await callMetricsCron.runCallMetrics({ startLimit: 10, pollLimit: 25 });
+      logger.info('Call-metrics cron · ' + JSON.stringify(r));
+      return r;
+    },
+  });
+  if (cronDisabled) {
+    callMetricsJob.skipReason = 'CRON_DISABLED=true';
+  } else if (!transcribeSvc.enabled()) {
+    callMetricsJob.skipReason = "transcribe.analytics.enabled not 'true' OR AWS config (S3_BUCKET_NAME / TRANSCRIBE_DATA_ACCESS_ROLE_ARN) missing at server start";
+    logger.info('Call-metrics cron SKIPPED — set transcribe.analytics.enabled=true + AWS config to enable (takes effect after restart).');
+  } else {
+    callMetricsJob.task = cron.schedule(
+      callMetricsJob.cron,
+      () => invokeJob(callMetricsJob, 'cron'),
+      { timezone: TZ },
+    );
+    callMetricsJob.registered = true;
+    logger.info('Call-metrics cron registered (transcribe.analytics.enabled=true, every 10 min IST).');
+  }
+
   // ─── Deep Skill Image-Gen orphan reset — every 5 minutes ─────────────
   // Standalone cron (NOT registered via registerJob()). Deliberately
   // absent from the Scheduled Jobs admin page — this is infrastructure
