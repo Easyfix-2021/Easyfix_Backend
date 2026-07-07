@@ -739,6 +739,43 @@ async function storeTranscriptionBestEffort({ jobCallerInfoId, recordingId }) {
   }
 }
 
+// On-demand transcript fetch for the analysis view: if the 30-min backfill cron
+// hasn't reached this call yet, pull its transcript NOW (transcript only — the
+// recording DOWNLOAD stays lazy) so the first "View Analysis" isn't blocked on
+// the cron cadence. Best-effort: returns the text or null, never throws, and
+// persists the result on the row so the next open is a cache hit.
+async function fetchTranscriptOnDemand({ jobCallerInfoId, callUuid, currentStatus }) {
+  try {
+    if (!callUuid || !plivo.transcriptionEnabled()) return null;
+    const meta = await plivo.fetchRecordingMeta({ callUuid });
+    if (!meta.ok || !meta.recordingId) return null;
+    const tx = await plivo.fetchTranscription({ recordingId: meta.recordingId });
+    if (tx.ok && tx.text) {
+      await pool.query(
+        "UPDATE tbl_plivo_call_log SET transcription = ?, transcription_status = 'completed', transcription_fetched_at = NOW() WHERE job_caller_info_id = ?",
+        [tx.text, jobCallerInfoId]
+      );
+      return tx.text;
+    }
+    // No transcript yet. If we've never requested one, REQUEST it now (Plivo
+    // doesn't auto-transcribe) and mark 'processing' — it'll be retrieved on the
+    // next View Analysis or by the backfill cron. Recording download stays lazy.
+    // Already 'processing' → wait; 'not_available' → terminal, don't re-request.
+    if (tx.ok && !currentStatus) {
+      const created = await plivo.createTranscription({ recordingId: meta.recordingId });
+      const status = created.notEnabled ? 'not_available' : 'processing';
+      await pool.query(
+        "UPDATE tbl_plivo_call_log SET transcription_status = ?, transcription_fetched_at = NOW() WHERE job_caller_info_id = ?",
+        [status, jobCallerInfoId]
+      );
+    }
+    return null;
+  } catch (e) {
+    logger.warn('On-demand transcript fetch failed · jci=' + jobCallerInfoId + ' · ' + e.message);
+    return null;
+  }
+}
+
 // ─── GET /:id/recording — lazy Plivo→S3 call-recording play URL ────────
 // On first play we fetch the recording from Plivo (by CallUUID), store it once
 // on our S3 under a stable key, persist that key on the row, and return a
@@ -829,7 +866,7 @@ router.get('/:id/analysis', requireClickToCallAction, async (req, res, next) => 
     const analysisCol = hasAnalysis ? 'call_analysis' : 'NULL AS call_analysis';
     const metricsSelect = hasMetrics ? ', call_metrics, call_metrics_status' : '';
     const [[row]] = await pool.query(
-      `SELECT transcription, transcription_status, ${analysisCol}${metricsSelect}
+      `SELECT transcription, transcription_status, call_uuid, ${analysisCol}${metricsSelect}
          FROM tbl_plivo_call_log WHERE job_caller_info_id = ? ORDER BY id DESC LIMIT 1`,
       [id]
     );
@@ -849,6 +886,13 @@ router.get('/:id/analysis', requireClickToCallAction, async (req, res, next) => 
     if (row.call_analysis) {
       try { return modernOk(res, withMetrics({ status: 'ready', analysis: JSON.parse(row.call_analysis) })); }
       catch (_e) { /* corrupt cache — fall through + regenerate */ }
+    }
+    // No stored transcript yet — try to fetch it on-demand (transcript only;
+    // the recording download stays lazy) before giving up, so the cron's 30-min
+    // cadence doesn't block the first View Analysis for this call.
+    if ((!row.transcription || String(row.transcription).trim().length < 10) && row.call_uuid) {
+      const fetched = await fetchTranscriptOnDemand({ jobCallerInfoId: id, callUuid: row.call_uuid, currentStatus: row.transcription_status });
+      if (fetched) row.transcription = fetched;
     }
     if (!row.transcription || String(row.transcription).trim().length < 10) {
       return modernOk(res, withMetrics({ status: 'no_transcript' }));
@@ -1007,17 +1051,19 @@ router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
     const offset = (page - 1) * limit;
 
-    // Surface transcription_status from tbl_plivo_call_log when the columns
-    // exist (2026-07-06-add-plivo-transcription migration). Guarded so the list
-    // keeps working pre-migration. 1:1 with the call via job_caller_info_id.
+    // Call Analytics is Plivo-only: transcription + coaching analysis live in
+    // tbl_plivo_call_log, so this list shows ONLY calls that have a Plivo log
+    // row — the "relevant" set — not every row in the ~940k-row shared
+    // caller-info audit table (dominated by null/legacy-provider rows). INNER
+    // JOIN restricts BOTH the count and the page to those; 1:1 with the call via
+    // job_caller_info_id. transcription_status is selected only when the
+    // 2026-07-06 migration added the column (guarded for pre-migration envs).
     const hasTx = await hasTranscriptionColumn();
     const txSelect = hasTx ? ',\n              pcl.transcription_status' : '';
-    const txJoin = hasTx
-      ? 'LEFT JOIN tbl_plivo_call_log pcl ON pcl.job_caller_info_id = jci.job_caller_info'
-      : '';
+    const plivoJoin = 'JOIN tbl_plivo_call_log pcl ON pcl.job_caller_info_id = jci.job_caller_info';
 
     const [[{ total }]] = await pool.query(
-      `SELECT COUNT(*) AS total FROM tbl_job_caller_info jci ${whereSql}`,
+      `SELECT COUNT(*) AS total FROM tbl_job_caller_info jci ${plivoJoin} ${whereSql}`,
       params
     );
     const [rows] = await pool.query(
@@ -1042,7 +1088,7 @@ router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
               jci.inserted_time,
               jci.is_updated${txSelect}
          FROM tbl_job_caller_info jci
-         ${txJoin}
+         ${plivoJoin}
          ${whereSql}
          ORDER BY jci.inserted_time DESC
          LIMIT ? OFFSET ?`,

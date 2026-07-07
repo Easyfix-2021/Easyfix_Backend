@@ -11,6 +11,9 @@ const fcmService = require('../../services/fcm.service');
 const smsService = require('../../services/sms.service');
 const whatsappService = require('../../services/meta.whatsapp.service');
 const { resolveTokens } = require('../../services/job-offer-push.service');
+const aiSession = require('../../services/ai-call-session.service');
+const aiCall = require('../../services/plivo-ai-call.service');
+const { listFlows, DEFAULT_FLOW } = require('../../services/ai-call-flows');
 
 /*
  * Admin "Validate Flows" utilities — operator smoke-tests for delivery paths
@@ -196,6 +199,106 @@ router.post('/message', validate(messageBody), async (req, res, next) => {
       : `${label} not sent — see reason.`);
   } catch (e) {
     logger.error('Validate Flows test message failed · ' + e.message);
+    next(e);
+  }
+});
+
+// ── AI Calling → Profile Update (TEST flow) ─────────────────────────────────
+// Places an AI voice call that converses in the technician's language, asks for
+// their skills + serviceable areas, then maps the transcript to Deep-Skill
+// options + pincodes (DISPLAY ONLY — nothing is written to real profile tables).
+// Gated by ai.calling.enabled + an OpenAI Realtime key; hard concurrency cap.
+// Flow set is driven by the registry (services/ai-call-flows.js) — adding a flow
+// there makes it a valid `flow` here with no change to this route.
+const AI_FLOW_IDS = listFlows().map((f) => f.id);
+const aiStartBody = Joi.object({
+  flow: Joi.string().valid(...AI_FLOW_IDS).default(DEFAULT_FLOW),
+  efrId: Joi.number().integer().positive(),
+  mobile: Joi.string().trim().pattern(/^\d{10}$/),
+}).or('efrId', 'mobile');
+
+// List the available AI-calling flows (for a UI flow selector).
+router.get('/ai-calling/flows', (req, res) => modernOk(res, { flows: listFlows() }));
+
+router.post('/ai-calling/start', validate(aiStartBody), async (req, res, next) => {
+  try {
+    if (!aiSession.enabled()) {
+      return modernError(res, 400,
+        'AI calling is not enabled. Set property ai.calling.enabled=true and configure an OpenAI Realtime key (OPENAI_REALTIME_API_KEY / OPENAI_API_KEY).');
+    }
+    // Rule 2 — cap pre-check at start (the authoritative acquire happens when the
+    // media socket connects). Protects the shared backend from over-admission.
+    if (aiSession.activeCount() >= aiSession.MAX_CONCURRENT) {
+      return modernError(res, 503,
+        `Capacity reached — ${aiSession.activeCount()}/${aiSession.MAX_CONCURRENT} AI calls already active. Try again shortly.`);
+    }
+
+    const { efrId, mobile } = req.body;
+    const via = efrId ? 'efrId' : 'mobile';
+    const tech = await resolveTech({ efrId, mobile });
+    const to = mobile || (tech && tech.efr_no);
+    const resolvedTech = tech
+      ? { efrId: tech.efr_id, name: tech.efr_name, mobile: tech.efr_no, email: tech.efr_email }
+      : null;
+    if (!to) {
+      if (!tech) return modernError(res, 404, 'No technician found for the supplied ' + via + '.');
+      return modernError(res, 404, 'Technician found but has no mobile number on record.', { resolvedTech });
+    }
+
+    let sessionId;
+    try {
+      sessionId = await aiSession.createSession({ mobile: to, efrId: tech ? tech.efr_id : null, flow: req.body.flow });
+    } catch (e) {
+      logger.error('Validate Flows · ai-calling · session store not ready · ' + e.message);
+      return modernError(res, 503,
+        'AI-calling storage is not ready — run migrations/2026-07-06-create-tbl-ai-call-session.sql, then retry.');
+    }
+
+    const token = aiSession.signToken(sessionId);
+    const placed = await aiCall.placeAiCall({ to, token });
+    if (!placed.ok) {
+      await aiSession.setStatus(sessionId, 'failed', { error: placed.error });
+      return modernError(res, 502, 'Could not place the AI call: ' + placed.error, { sessionId });
+    }
+    await aiSession.setStatus(sessionId, 'calling', { callUuid: placed.callId || null });
+    // Backstop: if the media stream never connects, fail the session (and unstick
+    // the polling UI) after a timeout instead of leaving it stuck at 'calling'.
+    aiSession.scheduleConnectReaper(sessionId);
+
+    logger.info('Validate Flows · ai-calling · placed · session=' + sessionId + ' · via=' + via
+      + ' · active=' + aiSession.activeCount());
+    return modernOk(res, {
+      sessionId,
+      resolvedVia: via,
+      resolvedTech,
+      to: shortMobile(to),
+      callId: placed.callId || null,
+    }, 'Calling now — pick up your phone. The panel will update once the call ends.');
+  } catch (e) {
+    logger.error('Validate Flows · ai-calling · start failed · ' + e.message);
+    next(e);
+  }
+});
+
+// Poll the durable session (any replica — state lives in tbl_ai_call_session).
+router.get('/ai-calling/:sessionId', async (req, res, next) => {
+  try {
+    const s = await aiSession.getSession(req.params.sessionId);
+    if (!s) return modernError(res, 404, 'Session not found (or AI-calling storage is not ready).');
+    let result = null;
+    if (s.result_json) { try { result = JSON.parse(s.result_json); } catch { result = null; } }
+    return modernOk(res, {
+      sessionId: s.session_id,
+      status: s.status,
+      error: s.error || null,
+      mobile: shortMobile(s.mobile),
+      efrId: s.efr_id || null,
+      transcript: s.transcript || '',
+      result,
+      createdOn: s.created_on,
+    });
+  } catch (e) {
+    logger.error('Validate Flows · ai-calling · poll failed · ' + e.message);
     next(e);
   }
 });

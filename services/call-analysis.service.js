@@ -4,58 +4,26 @@
  * what-to-avoid / what-to-add). Plivo gives us the transcript (ASR); the
  * COMMUNICATION analysis is not something Plivo provides, so we do it here.
  *
- * Reuses the same OpenAI Chat-Completions plumbing as
- * services/service-skill-matrix.service.js (temperature 0, JSON response,
- * returns null on ANY failure so callers degrade gracefully). Key resolution
- * falls back across a few env vars so it works wherever an OpenAI key exists.
+ * The LLM step routes through Sophy (services/sophy.service.js), the central AI
+ * gateway — model/prompt/quota are key-controlled. Sophy folds our system prompt
+ * into the user turn and parses JSON leniently, so we pass {system,user} and get
+ * an object (or null on ANY failure so callers degrade gracefully).
  */
 
-const logger = require('../logger');
+const sophy = require('./sophy.service');
 
-const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
-const MODEL = process.env.OPENAI_CALL_ANALYTICS_MODEL || process.env.OPENAI_NLU_MODEL || 'gpt-4o-mini';
-
-function apiKey() {
-  return process.env.OPENAI_API_KEY_CALL_ANALYTICS
-    || process.env.OPENAI_API_KEY_SKILL_MATRIX
-    || process.env.OPENAI_API_KEY
-    || null;
+// This feature's OWN Sophy key (own model/prompt/quota/cost line).
+function sophyKey() {
+  return process.env.SOPHY_API_KEY_CALL_ANALYSIS;
 }
-
 function llmEnabled() {
-  return !!apiKey();
+  return sophy.enabled(sophyKey());
 }
 
+// JSON chat call — routed through Sophy on the call-analysis key. Returns the
+// parsed object, or null on any failure (never throws; caller degrades).
 async function chatJson({ system, user, maxTokens = 1600 }) {
-  const key = apiKey();
-  if (!key) return null;
-  try {
-    const res = await fetch(OPENAI_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
-      body: JSON.stringify({
-        model: MODEL,
-        temperature: 0,
-        max_tokens: maxTokens,
-        response_format: { type: 'json_object' },
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: user },
-        ],
-      }),
-    });
-    if (!res.ok) {
-      logger.warn('call-analysis LLM http ' + res.status + ' · ' + (await res.text()).slice(0, 200));
-      return null;
-    }
-    const data = await res.json();
-    const content = data?.choices?.[0]?.message?.content;
-    if (!content) return null;
-    try { return JSON.parse(content); } catch { return null; }
-  } catch (e) {
-    logger.warn('call-analysis LLM error · ' + e.message);
-    return null;
-  }
+  return sophy.chatJson({ system, user, maxTokens, apiKey: sophyKey() });
 }
 
 const SYSTEM = [

@@ -1,5 +1,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
+const sophy = require('./sophy.service');
 
 /*
  * Job Skill Matrix builder.
@@ -15,51 +16,27 @@ const logger = require('../logger');
  * job's services → required deep skills through this table (a separate, flagged
  * integration step).
  *
- * Reuses the same OpenAI Chat-Completions plumbing as services/ai.service.js.
+ * The LLM step routes through Sophy (services/sophy.service.js), the central AI
+ * gateway — model/prompt/quota are key-controlled. Sophy folds our system prompt
+ * into the user turn and parses JSON leniently, so callers pass {system,user} and
+ * get an object (or null → degrade gracefully; never throws).
  */
 
-const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
-const MODEL = process.env.OPENAI_MATRIX_MODEL || process.env.OPENAI_NLU_MODEL || 'gpt-4o-mini';
+const MODEL = 'sophy'; // reported in the build summary; the real model is key-set
 const BATCH = 25; // service names classified per LLM call
 
+// This feature's OWN Sophy key (own model/prompt/quota/cost line).
+function sophyKey() {
+  return process.env.SOPHY_API_KEY_SKILL_MATRIX;
+}
 function llmEnabled() {
-  return !!process.env.OPENAI_API_KEY_SKILL_MATRIX;
+  return sophy.enabled(sophyKey());
 }
 
-// Generic JSON chat call — returns the parsed object, or null on any failure
-// (never throws; the caller degrades gracefully).
+// Generic JSON chat call — routed through Sophy on the skill-matrix key. Returns
+// the parsed object, or null on any failure (never throws; caller degrades).
 async function chatJson({ system, user, maxTokens = 1500 }) {
-  if (!llmEnabled()) return null;
-  try {
-    const res = await fetch(OPENAI_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY_SKILL_MATRIX}`,
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        temperature: 0,
-        max_tokens: maxTokens,
-        response_format: { type: 'json_object' },
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: user },
-        ],
-      }),
-    });
-    if (!res.ok) {
-      logger.warn('skill-matrix LLM http ' + res.status + ' · ' + (await res.text()).slice(0, 200));
-      return null;
-    }
-    const data = await res.json();
-    const content = data?.choices?.[0]?.message?.content;
-    if (!content) return null;
-    try { return JSON.parse(content); } catch { return null; }
-  } catch (e) {
-    logger.warn('skill-matrix LLM error · ' + e.message);
-    return null;
-  }
+  return sophy.chatJson({ system, user, maxTokens, apiKey: sophyKey() });
 }
 
 // Active deep skills grouped by category_id, each tagged with its service-type
@@ -150,7 +127,7 @@ async function classifyBatch(categoryId, categoryName, skills, names) {
  */
 async function buildMatrix({ categoryId = null, dryRun = false } = {}) {
   if (!llmEnabled()) {
-    const e = new Error('OPENAI_API_KEY_SKILL_MATRIX is not configured — cannot build the skill matrix.');
+    const e = new Error('Sophy (SOPHY_API_KEY) is not configured — cannot build the skill matrix.');
     e.status = 422;
     throw e;
   }

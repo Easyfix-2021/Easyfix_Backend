@@ -4,6 +4,8 @@ const logger = require('../../logger');
 const { pool } = require('../../db');
 const plivo = require('../../services/plivo.service');
 const plivoLog = require('../../services/plivo-call-log.service');
+const aiCall = require('../../services/plivo-ai-call.service');
+const aiSession = require('../../services/ai-call-session.service');
 
 /*
  * /api/public/plivo/answer — Plivo answer_url callback (truly public, no auth).
@@ -103,5 +105,42 @@ async function webAnswer(req, res) {
 }
 router.post('/web-answer', express.urlencoded({ extended: false }), webAnswer);
 router.get('/web-answer', webAnswer);
+
+/*
+ * /api/public/plivo/ai-answer — answer_url for the AI-calling TEST flow ONLY.
+ * SEPARATE from /answer (which bridges to a human via <Dial>): this returns
+ * <Stream> so Plivo pipes the call audio to our media websocket → OpenAI
+ * Realtime. Authorisation is the signed `t` JWT minted by
+ * ai-call-session.signToken (carries the sessionId). Any invalid/expired token,
+ * disabled feature, or missing wss base yields an empty <Response/> so Plivo
+ * never chokes and the existing bridge flow is entirely untouched.
+ */
+router.get('/ai-answer', async (req, res) => {
+  const xml = (body) => res.type('text/xml').send(body);
+  const empty = '<?xml version="1.0" encoding="UTF-8"?>\n<Response></Response>';
+
+  const claims = aiSession.verifyToken(req.query.t);
+  if (!claims || !claims.sid) {
+    logger.warn('Plivo ai-answer: invalid/expired token · returning empty Response');
+    return xml(empty);
+  }
+  if (!aiSession.enabled()) {
+    logger.warn('Plivo ai-answer: ai.calling disabled / no key · returning empty Response');
+    return xml(empty);
+  }
+  const base = aiCall.wsBase();
+  if (!base) {
+    logger.error('Plivo ai-answer: no wss callback base configured · returning empty Response');
+    return xml(empty);
+  }
+
+  // NOTE: we intentionally do NOT flip status to 'streaming' here. The call is
+  // answered but the media ws may still fail to connect (cap/gate/replica). The
+  // relay stamps 'streaming' (+ CallUUID) from its 'start' event once audio
+  // actually flows, so the session status stays truthful.
+  const wssUrl = `${base}/ai-voice-stream?t=${encodeURIComponent(req.query.t)}`;
+  logger.info('Plivo ai-answer: returning Stream XML · session=' + claims.sid);
+  return xml(aiCall.buildStreamXml(wssUrl));
+});
 
 module.exports = router;

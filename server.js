@@ -156,8 +156,22 @@ async function start() {
     scheduler.init();
   });
 
+  // AI-calling media websocket (Plivo <Stream> ⇄ OpenAI Realtime). Attached to
+  // the SAME HTTP server's `upgrade` event (no extra port). Wrapped so a missing
+  // `ws` dependency or any attach error degrades the AI-calling flow to OFF
+  // WITHOUT crashing the shared backend. Gated per-connection by ai.calling.enabled.
+  try {
+    require('./services/ai-voice-server.service').attach(server);
+  } catch (err) {
+    logger.warn(`AI voice ws server not attached — ${err.message}. AI-calling flow disabled (shared backend unaffected).`);
+  }
+
   const shutdown = async (signal) => {
     logger.shutdown(`Shutdown requested (${signal}) — closing connections gracefully…`);
+    // Close any live AI-call media sockets FIRST (while the DB pool is still
+    // open) so each call's teardown can persist its transcript/result. Guarded
+    // so a missing/never-attached ws server can't disrupt shutdown.
+    try { require('./services/ai-voice-server.service').shutdown(); } catch { /* noop */ }
     // Stop cron BEFORE closing the HTTP server so an in-flight cron task
     // doesn't keep the pool alive past closePool().
     scheduler.stop();

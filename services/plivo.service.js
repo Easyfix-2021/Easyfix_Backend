@@ -157,7 +157,13 @@ function verifyCallToken(t) {
 // up — bridges to the customer leg. callerId is the Plivo DID.
 //
 // Recording (2026-07-03): `record="true"` on <Dial> records the bridged
-// conversation server-side at Plivo (dual-channel mp3). We do NOT set a
+// conversation server-side at Plivo as an mp3. NOTE: <Dial> exposes NO channel
+// option, so this is Plivo's default single/mixed (mono) track — NOT guaranteed
+// 2-channel. ⚠️ AWS Transcribe CALL ANALYTICS (the metrics panel) needs
+// dual-channel input, so verify an actual recording's channel count (e.g.
+// `ffprobe -show_entries stream=channels`) before relying on it — if mono, the
+// metrics half won't run (the LLM coaching, from the Plivo transcript, is
+// unaffected by channel count). We do NOT set a
 // recordingCallbackUrl — the recording is fetched LAZILY on demand (only when
 // an operator plays it) via the Plivo Recording API keyed by CallUUID, then
 // cached to our S3, so we don't store audio nobody listens to. Gated on
@@ -279,6 +285,14 @@ async function hangupCall({ callUuid }) {
   }
 }
 
+// Bound every Plivo HTTP lookup so a hung provider request can't stall the
+// caller — critical for the on-demand transcript fetch that runs INSIDE the
+// user-facing GET /calls/:id/analysis request. `AbortSignal.timeout` throws a
+// DOMException ('TimeoutError') that each function's try/catch already turns
+// into a graceful { ok: false } (→ null transcript → "no transcript"), so a
+// slow Plivo degrades to "not available" instead of hanging the request.
+const PLIVO_HTTP_TIMEOUT_MS = 8000;
+
 /*
  * Look up a call's recording by CallUUID via the Plivo Recording API
  * (GET /Account/{id}/Recording/?call_uuid=…). Returns the first recording's
@@ -293,7 +307,7 @@ async function fetchRecordingMeta({ callUuid }) {
   }
   const url = `${BASE}/Account/${encodeURIComponent(process.env.PLIVO_AUTH_ID)}/Recording/?call_uuid=${encodeURIComponent(callUuid)}`;
   try {
-    const res = await fetch(url, { headers: { Authorization: auth } });
+    const res = await fetch(url, { headers: { Authorization: auth }, signal: AbortSignal.timeout(PLIVO_HTTP_TIMEOUT_MS) });
     if (!res.ok) {
       logger.warn(`Plivo recording lookup FAIL · uuid=${callUuid} · http=${res.status}`);
       return { ok: false, httpStatus: res.status, url: null };
@@ -353,7 +367,7 @@ async function fetchTranscription({ recordingId }) {
   }
   const url = `${BASE}/Account/${encodeURIComponent(process.env.PLIVO_AUTH_ID)}/Transcription/${encodeURIComponent(recordingId)}/`;
   try {
-    const res = await fetch(url, { headers: { Authorization: auth } });
+    const res = await fetch(url, { headers: { Authorization: auth }, signal: AbortSignal.timeout(PLIVO_HTTP_TIMEOUT_MS) });
     // 404 = no transcription generated for this recording (not requested at
     // record time, or still processing) — a normal "not available", not an error.
     if (res.status === 404) return { ok: true, text: null, notAvailable: true };
@@ -367,6 +381,50 @@ async function fetchTranscription({ recordingId }) {
   } catch (err) {
     logger.error(`Plivo transcription lookup network error · recId=${recordingId} · ${err.message}`);
     return { ok: false, error: err.message, text: null };
+  }
+}
+
+/*
+ * REQUEST Plivo to create a transcription for a recording (POST). Plivo does NOT
+ * auto-transcribe recordings — a transcript must be requested first, then
+ * retrieved via fetchTranscription() once Plivo finishes processing (seconds to
+ * minutes). This is the missing half of the pipeline: `record="true"` on <Dial>
+ * only captures audio; without this POST the GET always 404s.
+ *
+ * Returns { ok, requested, alreadyExists, notEnabled }:
+ *   - requested     — Plivo accepted the create (transcript is now processing)
+ *   - alreadyExists — a transcription was already requested for this recording
+ *   - notEnabled    — transcription isn't enabled/billed on the account (402/403)
+ * Gated by plivo.transcription.enabled at the call sites (cron + on-demand).
+ */
+async function createTranscription({ recordingId }) {
+  if (!recordingId) return { ok: false, error: 'recordingId required' };
+  const auth = authHeader();
+  if (!auth || !process.env.PLIVO_AUTH_ID) {
+    return { ok: false, error: 'PLIVO_AUTH_ID / PLIVO_AUTH_TOKEN not configured' };
+  }
+  const url = `${BASE}/Account/${encodeURIComponent(process.env.PLIVO_AUTH_ID)}/Transcription/${encodeURIComponent(recordingId)}/`;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { Authorization: auth, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'auto' }),
+      signal: AbortSignal.timeout(PLIVO_HTTP_TIMEOUT_MS),
+    });
+    // 201/202 (or any 2xx) = creation accepted; transcript is now processing.
+    if (res.ok) return { ok: true, requested: true };
+    // 400/409 = a transcription already exists / is already in progress.
+    if (res.status === 400 || res.status === 409) return { ok: true, alreadyExists: true };
+    // 402/403 = transcription not enabled/billed on the account — don't retry forever.
+    if (res.status === 402 || res.status === 403) {
+      logger.warn(`Plivo transcription CREATE not permitted · recId=${recordingId} · http=${res.status} (account add-on?)`);
+      return { ok: false, httpStatus: res.status, notEnabled: true };
+    }
+    logger.warn(`Plivo transcription CREATE FAIL · recId=${recordingId} · http=${res.status}`);
+    return { ok: false, httpStatus: res.status };
+  } catch (err) {
+    logger.error(`Plivo transcription create network error · recId=${recordingId} · ${err.message}`);
+    return { ok: false, error: err.message };
   }
 }
 
@@ -451,6 +509,7 @@ module.exports = {
   fetchRecordingMeta,
   downloadRecording,
   fetchTranscription,
+  createTranscription,
   transcriptionEnabled,
   normaliseIndianPhone,
   signCallToken,

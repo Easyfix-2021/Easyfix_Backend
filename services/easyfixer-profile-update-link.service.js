@@ -1137,6 +1137,10 @@ module.exports = {
   acceptSubmission,
   profileOtpRequired,
   searchPincodes,
+  // Exposed for the AI-calling test flow's post-call mapper
+  // (services/ai-profile-extract.service.js) — same cached catalog the
+  // profile-update magic-link form uses, so both stay in lockstep.
+  fetchDeepSkillCatalog,
   invalidateCatalogCaches,
   invalidateServiceCategoriesCache,
 };

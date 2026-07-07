@@ -729,7 +729,13 @@ async function createCustomProperty(clientId, body) {
     insertVals.push(body.label || null);
   }
   insertCols.push(cols.value, cols.mandatory);
-  insertVals.push(body.value || null, body.mandatory ? 1 : 0);
+  // Legacy `c_prop_values` is NOT NULL — coerce a missing/empty value to '' on
+  // that shape (value-less flag rows like `branch_details` carry no client-level
+  // default). Canonical `property_value` is nullable, so keep null there.
+  const valueCell = (body.value === undefined || body.value === null || body.value === '')
+    ? (cols.hasStatus ? '' : null)
+    : body.value;
+  insertVals.push(valueCell, body.mandatory ? 1 : 0);
   if (cols.hasStatus) {
     insertCols.push('status');
     insertVals.push(1);
@@ -773,6 +779,8 @@ async function updateCustomProperty(propId, body) {
     if (!dbCol) continue; // e.g. label on legacy without c_prop_label
     let v = val;
     if (colKey === 'mandatory') v = val ? 1 : 0;
+    // Legacy `c_prop_values` is NOT NULL — coerce null → '' for the value column.
+    else if (colKey === 'value' && v == null && cols.hasStatus) v = '';
     sets.push(`${dbCol} = ?`);
     vals.push(v);
   }

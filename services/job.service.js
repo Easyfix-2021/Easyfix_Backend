@@ -1882,6 +1882,51 @@ async function create(input, actor) {
     // on the deploy. Two paths to keep the column list + placeholder
     // count + values array perfectly aligned (mismatched lengths here
     // produced silent NULL writes pre-refactor in some legacy ports).
+    // Normalise Branch Details to the dedicated column across ALL booking
+    // surfaces. The CRM sends `branch_details` directly, but the client web/
+    // mobile apps fold every custom prop (incl. branch) into the flattened
+    // `custom_property` string. If branch_details wasn't set but a branch token
+    // is present in custom_property, hoist its value into branch_details and
+    // strip it from the string so reports/views reading tbl_job.branch_details
+    // stay consistent regardless of where the job was booked.
+    if ((input.branch_details == null || String(input.branch_details).trim() === '') && input.custom_property) {
+      const isBranchKey = (s) => {
+        const k = String(s || '').toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
+        return k === 'branch' || k === 'branch details';
+      };
+      const decoded = parseCustomPropertyString(input.custom_property);
+      const hit = decoded.find((p) => isBranchKey(p.name) || isBranchKey(p.label));
+      if (hit && hit.value) {
+        input.branch_details = hit.value;
+        const rest = decoded.filter((p) => p !== hit).map((p) => `${p.label || p.name}:${p.value}`);
+        input.custom_property = rest.length ? rest.join('|') : null;
+      }
+    }
+
+    // Server-side mandatory enforcement for Branch Details (belt-and-braces over
+    // the FE gate — blocks API-direct / tampered / bulk bookings that skip it).
+    // Fires ONLY for clients configured branch-mandatory in Manage Clients (a
+    // mandatory `branch_details` custom-property row), so every other client and
+    // non-branch flow is untouched. Runs AFTER the hoist above, so a branch value
+    // supplied via the custom_property string already satisfies it.
+    if (input.fk_client_id && (input.branch_details == null || String(input.branch_details).trim() === '')) {
+      let clientProps = [];
+      try {
+        clientProps = await require('./client.service').listCustomProperties(input.fk_client_id);
+      } catch (_e) { clientProps = []; }
+      const isBranchKey = (s) => {
+        const k = String(s || '').toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
+        return k === 'branch' || k === 'branch details';
+      };
+      const truthy = (v) => v === 1 || v === '1' || v === true || String(v).toLowerCase() === 'true';
+      const branchRow = clientProps.find((r) => isBranchKey(r.property_name ?? r.c_prop_name ?? r.name));
+      if (branchRow && truthy(branchRow.is_mandatory ?? branchRow.c_prop_mandatory ?? branchRow.mandatory ?? branchRow.required)) {
+        const err = new Error('Branch Details is required for this client.');
+        err.status = 400; err.code = 'BRANCH_DETAILS_REQUIRED';
+        throw err;
+      }
+    }
+
     const sharedCols = `
          job_desc, fk_customer_id, fk_address_id, fk_client_id,
          fk_service_type_id, fk_service_catg_id, service_type_ids,

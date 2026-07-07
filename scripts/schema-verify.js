@@ -147,6 +147,7 @@ const EXPECTED = {
 // Tables the code GRACEFULLY HANDLES being missing — we don't fail
 // the verify run for these, just note them in the report.
 const OPTIONAL = {
+  tbl_ai_call_session: 'AI-calling test flow (Validate Flows) — needs migrations/2026-07-06-create-tbl-ai-call-session.sql; gated by ai.calling.enabled, code degrades when absent',
   pincode_decathlon: 'Decathlon variant returns null when missing (handled in integration.service.js)',
   product: 'Product CRUD requires migrations/2026-05-12-create-product-tables.sql to be run',
   product_code: 'Product CRUD requires migrations/2026-05-12-create-product-tables.sql to be run',
