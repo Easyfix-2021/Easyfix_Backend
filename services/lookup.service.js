@@ -38,7 +38,21 @@ function inFilter(col, values, params) {
 }
 
 // ─── Cities / States ─────────────────────────────────────────────────
-async function cities({ stateId, q, limit = 500, includeInactive = false } = {}) {
+async function cities({ stateId, q, ids, limit = 500, includeInactive = false } = {}) {
+  // Preselect resolve: fetch specific cities by id (the async CitySelect uses
+  // this to show a saved job's city name without preloading the whole table).
+  // NOT status-filtered — a preselected/legacy city must still resolve its name
+  // even if it has since been deactivated.
+  if (Array.isArray(ids) && ids.length) {
+    const [rows] = await pool.query(
+      `SELECT city_id, city_name, state_id FROM tbl_city
+        WHERE city_id IN (${ids.map(() => '?').join(',')})
+        ORDER BY city_name ASC`,
+      ids.map(Number)
+    );
+    logger.info(`Lookup cities · ids=[${ids.join(',')}] · found=${rows.length}`);
+    return rows;
+  }
   const clauses = [];
   const params = [];
   if (!includeInactive) clauses.push('city_status = 1');
@@ -47,9 +61,12 @@ async function cities({ stateId, q, limit = 500, includeInactive = false } = {})
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   params.push(Number(limit));
   logger.info(`Lookup cities · stateId=${stateId ?? '—'} · q=${q ?? '—'} · limit=${limit} · includeInactive=${includeInactive}`);
+  // Trimmed projection: every consumer of this lookup uses only id + name
+  // (+ state_id for manage-users / zones scope math). tier / district /
+  // reference_pincode / city_status are read from the admin Manage-Cities
+  // endpoint, never from this lookup — so we don't ship them here.
   const [rows] = await pool.query(
-    `SELECT city_id, city_name, state_id, city_status, tier, district, reference_pincode
-       FROM tbl_city ${where}
+    `SELECT city_id, city_name, state_id FROM tbl_city ${where}
        ORDER BY city_name ASC LIMIT ?`,
     params
   );

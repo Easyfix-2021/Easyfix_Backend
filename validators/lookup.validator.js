@@ -9,7 +9,14 @@ const idArray = Joi.array().items(intId).single();
 const citiesQuery = Joi.object({
   stateId: intId.optional(),
   q: Joi.string().min(1).max(100).optional(),
-  limit: Joi.number().integer().min(1).max(1000).default(500),
+  // Resolve specific cities by id — the async CitySelect uses ?ids= to show a
+  // preselected city's name without preloading the whole table.
+  ids: idArray.optional(),
+  // tbl_city holds ~11k active cities. Full-list consumers (manage-users scope
+  // math, zones) + AddressPickerWithMap's reverse-geocode name→id matcher still
+  // preload the whole set, so the cap must clear it (with headroom) — a 1000 cap
+  // truncated the list mid-alphabet (~"Balwada"). Pickers now typeahead via ?q=.
+  limit: Joi.number().integer().min(1).max(20000).default(500),
   includeInactive: Joi.boolean().default(false),
 });
 

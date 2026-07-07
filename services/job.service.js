@@ -1025,6 +1025,11 @@ async function getByIdCore(jobId) {
   const decodedProps = decomposeRemarks(job.remarks);
   if (job.product_code == null) job.product_code = decodedProps.product_code || null;
   if (job.building_name == null) job.building_name = decodedProps.building_name || null;
+  // Decode the flattened `custom_property` string (Label:Value|…, written by the
+  // client booking apps) into structured rows so the CRM Job Transaction view can
+  // prepopulate the client custom-property values on reopen. Pure string parse —
+  // no extra query — so getByIdCore stays lean for the scope/status hot paths.
+  job.custom_properties = parseCustomPropertyString(job.custom_property);
   return job;
 }
 
@@ -1563,6 +1568,48 @@ function decomposeRemarks(raw) {
     if (m) { building_name = m[1].trim(); continue; }
   }
   return { product_code, building_name };
+}
+
+/*
+ * parseCustomPropertyString — decode the flattened `tbl_job.custom_property`
+ * VARCHAR(510) column back into structured rows so the CRM Job Transaction view
+ * (JobTransactionView reads `job.custom_properties`) prepopulates the client
+ * custom-property values a SPOC entered at booking.
+ *
+ * The client booking apps compose this column as `Label:Value|Label:Value`,
+ * keyed by the property's display LABEL, dropping empties
+ * (Easyfix_client_UI src/app/(authed)/jobs/new/page.tsx and Easyfix_Client_App
+ * app/jobs/new.tsx); createJob stores it verbatim. Nothing ever parsed it back,
+ * so previously-entered values rendered blank on reopen — this is the inverse.
+ *
+ * Rules mirror the writers + the legacy data quirks seen in the DB:
+ *  - split on '|', then on the FIRST ':' only (so a value like "12:30" survives)
+ *  - `(NULL)` (legacy Java `String.valueOf(null)` sentinel) and a literal `null`
+ *    value → unset
+ *  - degenerate `null:` / empty-label tokens are dropped
+ *  - only rows with a real value are returned (matches the writer's empty-drop,
+ *    keeps legacy `Store Name:(NULL)|Ageing:(NULL)` noise out of the view)
+ * Pure string parse — no DB round-trip — so callers (incl. the lean getByIdCore
+ * hot path) pay nothing. Returns [] for null/empty/'null'.
+ */
+function parseCustomPropertyString(raw) {
+  if (raw == null) return [];
+  const s = String(raw).trim();
+  if (!s || s.toLowerCase() === 'null') return [];
+  const out = [];
+  for (const token of s.split('|')) {
+    const seg = token.trim();
+    if (!seg) continue;
+    const idx = seg.indexOf(':');
+    if (idx === -1) continue;
+    const label = seg.slice(0, idx).trim();
+    let value = seg.slice(idx + 1).trim();
+    if (!label || label.toLowerCase() === 'null') continue;
+    if (value === '(NULL)' || value.toLowerCase() === 'null') value = '';
+    if (!value) continue;
+    out.push({ name: label.toLowerCase().replace(/\s+/g, ' ').trim(), label, value });
+  }
+  return out;
 }
 
 /*
