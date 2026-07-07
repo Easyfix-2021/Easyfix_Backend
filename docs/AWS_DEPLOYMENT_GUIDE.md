@@ -190,12 +190,38 @@ pm2 logs easyfix-backend   # watch for "listening on :5100"
 Create `/etc/nginx/sites-available/easyfix-backend`:
 
 ```nginx
+# WebSocket upgrade helper — "upgrade" for a WS handshake, "close" otherwise.
+# Must live at http{} context; in a sites-available file (included into http{})
+# it belongs ABOVE the server block.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
 server {
     listen 80;
     server_name qa.api.easyfix.in;
 
     # Slightly looser body size — Excel uploads + multi-image jobs
     client_max_body_size 25M;
+
+    # AI-calling media stream — Plivo <Stream> opens a WebSocket to the backend
+    # at /ai-voice-stream. This location MUST carry the Upgrade/Connection headers
+    # (and proxy_http_version 1.1) or the handshake fails and calls drop the moment
+    # they're answered. Long read/send timeouts keep the audio socket alive for the
+    # whole call (the app also bounds it via AI_CALL_MAX_DURATION_SEC).
+    location /ai-voice-stream {
+        proxy_pass http://127.0.0.1:5100;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
 
     location / {
         proxy_pass http://127.0.0.1:5100;
@@ -215,6 +241,12 @@ server {
     }
 }
 ```
+
+> **Note on the WebSocket path:** `/ai-voice-stream` is a *raw* server path (not
+> under `/api/public`), so it needs its own `location`. The `/api/public/plivo/ai-answer`
+> callback is an ordinary HTTPS GET and is served fine by `location /`. If your
+> edge also has a VPN allowlist (see the public-routes setup), `/ai-voice-stream`
+> must be reachable by Plivo the same way `/api/public/*` is.
 
 Enable + reload:
 ```bash

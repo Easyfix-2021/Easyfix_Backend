@@ -17,7 +17,9 @@ const { pool } = require('../db');
 const logger = require('../logger');
 const { getProperty } = require('./properties.service');
 
-const MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview';
+// GA Realtime model (the beta `gpt-4o-realtime-preview` on the beta API is no
+// longer supported). Override via OPENAI_REALTIME_MODEL.
+const MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime';
 const MAX_CONCURRENT = Math.max(1, parseInt(process.env.MAX_CONCURRENT_AI_CALLS || '50', 10));
 const MAX_DURATION_MS = Math.max(30, parseInt(process.env.AI_CALL_MAX_DURATION_SEC || '300', 10)) * 1000;
 const TOKEN_TTL_SEC = 15 * 60;

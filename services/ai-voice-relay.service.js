@@ -112,8 +112,10 @@ function connectOpenAI(state, lang) {
   const url = OPENAI_REALTIME_URL + '?model=' + encodeURIComponent(aiSession.MODEL);
   let oa;
   try {
+    // GA Realtime API: Authorization is the ONLY required header — the beta
+    // `OpenAI-Beta: realtime=v1` header is gone (sending it now errors the session).
     oa = new WebSocket(url, {
-      headers: { Authorization: 'Bearer ' + key, 'OpenAI-Beta': 'realtime=v1' },
+      headers: { Authorization: 'Bearer ' + key },
       perMessageDeflate: false,
       maxPayload: WS_MAX_PAYLOAD,
     });
@@ -126,16 +128,29 @@ function connectOpenAI(state, lang) {
 
   oa.on('open', () => {
     try {
+      // GA session shape: type:"realtime", output_modalities, and audio config
+      // NESTED under audio.input / audio.output with FORMAT OBJECTS. μ-law
+      // telephony = "audio/pcmu" both ways (still a zero-transcode passthrough to
+      // Plivo's audio/x-mulaw). (Beta used flat input_audio_format:"g711_ulaw".)
       oa.send(JSON.stringify({
         type: 'session.update',
         session: {
-          modalities: ['audio', 'text'],
+          type: 'realtime',
+          output_modalities: ['audio'],
           instructions: (state.flow || resolveFlow(DEFAULT_FLOW)).buildInstructions({ lang, session: state }),
-          voice: VOICE,
-          input_audio_format: 'g711_ulaw',
-          output_audio_format: 'g711_ulaw',
-          input_audio_transcription: { model: 'whisper-1' },
-          turn_detection: { type: 'server_vad', threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 600 },
+          audio: {
+            input: {
+              format: { type: 'audio/pcmu' },
+              turn_detection: { type: 'server_vad', threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 600 },
+              // Input (technician) speech transcription — needed for the post-call
+              // mapping. Override via env if GA rejects the model enum.
+              transcription: { model: process.env.OPENAI_REALTIME_TRANSCRIBE_MODEL || 'whisper-1' },
+            },
+            output: {
+              format: { type: 'audio/pcmu' },
+              voice: VOICE,
+            },
+          },
         },
       }));
       state.openaiReady = true;
@@ -150,8 +165,9 @@ function connectOpenAI(state, lang) {
     try {
       const evt = JSON.parse(data);
       switch (evt.type) {
-        case 'response.audio.delta':
-          // Passthrough μ-law → Plivo playAudio (Rule 1).
+        case 'response.output_audio.delta':
+          // Passthrough μ-law → Plivo playAudio (Rule 1). (GA renamed this from
+          // response.audio.delta.)
           if (evt.delta) {
             sendToPlivo(state, {
               event: 'playAudio',
@@ -169,7 +185,8 @@ function connectOpenAI(state, lang) {
         case 'conversation.item.input_audio_transcription.completed':
           appendTranscript(state, 'User', evt.transcript);
           break;
-        case 'response.audio_transcript.done':
+        case 'response.output_audio_transcript.done':
+          // GA renamed this from response.audio_transcript.done.
           appendTranscript(state, 'Agent', evt.transcript);
           break;
         case 'error':

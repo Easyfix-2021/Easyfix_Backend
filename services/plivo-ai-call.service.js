@@ -73,7 +73,7 @@ async function placeAiCall({ to, token }) {
     const callId = Array.isArray(ru) ? ru[0] : ru || null;
     const ok = (res.status === 200 || res.status === 201) && !!callId;
     if (!ok) logger.warn('Plivo AI call FAIL · http=' + res.status + ' · ' + (text || '').slice(0, 300));
-    else logger.info('Plivo AI call ACCEPTED · request_uuid=' + callId);
+    else logger.debug('Plivo AI call ACCEPTED · request_uuid=' + callId); // start is logged once by the route ("placed")
     return { ok, callId, httpStatus: res.status, error: ok ? null : ((parsed && parsed.error) || `HTTP ${res.status}`) };
   } catch (e) {
     logger.error('Plivo AI call network error · ' + e.message);

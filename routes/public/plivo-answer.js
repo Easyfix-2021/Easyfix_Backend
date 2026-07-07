@@ -143,4 +143,10 @@ router.get('/ai-answer', async (req, res) => {
   return xml(aiCall.buildStreamXml(wssUrl));
 });
 
+// Plivo also POSTs the answer_url as a terminal/stream callback once the <Stream>
+// ends. The GET above is the real answer; reply to POST with an empty Response so
+// Plivo gets clean XML (a clean hangup) instead of a 404 + error log.
+router.post('/ai-answer', (req, res) =>
+  res.type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?>\n<Response></Response>'));
+
 module.exports = router;
