@@ -21,6 +21,20 @@ const gemini = require('./gemini.engine');
 const ENGINES = { openai, gemini };
 const DEFAULT_ENGINE = 'gemini'; // cheaper; property `ai.calling.engine` can override
 
+// Selectable prebuilt VOICES per engine (voice names differ by provider). Per-call
+// voice rides in the JWT; the global default for automated calls is property
+// `ai.calling.voice.<engine>` (falling back to DEFAULT_VOICE[engine]).
+// OpenAI list is limited to voices that ALSO exist in the TTS API so the sample
+// preview works for every option (marin/cedar are realtime-only → omitted).
+const VOICES = {
+  gemini: ['Kore', 'Leda', 'Zephyr', 'Orus', 'Autonoe', 'Raselgethi', 'Garcux', 'Achird', 'Sadaltager'],
+  openai: ['alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse'],
+};
+const DEFAULT_VOICE = { gemini: 'Autonoe', openai: 'alloy' };
+function voicesForEngine(engine) { return VOICES[engine] || VOICES.gemini; }
+function defaultVoiceForEngine(engine) { return DEFAULT_VOICE[engine] || DEFAULT_VOICE.gemini; }
+function isValidVoice(engine, v) { return voicesForEngine(engine).includes(v); }
+
 function getEngine(name) { return ENGINES[name] || null; }
 // Always returns a usable engine (falls back to the product default).
 function resolveEngine(name) { return ENGINES[name] || ENGINES[DEFAULT_ENGINE]; }
@@ -35,4 +49,7 @@ function listEngines() {
   ];
 }
 
-module.exports = { getEngine, resolveEngine, engineConfigured, listEngines, DEFAULT_ENGINE, ENGINE_NAMES: Object.keys(ENGINES) };
+module.exports = {
+  getEngine, resolveEngine, engineConfigured, listEngines, DEFAULT_ENGINE, ENGINE_NAMES: Object.keys(ENGINES),
+  VOICES, voicesForEngine, defaultVoiceForEngine, isValidVoice,
+};

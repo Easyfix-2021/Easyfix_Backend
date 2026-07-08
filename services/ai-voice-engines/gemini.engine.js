@@ -29,7 +29,7 @@ const WS_PATH = '/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiG
 // wins. Switch GEMINI_LIVE_MODEL to a native-audio model (e.g.
 // gemini-2.5-flash-native-audio-preview-12-2025) if you want affective dialog.
 const MODEL = process.env.GEMINI_LIVE_MODEL || 'gemini-3.1-flash-live-preview';
-const VOICE = process.env.GEMINI_VOICE || 'Puck';
+const VOICE = process.env.GEMINI_VOICE || 'Autonoe'; // fallback; per-call voice comes via opts.voice
 // Affective (emotion-adaptive) dialog is native-audio-only — the flag is sent ONLY
 // for native-audio models so 3.1 (or a half-cascade model) never rejects it.
 const AFFECTIVE = /native-audio/i.test(MODEL);
@@ -39,7 +39,7 @@ const BACKPRESSURE_BYTES = 1 << 18;
 function apiKey() { return process.env.GEMINI_API_KEY || null; }
 function configured() { return !!apiKey(); }
 
-function start(state, { instructions, callbacks }) {
+function start(state, { instructions, voice, callbacks }) {
   const key = apiKey();
   if (!key) { callbacks.onClosed('gemini-no-key'); return; }
   const url = HOST + WS_PATH + '?key=' + encodeURIComponent(key);
@@ -61,7 +61,7 @@ function start(state, { instructions, callbacks }) {
         model: 'models/' + MODEL,
         generationConfig: {
           responseModalities: ['AUDIO'],
-          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: VOICE } } },
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice || VOICE } } },
         },
         systemInstruction: { parts: [{ text: instructions }] },
         inputAudioTranscription: {},
@@ -72,6 +72,15 @@ function start(state, { instructions, callbacks }) {
       // to the caller's tone for a more human call. NOT proactive audio (that's an
       // ambient-device feature; a 1:1 call wants the agent to always respond).
       if (AFFECTIVE) setup.enableAffectiveDialog = true;
+      // end_call tool → lets the agent hang up itself once it has said goodbye, so
+      // the line doesn't stay open until the idle/max-duration reaper.
+      setup.tools = [{
+        functionDeclarations: [{
+          name: 'end_call',
+          description: 'Hang up and end the phone call. Call this ONLY after you have said your goodbye and the conversation is complete.',
+          parameters: { type: 'object', properties: {} },
+        }],
+      }];
       gw.send(JSON.stringify({ setup }));
     } catch (e) {
       callbacks.onClosed('gemini-setup-error:' + (e && e.message));
@@ -91,6 +100,19 @@ function start(state, { instructions, callbacks }) {
             clientContent: { turns: [{ role: 'user', parts: [{ text: 'The call just connected. Greet the person warmly and begin.' }] }], turnComplete: true },
           }));
         } catch { /* noop */ }
+        return;
+      }
+
+      // Tool call — the only tool is end_call (agent hanging up after goodbye).
+      const toolCall = msg.toolCall || msg.tool_call;
+      if (toolCall && Array.isArray(toolCall.functionCalls || toolCall.function_calls)) {
+        const calls = toolCall.functionCalls || toolCall.function_calls;
+        for (const fc of calls) {
+          try {
+            gw.send(JSON.stringify({ toolResponse: { functionResponses: [{ id: fc.id, name: fc.name, response: { result: 'ok' } }] } }));
+          } catch { /* noop */ }
+          if (fc.name === 'end_call' && callbacks.onEndCall) callbacks.onEndCall();
+        }
         return;
       }
 

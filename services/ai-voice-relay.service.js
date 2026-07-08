@@ -119,7 +119,7 @@ async function cleanup(state, reason, errMsg) {
  * the concurrency slot. Owns the socket lifecycle. Returns a promise that never
  * rejects (all errors route through cleanup()).
  */
-async function handleConnection(plivoWs, { sessionId }) {
+async function handleConnection(plivoWs, { sessionId, voice }) {
   const state = {
     sessionId,
     plivoWs,
@@ -208,6 +208,7 @@ async function handleConnection(plivoWs, { sessionId }) {
     const instructions = state.flow.buildInstructions({ lang, context, session: state });
     state.engine.start(state, {
       instructions,
+      voice, // per-call voice from the JWT (Gemini engine uses it)
       callbacks: {
         onReady: () => { /* provider ready; engine gates its own send-readiness */ },
         onAudioToCaller: (muLawB64) => sendToPlivo(state, {
@@ -220,6 +221,9 @@ async function handleConnection(plivoWs, { sessionId }) {
         onUserText: (t) => appendTranscript(state, 'User', t),
         onAgentText: (t) => appendTranscript(state, 'Agent', t),
         onError: (msg) => logger.warn('AI voice engine error · session=' + sessionId + ' · engine=' + state.engineName + ' · ' + msg),
+        // Agent invoked end_call (after its goodbye) → give the last audio ~1.8s to
+        // play out, then tear down. cleanup is idempotent, so racing a real close is safe.
+        onEndCall: () => { const t = setTimeout(() => cleanup(state, 'agent-ended'), 1800); if (t && t.unref) t.unref(); },
         onClosed: (reason) => cleanup(state, reason),
       },
     });

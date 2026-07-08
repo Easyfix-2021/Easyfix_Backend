@@ -69,7 +69,7 @@ function attach(server) {
       // just log + close; leaking one slot fails safe (reduces capacity), a
       // double-release does not (corrupts the cap that protects the event loop).
       Promise.resolve()
-        .then(() => relay.handleConnection(ws, { sessionId: claims.sid }))
+        .then(() => relay.handleConnection(ws, { sessionId: claims.sid, voice: claims.voice }))
         .catch((e) => {
           logger.error('AI voice: relay start failed · ' + (e && e.message));
           try { ws.close(); } catch { /* noop */ }

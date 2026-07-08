@@ -15,8 +15,9 @@ const aiSession = require('../../services/ai-call-session.service');
 const aiCall = require('../../services/plivo-ai-call.service');
 const plivo = require('../../services/plivo.service');
 const { listFlows, DEFAULT_FLOW } = require('../../services/ai-call-flows');
-const { listEngines, engineConfigured, ENGINE_NAMES, DEFAULT_ENGINE } = require('../../services/ai-voice-engines');
-const { getProperty } = require('../../services/properties.service');
+const { listEngines, engineConfigured, ENGINE_NAMES, DEFAULT_ENGINE, voicesForEngine, defaultVoiceForEngine, isValidVoice } = require('../../services/ai-voice-engines');
+const { getProperty, setProperty } = require('../../services/properties.service');
+const voiceSample = require('../../services/ai-voice-sample.service');
 const postCallQueue = require('../../services/ai-post-call-queue');
 
 /*
@@ -218,6 +219,7 @@ const AI_FLOW_IDS = listFlows().map((f) => f.id);
 const aiStartBody = Joi.object({
   flow: Joi.string().valid(...AI_FLOW_IDS).default(DEFAULT_FLOW),
   engine: Joi.string().valid(...ENGINE_NAMES), // default resolved from the property
+  voice: Joi.string(), // validated per-engine in the handler (voice names differ by engine)
   efrId: Joi.number().integer().positive(),
   mobile: Joi.string().trim().pattern(/^\d{10}$/),
 }).or('efrId', 'mobile');
@@ -227,10 +229,54 @@ function defaultEngine() {
   const p = String(getProperty('ai.calling.engine') || '').trim().toLowerCase();
   return ENGINE_NAMES.includes(p) ? p : DEFAULT_ENGINE;
 }
+// The default VOICE for automated calls, per engine = property `ai.calling.voice.<engine>`.
+function defaultVoice(engine) {
+  const p = String(getProperty('ai.calling.voice.' + engine) || '').trim();
+  return isValidVoice(engine, p) ? p : defaultVoiceForEngine(engine);
+}
 
-// List the available AI-calling flows + engines (for the UI selectors).
+// List the available AI-calling flows / engines / voices (for the UI selectors).
 router.get('/ai-calling/flows', (req, res) => modernOk(res, { flows: listFlows() }));
 router.get('/ai-calling/engines', (req, res) => modernOk(res, { engines: listEngines(), default: defaultEngine() }));
+// Per-engine voice lists + the current default of each.
+router.get('/ai-calling/voices', (req, res) => modernOk(res, {
+  engines: Object.fromEntries(ENGINE_NAMES.map((e) => [e, { voices: voicesForEngine(e), default: defaultVoice(e) }])),
+}));
+
+// Set the GLOBAL default voice (per engine) for all automated calls.
+const voiceDefaultBody = Joi.object({
+  engine: Joi.string().valid(...ENGINE_NAMES).required(),
+  voice: Joi.string().required(),
+});
+router.post('/ai-calling/voice-default', validate(voiceDefaultBody), async (req, res, next) => {
+  try {
+    const { engine, voice } = req.body;
+    if (!isValidVoice(engine, voice)) return modernError(res, 400, `Voice "${voice}" is not valid for engine "${engine}".`);
+    await setProperty('ai.calling.voice.' + engine, voice);
+    logger.info('Validate Flows · ai-calling · default ' + engine + ' voice set to ' + voice);
+    return modernOk(res, { engine, default: voice }, `Default ${engine} voice set to ${voice} for all automated calls.`);
+  } catch (e) {
+    logger.error('Validate Flows · ai-calling · set default voice failed · ' + e.message);
+    next(e);
+  }
+});
+
+// Synthesize a short SAMPLE of a voice (REST TTS) so operators can hear it before
+// selecting. Streams audio (wav/mp3); the FE fetches authenticated → Blob → <audio>.
+router.get('/ai-calling/voice-sample', async (req, res, next) => {
+  try {
+    const engine = ENGINE_NAMES.includes(String(req.query.engine)) ? String(req.query.engine) : DEFAULT_ENGINE;
+    const voice = String(req.query.voice || '');
+    if (!isValidVoice(engine, voice)) return modernError(res, 400, 'Invalid voice for the selected engine.');
+    const out = await voiceSample.synthesize(engine, voice);
+    if (!out.ok || !out.buffer) return modernError(res, 502, 'Could not synthesize a sample: ' + (out.error || 'unknown'));
+    res.type(out.contentType || 'audio/mpeg');
+    return res.send(out.buffer);
+  } catch (e) {
+    logger.error('Validate Flows · ai-calling · voice-sample failed · ' + e.message);
+    next(e);
+  }
+});
 
 // Operational stats — live call slots + the bounded post-call mapping queue. Lets
 // ops watch load and tune MAX_CONCURRENT_AI_CALLS / AI_POST_CALL_CONCURRENCY.
@@ -279,7 +325,10 @@ router.post('/ai-calling/start', validate(aiStartBody), async (req, res, next) =
         'AI-calling storage is not ready — run migrations/2026-07-06-create-tbl-ai-call-session.sql, then retry.');
     }
 
-    const token = aiSession.signToken(sessionId);
+    // Per-call voice → rides in the JWT (no DB column). Explicit body override, else
+    // the global default (property ai.calling.voice), else the code default.
+    const voice = req.body.voice && isValidVoice(engine, req.body.voice) ? req.body.voice : defaultVoice(engine);
+    const token = aiSession.signToken(sessionId, { voice });
     const placed = await aiCall.placeAiCall({ to, token });
     if (!placed.ok) {
       await aiSession.setStatus(sessionId, 'failed', { error: placed.error });
@@ -295,6 +344,7 @@ router.post('/ai-calling/start', validate(aiStartBody), async (req, res, next) =
     return modernOk(res, {
       sessionId,
       engine,
+      voice,
       resolvedVia: via,
       resolvedTech,
       to: shortMobile(to),

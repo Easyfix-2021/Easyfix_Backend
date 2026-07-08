@@ -43,8 +43,8 @@ function recordEnabled() {
 function tokenSecret() {
   return process.env.PLIVO_ANSWER_TOKEN_SECRET || process.env.JWT_SECRET;
 }
-function signToken(sid) {
-  return jwt.sign({ sid }, tokenSecret(), { expiresIn: TOKEN_TTL_SEC });
+function signToken(sid, extra = {}) {
+  return jwt.sign({ sid, ...extra }, tokenSecret(), { expiresIn: TOKEN_TTL_SEC });
 }
 function verifyToken(t) {
   try { return jwt.verify(t, tokenSecret()); } catch { return null; }
@@ -97,16 +97,26 @@ async function saveResult(sessionId, resultObj) {
       [resultObj ? JSON.stringify(resultObj) : null, sessionId]);
   } catch (e) { logger.warn('ai-call saveResult failed · ' + e.message); }
 }
+const GET_COLS_FULL = 'session_id, flow, engine, status, mobile, efr_id, call_uuid, transcript, result_json, error, recording_url, recording_duration, created_on';
+const GET_COLS_BASE = 'session_id, flow, engine, status, mobile, efr_id, call_uuid, transcript, result_json, error, created_on';
 async function getSession(sessionId) {
   try {
     const [[row]] = await pool.query(
-      `SELECT session_id, flow, engine, status, mobile, efr_id, call_uuid, transcript, result_json, error,
-              recording_url, recording_duration, created_on
-         FROM tbl_ai_call_session WHERE session_id = ? LIMIT 1`,
-      [sessionId],
-    );
+      `SELECT ${GET_COLS_FULL} FROM tbl_ai_call_session WHERE session_id = ? LIMIT 1`, [sessionId]);
     return row || null;
   } catch (e) {
+    // Recording migration (2026-07-08-add-recording) not run yet → degrade to the
+    // core columns so the poll still works (recording just unavailable until run).
+    if (e && e.code === 'ER_BAD_FIELD_ERROR') {
+      try {
+        const [[row]] = await pool.query(
+          `SELECT ${GET_COLS_BASE} FROM tbl_ai_call_session WHERE session_id = ? LIMIT 1`, [sessionId]);
+        return row || null;
+      } catch (e2) {
+        logger.warn('ai-call getSession failed · ' + e2.message);
+        return null;
+      }
+    }
     logger.warn('ai-call getSession failed (table present?) · ' + e.message);
     return null;
   }

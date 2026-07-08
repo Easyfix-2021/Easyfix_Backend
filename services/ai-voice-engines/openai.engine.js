@@ -14,7 +14,7 @@ const BACKPRESSURE_BYTES = 1 << 18; // 256 KB — drop caller frames if OpenAI b
 
 function configured() { return !!aiSession.openaiKey(); }
 
-function start(state, { instructions, callbacks }) {
+function start(state, { instructions, voice, callbacks }) {
   const key = aiSession.openaiKey();
   if (!key) { callbacks.onClosed('openai-no-key'); return; } // clean fail (parity with gemini)
   const url = REALTIME_URL + '?model=' + encodeURIComponent(aiSession.MODEL);
@@ -43,8 +43,15 @@ function start(state, { instructions, callbacks }) {
               turn_detection: { type: 'server_vad', threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 600 },
               transcription: { model: process.env.OPENAI_REALTIME_TRANSCRIBE_MODEL || 'whisper-1' },
             },
-            output: { format: { type: 'audio/pcmu' }, voice: VOICE },
+            output: { format: { type: 'audio/pcmu' }, voice: voice || VOICE },
           },
+          // end_call tool → the agent hangs up itself after its goodbye.
+          tools: [{
+            type: 'function',
+            name: 'end_call',
+            description: 'Hang up and end the phone call. Call this ONLY after you have said your goodbye and the conversation is complete.',
+            parameters: { type: 'object', properties: {} },
+          }],
         },
       }));
       oa.send(JSON.stringify({ type: 'response.create' })); // agent greets first
@@ -69,6 +76,9 @@ function start(state, { instructions, callbacks }) {
           break;
         case 'response.output_audio_transcript.done':
           callbacks.onAgentText(evt.transcript);
+          break;
+        case 'response.function_call_arguments.done':
+          if (evt.name === 'end_call' && callbacks.onEndCall) callbacks.onEndCall();
           break;
         case 'error':
           callbacks.onError(evt.error && (evt.error.message || evt.error.code || 'unknown'));
