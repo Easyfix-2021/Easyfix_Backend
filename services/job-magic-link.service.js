@@ -34,7 +34,21 @@ const { signJobToken } = require('../utils/jwt');
 const whatsappService  = require('./gallabox.whatsapp.service');
 const urlShortener     = require('./url-shortener.service');
 const { maskMobile }   = require('../utils/mask-mobile');
+const s3Storage        = require('../utils/s3-storage');
 const logger           = require('../logger');
+
+/*
+ * Best-effort short-TTL presigned GET for a customer-uploaded media key.
+ * Returns null (not throw) on empty key or presign failure so a single bad
+ * key never 500s the whole magic-link load — the FE degrades to a placeholder
+ * tile for that item. The public route group is designed for exactly these
+ * unauthenticated, time-limited URLs.
+ */
+async function presignMediaKey(key) {
+  if (!key) return null;
+  try { return await s3Storage.getPresignedUrl(key); }
+  catch (e) { logger.warn({ err: e.message, key }, 'magic-link: media presign failed'); return null; }
+}
 
 /**
  * Fixed customer-request reason lists.
@@ -458,6 +472,25 @@ async function fetchPrefill(jobId, pool) {
   }
   const row = jobRows[0];
 
+  // Server-side prefill fallback: some bookings captured the PIN but not the
+  // city FK (tbl_address.city_id NULL). tbl_pincode maps pincode → city_id as
+  // a pure-DB lookup, so derive the city when it's missing but a valid 6-digit
+  // PIN is present. Best-effort — a lookup miss just leaves the city blank as
+  // before. (The reverse, PIN-from-city, isn't possible: a city has many PINs.)
+  let derivedCityId = row.city_id || null;
+  const rowPin = row.pin_code ? String(row.pin_code).trim() : '';
+  if (!derivedCityId && /^\d{6}$/.test(rowPin)) {
+    try {
+      const [[pcRow]] = await pool.query(
+        'SELECT city_id FROM tbl_pincode WHERE pincode = ? AND city_id IS NOT NULL LIMIT 1',
+        [rowPin],
+      );
+      if (pcRow && pcRow.city_id) derivedCityId = pcRow.city_id;
+    } catch (e) {
+      logger.warn({ err: e.message, jobId, pin: rowPin }, 'magic-link: city-from-pincode derive failed');
+    }
+  }
+
   // Build the city query based on schema probe.
   const hasFlag = await cityHasIsActive(pool);
   const citySql = hasFlag
@@ -624,7 +657,7 @@ async function fetchPrefill(jobId, pool) {
       address:             row.address || '',
       building:            row.building || '',
       landmark:            row.landmark || '',
-      city_id:             row.city_id || null,
+      city_id:             derivedCityId,
       pin_code:            row.pin_code || '',
       gps_location:        row.gps_location || '',
       address_instruction: row.address_instruction || '',
@@ -667,10 +700,11 @@ async function fetchPrefill(jobId, pool) {
       client_service_id: s.client_service_id,
       quantity:          s.quantity,
     })),
-    images: imageRows.map((i) => ({
+    images: await Promise.all(imageRows.map(async (i) => ({
       image_id: i.image_id,
       key:      i.image,
-    })),
+      url:      await presignMediaKey(i.image),
+    }))),
     // Videos shared by the customer via the public Product Photos/Videos
     // picker (or via the conversational chat flow — both write to
     // tbl_job_media). Probe-gated so deploys without the 2026-06-03 migration
@@ -682,7 +716,11 @@ async function fetchPrefill(jobId, pool) {
           `SELECT media_id, s3_key FROM tbl_job_media WHERE job_id = ? ORDER BY media_id ASC`,
           [jobId],
         );
-        return vRows.map((v) => ({ media_id: v.media_id, key: v.s3_key }));
+        return await Promise.all(vRows.map(async (v) => ({
+          media_id: v.media_id,
+          key:      v.s3_key,
+          url:      await presignMediaKey(v.s3_key),
+        })));
       } catch (_e) {
         return [];
       }
@@ -972,11 +1010,13 @@ async function sendForJob(jobId, { action, override = false } = {}, pool) {
  */
 async function acceptSubmission(jobId, payload, pool) {
   logger.info('Accept customer submission · jobId=' + jobId + ' services=' + (Array.isArray(payload && payload.services) ? payload.services.length : 0));
-  // Server-side mandatory custom-property enforcement (belt-and-braces over the
-  // FE gate). Runs BEFORE any connection/transaction so a tampered or older
-  // client that skips a required client field is rejected with a 400 listing
-  // the missing labels — no partial write occurs.
-  await enforceMandatoryCustomProps(jobId, payload, pool);
+  // Mandatory custom-property enforcement is DISABLED for the customer flow
+  // (2026-07-08): the job-completion form no longer collects per-client custom
+  // properties (Branch Details / Bill Number / Store Code are internal ops fields
+  // the customer can't meaningfully provide). Ops still captures them in the CRM
+  // Book-New-Call flow. Re-enable this call if custom props become customer-facing.
+  // await enforceMandatoryCustomProps(jobId, payload, pool);
+  void enforceMandatoryCustomProps; // keep referenced (defined below) — see note above.
 
   const conn = await pool.getConnection();
   try {

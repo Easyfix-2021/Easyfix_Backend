@@ -349,7 +349,10 @@ router.post(
           [jobId, imageKey],
         );
         logger.info('Job image uploaded · jobId=' + jobId + ' · image_id=' + ins.insertId + ' · seq=' + seq);
-        return modernOk(res, { kind: 'image', image_id: ins.insertId, key: imageKey, seq });
+        // Short-TTL presigned GET so the FE renders the thumbnail / lightbox
+        // immediately (best-effort — null just falls back to a placeholder).
+        const imageUrl = await s3Storage.getPresignedUrl(imageKey).catch(() => null);
+        return modernOk(res, { kind: 'image', image_id: ins.insertId, key: imageKey, url: imageUrl, seq });
       }
 
       // Video path — writes to tbl_job_media (separate table because
@@ -384,7 +387,8 @@ router.post(
         [jobId, videoKey, mime],
       );
       logger.info('Job video uploaded · jobId=' + jobId + ' · media_id=' + vins.insertId + ' · seq=' + vseq);
-      return modernOk(res, { kind: 'video', media_id: vins.insertId, key: videoKey, seq: vseq });
+      const videoUrl = await s3Storage.getPresignedUrl(videoKey).catch(() => null);
+      return modernOk(res, { kind: 'video', media_id: vins.insertId, key: videoKey, url: videoUrl, seq: vseq });
     } catch (e) {
       if (e?.code === 'LIMIT_FILE_SIZE') {
         const mb = Math.round(MAX_VIDEO_BYTES / (1024 * 1024));
@@ -612,10 +616,12 @@ router.get(
       const spoc = await magicLinkService.resolveJobSpoc(jobId, pool);
       if (!spoc.mobile) return modernError(res, 422, 'No SPOC available to call');
 
-      // Same alwaysApplyEnvOverride:true the actual spoc-call uses → the preview
-      // reflects precisely what would be dialled. voice.previewCallLegs resolves
-      // through the default provider (no explicit provider on the public flow).
+      // Hardcoded to Plivo's bridge (call) flow — this is a CUSTOMER-initiated
+      // public call, so it must use the server-placed Plivo Call bridge, never
+      // the Plivo web/WebRTC SDK (CRM-staff only). Same alwaysApplyEnvOverride:true
+      // the actual spoc-call uses → the preview reflects what would be dialled.
       const preview = voice.previewCallLegs({
+        provider: 'plivo',
         from: customerMob,
         to: spoc.mobile,
         alwaysApplyEnvOverride: true,
@@ -675,13 +681,14 @@ router.post(
         return modernError(res, 422, 'No SPOC available to call');
       }
 
-      // alwaysApplyEnvOverride: this is the OPERATOR-LESS public bridge —
-      // it resolves the REAL customer + SPOC numbers server-side, so the
-      // KALEYRA_CALL_FROM/TO test-redirect MUST apply in non-prod even when
-      // KALEYRA_CALLING_CUSTOM_NUMBER (an admin-prompt flag) is on. Prevents
-      // dialling a real customer from QA. In prod those env vars are unset
-      // → passes through to the real numbers as intended.
-      const result = await voice.clickToCall({ from: customerMob, to: spoc.mobile, alwaysApplyEnvOverride: true });
+      // Hardcoded to Plivo's bridge (call) flow: this is a CUSTOMER-initiated
+      // public call, so it uses the server-placed Plivo Call bridge (customer
+      // leg ⇄ SPOC leg), NOT the Plivo web/WebRTC SDK (which is CRM-staff only).
+      // alwaysApplyEnvOverride: the OPERATOR-LESS public bridge resolves the REAL
+      // customer + SPOC numbers server-side, so the CALL_FROM/TO test-redirect
+      // MUST apply in non-prod (prevents dialling a real customer from QA); in
+      // prod those env vars are unset → real numbers as intended.
+      const result = await voice.clickToCall({ provider: 'plivo', from: customerMob, to: spoc.mobile, alwaysApplyEnvOverride: true });
       if (!result.delivered && (result.suppressed || result.disabled)) {
         // Calling disabled in this environment — mirror admin/calls: 200 OK
         // with delivered:false + suppressed:true so the FE can show

@@ -74,9 +74,16 @@ const submitBody = Joi.object({
     Joi.string().email().max(120),
     Joi.string().valid(''),
   ).optional(),
-  address: Joi.string().trim().max(500).required(),
-  city_id: intId.required(),
-  pin_code: Joi.string().pattern(/^\d{6}$/).required(),
+  // address / city / PIN are BOOKED, display-only on the customer confirmation
+  // form — the customer can't edit them (the map pin captures GPS only), so
+  // requiring them would dead-end any booking that happens to lack one. Optional
+  // here; acceptSubmission COALESCEs, so an omitted value keeps the booked one.
+  address: Joi.string().trim().max(500).allow('').optional(),
+  city_id: intId.optional(),
+  pin_code: Joi.alternatives(
+    Joi.string().pattern(/^\d{6}$/),
+    Joi.string().valid(''),
+  ).optional(),
   time_slot: Joi.string().trim().max(50).required(),
   // Must be strictly in the future. Plain `.greater('now')` — no
   // grace-period buffer because no other validator in this repo uses
