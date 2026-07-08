@@ -69,6 +69,24 @@ async function markAnswered(jci, callUuid, recordRequested = null) {
   if (recordRequested != null) await setRecordingRequested(jci, recordRequested);
 }
 
+// Persist the recording URL/id/duration PUSHED by Plivo's recordingCallbackUrl
+// callback (keyed by jci, so it's robust to whichever leg's call_uuid the
+// recording is filed under). Best-effort — the columns are added by
+// 2026-07-08-add-recording-url-to-plivo-call-log.sql; a pre-migration deploy
+// no-ops and the Play endpoint falls back to the call_uuid lookup.
+async function setRecording(jci, { url, id, duration } = {}) {
+  if (jci == null || !url) return;
+  try {
+    await pool.query(
+      `UPDATE tbl_plivo_call_log
+          SET recording_url = ?, recording_id = ?, recording_duration = ?, updated_on = NOW()
+        WHERE job_caller_info_id = ?`,
+      [String(url), id || null, duration != null ? Number(duration) : null, jci],
+    );
+    logger.info('Plivo call-log recording stored · jci=' + jci + ' · id=' + (id || '?'));
+  } catch (e) { logger.warn({ err: e.message, jci }, 'plivo-call-log: setRecording failed (non-fatal — columns may be pre-migration)'); }
+}
+
 // Record whether Plivo was asked to record this call (1/0). Best-effort — the
 // column is added by 2026-07-08-add-recording-requested-to-plivo-call-log.sql.
 async function setRecordingRequested(jci, on) {
@@ -108,4 +126,4 @@ async function markTerminalByCallUuid(callUuid, { status, duration = null, hangu
   } catch (e) { logger.warn({ err: e.message, callUuid }, 'plivo-call-log: markTerminalByCallUuid failed (non-fatal)'); }
 }
 
-module.exports = { record, markRinging, markAnswered, setRecordingRequested, markTerminalByJci, markTerminalByCallUuid };
+module.exports = { record, markRinging, markAnswered, setRecordingRequested, setRecording, markTerminalByJci, markTerminalByCallUuid };

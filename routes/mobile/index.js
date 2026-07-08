@@ -8,6 +8,9 @@ const requireTechAuth = require('../../middleware/tech-auth');
 const { pool } = require('../../db');
 const techAuth = require('../../services/tech-auth.service');
 const jobService = require('../../services/job.service');
+const shareService = require('../../services/job-share.service');
+const voice = require('../../services/voice.service');
+const { dailyBridgeCapReached, persistBridgeCall } = require('../public/_public-call');
 const { modernOk, modernError } = require('../../utils/response');
 const { rateLimit } = require('../../middleware/rate-limit');
 
@@ -353,7 +356,108 @@ router.get('/jobs/:id', async (req, res, next) => {
     const canView = job.fk_easyfixter_id === req.tech.efr_id
       || (await jobService.techHasOpenOffer(job.job_id, req.tech.efr_id));
     if (!canView) return modernError(res, 404, 'job not found');
+    // Defence-in-depth (2026-07-08): the app never shows or dials the customer
+    // number — it uses the masked /customer-call bridge — so the raw number
+    // must not even reach the device. Strip it MOBILE-ONLY here; the shared
+    // getById keeps it for the CRM's own /admin route, and the bridge resolves
+    // it server-side from tbl_customer, so nothing that needs it is affected.
+    if (job.customer_mob_no != null) job.customer_mob_no = null;
+    if (job.customer && typeof job.customer === 'object' && job.customer.phone != null) job.customer.phone = null;
     modernOk(res, job);
+  } catch (e) { next(e); }
+});
+
+// Mint a public "share job" link + ready-to-share message for a job the
+// technician OWNS (is assigned to). The link opens a NON-CONFIDENTIAL public
+// page (service, address + Navigate, masked Call to the customer). Non-owners
+// get 404 (no existence disclosure). buildShareBundle throws 410 for a
+// finished/cancelled job so the app can tell the tech it can't be shared.
+router.get('/jobs/:id/share-link', async (req, res, next) => {
+  try {
+    const jobId = Number(req.params.id);
+    logger.info('Mint job share link · id=' + jobId + ' · efr=' + req.tech.efr_id);
+    const job = await jobService.getById(jobId);
+    if (!job || job.fk_easyfixter_id !== req.tech.efr_id) {
+      return modernError(res, 404, 'job not found');
+    }
+    const bundle = await shareService.buildShareBundle(jobId, pool, { sharedByEfrId: req.tech.efr_id });
+    return modernOk(res, bundle);
+  } catch (e) {
+    return e && typeof e.status === 'number' ? modernError(res, e.status, e.message) : next(e);
+  }
+});
+
+// ─── Masked click-to-call: bridge the technician ⇄ customer ──────────
+// The app NEVER shows or dials the customer's number. from = the tech's on-file
+// efr_no (auto — no typing); to = customer (resolved server-side, never
+// returned), bridged via Plivo. Scope: the tech must own the job or have an
+// open offer on it. Same masking posture as the CRM operator click-to-call.
+async function resolveMobileCallLegs(req, jobId) {
+  const job = await jobService.getById(jobId);
+  if (!job) return { error: { status: 404, msg: 'job not found' } };
+  const canCall = job.fk_easyfixter_id === req.tech.efr_id
+    || (await jobService.techHasOpenOffer(job.job_id, req.tech.efr_id));
+  if (!canCall) return { error: { status: 404, msg: 'job not found' } };
+  const techMobile = req.tech.efr_no;
+  if (!techMobile) return { error: { status: 422, msg: 'No mobile number on file for your account' } };
+  const [[cust]] = await pool.query(
+    `SELECT c.customer_mob_no AS mobile,
+            COALESCE(j.job_customer_name, c.customer_name) AS name, j.job_status
+       FROM tbl_job j LEFT JOIN tbl_customer c ON c.customer_id = j.fk_customer_id
+      WHERE j.job_id = ? LIMIT 1`,
+    [jobId],
+  );
+  if (!cust || !cust.mobile) return { error: { status: 422, msg: 'No customer number on file to connect the call' } };
+  return { techMobile, customer: cust };
+}
+
+// Optional masked from(tech)→to(customer) preview for a confirm dialog.
+router.post('/jobs/:id/customer-call/preview', async (req, res, next) => {
+  try {
+    const legs = await resolveMobileCallLegs(req, Number(req.params.id));
+    if (legs.error) return modernError(res, legs.error.status, legs.error.msg);
+    const preview = await voice.previewCallLegs({ provider: 'plivo', from: legs.techMobile, to: legs.customer.mobile, alwaysApplyEnvOverride: true });
+    return modernOk(res, preview);
+  } catch (e) { next(e); }
+});
+
+// Place the masked bridge call (tech's phone rings first, then the customer).
+router.post('/jobs/:id/customer-call', async (req, res, next) => {
+  try {
+    const jobId = Number(req.params.id);
+    const legs = await resolveMobileCallLegs(req, jobId);
+    if (legs.error) return modernError(res, legs.error.status, legs.error.msg);
+
+    if (await dailyBridgeCapReached(jobId)) {
+      return modernError(res, 429, 'Call limit reached for this job today. Please try again later.');
+    }
+
+    logger.info('Mobile customer bridge call · jobId=' + jobId + ' · efr=' + req.tech.efr_id);
+    const result = await voice.clickToCall({ provider: 'plivo', from: legs.techMobile, to: legs.customer.mobile, alwaysApplyEnvOverride: true });
+
+    const audit = {
+      jobId,
+      callId: result.callId,
+      fromMob: legs.techMobile,
+      fromName: req.tech.efr_name || 'Technician',
+      toMob: legs.customer.mobile,
+      toId: null,
+      toName: legs.customer.name || 'Customer',
+      jobStatus: legs.customer.job_status,
+      jobEfrId: req.tech.efr_id,
+      provider: result.provider,
+    };
+
+    if (!result.delivered && (result.suppressed || result.disabled)) {
+      await persistBridgeCall(audit);
+      return modernOk(res, { delivered: false, suppressed: true });
+    }
+    if (!result.delivered) {
+      logger.warn({ jobId, diagnostic: result.diagnostic, err: result.error }, 'mobile customer-call failed');
+      return modernError(res, 502, 'Could not place the call. Please try again.');
+    }
+    await persistBridgeCall(audit);
+    return modernOk(res, { delivered: true });
   } catch (e) { next(e); }
 });
 

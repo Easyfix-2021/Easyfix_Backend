@@ -153,6 +153,27 @@ function verifyCallToken(t) {
   try { return jwt.verify(t, tokenSecret()); } catch { return null; }
 }
 
+// Recording-callback token: carries the tbl_job_caller_info id (jci) so the
+// recording-ready callback can update the RIGHT call row regardless of which
+// leg's call_uuid the recording ends up filed under. Longer TTL than the 15-min
+// answer token because the recording callback fires AFTER the call ends (mp3
+// processing lag). `kind: 'rec'` isolates it from the answer/bridge token.
+function signRecordingToken(jci) {
+  return jwt.sign({ jci, kind: 'rec' }, tokenSecret(), { expiresIn: '2h' });
+}
+function verifyRecordingToken(t) {
+  try { const c = jwt.verify(t, tokenSecret()); return c && c.kind === 'rec' ? c : null; }
+  catch { return null; }
+}
+
+// Absolute URL Plivo POSTs the recording URL/id to once the mp3 is ready.
+// Null when no public callback base is configured.
+function recordingCallbackUrl(jci) {
+  const base = callbackBase();
+  if (!base) return null;
+  return `${base}/api/public/plivo/recording-callback?t=${encodeURIComponent(signRecordingToken(jci))}`;
+}
+
 // Plivo call-control XML the public answer route returns when the agent picks
 // up — bridges to the customer leg. callerId is the Plivo DID.
 //
@@ -164,17 +185,31 @@ function verifyCallToken(t) {
 // `ffprobe -show_entries stream=channels`) before relying on it — if mono, the
 // metrics half won't run (the LLM coaching, from the Plivo transcript, is
 // unaffected by channel count). We do NOT set a
-// recordingCallbackUrl — the recording is fetched LAZILY on demand (only when
-// an operator plays it) via the Plivo Recording API keyed by CallUUID, then
-// cached to our S3, so we don't store audio nobody listens to. Gated on
+// recordingCallbackUrl (2026-07-08): when a URL is supplied, Plivo POSTs the
+// recording URL/id to it once the mp3 is ready. We now DO set it (via the
+// caller) because the previous lazy "fetch by CallUUID" lookup FAILS for
+// web/WebRTC calls — the recording can be filed under a different leg than the
+// stored call_uuid, so the Recording API returns nothing even though
+// recording_requested=1. The callback pushes us the exact URL, no guessing.
+// Playback still caches to our S3 on first play. Gated on
 // `plivo.recording.enabled` by the caller so it can be turned off without a
 // deploy. ⚠️ Recording customer calls needs compliance/consent sign-off.
-function buildAnswerXml(dest, { record = false } = {}) {
+function buildAnswerXml(dest, { record = false, recordingCallbackUrl = null } = {}) {
   const callerId = process.env.PLIVO_CALLER_ID || '';
   const num = String(dest || '').replace(/[^0-9]/g, '');
-  const dialAttrs = record
-    ? ` callerId="${callerId}" record="true" recordFileFormat="mp3"`
-    : ` callerId="${callerId}"`;
+  let dialAttrs = ` callerId="${callerId}"`;
+  if (record) {
+    dialAttrs += ` record="true" recordFileFormat="mp3"`;
+    if (recordingCallbackUrl) {
+      // XML-attribute-escape (the URL query is `?t=<jwt>` — base64url has no
+      // XML specials, but escape defensively).
+      const escUrl = String(recordingCallbackUrl).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      // Only the documented `recordingCallbackUrl` attribute — Plivo POSTs the
+      // recording callback by default (and our route handles POST+GET), so no
+      // separate method attribute is needed.
+      dialAttrs += ` recordingCallbackUrl="${escUrl}"`;
+    }
+  }
   return `<?xml version="1.0" encoding="UTF-8"?>\n<Response><Dial${dialAttrs}><Number>${num}</Number></Dial></Response>`;
 }
 
@@ -514,6 +549,9 @@ module.exports = {
   normaliseIndianPhone,
   signCallToken,
   verifyCallToken,
+  signRecordingToken,
+  verifyRecordingToken,
+  recordingCallbackUrl,
   buildAnswerXml,
   callingEnabled,
   maskForDisplay,

@@ -22,6 +22,13 @@
 const router = require('express').Router();
 
 router.use('/job-completion', require('./job-completion'));
+/*
+ * Technician "share job" surface. UNAUTHENTICATED — a public link a technician
+ * shares; whoever opens it sees NON-CONFIDENTIAL job details and can navigate /
+ * place a masked call to the customer. Self-verifies its own `job_share` token
+ * (separate type from job-completion). See routes/public/shared-job.js.
+ */
+router.use('/shared-job', require('./shared-job'));
 // Easyfixer-facing profile-update magic-link surface. Token lives in the
 // query string (?token=…) rather than the URL path because the FE keeps the
 // path stable (/profile-update/<jwt>) and proxies the JWT through to the BE

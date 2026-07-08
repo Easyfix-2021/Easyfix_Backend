@@ -821,11 +821,27 @@ router.get('/:id/recording', requireClickToCallAction, async (req, res, next) =>
       return modernOk(res, { url: await s3.getPresignedUrl(row.recording), source: 's3' });
     }
 
-    // Cache miss: fetch from Plivo (keyed by the stored CallUUID = unique_id).
-    if (row.provider !== 'plivo' || !row.unique_id) {
-      return modernError(res, 404, 'No recording available for this call');
+    // Cache miss. PREFER the callback-PUSHED recording URL (stored on
+    // tbl_plivo_call_log by the <Dial recordingCallbackUrl> callback) — robust
+    // for web/WebRTC calls where the recording is filed under a different leg
+    // than the stored call_uuid, which is why the lazy call_uuid lookup below
+    // returned nothing. Fall back to that lookup. Column-probed via try/catch
+    // so a pre-migration deploy still works via the legacy path.
+    let meta = null;
+    try {
+      const [[plog]] = await pool.query(
+        'SELECT recording_url, recording_id FROM tbl_plivo_call_log WHERE job_caller_info_id = ? AND recording_url IS NOT NULL ORDER BY id DESC LIMIT 1',
+        [id],
+      );
+      if (plog && plog.recording_url) meta = { ok: true, url: plog.recording_url, recordingId: plog.recording_id };
+    } catch (_e) { /* pre-migration: recording_url column absent — fall through */ }
+
+    if (!meta) {
+      if (row.provider !== 'plivo' || !row.unique_id) {
+        return modernError(res, 404, 'No recording available for this call');
+      }
+      meta = await plivo.fetchRecordingMeta({ callUuid: row.unique_id });
     }
-    const meta = await plivo.fetchRecordingMeta({ callUuid: row.unique_id });
     if (!meta.ok || !meta.url) {
       // Plivo can lag a few seconds after hangup, or recording was off.
       return modernError(res, 404, 'No recording available yet — if the call just ended, try again shortly.');

@@ -61,7 +61,10 @@ router.get('/answer', async (req, res) => {
   await plivoLog.markAnswered(claims.jci, req.query.CallUUID || null, record);
 
   logger.info('Plivo answer: bridging to customer · jci=' + claims.jci);
-  return xml(plivo.buildAnswerXml(claims.dest, { record }));
+  // recordingCallbackUrl: Plivo pushes us the recording URL/id when ready, so
+  // playback doesn't depend on guessing the recording's call_uuid.
+  const recCbUrl = record ? plivo.recordingCallbackUrl(claims.jci) : null;
+  return xml(plivo.buildAnswerXml(claims.dest, { record, recordingCallbackUrl: recCbUrl }));
 });
 
 /*
@@ -109,10 +112,36 @@ async function webAnswer(req, res) {
   logger.info('Plivo web-answer · jci=' + resolved.jci + ' · CallUUID=' + (src.CallUUID || 'none') + ' · record=' + record);
   await plivoLog.markRinging(resolved.jci, src.CallUUID || null);
   await plivoLog.setRecordingRequested(resolved.jci, record);
-  return xml(plivo.buildAnswerXml(resolved.number, { record }));
+  const recCbUrl = record ? plivo.recordingCallbackUrl(resolved.jci) : null;
+  return xml(plivo.buildAnswerXml(resolved.number, { record, recordingCallbackUrl: recCbUrl }));
 }
 router.post('/web-answer', express.urlencoded({ extended: false }), webAnswer);
 router.get('/web-answer', webAnswer);
+
+/*
+ * /api/public/plivo/recording-callback — Plivo POSTs the recording URL/id here
+ * once the mp3 is ready (set via <Dial recordingCallbackUrl>). UNAUTHENTICATED;
+ * the signed `t` token (kind:'rec', carries jci) is the authorisation. Storing
+ * by jci is robust to whichever leg's call_uuid the recording is filed under —
+ * exactly why the old lazy call_uuid lookup failed for web calls. ALWAYS 200 so
+ * Plivo doesn't retry-storm; the DB write is best-effort.
+ */
+async function recordingCallback(req, res) {
+  const src = { ...req.query, ...(req.body || {}) };
+  const claims = plivo.verifyRecordingToken(req.query.t);
+  if (!claims || claims.jci == null) {
+    logger.warn('Plivo recording-callback: invalid/expired token · ignoring');
+    return res.status(200).type('text/plain').send('ok');
+  }
+  const url = src.RecordUrl || src.recording_url || null;
+  const id = src.RecordingID || src.recording_id || null;
+  const duration = src.RecordingDuration || src.recording_duration || null;
+  logger.info('Plivo recording-callback · jci=' + claims.jci + ' · id=' + (id || 'none') + ' · hasUrl=' + !!url);
+  if (url) await plivoLog.setRecording(claims.jci, { url, id, duration });
+  return res.status(200).type('text/plain').send('ok');
+}
+router.post('/recording-callback', express.urlencoded({ extended: false }), recordingCallback);
+router.get('/recording-callback', recordingCallback);
 
 /*
  * /api/public/plivo/ai-answer — answer_url for the AI-calling TEST flow ONLY.
