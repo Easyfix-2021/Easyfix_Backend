@@ -81,4 +81,33 @@ async function placeAiCall({ to, token }) {
   }
 }
 
-module.exports = { placeAiCall, buildStreamXml, wsBase, httpBase };
+// Start recording an in-progress AI call (Plivo Record API). Plivo POSTs the
+// finished recording to `recording_callback_url` → /api/public/plivo/ai-recording.
+// Best-effort + fully guarded — recording must NEVER disrupt the live call.
+async function startRecording(callUuid) {
+  if (!callUuid) return { ok: false, error: 'callUuid required' };
+  const auth = authHeader();
+  if (!auth || !process.env.PLIVO_AUTH_ID) return { ok: false, error: 'Plivo not configured' };
+  const base = httpBase();
+  const body = { file_format: 'mp3' };
+  if (base) {
+    body.recording_callback_url = `${base}/api/public/plivo/ai-recording`;
+    body.recording_callback_method = 'POST';
+  }
+  const url = `${PLIVO_API}/Account/${encodeURIComponent(process.env.PLIVO_AUTH_ID)}/Call/${encodeURIComponent(callUuid)}/Record/`;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { Authorization: auth, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const ok = res.status >= 200 && res.status < 300;
+    if (!ok) logger.warn('Plivo AI record start FAIL · http=' + res.status + ' · ' + (await res.text()).slice(0, 200));
+    return { ok, httpStatus: res.status };
+  } catch (e) {
+    logger.warn('Plivo AI record start error · ' + e.message);
+    return { ok: false, error: e.message };
+  }
+}
+
+module.exports = { placeAiCall, buildStreamXml, wsBase, httpBase, startRecording };

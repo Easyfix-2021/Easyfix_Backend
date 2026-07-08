@@ -157,4 +157,28 @@ router.get('/ai-answer', async (req, res) => {
 router.post('/ai-answer', (req, res) =>
   res.type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?>\n<Response></Response>'));
 
+/*
+ * /api/public/plivo/ai-recording — Plivo POSTs the finished recording here (set as
+ * recording_callback_url by plivo-ai-call.startRecording). We ack 200 immediately
+ * and persist off the live path via the bounded post-call queue.
+ */
+const aiPostCallQueue = require('../../services/ai-post-call-queue');
+router.post('/ai-recording', express.urlencoded({ extended: false }), (req, res) => {
+  const src = { ...req.query, ...(req.body || {}) };
+  const callUuid = src.CallUUID || src.call_uuid || null;
+  const recordUrl = src.RecordUrl || src.recording_url || null;
+  const duration = src.RecordingDuration || src.recording_duration || null;
+  res.status(200).type('text/plain').send('ok');
+  if (!callUuid || !recordUrl) { logger.warn('Plivo ai-recording: missing CallUUID/RecordUrl'); return; }
+  aiPostCallQueue.enqueueTask({
+    label: 'record:' + callUuid,
+    run: async () => {
+      const sessionId = await aiSession.getSessionIdByCallUuid(callUuid);
+      if (!sessionId) { logger.warn('Plivo ai-recording: no session for CallUUID=' + callUuid); return; }
+      await aiSession.saveRecording(sessionId, { url: recordUrl, duration });
+      logger.info('AI voice recording saved · session=' + sessionId + ' · dur=' + (duration || '?') + 's');
+    },
+  });
+});
+
 module.exports = router;

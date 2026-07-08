@@ -441,6 +441,48 @@ function combineDateTime(dt, timeStr) {
   return formatMysqlDateTimeIST(d);
 }
 
+/*
+ * Derive booking_cut_off_time_slot — the legacy "H AM - H PM" appointment
+ * window — from an IST 'YYYY-MM-DD HH:MM:SS' datetime string. The new-CRM
+ * create flow only ever set the named `time_slot` ("Morning 9 to 2" …) and
+ * left booking_cut_off_time_slot NULL; ops want BOTH columns populated, so we
+ * backfill this from the same appointment time. Values (buckets + the one-word
+ * "AfterHours") verified against tbl_job's existing legacy rows. Callers MUST
+ * pass a wall-clock STRING (createJob's combineDateTime output, or a
+ * DATE_FORMAT'd column) so slice(11,13) is the IST hour regardless of the
+ * mysql2 connection timezone. Returns null for an absent/unparseable value.
+ */
+function deriveBookingCutoffSlot(dt) {
+  if (!dt) return null;
+  const h = Number(String(dt).slice(11, 13)); // 'YYYY-MM-DD HH:...' → HH
+  if (!Number.isFinite(h)) return null;
+  if (h >= 9  && h < 12) return '9 AM - 12 PM';
+  if (h >= 12 && h < 15) return '12 PM - 3 PM';
+  if (h >= 15 && h < 19) return '3 PM - 7 PM';
+  return 'AfterHours';
+}
+
+/*
+ * Derive the named `time_slot` window ("Morning 9 to 2" …) from an IST
+ * 'YYYY-MM-DD HH:MM:SS' string. Boundaries mirror the CRM FE's deriveTimeSlot
+ * (ScheduleAssignModal: 9–11 / 12–13 / 14–18); the out-of-range value is
+ * "After Hours" to match the new-CRM booking rows in tbl_job (the FE picker's
+ * own "Anytime" fallback is a different, Schedule-&-Assign-only label). Used as
+ * a fallback so create paths that DON'T send time_slot (e.g. some integration
+ * sources) still populate it. Returns null for an absent/unparseable datetime
+ * so `input.time_slot || deriveTimeSlot(...)` leaves NULL as NULL when there's
+ * no appointment time at all.
+ */
+function deriveTimeSlot(dt) {
+  if (!dt) return null;
+  const h = Number(String(dt).slice(11, 13)); // 'YYYY-MM-DD HH:...' → HH
+  if (!Number.isFinite(h)) return null;
+  if (h >= 9  && h < 12) return 'Morning 9 to 2';
+  if (h >= 12 && h < 14) return 'Afternoon 12 to 5';
+  if (h >= 14 && h < 19) return 'Evening 2 to 7';
+  return 'After Hours';
+}
+
 let _hasClientVerticalIdColumn = null;
 async function hasClientVerticalIdColumn() {
   if (_hasClientVerticalIdColumn !== null) return _hasClientVerticalIdColumn;
@@ -1104,7 +1146,13 @@ async function getJobMeta(jobId) {
   // exists, but explicitly emitting NULL keeps the shape stable.
   const otpCol = (await hasOtpColumn()) ? 'otp' : 'NULL AS otp';
   const [[row]] = await pool.query(
-    `SELECT job_id, job_status, fk_easyfixter_id, fk_customer_id, fk_client_id, ${otpCol} FROM tbl_job WHERE job_id = ? LIMIT 1`,
+    // requested_date_time as a STRING (DATE_FORMAT) so setStatus's slot
+    // derivation reads the IST wall-clock hour regardless of connection tz;
+    // booking_cut_off_time_slot so the BOOKED confirm can COALESCE-backfill it.
+    `SELECT job_id, job_status, fk_easyfixter_id, fk_customer_id, fk_client_id,
+            DATE_FORMAT(requested_date_time, '%Y-%m-%d %H:%i:%s') AS requested_date_time,
+            booking_cut_off_time_slot, ${otpCol}
+       FROM tbl_job WHERE job_id = ? LIMIT 1`,
     [jobId]
   );
   return row || null;
@@ -1948,7 +1996,14 @@ async function create(input, actor) {
         customerId, addressId, input.fk_client_id,
         input.fk_service_type_id || null, input.fk_service_catg_id || null, serviceTypeIds,
         input.reporting_contact_id || null,
-        requestedDateTime, requestedTime, input.time_slot || null, input.booking_cut_off_time_slot || null,
+        requestedDateTime, requestedTime,
+        // Both slot columns are derived from the appointment time when the
+        // caller doesn't send them, so create paths that omit one (or both) —
+        // e.g. some integration sources — still populate both (ops 2026-07-08).
+        // time_slot = named window ("Morning 9 to 2"); booking_cut_off_time_slot
+        // = legacy "H AM - H PM" window. FE-sent values always win.
+        input.time_slot || deriveTimeSlot(requestedDateTime),
+        input.booking_cut_off_time_slot || deriveBookingCutoffSlot(requestedDateTime),
         new Date(), new Date(),
         // fk_created_by (2026-06-04): explicit Number() coercion. JWT
         // claims encode `user_id` as a string (see CLAUDE.md "Auth
@@ -2829,6 +2884,28 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
     if (bookedActorId) {
       sets.push('fk_created_by = COALESCE(fk_created_by, ?)');
       values.push(bookedActorId);
+    }
+    /*
+     * eta_status (ops 2026-07-08): order confirmation lands the job as '01' —
+     * the platform's "booked/confirmed" sentinel (verified: status-0 rows are
+     * overwhelmingly '01'; the later '11' is stamped downstream as the job
+     * progresses). create() already writes '01' on Book-New-Call; this covers
+     * the OTHER booking entry point — Book Now / Confirm & Schedule (9 → 0).
+     * (Supersedes the earlier "update paths must never touch eta_status" note:
+     * this is setStatus, and the confirm transition is a booking action.)
+     */
+    sets.push('eta_status = ?');
+    values.push('01');
+    /*
+     * booking_cut_off_time_slot backfill: unconfirmed rows (often website /
+     * integration sourced) frequently arrive with the named time_slot but a
+     * NULL cut-off window. Derive it from the appointment time on confirm so
+     * BOTH slot columns are populated. COALESCE keeps any value already set.
+     */
+    const cutoffSlot = deriveBookingCutoffSlot(existing.requested_date_time);
+    if (cutoffSlot) {
+      sets.push('booking_cut_off_time_slot = COALESCE(booking_cut_off_time_slot, ?)');
+      values.push(cutoffSlot);
     }
   } else if (COMPLETED_STATES.has(Number(status))) {
     sets.push('checkout_date_time = COALESCE(checkout_date_time, ?)', 'fk_checkout_by = COALESCE(fk_checkout_by, ?)');
