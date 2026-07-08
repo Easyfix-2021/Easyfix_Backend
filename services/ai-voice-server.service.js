@@ -37,8 +37,9 @@ function attach(server) {
     try { url = new URL(req.url, 'http://localhost'); } catch { return reject(socket, '400 Bad Request'); }
     if (url.pathname !== WS_PATH) return reject(socket, '404 Not Found');
 
-    // Feature must be on (property + OpenAI key). Togglable at runtime, so we
-    // check per-connection rather than gating the attach.
+    // Feature flag on? (`ai.calling.enabled`.) The per-ENGINE key check happens at
+    // POST /ai-calling/start, so any session that got this far is already vetted.
+    // Togglable at runtime, so we check per-connection rather than gating the attach.
     if (!aiSession.enabled()) return reject(socket, '403 Forbidden');
 
     const claims = aiSession.verifyToken(url.searchParams.get('t') || '');

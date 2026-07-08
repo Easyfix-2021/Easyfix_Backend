@@ -13,7 +13,11 @@ const whatsappService = require('../../services/meta.whatsapp.service');
 const { resolveTokens } = require('../../services/job-offer-push.service');
 const aiSession = require('../../services/ai-call-session.service');
 const aiCall = require('../../services/plivo-ai-call.service');
+const plivo = require('../../services/plivo.service');
 const { listFlows, DEFAULT_FLOW } = require('../../services/ai-call-flows');
+const { listEngines, engineConfigured, ENGINE_NAMES, DEFAULT_ENGINE } = require('../../services/ai-voice-engines');
+const { getProperty } = require('../../services/properties.service');
+const postCallQueue = require('../../services/ai-post-call-queue');
 
 /*
  * Admin "Validate Flows" utilities — operator smoke-tests for delivery paths
@@ -213,18 +217,39 @@ router.post('/message', validate(messageBody), async (req, res, next) => {
 const AI_FLOW_IDS = listFlows().map((f) => f.id);
 const aiStartBody = Joi.object({
   flow: Joi.string().valid(...AI_FLOW_IDS).default(DEFAULT_FLOW),
+  engine: Joi.string().valid(...ENGINE_NAMES), // default resolved from the property
   efrId: Joi.number().integer().positive(),
   mobile: Joi.string().trim().pattern(/^\d{10}$/),
 }).or('efrId', 'mobile');
 
-// List the available AI-calling flows (for a UI flow selector).
+// The default engine = the DB property (`ai.calling.engine`), else the code default.
+function defaultEngine() {
+  const p = String(getProperty('ai.calling.engine') || '').trim().toLowerCase();
+  return ENGINE_NAMES.includes(p) ? p : DEFAULT_ENGINE;
+}
+
+// List the available AI-calling flows + engines (for the UI selectors).
 router.get('/ai-calling/flows', (req, res) => modernOk(res, { flows: listFlows() }));
+router.get('/ai-calling/engines', (req, res) => modernOk(res, { engines: listEngines(), default: defaultEngine() }));
+
+// Operational stats — live call slots + the bounded post-call mapping queue. Lets
+// ops watch load and tune MAX_CONCURRENT_AI_CALLS / AI_POST_CALL_CONCURRENCY.
+router.get('/ai-calling/stats', (req, res) => modernOk(res, {
+  liveCalls: { active: aiSession.activeCount(), max: aiSession.MAX_CONCURRENT },
+  postCall: postCallQueue.stats(),
+  engineDefault: defaultEngine(),
+}));
 
 router.post('/ai-calling/start', validate(aiStartBody), async (req, res, next) => {
   try {
     if (!aiSession.enabled()) {
-      return modernError(res, 400,
-        'AI calling is not enabled. Set property ai.calling.enabled=true and configure an OpenAI Realtime key (OPENAI_REALTIME_API_KEY / OPENAI_API_KEY).');
+      return modernError(res, 400, 'AI calling is not enabled. Set property ai.calling.enabled=true.');
+    }
+    // Which engine? explicit body override → DB property default → code default.
+    const engine = req.body.engine || defaultEngine();
+    if (!engineConfigured(engine)) {
+      const keyVar = engine === 'gemini' ? 'GEMINI_API_KEY' : 'OPENAI_REALTIME_API_KEY (or OPENAI_API_KEY)';
+      return modernError(res, 400, `AI-calling engine "${engine}" is not configured — set ${keyVar}.`);
     }
     // Rule 2 — cap pre-check at start (the authoritative acquire happens when the
     // media socket connects). Protects the shared backend from over-admission.
@@ -247,7 +272,7 @@ router.post('/ai-calling/start', validate(aiStartBody), async (req, res, next) =
 
     let sessionId;
     try {
-      sessionId = await aiSession.createSession({ mobile: to, efrId: tech ? tech.efr_id : null, flow: req.body.flow });
+      sessionId = await aiSession.createSession({ mobile: to, efrId: tech ? tech.efr_id : null, flow: req.body.flow, engine });
     } catch (e) {
       logger.error('Validate Flows · ai-calling · session store not ready · ' + e.message);
       return modernError(res, 503,
@@ -265,10 +290,11 @@ router.post('/ai-calling/start', validate(aiStartBody), async (req, res, next) =
     // the polling UI) after a timeout instead of leaving it stuck at 'calling'.
     aiSession.scheduleConnectReaper(sessionId);
 
-    logger.info('Validate Flows · ai-calling · placed · session=' + sessionId + ' · via=' + via
-      + ' · active=' + aiSession.activeCount());
+    logger.info('Validate Flows · ai-calling · placed · session=' + sessionId + ' · engine=' + engine
+      + ' · via=' + via + ' · active=' + aiSession.activeCount());
     return modernOk(res, {
       sessionId,
+      engine,
       resolvedVia: via,
       resolvedTech,
       to: shortMobile(to),
@@ -295,10 +321,30 @@ router.get('/ai-calling/:sessionId', async (req, res, next) => {
       efrId: s.efr_id || null,
       transcript: s.transcript || '',
       result,
+      // Recording flag only (the raw Plivo URL needs auth — play it via the proxy
+      // route below, never expose the URL to the browser).
+      recordingAvailable: !!s.recording_url,
+      recordingDuration: s.recording_duration || null,
       createdOn: s.created_on,
     });
   } catch (e) {
     logger.error('Validate Flows · ai-calling · poll failed · ' + e.message);
+    next(e);
+  }
+});
+
+// Stream a call recording for playback (proxied from Plivo, which needs Basic auth
+// the browser can't send). Property-gated by the Validate-Flows allowlist above.
+router.get('/ai-calling/:sessionId/recording', async (req, res, next) => {
+  try {
+    const s = await aiSession.getSession(req.params.sessionId);
+    if (!s || !s.recording_url) return modernError(res, 404, 'No recording for this session.');
+    const dl = await plivo.downloadRecording(s.recording_url);
+    if (!dl.ok || !dl.buffer) return modernError(res, 502, 'Could not fetch the recording from Plivo.');
+    res.type(dl.contentType || 'audio/mpeg');
+    return res.send(dl.buffer);
+  } catch (e) {
+    logger.error('Validate Flows · ai-calling · recording proxy failed · ' + e.message);
     next(e);
   }
 });

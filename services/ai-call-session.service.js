@@ -30,9 +30,14 @@ function propEnabled() {
 function openaiKey() {
   return process.env.OPENAI_REALTIME_API_KEY || process.env.OPENAI_API_KEY || null;
 }
-// Turned on AND an OpenAI key present. (Plivo config is checked at call time.)
+// Feature on? Per-ENGINE key config is checked at POST /ai-calling/start against
+// the selected engine (openai → OpenAI Realtime key; gemini → GEMINI_API_KEY).
 function enabled() {
-  return propEnabled() && !!openaiKey();
+  return propEnabled();
+}
+// Record the streamed AI call? (property `ai.calling.record.enabled`, default false)
+function recordEnabled() {
+  return String(getProperty('ai.calling.record.enabled')).trim().toLowerCase() === 'true';
 }
 
 function tokenSecret() {
@@ -61,12 +66,12 @@ function release() {
 function newSessionId() {
   return 'ai_' + crypto.randomBytes(12).toString('hex');
 }
-async function createSession({ mobile, efrId, flow = 'profile_update' }) {
+async function createSession({ mobile, efrId, flow = 'profile_update', engine = 'gemini' }) {
   const sessionId = newSessionId();
   await pool.query(
-    `INSERT INTO tbl_ai_call_session (session_id, flow, status, mobile, efr_id)
-     VALUES (?, ?, 'calling', ?, ?)`,
-    [sessionId, flow, mobile || null, efrId || null],
+    `INSERT INTO tbl_ai_call_session (session_id, flow, engine, status, mobile, efr_id)
+     VALUES (?, ?, ?, 'calling', ?, ?)`,
+    [sessionId, flow, engine, mobile || null, efrId || null],
   );
   return sessionId;
 }
@@ -95,7 +100,8 @@ async function saveResult(sessionId, resultObj) {
 async function getSession(sessionId) {
   try {
     const [[row]] = await pool.query(
-      `SELECT session_id, flow, status, mobile, efr_id, call_uuid, transcript, result_json, error, created_on
+      `SELECT session_id, flow, engine, status, mobile, efr_id, call_uuid, transcript, result_json, error,
+              recording_url, recording_duration, created_on
          FROM tbl_ai_call_session WHERE session_id = ? LIMIT 1`,
       [sessionId],
     );
@@ -104,6 +110,24 @@ async function getSession(sessionId) {
     logger.warn('ai-call getSession failed (table present?) · ' + e.message);
     return null;
   }
+}
+
+// Persist a completed recording (from the Plivo recording callback).
+async function saveRecording(sessionId, { url, duration } = {}) {
+  try {
+    await pool.query(
+      'UPDATE tbl_ai_call_session SET recording_url = ?, recording_duration = ? WHERE session_id = ?',
+      [url || null, duration != null ? Number(duration) : null, sessionId]);
+  } catch (e) { logger.warn('ai-call saveRecording failed · ' + e.message); }
+}
+
+// Map a Plivo CallUUID → session_id (the recording callback carries CallUUID).
+async function getSessionIdByCallUuid(callUuid) {
+  try {
+    const [[row]] = await pool.query(
+      'SELECT session_id FROM tbl_ai_call_session WHERE call_uuid = ? ORDER BY created_on DESC LIMIT 1', [callUuid]);
+    return row ? row.session_id : null;
+  } catch { return null; }
 }
 
 // After a call is placed it sits at 'calling' until the media ws connects and the
@@ -129,9 +153,9 @@ function scheduleConnectReaper(sessionId) {
 }
 
 module.exports = {
-  enabled, propEnabled, openaiKey, MODEL, MAX_CONCURRENT, MAX_DURATION_MS,
+  enabled, propEnabled, recordEnabled, openaiKey, MODEL, MAX_CONCURRENT, MAX_DURATION_MS,
   signToken, verifyToken,
   activeCount, tryAcquire, release,
   createSession, setStatus, saveTranscript, saveResult, getSession,
-  scheduleConnectReaper,
+  saveRecording, getSessionIdByCallUuid, scheduleConnectReaper,
 };

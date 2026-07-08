@@ -26,14 +26,43 @@
 const { mapTranscript: mapProfileUpdate } = require('./ai-profile-extract.service');
 
 // ── profile_update ─────────────────────────────────────────────────────────
-function profileUpdateInstructions({ lang } = {}) {
+// Pre-load the technician's known context (best-effort) so the agent can open
+// relevantly — greet by name, acknowledge they're a registered Easyfixer — WITHOUT
+// any mid-call lookups. Returns null on anything missing (agent falls back to a
+// generic warm greeting). `mysql2` returns BIT(1) as a Buffer, so cast defensively.
+function toBool(v) {
+  if (Buffer.isBuffer(v)) return v[0] === 1;
+  return v === 1 || v === true || v === '1';
+}
+async function profileUpdatePreload({ efrId } = {}, pool) {
+  if (!efrId || !pool) return null;
+  try {
+    const [[t]] = await pool.query(
+      'SELECT efr_name, is_technician_verified FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1', [efrId]);
+    if (!t) return null;
+    return {
+      name: t.efr_name ? String(t.efr_name).trim() : null,
+      registered: true, // exists in tbl_easyfixer
+      verified: toBool(t.is_technician_verified),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function profileUpdateInstructions({ lang, context } = {}) {
   const langLine = lang
     ? `The technician's preferred language is "${lang}". Greet and speak in that language by default, but immediately mirror whatever language they actually reply in.`
     : 'From their first reply, detect the language they speak (Hindi, Hinglish, English, or a regional Indian language) and speak that language. Mirror their language throughout.';
+  // Pre-loaded context → a relevant, personal opening with no mid-call lookup.
+  const whoLine = context && context.name
+    ? `You are calling ${context.name}, one of our registered EasyFix technicians${context.verified ? ' (a verified technician)' : ''}. Greet them by their first name so it feels personal.`
+    : 'Greet the technician warmly.';
   return [
     'You are a warm, friendly human staff member at EasyFix, a home-services company, making a short phone call to one of our field technicians.',
     'Your only goal on this call is to find out two things: (1) what work and skills they can do, and (2) which areas or pincodes they can serve.',
     langLine,
+    whoLine,
     'Sound completely human and conversational — natural, relaxed, warm. NEVER say you are an AI, a bot, an assistant, or a system. Do not mention forms, mapping, or any technology.',
     'Keep your turns short — one or two sentences. Ask one thing at a time and acknowledge what they said before moving on.',
     'Open by greeting them, say you are calling from EasyFix to quickly update their work profile, and ask if this is a good time.',
@@ -51,6 +80,9 @@ const FLOWS = {
     // Each flow uses its OWN Sophy key (own model/prompt/quota/cost line) for the
     // post-call text reasoning. Name it here; mapResult passes it to the mapper.
     apiKeyEnv: 'SOPHY_API_KEY_AI_CALLING',
+    // preload(ctx, pool) → known technician context (best-effort), injected into
+    // buildInstructions so the agent opens relevantly with NO mid-call tool lookup.
+    preload: profileUpdatePreload,
     buildInstructions: profileUpdateInstructions,
     mapResult: (transcript, pool) =>
       mapProfileUpdate(transcript, pool, { apiKey: process.env.SOPHY_API_KEY_AI_CALLING }),

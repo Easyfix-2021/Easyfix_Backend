@@ -165,6 +165,9 @@ async function start() {
   } catch (err) {
     logger.warn(`AI voice ws server not attached — ${err.message}. AI-calling flow disabled (shared backend unaffected).`);
   }
+  // Re-drain any post-call mappings left at 'mapping' by a restart mid-queue
+  // (the post-call queue is in-memory + bounded). Best-effort, non-blocking.
+  try { require('./services/ai-post-call-queue').recoverPending(); } catch { /* noop */ }
 
   const shutdown = async (signal) => {
     logger.shutdown(`Shutdown requested (${signal}) — closing connections gracefully…`);
@@ -172,6 +175,7 @@ async function start() {
     // open) so each call's teardown can persist its transcript/result. Guarded
     // so a missing/never-attached ws server can't disrupt shutdown.
     try { require('./services/ai-voice-server.service').shutdown(); } catch { /* noop */ }
+    try { require('./services/audio-transcode-pool').shutdown(); } catch { /* noop */ }
     // Stop cron BEFORE closing the HTTP server so an in-flight cron task
     // doesn't keep the pool alive past closePool().
     scheduler.stop();
