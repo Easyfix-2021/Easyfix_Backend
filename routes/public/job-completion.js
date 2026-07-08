@@ -515,6 +515,22 @@ router.post(
          VALUES (?, 'cancel', ?, ?)`,
         [jobId, req.body.reason, req.body.remarks || null],
       );
+      // Mirror into the job comment thread so ops sees the request in the CRM
+      // History tab (not only the tbl_job_customer_request queue). Best-effort:
+      // the request above is the source of truth, so a comment failure must NOT
+      // fail the customer's action. comment_on=1 = job-lifecycle bucket (avoids
+      // the job_stage=9 side-effect of 16/17); commented_by=null = customer.
+      try {
+        const parts = [`Customer requested CANCELLATION via link. Reason: ${req.body.reason}.`];
+        if (req.body.remarks) parts.push(`Remarks: ${req.body.remarks}`);
+        await require('../../services/job-comment.service').addComment(jobId, {
+          comments: parts.join(' '),
+          comment_on: 1,
+          commented_by: null,
+        });
+      } catch (ce) {
+        logger.warn('cancel-request comment mirror failed · jobId=' + jobId + ' · ' + ce.message);
+      }
       logger.info({ jobId, request_id: ins.insertId }, 'magic-link: customer cancel request logged');
       return modernOk(res, { request_id: ins.insertId });
     } catch (e) {
@@ -542,6 +558,23 @@ router.post(
          VALUES (?, 'reschedule', ?, ?, ?)`,
         [jobId, req.body.reason, req.body.remarks || null, preferred],
       );
+      // Mirror into the job comment thread for ops visibility (best-effort — the
+      // request above is authoritative). comment_on=1 = the job-lifecycle bucket
+      // legacy uses for reschedule notes; appointment_on carries the preferred
+      // date so the comment row itself shows the requested new time.
+      try {
+        const parts = [`Customer requested RESCHEDULE via link. Reason: ${req.body.reason}.`];
+        if (preferred) parts.push(`Preferred: ${preferred}.`);
+        if (req.body.remarks) parts.push(`Remarks: ${req.body.remarks}`);
+        await require('../../services/job-comment.service').addComment(jobId, {
+          comments: parts.join(' '),
+          comment_on: 1,
+          commented_by: null,
+          appointment_on: preferred || null,
+        });
+      } catch (ce) {
+        logger.warn('reschedule-request comment mirror failed · jobId=' + jobId + ' · ' + ce.message);
+      }
       logger.info({ jobId, request_id: ins.insertId }, 'magic-link: customer reschedule request logged');
       return modernOk(res, { request_id: ins.insertId });
     } catch (e) {
