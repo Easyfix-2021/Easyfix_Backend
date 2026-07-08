@@ -50,9 +50,10 @@ async function markRinging(jci, callUuid) {
   } catch (e) { logger.warn({ err: e.message, jci }, 'plivo-call-log: markRinging failed (non-fatal)'); }
 }
 
-async function markAnswered(jci, callUuid) {
+async function markAnswered(jci, callUuid, recordRequested = null) {
   if (jci == null) return;
-  logger.info('Plivo call-log mark answered · jci=' + jci);
+  logger.info('Plivo call-log mark answered · jci=' + jci
+    + (recordRequested == null ? '' : ' · recording=' + (recordRequested ? 'on' : 'off')));
   try {
     await pool.query(
       `UPDATE tbl_plivo_call_log
@@ -62,6 +63,22 @@ async function markAnswered(jci, callUuid) {
       [callUuid || null, jci],
     );
   } catch (e) { logger.warn({ err: e.message, jci }, 'plivo-call-log: markAnswered failed (non-fatal)'); }
+  // Persist the recording decision SEPARATELY + fail-soft: on a deploy where the
+  // recording_requested column isn't migrated yet, this no-ops with a warn and
+  // the status write above is unaffected.
+  if (recordRequested != null) await setRecordingRequested(jci, recordRequested);
+}
+
+// Record whether Plivo was asked to record this call (1/0). Best-effort — the
+// column is added by 2026-07-08-add-recording-requested-to-plivo-call-log.sql.
+async function setRecordingRequested(jci, on) {
+  if (jci == null) return;
+  try {
+    await pool.query(
+      'UPDATE tbl_plivo_call_log SET recording_requested = ?, updated_on = NOW() WHERE job_caller_info_id = ?',
+      [on ? 1 : 0, jci],
+    );
+  } catch (e) { logger.warn({ err: e.message, jci }, 'plivo-call-log: setRecordingRequested failed (non-fatal — column may be pre-migration)'); }
 }
 
 async function markTerminalByJci(jci, { status, duration = null, hangupCause = null, callUuid = null } = {}) {
@@ -91,4 +108,4 @@ async function markTerminalByCallUuid(callUuid, { status, duration = null, hangu
   } catch (e) { logger.warn({ err: e.message, callUuid }, 'plivo-call-log: markTerminalByCallUuid failed (non-fatal)'); }
 }
 
-module.exports = { record, markRinging, markAnswered, markTerminalByJci, markTerminalByCallUuid };
+module.exports = { record, markRinging, markAnswered, setRecordingRequested, markTerminalByJci, markTerminalByCallUuid };

@@ -53,10 +53,15 @@ router.get('/answer', async (req, res) => {
   } catch (err) {
     logger.warn({ jci: claims.jci, err: err && err.message }, 'plivo answer: audit update failed (returning XML anyway)');
   }
-  await plivoLog.markAnswered(claims.jci, req.query.CallUUID || null);
+  // Decide recording ONCE (from the cached plivo.recording.enabled flag) and
+  // use the same value for the log, the persisted per-call flag, and the Dial
+  // XML — so "was this call set to record?" is answerable per call afterward.
+  const record = plivo.recordingEnabled();
+  logger.info('Plivo answer · jci=' + claims.jci + ' · CallUUID=' + (req.query.CallUUID || 'none') + ' · record=' + record);
+  await plivoLog.markAnswered(claims.jci, req.query.CallUUID || null, record);
 
   logger.info('Plivo answer: bridging to customer · jci=' + claims.jci);
-  return xml(plivo.buildAnswerXml(claims.dest, { record: plivo.recordingEnabled() }));
+  return xml(plivo.buildAnswerXml(claims.dest, { record }));
 });
 
 /*
@@ -100,8 +105,11 @@ async function webAnswer(req, res) {
   } catch (err) {
     logger.warn({ jci: resolved.jci, err: err && err.message }, 'plivo web-answer: audit update failed (returning XML anyway)');
   }
+  const record = plivo.recordingEnabled();
+  logger.info('Plivo web-answer · jci=' + resolved.jci + ' · CallUUID=' + (src.CallUUID || 'none') + ' · record=' + record);
   await plivoLog.markRinging(resolved.jci, src.CallUUID || null);
-  return xml(plivo.buildAnswerXml(resolved.number, { record: plivo.recordingEnabled() }));
+  await plivoLog.setRecordingRequested(resolved.jci, record);
+  return xml(plivo.buildAnswerXml(resolved.number, { record }));
 }
 router.post('/web-answer', express.urlencoded({ extended: false }), webAnswer);
 router.get('/web-answer', webAnswer);
@@ -125,7 +133,7 @@ router.get('/ai-answer', async (req, res) => {
     return xml(empty);
   }
   if (!aiSession.enabled()) {
-    logger.warn('Plivo ai-answer: ai.calling disabled / no key · returning empty Response');
+    logger.warn('Plivo ai-answer: ai.calling.enabled is off · returning empty Response');
     return xml(empty);
   }
   const base = aiCall.wsBase();
