@@ -38,10 +38,10 @@ const deepSkillService = require('./deep-skill.service');
 
 const EASYFIX_MANAGER_FALLBACK_NUMBER = '9810833037'; // legacy ProfilePercentageDto default
 
-// THIRD/last training video gates "training complete" in legacy
-// getProfileFinalStatus. VERIFY: confirm the canonical last-video id
-// against training_videos on the live DB (legacy AppConstant.THIRD_TRAINING_VIDEO).
-const TRAINING_VIDEO_ID_FOR_COMPLETION = 3;
+// "Training complete" = EVERY mandatory training_videos row watched to 100% by
+// the tech (see fetchTrainingCompletedTime). The old logic gated on ONLY the last
+// video (id=3), so finishing a single video wrongly marked the whole section done
+// — which is what the app's `allComplete` gate already requires.
 
 function bool(v) {
   if (v === null || v === undefined) return false;
@@ -115,17 +115,22 @@ async function resolveProfileImageUrl(raw) {
 // crashes if the row/column set ever drifts.
 async function fetchTrainingCompletedTime(efrId) {
   try {
+    // Complete only when the tech has a 100%-watched row for EVERY mandatory
+    // training_videos row (video_id = training_videos.id). Returns the latest
+    // completion timestamp, or null while any mandatory video is unfinished.
     const [[row]] = await pool.query(
-      `SELECT update_date
-         FROM easyfixer_watched_video
-        WHERE easyfixer_id = ?
-          AND video_id = ?
-          AND watched_percentage = 100
-        ORDER BY update_date DESC
-        LIMIT 1`,
-      [efrId, TRAINING_VIDEO_ID_FOR_COMPLETION],
+      `SELECT (SELECT COUNT(*) FROM training_videos) AS total,
+              COUNT(DISTINCT w.video_id)             AS done,
+              MAX(w.update_date)                     AS last_done
+         FROM easyfixer_watched_video w
+        WHERE w.easyfixer_id = ?
+          AND w.watched_percentage = 100
+          AND w.video_id IN (SELECT id FROM training_videos)`,
+      [efrId],
     );
-    return row?.update_date || null;
+    const total = Number(row?.total || 0);
+    const done = Number(row?.done || 0);
+    return total > 0 && done >= total ? (row?.last_done || null) : null;
   } catch (e) {
     logger.info(
       { err: e.message, efrId },
@@ -180,6 +185,25 @@ function deriveStatus(flags) {
   return 'active';
 }
 
+// Skills are declared via the deep-skill picker → tbl_efr_deepskill_mapping
+// (is_repairing=1 = active), which is ALSO what candidate-ranking matches jobs on.
+// The legacy efr_service_category/efr_service_type CSV columns are NOT written by
+// that flow, so checking them alone wrongly reported "no skills" for a tech who
+// actually has active deep-skill mappings (the "Add your skills" bug).
+async function fetchHasActiveSkills(efrId) {
+  try {
+    const [rows] = await pool.query(
+      `SELECT 1 FROM tbl_efr_deepskill_mapping
+        WHERE easyfixer_id = ? AND is_repairing = 1 LIMIT 1`,
+      [efrId],
+    );
+    return rows.length > 0;
+  } catch (e) {
+    logger.info({ err: e.message, efrId }, 'registration: deep-skill mapping lookup failed; treating as no-skills');
+    return false;
+  }
+}
+
 async function getStatus(efrId) {
   logger.info('Registration status · efrId=' + efrId);
   const e = await fetchGateRow(efrId);
@@ -190,9 +214,10 @@ async function getStatus(efrId) {
     throw err;
   }
 
-  const [profileImageUrl, trainingCompletedTime] = await Promise.all([
+  const [profileImageUrl, trainingCompletedTime, hasActiveSkills] = await Promise.all([
     resolveProfileImageUrl(e.efr_profile_img),
     fetchTrainingCompletedTime(efrId),
+    fetchHasActiveSkills(efrId),
   ]);
 
   const aadhaarPresent = present(e.adhaar_card_number);
@@ -201,7 +226,7 @@ async function getStatus(efrId) {
   // "Has skills" = the tech declared at least a service category/type (the
   // matching key candidate-ranking needs). Folded into the Gate-2 checklist,
   // no longer a registration wall.
-  const hasSkills      = present(e.efr_service_category) || present(e.efr_service_type);
+  const hasSkills      = hasActiveSkills || present(e.efr_service_category) || present(e.efr_service_type);
   const isPersonalDetailFilled = bool(e.user_is_personal_detail_filled);
   // Gate 1 = the merged registration screen: personal step submitted AND
   // Aadhaar + photo on file. All three are written together by that screen;
