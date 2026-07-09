@@ -332,6 +332,29 @@ async function savePersonalDetails(efrId, body) {
     );
   }
 
+  // Best-effort location enrichment (2026-07-09): resolve the submitted
+  // pincode into a city FK + state + GPS centroid so the CRM Registered-
+  // Easyfixers list and Self-Registration Verification screen show City /
+  // State / State-User / GPS instead of dashes.
+  //
+  // DETACHED (not awaited): enrichment may hit a live Google geocode for an
+  // uncataloged pincode, and the technician's submit must not wait on that.
+  // Fail-soft by contract — a geocode miss or Google outage must never fail
+  // the submit (the raw pincode is already saved above; the CRM verification
+  // page also backfills lazily, and an operator can resolve the FK by hand).
+  if (body.pincode != null) {
+    const { enrichEasyfixerLocationFromPincode } = require('./easyfixer-location.service');
+    enrichEasyfixerLocationFromPincode({
+      efrId,
+      pincode: body.pincode,
+      userId: row?.user_id || null,
+      deviceLat: body.latitude,
+      deviceLng: body.longitude,
+    }).catch((err) => {
+      logger.warn('Registration location enrichment failed (non-fatal) · efrId=' + efrId + ' · ' + (err && err.message ? err.message : err));
+    });
+  }
+
   logger.info('Personal details saved · efrId=' + efrId + ' personalStepMarked=' + Boolean(row?.user_id));
   return { ok: true };
 }

@@ -830,18 +830,42 @@ async function ensurePincode(pincodeRaw, { userId = null, createdByEfrId = null 
   const cityId  = match.city?.city_id
     || (await findOrCreateCityByName(cityName, stateId, { district: match.district, createdByEfrId, userId })).city_id;
 
-  const detail = await createPincode(
-    {
-      pincode:  pin,
-      location: cityName,
-      city_id:  cityId,
-      district: match.district,
-      lat:      match.lat,
-      lng:      match.lng,
-      is_active: true,
-    },
-    { userId, createdByEfrId },
-  );
+  let detail;
+  try {
+    detail = await createPincode(
+      {
+        pincode:  pin,
+        location: cityName,
+        city_id:  cityId,
+        district: match.district,
+        lat:      match.lat,
+        lng:      match.lng,
+        is_active: true,
+      },
+      { userId, createdByEfrId },
+    );
+  } catch (err) {
+    // Lost a create race: another caller inserted this pincode between our
+    // dedup check (above) and this INSERT. Treat 409 as the idempotent branch
+    // — re-read and return the existing row instead of propagating a conflict.
+    if (err && err.status === 409) {
+      const dup = await getPincodeByValue(pin);
+      if (dup) {
+        logger.info('Pincode create raced — returning existing · pincode=' + pin);
+        return {
+          pincode_id: dup.pincode_id,
+          pincode:    dup.pincode,
+          city_id:    dup.city_id,
+          city_name:  dup.city_name,
+          state_name: dup.state_name,
+          lat:        dup.lat,
+          lng:        dup.lng,
+          created:    false,
+        };
+      }
+    }
+    throw err;
+  }
 
   logger.info('Pincode ensured (created) · id=' + detail.pincode_id + ' pincode=' + pin);
   return {

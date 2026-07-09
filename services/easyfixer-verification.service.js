@@ -38,6 +38,22 @@ function pct(v) {
   return Math.max(0, Math.min(100, Math.round(n)));
 }
 
+/*
+ * Per-process guard for the read-time location backfill (see getVerificationPage).
+ * The backfill may hit a live Google geocode; a lead whose pincode is
+ * un-geocodable would otherwise re-fire that geocode on EVERY page load / every
+ * section save, because a failed enrichment leaves efr_cityId blank and the
+ * guard condition true. This Set caps the attempt to ONCE per lead per process
+ * regardless of outcome. Successful backfills set efr_cityId (which clears the
+ * outer condition anyway) — this only bounds the un-resolvable tail. Bounded so
+ * it can never grow without limit.
+ */
+const _locBackfillAttempted = new Set();
+function _markLocBackfillAttempted(efrId) {
+  if (_locBackfillAttempted.size > 5000) _locBackfillAttempted.clear();
+  _locBackfillAttempted.add(efrId);
+}
+
 function bool(v) {
   if (v === null || v === undefined) return false;
   if (typeof v === 'boolean') return v;
@@ -141,10 +157,45 @@ async function listCitiesForLookup() {
 // ─── Public: full page payload ──────────────────────────────────────
 async function getVerificationPage(efrId) {
   logger.info('Load easyfixer verification page · efrId=' + efrId);
-  const e = await getEasyfixerForVerification(efrId);
+  let e = await getEasyfixerForVerification(efrId);
   if (!e) {
     logger.warn('Verification page not found · efrId=' + efrId);
     return null;
+  }
+
+  // Lazy geocode backfill (2026-07-09) — self-registered leads submit only a
+  // raw pincode from the app. If the city FK was never resolved (older leads
+  // predating the registration-time enrichment), fill it now, ONCE, so City /
+  // State / State-User / GPS render on this page and the list. Fail-soft; on
+  // success we re-read the joined row so THIS response reflects the backfill
+  // without requiring a second page load.
+  //
+  // Gated to SELF-REGISTERED leads (new_easy_fixer = 1) so opening the
+  // verification page for an operator-curated easyfixer never auto-geocodes /
+  // creates master data as a side-effect of a read. Guarded to at most ONE
+  // attempt per lead per process (_locBackfillAttempted) so an un-geocodable
+  // pincode can't re-hit Google on every load / every section-save.
+  if (
+    Number(e.new_easy_fixer) === 1 &&
+    (e.efr_cityId == null || Number(e.efr_cityId) === 0) &&
+    e.efr_pin_no && !e.city_name &&
+    !_locBackfillAttempted.has(efrId)
+  ) {
+    _markLocBackfillAttempted(efrId);
+    try {
+      const { enrichEasyfixerLocationFromPincode } = require('./easyfixer-location.service');
+      const res = await enrichEasyfixerLocationFromPincode({
+        efrId,
+        pincode: e.efr_pin_no,
+        userId: e.user_id || null,
+      });
+      if (res && res.enriched) {
+        const fresh = await getEasyfixerForVerification(efrId);
+        if (fresh) e = fresh;
+      }
+    } catch (err) {
+      logger.warn('Verification lazy location backfill failed (non-fatal) · efrId=' + efrId + ' · ' + (err && err.message ? err.message : err));
+    }
   }
 
   /*
