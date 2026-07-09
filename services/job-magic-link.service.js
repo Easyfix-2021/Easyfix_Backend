@@ -913,7 +913,11 @@ async function sendForJob(jobId, { action, override = false } = {}, pool) {
       templateName: 'confirm_order',
       bodyValues: {
         1: row.customer_name || 'there',
-        2: row.client_name   || '',
+        // Append the Job ID to the client name so the confirmation reads
+        // "<Client> #<JobId>" (e.g. "For Testing #511425"), giving the
+        // customer a stable order reference right in the greeting. `.trim()`
+        // keeps it clean ("#511425") when the client name is missing.
+        2: `${row.client_name || ''} #${jobId}`.trim(),
         3: bodyUrl,
       },
     });
