@@ -751,9 +751,13 @@ async function createCustomProperty(clientId, body) {
   // Legacy `c_prop_values` is NOT NULL — coerce a missing/empty value to '' on
   // that shape (value-less flag rows like `branch_details` carry no client-level
   // default). Canonical `property_value` is nullable, so keep null there.
-  const valueCell = (body.value === undefined || body.value === null || body.value === '')
+  // Trim the value so a stray space can never land in c_prop_values — the
+  // opt-in checks match it EXACTLY ('true'), so 'true ' silently disables the
+  // flag (the Greensoul trap). null → '' on legacy (c_prop_values is NOT NULL).
+  const trimmedValue = (body.value == null) ? '' : String(body.value).trim();
+  const valueCell = (trimmedValue === '')
     ? (cols.hasStatus ? '' : null)
-    : body.value;
+    : trimmedValue;
   insertVals.push(valueCell, body.mandatory ? 1 : 0);
   if (cols.hasStatus) {
     insertCols.push('status');
@@ -798,8 +802,10 @@ async function updateCustomProperty(propId, body) {
     if (!dbCol) continue; // e.g. label on legacy without c_prop_label
     let v = val;
     if (colKey === 'mandatory') v = val ? 1 : 0;
-    // Legacy `c_prop_values` is NOT NULL — coerce null → '' for the value column.
-    else if (colKey === 'value' && v == null && cols.hasStatus) v = '';
+    // Trim the value so a stray space can't land in c_prop_values — the opt-in
+    // checks match it EXACTLY ('true'), so 'true ' silently disables the flag
+    // (the Greensoul trap). null → '' on legacy (c_prop_values is NOT NULL).
+    else if (colKey === 'value') v = (v == null) ? (cols.hasStatus ? '' : null) : String(v).trim();
     sets.push(`${dbCol} = ?`);
     vals.push(v);
   }

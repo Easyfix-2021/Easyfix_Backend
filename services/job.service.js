@@ -256,8 +256,8 @@ const LIST_COLUMNS = `
   (EXISTS (
      SELECT 1 FROM tbl_client_custom_properties ccp
       WHERE ccp.client_id = j.fk_client_id
-        AND LOWER(REPLACE(ccp.c_prop_name, '_', ' ')) = LOWER('Auto Process Unconfirmed Order')
-        AND LOWER(ccp.c_prop_values) = 'true'
+        AND LOWER(TRIM(REPLACE(ccp.c_prop_name, '_', ' '))) = LOWER('Auto Process Unconfirmed Order')
+        AND LOWER(TRIM(ccp.c_prop_values)) = 'true'
         AND ccp.status = 1
    )) AS client_opted_in
 `;
