@@ -67,12 +67,15 @@ const MAGIC_LINK_REASON_USER_TYPE = 2;
 async function fetchReasonList(pool, actionType) {
   try {
     const [rows] = await pool.query(
-      `SELECT action_desc FROM action_taken_reason
+      `SELECT id, action_desc FROM action_taken_reason
         WHERE action_type = ? AND user_type = ? AND status = 1
         ORDER BY id ASC`,
       [actionType, MAGIC_LINK_REASON_USER_TYPE],
     );
-    return rows.map((r) => r.action_desc).filter(Boolean);
+    // Return {id, action_desc} — the prefill maps to labels for the FE
+    // dropdown (string[] contract), while the submit routes use the id to
+    // stamp tbl_job_comment.enum_reason_id.
+    return rows.filter((r) => r.action_desc).map((r) => ({ id: r.id, action_desc: r.action_desc }));
   } catch (err) {
     // Fail-soft: a reason-list read must never break the whole prefill page.
     logger.warn('Magic-link reason list fetch failed · actionType=' + actionType + ' · ' + (err && err.message ? err.message : err));
@@ -663,8 +666,8 @@ async function fetchPrefill(jobId, pool) {
     // Reason lists — DB-driven from action_taken_reason (magic-link customer
     // action_types 39=cancel, 38=reschedule, user_type=2). Same query the
     // submit routes validate against, so options and allowlist can't drift.
-    cancel_reasons:     await getCancelReasons(pool),
-    reschedule_reasons: await getRescheduleReasons(pool),
+    cancel_reasons:     (await getCancelReasons(pool)).map((r) => r.action_desc),
+    reschedule_reasons: (await getRescheduleReasons(pool)).map((r) => r.action_desc),
     // Customer's OWN mobile, UNMASKED. It is the customer's own number on
     // their own order; the FE renders it read-only. (Distinct from the
     // masked `customer.mobile` kept below for back-compat.)
@@ -1089,11 +1092,21 @@ async function acceptSubmission(jobId, payload, pool) {
     const hasBuildingCol = await jobHasColumn(pool, 'building_name');
     const hasProductCol  = await jobHasColumn(pool, 'product_code');
 
+    // requested_time (HH:MM) mirrors the chosen slot's start time so the slot
+    // columns stay coherent with the create() flow (which writes both
+    // requested_time + booking_cut_off_time_slot). Extracted from the ISO
+    // requested_date_time the FE submits for the picked slot chip.
+    const reqTimeHHMM = (() => {
+      const m = String(payload.requested_date_time || '').match(/T(\d{2}:\d{2})/);
+      return m ? m[1] : null;
+    })();
     const jobSetClauses = [
       'customer_submitted_at      = ?',
       'customer_submitted_payload = ?',
       'requested_date_time        = COALESCE(?, requested_date_time)',
       'time_slot                  = COALESCE(?, time_slot)',
+      'booking_cut_off_time_slot  = COALESCE(?, booking_cut_off_time_slot)',
+      'requested_time             = COALESCE(?, requested_time)',
       'additional_name            = COALESCE(?, additional_name)',
       'additional_number          = COALESCE(?, additional_number)',
       'job_desc                   = COALESCE(?, job_desc)',
@@ -1104,6 +1117,8 @@ async function acceptSubmission(jobId, payload, pool) {
       JSON.stringify(payload),
       payload.requested_date_time || null,
       payload.time_slot || null,
+      payload.time_slot || null,   // booking_cut_off_time_slot = the chosen slot label
+      reqTimeHHMM,                 // requested_time = HH:MM of the chosen slot
       payload.additional_name || null,
       payload.additional_number || null,
       (payload.job_desc && String(payload.job_desc).trim()) ? payload.job_desc : null,

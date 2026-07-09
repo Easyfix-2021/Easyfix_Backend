@@ -512,11 +512,13 @@ router.post(
   async (req, res, next) => {
     try {
       const jobId = await verify(req);
-      // Membership check — the Joi schema only guarantees a non-empty string;
-      // the reasons are now DB-driven (action_taken_reason action_type=39), so
-      // validate the submitted text against the live list here.
-      const validCancelReasons = await magicLinkService.getCancelReasons(pool);
-      if (!validCancelReasons.includes(req.body.reason)) {
+      // Membership check + id resolution — the Joi schema only guarantees a
+      // non-empty string; the reasons are DB-driven (action_taken_reason
+      // action_type=39). Resolve the matching row so we get BOTH validation
+      // AND its id for tbl_job_comment.enum_reason_id.
+      const cancelReasons = await magicLinkService.getCancelReasons(pool);
+      const reasonRow = cancelReasons.find((r) => r.action_desc === req.body.reason);
+      if (!reasonRow) {
         throw Object.assign(new Error('Please select a valid cancellation reason.'), { status: 400 });
       }
       logger.info('Log customer cancel request · jobId=' + jobId + ' · reason=' + req.body.reason);
@@ -532,12 +534,15 @@ router.post(
       // fail the customer's action. comment_on=1 = job-lifecycle bucket (avoids
       // the job_stage=9 side-effect of 16/17); commented_by=null = customer.
       try {
-        const parts = [`Customer requested CANCELLATION via link. Reason: ${req.body.reason}.`];
-        if (req.body.remarks) parts.push(`Remarks: ${req.body.remarks}`);
+        // Mirror to the job History (tbl_job_comment). comments = ONLY the
+        // customer's remark text; the reason is structured in enum_reason_id
+        // (action_taken_reason.id); commented_by=null=customer; comment_on=1
+        // (lifecycle bucket — avoids the 16/17 job_stage=9 side-effect).
         await require('../../services/job-comment.service').addComment(jobId, {
-          comments: parts.join(' '),
+          comments: (req.body.remarks || '').trim(),
           comment_on: 1,
           commented_by: null,
+          enum_reason_id: reasonRow.id,
         });
       } catch (ce) {
         logger.warn('cancel-request comment mirror failed · jobId=' + jobId + ' · ' + ce.message);
@@ -561,10 +566,11 @@ router.post(
   async (req, res, next) => {
     try {
       const jobId = await verify(req);
-      // Membership check — reasons are DB-driven (action_taken_reason
-      // action_type=38); the Joi schema only checks it's a non-empty string.
-      const validReschedReasons = await magicLinkService.getRescheduleReasons(pool);
-      if (!validReschedReasons.includes(req.body.reason)) {
+      // Membership check + id resolution — reasons are DB-driven
+      // (action_taken_reason action_type=38).
+      const reschedReasons = await magicLinkService.getRescheduleReasons(pool);
+      const reasonRow = reschedReasons.find((r) => r.action_desc === req.body.reason);
+      if (!reasonRow) {
         throw Object.assign(new Error('Please select a valid reschedule reason.'), { status: 400 });
       }
       logger.info('Log customer reschedule request · jobId=' + jobId + ' · reason=' + req.body.reason);
@@ -580,14 +586,15 @@ router.post(
       // legacy uses for reschedule notes; appointment_on carries the preferred
       // date so the comment row itself shows the requested new time.
       try {
-        const parts = [`Customer requested RESCHEDULE via link. Reason: ${req.body.reason}.`];
-        if (preferred) parts.push(`Preferred: ${preferred}.`);
-        if (req.body.remarks) parts.push(`Remarks: ${req.body.remarks}`);
+        // Mirror to job History. comments = ONLY the customer's remark; the
+        // reason is structured in enum_reason_id; appointment_on carries the
+        // requested new time; commented_by=null=customer; comment_on=1.
         await require('../../services/job-comment.service').addComment(jobId, {
-          comments: parts.join(' '),
+          comments: (req.body.remarks || '').trim(),
           comment_on: 1,
           commented_by: null,
           appointment_on: preferred || null,
+          enum_reason_id: reasonRow.id,
         });
       } catch (ce) {
         logger.warn('reschedule-request comment mirror failed · jobId=' + jobId + ' · ' + ce.message);
