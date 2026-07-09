@@ -5,6 +5,8 @@ const multer = require('multer');
 const validate = require('../../middleware/validate');
 const { modernOk, modernError } = require('../../utils/response');
 const svc = require('../../services/mobile-profile-extra.service');
+const withdrawalService = require('../../services/withdrawal.service');
+const { pool } = require('../../db');
 const logger = require('../../logger');
 
 // Profile-image multipart upload — memory storage, single image ≤10MB.
@@ -126,6 +128,32 @@ router.get('/earnings', validate(dateWindow, 'query'), async (req, res, next) =>
     const data = await svc.getEarnings(req.tech.efr_id, { from, to });
     logger.info(`Returning ${data.items.length} earning record(s) · ${window}`);
     modernOk(res, data);
+  } catch (e) { next(e); }
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Withdraw / payout request
+// ─────────────────────────────────────────────────────────────────────
+
+/*
+ * Record a payout/withdrawal request against the technician's wallet balance.
+ *
+ * MVP (finance-in-the-loop): this ONLY records the request row in
+ * tbl_easyfixer_withdrawal_request (status='requested'). It deliberately does
+ * NOT debit tbl_easyfixer.current_balance — the actual payout + wallet debit are
+ * a downstream FINANCE/OPS step performed when the payout is settled (see
+ * services/withdrawal.service.js). The service throws { status, code, message }
+ * for the bank-missing / invalid-amount / already-pending cases, which the
+ * central error-handler surfaces to the app verbatim.
+ */
+router.post('/withdraw', validate(Joi.object({
+  amount: Joi.number().positive().required(),
+})), async (req, res, next) => {
+  try {
+    logger.info('Withdrawal requested · amount=' + req.body.amount);
+    const result = await withdrawalService.requestWithdrawal(req.tech.efr_id, req.body, pool);
+    logger.info('Withdrawal request recorded · requestId=' + result.requestId);
+    modernOk(res, result);
   } catch (e) { next(e); }
 });
 

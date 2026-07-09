@@ -520,9 +520,13 @@ router.post('/email-statement', validate(Joi.object({
 //     transaction_id, easyfixer_id, source, description, transaction_type,
 //     transaction_date, amount, balance, created_date, created_by,
 //     job_id, trans_reason_code
-//   transaction_type values: 1 (credit) and 2 (debit) per the legacy
-//   convention. The Finance sidebar's "Easyfixer Debit" and "Easyfixer
-//   Credit" sub-menus both point here with a different ?type= filter.
+//   transaction_type values: 1 (DEBIT — subtracts from balance) and 2 (CREDIT —
+//   adds to balance), per the legacy Java DAO EasyfixerTransactionDAO
+//   .updateTransaction (type==1 → balance minus; type==2 → balance plus) and the
+//   mobile earnings read. The Finance sidebar's "Easyfixer Debit" / "Easyfixer
+//   Credit" sub-menus point here with a different ?type= filter — those filters
+//   must use 1=debit / 2=credit; VERIFY they aren't inverted (this comment was
+//   previously wrong, which caused the recharge-type bug fixed 2026-07-09).
 router.get('/efr-transactions', async (req, res, next) => {
   try {
     const { efrId, type, from, to } = req.query;
@@ -1085,12 +1089,16 @@ router.post('/easyfixer/:id/recharge', validate(Joi.object({
       const [[bal]] = await conn.query(
         'SELECT current_balance FROM tbl_easyfixer WHERE efr_id = ? AND NOT (tbl_easyfixer.efr_status <=> 3)',
         [efrId]);
-      // Audit ledger row for the manual admin credit (transaction_type=1 = credit).
-      // TODO confirm legacy 'source' convention for manual admin credits against existing tbl_easyfixer_transaction rows
+      // Audit ledger row for the manual admin credit. transaction_type=2 = CREDIT
+      // per the legacy Java DAO (EasyfixerTransactionDAO.updateTransaction:
+      // type==1 subtracts → DEBIT, type==2 adds → CREDIT), confirmed by the
+      // mobile earnings read (mobile-profile-extra.service.js: txType===2 is credit).
+      // FIXED 2026-07-09: was erroneously 1, so a recharge (which credits the
+      // balance here) was logged as a DEBIT and rendered as -amount in the tech's app.
       await conn.query(
         `INSERT INTO tbl_easyfixer_transaction
            (easyfixer_id, source, description, transaction_type, transaction_date, amount, balance, created_date, created_by)
-         VALUES (?, ?, ?, 1, NOW(), ?, ?, NOW(), ?)`,
+         VALUES (?, ?, ?, 2, NOW(), ?, ?, NOW(), ?)`,
         [efrId, 'ADMIN_RECHARGE', req.body.reference || null, req.body.amount, bal.current_balance, req.user.user_id]);
       await conn.commit();
       logger.info('Admin recharge applied · efrId=' + efrId + ' amount=' + req.body.amount + ' newBalance=' + bal.current_balance);

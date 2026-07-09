@@ -148,6 +148,8 @@ router.get('/', validate(v.listClientsQuery, 'query'), async (req, res, next) =>
       cityId: req.query.cityId ? Number(req.query.cityId) : undefined,
       limit: req.query.limit,
       offset: req.query.offset,
+      sortBy: req.query.sortBy,
+      sortDir: req.query.sortDir,
     });
     // Modern envelope wraps `{items, total}` as the data payload — the
     // FE reads `data.items` + `data.total`. Backwards-compat note:

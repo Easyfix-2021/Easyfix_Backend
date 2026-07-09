@@ -2209,6 +2209,11 @@ async function create(input, actor) {
       // (geocoded) if it's new. Idempotent + never throws — see ensureJobPincode.
       ensureJobPincode(input.address?.pin_code, actor);
     });
+    // NOTE: enquiry WhatsApp is intentionally NOT fired here for a direct
+    // book-as-ENQUIRY (initial_status=7). create() never stamps
+    // enquiry_reason_id, so this path would send a blank-reason template; and
+    // legacy only notified on the "mark as Enquiry" transition. The CRM books
+    // at BOOKED(0) then transitions via setStatus(7) — see the setStatus hook.
 
     return getById(jobId);
   } catch (e) {
@@ -2945,6 +2950,17 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
   logger.info('Job status updated · id=' + jobId + ' · ' + existing.job_status + '->' + Number(status) + (eventName ? ' · event=' + eventName : ''));
   if (eventName) fireWebhook(eventName, jobId);
 
+  // Enquiry WhatsApp (2026-07-09): ENQUIRY has no status→event mapping
+  // (statusToEventName returns null), so fire the customer + SPOC WhatsApp
+  // directly on the "mark as Enquiry" TRANSITION (the sole trigger — see the
+  // create() note above). Guard on a real transition INTO enquiry so a 7→7
+  // re-submit doesn't double-send. Fire-and-forget — never blocks the
+  // response. Runs after the UPDATE above, so enquiry_reason_id /
+  // enquiry_date_time are already persisted when the send reads them.
+  if (Number(status) === STATUS.ENQUIRY && Number(existing.job_status) !== STATUS.ENQUIRY) {
+    require('./enquiry-notification.service').fireEnquiryWhatsapp(jobId);
+  }
+
   return getById(jobId);
 }
 
@@ -2999,6 +3015,10 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
   if (!offerFlowEnabled() || !(await jobOfferTableExists())) {
     return assign(jobId, { easyfixerId: ids[0], requestedDateTime, timeSlot }, actor);
   }
+
+  // Defense-in-depth: every tech in the offer pool must be verified+active.
+  // (The OFF path above delegates to assign(), which runs the same gate.)
+  await assertTechniciansVerified(ids);
 
   // Normalise the OPTIONAL schedule edit exactly as assign() does — an IST
   // wall-clock string stored as a literal "YYYY-MM-DD HH:mm:ss" (never a JS
@@ -3097,6 +3117,44 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
 }
 
 /*
+ * Defense-in-depth verified gate for the assignment/offer write path.
+ * candidate-ranking.service.js + auto-assign.service.js already filter to
+ * `efr_status=1 AND is_technician_verified=1` when BUILDING the technician
+ * list, but the write endpoints historically trusted that list. Post the
+ * onboarding redesign, many unverified techs live inside the app, so a
+ * direct/stray call with an unverified efr_id must be rejected here too —
+ * making "unverified technicians never get work" a hard invariant. Throws
+ * 400 (code TECH_NOT_VERIFIED) naming the offending id(s). Accepts a scalar
+ * or array; `runner` may be a pooled connection so it can run inside a txn.
+ */
+async function assertTechniciansVerified(efrIds, runner = pool) {
+  const ids = Array.from(new Set(
+    (Array.isArray(efrIds) ? efrIds : [efrIds])
+      .map((v) => Number(v))
+      .filter((n) => Number.isInteger(n) && n > 0),
+  ));
+  if (!ids.length) return;
+  const [rows] = await runner.query(
+    `SELECT efr_id FROM tbl_easyfixer
+      WHERE efr_id IN (?) AND efr_status = 1 AND is_technician_verified = 1`,
+    [ids],
+  );
+  const okIds = new Set(rows.map((r) => Number(r.efr_id)));
+  const bad = ids.filter((id) => !okIds.has(id));
+  if (bad.length) {
+    logger.warn('Assign/offer rejected, technician(s) not verified · efrIds=' + bad.join(','));
+    const err = new Error(
+      bad.length === 1
+        ? `easyfixer ${bad[0]} is not verified and cannot be assigned work`
+        : `easyfixers ${bad.join(', ')} are not verified and cannot be assigned work`,
+    );
+    err.status = 400;
+    err.code = 'TECH_NOT_VERIFIED';
+    throw err;
+  }
+}
+
+/*
  * assign(jobId, body, actor)
  *
  * body:
@@ -3136,6 +3194,10 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
     logger.warn('Assign rejected, easyfixer inactive · id=' + jobId + ' · easyfixerId=' + easyfixerId);
     const err = new Error(`easyfixer ${easyfixerId} is inactive`); err.status = 400; throw err;
   }
+  // Defense-in-depth verified gate (see assertTechniciansVerified). auto-assign
+  // + CRM both source ids from the verified candidate list; this rejects a
+  // direct/stray call with an unverified id.
+  await assertTechniciansVerified([easyfixerId]);
   if (!existing) {
     logger.warn('Assign job not found · id=' + jobId);
     const err = new Error('job not found'); err.status = 404; throw err;
@@ -3362,6 +3424,9 @@ async function unassign(jobId, { reason, reasonId }, actor) {
  */
 async function acceptOffer(jobId, efrId) {
   logger.info('Accept job offer · id=' + jobId + ' · efrId=' + efrId);
+  // Defense-in-depth: an unverified tech (e.g. de-verified after being offered)
+  // cannot claim a job. Cheap PK lookup before the txn.
+  await assertTechniciansVerified([efrId]);
   const hasOfferTable = await jobOfferTableExists();
   const conn = await pool.getConnection();
   // `committed` guards the catch so a post-commit throw (the 409 path) doesn't

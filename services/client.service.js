@@ -108,22 +108,22 @@ async function getClientColumns() {
  * `extraClauses` / `extraParams` come from the route's RBAC + search
  * filter assembly. Pagination is enforced here (max 500 per page).
  */
-async function listClients({ extraClauses = [], extraParams = [], includeInactive, q, limit, offset, cityId }) {
+async function listClients({ extraClauses = [], extraParams = [], includeInactive, q, limit, offset, cityId, sortBy, sortDir }) {
   logger.info('List clients · q=' + (q || '') + ' cityId=' + (cityId || '') + ' includeInactive=' + !!includeInactive + ' limit=' + (limit || '') + ' offset=' + (offset || ''));
   const clauses = [...extraClauses];
   const params  = [...extraParams];
   if (!includeInactive) clauses.push('cl.client_status = 1');
   if (q) {
-    // Match client_name OR city_name OR any SPOC contact_name.
+    // Match client name / email / reference code / city / client id / SPOC contact name.
     // - City name needs the tbl_city JOIN in both COUNT and SELECT
     //   below (we add it unconditionally — JOIN cost is trivial vs.
     //   the operator confusion of "search Mumbai returns nothing").
     // - EXISTS keeps the row count stable on the contact match (no
     //   JOIN row-explosion when a client has many contacts).
     clauses.push(
-      '(cl.client_name LIKE ? OR ct.city_name LIKE ? OR EXISTS (SELECT 1 FROM tbl_client_contacts c WHERE c.client_id = cl.client_id AND c.contact_name LIKE ?))',
+      '(cl.client_name LIKE ? OR cl.client_email LIKE ? OR cl.reference_code LIKE ? OR ct.city_name LIKE ? OR CAST(cl.client_id AS CHAR) LIKE ? OR EXISTS (SELECT 1 FROM tbl_client_contacts c WHERE c.client_id = cl.client_id AND c.contact_name LIKE ?))',
     );
-    params.push(`%${q}%`, `%${q}%`, `%${q}%`);
+    params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
   }
   if (cityId) {
     // Legacy column name: `client_city_id` on tbl_client; tbl_city's
@@ -133,6 +133,25 @@ async function listClients({ extraClauses = [], extraParams = [], includeInactiv
     params.push(cityId);
   }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+
+  // Server-side ORDER BY over the COMPLETE result set (whitelisted columns
+  // only — the map is the SQL-injection guard). Default: client_name ASC.
+  // A client_id tiebreaker keeps paging deterministic when the sort col ties.
+  const SORT_MAP = {
+    client_id:     'cl.client_id',
+    client_name:   'cl.client_name',
+    client_email:  'cl.client_email',
+    city_name:     'ct.city_name',
+    client_status: 'cl.client_status',
+  };
+  let orderBy = 'ORDER BY cl.client_name ASC';
+  if (sortBy && SORT_MAP[sortBy]) {
+    const scol = SORT_MAP[sortBy];
+    const sdir = String(sortDir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+    orderBy = scol === 'cl.client_id'
+      ? `ORDER BY cl.client_id ${sdir}`
+      : `ORDER BY ${scol} ${sdir}, cl.client_id ASC`;
+  }
 
   // Query 1 — COUNT(*) for pagination. Same WHERE + JOIN as the SELECT
   // (the JOIN is needed so the `ct.city_name LIKE ?` clause resolves).
@@ -162,7 +181,7 @@ async function listClients({ extraClauses = [], extraParams = [], includeInactiv
        FROM tbl_client cl
        LEFT JOIN tbl_city ct ON ct.city_id = cl.client_city_id
        ${where}
-       ORDER BY cl.client_name
+       ${orderBy}
        LIMIT ? OFFSET ?`,
     pageParams,
   );
@@ -786,6 +805,18 @@ async function updateCustomProperty(propId, body) {
   }
   if (sets.length === 0) {
     throw Object.assign(new Error('nothing to update'), { status: 400 });
+  }
+  // Reactivate on edit (2026-07-09): a legacy soft-deleted row (status=0)
+  // that gets edited in the CRM should become active again. Otherwise a
+  // property that reads c_prop_values='true' but is still status=0 is
+  // silently ignored by every status=1 opt-in check (magic-link sweep,
+  // auto-process-unconfirmed-order) — the exact Greensoul trap. The new
+  // backend never sets status=0 (delete is a hard DELETE), so forcing 1 on
+  // update only ever HEALS a legacy soft-delete; it never re-enables a value
+  // the operator turned off (that lives in c_prop_values, not status).
+  if (cols.hasStatus) {
+    sets.push('status = ?');
+    vals.push(1);
   }
   vals.push(propId);
   const [r] = await pool.query(

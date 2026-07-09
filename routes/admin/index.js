@@ -67,6 +67,10 @@ router.use('/webhooks',        require('./webhooks'));
 router.use('/quicksight',      require('./quicksight'));
 router.use('/maps',            require('./maps'));
 router.use('/finance',         require('./finance'));
+// Payout Requests — finance processor for technician wallet withdrawals
+// recorded by POST /api/mobile/withdraw. Gated Finance+Admin at the router
+// level; per-action FE gating via isPayoutRequestsView / isPayoutRequestsProcess.
+router.use('/withdrawals',     require('./withdrawals'));
 router.use('/advances',        require('./advances'));
 router.use('/clients',         require('./clients'));
 router.use('/customers',       require('./customers'));

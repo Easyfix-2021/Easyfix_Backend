@@ -56,6 +56,12 @@ function pct(v) {
   return Math.max(0, Math.min(100, Math.round(n)));
 }
 
+// Non-empty presence check for text-ish columns (Aadhaar/PAN numbers,
+// image keys, service category). Used by the Gate-1 + Gate-2 checklists.
+function present(v) {
+  return v != null && String(v).trim() !== '';
+}
+
 // ─── Identity + flags fetch ─────────────────────────────────────────
 async function fetchGateRow(efrId) {
   const [[row]] = await pool.query(
@@ -68,6 +74,7 @@ async function fetchGateRow(efrId) {
             e.is_personal_details_verified_by_crm,
             e.send_back_to_tx_reason_crm,
             e.adhaar_card_number,
+            e.pan_card_number,
             e.efr_service_type,
             e.efr_service_category,
             e.efr_cityId,
@@ -130,48 +137,46 @@ async function fetchTrainingCompletedTime(efrId) {
 
 /*
  * Derive the single onboarding status from the flags. Order matters —
- * earlier branches take precedence (mirrors the legacy stepper):
+ * earlier branches take precedence.
  *
- *   personal_pending      — technician hasn't submitted personal details
- *                           yet (is_personal_detail_filled = false).
- *   not_eligible          — CRM marked the lead denied
- *                           (personal_details_filled = 2).
- *   under_verification    — submitted, awaiting CRM lead-accept
- *                           (personal_details_filled NOT yet 1).
- *   rejected              — identity verification was rejected by CRM
+ * REDESIGN (2026-07): the old flow blocked the technician behind FOUR walls
+ * — under_verification (CRM lead-accept), in_progress (4-card profile),
+ * training_pending, verification_pending (CRM activation) — each a dead-end
+ * screen. The new model collapses these into ONE non-blocking in-app state
+ * and lets the technician reach the dashboard immediately after Gate 1, doing
+ * profile/training there while Ops verifies in the background. Job assignment
+ * stays gated on is_technician_verified (enforced in candidate-ranking +,
+ * now, the assign/offer/accept write endpoints), so letting an unverified
+ * tech into the app is safe — they simply can't be offered work yet.
+ *
+ * States:
+ *   not_eligible          — CRM explicitly denied the lead
+ *                           (personal_details_filled = 2). Terminal.
+ *   rejected              — identity rejected by CRM
  *                           (is_identity_details_verified_by_crm = 2);
- *                           rejectedReason carries the why.
- *   in_progress           — accepted lead, profile still incomplete
- *                           (profile % < 100).
- *   training_pending      — profile complete but the last training video
- *                           isn't finished.
- *   verification_pending  — everything submitted, awaiting final CRM
- *                           activation (is_technician_verified != 1).
- *   active                — fully onboarded AND CRM-activated: lead accepted
- *                           + profile 100% + training done + is_technician_
- *                           verified = 1. Checked LAST so a premature flag
- *                           can't bypass the profile-completion gate.
+ *                           rejectedReason carries the why. Tech resubmits.
+ *   personal_pending      — Gate 1 not yet complete: the merged registration
+ *                           screen (name + pincode + photo + Aadhaar) hasn't
+ *                           been submitted. Stays in the (registration) group.
+ *   pending_verification  — Gate 1 done, in the app, but not CRM-activated
+ *                           (is_technician_verified != 1). Dashboard is fully
+ *                           usable; jobs stay locked until verified. Replaces
+ *                           the old under_verification / in_progress /
+ *                           training_pending / verification_pending walls.
+ *   active                — CRM-activated (is_technician_verified = 1).
+ *                           Checked LAST so a premature flag can't skip Gate 1.
  */
 function deriveStatus(flags) {
   // Denied lead — terminal until CRM re-accepts.
   if (Number(flags.personalDetailsFilled) === 2) return 'not_eligible';
   // Identity rejected by CRM — show the reason, let the tech resubmit.
   if (Number(flags.identityVerifiedByCrm) === 2) return 'rejected';
-  // Hasn't even submitted the personal step.
-  if (!flags.isPersonalDetailFilled) return 'personal_pending';
-  // Submitted but lead not yet accepted by CRM (filled != 1) → Under Verification.
-  if (Number(flags.personalDetailsFilled) !== 1) return 'under_verification';
-  // Accepted lead, but profile still incomplete → Profile Progress (the 4 sections).
-  if (flags.profilePercentage < 100) return 'in_progress';
-  // Profile complete, training not finished.
-  if (!flags.trainingCompletedTime) return 'training_pending';
-  // Tech side fully done, but CRM hasn't activated yet → awaiting activation.
-  if (!flags.isTechnicianVerified) return 'verification_pending';
-  // Released into the app ONLY when verified AND profile-complete AND trained.
-  // is_technician_verified is checked LAST (not first) so a premature / out-of-
-  // order flag can never leak a half-onboarded tech straight into the app — this
-  // mirrors the legacy router, which only reaches the Dashboard from inside the
-  // lead-accepted branch after all prerequisites.
+  // Gate 1 incomplete (personal step + Aadhaar + photo) → merged reg screen.
+  if (!flags.gate1Complete) return 'personal_pending';
+  // Gate 1 done but CRM hasn't activated → in the app, unverified (non-blocking).
+  if (!flags.isTechnicianVerified) return 'pending_verification';
+  // CRM-activated. Verified is checked LAST so an out-of-order flag can never
+  // leak a tech past Gate 1 straight to active.
   return 'active';
 }
 
@@ -190,8 +195,23 @@ async function getStatus(efrId) {
     fetchTrainingCompletedTime(efrId),
   ]);
 
+  const aadhaarPresent = present(e.adhaar_card_number);
+  const photoPresent   = present(e.efr_profile_img);
+  const panPresent     = present(e.pan_card_number);
+  // "Has skills" = the tech declared at least a service category/type (the
+  // matching key candidate-ranking needs). Folded into the Gate-2 checklist,
+  // no longer a registration wall.
+  const hasSkills      = present(e.efr_service_category) || present(e.efr_service_type);
+  const isPersonalDetailFilled = bool(e.user_is_personal_detail_filled);
+  // Gate 1 = the merged registration screen: personal step submitted AND
+  // Aadhaar + photo on file. All three are written together by that screen;
+  // requiring all three defends against legacy rows that set the personal
+  // flag before Aadhaar/photo existed.
+  const gate1Complete  = isPersonalDetailFilled && aadhaarPresent && photoPresent;
+
   const flags = {
-    isPersonalDetailFilled:     bool(e.user_is_personal_detail_filled),
+    isPersonalDetailFilled,
+    gate1Complete,
     // Lead status as stored on tbl_user (0 new / 1 accepted / 2 denied).
     personalDetailsFilled:      e.user_personal_details_filled != null
       ? Number(e.user_personal_details_filled) : null,
@@ -200,16 +220,35 @@ async function getStatus(efrId) {
       ? Number(e.is_identity_details_verified_by_crm) : null,
     isReleased:                 bool(e.user_is_released),
     isTechnicianVerified:       bool(e.is_technician_verified),
+    aadhaarPresent,
+    photoPresent,
+    panPresent,
+    hasSkills,
     trainingCompletedTime,
     profilePercentage:          pct(e.efr_profile_perc),
   };
 
   const status = deriveStatus(flags);
 
-  logger.info('Returning registration status · status=' + status + ' profilePct=' + pct(e.efr_profile_perc));
+  // Gate 2 (earning) unlock: CRM-verified AND the tech has the full identity
+  // + skills + training the first job needs. Surfaced as a dashboard checklist
+  // so the tech sees exactly what's left; job offers stay locked until true.
+  const trainingComplete = !!trainingCompletedTime;
+  const jobsUnlocked = flags.isTechnicianVerified && panPresent && hasSkills && trainingComplete;
+
+  logger.info('Returning registration status · status=' + status + ' profilePct=' + pct(e.efr_profile_perc) + ' jobsUnlocked=' + jobsUnlocked);
 
   return {
     status,
+    verified:             flags.isTechnicianVerified,
+    jobsUnlocked,
+    // Gate-2 unlock checklist for the dashboard (all true ⇒ jobsUnlocked).
+    checklist: {
+      verified:         flags.isTechnicianVerified,
+      panPresent,
+      hasSkills,
+      trainingComplete,
+    },
     profilePercentage:    pct(e.efr_profile_perc),
     profileImageUrl:      profileImageUrl || null,
     // Only surface a rejection reason when the gate is actually rejected.
