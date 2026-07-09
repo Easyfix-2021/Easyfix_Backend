@@ -51,16 +51,36 @@ async function presignMediaKey(key) {
 }
 
 /**
- * Fixed customer-request reason lists.
+ * Customer-request reason lists — DYNAMIC from action_taken_reason.
  *
- * Frozen so the BE validation (routes/public/job-completion.js Joi
- * `valid(...)`) and the prefill payload (fetchPrefill returns these verbatim
- * so the FE dropdowns match the validator exactly) draw from a SINGLE source.
- * If ops want new reasons, edit here — the FE picks them up from the prefill
- * automatically and the validator accepts them in lockstep.
+ * Ops created dedicated magic-link customer action_types (2026-07-09):
+ *   action_type 39 = Cancel, 38 = Reschedule; both user_type = 2, status = 1.
+ * The prefill returns these lists AND the submit routes validate the chosen
+ * text against the SAME query (getCancelReasons / getRescheduleReasons), so
+ * the FE dropdown options and the server-side allowlist can never drift. The
+ * deprecated per-type tables (tbl_cancel_reason / reschedule_reason_app) are
+ * no longer used for the magic-link flow.
  */
-const CANCEL_REASONS     = Object.freeze(['Self Assembly', 'Product Returned / Damaged']);
-const RESCHEDULE_REASONS = Object.freeze(['Product Not Delivered', 'Site Not Ready']);
+const MAGIC_LINK_REASON = Object.freeze({ cancel: 39, reschedule: 38 });
+const MAGIC_LINK_REASON_USER_TYPE = 2;
+
+async function fetchReasonList(pool, actionType) {
+  try {
+    const [rows] = await pool.query(
+      `SELECT action_desc FROM action_taken_reason
+        WHERE action_type = ? AND user_type = ? AND status = 1
+        ORDER BY id ASC`,
+      [actionType, MAGIC_LINK_REASON_USER_TYPE],
+    );
+    return rows.map((r) => r.action_desc).filter(Boolean);
+  } catch (err) {
+    // Fail-soft: a reason-list read must never break the whole prefill page.
+    logger.warn('Magic-link reason list fetch failed · actionType=' + actionType + ' · ' + (err && err.message ? err.message : err));
+    return [];
+  }
+}
+async function getCancelReasons(pool)     { return fetchReasonList(pool, MAGIC_LINK_REASON.cancel); }
+async function getRescheduleReasons(pool) { return fetchReasonList(pool, MAGIC_LINK_REASON.reschedule); }
 
 /* ─── Client custom-property helpers (shared by prefill + submit) ─────────
  *
@@ -640,10 +660,11 @@ async function fetchPrefill(jobId, pool) {
       name:   row.owner_name || null,
       mobile: row.owner_mobile || null,
     },
-    // Fixed reason lists — same arrays the BE validates against, so the FE
-    // dropdowns match the validator exactly.
-    cancel_reasons:     CANCEL_REASONS,
-    reschedule_reasons: RESCHEDULE_REASONS,
+    // Reason lists — DB-driven from action_taken_reason (magic-link customer
+    // action_types 39=cancel, 38=reschedule, user_type=2). Same query the
+    // submit routes validate against, so options and allowlist can't drift.
+    cancel_reasons:     await getCancelReasons(pool),
+    reschedule_reasons: await getRescheduleReasons(pool),
     // Customer's OWN mobile, UNMASKED. It is the customer's own number on
     // their own order; the FE renders it read-only. (Distinct from the
     // masked `customer.mobile` kept below for back-compat.)
@@ -1513,7 +1534,7 @@ module.exports = {
   writeCustomerOrderDetails,
   resolveJobSpoc,
   orderStatusLabel,
-  CANCEL_REASONS,
-  RESCHEDULE_REASONS,
+  getCancelReasons,
+  getRescheduleReasons,
   TIME_SLOTS,
 };

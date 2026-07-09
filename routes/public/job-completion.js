@@ -503,7 +503,7 @@ function toMysqlDatetime(val) {
 
 // ─── POST /:token/cancel-request — log a customer cancel request ────
 // LOGS A REQUEST for ops. Does NOT change job_status (ops actions it later
-// in the CRM). Reason is constrained by Joi to CANCEL_REASONS.
+// in the CRM). Reason is validated against the live action_taken_reason list.
 router.post(
   '/:token/cancel-request',
   peekToken,
@@ -512,6 +512,13 @@ router.post(
   async (req, res, next) => {
     try {
       const jobId = await verify(req);
+      // Membership check — the Joi schema only guarantees a non-empty string;
+      // the reasons are now DB-driven (action_taken_reason action_type=39), so
+      // validate the submitted text against the live list here.
+      const validCancelReasons = await magicLinkService.getCancelReasons(pool);
+      if (!validCancelReasons.includes(req.body.reason)) {
+        throw Object.assign(new Error('Please select a valid cancellation reason.'), { status: 400 });
+      }
       logger.info('Log customer cancel request · jobId=' + jobId + ' · reason=' + req.body.reason);
       const [ins] = await pool.query(
         `INSERT INTO tbl_job_customer_request
@@ -554,6 +561,12 @@ router.post(
   async (req, res, next) => {
     try {
       const jobId = await verify(req);
+      // Membership check — reasons are DB-driven (action_taken_reason
+      // action_type=38); the Joi schema only checks it's a non-empty string.
+      const validReschedReasons = await magicLinkService.getRescheduleReasons(pool);
+      if (!validReschedReasons.includes(req.body.reason)) {
+        throw Object.assign(new Error('Please select a valid reschedule reason.'), { status: 400 });
+      }
       logger.info('Log customer reschedule request · jobId=' + jobId + ' · reason=' + req.body.reason);
       const preferred = toMysqlDatetime(req.body.preferred_datetime);
       const [ins] = await pool.query(

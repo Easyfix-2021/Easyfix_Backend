@@ -22,20 +22,17 @@
  */
 
 const Joi = require('joi');
-const {
-  CANCEL_REASONS,
-  RESCHEDULE_REASONS,
-} = require('../services/job-magic-link.service');
 
 const intId = Joi.number().integer().positive();
 
 /*
  * Customer cancel / reschedule request bodies.
  *
- * `reason` is constrained to the SAME frozen lists the prefill returns
- * (services/job-magic-link.service.js) so the FE dropdown options and the
- * server-side allowlist can never drift. `remarks` is an optional free-text
- * note (capped at 1000 chars to bound storage / abuse).
+ * `reason` is a free string here; the ROUTE validates it against the LIVE
+ * action_taken_reason list (magic-link action_types 39=cancel, 38=reschedule)
+ * — Joi can't see the DB at schema-build time, so that membership check lives
+ * in routes/public/job-completion.js. `remarks` is an optional free-text note
+ * (capped at 1000 chars to bound storage / abuse).
  *
  * `preferred_datetime` (reschedule only) accepts BOTH ISO-8601 and the
  * legacy "YYYY-MM-DD HH:mm" shape the FE date-picker emits — Joi.date()
@@ -43,12 +40,12 @@ const intId = Joi.number().integer().positive();
  * a MySQL DATETIME. Absent → stored as NULL.
  */
 const cancelRequestBody = Joi.object({
-  reason: Joi.string().valid(...CANCEL_REASONS).required(),
+  reason: Joi.string().trim().min(1).max(200).required(),
   remarks: Joi.string().trim().max(1000).allow('').optional(),
 });
 
 const rescheduleRequestBody = Joi.object({
-  reason: Joi.string().valid(...RESCHEDULE_REASONS).required(),
+  reason: Joi.string().trim().min(1).max(200).required(),
   remarks: Joi.string().trim().max(1000).allow('').optional(),
   // Accept ISO-8601 OR the legacy "YYYY-MM-DD HH:mm" string. Joi.date().iso()
   // covers the ISO case; the string pattern covers the space-separated legacy
