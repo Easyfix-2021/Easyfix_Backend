@@ -73,6 +73,12 @@ app.get('/api/openapi.json', swaggerDocs.jsonSpecHandler);
 // authed routes aggregator.
 app.use('/api/public', require('./routes/public'));
 
+// Internal router — machine-to-machine only (currently the legacy Java CRM's
+// /resolveJobImage action). Auth is a shared secret header per-endpoint, NOT a
+// JWT. Mounted here — a sibling of /api/public, ahead of the /api aggregator —
+// so no requireAuth / maskMobile middleware wraps it.
+app.use('/api/internal', require('./routes/internal'));
+
 app.use('/api', routes);
 
 // Public URL shortener redirect — `GET /book/:code` → 302 to the long URL.
