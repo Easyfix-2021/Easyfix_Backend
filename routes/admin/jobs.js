@@ -7,7 +7,7 @@ const jobLocation = require('../../services/job-location.service');
 const { modernOk, modernError } = require('../../utils/response');
 const logger = require('../../logger');
 const {
-  listQuery, createBody, updateBody, statusBody, assignBody, offerBody, ownerBody, idParam,
+  listQuery, createBody, updateBody, statusBody, assignBody, offerBody, ownerBody, rescheduleBody, idParam,
   candidatesQuery, candidatesSearchQuery,
 } = require('../../validators/job.validator');
 const { assertEntityInScope } = require('../../lib/scope');
@@ -87,6 +87,11 @@ router.get('/:id/candidates',
     try {
       const { limit, jobDate, timeSlot } = req.query;
       logger.info('Rank candidates for job · jobId=' + req.params.id + ' limit=' + limit + ' jobDate=' + (jobDate || '-') + ' timeSlot=' + (timeSlot || '-'));
+      // Lazy offer-expiry (job-scoped) BEFORE ranking. l1Eligibility EXCLUDES techs
+      // with an OPEN offer, so a >30-min stale offer (cron off / between ticks)
+      // would wrongly keep an already-re-offerable tech OUT of the pool. Expiring
+      // first (0→3) lets them re-rank. undefined = default 30-min TTL. Idempotent.
+      await job.expireStaleOffers(undefined, Number(req.params.id));
       const result = await candidateRanking.rankCandidatesForJob(req.params.id, {
         limit,
         // jobDate is a validated IST wall-clock string — pass it through
@@ -142,6 +147,10 @@ router.get('/:id/candidates/search',
     try {
       const { term, limit, jobDate, timeSlot } = req.query;
       logger.info('Search technicians for job · jobId=' + req.params.id + ' term="' + (term || '') + '" limit=' + limit);
+      // Lazy offer-expiry (job-scoped) so search reflects the same fresh offer
+      // state as the ranked list (see the /candidates note). Idempotent no-op when
+      // nothing is stale / the offer table is absent.
+      await job.expireStaleOffers(undefined, Number(req.params.id));
       const result = await candidateRanking.searchTechniciansForJob(req.params.id, {
         term,
         limit,
@@ -1100,6 +1109,39 @@ router.get('/action-reasons', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+/*
+ * GET /api/admin/jobs/reschedule-reasons
+ *
+ * Reason list for the Schedule & Assign → Reschedule dialog. Returns the same
+ * `{ id, label }[]` shape as /action-reasons so the CRM renders it identically.
+ *
+ * Source: action_taken_reason, action_type = 8 (the CRM "Reschedule" bucket —
+ * seeded by migrations/2026-07-10-seed-reschedule-reasons-action-type-8.sql).
+ * UNLIKE /action-reasons this deliberately does NOT filter by user_type — the
+ * Reschedule dialog has a single reason dropdown (no "due to" Customer/Client/
+ * EasyFix/Technician radio), so ALL active action_type=8 reasons are offered.
+ *
+ * Literal-segment route — declared before the `/:id` wildcard (same reason as
+ * /action-reasons above, so Express doesn't try to parse "reschedule-reasons"
+ * as a numeric job id).
+ */
+router.get('/reschedule-reasons', async (_req, res, next) => {
+  try {
+    logger.info('Fetch reschedule reasons (Schedule & Assign)');
+    const [reasonRows] = await pool.query(
+      `SELECT id, action_desc FROM action_taken_reason
+        WHERE action_type = ? AND (status IS NULL OR status = 1)
+        ORDER BY id ASC`,
+      [8],
+    );
+    const items = reasonRows
+      .map((r) => ({ id: r.id, label: String(r.action_desc || '').trim() }))
+      .filter((x) => x.label);
+    logger.info('Returning ' + items.length + ' reschedule reasons');
+    modernOk(res, items);
+  } catch (e) { next(e); }
+});
+
 router.get('/:id', validate(idParam, 'params'), scopedJob, async (req, res) => {
   logger.info('Fetch job detail · jobId=' + req.params.id);
   modernOk(res, req.scopedJob);
@@ -1215,6 +1257,29 @@ router.patch('/:id/assign', validate(idParam, 'params'), validate(assignBody), s
     logger.info('Technician assigned · jobId=' + req.params.id);
     modernOk(res, updated, 'technician assigned');
   } catch (e) { next(e); }
+});
+
+/*
+ * PATCH /api/admin/jobs/:id/reschedule
+ *
+ * Explicit, audited reschedule from the Schedule & Assign modal — its Date/Time
+ * fields are read-only, so this is the ONLY way to move the appointment.
+ * Persists the new requested_date_time + the two derived slot columns, logs
+ * reason + remarks to scheduling_history and tbl_job_comment, and expires any
+ * open offers (made for the old slot). Reason + remarks are mandatory
+ * (rescheduleBody). Literal second segment "reschedule" disambiguates from the
+ * `/:id` wildcard.
+ */
+router.patch('/:id/reschedule', validate(idParam, 'params'), validate(rescheduleBody), scopedJob, async (req, res, next) => {
+  try {
+    logger.info('Reschedule job · jobId=' + req.params.id + ' reasonId=' + (req.body?.reasonId ?? '-'));
+    const updated = await job.reschedule(Number(req.params.id), req.body, req.user);
+    logger.info('Job rescheduled · jobId=' + req.params.id);
+    modernOk(res, updated, 'job rescheduled');
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
 });
 
 /*

@@ -372,9 +372,25 @@ const ownerBody = Joi.object({
   reason: Joi.string().min(3).max(500).required(),
 });
 
+/*
+ * Reschedule body — PATCH /:id/reschedule. The Schedule & Assign modal locks the
+ * job's Date/Time and changes them ONLY via the explicit Reschedule dialog, where
+ * reason + remarks are MANDATORY (audited to scheduling_history + a job comment).
+ * All three fields required. `requestedDateTime` is an IST WALL-CLOCK string
+ * exactly like assignBody's (never Joi.date() — see that note). `rescheduleReason`
+ * is the selected reason's label (mirrored into scheduling_history.reschedule_reason
+ * alongside `reasonId`).
+ */
+const rescheduleBody = Joi.object({
+  requestedDateTime: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$/).max(40).required(),
+  reasonId: intId.required(),
+  rescheduleReason: Joi.string().max(500).optional(),
+  remarks: Joi.string().trim().min(1).max(500).required(),
+});
+
 const idParam = Joi.object({ id: intId.required() });
 
 module.exports = {
   listQuery, createBody, updateBody, statusBody, assignBody, offerBody, ownerBody, idParam,
-  candidatesQuery, candidatesSearchQuery,
+  rescheduleBody, candidatesQuery, candidatesSearchQuery,
 };

@@ -74,16 +74,26 @@ const { OFFER_STATUS } = require('./offer-status');
  * EXPIRED). Reuses acceptOffer()'s exact expire shape (status=3 + responded_at).
  * Touches ONLY tbl_job_offer — the job legitimately stays BOOKED/owner-less
  * (fk_easyfixter_id NULL) so it remains re-offerable. Tolerant of a missing
- * table (no-op on un-migrated deploys). Driven by the every-2-min scheduler cron.
+ * table (no-op on un-migrated deploys).
+ *
+ * Two callers:
+ *   • the every-2-min scheduler cron — no jobId, a global sweep.
+ *   • listOffers() — passes jobId for a lazy, on-read, job-scoped sweep so the
+ *     30-min TTL is honoured in the CRM even when the cron is disabled
+ *     (CRON_DISABLED) or a tech's offer crosses 30 min between ticks. The UPDATE
+ *     is idempotent, so the two paths can never double-expire.
  */
-async function expireStaleOffers(maxAgeMinutes = OFFER_TTL_MINUTES) {
+async function expireStaleOffers(maxAgeMinutes = OFFER_TTL_MINUTES, jobId = null) {
   if (!(await jobOfferTableExists())) return { skipped: true, expired: 0 };
+  const params = [maxAgeMinutes];
+  let jobClause = '';
+  if (jobId != null) { jobClause = ' AND job_id = ?'; params.push(Number(jobId)); }
   const [r] = await pool.query(
     `UPDATE tbl_job_offer
         SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
       WHERE offer_status = ${OFFER_STATUS.OFFERED}
-        AND offered_at < NOW() - INTERVAL ? MINUTE`,
-    [maxAgeMinutes],
+        AND offered_at < NOW() - INTERVAL ? MINUTE${jobClause}`,
+    params,
   );
   return { expired: r.affectedRows || 0 };
 }
@@ -3560,19 +3570,138 @@ async function rejectOffer(jobId, efrId, { reason, reasonId } = {}) {
  * Each row: { efr_id, efr_name, offered_at }.
  */
 async function listOffers(jobId) {
-  logger.info('List open offers for job · id=' + jobId);
+  logger.info('List offers for job · id=' + jobId);
   if (!(await jobOfferTableExists())) return [];
+  // Lazy expiry: sweep THIS job's stale open offers before reading, so an offer
+  // older than 30 min surfaces as EXPIRED even when the scheduler cron is off
+  // (CRON_DISABLED) or between its 2-min ticks. Idempotent + job-scoped.
+  await expireStaleOffers(OFFER_TTL_MINUTES, jobId);
+  // Latest offer row PER technician — a re-offer can leave more than one row for
+  // the same (job, tech), so MAX(job_offer_id) picks the current one. Surfaced
+  // states: OFFERED (live), REJECTED, EXPIRED — the Schedule & Assign modal shows
+  // all three so ops can see who declined / timed out, not just live offers.
+  // ACCEPTED is excluded (that job is already assigned and leaves this modal).
+  // Order: live → rejected → expired, newest-first within each bucket.
   const [rows] = await pool.query(
-    `SELECT jo.fk_easyfixter_id AS efr_id, ef.efr_name, jo.offered_at,
-            jo.offer_status_label, jo.offer_count, jo.offer_source
+    `SELECT jo.fk_easyfixter_id AS efr_id, ef.efr_name, jo.offered_at, jo.responded_at,
+            jo.offer_status, jo.offer_status_label, jo.offer_count, jo.offer_source,
+            jo.reject_reason
        FROM tbl_job_offer jo
+       JOIN (SELECT fk_easyfixter_id, MAX(job_offer_id) AS mid
+               FROM tbl_job_offer
+              WHERE job_id = ?
+              GROUP BY fk_easyfixter_id) latest ON latest.mid = jo.job_offer_id
        JOIN tbl_easyfixer ef ON ef.efr_id = jo.fk_easyfixter_id
-      WHERE jo.job_id = ? AND jo.offer_status = ${OFFER_STATUS.OFFERED}
-      ORDER BY jo.offered_at DESC`,
+      WHERE jo.offer_status IN (${OFFER_STATUS.OFFERED}, ${OFFER_STATUS.REJECTED}, ${OFFER_STATUS.EXPIRED})
+      ORDER BY FIELD(jo.offer_status, ${OFFER_STATUS.OFFERED}, ${OFFER_STATUS.REJECTED}, ${OFFER_STATUS.EXPIRED}),
+               jo.offered_at DESC`,
     [jobId],
   );
-  logger.info('Found ' + rows.length + ' open offers · jobId=' + jobId);
+  logger.info('Found ' + rows.length + ' offers (live+rejected+expired) · jobId=' + jobId);
   return rows;
+}
+
+// ─── Reschedule a job's appointment (Schedule & Assign → Reschedule) ─
+/*
+ * Explicit, audited reschedule. Distinct from assign(): it changes ONLY the
+ * appointment (requested_date_time + the two derived slot columns) — never the
+ * technician — and ALWAYS captures reason + remarks. The modal's Date/Time
+ * fields are read-only; this is the sole path that moves them. All three inputs
+ * are mandatory (rescheduleBody validates at the route). Transactional:
+ *   1. tbl_job.requested_date_time / time_slot / booking_cut_off_time_slot
+ *   2. scheduling_history (reason_id + reschedule_reason) — same shape as assign
+ *   3. any OPEN offers on this job → EXPIRED (they were made for the OLD slot,
+ *      so a tech must not be able to accept a now-stale appointment)
+ * Then a tbl_job_comment audit row (comment_on=1, enum_reason_id, remarks) is
+ * added outside the txn (addComment also mirrors to tbl_job.remarks). Returns
+ * the refreshed job detail.
+ */
+async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason, remarks }, actor) {
+  logger.info('Reschedule job · id=' + jobId + ' · reasonId=' + reasonId);
+  const [[existing]] = await pool.query(
+    'SELECT job_id, fk_easyfixter_id FROM tbl_job WHERE job_id = ? LIMIT 1',
+    [jobId],
+  );
+  if (!existing) { const err = new Error('job not found'); err.status = 404; throw err; }
+
+  // Parse the IST wall-clock string exactly like assign() — NEVER new Date()/
+  // toISOString() it (UTC↔IST day shift). Produces 'YYYY-MM-DD HH:MM:SS'.
+  const m = String(requestedDateTime).match(/^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2})(:\d{2})?)?$/);
+  if (!m) { const err = new Error('requestedDateTime is not a valid date'); err.status = 400; throw err; }
+  const newRequested = `${m[1]} ${m[2] ? `${m[2]}${m[3] || ':00'}` : '00:00:00'}`;
+  // Re-derive both slot columns from the new appointment time so time_slot and
+  // booking_cut_off_time_slot stay coherent with requested_date_time.
+  const newTimeSlot = deriveTimeSlot(newRequested);
+  const newCutoffSlot = deriveBookingCutoffSlot(newRequested);
+
+  // Atomic core: the schedule move + offer-expiry must commit together (an
+  // outstanding offer must never survive with the OLD slot). The audit rows
+  // (scheduling_history + comment) are best-effort AFTER commit so a legacy
+  // constraint can't fail the whole reschedule — critically, this flow runs on
+  // UNASSIGNED jobs (fk_easyfixter_id NULL), and if scheduling_history.easyfixer_id
+  // is legacy NOT NULL that insert would otherwise abort the whole operation.
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.query(
+      `UPDATE tbl_job
+          SET requested_date_time       = ?,
+              time_slot                 = COALESCE(?, time_slot),
+              booking_cut_off_time_slot = COALESCE(?, booking_cut_off_time_slot),
+              last_update_time          = ?
+        WHERE job_id = ?`,
+      [newRequested, newTimeSlot, newCutoffSlot, new Date(), jobId],
+    );
+    // Open offers were extended for the OLD slot — expire them so no tech accepts
+    // a stale appointment. Tolerant of a missing offer table (un-migrated deploys).
+    if (await jobOfferTableExists()) {
+      await conn.query(
+        `UPDATE tbl_job_offer
+            SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
+          WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
+        [jobId],
+      );
+    }
+    await conn.commit();
+    logger.info('Job rescheduled · id=' + jobId + ' · newTime=' + newRequested);
+  } catch (e) {
+    await conn.rollback();
+    logger.error('Reschedule failed, rolled back · id=' + jobId + ' · ' + e.message);
+    throw e;
+  } finally {
+    conn.release();
+  }
+
+  // Audit (best-effort, post-commit). scheduling_history mirrors assign()'s shape
+  // (reason_id + reschedule_reason label); easyfixer_id may be NULL on an
+  // unassigned job. schedule_time = the NEW promised time.
+  try {
+    await pool.query(
+      `INSERT INTO scheduling_history (job_id, easyfixer_id, schedule_time, reason_id, reschedule_reason)
+       VALUES (?, ?, ?, ?, ?)`,
+      [jobId, existing.fk_easyfixter_id || null, newRequested, reasonId || null, rescheduleReason || null],
+    );
+  } catch (e) {
+    logger.warn('Reschedule scheduling_history insert failed (non-fatal) · id=' + jobId + ' · ' + e.message);
+  }
+
+  // Comment audit — addComment uses the pool + mirrors the latest remark to
+  // tbl_job.remarks. comment_on=1 (lifecycle/schedule), reason FK in enum_reason_id,
+  // new promised time in appointment_on, actor = CRM user.
+  try {
+    await require('./job-comment.service').addComment(jobId, {
+      comments: remarks,
+      comment_on: 1,
+      commented_by: actor?.user_id || null,
+      appointment_on: newRequested,
+      enum_reason_id: reasonId || null,
+    });
+  } catch (e) {
+    logger.warn('Reschedule audit comment failed (non-fatal) · id=' + jobId + ' · ' + e.message);
+  }
+
+  fireWebhook('RescheduleTech', jobId);
+  return getById(jobId);
 }
 
 // ─── A technician's open offers (mobile "Offered to you" list) ──────
@@ -3850,7 +3979,7 @@ module.exports = {
   // tbl_job.client_services CSV in sync after the customer's self-submit
   // mutates tbl_job_services. Single source of truth, one helper.
   recomputeClientServicesCsv,
-  list, getById, getByIdCore, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, unassign, acceptOffer, changeOwner,
+  list, getById, getByIdCore, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, reschedule, unassign, acceptOffer, changeOwner,
   // THE OFFER MODEL (pool offers): offer one job to many techs, list a job's
   // open offers, and list a tech's open offers.
   offerToTechnicians, listOffers, listOfferedForTech, techHasOpenOffer, rejectOffer,

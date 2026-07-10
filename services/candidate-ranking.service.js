@@ -1139,6 +1139,10 @@ async function rankCandidatesForJob(jobId, {
     payment_mode:      paidByLabel(job.paid_by),
     requested_date_time: job.requested_date_time ?? null,
     time_slot:         job.time_slot        ?? null,
+    // The legacy "H AM - H PM" cut-off window — the Schedule & Assign modal shows
+    // THIS as the read-only Time Slot (the customer's booked slot), not a
+    // client-derived label. Reschedule re-derives it BE-side from the new time.
+    booking_cut_off_time_slot: job.booking_cut_off_time_slot ?? null,
     job_desc:          job.job_desc         ?? null,
     paid_by:           job.paid_by          ?? null,
     paid_by_label:     paidByLabel(job.paid_by),
@@ -1551,6 +1555,7 @@ async function searchJobHeader(job) {
     payment_mode:      paidByLabel(job.paid_by),
     requested_date_time: job.requested_date_time ?? null,
     time_slot:         job.time_slot        ?? null,
+    booking_cut_off_time_slot: job.booking_cut_off_time_slot ?? null,
     job_desc:          job.job_desc         ?? null,
     paid_by:           job.paid_by          ?? null,
     paid_by_label:     paidByLabel(job.paid_by),
