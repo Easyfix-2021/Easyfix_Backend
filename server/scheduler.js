@@ -487,6 +487,44 @@ Why this matters: without this, a job offered to technicians who never respond w
     offerExpiryJob.skipReason = 'CRON_DISABLED=true';
   }
 
+  // ─── Call-recording backfill — every 15 min ──────────────────────────
+  // (Added 2026-07-10) The Plivo PUSH recording callback (<Dial
+  // recordingCallbackUrl>) has proven unreliable — tbl_plivo_call_log.recording_url
+  // was never populated by it. This PULLS missing recordings from the Plivo
+  // Recording API (by call_uuid) and persists them, so recording_url stays
+  // populated for the "Missing Call Recordings" report + downstream transcription
+  // without depending on the push. No-op when there's nothing missing / columns
+  // absent. No property gate (one bounded sweep; safe).
+  const recordingBackfillSvc = require('../services/recording-backfill.service');
+  const recordingBackfillJob = registerJob({
+    id: 'recording-backfill',
+    name: 'Call-Recording Backfill',
+    description:
+`What this task does: When the CRM records a call, the recording URL is supposed to be pushed back by the phone provider (Plivo). That push has been unreliable, so this task fills the gap. Step by step:
+  1. Every 15 minutes, the task wakes up automatically.
+  2. It finds recorded calls that are still missing their recording URL.
+  3. For each, it asks Plivo directly for the recording and saves the URL.
+  4. It logs how many it recovered — visible in the server logs and on this page.
+
+Why this matters: without this, recorded calls would show no recording in the CRM and would be missed by the "Missing Call Recordings" report and by call-quality transcription, even though Plivo has the audio.`,
+    cron: '*/15 * * * *',
+    runner: async () => {
+      const result = await recordingBackfillSvc.backfillMissingRecordings({ limit: 100 });
+      logger.info(`Recording-backfill cron · recovered=${result.recovered} scanned=${result.scanned}` + (result.skipped ? ' (skipped: columns absent)' : ''));
+      return result;
+    },
+  });
+  if (!cronDisabled) {
+    recordingBackfillJob.task = cron.schedule(
+      recordingBackfillJob.cron,
+      () => invokeJob(recordingBackfillJob, 'cron'),
+      { timezone: TZ },
+    );
+    recordingBackfillJob.registered = true;
+  } else {
+    recordingBackfillJob.skipReason = 'CRON_DISABLED=true';
+  }
+
   // ─── Attendance reminder — daily at 9:00 IST ─────────────────────────
   // (Added 2026-06-28) Pushes a "mark your attendance" FCM reminder to every
   // active + verified technician who has NOT marked attendance for TODAY (IST).
