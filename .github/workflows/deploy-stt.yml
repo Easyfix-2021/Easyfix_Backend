@@ -205,7 +205,7 @@ jobs:
           # self-measures with zero hardcoding — resize the box, redeploy, done.
           TOTAL_MB=\$(free -m | awk '/^Mem:/{print \$2}')
           if [[ -z "\$TOTAL_MB" || "\$TOTAL_MB" -le 0 ]]; then
-            echo "⚠ could not read host RAM — falling back to \${STT_MEM_MAX_MB:-1536}m cap"
+            echo "⚠ could not read host RAM — falling back to ${STT_MEM_MAX_MB}m cap"
             CAP_MB=$STT_MEM_MAX_MB
           else
             CAP_MB=\$(( TOTAL_MB * $STT_MEM_PERCENT / 100 ))

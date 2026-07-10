@@ -61,7 +61,10 @@ router.post('/', async (req, res) => {
     return modernOk(res, { received: true, alerted: false, reason: 'cooldown' });
   }
 
-  // Fresh read (await ensures the property cache is warm even right after boot).
+  // Ensure the property cache is warm (no-op if already loaded). NOTE: this does NOT
+  // force a DB refresh — recipients added after boot propagate within the
+  // easyfix_properties TTL (~1h) or on the next restart. Enabling alerting requires
+  // setting STT_OOM_WEBHOOK_KEY (a redeploy), which reloads the cache fresh anyway.
   await properties.getAllProperties();
   const recipients = [...properties.parseEmailAllowlist('teleprompter.stt.alert.emails')];
   if (!recipients.length) {
@@ -69,7 +72,6 @@ router.post('/', async (req, res) => {
     return modernOk(res, { received: true, alerted: false, reason: 'no-recipients' });
   }
 
-  _lastAlertAt.set(container, now);
   const envLabel = process.env.DEPLOY_ENV || process.env.NODE_ENV || 'unknown';
   const when = istNow();
   const cap = process.env.STT_MEM_LIMIT || 'see STT_MEM_* deploy vars';
@@ -94,6 +96,14 @@ router.post('/', async (req, res) => {
 
   try {
     const r = await email.send({ to: recipients, subject, html, category: 'transactional' });
+    // Arm the per-container cooldown ONLY on a confirmed send. email.send() returns
+    // {delivered:false} (it never throws) on a Graph outage — leaving the cooldown
+    // UNARMED so the next OOM event in a crash-loop retries instead of being suppressed.
+    if (r.delivered === true) {
+      _lastAlertAt.set(container, now);
+    } else {
+      logger.warn(`STT OOM alert not delivered — cooldown NOT armed, will retry · ${r.error || 'unknown'}`);
+    }
     return modernOk(res, { received: true, alerted: r.delivered === true, delivery: r });
   } catch (err) {
     logger.error(`STT OOM alert email failed · ${err.message}`);

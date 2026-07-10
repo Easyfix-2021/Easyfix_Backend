@@ -144,21 +144,29 @@ Env: `STT_SERVICE_URL` (sidecar ws URL), `SOPHY_API_KEY_TELEPROMPTER` (falls bac
     (`STT_MEM_PERCENT` / `STT_MEM_MIN_MB` / `STT_MEM_MAX_MB`) — bump `STT_MEM_MAX_MB` if you swap to a bigger
     Whisper model. The clamps (not the %) are what protect co-tenants: the `small` model's footprint is fixed
     (~1 GB), so a raw % of a large box would over-allocate memory STT can't use.
-  - **OOM priority — STT can die, the backend never does.** Two layers. (1) *Airtight:* STT's own `mem_limit`
-    means an OOM inside STT is **cgroup-scoped** — the kernel kills a process in STT's cgroup, it cannot reach
-    the backend. (2) *Global-pressure backstop:* `oom_score_adj` — `stt: 1000` (first victim), `backend: -1000`
-    (last thing the kernel will ever kill) — so even if the whole box exhausts RAM, STT is chosen over the
-    backend. (Caveat: `-1000` means the backend is effectively unkillable by the OOM-killer; if the backend
-    itself were the runaway with everything else already dead, the box could stall — relax to `-900` if you
-    want a last-resort sliver.)
+  - **OOM priority — STT dies before the backend.** Two layers. (1) *Airtight:* STT's own `mem_limit` means an
+    OOM inside STT is **cgroup-scoped** — the kernel kills a process in STT's cgroup, it cannot reach the
+    backend. (2) *Global-pressure backstop:* `oom_score_adj` — `stt: 1000` (first victim), `backend: -500` (last
+    **container** the kernel picks) — so if the whole box exhausts RAM, STT is chosen over the backend. We use
+    **-500, not the -1000 floor**: at -1000 the backend is effectively unkillable, so a *backend-originated*
+    leak would make the kernel kill `sshd`/`ssm-agent` first and leave the box unrecoverable (no way in to
+    deploy a fix). -500 still deprioritizes the backend below every other container while letting the kernel
+    reclaim it before a total stall. The only way to fully shield the management plane from a backend leak is
+    to also cap the backend's memory (deliberately not done — the backend is left unbounded by design).
   - **OOM alerting (email).** A tiny `stt-oom-watch` sidecar (Docker socket mounted **read-only** — same trust
     model as Dozzle) watches `easyfix-stt` for an `oom` event (or a `die` with `State.OOMKilled=true`) and POSTs
     `POST /api/webhook/stt-oom` on the backend. The webhook (auth: shared `STT_OOM_WEBHOOK_KEY` header, injected
     into both containers from `/opt/easyfix/.env`) emails the recipients in
     `easyfix_properties('teleprompter.stt.alert.emails')` via Microsoft Graph (`services/email.service`),
     rate-limited per container (10-min cooldown). **Inert by default:** unset key **or** empty recipients ⇒
-    silent no-op, so it's additive and flag-off-safe. **Provision:** add `STT_OOM_WEBHOOK_KEY=<random>` to
-    `/opt/easyfix/.env` and set the recipients property.
+    silent no-op. **Provision:** add `STT_OOM_WEBHOOK_KEY=<random>` to `/opt/easyfix/.env` (NOT `backend.env` —
+    the compose `environment:` block overrides `env_file`) and set the recipients property.
+  - **Flag scope (honest statement).** `teleprompter.enabled` gates all *request-path* behavior (guided calls,
+    the `<Stream>` fork, admin routes, alert emails). It does **not** gate container residency: once the STT
+    image is deployed, `stt` (~0.5–1 GB resident for the model) and `stt-oom-watch` run 24/7 regardless of the
+    flag. They are fenced (`mem_limit` + `oom_score_adj`) so they can't harm the backend, but "flag off ⇒ zero
+    new processes" holds only until you deploy the STT image. To make the sidecars themselves flag-gated, put
+    them behind a Compose `profiles:` and enable that profile only when the teleprompter is on.
 
 Flip live with `setProperty` (no redeploy). FE flag delivered via `GET /admin/access/features`
 → `canRunTeleprompter`.

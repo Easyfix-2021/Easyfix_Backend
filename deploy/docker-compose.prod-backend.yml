@@ -31,11 +31,14 @@ services:
     image: ${BACKEND_IMAGE}
     container_name: easyfix-backend
     restart: unless-stopped
-    # OOM priority — PROTECT the backend. If the box ever hits a GLOBAL
-    # out-of-memory, -1000 makes the backend the last thing the kernel will kill,
-    # so STT (oom_score_adj 1000) dies first. The airtight guarantee is already
-    # STT's own mem_limit (cgroup-scoped OOM); this is the global-pressure backstop.
-    oom_score_adj: -1000
+    # OOM priority — DEPRIORITIZE the backend under GLOBAL memory pressure so STT
+    # (oom_score_adj 1000) is killed first. We use -500, NOT the -1000 floor: at
+    # -1000 the backend is effectively unkillable, so a backend-originated leak would
+    # force the kernel to kill sshd / ssm-agent first and leave the box unrecoverable.
+    # -500 keeps the backend the last CONTAINER the kernel picks while still allowing
+    # reclaim before a total stall. The airtight guarantee that STT can't touch the
+    # backend is STT's own mem_limit (cgroup-scoped); this is the global backstop only.
+    oom_score_adj: -500
     env_file:
       # Real secrets live HERE on the host filesystem (chmod 600).
       # Managed via deploy/bootstrap-env.sh — never in any image, never
@@ -46,14 +49,18 @@ services:
       # Point the relay at it; keep the in-process autostart OFF (no double spawn).
       STT_SERVICE_URL: "ws://stt:8300/stt"
       STT_AUTOSTART: "false"
-      # Shared key for the STT OOM-alert webhook (also given to stt-oom-watch);
-      # sourced from /opt/easyfix/.env. Unset ⇒ OOM alerting is off (no-op).
+      # Shared key for the STT OOM-alert webhook (also given to stt-oom-watch).
+      # MUST be set in /opt/easyfix/.env (NOT backend.env — this environment: block
+      # overrides env_file, so a backend.env value would be clobbered to ''). Unset
+      # ⇒ OOM alerting is off (no-op).
       STT_OOM_WEBHOOK_KEY: ${STT_OOM_WEBHOOK_KEY:-}
       # Human label for the alert email (QA vs Production).
       DEPLOY_ENV: "production"
-    depends_on:
-      stt:
-        condition: service_started
+    # No depends_on: stt — the backend connects to STT lazily per-call and the
+    # mandatory-STT gate returns 409 when it's down, so the backend must NOT be
+    # coupled to the stt service. Coupling here would also hard-fail a first-boot
+    # backend deploy on a box where STT_IMAGE isn't in .env yet (compose would try
+    # to create stt with an empty image and abort the whole `up`).
     ports:
       - "5100:5100"
     networks:
