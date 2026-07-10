@@ -8,6 +8,7 @@ const plivo = require('../../services/plivo.service');
 const voice = require('../../services/voice.service');
 const plivoLog = require('../../services/plivo-call-log.service');
 const callAnalysis = require('../../services/call-analysis.service');
+const callerScorecard = require('../../services/caller-scorecard.service');
 const propertiesSvc = require('../../services/properties.service');
 const { requirePropertyAllowlist } = require('../../middleware/require-property-allowlist');
 const { FEATURES } = require('../../services/feature-access.service');
@@ -550,7 +551,9 @@ router.post('/web-start', requireClickToCallAction, validate(clickToCallBody), a
 
     // Opaque, one-time id the browser dials; the answer route maps it → number.
     // In QA this is the TEST number; the audit row above kept the real customer.
-    const dialId = plivo.stashWebDial({ number: dialNumber, jci });
+    // teleprompterSessionId (optional) rides along so web-answer can fork the call
+    // audio to STT for a guided teleprompter call (additive; null ⇒ normal call).
+    const dialId = plivo.stashWebDial({ number: dialNumber, jci, teleprompterSessionId: req.body.teleprompterSessionId || null });
 
     // Dedicated Plivo call log (fail-soft) — for Plivo-only reconciliation.
     await plivoLog.record({
@@ -1044,8 +1047,9 @@ async function resolveJobParties(jobId) {
 // ─── GET / — paginated call history ───────────────────────────────────
 router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
   try {
-    const { jobId, customerId, dateFrom, dateTo, mobile, page, limit } = req.query;
-    logger.info('List call history · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · mobile=' + (mobile ? '***' : '—') + ' · from=' + (dateFrom || '—') + ' · to=' + (dateTo || '—') + ' · page=' + page + ' · limit=' + limit);
+    const { jobId, customerId, dateFrom, dateTo, mobile, flow, callerId, minScore, page, limit } = req.query;
+    const hasAnalysisFilter = /^(true|1)$/i.test(String(req.query.hasAnalysis || ''));
+    logger.info('List call history · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · mobile=' + (mobile ? '***' : '—') + ' · flow=' + (flow || '—') + ' · callerId=' + (callerId ?? '—') + ' · from=' + (dateFrom || '—') + ' · to=' + (dateTo || '—') + ' · page=' + page + ' · limit=' + limit);
     const where = [];
     const params = [];
     if (jobId)      { where.push('jci.job_id = ?');      params.push(jobId); }
@@ -1064,6 +1068,17 @@ router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
         params.push(digits, digits);
       }
     }
+    // Unified Call Analysis filters (all additive; call_flow is always present,
+    // the analysis-based ones are guarded on the column existing).
+    const hasTx = await hasTranscriptionColumn();
+    const hasAna = await hasAnalysisColumn();
+    if (flow)     { where.push('pcl.call_flow = ?');   params.push(flow); }
+    if (callerId) { where.push('jci.caller_id = ?');   params.push(callerId); }
+    if (hasAna && hasAnalysisFilter) where.push('pcl.call_analysis IS NOT NULL');
+    if (hasAna && minScore) {
+      where.push("CAST(JSON_UNQUOTE(JSON_EXTRACT(pcl.call_analysis, '$.overall_score')) AS UNSIGNED) >= ?");
+      params.push(minScore);
+    }
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
     const offset = (page - 1) * limit;
 
@@ -1074,8 +1089,13 @@ router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
     // JOIN restricts BOTH the count and the page to those; 1:1 with the call via
     // job_caller_info_id. transcription_status is selected only when the
     // 2026-07-06 migration added the column (guarded for pre-migration envs).
-    const hasTx = await hasTranscriptionColumn();
     const txSelect = hasTx ? ',\n              pcl.transcription_status' : '';
+    // Flow (always present) + coaching score (extracted from the cached analysis
+    // JSON so the big blob isn't shipped per row) for the unified Call Analysis list.
+    const flowSelect = ',\n              pcl.call_flow';
+    const anaSelect = hasAna
+      ? ",\n              pcl.call_analysis_status,\n              JSON_UNQUOTE(JSON_EXTRACT(pcl.call_analysis, '$.overall_score')) AS score"
+      : '';
     const plivoJoin = 'JOIN tbl_plivo_call_log pcl ON pcl.job_caller_info_id = jci.job_caller_info';
 
     const [[{ total }]] = await pool.query(
@@ -1102,7 +1122,7 @@ router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
               jci.location,
               jci.provider,
               jci.inserted_time,
-              jci.is_updated${txSelect}
+              jci.is_updated${txSelect}${flowSelect}${anaSelect}
          FROM tbl_job_caller_info jci
          ${plivoJoin}
          ${whereSql}
@@ -1134,6 +1154,18 @@ router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
 
     logger.info('Returning ' + rows.length + ' call history rows · total=' + total);
     return modernOk(res, { total, page, limit, items: rows });
+  } catch (e) { next(e); }
+});
+
+// ─── GET /scorecard — per-caller (ops agent) coaching-score rollup ─────
+// "Who is improving, who is not." Reads the pre-aggregated tbl_caller_score_rollup
+// (refreshed after each analysed call). Same permission as View Analysis.
+router.get('/scorecard', requireClickToCallAction, async (req, res, next) => {
+  try {
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit || '50', 10)));
+    const offset = Math.max(0, parseInt(req.query.offset || '0', 10));
+    const items = await callerScorecard.list({ limit, offset });
+    return modernOk(res, { items });
   } catch (e) { next(e); }
 });
 

@@ -165,6 +165,11 @@ async function start() {
   } catch (err) {
     logger.warn(`AI voice ws server not attached — ${err.message}. AI-calling flow disabled (shared backend unaffected).`);
   }
+  // AI Teleprompter STT sidecar (self-hosted OSS speech-to-text). Auto-started as a
+  // managed child process ONLY when STT_AUTOSTART=true (model loads once, not
+  // per-call); otherwise a no-op (run the sidecar separately + set STT_SERVICE_URL).
+  // Guarded so a missing Python / spawn failure can't disrupt the shared backend.
+  try { require('./services/stt-sidecar.service').maybeStart(); } catch (err) { logger.warn('STT sidecar autostart skipped — ' + err.message); }
   // Re-drain any post-call mappings left at 'mapping' by a restart mid-queue
   // (the post-call queue is in-memory + bounded). Best-effort, non-blocking.
   try { require('./services/ai-post-call-queue').recoverPending(); } catch { /* noop */ }
@@ -175,6 +180,7 @@ async function start() {
     // open) so each call's teardown can persist its transcript/result. Guarded
     // so a missing/never-attached ws server can't disrupt shutdown.
     try { require('./services/ai-voice-server.service').shutdown(); } catch { /* noop */ }
+    try { require('./services/stt-sidecar.service').shutdown(); } catch { /* noop */ }
     try { require('./services/audio-transcode-pool').shutdown(); } catch { /* noop */ }
     // Stop cron BEFORE closing the HTTP server so an in-flight cron task
     // doesn't keep the pool alive past closePool().

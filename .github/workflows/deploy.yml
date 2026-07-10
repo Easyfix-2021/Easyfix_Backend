@@ -41,6 +41,12 @@ name: Deploy Backend (CI build → ECR → SSM pull)
 on:
   push:
     branches: [QA, Production]
+    # The STT sidecar (stt-service/**) is a SEPARATE image deployed by
+    # deploy-stt.yml. A push touching ONLY stt-service/** must not rebuild +
+    # redeploy the whole backend. (A push touching both still deploys both —
+    # paths-ignore only skips when EVERY changed path matches.)
+    paths-ignore:
+      - 'stt-service/**'
   workflow_dispatch:
     inputs:
       target:
@@ -315,12 +321,18 @@ jobs:
           # the next two lines append/overwrite BACKEND_IMAGE.
           touch /opt/easyfix/.env
 
-          # Update BACKEND_IMAGE to the new tag. Append if first run.
-          if grep -q '^BACKEND_IMAGE=' /opt/easyfix/.env; then
-            sed -i "s|^BACKEND_IMAGE=.*|BACKEND_IMAGE=$IMAGE_URI|" /opt/easyfix/.env
-          else
-            echo "BACKEND_IMAGE=$IMAGE_URI" >> /opt/easyfix/.env
-          fi
+          # Update BACKEND_IMAGE to the new tag. Append if first run. flock serialises
+          # with a concurrent STT deploy (deploy-stt.yml) writing the same .env when a
+          # single push touches both — same lock file, so neither clobbers the other.
+          touch /opt/easyfix/.env
+          (
+            flock 9
+            if grep -q '^BACKEND_IMAGE=' /opt/easyfix/.env; then
+              sed -i "s|^BACKEND_IMAGE=.*|BACKEND_IMAGE=$IMAGE_URI|" /opt/easyfix/.env
+            else
+              echo "BACKEND_IMAGE=$IMAGE_URI" >> /opt/easyfix/.env
+            fi
+          ) 9>/opt/easyfix/.env.lock
 
           # ─── ECR credential-helper auto-bootstrap (idempotent) ─────────
           # The "pull access denied / no basic auth credentials" symptom is

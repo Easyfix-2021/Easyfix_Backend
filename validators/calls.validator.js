@@ -73,6 +73,10 @@ const clickToCallBody = Joi.object({
   // Optional "Call From Flow" label (which screen started the call) for the
   // dedicated Plivo call log. Falls back to a coarse identifier-derived flow.
   flow: Joi.string().max(64).optional(),
+  // Optional AI-teleprompter session id (from POST /admin/teleprompter/start).
+  // When present + teleprompter.enabled, the web-answer forks the call audio to
+  // the STT websocket for this session. Additive: absent ⇒ a normal web call.
+  teleprompterSessionId: Joi.string().max(64).optional(),
 }).xor('jobId', 'customerId', 'efrId', 'reportingContactId');
 
 /*
@@ -103,6 +107,12 @@ const callListQuery = Joi.object({
   // the My Orders "call history for this number" popup so it shows only calls
   // to/from the clicked customer mobile for the given job.
   mobile:   Joi.string().max(20).optional(),
+  // Unified Call Analysis filters (2026-07-09): scope the list by flow (call_flow),
+  // by caller (ops agent), to only-analysed calls, and by a minimum coaching score.
+  flow:     Joi.string().max(64).optional(),
+  callerId: intId.optional(),
+  hasAnalysis: Joi.alternatives(Joi.boolean(), Joi.string().valid('true', 'false', '1', '0')).optional(),
+  minScore: Joi.number().integer().min(1).max(10).optional(),
   page:     Joi.number().integer().min(1).default(1),
   limit:    Joi.number().integer().min(1).max(200).default(20),
 });

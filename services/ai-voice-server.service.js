@@ -19,8 +19,38 @@ const { WebSocketServer } = require('ws');
 const logger = require('../logger');
 const aiSession = require('./ai-call-session.service');
 const relay = require('./ai-voice-relay.service');
+const teleprompter = require('./teleprompter.service');
+const teleprompterRelay = require('./teleprompter-relay.service');
 
-const WS_PATH = '/ai-voice-stream';
+const AI_PATH = '/ai-voice-stream';
+const TP_PATH = '/teleprompter-stream';
+
+// Per-path config so both media legs share the SAME upgrade discipline (feature
+// flag → token verify → hard concurrency cap → hand to relay). Each has its OWN
+// flag + cap + relay, so the two features fail independently.
+const ROUTES = {
+  [AI_PATH]: {
+    label: 'AI voice',
+    enabled: () => aiSession.enabled(),
+    verify: (t) => aiSession.verifyToken(t),
+    tryAcquire: () => aiSession.tryAcquire(),
+    release: () => aiSession.release(),
+    activeCount: () => aiSession.activeCount(),
+    max: () => aiSession.MAX_CONCURRENT,
+    handle: (ws, claims) => relay.handleConnection(ws, { sessionId: claims.sid, voice: claims.voice }),
+  },
+  [TP_PATH]: {
+    label: 'Teleprompter',
+    enabled: () => teleprompter.enabled(),
+    verify: (t) => teleprompter.verifyToken(t),
+    tryAcquire: () => teleprompter.tryAcquire(),
+    release: () => teleprompter.release(),
+    activeCount: () => teleprompter.activeCount(),
+    max: () => teleprompter.MAX_CONCURRENT,
+    handle: (ws, claims) => teleprompterRelay.handleConnection(ws, { sessionId: claims.sid }),
+  },
+};
+
 let wss = null;
 
 function reject(socket, statusLine) {
@@ -35,19 +65,18 @@ function attach(server) {
   server.on('upgrade', (req, socket, head) => {
     let url;
     try { url = new URL(req.url, 'http://localhost'); } catch { return reject(socket, '400 Bad Request'); }
-    if (url.pathname !== WS_PATH) return reject(socket, '404 Not Found');
+    const route = ROUTES[url.pathname];
+    if (!route) return reject(socket, '404 Not Found'); // we're the only upgrade consumer
 
-    // Feature flag on? (`ai.calling.enabled`.) The per-ENGINE key check happens at
-    // POST /ai-calling/start, so any session that got this far is already vetted.
-    // Togglable at runtime, so we check per-connection rather than gating the attach.
-    if (!aiSession.enabled()) return reject(socket, '403 Forbidden');
+    // Feature flag on? Togglable at runtime, so checked per-connection.
+    if (!route.enabled()) return reject(socket, '403 Forbidden');
 
-    const claims = aiSession.verifyToken(url.searchParams.get('t') || '');
+    const claims = route.verify(url.searchParams.get('t') || '');
     if (!claims || !claims.sid) return reject(socket, '401 Unauthorized');
 
-    // Rule 2 — authoritative hard cap. Acquire BEFORE completing the handshake.
-    if (!aiSession.tryAcquire()) {
-      logger.warn('AI voice: capacity reached (' + aiSession.activeCount() + '/' + aiSession.MAX_CONCURRENT
+    // Authoritative hard cap. Acquire BEFORE completing the handshake.
+    if (!route.tryAcquire()) {
+      logger.warn(route.label + ': capacity reached (' + route.activeCount() + '/' + route.max()
         + ') — rejecting stream for ' + claims.sid);
       return reject(socket, '503 Service Unavailable');
     }
@@ -56,28 +85,25 @@ function attach(server) {
     // after we acquired), release the slot when the raw socket closes. Once the
     // relay owns the ws (`handed`), the relay's cleanup() is the sole releaser.
     let handed = false;
-    socket.on('close', () => { if (!handed) aiSession.release(); });
+    socket.on('close', () => { if (!handed) route.release(); });
 
     wss.handleUpgrade(req, socket, head, (ws) => {
       handed = true;
       // From here the relay is the SOLE releaser of the acquired slot (its
-      // cleanup() releases exactly once on every teardown path). We deliberately
-      // do NOT release here: relay.handleConnection is fully self-contained
-      // (its whole body is try/caught → cleanup) and never rejects, so a
-      // release() here would only ever be reachable as a double-release if a
-      // future edit broke that invariant. On the impossible-today reject path we
-      // just log + close; leaking one slot fails safe (reduces capacity), a
-      // double-release does not (corrupts the cap that protects the event loop).
+      // cleanup() releases exactly once on every teardown path). Both relays are
+      // fully self-contained (whole body try/caught → cleanup) and never reject,
+      // so we deliberately do NOT release here.
       Promise.resolve()
-        .then(() => relay.handleConnection(ws, { sessionId: claims.sid, voice: claims.voice }))
+        .then(() => route.handle(ws, claims))
         .catch((e) => {
-          logger.error('AI voice: relay start failed · ' + (e && e.message));
+          logger.error(route.label + ': relay start failed · ' + (e && e.message));
           try { ws.close(); } catch { /* noop */ }
         });
     });
   });
 
-  logger.info('AI voice ws server attached on ' + WS_PATH + ' (max concurrent ' + aiSession.MAX_CONCURRENT + ')');
+  logger.info('Voice/teleprompter ws server attached on ' + AI_PATH + ' + ' + TP_PATH
+    + ' (max concurrent ai=' + aiSession.MAX_CONCURRENT + ' tp=' + teleprompter.MAX_CONCURRENT + ')');
 }
 
 // Graceful shutdown: server.close() does NOT reap upgraded ws connections, so on

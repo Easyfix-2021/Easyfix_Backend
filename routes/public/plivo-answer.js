@@ -6,6 +6,7 @@ const plivo = require('../../services/plivo.service');
 const plivoLog = require('../../services/plivo-call-log.service');
 const aiCall = require('../../services/plivo-ai-call.service');
 const aiSession = require('../../services/ai-call-session.service');
+const teleprompter = require('../../services/teleprompter.service');
 
 /*
  * /api/public/plivo/answer — Plivo answer_url callback (truly public, no auth).
@@ -113,7 +114,26 @@ async function webAnswer(req, res) {
   await plivoLog.markRinging(resolved.jci, src.CallUUID || null);
   await plivoLog.setRecordingRequested(resolved.jci, record);
   const recCbUrl = record ? plivo.recordingCallbackUrl(resolved.jci) : null;
-  return xml(plivo.buildAnswerXml(resolved.number, { record, recordingCallbackUrl: recCbUrl }));
+
+  // AI Teleprompter (additive, flag-gated): if this web call is a guided
+  // teleprompter session AND the feature is on AND a wss base is configured, fork
+  // the call audio (listen-only) to the STT websocket for this session. Any
+  // failure/absence ⇒ streamWssUrl stays null ⇒ the exact previous <Dial> XML.
+  let streamWssUrl = null;
+  try {
+    if (resolved.teleprompterSessionId && teleprompter.enabled()) {
+      const base = aiCall.wsBase();
+      if (base) {
+        const t = teleprompter.signToken(resolved.teleprompterSessionId);
+        streamWssUrl = `${base}/teleprompter-stream?t=${encodeURIComponent(t)}`;
+        logger.info('Plivo web-answer: forking audio to teleprompter STT · session=' + resolved.teleprompterSessionId);
+      } else {
+        logger.warn('Plivo web-answer: teleprompter on but no wss base configured — no STT fork');
+      }
+    }
+  } catch (e) { logger.warn('Plivo web-answer: teleprompter stream setup failed (bridging normally) · ' + (e && e.message)); }
+
+  return xml(plivo.buildAnswerXml(resolved.number, { record, recordingCallbackUrl: recCbUrl, streamWssUrl }));
 }
 router.post('/web-answer', express.urlencoded({ extended: false }), webAnswer);
 router.get('/web-answer', webAnswer);

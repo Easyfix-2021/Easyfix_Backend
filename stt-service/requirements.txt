@@ -1,0 +1,6 @@
+# EasyFix STT sidecar (reference, faster-whisper backend). All permissive/OSS.
+websockets>=12.0
+faster-whisper>=1.0.0
+numpy>=1.24
+# For AI4Bharat IndicConformer instead (see README), add e.g.:
+#   nemo_toolkit[asr]   OR   sherpa-onnx   (+ the IndicConformer checkpoint)

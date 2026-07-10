@@ -194,7 +194,7 @@ function recordingCallbackUrl(jci) {
 // Playback still caches to our S3 on first play. Gated on
 // `plivo.recording.enabled` by the caller so it can be turned off without a
 // deploy. ⚠️ Recording customer calls needs compliance/consent sign-off.
-function buildAnswerXml(dest, { record = false, recordingCallbackUrl = null } = {}) {
+function buildAnswerXml(dest, { record = false, recordingCallbackUrl = null, streamWssUrl = null } = {}) {
   const callerId = process.env.PLIVO_CALLER_ID || '';
   const num = String(dest || '').replace(/[^0-9]/g, '');
   let dialAttrs = ` callerId="${callerId}"`;
@@ -210,7 +210,18 @@ function buildAnswerXml(dest, { record = false, recordingCallbackUrl = null } = 
       dialAttrs += ` recordingCallbackUrl="${escUrl}"`;
     }
   }
-  return `<?xml version="1.0" encoding="UTF-8"?>\n<Response><Dial${dialAttrs}><Number>${num}</Number></Dial></Response>`;
+  // Optional listen-only media fork (AI teleprompter): stream the call audio to our
+  // STT websocket IN PARALLEL with the bridge. bidirectional="false" = we only
+  // listen (never inject audio); <Stream> is non-blocking so placing it BEFORE
+  // <Dial> starts the fork, then Plivo proceeds to bridge. keepCallAlive so the
+  // fork ending can't drop the call. ADDITIVE — absent streamWssUrl ⇒ byte-for-byte
+  // the previous XML, so non-teleprompter web/bridge calls are untouched.
+  let streamEl = '';
+  if (streamWssUrl) {
+    const escUrl = String(streamWssUrl).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    streamEl = `<Stream bidirectional="false" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000">${escUrl}</Stream>`;
+  }
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>${streamEl}<Dial${dialAttrs}><Number>${num}</Number></Dial></Response>`;
 }
 
 function authHeader() {
@@ -519,11 +530,11 @@ function webAccessToken({ operatorId } = {}) {
 // number.
 const WEB_DIAL_TTL_MS = 2 * 60 * 1000;
 const _webDials = new Map();
-function stashWebDial({ number, jci }) {
+function stashWebDial({ number, jci, teleprompterSessionId = null }) {
   const now = Date.now();
   for (const [k, v] of _webDials) if (v.expires <= now) _webDials.delete(k); // sweep
   const id = crypto.randomBytes(16).toString('hex');
-  _webDials.set(id, { number, jci, expires: now + WEB_DIAL_TTL_MS });
+  _webDials.set(id, { number, jci, teleprompterSessionId, expires: now + WEB_DIAL_TTL_MS });
   return id;
 }
 function resolveWebDial(id) {
@@ -532,7 +543,7 @@ function resolveWebDial(id) {
   if (!v) return null;
   _webDials.delete(key); // one-time use
   if (v.expires <= Date.now()) return null;
-  return { number: v.number, jci: v.jci };
+  return { number: v.number, jci: v.jci, teleprompterSessionId: v.teleprompterSessionId || null };
 }
 
 module.exports = {

@@ -21,6 +21,7 @@ const FEATURES = {
   canDeleteEntities: 'access.entitydelete.emails',
   canValidateFlows: 'validate.flows.emails',
   canBuildSkillMatrix: 'skill.matrix.emails',
+  canRunTeleprompter: 'teleprompter.emails',
 };
 
 // Is `email` on the allowlist held in easyfix_properties[propertyKey]?
