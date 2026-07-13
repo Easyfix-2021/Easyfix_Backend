@@ -2,6 +2,7 @@ const router = require('express').Router();
 const multer = require('multer');
 const crypto = require('crypto');
 
+const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
 const s3Storage = require('../../utils/s3-storage');
 const { writeBuffer } = require('../../utils/file-storage');
@@ -132,6 +133,75 @@ router.post('/', upload.single('file'), async (req, res, next) => {
     }
     uploadLogger.error('Mobile upload failed · ' + e.message);
     uploadLogger.error({ efrId, err: e }, 'mobile upload failed');
+    return next(e);
+  }
+});
+
+/*
+ * POST /api/mobile/uploads/document — like POST /uploads, but ALSO inserts a
+ * `document` row and returns its numeric id, so callers that reference a document
+ * FK (tbl_job.tx_selfie_id → document.id for the reached-location selfie) get a
+ * real integer id instead of an opaque S3-key string. The S3 key is stored in
+ * document.path so the admin selfie resolver can presign it on read; url is left
+ * NULL. Same multer allowlist / size limit as the generic upload.
+ *
+ *   →  modernOk { documentId, key, url }
+ */
+router.post('/document', upload.single('file'), async (req, res, next) => {
+  const efrId = req.tech.efr_id;
+  try {
+    if (!req.file) {
+      uploadLogger.warn('Mobile document upload rejected · missing file');
+      return modernError(res, 400, 'missing "file" upload');
+    }
+    const kind = String(req.body?.kind || 'general').trim() || 'general';
+
+    let key;
+    let url;
+    let storage;
+    if (s3Storage.isEnabled()) {
+      key = await s3Storage.putAtKey({
+        key: buildKey(efrId),
+        buffer: req.file.buffer,
+        contentType: req.file.mimetype,
+        originalName: req.file.originalname,
+      });
+      url = await s3Storage.resolveImageUrl(key);
+      storage = 's3';
+    } else {
+      const saved = writeBuffer('general', req.file.buffer, req.file.originalname, req.file.mimetype);
+      key = saved.filename;
+      url = saved.url;
+      storage = 'local';
+    }
+
+    // Persist a document row so a numeric FK can reference it. S3 KEY → `path`
+    // (resolver presigns from it); url + document_type_id left NULL. created_by
+    // is the technician's efr_id (nullable column — matches the legacy insert).
+    const [ins] = await pool.query(
+      'INSERT INTO document (`path`, url, file_name, created_on, created_by, document_type_id) '
+      + 'VALUES (?, NULL, ?, NOW(), ?, NULL)',
+      [key, req.file.originalname || null, efrId || null],
+    );
+    const documentId = ins.insertId;
+
+    uploadLogger.upload(
+      { efrId, kind, key, storage, documentId, originalName: req.file.originalname, mimeType: req.file.mimetype, bytes: req.file.size },
+      'mobile document upload stored',
+    );
+    uploadLogger.info('Mobile document upload stored · kind=' + kind + ' storage=' + storage + ' documentId=' + documentId);
+    return modernOk(res, { documentId, key, url });
+  } catch (e) {
+    if (e?.code === 'LIMIT_FILE_SIZE') {
+      uploadLogger.warn('Mobile document upload rejected · file exceeds 10MB · ' + e.message);
+      return modernError(res, 400, 'file exceeds 10MB');
+    }
+    if (e?.code === 'LIMIT_UNEXPECTED_FILE') {
+      uploadLogger.warn('Mobile document upload rejected · unsupported file · ' + e.message);
+      return modernError(res, 400, e.message || 'unsupported file');
+    }
+    uploadLogger.error('Mobile document upload failed · ' + e.message);
+    uploadLogger.error({ efrId, err: e }, 'mobile document upload failed');
     return next(e);
   }
 });

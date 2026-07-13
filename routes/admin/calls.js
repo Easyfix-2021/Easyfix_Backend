@@ -443,6 +443,7 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
         receiver_number: kaleyra.normaliseIndianPhone(receiverMobile),
         dialed_number: kaleyra.normaliseIndianPhone(dialTo),
         status: 'placed',
+        recording_requested: plivo.recordingEnabled() ? 1 : 0,
       });
     }
 
@@ -559,6 +560,7 @@ router.post('/web-start', requireClickToCallAction, validate(clickToCallBody), a
       caller_user_id: agent.user_id, caller_name: agent.user_name, receiver_name: rr.receiverName || null,
       receiver_number: receiver, dialed_number: dialNumber,
       status: 'initiated',
+      recording_requested: plivo.recordingEnabled() ? 1 : 0,
     });
 
     logger.info(`Web call started · agent=${agent.user_name}(#${agent.user_id}) → ${rr.receiverName || rr.receiverCustomerId || 'customer'} · row=${jci}`);

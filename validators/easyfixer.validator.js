@@ -120,6 +120,11 @@ const statusBody = Joi.object({
   active:    Joi.boolean().required(),
   reasonId:  Joi.number().integer().positive().when('active', { is: false, then: Joi.optional(), otherwise: Joi.forbidden() }),
   comment:   Joi.string().max(500).when('active',  { is: false, then: Joi.optional(), otherwise: Joi.forbidden() }),
+  // Optional auto-reactivation date (YYYY-MM-DD) — only on deactivate. Setting it
+  // marks the tech "temporarily inactive"; a daily cron reactivates on/after this
+  // date. Kept a plain date string (no Joi.date() Date coercion) so it stores
+  // verbatim into the DATE column with no timezone drift. Admins-only at the route.
+  reactivationDate: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).when('active', { is: false, then: Joi.optional(), otherwise: Joi.forbidden() }),
 });
 
 const idParam = Joi.object({

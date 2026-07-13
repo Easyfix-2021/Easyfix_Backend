@@ -21,11 +21,46 @@ const RECORD_COLS = [
   'call_uuid', 'status',
 ];
 
+/*
+ * Cached probe: does tbl_plivo_call_log have the recording_requested column?
+ * The migration adding it (2026-07-08) may still be pending on an env, and
+ * record() builds a DYNAMIC insert — naming a missing column would fail-soft the
+ * WHOLE row insert (losing the call log entirely). So we only INSERT the flag
+ * once the column is confirmed present. Resolved once per process, then cached
+ * (undefined = not yet probed).
+ */
+let _hasRecordingRequestedCol;
+async function hasRecordingRequestedColumn() {
+  if (_hasRecordingRequestedCol !== undefined) return _hasRecordingRequestedCol;
+  try {
+    const [rows] = await pool.query(
+      `SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE()
+          AND table_name = 'tbl_plivo_call_log'
+          AND column_name = 'recording_requested'
+        LIMIT 1`,
+    );
+    _hasRecordingRequestedCol = rows.length > 0;
+  } catch (e) {
+    _hasRecordingRequestedCol = false;
+  }
+  return _hasRecordingRequestedCol;
+}
+
 // Insert one row at call start (initiated_on = NOW()). Returns id or null.
 async function record(fields = {}) {
   try {
     const cols = RECORD_COLS.filter((c) => fields[c] !== undefined);
     const params = cols.map((c) => fields[c]);
+    // Stamp the recording decision at INSERT so the flag is correct even for
+    // calls that are never answered — the answer callback is the only OTHER
+    // writer and it fires only on answered calls, which is why so many rows had
+    // recording_requested = NULL. Probe-gated: skipped when the column is still
+    // pre-migration, so the row insert itself never fails.
+    if (fields.recording_requested !== undefined && (await hasRecordingRequestedColumn())) {
+      cols.push('recording_requested');
+      params.push(fields.recording_requested ? 1 : 0);
+    }
     const sql = `INSERT INTO tbl_plivo_call_log (${cols.concat('initiated_on').join(', ')}) `
       + `VALUES (${cols.map(() => '?').concat('NOW()').join(', ')})`;
     const [r] = await pool.query(sql, params);

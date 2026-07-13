@@ -21,8 +21,8 @@ const plivoLog = require('./plivo-call-log.service');
 const logger = require('../logger');
 
 /*
- * Sweep rows that requested recording but have no URL, PULL each from Plivo, and
- * persist. Bounded by `limit` (default 50, hard-capped 200). Sequential — a
+ * Sweep Plivo rows that have a call_uuid but no recording URL, PULL each from
+ * Plivo, and persist. Bounded by `limit` (default 50, hard-capped 200). Sequential — a
  * sweep must not hammer the Plivo Recording API's rate limit. Fail-soft: a bad
  * row is counted and skipped; the columns being pre-migration is a clean no-op.
  * Returns { scanned, recovered, stillMissing, errors, limit }.
@@ -31,16 +31,22 @@ async function backfillMissingRecordings({ limit = 50 } = {}) {
   const lim = Math.min(Math.max(Number(limit) || 50, 1), 200);
   let rows;
   try {
+    // Deliberately does NOT filter on recording_requested: that column is the
+    // one commonly NULL / pre-migration, and gating on `= 1` was silently
+    // excluding every row (throwing "Unknown column" pre-migration, or matching
+    // nothing when the flag was never written). Sweep by what actually exists —
+    // any Plivo row with a call_uuid but no recording_url — and let the Plivo
+    // pull decide (it returns no URL when recording was off / still processing).
     [rows] = await pool.query(
       `SELECT job_caller_info_id AS jci, call_uuid
          FROM tbl_plivo_call_log
-        WHERE recording_requested = 1 AND recording_url IS NULL AND call_uuid IS NOT NULL
+        WHERE recording_url IS NULL AND call_uuid IS NOT NULL
         ORDER BY id DESC
         LIMIT ?`,
       [lim],
     );
   } catch (e) {
-    // Pre-migration deploy (recording_requested / recording_url columns absent).
+    // Pre-migration deploy (recording_url column absent).
     logger.warn({ err: e.message }, 'recording-backfill: query failed (columns may be pre-migration)');
     return { scanned: 0, recovered: 0, stillMissing: 0, errors: 0, skipped: true };
   }

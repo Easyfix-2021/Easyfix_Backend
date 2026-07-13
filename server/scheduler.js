@@ -592,6 +592,59 @@ Note: this task only runs automatically if the property "attendance.reminder.ena
     logger.info(`Attendance-reminder cron registered (attendance.reminder.enabled=true, schedule="${attendanceCronExpr}" IST).`);
   }
 
+  // ─── Easyfixer auto-reactivation — daily at 01:00 IST ───────────────
+  // (Added 2026-07-13) Reactivates technicians set "Temporarily Inactive" with a
+  // scheduled_reactivation_date that has arrived (efr_status 0 → 1, clears the
+  // date). Property-gated + IST-date based (not CURDATE). Runs at 01:00 IST,
+  // before the 09:00 attendance push, so a reactivated tech is in that day's pool.
+  const easyfixerReactivationCron = require('../services/easyfixer-reactivation-cron');
+  const easyfixerReactivationJob = registerJob({
+    id: 'easyfixer-auto-reactivation',
+    name: 'Technician Auto-Reactivation',
+    description:
+`What this task does: Every day at 1:00 AM IST, technicians who were set "Temporarily Inactive" with a scheduled reactivation date that has now arrived are automatically switched back to Active.
+
+Here's how it works, step by step:
+  1. Every day at 1:00 AM IST, the task wakes up automatically.
+  2. It finds every technician who is currently Inactive (efr_status = 0), is verified, and has a scheduled reactivation date on or before today (IST).
+  3. For each, it flips them back to Active and clears the scheduled date + the stored inactivity reason, so the row is processed once and never re-fires.
+  4. Technicians deactivated permanently (no scheduled date) are never touched.
+  5. The task logs how many technicians were reactivated (visible in the server logs and on this page).
+
+Why this matters: ops can put a technician on a fixed break (leave, temporary suspension) and have the system bring them back automatically on the agreed date, instead of relying on someone remembering to reactivate them.
+
+Note: this task only runs automatically if the property "easyfixer.auto_reactivation.enabled" is "true" in easyfix_properties (checked once at server start — a restart is required after changing it). If unset or "false", the schedule is OFF, but Trigger Now / Test still work for manual verification.`,
+    cron: '0 1 * * *',
+    runner: async () => {
+      const result = await easyfixerReactivationCron.runDailyReactivation();
+      logger.info(
+        `Easyfixer auto-reactivation cron · reactivated=${result.reactivated}` +
+        (result.skipped ? ' (skipped — column pre-migration)' : '')
+      );
+      return result;
+    },
+    tester: ({ sourceId }) => easyfixerReactivationCron.runTest({ sourceId }),
+    testSourceLabel: 'Easyfixer ID (efr_id)',
+    testSourceHelp:
+      'Required. Immediately reactivates THIS temporarily-inactive, verified technician (ignores the scheduled date) so you can verify the flow end-to-end.',
+  });
+  const easyfixerReactivationEnabled =
+    String(getProperty('easyfixer.auto_reactivation.enabled') ?? '').toLowerCase() === 'true';
+  if (cronDisabled) {
+    easyfixerReactivationJob.skipReason = 'CRON_DISABLED=true';
+  } else if (!easyfixerReactivationEnabled) {
+    easyfixerReactivationJob.skipReason = "property 'easyfixer.auto_reactivation.enabled' was not 'true' at server start — flip it to 'true' and restart the server to enable";
+    logger.info("Easyfixer auto-reactivation cron SKIPPED — set easyfixer.auto_reactivation.enabled=true in easyfix_properties to enable (takes effect after restart).");
+  } else {
+    easyfixerReactivationJob.task = cron.schedule(
+      easyfixerReactivationJob.cron,
+      () => invokeJob(easyfixerReactivationJob, 'cron'),
+      { timezone: TZ },
+    );
+    easyfixerReactivationJob.registered = true;
+    logger.info('Easyfixer auto-reactivation cron registered (easyfixer.auto_reactivation.enabled=true, 01:00 IST).');
+  }
+
   // ── Transcription backfill — fetch Plivo transcripts for EVERY completed
   //    call (not just ones whose recording someone played), so Call Analytics
   //    has a transcript per call. Gated by plivo.transcription.enabled. ──
