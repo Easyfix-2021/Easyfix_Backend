@@ -28,19 +28,29 @@ const { signUserToken } = require('../utils/jwt');
  */
 
 async function findActiveUserByIdentifier(identifier) {
-  const isEmail = /@/.test(identifier);
-  const column = isEmail ? 'official_email' : 'mobile_no';
+  const raw = String(identifier || '').trim();
+  const isEmail = /@/.test(raw);
+  // Email login is case-insensitive: users may type "Pranav@easyfix.in" but the
+  // row is stored lowercase (see user.service.js create/dup-check). Match on
+  // LOWER(official_email) with a lowercased param — the same house pattern the
+  // duplicate-email check uses. Mobile identifiers are digits (no case), so they
+  // are compared as-is: this keeps the mobile_no index usable and never mangles
+  // the value with toLowerCase(). Both createLoginOtp and verifyLoginOtp route
+  // through here and then key otp_details by the RETURNED row's canonical
+  // official_email/mobile_no, so OTP correlation stays intact regardless of casing.
+  const whereCol = isEmail ? 'LOWER(official_email)' : 'mobile_no';
+  const value = isEmail ? raw.toLowerCase() : raw;
   const [[user]] = await pool.query(
     `SELECT user_id, user_code, user_name, official_email, user_role, user_type_id,
             city_id, mobile_no, alternate_no,
             manage_clients, manage_cities, manage_states, manage_verticals,
             user_status
        FROM tbl_user
-      WHERE ${column} = ?
+      WHERE ${whereCol} = ?
         AND user_status = 1
         AND user_type_id = 5
       LIMIT 1`,
-    [identifier]
+    [value]
   );
   return user || null;
 }

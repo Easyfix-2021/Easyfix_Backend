@@ -79,6 +79,47 @@ router.get('/:id/location',
     }
   });
 
+/*
+ * GET /api/admin/jobs/:id/selfie-url — resolve the technician's reached-location
+ * selfie to a short-TTL presigned URL for the CRM. tbl_job.tx_selfie_id is an int
+ * FK to document.id; the mobile upload stored the S3 key in document.path, so we
+ * presign it on read (5-min TTL, re-minted per view — nothing cached). Returns
+ * { selfieId, url } with url=null when there is no selfie / no resolvable key, so
+ * the CRM can render the tile unconditionally and simply hide it on null. scopedJob
+ * enforces the operator's manage_* scope.
+ */
+router.get('/:id/selfie-url',
+  validate(idParam, 'params'),
+  scopedJob,
+  async (req, res, next) => {
+    try {
+      const selfieId = req.scopedJob.tx_selfie_id;
+      if (!selfieId) return modernOk(res, { selfieId: null, url: null });
+
+      const { pool } = require('../../db');
+      const s3Storage = require('../../utils/s3-storage');
+      const [[doc]] = await pool.query(
+        'SELECT `path`, url FROM document WHERE id = ? LIMIT 1',
+        [selfieId],
+      );
+      if (!doc) return modernOk(res, { selfieId, url: null });
+
+      // S3 key lives in `path`; presign on read. Fall back to a legacy stored url.
+      const key = String(doc.path || '').trim();
+      let url = null;
+      if (key && s3Storage.isEnabled()) {
+        try { url = await s3Storage.getPresignedUrl(key); }
+        catch (e) { logger.warn('Selfie presign failed · jobId=' + req.params.id + ' · ' + e.message); }
+      }
+      if (!url && doc.url) url = doc.url;
+      logger.info('Resolved selfie url · jobId=' + req.params.id + ' · has=' + !!url);
+      modernOk(res, { selfieId, url });
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  });
+
 router.get('/:id/candidates',
   validate(idParam, 'params'),
   validate(candidatesQuery, 'query'),

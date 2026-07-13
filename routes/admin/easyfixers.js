@@ -385,7 +385,16 @@ router.get('/:id/mapped-clients',
     } catch (e) { next(e); }
   });
 
-router.patch('/:id/status', validate(idParam, 'params'), validate(statusBody), async (req, res, next) => {
+router.patch('/:id/status',
+  validate(idParam, 'params'),
+  validate(statusBody),
+  // "Only Admins can auto-activate technicians": scheduling an auto-reactivation
+  // (reactivationDate present) requires the Admin-only seeded action; a plain
+  // activate/deactivate stays open to the admin group.
+  (req, res, next) => (req.body && req.body.reactivationDate
+    ? requireAction('isEasyfixerTempInactive')(req, res, next)
+    : next()),
+  async (req, res, next) => {
   try {
     logger.info('Set easyfixer status · id=' + req.params.id + ' active=' + req.body.active);
     const existing = await easyfixer.getById(req.params.id);

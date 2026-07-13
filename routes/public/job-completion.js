@@ -574,7 +574,22 @@ router.post(
         throw Object.assign(new Error('Please select a valid reschedule reason.'), { status: 400 });
       }
       logger.info('Log customer reschedule request · jobId=' + jobId + ' · reason=' + req.body.reason);
-      const preferred = toMysqlDatetime(req.body.preferred_datetime);
+      // Default the preferred date to the job's CURRENT appointment
+      // (tbl_job.requested_date_time) when the customer didn't pick one, instead
+      // of storing NULL — so Ops always has a concrete date to act on and the
+      // list/detail surfaces never show a bare "Reschedule Requested" with no
+      // date. db.js runs dateStrings:true + timezone '+05:30', so the column
+      // comes back as a ready 'YYYY-MM-DD HH:MM:SS' IST wall-clock string — a
+      // valid DATETIME literal used verbatim (do NOT re-parse through
+      // toMysqlDatetime, which is only for normalising the raw request body).
+      let preferred = toMysqlDatetime(req.body.preferred_datetime);
+      if (!preferred) {
+        const [[jobRow]] = await pool.query(
+          'SELECT requested_date_time FROM tbl_job WHERE job_id = ? LIMIT 1',
+          [jobId],
+        );
+        preferred = jobRow ? jobRow.requested_date_time : null;
+      }
       const [ins] = await pool.query(
         `INSERT INTO tbl_job_customer_request
            (job_id, request_type, reason, remarks, preferred_datetime)

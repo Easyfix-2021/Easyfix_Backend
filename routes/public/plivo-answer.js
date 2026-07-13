@@ -140,7 +140,8 @@ router.get('/web-answer', webAnswer);
 
 /*
  * /api/public/plivo/recording-callback — Plivo POSTs the recording URL/id here
- * once the mp3 is ready (set via <Dial recordingCallbackUrl>). UNAUTHENTICATED;
+ * once the mp3 is ready (set via the <Record callbackUrl> in buildAnswerXml).
+ * Plivo params: RecordUrl / RecordingID / RecordingDuration. UNAUTHENTICATED;
  * the signed `t` token (kind:'rec', carries jci) is the authorisation. Storing
  * by jci is robust to whichever leg's call_uuid the recording is filed under —
  * exactly why the old lazy call_uuid lookup failed for web calls. ALWAYS 200 so

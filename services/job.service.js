@@ -608,20 +608,31 @@ async function jobOfferTableExists() {
 }
 
 /*
- * Builds the two pending-customer-request projection columns for the LIST
+ * Builds the pending-customer-request projection columns for the LIST
  * query. When the table exists, emits correlated subqueries selecting the
- * latest PENDING request's type + reason; otherwise emits NULL aliases so
- * the column shape stays identical. Parameterised SQL — the literal
- * 'pending' is the only constant and it is bound as a parameter list the
- * caller appends, but since it's a fixed string we inline it safely (no
- * user input). Returns a leading-comma fragment ready to append after
- * client_opted_in.
+ * latest PENDING request's type, reason + preferred (requested) datetime;
+ * otherwise emits NULL aliases so the column shape stays identical.
+ * Parameterised SQL — the literal 'pending' is the only constant and it is
+ * bound as a parameter list the caller appends, but since it's a fixed
+ * string we inline it safely (no user input). Returns a leading-comma
+ * fragment ready to append after client_opted_in.
+ *
+ * `pending_request_preferred_datetime` is what the customer asked to move
+ * the appointment TO (job-completion.js reschedule-request stores it in
+ * tbl_job_customer_request.preferred_datetime; NULL when the customer did
+ * not pick a specific date). It is intentionally distinct from
+ * j.requested_date_time (the current/live appointment) — a reschedule
+ * REQUEST does not move the live appointment until Ops actions it, so the
+ * UI must surface the requested date separately or the row looks stale.
+ * All three subqueries share the same ORDER BY created_at DESC LIMIT 1, so
+ * they resolve to the same latest-pending row.
  */
 function pendingRequestColumns(tableExists) {
   if (!tableExists) {
     return `,
   NULL AS pending_request_type,
-  NULL AS pending_request_reason`;
+  NULL AS pending_request_reason,
+  NULL AS pending_request_preferred_datetime`;
   }
   return `,
   (SELECT cr.request_type FROM tbl_job_customer_request cr
@@ -629,7 +640,10 @@ function pendingRequestColumns(tableExists) {
     ORDER BY cr.created_at DESC LIMIT 1) AS pending_request_type,
   (SELECT cr.reason FROM tbl_job_customer_request cr
     WHERE cr.job_id = j.job_id AND cr.request_status = 'pending'
-    ORDER BY cr.created_at DESC LIMIT 1) AS pending_request_reason`;
+    ORDER BY cr.created_at DESC LIMIT 1) AS pending_request_reason,
+  (SELECT cr.preferred_datetime FROM tbl_job_customer_request cr
+    WHERE cr.job_id = j.job_id AND cr.request_status = 'pending'
+    ORDER BY cr.created_at DESC LIMIT 1) AS pending_request_preferred_datetime`;
 }
 
 /*
@@ -1095,10 +1109,17 @@ async function getById(jobId) {
       // hides them by default but exposes a "Show Inactive" toggle that
       // lets the operator restore a row they removed by mistake. Filtering
       // them out here would deny the restore path. (Updated 2026-05-26.)
+      // ADDITIVE (2026-07-10): charge_type + effective_charge are NEW alias keys
+      // for the mobile order-detail (line price usually lives on the client-service
+      // row, not js.total_charge which is often 0, so the app showed every order as
+      // "Free"/blank). Existing columns — incl. js.total_charge the CRM reads — are
+      // unchanged, so the CRM Job Transaction view is unaffected.
       `SELECT js.job_service_id, js.service_id, js.quantity, js.total_charge,
               js.job_service_status, js.service_category_id, js.service_type_id,
               st.service_type_name, sc.service_catg_name,
-              CR.crc_ratecard_name AS service_name
+              CR.crc_ratecard_name AS service_name,
+              CS.charge_type,
+              COALESCE(NULLIF(js.total_charge, 0), CS.total_amount) AS effective_charge
          FROM tbl_job_services js
          LEFT JOIN tbl_service_type st ON st.service_type_id = js.service_type_id
          LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = js.service_category_id

@@ -3,6 +3,7 @@ const multer = require('multer');
 
 const logger = require('../../logger');
 const validate = require('../../middleware/validate');
+const { role } = require('../../middleware/role');
 const { writeBuffer, unlinkFile } = require('../../utils/file-storage');
 const { modernOk, modernError } = require('../../utils/response');
 const { uploadForm, deleteQuery } = require('../../validators/files.validator');
@@ -18,12 +19,18 @@ const upload = multer({
  *     file       = <binary, required>
  *     category   = easyfixer_documents | job_files | invoices | general (default)
  *
- * DELETE /api/shared/files?category=...&filename=...
+ * DELETE /api/shared/files?category=...&filename=...   [ADMIN GROUP ONLY]
  *   Both query params are required. Filename must not contain "/", "\", or null bytes.
  *   Resolved path must start with the category root (path-traversal guard).
  *
- * Entity-aware deletes that also remove DB rows (e.g. tbl_job_image,
- * tbl_easyfixer_document) live in the owning route groups, NOT here.
+ *   This raw filename delete carries NO owner/entity linkage (on-disk names are
+ *   opaque `{ts}_{rand8}{ext}`), so ownership cannot be authorized from the name
+ *   alone. It is therefore gated to the `admin` group — a technician (efr) or
+ *   client SPOC bearer, which requireAuth otherwise accepts on this shared mount,
+ *   now fails closed (403). Entity-aware deletes that also remove DB rows and are
+ *   scope-checked (e.g. tbl_job_image via DELETE /api/admin/jobs/images/:imageId,
+ *   tbl_easyfixer_document) live in the owning route groups, NOT here. No app/CRM
+ *   caller uses this shared delete today (they use the entity endpoints).
  */
 
 router.post('/upload', upload.single('file'), validate(uploadForm, 'body'), async (req, res, next) => {
@@ -46,7 +53,7 @@ router.post('/upload', upload.single('file'), validate(uploadForm, 'body'), asyn
   }
 });
 
-router.delete('/files', validate(deleteQuery, 'query'), async (req, res, next) => {
+router.delete('/files', role(['admin']), validate(deleteQuery, 'query'), async (req, res, next) => {
   try {
     logger.info('Delete file · category=' + req.query.category + ' filename=' + req.query.filename);
     const result = unlinkFile(req.query.category, req.query.filename);

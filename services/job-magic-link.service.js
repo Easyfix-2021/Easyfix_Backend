@@ -102,6 +102,7 @@ const CONFIG_PROP_KEYS = Object.freeze(new Set([
   'auto_process_unconfirmed_order',
   'max_magic_link_send_count',
   'collected_by',
+  'order_confirmation_mode',
 ]));
 
 // Raw prop name → canonical key (dedicated tbl_job column + top-level payload key).
@@ -199,8 +200,14 @@ function normaliseCustomPropRows(rows) {
       ),
       label: r.property_label ?? r.c_prop_label ?? r.label ?? r.display_name ?? null,
       value: r.property_value ?? r.c_prop_values ?? r.value ?? r.field_value ?? null,
+      // is_config discriminator (migration 2026-07-10). 1 = client-level
+      // CONFIG/CONTROL row → strip from the customer form regardless of name.
+      isConfig: propFlagTruthy(r.is_config),
     }))
-    .filter((p) => p.name && !CONFIG_PROP_KEYS.has(normalizePropKey(p.name)));
+    // Strip a row when it is flagged is_config=1 OR its name matches a known
+    // CONFIG key. The name match is a DEFENSIVE fallback for pre-migration /
+    // unflagged rows so a customer NEVER sees a control toggle.
+    .filter((p) => p.name && !p.isConfig && !CONFIG_PROP_KEYS.has(normalizePropKey(p.name)));
 }
 
 // Load + normalise a client's CUSTOMER-FACING custom properties (config rows

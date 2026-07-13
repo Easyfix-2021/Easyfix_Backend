@@ -1,9 +1,8 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const fcmService = require('./fcm.service');
-// Reuse the canonical dual-source token resolver (tbl_easyfixer_app.device_id +
-// device_info.fire_base_token) rather than cloning it a 4th time.
-const { resolveTokens } = require('./registration-status-push.service');
+// Token resolution + dead-token pruning come from the one shared delivery layer.
+const pushDelivery = require('./push-delivery.service');
 
 /*
  * Attendance-reminder cron (2026-06-28).
@@ -15,9 +14,9 @@ const { resolveTokens } = require('./registration-status-push.service');
  * Companion to the in-app "mark attendance" popup the technician app shows on
  * open (both read the same predicate: attendance unmarked for the IST day).
  *
- * Token routing: the canonical dual-source resolver (resolveTokens) — reads
- * tbl_easyfixer_app.device_id first, then device_info.fire_base_token. Dead
- * tokens FCM reports (404 UNREGISTERED) are pruned from both stores.
+ * Token routing + dead-token pruning: the shared push-delivery layer (reads
+ * tbl_easyfixer_app.device_id first, then device_info.fire_base_token; prunes
+ * 404 UNREGISTERED tokens from both stores).
  *
  * Best-effort by contract: per-tech failures are counted + logged, never abort
  * the loop; the top level swallows so a cron tick can't crash the process.
@@ -35,49 +34,17 @@ function istDateString(offsetDays = 0) {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(d);
 }
 
-// Clear a token FCM reported as dead from BOTH stores so fan-out stops
-// targeting it (registration-status-push keeps this private, so a small local
-// copy — same statements).
-async function pruneDeadToken(efrId, token) {
-  if (!efrId || !token) return;
-  try {
-    await pool.query(
-      "UPDATE device_info SET fire_base_token = NULL, is_logged_in = '0' WHERE user_id = ? AND fire_base_token = ?",
-      [efrId, token],
-    );
-    await pool.query(
-      'UPDATE tbl_easyfixer_app SET device_id = NULL WHERE efr_id = ? AND device_id = ?',
-      [efrId, token],
-    );
-    logger.push('attendance-reminder · pruned dead token · efr=' + efrId);
-  } catch (e) {
-    logger.warn({ efrId, err: e.message }, 'attendance-reminder: dead-token prune failed');
-  }
-}
-
-// Push the reminder to ONE technician across all their device tokens. Returns
-// { delivered } — delivered true if at least one token took the push.
+// Push the reminder to ONE technician across all their device tokens (dead
+// tokens are pruned inside the shared delivery layer). Returns { delivered } —
+// delivered true if at least one token took the push, skipped when no tokens.
 async function pushTo(efrId) {
-  const tokens = await resolveTokens(efrId);
-  if (!tokens.length) return { delivered: false, skipped: true };
-
-  const results = await Promise.all(
-    tokens.map((token) =>
-      fcmService
-        .sendPush({ token, title: PUSH_TITLE, body: PUSH_BODY, data: PUSH_DATA })
-        // Pair the token back with its result — sendPush() doesn't echo it, and
-        // pruneDeadToken needs to know WHICH token died.
-        .then((r) => ({ token, ...(r || {}) }))
-        .catch((e) => ({ token, delivered: false, error: e.message })),
-    ),
+  const r = await pushDelivery.deliverToEfr(
+    efrId,
+    { title: PUSH_TITLE, body: PUSH_BODY, data: PUSH_DATA },
+    { channel: 'attendance-reminder' },
   );
-
-  let delivered = 0;
-  for (const r of results) {
-    if (r.deadToken && !r.redirected) await pruneDeadToken(efrId, r.token);
-    if (r.delivered) delivered += 1;
-  }
-  return { delivered: delivered > 0, deliveredCount: delivered };
+  if (r.reason === 'no tokens') return { delivered: false, skipped: true };
+  return { delivered: r.delivered, deliveredCount: r.deliveredCount };
 }
 
 /*
@@ -181,7 +148,7 @@ async function runTest({ sourceId } = {}) {
     });
   }
 
-  const tokens = await resolveTokens(efrId);
+  const tokens = await pushDelivery.resolveTokensForEfr(efrId);
   logger.info('attendance-reminder TEST · efr_id=' + efrId + ' · tokens=' + tokens.length);
   if (!tokens.length) {
     return { test: true, source: { efr_id: efrId, name: row.name }, tokens: 0, delivered: false, note: 'no device tokens for this easyfixer' };

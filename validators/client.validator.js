@@ -267,6 +267,10 @@ const createCustomPropertyBody = Joi.object({
   label:      Joi.string().max(200).optional().allow('', null),
   value:      Joi.string().max(500).optional().allow('', null),
   mandatory:  Joi.boolean().optional(),
+  // is_config discriminator (2026-07-10): 1 = client-level CONFIG/CONTROL
+  // setting (hidden from booking forms + bulk templates); 0 = per-booking
+  // DATA-ENTRY field. Tolerant boolean/0-1 variant; defaults to 0 server-side.
+  is_config:  Joi.alternatives(Joi.boolean(), Joi.number().valid(0, 1)).optional(),
 }).options({ stripUnknown: true });
 
 const updateCustomPropertyBody = Joi.object({
@@ -275,6 +279,8 @@ const updateCustomPropertyBody = Joi.object({
   value:      Joi.string().max(500).optional().allow('', null),
   mandatory:  Joi.boolean().optional(),
   isMandatory: Joi.boolean().optional(),
+  // is_config discriminator (2026-07-10) — see createCustomPropertyBody.
+  is_config:  Joi.alternatives(Joi.boolean(), Joi.number().valid(0, 1)).optional(),
   // snake_case
   property_name:  Joi.string().max(100).optional(),
   property_label: Joi.string().max(200).optional().allow('', null),

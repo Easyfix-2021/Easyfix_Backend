@@ -65,8 +65,9 @@ router.post(
 // DUPLICATES REMOVED: `start-work` (duplicated POST /jobs/:id/checkin —
 // already transitions BOOKED/SCHEDULED → 2 IN_PROGRESS) and `complete`
 // (duplicated POST /jobs/:id/checkout — already transitions → 3 COMPLETED).
-// The app consumes those existing routes. The problem/cash/revisit body +
-// revisit(→10) routing will be added to `checkout` in a later iteration.
+// The app consumes those existing routes. `checkout` persists the full
+// problem/cash/revisit body (incl. otherRemark → check-out job comment and
+// revisit_date + revisit_time_slot) and routes a next-visit to status 10.
 
 // ─── Check-in PIN SMS ────────────────────────────────────────────────
 // POST /jobs/:id/checkin-sms → (re)send the customer the check-in PIN.

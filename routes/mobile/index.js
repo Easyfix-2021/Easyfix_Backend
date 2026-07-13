@@ -8,6 +8,7 @@ const requireTechAuth = require('../../middleware/tech-auth');
 const { pool } = require('../../db');
 const techAuth = require('../../services/tech-auth.service');
 const jobService = require('../../services/job.service');
+const jobCommentService = require('../../services/job-comment.service');
 const shareService = require('../../services/job-share.service');
 const voice = require('../../services/voice.service');
 const { dailyBridgeCapReached, persistBridgeCall } = require('../public/_public-call');
@@ -575,7 +576,11 @@ router.post('/jobs/:id/eta', validate(Joi.object({
 // through the `extras` whitelist so the transition rules + stamps land
 // in a single shared UPDATE — no duplication of status-transition logic.
 router.post('/jobs/:id/checkin', validate(Joi.object({
-  gps: Joi.string().pattern(/^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/).required(),
+  // Location stamp is nice-to-have, NOT a gate — the customer PIN is the real
+  // check-in control. Requiring gps used to 400 the whole request before the PIN
+  // verify ran whenever coords were unavailable (GPS off / permission denied),
+  // effectively making check-in unreachable. Optional keeps the tech unblocked.
+  gps: Joi.string().pattern(/^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/).optional().allow('', null),
   address: Joi.string().max(500).optional(),
   pincode: Joi.string().pattern(/^[0-9]{6}$/).optional(),
   otp: Joi.string().optional(),
@@ -592,14 +597,21 @@ router.post('/jobs/:id/checkin', validate(Joi.object({
     const submittedOtp = req.body.otp == null ? '' : String(req.body.otp).trim();
     if (jobPin && jobPin !== submittedOtp) {
       logger.warn('Check-in blocked · id=' + req.params.id + ' · PIN mismatch');
-      return modernError(res, 409, 'Incorrect check-in PIN. Ask the customer for the PIN sent to them.');
+      // Structured error so the app re-prompts for the PIN specifically, instead
+      // of mislabelling every 4xx as "wrong PIN". modernError only auto-sets the
+      // HTTP-log hint for string errors, so set it manually for the object form.
+      if (res.locals) res.locals.logHint = 'check-in PIN mismatch';
+      return modernError(res, 409, {
+        message: 'Incorrect check-in PIN. Ask the customer for the PIN sent to them.',
+        code: 'INVALID_CHECKIN_PIN',
+      });
     }
     await jobService.setStatus(
       job.job_id,
       {
         status: 2 /* IN_PROGRESS */,
         extras: {
-          checkin_gps_location: req.body.gps,
+          checkin_gps_location: req.body.gps || null,
           checkin_address:      req.body.address || null,
           checkin_pincode:      req.body.pincode || null,
           fk_checkin_by:        req.tech.efr_id,
@@ -623,8 +635,9 @@ router.post('/jobs/:id/checkin', validate(Joi.object({
 //   else              → job_status 3  COMPLETED
 // `setStatus` fires the transition webhook + stamps checkout_date_time +
 // fk_checkout_by; the cash/problem/revisit columns ride through the extras
-// allowlist so everything lands in one UPDATE. (otherRemark has no tbl_job
-// column today, so it's accepted but not persisted — a future job-comment hook.)
+// allowlist so everything lands in one UPDATE. otherRemark has no tbl_job
+// column, so it's persisted below as a tbl_job_comment (comment_on=3, check-out)
+// after the transition. A revisit stamps both revisit_date + revisit_time_slot.
 router.post('/jobs/:id/checkout',
   validate(Joi.object({
     haveProblemWithJob:       Joi.boolean().default(false),
@@ -660,7 +673,15 @@ router.post('/jobs/:id/checkout',
     if (isRevisit) {
       if (b.easyfixerRevisitReasonId != null) extras.revisit_reason_id = b.easyfixerRevisitReasonId;
       if (b.requestedDateTime) {
-        extras.revisit_date = String(b.requestedDateTime).replace('T', ' ').slice(0, 19);
+        // App sends wall-clock 'yyyy-MM-ddTHH:mm:ss'. Legacy keeps the revisit
+        // appointment as two columns (revisit_date + revisit_time_slot). Split so
+        // the chosen time survives even if revisit_date is a DATE column, and so
+        // the work-progress read + the transition webhook's revisitTimeSlot stop
+        // returning NULL.
+        const dt = String(b.requestedDateTime).replace('T', ' ').slice(0, 19); // 'YYYY-MM-DD HH:mm:ss'
+        extras.revisit_date = dt;
+        const timePart = dt.slice(11); // 'HH:mm:ss' — empty when only a date was sent
+        if (timePart) extras.revisit_time_slot = timePart;
       }
     }
     await jobService.setStatus(
@@ -669,6 +690,25 @@ router.post('/jobs/:id/checkout',
       { user_id: req.tech.efr_id },
     );
     logger.info('Checked out · id=' + job.job_id + ' · status->' + (isRevisit ? 'REVISIT' : 'COMPLETED'));
+
+    // otherRemark has no tbl_job column — persist it as a check-out job comment
+    // (comment_on=3; addComment also mirrors it onto tbl_job.remarks). Best-effort:
+    // the status transition already committed, so a comment failure must NOT fail
+    // the checkout response.
+    const remark = b.otherRemark == null ? '' : String(b.otherRemark).trim();
+    if (remark) {
+      try {
+        await jobCommentService.addComment(job.job_id, {
+          comments: remark,
+          comment_on: 3, // check_out
+          efr_id: req.tech.efr_id,
+          job_stage: isRevisit ? 10 : 3,
+        });
+      } catch (ce) {
+        logger.warn('Checkout remark comment failed · id=' + job.job_id + ' · ' + ce.message);
+      }
+    }
+
     modernOk(res, {
       jobId: job.job_id,
       completedAt: extras.app_checkout_date_time,

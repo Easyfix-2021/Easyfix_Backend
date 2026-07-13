@@ -487,6 +487,44 @@ Why this matters: without this, a job offered to technicians who never respond w
     offerExpiryJob.skipReason = 'CRON_DISABLED=true';
   }
 
+  // ─── Call-recording backfill — every 15 min ──────────────────────────
+  // (Added 2026-07-10) The Plivo PUSH recording callback (<Dial
+  // recordingCallbackUrl>) has proven unreliable — tbl_plivo_call_log.recording_url
+  // was never populated by it. This PULLS missing recordings from the Plivo
+  // Recording API (by call_uuid) and persists them, so recording_url stays
+  // populated for the "Missing Call Recordings" report + downstream transcription
+  // without depending on the push. No-op when there's nothing missing / columns
+  // absent. No property gate (one bounded sweep; safe).
+  const recordingBackfillSvc = require('../services/recording-backfill.service');
+  const recordingBackfillJob = registerJob({
+    id: 'recording-backfill',
+    name: 'Call-Recording Backfill',
+    description:
+`What this task does: When the CRM records a call, the recording URL is supposed to be pushed back by the phone provider (Plivo). That push has been unreliable, so this task fills the gap. Step by step:
+  1. Every 15 minutes, the task wakes up automatically.
+  2. It finds recorded calls that are still missing their recording URL.
+  3. For each, it asks Plivo directly for the recording and saves the URL.
+  4. It logs how many it recovered — visible in the server logs and on this page.
+
+Why this matters: without this, recorded calls would show no recording in the CRM and would be missed by the "Missing Call Recordings" report and by call-quality transcription, even though Plivo has the audio.`,
+    cron: '*/15 * * * *',
+    runner: async () => {
+      const result = await recordingBackfillSvc.backfillMissingRecordings({ limit: 100 });
+      logger.info(`Recording-backfill cron · recovered=${result.recovered} scanned=${result.scanned}` + (result.skipped ? ' (skipped: columns absent)' : ''));
+      return result;
+    },
+  });
+  if (!cronDisabled) {
+    recordingBackfillJob.task = cron.schedule(
+      recordingBackfillJob.cron,
+      () => invokeJob(recordingBackfillJob, 'cron'),
+      { timezone: TZ },
+    );
+    recordingBackfillJob.registered = true;
+  } else {
+    recordingBackfillJob.skipReason = 'CRON_DISABLED=true';
+  }
+
   // ─── Attendance reminder — daily at 9:00 IST ─────────────────────────
   // (Added 2026-06-28) Pushes a "mark your attendance" FCM reminder to every
   // active + verified technician who has NOT marked attendance for TODAY (IST).
@@ -552,6 +590,59 @@ Note: this task only runs automatically if the property "attendance.reminder.ena
     );
     attendanceReminderJob.registered = true;
     logger.info(`Attendance-reminder cron registered (attendance.reminder.enabled=true, schedule="${attendanceCronExpr}" IST).`);
+  }
+
+  // ─── Easyfixer auto-reactivation — daily at 01:00 IST ───────────────
+  // (Added 2026-07-13) Reactivates technicians set "Temporarily Inactive" with a
+  // scheduled_reactivation_date that has arrived (efr_status 0 → 1, clears the
+  // date). Property-gated + IST-date based (not CURDATE). Runs at 01:00 IST,
+  // before the 09:00 attendance push, so a reactivated tech is in that day's pool.
+  const easyfixerReactivationCron = require('../services/easyfixer-reactivation-cron');
+  const easyfixerReactivationJob = registerJob({
+    id: 'easyfixer-auto-reactivation',
+    name: 'Technician Auto-Reactivation',
+    description:
+`What this task does: Every day at 1:00 AM IST, technicians who were set "Temporarily Inactive" with a scheduled reactivation date that has now arrived are automatically switched back to Active.
+
+Here's how it works, step by step:
+  1. Every day at 1:00 AM IST, the task wakes up automatically.
+  2. It finds every technician who is currently Inactive (efr_status = 0), is verified, and has a scheduled reactivation date on or before today (IST).
+  3. For each, it flips them back to Active and clears the scheduled date + the stored inactivity reason, so the row is processed once and never re-fires.
+  4. Technicians deactivated permanently (no scheduled date) are never touched.
+  5. The task logs how many technicians were reactivated (visible in the server logs and on this page).
+
+Why this matters: ops can put a technician on a fixed break (leave, temporary suspension) and have the system bring them back automatically on the agreed date, instead of relying on someone remembering to reactivate them.
+
+Note: this task only runs automatically if the property "easyfixer.auto_reactivation.enabled" is "true" in easyfix_properties (checked once at server start — a restart is required after changing it). If unset or "false", the schedule is OFF, but Trigger Now / Test still work for manual verification.`,
+    cron: '0 1 * * *',
+    runner: async () => {
+      const result = await easyfixerReactivationCron.runDailyReactivation();
+      logger.info(
+        `Easyfixer auto-reactivation cron · reactivated=${result.reactivated}` +
+        (result.skipped ? ' (skipped — column pre-migration)' : '')
+      );
+      return result;
+    },
+    tester: ({ sourceId }) => easyfixerReactivationCron.runTest({ sourceId }),
+    testSourceLabel: 'Easyfixer ID (efr_id)',
+    testSourceHelp:
+      'Required. Immediately reactivates THIS temporarily-inactive, verified technician (ignores the scheduled date) so you can verify the flow end-to-end.',
+  });
+  const easyfixerReactivationEnabled =
+    String(getProperty('easyfixer.auto_reactivation.enabled') ?? '').toLowerCase() === 'true';
+  if (cronDisabled) {
+    easyfixerReactivationJob.skipReason = 'CRON_DISABLED=true';
+  } else if (!easyfixerReactivationEnabled) {
+    easyfixerReactivationJob.skipReason = "property 'easyfixer.auto_reactivation.enabled' was not 'true' at server start — flip it to 'true' and restart the server to enable";
+    logger.info("Easyfixer auto-reactivation cron SKIPPED — set easyfixer.auto_reactivation.enabled=true in easyfix_properties to enable (takes effect after restart).");
+  } else {
+    easyfixerReactivationJob.task = cron.schedule(
+      easyfixerReactivationJob.cron,
+      () => invokeJob(easyfixerReactivationJob, 'cron'),
+      { timezone: TZ },
+    );
+    easyfixerReactivationJob.registered = true;
+    logger.info('Easyfixer auto-reactivation cron registered (easyfixer.auto_reactivation.enabled=true, 01:00 IST).');
   }
 
   // ── Transcription backfill — fetch Plivo transcripts for EVERY completed

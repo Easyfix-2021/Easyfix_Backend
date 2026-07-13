@@ -177,38 +177,47 @@ function recordingCallbackUrl(jci) {
 // Plivo call-control XML the public answer route returns when the agent picks
 // up — bridges to the customer leg. callerId is the Plivo DID.
 //
-// Recording (2026-07-03): `record="true"` on <Dial> records the bridged
-// conversation server-side at Plivo as an mp3. NOTE: <Dial> exposes NO channel
-// option, so this is Plivo's default single/mixed (mono) track — NOT guaranteed
-// 2-channel. ⚠️ AWS Transcribe CALL ANALYTICS (the metrics panel) needs
-// dual-channel input, so verify an actual recording's channel count (e.g.
-// `ffprobe -show_entries stream=channels`) before relying on it — if mono, the
-// metrics half won't run (the LLM coaching, from the Plivo transcript, is
-// unaffected by channel count). We do NOT set a
-// recordingCallbackUrl (2026-07-08): when a URL is supplied, Plivo POSTs the
-// recording URL/id to it once the mp3 is ready. We now DO set it (via the
-// caller) because the previous lazy "fetch by CallUUID" lookup FAILS for
-// web/WebRTC calls — the recording can be filed under a different leg than the
-// stored call_uuid, so the Recording API returns nothing even though
-// recording_requested=1. The callback pushes us the exact URL, no guessing.
-// Playback still caches to our S3 on first play. Gated on
-// `plivo.recording.enabled` by the caller so it can be turned off without a
-// deploy. ⚠️ Recording customer calls needs compliance/consent sign-off.
+// Recording (FIXED 2026-07-13): a bridged Plivo call is recorded with the
+// <Record> ELEMENT placed BEFORE <Dial> — NOT via attributes on <Dial>. The
+// <Dial> element has NO record/recordFileFormat/recordingCallbackUrl attributes
+// (verified against Plivo's XML reference), so the previous `record="true"` on
+// <Dial> was SILENTLY IGNORED and NO recording was ever created — which is why
+// tbl_plivo_call_log.recording_url was NULL for every row (nothing to push, and
+// nothing for the pull to find).
+//   recordSession="true"     → records the whole session in the BACKGROUND, so
+//                              call flow continues straight to <Dial>.
+//   startOnDialAnswer="true" → recording begins when the customer (B-leg) picks
+//                              up (skips the ring/dead-air).
+//   recordChannelType="stereo" → 2-channel (each party on its own channel) —
+//                              needed for AWS Transcribe CALL ANALYTICS.
+//   callbackUrl + callbackMethod="POST" → Plivo POSTs RecordUrl / RecordingID /
+//                              RecordingDuration here when the mp3 is ready
+//                              (handled by /api/public/plivo/recording-callback,
+//                              keyed by the jci token — LEG-AGNOSTIC, so
+//                              web/WebRTC calls populate too). If no public
+//                              callback base is configured, recording still
+//                              happens and the play-time / sweep PULL
+//                              (fetchRecordingMeta by call_uuid) recovers it.
+// Gated on `plivo.recording.enabled` by the caller (DB property, no redeploy).
+// ⚠️ Recording customer calls needs compliance/consent sign-off.
+//
+// streamWssUrl (AI teleprompter, merged from AI-Teleprompter branch): optional
+// listen-only media fork — see the <Stream> block below. ADDITIVE; absent ⇒
+// identical XML to a plain recorded bridge.
 function buildAnswerXml(dest, { record = false, recordingCallbackUrl = null, streamWssUrl = null } = {}) {
   const callerId = process.env.PLIVO_CALLER_ID || '';
   const num = String(dest || '').replace(/[^0-9]/g, '');
-  let dialAttrs = ` callerId="${callerId}"`;
+  let recordEl = '';
   if (record) {
-    dialAttrs += ` record="true" recordFileFormat="mp3"`;
+    let recAttrs = ' recordSession="true" startOnDialAnswer="true"'
+      + ' fileFormat="mp3" recordChannelType="stereo"';
     if (recordingCallbackUrl) {
       // XML-attribute-escape (the URL query is `?t=<jwt>` — base64url has no
       // XML specials, but escape defensively).
       const escUrl = String(recordingCallbackUrl).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-      // Only the documented `recordingCallbackUrl` attribute — Plivo POSTs the
-      // recording callback by default (and our route handles POST+GET), so no
-      // separate method attribute is needed.
-      dialAttrs += ` recordingCallbackUrl="${escUrl}"`;
+      recAttrs += ` callbackUrl="${escUrl}" callbackMethod="POST"`;
     }
+    recordEl = `<Record${recAttrs}/>`;
   }
   // Optional listen-only media fork (AI teleprompter): stream the call audio to our
   // STT websocket IN PARALLEL with the bridge. bidirectional="false" = we only
@@ -221,7 +230,10 @@ function buildAnswerXml(dest, { record = false, recordingCallbackUrl = null, str
     const escUrl = String(streamWssUrl).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     streamEl = `<Stream bidirectional="false" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000">${escUrl}</Stream>`;
   }
-  return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>${streamEl}<Dial${dialAttrs}><Number>${num}</Number></Dial></Response>`;
+  // MERGE (2026-07-13): keep BOTH the <Record> element (Production recording-NULL
+  // fix) AND the <Stream> fork (teleprompter) before a clean <Dial callerId> —
+  // recording is NO LONGER a <Dial> attribute, and both are background/non-blocking.
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>${recordEl}${streamEl}<Dial callerId="${callerId}"><Number>${num}</Number></Dial></Response>`;
 }
 
 function authHeader() {

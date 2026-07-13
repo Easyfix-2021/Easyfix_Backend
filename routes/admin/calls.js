@@ -7,6 +7,7 @@ const kaleyra = require('../../services/kaleyra.service');
 const plivo = require('../../services/plivo.service');
 const voice = require('../../services/voice.service');
 const plivoLog = require('../../services/plivo-call-log.service');
+const recordingBackfill = require('../../services/recording-backfill.service');
 const callAnalysis = require('../../services/call-analysis.service');
 const callerScorecard = require('../../services/caller-scorecard.service');
 const propertiesSvc = require('../../services/properties.service');
@@ -443,6 +444,7 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
         receiver_number: kaleyra.normaliseIndianPhone(receiverMobile),
         dialed_number: kaleyra.normaliseIndianPhone(dialTo),
         status: 'placed',
+        recording_requested: plivo.recordingEnabled() ? 1 : 0,
       });
     }
 
@@ -561,6 +563,7 @@ router.post('/web-start', requireClickToCallAction, validate(clickToCallBody), a
       caller_user_id: agent.user_id, caller_name: agent.user_name, receiver_name: rr.receiverName || null,
       receiver_number: receiver, dialed_number: dialNumber,
       status: 'initiated',
+      recording_requested: plivo.recordingEnabled() ? 1 : 0,
     });
 
     logger.info(`Web call started · agent=${agent.user_name}(#${agent.user_id}) → ${rr.receiverName || rr.receiverCustomerId || 'customer'} · row=${jci}`);
@@ -628,6 +631,21 @@ function parseRowId(raw) {
   const n = Number(raw);
   return Number.isInteger(n) && n > 0 ? n : null;
 }
+
+// ─── POST /recordings/backfill — recover missing recording URLs (admin) ───────
+// The Plivo push callback (<Dial recordingCallbackUrl>) never populated
+// recording_url (observed has_url=0). This sweeps rows that requested recording
+// but have no URL and PULLS each from the Plivo Recording API by call_uuid,
+// persisting it via setRecording. Request-triggered, so it runs even when
+// CRON_DISABLED (QA). ?limit (default 50, max 200) — sweep is sequential.
+// Declared BEFORE the '/:id/*' routes so ':id' can't capture 'recordings'.
+router.post('/recordings/backfill', requireClickToCallAction, async (req, res, next) => {
+  try {
+    const result = await recordingBackfill.backfillMissingRecordings({ limit: req.query.limit });
+    logger.info('Recording backfill (manual) · ' + JSON.stringify(result));
+    return modernOk(res, result);
+  } catch (e) { next(e); }
+});
 
 // ─── GET /:id/status — live status of one call (FE polling) ────────────
 // Returns the normalized caller_status + timestamps so the FE live panel can
@@ -831,6 +849,7 @@ router.get('/:id/recording', requireClickToCallAction, async (req, res, next) =>
     // returned nothing. Fall back to that lookup. Column-probed via try/catch
     // so a pre-migration deploy still works via the legacy path.
     let meta = null;
+    let pulled = false;
     try {
       const [[plog]] = await pool.query(
         'SELECT recording_url, recording_id FROM tbl_plivo_call_log WHERE job_caller_info_id = ? AND recording_url IS NOT NULL ORDER BY id DESC LIMIT 1',
@@ -844,11 +863,18 @@ router.get('/:id/recording', requireClickToCallAction, async (req, res, next) =>
         return modernError(res, 404, 'No recording available for this call');
       }
       meta = await plivo.fetchRecordingMeta({ callUuid: row.unique_id });
+      pulled = true;
     }
     if (!meta.ok || !meta.url) {
       // Plivo can lag a few seconds after hangup, or recording was off.
       return modernError(res, 404, 'No recording available yet — if the call just ended, try again shortly.');
     }
+    // Backfill tbl_plivo_call_log.recording_url from this fresh PULL — the Plivo
+    // push callback (<Dial recordingCallbackUrl>) has proven unreliable (never
+    // populated the column), so playing a call self-heals its log row and clears
+    // it from the "missing recordings" report. Best-effort (setRecording is
+    // fail-soft). Only when we actually pulled (skip when meta came from the log).
+    if (pulled) await plivoLog.setRecording(id, { url: meta.url, id: meta.recordingId, duration: meta.duration });
     const dl = await plivo.downloadRecording(meta.url);
     if (!dl.ok || !dl.buffer) {
       return modernError(res, 502, 'Failed to fetch the recording from the provider.');

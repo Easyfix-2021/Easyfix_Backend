@@ -1,0 +1,11 @@
+-- "Temporary Inactive" support for technicians. When an Admin deactivates a
+-- technician (efr_status=0) and supplies a date to auto-reactivate on, that date
+-- is stored here; a daily IST cron (easyfixer-auto-reactivation) flips efr_status
+-- back to 1 on/after the date and clears this column. NULL = a permanent
+-- deactivation (the cron never touches it).
+--
+-- SHARED DB: tbl_easyfixer is read by 5 legacy services. This column is nullable
+-- with DEFAULT NULL and is never referenced by any legacy SELECT/UPDATE, so it is
+-- backward-compatible. SHARED-SCHEMA change — requires DBA sign-off before running.
+-- Backend reads/writes it probe-gated, so the code is safe before this is applied.
+ALTER TABLE tbl_easyfixer ADD COLUMN scheduled_reactivation_date DATE NULL DEFAULT NULL;

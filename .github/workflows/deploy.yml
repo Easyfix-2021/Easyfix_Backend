@@ -78,6 +78,13 @@ jobs:
           node --check services/zone.service.js           || true
           node --check services/zone-upload.service.js    || true
 
+      # Characterization tests for the shared choke points (setStatus, create,
+      # assign, offer, accept-offer, reschedule, magic-link write, + the
+      # statusToEventName notification gate). Fake-pool based — no DB, no network,
+      # deterministic. A failure blocks the deploy (build-and-push needs precheck).
+      - name: Unit tests (characterization — no DB)
+        run: npm test
+
   build-and-push:
     name: Build image & push to ECR
     needs: precheck

@@ -10,11 +10,18 @@ const jwt = require('jsonwebtoken');
  */
 
 async function findSpoc(identifier) {
-  const col = /@/.test(identifier) ? 'contact_email' : 'contact_no';
+  const raw = String(identifier || '').trim();
+  const isEmail = /@/.test(raw);
+  // Case-insensitive email match (mobile compared as-is so its index stays
+  // usable). LOWER() on both sides handles any stored casing. Both createLoginOtp
+  // and verifyLoginOtp key otp_details by the RETURNED row's canonical
+  // contact_email/contact_no, so OTP correlation stays intact regardless of casing.
+  const col = isEmail ? 'LOWER(contact_email)' : 'contact_no';
+  const value = isEmail ? raw.toLowerCase() : raw;
   const [[row]] = await pool.query(
     `SELECT id, client_id, contact_name, contact_email, contact_no
        FROM tbl_client_contacts WHERE ${col} = ? AND status = 1 LIMIT 1`,
-    [identifier]
+    [value]
   );
   return row || null;
 }

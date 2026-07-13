@@ -713,6 +713,7 @@ const CUSTOM_PROP_COLS_CANONICAL = {
   label: 'property_label',
   value: 'property_value',
   mandatory: 'is_mandatory',
+  isConfig: 'is_config', // only used if _customPropsHasIsConfig
   hasStatus: false,
 };
 const CUSTOM_PROP_COLS_LEGACY = {
@@ -721,6 +722,7 @@ const CUSTOM_PROP_COLS_LEGACY = {
   label: 'c_prop_label', // only used if _customPropsHasLegacyLabel
   value: 'c_prop_values',
   mandatory: 'c_prop_mandatory',
+  isConfig: 'is_config', // only used if _customPropsHasIsConfig
   hasStatus: true,
 };
 
@@ -730,6 +732,10 @@ async function customPropCols() {
   // Legacy schema may or may not have c_prop_label. Drop the column
   // when the probe says absent so INSERT/UPDATE doesn't reference it.
   if (legacy && !_customPropsHasLegacyLabel) cols.label = null;
+  // is_config is an optional additive column (migration 2026-07-10). Drop it
+  // when the probe says absent so INSERT/UPDATE never reference a missing
+  // column on a pre-migration deploy — exactly how c_prop_label is gated.
+  if (!_customPropsHasIsConfig) cols.isConfig = null;
   return cols;
 }
 
@@ -759,6 +765,13 @@ async function createCustomProperty(clientId, body) {
     ? (cols.hasStatus ? '' : null)
     : trimmedValue;
   insertVals.push(valueCell, body.mandatory ? 1 : 0);
+  // is_config discriminator (optional column — gated by the probe). Coerce a
+  // truthy body flag → 1, else 0. Absent column → cols.isConfig is null and
+  // this block no-ops (the DB DEFAULT 0 still applies on newer deploys).
+  if (cols.isConfig) {
+    insertCols.push(cols.isConfig);
+    insertVals.push(body.is_config ? 1 : 0);
+  }
   if (cols.hasStatus) {
     insertCols.push('status');
     insertVals.push(1);
@@ -783,6 +796,7 @@ const CUSTOM_PROP_BODY_KEY_TO_COL_KEY = {
   value: 'value',
   mandatory: 'mandatory',
   isMandatory: 'mandatory',
+  is_config: 'isConfig',
   // Canonical column names are also accepted (legacy callers).
   property_name: 'name',
   property_label: 'label',
@@ -802,6 +816,7 @@ async function updateCustomProperty(propId, body) {
     if (!dbCol) continue; // e.g. label on legacy without c_prop_label
     let v = val;
     if (colKey === 'mandatory') v = val ? 1 : 0;
+    else if (colKey === 'isConfig') v = val ? 1 : 0;
     // Trim the value so a stray space can't land in c_prop_values — the opt-in
     // checks match it EXACTLY ('true'), so 'true ' silently disables the flag
     // (the Greensoul trap). null → '' on legacy (c_prop_values is NOT NULL).
@@ -878,6 +893,7 @@ async function getCustomPropertyClientId(propId) {
 let _customPropsColsProbed = false;
 let _customPropsLegacyShape = false; // true → c_prop_* columns
 let _customPropsHasLegacyLabel = false; // true → c_prop_label exists
+let _customPropsHasIsConfig = false; // true → is_config exists (migration 2026-07-10)
 async function detectCustomPropsShape() {
   if (_customPropsColsProbed) return _customPropsLegacyShape;
   try {
@@ -893,6 +909,15 @@ async function detectCustomPropsShape() {
     } catch (_e) {
       _customPropsHasLegacyLabel = false;
     }
+  }
+  // Probe the additive is_config column independently of schema shape — the
+  // migration adds it to whichever variant this deploy runs. Absent → the
+  // write paths null out cols.isConfig and never reference the column.
+  try {
+    await pool.query('SELECT is_config FROM tbl_client_custom_properties LIMIT 1');
+    _customPropsHasIsConfig = true;
+  } catch (_e) {
+    _customPropsHasIsConfig = false;
   }
   _customPropsColsProbed = true;
   return _customPropsLegacyShape;
