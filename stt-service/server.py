@@ -17,10 +17,29 @@ Env:
 
 import asyncio
 import json
+import logging
 import os
 import numpy as np
 import websockets
+from websockets.exceptions import InvalidMessage
 from faster_whisper import WhisperModel
+
+# ── Quiet benign liveness-probe noise ───────────────────────────────────────
+# The Docker/compose HEALTHCHECK (and any LB / k8s tcpSocket probe) opens a bare
+# TCP connection to the port and closes it WITHOUT a WebSocket handshake, purely
+# to confirm the port is listening. The `websockets` server logs each one as an
+# ERROR with a full traceback ("opening handshake failed" → InvalidMessage /
+# EOFError: connection closed while reading HTTP request line). That is expected
+# probe traffic, not a real failure — drop it so genuine errors stay visible.
+class _QuietProbeHandshakes(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        exc = record.exc_info[1] if record.exc_info else None
+        if isinstance(exc, (InvalidMessage, EOFError)):
+            return False
+        return "opening handshake failed" not in record.getMessage()
+
+
+logging.getLogger("websockets.server").addFilter(_QuietProbeHandshakes())
 
 PORT = int(os.getenv("STT_PORT", "8300"))
 HOST = os.getenv("STT_HOST", "0.0.0.0")

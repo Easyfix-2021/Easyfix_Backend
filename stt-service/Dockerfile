@@ -26,7 +26,7 @@ RUN pip install --no-cache-dir --upgrade pip \
 ARG STT_MODEL=small
 RUN python -c "from faster_whisper import WhisperModel; WhisperModel('${STT_MODEL}', device='cpu', compute_type='int8')"
 
-COPY server.py .
+COPY server.py healthcheck.py .
 
 ENV STT_HOST=0.0.0.0 \
     STT_PORT=8300 \
@@ -36,9 +36,12 @@ ENV STT_HOST=0.0.0.0 \
 
 EXPOSE 8300
 
-# The WS server only starts listening AFTER the model loads → a successful TCP
-# connect to 8300 means "ready". Docker/compose read this for the health status.
+# The WS server only starts listening AFTER the model loads. This healthcheck
+# performs a REAL WebSocket handshake (healthcheck.py) — so "healthy" means the
+# server actually ACCEPTS WebSocket connections, not just that the TCP port is
+# open. A bare TCP connect couldn't tell the difference and logged an "opening
+# handshake failed" traceback on every probe. Docker/compose read this status.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=5 \
-    CMD python -c "import socket; socket.create_connection(('127.0.0.1',8300),2)" || exit 1
+    CMD python healthcheck.py
 
 CMD ["python", "server.py"]
