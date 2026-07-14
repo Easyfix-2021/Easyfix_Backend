@@ -607,6 +607,23 @@ async function jobOfferTableExists() {
   return _hasJobOfferTable;
 }
 
+// Memoised COLUMN-existence probe for the WhatsApp delivery-status columns
+// (migrations/2026-07-14-magic-link-delivery-status.sql). Selecting a missing
+// column parse-errors and 500s the WHOLE jobs list, so — like the table probes
+// above — we probe once and emit NULL aliases when the columns are absent,
+// keeping the LIST projection a transparent no-op on un-migrated deploys.
+let _hasMagicLinkDeliveryCols = null;
+async function magicLinkDeliveryColsExist() {
+  if (_hasMagicLinkDeliveryCols !== null) return _hasMagicLinkDeliveryCols;
+  try {
+    await pool.query('SELECT magic_link_delivery_status FROM tbl_job LIMIT 1');
+    _hasMagicLinkDeliveryCols = true;
+  } catch {
+    _hasMagicLinkDeliveryCols = false;
+  }
+  return _hasMagicLinkDeliveryCols;
+}
+
 /*
  * Builds the pending-customer-request projection columns for the LIST
  * query. When the table exists, emits correlated subqueries selecting the
@@ -655,6 +672,16 @@ function pendingRequestColumns(tableExists) {
  * can accrue many historical offer rows, so a JOIN would fan-out the LIST.
  * Returns a LEADING-COMMA fragment ready to append after pendingRequestColumns().
  */
+// Builds the two WhatsApp delivery-state projection columns. NULL aliases when
+// the columns are absent (pre-migration) so the row shape is identical. LEADING-
+// COMMA fragment, appended after offerColumns().
+function magicLinkDeliveryColumns(colsExist) {
+  if (!colsExist) {
+    return `, NULL AS magic_link_delivery_status, NULL AS magic_link_delivery_reason`;
+  }
+  return `, j.magic_link_delivery_status, j.magic_link_delivery_reason`;
+}
+
 function offerColumns(tableExists) {
   if (!tableExists) {
     return `, NULL AS is_offered, NULL AS offered_efr_name, NULL AS offered_count`;
@@ -732,6 +759,7 @@ async function list({
   noServices,
   startDate, endDate,
   scope,
+  sortBy, sortDir,           // server-side sort — whitelisted column + asc|desc
   limit = 50, offset = 0,
 } = {}) {
   logger.info('List jobs · status=' + (status ?? statuses ?? 'any') + ' · clientId=' + (clientId ?? '-') + ' · easyfixerId=' + (easyfixerId ?? '-') + ' · limit=' + limit + ' · offset=' + offset);
@@ -750,8 +778,13 @@ async function list({
   // Probe ONCE for tbl_job_offer presence too, appending the offer projection
   // (is_offered / offered_efr_name, or NULL aliases). See offerColumns() above.
   const hasJobOffer = await jobOfferTableExists();
+  // Probe ONCE for the WhatsApp delivery-status columns, appending them (or NULL
+  // aliases) so a SPOC/unconfirmed list never 500s pre-migration. See
+  // magicLinkDeliveryColumns() above.
+  const hasMagicLinkDeliveryCols = await magicLinkDeliveryColsExist();
   const listColumns =
-    LIST_COLUMNS + pendingRequestColumns(hasCustomerRequestTable) + offerColumns(hasJobOffer);
+    LIST_COLUMNS + pendingRequestColumns(hasCustomerRequestTable) + offerColumns(hasJobOffer)
+    + magicLinkDeliveryColumns(hasMagicLinkDeliveryCols);
 
   // Apply RBAC scope FIRST so any explicit clientId/cityId filter
   // narrows within the allowed set (caller can't widen scope by passing
@@ -994,8 +1027,14 @@ async function list({
     // customer name+mobile PLUS client name, city, technician, and owner. The
     // cl/ci/ef/ow aliases are already in the data-query LIST_JOIN, and the COUNT
     // query's alias-detection below auto-adds their joins once they appear here.
-    clauses.push('(CAST(j.job_id AS CHAR) LIKE ? OR j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ? OR cl.client_name LIKE ? OR ci.city_name LIKE ? OR ef.efr_name LIKE ? OR ow.user_name LIKE ?)');
-    params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
+    // client_spoc_name / client_spoc are denormalised snapshots ON tbl_job (alias
+    // j) — captured at booking, shown in the "Client SPOC" column of the
+    // Unconfirmed + Pending-to-Scheduling tabs. They were displayed but NOT
+    // searchable; added here so a SPOC-name search matches. No new JOIN (alias j
+    // is always present), and since COUNT + data share this where/params the two
+    // OR terms apply to both.
+    clauses.push('(CAST(j.job_id AS CHAR) LIKE ? OR j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ? OR cl.client_name LIKE ? OR ci.city_name LIKE ? OR ef.efr_name LIKE ? OR ow.user_name LIKE ? OR j.client_spoc_name LIKE ? OR j.client_spoc LIKE ?)');
+    params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
   }
 
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -1020,6 +1059,37 @@ async function list({
     ${needsOw ? 'LEFT JOIN tbl_user     ow ON ow.user_id     = j.job_owner' : ''}
   `;
 
+  // Server-side sort — sort the WHOLE result set in SQL (before LIMIT/OFFSET)
+  // so paging + sorting agree; a client-side reorder would only touch the
+  // current page. Whitelist maps the FE sort key → a qualified column (all
+  // these aliases are always joined in LIST_JOIN); an unknown/absent key falls
+  // back to the default newest-first. NEVER interpolate raw sortBy/sortDir.
+  // j.job_id DESC is always appended as a stable tiebreaker.
+  const SORT_COLUMN = {
+    job_id: 'j.job_id',
+    job_reference_id: 'j.job_reference_id',
+    client_ref_id: 'j.client_ref_id',
+    created_date_time: 'j.created_date_time',
+    client_name: 'cl.client_name',
+    city_name: 'ci.city_name',
+    job_status: 'j.job_status',
+    job_type: 'j.job_type',
+    requested_date_time: 'j.requested_date_time',
+    scheduled_date_time: 'j.scheduled_date_time',
+    checkin_date_time: 'j.checkin_date_time',
+    checkout_date_time: 'j.checkout_date_time',
+    customer_name: 'cu.customer_name',
+    customer_mob_no: 'cu.customer_mob_no',
+    source_type: 'j.source_type',
+    easyfixer_name: 'ef.efr_name',
+    owner_name: 'ow.user_name',
+  };
+  const sortCol = SORT_COLUMN[sortBy];
+  const sortDirSql = String(sortDir).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+  const orderBy = sortCol
+    ? `ORDER BY ${sortCol} ${sortDirSql}, j.job_id DESC`
+    : 'ORDER BY j.job_id DESC';
+
   // Run COUNT and data query in parallel — they're independent, no reason to
   // serialize. Roughly halves wall-clock time on cold caches.
   const dataParams = [...params, Number(limit), Number(offset)];
@@ -1027,7 +1097,7 @@ async function list({
     pool.query(`SELECT COUNT(*) AS total ${countJoin} ${where}`, params),
     pool.query(
       `SELECT ${listColumns} ${LIST_JOIN} ${where}
-       ORDER BY j.job_id DESC LIMIT ? OFFSET ?`,
+       ${orderBy} LIMIT ? OFFSET ?`,
       dataParams
     ),
   ]);

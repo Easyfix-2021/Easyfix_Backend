@@ -245,6 +245,16 @@ router.get(
   async (req, res, next) => {
     try {
       const jobId = await verify(req);
+      // Late-open auto-reschedule (IST >= 3pm): shift a still-unconfirmed job's
+      // appointment to next day BEFORE building the prefill, so the customer
+      // sees the new date. Best-effort — must never block the form. Idempotent
+      // by construction; writes scheduling_history (NOT a customer request, so
+      // no "Reschedule Requested" chip). See autoRescheduleOnOpenIfLate().
+      try {
+        await magicLinkService.autoRescheduleOnOpenIfLate(jobId, pool);
+      } catch (e) {
+        logger.warn('auto-reschedule-on-open failed · jobId=' + jobId + ' · ' + (e && e.message));
+      }
       logger.info('Fetch magic-link prefill · jobId=' + jobId);
       const payload = await magicLinkService.fetchPrefill(jobId, pool);
       // Global UI toggle so the customer page can render its map read-only.

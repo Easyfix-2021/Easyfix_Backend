@@ -177,7 +177,20 @@ async function listClients({ extraClauses = [], extraParams = [], includeInactiv
     `SELECT cl.client_id, cl.client_name, cl.client_email, cl.client_status, cl.client_type,
             cl.reference_code, cl.booking_cut_off, cl.vertical_id, cl.collected_by,
             cl.client_city_id AS city_id, ct.city_name,
-            cl.monthly_revenue
+            cl.monthly_revenue,
+            /* Magic-link (job-completion) opt-in, shown at a glance on the
+               Manage Clients list so ops don't have to open each client's
+               Custom Properties tab. Single correlated EXISTS on the indexed
+               ccp.client_id (no N+1) — copied verbatim from the jobs LIST
+               client_opted_in projection (job.service.js). Strict status=1:
+               a soft-deleted (status=0) opt-in row must read as NOT enabled. */
+            (EXISTS (
+               SELECT 1 FROM tbl_client_custom_properties ccp
+                WHERE ccp.client_id = cl.client_id
+                  AND LOWER(TRIM(REPLACE(ccp.c_prop_name, '_', ' '))) = LOWER('Auto Process Unconfirmed Order')
+                  AND LOWER(TRIM(ccp.c_prop_values)) = 'true'
+                  AND ccp.status = 1
+            )) AS magic_link_enabled
        FROM tbl_client cl
        LEFT JOIN tbl_city ct ON ct.city_id = cl.client_city_id
        ${where}

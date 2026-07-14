@@ -102,6 +102,17 @@ const listQuery = Joi.object({
     Joi.string().valid('now'),
     Joi.date().iso(),
   ).optional(),
+  // Server-side sort (whitelisted). sortBy must be one of the sortable list
+  // columns; sortDir asc|desc. Both optional — absent → default job_id DESC.
+  // The service also whitelists (SORT_COLUMN) so an unknown value is a safe
+  // no-op, never raw SQL.
+  sortBy: Joi.string().valid(
+    'job_id', 'job_reference_id', 'client_ref_id', 'created_date_time',
+    'client_name', 'city_name', 'job_status', 'job_type', 'requested_date_time',
+    'scheduled_date_time', 'checkin_date_time', 'checkout_date_time',
+    'customer_name', 'customer_mob_no', 'source_type', 'easyfixer_name', 'owner_name',
+  ).optional(),
+  sortDir: Joi.string().valid('asc', 'desc').optional(),
   limit: Joi.number().integer().min(1).max(500).default(50),
   offset: Joi.number().integer().min(0).default(0),
 });

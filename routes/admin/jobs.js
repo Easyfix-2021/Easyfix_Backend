@@ -912,7 +912,7 @@ const { DUE_TO_USER_TYPE, ACTION_TYPE_BY_MODE, ACTION_TYPE } = require('../../se
 router.get('/comment-reasons', async (req, res, next) => {
   try {
     const dueRaw = String(req.query.dueTo || '').toLowerCase().replace(/\s+/g, '');
-    const userType = DUE_TO_USER_TYPE[dueRaw] || 2; // legacy default = Client
+    const userType = DUE_TO_USER_TYPE[dueRaw] || 2; // default = Customer (user_type 2); matches the pre-checked "By Customer" radio
     logger.info('Fetch comment reasons · dueTo=' + (dueRaw || '-') + ' userType=' + userType);
     const [rows] = await imagePool.query(
       `SELECT id, action_desc FROM action_taken_reason
@@ -1133,7 +1133,7 @@ router.get('/action-reasons', async (req, res, next) => {
     if (!actionTypeId) return modernOk(res, []);
 
     const dueRaw = String(req.query.dueTo || '').toLowerCase().replace(/\s+/g, '');
-    const userType = DUE_TO_USER_TYPE[dueRaw] || 2; // legacy default = Client
+    const userType = DUE_TO_USER_TYPE[dueRaw] || 2; // default = Customer (user_type 2); matches the pre-checked "By Customer" radio
 
     const [reasonRows] = await pool.query(
       `SELECT id, action_desc FROM action_taken_reason

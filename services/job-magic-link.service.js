@@ -469,6 +469,100 @@ async function jobHasColumn(pool, col) {
  * Promise.all because they're mutually independent. Saves ~3× the
  * latency vs sequential.
  */
+/*
+ * autoRescheduleOnOpenIfLate — when a customer OPENS the magic-link form late
+ * in the day, push the appointment to the next day so ops can still staff it.
+ *
+ * WHY: bulk-upload jobs often arrive in the evening with tomorrow's 9-12 slot;
+ * the cron fires the link within the hour, and a customer confirming that same
+ * slot late-evening leaves ops unable to assign a technician before it starts.
+ * So on OPEN (this runs on GET /:token, AFTER verify() has already enforced
+ * link-not-expired + job_status=9), if the current IST hour is >= 15 (3pm), we
+ * shift requested_date_time by +1 day ONCE, before the prefill is built — the
+ * customer simply sees the new date (no reschedule button, no chip).
+ *
+ * IDEMPOTENT BY CONSTRUCTION: the UPDATE only fires while
+ * DATE(requested_date_time) = DATE(original_appointment_date_time) (the shift
+ * moves them apart), further guarded by job_status=9 + customer_submitted_at
+ * IS NULL. A second open finds the dates already differ → 0 rows → exactly one
+ * shift, ever. No marker column, and crucially NO tbl_job_customer_request row —
+ * so the CRM "Reschedule Requested" chip never lights up. Audit lands in
+ * scheduling_history (+ a job comment) instead. Best-effort throughout: it must
+ * never block the form from rendering (the caller wraps it in try/catch too).
+ *
+ * @param {number} jobId
+ * @param {import('mysql2/promise').Pool} pool
+ * @param {{ nowMs?: number }} [opts]  nowMs injectable for deterministic tests.
+ * @returns {Promise<{shifted:boolean, newRequested?:string, reason?:string}>}
+ */
+async function autoRescheduleOnOpenIfLate(jobId, pool, { nowMs = Date.now() } = {}) {
+  // IST hour via the fixed +5:30 offset (no DST in IST) — never toISOString().
+  const istHour = new Date(nowMs + (5 * 60 + 30) * 60 * 1000).getUTCHours();
+  if (istHour < 15) return { shifted: false };
+
+  // 12-hour label for the reason string, e.g. 15 -> "3pm", 20 -> "8pm".
+  const h12 = ((istHour + 11) % 12) + 1;
+  const ampm = istHour < 12 ? 'am' : 'pm';
+  const reason = `Job Received at ${h12}${ampm}, Auto Rescheduled for Next Day`;
+
+  // Guarded, idempotent-by-construction shift. +1 day done IN MySQL on the
+  // stored IST wall-clock string (dateStrings + '+05:30' pool) so there is no
+  // JS/UTC date math. time_slot is intentionally UNCHANGED (same hour-of-day →
+  // same slot; only the calendar date moves).
+  const [result] = await pool.query(
+    `UPDATE tbl_job
+        SET requested_date_time = requested_date_time + INTERVAL 1 DAY,
+            last_update_time = NOW()
+      WHERE job_id = ?
+        AND job_status = 9
+        AND customer_submitted_at IS NULL
+        AND requested_date_time IS NOT NULL
+        AND original_appointment_date_time IS NOT NULL
+        AND DATE(requested_date_time) = DATE(original_appointment_date_time)`,
+    [jobId],
+  );
+  if (!result || result.affectedRows !== 1) return { shifted: false };
+
+  // Read the new value + assigned tech (for the non-NULL audit key).
+  const [rows] = await pool.query(
+    'SELECT requested_date_time AS newReq, fk_easyfixter_id FROM tbl_job WHERE job_id = ? LIMIT 1',
+    [jobId],
+  );
+  const newReq = rows && rows[0] ? rows[0].newReq : null;
+  const efrId = rows && rows[0] ? rows[0].fk_easyfixter_id : null;
+
+  // Audit — best-effort (idempotency does NOT depend on these). easyfixer_id
+  // MUST be non-NULL: a NULL there poisons the `efr_id NOT IN (SELECT ...)` in
+  // candidate-ranking / auto-assign and would exclude ALL techs once the job is
+  // later confirmed. COALESCE to 0 — the same sentinel those paths rely on.
+  try {
+    await pool.query(
+      `INSERT INTO scheduling_history (job_id, easyfixer_id, schedule_time, reason_id, reschedule_reason)
+       VALUES (?, ?, ?, NULL, ?)`,
+      [jobId, efrId != null ? efrId : 0, newReq, reason],
+    );
+  } catch (e) {
+    logger.warn('auto-reschedule scheduling_history insert failed · jobId=' + jobId + ' · ' + (e && e.message));
+  }
+  // Mirror to the comment thread so the shift + reason surface in the CRM
+  // Rescheduling History tab. comment_on=1 (lifecycle) — does NOT touch
+  // tbl_job_customer_request, so no "Reschedule Requested" chip.
+  try {
+    await require('./job-comment.service').addComment(jobId, {
+      comments: reason,
+      comment_on: 1,
+      commented_by: null,
+      appointment_on: newReq,
+      enum_reason_id: null,
+    });
+  } catch (e) {
+    logger.warn('auto-reschedule comment insert failed · jobId=' + jobId + ' · ' + (e && e.message));
+  }
+
+  logger.info('Magic-link auto-reschedule · jobId=' + jobId + ' · newRequested=' + newReq + ' · ' + reason);
+  return { shifted: true, newRequested: newReq, reason };
+}
+
 async function fetchPrefill(jobId, pool) {
   logger.info('Build magic-link prefill · jobId=' + jobId);
   // Schema-drift gate: older deploys lack tbl_address.address_instruction.
@@ -996,10 +1090,33 @@ async function sendForJob(jobId, { action, override = false } = {}, pool) {
   // success (rather than in the reservation UPDATE) means a failed send
   // never leaves sent_at / last_action claiming a dispatch that didn't
   // happen, and a failed FIRST send can't flip later attempts to 'resend'.
-  await pool.query(
-    `UPDATE tbl_job SET magic_link_sent_at = ?, magic_link_last_action = ? WHERE job_id = ?`,
-    [sentAt, effectiveAction, jobId],
-  );
+  // Also persist the provider message id + seed delivery_status='sent'. HTTP-200
+  // from Gallabox only means "queued/accepted", not "reached the customer"; the
+  // real outcome (delivered / read / failed / undelivered + reason) arrives
+  // asynchronously as a status callback that keys off magic_link_provider_msg_id
+  // (see routes/webhook/whatsapp.js). Reset the reason to NULL so a re-send
+  // clears any prior failure. Written column-tolerant: on deploys where the
+  // 2026-07-14-magic-link-delivery-status migration hasn't run yet, this UPDATE
+  // would error on the unknown columns — so fall back to the original stamp.
+  try {
+    await pool.query(
+      `UPDATE tbl_job
+          SET magic_link_sent_at = ?, magic_link_last_action = ?,
+              magic_link_provider_msg_id = ?, magic_link_delivery_status = 'sent',
+              magic_link_delivery_reason = NULL
+        WHERE job_id = ?`,
+      [sentAt, effectiveAction, response.providerMessageId || null, jobId],
+    );
+  } catch (e) {
+    if (e && e.code === 'ER_BAD_FIELD_ERROR') {
+      await pool.query(
+        `UPDATE tbl_job SET magic_link_sent_at = ?, magic_link_last_action = ? WHERE job_id = ?`,
+        [sentAt, effectiveAction, jobId],
+      );
+    } else {
+      throw e;
+    }
+  }
 
   logger.info('Magic-link sent · jobId=' + jobId + ' action=' + effectiveAction + ' sendCount=' + ((row.magic_link_send_count || 0) + 1));
 
@@ -1551,6 +1668,7 @@ async function writeCustomerOrderDetails(jobId, fields, pool) {
 
 module.exports = {
   fetchPrefill,
+  autoRescheduleOnOpenIfLate,
   sendForJob,
   acceptSubmission,
   writeCustomerOrderDetails,

@@ -116,10 +116,20 @@ async function sendTemplate({
     });
     const text = await res.text();
     const delivered = res.ok;
+    // Pull the provider message id out of Gallabox's send response so the async
+    // delivery-STATUS callback (POST → routes/webhook/whatsapp.js) can be
+    // correlated back to the job. Gallabox echoes the WhatsApp wamid on the
+    // status callback, so prefer whatsappMessageId; fall back to the other id
+    // shapes. Tolerant parse — a non-JSON body just yields null.
+    let providerMessageId = null;
+    try {
+      const j = JSON.parse(text);
+      providerMessageId = j.whatsappMessageId || j.channelMessageId || j.messageId || j.id || null;
+    } catch (_e) { /* non-JSON provider body — leave id null */ }
     const who = redirected ? `${phone} (was ${originalPhone})` : phone;
     if (delivered) logger.whatsapp(`sent to ${who} · template=${templateName}`);
     else           logger.warn(`WhatsApp rejected · to=${who} · template=${templateName} · status=${res.status} · ${text.slice(0, 120)}`);
-    return { delivered, providerResponse: text, httpStatus: res.status, redirected, intendedTo: redirected ? originalPhone : undefined };
+    return { delivered, providerResponse: text, providerMessageId, httpStatus: res.status, redirected, intendedTo: redirected ? originalPhone : undefined };
   } catch (err) {
     logger.error(`WhatsApp error · to=${phone} · template=${templateName} · ${err.message}`);
     return { delivered: false, error: err.message };

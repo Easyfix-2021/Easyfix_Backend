@@ -82,6 +82,33 @@ function normaliseInbound(body) {
   };
 }
 
+// Delivery-STATUS callback normaliser. Distinct from normaliseInbound (which
+// only understands CUSTOMER messages and returns null for a status callback).
+//
+// LOAD OPTIMISATION: we recognise ONLY the FAILURE states (failed/undelivered).
+// WhatsApp fires a status callback for EVERY message transition
+// (sent → delivered → read), so acting on all of them would mean 3+ DB writes
+// per message for ZERO UI benefit — the only surface is the "Delivery Failed"
+// chip. Non-failure callbacks return null here and fall through to the cheap
+// "not actionable, ignored" path (no DB touch). So only genuinely-failed sends
+// ever hit the (indexed) UPDATE — the write path stays near-zero. delivery_status
+// is optimistically seeded 'sent' at dispatch, so "no failure callback" already
+// reads as sent. Field-probing is tolerant of the envelope shape.
+const DELIVERY_FAILURE_STATES = new Set(['failed', 'undelivered']);
+function normaliseStatus(body) {
+  if (!body || typeof body !== 'object') return null;
+  const p = body.payload || body.data || body.message || body;
+  const s = String(p.status || p.deliveryStatus || p.event || '').toLowerCase();
+  if (!DELIVERY_FAILURE_STATES.has(s)) return null;
+  const msgId = p.whatsappMessageId || p.messageId || p.id || p.channelMessageId || null;
+  if (!msgId) return null;
+  const errObj = p.failedReason || p.error || (Array.isArray(p.errors) ? p.errors[0] : null) || null;
+  const reason = errObj
+    ? String(errObj.message || errObj.title || errObj.reason || errObj.code || '').slice(0, 255)
+    : null;
+  return { msgId, status: s, reason };
+}
+
 // Optional GET verify handshake (some BSPs ping the URL with the secret).
 router.get('/whatsapp', (req, res) => {
   if (!secretOk(req)) { logger.warn('WhatsApp verify handshake · bad secret, refused'); return modernError(res, 401, 'unauthorized'); }
@@ -91,6 +118,26 @@ router.get('/whatsapp', (req, res) => {
 
 router.post('/whatsapp', async (req, res) => {
   if (!secretOk(req)) { logger.warn('WhatsApp inbound webhook · bad secret, refused'); return modernError(res, 401, 'unauthorized'); }
+
+  // Delivery-status callback FIRST — these were previously swallowed by the
+  // "not actionable" branch below. Reflect the real WhatsApp outcome onto the
+  // job (keyed by the provider msg id we stamped at send time). Unmatched id →
+  // affectedRows 0, benign (covers non-magic-link sends). Always 200 so the BSP
+  // doesn't retry-storm. Column-tolerant: pre-migration deploys just log + skip.
+  const statusCb = normaliseStatus(req.body);
+  if (statusCb) {
+    try {
+      const [r] = await pool.query(
+        `UPDATE tbl_job SET magic_link_delivery_status = ?, magic_link_delivery_reason = ?
+          WHERE magic_link_provider_msg_id = ?`,
+        [statusCb.status, statusCb.reason, statusCb.msgId],
+      );
+      logger.info('WhatsApp status callback · status=' + statusCb.status + ' msgId=' + statusCb.msgId + ' matchedJobs=' + (r && r.affectedRows != null ? r.affectedRows : 0));
+    } catch (err) {
+      logger.warn({ err: err && err.message }, 'whatsapp status callback update failed (pre-migration columns?)');
+    }
+    return modernOk(res, { received: true, status: statusCb.status });
+  }
 
   const inbound = normaliseInbound(req.body);
   if (!inbound) {
