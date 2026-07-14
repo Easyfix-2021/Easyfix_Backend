@@ -470,25 +470,37 @@ async function jobHasColumn(pool, col) {
  * latency vs sequential.
  */
 /*
- * autoRescheduleOnOpenIfLate — when a customer OPENS the magic-link form late
- * in the day, push the appointment to the next day so ops can still staff it.
+ * autoRescheduleOnOpenIfLate — when a customer OPENS the magic-link form late in
+ * the day, push the appointment to the next day so ops can still staff it.
  *
- * WHY: bulk-upload jobs often arrive in the evening with tomorrow's 9-12 slot;
- * the cron fires the link within the hour, and a customer confirming that same
- * slot late-evening leaves ops unable to assign a technician before it starts.
- * So on OPEN (this runs on GET /:token, AFTER verify() has already enforced
- * link-not-expired + job_status=9), if the current IST hour is >= 15 (3pm), we
- * shift requested_date_time by +1 day ONCE, before the prefill is built — the
- * customer simply sees the new date (no reschedule button, no chip).
+ * WHY: bulk-upload / client-portal jobs often arrive with tomorrow's 9-12 slot;
+ * if the customer opens the form late evening and confirms that same slot, ops
+ * (who have left for the day) can't assign a technician before it starts. So on
+ * OPEN (this runs on GET /:token, AFTER verify() enforced link-not-expired +
+ * job_status=9), if the current IST hour is >= 15 (3pm) we shift
+ * requested_date_time by +1 day ONCE, before the prefill is built — the customer
+ * simply sees the new date (no reschedule button, no chip).
+ *
+ * THE TRIGGER IS THE OPEN TIME: if the CURRENT IST hour is >= 15 (3pm) when the
+ * customer opens the link, shift. This matches the problem as stated — "if the
+ * customer opens the form late evening and proceeds with the same slot, ops
+ * can't staff it" — so it's the moment of opening that matters, not when the
+ * job was created.
  *
  * IDEMPOTENT BY CONSTRUCTION: the UPDATE only fires while
- * DATE(requested_date_time) = DATE(original_appointment_date_time) (the shift
- * moves them apart), further guarded by job_status=9 + customer_submitted_at
- * IS NULL. A second open finds the dates already differ → 0 rows → exactly one
- * shift, ever. No marker column, and crucially NO tbl_job_customer_request row —
- * so the CRM "Reschedule Requested" chip never lights up. Audit lands in
- * scheduling_history (+ a job comment) instead. Best-effort throughout: it must
- * never block the form from rendering (the caller wraps it in try/catch too).
+ * DATE(requested) = DATE(original) — the shift moves them apart, so a second
+ * open finds them differing → 0 rows → exactly one shift, ever. No marker
+ * column, and crucially NO tbl_job_customer_request row — so the CRM "Reschedule
+ * Requested" chip never lights up. Audit lands in scheduling_history (+ a job
+ * comment) instead. Best-effort throughout: it must never block the form.
+ *
+ * `original` = COALESCE(original_appointment_date_time, requested_date_time):
+ * BULK-UPLOAD jobs leave original_appointment_date_time NULL, unlike the regular
+ * create which snapshots it. So we COALESCE it to requested in BOTH the guard AND
+ * the SET — the same UPDATE that shifts the date also back-fills the NULL
+ * original with the pre-shift date, keeping the DATE-based idempotency atomic.
+ * Without this, `original IS NOT NULL` silently no-op'd the shift for every
+ * bulk-upload job.
  *
  * @param {number} jobId
  * @param {import('mysql2/promise').Pool} pool
@@ -496,7 +508,8 @@ async function jobHasColumn(pool, col) {
  * @returns {Promise<{shifted:boolean, newRequested?:string, reason?:string}>}
  */
 async function autoRescheduleOnOpenIfLate(jobId, pool, { nowMs = Date.now() } = {}) {
-  // IST hour via the fixed +5:30 offset (no DST in IST) — never toISOString().
+  // Trigger = the OPEN time. IST hour via the fixed +5:30 offset (no DST in IST)
+  // — never toISOString(). Before 3pm → do nothing (not even a DB round-trip).
   const istHour = new Date(nowMs + (5 * 60 + 30) * 60 * 1000).getUTCHours();
   if (istHour < 15) return { shifted: false };
 
@@ -511,14 +524,14 @@ async function autoRescheduleOnOpenIfLate(jobId, pool, { nowMs = Date.now() } = 
   // same slot; only the calendar date moves).
   const [result] = await pool.query(
     `UPDATE tbl_job
-        SET requested_date_time = requested_date_time + INTERVAL 1 DAY,
+        SET original_appointment_date_time = COALESCE(original_appointment_date_time, requested_date_time),
+            requested_date_time = requested_date_time + INTERVAL 1 DAY,
             last_update_time = NOW()
       WHERE job_id = ?
         AND job_status = 9
         AND customer_submitted_at IS NULL
         AND requested_date_time IS NOT NULL
-        AND original_appointment_date_time IS NOT NULL
-        AND DATE(requested_date_time) = DATE(original_appointment_date_time)`,
+        AND DATE(requested_date_time) = DATE(COALESCE(original_appointment_date_time, requested_date_time))`,
     [jobId],
   );
   if (!result || result.affectedRows !== 1) return { shifted: false };

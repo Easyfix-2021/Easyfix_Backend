@@ -749,11 +749,26 @@ async function storeTranscriptionBestEffort({ jobCallerInfoId, recordingId }) {
         [tx.text, jobCallerInfoId]
       );
       logger.info('Call transcription stored · jci=' + jobCallerInfoId);
-    } else {
-      await pool.query(
-        "UPDATE tbl_plivo_call_log SET transcription_status = 'not_available' WHERE job_caller_info_id = ?",
+    } else if (tx.ok) {
+      // No transcript yet. Plivo does NOT auto-transcribe, so REQUEST one
+      // (phase 1) and mark 'processing' — the text is retrieved on a later cron
+      // / on-demand run (phase 2). Only when we've never requested (status still
+      // NULL) so a replay doesn't re-hit Plivo. Add-on missing → notEnabled →
+      // 'not_available' (correct terminal). BUG FIX: this branch previously set
+      // 'not_available' WITHOUT requesting, permanently poisoning the row — the
+      // cron and on-demand paths both skip 'not_available', so it never recovered.
+      const [[cur]] = await pool.query(
+        'SELECT transcription_status AS s FROM tbl_plivo_call_log WHERE job_caller_info_id = ? LIMIT 1',
         [jobCallerInfoId]
       );
+      if (!cur || cur.s == null) {
+        const created = await plivo.createTranscription({ recordingId });
+        const status = created.notEnabled ? 'not_available' : 'processing';
+        await pool.query(
+          "UPDATE tbl_plivo_call_log SET transcription_status = ?, transcription_fetched_at = NOW() WHERE job_caller_info_id = ?",
+          [status, jobCallerInfoId]
+        );
+      }
     }
   } catch (e) {
     logger.warn('Transcription store failed · jci=' + jobCallerInfoId + ' · ' + e.message);

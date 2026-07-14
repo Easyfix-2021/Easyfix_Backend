@@ -66,31 +66,33 @@ test('writeCustomerOrderDetails writes tbl_job directly, no status transition', 
   assert.match(write.sql, /customer_submitted_at/);
 });
 
-// ─── autoRescheduleOnOpenIfLate (after-3pm link-open shift) ──────────────
-// installFakePool monkeypatches the shared db.pool so the internal addComment
-// (which captures the module pool) routes through the fake too — no real DB.
+// ─── autoRescheduleOnOpenIfLate (after-3pm link-OPEN shift) ──────────────
+// Trigger is the OPEN time (current IST hour), injected via nowMs. Before 3pm →
+// no DB round-trip. installFakePool monkeypatches the shared db.pool so the
+// internal addComment routes through the fake too — no real DB.
 
-test('autoRescheduleOnOpenIfLate — before 3pm IST is a no-op (no query at all)', async () => {
+test('autoRescheduleOnOpenIfLate — opened before 3pm IST is a no-op (no query at all)', async () => {
   const inst = installFakePool([]);
   try {
     const r = await magic.autoRescheduleOnOpenIfLate(42, db.pool, { nowMs: nowMsForIstHour(10) });
     assert.equal(r.shifted, false);
-    assert.equal(inst.calls.length, 0, 'no query fired before 3pm');
+    assert.equal(inst.calls.length, 0, 'no query fired when opened before 3pm');
   } finally { inst.restore(); }
 });
 
-test('autoRescheduleOnOpenIfLate — after 3pm shifts +1 day (guarded) and audits with non-NULL easyfixer_id', async () => {
+test('autoRescheduleOnOpenIfLate — opened after 3pm shifts +1 day (guarded) and audits with non-NULL easyfixer_id', async () => {
   const inst = installFakePool([
-    [/UPDATE tbl_job\s+SET\s+requested_date_time/, { affectedRows: 1 }],
+    [/UPDATE tbl_job\s+SET\s+original_appointment_date_time/, { affectedRows: 1 }],
     [/SELECT requested_date_time AS newReq/, [{ newReq: '2026-01-02 09:00:00', fk_easyfixter_id: 55 }]],
   ]);
   try {
     const r = await magic.autoRescheduleOnOpenIfLate(42, db.pool, { nowMs: nowMsForIstHour(16) });
     assert.equal(r.shifted, true);
-    const upd = inst.calls.find((c) => /UPDATE tbl_job\s+SET\s+requested_date_time/.test(c.sql));
+    const upd = inst.calls.find((c) => /UPDATE tbl_job\s+SET\s+original_appointment_date_time/.test(c.sql));
     assert.ok(upd, 'UPDATE fired');
     assert.match(upd.sql, /INTERVAL 1 DAY/, 'shifts by exactly one day');
-    assert.match(upd.sql, /DATE\(requested_date_time\) = DATE\(original_appointment_date_time\)/, 'idempotency guard present');
+    assert.match(upd.sql, /DATE\(requested_date_time\) = DATE\(COALESCE\(original_appointment_date_time/, 'idempotency guard COALESCEs NULL original (bulk-upload jobs)');
+    assert.match(upd.sql, /SET original_appointment_date_time = COALESCE\(original_appointment_date_time, requested_date_time\)/, 'back-fills a NULL original in the same atomic UPDATE');
     assert.match(upd.sql, /customer_submitted_at IS NULL/);
     assert.match(upd.sql, /job_status = 9/);
     const hist = inst.calls.find((c) => /INSERT INTO scheduling_history/.test(c.sql));
@@ -102,7 +104,7 @@ test('autoRescheduleOnOpenIfLate — after 3pm shifts +1 day (guarded) and audit
 
 test('autoRescheduleOnOpenIfLate — idempotent: 0 rows affected writes no audit row', async () => {
   const inst = installFakePool([
-    [/UPDATE tbl_job\s+SET\s+requested_date_time/, { affectedRows: 0 }],
+    [/UPDATE tbl_job\s+SET\s+original_appointment_date_time/, { affectedRows: 0 }],
   ]);
   try {
     const r = await magic.autoRescheduleOnOpenIfLate(42, db.pool, { nowMs: nowMsForIstHour(16) });
