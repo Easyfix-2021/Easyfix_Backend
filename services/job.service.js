@@ -179,6 +179,16 @@ const LIST_COLUMNS = `
   j.last_update_time,
   j.client_spoc, j.client_spoc_name,
   LEFT(j.remarks, 500) AS remarks,
+  j.original_appointment_date_time,
+  /* Auto-reschedule marker — was this job's appointment auto-shifted +1 day by
+     the after-3pm magic-link-open rule? Drives the "Auto Rescheduled" chip +
+     the "Original: <date>" line on the Unconfirmed list. Keyed on
+     scheduling_history (rows persist — unlike j.remarks, which the next comment
+     overwrites) via the idx_sched_hist_job covering index (job_id, …,
+     reschedule_reason), so it's a cheap indexed EXISTS per row. */
+  (EXISTS (SELECT 1 FROM scheduling_history sh
+     WHERE sh.job_id = j.job_id
+       AND sh.reschedule_reason LIKE '%Auto Rescheduled for Next Day')) AS auto_rescheduled,
   j.fk_customer_id, cu.customer_name, cu.customer_mob_no,
   j.fk_client_id, cl.client_name,
   j.fk_service_catg_id, sc.service_catg_name AS service_category,
