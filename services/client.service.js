@@ -770,7 +770,10 @@ async function createCustomProperty(clientId, body) {
   // this block no-ops (the DB DEFAULT 0 still applies on newer deploys).
   if (cols.isConfig) {
     insertCols.push(cols.isConfig);
-    insertVals.push(body.is_config ? 1 : 0);
+    // Force is_config=1 for the known control/config props (by normalized name),
+    // regardless of what the FE sent — these are ALWAYS config and must stay out
+    // of the client-dashboard bulk-upload template. Otherwise honour the flag.
+    insertVals.push((body.is_config || isConfigPropName(body.name)) ? 1 : 0);
   }
   if (cols.hasStatus) {
     insertCols.push('status');
@@ -783,6 +786,26 @@ async function createCustomProperty(clientId, body) {
   );
   logger.info('Custom property created · id=' + ins.insertId + ' clientId=' + clientId);
   return ins.insertId;
+}
+
+/*
+ * The client-level CONFIG/CONTROL properties (vs per-booking data-entry custom
+ * fields). These are ALWAYS is_config=1 — they must never leak into the client-
+ * dashboard bulk-upload template. Matched on a NORMALIZED name (case-insensitive,
+ * `_` and `-` → space) so the snake_case stored form (auto_process_unconfirmed_order)
+ * and the Title-Case UI form ("Auto Process Unconfirmed Order", "Max Magic-Link
+ * Send Count") resolve identically. Keep in sync with the migration backfill
+ * (2026-07-10) and job-magic-link's CONFIG_PROP_KEYS.
+ */
+const CONFIG_PROP_NORMALIZED_NAMES = new Set([
+  'auto process unconfirmed order',
+  'max magic link send count',
+  'collected by',
+  'order confirmation mode',
+]);
+function isConfigPropName(name) {
+  const norm = String(name || '').trim().toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ');
+  return CONFIG_PROP_NORMALIZED_NAMES.has(norm);
 }
 
 /*
@@ -823,6 +846,25 @@ async function updateCustomProperty(propId, body) {
     else if (colKey === 'value') v = (v == null) ? (cols.hasStatus ? '' : null) : String(v).trim();
     sets.push(`${dbCol} = ?`);
     vals.push(v);
+  }
+  // Force is_config=1 for the known control/config props (by normalized name) so
+  // a FE surface that omits the flag on edit can't leave a config row
+  // miscategorised (which would leak it into the client-dashboard bulk template).
+  // Resolve the name from the body, else from the existing row.
+  if (cols.isConfig) {
+    let effectiveName = body.name ?? body.property_name;
+    if (effectiveName == null) {
+      const [[row]] = await pool.query(
+        `SELECT ${cols.name} AS name FROM tbl_client_custom_properties WHERE ${cols.pk} = ? LIMIT 1`,
+        [propId],
+      );
+      effectiveName = row?.name;
+    }
+    if (isConfigPropName(effectiveName)) {
+      const idx = sets.indexOf(`${cols.isConfig} = ?`);
+      if (idx >= 0) vals[idx] = 1;
+      else { sets.push(`${cols.isConfig} = ?`); vals.push(1); }
+    }
   }
   if (sets.length === 0) {
     throw Object.assign(new Error('nothing to update'), { status: 400 });
