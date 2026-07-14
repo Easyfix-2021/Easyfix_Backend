@@ -534,12 +534,17 @@ router.post(
       // fail the customer's action. comment_on=1 = job-lifecycle bucket (avoids
       // the job_stage=9 side-effect of 16/17); commented_by=null = customer.
       try {
-        // Mirror to the job History (tbl_job_comment). comments = ONLY the
-        // customer's remark text; the reason is structured in enum_reason_id
-        // (action_taken_reason.id); commented_by=null=customer; comment_on=1
+        // Mirror to the job History (tbl_job_comment). Compose a NON-EMPTY
+        // reason-bearing comment text (reason label + optional remark) so
+        // addComment's empty-text guard can't silently drop the row (and the
+        // reason enum_reason_id) when the customer typed no remark. comment_on=1
         // (lifecycle bucket — avoids the 16/17 job_stage=9 side-effect).
+        const remarkText = (req.body.remarks || '').trim();
+        const commentText = remarkText
+          ? `Cancellation requested: ${req.body.reason} — ${remarkText}`
+          : `Cancellation requested: ${req.body.reason}`;
         await require('../../services/job-comment.service').addComment(jobId, {
-          comments: (req.body.remarks || '').trim(),
+          comments: commentText,
           comment_on: 1,
           commented_by: null,
           enum_reason_id: reasonRow.id,
@@ -601,11 +606,17 @@ router.post(
       // legacy uses for reschedule notes; appointment_on carries the preferred
       // date so the comment row itself shows the requested new time.
       try {
-        // Mirror to job History. comments = ONLY the customer's remark; the
-        // reason is structured in enum_reason_id; appointment_on carries the
-        // requested new time; commented_by=null=customer; comment_on=1.
+        // Mirror to job History. Compose a NON-EMPTY reason-bearing comment text
+        // (reason label + optional remark) so addComment's empty-text guard can't
+        // silently drop the row when the customer typed no remark — that used to
+        // lose enum_reason_id (the reason) entirely. appointment_on carries the
+        // requested new time; enum_reason_id stamps the reason FK; commented_by=null.
+        const remarkText = (req.body.remarks || '').trim();
+        const commentText = remarkText
+          ? `Reschedule requested: ${req.body.reason} — ${remarkText}`
+          : `Reschedule requested: ${req.body.reason}`;
         await require('../../services/job-comment.service').addComment(jobId, {
-          comments: (req.body.remarks || '').trim(),
+          comments: commentText,
           comment_on: 1,
           commented_by: null,
           appointment_on: preferred || null,
