@@ -849,6 +849,75 @@ async function fetchTranscriptOnDemand({ jobCallerInfoId, callUuid, currentStatu
   }
 }
 
+// Refresh the per-caller scorecard for the caller of ONE call. The Scorecard tab
+// reads ONLY the pre-aggregated tbl_caller_score_rollup, so an analysis that is
+// never rolled up is invisible there no matter what the call row says. Keyed on
+// tbl_plivo_call_log.caller_user_id — the exact column rollupForCaller aggregates
+// on; tbl_job_caller_info.caller_id is the fallback for a log row that never got
+// the operator stamped. Unresolvable → skip silently: a rollup we can't attribute
+// to a caller is worse than none. Never throws — same idiom as
+// teleprompter-postcall.service.js's step 3.
+async function rollupCallerBestEffort(jobCallerInfoId, callerUserIdFromLog) {
+  try {
+    let callerUserId = callerUserIdFromLog || null;
+    if (!callerUserId) {
+      const [[jci]] = await pool.query(
+        'SELECT caller_id FROM tbl_job_caller_info WHERE job_caller_info = ? LIMIT 1',
+        [jobCallerInfoId]
+      );
+      callerUserId = (jci && jci.caller_id) || null;
+    }
+    if (!callerUserId) {
+      logger.warn('Caller scorecard write-through skipped · no caller resolved · jci=' + jobCallerInfoId);
+      return;
+    }
+    await callerScorecard.rollupForCaller(callerUserId);
+  } catch (e) {
+    logger.warn('Caller scorecard write-through failed · jci=' + jobCallerInfoId + ' · ' + e.message);
+  }
+}
+
+// Generate → cache → roll up. Shared by GET /:id/analysis (first view) and
+// POST /:id/reanalyse (forced refresh) so the store + scorecard contract lives in
+// exactly one place. The rollup runs ONLY on a fresh generate — a cache hit would
+// recompute identical numbers on every page view. Returns the analysis or null.
+async function generateAndStoreAnalysis({ id, transcript, hasAnalysis, callerUserId }) {
+  logger.info('Generate call analysis · row=' + id);
+  const analysis = await callAnalysis.analyzeTranscript(transcript);
+  if (!analysis) {
+    if (hasAnalysis) await pool.query("UPDATE tbl_plivo_call_log SET call_analysis_status = 'failed' WHERE job_caller_info_id = ?", [id]);
+    return null;
+  }
+  if (hasAnalysis) {
+    await pool.query(
+      "UPDATE tbl_plivo_call_log SET call_analysis = ?, call_analysis_status = 'ready', call_analysis_generated_at = NOW() WHERE job_caller_info_id = ?",
+      [JSON.stringify(analysis), id]
+    );
+    // Only meaningful once the analysis is actually STORED — rollupForCaller
+    // re-reads call_analysis off the table, so an unstored one aggregates nothing.
+    await rollupCallerBestEffort(id, callerUserId);
+  }
+  return analysis;
+}
+
+// Re-analyse only: drop THIS row's cached transcript so the shared acquisition
+// path (fetchTranscriptOnDemand, and the backfill cron behind it) sees a
+// never-fetched row and re-requests from the provider — the point of Re-analyse
+// is a better transcript, not just a re-run of the LLM over the old text.
+// Clearing the TEXT (not just the status) is required, not incidental: the
+// backfill cron's WHERE excludes rows that already have text, so a status-only
+// reset would strip 'not_available' and still never re-fetch. Safe because the
+// provider holds the transcript and this column is only a cache of it. Scoped to
+// the one requested job_caller_info_id — never a status-wide sweep.
+async function resetTranscriptForRefetch(jobCallerInfoId) {
+  await pool.query(
+    `UPDATE tbl_plivo_call_log
+        SET transcription = NULL, transcription_status = NULL, transcription_fetched_at = NULL
+      WHERE job_caller_info_id = ?`,
+    [jobCallerInfoId]
+  );
+}
+
 // ─── GET /:id/recording — lazy Plivo→S3 call-recording play URL ────────
 // On first play we fetch the recording from Plivo (by CallUUID), store it once
 // on our S3 under a stable key, persist that key on the row, and return a
@@ -963,7 +1032,7 @@ router.get('/:id/analysis', requireClickToCallAction, async (req, res, next) => 
     const analysisCol = hasAnalysis ? 'call_analysis' : 'NULL AS call_analysis';
     const metricsSelect = hasMetrics ? ', call_metrics, call_metrics_status' : '';
     const [[row]] = await pool.query(
-      `SELECT transcription, transcription_status, call_uuid, ${analysisCol}${metricsSelect}
+      `SELECT transcription, transcription_status, call_uuid, caller_user_id, ${analysisCol}${metricsSelect}
          FROM tbl_plivo_call_log WHERE job_caller_info_id = ? ORDER BY id DESC LIMIT 1`,
       [id]
     );
@@ -997,19 +1066,72 @@ router.get('/:id/analysis', requireClickToCallAction, async (req, res, next) => 
     if (!callAnalysis.llmEnabled()) {
       return modernOk(res, withMetrics({ status: 'llm_disabled', reason: 'Call-analysis AI is not configured in this environment.' }));
     }
-    logger.info('Generate call analysis · row=' + id);
-    const analysis = await callAnalysis.analyzeTranscript(row.transcription);
-    if (!analysis) {
-      if (hasAnalysis) await pool.query("UPDATE tbl_plivo_call_log SET call_analysis_status = 'failed' WHERE job_caller_info_id = ?", [id]);
-      return modernOk(res, withMetrics({ status: 'failed', reason: 'Analysis could not be generated.' }));
-    }
-    if (hasAnalysis) {
-      await pool.query(
-        "UPDATE tbl_plivo_call_log SET call_analysis = ?, call_analysis_status = 'ready', call_analysis_generated_at = NOW() WHERE job_caller_info_id = ?",
-        [JSON.stringify(analysis), id]
-      );
-    }
+    const analysis = await generateAndStoreAnalysis({
+      id, transcript: row.transcription, hasAnalysis, callerUserId: row.caller_user_id,
+    });
+    if (!analysis) return modernOk(res, withMetrics({ status: 'failed', reason: 'Analysis could not be generated.' }));
     return modernOk(res, withMetrics({ status: 'ready', analysis }));
+  } catch (e) { next(e); }
+});
+
+// ─── POST /:id/reanalyse — force a fresh transcript + fresh coaching ───
+// View Analysis is a CACHE on both halves: once call_analysis_status='ready' it
+// never regenerates, and a transcript in a TERMINAL state ('completed' /
+// 'not_available') is never re-requested. Both are right for the read path and
+// wrong when the TRANSCRIPT itself improves (a better STT provider re-run over
+// the same audio yields a better score). This is the explicit escape hatch —
+// reset this one row's transcript cache, then fall through the SAME acquisition
+// + analysis path the read uses.
+router.post('/:id/reanalyse', requireClickToCallAction, async (req, res, next) => {
+  try {
+    const id = parseRowId(req.params.id);
+    if (!id) return modernError(res, 400, 'invalid call id');
+    if (!(await hasTranscriptionColumn())) {
+      return modernOk(res, { status: 'unavailable', reason: 'Call analytics is not enabled in this environment.' });
+    }
+
+    const [[jci]] = await pool.query(
+      'SELECT caller_id FROM tbl_job_caller_info WHERE job_caller_info = ? LIMIT 1',
+      [id]
+    );
+    if (!jci) return modernError(res, 404, 'call not found');
+    // Stronger gate than the read: this re-requests a PAID transcription, spends
+    // an LLM round-trip and rewrites the caller's rollup score. Same owner-or-admin
+    // rule the other per-call actions (/:id/recording, /:id/hangup) already use.
+    const isOwner = jci.caller_id != null && Number(jci.caller_id) === Number(req.user.user_id);
+    const isAdmin = Number(req.user.user_role) === 2;
+    if (!isOwner && !isAdmin) {
+      return modernError(res, 403, 'You can only re-analyse calls you placed');
+    }
+
+    const hasAnalysis = await hasAnalysisColumn();
+    const [[row]] = await pool.query(
+      `SELECT call_uuid, caller_user_id
+         FROM tbl_plivo_call_log WHERE job_caller_info_id = ? ORDER BY id DESC LIMIT 1`,
+      [id]
+    );
+    if (!row) return modernOk(res, { status: 'no_transcript' });
+    logger.info('Re-analyse call · row=' + id);
+
+    await resetTranscriptForRefetch(id);
+    const transcript = row.call_uuid
+      ? await fetchTranscriptOnDemand({ jobCallerInfoId: id, callUuid: row.call_uuid, currentStatus: null })
+      : null;
+    if (!transcript || String(transcript).trim().length < 10) {
+      // Provider has nothing ready yet — the reset above left the row 'processing',
+      // so the backfill cron lands the text and a second Re-analyse picks it up.
+      return modernOk(res, { status: 'transcript_pending', reason: 'A fresh transcript has been requested — try Re-analyse again in a few minutes.' });
+    }
+    if (!callAnalysis.llmEnabled()) {
+      return modernOk(res, { status: 'llm_disabled', reason: 'Call-analysis AI is not configured in this environment.' });
+    }
+    // Cache bypass is a READ-path difference, not a destructive write: we simply
+    // never consult call_analysis here, and only overwrite it on a successful
+    // generate — so a failed re-analyse leaves the previous analysis intact rather
+    // than blanking a row the operator still needs.
+    const analysis = await generateAndStoreAnalysis({ id, transcript, hasAnalysis, callerUserId: row.caller_user_id });
+    if (!analysis) return modernOk(res, { status: 'failed', reason: 'Analysis could not be generated.' });
+    return modernOk(res, { status: 'ready', analysis });
   } catch (e) { next(e); }
 });
 
