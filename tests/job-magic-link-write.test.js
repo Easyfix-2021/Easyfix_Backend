@@ -54,6 +54,58 @@ test('acceptSubmission includes the optional columns when they are present', asy
   assert.match(write.sql, /product_code/);
 });
 
+/*
+ * The address-section gate (2026-07-15 regression tripwire).
+ *
+ * The whole tbl_address write used to hang off `payload.address` — the ONE
+ * field the customer cannot edit (Service Address renders read-only; the map
+ * "captures GPS only"). So a pin-only submission wrote NOTHING and the pin was
+ * lost to everything but the customer_submitted_payload JSON blob. These lock
+ * the widened gate: any supplied address-section field must reach tbl_address,
+ * and a payload with none of them must still write nothing.
+ */
+const ADDR_ROUTE = [/SELECT fk_address_id, fk_customer_id, fk_client_id FROM tbl_job/,
+  [{ fk_address_id: 10, fk_customer_id: 20, fk_client_id: 30 }]];
+
+test('acceptSubmission — a PIN-ONLY submission (gps, no address) still writes tbl_address', async () => {
+  const fake = makeFakePool([ADDR_ROUTE], { stopOn: /UPDATE tbl_address/ });
+  await assert.rejects(() => magic.acceptSubmission(42, { gps_location: '28.631500,77.216700' }, fake.pool));
+  const write = fake.calls.find((c) => /UPDATE tbl_address/.test(c.sql));
+  assert.ok(write, 'a pin with no address text MUST still reach tbl_address (this was the bug)');
+  assert.match(write.sql, /gps_location\s*=\s*COALESCE/, 'gps_location is COALESCE-guarded, not blind-set');
+  assert.ok(write.params.includes('28.631500,77.216700'), 'the pin coordinates are bound as a param');
+  assert.ok(write.params.includes(10), 'scoped to the job\'s fk_address_id');
+});
+
+test('acceptSubmission — the map-search text persists to tbl_address.building', async () => {
+  const fake = makeFakePool([ADDR_ROUTE], { stopOn: /UPDATE tbl_address/ });
+  await assert.rejects(() => magic.acceptSubmission(42, {
+    building: '12 MG Road, Bengaluru', gps_location: '12.971600,77.594600',
+  }, fake.pool));
+  const write = fake.calls.find((c) => /UPDATE tbl_address/.test(c.sql));
+  assert.ok(write);
+  // `building` is the column the CRM's Confirm & Schedule "Search Location On
+  // Map" field reads back — see AddressPickerWithMap's serviceAddressReadOnly.
+  assert.ok(write.params.includes('12 MG Road, Bengaluru'), 'map-search text is bound');
+  assert.doesNotMatch(write.sql, /address\s*=\s*\?/, 'the booked address must never be blind-overwritten');
+});
+
+test('acceptSubmission — no address-section fields at all → no tbl_address write', async () => {
+  // No stopOn: a payload with no `services` skips the service block, so the
+  // whole call runs to completion against the fake. Letting it finish proves
+  // the ABSENCE of the address write rather than merely never reaching it.
+  const fake = makeFakePool([ADDR_ROUTE]);
+  await magic.acceptSubmission(42, { customer_name: 'Asha' }, fake.pool);
+  assert.ok(
+    fake.calls.some((c) => /UPDATE tbl_job SET/.test(c.sql)),
+    'sanity: the tbl_job write still ran, so we really did traverse the address block',
+  );
+  assert.ok(
+    !fake.calls.some((c) => /UPDATE tbl_address/.test(c.sql)),
+    'nothing address-shaped was supplied, so the gate must stay closed',
+  );
+});
+
 test('writeCustomerOrderDetails writes tbl_job directly, no status transition', async () => {
   const fake = makeFakePool(
     [[/SELECT fk_address_id FROM tbl_job/, [{ fk_address_id: 10 }]]],

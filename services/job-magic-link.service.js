@@ -1306,9 +1306,17 @@ async function acceptSubmission(jobId, payload, pool) {
       );
     }
 
-    // 4. Full address overwrite. Address is bound 1:1 to the job's
-    //    customer-on-create, so updating in place is correct — we are
-    //    NOT mutating a shared address that other jobs reference.
+    // 4. Full address overwrite, in place on the job's fk_address_id.
+    //
+    //    ⚠ NOT strictly 1:1 (corrected 2026-07-15): an earlier comment here
+    //    claimed the address row is private to this job's customer-on-create.
+    //    It isn't — job.service.js create() REUSES a caller-supplied
+    //    `input.address.address_id` when one is passed instead of inserting a
+    //    fresh row, so sibling jobs can share an fk_address_id and this UPDATE
+    //    reaches all of them. Every SET below is COALESCE-guarded (empty →
+    //    NULL → keep existing), which bounds the blast radius to fields the
+    //    customer actually supplied, but it does not eliminate it. Splitting
+    //    the row on write is a data-model decision, not a patch — left alone.
     //
     //    Payload shape (2026-05-28 fix): the Joi validator declares `address`
     //    as a FLAT string and `building`, `landmark`, `city_id`, `pin_code`,
@@ -1330,7 +1338,23 @@ async function acceptSubmission(jobId, payload, pool) {
     const gps         = payload.gps_location && String(payload.gps_location).length ? payload.gps_location : null;
     const addrInstr   = payload.address_instruction && String(payload.address_instruction).length ? payload.address_instruction : null;
 
-    if (addressId && addressLine) {
+    // Run whenever the customer supplied ANY address-section field — not just
+    // `address`.
+    //
+    // Bug fix 2026-07-15: the gate was `if (addressId && addressLine)`, which
+    // hung the ENTIRE address write (gps_location, building, landmark, city,
+    // pin, instructions) off `payload.address` — the one field the customer is
+    // NOT allowed to edit. The form renders Service Address read-only and the
+    // map "captures GPS only" (see the validator docblock), so a pin-only
+    // submission had `address` empty, failed this guard, and silently wrote
+    // NOTHING: the customer's pin survived only as JSON in
+    // tbl_job.customer_submitted_payload and never reached tbl_address, so ops
+    // opening Confirm & Schedule saw no pin. Each SET is independently
+    // COALESCE-guarded, so widening the gate cannot blank a column — a field
+    // the customer didn't supply is NULL and COALESCE keeps the existing value.
+    const hasAnyAddressField =
+      addressLine || building || landmark || cityId || pinCode || gps || addrInstr;
+    if (addressId && hasAnyAddressField) {
       // Schema-drift gate: conditionally include the address_instruction
       // SET clause + its parameter only when the column exists on this
       // deploy. Without the gate, deploys missing the column would 500
