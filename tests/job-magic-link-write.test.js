@@ -90,6 +90,22 @@ test('acceptSubmission — the map-search text persists to tbl_address.building'
   assert.doesNotMatch(write.sql, /address\s*=\s*\?/, 'the booked address must never be blind-overwritten');
 });
 
+test('acceptSubmission — address:\'\' alongside a pin must NOT blank the booked address', async () => {
+  // Regression guard. `COALESCE('', address)` returns '' (empty string is not
+  // NULL), so passing '' through would WIPE the customer's booked address. '' has
+  // to reach the query as NULL, like every sibling field. Reachable input: Joi
+  // .allow('')s this field, and the widened gate lets a pin-only payload through
+  // on gps alone.
+  const fake = makeFakePool([ADDR_ROUTE], { stopOn: /UPDATE tbl_address/ });
+  await assert.rejects(() => magic.acceptSubmission(42, {
+    address: '', gps_location: '19.076000,72.877700',
+  }, fake.pool));
+  const write = fake.calls.find((c) => /UPDATE tbl_address/.test(c.sql));
+  assert.ok(write, 'the pin still writes (the gate passes on gps)');
+  assert.ok(!write.params.includes(''), 'an empty address must never be bound — it would blank the column');
+  assert.equal(write.params[0], null, 'address collapses to NULL so COALESCE keeps the booked value');
+});
+
 test('acceptSubmission — no address-section fields at all → no tbl_address write', async () => {
   // No stopOn: a payload with no `services` skips the service block, so the
   // whole call runs to completion against the fake. Letting it finish proves

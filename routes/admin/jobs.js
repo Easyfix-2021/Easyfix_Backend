@@ -172,7 +172,8 @@ router.get('/:id/candidates',
  * GET /api/admin/jobs/:id/candidates/search?term=<q>&jobDate=&timeSlot=
  *
  * Match-anyone variant of /:id/candidates — finds technicians by
- * efr_id / efr_name / efr_no(mobile) with NO top-10 hard filters and NO
+ * efr_id / efr_name / efr_no(mobile) / city_name / efr_pin_no (single `term`
+ * box — no per-field params) with NO top-10 hard filters and NO
  * ranking exclusion, returning the same widened row shape (distance,
  * attendance, concurrent, skill state, …) so ops can assign anyone.
  * Capped at 50; the service logger.warns when the cap is hit.

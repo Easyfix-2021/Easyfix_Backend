@@ -368,8 +368,9 @@ const candidatesQuery = Joi.object({
 
 /*
  * Query schema for GET /:id/candidates/search (match-anyone). `term` is
- * required (matches efr_id / efr_name / efr_no). Same optional schedule
- * overrides as the ranked list.
+ * required and is the ONLY search input — it matches efr_id / efr_name /
+ * efr_no / city_name / efr_pin_no, so no per-field (city=/pin=) params exist.
+ * Same optional schedule overrides as the ranked list.
  */
 const candidatesSearchQuery = Joi.object({
   term: Joi.string().trim().min(1).max(100).required(),

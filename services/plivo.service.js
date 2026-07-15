@@ -446,8 +446,10 @@ async function fetchTranscription({ recordingId }) {
  * REQUEST Plivo to create a transcription for a recording (POST). Plivo does NOT
  * auto-transcribe recordings — a transcript must be requested first, then
  * retrieved via fetchTranscription() once Plivo finishes processing (seconds to
- * minutes). This is the missing half of the pipeline: `record="true"` on <Dial>
- * only captures audio; without this POST the GET always 404s.
+ * minutes). This is the missing half of the pipeline: the <Record> element in
+ * buildAnswerXml only captures audio; without this POST the GET always 404s.
+ * (Comment corrected 2026-07-15 — it referenced `record="true"` on <Dial>, the
+ * pre-2026-07-13 construction that was silently ignored and recorded nothing.)
  *
  * Returns { ok, requested, alreadyExists, notEnabled }:
  *   - requested     — Plivo accepted the create (transcript is now processing)

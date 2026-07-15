@@ -594,16 +594,32 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
     // dates with no row also return [] → red cross, per the locked decision.
     // Fail-soft: a schema/table mismatch yields [] (everyone red) rather than
     // erroring the whole list.
+    // ⚠ INVERTED 2026-07-15 — this now selects the ABSENT set, not the present
+    // set. Per ops: "if attendance is not marked as absent, consider it present;
+    // ONLY explicitly absent counts as absent." Previously presence had to be
+    // AFFIRMED (a row existed AND a slot was ticked AND no leave), so the far
+    // larger population of techs who simply never marked anything was treated as
+    // absent — the default was backwards. `is_leave_marked = 1` is the only
+    // explicit absence signal the table carries (columns: morning_slot,
+    // evening_slot, is_leave_marked — see scripts/schema-verify.js), so it alone
+    // defines absence now. A row with neither slot ticked and no leave flag is
+    // NOT explicit absence → present.
+    //
+    // Consequences of the flip, both intentional:
+    //   - reqDate null (no schedule): empty ABSENT set → everyone present. Was:
+    //     everyone absent.
+    //   - Query failure: fails OPEN (empty absent set → everyone present) rather
+    //     than closed. That follows directly from the rule — we cannot claim
+    //     someone is "explicitly absent" on the strength of a failed query.
     reqDate
       ? pool.query(
           `SELECT DISTINCT easyfixer_id AS efr_id
              FROM tbl_easyfixer_attendance
             WHERE easyfixer_id IN (${placeholders})
               AND DATE(created_on) = ?
-              AND (morning_slot = 1 OR evening_slot = 1)
-              AND (is_leave_marked IS NULL OR is_leave_marked = 0)`,
+              AND is_leave_marked = 1`,
           [...efrIds, reqDate]
-        ).catch((e) => { logger.warn({ err: e.message }, 'candidate-ranking: attendance-for-job-date query failed; treating all as absent'); return [[]]; })
+        ).catch((e) => { logger.warn({ err: e.message }, 'candidate-ranking: attendance-absent query failed; treating all as present (only explicit absence excludes)'); return [[]]; })
       : Promise.resolve([[]]),
 
     // Deep-skill match per tech (built above so the SQL stays readable).
@@ -676,7 +692,9 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
   for (const r of (workedClientRowsResult[0] || [])) workedClientMap.set(r.efr_id, true);
   const workedVerticalMap = new Map();
   for (const r of (workedVerticalRowsResult[0] || [])) workedVerticalMap.set(r.efr_id, true);
-  const attendanceMap = new Map((attRowsResult[0] || []).map((r) => [r.efr_id, true]));
+  // Membership = EXPLICITLY ABSENT (is_leave_marked = 1). Non-membership —
+  // including "never marked attendance at all" — means present. See the query.
+  const absentMap = new Map((attRowsResult[0] || []).map((r) => [r.efr_id, true]));
   const deepSkillMap  = new Map((deepSkillResult[0] || []).map((r) => [r.efr_id, true]));
   const anySkillMap   = new Map((anySkillResult[0] || []).map((r) => [r.efr_id, true]));
 
@@ -822,7 +840,10 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
       sda_history:        !!sdaRow,
       worked_for_client:  workedClientMap.get(id) === true,
       worked_for_vertical:workedVerticalMap.get(id) === true,
-      attendance_marked:  attendanceMap.get(id) === true,
+      // Drives the modal's "Attendance Today" tick/cross. Same rule as
+      // attendance_for_job_date: a cross now means EXPLICITLY marked absent
+      // (is_leave_marked=1), not merely "hasn't marked attendance".
+      attendance_marked:  !absentMap.has(id),
       has_deep_skill:     matchesJobSkill,
       tat_target_hours:   tatTargetHours,
       max_concurrent:     maxConcurrent,
@@ -836,7 +857,8 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
       zone_name:              techZone.zone_name ?? null,
       distance_km:            distanceKm == null ? null : Number(distanceKm.toFixed(1)),
       distance_tier:          tr.tier,
-      attendance_for_job_date: attendanceMap.get(id) === true,
+      // Present UNLESS explicitly marked absent — `absentMap` is the leave set.
+      attendance_for_job_date: !absentMap.has(id),
       deep_skill_status:      skillStatus,
       deep_skill_match:       matchesJobSkill,
       worked_in_category:     workedVerticalMap.get(id) === true,
@@ -965,7 +987,7 @@ function buildCandidateRow(tech, s, job) {
  *
  * Hard filters:
  *   - same-day + same-slot booking conflict    (ALWAYS)
- *   - attendance present for the job date       (when enforceAttendance)
+ *   - not explicitly absent for the job date    (when enforceAttendance)
  *   - at/over Max Concurrent Jobs               (when enforceMaxConcurrent)
  *   - COD job + balance <= floor                (when enforceCodBalance)
  */
@@ -980,8 +1002,12 @@ function filterAndScore(eligible, stats, job, opts) {
     if (s.same_slot_conflict) {
       rejected.push({ efr_id: e.efr_id, efr_name: e.efr_name, reason: 'already booked same day + same slot' }); continue;
     }
-    // Attendance HARD FILTER: only technicians marked present for the job date
-    // pass. The `enforceAttendance` flag here is already WINDOW-GATED by the
+    // Attendance HARD FILTER: excludes only technicians EXPLICITLY marked
+    // absent (is_leave_marked=1) for the job date — as of 2026-07-15 an
+    // unmarked technician counts as PRESENT and passes (see the absent-set
+    // query above; this used to require affirmative presence and rejected
+    // everyone who simply never marked). The `enforceAttendance` flag here is
+    // already WINDOW-GATED by the
     // caller (rankCandidatesForJob) to jobs scheduled TODAY/TOMORROW — the only
     // dates a technician can mark attendance for — so later/past/unscheduled
     // jobs never hit this gate. DIVERGES from legacy (legacy used attendance
@@ -1043,7 +1069,7 @@ function filterAndScore(eligible, stats, job, opts) {
  *                          applies the floor POST-rank via
  *                          pickAutoAssignCandidate, not as a ranked-list
  *                          exclude). The Schedule & Assign modal passes TRUE.
- *   enforceAttendance    — hard-exclude techs NOT marked present for the job
+ *   enforceAttendance    — hard-exclude techs EXPLICITLY marked absent for the job
  *                          date. DEFAULT true, but INTERNALLY WINDOW-GATED: it
  *                          only applies when the job is scheduled TODAY or
  *                          TOMORROW (the dates a technician can mark attendance
@@ -1147,6 +1173,18 @@ async function rankCandidatesForJob(jobId, {
     paid_by:           job.paid_by          ?? null,
     paid_by_label:     paidByLabel(job.paid_by),
     assigned_efr_id:   assignedEfrId,
+    // Schedule & Assign Job Details fields. This object is an ALLOWLIST over the
+    // getById payload — anything not copied here reaches the modal as undefined
+    // and renders blank, which is exactly what happened to Booked By / Booked On
+    // / Client SPOC. Add the field HERE too when the modal grows a column.
+    client_spoc:       job.client_spoc      ?? null,
+    client_spoc_name:  job.client_spoc_name ?? null,
+    created_by_name:   job.created_by_name  ?? null,
+    created_date_time: job.created_date_time ?? null,
+    // Who collects payment — per JOB. Shown against Paid service lines.
+    collected_by:      job.collected_by     ?? null,
+    // Technician-facing note, surfaced as "Additional Comments".
+    efr_special_notes: job.efr_special_notes ?? null,
   };
 
   // COD = customer pays the tech on-site (paid_by = Customer). Such techs
@@ -1365,6 +1403,11 @@ function mapJobServices(job) {
       service_type: s.service_type_name ?? null,
       quantity:     s.quantity          ?? null,
       total_charge: s.total_charge      ?? null,
+      // Free/Paid per service, derived by job.service.js getById from
+      // effective_charge. This mapper is an ALLOWLIST — a field absent here is
+      // dropped no matter what getById projects, which is why the modal's
+      // Billing chip rendered "—".
+      billing_label: s.billing_label    ?? null,
     }));
 }
 
@@ -1435,8 +1478,10 @@ function pickAutoAssignCandidate(rankResult, { paidBy, balanceFloor = DEFAULTS.A
  * searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit })
  *
  * Powers GET /api/admin/jobs/:id/candidates/search. Matches ANY technician
- * by efr_id / efr_name / efr_no(mobile) — NO top-10 hard filters, NO
- * ranking-based exclusion — so ops can assign anyone. Returns the SAME
+ * by efr_id / efr_name / efr_no(mobile) / city_name / efr_pin_no — NO top-10
+ * hard filters, NO ranking-based exclusion — so ops can assign anyone. One
+ * `term` box covers every column (ops should never have to pick a field first).
+ * Returns the SAME
  * widened row shape as the ranked list (reuses statsForCandidates +
  * buildCandidateRow), so every computed column (distance, attendance,
  * concurrent, skill state, …) is consistent across both surfaces.
@@ -1465,14 +1510,28 @@ async function searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit =
     return { job: await searchJobHeader(job), candidates: [], capped: false };
   }
 
-  // Match by name / mobile (efr_no) always; by efr_id only when the term is
-  // a pure integer. capLookup = cap + 1 so we can detect "hit the cap".
+  // Match by name / mobile (efr_no) / city always; by efr_id only when the term
+  // is a pure integer. capLookup = cap + 1 so we can detect "hit the cap".
   const like = `%${q}%`;
-  const params = [like, like];
+  const params = [like, like, like];
   let idClause = '';
   if (/^[0-9]+$/.test(q)) {
     idClause = ' OR e.efr_id = ?';
     params.push(Number(q));
+  }
+  // A 6-digit numeric term is genuinely ambiguous: it can be a pincode, an
+  // efr_id (ids are sequential and already reach that width) or a fragment of a
+  // 10-digit mobile. We deliberately do NOT disambiguate — every clause is OR'd,
+  // so the pin match is purely ADDITIVE and the pre-existing id / mobile
+  // behaviour is untouched (a superset, never a replacement). Gated to exactly 6
+  // digits: that is the full Indian pincode width, a shorter term would match a
+  // whole region's worth of techs, and a 10-digit mobile can never be a pin.
+  // Bound as a STRING because efr_pin_no is a varchar — a numeric param would
+  // make MySQL coerce the column and lose the index.
+  let pinClause = '';
+  if (/^[0-9]{6}$/.test(q)) {
+    pinClause = ' OR e.efr_pin_no = ?';
+    params.push(q);
   }
   // Search is a "match-anyone" override so ops can bypass the RANKING filters
   // (deep-skill match, distance, serviceable pincode, attendance, same-slot
@@ -1490,7 +1549,7 @@ async function searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit =
        LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId
       WHERE e.efr_status = 1
         AND e.is_technician_verified = 1
-        AND (e.efr_name LIKE ? OR e.efr_no LIKE ?${idClause})
+        AND (e.efr_name LIKE ? OR e.efr_no LIKE ? OR c.city_name LIKE ?${idClause}${pinClause})
       ORDER BY e.efr_name ASC
       LIMIT ?`,
     [...params, cap + 1],

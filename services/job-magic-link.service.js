@@ -35,6 +35,7 @@ const whatsappService  = require('./gallabox.whatsapp.service');
 const urlShortener     = require('./url-shortener.service');
 const { maskMobile }   = require('../utils/mask-mobile');
 const s3Storage        = require('../utils/s3-storage');
+const addressService   = require('./address.service');
 const logger           = require('../logger');
 
 /*
@@ -405,6 +406,15 @@ async function cityHasIsActive(pool) {
  *
  * If/when ops backfills the column on every environment, the probe
  * returns true everywhere and behaviour upgrades automatically.
+ *
+ * NOT the shared address.service probe, deliberately. That one asks the
+ * catalog ("is this column listed?"); this one asks the question the degraded
+ * mode actually cares about ("can I SELECT this column without the query
+ * blowing up?"), so it treats a THROW as absent where the catalog probe treats
+ * an empty result as absent. The two therefore fail in opposite directions and
+ * cannot share a memo — a catalog answer cached here would defeat the guard
+ * this exists to provide. tests/job-magic-link-degraded.test.js pins the
+ * throw-means-absent convention.
  */
 let _addrInstrProbed = false;
 let _addrHasInstruction = false;
@@ -1330,7 +1340,16 @@ async function acceptSubmission(jobId, payload, pool) {
     //    Empty strings (Joi allows `''` for the optional siblings) collapse
     //    to NULL so COALESCE keeps the existing column value rather than
     //    blanking out a building/landmark ops had set earlier.
-    const addressLine = payload.address ?? null;
+    // `''` MUST collapse to NULL exactly like every sibling below (and like
+    // writeCustomerOrderDetails does for the same field). It used to be
+    // `payload.address ?? null`, which passes '' straight through — and
+    // `COALESCE('', address)` returns '' (empty string is not NULL), BLANKING the
+    // customer's booked service address. That was unreachable while the gate was
+    // `if (addressId && addressLine)` ('' is falsy → whole block skipped), but
+    // widening the gate to hasAnyAddressField made a pin-only payload carrying
+    // `address: ''` pass on gps alone and wipe the address. Joi explicitly
+    // `.allow('')`s this field, so it is reachable input, not a theoretical one.
+    const addressLine = payload.address && String(payload.address).length ? payload.address : null;
     const building    = payload.building && String(payload.building).length     ? payload.building     : null;
     const landmark    = payload.landmark && String(payload.landmark).length     ? payload.landmark     : null;
     const cityId      = payload.city_id ?? null;
@@ -1355,43 +1374,27 @@ async function acceptSubmission(jobId, payload, pool) {
     const hasAnyAddressField =
       addressLine || building || landmark || cityId || pinCode || gps || addrInstr;
     if (addressId && hasAnyAddressField) {
-      // Schema-drift gate: conditionally include the address_instruction
-      // SET clause + its parameter only when the column exists on this
-      // deploy. Without the gate, deploys missing the column would 500
-      // here with `Unknown column 'address_instruction' in 'field list'`
-      // — caught 2026-05-31 mirroring the same gate in fetchPrefill.
-      // When absent, the customer's address-instruction text is silently
-      // dropped (degraded mode); the rest of the address persists.
-      const hasAddrInstr = await addressHasInstruction(pool);
-      const setClauses = [
-        'address             = COALESCE(?, address)',
-        'building            = COALESCE(?, building)',
-        'landmark            = COALESCE(?, landmark)',
-        'city_id             = COALESCE(?, city_id)',
-        'pin_code            = COALESCE(?, pin_code)',
-        'gps_location        = COALESCE(?, gps_location)',
-      ];
-      const params = [addressLine, building, landmark, cityId, pinCode, gps];
-      if (hasAddrInstr) {
-        setClauses.push('address_instruction = COALESCE(?, address_instruction)');
-        params.push(addrInstr);
-        // 2026-06-03: per ops, `is_instruction_added` must stay 0 even
-        // when the text is non-empty. See services/job.service.js
-        // insertAddress() for the full rationale. When the customer's
-        // payload included the field at all, we still touch the column
-        // (reset to 0) so any pre-existing 1 from older code paths is
-        // cleared on submission — the invariant must hold cross-tier.
-        if (addrInstr != null) {
-          setClauses.push('is_instruction_added = ?');
-          params.push(0);
-        }
-      }
-      params.push(addressId);
-
-      await conn.query(
-        `UPDATE tbl_address SET ${setClauses.join(', ')} WHERE address_id = ?`,
-        params,
+      // Schema-drift gate: the address_instruction SET is included only when
+      // the column exists on this deploy. Without it, deploys missing the
+      // column would 500 here with `Unknown column 'address_instruction' in
+      // 'field list'` — caught 2026-05-31 mirroring the same gate in
+      // fetchPrefill. When absent, the customer's address-instruction text is
+      // silently dropped (degraded mode); the rest of the address persists.
+      // resetInstructionFlag: this path clears a stale is_instruction_added=1
+      // when the customer supplied text — the invariant must hold cross-tier.
+      const write = addressService.buildCoalesceAddressUpdate(
+        addressId,
+        {
+          address: addressLine, building, landmark,
+          city_id: cityId, pin_code: pinCode, gps_location: gps,
+          address_instruction: addrInstr,
+        },
+        {
+          hasInstructionColumn: await addressHasInstruction(pool),
+          resetInstructionFlag: true,
+        },
       );
+      await conn.query(write.sql, write.params);
     }
 
     // 5. Service upsert — bidirectional reconciliation of the customer's
@@ -1663,31 +1666,28 @@ async function writeCustomerOrderDetails(jobId, fields, pool) {
       ],
     );
 
+    // Gate is `addressLine` alone (NOT acceptSubmission's any-field gate): the
+    // chat flow only ever reaches here having collected a full address line.
+    // It also collapses an empty `address` to NULL, which acceptSubmission
+    // deliberately does not — hence the normalisation stays here rather than in
+    // the shared builder. resetInstructionFlag is omitted: this path has never
+    // touched is_instruction_added.
     const addressLine = (fields.address && String(fields.address).length) ? fields.address : null;
     if (addressId && addressLine) {
-      const hasAddrInstr = await addressHasInstruction(pool);
-      const setClauses = [
-        'address      = COALESCE(?, address)',
-        'building     = COALESCE(?, building)',
-        'landmark     = COALESCE(?, landmark)',
-        'city_id      = COALESCE(?, city_id)',
-        'pin_code     = COALESCE(?, pin_code)',
-        'gps_location = COALESCE(?, gps_location)',
-      ];
-      const params = [
-        addressLine,
-        (fields.building && String(fields.building).length) ? fields.building : null,
-        (fields.landmark && String(fields.landmark).length) ? fields.landmark : null,
-        fields.city_id ?? null,
-        fields.pin_code ?? null,
-        (fields.gps_location && String(fields.gps_location).length) ? fields.gps_location : null,
-      ];
-      if (hasAddrInstr) {
-        setClauses.push('address_instruction = COALESCE(?, address_instruction)');
-        params.push((fields.address_instruction && String(fields.address_instruction).length) ? fields.address_instruction : null);
-      }
-      params.push(addressId);
-      await conn.query(`UPDATE tbl_address SET ${setClauses.join(', ')} WHERE address_id = ?`, params);
+      const write = addressService.buildCoalesceAddressUpdate(
+        addressId,
+        {
+          address: addressLine,
+          building: (fields.building && String(fields.building).length) ? fields.building : null,
+          landmark: (fields.landmark && String(fields.landmark).length) ? fields.landmark : null,
+          city_id: fields.city_id ?? null,
+          pin_code: fields.pin_code ?? null,
+          gps_location: (fields.gps_location && String(fields.gps_location).length) ? fields.gps_location : null,
+          address_instruction: (fields.address_instruction && String(fields.address_instruction).length) ? fields.address_instruction : null,
+        },
+        { hasInstructionColumn: await addressHasInstruction(pool) },
+      );
+      await conn.query(write.sql, write.params);
     }
 
     await conn.commit();

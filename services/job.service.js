@@ -8,6 +8,7 @@ const { generateOtp } = require('../utils/otp');
 // Property-flag reader for THE OFFER MODEL toggle (`job.offer.flow.enabled`).
 // Synchronous, cache-backed — see services/properties.service.js::getProperty.
 const { getProperty } = require('./properties.service');
+const addressService = require('./address.service');
 
 /*
  * THE OFFER MODEL feature flag. ON by default — only the literal string
@@ -522,19 +523,15 @@ async function hasClientVerticalIdColumn() {
   return _hasClientVerticalIdColumn;
 }
 
-// tbl_address.address_instruction is column-probed (present per deploy — same
-// guard the write path uses in insertAddress/update). getByIdCore must branch
-// the SELECT so DBs without the column don't 500 on job-detail reads.
-let _hasAddressInstructionColumn = null;
-async function hasAddressInstructionColumn() {
-  if (_hasAddressInstructionColumn !== null) return _hasAddressInstructionColumn;
-  try {
-    const [rows] = await pool.query("SHOW COLUMNS FROM tbl_address LIKE 'address_instruction'");
-    _hasAddressInstructionColumn = rows.length > 0;
-  } catch (_e) {
-    _hasAddressInstructionColumn = false;
-  }
-  return _hasAddressInstructionColumn;
+// tbl_address.address_instruction is column-probed (present per deploy — the
+// same guard the write paths use). getByIdCore must branch the SELECT so DBs
+// without the column don't 500 on job-detail reads. Memoised + degrades to
+// "absent" on probe failure: a read must never 500 over a missing column.
+function hasAddressInstructionColumn() {
+  return addressService.hasAddressInstructionColumn(pool, {
+    cache: true,
+    onProbeError: 'assume-absent',
+  });
 }
 
 /*
@@ -694,14 +691,45 @@ function magicLinkDeliveryColumns(colsExist) {
 
 function offerColumns(tableExists) {
   if (!tableExists) {
-    return `, NULL AS is_offered, NULL AS offered_efr_name, NULL AS offered_count`;
+    // The NULL aliases MUST mirror the real branch column-for-column so the row
+    // shape is identical on un-migrated deploys.
+    return `, NULL AS is_offered, NULL AS offered_efr_name, NULL AS offered_count`
+         + `, NULL AS total_offer_count, NULL AS expired_offer_count`;
   }
   // offered_count — how many techs currently hold an OPEN (status=0) offer on
   // this job, so the CRM can render "Offered to N" on the my-orders / jobs
   // list. Correlated COUNT subquery on the indexed job_id column. Kept beside
   // is_offered / offered_efr_name (the latter shows the most-recent offeree's
   // name for the single-offer common case).
-  return `, (EXISTS(SELECT 1 FROM tbl_job_offer jo WHERE jo.job_id = j.job_id AND jo.offer_status = ${OFFER_STATUS.OFFERED})) AS is_offered, (SELECT ef2.efr_name FROM tbl_job_offer jo2 JOIN tbl_easyfixer ef2 ON ef2.efr_id = jo2.fk_easyfixter_id WHERE jo2.job_id = j.job_id AND jo2.offer_status = ${OFFER_STATUS.OFFERED} ORDER BY jo2.job_offer_id DESC LIMIT 1) AS offered_efr_name, (SELECT COUNT(*) FROM tbl_job_offer jo3 WHERE jo3.job_id = j.job_id AND jo3.offer_status = ${OFFER_STATUS.OFFERED}) AS offered_count`;
+  //
+  // total_offer_count / expired_offer_count (2026-07-15) drive the
+  // Pending-for-Scheduling tri-state chip — Offered / Expired / Pending For
+  // Scheduling. Ops asked for the rule LITERALLY: "Expired only when ALL the
+  // offers are expired; Offered if even a single offer is active." So the FE
+  // reads, in order:
+  //     offered_count > 0                                        → Offered
+  //     total > 0 && expired === total                           → Expired
+  //     else                                                     → Pending For Scheduling
+  // Two counts rather than one, because "all expired" is NOT the same as "none
+  // open": a job whose only offer was REJECTED (status=2) has no open offer yet
+  // is not all-expired, and must read as Pending For Scheduling, not Expired.
+  // Comparing expired against the TOTAL is what encodes that distinction —
+  // don't "simplify" this to `offered_count === 0 && total > 0`.
+  //
+  // Raw COUNT(*) (not latest-per-tech): the re-offer path UPDATEs in place and
+  // collapses strays, so there is one row per (job, tech) in practice.
+  //
+  // All correlated subqueries on the indexed job_id — same shape and cost class
+  // as service_count above. Deliberately NOT a JOIN: a job accrues many
+  // historical offer rows and a JOIN would fan-out the LIST (see the docblock).
+  const openOffer  = `jo.job_id = j.job_id AND jo.offer_status = ${OFFER_STATUS.OFFERED}`;
+  return `, (EXISTS(SELECT 1 FROM tbl_job_offer jo WHERE ${openOffer})) AS is_offered`
+       + `, (SELECT ef2.efr_name FROM tbl_job_offer jo2 JOIN tbl_easyfixer ef2 ON ef2.efr_id = jo2.fk_easyfixter_id`
+       + `    WHERE jo2.job_id = j.job_id AND jo2.offer_status = ${OFFER_STATUS.OFFERED}`
+       + `    ORDER BY jo2.job_offer_id DESC LIMIT 1) AS offered_efr_name`
+       + `, (SELECT COUNT(*) FROM tbl_job_offer jo3 WHERE jo3.job_id = j.job_id AND jo3.offer_status = ${OFFER_STATUS.OFFERED}) AS offered_count`
+       + `, (SELECT COUNT(*) FROM tbl_job_offer jo4 WHERE jo4.job_id = j.job_id) AS total_offer_count`
+       + `, (SELECT COUNT(*) FROM tbl_job_offer jo5 WHERE jo5.job_id = j.job_id AND jo5.offer_status = ${OFFER_STATUS.EXPIRED}) AS expired_offer_count`;
 }
 
 // Kept for getById(), which does select these as part of the full detail payload.
@@ -1237,7 +1265,29 @@ async function getById(jobId) {
     );
     videos = vRows;
   }
-  return { ...job, services: services[0], images: images[0], videos };
+  /*
+   * billing_label — per-service Free/Paid, derived (not stored). ADDITIVE
+   * 2026-07-15 for the Schedule & Assign modal's per-service Free/Paid chip.
+   *
+   * Same rule as the customer-facing magic-link bundle (job-magic-link.service.js
+   * fetchPrefill: `total_amount null or 0 → 'Free', else 'Paid'`) so Free/Paid
+   * means exactly one thing on every surface. Keyed off `effective_charge` —
+   * the COALESCE(NULLIF(js.total_charge,0), CS.total_amount) alias above —
+   * because js.total_charge is usually 0 and the real price sits on the
+   * client-service row (that mismatch is what made the mobile app render every
+   * order as "Free"; see the comment on the SELECT).
+   *
+   * ⚠ Free/Paid is billing_label, and it is PER-SERVICE. It is NOT collected_by
+   * — that's a per-JOB enum for WHO collects the money (1=Easyfixer, 2=Easyfix,
+   * 3=Client) and lives on tbl_job. Neither tbl_job_services nor
+   * tbl_client_service carries a collected-by column.
+   */
+  const shapedServices = (services[0] || []).map((s) => ({
+    ...s,
+    billing_label:
+      (s.effective_charge == null || Number(s.effective_charge) === 0) ? 'Free' : 'Paid',
+  }));
+  return { ...job, services: shapedServices, images: images[0], videos };
 }
 
 /*
@@ -1796,83 +1846,13 @@ async function recomputeClientServicesCsv(conn, jobId) {
   );
 }
 
-async function insertAddress(conn, customerId, addr, actor) {
-  // Column-presence probe — production tbl_address may or may not carry
-  // the `address_instruction` column depending on deploy. We branch the
-  // INSERT shape so older DBs aren't broken by an unknown column.
-  let hasInstruction = false;
-  try {
-    const [cols] = await conn.query(
-      `SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = DATABASE()
-          AND TABLE_NAME   = 'tbl_address'
-          AND COLUMN_NAME  = 'address_instruction'
-        LIMIT 1`,
-    );
-    hasInstruction = cols.length > 0;
-  } catch (_e) { /* defensively assume absent on probe failure */ }
-
-  // is_instruction_added — legacy "does this address carry notes?" flag.
-  //
-  // 2026-06-03: per ops, this column must stay 0 even when
-  // `address_instruction` is non-empty. Previously we kept it in sync
-  // with the text content (1 when filled, 0 when blank), but that
-  // collided with downstream legacy logic that uses the flag as a
-  // gate (rule TBD). Persisting 0 unconditionally is the agreed
-  // invariant; the actual text still lives in `address_instruction`
-  // and is the canonical source for reads. We retain the `hasInstructionText`
-  // local in case future flows need it — but it no longer drives the column.
-  const hasInstructionText = addr.address_instruction != null
-    && String(addr.address_instruction).trim() !== '';
-  // Silence the unused-binding hint for the local — the comment above
-  // documents why it's kept around for future readers.
-  void hasInstructionText;
-
-  let addressId;
-  if (hasInstruction) {
-    const [ins] = await conn.query(
-      `INSERT INTO tbl_address
-         (customer_id, address, building, landmark, locality, city_id, pin_code, gps_location,
-          mobile_number, address_instruction, is_instruction_added,
-          created_by, insert_date, update_date)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        customerId,
-        addr.address, addr.building || null, addr.landmark || null, addr.locality || null,
-        addr.city_id, addr.pin_code, addr.gps_location || null,
-        addr.mobile_number || null, addr.address_instruction || null,
-        // is_instruction_added pinned to 0 per ops (2026-06-03) —
-        // see the docblock above hasInstructionText for the rationale.
-        0,
-        actor?.user_id || null,
-        new Date(), new Date(),
-      ]
-    );
-    addressId = ins.insertId;
-  } else {
-    // Fallback path (legacy DBs) — address_instruction silently dropped.
-    const [ins] = await conn.query(
-      `INSERT INTO tbl_address
-         (customer_id, address, building, landmark, locality, city_id, pin_code, gps_location,
-          mobile_number, created_by, insert_date, update_date)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        customerId,
-        addr.address, addr.building || null, addr.landmark || null, addr.locality || null,
-        addr.city_id, addr.pin_code, addr.gps_location || null,
-        addr.mobile_number || null, actor?.user_id || null,
-        new Date(), new Date(),
-      ]
-    );
-    addressId = ins.insertId;
-  }
-
-  // Free-text instruction is persisted directly on tbl_address.address_instruction
-  // via the column-probe branch above — no companion-table write needed
-  // (2026-06-04 simplification: dropped the `address_instruction` legacy
-  // table writes in favour of a single column on tbl_address).
-  return addressId;
-}
+// The INSERT itself (column-probe branch + the is_instruction_added invariant)
+// lives in address.service — tbl_address is shared/polymorphic and every writer
+// has to probe it the same way. Free-text instruction is persisted directly on
+// tbl_address.address_instruction, no companion-table write needed (2026-06-04
+// simplification: dropped the legacy `address_instruction` table writes in
+// favour of a single column on tbl_address).
+const insertAddress = addressService.insertCustomerAddress;
 
 // ─── Create ─────────────────────────────────────────────────────────
 async function create(input, actor) {
@@ -2562,28 +2542,24 @@ async function update(jobId, input, actor) {
       if (input.address.gps_location !== undefined) { addrSets.push('gps_location = ?'); addrVals.push(input.address.gps_location || null); }
       // address_instruction is column-probed per the matching guard in
       // insertAddress(). We skip the SET if the column doesn't exist on
-      // the deploy so the UPDATE doesn't fail with Unknown column. When
-      // the column IS present, we also flip is_instruction_added in lock-
-      // step so the legacy "has notes?" flag stays in sync with the text
-      // (legacy CRM views/reports filter on this flag).
+      // the deploy so the UPDATE doesn't fail with Unknown column.
+      // Probed uncached on the txn conn, and a probe failure ABORTS this
+      // edit rather than degrading it — dropping an operator's instruction
+      // text silently is worse here than rolling the whole update back.
       if (input.address.address_instruction !== undefined) {
-        const [cols] = await conn.query(
-          `SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE()
-              AND TABLE_NAME   = 'tbl_address'
-              AND COLUMN_NAME  = 'address_instruction'
-            LIMIT 1`,
-        );
-        if (cols.length > 0) {
-          // 2026-06-03: per ops, `is_instruction_added` must stay 0 even
-          // when the text is non-empty (see insertAddress for full
-          // rationale). We still WRITE the column on update so a row
-          // that was previously flipped to 1 by older code resets to 0
-          // — leaving stale 1s in place would defeat the invariant.
+        const hasAddrInstr = await addressService.hasAddressInstructionColumn(conn, {
+          cache: false,
+          onProbeError: 'throw',
+        });
+        if (hasAddrInstr) {
+          // is_instruction_added is pinned to 0, NOT kept in sync with the
+          // text — see address.service IS_INSTRUCTION_ADDED for the ops
+          // rationale. We still WRITE it so a row previously flipped to 1
+          // by older code resets to 0.
           addrSets.push('address_instruction = ?');
           addrVals.push(input.address.address_instruction || null);
           addrSets.push('is_instruction_added = ?');
-          addrVals.push(0);
+          addrVals.push(addressService.IS_INSTRUCTION_ADDED);
         }
       }
       if (addrSets.length > 0) {

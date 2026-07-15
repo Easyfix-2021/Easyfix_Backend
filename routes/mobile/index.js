@@ -8,6 +8,7 @@ const requireTechAuth = require('../../middleware/tech-auth');
 const { pool } = require('../../db');
 const techAuth = require('../../services/tech-auth.service');
 const jobService = require('../../services/job.service');
+const addressService = require('../../services/address.service');
 const jobCommentService = require('../../services/job-comment.service');
 const shareService = require('../../services/job-share.service');
 const voice = require('../../services/voice.service');
@@ -822,17 +823,10 @@ router.get('/profile/percentage', async (req, res, next) => {
 // rows that the CRM doc view can't disambiguate.
 // tbl_address is a SHARED/polymorphic table (job rows + technician-personal rows)
 // and its column set can drift across deploys, so we probe the live columns once
-// and only ever write the ones that actually exist (mirrors job-magic-link's
-// addressHasInstruction). Resolves the `city` vs `city1` ambiguity automatically.
-let _addressColumnsCache = null;
-async function addressColumns() {
-  if (_addressColumnsCache) return _addressColumnsCache;
-  const [rows] = await pool.query(
-    `SELECT COLUMN_NAME FROM information_schema.columns
-      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tbl_address'`);
-  _addressColumnsCache = new Set(rows.map((r) => r.COLUMN_NAME));
-  return _addressColumnsCache;
-}
+// and only ever write the ones that actually exist. Resolves the `city` vs
+// `city1` ambiguity automatically. Probe lives in address.service — every
+// tbl_address writer needs it.
+const addressColumns = () => addressService.addressColumnSet(pool);
 
 async function upsertEasyfixerDocuments(conn, efrId, rows) {
   for (const [typeId, key] of rows) {
@@ -1170,6 +1164,15 @@ router.post('/profile/contact-info', validate(Joi.object({
     const cols = await addressColumns();
     // Candidate column → value; only columns that exist on the live table are written.
     // Both city1 + city are offered (whichever exists wins) to span schema drift.
+    //
+    // The WRITE stays hand-rolled and does NOT use address.service's write
+    // helpers, deliberately: this is the polymorphic technician row — keyed by
+    // user_id, not customer_id — and its column set (house_no / district / state
+    // / city1 / is_address_details_filled) is disjoint from every customer-address
+    // writer. Only the column probe is genuinely shared. Routing this through a
+    // common builder would mean accepting an arbitrary column→value map, i.e.
+    // `UPDATE ... SET` with extra steps, and would put the customer columns one
+    // typo away from a technician row.
     const candidates = {
       house_no:                   b.houseNo ?? null,
       locality:                   b.areaOrLocation ?? null,
