@@ -21,7 +21,10 @@ function coarseFlow(body) {
   if (body.jobId) return 'job';
   if (body.customerId) return 'customer';
   if (body.efrId) return 'technician';
+  // Both SPOC shapes report the same flow — analytics cares that the operator
+  // called a client contact, not which table the number was read from.
   if (body.reportingContactId) return 'spoc';
+  if (body.spocJobId) return 'spoc';
   return null;
 }
 const { getEffectivePermissions } = require('../../services/role.service');
@@ -119,15 +122,15 @@ router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'
     // jobId / customerId / efrId / reportingContactId / page / limit and
     // silently strips unknowns. /preview consumes whichever of the four
     // identifiers the FE supplied — matching the click-to-call branches.
-    const { jobId, customerId, efrId, reportingContactId, useAlt, provider } = req.query;
-    logger.info('Preview call legs · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · efrId=' + (efrId ?? '—') + ' · contactId=' + (reportingContactId ?? '—') + ' · provider=' + (provider || 'default'));
+    const { jobId, customerId, efrId, reportingContactId, spocJobId, useAlt, provider } = req.query;
+    logger.info('Preview call legs · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · efrId=' + (efrId ?? '—') + ' · contactId=' + (reportingContactId ?? '—') + ' · spocJobId=' + (spocJobId ?? '—') + ' · provider=' + (provider || 'default'));
     // Boolean coercion — query strings carry primitives as strings.
     // Accept '1' or 'true' (case-insensitive) so callers don't have to
     // remember which truthy shape we expect.
     const useAltFlag = String(useAlt || '').toLowerCase() === 'true' || String(useAlt) === '1';
-    if (!jobId && !customerId && !efrId && !reportingContactId) {
+    if (!jobId && !customerId && !efrId && !reportingContactId && !spocJobId) {
       logger.warn('Preview rejected · no receiver identifier supplied');
-      return modernError(res, 400, 'one of jobId/customerId/efrId/reportingContactId is required');
+      return modernError(res, 400, 'one of jobId/customerId/efrId/reportingContactId/spocJobId is required');
     }
 
     // Resolve receiver real-mobile via the same lookups the POST handler
@@ -163,6 +166,13 @@ router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'
       );
       if (!efr) return modernError(res, 404, `Easyfixer ${efrId} not found`);
       receiverReal = efr.efr_no || null;
+    } else if (spocJobId) {
+      const [[job]] = await pool.query(
+        `SELECT client_spoc FROM tbl_job WHERE job_id = ? LIMIT 1`,
+        [spocJobId]
+      );
+      if (!job) return modernError(res, 404, `Job ${spocJobId} not found`);
+      receiverReal = job.client_spoc || null;
     } else {
       const [[ct]] = await pool.query(
         `SELECT contact_no FROM tbl_client_contacts WHERE id = ? LIMIT 1`,
@@ -204,8 +214,8 @@ router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'
 // server-side here. Returns { ok:true, receiverMobile, receiverName,
 // receiverCustomerId, jobIdToStore, jobStatusSnapshot, jobEfrId } on success,
 // or { ok:false, status, message } the caller turns into a modernError.
-async function resolveReceiver({ jobId, customerId, efrId, reportingContactId, useAlt, jobContextId }) {
-  logger.info('Resolve call receiver · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · efrId=' + (efrId ?? '—') + ' · contactId=' + (reportingContactId ?? '—') + ' · useAlt=' + !!useAlt);
+async function resolveReceiver({ jobId, customerId, efrId, reportingContactId, spocJobId, useAlt, jobContextId }) {
+  logger.info('Resolve call receiver · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · efrId=' + (efrId ?? '—') + ' · contactId=' + (reportingContactId ?? '—') + ' · spocJobId=' + (spocJobId ?? '—') + ' · useAlt=' + !!useAlt);
   if (jobId) {
     const [[job]] = await pool.query(
       `SELECT j.job_id, j.fk_customer_id, j.fk_easyfixter_id, j.job_status,
@@ -233,6 +243,33 @@ async function resolveReceiver({ jobId, customerId, efrId, reportingContactId, u
     return {
       ok: true, receiverMobile, receiverName,
       receiverCustomerId: job.fk_customer_id || null,
+      jobIdToStore: job.job_id, jobStatusSnapshot: job.job_status,
+      jobEfrId: job.fk_easyfixter_id || null,
+    };
+  }
+  if (spocJobId) {
+    const [[job]] = await pool.query(
+      `SELECT job_id, job_status, fk_easyfixter_id, client_spoc, client_spoc_name
+         FROM tbl_job WHERE job_id = ? LIMIT 1`,
+      [spocJobId]
+    );
+    if (!job) logger.warn('Resolve receiver · job not found · spocJobId=' + spocJobId);
+    if (!job) return { ok: false, status: 404, message: `Job ${spocJobId} not found` };
+    if (!job.client_spoc) logger.warn('Resolve receiver · no client SPOC mobile · spocJobId=' + spocJobId);
+    if (!job.client_spoc) return { ok: false, status: 400, message: `Job ${spocJobId} has no client SPOC mobile on file` };
+    // receiverCustomerId stays NULL even though we know the job's customer:
+    // reciever_id holds a CUSTOMER id (GET / filters `customerId` straight onto
+    // it), and a client SPOC is not the customer — stamping it would surface
+    // this call under the customer's history. Matches the efr/contact paths.
+    // jobIdToStore is the job itself (jobContextId is ignored here, as on the
+    // jobId path): the SPOC is reached THROUGH a job, so the call belongs to
+    // that job's history, where resolveJobParties already labels a
+    // client_spoc-matching leg as 'Client SPOC'.
+    return {
+      ok: true,
+      receiverMobile: job.client_spoc,
+      receiverName: job.client_spoc_name || null,
+      receiverCustomerId: null,
       jobIdToStore: job.job_id, jobStatusSnapshot: job.job_status,
       jobEfrId: job.fk_easyfixter_id || null,
     };
@@ -273,9 +310,9 @@ async function resolveReceiver({ jobId, customerId, efrId, reportingContactId, u
 // ─── POST /click-to-call ─────────────────────────────────────────────
 router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody), async (req, res, next) => {
   try {
-    const { jobId, customerId, efrId, reportingContactId, callFrom, callTo, useAlt, provider, jobContextId } = req.body;
+    const { jobId, customerId, efrId, reportingContactId, spocJobId, callFrom, callTo, useAlt, provider, jobContextId } = req.body;
     const agent = req.user;
-    logger.info('Click-to-call request · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · efrId=' + (efrId ?? '—') + ' · contactId=' + (reportingContactId ?? '—') + ' · provider=' + (provider || 'default') + ' · useAlt=' + !!useAlt);
+    logger.info('Click-to-call request · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · efrId=' + (efrId ?? '—') + ' · contactId=' + (reportingContactId ?? '—') + ' · spocJobId=' + (spocJobId ?? '—') + ' · provider=' + (provider || 'default') + ' · useAlt=' + !!useAlt);
 
     // Three-tier number-resolution waterfall:
     //   1. QA prompt mode → FE MUST supply both callFrom + callTo, BE uses them.
@@ -314,7 +351,7 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
     // ── Resolve receiver mobile + name + (optional) job context ──
     // Shared with POST /web-start via resolveReceiver() so the two paths can't
     // drift. FE never sends the customer mobile — always looked up server-side.
-    const rr = await resolveReceiver({ jobId, customerId, efrId, reportingContactId, useAlt, jobContextId });
+    const rr = await resolveReceiver({ jobId, customerId, efrId, reportingContactId, spocJobId, useAlt, jobContextId });
     if (!rr.ok) return modernError(res, rr.status, rr.message);
     const {
       receiverMobile, receiverName, receiverCustomerId,
@@ -497,16 +534,16 @@ router.get('/web-credentials', requireClickToCallAction, (req, res) => {
 // number and bridges. Reuses resolveReceiver() so it can't drift from /click-to-call.
 router.post('/web-start', requireClickToCallAction, validate(clickToCallBody), async (req, res, next) => {
   try {
-    logger.info('Web call start request · jobId=' + (req.body.jobId ?? '—') + ' · customerId=' + (req.body.customerId ?? '—') + ' · efrId=' + (req.body.efrId ?? '—') + ' · contactId=' + (req.body.reportingContactId ?? '—'));
+    logger.info('Web call start request · jobId=' + (req.body.jobId ?? '—') + ' · customerId=' + (req.body.customerId ?? '—') + ' · efrId=' + (req.body.efrId ?? '—') + ' · contactId=' + (req.body.reportingContactId ?? '—') + ' · spocJobId=' + (req.body.spocJobId ?? '—'));
     if (voice.callMode() !== 'web') logger.warn('Web call rejected · web calling not enabled');
     if (voice.callMode() !== 'web') return modernError(res, 409, 'Web calling is not enabled.');
     if (!plivo.callingEnabled()) logger.warn('Web call rejected · Plivo not enabled');
     if (!plivo.callingEnabled()) return modernError(res, 409, 'Plivo is not enabled.');
 
-    const { jobId, customerId, efrId, reportingContactId, useAlt, jobContextId } = req.body;
+    const { jobId, customerId, efrId, reportingContactId, spocJobId, useAlt, jobContextId } = req.body;
     const agent = req.user;
 
-    const rr = await resolveReceiver({ jobId, customerId, efrId, reportingContactId, useAlt, jobContextId });
+    const rr = await resolveReceiver({ jobId, customerId, efrId, reportingContactId, spocJobId, useAlt, jobContextId });
     if (!rr.ok) return modernError(res, rr.status, rr.message);
 
     const receiver = plivo.normaliseIndianPhone(rr.receiverMobile);

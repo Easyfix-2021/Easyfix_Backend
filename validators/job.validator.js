@@ -374,7 +374,11 @@ const candidatesQuery = Joi.object({
  */
 const candidatesSearchQuery = Joi.object({
   term: Joi.string().trim().min(1).max(100).required(),
-  limit: Joi.number().integer().min(1).max(50).default(50),
+  // 250 (2026-07-15): the modal paginates the result client-side, so a bigger
+  // page is a nicer list rather than a longer scroll. Still CAPPED — an
+  // unbounded LIKE over ~4.7k technicians would serialise the whole table into
+  // one payload on a 1-char term.
+  limit: Joi.number().integer().min(1).max(250).default(250),
   jobDate: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$/).max(40).optional(),
   timeSlot: Joi.string().max(200).optional(),
 });

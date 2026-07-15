@@ -1376,11 +1376,23 @@ async function ensureAssignedFirst(candidatesList, assignedEfrId, job, scoredAll
 }
 
 /*
- * paid_by storage convention (verified against legacy CRM JSP templates):
- *   1 → 'NE'        (legacy "Client" / "By client" — non-Easyfix party pays)
+ * paid_by storage convention (verified against legacy CRM Velocity templates):
+ *   1 → 'Client'    (the client pays — legacy "Client" / "By client")
  *   2 → 'Customer'  (end customer pays the technician on-site)
  *   3 → 'Easyfix'   (Easyfix bills the client, no on-site collection)
- *   anything else → 'NA'
+ *   anything else → 'Not Set'
+ *
+ * Wording checked against legacy pages/jobs/jobDetails.vm, which renders the
+ * JOB's paid_by as: 1 → "Client", 2 → "Customer", else → "NA".
+ *   - 1 was previously labelled 'NE' ("non-Easyfix party") — accurate but
+ *     jargon ops never see anywhere else. Legacy calls it Client; so do we.
+ *   - 'NA' → 'Not Set' is a WORDING change only, same trigger. It matters
+ *     because paid_by is 0 on ~434k of ~481k jobs and NULL on ~29k — i.e. ~96%
+ *     of jobs render this label, and "Not Set" says what's true (nobody
+ *     populates the column) where "NA" reads like a system error. There is no
+ *     "Cash" value in this enum on any tier — legacy included.
+ * Labels only: paidByIsCustomer() keys on 2, so the COD/balance gate is
+ * untouched by the 1 and fallback rewordings.
  *
  * paidByLabel() converts whichever shape arrives (int from the DB, string
  * from older code paths, null) into the canonical human label. paidByIsCustomer()
@@ -1414,16 +1426,16 @@ function mapJobServices(job) {
 function paidByLabel(raw) {
   const n = Number(raw);
   if (Number.isFinite(n)) {
-    if (n === 1) return 'NE';
+    if (n === 1) return 'Client';
     if (n === 2) return 'Customer';
     if (n === 3) return 'Easyfix';
-    return 'NA';
+    return 'Not Set';
   }
   const s = String(raw ?? '').trim().toLowerCase();
   if (s === 'customer') return 'Customer';
-  if (s === 'ne')       return 'NE';
+  if (s === 'ne' || s === 'client') return 'Client';
   if (s === 'easyfix')  return 'Easyfix';
-  return 'NA';
+  return 'Not Set';
 }
 function paidByIsCustomer(raw) {
   return paidByLabel(raw) === 'Customer';
@@ -1486,7 +1498,7 @@ function pickAutoAssignCandidate(rankResult, { paidBy, balanceFloor = DEFAULTS.A
  * buildCandidateRow), so every computed column (distance, attendance,
  * concurrent, skill state, …) is consistent across both surfaces.
  *
- * Cap (default 50) + logger.warn when the raw match count hits the cap, so
+ * Cap (default 250) + logger.warn when the raw match count hits the cap, so
  * a too-broad term is observable in logs (the operator should refine).
  */
 async function searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit = 50, preloadedJob = null } = {}) {
@@ -1498,7 +1510,7 @@ async function searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit =
     logger.warn('Search technicians failed · job not found · jobId=' + jobId);
     const err = new Error('job not found'); err.status = 404; throw err;
   }
-  const cap = Math.min(Math.max(Number(limit) || 50, 1), 50);
+  const cap = Math.min(Math.max(Number(limit) || 250, 1), 250);
 
   // Proposed-schedule overrides (same contract as rankCandidatesForJob).
   if (jobDate) job.requested_date_time = jobDate;
