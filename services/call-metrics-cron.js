@@ -13,25 +13,10 @@
 
 const { pool } = require('../db');
 const logger = require('../logger');
-const plivo = require('./plivo.service');
 const transcribe = require('./transcribe-call-analytics.service');
-const s3 = require('../utils/s3-storage');
-
-// Ensure the call's recording is in S3; return its key or null.
-async function ensureRecordingInS3({ jci, recording, callUuid }) {
-  if (recording && String(recording).startsWith('CallRecordings/') && (await s3.exists(recording))) {
-    return recording;
-  }
-  if (!callUuid || !s3.isEnabled()) return null;
-  const meta = await plivo.fetchRecordingMeta({ callUuid });
-  if (!meta.ok || !meta.url) return null;
-  const dl = await plivo.downloadRecording(meta.url);
-  if (!dl.ok || !dl.buffer) return null;
-  const key = s3.buildCallRecordingKey(jci);
-  await s3.putAtKey({ key, buffer: dl.buffer, contentType: dl.contentType || 'audio/mpeg' });
-  await pool.query('UPDATE tbl_job_caller_info SET recording = ? WHERE job_caller_info = ?', [key, jci]);
-  return key;
-}
+// Recording→S3 resolution was promoted here into a shared service when the
+// Gemini recording-mode analysis became a second audio consumer.
+const { ensureRecordingInS3 } = require('./call-recording.service');
 
 async function runCallMetrics({ startLimit = 10, pollLimit = 25 } = {}) {
   if (!transcribe.enabled()) {

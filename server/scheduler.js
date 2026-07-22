@@ -154,15 +154,28 @@ Why this matters: without this task, the Call History pages in the CRM would alw
       return result;
     },
   });
-  if (!cronDisabled) {
+  // Per-cron kill-switch (2026-07-14) — lets ops silence THIS cron individually
+  // without killing every cron via the master CRON_DISABLED. This is an
+  // ALWAYS-ON infra cron, so the flag DEFAULTS ON: absent (or anything but
+  // 'false') → registers; set the property to 'false' to disable. (Contrast the
+  // opt-in gated crons above, which default OFF via `=== 'true'`.) Read once at
+  // boot → restart after flipping. Seeded 'true' for visibility via migration
+  // 2026-07-14-seed-per-cron-enable-flags.sql, but works with the row absent.
+  const kaleyraSyncEnabled =
+    String(getProperty('kaleyra.report_sync.enabled') ?? '').toLowerCase() !== 'false';
+  if (cronDisabled) {
+    kaleyraJob.skipReason = 'CRON_DISABLED=true';
+  } else if (!kaleyraSyncEnabled) {
+    kaleyraJob.skipReason = "property 'kaleyra.report_sync.enabled' is 'false' — set it to 'true' (or remove it) and restart to enable";
+    logger.info("Kaleyra report-sync cron SKIPPED — kaleyra.report_sync.enabled=false in easyfix_properties (set 'true' + restart to enable).");
+  } else {
     kaleyraJob.task = cron.schedule(
       kaleyraJob.cron,
       () => invokeJob(kaleyraJob, 'cron'),
       { timezone: TZ },
     );
     kaleyraJob.registered = true;
-  } else {
-    kaleyraJob.skipReason = 'CRON_DISABLED=true';
+    logger.info('Kaleyra report-sync cron registered (kaleyra.report_sync.enabled=true, every 4h IST).');
   }
 
   // ─── Customer Magic-Link cron — hourly at :05 IST ─────────────────
@@ -435,15 +448,22 @@ Why this matters: before this task existed, the notice feeds would already DISPL
       return result;
     },
   });
-  if (!cronDisabled) {
+  // Always-on infra cron → default-ON kill-switch (set 'false' to disable). See kaleyra note above.
+  const noticePublishEnabled =
+    String(getProperty('notice.publish.enabled') ?? '').toLowerCase() !== 'false';
+  if (cronDisabled) {
+    noticePublishJob.skipReason = 'CRON_DISABLED=true';
+  } else if (!noticePublishEnabled) {
+    noticePublishJob.skipReason = "property 'notice.publish.enabled' is 'false' — set it to 'true' (or remove it) and restart to enable";
+    logger.info("Notice-publish cron SKIPPED — notice.publish.enabled=false in easyfix_properties (set 'true' + restart to enable).");
+  } else {
     noticePublishJob.task = cron.schedule(
       noticePublishJob.cron,
       () => invokeJob(noticePublishJob, 'cron'),
       { timezone: TZ },
     );
     noticePublishJob.registered = true;
-  } else {
-    noticePublishJob.skipReason = 'CRON_DISABLED=true';
+    logger.info('Notice-publish cron registered (notice.publish.enabled=true, every minute IST).');
   }
 
   // ─── Job-offer auto-expiry — every 2 minutes ────────────────────────
@@ -476,15 +496,22 @@ Why this matters: without this, a job offered to technicians who never respond w
       return result;
     },
   });
-  if (!cronDisabled) {
+  // Always-on infra cron → default-ON kill-switch (set 'false' to disable). See kaleyra note above.
+  const offerExpiryEnabled =
+    String(getProperty('job.offer_expiry.enabled') ?? '').toLowerCase() !== 'false';
+  if (cronDisabled) {
+    offerExpiryJob.skipReason = 'CRON_DISABLED=true';
+  } else if (!offerExpiryEnabled) {
+    offerExpiryJob.skipReason = "property 'job.offer_expiry.enabled' is 'false' — set it to 'true' (or remove it) and restart to enable";
+    logger.info("Job-offer expiry cron SKIPPED — job.offer_expiry.enabled=false in easyfix_properties (set 'true' + restart to enable).");
+  } else {
     offerExpiryJob.task = cron.schedule(
       offerExpiryJob.cron,
       () => invokeJob(offerExpiryJob, 'cron'),
       { timezone: TZ },
     );
     offerExpiryJob.registered = true;
-  } else {
-    offerExpiryJob.skipReason = 'CRON_DISABLED=true';
+    logger.info('Job-offer expiry cron registered (job.offer_expiry.enabled=true, every 2 min IST).');
   }
 
   // ─── Call-recording backfill — every 15 min ──────────────────────────
@@ -514,15 +541,22 @@ Why this matters: without this, recorded calls would show no recording in the CR
       return result;
     },
   });
-  if (!cronDisabled) {
+  // Always-on infra cron → default-ON kill-switch (set 'false' to disable). See kaleyra note above.
+  const recordingBackfillEnabled =
+    String(getProperty('recording.backfill.enabled') ?? '').toLowerCase() !== 'false';
+  if (cronDisabled) {
+    recordingBackfillJob.skipReason = 'CRON_DISABLED=true';
+  } else if (!recordingBackfillEnabled) {
+    recordingBackfillJob.skipReason = "property 'recording.backfill.enabled' is 'false' — set it to 'true' (or remove it) and restart to enable";
+    logger.info("Recording-backfill cron SKIPPED — recording.backfill.enabled=false in easyfix_properties (set 'true' + restart to enable).");
+  } else {
     recordingBackfillJob.task = cron.schedule(
       recordingBackfillJob.cron,
       () => invokeJob(recordingBackfillJob, 'cron'),
       { timezone: TZ },
     );
     recordingBackfillJob.registered = true;
-  } else {
-    recordingBackfillJob.skipReason = 'CRON_DISABLED=true';
+    logger.info('Recording-backfill cron registered (recording.backfill.enabled=true, every 15 min IST).');
   }
 
   // ─── Attendance reminder — daily at 9:00 IST ─────────────────────────

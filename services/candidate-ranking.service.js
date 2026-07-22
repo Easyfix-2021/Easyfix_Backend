@@ -232,14 +232,22 @@ function computeTierAndRefPin({ jobPin, jobZoneIds, currentPincode, servPins, se
 }
 
 /*
- * Deep-skill 3-state. job-level skill requirement decides applicability.
- *   - job has NO skill requirement      → 'both_available' (not-applicable).
+ * Deep-skill 4-state. The job-level skill requirement decides applicability.
+ *   - job has NO skill requirement      → 'not_applicable'.
  *   - tech has ZERO active mappings      → 'easyfixer_skills_not_available'.
  *   - tech has mappings but none match   → 'job_skill_not_available'.
  *   - tech matches the job skill         → 'both_available'.
+ *
+ * 'not_applicable' used to collapse into 'both_available', so ONE green label
+ * meant both "this technician matches the job's skill" and "the job names no
+ * skill, so there was nothing to match". Those are very different facts for an
+ * operator choosing who to assign, and the second was reading as a positive
+ * signal it never earned. Note this is applicability only — the match itself is
+ * Category + Type (see l1Eligibility); the deep skill id is never compared,
+ * because a job carries no deep-skill requirement yet.
  */
 function deepSkillStatus({ jobHasSkillReq, hasAnySkill, matchesJobSkill }) {
-  if (!jobHasSkillReq) return 'both_available';
+  if (!jobHasSkillReq) return 'not_applicable';
   if (!hasAnySkill) return 'easyfixer_skills_not_available';
   if (!matchesJobSkill) return 'job_skill_not_available';
   return 'both_available';
@@ -594,16 +602,32 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
     // dates with no row also return [] → red cross, per the locked decision.
     // Fail-soft: a schema/table mismatch yields [] (everyone red) rather than
     // erroring the whole list.
+    // ⚠ INVERTED 2026-07-15 — this now selects the ABSENT set, not the present
+    // set. Per ops: "if attendance is not marked as absent, consider it present;
+    // ONLY explicitly absent counts as absent." Previously presence had to be
+    // AFFIRMED (a row existed AND a slot was ticked AND no leave), so the far
+    // larger population of techs who simply never marked anything was treated as
+    // absent — the default was backwards. `is_leave_marked = 1` is the only
+    // explicit absence signal the table carries (columns: morning_slot,
+    // evening_slot, is_leave_marked — see scripts/schema-verify.js), so it alone
+    // defines absence now. A row with neither slot ticked and no leave flag is
+    // NOT explicit absence → present.
+    //
+    // Consequences of the flip, both intentional:
+    //   - reqDate null (no schedule): empty ABSENT set → everyone present. Was:
+    //     everyone absent.
+    //   - Query failure: fails OPEN (empty absent set → everyone present) rather
+    //     than closed. That follows directly from the rule — we cannot claim
+    //     someone is "explicitly absent" on the strength of a failed query.
     reqDate
       ? pool.query(
           `SELECT DISTINCT easyfixer_id AS efr_id
              FROM tbl_easyfixer_attendance
             WHERE easyfixer_id IN (${placeholders})
               AND DATE(created_on) = ?
-              AND (morning_slot = 1 OR evening_slot = 1)
-              AND (is_leave_marked IS NULL OR is_leave_marked = 0)`,
+              AND is_leave_marked = 1`,
           [...efrIds, reqDate]
-        ).catch((e) => { logger.warn({ err: e.message }, 'candidate-ranking: attendance-for-job-date query failed; treating all as absent'); return [[]]; })
+        ).catch((e) => { logger.warn({ err: e.message }, 'candidate-ranking: attendance-absent query failed; treating all as present (only explicit absence excludes)'); return [[]]; })
       : Promise.resolve([[]]),
 
     // Deep-skill match per tech (built above so the SQL stays readable).
@@ -676,7 +700,9 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
   for (const r of (workedClientRowsResult[0] || [])) workedClientMap.set(r.efr_id, true);
   const workedVerticalMap = new Map();
   for (const r of (workedVerticalRowsResult[0] || [])) workedVerticalMap.set(r.efr_id, true);
-  const attendanceMap = new Map((attRowsResult[0] || []).map((r) => [r.efr_id, true]));
+  // Membership = EXPLICITLY ABSENT (is_leave_marked = 1). Non-membership —
+  // including "never marked attendance at all" — means present. See the query.
+  const absentMap = new Map((attRowsResult[0] || []).map((r) => [r.efr_id, true]));
   const deepSkillMap  = new Map((deepSkillResult[0] || []).map((r) => [r.efr_id, true]));
   const anySkillMap   = new Map((anySkillResult[0] || []).map((r) => [r.efr_id, true]));
 
@@ -822,7 +848,10 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
       sda_history:        !!sdaRow,
       worked_for_client:  workedClientMap.get(id) === true,
       worked_for_vertical:workedVerticalMap.get(id) === true,
-      attendance_marked:  attendanceMap.get(id) === true,
+      // Drives the modal's "Attendance Today" tick/cross. Same rule as
+      // attendance_for_job_date: a cross now means EXPLICITLY marked absent
+      // (is_leave_marked=1), not merely "hasn't marked attendance".
+      attendance_marked:  !absentMap.has(id),
       has_deep_skill:     matchesJobSkill,
       tat_target_hours:   tatTargetHours,
       max_concurrent:     maxConcurrent,
@@ -836,7 +865,8 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
       zone_name:              techZone.zone_name ?? null,
       distance_km:            distanceKm == null ? null : Number(distanceKm.toFixed(1)),
       distance_tier:          tr.tier,
-      attendance_for_job_date: attendanceMap.get(id) === true,
+      // Present UNLESS explicitly marked absent — `absentMap` is the leave set.
+      attendance_for_job_date: !absentMap.has(id),
       deep_skill_status:      skillStatus,
       deep_skill_match:       matchesJobSkill,
       worked_in_category:     workedVerticalMap.get(id) === true,
@@ -941,7 +971,11 @@ function buildCandidateRow(tech, s, job) {
     distance_km:            s.distance_km ?? null,
     distance_tier:          s.distance_tier ?? 'unknown',
     attendance_for_job_date: s.attendance_for_job_date === true,
-    deep_skill_status:      s.deep_skill_status ?? 'both_available',
+    // Defensive default only — deepSkillStatus() always sets this. It falls back
+    // to 'not_applicable' rather than 'both_available' so a missing value can
+    // never render as a green "this technician matches", which is the exact
+    // overstatement the 4th state exists to remove.
+    deep_skill_status:      s.deep_skill_status ?? 'not_applicable',
     deep_skill_match:       s.deep_skill_match === true,
     worked_in_category:     s.worked_in_category === true,
     payment_mode:           paidByLabel(job.paid_by),
@@ -965,7 +999,7 @@ function buildCandidateRow(tech, s, job) {
  *
  * Hard filters:
  *   - same-day + same-slot booking conflict    (ALWAYS)
- *   - attendance present for the job date       (when enforceAttendance)
+ *   - not explicitly absent for the job date    (when enforceAttendance)
  *   - at/over Max Concurrent Jobs               (when enforceMaxConcurrent)
  *   - COD job + balance <= floor                (when enforceCodBalance)
  */
@@ -980,8 +1014,12 @@ function filterAndScore(eligible, stats, job, opts) {
     if (s.same_slot_conflict) {
       rejected.push({ efr_id: e.efr_id, efr_name: e.efr_name, reason: 'already booked same day + same slot' }); continue;
     }
-    // Attendance HARD FILTER: only technicians marked present for the job date
-    // pass. The `enforceAttendance` flag here is already WINDOW-GATED by the
+    // Attendance HARD FILTER: excludes only technicians EXPLICITLY marked
+    // absent (is_leave_marked=1) for the job date — as of 2026-07-15 an
+    // unmarked technician counts as PRESENT and passes (see the absent-set
+    // query above; this used to require affirmative presence and rejected
+    // everyone who simply never marked). The `enforceAttendance` flag here is
+    // already WINDOW-GATED by the
     // caller (rankCandidatesForJob) to jobs scheduled TODAY/TOMORROW — the only
     // dates a technician can mark attendance for — so later/past/unscheduled
     // jobs never hit this gate. DIVERGES from legacy (legacy used attendance
@@ -1043,7 +1081,7 @@ function filterAndScore(eligible, stats, job, opts) {
  *                          applies the floor POST-rank via
  *                          pickAutoAssignCandidate, not as a ranked-list
  *                          exclude). The Schedule & Assign modal passes TRUE.
- *   enforceAttendance    — hard-exclude techs NOT marked present for the job
+ *   enforceAttendance    — hard-exclude techs EXPLICITLY marked absent for the job
  *                          date. DEFAULT true, but INTERNALLY WINDOW-GATED: it
  *                          only applies when the job is scheduled TODAY or
  *                          TOMORROW (the dates a technician can mark attendance
@@ -1115,6 +1153,10 @@ async function rankCandidatesForJob(jobId, {
     serviceCatgName = labels?.catg_name ?? null;
   }
 
+  // Required deep skill(s) per service, in ONE batched query for the whole job
+  // (never per-service). Empty Map when the job carries no services.
+  const jobSkillsByService = await loadJobSkillMatrix(job);
+
   // Pre-build the enriched job payload used in ALL return paths (early-exit
   // on zero-eligible and the normal ranked return).
   const enrichedJob = {
@@ -1134,7 +1176,7 @@ async function rankCandidatesForJob(jobId, {
     service_category:  serviceCatgName ?? job.service_category ?? null,
     service_type:      serviceTypeName      ?? null,
     deep_skill_label:  deepSkillLabel       ?? null,
-    services:          mapJobServices(job),
+    services:          mapJobServices(job, jobSkillsByService),
     job_type:          job.job_type         ?? null,
     payment_mode:      paidByLabel(job.paid_by),
     requested_date_time: job.requested_date_time ?? null,
@@ -1147,6 +1189,18 @@ async function rankCandidatesForJob(jobId, {
     paid_by:           job.paid_by          ?? null,
     paid_by_label:     paidByLabel(job.paid_by),
     assigned_efr_id:   assignedEfrId,
+    // Schedule & Assign Job Details fields. This object is an ALLOWLIST over the
+    // getById payload — anything not copied here reaches the modal as undefined
+    // and renders blank, which is exactly what happened to Booked By / Booked On
+    // / Client SPOC. Add the field HERE too when the modal grows a column.
+    client_spoc:       job.client_spoc      ?? null,
+    client_spoc_name:  job.client_spoc_name ?? null,
+    created_by_name:   job.created_by_name  ?? null,
+    created_date_time: job.created_date_time ?? null,
+    // Who collects payment — per JOB. Shown against Paid service lines.
+    collected_by:      job.collected_by     ?? null,
+    // Technician-facing note, surfaced as "Additional Comments".
+    efr_special_notes: job.efr_special_notes ?? null,
   };
 
   // COD = customer pays the tech on-site (paid_by = Customer). Such techs
@@ -1338,11 +1392,23 @@ async function ensureAssignedFirst(candidatesList, assignedEfrId, job, scoredAll
 }
 
 /*
- * paid_by storage convention (verified against legacy CRM JSP templates):
- *   1 → 'NE'        (legacy "Client" / "By client" — non-Easyfix party pays)
+ * paid_by storage convention (verified against legacy CRM Velocity templates):
+ *   1 → 'Client'    (the client pays — legacy "Client" / "By client")
  *   2 → 'Customer'  (end customer pays the technician on-site)
  *   3 → 'Easyfix'   (Easyfix bills the client, no on-site collection)
- *   anything else → 'NA'
+ *   anything else → 'Not Set'
+ *
+ * Wording checked against legacy pages/jobs/jobDetails.vm, which renders the
+ * JOB's paid_by as: 1 → "Client", 2 → "Customer", else → "NA".
+ *   - 1 was previously labelled 'NE' ("non-Easyfix party") — accurate but
+ *     jargon ops never see anywhere else. Legacy calls it Client; so do we.
+ *   - 'NA' → 'Not Set' is a WORDING change only, same trigger. It matters
+ *     because paid_by is 0 on ~434k of ~481k jobs and NULL on ~29k — i.e. ~96%
+ *     of jobs render this label, and "Not Set" says what's true (nobody
+ *     populates the column) where "NA" reads like a system error. There is no
+ *     "Cash" value in this enum on any tier — legacy included.
+ * Labels only: paidByIsCustomer() keys on 2, so the COD/balance gate is
+ * untouched by the 1 and fallback rewordings.
  *
  * paidByLabel() converts whichever shape arrives (int from the DB, string
  * from older code paths, null) into the canonical human label. paidByIsCustomer()
@@ -1350,37 +1416,162 @@ async function ensureAssignedFirst(candidatesList, assignedEfrId, job, scoredAll
  * applied in pickAutoAssignCandidate — accepts both 2 and 'Customer'/'customer'.
  */
 /*
+ * Job Skill Matrix availability probe (2026-07-22).
+ *
+ * services/service-skill-matrix.service.js owns tbl_service_skill_mapping and
+ * writes it keyed on (service_catg_id, service_name) — that is the shape in the
+ * committed DDL (migrations/executed/2026-07-02-create-tbl-service-skill-mapping.sql).
+ * Some deploys still carry the PRE-recut table keyed on `service_type_id`, whose
+ * ids come from a DIFFERENT namespace: joining a category id to it would produce
+ * silently WRONG skills, and the current builder cannot write into it anyway
+ * (its INSERT names service_catg_id), so such a table is by definition stale.
+ * We therefore treat "no service_catg_id column" as "matrix unavailable" and
+ * degrade to no skills rather than guessing — the modal must never 500 because
+ * an environment is un-migrated. Memoised once per process; mirrors the
+ * jobServicesCreatedByColumn() probe idiom in job.service.js.
+ */
+let _skillMatrixReadable = undefined; // undefined = unprobed
+async function skillMatrixReadable() {
+  if (_skillMatrixReadable !== undefined) return _skillMatrixReadable;
+  try {
+    const [rows] = await pool.query(
+      "SHOW COLUMNS FROM tbl_service_skill_mapping WHERE Field = 'service_catg_id'",
+    );
+    _skillMatrixReadable = rows.length > 0;
+  } catch {
+    _skillMatrixReadable = false;
+  }
+  if (!_skillMatrixReadable) {
+    logger.warn('Job Skill Matrix unavailable (tbl_service_skill_mapping missing or not category-keyed) · Job Skill columns will render empty');
+  }
+  return _skillMatrixReadable;
+}
+
+/*
+ * Required deep skill(s) per job service, resolved through the Job Skill Matrix.
+ *
+ * ONE batched query for the WHOLE job — never per-service (this modal is on a
+ * latency budget). Returns Map<job_service_id, [{deep_skill_id, deepskill_name,
+ * confidence}]>, ordered highest-confidence first so callers can take [0] as the
+ * top score. A service maps to 0..N deep skills (the builder writes one row per
+ * (service, skill) pair), so every match is kept — nothing is collapsed away.
+ *
+ * JOIN KEY (verified 2026-07-22 against live data — see report): both sides read
+ * the SAME column by the SAME path, tbl_client_rate_card.crc_ratecard_name
+ * reached via tbl_client_service.rate_card_id. Two details make the equality
+ * actually land:
+ *   - TRIM() is mandatory. The builder stores TRIM(cr.crc_ratecard_name); the
+ *     job's service_name in job.service.js getById is the RAW column, and 152 of
+ *     6,097 live rate-card names carry surrounding whitespace.
+ *   - The category must be cs.service_catg_id (the builder's own source), NOT
+ *     js.service_category_id — the job-service column is caller-supplied and
+ *     disagreed on 79 of 9,949 recent rows (77 of them NULL).
+ * The builder's 255-char truncation is a no-op here: crc_ratecard_name is itself
+ * VARCHAR(255) (longest live value: 153). Collation differs across the join
+ * (latin1_swedish_ci vs utf8mb4_0900_ai_ci) but MySQL coerces cleanly and both
+ * are accent/case-insensitive, so casing differences still match.
+ *
+ * Read-only. No status filter on tbl_job_services here — mapJobServices() stays
+ * the single owner of the "active row" rule.
+ */
+async function loadJobSkillMatrix(job) {
+  const jobId = job?.job_id;
+  const hasServices = Array.isArray(job?.services) && job.services.length > 0;
+  if (!jobId || !hasServices) return new Map();
+  if (!(await skillMatrixReadable())) return new Map();
+
+  let rows = [];
+  try {
+    [rows] = await pool.query(
+      `SELECT js.job_service_id, ssm.deep_skill_id, ds.deepskill_name, ssm.confidence
+         FROM tbl_job_services js
+         JOIN tbl_client_service   cs  ON cs.client_service_id = js.service_id
+         JOIN tbl_client_rate_card cr  ON cr.crc_id = cs.rate_card_id
+         JOIN tbl_service_skill_mapping ssm
+              ON ssm.service_catg_id = cs.service_catg_id
+             AND ssm.service_name    = TRIM(cr.crc_ratecard_name)
+             AND ssm.status          = 1
+         LEFT JOIN tbl_deep_skill ds ON ds.deepskill_id = ssm.deep_skill_id
+        WHERE js.job_id = ?
+        ORDER BY js.job_service_id, ssm.confidence DESC, ds.deepskill_name`,
+      [jobId],
+    );
+  } catch (e) {
+    // Never let a matrix lookup take the Schedule & Assign modal down.
+    logger.warn('Job Skill Matrix lookup failed · jobId=' + jobId + ' · ' + e.message);
+    return new Map();
+  }
+
+  const byJobService = new Map();
+  for (const r of rows) {
+    if (!byJobService.has(r.job_service_id)) byJobService.set(r.job_service_id, []);
+    byJobService.get(r.job_service_id).push({
+      deep_skill_id:  r.deep_skill_id,
+      deepskill_name: r.deepskill_name ?? null,
+      // confidence is DECIMAL(3,2) → mysql2 hands back a STRING ('0.90'/'0.00').
+      // Passed through verbatim so the modal prints the exact same text the
+      // Skill Matrix page shows for that row, and so a real 0 is never
+      // indistinguishable from "no value".
+      confidence:     r.confidence ?? null,
+    });
+  }
+  return byJobService;
+}
+
+/*
  * Compact per-service breakdown (service name / category / type / qty / charge)
  * for the Schedule & Assign modal header. Source rows come from job.services
  * (populated only on the full-getById path — i.e. the route's req.scopedJob
  * preloadedJob); the getByIdCore / auto-assign path carries no services → [].
  * Active rows only (job_service_status !== 0 hides soft-deleted lines).
+ *
+ * `skillsByJobService` is the loadJobSkillMatrix() Map (pass an empty Map when
+ * the caller has none) — the Job Skill / Job Matrix Score columns.
  */
-function mapJobServices(job) {
+function mapJobServices(job, skillsByJobService = new Map()) {
   return (Array.isArray(job.services) ? job.services : [])
     .filter((s) => s.job_service_status !== 0)
-    .map((s) => ({
-      service_name: s.service_name      ?? null,
-      service_catg: s.service_catg_name ?? null,
-      service_type: s.service_type_name ?? null,
-      quantity:     s.quantity          ?? null,
-      total_charge: s.total_charge      ?? null,
-    }));
+    .map((s) => {
+      const skills = skillsByJobService.get(s.job_service_id) ?? [];
+      return {
+        service_name: s.service_name      ?? null,
+        service_catg: s.service_catg_name ?? null,
+        service_type: s.service_type_name ?? null,
+        quantity:     s.quantity          ?? null,
+        total_charge: s.total_charge      ?? null,
+        // Free/Paid per service, derived by job.service.js getById from
+        // effective_charge. This mapper is an ALLOWLIST — a field absent here is
+        // dropped no matter what getById projects, which is why the modal's
+        // Billing chip rendered "—".
+        billing_label: s.billing_label    ?? null,
+        /*
+         * Job Skill Matrix (display-only for now — candidate matching still runs
+         * on category/deep-skill, not on this). ALL mapped skills are projected;
+         * an empty array means the matrix has NO mapping for this service, which
+         * is what makes the modal's "—" mean exactly that.
+         */
+        job_skills: skills,
+        // Highest confidence among the mapped skills — rows arrive sorted
+        // confidence DESC, so [0] is the top one. null only when the matrix has
+        // no mapping, or recorded no confidence for any of them.
+        job_skill_score: skills[0]?.confidence ?? null,
+      };
+    });
 }
 
 function paidByLabel(raw) {
   const n = Number(raw);
   if (Number.isFinite(n)) {
-    if (n === 1) return 'NE';
+    if (n === 1) return 'Client';
     if (n === 2) return 'Customer';
     if (n === 3) return 'Easyfix';
-    return 'NA';
+    return 'Not Set';
   }
   const s = String(raw ?? '').trim().toLowerCase();
   if (s === 'customer') return 'Customer';
-  if (s === 'ne')       return 'NE';
+  if (s === 'ne' || s === 'client') return 'Client';
   if (s === 'easyfix')  return 'Easyfix';
-  return 'NA';
+  return 'Not Set';
 }
 function paidByIsCustomer(raw) {
   return paidByLabel(raw) === 'Customer';
@@ -1435,13 +1626,15 @@ function pickAutoAssignCandidate(rankResult, { paidBy, balanceFloor = DEFAULTS.A
  * searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit })
  *
  * Powers GET /api/admin/jobs/:id/candidates/search. Matches ANY technician
- * by efr_id / efr_name / efr_no(mobile) — NO top-10 hard filters, NO
- * ranking-based exclusion — so ops can assign anyone. Returns the SAME
+ * by efr_id / efr_name / efr_no(mobile) / city_name / efr_pin_no — NO top-10
+ * hard filters, NO ranking-based exclusion — so ops can assign anyone. One
+ * `term` box covers every column (ops should never have to pick a field first).
+ * Returns the SAME
  * widened row shape as the ranked list (reuses statsForCandidates +
  * buildCandidateRow), so every computed column (distance, attendance,
  * concurrent, skill state, …) is consistent across both surfaces.
  *
- * Cap (default 50) + logger.warn when the raw match count hits the cap, so
+ * Cap (default 250) + logger.warn when the raw match count hits the cap, so
  * a too-broad term is observable in logs (the operator should refine).
  */
 async function searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit = 50, preloadedJob = null } = {}) {
@@ -1453,7 +1646,7 @@ async function searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit =
     logger.warn('Search technicians failed · job not found · jobId=' + jobId);
     const err = new Error('job not found'); err.status = 404; throw err;
   }
-  const cap = Math.min(Math.max(Number(limit) || 50, 1), 50);
+  const cap = Math.min(Math.max(Number(limit) || 250, 1), 250);
 
   // Proposed-schedule overrides (same contract as rankCandidatesForJob).
   if (jobDate) job.requested_date_time = jobDate;
@@ -1465,14 +1658,28 @@ async function searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit =
     return { job: await searchJobHeader(job), candidates: [], capped: false };
   }
 
-  // Match by name / mobile (efr_no) always; by efr_id only when the term is
-  // a pure integer. capLookup = cap + 1 so we can detect "hit the cap".
+  // Match by name / mobile (efr_no) / city always; by efr_id only when the term
+  // is a pure integer. capLookup = cap + 1 so we can detect "hit the cap".
   const like = `%${q}%`;
-  const params = [like, like];
+  const params = [like, like, like];
   let idClause = '';
   if (/^[0-9]+$/.test(q)) {
     idClause = ' OR e.efr_id = ?';
     params.push(Number(q));
+  }
+  // A 6-digit numeric term is genuinely ambiguous: it can be a pincode, an
+  // efr_id (ids are sequential and already reach that width) or a fragment of a
+  // 10-digit mobile. We deliberately do NOT disambiguate — every clause is OR'd,
+  // so the pin match is purely ADDITIVE and the pre-existing id / mobile
+  // behaviour is untouched (a superset, never a replacement). Gated to exactly 6
+  // digits: that is the full Indian pincode width, a shorter term would match a
+  // whole region's worth of techs, and a 10-digit mobile can never be a pin.
+  // Bound as a STRING because efr_pin_no is a varchar — a numeric param would
+  // make MySQL coerce the column and lose the index.
+  let pinClause = '';
+  if (/^[0-9]{6}$/.test(q)) {
+    pinClause = ' OR e.efr_pin_no = ?';
+    params.push(q);
   }
   // Search is a "match-anyone" override so ops can bypass the RANKING filters
   // (deep-skill match, distance, serviceable pincode, attendance, same-slot
@@ -1490,7 +1697,7 @@ async function searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit =
        LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId
       WHERE e.efr_status = 1
         AND e.is_technician_verified = 1
-        AND (e.efr_name LIKE ? OR e.efr_no LIKE ?${idClause})
+        AND (e.efr_name LIKE ? OR e.efr_no LIKE ? OR c.city_name LIKE ?${idClause}${pinClause})
       ORDER BY e.efr_name ASC
       LIMIT ?`,
     [...params, cap + 1],
@@ -1536,6 +1743,8 @@ async function searchJobHeader(job) {
     serviceCatgName = labels?.catg_name ?? null;
   }
   const deepSkillLabel = [serviceCatgName, serviceTypeName].filter(Boolean).join(' › ') || null;
+  // Same single batched Job Skill Matrix lookup the ranked header does.
+  const jobSkillsByService = await loadJobSkillMatrix(job);
   return {
     job_id:            job.job_id,
     fk_client_id:      job.fk_client_id,
@@ -1550,7 +1759,7 @@ async function searchJobHeader(job) {
     service_category:  serviceCatgName ?? job.service_category ?? null,
     service_type:      serviceTypeName      ?? null,
     deep_skill_label:  deepSkillLabel       ?? null,
-    services:          mapJobServices(job),
+    services:          mapJobServices(job, jobSkillsByService),
     job_type:          job.job_type         ?? null,
     payment_mode:      paidByLabel(job.paid_by),
     requested_date_time: job.requested_date_time ?? null,

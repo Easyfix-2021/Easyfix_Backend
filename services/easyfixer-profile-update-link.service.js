@@ -39,6 +39,19 @@ const urlShortener    = require('./url-shortener.service');
 const verification    = require('./easyfixer-verification.service');
 const deepSkillService = require('./deep-skill.service');
 const s3Storage        = require('../utils/s3-storage');
+
+/*
+ * The Gallabox template for the profile-completion nudge. ONE owner — the two
+ * reminder crons import this rather than re-declaring the string, so a template
+ * rename can never leave a caller pointing at a retired template.
+ *
+ * ⚠ The template lives in Gallabox (Meta-approved); this is only the reference to
+ * it. Renaming here does NOTHING until the template exists there under this name
+ * and is approved — and its body variables MUST be {{name}}, {{id}},
+ * {{profile_link}} to match `bodyValues` below. A key that doesn't match a
+ * template variable EXACTLY (casing included) silently arrives empty.
+ */
+const PROFILE_TEMPLATE_NAME = 'skill_otp_tx1';
 const logger          = require('../logger');
 const { getProperty } = require('./properties.service');
 
@@ -919,14 +932,18 @@ async function sendForEasyfixer(efrId, { action = 'first', override_mobile, bypa
     response = await whatsappService.sendTemplate({
       to: destinationMobile,
       recipientName: fullName,
-      templateName: 'tx_complete_profile',
+      templateName: PROFILE_TEMPLATE_NAME,
       bypassTestRedirect,
-      // Gallabox `tx_complete_profile` uses NAMED body variables
-      // ({{Name}}, {{efr_id}}, {{profile_link}}) — positional keys (1/2/3)
-      // don't bind and arrive empty. Keys must match the template var names.
+      // Gallabox `skill_otp_tx1` uses NAMED body variables
+      // ({{name}}, {{id}}, {{profile_link}}) — positional keys (1/2/3) don't
+      // bind and arrive EMPTY, and so do names that don't match the template
+      // exactly. The predecessor (tx_complete_profile) used {{Name}}/{{efr_id}};
+      // both the name and the casing changed, so these keys are not
+      // interchangeable — renaming the template without renaming these would
+      // deliver a message reading "Hello  []".
       bodyValues: {
-        Name:         fullName,
-        efr_id:       String(efrId),
+        name:         fullName,
+        id:           String(efrId),
         profile_link: shortUrl,
       },
     });
@@ -1132,6 +1149,7 @@ async function acceptSubmission(efrId, payload, pool) {
 }
 
 module.exports = {
+  PROFILE_TEMPLATE_NAME,
   fetchPrefill,
   sendForEasyfixer,
   acceptSubmission,

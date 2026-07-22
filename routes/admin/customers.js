@@ -111,8 +111,8 @@ router.get('/by-mobile/lookup', async (req, res, next) => {
       return modernError(res, 404, 'customer not found');
     }
     const customer = rows[0];
-    // Real columns on tbl_address (verified against insertAddress in
-    // services/job.service.js): address, building, landmark, locality,
+    // Real columns on tbl_address (verified against insertCustomerAddress in
+    // services/address.service.js): address, building, landmark, locality,
     // city_id, pin_code, gps_location, mobile_number. Earlier I aliased
     // a non-existent `a.area` + wrong `a.pincode` — both fixed here.
     const [addresses] = await pool.query(
@@ -139,13 +139,19 @@ router.get('/by-mobile/lookup', async (req, res, next) => {
  * inline form pre-filled with the saved address, edits, saves, and
  * the row updates without creating a duplicate.
  *
- * Same column whitelist + validation shape as `insertAddress()` in
- * services/job.service.js. We deliberately don't allow swapping
+ * Same column whitelist + validation shape as `insertCustomerAddress()` in
+ * services/address.service.js. We deliberately don't allow swapping
  * customer_id (that would silently transfer an address between
  * customers — instant data-integrity bug); the URL-path customer_id
  * is the authoritative owner check.
  *
  * gps_location is stored as "lat,lng" string per legacy convention.
+ *
+ * NOT routed through address.service's write helpers, deliberately: this is the
+ * only writer whose WHERE re-checks customer_id (the ownership guard above), it
+ * stamps update_date, and it owns none of the instruction columns. A shared
+ * builder would have to grow three options used by exactly one caller each, and
+ * the flat statement below is the clearer artifact.
  */
 const addressEditBody = Joi.object({
   address:       Joi.string().min(1).max(1000).required(),

@@ -102,6 +102,17 @@ const listQuery = Joi.object({
     Joi.string().valid('now'),
     Joi.date().iso(),
   ).optional(),
+  // Server-side sort (whitelisted). sortBy must be one of the sortable list
+  // columns; sortDir asc|desc. Both optional — absent → default job_id DESC.
+  // The service also whitelists (SORT_COLUMN) so an unknown value is a safe
+  // no-op, never raw SQL.
+  sortBy: Joi.string().valid(
+    'job_id', 'job_reference_id', 'client_ref_id', 'created_date_time',
+    'client_name', 'city_name', 'job_status', 'job_type', 'requested_date_time',
+    'scheduled_date_time', 'checkin_date_time', 'checkout_date_time',
+    'customer_name', 'customer_mob_no', 'source_type', 'easyfixer_name', 'owner_name',
+  ).optional(),
+  sortDir: Joi.string().valid('asc', 'desc').optional(),
   limit: Joi.number().integer().min(1).max(500).default(50),
   offset: Joi.number().integer().min(0).default(0),
 });
@@ -357,12 +368,17 @@ const candidatesQuery = Joi.object({
 
 /*
  * Query schema for GET /:id/candidates/search (match-anyone). `term` is
- * required (matches efr_id / efr_name / efr_no). Same optional schedule
- * overrides as the ranked list.
+ * required and is the ONLY search input — it matches efr_id / efr_name /
+ * efr_no / city_name / efr_pin_no, so no per-field (city=/pin=) params exist.
+ * Same optional schedule overrides as the ranked list.
  */
 const candidatesSearchQuery = Joi.object({
   term: Joi.string().trim().min(1).max(100).required(),
-  limit: Joi.number().integer().min(1).max(50).default(50),
+  // 250 (2026-07-15): the modal paginates the result client-side, so a bigger
+  // page is a nicer list rather than a longer scroll. Still CAPPED — an
+  // unbounded LIKE over ~4.7k technicians would serialise the whole table into
+  // one payload on a 1-char term.
+  limit: Joi.number().integer().min(1).max(250).default(250),
   jobDate: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$/).max(40).optional(),
   timeSlot: Joi.string().max(200).optional(),
 });

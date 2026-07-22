@@ -327,6 +327,23 @@ async function stepNoServiceReason(convo, ctx, inbound, to, pool) {
      VALUES (?, ?, ?, ?)`,
     [convo.job_id, reason.type, reason.label, 'Logged via WhatsApp conversation'],
   );
+  // Mirror the ask into the job comment thread (tbl_job_comment) so it also
+  // shows in the CRM "Remarks / Comments" panel — the web magic-link path
+  // (routes/public/job-completion.js) already does this; without the mirror a
+  // WhatsApp-origin reschedule/cancel reason is invisible there. Best-effort:
+  // the request row above is the source of truth, so a comment hiccup must
+  // never break the customer's WhatsApp reply. comment_on=1 = lifecycle.
+  try {
+    const label = reason.type === 'cancel' ? 'Cancellation' : 'Reschedule';
+    await require('./job-comment.service').addComment(convo.job_id, {
+      comments: `${label} requested (via WhatsApp): ${reason.label}`,
+      comment_on: 1,
+      commented_by: null,
+      appointment_on: null,
+    });
+  } catch (e) {
+    logger.warn({ jobId: convo.job_id, err: e && e.message }, 'whatsapp-conversation: comment mirror failed');
+  }
   await updateConversation(convo.conversation_id, {
     status: 'closed_no_service',
     context: { ...ctx, no_service_reason: reason.label, request_type: reason.type },

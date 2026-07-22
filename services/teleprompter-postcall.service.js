@@ -16,7 +16,7 @@ const { pool } = require('../db');
 const logger = require('../logger');
 const teleprompter = require('./teleprompter.service');
 const { resolveFlow } = require('./teleprompter-flows');
-const callAnalysis = require('./call-analysis.service');
+const analysisMode = require('./call-analysis-mode.service');
 const callerScorecard = require('./caller-scorecard.service');
 
 function parseJson(s) { try { return s ? JSON.parse(s) : null; } catch { return null; } }
@@ -37,9 +37,18 @@ async function processCompleted(sessionId) {
   await teleprompter.saveResult(sessionId, { result, coverage });
 
   // 2. coaching analysis → unified per-call record (matched by call_uuid)
+  //
+  // Pinned to TRANSCRIPT mode on purpose — it does NOT follow call.analysis.mode.
+  // This path owns a richer real-time STT transcript than any downstream source
+  // (that's the whole reason it analyses here), it is keyed by call_uuid with no
+  // job_caller_info_id to resolve audio from, and it runs the moment the call
+  // ends — before Plivo has filed the recording. Recording mode would be strictly
+  // worse here. It still goes through the shared dispatcher rather than calling
+  // the LLM directly, so the branch and the `analysis_mode` provenance stamp stay
+  // in one place.
   try {
-    if (callAnalysis.llmEnabled() && transcript && s.call_uuid) {
-      const analysis = await callAnalysis.analyzeTranscript(transcript);
+    if (transcript && s.call_uuid) {
+      const { analysis } = await analysisMode.analyzeCall({ transcript, mode: analysisMode.MODE_TRANSCRIPT });
       if (analysis) {
         const [r] = await pool.query(
           `UPDATE tbl_plivo_call_log

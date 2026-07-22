@@ -16,9 +16,17 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { makeFakePool } = require('./helpers/fake-pool');
+const { makeFakePool, installFakePool } = require('./helpers/fake-pool');
 
+const db = require('../db');
 const magic = require('../services/job-magic-link.service');
+
+// IST wall-clock helper for the auto-reschedule tests: pick a UTC ms whose
+// (+5:30) IST hour is `istHour`. e.g. istHour=10 → before 3pm; 16 → after 3pm.
+function nowMsForIstHour(istHour) {
+  // istHour = getUTCHours(nowMs + 5h30m). So nowMs at UTC (istHour-5), minus 30m.
+  return Date.UTC(2026, 0, 1, istHour, 0, 0) - (5 * 60 + 30) * 60 * 1000;
+}
 
 test('acceptSubmission writes via its own UPDATE tbl_job — never setStatus / job_status', async () => {
   const fake = makeFakePool(
@@ -46,6 +54,74 @@ test('acceptSubmission includes the optional columns when they are present', asy
   assert.match(write.sql, /product_code/);
 });
 
+/*
+ * The address-section gate (2026-07-15 regression tripwire).
+ *
+ * The whole tbl_address write used to hang off `payload.address` — the ONE
+ * field the customer cannot edit (Service Address renders read-only; the map
+ * "captures GPS only"). So a pin-only submission wrote NOTHING and the pin was
+ * lost to everything but the customer_submitted_payload JSON blob. These lock
+ * the widened gate: any supplied address-section field must reach tbl_address,
+ * and a payload with none of them must still write nothing.
+ */
+const ADDR_ROUTE = [/SELECT fk_address_id, fk_customer_id, fk_client_id FROM tbl_job/,
+  [{ fk_address_id: 10, fk_customer_id: 20, fk_client_id: 30 }]];
+
+test('acceptSubmission — a PIN-ONLY submission (gps, no address) still writes tbl_address', async () => {
+  const fake = makeFakePool([ADDR_ROUTE], { stopOn: /UPDATE tbl_address/ });
+  await assert.rejects(() => magic.acceptSubmission(42, { gps_location: '28.631500,77.216700' }, fake.pool));
+  const write = fake.calls.find((c) => /UPDATE tbl_address/.test(c.sql));
+  assert.ok(write, 'a pin with no address text MUST still reach tbl_address (this was the bug)');
+  assert.match(write.sql, /gps_location\s*=\s*COALESCE/, 'gps_location is COALESCE-guarded, not blind-set');
+  assert.ok(write.params.includes('28.631500,77.216700'), 'the pin coordinates are bound as a param');
+  assert.ok(write.params.includes(10), 'scoped to the job\'s fk_address_id');
+});
+
+test('acceptSubmission — the map-search text persists to tbl_address.building', async () => {
+  const fake = makeFakePool([ADDR_ROUTE], { stopOn: /UPDATE tbl_address/ });
+  await assert.rejects(() => magic.acceptSubmission(42, {
+    building: '12 MG Road, Bengaluru', gps_location: '12.971600,77.594600',
+  }, fake.pool));
+  const write = fake.calls.find((c) => /UPDATE tbl_address/.test(c.sql));
+  assert.ok(write);
+  // `building` is the column the CRM's Confirm & Schedule "Search Location On
+  // Map" field reads back — see AddressPickerWithMap's serviceAddressReadOnly.
+  assert.ok(write.params.includes('12 MG Road, Bengaluru'), 'map-search text is bound');
+  assert.doesNotMatch(write.sql, /address\s*=\s*\?/, 'the booked address must never be blind-overwritten');
+});
+
+test('acceptSubmission — address:\'\' alongside a pin must NOT blank the booked address', async () => {
+  // Regression guard. `COALESCE('', address)` returns '' (empty string is not
+  // NULL), so passing '' through would WIPE the customer's booked address. '' has
+  // to reach the query as NULL, like every sibling field. Reachable input: Joi
+  // .allow('')s this field, and the widened gate lets a pin-only payload through
+  // on gps alone.
+  const fake = makeFakePool([ADDR_ROUTE], { stopOn: /UPDATE tbl_address/ });
+  await assert.rejects(() => magic.acceptSubmission(42, {
+    address: '', gps_location: '19.076000,72.877700',
+  }, fake.pool));
+  const write = fake.calls.find((c) => /UPDATE tbl_address/.test(c.sql));
+  assert.ok(write, 'the pin still writes (the gate passes on gps)');
+  assert.ok(!write.params.includes(''), 'an empty address must never be bound — it would blank the column');
+  assert.equal(write.params[0], null, 'address collapses to NULL so COALESCE keeps the booked value');
+});
+
+test('acceptSubmission — no address-section fields at all → no tbl_address write', async () => {
+  // No stopOn: a payload with no `services` skips the service block, so the
+  // whole call runs to completion against the fake. Letting it finish proves
+  // the ABSENCE of the address write rather than merely never reaching it.
+  const fake = makeFakePool([ADDR_ROUTE]);
+  await magic.acceptSubmission(42, { customer_name: 'Asha' }, fake.pool);
+  assert.ok(
+    fake.calls.some((c) => /UPDATE tbl_job SET/.test(c.sql)),
+    'sanity: the tbl_job write still ran, so we really did traverse the address block',
+  );
+  assert.ok(
+    !fake.calls.some((c) => /UPDATE tbl_address/.test(c.sql)),
+    'nothing address-shaped was supplied, so the gate must stay closed',
+  );
+});
+
 test('writeCustomerOrderDetails writes tbl_job directly, no status transition', async () => {
   const fake = makeFakePool(
     [[/SELECT fk_address_id FROM tbl_job/, [{ fk_address_id: 10 }]]],
@@ -56,4 +132,53 @@ test('writeCustomerOrderDetails writes tbl_job directly, no status transition', 
   assert.ok(write, 'an UPDATE tbl_job must be issued');
   assert.doesNotMatch(write.sql, /job_status/, 'must NOT transition status');
   assert.match(write.sql, /customer_submitted_at/);
+});
+
+// ─── autoRescheduleOnOpenIfLate (after-3pm link-OPEN shift) ──────────────
+// Trigger is the OPEN time (current IST hour), injected via nowMs. Before 3pm →
+// no DB round-trip. installFakePool monkeypatches the shared db.pool so the
+// internal addComment routes through the fake too — no real DB.
+
+test('autoRescheduleOnOpenIfLate — opened before 3pm IST is a no-op (no query at all)', async () => {
+  const inst = installFakePool([]);
+  try {
+    const r = await magic.autoRescheduleOnOpenIfLate(42, db.pool, { nowMs: nowMsForIstHour(10) });
+    assert.equal(r.shifted, false);
+    assert.equal(inst.calls.length, 0, 'no query fired when opened before 3pm');
+  } finally { inst.restore(); }
+});
+
+test('autoRescheduleOnOpenIfLate — opened after 3pm shifts +1 day (guarded) and audits with non-NULL easyfixer_id', async () => {
+  const inst = installFakePool([
+    [/UPDATE tbl_job\s+SET\s+original_appointment_date_time/, { affectedRows: 1 }],
+    [/SELECT requested_date_time AS newReq/, [{ newReq: '2026-01-02 09:00:00', fk_easyfixter_id: 55 }]],
+  ]);
+  try {
+    const r = await magic.autoRescheduleOnOpenIfLate(42, db.pool, { nowMs: nowMsForIstHour(16) });
+    assert.equal(r.shifted, true);
+    const upd = inst.calls.find((c) => /UPDATE tbl_job\s+SET\s+original_appointment_date_time/.test(c.sql));
+    assert.ok(upd, 'UPDATE fired');
+    assert.match(upd.sql, /INTERVAL 2 DAY/, 'shifts by two days (late-open jobs need >1 day of lead time)');
+    assert.match(upd.sql, /DATE\(requested_date_time\) = DATE\(COALESCE\(original_appointment_date_time/, 'idempotency guard COALESCEs NULL original (bulk-upload jobs)');
+    assert.match(upd.sql, /SET original_appointment_date_time = COALESCE\(original_appointment_date_time, requested_date_time\)/, 'back-fills a NULL original in the same atomic UPDATE');
+    assert.match(upd.sql, /customer_submitted_at IS NULL/);
+    assert.match(upd.sql, /job_status = 9/);
+    const hist = inst.calls.find((c) => /INSERT INTO scheduling_history/.test(c.sql));
+    assert.ok(hist, 'scheduling_history audit row written');
+    assert.equal(hist.params[1], 55, 'easyfixer_id is the non-NULL tech id (NOT NULL — avoids candidate-ranking NOT-IN poison)');
+    assert.match(String(hist.params[3]), /Auto Rescheduled/, 'carries the auto-reschedule reason (stable token, no "for Next Day" since the shift is +2)');
+  } finally { inst.restore(); }
+});
+
+test('autoRescheduleOnOpenIfLate — idempotent: 0 rows affected writes no audit row', async () => {
+  const inst = installFakePool([
+    [/UPDATE tbl_job\s+SET\s+original_appointment_date_time/, { affectedRows: 0 }],
+  ]);
+  try {
+    const r = await magic.autoRescheduleOnOpenIfLate(42, db.pool, { nowMs: nowMsForIstHour(16) });
+    assert.equal(r.shifted, false);
+    assert.ok(inst.calls.some((c) => /UPDATE tbl_job/.test(c.sql)), 'UPDATE attempted');
+    assert.ok(!inst.calls.some((c) => /INSERT INTO scheduling_history/.test(c.sql)), 'no audit row when nothing shifted');
+    assert.ok(!inst.calls.some((c) => /SELECT requested_date_time AS newReq/.test(c.sql)), 'no follow-up SELECT');
+  } finally { inst.restore(); }
 });

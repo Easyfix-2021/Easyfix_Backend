@@ -23,7 +23,7 @@ function isIntegrationRoute(req) {
  * (CloudWatch, etc.) will receive it.
  */
 const LOGGABLE_FIELDS = new Set([
-  'jobId', 'customerId', 'efrId', 'reportingContactId', 'useAlt',
+  'jobId', 'customerId', 'efrId', 'reportingContactId', 'spocJobId', 'useAlt',
   'page', 'limit', 'offset', 'status', 'statuses', 'mode', 'tab',
   'category_id', 'service_type_id', 'fk_client_id', 'fk_service_catg_id',
   'fk_service_type_id', 'deepskill_id', 'id', 'sourceType', 'type',

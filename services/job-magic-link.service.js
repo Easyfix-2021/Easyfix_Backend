@@ -35,6 +35,7 @@ const whatsappService  = require('./gallabox.whatsapp.service');
 const urlShortener     = require('./url-shortener.service');
 const { maskMobile }   = require('../utils/mask-mobile');
 const s3Storage        = require('../utils/s3-storage');
+const addressService   = require('./address.service');
 const logger           = require('../logger');
 
 /*
@@ -405,6 +406,15 @@ async function cityHasIsActive(pool) {
  *
  * If/when ops backfills the column on every environment, the probe
  * returns true everywhere and behaviour upgrades automatically.
+ *
+ * NOT the shared address.service probe, deliberately. That one asks the
+ * catalog ("is this column listed?"); this one asks the question the degraded
+ * mode actually cares about ("can I SELECT this column without the query
+ * blowing up?"), so it treats a THROW as absent where the catalog probe treats
+ * an empty result as absent. The two therefore fail in opposite directions and
+ * cannot share a memo — a catalog answer cached here would defeat the guard
+ * this exists to provide. tests/job-magic-link-degraded.test.js pins the
+ * throw-means-absent convention.
  */
 let _addrInstrProbed = false;
 let _addrHasInstruction = false;
@@ -469,6 +479,120 @@ async function jobHasColumn(pool, col) {
  * Promise.all because they're mutually independent. Saves ~3× the
  * latency vs sequential.
  */
+/*
+ * autoRescheduleOnOpenIfLate — when a customer OPENS the magic-link form late in
+ * the day, push the appointment to the next day so ops can still staff it.
+ *
+ * WHY: bulk-upload / client-portal jobs often arrive with tomorrow's 9-12 slot;
+ * if the customer opens the form late evening and confirms that same slot, ops
+ * (who have left for the day) can't assign a technician before it starts. So on
+ * OPEN (this runs on GET /:token, AFTER verify() enforced link-not-expired +
+ * job_status=9), if the current IST hour is >= 15 (3pm) we shift
+ * requested_date_time by +1 day ONCE, before the prefill is built — the customer
+ * simply sees the new date (no reschedule button, no chip).
+ *
+ * THE TRIGGER IS THE OPEN TIME: if the CURRENT IST hour is >= 15 (3pm) when the
+ * customer opens the link, shift. This matches the problem as stated — "if the
+ * customer opens the form late evening and proceeds with the same slot, ops
+ * can't staff it" — so it's the moment of opening that matters, not when the
+ * job was created.
+ *
+ * IDEMPOTENT BY CONSTRUCTION: the UPDATE only fires while
+ * DATE(requested) = DATE(original) — the shift moves them apart, so a second
+ * open finds them differing → 0 rows → exactly one shift, ever. No marker
+ * column, and crucially NO tbl_job_customer_request row — so the CRM "Reschedule
+ * Requested" chip never lights up. Audit lands in scheduling_history (+ a job
+ * comment) instead. Best-effort throughout: it must never block the form.
+ *
+ * `original` = COALESCE(original_appointment_date_time, requested_date_time):
+ * BULK-UPLOAD jobs leave original_appointment_date_time NULL, unlike the regular
+ * create which snapshots it. So we COALESCE it to requested in BOTH the guard AND
+ * the SET — the same UPDATE that shifts the date also back-fills the NULL
+ * original with the pre-shift date, keeping the DATE-based idempotency atomic.
+ * Without this, `original IS NOT NULL` silently no-op'd the shift for every
+ * bulk-upload job.
+ *
+ * @param {number} jobId
+ * @param {import('mysql2/promise').Pool} pool
+ * @param {{ nowMs?: number }} [opts]  nowMs injectable for deterministic tests.
+ * @returns {Promise<{shifted:boolean, newRequested?:string, reason?:string}>}
+ */
+async function autoRescheduleOnOpenIfLate(jobId, pool, { nowMs = Date.now() } = {}) {
+  // Trigger = the OPEN time. IST hour via the fixed +5:30 offset (no DST in IST)
+  // — never toISOString(). Before 3pm → do nothing (not even a DB round-trip).
+  const istHour = new Date(nowMs + (5 * 60 + 30) * 60 * 1000).getUTCHours();
+  if (istHour < 15) return { shifted: false };
+
+  // 12-hour label for the reason string, e.g. 15 -> "3pm", 20 -> "8pm".
+  const h12 = ((istHour + 11) % 12) + 1;
+  const ampm = istHour < 12 ? 'am' : 'pm';
+  // Reason text no longer says "for Next Day" — the shift is +2 days (below), so
+  // the wording would lie. The chip detector matches the stable 'Auto Rescheduled'
+  // token (job.service.js LIST_COLUMNS uses LIKE '%Auto Rescheduled%'), so old
+  // rows written as '…for Next Day' still match.
+  const reason = `Job Received at ${h12}${ampm}, Auto Rescheduled`;
+
+  // Guarded, idempotent-by-construction shift. +2 days (was +1) — a late-evening
+  // open that only bumped to the NEXT day still landed a first-slot appointment
+  // ops couldn't staff in time, so we push two days out. Done IN MySQL on the
+  // stored IST wall-clock string (dateStrings + '+05:30' pool) so there is no
+  // JS/UTC date math. time_slot is intentionally UNCHANGED (same hour-of-day →
+  // same slot; only the calendar date moves). Still idempotent: the guard below
+  // fires only while requested_date_time is still on its ORIGINAL date.
+  const [result] = await pool.query(
+    `UPDATE tbl_job
+        SET original_appointment_date_time = COALESCE(original_appointment_date_time, requested_date_time),
+            requested_date_time = requested_date_time + INTERVAL 2 DAY,
+            last_update_time = NOW()
+      WHERE job_id = ?
+        AND job_status = 9
+        AND customer_submitted_at IS NULL
+        AND requested_date_time IS NOT NULL
+        AND DATE(requested_date_time) = DATE(COALESCE(original_appointment_date_time, requested_date_time))`,
+    [jobId],
+  );
+  if (!result || result.affectedRows !== 1) return { shifted: false };
+
+  // Read the new value + assigned tech (for the non-NULL audit key).
+  const [rows] = await pool.query(
+    'SELECT requested_date_time AS newReq, fk_easyfixter_id FROM tbl_job WHERE job_id = ? LIMIT 1',
+    [jobId],
+  );
+  const newReq = rows && rows[0] ? rows[0].newReq : null;
+  const efrId = rows && rows[0] ? rows[0].fk_easyfixter_id : null;
+
+  // Audit — best-effort (idempotency does NOT depend on these). easyfixer_id
+  // MUST be non-NULL: a NULL there poisons the `efr_id NOT IN (SELECT ...)` in
+  // candidate-ranking / auto-assign and would exclude ALL techs once the job is
+  // later confirmed. COALESCE to 0 — the same sentinel those paths rely on.
+  try {
+    await pool.query(
+      `INSERT INTO scheduling_history (job_id, easyfixer_id, schedule_time, reason_id, reschedule_reason)
+       VALUES (?, ?, ?, NULL, ?)`,
+      [jobId, efrId != null ? efrId : 0, newReq, reason],
+    );
+  } catch (e) {
+    logger.warn('auto-reschedule scheduling_history insert failed · jobId=' + jobId + ' · ' + (e && e.message));
+  }
+  // Mirror to the comment thread so the shift + reason surface in the CRM
+  // Rescheduling History tab. comment_on=1 (lifecycle) — does NOT touch
+  // tbl_job_customer_request, so no "Reschedule Requested" chip.
+  try {
+    await require('./job-comment.service').addComment(jobId, {
+      comments: reason,
+      comment_on: 1,
+      commented_by: null,
+      appointment_on: newReq,
+      enum_reason_id: null,
+    });
+  } catch (e) {
+    logger.warn('auto-reschedule comment insert failed · jobId=' + jobId + ' · ' + (e && e.message));
+  }
+
+  logger.info('Magic-link auto-reschedule · jobId=' + jobId + ' · newRequested=' + newReq + ' · ' + reason);
+  return { shifted: true, newRequested: newReq, reason };
+}
+
 async function fetchPrefill(jobId, pool) {
   logger.info('Build magic-link prefill · jobId=' + jobId);
   // Schema-drift gate: older deploys lack tbl_address.address_instruction.
@@ -996,10 +1120,33 @@ async function sendForJob(jobId, { action, override = false } = {}, pool) {
   // success (rather than in the reservation UPDATE) means a failed send
   // never leaves sent_at / last_action claiming a dispatch that didn't
   // happen, and a failed FIRST send can't flip later attempts to 'resend'.
-  await pool.query(
-    `UPDATE tbl_job SET magic_link_sent_at = ?, magic_link_last_action = ? WHERE job_id = ?`,
-    [sentAt, effectiveAction, jobId],
-  );
+  // Also persist the provider message id + seed delivery_status='sent'. HTTP-200
+  // from Gallabox only means "queued/accepted", not "reached the customer"; the
+  // real outcome (delivered / read / failed / undelivered + reason) arrives
+  // asynchronously as a status callback that keys off magic_link_provider_msg_id
+  // (see routes/webhook/whatsapp.js). Reset the reason to NULL so a re-send
+  // clears any prior failure. Written column-tolerant: on deploys where the
+  // 2026-07-14-magic-link-delivery-status migration hasn't run yet, this UPDATE
+  // would error on the unknown columns — so fall back to the original stamp.
+  try {
+    await pool.query(
+      `UPDATE tbl_job
+          SET magic_link_sent_at = ?, magic_link_last_action = ?,
+              magic_link_provider_msg_id = ?, magic_link_delivery_status = 'sent',
+              magic_link_delivery_reason = NULL
+        WHERE job_id = ?`,
+      [sentAt, effectiveAction, response.providerMessageId || null, jobId],
+    );
+  } catch (e) {
+    if (e && e.code === 'ER_BAD_FIELD_ERROR') {
+      await pool.query(
+        `UPDATE tbl_job SET magic_link_sent_at = ?, magic_link_last_action = ? WHERE job_id = ?`,
+        [sentAt, effectiveAction, jobId],
+      );
+    } else {
+      throw e;
+    }
+  }
 
   logger.info('Magic-link sent · jobId=' + jobId + ' action=' + effectiveAction + ' sendCount=' + ((row.magic_link_send_count || 0) + 1));
 
@@ -1176,9 +1323,17 @@ async function acceptSubmission(jobId, payload, pool) {
       );
     }
 
-    // 4. Full address overwrite. Address is bound 1:1 to the job's
-    //    customer-on-create, so updating in place is correct — we are
-    //    NOT mutating a shared address that other jobs reference.
+    // 4. Full address overwrite, in place on the job's fk_address_id.
+    //
+    //    ⚠ NOT strictly 1:1 (corrected 2026-07-15): an earlier comment here
+    //    claimed the address row is private to this job's customer-on-create.
+    //    It isn't — job.service.js create() REUSES a caller-supplied
+    //    `input.address.address_id` when one is passed instead of inserting a
+    //    fresh row, so sibling jobs can share an fk_address_id and this UPDATE
+    //    reaches all of them. Every SET below is COALESCE-guarded (empty →
+    //    NULL → keep existing), which bounds the blast radius to fields the
+    //    customer actually supplied, but it does not eliminate it. Splitting
+    //    the row on write is a data-model decision, not a patch — left alone.
     //
     //    Payload shape (2026-05-28 fix): the Joi validator declares `address`
     //    as a FLAT string and `building`, `landmark`, `city_id`, `pin_code`,
@@ -1192,7 +1347,16 @@ async function acceptSubmission(jobId, payload, pool) {
     //    Empty strings (Joi allows `''` for the optional siblings) collapse
     //    to NULL so COALESCE keeps the existing column value rather than
     //    blanking out a building/landmark ops had set earlier.
-    const addressLine = payload.address ?? null;
+    // `''` MUST collapse to NULL exactly like every sibling below (and like
+    // writeCustomerOrderDetails does for the same field). It used to be
+    // `payload.address ?? null`, which passes '' straight through — and
+    // `COALESCE('', address)` returns '' (empty string is not NULL), BLANKING the
+    // customer's booked service address. That was unreachable while the gate was
+    // `if (addressId && addressLine)` ('' is falsy → whole block skipped), but
+    // widening the gate to hasAnyAddressField made a pin-only payload carrying
+    // `address: ''` pass on gps alone and wipe the address. Joi explicitly
+    // `.allow('')`s this field, so it is reachable input, not a theoretical one.
+    const addressLine = payload.address && String(payload.address).length ? payload.address : null;
     const building    = payload.building && String(payload.building).length     ? payload.building     : null;
     const landmark    = payload.landmark && String(payload.landmark).length     ? payload.landmark     : null;
     const cityId      = payload.city_id ?? null;
@@ -1200,44 +1364,44 @@ async function acceptSubmission(jobId, payload, pool) {
     const gps         = payload.gps_location && String(payload.gps_location).length ? payload.gps_location : null;
     const addrInstr   = payload.address_instruction && String(payload.address_instruction).length ? payload.address_instruction : null;
 
-    if (addressId && addressLine) {
-      // Schema-drift gate: conditionally include the address_instruction
-      // SET clause + its parameter only when the column exists on this
-      // deploy. Without the gate, deploys missing the column would 500
-      // here with `Unknown column 'address_instruction' in 'field list'`
-      // — caught 2026-05-31 mirroring the same gate in fetchPrefill.
-      // When absent, the customer's address-instruction text is silently
-      // dropped (degraded mode); the rest of the address persists.
-      const hasAddrInstr = await addressHasInstruction(pool);
-      const setClauses = [
-        'address             = COALESCE(?, address)',
-        'building            = COALESCE(?, building)',
-        'landmark            = COALESCE(?, landmark)',
-        'city_id             = COALESCE(?, city_id)',
-        'pin_code            = COALESCE(?, pin_code)',
-        'gps_location        = COALESCE(?, gps_location)',
-      ];
-      const params = [addressLine, building, landmark, cityId, pinCode, gps];
-      if (hasAddrInstr) {
-        setClauses.push('address_instruction = COALESCE(?, address_instruction)');
-        params.push(addrInstr);
-        // 2026-06-03: per ops, `is_instruction_added` must stay 0 even
-        // when the text is non-empty. See services/job.service.js
-        // insertAddress() for the full rationale. When the customer's
-        // payload included the field at all, we still touch the column
-        // (reset to 0) so any pre-existing 1 from older code paths is
-        // cleared on submission — the invariant must hold cross-tier.
-        if (addrInstr != null) {
-          setClauses.push('is_instruction_added = ?');
-          params.push(0);
-        }
-      }
-      params.push(addressId);
-
-      await conn.query(
-        `UPDATE tbl_address SET ${setClauses.join(', ')} WHERE address_id = ?`,
-        params,
+    // Run whenever the customer supplied ANY address-section field — not just
+    // `address`.
+    //
+    // Bug fix 2026-07-15: the gate was `if (addressId && addressLine)`, which
+    // hung the ENTIRE address write (gps_location, building, landmark, city,
+    // pin, instructions) off `payload.address` — the one field the customer is
+    // NOT allowed to edit. The form renders Service Address read-only and the
+    // map "captures GPS only" (see the validator docblock), so a pin-only
+    // submission had `address` empty, failed this guard, and silently wrote
+    // NOTHING: the customer's pin survived only as JSON in
+    // tbl_job.customer_submitted_payload and never reached tbl_address, so ops
+    // opening Confirm & Schedule saw no pin. Each SET is independently
+    // COALESCE-guarded, so widening the gate cannot blank a column — a field
+    // the customer didn't supply is NULL and COALESCE keeps the existing value.
+    const hasAnyAddressField =
+      addressLine || building || landmark || cityId || pinCode || gps || addrInstr;
+    if (addressId && hasAnyAddressField) {
+      // Schema-drift gate: the address_instruction SET is included only when
+      // the column exists on this deploy. Without it, deploys missing the
+      // column would 500 here with `Unknown column 'address_instruction' in
+      // 'field list'` — caught 2026-05-31 mirroring the same gate in
+      // fetchPrefill. When absent, the customer's address-instruction text is
+      // silently dropped (degraded mode); the rest of the address persists.
+      // resetInstructionFlag: this path clears a stale is_instruction_added=1
+      // when the customer supplied text — the invariant must hold cross-tier.
+      const write = addressService.buildCoalesceAddressUpdate(
+        addressId,
+        {
+          address: addressLine, building, landmark,
+          city_id: cityId, pin_code: pinCode, gps_location: gps,
+          address_instruction: addrInstr,
+        },
+        {
+          hasInstructionColumn: await addressHasInstruction(pool),
+          resetInstructionFlag: true,
+        },
       );
+      await conn.query(write.sql, write.params);
     }
 
     // 5. Service upsert — bidirectional reconciliation of the customer's
@@ -1509,31 +1673,28 @@ async function writeCustomerOrderDetails(jobId, fields, pool) {
       ],
     );
 
+    // Gate is `addressLine` alone (NOT acceptSubmission's any-field gate): the
+    // chat flow only ever reaches here having collected a full address line.
+    // It also collapses an empty `address` to NULL, which acceptSubmission
+    // deliberately does not — hence the normalisation stays here rather than in
+    // the shared builder. resetInstructionFlag is omitted: this path has never
+    // touched is_instruction_added.
     const addressLine = (fields.address && String(fields.address).length) ? fields.address : null;
     if (addressId && addressLine) {
-      const hasAddrInstr = await addressHasInstruction(pool);
-      const setClauses = [
-        'address      = COALESCE(?, address)',
-        'building     = COALESCE(?, building)',
-        'landmark     = COALESCE(?, landmark)',
-        'city_id      = COALESCE(?, city_id)',
-        'pin_code     = COALESCE(?, pin_code)',
-        'gps_location = COALESCE(?, gps_location)',
-      ];
-      const params = [
-        addressLine,
-        (fields.building && String(fields.building).length) ? fields.building : null,
-        (fields.landmark && String(fields.landmark).length) ? fields.landmark : null,
-        fields.city_id ?? null,
-        fields.pin_code ?? null,
-        (fields.gps_location && String(fields.gps_location).length) ? fields.gps_location : null,
-      ];
-      if (hasAddrInstr) {
-        setClauses.push('address_instruction = COALESCE(?, address_instruction)');
-        params.push((fields.address_instruction && String(fields.address_instruction).length) ? fields.address_instruction : null);
-      }
-      params.push(addressId);
-      await conn.query(`UPDATE tbl_address SET ${setClauses.join(', ')} WHERE address_id = ?`, params);
+      const write = addressService.buildCoalesceAddressUpdate(
+        addressId,
+        {
+          address: addressLine,
+          building: (fields.building && String(fields.building).length) ? fields.building : null,
+          landmark: (fields.landmark && String(fields.landmark).length) ? fields.landmark : null,
+          city_id: fields.city_id ?? null,
+          pin_code: fields.pin_code ?? null,
+          gps_location: (fields.gps_location && String(fields.gps_location).length) ? fields.gps_location : null,
+          address_instruction: (fields.address_instruction && String(fields.address_instruction).length) ? fields.address_instruction : null,
+        },
+        { hasInstructionColumn: await addressHasInstruction(pool) },
+      );
+      await conn.query(write.sql, write.params);
     }
 
     await conn.commit();
@@ -1551,6 +1712,7 @@ async function writeCustomerOrderDetails(jobId, fields, pool) {
 
 module.exports = {
   fetchPrefill,
+  autoRescheduleOnOpenIfLate,
   sendForJob,
   acceptSubmission,
   writeCustomerOrderDetails,

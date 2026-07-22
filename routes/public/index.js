@@ -65,5 +65,13 @@ router.use('/email-verify', require('./email-verify'));
  * /api/public/plivo/answer. See routes/public/plivo-answer.js.
  */
 router.use('/plivo', require('./plivo-answer'));
+/*
+ * Technician-app force-update policy (2026-07-15). The ONLY sub-router here that
+ * verifies no token — by necessity: it gates the app's LOGIN screen, so an
+ * outdated client has no session to present. Safe because it returns version
+ * policy only (no user data / PII / job scope). Fails OPEN — see the route.
+ * Full path: /api/public/app-version?platform=android
+ */
+router.use('/app-version', require('./app-version'));
 
 module.exports = router;

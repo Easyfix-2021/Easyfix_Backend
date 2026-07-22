@@ -25,6 +25,18 @@ const sophy = require('./sophy.service');
 const MODEL = 'sophy'; // reported in the build summary; the real model is key-set
 const BATCH = 25; // service names classified per LLM call
 
+/*
+ * tbl_service_skill_mapping.source values — Title Case, acronym preserved
+ * ('AI', not 'Ai'). ONE owner so the write, the replace-DELETE, and the stats
+ * SUM can never drift to different casings. The CRM Skill Matrix page renders
+ * this string verbatim (no transform), so the stored casing IS the displayed
+ * casing. The column collation is utf8mb4_0900_ai_ci (case-INSENSITIVE), so
+ * these comparisons still match legacy lower-case rows until the one-shot
+ * normalisation migration (2026-07-19-title-case-service-skill-source.sql) runs
+ * — nothing breaks in the interim; the next build self-heals AI rows to 'AI'.
+ */
+const SOURCE = Object.freeze({ AI: 'AI', MANUAL: 'Manual' });
+
 // This feature's OWN Sophy key (own model/prompt/quota/cost line).
 function sophyKey() {
   return process.env.SOPHY_API_KEY_SKILL_MATRIX;
@@ -122,7 +134,7 @@ async function classifyBatch(categoryId, categoryName, skills, names) {
 /*
  * Build (or dry-run) the matrix. Scope is optional (categoryId). For each
  * in-scope category with active deep skills, classifies its distinct service
- * names in BATCHes, then wholesale-replaces the category's source='ai' rows
+ * names in BATCHes, then wholesale-replaces the category's source=AI rows
  * (manual overrides preserved via INSERT IGNORE). Returns a summary.
  */
 async function buildMatrix({ categoryId = null, dryRun = false } = {}) {
@@ -170,13 +182,13 @@ async function buildMatrix({ categoryId = null, dryRun = false } = {}) {
         const k = catgId + '|' + nm + '|' + f.deep_skill_id;
         if (seen.has(k)) continue;
         seen.add(k);
-        values.push([catgId, nm, f.deep_skill_id, f.confidence, 'ai', 1]);
+        values.push([catgId, nm, f.deep_skill_id, f.confidence, SOURCE.AI, 1]);
       }
       const conn = await pool.getConnection();
       try {
         await conn.beginTransaction();
         // Replace this category's AI mappings; INSERT IGNORE keeps manual overrides.
-        await conn.query('DELETE FROM tbl_service_skill_mapping WHERE service_catg_id = ? AND source = ?', [catgId, 'ai']);
+        await conn.query('DELETE FROM tbl_service_skill_mapping WHERE service_catg_id = ? AND source = ?', [catgId, SOURCE.AI]);
         if (values.length) {
           const [r] = await conn.query(
             'INSERT IGNORE INTO tbl_service_skill_mapping ' +
@@ -205,8 +217,9 @@ async function getStats() {
     `SELECT COUNT(*) AS total,
             COUNT(DISTINCT service_catg_id) AS categories,
             COUNT(DISTINCT deep_skill_id) AS skills,
-            SUM(source = 'manual') AS manual
+            SUM(source = ?) AS manual
        FROM tbl_service_skill_mapping WHERE status = 1`,
+    [SOURCE.MANUAL],
   );
   return {
     total: m.total || 0,
@@ -217,22 +230,95 @@ async function getStats() {
   };
 }
 
-async function list({ categoryId = null, limit = 100, offset = 0 } = {}) {
+/*
+ * Sortable columns for the CRM matrix table — the ONLY strings ever spliced
+ * into ORDER BY. Keys are what the client sends; values are the real SQL
+ * expressions. Never interpolate a raw client string here (the route Joi
+ * whitelists against Object.keys(...) too, so this is defence-in-depth).
+ *
+ * Two of the five live on JOINED tables (sc / ds), which is exactly why the
+ * COUNT query below has to carry the same LEFT JOINs — see list().
+ */
+const SORTABLE_COLUMNS = Object.freeze({
+  service_catg_name: 'sc.service_catg_name',
+  service_name:      'ssm.service_name',
+  deepskill_name:    'ds.deepskill_name',
+  confidence:        'ssm.confidence',
+  source:            'ssm.source',
+});
+
+// Order applied when the client sends no (or an unrecognised) sortBy — the
+// table's historical default, so the 3rd-click "unsorted" state restores it.
+const DEFAULT_ORDER = 'ssm.service_catg_id, ssm.service_name';
+
+/*
+ * One page of the matrix, plus the TOTAL of the full filtered set.
+ *
+ * Search / sort / pagination are all server-side: a full build spans
+ * thousands of (category, service) pairs, so the client can never hold the
+ * whole matrix and sort it in memory. Returns { items, total } — `total`
+ * drives the CRM's TablePagination.
+ */
+async function list({
+  categoryId = null, q: searchTerm = null,
+  sortBy = null, sortDir = 'asc',
+  limit = 100, offset = 0,
+} = {}) {
+  const lim = Math.min(Math.max(Number(limit) || 100, 1), 500);
+  const off = Math.max(Number(offset) || 0, 0);
+
   const where = ['ssm.status = 1'];
   const params = [];
   if (categoryId) { where.push('ssm.service_catg_id = ?'); params.push(categoryId); }
+
+  /*
+   * Search spans the three NAME columns only (Category / Service / Deep
+   * Skill), matching what the CRM used to filter client-side. Parameterised
+   * LIKE with %-wrapped params — never string concatenation.
+   */
+  const q = String(searchTerm ?? '').trim();
+  if (q) {
+    where.push('(sc.service_catg_name LIKE ? OR ssm.service_name LIKE ? OR ds.deepskill_name LIKE ?)');
+    params.push(`%${q}%`, `%${q}%`, `%${q}%`);
+  }
+
+  const sortExpr = SORTABLE_COLUMNS[sortBy];
+  const dir = String(sortDir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+  // `ssm.id` is the tiebreaker on BOTH branches: without a unique trailing
+  // key, rows tying on the sort column can shuffle between LIMIT windows and
+  // the same row shows up on two pages (or on none).
+  const orderBy = sortExpr ? `${sortExpr} ${dir}, ssm.id ASC` : `${DEFAULT_ORDER}, ssm.id ASC`;
+
+  /*
+   * The joins are NOT decoration — sc / ds supply two of the searchable name
+   * columns and two of the sortable expressions. The COUNT query therefore
+   * repeats them verbatim: a bare COUNT(*) over tbl_service_skill_mapping
+   * would throw "Unknown column 'sc.service_catg_name'" the moment anyone
+   * typed a category name into the search box.
+   */
+  const from =
+    `FROM tbl_service_skill_mapping ssm
+       LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = ssm.service_catg_id
+       LEFT JOIN tbl_deep_skill ds ON ds.deepskill_id = ssm.deep_skill_id
+      WHERE ${where.join(' AND ')}`;
+
   const [rows] = await pool.query(
     `SELECT ssm.id, ssm.service_catg_id, sc.service_catg_name, ssm.service_name,
             ssm.deep_skill_id, ds.deepskill_name, ssm.confidence, ssm.source, ssm.updated_on
-       FROM tbl_service_skill_mapping ssm
-       LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = ssm.service_catg_id
-       LEFT JOIN tbl_deep_skill ds ON ds.deepskill_id = ssm.deep_skill_id
-      WHERE ${where.join(' AND ')}
-      ORDER BY ssm.service_catg_id, ssm.service_name
+       ${from}
+      ORDER BY ${orderBy}
       LIMIT ? OFFSET ?`,
-    [...params, Number(limit), Number(offset)],
+    [...params, lim, off],
   );
-  return rows;
+
+  const [[{ total }]] = await pool.query(`SELECT COUNT(*) AS total ${from}`, params);
+
+  logger.info(
+    'Skill-matrix list · returned=' + rows.length + ' · total=' + total +
+    (categoryId ? ' · categoryId=' + categoryId : '') +
+    (q ? ' · search=yes' : '') + (sortExpr ? ' · sortBy=' + sortBy + ' ' + dir : ''),
+  );
+  return { items: rows, total };
 }
 
-module.exports = { buildMatrix, getStats, list, llmEnabled };
+module.exports = { buildMatrix, getStats, list, llmEnabled, SORTABLE_COLUMNS };
