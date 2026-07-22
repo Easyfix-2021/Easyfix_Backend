@@ -2459,8 +2459,17 @@ async function update(jobId, input, actor) {
 
     if (sets.length > 0) {
       if (isStructuralEdit) {
-        sets.push('last_update_time = ?');
-        const scalarValues = [...values, new Date(), jobId];
+        // created_date_time = the Book-Now moment. PUT/PATCH /:id is ONLY the
+        // booking-form submit — reschedule / assign / status / owner / hold each
+        // have their own route that never reaches update() — so re-stamping it
+        // here means "when the order was (re)booked". For a bulk-uploaded row
+        // that is when ops actually confirms it via Confirm & Schedule (also a
+        // PATCH /:id); its ticket_created_date_time stays the upload time.
+        // Gated on a STRUCTURAL edit, exactly like last_update_time: a
+        // remarks-only quick-note is not a booking and must move neither stamp.
+        const bookedAt = new Date();
+        sets.push('last_update_time = ?', 'created_date_time = ?');
+        const scalarValues = [...values, bookedAt, bookedAt, jobId];
         await conn.query(`UPDATE tbl_job SET ${sets.join(', ')} WHERE job_id = ?`, scalarValues);
       } else {
         // Comment-only path — write the remarks/efr_special_notes without
@@ -2690,7 +2699,14 @@ async function update(jobId, input, actor) {
     // customer, address). Downstream consumers (webhooks, audit) see the
     // nested edit as a meaningful change to the job record.
     if (sets.length === 0 && (hasServicesEdit || hasCustomerEdit || hasAddressEdit)) {
-      await conn.query('UPDATE tbl_job SET last_update_time = ? WHERE job_id = ?', [new Date(), jobId]);
+      // Nested-only booking edit (services/customer/address changed, no scalar
+      // column). Stamp created_date_time = the Book-Now moment alongside
+      // last_update_time — same rationale as the scalar branch above.
+      const bookedAt = new Date();
+      await conn.query(
+        'UPDATE tbl_job SET last_update_time = ?, created_date_time = ? WHERE job_id = ?',
+        [bookedAt, bookedAt, jobId],
+      );
     }
 
     await conn.commit();
