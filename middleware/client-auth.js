@@ -23,6 +23,14 @@ async function requireSpocAuth(req, res, next) {
   if (!spoc) return modernError(res, 401, 'SPOC not found or inactive');
 
   req.spoc = spoc;
+  // Client (user_type_id = 3) identity carried in the token claims, for
+  // role-based authorization on routes. Older tokens (pre-enrichment) lack
+  // these claims — they resolve to null, so this is non-breaking.
+  req.clientUser = {
+    userId: payload.userId ?? null,
+    userRole: payload.userRole ?? null,
+    userType: payload.userType ?? null,
+  };
   next();
 }
 

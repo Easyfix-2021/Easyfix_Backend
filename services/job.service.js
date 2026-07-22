@@ -1074,6 +1074,7 @@ async function getByIdCore(jobId) {
             cu.customer_name, cu.customer_mob_no, cu.customer_email,
             ad.address, ad.building, ad.landmark, ad.locality, ad.pin_code,
             ad.gps_location, ${addrInstrSelect}, ad.city_id, ci.city_name,
+            sc.service_catg_name AS service_category,
             cl.client_name, cl.client_email, ${verticalSelect},
             ef.efr_name AS easyfixer_name, ef.efr_no AS easyfixer_mobile,
             ow.user_name AS owner_name,
@@ -1988,7 +1989,11 @@ async function create(input, actor) {
     // mandatory `branch_details` custom-property row), so every other client and
     // non-branch flow is untouched. Runs AFTER the hoist above, so a branch value
     // supplied via the custom_property string already satisfies it.
-    if (input.fk_client_id && (input.branch_details == null || String(input.branch_details).trim() === '')) {
+    // The mobile Client App does not collect custom properties at all, so the
+    // branch-mandatory gate can never be satisfied there — skip it for that
+    // surface only. CRM / client-web bookings keep the enforcement.
+    const isClientApp = String(input.source_type || '').toLowerCase() === 'client_app';
+    if (!isClientApp && input.fk_client_id && (input.branch_details == null || String(input.branch_details).trim() === '')) {
       let clientProps = [];
       try {
         clientProps = await require('./client.service').listCustomProperties(input.fk_client_id);

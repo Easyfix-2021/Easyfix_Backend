@@ -35,6 +35,36 @@ async function findSpocById(id) {
   return row || null;
 }
 
+/**
+ * Resolve the active Client (user_type_id = 3) row in tbl_user that corresponds
+ * to a SPOC, so its user_id + user_role can enrich the login token. SPOCs are
+ * linked to tbl_user only by identity (tbl_client_contacts.user_id is often 0),
+ * so we match on the SPOC's own email (canonical) then fall back to mobile.
+ * Empty strings are treated as "no value" — many type-3 rows share an empty
+ * official_email, and matching those would attach a wrong role. Returns null
+ * (never throws) when there is no match; login is not gated on this.
+ */
+async function findClientUser(spoc) {
+  const email = (spoc.contact_email || '').trim() || null;
+  const mobile = (spoc.contact_no || '').trim() || null;
+  if (!email && !mobile) return null;
+  try {
+    const [[user]] = await pool.query(
+      `SELECT user_id, user_role FROM tbl_user
+        WHERE user_type_id = 3 AND user_status = 1
+          AND ( (? IS NOT NULL AND LOWER(official_email) = LOWER(?))
+             OR (? IS NOT NULL AND mobile_no = ?) )
+        ORDER BY (? IS NOT NULL AND LOWER(official_email) = LOWER(?)) DESC, user_id DESC
+        LIMIT 1`,
+      [email, email, mobile, mobile, email, email]
+    );
+    return user || null;
+  } catch (e) {
+    logger.warn('Login enrich · type-3 client user lookup failed · ' + e.message);
+    return null;
+  }
+}
+
 async function createLoginOtp(identifier) {
   logger.info('Create client SPOC login OTP');
   const spoc = await findSpoc(identifier);
@@ -113,12 +143,28 @@ async function verifyLoginOtp(identifier, otp) {
   if (Number(row.otp) !== Number(otp)) return { ok: false, reason: 'OTP_MISMATCH' };
   await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
 
+  // Enrich (does NOT gate login): resolve the SPOC's matching active Client
+  // (user_type_id = 3) row in tbl_user by email, falling back to mobile, to
+  // carry user_id + user_role into the token for role-based authorization.
+  // The SPOC (tbl_client_contacts) stays the login principal; a SPOC with no
+  // matching type-3 user still authenticates (claims are null).
+  const clientUser = await findClientUser(spoc);
+
   const token = jwt.sign(
-    { sub: `spoc:${spoc.id}`, clientId: spoc.client_id, name: spoc.contact_name, email: spoc.contact_email },
+    {
+      sub: `spoc:${spoc.id}`,
+      clientId: spoc.client_id,
+      name: spoc.contact_name,
+      email: spoc.contact_email,
+      userId: clientUser?.user_id ?? null,
+      userRole: clientUser?.user_role ?? null,
+      userType: clientUser ? 3 : null,
+    },
     process.env.JWT_SECRET,
     { expiresIn: process.env.JWT_EXPIRY || '30d' }
   );
-  logger.info('Client SPOC login OTP verified · spocId=' + spoc.id + ' clientId=' + spoc.client_id);
+  logger.info('Client SPOC login OTP verified · spocId=' + spoc.id + ' clientId=' + spoc.client_id
+    + ' · clientUserId=' + (clientUser?.user_id ?? '-') + ' role=' + (clientUser?.user_role ?? '-'));
   return { ok: true, token, spoc };
 }
 

@@ -77,11 +77,21 @@ router.get('/me/custom-properties', async (req, res, next) => {
       const s = String(v).trim().toLowerCase();
       return s === '1' || s === 'true' || s === 'yes' || s === 'y';
     };
-    const items = rows.map((r) => ({
-      name: String(r.property_name ?? r.name ?? r.key ?? r.field_name ?? '').toLowerCase().trim(),
-      label: r.property_label ?? r.label ?? r.display_name ?? r.property_name ?? null,
-      mandatory: truthy(r.is_mandatory ?? r.mandatory ?? r.required ?? r.is_required ?? r.is_required_field),
-    })).filter((p) => p.name);
+    // The live table uses the c_prop_* naming (c_prop_name / c_prop_mandatory);
+    // the ?? chains keep older/renamed deploys working. Only ACTIVE (status=1),
+    // non-config rows are returned — `is_config` rows (e.g.
+    // auto_process_unconfirmed_order) are backend switches, not booking fields.
+    const items = rows
+      .filter((r) => truthy(r.status ?? 1) && !truthy(r.is_config))
+      .map((r) => {
+        const raw = String(r.c_prop_name ?? r.property_name ?? r.name ?? r.key ?? r.field_name ?? '').trim();
+        return {
+          name: raw.toLowerCase(),
+          label: r.property_label ?? r.label ?? r.display_name ?? raw,
+          mandatory: truthy(r.c_prop_mandatory ?? r.is_mandatory ?? r.mandatory ?? r.required ?? r.is_required),
+        };
+      })
+      .filter((p) => p.name);
     logger.info('Returning ' + items.length + ' custom-properties');
     modernOk(res, { items });
   } catch (e) { next(e); }
@@ -111,17 +121,101 @@ router.get('/lookup/service-categories', async (req, res, next) => {
 
 router.get('/dashboard', async (req, res, next) => {
   try {
-    logger.info('Fetch client dashboard stats · clientId=' + req.spoc.client_id);
+    // scope=today: each active bucket is scoped to TODAY by its own date column —
+    //   New         = tickets created today   (ticket_created_date_time)
+    //   Scheduled   = appointment today        (requested_date_time)
+    //   In Progress = appointment today        (requested_date_time)
+    //   Completed   = checked out today         (checkout_date_time)
+    // open / cancelled / total stay lifetime. Default (no scope) = all lifetime.
+    const todayOnly = String(req.query.scope || '') === 'today';
+    const on = (col) => (todayOnly ? `AND DATE(${col}) = CURDATE()` : '');
+    logger.info('Fetch client dashboard stats · clientId=' + req.spoc.client_id + (todayOnly ? ' · scope=today' : ''));
     const [[stats]] = await pool.query(`
       SELECT
+        SUM(CASE WHEN job_status = 9      ${on('ticket_created_date_time')} THEN 1 ELSE 0 END) AS newTickets,
+        SUM(CASE WHEN job_status = 1      ${on('requested_date_time')}      THEN 1 ELSE 0 END) AS scheduled,
+        SUM(CASE WHEN job_status = 2      ${on('requested_date_time')}      THEN 1 ELSE 0 END) AS inProgress,
+        SUM(CASE WHEN job_status IN (3,5) ${on('checkout_date_time')}       THEN 1 ELSE 0 END) AS completed,
         SUM(CASE WHEN job_status IN (0,7,9) THEN 1 ELSE 0 END) AS open,
-        SUM(CASE WHEN job_status = 1 THEN 1 ELSE 0 END) AS scheduled,
-        SUM(CASE WHEN job_status = 2 THEN 1 ELSE 0 END) AS inProgress,
-        SUM(CASE WHEN job_status IN (3,5) THEN 1 ELSE 0 END) AS completed,
-        SUM(CASE WHEN job_status = 6 THEN 1 ELSE 0 END) AS cancelled,
+        SUM(CASE WHEN job_status = 6        THEN 1 ELSE 0 END) AS cancelled,
         COUNT(*) AS total
        FROM tbl_job WHERE fk_client_id = ?`, [req.spoc.client_id]);
     modernOk(res, stats);
+  } catch (e) { next(e); }
+});
+
+// Per-service × city-tier TAT + SDA completion rates.
+//   TAT (Turn-Around Time): job age (24h days, ticket-created → completion/close)
+//        must be ≤ the pre-defined TAT for that category × tier. Denominator = all jobs.
+//   SDA (Same-Day Attendance): technician checked in on/before the appointment date.
+//        Denominator = only jobs where SDA applies (right status + both dates present).
+// Query params:  ?days=<N>   window on ticket_created_date_time (default: all-time)
+router.get('/services/sda-tat', async (req, res, next) => {
+  try {
+    const days = Number(req.query.days) > 0 ? Number(req.query.days) : null;
+    const params = [req.spoc.client_id];
+    let windowClause = '';
+    if (days) { windowClause = 'AND J.ticket_created_date_time >= DATE_SUB(CURDATE(), INTERVAL ? DAY)'; params.push(days); }
+    logger.info('Fetch client service SDA/TAT (tiered) · clientId=' + req.spoc.client_id + (days ? ' · days=' + days : ''));
+    const [rows] = await pool.query(`
+      SELECT
+        d.service_name,
+        d.tier,
+        COUNT(*)                                                          AS total_jobs,
+        SUM(d.in_tat)                                                     AS jobs_in_tat,
+        ROUND(100.0 * SUM(d.in_tat) / COUNT(*), 2)                        AS tat_completion_pct,
+        SUM(d.sda_applicable)                                             AS sda_applicable_jobs,
+        SUM(d.sda_met)                                                    AS jobs_sda_met,
+        ROUND(100.0 * SUM(d.sda_met) / NULLIF(SUM(d.sda_applicable),0), 2) AS sda_completion_pct
+      FROM (
+        SELECT
+          COALESCE(TSC.service_catg_name, 'Uncategorised') AS service_name,
+          city.tier             AS tier,
+          /* In TAT? job age (24h days) <= pre-defined TAT for category × tier */
+          CASE WHEN
+            (CASE
+                WHEN J.job_status IN (9,1,0,2,20,10,15,21) THEN TIMESTAMPDIFF(HOUR, J.ticket_created_date_time, NOW()) DIV 24
+                WHEN J.job_status IN (3,5) THEN TIMESTAMPDIFF(HOUR, J.ticket_created_date_time, J.checkout_date_time) DIV 24
+                WHEN J.job_status = 6 THEN TIMESTAMPDIFF(HOUR, J.ticket_created_date_time, J.cancel_date_time) DIV 24
+                WHEN J.job_status = 7 THEN TIMESTAMPDIFF(HOUR, J.ticket_created_date_time, J.enquiry_date_time) DIV 24
+                ELSE 0 END)
+            <=
+            (CASE
+                WHEN J.fk_service_catg_id IS NULL OR city.tier IS NULL THEN 3
+                WHEN J.fk_service_catg_id = 15 THEN CASE city.tier WHEN 3 THEN 7 WHEN 2 THEN 5 ELSE 3 END
+                WHEN J.fk_service_catg_id IN (1,5,12,21) THEN CASE city.tier WHEN 3 THEN 5 ELSE 3 END
+                ELSE 3 END)
+          THEN 1 ELSE 0 END AS in_tat,
+          /* SDA applies: right status + both dates present */
+          CASE WHEN J.job_status IN (2,20,10,21,15,3,5)
+                    AND J.checkin_date_time IS NOT NULL
+                    AND J.original_appointment_date_time IS NOT NULL
+               THEN 1 ELSE 0 END AS sda_applicable,
+          /* SDA met: check-in date on/before appointment date */
+          CASE WHEN J.job_status IN (2,20,10,21,15,3,5)
+                    AND J.checkin_date_time IS NOT NULL
+                    AND J.original_appointment_date_time IS NOT NULL
+                    AND DATE(J.checkin_date_time) <= DATE(J.original_appointment_date_time)
+               THEN 1 ELSE 0 END AS sda_met
+        FROM tbl_job J
+        LEFT JOIN tbl_address     A    ON A.customer_id = J.fk_customer_id AND A.address_id = J.fk_address_id
+        LEFT JOIN tbl_city        city ON city.city_id  = A.city_id
+        LEFT JOIN tbl_service_catg TSC ON TSC.service_catg_id = J.fk_service_catg_id
+        WHERE J.fk_client_id = ? ${windowClause}
+      ) d
+      GROUP BY d.service_name, d.tier
+      ORDER BY (d.service_name = 'Uncategorised'), d.service_name, d.tier`, params);
+    const items = rows.map((r) => ({
+      service: r.service_name,
+      tier: r.tier,
+      total: Number(r.total_jobs),
+      jobsInTat: Number(r.jobs_in_tat),
+      tatPct: r.tat_completion_pct != null ? Number(r.tat_completion_pct) : null,
+      sdaApplicable: Number(r.sda_applicable_jobs),
+      jobsSdaMet: Number(r.jobs_sda_met),
+      sdaPct: r.sda_completion_pct != null ? Number(r.sda_completion_pct) : null,
+    }));
+    modernOk(res, { items });
   } catch (e) { next(e); }
 });
 
@@ -132,6 +226,11 @@ router.get('/jobs', async (req, res, next) => {
       clientId: req.spoc.client_id,
       status: req.query.status != null ? Number(req.query.status) : undefined,
       q: req.query.q,
+      // Server-side date range (so the app can reach any historical date
+      // instead of only the recent window it can hold client-side).
+      dateType: req.query.dateType,          // 'ticket' → ticket_created_date_time
+      startDate: req.query.startDate,
+      endDate: req.query.endDate,
       limit: Math.min(Number(req.query.limit) || 50, 500),
       offset: Number(req.query.offset) || 0,
     });
@@ -253,6 +352,89 @@ router.patch('/jobs/:id/estimate/reject', validate(Joi.object({ reason: Joi.stri
   } catch (e) { next(e); }
 });
 
+// Human-readable stage stored on an escalation row (job_stage), matching the
+// vocabulary the legacy Client Dashboard already writes to this table.
+const STAGE_LABEL = {
+  0: 'Unconfirmed', 1: 'Scheduled', 2: 'Pending To Start', 3: 'Completed',
+  5: 'Completed', 6: 'Cancelled', 7: 'Enquiry', 9: 'Booked',
+  10: 'Under Audit', 15: 'Awaiting Approval', 20: 'Pending To Start', 21: 'On Hold',
+};
+
+/**
+ * Cancel an order (client-initiated).
+ * Routes through jobService.setStatus so it takes the same path ops uses —
+ * job_status → 6 plus cancel_date_time / cancel_reason_id / cancel_comment.
+ */
+router.post('/jobs/:id/cancel', validate(Joi.object({
+  comment: Joi.string().min(3).max(500).required(),
+  reasonId: Joi.number().integer().allow(null).optional(),
+})), async (req, res, next) => {
+  try {
+    const job = await jobService.getById(Number(req.params.id));
+    if (!job || job.fk_client_id !== req.spoc.client_id) {
+      logger.warn('Client cancel — job not found / not owned · id=' + req.params.id);
+      return modernError(res, 404, 'job not found');
+    }
+    if (job.job_status === 6) return modernError(res, 409, 'job is already cancelled');
+    if ([3, 5].includes(job.job_status)) return modernError(res, 409, 'cannot cancel a completed job');
+
+    // Legacy stamps cancel_by with the SPOC's linked USER (clientContact.getUser()).
+    const [[link]] = await pool.query('SELECT user_id FROM tbl_client_contacts WHERE id = ?', [req.spoc.id]);
+    logger.info('Client cancel job · id=' + job.job_id + ' · spoc=' + req.spoc.id + ' · user=' + (link?.user_id ?? '-'));
+    await jobService.setStatus(job.job_id, {
+      status: 6,
+      reasonId: req.body.reasonId ?? null,
+      comment: req.body.comment,
+    }, { user_id: link?.user_id ?? null });
+    modernOk(res, { cancelled: true, job_id: job.job_id });
+  } catch (e) { next(e); }
+});
+
+/**
+ * Escalate an order — writes to tbl_job_escalation_info, the same table the
+ * legacy Client Dashboard writes, so ops sees app + dashboard escalations in
+ * one place. `escalated_from` marks the source as the mobile app.
+ */
+router.post('/jobs/:id/escalate', validate(Joi.object({
+  reasonId: Joi.number().integer().required(),
+  comment: Joi.string().allow('').max(500).optional(),
+})), async (req, res, next) => {
+  try {
+    const job = await jobService.getById(Number(req.params.id));
+    if (!job || job.fk_client_id !== req.spoc.client_id) {
+      logger.warn('Client escalate — job not found / not owned · id=' + req.params.id);
+      return modernError(res, 404, 'job not found');
+    }
+    logger.info('Client escalate job · id=' + job.job_id + ' · reason=' + req.body.reasonId + ' · spoc=' + req.spoc.id);
+    const escalatedBy = req.spoc.contact_name || null;
+
+    // 1) the escalation record itself (job_stage here is the human-readable label)
+    const [r] = await pool.query(
+      `INSERT INTO tbl_job_escalation_info
+         (job_id, easyfixer_id, escalation_time, job_stage, escalated_by,
+          escalated_by_name, escalated_comments, escalated_from, escalation_reason)
+       VALUES (?, ?, NOW(), ?, 0, ?, ?, 'Client App', ?)`,
+      [
+        job.job_id,
+        job.fk_easyfixter_id || null,   // note: column name has the legacy "easyfixter" typo
+        STAGE_LABEL[job.job_status] || String(job.job_status ?? ''),
+        escalatedBy,
+        req.body.comment || null,
+        req.body.reasonId,
+      ]);
+
+    // 2) the matching job-timeline comment the legacy dashboard also writes
+    //    (comment_on = 19 marks it as an escalation; job_stage here is the raw status int).
+    await pool.query(
+      `INSERT INTO tbl_job_comment
+         (job_id, enum_reason_id, comments, comment_on, created_on, job_stage, job_escalated_by)
+       VALUES (?, ?, ?, 19, NOW(), ?, ?)`,
+      [job.job_id, req.body.reasonId, req.body.comment || null, job.job_status ?? null, escalatedBy]);
+
+    modernOk(res, { escalated: true, escalation_info_id: r.insertId, job_id: job.job_id });
+  } catch (e) { next(e); }
+});
+
 /**
  * Escalation email on SPOC rejection.
  * Replaces legacy `sendemailClitoClientUrgentRequest` — that legacy
@@ -299,7 +481,12 @@ router.get('/profile', async (req, res, next) => {
   try {
     logger.info('Fetch SPOC profile · spocId=' + req.spoc.id);
     const [[profile]] = await pool.query(
-      'SELECT id, contact_name, contact_email, contact_no, contact_alt_no, contact_desgn, linkedIn_profile FROM tbl_client_contacts WHERE id = ?',
+      `SELECT cc.id, cc.contact_name, cc.contact_email, cc.contact_no,
+              cc.contact_alt_no, cc.contact_desgn, cc.linkedIn_profile,
+              cc.client_id, cl.client_name
+       FROM tbl_client_contacts cc
+       LEFT JOIN tbl_client cl ON cl.client_id = cc.client_id
+       WHERE cc.id = ?`,
       [req.spoc.id]);
     modernOk(res, profile);
   } catch (e) { next(e); }
@@ -322,7 +509,118 @@ router.put('/profile', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.get('/contacts/managers', async (req, res, next) => {
+// ─── Change mobile number (OTP-verified) ─────────────────────────────
+// The SPOC's number lives in BOTH tbl_client_contacts (contact_no, the
+// login/contact record) and tbl_user (mobile_no). We OTP the NEW number,
+// reject it if it is already registered to anyone, then update both tables.
+function cn_normalizePhone(v) { return String(v || '').replace(/\D/g, ''); }
+function cn_isJunkMobile(m) {
+  if (!/^[6-9]\d{9}$/.test(m)) return true;            // 10 digits, starts 6-9
+  if (/^(\d)\1{9}$/.test(m)) return true;              // all same digit (e.g. 9999999999)
+  if ('01234567890'.includes(m) || '09876543210'.includes(m)) return true; // sequential
+  if (/^(\d\d)\1{4}$/.test(m)) return true;            // repeated pair (e.g. 1212121212)
+  return false;
+}
+async function cn_alreadyRegistered(phone, exceptContactId) {
+  const [[cc]] = await pool.query(
+    'SELECT id FROM tbl_client_contacts WHERE contact_no = ? AND id <> ? LIMIT 1',
+    [phone, exceptContactId]);
+  if (cc) return true;
+  const [[u]] = await pool.query(
+    'SELECT user_id FROM tbl_user WHERE mobile_no = ? LIMIT 1', [phone]);
+  return !!u;
+}
+
+router.post('/profile/change-phone/send-otp', async (req, res, next) => {
+  try {
+    const phone = cn_normalizePhone(req.body && req.body.new_phone);
+    if (cn_isJunkMobile(phone)) return modernError(res, 400, 'Enter a valid 10-digit mobile number.');
+    if (await cn_alreadyRegistered(phone, req.spoc.id)) {
+      return modernError(res, 409, 'This number is already registered. Please use a different one.');
+    }
+    const { resolveLoginOtp, otpExpiryDate } = require('../../utils/otp');
+    const now = new Date();
+    const otp = resolveLoginOtp(phone);
+    const expires = otpExpiryDate(now);
+    const [[existing]] = await pool.query(
+      `SELECT id FROM otp_details WHERE user_mobile_no = ? AND otp_type = 'Change Number' LIMIT 1`, [phone]);
+    if (existing) {
+      await pool.query(
+        `UPDATE otp_details SET otp = ?, generated_on = ?, valid_up_to = ?, is_expired = 0 WHERE id = ?`,
+        [otp, now, expires, existing.id]);
+    } else {
+      await pool.query(
+        `INSERT INTO otp_details (otp, otp_type, user_email, user_mobile_no, generated_on, valid_up_to, is_expired, count)
+         VALUES (?, 'Change Number', NULL, ?, ?, ?, 0, 0)`,
+        [otp, phone, now, expires]);
+    }
+    try {
+      const { deliverOtp } = require('../../services/otp-delivery.service');
+      await deliverOtp({ identifier: phone, email: null, mobile: phone, name: req.spoc.contact_name, otp, contextLabel: 'spoc-change-phone' });
+    } catch (e) { logger.warn('change-phone OTP deliver failed: ' + e.message); }
+    logger.info('Change-phone OTP issued · spocId=' + req.spoc.id);
+    return modernOk(res, { sent: true });
+  } catch (e) { next(e); }
+});
+
+router.post('/profile/change-phone/verify-otp', async (req, res, next) => {
+  try {
+    const phone = cn_normalizePhone(req.body && req.body.new_phone);
+    const otp = Number(req.body && req.body.otp);
+    if (cn_isJunkMobile(phone)) return modernError(res, 400, 'Enter a valid 10-digit mobile number.');
+    const [[row]] = await pool.query(
+      `SELECT id, otp, valid_up_to, is_expired FROM otp_details
+        WHERE user_mobile_no = ? AND otp_type = 'Change Number' ORDER BY id DESC LIMIT 1`, [phone]);
+    if (!row) return modernError(res, 400, 'No OTP was requested for this number.');
+    if (row.is_expired || new Date(row.valid_up_to) < new Date()) {
+      await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
+      return modernError(res, 400, 'OTP has expired. Please request a new one.');
+    }
+    if (Number(row.otp) !== otp) return modernError(res, 400, 'Incorrect OTP.');
+    // Re-check right before writing (guards a race between two requests).
+    if (await cn_alreadyRegistered(phone, req.spoc.id)) {
+      return modernError(res, 409, 'This number is already registered. Please use a different one.');
+    }
+    const oldPhone = req.spoc.contact_no;
+    await pool.query('UPDATE tbl_client_contacts SET contact_no = ? WHERE id = ?', [phone, req.spoc.id]);
+    if (oldPhone) {
+      await pool.query('UPDATE tbl_user SET mobile_no = ? WHERE mobile_no = ?', [phone, oldPhone]);
+    }
+    await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
+    logger.info('SPOC phone changed · spocId=' + req.spoc.id + ' (updated tbl_client_contacts + tbl_user)');
+    return modernOk(res, { updated: true });
+  } catch (e) { next(e); }
+});
+
+/**
+ * My Rate Card — the client's active priced services.
+ * Mirrors the legacy dashboard's rate-card source (tbl_client_service joined to
+ * tbl_client_rate_card), but returns the full line (category + service type +
+ * charge + rate-card name) rather than just the rate-card id/name pair.
+ */
+router.get('/ratecard', async (req, res, next) => {
+  try {
+    logger.info('Fetch client rate card · clientId=' + req.spoc.client_id);
+    const [rows] = await pool.query(
+      `SELECT CS.client_service_id,
+              CS.total_amount,
+              CS.charge_type,
+              SC.service_catg_name  AS service_category_name,
+              ST.service_type_name,
+              CRC.crc_ratecard_name AS rate_card_name
+         FROM tbl_client_service CS
+         LEFT JOIN tbl_service_type     ST  ON ST.service_type_id  = CS.service_type_id
+         LEFT JOIN tbl_service_catg     SC  ON SC.service_catg_id  = CS.service_catg_id
+         LEFT JOIN tbl_client_rate_card CRC ON CRC.crc_id = CS.rate_card_id AND CRC.status = 1
+        WHERE CS.client_id = ? AND CS.service_status = 1
+        ORDER BY SC.service_catg_name ASC, ST.service_type_name ASC
+        LIMIT 1000`, [req.spoc.client_id]);
+    logger.info('Returning ' + rows.length + ' rate card lines');
+    modernOk(res, { items: rows });
+  } catch (e) { next(e); }
+});
+
+router.get('/contacts/managers',async (req, res, next) => {
   try {
     logger.info('List client contact-managers · clientId=' + req.spoc.client_id);
     const [rows] = await pool.query(
@@ -331,6 +629,74 @@ router.get('/contacts/managers', async (req, res, next) => {
       [req.spoc.client_id]);
     logger.info('Returning ' + rows.length + ' contact-managers');
     modernOk(res, rows);
+  } catch (e) { next(e); }
+});
+
+// My Team — every contact belonging to the SPOC's client. Sourced from
+// tbl_client_contacts by client_id (both active + inactive so the mobile
+// app can show the status badge). Shape matches the client app's TeamMember.
+/**
+ * Distinct cities the client actually has orders in — for the Orders "Cities"
+ * filter. Server-side DISTINCT over ALL the client's jobs, so the list is
+ * complete (not limited to the recent window the app can hold client-side) and
+ * client-scoped (not the ~11k tbl_city master the legacy dumped).
+ */
+router.get('/cities', async (req, res, next) => {
+  try {
+    logger.info('List client cities · clientId=' + req.spoc.client_id);
+    const [rows] = await pool.query(
+      `SELECT DISTINCT ci.city_name AS name
+         FROM tbl_job j
+         LEFT JOIN tbl_address a ON a.address_id = j.fk_address_id
+         LEFT JOIN tbl_city    ci ON ci.city_id  = a.city_id
+        WHERE j.fk_client_id = ? AND ci.city_name IS NOT NULL AND ci.city_name <> ''
+        ORDER BY ci.city_name`,
+      [req.spoc.client_id]);
+    logger.info('Returning ' + rows.length + ' cities');
+    modernOk(res, { items: rows.map((r) => r.name) });
+  } catch (e) { next(e); }
+});
+
+router.get('/team', async (req, res, next) => {
+  try {
+    logger.info('List client team · clientId=' + req.spoc.client_id);
+    const [rows] = await pool.query(
+      `SELECT id, contact_name, contact_email, contact_no,
+              contact_desgn, manager_id, status, approval_by_client
+         FROM tbl_client_contacts
+        WHERE client_id = ?
+        ORDER BY contact_name`,
+      [req.spoc.client_id]);
+    const items = rows.map((r) => ({
+      id: r.id,
+      name: r.contact_name,
+      email: r.contact_email,
+      mobile: r.contact_no,
+      designation: r.contact_desgn,
+      managerId: r.manager_id,
+      status: r.status,
+      approvalByClient: r.approval_by_client,
+    }));
+    logger.info('Returning ' + items.length + ' team members');
+    modernOk(res, { items });
+  } catch (e) { next(e); }
+});
+
+// Customer lookup by mobile — powers the New Order auto-fill (name/email
+// prefill when the caller is an existing customer). Returns the most recent
+// matching customer, or { customer: null } when unknown.
+router.get('/customers/mobile/:mobile', async (req, res, next) => {
+  try {
+    const mobile = String(req.params.mobile || '').replace(/\D/g, '');
+    if (!/^\d{10}$/.test(mobile)) return modernOk(res, { customer: null });
+    const [[customer]] = await pool.query(
+      `SELECT customer_id, customer_name, customer_mob_no, customer_email
+         FROM tbl_customer
+        WHERE customer_mob_no = ?
+        ORDER BY customer_id DESC LIMIT 1`,
+      [mobile]);
+    logger.info('Customer lookup by mobile · found=' + (customer ? 'yes' : 'no'));
+    modernOk(res, { customer: customer || null });
   } catch (e) { next(e); }
 });
 
