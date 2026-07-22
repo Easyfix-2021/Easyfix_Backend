@@ -580,6 +580,41 @@ async function customerRequestTableExists() {
   return _hasCustomerRequestTable;
 }
 
+/*
+ * Mark a job's PENDING customer requests as 'actioned' — called when Ops takes a
+ * deliberate action on the job (confirm/cancel/enquiry via setStatus, assign,
+ * offer, reschedule). Scenario: a customer submits a cancel request, then phones
+ * in to schedule instead; Ops confirms via Confirm & Schedule. Without this the
+ * 'pending' cancel row lingers and every surface keeps flagging "1 pending
+ * customer request" — even though Ops already handled it, per the customer's own
+ * new instruction.
+ *
+ * 'actioned' is the existing terminal status the manual "Mark Actioned" button
+ * writes (domain: pending | actioned | dismissed) — no schema change, no new
+ * status. Every count/chip filters `request_status = 'pending'`, so this clears
+ * them all; the yellow tbl_job_comment history is a SEPARATE table and is
+ * untouched, so the audit trail stays.
+ *
+ * Keyed by job_id (not request_id) so one call clears every pending ask. Best-
+ * effort + existence-gated: a failure here must never fail the Ops action, and
+ * it's a no-op on un-migrated deploys. Deliberately NOT called from update() — a
+ * plain field edit / draft-save is not "handling the request"; only a real
+ * confirm/assign/offer/reschedule is.
+ */
+async function resolveCustomerRequests(jobId, runner = pool) {
+  if (!(await customerRequestTableExists())) return;
+  try {
+    await runner.query(
+      `UPDATE tbl_job_customer_request
+          SET request_status = 'actioned'
+        WHERE job_id = ? AND request_status = 'pending'`,
+      [jobId],
+    );
+  } catch (e) {
+    logger.warn('resolveCustomerRequests failed (non-fatal) · id=' + jobId + ' · ' + (e && e.message));
+  }
+}
+
 // Same memoised existence probe for tbl_job_media — new EasyFix-owned table
 // (videos shared via the conversational WhatsApp flow, see
 // migrations/2026-06-03-whatsapp-conversation.sql). On deploys without that
@@ -3072,6 +3107,9 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
     require('./enquiry-notification.service').fireEnquiryWhatsapp(jobId);
   }
 
+  // Ops took a deliberate status action (confirm 9→0, cancel, enquiry, …) — any
+  // pending customer request on this job is now handled. See resolveCustomerRequests.
+  await resolveCustomerRequests(jobId);
   return getById(jobId);
 }
 
@@ -3224,6 +3262,8 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
       .catch(() => {});
   }
 
+  // Offering the job out is Ops handling it — clear any pending customer request.
+  await resolveCustomerRequests(jobId);
   return getById(jobId);
 }
 
@@ -3393,6 +3433,8 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
 
     fireWebhook(isReassign ? 'RescheduleTech' : 'TechAssigned', jobId);
 
+    // Assigning a technician is Ops handling the job — clear any pending request.
+    await resolveCustomerRequests(jobId);
     return getById(jobId);
   } catch (e) {
     await conn.rollback();
@@ -3802,6 +3844,8 @@ async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason
   }
 
   fireWebhook('RescheduleTech', jobId);
+  // Ops rescheduled the job — directly handles a customer reschedule/cancel ask.
+  await resolveCustomerRequests(jobId);
   return getById(jobId);
 }
 
