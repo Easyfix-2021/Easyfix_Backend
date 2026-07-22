@@ -41,14 +41,27 @@ router.get('/stats', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+/*
+ * List query. Search / sort / pagination are ALL server-side — the matrix runs
+ * to thousands of rows on live data, so the client can never hold it whole.
+ *
+ * `sortBy` is whitelisted against the service's SORTABLE_COLUMNS keys (the
+ * service re-checks; nothing client-supplied ever reaches ORDER BY). It has NO
+ * default on purpose: omitting it is the 3rd-click "unsorted" state, which the
+ * service answers with its historical default order.
+ */
 const listQuery = Joi.object({
   categoryId: Joi.number().integer().positive().optional(),
+  q: Joi.string().allow('').max(200).optional(),
+  sortBy: Joi.string().valid(...Object.keys(matrix.SORTABLE_COLUMNS)).optional(),
+  sortDir: Joi.string().valid('asc', 'desc').default('asc'),
   limit: Joi.number().integer().min(1).max(500).default(100),
   offset: Joi.number().integer().min(0).default(0),
 });
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
   try {
-    return modernOk(res, { items: await matrix.list(req.query) });
+    const { items, total } = await matrix.list(req.query);
+    return modernOk(res, { items, total });
   } catch (e) { next(e); }
 });
 

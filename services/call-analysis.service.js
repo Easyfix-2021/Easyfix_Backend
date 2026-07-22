@@ -8,6 +8,13 @@
  * gateway — model/prompt/quota are key-controlled. Sophy folds our system prompt
  * into the user turn and parses JSON leniently, so we pass {system,user} and get
  * an object (or null on ANY failure so callers degrade gracefully).
+ *
+ * This module owns the coaching PROMPT + output shape for BOTH analysis modes.
+ * The RECORDING mode (services/gemini-call-analysis.service.js) sends the audio
+ * to Gemini direct — Sophy is text-only and physically cannot carry audio — but
+ * must produce the IDENTICAL JSON so the stored analysis, the scorecard rollup
+ * and the FE modal render unchanged. Hence coachingSystemPrompt() is exported
+ * rather than the prompt being copy-pasted into the audio path.
  */
 
 const sophy = require('./sophy.service');
@@ -26,29 +33,40 @@ async function chatJson({ system, user, maxTokens = 1600 }) {
   return sophy.chatJson({ system, user, maxTokens, apiKey: sophyKey() });
 }
 
-const SYSTEM = [
-  "You are a call-quality coach for a field-service company's phone agents.",
-  'Calls are in English and Hindi/Hinglish, between an AGENT and a customer.',
-  'Analyse the AGENT\'s communication (not the customer) from the transcript and',
-  'return STRICT JSON only (no markdown, no prose) with this EXACT shape:',
-  '{',
-  '  "overall_score": <integer 1-10>,',
-  '  "summary": "<2-3 sentence overview of the agent\'s performance>",',
-  '  "dimensions": [',
-  '    { "name": "Pronunciation", "score": <1-10>, "notes": "<specific, actionable>" },',
-  '    { "name": "Vocabulary", "score": <1-10>, "notes": "..." },',
-  '    { "name": "Communication Skills", "score": <1-10>, "notes": "..." },',
-  '    { "name": "Professionalism", "score": <1-10>, "notes": "..." }',
-  '  ],',
-  '  "strengths": ["<point>", ...],',
-  '  "areas_of_improvement": ["<point>", ...],',
-  '  "what_to_avoid": ["<phrase or behaviour to avoid saying>", ...],',
-  '  "what_to_add": ["<phrase or behaviour to add>", ...]',
-  '}',
-  'Ground EVERY point in evidence from the transcript. Keep each array to 3-6',
-  'concise, concrete items. If the transcript is too short or unusable, still',
-  'return the exact shape with low scores and a note explaining why.',
-].join('\n');
+/*
+ * The one coaching prompt, parameterised ONLY by what the model is looking at
+ * ('transcript' for the Sophy/text path, 'call recording' for the Gemini/audio
+ * path). `source` defaults to 'transcript' so the text path's prompt is
+ * byte-identical to what it has always sent — the scores stay comparable across
+ * the two modes because everything except that noun is the same.
+ */
+function coachingSystemPrompt({ source = 'transcript' } = {}) {
+  return [
+    "You are a call-quality coach for a field-service company's phone agents.",
+    'Calls are in English and Hindi/Hinglish, between an AGENT and a customer.',
+    `Analyse the AGENT's communication (not the customer) from the ${source} and`,
+    'return STRICT JSON only (no markdown, no prose) with this EXACT shape:',
+    '{',
+    '  "overall_score": <integer 1-10>,',
+    '  "summary": "<2-3 sentence overview of the agent\'s performance>",',
+    '  "dimensions": [',
+    '    { "name": "Pronunciation", "score": <1-10>, "notes": "<specific, actionable>" },',
+    '    { "name": "Vocabulary", "score": <1-10>, "notes": "..." },',
+    '    { "name": "Communication Skills", "score": <1-10>, "notes": "..." },',
+    '    { "name": "Professionalism", "score": <1-10>, "notes": "..." }',
+    '  ],',
+    '  "strengths": ["<point>", ...],',
+    '  "areas_of_improvement": ["<point>", ...],',
+    '  "what_to_avoid": ["<phrase or behaviour to avoid saying>", ...],',
+    '  "what_to_add": ["<phrase or behaviour to add>", ...]',
+    '}',
+    `Ground EVERY point in evidence from the ${source}. Keep each array to 3-6`,
+    `concise, concrete items. If the ${source} is too short or unusable, still`,
+    'return the exact shape with low scores and a note explaining why.',
+  ].join('\n');
+}
+
+const SYSTEM = coachingSystemPrompt();
 
 /*
  * Analyse a transcript. Returns the parsed analysis object, or null when the
@@ -62,4 +80,4 @@ async function analyzeTranscript(transcript) {
   return chatJson({ system: SYSTEM, user });
 }
 
-module.exports = { analyzeTranscript, llmEnabled };
+module.exports = { analyzeTranscript, llmEnabled, coachingSystemPrompt };

@@ -1,0 +1,24 @@
+-- Call-analysis INPUT mode: transcript (Sophy) vs recording (Gemini direct) — 2026-07-22.
+-- Adds the option to score a call from its RECORDING instead of Plivo's ASR text,
+-- because a poor transcript caps the achievable score. Audio cannot go through
+-- Sophy (text-only by design), so recording mode calls Google AI Studio directly
+-- with GEMINI_API_KEY — see docs/gemini-transcription-plan.md.
+--
+-- call.analysis.mode  GLOBAL DEFAULT: 'transcript' | 'recording'. Seeded
+--   'transcript' = today's behaviour, and the fail-closed one: recording mode
+--   sends customer call audio to a NEW data processor (retention / DPA review
+--   applies before Production), so it is never the accidental default. Every
+--   read / re-analyse endpoint also takes a per-call `mode` override on top.
+--   Set via Setting → Admin Actions (POST /api/admin/calls/analysis-mode), which
+--   refuses 'recording' when GEMINI_API_KEY is unset.
+--
+-- call.analysis.gemini.model  Model id, runtime-switchable with no redeploy
+--   (CRS's pattern). Blank/absent falls back to the code default. Move this to a
+--   newer id the day Google ships one — do NOT wait for a deploy.
+--
+-- Provenance for each stored analysis is written INSIDE the existing
+-- tbl_plivo_call_log.call_analysis JSON as `analysis_mode` — NO new column and no
+-- schema change. Rows written before this carry no marker and are, by
+-- construction, transcript-produced.
+INSERT INTO easyfix_properties (property_key, property_value) VALUES ('call.analysis.mode', 'transcript') ON DUPLICATE KEY UPDATE property_value = property_value;
+INSERT INTO easyfix_properties (property_key, property_value) VALUES ('call.analysis.gemini.model', 'gemini-2.5-flash') ON DUPLICATE KEY UPDATE property_value = property_value;

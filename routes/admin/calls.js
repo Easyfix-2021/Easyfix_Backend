@@ -8,7 +8,9 @@ const plivo = require('../../services/plivo.service');
 const voice = require('../../services/voice.service');
 const plivoLog = require('../../services/plivo-call-log.service');
 const recordingBackfill = require('../../services/recording-backfill.service');
-const callAnalysis = require('../../services/call-analysis.service');
+// The route layer talks ONLY to the mode service: it owns the transcript-vs-
+// recording branch, the provider clients behind each, and the provenance stamp.
+const analysisMode = require('../../services/call-analysis-mode.service');
 const callerScorecard = require('../../services/caller-scorecard.service');
 const propertiesSvc = require('../../services/properties.service');
 const { requirePropertyAllowlist } = require('../../middleware/require-property-allowlist');
@@ -656,6 +658,41 @@ router.post('/default-provider', requirePropertyAllowlist(FEATURES.canSwitchCall
   } catch (e) { next(e); }
 });
 
+// ─── GET /analysis-mode — global call-analysis input mode + availability ─────
+// Which input the coaching analysis runs over by default: the Plivo TRANSCRIPT
+// (Sophy) or the RECORDING audio (Gemini direct). `modeAvailable.recording` is
+// false without GEMINI_API_KEY so the FE disables the option rather than offering
+// one that would only fall back. Same gate as View Analysis. Declared before the
+// '/:id/*' routes, alongside the other global-setting endpoints.
+router.get('/analysis-mode', requireClickToCallAction, (req, res) => {
+  logger.info('Get call-analysis mode');
+  return modernOk(res, { mode: analysisMode.globalMode(), modeAvailable: analysisMode.modeAvailable() });
+});
+
+// ─── POST /analysis-mode — set call.analysis.mode (Admin Action) ─────────────
+// Mirrors POST /default-provider: persists to easyfix_properties + flushes the
+// cache so it takes effect immediately (no restart). Refuses 'recording' when
+// Gemini isn't configured — storing a mode that can only fall back would be a
+// lie to every later reader.
+router.post('/analysis-mode', requirePropertyAllowlist(FEATURES.canSwitchCallMode, { label: 'Switch Call Mode' }), async (req, res, next) => {
+  try {
+    const mode = analysisMode.normaliseMode(req.body.mode);
+    logger.info('Set call-analysis mode · mode=' + (mode || '—'));
+    if (!analysisMode.isValidMode(mode)) {
+      logger.warn('Set call-analysis mode rejected · invalid mode');
+      return modernError(res, 400, "mode must be 'transcript' or 'recording'.");
+    }
+    if (mode === analysisMode.MODE_RECORDING && !analysisMode.modeAvailable().recording) {
+      logger.warn('Set call-analysis mode rejected · Gemini not configured');
+      return modernError(res, 409, 'Recording analysis needs GEMINI_API_KEY configured in this environment.');
+    }
+    await propertiesSvc.setProperty('call.analysis.mode', mode);
+    await propertiesSvc.flushCache();
+    logger.info(`call.analysis.mode set to '${mode}' by user #${req.user.user_id}`);
+    return modernOk(res, { mode: analysisMode.globalMode(), modeAvailable: analysisMode.modeAvailable() });
+  } catch (e) { next(e); }
+});
+
 // Terminal normalized statuses — once the row reaches one of these the FE can
 // stop polling. Mirrors the webhook's CallStatus→status mapping (plus the
 // operator-driven 'hungup'). Kept in sync with routes/webhook/plivo.js.
@@ -877,27 +914,65 @@ async function rollupCallerBestEffort(jobCallerInfoId, callerUserIdFromLog) {
   }
 }
 
-// Generate → cache → roll up. Shared by GET /:id/analysis (first view) and
-// POST /:id/reanalyse (forced refresh) so the store + scorecard contract lives in
-// exactly one place. The rollup runs ONLY on a fresh generate — a cache hit would
-// recompute identical numbers on every page view. Returns the analysis or null.
-async function generateAndStoreAnalysis({ id, transcript, hasAnalysis, callerUserId }) {
-  logger.info('Generate call analysis · row=' + id);
-  const analysis = await callAnalysis.analyzeTranscript(transcript);
-  if (!analysis) {
-    if (hasAnalysis) await pool.query("UPDATE tbl_plivo_call_log SET call_analysis_status = 'failed' WHERE job_caller_info_id = ?", [id]);
-    return null;
+/*
+ * Analyse → cache → roll up. Shared by GET /:id/analysis (first view) and
+ * POST /:id/reanalyse (forced refresh), and the ONLY analysis-persistence path
+ * for BOTH modes: what produced the JSON changes, what happens to it afterwards
+ * never does. The mode branch itself lives in ONE place upstream
+ * (call-analysis-mode.service.analyzeCall) — this function only stores.
+ *
+ * The rollup runs ONLY on a fresh generate; a cache hit would recompute identical
+ * numbers on every page view. `analysis_mode` provenance is already stamped in the
+ * JSON by the dispatcher — stored inside the existing column, no schema change,
+ * and inert for the scorecard (which reads only overall_score + dimensions).
+ *
+ * Returns the dispatcher result with `analysis` replaced by the STORED object.
+ */
+async function runAndStoreAnalysis({ id, transcript, mode, hasAnalysis, callerUserId }) {
+  logger.info('Generate call analysis · row=' + id + ' · mode=' + (mode || 'default'));
+  const out = await analysisMode.analyzeCall({ jobCallerInfoId: id, transcript, mode });
+  if (!out.analysis) {
+    // Only a real LLM failure marks the row failed — "no transcript yet" and
+    // "AI not configured" are environment states, not a failed generation.
+    if (out.reason === 'analysis_failed' && hasAnalysis) {
+      await pool.query("UPDATE tbl_plivo_call_log SET call_analysis_status = 'failed' WHERE job_caller_info_id = ?", [id]);
+    }
+    return out;
   }
   if (hasAnalysis) {
     await pool.query(
       "UPDATE tbl_plivo_call_log SET call_analysis = ?, call_analysis_status = 'ready', call_analysis_generated_at = NOW() WHERE job_caller_info_id = ?",
-      [JSON.stringify(analysis), id]
+      [JSON.stringify(out.analysis), id]
     );
     // Only meaningful once the analysis is actually STORED — rollupForCaller
     // re-reads call_analysis off the table, so an unstored one aggregates nothing.
     await rollupCallerBestEffort(id, callerUserId);
   }
-  return analysis;
+  return out;
+}
+
+/*
+ * Parse the OPTIONAL per-call mode override off a request (?mode= on the read,
+ * body.mode on the re-analyse). Returns { override, invalid } — absent is fine
+ * (the global default then applies), but a value we don't recognise is a caller
+ * bug and 400s rather than silently resolving to something else.
+ */
+function readModeOverride(raw) {
+  if (raw == null || String(raw).trim() === '') return { override: null, invalid: false };
+  if (!analysisMode.isValidMode(raw)) return { override: null, invalid: true };
+  return { override: analysisMode.normaliseMode(raw), invalid: false };
+}
+
+/*
+ * Map a dispatcher reason code to the FE's status contract. Both handlers share
+ * it so the same failure never reads differently on the read and re-analyse paths.
+ */
+function statusForReason(reason) {
+  if (reason === 'no_transcript') return { status: 'no_transcript' };
+  if (reason === 'llm_disabled') {
+    return { status: 'llm_disabled', reason: 'Call-analysis AI is not configured in this environment.' };
+  }
+  return { status: 'failed', reason: 'Analysis could not be generated.' };
 }
 
 // Re-analyse only: drop THIS row's cached transcript so the shared acquisition
@@ -1014,18 +1089,34 @@ router.get('/:id/recording', requireClickToCallAction, async (req, res, next) =>
   } catch (e) { next(e); }
 });
 
-// ─── GET /:id/analysis — LLM coaching analysis of the call transcript ──
+// ─── GET /:id/analysis — LLM coaching analysis of the call ─────────────
 // On-demand (Call Analytics → View Analysis): returns the cached analysis, else
-// generates it from the stored transcript + caches it. Needs an OpenAI key + the
-// transcription/analysis columns (2026-07-06 migrations); degrades gracefully.
+// generates one and caches it. Needs the transcription/analysis columns
+// (2026-07-06 migrations) + a configured LLM; degrades gracefully.
+//
+// ?mode=transcript|recording is an OPTIONAL per-call override of the global
+// `call.analysis.mode`. Every response reports `mode` (what ACTUALLY produced the
+// analysis) + `modeAvailable` (what this environment can run) so the FE never
+// mislabels an analysis or offers an option that would only fall back.
 router.get('/:id/analysis', requireClickToCallAction, async (req, res, next) => {
   try {
     const id = parseRowId(req.params.id);
     if (!id) return modernError(res, 400, 'invalid call id');
+    const { override, invalid } = readModeOverride(req.query.mode);
+    if (invalid) {
+      logger.warn('Get call analysis rejected · invalid mode · row=' + id);
+      return modernError(res, 400, "mode must be 'transcript' or 'recording'.");
+    }
+    const modeAvailable = analysisMode.modeAvailable();
+    const resolved = analysisMode.resolveMode(override);
+
     // Transcription columns are the base surface; analysis (LLM) + metrics
     // (Transcribe) are each conditionally present per their own migration.
     if (!(await hasTranscriptionColumn())) {
-      return modernOk(res, { status: 'unavailable', reason: 'Call analytics is not enabled in this environment.' });
+      return modernOk(res, {
+        status: 'unavailable', reason: 'Call analytics is not enabled in this environment.',
+        mode: resolved.mode, modeAvailable,
+      });
     }
     const hasAnalysis = await hasAnalysisColumn();
     const hasMetrics = await hasMetricsColumn();
@@ -1045,32 +1136,45 @@ router.get('/:id/analysis', requireClickToCallAction, async (req, res, next) => 
       try { metrics = JSON.parse(row.call_metrics); } catch (_e) { metrics = null; }
     }
     const metricsStatus = (hasMetrics && row) ? (row.call_metrics_status || null) : null;
-    const withMetrics = (obj) => ({ ...obj, metrics, metricsStatus });
-
-    if (!row) return modernOk(res, withMetrics({ status: 'no_transcript' }));
-    // Cache hit — return the stored coaching (parse-guarded).
-    if (row.call_analysis) {
-      try { return modernOk(res, withMetrics({ status: 'ready', analysis: JSON.parse(row.call_analysis) })); }
-      catch (_e) { /* corrupt cache — fall through + regenerate */ }
-    }
-    // No stored transcript yet — try to fetch it on-demand (transcript only;
-    // the recording download stays lazy) before giving up, so the cron's 30-min
-    // cadence doesn't block the first View Analysis for this call.
-    if ((!row.transcription || String(row.transcription).trim().length < 10) && row.call_uuid) {
-      const fetched = await fetchTranscriptOnDemand({ jobCallerInfoId: id, callUuid: row.call_uuid, currentStatus: row.transcription_status });
-      if (fetched) row.transcription = fetched;
-    }
-    if (!row.transcription || String(row.transcription).trim().length < 10) {
-      return modernOk(res, withMetrics({ status: 'no_transcript' }));
-    }
-    if (!callAnalysis.llmEnabled()) {
-      return modernOk(res, withMetrics({ status: 'llm_disabled', reason: 'Call-analysis AI is not configured in this environment.' }));
-    }
-    const analysis = await generateAndStoreAnalysis({
-      id, transcript: row.transcription, hasAnalysis, callerUserId: row.caller_user_id,
+    const envelope = (obj, { mode = resolved.mode, fallbackReason = null } = {}) => ({
+      ...obj, metrics, metricsStatus, mode, modeAvailable,
+      ...(fallbackReason ? { modeFallbackReason: fallbackReason } : {}),
     });
-    if (!analysis) return modernOk(res, withMetrics({ status: 'failed', reason: 'Analysis could not be generated.' }));
-    return modernOk(res, withMetrics({ status: 'ready', analysis }));
+
+    if (!row) return modernOk(res, envelope({ status: 'no_transcript' }));
+    // Cache hit — return the stored coaching (parse-guarded). An EXPLICIT ?mode=
+    // is a request for THAT mode, so a cache produced the other way is bypassed
+    // and regenerated; compared against the RESOLVED mode so asking for an
+    // unavailable recording doesn't re-generate the same transcript every view.
+    if (row.call_analysis) {
+      try {
+        const cached = JSON.parse(row.call_analysis);
+        const cachedMode = analysisMode.analysisModeOf(cached);
+        if (!override || resolved.mode === cachedMode) {
+          return modernOk(res, envelope({ status: 'ready', analysis: cached }, { mode: cachedMode }));
+        }
+      } catch (_e) { /* corrupt cache — fall through + regenerate */ }
+    }
+
+    // Transcript acquisition is LAZY: recording mode reads the audio and needs no
+    // transcript at all, so the thunk only runs if the transcript path is what
+    // actually executes. If the 30-min backfill cron hasn't reached this call, it
+    // pulls the transcript NOW (transcript only — the recording download stays
+    // lazy elsewhere) so the cron cadence doesn't block the first View Analysis.
+    const transcript = async () => {
+      if ((!row.transcription || String(row.transcription).trim().length < analysisMode.MIN_TRANSCRIPT_CHARS) && row.call_uuid) {
+        const fetched = await fetchTranscriptOnDemand({ jobCallerInfoId: id, callUuid: row.call_uuid, currentStatus: row.transcription_status });
+        if (fetched) row.transcription = fetched;
+      }
+      return row.transcription;
+    };
+
+    const out = await runAndStoreAnalysis({
+      id, transcript, mode: override, hasAnalysis, callerUserId: row.caller_user_id,
+    });
+    const opts = { mode: out.mode, fallbackReason: out.fallbackReason };
+    if (!out.analysis) return modernOk(res, envelope(statusForReason(out.reason), opts));
+    return modernOk(res, envelope({ status: 'ready', analysis: out.analysis }, opts));
   } catch (e) { next(e); }
 });
 
@@ -1082,12 +1186,27 @@ router.get('/:id/analysis', requireClickToCallAction, async (req, res, next) => 
 // the same audio yields a better score). This is the explicit escape hatch —
 // reset this one row's transcript cache, then fall through the SAME acquisition
 // + analysis path the read uses.
+//
+// body.mode is the same OPTIONAL per-call override as the read's ?mode=. In
+// recording mode the transcript reset is skipped when the audio carries the
+// analysis — the audio is immutable, so there is nothing to re-request; the
+// reset only happens on the transcript leg that actually needs it.
 router.post('/:id/reanalyse', requireClickToCallAction, async (req, res, next) => {
   try {
     const id = parseRowId(req.params.id);
     if (!id) return modernError(res, 400, 'invalid call id');
+    const { override, invalid } = readModeOverride(req.body && req.body.mode);
+    if (invalid) {
+      logger.warn('Re-analyse rejected · invalid mode · row=' + id);
+      return modernError(res, 400, "mode must be 'transcript' or 'recording'.");
+    }
+    const modeAvailable = analysisMode.modeAvailable();
+    const resolved = analysisMode.resolveMode(override);
     if (!(await hasTranscriptionColumn())) {
-      return modernOk(res, { status: 'unavailable', reason: 'Call analytics is not enabled in this environment.' });
+      return modernOk(res, {
+        status: 'unavailable', reason: 'Call analytics is not enabled in this environment.',
+        mode: resolved.mode, modeAvailable,
+      });
     }
 
     const [[jci]] = await pool.query(
@@ -1110,28 +1229,38 @@ router.post('/:id/reanalyse', requireClickToCallAction, async (req, res, next) =
          FROM tbl_plivo_call_log WHERE job_caller_info_id = ? ORDER BY id DESC LIMIT 1`,
       [id]
     );
-    if (!row) return modernOk(res, { status: 'no_transcript' });
-    logger.info('Re-analyse call · row=' + id);
+    const envelope = (obj, { mode = resolved.mode, fallbackReason = null } = {}) => ({
+      ...obj, mode, modeAvailable,
+      ...(fallbackReason ? { modeFallbackReason: fallbackReason } : {}),
+    });
+    if (!row) return modernOk(res, envelope({ status: 'no_transcript' }));
+    logger.info('Re-analyse call · row=' + id + ' · mode=' + (override || 'default'));
 
-    await resetTranscriptForRefetch(id);
-    const transcript = row.call_uuid
-      ? await fetchTranscriptOnDemand({ jobCallerInfoId: id, callUuid: row.call_uuid, currentStatus: null })
-      : null;
-    if (!transcript || String(transcript).trim().length < 10) {
-      // Provider has nothing ready yet — the reset above left the row 'processing',
-      // so the backfill cron lands the text and a second Re-analyse picks it up.
-      return modernOk(res, { status: 'transcript_pending', reason: 'A fresh transcript has been requested — try Re-analyse again in a few minutes.' });
-    }
-    if (!callAnalysis.llmEnabled()) {
-      return modernOk(res, { status: 'llm_disabled', reason: 'Call-analysis AI is not configured in this environment.' });
-    }
+    // Lazy, and only on the transcript leg: recording mode re-runs the model over
+    // the SAME immutable audio, so resetting the transcript cache there would
+    // spend a paid re-transcription nobody reads.
+    const transcript = async () => {
+      await resetTranscriptForRefetch(id);
+      return row.call_uuid
+        ? fetchTranscriptOnDemand({ jobCallerInfoId: id, callUuid: row.call_uuid, currentStatus: null })
+        : null;
+    };
+
     // Cache bypass is a READ-path difference, not a destructive write: we simply
     // never consult call_analysis here, and only overwrite it on a successful
     // generate — so a failed re-analyse leaves the previous analysis intact rather
     // than blanking a row the operator still needs.
-    const analysis = await generateAndStoreAnalysis({ id, transcript, hasAnalysis, callerUserId: row.caller_user_id });
-    if (!analysis) return modernOk(res, { status: 'failed', reason: 'Analysis could not be generated.' });
-    return modernOk(res, { status: 'ready', analysis });
+    const out = await runAndStoreAnalysis({
+      id, transcript, mode: override, hasAnalysis, callerUserId: row.caller_user_id,
+    });
+    const opts = { mode: out.mode, fallbackReason: out.fallbackReason };
+    if (out.analysis) return modernOk(res, envelope({ status: 'ready', analysis: out.analysis }, opts));
+    if (out.reason === 'no_transcript') {
+      // Provider has nothing ready yet — the reset above left the row 'processing',
+      // so the backfill cron lands the text and a second Re-analyse picks it up.
+      return modernOk(res, envelope({ status: 'transcript_pending', reason: 'A fresh transcript has been requested — try Re-analyse again in a few minutes.' }, opts));
+    }
+    return modernOk(res, envelope(statusForReason(out.reason), opts));
   } catch (e) { next(e); }
 });
 
@@ -1290,11 +1419,23 @@ router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
     // job_caller_info_id. transcription_status is selected only when the
     // 2026-07-06 migration added the column (guarded for pre-migration envs).
     const txSelect = hasTx ? ',\n              pcl.transcription_status' : '';
-    // Flow (always present) + coaching score (extracted from the cached analysis
-    // JSON so the big blob isn't shipped per row) for the unified Call Analysis list.
+    // Flow (always present) + coaching score and its PROVENANCE (both extracted
+    // from the cached analysis JSON so the big blob isn't shipped per row) for the
+    // unified Call Analysis list.
+    //
+    // A stored analysis with NO `analysis_mode` marker is NOT unknown provenance:
+    // analyzeCall() stamps every analysis it produces, so an unstamped row can
+    // only predate recording mode — i.e. it was transcript-produced by
+    // construction. We therefore resolve it to 'transcript' here, matching
+    // call-analysis-mode.service.js's analysisModeOf(). Without this the SAME row
+    // read "no chip" in the list and "Transcript" in the modal.
+    // NULL is reserved for its one honest meaning: no analysis at all ⇒ no chip.
     const flowSelect = ',\n              pcl.call_flow';
     const anaSelect = hasAna
       ? ",\n              pcl.call_analysis_status,\n              JSON_UNQUOTE(JSON_EXTRACT(pcl.call_analysis, '$.overall_score')) AS score"
+        + ",\n              CASE WHEN pcl.call_analysis IS NULL THEN NULL"
+        + "\n                   ELSE COALESCE(JSON_UNQUOTE(JSON_EXTRACT(pcl.call_analysis, '$.analysis_mode')), 'transcript')"
+        + "\n              END AS analysis_mode"
       : '';
     const plivoJoin = 'JOIN tbl_plivo_call_log pcl ON pcl.job_caller_info_id = jci.job_caller_info';
 

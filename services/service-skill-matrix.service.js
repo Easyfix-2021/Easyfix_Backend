@@ -230,22 +230,95 @@ async function getStats() {
   };
 }
 
-async function list({ categoryId = null, limit = 100, offset = 0 } = {}) {
+/*
+ * Sortable columns for the CRM matrix table — the ONLY strings ever spliced
+ * into ORDER BY. Keys are what the client sends; values are the real SQL
+ * expressions. Never interpolate a raw client string here (the route Joi
+ * whitelists against Object.keys(...) too, so this is defence-in-depth).
+ *
+ * Two of the five live on JOINED tables (sc / ds), which is exactly why the
+ * COUNT query below has to carry the same LEFT JOINs — see list().
+ */
+const SORTABLE_COLUMNS = Object.freeze({
+  service_catg_name: 'sc.service_catg_name',
+  service_name:      'ssm.service_name',
+  deepskill_name:    'ds.deepskill_name',
+  confidence:        'ssm.confidence',
+  source:            'ssm.source',
+});
+
+// Order applied when the client sends no (or an unrecognised) sortBy — the
+// table's historical default, so the 3rd-click "unsorted" state restores it.
+const DEFAULT_ORDER = 'ssm.service_catg_id, ssm.service_name';
+
+/*
+ * One page of the matrix, plus the TOTAL of the full filtered set.
+ *
+ * Search / sort / pagination are all server-side: a full build spans
+ * thousands of (category, service) pairs, so the client can never hold the
+ * whole matrix and sort it in memory. Returns { items, total } — `total`
+ * drives the CRM's TablePagination.
+ */
+async function list({
+  categoryId = null, q: searchTerm = null,
+  sortBy = null, sortDir = 'asc',
+  limit = 100, offset = 0,
+} = {}) {
+  const lim = Math.min(Math.max(Number(limit) || 100, 1), 500);
+  const off = Math.max(Number(offset) || 0, 0);
+
   const where = ['ssm.status = 1'];
   const params = [];
   if (categoryId) { where.push('ssm.service_catg_id = ?'); params.push(categoryId); }
+
+  /*
+   * Search spans the three NAME columns only (Category / Service / Deep
+   * Skill), matching what the CRM used to filter client-side. Parameterised
+   * LIKE with %-wrapped params — never string concatenation.
+   */
+  const q = String(searchTerm ?? '').trim();
+  if (q) {
+    where.push('(sc.service_catg_name LIKE ? OR ssm.service_name LIKE ? OR ds.deepskill_name LIKE ?)');
+    params.push(`%${q}%`, `%${q}%`, `%${q}%`);
+  }
+
+  const sortExpr = SORTABLE_COLUMNS[sortBy];
+  const dir = String(sortDir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+  // `ssm.id` is the tiebreaker on BOTH branches: without a unique trailing
+  // key, rows tying on the sort column can shuffle between LIMIT windows and
+  // the same row shows up on two pages (or on none).
+  const orderBy = sortExpr ? `${sortExpr} ${dir}, ssm.id ASC` : `${DEFAULT_ORDER}, ssm.id ASC`;
+
+  /*
+   * The joins are NOT decoration — sc / ds supply two of the searchable name
+   * columns and two of the sortable expressions. The COUNT query therefore
+   * repeats them verbatim: a bare COUNT(*) over tbl_service_skill_mapping
+   * would throw "Unknown column 'sc.service_catg_name'" the moment anyone
+   * typed a category name into the search box.
+   */
+  const from =
+    `FROM tbl_service_skill_mapping ssm
+       LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = ssm.service_catg_id
+       LEFT JOIN tbl_deep_skill ds ON ds.deepskill_id = ssm.deep_skill_id
+      WHERE ${where.join(' AND ')}`;
+
   const [rows] = await pool.query(
     `SELECT ssm.id, ssm.service_catg_id, sc.service_catg_name, ssm.service_name,
             ssm.deep_skill_id, ds.deepskill_name, ssm.confidence, ssm.source, ssm.updated_on
-       FROM tbl_service_skill_mapping ssm
-       LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = ssm.service_catg_id
-       LEFT JOIN tbl_deep_skill ds ON ds.deepskill_id = ssm.deep_skill_id
-      WHERE ${where.join(' AND ')}
-      ORDER BY ssm.service_catg_id, ssm.service_name
+       ${from}
+      ORDER BY ${orderBy}
       LIMIT ? OFFSET ?`,
-    [...params, Number(limit), Number(offset)],
+    [...params, lim, off],
   );
-  return rows;
+
+  const [[{ total }]] = await pool.query(`SELECT COUNT(*) AS total ${from}`, params);
+
+  logger.info(
+    'Skill-matrix list · returned=' + rows.length + ' · total=' + total +
+    (categoryId ? ' · categoryId=' + categoryId : '') +
+    (q ? ' · search=yes' : '') + (sortExpr ? ' · sortBy=' + sortBy + ' ' + dir : ''),
+  );
+  return { items: rows, total };
 }
 
-module.exports = { buildMatrix, getStats, list, llmEnabled };
+module.exports = { buildMatrix, getStats, list, llmEnabled, SORTABLE_COLUMNS };

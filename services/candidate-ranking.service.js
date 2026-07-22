@@ -232,14 +232,22 @@ function computeTierAndRefPin({ jobPin, jobZoneIds, currentPincode, servPins, se
 }
 
 /*
- * Deep-skill 3-state. job-level skill requirement decides applicability.
- *   - job has NO skill requirement      → 'both_available' (not-applicable).
+ * Deep-skill 4-state. The job-level skill requirement decides applicability.
+ *   - job has NO skill requirement      → 'not_applicable'.
  *   - tech has ZERO active mappings      → 'easyfixer_skills_not_available'.
  *   - tech has mappings but none match   → 'job_skill_not_available'.
  *   - tech matches the job skill         → 'both_available'.
+ *
+ * 'not_applicable' used to collapse into 'both_available', so ONE green label
+ * meant both "this technician matches the job's skill" and "the job names no
+ * skill, so there was nothing to match". Those are very different facts for an
+ * operator choosing who to assign, and the second was reading as a positive
+ * signal it never earned. Note this is applicability only — the match itself is
+ * Category + Type (see l1Eligibility); the deep skill id is never compared,
+ * because a job carries no deep-skill requirement yet.
  */
 function deepSkillStatus({ jobHasSkillReq, hasAnySkill, matchesJobSkill }) {
-  if (!jobHasSkillReq) return 'both_available';
+  if (!jobHasSkillReq) return 'not_applicable';
   if (!hasAnySkill) return 'easyfixer_skills_not_available';
   if (!matchesJobSkill) return 'job_skill_not_available';
   return 'both_available';
@@ -963,7 +971,11 @@ function buildCandidateRow(tech, s, job) {
     distance_km:            s.distance_km ?? null,
     distance_tier:          s.distance_tier ?? 'unknown',
     attendance_for_job_date: s.attendance_for_job_date === true,
-    deep_skill_status:      s.deep_skill_status ?? 'both_available',
+    // Defensive default only — deepSkillStatus() always sets this. It falls back
+    // to 'not_applicable' rather than 'both_available' so a missing value can
+    // never render as a green "this technician matches", which is the exact
+    // overstatement the 4th state exists to remove.
+    deep_skill_status:      s.deep_skill_status ?? 'not_applicable',
     deep_skill_match:       s.deep_skill_match === true,
     worked_in_category:     s.worked_in_category === true,
     payment_mode:           paidByLabel(job.paid_by),
@@ -1141,6 +1153,10 @@ async function rankCandidatesForJob(jobId, {
     serviceCatgName = labels?.catg_name ?? null;
   }
 
+  // Required deep skill(s) per service, in ONE batched query for the whole job
+  // (never per-service). Empty Map when the job carries no services.
+  const jobSkillsByService = await loadJobSkillMatrix(job);
+
   // Pre-build the enriched job payload used in ALL return paths (early-exit
   // on zero-eligible and the normal ranked return).
   const enrichedJob = {
@@ -1160,7 +1176,7 @@ async function rankCandidatesForJob(jobId, {
     service_category:  serviceCatgName ?? job.service_category ?? null,
     service_type:      serviceTypeName      ?? null,
     deep_skill_label:  deepSkillLabel       ?? null,
-    services:          mapJobServices(job),
+    services:          mapJobServices(job, jobSkillsByService),
     job_type:          job.job_type         ?? null,
     payment_mode:      paidByLabel(job.paid_by),
     requested_date_time: job.requested_date_time ?? null,
@@ -1400,27 +1416,147 @@ async function ensureAssignedFirst(candidatesList, assignedEfrId, job, scoredAll
  * applied in pickAutoAssignCandidate — accepts both 2 and 'Customer'/'customer'.
  */
 /*
+ * Job Skill Matrix availability probe (2026-07-22).
+ *
+ * services/service-skill-matrix.service.js owns tbl_service_skill_mapping and
+ * writes it keyed on (service_catg_id, service_name) — that is the shape in the
+ * committed DDL (migrations/executed/2026-07-02-create-tbl-service-skill-mapping.sql).
+ * Some deploys still carry the PRE-recut table keyed on `service_type_id`, whose
+ * ids come from a DIFFERENT namespace: joining a category id to it would produce
+ * silently WRONG skills, and the current builder cannot write into it anyway
+ * (its INSERT names service_catg_id), so such a table is by definition stale.
+ * We therefore treat "no service_catg_id column" as "matrix unavailable" and
+ * degrade to no skills rather than guessing — the modal must never 500 because
+ * an environment is un-migrated. Memoised once per process; mirrors the
+ * jobServicesCreatedByColumn() probe idiom in job.service.js.
+ */
+let _skillMatrixReadable = undefined; // undefined = unprobed
+async function skillMatrixReadable() {
+  if (_skillMatrixReadable !== undefined) return _skillMatrixReadable;
+  try {
+    const [rows] = await pool.query(
+      "SHOW COLUMNS FROM tbl_service_skill_mapping WHERE Field = 'service_catg_id'",
+    );
+    _skillMatrixReadable = rows.length > 0;
+  } catch {
+    _skillMatrixReadable = false;
+  }
+  if (!_skillMatrixReadable) {
+    logger.warn('Job Skill Matrix unavailable (tbl_service_skill_mapping missing or not category-keyed) · Job Skill columns will render empty');
+  }
+  return _skillMatrixReadable;
+}
+
+/*
+ * Required deep skill(s) per job service, resolved through the Job Skill Matrix.
+ *
+ * ONE batched query for the WHOLE job — never per-service (this modal is on a
+ * latency budget). Returns Map<job_service_id, [{deep_skill_id, deepskill_name,
+ * confidence}]>, ordered highest-confidence first so callers can take [0] as the
+ * top score. A service maps to 0..N deep skills (the builder writes one row per
+ * (service, skill) pair), so every match is kept — nothing is collapsed away.
+ *
+ * JOIN KEY (verified 2026-07-22 against live data — see report): both sides read
+ * the SAME column by the SAME path, tbl_client_rate_card.crc_ratecard_name
+ * reached via tbl_client_service.rate_card_id. Two details make the equality
+ * actually land:
+ *   - TRIM() is mandatory. The builder stores TRIM(cr.crc_ratecard_name); the
+ *     job's service_name in job.service.js getById is the RAW column, and 152 of
+ *     6,097 live rate-card names carry surrounding whitespace.
+ *   - The category must be cs.service_catg_id (the builder's own source), NOT
+ *     js.service_category_id — the job-service column is caller-supplied and
+ *     disagreed on 79 of 9,949 recent rows (77 of them NULL).
+ * The builder's 255-char truncation is a no-op here: crc_ratecard_name is itself
+ * VARCHAR(255) (longest live value: 153). Collation differs across the join
+ * (latin1_swedish_ci vs utf8mb4_0900_ai_ci) but MySQL coerces cleanly and both
+ * are accent/case-insensitive, so casing differences still match.
+ *
+ * Read-only. No status filter on tbl_job_services here — mapJobServices() stays
+ * the single owner of the "active row" rule.
+ */
+async function loadJobSkillMatrix(job) {
+  const jobId = job?.job_id;
+  const hasServices = Array.isArray(job?.services) && job.services.length > 0;
+  if (!jobId || !hasServices) return new Map();
+  if (!(await skillMatrixReadable())) return new Map();
+
+  let rows = [];
+  try {
+    [rows] = await pool.query(
+      `SELECT js.job_service_id, ssm.deep_skill_id, ds.deepskill_name, ssm.confidence
+         FROM tbl_job_services js
+         JOIN tbl_client_service   cs  ON cs.client_service_id = js.service_id
+         JOIN tbl_client_rate_card cr  ON cr.crc_id = cs.rate_card_id
+         JOIN tbl_service_skill_mapping ssm
+              ON ssm.service_catg_id = cs.service_catg_id
+             AND ssm.service_name    = TRIM(cr.crc_ratecard_name)
+             AND ssm.status          = 1
+         LEFT JOIN tbl_deep_skill ds ON ds.deepskill_id = ssm.deep_skill_id
+        WHERE js.job_id = ?
+        ORDER BY js.job_service_id, ssm.confidence DESC, ds.deepskill_name`,
+      [jobId],
+    );
+  } catch (e) {
+    // Never let a matrix lookup take the Schedule & Assign modal down.
+    logger.warn('Job Skill Matrix lookup failed · jobId=' + jobId + ' · ' + e.message);
+    return new Map();
+  }
+
+  const byJobService = new Map();
+  for (const r of rows) {
+    if (!byJobService.has(r.job_service_id)) byJobService.set(r.job_service_id, []);
+    byJobService.get(r.job_service_id).push({
+      deep_skill_id:  r.deep_skill_id,
+      deepskill_name: r.deepskill_name ?? null,
+      // confidence is DECIMAL(3,2) → mysql2 hands back a STRING ('0.90'/'0.00').
+      // Passed through verbatim so the modal prints the exact same text the
+      // Skill Matrix page shows for that row, and so a real 0 is never
+      // indistinguishable from "no value".
+      confidence:     r.confidence ?? null,
+    });
+  }
+  return byJobService;
+}
+
+/*
  * Compact per-service breakdown (service name / category / type / qty / charge)
  * for the Schedule & Assign modal header. Source rows come from job.services
  * (populated only on the full-getById path — i.e. the route's req.scopedJob
  * preloadedJob); the getByIdCore / auto-assign path carries no services → [].
  * Active rows only (job_service_status !== 0 hides soft-deleted lines).
+ *
+ * `skillsByJobService` is the loadJobSkillMatrix() Map (pass an empty Map when
+ * the caller has none) — the Job Skill / Job Matrix Score columns.
  */
-function mapJobServices(job) {
+function mapJobServices(job, skillsByJobService = new Map()) {
   return (Array.isArray(job.services) ? job.services : [])
     .filter((s) => s.job_service_status !== 0)
-    .map((s) => ({
-      service_name: s.service_name      ?? null,
-      service_catg: s.service_catg_name ?? null,
-      service_type: s.service_type_name ?? null,
-      quantity:     s.quantity          ?? null,
-      total_charge: s.total_charge      ?? null,
-      // Free/Paid per service, derived by job.service.js getById from
-      // effective_charge. This mapper is an ALLOWLIST — a field absent here is
-      // dropped no matter what getById projects, which is why the modal's
-      // Billing chip rendered "—".
-      billing_label: s.billing_label    ?? null,
-    }));
+    .map((s) => {
+      const skills = skillsByJobService.get(s.job_service_id) ?? [];
+      return {
+        service_name: s.service_name      ?? null,
+        service_catg: s.service_catg_name ?? null,
+        service_type: s.service_type_name ?? null,
+        quantity:     s.quantity          ?? null,
+        total_charge: s.total_charge      ?? null,
+        // Free/Paid per service, derived by job.service.js getById from
+        // effective_charge. This mapper is an ALLOWLIST — a field absent here is
+        // dropped no matter what getById projects, which is why the modal's
+        // Billing chip rendered "—".
+        billing_label: s.billing_label    ?? null,
+        /*
+         * Job Skill Matrix (display-only for now — candidate matching still runs
+         * on category/deep-skill, not on this). ALL mapped skills are projected;
+         * an empty array means the matrix has NO mapping for this service, which
+         * is what makes the modal's "—" mean exactly that.
+         */
+        job_skills: skills,
+        // Highest confidence among the mapped skills — rows arrive sorted
+        // confidence DESC, so [0] is the top one. null only when the matrix has
+        // no mapping, or recorded no confidence for any of them.
+        job_skill_score: skills[0]?.confidence ?? null,
+      };
+    });
 }
 
 function paidByLabel(raw) {
@@ -1607,6 +1743,8 @@ async function searchJobHeader(job) {
     serviceCatgName = labels?.catg_name ?? null;
   }
   const deepSkillLabel = [serviceCatgName, serviceTypeName].filter(Boolean).join(' › ') || null;
+  // Same single batched Job Skill Matrix lookup the ranked header does.
+  const jobSkillsByService = await loadJobSkillMatrix(job);
   return {
     job_id:            job.job_id,
     fk_client_id:      job.fk_client_id,
@@ -1621,7 +1759,7 @@ async function searchJobHeader(job) {
     service_category:  serviceCatgName ?? job.service_category ?? null,
     service_type:      serviceTypeName      ?? null,
     deep_skill_label:  deepSkillLabel       ?? null,
-    services:          mapJobServices(job),
+    services:          mapJobServices(job, jobSkillsByService),
     job_type:          job.job_type         ?? null,
     payment_mode:      paidByLabel(job.paid_by),
     requested_date_time: job.requested_date_time ?? null,
