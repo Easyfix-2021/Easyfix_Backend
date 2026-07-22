@@ -189,7 +189,7 @@ const LIST_COLUMNS = `
      reschedule_reason), so it's a cheap indexed EXISTS per row. */
   (EXISTS (SELECT 1 FROM scheduling_history sh
      WHERE sh.job_id = j.job_id
-       AND sh.reschedule_reason LIKE '%Auto Rescheduled for Next Day')) AS auto_rescheduled,
+       AND sh.reschedule_reason LIKE '%Auto Rescheduled%')) AS auto_rescheduled,
   j.fk_customer_id, cu.customer_name, cu.customer_mob_no,
   j.fk_client_id, cl.client_name,
   j.fk_service_catg_id, sc.service_catg_name AS service_category,

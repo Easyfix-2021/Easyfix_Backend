@@ -158,7 +158,7 @@ test('autoRescheduleOnOpenIfLate — opened after 3pm shifts +1 day (guarded) an
     assert.equal(r.shifted, true);
     const upd = inst.calls.find((c) => /UPDATE tbl_job\s+SET\s+original_appointment_date_time/.test(c.sql));
     assert.ok(upd, 'UPDATE fired');
-    assert.match(upd.sql, /INTERVAL 1 DAY/, 'shifts by exactly one day');
+    assert.match(upd.sql, /INTERVAL 2 DAY/, 'shifts by two days (late-open jobs need >1 day of lead time)');
     assert.match(upd.sql, /DATE\(requested_date_time\) = DATE\(COALESCE\(original_appointment_date_time/, 'idempotency guard COALESCEs NULL original (bulk-upload jobs)');
     assert.match(upd.sql, /SET original_appointment_date_time = COALESCE\(original_appointment_date_time, requested_date_time\)/, 'back-fills a NULL original in the same atomic UPDATE');
     assert.match(upd.sql, /customer_submitted_at IS NULL/);
@@ -166,7 +166,7 @@ test('autoRescheduleOnOpenIfLate — opened after 3pm shifts +1 day (guarded) an
     const hist = inst.calls.find((c) => /INSERT INTO scheduling_history/.test(c.sql));
     assert.ok(hist, 'scheduling_history audit row written');
     assert.equal(hist.params[1], 55, 'easyfixer_id is the non-NULL tech id (NOT NULL — avoids candidate-ranking NOT-IN poison)');
-    assert.match(String(hist.params[3]), /Auto Rescheduled for Next Day/, 'carries the auto-reschedule reason');
+    assert.match(String(hist.params[3]), /Auto Rescheduled/, 'carries the auto-reschedule reason (stable token, no "for Next Day" since the shift is +2)');
   } finally { inst.restore(); }
 });
 

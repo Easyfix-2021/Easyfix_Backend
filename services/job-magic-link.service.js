@@ -526,16 +526,23 @@ async function autoRescheduleOnOpenIfLate(jobId, pool, { nowMs = Date.now() } = 
   // 12-hour label for the reason string, e.g. 15 -> "3pm", 20 -> "8pm".
   const h12 = ((istHour + 11) % 12) + 1;
   const ampm = istHour < 12 ? 'am' : 'pm';
-  const reason = `Job Received at ${h12}${ampm}, Auto Rescheduled for Next Day`;
+  // Reason text no longer says "for Next Day" — the shift is +2 days (below), so
+  // the wording would lie. The chip detector matches the stable 'Auto Rescheduled'
+  // token (job.service.js LIST_COLUMNS uses LIKE '%Auto Rescheduled%'), so old
+  // rows written as '…for Next Day' still match.
+  const reason = `Job Received at ${h12}${ampm}, Auto Rescheduled`;
 
-  // Guarded, idempotent-by-construction shift. +1 day done IN MySQL on the
+  // Guarded, idempotent-by-construction shift. +2 days (was +1) — a late-evening
+  // open that only bumped to the NEXT day still landed a first-slot appointment
+  // ops couldn't staff in time, so we push two days out. Done IN MySQL on the
   // stored IST wall-clock string (dateStrings + '+05:30' pool) so there is no
   // JS/UTC date math. time_slot is intentionally UNCHANGED (same hour-of-day →
-  // same slot; only the calendar date moves).
+  // same slot; only the calendar date moves). Still idempotent: the guard below
+  // fires only while requested_date_time is still on its ORIGINAL date.
   const [result] = await pool.query(
     `UPDATE tbl_job
         SET original_appointment_date_time = COALESCE(original_appointment_date_time, requested_date_time),
-            requested_date_time = requested_date_time + INTERVAL 1 DAY,
+            requested_date_time = requested_date_time + INTERVAL 2 DAY,
             last_update_time = NOW()
       WHERE job_id = ?
         AND job_status = 9
