@@ -1913,11 +1913,19 @@ async function create(input, actor) {
     const originalApptTime = input.original_appointment_time      || requestedTime || null;
 
     // collected_by: per-job preference. Integer enum (1=Easyfixer,
-    // 2=Easyfix, 3=Client) — accept strings/numbers from FE and coerce.
+    // 2=Easyfix, 3=Client) — accept numbers or numeric strings from the FE.
+    //
+    // A NON-numeric string (e.g. a label like 'Easyfix' the FE forgot to code)
+    // must fall to NULL, NOT be written verbatim: the column is INT, so MySQL
+    // silently coerces 'Easyfix' → 0, and 0 = "Any" blocks the job from ever
+    // checking out. NULL is an honest "unset" and doesn't masquerade as a real
+    // choice. (The FE codes this correctly; this is defence against the next
+    // caller that doesn't — a real bug shipped exactly this way, see the Book
+    // New Call per-tab override in JobModal.)
     let collectedBy = null;
     if (input.collected_by != null && input.collected_by !== '') {
       const n = Number(input.collected_by);
-      collectedBy = Number.isFinite(n) ? n : String(input.collected_by);
+      collectedBy = Number.isFinite(n) ? n : null;
     }
 
     // Resolve the effective initial status once so the OTP gate below
