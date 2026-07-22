@@ -25,6 +25,18 @@ const sophy = require('./sophy.service');
 const MODEL = 'sophy'; // reported in the build summary; the real model is key-set
 const BATCH = 25; // service names classified per LLM call
 
+/*
+ * tbl_service_skill_mapping.source values — Title Case, acronym preserved
+ * ('AI', not 'Ai'). ONE owner so the write, the replace-DELETE, and the stats
+ * SUM can never drift to different casings. The CRM Skill Matrix page renders
+ * this string verbatim (no transform), so the stored casing IS the displayed
+ * casing. The column collation is utf8mb4_0900_ai_ci (case-INSENSITIVE), so
+ * these comparisons still match legacy lower-case rows until the one-shot
+ * normalisation migration (2026-07-19-title-case-service-skill-source.sql) runs
+ * — nothing breaks in the interim; the next build self-heals AI rows to 'AI'.
+ */
+const SOURCE = Object.freeze({ AI: 'AI', MANUAL: 'Manual' });
+
 // This feature's OWN Sophy key (own model/prompt/quota/cost line).
 function sophyKey() {
   return process.env.SOPHY_API_KEY_SKILL_MATRIX;
@@ -122,7 +134,7 @@ async function classifyBatch(categoryId, categoryName, skills, names) {
 /*
  * Build (or dry-run) the matrix. Scope is optional (categoryId). For each
  * in-scope category with active deep skills, classifies its distinct service
- * names in BATCHes, then wholesale-replaces the category's source='ai' rows
+ * names in BATCHes, then wholesale-replaces the category's source=AI rows
  * (manual overrides preserved via INSERT IGNORE). Returns a summary.
  */
 async function buildMatrix({ categoryId = null, dryRun = false } = {}) {
@@ -170,13 +182,13 @@ async function buildMatrix({ categoryId = null, dryRun = false } = {}) {
         const k = catgId + '|' + nm + '|' + f.deep_skill_id;
         if (seen.has(k)) continue;
         seen.add(k);
-        values.push([catgId, nm, f.deep_skill_id, f.confidence, 'ai', 1]);
+        values.push([catgId, nm, f.deep_skill_id, f.confidence, SOURCE.AI, 1]);
       }
       const conn = await pool.getConnection();
       try {
         await conn.beginTransaction();
         // Replace this category's AI mappings; INSERT IGNORE keeps manual overrides.
-        await conn.query('DELETE FROM tbl_service_skill_mapping WHERE service_catg_id = ? AND source = ?', [catgId, 'ai']);
+        await conn.query('DELETE FROM tbl_service_skill_mapping WHERE service_catg_id = ? AND source = ?', [catgId, SOURCE.AI]);
         if (values.length) {
           const [r] = await conn.query(
             'INSERT IGNORE INTO tbl_service_skill_mapping ' +
@@ -205,8 +217,9 @@ async function getStats() {
     `SELECT COUNT(*) AS total,
             COUNT(DISTINCT service_catg_id) AS categories,
             COUNT(DISTINCT deep_skill_id) AS skills,
-            SUM(source = 'manual') AS manual
+            SUM(source = ?) AS manual
        FROM tbl_service_skill_mapping WHERE status = 1`,
+    [SOURCE.MANUAL],
   );
   return {
     total: m.total || 0,
