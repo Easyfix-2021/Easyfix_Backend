@@ -1,0 +1,35 @@
+-- Force the OLD Flutter technician app to update → new RN app 3.0.0 (2026-07-15).
+--
+-- ⚠️  DO NOT RUN THIS AT DEPLOY / ON A SCHEDULE. It is a MANUAL cut-over action.
+--     Run it ONLY AFTER the new build (versionName 3.0.0 / versionCode 50) is
+--     LIVE on the Play Store. Running it earlier walls off every technician on
+--     the old app with no upgrade available to install.
+--
+-- WHAT IT DOES
+--   The old Flutter app (Technician_mobile_App_v2, same package com.dev.easyfix)
+--   fetches https://core.easyfix.in/test-api/api/version on its splash — served
+--   by the LEGACY ACD_APIs service from `app_version` row id=1
+--   (VersionServiceImpl.getVersion() = findById(1)). Its splash logic is:
+--       if (android_version != installedVersion && android_is_released)
+--            -> show an UNSKIPPABLE update dialog  (barrierDismissible:false,
+--               PopScope canPop:false — no back, no dismiss)
+--       else -> proceed to login
+--   It's a STRING inequality, not semver. Setting android_version to '3.0.0'
+--   (which no installed old build equals: live is 2.0.14, others 2.0.x) with
+--   android_is_released=1 makes EVERY old install hit the wall on next launch.
+--
+--   The NEW RN app does NOT read this table — it gates itself via
+--   /api/public/app-version + the `app.android.min.version.code` property. So a
+--   3.0.0 install sees '3.0.0' == its own version -> no dialog. This flip is
+--   therefore invisible to the new app and only bites the old one. iOS is left
+--   untouched (ios_is_released not flipped) — iOS force-update is a separate call.
+--
+-- SCOPE: `app_version` is a LEGACY table in the shared easyfix_core DB, owned by
+--   ACD_APIs (not this Node backend). Scoped to id=1 because that's the ONLY row
+--   the endpoint ever reads.
+--
+-- TO REVERT (if the cut-over is aborted): set android_version back to the old
+--   live value so the dialog stops firing:
+--   UPDATE app_version SET android_version = '2.0.14' WHERE id = 1;
+
+UPDATE app_version SET android_version = '3.0.0', android_is_released = 1 WHERE id = 1;
