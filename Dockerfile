@@ -14,8 +14,13 @@ FROM node:20-alpine
 
 # Smaller image + non-root user for runtime hardening. node:20-alpine
 # already has a `node` user (uid 1000) — we use it instead of root.
-RUN apk add --no-cache tini curl \
-    && mkdir -p /app /app/uploads \
+# mariadb-client supplies `mysqldump` + `mysql`, used ONLY by the QA database
+# refresh job (services/qa-db-refresh.service.js). It ships in the production
+# image too — one Dockerfile serves both — which is precisely why that job's
+# first guard is `ENVIRONMENT === 'qa'`: the binaries existing on a prod box must
+# never mean the job can run there.
+RUN apk add --no-cache tini curl mariadb-client \
+    && mkdir -p /app /app/uploads /app/dbdumps \
     && chown -R node:node /app
 
 WORKDIR /app

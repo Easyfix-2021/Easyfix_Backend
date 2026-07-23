@@ -55,7 +55,7 @@ services:
       # ⇒ OOM alerting is off (no-op).
       STT_OOM_WEBHOOK_KEY: ${STT_OOM_WEBHOOK_KEY:-}
       # Human label for the alert email (QA vs Production).
-      DEPLOY_ENV: "production"
+      ENVIRONMENT: "production"
     # No depends_on: stt — the backend connects to STT lazily per-call and the
     # mandatory-STT gate returns 409 when it's down, so the backend must NOT be
     # coupled to the stt service. Coupling here would also hard-fail a first-boot

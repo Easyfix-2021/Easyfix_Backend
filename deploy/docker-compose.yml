@@ -52,7 +52,7 @@ services:
       # ⇒ OOM alerting is off (no-op).
       STT_OOM_WEBHOOK_KEY: ${STT_OOM_WEBHOOK_KEY:-}
       # Human label for the alert email (QA vs Production).
-      DEPLOY_ENV: "qa"
+      ENVIRONMENT: "qa"
     # No depends_on: stt — the backend connects to STT lazily per-call and the
     # mandatory-STT gate returns 409 when it's down, so the backend must NOT be
     # coupled to the stt service. Coupling here would also hard-fail a first-boot
@@ -62,6 +62,15 @@ services:
       # host:5100 → container:5100. Tighten to 127.0.0.1:5100 if/when
       # nginx fronts it.
       - "5100:5100"
+    volumes:
+      # QA database refresh dumps (services/qa-db-refresh.service.js). On the
+      # HOST so they survive container recreation — every deploy replaces the
+      # container, and a dump inside the container layer would vanish with it,
+      # taking away the ability to hand-restore a bad refresh. Also lets ops
+      # inspect / gzip -t a dump without exec'ing into the container.
+      # QA ONLY: the prod compose file deliberately has no such mount, since the
+      # refresh job refuses to run outside ENVIRONMENT=qa anyway.
+      - /opt/easyfix/dbdumps:/app/dbdumps
     networks:
       - easyfix-net
     healthcheck:

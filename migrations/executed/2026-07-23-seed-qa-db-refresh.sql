@@ -1,0 +1,29 @@
+-- QA database refresh from production — alert recipients — 2026-07-23.
+--
+-- Supports services/qa-db-refresh.service.js, scheduled on the 1st + 16th at
+-- 00:30 IST (server/scheduler.js job id 'qa-db-refresh').
+--
+-- RUN THIS ON QA ONLY.
+--
+-- THERE IS NO ENABLE FLAG. Whether this job may run is decided by ENVIRONMENT,
+-- which the compose file sets per HOST (deploy/docker-compose.yml sets "qa"; the
+-- prod compose does not) — checked both when the cron registers and again inside
+-- the service before every run. A property would have made "may this box drop a
+-- database" a flippable value in a table every environment reads; the
+-- environment is a property of the MACHINE, which is the correct shape for that
+-- decision and cannot be switched on for production by editing a row.
+--
+-- Before the first run, on the QA host:
+--   1. PROD_SLAVE_DB_* point at the production READ REPLICA (never the primary)
+--      and the user is granted ONLY SELECT, SHOW VIEW, TRIGGER.
+--   2. TEST_MOBILE / TEST_EMAILS / TEST_FCM_TOKEN are set on QA. The job
+--      restores REAL customer contact details; those per-channel redirects are
+--      what stop a QA run from reaching a real customer.
+--   3. /opt/easyfix/dbdumps exists on the host with room for two dumps.
+--   4. Use Settings → Scheduled Jobs → "QA Database Refresh — Dry Run" first.
+--      It runs every check and the dump, then stops without touching QA.
+
+-- Who gets the success / failure email. The service falls back to
+-- harshit@channelplay.in when this is absent or empty, so alerting can never
+-- silently go nowhere.
+INSERT INTO easyfix_properties (property_key, property_value) VALUES ('qa.dbrefresh.alert.emails', 'harshit@channelplay.in') ON DUPLICATE KEY UPDATE property_value = property_value;
