@@ -19,6 +19,18 @@ FROM node:20-alpine
 # image too — one Dockerfile serves both — which is precisely why that job's
 # first guard is `ENVIRONMENT === 'qa'`: the binaries existing on a prod box must
 # never mean the job can run there.
+#
+# ⚠ These are MARIADB's tools, not Oracle MySQL's — Alpine has no Oracle client
+# in its repos, and `mysqldump` here is a symlink to `mariadb-dump`. Our SERVERS
+# are MySQL 8 (the schema uses utf8mb4_0900_ai_ci, a MySQL-8-only collation), so
+# client and server are different lineages. Two consequences:
+#   1. MySQL-only dump flags are rejected at ARG-PARSE time, before connecting —
+#      see the flag list in dumpFromReplica().
+#   2. MariaDB's client cannot do MySQL 8's default `caching_sha2_password`
+#      auth. The dump user must therefore be created with
+#      `IDENTIFIED WITH mysql_native_password`, or the connection fails.
+# If either becomes limiting, the fix is a Debian base + Oracle's MySQL APT repo
+# — a heavier change, deliberately deferred until something actually needs it.
 RUN apk add --no-cache tini curl mariadb-client \
     && mkdir -p /app /app/uploads /app/dbdumps \
     && chown -R node:node /app

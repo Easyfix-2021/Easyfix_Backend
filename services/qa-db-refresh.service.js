@@ -22,6 +22,8 @@
  *    instead of buffering a table in RAM on either end. We explicitly do NOT
  *    pass --master-data/--source-data (needs RELOAD and takes a brief GLOBAL
  *    lock), --lock-all-tables or --flush-logs, and we never STOP REPLICA.
+ *    They are also restricted to options BOTH the MySQL and MariaDB clients
+ *    accept — see dumpFromReplica(), the image ships MariaDB's dumper.
  *
  * 4. THE SNAPSHOT IS TIME-BOUNDED. --single-transaction holds one long
  *    REPEATABLE READ open, and InnoDB must retain undo history for its whole
@@ -48,6 +50,7 @@
  */
 
 const path = require('path');
+const os = require('os');
 const fs = require('fs/promises');
 const fssync = require('fs');
 const zlib = require('zlib');
@@ -165,12 +168,86 @@ async function freeBytes(dir) {
 }
 
 /*
- * Run a binary with a timeout, returning {code}. Uses execFile — NOT a shell
- * string — so no argument can ever be interpreted as shell syntax.
+ * LIVE RUN STATE — module-level, so progress survives the operator navigating
+ * away or closing the tab. The browser holds nothing; it polls this. Single
+ * container, and the process that runs the job is the one that serves the
+ * poll, so there is no cross-replica coordination to do.
+ */
+let _run = null;      // { phase, startedAt, dryRun, file, bytes, cancelled, child }
+
+const PHASES = {
+  idle: 'Idle',
+  checking: 'Running safety checks',
+  probing: 'Checking connectivity to the replica',
+  dumping: 'Downloading data from the production replica',
+  verifying: 'Verifying the copy is complete',
+  restoring: 'Restoring into QA',
+  finishing: 'Finishing up',
+};
+
+function setPhase(phase) {
+  if (!_run) return;
+  _run.phase = phase;
+  /*
+   * Mirror the phase onto the scheduler's generic progress channel so the
+   * Scheduled Jobs card can render it from the LIST endpoint it already polls —
+   * no dedicated progress endpoint, and no knowledge of this job inside the
+   * scheduler. Required lazily to avoid a require cycle (scheduler → this
+   * service → scheduler).
+   */
+  try {
+    const id = _run.dryRun ? 'qa-db-refresh-dry-run' : 'qa-db-refresh';
+    require('../server/scheduler').setJobProgress(id, PHASES[phase] || phase);
+  } catch { /* scheduler not loaded (unit tests) — progress is cosmetic */ }
+}
+
+/*
+ * Snapshot for the admin card. Returns a plain object (never the child handle).
+ * `bytes` is read from the file on disk rather than counted in memory, so it
+ * stays accurate even though the dump streams straight through gzip to disk.
+ */
+function getProgress() {
+  if (!_run) return { running: false, phase: 'idle', label: PHASES.idle };
+  let bytes = null;
+  try { bytes = fssync.statSync(_run.file).size; } catch { /* not created yet */ }
+  return {
+    running: true,
+    dryRun: _run.dryRun,
+    phase: _run.phase,
+    label: PHASES[_run.phase] || _run.phase,
+    startedAt: new Date(_run.startedAt).toISOString(),
+    elapsedMs: Date.now() - _run.startedAt,
+    bytes,
+    cancelled: _run.cancelled,
+    file: path.basename(_run.file),
+  };
+}
+
+/*
+ * Operator-requested stop. Kills the in-flight mysqldump/mysql child, which
+ * makes runTool reject and unwinds runQaDbRefresh through its normal failure
+ * path — so the maintenance gate is lowered and the partial dump is cleaned up
+ * by the same code that handles any other failure. We do NOT tear down state
+ * here; letting the existing error path do it keeps one exit route.
+ */
+function cancelRun() {
+  if (!_run) return { cancelled: false, reason: 'nothing is running' };
+  _run.cancelled = true;
+  try { _run.child?.kill('SIGKILL'); } catch { /* already gone */ }
+  logger.warn('QA refresh · CANCELLED by operator during phase=' + _run.phase);
+  return { cancelled: true, phase: _run.phase };
+}
+
+/*
+ * Run a binary with a timeout. Uses execFile — NOT a shell string — so no
+ * argument can ever be interpreted as shell syntax.
  *
  * The password goes in the child's ENV as MYSQL_PWD, never in argv: argv is
  * world-readable through /proc on the host, so `--password=` would leak the
  * production credential to anything that can run `ps`.
+ *
+ * The child handle is parked on `_run` so cancelRun() can kill it mid-stream —
+ * a multi-GB dump is otherwise uninterruptible for its whole duration.
  */
 function runTool(bin, args, { timeoutMs, password, stdout = null, stdin = null }) {
   return new Promise((resolve, reject) => {
@@ -180,9 +257,12 @@ function runTool(bin, args, { timeoutMs, password, stdout = null, stdin = null }
       maxBuffer: 10 * 1024 * 1024,
       env: { ...process.env, MYSQL_PWD: password || '' },
     }, (err) => {
+      if (_run && _run.child === child) _run.child = null;
+      if (_run?.cancelled) return reject(new Error('cancelled by operator'));
       if (err) return reject(err);
       return resolve({ ok: true });
     });
+    if (_run) _run.child = child;
     if (stdout) child.stdout.pipe(stdout);
     if (stdin) stdin.pipe(child.stdin);
     child.on('error', reject);
@@ -190,34 +270,140 @@ function runTool(bin, args, { timeoutMs, password, stdout = null, stdin = null }
 }
 
 /*
- * mysqldump the REPLICA to a gzipped file. Flag rationale is in the header; the
- * two easy-to-miss ones:
+ * CREDENTIALS VIA A TEMP DEFAULTS FILE — not MYSQL_PWD, not argv.
+ *
+ * We originally relied on the MYSQL_PWD env var. On QA the client still reported
+ * "insecure passwordless login" with the password correctly present in
+ * backend.env, i.e. MYSQL_PWD was not being honoured by MariaDB's client. Rather
+ * than chase which env var this particular build reads, use the mechanism BOTH
+ * MySQL and MariaDB document and have always supported.
+ *
+ * Still safe: the file is written 0600 into the container's own tmp and deleted
+ * in a finally, so the secret never reaches argv (world-readable via /proc, which
+ * is why `--password=` is never an option) and never lands in a log.
+ *
+ * The value is single-quoted with embedded quotes escaped — passwords here
+ * legitimately contain '@' and other punctuation that an unquoted my.cnf value
+ * would mangle.
+ */
+async function withDefaultsFile(password, fn) {
+  const file = path.join(
+    os.tmpdir(),
+    `easyfix-dbrefresh-${process.pid}-${Math.random().toString(36).slice(2)}.cnf`,
+  );
+  const safe = String(password ?? '').replace(/'/g, "''");
+  await fs.writeFile(file, `[client]\npassword='${safe}'\n`, { mode: 0o600 });
+  try {
+    return await fn(file);
+  } finally {
+    await fs.unlink(file).catch(() => { /* already gone */ });
+  }
+}
+
+/*
+ * One-line, secret-free statement of what the client will actually use. This is
+ * the diagnostic that was missing: the QA failure showed "passwordless login"
+ * while the operator could see the password in backend.env, and nothing in our
+ * logs said whether the process had in fact resolved one.
+ */
+function logCredentialState(label, conn) {
+  const pw = String(conn.password ?? '');
+  logger.info(
+    `QA refresh · ${label} · host=${conn.host}:${conn.port} db=${conn.database} user=${conn.user || '(unset)'}`
+    + ` · password=${pw ? `set (${pw.length} chars)` : 'NOT SET'}`,
+  );
+}
+
+/*
+ * PRE-FLIGHT REACHABILITY PROBE.
+ *
+ * Without this, an unreachable replica shows up as `mysqldump` sitting on a TCP
+ * connect until the OS gives up — 2m16s of no output, then a raw errno buried in
+ * stderr (observed on QA: errno 115, "Can't connect"). A plain socket attempt
+ * with a short timeout turns that into a few seconds and a sentence naming the
+ * likely cause, which for a private-subnet EC2 reaching another VPC host is
+ * almost always a security-group / routing gap rather than anything in the DB.
+ */
+function probeReachable(host, port, timeoutMs = 8000) {
+  return new Promise((resolve) => {
+    const net = require('net');
+    const sock = new net.Socket();
+    const done = (ok, why) => {
+      try { sock.destroy(); } catch { /* noop */ }
+      resolve({ ok, why });
+    };
+    sock.setTimeout(timeoutMs);
+    sock.once('connect', () => done(true, null));
+    sock.once('timeout', () => done(false, `no response within ${timeoutMs} ms`));
+    sock.once('error', (e) => done(false, e.code || e.message));
+    sock.connect(Number(port), host);
+  });
+}
+
+/*
+ * mysqldump the REPLICA to a gzipped file.
+ *
+ * ⚠ EVERY FLAG HERE MUST BE ACCEPTED BY *BOTH* CLIENTS. The image installs
+ * Alpine's `mariadb-client`, whose `mysqldump` is a symlink to MariaDB's
+ * `mariadb-dump` — there is no Oracle MySQL client in Alpine's repos. MariaDB's
+ * dumper rejects MySQL-only options outright ("unknown variable"), and it does so
+ * while PARSING ARGS, i.e. before connecting — so a single bad flag fails the
+ * whole run instantly with no dump at all. Two that bit us / would:
+ *   --set-gtid-purged=OFF  MySQL-only. REMOVED (2026-07-23) — MariaDB errors on
+ *     it. Nothing is lost: it suppresses a `SET @@GLOBAL.gtid_purged` line that
+ *     only Oracle's mysqldump ever emits, so with this client it was already
+ *     a no-op.
+ *   --column-statistics=0  MySQL-8-client-only. Deliberately never added.
+ *
+ * Flag rationale for the rest is in the header; the easy-to-miss one:
  *   --routines/--triggers/--events — the schema has stored programs (see the SP
  *     referenced at routes/admin/finance.js:1031). Omit these and the restore
  *     silently produces a database that is missing behaviour, not just rows.
- *   --set-gtid-purged=OFF — without it a GTID-enabled source emits SET
- *     @@GLOBAL.gtid_purged, which fails (or corrupts GTID state) on restore.
  */
 async function dumpFromReplica(file) {
   const s = src();
-  const args = [
-    `--host=${s.host}`, `--port=${s.port}`, `--user=${s.user}`,
-    '--single-transaction',   // MVCC snapshot — no table locks
-    '--skip-lock-tables',     // never take the default read locks
-    '--quick',                // stream rows; don't buffer a table in RAM
-    '--no-tablespaces',       // avoids needing the PROCESS privilege
-    '--set-gtid-purged=OFF',
-    '--hex-blob',
-    '--routines', '--triggers', '--events',
-    '--default-character-set=utf8mb4',
-    s.database,
-  ];
-  logger.info(`QA refresh · dumping ${s.host}:${s.port}/${s.database} (replica, read-only user) → ${path.basename(file)}`);
-  const gz = zlib.createGzip();
-  const out = fssync.createWriteStream(file);
-  const done = pipeline(gz, out);
-  await runTool('mysqldump', args, { timeoutMs: DUMP_TIMEOUT_MS, password: s.password, stdout: gz });
-  await done;
+  logCredentialState('dump source (production replica, read-only user)', s);
+  return withDefaultsFile(s.password, async (cnf) => {
+    const args = [
+      // MUST be first — both clients require --defaults-file to precede
+      // every other option, and silently ignore it otherwise.
+      `--defaults-file=${cnf}`,
+      `--host=${s.host}`, `--port=${s.port}`, `--user=${s.user}`,
+      '--single-transaction',   // MVCC snapshot — no table locks
+      '--skip-lock-tables',     // never take the default read locks
+      '--quick',                // stream rows; don't buffer a table in RAM
+      '--no-tablespaces',       // avoids needing the PROCESS privilege
+      '--hex-blob',
+      '--routines', '--triggers', '--events',
+      '--default-character-set=utf8mb4',
+      s.database,
+    ];
+    logger.info(`QA refresh · dumping ${s.host}:${s.port}/${s.database} → ${path.basename(file)}`);
+    const gz = zlib.createGzip();
+    const out = fssync.createWriteStream(file);
+    /*
+     * `.catch()` attached IMMEDIATELY, not at the await below. When the dump is
+     * cancelled or fails, runTool rejects first and we never reach `await done`
+     * — leaving this pipeline's rejection unhandled, which in Node is a process-
+     * level warning today and a hard crash under --unhandled-rejections=strict.
+     * Capturing it here means the failure path can still await it safely.
+     */
+    let pipeErr = null;
+    const done = pipeline(gz, out).catch((e) => { pipeErr = e; });
+    try {
+      await runTool('mysqldump', args, { timeoutMs: DUMP_TIMEOUT_MS, password: s.password, stdout: gz });
+      await done;
+      if (pipeErr) throw pipeErr;
+    } catch (e) {
+      // Tear the streams down so the file descriptor is released now rather than
+      // whenever GC gets to it — the caller deletes the partial file straight
+      // after, and on some filesystems an open handle keeps the space allocated.
+      gz.destroy();
+      out.destroy();
+      await done;
+      throw e;
+    }
+  });
 }
 
 /*
@@ -256,19 +442,50 @@ function readGzipTail(file, keepBytes = 4096) {
 // Drop + recreate the QA schema, then stream the dump into it.
 async function restoreIntoQa(file) {
   const d = dst();
-  const base = [`--host=${d.host}`, `--port=${d.port}`, `--user=${d.user}`, '--default-character-set=utf8mb4'];
+  logCredentialState('restore target (QA)', d);
+  return withDefaultsFile(d.password, async (cnf) => {
+    // --defaults-file first (see withDefaultsFile).
+    const base = [
+      `--defaults-file=${cnf}`,
+      `--host=${d.host}`, `--port=${d.port}`, `--user=${d.user}`,
+      '--default-character-set=utf8mb4',
+    ];
 
-  logger.warn(`QA refresh · DROPPING and recreating ${d.host}:${d.port}/${d.database}`);
-  await runTool('mysql', [...base, '--execute',
-    `DROP DATABASE IF EXISTS \`${d.database}\`; CREATE DATABASE \`${d.database}\` `
-    + 'CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;',
-  ], { timeoutMs: 60_000, password: d.password });
+    logger.warn(`QA refresh · DROPPING and recreating ${d.host}:${d.port}/${d.database}`);
+    await runTool('mysql', [...base, '--execute',
+      `DROP DATABASE IF EXISTS \`${d.database}\`; CREATE DATABASE \`${d.database}\` `
+      + 'CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;',
+    ], { timeoutMs: 60_000, password: d.password });
 
-  logger.info('QA refresh · restoring dump into QA…');
-  const gunzip = fssync.createReadStream(file).pipe(zlib.createGunzip());
-  await runTool('mysql', [...base, d.database], {
-    timeoutMs: RESTORE_TIMEOUT_MS, password: d.password, stdin: gunzip,
+    logger.info('QA refresh · restoring dump into QA…');
+    const gunzip = fssync.createReadStream(file).pipe(zlib.createGunzip());
+    await runTool('mysql', [...base, d.database], {
+      timeoutMs: RESTORE_TIMEOUT_MS, password: d.password, stdin: gunzip,
+    });
   });
+}
+
+/*
+ * Delete leftover *.part files.
+ *
+ * A dump is written to `<name>.sql.gz.part` and only renamed to `.sql.gz` once
+ * it has been verified complete. That makes orphan detection UNAMBIGUOUS: a
+ * `.part` file can only be the remains of a run that died before verification —
+ * a hard kill, an OOM, a deploy mid-dump. Age-based sweeping could not do this
+ * safely, because a legitimately RETAINED dump from a successful refresh also
+ * gets old, and deleting it would destroy the rollback copy.
+ */
+async function sweepPartials() {
+  try {
+    const names = (await fs.readdir(DUMP_DIR)).filter((n) => n.endsWith('.part'));
+    for (const n of names) {
+      await fs.unlink(path.join(DUMP_DIR, n)).catch(() => { /* raced */ });
+      logger.warn(`QA refresh · removed orphaned partial dump ${n} (previous run died before it completed)`);
+    }
+    return names.length;
+  } catch {
+    return 0;   // dir not created yet
+  }
 }
 
 // Keep the newest KEEP_DUMPS files so a bad refresh can be rolled back by hand.
@@ -377,11 +594,22 @@ async function notify({ ok, summary, error }) {
  * notices until testing gives a wrong answer.
  */
 async function runQaDbRefresh({ dryRun = false } = {}) {
+  // One at a time. Two concurrent runs would race on the same DUMP_DIR and, in
+  // the real mode, on the same schema — and the progress card can only describe
+  // one of them.
+  if (_run) {
+    return { ok: false, error: `a ${_run.dryRun ? 'dry run' : 'refresh'} is already in progress (${_run.phase})`, dryRun };
+  }
+
   const startedAt = Date.now();
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const file = path.join(DUMP_DIR, `qa-refresh-${stamp}.sql.gz`);
+  // Written here first; renamed to `file` only after verifyDump passes, so an
+  // unverified dump can never masquerade as a usable one. See sweepPartials().
+  const partFile = `${file}.part`;
   const summary = { dumpBytes: null, durationMs: null, pruned: 0, file, dryRun };
   let maintenanceRaised = false;
+  _run = { phase: 'checking', startedAt, dryRun, file: partFile, cancelled: false, child: null };
 
   try {
     /*
@@ -394,15 +622,36 @@ async function runQaDbRefresh({ dryRun = false } = {}) {
     assertSafeToRun();
 
     await fs.mkdir(DUMP_DIR, { recursive: true });
+    // Clear any .part left by a run that was hard-killed (deploy, OOM) — those
+    // are pure junk and could otherwise accumulate unbounded.
+    await sweepPartials();
     const free = await freeBytes(DUMP_DIR);
     if (free != null && free < MIN_FREE_BYTES) {
       throw new Error(`not enough disk on ${DUMP_DIR} — ${mb(free)} free, need at least ${mb(MIN_FREE_BYTES)}`);
     }
 
+    /*
+     * Fail fast on an unreachable replica. mysqldump would otherwise sit on a
+     * TCP connect for minutes and then report a bare errno — see probeReachable.
+     */
+    setPhase('probing');
+    const s = src();
+    const reach = await probeReachable(s.host, s.port);
+    if (!reach.ok) {
+      throw new Error(
+        `cannot reach the production replica at ${s.host}:${s.port} (${reach.why}). `
+        + 'The database is not the problem — nothing accepted the connection. Check that the QA host '
+        + "is allowed to reach it: the replica's security group / firewall must permit this EC2's IP "
+        + 'on the MySQL port, and a route must exist between the two networks.',
+      );
+    }
+
     // Dump + verify happen with QA still fully serving traffic: if either fails,
     // QA is untouched and nobody noticed.
-    await dumpFromReplica(file);
-    summary.dumpBytes = await verifyDump(file);
+    setPhase('dumping');
+    await dumpFromReplica(partFile);
+    setPhase('verifying');
+    summary.dumpBytes = await verifyDump(partFile);
     logger.info(`QA refresh · dump verified · ${mb(summary.dumpBytes)}`);
 
     /*
@@ -413,12 +662,25 @@ async function runQaDbRefresh({ dryRun = false } = {}) {
      * maintenance window was ever opened. This is the safe first run.
      */
     if (dryRun) {
-      summary.pruned = await pruneOldDumps();
+      setPhase('finishing');
+      /*
+       * DELETE the dump a dry run produced. A rehearsal proves the pipeline
+       * works; the bytes themselves are worthless — the real run takes its own
+       * fresh copy. Keeping them would silently consume GBs on a shared EC2
+       * every time someone presses the button, and the pruner only trims to
+       * KEEP_DUMPS, so a few dry runs could still hold multiple copies.
+       */
+      await fs.unlink(partFile).catch(() => { /* never existed / already gone */ });
+      summary.deletedDump = true;
       summary.durationMs = Date.now() - startedAt;
-      logger.ready(`QA refresh DRY RUN complete · ${mb(summary.dumpBytes)} · ${Math.round(summary.durationMs / 1000)}s · QA untouched`);
+      logger.ready(`QA refresh DRY RUN complete · ${mb(summary.dumpBytes)} verified then deleted · ${Math.round(summary.durationMs / 1000)}s · QA untouched`);
       await notify({ ok: true, summary });
       return { ok: true, ...summary };
     }
+
+    // Verified — promote to the real name. Only from here can the file be
+    // picked up as a rollback copy or by the retention pruner.
+    await fs.rename(partFile, file);
 
     // Only now does anything destructive happen.
     maintenance.begin('QA database refresh');
@@ -446,11 +708,28 @@ async function runQaDbRefresh({ dryRun = false } = {}) {
     // The gate must never be left up on a failure — that would strand QA in 503.
     if (maintenanceRaised) maintenance.end();
     summary.durationMs = Date.now() - startedAt;
-    const reason = err?.message || String(err);
-    logger.error(`QA refresh FAILED · ${reason}`);
+    const cancelled = _run?.cancelled === true;
+    const reason = cancelled ? 'stopped by operator' : (err?.message || String(err));
+    /*
+     * A failed or cancelled run leaves a PARTIAL .sql.gz behind. It can never be
+     * used (verifyDump would reject it) but it still occupies disk, so remove it
+     * here rather than waiting for the pruner — which trims by count and would
+     * happily keep a broken file while deleting a good one.
+     */
+    await fs.unlink(partFile).catch(() => { /* never created */ });
+    await fs.unlink(file).catch(() => { /* only exists post-rename */ });
+    if (cancelled) logger.warn('QA refresh stopped by operator · partial dump removed');
+    else logger.error(`QA refresh FAILED · ${reason}`);
     await notify({ ok: false, summary, error: reason });
-    return { ok: false, error: reason, ...summary };
+    return { ok: false, error: reason, cancelled, ...summary };
+  } finally {
+    // ALWAYS clear the live-run state, or the single-run guard above would
+    // permanently refuse every later run after one crash.
+    _run = null;
   }
 }
 
-module.exports = { runQaDbRefresh, assertSafeToRun };
+module.exports = {
+  runQaDbRefresh, assertSafeToRun,
+  getProgress, cancelRun,
+};

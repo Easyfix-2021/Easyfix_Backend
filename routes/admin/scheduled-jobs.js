@@ -139,4 +139,31 @@ router.post(
   },
 );
 
+/*
+ * ─── POST /:id/cancel — stop a running job ───────────────────────────
+ *
+ * Generic, because every job on this page can now report progress and the
+ * long-running ones need a way out. "Stop" has two honest meanings (see
+ * scheduler.requestCancel): jobs registered with a `canceller` are interrupted
+ * for real, others merely get a flag they may check at a checkpoint. The list
+ * endpoint publishes `cancellable` so the FE only offers Stop where it bites.
+ *
+ * NOTE there is deliberately NO separate progress endpoint. Live fields ride on
+ * GET /admin/scheduled-jobs — the request this page already makes — so watching
+ * a run costs no extra round-trip on a backend shared with the client portal and
+ * the mobile app.
+ */
+router.post('/:id/cancel', validate(idParam, 'params'), (req, res, next) => {
+  try {
+    const r = sj.cancelJob(req.params.id);
+    logger.warn('Scheduled job stop requested · id=' + req.params.id + ' · by user #' + req.user.user_id + ' · ' + JSON.stringify(r));
+    return modernOk(res, r, r.cancelled
+      ? (r.immediate ? 'Stopping now…' : 'Stop requested — the task will end at its next checkpoint.')
+      : 'That task is not running.');
+  } catch (e) {
+    if (e && e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
 module.exports = router;

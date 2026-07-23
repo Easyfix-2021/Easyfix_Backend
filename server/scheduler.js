@@ -65,12 +65,20 @@ function registerJob({
   // `testSourceLabel` + `testSourceHelp` drive the modal's optional
   // source-id input copy (e.g. "Easyfixer ID" / "Unconfirmed Job ID").
   tester, testSourceLabel, testSourceHelp,
+  // Optional real-interrupt hook — see requestCancel(). Its presence is what
+  // makes the FE show a Stop button for this job.
+  canceller,
 }) {
   const job = {
     id, name, description,
     cron: cronExpr,
     runner,
     tester: tester || null,
+    canceller: canceller || null,
+    running: false,
+    runningSince: null,
+    cancelRequested: false,
+    progressText: null,
     testSourceLabel: testSourceLabel || null,
     testSourceHelp: testSourceHelp || null,
     registered: false,
@@ -99,6 +107,16 @@ async function invokeJob(job, kind /* 'cron' | 'manual' */) {
   job.lastTriggerKind = kind;
   job.lastResult = null;
   job.lastError = null;
+  /*
+   * LIVE-RUN STATE. Set on the job entry (not a side map) so getJobs() can
+   * publish it with zero extra bookkeeping — the Scheduled Jobs page then shows
+   * progress from the list endpoint it ALREADY fetches, instead of needing a
+   * second polling endpoint per job.
+   */
+  job.running = true;
+  job.runningSince = t0;
+  job.cancelRequested = false;
+  job.progressText = null;
   try {
     const result = await job.runner();
     job.lastDurationMs = Date.now() - t0;
@@ -110,7 +128,52 @@ async function invokeJob(job, kind /* 'cron' | 'manual' */) {
     logger.error(`Cron job "${job.id}" (${kind}) failed: ${job.lastError}`);
     if (kind === 'manual') throw err;     // surface to HTTP caller
     return null;                          // cron path — swallow per the rule
+  } finally {
+    // ALWAYS clear, or a crashed run would leave the card showing a phantom
+    // "running" for the life of the process.
+    job.running = false;
+    job.runningSince = null;
+    job.progressText = null;
   }
+}
+
+/*
+ * Publish a human progress line for a running job. Long jobs call this as they
+ * move between phases; everything else simply shows elapsed time. Kept as a
+ * plain string so the scheduler needs no knowledge of any job's internals.
+ */
+function setJobProgress(id, text) {
+  const job = jobs.find((j) => j.id === id);
+  if (job) job.progressText = text || null;
+}
+
+/*
+ * Cooperative cancellation.
+ *
+ * A promise cannot be killed from outside, so "stop" means two different things
+ * and the UI must not pretend otherwise:
+ *   - a job registered with `canceller` can be interrupted for real (the QA
+ *     refresh kills its mysqldump child), and
+ *   - any job can READ isCancelRequested() at a checkpoint and bail cleanly.
+ * Jobs that do neither are published as cancellable:false so the FE never offers
+ * a Stop button that would do nothing.
+ */
+function requestCancel(id) {
+  const job = jobs.find((j) => j.id === id);
+  if (!job) { const e = new Error(`No scheduled job with id "${id}"`); e.status = 404; throw e; }
+  if (!job.running) return { cancelled: false, reason: 'not running' };
+  job.cancelRequested = true;
+  logger.warn(`Cron job "${job.id}" — stop requested by operator`);
+  if (typeof job.canceller === 'function') {
+    try { job.canceller(); } catch (e) { logger.warn(`canceller for "${job.id}" threw · ${e.message}`); }
+    return { cancelled: true, immediate: true };
+  }
+  return { cancelled: true, immediate: false };
+}
+
+function isCancelRequested(id) {
+  const job = jobs.find((j) => j.id === id);
+  return !!job?.cancelRequested;
 }
 
 function init() {
@@ -775,6 +838,8 @@ Here's how it works, step by step:
 
 Note: this task exists ONLY in the QA environment. On production it is never scheduled and refuses to run at all, so it can never touch production's own database. Trigger Now runs it on demand in QA (the same safety checks still apply).`,
     cron: '30 0 1,16 * *',
+    // Real interrupt: kills the in-flight mysqldump/mysql child.
+    canceller: () => qaDbRefresh.cancelRun(),
     runner: async () => {
       const r = await qaDbRefresh.runQaDbRefresh();
       logger.info('QA DB refresh · ' + JSON.stringify({ ok: r.ok, tables: r.tables, error: r.error }));
@@ -826,6 +891,7 @@ Use this to prove the real refresh will work before letting it run for the first
 
 This task has no schedule and can only be started with "Trigger Now".`,
     cron: 'manual only (no schedule)',
+    canceller: () => qaDbRefresh.cancelRun(),
     runner: async () => {
       const r = await qaDbRefresh.runQaDbRefresh({ dryRun: true });
       logger.info('QA DB refresh DRY RUN · ' + JSON.stringify({ ok: r.ok, dumpBytes: r.dumpBytes, error: r.error }));
@@ -903,6 +969,14 @@ function getJobs() {
     lastResult: j.lastResult,
     lastError: j.lastError,
     lastTriggerKind: j.lastTriggerKind,
+    // Live-run surface — drives the progress strip + Stop button. All in-memory,
+    // so the list endpoint stays a pure projection with no added query cost.
+    running: !!j.running,
+    runningSince: j.runningSince ? new Date(j.runningSince).toISOString() : null,
+    runningMs: j.runningSince ? Date.now() - j.runningSince : null,
+    progressText: j.progressText || null,
+    cancelRequested: !!j.cancelRequested,
+    cancellable: typeof j.canceller === 'function',
     // Test-send surface (2026-06-06). `testable` drives whether the FE
     // renders a Test button next to Trigger Now; the label/help strings
     // drive the modal's optional source-id input copy. The lastTest*
@@ -984,4 +1058,7 @@ async function testJob(id, opts) {
   }
 }
 
-module.exports = { init, stop, getJobs, triggerJob, testJob };
+module.exports = {
+  init, stop, getJobs, triggerJob, testJob,
+  setJobProgress, requestCancel, isCancelRequested,
+};

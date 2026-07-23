@@ -1432,19 +1432,30 @@ async function ensureAssignedFirst(candidatesList, assignedEfrId, job, scoredAll
  */
 let _skillMatrixReadable = undefined; // undefined = unprobed
 async function skillMatrixReadable() {
-  if (_skillMatrixReadable !== undefined) return _skillMatrixReadable;
+  // ONLY a positive result is memoised. Caching a failure would be a trap: one
+  // transient DB blip while probing (a restart mid-deploy, a dropped connection)
+  // would latch `false` for the entire process lifetime, silently blanking the
+  // Job Skill columns until someone happened to restart the backend — with a
+  // single warn line, logged once, as the only clue. The probe is a cheap
+  // SHOW COLUMNS on a path that only runs when the Schedule & Assign modal
+  // opens, so retrying until it succeeds costs effectively nothing.
+  if (_skillMatrixReadable === true) return true;
+  let ok = false;
   try {
     const [rows] = await pool.query(
       "SHOW COLUMNS FROM tbl_service_skill_mapping WHERE Field = 'service_catg_id'",
     );
-    _skillMatrixReadable = rows.length > 0;
-  } catch {
-    _skillMatrixReadable = false;
+    ok = rows.length > 0;
+  } catch (e) {
+    logger.warn('Job Skill Matrix probe failed (will retry on the next open) · ' + e.message);
+    return false;
   }
-  if (!_skillMatrixReadable) {
-    logger.warn('Job Skill Matrix unavailable (tbl_service_skill_mapping missing or not category-keyed) · Job Skill columns will render empty');
+  if (ok) {
+    _skillMatrixReadable = true;
+    return true;
   }
-  return _skillMatrixReadable;
+  logger.warn('Job Skill Matrix unavailable (tbl_service_skill_mapping missing or not category-keyed) · Job Skill columns will render empty');
+  return false;
 }
 
 /*
