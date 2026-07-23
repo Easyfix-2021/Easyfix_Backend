@@ -51,6 +51,11 @@ function list() {
   return scheduler.getJobs();
 }
 
+/* Pass-through to the scheduler's cooperative stop. */
+function cancelJob(id) {
+  return scheduler.requestCancel(id);
+}
+
 /* Pass-through to the scheduler's manual trigger. */
 async function trigger(id) {
   logger.info('Trigger scheduled job · id=' + id);
@@ -76,4 +81,5 @@ module.exports = {
   list,
   trigger,
   test,
+  cancelJob,
 };

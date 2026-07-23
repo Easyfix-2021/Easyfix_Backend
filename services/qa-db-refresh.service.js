@@ -186,7 +186,19 @@ const PHASES = {
 };
 
 function setPhase(phase) {
-  if (_run) _run.phase = phase;
+  if (!_run) return;
+  _run.phase = phase;
+  /*
+   * Mirror the phase onto the scheduler's generic progress channel so the
+   * Scheduled Jobs card can render it from the LIST endpoint it already polls —
+   * no dedicated progress endpoint, and no knowledge of this job inside the
+   * scheduler. Required lazily to avoid a require cycle (scheduler → this
+   * service → scheduler).
+   */
+  try {
+    const id = _run.dryRun ? 'qa-db-refresh-dry-run' : 'qa-db-refresh';
+    require('../server/scheduler').setJobProgress(id, PHASES[phase] || phase);
+  } catch { /* scheduler not loaded (unit tests) — progress is cosmetic */ }
 }
 
 /*

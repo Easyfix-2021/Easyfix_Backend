@@ -140,38 +140,30 @@ router.post(
 );
 
 /*
- * ─── QA database refresh — live progress + stop ──────────────────────
+ * ─── POST /:id/cancel — stop a running job ───────────────────────────
  *
- * The refresh and its dry run are the only jobs here that run for MINUTES
- * (a multi-GB dump over a private link), so "Last Run" telemetry alone leaves
- * the operator staring at a spinner with no idea whether anything is happening.
+ * Generic, because every job on this page can now report progress and the
+ * long-running ones need a way out. "Stop" has two honest meanings (see
+ * scheduler.requestCancel): jobs registered with a `canceller` are interrupted
+ * for real, others merely get a flag they may check at a checkpoint. The list
+ * endpoint publishes `cancellable` so the FE only offers Stop where it bites.
  *
- * Progress lives in the SERVICE, not the browser, which is what makes it
- * survive navigating away or closing the tab — the card just polls this. Added
- * here rather than in a new route file so both endpoints inherit the
- * `requireAllowedEmail` allowlist already applied to this router (see the header
- * note) instead of re-implementing that gate.
+ * NOTE there is deliberately NO separate progress endpoint. Live fields ride on
+ * GET /admin/scheduled-jobs — the request this page already makes — so watching
+ * a run costs no extra round-trip on a backend shared with the client portal and
+ * the mobile app.
  */
-const qaDbRefresh = require('../../services/qa-db-refresh.service');
-
-// GET /qa-db-refresh/progress → { running, phase, label, elapsedMs, bytes, … }
-// Safe to poll: pure in-memory state plus one stat() of the dump file.
-router.get('/qa-db-refresh/progress', (req, res) => {
-  return modernOk(res, qaDbRefresh.getProgress());
-});
-
-/*
- * POST /qa-db-refresh/cancel → stop the in-flight run.
- *
- * Kills the mysqldump/mysql child, which unwinds the job through its normal
- * failure path — so the maintenance gate is lowered and the partial dump is
- * deleted by the same code that handles any other failure. Idempotent: cancelling
- * when nothing is running is a 200 with cancelled:false, not an error.
- */
-router.post('/qa-db-refresh/cancel', (req, res) => {
-  const r = qaDbRefresh.cancelRun();
-  logger.warn('QA refresh cancel requested by user #' + req.user.user_id + ' · ' + JSON.stringify(r));
-  return modernOk(res, r, r.cancelled ? 'Stopping…' : 'Nothing is running.');
+router.post('/:id/cancel', validate(idParam, 'params'), (req, res, next) => {
+  try {
+    const r = sj.cancelJob(req.params.id);
+    logger.warn('Scheduled job stop requested · id=' + req.params.id + ' · by user #' + req.user.user_id + ' · ' + JSON.stringify(r));
+    return modernOk(res, r, r.cancelled
+      ? (r.immediate ? 'Stopping now…' : 'Stop requested — the task will end at its next checkpoint.')
+      : 'That task is not running.');
+  } catch (e) {
+    if (e && e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
 });
 
 module.exports = router;
