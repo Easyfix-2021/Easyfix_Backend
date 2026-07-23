@@ -119,6 +119,24 @@ router.get('/lookup/service-categories', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// Action reasons for the app/client user (action_taken_reason, user_type 4),
+// selected by action_type — e.g. escalation = 23. Powers the Escalate sheet's
+// reason picker. Returns [{ id, label }].
+router.get('/lookup/reasons', async (req, res, next) => {
+  try {
+    const actionType = Number(req.query.actionType);
+    if (!actionType) return modernOk(res, { items: [] });
+    const [rows] = await pool.query(
+      `SELECT id, action_desc AS label
+         FROM action_taken_reason
+        WHERE action_type = ? AND user_type = 4 AND status = 1 AND is_new = 1
+        ORDER BY action_desc ASC`,
+      [actionType]);
+    logger.info('Lookup reasons · actionType=' + actionType + ' · count=' + rows.length);
+    modernOk(res, { items: rows });
+  } catch (e) { next(e); }
+});
+
 router.get('/dashboard', async (req, res, next) => {
   try {
     // scope=today: each active bucket is scoped to TODAY by its own date column —
@@ -489,6 +507,25 @@ router.post('/jobs', async (req, res, next) => {
     logger.info('SPOC create job · clientId=' + req.spoc.client_id + ' type=' + (req.body?.job_type || '-'));
     const created = await jobService.create({ ...req.body, fk_client_id: req.spoc.client_id }, { user_id: null });
     logger.info('Job created · id=' + created.job_id);
+
+    // In-app "Booking confirmed" notification for the client inbox. Matched by
+    // the client's jobs in GET /notices, so it surfaces for whoever booked and
+    // the client's other SPOCs. Fire-and-forget — a logging hiccup must never
+    // fail the booking itself.
+    setImmediate(async () => {
+      try {
+        const inbox = require('../../services/notification-inbox.service');
+        await inbox.create({
+          userId: req.clientUser?.userId || created.job_client_owner || 0,
+          jobId: created.job_id,
+          title: 'Booking confirmed',
+          desc: `Your service request has been booked. Job #${created.job_id}.`,
+        });
+      } catch (err) {
+        logger.warn({ jobId: created.job_id, err: err.message }, 'booking notification insert failed');
+      }
+    });
+
     res.status(201);
     modernOk(res, created, 'job created');
   } catch (e) {
@@ -763,16 +800,19 @@ router.get('/support-contacts', async (req, res, next) => {
 //   WHERE user_id = ? GROUP BY job_id ORDER BY createdAt DESC.
 router.get('/notices', async (req, res, next) => {
   try {
-    const myUserId = req.clientUser?.userId ?? null;
-    if (!myUserId) { logger.info('Notices · no client user on token → empty'); return modernOk(res, { items: [] }); }
+    // Dashboard notifications for the logged-in CLIENT — matched by the client's
+    // jobs (dashboard_notification_log.job_id → tbl_job.fk_client_id), not by an
+    // individual user_id (those rows are keyed to whichever internal/SPOC user
+    // the event fired for, so a user-id filter misses the client's own events).
     const [rows] = await pool.query(
-      `SELECT id, n_title, n_desc, status, job_id, createdAt
-         FROM dashboard_notification_log
-        WHERE user_id = ?
-        GROUP BY job_id
-        ORDER BY createdAt DESC
+      `SELECT n.id, n.n_title, n.n_desc, n.status, n.job_id, n.createdAt
+         FROM dashboard_notification_log n
+         JOIN tbl_job j ON j.job_id = n.job_id
+        WHERE j.fk_client_id = ?
+        GROUP BY n.job_id
+        ORDER BY n.createdAt DESC
         LIMIT 100`,
-      [myUserId]);
+      [req.spoc.client_id]);
     const items = rows.map((r) => ({
       notice_id: r.id,
       title: r.n_title || 'Notification',
@@ -781,21 +821,63 @@ router.get('/notices', async (req, res, next) => {
       created_at: r.createdAt,
       job_id: r.job_id || null,
     }));
-    logger.info('Notices · clientUser=' + myUserId + ' · count=' + items.length);
+    logger.info('Notices · clientId=' + req.spoc.client_id + ' · count=' + items.length);
     modernOk(res, { items });
   } catch (e) { next(e); }
 });
 
-// Mark notifications read — all for the user, or a single id.
+// Mark notifications read — a single id, or all of the client's notifications.
+// Scoped to the client's jobs (same matching as GET /notices).
 router.patch('/notices/read', async (req, res, next) => {
   try {
-    const myUserId = req.clientUser?.userId ?? null;
-    if (!myUserId) return modernOk(res, { updated: 0 });
     const id = Number(req.body && req.body.notice_id) || null;
     const [r] = id
-      ? await pool.query("UPDATE dashboard_notification_log SET status='read' WHERE id = ? AND user_id = ?", [id, myUserId])
-      : await pool.query("UPDATE dashboard_notification_log SET status='read' WHERE user_id = ? AND status <> 'read'", [myUserId]);
+      ? await pool.query(
+          `UPDATE dashboard_notification_log n JOIN tbl_job j ON j.job_id = n.job_id
+              SET n.status = 'read' WHERE n.id = ? AND j.fk_client_id = ?`,
+          [id, req.spoc.client_id])
+      : await pool.query(
+          `UPDATE dashboard_notification_log n JOIN tbl_job j ON j.job_id = n.job_id
+              SET n.status = 'read' WHERE j.fk_client_id = ? AND n.status <> 'read'`,
+          [req.spoc.client_id]);
     modernOk(res, { updated: r.affectedRows || 0 });
+  } catch (e) { next(e); }
+});
+
+// ─── Notice board ────────────────────────────────────────────────────
+// Published announcements targeted at the 'client' surface (managed from the
+// CRM Notice Board). Pinned first, then newest. Read state keyed to the SPOC.
+router.get('/notice-board', async (req, res, next) => {
+  try {
+    const notice = require('../../services/notice.service');
+    const items = await notice.listActiveForSurface({
+      surface: 'client', readerType: 'client', readerId: req.spoc.id, limit: 20,
+    });
+    logger.info('Notice board · clientId=' + req.spoc.client_id + ' · count=' + items.length);
+    modernOk(res, { items });
+  } catch (e) { next(e); }
+});
+
+router.patch('/notice-board/:noticeId/read', async (req, res, next) => {
+  try {
+    const notice = require('../../services/notice.service');
+    await notice.markRead({ noticeId: Number(req.params.noticeId), surface: 'client', readerType: 'client', readerId: req.spoc.id });
+    modernOk(res, { ok: true });
+  } catch (e) { next(e); }
+});
+
+// ─── Device id ───────────────────────────────────────────────────────
+// On login the client app reports a stable per-install device id; store it on
+// the SPOC's tbl_client_contacts row so we know which device is signed in.
+router.post('/device-token', async (req, res, next) => {
+  try {
+    const deviceId = req.body && (req.body.device_id || req.body.token);
+    if (!deviceId) return modernError(res, 400, 'device_id is required');
+    await pool.query(
+      'UPDATE tbl_client_contacts SET device_id = ? WHERE id = ?',
+      [String(deviceId), req.spoc.id]);
+    logger.info('Device id recorded · spocId=' + req.spoc.id);
+    modernOk(res, { ok: true });
   } catch (e) { next(e); }
 });
 
