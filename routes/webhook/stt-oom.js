@@ -72,7 +72,7 @@ router.post('/', async (req, res) => {
     return modernOk(res, { received: true, alerted: false, reason: 'no-recipients' });
   }
 
-  const envLabel = process.env.DEPLOY_ENV || process.env.NODE_ENV || 'unknown';
+  const envLabel = process.env.ENVIRONMENT || process.env.NODE_ENV || 'unknown';
   const when = istNow();
   const cap = process.env.STT_MEM_LIMIT || 'see STT_MEM_* deploy vars';
   logger.error(`STT container OOM-killed · container=${container} · env=${envLabel} · exit=${exitCode} — alerting ${recipients.length} recipient(s)`);

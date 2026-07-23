@@ -589,22 +589,58 @@ router.post(
         throw Object.assign(new Error('Please select a valid reschedule reason.'), { status: 400 });
       }
       logger.info('Log customer reschedule request · jobId=' + jobId + ' · reason=' + req.body.reason);
-      // Default the preferred date to the job's CURRENT appointment
-      // (tbl_job.requested_date_time) when the customer didn't pick one, instead
-      // of storing NULL — so Ops always has a concrete date to act on and the
-      // list/detail surfaces never show a bare "Reschedule Requested" with no
-      // date. db.js runs dateStrings:true + timezone '+05:30', so the column
-      // comes back as a ready 'YYYY-MM-DD HH:MM:SS' IST wall-clock string — a
-      // valid DATETIME literal used verbatim (do NOT re-parse through
-      // toMysqlDatetime, which is only for normalising the raw request body).
+      // The job's CURRENT appointment — needed twice below: as the floor for how
+      // far back a customer may move it, and as the fallback when they pick
+      // nothing. db.js runs dateStrings:true + timezone '+05:30', so this comes
+      // back as a ready 'YYYY-MM-DD HH:MM:SS' IST wall-clock string.
+      const [[jobRow]] = await pool.query(
+        'SELECT requested_date_time FROM tbl_job WHERE job_id = ? LIMIT 1',
+        [jobId],
+      );
       let preferred = toMysqlDatetime(req.body.preferred_datetime);
-      if (!preferred) {
-        const [[jobRow]] = await pool.query(
-          'SELECT requested_date_time FROM tbl_job WHERE job_id = ? LIMIT 1',
-          [jobId],
-        );
-        preferred = jobRow ? jobRow.requested_date_time : null;
+      /*
+       * A CUSTOMER may only push an appointment OUT, never pull it earlier.
+       *
+       * The magic-link form already blocks earlier dates in its calendar, but a
+       * public token endpoint must not trust its own UI — anyone holding a link
+       * can POST whatever they like. The floor is the later of:
+       *   - the current appointment's DAY (so it can't be pulled forward), and
+       *   - TODAY (so an already-past appointment can't be "moved" backwards).
+       * Compared at DATE granularity, matching the calendar's day-level rule and
+       * leaving the customer free to pick any slot on the floor day itself.
+       *
+       * OPS ARE UNAFFECTED: they reschedule through the authenticated CRM
+       * routes, where back-dating is a legitimate correction. This is the
+       * customer-facing path only.
+       *
+       * IST day computed from the fixed +5:30 offset — NOT CURDATE(), whose
+       * calendar day follows the DB server's timezone, not IST.
+       */
+      if (preferred) {
+        const istToday = new Date(Date.now() + (5 * 60 + 30) * 60 * 1000)
+          .toISOString().slice(0, 10);
+        const apptDay = String(jobRow?.requested_date_time || '').slice(0, 10);
+        const floorDay = apptDay && apptDay > istToday ? apptDay : istToday;
+        const pickedDay = String(preferred).slice(0, 10);
+        if (pickedDay < floorDay) {
+          logger.warn(
+            'Customer reschedule rejected, earlier than allowed · jobId=' + jobId
+            + ' · picked=' + pickedDay + ' · floor=' + floorDay,
+          );
+          throw Object.assign(
+            new Error(`Please choose a date on or after ${floorDay}. An appointment can only be moved later.`),
+            { status: 400 },
+          );
+        }
       }
+      /*
+       * Default to the job's CURRENT appointment when the customer didn't pick
+       * one, instead of storing NULL — so Ops always has a concrete date to act
+       * on and the list/detail surfaces never show a bare "Reschedule Requested"
+       * with no date. Used verbatim as a DATETIME literal (do NOT re-parse
+       * through toMysqlDatetime, which only normalises the raw request body).
+       */
+      if (!preferred) preferred = jobRow ? jobRow.requested_date_time : null;
       const [ins] = await pool.query(
         `INSERT INTO tbl_job_customer_request
            (job_id, request_type, reason, remarks, preferred_datetime)

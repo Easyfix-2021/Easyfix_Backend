@@ -38,6 +38,14 @@ app.use(cookieParser());
 // directly.) Verified: context survives the parser + awaited DB calls.
 app.use((req, res, next) => requestContext.run(req, next));
 
+// Maintenance gate — 503s API traffic while an in-process destructive operation
+// runs (today: the QA database refresh, which drops the schema this process is
+// connected to). Mounted AFTER request-context so the refusals still log with
+// their request identity, and BEFORE the routes so no handler can reach a
+// half-restored database. Inert unless a job raises it; /api/health stays exempt
+// so Docker's HEALTHCHECK can't restart the container mid-restore.
+app.use(require('./middleware/maintenance').maintenance);
+
 // Phase 14 — per-tier rate limits. Integration + mobile + client get their own
 // bucket; admin is uncapped to avoid self-DoSing a data-entry spree.
 app.use('/api/integration', rateLimit({ windowMs: 60_000, max: 1200, key: (req) =>
@@ -145,6 +153,30 @@ async function start() {
   const server = app.listen(PORT, () => {
     const env = process.env.NODE_ENV || 'development';
     logger.ready(`Server is ready — listening on http://localhost:${PORT} (${env} mode)`);
+    /*
+     * ENVIRONMENT is not a label — it GATES destructive, environment-specific
+     * behaviour. The QA database refresh registers its cron and runs only when
+     * this is exactly 'qa' (server/scheduler.js + qa-db-refresh.service.js), and
+     * it names the environment in ops alert emails.
+     *
+     * A wrong or missing value is otherwise SILENT: the job simply never
+     * registers, no error is raised, and the first symptom is someone noticing
+     * weeks later that QA data is stale. So state the resolved value plainly at
+     * boot, and warn when it's absent. Distinct from NODE_ENV above, which is
+     * about build/runtime mode, not about which deployment this process IS.
+     */
+    const deployEnv = String(process.env.ENVIRONMENT || '').trim();
+    if (!deployEnv) {
+      logger.warn(
+        'ENVIRONMENT is NOT set — environment-gated jobs (e.g. the QA database refresh) will '
+        + 'refuse to run and ops alerts will be labelled "unknown". Set it in the compose '
+        + 'environment: block ("qa" / "production"), or in .env for local dev.',
+      );
+    } else if (deployEnv.toLowerCase() === 'qa') {
+      logger.info(`ENVIRONMENT = "${deployEnv}" — QA-only jobs are ARMED on this host (incl. the database refresh, which drops and reloads ${process.env.DB_NAME || 'the DB'}).`);
+    } else {
+      logger.info(`ENVIRONMENT = "${deployEnv}" — QA-only jobs are disabled on this host.`);
+    }
     if (process.env.TEST_EMAILS || process.env.TEST_MOBILE) {
       logger.test(`TEST MODE active — outgoing emails redirect to "${process.env.TEST_EMAILS || '—'}", SMS/WhatsApp to "${process.env.TEST_MOBILE || '—'}".`);
     }

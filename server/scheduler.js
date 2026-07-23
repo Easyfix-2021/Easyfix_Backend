@@ -754,6 +754,92 @@ Note: only runs automatically when easyfix_properties "transcribe.analytics.enab
     logger.info('Call-metrics cron registered (transcribe.analytics.enabled=true, every 10 min IST).');
   }
 
+  // ─── QA database refresh from production — 1st + 16th, 00:30 IST ────
+  // Explicit OPT-IN gate (=== 'true'), unlike the default-on per-cron flags:
+  // this job DROPS a database, so a missing property must never be able to
+  // schedule it. Guards inside the service refuse to run outside ENVIRONMENT=qa.
+  const qaDbRefresh = require('../services/qa-db-refresh.service');
+  const qaDbRefreshJob = registerJob({
+    id: 'qa-db-refresh',
+    name: 'QA Database Refresh from Production',
+    description:
+`What this task does: QA's database slowly drifts away from production, so bugs that only show up on real data can't be reproduced and testing gives false confidence. Twice a month this task reloads QA with a fresh copy of production data.
+
+Here's how it works, step by step:
+  1. At 12:30 AM IST on the 1st and the 16th of each month, the task wakes up.
+  2. It runs a series of safety checks BEFORE touching anything. It refuses to run unless this is the QA environment, and unless the restore target is the QA database and is not the same server it is copying from. Either of those failing stops the task immediately and emails the failure. (Keeping QA from messaging real customers is handled separately, by the test-number redirects each message channel already applies.)
+  3. It takes a copy of the database from production's REPLICA — a stand-by copy of production — never from the live production database itself. It connects using a read-only login that is not permitted to change anything, so production cannot be affected even in principle. The copy is taken in a way that places no locks on the replica.
+  4. It checks the copy is complete. A dropped network connection can produce a file that looks fine but stops halfway — restoring that would leave QA quietly missing data. The task confirms the copy ran to the very end before going any further.
+  5. Only then does it pause QA: the app starts replying "briefly unavailable" to requests, the QA database is replaced with the fresh copy, and the app resumes. This pause is why the task runs at 12:30 AM.
+  6. It confirms QA came back up with data, deletes older copies to save disk, and emails the result — success or failure — to the recipients in "qa.dbrefresh.alert.emails".
+
+Note: this task exists ONLY in the QA environment. On production it is never scheduled and refuses to run at all, so it can never touch production's own database. Trigger Now runs it on demand in QA (the same safety checks still apply).`,
+    cron: '30 0 1,16 * *',
+    runner: async () => {
+      const r = await qaDbRefresh.runQaDbRefresh();
+      logger.info('QA DB refresh · ' + JSON.stringify({ ok: r.ok, tables: r.tables, error: r.error }));
+      return r;
+    },
+  });
+  /*
+   * ENVIRONMENT is the only gate. There is deliberately no property flag: a
+   * property is a value someone can flip, and the one thing that must never be
+   * flippable is "may this job drop a database on this box". ENVIRONMENT is set
+   * per-host by the compose file (deploy/docker-compose.yml sets "qa"; the prod
+   * compose does not), so the answer is a property OF THE MACHINE, not of the
+   * data — which is exactly the right shape for this decision.
+   *
+   * Defence in depth: the service re-checks ENVIRONMENT in assertSafeToRun()
+   * before every run, so even Trigger Now on a prod box refuses.
+   */
+  const isQaEnv = String(process.env.ENVIRONMENT || '').toLowerCase() === 'qa';
+  if (cronDisabled) {
+    qaDbRefreshJob.skipReason = 'CRON_DISABLED=true';
+  } else if (!isQaEnv) {
+    qaDbRefreshJob.skipReason = `ENVIRONMENT is "${process.env.ENVIRONMENT || '(unset)'}", not "qa" — this job only ever runs in QA`;
+    logger.info('QA DB refresh cron NOT registered — this is not the QA environment (ENVIRONMENT != qa).');
+  } else {
+    qaDbRefreshJob.task = cron.schedule(
+      qaDbRefreshJob.cron,
+      () => invokeJob(qaDbRefreshJob, 'cron'),
+      { timezone: TZ },
+    );
+    qaDbRefreshJob.registered = true;
+    logger.info('QA DB refresh cron registered (ENVIRONMENT=qa, 1st + 16th 00:30 IST).');
+  }
+
+  /*
+   * ─── QA DB refresh — DRY RUN (manual only, never scheduled) ─────────
+   * Registered as its OWN job rather than an option on the one above,
+   * because `triggerJob(id)` takes no arguments — threading options through
+   * invokeJob() would change shared plumbing every other job depends on. As a
+   * separate entry it gets its own Trigger Now button, its own telemetry, and
+   * — having no cron task — it can never fire on its own.
+   */
+  const qaDbRefreshDryJob = registerJob({
+    id: 'qa-db-refresh-dry-run',
+    name: 'QA Database Refresh — Dry Run (safe, no restore)',
+    description:
+`What this task does: exactly what the QA Database Refresh does, but it STOPS before touching QA. It runs every safety check, connects to the production replica with the read-only login, downloads the copy, and verifies the copy is complete — then stops and emails you the result. QA is left exactly as it was.
+
+Use this to prove the real refresh will work before letting it run for the first time, or after changing any of the database settings. If the dry run passes, the only step left untested is the restore itself.
+
+This task has no schedule and can only be started with "Trigger Now".`,
+    cron: 'manual only (no schedule)',
+    runner: async () => {
+      const r = await qaDbRefresh.runQaDbRefresh({ dryRun: true });
+      logger.info('QA DB refresh DRY RUN · ' + JSON.stringify({ ok: r.ok, dumpBytes: r.dumpBytes, error: r.error }));
+      return r;
+    },
+  });
+  // Never scheduled by design — `registered:false` + this reason is what the
+  // admin page renders, and Trigger Now stays available regardless. Outside QA
+  // it stays visible but refuses on invocation (assertSafeToRun), so say so
+  // here rather than letting an operator discover it by pressing the button.
+  qaDbRefreshDryJob.skipReason = isQaEnv
+    ? 'manual only — this job has no schedule; use Trigger Now'
+    : `manual only — and ENVIRONMENT is "${process.env.ENVIRONMENT || '(unset)'}", so it will refuse to run outside QA`;
+
   // ─── Deep Skill Image-Gen orphan reset — every 5 minutes ─────────────
   // Standalone cron (NOT registered via registerJob()). Deliberately
   // absent from the Scheduled Jobs admin page — this is infrastructure

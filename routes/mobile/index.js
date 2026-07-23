@@ -424,6 +424,14 @@ router.post('/jobs/:id/customer-call/preview', async (req, res, next) => {
 });
 
 // Place the masked bridge call (tech's phone rings first, then the customer).
+//
+// ALWAYS a PSTN bridge — deliberately independent of `voice.call.mode`. That
+// property is a CRM-ONLY feature gate (read solely in routes/admin/calls.js to
+// 409 the web-calling endpoints and pick the CRM panel); it is currently 'web'
+// because the CRM needs WebRTC. plivo.service.clickToCall() never reads it — it
+// only consults plivo.calling.enabled — so a 'web' setting has no effect here.
+// This MUST stay true: the technician has no browser leg, so if callMode() ever
+// gets wired into clickToCall, this route must pin mode='mobile' explicitly.
 router.post('/jobs/:id/customer-call', async (req, res, next) => {
   try {
     const jobId = Number(req.params.id);
