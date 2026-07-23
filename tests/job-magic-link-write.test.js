@@ -134,39 +134,98 @@ test('writeCustomerOrderDetails writes tbl_job directly, no status transition', 
   assert.match(write.sql, /customer_submitted_at/);
 });
 
-// ─── autoRescheduleOnOpenIfLate (after-3pm link-OPEN shift) ──────────────
-// Trigger is the OPEN time (current IST hour), injected via nowMs. Before 3pm →
-// no DB round-trip. installFakePool monkeypatches the shared db.pool so the
-// internal addComment routes through the fake too — no real DB.
+// ─── autoRescheduleOnOpenIfLate (link-OPEN shift) ────────────────────────
+// The trigger is the APPOINTMENT DATE evaluated at open time: shift only when
+// DATE(requested_date_time) <= today (IST), and always land on TOMORROW. The
+// open HOUR is no longer a trigger (it used to be ">= 3pm", which also shifted
+// jobs booked for next week) — it survives only as audit text.
+// installFakePool monkeypatches the shared db.pool so the internal addComment
+// routes through the fake too — no real DB.
 
-test('autoRescheduleOnOpenIfLate — opened before 3pm IST is a no-op (no query at all)', async () => {
-  const inst = installFakePool([]);
+// The kill switch reads easyfix_properties through the cache; stub it so these
+// tests never depend on DB state. `undefined` = property absent = default ON.
+const properties = require('../services/properties.service');
+function withAutoReschedule(value, fn) {
+  const original = properties.getProperty;
+  properties.getProperty = (k) => (k === 'job.auto_reschedule.enabled' ? value : original(k));
+  return (async () => { try { return await fn(); } finally { properties.getProperty = original; } })();
+}
+
+test('autoRescheduleOnOpenIfLate — disabled by property never writes, and reports a DUE appointment', async () => {
+  // The disabled path deliberately runs ONE read-only lookup so an already-due
+  // appointment is still reported — otherwise the switch being off is invisible
+  // in the funnel. What it must never do is WRITE.
+  const inst = installFakePool([
+    [/SELECT requested_date_time AS req FROM tbl_job/, [{ req: '2026-01-01 09:00:00' }]],
+  ]);
   try {
-    const r = await magic.autoRescheduleOnOpenIfLate(42, db.pool, { nowMs: nowMsForIstHour(10) });
-    assert.equal(r.shifted, false);
-    assert.equal(inst.calls.length, 0, 'no query fired when opened before 3pm');
+    await withAutoReschedule('false', async () => {
+      const r = await magic.autoRescheduleOnOpenIfLate(42, db.pool, { nowMs: nowMsForIstHour(16) });
+      assert.equal(r.shifted, false);
+      assert.equal(r.reason, 'disabled');
+    });
+    assert.ok(
+      !inst.calls.some((c) => /UPDATE tbl_job/.test(c.sql)),
+      'the kill switch must prevent every write',
+    );
+    assert.ok(
+      !inst.calls.some((c) => /INSERT INTO scheduling_history/.test(c.sql)),
+      'no audit row when nothing was rescheduled',
+    );
+    const probe = inst.calls.find((c) => /SELECT requested_date_time AS req FROM tbl_job/.test(c.sql));
+    assert.ok(probe, 'the due-appointment probe still runs so the skip can be logged');
+    assert.match(probe.sql, /DATE\(requested_date_time\) <= \?/, 'probe asks the same due question the trigger does');
   } finally { inst.restore(); }
 });
 
-test('autoRescheduleOnOpenIfLate — opened after 3pm shifts +1 day (guarded) and audits with non-NULL easyfixer_id', async () => {
+test('autoRescheduleOnOpenIfLate — absent property means ENABLED (default-on, matches the per-cron flags)', async () => {
+  const inst = installFakePool([
+    [/UPDATE tbl_job\s+SET\s+original_appointment_date_time/, { affectedRows: 0 }],
+  ]);
+  try {
+    await withAutoReschedule(undefined, async () => {
+      await magic.autoRescheduleOnOpenIfLate(42, db.pool, { nowMs: nowMsForIstHour(16) });
+    });
+    assert.ok(inst.calls.some((c) => /UPDATE tbl_job/.test(c.sql)), 'an absent flag must NOT disable the feature');
+  } finally { inst.restore(); }
+});
+
+test('autoRescheduleOnOpenIfLate — shifts a due appointment to TOMORROW and audits with non-NULL easyfixer_id', async () => {
   const inst = installFakePool([
     [/UPDATE tbl_job\s+SET\s+original_appointment_date_time/, { affectedRows: 1 }],
     [/SELECT requested_date_time AS newReq/, [{ newReq: '2026-01-02 09:00:00', fk_easyfixter_id: 55 }]],
   ]);
   try {
-    const r = await magic.autoRescheduleOnOpenIfLate(42, db.pool, { nowMs: nowMsForIstHour(16) });
-    assert.equal(r.shifted, true);
+    await withAutoReschedule(undefined, async () => {
+      const r = await magic.autoRescheduleOnOpenIfLate(42, db.pool, { nowMs: nowMsForIstHour(16) });
+      assert.equal(r.shifted, true);
+    });
     const upd = inst.calls.find((c) => /UPDATE tbl_job\s+SET\s+original_appointment_date_time/.test(c.sql));
     assert.ok(upd, 'UPDATE fired');
-    assert.match(upd.sql, /INTERVAL 2 DAY/, 'shifts by two days (late-open jobs need >1 day of lead time)');
+    // ABSOLUTE target, not a relative interval: `+ INTERVAL n DAY` on an
+    // appointment five days old would still land in the past.
+    assert.match(upd.sql, /requested_date_time = TIMESTAMP\(\?, TIME\(requested_date_time\)\)/, 'lands on an absolute date, preserving the time-of-day so time_slot stays valid');
+    assert.doesNotMatch(upd.sql, /INTERVAL \d+ DAY/, 'must NOT use a relative interval');
+    assert.match(upd.sql, /DATE\(requested_date_time\) <= \?/, 'only fires when the appointment is today or already past');
     assert.match(upd.sql, /DATE\(requested_date_time\) = DATE\(COALESCE\(original_appointment_date_time/, 'idempotency guard COALESCEs NULL original (bulk-upload jobs)');
     assert.match(upd.sql, /SET original_appointment_date_time = COALESCE\(original_appointment_date_time, requested_date_time\)/, 'back-fills a NULL original in the same atomic UPDATE');
     assert.match(upd.sql, /customer_submitted_at IS NULL/);
     assert.match(upd.sql, /job_status = 9/);
+    // IST dates are computed in JS and bound as params — never CURDATE()/NOW(),
+    // whose calendar day follows the DB server's timezone, not IST.
+    assert.doesNotMatch(upd.sql, /CURDATE\(\)/, 'IST day must not come from the DB server clock');
+    const [tomorrow, , today] = upd.params;
+    assert.match(String(tomorrow), /^\d{4}-\d{2}-\d{2}$/, 'tomorrow bound as a bare IST date');
+    assert.match(String(today), /^\d{4}-\d{2}-\d{2}$/, 'today bound as a bare IST date');
+    // The target is TODAY + 1 — derived from the current IST day, never from the
+    // appointment. An appointment-relative shift would leave an old date in the past.
+    const expectedTomorrow = new Date(Date.parse(String(today) + 'T00:00:00Z') + 86400000)
+      .toISOString().slice(0, 10);
+    assert.equal(String(tomorrow), expectedTomorrow, 'target is exactly today + 1 (not appointment + N)');
     const hist = inst.calls.find((c) => /INSERT INTO scheduling_history/.test(c.sql));
     assert.ok(hist, 'scheduling_history audit row written');
     assert.equal(hist.params[1], 55, 'easyfixer_id is the non-NULL tech id (NOT NULL — avoids candidate-ranking NOT-IN poison)');
-    assert.match(String(hist.params[3]), /Auto Rescheduled/, 'carries the auto-reschedule reason (stable token, no "for Next Day" since the shift is +2)');
+    assert.match(String(hist.params[3]), /Auto Rescheduled/, 'carries the stable token the CRM chip detector matches on');
   } finally { inst.restore(); }
 });
 
@@ -175,8 +234,10 @@ test('autoRescheduleOnOpenIfLate — idempotent: 0 rows affected writes no audit
     [/UPDATE tbl_job\s+SET\s+original_appointment_date_time/, { affectedRows: 0 }],
   ]);
   try {
-    const r = await magic.autoRescheduleOnOpenIfLate(42, db.pool, { nowMs: nowMsForIstHour(16) });
-    assert.equal(r.shifted, false);
+    await withAutoReschedule(undefined, async () => {
+      const r = await magic.autoRescheduleOnOpenIfLate(42, db.pool, { nowMs: nowMsForIstHour(16) });
+      assert.equal(r.shifted, false);
+    });
     assert.ok(inst.calls.some((c) => /UPDATE tbl_job/.test(c.sql)), 'UPDATE attempted');
     assert.ok(!inst.calls.some((c) => /INSERT INTO scheduling_history/.test(c.sql)), 'no audit row when nothing shifted');
     assert.ok(!inst.calls.some((c) => /SELECT requested_date_time AS newReq/.test(c.sql)), 'no follow-up SELECT');
