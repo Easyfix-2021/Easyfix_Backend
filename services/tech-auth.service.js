@@ -8,18 +8,82 @@ const jwt = require('jsonwebtoken');
  * OTP delivered via efr_no (mobile). JWT `sub` = `efr:<id>`.
  */
 
-async function findByMobile(mobile) {
-  const [[row]] = await pool.query(
-    `SELECT efr_id, efr_name, efr_no, efr_email FROM tbl_easyfixer
-      WHERE efr_no = ? AND efr_status = 1 LIMIT 1`,
+/*
+ * Login identity resolution — deliberately NOT filtered on efr_status.
+ *
+ * The old lookup was `efr_no = ? AND efr_status = 1`, which conflated two
+ * different questions: "who is this?" (identity) and "may they work?"
+ * (eligibility). Because the caller's response to "no identity" is CREATE, every
+ * rule that hid a row silently became a rule that MINTED one — a deactivated or
+ * rejected technician who logged in again got a brand-new empty stub instead of
+ * their own record, orphaning their history. Identity resolution now ignores
+ * status entirely; eligibility is enforced downstream where it belongs
+ * (candidate-ranking + job assign both hard-gate on efr_status = 1, so a
+ * deactivated tech can log in and see their status but can never be given work).
+ *
+ * `bestRowOrder` picks the most authoritative row when a mobile has several
+ * (production has genuine duplicates — see SCHEMA.md and the cleanup queries in
+ * migrations/): a CRM-verified row wins, then an active one, then the newest.
+ * `(x = 1) DESC` — not `x DESC` — so NULL flags sort last instead of ahead of 0.
+ */
+const TECH_COLS = 'efr_id, efr_name, efr_no, efr_email, efr_status, is_technician_verified, user_id';
+const BEST_ROW_ORDER =
+  'ORDER BY (is_technician_verified = 1) DESC, (efr_status = 1) DESC, efr_id DESC';
+
+/** Primary lookup: the technician's own login number on tbl_easyfixer. */
+async function resolveByEfrNo(mobile, runner = pool) {
+  const [[row]] = await runner.query(
+    `SELECT ${TECH_COLS} FROM tbl_easyfixer
+      WHERE efr_no = ?
+      ${BEST_ROW_ORDER}
+      LIMIT 1`,
     [mobile]);
   return row || null;
 }
 
+/*
+ * Reconciliation lookup: tbl_user.mobile_no.
+ *
+ * tbl_easyfixer.efr_no and tbl_user.mobile_no DIVERGE in production — e.g. a
+ * technician whose tbl_user row carries one number while their easyfixer row
+ * carries another. Authenticating on efr_no alone made that technician
+ * unreachable by their tbl_user number, so logging in with it created a stub
+ * alongside their real (often fully verified) record. Scoped to role 19 so a
+ * non-technician tbl_user row sharing a number can never resolve to somebody
+ * else's easyfixer record.
+ */
+async function resolveByUserMobile(mobile, runner = pool) {
+  const [[row]] = await runner.query(
+    `SELECT e.efr_id, e.efr_name, e.efr_no, e.efr_email, e.efr_status,
+            e.is_technician_verified, e.user_id
+       FROM tbl_easyfixer e
+       JOIN tbl_user u ON u.user_id = e.user_id
+      WHERE u.mobile_no = ? AND u.user_role = ?
+      ORDER BY (e.is_technician_verified = 1) DESC, (e.efr_status = 1) DESC, e.efr_id DESC
+      LIMIT 1`,
+    [mobile, TECH_ROLE_ID]);
+  return row || null;
+}
+
+/** Identity resolution for login: own number first, then tbl_user reconciliation. */
+async function findByMobile(mobile, runner = pool) {
+  return (await resolveByEfrNo(mobile, runner))
+      || (await resolveByUserMobile(mobile, runner));
+}
+
+/*
+ * Token → technician. Also NOT filtered on efr_status: a deactivated technician
+ * must stay able to authenticate, reach /mobile/registration/status and see why
+ * they're deactivated (plus the support contact). Filtering here rejected their
+ * token on EVERY request with "technician not found or inactive", which is what
+ * made deactivation indistinguishable from a broken session. Work remains
+ * blocked downstream — see the note on findByMobile.
+ */
 async function findById(id) {
   const [[row]] = await pool.query(
-    `SELECT efr_id, efr_name, efr_no, efr_email, efr_cityId, efr_service_category
-       FROM tbl_easyfixer WHERE efr_id = ? AND efr_status = 1 LIMIT 1`, [id]);
+    `SELECT efr_id, efr_name, efr_no, efr_email, efr_cityId, efr_service_category,
+            efr_status, is_technician_verified
+       FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1`, [id]);
   return row || null;
 }
 
@@ -69,14 +133,20 @@ async function createStubTechnician(mobile) {
       throw err;
     }
 
-    // Re-check under the lock — another request may have created the stub
-    // between findByMobile() and acquiring the lock.
-    const [[existing]] = await conn.query(
-      `SELECT efr_id, efr_name, efr_no, efr_email FROM tbl_easyfixer
-        WHERE efr_no = ? AND efr_status = 1 LIMIT 1`,
-      [mobile]);
+    /*
+     * Re-check under the lock, using the SAME status-blind resolver as login.
+     *
+     * This is the guard against re-creating over an existing technician. The
+     * previous re-check reused the `efr_status = 1` predicate, so it only saw
+     * ACTIVE rows — a deactivated or rejected technician was invisible to it and
+     * a duplicate got created anyway. Running the full resolver (efr_no, then
+     * tbl_user.mobile_no) means we create ONLY when the number is genuinely
+     * unknown to the platform, in any table, in any status. A verified
+     * technician can therefore never be shadowed by a stub.
+     */
+    const existing = await findByMobile(mobile, conn);
     if (existing) {
-      logger.info('Stub already created concurrently · efr_id=' + existing.efr_id);
+      logger.info('Existing technician found under lock — not creating · efr_id=' + existing.efr_id);
       return existing;
     }
 
@@ -113,11 +183,7 @@ async function createStubTechnician(mobile) {
 
     // Re-fetch on the pinned connection so the new (or concurrently-created)
     // row is returned in findByMobile's shape regardless of which insert won.
-    const [[row]] = await conn.query(
-      `SELECT efr_id, efr_name, efr_no, efr_email FROM tbl_easyfixer
-        WHERE efr_no = ? AND efr_status = 1 LIMIT 1`,
-      [mobile]);
-    return row || null;
+    return await findByMobile(mobile, conn);
   } finally {
     try { await conn.query('SELECT RELEASE_LOCK(?)', [lockName]); } catch (_) { /* connection teardown releases it anyway */ }
     conn.release();
@@ -126,19 +192,21 @@ async function createStubTechnician(mobile) {
 
 async function createLoginOtp(mobile) {
   logger.info('Create technician login OTP');
-  // Unknown number → self-onboard a stub technician, then fall through to the
-  // normal OTP generate/deliver path so the new tech gets their first OTP.
-  let tech = await findByMobile(mobile);
+  /*
+   * NOTHING IS CREATED HERE. This endpoint is public and unauthenticated, so
+   * self-onboarding at send-OTP time meant that merely typing a 10-digit number
+   * and tapping "Send OTP" permanently wrote a tbl_user + tbl_easyfixer row —
+   * an unauthenticated write, and an enumeration/pollution vector. Onboarding
+   * moved to verifyLoginOtp, which runs only AFTER the caller proves they
+   * control the number.
+   *
+   * An unknown number still gets an OTP (that's how a genuinely new technician
+   * onboards); `tech` is simply null and the OTP row carries a NULL user_email,
+   * which verifyLoginOtp already tolerates — it matches on mobile alone.
+   */
+  const tech = await findByMobile(mobile);
   if (!tech) {
-    tech = await createStubTechnician(mobile);
-    if (!tech) {
-      logger.warn('No technician resolved after stub onboarding');
-      return { found: false };
-    }
-    if (process.env.NODE_ENV !== 'production') {
-      logger.event('🆕', 'green',
-        `self-onboarded new technician for ${mobile} (efr_id=${tech.efr_id}) — dev only`);
-    }
+    logger.info('Unknown mobile — issuing OTP without creating any row (onboarding happens on verify)');
   }
   // Tech logins are always mobile-based, so resolveLoginOtp will return
   // the last 4 digits of the mobile in QA mode (env QA_DETERMINISTIC_OTP=true).
@@ -170,12 +238,12 @@ async function createLoginOtp(mobile) {
     await pool.query(
       `INSERT INTO otp_details (otp, otp_type, user_email, user_mobile_no, generated_on, valid_up_to, is_expired, count)
        VALUES (?, 'Mobile App Otp', ?, ?, ?, ?, 0, 1)`,
-      [otp, tech.efr_email, mobile, now, expires]
+      [otp, tech ? tech.efr_email : null, mobile, now, expires]
     );
   }
   if (process.env.NODE_ENV !== 'production') {
     logger.event('🔑', 'cyan',
-      `OTP for ${mobile}: ${otp}  (technician efr_id=${tech.efr_id}, valid 5 min) — dev only`);
+      `OTP for ${mobile}: ${otp}  (${tech ? 'technician efr_id=' + tech.efr_id : 'NEW number — no row yet'}, valid 5 min) — dev only`);
   }
 
   // Technicians always log in with a mobile number, so the default branch
@@ -184,24 +252,35 @@ async function createLoginOtp(mobile) {
   const { deliverOtp } = require('./otp-delivery.service');
   await deliverOtp({
     identifier: mobile,
-    email: tech.efr_email,
+    email: tech ? tech.efr_email : null,
     mobile,
-    name: tech.efr_name,
+    name: tech ? tech.efr_name : null,
     otp,
     contextLabel: 'technician',
   });
 
-  logger.info('Technician login OTP issued · efr_id=' + tech.efr_id);
+  // `found` stays TRUE for an unknown number: it reports "an OTP was delivered",
+  // which the route surfaces as `delivered`. It never meant "this number is
+  // already registered", and the app relies on it to advance to the OTP screen.
+  logger.info('Technician login OTP issued · ' + (tech ? 'efr_id=' + tech.efr_id : 'new number'));
   return { found: true, expiresAt: expires };
 }
 
+/*
+ * Verify, THEN onboard.
+ *
+ * Order is deliberate and is the whole point of the change: the OTP is checked
+ * against the mobile alone (it never needed a technician row — the lookup below
+ * keys on user_mobile_no), and only once the caller has PROVEN control of the
+ * number do we resolve-or-create their identity. That is what stops an
+ * unauthenticated `/auth/login-otp` hit from writing rows.
+ *
+ * There is no USER_NOT_FOUND path any more. An unknown-but-verified number is a
+ * legitimate first-time technician, so it onboards here instead of being
+ * rejected.
+ */
 async function verifyLoginOtp(mobile, otp) {
   logger.info('Verify technician login OTP');
-  const tech = await findByMobile(mobile);
-  if (!tech) {
-    logger.warn('OTP verify failed · reason=USER_NOT_FOUND');
-    return { ok: false, reason: 'USER_NOT_FOUND' };
-  }
   // Match on (mobile, otp_type) ALONE. The mobile number is the real login
   // identity for technicians; user_email is stored purely informationally
   // (and is NULL for techs with no efr_email on file). Including user_email in
@@ -216,23 +295,45 @@ async function verifyLoginOtp(mobile, otp) {
       LIMIT 1`,
     [mobile]);
   if (!row) {
-    logger.warn('OTP verify failed · reason=NO_OTP_ISSUED · efr_id=' + tech.efr_id);
+    logger.warn('OTP verify failed · reason=NO_OTP_ISSUED');
     return { ok: false, reason: 'NO_OTP_ISSUED' };
   }
   if (row.is_expired || new Date(row.valid_up_to).getTime() < Date.now()) {
     await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
-    logger.warn('OTP verify failed · reason=OTP_EXPIRED · efr_id=' + tech.efr_id);
+    logger.warn('OTP verify failed · reason=OTP_EXPIRED');
     return { ok: false, reason: 'OTP_EXPIRED' };
   }
   if (Number(row.otp) !== Number(otp)) {
-    logger.warn('OTP verify failed · reason=OTP_MISMATCH · efr_id=' + tech.efr_id);
+    logger.warn('OTP verify failed · reason=OTP_MISMATCH');
     return { ok: false, reason: 'OTP_MISMATCH' };
   }
+
+  /*
+   * OTP proven. NOW resolve identity — creating one only if this number is
+   * genuinely unknown across tbl_easyfixer (any status) and tbl_user.
+   *
+   * The OTP is consumed AFTER this, not before: if onboarding hits a transient
+   * error the technician can retry with the same code instead of being told to
+   * request a new one. The replay window that opens is bounded by the per-mobile
+   * GET_LOCK inside createStubTechnician, so two racing verifies still produce
+   * exactly one row (both then receive a token for the same efr_id).
+   */
+  let tech = await findByMobile(mobile);
+  if (!tech) {
+    tech = await createStubTechnician(mobile);
+    if (!tech) {
+      logger.warn('OTP verified but no technician could be resolved or created');
+      return { ok: false, reason: 'ONBOARDING_FAILED' };
+    }
+    logger.info('Onboarded new technician after OTP verification · efr_id=' + tech.efr_id);
+  }
+
   await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
   const token = jwt.sign(
     { sub: `efr:${tech.efr_id}`, name: tech.efr_name, mobile: tech.efr_no },
     process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRY || '30d' });
-  logger.info('Technician OTP verified · token issued · efr_id=' + tech.efr_id);
+  logger.info('Technician OTP verified · token issued · efr_id=' + tech.efr_id
+    + ' · active=' + (Number(tech.efr_status) === 1));
   return { ok: true, token, tech };
 }
 

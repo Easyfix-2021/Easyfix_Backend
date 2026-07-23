@@ -69,6 +69,8 @@ async function fetchGateRow(efrId) {
             e.efr_first_name, e.efr_name, e.efr_no,
             e.efr_profile_img,
             e.efr_profile_perc,
+            e.efr_status,
+            e.last_inactive_date_time,
             e.is_technician_verified,
             e.is_identity_details_verified_by_crm,
             e.is_personal_details_verified_by_crm,
@@ -255,18 +257,48 @@ async function getStatus(efrId) {
 
   const status = deriveStatus(flags);
 
+  /*
+   * Deactivation is reported ADDITIVELY — deliberately NOT as a new `status`
+   * value. The app maps status through an exhaustive
+   * `Record<RegistrationStatus, string>` (app: (registration)/index.tsx), so an
+   * unrecognised value would resolve to `undefined` and break the redirect.
+   * Shipping a new enum member would therefore require an app release; a new
+   * FIELD is ignored by current builds and consumed by the next one.
+   *
+   * Only an EXPLICIT 0 counts. `efr_status` is NULL on legacy rows that predate
+   * the flag, and treating NULL as deactivated would wrongly lock out a large
+   * slice of existing technicians.
+   */
+  const deactivated = Number(e.efr_status) === 0;
+
   // Gate 2 (earning) unlock: CRM-verified AND the tech has the full identity
   // + skills + training the first job needs. Surfaced as a dashboard checklist
   // so the tech sees exactly what's left; job offers stay locked until true.
   const trainingComplete = !!trainingCompletedTime;
-  const jobsUnlocked = flags.isTechnicianVerified && panPresent && hasSkills && trainingComplete;
+  // A deactivated technician can never be offered work (candidate-ranking and
+  // job.service both require efr_status = 1), so report jobs as locked. This is
+  // what makes the deactivated experience correct on TODAY's app build with no
+  // client change: they log in, reach the dashboard, and jobs are shown locked
+  // instead of appearing available and silently never arriving.
+  const jobsUnlocked = !deactivated
+    && flags.isTechnicianVerified && panPresent && hasSkills && trainingComplete;
 
-  logger.info('Returning registration status · status=' + status + ' profilePct=' + pct(e.efr_profile_perc) + ' jobsUnlocked=' + jobsUnlocked);
+  logger.info('Returning registration status · status=' + status + ' profilePct=' + pct(e.efr_profile_perc) + ' jobsUnlocked=' + jobsUnlocked + ' deactivated=' + deactivated);
 
   return {
     status,
     verified:             flags.isTechnicianVerified,
     jobsUnlocked,
+    /*
+     * Additive deactivation block — new fields, existing `status` untouched.
+     * A future app build renders a "your account is deactivated, contact
+     * support" screen from these; current builds ignore them harmlessly.
+     */
+    deactivated,
+    // `last_inactive_date_time` only — the internal `inactive_reason` FK and
+    // `inactive_comment` are Ops notes and are intentionally NOT surfaced to the
+    // technician; the app shows a generic "contact support" message instead.
+    deactivatedSince:     deactivated ? (e.last_inactive_date_time || null) : null,
     // Gate-2 unlock checklist for the dashboard (all true ⇒ jobsUnlocked).
     checklist: {
       verified:         flags.isTechnicianVerified,
