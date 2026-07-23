@@ -139,4 +139,39 @@ router.post(
   },
 );
 
+/*
+ * ─── QA database refresh — live progress + stop ──────────────────────
+ *
+ * The refresh and its dry run are the only jobs here that run for MINUTES
+ * (a multi-GB dump over a private link), so "Last Run" telemetry alone leaves
+ * the operator staring at a spinner with no idea whether anything is happening.
+ *
+ * Progress lives in the SERVICE, not the browser, which is what makes it
+ * survive navigating away or closing the tab — the card just polls this. Added
+ * here rather than in a new route file so both endpoints inherit the
+ * `requireAllowedEmail` allowlist already applied to this router (see the header
+ * note) instead of re-implementing that gate.
+ */
+const qaDbRefresh = require('../../services/qa-db-refresh.service');
+
+// GET /qa-db-refresh/progress → { running, phase, label, elapsedMs, bytes, … }
+// Safe to poll: pure in-memory state plus one stat() of the dump file.
+router.get('/qa-db-refresh/progress', (req, res) => {
+  return modernOk(res, qaDbRefresh.getProgress());
+});
+
+/*
+ * POST /qa-db-refresh/cancel → stop the in-flight run.
+ *
+ * Kills the mysqldump/mysql child, which unwinds the job through its normal
+ * failure path — so the maintenance gate is lowered and the partial dump is
+ * deleted by the same code that handles any other failure. Idempotent: cancelling
+ * when nothing is running is a 200 with cancelled:false, not an error.
+ */
+router.post('/qa-db-refresh/cancel', (req, res) => {
+  const r = qaDbRefresh.cancelRun();
+  logger.warn('QA refresh cancel requested by user #' + req.user.user_id + ' · ' + JSON.stringify(r));
+  return modernOk(res, r, r.cancelled ? 'Stopping…' : 'Nothing is running.');
+});
+
 module.exports = router;
