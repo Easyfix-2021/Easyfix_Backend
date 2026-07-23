@@ -1,0 +1,24 @@
+-- Magic-link auto-reschedule kill switch — 2026-07-23.
+--
+-- `job.auto_reschedule.enabled` gates services/job-magic-link.service.js
+-- autoRescheduleOnOpenIfLate(), which moves an already-due appointment to
+-- TOMORROW when the customer opens the job-completion magic link.
+--
+-- DEFAULT-ON semantics, matching the per-cron flags
+-- (2026-07-14-seed-per-cron-enable-flags.sql): ONLY the literal string 'false'
+-- disables it, so an absent property or a pre-migration host keeps working.
+--
+-- Seeded 'false' ON PURPOSE — ops asked to stop auto-rescheduling for a while.
+-- Set it back to 'true' (or delete the row) to re-enable.
+--
+-- Read per link-open, NOT at boot, so a change takes effect within the
+-- easyfix_properties cache TTL (1h) or immediately after POST
+-- /api/admin/properties/reload. No backend restart needed — unlike the cron
+-- flags, whose registration is decided once at startup.
+--
+-- SCOPE — this does NOT disable the CRM's SEND-time gate. Ops are still forced
+-- to reschedule a past-dated appointment before a magic link can be sent at all;
+-- that check is client-side date math in Easyfix_CRM_UI (lib/utils.ts
+-- magicLinkRescheduleGate + UnconfirmedJobsTable) and never consults this
+-- property. The two are independent by construction.
+INSERT INTO easyfix_properties (property_key, property_value) VALUES ('job.auto_reschedule.enabled', 'false') ON DUPLICATE KEY UPDATE property_value = 'false';

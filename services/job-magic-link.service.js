@@ -22,6 +22,14 @@
  */
 
 const { signJobToken } = require('../utils/jwt');
+/*
+ * Kill switch for the link-open auto-reschedule (job.auto_reschedule.enabled).
+ * Held as the MODULE, not a destructured `getProperty`: destructuring binds the
+ * function at require time, so a test that requires this service before stubbing
+ * would silently keep the real (DB-backed) lookup. Calling through the module
+ * object is late-bound and works whatever the require order.
+ */
+const properties = require('./properties.service');
 // WhatsApp wrapper — Gallabox.
 // CLAUDE.md Step 11 (Notification services) names Gallabox as the canonical
 // WhatsApp provider; deployments are configured with GALLABOX_API_KEY /
@@ -483,19 +491,25 @@ async function jobHasColumn(pool, col) {
  * autoRescheduleOnOpenIfLate — when a customer OPENS the magic-link form late in
  * the day, push the appointment to the next day so ops can still staff it.
  *
- * WHY: bulk-upload / client-portal jobs often arrive with tomorrow's 9-12 slot;
- * if the customer opens the form late evening and confirms that same slot, ops
- * (who have left for the day) can't assign a technician before it starts. So on
+ * WHY: bulk-upload / client-portal jobs often sit unopened until their slot has
+ * already come round. If the customer then opens the form and confirms a slot
+ * that is today or already past, ops cannot assign a technician for it. So on
  * OPEN (this runs on GET /:token, AFTER verify() enforced link-not-expired +
- * job_status=9), if the current IST hour is >= 15 (3pm) we shift
- * requested_date_time by +1 day ONCE, before the prefill is built — the customer
- * simply sees the new date (no reschedule button, no chip).
+ * job_status=9) we validate the APPOINTMENT DATE and, if it is already due,
+ * move it to TOMORROW once, before the prefill is built — the customer simply
+ * sees the new date (no reschedule button, no chip).
  *
- * THE TRIGGER IS THE OPEN TIME: if the CURRENT IST hour is >= 15 (3pm) when the
- * customer opens the link, shift. This matches the problem as stated — "if the
- * customer opens the form late evening and proceeds with the same slot, ops
- * can't staff it" — so it's the moment of opening that matters, not when the
- * job was created.
+ * THE TRIGGER IS THE APPOINTMENT DATE, checked at open time: shift only when
+ * DATE(requested_date_time) <= today (IST). The earlier rule triggered on the
+ * OPEN HOUR alone (>= 3pm IST), which also shifted jobs booked for next week
+ * whenever the link happened to be opened late in the day — the appointment
+ * date is what actually determines whether ops can still staff it.
+ *
+ * GATED: `job.auto_reschedule.enabled` = 'false' disables this entirely
+ * (default-on; see the check at the top of the function). This is independent
+ * of the CRM's SEND-time gate, which forces ops to reschedule a past-dated job
+ * before a link can be sent at all — that lives in the CRM
+ * (lib/utils.ts magicLinkRescheduleGate) and is unaffected by this flag.
  *
  * IDEMPOTENT BY CONSTRUCTION: the UPDATE only fires while
  * DATE(requested) = DATE(original) — the shift moves them apart, so a second
@@ -518,38 +532,104 @@ async function jobHasColumn(pool, col) {
  * @returns {Promise<{shifted:boolean, newRequested?:string, reason?:string}>}
  */
 async function autoRescheduleOnOpenIfLate(jobId, pool, { nowMs = Date.now() } = {}) {
-  // Trigger = the OPEN time. IST hour via the fixed +5:30 offset (no DST in IST)
-  // — never toISOString(). Before 3pm → do nothing (not even a DB round-trip).
-  const istHour = new Date(nowMs + (5 * 60 + 30) * 60 * 1000).getUTCHours();
-  if (istHour < 15) return { shifted: false };
+  /*
+   * IST "today" / "tomorrow", computed FIRST because the disabled branch below
+   * needs `istToday` to report whether the appointment was actually due.
+   * Both are pure JS off the fixed +5:30 offset (no DST in IST) — see the
+   * TRIGGER note below for why this can't come from the database.
+   */
+  const istNow = new Date(nowMs + (5 * 60 + 30) * 60 * 1000);
+  const istToday = istNow.toISOString().slice(0, 10);
+  const istTomorrow = new Date(istNow.getTime() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
-  // 12-hour label for the reason string, e.g. 15 -> "3pm", 20 -> "8pm".
+  /*
+   * KILL SWITCH — `job.auto_reschedule.enabled` in easyfix_properties.
+   * DEFAULT-ON semantics, matching the per-cron flags
+   * (migrations/2026-07-14-seed-per-cron-enable-flags.sql): only the literal
+   * string 'false' disables it, so an absent property or a pre-migration host
+   * behaves exactly as before.
+   *
+   * Unlike the cron flags this is read per-open, not at boot, so flipping it
+   * takes effect within the property cache TTL (or immediately after a
+   * properties reload) — no restart.
+   *
+   * When disabled we still do ONE cheap indexed lookup to report the case that
+   * actually matters: a link opened on an ALREADY-DUE appointment, which the
+   * customer is now about to confirm on a today/past date. Without this the
+   * switch is invisible in the funnel — you'd see confirmations on dead slots
+   * with no trace that the safety net was deliberately off. Best-effort and
+   * never allowed to block the form; a job that wasn't due logs nothing.
+   */
+  if (String(properties.getProperty('job.auto_reschedule.enabled') ?? '').trim().toLowerCase() === 'false') {
+    try {
+      const [due] = await pool.query(
+        `SELECT requested_date_time AS req FROM tbl_job
+          WHERE job_id = ?
+            AND job_status = 9
+            AND customer_submitted_at IS NULL
+            AND requested_date_time IS NOT NULL
+            AND DATE(requested_date_time) <= ?
+          LIMIT 1`,
+        [jobId, istToday],
+      );
+      if (due && due.length) {
+        logger.info(
+          'Magic-link auto-reschedule SKIPPED — disabled by job.auto_reschedule.enabled · jobId=' + jobId
+          + ' · appointment=' + due[0].req + ' is due on/before ' + istToday
+          + ' · customer will see the original date',
+        );
+      }
+    } catch (e) {
+      logger.warn('auto-reschedule skip-check failed · jobId=' + jobId + ' · ' + (e && e.message));
+    }
+    return { shifted: false, reason: 'disabled' };
+  }
+
+  /*
+   * TRIGGER = the APPOINTMENT DATE, evaluated at link-open time.
+   *
+   * Shift ONLY when the appointment is already due — its date is TODAY or in the
+   * PAST — and always land it on TOMORROW.
+   *
+   * This replaced an "opened after 3pm IST" trigger, which fired on the open time
+   * alone and so also shifted jobs booked for NEXT WEEK whenever someone happened
+   * to open the link late in the day. The appointment date is what actually
+   * decides whether ops can still staff the job, so that is what we test.
+   *
+   * The target is TODAY + 1 — NOT the appointment date + N. It is computed from
+   * the CURRENT IST day (`istTomorrow` above), never from the stored appointment,
+   * because a relative `+ INTERVAL n DAY` on an appointment five days old would
+   * still land in the past. We set tomorrow's DATE and keep the original
+   * TIME(...) — so time_slot stays correct (same hour-of-day → same slot; only
+   * the calendar date moves).
+   *
+   * Both dates are computed in JS from the fixed +5:30 offset (no DST in IST) and
+   * passed as params. Deliberately NOT CURDATE()/NOW(): mysql2's `timezone`
+   * option controls JS<->driver serialisation, NOT the MySQL session time_zone,
+   * so server-side date functions can resolve to a non-IST calendar day.
+   */
+  // 12-hour label for the reason string, e.g. 15 -> "3pm", 20 -> "8pm". Retained
+  // purely as audit context — it is no longer part of the trigger.
+  const istHour = istNow.getUTCHours();
   const h12 = ((istHour + 11) % 12) + 1;
   const ampm = istHour < 12 ? 'am' : 'pm';
-  // Reason text no longer says "for Next Day" — the shift is +2 days (below), so
-  // the wording would lie. The chip detector matches the stable 'Auto Rescheduled'
-  // token (job.service.js LIST_COLUMNS uses LIKE '%Auto Rescheduled%'), so old
-  // rows written as '…for Next Day' still match.
-  const reason = `Job Received at ${h12}${ampm}, Auto Rescheduled`;
+  // MUST keep the stable 'Auto Rescheduled' token — the CRM chip detector matches
+  // LIKE '%Auto Rescheduled%' (job.service.js LIST_COLUMNS), and older rows
+  // written as '…for Next Day' still match it too.
+  const reason = `Link Opened at ${h12}${ampm}, Appointment Due, Auto Rescheduled`;
 
-  // Guarded, idempotent-by-construction shift. +2 days (was +1) — a late-evening
-  // open that only bumped to the NEXT day still landed a first-slot appointment
-  // ops couldn't staff in time, so we push two days out. Done IN MySQL on the
-  // stored IST wall-clock string (dateStrings + '+05:30' pool) so there is no
-  // JS/UTC date math. time_slot is intentionally UNCHANGED (same hour-of-day →
-  // same slot; only the calendar date moves). Still idempotent: the guard below
-  // fires only while requested_date_time is still on its ORIGINAL date.
   const [result] = await pool.query(
     `UPDATE tbl_job
         SET original_appointment_date_time = COALESCE(original_appointment_date_time, requested_date_time),
-            requested_date_time = requested_date_time + INTERVAL 2 DAY,
+            requested_date_time = TIMESTAMP(?, TIME(requested_date_time)),
             last_update_time = NOW()
       WHERE job_id = ?
         AND job_status = 9
         AND customer_submitted_at IS NULL
         AND requested_date_time IS NOT NULL
+        AND DATE(requested_date_time) <= ?
         AND DATE(requested_date_time) = DATE(COALESCE(original_appointment_date_time, requested_date_time))`,
-    [jobId],
+    [istTomorrow, jobId, istToday],
   );
   if (!result || result.affectedRows !== 1) return { shifted: false };
 
