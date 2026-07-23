@@ -8,10 +8,11 @@ const { modernOk, modernError } = require('../../utils/response');
 const logger = require('../../logger');
 const {
   listQuery, createBody, updateBody, statusBody, assignBody, offerBody, ownerBody, rescheduleBody, idParam,
-  candidatesQuery, candidatesSearchQuery,
+  candidatesQuery, candidatesSearchQuery, slotRecommendationsQuery,
 } = require('../../validators/job.validator');
 const { assertEntityInScope } = require('../../lib/scope');
 const { streamStyledXlsx } = require('../../utils/xlsx-styled-export');
+const ttlCache = require('../../utils/ttl-cache');
 
 /*
  * Row-level scope guard for every /:id endpoint. Fetches the job once,
@@ -162,6 +163,42 @@ router.get('/:id/candidates',
       const offerFlowEnabled = await job.isOfferFlowActive();
       logger.info('Returning ' + (result?.candidates?.length || 0) + ' ranked candidates · jobId=' + req.params.id + ' offerFlow=' + offerFlowEnabled + (result?.note ? ' note=' + result.note : ''));
       modernOk(res, { ...result, offerFlowEnabled });
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  });
+
+/*
+ * GET /api/admin/jobs/:id/slot-recommendations?date=YYYY-MM-DD
+ *
+ * Which of the four booking windows can actually be STAFFED on that date.
+ * Ops otherwise pick a slot from a static list with nothing to say whether
+ * anyone is free — the cost of which shows up later as failed assignments and
+ * reschedules.
+ *
+ * Advice only: every window is returned (with a reason when it is poor), the FE
+ * keeps them all selectable, and nothing here blocks a booking.
+ *
+ * CACHED for 30s on (jobId, date). The CRM calls this on every date pick and
+ * the underlying work is a full ranking pass; this backend is shared with the
+ * client portal and the mobile app, so a repeat pick of the same date must not
+ * re-run it. ttl-cache also JOINS in-flight callers, so two operators opening
+ * the same job at once cost one computation, not two.
+ */
+router.get('/:id/slot-recommendations',
+  validate(idParam, 'params'),
+  validate(slotRecommendationsQuery, 'query'),
+  scopedJob,
+  async (req, res, next) => {
+    try {
+      const day = String(req.query.date).slice(0, 10);
+      const result = await ttlCache.cached(
+        `slot-rec:${req.params.id}:${day}`,
+        30_000,
+        () => candidateRanking.recommendSlotsForJob(req.params.id, { date: day }),
+      );
+      modernOk(res, result);
     } catch (e) {
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
