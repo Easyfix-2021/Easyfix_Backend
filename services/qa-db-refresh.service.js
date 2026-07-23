@@ -22,6 +22,8 @@
  *    instead of buffering a table in RAM on either end. We explicitly do NOT
  *    pass --master-data/--source-data (needs RELOAD and takes a brief GLOBAL
  *    lock), --lock-all-tables or --flush-logs, and we never STOP REPLICA.
+ *    They are also restricted to options BOTH the MySQL and MariaDB clients
+ *    accept — see dumpFromReplica(), the image ships MariaDB's dumper.
  *
  * 4. THE SNAPSHOT IS TIME-BOUNDED. --single-transaction holds one long
  *    REPEATABLE READ open, and InnoDB must retain undo history for its whole
@@ -190,13 +192,24 @@ function runTool(bin, args, { timeoutMs, password, stdout = null, stdin = null }
 }
 
 /*
- * mysqldump the REPLICA to a gzipped file. Flag rationale is in the header; the
- * two easy-to-miss ones:
+ * mysqldump the REPLICA to a gzipped file.
+ *
+ * ⚠ EVERY FLAG HERE MUST BE ACCEPTED BY *BOTH* CLIENTS. The image installs
+ * Alpine's `mariadb-client`, whose `mysqldump` is a symlink to MariaDB's
+ * `mariadb-dump` — there is no Oracle MySQL client in Alpine's repos. MariaDB's
+ * dumper rejects MySQL-only options outright ("unknown variable"), and it does so
+ * while PARSING ARGS, i.e. before connecting — so a single bad flag fails the
+ * whole run instantly with no dump at all. Two that bit us / would:
+ *   --set-gtid-purged=OFF  MySQL-only. REMOVED (2026-07-23) — MariaDB errors on
+ *     it. Nothing is lost: it suppresses a `SET @@GLOBAL.gtid_purged` line that
+ *     only Oracle's mysqldump ever emits, so with this client it was already
+ *     a no-op.
+ *   --column-statistics=0  MySQL-8-client-only. Deliberately never added.
+ *
+ * Flag rationale for the rest is in the header; the easy-to-miss one:
  *   --routines/--triggers/--events — the schema has stored programs (see the SP
  *     referenced at routes/admin/finance.js:1031). Omit these and the restore
  *     silently produces a database that is missing behaviour, not just rows.
- *   --set-gtid-purged=OFF — without it a GTID-enabled source emits SET
- *     @@GLOBAL.gtid_purged, which fails (or corrupts GTID state) on restore.
  */
 async function dumpFromReplica(file) {
   const s = src();
@@ -206,7 +219,6 @@ async function dumpFromReplica(file) {
     '--skip-lock-tables',     // never take the default read locks
     '--quick',                // stream rows; don't buffer a table in RAM
     '--no-tablespaces',       // avoids needing the PROCESS privilege
-    '--set-gtid-purged=OFF',
     '--hex-blob',
     '--routines', '--triggers', '--events',
     '--default-character-set=utf8mb4',
