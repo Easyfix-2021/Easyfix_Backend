@@ -801,6 +801,7 @@ const DATE_TYPE_COLUMN = {
 
 async function list({
   q, status, statuses, assigned, clientId, cityId, ownerId, easyfixerId,
+  clientOwnerIds,            // number[] — restrict to jobs owned (job_client_owner) by these client users (reporting-manager scope)
   customerId,
   jobIds,                    // number[] — restrict to an explicit set of job ids
   isEscalated,
@@ -940,6 +941,10 @@ async function list({
   if (clientId != null)    { clauses.push('j.fk_client_id = ?');     params.push(clientId); }
   if (easyfixerId != null) { clauses.push('j.fk_easyfixter_id = ?'); params.push(easyfixerId); }
   if (ownerId != null)     { clauses.push('j.job_owner = ?');        params.push(ownerId); }
+  if (Array.isArray(clientOwnerIds) && clientOwnerIds.length) {
+    clauses.push(`j.job_client_owner IN (${clientOwnerIds.map(() => '?').join(',')})`);
+    params.push(...clientOwnerIds);
+  }
   if (cityId != null)      { clauses.push('ad.city_id = ?');         params.push(cityId); }
   if (customerId != null)  { clauses.push('j.fk_customer_id = ?');   params.push(customerId); }
   // Explicit job-id set — used by listOfferedForTech() to reuse this LIST

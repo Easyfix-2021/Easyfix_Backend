@@ -219,11 +219,34 @@ router.get('/services/sda-tat', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// Reporting-manager visibility — mirrors the legacy client dashboard exactly:
+//   • MANAGER = another active user reports to them (tbl_user.reporting_manager = them).
+//   • Manager      → their team's jobs: job_client_owner IN (self + direct reports).
+//   • Non-manager  → only their own jobs: job_client_owner = self.
+// Keyed off the SPOC's linked Client (user_type_id=3) user, carried in the token
+// as req.clientUser.userId (added at login). ownerIds === null means we couldn't
+// resolve the user (older token) → no scoping, show all the client's jobs.
+async function resolveManagerScope(req) {
+  const myUserId = req.clientUser?.userId ?? null;
+  if (!myUserId) return { isManager: false, ownerIds: null };
+  const [reports] = await pool.query(
+    `SELECT user_id FROM tbl_user
+      WHERE reporting_manager = ? AND user_status = 1 AND user_id <> reporting_manager`,
+    [myUserId]);
+  const reportIds = reports.map((r) => Number(r.user_id));
+  const isManager = reportIds.length > 0;
+  const ownerIds = isManager ? [Number(myUserId), ...reportIds] : [Number(myUserId)];
+  return { isManager, ownerIds };
+}
+
 router.get('/jobs', async (req, res, next) => {
   try {
     logger.info('List client jobs · status=' + (req.query.status ?? 'all') + ' q=' + (req.query.q || '-') + ' limit=' + (Math.min(Number(req.query.limit) || 50, 500)) + ' offset=' + (Number(req.query.offset) || 0));
+    const { isManager, ownerIds } = await resolveManagerScope(req);
+    logger.info('Job visibility · clientUser=' + (req.clientUser?.userId ?? '-') + ' · isManager=' + isManager + ' · owners=' + (ownerIds ? ownerIds.length : 'all'));
     const { rows, total } = await jobService.list({
       clientId: req.spoc.client_id,
+      clientOwnerIds: ownerIds || undefined,
       status: req.query.status != null ? Number(req.query.status) : undefined,
       q: req.query.q,
       // Server-side date range (so the app can reach any historical date
@@ -504,6 +527,25 @@ router.put('/profile', async (req, res, next) => {
               linkedIn_profile = COALESCE(?, linkedIn_profile)
         WHERE id = ?`,
       [contact_name, contact_alt_no, contact_desgn, linkedIn_profile, req.spoc.id]);
+
+    // Mirror the name onto the SPOC's linked internal user (tbl_user) so both
+    // records stay in sync. SPOCs link by tbl_client_contacts.user_id when set,
+    // otherwise by matching email on an active Client (user_type_id = 3) user.
+    if (contact_name != null && String(contact_name).trim() !== '') {
+      const [[cc]] = await pool.query(
+        'SELECT user_id, contact_email FROM tbl_client_contacts WHERE id = ?', [req.spoc.id]);
+      const uid = cc && Number(cc.user_id) > 0 ? Number(cc.user_id) : null;
+      const email = cc && cc.contact_email ? String(cc.contact_email).trim() : null;
+      if (uid) {
+        await pool.query('UPDATE tbl_user SET user_name = ? WHERE user_id = ?', [contact_name, uid]);
+      } else if (email) {
+        await pool.query(
+          `UPDATE tbl_user SET user_name = ?
+            WHERE LOWER(official_email) = LOWER(?) AND user_type_id = 3 AND user_status = 1`,
+          [contact_name, email]);
+      }
+      logger.info('SPOC name mirrored to tbl_user · spocId=' + req.spoc.id + ' · via=' + (uid ? 'user_id' : email ? 'email' : 'none'));
+    }
     logger.info('SPOC profile updated · spocId=' + req.spoc.id);
     modernOk(res, { updated: true });
   } catch (e) { next(e); }
@@ -677,8 +719,83 @@ router.get('/team', async (req, res, next) => {
       status: r.status,
       approvalByClient: r.approval_by_client,
     }));
-    logger.info('Returning ' + items.length + ' team members');
+    // isManager drives the Orders "Client Team" filter: only reporting managers
+    // (who see their team's jobs) get the team filter; individual users don't.
+    const { isManager } = await resolveManagerScope(req);
+    logger.info('Returning ' + items.length + ' team members · isManager=' + isManager);
+    modernOk(res, { items, isManager });
+  } catch (e) { next(e); }
+});
+
+// ─── Support contacts ────────────────────────────────────────────────
+// The EasyFix SPOCs assigned to the logged-in client, from tbl_vertical_mapping:
+//   user_type 1 = PRIMARY SPOC, user_type 2 = SECONDARY SPOC.
+// Powers Profile → Contact Support: the mail is addressed to the primary SPOC
+// with the secondary SPOC cc'd, so the client reaches the people who own them.
+router.get('/support-contacts', async (req, res, next) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT vm.user_type, u.official_email AS email, u.user_name AS name, u.mobile_no AS mobile
+         FROM tbl_vertical_mapping vm
+         JOIN tbl_user u ON u.user_id = vm.user_id AND u.user_status = 1
+        WHERE vm.client_id = ? AND vm.user_type IN (1, 2)
+          AND u.official_email IS NOT NULL AND u.official_email <> ''
+        ORDER BY vm.user_type, u.user_id`,
+      [req.spoc.client_id]);
+    const pick = (t) => rows.filter((r) => Number(r.user_type) === t).map((r) => ({ email: r.email, name: r.name, mobile: r.mobile || null }));
+    const primary = pick(1);
+    const secondary = pick(2);
+    logger.info('Support contacts · clientId=' + req.spoc.client_id + ' · primary=' + primary.length + ' secondary=' + secondary.length);
+    modernOk(res, {
+      primary,
+      secondary,
+      to: primary.map((p) => p.email),        // primary SPOC(s)
+      cc: secondary.map((s) => s.email),      // secondary SPOC(s)
+    });
+  } catch (e) { next(e); }
+});
+
+// ─── Notifications ───────────────────────────────────────────────────
+// Dashboard notifications for the logged-in Client user, from the same
+// dashboard_notification_log the legacy dashboard reads (job assigned /
+// completed / cancelled, booking confirmed, …). Keyed by the SPOC's linked
+// Client user (req.clientUser.userId). Mirrors the legacy query exactly:
+//   WHERE user_id = ? GROUP BY job_id ORDER BY createdAt DESC.
+router.get('/notices', async (req, res, next) => {
+  try {
+    const myUserId = req.clientUser?.userId ?? null;
+    if (!myUserId) { logger.info('Notices · no client user on token → empty'); return modernOk(res, { items: [] }); }
+    const [rows] = await pool.query(
+      `SELECT id, n_title, n_desc, status, job_id, createdAt
+         FROM dashboard_notification_log
+        WHERE user_id = ?
+        GROUP BY job_id
+        ORDER BY createdAt DESC
+        LIMIT 100`,
+      [myUserId]);
+    const items = rows.map((r) => ({
+      notice_id: r.id,
+      title: r.n_title || 'Notification',
+      message: r.n_desc || null,
+      is_read: String(r.status).toLowerCase() === 'read',
+      created_at: r.createdAt,
+      job_id: r.job_id || null,
+    }));
+    logger.info('Notices · clientUser=' + myUserId + ' · count=' + items.length);
     modernOk(res, { items });
+  } catch (e) { next(e); }
+});
+
+// Mark notifications read — all for the user, or a single id.
+router.patch('/notices/read', async (req, res, next) => {
+  try {
+    const myUserId = req.clientUser?.userId ?? null;
+    if (!myUserId) return modernOk(res, { updated: 0 });
+    const id = Number(req.body && req.body.notice_id) || null;
+    const [r] = id
+      ? await pool.query("UPDATE dashboard_notification_log SET status='read' WHERE id = ? AND user_id = ?", [id, myUserId])
+      : await pool.query("UPDATE dashboard_notification_log SET status='read' WHERE user_id = ? AND status <> 'read'", [myUserId]);
+    modernOk(res, { updated: r.affectedRows || 0 });
   } catch (e) { next(e); }
 });
 
@@ -697,6 +814,27 @@ router.get('/customers/mobile/:mobile', async (req, res, next) => {
       [mobile]);
     logger.info('Customer lookup by mobile · found=' + (customer ? 'yes' : 'no'));
     modernOk(res, { customer: customer || null });
+  } catch (e) { next(e); }
+});
+
+// Saved addresses for a customer, so Book-a-service can offer their previous
+// locations. Scoped to addresses THIS client has used for the customer (via
+// their jobs) — never exposes addresses from other clients' work.
+router.get('/customers/:customerId/addresses', async (req, res, next) => {
+  try {
+    const cid = Number(req.params.customerId);
+    if (!cid) return modernOk(res, { items: [] });
+    const [rows] = await pool.query(
+      `SELECT DISTINCT a.address_id, a.address, a.building, a.landmark, a.locality,
+              a.pin_code, a.gps_location, a.city_id, ci.city_name
+         FROM tbl_address a
+         JOIN tbl_job    j  ON j.fk_address_id = a.address_id AND j.fk_customer_id = a.customer_id
+         LEFT JOIN tbl_city ci ON ci.city_id = a.city_id
+        WHERE a.customer_id = ? AND j.fk_client_id = ?
+        ORDER BY a.address_id DESC LIMIT 20`,
+      [cid, req.spoc.client_id]);
+    logger.info('Customer saved addresses · customerId=' + cid + ' · count=' + rows.length);
+    modernOk(res, { items: rows });
   } catch (e) { next(e); }
 });
 
