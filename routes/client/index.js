@@ -431,6 +431,31 @@ router.post('/jobs/:id/cancel', validate(Joi.object({
   } catch (e) { next(e); }
 });
 
+// ─── Job image upload (Book-a-service attachments) ───────────────────
+// Reuses the shared job-image service (same storage as the ops route: S3 with
+// a local-disk fallback + a tbl_job_image row). Scoped to the SPOC's client so
+// a client can only attach to its own jobs.
+const multerClientImg = require('multer');
+const jobImageService = require('../../services/job-image.service');
+const clientImageUpload = multerClientImg({
+  storage: multerClientImg.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024, files: 1 },
+});
+
+router.post('/jobs/:id/images', clientImageUpload.single('file'), async (req, res, next) => {
+  const jobId = Number(req.params.id);
+  try {
+    const job = await jobService.getById(jobId);
+    if (!job || job.fk_client_id !== req.spoc.client_id) return modernError(res, 404, 'job not found');
+    const result = await jobImageService.uploadJobImage({ jobId, file: req.file, category: 'Booking' });
+    modernOk(res, result, 'image uploaded');
+  } catch (e) {
+    if (e?.code === 'LIMIT_FILE_SIZE') return modernError(res, 400, 'file exceeds 10MB');
+    if (e?.status === 400) return modernError(res, 400, e.message);
+    next(e);
+  }
+});
+
 /**
  * Escalate an order — writes to tbl_job_escalation_info, the same table the
  * legacy Client Dashboard writes, so ops sees app + dashboard escalations in
