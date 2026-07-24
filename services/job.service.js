@@ -1226,7 +1226,9 @@ async function getByIdCore(jobId) {
             cl.client_name, cl.client_email, ${verticalSelect},
             ef.efr_name AS easyfixer_name, ef.efr_no AS easyfixer_mobile,
             ow.user_name AS owner_name,
-            cr.user_name AS created_by_name
+            cr.user_name AS created_by_name,
+            (SELECT u2.user_name FROM tbl_user u2 WHERE u2.user_id = j.cancel_by LIMIT 1) AS cancelled_by_name,
+            (SELECT atr.action_desc FROM action_taken_reason atr WHERE atr.id = j.cancel_reason_id LIMIT 1) AS cancel_reason_name
      ${DETAIL_JOIN}
      WHERE j.job_id = ? LIMIT 1`,
     [jobId]

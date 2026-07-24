@@ -260,11 +260,11 @@ async function resolveManagerScope(req) {
 router.get('/jobs', async (req, res, next) => {
   try {
     logger.info('List client jobs · status=' + (req.query.status ?? 'all') + ' q=' + (req.query.q || '-') + ' limit=' + (Math.min(Number(req.query.limit) || 50, 500)) + ' offset=' + (Number(req.query.offset) || 0));
-    const { isManager, ownerIds } = await resolveManagerScope(req);
-    logger.info('Job visibility · clientUser=' + (req.clientUser?.userId ?? '-') + ' · isManager=' + isManager + ' · owners=' + (ownerIds ? ownerIds.length : 'all'));
+    // Client-scoped: a SPOC sees ALL of their client's jobs. (Owner-based
+    // scoping hid jobs whose job_client_owner is an internal user or NULL —
+    // e.g. a job a non-primary SPOC just booked — so the SPOC saw nothing.)
     const { rows, total } = await jobService.list({
       clientId: req.spoc.client_id,
-      clientOwnerIds: ownerIds || undefined,
       status: req.query.status != null ? Number(req.query.status) : undefined,
       q: req.query.q,
       // Server-side date range (so the app can reach any historical date
@@ -505,8 +505,18 @@ async function fireRejectEscalation(job, reason, spoc) {
 router.post('/jobs', async (req, res, next) => {
   try {
     logger.info('SPOC create job · clientId=' + req.spoc.client_id + ' type=' + (req.body?.job_type || '-'));
-    const created = await jobService.create({ ...req.body, fk_client_id: req.spoc.client_id }, { user_id: null });
-    logger.info('Job created · id=' + created.job_id);
+    // Stamp the logged-in SPOC onto the job so ops/reports know who booked it.
+    // These always come from the authenticated SPOC — never trust the client
+    // body for identity — so they override anything the app might send.
+    const created = await jobService.create({
+      ...req.body,
+      fk_client_id: req.spoc.client_id,
+      reporting_contact_id: req.spoc.id,
+      client_spoc: req.spoc.contact_no || null,
+      client_spoc_name: req.spoc.contact_name || null,
+      client_spoc_email: req.spoc.contact_email || null,
+    }, { user_id: null });
+    logger.info('Job created · id=' + created.job_id + ' · spoc=' + req.spoc.id);
 
     // In-app "Booking confirmed" notification for the client inbox. Matched by
     // the client's jobs in GET /notices, so it surfaces for whoever booked and
@@ -900,22 +910,30 @@ router.get('/customers/mobile/:mobile', async (req, res, next) => {
 });
 
 // Saved addresses for a customer, so Book-a-service can offer their previous
-// locations. Scoped to addresses THIS client has used for the customer (via
-// their jobs) — never exposes addresses from other clients' work.
+// locations. Only the addresses used in this customer's LAST 3 jobs with THIS
+// client (deduped) — recent + relevant, never other clients' work.
 router.get('/customers/:customerId/addresses', async (req, res, next) => {
   try {
     const cid = Number(req.params.customerId);
     if (!cid) return modernOk(res, { items: [] });
     const [rows] = await pool.query(
-      `SELECT DISTINCT a.address_id, a.address, a.building, a.landmark, a.locality,
-              a.pin_code, a.gps_location, a.city_id, ci.city_name
-         FROM tbl_address a
-         JOIN tbl_job    j  ON j.fk_address_id = a.address_id AND j.fk_customer_id = a.customer_id
+      `SELECT a.address_id, a.address, a.building, a.landmark, a.locality,
+              a.pin_code, a.gps_location, a.city_id, ci.city_name,
+              MAX(recent.job_id) AS last_job
+         FROM (
+                SELECT fk_address_id, job_id
+                  FROM tbl_job
+                 WHERE fk_customer_id = ? AND fk_client_id = ?
+                 ORDER BY job_id DESC
+                 LIMIT 3
+              ) recent
+         JOIN tbl_address a  ON a.address_id = recent.fk_address_id
          LEFT JOIN tbl_city ci ON ci.city_id = a.city_id
-        WHERE a.customer_id = ? AND j.fk_client_id = ?
-        ORDER BY a.address_id DESC LIMIT 20`,
+        GROUP BY a.address_id, a.address, a.building, a.landmark, a.locality,
+                 a.pin_code, a.gps_location, a.city_id, ci.city_name
+        ORDER BY last_job DESC`,
       [cid, req.spoc.client_id]);
-    logger.info('Customer saved addresses · customerId=' + cid + ' · count=' + rows.length);
+    logger.info('Customer saved addresses (last 3 jobs) · customerId=' + cid + ' · count=' + rows.length);
     modernOk(res, { items: rows });
   } catch (e) { next(e); }
 });
