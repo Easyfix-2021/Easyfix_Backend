@@ -65,4 +65,60 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+/*
+ * Manual gap-fill. The AI build leaves visit/charge/estimate line items (and the
+ * odd genuine miss) unmapped; these let ops map a service → deep skill by hand.
+ * Manual rows are preserved across rebuilds and feed ranking like AI rows.
+ */
+const catgQuery = Joi.object({ categoryId: Joi.number().integer().positive().required() });
+
+// "Which skill" picker — active deep skills in the category.
+router.get('/deep-skills', validate(catgQuery, 'query'), async (req, res, next) => {
+  try {
+    return modernOk(res, await matrix.listDeepSkillsForCategory(req.query.categoryId));
+  } catch (e) { next(e); }
+});
+
+// "Which service" picker — active services in the category + whether each is
+// already mapped (unmapped ones are the gaps).
+router.get('/category-services', validate(catgQuery, 'query'), async (req, res, next) => {
+  try {
+    return modernOk(res, await matrix.listCategoryServices(req.query.categoryId));
+  } catch (e) { next(e); }
+});
+
+// Lightweight gap COUNT for the "Gaps Only (N)" badge — integers only, never
+// the full service list (some categories run to 1000+ services).
+router.get('/gaps-count', validate(catgQuery, 'query'), async (req, res, next) => {
+  try {
+    return modernOk(res, await matrix.gapsCount(req.query.categoryId));
+  } catch (e) { next(e); }
+});
+
+const mappingBody = Joi.object({
+  categoryId: Joi.number().integer().positive().required(),
+  serviceName: Joi.string().trim().min(1).max(255).required(),
+  deepSkillId: Joi.number().integer().positive().required(),
+});
+router.post('/mapping', validate(mappingBody), async (req, res, next) => {
+  try {
+    const out = await matrix.addManualMapping({
+      serviceCatgId: req.body.categoryId,
+      serviceName: req.body.serviceName,
+      deepSkillId: req.body.deepSkillId,
+    });
+    return modernOk(res, out, 'Mapping saved');
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
+const idParam = Joi.object({ id: Joi.number().integer().positive().required() });
+router.delete('/mapping/:id', validate(idParam, 'params'), async (req, res, next) => {
+  try {
+    return modernOk(res, await matrix.deleteMapping(req.params.id), 'Mapping removed');
+  } catch (e) { next(e); }
+});
+
 module.exports = router;

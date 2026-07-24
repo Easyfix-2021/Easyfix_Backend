@@ -1310,16 +1310,62 @@ async function rankCandidatesForJob(jobId, {
     };
   }
 
-  // Priority-order ranking (NOT a weighted score): PRESENT-for-job-date techs
-  // first (so soft-attendance backfill can never bury a present tech below an
-  // absent one, and the top-N slice keeps present techs as the priority), then
-  // existing-tech preference — worked in this Vertical, then worked for this
-  // Client — then past performance (Rating/TAT/SDA) as the tiebreaker. In HARD
-  // attendance mode every scored tech is present, so the attendance key is a
-  // no-op (no behaviour change for auto-assign). Balance is a column, never a
-  // sort input.
+  /*
+   * SKILL-MATRIX signal (ranking only — never excludes; sparse-matrix-safe).
+   *
+   * Resolve the deep skills THIS job's services actually require per the Job
+   * Skill Matrix, then mark which scored techs hold one. `matrixApplicable` is
+   * false when the matrix has no mapping for this job — in which case
+   * skill_signal falls back to the existing category+type match (has_deep_skill),
+   * so an unmapped job ranks exactly as it does today. One extra query, over the
+   * already-eligible set, fail-soft.
+   */
+  const matrixSkillIds = await matrixRequiredSkillIds(job.job_id);
+  const matrixApplicable = matrixSkillIds.size > 0;
+  let matrixMatchSet = null;
+  if (matrixApplicable && scored.length) {
+    try {
+      const ids = scored.map((s) => Number(s.efr_id)).filter(Boolean);
+      const skillList = [...matrixSkillIds];
+      const [rows] = await pool.query(
+        `SELECT DISTINCT m.easyfixer_id AS efr_id
+           FROM tbl_efr_deepskill_mapping m
+          WHERE m.easyfixer_id IN (${ids.map(() => '?').join(',')})
+            AND m.is_repairing = 1
+            AND m.parent_skill_id IN (${skillList.map(() => '?').join(',')})`,
+        [...ids, ...skillList],
+      );
+      matrixMatchSet = new Set(rows.map((r) => Number(r.efr_id)));
+    } catch (e) {
+      logger.warn('Matrix candidate-match query failed (falling back to category+type) · jobId=' + job.job_id + ' · ' + e.message);
+      matrixMatchSet = null;
+    }
+  }
+  for (const s of scored) {
+    // matrix match where the matrix applies, else the category+type match.
+    s.skill_matrix_match = matrixMatchSet ? matrixMatchSet.has(Number(s.efr_id)) : null;
+    s.skill_signal = matrixMatchSet ? matrixMatchSet.has(Number(s.efr_id)) : (s.has_deep_skill === true);
+  }
+
+  /*
+   * Priority-order ranking (NOT a weighted score). Order, best-first:
+   *   1. PRESENT for the job date  (soft-attendance backfill can't bury a present
+   *      tech below an absent one; the top-N slice keeps present techs first).
+   *   2. PINCODE proximity         (distance_tier: serviceable-covers-job →
+   *      current-pincode → in-zone → …) — surfaces techs who can actually reach
+   *      the job first, which was previously computed but never sorted on.
+   *   3. SKILL match               (skill_signal: Job Skill Matrix where mapped,
+   *      else category+type) — the best-skilled tech wins among equally-near ones.
+   *   4/5. existing-tech preference — worked in this Vertical, then this Client.
+   *   6. past performance (Rating/TAT/SDA) as the final tiebreaker.
+   * In HARD attendance mode every scored tech is present, so key 1 is a no-op.
+   * Balance is a column, never a sort input.
+   */
   scored.sort((a, b) => {
     if (a.attendance_for_job_date !== b.attendance_for_job_date) return a.attendance_for_job_date ? -1 : 1;
+    const ta = tierRank(a.distance_tier), tb = tierRank(b.distance_tier);
+    if (ta !== tb) return ta - tb;
+    if (a.skill_signal !== b.skill_signal) return a.skill_signal ? -1 : 1;
     if (a.worked_for_vertical !== b.worked_for_vertical) return a.worked_for_vertical ? -1 : 1;
     if (a.worked_for_client   !== b.worked_for_client)   return a.worked_for_client   ? -1 : 1;
     return b.performance - a.performance;
@@ -1494,7 +1540,7 @@ async function loadJobSkillMatrix(job) {
   let rows = [];
   try {
     [rows] = await pool.query(
-      `SELECT js.job_service_id, ssm.deep_skill_id, ds.deepskill_name, ssm.confidence
+      `SELECT js.job_service_id, ssm.deep_skill_id, ds.deepskill_name, ssm.confidence, ssm.source
          FROM tbl_job_services js
          JOIN tbl_client_service   cs  ON cs.client_service_id = js.service_id
          JOIN tbl_client_rate_card cr  ON cr.crc_id = cs.rate_card_id
@@ -1524,9 +1570,65 @@ async function loadJobSkillMatrix(job) {
       // Skill Matrix page shows for that row, and so a real 0 is never
       // indistinguishable from "no value".
       confidence:     r.confidence ?? null,
+      // source is an ENUM/VARCHAR ('AI' | 'Manual') — plain passthrough so the
+      // modal can badge hand-made ('Manual') mappings. No numeric/string
+      // coercion needed like confidence.
+      source:         r.source ?? null,
     });
   }
   return byJobService;
+}
+
+/*
+ * The DISTINCT deep-skill ids the Job Skill Matrix says THIS job's services
+ * require — resolved by job_id alone (no dependency on a pre-loaded job.services,
+ * so it works on the lean ranking path). Same verified join as loadJobSkillMatrix
+ * (service → rate-card name → matrix), just projected to the id set the ranker
+ * needs to test each candidate against.
+ *
+ * Returns an EMPTY set when: the matrix table isn't category-keyed yet, the job's
+ * services aren't mapped, or the lookup fails. An empty set is the signal to FALL
+ * BACK to the existing category+type deep-skill match — so this can only ADD
+ * precision where the matrix exists, never subtract eligibility where it doesn't
+ * (the explicit product decision for the sparse-matrix rollout).
+ */
+async function matrixRequiredSkillIds(jobId) {
+  if (!jobId || !(await skillMatrixReadable())) return new Set();
+  try {
+    const [rows] = await pool.query(
+      `SELECT DISTINCT ssm.deep_skill_id
+         FROM tbl_job_services js
+         JOIN tbl_client_service   cs ON cs.client_service_id = js.service_id
+         JOIN tbl_client_rate_card cr ON cr.crc_id = cs.rate_card_id
+         JOIN tbl_service_skill_mapping ssm
+              ON ssm.service_catg_id = cs.service_catg_id
+             AND ssm.service_name    = TRIM(cr.crc_ratecard_name)
+             AND ssm.status          = 1
+        WHERE js.job_id = ?`,
+      [jobId],
+    );
+    return new Set(rows.map((r) => Number(r.deep_skill_id)).filter(Boolean));
+  } catch (e) {
+    logger.warn('Matrix required-skill lookup failed (falling back to category+type) · jobId=' + jobId + ' · ' + e.message);
+    return new Set();
+  }
+}
+
+/*
+ * Pincode-proximity as a sort key. distance_tier is already computed per
+ * candidate (computeTierAndRefPin) but was never used to ORDER them — this is
+ * the missing link that makes "prefer techs whose serviceable pincode covers the
+ * job, then techs whose current pincode matches" actually happen. Lower = better.
+ */
+const DISTANCE_TIER_RANK = Object.freeze({
+  same_pincode: 0,     // a serviceable pincode == the job pincode (best)
+  current_pincode: 1,  // home pincode == the job pincode
+  in_zone: 2,          // a serviceable pincode sits in the job's zone
+  out_of_zone: 3,
+  unknown: 4,
+});
+function tierRank(tier) {
+  return DISTANCE_TIER_RANK[tier] ?? DISTANCE_TIER_RANK.unknown;
 }
 
 /*
