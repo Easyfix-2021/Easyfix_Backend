@@ -1839,13 +1839,33 @@ async function recommendSlotsForJob(jobId, { date, nowMs = Date.now() } = {}) {
     const e = new Error('date must be YYYY-MM-DD'); e.status = 400; throw e;
   }
 
-  // ONE ranking pass for the date. enforceMaxConcurrent stays OFF so saturated
-  // technicians still come back with their load attached — we need that number
-  // to judge per-window freedom ourselves rather than having them pre-filtered.
+  /*
+   * ONE ranking pass for the date, using the SAME flags as the Schedule & Assign
+   * "Top-10" list (routes/admin/jobs.js /candidates). This is the pool ops
+   * actually see when they open the job, so the recommendation must reflect it —
+   * a slot the engine calls "unstaffable" while Schedule & Assign shows five
+   * technicians would destroy trust in the feature.
+   *
+   * softAttendance:true is the load-bearing one, and the cause of a production
+   * bug where EVERY slot showed 0: with the default (hard) attendance filter,
+   * `enforceAttendance` hard-EXCLUDES anyone marked absent — but only inside the
+   * today/tomorrow marking window (attendanceWindowActive). QA has little
+   * attendance data so nobody was excluded and it looked fine; production has
+   * real leave rows, so confirming for today/tomorrow emptied the pool entirely.
+   * Schedule & Assign uses soft attendance for exactly this reason: keep absent
+   * techs in the list (present-first), never show an empty pool. We then subtract
+   * the absent ones from the per-slot FREE count below, so the pool is honest
+   * without being empty.
+   *
+   * enforceMaxConcurrent stays OFF so saturated technicians still come back with
+   * their load attached — we judge per-window freedom ourselves.
+   */
   const ranked = await rankCandidatesForJob(jobId, {
     jobDate: day,
     limit: 1000,
     enforceMaxConcurrent: false,
+    enforceCodBalance: true,
+    softAttendance: true,
   });
   const candidates = Array.isArray(ranked.candidates) ? ranked.candidates : [];
   const efrIds = candidates.map((c) => Number(c.efr_id)).filter(Boolean);
@@ -1887,6 +1907,11 @@ async function recommendSlotsForJob(jobId, { date, nowMs = Date.now() } = {}) {
     const busy = busyBySlot.get(slot.value) || new Set();
     const free = candidates.filter((c) => {
       if (busy.has(Number(c.efr_id))) return false;              // already booked in this window
+      // Absent = explicitly on leave that day (is_leave_marked=1). softAttendance
+      // keeps them in the POOL so it's never empty, but they cannot be counted as
+      // free. On a future date nobody is absent, so this is a no-op there — which
+      // matches the honest "attendance isn't known yet" caveat the UI shows.
+      if (c.attendance_for_job_date === false) return false;
       const load = Number(c.active_jobs ?? 0);
       const cap = Number(c.max_concurrent ?? 0);
       return !(cap > 0 && load >= cap);                          // saturated for the day

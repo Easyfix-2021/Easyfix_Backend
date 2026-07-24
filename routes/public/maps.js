@@ -87,16 +87,24 @@ async function verifyTokenAndState(req, res) {
 }
 
 /*
- * GET /api/public/maps/autocomplete?token=<jwt>&q=<text>
+ * GET /api/public/maps/autocomplete?token=<jwt>&q=<text>&sessionToken=<uuid>
+ *
+ * `sessionToken` (added 2026-07-24) mirrors the admin mount — see the
+ * billing note in `services/maps.service.js`. Optional so existing
+ * callers keep working un-tokened.
  */
 router.get('/autocomplete', tokenRateLimit, validate(Joi.object({
   token: Joi.string().required(),
   q:     Joi.string().min(3).max(200).required(),
+  sessionToken: Joi.string().min(8).max(100).optional(),
 }), 'query'), async (req, res, next) => {
   if (!await verifyTokenAndState(req, res)) return;
   logger.info('Public maps autocomplete · q=' + String(req.query.q).trim());
   try {
-    const out = await mapsService.autocomplete(String(req.query.q).trim());
+    const out = await mapsService.autocomplete(
+      String(req.query.q).trim(),
+      req.query.sessionToken ? String(req.query.sessionToken) : undefined,
+    );
     modernOk(res, out);
   } catch (e) {
     logger.warn('Public maps autocomplete failed · ' + e.message);
@@ -107,16 +115,29 @@ router.get('/autocomplete', tokenRateLimit, validate(Joi.object({
 
 /*
  * GET /api/public/maps/geocode?token=<jwt>&place_id=… | &address=… | &latlng=…
+ *                              [&sessionToken=<uuid>]
+ *
+ * `sessionToken` (added 2026-07-24): when BOTH `place_id` AND
+ * `sessionToken` are present this closes out an autocomplete session
+ * — route to `placeDetails()` (session-billed Places API) instead of
+ * `geocode()` (Geocoding API, ignores sessiontoken). Mirrors the
+ * admin mount; see `services/maps.service.js` for the full rationale.
  */
 router.get('/geocode', tokenRateLimit, validate(Joi.object({
   token:    Joi.string().required(),
   place_id: Joi.string().min(5).max(300).optional(),
   address:  Joi.string().min(3).max(500).optional(),
   latlng:   Joi.string().pattern(/^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/).optional(),
+  sessionToken: Joi.string().min(8).max(100).optional(),
 }).or('place_id', 'address', 'latlng'), 'query'), async (req, res, next) => {
   if (!await verifyTokenAndState(req, res)) return;
   logger.info('Public maps geocode · by=' + (req.query.place_id ? 'place_id' : req.query.address ? 'address' : 'latlng'));
   try {
+    const sessionToken = req.query.sessionToken ? String(req.query.sessionToken) : null;
+    if (req.query.place_id && sessionToken) {
+      const out = await mapsService.placeDetails({ place_id: String(req.query.place_id), sessionToken });
+      return modernOk(res, out);
+    }
     const out = await mapsService.geocode({
       place_id: req.query.place_id ? String(req.query.place_id) : null,
       address:  req.query.address  ? String(req.query.address)  : null,
