@@ -404,9 +404,18 @@ const rescheduleBody = Joi.object({
   remarks: Joi.string().trim().min(1).max(500).required(),
 });
 
+/*
+ * Query schema for GET /:id/slot-recommendations. `date` is a wall-clock IST
+ * date — the service compares it as a plain string against DATE() values, so it
+ * must NOT be UTC-converted anywhere on the way in.
+ */
+const slotRecommendationsQuery = Joi.object({
+  date: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$/).max(40).required(),
+});
+
 const idParam = Joi.object({ id: intId.required() });
 
 module.exports = {
   listQuery, createBody, updateBody, statusBody, assignBody, offerBody, ownerBody, idParam,
-  rescheduleBody, candidatesQuery, candidatesSearchQuery,
+  rescheduleBody, candidatesQuery, candidatesSearchQuery, slotRecommendationsQuery,
 };

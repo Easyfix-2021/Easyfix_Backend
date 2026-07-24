@@ -43,5 +43,8 @@ router.use('/employee-productivity',  require('./employee-productivity'));
 router.use('/admin-dashboard',        require('./admin-dashboard'));
 router.use('/offer-acceptance',       require('./offer-acceptance'));
 router.use('/profile-update-requests', require('./profile-update-requests'));
+// Confirmation-quality audit: jobs pushed to Pending for Scheduling without the
+// customer ever confirming (no form submission / Unreachable, and no real call).
+router.use('/premature-confirmations', require('./premature-confirmations'));
 
 module.exports = router;

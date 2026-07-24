@@ -1782,10 +1782,185 @@ async function searchJobHeader(job) {
   };
 }
 
+/*
+ * ─── BEST TIME SLOT FOR A DATE ───────────────────────────────────────
+ *
+ * Ops pick an appointment date, then choose a window from a STATIC list with
+ * nothing to say which one can actually be staffed — so jobs get booked into
+ * windows where no suitable technician is free, surfacing later as failed
+ * assignments and reschedules. "Best slot" = a window where enough well-ranked,
+ * eligible technicians are genuinely free to serve this job's pincode.
+ *
+ * THE CANONICAL FOUR WINDOWS. Byte-identical to the CRM's `SLOTS`
+ * (Easyfix_CRM_UI/src/components/job/JobModal.tsx) and the customer form's
+ * `APPT_SLOTS` — the separator is an EN-DASH (U+2013), NOT a hyphen, and these
+ * exact strings are what `tbl_job.time_slot` stores. A hyphen here would silently
+ * match nothing.
+ *
+ * `After Hours` is 7 PM → 9 AM THE NEXT MORNING (some jobs must run at night),
+ * so it is the one OVERNIGHT window: its end hour is numerically LESS than its
+ * start. Any hour comparison that assumes fromH < toH breaks on it, which is why
+ * it carries an explicit `overnight` flag rather than being inferred.
+ *
+ * NOTE the CRM's own `SLOTS` records After Hours as fromH/toH = -1. That -1 is a
+ * FE sentinel meaning "don't nudge the time picker", not a claim that the window
+ * has no hours — the real range is the one below, and this service needs it to
+ * decide whether the window has passed.
+ */
+const APPOINTMENT_SLOTS = Object.freeze([
+  { value: '9 AM – 12 PM', fromH: 9,  toH: 12, overnight: false },
+  { value: '12 PM – 3 PM', fromH: 12, toH: 15, overnight: false },
+  { value: '3 PM – 7 PM',  fromH: 15, toH: 19, overnight: false },
+  { value: 'After Hours',  fromH: 19, toH: 9,  overnight: true  },
+]);
+
+/*
+ * Recommend which of the four windows to book on `date`.
+ *
+ * WHY THIS IS CHEAP: the ranking engine already recomputes attendance,
+ * concurrency and conflicts against a PROPOSED date (rankCandidatesForJob's
+ * jobDate override). Of those, only the same-slot conflict is slot-dependent —
+ * attendance and load are date-scoped. So all four windows come from ONE ranking
+ * pass plus ONE occupancy query, never four ranker calls.
+ *
+ * ⚠ ATTENDANCE IS ONLY REAL FOR TODAY. tbl_easyfixer_attendance rows appear when
+ * a technician marks in, and the eligibility filter selects the ABSENT set
+ * (is_leave_marked = 1). A FUTURE date has no rows, so everyone reads present.
+ * Same-day advice reflects attendance; future-date advice is eligibility + load.
+ * `attendanceKnown` is returned so the UI can say which it is rather than
+ * implying the system knows who will turn up next week.
+ *
+ * Returns EVERY window — never a filtered list — so the UI can show why a window
+ * is poor instead of hiding it. Advice only: nothing here blocks a booking.
+ */
+async function recommendSlotsForJob(jobId, { date, nowMs = Date.now() } = {}) {
+  const day = String(date || '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+    const e = new Error('date must be YYYY-MM-DD'); e.status = 400; throw e;
+  }
+
+  // ONE ranking pass for the date. enforceMaxConcurrent stays OFF so saturated
+  // technicians still come back with their load attached — we need that number
+  // to judge per-window freedom ourselves rather than having them pre-filtered.
+  const ranked = await rankCandidatesForJob(jobId, {
+    jobDate: day,
+    limit: 1000,
+    enforceMaxConcurrent: false,
+  });
+  const candidates = Array.isArray(ranked.candidates) ? ranked.candidates : [];
+  const efrIds = candidates.map((c) => Number(c.efr_id)).filter(Boolean);
+
+  // IST "today" from the fixed +5:30 offset — never CURDATE()/new Date() local,
+  // whose calendar day follows the server's timezone rather than IST.
+  const ist = new Date(nowMs + (5 * 60 + 30) * 60 * 1000);
+  const istToday = ist.toISOString().slice(0, 10);
+  const istHour = ist.getUTCHours();
+  const isToday = day === istToday;
+  const isPast = day < istToday;
+
+  /*
+   * ONE occupancy query: which windows each candidate is already committed to on
+   * this date. Status set (0,1,2) and the DATE()/time_slot predicates mirror the
+   * engine's own same-slot conflict query verbatim, so "busy" means exactly what
+   * it means everywhere else. The current job is excluded — rescheduling a job
+   * must not count as a clash with itself.
+   */
+  const busyBySlot = new Map();   // slot value -> Set(efr_id)
+  if (efrIds.length) {
+    const [rows] = await pool.query(
+      `SELECT DISTINCT fk_easyfixter_id AS efr_id, time_slot
+         FROM tbl_job
+        WHERE fk_easyfixter_id IN (?)
+          AND DATE(requested_date_time) = ?
+          AND job_status IN (0, 1, 2)
+          AND job_id <> ?`,
+      [efrIds, day, jobId],
+    );
+    for (const r of rows) {
+      if (!r.time_slot) continue;
+      if (!busyBySlot.has(r.time_slot)) busyBySlot.set(r.time_slot, new Set());
+      busyBySlot.get(r.time_slot).add(Number(r.efr_id));
+    }
+  }
+
+  const slots = APPOINTMENT_SLOTS.map((slot) => {
+    const busy = busyBySlot.get(slot.value) || new Set();
+    const free = candidates.filter((c) => {
+      if (busy.has(Number(c.efr_id))) return false;              // already booked in this window
+      const load = Number(c.active_jobs ?? 0);
+      const cap = Number(c.max_concurrent ?? 0);
+      return !(cap > 0 && load >= cap);                          // saturated for the day
+    });
+    const topScore = free.length ? Math.max(...free.map((c) => Number(c.score) || 0)) : 0;
+
+    /*
+     * Time-of-day gating, TODAY only.
+     *
+     * The OVERNIGHT window (After Hours, 7 PM → 9 AM next morning) can never
+     * have "already ended" on its own date — it runs past midnight into the
+     * following day, so while today is still today there is always some of it
+     * left. Comparing istHour >= toH would be wrong for it in both directions:
+     * at 10 AM it would read as ended (toH = 9), and it would never be gated at
+     * 8 PM when it is genuinely still open.
+     */
+    let unavailable = false;
+    let reason = null;
+    if (isPast) {
+      unavailable = true; reason = 'This date has already passed.';
+    } else if (isToday && !slot.overnight && istHour >= slot.toH) {
+      unavailable = true; reason = 'This window has already ended today.';
+    } else if (!free.length) {
+      reason = 'No technician is free for this window.';
+    }
+
+    return {
+      slot: slot.value,
+      freeCount: free.length,
+      totalCandidates: candidates.length,
+      topScore: Number(topScore.toFixed(4)),
+      unavailable,
+      reason,
+      recommended: false,           // set below
+    };
+  });
+
+  /*
+   * Rank by free-technician count, then by the best score among those free — a
+   * window with one excellent technician should not outrank one with five good
+   * ones, but it should beat an equally-staffed window of weaker technicians.
+   * Only a window that is both available AND has someone free can be the pick.
+   */
+  const best = slots
+    .filter((s) => !s.unavailable && s.freeCount > 0)
+    .sort((a, b) => (b.freeCount - a.freeCount) || (b.topScore - a.topScore))[0];
+  if (best) {
+    const hit = slots.find((s) => s.slot === best.slot);
+    if (hit) hit.recommended = true;
+  }
+
+  logger.info(
+    'Slot recommendations · jobId=' + jobId + ' · date=' + day
+    + ' · candidates=' + candidates.length
+    + ' · ' + slots.map((s) => `${s.slot}=${s.freeCount}`).join(' ')
+    + (best ? ' · best=' + best.slot : ' · best=none'),
+  );
+
+  return {
+    date: day,
+    slots,
+    candidatePool: candidates.length,
+    // Lets the UI phrase the advice honestly — see the attendance note above.
+    attendanceKnown: isToday,
+    note: ranked.note || null,
+  };
+}
+
 module.exports = {
   rankCandidatesForJob,
   searchTechniciansForJob,
   pickAutoAssignCandidate,
+  recommendSlotsForJob,
+  APPOINTMENT_SLOTS,
   RANKING_ORDER,
   PERFORMANCE_SUB,
   DEFAULTS,
