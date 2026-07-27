@@ -20,6 +20,9 @@ router.use(requirePropertyAllowlist(FEATURES.canBuildSkillMatrix, { label: 'Buil
 const buildBody = Joi.object({
   categoryId: Joi.number().integer().positive().optional(),
   dryRun: Joi.boolean().default(false),
+  // Opt-in: fold completion-history evidence into the AI classification.
+  // Defaults OFF — reliable only once ops' assignment process is trustworthy.
+  includeHistory: Joi.boolean().default(false),
 });
 
 // POST /build — run (or dry-run) the AI matrix build. Synchronous; the optional

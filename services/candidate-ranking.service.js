@@ -706,6 +706,30 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
   const deepSkillMap  = new Map((deepSkillResult[0] || []).map((r) => [r.efr_id, true]));
   const anySkillMap   = new Map((anySkillResult[0] || []).map((r) => [r.efr_id, true]));
 
+  // ── Job Skill Matrix match (shared by ranked list + search) ──────
+  // Resolve the deep skills THIS job's services require per the Job Skill
+  // Matrix, then mark which techs hold one. `matrixMatchSet === null` means
+  // the matrix has NO mapping for this job (or the lookup failed) — callers
+  // fall back to the category+type deep-skill match, so unmapped jobs behave
+  // exactly as before. Fail-soft: any error → null → category+type fallback.
+  const matrixSkillIds = await matrixRequiredSkillIds(job.job_id);
+  let matrixMatchSet = null;
+  if (matrixSkillIds.size && efrIds.length) {
+    try {
+      const skillList = [...matrixSkillIds];
+      const [rows] = await pool.query(
+        `SELECT DISTINCT m.easyfixer_id AS efr_id FROM tbl_efr_deepskill_mapping m
+          WHERE m.easyfixer_id IN (${efrIds.map(() => '?').join(',')}) AND m.is_repairing = 1
+            AND m.parent_skill_id IN (${skillList.map(() => '?').join(',')})`,
+        [...efrIds, ...skillList],
+      );
+      matrixMatchSet = new Set(rows.map((r) => Number(r.efr_id)));
+    } catch (e) {
+      logger.warn('stats matrix-match query failed (falling back to category+type) · ' + e.message);
+      matrixMatchSet = null;
+    }
+  }
+
   // Tech base fields — current pincode + zone FK.
   const baseMap = new Map();
   for (const r of (baseRowsResult[0] || [])) {
@@ -830,10 +854,13 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
       }
     }
 
-    // Deep-skill 3-state + bool.
-    const matchesJobSkill = deepSkillMap.get(id) === true;
+    // Deep-skill 3-state + bool. Prefer the Job Skill Matrix skill where the
+    // matrix maps this job; fall back to the category+type match otherwise.
+    const catgTypeMatch = deepSkillMap.get(id) === true;                       // category+type (fallback / eligibility signal)
+    const matrixMatch   = matrixMatchSet ? matrixMatchSet.has(id) : null;      // null = matrix has no mapping for this job
+    const effectiveMatch = matrixMatch !== null ? matrixMatch : catgTypeMatch; // matrix where mapped, else fallback
     const hasAnySkill = jobHasSkillReq ? (anySkillMap.get(id) === true) : true;
-    const skillStatus = deepSkillStatus({ jobHasSkillReq, hasAnySkill, matchesJobSkill });
+    const skillStatus = deepSkillStatus({ jobHasSkillReq, hasAnySkill, matchesJobSkill: effectiveMatch });
 
     const techZone = techZoneMap.get(id) || {};
 
@@ -852,7 +879,7 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
       // attendance_for_job_date: a cross now means EXPLICITLY marked absent
       // (is_leave_marked=1), not merely "hasn't marked attendance".
       attendance_marked:  !absentMap.has(id),
-      has_deep_skill:     matchesJobSkill,
+      has_deep_skill:     catgTypeMatch,
       tat_target_hours:   tatTargetHours,
       max_concurrent:     maxConcurrent,
       // Defaults travel through to scoreOne so per-job overrides work.
@@ -868,7 +895,9 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
       // Present UNLESS explicitly marked absent — `absentMap` is the leave set.
       attendance_for_job_date: !absentMap.has(id),
       deep_skill_status:      skillStatus,
-      deep_skill_match:       matchesJobSkill,
+      deep_skill_match:       effectiveMatch,
+      skill_matrix_match:     matrixMatch,
+      skill_signal:           effectiveMatch,
       worked_in_category:     workedVerticalMap.get(id) === true,
       concurrent_jobs_count:  concurrentMap.get(id) ?? 0,
       same_slot_conflict:     conflictMap.get(id) === true,
@@ -977,6 +1006,8 @@ function buildCandidateRow(tech, s, job) {
     // overstatement the 4th state exists to remove.
     deep_skill_status:      s.deep_skill_status ?? 'not_applicable',
     deep_skill_match:       s.deep_skill_match === true,
+    skill_matrix_match:     s.skill_matrix_match ?? null,
+    skill_signal:           s.skill_signal === true,
     worked_in_category:     s.worked_in_category === true,
     payment_mode:           paidByLabel(job.paid_by),
     concurrent_jobs_count:  s.concurrent_jobs_count ?? 0,
@@ -1308,43 +1339,6 @@ async function rankCandidatesForJob(jobId, {
       l1Count: 0, l2Count: 0, candidates: [], rejected: [],
       config: { ranking_order: RANKING_ORDER, performance_sub: PERFORMANCE_SUB },
     };
-  }
-
-  /*
-   * SKILL-MATRIX signal (ranking only — never excludes; sparse-matrix-safe).
-   *
-   * Resolve the deep skills THIS job's services actually require per the Job
-   * Skill Matrix, then mark which scored techs hold one. `matrixApplicable` is
-   * false when the matrix has no mapping for this job — in which case
-   * skill_signal falls back to the existing category+type match (has_deep_skill),
-   * so an unmapped job ranks exactly as it does today. One extra query, over the
-   * already-eligible set, fail-soft.
-   */
-  const matrixSkillIds = await matrixRequiredSkillIds(job.job_id);
-  const matrixApplicable = matrixSkillIds.size > 0;
-  let matrixMatchSet = null;
-  if (matrixApplicable && scored.length) {
-    try {
-      const ids = scored.map((s) => Number(s.efr_id)).filter(Boolean);
-      const skillList = [...matrixSkillIds];
-      const [rows] = await pool.query(
-        `SELECT DISTINCT m.easyfixer_id AS efr_id
-           FROM tbl_efr_deepskill_mapping m
-          WHERE m.easyfixer_id IN (${ids.map(() => '?').join(',')})
-            AND m.is_repairing = 1
-            AND m.parent_skill_id IN (${skillList.map(() => '?').join(',')})`,
-        [...ids, ...skillList],
-      );
-      matrixMatchSet = new Set(rows.map((r) => Number(r.efr_id)));
-    } catch (e) {
-      logger.warn('Matrix candidate-match query failed (falling back to category+type) · jobId=' + job.job_id + ' · ' + e.message);
-      matrixMatchSet = null;
-    }
-  }
-  for (const s of scored) {
-    // matrix match where the matrix applies, else the category+type match.
-    s.skill_matrix_match = matrixMatchSet ? matrixMatchSet.has(Number(s.efr_id)) : null;
-    s.skill_signal = matrixMatchSet ? matrixMatchSet.has(Number(s.efr_id)) : (s.has_deep_skill === true);
   }
 
   /*

@@ -128,10 +128,11 @@ async function loadServiceNames(categoryId) {
 // Returns { results: [{ service_name, deep_skill_id, confidence }], llmOk }.
 // llmOk === false ONLY when the Sophy call itself failed (so the caller can
 // retry); a genuine empty answer returns { results: [], llmOk: true }.
-async function classifyBatch(categoryId, categoryName, skills, names) {
+async function classifyBatch(categoryId, categoryName, skills, names, history = null) {
   const skillList = skills
     .map((s) => `${s.deepskill_id}: ${s.name}${s.type ? ` (${s.type})` : ''}`)
     .join('\n');
+  const hasHistory = !!(history && Array.isArray(history.skills) && history.skills.length);
   const system = [
     'You map home-service booking line-items to the technical DEEP SKILL(s) a technician needs to perform them.',
     'You get a list of candidate deep skills (as "id: name (service type)") and a list of service line-item names, all within one service category.',
@@ -140,13 +141,21 @@ async function classifyBatch(categoryId, categoryName, skills, names) {
     '- Only choose ids from the given list. NEVER invent ids.',
     '- A service maps to 0, 1, or a few deep skills. Prefer the single best match; add more only when clearly needed.',
     '- If the name is a fee/charge/discount/incentive/visit-charge/tax or any non-service line item, or nothing fits, return an EMPTY ids array.',
+    ...(hasHistory ? [
+      '- A HISTORICAL SIGNAL is provided: deep skills most commonly held by technicians who recently COMPLETED jobs in this category. Use it as SUPPORTING evidence (a service is somewhat more likely to need a frequently-held skill), but the service NAME is the PRIMARY signal — never map a service to a skill its name clearly does not call for just because that skill is common.',
+    ] : []),
     '- confidence is 0..1 (your certainty).',
     'Return STRICT JSON: {"mappings":[{"service":"<exact input name>","ids":[<id>,...],"confidence":<0..1>}]}',
   ].join('\n');
+  const historyBlock = hasHistory
+    ? `\n\nHistorical signal (deep skills held by the ${history.total} technicians who completed recent jobs in this category):\n` +
+      history.skills.map((h) => `- ${h.deepskill_id}: ${h.deepskill_name} — held by ${h.techs_holding}/${history.total}`).join('\n')
+    : '';
   const user =
     `Service Category: ${categoryName || categoryId}\n\n` +
     `Candidate deep skills:\n${skillList}\n\n` +
-    `Service names:\n${names.map((n) => `- ${n}`).join('\n')}`;
+    `Service names:\n${names.map((n) => `- ${n}`).join('\n')}` +
+    historyBlock;
 
   const out = await chatJson({ system, user });
   // out === null ⇒ the Sophy call itself failed (timeout / quota / unparseable).
@@ -179,12 +188,54 @@ async function classifyBatch(categoryId, categoryName, skills, names) {
 }
 
 /*
+ * OPT-IN empirical signal ("Include Completed Job Details" toggle). The deep
+ * skills held by the technicians who completed the most recent jobs in a
+ * category, ranked by how many of them hold each — fed to the LLM as SUPPORTING
+ * evidence in classifyBatch. Restricted to the category's OWN skills so a
+ * completer's unrelated skills don't add noise.
+ *
+ * ⚠ Only as reliable as the assignment process behind that history. While ops
+ * still assign somewhat randomly, this would skew the matrix — hence it's gated
+ * behind a UI toggle that DEFAULTS OFF. Fail-soft: any error → empty → the build
+ * proceeds name-only. One query pair per category; reused across its batches.
+ */
+const HISTORY_JOB_SAMPLE = 50; // recent completed jobs sampled per category
+async function loadCompletionHistorySkills(catgId) {
+  try {
+    const [jobRows] = await pool.query(
+      `SELECT DISTINCT fk_easyfixter_id AS efr FROM (
+         SELECT j.fk_easyfixter_id FROM tbl_job j
+          WHERE j.job_status IN (3, 5) AND j.fk_service_catg_id = ? AND j.fk_easyfixter_id IS NOT NULL
+          ORDER BY j.job_id DESC LIMIT ?
+       ) t`,
+      [catgId, HISTORY_JOB_SAMPLE],
+    );
+    const efrs = jobRows.map((r) => Number(r.efr)).filter(Boolean);
+    if (!efrs.length) return { total: 0, skills: [] };
+    const [skillRows] = await pool.query(
+      `SELECT ds.deepskill_id, ds.deepskill_name, COUNT(DISTINCT m.easyfixer_id) AS techs_holding
+         FROM tbl_efr_deepskill_mapping m
+         JOIN tbl_deep_skill ds ON ds.deepskill_id = m.parent_skill_id
+              AND ds.status = 1 AND ds.category_id = ?
+        WHERE m.easyfixer_id IN (${efrs.map(() => '?').join(',')}) AND m.is_repairing = 1
+        GROUP BY ds.deepskill_id, ds.deepskill_name
+        ORDER BY techs_holding DESC`,
+      [catgId, ...efrs],
+    );
+    return { total: efrs.length, skills: skillRows };
+  } catch (e) {
+    logger.warn('skill-matrix history query failed (proceeding name-only) · categoryId=' + catgId + ' · ' + e.message);
+    return { total: 0, skills: [] };
+  }
+}
+
+/*
  * Build (or dry-run) the matrix. Scope is optional (categoryId). For each
  * in-scope category with active deep skills, classifies its distinct service
  * names in BATCHes, then wholesale-replaces the category's source=AI rows
  * (manual overrides preserved via INSERT IGNORE). Returns a summary.
  */
-async function buildMatrix({ categoryId = null, dryRun = false } = {}) {
+async function buildMatrix({ categoryId = null, dryRun = false, includeHistory = false } = {}) {
   if (!llmEnabled()) {
     const e = new Error('Sophy (SOPHY_API_KEY) is not configured — cannot build the skill matrix.');
     e.status = 422;
@@ -214,7 +265,7 @@ async function buildMatrix({ categoryId = null, dryRun = false } = {}) {
   }
 
   let categoriesProcessed = 0, servicesSeen = 0, mappingsFound = 0, mappingsWritten = 0, llmCalls = 0;
-  let llmFailedBatches = 0;
+  let llmFailedBatches = 0, categoriesWithHistory = 0;
   // (categoryId|serviceName) that received >=1 skill — lets the build report how
   // many services it left with NO mapping (visit/charge line items the model
   // deliberately skips, plus any genuine gaps worth a manual override).
@@ -225,17 +276,22 @@ async function buildMatrix({ categoryId = null, dryRun = false } = {}) {
     categoriesProcessed++;
     servicesSeen += names.length;
 
+    // Opt-in empirical grounding (see loadCompletionHistorySkills). One query pair
+    // per category; the SAME history object is reused across the category's batches.
+    const history = includeHistory ? await loadCompletionHistorySkills(catgId) : null;
+    if (history && history.skills.length) categoriesWithHistory++;
+
     const found = [];
     for (let i = 0; i < names.length; i += BATCH) {
       const batchNames = names.slice(i, i + BATCH);
       llmCalls++;
-      let { results, llmOk } = await classifyBatch(catgId, catgNameById.get(catgId), skills, batchNames);
+      let { results, llmOk } = await classifyBatch(catgId, catgNameById.get(catgId), skills, batchNames, history);
       if (!llmOk) {
         // Retry ONCE. Without this a single transient Sophy failure silently
         // drops this whole batch's services from the matrix — the exact "some
         // are missed in build" symptom. A genuine empty answer never lands here.
         llmCalls++;
-        ({ results, llmOk } = await classifyBatch(catgId, catgNameById.get(catgId), skills, batchNames));
+        ({ results, llmOk } = await classifyBatch(catgId, catgNameById.get(catgId), skills, batchNames, history));
         if (!llmOk) {
           llmFailedBatches++;
           logger.warn('skill-matrix: LLM batch failed twice — ' + batchNames.length + ' service(s) left unmapped this build · categoryId=' + catgId);
@@ -281,7 +337,7 @@ async function buildMatrix({ categoryId = null, dryRun = false } = {}) {
   }
 
   const servicesUnmapped = Math.max(servicesSeen - mappedNames.size, 0);
-  const summary = { categoriesProcessed, servicesSeen, mappingsFound, mappingsWritten, servicesUnmapped, llmFailedBatches, llmCalls, dryRun, model: MODEL };
+  const summary = { categoriesProcessed, servicesSeen, mappingsFound, mappingsWritten, servicesUnmapped, llmFailedBatches, llmCalls, includeHistory, categoriesWithHistory, dryRun, model: MODEL };
   logger.info('Skill-matrix build done · ' + JSON.stringify(summary));
   return summary;
 }
