@@ -77,9 +77,10 @@ async function getWeeklyPerformance(efrId, from, to) {
       logger.warn({ err: e.message, efrId }, 'mobile-performance rating failed');
       return 0;
     }),
-    // Acceptance rate (jobs accepted / offered) — reuses performance.service's
-    // scheduling_history definition so the Performance screen stays consistent
-    // with the dashboard ring. Omitted when the tech has no offer history yet.
+    // Acceptance rate (offers accepted / offered, from tbl_job_offer) — the SAME
+    // computeAcceptance the dashboard uses, so the acceptance chip, the dashboard
+    // stat, and the Your-Offers card all agree. Omitted when there's no offer
+    // history yet (caller falls back to OTA).
     performanceService.computeAcceptance(efrId).catch((e) => {
       logger.warn({ err: e.message, efrId }, 'mobile-performance acceptance failed');
       return { acceptanceRate: undefined };
