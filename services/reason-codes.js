@@ -55,6 +55,10 @@ const ACTION_TYPE_BY_MODE = Object.freeze({
 });
 
 const ACTION_TYPE = Object.freeze({
+  // Cancel Job → action_type = 1 bucket (CRM admin Cancel dialog). Reason is
+  // picked per user_type via the "Cancellation Due To" radio, mirroring the
+  // Add Remarks (action_type = 5) flow. Replaces the deprecated tbl_cancel_reason.
+  CANCEL: 1,
   ADD_REMARKS: 5,
   ENQUIRY: 24,
   UNREACHABLE: 25,

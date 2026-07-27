@@ -968,6 +968,38 @@ router.get('/comment-reasons', async (req, res, next) => {
 });
 
 /*
+ * GET /api/admin/jobs/cancel-reasons?dueTo=customer|client|easyfix|technician
+ *
+ * Reason list for the Cancel Job popup — the cancel-flow twin of
+ * /comment-reasons. Reads action_taken_reason WHERE action_type = 1 (the Cancel
+ * bucket, ACTION_TYPE.CANCEL) AND user_type = the "Cancellation Due To" radio,
+ * so the dropdown narrows as the operator switches the radio (same as Add
+ * Remarks). The picked id lands in tbl_job.enum_reason_id + the tbl_job_comment
+ * audit row on submit. Default user_type = 1 (EasyFix) — CRM-staff-initiated
+ * cancel. Replaces the deprecated tbl_cancel_reason source.
+ * Route-order: declared BEFORE `/:id`.
+ */
+router.get('/cancel-reasons', async (req, res, next) => {
+  try {
+    const dueRaw = String(req.query.dueTo || '').toLowerCase().replace(/\s+/g, '');
+    const userType = DUE_TO_USER_TYPE[dueRaw] || 1; // default = EasyFix (user_type 1)
+    logger.info('Fetch cancel reasons · dueTo=' + (dueRaw || '-') + ' userType=' + userType);
+    const [rows] = await imagePool.query(
+      `SELECT id, action_desc FROM action_taken_reason
+        WHERE action_type = ? AND user_type = ?
+              AND (status IS NULL OR status = 1)
+        ORDER BY id ASC`,
+      [ACTION_TYPE.CANCEL, userType]
+    );
+    const items = rows
+      .map((r) => ({ id: r.id, label: String(r.action_desc || '').trim() }))
+      .filter((x) => x.label);
+    logger.info('Returning ' + items.length + ' cancel reasons');
+    modernOk(res, items);
+  } catch (e) { next(e); }
+});
+
+/*
  * GET /api/admin/jobs/:id/transaction
  *
  * Read-only, all-data payload for the legacy "Job Transaction" view

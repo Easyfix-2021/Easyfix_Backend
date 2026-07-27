@@ -2961,8 +2961,11 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
   const actorId = actor?.user_id || null;
 
   if (Number(status) === STATUS.CANCELLED) {
-    sets.push('cancel_date_time = ?', 'cancel_reason_id = ?', 'cancel_comment = ?', 'cancel_by = ?');
-    values.push(new Date(), reasonId || null, comment || null, actorId);
+    // enum_reason_id mirrors the picked action_taken_reason id — the same column
+    // the job-comment History JOIN resolves against — so the cancel reason renders
+    // there; cancel_reason_id keeps the legacy cancel-audit column populated too.
+    sets.push('cancel_date_time = ?', 'cancel_reason_id = ?', 'cancel_comment = ?', 'cancel_by = ?', 'enum_reason_id = ?');
+    values.push(new Date(), reasonId || null, comment || null, actorId, reasonId || null);
   } else if (Number(status) === STATUS.CALL_LATER) {
     // UNREACHABLE / CALL_LATER outcome — set the call_later flag (if
     // the column exists) and stamp `cancel_by` so the audit trail
@@ -3105,6 +3108,26 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
   // enquiry_date_time are already persisted when the send reads them.
   if (Number(status) === STATUS.ENQUIRY && Number(existing.job_status) !== STATUS.ENQUIRY) {
     require('./enquiry-notification.service').fireEnquiryWhatsapp(jobId);
+  }
+
+  // Cancel audit comment (2026-07-27): mirror Add Remarks — record the
+  // cancellation on the job comment / History timeline so it isn't only in the
+  // cancel_* columns. comment_on = 1 is the lifecycle/audit bucket (no cancel-
+  // specific stage code exists; reschedule + Add Remarks use 1 too). Guard on a
+  // real transition INTO cancelled so a 6→6 re-submit doesn't double-write. The
+  // reason renders in History via enum_reason_id. Non-fatal — a comment failure
+  // must never block the cancellation (the UPDATE above already persisted it).
+  if (Number(status) === STATUS.CANCELLED && Number(existing.job_status) !== STATUS.CANCELLED) {
+    try {
+      await require('./job-comment.service').addComment(jobId, {
+        comments: (comment && String(comment).trim()) || 'Job cancelled',
+        comment_on: 1,
+        commented_by: actorId,
+        enum_reason_id: reasonId || null,
+      });
+    } catch (e) {
+      logger.warn('Cancel audit comment failed (non-fatal) · id=' + jobId + ' · ' + e.message);
+    }
   }
 
   // Ops took a deliberate status action (confirm 9→0, cancel, enquiry, …) — any
