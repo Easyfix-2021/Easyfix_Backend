@@ -443,7 +443,14 @@ async function list({
 
   const [rows] = await pool.query(
     `SELECT ssm.id, ssm.service_catg_id, sc.service_catg_name, ssm.service_name,
-            ssm.deep_skill_id, ds.deepskill_name, ssm.confidence, ssm.source, ssm.updated_on
+            ssm.deep_skill_id, ds.deepskill_name, ssm.confidence, ssm.source, ssm.updated_on,
+            -- Options the mapped deep skill carries (level-4 of the hierarchy),
+            -- comma-joined for display. The matrix maps to the deep SKILL only for
+            -- now, so we show ALL its active options; option-level mapping is a
+            -- separate step. tbl_deepskill_options is small + indexed by deepskill.
+            (SELECT GROUP_CONCAT(o.skill_option ORDER BY o.id SEPARATOR ', ')
+               FROM tbl_deepskill_options o
+              WHERE o.deepskill_id = ssm.deep_skill_id AND o.status = 1) AS deepskill_options
        ${from}
       ORDER BY ${orderBy}
       LIMIT ? OFFSET ?`,
