@@ -984,10 +984,21 @@ router.get('/cancel-reasons', async (req, res, next) => {
     const dueRaw = String(req.query.dueTo || '').toLowerCase().replace(/\s+/g, '');
     const userType = DUE_TO_USER_TYPE[dueRaw] || 1; // default = EasyFix (user_type 1)
     logger.info('Fetch cancel reasons · dueTo=' + (dueRaw || '-') + ' userType=' + userType);
+    // is_new = MAX(is_new) → "curated-else-legacy": prefer the curated new set
+    // (is_new=1), but fall back to the migrated legacy rows (is_new=0) for any
+    // bucket that has NO curated rows. A blanket `AND is_new = 1` would EMPTY
+    // such a bucket (the documented action_taken_reason gotcha — e.g. reschedule
+    // has only is_new=0 rows), which for a mandatory reason dropdown = a dead
+    // Cancel flow. The correlated subquery keeps this per (action_type,user_type).
     const [rows] = await imagePool.query(
-      `SELECT id, action_desc FROM action_taken_reason
+      `SELECT id, action_desc FROM action_taken_reason ar
         WHERE action_type = ? AND user_type = ?
               AND (status IS NULL OR status = 1)
+              AND is_new = (
+                SELECT MAX(is_new) FROM action_taken_reason
+                 WHERE action_type = ar.action_type AND user_type = ar.user_type
+                       AND (status IS NULL OR status = 1)
+              )
         ORDER BY id ASC`,
       [ACTION_TYPE.CANCEL, userType]
     );
