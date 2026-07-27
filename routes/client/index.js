@@ -19,8 +19,12 @@ router.post('/auth/login-otp', validate(Joi.object({ identifier: identifier.requ
   try {
     logger.info('SPOC login-OTP requested');
     const r = await clientAuth.createLoginOtp(req.body.identifier);
-    logger.info('SPOC login-OTP result · delivered=' + (r.found ? 'yes' : 'no'));
-    modernOk(res, { delivered: r.found, expiresAt: r.expiresAt || null });
+    logger.info('SPOC login-OTP result · delivered=' + (r.found ? 'yes' : 'no') + (r.clientInactive ? ' (client inactive)' : ''));
+    modernOk(res, {
+      delivered: r.found,
+      expiresAt: r.expiresAt || null,
+      message: r.clientInactive ? 'This client account is inactive. Please contact your EasyFix SPOC.' : undefined,
+    });
   } catch (e) { logger.error('SPOC login-OTP failed · ' + e.message); next(e); }
 });
 
@@ -33,6 +37,9 @@ router.post('/auth/verify-otp', validate(Joi.object({
     const r = await clientAuth.verifyLoginOtp(req.body.identifier, req.body.otp);
     if (!r.ok) {
       logger.warn('SPOC verify-OTP rejected · ' + r.reason);
+      if (r.reason === 'CLIENT_INACTIVE') {
+        return modernError(res, 403, 'This client account is inactive. Please contact your EasyFix SPOC.');
+      }
       return modernError(res, 401, r.reason);
     }
     logger.info('SPOC verify-OTP ok · spocId=' + r.spoc.id + ' clientId=' + r.spoc.client_id);
@@ -41,6 +48,27 @@ router.post('/auth/verify-otp', validate(Joi.object({
     res.cookie('client_auth_token', r.token, { httpOnly: true, sameSite: 'lax', maxAge: 30 * 86400 * 1000 });
     modernOk(res, { token: r.token, spoc: { id: r.spoc.id, name: r.spoc.contact_name, client_id: r.spoc.client_id } });
   } catch (e) { logger.error('SPOC verify-OTP failed · ' + e.message); next(e); }
+});
+
+// Public (pre-login) support — a user who can't sign in (not registered /
+// inactive) can still reach us from the login screen. Sends to the IT helpdesk;
+// NO auth required, so it stays above requireSpocAuth.
+router.post('/auth/support', validate(Joi.object({
+  email: Joi.string().allow('', null).max(150),
+  subject: Joi.string().allow('', null).max(200),
+  message: Joi.string().min(3).max(1000).required(),
+})), async (req, res, next) => {
+  try {
+    const message = String(req.body.message).trim();
+    const from = String(req.body.email || '').trim();
+    const subject = String(req.body.subject || '').trim() || 'Client App — Support Request (login)';
+    const text = `From: ${from || 'unknown (login screen)'}\n\n${message}`;
+    await require('../../services/email.service').send({
+      to: ['ithelpdesk@easyfix.in'], cc: ['prem.rai@easyfix.in'], subject, text, category: 'client-support-public',
+    });
+    logger.info('Public client support email · from=' + (from || '-'));
+    modernOk(res, { sent: true });
+  } catch (e) { next(e); }
 });
 
 // ─── Protected ──────────────────────────────────────────────────────
@@ -824,6 +852,47 @@ router.get('/support-contacts', async (req, res, next) => {
       to: primary.map((p) => p.email),        // primary SPOC(s)
       cc: secondary.map((s) => s.email),      // secondary SPOC(s)
     });
+  } catch (e) { next(e); }
+});
+
+// Contact Support — sends the support email SERVER-SIDE so the app never opens
+// the phone's mail app. Recipients are resolved server-side (To = primary
+// SPOC(s), Cc = secondary SPOC(s) + prem.rai@easyfix.in) — never trusted from
+// the client body. The app just sends { subject?, message }.
+router.post('/support', async (req, res, next) => {
+  try {
+    const message = String(req.body?.message || '').trim();
+    if (message.length < 3) return modernError(res, 400, 'Please add a message (min 3 characters).');
+    const [rows] = await pool.query(
+      `SELECT vm.user_type, u.official_email AS email
+         FROM tbl_vertical_mapping vm
+         JOIN tbl_user u ON u.user_id = vm.user_id AND u.user_status = 1
+        WHERE vm.client_id = ? AND vm.user_type IN (1, 2)
+          AND u.official_email IS NOT NULL AND u.official_email <> ''
+        ORDER BY vm.user_type, u.user_id`,
+      [req.spoc.client_id]);
+    const primary = rows.filter((r) => Number(r.user_type) === 1).map((r) => r.email);
+    const secondary = rows.filter((r) => Number(r.user_type) === 2).map((r) => r.email);
+    const to = primary.length ? primary : ['ithelpdesk@easyfix.in'];
+    const cc = Array.from(new Set([...secondary, 'prem.rai@easyfix.in'])).filter(Boolean);
+    const [[cl]] = await pool.query('SELECT client_name FROM tbl_client WHERE client_id = ?', [req.spoc.client_id]);
+    const clientName = cl?.client_name || '';
+    const subject = String(req.body?.subject || '').trim() || `Client App Support Request${clientName ? ' – ' + clientName : ''}`;
+    const from = req.spoc.contact_email || req.spoc.contact_no || '';
+    const text = `From: ${req.spoc.contact_name || ''} <${from}>${clientName ? ' · ' + clientName : ''}\n\n${message}`;
+    await require('../../services/email.service').send({ to, cc, subject, text, category: 'client-support' });
+    logger.info('Client support email sent · clientId=' + req.spoc.client_id + ' · to=' + to.join(','));
+    modernOk(res, { sent: true, to, cc, subject });
+  } catch (e) { next(e); }
+});
+
+// Delete (deactivate) my account — soft delete: sets the SPOC inactive so they
+// can no longer log in (findSpoc/findSpocById require status = 1). Data is kept.
+router.delete('/profile', async (req, res, next) => {
+  try {
+    await pool.query('UPDATE tbl_client_contacts SET status = 0 WHERE id = ?', [req.spoc.id]);
+    logger.info('Client account deactivated (delete) · spocId=' + req.spoc.id);
+    modernOk(res, { deleted: true });
   } catch (e) { next(e); }
 });
 

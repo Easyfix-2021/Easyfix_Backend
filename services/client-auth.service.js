@@ -16,11 +16,17 @@ async function findSpoc(identifier) {
   // usable). LOWER() on both sides handles any stored casing. Both createLoginOtp
   // and verifyLoginOtp key otp_details by the RETURNED row's canonical
   // contact_email/contact_no, so OTP correlation stays intact regardless of casing.
-  const col = isEmail ? 'LOWER(contact_email)' : 'contact_no';
+  const col = isEmail ? 'LOWER(cc.contact_email)' : 'cc.contact_no';
   const value = isEmail ? raw.toLowerCase() : raw;
+  // SPOC must be active (cc.status = 1 — inactive SPOC = "you are inactive").
+  // Also carry the CLIENT's active flag (cl.client_status) so callers can
+  // block/label an inactive client distinctly.
   const [[row]] = await pool.query(
-    `SELECT id, client_id, contact_name, contact_email, contact_no
-       FROM tbl_client_contacts WHERE ${col} = ? AND status = 1 LIMIT 1`,
+    `SELECT cc.id, cc.client_id, cc.contact_name, cc.contact_email, cc.contact_no,
+            cl.client_status
+       FROM tbl_client_contacts cc
+       LEFT JOIN tbl_client cl ON cl.client_id = cc.client_id
+      WHERE ${col} = ? AND cc.status = 1 LIMIT 1`,
     [value]
   );
   return row || null;
@@ -28,8 +34,11 @@ async function findSpoc(identifier) {
 
 async function findSpocById(id) {
   const [[row]] = await pool.query(
-    `SELECT id, client_id, contact_name, contact_email, contact_no
-       FROM tbl_client_contacts WHERE id = ? AND status = 1 LIMIT 1`,
+    `SELECT cc.id, cc.client_id, cc.contact_name, cc.contact_email, cc.contact_no,
+            cl.client_status
+       FROM tbl_client_contacts cc
+       LEFT JOIN tbl_client cl ON cl.client_id = cc.client_id
+      WHERE cc.id = ? AND cc.status = 1 LIMIT 1`,
     [id]
   );
   return row || null;
@@ -70,6 +79,10 @@ async function createLoginOtp(identifier) {
   const spoc = await findSpoc(identifier);
   if (!spoc) logger.warn('Create login OTP · SPOC not found');
   if (!spoc) return { found: false };
+  if (Number(spoc.client_status) !== 1) {
+    logger.warn('Create login OTP · client inactive · clientId=' + spoc.client_id);
+    return { found: false, clientInactive: true };
+  }
   // SPOC identifier can be email or mobile (we accept both via findSpoc).
   // resolveLoginOtp picks 2468 for email or last 4 digits of mobile in QA;
   // real random in prod.
@@ -81,7 +94,7 @@ async function createLoginOtp(identifier) {
   // a future verify. See auth.service.js for the full rationale.
   const [[existing]] = await pool.query(
     `SELECT id FROM otp_details
-      WHERE user_email = ? AND user_mobile_no = ? AND otp_type = 'Login Otp'
+      WHERE user_email = ? AND user_mobile_no = ? AND otp_type = 'Client_login'
       LIMIT 1`,
     [spoc.contact_email, spoc.contact_no]
   );
@@ -96,7 +109,7 @@ async function createLoginOtp(identifier) {
   } else {
     await pool.query(
       `INSERT INTO otp_details (otp, otp_type, user_email, user_mobile_no, generated_on, valid_up_to, is_expired, count)
-       VALUES (?, 'Login Otp', ?, ?, ?, ?, 0, 1)`,
+       VALUES (?, 'Client_login', ?, ?, ?, ?, 0, 1)`,
       [otp, spoc.contact_email, spoc.contact_no, now, expires]
     );
   }
@@ -124,11 +137,15 @@ async function verifyLoginOtp(identifier, otp) {
   const spoc = await findSpoc(identifier);
   if (!spoc) logger.warn('Verify login OTP · reason=USER_NOT_FOUND');
   if (!spoc) return { ok: false, reason: 'USER_NOT_FOUND' };
+  if (Number(spoc.client_status) !== 1) {
+    logger.warn('Verify login OTP · reason=CLIENT_INACTIVE · clientId=' + spoc.client_id);
+    return { ok: false, reason: 'CLIENT_INACTIVE' };
+  }
   // Match the same (email, mobile, otp_type) tuple that createLoginOtp wrote.
   // AND-ing both columns ensures partial legacy rows never get returned.
   const [[row]] = await pool.query(
     `SELECT id, otp, valid_up_to, is_expired FROM otp_details
-      WHERE user_email = ? AND user_mobile_no = ? AND otp_type = 'Login Otp'
+      WHERE user_email = ? AND user_mobile_no = ? AND otp_type = 'Client_login'
       LIMIT 1`,
     [spoc.contact_email, spoc.contact_no]
   );
