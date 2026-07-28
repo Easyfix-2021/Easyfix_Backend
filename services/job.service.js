@@ -194,8 +194,19 @@ const LIST_COLUMNS = `
   j.fk_client_id, cl.client_name,
   j.fk_service_catg_id, sc.service_catg_name AS service_category,
   j.fk_easyfixter_id, ef.efr_name AS easyfixer_name,
+  /*
+   * easyfixer_mobile — the assigned technician's phone (tbl_easyfixer.efr_no),
+   * surfaced so the Pending-to-Start Technician column can offer click-to-call.
+   * This exact alias is already listed in utils/mask-mobile.js MOBILE_FIELDS
+   * (and deliberately NOT in CUSTOMER_MOBILE_FIELDS), so the mask middleware
+   * auto-masks it to first-4-then-bullets and keeps it masked even when the
+   * customer-number-visible flag is ON — do NOT add any other masking here, and
+   * do NOT rename the alias (a different key would bypass the mask and leak the
+   * staff number).
+   */
+  ef.efr_no AS easyfixer_mobile,
   j.job_owner, ow.user_name AS owner_name,
-  j.fk_address_id, ci.city_name,
+  j.fk_address_id, ci.city_name, ad.address,
   /*
    * service_count — count of ACTIVE rows on tbl_job_services for this
    * job. Powers the FE "Booked but no services" pill (added
@@ -799,6 +810,20 @@ const DATE_TYPE_COLUMN = {
   requested: 'j.requested_date_time',
 };
 
+/*
+ * Normalise a filter param that may arrive as a single number, a single-id
+ * string, a CSV string ("12,34") or an array into a clean number[]. Mirrors the
+ * `statuses` CSV-split pattern above so the Pending-to-Start multi-select
+ * filters (clientId / cityId / projectManagerId / zonalManagerId) can each build
+ * an IN (?, ?, …) clause. Back-compatible: a lone id still yields a 1-element
+ * array, so pre-existing single-select callers keep working unchanged.
+ */
+function toIdArray(v) {
+  if (v == null || v === '') return [];
+  const raw = Array.isArray(v) ? v : String(v).split(',');
+  return raw.map((s) => Number(String(s).trim())).filter((n) => Number.isFinite(n));
+}
+
 async function list({
   q, status, statuses, assigned, clientId, cityId, ownerId, easyfixerId,
   clientOwnerIds,            // number[] — restrict to jobs owned (job_client_owner) by these client users (reporting-manager scope)
@@ -814,6 +839,8 @@ async function list({
   stateId,                   // FK   — tbl_city.state_id
   categoryId,                // FK   — j.fk_service_catg_id
   verticalId,                // FK   — via EXISTS on tbl_vertical_mapping
+  projectManagerId,          // FK   — tbl_vertical_mapping.user_id where user_type = 1
+  zonalManagerId,            // FK   — tbl_city.state_user (the city's zonal owner)
   dateType,                  // enum — see DATE_TYPE_COLUMN above
   // Phase-2 filters (2026-05-19).
   rating,                    // 1..5 — tbl_easyfixer_rating_by_customer.customer_rating
@@ -938,14 +965,29 @@ async function list({
        WHERE js.job_id = j.job_id AND js.job_service_status = 1
     )`);
   }
-  if (clientId != null)    { clauses.push('j.fk_client_id = ?');     params.push(clientId); }
+  // clientId — single id OR CSV/array (Pending-to-Start multi-select Clients
+  // filter). Builds j.fk_client_id IN (...) — the `j` alias is always present,
+  // so no COUNT-join change. Narrows within any RBAC clients scope applied above.
+  const clientIdList = toIdArray(clientId);
+  if (clientIdList.length) {
+    clauses.push(`j.fk_client_id IN (${clientIdList.map(() => '?').join(',')})`);
+    params.push(...clientIdList);
+  }
   if (easyfixerId != null) { clauses.push('j.fk_easyfixter_id = ?'); params.push(easyfixerId); }
   if (ownerId != null)     { clauses.push('j.job_owner = ?');        params.push(ownerId); }
   if (Array.isArray(clientOwnerIds) && clientOwnerIds.length) {
     clauses.push(`j.job_client_owner IN (${clientOwnerIds.map(() => '?').join(',')})`);
     params.push(...clientOwnerIds);
   }
-  if (cityId != null)      { clauses.push('ad.city_id = ?');         params.push(cityId); }
+  // cityId — single id OR CSV/array (Pending-to-Start multi-select Cities
+  // filter). The `ad.` literal keeps needsAd tripped below so the COUNT query
+  // still joins tbl_address (join parity — a WHERE referencing `ad.` without the
+  // matching COUNT join is the known scoped-user-500 regression).
+  const cityIdList = toIdArray(cityId);
+  if (cityIdList.length) {
+    clauses.push(`ad.city_id IN (${cityIdList.map(() => '?').join(',')})`);
+    params.push(...cityIdList);
+  }
   if (customerId != null)  { clauses.push('j.fk_customer_id = ?');   params.push(customerId); }
   // Explicit job-id set — used by listOfferedForTech() to reuse this LIST
   // projection for a tech's open-offer jobs. Empty array short-circuits to
@@ -966,6 +1008,25 @@ async function list({
   if (verticalId != null) {
     clauses.push('EXISTS (SELECT 1 FROM tbl_vertical_mapping vm WHERE vm.client_id = j.fk_client_id AND vm.vertical_id = ?)');
     params.push(verticalId);
+  }
+  // Project Manager — the PM is the user mapped to the job's client in
+  // tbl_vertical_mapping with user_type = 1. EXISTS mirrors the verticalId
+  // shape above; the subquery is self-contained (references only vm + the
+  // outer j alias), so it introduces NO new outer alias and the COUNT-join
+  // detection below is unaffected.
+  const pmIdList = toIdArray(projectManagerId);
+  if (pmIdList.length) {
+    clauses.push(`EXISTS (SELECT 1 FROM tbl_vertical_mapping vm WHERE vm.client_id = j.fk_client_id AND vm.user_type = 1 AND vm.user_id IN (${pmIdList.map(() => '?').join(',')}))`);
+    params.push(...pmIdList);
+  }
+  // Zonal Manager — a city's zonal owner is tbl_city.state_user. `ci` is the
+  // tbl_city alias already joined in LIST_JOIN; the `ci.` literal here trips
+  // the needsCi detection below so the COUNT query also joins tbl_address +
+  // tbl_city, keeping main-query and COUNT-query WHERE join-consistent.
+  const zmIdList = toIdArray(zonalManagerId);
+  if (zmIdList.length) {
+    clauses.push(`ci.state_user IN (${zmIdList.map(() => '?').join(',')})`);
+    params.push(...zmIdList);
   }
   // Text LIKE filters — use the customary `%val%` wrap. Each adds its
   // referenced alias to the COUNT-join detection regex below via the
@@ -3224,12 +3285,32 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
   try {
     await conn.beginTransaction();
 
-    // Optional schedule edit rides in the same txn. Crucially we do NOT touch
-    // job_status or fk_easyfixter_id — the job stays BOOKED with no owner while
-    // the pool offer is live. last_update_time is bumped so the row sorts fresh.
-    if (editSchedule || hasSlot) {
-      const sets = ['last_update_time = ?'];
-      const values = [new Date()];
+    // The pool offer IS the ops "Schedule & Assign" action, so the schedule
+    // AUDIT columns must be stamped here — scheduled_date_time ("Schedule On"),
+    // fk_scheduled_by ("Schedule By") and first_scheduled_by. The legacy
+    // direct-assign path (assign()) stamps these in one UPDATE; when Schedule &
+    // Assign moved onto the offer flow that stamp was dropped, so both columns
+    // silently stopped populating from the modal. We stamp them on EVERY offer.
+    // Crucially we STILL do NOT touch job_status or fk_easyfixter_id — the job
+    // stays BOOKED with no owner while the pool offer is live (a tech ACCEPT is
+    // what flips it to SCHEDULED + sets the fk). Uses new Date() (pool tz +05:30
+    // → IST wall-clock, stored verbatim), never SQL NOW(). Optional schedule
+    // edit (requested_date_time / time_slot) rides in the same UPDATE.
+    {
+      const now = new Date();
+      const actorId = (actor && actor.user_id != null) ? actor.user_id : null;
+      const sets = [
+        'last_update_time = ?',
+        'scheduled_date_time = ?',
+        'fk_scheduled_by = ?',
+        'first_scheduled_by = COALESCE(first_scheduled_by, ?)',
+        // original_scheduling_date_time — the FIRST time this job was scheduled.
+        // Captured ONCE (COALESCE preserves it across re-offers and later
+        // reschedules), mirroring the legacy "SET original_scheduling_date_time
+        // = NOW() WHERE it IS NULL" rule. Pairs with first_scheduled_by.
+        'original_scheduling_date_time = COALESCE(original_scheduling_date_time, ?)',
+      ];
+      const values = [now, now, actorId, actorId, now];
       if (editSchedule) { sets.push('requested_date_time = ?'); values.push(newRequested); }
       if (hasSlot)      { sets.push('time_slot = ?');           values.push(String(timeSlot)); }
       values.push(jobId);
@@ -3434,9 +3515,15 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
       'fk_scheduled_by = ?',
       `job_status = CASE WHEN job_status = ${STATUS.BOOKED} THEN ${STATUS.SCHEDULED} ELSE job_status END`,
       'first_scheduled_by = COALESCE(first_scheduled_by, ?)',
+      // original_scheduling_date_time — first-schedule capture (set ONCE; legacy
+      // parity with first_scheduled_by). COALESCE preserves it on later moves.
+      'original_scheduling_date_time = COALESCE(original_scheduling_date_time, ?)',
       'last_update_time = ?',
     ];
-    const values = [easyfixerId, now, actor?.user_id || null, actor?.user_id || null, now];
+    // Value order tracks the placeholders above (job_status has no ?):
+    // fk_easyfixter_id, scheduled_date_time, fk_scheduled_by, first_scheduled_by,
+    // original_scheduling_date_time, last_update_time.
+    const values = [easyfixerId, now, actor?.user_id || null, actor?.user_id || null, now, now];
     if (editSchedule) {
       sets.push('requested_date_time = ?');
       values.push(newRequested);
@@ -3781,12 +3868,16 @@ async function listOffers(jobId) {
 
 // ─── Reschedule a job's appointment (Schedule & Assign → Reschedule) ─
 /*
- * Explicit, audited reschedule. Distinct from assign(): it changes ONLY the
- * appointment (requested_date_time + the two derived slot columns) — never the
- * technician — and ALWAYS captures reason + remarks. The modal's Date/Time
- * fields are read-only; this is the sole path that moves them. All three inputs
- * are mandatory (rescheduleBody validates at the route). Transactional:
- *   1. tbl_job.requested_date_time / time_slot / booking_cut_off_time_slot
+ * Explicit, audited reschedule. Distinct from assign(): it moves the
+ * appointment (requested_date_time + requested_time + the two derived slot
+ * columns) and re-stamps the schedule audit (scheduled_date_time +
+ * fk_scheduled_by = THIS reschedule) — but never the technician, and never the
+ * ORIGINAL-schedule columns (first_scheduled_by / original_scheduling_date_time
+ * stay put). ALWAYS captures reason + remarks. The modal's Date/Time fields are
+ * read-only; this is the sole path that moves them. All three inputs are
+ * mandatory (rescheduleBody validates at the route). Transactional:
+ *   1. tbl_job.requested_date_time / requested_time / time_slot /
+ *      booking_cut_off_time_slot / scheduled_date_time / fk_scheduled_by
  *   2. scheduling_history (reason_id + reschedule_reason) — same shape as assign
  *   3. any OPEN offers on this job → EXPIRED (they were made for the OLD slot,
  *      so a tech must not be able to accept a now-stale appointment)
@@ -3821,14 +3912,29 @@ async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    // Reschedule also stamps the schedule AUDIT: scheduled_date_time +
+    // fk_scheduled_by reflect the LATEST scheduling action (this reschedule);
+    // first_scheduled_by / original_scheduling_date_time are deliberately NOT
+    // touched (they hold the ORIGINAL schedule). requested_time is the legacy
+    // HH:MM companion, re-derived from the new appointment so it stays coherent
+    // with requested_date_time. (enum_reason_id / remarks / remarks_date_time +
+    // the tbl_job_comment row are stamped by addComment below.) fk_scheduled_by
+    // uses COALESCE so an actor-less auto-reschedule preserves the prior
+    // scheduler. new Date() → pool tz +05:30 IST wall-clock, never SQL NOW().
+    const rescheduledAt = new Date();
+    const rescheduledBy = (actor && actor.user_id != null) ? actor.user_id : null;
+    const newRequestedTime = formatTimeIST(newRequested);
     await conn.query(
       `UPDATE tbl_job
           SET requested_date_time       = ?,
+              requested_time            = ?,
               time_slot                 = COALESCE(?, time_slot),
               booking_cut_off_time_slot = COALESCE(?, booking_cut_off_time_slot),
+              scheduled_date_time       = ?,
+              fk_scheduled_by           = COALESCE(?, fk_scheduled_by),
               last_update_time          = ?
         WHERE job_id = ?`,
-      [newRequested, newTimeSlot, newCutoffSlot, new Date(), jobId],
+      [newRequested, newRequestedTime, newTimeSlot, newCutoffSlot, rescheduledAt, rescheduledBy, rescheduledAt, jobId],
     );
     // Open offers were extended for the OLD slot — expire them so no tech accepts
     // a stale appointment. Tolerant of a missing offer table (un-migrated deploys).

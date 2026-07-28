@@ -5,8 +5,10 @@
  *
  *   POST /api/admin/quicksight/offer-acceptance/summary
  *     body: { clientId?[], verticalId?[], zonalManagerId?[], serviceCategoryId?[],
- *             dateFrom?, dateTo?, source? ('top10'|'search'|'auto'), format? }
- *     → { rows: [per-tech], bySource: [...], totals: {...} }  (or XLSX)
+ *             offeredById?[] (job owner), dateFrom?, dateTo? (offered_at window),
+ *             respondedFrom?, respondedTo? (responded_at / acceptance window),
+ *             source? ('top10'|'search'|'auto'), format? }
+ *     → { rows: [per-tech], bySource: [...], byOwner: [...], byDay: [...], totals: {...} }  (or XLSX)
  */
 
 const router = require('express').Router();
@@ -16,7 +18,7 @@ const validate = require('../../../middleware/validate');
 const requireQuickSight = require('../../../middleware/require-quicksight');
 const { modernOk } = require('../../../utils/response');
 const { streamStyledXlsx } = require('../../../utils/xlsx-styled-export');
-const { extendJobFilter } = require('../../../validators/quicksight.validator');
+const { extendJobFilter, idArray } = require('../../../validators/quicksight.validator');
 const { fileStamp, displayStamp, FMT, decorateColumns } = require('../../../services/quicksight/_shared');
 const service = require('../../../services/quicksight/quicksight-offer-acceptance.service');
 const logger = require('../../../logger');
@@ -25,9 +27,15 @@ const ACTION_KEY = 'isQuickSightOfferAcceptanceView';
 router.use(requireQuickSight(ACTION_KEY));
 
 const summaryBody = extendJobFilter({
+  // offered_at cohort window (when the offer was made).
   dateFrom: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).optional(),
   dateTo: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  // responded_at window (the acceptance date — when the tech accepted/rejected).
+  respondedFrom: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  respondedTo: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).optional(),
   source: Joi.string().valid('top10', 'search', 'auto').optional(),
+  // "Offered By" = job owner (tbl_job.job_owner). Array of user ids; empty = all.
+  offeredById: idArray,
 });
 
 const COUNT_KEYS = ['efrId', 'offered', 'accepted', 'rejected', 'expired', 'open', 'avgResponseMins'];
@@ -45,8 +53,11 @@ router.post('/summary', validate(summaryBody), async (req, res, next) => {
       verticalId: req.body.verticalId,
       zonalManagerId: req.body.zonalManagerId,
       serviceCategoryId: req.body.serviceCategoryId,
+      offeredById: req.body.offeredById,
       dateFrom: req.body.dateFrom,
       dateTo: req.body.dateTo,
+      respondedFrom: req.body.respondedFrom,
+      respondedTo: req.body.respondedTo,
       source: req.body.source,
     };
     const data = await service.getOfferAcceptance(filters);

@@ -60,6 +60,13 @@ router.use('/deep-skills',     require('./deep-skills'));
 router.use('/auto-allocation', require('./auto-allocation'));
 router.use('/jobs',          require('./jobs'));
 router.use('/jobs',          require('./job-magic-link')); // adds /:id/send-magic-link + /:id/magic-link-status under /jobs (see file for shape)
+// Billing & Charges job-workspace tab — Penalty/Travel/Incentive (job_material),
+// service billing approval (tbl_job_services.approval_by_client), and Job Sheet /
+// Purchase Order documents (tbl_job_image). Mutations gated by the
+// `job.charges.emails` property allowlist (FEATURES.canManageJobCharges); the
+// read is scope-only. Mounted under /jobs; both fall through from jobs.js.
+router.use('/jobs',          require('./job-charges'));
+router.use('/jobs',          require('./job-documents'));
 router.use('/customer-requests', require('./customer-requests')); // ops inbox for tbl_job_customer_request (cancel/reschedule signals)
 router.use('/auto-assign',   require('./auto-assign'));
 router.use('/notifications', require('./notifications'));

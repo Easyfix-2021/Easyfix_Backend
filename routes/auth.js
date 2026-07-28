@@ -7,6 +7,7 @@ const { createLoginOtp, verifyLoginOtp } = require('../services/auth.service');
 const { getRoleById } = require('../services/role.service');
 const { signUserToken } = require('../utils/jwt');
 const { modernOk, modernError } = require('../utils/response');
+const { FEATURES, emailAllowed } = require('../services/feature-access.service');
 const logger = require('../logger');
 
 /*
@@ -146,6 +147,7 @@ router.get('/me', requireAuth, async (req, res, next) => {
         },
         hierarchy: { directReportsCount: 0, descendantsCount: 0 },
         scheduledJobsAccess: false,
+        canManageJobCharges: false,
       });
     }
 
@@ -217,6 +219,13 @@ router.get('/me', requireAuth, async (req, res, next) => {
     const sj = require('../services/scheduled-jobs.service');
     const scheduledJobsAccess = sj.isAllowedUser(req.user);
 
+    // canManageJobCharges (2026-07-28): property-allowlist gate for the
+    // Billing & Charges job-workspace tab. Same fail-closed model as
+    // canBuildSkillMatrix — the FE reads this to show/hide the tab; every
+    // mutating charges/documents route independently enforces the same
+    // allowlist, so a forged flag buys nothing.
+    const canManageJobCharges = emailAllowed(FEATURES.canManageJobCharges, req.user.official_email);
+
     logger.info('Returning identity · bypassScope=' + !!bypass + ' menuIds=' + ((permissions && permissions.menuIds && permissions.menuIds.length) || 0) + ' directReports=' + hierarchy.directReports.length + ' descendants=' + hierarchy.descendants.length + ' scheduledJobsAccess=' + scheduledJobsAccess);
     modernOk(res, {
       user: req.user,
@@ -233,6 +242,7 @@ router.get('/me', requireAuth, async (req, res, next) => {
         descendantsCount: hierarchy.descendants.length,
       },
       scheduledJobsAccess,
+      canManageJobCharges,
     });
   } catch (err) {
     next(err);

@@ -56,4 +56,65 @@ async function uploadJobImage({ jobId, file, category = 'Booking' }) {
   return { image_id: ins.insertId, job_id: jobId, image, image_category: String(category).toLowerCase(), job_stage: 0, seq, storage };
 }
 
-module.exports = { uploadJobImage };
+/*
+ * Guarded delete of a single tbl_job_image row. Mirrors the storage-cleanup +
+ * hard-DB-delete behaviour of the Images tab (routes/admin/jobs.js
+ * DELETE /images/:imageId) but adds ownership guards so callers can restrict a
+ * delete to a specific job AND a specific set of image_category values (used by
+ * the Billing & Charges documents delete so Job Sheet / Purchase Order removal
+ * can NEVER touch other categories).
+ *
+ *   opts.jobId       — if set, the row must belong to this job.
+ *   opts.categories  — if set (array of labels), LOWER(image_category) must be
+ *                      one of them (case-insensitive; the upload path lowercases).
+ *
+ * Returns the deleted row's summary, or null when nothing matched the guards
+ * (caller maps null → 404). Storage removal is best-effort — an orphaned S3
+ * object / local file is cheaper than a dangling DB row on a half-failed delete.
+ */
+async function deleteJobImage({ imageId, jobId = null, categories = null }) {
+  const params = [Number(imageId)];
+  let clause = '';
+  if (jobId != null) { clause += ' AND job_id = ?'; params.push(Number(jobId)); }
+  if (Array.isArray(categories) && categories.length) {
+    clause += ` AND LOWER(image_category) IN (${categories.map(() => '?').join(',')})`;
+    params.push(...categories.map((c) => String(c).toLowerCase()));
+  }
+  const [[row]] = await pool.query(
+    `SELECT image_id, job_id, image, image_category
+       FROM tbl_job_image WHERE image_id = ?${clause} LIMIT 1`,
+    params
+  );
+  if (!row) return null;
+
+  const stored = String(row.image || '').trim();
+  if (stored) {
+    if (stored.includes('/')) {
+      // S3 key — deleteObject soft-fails internally.
+      try { await s3Storage.deleteObject(stored); }
+      catch (e) { logger.warn({ imageId, err: e?.message }, 'job image S3 delete failed (continuing with DB delete)'); }
+    } else {
+      // Legacy local-only bare filename. Path-traversal guarded.
+      try {
+        const fs = require('fs');
+        const path = require('path');
+        const root = process.env.UPLOAD_JOB_FILES;
+        if (root) {
+          const resolvedRoot = path.resolve(root);
+          const localPath = path.resolve(resolvedRoot, stored);
+          if (localPath === resolvedRoot || localPath.startsWith(resolvedRoot + path.sep)) {
+            if (fs.existsSync(localPath)) fs.unlinkSync(localPath);
+          }
+        }
+      } catch (e) {
+        logger.warn({ imageId, err: e?.message }, 'job image local unlink failed (continuing with DB delete)');
+      }
+    }
+  }
+
+  await pool.query('DELETE FROM tbl_job_image WHERE image_id = ?', [Number(imageId)]);
+  logger.info('Job image deleted · imageId=' + imageId + ' · job=' + row.job_id + ' · category=' + row.image_category);
+  return { image_id: Number(imageId), job_id: row.job_id, image_category: row.image_category };
+}
+
+module.exports = { uploadJobImage, deleteJobImage };

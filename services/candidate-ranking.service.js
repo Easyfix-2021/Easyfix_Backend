@@ -232,6 +232,34 @@ function computeTierAndRefPin({ jobPin, jobZoneIds, currentPincode, servPins, se
 }
 
 /*
+ * Human label naming the BASIS that produced a candidate's distance_tier — i.e.
+ * WHY this tech surfaced for this job's location. 1:1 with the tier computed in
+ * computeTierAndRefPin (display-only; NOT a ranking input):
+ *   same_pincode    → 'Serviceable Pincode' — a pincode in the tech's serviceable
+ *                     list equals the job pincode (refPin = the job pincode).
+ *   current_pincode → 'Current Pincode'     — the tech's current pincode
+ *                     (efr_pin_no) was compared to the job pincode (refPin = it).
+ *   in_zone         → 'Zone'                — a serviceable pincode of the tech
+ *                     sits in the job pincode's zone (refPin = that pincode).
+ *   out_of_zone     → 'GPS Distance'        — none of the above matched; the km is
+ *                     the raw geocoded haversine from the tech's reference pincode.
+ *   unknown         → '—'                   — no comparable reference pincode.
+ * The matched value (distance_criteria_value) is the reference pincode (refPin)
+ * that the tier keyed on — null when unknown. Additive + fail-soft: an
+ * unrecognised tier degrades to '—'.
+ */
+const DISTANCE_CRITERIA_LABEL = Object.freeze({
+  same_pincode:    'Serviceable Pincode',
+  current_pincode: 'Current Pincode',
+  in_zone:         'Zone',
+  out_of_zone:     'GPS Distance',
+  unknown:         '—',
+});
+function distanceCriteriaFor(tier) {
+  return DISTANCE_CRITERIA_LABEL[tier] ?? '—';
+}
+
+/*
  * Deep-skill 4-state. The job-level skill requirement decides applicability.
  *   - job has NO skill requirement      → 'not_applicable'.
  *   - tech has ZERO active mappings      → 'easyfixer_skills_not_available'.
@@ -892,6 +920,11 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
       zone_name:              techZone.zone_name ?? null,
       distance_km:            distanceKm == null ? null : Number(distanceKm.toFixed(1)),
       distance_tier:          tr.tier,
+      // Additive display field — the BASIS that produced this tech's distance_tier
+      // (serviceable pincode / current pincode / zone / raw GPS), plus the matched
+      // reference pincode. Not a ranking input; see distanceCriteriaFor().
+      distance_criteria:       distanceCriteriaFor(tr.tier),
+      distance_criteria_value: tr.refPin ?? null,
       // Present UNLESS explicitly marked absent — `absentMap` is the leave set.
       attendance_for_job_date: !absentMap.has(id),
       deep_skill_status:      skillStatus,
@@ -999,6 +1032,9 @@ function buildCandidateRow(tech, s, job) {
     serviceable_pincodes:   s.serviceable_pincodes ?? [],
     distance_km:            s.distance_km ?? null,
     distance_tier:          s.distance_tier ?? 'unknown',
+    // Basis that produced distance_tier + the matched reference pincode (display).
+    distance_criteria:       s.distance_criteria ?? distanceCriteriaFor(s.distance_tier ?? 'unknown'),
+    distance_criteria_value: s.distance_criteria_value ?? null,
     attendance_for_job_date: s.attendance_for_job_date === true,
     // Defensive default only — deepSkillStatus() always sets this. It falls back
     // to 'not_applicable' rather than 'both_available' so a missing value can

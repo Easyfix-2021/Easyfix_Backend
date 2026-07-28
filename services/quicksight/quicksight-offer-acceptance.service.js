@@ -5,9 +5,16 @@
  * they were extended and how many they accepted / rejected / let expire, plus
  * acceptance rate and average response time. Sourced entirely from
  * tbl_job_offer (offer_status / offer_source / offered_at / responded_at),
- * scoped by the standard QuickSight job filters + an optional offered_at window
- * and offer_source. Returns { rows (per tech), bySource, totals } so the CRM
- * page can render KPI tiles + a table + a by-source chart from one call.
+ * scoped by the standard QuickSight job filters + an optional offered_at window,
+ * a responded_at (acceptance-date) window, an "Offered By" (job owner) filter,
+ * and offer_source. Returns { rows (per tech), bySource, byOwner, byDay, totals }
+ * so the CRM page can render KPI tiles + a table + by-source / by-owner charts
+ * from one call.
+ *
+ * "Offered By": tbl_job_offer carries NO offered-by / created-by user column
+ * (only fk_easyfixter_id = who the offer went TO). So the closest attribution
+ * for who PUT the offer out is the job owner — tbl_job.job_owner → tbl_user
+ * (aliased ow.user_name). NULL owner (orphan / unowned job) buckets 'Unassigned'.
  *
  * Uses the named OFFER_STATUS constants (services/offer-status.js) so the SQL
  * reads OFFERED/ACCEPTED/REJECTED/EXPIRED, never bare 0/1/2/3.
@@ -54,10 +61,20 @@ function buildScope(filters) {
   where += buildInFilter('c.vertical_id', filters.verticalId, params);
   where += buildInFilter('cy.state_user', filters.zonalManagerId, params);
   where += buildInFilter('j.fk_service_catg_id', filters.serviceCategoryId, params);
+  // "Offered By" = job owner (tbl_job.job_owner). Array of tbl_user ids; empty = all.
+  where += buildInFilter('j.job_owner', filters.offeredById, params);
   if (filters.source) { where += ' AND jo.offer_source = ?'; params.push(filters.source); }
   if (filters.dateFrom) { where += ' AND jo.offered_at >= ?'; params.push(filters.dateFrom + ' 00:00:00'); }
   // Inclusive upper bound — cover the whole dateTo day (legacy DATE_ADD idiom).
   if (filters.dateTo) { where += ' AND jo.offered_at < DATE_ADD(?, INTERVAL 1 DAY)'; params.push(filters.dateTo); }
+  // Acceptance-date window on responded_at (when the tech actually accepted /
+  // rejected — the response event), distinct from the offered_at cohort window
+  // above. Still-open offers (responded_at IS NULL) naturally fall out. IST edges:
+  // the pool session TZ is +05:30, so a bare 'YYYY-MM-DD' compares at IST
+  // wall-clock — lower bound at 00:00:00 IST, upper via DATE_ADD(+1 day), matching
+  // the offered_at idiom so day boundaries land on IST edges.
+  if (filters.respondedFrom) { where += ' AND jo.responded_at >= ?'; params.push(filters.respondedFrom + ' 00:00:00'); }
+  if (filters.respondedTo) { where += ' AND jo.responded_at < DATE_ADD(?, INTERVAL 1 DAY)'; params.push(filters.respondedTo); }
   const from = `
       FROM tbl_job_offer jo
       JOIN tbl_easyfixer ef  ON ef.efr_id = jo.fk_easyfixter_id
@@ -116,6 +133,23 @@ async function getOfferAcceptance(filters = {}) {
     s2.params,
   );
 
+  // Offers grouped by "Offered By" = the job owner. tbl_job_offer has no
+  // offered-by user column, so the job's owner (tbl_job.job_owner →
+  // tbl_user.user_name) is the attribution. The tbl_user join lives only here —
+  // the other groupings don't need the owner NAME, and the owner FILTER above
+  // reads j.job_owner directly (already joined), so no extra cost elsewhere.
+  const s4 = buildScope(filters);
+  const [ownerRows] = await pool.query(
+    `SELECT COALESCE(j.job_owner, 0) AS ownerId,
+            COALESCE(ow.user_name, 'Unassigned') AS ownerName, ${STATUS_AGG}
+       ${s4.from}
+       LEFT JOIN tbl_user ow ON ow.user_id = j.job_owner
+       ${s4.where}
+      GROUP BY COALESCE(j.job_owner, 0), COALESCE(ow.user_name, 'Unassigned')
+      ORDER BY offered DESC`,
+    s4.params,
+  );
+
   const s3 = buildScope(filters);
   const [[tot]] = await pool.query(`SELECT ${STATUS_AGG} ${s3.from} ${s3.where}`, s3.params);
 
@@ -154,6 +188,13 @@ async function getOfferAcceptance(filters = {}) {
     expired: n(r.expired), open: n(r.open_count),
     acceptanceRate: rate(n(r.accepted), n(r.rejected), n(r.expired)),
   }));
+  const byOwner = ownerRows.map((r) => ({
+    ownerId: n(r.ownerId),
+    ownerName: r.ownerName || 'Unassigned',
+    offered: n(r.offered), accepted: n(r.accepted), rejected: n(r.rejected),
+    expired: n(r.expired), open: n(r.open_count),
+    acceptanceRate: rate(n(r.accepted), n(r.rejected), n(r.expired)),
+  }));
   const totals = {
     offered: n(tot && tot.offered), accepted: n(tot && tot.accepted), rejected: n(tot && tot.rejected),
     expired: n(tot && tot.expired), open: n(tot && tot.open_count),
@@ -161,8 +202,8 @@ async function getOfferAcceptance(filters = {}) {
     avgResponseSecs: tot && tot.avg_response_secs != null ? Number(tot.avg_response_secs) : null,
   };
 
-  logger.info('Returning ' + rows.length + ' technician rows · ' + bySource.length + ' sources · ' + byDay.length + ' trend days');
-  return { rows, bySource, byDay, totals };
+  logger.info('Returning ' + rows.length + ' technician rows · ' + bySource.length + ' sources · ' + byOwner.length + ' owners · ' + byDay.length + ' trend days');
+  return { rows, bySource, byOwner, byDay, totals };
 }
 
 // Flat per-technician rows for the XLSX download.
