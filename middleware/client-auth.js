@@ -21,8 +21,21 @@ async function requireSpocAuth(req, res, next) {
   const spocId = Number(String(payload.sub).slice(5));
   const spoc = await findSpocById(spocId);
   if (!spoc) return modernError(res, 401, 'SPOC not found or inactive');
+  // Client-level gate: an active SPOC whose CLIENT has been deactivated is
+  // blocked too (distinct 403 so the app can show "client inactive").
+  if (Number(spoc.client_status) !== 1) {
+    return modernError(res, 403, 'This client account is inactive. Please contact your EasyFix SPOC.');
+  }
 
   req.spoc = spoc;
+  // Client (user_type_id = 3) identity carried in the token claims, for
+  // role-based authorization on routes. Older tokens (pre-enrichment) lack
+  // these claims — they resolve to null, so this is non-breaking.
+  req.clientUser = {
+    userId: payload.userId ?? null,
+    userRole: payload.userRole ?? null,
+    userType: payload.userType ?? null,
+  };
   next();
 }
 

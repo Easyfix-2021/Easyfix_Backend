@@ -2292,113 +2292,20 @@ router.post(
   async (req, res, next) => {
     const jobId = Number(req.params.id);
     try {
-      if (!req.file) {
-        uploadLogger.warn({ jobId }, 'job image upload rejected — missing file field');
-        return modernError(res, 400, 'missing "file" upload');
-      }
-
-      // Compute the next seq from existing rows. Off-by-one safe: if
-      // there are 0 existing rows, seq=1. Two concurrent uploads can
-      // race here; we accept that risk because (a) it's the ops UI
-      // single-uploading per booking, (b) S3 PutObject is idempotent
-      // by key (last-write wins), and (c) the seq is just for
-      // human-readable keys, not a uniqueness constraint.
-      const [[{ existing }]] = await imagePool.query(
-        'SELECT COUNT(*) AS existing FROM tbl_job_image WHERE job_id = ?',
-        [jobId]
-      );
-      const seq = Number(existing || 0) + 1;
-
-      // Entry log — captures intent + the bits we'll need to debug any
-      // downstream S3/DB failure (jobId, seq, originalname, mimetype,
-      // size). originalname is logged here because it never lands in
-      // the DB (lives only in S3 object metadata), so this is the
-      // primary audit trail tying job_id → user-provided filename.
-      uploadLogger.upload({
-        jobId, seq,
-        originalName: req.file.originalname,
-        mimeType: req.file.mimetype,
-        bytes: req.file.size,
-      }, 'job image upload received');
-
-      let imageValue;
-      let usedStorage;
-
-      if (s3Storage.isEnabled()) {
-        // Happy path: S3. Store the canonical key in the DB so
-        // resolveImageUrl() reads it back as an S3 object.
-        //
-        // Category convention (per ops 2026-05-15): this endpoint is
-        // the Book-New-Call attachment surface — every upload here
-        // belongs to the `Booking` lifecycle stage, so we hardcode
-        // it. Completion / Reschedule / Cancellation uploads will
-        // arrive on their own routes (or take an explicit
-        // `?category=` param) when those flows ship; do NOT extend
-        // this handler to accept user-supplied category strings
-        // without server-side validation against an allowlist —
-        // keyFor() also defends with a PascalCase regex.
-        //
-        // The final S3 key shape is `JobSupportings/Booking_<jobId>_<seq>`
-        // — no file extension on the key itself. The file's actual
-        // extension/MIME is preserved via Content-Type (set from
-        // req.file.mimetype) and the original filename is stashed
-        // as object metadata for audit.
-        try {
-          imageValue = await s3Storage.putJobImage({
-            jobId, seq,
-            buffer: req.file.buffer,
-            contentType: req.file.mimetype,
-            originalName: req.file.originalname,
-            category: 'Booking',
-          });
-          usedStorage = 's3';
-          uploadLogger.upload({ jobId, seq, key: imageValue }, 'job image stored on S3');
-        } catch (e) {
-          // S3 failed mid-flight — fall back to local writeBuffer so
-          // the booking image isn't lost. The next reader will use
-          // the local URL automatically.
-          uploadLogger.warn(
-            { jobId, seq, err: e },
-            'S3 putJobImage failed — falling back to local disk',
-          );
-          const saved = writeBuffer('job_files', req.file.buffer, req.file.originalname, req.file.mimetype);
-          imageValue = saved.filename;
-          usedStorage = 'local-fallback';
-          uploadLogger.upload({ jobId, seq, filename: imageValue }, 'job image stored on local disk (fallback)');
-        }
-      } else {
-        // S3 not configured — pure local path (dev / small deploys).
-        const saved = writeBuffer('job_files', req.file.buffer, req.file.originalname, req.file.mimetype);
-        imageValue = saved.filename;
-        usedStorage = 'local';
-        uploadLogger.upload({ jobId, seq, filename: imageValue }, 'job image stored on local disk (S3 disabled)');
-      }
-
-      const [ins] = await imagePool.query(
-        `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, created_date)
-         VALUES (?, ?, ?, ?, NOW())`,
-        [jobId, imageValue, 'booking', 0]
-      );
-
-      uploadLogger.upload(
-        { jobId, seq, imageId: ins.insertId, storage: usedStorage, image: imageValue },
-        'job image row inserted',
-      );
-
-      modernOk(res, {
-        image_id: ins.insertId,
-        job_id: jobId,
-        image: imageValue,
-        image_category: 'booking',
-        job_stage: 0,
-        seq,
-        storage: usedStorage,
-      }, 'image uploaded');
+      // Shared with the client Book-a-service route — one implementation of
+      // S3 (JobSupportings/Booking_<jobId>_<seq>) + local fallback + the
+      // tbl_job_image insert.
+      const result = await require('../../services/job-image.service').uploadJobImage({
+        jobId, file: req.file, category: 'Booking',
+      });
+      uploadLogger.upload({ jobId, imageId: result.image_id, storage: result.storage, image: result.image }, 'job image row inserted');
+      modernOk(res, result, 'image uploaded');
     } catch (e) {
       if (e?.code === 'LIMIT_FILE_SIZE') {
         uploadLogger.warn({ jobId, bytes: req.file?.size }, 'job image upload rejected — exceeds 10MB');
         return modernError(res, 400, 'file exceeds 10MB');
       }
+      if (e?.status === 400) return modernError(res, 400, e.message);
       uploadLogger.error({ jobId, err: e }, 'job image upload failed');
       next(e);
     }

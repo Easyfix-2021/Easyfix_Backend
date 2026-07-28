@@ -801,6 +801,7 @@ const DATE_TYPE_COLUMN = {
 
 async function list({
   q, status, statuses, assigned, clientId, cityId, ownerId, easyfixerId,
+  clientOwnerIds,            // number[] — restrict to jobs owned (job_client_owner) by these client users (reporting-manager scope)
   customerId,
   jobIds,                    // number[] — restrict to an explicit set of job ids
   isEscalated,
@@ -940,6 +941,10 @@ async function list({
   if (clientId != null)    { clauses.push('j.fk_client_id = ?');     params.push(clientId); }
   if (easyfixerId != null) { clauses.push('j.fk_easyfixter_id = ?'); params.push(easyfixerId); }
   if (ownerId != null)     { clauses.push('j.job_owner = ?');        params.push(ownerId); }
+  if (Array.isArray(clientOwnerIds) && clientOwnerIds.length) {
+    clauses.push(`j.job_client_owner IN (${clientOwnerIds.map(() => '?').join(',')})`);
+    params.push(...clientOwnerIds);
+  }
   if (cityId != null)      { clauses.push('ad.city_id = ?');         params.push(cityId); }
   if (customerId != null)  { clauses.push('j.fk_customer_id = ?');   params.push(customerId); }
   // Explicit job-id set — used by listOfferedForTech() to reuse this LIST
@@ -1217,10 +1222,13 @@ async function getByIdCore(jobId) {
             cu.customer_name, cu.customer_mob_no, cu.customer_email,
             ad.address, ad.building, ad.landmark, ad.locality, ad.pin_code,
             ad.gps_location, ${addrInstrSelect}, ad.city_id, ci.city_name,
+            sc.service_catg_name AS service_category,
             cl.client_name, cl.client_email, ${verticalSelect},
             ef.efr_name AS easyfixer_name, ef.efr_no AS easyfixer_mobile,
             ow.user_name AS owner_name,
-            cr.user_name AS created_by_name
+            cr.user_name AS created_by_name,
+            (SELECT u2.user_name FROM tbl_user u2 WHERE u2.user_id = j.cancel_by LIMIT 1) AS cancelled_by_name,
+            (SELECT atr.action_desc FROM action_taken_reason atr WHERE atr.id = j.cancel_reason_id LIMIT 1) AS cancel_reason_name
      ${DETAIL_JOIN}
      WHERE j.job_id = ? LIMIT 1`,
     [jobId]
@@ -2091,7 +2099,11 @@ async function create(input, actor) {
     // mandatory `branch_details` custom-property row), so every other client and
     // non-branch flow is untouched. Runs AFTER the hoist above, so a branch value
     // supplied via the custom_property string already satisfies it.
-    if (input.fk_client_id && (input.branch_details == null || String(input.branch_details).trim() === '')) {
+    // The mobile Client App does not collect custom properties at all, so the
+    // branch-mandatory gate can never be satisfied there — skip it for that
+    // surface only. CRM / client-web bookings keep the enforcement.
+    const isClientApp = String(input.source_type || '').toLowerCase() === 'client_app';
+    if (!isClientApp && input.fk_client_id && (input.branch_details == null || String(input.branch_details).trim() === '')) {
       let clientProps = [];
       try {
         clientProps = await require('./client.service').listCustomProperties(input.fk_client_id);
