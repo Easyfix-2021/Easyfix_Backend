@@ -244,6 +244,53 @@ jobs:
           echo "▶ Pulling $IMAGE_URI"
           docker compose pull stt
 
+          # ─── Log history for Dozzle (rolling 7-day window) ──────────────
+          # \`compose up --force-recreate\` DESTROYS the outgoing container, and
+          # json-file logs live under /var/lib/docker/containers/<id>/ — a
+          # directory Docker deletes with the container. So Dozzle can only ever
+          # show the CURRENT deployment unless we preserve the old logs first.
+          #
+          # Replay them into a throwaway container: \`alpine cat\` copies stdin to
+          # stdout, the daemon captures that as the new container's own json log,
+          # and Dozzle lists it (Settings → "Show Stopped Containers"). Renaming
+          # + keeping the old container does NOT work — compose tracks service
+          # containers by LABEL, so the next \`up\` reclaims it.
+          # \`-t\` preserves the ORIGINAL timestamps in the text (Dozzle's own
+          # timestamp column shows the replay time). Full rationale in the
+          # backend's .github/workflows/deploy.yml.
+          #
+          # STT-specific value: this is what preserves the log tail from an
+          # OOM-killed container across the next deploy.
+          if docker inspect easyfix-stt >/dev/null 2>&1; then
+            docker image inspect alpine:3 >/dev/null 2>&1 || docker pull alpine:3 >/dev/null 2>&1 || true
+            if docker image inspect alpine:3 >/dev/null 2>&1; then
+              PREV_TAG=\$(docker inspect --format '{{.Config.Image}}' easyfix-stt 2>/dev/null | sed 's|.*:||')
+              STAMP=\$(date -u +%Y%m%d-%H%M%S)
+              ARCHIVE_NAME="easyfix-stt-logs-\${STAMP}-\${PREV_TAG:-unknown}"
+              echo "▶ Archiving outgoing container logs → \$ARCHIVE_NAME"
+              # Client stdout → /dev/null: the daemon still captures the
+              # container's stdout; without this the whole backlog would be
+              # echoed into the SSM command output.
+              docker logs -t easyfix-stt 2>&1 \
+                | docker run -i --name "\$ARCHIVE_NAME" \
+                    --label easyfix.logarchive=true \
+                    --log-opt max-size=60m --log-opt max-file=1 \
+                    alpine:3 cat >/dev/null 2>&1 \
+                && echo "✓ Log archive container created: \$ARCHIVE_NAME" \
+                || echo "⚠ Log archive failed (non-fatal) — continuing deploy"
+            else
+              echo "⚠ alpine:3 unavailable (no Docker Hub egress?) — skipping log archive"
+            fi
+          fi
+
+          # 7-DAY RETENTION. Label-scoped so it can never touch a real service
+          # container. The label is SHARED across every EasyFix deploy workflow,
+          # so whichever service deploys next also cleans up the others' stale
+          # archives on this host.
+          docker container prune -f \
+            --filter "label=easyfix.logarchive=true" \
+            --filter "until=168h" >/dev/null 2>&1 || true
+
           echo "▶ Recreating stt container (backend + UIs untouched)"
           docker compose up -d --no-deps --force-recreate stt
 
