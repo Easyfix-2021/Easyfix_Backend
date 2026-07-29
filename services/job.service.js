@@ -3247,6 +3247,47 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
     } catch (e) {
       logger.warn('Cancel audit comment failed (non-fatal) · id=' + jobId + ' · ' + e.message);
     }
+
+    /*
+     * Cancelling KILLS every still-open offer (2026-07-29). Without this, the
+     * OFFERED rows survived until the 30-min TTL swept them, so for up to half
+     * an hour after a cancellation the CRM list projection (offerColumns():
+     * is_offered / offered_count / offered_efr_name) still reported a LIVE offer
+     * on a dead job, and the technician could still see and act on it.
+     *
+     * Same expire shape as acceptOffer() / reschedule(): offer_status → EXPIRED
+     * with responded_at stamped. Idempotent — `offer_status = OFFERED` in the
+     * WHERE means the TTL sweep can never double-expire these — and scoped to
+     * the INTO-cancelled transition by the guard above, so a 6→6 re-submit
+     * doesn't re-stamp responded_at on rows this already closed.
+     *
+     * NOT transactional, deliberately: setStatus writes through the shared pool
+     * with no transaction (see the UPDATE above), so there is no connection to
+     * enlist — this is a second statement on the same pool, issued only after
+     * the cancellation itself has already committed. Non-fatal for the same
+     * reason: the job IS cancelled, and a failure here must never surface as a
+     * 500 on a cancel that actually happened (the TTL sweep remains the
+     * backstop). Missing table on an un-migrated instance degrades quietly via
+     * the memoised jobOfferTableExists() probe the rest of the offer code uses,
+     * with the ER_NO_SUCH_TABLE catch as belt-and-braces for a stale probe.
+     */
+    try {
+      if (await jobOfferTableExists()) {
+        const [r] = await pool.query(
+          `UPDATE tbl_job_offer
+              SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
+            WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
+          [jobId],
+        );
+        if (r.affectedRows) {
+          logger.info('Cancelled job expired ' + r.affectedRows + ' open offer(s) · id=' + jobId);
+        }
+      }
+    } catch (e) {
+      if (e?.code !== 'ER_NO_SUCH_TABLE') {
+        logger.warn('Expiring open offers on cancel failed (non-fatal) · id=' + jobId + ' · ' + e.message);
+      }
+    }
   }
 
   // Ops took a deliberate status action (confirm 9→0, cancel, enquiry, …) — any
@@ -4053,6 +4094,17 @@ async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason
  *   efrId : the technician (tbl_easyfixer.efr_id)
  *   limit : max jobs to return (default 50)
  *
+ * Each returned row also carries the OFFER's own timing, in the projection's
+ * snake_case so the app reads one consistent naming style:
+ *   offered_at — when this tech's live offer was (re)extended
+ *   expires_at — offered_at + OFFER_TTL_MINUTES, i.e. the instant acceptOffer()
+ *                will start rejecting it and the expiry cron will close it
+ * Both are DERIVED IN SQL (DATE_ADD) off the row we already read, so there is no
+ * extra query and — because the pool runs `dateStrings: true` — both arrive as
+ * "YYYY-MM-DD HH:mm:ss" IST strings rather than tz-shifting Date objects.
+ * Computing expires_at server-side (not in the app) keeps the 30-minute TTL a
+ * single source of truth: change OFFER_TTL_MINUTES and every client follows.
+ *
  * Returns { items } — [] when tbl_job_offer is absent.
  */
 async function listOfferedForTech(efrId, { limit = 50 } = {}) {
@@ -4060,7 +4112,9 @@ async function listOfferedForTech(efrId, { limit = 50 } = {}) {
   if (!(await jobOfferTableExists())) return { items: [] };
   // Most-recent open offers first; cap before hydrating the full preview.
   const [offerRows] = await pool.query(
-    `SELECT job_id FROM tbl_job_offer
+    `SELECT job_id, offered_at,
+            DATE_ADD(offered_at, INTERVAL ${OFFER_TTL_MINUTES} MINUTE) AS expires_at
+       FROM tbl_job_offer
       WHERE fk_easyfixter_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}
       ORDER BY offered_at DESC
       LIMIT ?`,
@@ -4074,6 +4128,16 @@ async function listOfferedForTech(efrId, { limit = 50 } = {}) {
   const { rows } = await list({ jobIds: ids, limit: ids.length });
   const order = new Map(ids.map((id, i) => [id, i]));
   rows.sort((a, b) => (order.get(Number(a.job_id)) ?? 0) - (order.get(Number(b.job_id)) ?? 0));
+  // Stamp the offer timing back onto the preview rows. Keyed by job_id — one
+  // OPEN offer per (job, tech) is an invariant of offerToTechnicians(), which
+  // collapses stray duplicates, so this map can't lose a row.
+  const timing = new Map(offerRows.map((r) => [Number(r.job_id), r]));
+  for (const row of rows) {
+    const t = timing.get(Number(row.job_id));
+    if (!t) continue;
+    row.offered_at = t.offered_at ?? null;
+    row.expires_at = t.expires_at ?? null;
+  }
   logger.info('Returning ' + rows.length + ' offered jobs · efrId=' + efrId);
   return { items: rows };
 }
@@ -4322,6 +4386,9 @@ module.exports = {
   // open offers, and list a tech's open offers.
   offerToTechnicians, listOffers, listOfferedForTech, techHasOpenOffer, rejectOffer,
   isOfferFlowActive, expireStaleOffers,
+  // The 30-min offer window. Exported so the offer-REMINDER cron can bound its
+  // re-push window by the same constant instead of re-declaring it and drifting.
+  OFFER_TTL_MINUTES,
   tryAutoAssignOnCreate,
   fireWebhook, statusToEventName,
   hasClientVerticalIdColumn,

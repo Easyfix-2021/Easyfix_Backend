@@ -577,6 +577,59 @@ Why this matters: without this, a job offered to technicians who never respond w
     logger.info('Job-offer expiry cron registered (job.offer_expiry.enabled=true, every 2 min IST).');
   }
 
+  // ─── Job-offer escalation reminder — every 2 minutes ─────────────────
+  // (Added 2026-07-29) Re-pushes offers that are still open and unanswered
+  // 5 minutes in, at most twice, and never once the 30-min window is nearly up.
+  // Deliberately DOUBLE-gated (master loud-alert flag AND its own flag, both
+  // default-off) because unlike the expiry sweep above this SENDS traffic to
+  // technicians — it must stay dark until ops explicitly turns it on. The
+  // runner re-checks the same gate, so Trigger Now is a no-op while off.
+  const offerReminderCron = require('../services/job-offer-reminder-cron');
+  const offerReminderJob = registerJob({
+    id: 'job-offer-reminder',
+    name: 'Job Offer Reminder Push',
+    description:
+`What this task does: When a job is offered to technicians, they get one push notification. If their phone was in a pocket or the notification got buried, the offer quietly expires after 30 minutes and ops has to offer the job all over again. This task gives unanswered offers a second (and at most a third) chance. Step by step:
+  1. Every 2 minutes, the task wakes up automatically.
+  2. It finds every job offer that is STILL waiting for a response and was sent at least 5 minutes ago.
+  3. It skips any offer it already reminded about in the last 5 minutes, and any offer older than 15 minutes (close to the 30-minute expiry, where a reminder would only frustrate).
+  4. Each remaining offer gets ONE more push to that technician — the same notification, worded as a reminder, opening the same accept screen.
+  5. Any single offer can be reminded at most TWICE, ever.
+  6. It logs how many offers were eligible, how many it actually reminded, and how many pushes failed — visible in the server logs and on this page (Last Run details below).
+
+Why this matters: a missed job-offer notification costs the technician a job and costs ops a re-offer. A short, capped nudge recovers offers that were simply not seen, without turning into notification spam.
+
+Note: this task only runs if BOTH properties "job.offer.loud_alert.enabled" AND "job.offer.reminder.enabled" are "true" in easyfix_properties. Both are checked at server start (so a restart/redeploy is needed after changing them) AND again on every run — so while either is off, even Trigger Now does nothing.`,
+    cron: '*/2 * * * *',
+    runner: async () => {
+      const result = await offerReminderCron.runOfferReminders();
+      logger.info(
+        `Job-offer reminder cron · eligible=${result.eligible} · reminded=${result.claimed} · ` +
+        `pushed=${result.pushed} · failed=${result.failed}` + (result.skipped ? ` (skipped: ${result.reason})` : '')
+      );
+      return result;
+    },
+  });
+  // Default-OFF gate (mirrors the attendance-reminder pattern, NOT the always-on
+  // kill-switch pattern above): the job stays unregistered unless BOTH flags read
+  // 'true' at boot. `offerReminderEnabled()` is the shared AND of the two — the
+  // same helper the runner and the push sender use, so they can't disagree.
+  const offerReminderEnabled = require('../services/job-offer-alert-flags').offerReminderEnabled();
+  if (cronDisabled) {
+    offerReminderJob.skipReason = 'CRON_DISABLED=true';
+  } else if (!offerReminderEnabled) {
+    offerReminderJob.skipReason = "properties 'job.offer.loud_alert.enabled' + 'job.offer.reminder.enabled' were not both 'true' at server start — set both to 'true' and restart the server to enable";
+    logger.info("Job-offer reminder cron SKIPPED — set job.offer.loud_alert.enabled=true AND job.offer.reminder.enabled=true in easyfix_properties to enable (takes effect after restart).");
+  } else {
+    offerReminderJob.task = cron.schedule(
+      offerReminderJob.cron,
+      () => invokeJob(offerReminderJob, 'cron'),
+      { timezone: TZ },
+    );
+    offerReminderJob.registered = true;
+    logger.info('Job-offer reminder cron registered (both loud-alert + reminder flags true, every 2 min IST).');
+  }
+
   // ─── Call-recording backfill — every 15 min ──────────────────────────
   // (Added 2026-07-10) The Plivo PUSH recording callback (<Dial
   // recordingCallbackUrl>) has proven unreliable — tbl_plivo_call_log.recording_url

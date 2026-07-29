@@ -22,10 +22,26 @@ const logger = require('../logger');
  * NOTIFICATIONS_DISABLE + TEST_MODE (TEST_EMAILS|TEST_MOBILE → TEST_FCM_TOKEN)
  * behaviour, the return shape ({ delivered, deadToken, providerResponse, … }),
  * and the public sendPush() signature are all preserved from the legacy version.
+ *
+ * LOUD/ALERTING STYLE (2026-07-29, OPTIONAL + OPT-IN): sendPush() also accepts
+ * { androidChannelId, sound, iosSound, interruptionLevel }. Passing ANY of them
+ * attaches an `android.notification` block + an `apns` block so the push rings
+ * on a dedicated high-importance channel instead of arriving as a silent chirp.
+ * Passing NONE of them emits the payload EXACTLY as it always has — same keys,
+ * same order, no undefined keys — so the five other push senders (attendance
+ * reminder, notice publish, registration status, validate-flows test, admin
+ * notification) are byte-for-byte unchanged. The gate is deliberately "did the
+ * caller opt in", not a flag read, so this module stays flag-agnostic.
  */
 
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const SCOPE = 'https://www.googleapis.com/auth/firebase.messaging';
+
+// Vibration pattern for an opted-in loud push: [delay, vibrate, sleep, vibrate].
+// FCM v1 wants protobuf Durations ("0.5s"), not milliseconds. Two firm pulses
+// read as "act on me now" without becoming an alarm. `default_vibrate_timings`
+// is left unset (proto default false), which is what makes this pattern apply.
+const LOUD_VIBRATE_TIMINGS = ['0s', '0.5s', '0.3s', '0.5s'];
 
 function disabled() {
   return String(process.env.NOTIFICATIONS_DISABLE).toLowerCase() === 'true';
@@ -72,7 +88,60 @@ async function getAccessToken() {
   return cachedToken.token;
 }
 
-async function sendPush({ token, title, body, data = {} }) {
+/*
+ * Build the FCM v1 request body. Extracted from sendPush() as a PURE function
+ * so the exact emitted shape can be characterization-tested without a network
+ * call or service-account env (see tests/fcm-push-payload.test.js) — the whole
+ * point of the loud-alert work is that the DEFAULT payload never drifts.
+ *
+ * Without any of { androidChannelId, sound, interruptionLevel } the returned
+ * object is exactly the four-key message it has always been. With them, the
+ * android.notification + apns blocks are ATTACHED (mutated on) afterwards
+ * rather than spread conditionally into the literal, so the default path can
+ * never gain an `undefined` key.
+ */
+function buildMessage({ token, title, body, data = {}, androidChannelId, sound, iosSound, interruptionLevel }) {
+  // v1 requires every data value to be a string.
+  const stringData = {};
+  for (const [k, v] of Object.entries(data || {})) stringData[k] = v == null ? '' : String(v);
+
+  const payload = {
+    message: {
+      token,
+      notification: { title: title || '', body: body || '' },
+      data: stringData,
+      android: { priority: 'high' },
+    },
+  };
+
+  // ── OPTIONAL loud/alerting style — attached ONLY when a caller opted in ──
+  // Every other push sender passes none of these, so their message object is
+  // byte-for-byte what it was before this option existed.
+  if (androidChannelId || sound || interruptionLevel) {
+    // Android: on API 26+ the CHANNEL carries importance/sound/vibration, so
+    // channel_id is the load-bearing field — `sound` here is the pre-26
+    // fallback and the resource name the app registers against the channel.
+    const androidNotification = {};
+    if (androidChannelId) androidNotification.channel_id = androidChannelId;
+    if (sound) androidNotification.sound = sound;
+    androidNotification.notification_priority = 'PRIORITY_MAX';
+    androidNotification.vibrate_timings = LOUD_VIBRATE_TIMINGS;
+    payload.message.android.notification = androidNotification;
+
+    // iOS: apns-priority 10 = deliver immediately; `interruption-level`
+    // time-sensitive is what lets the alert break through Focus/Do-Not-Disturb.
+    // APNs wants the sound FILE name (with extension) while Android wants the
+    // bare resource name — hence the ".wav" default instead of reusing `sound`.
+    const aps = {};
+    if (sound) aps.sound = iosSound || `${sound}.wav`;
+    if (interruptionLevel) aps['interruption-level'] = interruptionLevel;
+    payload.message.apns = { headers: { 'apns-priority': '10' }, payload: { aps } };
+  }
+
+  return payload;
+}
+
+async function sendPush({ token, title, body, data = {}, androidChannelId, sound, iosSound, interruptionLevel }) {
   const originalToken = token;
   logger.info('Send push · title="' + (title || '') + '" · dataKeys=' + Object.keys(data || {}).length);
   if (!token) return { delivered: false, error: 'token required' };
@@ -108,18 +177,7 @@ async function sendPush({ token, title, body, data = {} }) {
     }
   }
 
-  // v1 requires every data value to be a string.
-  const stringData = {};
-  for (const [k, v] of Object.entries(data || {})) stringData[k] = v == null ? '' : String(v);
-
-  const payload = {
-    message: {
-      token,
-      notification: { title: title || '', body: body || '' },
-      data: stringData,
-      android: { priority: 'high' },
-    },
-  };
+  const payload = buildMessage({ token, title, body, data, androidChannelId, sound, iosSound, interruptionLevel });
 
   let accessToken;
   try {
@@ -151,4 +209,6 @@ async function sendPush({ token, title, body, data = {} }) {
   }
 }
 
-module.exports = { sendPush, isConfigured: configured };
+// `buildMessage` is exported for the payload characterization test only — no
+// production caller should build a message without going through sendPush().
+module.exports = { sendPush, isConfigured: configured, buildMessage };
