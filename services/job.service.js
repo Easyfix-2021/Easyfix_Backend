@@ -3282,6 +3282,11 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
 
   const conn = await pool.getConnection();
   const offeredIds = [];
+  // Who is putting this offer out — the SAME actor stamped onto the job's
+  // schedule-audit columns below, but captured PER OFFER ROW so re-offers by
+  // different people (and the report's "Offered By") attribute correctly. NULL
+  // for a system/auto offer with no actor (e.g. the auto-assign engine).
+  const offeredBy = (actor && actor.user_id != null) ? actor.user_id : null;
   try {
     await conn.beginTransaction();
 
@@ -3340,9 +3345,10 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
           `UPDATE tbl_job_offer
               SET offer_status = ${OFFER_STATUS.OFFERED}, offered_at = NOW(), updated_on = NOW(),
                   offer_count = offer_count + 1, offer_source = COALESCE(?, offer_source),
+                  offered_by_user_id = COALESCE(?, offered_by_user_id),
                   responded_at = NULL, reject_reason = NULL, reject_reason_id = NULL
             WHERE job_offer_id = ?`,
-          [src, latest.job_offer_id],
+          [src, offeredBy, latest.job_offer_id],
         );
         await conn.query(
           `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
@@ -3352,9 +3358,9 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
       } else {
         await conn.query(
           `INSERT INTO tbl_job_offer
-             (job_id, fk_easyfixter_id, offer_status, offered_at, created_on, updated_on, offer_count, offer_source)
-           VALUES (?, ?, 0, NOW(), NOW(), NOW(), 1, ?)`,
-          [jobId, efrId, src],
+             (job_id, fk_easyfixter_id, offer_status, offered_at, created_on, updated_on, offer_count, offer_source, offered_by_user_id)
+           VALUES (?, ?, 0, NOW(), NOW(), NOW(), 1, ?, ?)`,
+          [jobId, efrId, src, offeredBy],
         );
       }
       offeredIds.push(efrId);

@@ -11,10 +11,13 @@
  * so the CRM page can render KPI tiles + a table + by-source / by-owner charts
  * from one call.
  *
- * "Offered By": tbl_job_offer carries NO offered-by / created-by user column
- * (only fk_easyfixter_id = who the offer went TO). So the closest attribution
- * for who PUT the offer out is the job owner — tbl_job.job_owner → tbl_user
- * (aliased ow.user_name). NULL owner (orphan / unowned job) buckets 'Unassigned'.
+ * "Offered By": the CRM user who PUT the offer out, captured per-offer on
+ * tbl_job_offer.offered_by_user_id (→ tbl_user, aliased ob.user_name). This is
+ * the real offerer — job.service stamps it at the offer site — NOT the job owner
+ * (many people touch one job, so job_owner over-credited owners). NULL offered_by
+ * buckets 'Unassigned': that means a system/auto offer with no actor, OR a
+ * PRE-MIGRATION offer made before the column existed (intentionally not
+ * backfilled — historical rows read as "unknown offerer").
  *
  * Uses the named OFFER_STATUS constants (services/offer-status.js) so the SQL
  * reads OFFERED/ACCEPTED/REJECTED/EXPIRED, never bare 0/1/2/3.
@@ -61,8 +64,11 @@ function buildScope(filters) {
   where += buildInFilter('c.vertical_id', filters.verticalId, params);
   where += buildInFilter('cy.state_user', filters.zonalManagerId, params);
   where += buildInFilter('j.fk_service_catg_id', filters.serviceCategoryId, params);
-  // "Offered By" = job owner (tbl_job.job_owner). Array of tbl_user ids; empty = all.
-  where += buildInFilter('j.job_owner', filters.offeredById, params);
+  // "Offered By" = who made the offer (tbl_job_offer.offered_by_user_id). Array of
+  // tbl_user ids; empty = all. Reads the base table directly (no job join needed).
+  // NULL offered_by (auto / pre-migration offers) never matches an id filter, so
+  // those rows only surface when no "Offered By" filter is applied.
+  where += buildInFilter('jo.offered_by_user_id', filters.offeredById, params);
   if (filters.source) { where += ' AND jo.offer_source = ?'; params.push(filters.source); }
   if (filters.dateFrom) { where += ' AND jo.offered_at >= ?'; params.push(filters.dateFrom + ' 00:00:00'); }
   // Inclusive upper bound — cover the whole dateTo day (legacy DATE_ADD idiom).
@@ -133,19 +139,21 @@ async function getOfferAcceptance(filters = {}) {
     s2.params,
   );
 
-  // Offers grouped by "Offered By" = the job owner. tbl_job_offer has no
-  // offered-by user column, so the job's owner (tbl_job.job_owner →
-  // tbl_user.user_name) is the attribution. The tbl_user join lives only here —
-  // the other groupings don't need the owner NAME, and the owner FILTER above
-  // reads j.job_owner directly (already joined), so no extra cost elsewhere.
+  // Offers grouped by "Offered By" = the user who made the offer
+  // (tbl_job_offer.offered_by_user_id → tbl_user.user_name). NULL offered_by
+  // (system/auto or pre-migration offers) buckets to 'Unassigned'. The tbl_user
+  // join lives only here — the other groupings don't need the offerer NAME, and
+  // the "Offered By" FILTER above reads jo.offered_by_user_id off the base table,
+  // so there's no extra cost elsewhere. (ownerId/ownerName keys are kept so the
+  // FE response contract is unchanged; they now carry the offerer, not the owner.)
   const s4 = buildScope(filters);
   const [ownerRows] = await pool.query(
-    `SELECT COALESCE(j.job_owner, 0) AS ownerId,
-            COALESCE(ow.user_name, 'Unassigned') AS ownerName, ${STATUS_AGG}
+    `SELECT COALESCE(jo.offered_by_user_id, 0) AS ownerId,
+            COALESCE(ob.user_name, 'Unassigned') AS ownerName, ${STATUS_AGG}
        ${s4.from}
-       LEFT JOIN tbl_user ow ON ow.user_id = j.job_owner
+       LEFT JOIN tbl_user ob ON ob.user_id = jo.offered_by_user_id
        ${s4.where}
-      GROUP BY COALESCE(j.job_owner, 0), COALESCE(ow.user_name, 'Unassigned')
+      GROUP BY COALESCE(jo.offered_by_user_id, 0), COALESCE(ob.user_name, 'Unassigned')
       ORDER BY offered DESC`,
     s4.params,
   );

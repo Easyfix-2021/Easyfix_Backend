@@ -5,7 +5,7 @@
  *
  *   POST /api/admin/quicksight/offer-acceptance/summary
  *     body: { clientId?[], verticalId?[], zonalManagerId?[], serviceCategoryId?[],
- *             offeredById?[] (job owner), dateFrom?, dateTo? (offered_at window),
+ *             offeredById?[] (user who made the offer), dateFrom?, dateTo? (offered_at window),
  *             respondedFrom?, respondedTo? (responded_at / acceptance window),
  *             source? ('top10'|'search'|'auto'), format? }
  *     → { rows: [per-tech], bySource: [...], byOwner: [...], byDay: [...], totals: {...} }  (or XLSX)
@@ -34,7 +34,7 @@ const summaryBody = extendJobFilter({
   respondedFrom: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).optional(),
   respondedTo: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).optional(),
   source: Joi.string().valid('top10', 'search', 'auto').optional(),
-  // "Offered By" = job owner (tbl_job.job_owner). Array of user ids; empty = all.
+  // "Offered By" = who made the offer (tbl_job_offer.offered_by_user_id). Array of user ids; empty = all.
   offeredById: idArray,
 });
 
