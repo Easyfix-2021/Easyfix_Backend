@@ -11,6 +11,7 @@ const {
   candidatesQuery, candidatesSearchQuery, slotRecommendationsQuery,
 } = require('../../validators/job.validator');
 const { assertEntityInScope } = require('../../lib/scope');
+const requireStageForTransition = require('../../middleware/require-stage');
 const { streamStyledXlsx } = require('../../utils/xlsx-styled-export');
 const ttlCache = require('../../utils/ttl-cache');
 
@@ -258,7 +259,10 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
     const { pool } = require('../../db');
     logger.info('List jobs · status=' + (req.query.status ?? '-') + ' clientId=' + (req.query.clientId ?? '-') + ' cityId=' + (req.query.cityId ?? '-') + ' limit=' + req.query.limit + ' offset=' + req.query.offset);
     const scope = await buildRequestScopeWithHierarchy(req, pool);
-    const { rows, total } = await job.list({ ...req.query, scope });
+    // Job Stage Access — req.allowedStages is attached by routes/admin/index.js
+    // (bypass roles / no-rows → {mode:'all'} = unrestricted). list() intersects
+    // the visible statuses with any tab/status filter.
+    const { rows, total } = await job.list({ ...req.query, scope, allowedStages: req.allowedStages });
     logger.info('Returning ' + rows.length + ' jobs (total=' + total + ')');
     modernOk(res, { items: rows, total, limit: req.query.limit, offset: req.query.offset });
   } catch (e) { next(e); }
@@ -302,6 +306,8 @@ router.get('/export.xlsx', validate(listQuery, 'query'), async (req, res, next) 
       limit: EXPORT_CAP,
       offset: 0,
       scope,
+      // Job Stage Access — the export mirrors exactly what the operator sees.
+      allowedStages: req.allowedStages,
     });
     const truncated = total > EXPORT_CAP;
     logger.info('Streaming jobs export · ' + rows.length + ' rows (total=' + total + ', truncated=' + truncated + ')');
@@ -423,6 +429,7 @@ router.get('/counts', async (req, res, next) => {
     const counts = await job.getStatusCounts({
       ownerId: Number.isFinite(ownerId) ? ownerId : undefined,
       scope: req.scope,
+      allowedStages: req.allowedStages,
     });
     modernOk(res, counts);
   } catch (e) { next(e); }
@@ -450,7 +457,7 @@ router.get('/counts', async (req, res, next) => {
 router.get('/attention-summary', async (req, res, next) => {
   try {
     logger.info('Fetch attention summary');
-    const data = await job.getAttentionSummary({ scope: req.scope });
+    const data = await job.getAttentionSummary({ scope: req.scope, allowedStages: req.allowedStages });
     modernOk(res, data);
   } catch (e) { next(e); }
 });
@@ -1334,7 +1341,7 @@ const updateHandler = async (req, res, next) => {
 router.put('/:id',   validate(idParam, 'params'), validate(updateBody), scopedJob, updateHandler);
 router.patch('/:id', validate(idParam, 'params'), validate(updateBody), scopedJob, updateHandler);
 
-router.patch('/:id/status', validate(idParam, 'params'), validate(statusBody), scopedJob, async (req, res, next) => {
+router.patch('/:id/status', validate(idParam, 'params'), validate(statusBody), scopedJob, requireStageForTransition('status'), async (req, res, next) => {
   try {
     logger.info('Change job status · jobId=' + req.params.id + ' status=' + req.body?.status);
     /*
@@ -1372,7 +1379,7 @@ router.patch('/:id/status', validate(idParam, 'params'), validate(statusBody), s
   } catch (e) { next(e); }
 });
 
-router.patch('/:id/assign', validate(idParam, 'params'), validate(assignBody), scopedJob, async (req, res, next) => {
+router.patch('/:id/assign', validate(idParam, 'params'), validate(assignBody), scopedJob, requireStageForTransition('assign'), async (req, res, next) => {
   try {
     logger.info('Assign technician · jobId=' + req.params.id + ' efrId=' + (req.body?.easyfixerId ?? req.body?.efr_id ?? '-'));
     const updated = await job.assign(req.params.id, req.body, req.user);
@@ -1392,7 +1399,7 @@ router.patch('/:id/assign', validate(idParam, 'params'), validate(assignBody), s
  * (rescheduleBody). Literal second segment "reschedule" disambiguates from the
  * `/:id` wildcard.
  */
-router.patch('/:id/reschedule', validate(idParam, 'params'), validate(rescheduleBody), scopedJob, async (req, res, next) => {
+router.patch('/:id/reschedule', validate(idParam, 'params'), validate(rescheduleBody), scopedJob, requireStageForTransition('reschedule'), async (req, res, next) => {
   try {
     logger.info('Reschedule job · jobId=' + req.params.id + ' reasonId=' + (req.body?.reasonId ?? '-'));
     const updated = await job.reschedule(Number(req.params.id), req.body, req.user);
@@ -1420,7 +1427,7 @@ router.patch('/:id/reschedule', validate(idParam, 'params'), validate(reschedule
  * Literal-segment route under `/:id/`; its distinct second segment ("offer")
  * keeps it from colliding with the bare `/:id` wildcard.
  */
-router.post('/:id/offer', validate(idParam, 'params'), validate(offerBody), scopedJob, async (req, res, next) => {
+router.post('/:id/offer', validate(idParam, 'params'), validate(offerBody), scopedJob, requireStageForTransition('offer'), async (req, res, next) => {
   try {
     const { easyfixerIds, requestedDateTime, timeSlot, source, sourceByEfr } = req.body;
     logger.info('Offer job to technicians · jobId=' + req.params.id + ' count=' + (Array.isArray(easyfixerIds) ? easyfixerIds.length : 0));

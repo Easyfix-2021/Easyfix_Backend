@@ -9,6 +9,10 @@ const { generateOtp } = require('../utils/otp');
 // Synchronous, cache-backed — see services/properties.service.js::getProperty.
 const { getProperty } = require('./properties.service');
 const addressService = require('./address.service');
+// Job Stage Access — pure stage/status helpers (no DB). stageVisibleStatuses
+// turns a user's allowed stage keys into the union of visible job_status codes,
+// AND-combined (intersected) with the tab/status filters in list/counts/attention.
+const { stageVisibleStatuses } = require('../lib/job-stages');
 
 /*
  * THE OFFER MODEL feature flag. ON by default — only the literal string
@@ -860,6 +864,7 @@ async function list({
   noServices,
   startDate, endDate,
   scope,
+  allowedStages,             // Job Stage Access — { mode:'all'|'list', stages }
   sortBy, sortDir,           // server-side sort — whitelisted column + asc|desc
   limit = 50, offset = 0,
 } = {}) {
@@ -916,6 +921,21 @@ async function list({
         clauses.push(`cl.vertical_id IN (${v.ids.map(() => '?').join(',')})`);
         params.push(...v.ids);
       }
+    }
+  }
+
+  // Job Stage Access — restrict the visible rows to the union of statuses
+  // across the caller's allowed stages, AND-combined (intersected) with any
+  // tab/status filter below. mode 'all' (unrestricted / bypass) = no clause.
+  // References only `j.` so it doesn't affect the COUNT-join detection. Empty
+  // union (shouldn't happen for a 'list' with valid keys) → 1=0.
+  if (allowedStages && allowedStages.mode === 'list') {
+    const visible = [...stageVisibleStatuses(allowedStages.stages)];
+    if (visible.length === 0) {
+      clauses.push('1=0');
+    } else {
+      clauses.push(`j.job_status IN (${visible.map(() => '?').join(',')})`);
+      params.push(...visible);
     }
   }
 
@@ -1436,7 +1456,7 @@ async function getJobMeta(jobId) {
  * side sum — we use client-side sum because MySQL 5.7's WITH ROLLUP syntax is
  * fussy and the row count is always tiny (≤ 10 status codes).
  */
-async function getStatusCounts({ ownerId, easyfixerId, scope } = {}) {
+async function getStatusCounts({ ownerId, easyfixerId, scope, allowedStages } = {}) {
   logger.info('Compute job status counts · ownerId=' + (ownerId ?? '-') + ' · easyfixerId=' + (easyfixerId ?? '-'));
   /*
    * Two queries run in parallel:
@@ -1505,6 +1525,20 @@ async function getStatusCounts({ ownerId, easyfixerId, scope } = {}) {
     if (v && v.mode === 'allow' && v.ids.length && hasVerticalCol) {
       clauses.push(`cl.vertical_id IN (${v.ids.map(() => '?').join(',')})`);
       params.push(...v.ids);
+    }
+  }
+
+  // Job Stage Access — same intersection as list() so tab counts respect the
+  // caller's visible stages. Added to the shared `clauses`, so it flows into
+  // BOTH the GROUP BY status query and the BOOKED-split query (a user who can't
+  // see the pending-scheduling stage gets 0 for the booked buckets too).
+  if (allowedStages && allowedStages.mode === 'list') {
+    const visible = [...stageVisibleStatuses(allowedStages.stages)];
+    if (visible.length === 0) {
+      clauses.push('1=0');
+    } else {
+      clauses.push(`j.job_status IN (${visible.map(() => '?').join(',')})`);
+      params.push(...visible);
     }
   }
 
@@ -1592,7 +1626,7 @@ async function getStatusCounts({ ownerId, easyfixerId, scope } = {}) {
  * (Admin/Finance) see the full count; scoped users see only their
  * hierarchy-unioned slice.
  */
-async function getAttentionSummary({ scope } = {}) {
+async function getAttentionSummary({ scope, allowedStages } = {}) {
   const hasVerticalCol = await hasClientVerticalIdColumn();
   // OFFER MODEL: when tbl_job_offer exists, "pending tech accept" keys off an
   // OPEN offer EXISTS rather than the fk (a pool-offered job keeps fk NULL).
@@ -1631,6 +1665,18 @@ async function getAttentionSummary({ scope } = {}) {
       if (v && v.mode === 'allow' && v.ids.length && hasVerticalCol) {
         clauses.push(`cl.vertical_id IN (${v.ids.map(() => '?').join(',')})`);
         params.push(...v.ids);
+      }
+    }
+    // Job Stage Access — intersect every tile's own status predicate with the
+    // caller's visible-status union so the tiles respect the same restriction
+    // as the list + counts. References only the job alias → no extra join.
+    if (allowedStages && allowedStages.mode === 'list') {
+      const visible = [...stageVisibleStatuses(allowedStages.stages)];
+      if (visible.length === 0) {
+        clauses.push('1=0');
+      } else {
+        clauses.push(`${jobAlias}.job_status IN (${visible.map(() => '?').join(',')})`);
+        params.push(...visible);
       }
     }
     // Same JOIN strategy as getStatusCounts: tbl_address needed

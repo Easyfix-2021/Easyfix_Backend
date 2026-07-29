@@ -3,6 +3,7 @@ const router = require('express').Router();
 const requireAuth = require('../../middleware/auth');
 const { role } = require('../../middleware/role');
 const { buildRequestScopeWithHierarchy } = require('../../lib/scope');
+const { loadAllowedStages } = require('../../services/user.service');
 const maskMobile = require('../../middleware/mask-mobile');
 const rejectMaskedMobile = require('../../middleware/reject-masked-mobile');
 const { pool } = require('../../db');
@@ -38,8 +39,17 @@ router.use(rejectMaskedMobile);
 router.use(async (req, _res, next) => {
   // Hierarchy-aware scope: own manage_* ∪ every direct/indirect report's
   // manage_*. Bypass roles (Admin/Finance) get `undefined` = no row filter.
-  try { req.scope = await buildRequestScopeWithHierarchy(req, pool); }
-  catch (e) { return next(e); }
+  //
+  // Job Stage Access: also resolve req.allowedStages ONCE per request. Consumed
+  // by the jobs list/counts/attention (visibility) + middleware/require-stage
+  // (transitions). NOT subject to the Admin/Finance scope bypass — a stage
+  // grant is an explicit per-user setting, so it applies to whoever it was set
+  // on (see routes/auth.js for the full rationale). No rows → {mode:'all'} =
+  // unrestricted, which is still every user's default.
+  try {
+    req.scope = await buildRequestScopeWithHierarchy(req, pool);
+    req.allowedStages = await loadAllowedStages(req.user.user_id);
+  } catch (e) { return next(e); }
   next();
 });
 
