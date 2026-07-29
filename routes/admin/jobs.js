@@ -37,6 +37,51 @@ async function scopedJob(req, res, next) {
   } catch (e) { next(e); }
 }
 
+/*
+ * Past-appointment gate (2026-07-29).
+ *
+ * Two things ops could do that shouldn't be possible: reschedule a job INTO a
+ * moment that has already gone, and offer a job whose promised slot has already
+ * passed (e.g. a 9 AM appointment still being offered at 12:44). Both put a
+ * technician on the hook for a time nobody can meet; the second also produces
+ * offers that are stale the instant they are sent.
+ *
+ * ROUTE LAYER ONLY — deliberately not inside job.service. `offerToTechnicians`
+ * is shared with assign() and the on-create auto-assign path, where a
+ * back-dated import must still be allowed to land. Same reasoning as
+ * middleware/require-stage.js. NOT applied to /assign either: reassigning a
+ * running-late job (tech no-show at 9 AM, swap at 12:44) is a legitimate
+ * recovery ops must keep.
+ *
+ * The "effective" appointment is the body's requestedDateTime when present —
+ * both /offer and /reschedule can carry a schedule edit — otherwise the job's
+ * stored one. So fixing the time in the SAME call is always allowed; only a
+ * stale time left stale is refused.
+ */
+function appointmentIsPast(value) {
+  const raw = String(value || '').trim().replace('T', ' ');
+  if (!raw) return false;                       // nothing to judge → don't block
+  const nowIst = job.formatMysqlDateTimeIST(new Date()); // 'YYYY-MM-DD HH:MM:SS' IST
+  if (!nowIst) return false;
+  // Date-only carries no promised time, so judge it by DATE alone — otherwise
+  // "today, time unspecified" would read as 00:00 and be wrongly called past.
+  // Zero-padded fixed-width strings, so lexicographic compare IS chronological.
+  if (raw.length <= 10) return raw.slice(0, 10) < nowIst.slice(0, 10);
+  return raw.slice(0, 16) < nowIst.slice(0, 16);
+}
+
+function blockPastAppointment(message) {
+  return function pastAppointmentGuard(req, res, next) {
+    const effective = req.body?.requestedDateTime
+      || (req.scopedJob && req.scopedJob.requested_date_time);
+    if (appointmentIsPast(effective)) {
+      logger.warn('Past-appointment blocked · jobId=' + req.params.id + ' · appointment=' + effective);
+      return modernError(res, 400, message);
+    }
+    return next();
+  };
+}
+
 // Upload sub-router (POST /upload) — isolated because of multer middleware.
 router.use(require('./jobs-upload'));
 
@@ -1399,7 +1444,9 @@ router.patch('/:id/assign', validate(idParam, 'params'), validate(assignBody), s
  * (rescheduleBody). Literal second segment "reschedule" disambiguates from the
  * `/:id` wildcard.
  */
-router.patch('/:id/reschedule', validate(idParam, 'params'), validate(rescheduleBody), scopedJob, requireStageForTransition('reschedule'), async (req, res, next) => {
+router.patch('/:id/reschedule', validate(idParam, 'params'), validate(rescheduleBody), scopedJob, requireStageForTransition('reschedule'),
+  blockPastAppointment('Cannot reschedule to a date and time that has already passed. Pick a future appointment.'),
+  async (req, res, next) => {
   try {
     logger.info('Reschedule job · jobId=' + req.params.id + ' reasonId=' + (req.body?.reasonId ?? '-'));
     const updated = await job.reschedule(Number(req.params.id), req.body, req.user);
@@ -1427,7 +1474,9 @@ router.patch('/:id/reschedule', validate(idParam, 'params'), validate(reschedule
  * Literal-segment route under `/:id/`; its distinct second segment ("offer")
  * keeps it from colliding with the bare `/:id` wildcard.
  */
-router.post('/:id/offer', validate(idParam, 'params'), validate(offerBody), scopedJob, requireStageForTransition('offer'), async (req, res, next) => {
+router.post('/:id/offer', validate(idParam, 'params'), validate(offerBody), scopedJob, requireStageForTransition('offer'),
+  blockPastAppointment('This job\'s appointment time has already passed. Reschedule it to a future slot before offering it to technicians.'),
+  async (req, res, next) => {
   try {
     const { easyfixerIds, requestedDateTime, timeSlot, source, sourceByEfr } = req.body;
     logger.info('Offer job to technicians · jobId=' + req.params.id + ' count=' + (Array.isArray(easyfixerIds) ? easyfixerIds.length : 0));

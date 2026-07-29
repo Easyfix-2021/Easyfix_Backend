@@ -37,6 +37,17 @@ const scenario = {
   serviceCount: 0,         // tbl_job_services rows (the ≥1-service BOOKED gate)
 };
 
+/*
+ * IST wall-clock 'YYYY-MM-DD HH:MM' offset by `days`. Fixtures MUST be relative:
+ * the /offer + /reschedule routes now refuse a past appointment, so a hardcoded
+ * date would quietly turn these tests red the day it went stale.
+ */
+function istPlusDays(days) {
+  const ist = new Date(Date.now() + (5 * 60 + 30) * 60 * 1000 + days * 86_400_000);
+  return ist.toISOString().slice(0, 16).replace('T', ' ');
+}
+const FUTURE_APPOINTMENT = istPlusDays(1);
+
 // The job row `scopedJob` loads. city/client/vertical are all in-scope below.
 function jobRow() {
   return {
@@ -47,7 +58,7 @@ function jobRow() {
     vertical_id: 3,
     fk_easyfixter_id: null,
     fk_customer_id: 3,
-    requested_date_time: '2026-07-30 10:00:00',
+    requested_date_time: `${FUTURE_APPOINTMENT}:00`,
     booking_cut_off_time_slot: null,
     otp: null,
     remarks: null,
@@ -242,7 +253,7 @@ test('assign + offer pass for a scheduler holding the source stage', async () =>
  */
 test('reschedule is gated on the CURRENT stage being visible to the caller', async () => {
   const body = {
-    requestedDateTime: '2026-08-01T10:00',
+    requestedDateTime: FUTURE_APPOINTMENT.replace(' ', 'T'),
     reasonId: 12,
     remarks: 'slot moved',
   };

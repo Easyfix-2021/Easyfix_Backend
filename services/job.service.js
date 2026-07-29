@@ -4326,4 +4326,8 @@ module.exports = {
   fireWebhook, statusToEventName,
   hasClientVerticalIdColumn,
   notifyCustomerNotReachable,
+  // Canonical IST wall-clock formatter (server-TZ independent). Exported so
+  // route-layer guards can compare an appointment against "now" in IST without
+  // re-implementing the offset — there is exactly one correct version of this.
+  formatMysqlDateTimeIST,
 };

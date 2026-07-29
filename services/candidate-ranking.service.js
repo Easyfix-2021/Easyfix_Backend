@@ -391,27 +391,67 @@ async function l1Eligibility(job, { applyDeepSkill = true, zoneIds = null, zoneP
     params.push(...excludeEfrIds);
   }
 
-  // ── Already rejected / rescheduled-off THIS job ──
+  /*
+   * ── Already rejected / rescheduled-off THIS job ──
+   *
+   * ⚠ `sh.easyfixer_id IS NOT NULL` is LOAD-BEARING, not tidiness. SQL's
+   * `x NOT IN (…)` evaluates to UNKNOWN — never TRUE — as soon as the subquery
+   * yields a single NULL, so one NULL row here silently rejects EVERY
+   * technician and the ranked list goes completely empty.
+   *
+   * That is not hypothetical: an ops reschedule on an UNASSIGNED job (BOOKED
+   * with offers out, fk_easyfixter_id NULL) writes exactly such a row —
+   * job.service reschedule() inserts `existing.fk_easyfixter_id || null` with a
+   * mandatory reason — so before this guard, rescheduling an unassigned job
+   * blacked out its Top-10 forever ("No Technicians Available For This Job"),
+   * including the no-deep-skill and zone-widening fallbacks, since they all
+   * come through here. Search was unaffected (it bypasses this filter), which
+   * is why the list could look selectively broken.
+   *
+   * Semantically the guard is also the correct reading: a NULL-technician row
+   * records a JOB-level reschedule, not a per-technician rejection, so it must
+   * exclude nobody.
+   */
   where.push(`e.efr_id NOT IN (
           SELECT sh.easyfixer_id FROM scheduling_history sh
            WHERE sh.job_id = ?
+             AND sh.easyfixer_id IS NOT NULL
              AND sh.reschedule_reason IS NOT NULL
              AND sh.reschedule_reason <> ''
         )`);
   params.push(job.job_id);
 
-  // ── Already OFFERED this job (offer-pool model) ──
-  // In THE OFFER MODEL a job is offered to MANY technicians at once; each open
-  // offer is a tbl_job_offer row with offer_status = 0 (OFFERED). Suppress any
-  // tech who currently holds an open offer for THIS job so the Top-10 / search
-  // candidate list never re-surfaces someone already offered. Gated by the
-  // memoised existence probe — when tbl_job_offer is absent this clause is
-  // omitted and eligibility is identical to the pre-offer-model behaviour.
+  /*
+   * ── Already OFFERED / DECLINED this job (offer-pool model) ──
+   * In THE OFFER MODEL a job is offered to MANY technicians at once; each offer
+   * is a tbl_job_offer row. Two statuses take a tech out of the running for
+   * THIS job:
+   *   OFFERED  — they already hold an open offer; re-surfacing them would let
+   *              ops offer the same job to the same person twice.
+   *   REJECTED — they explicitly declined, with a reason. Re-listing someone
+   *              who just said no (and whose refusal is displayed right above
+   *              in "Offered To") is exactly the mistake ops flagged.
+   * EXPIRED is deliberately NOT excluded — that is "didn't answer in time", and
+   * re-offering is a normal, intended recovery. ACCEPTED can't reach here (the
+   * job is assigned by then).
+   *
+   * Ops can still reach a declined tech through SEARCH, which bypasses the
+   * ranking filters by design — the exclusion shapes the recommendation, it
+   * doesn't remove the override.
+   *
+   * Gated by the memoised existence probe — when tbl_job_offer is absent this
+   * clause is omitted and eligibility matches pre-offer-model behaviour.
+   */
   if (await jobOfferTableExists()) {
+    // `IS NOT NULL` for the same reason as the scheduling_history subquery
+    // above — a single NULL in a NOT IN list rejects every row. fk_easyfixter_id
+    // should never be NULL on an offer, but the failure mode (silent, total
+    // blackout of the candidate list) is far too costly to leave to "should".
     where.push(`e.efr_id NOT IN (
           SELECT jo.fk_easyfixter_id FROM tbl_job_offer jo
            WHERE jo.job_id = ?
-             AND jo.offer_status = ${OFFER_STATUS.OFFERED}
+             AND jo.fk_easyfixter_id IS NOT NULL
+             AND jo.offer_status IN (${OFFER_STATUS.OFFERED}, ${OFFER_STATUS.REJECTED})
         )`);
     params.push(job.job_id);
   }
@@ -1114,6 +1154,145 @@ function filterAndScore(eligible, stats, job, opts) {
   return { scored, rejected };
 }
 
+/*
+ * diagnoseEmptyPool(job, rejected) → { code, message, counts, declined }
+ *
+ * Why the candidate list came back empty, in ops' language. Runs ONLY on the
+ * empty path, so the happy path pays nothing.
+ *
+ * The old empty state said "No active, verified technician with the required
+ * skill was found in this city" no matter WHY the list was empty — which sent
+ * ops (and us) chasing skills and city data when the real cause was a query
+ * bug, everyone already being offered, or an attendance gate. One extra query
+ * turns that into a specific, actionable sentence.
+ *
+ * The counts come from ONE pass over the city's active+verified technicians,
+ * so each figure is a subset of `cityPool` and they are directly comparable.
+ * `rejected` (from filterAndScore) covers the OTHER kind of emptiness: people
+ * who were eligible but lost to attendance / saturation / COD balance.
+ */
+async function diagnoseEmptyPool(job, rejected = []) {
+  const counts = {
+    cityPool: 0, withSkill: 0, openOffer: 0, declined: 0, removedEarlier: 0, filtered: rejected.length,
+  };
+  try {
+    const hasOffers = await jobOfferTableExists();
+    const skillPredicate = (job.fk_service_catg_id || job.fk_service_type_id)
+      ? `EXISTS (SELECT 1 FROM tbl_efr_deepskill_mapping m
+                  WHERE m.easyfixer_id = e.efr_id AND m.is_repairing = 1
+                    ${job.fk_service_catg_id ? 'AND m.category_id = ' + Number(job.fk_service_catg_id) : ''}
+                    ${job.fk_service_type_id ? 'AND m.service_type_id = ' + Number(job.fk_service_type_id) : ''})`
+      : '1=1';
+    const offerCount = (statuses) => (hasOffers
+      ? `EXISTS (SELECT 1 FROM tbl_job_offer jo WHERE jo.job_id = ${Number(job.job_id)}
+                  AND jo.fk_easyfixter_id = e.efr_id AND jo.offer_status IN (${statuses}))`
+      : '0');
+    const [[row]] = await pool.query(
+      `SELECT COUNT(*) AS cityPool,
+              SUM(${skillPredicate}) AS withSkill,
+              SUM(${offerCount(OFFER_STATUS.OFFERED)}) AS openOffer,
+              SUM(${offerCount(OFFER_STATUS.REJECTED)}) AS declined,
+              SUM(EXISTS (SELECT 1 FROM scheduling_history sh
+                           WHERE sh.job_id = ? AND sh.easyfixer_id = e.efr_id
+                             AND sh.reschedule_reason IS NOT NULL AND sh.reschedule_reason <> '')) AS removedEarlier
+         FROM tbl_easyfixer e
+        WHERE e.efr_status = 1 AND e.is_technician_verified = 1 AND e.efr_cityId = ?`,
+      [job.job_id, job.city_id],
+    );
+    for (const k of Object.keys(counts)) {
+      if (row && row[k] != null) counts[k] = Number(row[k]);
+    }
+  } catch (e) {
+    // Diagnosis must never break the response it is explaining.
+    logger.warn({ err: e.message }, 'diagnoseEmptyPool failed; falling back to the generic message');
+    return { code: 'unknown', message: 'No technician is available for this job right now.', counts, declined: [] };
+  }
+
+  /*
+   * The DECLINES, with the reason each technician gave. When the pool is empty
+   * because people said no, "1 declined it" is a dead end — the reason is what
+   * tells ops whether to re-offer, widen the search, or escalate (e.g. "issue
+   * with the customer" is a very different signal from "already booked").
+   * Latest offer per tech (MAX(job_offer_id)), mirroring job.service listOffers,
+   * so a re-offered tech appears once. Fail-soft: an empty list is fine.
+   */
+  let declined = [];
+  if (counts.declined > 0) {
+    try {
+      const [rows] = await pool.query(
+        `SELECT jo.fk_easyfixter_id AS efr_id, ef.efr_name, jo.reject_reason AS reason
+           FROM tbl_job_offer jo
+           JOIN (SELECT fk_easyfixter_id, MAX(job_offer_id) AS mid
+                   FROM tbl_job_offer
+                  WHERE job_id = ?
+                  GROUP BY fk_easyfixter_id) latest ON latest.mid = jo.job_offer_id
+           JOIN tbl_easyfixer ef ON ef.efr_id = jo.fk_easyfixter_id
+          WHERE jo.offer_status = ${OFFER_STATUS.REJECTED}
+          ORDER BY jo.responded_at DESC
+          LIMIT 10`,
+        [job.job_id],
+      );
+      declined = rows.map((r) => ({
+        efr_id: Number(r.efr_id),
+        efr_name: r.efr_name || null,
+        reason: (r.reason && String(r.reason).trim()) || null,
+      }));
+    } catch (e) {
+      logger.warn({ err: e.message }, 'diagnoseEmptyPool: decline-reason lookup failed');
+    }
+  }
+
+  const cityName = job.city_name ? ` in ${job.city_name}` : ' in this city';
+  if (counts.cityPool === 0) {
+    return {
+      code: 'no_tech_in_city',
+      message: `No active, verified technician is registered${cityName}.`,
+      counts, declined,
+    };
+  }
+  // Everyone in the city is spoken for on THIS job.
+  const spokenFor = counts.openOffer + counts.declined + counts.removedEarlier;
+  if (spokenFor >= counts.cityPool) {
+    const parts = [];
+    if (counts.openOffer)      parts.push(`${counts.openOffer} already hold an open offer`);
+    if (counts.declined)       parts.push(`${counts.declined} declined it`);
+    if (counts.removedEarlier) parts.push(`${counts.removedEarlier} were removed from it earlier`);
+    return {
+      code: 'all_offered_or_declined',
+      message: `All ${counts.cityPool} technicians${cityName} are already accounted for on this job — ${parts.join(', ')}. Wait for a response, or use search to pick someone directly.`,
+      counts, declined,
+    };
+  }
+  // Eligible people existed but every one lost a scoring filter — name them.
+  if (counts.filtered > 0) {
+    const byReason = new Map();
+    for (const r of rejected) {
+      // Reasons carry per-tech numbers ("saturated (3 active jobs)") — strip the
+      // parenthetical so they group into one line per CAUSE.
+      const key = String(r.reason || 'excluded').replace(/\s*\(.*\)\s*$/, '');
+      byReason.set(key, (byReason.get(key) || 0) + 1);
+    }
+    const parts = [...byReason.entries()].map(([reason, n]) => `${n} ${reason}`);
+    return {
+      code: 'filtered_out',
+      message: `${counts.filtered} technician${counts.filtered === 1 ? '' : 's'} matched this job but ${counts.filtered === 1 ? 'was' : 'were'} excluded: ${parts.join('; ')}.`,
+      counts, declined,
+    };
+  }
+  if (counts.withSkill === 0) {
+    return {
+      code: 'no_skill_match',
+      message: `${counts.cityPool} technicians are active${cityName}, but none is mapped to this job's skill.`,
+      counts, declined,
+    };
+  }
+  return {
+    code: 'unknown',
+    message: 'No technician is available for this job right now.',
+    counts, declined,
+  };
+}
+
 // ─── Public entrypoint ───────────────────────────────────────────────
 /*
  * Returns:
@@ -1123,7 +1302,9 @@ function filterAndScore(eligible, stats, job, opts) {
  *     note: 'no_deep_skill_match' | null,
  *     l1Count, l2Count, candidates: [...],
  *     config: { ranking_order, max_concurrent, … },
- *     rejected: [{ efr_id, reason }]
+ *     rejected: [{ efr_id, reason }],
+ *     emptyReason: { code, message, counts } | null   ← only when candidates is
+ *        empty; says WHY in ops' language (see diagnoseEmptyPool).
  *   }
  *
  * Each candidate row carries everything the modal needs: name, location,
@@ -1369,10 +1550,12 @@ async function rankCandidatesForJob(jobId, {
   }
 
   if (scored.length === 0 && totalEligible === 0) {
-    logger.info('Returning 0 candidates · no eligible techs · jobId=' + jobId);
+    const emptyReason = await diagnoseEmptyPool(job, rejected);
+    logger.info('Returning 0 candidates · no eligible techs · jobId=' + jobId + ' · reason=' + emptyReason.code);
     return {
       job: enrichedJob, alreadyAssigned, note: note ?? 'no_eligible_techs',
       l1Count: 0, l2Count: 0, candidates: [], rejected: [],
+      emptyReason,
       config: { ranking_order: RANKING_ORDER, performance_sub: PERFORMANCE_SUB },
     };
   }
@@ -1410,7 +1593,15 @@ async function rankCandidatesForJob(jobId, {
     candidatesList = await ensureAssignedFirst(candidatesList, assignedEfrId, job, scored);
   }
 
-  logger.info('Returning ' + candidatesList.length + ' candidates · eligible=' + totalEligible + ' scored=' + scored.length + ' rejected=' + rejected.length + (note ? ' note=' + note : ''));
+  /*
+   * The OTHER emptiness: technicians WERE eligible, but every one lost a
+   * scoring filter (attendance / saturation / COD balance), so `candidates` is
+   * empty while totalEligible > 0 — the early return above never fires. Explain
+   * that case too, or ops sees the same blank panel with no cause.
+   */
+  const emptyReason = candidatesList.length === 0 ? await diagnoseEmptyPool(job, rejected) : null;
+
+  logger.info('Returning ' + candidatesList.length + ' candidates · eligible=' + totalEligible + ' scored=' + scored.length + ' rejected=' + rejected.length + (note ? ' note=' + note : '') + (emptyReason ? ' emptyReason=' + emptyReason.code : ''));
   return {
     job: enrichedJob,
     alreadyAssigned,
@@ -1419,6 +1610,7 @@ async function rankCandidatesForJob(jobId, {
     l2Count: scored.length,
     candidates: candidatesList,
     rejected: rejected.slice(0, 20),
+    emptyReason,
     config: {
       ranking_order: RANKING_ORDER,
       performance_sub: PERFORMANCE_SUB,
