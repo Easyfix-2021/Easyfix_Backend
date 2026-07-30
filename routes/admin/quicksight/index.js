@@ -38,6 +38,11 @@ router.use('/priority-jobs',          require('./priority-jobs'));
 router.use('/material-report',        require('./material-report'));
 router.use('/city-performance',       require('./city-performance'));
 router.use('/technician-performance', require('./technician-performance'));
+// STATE + USER Performance — the City scorecard over two new dimensions, built
+// for the Performance Report page's tabs. ONE sub-router mounted twice; it reads
+// req.baseUrl to pick the dimension + the matching action key.
+router.use('/state-performance',      require('./region-performance'));
+router.use('/user-performance',       require('./region-performance'));
 router.use('/supply-gap',             require('./supply-gap'));
 router.use('/employee-productivity',  require('./employee-productivity'));
 router.use('/admin-dashboard',        require('./admin-dashboard'));
