@@ -605,9 +605,26 @@ async function cancelReasons() {
 
 async function rescheduleReasons() {
   logger.info('Lookup reschedule reasons');
-  // Actual table is reschedule_reason_app (blueprint's tbl_reschedule_reason doesn't exist).
+  // Source: action_taken_reason, action_type = 8 — the "Reschedule" bucket seeded
+  // by migrations/executed/2026-07-10-seed-reschedule-reasons-action-type-8.sql.
+  //
+  // WHY THIS CHANGED (2026-07-29): the mobile dropdown used to read the legacy
+  // `reschedule_reason_app` table, whose 4 live rows had been seeded (in the
+  // legacy era) with CANCELLATION-flavoured text ("Work done by an outsider",
+  // "Customer denied work", …) — so techs saw cancel reasons under Reschedule.
+  // This now reads the same clean set the CRM Schedule & Assign dialog serves
+  // (routes/admin/jobs.js GET /reschedule-reasons), keeping the two consistent.
+  //
+  // Deliberately NO user_type filter (unlike rejectReasons' user_type=4): the
+  // action_type=8 bucket intentionally mixes customer/tech/ops perspectives and
+  // the CRM offers ALL active rows, so the app must too or it would show only a
+  // fraction of the list. `action_desc AS reason` keeps the exact response shape
+  // the app already consumes for reject reasons — no client change needed.
   const [rows] = await pool.query(
-    `SELECT id, reschedule_reason AS reason FROM reschedule_reason_app ORDER BY id ASC`
+    `SELECT id, action_desc AS reason
+       FROM action_taken_reason
+      WHERE action_type = 8 AND (status IS NULL OR status = 1)
+      ORDER BY id ASC`
   );
   logger.info(`Found ${rows.length} reschedule reasons`);
   return rows;
