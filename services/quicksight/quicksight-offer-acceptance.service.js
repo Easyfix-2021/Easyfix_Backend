@@ -192,6 +192,14 @@ async function getOfferAcceptance(filters = {}) {
     `SELECT jo.job_id AS jobId,
             MAX(c.client_name) AS clientName,
             MAX(j.job_status)  AS jobStatus,
+            /*
+             * The JOB's assigned technician (tbl_job.fk_easyfixter_id, NOT the
+             * offer's fk_easyfixter_id) — drives the BOOKED sub-label split
+             * ("Pending App Ack" when a tech is assigned vs "Pending for
+             * Scheduling" when not), so the report's Job Status reads the same as
+             * the job modal / jobs list. One job per group, so MAX is exact.
+             */
+            MAX(j.fk_easyfixter_id) AS jobEfrId,
             COUNT(DISTINCT jo.fk_easyfixter_id) AS techsOffered,
             /*
              * ROUNDS = offer WAVES, i.e. how many times ops pressed "Offer" for
@@ -312,6 +320,9 @@ async function getOfferAcceptance(filters = {}) {
     jobId: n(r.jobId),
     clientName: r.clientName || null,
     jobStatus: r.jobStatus == null ? null : n(r.jobStatus),
+    // Whether the JOB has a technician assigned — the FE labels status 0 by this
+    // (Pending App Ack vs Pending for Scheduling), matching the job modal.
+    assigned: r.jobEfrId != null,
     techsOffered: n(r.techsOffered),
     // waves = "Rounds" on screen. `rounds` (SUM offer_count) is kept as the
     // raw offer-action total; `reoffers` is the part of it that was a REPEAT
@@ -388,6 +399,7 @@ async function getOfferDetails(filters = {}, selection = {}) {
   const [rows] = await pool.query(
     `SELECT jo.job_id AS jobId, c.client_name AS clientName,
             j.job_status AS jobStatus,
+            j.fk_easyfixter_id AS jobEfrId,
             jo.fk_easyfixter_id AS efrId, ef.efr_name AS efrName,
             COALESCE(ob.user_name, 'Unassigned') AS offererName,
             jo.offer_status AS offerStatus,
@@ -424,6 +436,8 @@ async function getOfferDetails(filters = {}, selection = {}) {
       // Where the JOB is now — lets a drill-down row be triaged in place
       // instead of bouncing back to the report or the CRM to look it up.
       jobStatus: r.jobStatus == null ? null : n(r.jobStatus),
+      // Job-level tech presence — same BOOKED sub-label split as the modal.
+      assigned: r.jobEfrId != null,
       efrId: n(r.efrId),
       efrName: r.efrName || null,
       offererName: r.offererName || 'Unassigned',
@@ -440,22 +454,36 @@ async function getOfferDetails(filters = {}, selection = {}) {
 }
 
 /*
- * CRM-facing job-status labels for the XLSX Job sheet.
+ * CRM-facing job-status label for the XLSX Job sheet.
  *
  * ⚠ Do NOT swap this for services/integration.service.js's statusLabel(). That
  * map is FROZEN to the legacy Dropwizard contract external clients depend on,
  * where 0 = 'Unconfirmed' and 9 = 'Call Later'. In the CRM's own vocabulary
  * 0 = 'Booked' and 9 = 'Unconfirmed' — reusing it would label the export
  * differently from the chip the operator just looked at, on the very statuses
- * they care about most. Mirrors the FE's statusLabel (src/lib/utils.ts); the
- * assigned/unassigned split of BOOKED is deliberately not reproduced (this
- * report has no fk_easyfixter_id in scope).
+ * they care about most.
+ *
+ * Mirrors the FE's statusLabel (src/lib/utils.ts) EXACTLY, including the BOOKED
+ * sub-split by tech presence: status 0 + a tech assigned → "Pending App Ack",
+ * status 0 + no tech → "Pending for Scheduling", and plain "Booked" only when
+ * assignment is unknown. Reproducing the split is what keeps the export cell
+ * equal to the on-screen chip and the job modal header (the mismatch this fixes:
+ * the report said "Booked" while the modal said "Pending App Ack" for the same
+ * assigned-but-unacknowledged job). `assigned` now flows in from the query
+ * (MAX(j.fk_easyfixter_id)); before, this report had no fk_easyfixter_id in scope.
  */
-const JOB_STATUS_LABEL = {
+const JOB_STATUS_MAP = {
   0: 'Booked', 1: 'Scheduled', 2: 'In Progress', 3: 'Completed', 5: 'Completed',
   6: 'Cancelled', 7: 'Enquiry', 9: 'Unconfirmed', 10: 'Closed from App',
   15: 'Estimate Pending', 20: 'In Progress', 21: 'On Hold',
 };
+function jobStatusLabel(code, assigned) {
+  if (code == null) return '';
+  if (code === 0 && (assigned === true || assigned === false)) {
+    return assigned ? 'Pending App Ack' : 'Pending for Scheduling';
+  }
+  return JOB_STATUS_MAP[code] || `Status ${code}`;
+}
 
 /*
  * XLSX payload — THREE sheets mirroring the on-screen tabs (Technician /
@@ -519,8 +547,9 @@ function toXlsx(data) {
         rows: data.byJob.map((j) => ({
           ...j,
           // Same label the on-screen chip shows — an exported row has to be
-          // triageable without going back to the CRM to look up a code.
-          jobStatusLabel: j.jobStatus == null ? '' : (JOB_STATUS_LABEL[j.jobStatus] || `Status ${j.jobStatus}`),
+          // triageable without going back to the CRM to look up a code. Passes
+          // `assigned` so the BOOKED sub-split matches the chip and modal.
+          jobStatusLabel: jobStatusLabel(j.jobStatus, j.assigned),
           // Flatten the offerer array for a spreadsheet cell — same text the
           // Offerers column shows on screen.
           offerersLabel: (j.offerers || []).map((o) => `${o.ownerName} (${o.rounds})`).join(', '),
