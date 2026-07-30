@@ -170,22 +170,37 @@ router.get('/dashboard', async (req, res, next) => {
     // scope=today: each active bucket is scoped to TODAY by its own date column —
     //   New         = tickets created today   (ticket_created_date_time)
     //   Scheduled   = appointment today        (requested_date_time)
-    //   In Progress = appointment today        (requested_date_time)
+    //   In Progress = scheduled today           (scheduled_date_time)
     //   Completed   = checked out today         (checkout_date_time)
     // open / cancelled / total stay lifetime. Default (no scope) = all lifetime.
     const todayOnly = String(req.query.scope || '') === 'today';
     const on = (col) => (todayOnly ? `AND DATE(${col}) = CURDATE()` : '');
-    logger.info('Fetch client dashboard stats · clientId=' + req.spoc.client_id + (todayOnly ? ' · scope=today' : ''));
+
+    // Visibility for the "Today's jobs" counts — same reporting hierarchy as
+    // Orders (tbl_client_contacts.manager_id, attributed via reporting_contact_id):
+    //   • Top SPOC (no manager)  → the WHOLE client's counts.
+    //   • Everyone else          → their subtree (themselves + team's bookings).
+    //   • ?spoc=<id> (a member)  → just that one SPOC's counts (team drill-down).
+    const hier = await resolveClientHierarchy(req);
+    const scopeIds = hierarchyFilter(hier, req);   // undefined = whole client
+    const params = [req.spoc.client_id];
+    let mine = '';
+    if (Array.isArray(scopeIds)) {
+      mine = `AND reporting_contact_id IN (${scopeIds.map(() => '?').join(',')})`;
+      params.push(...scopeIds);
+    }
+
+    logger.info('Fetch client dashboard stats · clientId=' + req.spoc.client_id + (todayOnly ? ' · scope=today' : '') + (Array.isArray(scopeIds) ? ' · scope=' + scopeIds.length + 'spoc' : ' · all'));
     const [[stats]] = await pool.query(`
       SELECT
         SUM(CASE WHEN job_status = 9      ${on('ticket_created_date_time')} THEN 1 ELSE 0 END) AS newTickets,
         SUM(CASE WHEN job_status = 1      ${on('requested_date_time')}      THEN 1 ELSE 0 END) AS scheduled,
-        SUM(CASE WHEN job_status = 2      ${on('requested_date_time')}      THEN 1 ELSE 0 END) AS inProgress,
+        SUM(CASE WHEN job_status = 2      ${on('scheduled_date_time')}      THEN 1 ELSE 0 END) AS inProgress,
         SUM(CASE WHEN job_status IN (3,5) ${on('checkout_date_time')}       THEN 1 ELSE 0 END) AS completed,
         SUM(CASE WHEN job_status IN (0,7,9) THEN 1 ELSE 0 END) AS open,
         SUM(CASE WHEN job_status = 6        THEN 1 ELSE 0 END) AS cancelled,
         COUNT(*) AS total
-       FROM tbl_job WHERE fk_client_id = ?`, [req.spoc.client_id]);
+       FROM tbl_job WHERE fk_client_id = ? ${mine}`, params);
     modernOk(res, stats);
   } catch (e) { next(e); }
 });
@@ -285,14 +300,71 @@ async function resolveManagerScope(req) {
   return { isManager, ownerIds };
 }
 
+/**
+ * Client-app reporting hierarchy — walks the SPOC-to-SPOC tree
+ * (tbl_client_contacts.manager_id) for the logged-in SPOC. Bookings are
+ * attributed to a SPOC via tbl_job.reporting_contact_id.
+ *   subtreeIds — this SPOC's contact id + every active contact at/under them
+ *   isTop      — this SPOC has no manager above them → sees the WHOLE client
+ *                (incl. old / CRM jobs with no booking SPOC)
+ *   isManager  — this SPOC has at least one report (subtree bigger than self)
+ * MySQL 8 recursive CTE; cte_max_recursion_depth (1000) bounds cyclic data.
+ */
+async function resolveClientHierarchy(req) {
+  const myId = Number(req.spoc.id);
+  const clientId = req.spoc.client_id;
+  try {
+    const [[me]] = await pool.query(
+      'SELECT manager_id FROM tbl_client_contacts WHERE id = ? LIMIT 1', [myId]);
+    const isTop = !me || me.manager_id == null || Number(me.manager_id) === 0;
+    const [rows] = await pool.query(
+      `WITH RECURSIVE team AS (
+          SELECT id FROM tbl_client_contacts WHERE id = ? AND client_id = ?
+          UNION ALL
+          SELECT c.id FROM tbl_client_contacts c
+            JOIN team t ON c.manager_id = t.id
+           WHERE c.client_id = ? AND c.status = 1
+       )
+       SELECT DISTINCT id FROM team`,
+      [myId, clientId, clientId]);
+    const subtreeIds = rows.map((r) => Number(r.id));
+    if (!subtreeIds.length) subtreeIds.push(myId); // always include self
+    return { isTop, isManager: subtreeIds.length > 1, subtreeIds };
+  } catch (e) {
+    // Cyclic manager_id, recursion-depth limit, or an un-migrated column would
+    // otherwise 500 the Orders screen. Fall back to the pre-hierarchy behaviour
+    // (client-scoped = see everything) so orders never disappear on a data glitch.
+    logger.warn('resolveClientHierarchy failed (' + e.message + ') — falling back to client-wide');
+    return { isTop: true, isManager: false, subtreeIds: [myId] };
+  }
+}
+
+/**
+ * Resolve the reporting-contact filter for a list/dashboard request given the
+ * caller's hierarchy + an optional `?spoc=<contactId>` team filter.
+ *   • ?spoc in my subtree → just that one SPOC
+ *   • else if I'm top      → undefined (no filter → whole client)
+ *   • else                 → my whole subtree
+ */
+function hierarchyFilter(hier, req) {
+  const spocFilter = Number(req.query.spoc) || null;
+  if (spocFilter && hier.subtreeIds.includes(spocFilter)) return [spocFilter];
+  if (hier.isTop) return undefined;
+  return hier.subtreeIds;
+}
+
 router.get('/jobs', async (req, res, next) => {
   try {
     logger.info('List client jobs · status=' + (req.query.status ?? 'all') + ' q=' + (req.query.q || '-') + ' limit=' + (Math.min(Number(req.query.limit) || 50, 500)) + ' offset=' + (Number(req.query.offset) || 0));
-    // Client-scoped: a SPOC sees ALL of their client's jobs. (Owner-based
-    // scoping hid jobs whose job_client_owner is an internal user or NULL —
-    // e.g. a job a non-primary SPOC just booked — so the SPOC saw nothing.)
+    // Reporting-hierarchy scope (tbl_client_contacts.manager_id, attributed via
+    // tbl_job.reporting_contact_id): a top SPOC sees the whole client; everyone
+    // else sees jobs booked by themselves + their team. `?spoc=<id>` narrows a
+    // manager to one team member.
+    const hier = await resolveClientHierarchy(req);
+    const reportingContactIds = hierarchyFilter(hier, req);
     const { rows, total } = await jobService.list({
       clientId: req.spoc.client_id,
+      reportingContactIds,
       status: req.query.status != null ? Number(req.query.status) : undefined,
       q: req.query.q,
       // Server-side date range (so the app can reach any historical date
@@ -482,6 +554,24 @@ router.post('/jobs/:id/images', clientImageUpload.single('file'), async (req, re
     if (e?.status === 400) return modernError(res, 400, e.message);
     next(e);
   }
+});
+
+// One canonical, stable URL for every job image regardless of storage backend
+// (S3 or legacy server disk). Resolves + 302-redirects (S3 presigned) or streams
+// (local file) so both CRMs' images render identically, and the app caches by
+// this stable URL. Declared BEFORE /jobs/:id so "images" isn't captured as :id.
+router.get('/jobs/images/:imageId/file', async (req, res, next) => {
+  try {
+    const imageId = Number(req.params.imageId);
+    if (!Number.isInteger(imageId) || imageId <= 0) return modernError(res, 400, 'invalid imageId');
+    const [[row]] = await pool.query(
+      'SELECT image_id, job_id, image FROM tbl_job_image WHERE image_id = ? LIMIT 1', [imageId]);
+    if (!row || !row.image) return modernError(res, 404, 'image not found');
+    // RBAC: the image's job must belong to the SPOC's client.
+    const job = await jobService.getById(row.job_id);
+    if (!job || job.fk_client_id !== req.spoc.client_id) return modernError(res, 404, 'image not found');
+    await jobImageService.serveResolvedImage(res, row.image);
+  } catch (e) { next(e); }
 });
 
 /**
@@ -820,10 +910,47 @@ router.get('/team', async (req, res, next) => {
       approvalByClient: r.approval_by_client,
     }));
     // isManager drives the Orders "Client Team" filter: only reporting managers
-    // (who see their team's jobs) get the team filter; individual users don't.
-    const { isManager } = await resolveManagerScope(req);
+    // (someone reports to them in the manager_id tree) get the team filter.
+    const { isManager } = await resolveClientHierarchy(req);
     logger.info('Returning ' + items.length + ' team members · isManager=' + isManager);
     modernOk(res, { items, isManager });
+  } catch (e) { next(e); }
+});
+
+// Per-SPOC booking breakdown for the Orders "Client Team" filter and the
+// per-SPOC Today's-jobs view. Lists everyone in the caller's reporting subtree
+// (themselves + all reports, recursively) with how many jobs each has booked
+// (tbl_job.reporting_contact_id). `?scope=today` counts only today's tickets.
+router.get('/team/bookings', async (req, res, next) => {
+  try {
+    const hier = await resolveClientHierarchy(req);
+    const todayOnly = String(req.query.scope || '') === 'today';
+    const dateClause = todayOnly ? 'AND DATE(j.ticket_created_date_time) = CURDATE()' : '';
+    const placeholders = hier.subtreeIds.map(() => '?').join(',');
+    logger.info('Team bookings · clientId=' + req.spoc.client_id + ' · subtree=' + hier.subtreeIds.length + (todayOnly ? ' · today' : ''));
+    // ONE grouped scan of tbl_job (not 56 correlated COUNT subqueries — with no
+    // index on reporting_contact_id those each full-scan ~1.4M rows and blow the
+    // request timeout). LEFT JOIN so zero-booking SPOCs still appear.
+    const [rows] = await pool.query(
+      `SELECT c.id, c.contact_name, c.contact_desgn, COALESCE(b.cnt, 0) AS bookings
+         FROM tbl_client_contacts c
+         LEFT JOIN (
+           SELECT j.reporting_contact_id AS rc, COUNT(*) AS cnt
+             FROM tbl_job j
+            WHERE j.reporting_contact_id IN (${placeholders}) ${dateClause}
+            GROUP BY j.reporting_contact_id
+         ) b ON b.rc = c.id
+        WHERE c.id IN (${placeholders})
+        ORDER BY (c.id = ?) DESC, bookings DESC, c.contact_name`,
+      [...hier.subtreeIds, ...hier.subtreeIds, req.spoc.id]);
+    const members = rows.map((r) => ({
+      id: r.id,
+      name: r.contact_name,
+      designation: r.contact_desgn,
+      bookings: Number(r.bookings),
+      isMe: Number(r.id) === Number(req.spoc.id),
+    }));
+    modernOk(res, { isManager: hier.isManager, isTop: hier.isTop, me: req.spoc.id, members });
   } catch (e) { next(e); }
 });
 
