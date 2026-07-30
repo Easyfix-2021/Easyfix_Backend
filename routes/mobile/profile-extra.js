@@ -274,4 +274,34 @@ router.get('/kyc/aadhaar-pan-exists/:number', validate(Joi.object({
   } catch (e) { next(e); }
 });
 
+// ─── Serviceable pincodes ──────────────────────────────────────────────────
+// The 6-digit pincodes a technician is willing to work in. Scoped strictly to
+// req.tech.efr_id. Read returns the CSV as an array; write reuses the
+// verification service's replaceServiceablePincodes (same soft-write + flip-to-
+// serviceable the CRM/public flows use), so storage format can't drift.
+const verificationService = require('../../services/easyfixer-verification.service');
+
+router.get('/serviceable-pincodes', async (req, res, next) => {
+  try {
+    logger.info('Get serviceable pincodes · efr=' + req.tech.efr_id);
+    modernOk(res, await svc.getServiceablePincodes(req.tech.efr_id));
+  } catch (e) { next(e); }
+});
+
+// PUT the full set (idempotent replace). An empty array clears the set.
+// Pincodes are 6-digit strings; replaceServiceablePincodes matches them against
+// tbl_pincode by value, so an unknown pincode is dropped (partial-resolution
+// warning) rather than stored — the app validates each one before adding it.
+router.put('/serviceable-pincodes', validate(Joi.object({
+  pincodes: Joi.array().items(Joi.string().trim().pattern(/^[0-9]{6}$/)).max(200).required(),
+})), async (req, res, next) => {
+  try {
+    logger.info('Replace serviceable pincodes · efr=' + req.tech.efr_id + ' · count=' + req.body.pincodes.length);
+    // actor=null → the technician is acting on their own behalf; the helper
+    // stamps their efr_id as created_by/updated_by.
+    await verificationService.replaceServiceablePincodes(req.tech.efr_id, req.body.pincodes, null);
+    modernOk(res, await svc.getServiceablePincodes(req.tech.efr_id));
+  } catch (e) { next(e); }
+});
+
 module.exports = router;

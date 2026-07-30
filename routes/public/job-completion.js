@@ -47,6 +47,9 @@ const validate = require('../../middleware/validate');
 const { rateLimit } = require('../../middleware/rate-limit');
 const { getProperty } = require('../../services/properties.service');
 const logger = require('../../logger');
+const ttlCache = require('../../utils/ttl-cache');
+const candidateRanking = require('../../services/candidate-ranking.service');
+const { slotRecommendationsQuery } = require('../../validators/job.validator');
 
 // Global map-clickability toggle (easyfix_properties). Absent/'true' →
 // clickable; 'false' → the customer's map is rendered non-interactive.
@@ -262,6 +265,46 @@ router.get(
       return modernOk(res, payload);
     } catch (e) {
       logger.warn('Magic-link prefill failed · ' + e.message);
+      return mapKnownError(res, next, e);
+    }
+  },
+);
+
+// ─── GET /:token/slot-recommendations?date=YYYY-MM-DD — best-slot advisory ──
+// Token-gated clone of the admin route (routes/admin/jobs.js /:id/slot-
+// recommendations), for the customer job-completion form's Reschedule dialog.
+// verify() replaces the admin route's scopedJob guard: it cryptographically
+// checks the magic-link JWT AND requires job_status=9 (Unconfirmed). The jobId
+// comes ONLY from the token — there is no path to address another job. Shares
+// the SAME 30s ttlCache key as the admin route so admin + public reuse one
+// computation. The response is deliberately SLIM (best slot label + two flags)
+// — the raw ranking output (per-slot freeCount/topScore/totalCandidates + the
+// candidatePool count) is internal supply data and MUST NOT reach the
+// unauthenticated client's network tab.
+router.get(
+  '/:token/slot-recommendations',
+  peekToken,
+  tokenRateLimit,
+  validate(slotRecommendationsQuery, 'query'),
+  async (req, res, next) => {
+    try {
+      const jobId = await verify(req);
+      const day = String(req.query.date).slice(0, 10);
+      logger.info('Magic-link slot recommendations · jobId=' + jobId + ' · date=' + day);
+      const result = await ttlCache.cached(
+        `slot-rec:${jobId}:${day}`,
+        30_000,
+        () => candidateRanking.recommendSlotsForJob(jobId, { date: day }),
+      );
+      const best = result.slots.find((s) => s.recommended) || null;
+      return modernOk(res, {
+        date: result.date,
+        best: best ? { slot: best.slot } : null,
+        hasCandidatePool: result.candidatePool > 0,
+        attendanceKnown: result.attendanceKnown,
+      });
+    } catch (e) {
+      logger.warn('Magic-link slot recommendations failed · ' + e.message);
       return mapKnownError(res, next, e);
     }
   },

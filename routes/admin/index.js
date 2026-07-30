@@ -3,6 +3,7 @@ const router = require('express').Router();
 const requireAuth = require('../../middleware/auth');
 const { role } = require('../../middleware/role');
 const { buildRequestScopeWithHierarchy } = require('../../lib/scope');
+const { loadAllowedStages } = require('../../services/user.service');
 const maskMobile = require('../../middleware/mask-mobile');
 const rejectMaskedMobile = require('../../middleware/reject-masked-mobile');
 const { pool } = require('../../db');
@@ -38,8 +39,17 @@ router.use(rejectMaskedMobile);
 router.use(async (req, _res, next) => {
   // Hierarchy-aware scope: own manage_* ∪ every direct/indirect report's
   // manage_*. Bypass roles (Admin/Finance) get `undefined` = no row filter.
-  try { req.scope = await buildRequestScopeWithHierarchy(req, pool); }
-  catch (e) { return next(e); }
+  //
+  // Job Stage Access: also resolve req.allowedStages ONCE per request. Consumed
+  // by the jobs list/counts/attention (visibility) + middleware/require-stage
+  // (transitions). NOT subject to the Admin/Finance scope bypass — a stage
+  // grant is an explicit per-user setting, so it applies to whoever it was set
+  // on (see routes/auth.js for the full rationale). No rows → {mode:'all'} =
+  // unrestricted, which is still every user's default.
+  try {
+    req.scope = await buildRequestScopeWithHierarchy(req, pool);
+    req.allowedStages = await loadAllowedStages(req.user.user_id);
+  } catch (e) { return next(e); }
   next();
 });
 
@@ -60,6 +70,13 @@ router.use('/deep-skills',     require('./deep-skills'));
 router.use('/auto-allocation', require('./auto-allocation'));
 router.use('/jobs',          require('./jobs'));
 router.use('/jobs',          require('./job-magic-link')); // adds /:id/send-magic-link + /:id/magic-link-status under /jobs (see file for shape)
+// Billing & Charges job-workspace tab — Penalty/Travel/Incentive (job_material),
+// service billing approval (tbl_job_services.approval_by_client), and Job Sheet /
+// Purchase Order documents (tbl_job_image). Mutations gated by the
+// `job.charges.emails` property allowlist (FEATURES.canManageJobCharges); the
+// read is scope-only. Mounted under /jobs; both fall through from jobs.js.
+router.use('/jobs',          require('./job-charges'));
+router.use('/jobs',          require('./job-documents'));
 router.use('/customer-requests', require('./customer-requests')); // ops inbox for tbl_job_customer_request (cancel/reschedule signals)
 router.use('/auto-assign',   require('./auto-assign'));
 router.use('/notifications', require('./notifications'));

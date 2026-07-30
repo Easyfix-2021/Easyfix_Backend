@@ -11,6 +11,7 @@ const {
   candidatesQuery, candidatesSearchQuery, slotRecommendationsQuery,
 } = require('../../validators/job.validator');
 const { assertEntityInScope } = require('../../lib/scope');
+const requireStageForTransition = require('../../middleware/require-stage');
 const { streamStyledXlsx } = require('../../utils/xlsx-styled-export');
 const ttlCache = require('../../utils/ttl-cache');
 
@@ -34,6 +35,51 @@ async function scopedJob(req, res, next) {
     req.scopedJob = j;
     return next();
   } catch (e) { next(e); }
+}
+
+/*
+ * Past-appointment gate (2026-07-29).
+ *
+ * Two things ops could do that shouldn't be possible: reschedule a job INTO a
+ * moment that has already gone, and offer a job whose promised slot has already
+ * passed (e.g. a 9 AM appointment still being offered at 12:44). Both put a
+ * technician on the hook for a time nobody can meet; the second also produces
+ * offers that are stale the instant they are sent.
+ *
+ * ROUTE LAYER ONLY — deliberately not inside job.service. `offerToTechnicians`
+ * is shared with assign() and the on-create auto-assign path, where a
+ * back-dated import must still be allowed to land. Same reasoning as
+ * middleware/require-stage.js. NOT applied to /assign either: reassigning a
+ * running-late job (tech no-show at 9 AM, swap at 12:44) is a legitimate
+ * recovery ops must keep.
+ *
+ * The "effective" appointment is the body's requestedDateTime when present —
+ * both /offer and /reschedule can carry a schedule edit — otherwise the job's
+ * stored one. So fixing the time in the SAME call is always allowed; only a
+ * stale time left stale is refused.
+ */
+function appointmentIsPast(value) {
+  const raw = String(value || '').trim().replace('T', ' ');
+  if (!raw) return false;                       // nothing to judge → don't block
+  const nowIst = job.formatMysqlDateTimeIST(new Date()); // 'YYYY-MM-DD HH:MM:SS' IST
+  if (!nowIst) return false;
+  // Date-only carries no promised time, so judge it by DATE alone — otherwise
+  // "today, time unspecified" would read as 00:00 and be wrongly called past.
+  // Zero-padded fixed-width strings, so lexicographic compare IS chronological.
+  if (raw.length <= 10) return raw.slice(0, 10) < nowIst.slice(0, 10);
+  return raw.slice(0, 16) < nowIst.slice(0, 16);
+}
+
+function blockPastAppointment(message) {
+  return function pastAppointmentGuard(req, res, next) {
+    const effective = req.body?.requestedDateTime
+      || (req.scopedJob && req.scopedJob.requested_date_time);
+    if (appointmentIsPast(effective)) {
+      logger.warn('Past-appointment blocked · jobId=' + req.params.id + ' · appointment=' + effective);
+      return modernError(res, 400, message);
+    }
+    return next();
+  };
 }
 
 // Upload sub-router (POST /upload) — isolated because of multer middleware.
@@ -258,7 +304,10 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
     const { pool } = require('../../db');
     logger.info('List jobs · status=' + (req.query.status ?? '-') + ' clientId=' + (req.query.clientId ?? '-') + ' cityId=' + (req.query.cityId ?? '-') + ' limit=' + req.query.limit + ' offset=' + req.query.offset);
     const scope = await buildRequestScopeWithHierarchy(req, pool);
-    const { rows, total } = await job.list({ ...req.query, scope });
+    // Job Stage Access — req.allowedStages is attached by routes/admin/index.js
+    // (bypass roles / no-rows → {mode:'all'} = unrestricted). list() intersects
+    // the visible statuses with any tab/status filter.
+    const { rows, total } = await job.list({ ...req.query, scope, allowedStages: req.allowedStages });
     logger.info('Returning ' + rows.length + ' jobs (total=' + total + ')');
     modernOk(res, { items: rows, total, limit: req.query.limit, offset: req.query.offset });
   } catch (e) { next(e); }
@@ -302,6 +351,8 @@ router.get('/export.xlsx', validate(listQuery, 'query'), async (req, res, next) 
       limit: EXPORT_CAP,
       offset: 0,
       scope,
+      // Job Stage Access — the export mirrors exactly what the operator sees.
+      allowedStages: req.allowedStages,
     });
     const truncated = total > EXPORT_CAP;
     logger.info('Streaming jobs export · ' + rows.length + ' rows (total=' + total + ', truncated=' + truncated + ')');
@@ -423,6 +474,7 @@ router.get('/counts', async (req, res, next) => {
     const counts = await job.getStatusCounts({
       ownerId: Number.isFinite(ownerId) ? ownerId : undefined,
       scope: req.scope,
+      allowedStages: req.allowedStages,
     });
     modernOk(res, counts);
   } catch (e) { next(e); }
@@ -450,7 +502,7 @@ router.get('/counts', async (req, res, next) => {
 router.get('/attention-summary', async (req, res, next) => {
   try {
     logger.info('Fetch attention summary');
-    const data = await job.getAttentionSummary({ scope: req.scope });
+    const data = await job.getAttentionSummary({ scope: req.scope, allowedStages: req.allowedStages });
     modernOk(res, data);
   } catch (e) { next(e); }
 });
@@ -968,6 +1020,49 @@ router.get('/comment-reasons', async (req, res, next) => {
 });
 
 /*
+ * GET /api/admin/jobs/cancel-reasons?dueTo=customer|client|easyfix|technician
+ *
+ * Reason list for the Cancel Job popup — the cancel-flow twin of
+ * /comment-reasons. Reads action_taken_reason WHERE action_type = 1 (the Cancel
+ * bucket, ACTION_TYPE.CANCEL) AND user_type = the "Cancellation Due To" radio,
+ * so the dropdown narrows as the operator switches the radio (same as Add
+ * Remarks). The picked id lands in tbl_job.enum_reason_id + the tbl_job_comment
+ * audit row on submit. Default user_type = 1 (EasyFix) — CRM-staff-initiated
+ * cancel. Replaces the deprecated tbl_cancel_reason source.
+ * Route-order: declared BEFORE `/:id`.
+ */
+router.get('/cancel-reasons', async (req, res, next) => {
+  try {
+    const dueRaw = String(req.query.dueTo || '').toLowerCase().replace(/\s+/g, '');
+    const userType = DUE_TO_USER_TYPE[dueRaw] || 1; // default = EasyFix (user_type 1)
+    logger.info('Fetch cancel reasons · dueTo=' + (dueRaw || '-') + ' userType=' + userType);
+    // is_new = MAX(is_new) → "curated-else-legacy": prefer the curated new set
+    // (is_new=1), but fall back to the migrated legacy rows (is_new=0) for any
+    // bucket that has NO curated rows. A blanket `AND is_new = 1` would EMPTY
+    // such a bucket (the documented action_taken_reason gotcha — e.g. reschedule
+    // has only is_new=0 rows), which for a mandatory reason dropdown = a dead
+    // Cancel flow. The correlated subquery keeps this per (action_type,user_type).
+    const [rows] = await imagePool.query(
+      `SELECT id, action_desc FROM action_taken_reason ar
+        WHERE action_type = ? AND user_type = ?
+              AND (status IS NULL OR status = 1)
+              AND is_new = (
+                SELECT MAX(is_new) FROM action_taken_reason
+                 WHERE action_type = ar.action_type AND user_type = ar.user_type
+                       AND (status IS NULL OR status = 1)
+              )
+        ORDER BY id ASC`,
+      [ACTION_TYPE.CANCEL, userType]
+    );
+    const items = rows
+      .map((r) => ({ id: r.id, label: String(r.action_desc || '').trim() }))
+      .filter((x) => x.label);
+    logger.info('Returning ' + items.length + ' cancel reasons');
+    modernOk(res, items);
+  } catch (e) { next(e); }
+});
+
+/*
  * GET /api/admin/jobs/:id/transaction
  *
  * Read-only, all-data payload for the legacy "Job Transaction" view
@@ -1291,7 +1386,7 @@ const updateHandler = async (req, res, next) => {
 router.put('/:id',   validate(idParam, 'params'), validate(updateBody), scopedJob, updateHandler);
 router.patch('/:id', validate(idParam, 'params'), validate(updateBody), scopedJob, updateHandler);
 
-router.patch('/:id/status', validate(idParam, 'params'), validate(statusBody), scopedJob, async (req, res, next) => {
+router.patch('/:id/status', validate(idParam, 'params'), validate(statusBody), scopedJob, requireStageForTransition('status'), async (req, res, next) => {
   try {
     logger.info('Change job status · jobId=' + req.params.id + ' status=' + req.body?.status);
     /*
@@ -1329,7 +1424,7 @@ router.patch('/:id/status', validate(idParam, 'params'), validate(statusBody), s
   } catch (e) { next(e); }
 });
 
-router.patch('/:id/assign', validate(idParam, 'params'), validate(assignBody), scopedJob, async (req, res, next) => {
+router.patch('/:id/assign', validate(idParam, 'params'), validate(assignBody), scopedJob, requireStageForTransition('assign'), async (req, res, next) => {
   try {
     logger.info('Assign technician · jobId=' + req.params.id + ' efrId=' + (req.body?.easyfixerId ?? req.body?.efr_id ?? '-'));
     const updated = await job.assign(req.params.id, req.body, req.user);
@@ -1349,7 +1444,9 @@ router.patch('/:id/assign', validate(idParam, 'params'), validate(assignBody), s
  * (rescheduleBody). Literal second segment "reschedule" disambiguates from the
  * `/:id` wildcard.
  */
-router.patch('/:id/reschedule', validate(idParam, 'params'), validate(rescheduleBody), scopedJob, async (req, res, next) => {
+router.patch('/:id/reschedule', validate(idParam, 'params'), validate(rescheduleBody), scopedJob, requireStageForTransition('reschedule'),
+  blockPastAppointment('Cannot reschedule to a date and time that has already passed. Pick a future appointment.'),
+  async (req, res, next) => {
   try {
     logger.info('Reschedule job · jobId=' + req.params.id + ' reasonId=' + (req.body?.reasonId ?? '-'));
     const updated = await job.reschedule(Number(req.params.id), req.body, req.user);
@@ -1377,7 +1474,9 @@ router.patch('/:id/reschedule', validate(idParam, 'params'), validate(reschedule
  * Literal-segment route under `/:id/`; its distinct second segment ("offer")
  * keeps it from colliding with the bare `/:id` wildcard.
  */
-router.post('/:id/offer', validate(idParam, 'params'), validate(offerBody), scopedJob, async (req, res, next) => {
+router.post('/:id/offer', validate(idParam, 'params'), validate(offerBody), scopedJob, requireStageForTransition('offer'),
+  blockPastAppointment('This job\'s appointment time has already passed. Reschedule it to a future slot before offering it to technicians.'),
+  async (req, res, next) => {
   try {
     const { easyfixerIds, requestedDateTime, timeSlot, source, sourceByEfr } = req.body;
     logger.info('Offer job to technicians · jobId=' + req.params.id + ' count=' + (Array.isArray(easyfixerIds) ? easyfixerIds.length : 0));

@@ -138,6 +138,10 @@ async function pruneDeadToken(efrId, token, channel = 'push') {
  * Fan a single message out to a set of recipients.
  *   recipients : [{ efrId, token }]  (efrId null/absent => that token is never pruned)
  *   message    : { title, body, data }  (passed straight to fcmService.sendPush)
+ *                PLUS the OPTIONAL loud/alerting style fields
+ *                { androidChannelId, sound, iosSound, interruptionLevel } — extra
+ *                fields on the SAME object, so no caller's signature changed and
+ *                a caller that omits them gets the exact payload it always got.
  *   opts:
  *     concurrency : max sends in flight per batch (Infinity => one Promise.all).
  *                   Notice uses 10 (bounded chunks, chunks serial); per-tech
@@ -154,13 +158,22 @@ async function deliver(recipients, message, opts = {}) {
   const list = Array.isArray(recipients) ? recipients.filter((r) => r && r.token) : [];
   const chunkSize = Number.isFinite(concurrency) && concurrency > 0 ? concurrency : (list.length || 1);
 
+  // Optional loud/alerting style, forwarded verbatim to fcm.service. Collected
+  // ONCE (not per token) and only for keys the caller actually set, so a normal
+  // message spreads nothing and its FCM payload is unchanged.
+  const alertStyle = {};
+  if (message.androidChannelId)  alertStyle.androidChannelId  = message.androidChannelId;
+  if (message.sound)             alertStyle.sound             = message.sound;
+  if (message.iosSound)          alertStyle.iosSound          = message.iosSound;
+  if (message.interruptionLevel) alertStyle.interruptionLevel = message.interruptionLevel;
+
   let deliveredCount = 0;
   for (let i = 0; i < list.length; i += chunkSize) {
     const chunk = list.slice(i, i + chunkSize);
     const results = await Promise.all(
       chunk.map(async ({ efrId, token }) => {
         const r = await fcmService
-          .sendPush({ token, title: message.title, body: message.body, data: message.data })
+          .sendPush({ token, title: message.title, body: message.body, data: message.data, ...alertStyle })
           .catch((e) => ({ delivered: false, error: e.message }));
         // Skip the prune when the send was redirected to a test device — the dead
         // signal is about the test token, not the real one.

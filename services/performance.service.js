@@ -1,6 +1,7 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const gradeService = require('./grade.service');
+const { OFFER_STATUS } = require('./offer-status');
 
 /*
  * Performance metrics — canonical reader for OTA/SDA/grade/rating.
@@ -134,37 +135,43 @@ async function computeOtaSda(efrId) {
 }
 
 /*
- * Compute Acceptance Rate = jobs ACCEPTED / jobs OFFERED for one
- * technician, from the legacy `scheduling_history` table. Every
- * assignment/offer to a tech inserts a row; a tech DECLINE (or admin
- * unassign) inserts a row carrying a NON-EMPTY `reschedule_reason`.
- * We treat a non-empty `reschedule_reason` as the canonical 'declined'
- * signal — the exact definition candidate-ranking.service.js already
- * trusts for its rejection filter.
+ * Compute Acceptance Rate = offers ACCEPTED / offers OFFERED, from
+ * `tbl_job_offer` (the modern offer flow).
  *
- * CAVEAT: scheduling_history's unassign path is shared by a tech
- * self-reject AND an admin force-unassign (there is no column that
- * distinguishes the two), so `declined` may slightly over-count — this
- * is the same proxy candidate-ranking already relies on.
+ * WHY THIS CHANGED (2026-07-27): acceptance used to come from
+ * `scheduling_history`, counting a tech as "accepted" whenever they didn't
+ * actively DECLINE (non-empty reschedule_reason). Under the offer flow a job can
+ * be MISSED (a teammate accepted first) without any decline, so that definition
+ * scored a tech who accepted 0 of 3 offers as 100% — directly contradicting the
+ * Performance screen's own "Your Offers: 0 Accepted / 3 Missed" card and its
+ * "how many you accepted" caption. This now matches getOfferStats exactly, so
+ * the dashboard stat, the acceptance chip, and the offers card all agree.
  *
- * Returns { acceptanceRate: undefined } when the tech has never been
- * offered a job, so callers can omit the field and fall back to OTA for
- * brand-new technicians.
+ * `offer_status = ACCEPTED (1)` is the accepted signal. Returns
+ * { acceptanceRate: undefined } when the tech has no offer history (or the
+ * table is absent on an older instance), so callers fall back to OTA.
  */
 async function computeAcceptance(efrId) {
-  const [[row]] = await pool.query(
-    `SELECT COUNT(DISTINCT job_id) AS offered,
-            COUNT(DISTINCT CASE WHEN reschedule_reason IS NOT NULL AND reschedule_reason <> '' THEN job_id END) AS declined
-       FROM scheduling_history
-      WHERE easyfixer_id = ?`,
-    [efrId],
-  );
-  const offered = Number(row?.offered) || 0;
-  const declined = Number(row?.declined) || 0;
-  logger.info('Acceptance computed · efrId=' + efrId + ' offered=' + offered + ' declined=' + declined);
-  if (offered === 0) return { acceptanceRate: undefined };
-  const rate = Math.round(((offered - declined) / offered) * 100);
-  return { acceptanceRate: Math.max(0, Math.min(100, rate)) };
+  try {
+    const [[row]] = await pool.query(
+      `SELECT COUNT(*) AS offered,
+              COUNT(CASE WHEN offer_status = ? THEN 1 END) AS accepted
+         FROM tbl_job_offer
+        WHERE fk_easyfixter_id = ?`,
+      [OFFER_STATUS.ACCEPTED, efrId],
+    );
+    const offered = Number(row?.offered) || 0;
+    const accepted = Number(row?.accepted) || 0;
+    logger.info('Acceptance computed · efrId=' + efrId + ' offered=' + offered + ' accepted=' + accepted);
+    if (offered === 0) return { acceptanceRate: undefined };
+    const rate = Math.round((accepted / offered) * 100);
+    return { acceptanceRate: Math.max(0, Math.min(100, rate)) };
+  } catch (e) {
+    // tbl_job_offer may be absent on an older instance — treat as no history so
+    // the caller falls back to OTA rather than 500-ing the whole payload.
+    logger.warn({ err: e.message, efrId }, 'computeAcceptance: offer-table query failed');
+    return { acceptanceRate: undefined };
+  }
 }
 
 /*

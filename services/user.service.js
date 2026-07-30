@@ -1,6 +1,7 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const roleService = require('./role.service');
+const { parseAllowedRows, parseAllowedInput, NO_ACCESS_KEY } = require('../lib/job-stages');
 
 /*
  * Manage Users — internal-staff CRUD on tbl_user.
@@ -62,6 +63,94 @@ const MUTABLE_COLUMNS = Object.freeze([
   'reporting_manager',
 ]);
 
+// ─── Job Stage Access (tbl_user_allowed_stages) ──────────────────────
+/*
+ * loadAllowedStages(userId) → { mode, stages }
+ * Reads the user's stage grants and folds them into the permission object
+ * (see lib/job-stages.js). NO rows → { mode:'all', stages:[] } (unrestricted);
+ * the lone NO_ACCESS_KEY sentinel row → { mode:'list', stages:[] } (no access).
+ */
+async function loadAllowedStages(userId) {
+  const [rows] = await pool.query(
+    'SELECT stage_key FROM tbl_user_allowed_stages WHERE user_id = ?',
+    [userId]
+  );
+  return parseAllowedRows(rows);
+}
+
+/*
+ * loadAllowedStagesForUsers(userIds) → Map<user_id, { mode, stages }>
+ * BATCHED counterpart of loadAllowedStages — ONE query for a whole page of
+ * users instead of N point-lookups. Used by listUsers so the Manage Users table
+ * can show each user's stage grant. Every requested id is present in the map
+ * (users with no rows resolve to { mode:'all' }), so callers never branch on
+ * "missing vs unrestricted".
+ */
+async function loadAllowedStagesForUsers(userIds) {
+  const ids = [...new Set((userIds || []).map(Number).filter(Number.isInteger))];
+  const out = new Map();
+  if (ids.length === 0) return out;
+  const [rows] = await pool.query(
+    `SELECT user_id, stage_key FROM tbl_user_allowed_stages
+      WHERE user_id IN (${ids.map(() => '?').join(',')})`,
+    ids
+  );
+  const byUser = new Map();
+  for (const r of rows) {
+    const uid = Number(r.user_id);
+    if (!byUser.has(uid)) byUser.set(uid, []);
+    byUser.get(uid).push(r.stage_key);
+  }
+  for (const id of ids) out.set(id, parseAllowedRows(byUser.get(id) || []));
+  return out;
+}
+
+/*
+ * reconcileAllowedStages(userId, stages, actorId)
+ * Replaces the user's stage grants with the `stages` payload value.
+ * DELETE-then-bulk-INSERT in ONE transaction so the swap is atomic.
+ *
+ *   null (or absent value) → zero rows                → UNRESTRICTED
+ *   []                     → ONE NO_ACCESS_KEY row    → NO ACCESS
+ *   ['unconfirmed', …]     → one row per stage_key    → restricted
+ *
+ * The sentinel row is what makes "grant nothing" survive a round-trip: without
+ * it an empty pick would write zero rows and read back as unrestricted (the
+ * zero-rows default that keeps never-configured users out of a lockout).
+ * Unknown/duplicate keys are dropped by parseAllowedInput before the write.
+ */
+async function reconcileAllowedStages(userId, stages, actorId) {
+  const parsed = parseAllowedInput(stages);
+  // mode 'all' → nothing to store. mode 'list' with no stages → the sentinel.
+  const clean = parsed.mode === 'all'
+    ? []
+    : (parsed.stages.length ? parsed.stages : [NO_ACCESS_KEY]);
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.query('DELETE FROM tbl_user_allowed_stages WHERE user_id = ?', [userId]);
+    if (clean.length) {
+      const placeholders = clean.map(() => '(?, ?, ?)').join(', ');
+      const params = [];
+      for (const k of clean) params.push(userId, k, actorId || null);
+      await conn.query(
+        `INSERT INTO tbl_user_allowed_stages (user_id, stage_key, created_by) VALUES ${placeholders}`,
+        params
+      );
+    }
+    await conn.commit();
+    const shape = parsed.mode === 'all'
+      ? '(unrestricted)'
+      : (parsed.stages.length ? parsed.stages.join(',') : '(no access)');
+    logger.info('Reconciled allowed stages · userId=' + userId + ' · stages=' + shape);
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
+}
+
 // ─── List ────────────────────────────────────────────────────────────
 async function listUsers({
   q, roleId, cityId, includeInactive = false,
@@ -112,6 +201,19 @@ async function listUsers({
     params
   );
 
+  /*
+   * Job Stage Access for the list column. ONE batched query for the page (not
+   * a per-row lookup). Same tri-state as getUserById: null = unrestricted,
+   * [] = explicit no access, non-empty = restricted — the distinction matters
+   * on screen, since "no access" now genuinely blanks every job page for that
+   * user and an admin needs to spot it without opening each row.
+   */
+  const stagePerms = await loadAllowedStagesForUsers(rows.map((r) => r.user_id));
+  for (const r of rows) {
+    const p = stagePerms.get(Number(r.user_id));
+    r.allowed_stages = (!p || p.mode === 'all') ? null : p.stages;
+  }
+
   logger.info('Found ' + rows.length + ' users (total=' + total + ')');
   return { items: rows, total };
 }
@@ -132,7 +234,16 @@ async function getUserById(userId) {
       LIMIT 1`,
     [userId, INTERNAL_USER_TYPE_ID]
   );
-  return row || null;
+  if (!row) return null;
+  /*
+   * Job Stage Access. NULL = unrestricted; [] = explicit NO ACCESS; a non-empty
+   * array = restricted to those stage_keys. The null-vs-[] distinction is
+   * load-bearing — the FE edit form seeds its "All stages" toggle from it, and
+   * flattening both to [] is what made a saved empty pick read back as All.
+   */
+  const stagePerm = await loadAllowedStages(userId);
+  row.allowed_stages = stagePerm.mode === 'all' ? null : stagePerm.stages;
+  return row;
 }
 
 // ─── Create ──────────────────────────────────────────────────────────
@@ -149,6 +260,7 @@ async function createUser({
   city_id, alternate_no,
   manage_clients, manage_cities, manage_states, manage_verticals,
   reporting_manager,
+  allowed_stages,
   createdBy,
 }) {
   logger.info('Create user · role=' + (user_role || '') + ' · cityId=' + (city_id || ''));
@@ -209,6 +321,12 @@ async function createUser({
   // the next hierarchy resolution picks up the new edge instead of
   // serving the pre-insert adjacency map for up to 60s.
   invalidateHierarchyCache();
+  // Job Stage Access — only when the operator supplied the field. null =
+  // unrestricted → no rows (a fresh user has none anyway); [] = explicit no
+  // access → one sentinel row. See reconcileAllowedStages.
+  if (allowed_stages !== undefined) {
+    await reconcileAllowedStages(r.insertId, allowed_stages, createdBy);
+  }
   logger.info('User created · id=' + r.insertId + ' · role=' + Number(user_role));
   return getUserById(r.insertId);
 }
@@ -325,10 +443,18 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
     }
   }
 
+  // Job Stage Access — present (an array, including [], or null) means the
+  // operator intends to (re)set the user's allowed stages. Reconciled AFTER the
+  // tbl_user write, independent of the column diff so a stage-only PATCH still
+  // applies. ABSENT = untouched. Counts toward suppliedCount so a stage-only
+  // change isn't mistaken for an empty body.
+  const hasAllowedStages = fields.allowed_stages !== undefined;
+  if (hasAllowedStages) suppliedCount++;
+
   // Distinguish "operator sent nothing" (real 400) from "operator sent
   // values that all match" (no-op, return unchanged sentinel).
   if (suppliedCount === 0) throw mkErr(400, 'No mutable fields supplied');
-  if (!sets.length) {
+  if (!sets.length && !hasAllowedStages) {
     logger.info('Update user no-op · userId=' + userId + ' · all supplied values match');
     const row = await getUserById(userId);
     if (row) row.__unchanged = true;
@@ -346,19 +472,31 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
     return row;
   }
 
-  sets.push('update_date = NOW()', 'updated_by = ?');
-  params.push(updatedBy || null, userId);
+  // tbl_user column write — only when a mutable column actually changed. A
+  // stage-only PATCH (sets empty) skips this and just reconciles below.
+  if (sets.length) {
+    sets.push('update_date = NOW()', 'updated_by = ?');
+    params.push(updatedBy || null, userId);
 
-  await pool.query(`UPDATE tbl_user SET ${sets.join(', ')} WHERE user_id = ?`, params);
-  logger.info('User updated · id=' + userId + ' · fields=' + sets.length);
-  // Per-user perms cache invalidation. A user_role change is the obvious
-  // trigger; other field edits (name, email, etc.) don't change perms but
-  // clearing one entry is cheap so we do it unconditionally.
-  roleService.invalidatePermissionsCache(userId);
-  // Hierarchy adjacency invalidation. reporting_manager / user_status /
-  // user_type_id are all reachable via this update path; rather than
-  // sniff which field changed, just clear unconditionally (rebuild ~1 ms).
-  invalidateHierarchyCache();
+    await pool.query(`UPDATE tbl_user SET ${sets.join(', ')} WHERE user_id = ?`, params);
+    logger.info('User updated · id=' + userId + ' · fields=' + sets.length);
+    // Per-user perms cache invalidation. A user_role change is the obvious
+    // trigger; other field edits (name, email, etc.) don't change perms but
+    // clearing one entry is cheap so we do it unconditionally.
+    roleService.invalidatePermissionsCache(userId);
+    // Hierarchy adjacency invalidation. reporting_manager / user_status /
+    // user_type_id are all reachable via this update path; rather than
+    // sniff which field changed, just clear unconditionally (rebuild ~1 ms).
+    invalidateHierarchyCache();
+  }
+
+  // Job Stage Access reconcile — after the column write, atomically swaps the
+  // user's grants. null = unrestricted (clears all rows); [] = no access.
+  // Only when supplied.
+  if (hasAllowedStages) {
+    await reconcileAllowedStages(userId, fields.allowed_stages, updatedBy);
+  }
+
   return getUserById(userId);
 }
 
@@ -629,6 +767,10 @@ module.exports = {
   suggestAvailableEmail,
   findDescendantUserIds,
   buildHierarchyTree,
+  // Job Stage Access — per-user allowed lifecycle stages.
+  loadAllowedStages,
+  loadAllowedStagesForUsers,
+  reconcileAllowedStages,
   // Hierarchy adjacency cache invalidation hook — call from any external
   // write path that mutates tbl_user beyond the create/update/deactivate
   // entrypoints here (e.g. a future bulk-import path that writes

@@ -2,7 +2,7 @@
   "name": "easyfix-backend",
   "version": "0.1.0",
   "private": true,
-  "description": "EasyFix unified backend API — serves CRM_UI, Client_UI, and EasyFixer_App from a single Express service",
+  "description": "EasyFix unified backend API \u2014 serves CRM_UI, Client_UI, and EasyFixer_App from a single Express service",
   "main": "server.js",
   "scripts": {
     "dev": "nodemon server.js",
@@ -13,11 +13,13 @@
     "test:rate-card": "node --test tests/rate-card-calc.test.js",
     "test:events": "node --test --test-force-exit tests/job-status-events.test.js",
     "test:job": "node --test --test-force-exit tests/job-service-setstatus.test.js",
+    "test:stages": "node --test --test-force-exit tests/job-stages.test.js tests/job-stage-access-routes.test.js",
     "test": "node --test --test-force-exit tests/*.test.js",
     "upload:deepskill-images": "node scripts/upload-deepskill-images.js",
     "verify:schema": "node scripts/schema-verify.js",
     "verify:env": "node scripts/env-verify.js",
-    "verify:all": "npm run build && npm run test:db && npm run verify:schema && npm run verify:env"
+    "verify:all": "npm run build && npm run test:db && npm run verify:schema && npm run verify:migrations && npm run verify:env",
+    "verify:migrations": "node scripts/migration-status.js"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -49,7 +51,7 @@
   "devDependencies": {
     "nodemon": "^3.1.7"
   },
-  "overridesComment": "exceljs (3.x and 4.x) depends on uuid ^8.3.0 which carries GHSA-w5hq-g745-h8pq (missing buffer bounds check in v3/v5/v6 generators). uuid 14.x patches it. We use uuid only transitively through exceljs's xlsx generation (Manage Zones / Manage Pincodes templates) which calls v4 random — the API surface is stable across uuid 7→14, so the override is safe. Remove this override only when exceljs itself bumps its uuid range to >=14.",
+  "overridesComment": "exceljs (3.x and 4.x) depends on uuid ^8.3.0 which carries GHSA-w5hq-g745-h8pq (missing buffer bounds check in v3/v5/v6 generators). uuid 14.x patches it. We use uuid only transitively through exceljs's xlsx generation (Manage Zones / Manage Pincodes templates) which calls v4 random \u2014 the API surface is stable across uuid 7\u219214, so the override is safe. Remove this override only when exceljs itself bumps its uuid range to >=14.",
   "overrides": {
     "uuid": "^14.0.0"
   }

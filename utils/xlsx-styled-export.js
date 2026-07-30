@@ -93,9 +93,17 @@ const KPI_ACCENTS = [
  * @param {Object=} o.totalRow      Optional footer row, keyed by column.key.
  * @param {string=} o.emptyMessage  Shown when rows is empty (default
  *                                  "No rows.").
+ * @param {Object=} o.wb            EXISTING workbook to add this sheet to.
+ *                                  Omit (the default) and a fresh workbook is
+ *                                  created, exactly as before — every existing
+ *                                  caller is unaffected. Pass the workbook
+ *                                  returned by a previous call to build a
+ *                                  MULTI-SHEET export (see the Offer Acceptance
+ *                                  report: Technician / Offerer / Job sheets),
+ *                                  then hand it to streamWorkbook().
  */
 function buildStyledWorkbook({
-  title, meta, sheetName, columns, rows, kpis, totalRow, emptyMessage,
+  title, meta, sheetName, columns, rows, kpis, totalRow, emptyMessage, wb: existingWb,
 }) {
   if (!Array.isArray(columns) || columns.length === 0) {
     throw new Error('buildStyledWorkbook: columns required');
@@ -105,9 +113,13 @@ function buildStyledWorkbook({
   const nCols = columns.length;
   const name = (sheetName || title || 'Sheet1').slice(0, 31);
 
-  const wb = new ExcelJS.Workbook();
-  wb.creator = 'EasyFix CRM';
-  wb.created = new Date();
+  // Reuse the caller's workbook when building a multi-sheet export; otherwise
+  // create one (the single-sheet path every other report takes).
+  const wb = existingWb || new ExcelJS.Workbook();
+  if (!existingWb) {
+    wb.creator = 'EasyFix CRM';
+    wb.created = new Date();
+  }
 
   const ws = wb.addWorksheet(name);
 
@@ -298,6 +310,23 @@ function buildStyledWorkbook({
  * @param {string} filename  e.g. "city-performance_2026-06-15.xlsx".
  * @param {Object} opts      Same shape as buildStyledWorkbook input.
  */
+/*
+ * Ship an ALREADY-BUILT workbook. Split out of streamStyledXlsx so a
+ * multi-sheet caller can build N sheets (buildStyledWorkbook with `wb`) and
+ * then stream the result. streamStyledXlsx below is the single-sheet
+ * convenience wrapper and behaves exactly as it always has.
+ */
+async function streamWorkbook(res, filename, wb) {
+  res.setHeader(
+    'Content-Type',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  );
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  await wb.xlsx.write(res);
+  res.end();
+}
+
 async function streamStyledXlsx(res, filename, opts) {
   const wb = buildStyledWorkbook(opts);
   res.setHeader(
@@ -315,6 +344,7 @@ async function streamStyledXlsx(res, filename, opts) {
 
 module.exports = {
   buildStyledWorkbook,
+  streamWorkbook,
   streamStyledXlsx,
   // Re-export the palette so siblings can stay visually consistent
   // when they need custom styling.

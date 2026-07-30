@@ -9,6 +9,10 @@ const { generateOtp } = require('../utils/otp');
 // Synchronous, cache-backed — see services/properties.service.js::getProperty.
 const { getProperty } = require('./properties.service');
 const addressService = require('./address.service');
+// Job Stage Access — pure stage/status helpers (no DB). stageVisibleStatuses
+// turns a user's allowed stage keys into the union of visible job_status codes,
+// AND-combined (intersected) with the tab/status filters in list/counts/attention.
+const { stageVisibleStatuses } = require('../lib/job-stages');
 
 /*
  * THE OFFER MODEL feature flag. ON by default — only the literal string
@@ -194,8 +198,19 @@ const LIST_COLUMNS = `
   j.fk_client_id, cl.client_name,
   j.fk_service_catg_id, sc.service_catg_name AS service_category,
   j.fk_easyfixter_id, ef.efr_name AS easyfixer_name,
+  /*
+   * easyfixer_mobile — the assigned technician's phone (tbl_easyfixer.efr_no),
+   * surfaced so the Pending-to-Start Technician column can offer click-to-call.
+   * This exact alias is already listed in utils/mask-mobile.js MOBILE_FIELDS
+   * (and deliberately NOT in CUSTOMER_MOBILE_FIELDS), so the mask middleware
+   * auto-masks it to first-4-then-bullets and keeps it masked even when the
+   * customer-number-visible flag is ON — do NOT add any other masking here, and
+   * do NOT rename the alias (a different key would bypass the mask and leak the
+   * staff number).
+   */
+  ef.efr_no AS easyfixer_mobile,
   j.job_owner, ow.user_name AS owner_name,
-  j.fk_address_id, ci.city_name,
+  j.fk_address_id, ci.city_name, ad.address,
   /*
    * service_count — count of ACTIVE rows on tbl_job_services for this
    * job. Powers the FE "Booked but no services" pill (added
@@ -799,6 +814,20 @@ const DATE_TYPE_COLUMN = {
   requested: 'j.requested_date_time',
 };
 
+/*
+ * Normalise a filter param that may arrive as a single number, a single-id
+ * string, a CSV string ("12,34") or an array into a clean number[]. Mirrors the
+ * `statuses` CSV-split pattern above so the Pending-to-Start multi-select
+ * filters (clientId / cityId / projectManagerId / zonalManagerId) can each build
+ * an IN (?, ?, …) clause. Back-compatible: a lone id still yields a 1-element
+ * array, so pre-existing single-select callers keep working unchanged.
+ */
+function toIdArray(v) {
+  if (v == null || v === '') return [];
+  const raw = Array.isArray(v) ? v : String(v).split(',');
+  return raw.map((s) => Number(String(s).trim())).filter((n) => Number.isFinite(n));
+}
+
 async function list({
   q, status, statuses, assigned, clientId, cityId, ownerId, easyfixerId,
   clientOwnerIds,            // number[] — restrict to jobs owned (job_client_owner) by these client users (reporting-manager scope)
@@ -815,6 +844,8 @@ async function list({
   stateId,                   // FK   — tbl_city.state_id
   categoryId,                // FK   — j.fk_service_catg_id
   verticalId,                // FK   — via EXISTS on tbl_vertical_mapping
+  projectManagerId,          // FK   — tbl_vertical_mapping.user_id where user_type = 1
+  zonalManagerId,            // FK   — tbl_city.state_user (the city's zonal owner)
   dateType,                  // enum — see DATE_TYPE_COLUMN above
   // Phase-2 filters (2026-05-19).
   rating,                    // 1..5 — tbl_easyfixer_rating_by_customer.customer_rating
@@ -834,6 +865,7 @@ async function list({
   noServices,
   startDate, endDate,
   scope,
+  allowedStages,             // Job Stage Access — { mode:'all'|'list', stages }
   sortBy, sortDir,           // server-side sort — whitelisted column + asc|desc
   limit = 50, offset = 0,
 } = {}) {
@@ -893,6 +925,21 @@ async function list({
     }
   }
 
+  // Job Stage Access — restrict the visible rows to the union of statuses
+  // across the caller's allowed stages, AND-combined (intersected) with any
+  // tab/status filter below. mode 'all' (unrestricted / bypass) = no clause.
+  // References only `j.` so it doesn't affect the COUNT-join detection. Empty
+  // union (shouldn't happen for a 'list' with valid keys) → 1=0.
+  if (allowedStages && allowedStages.mode === 'list') {
+    const visible = [...stageVisibleStatuses(allowedStages.stages)];
+    if (visible.length === 0) {
+      clauses.push('1=0');
+    } else {
+      clauses.push(`j.job_status IN (${visible.map(() => '?').join(',')})`);
+      params.push(...visible);
+    }
+  }
+
   // `statuses` (array/CSV) takes priority over single `status` — supports UI
   // tabs that bucket multiple codes (e.g. "Pending to Close" = 2 OR 20,
   // "Audit & Complete" = 3 OR 5). Single `status` still works for backward
@@ -939,7 +986,14 @@ async function list({
        WHERE js.job_id = j.job_id AND js.job_service_status = 1
     )`);
   }
-  if (clientId != null)    { clauses.push('j.fk_client_id = ?');     params.push(clientId); }
+  // clientId — single id OR CSV/array (Pending-to-Start multi-select Clients
+  // filter). Builds j.fk_client_id IN (...) — the `j` alias is always present,
+  // so no COUNT-join change. Narrows within any RBAC clients scope applied above.
+  const clientIdList = toIdArray(clientId);
+  if (clientIdList.length) {
+    clauses.push(`j.fk_client_id IN (${clientIdList.map(() => '?').join(',')})`);
+    params.push(...clientIdList);
+  }
   if (easyfixerId != null) { clauses.push('j.fk_easyfixter_id = ?'); params.push(easyfixerId); }
   if (ownerId != null)     { clauses.push('j.job_owner = ?');        params.push(ownerId); }
   if (Array.isArray(clientOwnerIds) && clientOwnerIds.length) {
@@ -956,7 +1010,15 @@ async function list({
       params.push(...reportingContactIds);
     }
   }
-  if (cityId != null)      { clauses.push('ad.city_id = ?');         params.push(cityId); }
+  // cityId — single id OR CSV/array (Pending-to-Start multi-select Cities
+  // filter). The `ad.` literal keeps needsAd tripped below so the COUNT query
+  // still joins tbl_address (join parity — a WHERE referencing `ad.` without the
+  // matching COUNT join is the known scoped-user-500 regression).
+  const cityIdList = toIdArray(cityId);
+  if (cityIdList.length) {
+    clauses.push(`ad.city_id IN (${cityIdList.map(() => '?').join(',')})`);
+    params.push(...cityIdList);
+  }
   if (customerId != null)  { clauses.push('j.fk_customer_id = ?');   params.push(customerId); }
   // Explicit job-id set — used by listOfferedForTech() to reuse this LIST
   // projection for a tech's open-offer jobs. Empty array short-circuits to
@@ -977,6 +1039,25 @@ async function list({
   if (verticalId != null) {
     clauses.push('EXISTS (SELECT 1 FROM tbl_vertical_mapping vm WHERE vm.client_id = j.fk_client_id AND vm.vertical_id = ?)');
     params.push(verticalId);
+  }
+  // Project Manager — the PM is the user mapped to the job's client in
+  // tbl_vertical_mapping with user_type = 1. EXISTS mirrors the verticalId
+  // shape above; the subquery is self-contained (references only vm + the
+  // outer j alias), so it introduces NO new outer alias and the COUNT-join
+  // detection below is unaffected.
+  const pmIdList = toIdArray(projectManagerId);
+  if (pmIdList.length) {
+    clauses.push(`EXISTS (SELECT 1 FROM tbl_vertical_mapping vm WHERE vm.client_id = j.fk_client_id AND vm.user_type = 1 AND vm.user_id IN (${pmIdList.map(() => '?').join(',')}))`);
+    params.push(...pmIdList);
+  }
+  // Zonal Manager — a city's zonal owner is tbl_city.state_user. `ci` is the
+  // tbl_city alias already joined in LIST_JOIN; the `ci.` literal here trips
+  // the needsCi detection below so the COUNT query also joins tbl_address +
+  // tbl_city, keeping main-query and COUNT-query WHERE join-consistent.
+  const zmIdList = toIdArray(zonalManagerId);
+  if (zmIdList.length) {
+    clauses.push(`ci.state_user IN (${zmIdList.map(() => '?').join(',')})`);
+    params.push(...zmIdList);
   }
   // Text LIKE filters — use the customary `%val%` wrap. Each adds its
   // referenced alias to the COUNT-join detection regex below via the
@@ -1407,7 +1488,7 @@ async function getJobMeta(jobId) {
  * side sum — we use client-side sum because MySQL 5.7's WITH ROLLUP syntax is
  * fussy and the row count is always tiny (≤ 10 status codes).
  */
-async function getStatusCounts({ ownerId, easyfixerId, scope } = {}) {
+async function getStatusCounts({ ownerId, easyfixerId, scope, allowedStages } = {}) {
   logger.info('Compute job status counts · ownerId=' + (ownerId ?? '-') + ' · easyfixerId=' + (easyfixerId ?? '-'));
   /*
    * Two queries run in parallel:
@@ -1476,6 +1557,20 @@ async function getStatusCounts({ ownerId, easyfixerId, scope } = {}) {
     if (v && v.mode === 'allow' && v.ids.length && hasVerticalCol) {
       clauses.push(`cl.vertical_id IN (${v.ids.map(() => '?').join(',')})`);
       params.push(...v.ids);
+    }
+  }
+
+  // Job Stage Access — same intersection as list() so tab counts respect the
+  // caller's visible stages. Added to the shared `clauses`, so it flows into
+  // BOTH the GROUP BY status query and the BOOKED-split query (a user who can't
+  // see the pending-scheduling stage gets 0 for the booked buckets too).
+  if (allowedStages && allowedStages.mode === 'list') {
+    const visible = [...stageVisibleStatuses(allowedStages.stages)];
+    if (visible.length === 0) {
+      clauses.push('1=0');
+    } else {
+      clauses.push(`j.job_status IN (${visible.map(() => '?').join(',')})`);
+      params.push(...visible);
     }
   }
 
@@ -1563,7 +1658,7 @@ async function getStatusCounts({ ownerId, easyfixerId, scope } = {}) {
  * (Admin/Finance) see the full count; scoped users see only their
  * hierarchy-unioned slice.
  */
-async function getAttentionSummary({ scope } = {}) {
+async function getAttentionSummary({ scope, allowedStages } = {}) {
   const hasVerticalCol = await hasClientVerticalIdColumn();
   // OFFER MODEL: when tbl_job_offer exists, "pending tech accept" keys off an
   // OPEN offer EXISTS rather than the fk (a pool-offered job keeps fk NULL).
@@ -1602,6 +1697,18 @@ async function getAttentionSummary({ scope } = {}) {
       if (v && v.mode === 'allow' && v.ids.length && hasVerticalCol) {
         clauses.push(`cl.vertical_id IN (${v.ids.map(() => '?').join(',')})`);
         params.push(...v.ids);
+      }
+    }
+    // Job Stage Access — intersect every tile's own status predicate with the
+    // caller's visible-status union so the tiles respect the same restriction
+    // as the list + counts. References only the job alias → no extra join.
+    if (allowedStages && allowedStages.mode === 'list') {
+      const visible = [...stageVisibleStatuses(allowedStages.stages)];
+      if (visible.length === 0) {
+        clauses.push('1=0');
+      } else {
+        clauses.push(`${jobAlias}.job_status IN (${visible.map(() => '?').join(',')})`);
+        params.push(...visible);
       }
     }
     // Same JOIN strategy as getStatusCounts: tbl_address needed
@@ -3005,8 +3112,11 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
   const actorId = actor?.user_id || null;
 
   if (Number(status) === STATUS.CANCELLED) {
-    sets.push('cancel_date_time = ?', 'cancel_reason_id = ?', 'cancel_comment = ?', 'cancel_by = ?');
-    values.push(new Date(), reasonId || null, comment || null, actorId);
+    // enum_reason_id mirrors the picked action_taken_reason id — the same column
+    // the job-comment History JOIN resolves against — so the cancel reason renders
+    // there; cancel_reason_id keeps the legacy cancel-audit column populated too.
+    sets.push('cancel_date_time = ?', 'cancel_reason_id = ?', 'cancel_comment = ?', 'cancel_by = ?', 'enum_reason_id = ?');
+    values.push(new Date(), reasonId || null, comment || null, actorId, reasonId || null);
   } else if (Number(status) === STATUS.CALL_LATER) {
     // UNREACHABLE / CALL_LATER outcome — set the call_later flag (if
     // the column exists) and stamp `cancel_by` so the audit trail
@@ -3151,6 +3261,67 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
     require('./enquiry-notification.service').fireEnquiryWhatsapp(jobId);
   }
 
+  // Cancel audit comment (2026-07-27): mirror Add Remarks — record the
+  // cancellation on the job comment / History timeline so it isn't only in the
+  // cancel_* columns. comment_on = 1 is the lifecycle/audit bucket (no cancel-
+  // specific stage code exists; reschedule + Add Remarks use 1 too). Guard on a
+  // real transition INTO cancelled so a 6→6 re-submit doesn't double-write. The
+  // reason renders in History via enum_reason_id. Non-fatal — a comment failure
+  // must never block the cancellation (the UPDATE above already persisted it).
+  if (Number(status) === STATUS.CANCELLED && Number(existing.job_status) !== STATUS.CANCELLED) {
+    try {
+      await require('./job-comment.service').addComment(jobId, {
+        comments: (comment && String(comment).trim()) || 'Job cancelled',
+        comment_on: 1,
+        commented_by: actorId,
+        enum_reason_id: reasonId || null,
+      });
+    } catch (e) {
+      logger.warn('Cancel audit comment failed (non-fatal) · id=' + jobId + ' · ' + e.message);
+    }
+
+    /*
+     * Cancelling KILLS every still-open offer (2026-07-29). Without this, the
+     * OFFERED rows survived until the 30-min TTL swept them, so for up to half
+     * an hour after a cancellation the CRM list projection (offerColumns():
+     * is_offered / offered_count / offered_efr_name) still reported a LIVE offer
+     * on a dead job, and the technician could still see and act on it.
+     *
+     * Same expire shape as acceptOffer() / reschedule(): offer_status → EXPIRED
+     * with responded_at stamped. Idempotent — `offer_status = OFFERED` in the
+     * WHERE means the TTL sweep can never double-expire these — and scoped to
+     * the INTO-cancelled transition by the guard above, so a 6→6 re-submit
+     * doesn't re-stamp responded_at on rows this already closed.
+     *
+     * NOT transactional, deliberately: setStatus writes through the shared pool
+     * with no transaction (see the UPDATE above), so there is no connection to
+     * enlist — this is a second statement on the same pool, issued only after
+     * the cancellation itself has already committed. Non-fatal for the same
+     * reason: the job IS cancelled, and a failure here must never surface as a
+     * 500 on a cancel that actually happened (the TTL sweep remains the
+     * backstop). Missing table on an un-migrated instance degrades quietly via
+     * the memoised jobOfferTableExists() probe the rest of the offer code uses,
+     * with the ER_NO_SUCH_TABLE catch as belt-and-braces for a stale probe.
+     */
+    try {
+      if (await jobOfferTableExists()) {
+        const [r] = await pool.query(
+          `UPDATE tbl_job_offer
+              SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
+            WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
+          [jobId],
+        );
+        if (r.affectedRows) {
+          logger.info('Cancelled job expired ' + r.affectedRows + ' open offer(s) · id=' + jobId);
+        }
+      }
+    } catch (e) {
+      if (e?.code !== 'ER_NO_SUCH_TABLE') {
+        logger.warn('Expiring open offers on cancel failed (non-fatal) · id=' + jobId + ' · ' + e.message);
+      }
+    }
+  }
+
   // Ops took a deliberate status action (confirm 9→0, cancel, enquiry, …) — any
   // pending customer request on this job is now handled. See resolveCustomerRequests.
   await resolveCustomerRequests(jobId);
@@ -3230,15 +3401,40 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
 
   const conn = await pool.getConnection();
   const offeredIds = [];
+  // Who is putting this offer out — the SAME actor stamped onto the job's
+  // schedule-audit columns below, but captured PER OFFER ROW so re-offers by
+  // different people (and the report's "Offered By") attribute correctly. NULL
+  // for a system/auto offer with no actor (e.g. the auto-assign engine).
+  const offeredBy = (actor && actor.user_id != null) ? actor.user_id : null;
   try {
     await conn.beginTransaction();
 
-    // Optional schedule edit rides in the same txn. Crucially we do NOT touch
-    // job_status or fk_easyfixter_id — the job stays BOOKED with no owner while
-    // the pool offer is live. last_update_time is bumped so the row sorts fresh.
-    if (editSchedule || hasSlot) {
-      const sets = ['last_update_time = ?'];
-      const values = [new Date()];
+    // The pool offer IS the ops "Schedule & Assign" action, so the schedule
+    // AUDIT columns must be stamped here — scheduled_date_time ("Schedule On"),
+    // fk_scheduled_by ("Schedule By") and first_scheduled_by. The legacy
+    // direct-assign path (assign()) stamps these in one UPDATE; when Schedule &
+    // Assign moved onto the offer flow that stamp was dropped, so both columns
+    // silently stopped populating from the modal. We stamp them on EVERY offer.
+    // Crucially we STILL do NOT touch job_status or fk_easyfixter_id — the job
+    // stays BOOKED with no owner while the pool offer is live (a tech ACCEPT is
+    // what flips it to SCHEDULED + sets the fk). Uses new Date() (pool tz +05:30
+    // → IST wall-clock, stored verbatim), never SQL NOW(). Optional schedule
+    // edit (requested_date_time / time_slot) rides in the same UPDATE.
+    {
+      const now = new Date();
+      const actorId = (actor && actor.user_id != null) ? actor.user_id : null;
+      const sets = [
+        'last_update_time = ?',
+        'scheduled_date_time = ?',
+        'fk_scheduled_by = ?',
+        'first_scheduled_by = COALESCE(first_scheduled_by, ?)',
+        // original_scheduling_date_time — the FIRST time this job was scheduled.
+        // Captured ONCE (COALESCE preserves it across re-offers and later
+        // reschedules), mirroring the legacy "SET original_scheduling_date_time
+        // = NOW() WHERE it IS NULL" rule. Pairs with first_scheduled_by.
+        'original_scheduling_date_time = COALESCE(original_scheduling_date_time, ?)',
+      ];
+      const values = [now, now, actorId, actorId, now];
       if (editSchedule) { sets.push('requested_date_time = ?'); values.push(newRequested); }
       if (hasSlot)      { sets.push('time_slot = ?');           values.push(String(timeSlot)); }
       values.push(jobId);
@@ -3268,9 +3464,10 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
           `UPDATE tbl_job_offer
               SET offer_status = ${OFFER_STATUS.OFFERED}, offered_at = NOW(), updated_on = NOW(),
                   offer_count = offer_count + 1, offer_source = COALESCE(?, offer_source),
+                  offered_by_user_id = COALESCE(?, offered_by_user_id),
                   responded_at = NULL, reject_reason = NULL, reject_reason_id = NULL
             WHERE job_offer_id = ?`,
-          [src, latest.job_offer_id],
+          [src, offeredBy, latest.job_offer_id],
         );
         await conn.query(
           `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
@@ -3280,9 +3477,9 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
       } else {
         await conn.query(
           `INSERT INTO tbl_job_offer
-             (job_id, fk_easyfixter_id, offer_status, offered_at, created_on, updated_on, offer_count, offer_source)
-           VALUES (?, ?, 0, NOW(), NOW(), NOW(), 1, ?)`,
-          [jobId, efrId, src],
+             (job_id, fk_easyfixter_id, offer_status, offered_at, created_on, updated_on, offer_count, offer_source, offered_by_user_id)
+           VALUES (?, ?, 0, NOW(), NOW(), NOW(), 1, ?, ?)`,
+          [jobId, efrId, src, offeredBy],
         );
       }
       offeredIds.push(efrId);
@@ -3443,9 +3640,15 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
       'fk_scheduled_by = ?',
       `job_status = CASE WHEN job_status = ${STATUS.BOOKED} THEN ${STATUS.SCHEDULED} ELSE job_status END`,
       'first_scheduled_by = COALESCE(first_scheduled_by, ?)',
+      // original_scheduling_date_time — first-schedule capture (set ONCE; legacy
+      // parity with first_scheduled_by). COALESCE preserves it on later moves.
+      'original_scheduling_date_time = COALESCE(original_scheduling_date_time, ?)',
       'last_update_time = ?',
     ];
-    const values = [easyfixerId, now, actor?.user_id || null, actor?.user_id || null, now];
+    // Value order tracks the placeholders above (job_status has no ?):
+    // fk_easyfixter_id, scheduled_date_time, fk_scheduled_by, first_scheduled_by,
+    // original_scheduling_date_time, last_update_time.
+    const values = [easyfixerId, now, actor?.user_id || null, actor?.user_id || null, now, now];
     if (editSchedule) {
       sets.push('requested_date_time = ?');
       values.push(newRequested);
@@ -3790,12 +3993,16 @@ async function listOffers(jobId) {
 
 // ─── Reschedule a job's appointment (Schedule & Assign → Reschedule) ─
 /*
- * Explicit, audited reschedule. Distinct from assign(): it changes ONLY the
- * appointment (requested_date_time + the two derived slot columns) — never the
- * technician — and ALWAYS captures reason + remarks. The modal's Date/Time
- * fields are read-only; this is the sole path that moves them. All three inputs
- * are mandatory (rescheduleBody validates at the route). Transactional:
- *   1. tbl_job.requested_date_time / time_slot / booking_cut_off_time_slot
+ * Explicit, audited reschedule. Distinct from assign(): it moves the
+ * appointment (requested_date_time + requested_time + the two derived slot
+ * columns) and re-stamps the schedule audit (scheduled_date_time +
+ * fk_scheduled_by = THIS reschedule) — but never the technician, and never the
+ * ORIGINAL-schedule columns (first_scheduled_by / original_scheduling_date_time
+ * stay put). ALWAYS captures reason + remarks. The modal's Date/Time fields are
+ * read-only; this is the sole path that moves them. All three inputs are
+ * mandatory (rescheduleBody validates at the route). Transactional:
+ *   1. tbl_job.requested_date_time / requested_time / time_slot /
+ *      booking_cut_off_time_slot / scheduled_date_time / fk_scheduled_by
  *   2. scheduling_history (reason_id + reschedule_reason) — same shape as assign
  *   3. any OPEN offers on this job → EXPIRED (they were made for the OLD slot,
  *      so a tech must not be able to accept a now-stale appointment)
@@ -3830,14 +4037,29 @@ async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    // Reschedule also stamps the schedule AUDIT: scheduled_date_time +
+    // fk_scheduled_by reflect the LATEST scheduling action (this reschedule);
+    // first_scheduled_by / original_scheduling_date_time are deliberately NOT
+    // touched (they hold the ORIGINAL schedule). requested_time is the legacy
+    // HH:MM companion, re-derived from the new appointment so it stays coherent
+    // with requested_date_time. (enum_reason_id / remarks / remarks_date_time +
+    // the tbl_job_comment row are stamped by addComment below.) fk_scheduled_by
+    // uses COALESCE so an actor-less auto-reschedule preserves the prior
+    // scheduler. new Date() → pool tz +05:30 IST wall-clock, never SQL NOW().
+    const rescheduledAt = new Date();
+    const rescheduledBy = (actor && actor.user_id != null) ? actor.user_id : null;
+    const newRequestedTime = formatTimeIST(newRequested);
     await conn.query(
       `UPDATE tbl_job
           SET requested_date_time       = ?,
+              requested_time            = ?,
               time_slot                 = COALESCE(?, time_slot),
               booking_cut_off_time_slot = COALESCE(?, booking_cut_off_time_slot),
+              scheduled_date_time       = ?,
+              fk_scheduled_by           = COALESCE(?, fk_scheduled_by),
               last_update_time          = ?
         WHERE job_id = ?`,
-      [newRequested, newTimeSlot, newCutoffSlot, new Date(), jobId],
+      [newRequested, newRequestedTime, newTimeSlot, newCutoffSlot, rescheduledAt, rescheduledBy, rescheduledAt, jobId],
     );
     // Open offers were extended for the OLD slot — expire them so no tech accepts
     // a stale appointment. Tolerant of a missing offer table (un-migrated deploys).
@@ -3904,6 +4126,17 @@ async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason
  *   efrId : the technician (tbl_easyfixer.efr_id)
  *   limit : max jobs to return (default 50)
  *
+ * Each returned row also carries the OFFER's own timing, in the projection's
+ * snake_case so the app reads one consistent naming style:
+ *   offered_at — when this tech's live offer was (re)extended
+ *   expires_at — offered_at + OFFER_TTL_MINUTES, i.e. the instant acceptOffer()
+ *                will start rejecting it and the expiry cron will close it
+ * Both are DERIVED IN SQL (DATE_ADD) off the row we already read, so there is no
+ * extra query and — because the pool runs `dateStrings: true` — both arrive as
+ * "YYYY-MM-DD HH:mm:ss" IST strings rather than tz-shifting Date objects.
+ * Computing expires_at server-side (not in the app) keeps the 30-minute TTL a
+ * single source of truth: change OFFER_TTL_MINUTES and every client follows.
+ *
  * Returns { items } — [] when tbl_job_offer is absent.
  */
 async function listOfferedForTech(efrId, { limit = 50 } = {}) {
@@ -3911,7 +4144,9 @@ async function listOfferedForTech(efrId, { limit = 50 } = {}) {
   if (!(await jobOfferTableExists())) return { items: [] };
   // Most-recent open offers first; cap before hydrating the full preview.
   const [offerRows] = await pool.query(
-    `SELECT job_id FROM tbl_job_offer
+    `SELECT job_id, offered_at,
+            DATE_ADD(offered_at, INTERVAL ${OFFER_TTL_MINUTES} MINUTE) AS expires_at
+       FROM tbl_job_offer
       WHERE fk_easyfixter_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}
       ORDER BY offered_at DESC
       LIMIT ?`,
@@ -3925,6 +4160,16 @@ async function listOfferedForTech(efrId, { limit = 50 } = {}) {
   const { rows } = await list({ jobIds: ids, limit: ids.length });
   const order = new Map(ids.map((id, i) => [id, i]));
   rows.sort((a, b) => (order.get(Number(a.job_id)) ?? 0) - (order.get(Number(b.job_id)) ?? 0));
+  // Stamp the offer timing back onto the preview rows. Keyed by job_id — one
+  // OPEN offer per (job, tech) is an invariant of offerToTechnicians(), which
+  // collapses stray duplicates, so this map can't lose a row.
+  const timing = new Map(offerRows.map((r) => [Number(r.job_id), r]));
+  for (const row of rows) {
+    const t = timing.get(Number(row.job_id));
+    if (!t) continue;
+    row.offered_at = t.offered_at ?? null;
+    row.expires_at = t.expires_at ?? null;
+  }
   logger.info('Returning ' + rows.length + ' offered jobs · efrId=' + efrId);
   return { items: rows };
 }
@@ -4173,8 +4418,15 @@ module.exports = {
   // open offers, and list a tech's open offers.
   offerToTechnicians, listOffers, listOfferedForTech, techHasOpenOffer, rejectOffer,
   isOfferFlowActive, expireStaleOffers,
+  // The 30-min offer window. Exported so the offer-REMINDER cron can bound its
+  // re-push window by the same constant instead of re-declaring it and drifting.
+  OFFER_TTL_MINUTES,
   tryAutoAssignOnCreate,
   fireWebhook, statusToEventName,
   hasClientVerticalIdColumn,
   notifyCustomerNotReachable,
+  // Canonical IST wall-clock formatter (server-TZ independent). Exported so
+  // route-layer guards can compare an appointment against "now" in IST without
+  // re-implementing the offset — there is exactly one correct version of this.
+  formatMysqlDateTimeIST,
 };

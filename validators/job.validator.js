@@ -3,6 +3,17 @@ const { ALL_STATUS_VALUES } = require('../services/job.service');
 
 const intId   = Joi.number().integer().positive();
 /*
+ * csvIds — a filter param that accepts EITHER a single positive integer id OR a
+ * comma-separated list of them ("12,34,56"). Backs the Pending-to-Start
+ * multi-select filters (clientId / cityId / projectManagerId / zonalManagerId).
+ * The single-id alternative preserves back-compat with existing single-select
+ * callers; the service layer (toIdArray) normalises both shapes to an IN (...).
+ */
+const csvIds  = Joi.alternatives(
+  intId,
+  Joi.string().pattern(/^\d+(,\d+)*$/).max(200),
+);
+/*
  * INDIAN_MOBILE_REGEX (2026-06-03): tightened from `/^[0-9]{10}$/` to
  * `/^[6-9]\d{9}$/`. Matches the FE `INDIAN_MOBILE_REGEX` in
  * Easyfix_CRM_UI/src/lib/format.ts — same rule, defence-in-depth so
@@ -50,8 +61,17 @@ const listQuery = Joi.object({
   // tab. URLSearchParams ships the value as the string 'true'/'false';
   // accept both shapes for parity with the other boolean-ish filters.
   noServices: Joi.alternatives(Joi.boolean(), Joi.string().valid('true', 'false')).optional(),
-  clientId: intId.optional(),
-  cityId: intId.optional(),
+  // clientId / cityId — single id OR CSV list (Pending-to-Start multi-select
+  // Clients / Cities filters). csvIds keeps a lone id valid for back-compat.
+  clientId: csvIds.optional(),
+  cityId: csvIds.optional(),
+  // projectManagerId — the client's mapped PM in tbl_vertical_mapping
+  // (user_id where user_type = 1). zonalManagerId — the city's zonal owner
+  // (tbl_city.state_user). Both drive the Pending-to-Start page's PM / ZM
+  // filters; single id OR CSV list, applied as EXISTS / ci-column IN (...)
+  // predicates in service.list().
+  projectManagerId: csvIds.optional(),
+  zonalManagerId: csvIds.optional(),
   ownerId: intId.optional(),
   easyfixerId: intId.optional(),
   // customerId — drives the "View History" panel in the Book-New-Call

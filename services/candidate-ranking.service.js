@@ -232,6 +232,34 @@ function computeTierAndRefPin({ jobPin, jobZoneIds, currentPincode, servPins, se
 }
 
 /*
+ * Human label naming the BASIS that produced a candidate's distance_tier — i.e.
+ * WHY this tech surfaced for this job's location. 1:1 with the tier computed in
+ * computeTierAndRefPin (display-only; NOT a ranking input):
+ *   same_pincode    → 'Serviceable Pincode' — a pincode in the tech's serviceable
+ *                     list equals the job pincode (refPin = the job pincode).
+ *   current_pincode → 'Current Pincode'     — the tech's current pincode
+ *                     (efr_pin_no) was compared to the job pincode (refPin = it).
+ *   in_zone         → 'Zone'                — a serviceable pincode of the tech
+ *                     sits in the job pincode's zone (refPin = that pincode).
+ *   out_of_zone     → 'GPS Distance'        — none of the above matched; the km is
+ *                     the raw geocoded haversine from the tech's reference pincode.
+ *   unknown         → '—'                   — no comparable reference pincode.
+ * The matched value (distance_criteria_value) is the reference pincode (refPin)
+ * that the tier keyed on — null when unknown. Additive + fail-soft: an
+ * unrecognised tier degrades to '—'.
+ */
+const DISTANCE_CRITERIA_LABEL = Object.freeze({
+  same_pincode:    'Serviceable Pincode',
+  current_pincode: 'Current Pincode',
+  in_zone:         'Zone',
+  out_of_zone:     'GPS Distance',
+  unknown:         '—',
+});
+function distanceCriteriaFor(tier) {
+  return DISTANCE_CRITERIA_LABEL[tier] ?? '—';
+}
+
+/*
  * Deep-skill 4-state. The job-level skill requirement decides applicability.
  *   - job has NO skill requirement      → 'not_applicable'.
  *   - tech has ZERO active mappings      → 'easyfixer_skills_not_available'.
@@ -363,27 +391,67 @@ async function l1Eligibility(job, { applyDeepSkill = true, zoneIds = null, zoneP
     params.push(...excludeEfrIds);
   }
 
-  // ── Already rejected / rescheduled-off THIS job ──
+  /*
+   * ── Already rejected / rescheduled-off THIS job ──
+   *
+   * ⚠ `sh.easyfixer_id IS NOT NULL` is LOAD-BEARING, not tidiness. SQL's
+   * `x NOT IN (…)` evaluates to UNKNOWN — never TRUE — as soon as the subquery
+   * yields a single NULL, so one NULL row here silently rejects EVERY
+   * technician and the ranked list goes completely empty.
+   *
+   * That is not hypothetical: an ops reschedule on an UNASSIGNED job (BOOKED
+   * with offers out, fk_easyfixter_id NULL) writes exactly such a row —
+   * job.service reschedule() inserts `existing.fk_easyfixter_id || null` with a
+   * mandatory reason — so before this guard, rescheduling an unassigned job
+   * blacked out its Top-10 forever ("No Technicians Available For This Job"),
+   * including the no-deep-skill and zone-widening fallbacks, since they all
+   * come through here. Search was unaffected (it bypasses this filter), which
+   * is why the list could look selectively broken.
+   *
+   * Semantically the guard is also the correct reading: a NULL-technician row
+   * records a JOB-level reschedule, not a per-technician rejection, so it must
+   * exclude nobody.
+   */
   where.push(`e.efr_id NOT IN (
           SELECT sh.easyfixer_id FROM scheduling_history sh
            WHERE sh.job_id = ?
+             AND sh.easyfixer_id IS NOT NULL
              AND sh.reschedule_reason IS NOT NULL
              AND sh.reschedule_reason <> ''
         )`);
   params.push(job.job_id);
 
-  // ── Already OFFERED this job (offer-pool model) ──
-  // In THE OFFER MODEL a job is offered to MANY technicians at once; each open
-  // offer is a tbl_job_offer row with offer_status = 0 (OFFERED). Suppress any
-  // tech who currently holds an open offer for THIS job so the Top-10 / search
-  // candidate list never re-surfaces someone already offered. Gated by the
-  // memoised existence probe — when tbl_job_offer is absent this clause is
-  // omitted and eligibility is identical to the pre-offer-model behaviour.
+  /*
+   * ── Already OFFERED / DECLINED this job (offer-pool model) ──
+   * In THE OFFER MODEL a job is offered to MANY technicians at once; each offer
+   * is a tbl_job_offer row. Two statuses take a tech out of the running for
+   * THIS job:
+   *   OFFERED  — they already hold an open offer; re-surfacing them would let
+   *              ops offer the same job to the same person twice.
+   *   REJECTED — they explicitly declined, with a reason. Re-listing someone
+   *              who just said no (and whose refusal is displayed right above
+   *              in "Offered To") is exactly the mistake ops flagged.
+   * EXPIRED is deliberately NOT excluded — that is "didn't answer in time", and
+   * re-offering is a normal, intended recovery. ACCEPTED can't reach here (the
+   * job is assigned by then).
+   *
+   * Ops can still reach a declined tech through SEARCH, which bypasses the
+   * ranking filters by design — the exclusion shapes the recommendation, it
+   * doesn't remove the override.
+   *
+   * Gated by the memoised existence probe — when tbl_job_offer is absent this
+   * clause is omitted and eligibility matches pre-offer-model behaviour.
+   */
   if (await jobOfferTableExists()) {
+    // `IS NOT NULL` for the same reason as the scheduling_history subquery
+    // above — a single NULL in a NOT IN list rejects every row. fk_easyfixter_id
+    // should never be NULL on an offer, but the failure mode (silent, total
+    // blackout of the candidate list) is far too costly to leave to "should".
     where.push(`e.efr_id NOT IN (
           SELECT jo.fk_easyfixter_id FROM tbl_job_offer jo
            WHERE jo.job_id = ?
-             AND jo.offer_status = ${OFFER_STATUS.OFFERED}
+             AND jo.fk_easyfixter_id IS NOT NULL
+             AND jo.offer_status IN (${OFFER_STATUS.OFFERED}, ${OFFER_STATUS.REJECTED})
         )`);
     params.push(job.job_id);
   }
@@ -706,6 +774,30 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
   const deepSkillMap  = new Map((deepSkillResult[0] || []).map((r) => [r.efr_id, true]));
   const anySkillMap   = new Map((anySkillResult[0] || []).map((r) => [r.efr_id, true]));
 
+  // ── Job Skill Matrix match (shared by ranked list + search) ──────
+  // Resolve the deep skills THIS job's services require per the Job Skill
+  // Matrix, then mark which techs hold one. `matrixMatchSet === null` means
+  // the matrix has NO mapping for this job (or the lookup failed) — callers
+  // fall back to the category+type deep-skill match, so unmapped jobs behave
+  // exactly as before. Fail-soft: any error → null → category+type fallback.
+  const matrixSkillIds = await matrixRequiredSkillIds(job.job_id);
+  let matrixMatchSet = null;
+  if (matrixSkillIds.size && efrIds.length) {
+    try {
+      const skillList = [...matrixSkillIds];
+      const [rows] = await pool.query(
+        `SELECT DISTINCT m.easyfixer_id AS efr_id FROM tbl_efr_deepskill_mapping m
+          WHERE m.easyfixer_id IN (${efrIds.map(() => '?').join(',')}) AND m.is_repairing = 1
+            AND m.parent_skill_id IN (${skillList.map(() => '?').join(',')})`,
+        [...efrIds, ...skillList],
+      );
+      matrixMatchSet = new Set(rows.map((r) => Number(r.efr_id)));
+    } catch (e) {
+      logger.warn('stats matrix-match query failed (falling back to category+type) · ' + e.message);
+      matrixMatchSet = null;
+    }
+  }
+
   // Tech base fields — current pincode + zone FK.
   const baseMap = new Map();
   for (const r of (baseRowsResult[0] || [])) {
@@ -830,10 +922,13 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
       }
     }
 
-    // Deep-skill 3-state + bool.
-    const matchesJobSkill = deepSkillMap.get(id) === true;
+    // Deep-skill 3-state + bool. Prefer the Job Skill Matrix skill where the
+    // matrix maps this job; fall back to the category+type match otherwise.
+    const catgTypeMatch = deepSkillMap.get(id) === true;                       // category+type (fallback / eligibility signal)
+    const matrixMatch   = matrixMatchSet ? matrixMatchSet.has(id) : null;      // null = matrix has no mapping for this job
+    const effectiveMatch = matrixMatch !== null ? matrixMatch : catgTypeMatch; // matrix where mapped, else fallback
     const hasAnySkill = jobHasSkillReq ? (anySkillMap.get(id) === true) : true;
-    const skillStatus = deepSkillStatus({ jobHasSkillReq, hasAnySkill, matchesJobSkill });
+    const skillStatus = deepSkillStatus({ jobHasSkillReq, hasAnySkill, matchesJobSkill: effectiveMatch });
 
     const techZone = techZoneMap.get(id) || {};
 
@@ -852,7 +947,7 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
       // attendance_for_job_date: a cross now means EXPLICITLY marked absent
       // (is_leave_marked=1), not merely "hasn't marked attendance".
       attendance_marked:  !absentMap.has(id),
-      has_deep_skill:     matchesJobSkill,
+      has_deep_skill:     catgTypeMatch,
       tat_target_hours:   tatTargetHours,
       max_concurrent:     maxConcurrent,
       // Defaults travel through to scoreOne so per-job overrides work.
@@ -865,10 +960,17 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
       zone_name:              techZone.zone_name ?? null,
       distance_km:            distanceKm == null ? null : Number(distanceKm.toFixed(1)),
       distance_tier:          tr.tier,
+      // Additive display field — the BASIS that produced this tech's distance_tier
+      // (serviceable pincode / current pincode / zone / raw GPS), plus the matched
+      // reference pincode. Not a ranking input; see distanceCriteriaFor().
+      distance_criteria:       distanceCriteriaFor(tr.tier),
+      distance_criteria_value: tr.refPin ?? null,
       // Present UNLESS explicitly marked absent — `absentMap` is the leave set.
       attendance_for_job_date: !absentMap.has(id),
       deep_skill_status:      skillStatus,
-      deep_skill_match:       matchesJobSkill,
+      deep_skill_match:       effectiveMatch,
+      skill_matrix_match:     matrixMatch,
+      skill_signal:           effectiveMatch,
       worked_in_category:     workedVerticalMap.get(id) === true,
       concurrent_jobs_count:  concurrentMap.get(id) ?? 0,
       same_slot_conflict:     conflictMap.get(id) === true,
@@ -970,6 +1072,9 @@ function buildCandidateRow(tech, s, job) {
     serviceable_pincodes:   s.serviceable_pincodes ?? [],
     distance_km:            s.distance_km ?? null,
     distance_tier:          s.distance_tier ?? 'unknown',
+    // Basis that produced distance_tier + the matched reference pincode (display).
+    distance_criteria:       s.distance_criteria ?? distanceCriteriaFor(s.distance_tier ?? 'unknown'),
+    distance_criteria_value: s.distance_criteria_value ?? null,
     attendance_for_job_date: s.attendance_for_job_date === true,
     // Defensive default only — deepSkillStatus() always sets this. It falls back
     // to 'not_applicable' rather than 'both_available' so a missing value can
@@ -977,6 +1082,8 @@ function buildCandidateRow(tech, s, job) {
     // overstatement the 4th state exists to remove.
     deep_skill_status:      s.deep_skill_status ?? 'not_applicable',
     deep_skill_match:       s.deep_skill_match === true,
+    skill_matrix_match:     s.skill_matrix_match ?? null,
+    skill_signal:           s.skill_signal === true,
     worked_in_category:     s.worked_in_category === true,
     payment_mode:           paidByLabel(job.paid_by),
     concurrent_jobs_count:  s.concurrent_jobs_count ?? 0,
@@ -1047,6 +1154,145 @@ function filterAndScore(eligible, stats, job, opts) {
   return { scored, rejected };
 }
 
+/*
+ * diagnoseEmptyPool(job, rejected) → { code, message, counts, declined }
+ *
+ * Why the candidate list came back empty, in ops' language. Runs ONLY on the
+ * empty path, so the happy path pays nothing.
+ *
+ * The old empty state said "No active, verified technician with the required
+ * skill was found in this city" no matter WHY the list was empty — which sent
+ * ops (and us) chasing skills and city data when the real cause was a query
+ * bug, everyone already being offered, or an attendance gate. One extra query
+ * turns that into a specific, actionable sentence.
+ *
+ * The counts come from ONE pass over the city's active+verified technicians,
+ * so each figure is a subset of `cityPool` and they are directly comparable.
+ * `rejected` (from filterAndScore) covers the OTHER kind of emptiness: people
+ * who were eligible but lost to attendance / saturation / COD balance.
+ */
+async function diagnoseEmptyPool(job, rejected = []) {
+  const counts = {
+    cityPool: 0, withSkill: 0, openOffer: 0, declined: 0, removedEarlier: 0, filtered: rejected.length,
+  };
+  try {
+    const hasOffers = await jobOfferTableExists();
+    const skillPredicate = (job.fk_service_catg_id || job.fk_service_type_id)
+      ? `EXISTS (SELECT 1 FROM tbl_efr_deepskill_mapping m
+                  WHERE m.easyfixer_id = e.efr_id AND m.is_repairing = 1
+                    ${job.fk_service_catg_id ? 'AND m.category_id = ' + Number(job.fk_service_catg_id) : ''}
+                    ${job.fk_service_type_id ? 'AND m.service_type_id = ' + Number(job.fk_service_type_id) : ''})`
+      : '1=1';
+    const offerCount = (statuses) => (hasOffers
+      ? `EXISTS (SELECT 1 FROM tbl_job_offer jo WHERE jo.job_id = ${Number(job.job_id)}
+                  AND jo.fk_easyfixter_id = e.efr_id AND jo.offer_status IN (${statuses}))`
+      : '0');
+    const [[row]] = await pool.query(
+      `SELECT COUNT(*) AS cityPool,
+              SUM(${skillPredicate}) AS withSkill,
+              SUM(${offerCount(OFFER_STATUS.OFFERED)}) AS openOffer,
+              SUM(${offerCount(OFFER_STATUS.REJECTED)}) AS declined,
+              SUM(EXISTS (SELECT 1 FROM scheduling_history sh
+                           WHERE sh.job_id = ? AND sh.easyfixer_id = e.efr_id
+                             AND sh.reschedule_reason IS NOT NULL AND sh.reschedule_reason <> '')) AS removedEarlier
+         FROM tbl_easyfixer e
+        WHERE e.efr_status = 1 AND e.is_technician_verified = 1 AND e.efr_cityId = ?`,
+      [job.job_id, job.city_id],
+    );
+    for (const k of Object.keys(counts)) {
+      if (row && row[k] != null) counts[k] = Number(row[k]);
+    }
+  } catch (e) {
+    // Diagnosis must never break the response it is explaining.
+    logger.warn({ err: e.message }, 'diagnoseEmptyPool failed; falling back to the generic message');
+    return { code: 'unknown', message: 'No technician is available for this job right now.', counts, declined: [] };
+  }
+
+  /*
+   * The DECLINES, with the reason each technician gave. When the pool is empty
+   * because people said no, "1 declined it" is a dead end — the reason is what
+   * tells ops whether to re-offer, widen the search, or escalate (e.g. "issue
+   * with the customer" is a very different signal from "already booked").
+   * Latest offer per tech (MAX(job_offer_id)), mirroring job.service listOffers,
+   * so a re-offered tech appears once. Fail-soft: an empty list is fine.
+   */
+  let declined = [];
+  if (counts.declined > 0) {
+    try {
+      const [rows] = await pool.query(
+        `SELECT jo.fk_easyfixter_id AS efr_id, ef.efr_name, jo.reject_reason AS reason
+           FROM tbl_job_offer jo
+           JOIN (SELECT fk_easyfixter_id, MAX(job_offer_id) AS mid
+                   FROM tbl_job_offer
+                  WHERE job_id = ?
+                  GROUP BY fk_easyfixter_id) latest ON latest.mid = jo.job_offer_id
+           JOIN tbl_easyfixer ef ON ef.efr_id = jo.fk_easyfixter_id
+          WHERE jo.offer_status = ${OFFER_STATUS.REJECTED}
+          ORDER BY jo.responded_at DESC
+          LIMIT 10`,
+        [job.job_id],
+      );
+      declined = rows.map((r) => ({
+        efr_id: Number(r.efr_id),
+        efr_name: r.efr_name || null,
+        reason: (r.reason && String(r.reason).trim()) || null,
+      }));
+    } catch (e) {
+      logger.warn({ err: e.message }, 'diagnoseEmptyPool: decline-reason lookup failed');
+    }
+  }
+
+  const cityName = job.city_name ? ` in ${job.city_name}` : ' in this city';
+  if (counts.cityPool === 0) {
+    return {
+      code: 'no_tech_in_city',
+      message: `No active, verified technician is registered${cityName}.`,
+      counts, declined,
+    };
+  }
+  // Everyone in the city is spoken for on THIS job.
+  const spokenFor = counts.openOffer + counts.declined + counts.removedEarlier;
+  if (spokenFor >= counts.cityPool) {
+    const parts = [];
+    if (counts.openOffer)      parts.push(`${counts.openOffer} already hold an open offer`);
+    if (counts.declined)       parts.push(`${counts.declined} declined it`);
+    if (counts.removedEarlier) parts.push(`${counts.removedEarlier} were removed from it earlier`);
+    return {
+      code: 'all_offered_or_declined',
+      message: `All ${counts.cityPool} technicians${cityName} are already accounted for on this job — ${parts.join(', ')}. Wait for a response, or use search to pick someone directly.`,
+      counts, declined,
+    };
+  }
+  // Eligible people existed but every one lost a scoring filter — name them.
+  if (counts.filtered > 0) {
+    const byReason = new Map();
+    for (const r of rejected) {
+      // Reasons carry per-tech numbers ("saturated (3 active jobs)") — strip the
+      // parenthetical so they group into one line per CAUSE.
+      const key = String(r.reason || 'excluded').replace(/\s*\(.*\)\s*$/, '');
+      byReason.set(key, (byReason.get(key) || 0) + 1);
+    }
+    const parts = [...byReason.entries()].map(([reason, n]) => `${n} ${reason}`);
+    return {
+      code: 'filtered_out',
+      message: `${counts.filtered} technician${counts.filtered === 1 ? '' : 's'} matched this job but ${counts.filtered === 1 ? 'was' : 'were'} excluded: ${parts.join('; ')}.`,
+      counts, declined,
+    };
+  }
+  if (counts.withSkill === 0) {
+    return {
+      code: 'no_skill_match',
+      message: `${counts.cityPool} technicians are active${cityName}, but none is mapped to this job's skill.`,
+      counts, declined,
+    };
+  }
+  return {
+    code: 'unknown',
+    message: 'No technician is available for this job right now.',
+    counts, declined,
+  };
+}
+
 // ─── Public entrypoint ───────────────────────────────────────────────
 /*
  * Returns:
@@ -1056,7 +1302,9 @@ function filterAndScore(eligible, stats, job, opts) {
  *     note: 'no_deep_skill_match' | null,
  *     l1Count, l2Count, candidates: [...],
  *     config: { ranking_order, max_concurrent, … },
- *     rejected: [{ efr_id, reason }]
+ *     rejected: [{ efr_id, reason }],
+ *     emptyReason: { code, message, counts } | null   ← only when candidates is
+ *        empty; says WHY in ops' language (see diagnoseEmptyPool).
  *   }
  *
  * Each candidate row carries everything the modal needs: name, location,
@@ -1302,24 +1550,35 @@ async function rankCandidatesForJob(jobId, {
   }
 
   if (scored.length === 0 && totalEligible === 0) {
-    logger.info('Returning 0 candidates · no eligible techs · jobId=' + jobId);
+    const emptyReason = await diagnoseEmptyPool(job, rejected);
+    logger.info('Returning 0 candidates · no eligible techs · jobId=' + jobId + ' · reason=' + emptyReason.code);
     return {
       job: enrichedJob, alreadyAssigned, note: note ?? 'no_eligible_techs',
       l1Count: 0, l2Count: 0, candidates: [], rejected: [],
+      emptyReason,
       config: { ranking_order: RANKING_ORDER, performance_sub: PERFORMANCE_SUB },
     };
   }
 
-  // Priority-order ranking (NOT a weighted score): PRESENT-for-job-date techs
-  // first (so soft-attendance backfill can never bury a present tech below an
-  // absent one, and the top-N slice keeps present techs as the priority), then
-  // existing-tech preference — worked in this Vertical, then worked for this
-  // Client — then past performance (Rating/TAT/SDA) as the tiebreaker. In HARD
-  // attendance mode every scored tech is present, so the attendance key is a
-  // no-op (no behaviour change for auto-assign). Balance is a column, never a
-  // sort input.
+  /*
+   * Priority-order ranking (NOT a weighted score). Order, best-first:
+   *   1. PRESENT for the job date  (soft-attendance backfill can't bury a present
+   *      tech below an absent one; the top-N slice keeps present techs first).
+   *   2. PINCODE proximity         (distance_tier: serviceable-covers-job →
+   *      current-pincode → in-zone → …) — surfaces techs who can actually reach
+   *      the job first, which was previously computed but never sorted on.
+   *   3. SKILL match               (skill_signal: Job Skill Matrix where mapped,
+   *      else category+type) — the best-skilled tech wins among equally-near ones.
+   *   4/5. existing-tech preference — worked in this Vertical, then this Client.
+   *   6. past performance (Rating/TAT/SDA) as the final tiebreaker.
+   * In HARD attendance mode every scored tech is present, so key 1 is a no-op.
+   * Balance is a column, never a sort input.
+   */
   scored.sort((a, b) => {
     if (a.attendance_for_job_date !== b.attendance_for_job_date) return a.attendance_for_job_date ? -1 : 1;
+    const ta = tierRank(a.distance_tier), tb = tierRank(b.distance_tier);
+    if (ta !== tb) return ta - tb;
+    if (a.skill_signal !== b.skill_signal) return a.skill_signal ? -1 : 1;
     if (a.worked_for_vertical !== b.worked_for_vertical) return a.worked_for_vertical ? -1 : 1;
     if (a.worked_for_client   !== b.worked_for_client)   return a.worked_for_client   ? -1 : 1;
     return b.performance - a.performance;
@@ -1334,7 +1593,15 @@ async function rankCandidatesForJob(jobId, {
     candidatesList = await ensureAssignedFirst(candidatesList, assignedEfrId, job, scored);
   }
 
-  logger.info('Returning ' + candidatesList.length + ' candidates · eligible=' + totalEligible + ' scored=' + scored.length + ' rejected=' + rejected.length + (note ? ' note=' + note : ''));
+  /*
+   * The OTHER emptiness: technicians WERE eligible, but every one lost a
+   * scoring filter (attendance / saturation / COD balance), so `candidates` is
+   * empty while totalEligible > 0 — the early return above never fires. Explain
+   * that case too, or ops sees the same blank panel with no cause.
+   */
+  const emptyReason = candidatesList.length === 0 ? await diagnoseEmptyPool(job, rejected) : null;
+
+  logger.info('Returning ' + candidatesList.length + ' candidates · eligible=' + totalEligible + ' scored=' + scored.length + ' rejected=' + rejected.length + (note ? ' note=' + note : '') + (emptyReason ? ' emptyReason=' + emptyReason.code : ''));
   return {
     job: enrichedJob,
     alreadyAssigned,
@@ -1343,6 +1610,7 @@ async function rankCandidatesForJob(jobId, {
     l2Count: scored.length,
     candidates: candidatesList,
     rejected: rejected.slice(0, 20),
+    emptyReason,
     config: {
       ranking_order: RANKING_ORDER,
       performance_sub: PERFORMANCE_SUB,
@@ -1494,7 +1762,7 @@ async function loadJobSkillMatrix(job) {
   let rows = [];
   try {
     [rows] = await pool.query(
-      `SELECT js.job_service_id, ssm.deep_skill_id, ds.deepskill_name, ssm.confidence
+      `SELECT js.job_service_id, ssm.deep_skill_id, ds.deepskill_name, ssm.confidence, ssm.source
          FROM tbl_job_services js
          JOIN tbl_client_service   cs  ON cs.client_service_id = js.service_id
          JOIN tbl_client_rate_card cr  ON cr.crc_id = cs.rate_card_id
@@ -1524,9 +1792,65 @@ async function loadJobSkillMatrix(job) {
       // Skill Matrix page shows for that row, and so a real 0 is never
       // indistinguishable from "no value".
       confidence:     r.confidence ?? null,
+      // source is an ENUM/VARCHAR ('AI' | 'Manual') — plain passthrough so the
+      // modal can badge hand-made ('Manual') mappings. No numeric/string
+      // coercion needed like confidence.
+      source:         r.source ?? null,
     });
   }
   return byJobService;
+}
+
+/*
+ * The DISTINCT deep-skill ids the Job Skill Matrix says THIS job's services
+ * require — resolved by job_id alone (no dependency on a pre-loaded job.services,
+ * so it works on the lean ranking path). Same verified join as loadJobSkillMatrix
+ * (service → rate-card name → matrix), just projected to the id set the ranker
+ * needs to test each candidate against.
+ *
+ * Returns an EMPTY set when: the matrix table isn't category-keyed yet, the job's
+ * services aren't mapped, or the lookup fails. An empty set is the signal to FALL
+ * BACK to the existing category+type deep-skill match — so this can only ADD
+ * precision where the matrix exists, never subtract eligibility where it doesn't
+ * (the explicit product decision for the sparse-matrix rollout).
+ */
+async function matrixRequiredSkillIds(jobId) {
+  if (!jobId || !(await skillMatrixReadable())) return new Set();
+  try {
+    const [rows] = await pool.query(
+      `SELECT DISTINCT ssm.deep_skill_id
+         FROM tbl_job_services js
+         JOIN tbl_client_service   cs ON cs.client_service_id = js.service_id
+         JOIN tbl_client_rate_card cr ON cr.crc_id = cs.rate_card_id
+         JOIN tbl_service_skill_mapping ssm
+              ON ssm.service_catg_id = cs.service_catg_id
+             AND ssm.service_name    = TRIM(cr.crc_ratecard_name)
+             AND ssm.status          = 1
+        WHERE js.job_id = ?`,
+      [jobId],
+    );
+    return new Set(rows.map((r) => Number(r.deep_skill_id)).filter(Boolean));
+  } catch (e) {
+    logger.warn('Matrix required-skill lookup failed (falling back to category+type) · jobId=' + jobId + ' · ' + e.message);
+    return new Set();
+  }
+}
+
+/*
+ * Pincode-proximity as a sort key. distance_tier is already computed per
+ * candidate (computeTierAndRefPin) but was never used to ORDER them — this is
+ * the missing link that makes "prefer techs whose serviceable pincode covers the
+ * job, then techs whose current pincode matches" actually happen. Lower = better.
+ */
+const DISTANCE_TIER_RANK = Object.freeze({
+  same_pincode: 0,     // a serviceable pincode == the job pincode (best)
+  current_pincode: 1,  // home pincode == the job pincode
+  in_zone: 2,          // a serviceable pincode sits in the job's zone
+  out_of_zone: 3,
+  unknown: 4,
+});
+function tierRank(tier) {
+  return DISTANCE_TIER_RANK[tier] ?? DISTANCE_TIER_RANK.unknown;
 }
 
 /*
@@ -1839,13 +2163,33 @@ async function recommendSlotsForJob(jobId, { date, nowMs = Date.now() } = {}) {
     const e = new Error('date must be YYYY-MM-DD'); e.status = 400; throw e;
   }
 
-  // ONE ranking pass for the date. enforceMaxConcurrent stays OFF so saturated
-  // technicians still come back with their load attached — we need that number
-  // to judge per-window freedom ourselves rather than having them pre-filtered.
+  /*
+   * ONE ranking pass for the date, using the SAME flags as the Schedule & Assign
+   * "Top-10" list (routes/admin/jobs.js /candidates). This is the pool ops
+   * actually see when they open the job, so the recommendation must reflect it —
+   * a slot the engine calls "unstaffable" while Schedule & Assign shows five
+   * technicians would destroy trust in the feature.
+   *
+   * softAttendance:true is the load-bearing one, and the cause of a production
+   * bug where EVERY slot showed 0: with the default (hard) attendance filter,
+   * `enforceAttendance` hard-EXCLUDES anyone marked absent — but only inside the
+   * today/tomorrow marking window (attendanceWindowActive). QA has little
+   * attendance data so nobody was excluded and it looked fine; production has
+   * real leave rows, so confirming for today/tomorrow emptied the pool entirely.
+   * Schedule & Assign uses soft attendance for exactly this reason: keep absent
+   * techs in the list (present-first), never show an empty pool. We then subtract
+   * the absent ones from the per-slot FREE count below, so the pool is honest
+   * without being empty.
+   *
+   * enforceMaxConcurrent stays OFF so saturated technicians still come back with
+   * their load attached — we judge per-window freedom ourselves.
+   */
   const ranked = await rankCandidatesForJob(jobId, {
     jobDate: day,
     limit: 1000,
     enforceMaxConcurrent: false,
+    enforceCodBalance: true,
+    softAttendance: true,
   });
   const candidates = Array.isArray(ranked.candidates) ? ranked.candidates : [];
   const efrIds = candidates.map((c) => Number(c.efr_id)).filter(Boolean);
@@ -1887,6 +2231,11 @@ async function recommendSlotsForJob(jobId, { date, nowMs = Date.now() } = {}) {
     const busy = busyBySlot.get(slot.value) || new Set();
     const free = candidates.filter((c) => {
       if (busy.has(Number(c.efr_id))) return false;              // already booked in this window
+      // Absent = explicitly on leave that day (is_leave_marked=1). softAttendance
+      // keeps them in the POOL so it's never empty, but they cannot be counted as
+      // free. On a future date nobody is absent, so this is a no-op there — which
+      // matches the honest "attendance isn't known yet" caveat the UI shows.
+      if (c.attendance_for_job_date === false) return false;
       const load = Number(c.active_jobs ?? 0);
       const cap = Number(c.max_concurrent ?? 0);
       return !(cap > 0 && load >= cap);                          // saturated for the day

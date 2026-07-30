@@ -4,8 +4,24 @@ const Joi    = require('joi');
 const validate = require('../../middleware/validate');
 const { roleByName } = require('../../middleware/role');
 const userService = require('../../services/user.service');
+const { STAGE_KEYS } = require('../../lib/job-stages');
 const { modernOk, modernError } = require('../../utils/response');
 const logger = require('../../logger');
+
+/*
+ * Job Stage Access field — an array of stage keys (each one of the 9 canonical
+ * keys in lib/job-stages.js). Three distinct values, all meaningful:
+ *
+ *   NULL              → ALL / unrestricted (the service stores NO rows)
+ *   []                → explicit NO ACCESS (the service stores a sentinel row)
+ *   ['unconfirmed',…] → restricted to those stages
+ *   ABSENT (on PATCH) → no change
+ *
+ * `.allow(null)` is therefore load-bearing, not cosmetic: without it the only
+ * way to express "unrestricted" would be [], which now means the opposite.
+ * Reused across create/update/bulk.
+ */
+const allowedStagesField = Joi.array().items(Joi.string().valid(...STAGE_KEYS)).allow(null).optional();
 
 /*
  * /api/admin/users — Manage Users settings surface.
@@ -50,6 +66,7 @@ const createBody = Joi.object({
   manage_states:     Joi.string().allow('', null).optional(),
   manage_verticals:  Joi.string().allow('', null).optional(),
   reporting_manager: Joi.number().integer().positive().allow(null).optional(),
+  allowed_stages:    allowedStagesField,
 });
 
 const updateBody = Joi.object({
@@ -63,6 +80,7 @@ const updateBody = Joi.object({
   manage_verticals:  Joi.string().allow('', null).optional(),
   reporting_manager: Joi.number().integer().positive().allow(null).optional(),
   is_active:         Joi.boolean().optional(),
+  allowed_stages:    allowedStagesField,
 }).min(1);
 
 // ─── Bulk-update sub-router ──────────────────────────────────────────
@@ -221,6 +239,10 @@ const bulkUpdateBody = Joi.object({
     // non-admin-group roles with a 400 — so we only enforce shape
     // here. Joi.integer().positive keeps obvious garbage out.
     user_role:         Joi.number().integer().positive().optional(),
+    // Job Stage Access — optional here too so ops can apply the same stage
+    // set to N users at once. Same tri-state as the single-user routes:
+    // null = unrestricted, [] = no access, non-empty = restricted.
+    allowed_stages:    allowedStagesField,
   }).min(1).required(),
 });
 router.post('/bulk-update', roleByName(['Admin']), validate(bulkUpdateBody), async (req, res, next) => {

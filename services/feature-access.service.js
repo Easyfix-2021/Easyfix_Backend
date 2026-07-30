@@ -23,6 +23,7 @@ const FEATURES = {
   canBuildSkillMatrix: 'skill.matrix.emails',
   canRunTeleprompter: 'teleprompter.emails',
   canSwitchOtpChannel: 'access.otpchannel.emails',
+  canManageJobCharges: 'job.charges.emails',
 };
 
 // Is `email` on the allowlist held in easyfix_properties[propertyKey]?

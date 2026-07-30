@@ -392,13 +392,24 @@ router.get('/jobs/:id/share-link', async (req, res, next) => {
 // ─── Masked click-to-call: bridge the technician ⇄ customer ──────────
 // The app NEVER shows or dials the customer's number. from = the tech's on-file
 // efr_no (auto — no typing); to = customer (resolved server-side, never
-// returned), bridged via Plivo. Scope: the tech must own the job or have an
-// open offer on it. Same masking posture as the CRM operator click-to-call.
+// returned), bridged via Plivo. Same masking posture as the CRM operator
+// click-to-call.
+//
+// SCOPE — the tech must OWN the job (it is assigned to them). An open offer is
+// deliberately NOT enough (tightened 2026-07-29).
+//
+// WHY: under the offer-pool model one job is offered to SEVERAL technicians at
+// once, and `fk_easyfixter_id` stays NULL until one accepts. While the previous
+// rule (`owner OR open offer`) leaked no phone number — the bridge is masked and
+// the raw number is stripped from the mobile payload — it did let EVERY offered
+// tech ring the same customer about a job only one of them will ever do, before
+// any of them had committed to it. Viewing the job (line ~359) and rejecting the
+// offer (line ~527) still accept an open offer, because a tech must be able to
+// review and decline; only CONTACTING the customer now requires acceptance.
 async function resolveMobileCallLegs(req, jobId) {
   const job = await jobService.getById(jobId);
   if (!job) return { error: { status: 404, msg: 'job not found' } };
-  const canCall = job.fk_easyfixter_id === req.tech.efr_id
-    || (await jobService.techHasOpenOffer(job.job_id, req.tech.efr_id));
+  const canCall = job.fk_easyfixter_id === req.tech.efr_id;
   if (!canCall) return { error: { status: 404, msg: 'job not found' } };
   const techMobile = req.tech.efr_no;
   if (!techMobile) return { error: { status: 422, msg: 'No mobile number on file for your account' } };

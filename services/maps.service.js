@@ -54,7 +54,7 @@ function cacheSet(key, value) {
 }
 
 /*
- * autocomplete(q)
+ * autocomplete(q, sessionToken?)
  *
  * Wraps Google Places Autocomplete. Returns a slim shape so callers
  * don't depend on Google's full response:
@@ -64,19 +64,33 @@ function cacheSet(key, value) {
  * vs. neighbourhood/city). Letting the UI render them as a two-line
  * suggestion is what makes Places feel native.
  *
+ * `sessionToken` (added 2026-07-24, billing optimisation): when the
+ * caller threads a Places session token through every autocomplete
+ * keystroke AND the closing Place Details call (see `placeDetails()`
+ * below), Google bills the whole session as a single Places SKU
+ * instead of per-request. We deliberately do NOT cache responses when
+ * a sessionToken is present — the cache key would otherwise be shared
+ * across unrelated sessions and a cache hit would starve Google of the
+ * request it needs to see to honour the session-billing discount.
+ * Un-tokened calls (legacy callers, or defensive fallback) keep the
+ * existing shared cache keyed by `q` alone.
+ *
  * Throws `{ status, message }` for caller-mappable errors:
  *   - 503 when GOOGLE_MAPS_API_KEY isn't configured
  *   - 502 when Google returns a non-OK / non-ZERO_RESULTS status
  */
-async function autocomplete(q) {
-  logger.info('Maps autocomplete · qLen=' + String(q || '').length);
+async function autocomplete(q, sessionToken) {
+  logger.info('Maps autocomplete · qLen=' + String(q || '').length + ' · tokened=' + Boolean(sessionToken));
   const apiKey = process.env.GOOGLE_MAPS_API_KEY;
   if (!apiKey) throw { status: 503, message: 'Google Maps not configured (GOOGLE_MAPS_API_KEY missing)' };
   const cacheKey = `ac:${q.toLowerCase()}`;
-  const cached = cacheGet(cacheKey);
-  if (cached) return cached;
+  if (!sessionToken) {
+    const cached = cacheGet(cacheKey);
+    if (cached) return cached;
+  }
 
-  const url = `${MAPS_BASE}/place/autocomplete/json?input=${encodeURIComponent(q)}&components=country:in&key=${apiKey}`;
+  let url = `${MAPS_BASE}/place/autocomplete/json?input=${encodeURIComponent(q)}&components=country:in&key=${apiKey}`;
+  if (sessionToken) url += `&sessiontoken=${encodeURIComponent(sessionToken)}`;
   const r = await fetch(url);
   const data = await r.json();
   if (data.status !== 'OK' && data.status !== 'ZERO_RESULTS') {
@@ -93,8 +107,33 @@ async function autocomplete(q) {
     secondary: p.structured_formatting?.secondary_text || '',
   }));
   const out = { items };
-  cacheSet(cacheKey, out);
+  // Skip the shared cache for tokened requests — see the sessionToken note
+  // in the doc comment above.
+  if (!sessionToken) cacheSet(cacheKey, out);
   logger.info('Returning ' + items.length + ' autocomplete predictions');
+  return out;
+}
+
+/*
+ * flattenAddressComponents(components)
+ *
+ * Shared by `geocode()` and `placeDetails()` — both Google Geocoding
+ * and Places Details return the same `address_components: [{ types,
+ * long_name, short_name }]` shape, so one flattener keeps the two
+ * response paths byte-identical for FE consumers (PIN/city autofill
+ * reads this same flattened shape regardless of which Google API
+ * produced it).
+ */
+function flattenAddressComponents(components) {
+  const out = {};
+  for (const c of (components || [])) {
+    if (c.types.includes('postal_code'))                  out.postal_code = c.long_name;
+    if (c.types.includes('locality'))                      out.city = c.long_name;
+    if (c.types.includes('administrative_area_level_1'))   out.state = c.long_name;
+    if (c.types.includes('country'))                       out.country = c.long_name;
+    if (c.types.includes('route'))                          out.route = c.long_name;
+    if (c.types.includes('sublocality_level_1'))            out.sublocality = c.long_name;
+  }
   return out;
 }
 
@@ -163,15 +202,7 @@ async function geocode({ place_id, address, latlng }) {
   const first = data.results?.[0];
   if (!first) throw { status: 404, message: 'no geocode results' };
   const loc = first.geometry?.location || {};
-  const components = {};
-  for (const c of (first.address_components || [])) {
-    if (c.types.includes('postal_code'))            components.postal_code = c.long_name;
-    if (c.types.includes('locality'))                components.city = c.long_name;
-    if (c.types.includes('administrative_area_level_1')) components.state = c.long_name;
-    if (c.types.includes('country'))                 components.country = c.long_name;
-    if (c.types.includes('route'))                   components.route = c.long_name;
-    if (c.types.includes('sublocality_level_1'))     components.sublocality = c.long_name;
-  }
+  const components = flattenAddressComponents(first.address_components);
   const out = {
     lat: loc.lat ?? null,
     lng: loc.lng ?? null,
@@ -180,6 +211,74 @@ async function geocode({ place_id, address, latlng }) {
   };
   cacheSet(cacheKey, out);
   logger.info('Geocode resolved · pin=' + (components.postal_code || 'n/a') + ' · city=' + (components.city || 'n/a'));
+  return out;
+}
+
+/*
+ * placeDetails({ place_id, sessionToken })
+ *
+ * Session-token-aware replacement for `geocode({ place_id })` on the
+ * autosuggest-pick path (added 2026-07-24). Wraps Google Places
+ * Details and returns the SAME shape `geocode()` does —
+ *   { lat, lng, formatted_address, address_components: {...} }
+ * — so callers that resolve a place_id are unaffected by which Google
+ * API served the request.
+ *
+ * Why this exists: a Places Autocomplete session token only earns its
+ * billing discount if the SAME token is sent on every autocomplete
+ * keystroke request AND a closing Places Details call. Geocoding
+ * ignores `sessiontoken` entirely, so resolving a picked place_id via
+ * `geocode()` (as we used to) meant the token never closed a session —
+ * autocomplete kept billing per-request regardless. Routing the pick
+ * through Places Details with the same token is what actually realises
+ * the saving; the token is single-use and should be discarded by the
+ * caller immediately after this call.
+ *
+ * `fields` is scoped tight to exactly what callers consume — Places
+ * Details bills by requested field mask, so asking for more than
+ * geometry/formatted_address/address_component would cost more for no
+ * benefit. Never cached: a sessionToken is single-use by definition,
+ * and caching by place_id alone would let a later un-tokened caller
+ * silently reuse a session-scoped response.
+ *
+ * Throws `{ status, message }` — same contract as `geocode()`.
+ */
+async function placeDetails({ place_id, sessionToken }) {
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+  if (!apiKey) throw { status: 503, message: 'Google Maps not configured' };
+  if (!place_id) throw { status: 400, message: 'place_id required' };
+  logger.info('Maps place details · tokened=' + Boolean(sessionToken));
+
+  const fields = 'geometry,formatted_address,address_component';
+  let url = `${MAPS_BASE}/place/details/json?place_id=${encodeURIComponent(place_id)}&fields=${fields}&key=${apiKey}`;
+  if (sessionToken) url += `&sessiontoken=${encodeURIComponent(sessionToken)}`;
+  const r = await fetch(url);
+  const data = await r.json();
+  if (data.status !== 'OK') {
+    logger.warn({ status: data.status, error_message: String(data.error_message || '').slice(0, 200) }, 'Google place details error');
+    logger.warn('Maps place details failed · status=' + data.status);
+    let msg;
+    if (data.status === 'REQUEST_DENIED') {
+      msg = 'Places Details rejected this key — enable "Places API" on the same GCP key that already serves Places Autocomplete, then check API key restrictions still allow this server\'s IP / referer.';
+    } else if (data.status === 'OVER_QUERY_LIMIT' || data.status === 'OVER_DAILY_LIMIT') {
+      msg = 'Places Details quota/limit reached — check billing or raise the cap.';
+    } else if (data.status === 'INVALID_REQUEST') {
+      msg = 'Places Details rejected the request — likely a stale or malformed place_id.';
+    } else {
+      msg = `Google place details failed: ${data.status}`;
+    }
+    throw { status: 502, message: msg };
+  }
+  const result = data.result || {};
+  const loc = result.geometry?.location || {};
+  const components = flattenAddressComponents(result.address_components);
+  const out = {
+    lat: loc.lat ?? null,
+    lng: loc.lng ?? null,
+    formatted_address: result.formatted_address || '',
+    address_components: components,
+  };
+  logger.info('Place details resolved · pin=' + (components.postal_code || 'n/a') + ' · city=' + (components.city || 'n/a'));
   return out;
 }
 
@@ -288,6 +387,7 @@ async function reverseGeocode(lat, lng, pool = null) {
 module.exports = {
   autocomplete,
   geocode,
+  placeDetails,
   reverseGeocode,
   getConfigKey,
 };
