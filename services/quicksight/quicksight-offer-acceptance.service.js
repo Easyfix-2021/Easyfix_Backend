@@ -28,6 +28,7 @@ const logger = require('../../logger');
 const { buildInFilter, _dateHelpers } = require('./_shared');
 const { istToday, fmt, addDays } = _dateHelpers;
 const { OFFER_STATUS } = require('../offer-status');
+const { jobStatusLabel } = require('../../utils/job-status-label');
 
 const ROW_CAP = 5000;
 // Cap the daily trend so a wide offered_at filter can't explode the chart into
@@ -453,37 +454,9 @@ async function getOfferDetails(filters = {}, selection = {}) {
   };
 }
 
-/*
- * CRM-facing job-status label for the XLSX Job sheet.
- *
- * ⚠ Do NOT swap this for services/integration.service.js's statusLabel(). That
- * map is FROZEN to the legacy Dropwizard contract external clients depend on,
- * where 0 = 'Unconfirmed' and 9 = 'Call Later'. In the CRM's own vocabulary
- * 0 = 'Booked' and 9 = 'Unconfirmed' — reusing it would label the export
- * differently from the chip the operator just looked at, on the very statuses
- * they care about most.
- *
- * Mirrors the FE's statusLabel (src/lib/utils.ts) EXACTLY, including the BOOKED
- * sub-split by tech presence: status 0 + a tech assigned → "Pending App Ack",
- * status 0 + no tech → "Pending for Scheduling", and plain "Booked" only when
- * assignment is unknown. Reproducing the split is what keeps the export cell
- * equal to the on-screen chip and the job modal header (the mismatch this fixes:
- * the report said "Booked" while the modal said "Pending App Ack" for the same
- * assigned-but-unacknowledged job). `assigned` now flows in from the query
- * (MAX(j.fk_easyfixter_id)); before, this report had no fk_easyfixter_id in scope.
- */
-const JOB_STATUS_MAP = {
-  0: 'Booked', 1: 'Scheduled', 2: 'In Progress', 3: 'Completed', 5: 'Completed',
-  6: 'Cancelled', 7: 'Enquiry', 9: 'Unconfirmed', 10: 'Closed from App',
-  15: 'Estimate Pending', 20: 'In Progress', 21: 'On Hold',
-};
-function jobStatusLabel(code, assigned) {
-  if (code == null) return '';
-  if (code === 0 && (assigned === true || assigned === false)) {
-    return assigned ? 'Pending App Ack' : 'Pending for Scheduling';
-  }
-  return JOB_STATUS_MAP[code] || `Status ${code}`;
-}
+// Job-status label for the XLSX Job sheet uses the shared CRM helper
+// (utils/job-status-label.js, imported at the top) — mirrors the FE statusLabel
+// and does the BOOKED sub-split from `assigned` (MAX(j.fk_easyfixter_id)).
 
 /*
  * XLSX payload — THREE sheets mirroring the on-screen tabs (Technician /
