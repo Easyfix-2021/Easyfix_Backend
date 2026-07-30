@@ -210,7 +210,7 @@ const LIST_COLUMNS = `
    */
   ef.efr_no AS easyfixer_mobile,
   j.job_owner, ow.user_name AS owner_name,
-  j.fk_address_id, ci.city_name, ad.address,
+  j.fk_address_id, ci.city_name, ad.address, ad.gps_location,
   /*
    * service_count — count of ACTIVE rows on tbl_job_services for this
    * job. Powers the FE "Booked but no services" pill (added
