@@ -1,6 +1,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
-const { resolveLoginOtp, otpExpiryDate } = require('../utils/otp');
+const { resolveLoginOtp, staticLoginOtpFor, otpExpiryDate } = require('../utils/otp');
 const { signUserToken } = require('../utils/jwt');
 
 /*
@@ -138,6 +138,23 @@ async function createLoginOtp(identifier) {
   if (process.env.NODE_ENV !== 'production') {
     logger.event('🔑', 'cyan',
       `OTP for ${user.official_email || user.mobile_no}: ${otp}  (staff user_id=${user.user_id}, valid 5 min) — dev only`);
+  }
+
+  // Fixed-OTP test accounts (utils/otp.js::STATIC_LOGIN_OTP_ACCOUNTS): the code
+  // is a published constant, so there is nothing to deliver — skip the real
+  // email/WhatsApp send entirely (no message ever reaches the mailbox) while
+  // still reporting success so the client advances to the OTP-entry screen. The
+  // OTP row was already written above, so verifyLoginOtp() finds it normally.
+  if (staticLoginOtpFor(identifier) != null) {
+    logger.info('Login OTP is a STATIC test-account code — delivery suppressed · user_id=' + user.user_id);
+    return {
+      found: true,
+      userId: user.user_id,
+      email: user.official_email,
+      expiresAt: expires,
+      delivered: true,
+      channelsTried: 'static-test-otp',
+    };
   }
 
   // Channel-preference delivery:

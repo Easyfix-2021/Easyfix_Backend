@@ -9,6 +9,44 @@ const OTP_MAX_ATTEMPTS = 5;
 // resolveLoginOtp() below for the gate.
 const QA_EMAIL_OTP = 2468;
 
+/**
+ * Fixed-OTP test accounts — ALWAYS resolve to a static OTP, in EVERY
+ * environment (production included), and their OTP email/SMS is suppressed
+ * (auth.service.js::createLoginOtp skips delivery for them). This exists so a
+ * persistent QA / app-review test login works without a live mail/SMS gateway
+ * and without depending on any env flag.
+ *
+ * SECURITY — how this differs from QA_DETERMINISTIC_OTP:
+ *   • QA_DETERMINISTIC_OTP makes EVERY login guessable, so it is hard-gated to
+ *     the QA host and must never run in prod.
+ *   • THIS is an explicit allowlist of individual accounts, so the blast radius
+ *     is exactly those accounts. Anyone who knows a listed email + its OTP can
+ *     log in AS THAT ACCOUNT (and nobody else). Therefore:
+ *       - list ONLY dedicated, low-privilege test users,
+ *       - never add a real staff member's email,
+ *       - it does NOT bypass the user lookup — the account must still exist as
+ *         an active internal user (user_status=1, user_type_id=5).
+ * Keys MUST be lowercase; staticLoginOtpFor() lowercases+trims the identifier.
+ */
+const STATIC_LOGIN_OTP_ACCOUNTS = {
+  'pradeep@easyfix.in': 2468,
+};
+
+/**
+ * Fixed OTP for an allowlisted test account, or null for every other login.
+ * Applies in ALL environments (prod included) by design — the caller must not
+ * env-gate this.
+ *
+ * @param {string} identifier  the login identifier the user typed (email/mobile)
+ * @returns {number|null}       the static 4-digit OTP, or null if not allowlisted
+ */
+function staticLoginOtpFor(identifier) {
+  const key = String(identifier || '').trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(STATIC_LOGIN_OTP_ACCOUNTS, key)
+    ? STATIC_LOGIN_OTP_ACCOUNTS[key]
+    : null;
+}
+
 function generateOtp() {
   // 4-digit random OTP, matches legacy otp_details.otp INT column.
   // The default behavior — used by every flow except the QA login
@@ -38,6 +76,14 @@ function generateOtp() {
  * @returns {number}           4-digit OTP
  */
 function resolveLoginOtp(identifier) {
+  // Allowlisted test accounts get their fixed OTP in EVERY environment (prod
+  // included) — checked BEFORE the QA env gate below, so it is independent of
+  // QA_DETERMINISTIC_OTP. See STATIC_LOGIN_OTP_ACCOUNTS for the security notes.
+  const staticOtp = staticLoginOtpFor(identifier);
+  if (staticOtp != null) {
+    return staticOtp;
+  }
+
   if (process.env.QA_DETERMINISTIC_OTP !== 'true') {
     return generateOtp();
   }
@@ -101,6 +147,7 @@ module.exports = {
   generateOtp,
   resolveLoginOtp,
   resolveMobileOtp,
+  staticLoginOtpFor,
   otpExpiryDate,
   OTP_TTL_MINUTES,
   OTP_MAX_ATTEMPTS,
