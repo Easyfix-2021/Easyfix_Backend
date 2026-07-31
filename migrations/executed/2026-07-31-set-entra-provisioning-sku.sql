@@ -1,0 +1,80 @@
+-- Set the Microsoft 365 licence SKU used when provisioning a new user's mailbox
+-- (2026-07-31).
+--
+-- WHY A SEPARATE MIGRATION, rather than editing the create migration:
+-- 2026-07-30-create-tbl-user-entra-provisioning.sql has already been applied and
+-- lives in migrations/executed/ (frozen by convention). It seeded this key with
+-- an EMPTY value behind `WHERE NOT EXISTS`, so re-running it would not change
+-- anything. Setting a value therefore needs its own forward migration.
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+-- WHICH SKU, AND WHY THIS ONE
+-- ─────────────────────────────────────────────────────────────────────────────
+-- The value is a **skuPartNumber**, never the GUID. entra-provisioning.service.js
+-- (pickSku) matches case-insensitively against skuPartNumber from
+-- GET https://graph.microsoft.com/v1.0/subscribedSkus. A GUID here resolves to
+-- SKU_NOT_FOUND and no mailbox is created.
+--
+-- ⚠ THE POINT OF THE LICENCE: creating an Entra user does NOT create a mailbox.
+-- Exchange Online provisioning is what produces the mailbox, and that only
+-- happens when a licence containing an EXCHANGE service plan is assigned. So the
+-- SKU is not a nicety — pick one without Exchange and the account is created,
+-- assignLicense returns success, this service records licence_status='assigned',
+-- and the address STILL bounces. That is precisely the "user exists, no email"
+-- state this whole feature was built to prevent, only now with a green tick.
+--
+-- Tenant SKUs available at the time of writing:
+--
+--   Product                            skuPartNumber              Exchange mailbox?
+--   ---------------------------------- -------------------------- -----------------
+--   Microsoft 365 Business Basic       O365_BUSINESS_ESSENTIALS   YES  (Exchange P1)
+--   Exchange Online (Plan 2)           EXCHANGEENTERPRISE         YES  (mailbox only)
+--   Microsoft 365 Apps for business    O365_BUSINESS              NO   <-- DO NOT USE
+--
+-- CHOSEN: O365_BUSINESS_ESSENTIALS (Microsoft 365 Business Basic).
+--   It carries Exchange Online Plan 1 (the mailbox) PLUS Teams and the web
+--   versions of the Office apps. CRM users provisioned through Add User are
+--   staff — project managers, executives, finance — who need Teams and a
+--   calendar as well as mail, so this is the sensible default for the account
+--   type this flow creates.
+--
+-- WHEN TO SWITCH:
+--   * EXCHANGEENTERPRISE   — use if a cohort genuinely needs EMAIL ONLY (no
+--                            Teams, no Office). Also the cheaper answer for
+--                            shared/functional addresses. Plan 2 adds a larger
+--                            mailbox, archiving and DLP over Plan 1.
+--   * O365_BUSINESS        — never, for this purpose. "Apps for business" is
+--                            desktop Office ONLY and contains no Exchange
+--                            service plan, so it will not create a mailbox.
+--   * anything else        — must appear in GET /subscribedSkus for this tenant.
+--                            pickSku() lists every available skuPartNumber in its
+--                            error when the configured one is absent, so a typo
+--                            is self-diagnosing.
+--
+-- SEATS: assignment fails with licence_status='no_seats_available' (and the
+-- exact consumed/enabled numbers) when the SKU is exhausted. Check
+-- prepaidUnits.enabled - consumedUnits before enabling the feature.
+--
+-- PRECEDENCE: this property wins over the MS_GRAPH_LICENSE_SKU_PART_NUMBER env
+-- var, which exists only as a bootstrap fallback for a host whose property row
+-- is still empty.
+--
+-- ORDER OF OPERATIONS when turning the feature on: set this SKU FIRST, then the
+-- access.entraprovision.emails allowlist, and flip entra.provisioning.enabled to
+-- 'true' LAST — so the very first provisioning attempt produces a real mailbox
+-- rather than a licence-less directory account. Requires the Graph Application
+-- permissions User.ReadWrite.All + Organization.Read.All with admin consent
+-- (full click-path: docs/ENTRA_PROVISIONING.md).
+--
+-- No schema change. easyfix_properties already exists; property_key is its
+-- PRIMARY KEY.
+
+-- Create the row on any host that somehow lacks it (the create migration seeds
+-- it, so this is belt-and-braces for an out-of-order apply).
+INSERT INTO easyfix_properties (property_key, property_value) SELECT 'entra.provisioning.sku.part.number', '' WHERE NOT EXISTS (SELECT 1 FROM easyfix_properties WHERE property_key = 'entra.provisioning.sku.part.number');
+
+-- Set the value ONLY while it is still unset. A deliberate operator choice made
+-- before this migration runs (e.g. EXCHANGEENTERPRISE) is preserved rather than
+-- silently overwritten — re-running this file can never change a configured
+-- tenant.
+UPDATE easyfix_properties SET property_value = 'O365_BUSINESS_ESSENTIALS' WHERE property_key = 'entra.provisioning.sku.part.number' AND (property_value IS NULL OR TRIM(property_value) = '');
