@@ -35,7 +35,7 @@ async function findSpoc(identifier) {
 async function findSpocById(id) {
   const [[row]] = await pool.query(
     `SELECT cc.id, cc.client_id, cc.contact_name, cc.contact_email, cc.contact_no,
-            cl.client_status
+            cl.client_name, cl.client_status
        FROM tbl_client_contacts cc
        LEFT JOIN tbl_client cl ON cl.client_id = cc.client_id
       WHERE cc.id = ? AND cc.status = 1 LIMIT 1`,

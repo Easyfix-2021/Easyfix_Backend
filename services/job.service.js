@@ -1289,6 +1289,7 @@ function toIdArray(v) {
 async function list({
   q, status, statuses, assigned, clientId, cityId, ownerId, easyfixerId,
   clientOwnerIds,            // number[] — restrict to jobs owned (job_client_owner) by these client users (reporting-manager scope)
+  reportingContactIds,       // number[] — restrict to jobs booked by these SPOC contacts (tbl_job.reporting_contact_id) — client-app hierarchy scope
   customerId,
   jobIds,                    // number[] — restrict to an explicit set of job ids
   isEscalated,
@@ -1491,6 +1492,16 @@ async function list({
   if (Array.isArray(clientOwnerIds) && clientOwnerIds.length) {
     clauses.push(`j.job_client_owner IN (${clientOwnerIds.map(() => '?').join(',')})`);
     params.push(...clientOwnerIds);
+  }
+  // Client-app reporting hierarchy: restrict to jobs whose booking SPOC
+  // (reporting_contact_id) is in the caller's subtree. Empty array → zero rows
+  // (never silently widen to the whole client when the subtree is empty).
+  if (Array.isArray(reportingContactIds)) {
+    if (reportingContactIds.length === 0) { clauses.push('1=0'); }
+    else {
+      clauses.push(`j.reporting_contact_id IN (${reportingContactIds.map(() => '?').join(',')})`);
+      params.push(...reportingContactIds);
+    }
   }
   // cityId — single id OR CSV/array (Pending-to-Start multi-select Cities
   // filter). The `ad.` literal keeps needsAd tripped below so the COUNT query
@@ -1772,6 +1783,14 @@ async function getByIdCore(jobId) {
   const verticalSelect = hasVerticalCol ? 'cl.vertical_id' : 'NULL AS vertical_id';
   const hasAddrInstr = await hasAddressInstructionColumn();
   const addrInstrSelect = hasAddrInstr ? 'ad.address_instruction' : 'NULL AS address_instruction';
+  // "Closed as enquiry" (status 7) reason — enquiry_* columns don't exist on
+  // every deploy, so probe before referencing enquiry_reason_id. enquiry_comment
+  // comes through j.* when present. cancel_by is the actor for enquiry too, so
+  // cancelled_by_name already covers "closed by".
+  const hasEnq = await hasEnquiryColumns();
+  const enquiryReasonSelect = hasEnq
+    ? `(SELECT atr.action_desc FROM action_taken_reason atr WHERE atr.id = j.enquiry_reason_id LIMIT 1) AS enquiry_reason_name`
+    : `NULL AS enquiry_reason_name`;
   const [jobRows] = await pool.query(
     `SELECT j.*,
             cu.customer_name, cu.customer_mob_no, cu.customer_email,
@@ -1783,9 +1802,14 @@ async function getByIdCore(jobId) {
             ow.user_name AS owner_name,
             cr.user_name AS created_by_name,
             (SELECT u2.user_name FROM tbl_user u2 WHERE u2.user_id = j.cancel_by LIMIT 1) AS cancelled_by_name,
-            (SELECT atr.action_desc FROM action_taken_reason atr WHERE atr.id = j.cancel_reason_id LIMIT 1) AS cancel_reason_name
+            (SELECT atr.action_desc FROM action_taken_reason atr WHERE atr.id = j.cancel_reason_id LIMIT 1) AS cancel_reason_name,
+            /* From Production: enquiry reason, NULL-aliased on deploys that
+               predate the enquiry columns (hasEnquiryColumns probe above). */
+            ${enquiryReasonSelect}
             /* Job Age — same two derived fields the LIST emits, from the SAME
-               constant, so the detail modal and the list row always agree. */
+               constant, so the detail modal and the list row always agree.
+               JOB_AGE_COLUMNS is a LEADING-comma fragment, so the line above
+               must NOT end in one. */
             ${JOB_AGE_COLUMNS}
      ${DETAIL_JOIN}
      WHERE j.job_id = ? LIMIT 1`,
@@ -1888,7 +1912,19 @@ async function getById(jobId) {
     billing_label:
       (s.effective_charge == null || Number(s.effective_charge) === 0) ? 'Free' : 'Paid',
   }));
-  return { ...job, services: shapedServices, images: images[0], videos };
+
+  // Resolve each stored image (an S3 key like `JobSupportings/Booking_<id>_<seq>`
+  // or a legacy filename) into a directly-renderable URL: a short-lived S3
+  // presigned URL when the object is in the bucket, else the legacy media-host
+  // URL. The app renders `image_url` and no longer guesses the path itself.
+  const s3Storage = require('../utils/s3-storage');
+  const shapedImages = await Promise.all((images[0] || []).map(async (im) => {
+    let image_url = null;
+    try { image_url = await s3Storage.resolveImageUrl(im.image); } catch { image_url = null; }
+    return { ...im, image_url };
+  }));
+
+  return { ...job, services: shapedServices, images: shapedImages, videos };
 }
 
 /*
