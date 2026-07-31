@@ -127,9 +127,12 @@ async function sendVerification(efrId, email, { origin } = {}) {
     category: 'transactional',
   });
 
+  // `accepted` (Graph 202 = queued), not `delivered` — email.service cannot
+  // tell us the mailbox received anything. Logging it as "delivered" is what
+  // made the OTP variant of this bug so hard to see.
   logger.info(
-    { efrId, delivered: !!result.delivered, disabled: !!result.disabled },
-    'email-verify: verification link dispatched',
+    { efrId, accepted: !!result.accepted, disabled: !!result.disabled },
+    'email-verify: verification link queued with Microsoft Graph',
   );
 
   return { sent: true };

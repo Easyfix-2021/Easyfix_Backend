@@ -1,0 +1,929 @@
+const crypto = require('crypto');
+
+const { pool } = require('../db');
+const logger = require('../logger');
+const { graphRequest } = require('./ms-graph-token.service');
+const { getProperty } = require('./properties.service');
+// Only for the property KEY name in the skip reason — the allowlist decision
+// itself is taken by the caller (route middleware / route handler), never here.
+const { FEATURES } = require('./feature-access.service');
+
+/*
+ * ══════════════════════════════════════════════════════════════════════════
+ *  Microsoft 365 / Entra ID mailbox provisioning for CRM users.
+ * ══════════════════════════════════════════════════════════════════════════
+ *
+ * THE BUG THIS FIXES
+ * ──────────────────
+ * Before this file existed, the ONLY Graph endpoint in the whole backend was
+ * sendMail. `createUser()` wrote a tbl_user row with `official_email` set and
+ * stopped there — no Entra account, no Exchange mailbox, no record of that
+ * fact anywhere. The address looked real in the CRM, OTP email to it was
+ * "delivered" (Graph 202-accepts anything, see services/email.service.js), and
+ * the bounce went to the sender mailbox that nobody reads. Reported case:
+ * user_id 8710 / ankitjha@easyfix.in — a Project Manager who simply could not
+ * log in and no screen could say why.
+ *
+ * TWO INDEPENDENT OUTCOMES, ON PURPOSE
+ * ────────────────────────────────────
+ * Creating an Entra user does NOT create a mailbox. Exchange Online only
+ * provisions one when the account holds a LICENCE. So the account step and the
+ * licence step can fail independently, and "directory account exists but has
+ * no mailbox" is exactly the silent state we were bitten by. They are recorded
+ * as two separate columns (account_status, licence_status) in
+ * tbl_user_entra_provisioning — never collapsed into one boolean.
+ *
+ * FAIL-CLOSED
+ * ───────────
+ * `entra.provisioning.enabled` in easyfix_properties gates every directory
+ * WRITE and defaults to FALSE both in the seed migration and in this code, so
+ * merging this cannot start creating AD accounts in production. Turning it on
+ * is a deliberate, revertible act (see docs/ENTRA_PROVISIONING.md).
+ *
+ * FAIL-SOFT
+ * ─────────
+ * Nothing in here may ever break CRM user creation. Every Graph call is
+ * status-inspected instead of thrown, every DB write is wrapped, and the
+ * orchestrator always returns an outcome object rather than raising.
+ *
+ * GRAPH CALLS + APPLICATION PERMISSIONS
+ * ─────────────────────────────────────
+ *   GET  /v1.0/users/{upn}?$select=…              User.ReadWrite.All (or .Read.All)
+ *   GET  /v1.0/users?$filter=mail eq '…'          User.ReadWrite.All (alias fallback)
+ *   POST /v1.0/users                              User.ReadWrite.All
+ *   GET  /v1.0/subscribedSkus                     Organization.Read.All
+ *   POST /v1.0/users/{id}/assignLicense           User.ReadWrite.All
+ * All application (daemon) permissions — this is a client-credentials flow, so
+ * Delegated permissions do nothing. Admin consent required.
+ */
+
+// ── Feature flags / config ────────────────────────────────────────────────
+
+const PROP_ENABLED   = 'entra.provisioning.enabled';
+const PROP_SKU       = 'entra.provisioning.sku.part.number';
+const PROP_DOMAINS   = 'entra.managed.domains';
+const PROP_PRECHECK  = 'login.otp.email.mailbox.precheck';
+
+function propBool(key, fallback) {
+  const v = String(getProperty(key) ?? '').trim().toLowerCase();
+  if (v === 'true')  return true;
+  if (v === 'false') return false;
+  return fallback;
+}
+
+/*
+ * MASTER switch for every directory WRITE. Defaults FALSE in code as well as
+ * in the seed, so a host that never ran the migration is also off.
+ */
+function provisioningEnabled() {
+  return propBool(PROP_ENABLED, false);
+}
+
+/*
+ * The read-only mailbox-existence pre-check used by the OTP path. Defaults
+ * TRUE — unlike the provisioning master switch — and that difference is
+ * deliberate:
+ *   - it performs NO writes; it cannot create, licence or modify anything;
+ *   - it is fail-OPEN on every outcome except a clean "no such mailbox", so
+ *     before admin consent is granted it answers 403 → 'unknown' → the email
+ *     is attempted exactly as it is today;
+ *   - it only applies to addresses in our OWN verified domains, so a user who
+ *     signs in with a gmail.com address is never affected;
+ *   - and it IS the fix for the reported bug. Defaulting it off would ship the
+ *     diagnosis without the cure.
+ * Flip `login.otp.email.mailbox.precheck` to 'false' to disable it with no
+ * redeploy if it ever misbehaves.
+ */
+function mailboxPrecheckEnabled() {
+  return propBool(PROP_PRECHECK, true);
+}
+
+/*
+ * Licence SKU chosen by PART NUMBER (e.g. 'O365_BUSINESS_ESSENTIALS',
+ * 'SPB', 'EXCHANGESTANDARD') — never a hardcoded GUID, because SKU GUIDs are
+ * tenant-agnostic but opaque and the part number is what the M365 admin centre
+ * and `GET /subscribedSkus` both show. Property wins; env is the bootstrap
+ * fallback for a host whose property row is still empty.
+ */
+function configuredSkuPartNumber() {
+  const fromProp = String(getProperty(PROP_SKU) ?? '').trim();
+  if (fromProp) return fromProp;
+  return String(process.env.MS_GRAPH_LICENSE_SKU_PART_NUMBER || '').trim();
+}
+
+/*
+ * Domains this tenant actually owns. Two jobs:
+ *   1. we refuse to create an account for an address we don't control;
+ *   2. the OTP pre-check only runs for these domains — a personal address
+ *      (gmail.com, and there are real CRM users on those) will ALWAYS 404 in
+ *      our directory, and suppressing their OTP email would lock them out.
+ */
+function managedDomains() {
+  const raw = String(getProperty(PROP_DOMAINS) ?? '').trim()
+    || String(process.env.MS_GRAPH_MANAGED_DOMAINS || '').trim()
+    || 'easyfix.in';
+  return raw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+}
+
+function isManagedDomain(address, domains = managedDomains()) {
+  const at = String(address || '').lastIndexOf('@');
+  if (at < 0) return false;
+  const dom = String(address).slice(at + 1).trim().toLowerCase();
+  return domains.includes(dom);
+}
+
+// Entra requires a usageLocation (ISO-3166 alpha-2) before some SKUs can be
+// assigned; assignLicense fails outright without it. Set at create time.
+function usageLocation() {
+  return String(process.env.MS_GRAPH_USAGE_LOCATION || 'IN').trim().toUpperCase();
+}
+
+// ── Status vocabularies (mirrored in the migration comment) ───────────────
+
+const ACCOUNT_STATUS = Object.freeze({
+  SKIPPED_DISABLED:   'skipped_disabled',      // feature flag off
+  SKIPPED_NOT_ALLOWED:'skipped_not_allowed',   // actor is not on the per-person allowlist
+  SKIPPED_DOMAIN:     'skipped_domain',        // email not in a managed domain
+  SKIPPED_INVALID:    'skipped_invalid_email', // unusable official_email
+  CREATED:            'created',
+  ALREADY_EXISTS:     'already_exists',
+  FAILED:             'failed',
+});
+
+const LICENCE_STATUS = Object.freeze({
+  NOT_ATTEMPTED:      'not_attempted',   // no account to licence
+  SKIPPED:            'skipped',         // provisioning skipped entirely
+  NO_SKU_CONFIGURED:  'no_sku_configured',
+  SKU_NOT_FOUND:      'sku_not_found',
+  SKU_NOT_ACTIVE:     'sku_not_active',
+  NO_SEATS:           'no_seats_available',
+  ALREADY_LICENSED:   'already_licensed',
+  ASSIGNED:           'assigned',
+  FAILED:             'failed',
+});
+
+// A mailbox only exists once BOTH steps landed.
+function mailboxLikelyExists(accountStatus, licenceStatus) {
+  const accountOk = accountStatus === ACCOUNT_STATUS.CREATED || accountStatus === ACCOUNT_STATUS.ALREADY_EXISTS;
+  const licenceOk = licenceStatus === LICENCE_STATUS.ASSIGNED || licenceStatus === LICENCE_STATUS.ALREADY_LICENSED;
+  return accountOk && licenceOk;
+}
+
+/*
+ * Does this Graph user object actually have a MAILBOX behind it?
+ *
+ * "A directory object exists" and "a mailbox exists" are NOT the same claim —
+ * that gap is the whole reason this file exists (see the header). An Entra user
+ * created without a licence is a perfectly valid object with `mail: null` and no
+ * SMTP proxy address, because Exchange Online never provisioned anything for it.
+ * So the object's presence alone must never be read as "email is a live
+ * channel"; we have to look at the mail-enabled attributes we already $select.
+ *
+ * Two signals, either is sufficient:
+ *   mail            the primary SMTP address Exchange stamped on the object;
+ *   proxyAddresses  contains 'SMTP:primary@…' / 'smtp:alias@…' entries for any
+ *                   mail-enabled object, including hybrid/on-prem-synced ones
+ *                   whose `mail` can lag or be unset.
+ * Requiring BOTH to be empty before we doubt the mailbox keeps the false-negative
+ * rate down — a false "no mailbox" is the expensive direction here.
+ */
+function directoryObjectHasMailbox(user) {
+  if (!user || typeof user !== 'object') return false;
+  if (String(user.mail || '').trim()) return true;
+  const proxies = Array.isArray(user.proxyAddresses) ? user.proxyAddresses : [];
+  return proxies.some((p) => /^smtp:[^\s@]+@[^\s@]+$/i.test(String(p || '').trim()));
+}
+
+// ── Pure helpers (unit-tested; no network, no DB) ─────────────────────────
+
+/*
+ * Temp password for the new account.
+ *
+ * crypto ONLY — Math.random is not a CSPRNG and a predictable first-sign-in
+ * password on a mail-enabled account is a real takeover path.
+ *
+ * ⚠ The value is passed straight into the Graph create body and then dropped.
+ * It is NEVER logged, NEVER persisted, and NEVER returned in an API response.
+ * forceChangePasswordNextSignIn is true, so the operator resets it from the
+ * M365 admin centre if the user needs it — that is the only supported route.
+ *
+ * Shape: 20 chars, at least two each of lower/upper/digit/symbol (Entra wants
+ * 3 of 4 categories and 8–256 chars, so this clears it comfortably), from a
+ * symbol set that survives copy/paste through the admin centre and shells.
+ */
+const PW_LOWER  = 'abcdefghijkmnopqrstuvwxyz';   // no 'l'
+const PW_UPPER  = 'ABCDEFGHJKLMNPQRSTUVWXYZ';    // no 'I', no 'O'
+const PW_DIGIT  = '23456789';                    // no 0/1
+const PW_SYMBOL = '!@#$%^*()-_=+?';
+const PW_ALL    = PW_LOWER + PW_UPPER + PW_DIGIT + PW_SYMBOL;
+
+function pick(alphabet, n) {
+  let out = '';
+  for (let i = 0; i < n; i++) out += alphabet[crypto.randomInt(0, alphabet.length)];
+  return out;
+}
+
+function generateTempPassword(length = 20) {
+  const len = Math.max(16, Math.min(64, Number(length) || 20));
+  const chars = (
+    pick(PW_LOWER, 2) + pick(PW_UPPER, 2) + pick(PW_DIGIT, 2) + pick(PW_SYMBOL, 2)
+    + pick(PW_ALL, len - 8)
+  ).split('');
+  // Fisher–Yates with a CSPRNG so the guaranteed-class characters aren't
+  // pinned to the first eight positions.
+  for (let i = chars.length - 1; i > 0; i--) {
+    const j = crypto.randomInt(0, i + 1);
+    [chars[i], chars[j]] = [chars[j], chars[i]];
+  }
+  return chars.join('');
+}
+
+/*
+ * Derive the Entra identity from a CRM user's name + official_email.
+ *
+ * THE UPN IS THE EMAIL, VERBATIM. It is tempting to "clean up" the local part,
+ * but the whole point is that mail sent to tbl_user.official_email must land in
+ * this mailbox — a derived-but-different UPN would create a mailbox at an
+ * address nobody writes to, which is the bug we are fixing wearing a hat.
+ * mailNickname (the Exchange alias seed) is allowed to differ and IS sanitised.
+ *
+ *   → { ok: true, userPrincipalName, mailNickname, displayName, domain }
+ *   → { ok: false, reason, accountStatus }
+ */
+function deriveIdentity({ user_name, official_email } = {}, domains = managedDomains()) {
+  const email = String(official_email || '').trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return { ok: false, accountStatus: ACCOUNT_STATUS.SKIPPED_INVALID, reason: `official_email "${official_email || ''}" is not a usable email address` };
+  }
+  const at = email.lastIndexOf('@');
+  const local = email.slice(0, at);
+  const domain = email.slice(at + 1);
+
+  if (!domains.includes(domain)) {
+    return {
+      ok: false,
+      accountStatus: ACCOUNT_STATUS.SKIPPED_DOMAIN,
+      reason: `domain "${domain}" is not an EasyFix-managed Microsoft 365 domain (managed: ${domains.join(', ')}) — no mailbox can be created for it`,
+    };
+  }
+  // A UPN local part is narrower than an email local part: '+' and '%' are
+  // legal in SMTP but not in a UPN, so we refuse rather than silently mangle.
+  if (!/^[a-z0-9._'-]+$/.test(local)) {
+    return { ok: false, accountStatus: ACCOUNT_STATUS.SKIPPED_INVALID, reason: `local part "${local}" contains characters that are not valid in a userPrincipalName` };
+  }
+
+  const mailNickname = (local.replace(/[^a-z0-9._-]/g, '').replace(/\.{2,}/g, '.').replace(/^\.+|\.+$/g, '') || 'user').slice(0, 64);
+  const displayName = (String(user_name || '').trim().replace(/\s+/g, ' ') || local).slice(0, 256);
+
+  return { ok: true, userPrincipalName: email, mailNickname, displayName, domain };
+}
+
+/*
+ * Turn a Graph error response into something an operator can act on, and keep
+ * the correlation id — it is the first thing Microsoft support asks for.
+ *
+ *   → { status, code, reason, requestId, permissionIssue, notFound,
+ *       alreadyExists, throttled }
+ */
+function graphErrorToReason(result) {
+  const status = result && typeof result.status === 'number' ? result.status : 0;
+  // graphRequest() already lifts the correlation id out of the response headers;
+  // fall back to the body's innerError for callers handing us a raw payload
+  // (and for the endpoints that only put it there).
+  const inner = result && result.json && result.json.error && result.json.error.innerError;
+  const requestId = (result && result.requestId)
+    || (inner && (inner['request-id'] || inner.requestId || inner['client-request-id']))
+    || null;
+
+  if (result && result.networkError) {
+    return { status: 0, code: 'network', reason: `could not reach Microsoft Graph — ${result.networkError}`, requestId, permissionIssue: false, notFound: false, alreadyExists: false, throttled: false };
+  }
+
+  const err     = (result && result.json && result.json.error) || null;
+  const code    = (err && err.code) || null;
+  const message = (err && err.message) || (result && result.text ? String(result.text).slice(0, 300) : '');
+  const lower   = String(message).toLowerCase();
+
+  const permissionIssue = status === 401 || status === 403;
+  const notFound        = status === 404 || code === 'Request_ResourceNotFound';
+  const alreadyExists   = status === 409
+    || (code === 'Request_BadRequest' && /already exists|conflicting object/.test(lower))
+    || /another object with the same value for property userprincipalname/.test(lower);
+  const throttled       = status === 429;
+
+  let reason;
+  if (status === 401) {
+    reason = 'Graph rejected the token (401) — check MS_GRAPH_CLIENT_SECRET has not expired';
+  } else if (status === 403) {
+    reason = 'Graph denied the call (403) — the app registration is missing admin consent for User.ReadWrite.All / Organization.Read.All. See docs/ENTRA_PROVISIONING.md';
+  } else if (notFound) {
+    reason = 'not found in the directory (404)';
+  } else if (alreadyExists) {
+    reason = 'an object with this userPrincipalName already exists in the directory';
+  } else if (throttled) {
+    reason = 'Graph throttled the request (429) — retry shortly';
+  } else if (status >= 500) {
+    reason = `Microsoft Graph service error (${status})`;
+  } else if (message) {
+    reason = `${code ? code + ': ' : ''}${String(message).slice(0, 240)}`;
+  } else {
+    reason = `Graph call failed with HTTP ${status}`;
+  }
+
+  return { status, code, reason, requestId, permissionIssue, notFound, alreadyExists, throttled };
+}
+
+/*
+ * Idempotency decision. Called with the directory lookup result BEFORE any
+ * write, so a second click (or a retry after a partial failure) never creates a
+ * duplicate account.
+ *
+ *   found            → reuse it (already_exists), then check the licence
+ *   definitely gone  → create
+ *   can't tell       → ABORT. Creating while blind is how you end up with two
+ *                      accounts; and if the lookup 403s the create would 403
+ *                      too, so aborting loses nothing and reports a clean
+ *                      reason the operator can fix.
+ */
+function decideAccountAction(lookup) {
+  if (lookup && lookup.found) {
+    return { action: 'reuse', accountStatus: ACCOUNT_STATUS.ALREADY_EXISTS, entraObjectId: lookup.user && lookup.user.id };
+  }
+  if (lookup && lookup.status === 'missing') {
+    return { action: 'create' };
+  }
+  return {
+    action: 'abort',
+    accountStatus: ACCOUNT_STATUS.FAILED,
+    reason: (lookup && lookup.reason) || 'directory lookup did not return a definitive answer',
+  };
+}
+
+/*
+ * Choose a licence SKU from GET /subscribedSkus by part number, and refuse to
+ * pretend when there is nothing to assign. Every negative outcome carries the
+ * PRECISE reason, because "licence failed" is what made the original bug
+ * undiagnosable.
+ */
+function pickSku(skus, wantedPartNumber) {
+  const wanted = String(wantedPartNumber || '').trim();
+  if (!wanted) {
+    return { ok: false, status: LICENCE_STATUS.NO_SKU_CONFIGURED, reason: `no licence SKU configured — set easyfix_properties["${PROP_SKU}"] (or MS_GRAPH_LICENSE_SKU_PART_NUMBER) to a skuPartNumber from GET /subscribedSkus` };
+  }
+  const list = Array.isArray(skus) ? skus : [];
+  const match = list.find((s) => String(s && s.skuPartNumber || '').trim().toLowerCase() === wanted.toLowerCase());
+  if (!match) {
+    return {
+      ok: false,
+      status: LICENCE_STATUS.SKU_NOT_FOUND,
+      reason: `skuPartNumber "${wanted}" is not present on this tenant’s subscriptions${list.length ? ` (available: ${list.map((s) => s.skuPartNumber).filter(Boolean).join(', ')})` : ' (tenant returned no subscribed SKUs)'}`,
+    };
+  }
+  const capability = String(match.capabilityStatus || '').trim();
+  if (capability && capability !== 'Enabled' && capability !== 'Warning') {
+    return { ok: false, status: LICENCE_STATUS.SKU_NOT_ACTIVE, reason: `SKU "${match.skuPartNumber}" is ${capability}, not Enabled — it cannot be assigned`, skuPartNumber: match.skuPartNumber };
+  }
+  const enabled  = Number(match.prepaidUnits && match.prepaidUnits.enabled) || 0;
+  const consumed = Number(match.consumedUnits) || 0;
+  const seats    = enabled - consumed;
+  if (seats <= 0) {
+    return { ok: false, status: LICENCE_STATUS.NO_SEATS, reason: `SKU "${match.skuPartNumber}" has no free seats (${consumed}/${enabled} used) — buy or free a seat, then retry`, skuPartNumber: match.skuPartNumber, seats };
+  }
+  return { ok: true, skuId: match.skuId, skuPartNumber: match.skuPartNumber, seats };
+}
+
+// ── Graph calls ───────────────────────────────────────────────────────────
+
+/*
+ * GET /v1.0/users/{upn} — the directory existence check. ALSO used by the OTP
+ * mailbox pre-check, hence the shared implementation.
+ *
+ *   → { found: true, status: 'found', user }
+ *   → { found: false, status: 'missing' }               definitive 404
+ *   → { found: false, status: 'unknown', reason, … }    anything else
+ *
+ * The alias fallback matters: GET /users/{address} matches only
+ * userPrincipalName or id, so a mailbox reachable at a secondary SMTP address
+ * 404s on the direct lookup. We therefore re-ask with a `mail` filter before
+ * concluding "no such mailbox" — a false 'missing' would suppress a working
+ * OTP channel.
+ */
+async function findByUpn(upn, { select = 'id,mail,userPrincipalName,accountEnabled,proxyAddresses' } = {}) {
+  const address = String(upn || '').trim().toLowerCase();
+  if (!address) return { found: false, status: 'unknown', reason: 'no address supplied' };
+
+  // $select is a fixed, code-controlled field list — left UNENCODED so the
+  // commas reach OData as separators (a %2C is not universally decoded before
+  // the $select parser sees it). The address IS encoded: it is data.
+  const direct = await graphRequest(`/users/${encodeURIComponent(address)}?$select=${select}`);
+  if (direct.ok && direct.json && direct.json.id) {
+    return { found: true, status: 'found', user: direct.json, requestId: direct.requestId };
+  }
+  const err = graphErrorToReason(direct);
+  if (!err.notFound) {
+    return { found: false, status: 'unknown', reason: err.reason, permissionIssue: err.permissionIssue, httpStatus: err.status, requestId: err.requestId };
+  }
+
+  // 404 on the direct lookup → could still be an alias. `$filter=mail eq …`
+  // needs no advanced-query headers and works with User.Read.All.
+  const quoted = address.replace(/'/g, "''");
+  const byMail = await graphRequest(`/users?$filter=${encodeURIComponent(`mail eq '${quoted}'`)}&$select=${select}&$top=1`);
+  if (byMail.ok && byMail.json && Array.isArray(byMail.json.value) && byMail.json.value.length) {
+    return { found: true, status: 'found', user: byMail.json.value[0], matchedBy: 'mail', requestId: byMail.requestId };
+  }
+  if (!byMail.ok) {
+    const e2 = graphErrorToReason(byMail);
+    // The direct call already gave a clean 404; if the alias probe failed for
+    // an unrelated reason we must NOT upgrade that to a definitive "missing".
+    return { found: false, status: 'unknown', reason: `direct lookup returned 404 but the alias probe failed — ${e2.reason}`, permissionIssue: e2.permissionIssue, httpStatus: e2.status, requestId: e2.requestId };
+  }
+  return { found: false, status: 'missing', reason: 'no directory object with this userPrincipalName or mail address', requestId: direct.requestId };
+}
+
+async function listSubscribedSkus() {
+  const res = await graphRequest('/subscribedSkus?$select=skuId,skuPartNumber,capabilityStatus,consumedUnits,prepaidUnits');
+  if (res.ok && res.json && Array.isArray(res.json.value)) return { ok: true, skus: res.json.value };
+  const err = graphErrorToReason(res);
+  return { ok: false, reason: err.reason, requestId: err.requestId, permissionIssue: err.permissionIssue };
+}
+
+/*
+ * POST /v1.0/users — create the directory account.
+ * ⚠ `password` is inside `body` and must never reach a log line or a response.
+ */
+async function createEntraUser({ userPrincipalName, displayName, mailNickname }) {
+  const body = {
+    accountEnabled: true,
+    displayName,
+    mailNickname,
+    userPrincipalName,
+    usageLocation: usageLocation(),
+    passwordProfile: {
+      forceChangePasswordNextSignIn: true,
+      password: generateTempPassword(),
+    },
+  };
+  const res = await graphRequest('/users', { method: 'POST', body });
+  if (res.ok && res.json && res.json.id) {
+    // Deliberately logs the UPN and NOTHING from passwordProfile.
+    logger.info('Entra account created · upn=' + userPrincipalName + ' · objectId=' + res.json.id);
+    return { ok: true, id: res.json.id, requestId: res.requestId };
+  }
+  const err = graphErrorToReason(res);
+  return { ok: false, ...err };
+}
+
+async function assignLicense(objectId, skuId) {
+  const res = await graphRequest(`/users/${encodeURIComponent(objectId)}/assignLicense`, {
+    method: 'POST',
+    body: { addLicenses: [{ skuId, disabledPlans: [] }], removeLicenses: [] },
+  });
+  if (res.ok) return { ok: true, requestId: res.requestId };
+  const err = graphErrorToReason(res);
+  return { ok: false, ...err };
+}
+
+// ── OTP mailbox pre-check (Job 1b) ────────────────────────────────────────
+
+/*
+ * Short-TTL in-process cache so the login path doesn't add a Graph round-trip
+ * per OTP. Positive answers are stable, so they live longer; negative and
+ * unknown answers expire fast, so a mailbox created a minute ago starts being
+ * used almost immediately and a transient outage doesn't stick.
+ */
+const EXISTS_TTL_MS  = 10 * 60 * 1000;
+const NEGATIVE_TTL_MS = 60 * 1000;
+const MAX_CACHE_ENTRIES = 500;
+const _mailboxCache = new Map(); // address → { at, status, reason }
+
+function _cacheGet(address) {
+  const hit = _mailboxCache.get(address);
+  if (!hit) return null;
+  const ttl = hit.status === 'exists' ? EXISTS_TTL_MS : NEGATIVE_TTL_MS;
+  if (Date.now() - hit.at > ttl) { _mailboxCache.delete(address); return null; }
+  return hit;
+}
+
+function _cacheSet(address, status, reason) {
+  if (_mailboxCache.size >= MAX_CACHE_ENTRIES) {
+    // Cheap bounded eviction — drop the oldest inserted key.
+    const oldest = _mailboxCache.keys().next().value;
+    if (oldest !== undefined) _mailboxCache.delete(oldest);
+  }
+  _mailboxCache.set(address, { at: Date.now(), status, reason });
+}
+
+function clearMailboxCache() { _mailboxCache.clear(); }
+
+/**
+ * Is there a mailbox behind this address?
+ *
+ *   { status: 'exists'     } → a MAIL-ENABLED directory object (see
+ *                              directoryObjectHasMailbox); email is a real channel
+ *   { status: 'no_mailbox' } → the directory object EXISTS but carries no mail
+ *                              address and no SMTP proxy address. This is the
+ *                              "account created, licence never assigned" state
+ *                              the header describes — an object, no mailbox. It
+ *                              does NOT suppress the send (the attributes can lag
+ *                              a freshly licensed account), but the caller must
+ *                              not count the send as a delivered channel, so the
+ *                              WhatsApp/SMS fallback still runs.
+ *   { status: 'missing'    } → clean 404 in a domain we own. The ONLY value that
+ *                              suppresses the email channel outright.
+ *   { status: 'unknown'    } → 401/403/429/5xx/timeout. FAIL OPEN: behave exactly
+ *                              as before this check existed and attempt the email.
+ *   { status: 'skipped'    } → check disabled, or the address is outside our
+ *                              managed domains (personal Gmail etc.), so the
+ *                              directory can say nothing useful about it.
+ *
+ * The fail-open-on-permission-errors rule is load-bearing: User.Read.All comes
+ * with the User.ReadWrite.All consent that provisioning needs, and until an
+ * admin grants it every call here answers 403. Treating that as "no mailbox"
+ * would block OTP email for EVERY user the moment this shipped.
+ */
+async function mailboxExists(address) {
+  const addr = String(address || '').trim().toLowerCase();
+  if (!addr) return { status: 'skipped', reason: 'no address' };
+  if (!mailboxPrecheckEnabled()) return { status: 'skipped', reason: 'pre-check disabled (' + PROP_PRECHECK + '=false)' };
+  if (!isManagedDomain(addr)) {
+    return { status: 'skipped', reason: 'address is outside the EasyFix-managed domains — the directory cannot confirm or deny it' };
+  }
+
+  const cached = _cacheGet(addr);
+  if (cached) return { status: cached.status, reason: cached.reason, cached: true };
+
+  const lookup = await findByUpn(addr);
+  let out;
+  if (lookup.found) {
+    /*
+     * FOUND ≠ HAS A MAILBOX. Reading `found` as 'exists' is exactly the bug this
+     * whole feature was written to catch: a partially provisioned user (POST
+     * /users succeeded, the licence step did not) would pass the pre-check, the
+     * OTP email would be 202-accepted into a void and the fallback would never
+     * fire. Consult the mail-enabled attributes findByUpn already fetched.
+     */
+    out = directoryObjectHasMailbox(lookup.user)
+      ? { status: 'exists', reason: 'mail-enabled directory object found' }
+      : {
+        status: 'no_mailbox',
+        reason: 'directory object exists but has no mail address and no SMTP proxy address '
+          + '— the account is almost certainly unlicensed, so Exchange Online never provisioned a mailbox',
+      };
+  } else if (lookup.status === 'missing') {
+    out = { status: 'missing', reason: lookup.reason || 'no such mailbox in the directory' };
+  } else {
+    out = { status: 'unknown', reason: lookup.reason || 'lookup inconclusive', permissionIssue: !!lookup.permissionIssue };
+  }
+  _cacheSet(addr, out.status, out.reason);
+  return out;
+}
+
+// ── Persistence (tbl_user_entra_provisioning) ─────────────────────────────
+
+// COALESCE(?, col) only guards NULL — '' would overwrite. Normalise first.
+const nz = (v) => {
+  const s = v === undefined || v === null ? '' : String(v).trim();
+  return s === '' ? null : s;
+};
+
+/*
+ * Upsert the one row per CRM user. ALWAYS called — including for
+ * 'skipped: feature disabled' — because the whole point is that a missing
+ * mailbox must be discoverable instead of silent.
+ *
+ * DATETIME columns are bound as `new Date()` (the pool runs at +05:30, so the
+ * IST wall-clock is stored verbatim). Never SQL NOW() for application stamps.
+ *
+ * Fail-soft: a host that hasn't run the migration yet must still be able to
+ * create users, so a missing table logs a warn and returns false.
+ */
+async function recordProvisioning({
+  userId, userPrincipalName, entraObjectId, accountStatus, licenceStatus,
+  skuPartNumber, lastError, graphRequestId, countAttempt = false,
+}) {
+  const now = new Date();
+  try {
+    await pool.query(
+      `INSERT INTO tbl_user_entra_provisioning
+         (user_id, user_principal_name, entra_object_id, account_status, licence_status,
+          sku_part_number, last_error, graph_request_id, attempts, created_on, updated_on)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         user_principal_name = VALUES(user_principal_name),
+         entra_object_id     = COALESCE(VALUES(entra_object_id), entra_object_id),
+         account_status      = VALUES(account_status),
+         licence_status      = VALUES(licence_status),
+         sku_part_number     = COALESCE(VALUES(sku_part_number), sku_part_number),
+         last_error          = VALUES(last_error),
+         graph_request_id    = VALUES(graph_request_id),
+         attempts            = attempts + VALUES(attempts),
+         updated_on          = VALUES(updated_on)`,
+      [
+        Number(userId), nz(userPrincipalName), nz(entraObjectId),
+        String(accountStatus), String(licenceStatus),
+        nz(skuPartNumber), nz(lastError) ? String(lastError).slice(0, 500) : null, nz(graphRequestId),
+        countAttempt ? 1 : 0, now, now,
+      ],
+    );
+    return true;
+  } catch (e) {
+    logger.warn('Could not record Entra provisioning outcome · userId=' + userId + ' · ' + (e.code || e.message)
+      + ' — has migrations/2026-07-30-create-tbl-user-entra-provisioning.sql been applied?');
+    return false;
+  }
+}
+
+/** Current recorded provisioning state for a CRM user (null when never run). */
+async function getProvisioning(userId) {
+  try {
+    const [[row]] = await pool.query(
+      `SELECT id, user_id, user_principal_name, entra_object_id, account_status,
+              licence_status, sku_part_number, last_error, graph_request_id,
+              attempts, created_on, updated_on
+         FROM tbl_user_entra_provisioning
+        WHERE user_id = ?
+        LIMIT 1`,
+      [Number(userId)],
+    );
+    if (!row) return null;
+    row.mailbox_ready = mailboxLikelyExists(row.account_status, row.licence_status);
+    return row;
+  } catch (e) {
+    logger.warn('Could not read Entra provisioning state · userId=' + userId + ' · ' + (e.code || e.message));
+    return null;
+  }
+}
+
+// ── Orchestrator ──────────────────────────────────────────────────────────
+
+/**
+ * Provision (or repair) the Microsoft 365 mailbox for one CRM user.
+ *
+ * NEVER throws and NEVER participates in the caller's transaction — CRM user
+ * creation must succeed whether or not Azure is reachable. The return value is
+ * the outcome, and the same outcome is persisted.
+ *
+ * @param {Object}  args
+ * @param {number}  args.userId          tbl_user.user_id
+ * @param {string}  args.userName        tbl_user.user_name  (→ displayName)
+ * @param {string}  args.officialEmail   tbl_user.official_email (→ UPN)
+ * @param {string} [args.trigger]        'create-user' | 'admin-retry' (logs only)
+ * @param {number} [args.actorId]        who triggered it (logs only)
+ * @param {boolean} [args.actorAllowed]  is the ACTOR on the per-person
+ *        `access.entraprovision.emails` allowlist? A directory write spends a
+ *        licence seat, so the same person-level gate that guards the repair
+ *        endpoint has to guard every other entry point too — otherwise the
+ *        allowlist is decoration and Add User is an unlimited seat drain.
+ *        Defaults true because the repair route is already allowlist-gated by
+ *        middleware; every OTHER caller must pass the resolved value.
+ */
+async function provisionUserMailbox({
+  userId, userName, officialEmail, trigger = 'create-user', actorId, actorAllowed = true,
+} = {}) {
+  const base = {
+    userId: Number(userId),
+    trigger,
+    userPrincipalName: String(officialEmail || '').trim().toLowerCase() || null,
+    entraObjectId: null,
+    skuPartNumber: null,
+    graphRequestId: null,
+  };
+
+  // 0 ── PER-PERSON GATE. Creating an enabled, mail-enabled directory account
+  //      and consuming a purchased licence seat is the same privileged act no
+  //      matter which route reached us, so it needs the same
+  //      `access.entraprovision.emails` allowlist the repair endpoint enforces.
+  //      Recorded (not silent) so an operator can see why nothing was tried.
+  if (actorAllowed === false) {
+    const reason = 'mailbox provisioning not attempted — the acting user is not on the '
+      + `easyfix_properties["${FEATURES.canProvisionMailboxes}"] allowlist. `
+      + 'Ask an allowlisted operator to run POST /api/admin/users/:userId/provision-mailbox.';
+    const outcome = {
+      ...base,
+      attempted: false,
+      accountStatus: ACCOUNT_STATUS.SKIPPED_NOT_ALLOWED,
+      licenceStatus: LICENCE_STATUS.SKIPPED,
+      mailboxReady: false,
+      reason,
+    };
+    logger.warn('Entra provisioning skipped (actor not allowlisted) · userId=' + userId
+      + ' · trigger=' + trigger + (actorId ? ' · actorId=' + actorId : ''));
+    await recordProvisioning({ ...outcome, lastError: reason });
+    return outcome;
+  }
+
+  // 1 ── FAIL-CLOSED GATE. Recorded, not silent: an operator looking at the
+  //      row must be able to tell "nobody tried" from "it failed".
+  if (!provisioningEnabled()) {
+    const outcome = {
+      ...base,
+      attempted: false,
+      accountStatus: ACCOUNT_STATUS.SKIPPED_DISABLED,
+      licenceStatus: LICENCE_STATUS.SKIPPED,
+      mailboxReady: false,
+      reason: `mailbox provisioning is off — set easyfix_properties["${PROP_ENABLED}"] = 'true' to enable it`,
+    };
+    logger.info('Entra provisioning skipped (feature off) · userId=' + userId + ' · trigger=' + trigger);
+    await recordProvisioning({ ...outcome, lastError: outcome.reason });
+    return outcome;
+  }
+
+  // 2 ── Identity. Refuses addresses we cannot own a mailbox for.
+  const ident = deriveIdentity({ user_name: userName, official_email: officialEmail });
+  if (!ident.ok) {
+    const outcome = {
+      ...base,
+      attempted: false,
+      accountStatus: ident.accountStatus,
+      licenceStatus: LICENCE_STATUS.NOT_ATTEMPTED,
+      mailboxReady: false,
+      reason: ident.reason,
+    };
+    logger.warn('Entra provisioning not possible · userId=' + userId + ' · ' + ident.reason);
+    await recordProvisioning({ ...outcome, lastError: ident.reason });
+    return outcome;
+  }
+  base.userPrincipalName = ident.userPrincipalName;
+
+  logger.info('Entra provisioning start · userId=' + userId + ' · upn=' + ident.userPrincipalName
+    + ' · trigger=' + trigger + (actorId ? ' · actorId=' + actorId : ''));
+
+  // 3 ── IDEMPOTENCY: look before you leap. Also pulls assignedLicenses so a
+  //      re-run on an already-licensed account is a no-op.
+  const lookup = await findByUpn(ident.userPrincipalName, {
+    select: 'id,mail,userPrincipalName,accountEnabled,assignedLicenses',
+  });
+  const decision = decideAccountAction(lookup);
+
+  let accountStatus;
+  let entraObjectId = null;
+  let graphRequestId = lookup.requestId || null;
+  let accountError = null;
+
+  if (decision.action === 'abort') {
+    const outcome = {
+      ...base,
+      attempted: true,
+      accountStatus: ACCOUNT_STATUS.FAILED,
+      licenceStatus: LICENCE_STATUS.NOT_ATTEMPTED,
+      mailboxReady: false,
+      reason: `directory lookup failed, refusing to create blind — ${decision.reason}`,
+      graphRequestId,
+    };
+    logger.error('Entra provisioning aborted · userId=' + userId + ' · ' + outcome.reason);
+    await recordProvisioning({ ...outcome, lastError: outcome.reason, countAttempt: true });
+    return outcome;
+  }
+
+  if (decision.action === 'reuse') {
+    accountStatus = ACCOUNT_STATUS.ALREADY_EXISTS;
+    entraObjectId = decision.entraObjectId || null;
+    logger.info('Entra account already exists — not creating a second one · upn=' + ident.userPrincipalName);
+  } else {
+    const created = await createEntraUser(ident);
+    if (created.ok) {
+      accountStatus = ACCOUNT_STATUS.CREATED;
+      entraObjectId = created.id;
+      graphRequestId = created.requestId || graphRequestId;
+    } else if (created.alreadyExists) {
+      // Lost a race (or an alias we couldn't see). Re-resolve rather than fail.
+      const again = await findByUpn(ident.userPrincipalName, { select: 'id,mail,userPrincipalName,assignedLicenses' });
+      accountStatus = again.found ? ACCOUNT_STATUS.ALREADY_EXISTS : ACCOUNT_STATUS.FAILED;
+      entraObjectId = again.found ? again.user.id : null;
+      accountError = again.found ? null : created.reason;
+      graphRequestId = created.requestId || graphRequestId;
+    } else {
+      accountStatus = ACCOUNT_STATUS.FAILED;
+      accountError = created.reason;
+      graphRequestId = created.requestId || graphRequestId;
+    }
+  }
+
+  if (accountStatus === ACCOUNT_STATUS.FAILED || !entraObjectId) {
+    const reason = accountError || 'account creation did not return a directory object id';
+    const outcome = {
+      ...base,
+      attempted: true,
+      accountStatus: ACCOUNT_STATUS.FAILED,
+      licenceStatus: LICENCE_STATUS.NOT_ATTEMPTED,
+      mailboxReady: false,
+      reason,
+      graphRequestId,
+    };
+    logger.error('Entra account step failed · userId=' + userId + ' · upn=' + ident.userPrincipalName + ' · ' + reason);
+    await recordProvisioning({ ...outcome, lastError: reason, countAttempt: true });
+    return outcome;
+  }
+  base.entraObjectId = entraObjectId;
+
+  // 4 ── LICENCE — a SEPARATE outcome. Without it the account exists in the
+  //      directory and NO mailbox is ever provisioned in Exchange Online.
+  const wanted = configuredSkuPartNumber();
+  const alreadyHeld = (lookup.found && lookup.user && Array.isArray(lookup.user.assignedLicenses))
+    ? lookup.user.assignedLicenses.map((l) => String(l && l.skuId || '').toLowerCase())
+    : [];
+
+  let licenceStatus = LICENCE_STATUS.NOT_ATTEMPTED;
+  let licenceReason = null;
+  let skuPartNumber = null;
+
+  if (!wanted) {
+    const p = pickSku([], '');
+    licenceStatus = p.status;
+    licenceReason = p.reason;
+  } else {
+    const skuList = await listSubscribedSkus();
+    if (!skuList.ok) {
+      licenceStatus = LICENCE_STATUS.FAILED;
+      licenceReason = `could not read subscribed SKUs — ${skuList.reason}`;
+      graphRequestId = skuList.requestId || graphRequestId;
+    } else {
+      const chosen = pickSku(skuList.skus, wanted);
+      skuPartNumber = chosen.skuPartNumber || wanted;
+      if (!chosen.ok) {
+        licenceStatus = chosen.status;
+        licenceReason = chosen.reason;
+      } else if (alreadyHeld.includes(String(chosen.skuId).toLowerCase())) {
+        licenceStatus = LICENCE_STATUS.ALREADY_LICENSED;
+        licenceReason = `already holds ${chosen.skuPartNumber}`;
+      } else {
+        const assigned = await assignLicense(entraObjectId, chosen.skuId);
+        graphRequestId = assigned.requestId || graphRequestId;
+        if (assigned.ok) {
+          licenceStatus = LICENCE_STATUS.ASSIGNED;
+          logger.info('Entra licence assigned · upn=' + ident.userPrincipalName + ' · sku=' + chosen.skuPartNumber);
+        } else {
+          licenceStatus = LICENCE_STATUS.FAILED;
+          licenceReason = `licence assignment failed — ${assigned.reason}`;
+        }
+      }
+    }
+  }
+
+  const mailboxReady = mailboxLikelyExists(accountStatus, licenceStatus);
+  const outcome = {
+    ...base,
+    attempted: true,
+    accountStatus,
+    licenceStatus,
+    skuPartNumber,
+    mailboxReady,
+    graphRequestId,
+    reason: licenceReason || (mailboxReady ? 'account and licence in place' : null),
+  };
+
+  if (mailboxReady) {
+    logger.info('Entra provisioning complete · userId=' + userId + ' · upn=' + ident.userPrincipalName
+      + ' · account=' + accountStatus + ' · licence=' + licenceStatus);
+  } else {
+    // The exact state that produced the reported bug: directory account, no
+    // mailbox. Warn loudly with the address so ops can find it.
+    logger.warn('Entra provisioning INCOMPLETE — account without a mailbox · userId=' + userId
+      + ' · upn=' + ident.userPrincipalName + ' · account=' + accountStatus + ' · licence=' + licenceStatus
+      + (licenceReason ? ' · ' + licenceReason : '')
+      + (graphRequestId ? ' · graph-request-id=' + graphRequestId : ''));
+  }
+
+  // A freshly provisioned (or repaired) mailbox must not stay negatively
+  // cached in the OTP pre-check.
+  _mailboxCache.delete(ident.userPrincipalName);
+
+  await recordProvisioning({ ...outcome, lastError: licenceReason || accountError, countAttempt: true });
+  return outcome;
+}
+
+module.exports = {
+  // orchestrator + persistence
+  provisionUserMailbox,
+  getProvisioning,
+  recordProvisioning,
+  // OTP pre-check
+  mailboxExists,
+  clearMailboxCache,
+  // graph calls
+  findByUpn,
+  createEntraUser,
+  assignLicense,
+  listSubscribedSkus,
+  // pure helpers (unit-tested)
+  generateTempPassword,
+  deriveIdentity,
+  graphErrorToReason,
+  decideAccountAction,
+  pickSku,
+  isManagedDomain,
+  mailboxLikelyExists,
+  directoryObjectHasMailbox,
+  // config readers
+  provisioningEnabled,
+  mailboxPrecheckEnabled,
+  configuredSkuPartNumber,
+  managedDomains,
+  // vocabularies + property keys
+  ACCOUNT_STATUS,
+  LICENCE_STATUS,
+  PROP_ENABLED,
+  PROP_SKU,
+  PROP_DOMAINS,
+  PROP_PRECHECK,
+};

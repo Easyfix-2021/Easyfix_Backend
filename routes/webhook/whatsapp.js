@@ -45,9 +45,22 @@ function normaliseInbound(body) {
   const rawType = (p.type || wa.type || '').toString().toLowerCase();
 
   // Interactive button reply — id is the stable thing we keyed our buttons on.
+  //
+  // TEMPLATE quick replies (the `customer_interactive_msg` confirm/reschedule/
+  // not-required buttons) are matched by Gallabox/Meta on the PAYLOAD string, and
+  // different envelope shapes surface it as `payload`, `id` or the button
+  // `title`/`text`. Probe all of them — whatsapp-conversation.service's
+  // matchTemplateChoice() normalises case/whitespace and also accepts the raw
+  // text, so any of these resolves to the right branch.
   const interactive = p.interactive || wa.interactive || null;
   const buttonReply = interactive?.button_reply || interactive?.reply || p.button || null;
-  const buttonId = buttonReply?.id || p.buttonId || p.payload?.id || null;
+  const buttonId = buttonReply?.id
+    || buttonReply?.payload
+    || buttonReply?.title
+    || buttonReply?.text
+    || p.buttonId
+    || p.payload?.id
+    || null;
 
   // Location
   const loc = p.location || wa.location || null;

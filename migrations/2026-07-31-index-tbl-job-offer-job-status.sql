@@ -1,0 +1,40 @@
+-- ─────────────────────────────────────────────────────────────────────
+-- 2026-07-31 — tbl_job_offer(job_id, offer_status) covering index
+--
+-- WHAT: one composite secondary index on (job_id, offer_status).
+--
+-- WHY: the Pending-for-Scheduling offer SUB-STATE (services/job.service.js,
+-- the canonical docblock above offerColumns) is answered ENTIRELY by correlated
+-- EXISTS / COUNT subqueries whose leading predicate is exactly
+--     job_id = <the outer job>  AND  offer_status = <a code>
+-- Every fragment has that shape — the row chip's projection columns
+-- (is_offered / offered_count / expired_offer_count / total_offer_count /
+-- offer_state), the `offerState` list filter ('pending' / 'offered' /
+-- 'expired'), and the latest-row-per-technician probe. Correlated subqueries
+-- are deliberate: a JOIN onto the list would fan out the rows and inflate the
+-- paginated COUNT. The cost of that choice is that the subqueries run once per
+-- listed row, so the (job_id, offer_status) lookup must be an index seek, not a
+-- scan of every offer row on the job.
+--
+-- tbl_job_offer today has idx_job_offer_job (job_id) — a PREFIX of this index,
+-- so it filters on job_id and then evaluates offer_status row by row. This
+-- index makes offer_status part of the seek and, because both columns are in
+-- the index, lets the EXISTS terms be answered from the index alone.
+-- idx_job_offer_job therefore becomes redundant; dropping it is left to the DBA
+-- as a separate call rather than bundled into a read-path fix.
+--
+-- NOTE for whoever tunes this next: the sub-state predicate also reads
+-- offered_at (an offer counts as OPEN only while
+-- offer_status = 0 AND offered_at >= NOW() - INTERVAL 30 MINUTE, because expiry
+-- is a batch cron and the stored status can lag the truth). offered_at is
+-- evaluated as an in-row filter after this index range. Extending this index to
+-- (job_id, offer_status, offered_at) would fold that in too, but it is NOT
+-- included here — this migration stays the minimal, obviously-safe change.
+--
+-- tbl_job_offer is EasyFix-owned (referenced by NO legacy service), so adding
+-- an index here is within the schema rules. Non-destructive and online-safe:
+-- no column added, dropped or altered; existing reads/writes are unaffected;
+-- the only cost is a small write-amplification on offer INSERT/UPDATE.
+-- ─────────────────────────────────────────────────────────────────────
+
+ALTER TABLE tbl_job_offer ADD INDEX idx_job_offer_job_status (job_id, offer_status);

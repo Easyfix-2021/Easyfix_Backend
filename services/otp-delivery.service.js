@@ -9,6 +9,9 @@ const whatsappService =
     : require('./gallabox.whatsapp.service');
 const smsTemplate = require('./sms-template.service');
 const { getProperty } = require('./properties.service');
+// Read-only mailbox-existence probe (Microsoft Graph). See tryEmail() below for
+// why an email "send" alone is not evidence the user can receive anything.
+const { mailboxExists } = require('./entra-provisioning.service');
 
 /*
  * OTP delivery with channel-preference fallback.
@@ -20,8 +23,13 @@ const { getProperty } = require('./properties.service');
  *       2. On failure, fall back to the OTHER channel. The property reorders the
  *          two; it never removes one, so no setting can strand a user.
  *   - If the user logged in WITH AN EMAIL:
- *       1. Try Email first (Gmail SMTP).
- *       2. On failure, fall back to WhatsApp (if user has a mobile on file).
+ *       0. FIRST confirm a mailbox actually exists for that address (read-only
+ *          Microsoft Graph probe, cached, fail-open — see tryEmail below). A
+ *          Graph 202 is only "queued", never proof of receipt, so without this
+ *          an address with no mailbox reported success and starved the fallback.
+ *       1. Try Email.
+ *       2. On failure/suppression, fall back to WhatsApp (if user has a mobile
+ *          on file).
  *
  * Any failure = provider returned delivered:false OR threw. Each hop's outcome
  * is logged so ops can see "WA failed → fell back to SMS → OK" in one glance.
@@ -212,10 +220,106 @@ async function trySms({ mobile, otp }) {
   } catch (e) { return { delivered: false, error: e.message }; }
 }
 
-async function tryEmail({ email, otp }) {
-  if (!email) return { delivered: false, skipped: 'no email' };
+/*
+ * EMAIL IS NOT PROOF OF REACHABILITY.
+ *
+ * Microsoft Graph answers 202 Accepted the moment it QUEUES a message and does
+ * NOT check that the recipient mailbox exists. So an OTP mailed to an address
+ * whose @easyfix.in mailbox was never created came back as
+ * `delivered: true` → this function reported success → the WhatsApp fallback
+ * below NEVER RAN → the user was silently locked out, while the bounce landed
+ * in the sender mailbox that no CRM screen reads. That is the reported bug
+ * (user_id 8710, ankitjha@easyfix.in), and it is the same class of failure the
+ * dual-channel comment further down describes for Gallabox.
+ *
+ * The fix is a cheap, cached, read-only directory probe BEFORE we count email
+ * as a channel:
+ *   'missing'  → a clean 404 in a domain WE own. The only value that suppresses
+ *                the email: we return delivered:false so the caller falls
+ *                through to WhatsApp/SMS.
+ *   'no_mailbox' → the directory object EXISTS but is not mail-enabled (no
+ *                `mail`, no SMTP proxyAddress) — "account created, licence never
+ *                assigned", the exact partial-provisioning state this feature
+ *                exists to catch. We still SEND (the attributes can lag a
+ *                just-licensed account, and suppressing on a heuristic would be
+ *                the expensive mistake) but we do NOT report it as delivered, so
+ *                the WhatsApp/SMS fallback runs regardless. Belt and braces.
+ *   'unknown'  → 401/403 (Graph permission not consented yet), 429, 5xx,
+ *                timeout. FAIL OPEN — attempt the email exactly as before this
+ *                check existed. Critical, because User.Read.All arrives with
+ *                the same consent as the provisioning permission; until an
+ *                admin grants it every probe 403s, and treating that as "no
+ *                mailbox" would block OTP email for EVERYONE.
+ *   'skipped'  → probe disabled, or the address is outside our managed domains
+ *                (personal Gmail etc., which the directory can say nothing
+ *                about). Attempt the email.
+ *
+ * Every non-'exists' path logs the EXACT address so ops can find the account.
+ */
+async function tryEmail({ email, otp, contextLabel = 'login' }) {
+  if (!email) return { delivered: false, accepted: false, skipped: 'no email' };
+
+  let probe = { status: 'skipped', reason: 'probe not run' };
+  // NOTIFICATIONS_DISABLE short-circuits the send inside email.service, so
+  // probing first would be a pointless Graph round-trip on every QA login.
+  // Mirrors email.service's own disabled() check.
+  const notificationsOff = String(process.env.NOTIFICATIONS_DISABLE).toLowerCase() === 'true';
+  /*
+   * TEST_EMAILS is email.service's OTHER pre-dispatch rewrite: it replaces the
+   * recipient list with the developer inbox just before the Graph call
+   * (email.service.js — "TEST-MODE INTERCEPTION"). So on QA/staging the address
+   * we would probe here is NOT the address that gets mailed. Probing it anyway
+   * meant a fabricated @easyfix.in test account 404'd, the send was suppressed
+   * before the redirect could fire, and email-OTP became untestable on QA. When
+   * the redirect is active the probe tells us nothing relevant — skip it.
+   */
+  const testRedirect = String(process.env.TEST_EMAILS || '').split(',').map((s) => s.trim()).filter(Boolean);
+  if (notificationsOff) {
+    probe = { status: 'skipped', reason: 'notifications disabled on this host' };
+  } else if (testRedirect.length) {
+    probe = {
+      status: 'skipped',
+      reason: `TEST_EMAILS redirects this send to ${testRedirect.join(',')} — "${email}" is never dispatched to`,
+    };
+  } else {
+    try {
+      probe = await mailboxExists(email);
+    } catch (e) {
+      // The probe must never be able to break login. Any throw = fail open.
+      probe = { status: 'unknown', reason: 'probe threw — ' + e.message };
+    }
+  }
+
+  if (probe.status === 'missing') {
+    logger.warn(`${contextLabel} OTP email SUPPRESSED — no Microsoft 365 mailbox exists for "${email}" `
+      + `(${probe.reason}). Falling back to WhatsApp/SMS. Repair with `
+      + 'POST /api/admin/users/:userId/provision-mailbox — see docs/ENTRA_PROVISIONING.md');
+    return {
+      delivered: false,
+      accepted: false,
+      mailbox: 'missing',
+      skipped: 'no mailbox for this address',
+      error: 'no Microsoft 365 mailbox exists for ' + email,
+    };
+  }
+  if (probe.status === 'unknown') {
+    logger.warn(`${contextLabel} OTP email mailbox check inconclusive for "${email}" — ${probe.reason}. `
+      + 'Attempting the email anyway (fail-open).');
+  }
+  /*
+   * Directory object present but NOT mail-enabled — the partial-provisioning
+   * state (account created, licence never assigned). We still attempt the send,
+   * but this address must NOT count as a delivered channel or the fallback is
+   * starved exactly as it was before this pre-check existed.
+   */
+  if (probe.status === 'no_mailbox') {
+    logger.warn(`${contextLabel} OTP email NOT COUNTED AS DELIVERED — "${email}" has an Entra account but no mailbox `
+      + `(${probe.reason}). Sending anyway, and falling back to WhatsApp/SMS regardless. Repair with `
+      + 'POST /api/admin/users/:userId/provision-mailbox — see docs/ENTRA_PROVISIONING.md');
+  }
+
   try {
-    return await emailService.send({
+    const res = await emailService.send({
       to: email,
       // "sign-in code" is less spam-triggering than "OTP" / "password" / "verify".
       subject: 'Your EasyFix sign-in code',
@@ -223,7 +327,23 @@ async function tryEmail({ email, otp }) {
       html: buildOtpEmailHtml(otp),
       category: 'transactional',
     });
-  } catch (e) { return { delivered: false, error: e.message }; }
+    /*
+     * `res.delivered` is email.service's backward-compatible alias for
+     * "accepted for delivery" (Graph 202 = queued). We keep returning it so the
+     * fallback ladder below is unchanged, but annotate what we actually know.
+     * When the mailbox could not be confirmed, say so with the address — this
+     * is the line ops greps when a user reports "no OTP arrived".
+     */
+    if (res.accepted && probe.status !== 'exists') {
+      logger.warn(`${contextLabel} OTP email QUEUED but delivery UNCONFIRMED · to=${email} `
+        + `· mailbox=${probe.status} (${probe.reason})`);
+    }
+    // A 202 into an account with no mailbox is not a channel. Keep `accepted`
+    // honest (Graph did accept it) and force `delivered` false so the ladder
+    // below moves on to WhatsApp/SMS.
+    const delivered = probe.status === 'no_mailbox' ? false : !!res.delivered;
+    return { ...res, delivered, mailbox: probe.status, deliveryConfirmed: false };
+  } catch (e) { return { delivered: false, accepted: false, mailbox: probe.status, error: e.message }; }
 }
 
 /**
@@ -236,6 +356,17 @@ async function tryEmail({ email, otp }) {
  * @param {string|null} args.name    — user's display name (for WA recipientName)
  * @param {number}     args.otp      — the OTP digits
  * @param {string}     args.contextLabel — 'staff' | 'spoc' | 'technician' (for logs)
+ *
+ * @returns {Promise<{attempts: Array, finalDelivered: boolean, primaryChannel: string, disabled: boolean}>}
+ *   finalDelivered — did ANY channel report success? CALLERS MUST NOT DISCARD
+ *                    THIS. A route that answers "OTP sent" while this is false
+ *                    reproduces the original bug at the UI layer: the user waits
+ *                    for a code that no channel ever carried.
+ *   disabled       — every channel was suppressed by NOTIFICATIONS_DISABLE on
+ *                    this host. finalDelivered is false, but that is a QA/dev
+ *                    configuration, NOT a delivery failure — callers should
+ *                    treat it as dispatched (the OTP is in the logs) rather than
+ *                    failing the request.
  */
 async function deliverOtp({ identifier, email, mobile, name, otp, contextLabel = 'login' }) {
   const identifierIsEmail = /@/.test(String(identifier || ''));
@@ -261,15 +392,28 @@ async function deliverOtp({ identifier, email, mobile, name, otp, contextLabel =
 
   if (identifierIsEmail) {
     // Primary: Email → Fallback: WhatsApp
-    const a1 = await tryEmail({ email, otp });
+    const a1 = await tryEmail({ email, otp, contextLabel });
     attempts.push({ channel: 'email', ...a1 });
-    logger.info(`${contextLabel} OTP email attempt: ${a1.delivered ? 'delivered' : 'failed'}${a1.error ? ` (${a1.error})` : ''}`);
-    if (a1.delivered || a1.disabled) return { attempts, finalDelivered: !!a1.delivered, primaryChannel: 'email' };
+    // Both mailbox verdicts mean "there is nothing behind this address": a clean
+    // 404 ('missing') or an account with no mailbox ('no_mailbox').
+    const noMailbox = a1.mailbox === 'missing' || a1.mailbox === 'no_mailbox';
+    // "queued" not "delivered": the strongest thing Graph tells us is that it
+    // accepted the message. `a1.mailbox` records what the pre-check knew.
+    const emailOutcome = a1.delivered
+      ? 'queued (delivery not confirmed)'
+      : (noMailbox ? 'not a usable channel — no mailbox' : 'failed');
+    logger.info(`${contextLabel} OTP email attempt: ${emailOutcome}`
+      + (a1.mailbox ? ` · mailbox=${a1.mailbox}` : '')
+      + (a1.error ? ` (${a1.error})` : ''));
+    if (a1.delivered || a1.disabled) {
+      return { attempts, finalDelivered: !!a1.delivered, primaryChannel: 'email', disabled: !!a1.disabled };
+    }
 
     const a2 = await tryWhatsApp({ mobile, name, otp });
     attempts.push({ channel: 'whatsapp', ...a2, fallback: true });
-    logger.warn(`${contextLabel} OTP email failed — falling back to WhatsApp${a2.delivered ? ' (ok)' : ` (${a2.error || 'failed'})`}`);
-    return { attempts, finalDelivered: !!a2.delivered, primaryChannel: 'email' };
+    logger.warn(`${contextLabel} OTP email ${noMailbox ? 'not usable (no mailbox)' : 'failed'}`
+      + ` — falling back to WhatsApp${a2.delivered ? ' (ok)' : ` (${a2.error || 'failed'})`}`);
+    return { attempts, finalDelivered: !!a2.delivered, primaryChannel: 'email', disabled: !!a2.disabled };
   }
 
   // identifier is a mobile.
@@ -298,7 +442,12 @@ async function deliverOtp({ identifier, email, mobile, name, otp, contextLabel =
     attempts.push({ channel: 'whatsapp', ...a1 });
     attempts.push({ channel: 'sms', ...a2, parallel: true });
     logger.info(`${contextLabel} OTP dual-send · WhatsApp=${a1.delivered ? 'ok' : 'fail'} · SMS=${a2.delivered ? 'ok' : 'fail'}`);
-    return { attempts, finalDelivered: !!(a1.delivered || a2.delivered), primaryChannel: 'whatsapp+sms' };
+    return {
+      attempts,
+      finalDelivered: !!(a1.delivered || a2.delivered),
+      primaryChannel: 'whatsapp+sms',
+      disabled: !!(a1.disabled && a2.disabled),
+    };
   }
 
   /*
@@ -317,12 +466,14 @@ async function deliverOtp({ identifier, email, mobile, name, otp, contextLabel =
   const a1 = await send[primary]();
   attempts.push({ channel: primary, ...a1 });
   logger.info(`${contextLabel} OTP ${primary} attempt: ${a1.delivered ? 'delivered' : 'failed'}${a1.error ? ` (${a1.error})` : ''}`);
-  if (a1.delivered || a1.disabled) return { attempts, finalDelivered: !!a1.delivered, primaryChannel: primary };
+  if (a1.delivered || a1.disabled) {
+    return { attempts, finalDelivered: !!a1.delivered, primaryChannel: primary, disabled: !!a1.disabled };
+  }
 
   const a2 = await send[fallback]();
   attempts.push({ channel: fallback, ...a2, fallback: true });
   logger.warn(`${contextLabel} OTP ${primary} failed — falling back to ${fallback}${a2.delivered ? ' (ok)' : ` (${a2.error || 'failed'})`}`);
-  return { attempts, finalDelivered: !!a2.delivered, primaryChannel: primary };
+  return { attempts, finalDelivered: !!a2.delivered, primaryChannel: primary, disabled: !!a2.disabled };
 }
 
 module.exports = {

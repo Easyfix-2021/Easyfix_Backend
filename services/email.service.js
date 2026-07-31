@@ -1,4 +1,5 @@
 const logger = require('../logger');
+const { getGraphToken, invalidateGraphToken } = require('./ms-graph-token.service');
 
 /*
  * Email via Microsoft Graph API — application-permission sendMail
@@ -15,15 +16,20 @@ const logger = require('../logger');
  *                              in Azure AD). Defaults to ithelpdesk@easyfix.in.
  *
  * Flow per send():
- *   1. If no cached access token, or cached one is within 2 min of expiry,
- *      POST to /{tenant}/oauth2/v2.0/token with scope=https://graph.microsoft.com/.default
- *      to mint a fresh Bearer (valid ~60 min).
+ *   1. Get a bearer from services/ms-graph-token.service.js — the SHARED
+ *      client-credentials token cache (this file used to own a private copy;
+ *      it was extracted so the Entra provisioning service can reuse it rather
+ *      than mint a second token against the same app registration). Same env
+ *      vars, same 2-minute expiry buffer, same error text as before.
  *   2. POST https://graph.microsoft.com/v1.0/users/{sender}/sendMail with the
  *      message envelope. Graph responds 202 Accepted on success — there's no
  *      SMTP-equivalent messageId returned; Graph logs the send server-side.
  *
+ * ⚠ 202 ACCEPTED IS NOT DELIVERY. See the return-shape note on send() below.
+ *
  * Kept contract:
- *   send({ to, subject, text, html, cc, bcc, category }) → { delivered, … }
+ *   send({ to, subject, text, html, cc, bcc, category })
+ *     → { accepted, deliveryConfirmed, delivered (alias of accepted), … }
  * — callers (notification-orchestrator, auth OTP delivery, deploy workflow,
  *   auto-assign failure notification) are unchanged.
  *
@@ -40,50 +46,18 @@ const logger = require('../logger');
  * this file inside a commented block — un-comment + swap if Graph is down.
  */
 
-// Token cache: module-singleton. Rotates when within 2 min of expiry.
-let cachedToken = null; // { token: string, expiresAt: number (ms epoch) }
-
 function disabled() {
   return String(process.env.NOTIFICATIONS_DISABLE).toLowerCase() === 'true';
 }
 
+/*
+ * Token acquisition now lives in services/ms-graph-token.service.js so the
+ * Entra provisioning service shares ONE cache with this file. Kept as a
+ * one-line delegate rather than inlining getGraphToken() at the call site so
+ * the flow reads the same as it did before the extraction.
+ */
 async function fetchGraphToken() {
-  const tenantId     = process.env.MS_GRAPH_TENANT_ID;
-  const clientId     = process.env.MS_GRAPH_CLIENT_ID;
-  const clientSecret = process.env.MS_GRAPH_CLIENT_SECRET;
-  if (!tenantId || !clientId || !clientSecret) {
-    throw new Error('MS_GRAPH_TENANT_ID / MS_GRAPH_CLIENT_ID / MS_GRAPH_CLIENT_SECRET not configured');
-  }
-
-  // Reuse cached token if >2 min remaining. Two-minute buffer avoids racing
-  // a token that Graph would accept-then-reject in the middle of a long send.
-  if (cachedToken && cachedToken.expiresAt - Date.now() > 120_000) {
-    return cachedToken.token;
-  }
-
-  const url = `https://login.microsoftonline.com/${encodeURIComponent(tenantId)}/oauth2/v2.0/token`;
-  const body = new URLSearchParams({
-    grant_type:    'client_credentials',
-    client_id:     clientId,
-    client_secret: clientSecret,
-    scope:         'https://graph.microsoft.com/.default',
-  });
-
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: body.toString(),
-  });
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Graph token fetch failed ${res.status}: ${errText.slice(0, 300)}`);
-  }
-  const data = await res.json();
-  cachedToken = {
-    token:     data.access_token,
-    expiresAt: Date.now() + (Number(data.expires_in) * 1000),
-  };
-  return cachedToken.token;
+  return getGraphToken();
 }
 
 /*
@@ -96,16 +70,42 @@ function toRecipientArray(input) {
   return arr.map((addr) => ({ emailAddress: { address: addr } }));
 }
 
+/*
+ * RETURN SHAPE — read this before writing a caller.
+ *
+ *   accepted           true  ⇔ Graph answered 202 Accepted: the message is
+ *                      QUEUED in the tenant's outbound pipeline. That is the
+ *                      strongest signal this API can ever give us.
+ *   deliveryConfirmed  ALWAYS false on the success path. Graph exposes no
+ *                      delivery receipt and does NOT validate the recipient
+ *                      mailbox before accepting, so a send to an address that
+ *                      does not exist still returns 202 and bounces
+ *                      asynchronously — the NDR lands in the SENDER mailbox
+ *                      (MS_GRAPH_SENDER_EMAIL), which no CRM surface reads.
+ *                      The field exists so callers can never write
+ *                      `if (r.delivered)` and believe they proved receipt; if
+ *                      a real delivery-report integration ever lands, this is
+ *                      the field it sets.
+ *   delivered          BACKWARD-COMPAT ALIAS of `accepted`, kept because ~15
+ *                      call sites across routes/ and services/ already read it
+ *                      (and the SMS / WhatsApp / push services expose the same
+ *                      key, so renaming it here alone would fragment the
+ *                      cross-channel shape). IT MEANS "ACCEPTED FOR DELIVERY",
+ *                      NOT "RECEIVED". Anything that must not be fooled by a
+ *                      dead mailbox — OTP delivery above all — has to check
+ *                      reachability itself: see the mailbox-existence
+ *                      pre-check in services/otp-delivery.service.js.
+ */
 async function send({ to, subject, text, html, cc, bcc, category, attachments }) {
   const originalTo = to;
   logger.info('Send email · subject="' + subject + '"' + (category ? ' · category=' + category : '') + (Array.isArray(attachments) && attachments.length ? ' · attachments=' + attachments.length : ''));
-  if (!to)             return { delivered: false, error: 'to is required' };
-  if (!subject)        return { delivered: false, error: 'subject is required' };
-  if (!text && !html)  return { delivered: false, error: 'text or html body required' };
+  if (!to)             return { accepted: false, delivered: false, deliveryConfirmed: false, error: 'to is required' };
+  if (!subject)        return { accepted: false, delivered: false, deliveryConfirmed: false, error: 'subject is required' };
+  if (!text && !html)  return { accepted: false, delivered: false, deliveryConfirmed: false, error: 'text or html body required' };
 
   if (disabled()) {
     logger.test(`Email suppressed (NOTIFICATIONS_DISABLE) · to=${to} · subject="${subject}"`);
-    return { delivered: false, disabled: true };
+    return { accepted: false, delivered: false, deliveryConfirmed: false, disabled: true };
   }
 
   // ── TEST-MODE INTERCEPTION (last point before Graph dispatch) ──
@@ -195,13 +195,25 @@ async function send({ to, subject, text, html, cc, bcc, category, attachments })
       body: JSON.stringify({ message, saveToSentItems: true }),
     });
 
-    // Graph returns 202 Accepted with an empty body on success.
+    /*
+     * Graph returns 202 Accepted with an empty body on success.
+     *
+     * 202 = QUEUED, NOT DELIVERED. Graph performs no recipient-existence check
+     * before accepting, so this branch is also what a send to a mailbox that
+     * was never created looks like. `queuedForDelivery` says exactly what we
+     * know; `delivered` is the legacy alias (see the return-shape note above).
+     */
     if (res.status === 202) {
       const who = Array.isArray(to) ? to.join(',') : to;
-      logger.info('Email accepted by Graph (202) · subject="' + subject + '"' + (redirected ? ' · redirected (TEST_EMAILS)' : ''));
-      logger.email(`sent to ${who} · "${subject}"${redirected ? ` · was "${originalTo}"` : ''}`);
+      logger.info('Email accepted by Graph (202 — queued, delivery NOT confirmed) · subject="' + subject + '"' + (redirected ? ' · redirected (TEST_EMAILS)' : ''));
+      logger.email(`queued for ${who} · "${subject}"${redirected ? ` · was "${originalTo}"` : ''}`);
       return {
-        delivered: true,
+        accepted: true,
+        queuedForDelivery: true,
+        // Graph gives us no delivery receipt, ever. Never flip this to true
+        // from an HTTP status code.
+        deliveryConfirmed: false,
+        delivered: true, // alias of `accepted` — "accepted for delivery"
         // No messageId on Graph — tenant Sent-Items folder is the audit trail.
         messageId: null,
         redirected,
@@ -209,10 +221,10 @@ async function send({ to, subject, text, html, cc, bcc, category, attachments })
       };
     }
 
-    // Non-202 → failure. Invalidate the token cache on 401 so the next send
-    // refetches — covers the edge case where the app secret was rotated
+    // Non-202 → failure. Invalidate the shared token cache on 401 so the next
+    // send refetches — covers the edge case where the app secret was rotated
     // while this process had a live cached token.
-    if (res.status === 401) cachedToken = null;
+    if (res.status === 401) invalidateGraphToken();
 
     const errText = await res.text();
     let parsedErr = errText;
@@ -220,7 +232,7 @@ async function send({ to, subject, text, html, cc, bcc, category, attachments })
     throw new Error(`Graph sendMail ${res.status}: ${String(parsedErr).slice(0, 300)}`);
   } catch (err) {
     logger.error(`Email error · to=${to} · ${err.message}`);
-    return { delivered: false, error: err.message };
+    return { accepted: false, delivered: false, deliveryConfirmed: false, error: err.message };
   }
 }
 

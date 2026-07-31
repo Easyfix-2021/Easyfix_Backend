@@ -1,5 +1,5 @@
 const Joi = require('joi');
-const { ALL_STATUS_VALUES } = require('../services/job.service');
+const { ALL_STATUS_VALUES, SORTABLE_COLUMNS, OFFER_STATE_VALUES } = require('../services/job.service');
 
 const intId   = Joi.number().integer().positive();
 /*
@@ -61,6 +61,19 @@ const listQuery = Joi.object({
   // tab. URLSearchParams ships the value as the string 'true'/'false';
   // accept both shapes for parity with the other boolean-ish filters.
   noServices: Joi.alternatives(Joi.boolean(), Joi.string().valid('true', 'false')).optional(),
+  /*
+   * `offerState` (2026-07-31) — the Pending-for-Scheduling tab's SUB-STATE
+   * filter. That tab is a bucket (status=0 + assigned=false), so every job in
+   * it already shares one job_status; the axis worth filtering is the OFFER
+   * lifecycle inside the bucket:
+   *   'pending' → never offered   'offered' → an OPEN offer exists
+   *   'expired' → offers exist, none open
+   * It NARROWS — it never replaces the caller's status / assigned pins.
+   * `''` is allowed (and ignored) so the FE can clear the control without
+   * having to strip the key. Values derive from the service's
+   * OFFER_STATE_VALUES so the two sides cannot drift.
+   */
+  offerState: Joi.string().valid(...OFFER_STATE_VALUES).allow('').optional(),
   // clientId / cityId — single id OR CSV list (Pending-to-Start multi-select
   // Clients / Cities filters). csvIds keeps a lone id valid for back-compat.
   clientId: csvIds.optional(),
@@ -122,16 +135,24 @@ const listQuery = Joi.object({
     Joi.string().valid('now'),
     Joi.date().iso(),
   ).optional(),
-  // Server-side sort (whitelisted). sortBy must be one of the sortable list
-  // columns; sortDir asc|desc. Both optional — absent → default job_id DESC.
-  // The service also whitelists (SORT_COLUMN) so an unknown value is a safe
-  // no-op, never raw SQL.
-  sortBy: Joi.string().valid(
-    'job_id', 'job_reference_id', 'client_ref_id', 'created_date_time',
-    'client_name', 'city_name', 'job_status', 'job_type', 'requested_date_time',
-    'scheduled_date_time', 'checkin_date_time', 'checkout_date_time',
-    'customer_name', 'customer_mob_no', 'source_type', 'easyfixer_name', 'owner_name',
-  ).optional(),
+  /*
+   * Server-side sort (whitelisted). sortDir asc|desc. Both optional — absent →
+   * default job_id DESC.
+   *
+   * `sortBy` is derived from the SERVICE's SORTABLE_COLUMNS keys rather than
+   * being re-listed here. The two whitelists previously had to be maintained by
+   * hand on both sides, and a key present in only one of them is silently
+   * dropped — the list then falls back to the default job_id DESC order with no
+   * error, which is exactly the regression this endpoint hit before. Deriving
+   * makes BE-side drift structurally impossible. (Same pattern as
+   * routes/admin/tools.js, service-types.js, users.js, etc.)
+   *
+   * Includes 'age' — NOT a tbl_job column: the service maps it to
+   * JOB_AGE_SECS_EXPR (precise seconds), so same-day jobs order correctly
+   * instead of tying on the floored day value the UI displays. The FE keeps its
+   * own sortable-column list and must list 'age' there too.
+   */
+  sortBy: Joi.string().valid(...Object.keys(SORTABLE_COLUMNS)).optional(),
   sortDir: Joi.string().valid('asc', 'desc').optional(),
   limit: Joi.number().integer().min(1).max(500).default(50),
   offset: Joi.number().integer().min(0).default(0),

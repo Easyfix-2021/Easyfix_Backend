@@ -3,7 +3,10 @@ const Joi    = require('joi');
 
 const validate = require('../../middleware/validate');
 const { roleByName } = require('../../middleware/role');
+const { requirePropertyAllowlist } = require('../../middleware/require-property-allowlist');
 const userService = require('../../services/user.service');
+const entraProvisioning = require('../../services/entra-provisioning.service');
+const { FEATURES, emailAllowed } = require('../../services/feature-access.service');
 const { STAGE_KEYS } = require('../../lib/job-stages');
 const { modernOk, modernError } = require('../../utils/response');
 const logger = require('../../logger');
@@ -166,13 +169,49 @@ router.get('/:userId/hierarchy', validate(idParam, 'params'), async (req, res, n
 router.post('/', roleByName(['Admin']), validate(createBody), async (req, res, next) => {
   logger.info('Create user · role=' + req.body.user_role + ' cityId=' + (req.body.city_id || ''));
   try {
+    /*
+     * SAME PER-PERSON GATE AS THE REPAIR ENDPOINT.
+     *
+     * Add User reaches the identical directory write (create an enabled Entra
+     * account + spend a purchased licence seat) that
+     * POST /:userId/provision-mailbox guards with
+     * requirePropertyAllowlist(FEATURES.canProvisionMailboxes). Leaving it on
+     * roleByName(['Admin']) alone made the allowlist decorative: a
+     * non-allowlisted Admin got a 403 on the repair route and then achieved the
+     * same write, once per Add User, with no rate limit. So the allowlist is
+     * evaluated here too and passed down — the CRM user is still created either
+     * way (that contract does not change); only the directory side-effect is
+     * gated, and the skip is RECORDED so an allowlisted operator can finish the
+     * job from the Provisioning panel.
+     */
+    const canProvisionMailbox = emailAllowed(FEATURES.canProvisionMailboxes, req.user?.official_email);
     const created = await userService.createUser({
       ...req.body,
       createdBy: req.user?.user_id,
+      provisionMailbox: canProvisionMailbox,
     });
     res.status(201);
-    logger.info('User created · userId=' + (created && (created.user_id || created.id)));
-    modernOk(res, created, 'User added');
+    /*
+     * `created.provisioning` is attached by userService.createUser — the
+     * Microsoft 365 mailbox outcome. It rides along on the SUCCESS payload and
+     * deliberately does NOT influence the status code: the CRM user was
+     * created either way (that is today's contract), we are only making a
+     * missing mailbox visible instead of silent. With the feature flag off it
+     * reads { accountStatus: 'skipped_disabled', … }.
+     */
+    const prov = created && created.provisioning;
+    logger.info('User created · userId=' + (created && (created.user_id || created.id))
+      + (prov ? ' · mailbox=' + prov.accountStatus + '/' + prov.licenceStatus : ''));
+    let message = 'User added';
+    if (prov && prov.pending) {
+      // Provisioning outran the inline deadline and is finishing detached — the
+      // outcome lands in tbl_user_entra_provisioning, readable from
+      // GET /api/admin/users/:userId/provisioning.
+      message = 'User added — Microsoft 365 mailbox provisioning is still running; check the Provisioning panel shortly';
+    } else if (prov && prov.attempted && !prov.mailboxReady) {
+      message = 'User added — but the Microsoft 365 mailbox is NOT ready: ' + (prov.reason || 'see provisioning outcome');
+    }
+    modernOk(res, created, message);
   } catch (e) {
     if (e.status) return modernError(res, e.status, e.message);
     next(e);
@@ -293,6 +332,94 @@ router.post('/bulk-update', roleByName(['Admin']), validate(bulkUpdateBody), asy
     next(e);
   }
 });
+
+/*
+ * ── Microsoft 365 mailbox provisioning ───────────────────────────────
+ *
+ * GET  /api/admin/users/:userId/provisioning        — read the recorded state
+ * POST /api/admin/users/:userId/provision-mailbox   — (re)provision / repair
+ *
+ * WHY THE POST EXISTS: creating the CRM user is what SHOULD create the
+ * mailbox, but that step can fail on its own (Graph down, no licence seat,
+ * consent not granted yet) and re-creating the CRM user is not an option — the
+ * row is referenced by tbl_job audit columns. This endpoint is the repair
+ * path. It is what fixes the reported case (user_id 8710, ankitjha@easyfix.in,
+ * Project Manager, mailbox never created) without anyone touching tbl_user.
+ *
+ * IDEMPOTENT: the service looks the account up in the directory before
+ * creating, so a second click records 'already_exists' and moves on to the
+ * licence check rather than making a duplicate account. Safe to click twice.
+ *
+ * GATING — three layers, all of which must pass:
+ *   1. requireAuth + role(['admin'])          (inherited from routes/admin/index.js)
+ *   2. roleByName(['Admin'])                  same guard every other mutating
+ *                                             route in this file uses
+ *   3. requirePropertyAllowlist(...)          per-person allowlist, seeded
+ *                                             EMPTY = deny-all. It creates a
+ *                                             directory account and spends a
+ *                                             licence seat, so RBAC alone is
+ *                                             not enough.
+ * The SAME allowlist is evaluated in POST '/' above (see the comment there):
+ * Add User performs the identical directory write, so gating only this route
+ * would have made the allowlist decoration rather than containment.
+ * On top of that the SERVICE itself is fail-closed on
+ * easyfix_properties['entra.provisioning.enabled'] (default 'false'), so even
+ * an allowlisted Admin gets a recorded "skipped: feature disabled" until
+ * someone deliberately turns the feature on.
+ */
+router.get('/:userId/provisioning',
+  roleByName(['Admin']),
+  validate(idParam, 'params'),
+  async (req, res, next) => {
+    logger.info('Read mailbox provisioning state · userId=' + req.params.userId);
+    try {
+      const user = await userService.getUserById(Number(req.params.userId));
+      if (!user) return modernError(res, 404, 'User not found');
+      const state = await entraProvisioning.getProvisioning(Number(req.params.userId));
+      modernOk(res, {
+        user_id: user.user_id,
+        official_email: user.official_email,
+        // null = provisioning has never been recorded for this user at all
+        // (the row predates this feature). That is itself the answer an
+        // operator needs, so we return it rather than 404-ing.
+        provisioning: state,
+        feature_enabled: entraProvisioning.provisioningEnabled(),
+        sku_part_number: entraProvisioning.configuredSkuPartNumber() || null,
+      });
+    } catch (e) { next(e); }
+  }
+);
+
+router.post('/:userId/provision-mailbox',
+  roleByName(['Admin']),
+  requirePropertyAllowlist(FEATURES.canProvisionMailboxes, { label: 'Provision Microsoft 365 Mailbox' }),
+  validate(idParam, 'params'),
+  async (req, res, next) => {
+    const userId = Number(req.params.userId);
+    logger.info('Provision mailbox requested · userId=' + userId + ' · actorId=' + (req.user?.user_id || ''));
+    try {
+      const user = await userService.getUserById(userId);
+      if (!user) return modernError(res, 404, 'User not found');
+
+      const outcome = await entraProvisioning.provisionUserMailbox({
+        userId,
+        userName: user.user_name,
+        officialEmail: user.official_email,
+        trigger: 'admin-retry',
+        actorId: req.user?.user_id,
+      });
+
+      // 200 either way — the caller asked us to TRY, and the outcome (including
+      // "the licence step failed, here is exactly why") is the payload. A 5xx
+      // would hide the reason behind the generic error handler.
+      const msg = outcome.mailboxReady
+        ? 'Mailbox is ready (' + outcome.accountStatus + ' / ' + outcome.licenceStatus + ')'
+        : 'Mailbox NOT ready — ' + (outcome.reason || outcome.accountStatus + ' / ' + outcome.licenceStatus);
+      logger.info('Provision mailbox result · userId=' + userId + ' · ' + msg);
+      modernOk(res, { user_id: userId, official_email: user.official_email, provisioning: outcome }, msg);
+    } catch (e) { next(e); }
+  }
+);
 
 router.delete('/:userId', roleByName(['Admin']), validate(idParam, 'params'), async (req, res, next) => {
   logger.info('Deactivate user · userId=' + req.params.userId);

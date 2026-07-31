@@ -1713,9 +1713,15 @@ async function acceptSubmission(jobId, payload, pool) {
  * form or the chat.
  *
  * `fields` (all optional except none — COALESCE preserves existing on null):
- *   requested_date_time, time_slot, job_desc,
+ *   requested_date_time, time_slot, requested_time, job_desc,
  *   address, building, landmark, city_id, pin_code, gps_location, address_instruction,
  *   payload (object — snapshot stored as customer_submitted_payload JSON).
+ *
+ * `requested_time` is the legacy HH:MM TEXT column that mirrors the chosen
+ * slot's START time — the same pairing acceptSubmission() writes (see reqTimeHHMM
+ * there). The conversational flow supplies it so a chat-confirmed job's slot
+ * columns are as coherent as a form-confirmed one's; callers that omit it are
+ * unaffected (NULL → COALESCE keeps the existing value).
  */
 async function writeCustomerOrderDetails(jobId, fields, pool) {
   logger.info('Write customer order details (chat flow) · jobId=' + jobId);
@@ -1739,6 +1745,7 @@ async function writeCustomerOrderDetails(jobId, fields, pool) {
          customer_submitted_payload = ?,
          requested_date_time        = COALESCE(?, requested_date_time),
          time_slot                  = COALESCE(?, time_slot),
+         requested_time             = COALESCE(?, requested_time),
          job_desc                   = COALESCE(?, job_desc),
          last_update_time           = ?
        WHERE job_id = ?`,
@@ -1747,6 +1754,7 @@ async function writeCustomerOrderDetails(jobId, fields, pool) {
         JSON.stringify(fields.payload || fields),
         fields.requested_date_time || null,
         fields.time_slot || null,
+        (fields.requested_time && String(fields.requested_time).trim()) ? fields.requested_time : null,
         (fields.job_desc && String(fields.job_desc).trim()) ? fields.job_desc : null,
         submittedAt,
         jobId,
