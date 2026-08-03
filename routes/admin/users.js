@@ -3,10 +3,8 @@ const Joi    = require('joi');
 
 const validate = require('../../middleware/validate');
 const { roleByName } = require('../../middleware/role');
-const { requirePropertyAllowlist } = require('../../middleware/require-property-allowlist');
 const userService = require('../../services/user.service');
 const entraProvisioning = require('../../services/entra-provisioning.service');
-const { FEATURES, emailAllowed } = require('../../services/feature-access.service');
 const { STAGE_KEYS } = require('../../lib/job-stages');
 const { modernOk, modernError } = require('../../utils/response');
 const logger = require('../../logger');
@@ -182,25 +180,32 @@ router.post('/', roleByName(['Admin']), validate(createBody), async (req, res, n
   logger.info('Create user · role=' + req.body.user_role + ' cityId=' + (req.body.city_id || ''));
   try {
     /*
-     * SAME PER-PERSON GATE AS THE REPAIR ENDPOINT.
+     * PROVISIONING RUNS FOR EVERY USER CREATED HERE — no per-person allowlist.
      *
-     * Add User reaches the identical directory write (create an enabled Entra
-     * account + spend a purchased licence seat) that
-     * POST /:userId/provision-mailbox guards with
-     * requirePropertyAllowlist(FEATURES.canProvisionMailboxes). Leaving it on
-     * roleByName(['Admin']) alone made the allowlist decorative: a
-     * non-allowlisted Admin got a 403 on the repair route and then achieved the
-     * same write, once per Add User, with no rate limit. So the allowlist is
-     * evaluated here too and passed down — the CRM user is still created either
-     * way (that contract does not change); only the directory side-effect is
-     * gated, and the skip is RECORDED so an allowlisted operator can finish the
-     * job from the Provisioning panel.
+     * It briefly did carry one (emailAllowed(FEATURES.canProvisionMailboxes)),
+     * added on the theory that spending a licence seat deserved a gate narrower
+     * than the route's own roleByName(['Admin']). That was wrong twice over:
+     *
+     *  1. WRONG BOUNDARY. A mailbox is part of creating a staff user, not a
+     *     separate privilege. Whoever is trusted to create the CRM account is
+     *     trusted to create its mailbox; anything else half-creates a person.
+     *  2. FAILED CLOSED, SILENTLY. emailAllowed() returns false for an UNSET
+     *     property, so with access.entraprovision.emails empty — its state in
+     *     production — EVERY Add User recorded skipped_not_allowed and no
+     *     mailbox was ever made. Observed on user 8735
+     *     (vijay.nailwal@easyfix.in, 2026-08-03): CRM row created, Entra
+     *     account absent, and nobody noticed until the user could not log in.
+     *     A gate whose default is "nobody" turns an opt-in feature into a
+     *     silent no-op.
+     *
+     * The real containment boundary is the roleByName(['Admin']) already on
+     * this route, plus entra.provisioning.enabled as the master switch. Those
+     * are the two things that decide whether a directory write happens.
      */
-    const canProvisionMailbox = emailAllowed(FEATURES.canProvisionMailboxes, req.user?.official_email);
     const created = await userService.createUser({
       ...req.body,
       createdBy: req.user?.user_id,
-      provisionMailbox: canProvisionMailbox,
+      provisionMailbox: true,
     });
     res.status(201);
     /*
@@ -362,22 +367,19 @@ router.post('/bulk-update', roleByName(['Admin']), validate(bulkUpdateBody), asy
  * creating, so a second click records 'already_exists' and moves on to the
  * licence check rather than making a duplicate account. Safe to click twice.
  *
- * GATING — three layers, all of which must pass:
- *   1. requireAuth + role(['admin'])          (inherited from routes/admin/index.js)
- *   2. roleByName(['Admin'])                  same guard every other mutating
- *                                             route in this file uses
- *   3. requirePropertyAllowlist(...)          per-person allowlist, seeded
- *                                             EMPTY = deny-all. It creates a
- *                                             directory account and spends a
- *                                             licence seat, so RBAC alone is
- *                                             not enough.
- * The SAME allowlist is evaluated in POST '/' above (see the comment there):
- * Add User performs the identical directory write, so gating only this route
- * would have made the allowlist decoration rather than containment.
- * On top of that the SERVICE itself is fail-closed on
- * easyfix_properties['entra.provisioning.enabled'] (default 'false'), so even
- * an allowlisted Admin gets a recorded "skipped: feature disabled" until
- * someone deliberately turns the feature on.
+ * GATING — two layers, both of which must pass:
+ *   1. requireAuth + role(['admin'])   (inherited from routes/admin/index.js)
+ *   2. roleByName(['Admin'])           the same guard every other mutating
+ *                                      route in this file uses, and the same
+ *                                      one Add User uses to provision
+ * A third per-person allowlist layer was tried and REMOVED (2026-08-03): it
+ * fails closed on an unset property, and the property is unset in production,
+ * so it silently denied everyone — including the recovery path for the users it
+ * had already caused to be created without a mailbox.
+ * The SERVICE remains fail-closed on
+ * easyfix_properties['entra.provisioning.enabled'] (default 'false'), so an
+ * Admin gets a recorded "skipped: feature disabled" until someone deliberately
+ * turns the feature on. THAT is the master switch.
  */
 router.get('/:userId/provisioning',
   roleByName(['Admin']),
@@ -402,9 +404,25 @@ router.get('/:userId/provisioning',
   }
 );
 
+/*
+ * Guarded by roleByName(['Admin']) only — the SAME authority as Add User, which
+ * now provisions unconditionally. The per-person
+ * requirePropertyAllowlist(FEATURES.canProvisionMailboxes) that used to sit here
+ * was removed for two reasons:
+ *
+ *  - INCONSISTENT: an Admin could cause the identical directory write by simply
+ *    creating a user, but got a 403 when repairing one. The allowlist bought no
+ *    containment, only confusion.
+ *  - IT DEADLOCKED THE RECOVERY PATH: the allowlist fails closed on an unset
+ *    property, and it IS unset in production — so the endpoint documented as the
+ *    fix for a missing mailbox could not be called by anyone, including the
+ *    people whose users were affected.
+ *
+ * The action is idempotent (an existing account resolves to already_exists and
+ * spends no extra seat), so repeated calls cannot over-consume licences.
+ */
 router.post('/:userId/provision-mailbox',
   roleByName(['Admin']),
-  requirePropertyAllowlist(FEATURES.canProvisionMailboxes, { label: 'Provision Microsoft 365 Mailbox' }),
   validate(idParam, 'params'),
   async (req, res, next) => {
     const userId = Number(req.params.userId);
