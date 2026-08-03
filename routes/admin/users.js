@@ -56,7 +56,19 @@ const listQuery = Joi.object({
 const createBody = Joi.object({
   user_name:      Joi.string().trim().min(2).max(200).required(),
   official_email: Joi.string().trim().lowercase().email().max(255).required(),
-  mobile_no:      Joi.string().trim().pattern(/^[0-9]{10}$/).required(),
+  /*
+   * OPTIONAL as of 2026-08-03 (was .required()). tbl_user.mobile_no is nullable
+   * and 7 active users already have none, so nothing downstream assumes it.
+   * The FORMAT is still enforced: supply a mobile and it must be 10 digits —
+   * only the presence requirement was dropped, so a typo still fails rather
+   * than silently storing a half-number.
+   *
+   * ⚠ LOGIN CONSEQUENCE, deliberately accepted: sign-in is OTP-only via email
+   * OR mobile. A user with no mobile can only receive an OTP by email, so if
+   * their @easyfix.in mailbox does not exist they cannot log in at all. Keep
+   * that in mind for anyone created without one.
+   */
+  mobile_no:      Joi.string().trim().pattern(/^[0-9]{10}$/).allow('', null).optional(),
   alternate_no:   Joi.string().trim().pattern(/^[0-9]{10}$/).allow('', null).optional(),
   user_role:      Joi.number().integer().positive().required(),
   city_id:        Joi.number().integer().positive().allow(null).optional(),
