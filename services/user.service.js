@@ -302,7 +302,16 @@ async function createUser({
   const mob   = String(mobile_no || '').trim();
   if (!name)  throw mkErr(400, 'user_name is required');
   if (!email) throw mkErr(400, 'official_email is required');
-  if (!mob)   throw mkErr(400, 'mobile_no is required');
+  /*
+   * NO mobile_no guard — it became OPTIONAL on 2026-08-03 (tbl_user.mobile_no is
+   * nullable and active users already exist without one).
+   *
+   * This service-level check is why loosening the route's Joi schema alone did
+   * NOT work: the request passed validation and then died here with the same
+   * wording, so the API still answered "mobile_no is required" while the form
+   * showed the field as optional. A field's requiredness lives in BOTH places —
+   * change one and the other silently wins.
+   */
   if (!user_role) throw mkErr(400, 'user_role is required');
 
   // Validate role exists + is admin-group (we don't manage technicians or
@@ -323,12 +332,21 @@ async function createUser({
     throw mkErr(409, `An active user with email "${email}" already exists`);
   }
 
-  const [[dupMob]] = await pool.query(
+  /*
+   * Uniqueness only means something for a mobile that was actually supplied.
+   * Skipping the probe on a blank one is REQUIRED now that mobile is optional:
+   * otherwise the second blank-mobile user would match the first on
+   * `mobile_no = ''` and be rejected as a duplicate of it. (Today's 7
+   * mobile-less users store NULL, which never matches — so this would have
+   * stayed dormant until the first '' row was written, then broken every
+   * blank-mobile create after it.)
+   */
+  const [[dupMob]] = mob ? await pool.query(
     `SELECT user_id FROM tbl_user
       WHERE mobile_no = ? AND user_status = 1 AND user_type_id = ?
       LIMIT 1`,
     [mob, INTERNAL_USER_TYPE_ID]
-  );
+  ) : [[null]];
   if (dupMob) {
     logger.warn('Create user rejected · duplicate active mobile');
     throw mkErr(409, `An active user with mobile "${mob}" already exists`);
@@ -343,7 +361,11 @@ async function createUser({
         user_status, insert_date, updated_by)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?)`,
     [
-      name, email, mob, alternate_no || null,
+      // `mob || null` — store NULL, never '', for a mobile-less user. Matches
+      // how the 7 existing mobile-less rows are stored, and keeps the
+      // uniqueness probe above meaningful (NULL never equals NULL in SQL, so
+      // blank rows can't collide with each other).
+      name, email, mob || null, alternate_no || null,
       Number(user_role), INTERNAL_USER_TYPE_ID, city_id ? Number(city_id) : null,
       manage_clients || null, manage_cities || null, manage_states || null, manage_verticals || null,
       reporting_manager ? Number(reporting_manager) : null,
