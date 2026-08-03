@@ -13,6 +13,10 @@ const addressService = require('./address.service');
 // turns a user's allowed stage keys into the union of visible job_status codes,
 // AND-combined (intersected) with the tab/status filters in list/counts/attention.
 const { stageVisibleStatuses } = require('../lib/job-stages');
+// Appointment time-slot model (pure, no DB) — see services/time-slot.js for
+// what tbl_job.time_slot / requested_time / requested_date_time each mean and
+// why the slot STRING is no longer load-bearing anywhere.
+const { deriveTimeSlot, resolveTimeSlot, hasTimeOfDay, wallClockTime } = require('./time-slot');
 
 /*
  * THE OFFER MODEL feature flag. ON by default — only the literal string
@@ -644,85 +648,29 @@ function deriveBookingCutoffSlot(dt) {
 }
 
 /*
- * Derive the named `time_slot` window ("Morning 9 to 2" …) from an IST
- * 'YYYY-MM-DD HH:MM:SS' string. Boundaries mirror the CRM FE's deriveTimeSlot
- * (ScheduleAssignModal: 9–11 / 12–13 / 14–18); the out-of-range value is
- * "After Hours" to match the new-CRM booking rows in tbl_job (the FE picker's
- * own "Anytime" fallback is a different, Schedule-&-Assign-only label). Used as
- * a fallback so create paths that DON'T send time_slot (e.g. some integration
- * sources) still populate it. Returns null for an absent/unparseable datetime
- * so `input.time_slot || deriveTimeSlot(...)` leaves NULL as NULL when there's
- * no appointment time at all.
- */
-function deriveTimeSlot(dt) {
-  if (!dt) return null;
-  const h = Number(String(dt).slice(11, 13)); // 'YYYY-MM-DD HH:...' → HH
-  if (!Number.isFinite(h)) return null;
-  if (h >= 9  && h < 12) return 'Morning 9 to 2';
-  if (h >= 12 && h < 14) return 'Afternoon 12 to 5';
-  if (h >= 14 && h < 19) return 'Evening 2 to 7';
-  return 'After Hours';
-}
-
-/*
- * ── The CURRENT 1-hour slot vocabulary ─────────────────────────────────────
+ * ── `time_slot` = the BROAD BOOKING BAND, and nothing else ────────────────
  *
- * The four bands deriveTimeSlot() above returns are LEGACY. Every live booking
- * path now writes a 1-HOUR frame instead:
- *   - the CRM Confirm & Schedule modal  (Easyfix_CRM_UI JobModal `SLOTS`)
- *   - the WhatsApp confirmation flow    (whatsapp-conversation.service
- *                                        SLOT_START_HOURS / ONE_HOUR_SLOTS)
+ * deriveTimeSlot(dt) returns the BAND containing an IST 'YYYY-MM-DD HH:MM:SS'
+ * appointment time — one of exactly four values ('9AM to 12PM', '12PM to 3PM',
+ * '3PM to 7PM', 'After Hours'). It lives in services/time-slot.js, the single
+ * module that owns the model; re-exported from here because every existing
+ * caller (and the module export surface) reaches for it via job.service.
  *
- * ⚠ LABEL FORMAT IS LOAD-BEARING — it must stay byte-identical to those two.
- * EN-DASH U+2013 ('–') with NO surrounding spaces: "3 PM–4 PM", never
- * "3 PM - 4 PM". candidate-ranking.service matches slots with `AND time_slot = ?`
- * (an exact string equality), so a single stray space silently disables
- * same-slot conflict detection. Frames run 9 AM → 7 PM; anything outside is
- * 'After Hours', matching the CRM picker's own out-of-window value.
+ * REVERSED 2026-07-31 — the 1-HOUR slot vocabulary is GONE from this column.
+ * deriveOneHourSlot() / LEGACY_TIME_SLOT_BANDS / rederiveTimeSlot(), added
+ * earlier the same day so reschedule would PRESERVE a 1-hour label, are
+ * deleted. The 1-hour frame ops/the customer picks now lives where it belongs:
+ * its START is requested_date_time's time-of-day (and requested_time), and
+ * time_slot only ever records the band containing it. resolveTimeSlot() is the
+ * one writer-side gate that guarantees it.
  *
- * (Not imported from whatsapp-conversation.service on purpose: that module
- * pulls in the Gallabox / AI / Maps clients at require time, and job.service is
- * loaded by every route in the app.)
+ * The old four bands this function used to emit ('Morning 9 to 2' …) were a
+ * SECOND vocabulary the backend wrote while the CRM picker wrote a third —
+ * which is why `time_slot = ?` equality could never be trusted. Historical
+ * rows are deliberately NOT migrated; nothing matches on the string any more.
+ *
+ * (deriveTimeSlot / resolveTimeSlot are imported at the top of this file.)
  */
-function hour12Label(h) {
-  return `${((h + 11) % 12) + 1} ${h < 12 ? 'AM' : 'PM'}`;
-}
-
-function deriveOneHourSlot(dt) {
-  if (!dt) return null;
-  const h = Number(String(dt).slice(11, 13)); // 'YYYY-MM-DD HH:...' → HH
-  if (!Number.isFinite(h)) return null;
-  if (h < 9 || h > 18) return 'After Hours';
-  return `${hour12Label(h)}–${hour12Label(h + 1)}`;
-}
-
-/*
- * The exact legacy band labels. A job still holding one of these is a legacy
- * row, and a re-derive keeps it in the legacy vocabulary; ANY other value
- * (a 1-hour frame, 'After Hours', or NULL) re-derives as a 1-hour frame.
- * Rationale: never migrate a job's slot vocabulary as a side effect of an
- * unrelated action, and never DOWNGRADE a customer-confirmed 1-hour frame to a
- * 5-hour band.
- */
-const LEGACY_TIME_SLOT_BANDS = new Set([
-  'Morning 9 to 2',
-  'Afternoon 12 to 5',
-  'Evening 2 to 7',
-  'Anytime',
-]);
-
-/*
- * Re-derive `time_slot` for a NEW appointment time, in the SAME vocabulary the
- * job already speaks. Used by reschedule(), which moves the appointment and so
- * must keep the slot coherent with it — without rewriting a chat-confirmed
- * 1-hour frame into a legacy band.
- */
-function rederiveTimeSlot(newRequested, currentSlot) {
-  const current = String(currentSlot == null ? '' : currentSlot).trim();
-  return LEGACY_TIME_SLOT_BANDS.has(current)
-    ? deriveTimeSlot(newRequested)
-    : deriveOneHourSlot(newRequested);
-}
 
 let _hasClientVerticalIdColumn = null;
 async function hasClientVerticalIdColumn() {
@@ -2773,12 +2721,14 @@ async function create(input, actor) {
         input.fk_service_type_id || null, input.fk_service_catg_id || null, serviceTypeIds,
         input.reporting_contact_id || null,
         requestedDateTime, requestedTime,
-        // Both slot columns are derived from the appointment time when the
-        // caller doesn't send them, so create paths that omit one (or both) —
-        // e.g. some integration sources — still populate both (ops 2026-07-08).
-        // time_slot = named window ("Morning 9 to 2"); booking_cut_off_time_slot
-        // = legacy "H AM - H PM" window. FE-sent values always win.
-        input.time_slot || deriveTimeSlot(requestedDateTime),
+        // time_slot is ALWAYS one of the four broad bands. The appointment time
+        // decides it (the band CONTAINING requested_date_time) — a caller-sent
+        // label only matters for a date-only booking, where it is canonicalised
+        // rather than stored verbatim. That is what stops a 1-hour frame label
+        // (or any of the ~12 legacy vocabularies) from landing in the column.
+        // booking_cut_off_time_slot stays on its own legacy "H AM - H PM"
+        // derivation — nothing matches on it.
+        resolveTimeSlot(input.time_slot, requestedDateTime),
         input.booking_cut_off_time_slot || deriveBookingCutoffSlot(requestedDateTime),
         new Date(), new Date(),
         // fk_created_by (2026-06-04): explicit Number() coercion. JWT
@@ -3088,6 +3038,60 @@ async function update(jobId, input, actor) {
   // is undefined in input — never overwrites an explicit value.
   if (input.requested_date_time !== undefined && input.requested_time === undefined) {
     input.requested_time = formatTimeIST(input.requested_date_time);
+  }
+  /*
+   * time_slot is a BAND, never the 1-hour frame the picker offers (see
+   * services/time-slot.js). PATCH is a live slot writer — the Confirm &
+   * Schedule modal edits the appointment through here — so the same
+   * writer-side gate create()/assign()/reschedule() use applies. Normalised
+   * against the SAME datetime projection the SET loop below will store, so the
+   * two columns can never disagree.
+   *
+   * ⚠ ONLY ON A REAL EDIT. JobModal sends `requested_date_time` AND `time_slot`
+   * on EVERY non-outcome PATCH, touched or not — so re-deriving unconditionally
+   * turned an open-and-save-nothing into a silent slot rewrite: a job holding
+   * the legacy 'Morning 9 to 2' at 10:00 came back as '9AM to 12PM', narrowing a
+   * 5-hour promise to a 3-hour one with no operator action. That breaks the
+   * backward-compatibility contract both new modules state as mandatory
+   * (src/lib/job-slots.ts: "an untouched open-and-save must persist it
+   * unchanged"; JobModal's load-time heal deliberately leaves a non-empty slot
+   * alone for the same reason).
+   *
+   * So we compare against what is STORED and re-derive only when the caller
+   * actually moved the appointment or actually picked a different slot. A
+   * no-op save drops time_slot out of the patch entirely — the column is not
+   * even written. Historical rows are never migrated by a side effect.
+   */
+  if (input.time_slot !== undefined || input.requested_date_time !== undefined) {
+    const projectedDt = input.requested_date_time !== undefined
+      ? combineDateTime(input.requested_date_time, null)
+      : null;
+    // Both stored values come back from getById() as IST wall-clock literals
+    // (dateStrings:true). Compared to MINUTE precision: no picker in the app
+    // emits seconds, but legacy rows carry them, and a stray ':30' must not read
+    // as "the operator moved the appointment".
+    const toMinute   = (v) => (v ? String(v).slice(0, 16) : null);
+    const storedDt   = existing.requested_date_time ? String(existing.requested_date_time) : null;
+    const storedSlot = existing.time_slot == null ? '' : String(existing.time_slot).trim();
+    const dtMoved    = projectedDt != null && toMinute(projectedDt) !== toMinute(storedDt);
+    const slotPicked = input.time_slot !== undefined
+      && String(input.time_slot ?? '').trim() !== storedSlot;
+    if (dtMoved) {
+      // The appointment moved: the band is a function of the time, so it moves
+      // with it and any label the caller echoed is discarded.
+      const band = resolveTimeSlot(input.time_slot, projectedDt);
+      if (band != null) input.time_slot = band;
+    } else if (slotPicked) {
+      // The operator deliberately picked a DIFFERENT slot without moving the
+      // appointment. Honour that pick — canonicalised where we can read it,
+      // verbatim otherwise. Deriving from the (unchanged) stored datetime here
+      // would store neither what they picked nor what was there.
+      const band = resolveTimeSlot(input.time_slot, null);
+      if (band != null) input.time_slot = band;
+    } else if (input.time_slot !== undefined) {
+      // Untouched echo of the stored value — leave the column entirely alone.
+      delete input.time_slot;
+    }
   }
   for (const col of MUTABLE_COLUMNS) {
     if (input[col] !== undefined) {
@@ -3927,7 +3931,29 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
       ];
       const values = [now, now, actorId, actorId, now];
       if (editSchedule) { sets.push('requested_date_time = ?'); values.push(newRequested); }
-      if (hasSlot)      { sets.push('time_slot = ?');           values.push(String(timeSlot)); }
+      // The schedule edit carries the 1-HOUR frame in its time-of-day, so
+      // requested_time (the legacy HH:MM twin) moves with it. Guarded on a real
+      // time-of-day: a date-only edit must not blank a good requested_time.
+      if (editSchedule && hasTimeOfDay(newRequested)) {
+        sets.push('requested_time = ?'); values.push(wallClockTime(newRequested));
+      }
+      // time_slot is written as a BAND — never the raw picker label. The
+      // appointment time decides it when the edit supplies a REAL time-of-day;
+      // otherwise an FE-sent label is canonicalised. See resolveTimeSlot.
+      //
+      // ⚠ The datetime is gated on hasTimeOfDay for the same reason the
+      // requested_time write above is. offerBody/assignBody accept a DATE-ONLY
+      // requestedDateTime (validators/job.validator.js), which becomes
+      // '<date> 00:00:00' — and resolveTimeSlot(null, '<date> 00:00:00') returns
+      // 'After Hours', so a date-only schedule edit used to CLOBBER a perfectly
+      // good stored '9AM to 12PM' with 'After Hours'. reschedule() never had the
+      // bug because it passes the job's existing slot as the fallback; here we
+      // simply write nothing when there is nothing to derive from.
+      const slotSource  = (editSchedule && hasTimeOfDay(newRequested)) ? newRequested : null;
+      const slotToStore = (slotSource || hasSlot)
+        ? resolveTimeSlot(hasSlot ? timeSlot : null, slotSource)
+        : null;
+      if (slotToStore) { sets.push('time_slot = ?'); values.push(slotToStore); }
       values.push(jobId);
       await conn.query(`UPDATE tbl_job SET ${sets.join(', ')} WHERE job_id = ?`, values);
     }
@@ -4143,10 +4169,28 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
     if (editSchedule) {
       sets.push('requested_date_time = ?');
       values.push(newRequested);
+      // requested_time = the 1-HOUR START of the edited appointment. Skipped on
+      // a date-only edit so the midnight sentinel can't wipe a real time.
+      if (hasTimeOfDay(newRequested)) {
+        sets.push('requested_time = ?');
+        values.push(wallClockTime(newRequested));
+      }
     }
-    if (hasSlot) {
+    // time_slot is written as a BAND — never the raw picker label (see
+    // resolveTimeSlot). Derived from the edited appointment time when the edit
+    // carries a REAL time-of-day, else canonicalised from whatever label the
+    // caller sent — and written at all only when one of those exists.
+    //
+    // ⚠ hasTimeOfDay is the guard that stops a DATE-ONLY requestedDateTime
+    // (which assignBody accepts) from resolving to 'After Hours' via the 00:00
+    // sentinel and clobbering a good stored band. Same fix as offerToTechnicians.
+    const slotSource  = (editSchedule && hasTimeOfDay(newRequested)) ? newRequested : null;
+    const slotToStore = (slotSource || hasSlot)
+      ? resolveTimeSlot(hasSlot ? timeSlot : null, slotSource)
+      : null;
+    if (slotToStore) {
       sets.push('time_slot = ?');
-      values.push(String(timeSlot));
+      values.push(slotToStore);
     }
     values.push(jobId);
 
@@ -4524,8 +4568,8 @@ async function listOffers(jobId) {
  */
 async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason, remarks }, actor) {
   logger.info('Reschedule job · id=' + jobId + ' · reasonId=' + reasonId);
-  // time_slot is read so the re-derive below can stay in the job's OWN slot
-  // vocabulary (see rederiveTimeSlot).
+  // time_slot is read only as the FALLBACK for a date-only reschedule (no
+  // time-of-day to derive a band from) — see resolveTimeSlot below.
   const [[existing]] = await pool.query(
     'SELECT job_id, fk_easyfixter_id, time_slot FROM tbl_job WHERE job_id = ? LIMIT 1',
     [jobId],
@@ -4541,21 +4585,20 @@ async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason
    * Re-derive both slot columns from the new appointment time so time_slot and
    * booking_cut_off_time_slot stay coherent with requested_date_time.
    *
-   * time_slot re-derives IN THE JOB'S OWN VOCABULARY. This used to call
-   * deriveTimeSlot() unconditionally, which returns only the four legacy bands
-   * — and since the write below is `COALESCE(?, time_slot)` (a guard that only
-   * ever fires when the derive returns null, i.e. never once a date parsed),
-   * every reschedule DESTROYED a customer-confirmed 1-hour frame: '3 PM–4 PM'
-   * became 'Evening 2 to 7' even when the appointment moved to the same hour on
-   * another day. Downstream that broke the WhatsApp prompt label
-   * (slotByLabelOrStart could no longer resolve it) and candidate-ranking's
-   * `AND time_slot = ?` conflict probe, which then compared a 5-hour band
-   * against the 1-hour labels every other job holds.
+   * time_slot always becomes the BAND containing the new appointment time. The
+   * 1-hour frame the operator picked is not lost — it IS the new time-of-day,
+   * carried by requested_date_time and requested_time (written just below).
+   *
+   * The `existing.time_slot` argument only comes into play for a DATE-ONLY
+   * reschedule ('2026-07-20' with no time): there is no hour to band, so the
+   * job's current label is canonicalised and kept rather than being clobbered
+   * with 'After Hours' — the midnight sentinel must never masquerade as a real
+   * appointment time.
    *
    * booking_cut_off_time_slot is a separate LEGACY derived column and keeps its
    * own legacy derivation — nothing matches on it.
    */
-  const newTimeSlot = rederiveTimeSlot(newRequested, existing.time_slot);
+  const newTimeSlot = resolveTimeSlot(existing.time_slot, newRequested);
   const newCutoffSlot = deriveBookingCutoffSlot(newRequested);
 
   // Atomic core: the schedule move + offer-expiry must commit together (an
@@ -4578,7 +4621,11 @@ async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason
     // scheduler. new Date() → pool tz +05:30 IST wall-clock, never SQL NOW().
     const rescheduledAt = new Date();
     const rescheduledBy = (actor && actor.user_id != null) ? actor.user_id : null;
-    const newRequestedTime = formatTimeIST(newRequested);
+    // requested_time = the 1-HOUR START, taken verbatim off the IST wall-clock
+    // literal. NOT formatTimeIST(): that re-parses the string as a real instant
+    // and adds +05:30 again, which on our UTC containers stored an IST 14:30
+    // appointment as requested_time '20:00' (see wallClockTime's note).
+    const newRequestedTime = wallClockTime(newRequested);
     await conn.query(
       `UPDATE tbl_job
           SET requested_date_time       = ?,
@@ -4990,4 +5037,18 @@ module.exports = {
    * live config, and so expireStaleOffers()'s gate is checkable.
    */
   offerExpiryEnabled,
+  /*
+   * The appointment slot model, re-exported so callers (and tests) reach it
+   * through job.service the way they always have. The implementations live in
+   * services/time-slot.js — require that module directly in new code.
+   *   deriveTimeSlot   — IST datetime → one of the FOUR bands
+   *   resolveTimeSlot  — the writer-side gate for tbl_job.time_slot
+   */
+  deriveTimeSlot, resolveTimeSlot,
+  /*
+   * The LEGACY "H AM - H PM" derivation for booking_cut_off_time_slot. Exported
+   * so job-magic-link.service writes that column in the SAME spelling every
+   * other create path writes it, instead of inventing a spelling of its own.
+   */
+  deriveBookingCutoffSlot,
 };

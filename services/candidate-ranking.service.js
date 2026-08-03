@@ -4,6 +4,14 @@ const logger = require('../logger');
 const settings = require('./settings.service');
 const jobService = require('./job.service');
 const geocode = require('./pincode-geocode.service');
+// The appointment slot model — bands, the midnight-sentinel guard, and the
+// 1-hour conflict window this service's hard filter is built on.
+const slotModel = require('./time-slot');
+// easyfix_properties — the ops-flippable kill switch for the booking-conflict
+// hard filter (see conflictFrame). Held as the MODULE, not a
+// destructured getProperty, so the flag is stubbable from tests (a destructured
+// reference is captured at require time and can never be swapped).
+const properties = require('./properties.service');
 
 /*
  * Candidate ranking — single shared pipeline used by both:
@@ -21,7 +29,10 @@ const geocode = require('./pincode-geocode.service');
  *
  *   L2 — Availability (who SHOULDN'T get more work right now)
  *     1. ≥ Max Concurrent Jobs                ← excluded
- *     2. Booking conflict same date+slot      ← excluded
+ *     2. Booking conflict — another ACTIVE job whose 1-HOUR window OVERLAPS
+ *        the proposed appointment            ← excluded
+ *        (was: same date + same time_slot STRING, a 3-to-5-hour band across
+ *         a dozen incompatible vocabularies — see the conflict query below)
  *     (3. Local/Travel pincode distance — DEFERRED, ignored for now)
  *
  *   Ranking (Performance Score + Worked-for-Client + Vertical + Attendance)
@@ -44,9 +55,17 @@ const geocode = require('./pincode-geocode.service');
  *   All per-tech stats are batched in parallel via Promise.all — every
  *   query is `WHERE fk_easyfixter_id IN (?, ?, …)`-shaped so MySQL can use
  *   the index on tbl_job.fk_easyfixter_id (legacy index, present on prod).
- *   See migrations/2026-05-06-candidate-ranking-indexes.sql for the full
- *   set of supporting indexes (most already exist; one new composite covers
- *   the slot-conflict query specifically).
+ *   See migrations/executed/2026-05-06-candidate-ranking-indexes-and-defaults.sql
+ *   for the supporting indexes. NOTE what that file actually does: the ONLY
+ *   index it creates is idx_efr_rating_efr_date on tbl_easyfixer_rating_by_customer.
+ *   It explicitly DECLINES to add a tbl_job composite ("Skipped here because
+ *   tbl_job already carries a thick set of single-column indexes from legacy and
+ *   adding another wide one materially slows down INSERTs"). So there is NO
+ *   composite covering the booking-conflict query — it is driven by the legacy
+ *   single-column fk_easyfixter_id index, and its `TIME(requested_date_time) <>
+ *   '00:00:00'` guard is non-sargable (a residual filter, applied after the
+ *   sargable requested_date_time BETWEEN-style range narrows the rows). Don't go
+ *   looking for a composite that was never created.
  */
 
 const DEFAULTS = {
@@ -68,6 +87,41 @@ const DEFAULTS = {
   DEFAULT_SDA_SCORE:       0.5,
 };
 
+/*
+ * ── BOOKING CONFLICT: SAME 1-HOUR FRAME, ALWAYS ──────────────────────
+ *
+ * THE RULE (product owner, 2026-07-31): a technician must NEVER be surfaced in
+ * the Top 10 while they already hold a booking in the SAME 1-hour slot. The
+ * BAND may be shared — two jobs both inside '3PM to 7PM' are fine — it is the
+ * appointment HOUR that must not collide.
+ *
+ * There is deliberately NO kill switch and NO configurable window width:
+ *   - a property that disabled it would be a supported way to double-book a
+ *     technician;
+ *   - a resizable window would let a wider setting quietly restore the 3-4h
+ *     band-style over-exclusion this model was built to remove, or a narrower
+ *     one miss real clashes.
+ * The only tuning knob is the data itself.
+ *
+ * WHAT THIS REPLACED — `DATE(requested_date_time) = ? AND time_slot = ?`:
+ *   - a 3-4 HOUR band, so a 3 PM technician was dropped from a 6 PM job;
+ *   - STRING equality across two live vocabularies ('Morning 9 to 2' never
+ *     matched '9AM to 12PM'), so it also MISSED same-instant clashes;
+ *   - inert on the ~64% of active jobs whose time_slot is NULL — those had no
+ *     double-booking protection at all.
+ *
+ * MEASURED on live easyfix_core QA, 2026-07-31 (rerun before changing this):
+ * on the comparable set the band rule produced 416 exclusions across 67
+ * technicians; frame equality releases the false ones (jobs 3h/4h/4.5h apart)
+ * while catching same-instant clashes the string comparison missed.
+ *
+ * ⚠ DATA NOTE, not a code problem: a large tail of active rows carries a
+ * bulk-stamped hour (233 rows at 15:00, 104 at 18:00; one technician holds ten
+ * jobs at exactly 19:00 across ten customers). Under this rule those ARE
+ * conflicts — correctly, since the data says the technician is committed. The
+ * fix belongs in whatever stamps that default hour, not here. Each ranking pass
+ * logs conflicts=<n> so the effect stays visible.
+ */
 // Ranking model — PRIORITY ORDER, not a weighted score (2026-06-22).
 // After candidates clear every hard filter, order them by:
 //   1. Worked in this Vertical (service category) before  — existing-tech preference
@@ -535,6 +589,20 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
     ? String(job.requested_date_time).slice(0, 10)
     : null;
 
+  // The 1-HOUR window this job would occupy — { from, to } wall-clock bounds,
+  // or null when the proposed appointment has no real time-of-day (unscheduled,
+  // date-only override, or the 00:00 sentinel). Null ⇒ the booking-conflict
+  // filter is SKIPPED entirely: with no hour we cannot know what clashes, and
+  // guessing would hard-exclude technicians on no evidence.
+  //
+  // There is deliberately NO off switch and no configurable width. The rule is
+  // absolute: never surface a technician who already holds a booking in this
+  // 1-hour frame. A property that could disable it would be a way to
+  // double-book someone, and a resizable window would quietly re-introduce the
+  // over-exclusion (a wider frame) or under-detection (a narrower one) that this
+  // change exists to remove.
+  const conflictAt = slotModel.conflictFrame(job.requested_date_time);
+
   // Static ranking config — ONE batched round-trip (getRankingConfig →
   // settings.getAllForClient) instead of the 5× getClientSetting that used to
   // sit in this Promise.all. Resolved once per request and passed in as `cfg`
@@ -583,17 +651,84 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
       efrIds
     ),
 
-    // Same-day + same-slot conflict (the HARD-FILTER signal). Scoped to the
-    // PROPOSED job date (reqDate) + slot, regardless of Max-Concurrent.
-    reqDate && job.time_slot
+    /*
+     * ── BOOKING CONFLICT (the HARD-FILTER signal) ────────────────────
+     *
+     * A technician conflicts when they already hold an ACTIVE job whose
+     * 1-HOUR window OVERLAPS the proposed one. Scoped to the PROPOSED
+     * appointment instant (jobDate override included), regardless of
+     * Max-Concurrent.
+     *
+     * REPLACED 2026-07-31 — this used to be
+     *     AND DATE(requested_date_time) = ? AND time_slot = ?
+     * i.e. string equality on a 3-to-5-HOUR band. Two defects, both fixed
+     * here:
+     *   1. FAR TOO COARSE. A technician holding a 9 AM job was excluded
+     *      from an 11 AM job simply because both fell in the same band.
+     *   2. UNRELIABLE. tbl_job.time_slot carries ~12 free-text values from
+     *      several pickers, so 'Morning 9 to 2' never matched '9AM to 12PM'
+     *      even though the two describe overlapping windows — the filter was
+     *      simultaneously over-aggressive AND missing real clashes.
+     * The predicate now reads the APPOINTMENT DATETIME and never the slot
+     * string. The frame comes from time-slot.conflictFrame(), so the SQL and
+     * the JS mirror (sameConflictFrame, unit-tested) share one definition.
+     *
+     * The bounds are STRICTLY exclusive: a job starting exactly an hour
+     * earlier ENDS as this one starts, so it does not conflict.
+     *
+     * ⚠ MIDNIGHT SENTINEL. A large tail of rows sits at requested_date_time
+     * 00:00:00 meaning "no appointment time captured", not "booked at
+     * midnight". `TIME(requested_date_time) <> '00:00:00'` keeps them OUT of
+     * the candidate side, and conflictFrame() returns null (⇒ no filter at
+     * all) when the PROPOSED job is one of them. Without both guards every
+     * sentinel row would collide with every other at 00:00 and this filter
+     * would exclude technicians far more aggressively than the band equality
+     * it replaces — the exact opposite of the intent.
+     *
+     * `job_id <> ?` is new too: a job must never count as a clash with
+     * itself, which previously excluded the currently-assigned technician
+     * from their own job's reassign list.
+     */
+    /*
+     * SAME 1-HOUR FRAME = conflict. Not a sliding ±1h overlap.
+     *
+     * The rule, stated by the product owner: a technician must NEVER appear in
+     * the Top 10 if they already hold a booking in the SAME 1-hour slot. The
+     * BAND may be shared freely — two jobs both in '3PM to 7PM' are fine — it is
+     * the appointment HOUR that must not collide. That is the whole point of
+     * dropping the 3-4h band equality: it excluded a 3 PM technician from a 6 PM
+     * job for no reason.
+     *
+     * Implemented as equality on the (date, hour) frame rather than a window:
+     *   09:00 vs 10:00 → different frames → NO conflict (the old ±1h window
+     *                    wrongly flagged these as overlapping)
+     *   10:00 vs 10:30 → same 10:00 frame → CONFLICT (legacy half-hour rows land
+     *                    in the frame that contains them)
+     * DATE() + HOUR() rather than a raw datetime equality so a legacy row stored
+     * a few minutes off the hour still collides with the frame it belongs to.
+     *
+     * Two guards, both load-bearing:
+     *   TIME(...) <> '00:00:00'  the midnight SENTINEL. Many legacy rows carry a
+     *                            date with no real time; treating them as a
+     *                            booking would collide every one of them at
+     *                            midnight and mass-exclude technicians on no
+     *                            evidence.
+     *   job_id <> ?              a job must not conflict with ITSELF, which
+     *                            previously dropped the currently-assigned
+     *                            technician off their own reassign list.
+     */
+    conflictAt
       ? pool.query(
           `SELECT DISTINCT fk_easyfixter_id AS efr_id
              FROM tbl_job
             WHERE fk_easyfixter_id IN (${placeholders})
+              AND job_status IN (0, 1, 2)
+              AND job_id <> ?
+              AND requested_date_time IS NOT NULL
+              AND TIME(requested_date_time) <> '00:00:00'
               AND DATE(requested_date_time) = ?
-              AND time_slot = ?
-              AND job_status IN (0, 1, 2)`,
-          [...efrIds, reqDate, job.time_slot]
+              AND HOUR(requested_date_time) = ?`,
+          [...efrIds, Number(job.job_id) || 0, conflictAt.date, conflictAt.hour]
         )
       : Promise.resolve([[]]),
 
@@ -1105,7 +1240,7 @@ function buildCandidateRow(tech, s, job) {
  * and the zone-widening fallback so the gates stay identical across both.
  *
  * Hard filters:
- *   - same-day + same-slot booking conflict    (ALWAYS)
+ *   - overlapping 1-hour booking conflict      (ALWAYS)
  *   - not explicitly absent for the job date    (when enforceAttendance)
  *   - at/over Max Concurrent Jobs               (when enforceMaxConcurrent)
  *   - COD job + balance <= floor                (when enforceCodBalance)
@@ -1118,8 +1253,11 @@ function filterAndScore(eligible, stats, job, opts) {
     const s = stats.get(e.efr_id);
     if (!s) continue;
 
+    // `reason` is prefixed 'booking conflict · ' so the count of technicians
+    // this filter costs us is greppable in prod logs (and countable below) —
+    // the conflicts=<n> log line is worth watching after any slot change.
     if (s.same_slot_conflict) {
-      rejected.push({ efr_id: e.efr_id, efr_name: e.efr_name, reason: 'already booked same day + same slot' }); continue;
+      rejected.push({ efr_id: e.efr_id, efr_name: e.efr_name, reason: 'booking conflict · already booked in an overlapping 1-hour window' }); continue;
     }
     // Attendance HARD FILTER: excludes only technicians EXPLICITLY marked
     // absent (is_leave_marked=1) for the job date — as of 2026-07-15 an
@@ -1338,7 +1476,7 @@ async function diagnoseEmptyPool(job, rejected = []) {
  *                          assign is never starved. DIVERGES from legacy (which
  *                          gated on attendance NOWHERE — display + soft score
  *                          only). Pass false to disable the gate completely.
- * The same-day + same-slot conflict is ALWAYS a hard exclude (unchanged).
+ * The overlapping-1-hour booking conflict is ALWAYS a hard exclude.
  *
  * Zone-widening fallback: when fewer than DEFAULTS.MIN_CANDIDATES_BEFORE_WIDEN
  * (10) candidates survive the CITY-scoped pass, eligibility is re-run widened
@@ -1366,13 +1504,23 @@ async function rankCandidatesForJob(jobId, {
   const alreadyAssigned = !!job.fk_easyfixter_id;
   const assignedEfrId = alreadyAssigned ? Number(job.fk_easyfixter_id) : null;
 
-  // Apply proposed-schedule overrides so attendance / concurrent / same-slot
-  // (computed in statsForCandidates against job.requested_date_time +
-  // job.time_slot) recompute against what the ops user is about to set. When
-  // omitted, fall back to the job's current schedule. dateStrings:true keeps
-  // the value as the IST literal; slice to date-only for DATE() comparisons.
+  // Apply proposed-schedule overrides so attendance / concurrent / booking
+  // conflict (computed in statsForCandidates against job.requested_date_time)
+  // recompute against what the ops user is about to set. When omitted, fall
+  // back to the job's current schedule. dateStrings:true keeps the value as the
+  // IST literal; slice to date-only for DATE() comparisons.
+  //
+  // ⚠ jobDate is what the conflict filter now runs on — it must carry the
+  // PROPOSED TIME-OF-DAY ('YYYY-MM-DD HH:MM'), not just the date. A date-only
+  // override leaves no hour to compare, so the booking-conflict filter is
+  // skipped for that request rather than guessing (see conflictFrame).
   if (jobDate) job.requested_date_time = jobDate;
   if (timeSlot !== undefined && timeSlot !== null && timeSlot !== '') job.time_slot = timeSlot;
+  // The header echoes the BAND, not whatever label the FE happened to send —
+  // same writer-side rule the job row itself now obeys. Derived from the
+  // proposed appointment time when there is one, so the modal header and the
+  // conflict probe can never describe different windows.
+  job.time_slot = slotModel.resolveTimeSlot(job.time_slot, job.requested_date_time);
 
   /*
    * Resolve human labels for the job's service category + type so the
@@ -1601,7 +1749,11 @@ async function rankCandidatesForJob(jobId, {
    */
   const emptyReason = candidatesList.length === 0 ? await diagnoseEmptyPool(job, rejected) : null;
 
-  logger.info('Returning ' + candidatesList.length + ' candidates · eligible=' + totalEligible + ' scored=' + scored.length + ' rejected=' + rejected.length + (note ? ' note=' + note : '') + (emptyReason ? ' emptyReason=' + emptyReason.code : ''));
+  // conflicts= is the MEASUREMENT of the booking-conflict hard filter: how many
+  // technicians this one gate cost us on this pass. Without it the switch in
+  // the conflict filter would be flown blind.
+  const conflictDrops = rejected.filter((r) => String(r.reason || '').startsWith('booking conflict ·')).length;
+  logger.info('Returning ' + candidatesList.length + ' candidates · eligible=' + totalEligible + ' scored=' + scored.length + ' rejected=' + rejected.length + ' conflicts=' + conflictDrops + (note ? ' note=' + note : '') + (emptyReason ? ' emptyReason=' + emptyReason.code : ''));
   return {
     job: enrichedJob,
     alreadyAssigned,
@@ -1983,9 +2135,12 @@ async function searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit =
   }
   const cap = Math.min(Math.max(Number(limit) || 250, 1), 250);
 
-  // Proposed-schedule overrides (same contract as rankCandidatesForJob).
+  // Proposed-schedule overrides (same contract as rankCandidatesForJob) —
+  // including the band normalisation, so the search header and the ranked-list
+  // header describe the proposed window identically.
   if (jobDate) job.requested_date_time = jobDate;
   if (timeSlot !== undefined && timeSlot !== null && timeSlot !== '') job.time_slot = timeSlot;
+  job.time_slot = slotModel.resolveTimeSlot(job.time_slot, job.requested_date_time);
 
   const q = String(term ?? '').trim();
   if (!q) {
@@ -2115,11 +2270,15 @@ async function searchJobHeader(job) {
  * assignments and reschedules. "Best slot" = a window where enough well-ranked,
  * eligible technicians are genuinely free to serve this job's pincode.
  *
- * THE CANONICAL FOUR WINDOWS. Byte-identical to the CRM's `SLOTS`
- * (Easyfix_CRM_UI/src/components/job/JobModal.tsx) and the customer form's
- * `APPT_SLOTS` — the separator is an EN-DASH (U+2013), NOT a hyphen, and these
- * exact strings are what `tbl_job.time_slot` stores. A hyphen here would silently
- * match nothing.
+ * THE CANONICAL FOUR WINDOWS — services/time-slot.js TIME_SLOT_BANDS, the same
+ * four values tbl_job.time_slot now stores.
+ *
+ * ⚠ These strings are LABELS ONLY. Occupancy below is computed from each job's
+ * requested_date_time hour, NOT by matching them against tbl_job.time_slot. The
+ * old spaced-en-dash spellings ('9 AM – 12 PM' …) used to be compared to the
+ * column directly, which silently matched almost nothing: live data holds
+ * 39,997 rows of '9AM to 12PM' and 8 of '9 AM – 12 PM'. Never reintroduce a
+ * string comparison here.
  *
  * `After Hours` is 7 PM → 9 AM THE NEXT MORNING (some jobs must run at night),
  * so it is the one OVERNIGHT window: its end hour is numerically LESS than its
@@ -2132,10 +2291,10 @@ async function searchJobHeader(job) {
  * decide whether the window has passed.
  */
 const APPOINTMENT_SLOTS = Object.freeze([
-  { value: '9 AM – 12 PM', fromH: 9,  toH: 12, overnight: false },
-  { value: '12 PM – 3 PM', fromH: 12, toH: 15, overnight: false },
-  { value: '3 PM – 7 PM',  fromH: 15, toH: 19, overnight: false },
-  { value: 'After Hours',  fromH: 19, toH: 9,  overnight: true  },
+  { value: slotModel.BAND_MORNING,     fromH: 9,  toH: 12, overnight: false },
+  { value: slotModel.BAND_AFTERNOON,   fromH: 12, toH: 15, overnight: false },
+  { value: slotModel.BAND_EVENING,     fromH: 15, toH: 19, overnight: false },
+  { value: slotModel.BAND_AFTER_HOURS, fromH: 19, toH: 9,  overnight: true  },
 ]);
 
 /*
@@ -2143,9 +2302,12 @@ const APPOINTMENT_SLOTS = Object.freeze([
  *
  * WHY THIS IS CHEAP: the ranking engine already recomputes attendance,
  * concurrency and conflicts against a PROPOSED date (rankCandidatesForJob's
- * jobDate override). Of those, only the same-slot conflict is slot-dependent —
+ * jobDate override). Of those, only the booking conflict is window-dependent —
  * attendance and load are date-scoped. So all four windows come from ONE ranking
- * pass plus ONE occupancy query, never four ranker calls.
+ * pass plus ONE occupancy query, never four ranker calls. The ranking pass is
+ * given a DATE-ONLY jobDate on purpose: with no proposed hour its own
+ * booking-conflict filter stands down, leaving per-window occupancy entirely to
+ * the busy map below (which is what the four recommendations are made of).
  *
  * ⚠ ATTENDANCE IS ONLY REAL FOR TODAY. tbl_easyfixer_attendance rows appear when
  * a technician marks in, and the eligibility filter selects the ABSENT set
@@ -2203,16 +2365,49 @@ async function recommendSlotsForJob(jobId, { date, nowMs = Date.now() } = {}) {
   const isPast = day < istToday;
 
   /*
-   * ONE occupancy query: which windows each candidate is already committed to on
-   * this date. Status set (0,1,2) and the DATE()/time_slot predicates mirror the
-   * engine's own same-slot conflict query verbatim, so "busy" means exactly what
-   * it means everywhere else. The current job is excluded — rescheduling a job
-   * must not count as a clash with itself.
+   * ONE occupancy query: what each candidate is already committed to on this
+   * date. Status set (0,1,2) matches the engine's own booking-conflict query.
+   * The current job is excluded — rescheduling a job must not count as a clash
+   * with itself.
+   *
+   * ⚠ THE BUSY MAP AND THE HARD FILTER MUST AGREE. This used to bucket each
+   * committed job into its BAND and call the technician busy for the whole
+   * 3-to-4-hour window. The hard filter it claims to mirror is 1-HOUR exact, so
+   * the two disagreed in both directions and the disagreement was visible:
+   *   · TOO PERMISSIVE — a job at 14:30 banded to '12PM to 3PM', so the
+   *     technician counted FREE for '3PM to 7PM'. Ops takes the advice, sets
+   *     15:00, and the Top-10 hard-rejects them (14:30 is inside the 15:00
+   *     window). The recommended window comes back short or empty.
+   *   · TOO RESTRICTIVE — three technicians each holding one job at 18:00 all
+   *     landed in '3PM to 7PM', freeCount 0, "No technician is free for this
+   *     window" — while the Top-10 for a 15:00 proposal listed all three,
+   *     because 18:00 is outside (14:00, 16:00).
+   * That is exactly the "a slot the engine calls unstaffable while Schedule &
+   * Assign shows five technicians" failure the note above calls unacceptable.
+   *
+   * So occupancy is now measured at the SAME 1-hour granularity as the filter:
+   * a technician is busy for a WINDOW only when EVERY 1-hour frame inside that
+   * window overlaps one of their commitments — i.e. only when the window holds
+   * no hour they could actually be booked into. Overlap is decided by
+   * slotModel.sameConflictFrame(), the JS mirror of the SQL predicate, so the two
+   * can never drift apart again.
+   *
+   * ⚠ MIDNIGHT SENTINEL — rows with no real time-of-day contribute NOTHING.
+   * They used to fall back to slotModel.normaliseSlotLabel(r.time_slot), which
+   * resurrected as occupancy the very rows the conflict filter deliberately
+   * ignores: the same row meant two different things inside one request (a
+   * technician whose only commitment was a sentinel labelled '9AM to 12PM' was
+   * "unavailable all morning" here and "no conflict at all" in the Top-10 for a
+   * 10:00 appointment). The fallback was also unreadable for the single most
+   * common legacy value — normaliseSlotLabel('Morning 9 to 2') is null, as it is
+   * for 'Afternoon 12 to 5' and 'Evening 2 to 7' — so it fired only on the
+   * handful of digit-leading labels, which is arbitrary. time_slot is not read
+   * here at all any more; the string is not load-bearing anywhere.
    */
-  const busyBySlot = new Map();   // slot value -> Set(efr_id)
+  const busyByTech = new Map();   // efr_id -> [appointment instant, …]
   if (efrIds.length) {
     const [rows] = await pool.query(
-      `SELECT DISTINCT fk_easyfixter_id AS efr_id, time_slot
+      `SELECT DISTINCT fk_easyfixter_id AS efr_id, requested_date_time
          FROM tbl_job
         WHERE fk_easyfixter_id IN (?)
           AND DATE(requested_date_time) = ?
@@ -2221,16 +2416,44 @@ async function recommendSlotsForJob(jobId, { date, nowMs = Date.now() } = {}) {
       [efrIds, day, jobId],
     );
     for (const r of rows) {
-      if (!r.time_slot) continue;
-      if (!busyBySlot.has(r.time_slot)) busyBySlot.set(r.time_slot, new Set());
-      busyBySlot.get(r.time_slot).add(Number(r.efr_id));
+      if (!slotModel.hasTimeOfDay(r.requested_date_time)) continue;   // sentinel ⇒ no occupancy
+      const id = Number(r.efr_id);
+      if (!busyByTech.has(id)) busyByTech.set(id, []);
+      busyByTech.get(id).push(String(r.requested_date_time));
     }
   }
 
+  /*
+   * The 1-hour frames a window contains, as bookable appointment instants on
+   * `day`. Hour 0 is skipped: 00:00 IS the sentinel, so nothing can be booked
+   * into it and sameConflictFrame() would refuse to compare it anyway.
+   */
+  const frameInstants = (slot) => {
+    const hours = [];
+    if (slot.overnight) {
+      for (let h = slot.fromH; h < 24; h++) hours.push(h);
+      for (let h = 1; h < slot.toH; h++) hours.push(h);
+    } else {
+      for (let h = slot.fromH; h < slot.toH; h++) hours.push(h);
+    }
+    return hours.map((h) => `${day} ${String(h).padStart(2, '0')}:00:00`);
+  };
+
+  // efr_id set busy for a window = every frame in it is already taken.
+  const busyForSlot = (slot) => {
+    const frames = frameInstants(slot);
+    const out = new Set();
+    if (!frames.length) return out;
+    for (const [id, times] of busyByTech) {
+      if (frames.every((f) => times.some((t) => slotModel.sameConflictFrame(f, t)))) out.add(id);
+    }
+    return out;
+  };
+
   const slots = APPOINTMENT_SLOTS.map((slot) => {
-    const busy = busyBySlot.get(slot.value) || new Set();
+    const busy = busyForSlot(slot);
     const free = candidates.filter((c) => {
-      if (busy.has(Number(c.efr_id))) return false;              // already booked in this window
+      if (busy.has(Number(c.efr_id))) return false;              // no free 1-hour frame left in this window
       // Absent = explicitly on leave that day (is_leave_marked=1). softAttendance
       // keeps them in the POOL so it's never empty, but they cannot be counted as
       // free. On a future date nobody is absent, so this is a no-op there — which

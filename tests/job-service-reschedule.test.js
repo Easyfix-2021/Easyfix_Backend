@@ -13,8 +13,8 @@ const { test, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 const { installFakePool } = require('./helpers/fake-pool');
 
-// `time_slot` is read by reschedule so the slot re-derive can stay in the job's
-// OWN vocabulary (1-hour frame vs. legacy band) — see rederiveTimeSlot.
+// `time_slot` is read by reschedule ONLY as the fallback for a date-only move
+// (no hour to band) — see resolveTimeSlot in services/time-slot.js.
 const DEFAULTS = () => ({ existing: { job_id: 42, fk_easyfixter_id: null, time_slot: null } });
 const scenario = DEFAULTS();
 
@@ -62,43 +62,87 @@ test('reschedule moves ONLY the schedule columns, not the mobile extras columns'
 });
 
 /*
- * The slot re-derive must stay in the job's OWN vocabulary.
+ * ─── time_slot IS ALWAYS A BAND ──────────────────────────────────────
  *
- * reschedule() used to re-derive time_slot with the legacy 4-band
- * deriveTimeSlot() unconditionally, and the write is `COALESCE(?, time_slot)`
- * — a guard that only fires when the derive returns null, i.e. never once the
- * date has parsed. So every reschedule OVERWROTE a customer-confirmed 1-hour
- * frame with a 5-hour band, breaking both the WhatsApp label round-trip
- * (slotByLabelOrStart) and candidate-ranking's `AND time_slot = ?` conflict
- * probe. 14:30 is deliberately inside BOTH vocabularies' afternoon range so the
- * two cases below differ only by the job's existing value.
+ * REVERSED 2026-07-31. For one day reschedule() PRESERVED a 1-hour frame label
+ * ('3 PM–4 PM') in tbl_job.time_slot; that decision is undone. time_slot now
+ * carries only the four broad bands, and the 1-hour granularity the operator
+ * picked lives in requested_date_time / requested_time.
+ *
+ * 14:30 is used throughout because it sits in the 12PM-to-3PM band while being
+ * a time no band label spells out — so a test passing by coincidence is
+ * unlikely.
  */
-async function reschedTo(dt) {
+async function rescheduleTo(dt) {
   await assert.rejects(
     () => jobSvc.reschedule(42, { requestedDateTime: dt, reasonId: 3 }, { user_id: 9 }),
   );
   const upd = fake.calls.find((c) => /UPDATE tbl_job\b/.test(c.sql));
   assert.ok(upd, 'the schedule UPDATE must be issued');
   // Param order mirrors the SET list: requested_date_time, requested_time, time_slot, …
-  return upd.params[2];
+  return { requestedDateTime: upd.params[0], requestedTime: upd.params[1], timeSlot: upd.params[2] };
 }
 
-test('a 1-hour slot is re-derived as a 1-HOUR slot, never a legacy band', async () => {
+const BANDS = ['9AM to 12PM', '12PM to 3PM', '3PM to 7PM', 'After Hours'];
+
+test('a job holding a 1-hour frame is re-derived to the BAND, never another frame', async () => {
   scenario.existing.time_slot = '3 PM–4 PM';
-  assert.equal(await reschedTo('2026-07-20 14:30'), '2 PM–3 PM');
+  assert.equal((await rescheduleTo('2026-07-20 14:30')).timeSlot, '12PM to 3PM');
 });
 
-test('an absent slot re-derives into the CURRENT 1-hour vocabulary', async () => {
-  scenario.existing.time_slot = null;
-  assert.equal(await reschedTo('2026-07-20 14:30'), '2 PM–3 PM');
-});
-
-test('a job still holding a LEGACY band keeps the legacy vocabulary', async () => {
+test('a job holding a LEGACY band is re-derived onto the canonical vocabulary', async () => {
+  // Deliberately NOT a data migration: only the row being rescheduled moves,
+  // and it moves because the appointment time changed, not because of its label.
   scenario.existing.time_slot = 'Morning 9 to 2';
-  assert.equal(await reschedTo('2026-07-20 14:30'), 'Evening 2 to 7');
+  assert.equal((await rescheduleTo('2026-07-20 14:30')).timeSlot, '12PM to 3PM');
 });
 
-test('out-of-window hours land on After Hours in the 1-hour vocabulary', async () => {
+test('an absent slot is derived from the new appointment time', async () => {
+  scenario.existing.time_slot = null;
+  assert.equal((await rescheduleTo('2026-07-20 09:15')).timeSlot, '9AM to 12PM');
+});
+
+test('out-of-window hours land on After Hours', async () => {
   scenario.existing.time_slot = '3 PM–4 PM';
-  assert.equal(await reschedTo('2026-07-20 21:00'), 'After Hours');
+  assert.equal((await rescheduleTo('2026-07-20 21:00')).timeSlot, 'After Hours');
+});
+
+test('reschedule NEVER writes a 1-hour label, at any hour of the day', async () => {
+  for (let h = 0; h < 24; h += 1) {
+    fake.reset();
+    scenario.existing.time_slot = '3 PM–4 PM';
+    const hh = String(h).padStart(2, '0');
+    const { timeSlot } = await rescheduleTo(`2026-07-20 ${hh}:30`);
+    assert.ok(BANDS.includes(timeSlot), `${hh}:30 stored time_slot=${timeSlot}`);
+  }
+});
+
+/*
+ * A DATE-ONLY reschedule carries no hour, so the midnight sentinel must not be
+ * mistaken for a real 00:00 appointment and clobber the slot with 'After
+ * Hours'. The job's own label is canonicalised and kept instead.
+ */
+test('a date-only reschedule keeps the job’s own slot instead of banding midnight', async () => {
+  scenario.existing.time_slot = '3 PM–4 PM';
+  assert.equal((await rescheduleTo('2026-07-20')).timeSlot, '3PM to 7PM');
+});
+
+/*
+ * requested_time is the 1-HOUR START and must be the wall clock verbatim.
+ * It used to go through formatTimeIST(), which re-parses an already-IST string
+ * as a real instant and adds +05:30 again — on a UTC container an IST 14:30
+ * appointment was stored as requested_time '20:00' (see prod job 482474).
+ * Asserted under a forced UTC timezone so the regression cannot hide on an
+ * IST developer laptop.
+ */
+test('requested_time is the IST wall clock, not double-shifted by +05:30', async () => {
+  const savedTz = process.env.TZ;
+  process.env.TZ = 'UTC';
+  try {
+    const { requestedDateTime, requestedTime } = await rescheduleTo('2026-07-20 14:30');
+    assert.ok(String(requestedDateTime).startsWith('2026-07-20 14:30'));
+    assert.equal(requestedTime, '14:30');
+  } finally {
+    if (savedTz === undefined) delete process.env.TZ; else process.env.TZ = savedTz;
+  }
 });

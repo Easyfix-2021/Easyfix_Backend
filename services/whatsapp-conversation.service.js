@@ -5,6 +5,10 @@ const maps = require('./maps.service');
 const jml = require('./job-magic-link.service');
 const addressService = require('./address.service');
 const s3 = require('../utils/s3-storage');
+// The appointment slot model. The chat OFFERS 1-hour frames; STORAGE is
+// requested_date_time + requested_time (the 1-hour start) and a BAND in
+// time_slot. See services/time-slot.js.
+const slotModel = require('./time-slot');
 
 /*
  * services/whatsapp-conversation.service.js
@@ -172,15 +176,18 @@ function istTimeString(nowMs = Date.now()) {
  * The 1-HOUR appointment frames the customer may choose (IST wall-clock).
  * 9 AM → 7 PM, i.e. ten one-hour frames starting on the hour.
  *
- * ⚠ LABEL WIDTH: the en-dash carries NO surrounding spaces, unlike the legacy
- * 3-hour labels in job-magic-link.service.js TIME_SLOTS ('3 PM – 7 PM'). The
- * label is written to tbl_job.time_slot, whose width is not declared in any
- * migration we own (legacy column) and whose longest legacy value is exactly
- * 12 chars. Dropping the spaces caps every label at 11 chars, so a narrow
- * VARCHAR cannot silently truncate — truncation would break the
- * `AND time_slot = ?` equality candidate-ranking relies on.
+ * PRESENTATION ONLY. These labels are what the customer sees and taps; the
+ * chosen frame's START is what gets persisted (requested_date_time's
+ * time-of-day + requested_time), and tbl_job.time_slot receives the BAND
+ * containing it. No label from this list is ever written to a column, so the
+ * old "the en-dash spacing is load-bearing because candidate-ranking does
+ * `AND time_slot = ?`" constraint is retired — that equality is gone (the
+ * conflict test is a datetime overlap now). Spelling is kept stable anyway
+ * because parseOneHourSlot round-trips our own echoed labels.
+ *
+ * Shared shape with services/time-slot.js SLOT_START_HOURS — same ten hours.
  */
-const SLOT_START_HOURS = Object.freeze([9, 10, 11, 12, 13, 14, 15, 16, 17, 18]);
+const SLOT_START_HOURS = slotModel.SLOT_START_HOURS;
 
 function hour12Label(h) {
   const suffix = h < 12 ? 'AM' : 'PM';
@@ -574,10 +581,12 @@ async function updateConversation(id, fields, pool) {
  *
  * {{date}}    ← tbl_job.requested_date_time (the scheduled/appointment date;
  *               `original_appointment_date_time` is the pre-reschedule
- *               SNAPSHOT, so it is NOT what the customer should be shown) plus
- *               tbl_job.time_slot, falling back to tbl_job.requested_time.
- *               requested_time is HH:MM-style TEXT, hence the string handling
- *               rather than date arithmetic.
+ *               SNAPSHOT, so it is NOT what the customer should be shown) —
+ *               BOTH its date (`appointment_date`) and its hour
+ *               (`appointment_time`), falling back to tbl_job.time_slot's band
+ *               label only when the hour is the 00:00 sentinel. See
+ *               jobDateLabel for why the legacy requested_time TEXT column is
+ *               projected but NOT used for the hour.
  * {{address}} ← tbl_address (via tbl_job.fk_address_id) `address` + `landmark`
  *               + tbl_city.city_name + `pin_code`. See composeAddressLine for
  *               why `building` is excluded.
@@ -589,6 +598,14 @@ async function loadJobForConversation(jobId, pool) {
   const [[job]] = await pool.query(
     `SELECT j.job_id, j.job_status, j.time_slot, j.requested_time,
             DATE_FORMAT(j.requested_date_time, '%Y-%m-%d') AS appointment_date,
+            -- The AUTHORITATIVE appointment hour. requested_time is a legacy
+            -- TEXT twin that is corrupted on historical rows (job.service's old
+            -- reschedule ran an IST wall-clock literal back through
+            -- formatTimeIST(), adding +05:30 a second time — job 482474 has
+            -- requested_date_time 16:00 and requested_time 21:30), and those
+            -- rows are deliberately NOT migrated. So the DATETIME's own
+            -- time-of-day is projected and preferred; see jobDateLabel.
+            DATE_FORMAT(j.requested_date_time, '%H:%i') AS appointment_time,
             j.fk_address_id,
             c.customer_mob_no,
             COALESCE(j.job_customer_name, c.customer_name) AS customer_name,
@@ -608,18 +625,35 @@ async function loadJobForConversation(jobId, pool) {
 
 /*
  * Human {{date}} value: "Wed, 05 Aug 2026" plus the booked window when one is
- * on file ("Wed, 05 Aug 2026, 3 PM – 7 PM"). Returns null when the job has no
+ * on file ("Wed, 05 Aug 2026, 3 PM"). Returns null when the job has no
  * scheduled date at all — the caller substitutes a friendly fallback so the
  * template never renders "null"/"undefined".
+ *
+ * PRECEDENCE 2026-07-31 — the APPOINTMENT HOUR first, the band only as the
+ * fallback. The customer chose a 1-hour frame, so telling them "3 PM" is both
+ * more precise and what they actually said; echoing "3PM to 7PM" back would
+ * read as if we'd lost their choice.
+ *
+ * ⚠ THE HOUR COMES FROM requested_date_time, NOT requested_time. The two are
+ * supposed to be twins, but requested_time is corrupted on every row that ever
+ * passed through the old reschedule() — it re-parsed an IST wall-clock literal
+ * as a real instant and added +05:30 again, so job 482474 carries
+ * requested_date_time 16:00 alongside requested_time 21:30. Historical rows are
+ * deliberately not migrated, so preferring the TEXT column would have sent that
+ * customer a template reading "9:30 PM" for a 4 PM appointment. requested_date_time
+ * is the appointment instant by definition and cannot drift from itself; it is
+ * projected as `appointment_time` in loadJobForConversation.
+ *
+ * Legacy rows with no usable hour at all (the 00:00 sentinel) still fall back to
+ * whatever label time_slot carries, in whichever of the dozen vocabularies it
+ * happens to use — coarse, but never a wrong hour.
  */
 function jobDateLabel(job) {
   const dateLabel = formatCustomerDateLabel(job && job.appointment_date);
   if (!dateLabel) return null;
-  const slot = job.time_slot && String(job.time_slot).trim();
-  if (slot) return `${dateLabel}, ${slot}`;
-  // requested_time is HH:MM(:SS) TEXT — a separate legacy column, not a date.
-  // '00:00' is the "no time captured" sentinel on legacy rows, so skip it.
-  const t = /^(\d{1,2}):(\d{2})/.exec(String(job.requested_time || '').trim());
+  // appointment_time is 'HH:MM' projected off requested_date_time. '00:00' is
+  // the "no time captured" sentinel on legacy rows, so skip it.
+  const t = /^(\d{1,2}):(\d{2})/.exec(String((job && job.appointment_time) || '').trim());
   if (t) {
     const h = Number(t[1]);
     const mins = t[2];
@@ -629,6 +663,8 @@ function jobDateLabel(job) {
       return `${dateLabel}, ${mins === '00' ? `${h12} ${suffix}` : `${h12}:${mins} ${suffix}`}`;
     }
   }
+  const slot = job.time_slot && String(job.time_slot).trim();
+  if (slot) return `${dateLabel}, ${slot}`;
   return dateLabel;
 }
 
@@ -1068,20 +1104,35 @@ async function stepSlot(convo, ctx, inbound, to, pool, meta) {
  * fire notifications on a customer tap, which is exactly what that bypass
  * exists to prevent.
  *
- * Columns written on tbl_job: requested_date_time (IST 'YYYY-MM-DD HH:MM:SS'),
- * time_slot (1-hour label), requested_time (HH:MM start — the legacy text
- * column), customer_submitted_at, customer_submitted_payload, last_update_time.
+ * Columns written on tbl_job: requested_date_time (IST 'YYYY-MM-DD HH:MM:SS',
+ * its time-of-day = the 1-hour frame's START), requested_time (that same start
+ * as the legacy HH:MM text column), time_slot (the BROAD BAND containing it),
+ * customer_submitted_at, customer_submitted_payload, last_update_time.
+ *
+ * ⚠ THE CHAT STILL OFFERS 1-HOUR FRAMES — only the STORAGE changed
+ * (2026-07-31). We used to write the frame LABEL ('3 PM–4 PM') into time_slot,
+ * which made that column speak yet another vocabulary. time_slot is now
+ * strictly one of the four bands; the customer's 1-hour choice survives in
+ * requested_date_time / requested_time, which is where the ranking engine's
+ * conflict window reads it from. `slot.label` is kept in the audit payload so
+ * the exact frame the customer picked is never lost.
  */
 async function finaliseConfirmed(convo, ctx, { date, slot }, to, pool, meta) {
   // IST wall-clock literal. The pool is `timezone: '+05:30'` + dateStrings, so a
   // pre-formatted string stores verbatim — no driver UTC conversion, and no SQL
   // NOW() for an application timestamp.
   const requestedDateTime = `${date} ${slot.start}:00`;
+  // The band CONTAINING the chosen frame — derived from the appointment
+  // instant, exactly as every other write path derives it.
+  const band = slotModel.deriveTimeSlot(requestedDateTime);
   const payload = {
     ...ctx,
     channel: 'whatsapp_conversation',
     confirmed_date: date,
-    time_slot: slot.label,
+    // Audit: BOTH the band we store and the 1-hour frame the customer actually
+    // tapped, so the choice is reconstructable from the payload alone.
+    time_slot: band,
+    slot_label: slot.label,
     requested_time: slot.start,
     requested_date_time: requestedDateTime,
     confirmed_via: ctx.branch === 'reschedule' ? 'reschedule' : 'confirm',
@@ -1090,7 +1141,7 @@ async function finaliseConfirmed(convo, ctx, { date, slot }, to, pool, meta) {
 
   await jml.writeCustomerOrderDetails(convo.job_id, {
     requested_date_time: requestedDateTime,
-    time_slot: slot.label,
+    time_slot: band,
     requested_time: slot.start,
     payload,
   }, pool);

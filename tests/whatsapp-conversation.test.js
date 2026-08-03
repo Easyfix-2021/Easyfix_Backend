@@ -142,10 +142,12 @@ test('ONE_HOUR_SLOTS are ten 1-HOUR frames, 9 AM → 7 PM', () => {
   assert.equal(convo.ONE_HOUR_SLOTS[9].label, '6 PM–7 PM');
   for (const s of convo.ONE_HOUR_SLOTS) {
     assert.equal(Number(s.end.slice(0, 2)) - Number(s.start.slice(0, 2)), 1, `${s.label} must span exactly one hour`);
-    // tbl_job.time_slot is a legacy VARCHAR whose width we do not own; the
-    // longest legacy value is 12 chars, so stay within that or a truncated
-    // write would break `AND time_slot = ?` equality matching.
-    assert.ok(s.label.length <= 12, `${s.label} (${s.label.length}) must fit the legacy time_slot width`);
+    // These labels are PRESENTATION ONLY as of 2026-07-31 — none of them is
+    // written to tbl_job.time_slot any more (that column takes the containing
+    // BAND; the frame survives as requested_date_time / requested_time). The
+    // width bound is kept anyway: it costs nothing and the labels also ride in
+    // WhatsApp quick replies, which have their own length limits.
+    assert.ok(s.label.length <= 12, `${s.label} (${s.label.length}) must stay short`);
   }
 });
 
@@ -238,16 +240,39 @@ test('formatCustomerDateLabel renders a customer-friendly date', () => {
   assert.equal(convo.formatCustomerDateLabel('garbage'), null);
 });
 
-test('jobDateLabel prefers the booked time_slot, then requested_time', () => {
+/*
+ * PRECEDENCE 2026-07-31. The APPOINTMENT HOUR wins and the band is only the
+ * fallback: the customer tapped a 1-hour frame, so echoing "3PM to 7PM" back at
+ * them would read as if we had lost their choice.
+ *
+ * ⚠ The hour is `appointment_time`, projected off requested_date_time — NOT the
+ * legacy requested_time TEXT column, which is corrupted on every row that passed
+ * through the old reschedule() (an IST literal re-shifted by +05:30: job 482474
+ * is requested_date_time 16:00 / requested_time 21:30). Those rows are not
+ * migrated, so reading the text column would send a 4 PM customer "9:30 PM".
+ * The last case below pins exactly that.
+ */
+test('jobDateLabel prefers the appointment hour, then falls back to time_slot', () => {
+  assert.equal(convo.jobDateLabel({ appointment_date: '2026-08-05', time_slot: '3PM to 7PM', appointment_time: '15:00' }),
+    'Wed, 05 Aug 2026, 3 PM', 'the 1-hour start wins over the broad band');
   assert.equal(convo.jobDateLabel({ appointment_date: '2026-08-05', time_slot: '3 PM – 7 PM' }),
-    'Wed, 05 Aug 2026, 3 PM – 7 PM');
-  assert.equal(convo.jobDateLabel({ appointment_date: '2026-08-05', requested_time: '14:00' }),
+    'Wed, 05 Aug 2026, 3 PM – 7 PM', 'a legacy row with no usable hour still shows its band');
+  assert.equal(convo.jobDateLabel({ appointment_date: '2026-08-05', time_slot: '3 PM – 7 PM', appointment_time: '00:00' }),
+    'Wed, 05 Aug 2026, 3 PM – 7 PM', 'the 00:00 sentinel is skipped, not rendered as midnight');
+  assert.equal(convo.jobDateLabel({ appointment_date: '2026-08-05', appointment_time: '14:00' }),
     'Wed, 05 Aug 2026, 2 PM');
-  assert.equal(convo.jobDateLabel({ appointment_date: '2026-08-05', requested_time: '14:30' }),
+  assert.equal(convo.jobDateLabel({ appointment_date: '2026-08-05', appointment_time: '14:30' }),
     'Wed, 05 Aug 2026, 2:30 PM');
-  assert.equal(convo.jobDateLabel({ appointment_date: '2026-08-05', requested_time: '00:00' }),
+  assert.equal(convo.jobDateLabel({ appointment_date: '2026-08-05', appointment_time: '00:00' }),
     'Wed, 05 Aug 2026', 'the 00:00 legacy sentinel is not shown');
   assert.equal(convo.jobDateLabel({ appointment_date: null }), null, 'no date → caller uses the fallback string');
+  // THE REGRESSION: job 482474's real shape. The corrupted TEXT column must
+  // never reach the customer.
+  assert.equal(
+    convo.jobDateLabel({ appointment_date: '2026-08-05', appointment_time: '16:00', requested_time: '21:30', time_slot: '3PM to 7PM' }),
+    'Wed, 05 Aug 2026, 4 PM',
+    'the corrupted legacy requested_time is ignored in favour of the appointment instant',
+  );
 });
 
 test('composeAddressLine strips newlines — WhatsApp rejects them in a template parameter', () => {
@@ -312,6 +337,9 @@ const JOB_ROW = {
   time_slot: '3 PM – 7 PM',
   requested_time: '15:00',
   appointment_date: '2026-08-05',
+  // Projected off requested_date_time by loadJobForConversation — the hour
+  // jobDateLabel actually renders.
+  appointment_time: '15:00',
   fk_address_id: 10,
   customer_mob_no: '9876543210',
   customer_name: 'Asha',
@@ -340,7 +368,8 @@ test('startConversation sends `customer_interactive_msg` with NAMED bodyValues +
     assert.deepEqual(Object.keys(t.bodyValues).sort(), ['address', 'client_name', 'date', 'name']);
     assert.equal(t.bodyValues.client_name, 'For Testing');
     assert.equal(t.bodyValues.name, 'Asha');
-    assert.equal(t.bodyValues.date, 'Wed, 05 Aug 2026, 3 PM – 7 PM');
+    // JOB_ROW carries requested_time 15:00, which now outranks the band label.
+    assert.equal(t.bodyValues.date, 'Wed, 05 Aug 2026, 3 PM');
     assert.equal(t.bodyValues.address, 'Flat 4B, Tower 2, Near Metro, Gurugram, 122003');
     assert.deepEqual(t.buttonValues.map((b) => b.payload),
       ['Yes, Confirm', 'Need a Reschdeule', 'Service Not Required']);
@@ -361,7 +390,7 @@ test('startConversation substitutes a graceful fallback when the job has no sche
   const stub = stubTemplate();
   try {
     const fake = makeFakePool([
-      [/FROM tbl_job j/, [{ ...JOB_ROW, appointment_date: null, time_slot: null, requested_time: null }]],
+      [/FROM tbl_job j/, [{ ...JOB_ROW, appointment_date: null, appointment_time: null, time_slot: null, requested_time: null }]],
       [/SELECT conversation_id FROM tbl_whatsapp_conversation/, []],
       [/INSERT INTO tbl_whatsapp_conversation/, { insertId: 8 }],
     ]);

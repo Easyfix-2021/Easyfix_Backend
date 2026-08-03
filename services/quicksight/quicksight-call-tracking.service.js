@@ -1,13 +1,15 @@
 /*
  * QuickSight — Call Tracking service.
  *
- * Answers three questions off ONE call log:
+ * Answers four questions off ONE call log:
  *   1. per JOB   — how much phoning did this job take, by whom, to whom, and at
  *                  which lifecycle step was each call made;
  *   2. per (DAY, USER) — how much calling did each CRM user do on each day, and
  *                  where in the job lifecycle was that effort mostly spent;
- *   3. per DAY   — a gap-filled volume/connect trend for the chart.
- * Plus a per-call drill-down behind every number, and a 2-sheet XLSX.
+ *   3. per USER over the WHOLE window — the same effort collapsed to one row per
+ *                  caller, plus the per-day efficiency averages (byUserCombined);
+ *   4. per DAY   — a gap-filled volume/connect trend for the chart.
+ * Plus a per-call drill-down behind every number, and a 3-sheet XLSX.
  *
  * ── Data rules (settled by the lead — do NOT re-litigate) ───────────────────
  * BASE TABLE is the LEGACY tbl_job_caller_info (alias jci), PK job_caller_info.
@@ -297,6 +299,48 @@ const CALL_AGG = `
       -- renders as a dash, which is the honest value — hence the nullable type.
       ROUND(AVG(CASE WHEN COALESCE(jci.duration, 0) > 0 THEN jci.duration END)) AS avg_duration_secs`;
 
+/*
+ * ── ACTIVE DAYS — the denominator of every "per day" average ────────────────
+ *
+ * The number of distinct IST calendar days on which this caller placed AT LEAST
+ * ONE call. NOT the number of days in the selected range, and this distinction
+ * is the whole point of the combined grain:
+ *
+ *   Dividing by RANGE days silently penalises weekends, leave, holidays and
+ *   part-period joiners. A strong caller who worked 3 days of a 30-day window
+ *   would read at 1/10th of their real intensity, and the column would end up
+ *   ranking people by ATTENDANCE rather than by how hard they worked on the days
+ *   they worked — which is the question "efficiency" is asking.
+ *
+ * It is COUNTED IN SQL, deliberately, and must stay that way: byUser is capped
+ * at ROW_CAP day-rows, so deriving active days by counting a user's rows in that
+ * array would UNDER-count the denominator the moment the cap bites and INFLATE
+ * every average built on it. The cap can drop rows; COUNT(DISTINCT …) cannot.
+ *
+ * Expressed through DAY_EXPR — the same day expression the (day, user) grain
+ * groups by — so the denominator counts exactly the days that grain would emit.
+ * (Semantically identical to COUNT(DISTINCT DATE(jci.inserted_time)); written
+ * this way so the two grains can never bucket a day differently.)
+ */
+const ACTIVE_DAYS = `COUNT(DISTINCT ${DAY_EXPR}) AS active_days`;
+
+/*
+ * A "per day" average over ACTIVE days.
+ *
+ * Returns null — never 0, NaN or Infinity — when there is no denominator, the
+ * same convention avgDurationSecs already uses for "nothing connected". The FE
+ * renders null as an em-dash: "we cannot divide" and "the answer is zero" are
+ * different facts and must not print the same. activeDays is >= 1 for any user
+ * who has a call at all, so the guard is defensive, but a silent Infinity in an
+ * efficiency ranking is exactly the failure worth being defensive about.
+ */
+function perDay(total, activeDays, decimals = 0) {
+  const days = n(activeDays);
+  if (days <= 0) return null;
+  const f = 10 ** decimals;
+  return Math.round((n(total) / days) * f) / f;
+}
+
 // Shape one aggregate row into the response's shared numeric block.
 function shapeAgg(r) {
   const calls = n(r && r.calls);
@@ -436,6 +480,43 @@ async function getCallTracking(filters = {}) {
   if (userRows.length >= ROW_CAP) logger.warn(`Call Tracking (daily by user) hit the ${ROW_CAP}-row cap`);
 
   /*
+   * ── Per-USER grain, WHOLE WINDOW ──
+   * The SECOND aggregation grain of the By User tab: one row per caller for the
+   * entire window, carrying the per-day efficiency averages. Same buildScope, so
+   * it is scoped by the SAME filters as the daily grain and the two reconcile —
+   * SUM(byUser.calls) === SUM(byUserCombined.calls) for any filter set (as long
+   * as neither hit ROW_CAP, which is logged when it happens).
+   *
+   * It is its OWN grouped query rather than a JS roll-up of byUser for two
+   * reasons: byUser is row-capped (a roll-up of a truncated array under-reports),
+   * and active_days / unique_jobs are DISTINCT counts that cannot be recovered by
+   * summing day rows at all.
+   *
+   * Computed unconditionally, not only for multi-day windows: on a single-day
+   * window the two grains are identical and the FE simply doesn't offer the
+   * toggle, but a response whose SHAPE depends on the filters is a trap for every
+   * later consumer (and for the XLSX, which always carries all three sheets).
+   */
+  const sUC = buildScope(filters);
+  const [combinedRows] = await pool.query(
+    `SELECT jci.caller_id AS userId,
+            MAX(COALESCE(u.user_name, jci.caller_name)) AS userName,
+            ${ACTIVE_DAYS},
+            ${CALL_AGG},
+            COUNT(DISTINCT NULLIF(jci.job_id, 0)) AS unique_jobs,
+            MIN(jci.inserted_time) AS firstCallAt,
+            MAX(jci.inserted_time) AS lastCallAt
+       ${sUC.from}
+       LEFT JOIN tbl_user u ON u.user_id = jci.caller_id
+       ${sUC.where}
+      GROUP BY jci.caller_id
+      ORDER BY calls DESC, jci.caller_id
+      LIMIT ${ROW_CAP}`,
+    sUC.params,
+  );
+  if (combinedRows.length >= ROW_CAP) logger.warn(`Call Tracking (combined by user) hit the ${ROW_CAP}-row cap`);
+
+  /*
    * ── Nested breakdowns ──
    * The callers / parties / steps arrays are built by a handful of GROUPED
    * queries and stitched in JS by key — never one query per row. Each is
@@ -547,6 +628,56 @@ async function getCallTracking(filters = {}) {
   }
 
   /*
+   * Per-USER (whole-window) breakdowns. Keyed on caller_id ALONE — the day is not
+   * part of this grain. Same machinery as every other breakdown above: ONE
+   * grouped query per breakdown, restricted to the caller ids this grain actually
+   * returned, ordered BY THE STITCH KEY and filtered through completeKeysOnly so
+   * a hit cap drops whole keys instead of leaving a half-counted list beside a
+   * full total.
+   *
+   * The ids come from combinedRows, NOT from the daily grain: if byUser hit
+   * ROW_CAP its caller set can be a strict subset, and stitching off it would
+   * leave the tail of the combined table with empty parties/steps.
+   */
+  const combinedUserIds = [...new Set(
+    combinedRows.map((r) => (r.userId == null ? null : n(r.userId))).filter((v) => v != null),
+  )];
+  let partiesByCaller = new Map();
+  let stepsByCaller = new Map();
+  const callerKey = (r) => n(r.userId);
+  if (combinedUserIds.length > 0) {
+    const combIn = combinedUserIds.map(() => '?').join(',');
+
+    const sCP = buildScope(filters);
+    const [cpRows] = await pool.query(
+      `SELECT jci.caller_id AS userId, ${PARTY_ROLE} AS role, COUNT(*) AS calls
+         ${sCP.from}
+         ${sCP.where} AND jci.caller_id IN (${combIn})
+        GROUP BY jci.caller_id, ${PARTY_ROLE}
+        ORDER BY jci.caller_id, calls DESC
+        LIMIT ${NESTED_CAP}`,
+      [...sCP.params, ...combinedUserIds],
+    );
+    if (cpRows.length >= NESTED_CAP) logger.warn(`Call Tracking (combined user parties) hit the ${NESTED_CAP}-row cap`);
+    partiesByCaller = groupBy(completeKeysOnly(cpRows, callerKey, NESTED_CAP), callerKey, (r) => ({ role: r.role || 'Other', calls: n(r.calls) }));
+
+    const sCS = buildScope(filters);
+    const [csRows] = await pool.query(
+      `SELECT jci.caller_id AS userId, jci.job_status AS status,
+              ${ASSIGNED_AT_CALL} AS assignedFlag, COUNT(*) AS calls
+         ${sCS.from}
+         ${sCS.where} AND jci.caller_id IN (${combIn})
+        GROUP BY jci.caller_id, jci.job_status, ${ASSIGNED_AT_CALL}
+        ORDER BY jci.caller_id, calls DESC
+        LIMIT ${NESTED_CAP}`,
+      [...sCS.params, ...combinedUserIds],
+    );
+    if (csRows.length >= NESTED_CAP) logger.warn(`Call Tracking (combined user steps) hit the ${NESTED_CAP}-row cap`);
+    const rawStepsByCaller = groupBy(completeKeysOnly(csRows, callerKey, NESTED_CAP), callerKey, (r) => r);
+    stepsByCaller = new Map([...rawStepsByCaller].map(([k, v]) => [k, foldSteps(v)]));
+  }
+
+  /*
    * ── Daily trend, GAP-FILLED ──
    * A GROUP BY only returns days that had calls, so every day in the window is
    * materialised here and missing days read as zero. Same approach as the Offer
@@ -615,9 +746,49 @@ async function getCallTracking(filters = {}) {
     };
   });
 
+  /*
+   * The COMBINED grain — one row per user for the whole window.
+   *
+   * Every "per day" figure divides by activeDays (this row's OWN count of days
+   * with at least one call), never by the days in the range. activeDays is
+   * emitted as a column of its own and sits BEFORE the averages on screen so an
+   * operator can always see what the average was divided by: 5 calls/day over 2
+   * active days and 5 calls/day over 20 are very different claims.
+   *
+   * avgDurationSecs (per CONNECTED call) comes from CALL_AGG untouched — a
+   * ring-out must not drag down talk time — while avgDurationPerDaySecs divides
+   * TOTAL talk time by active days, which is the "how much of the day was spent
+   * on the phone" figure. The two answer different questions and are both here.
+   */
+  const byUserCombined = combinedRows.map((r) => {
+    const id = r.userId == null ? null : n(r.userId);
+    const steps = (id == null ? null : stepsByCaller.get(id)) || [];
+    const top = steps[0] || null;
+    const activeDays = n(r.active_days);
+    const agg = shapeAgg(r);
+    return {
+      userId: id,
+      userName: r.userName || `User #${n(r.userId)}`,
+      activeDays,
+      ...agg,
+      uniqueJobs: n(r.unique_jobs),
+      // One decimal — an efficiency figure, not a count; "12.4 calls/day".
+      avgCallsPerDay: perDay(agg.calls, activeDays, 1),
+      avgDurationPerDaySecs: perDay(agg.totalDurationSecs, activeDays),
+      topStatus: top ? top.status : null,
+      topStatusLabel: top ? top.label : '',
+      topStatusCalls: top ? top.calls : 0,
+      steps,
+      parties: (id == null ? null : partiesByCaller.get(id)) || [],
+      firstCallAt: r.firstCallAt || null,
+      lastCallAt: r.lastCallAt || null,
+    };
+  });
+
   logger.info('Returning ' + byJob.length + ' job rows · ' + byUser.length + ' day-user rows · '
+    + byUserCombined.length + ' combined user rows · '
     + byDay.length + ' trend days · ' + totals.calls + ' calls');
-  return { totals, byJob, byUser, byDay };
+  return { totals, byJob, byUser, byUserCombined, byDay };
 }
 
 /*
@@ -632,8 +803,14 @@ async function getCallTracking(filters = {}) {
  *
  * `selection` narrows to the clicked cell:
  *   jobId            — a By Job row
- *   selectedCallerId — a Daily By User row's user (or a caller chip)
- *   day              — a Daily By User row's day, or a trend bar
+ *   selectedCallerId — a By User row's user (or a caller chip)
+ *   day              — a Date Wise row's day, or a trend bar
+ *
+ * The keys are INDEPENDENT and each is applied only when present, so
+ * selectedCallerId WITHOUT a day is a supported combination and is exactly what
+ * the Combined grain drills on: one user across the whole scope window. No
+ * change was needed for it — the window predicate always comes from buildScope,
+ * and `day` only ever NARROWS within that window.
  */
 async function getCallDetails(filters = {}, selection = {}) {
   const s = buildScope(filters);
@@ -701,9 +878,10 @@ async function getCallDetails(filters = {}, selection = {}) {
 }
 
 /*
- * XLSX payload — TWO sheets mirroring the two on-screen grains, so the download
- * carries everything the report can show. The route walks `sheets` and hands
- * each to buildStyledWorkbook with a shared workbook.
+ * XLSX payload — THREE sheets mirroring the on-screen grains (By Job, the daily
+ * By User table, and its combined per-user sub-view), so the download carries
+ * everything the report can show. The route walks `sheets` and hands each to
+ * buildStyledWorkbook with a shared workbook.
  *
  * The nested arrays are flattened into readable single cells ('Priya (3), Amit
  * (1)') — a spreadsheet cell cannot hold a list, and an operator reading the
@@ -771,6 +949,40 @@ function toXlsx(data) {
           partiesLabel: flatten(r.parties, (x) => x.role),
         })),
       },
+      /*
+       * The SECOND grain of the By User tab — one row per user for the whole
+       * window. 'Active Days' is carried NEXT TO the averages on purpose: an
+       * average per day is unreadable without the denominator it used, and this
+       * sheet is the one an operator sorts by "Avg Calls / Day".
+       */
+      {
+        name: 'By User (Combined)',
+        columns: [
+          { key: 'userName', header: 'User', width: 26 },
+          { key: 'activeDays', header: 'Active Days', width: 13 },
+          ...SHARED_COLS,
+          { key: 'uniqueJobs', header: 'Jobs Touched', width: 14 },
+          { key: 'avgCallsPerDay', header: 'Avg Calls / Day', width: 16 },
+          { key: 'avgDurationPerDaySecs', header: 'Avg Talk / Day (Sec)', width: 20 },
+          { key: 'topStatusLabel', header: 'Majorly At', width: 20 },
+          { key: 'topStatusCalls', header: 'Calls At That Step', width: 18 },
+          { key: 'stepsLabel', header: 'At Job Step', width: 40 },
+          { key: 'partiesLabel', header: 'Called To', width: 30 },
+          { key: 'firstCallAt', header: 'First Call', width: 20 },
+          { key: 'lastCallAt', header: 'Last Call', width: 20 },
+        ],
+        rows: (data.byUserCombined || []).map((r) => ({
+          ...r,
+          // A spreadsheet cell has no em-dash convention; the on-screen '—' for
+          // "nothing to average" lands as 0 here, exactly as the existing sheets
+          // already do for avgDurationSecs.
+          avgDurationSecs: r.avgDurationSecs == null ? 0 : r.avgDurationSecs,
+          avgCallsPerDay: r.avgCallsPerDay == null ? 0 : r.avgCallsPerDay,
+          avgDurationPerDaySecs: r.avgDurationPerDaySecs == null ? 0 : r.avgDurationPerDaySecs,
+          stepsLabel: flatten(r.steps, (x) => x.label),
+          partiesLabel: flatten(r.parties, (x) => x.role),
+        })),
+      },
     ],
   };
 }
@@ -782,4 +994,9 @@ module.exports = {
   // Exposed so the route's Joi enums stay in lockstep with the derivation above.
   PARTY_ROLES,
   PROVIDERS,
+  /*
+   * Test seam — the pure averaging helper and the SQL fragment that produces its
+   * denominator, so tests can pin "per day means per ACTIVE day" without a DB.
+   */
+  _test: { perDay, ACTIVE_DAYS, DAY_EXPR },
 };

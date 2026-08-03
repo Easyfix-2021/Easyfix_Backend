@@ -9,8 +9,10 @@
  *             callerId?[] (tbl_user ids — who MADE the call),
  *             provider? ('plivo'|'kaleyra'|''), partyRole? (derived receiver
  *             type, ''=all), format? }
- *     → { totals, byJob: [per job], byUser: [per (day, user)], byDay: [trend] }
- *       (or a 2-sheet XLSX when format='xlsx')
+ *     → { totals, byJob: [per job], byUser: [per (day, user)],
+ *           byUserCombined: [per user, whole window + per-active-day averages],
+ *           byDay: [trend] }
+ *       (or a 3-sheet XLSX when format='xlsx')
  *
  *   POST /api/admin/quicksight/call-tracking/calls
  *     body: the SAME filters + { jobId? | selectedCallerId? | day? }
@@ -86,6 +88,9 @@ const summaryBody = withDateOrder(extendJobFilter({ ...FILTER_KEYS }));
 const COUNT_KEYS = [
   'jobId', 'calls', 'connected', 'uniqueJobs', 'topStatusCalls',
   'totalDurationSecs', 'avgDurationSecs', 'maxDurationSecs',
+  // Combined-grain columns. activeDays is the DENOMINATOR of the averages below
+  // it and is a whole count; avgDurationPerDaySecs is whole seconds.
+  'activeDays', 'avgDurationPerDaySecs',
 ];
 const COLUMN_RULES = [
   {
@@ -96,6 +101,12 @@ const COLUMN_RULES = [
     hints: { align: 'left' },
   },
   { match: (k) => k === 'connectRate', hints: { align: 'right', numFmt: FMT.PCT } },
+  /*
+   * Calls-per-day carries ONE decimal — the service rounds to 1dp, and the
+   * shared FMT.COUNT integer mask would print 12.4 as "12" while the cell still
+   * held 12.4, so a sort and the printed value would disagree.
+   */
+  { match: (k) => k === 'avgCallsPerDay', hints: { align: 'right', numFmt: '#,##0.0' } },
   { match: (k) => COUNT_KEYS.includes(k), hints: { align: 'right', numFmt: FMT.COUNT } },
 ];
 
@@ -121,7 +132,8 @@ router.post('/summary', validate(summaryBody), async (req, res, next) => {
 
     if (req.body.format === 'xlsx') {
       /*
-       * TWO sheets — By Job / Daily By User — mirroring the on-screen grains.
+       * THREE sheets — By Job / Daily By User / By User (Combined) — mirroring
+       * the on-screen grains.
        * Each buildStyledWorkbook call after the first passes the SAME workbook,
        * then streamWorkbook ships it (see utils/xlsx-styled-export). The KPI band
        * rides on the first sheet only; repeating it would just be noise.
