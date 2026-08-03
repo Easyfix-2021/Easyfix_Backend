@@ -28,7 +28,6 @@ const FEATURES = {
   // directory account and spends a licence seat, so it stays outside RBAC and
   // is granted per person. Seeded EMPTY = deny-all
   // (migrations/2026-07-30-create-tbl-user-entra-provisioning.sql).
-  canProvisionMailboxes: 'access.entraprovision.emails',
 };
 
 // Is `email` on the allowlist held in easyfix_properties[propertyKey]?

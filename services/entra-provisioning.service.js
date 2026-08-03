@@ -6,7 +6,6 @@ const { graphRequest } = require('./ms-graph-token.service');
 const { getProperty } = require('./properties.service');
 // Only for the property KEY name in the skip reason — the allowlist decision
 // itself is taken by the caller (route middleware / route handler), never here.
-const { FEATURES } = require('./feature-access.service');
 
 /*
  * ══════════════════════════════════════════════════════════════════════════
@@ -669,16 +668,9 @@ async function getProvisioning(userId) {
  * @param {string}  args.officialEmail   tbl_user.official_email (→ UPN)
  * @param {string} [args.trigger]        'create-user' | 'admin-retry' (logs only)
  * @param {number} [args.actorId]        who triggered it (logs only)
- * @param {boolean} [args.actorAllowed]  is the ACTOR on the per-person
- *        `access.entraprovision.emails` allowlist? A directory write spends a
- *        licence seat, so the same person-level gate that guards the repair
- *        endpoint has to guard every other entry point too — otherwise the
- *        allowlist is decoration and Add User is an unlimited seat drain.
- *        Defaults true because the repair route is already allowlist-gated by
- *        middleware; every OTHER caller must pass the resolved value.
  */
 async function provisionUserMailbox({
-  userId, userName, officialEmail, trigger = 'create-user', actorId, actorAllowed = true,
+  userId, userName, officialEmail, trigger = 'create-user', actorId,
 } = {}) {
   const base = {
     userId: Number(userId),
@@ -689,28 +681,19 @@ async function provisionUserMailbox({
     graphRequestId: null,
   };
 
-  // 0 ── PER-PERSON GATE. Creating an enabled, mail-enabled directory account
-  //      and consuming a purchased licence seat is the same privileged act no
-  //      matter which route reached us, so it needs the same
-  //      `access.entraprovision.emails` allowlist the repair endpoint enforces.
-  //      Recorded (not silent) so an operator can see why nothing was tried.
-  if (actorAllowed === false) {
-    const reason = 'mailbox provisioning not attempted — the acting user is not on the '
-      + `easyfix_properties["${FEATURES.canProvisionMailboxes}"] allowlist. `
-      + 'Ask an allowlisted operator to run POST /api/admin/users/:userId/provision-mailbox.';
-    const outcome = {
-      ...base,
-      attempted: false,
-      accountStatus: ACCOUNT_STATUS.SKIPPED_NOT_ALLOWED,
-      licenceStatus: LICENCE_STATUS.SKIPPED,
-      mailboxReady: false,
-      reason,
-    };
-    logger.warn('Entra provisioning skipped (actor not allowlisted) · userId=' + userId
-      + ' · trigger=' + trigger + (actorId ? ' · actorId=' + actorId : ''));
-    await recordProvisioning({ ...outcome, lastError: reason });
-    return outcome;
-  }
+  /*
+   * The per-person `access.entraprovision.emails` gate that used to sit here
+   * was REMOVED (2026-08-03). It fails closed on an unset property, and the
+   * property was never set in production, so every Add User recorded
+   * skipped_not_allowed and no mailbox was ever created — while the repair
+   * endpoint it pointed people at was gated by the same empty list. The
+   * authority is the roleByName(['Admin']) on both routes; the master switch is
+   * entra.provisioning.enabled, checked above.
+   *
+   * ACCOUNT_STATUS.SKIPPED_NOT_ALLOWED is deliberately KEPT in the vocabulary:
+   * historical rows still carry it (e.g. user 8735) and must stay readable.
+   * Nothing writes it any more.
+   */
 
   // 1 ── FAIL-CLOSED GATE. Recorded, not silent: an operator looking at the
   //      row must be able to tell "nobody tried" from "it failed".

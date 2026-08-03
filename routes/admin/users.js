@@ -205,7 +205,6 @@ router.post('/', roleByName(['Admin']), validate(createBody), async (req, res, n
     const created = await userService.createUser({
       ...req.body,
       createdBy: req.user?.user_id,
-      provisionMailbox: true,
     });
     res.status(201);
     /*

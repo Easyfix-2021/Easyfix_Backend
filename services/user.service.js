@@ -295,7 +295,6 @@ async function createUser({
    * a future caller that forgets to pass it gets no directory write rather than a
    * silent, ungated licence-seat spend.
    */
-  provisionMailbox = false,
 }) {
   logger.info('Create user · role=' + (user_role || '') + ' · cityId=' + (city_id || ''));
   const name  = String(user_name || '').trim();
@@ -403,7 +402,6 @@ async function createUser({
       officialEmail: email,
       trigger: 'create-user',
       actorId: createdBy || null,
-      actorAllowed: provisionMailbox === true,
     }).catch((e) => {
       logger.warn('Mailbox provisioning threw after user create (user IS created) · userId=' + r.insertId + ' · ' + e.message);
       return { attempted: false, accountStatus: 'failed', licenceStatus: 'not_attempted', mailboxReady: false, reason: e.message };
