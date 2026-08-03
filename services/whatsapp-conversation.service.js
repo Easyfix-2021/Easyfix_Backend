@@ -142,16 +142,45 @@ const SESSION_HOURS = 24;
 const CONVERSATION_TEMPLATE_NAME = 'customer_interactive_msg';
 
 /*
- * buttonValues for the three template quick replies. Index order MUST match
- * the approved template (0 = confirm, 1 = reschedule, 2 = not required).
- * The Gallabox wrapper passes this through untouched.
+ * buttonValues for `customer_interactive_msg` — deliberately EMPTY.
+ *
+ * ─── WHY EMPTY, AND NOT "THE THREE QUICK REPLIES" ──────────────────────────
+ *
+ * This used to send:
+ *   [{ index: 0, type: 'quick_reply', payload: BTN_PAYLOAD.CONFIRM }, …]
+ * and Gallabox rejected EVERY send with HTTP 400:
+ *   whatsapp.template.buttonValues.0.parameters: Path `parameters` is required.
+ * (observed on jobId 523247, 2026-08-03 — a Mongoose "required path" error, so
+ * `parameters` is a hard schema requirement on each buttonValues entry.)
+ *
+ * A button component exists to carry a VARIABLE into a button. These three quick
+ * replies have no variable: their payloads are baked into the Meta-approved
+ * template — which is exactly why BTN_PAYLOAD.RESCHEDULE has to stay misspelled
+ * ("Need a Reschdeule"). We were sending a component to restate constants the
+ * template already owns, and getting the schema wrong doing it.
+ *
+ * The shape was wrong in two ways at once, which is worth recording so nobody
+ * "fixes" it by adding `parameters` to the old structure. Every working Gallabox
+ * call in the legacy Java services (ACD_APIs/WhatsNotificationUtil.java,
+ * EasyFix_CRM/NewAppAllNotification.java) uses:
+ *     { "index": 0, "sub_type": "url", "parameters": { "type": "text", "text": … } }
+ * — `sub_type`, not `type`, and `parameters` as an OBJECT, not an array. Those
+ * are all URL buttons carrying a real variable. No legacy sender uses
+ * quick_reply at all, so there is no in-repo evidence for a quick_reply
+ * parameter shape, and Gallabox's public docs do not specify one.
+ *
+ * `[]` is not a guess: the same legacy senders ship `"buttonValues": []` for
+ * templates with no dynamic button data (eta_sent_clone_clone, cancel_order) and
+ * those deliver in production. Inbound matching is unaffected — the webhook
+ * reports the button payload the TEMPLATE defines, which is what
+ * routes/webhook/whatsapp.js already matches on.
+ *
+ * If Meta ever re-approves this template with variable button payloads, the send
+ * will fail loudly with a button-parameter-count error rather than silently — at
+ * which point the correct shape must be confirmed against Gallabox, not guessed.
  */
 function templateButtonValues() {
-  return [
-    { index: 0, type: 'quick_reply', payload: BTN_PAYLOAD.CONFIRM },
-    { index: 1, type: 'quick_reply', payload: BTN_PAYLOAD.RESCHEDULE },
-    { index: 2, type: 'quick_reply', payload: BTN_PAYLOAD.NOT_REQUIRED },
-  ];
+  return [];
 }
 
 // ── Pure helpers (exported — unit-tested in tests/whatsapp-conversation.test.js) ──
@@ -789,8 +818,33 @@ async function startConversation(jobId, { action = 'first' } = {}, pool) {
     [new Date(), `conversation_${action}`, jobId],
   );
 
-  logger.info({ jobId, conversationId, delivered: result.delivered }, 'whatsapp-conversation: started');
-  return { delivered: !!result.delivered, suppressed: !!result.disabled, conversationId };
+  /*
+   * A NOT-DELIVERED send is a WARN, and the provider's reason is propagated.
+   *
+   * This returned `{delivered, suppressed, conversationId}` and dropped
+   * `result.error` on the floor, so a provider rejection left one WARN line from
+   * the Gallabox wrapper and an INFO line here saying the conversation started.
+   * The route then logged "Magic link sent" and answered 200. Every send of
+   * `customer_interactive_msg` was failing with an HTTP 400 and the CRM was
+   * reporting success — which is why it took a log read to notice at all.
+   *
+   * `suppressed` (NOTIFICATIONS_DISABLE in dev) stays INFO: that is a
+   * deliberately silenced send, not a failure.
+   */
+  const failed = !result.delivered && !result.disabled;
+  const logLine = { jobId, conversationId, delivered: !!result.delivered };
+  if (failed) {
+    logger.warn({ ...logLine, err: result.error }, 'whatsapp-conversation: started but NOT delivered');
+  } else {
+    logger.info(logLine, 'whatsapp-conversation: started');
+  }
+  return {
+    delivered: !!result.delivered,
+    suppressed: !!result.disabled,
+    conversationId,
+    // Surfaced so the caller can tell the operator the message did not go out.
+    error: failed ? (result.error || 'provider rejected the message') : undefined,
+  };
 }
 
 /*
