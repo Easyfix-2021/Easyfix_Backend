@@ -2,6 +2,13 @@ const ExcelJS = require('exceljs');
 const { pool } = require('../db');
 const logger   = require('../logger');
 const s3Storage = require('../utils/s3-storage');
+const { cached } = require('../utils/ttl-cache');
+// Memo TTL for the legacy-image S3 existence probe (a HEAD network round-trip).
+// 5 min — an object's existence is stable, and the catalog/option-mapping reads
+// re-resolve the SAME image keys constantly. We cache ONLY the boolean, never the
+// presigned URL (URLs carry their own short S3_PRESIGN_TTL_SEC and are always
+// signed fresh below). Busted on catalog mutation via invalidateCatalogCaches().
+const LEGACY_IMG_EXISTS_TTL_MS = 5 * 60 * 1000;
 
 /*
  * Deep-skill catalogue management.
@@ -487,7 +494,7 @@ async function update(deepskillId, patch) {
   //   - skip if image is now non-empty (operator EXPLICITLY set one,
   //     either via this patch or it was already there).
   //   - skip if the skill is soft-deleted (status !== 1).
-  //   - skip if feature flag or OPENAI_API_KEY is off.
+  //   - skip if feature flag or OPENAI_API_KEY_DEEPSKILL_IMAGE is off.
   // Patch path doesn't include the manual image-upload route — that
   // goes through replaceImage() — so we're safe to trigger from any
   // update() call that leaves deepskill_image empty.
@@ -1008,17 +1015,29 @@ async function resolveImageUrlFromKey(key) {
   // (blank-grey) thumbnail for a key that 404s. The HEAD probe also gives a
   // precise, actionable log line that distinguishes "missing object" (access
   // issue) from "blank name" (the empty-string check above already returns null).
+  //
+  // PERF: this S3 exists() HEAD is the dominant per-image latency on the catalog
+  // and option-mapping reads (one round-trip per legacy-keyed thumbnail, fanned
+  // out per request). Memoize the boolean (never the URL) for 5 min so repeated
+  // renders — same skill across techs/operators, re-expands — don't re-probe.
+  let objExists;
   try {
-    if (await s3Storage.exists(trimmed)) {
-      return await s3Storage.getPresignedUrl(trimmed);
-    }
+    objExists = await cached('deepskill:imgexists:' + trimmed, LEGACY_IMG_EXISTS_TTL_MS, () => s3Storage.exists(trimmed));
+  } catch (e) {
+    logger.warn({ err: e && e.message, key: trimmed }, 'deep-skill: legacy image existence probe failed');
+    return null;
+  }
+  if (!objExists) {
     logger.warn(
       { key: trimmed },
       'deep-skill: legacy image key has no S3 object — not in bucket (run scripts/upload-deepskill-images.js to migrate, or re-key the row)',
     );
     return null;
+  }
+  try {
+    return await s3Storage.getPresignedUrl(trimmed);
   } catch (e) {
-    logger.warn({ err: e && e.message, key: trimmed }, 'deep-skill: legacy image existence probe failed');
+    logger.warn({ err: e, key: trimmed }, 'deep-skill: presign failed for legacy key');
     return null;
   }
 }

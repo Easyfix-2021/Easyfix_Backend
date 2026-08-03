@@ -148,6 +148,8 @@ router.get('/', validate(v.listClientsQuery, 'query'), async (req, res, next) =>
       cityId: req.query.cityId ? Number(req.query.cityId) : undefined,
       limit: req.query.limit,
       offset: req.query.offset,
+      sortBy: req.query.sortBy,
+      sortDir: req.query.sortDir,
     });
     // Modern envelope wraps `{items, total}` as the data payload — the
     // FE reads `data.items` + `data.total`. Backwards-compat note:
@@ -946,6 +948,10 @@ router.get('/:clientId/custom-properties', async (req, res, next) => {
       label: r.property_label ?? r.c_prop_label ?? r.label ?? r.display_name ?? null,
       mandatory: truthy(r.is_mandatory ?? r.c_prop_mandatory ?? r.mandatory ?? r.required ?? r.is_required ?? r.is_required_field),
       value: r.property_value ?? r.c_prop_values ?? r.value ?? r.field_value ?? null,
+      // is_config discriminator (0/1): 1 = client-level CONFIG/CONTROL row
+      // (hidden from booking forms + templates). Absent on pre-migration rows
+      // → defaults to 0 so the CRM checkbox renders unchecked.
+      is_config: truthy(r.is_config) ? 1 : 0,
       // Surface the row id so the FE edit/delete flows have a target.
       // Legacy PK is c_prop_id; canonical is id. Either way the FE
       // gets a `id` to bind to.

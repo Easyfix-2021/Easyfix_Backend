@@ -1,17 +1,30 @@
 const Joi = require('joi');
 
 const intId = Joi.number().integer().positive();
+// Repeatable id query param: accepts ?clientId=1&clientId=2 (array) OR a bare
+// ?clientId=1 (.single() wraps the scalar). Used to scope owner-options lookups
+// by the selected client(s)/vertical(s) on the QuickSight reports.
+const idArray = Joi.array().items(intId).single();
 
 const citiesQuery = Joi.object({
   stateId: intId.optional(),
   q: Joi.string().min(1).max(100).optional(),
-  limit: Joi.number().integer().min(1).max(1000).default(500),
+  // Resolve specific cities by id — the async CitySelect uses ?ids= to show a
+  // preselected city's name without preloading the whole table.
+  ids: idArray.optional(),
+  // tbl_city holds ~11k active cities. Full-list consumers (manage-users scope
+  // math, zones) + AddressPickerWithMap's reverse-geocode name→id matcher still
+  // preload the whole set, so the cap must clear it (with headroom) — a 1000 cap
+  // truncated the list mid-alphabet (~"Balwada"). Pickers now typeahead via ?q=.
+  limit: Joi.number().integer().min(1).max(20000).default(500),
   includeInactive: Joi.boolean().default(false),
 });
 
 const serviceTypesQuery = Joi.object({
   categoryId: intId.optional(),
   includeInactive: Joi.boolean().default(false),
+  // 1=All, 0=CRM-only, 2=Tx-app. Deep-skill pickers pass display=2.
+  display: Joi.number().integer().valid(0, 1, 2).optional(),
 });
 
 const clientsQuery = Joi.object({
@@ -44,8 +57,21 @@ const simpleIncludeInactive = Joi.object({
 
 // Project Managers picker — optional user_type narrows to Primary (1) or
 // Secondary (2) SPOC; omitted returns both. (tbl_vertical_mapping.user_type)
+// Optional clientId/verticalId scope the SPOC list to the selected client(s)/
+// vertical(s) (QuickSight Client Performance "Project Manager" filter).
 const projectManagersQuery = Joi.object({
   userType: Joi.number().integer().valid(1, 2).optional(),
+  clientId: idArray.optional(),
+  verticalId: idArray.optional(),
+});
+
+// Zonal Managers picker — optional clientId/verticalId scope the list to zonal
+// owners of cities that back jobs for the selected client(s)/vertical(s)
+// (QuickSight Open Orders / City Performance / Client Performance). Omitting
+// both returns the full global list (Manage Easyfixers back-compat).
+const zonalManagersQuery = Joi.object({
+  clientId: idArray.optional(),
+  verticalId: idArray.optional(),
 });
 
 module.exports = {
@@ -57,4 +83,5 @@ module.exports = {
   banksQuery,
   simpleIncludeInactive,
   projectManagersQuery,
+  zonalManagersQuery,
 };

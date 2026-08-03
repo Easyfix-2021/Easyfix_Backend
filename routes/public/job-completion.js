@@ -45,7 +45,19 @@ const { modernOk, modernError } = require('../../utils/response');
 const s3Storage = require('../../utils/s3-storage');
 const validate = require('../../middleware/validate');
 const { rateLimit } = require('../../middleware/rate-limit');
+const { getProperty } = require('../../services/properties.service');
 const logger = require('../../logger');
+const ttlCache = require('../../utils/ttl-cache');
+const candidateRanking = require('../../services/candidate-ranking.service');
+const { slotRecommendationsQuery } = require('../../validators/job.validator');
+
+// Global map-clickability toggle (easyfix_properties). Absent/'true' →
+// clickable; 'false' → the customer's map is rendered non-interactive.
+function mapClickableFlag() {
+  const raw = getProperty('ui.map.clickable');
+  if (raw == null || String(raw).trim() === '') return true;
+  return String(raw).trim().toLowerCase() !== 'false';
+}
 
 // Peek-the-token middleware. Runs verifyJobToken() only (NOT the DB state
 // check) so the rate limiter can key its bucket on the verified jobId. If the
@@ -236,11 +248,63 @@ router.get(
   async (req, res, next) => {
     try {
       const jobId = await verify(req);
+      // Late-open auto-reschedule (IST >= 3pm): shift a still-unconfirmed job's
+      // appointment to next day BEFORE building the prefill, so the customer
+      // sees the new date. Best-effort — must never block the form. Idempotent
+      // by construction; writes scheduling_history (NOT a customer request, so
+      // no "Reschedule Requested" chip). See autoRescheduleOnOpenIfLate().
+      try {
+        await magicLinkService.autoRescheduleOnOpenIfLate(jobId, pool);
+      } catch (e) {
+        logger.warn('auto-reschedule-on-open failed · jobId=' + jobId + ' · ' + (e && e.message));
+      }
       logger.info('Fetch magic-link prefill · jobId=' + jobId);
       const payload = await magicLinkService.fetchPrefill(jobId, pool);
+      // Global UI toggle so the customer page can render its map read-only.
+      payload.mapClickable = mapClickableFlag();
       return modernOk(res, payload);
     } catch (e) {
       logger.warn('Magic-link prefill failed · ' + e.message);
+      return mapKnownError(res, next, e);
+    }
+  },
+);
+
+// ─── GET /:token/slot-recommendations?date=YYYY-MM-DD — best-slot advisory ──
+// Token-gated clone of the admin route (routes/admin/jobs.js /:id/slot-
+// recommendations), for the customer job-completion form's Reschedule dialog.
+// verify() replaces the admin route's scopedJob guard: it cryptographically
+// checks the magic-link JWT AND requires job_status=9 (Unconfirmed). The jobId
+// comes ONLY from the token — there is no path to address another job. Shares
+// the SAME 30s ttlCache key as the admin route so admin + public reuse one
+// computation. The response is deliberately SLIM (best slot label + two flags)
+// — the raw ranking output (per-slot freeCount/topScore/totalCandidates + the
+// candidatePool count) is internal supply data and MUST NOT reach the
+// unauthenticated client's network tab.
+router.get(
+  '/:token/slot-recommendations',
+  peekToken,
+  tokenRateLimit,
+  validate(slotRecommendationsQuery, 'query'),
+  async (req, res, next) => {
+    try {
+      const jobId = await verify(req);
+      const day = String(req.query.date).slice(0, 10);
+      logger.info('Magic-link slot recommendations · jobId=' + jobId + ' · date=' + day);
+      const result = await ttlCache.cached(
+        `slot-rec:${jobId}:${day}`,
+        30_000,
+        () => candidateRanking.recommendSlotsForJob(jobId, { date: day }),
+      );
+      const best = result.slots.find((s) => s.recommended) || null;
+      return modernOk(res, {
+        date: result.date,
+        best: best ? { slot: best.slot } : null,
+        hasCandidatePool: result.candidatePool > 0,
+        attendanceKnown: result.attendanceKnown,
+      });
+    } catch (e) {
+      logger.warn('Magic-link slot recommendations failed · ' + e.message);
       return mapKnownError(res, next, e);
     }
   },
@@ -338,7 +402,10 @@ router.post(
           [jobId, imageKey],
         );
         logger.info('Job image uploaded · jobId=' + jobId + ' · image_id=' + ins.insertId + ' · seq=' + seq);
-        return modernOk(res, { kind: 'image', image_id: ins.insertId, key: imageKey, seq });
+        // Short-TTL presigned GET so the FE renders the thumbnail / lightbox
+        // immediately (best-effort — null just falls back to a placeholder).
+        const imageUrl = await s3Storage.getPresignedUrl(imageKey).catch(() => null);
+        return modernOk(res, { kind: 'image', image_id: ins.insertId, key: imageKey, url: imageUrl, seq });
       }
 
       // Video path — writes to tbl_job_media (separate table because
@@ -373,7 +440,8 @@ router.post(
         [jobId, videoKey, mime],
       );
       logger.info('Job video uploaded · jobId=' + jobId + ' · media_id=' + vins.insertId + ' · seq=' + vseq);
-      return modernOk(res, { kind: 'video', media_id: vins.insertId, key: videoKey, seq: vseq });
+      const videoUrl = await s3Storage.getPresignedUrl(videoKey).catch(() => null);
+      return modernOk(res, { kind: 'video', media_id: vins.insertId, key: videoKey, url: videoUrl, seq: vseq });
     } catch (e) {
       if (e?.code === 'LIMIT_FILE_SIZE') {
         const mb = Math.round(MAX_VIDEO_BYTES / (1024 * 1024));
@@ -488,7 +556,7 @@ function toMysqlDatetime(val) {
 
 // ─── POST /:token/cancel-request — log a customer cancel request ────
 // LOGS A REQUEST for ops. Does NOT change job_status (ops actions it later
-// in the CRM). Reason is constrained by Joi to CANCEL_REASONS.
+// in the CRM). Reason is validated against the live action_taken_reason list.
 router.post(
   '/:token/cancel-request',
   peekToken,
@@ -497,6 +565,15 @@ router.post(
   async (req, res, next) => {
     try {
       const jobId = await verify(req);
+      // Membership check + id resolution — the Joi schema only guarantees a
+      // non-empty string; the reasons are DB-driven (action_taken_reason
+      // action_type=39). Resolve the matching row so we get BOTH validation
+      // AND its id for tbl_job_comment.enum_reason_id.
+      const cancelReasons = await magicLinkService.getCancelReasons(pool);
+      const reasonRow = cancelReasons.find((r) => r.action_desc === req.body.reason);
+      if (!reasonRow) {
+        throw Object.assign(new Error('Please select a valid cancellation reason.'), { status: 400 });
+      }
       logger.info('Log customer cancel request · jobId=' + jobId + ' · reason=' + req.body.reason);
       const [ins] = await pool.query(
         `INSERT INTO tbl_job_customer_request
@@ -504,6 +581,30 @@ router.post(
          VALUES (?, 'cancel', ?, ?)`,
         [jobId, req.body.reason, req.body.remarks || null],
       );
+      // Mirror into the job comment thread so ops sees the request in the CRM
+      // History tab (not only the tbl_job_customer_request queue). Best-effort:
+      // the request above is the source of truth, so a comment failure must NOT
+      // fail the customer's action. comment_on=1 = job-lifecycle bucket (avoids
+      // the job_stage=9 side-effect of 16/17); commented_by=null = customer.
+      try {
+        // Mirror to the job History (tbl_job_comment). Compose a NON-EMPTY
+        // reason-bearing comment text (reason label + optional remark) so
+        // addComment's empty-text guard can't silently drop the row (and the
+        // reason enum_reason_id) when the customer typed no remark. comment_on=1
+        // (lifecycle bucket — avoids the 16/17 job_stage=9 side-effect).
+        const remarkText = (req.body.remarks || '').trim();
+        const commentText = remarkText
+          ? `Cancellation requested: ${req.body.reason} — ${remarkText}`
+          : `Cancellation requested: ${req.body.reason}`;
+        await require('../../services/job-comment.service').addComment(jobId, {
+          comments: commentText,
+          comment_on: 1,
+          commented_by: null,
+          enum_reason_id: reasonRow.id,
+        });
+      } catch (ce) {
+        logger.warn('cancel-request comment mirror failed · jobId=' + jobId + ' · ' + ce.message);
+      }
       logger.info({ jobId, request_id: ins.insertId }, 'magic-link: customer cancel request logged');
       return modernOk(res, { request_id: ins.insertId });
     } catch (e) {
@@ -523,14 +624,96 @@ router.post(
   async (req, res, next) => {
     try {
       const jobId = await verify(req);
+      // Membership check + id resolution — reasons are DB-driven
+      // (action_taken_reason action_type=38).
+      const reschedReasons = await magicLinkService.getRescheduleReasons(pool);
+      const reasonRow = reschedReasons.find((r) => r.action_desc === req.body.reason);
+      if (!reasonRow) {
+        throw Object.assign(new Error('Please select a valid reschedule reason.'), { status: 400 });
+      }
       logger.info('Log customer reschedule request · jobId=' + jobId + ' · reason=' + req.body.reason);
-      const preferred = toMysqlDatetime(req.body.preferred_datetime);
+      // The job's CURRENT appointment — needed twice below: as the floor for how
+      // far back a customer may move it, and as the fallback when they pick
+      // nothing. db.js runs dateStrings:true + timezone '+05:30', so this comes
+      // back as a ready 'YYYY-MM-DD HH:MM:SS' IST wall-clock string.
+      const [[jobRow]] = await pool.query(
+        'SELECT requested_date_time FROM tbl_job WHERE job_id = ? LIMIT 1',
+        [jobId],
+      );
+      let preferred = toMysqlDatetime(req.body.preferred_datetime);
+      /*
+       * A CUSTOMER may only push an appointment OUT, never pull it earlier.
+       *
+       * The magic-link form already blocks earlier dates in its calendar, but a
+       * public token endpoint must not trust its own UI — anyone holding a link
+       * can POST whatever they like. The floor is the later of:
+       *   - the current appointment's DAY (so it can't be pulled forward), and
+       *   - TODAY (so an already-past appointment can't be "moved" backwards).
+       * Compared at DATE granularity, matching the calendar's day-level rule and
+       * leaving the customer free to pick any slot on the floor day itself.
+       *
+       * OPS ARE UNAFFECTED: they reschedule through the authenticated CRM
+       * routes, where back-dating is a legitimate correction. This is the
+       * customer-facing path only.
+       *
+       * IST day computed from the fixed +5:30 offset — NOT CURDATE(), whose
+       * calendar day follows the DB server's timezone, not IST.
+       */
+      if (preferred) {
+        const istToday = new Date(Date.now() + (5 * 60 + 30) * 60 * 1000)
+          .toISOString().slice(0, 10);
+        const apptDay = String(jobRow?.requested_date_time || '').slice(0, 10);
+        const floorDay = apptDay && apptDay > istToday ? apptDay : istToday;
+        const pickedDay = String(preferred).slice(0, 10);
+        if (pickedDay < floorDay) {
+          logger.warn(
+            'Customer reschedule rejected, earlier than allowed · jobId=' + jobId
+            + ' · picked=' + pickedDay + ' · floor=' + floorDay,
+          );
+          throw Object.assign(
+            new Error(`Please choose a date on or after ${floorDay}. An appointment can only be moved later.`),
+            { status: 400 },
+          );
+        }
+      }
+      /*
+       * Default to the job's CURRENT appointment when the customer didn't pick
+       * one, instead of storing NULL — so Ops always has a concrete date to act
+       * on and the list/detail surfaces never show a bare "Reschedule Requested"
+       * with no date. Used verbatim as a DATETIME literal (do NOT re-parse
+       * through toMysqlDatetime, which only normalises the raw request body).
+       */
+      if (!preferred) preferred = jobRow ? jobRow.requested_date_time : null;
       const [ins] = await pool.query(
         `INSERT INTO tbl_job_customer_request
            (job_id, request_type, reason, remarks, preferred_datetime)
          VALUES (?, 'reschedule', ?, ?, ?)`,
         [jobId, req.body.reason, req.body.remarks || null, preferred],
       );
+      // Mirror into the job comment thread for ops visibility (best-effort — the
+      // request above is authoritative). comment_on=1 = the job-lifecycle bucket
+      // legacy uses for reschedule notes; appointment_on carries the preferred
+      // date so the comment row itself shows the requested new time.
+      try {
+        // Mirror to job History. Compose a NON-EMPTY reason-bearing comment text
+        // (reason label + optional remark) so addComment's empty-text guard can't
+        // silently drop the row when the customer typed no remark — that used to
+        // lose enum_reason_id (the reason) entirely. appointment_on carries the
+        // requested new time; enum_reason_id stamps the reason FK; commented_by=null.
+        const remarkText = (req.body.remarks || '').trim();
+        const commentText = remarkText
+          ? `Reschedule requested: ${req.body.reason} — ${remarkText}`
+          : `Reschedule requested: ${req.body.reason}`;
+        await require('../../services/job-comment.service').addComment(jobId, {
+          comments: commentText,
+          comment_on: 1,
+          commented_by: null,
+          appointment_on: preferred || null,
+          enum_reason_id: reasonRow.id,
+        });
+      } catch (ce) {
+        logger.warn('reschedule-request comment mirror failed · jobId=' + jobId + ' · ' + ce.message);
+      }
       logger.info({ jobId, request_id: ins.insertId }, 'magic-link: customer reschedule request logged');
       return modernOk(res, { request_id: ins.insertId });
     } catch (e) {
@@ -568,10 +751,12 @@ router.get(
       const spoc = await magicLinkService.resolveJobSpoc(jobId, pool);
       if (!spoc.mobile) return modernError(res, 422, 'No SPOC available to call');
 
-      // Same alwaysApplyEnvOverride:true the actual spoc-call uses → the preview
-      // reflects precisely what would be dialled. voice.previewCallLegs resolves
-      // through the default provider (no explicit provider on the public flow).
+      // Hardcoded to Plivo's bridge (call) flow — this is a CUSTOMER-initiated
+      // public call, so it must use the server-placed Plivo Call bridge, never
+      // the Plivo web/WebRTC SDK (CRM-staff only). Same alwaysApplyEnvOverride:true
+      // the actual spoc-call uses → the preview reflects what would be dialled.
       const preview = voice.previewCallLegs({
+        provider: 'plivo',
         from: customerMob,
         to: spoc.mobile,
         alwaysApplyEnvOverride: true,
@@ -631,13 +816,14 @@ router.post(
         return modernError(res, 422, 'No SPOC available to call');
       }
 
-      // alwaysApplyEnvOverride: this is the OPERATOR-LESS public bridge —
-      // it resolves the REAL customer + SPOC numbers server-side, so the
-      // KALEYRA_CALL_FROM/TO test-redirect MUST apply in non-prod even when
-      // KALEYRA_CALLING_CUSTOM_NUMBER (an admin-prompt flag) is on. Prevents
-      // dialling a real customer from QA. In prod those env vars are unset
-      // → passes through to the real numbers as intended.
-      const result = await voice.clickToCall({ from: customerMob, to: spoc.mobile, alwaysApplyEnvOverride: true });
+      // Hardcoded to Plivo's bridge (call) flow: this is a CUSTOMER-initiated
+      // public call, so it uses the server-placed Plivo Call bridge (customer
+      // leg ⇄ SPOC leg), NOT the Plivo web/WebRTC SDK (which is CRM-staff only).
+      // alwaysApplyEnvOverride: the OPERATOR-LESS public bridge resolves the REAL
+      // customer + SPOC numbers server-side, so the CALL_FROM/TO test-redirect
+      // MUST apply in non-prod (prevents dialling a real customer from QA); in
+      // prod those env vars are unset → real numbers as intended.
+      const result = await voice.clickToCall({ provider: 'plivo', from: customerMob, to: spoc.mobile, alwaysApplyEnvOverride: true });
       if (!result.delivered && (result.suppressed || result.disabled)) {
         // Calling disabled in this environment — mirror admin/calls: 200 OK
         // with delivered:false + suppressed:true so the FE can show

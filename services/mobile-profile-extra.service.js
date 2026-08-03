@@ -690,8 +690,32 @@ async function aadhaarPanExists(number, excludeEfrId) {
   return { exists: Number(row?.cnt ?? 0) > 0 };
 }
 
+/*
+ * The technician's serviceable pincodes.
+ *
+ * Stored as a CSV of 6-digit pincode STRINGS in a single
+ * tbl_efr_serviceable_pincodes row keyed on easyfixer_id (PK). Returns a clean
+ * string[] for the mobile Edit Profile chip list; the WRITE side reuses
+ * easyfixer-verification.replaceServiceablePincodes (which also flips the
+ * pincodes to Serviceable), so the two paths can't diverge on storage format.
+ */
+async function getServiceablePincodes(efrId) {
+  logger.info('Get serviceable pincodes · efrId=' + efrId);
+  const [[row]] = await pool.query(
+    'SELECT pincodes FROM tbl_efr_serviceable_pincodes WHERE easyfixer_id = ? LIMIT 1',
+    [efrId],
+  );
+  const csv = row?.pincodes ? String(row.pincodes) : '';
+  const pincodes = csv
+    .split(',')
+    .map((p) => p.trim())
+    .filter((p) => /^[0-9]{6}$/.test(p));
+  return { pincodes };
+}
+
 module.exports = {
   updateName,
+  getServiceablePincodes,
   setProfileImage,
   setProfileImageFromUpload,
   getWeeklyPerformance,

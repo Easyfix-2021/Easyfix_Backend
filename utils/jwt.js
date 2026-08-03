@@ -251,6 +251,56 @@ function verifyEasyfixerProfileToken(token) {
   return Number(decoded.sub);
 }
 
+/**
+ * Sign a technician "share job" magic-link JWT.
+ *
+ * Mirrors signJobToken's isolation design but for a DIFFERENT public surface:
+ *   - Distinct `type: 'job_share'` claim so a share token can never be replayed
+ *     against the customer job-completion routes (or CRM auth), and vice-versa
+ *     — verifyJobShareToken below rejects every other `type`.
+ *   - Subject `job:<id>` (not a user_id) so `sub`-trusting middleware won't
+ *     misclassify it as a user identity.
+ *   - SHORT TTL (default 72h vs the 7d job-completion link) because a shared
+ *     link is world-reachable and exposes a masked call bridge — see
+ *     services/job-share.service.js. Rotatable via JOB_SHARE_LINK_TTL_HOURS.
+ *
+ * There is NO requireUnconfirmedJob-style companion: a shared job is not tied
+ * to status 9. Liveness (reject cancelled/completed) is enforced in
+ * job-share.service.fetchShareDetails so a stale link can't leak an active
+ * address or bridge a call for a finished/cancelled job.
+ */
+function signJobShareToken({ jobId }) {
+  const ttlHours = Number(process.env.JOB_SHARE_LINK_TTL_HOURS || 72);
+  return jwt.sign(
+    {
+      sub: 'job:' + jobId,
+      jobId: Number(jobId),
+      type: 'job_share',
+    },
+    requireSecret(),
+    { expiresIn: `${ttlHours}h` }
+  );
+}
+
+/**
+ * Verify a "share job" magic-link JWT. Returns `{ jobId }` (Number) on success;
+ * throws plain `{status, message}` shapes (NOT Error instances) so the public
+ * route handlers can `throw` directly. Rejects any non-'job_share' type as
+ * defence-in-depth against a leaked customer/CRM token probing this surface.
+ */
+function verifyJobShareToken(token) {
+  let claims;
+  try {
+    claims = jwt.verify(token, requireSecret());
+  } catch (_err) {
+    throw { status: 401, message: 'invalid or expired link' };
+  }
+  if (!claims || claims.type !== 'job_share') {
+    throw { status: 401, message: 'token type mismatch' };
+  }
+  return { jobId: Number(claims.jobId) };
+}
+
 module.exports = {
   signUserToken,
   verifyToken,
@@ -261,4 +311,6 @@ module.exports = {
   signEstimateToken,
   signEasyfixerProfileToken,
   verifyEasyfixerProfileToken,
+  signJobShareToken,
+  verifyJobShareToken,
 };

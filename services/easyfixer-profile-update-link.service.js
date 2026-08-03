@@ -39,7 +39,33 @@ const urlShortener    = require('./url-shortener.service');
 const verification    = require('./easyfixer-verification.service');
 const deepSkillService = require('./deep-skill.service');
 const s3Storage        = require('../utils/s3-storage');
+
+/*
+ * The Gallabox template for the profile-completion nudge. ONE owner — the two
+ * reminder crons import this rather than re-declaring the string, so a template
+ * rename can never leave a caller pointing at a retired template.
+ *
+ * ⚠ The template lives in Gallabox (Meta-approved); this is only the reference to
+ * it. Renaming here does NOTHING until the template exists there under this name
+ * and is approved — and its body variables MUST be {{name}}, {{id}},
+ * {{profile_link}} to match `bodyValues` below. A key that doesn't match a
+ * template variable EXACTLY (casing included) silently arrives empty.
+ */
+const PROFILE_TEMPLATE_NAME = 'skill_otp_tx1';
 const logger          = require('../logger');
+const { getProperty } = require('./properties.service');
+
+/*
+ * OTP kill-switch for the public profile-update SAVE. Default ON (codebase
+ * convention — only the literal string 'false' disables it, same as
+ * job.offer.flow.enabled). Migration 2026-06-30 seeds the property to 'false'
+ * to disable OTP for this form per product. Exported so the route gates
+ * verifyOtp on it AND fetchPrefill surfaces it to the FE as `otp_required`, so
+ * the BE gate and the FE OtpGate render from ONE source of truth.
+ */
+function profileOtpRequired() {
+  return String(getProperty('profile_update.otp.enabled') ?? 'true').toLowerCase() !== 'false';
+}
 
 /**
  * Resolve an `efr_profile_img` S3 key to a short-TTL presigned GET URL.
@@ -263,7 +289,7 @@ async function fetchPrefill(efrId, pool) {
     fetchDeepSkillCatalog(pool),
     presignProfileImage(row.profile_image_key),
     resolveServiceCategories(row.service_category_raw, pool),
-    fetchEasyfixerMappedCategoryIds(efrId, pool),
+    fetchEasyfixerMappedCategoryIds(efrId, pool, row.service_category_raw),
   ]);
 
   /*
@@ -335,6 +361,10 @@ async function fetchPrefill(efrId, pool) {
       ? serviceablePincodes
       : (serviceablePincodes?.items ?? []),
     deep_skill_catalog: deepSkillCatalog,
+    // Whether the FE must collect a WhatsApp OTP before saving. Mirrors the
+    // BE save gate (profile_update.otp.enabled) so the form renders the OtpGate
+    // only when the BE will actually require it.
+    otp_required: profileOtpRequired(),
   };
 }
 
@@ -441,6 +471,10 @@ function invalidateServiceCategoriesCache() {
 function invalidateCatalogCaches() {
   deepSkillCatalogCache = { data: null, expires: 0, inflight: null };
   invalidateServiceCategoriesCache();
+  // Also drop the deep-skill legacy-image existence memo (deep-skill.service.js)
+  // so a re-uploaded / migrated image reflects immediately rather than in ≤5 min.
+  // Lazy require + guard: non-fatal and avoids any load-order coupling.
+  try { require('../utils/ttl-cache').clearPrefix('deepskill:imgexists:'); } catch (_) { /* non-fatal */ }
 }
 
 /**
@@ -484,20 +518,26 @@ function invalidateCatalogCaches() {
  *                                  query; defensive `category_id IS NOT NULL`
  *                                  filter keeps the union safe.
  *
- * Soft-delete filter is applied ONLY on `easyfixer_service_type`. The other
- * two tables don't carry an `is_deleted` column (verified by greps against
- * EasyFix_CRM DAOs), so adding the predicate would fail at runtime.
+ * NO is_deleted filter (2026-06-30): the reference query (the user's source of
+ * truth) unions all three tables WITHOUT filtering easyfixer_service_type's
+ * is_deleted, and expects every category the technician is associated with to
+ * appear. An earlier is_deleted=0 predicate here DROPPED categories whose only
+ * association is a soft-deleted easyfixer_service_type row (e.g. efr 1736's
+ * "Cycle & Fitness" category), so a tech could not map skills under a category
+ * they service. We now include them to match the reference query. (Trade-off:
+ * a soft-deleted service-type association still counts toward the tech's
+ * mappable categories — intended per the reference query; to instead hide a
+ * specific stale association, fix its row data rather than re-adding the filter.)
  *
  * Used to filter the (globally cached) deep-skill catalog tree to only the
- * categories this easyfixer is mapped to.
+ * categories this easyfixer is associated with.
  */
-async function fetchEasyfixerMappedCategoryIds(efrId, pool) {
+async function fetchEasyfixerMappedCategoryIds(efrId, pool, serviceCategoryRaw = null) {
   const [rows] = await pool.query(
     `SELECT DISTINCT category_id FROM (
        SELECT service_category_id AS category_id
          FROM easyfixer_service_type
         WHERE easyfixer_id = ?
-          AND (is_deleted IS NULL OR is_deleted = 0)
           AND service_category_id IS NOT NULL
        UNION
        SELECT category_id
@@ -512,7 +552,39 @@ async function fetchEasyfixerMappedCategoryIds(efrId, pool) {
      ) AS unioned`,
     [efrId, efrId, efrId],
   );
-  return new Set(rows.map((r) => Number(r.category_id)).filter((n) => Number.isFinite(n)));
+  const ids = new Set(rows.map((r) => Number(r.category_id)).filter((n) => Number.isFinite(n)));
+
+  /*
+   * 4th source (2026-07-01): the technician's OWN service category(ies) from
+   * tbl_easyfixer.efr_service_category — the SAME column the profile header
+   * shows via resolveServiceCategories(). That CSV holds category IDs and/or
+   * literal names; resolve BOTH to ids so a tech whose category lives ONLY on
+   * tbl_easyfixer (no easyfixer_service_type / mapping / dskill_status row yet)
+   * can still map the deep skills of the categories assigned to them.
+   * Bug it fixes: efr 2334 "Plumbing Services" appeared in the header but the
+   * picker fell back to the read-only "contact CRM" state (empty catalog).
+   */
+  const raw = String(serviceCategoryRaw || '').trim();
+  if (raw) {
+    const parts = raw.split(',').map((s) => s.trim()).filter(Boolean);
+    const names = [];
+    for (const p of parts) {
+      if (/^\d+$/.test(p)) ids.add(Number(p));
+      else names.push(p);
+    }
+    if (names.length > 0) {
+      const placeholders = names.map(() => '?').join(',');
+      const [nameRows] = await pool.query(
+        `SELECT service_catg_id FROM tbl_service_catg WHERE service_catg_name IN (${placeholders})`,
+        names,
+      );
+      for (const r of nameRows) {
+        const n = Number(r.service_catg_id);
+        if (Number.isFinite(n)) ids.add(n);
+      }
+    }
+  }
+  return ids;
 }
 
 async function fetchDeepSkillCatalog(pool) {
@@ -558,11 +630,15 @@ async function buildDeepSkillCatalog(pool) {
       ORDER BY service_catg_name ASC`,
   );
   const [serviceTypes] = await pool.query(
+    // display = 2 ⇒ only Tx-app / deep-skill service types (matches the tech app's
+    // mobile-deepskill.service.js getHierarchy and the CRM deep-skill picker), so
+    // CRM-only booking types like "Amazon" (display=0) never appear in the
+    // technician self-service magic-link tree.
     `SELECT service_type_id,
             service_catg_id   AS category_id,
             service_type_name
        FROM tbl_service_type
-      WHERE service_type_status = 1
+      WHERE service_type_status = 1 AND display = 2
       ORDER BY service_type_name ASC`,
   );
   const [deepSkills] = await pool.query(
@@ -708,13 +784,16 @@ async function searchPincodes(q, limit, pool) {
      * all-digits branch above, so this fallback is for pure text.
      */
     const prefix = `${term}%`;
+    // Match on LOCATION (area label), CITY, or district — so the technician can
+    // find a pincode by any of Pincode / Location / City (the pincode itself is
+    // handled by the all-digits branch above).
     [rows] = await pool.query(
       `${SELECT}
        WHERE p.pincode_status = 1
-         AND (c.city_name LIKE ? OR COALESCE(p.district, c.district) LIKE ?)
+         AND (p.location LIKE ? OR c.city_name LIKE ? OR COALESCE(p.district, c.district) LIKE ?)
        ORDER BY p.pincode ASC
        LIMIT ?`,
-      [prefix, prefix, cap],
+      [prefix, prefix, prefix, cap],
     );
   }
   logger.info('Found ' + rows.length + ' pincodes');
@@ -853,14 +932,18 @@ async function sendForEasyfixer(efrId, { action = 'first', override_mobile, bypa
     response = await whatsappService.sendTemplate({
       to: destinationMobile,
       recipientName: fullName,
-      templateName: 'tx_complete_profile',
+      templateName: PROFILE_TEMPLATE_NAME,
       bypassTestRedirect,
-      // Gallabox `tx_complete_profile` uses NAMED body variables
-      // ({{Name}}, {{efr_id}}, {{profile_link}}) — positional keys (1/2/3)
-      // don't bind and arrive empty. Keys must match the template var names.
+      // Gallabox `skill_otp_tx1` uses NAMED body variables
+      // ({{name}}, {{id}}, {{profile_link}}) — positional keys (1/2/3) don't
+      // bind and arrive EMPTY, and so do names that don't match the template
+      // exactly. The predecessor (tx_complete_profile) used {{Name}}/{{efr_id}};
+      // both the name and the casing changed, so these keys are not
+      // interchangeable — renaming the template without renaming these would
+      // deliver a message reading "Hello  []".
       bodyValues: {
-        Name:         fullName,
-        efr_id:       String(efrId),
+        name:         fullName,
+        id:           String(efrId),
         profile_link: shortUrl,
       },
     });
@@ -1066,10 +1149,16 @@ async function acceptSubmission(efrId, payload, pool) {
 }
 
 module.exports = {
+  PROFILE_TEMPLATE_NAME,
   fetchPrefill,
   sendForEasyfixer,
   acceptSubmission,
+  profileOtpRequired,
   searchPincodes,
+  // Exposed for the AI-calling test flow's post-call mapper
+  // (services/ai-profile-extract.service.js) — same cached catalog the
+  // profile-update magic-link form uses, so both stay in lockstep.
+  fetchDeepSkillCatalog,
   invalidateCatalogCaches,
   invalidateServiceCategoriesCache,
 };

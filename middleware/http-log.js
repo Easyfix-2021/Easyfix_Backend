@@ -79,6 +79,15 @@ module.exports = function httpLog(req, res, next) {
       return;
     }
 
+    // AI-calling status poll (GET /api/admin/validate/ai-calling/<id|flows>) — the
+    // UI polls every few seconds while a call is live. Keep SUCCESSFUL polls at
+    // debug so the call's real start/answer/end/error lines stay readable;
+    // failures (4xx/5xx) fall through to the normal warn/error path below.
+    if (status < 400 && req.method === 'GET' && /\/admin\/validate\/ai-calling\//.test(path)) {
+      logger.debug(`${status} GET ${path} (${duration} ms)`);
+      return;
+    }
+
     // Access line, same `[time] [surface] identity → [LEVEL] …` shape as app
     // logs. If the request emitted app logs, the logger already printed a header
     // (METHOD path) ABOVE them, so here we only need the compact outcome

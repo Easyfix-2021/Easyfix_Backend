@@ -283,7 +283,12 @@ async function list({
     }
   }
   if (deepSkillId != null) {
-    clauses.push('EXISTS (SELECT 1 FROM tbl_efr_deepskill_mapping dsm WHERE dsm.easyfixer_id = e.efr_id AND dsm.deep_skill_id = ?)');
+    // Filter by the DEEP SKILL (3rd level). In tbl_efr_deepskill_mapping the
+    // physical column parent_skill_id holds tbl_deep_skill.deepskill_id (the
+    // "deep skill" id); the deep_skill_id physical column holds the 4th-level
+    // OPTION id. is_repairing = 1 excludes soft-deleted skill rows (same shape
+    // candidate-ranking uses).
+    clauses.push('EXISTS (SELECT 1 FROM tbl_efr_deepskill_mapping dsm WHERE dsm.easyfixer_id = e.efr_id AND dsm.is_repairing = 1 AND dsm.parent_skill_id = ?)');
     params.push(deepSkillId);
   }
   /*
@@ -584,8 +589,33 @@ async function update(id, input, actor) {
   return getById(id);
 }
 
+/*
+ * Cached probe: does tbl_easyfixer have the scheduled_reactivation_date column?
+ * It is added by a PENDING shared-schema migration (2026-07-13) that needs DBA
+ * sign-off, so it may not exist yet. setStatus builds a dynamic UPDATE and naming
+ * a missing column would throw — so we only touch it once confirmed present.
+ * Resolved once per process, then cached (undefined = not yet probed).
+ */
+let _hasReactivationCol;
+async function hasReactivationColumn() {
+  if (_hasReactivationCol !== undefined) return _hasReactivationCol;
+  try {
+    const [rows] = await pool.query(
+      `SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE()
+          AND table_name = 'tbl_easyfixer'
+          AND column_name = 'scheduled_reactivation_date'
+        LIMIT 1`,
+    );
+    _hasReactivationCol = rows.length > 0;
+  } catch (e) {
+    _hasReactivationCol = false;
+  }
+  return _hasReactivationCol;
+}
+
 // ─── Status toggle ──────────────────────────────────────────────────
-async function setStatus(id, { active, reasonId, comment }, actor) {
+async function setStatus(id, { active, reasonId, comment, reactivationDate }, actor) {
   logger.info('Toggle easyfixer status · id=' + id + ' active=' + active + ' reasonId=' + (reasonId || ''));
   const existing = await getById(id);
   if (!existing) {
@@ -595,15 +625,24 @@ async function setStatus(id, { active, reasonId, comment }, actor) {
     throw err;
   }
 
+  const hasReactCol = await hasReactivationColumn();
   const sets = ['efr_status = ?', 'updated_by = ?', 'update_date = ?'];
   const values = [active ? 1 : 0, actor?.user_id || null, new Date()];
 
   if (active === false) {
     sets.push('inactive_reason = ?', 'inactive_comment = ?', 'last_inactive_date_time = ?');
     values.push(reasonId || null, comment || null, new Date());
+    if (hasReactCol) {
+      // "Temporary Inactive": a future date auto-reactivates the tech via the
+      // daily cron. NULL = a permanent deactivate (the cron never touches it).
+      sets.push('scheduled_reactivation_date = ?');
+      values.push(reactivationDate || null);
+    }
   } else {
-    // Reactivation: clear inactivity reason fields
+    // Reactivation: clear inactivity reason fields AND any pending auto-
+    // reactivation so a manually-reactivated tech is never re-processed.
     sets.push('inactive_reason = NULL', 'inactive_comment = NULL');
+    if (hasReactCol) sets.push('scheduled_reactivation_date = NULL');
   }
 
   values.push(id);

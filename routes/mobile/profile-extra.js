@@ -5,6 +5,8 @@ const multer = require('multer');
 const validate = require('../../middleware/validate');
 const { modernOk, modernError } = require('../../utils/response');
 const svc = require('../../services/mobile-profile-extra.service');
+const withdrawalService = require('../../services/withdrawal.service');
+const { pool } = require('../../db');
 const logger = require('../../logger');
 
 // Profile-image multipart upload — memory storage, single image ≤10MB.
@@ -130,6 +132,32 @@ router.get('/earnings', validate(dateWindow, 'query'), async (req, res, next) =>
 });
 
 // ─────────────────────────────────────────────────────────────────────
+// Withdraw / payout request
+// ─────────────────────────────────────────────────────────────────────
+
+/*
+ * Record a payout/withdrawal request against the technician's wallet balance.
+ *
+ * MVP (finance-in-the-loop): this ONLY records the request row in
+ * tbl_easyfixer_withdrawal_request (status='requested'). It deliberately does
+ * NOT debit tbl_easyfixer.current_balance — the actual payout + wallet debit are
+ * a downstream FINANCE/OPS step performed when the payout is settled (see
+ * services/withdrawal.service.js). The service throws { status, code, message }
+ * for the bank-missing / invalid-amount / already-pending cases, which the
+ * central error-handler surfaces to the app verbatim.
+ */
+router.post('/withdraw', validate(Joi.object({
+  amount: Joi.number().positive().required(),
+})), async (req, res, next) => {
+  try {
+    logger.info('Withdrawal requested · amount=' + req.body.amount);
+    const result = await withdrawalService.requestWithdrawal(req.tech.efr_id, req.body, pool);
+    logger.info('Withdrawal request recorded · requestId=' + result.requestId);
+    modernOk(res, result);
+  } catch (e) { next(e); }
+});
+
+// ─────────────────────────────────────────────────────────────────────
 // I-Card
 // ─────────────────────────────────────────────────────────────────────
 
@@ -243,6 +271,36 @@ router.get('/kyc/aadhaar-pan-exists/:number', validate(Joi.object({
   try {
     logger.info(`KYC duplicate-check · type=${/^[0-9]{12}$/.test(req.params.number) ? 'aadhaar' : 'pan'}`);
     modernOk(res, await svc.aadhaarPanExists(req.params.number, req.tech.efr_id));
+  } catch (e) { next(e); }
+});
+
+// ─── Serviceable pincodes ──────────────────────────────────────────────────
+// The 6-digit pincodes a technician is willing to work in. Scoped strictly to
+// req.tech.efr_id. Read returns the CSV as an array; write reuses the
+// verification service's replaceServiceablePincodes (same soft-write + flip-to-
+// serviceable the CRM/public flows use), so storage format can't drift.
+const verificationService = require('../../services/easyfixer-verification.service');
+
+router.get('/serviceable-pincodes', async (req, res, next) => {
+  try {
+    logger.info('Get serviceable pincodes · efr=' + req.tech.efr_id);
+    modernOk(res, await svc.getServiceablePincodes(req.tech.efr_id));
+  } catch (e) { next(e); }
+});
+
+// PUT the full set (idempotent replace). An empty array clears the set.
+// Pincodes are 6-digit strings; replaceServiceablePincodes matches them against
+// tbl_pincode by value, so an unknown pincode is dropped (partial-resolution
+// warning) rather than stored — the app validates each one before adding it.
+router.put('/serviceable-pincodes', validate(Joi.object({
+  pincodes: Joi.array().items(Joi.string().trim().pattern(/^[0-9]{6}$/)).max(200).required(),
+})), async (req, res, next) => {
+  try {
+    logger.info('Replace serviceable pincodes · efr=' + req.tech.efr_id + ' · count=' + req.body.pincodes.length);
+    // actor=null → the technician is acting on their own behalf; the helper
+    // stamps their efr_id as created_by/updated_by.
+    await verificationService.replaceServiceablePincodes(req.tech.efr_id, req.body.pincodes, null);
+    modernOk(res, await svc.getServiceablePincodes(req.tech.efr_id));
   } catch (e) { next(e); }
 });
 

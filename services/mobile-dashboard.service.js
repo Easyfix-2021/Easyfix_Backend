@@ -3,6 +3,7 @@ const logger = require('../logger');
 const jobService = require('./job.service');
 const noticeService = require('./notice.service');
 const performanceService = require('./performance.service');
+const alertFlags = require('./job-offer-alert-flags');
 
 /*
  * Mobile dashboard orchestrator — composes shared services into the
@@ -222,6 +223,29 @@ async function getDashboard(efrId, opts = {}) {
       items:       notices || [],
       latest:      (notices || [])[0] || null,
       unreadCount: Number(noticesUnread) || 0,
+    },
+    // ─── Server-driven feature flags ───────────────────────────────
+    // Top-level `flags` block so the app can change BEHAVIOUR without a store
+    // release — ops flips an easyfix_properties row and the next dashboard
+    // fetch carries the new value.
+    //
+    //   loudOfferAlert — BANNER ONLY: render the attention-grabbing full-screen
+    //     offer banner for incoming job offers. Mirrors the MASTER
+    //     `job.offer.loud_alert.enabled` exactly: the banner is intrinsic to the
+    //     loud alert and has NO sub-flag of its own — see job-offer-alert-flags.js.
+    //     It does NOT govern the app's own alert sound. That is driven per-push by
+    //     `data.loudAlert` on the job-offer push (loudSoundEnabled() = master AND
+    //     `job.offer.loud_alert.sound.enabled`), which is what lets ops silence the
+    //     sound mid-rollout while this flag — and the banner — stay on. Do not
+    //     overload this key with a sound meaning: an app that plays its buzzer off
+    //     `flags.loudOfferAlert` defeats the only sound kill-switch there is.
+    //
+    // The app must treat a MISSING `flags` object / missing key as FALSE, which
+    // is the same fail-safe rule the backend applies to a missing property: off
+    // means exactly today's behaviour. Read synchronously off the cached
+    // property store, so this adds no query to the dashboard fan-out.
+    flags: {
+      loudOfferAlert: alertFlags.loudAlertMasterEnabled(),
     },
   };
 }
@@ -592,6 +616,14 @@ function mapJobForMobile(j) {
     // services[].job_charge_type on the detail call.
     totalAmount:       j.total_amount ?? null,
     helperReq:         j.helper_req ?? null,
+    // Offer countdown (offer rows only — see listOfferedForTech). Deliberately
+    // kept in the projection's own snake_case rather than camelCased, so the
+    // SAME two field names appear on this preview, on GET /jobs/offered, and in
+    // the app's offer model. Spread CONDITIONALLY: a non-offer preview (Today's
+    // Jobs) has no offer, and emitting `offered_at: null` there would imply one
+    // exists but is unknown. Sent regardless of any loud-alert flag — the
+    // countdown is useful on its own.
+    ...(j.offered_at != null ? { offered_at: j.offered_at, expires_at: j.expires_at ?? null } : {}),
   };
 }
 

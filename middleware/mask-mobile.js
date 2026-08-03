@@ -34,6 +34,7 @@
  */
 
 const { maskMobileInResponse } = require('../utils/mask-mobile');
+const { getProperty } = require('../services/properties.service');
 
 /*
  * Per-route mask opt-out (2026-05-25):
@@ -62,6 +63,27 @@ function isUnmaskedPath(reqPath) {
   return UNMASKED_PATH_PREFIXES.some((prefix) => reqPath === prefix || reqPath.startsWith(prefix + '/'));
 }
 
+/*
+ * Global CUSTOMER-number visibility toggle (easyfix_properties, DB-flipped).
+ * When 'true', CUSTOMER-facing mobile fields (see CUSTOMER_MOBILE_FIELDS in
+ * utils/mask-mobile.js) ship UNMASKED to CRM operational screens; technician
+ * / client-SPOC / staff numbers stay masked either way. Absent → false
+ * (masked — the long-standing default).
+ */
+function customerNumbersVisible() {
+  return String(getProperty('ui.customer.number.visible')).trim().toLowerCase() === 'true';
+}
+
+/*
+ * QuickSight report responses must stay masked even when the visibility flag
+ * is ON — the 'mask numbers in reports' posture is deliberate and independent.
+ * req.path here is mounted UNDER /api/admin, so report routes start with
+ * '/quicksight'.
+ */
+function isReportPath(reqPath) {
+  return reqPath === '/quicksight' || reqPath.startsWith('/quicksight/');
+}
+
 function maskMobileResponseMiddleware(req, res, next) {
   const wantsUnmasked = String(req.query?.unmasked).toLowerCase() === 'true';
   if (wantsUnmasked || isUnmaskedPath(req.path)) {
@@ -71,8 +93,12 @@ function maskMobileResponseMiddleware(req, res, next) {
     return next();
   }
 
+  // Customer-number visibility flag ON (and NOT a report path) → leave
+  // customer fields raw; everything else still masks. Flag OFF → mask all
+  // (identical to the historical behaviour).
+  const unmaskCustomer = customerNumbersVisible() && !isReportPath(req.path);
   const originalJson = res.json.bind(res);
-  res.json = (body) => originalJson(maskMobileInResponse(body));
+  res.json = (body) => originalJson(maskMobileInResponse(body, { unmaskCustomer }));
   return next();
 }
 

@@ -7,11 +7,13 @@ const jobLocation = require('../../services/job-location.service');
 const { modernOk, modernError } = require('../../utils/response');
 const logger = require('../../logger');
 const {
-  listQuery, createBody, updateBody, statusBody, assignBody, offerBody, ownerBody, idParam,
-  candidatesQuery, candidatesSearchQuery,
+  listQuery, createBody, updateBody, statusBody, assignBody, offerBody, ownerBody, rescheduleBody, idParam,
+  candidatesQuery, candidatesSearchQuery, slotRecommendationsQuery,
 } = require('../../validators/job.validator');
 const { assertEntityInScope } = require('../../lib/scope');
+const requireStageForTransition = require('../../middleware/require-stage');
 const { streamStyledXlsx } = require('../../utils/xlsx-styled-export');
+const ttlCache = require('../../utils/ttl-cache');
 
 /*
  * Row-level scope guard for every /:id endpoint. Fetches the job once,
@@ -33,6 +35,51 @@ async function scopedJob(req, res, next) {
     req.scopedJob = j;
     return next();
   } catch (e) { next(e); }
+}
+
+/*
+ * Past-appointment gate (2026-07-29).
+ *
+ * Two things ops could do that shouldn't be possible: reschedule a job INTO a
+ * moment that has already gone, and offer a job whose promised slot has already
+ * passed (e.g. a 9 AM appointment still being offered at 12:44). Both put a
+ * technician on the hook for a time nobody can meet; the second also produces
+ * offers that are stale the instant they are sent.
+ *
+ * ROUTE LAYER ONLY — deliberately not inside job.service. `offerToTechnicians`
+ * is shared with assign() and the on-create auto-assign path, where a
+ * back-dated import must still be allowed to land. Same reasoning as
+ * middleware/require-stage.js. NOT applied to /assign either: reassigning a
+ * running-late job (tech no-show at 9 AM, swap at 12:44) is a legitimate
+ * recovery ops must keep.
+ *
+ * The "effective" appointment is the body's requestedDateTime when present —
+ * both /offer and /reschedule can carry a schedule edit — otherwise the job's
+ * stored one. So fixing the time in the SAME call is always allowed; only a
+ * stale time left stale is refused.
+ */
+function appointmentIsPast(value) {
+  const raw = String(value || '').trim().replace('T', ' ');
+  if (!raw) return false;                       // nothing to judge → don't block
+  const nowIst = job.formatMysqlDateTimeIST(new Date()); // 'YYYY-MM-DD HH:MM:SS' IST
+  if (!nowIst) return false;
+  // Date-only carries no promised time, so judge it by DATE alone — otherwise
+  // "today, time unspecified" would read as 00:00 and be wrongly called past.
+  // Zero-padded fixed-width strings, so lexicographic compare IS chronological.
+  if (raw.length <= 10) return raw.slice(0, 10) < nowIst.slice(0, 10);
+  return raw.slice(0, 16) < nowIst.slice(0, 16);
+}
+
+function blockPastAppointment(message) {
+  return function pastAppointmentGuard(req, res, next) {
+    const effective = req.body?.requestedDateTime
+      || (req.scopedJob && req.scopedJob.requested_date_time);
+    if (appointmentIsPast(effective)) {
+      logger.warn('Past-appointment blocked · jobId=' + req.params.id + ' · appointment=' + effective);
+      return modernError(res, 400, message);
+    }
+    return next();
+  };
 }
 
 // Upload sub-router (POST /upload) — isolated because of multer middleware.
@@ -79,6 +126,47 @@ router.get('/:id/location',
     }
   });
 
+/*
+ * GET /api/admin/jobs/:id/selfie-url — resolve the technician's reached-location
+ * selfie to a short-TTL presigned URL for the CRM. tbl_job.tx_selfie_id is an int
+ * FK to document.id; the mobile upload stored the S3 key in document.path, so we
+ * presign it on read (5-min TTL, re-minted per view — nothing cached). Returns
+ * { selfieId, url } with url=null when there is no selfie / no resolvable key, so
+ * the CRM can render the tile unconditionally and simply hide it on null. scopedJob
+ * enforces the operator's manage_* scope.
+ */
+router.get('/:id/selfie-url',
+  validate(idParam, 'params'),
+  scopedJob,
+  async (req, res, next) => {
+    try {
+      const selfieId = req.scopedJob.tx_selfie_id;
+      if (!selfieId) return modernOk(res, { selfieId: null, url: null });
+
+      const { pool } = require('../../db');
+      const s3Storage = require('../../utils/s3-storage');
+      const [[doc]] = await pool.query(
+        'SELECT `path`, url FROM document WHERE id = ? LIMIT 1',
+        [selfieId],
+      );
+      if (!doc) return modernOk(res, { selfieId, url: null });
+
+      // S3 key lives in `path`; presign on read. Fall back to a legacy stored url.
+      const key = String(doc.path || '').trim();
+      let url = null;
+      if (key && s3Storage.isEnabled()) {
+        try { url = await s3Storage.getPresignedUrl(key); }
+        catch (e) { logger.warn('Selfie presign failed · jobId=' + req.params.id + ' · ' + e.message); }
+      }
+      if (!url && doc.url) url = doc.url;
+      logger.info('Resolved selfie url · jobId=' + req.params.id + ' · has=' + !!url);
+      modernOk(res, { selfieId, url });
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  });
+
 router.get('/:id/candidates',
   validate(idParam, 'params'),
   validate(candidatesQuery, 'query'),
@@ -87,6 +175,11 @@ router.get('/:id/candidates',
     try {
       const { limit, jobDate, timeSlot } = req.query;
       logger.info('Rank candidates for job · jobId=' + req.params.id + ' limit=' + limit + ' jobDate=' + (jobDate || '-') + ' timeSlot=' + (timeSlot || '-'));
+      // Lazy offer-expiry (job-scoped) BEFORE ranking. l1Eligibility EXCLUDES techs
+      // with an OPEN offer, so a >30-min stale offer (cron off / between ticks)
+      // would wrongly keep an already-re-offerable tech OUT of the pool. Expiring
+      // first (0→3) lets them re-rank. undefined = default 30-min TTL. Idempotent.
+      await job.expireStaleOffers(undefined, Number(req.params.id));
       const result = await candidateRanking.rankCandidatesForJob(req.params.id, {
         limit,
         // jobDate is a validated IST wall-clock string — pass it through
@@ -99,8 +192,58 @@ router.get('/:id/candidates',
         // the balance floor.
         enforceMaxConcurrent: false,
         enforceCodBalance: true,
+        // Manual picker: attendance is SOFT — present techs rank first, absent
+        // techs (shown with the ✗ column) backfill the list to `limit` instead
+        // of being excluded, so the Top-10 is never empty when eligible techs
+        // exist. (Auto-assign keeps attendance a HARD gate — it omits this.)
+        softAttendance: true,
+        // scopedJob already loaded this job — hand it over so the service
+        // doesn't run a second (redundant) getById on the hot path.
+        preloadedJob: req.scopedJob,
       });
-      logger.info('Returning ' + (result?.candidates?.length || 0) + ' ranked candidates · jobId=' + req.params.id + (result?.note ? ' note=' + result.note : ''));
+      // Tell the CRM modal which commit mode to render: offer-pool (multi-select
+      // + "Offer to N") when the offer flow is effectively active, else single
+      // direct-assign ("Assign"). Mirrors the BE's own assign-vs-offer gate so
+      // the UI never lies about what the commit will do. The candidate LIST is
+      // unchanged — this only flags the commit mode.
+      const offerFlowEnabled = await job.isOfferFlowActive();
+      logger.info('Returning ' + (result?.candidates?.length || 0) + ' ranked candidates · jobId=' + req.params.id + ' offerFlow=' + offerFlowEnabled + (result?.note ? ' note=' + result.note : ''));
+      modernOk(res, { ...result, offerFlowEnabled });
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  });
+
+/*
+ * GET /api/admin/jobs/:id/slot-recommendations?date=YYYY-MM-DD
+ *
+ * Which of the four booking windows can actually be STAFFED on that date.
+ * Ops otherwise pick a slot from a static list with nothing to say whether
+ * anyone is free — the cost of which shows up later as failed assignments and
+ * reschedules.
+ *
+ * Advice only: every window is returned (with a reason when it is poor), the FE
+ * keeps them all selectable, and nothing here blocks a booking.
+ *
+ * CACHED for 30s on (jobId, date). The CRM calls this on every date pick and
+ * the underlying work is a full ranking pass; this backend is shared with the
+ * client portal and the mobile app, so a repeat pick of the same date must not
+ * re-run it. ttl-cache also JOINS in-flight callers, so two operators opening
+ * the same job at once cost one computation, not two.
+ */
+router.get('/:id/slot-recommendations',
+  validate(idParam, 'params'),
+  validate(slotRecommendationsQuery, 'query'),
+  scopedJob,
+  async (req, res, next) => {
+    try {
+      const day = String(req.query.date).slice(0, 10);
+      const result = await ttlCache.cached(
+        `slot-rec:${req.params.id}:${day}`,
+        30_000,
+        () => candidateRanking.recommendSlotsForJob(req.params.id, { date: day }),
+      );
       modernOk(res, result);
     } catch (e) {
       if (e.status) return modernError(res, e.status, e.message);
@@ -112,7 +255,8 @@ router.get('/:id/candidates',
  * GET /api/admin/jobs/:id/candidates/search?term=<q>&jobDate=&timeSlot=
  *
  * Match-anyone variant of /:id/candidates — finds technicians by
- * efr_id / efr_name / efr_no(mobile) with NO top-10 hard filters and NO
+ * efr_id / efr_name / efr_no(mobile) / city_name / efr_pin_no (single `term`
+ * box — no per-field params) with NO top-10 hard filters and NO
  * ranking exclusion, returning the same widened row shape (distance,
  * attendance, concurrent, skill state, …) so ops can assign anyone.
  * Capped at 50; the service logger.warns when the cap is hit.
@@ -128,6 +272,10 @@ router.get('/:id/candidates/search',
     try {
       const { term, limit, jobDate, timeSlot } = req.query;
       logger.info('Search technicians for job · jobId=' + req.params.id + ' term="' + (term || '') + '" limit=' + limit);
+      // Lazy offer-expiry (job-scoped) so search reflects the same fresh offer
+      // state as the ranked list (see the /candidates note). Idempotent no-op when
+      // nothing is stale / the offer table is absent.
+      await job.expireStaleOffers(undefined, Number(req.params.id));
       const result = await candidateRanking.searchTechniciansForJob(req.params.id, {
         term,
         limit,
@@ -135,6 +283,8 @@ router.get('/:id/candidates/search',
         // round-trip) — the service slices the date prefix for DATE() math.
         jobDate: jobDate || undefined,
         timeSlot,
+        // Reuse scopedJob's already-loaded job row (skip the redundant getById).
+        preloadedJob: req.scopedJob,
       });
       logger.info('Returning ' + (result?.candidates?.length || 0) + ' matched technicians · jobId=' + req.params.id);
       modernOk(res, result);
@@ -154,7 +304,10 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
     const { pool } = require('../../db');
     logger.info('List jobs · status=' + (req.query.status ?? '-') + ' clientId=' + (req.query.clientId ?? '-') + ' cityId=' + (req.query.cityId ?? '-') + ' limit=' + req.query.limit + ' offset=' + req.query.offset);
     const scope = await buildRequestScopeWithHierarchy(req, pool);
-    const { rows, total } = await job.list({ ...req.query, scope });
+    // Job Stage Access — req.allowedStages is attached by routes/admin/index.js
+    // (bypass roles / no-rows → {mode:'all'} = unrestricted). list() intersects
+    // the visible statuses with any tab/status filter.
+    const { rows, total } = await job.list({ ...req.query, scope, allowedStages: req.allowedStages });
     logger.info('Returning ' + rows.length + ' jobs (total=' + total + ')');
     modernOk(res, { items: rows, total, limit: req.query.limit, offset: req.query.offset });
   } catch (e) { next(e); }
@@ -198,6 +351,8 @@ router.get('/export.xlsx', validate(listQuery, 'query'), async (req, res, next) 
       limit: EXPORT_CAP,
       offset: 0,
       scope,
+      // Job Stage Access — the export mirrors exactly what the operator sees.
+      allowedStages: req.allowedStages,
     });
     const truncated = total > EXPORT_CAP;
     logger.info('Streaming jobs export · ' + rows.length + ' rows (total=' + total + ', truncated=' + truncated + ')');
@@ -319,6 +474,7 @@ router.get('/counts', async (req, res, next) => {
     const counts = await job.getStatusCounts({
       ownerId: Number.isFinite(ownerId) ? ownerId : undefined,
       scope: req.scope,
+      allowedStages: req.allowedStages,
     });
     modernOk(res, counts);
   } catch (e) { next(e); }
@@ -346,7 +502,7 @@ router.get('/counts', async (req, res, next) => {
 router.get('/attention-summary', async (req, res, next) => {
   try {
     logger.info('Fetch attention summary');
-    const data = await job.getAttentionSummary({ scope: req.scope });
+    const data = await job.getAttentionSummary({ scope: req.scope, allowedStages: req.allowedStages });
     modernOk(res, data);
   } catch (e) { next(e); }
 });
@@ -846,7 +1002,7 @@ const { DUE_TO_USER_TYPE, ACTION_TYPE_BY_MODE, ACTION_TYPE } = require('../../se
 router.get('/comment-reasons', async (req, res, next) => {
   try {
     const dueRaw = String(req.query.dueTo || '').toLowerCase().replace(/\s+/g, '');
-    const userType = DUE_TO_USER_TYPE[dueRaw] || 2; // legacy default = Client
+    const userType = DUE_TO_USER_TYPE[dueRaw] || 2; // default = Customer (user_type 2); matches the pre-checked "By Customer" radio
     logger.info('Fetch comment reasons · dueTo=' + (dueRaw || '-') + ' userType=' + userType);
     const [rows] = await imagePool.query(
       `SELECT id, action_desc FROM action_taken_reason
@@ -859,6 +1015,49 @@ router.get('/comment-reasons', async (req, res, next) => {
       .map((r) => ({ id: r.id, label: String(r.action_desc || '').trim() }))
       .filter((x) => x.label);
     logger.info('Returning ' + items.length + ' comment reasons');
+    modernOk(res, items);
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/admin/jobs/cancel-reasons?dueTo=customer|client|easyfix|technician
+ *
+ * Reason list for the Cancel Job popup — the cancel-flow twin of
+ * /comment-reasons. Reads action_taken_reason WHERE action_type = 1 (the Cancel
+ * bucket, ACTION_TYPE.CANCEL) AND user_type = the "Cancellation Due To" radio,
+ * so the dropdown narrows as the operator switches the radio (same as Add
+ * Remarks). The picked id lands in tbl_job.enum_reason_id + the tbl_job_comment
+ * audit row on submit. Default user_type = 1 (EasyFix) — CRM-staff-initiated
+ * cancel. Replaces the deprecated tbl_cancel_reason source.
+ * Route-order: declared BEFORE `/:id`.
+ */
+router.get('/cancel-reasons', async (req, res, next) => {
+  try {
+    const dueRaw = String(req.query.dueTo || '').toLowerCase().replace(/\s+/g, '');
+    const userType = DUE_TO_USER_TYPE[dueRaw] || 1; // default = EasyFix (user_type 1)
+    logger.info('Fetch cancel reasons · dueTo=' + (dueRaw || '-') + ' userType=' + userType);
+    // is_new = MAX(is_new) → "curated-else-legacy": prefer the curated new set
+    // (is_new=1), but fall back to the migrated legacy rows (is_new=0) for any
+    // bucket that has NO curated rows. A blanket `AND is_new = 1` would EMPTY
+    // such a bucket (the documented action_taken_reason gotcha — e.g. reschedule
+    // has only is_new=0 rows), which for a mandatory reason dropdown = a dead
+    // Cancel flow. The correlated subquery keeps this per (action_type,user_type).
+    const [rows] = await imagePool.query(
+      `SELECT id, action_desc FROM action_taken_reason ar
+        WHERE action_type = ? AND user_type = ?
+              AND (status IS NULL OR status = 1)
+              AND is_new = (
+                SELECT MAX(is_new) FROM action_taken_reason
+                 WHERE action_type = ar.action_type AND user_type = ar.user_type
+                       AND (status IS NULL OR status = 1)
+              )
+        ORDER BY id ASC`,
+      [ACTION_TYPE.CANCEL, userType]
+    );
+    const items = rows
+      .map((r) => ({ id: r.id, label: String(r.action_desc || '').trim() }))
+      .filter((x) => x.label);
+    logger.info('Returning ' + items.length + ' cancel reasons');
     modernOk(res, items);
   } catch (e) { next(e); }
 });
@@ -1067,7 +1266,7 @@ router.get('/action-reasons', async (req, res, next) => {
     if (!actionTypeId) return modernOk(res, []);
 
     const dueRaw = String(req.query.dueTo || '').toLowerCase().replace(/\s+/g, '');
-    const userType = DUE_TO_USER_TYPE[dueRaw] || 2; // legacy default = Client
+    const userType = DUE_TO_USER_TYPE[dueRaw] || 2; // default = Customer (user_type 2); matches the pre-checked "By Customer" radio
 
     const [reasonRows] = await pool.query(
       `SELECT id, action_desc FROM action_taken_reason
@@ -1080,6 +1279,39 @@ router.get('/action-reasons', async (req, res, next) => {
       .map((r) => ({ id: r.id, label: String(r.action_desc || '').trim() }))
       .filter((x) => x.label);
     logger.info('Returning ' + items.length + ' action reasons · type=' + type);
+    modernOk(res, items);
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/admin/jobs/reschedule-reasons
+ *
+ * Reason list for the Schedule & Assign → Reschedule dialog. Returns the same
+ * `{ id, label }[]` shape as /action-reasons so the CRM renders it identically.
+ *
+ * Source: action_taken_reason, action_type = 8 (the CRM "Reschedule" bucket —
+ * seeded by migrations/2026-07-10-seed-reschedule-reasons-action-type-8.sql).
+ * UNLIKE /action-reasons this deliberately does NOT filter by user_type — the
+ * Reschedule dialog has a single reason dropdown (no "due to" Customer/Client/
+ * EasyFix/Technician radio), so ALL active action_type=8 reasons are offered.
+ *
+ * Literal-segment route — declared before the `/:id` wildcard (same reason as
+ * /action-reasons above, so Express doesn't try to parse "reschedule-reasons"
+ * as a numeric job id).
+ */
+router.get('/reschedule-reasons', async (_req, res, next) => {
+  try {
+    logger.info('Fetch reschedule reasons (Schedule & Assign)');
+    const [reasonRows] = await pool.query(
+      `SELECT id, action_desc FROM action_taken_reason
+        WHERE action_type = ? AND (status IS NULL OR status = 1)
+        ORDER BY id ASC`,
+      [8],
+    );
+    const items = reasonRows
+      .map((r) => ({ id: r.id, label: String(r.action_desc || '').trim() }))
+      .filter((x) => x.label);
+    logger.info('Returning ' + items.length + ' reschedule reasons');
     modernOk(res, items);
   } catch (e) { next(e); }
 });
@@ -1154,7 +1386,7 @@ const updateHandler = async (req, res, next) => {
 router.put('/:id',   validate(idParam, 'params'), validate(updateBody), scopedJob, updateHandler);
 router.patch('/:id', validate(idParam, 'params'), validate(updateBody), scopedJob, updateHandler);
 
-router.patch('/:id/status', validate(idParam, 'params'), validate(statusBody), scopedJob, async (req, res, next) => {
+router.patch('/:id/status', validate(idParam, 'params'), validate(statusBody), scopedJob, requireStageForTransition('status'), async (req, res, next) => {
   try {
     logger.info('Change job status · jobId=' + req.params.id + ' status=' + req.body?.status);
     /*
@@ -1192,13 +1424,38 @@ router.patch('/:id/status', validate(idParam, 'params'), validate(statusBody), s
   } catch (e) { next(e); }
 });
 
-router.patch('/:id/assign', validate(idParam, 'params'), validate(assignBody), scopedJob, async (req, res, next) => {
+router.patch('/:id/assign', validate(idParam, 'params'), validate(assignBody), scopedJob, requireStageForTransition('assign'), async (req, res, next) => {
   try {
     logger.info('Assign technician · jobId=' + req.params.id + ' efrId=' + (req.body?.easyfixerId ?? req.body?.efr_id ?? '-'));
     const updated = await job.assign(req.params.id, req.body, req.user);
     logger.info('Technician assigned · jobId=' + req.params.id);
     modernOk(res, updated, 'technician assigned');
   } catch (e) { next(e); }
+});
+
+/*
+ * PATCH /api/admin/jobs/:id/reschedule
+ *
+ * Explicit, audited reschedule from the Schedule & Assign modal — its Date/Time
+ * fields are read-only, so this is the ONLY way to move the appointment.
+ * Persists the new requested_date_time + the two derived slot columns, logs
+ * reason + remarks to scheduling_history and tbl_job_comment, and expires any
+ * open offers (made for the old slot). Reason + remarks are mandatory
+ * (rescheduleBody). Literal second segment "reschedule" disambiguates from the
+ * `/:id` wildcard.
+ */
+router.patch('/:id/reschedule', validate(idParam, 'params'), validate(rescheduleBody), scopedJob, requireStageForTransition('reschedule'),
+  blockPastAppointment('Cannot reschedule to a date and time that has already passed. Pick a future appointment.'),
+  async (req, res, next) => {
+  try {
+    logger.info('Reschedule job · jobId=' + req.params.id + ' reasonId=' + (req.body?.reasonId ?? '-'));
+    const updated = await job.reschedule(Number(req.params.id), req.body, req.user);
+    logger.info('Job rescheduled · jobId=' + req.params.id);
+    modernOk(res, updated, 'job rescheduled');
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
 });
 
 /*
@@ -1217,13 +1474,17 @@ router.patch('/:id/assign', validate(idParam, 'params'), validate(assignBody), s
  * Literal-segment route under `/:id/`; its distinct second segment ("offer")
  * keeps it from colliding with the bare `/:id` wildcard.
  */
-router.post('/:id/offer', validate(idParam, 'params'), validate(offerBody), scopedJob, async (req, res, next) => {
+router.post('/:id/offer', validate(idParam, 'params'), validate(offerBody), scopedJob, requireStageForTransition('offer'),
+  blockPastAppointment('This job\'s appointment time has already passed. Reschedule it to a future slot before offering it to technicians.'),
+  async (req, res, next) => {
   try {
-    const { easyfixerIds, requestedDateTime, timeSlot } = req.body;
+    const { easyfixerIds, requestedDateTime, timeSlot, source, sourceByEfr } = req.body;
     logger.info('Offer job to technicians · jobId=' + req.params.id + ' count=' + (Array.isArray(easyfixerIds) ? easyfixerIds.length : 0));
     const opts = {};
     if (requestedDateTime !== undefined) opts.requestedDateTime = requestedDateTime;
     if (timeSlot !== undefined) opts.timeSlot = timeSlot;
+    if (source !== undefined) opts.source = source;
+    if (sourceByEfr !== undefined) opts.sourceByEfr = sourceByEfr;
     const result = await job.offerToTechnicians(Number(req.params.id), easyfixerIds, req.user, opts);
     logger.info('Job offered to technicians · jobId=' + req.params.id + ' offered=' + (Array.isArray(easyfixerIds) ? easyfixerIds.length : 0));
     modernOk(res, result, 'job offered to technicians');
@@ -1981,6 +2242,19 @@ router.post('/:id/comments',
   }
 );
 
+// Customer "Unreachable" SMS — legacy parity with EasyFix_CRM
+// sendSmsToNotReachableCustomer. Fired by the Confirm modal's "Unreachable"
+// submit (after the status + comment writes). scopedJob ensures the job is in
+// the caller's scope. Non-fatal on the FE: a provider failure must not fail the
+// operator's outcome, so the FE wraps this call in try/catch.
+router.post('/:id/notify-unreachable', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
+  try {
+    logger.info('Notify customer unreachable · jobId=' + req.params.id);
+    const result = await job.notifyCustomerNotReachable(req.params.id);
+    modernOk(res, result, result.sent ? 'Customer notified' : 'SMS not sent');
+  } catch (e) { logger.error('Notify unreachable failed · jobId=' + req.params.id + ' · ' + e.message); next(e); }
+});
+
 // ─── Job Feedback sub-resource (legacy tbl_customer_feedback) ─────────
 const jobFeedback = require('../../services/job-feedback.service');
 // VERIFIED against tbl_customer_feedback (see services/job-feedback.service.js).
@@ -2074,113 +2348,20 @@ router.post(
   async (req, res, next) => {
     const jobId = Number(req.params.id);
     try {
-      if (!req.file) {
-        uploadLogger.warn({ jobId }, 'job image upload rejected — missing file field');
-        return modernError(res, 400, 'missing "file" upload');
-      }
-
-      // Compute the next seq from existing rows. Off-by-one safe: if
-      // there are 0 existing rows, seq=1. Two concurrent uploads can
-      // race here; we accept that risk because (a) it's the ops UI
-      // single-uploading per booking, (b) S3 PutObject is idempotent
-      // by key (last-write wins), and (c) the seq is just for
-      // human-readable keys, not a uniqueness constraint.
-      const [[{ existing }]] = await imagePool.query(
-        'SELECT COUNT(*) AS existing FROM tbl_job_image WHERE job_id = ?',
-        [jobId]
-      );
-      const seq = Number(existing || 0) + 1;
-
-      // Entry log — captures intent + the bits we'll need to debug any
-      // downstream S3/DB failure (jobId, seq, originalname, mimetype,
-      // size). originalname is logged here because it never lands in
-      // the DB (lives only in S3 object metadata), so this is the
-      // primary audit trail tying job_id → user-provided filename.
-      uploadLogger.upload({
-        jobId, seq,
-        originalName: req.file.originalname,
-        mimeType: req.file.mimetype,
-        bytes: req.file.size,
-      }, 'job image upload received');
-
-      let imageValue;
-      let usedStorage;
-
-      if (s3Storage.isEnabled()) {
-        // Happy path: S3. Store the canonical key in the DB so
-        // resolveImageUrl() reads it back as an S3 object.
-        //
-        // Category convention (per ops 2026-05-15): this endpoint is
-        // the Book-New-Call attachment surface — every upload here
-        // belongs to the `Booking` lifecycle stage, so we hardcode
-        // it. Completion / Reschedule / Cancellation uploads will
-        // arrive on their own routes (or take an explicit
-        // `?category=` param) when those flows ship; do NOT extend
-        // this handler to accept user-supplied category strings
-        // without server-side validation against an allowlist —
-        // keyFor() also defends with a PascalCase regex.
-        //
-        // The final S3 key shape is `JobSupportings/Booking_<jobId>_<seq>`
-        // — no file extension on the key itself. The file's actual
-        // extension/MIME is preserved via Content-Type (set from
-        // req.file.mimetype) and the original filename is stashed
-        // as object metadata for audit.
-        try {
-          imageValue = await s3Storage.putJobImage({
-            jobId, seq,
-            buffer: req.file.buffer,
-            contentType: req.file.mimetype,
-            originalName: req.file.originalname,
-            category: 'Booking',
-          });
-          usedStorage = 's3';
-          uploadLogger.upload({ jobId, seq, key: imageValue }, 'job image stored on S3');
-        } catch (e) {
-          // S3 failed mid-flight — fall back to local writeBuffer so
-          // the booking image isn't lost. The next reader will use
-          // the local URL automatically.
-          uploadLogger.warn(
-            { jobId, seq, err: e },
-            'S3 putJobImage failed — falling back to local disk',
-          );
-          const saved = writeBuffer('job_files', req.file.buffer, req.file.originalname, req.file.mimetype);
-          imageValue = saved.filename;
-          usedStorage = 'local-fallback';
-          uploadLogger.upload({ jobId, seq, filename: imageValue }, 'job image stored on local disk (fallback)');
-        }
-      } else {
-        // S3 not configured — pure local path (dev / small deploys).
-        const saved = writeBuffer('job_files', req.file.buffer, req.file.originalname, req.file.mimetype);
-        imageValue = saved.filename;
-        usedStorage = 'local';
-        uploadLogger.upload({ jobId, seq, filename: imageValue }, 'job image stored on local disk (S3 disabled)');
-      }
-
-      const [ins] = await imagePool.query(
-        `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, created_date)
-         VALUES (?, ?, ?, ?, NOW())`,
-        [jobId, imageValue, 'booking', 0]
-      );
-
-      uploadLogger.upload(
-        { jobId, seq, imageId: ins.insertId, storage: usedStorage, image: imageValue },
-        'job image row inserted',
-      );
-
-      modernOk(res, {
-        image_id: ins.insertId,
-        job_id: jobId,
-        image: imageValue,
-        image_category: 'booking',
-        job_stage: 0,
-        seq,
-        storage: usedStorage,
-      }, 'image uploaded');
+      // Shared with the client Book-a-service route — one implementation of
+      // S3 (JobSupportings/Booking_<jobId>_<seq>) + local fallback + the
+      // tbl_job_image insert.
+      const result = await require('../../services/job-image.service').uploadJobImage({
+        jobId, file: req.file, category: 'Booking',
+      });
+      uploadLogger.upload({ jobId, imageId: result.image_id, storage: result.storage, image: result.image }, 'job image row inserted');
+      modernOk(res, result, 'image uploaded');
     } catch (e) {
       if (e?.code === 'LIMIT_FILE_SIZE') {
         uploadLogger.warn({ jobId, bytes: req.file?.size }, 'job image upload rejected — exceeds 10MB');
         return modernError(res, 400, 'file exceeds 10MB');
       }
+      if (e?.status === 400) return modernError(res, 400, e.message);
       uploadLogger.error({ jobId, err: e }, 'job image upload failed');
       next(e);
     }

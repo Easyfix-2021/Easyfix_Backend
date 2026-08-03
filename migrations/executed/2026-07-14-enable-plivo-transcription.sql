@@ -1,0 +1,16 @@
+-- Enable Plivo call transcription.
+-- The transcription pipeline (lazy-on-play, on-demand View Analysis, and the
+-- 30-min backfill cron) is complete and correct, but is gated on the
+-- easyfix_properties key 'plivo.transcription.enabled'. That key was SEEDED
+-- 'false' by 2026-07-06-add-plivo-transcription.sql (with a no-op ON DUPLICATE
+-- KEY UPDATE property_value = property_value) and never flipped — unlike
+-- plivo.recording.enabled, which 2026-07-03 explicitly set to 'true'. So
+-- recording works but transcription stays blank. This flips the gate on.
+--
+-- AFTER RUNNING: RESTART the backend. easyfix_properties is cached AND the
+-- transcription-backfill cron's registration is decided once at server start.
+-- DEPENDENCIES: the Plivo Transcription add-on must be billed/enabled on the
+-- PLIVO_AUTH_ID account (a 402/403 marks calls transcription_status='not_available');
+-- and CRON_DISABLED must not be 'true' for automatic backfill (on-demand /
+-- lazy-on-play still work without the cron). Transcripts are customer PII.
+INSERT INTO easyfix_properties (property_key, property_value) VALUES ('plivo.transcription.enabled', 'true') ON DUPLICATE KEY UPDATE property_value = 'true';

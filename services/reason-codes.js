@@ -7,12 +7,21 @@
  * DUE_TO_USER_TYPE
  *   Maps the operator-facing "Pending Due To" / "Open Due To" radio
  *   label (lowercased + whitespace-stripped on the URL side) to the
- *   integer stored as `tbl_action_taken_reason.user_type`. Verified
- *   2026-05-19 against the legacy CRM action_taken_reason dump:
- *     1 → Customer    (e.g. "Customer is not responding")
- *     2 → Client      (e.g. "Phone not reachable", "Reschedule – CX request")
- *     3 → EasyFix     (e.g. "Spare not available", "Pending Authorisation")
+ *   integer stored as `tbl_action_taken_reason.user_type`.
+ *
+ *   ⚠ The seeded data does NOT follow the naive 1=Customer/2=Client order.
+ *   Ground truth is the legacy CRM Velocity pages — jobCancel.vm and every
+ *   sibling reason page (jobInquiry/jobComment/jobCallLater/…) bind the
+ *   radio to userType with the SAME else-EasyFix convention:
+ *     customer → 2, client → 3, technician → 4, else (easyfix) → 1
+ *   i.e. the rows live under:
+ *     1 → EasyFix     (the else-branch bucket; e.g. "Spare not available")
+ *     2 → Customer    (e.g. "Customer is not responding"; magic-link 38/39)
+ *     3 → Client      (e.g. "Phone not reachable", "Reschedule – CX request")
  *     4 → Technician  (e.g. "Tx No-Show", "Estimate not received from Technician")
+ *   The earlier "verified 2026-05-19" 1=Customer/2=Client mapping was read
+ *   off a mislabeled dump and shifted 3 of 4 parties (Technician=4 lined up
+ *   in both schemes, masking it). Corrected 2026-07-14 against the .vm source.
  *
  * ACTION_TYPE_BY_MODE
  *   Maps the FE dialog mode (route query param `type`) to the integer
@@ -27,10 +36,10 @@
  */
 
 const DUE_TO_USER_TYPE = Object.freeze({
-  customer: 1,
-  client: 2,
-  easyfix: 3,
-  technician: 4,
+  customer: 2,   // Customer reasons live under user_type = 2
+  client: 3,     // Client   reasons live under user_type = 3
+  easyfix: 1,    // EasyFix  reasons live under user_type = 1 (legacy .vm else-branch)
+  technician: 4, // Technician reasons live under user_type = 4
 });
 
 const ACTION_TYPE_BY_MODE = Object.freeze({
@@ -46,6 +55,10 @@ const ACTION_TYPE_BY_MODE = Object.freeze({
 });
 
 const ACTION_TYPE = Object.freeze({
+  // Cancel Job → action_type = 1 bucket (CRM admin Cancel dialog). Reason is
+  // picked per user_type via the "Cancellation Due To" radio, mirroring the
+  // Add Remarks (action_type = 5) flow. Replaces the deprecated tbl_cancel_reason.
+  CANCEL: 1,
   ADD_REMARKS: 5,
   ENQUIRY: 24,
   UNREACHABLE: 25,

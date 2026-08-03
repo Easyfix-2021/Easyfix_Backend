@@ -68,6 +68,10 @@ const listClientsQuery = Joi.object({
   includeInactive: Joi.string().valid('true', 'false').optional(),
   limit:           Joi.number().integer().min(1).max(500).optional(),
   offset:          Joi.number().integer().min(0).optional(),
+  // Server-side sort — whitelisted columns only (the service also guards
+  // via a SORT_MAP; this rejects garbage at the edge).
+  sortBy:          Joi.string().valid('client_id', 'client_name', 'client_email', 'city_name', 'client_status').optional(),
+  sortDir:         Joi.string().valid('asc', 'desc').insensitive().optional(),
 });
 
 /* ─── Client master ───────────────────────────────────────────────── */
@@ -263,6 +267,10 @@ const createCustomPropertyBody = Joi.object({
   label:      Joi.string().max(200).optional().allow('', null),
   value:      Joi.string().max(500).optional().allow('', null),
   mandatory:  Joi.boolean().optional(),
+  // is_config discriminator (2026-07-10): 1 = client-level CONFIG/CONTROL
+  // setting (hidden from booking forms + bulk templates); 0 = per-booking
+  // DATA-ENTRY field. Tolerant boolean/0-1 variant; defaults to 0 server-side.
+  is_config:  Joi.alternatives(Joi.boolean(), Joi.number().valid(0, 1)).optional(),
 }).options({ stripUnknown: true });
 
 const updateCustomPropertyBody = Joi.object({
@@ -271,6 +279,8 @@ const updateCustomPropertyBody = Joi.object({
   value:      Joi.string().max(500).optional().allow('', null),
   mandatory:  Joi.boolean().optional(),
   isMandatory: Joi.boolean().optional(),
+  // is_config discriminator (2026-07-10) — see createCustomPropertyBody.
+  is_config:  Joi.alternatives(Joi.boolean(), Joi.number().valid(0, 1)).optional(),
   // snake_case
   property_name:  Joi.string().max(100).optional(),
   property_label: Joi.string().max(200).optional().allow('', null),

@@ -1,6 +1,9 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const jobService = require('./job.service');
+// Shared appointment slot model — the 1-hour conflict window + the midnight
+// sentinel guard this legacy ranker now uses, same as candidate-ranking.
+const slotModel = require('./time-slot');
 
 /*
  * 3-layer auto-assignment pipeline (blueprint §5).
@@ -226,18 +229,45 @@ async function statsForCandidates(efrIds, jobRequestedTs, jobTimeSlot) {
   );
   const activeMap = new Map(activeRows.map((r) => [r.efr_id, Number(r.active_jobs)]));
 
-  // time-slot conflicts: any job on same date+slot
-  const reqDate = jobRequestedTs ? new Date(jobRequestedTs).toISOString().slice(0, 10) : null;
+  /*
+   * Booking conflict: another ACTIVE job whose 1-HOUR window OVERLAPS the
+   * proposed appointment. Identical predicate to the main engine
+   * (candidate-ranking.service.js) — see the long note there for why the old
+   * `DATE(requested_date_time) = ? AND time_slot = ?` band equality had to go
+   * (a 3-to-5-hour bucket, compared across ~12 incompatible slot vocabularies)
+   * and how the 00:00 midnight sentinel is kept from manufacturing conflicts.
+   *
+   * This also retires a second bug in the old two lines: reqDate came from
+   * `new Date(ts).toISOString()`, which shifts the calendar DAY on any non-UTC
+   * host. Bounds are computed on the IST wall clock now, host-independently.
+   *
+   * `jobTimeSlot` is no longer read — the slot STRING plays no part in
+   * conflict detection anywhere. Kept in the signature because callers pass it
+   * positionally and it still travels into the response payload.
+   */
+  /*
+   * SAME 1-HOUR FRAME = conflict — byte-identical to the rule in
+   * candidate-ranking.service.js. This is the SECOND ranker (it backs
+   * GET /admin/auto-assign/:jobId/candidates), and the two must never disagree
+   * about who is available, so both derive the frame from the one shared
+   * slotModel.conflictFrame(). Consecutive hours (09:00 vs 10:00) do NOT
+   * conflict; 10:00 and 10:30 share the 10:00 frame and DO.
+   * The midnight-sentinel guard is required on both sides for the same reason
+   * as there: a date-only row is not a booking at midnight.
+   */
   const conflictMap = new Map();
-  if (reqDate && jobTimeSlot) {
+  const conflictAt = slotModel.conflictFrame(jobRequestedTs);
+  if (conflictAt) {
     const [conflicts] = await pool.query(
       `SELECT DISTINCT fk_easyfixter_id AS efr_id
          FROM tbl_job
         WHERE fk_easyfixter_id IN (${placeholders})
+          AND job_status IN (0, 1, 2)
+          AND requested_date_time IS NOT NULL
+          AND TIME(requested_date_time) <> '00:00:00'
           AND DATE(requested_date_time) = ?
-          AND time_slot = ?
-          AND job_status IN (0, 1, 2)`,
-      [...efrIds, reqDate, jobTimeSlot]
+          AND HOUR(requested_date_time) = ?`,
+      [...efrIds, conflictAt.date, conflictAt.hour]
     );
     for (const r of conflicts) conflictMap.set(r.efr_id, true);
   }
@@ -382,7 +412,7 @@ async function getCandidates(jobId, { limit = 10, ignoreDistance = false } = {})
       rejected.push({ efr_id: e.efr_id, reason: `saturated (${s.active_jobs} active jobs)` }); continue;
     }
     if (s.has_conflict) {
-      rejected.push({ efr_id: e.efr_id, reason: 'time-slot conflict on requested date' }); continue;
+      rejected.push({ efr_id: e.efr_id, reason: 'already booked in an overlapping 1-hour window' }); continue;
     }
 
     // L3 scoring (normalised weights → final score in [0, 1])
@@ -452,6 +482,27 @@ async function getCandidates(jobId, { limit = 10, ignoreDistance = false } = {})
  */
 const candidateRanking = require('./candidate-ranking.service');
 
+/*
+ * Aggregate the ranker's per-tech rejection reasons into a compact
+ * "reason ×count" summary for logs + API details, so an empty auto-assign
+ * explains WHY (mirrors the Schedule & Assign modal's per-tech reasons).
+ * Variable parenthetical detail (active-job counts, balances) is normalised so
+ * like reasons group together. Empty string when there's nothing to summarise.
+ */
+function summariseRejections(rejected) {
+  const counts = new Map();
+  for (const r of rejected || []) {
+    const raw = String(r.reason || 'unknown');
+    let key = raw;
+    if (raw.includes('attendance')) key = 'attendance not marked for job date';
+    else if (raw.includes('same slot')) key = 'same-day + same-slot conflict';
+    else if (raw.startsWith('saturated')) key = 'max concurrent jobs reached';
+    else if (raw.startsWith('COD')) key = 'COD balance below floor';
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  return [...counts.entries()].map(([k, n]) => `${k} ×${n}`).join('; ');
+}
+
 async function assignTopCandidate(jobId, actor) {
   logger.info('Auto-assign top candidate · jobId=' + jobId);
   // Attendance is hard-filtered only for jobs scheduled TODAY/TOMORROW (the
@@ -466,13 +517,28 @@ async function assignTopCandidate(jobId, actor) {
     throw err;
   }
   if (!result.candidates.length) {
+    // Surface WHY nothing was assignable (mirrors the Schedule & Assign modal):
+    // l1Count>0 with reasons ⇒ techs matched but every one failed a hard gate
+    // (attendance / same-slot / balance); l1Count 0 ⇒ genuine supply gap.
+    const reasonSummary = summariseRejections(result.rejected);
+    logger.warn(
+      'Auto-assign found no assignable candidate · jobId=' + jobId
+      + ' · l1Eligible=' + result.l1Count + ' · rejected=' + result.rejected.length
+      + (result.note ? ' · note=' + result.note : '')
+      + (reasonSummary ? ' · reasons: ' + reasonSummary : '')
+    );
     const err = new Error(
       result.note === 'no_deep_skill_match'
         ? 'no candidate matched the deep-skill required for this job'
         : 'no eligible candidate found'
     );
     err.status = 422;
-    err.details = { l1Count: result.l1Count, rejectedCount: result.rejected.length, note: result.note };
+    err.details = {
+      l1Count: result.l1Count,
+      rejectedCount: result.rejected.length,
+      note: result.note,
+      rejectedReasons: reasonSummary,
+    };
     throw err;
   }
 
@@ -515,10 +581,15 @@ async function bulkAssignUnassigned({ limit = 50, dryRun = false } = {}, actor) 
       // service, so far-future on-create jobs are unaffected. Keep the default.
       const ranked = await candidateRanking.rankCandidatesForJob(job_id, { limit: 50 });
       if (!ranked.candidates.length) {
+        const reasonSummary = summariseRejections(ranked.rejected);
+        logger.warn('Bulk auto-assign · no candidate · jobId=' + job_id
+          + ' · l1Eligible=' + ranked.l1Count + ' · rejected=' + ranked.rejected.length
+          + (ranked.note ? ' · note=' + ranked.note : '')
+          + (reasonSummary ? ' · reasons: ' + reasonSummary : ''));
         results.push({
           jobId: job_id, status: 'no_candidate',
           l1Count: ranked.l1Count, rejectedCount: ranked.rejected.length,
-          note: ranked.note,
+          note: ranked.note, rejectedReasons: reasonSummary,
         });
         continue;
       }

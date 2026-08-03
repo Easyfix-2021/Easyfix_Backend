@@ -1,0 +1,48 @@
+-- Login OTP channel — admin-switchable primary channel — 2026-07-23.
+--
+-- `login.otp.channel` decides which channel is tried FIRST when a user signs in
+-- with a MOBILE NUMBER: 'whatsapp' (Gallabox template) or 'sms' (SMSCountry,
+-- DLT template). The OTHER channel always remains the fallback — this setting
+-- reorders the two, it never disables one. That is deliberate: OTP is the only
+-- way into the product, so no config flip may be able to lock everyone out.
+-- Email-identifier logins are unaffected (that path is Email -> WhatsApp).
+--
+-- Seeded 'whatsapp' = today's behaviour, so running this migration changes
+-- nothing until an admin switches it. Read by services/otp-delivery.service.js;
+-- absent/unrecognised also resolves to 'whatsapp', so a pre-migration host is
+-- identical too.
+--
+-- NOTE: dual-channel sending (`login.otp.dual.channel`) fires BOTH channels in
+-- parallel and outranks this entirely — there is no "first" when both go at once.
+INSERT INTO easyfix_properties (property_key, property_value) VALUES ('login.otp.channel', 'whatsapp') ON DUPLICATE KEY UPDATE property_value = property_value;
+
+-- `login.otp.dual.channel` is INTENTIONALLY NOT SEEDED HERE.
+--
+-- It is the property form of the legacy OTP_DUAL_CHANNEL_MOBILE env var, and
+-- services/otp-delivery.service.js falls back to that env var whenever the
+-- property is absent. Seeding a value would therefore SILENTLY FLIP any host
+-- currently running OTP_DUAL_CHANNEL_MOBILE=true back to single-channel — a
+-- real regression on exactly the hosts that turned it on for a reason.
+--
+-- Leaving it unset means every host keeps its current behaviour, and the
+-- property only starts winning once an admin toggles it from Admin Actions.
+-- Once every host has been toggled at least once, delete the env fallback in
+-- dualChannelEnabled() and drop OTP_DUAL_CHANNEL_MOBILE from .env / .env.example.
+
+-- Who may switch it. Same email-allowlist model as Switch Call Mode / Build
+-- Skill Matrix (services/feature-access.service.js -> canSwitchOtpChannel): the
+-- property both hides the Admin Actions card AND enforces the endpoints, and it
+-- carries NO menu_action row, so it can never be granted from Manage Role.
+--
+-- Fail-closed: an ABSENT key means nobody can switch the channel. We therefore
+-- copy the existing call-mode allowlist so the same admins who already flip
+-- global call settings get this immediately.
+-- If `access.callmode.emails` does not exist on this host, the SELECT matches no
+-- rows and NOTHING is inserted — the card stays hidden for everyone. In that
+-- case seed it by hand, e.g.:
+--   INSERT INTO easyfix_properties (property_key, property_value) VALUES ('access.otpchannel.emails', 'someone@channelplay.in');
+-- The SELECT is wrapped in a derived table on purpose: reading the SAME table
+-- an INSERT ... ON DUPLICATE KEY UPDATE writes to can raise MySQL error 1093
+-- ("can't specify target table ... in FROM clause"). The subquery materialises
+-- first, which sidesteps it. Plain standard SQL — no MariaDB-only syntax.
+INSERT INTO easyfix_properties (property_key, property_value) SELECT 'access.otpchannel.emails', src.v FROM (SELECT property_value AS v FROM easyfix_properties WHERE property_key = 'access.callmode.emails') AS src ON DUPLICATE KEY UPDATE property_value = property_value;

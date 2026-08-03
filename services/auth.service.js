@@ -1,6 +1,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
-const { resolveLoginOtp, otpExpiryDate } = require('../utils/otp');
+const { resolveLoginOtp, staticLoginOtpFor, otpExpiryDate } = require('../utils/otp');
 const { signUserToken } = require('../utils/jwt');
 
 /*
@@ -28,19 +28,29 @@ const { signUserToken } = require('../utils/jwt');
  */
 
 async function findActiveUserByIdentifier(identifier) {
-  const isEmail = /@/.test(identifier);
-  const column = isEmail ? 'official_email' : 'mobile_no';
+  const raw = String(identifier || '').trim();
+  const isEmail = /@/.test(raw);
+  // Email login is case-insensitive: users may type "Pranav@easyfix.in" but the
+  // row is stored lowercase (see user.service.js create/dup-check). Match on
+  // LOWER(official_email) with a lowercased param — the same house pattern the
+  // duplicate-email check uses. Mobile identifiers are digits (no case), so they
+  // are compared as-is: this keeps the mobile_no index usable and never mangles
+  // the value with toLowerCase(). Both createLoginOtp and verifyLoginOtp route
+  // through here and then key otp_details by the RETURNED row's canonical
+  // official_email/mobile_no, so OTP correlation stays intact regardless of casing.
+  const whereCol = isEmail ? 'LOWER(official_email)' : 'mobile_no';
+  const value = isEmail ? raw.toLowerCase() : raw;
   const [[user]] = await pool.query(
     `SELECT user_id, user_code, user_name, official_email, user_role, user_type_id,
             city_id, mobile_no, alternate_no,
             manage_clients, manage_cities, manage_states, manage_verticals,
             user_status
        FROM tbl_user
-      WHERE ${column} = ?
+      WHERE ${whereCol} = ?
         AND user_status = 1
         AND user_type_id = 5
       LIMIT 1`,
-    [identifier]
+    [value]
   );
   return user || null;
 }
@@ -130,13 +140,30 @@ async function createLoginOtp(identifier) {
       `OTP for ${user.official_email || user.mobile_no}: ${otp}  (staff user_id=${user.user_id}, valid 5 min) — dev only`);
   }
 
+  // Fixed-OTP test accounts (utils/otp.js::STATIC_LOGIN_OTP_ACCOUNTS): the code
+  // is a published constant, so there is nothing to deliver — skip the real
+  // email/WhatsApp send entirely (no message ever reaches the mailbox) while
+  // still reporting success so the client advances to the OTP-entry screen. The
+  // OTP row was already written above, so verifyLoginOtp() finds it normally.
+  if (staticLoginOtpFor(identifier) != null) {
+    logger.info('Login OTP is a STATIC test-account code — delivery suppressed · user_id=' + user.user_id);
+    return {
+      found: true,
+      userId: user.user_id,
+      email: user.official_email,
+      expiresAt: expires,
+      delivered: true,
+      channelsTried: 'static-test-otp',
+    };
+  }
+
   // Channel-preference delivery:
   //   email identifier → Email first, WhatsApp fallback
   //   mobile identifier → WhatsApp first, SMS fallback
   // TEST_EMAILS / TEST_MOBILE redirections inside each provider service keep
   // dev traffic from reaching real users.
   const { deliverOtp } = require('./otp-delivery.service');
-  await deliverOtp({
+  const delivery = await deliverOtp({
     identifier,
     email: user.official_email,
     mobile: user.mobile_no,
@@ -145,8 +172,39 @@ async function createLoginOtp(identifier) {
     contextLabel: 'staff',
   });
 
-  logger.info('Login OTP issued and dispatched · user_id=' + user.user_id);
-  return { found: true, userId: user.user_id, email: user.official_email, expiresAt: expires };
+  /*
+   * DO NOT DISCARD THE DELIVERY OUTCOME.
+   *
+   * Dropping it is how "OTP sent" got shown for an OTP that no channel ever
+   * carried — the email suppressed because the mailbox does not exist AND the
+   * WhatsApp fallback unavailable (no mobile on file / Gallabox down / template
+   * unapproved). That is verbatim the "no screen could say why" symptom this
+   * whole change exists to kill, so the truth has to reach the route.
+   *
+   * `disabled` is NOT a failure: it means NOTIFICATIONS_DISABLE suppressed every
+   * provider on this host (QA/dev), where the OTP is read from the logs.
+   */
+  const dispatched = !!(delivery && (delivery.finalDelivered || delivery.disabled));
+  const channelsTried = (delivery && Array.isArray(delivery.attempts) ? delivery.attempts : [])
+    .map((a) => a.channel + '=' + (a.delivered ? 'ok' : (a.skipped || a.error || 'failed')))
+    .join(', ');
+
+  if (dispatched) {
+    logger.info('Login OTP issued and dispatched · user_id=' + user.user_id
+      + ' · channels=[' + channelsTried + ']');
+  } else {
+    logger.error('Login OTP issued but NOT DELIVERED on any channel · user_id=' + user.user_id
+      + ' · channels=[' + channelsTried + ']');
+  }
+
+  return {
+    found: true,
+    userId: user.user_id,
+    email: user.official_email,
+    expiresAt: expires,
+    delivered: dispatched,
+    channelsTried,
+  };
 }
 
 async function verifyLoginOtp(identifier, otp) {

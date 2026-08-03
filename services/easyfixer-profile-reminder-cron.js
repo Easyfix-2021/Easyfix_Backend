@@ -9,7 +9,7 @@ const profileUpdateLink = require('./easyfixer-profile-update-link.service');
  * Runs once per day at 10:00 IST (see server/scheduler.js). For every
  * ACTIVE easyfixer whose profile is incomplete, sends a Gallabox
  * WhatsApp message using the pre-approved template
- * `tx_complete_profile`. The template is a generic nudge — no
+ * `skill_otp_tx1`. The template is a generic nudge — no
  * dynamic body values required from our side.
  *
  * "Incomplete profile" definition (verified against tbl_easyfixer
@@ -33,7 +33,9 @@ const profileUpdateLink = require('./easyfixer-profile-update-link.service');
  * still get their nudge.
  */
 
-const TEMPLATE_NAME = 'tx_complete_profile';
+// Re-exported from the link service — ONE owner for the template name so a
+// rename can't leave this cron pointing at a retired template.
+const { PROFILE_TEMPLATE_NAME: TEMPLATE_NAME } = require('./easyfixer-profile-update-link.service');
 
 async function runDailyReminder() {
   logger.info('Run daily profile-completion reminder · template=' + TEMPLATE_NAME);

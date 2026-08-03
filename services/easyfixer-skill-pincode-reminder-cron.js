@@ -5,7 +5,8 @@ const { signEasyfixerProfileToken } = require('../utils/jwt');
 const whatsappService = require('./gallabox.whatsapp.service');
 const urlShortener = require('./url-shortener.service');
 
-const TEMPLATE_NAME = 'tx_complete_profile';
+// Re-exported from the link service — ONE owner for the template name.
+const { PROFILE_TEMPLATE_NAME: TEMPLATE_NAME } = require('./easyfixer-profile-update-link.service');
 
 /*
  * Easyfixer Skill+Pincode Reminder cron service (2026-06-11).
@@ -245,7 +246,10 @@ async function runTest({ mobile, sourceId } = {}) {
     // Scheduled Jobs → Test: honour the operator's typed number on every env.
     bypassTestRedirect: true,
     // Named body vars (Name/efr_id/profile_link) — positional 1/2/3 don't bind.
-    bodyValues: { Name: recipientName, efr_id: String(efrId), profile_link: shortUrl },
+    // Keys MUST match skill_otp_tx1's variables exactly ({{name}}, {{id}},
+    // {{profile_link}}). A mismatched key binds to nothing and arrives EMPTY —
+    // the predecessor used {{Name}}/{{efr_id}}, so casing matters here.
+    bodyValues: { name: recipientName, id: String(efrId), profile_link: shortUrl },
   });
 
   logger.info(

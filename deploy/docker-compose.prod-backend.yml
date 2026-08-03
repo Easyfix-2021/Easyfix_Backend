@@ -31,11 +31,36 @@ services:
     image: ${BACKEND_IMAGE}
     container_name: easyfix-backend
     restart: unless-stopped
+    # OOM priority — DEPRIORITIZE the backend under GLOBAL memory pressure so STT
+    # (oom_score_adj 1000) is killed first. We use -500, NOT the -1000 floor: at
+    # -1000 the backend is effectively unkillable, so a backend-originated leak would
+    # force the kernel to kill sshd / ssm-agent first and leave the box unrecoverable.
+    # -500 keeps the backend the last CONTAINER the kernel picks while still allowing
+    # reclaim before a total stall. The airtight guarantee that STT can't touch the
+    # backend is STT's own mem_limit (cgroup-scoped); this is the global backstop only.
+    oom_score_adj: -500
     env_file:
       # Real secrets live HERE on the host filesystem (chmod 600).
       # Managed via deploy/bootstrap-env.sh — never in any image, never
       # in git, never in GitHub Secrets.
       - /opt/easyfix/backend.env
+    environment:
+      # AI Teleprompter STT runs as its OWN container (`stt` service below).
+      # Point the relay at it; keep the in-process autostart OFF (no double spawn).
+      STT_SERVICE_URL: "ws://stt:8300/stt"
+      STT_AUTOSTART: "false"
+      # Shared key for the STT OOM-alert webhook (also given to stt-oom-watch).
+      # MUST be set in /opt/easyfix/.env (NOT backend.env — this environment: block
+      # overrides env_file, so a backend.env value would be clobbered to ''). Unset
+      # ⇒ OOM alerting is off (no-op).
+      STT_OOM_WEBHOOK_KEY: ${STT_OOM_WEBHOOK_KEY:-}
+      # Human label for the alert email (QA vs Production).
+      ENVIRONMENT: "production"
+    # No depends_on: stt — the backend connects to STT lazily per-call and the
+    # mandatory-STT gate returns 409 when it's down, so the backend must NOT be
+    # coupled to the stt service. Coupling here would also hard-fail a first-boot
+    # backend deploy on a box where STT_IMAGE isn't in .env yet (compose would try
+    # to create stt with an empty image and abort the whole `up`).
     ports:
       - "5100:5100"
     networks:
@@ -65,6 +90,80 @@ services:
       - "8888:8080"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - easyfix-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # STT sidecar — self-hosted OSS speech-to-text for the AI Teleprompter.
+  # Own container; the IMAGE is self-contained (deps + model baked at build, see
+  # stt-service/Dockerfile) so no env/volume/healthcheck needed. Deployed by
+  # deploy-stt.yml on stt-service/** pushes. Backend reaches it at ws://stt:8300/stt.
+  # ⚠ Needs ~0.5–1 GB RAM for the 'small' model.
+  #
+  # mem_limit is a SAFETY FENCE so STT can never balloon and OOM-kill the backend
+  # on this prod-BE box. STT_MEM_LIMIT is computed at deploy time as a % of THIS
+  # box's RAM (clamped) by deploy-stt.yml and written to /opt/easyfix/.env, so it
+  # auto-adjusts if the instance is resized. The :-1g fallback covers a first-boot
+  # before deploy-stt has written the value — 1g fits the 'small' model.
+  stt:
+    image: ${STT_IMAGE}
+    container_name: easyfix-stt
+    restart: unless-stopped
+    mem_limit: ${STT_MEM_LIMIT:-1g}
+    # First victim under GLOBAL memory pressure (mirror of the backend's -1000).
+    # Combined with mem_limit above: STT can OOM (its own cgroup) but the backend
+    # never does.
+    oom_score_adj: 1000
+    networks:
+      - easyfix-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # stt-oom-watch — emails ops when the STT container is OOM-killed. Docker socket
+  # mounted READ-ONLY (Dozzle trust model). Watches `easyfix-stt` for `oom`/`die`
+  # and POSTs the backend's internal webhook, which mails the recipients in
+  # easyfix_properties('teleprompter.stt.alert.emails'). Inert unless
+  # STT_OOM_WEBHOOK_KEY (+ recipients) are set. Image ships the docker client +
+  # BusyBox wget; nothing installed at runtime.
+  stt-oom-watch:
+    image: docker:27-cli
+    container_name: easyfix-stt-oom-watch
+    restart: unless-stopped
+    depends_on:
+      stt:
+        condition: service_started
+    environment:
+      WATCH_CONTAINER: "easyfix-stt"
+      OOM_WEBHOOK_URL: "http://backend:5100/api/webhook/stt-oom"
+      OOM_WEBHOOK_KEY: ${STT_OOM_WEBHOOK_KEY:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    entrypoint: ["/bin/sh", "-c"]
+    # $$ escapes compose interpolation → the shell sees a single $ at runtime.
+    command:
+      - |
+        echo "stt-oom-watch: watching $$WATCH_CONTAINER for OOM-kills"
+        docker events --filter "container=$$WATCH_CONTAINER" --filter "event=oom" --filter "event=die" --format '{{.Action}} {{.Actor.Attributes.exitCode}}' \
+        | while read ACTION EXITCODE; do
+            if [ "$$ACTION" = "oom" ]; then OOM=true; else OOM=$$(docker inspect -f '{{.State.OOMKilled}}' "$$WATCH_CONTAINER" 2>/dev/null || echo false); fi
+            echo "stt-oom-watch: event=$$ACTION exit=$$EXITCODE oomKilled=$$OOM"
+            [ "$$OOM" = "true" ] || continue
+            [ -n "$$OOM_WEBHOOK_KEY" ] || { echo "stt-oom-watch: OOM_WEBHOOK_KEY unset — skipping alert"; continue; }
+            wget -q -O - \
+              --header "content-type: application/json" \
+              --header "x-webhook-key: $$OOM_WEBHOOK_KEY" \
+              --post-data "{\"container\":\"$$WATCH_CONTAINER\",\"exitCode\":\"$$EXITCODE\",\"oomKilled\":true}" \
+              "$$OOM_WEBHOOK_URL" >/dev/null 2>&1 \
+              && echo "stt-oom-watch: OOM alert POSTed" \
+              || echo "stt-oom-watch: OOM alert POST failed"
+          done
     networks:
       - easyfix-net
     logging:

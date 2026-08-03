@@ -38,6 +38,14 @@ app.use(cookieParser());
 // directly.) Verified: context survives the parser + awaited DB calls.
 app.use((req, res, next) => requestContext.run(req, next));
 
+// Maintenance gate — 503s API traffic while an in-process destructive operation
+// runs (today: the QA database refresh, which drops the schema this process is
+// connected to). Mounted AFTER request-context so the refusals still log with
+// their request identity, and BEFORE the routes so no handler can reach a
+// half-restored database. Inert unless a job raises it; /api/health stays exempt
+// so Docker's HEALTHCHECK can't restart the container mid-restore.
+app.use(require('./middleware/maintenance').maintenance);
+
 // Phase 14 — per-tier rate limits. Integration + mobile + client get their own
 // bucket; admin is uncapped to avoid self-DoSing a data-entry spree.
 app.use('/api/integration', rateLimit({ windowMs: 60_000, max: 1200, key: (req) =>
@@ -72,6 +80,12 @@ app.get('/api/openapi.json', swaggerDocs.jsonSpecHandler);
 // prefixes first, so /api/public/* lands here and never reaches the
 // authed routes aggregator.
 app.use('/api/public', require('./routes/public'));
+
+// Internal router — machine-to-machine only (currently the legacy Java CRM's
+// /resolveJobImage action). Auth is a shared secret header per-endpoint, NOT a
+// JWT. Mounted here — a sibling of /api/public, ahead of the /api aggregator —
+// so no requireAuth / maskMobile middleware wraps it.
+app.use('/api/internal', require('./routes/internal'));
 
 app.use('/api', routes);
 
@@ -139,11 +153,40 @@ async function start() {
   const server = app.listen(PORT, () => {
     const env = process.env.NODE_ENV || 'development';
     logger.ready(`Server is ready — listening on http://localhost:${PORT} (${env} mode)`);
+    /*
+     * ENVIRONMENT is not a label — it GATES destructive, environment-specific
+     * behaviour. The QA database refresh registers its cron and runs only when
+     * this is exactly 'qa' (server/scheduler.js + qa-db-refresh.service.js), and
+     * it names the environment in ops alert emails.
+     *
+     * A wrong or missing value is otherwise SILENT: the job simply never
+     * registers, no error is raised, and the first symptom is someone noticing
+     * weeks later that QA data is stale. So state the resolved value plainly at
+     * boot, and warn when it's absent. Distinct from NODE_ENV above, which is
+     * about build/runtime mode, not about which deployment this process IS.
+     */
+    const deployEnv = String(process.env.ENVIRONMENT || '').trim();
+    if (!deployEnv) {
+      logger.warn(
+        'ENVIRONMENT is NOT set — environment-gated jobs (e.g. the QA database refresh) will '
+        + 'refuse to run and ops alerts will be labelled "unknown". Set it in the compose '
+        + 'environment: block ("qa" / "production"), or in .env for local dev.',
+      );
+    } else if (deployEnv.toLowerCase() === 'qa') {
+      logger.info(`ENVIRONMENT = "${deployEnv}" — QA-only jobs are ARMED on this host (incl. the database refresh, which drops and reloads ${process.env.DB_NAME || 'the DB'}).`);
+    } else {
+      logger.info(`ENVIRONMENT = "${deployEnv}" — QA-only jobs are disabled on this host.`);
+    }
     if (process.env.TEST_EMAILS || process.env.TEST_MOBILE) {
       logger.test(`TEST MODE active — outgoing emails redirect to "${process.env.TEST_EMAILS || '—'}", SMS/WhatsApp to "${process.env.TEST_MOBILE || '—'}".`);
     }
     if (String(process.env.NOTIFICATIONS_DISABLE).toLowerCase() === 'true') {
       logger.test(`Notifications DISABLED — no real SMS / email / WhatsApp / push will be sent.`);
+    }
+    // Fail loud if the FCM v1 service account is missing — otherwise every push
+    // silently returns not-delivered (the prod incident on 2026-07-02).
+    if (!require('./services/fcm.service').isConfigured()) {
+      logger.warn('FCM v1 NOT configured — push notifications will NOT be sent. Set FCM_PROJECT_ID, FCM_CLIENT_EMAIL, FCM_PRIVATE_KEY.');
     }
     // Register cron jobs only AFTER the HTTP listener is up — guarantees
     // a job can't fire before the app is healthy enough to serve dependent
@@ -151,8 +194,32 @@ async function start() {
     scheduler.init();
   });
 
+  // AI-calling media websocket (Plivo <Stream> ⇄ OpenAI Realtime). Attached to
+  // the SAME HTTP server's `upgrade` event (no extra port). Wrapped so a missing
+  // `ws` dependency or any attach error degrades the AI-calling flow to OFF
+  // WITHOUT crashing the shared backend. Gated per-connection by ai.calling.enabled.
+  try {
+    require('./services/ai-voice-server.service').attach(server);
+  } catch (err) {
+    logger.warn(`AI voice ws server not attached — ${err.message}. AI-calling flow disabled (shared backend unaffected).`);
+  }
+  // AI Teleprompter STT sidecar (self-hosted OSS speech-to-text). Auto-started as a
+  // managed child process ONLY when STT_AUTOSTART=true (model loads once, not
+  // per-call); otherwise a no-op (run the sidecar separately + set STT_SERVICE_URL).
+  // Guarded so a missing Python / spawn failure can't disrupt the shared backend.
+  try { require('./services/stt-sidecar.service').maybeStart(); } catch (err) { logger.warn('STT sidecar autostart skipped — ' + err.message); }
+  // Re-drain any post-call mappings left at 'mapping' by a restart mid-queue
+  // (the post-call queue is in-memory + bounded). Best-effort, non-blocking.
+  try { require('./services/ai-post-call-queue').recoverPending(); } catch { /* noop */ }
+
   const shutdown = async (signal) => {
     logger.shutdown(`Shutdown requested (${signal}) — closing connections gracefully…`);
+    // Close any live AI-call media sockets FIRST (while the DB pool is still
+    // open) so each call's teardown can persist its transcript/result. Guarded
+    // so a missing/never-attached ws server can't disrupt shutdown.
+    try { require('./services/ai-voice-server.service').shutdown(); } catch { /* noop */ }
+    try { require('./services/stt-sidecar.service').shutdown(); } catch { /* noop */ }
+    try { require('./services/audio-transcode-pool').shutdown(); } catch { /* noop */ }
     // Stop cron BEFORE closing the HTTP server so an in-flight cron task
     // doesn't keep the pool alive past closePool().
     scheduler.stop();

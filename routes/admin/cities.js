@@ -12,6 +12,8 @@ const idParam = Joi.object({ cityId: Joi.number().integer().positive().required(
 const listQuery = Joi.object({
   q:               Joi.string().allow('', null).optional(),
   stateId:         Joi.number().integer().positive().optional(),
+  // Show only cities a technician created on the fly (created_by_type=technician).
+  createdByTech:   Joi.boolean().default(false),
   includeInactive: Joi.boolean().default(false),
   limit:           Joi.number().integer().min(1).max(1000).default(200),
   offset:          Joi.number().integer().min(0).default(0),

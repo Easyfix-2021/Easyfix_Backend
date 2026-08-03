@@ -2,6 +2,7 @@ const router = require('express').Router();
 const { pool } = require('../../db');
 const logger = require('../../logger');
 const { modernOk, modernError } = require('../../utils/response');
+const { jobStatusLabel } = require('../../utils/job-status-label');
 
 /*
  * Call Info — date-ranged easyfixer-call-record feed for the
@@ -60,6 +61,7 @@ router.get('/', async (req, res, next) => {
       `SELECT cr.*,
               e.efr_name, e.efr_no,
               j.job_status, j.job_type, j.job_customer_name,
+              j.fk_easyfixter_id AS job_efr_id,
               cu.customer_name, cu.customer_mob_no
          FROM tbl_easyfixer_call_record cr
          LEFT JOIN tbl_easyfixer e  ON e.efr_id     = cr.efr_id
@@ -94,15 +96,11 @@ router.get('/', async (req, res, next) => {
  */
 const { streamStyledXlsx } = require('../../utils/xlsx-styled-export');
 
-// Job-status integer → human label. Lifted from the legacy CRM job-
-// status enum so the exported file is readable without the consumer
-// needing to memorise numeric codes.
-const STATUS_LABEL = {
-  0: 'Booked', 1: 'Scheduled', 2: 'In Progress',
-  3: 'Completed', 5: 'Completed', 6: 'Cancelled',
-  7: 'Enquiry', 9: 'Unconfirmed', 10: 'Revisit',
-  15: 'Estimate Pending', 20: 'Pending to Close', 21: 'Followup',
-};
+// Job-status → label uses the shared CRM helper (utils/job-status-label.js,
+// imported at the top). It mirrors the on-screen statusLabel exactly — which
+// also corrected this export's old local map, where 10/20/21 read
+// Revisit/Pending to Close/Followup instead of Closed from App/In Progress/On
+// Hold — and does the BOOKED sub-split from `assigned` (j.fk_easyfixter_id).
 
 router.get('/export.xlsx', async (req, res, next) => {
   try {
@@ -133,6 +131,7 @@ router.get('/export.xlsx', async (req, res, next) => {
                 e.efr_name, e.efr_no,
                 cr.job_id,
                 j.job_status, j.job_type, j.job_customer_name,
+                j.fk_easyfixter_id AS job_efr_id,
                 cu.customer_name, cu.customer_mob_no
            FROM tbl_easyfixer_call_record cr
            LEFT JOIN tbl_easyfixer e  ON e.efr_id     = cr.efr_id
@@ -168,9 +167,8 @@ router.get('/export.xlsx', async (req, res, next) => {
       customer:     r.customer_name || r.job_customer_name || '',
       customer_mob: r.customer_mob_no || '',
       job_type:     r.job_type || '',
-      job_status:   r.job_status != null
-        ? (STATUS_LABEL[r.job_status] || `Status ${r.job_status}`)
-        : '',
+      // Split BOOKED by tech presence so the export matches the on-screen chip.
+      job_status:   jobStatusLabel(r.job_status, r.job_efr_id != null),
     }));
 
     const meta = [

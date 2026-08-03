@@ -22,6 +22,13 @@
 const router = require('express').Router();
 
 router.use('/job-completion', require('./job-completion'));
+/*
+ * Technician "share job" surface. UNAUTHENTICATED — a public link a technician
+ * shares; whoever opens it sees NON-CONFIDENTIAL job details and can navigate /
+ * place a masked call to the customer. Self-verifies its own `job_share` token
+ * (separate type from job-completion). See routes/public/shared-job.js.
+ */
+router.use('/shared-job', require('./shared-job'));
 // Easyfixer-facing profile-update magic-link surface. Token lives in the
 // query string (?token=…) rather than the URL path because the FE keeps the
 // path stable (/profile-update/<jwt>) and proxies the JWT through to the BE
@@ -66,5 +73,13 @@ router.use('/email-verify', require('./email-verify'));
  * /api/public/plivo/answer. See routes/public/plivo-answer.js.
  */
 router.use('/plivo', require('./plivo-answer'));
+/*
+ * Technician-app force-update policy (2026-07-15). The ONLY sub-router here that
+ * verifies no token — by necessity: it gates the app's LOGIN screen, so an
+ * outdated client has no session to present. Safe because it returns version
+ * policy only (no user data / PII / job scope). Fails OPEN — see the route.
+ * Full path: /api/public/app-version?platform=android
+ */
+router.use('/app-version', require('./app-version'));
 
 module.exports = router;

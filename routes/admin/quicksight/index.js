@@ -38,8 +38,21 @@ router.use('/priority-jobs',          require('./priority-jobs'));
 router.use('/material-report',        require('./material-report'));
 router.use('/city-performance',       require('./city-performance'));
 router.use('/technician-performance', require('./technician-performance'));
+// STATE + USER Performance — the City scorecard over two new dimensions, built
+// for the Performance Report page's tabs. ONE sub-router mounted twice; it reads
+// req.baseUrl to pick the dimension + the matching action key.
+router.use('/state-performance',      require('./region-performance'));
+router.use('/user-performance',       require('./region-performance'));
 router.use('/supply-gap',             require('./supply-gap'));
 router.use('/employee-productivity',  require('./employee-productivity'));
 router.use('/admin-dashboard',        require('./admin-dashboard'));
+router.use('/offer-acceptance',       require('./offer-acceptance'));
+router.use('/profile-update-requests', require('./profile-update-requests'));
+// Call effort audit: per-job and per-(day, user) call volume off the legacy
+// tbl_job_caller_info log — who called, whom, and at which job step.
+router.use('/call-tracking',          require('./call-tracking'));
+// Confirmation-quality audit: jobs pushed to Pending for Scheduling without the
+// customer ever confirming (no form submission / Unreachable, and no real call).
+router.use('/premature-confirmations', require('./premature-confirmations'));
 
 module.exports = router;

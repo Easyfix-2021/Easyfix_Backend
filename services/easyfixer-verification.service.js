@@ -38,6 +38,22 @@ function pct(v) {
   return Math.max(0, Math.min(100, Math.round(n)));
 }
 
+/*
+ * Per-process guard for the read-time location backfill (see getVerificationPage).
+ * The backfill may hit a live Google geocode; a lead whose pincode is
+ * un-geocodable would otherwise re-fire that geocode on EVERY page load / every
+ * section save, because a failed enrichment leaves efr_cityId blank and the
+ * guard condition true. This Set caps the attempt to ONCE per lead per process
+ * regardless of outcome. Successful backfills set efr_cityId (which clears the
+ * outer condition anyway) — this only bounds the un-resolvable tail. Bounded so
+ * it can never grow without limit.
+ */
+const _locBackfillAttempted = new Set();
+function _markLocBackfillAttempted(efrId) {
+  if (_locBackfillAttempted.size > 5000) _locBackfillAttempted.clear();
+  _locBackfillAttempted.add(efrId);
+}
+
 function bool(v) {
   if (v === null || v === undefined) return false;
   if (typeof v === 'boolean') return v;
@@ -141,10 +157,45 @@ async function listCitiesForLookup() {
 // ─── Public: full page payload ──────────────────────────────────────
 async function getVerificationPage(efrId) {
   logger.info('Load easyfixer verification page · efrId=' + efrId);
-  const e = await getEasyfixerForVerification(efrId);
+  let e = await getEasyfixerForVerification(efrId);
   if (!e) {
     logger.warn('Verification page not found · efrId=' + efrId);
     return null;
+  }
+
+  // Lazy geocode backfill (2026-07-09) — self-registered leads submit only a
+  // raw pincode from the app. If the city FK was never resolved (older leads
+  // predating the registration-time enrichment), fill it now, ONCE, so City /
+  // State / State-User / GPS render on this page and the list. Fail-soft; on
+  // success we re-read the joined row so THIS response reflects the backfill
+  // without requiring a second page load.
+  //
+  // Gated to SELF-REGISTERED leads (new_easy_fixer = 1) so opening the
+  // verification page for an operator-curated easyfixer never auto-geocodes /
+  // creates master data as a side-effect of a read. Guarded to at most ONE
+  // attempt per lead per process (_locBackfillAttempted) so an un-geocodable
+  // pincode can't re-hit Google on every load / every section-save.
+  if (
+    Number(e.new_easy_fixer) === 1 &&
+    (e.efr_cityId == null || Number(e.efr_cityId) === 0) &&
+    e.efr_pin_no && !e.city_name &&
+    !_locBackfillAttempted.has(efrId)
+  ) {
+    _markLocBackfillAttempted(efrId);
+    try {
+      const { enrichEasyfixerLocationFromPincode } = require('./easyfixer-location.service');
+      const res = await enrichEasyfixerLocationFromPincode({
+        efrId,
+        pincode: e.efr_pin_no,
+        userId: e.user_id || null,
+      });
+      if (res && res.enriched) {
+        const fresh = await getEasyfixerForVerification(efrId);
+        if (fresh) e = fresh;
+      }
+    } catch (err) {
+      logger.warn('Verification lazy location backfill failed (non-fatal) · efrId=' + efrId + ' · ' + (err && err.message ? err.message : err));
+    }
   }
 
   /*
@@ -796,6 +847,35 @@ async function unmapDeepSkill(efrId, rowId) {
   return { unmapped: true };
 }
 
+// Legacy audit-column discovery for tbl_efr_deepskill_mapping. The table
+// predates the Node migrations and isn't created here, so its audit-column
+// NAMES aren't known statically — and the live DB can be unreachable at probe
+// time. We SHOW COLUMNS once (cached) and pick the first matching candidate for
+// the "inserted date" + "inserted by" columns across the conventions this
+// codebase uses elsewhere (insert_date / inserted_by on tbl_easyfixer,
+// tbl_client, tbl_customer …). A missing probe / absent column → null → that
+// column is simply omitted from the write (graceful degrade, never a crash).
+let _deepskillMappingAudit = null;
+async function deepskillMappingAuditCols() {
+  if (_deepskillMappingAudit !== null) return _deepskillMappingAudit;
+  let names = new Set();
+  try {
+    const [cols] = await pool.query('SHOW COLUMNS FROM tbl_efr_deepskill_mapping');
+    names = new Set(cols.map((c) => c.Field));
+  } catch (_e) { /* DB unreachable / table absent → no audit stamping */ }
+  const pick = (cands) => cands.find((c) => names.has(c)) || null;
+  _deepskillMappingAudit = {
+    dateCol: pick(['insert_date', 'inserted_on', 'created_date', 'created_on', 'created_at']),
+    byCol:   pick(['inserted_by', 'insert_by', 'created_by']),
+  };
+  logger.info('tbl_efr_deepskill_mapping audit cols · date=' + (_deepskillMappingAudit.dateCol || '-') + ' · by=' + (_deepskillMappingAudit.byCol || '-'));
+  return _deepskillMappingAudit;
+}
+
+// Chunk size for the bulk reactivate (PK IN) + bulk INSERT statements. Keeps
+// placeholder counts well under MySQL limits even at the Joi cap of 500 items.
+const MAPPING_WRITE_CHUNK = 200;
+
 async function replaceOptionMappings(efrId, items, actor, externalConn = null) {
   const list = Array.isArray(items) ? items : [];
   logger.info('Replace deep-skill option mappings · efrId=' + efrId + ' · items=' + list.length);
@@ -803,10 +883,34 @@ async function replaceOptionMappings(efrId, items, actor, externalConn = null) {
   // enroll in the caller's transaction and leave begin/commit/release to them.
   const conn = externalConn || await pool.getConnection();
   const ownTxn = !externalConn;
+  // Audit stamping: WHO + WHEN. CRM passes a staff `actor` (its user_id); the
+  // PUBLIC profile-update form has no logged-in user (actor=null), so the
+  // easyfixer self-acts → stamp their efr_id. Columns discovered defensively.
+  const byId = actor?.user_id || efrId;
+  const audit = await deepskillMappingAuditCols();
+
+  // Normalise + dedupe the desired set into PHYSICAL-column tuples. INVERSION
+  // (preserved verbatim): semantic deep_skill_id → physical parent_skill_id;
+  // semantic option_id → physical deep_skill_id. Getting this backwards corrupts
+  // candidate-ranking, which filters is_repairing=1 on these columns.
+  const seen = new Set();
+  const desired = []; // { categoryId, serviceTypeId, parentSkillId, deepSkillId }
+  for (const it of list) {
+    const categoryId    = Number(it.category_id);
+    const serviceTypeId = Number(it.service_type_id);
+    const parentSkillId = Number(it.deep_skill_id); // → physical parent_skill_id
+    const deepSkillId   = Number(it.option_id);     // → physical deep_skill_id
+    if (![categoryId, serviceTypeId, parentSkillId, deepSkillId].every((n) => Number.isInteger(n) && n > 0)) continue;
+    const k = categoryId + '|' + serviceTypeId + '|' + parentSkillId + '|' + deepSkillId;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    desired.push({ categoryId, serviceTypeId, parentSkillId, deepSkillId });
+  }
+
   try {
     if (ownTxn) await conn.beginTransaction();
 
-    // 1) Soft-delete every active row for this easyfixer.
+    // 1) Soft-delete every active row for this easyfixer (one statement).
     await conn.query(
       `UPDATE tbl_efr_deepskill_mapping
           SET is_repairing = 0
@@ -814,45 +918,79 @@ async function replaceOptionMappings(efrId, items, actor, externalConn = null) {
       [efrId]
     );
 
-    // 2) For each desired item: try reactivate, INSERT if no matching row.
-    let updated = 0;
-    for (const it of list) {
-      const categoryId    = Number(it.category_id);
-      const serviceTypeId = Number(it.service_type_id);
-      const deepSkillId   = Number(it.deep_skill_id);  // semantic name; goes into the physical column `parent_skill_id`
-      const optionId      = Number(it.option_id);      // semantic name; goes into the physical column `deep_skill_id`
-      if (![categoryId, serviceTypeId, deepSkillId, optionId].every((n) => Number.isInteger(n) && n > 0)) {
-        continue;
-      }
-      const [r] = await conn.query(
-        `UPDATE tbl_efr_deepskill_mapping
-            SET is_repairing = 1
-          WHERE easyfixer_id    = ?
-            AND category_id     = ?
-            AND service_type_id = ?
-            AND parent_skill_id = ?    -- holds deep_skill_id (inversion, see docblock)
-            AND deep_skill_id   = ?`,  /* holds option_id (inversion, see docblock) */
-        [efrId, categoryId, serviceTypeId, deepSkillId, optionId]
-      );
-      if (r.affectedRows === 0) {
+    if (desired.length === 0) {
+      if (ownTxn) await conn.commit();
+      logger.info('Deep-skill option mappings replaced · efrId=' + efrId + ' · updated=0 · by=' + byId);
+      return { updated: 0 };
+    }
+
+    // 2) One read of this easyfixer's existing rows → map natural key → PK id.
+    //    Replaces the per-item reactivate probe with a single round-trip.
+    const [existingRows] = await conn.query(
+      `SELECT id, category_id, service_type_id, parent_skill_id, deep_skill_id
+         FROM tbl_efr_deepskill_mapping
+        WHERE easyfixer_id = ?`,
+      [efrId]
+    );
+    const idByKey = new Map();
+    for (const row of existingRows) {
+      idByKey.set(row.category_id + '|' + row.service_type_id + '|' + row.parent_skill_id + '|' + row.deep_skill_id, row.id);
+    }
+
+    // 3) Partition: existing rows reactivate (by PK); the rest INSERT.
+    const reactivateIds = [];
+    const toInsert = [];
+    for (const d of desired) {
+      const id = idByKey.get(d.categoryId + '|' + d.serviceTypeId + '|' + d.parentSkillId + '|' + d.deepSkillId);
+      if (id != null) reactivateIds.push(id);
+      else toInsert.push(d);
+    }
+
+    // 4) Bulk reactivate via PK IN (+ refresh audit stamp). One statement per
+    //    chunk — turns up to ~43 single-row UPDATEs into ~1 round-trip. PK seek.
+    if (reactivateIds.length) {
+      const reSets = ['is_repairing = 1'];
+      const auditParams = [];
+      if (audit.dateCol) reSets.push('`' + audit.dateCol + '` = NOW()');
+      if (audit.byCol)   { reSets.push('`' + audit.byCol + '` = ?'); auditParams.push(byId); }
+      for (let i = 0; i < reactivateIds.length; i += MAPPING_WRITE_CHUNK) {
+        const chunk = reactivateIds.slice(i, i + MAPPING_WRITE_CHUNK);
         await conn.query(
-          `INSERT INTO tbl_efr_deepskill_mapping
-             (easyfixer_id, category_id, service_type_id,
-              parent_skill_id, -- physical column name; holds deep_skill_id
-              deep_skill_id,   -- physical column name; holds option_id
-              is_repairing)
-           VALUES (?, ?, ?, ?, ?, 1)`,
-          [efrId, categoryId, serviceTypeId, deepSkillId, optionId]
+          `UPDATE tbl_efr_deepskill_mapping
+              SET ${reSets.join(', ')}
+            WHERE id IN (${chunk.map(() => '?').join(',')})`,
+          [...auditParams, ...chunk]
         );
       }
-      updated += 1;
+    }
+
+    // 5) Bulk INSERT the new mappings — one multi-row INSERT per chunk.
+    if (toInsert.length) {
+      const insCols = ['easyfixer_id', 'category_id', 'service_type_id', 'parent_skill_id', 'deep_skill_id', 'is_repairing'];
+      if (audit.dateCol) insCols.push('`' + audit.dateCol + '`');
+      if (audit.byCol)   insCols.push('`' + audit.byCol + '`');
+      for (let i = 0; i < toInsert.length; i += MAPPING_WRITE_CHUNK) {
+        const chunk = toInsert.slice(i, i + MAPPING_WRITE_CHUNK);
+        const rowSql = [];
+        const insParams = [];
+        for (const d of chunk) {
+          // parent_skill_id holds deep_skill_id; deep_skill_id holds option_id (inversion).
+          const vals = ['?', '?', '?', '?', '?', '1'];
+          insParams.push(efrId, d.categoryId, d.serviceTypeId, d.parentSkillId, d.deepSkillId);
+          if (audit.dateCol) vals.push('NOW()');
+          if (audit.byCol)   { vals.push('?'); insParams.push(byId); }
+          rowSql.push('(' + vals.join(', ') + ')');
+        }
+        await conn.query(
+          `INSERT INTO tbl_efr_deepskill_mapping (${insCols.join(', ')}) VALUES ${rowSql.join(', ')}`,
+          insParams
+        );
+      }
     }
 
     if (ownTxn) await conn.commit();
-    // actor is accepted for future audit columns; today the table has no
-    // updated_by / updated_on columns so we just log the actor for trail.
-    void actor;
-    logger.info('Deep-skill option mappings replaced · efrId=' + efrId + ' · updated=' + updated);
+    const updated = reactivateIds.length + toInsert.length;
+    logger.info('Deep-skill option mappings replaced · efrId=' + efrId + ' · updated=' + updated + ' · by=' + byId);
     return { updated };
   } catch (e) {
     if (ownTxn) { try { await conn.rollback(); } catch (_) { /* swallow rollback failure */ } }
@@ -894,7 +1032,7 @@ async function listServiceablePincodes(efrId) {
   const [items] = await pool.query(
     `SELECT p.pincode_id,
             p.pincode,
-            p.location           AS pincode_location,
+            p.location           AS location,
             p.city_id,
             c.city_name,
             c.state_id,
@@ -914,7 +1052,12 @@ async function replaceServiceablePincodes(efrId, pincodeIds, actor, externalConn
     ? Array.from(new Set(pincodeIds.map(Number).filter((n) => Number.isInteger(n) && n > 0)))
     : [];
   logger.info('Replace serviceable pincodes · efrId=' + efrId + ' · requested=' + list.length);
-  const userId = actor?.user_id || null;
+  // created_by / updated_by: the CRM path passes a staff `actor` (its user_id);
+  // the PUBLIC profile-update form has no logged-in user (actor=null), so the
+  // easyfixer is acting on their own behalf — stamp their efr_id. (created_by/
+  // updated_by are plain INT NULL with no FK, so an efr_id is safe here; the
+  // created_date/updated_date columns auto-populate via DB defaults.)
+  const userId = actor?.user_id || efrId;
   // Single-statement upsert — no begin/commit here. When an external
   // connection is injected we run on it so the write joins the caller's txn.
   const db = externalConn || pool;

@@ -19,17 +19,37 @@ const intId = Joi.number().integer().positive();
  * rather than a generic "value not allowed" — better DX for ops.
  */
 const clickToCallBody = Joi.object({
-  // Four supported receiver-identifier shapes — the BE looks up the
+  // Five supported receiver-identifier shapes — the BE looks up the
   // actual mobile from the appropriate table and never trusts a
   // FE-supplied mobile string:
   //   jobId               → tbl_job.customer_mob_no (customer of a job)
   //   customerId          → tbl_customer.customer_mob_no
   //   efrId               → tbl_easyfixer.efr_no (technician)
   //   reportingContactId  → tbl_client_contacts.contact_no (client SPOC)
+  //   spocJobId           → tbl_job.client_spoc (that job's own client SPOC)
   jobId:              intId,
   customerId:         intId,
   efrId:              intId,
   reportingContactId: intId,
+  // spocJobId (2026-07-15) — dials the SPOC captured ON THE JOB rather than a
+  // row in tbl_client_contacts. Two different SPOCs exist and both are real:
+  // `reportingContactId` is the client's master contact record, while
+  // `client_spoc` is the per-job denormalised snapshot (booked via the
+  // integration API / Book Call, often the only SPOC a job has). The id here is
+  // a JOB id — the SPOC has no id of its own, it's a plain string column — so
+  // the key is named for what you pass, matching the `<thing>Id` convention.
+  // Being a distinct target (not a `useAlt`-style modifier on jobId) is
+  // deliberate: the receiver is a CLIENT-side contact, not the customer, so it
+  // needs its own flow label and must NOT stamp reciever_id with the customer.
+  spocJobId:          intId,
+  // jobContextId (2026-07-03) — optional JOB the call belongs to, WITHOUT
+  // being the receiver. When an operator dials a technician (efrId) or client
+  // SPOC (reportingContactId) FROM a job, pass the job here so the call is
+  // stamped with tbl_job_caller_info.job_id and surfaces in that job's call
+  // history. NOT part of the .xor() below (which picks the receiver) — it's a
+  // context tag layered on top. Redundant/ignored on the jobId and spocJobId
+  // paths (both already stamp the job they dial out of).
+  jobContextId:       intId.optional(),
   // useAlt (2026-06-03, alternatives 2026-06-05): scopes the jobId
   // path to the customer's ALTERNATE number (tbl_job.additional_number)
   // instead of the canonical tbl_customer.customer_mob_no. Lets ops
@@ -65,7 +85,11 @@ const clickToCallBody = Joi.object({
   // Optional "Call From Flow" label (which screen started the call) for the
   // dedicated Plivo call log. Falls back to a coarse identifier-derived flow.
   flow: Joi.string().max(64).optional(),
-}).xor('jobId', 'customerId', 'efrId', 'reportingContactId');
+  // Optional AI-teleprompter session id (from POST /admin/teleprompter/start).
+  // When present + teleprompter.enabled, the web-answer forks the call audio to
+  // the STT websocket for this session. Additive: absent ⇒ a normal web call.
+  teleprompterSessionId: Joi.string().max(64).optional(),
+}).xor('jobId', 'customerId', 'efrId', 'reportingContactId', 'spocJobId');
 
 /*
  * Call-history list query (modal tab + future drill-downs).
@@ -76,11 +100,12 @@ const clickToCallBody = Joi.object({
 const callListQuery = Joi.object({
   jobId: intId.optional(),
   customerId: intId.optional(),
-  // /preview also accepts efrId / reportingContactId for tech + SPOC
-  // call resolution. The /list endpoint ignores them (history is
+  // /preview also accepts efrId / reportingContactId / spocJobId for tech +
+  // both SPOC shapes. The /list endpoint ignores them (history is
   // anchored to job/customer); /preview branches on whichever is set.
   efrId: intId.optional(),
   reportingContactId: intId.optional(),
+  spocJobId: intId.optional(),
   // useAlt (2026-06-03): when paired with jobId, /preview returns the
   // job's alternate number (tbl_job.additional_number) instead of the
   // customer's master mobile. Same flag the POST /click-to-call accepts.
@@ -91,6 +116,16 @@ const callListQuery = Joi.object({
   provider: Joi.string().valid('kaleyra', 'plivo').optional(),
   dateFrom: Joi.string().max(40).optional(),
   dateTo:   Joi.string().max(40).optional(),
+  // Scope history to a single phone number (matches either call leg). Used by
+  // the My Orders "call history for this number" popup so it shows only calls
+  // to/from the clicked customer mobile for the given job.
+  mobile:   Joi.string().max(20).optional(),
+  // Unified Call Analysis filters (2026-07-09): scope the list by flow (call_flow),
+  // by caller (ops agent), to only-analysed calls, and by a minimum coaching score.
+  flow:     Joi.string().max(64).optional(),
+  callerId: intId.optional(),
+  hasAnalysis: Joi.alternatives(Joi.boolean(), Joi.string().valid('true', 'false', '1', '0')).optional(),
+  minScore: Joi.number().integer().min(1).max(10).optional(),
   page:     Joi.number().integer().min(1).default(1),
   limit:    Joi.number().integer().min(1).max(200).default(20),
 });

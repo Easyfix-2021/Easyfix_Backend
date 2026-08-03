@@ -1,0 +1,34 @@
+# EasyFix_Backend — PR gate: syntax-check every file + run the characterization
+# test suite, BEFORE a change merges into a deploy branch. The QA/Production PUSH
+# path is gated separately by deploy.yml's `precheck` job (which runs the same
+# `npm test`), so this workflow covers the pull-request path without duplicating
+# the push path.
+#
+# Tests are fake-pool based (no DB, no network, deterministic), so this needs
+# nothing but Node — it runs in ~1 minute on a github-hosted runner.
+
+name: CI (syntax + tests)
+
+on:
+  pull_request:
+    branches: [QA, Production]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Syntax check & unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: 'npm' }
+      - run: npm ci
+      - name: Build check (syntax-check all files)
+        run: npm run build
+      - name: Unit tests (characterization — no DB)
+        run: npm test

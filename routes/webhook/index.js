@@ -9,5 +9,8 @@ router.use('/', require('./whatsapp'));
 // Plivo voice status callbacks (ring / hangup). Self-authorised via the signed
 // `t` token on each request — see routes/webhook/plivo.js.
 router.use('/plivo', require('./plivo'));
+// STT sidecar OOM alerts (internal `stt-oom-watch` sidecar → us). Authorised by
+// the shared STT_OOM_WEBHOOK_KEY header; 200 no-op unless configured.
+router.use('/stt-oom', require('./stt-oom'));
 
 module.exports = router;

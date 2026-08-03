@@ -8,6 +8,15 @@ const { generateOtp } = require('../utils/otp');
 // Property-flag reader for THE OFFER MODEL toggle (`job.offer.flow.enabled`).
 // Synchronous, cache-backed — see services/properties.service.js::getProperty.
 const { getProperty } = require('./properties.service');
+const addressService = require('./address.service');
+// Job Stage Access — pure stage/status helpers (no DB). stageVisibleStatuses
+// turns a user's allowed stage keys into the union of visible job_status codes,
+// AND-combined (intersected) with the tab/status filters in list/counts/attention.
+const { stageVisibleStatuses } = require('../lib/job-stages');
+// Appointment time-slot model (pure, no DB) — see services/time-slot.js for
+// what tbl_job.time_slot / requested_time / requested_date_time each mean and
+// why the slot STRING is no longer load-bearing anywhere.
+const { deriveTimeSlot, resolveTimeSlot, hasTimeOfDay, wallClockTime } = require('./time-slot');
 
 /*
  * THE OFFER MODEL feature flag. ON by default — only the literal string
@@ -18,6 +27,119 @@ const { getProperty } = require('./properties.service');
  */
 function offerFlowEnabled() {
   return String(getProperty('job.offer.flow.enabled') ?? 'true').toLowerCase() !== 'false';
+}
+
+/*
+ * Auto-ensure a job's pincode exists in tbl_pincode (geocoded + state/city) so
+ * distance ranking works and an admin can zone-map it — closes the gap where
+ * jobs are created with pincodes absent from the pincode catalog. Reuses the
+ * idempotent pincode.service.ensurePincode (existing pincode ⇒ one indexed
+ * SELECT, no geocode/write). Best-effort + fire-and-forget: called AFTER the
+ * job txn commits and NEVER throws — a bad / non-India pincode, a Google
+ * outage, or a missing API key just logs. Does NOT create zone mappings (those
+ * stay admin-curated). Gated by easyfix_properties 'job.ensure.pincode.enabled'
+ * (DEFAULT OFF — flip to 'true' to enable after monitoring).
+ */
+function ensurePincodeEnabled() {
+  return String(getProperty('job.ensure.pincode.enabled') ?? 'false').toLowerCase() === 'true';
+}
+async function ensureJobPincode(pincode, actor) {
+  if (!ensurePincodeEnabled()) return;
+  const pin = String(pincode ?? '').trim();
+  if (!/^\d{6}$/.test(pin)) return;
+  try {
+    const { ensurePincode } = require('./pincode.service');
+    const res = await ensurePincode(pin, { userId: actor?.user_id ?? null });
+    logger.info('Job pincode ensured · pincode=' + pin + ' · ' + (res?.created ? 'created+geocoded' : 'already existed'));
+  } catch (e) {
+    logger.warn('Job pincode auto-ensure failed (non-fatal) · pincode=' + pin + ' · ' + e.message);
+  }
+}
+
+/*
+ * EFFECTIVE offer-flow state = the property flag AND tbl_job_offer actually
+ * existing (the real activation gate). This is the SAME condition assign() /
+ * offerToTechnicians() use to choose offer-vs-direct-assign, exposed so the CRM
+ * Schedule & Assign modal can MIRROR it: offer-pool (multi-select + "Offer to N")
+ * when active, single direct-assign (single-select + "Assign") when not. Async
+ * because the table-existence check is. jobOfferTableExists() is a hoisted
+ * function declaration (defined below), so referencing it here is safe.
+ */
+async function isOfferFlowActive() {
+  return offerFlowEnabled() && (await jobOfferTableExists());
+}
+
+// Open offers auto-expire after this many minutes. ONE source of truth shared
+// by the scheduler sweep (expireStaleOffers) and acceptOffer()'s freshness gate
+// so the two can never drift. See server/scheduler.js 'job-offer-expiry'.
+const OFFER_TTL_MINUTES = 30;
+
+/*
+ * Is offer auto-expiry TURNED ON? `job.offer_expiry.enabled` in
+ * easyfix_properties, DEFAULT-ON: only the literal string 'false' disables it,
+ * exactly matching how server/scheduler.js gates the expiry cron and how the
+ * seed migration (migrations/executed/2026-07-14-seed-per-cron-enable-flags.sql)
+ * documents the key. Synchronous + cache-backed (properties.service).
+ *
+ * This is a BUSINESS switch, and it is NOT the same thing as CRON_DISABLED:
+ *   CRON_DISABLED (env)                = "no schedulers run in THIS process"
+ *                                        (dev/local). Offers still expire — the
+ *                                        lazy on-read sweep compensates, and
+ *                                        that is legitimate.
+ *   job.offer_expiry.enabled = 'false' = "offers must not expire AT ALL".
+ *                                        Nothing may expire one, by cron or
+ *                                        lazily, and the CRM must not render a
+ *                                        still-open offer as if it had.
+ * Read it through this ONE helper so the sweep, the row chip and the list
+ * filter can never disagree about which regime is in force.
+ */
+function offerExpiryEnabled() {
+  return String(getProperty('job.offer_expiry.enabled') ?? '').toLowerCase() !== 'false';
+}
+
+// Named tbl_job_offer.offer_status codes (see services/offer-status.js) — every
+// query below interpolates ${OFFER_STATUS.X} instead of a bare 0/1/2/3.
+const { OFFER_STATUS } = require('./offer-status');
+
+/*
+ * Bulk-expire OPEN offers older than OFFER_TTL_MINUTES (offer_status 0 → 3
+ * EXPIRED). Reuses acceptOffer()'s exact expire shape (status=3 + responded_at).
+ * Touches ONLY tbl_job_offer — the job legitimately stays BOOKED/owner-less
+ * (fk_easyfixter_id NULL) so it remains re-offerable. Tolerant of a missing
+ * table (no-op on un-migrated deploys).
+ *
+ * Two callers:
+ *   • the every-2-min scheduler cron — no jobId, a global sweep.
+ *   • listOffers() (and the candidate-ranking / tech-search routes) — pass jobId
+ *     for a lazy, on-read, job-scoped sweep so the 30-min TTL is honoured in the
+ *     CRM even when the schedulers don't run in this process (CRON_DISABLED) or
+ *     a tech's offer crosses 30 min between ticks. The UPDATE is idempotent, so
+ *     the two paths can never double-expire.
+ *
+ * ⚠ BOTH callers are gated on `job.offer_expiry.enabled`. The cron is gated at
+ * REGISTRATION (server/scheduler.js, decided once at boot), which used to leave
+ * the lazy path as a SIDE DOOR: with expiry switched off in properties, merely
+ * OPENING Schedule & Assign still performed the very write the business had
+ * disabled — and that is how job #521866's 92-minute-old offer flipped to
+ * EXPIRED at the exact moment an operator opened the modal, while the list
+ * (correctly, for that regime) still read "Offered to Tx". The gate lives HERE,
+ * in the one function that issues the UPDATE, so every caller inherits it.
+ * CRON_DISABLED is deliberately NOT consulted here — see offerExpiryEnabled().
+ */
+async function expireStaleOffers(maxAgeMinutes = OFFER_TTL_MINUTES, jobId = null) {
+  if (!offerExpiryEnabled()) return { skipped: true, expired: 0, reason: 'offer_expiry_disabled' };
+  if (!(await jobOfferTableExists())) return { skipped: true, expired: 0 };
+  const params = [maxAgeMinutes];
+  let jobClause = '';
+  if (jobId != null) { jobClause = ' AND job_id = ?'; params.push(Number(jobId)); }
+  const [r] = await pool.query(
+    `UPDATE tbl_job_offer
+        SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
+      WHERE offer_status = ${OFFER_STATUS.OFFERED}
+        AND offered_at < NOW() - INTERVAL ? MINUTE${jobClause}`,
+    params,
+  );
+  return { expired: r.affectedRows || 0 };
 }
 
 /*
@@ -78,6 +200,116 @@ const CLOSED_STATES = new Set([STATUS.COMPLETED, STATUS.COMPLETED_ALT]);
 // Terminal states — `setStatus` to these sets stamp timestamps
 const COMPLETED_STATES = new Set([STATUS.COMPLETED, STATUS.COMPLETED_ALT]);
 
+// ─── Job Age ────────────────────────────────────────────────────────
+/*
+ * JOB AGE — elapsed time from ticket creation to the job's TERMINAL event, or
+ * to NOW() while the job is still open. Defined ONCE here and reused by the
+ * LIST projection, the DETAIL projection and the ORDER BY, so the number an
+ * operator reads and the key the list sorts on can never diverge. Same
+ * discipline as DAY_EXPR in services/quicksight/quicksight-call-tracking.service.js.
+ *
+ * Anchors (verified against the live DB 2026-07-31, 481,027 tbl_job rows):
+ *   START — j.ticket_created_date_time  (0 NULL)
+ *   END   — job_status 3 / 5 (Completed / Completed-alt) → j.checkout_date_time (0 NULL)
+ *           job_status 6     (Cancelled)                 → j.cancel_date_time   (0 NULL)
+ *           job_status 7     (Enquiry)                   → j.enquiry_date_time  (1 NULL)
+ *           anything else    (OPEN)                      → NOW(), keeps ticking
+ *
+ * The CASE has NO ELSE on purpose: an open job falls out as NULL and the
+ * COALESCE turns it into NOW(). That same fall-through is also the robustness
+ * net for a terminal row whose anchor is somehow NULL (there is exactly one
+ * such enquiry row) — it ages against NOW() instead of emitting NULL.
+ *
+ * TIMESTAMPDIFF(DAY, …) — NOT DATEDIFF(). TIMESTAMPDIFF counts whole 24-hour
+ * spans with the TIME included, which is the agreed granularity: a job created
+ * today at 11 AM is age 1 tomorrow at 11 AM (23h59m → 0, 24h00m → 1). DATEDIFF
+ * counts calendar-date boundaries, so 11 PM → 1 AM two hours later would wrongly
+ * report 1. Verified in SQL — see tests/job-age.test.js for the pure-JS mirror.
+ *
+ * GREATEST(…, 0) clamps: 59 legacy rows have a terminal timestamp a few seconds
+ * BEFORE their ticket_created_date_time (back-dated corrections), and "-3 days"
+ * must never render.
+ *
+ * IST: the pool session timezone is +05:30 and these DATETIMEs are stored as IST
+ * wall-clock, so SQL NOW() is already IST and directly comparable. No conversion.
+ *
+ * PURE COLUMN ARITHMETIC — no placeholders — so it is safe to interpolate into
+ * both the SELECT list and the ORDER BY. Every expression is qualified with the
+ * `j` alias (tbl_job), which is present in LIST_JOIN, DETAIL_JOIN and the COUNT
+ * join alike, so it introduces NO new join and cannot break COUNT/data parity.
+ */
+const JOB_AGE_END_EXPR = `COALESCE(
+    CASE j.job_status
+      WHEN ${STATUS.COMPLETED}     THEN j.checkout_date_time
+      WHEN ${STATUS.COMPLETED_ALT} THEN j.checkout_date_time
+      WHEN ${STATUS.CANCELLED}     THEN j.cancel_date_time
+      WHEN ${STATUS.ENQUIRY}       THEN j.enquiry_date_time
+    END,
+    NOW()
+  )`;
+// Precise interval in SECONDS — the SORT key, and what the UI needs to render
+// sub-day ages ("5h") for a job younger than a day.
+const JOB_AGE_SECS_EXPR = `GREATEST(TIMESTAMPDIFF(SECOND, j.ticket_created_date_time, ${JOB_AGE_END_EXPR}), 0)`;
+// Floored whole DAYS — what operators read. Never sort on this: every job
+// created on the same day would tie and order arbitrarily.
+const JOB_AGE_DAYS_EXPR = `GREATEST(TIMESTAMPDIFF(DAY, j.ticket_created_date_time, ${JOB_AGE_END_EXPR}), 0)`;
+// Leading-comma projection fragment — appended to any SELECT that already has
+// the `j` alias in scope. One definition, so LIST and DETAIL cannot drift.
+const JOB_AGE_COLUMNS = `,
+  ${JOB_AGE_DAYS_EXPR} AS ageDays,
+  ${JOB_AGE_SECS_EXPR} AS ageSecs`;
+
+// ─── Server-side sort whitelist ─────────────────────────────────────
+/*
+ * Maps the FE sort key → the qualified SQL expression the list ORDER BY uses.
+ * The list sorts the WHOLE result set in SQL (before LIMIT/OFFSET) so paging and
+ * sorting agree; a client-side reorder would only touch the current page. An
+ * unknown/absent key falls back to the default newest-first. NEVER interpolate
+ * raw sortBy/sortDir — only values FROM this map reach the SQL string, and
+ * `j.job_id DESC` is always appended as a stable tiebreaker.
+ *
+ * All the aliases used here (j / cl / ci / cu / ef / ow) are unconditionally
+ * joined by LIST_JOIN. Sorting never touches the COUNT query (which has no
+ * ORDER BY at all), so nothing here can break COUNT/data join parity.
+ *
+ * ⚠ BOTH-SIDES WHITELIST: `validators/job.validator.js` derives its `sortBy`
+ * valid() list from Object.keys() of this map, so BE-side drift is now
+ * structurally impossible. The FE keeps its own sortable-column list — a key
+ * added here still has to be added there, or the column simply won't offer
+ * sorting (it can no longer be silently dropped by the API, which is the
+ * regression this endpoint hit before).
+ *
+ * Module scope (not rebuilt per call) so it is exportable and unit-testable.
+ */
+const SORTABLE_COLUMNS = {
+  job_id: 'j.job_id',
+  job_reference_id: 'j.job_reference_id',
+  client_ref_id: 'j.client_ref_id',
+  created_date_time: 'j.created_date_time',
+  client_name: 'cl.client_name',
+  city_name: 'ci.city_name',
+  job_status: 'j.job_status',
+  job_type: 'j.job_type',
+  requested_date_time: 'j.requested_date_time',
+  scheduled_date_time: 'j.scheduled_date_time',
+  checkin_date_time: 'j.checkin_date_time',
+  checkout_date_time: 'j.checkout_date_time',
+  customer_name: 'cu.customer_name',
+  customer_mob_no: 'cu.customer_mob_no',
+  source_type: 'j.source_type',
+  easyfixer_name: 'ef.efr_name',
+  owner_name: 'ow.user_name',
+  /*
+   * Job Age. Sorts on the SECONDS expression, never the floored days: sorting by
+   * the day value would make every job created on the same day tie and order
+   * arbitrarily, and would also collapse the whole sub-day population into one
+   * bucket. It is the SAME constant the projection emits as `ageSecs`, so the
+   * value on screen and the key rows are ordered by are one definition — they
+   * cannot diverge.
+   */
+  age: JOB_AGE_SECS_EXPR,
+};
+
 // ─── Projections ────────────────────────────────────────────────────
 // Note: extra columns (ticket_created_date_time, time_slot, client_spoc*,
 // remarks) are included on the LIST projection because the Unconfirmed
@@ -101,12 +333,33 @@ const LIST_COLUMNS = `
   j.last_update_time,
   j.client_spoc, j.client_spoc_name,
   LEFT(j.remarks, 500) AS remarks,
+  j.original_appointment_date_time,
+  /* Auto-reschedule marker — was this job's appointment auto-shifted +1 day by
+     the after-3pm magic-link-open rule? Drives the "Auto Rescheduled" chip +
+     the "Original: <date>" line on the Unconfirmed list. Keyed on
+     scheduling_history (rows persist — unlike j.remarks, which the next comment
+     overwrites) via the idx_sched_hist_job covering index (job_id, …,
+     reschedule_reason), so it's a cheap indexed EXISTS per row. */
+  (EXISTS (SELECT 1 FROM scheduling_history sh
+     WHERE sh.job_id = j.job_id
+       AND sh.reschedule_reason LIKE '%Auto Rescheduled%')) AS auto_rescheduled,
   j.fk_customer_id, cu.customer_name, cu.customer_mob_no,
   j.fk_client_id, cl.client_name,
   j.fk_service_catg_id, sc.service_catg_name AS service_category,
   j.fk_easyfixter_id, ef.efr_name AS easyfixer_name,
+  /*
+   * easyfixer_mobile — the assigned technician's phone (tbl_easyfixer.efr_no),
+   * surfaced so the Pending-to-Start Technician column can offer click-to-call.
+   * This exact alias is already listed in utils/mask-mobile.js MOBILE_FIELDS
+   * (and deliberately NOT in CUSTOMER_MOBILE_FIELDS), so the mask middleware
+   * auto-masks it to first-4-then-bullets and keeps it masked even when the
+   * customer-number-visible flag is ON — do NOT add any other masking here, and
+   * do NOT rename the alias (a different key would bypass the mask and leak the
+   * staff number).
+   */
+  ef.efr_no AS easyfixer_mobile,
   j.job_owner, ow.user_name AS owner_name,
-  j.fk_address_id, ci.city_name,
+  j.fk_address_id, ci.city_name, ad.address, ad.gps_location,
   /*
    * service_count — count of ACTIVE rows on tbl_job_services for this
    * job. Powers the FE "Booked but no services" pill (added
@@ -188,8 +441,8 @@ const LIST_COLUMNS = `
   (EXISTS (
      SELECT 1 FROM tbl_client_custom_properties ccp
       WHERE ccp.client_id = j.fk_client_id
-        AND LOWER(REPLACE(ccp.c_prop_name, '_', ' ')) = LOWER('Auto Process Unconfirmed Order')
-        AND LOWER(ccp.c_prop_values) = 'true'
+        AND LOWER(TRIM(REPLACE(ccp.c_prop_name, '_', ' '))) = LOWER('Auto Process Unconfirmed Order')
+        AND LOWER(TRIM(ccp.c_prop_values)) = 'true'
         AND ccp.status = 1
    )) AS client_opted_in,
   /* Ticket-authorization fields used by the "My New Tickets" page —
@@ -484,6 +737,52 @@ function combineDateTime(dt, timeStr) {
   return formatMysqlDateTimeIST(d);
 }
 
+/*
+ * Derive booking_cut_off_time_slot — the legacy "H AM - H PM" appointment
+ * window — from an IST 'YYYY-MM-DD HH:MM:SS' datetime string. The new-CRM
+ * create flow only ever set the named `time_slot` ("Morning 9 to 2" …) and
+ * left booking_cut_off_time_slot NULL; ops want BOTH columns populated, so we
+ * backfill this from the same appointment time. Values (buckets + the one-word
+ * "AfterHours") verified against tbl_job's existing legacy rows. Callers MUST
+ * pass a wall-clock STRING (createJob's combineDateTime output, or a
+ * DATE_FORMAT'd column) so slice(11,13) is the IST hour regardless of the
+ * mysql2 connection timezone. Returns null for an absent/unparseable value.
+ */
+function deriveBookingCutoffSlot(dt) {
+  if (!dt) return null;
+  const h = Number(String(dt).slice(11, 13)); // 'YYYY-MM-DD HH:...' → HH
+  if (!Number.isFinite(h)) return null;
+  if (h >= 9  && h < 12) return '9 AM - 12 PM';
+  if (h >= 12 && h < 15) return '12 PM - 3 PM';
+  if (h >= 15 && h < 19) return '3 PM - 7 PM';
+  return 'AfterHours';
+}
+
+/*
+ * ── `time_slot` = the BROAD BOOKING BAND, and nothing else ────────────────
+ *
+ * deriveTimeSlot(dt) returns the BAND containing an IST 'YYYY-MM-DD HH:MM:SS'
+ * appointment time — one of exactly four values ('9AM to 12PM', '12PM to 3PM',
+ * '3PM to 7PM', 'After Hours'). It lives in services/time-slot.js, the single
+ * module that owns the model; re-exported from here because every existing
+ * caller (and the module export surface) reaches for it via job.service.
+ *
+ * REVERSED 2026-07-31 — the 1-HOUR slot vocabulary is GONE from this column.
+ * deriveOneHourSlot() / LEGACY_TIME_SLOT_BANDS / rederiveTimeSlot(), added
+ * earlier the same day so reschedule would PRESERVE a 1-hour label, are
+ * deleted. The 1-hour frame ops/the customer picks now lives where it belongs:
+ * its START is requested_date_time's time-of-day (and requested_time), and
+ * time_slot only ever records the band containing it. resolveTimeSlot() is the
+ * one writer-side gate that guarantees it.
+ *
+ * The old four bands this function used to emit ('Morning 9 to 2' …) were a
+ * SECOND vocabulary the backend wrote while the CRM picker wrote a third —
+ * which is why `time_slot = ?` equality could never be trusted. Historical
+ * rows are deliberately NOT migrated; nothing matches on the string any more.
+ *
+ * (deriveTimeSlot / resolveTimeSlot are imported at the top of this file.)
+ */
+
 let _hasClientVerticalIdColumn = null;
 async function hasClientVerticalIdColumn() {
   if (_hasClientVerticalIdColumn !== null) return _hasClientVerticalIdColumn;
@@ -501,6 +800,40 @@ async function hasClientVerticalIdColumn() {
     console.warn('[job.service] tbl_client.vertical_id not present — verticals scope filter will be skipped on jobs list/count queries. Client→vertical mapping may live in tbl_vertical_mapping; wire that JOIN if vertical-based RBAC matters.');
   }
   return _hasClientVerticalIdColumn;
+}
+
+// tbl_address.address_instruction is column-probed (present per deploy — the
+// same guard the write paths use). getByIdCore must branch the SELECT so DBs
+// without the column don't 500 on job-detail reads. Memoised + degrades to
+// "absent" on probe failure: a read must never 500 over a missing column.
+function hasAddressInstructionColumn() {
+  return addressService.hasAddressInstructionColumn(pool, {
+    cache: true,
+    onProbeError: 'assume-absent',
+  });
+}
+
+/*
+ * job_primary_spoc — a denormalised snapshot of the JOB OWNER's phone, shown to
+ * the customer on the confirmation landing page. It's a PROD-only legacy column
+ * (absent on some DBs incl. QA), so probe once + no-op where missing. Re-stamped
+ * on every job_owner write (create + owner change) so it can't go stale after a
+ * reassignment. Pending migration: migrations/2026-07-03-add-job-primary-spoc.sql.
+ */
+let _hasJobPrimarySpocColumn = null;
+async function hasJobPrimarySpocColumn() {
+  if (_hasJobPrimarySpocColumn !== null) return _hasJobPrimarySpocColumn;
+  try {
+    const [rows] = await pool.query("SHOW COLUMNS FROM tbl_job LIKE 'job_primary_spoc'");
+    _hasJobPrimarySpocColumn = rows.length > 0;
+  } catch (_e) { _hasJobPrimarySpocColumn = false; }
+  return _hasJobPrimarySpocColumn;
+}
+async function stampJobPrimarySpoc(jobId, ownerUserId, conn) {
+  if (!jobId || !(await hasJobPrimarySpocColumn())) return;
+  const db = conn || pool;
+  const [[u]] = await db.query('SELECT mobile_no FROM tbl_user WHERE user_id = ? LIMIT 1', [ownerUserId || 0]);
+  await db.query('UPDATE tbl_job SET job_primary_spoc = ? WHERE job_id = ?', [u?.mobile_no || null, jobId]);
 }
 
 /*
@@ -524,6 +857,41 @@ async function customerRequestTableExists() {
     _hasCustomerRequestTable = false;
   }
   return _hasCustomerRequestTable;
+}
+
+/*
+ * Mark a job's PENDING customer requests as 'actioned' — called when Ops takes a
+ * deliberate action on the job (confirm/cancel/enquiry via setStatus, assign,
+ * offer, reschedule). Scenario: a customer submits a cancel request, then phones
+ * in to schedule instead; Ops confirms via Confirm & Schedule. Without this the
+ * 'pending' cancel row lingers and every surface keeps flagging "1 pending
+ * customer request" — even though Ops already handled it, per the customer's own
+ * new instruction.
+ *
+ * 'actioned' is the existing terminal status the manual "Mark Actioned" button
+ * writes (domain: pending | actioned | dismissed) — no schema change, no new
+ * status. Every count/chip filters `request_status = 'pending'`, so this clears
+ * them all; the yellow tbl_job_comment history is a SEPARATE table and is
+ * untouched, so the audit trail stays.
+ *
+ * Keyed by job_id (not request_id) so one call clears every pending ask. Best-
+ * effort + existence-gated: a failure here must never fail the Ops action, and
+ * it's a no-op on un-migrated deploys. Deliberately NOT called from update() — a
+ * plain field edit / draft-save is not "handling the request"; only a real
+ * confirm/assign/offer/reschedule is.
+ */
+async function resolveCustomerRequests(jobId, runner = pool) {
+  if (!(await customerRequestTableExists())) return;
+  try {
+    await runner.query(
+      `UPDATE tbl_job_customer_request
+          SET request_status = 'actioned'
+        WHERE job_id = ? AND request_status = 'pending'`,
+      [jobId],
+    );
+  } catch (e) {
+    logger.warn('resolveCustomerRequests failed (non-fatal) · id=' + jobId + ' · ' + (e && e.message));
+  }
 }
 
 // Same memoised existence probe for tbl_job_media — new EasyFix-owned table
@@ -560,27 +928,49 @@ async function jobOfferTableExists() {
   return _hasJobOfferTable;
 }
 
+// Memoised COLUMN-existence probe for the WhatsApp delivery-status columns
+// (migrations/2026-07-14-magic-link-delivery-status.sql). Selecting a missing
+// column parse-errors and 500s the WHOLE jobs list, so — like the table probes
+// above — we probe once and emit NULL aliases when the columns are absent,
+// keeping the LIST projection a transparent no-op on un-migrated deploys.
+let _hasMagicLinkDeliveryCols = null;
+async function magicLinkDeliveryColsExist() {
+  if (_hasMagicLinkDeliveryCols !== null) return _hasMagicLinkDeliveryCols;
+  try {
+    await pool.query('SELECT magic_link_delivery_status FROM tbl_job LIMIT 1');
+    _hasMagicLinkDeliveryCols = true;
+  } catch {
+    _hasMagicLinkDeliveryCols = false;
+  }
+  return _hasMagicLinkDeliveryCols;
+}
+
 /*
- * Builds the two pending-customer-request projection columns for the LIST
+ * Builds the pending-customer-request projection columns for the LIST
  * query. When the table exists, emits correlated subqueries selecting the
- * latest PENDING request's type + reason; otherwise emits NULL aliases so
- * the column shape stays identical. Parameterised SQL — the literal
- * 'pending' is the only constant and it is bound as a parameter list the
- * caller appends, but since it's a fixed string we inline it safely (no
- * user input). Returns a leading-comma fragment ready to append after
- * client_opted_in.
+ * latest PENDING request's type, reason + preferred (requested) datetime;
+ * otherwise emits NULL aliases so the column shape stays identical.
+ * Parameterised SQL — the literal 'pending' is the only constant and it is
+ * bound as a parameter list the caller appends, but since it's a fixed
+ * string we inline it safely (no user input). Returns a leading-comma
+ * fragment ready to append after client_opted_in.
  *
- * NOTE: the subquery aliases the customer-request row as `jcr` (not
- * `cr`) because LIST_JOIN already binds `cr` to tbl_user via the
- * Committed Appointments page's created_by join. Re-using `cr` here
- * would cause a "Not unique table/alias" parse error inside the
- * correlated subquery's scope-resolution.
+ * `pending_request_preferred_datetime` is what the customer asked to move
+ * the appointment TO (job-completion.js reschedule-request stores it in
+ * tbl_job_customer_request.preferred_datetime; NULL when the customer did
+ * not pick a specific date). It is intentionally distinct from
+ * j.requested_date_time (the current/live appointment) — a reschedule
+ * REQUEST does not move the live appointment until Ops actions it, so the
+ * UI must surface the requested date separately or the row looks stale.
+ * All three subqueries share the same ORDER BY created_at DESC LIMIT 1, so
+ * they resolve to the same latest-pending row.
  */
 function pendingRequestColumns(tableExists) {
   if (!tableExists) {
     return `,
   NULL AS pending_request_type,
-  NULL AS pending_request_reason`;
+  NULL AS pending_request_reason,
+  NULL AS pending_request_preferred_datetime`;
   }
   return `,
   (SELECT jcr.request_type FROM tbl_job_customer_request jcr
@@ -588,7 +978,236 @@ function pendingRequestColumns(tableExists) {
     ORDER BY jcr.created_at DESC LIMIT 1) AS pending_request_type,
   (SELECT jcr.reason FROM tbl_job_customer_request jcr
     WHERE jcr.job_id = j.job_id AND jcr.request_status = 'pending'
-    ORDER BY jcr.created_at DESC LIMIT 1) AS pending_request_reason`;
+    ORDER BY jcr.created_at DESC LIMIT 1) AS pending_request_reason,
+  (SELECT jcr.preferred_datetime FROM tbl_job_customer_request jcr
+    WHERE jcr.job_id = j.job_id AND jcr.request_status = 'pending'
+    ORDER BY jcr.created_at DESC LIMIT 1) AS pending_request_preferred_datetime`;
+}
+
+// Builds the two WhatsApp delivery-state projection columns. NULL aliases when
+// the columns are absent (pre-migration) so the row shape is identical. LEADING-
+// COMMA fragment, appended after offerColumns().
+function magicLinkDeliveryColumns(colsExist) {
+  if (!colsExist) {
+    return `, NULL AS magic_link_delivery_status, NULL AS magic_link_delivery_reason`;
+  }
+  return `, j.magic_link_delivery_status, j.magic_link_delivery_reason`;
+}
+
+/*
+ * ═══════════ THE OFFER SUB-STATE — ONE canonical definition ═══════════
+ *
+ * Three surfaces answer "does this job have an open offer?" — the LIST row chip
+ * (offerColumns below), the `offerState` LIST filter (offerStateClause below)
+ * and the Schedule & Assign modal (listOffers). They used to answer it three
+ * different ways and contradicted each other in production: job #521866 showed
+ * an orange "Offered to Tx" chip on Pending-for-Scheduling while the modal
+ * showed that job's single offeree badged EXPIRED, "offered 2 hr ago".
+ *
+ * ── ROOT CAUSE: expiry is a BATCH JOB, not a property of time ──
+ * An offer is advertised (and enforced by acceptOffer) as living for
+ * OFFER_TTL_MINUTES. The ROW, however, only flips to offer_status = EXPIRED
+ * when expireStaleOffers() sweeps it — the every-2-min scheduler cron, or
+ * listOffers()'s lazy per-job sweep. On #521866 the sweep landed ~2 hours after
+ * the offer was made (offered_at 15:39:39, responded_at 17:41:24, TTL 30 min),
+ * so for ~90 minutes the row sat at offer_status = 0 while being, by the
+ * product's own rule, already dead. The list faithfully reported
+ * EXISTS(offer_status = 0) → "Offered to Tx"; the modal was truthful only
+ * because it sweeps before it reads. Neither query was wrong — the DATA was
+ * stale, and any definition of "open" that reads offer_status alone inherits
+ * that staleness.
+ *
+ * ── THE RULE: open-ness is a function of TIME — WHEN EXPIRY IS ON ──
+ * The rule is CONDITIONAL on `job.offer_expiry.enabled` (offerExpiryEnabled()),
+ * because that property decides whether offers expire at all:
+ *
+ *   expiry ON (the default, and the normal configuration)
+ *     An offer is EFFECTIVELY OPEN only while a technician could still actually
+ *     accept it — exactly acceptOffer()'s race-safe claim gate:
+ *         offer_status = OFFERED  AND  offered_at >= NOW() - INTERVAL <TTL> MINUTE
+ *     Same comparison, same OFFER_TTL_MINUTES constant, so the chip can never
+ *     promise an offer the accept path would refuse, and it stays correct no
+ *     matter how far behind the expiry sweep is. EFFECTIVELY DEAD is the exact
+ *     complement — EXPIRED, or still OFFERED but past the TTL (expireStaleOffers
+ *     sweeps with `offered_at < NOW() - INTERVAL ? MINUTE`) — so a row can never
+ *     be neither.
+ *
+ *   expiry OFF (`job.offer_expiry.enabled` = 'false')
+ *     The business has said offers must NOT expire; they are meant to stay open
+ *     indefinitely and nothing (cron or lazy sweep) may retire them. Rendering a
+ *     30-minute-old offer as "Expired" would then misreport the system's actual
+ *     behaviour — the offer really IS still live. So the time component is
+ *     dropped entirely: OPEN is simply offer_status = OFFERED, and DEAD is
+ *     simply offer_status = EXPIRED (rows an earlier, enabled regime already
+ *     swept). Still exact complements.
+ *
+ * The property is resolved ONCE per request (list() reads it and hands the same
+ * boolean to both the projection and the filter), then baked into a constant SQL
+ * fragment. NEVER a per-row subquery against easyfix_properties.
+ *
+ * ── THE SUB-STATES (mutually exclusive; they partition the bucket) ──
+ *   'offered'  ≥1 effectively-open offer                      → "Offered to Tx"
+ *   'expired'  no open, none accepted, ≥1 effectively-dead     → "Expired"
+ *   'pending'  no open, none accepted, none dead               → "Pending For Scheduling"
+ *
+ * 'pending' is the catch-all, and that is deliberate: a job whose only offer
+ * was REJECTED is back in the pool and must read as Pending For Scheduling, NOT
+ * "Expired" — the documented ops intent. Same for a job whose only offer rows
+ * are unresolvable (see the technician guard below): nobody is holding it.
+ *
+ * ⚠ "all expired" is NOT "none open". Open-ness is an EXISTS over rows, never
+ * MAX(offer_status) and never a count comparison: a job holding 3 dead offers
+ * and 1 effectively-open one is 'offered', full stop.
+ *
+ * ACCEPTED is carved out rather than folded into 'expired': accepting sets
+ * fk_easyfixter_id, which evicts the job from the Pending-for-Scheduling
+ * bucket, so it should be unreachable here. If one ever is, it drops out of all
+ * three filters (and projects offer_state = 'none') instead of being
+ * mislabelled a dead offer.
+ *
+ * ── Two defensive guards, both matching what the MODAL shows ──
+ *  1. LATEST ROW PER TECHNICIAN. listOffers() collapses to MAX(job_offer_id)
+ *     per tech, so the list must too or the two can disagree. The re-offer path
+ *     tries to UPDATE in place and collapse strays, but that "one row per (job,
+ *     tech)" invariant is NOT enforced by any constraint and is NOT guaranteed
+ *     in production — do not re-simplify these subqueries on the assumption
+ *     that it holds.
+ *  2. TECHNICIAN RESOLVABLE. listOffers() INNER JOINs tbl_easyfixer, so a row
+ *     with a NULL or dangling fk_easyfixter_id is invisible there; without this
+ *     guard the list would count it and diverge. (tbl_job_offer has a recorded
+ *     NULL-fk trap — candidate ranking needed the same explicit guard.)
+ *
+ * ── Shape rules ──
+ * CORRELATED SUBQUERIES, never a JOIN onto the outer list: a job accrues many
+ * offer rows, and a JOIN would fan out the LIST rows and inflate the paginated
+ * COUNT (a recorded 500 in this codebase). The fragments reference only the `j`
+ * alias plus their own locals, so the COUNT query's alias detection
+ * (needsCu/needsAd/…) is untouched and COUNT + data keep identical WHERE/params.
+ */
+
+/*
+ * Guard for the values we INLINE into SQL. The offerState FILTER binds its
+ * constants as `?` params, but offerColumns() is a PROJECTION fragment that
+ * list() appends with NO params at all, so there the same constants must be
+ * rendered literally. Both renderings come out of the builders below, so they
+ * cannot drift; this just makes the inlined branch structurally incapable of
+ * emitting anything but a plain integer.
+ */
+function offerSqlInt(n) {
+  const v = Number(n);
+  if (!Number.isInteger(v)) throw new Error('offer-state SQL expects an integer, got ' + n);
+  return String(v);
+}
+
+/*
+ * Row scope shared by EVERY fragment: correlate to the outer job, require a
+ * resolvable technician, and keep only that technician's LATEST row. See guards
+ * 1 + 2 in the docblock above. `a` is the outer offer alias; its two children
+ * are `<a>e` (the technician probe) and `<a>m` (the latest-row probe), so
+ * callers only ever have to keep `a` unique.
+ */
+function offerRowScope(a) {
+  return `${a}.job_id = j.job_id`
+       + ` AND ${a}.fk_easyfixter_id IS NOT NULL`
+       + ` AND EXISTS (SELECT 1 FROM tbl_easyfixer ${a}e WHERE ${a}e.efr_id = ${a}.fk_easyfixter_id)`
+       + ` AND ${a}.job_offer_id = (SELECT MAX(${a}m.job_offer_id) FROM tbl_job_offer ${a}m`
+       + ` WHERE ${a}m.job_id = ${a}.job_id AND ${a}m.fk_easyfixter_id = ${a}.fk_easyfixter_id)`;
+}
+
+/*
+ * The status/freshness predicate for one offer KIND:
+ *   'live'      effectively open — acceptOffer()'s exact freshness gate
+ *   'dead'      already-swept EXPIRED, plus (when expiry is ON) still-OFFERED
+ *               but past the TTL. The exact complement of 'live' within
+ *               offer_status = OFFERED, NULL offered_at included.
+ *   'accepted'  the documented anomaly carve-out
+ *   'any'       no status predicate — "this technician has offer history"
+ *
+ * `expiry` is offerExpiryEnabled() for this request: false drops the time
+ * component entirely (see the docblock — offers that the business says never
+ * expire must not be rendered as expired). `bind` chooses `?` placeholders
+ * (WHERE fragments) vs inlined integers (projection fragments, which carry no
+ * params). Params come out in placeholder order.
+ */
+function offerKindPredicate(kind, a, bind, expiry) {
+  const params = [];
+  const v = (n) => { if (!bind) return offerSqlInt(n); params.push(n); return '?'; };
+  switch (kind) {
+    case 'live':
+      // expiry OFF ⇒ no TTL term at all: an OFFERED row is open, full stop.
+      return {
+        sql: `${a}.offer_status = ${v(OFFER_STATUS.OFFERED)}`
+           + (expiry ? ` AND ${a}.offered_at >= NOW() - INTERVAL ${v(OFFER_TTL_MINUTES)} MINUTE` : ''),
+        params,
+      };
+    case 'dead':
+      // expiry OFF ⇒ only rows an earlier ENABLED regime already swept are dead.
+      if (!expiry) return { sql: `${a}.offer_status = ${v(OFFER_STATUS.EXPIRED)}`, params };
+      return {
+        sql: `(${a}.offer_status = ${v(OFFER_STATUS.EXPIRED)}`
+           + ` OR (${a}.offer_status = ${v(OFFER_STATUS.OFFERED)}`
+           + ` AND (${a}.offered_at IS NULL`
+           + ` OR ${a}.offered_at < NOW() - INTERVAL ${v(OFFER_TTL_MINUTES)} MINUTE)))`,
+        params,
+      };
+    case 'accepted':
+      return { sql: `${a}.offer_status = ${v(OFFER_STATUS.ACCEPTED)}`, params };
+    case 'any':
+      return { sql: '', params };
+    default:
+      throw new Error('unknown offer kind: ' + kind);
+  }
+}
+
+// scope + kind predicate — the WHERE body of every offer subquery. Exposed on
+// its own because the COUNT projections need the body without the EXISTS wrap.
+function offerRowWhere(kind, a, bind, expiry) {
+  const k = offerKindPredicate(kind, a, bind, expiry);
+  return { sql: offerRowScope(a) + (k.sql ? ` AND ${k.sql}` : ''), params: k.params };
+}
+
+function offerRowExists(kind, a, { bind = true, negate = false, expiry = true } = {}) {
+  const w = offerRowWhere(kind, a, bind, expiry);
+  return {
+    sql: `${negate ? 'NOT ' : ''}EXISTS (SELECT 1 FROM tbl_job_offer ${a} WHERE ${w.sql})`,
+    params: w.params,
+  };
+}
+
+/*
+ * THE sub-state predicate. `offerStateClause` (the WHERE filter) and
+ * offerColumns' `offer_state` CASE are both built from this, so the filter and
+ * the chip are the same boolean algebra by construction, not by hand-sync:
+ *   offered = live
+ *   expired = ¬live ∧ ¬accepted ∧ dead
+ *   pending = ¬live ∧ ¬accepted ∧ ¬dead
+ * Returns { sql, params }, or null for an unknown state.
+ */
+function offerStateSql(state, { bind = true, alias = 'jos', expiry = true } = {}) {
+  const [a1, a2, a3] = [alias, alias + '2', alias + '3'];
+  const o = { bind, expiry };
+  const all = (...parts) => ({
+    sql: `(${parts.map((p) => p.sql).join(' AND ')})`,
+    params: parts.flatMap((p) => p.params),
+  });
+  switch (state) {
+    case 'offered':
+      return all(offerRowExists('live', a1, o));
+    case 'expired':
+      return all(
+        offerRowExists('live', a1, { ...o, negate: true }),
+        offerRowExists('accepted', a2, { ...o, negate: true }),
+        offerRowExists('dead', a3, o),
+      );
+    case 'pending':
+      return all(
+        offerRowExists('live', a1, { ...o, negate: true }),
+        offerRowExists('accepted', a2, { ...o, negate: true }),
+        offerRowExists('dead', a3, { ...o, negate: true }),
+      );
+    default:
+      return null;
+  }
 }
 
 // Detail join aliases LIST_JOIN directly — the cr (creator) join is
@@ -601,24 +1220,92 @@ function pendingRequestColumns(tableExists) {
 const DETAIL_JOIN = LIST_JOIN;
 
 /*
- * Builds the two job-offer projection columns for the LIST query. When the
- * tbl_job_offer table exists, emits correlated subqueries reporting whether the
- * job currently has an OPEN offer (offer_status = 0) and the offered
- * technician's name; otherwise emits NULL aliases so the column shape stays
- * identical on un-migrated deploys. Correlated subqueries (NOT a JOIN) — a job
- * can accrue many historical offer rows, so a JOIN would fan-out the LIST.
- * Returns a LEADING-COMMA fragment ready to append after pendingRequestColumns().
+ * `expiryEnabled` is passed in by list() so ONE property read serves both the
+ * projection and the filter in a request (they must describe the same regime or
+ * the chip and the filter disagree again). Defaulted for standalone callers.
  */
-function offerColumns(tableExists) {
+function offerColumns(tableExists, expiryEnabled = offerExpiryEnabled()) {
   if (!tableExists) {
-    return `, NULL AS is_offered, NULL AS offered_efr_name, NULL AS offered_count`;
+    // The NULL aliases MUST mirror the real branch column-for-column so the row
+    // shape is identical on un-migrated deploys.
+    return `, NULL AS is_offered, NULL AS offered_efr_name, NULL AS offered_count`
+         + `, NULL AS total_offer_count, NULL AS expired_offer_count, NULL AS offer_state`;
   }
-  // offered_count — how many techs currently hold an OPEN (status=0) offer on
-  // this job, so the CRM can render "Offered to N" on the my-orders / jobs
-  // list. Correlated COUNT subquery on the indexed job_id column. Kept beside
-  // is_offered / offered_efr_name (the latter shows the most-recent offeree's
-  // name for the single-offer common case).
-  return `, (EXISTS(SELECT 1 FROM tbl_job_offer jo WHERE jo.job_id = j.job_id AND jo.offer_status = 0)) AS is_offered, (SELECT ef2.efr_name FROM tbl_job_offer jo2 JOIN tbl_easyfixer ef2 ON ef2.efr_id = jo2.fk_easyfixter_id WHERE jo2.job_id = j.job_id AND jo2.offer_status = 0 ORDER BY jo2.job_offer_id DESC LIMIT 1) AS offered_efr_name, (SELECT COUNT(*) FROM tbl_job_offer jo3 WHERE jo3.job_id = j.job_id AND jo3.offer_status = 0) AS offered_count`;
+  /*
+   * `offer_state` is THE authoritative sub-state — the same boolean algebra the
+   * offerState FILTER uses (offerStateSql), rendered with inlined constants
+   * because a projection fragment carries no params. The FE renders this string
+   * directly instead of re-deriving the rule from counts; that second
+   * implementation is what let the chip and the filter disagree (a rejected-only
+   * job listed under the Expired filter but rendered a different chip).
+   *
+   * The CASE ladder is exclusive top-down, which makes it identical to the three
+   * filter fragments:
+   *   live                      → 'offered'
+   *   ¬live ∧ accepted          → 'none'      (documented anomaly; no filter matches it)
+   *   ¬live ∧ ¬accepted ∧ dead  → 'expired'
+   *   otherwise                 → 'pending'
+   *
+   * The counts stay for the FE tooltips only — offered_count feeds "Offered to N
+   * technicians", expired/total feed the Expired tooltip. They now use the SAME
+   * effectively-open / effectively-dead / latest-resolvable-row semantics, so a
+   * count can never contradict the state beside it. total_offer_count is one per
+   * TECHNICIAN with offer history (latest row per tech), which is exactly what
+   * the Schedule & Assign modal lists.
+   *
+   * offered_efr_name — most recent effectively-open offeree, for the
+   * single-offer common case. The tbl_easyfixer JOIN lives INSIDE this scalar
+   * subquery, so it cannot fan out the LIST.
+   */
+  const e        = { bind: false, expiry: expiryEnabled };
+  const live     = (a) => offerRowExists('live', a, e).sql;
+  const accepted = (a) => offerRowExists('accepted', a, e).sql;
+  const dead     = (a) => offerRowExists('dead', a, e).sql;
+  const where    = (kind, a) => offerRowWhere(kind, a, false, expiryEnabled).sql;
+  return `, (${live('jo')}) AS is_offered`
+       + `, (SELECT ef2.efr_name FROM tbl_job_offer jo2 JOIN tbl_easyfixer ef2 ON ef2.efr_id = jo2.fk_easyfixter_id`
+       + `    WHERE ${where('live', 'jo2')}`
+       + `    ORDER BY jo2.job_offer_id DESC LIMIT 1) AS offered_efr_name`
+       + `, (SELECT COUNT(*) FROM tbl_job_offer jo3 WHERE ${where('live', 'jo3')}) AS offered_count`
+       + `, (SELECT COUNT(*) FROM tbl_job_offer jo4 WHERE ${where('any', 'jo4')}) AS total_offer_count`
+       + `, (SELECT COUNT(*) FROM tbl_job_offer jo5 WHERE ${where('dead', 'jo5')}) AS expired_offer_count`
+       + `, (CASE WHEN ${live('jo6')} THEN 'offered'`
+       + `        WHEN ${accepted('jo7')} THEN 'none'`
+       + `        WHEN ${dead('jo8')} THEN 'expired'`
+       + `        ELSE 'pending' END) AS offer_state`;
+}
+
+/*
+ * ── `offerState` — the Pending-for-Scheduling SUB-STATE filter (2026-07-31) ──
+ *
+ * The CRM's "Pending for Scheduling" tab is a BUCKET, not a status tab:
+ *   job_status = 0 (BOOKED)  AND  fk_easyfixter_id IS NULL
+ * (the list endpoint receives it as status=0 + assigned=false). EVERY job in it
+ * therefore has job_status = 0 by definition, which makes a job-status filter on
+ * that tab meaningless — the axis operators actually triage on is where the job
+ * sits in the OFFER lifecycle *within* the bucket:
+ *
+ *   'pending'  Pending to Scheduling  — nobody is holding it (never offered,
+ *                                       only rejected, or only unresolvable rows)
+ *   'offered'  Offered to Tx          — ≥1 EFFECTIVELY OPEN offer (within TTL)
+ *   'expired'  Expired / No Response  — none open, none accepted, ≥1 dead offer
+ *
+ * The filter is nothing but `offerStateSql(state)` — the SAME predicate the
+ * `offer_state` projection column is built from, so the chip a row renders and
+ * the filter that would return that row can no longer disagree. All semantics,
+ * the TTL-derived definition of "open", the latest-row-per-technician and
+ * technician-resolvable guards, and the correlated-subquery shape rule live in
+ * the canonical docblock above offerColumns — read that, not this.
+ *
+ * Returns { sql, params } or null for "no filter" (absent / '' / unknown value).
+ * Exported so validators/job.validator.js derives its valid() list from
+ * OFFER_STATE_VALUES — one source of truth, and the FE/BE literal can't drift.
+ */
+const OFFER_STATE_VALUES = Object.freeze(['pending', 'offered', 'expired']);
+
+function offerStateClause(offerState, expiryEnabled = offerExpiryEnabled()) {
+  if (!OFFER_STATE_VALUES.includes(offerState)) return null;
+  return offerStateSql(offerState, { bind: true, alias: 'jos', expiry: expiryEnabled });
 }
 
 // ─── List ───────────────────────────────────────────────────────────
@@ -648,8 +1335,23 @@ const DATE_TYPE_COLUMN = {
   requested: 'j.requested_date_time',
 };
 
+/*
+ * Normalise a filter param that may arrive as a single number, a single-id
+ * string, a CSV string ("12,34") or an array into a clean number[]. Mirrors the
+ * `statuses` CSV-split pattern above so the Pending-to-Start multi-select
+ * filters (clientId / cityId / projectManagerId / zonalManagerId) can each build
+ * an IN (?, ?, …) clause. Back-compatible: a lone id still yields a 1-element
+ * array, so pre-existing single-select callers keep working unchanged.
+ */
+function toIdArray(v) {
+  if (v == null || v === '') return [];
+  const raw = Array.isArray(v) ? v : String(v).split(',');
+  return raw.map((s) => Number(String(s).trim())).filter((n) => Number.isFinite(n));
+}
+
 async function list({
   q, status, statuses, assigned, clientId, cityId, cityIds, ownerId, ownerIds, easyfixerId,
+  clientOwnerIds,            // number[] — restrict to jobs owned (job_client_owner) by these client users (reporting-manager scope)
   customerId,
   jobIds,                    // number[] — restrict to an explicit set of job ids
   isEscalated,
@@ -675,6 +1377,8 @@ async function list({
   stateId,                   // FK   — tbl_city.state_id
   categoryId,                // FK   — j.fk_service_catg_id
   verticalId,                // FK   — via EXISTS on tbl_vertical_mapping
+  projectManagerId,          // FK   — tbl_vertical_mapping.user_id where user_type = 1
+  zonalManagerId,            // FK   — tbl_city.state_user (the city's zonal owner)
   dateType,                  // enum — see DATE_TYPE_COLUMN above
   // Phase-2 filters (2026-05-19).
   rating,                    // 1..5 — tbl_easyfixer_rating_by_customer.customer_rating
@@ -692,8 +1396,18 @@ async function list({
    * subquery, so counts and rows agree by construction.
    */
   noServices,
+  /*
+   * `offerState` (2026-07-31) — Pending-for-Scheduling SUB-STATE filter:
+   * 'pending' | 'offered' | 'expired'. NARROWS the caller's bucket, never
+   * replaces it (the tab keeps sending status=0 + assigned=false). Absent /
+   * '' / unknown = no filter. See offerStateClause() above for the semantics
+   * and why it's EXISTS-based rather than a JOIN.
+   */
+  offerState,
   startDate, endDate,
   scope,
+  allowedStages,             // Job Stage Access — { mode:'all'|'list', stages }
+  sortBy, sortDir,           // server-side sort — whitelisted column + asc|desc
   limit = 50, offset = 0,
 } = {}) {
   logger.info('List jobs · status=' + (status ?? statuses ?? 'any') + ' · clientId=' + (clientId ?? '-') + ' · easyfixerId=' + (easyfixerId ?? '-') + ' · limit=' + limit + ' · offset=' + offset);
@@ -712,8 +1426,25 @@ async function list({
   // Probe ONCE for tbl_job_offer presence too, appending the offer projection
   // (is_offered / offered_efr_name, or NULL aliases). See offerColumns() above.
   const hasJobOffer = await jobOfferTableExists();
+  /*
+   * Resolve `job.offer_expiry.enabled` ONCE for this request and hand the SAME
+   * boolean to the offer PROJECTION and the offerState FILTER below. Reading it
+   * twice would let a mid-request property-cache refresh render a row's chip
+   * under one regime and filter it under the other — the exact chip/filter
+   * divergence this whole definition exists to eliminate. Synchronous +
+   * cache-backed, so this is a memory read, not a query.
+   */
+  const offerExpiry = offerExpiryEnabled();
+  // Probe ONCE for the WhatsApp delivery-status columns, appending them (or NULL
+  // aliases) so a SPOC/unconfirmed list never 500s pre-migration. See
+  // magicLinkDeliveryColumns() above.
+  const hasMagicLinkDeliveryCols = await magicLinkDeliveryColsExist();
   const listColumns =
-    LIST_COLUMNS + pendingRequestColumns(hasCustomerRequestTable) + offerColumns(hasJobOffer);
+    LIST_COLUMNS + pendingRequestColumns(hasCustomerRequestTable) + offerColumns(hasJobOffer, offerExpiry)
+    + magicLinkDeliveryColumns(hasMagicLinkDeliveryCols)
+    // Job Age (ageDays + ageSecs) — unconditional; every column it touches is a
+    // long-standing tbl_job column, so there is nothing to existence-probe.
+    + JOB_AGE_COLUMNS;
 
   // Apply RBAC scope FIRST so any explicit clientId/cityId filter
   // narrows within the allowed set (caller can't widen scope by passing
@@ -744,6 +1475,21 @@ async function list({
         clauses.push(`cl.vertical_id IN (${v.ids.map(() => '?').join(',')})`);
         params.push(...v.ids);
       }
+    }
+  }
+
+  // Job Stage Access — restrict the visible rows to the union of statuses
+  // across the caller's allowed stages, AND-combined (intersected) with any
+  // tab/status filter below. mode 'all' (unrestricted / bypass) = no clause.
+  // References only `j.` so it doesn't affect the COUNT-join detection. Empty
+  // union (shouldn't happen for a 'list' with valid keys) → 1=0.
+  if (allowedStages && allowedStages.mode === 'list') {
+    const visible = [...stageVisibleStatuses(allowedStages.stages)];
+    if (visible.length === 0) {
+      clauses.push('1=0');
+    } else {
+      clauses.push(`j.job_status IN (${visible.map(() => '?').join(',')})`);
+      params.push(...visible);
     }
   }
 
@@ -780,6 +1526,21 @@ async function list({
     clauses.push(wantAssigned ? 'j.fk_easyfixter_id IS NOT NULL' : 'j.fk_easyfixter_id IS NULL');
   }
   /*
+   * `offerState` — offer-lifecycle sub-state WITHIN whatever bucket the caller
+   * already pinned. It is an ADDITIONAL AND-ed clause: it can only ever remove
+   * rows, never re-open the status / assigned pins above (that inversion is
+   * exactly the bug this filter replaced on the CRM side).
+   *
+   * Degrades to a no-op when tbl_job_offer is absent on this deploy — the same
+   * memoised probe (`hasJobOffer`) that gates the offer PROJECTION gates the
+   * filter, so an un-migrated environment returns the unfiltered bucket instead
+   * of 500ing on an unknown table.
+   */
+  if (offerState && hasJobOffer) {
+    const oc = offerStateClause(offerState, offerExpiry);
+    if (oc) { clauses.push(oc.sql); params.push(...oc.params); }
+  }
+  /*
    * Booked-No-Services filter (2026-05-28). Forces both job_status = 0
    * (so callers don't need to set status separately) AND an anti-join
    * against tbl_job_services. The implicit status pin matches the
@@ -793,10 +1554,25 @@ async function list({
        WHERE js.job_id = j.job_id AND js.job_service_status = 1
     )`);
   }
-  if (clientId != null)    { clauses.push('j.fk_client_id = ?');     params.push(clientId); }
+  // clientId — single id OR CSV/array (Pending-to-Start multi-select Clients
+  // filter). Builds j.fk_client_id IN (...) — the `j` alias is always present,
+  // so no COUNT-join change. Narrows within any RBAC clients scope applied above.
+  const clientIdList = toIdArray(clientId);
+  if (clientIdList.length) {
+    clauses.push(`j.fk_client_id IN (${clientIdList.map(() => '?').join(',')})`);
+    params.push(...clientIdList);
+  }
   if (easyfixerId != null) { clauses.push('j.fk_easyfixter_id = ?'); params.push(easyfixerId); }
   if (ownerId != null)     { clauses.push('j.job_owner = ?');        params.push(ownerId); }
-  if (cityId != null)      { clauses.push('ad.city_id = ?');         params.push(cityId); }
+  // cityId — single id OR CSV/array (Pending-to-Start multi-select Cities
+  // filter). The `ad.` literal keeps needsAd tripped below so the COUNT query
+  // still joins tbl_address (join parity — a WHERE referencing `ad.` without the
+  // matching COUNT join is the known scoped-user-500 regression).
+  const cityIdList = toIdArray(cityId);
+  if (cityIdList.length) {
+    clauses.push(`ad.city_id IN (${cityIdList.map(() => '?').join(',')})`);
+    params.push(...cityIdList);
+  }
   // Multi-value variants — same shape as `statuses` (CSV or array).
   // Used by the Client_UI filter bar (City multi-select, Client Team
   // multi-select). Each adds its alias prefix so the COUNT-join
@@ -812,11 +1588,19 @@ async function list({
     const arr = toIdArr(ownerIds);
     if (arr.length) { clauses.push(`j.job_owner IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
   }
-  // reportingContactIds — server-set scope for the My-New-Tickets page.
-  // See routes/client/index.js GET /jobs handler for the source.
-  if (Array.isArray(reportingContactIds) && reportingContactIds.length) {
-    clauses.push(`j.reporting_contact_id IN (${reportingContactIds.map(() => '?').join(',')})`);
-    params.push(...reportingContactIds);
+  if (Array.isArray(clientOwnerIds) && clientOwnerIds.length) {
+    clauses.push(`j.job_client_owner IN (${clientOwnerIds.map(() => '?').join(',')})`);
+    params.push(...clientOwnerIds);
+  }
+  // Client-app reporting hierarchy: restrict to jobs whose booking SPOC
+  // (reporting_contact_id) is in the caller's subtree. Empty array → zero rows
+  // (never silently widen to the whole client when the subtree is empty).
+  if (Array.isArray(reportingContactIds)) {
+    if (reportingContactIds.length === 0) { clauses.push('1=0'); }
+    else {
+      clauses.push(`j.reporting_contact_id IN (${reportingContactIds.map(() => '?').join(',')})`);
+      params.push(...reportingContactIds);
+    }
   }
   // ticketFlag — three discrete tab states for the My-New-Tickets page.
   // Legacy parity: ACD_APIs JobFilterServiceImpl#getPredicates cases at
@@ -923,6 +1707,25 @@ async function list({
   if (verticalId != null) {
     clauses.push('EXISTS (SELECT 1 FROM tbl_vertical_mapping vm WHERE vm.client_id = j.fk_client_id AND vm.vertical_id = ?)');
     params.push(verticalId);
+  }
+  // Project Manager — the PM is the user mapped to the job's client in
+  // tbl_vertical_mapping with user_type = 1. EXISTS mirrors the verticalId
+  // shape above; the subquery is self-contained (references only vm + the
+  // outer j alias), so it introduces NO new outer alias and the COUNT-join
+  // detection below is unaffected.
+  const pmIdList = toIdArray(projectManagerId);
+  if (pmIdList.length) {
+    clauses.push(`EXISTS (SELECT 1 FROM tbl_vertical_mapping vm WHERE vm.client_id = j.fk_client_id AND vm.user_type = 1 AND vm.user_id IN (${pmIdList.map(() => '?').join(',')}))`);
+    params.push(...pmIdList);
+  }
+  // Zonal Manager — a city's zonal owner is tbl_city.state_user. `ci` is the
+  // tbl_city alias already joined in LIST_JOIN; the `ci.` literal here trips
+  // the needsCi detection below so the COUNT query also joins tbl_address +
+  // tbl_city, keeping main-query and COUNT-query WHERE join-consistent.
+  const zmIdList = toIdArray(zonalManagerId);
+  if (zmIdList.length) {
+    clauses.push(`ci.state_user IN (${zmIdList.map(() => '?').join(',')})`);
+    params.push(...zmIdList);
   }
   // Text LIKE filters — use the customary `%val%` wrap. Each adds its
   // referenced alias to the COUNT-join detection regex below via the
@@ -1057,8 +1860,19 @@ async function list({
      * so partial numeric matches (e.g. "1234" → 12340..12349) work,
      * matching operator expectations.
      */
-    clauses.push('(CAST(j.job_id AS CHAR) LIKE ? OR j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ?)');
-    params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
+    // Search covers every field the client-side filter (job-tabs.ts filterJobRows)
+    // matches, so the two layers agree: job id / reference / client ref /
+    // customer name+mobile PLUS client name, city, technician, and owner. The
+    // cl/ci/ef/ow aliases are already in the data-query LIST_JOIN, and the COUNT
+    // query's alias-detection below auto-adds their joins once they appear here.
+    // client_spoc_name / client_spoc are denormalised snapshots ON tbl_job (alias
+    // j) — captured at booking, shown in the "Client SPOC" column of the
+    // Unconfirmed + Pending-to-Scheduling tabs. They were displayed but NOT
+    // searchable; added here so a SPOC-name search matches. No new JOIN (alias j
+    // is always present), and since COUNT + data share this where/params the two
+    // OR terms apply to both.
+    clauses.push('(CAST(j.job_id AS CHAR) LIKE ? OR j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ? OR cl.client_name LIKE ? OR ci.city_name LIKE ? OR ef.efr_name LIKE ? OR ow.user_name LIKE ? OR j.client_spoc_name LIKE ? OR j.client_spoc LIKE ?)');
+    params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
   }
 
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -1123,6 +1937,17 @@ async function list({
       ${needsApc ? 'LEFT JOIN tbl_client_contacts apc ON apc.id      = j.approved_by_client_contact' : ''}
     `
     : LIST_JOIN;
+  // Server-side sort — see SORTABLE_COLUMNS at module scope for the whitelist
+  // and why sorting can't affect the COUNT join. hasOwnProperty guards against
+  // inherited keys ('constructor', '__proto__') reaching the SQL string even if
+  // a caller ever bypasses the Joi layer.
+  const sortCol = Object.prototype.hasOwnProperty.call(SORTABLE_COLUMNS, sortBy)
+    ? SORTABLE_COLUMNS[sortBy]
+    : undefined;
+  const sortDirSql = String(sortDir).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+  const orderBy = sortCol
+    ? `ORDER BY ${sortCol} ${sortDirSql}, j.job_id DESC`
+    : 'ORDER BY j.job_id DESC';
 
   // Run COUNT and data query in parallel — they're independent, no reason to
   // serialize. Roughly halves wall-clock time on cold caches.
@@ -1131,7 +1956,7 @@ async function list({
     pool.query(`SELECT COUNT(*) AS total ${countJoin} ${where}`, params),
     pool.query(
       `SELECT ${dataColumns} ${dataJoin} ${where}
-       ORDER BY j.job_id DESC LIMIT ? OFFSET ?`,
+       ${orderBy} LIMIT ? OFFSET ?`,
       dataParams
     ),
   ]);
@@ -1256,41 +2081,99 @@ async function listForExport(opts = {}) {
  * Services + images default to [] if the main row is missing — no point paying
  * for those lookups when we're about to 404.
  */
-async function getById(jobId) {
-  logger.info('Get job detail · id=' + jobId);
+/*
+ * getByIdCore — the job's DETAIL_JOIN scalar row ONLY (no services / images /
+ * videos sub-fetches). Callers that need just the job's own fields (scope
+ * assertion, candidate-ranking's enrichedJob, status/label reads) should use
+ * this: it skips the tbl_job_image lookup, which — with no index on
+ * tbl_job_image.job_id — full-scans ~1.4M rows (~1.1s) for images those paths
+ * never render. `getById` composes this with the three child lookups for the
+ * full detail payload.
+ *
+ * Returns null if the job row doesn't exist (same contract as getById's row).
+ */
+async function getByIdCore(jobId) {
   // Gate `cl.vertical_id` in the SELECT projection on column presence.
   // When the column isn't on this DB's tbl_client, fall back to a NULL
   // alias so the projection stays stable for downstream consumers
   // (image redirect endpoint reads `j.vertical_id` for scope assert).
-  // Without this gate, getById() throws "Unknown column" and EVERY
+  // Without this gate, the query throws "Unknown column" and EVERY
   // job-detail-dependent flow (view modal, image redirect, etc.)
   // 500s for this DB.
   const hasVerticalCol = await hasClientVerticalIdColumn();
   const verticalSelect = hasVerticalCol ? 'cl.vertical_id' : 'NULL AS vertical_id';
+  const hasAddrInstr = await hasAddressInstructionColumn();
+  const addrInstrSelect = hasAddrInstr ? 'ad.address_instruction' : 'NULL AS address_instruction';
+  // "Closed as enquiry" (status 7) reason — enquiry_* columns don't exist on
+  // every deploy, so probe before referencing enquiry_reason_id. enquiry_comment
+  // comes through j.* when present. cancel_by is the actor for enquiry too, so
+  // cancelled_by_name already covers "closed by".
+  const hasEnq = await hasEnquiryColumns();
+  const enquiryReasonSelect = hasEnq
+    ? `(SELECT atr.action_desc FROM action_taken_reason atr WHERE atr.id = j.enquiry_reason_id LIMIT 1) AS enquiry_reason_name`
+    : `NULL AS enquiry_reason_name`;
+  const [jobRows] = await pool.query(
+    `SELECT j.*,
+            cu.customer_name, cu.customer_mob_no, cu.customer_email,
+            ad.address, ad.building, ad.landmark, ad.locality, ad.pin_code,
+            ad.gps_location, ${addrInstrSelect}, ad.city_id, ci.city_name,
+            sc.service_catg_name AS service_category,
+            cl.client_name, cl.client_email, ${verticalSelect},
+            ef.efr_name AS easyfixer_name, ef.efr_no AS easyfixer_mobile,
+            ow.user_name AS owner_name,
+            cr.user_name AS created_by_name,
+            (SELECT u2.user_name FROM tbl_user u2 WHERE u2.user_id = j.cancel_by LIMIT 1) AS cancelled_by_name,
+            (SELECT atr.action_desc FROM action_taken_reason atr WHERE atr.id = j.cancel_reason_id LIMIT 1) AS cancel_reason_name,
+            /* From Production: enquiry reason, NULL-aliased on deploys that
+               predate the enquiry columns (hasEnquiryColumns probe above). */
+            ${enquiryReasonSelect}
+            /* Job Age — same two derived fields the LIST emits, from the SAME
+               constant, so the detail modal and the list row always agree.
+               JOB_AGE_COLUMNS is a LEADING-comma fragment, so the line above
+               must NOT end in one. */
+            ${JOB_AGE_COLUMNS}
+     ${DETAIL_JOIN}
+     WHERE j.job_id = ? LIMIT 1`,
+    [jobId]
+  );
+  const job = jobRows[0];
+  if (!job) { logger.warn('Job detail not found · id=' + jobId); return null; }
+  // Decode the custom-property fields folded into `remarks` on write so the
+  // Book-New-Call form repopulates them when a draft/job reopens (product_code
+  // + building_name are NOT tbl_job columns). branch_details is a real column
+  // and already present on the row.
+  const decodedProps = decomposeRemarks(job.remarks);
+  if (job.product_code == null) job.product_code = decodedProps.product_code || null;
+  if (job.building_name == null) job.building_name = decodedProps.building_name || null;
+  // Decode the flattened `custom_property` string (Label:Value|…, written by the
+  // client booking apps) into structured rows so the CRM Job Transaction view can
+  // prepopulate the client custom-property values on reopen. Pure string parse —
+  // no extra query — so getByIdCore stays lean for the scope/status hot paths.
+  job.custom_properties = parseCustomPropertyString(job.custom_property);
+  return job;
+}
 
-  const [jobRows, services, images] = await Promise.all([
-    pool.query(
-      `SELECT j.*,
-              cu.customer_name, cu.customer_mob_no, cu.customer_email,
-              ad.address, ad.building, ad.landmark, ad.locality, ad.pin_code,
-              ad.gps_location, ad.city_id, ci.city_name,
-              cl.client_name, cl.client_email, ${verticalSelect},
-              ef.efr_name AS easyfixer_name, ef.efr_no AS easyfixer_mobile,
-              ow.user_name AS owner_name,
-              cr.user_name AS created_by_name
-       ${DETAIL_JOIN}
-       WHERE j.job_id = ? LIMIT 1`,
-      [jobId]
-    ),
+async function getById(jobId) {
+  logger.info('Get job detail · id=' + jobId);
+
+  const [job, services, images] = await Promise.all([
+    getByIdCore(jobId),
     pool.query(
       // Return ALL service rows including soft-deleted (status=0). The FE
       // hides them by default but exposes a "Show Inactive" toggle that
       // lets the operator restore a row they removed by mistake. Filtering
       // them out here would deny the restore path. (Updated 2026-05-26.)
+      // ADDITIVE (2026-07-10): charge_type + effective_charge are NEW alias keys
+      // for the mobile order-detail (line price usually lives on the client-service
+      // row, not js.total_charge which is often 0, so the app showed every order as
+      // "Free"/blank). Existing columns — incl. js.total_charge the CRM reads — are
+      // unchanged, so the CRM Job Transaction view is unaffected.
       `SELECT js.job_service_id, js.service_id, js.quantity, js.total_charge,
               js.job_service_status, js.service_category_id, js.service_type_id,
               st.service_type_name, sc.service_catg_name,
-              CR.crc_ratecard_name AS service_name
+              CR.crc_ratecard_name AS service_name,
+              CS.charge_type,
+              COALESCE(NULLIF(js.total_charge, 0), CS.total_amount) AS effective_charge
          FROM tbl_job_services js
          LEFT JOIN tbl_service_type st ON st.service_type_id = js.service_type_id
          LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = js.service_category_id
@@ -1308,8 +2191,8 @@ async function getById(jobId) {
       [jobId]
     ),
   ]);
-  const job = jobRows[0][0];
-  if (!job) logger.warn('Job detail not found · id=' + jobId);
+  // getByIdCore already logged the not-found warn; bail before the child
+  // lookups (services/images were fetched in parallel but are discarded).
   if (!job) return null;
 
   // Customer-shared videos (via the WhatsApp conversational order-confirmation
@@ -1328,7 +2211,41 @@ async function getById(jobId) {
     );
     videos = vRows;
   }
-  return { ...job, services: services[0], images: images[0], videos };
+  /*
+   * billing_label — per-service Free/Paid, derived (not stored). ADDITIVE
+   * 2026-07-15 for the Schedule & Assign modal's per-service Free/Paid chip.
+   *
+   * Same rule as the customer-facing magic-link bundle (job-magic-link.service.js
+   * fetchPrefill: `total_amount null or 0 → 'Free', else 'Paid'`) so Free/Paid
+   * means exactly one thing on every surface. Keyed off `effective_charge` —
+   * the COALESCE(NULLIF(js.total_charge,0), CS.total_amount) alias above —
+   * because js.total_charge is usually 0 and the real price sits on the
+   * client-service row (that mismatch is what made the mobile app render every
+   * order as "Free"; see the comment on the SELECT).
+   *
+   * ⚠ Free/Paid is billing_label, and it is PER-SERVICE. It is NOT collected_by
+   * — that's a per-JOB enum for WHO collects the money (1=Easyfixer, 2=Easyfix,
+   * 3=Client) and lives on tbl_job. Neither tbl_job_services nor
+   * tbl_client_service carries a collected-by column.
+   */
+  const shapedServices = (services[0] || []).map((s) => ({
+    ...s,
+    billing_label:
+      (s.effective_charge == null || Number(s.effective_charge) === 0) ? 'Free' : 'Paid',
+  }));
+
+  // Resolve each stored image (an S3 key like `JobSupportings/Booking_<id>_<seq>`
+  // or a legacy filename) into a directly-renderable URL: a short-lived S3
+  // presigned URL when the object is in the bucket, else the legacy media-host
+  // URL. The app renders `image_url` and no longer guesses the path itself.
+  const s3Storage = require('../utils/s3-storage');
+  const shapedImages = await Promise.all((images[0] || []).map(async (im) => {
+    let image_url = null;
+    try { image_url = await s3Storage.resolveImageUrl(im.image); } catch { image_url = null; }
+    return { ...im, image_url };
+  }));
+
+  return { ...job, services: shapedServices, images: shapedImages, videos };
 }
 
 /*
@@ -1348,7 +2265,13 @@ async function getJobMeta(jobId) {
   // exists, but explicitly emitting NULL keeps the shape stable.
   const otpCol = (await hasOtpColumn()) ? 'otp' : 'NULL AS otp';
   const [[row]] = await pool.query(
-    `SELECT job_id, job_status, fk_easyfixter_id, fk_customer_id, fk_client_id, ${otpCol} FROM tbl_job WHERE job_id = ? LIMIT 1`,
+    // requested_date_time as a STRING (DATE_FORMAT) so setStatus's slot
+    // derivation reads the IST wall-clock hour regardless of connection tz;
+    // booking_cut_off_time_slot so the BOOKED confirm can COALESCE-backfill it.
+    `SELECT job_id, job_status, fk_easyfixter_id, fk_customer_id, fk_client_id,
+            DATE_FORMAT(requested_date_time, '%Y-%m-%d %H:%i:%s') AS requested_date_time,
+            booking_cut_off_time_slot, ${otpCol}
+       FROM tbl_job WHERE job_id = ? LIMIT 1`,
     [jobId]
   );
   return row || null;
@@ -1367,7 +2290,7 @@ async function getJobMeta(jobId) {
  * side sum — we use client-side sum because MySQL 5.7's WITH ROLLUP syntax is
  * fussy and the row count is always tiny (≤ 10 status codes).
  */
-async function getStatusCounts({ ownerId, easyfixerId, scope } = {}) {
+async function getStatusCounts({ ownerId, easyfixerId, scope, allowedStages } = {}) {
   logger.info('Compute job status counts · ownerId=' + (ownerId ?? '-') + ' · easyfixerId=' + (easyfixerId ?? '-'));
   /*
    * Two queries run in parallel:
@@ -1436,6 +2359,20 @@ async function getStatusCounts({ ownerId, easyfixerId, scope } = {}) {
     if (v && v.mode === 'allow' && v.ids.length && hasVerticalCol) {
       clauses.push(`cl.vertical_id IN (${v.ids.map(() => '?').join(',')})`);
       params.push(...v.ids);
+    }
+  }
+
+  // Job Stage Access — same intersection as list() so tab counts respect the
+  // caller's visible stages. Added to the shared `clauses`, so it flows into
+  // BOTH the GROUP BY status query and the BOOKED-split query (a user who can't
+  // see the pending-scheduling stage gets 0 for the booked buckets too).
+  if (allowedStages && allowedStages.mode === 'list') {
+    const visible = [...stageVisibleStatuses(allowedStages.stages)];
+    if (visible.length === 0) {
+      clauses.push('1=0');
+    } else {
+      clauses.push(`j.job_status IN (${visible.map(() => '?').join(',')})`);
+      params.push(...visible);
     }
   }
 
@@ -1523,7 +2460,7 @@ async function getStatusCounts({ ownerId, easyfixerId, scope } = {}) {
  * (Admin/Finance) see the full count; scoped users see only their
  * hierarchy-unioned slice.
  */
-async function getAttentionSummary({ scope } = {}) {
+async function getAttentionSummary({ scope, allowedStages } = {}) {
   const hasVerticalCol = await hasClientVerticalIdColumn();
   // OFFER MODEL: when tbl_job_offer exists, "pending tech accept" keys off an
   // OPEN offer EXISTS rather than the fk (a pool-offered job keeps fk NULL).
@@ -1562,6 +2499,18 @@ async function getAttentionSummary({ scope } = {}) {
       if (v && v.mode === 'allow' && v.ids.length && hasVerticalCol) {
         clauses.push(`cl.vertical_id IN (${v.ids.map(() => '?').join(',')})`);
         params.push(...v.ids);
+      }
+    }
+    // Job Stage Access — intersect every tile's own status predicate with the
+    // caller's visible-status union so the tiles respect the same restriction
+    // as the list + counts. References only the job alias → no extra join.
+    if (allowedStages && allowedStages.mode === 'list') {
+      const visible = [...stageVisibleStatuses(allowedStages.stages)];
+      if (visible.length === 0) {
+        clauses.push('1=0');
+      } else {
+        clauses.push(`${jobAlias}.job_status IN (${visible.map(() => '?').join(',')})`);
+        params.push(...visible);
       }
     }
     // Same JOIN strategy as getStatusCounts: tbl_address needed
@@ -1655,19 +2604,29 @@ async function getAttentionSummary({ scope } = {}) {
   //    accepted_at flag yet (per dashboard comment).
   const pendingTechAcceptPromise = (async () => {
     const f = buildScopeFragment('j');
-    // OFFER MODEL: a job awaiting tech acceptance now has an OPEN offer rather
-    // than a set fk. Fall back to the legacy fk-NOT-NULL proxy on un-migrated
-    // deploys (offer table absent).
-    const acceptClause = hasJobOffer
-      ? 'EXISTS (SELECT 1 FROM tbl_job_offer jo WHERE jo.job_id = j.job_id AND jo.offer_status = 0)'
-      : 'j.fk_easyfixter_id IS NOT NULL';
+    /*
+     * OFFER MODEL: a job awaiting tech acceptance now has an EFFECTIVELY OPEN
+     * offer rather than a set fk. Fall back to the legacy fk-NOT-NULL proxy on
+     * un-migrated deploys (offer table absent).
+     *
+     * Uses the SHARED offer-state builder, not a hand-written
+     * `EXISTS(offer_status = 0)`. The naive form counts rows the expiry sweep
+     * has not reached yet, so with expiry ON this tile disagreed with the
+     * "Offered to Tx" chip and filter on exactly the stale offers the operator
+     * is chasing. One builder = one definition of "open" across dashboard,
+     * chip and filter, in BOTH expiry regimes.
+     */
+    const openOffer = offerRowExists('live', 'jo', { bind: true, expiry: offerExpiryEnabled() });
+    const acceptClause = hasJobOffer ? openOffer.sql : 'j.fk_easyfixter_id IS NOT NULL';
     const where = ['j.job_status = 0',
                    acceptClause,
                    ...f.clauses].join(' AND ');
     return safeCount(
       'pendingTechAccept',
       `SELECT COUNT(*) AS c FROM tbl_job j ${f.joins} WHERE ${where}`,
-      f.params,
+      // The offer predicate's placeholders come FIRST — it is spliced into the
+      // WHERE ahead of the scope fragment's clauses.
+      hasJobOffer ? [...openOffer.params, ...f.params] : f.params,
     );
   })();
 
@@ -1834,6 +2793,70 @@ function composeRemarks(input) {
 }
 
 /*
+ * decomposeRemarks — inverse of composeRemarks. Pulls product_code +
+ * building_name back OUT of the `remarks` prefix lines so the Book-New-Call
+ * form can repopulate those fields when a draft reopens (they aren't real
+ * tbl_job columns, so SELECT j.* can't surface them). Non-destructive: we do
+ * NOT strip the prefixes from `remarks` here — the write paths keep the
+ * composed string intact, so re-saving a reopened job never loses or
+ * double-encodes the values.
+ */
+function decomposeRemarks(raw) {
+  const s = raw == null ? '' : String(raw);
+  let product_code = '';
+  let building_name = '';
+  for (const line of s.split('\n')) {
+    let m = line.match(/^\[Product Code\]\s?(.*)$/);
+    if (m) { product_code = m[1].trim(); continue; }
+    m = line.match(/^\[Building \/ Property\]\s?(.*)$/);
+    if (m) { building_name = m[1].trim(); continue; }
+  }
+  return { product_code, building_name };
+}
+
+/*
+ * parseCustomPropertyString — decode the flattened `tbl_job.custom_property`
+ * VARCHAR(510) column back into structured rows so the CRM Job Transaction view
+ * (JobTransactionView reads `job.custom_properties`) prepopulates the client
+ * custom-property values a SPOC entered at booking.
+ *
+ * The client booking apps compose this column as `Label:Value|Label:Value`,
+ * keyed by the property's display LABEL, dropping empties
+ * (Easyfix_client_UI src/app/(authed)/jobs/new/page.tsx and Easyfix_Client_App
+ * app/jobs/new.tsx); createJob stores it verbatim. Nothing ever parsed it back,
+ * so previously-entered values rendered blank on reopen — this is the inverse.
+ *
+ * Rules mirror the writers + the legacy data quirks seen in the DB:
+ *  - split on '|', then on the FIRST ':' only (so a value like "12:30" survives)
+ *  - `(NULL)` (legacy Java `String.valueOf(null)` sentinel) and a literal `null`
+ *    value → unset
+ *  - degenerate `null:` / empty-label tokens are dropped
+ *  - only rows with a real value are returned (matches the writer's empty-drop,
+ *    keeps legacy `Store Name:(NULL)|Ageing:(NULL)` noise out of the view)
+ * Pure string parse — no DB round-trip — so callers (incl. the lean getByIdCore
+ * hot path) pay nothing. Returns [] for null/empty/'null'.
+ */
+function parseCustomPropertyString(raw) {
+  if (raw == null) return [];
+  const s = String(raw).trim();
+  if (!s || s.toLowerCase() === 'null') return [];
+  const out = [];
+  for (const token of s.split('|')) {
+    const seg = token.trim();
+    if (!seg) continue;
+    const idx = seg.indexOf(':');
+    if (idx === -1) continue;
+    const label = seg.slice(0, idx).trim();
+    let value = seg.slice(idx + 1).trim();
+    if (!label || label.toLowerCase() === 'null') continue;
+    if (value === '(NULL)' || value.toLowerCase() === 'null') value = '';
+    if (!value) continue;
+    out.push({ name: label.toLowerCase().replace(/\s+/g, ' ').trim(), label, value });
+  }
+  return out;
+}
+
+/*
  * Rebuild tbl_job.client_services CSV from current ACTIVE tbl_job_services
  * rows. Called from every job-services mutator (create + update + magic-link
  * acceptSubmission) so the flat legacy column stays in sync with the
@@ -1858,83 +2881,13 @@ async function recomputeClientServicesCsv(conn, jobId) {
   );
 }
 
-async function insertAddress(conn, customerId, addr, actor) {
-  // Column-presence probe — production tbl_address may or may not carry
-  // the `address_instruction` column depending on deploy. We branch the
-  // INSERT shape so older DBs aren't broken by an unknown column.
-  let hasInstruction = false;
-  try {
-    const [cols] = await conn.query(
-      `SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = DATABASE()
-          AND TABLE_NAME   = 'tbl_address'
-          AND COLUMN_NAME  = 'address_instruction'
-        LIMIT 1`,
-    );
-    hasInstruction = cols.length > 0;
-  } catch (_e) { /* defensively assume absent on probe failure */ }
-
-  // is_instruction_added — legacy "does this address carry notes?" flag.
-  //
-  // 2026-06-03: per ops, this column must stay 0 even when
-  // `address_instruction` is non-empty. Previously we kept it in sync
-  // with the text content (1 when filled, 0 when blank), but that
-  // collided with downstream legacy logic that uses the flag as a
-  // gate (rule TBD). Persisting 0 unconditionally is the agreed
-  // invariant; the actual text still lives in `address_instruction`
-  // and is the canonical source for reads. We retain the `hasInstructionText`
-  // local in case future flows need it — but it no longer drives the column.
-  const hasInstructionText = addr.address_instruction != null
-    && String(addr.address_instruction).trim() !== '';
-  // Silence the unused-binding hint for the local — the comment above
-  // documents why it's kept around for future readers.
-  void hasInstructionText;
-
-  let addressId;
-  if (hasInstruction) {
-    const [ins] = await conn.query(
-      `INSERT INTO tbl_address
-         (customer_id, address, building, landmark, locality, city_id, pin_code, gps_location,
-          mobile_number, address_instruction, is_instruction_added,
-          created_by, insert_date, update_date)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        customerId,
-        addr.address, addr.building || null, addr.landmark || null, addr.locality || null,
-        addr.city_id, addr.pin_code, addr.gps_location || null,
-        addr.mobile_number || null, addr.address_instruction || null,
-        // is_instruction_added pinned to 0 per ops (2026-06-03) —
-        // see the docblock above hasInstructionText for the rationale.
-        0,
-        actor?.user_id || null,
-        new Date(), new Date(),
-      ]
-    );
-    addressId = ins.insertId;
-  } else {
-    // Fallback path (legacy DBs) — address_instruction silently dropped.
-    const [ins] = await conn.query(
-      `INSERT INTO tbl_address
-         (customer_id, address, building, landmark, locality, city_id, pin_code, gps_location,
-          mobile_number, created_by, insert_date, update_date)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        customerId,
-        addr.address, addr.building || null, addr.landmark || null, addr.locality || null,
-        addr.city_id, addr.pin_code, addr.gps_location || null,
-        addr.mobile_number || null, actor?.user_id || null,
-        new Date(), new Date(),
-      ]
-    );
-    addressId = ins.insertId;
-  }
-
-  // Free-text instruction is persisted directly on tbl_address.address_instruction
-  // via the column-probe branch above — no companion-table write needed
-  // (2026-06-04 simplification: dropped the `address_instruction` legacy
-  // table writes in favour of a single column on tbl_address).
-  return addressId;
-}
+// The INSERT itself (column-probe branch + the is_instruction_added invariant)
+// lives in address.service — tbl_address is shared/polymorphic and every writer
+// has to probe it the same way. Free-text instruction is persisted directly on
+// tbl_address.address_instruction, no companion-table write needed (2026-06-04
+// simplification: dropped the legacy `address_instruction` table writes in
+// favour of a single column on tbl_address).
+const insertAddress = addressService.insertCustomerAddress;
 
 // ─── Create ─────────────────────────────────────────────────────────
 async function create(input, actor) {
@@ -1995,11 +2948,19 @@ async function create(input, actor) {
     const originalApptTime = input.original_appointment_time      || requestedTime || null;
 
     // collected_by: per-job preference. Integer enum (1=Easyfixer,
-    // 2=Easyfix, 3=Client) — accept strings/numbers from FE and coerce.
+    // 2=Easyfix, 3=Client) — accept numbers or numeric strings from the FE.
+    //
+    // A NON-numeric string (e.g. a label like 'Easyfix' the FE forgot to code)
+    // must fall to NULL, NOT be written verbatim: the column is INT, so MySQL
+    // silently coerces 'Easyfix' → 0, and 0 = "Any" blocks the job from ever
+    // checking out. NULL is an honest "unset" and doesn't masquerade as a real
+    // choice. (The FE codes this correctly; this is defence against the next
+    // caller that doesn't — a real bug shipped exactly this way, see the Book
+    // New Call per-tab override in JobModal.)
     let collectedBy = null;
     if (input.collected_by != null && input.collected_by !== '') {
       const n = Number(input.collected_by);
-      collectedBy = Number.isFinite(n) ? n : String(input.collected_by);
+      collectedBy = Number.isFinite(n) ? n : null;
     }
 
     // Resolve the effective initial status once so the OTP gate below
@@ -2103,6 +3064,55 @@ async function create(input, actor) {
     // on the deploy. Two paths to keep the column list + placeholder
     // count + values array perfectly aligned (mismatched lengths here
     // produced silent NULL writes pre-refactor in some legacy ports).
+    // Normalise Branch Details to the dedicated column across ALL booking
+    // surfaces. The CRM sends `branch_details` directly, but the client web/
+    // mobile apps fold every custom prop (incl. branch) into the flattened
+    // `custom_property` string. If branch_details wasn't set but a branch token
+    // is present in custom_property, hoist its value into branch_details and
+    // strip it from the string so reports/views reading tbl_job.branch_details
+    // stay consistent regardless of where the job was booked.
+    if ((input.branch_details == null || String(input.branch_details).trim() === '') && input.custom_property) {
+      const isBranchKey = (s) => {
+        const k = String(s || '').toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
+        return k === 'branch' || k === 'branch details';
+      };
+      const decoded = parseCustomPropertyString(input.custom_property);
+      const hit = decoded.find((p) => isBranchKey(p.name) || isBranchKey(p.label));
+      if (hit && hit.value) {
+        input.branch_details = hit.value;
+        const rest = decoded.filter((p) => p !== hit).map((p) => `${p.label || p.name}:${p.value}`);
+        input.custom_property = rest.length ? rest.join('|') : null;
+      }
+    }
+
+    // Server-side mandatory enforcement for Branch Details (belt-and-braces over
+    // the FE gate — blocks API-direct / tampered / bulk bookings that skip it).
+    // Fires ONLY for clients configured branch-mandatory in Manage Clients (a
+    // mandatory `branch_details` custom-property row), so every other client and
+    // non-branch flow is untouched. Runs AFTER the hoist above, so a branch value
+    // supplied via the custom_property string already satisfies it.
+    // The mobile Client App does not collect custom properties at all, so the
+    // branch-mandatory gate can never be satisfied there — skip it for that
+    // surface only. CRM / client-web bookings keep the enforcement.
+    const isClientApp = String(input.source_type || '').toLowerCase() === 'client_app';
+    if (!isClientApp && input.fk_client_id && (input.branch_details == null || String(input.branch_details).trim() === '')) {
+      let clientProps = [];
+      try {
+        clientProps = await require('./client.service').listCustomProperties(input.fk_client_id);
+      } catch (_e) { clientProps = []; }
+      const isBranchKey = (s) => {
+        const k = String(s || '').toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
+        return k === 'branch' || k === 'branch details';
+      };
+      const truthy = (v) => v === 1 || v === '1' || v === true || String(v).toLowerCase() === 'true';
+      const branchRow = clientProps.find((r) => isBranchKey(r.property_name ?? r.c_prop_name ?? r.name));
+      if (branchRow && truthy(branchRow.is_mandatory ?? branchRow.c_prop_mandatory ?? branchRow.mandatory ?? branchRow.required)) {
+        const err = new Error('Branch Details is required for this client.');
+        err.status = 400; err.code = 'BRANCH_DETAILS_REQUIRED';
+        throw err;
+      }
+    }
+
     const sharedCols = `
          job_desc, fk_customer_id, fk_address_id, fk_client_id,
          fk_service_type_id, fk_service_catg_id, service_type_ids,
@@ -2124,7 +3134,16 @@ async function create(input, actor) {
         customerId, addressId, input.fk_client_id,
         input.fk_service_type_id || null, input.fk_service_catg_id || null, serviceTypeIds,
         input.reporting_contact_id || null,
-        requestedDateTime, requestedTime, input.time_slot || null, input.booking_cut_off_time_slot || null,
+        requestedDateTime, requestedTime,
+        // time_slot is ALWAYS one of the four broad bands. The appointment time
+        // decides it (the band CONTAINING requested_date_time) — a caller-sent
+        // label only matters for a date-only booking, where it is canonicalised
+        // rather than stored verbatim. That is what stops a 1-hour frame label
+        // (or any of the ~12 legacy vocabularies) from landing in the column.
+        // booking_cut_off_time_slot stays on its own legacy "H AM - H PM"
+        // derivation — nothing matches on it.
+        resolveTimeSlot(input.time_slot, requestedDateTime),
+        input.booking_cut_off_time_slot || deriveBookingCutoffSlot(requestedDateTime),
         new Date(), new Date(),
         // fk_created_by (2026-06-04): explicit Number() coercion. JWT
         // claims encode `user_id` as a string (see CLAUDE.md "Auth
@@ -2230,6 +3249,10 @@ async function create(input, actor) {
       }
     }
 
+    // Snapshot the owner's phone into job_primary_spoc (legacy-compat; no-op
+    // where the column is absent). Owner = explicit input else the operator.
+    await stampJobPrimarySpoc(jobId, input.job_owner || actor?.user_id || null, conn);
+
     if (Array.isArray(input.services) && input.services.length > 0) {
       // Batch-load rate-card rows for all picked services in ONE query
       // (avoids N+1) — then compute the 5 charge columns per row via
@@ -2322,7 +3345,15 @@ async function create(input, actor) {
         const logger = require('../logger');
         logger.warn(`Auto-assign on create failed for job ${jobId}: ${err.message}`);
       });
+      // Best-effort, post-commit: add this job's pincode to the pincode catalog
+      // (geocoded) if it's new. Idempotent + never throws — see ensureJobPincode.
+      ensureJobPincode(input.address?.pin_code, actor);
     });
+    // NOTE: enquiry WhatsApp is intentionally NOT fired here for a direct
+    // book-as-ENQUIRY (initial_status=7). create() never stamps
+    // enquiry_reason_id, so this path would send a blank-reason template; and
+    // legacy only notified on the "mark as Enquiry" transition. The CRM books
+    // at BOOKED(0) then transitions via setStatus(7) — see the setStatus hook.
 
     return getById(jobId);
   } catch (e) {
@@ -2422,6 +3453,60 @@ async function update(jobId, input, actor) {
   if (input.requested_date_time !== undefined && input.requested_time === undefined) {
     input.requested_time = formatTimeIST(input.requested_date_time);
   }
+  /*
+   * time_slot is a BAND, never the 1-hour frame the picker offers (see
+   * services/time-slot.js). PATCH is a live slot writer — the Confirm &
+   * Schedule modal edits the appointment through here — so the same
+   * writer-side gate create()/assign()/reschedule() use applies. Normalised
+   * against the SAME datetime projection the SET loop below will store, so the
+   * two columns can never disagree.
+   *
+   * ⚠ ONLY ON A REAL EDIT. JobModal sends `requested_date_time` AND `time_slot`
+   * on EVERY non-outcome PATCH, touched or not — so re-deriving unconditionally
+   * turned an open-and-save-nothing into a silent slot rewrite: a job holding
+   * the legacy 'Morning 9 to 2' at 10:00 came back as '9AM to 12PM', narrowing a
+   * 5-hour promise to a 3-hour one with no operator action. That breaks the
+   * backward-compatibility contract both new modules state as mandatory
+   * (src/lib/job-slots.ts: "an untouched open-and-save must persist it
+   * unchanged"; JobModal's load-time heal deliberately leaves a non-empty slot
+   * alone for the same reason).
+   *
+   * So we compare against what is STORED and re-derive only when the caller
+   * actually moved the appointment or actually picked a different slot. A
+   * no-op save drops time_slot out of the patch entirely — the column is not
+   * even written. Historical rows are never migrated by a side effect.
+   */
+  if (input.time_slot !== undefined || input.requested_date_time !== undefined) {
+    const projectedDt = input.requested_date_time !== undefined
+      ? combineDateTime(input.requested_date_time, null)
+      : null;
+    // Both stored values come back from getById() as IST wall-clock literals
+    // (dateStrings:true). Compared to MINUTE precision: no picker in the app
+    // emits seconds, but legacy rows carry them, and a stray ':30' must not read
+    // as "the operator moved the appointment".
+    const toMinute   = (v) => (v ? String(v).slice(0, 16) : null);
+    const storedDt   = existing.requested_date_time ? String(existing.requested_date_time) : null;
+    const storedSlot = existing.time_slot == null ? '' : String(existing.time_slot).trim();
+    const dtMoved    = projectedDt != null && toMinute(projectedDt) !== toMinute(storedDt);
+    const slotPicked = input.time_slot !== undefined
+      && String(input.time_slot ?? '').trim() !== storedSlot;
+    if (dtMoved) {
+      // The appointment moved: the band is a function of the time, so it moves
+      // with it and any label the caller echoed is discarded.
+      const band = resolveTimeSlot(input.time_slot, projectedDt);
+      if (band != null) input.time_slot = band;
+    } else if (slotPicked) {
+      // The operator deliberately picked a DIFFERENT slot without moving the
+      // appointment. Honour that pick — canonicalised where we can read it,
+      // verbatim otherwise. Deriving from the (unchanged) stored datetime here
+      // would store neither what they picked nor what was there.
+      const band = resolveTimeSlot(input.time_slot, null);
+      if (band != null) input.time_slot = band;
+    } else if (input.time_slot !== undefined) {
+      // Untouched echo of the stored value — leave the column entirely alone.
+      delete input.time_slot;
+    }
+  }
   for (const col of MUTABLE_COLUMNS) {
     if (input[col] !== undefined) {
       sets.push(`${col} = ?`);
@@ -2477,8 +3562,17 @@ async function update(jobId, input, actor) {
 
     if (sets.length > 0) {
       if (isStructuralEdit) {
-        sets.push('last_update_time = ?');
-        const scalarValues = [...values, new Date(), jobId];
+        // created_date_time = the Book-Now moment. PUT/PATCH /:id is ONLY the
+        // booking-form submit — reschedule / assign / status / owner / hold each
+        // have their own route that never reaches update() — so re-stamping it
+        // here means "when the order was (re)booked". For a bulk-uploaded row
+        // that is when ops actually confirms it via Confirm & Schedule (also a
+        // PATCH /:id); its ticket_created_date_time stays the upload time.
+        // Gated on a STRUCTURAL edit, exactly like last_update_time: a
+        // remarks-only quick-note is not a booking and must move neither stamp.
+        const bookedAt = new Date();
+        sets.push('last_update_time = ?', 'created_date_time = ?');
+        const scalarValues = [...values, bookedAt, bookedAt, jobId];
         await conn.query(`UPDATE tbl_job SET ${sets.join(', ')} WHERE job_id = ?`, scalarValues);
       } else {
         // Comment-only path — write the remarks/efr_special_notes without
@@ -2560,31 +3654,47 @@ async function update(jobId, input, actor) {
       if (input.address.gps_location !== undefined) { addrSets.push('gps_location = ?'); addrVals.push(input.address.gps_location || null); }
       // address_instruction is column-probed per the matching guard in
       // insertAddress(). We skip the SET if the column doesn't exist on
-      // the deploy so the UPDATE doesn't fail with Unknown column. When
-      // the column IS present, we also flip is_instruction_added in lock-
-      // step so the legacy "has notes?" flag stays in sync with the text
-      // (legacy CRM views/reports filter on this flag).
+      // the deploy so the UPDATE doesn't fail with Unknown column.
+      // Probed uncached on the txn conn, and a probe failure ABORTS this
+      // edit rather than degrading it — dropping an operator's instruction
+      // text silently is worse here than rolling the whole update back.
       if (input.address.address_instruction !== undefined) {
-        const [cols] = await conn.query(
-          `SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE()
-              AND TABLE_NAME   = 'tbl_address'
-              AND COLUMN_NAME  = 'address_instruction'
-            LIMIT 1`,
-        );
-        if (cols.length > 0) {
-          // 2026-06-03: per ops, `is_instruction_added` must stay 0 even
-          // when the text is non-empty (see insertAddress for full
-          // rationale). We still WRITE the column on update so a row
-          // that was previously flipped to 1 by older code resets to 0
-          // — leaving stale 1s in place would defeat the invariant.
+        const hasAddrInstr = await addressService.hasAddressInstructionColumn(conn, {
+          cache: false,
+          onProbeError: 'throw',
+        });
+        if (hasAddrInstr) {
+          // is_instruction_added is pinned to 0, NOT kept in sync with the
+          // text — see address.service IS_INSTRUCTION_ADDED for the ops
+          // rationale. We still WRITE it so a row previously flipped to 1
+          // by older code resets to 0.
           addrSets.push('address_instruction = ?');
           addrVals.push(input.address.address_instruction || null);
           addrSets.push('is_instruction_added = ?');
-          addrVals.push(0);
+          addrVals.push(addressService.IS_INSTRUCTION_ADDED);
         }
       }
       if (addrSets.length > 0) {
+        // Preserve the CLIENT-ENTERED address BEFORE we overwrite tbl_address in
+        // place. tbl_job.client_entered_address is a pending EasyFix column, so
+        // guard on its presence (no-op where the migration hasn't run). Capture
+        // only on the FIRST edit (IS NULL) so later edits don't clobber the
+        // original the client/portal booked with. No change needed in the old
+        // Client Dashboard — we snapshot at the moment the new CRM edits.
+        const [ceCols] = await conn.query(
+          `SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tbl_job'
+              AND COLUMN_NAME = 'client_entered_address' LIMIT 1`
+        );
+        if (ceCols.length > 0) {
+          await conn.query(
+            `UPDATE tbl_job j
+               JOIN tbl_address a ON a.address_id = j.fk_address_id
+                SET j.client_entered_address = a.address
+              WHERE j.job_id = ? AND j.client_entered_address IS NULL AND a.address IS NOT NULL`,
+            [existing.job_id]
+          );
+        }
         addrVals.push(existing.fk_address_id);
         await conn.query(`UPDATE tbl_address SET ${addrSets.join(', ')} WHERE address_id = ?`, addrVals);
       }
@@ -2692,7 +3802,14 @@ async function update(jobId, input, actor) {
     // customer, address). Downstream consumers (webhooks, audit) see the
     // nested edit as a meaningful change to the job record.
     if (sets.length === 0 && (hasServicesEdit || hasCustomerEdit || hasAddressEdit)) {
-      await conn.query('UPDATE tbl_job SET last_update_time = ? WHERE job_id = ?', [new Date(), jobId]);
+      // Nested-only booking edit (services/customer/address changed, no scalar
+      // column). Stamp created_date_time = the Book-Now moment alongside
+      // last_update_time — same rationale as the scalar branch above.
+      const bookedAt = new Date();
+      await conn.query(
+        'UPDATE tbl_job SET last_update_time = ?, created_date_time = ? WHERE job_id = ?',
+        [bookedAt, bookedAt, jobId],
+      );
     }
 
     await conn.commit();
@@ -2704,6 +3821,10 @@ async function update(jobId, input, actor) {
   } finally {
     conn.release();
   }
+  // Post-commit, best-effort: ensure a newly-set/changed pincode is in the
+  // pincode catalog (geocoded). Only when the address — including a pincode —
+  // was part of this edit (e.g. the bulk-upload Confirm & Schedule step).
+  if (hasAddressEdit && input.address?.pin_code) ensureJobPincode(input.address.pin_code, actor);
   return getById(jobId);
 }
 
@@ -2900,8 +4021,11 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
   const actorId = actor?.user_id || null;
 
   if (Number(status) === STATUS.CANCELLED) {
-    sets.push('cancel_date_time = ?', 'cancel_reason_id = ?', 'cancel_comment = ?', 'cancel_by = ?');
-    values.push(new Date(), reasonId || null, comment || null, actorId);
+    // enum_reason_id mirrors the picked action_taken_reason id — the same column
+    // the job-comment History JOIN resolves against — so the cancel reason renders
+    // there; cancel_reason_id keeps the legacy cancel-audit column populated too.
+    sets.push('cancel_date_time = ?', 'cancel_reason_id = ?', 'cancel_comment = ?', 'cancel_by = ?', 'enum_reason_id = ?');
+    values.push(new Date(), reasonId || null, comment || null, actorId, reasonId || null);
   } else if (Number(status) === STATUS.CALL_LATER) {
     // UNREACHABLE / CALL_LATER outcome — set the call_later flag (if
     // the column exists) and stamp `cancel_by` so the audit trail
@@ -2975,6 +4099,28 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
       sets.push('fk_created_by = COALESCE(fk_created_by, ?)');
       values.push(bookedActorId);
     }
+    /*
+     * eta_status (ops 2026-07-08): order confirmation lands the job as '01' —
+     * the platform's "booked/confirmed" sentinel (verified: status-0 rows are
+     * overwhelmingly '01'; the later '11' is stamped downstream as the job
+     * progresses). create() already writes '01' on Book-New-Call; this covers
+     * the OTHER booking entry point — Book Now / Confirm & Schedule (9 → 0).
+     * (Supersedes the earlier "update paths must never touch eta_status" note:
+     * this is setStatus, and the confirm transition is a booking action.)
+     */
+    sets.push('eta_status = ?');
+    values.push('01');
+    /*
+     * booking_cut_off_time_slot backfill: unconfirmed rows (often website /
+     * integration sourced) frequently arrive with the named time_slot but a
+     * NULL cut-off window. Derive it from the appointment time on confirm so
+     * BOTH slot columns are populated. COALESCE keeps any value already set.
+     */
+    const cutoffSlot = deriveBookingCutoffSlot(existing.requested_date_time);
+    if (cutoffSlot) {
+      sets.push('booking_cut_off_time_slot = COALESCE(booking_cut_off_time_slot, ?)');
+      values.push(cutoffSlot);
+    }
   } else if (COMPLETED_STATES.has(Number(status))) {
     sets.push('checkout_date_time = COALESCE(checkout_date_time, ?)', 'fk_checkout_by = COALESCE(fk_checkout_by, ?)');
     values.push(new Date(), actorId);
@@ -3013,6 +4159,81 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
   logger.info('Job status updated · id=' + jobId + ' · ' + existing.job_status + '->' + Number(status) + (eventName ? ' · event=' + eventName : ''));
   if (eventName) fireWebhook(eventName, jobId);
 
+  // Enquiry WhatsApp (2026-07-09): ENQUIRY has no status→event mapping
+  // (statusToEventName returns null), so fire the customer + SPOC WhatsApp
+  // directly on the "mark as Enquiry" TRANSITION (the sole trigger — see the
+  // create() note above). Guard on a real transition INTO enquiry so a 7→7
+  // re-submit doesn't double-send. Fire-and-forget — never blocks the
+  // response. Runs after the UPDATE above, so enquiry_reason_id /
+  // enquiry_date_time are already persisted when the send reads them.
+  if (Number(status) === STATUS.ENQUIRY && Number(existing.job_status) !== STATUS.ENQUIRY) {
+    require('./enquiry-notification.service').fireEnquiryWhatsapp(jobId);
+  }
+
+  // Cancel audit comment (2026-07-27): mirror Add Remarks — record the
+  // cancellation on the job comment / History timeline so it isn't only in the
+  // cancel_* columns. comment_on = 1 is the lifecycle/audit bucket (no cancel-
+  // specific stage code exists; reschedule + Add Remarks use 1 too). Guard on a
+  // real transition INTO cancelled so a 6→6 re-submit doesn't double-write. The
+  // reason renders in History via enum_reason_id. Non-fatal — a comment failure
+  // must never block the cancellation (the UPDATE above already persisted it).
+  if (Number(status) === STATUS.CANCELLED && Number(existing.job_status) !== STATUS.CANCELLED) {
+    try {
+      await require('./job-comment.service').addComment(jobId, {
+        comments: (comment && String(comment).trim()) || 'Job cancelled',
+        comment_on: 1,
+        commented_by: actorId,
+        enum_reason_id: reasonId || null,
+      });
+    } catch (e) {
+      logger.warn('Cancel audit comment failed (non-fatal) · id=' + jobId + ' · ' + e.message);
+    }
+
+    /*
+     * Cancelling KILLS every still-open offer (2026-07-29). Without this, the
+     * OFFERED rows survived until the 30-min TTL swept them, so for up to half
+     * an hour after a cancellation the CRM list projection (offerColumns():
+     * is_offered / offered_count / offered_efr_name) still reported a LIVE offer
+     * on a dead job, and the technician could still see and act on it.
+     *
+     * Same expire shape as acceptOffer() / reschedule(): offer_status → EXPIRED
+     * with responded_at stamped. Idempotent — `offer_status = OFFERED` in the
+     * WHERE means the TTL sweep can never double-expire these — and scoped to
+     * the INTO-cancelled transition by the guard above, so a 6→6 re-submit
+     * doesn't re-stamp responded_at on rows this already closed.
+     *
+     * NOT transactional, deliberately: setStatus writes through the shared pool
+     * with no transaction (see the UPDATE above), so there is no connection to
+     * enlist — this is a second statement on the same pool, issued only after
+     * the cancellation itself has already committed. Non-fatal for the same
+     * reason: the job IS cancelled, and a failure here must never surface as a
+     * 500 on a cancel that actually happened (the TTL sweep remains the
+     * backstop). Missing table on an un-migrated instance degrades quietly via
+     * the memoised jobOfferTableExists() probe the rest of the offer code uses,
+     * with the ER_NO_SUCH_TABLE catch as belt-and-braces for a stale probe.
+     */
+    try {
+      if (await jobOfferTableExists()) {
+        const [r] = await pool.query(
+          `UPDATE tbl_job_offer
+              SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
+            WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
+          [jobId],
+        );
+        if (r.affectedRows) {
+          logger.info('Cancelled job expired ' + r.affectedRows + ' open offer(s) · id=' + jobId);
+        }
+      }
+    } catch (e) {
+      if (e?.code !== 'ER_NO_SUCH_TABLE') {
+        logger.warn('Expiring open offers on cancel failed (non-fatal) · id=' + jobId + ' · ' + e.message);
+      }
+    }
+  }
+
+  // Ops took a deliberate status action (confirm 9→0, cancel, enquiry, …) — any
+  // pending customer request on this job is now handled. See resolveCustomerRequests.
+  await resolveCustomerRequests(jobId);
   return getById(jobId);
 }
 
@@ -3039,7 +4260,7 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
  *
  * Returns the full getById() payload.
  */
-async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, timeSlot } = {}) {
+async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, timeSlot, source, sourceByEfr } = {}) {
   const ids = Array.from(new Set((Array.isArray(efrIds) ? efrIds : [efrIds])
     .map((v) => Number(v))
     .filter((n) => Number.isInteger(n) && n > 0)));
@@ -3068,6 +4289,10 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
     return assign(jobId, { easyfixerId: ids[0], requestedDateTime, timeSlot }, actor);
   }
 
+  // Defense-in-depth: every tech in the offer pool must be verified+active.
+  // (The OFF path above delegates to assign(), which runs the same gate.)
+  await assertTechniciansVerified(ids);
+
   // Normalise the OPTIONAL schedule edit exactly as assign() does — an IST
   // wall-clock string stored as a literal "YYYY-MM-DD HH:mm:ss" (never a JS
   // Date, which would tz-shift on a UTC host). See assign() for the rationale.
@@ -3085,37 +4310,109 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
 
   const conn = await pool.getConnection();
   const offeredIds = [];
+  // Who is putting this offer out — the SAME actor stamped onto the job's
+  // schedule-audit columns below, but captured PER OFFER ROW so re-offers by
+  // different people (and the report's "Offered By") attribute correctly. NULL
+  // for a system/auto offer with no actor (e.g. the auto-assign engine).
+  const offeredBy = (actor && actor.user_id != null) ? actor.user_id : null;
   try {
     await conn.beginTransaction();
 
-    // Optional schedule edit rides in the same txn. Crucially we do NOT touch
-    // job_status or fk_easyfixter_id — the job stays BOOKED with no owner while
-    // the pool offer is live. last_update_time is bumped so the row sorts fresh.
-    if (editSchedule || hasSlot) {
-      const sets = ['last_update_time = ?'];
-      const values = [new Date()];
+    // The pool offer IS the ops "Schedule & Assign" action, so the schedule
+    // AUDIT columns must be stamped here — scheduled_date_time ("Schedule On"),
+    // fk_scheduled_by ("Schedule By") and first_scheduled_by. The legacy
+    // direct-assign path (assign()) stamps these in one UPDATE; when Schedule &
+    // Assign moved onto the offer flow that stamp was dropped, so both columns
+    // silently stopped populating from the modal. We stamp them on EVERY offer.
+    // Crucially we STILL do NOT touch job_status or fk_easyfixter_id — the job
+    // stays BOOKED with no owner while the pool offer is live (a tech ACCEPT is
+    // what flips it to SCHEDULED + sets the fk). Uses new Date() (pool tz +05:30
+    // → IST wall-clock, stored verbatim), never SQL NOW(). Optional schedule
+    // edit (requested_date_time / time_slot) rides in the same UPDATE.
+    {
+      const now = new Date();
+      const actorId = (actor && actor.user_id != null) ? actor.user_id : null;
+      const sets = [
+        'last_update_time = ?',
+        'scheduled_date_time = ?',
+        'fk_scheduled_by = ?',
+        'first_scheduled_by = COALESCE(first_scheduled_by, ?)',
+        // original_scheduling_date_time — the FIRST time this job was scheduled.
+        // Captured ONCE (COALESCE preserves it across re-offers and later
+        // reschedules), mirroring the legacy "SET original_scheduling_date_time
+        // = NOW() WHERE it IS NULL" rule. Pairs with first_scheduled_by.
+        'original_scheduling_date_time = COALESCE(original_scheduling_date_time, ?)',
+      ];
+      const values = [now, now, actorId, actorId, now];
       if (editSchedule) { sets.push('requested_date_time = ?'); values.push(newRequested); }
-      if (hasSlot)      { sets.push('time_slot = ?');           values.push(String(timeSlot)); }
+      // The schedule edit carries the 1-HOUR frame in its time-of-day, so
+      // requested_time (the legacy HH:MM twin) moves with it. Guarded on a real
+      // time-of-day: a date-only edit must not blank a good requested_time.
+      if (editSchedule && hasTimeOfDay(newRequested)) {
+        sets.push('requested_time = ?'); values.push(wallClockTime(newRequested));
+      }
+      // time_slot is written as a BAND — never the raw picker label. The
+      // appointment time decides it when the edit supplies a REAL time-of-day;
+      // otherwise an FE-sent label is canonicalised. See resolveTimeSlot.
+      //
+      // ⚠ The datetime is gated on hasTimeOfDay for the same reason the
+      // requested_time write above is. offerBody/assignBody accept a DATE-ONLY
+      // requestedDateTime (validators/job.validator.js), which becomes
+      // '<date> 00:00:00' — and resolveTimeSlot(null, '<date> 00:00:00') returns
+      // 'After Hours', so a date-only schedule edit used to CLOBBER a perfectly
+      // good stored '9AM to 12PM' with 'After Hours'. reschedule() never had the
+      // bug because it passes the job's existing slot as the fallback; here we
+      // simply write nothing when there is nothing to derive from.
+      const slotSource  = (editSchedule && hasTimeOfDay(newRequested)) ? newRequested : null;
+      const slotToStore = (slotSource || hasSlot)
+        ? resolveTimeSlot(hasSlot ? timeSlot : null, slotSource)
+        : null;
+      if (slotToStore) { sets.push('time_slot = ?'); values.push(slotToStore); }
       values.push(jobId);
       await conn.query(`UPDATE tbl_job SET ${sets.join(', ')} WHERE job_id = ?`, values);
     }
 
-    // Find which of the requested techs already have a live offer, so we skip
-    // re-inserting (avoids duplicate OPEN offers on a re-offer). One query.
-    const [openRows] = await conn.query(
-      `SELECT fk_easyfixter_id FROM tbl_job_offer
-        WHERE job_id = ? AND offer_status = 0
-          AND fk_easyfixter_id IN (${ids.map(() => '?').join(',')})`,
-      [jobId, ...ids],
-    );
-    const alreadyOpen = new Set(openRows.map((r) => Number(r.fk_easyfixter_id)));
-
+    // RE-OFFER SEMANTICS — ONE row per (job, tech) carrying the offer history:
+    //   offer_count = times (re)offered · created_on = FIRST offer · updated_on =
+    //   LAST offer · offered_at = LAST offer (drives the 30-min accept window).
+    // A manual re-offer (e.g. from Search Results) bumps the count + timestamps and
+    // REOPENS the offer so the tech can accept again within 30 min — whether the
+    // prior offer was stale-open, expired, or rejected. First-ever offer INSERTs.
+    // Any older stray open rows for the tech are collapsed so exactly one stays open.
     for (const efrId of ids) {
-      if (alreadyOpen.has(efrId)) continue;
-      await conn.query(
-        'INSERT INTO tbl_job_offer (job_id, fk_easyfixter_id, offer_status, offered_at) VALUES (?, ?, 0, NOW())',
+      // Per-tech offer source (top10 / search / auto): sourceByEfr wins, else the
+      // batch-wide source, else null. COALESCE on re-offer keeps the prior source
+      // when this offer didn't specify one.
+      const src = (sourceByEfr && sourceByEfr[efrId]) || source || null;
+      const [[latest]] = await conn.query(
+        `SELECT job_offer_id FROM tbl_job_offer
+          WHERE job_id = ? AND fk_easyfixter_id = ?
+          ORDER BY job_offer_id DESC LIMIT 1`,
         [jobId, efrId],
       );
+      if (latest) {
+        await conn.query(
+          `UPDATE tbl_job_offer
+              SET offer_status = ${OFFER_STATUS.OFFERED}, offered_at = NOW(), updated_on = NOW(),
+                  offer_count = offer_count + 1, offer_source = COALESCE(?, offer_source),
+                  offered_by_user_id = COALESCE(?, offered_by_user_id),
+                  responded_at = NULL, reject_reason = NULL, reject_reason_id = NULL
+            WHERE job_offer_id = ?`,
+          [src, offeredBy, latest.job_offer_id],
+        );
+        await conn.query(
+          `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
+            WHERE job_id = ? AND fk_easyfixter_id = ? AND job_offer_id <> ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
+          [jobId, efrId, latest.job_offer_id],
+        );
+      } else {
+        await conn.query(
+          `INSERT INTO tbl_job_offer
+             (job_id, fk_easyfixter_id, offer_status, offered_at, created_on, updated_on, offer_count, offer_source, offered_by_user_id)
+           VALUES (?, ?, 0, NOW(), NOW(), NOW(), 1, ?, ?)`,
+          [jobId, efrId, src, offeredBy],
+        );
+      }
       offeredIds.push(efrId);
     }
 
@@ -3137,7 +4434,47 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
       .catch(() => {});
   }
 
+  // Offering the job out is Ops handling it — clear any pending customer request.
+  await resolveCustomerRequests(jobId);
   return getById(jobId);
+}
+
+/*
+ * Defense-in-depth verified gate for the assignment/offer write path.
+ * candidate-ranking.service.js + auto-assign.service.js already filter to
+ * `efr_status=1 AND is_technician_verified=1` when BUILDING the technician
+ * list, but the write endpoints historically trusted that list. Post the
+ * onboarding redesign, many unverified techs live inside the app, so a
+ * direct/stray call with an unverified efr_id must be rejected here too —
+ * making "unverified technicians never get work" a hard invariant. Throws
+ * 400 (code TECH_NOT_VERIFIED) naming the offending id(s). Accepts a scalar
+ * or array; `runner` may be a pooled connection so it can run inside a txn.
+ */
+async function assertTechniciansVerified(efrIds, runner = pool) {
+  const ids = Array.from(new Set(
+    (Array.isArray(efrIds) ? efrIds : [efrIds])
+      .map((v) => Number(v))
+      .filter((n) => Number.isInteger(n) && n > 0),
+  ));
+  if (!ids.length) return;
+  const [rows] = await runner.query(
+    `SELECT efr_id FROM tbl_easyfixer
+      WHERE efr_id IN (?) AND efr_status = 1 AND is_technician_verified = 1`,
+    [ids],
+  );
+  const okIds = new Set(rows.map((r) => Number(r.efr_id)));
+  const bad = ids.filter((id) => !okIds.has(id));
+  if (bad.length) {
+    logger.warn('Assign/offer rejected, technician(s) not verified · efrIds=' + bad.join(','));
+    const err = new Error(
+      bad.length === 1
+        ? `easyfixer ${bad[0]} is not verified and cannot be assigned work`
+        : `easyfixers ${bad.join(', ')} are not verified and cannot be assigned work`,
+    );
+    err.status = 400;
+    err.code = 'TECH_NOT_VERIFIED';
+    throw err;
+  }
 }
 
 /*
@@ -3180,6 +4517,10 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
     logger.warn('Assign rejected, easyfixer inactive · id=' + jobId + ' · easyfixerId=' + easyfixerId);
     const err = new Error(`easyfixer ${easyfixerId} is inactive`); err.status = 400; throw err;
   }
+  // Defense-in-depth verified gate (see assertTechniciansVerified). auto-assign
+  // + CRM both source ids from the verified candidate list; this rejects a
+  // direct/stray call with an unverified id.
+  await assertTechniciansVerified([easyfixerId]);
   if (!existing) {
     logger.warn('Assign job not found · id=' + jobId);
     const err = new Error('job not found'); err.status = 404; throw err;
@@ -3230,16 +4571,40 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
       'fk_scheduled_by = ?',
       `job_status = CASE WHEN job_status = ${STATUS.BOOKED} THEN ${STATUS.SCHEDULED} ELSE job_status END`,
       'first_scheduled_by = COALESCE(first_scheduled_by, ?)',
+      // original_scheduling_date_time — first-schedule capture (set ONCE; legacy
+      // parity with first_scheduled_by). COALESCE preserves it on later moves.
+      'original_scheduling_date_time = COALESCE(original_scheduling_date_time, ?)',
       'last_update_time = ?',
     ];
-    const values = [easyfixerId, now, actor?.user_id || null, actor?.user_id || null, now];
+    // Value order tracks the placeholders above (job_status has no ?):
+    // fk_easyfixter_id, scheduled_date_time, fk_scheduled_by, first_scheduled_by,
+    // original_scheduling_date_time, last_update_time.
+    const values = [easyfixerId, now, actor?.user_id || null, actor?.user_id || null, now, now];
     if (editSchedule) {
       sets.push('requested_date_time = ?');
       values.push(newRequested);
+      // requested_time = the 1-HOUR START of the edited appointment. Skipped on
+      // a date-only edit so the midnight sentinel can't wipe a real time.
+      if (hasTimeOfDay(newRequested)) {
+        sets.push('requested_time = ?');
+        values.push(wallClockTime(newRequested));
+      }
     }
-    if (hasSlot) {
+    // time_slot is written as a BAND — never the raw picker label (see
+    // resolveTimeSlot). Derived from the edited appointment time when the edit
+    // carries a REAL time-of-day, else canonicalised from whatever label the
+    // caller sent — and written at all only when one of those exists.
+    //
+    // ⚠ hasTimeOfDay is the guard that stops a DATE-ONLY requestedDateTime
+    // (which assignBody accepts) from resolving to 'After Hours' via the 00:00
+    // sentinel and clobbering a good stored band. Same fix as offerToTechnicians.
+    const slotSource  = (editSchedule && hasTimeOfDay(newRequested)) ? newRequested : null;
+    const slotToStore = (slotSource || hasSlot)
+      ? resolveTimeSlot(hasSlot ? timeSlot : null, slotSource)
+      : null;
+    if (slotToStore) {
       sets.push('time_slot = ?');
-      values.push(String(timeSlot));
+      values.push(slotToStore);
     }
     values.push(jobId);
 
@@ -3264,6 +4629,8 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
 
     fireWebhook(isReassign ? 'RescheduleTech' : 'TechAssigned', jobId);
 
+    // Assigning a technician is Ops handling the job — clear any pending request.
+    await resolveCustomerRequests(jobId);
     return getById(jobId);
   } catch (e) {
     await conn.rollback();
@@ -3352,8 +4719,8 @@ async function unassign(jobId, { reason, reasonId }, actor) {
       if (await jobOfferTableExists()) {
         await conn.query(
           `UPDATE tbl_job_offer
-              SET offer_status = 2, reject_reason = ?, reject_reason_id = ?, responded_at = NOW()
-            WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = 0`,
+              SET offer_status = ${OFFER_STATUS.REJECTED}, reject_reason = ?, reject_reason_id = ?, responded_at = NOW()
+            WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
           [reason.trim(), reasonId != null ? reasonId : null, jobId, techIdAtUnassign],
         );
       }
@@ -3406,6 +4773,9 @@ async function unassign(jobId, { reason, reasonId }, actor) {
  */
 async function acceptOffer(jobId, efrId) {
   logger.info('Accept job offer · id=' + jobId + ' · efrId=' + efrId);
+  // Defense-in-depth: an unverified tech (e.g. de-verified after being offered)
+  // cannot claim a job. Cheap PK lookup before the txn.
+  await assertTechniciansVerified([efrId]);
   const hasOfferTable = await jobOfferTableExists();
   const conn = await pool.getConnection();
   // `committed` guards the catch so a post-commit throw (the 409 path) doesn't
@@ -3426,25 +4796,55 @@ async function acceptOffer(jobId, efrId) {
       return getById(jobId);
     }
 
-    // Race-safe claim. Only succeeds while the job is still BOOKED *and* owner-
-    // less — the atomic gate that makes accept first-wins across the pool.
+    /*
+     * Race-safe claim. Only succeeds while the job is still BOOKED *and* owner-
+     * less — `job_status = BOOKED AND fk_easyfixter_id IS NULL` IS the atomic
+     * first-wins gate, and it is what makes concurrent accepts safe. That
+     * property does NOT depend on the freshness clause below.
+     *
+     * FRESHNESS gate (this tech's own open offer still inside OFFER_TTL_MINUTES)
+     * is TTL ENFORCEMENT, not race safety: it exists to stop a tech accepting a
+     * >30-min stale offer in the gap between expiry-cron ticks. So it belongs to
+     * the SAME regime switch as the sweep and the CRM chip:
+     *
+     *   expiry ON  → enforce it. Identical comparison to offerColumns()'s
+     *                "effectively open", so the CRM can never show an offer as
+     *                live that this path would refuse.
+     *   expiry OFF → DROP it. `job.offer_expiry.enabled = 'false'` means offers
+     *                must not expire at all; keeping a hard 30-minute refusal
+     *                here would make that setting a no-op in practice — the CRM
+     *                would advertise an open offer while the technician's app
+     *                silently rejected it. Race safety is unaffected.
+     */
+    const enforceTtl = offerExpiryEnabled();
+    const freshnessClause = enforceTtl
+      ? ' AND jo.offered_at >= NOW() - INTERVAL ? MINUTE'
+      : '';
+    const claimParams = enforceTtl
+      ? [efrId, jobId, jobId, efrId, OFFER_TTL_MINUTES]
+      : [efrId, jobId, jobId, efrId];
     const [r] = await conn.query(
       `UPDATE tbl_job
           SET job_status = ${STATUS.SCHEDULED}, fk_easyfixter_id = ?
-        WHERE job_id = ? AND job_status = ${STATUS.BOOKED} AND fk_easyfixter_id IS NULL`,
-      [efrId, jobId],
+        WHERE job_id = ? AND job_status = ${STATUS.BOOKED} AND fk_easyfixter_id IS NULL
+          AND EXISTS (
+            SELECT 1 FROM tbl_job_offer jo
+             WHERE jo.job_id = ? AND jo.fk_easyfixter_id = ?
+               AND jo.offer_status = ${OFFER_STATUS.OFFERED}${freshnessClause}
+          )`,
+      claimParams,
     );
 
     if (r.affectedRows === 1) {
       // This tech claimed it: accept their offer, expire all sibling offers.
       await conn.query(
-        `UPDATE tbl_job_offer SET offer_status = 1, responded_at = NOW()
-          WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = 0`,
+        `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.ACCEPTED}, responded_at = NOW()
+          WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
         [jobId, efrId],
       );
       await conn.query(
-        `UPDATE tbl_job_offer SET offer_status = 3, responded_at = NOW()
-          WHERE job_id = ? AND offer_status = 0`,
+        `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
+          WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
         [jobId],
       );
       await conn.commit();
@@ -3456,8 +4856,8 @@ async function acceptOffer(jobId, efrId) {
     // Lost the race (someone else won, or the job already moved on). Expire this
     // tech's own open offer, commit that, and flag a 409 to throw post-finally.
     await conn.query(
-      `UPDATE tbl_job_offer SET offer_status = 3, responded_at = NOW()
-        WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = 0`,
+      `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
+        WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
       [jobId, efrId],
     );
     await conn.commit();
@@ -3471,8 +4871,11 @@ async function acceptOffer(jobId, efrId) {
   }
 
   // Reached only on the lost-race path (the success paths returned inside try).
-  logger.warn('Job offer lost race, already accepted by another technician · id=' + jobId + ' · efrId=' + efrId);
-  throw Object.assign(new Error('This job was already accepted by another technician'), { status: 409 });
+  // affectedRows=0 means one of: another tech won, the job moved on, OR this
+  // tech's offer expired (>30 min / cron-expired) — so the message is neutral
+  // rather than asserting another tech necessarily took it.
+  logger.warn('Job offer no longer available (lost race or expired) · id=' + jobId + ' · efrId=' + efrId);
+  throw Object.assign(new Error('This job offer is no longer available'), { status: 409 });
 }
 
 /*
@@ -3487,7 +4890,7 @@ async function techHasOpenOffer(jobId, efrId) {
   try {
     if (!(await jobOfferTableExists())) return false;
     const [[row]] = await pool.query(
-      'SELECT 1 AS ok FROM tbl_job_offer WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = 0 LIMIT 1',
+      `SELECT 1 AS ok FROM tbl_job_offer WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = ${OFFER_STATUS.OFFERED} LIMIT 1`,
       [jobId, efrId],
     );
     return !!row;
@@ -3508,8 +4911,8 @@ async function rejectOffer(jobId, efrId, { reason, reasonId } = {}) {
   }
   await pool.query(
     `UPDATE tbl_job_offer
-        SET offer_status = 2, reject_reason = ?, reject_reason_id = ?, responded_at = NOW()
-      WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = 0`,
+        SET offer_status = ${OFFER_STATUS.REJECTED}, reject_reason = ?, reject_reason_id = ?, responded_at = NOW()
+      WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
     [reason || null, reasonId != null ? reasonId : null, jobId, efrId],
   );
   return getById(jobId);
@@ -3527,18 +4930,180 @@ async function rejectOffer(jobId, efrId, { reason, reasonId } = {}) {
  * Each row: { efr_id, efr_name, offered_at }.
  */
 async function listOffers(jobId) {
-  logger.info('List open offers for job · id=' + jobId);
+  logger.info('List offers for job · id=' + jobId);
   if (!(await jobOfferTableExists())) return [];
+  // Lazy expiry: sweep THIS job's stale open offers before reading, so an offer
+  // older than 30 min surfaces as EXPIRED even when the scheduler cron is off
+  // (CRON_DISABLED) or between its 2-min ticks. Idempotent + job-scoped.
+  await expireStaleOffers(OFFER_TTL_MINUTES, jobId);
+  // Latest offer row PER technician — a re-offer can leave more than one row for
+  // the same (job, tech), so MAX(job_offer_id) picks the current one. Surfaced
+  // states: OFFERED (live), REJECTED, EXPIRED — the Schedule & Assign modal shows
+  // all three so ops can see who declined / timed out, not just live offers.
+  // ACCEPTED is excluded (that job is already assigned and leaves this modal).
+  // Order: live → rejected → expired, newest-first within each bucket.
   const [rows] = await pool.query(
-    `SELECT jo.fk_easyfixter_id AS efr_id, ef.efr_name, jo.offered_at
+    `SELECT jo.fk_easyfixter_id AS efr_id, ef.efr_name, jo.offered_at, jo.responded_at,
+            jo.offer_status, jo.offer_status_label, jo.offer_count, jo.offer_source,
+            jo.reject_reason
        FROM tbl_job_offer jo
+       JOIN (SELECT fk_easyfixter_id, MAX(job_offer_id) AS mid
+               FROM tbl_job_offer
+              WHERE job_id = ?
+              GROUP BY fk_easyfixter_id) latest ON latest.mid = jo.job_offer_id
        JOIN tbl_easyfixer ef ON ef.efr_id = jo.fk_easyfixter_id
-      WHERE jo.job_id = ? AND jo.offer_status = 0
-      ORDER BY jo.offered_at DESC`,
+      WHERE jo.offer_status IN (${OFFER_STATUS.OFFERED}, ${OFFER_STATUS.REJECTED}, ${OFFER_STATUS.EXPIRED})
+      ORDER BY FIELD(jo.offer_status, ${OFFER_STATUS.OFFERED}, ${OFFER_STATUS.REJECTED}, ${OFFER_STATUS.EXPIRED}),
+               jo.offered_at DESC`,
     [jobId],
   );
-  logger.info('Found ' + rows.length + ' open offers · jobId=' + jobId);
+  logger.info('Found ' + rows.length + ' offers (live+rejected+expired) · jobId=' + jobId);
   return rows;
+}
+
+// ─── Reschedule a job's appointment (Schedule & Assign → Reschedule) ─
+/*
+ * Explicit, audited reschedule. Distinct from assign(): it moves the
+ * appointment (requested_date_time + requested_time + the two derived slot
+ * columns) and re-stamps the schedule audit (scheduled_date_time +
+ * fk_scheduled_by = THIS reschedule) — but never the technician, and never the
+ * ORIGINAL-schedule columns (first_scheduled_by / original_scheduling_date_time
+ * stay put). ALWAYS captures reason + remarks. The modal's Date/Time fields are
+ * read-only; this is the sole path that moves them. All three inputs are
+ * mandatory (rescheduleBody validates at the route). Transactional:
+ *   1. tbl_job.requested_date_time / requested_time / time_slot /
+ *      booking_cut_off_time_slot / scheduled_date_time / fk_scheduled_by
+ *   2. scheduling_history (reason_id + reschedule_reason) — same shape as assign
+ *   3. any OPEN offers on this job → EXPIRED (they were made for the OLD slot,
+ *      so a tech must not be able to accept a now-stale appointment)
+ * Then a tbl_job_comment audit row (comment_on=1, enum_reason_id, remarks) is
+ * added outside the txn (addComment also mirrors to tbl_job.remarks). Returns
+ * the refreshed job detail.
+ */
+async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason, remarks }, actor) {
+  logger.info('Reschedule job · id=' + jobId + ' · reasonId=' + reasonId);
+  // time_slot is read only as the FALLBACK for a date-only reschedule (no
+  // time-of-day to derive a band from) — see resolveTimeSlot below.
+  const [[existing]] = await pool.query(
+    'SELECT job_id, fk_easyfixter_id, time_slot FROM tbl_job WHERE job_id = ? LIMIT 1',
+    [jobId],
+  );
+  if (!existing) { const err = new Error('job not found'); err.status = 404; throw err; }
+
+  // Parse the IST wall-clock string exactly like assign() — NEVER new Date()/
+  // toISOString() it (UTC↔IST day shift). Produces 'YYYY-MM-DD HH:MM:SS'.
+  const m = String(requestedDateTime).match(/^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2})(:\d{2})?)?$/);
+  if (!m) { const err = new Error('requestedDateTime is not a valid date'); err.status = 400; throw err; }
+  const newRequested = `${m[1]} ${m[2] ? `${m[2]}${m[3] || ':00'}` : '00:00:00'}`;
+  /*
+   * Re-derive both slot columns from the new appointment time so time_slot and
+   * booking_cut_off_time_slot stay coherent with requested_date_time.
+   *
+   * time_slot always becomes the BAND containing the new appointment time. The
+   * 1-hour frame the operator picked is not lost — it IS the new time-of-day,
+   * carried by requested_date_time and requested_time (written just below).
+   *
+   * The `existing.time_slot` argument only comes into play for a DATE-ONLY
+   * reschedule ('2026-07-20' with no time): there is no hour to band, so the
+   * job's current label is canonicalised and kept rather than being clobbered
+   * with 'After Hours' — the midnight sentinel must never masquerade as a real
+   * appointment time.
+   *
+   * booking_cut_off_time_slot is a separate LEGACY derived column and keeps its
+   * own legacy derivation — nothing matches on it.
+   */
+  const newTimeSlot = resolveTimeSlot(existing.time_slot, newRequested);
+  const newCutoffSlot = deriveBookingCutoffSlot(newRequested);
+
+  // Atomic core: the schedule move + offer-expiry must commit together (an
+  // outstanding offer must never survive with the OLD slot). The audit rows
+  // (scheduling_history + comment) are best-effort AFTER commit so a legacy
+  // constraint can't fail the whole reschedule — critically, this flow runs on
+  // UNASSIGNED jobs (fk_easyfixter_id NULL), and if scheduling_history.easyfixer_id
+  // is legacy NOT NULL that insert would otherwise abort the whole operation.
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    // Reschedule also stamps the schedule AUDIT: scheduled_date_time +
+    // fk_scheduled_by reflect the LATEST scheduling action (this reschedule);
+    // first_scheduled_by / original_scheduling_date_time are deliberately NOT
+    // touched (they hold the ORIGINAL schedule). requested_time is the legacy
+    // HH:MM companion, re-derived from the new appointment so it stays coherent
+    // with requested_date_time. (enum_reason_id / remarks / remarks_date_time +
+    // the tbl_job_comment row are stamped by addComment below.) fk_scheduled_by
+    // uses COALESCE so an actor-less auto-reschedule preserves the prior
+    // scheduler. new Date() → pool tz +05:30 IST wall-clock, never SQL NOW().
+    const rescheduledAt = new Date();
+    const rescheduledBy = (actor && actor.user_id != null) ? actor.user_id : null;
+    // requested_time = the 1-HOUR START, taken verbatim off the IST wall-clock
+    // literal. NOT formatTimeIST(): that re-parses the string as a real instant
+    // and adds +05:30 again, which on our UTC containers stored an IST 14:30
+    // appointment as requested_time '20:00' (see wallClockTime's note).
+    const newRequestedTime = wallClockTime(newRequested);
+    await conn.query(
+      `UPDATE tbl_job
+          SET requested_date_time       = ?,
+              requested_time            = ?,
+              time_slot                 = COALESCE(?, time_slot),
+              booking_cut_off_time_slot = COALESCE(?, booking_cut_off_time_slot),
+              scheduled_date_time       = ?,
+              fk_scheduled_by           = COALESCE(?, fk_scheduled_by),
+              last_update_time          = ?
+        WHERE job_id = ?`,
+      [newRequested, newRequestedTime, newTimeSlot, newCutoffSlot, rescheduledAt, rescheduledBy, rescheduledAt, jobId],
+    );
+    // Open offers were extended for the OLD slot — expire them so no tech accepts
+    // a stale appointment. Tolerant of a missing offer table (un-migrated deploys).
+    if (await jobOfferTableExists()) {
+      await conn.query(
+        `UPDATE tbl_job_offer
+            SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
+          WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
+        [jobId],
+      );
+    }
+    await conn.commit();
+    logger.info('Job rescheduled · id=' + jobId + ' · newTime=' + newRequested);
+  } catch (e) {
+    await conn.rollback();
+    logger.error('Reschedule failed, rolled back · id=' + jobId + ' · ' + e.message);
+    throw e;
+  } finally {
+    conn.release();
+  }
+
+  // Audit (best-effort, post-commit). scheduling_history mirrors assign()'s shape
+  // (reason_id + reschedule_reason label); easyfixer_id may be NULL on an
+  // unassigned job. schedule_time = the NEW promised time.
+  try {
+    await pool.query(
+      `INSERT INTO scheduling_history (job_id, easyfixer_id, schedule_time, reason_id, reschedule_reason)
+       VALUES (?, ?, ?, ?, ?)`,
+      [jobId, existing.fk_easyfixter_id || null, newRequested, reasonId || null, rescheduleReason || null],
+    );
+  } catch (e) {
+    logger.warn('Reschedule scheduling_history insert failed (non-fatal) · id=' + jobId + ' · ' + e.message);
+  }
+
+  // Comment audit — addComment uses the pool + mirrors the latest remark to
+  // tbl_job.remarks. comment_on=1 (lifecycle/schedule), reason FK in enum_reason_id,
+  // new promised time in appointment_on, actor = CRM user.
+  try {
+    await require('./job-comment.service').addComment(jobId, {
+      comments: remarks,
+      comment_on: 1,
+      commented_by: actor?.user_id || null,
+      appointment_on: newRequested,
+      enum_reason_id: reasonId || null,
+    });
+  } catch (e) {
+    logger.warn('Reschedule audit comment failed (non-fatal) · id=' + jobId + ' · ' + e.message);
+  }
+
+  fireWebhook('RescheduleTech', jobId);
+  // Ops rescheduled the job — directly handles a customer reschedule/cancel ask.
+  await resolveCustomerRequests(jobId);
+  return getById(jobId);
 }
 
 // ─── A technician's open offers (mobile "Offered to you" list) ──────
@@ -3552,6 +5117,17 @@ async function listOffers(jobId) {
  *   efrId : the technician (tbl_easyfixer.efr_id)
  *   limit : max jobs to return (default 50)
  *
+ * Each returned row also carries the OFFER's own timing, in the projection's
+ * snake_case so the app reads one consistent naming style:
+ *   offered_at — when this tech's live offer was (re)extended
+ *   expires_at — offered_at + OFFER_TTL_MINUTES, i.e. the instant acceptOffer()
+ *                will start rejecting it and the expiry cron will close it
+ * Both are DERIVED IN SQL (DATE_ADD) off the row we already read, so there is no
+ * extra query and — because the pool runs `dateStrings: true` — both arrive as
+ * "YYYY-MM-DD HH:mm:ss" IST strings rather than tz-shifting Date objects.
+ * Computing expires_at server-side (not in the app) keeps the 30-minute TTL a
+ * single source of truth: change OFFER_TTL_MINUTES and every client follows.
+ *
  * Returns { items } — [] when tbl_job_offer is absent.
  */
 async function listOfferedForTech(efrId, { limit = 50 } = {}) {
@@ -3559,8 +5135,10 @@ async function listOfferedForTech(efrId, { limit = 50 } = {}) {
   if (!(await jobOfferTableExists())) return { items: [] };
   // Most-recent open offers first; cap before hydrating the full preview.
   const [offerRows] = await pool.query(
-    `SELECT job_id FROM tbl_job_offer
-      WHERE fk_easyfixter_id = ? AND offer_status = 0
+    `SELECT job_id, offered_at,
+            DATE_ADD(offered_at, INTERVAL ${OFFER_TTL_MINUTES} MINUTE) AS expires_at
+       FROM tbl_job_offer
+      WHERE fk_easyfixter_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}
       ORDER BY offered_at DESC
       LIMIT ?`,
     [efrId, Number(limit)],
@@ -3573,6 +5151,16 @@ async function listOfferedForTech(efrId, { limit = 50 } = {}) {
   const { rows } = await list({ jobIds: ids, limit: ids.length });
   const order = new Map(ids.map((id, i) => [id, i]));
   rows.sort((a, b) => (order.get(Number(a.job_id)) ?? 0) - (order.get(Number(b.job_id)) ?? 0));
+  // Stamp the offer timing back onto the preview rows. Keyed by job_id — one
+  // OPEN offer per (job, tech) is an invariant of offerToTechnicians(), which
+  // collapses stray duplicates, so this map can't lose a row.
+  const timing = new Map(offerRows.map((r) => [Number(r.job_id), r]));
+  for (const row of rows) {
+    const t = timing.get(Number(row.job_id));
+    if (!t) continue;
+    row.offered_at = t.offered_at ?? null;
+    row.expires_at = t.expires_at ?? null;
+  }
   logger.info('Returning ' + rows.length + ' offered jobs · efrId=' + efrId);
   return { items: rows };
 }
@@ -3628,6 +5216,9 @@ async function changeOwner(jobId, { newOwnerId, reason }, actor) {
     [newOwnerId, actor?.user_id || null, reason, new Date(), new Date(), jobId]
   );
 
+  // Keep the denormalised owner-phone snapshot correct on reassignment.
+  await stampJobPrimarySpoc(jobId, newOwnerId);
+
   logger.info('Job owner changed · id=' + jobId + ' · newOwnerId=' + newOwnerId);
   return getById(jobId);
 }
@@ -3681,11 +5272,25 @@ async function tryAutoAssignOnCreate(jobId, clientId, actor) {
       logger.info(`Auto-assign skipped for job ${jobId} — already assigned (likely manual race): ${err.message}`);
       return;
     }
+    // err.details (from assignTopCandidate) carries the ranker diagnostics:
+    // { l1Count, rejectedCount, note, rejectedReasons }. Surface them in BOTH
+    // the log and the ops email so "no technician" is explained, not opaque.
+    const details = err.details || {};
     const reason =
-      err.status === 422 ? 'No eligible technician was found for this job.' :
-      err.status === 404 ? `Job could not be resolved (${err.message}).` :
-      `Auto-assignment errored before the technician could be saved: ${err.message}`;
-    logger.warn(`Auto-assign failed for job ${jobId}: ${err.message} (status=${err.status ?? 'unknown'})`);
+      err.status === 422
+        ? (details.l1Count > 0 && details.rejectedReasons
+            ? `${details.l1Count} technician(s) matched the skill & area, but none were available: ${details.rejectedReasons}.`
+            : 'No active, verified technician with the required skill was found for this job.')
+      : err.status === 404 ? `Job could not be resolved (${err.message}).`
+      : `Auto-assignment errored before the technician could be saved: ${err.message}`;
+    logger.warn(
+      `Auto-assign failed for job ${jobId}: ${err.message} (status=${err.status ?? 'unknown'})`
+      + (err.status === 422
+          ? ` · l1Eligible=${details.l1Count ?? '?'} · rejected=${details.rejectedCount ?? '?'}`
+            + (details.note ? ` · note=${details.note}` : '')
+            + (details.rejectedReasons ? ` · reasons: ${details.rejectedReasons}` : '')
+          : '')
+    );
     await notifyAutoAssignFailure(jobId, clientId, reason);
   }
 }
@@ -3732,17 +5337,132 @@ async function notifyAutoAssignFailure(jobId, clientId, reason) {
   }
 }
 
+/*
+ * Customer "Unreachable" SMS — direct port of legacy EasyFix_CRM
+ * JobAction.sendSmsToNotReachableCustomer(). Fired when an operator marks a job
+ * Unreachable from the Confirm modal (CRM POST /admin/jobs/:id/notify-unreachable).
+ *
+ * Parity with the legacy:
+ *   - body comes from the DLT row tbl_sms_transational_meta
+ *     (job_stage='customerNotReachable', client_id=1) — read via the shared
+ *     sms-template service so the 5-min cache + per-client fallback are reused;
+ *   - the legacy placeholders {#client#} / {#vertical#} / {#var#} are substituted
+ *     (client name / vertical-or-"Order Id-<id>" / the wame.pro helpdesk link);
+ *   - the customer mobile is tbl_customer.customer_mob_no via tbl_job.fk_customer_id;
+ *   - sent through services/sms.service.js (sender id env SMS_SENDER_ID='EsyFix',
+ *     SMSCountry), which already honours NOTIFICATIONS_DISABLE / TEST_MOBILE.
+ *
+ * Differences from legacy, by design: we do NOT replicate the obscure
+ * `clientSetting == null` send-gate (it suppressed the SMS for every client that
+ * had a settings row, which is counter-intuitive) — every Unreachable submit
+ * notifies. The inline fallback below is a dev/safety net; in prod the carrier
+ * delivers ONLY the DLT-registered template body. Caller treats this as
+ * fire-and-forget / non-fatal — a provider failure must not fail the outcome.
+ */
+const UNREACHABLE_HELPDESK_LINK = 'https://wame.pro/helpdesk';
+async function notifyCustomerNotReachable(jobId) {
+  const smsService  = require('./sms.service');
+  const smsTemplate = require('./sms-template.service');
+  const [rows] = await pool.query(
+    `SELECT j.job_id, cu.customer_mob_no, cl.client_name
+       FROM tbl_job j
+       LEFT JOIN tbl_customer cu ON cu.customer_id = j.fk_customer_id
+       LEFT JOIN tbl_client   cl ON cl.client_id   = j.fk_client_id
+      WHERE j.job_id = ?`,
+    [jobId],
+  );
+  const job = rows && rows[0];
+  if (!job) { logger.warn('Unreachable SMS skipped · job not found · jobId=' + jobId); return { sent: false, reason: 'job_not_found' }; }
+  if (!job.customer_mob_no) { logger.warn('Unreachable SMS skipped · no customer mobile · jobId=' + jobId); return { sent: false, reason: 'no_mobile' }; }
+
+  const clientName = job.client_name || 'EasyFix';
+  const verticalName = 'Order Id- ' + jobId; // legacy fallback when no vertical
+
+  let message = null;
+  try {
+    const tpl = await smsTemplate.getTemplate('customerNotReachable', { clientId: 1 });
+    if (tpl) {
+      message = String(tpl)
+        .replace(/\{#client#\}/g, clientName)
+        .replace(/\{#vertical#\}/g, verticalName)
+        .replace(/\{#var#\}/g, UNREACHABLE_HELPDESK_LINK);
+    }
+  } catch (e) { logger.warn('Unreachable SMS · template load failed · ' + e.message); }
+  if (!message) {
+    message = 'Dear Customer, You are not REACHABLE. On behalf of ' + clientName
+      + ' service of "Easyfix". Connect with us on this link - ' + UNREACHABLE_HELPDESK_LINK + '. Team EasyFix';
+  }
+
+  const result = await smsService.send({ to: job.customer_mob_no, message });
+  logger.info('Unreachable SMS · jobId=' + jobId + ' delivered=' + !!(result && result.delivered));
+  return { sent: !!(result && result.delivered), provider: result };
+}
+
 module.exports = {
   STATUS, ALL_STATUS_VALUES, MUTABLE_COLUMNS,
   // Cross-service helper — used by job-magic-link.service.js to keep the
   // tbl_job.client_services CSV in sync after the customer's self-submit
   // mutates tbl_job_services. Single source of truth, one helper.
   recomputeClientServicesCsv,
-  list, listForExport, getById, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, unassign, acceptOffer, changeOwner,
+  list, listForExport, getById, getByIdCore, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, reschedule, unassign, acceptOffer, changeOwner,
   // THE OFFER MODEL (pool offers): offer one job to many techs, list a job's
   // open offers, and list a tech's open offers.
   offerToTechnicians, listOffers, listOfferedForTech, techHasOpenOffer, rejectOffer,
+  isOfferFlowActive, expireStaleOffers,
+  // The 30-min offer window. Exported so the offer-REMINDER cron can bound its
+  // re-push window by the same constant instead of re-declaring it and drifting.
+  OFFER_TTL_MINUTES,
   tryAutoAssignOnCreate,
   fireWebhook, statusToEventName,
   hasClientVerticalIdColumn,
+  notifyCustomerNotReachable,
+  // Canonical IST wall-clock formatter (server-TZ independent). Exported so
+  // route-layer guards can compare an appointment against "now" in IST without
+  // re-implementing the offset — there is exactly one correct version of this.
+  formatMysqlDateTimeIST,
+  /*
+   * Job Age SQL — exported so any future consumer (a report, an export, a
+   * dashboard tile) reuses the SAME expression instead of re-deriving the
+   * anchors and drifting from what the jobs list shows. Pure column
+   * arithmetic, no placeholders; requires the `j` (tbl_job) alias in scope.
+   */
+  JOB_AGE_END_EXPR, JOB_AGE_SECS_EXPR, JOB_AGE_DAYS_EXPR, JOB_AGE_COLUMNS,
+  // The jobs-list server-side sort whitelist. Exported so
+  // validators/job.validator.js derives its `sortBy` valid() list from the SAME
+  // keys — one source of truth, no BE-side both-sides-whitelist drift.
+  SORTABLE_COLUMNS,
+  /*
+   * Pending-for-Scheduling offer sub-state filter. OFFER_STATE_VALUES is the
+   * ONE list of literals — validators/job.validator.js derives its valid() from
+   * it, so the accepted param values can never drift from what the service
+   * implements. offerStateClause is exported for its unit tests (the tri-state
+   * semantics are subtle enough to pin explicitly).
+   *
+   * offerColumns is exported for the SAME tests: they assert the `offer_state`
+   * projection column is built from the identical predicate as the filter, which
+   * is what makes "the chip and the filter cannot disagree" a checked property
+   * rather than a comment.
+   */
+  OFFER_STATE_VALUES, offerStateClause, offerColumns,
+  /*
+   * `job.offer_expiry.enabled` — exported so the tests can pin BOTH regimes
+   * (expiry on ⇒ a stale OFFERED row reads Expired; expiry off ⇒ it stays
+   * Offered, because the business said offers never expire) without touching
+   * live config, and so expireStaleOffers()'s gate is checkable.
+   */
+  offerExpiryEnabled,
+  /*
+   * The appointment slot model, re-exported so callers (and tests) reach it
+   * through job.service the way they always have. The implementations live in
+   * services/time-slot.js — require that module directly in new code.
+   *   deriveTimeSlot   — IST datetime → one of the FOUR bands
+   *   resolveTimeSlot  — the writer-side gate for tbl_job.time_slot
+   */
+  deriveTimeSlot, resolveTimeSlot,
+  /*
+   * The LEGACY "H AM - H PM" derivation for booking_cut_off_time_slot. Exported
+   * so job-magic-link.service writes that column in the SAME spelling every
+   * other create path writes it, instead of inventing a spelling of its own.
+   */
+  deriveBookingCutoffSlot,
 };

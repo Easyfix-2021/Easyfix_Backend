@@ -41,6 +41,12 @@ name: Deploy Backend (CI build → ECR → SSM pull)
 on:
   push:
     branches: [QA, Production]
+    # The STT sidecar (stt-service/**) is a SEPARATE image deployed by
+    # deploy-stt.yml. A push touching ONLY stt-service/** must not rebuild +
+    # redeploy the whole backend. (A push touching both still deploys both —
+    # paths-ignore only skips when EVERY changed path matches.)
+    paths-ignore:
+      - 'stt-service/**'
   workflow_dispatch:
     inputs:
       target:
@@ -71,6 +77,13 @@ jobs:
           node --check services/job.service.js
           node --check services/zone.service.js           || true
           node --check services/zone-upload.service.js    || true
+
+      # Characterization tests for the shared choke points (setStatus, create,
+      # assign, offer, accept-offer, reschedule, magic-link write, + the
+      # statusToEventName notification gate). Fake-pool based — no DB, no network,
+      # deterministic. A failure blocks the deploy (build-and-push needs precheck).
+      - name: Unit tests (characterization — no DB)
+        run: npm test
 
   build-and-push:
     name: Build image & push to ECR
@@ -315,12 +328,18 @@ jobs:
           # the next two lines append/overwrite BACKEND_IMAGE.
           touch /opt/easyfix/.env
 
-          # Update BACKEND_IMAGE to the new tag. Append if first run.
-          if grep -q '^BACKEND_IMAGE=' /opt/easyfix/.env; then
-            sed -i "s|^BACKEND_IMAGE=.*|BACKEND_IMAGE=$IMAGE_URI|" /opt/easyfix/.env
-          else
-            echo "BACKEND_IMAGE=$IMAGE_URI" >> /opt/easyfix/.env
-          fi
+          # Update BACKEND_IMAGE to the new tag. Append if first run. flock serialises
+          # with a concurrent STT deploy (deploy-stt.yml) writing the same .env when a
+          # single push touches both — same lock file, so neither clobbers the other.
+          touch /opt/easyfix/.env
+          (
+            flock 9
+            if grep -q '^BACKEND_IMAGE=' /opt/easyfix/.env; then
+              sed -i "s|^BACKEND_IMAGE=.*|BACKEND_IMAGE=$IMAGE_URI|" /opt/easyfix/.env
+            else
+              echo "BACKEND_IMAGE=$IMAGE_URI" >> /opt/easyfix/.env
+            fi
+          ) 9>/opt/easyfix/.env.lock
 
           # ─── ECR credential-helper auto-bootstrap (idempotent) ─────────
           # The "pull access denied / no basic auth credentials" symptom is
@@ -399,6 +418,61 @@ jobs:
           # \`set -u\` would trip on it.
           echo "▶ Pulling $IMAGE_URI via docker compose"
           docker compose pull backend
+
+          # ─── Log history for Dozzle (rolling 7-day window) ──────────────
+          # THE PROBLEM: \`compose up --force-recreate\` DESTROYS the outgoing
+          # container, and json-file logs live in /var/lib/docker/containers/
+          # <container-id>/ — a directory owned by that container ID. Docker
+          # deletes it with the container, so Dozzle (which reads through the
+          # Docker API) can only ever show the CURRENT deployment. Roll back to
+          # fix a bad release and the evidence you need is already gone.
+          #
+          # THE FIX: replay the outgoing container's logs into a throwaway
+          # container BEFORE recreating. \`alpine cat\` copies stdin to stdout;
+          # the daemon captures that as the new container's own json log, so
+          # Dozzle lists it like any other container. This is the pattern
+          # Dozzle's own docs recommend for surfacing on-disk logs.
+          #   → Viewers must enable Settings → "Show Stopped Containers" in
+          #     Dozzle (off by default, stored per-browser in single-user mode).
+          #
+          # WHY NOT just rename + keep the old container: compose tracks service
+          # containers by LABEL (com.docker.compose.service), not by name, so a
+          # renamed container is reclaimed and removed by the next \`up\` anyway.
+          #
+          # \`docker logs -t\` prefixes the ORIGINAL timestamps into the text.
+          # Dozzle's own timestamp column shows the REPLAY time, so without -t
+          # the real timing of every line would be lost.
+          #
+          # Non-fatal throughout: log history must never block a deploy.
+          if docker inspect easyfix-backend >/dev/null 2>&1; then
+            docker image inspect alpine:3 >/dev/null 2>&1 || docker pull alpine:3 >/dev/null 2>&1 || true
+            if docker image inspect alpine:3 >/dev/null 2>&1; then
+              PREV_TAG=\$(docker inspect --format '{{.Config.Image}}' easyfix-backend 2>/dev/null | sed 's|.*:||')
+              STAMP=\$(date -u +%Y%m%d-%H%M%S)
+              ARCHIVE_NAME="easyfix-backend-logs-\${STAMP}-\${PREV_TAG:-unknown}"
+              echo "▶ Archiving outgoing container logs → \$ARCHIVE_NAME"
+              # Client-side stdout → /dev/null: the daemon still captures the
+              # container's stdout into its json log, and without this the whole
+              # backlog (up to 50 MB) would be echoed into the SSM command output.
+              docker logs -t easyfix-backend 2>&1 \
+                | docker run -i --name "\$ARCHIVE_NAME" \
+                    --label easyfix.logarchive=true \
+                    --log-opt max-size=60m --log-opt max-file=1 \
+                    alpine:3 cat >/dev/null 2>&1 \
+                && echo "✓ Log archive container created: \$ARCHIVE_NAME" \
+                || echo "⚠ Log archive failed (non-fatal) — continuing deploy"
+            else
+              echo "⚠ alpine:3 unavailable (no Docker Hub egress?) — skipping log archive"
+            fi
+          fi
+
+          # 7-DAY RETENTION. \`until=168h\` prunes archive containers created more
+          # than 7 days ago; the label filter scopes it so this can NEVER touch a
+          # real service container. Runs every deploy — add a daily cron too if
+          # deploys ever go quiet for more than a week.
+          docker container prune -f \
+            --filter "label=easyfix.logarchive=true" \
+            --filter "until=168h" >/dev/null 2>&1 || true
 
           echo "▶ Recreating backend container (crm-ui untouched)"
           docker compose up -d --no-deps --force-recreate backend

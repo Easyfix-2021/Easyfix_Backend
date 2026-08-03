@@ -1,0 +1,344 @@
+# EasyFix STT sidecar — build in CI → push to ECR → recreate ONLY the `stt`
+# container on the (shared) backend EC2.
+#
+# Separate from deploy.yml so a change to the heavy Python STT image doesn't
+# rebuild/redeploy the Node backend and vice-versa:
+#   deploy.yml     triggers on everything EXCEPT stt-service/** (paths-ignore)
+#   deploy-stt.yml triggers ONLY on stt-service/**  (this file)
+#
+# The `stt` service is declared in deploy/docker-compose.yml (QA) and
+# deploy/docker-compose.prod-backend.yml (prod). This workflow ships the compose
+# file too (so the stt service definition exists on the box even on a stt-only
+# push) and updates STT_IMAGE in /opt/easyfix/.env.
+#
+# Required (in the 'Organisation Level Secrets' GitHub Environment):
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, QA_INSTANCE_ID,
+#   PROD_BACKEND_INSTANCE_ID, ECR_REGISTRY
+#   ECR_REPOSITORY_STT   → NEW ECR repo for this image (create it: `easyfix/stt`)
+#
+# ⚠ First deploy also needs the EC2 to have enough RAM for the model (~0.5–1 GB
+#   for 'small'). The credential-helper + IAM ECR-read policy are assumed present
+#   (installed by the backend deploys); if `compose pull` fails with "no basic
+#   auth credentials", see docs/ECR_AUTH_BOOTSTRAP.md.
+
+name: Deploy STT sidecar (CI build → ECR → SSM recreate stt)
+
+on:
+  push:
+    branches: [QA, Production]
+    paths:
+      - 'stt-service/**'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Deploy target'
+        required: true
+        default: 'QA'
+        type: choice
+        options: [QA, Production]
+
+concurrency:
+  group: deploy-stt-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  precheck:
+    name: Python syntax check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Compile server.py
+        run: python -m py_compile stt-service/server.py
+
+  build-and-push:
+    name: Build STT image & push to ECR
+    needs: precheck
+    # Native arm64 runner — the EC2 target is Graviton (arm64); faster-whisper /
+    # CTranslate2 ship aarch64 manylinux wheels, so a native build avoids QEMU.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    environment: 'Organisation Level Secrets'
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      env_name:  ${{ steps.target.outputs.env_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve target
+        id: target
+        run: |
+          TARGET="${{ github.event.inputs.target || github.ref_name }}"
+          if [[ "$TARGET" == "QA" ]]; then
+            echo "env_name=qa"         >> "$GITHUB_OUTPUT"
+          else
+            echo "env_name=production" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION || 'ap-south-1' }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Ensure ECR repository exists
+        # ECR (unlike Docker Hub) does not auto-create repos on first push — create
+        # it idempotently so the very first STT deploy doesn't hard-fail.
+        run: |
+          REPO="${{ secrets.ECR_REPOSITORY_STT || 'easyfix/stt' }}"
+          aws ecr describe-repositories --repository-names "$REPO" >/dev/null 2>&1 \
+            || aws ecr create-repository --repository-name "$REPO" --image-scanning-configuration scanOnPush=true >/dev/null
+          echo "ECR repo $REPO ready"
+
+      - name: Compute image metadata
+        id: meta
+        run: |
+          REGISTRY="${{ secrets.ECR_REGISTRY || '902810393464.dkr.ecr.ap-south-1.amazonaws.com' }}"
+          REPO="${{ secrets.ECR_REPOSITORY_STT || 'easyfix/stt' }}"
+          ENV_NAME="${{ steps.target.outputs.env_name }}"
+          SHA_TAG="stt-${ENV_NAME}-${GITHUB_SHA::7}"
+          echo "image_tag=${SHA_TAG}"                               >> "$GITHUB_OUTPUT"
+          echo "image_uri=${REGISTRY}/${REPO}:${SHA_TAG}"           >> "$GITHUB_OUTPUT"
+          echo "moving_uri=${REGISTRY}/${REPO}:stt-${ENV_NAME}-latest" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build & push STT image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./stt-service
+          file: ./stt-service/Dockerfile
+          push: true
+          platforms: linux/arm64
+          tags: |
+            ${{ steps.meta.outputs.image_uri }}
+            ${{ steps.meta.outputs.moving_uri }}
+          cache-from: type=gha,scope=stt
+          cache-to:   type=gha,mode=max,scope=stt
+          provenance: false
+
+  deploy:
+    name: Deploy via SSM (recreate stt only)
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    environment: 'Organisation Level Secrets'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Encode docker-compose.yml for transport
+        id: compose
+        run: |
+          ENV_NAME="${{ needs.build-and-push.outputs.env_name }}"
+          if [[ "$ENV_NAME" == "qa" ]]; then
+            COMPOSE_FILE="deploy/docker-compose.yml"
+          else
+            COMPOSE_FILE="deploy/docker-compose.prod-backend.yml"
+          fi
+          [[ -f "$COMPOSE_FILE" ]] || { echo "::error::$COMPOSE_FILE missing"; exit 1; }
+          echo "▶ Using $COMPOSE_FILE for env=$ENV_NAME"
+          echo "compose_b64=$(base64 -w0 "$COMPOSE_FILE")" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION || 'ap-south-1' }}
+
+      - name: Resolve instance ID for this env
+        id: target
+        run: |
+          ENV_NAME="${{ needs.build-and-push.outputs.env_name }}"
+          if [[ "$ENV_NAME" == "qa" ]]; then
+            echo "instance_id=${{ secrets.QA_INSTANCE_ID || 'i-032aa9d2942305364' }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "instance_id=${{ secrets.PROD_BACKEND_INSTANCE_ID }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: SSM compose pull + up (stt only)
+        run: |
+          set -euo pipefail
+          INSTANCE_ID="${{ steps.target.outputs.instance_id }}"
+          ENV_NAME="${{ needs.build-and-push.outputs.env_name }}"
+          IMAGE_TAG="${{ needs.build-and-push.outputs.image_tag }}"
+          REGISTRY="${{ secrets.ECR_REGISTRY || '902810393464.dkr.ecr.ap-south-1.amazonaws.com' }}"
+          REPO="${{ secrets.ECR_REPOSITORY_STT || 'easyfix/stt' }}"
+          IMAGE_URI="${REGISTRY}/${REPO}:${IMAGE_TAG}"
+
+          # STT memory-cap tunables — % of the target box's RAM + clamps. Baked into
+          # the remote script below; override per-repo/environment via GitHub Variables
+          # (Settings → Variables) without touching this file. Defaults suit both the
+          # shared QA box and the prod-BE box (the max clamp is what protects co-tenants).
+          STT_MEM_PERCENT="${{ vars.STT_MEM_PERCENT || '25' }}"
+          STT_MEM_MIN_MB="${{ vars.STT_MEM_MIN_MB || '768' }}"
+          STT_MEM_MAX_MB="${{ vars.STT_MEM_MAX_MB || '1536' }}"
+
+          [[ -n "$INSTANCE_ID" ]] || { echo "::error::INSTANCE_ID missing for $ENV_NAME"; exit 1; }
+
+          COMPOSE_B64="${{ steps.compose.outputs.compose_b64 }}"
+          REMOTE_SCRIPT=$(cat <<EOF
+          set -euo pipefail
+          cd /opt/easyfix
+
+          # docker compose loads the WHOLE stack model (incl. the backend service's
+          # env_file), so backend.env must already exist even for a stt-only op —
+          # fail with a clear pointer rather than a cryptic compose error.
+          if [[ ! -f /opt/easyfix/backend.env ]]; then
+            echo "::error::/opt/easyfix/backend.env missing — bootstrap the host first (deploy/bootstrap-env.sh, see AWS_QA_BOOTSTRAP.md)"; exit 1
+          fi
+
+          # Sync compose from the repo so the stt service definition exists here
+          # even on a stt-only push (atomic temp → mv).
+          echo "$COMPOSE_B64" | base64 -d > /opt/easyfix/.docker-compose.yml.new
+          mv /opt/easyfix/.docker-compose.yml.new /opt/easyfix/docker-compose.yml
+
+          # ── STT memory cap: a % of THIS box's RAM so it auto-adjusts on resize ──
+          # STT's real footprint is fixed (~1 GB for the 'small' model), so the % is a
+          # SAFETY CAP and the min/max clamps are what actually keep it from starving
+          # co-tenants (QA = backend + 2 UIs + STT on one box; prod-BE = backend + STT).
+          # Computed here on the target host via 'free', so each environment
+          # self-measures with zero hardcoding — resize the box, redeploy, done.
+          TOTAL_MB=\$(free -m | awk '/^Mem:/{print \$2}')
+          if [[ -z "\$TOTAL_MB" || "\$TOTAL_MB" -le 0 ]]; then
+            echo "⚠ could not read host RAM — falling back to ${STT_MEM_MAX_MB}m cap"
+            CAP_MB=$STT_MEM_MAX_MB
+          else
+            CAP_MB=\$(( TOTAL_MB * $STT_MEM_PERCENT / 100 ))
+            [ "\$CAP_MB" -lt $STT_MEM_MIN_MB ] && CAP_MB=$STT_MEM_MIN_MB
+            [ "\$CAP_MB" -gt $STT_MEM_MAX_MB ] && CAP_MB=$STT_MEM_MAX_MB
+          fi
+          STT_MEM_LIMIT="\${CAP_MB}m"
+          echo "▶ Host RAM=\${TOTAL_MB}m → STT mem cap=\$STT_MEM_LIMIT ($STT_MEM_PERCENT% of RAM, clamp ${STT_MEM_MIN_MB}m-${STT_MEM_MAX_MB}m)"
+
+          # Update STT_IMAGE + STT_MEM_LIMIT only — leaves BACKEND_IMAGE / *_UI_IMAGE
+          # untouched. flock serialises with a concurrent backend deploy writing the
+          # same .env (a single push touching both triggers both workflows).
+          touch /opt/easyfix/.env
+          (
+            flock 9
+            if grep -q '^STT_IMAGE=' /opt/easyfix/.env; then
+              sed -i "s|^STT_IMAGE=.*|STT_IMAGE=$IMAGE_URI|" /opt/easyfix/.env
+            else
+              echo "STT_IMAGE=$IMAGE_URI" >> /opt/easyfix/.env
+            fi
+            if grep -q '^STT_MEM_LIMIT=' /opt/easyfix/.env; then
+              sed -i "s|^STT_MEM_LIMIT=.*|STT_MEM_LIMIT=\$STT_MEM_LIMIT|" /opt/easyfix/.env
+            else
+              echo "STT_MEM_LIMIT=\$STT_MEM_LIMIT" >> /opt/easyfix/.env
+            fi
+          ) 9>/opt/easyfix/.env.lock
+
+          # ECR is a private registry — the credential-helper must be present to pull.
+          # It's installed by the backend deploy / host bootstrap; if it's missing
+          # here (a brand-new host doing an STT-first deploy), fail with a clear
+          # pointer instead of a cryptic "no basic auth credentials".
+          if ! command -v docker-credential-ecr-login >/dev/null 2>&1; then
+            echo "::error::amazon-ecr-credential-helper not installed — run the backend deploy first (it bootstraps ECR auth) or see docs/ECR_AUTH_BOOTSTRAP.md"; exit 1
+          fi
+
+          echo "▶ Pulling $IMAGE_URI"
+          docker compose pull stt
+
+          # ─── Log history for Dozzle (rolling 7-day window) ──────────────
+          # \`compose up --force-recreate\` DESTROYS the outgoing container, and
+          # json-file logs live under /var/lib/docker/containers/<id>/ — a
+          # directory Docker deletes with the container. So Dozzle can only ever
+          # show the CURRENT deployment unless we preserve the old logs first.
+          #
+          # Replay them into a throwaway container: \`alpine cat\` copies stdin to
+          # stdout, the daemon captures that as the new container's own json log,
+          # and Dozzle lists it (Settings → "Show Stopped Containers"). Renaming
+          # + keeping the old container does NOT work — compose tracks service
+          # containers by LABEL, so the next \`up\` reclaims it.
+          # \`-t\` preserves the ORIGINAL timestamps in the text (Dozzle's own
+          # timestamp column shows the replay time). Full rationale in the
+          # backend's .github/workflows/deploy.yml.
+          #
+          # STT-specific value: this is what preserves the log tail from an
+          # OOM-killed container across the next deploy.
+          if docker inspect easyfix-stt >/dev/null 2>&1; then
+            docker image inspect alpine:3 >/dev/null 2>&1 || docker pull alpine:3 >/dev/null 2>&1 || true
+            if docker image inspect alpine:3 >/dev/null 2>&1; then
+              PREV_TAG=\$(docker inspect --format '{{.Config.Image}}' easyfix-stt 2>/dev/null | sed 's|.*:||')
+              STAMP=\$(date -u +%Y%m%d-%H%M%S)
+              ARCHIVE_NAME="easyfix-stt-logs-\${STAMP}-\${PREV_TAG:-unknown}"
+              echo "▶ Archiving outgoing container logs → \$ARCHIVE_NAME"
+              # Client stdout → /dev/null: the daemon still captures the
+              # container's stdout; without this the whole backlog would be
+              # echoed into the SSM command output.
+              docker logs -t easyfix-stt 2>&1 \
+                | docker run -i --name "\$ARCHIVE_NAME" \
+                    --label easyfix.logarchive=true \
+                    --log-opt max-size=60m --log-opt max-file=1 \
+                    alpine:3 cat >/dev/null 2>&1 \
+                && echo "✓ Log archive container created: \$ARCHIVE_NAME" \
+                || echo "⚠ Log archive failed (non-fatal) — continuing deploy"
+            else
+              echo "⚠ alpine:3 unavailable (no Docker Hub egress?) — skipping log archive"
+            fi
+          fi
+
+          # 7-DAY RETENTION. Label-scoped so it can never touch a real service
+          # container. The label is SHARED across every EasyFix deploy workflow,
+          # so whichever service deploys next also cleans up the others' stale
+          # archives on this host.
+          docker container prune -f \
+            --filter "label=easyfix.logarchive=true" \
+            --filter "until=168h" >/dev/null 2>&1 || true
+
+          echo "▶ Recreating stt container (backend + UIs untouched)"
+          docker compose up -d --no-deps --force-recreate stt
+
+          # Wait for the container's healthcheck (image HEALTHCHECK; model is baked so
+          # load is fast). Fail on a not-running container.
+          for i in \$(seq 1 40); do
+            STATUS=\$(docker inspect --format '{{.State.Health.Status}}' easyfix-stt 2>/dev/null || echo unknown)
+            RUNNING=\$(docker inspect --format '{{.State.Running}}' easyfix-stt 2>/dev/null || echo false)
+            echo "[\$i/40] stt health=\$STATUS running=\$RUNNING"
+            [[ "\$STATUS" == "healthy" ]] && break
+            [[ "\$RUNNING" != "true" ]] && { echo "::error::easyfix-stt is not running"; docker logs easyfix-stt --tail 80 2>&1 || true; exit 1; }
+            sleep 6
+          done
+
+          # Terminal guard — a running-but-never-healthy container is a FAILED deploy,
+          # not green (else CI passes while the teleprompter has no reachable STT).
+          FINAL=\$(docker inspect --format '{{.State.Health.Status}}' easyfix-stt 2>/dev/null || echo unknown)
+          if [[ "\$FINAL" != "healthy" ]]; then
+            echo "::error::easyfix-stt did not become healthy (last=\$FINAL)"; docker logs easyfix-stt --tail 80 2>&1 || true; exit 1
+          fi
+
+          docker image prune -af --filter "until=72h" >/dev/null 2>&1 || true
+          docker compose ps stt
+          echo "✓ Deployed $IMAGE_URI (healthy)"
+          EOF
+          )
+
+          SCRIPT_B64=$(printf '%s' "$REMOTE_SCRIPT" | base64 -w0)
+          PARAMS_JSON=$(jq -n --arg b64 "$SCRIPT_B64" '{commands: ["echo \($b64) | base64 -d | bash"]}')
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy stt ${IMAGE_URI##*:}" \
+            --parameters "$PARAMS_JSON" \
+            --query 'Command.CommandId' --output text)
+
+          STATUS=""
+          for i in $(seq 1 72); do
+            sleep 5
+            STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --query 'Status' --output text 2>/dev/null || echo Pending)
+            echo "[$i/72] SSM status: $STATUS"
+            case "$STATUS" in Success|Failed|Cancelled|TimedOut) break ;; esac
+          done
+
+          echo "── Remote stdout ──"
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --query 'StandardOutputContent' --output text || true
+          echo "── Remote stderr ──"
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --query 'StandardErrorContent' --output text || true
+
+          [[ "$STATUS" == "Success" ]] || { echo "::error::SSM finished with $STATUS"; exit 1; }

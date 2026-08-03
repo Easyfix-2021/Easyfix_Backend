@@ -1,7 +1,18 @@
 const Joi = require('joi');
-const { ALL_STATUS_VALUES } = require('../services/job.service');
+const { ALL_STATUS_VALUES, SORTABLE_COLUMNS, OFFER_STATE_VALUES } = require('../services/job.service');
 
 const intId   = Joi.number().integer().positive();
+/*
+ * csvIds — a filter param that accepts EITHER a single positive integer id OR a
+ * comma-separated list of them ("12,34,56"). Backs the Pending-to-Start
+ * multi-select filters (clientId / cityId / projectManagerId / zonalManagerId).
+ * The single-id alternative preserves back-compat with existing single-select
+ * callers; the service layer (toIdArray) normalises both shapes to an IN (...).
+ */
+const csvIds  = Joi.alternatives(
+  intId,
+  Joi.string().pattern(/^\d+(,\d+)*$/).max(200),
+);
 /*
  * INDIAN_MOBILE_REGEX (2026-06-03): tightened from `/^[0-9]{10}$/` to
  * `/^[6-9]\d{9}$/`. Matches the FE `INDIAN_MOBILE_REGEX` in
@@ -50,8 +61,30 @@ const listQuery = Joi.object({
   // tab. URLSearchParams ships the value as the string 'true'/'false';
   // accept both shapes for parity with the other boolean-ish filters.
   noServices: Joi.alternatives(Joi.boolean(), Joi.string().valid('true', 'false')).optional(),
-  clientId: intId.optional(),
-  cityId: intId.optional(),
+  /*
+   * `offerState` (2026-07-31) — the Pending-for-Scheduling tab's SUB-STATE
+   * filter. That tab is a bucket (status=0 + assigned=false), so every job in
+   * it already shares one job_status; the axis worth filtering is the OFFER
+   * lifecycle inside the bucket:
+   *   'pending' → never offered   'offered' → an OPEN offer exists
+   *   'expired' → offers exist, none open
+   * It NARROWS — it never replaces the caller's status / assigned pins.
+   * `''` is allowed (and ignored) so the FE can clear the control without
+   * having to strip the key. Values derive from the service's
+   * OFFER_STATE_VALUES so the two sides cannot drift.
+   */
+  offerState: Joi.string().valid(...OFFER_STATE_VALUES).allow('').optional(),
+  // clientId / cityId — single id OR CSV list (Pending-to-Start multi-select
+  // Clients / Cities filters). csvIds keeps a lone id valid for back-compat.
+  clientId: csvIds.optional(),
+  cityId: csvIds.optional(),
+  // projectManagerId — the client's mapped PM in tbl_vertical_mapping
+  // (user_id where user_type = 1). zonalManagerId — the city's zonal owner
+  // (tbl_city.state_user). Both drive the Pending-to-Start page's PM / ZM
+  // filters; single id OR CSV list, applied as EXISTS / ci-column IN (...)
+  // predicates in service.list().
+  projectManagerId: csvIds.optional(),
+  zonalManagerId: csvIds.optional(),
   ownerId: intId.optional(),
   easyfixerId: intId.optional(),
   // customerId — drives the "View History" panel in the Book-New-Call
@@ -102,6 +135,25 @@ const listQuery = Joi.object({
     Joi.string().valid('now'),
     Joi.date().iso(),
   ).optional(),
+  /*
+   * Server-side sort (whitelisted). sortDir asc|desc. Both optional — absent →
+   * default job_id DESC.
+   *
+   * `sortBy` is derived from the SERVICE's SORTABLE_COLUMNS keys rather than
+   * being re-listed here. The two whitelists previously had to be maintained by
+   * hand on both sides, and a key present in only one of them is silently
+   * dropped — the list then falls back to the default job_id DESC order with no
+   * error, which is exactly the regression this endpoint hit before. Deriving
+   * makes BE-side drift structurally impossible. (Same pattern as
+   * routes/admin/tools.js, service-types.js, users.js, etc.)
+   *
+   * Includes 'age' — NOT a tbl_job column: the service maps it to
+   * JOB_AGE_SECS_EXPR (precise seconds), so same-day jobs order correctly
+   * instead of tying on the floored day value the UI displays. The FE keeps its
+   * own sortable-column list and must list 'age' there too.
+   */
+  sortBy: Joi.string().valid(...Object.keys(SORTABLE_COLUMNS)).optional(),
+  sortDir: Joi.string().valid('asc', 'desc').optional(),
   limit: Joi.number().integer().min(1).max(500).default(50),
   offset: Joi.number().integer().min(0).default(0),
 });
@@ -334,6 +386,12 @@ const offerBody = Joi.object({
   easyfixerIds: Joi.array().items(intId).min(1).max(50).required(),
   requestedDateTime: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$/).max(40).optional(),
   timeSlot: Joi.string().max(200).allow('', null).optional(),
+  // Where the offer was made from — the CRM sends `source` when the whole batch
+  // shares one origin (Top-10 list vs Search Result), or `sourceByEfr` to tag
+  // each tech individually when a selection mixes both lists. Stored on
+  // tbl_job_offer.offer_source. `sourceByEfr` overrides `source` per tech.
+  source: Joi.string().valid('top10', 'search', 'auto').optional(),
+  sourceByEfr: Joi.object().pattern(/^\d+$/, Joi.string().valid('top10', 'search', 'auto')).optional(),
 });
 
 /*
@@ -351,12 +409,17 @@ const candidatesQuery = Joi.object({
 
 /*
  * Query schema for GET /:id/candidates/search (match-anyone). `term` is
- * required (matches efr_id / efr_name / efr_no). Same optional schedule
- * overrides as the ranked list.
+ * required and is the ONLY search input — it matches efr_id / efr_name /
+ * efr_no / city_name / efr_pin_no, so no per-field (city=/pin=) params exist.
+ * Same optional schedule overrides as the ranked list.
  */
 const candidatesSearchQuery = Joi.object({
   term: Joi.string().trim().min(1).max(100).required(),
-  limit: Joi.number().integer().min(1).max(50).default(50),
+  // 250 (2026-07-15): the modal paginates the result client-side, so a bigger
+  // page is a nicer list rather than a longer scroll. Still CAPPED — an
+  // unbounded LIKE over ~4.7k technicians would serialise the whole table into
+  // one payload on a 1-char term.
+  limit: Joi.number().integer().min(1).max(250).default(250),
   jobDate: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$/).max(40).optional(),
   timeSlot: Joi.string().max(200).optional(),
 });
@@ -366,9 +429,34 @@ const ownerBody = Joi.object({
   reason: Joi.string().min(3).max(500).required(),
 });
 
+/*
+ * Reschedule body — PATCH /:id/reschedule. The Schedule & Assign modal locks the
+ * job's Date/Time and changes them ONLY via the explicit Reschedule dialog, where
+ * reason + remarks are MANDATORY (audited to scheduling_history + a job comment).
+ * All three fields required. `requestedDateTime` is an IST WALL-CLOCK string
+ * exactly like assignBody's (never Joi.date() — see that note). `rescheduleReason`
+ * is the selected reason's label (mirrored into scheduling_history.reschedule_reason
+ * alongside `reasonId`).
+ */
+const rescheduleBody = Joi.object({
+  requestedDateTime: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$/).max(40).required(),
+  reasonId: intId.required(),
+  rescheduleReason: Joi.string().max(500).optional(),
+  remarks: Joi.string().trim().min(1).max(500).required(),
+});
+
+/*
+ * Query schema for GET /:id/slot-recommendations. `date` is a wall-clock IST
+ * date — the service compares it as a plain string against DATE() values, so it
+ * must NOT be UTC-converted anywhere on the way in.
+ */
+const slotRecommendationsQuery = Joi.object({
+  date: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$/).max(40).required(),
+});
+
 const idParam = Joi.object({ id: intId.required() });
 
 module.exports = {
   listQuery, createBody, updateBody, statusBody, assignBody, offerBody, ownerBody, idParam,
-  candidatesQuery, candidatesSearchQuery,
+  rescheduleBody, candidatesQuery, candidatesSearchQuery, slotRecommendationsQuery,
 };

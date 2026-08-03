@@ -4,6 +4,9 @@ const logger = require('../../logger');
 const { pool } = require('../../db');
 const plivo = require('../../services/plivo.service');
 const plivoLog = require('../../services/plivo-call-log.service');
+const aiCall = require('../../services/plivo-ai-call.service');
+const aiSession = require('../../services/ai-call-session.service');
+const teleprompter = require('../../services/teleprompter.service');
 
 /*
  * /api/public/plivo/answer — Plivo answer_url callback (truly public, no auth).
@@ -51,10 +54,18 @@ router.get('/answer', async (req, res) => {
   } catch (err) {
     logger.warn({ jci: claims.jci, err: err && err.message }, 'plivo answer: audit update failed (returning XML anyway)');
   }
-  await plivoLog.markAnswered(claims.jci, req.query.CallUUID || null);
+  // Decide recording ONCE (from the cached plivo.recording.enabled flag) and
+  // use the same value for the log, the persisted per-call flag, and the Dial
+  // XML — so "was this call set to record?" is answerable per call afterward.
+  const record = plivo.recordingEnabled();
+  logger.info('Plivo answer · jci=' + claims.jci + ' · CallUUID=' + (req.query.CallUUID || 'none') + ' · record=' + record);
+  await plivoLog.markAnswered(claims.jci, req.query.CallUUID || null, record);
 
   logger.info('Plivo answer: bridging to customer · jci=' + claims.jci);
-  return xml(plivo.buildAnswerXml(claims.dest));
+  // recordingCallbackUrl: Plivo pushes us the recording URL/id when ready, so
+  // playback doesn't depend on guessing the recording's call_uuid.
+  const recCbUrl = record ? plivo.recordingCallbackUrl(claims.jci) : null;
+  return xml(plivo.buildAnswerXml(claims.dest, { record, recordingCallbackUrl: recCbUrl }));
 });
 
 /*
@@ -98,10 +109,126 @@ async function webAnswer(req, res) {
   } catch (err) {
     logger.warn({ jci: resolved.jci, err: err && err.message }, 'plivo web-answer: audit update failed (returning XML anyway)');
   }
+  const record = plivo.recordingEnabled();
+  logger.info('Plivo web-answer · jci=' + resolved.jci + ' · CallUUID=' + (src.CallUUID || 'none') + ' · record=' + record);
   await plivoLog.markRinging(resolved.jci, src.CallUUID || null);
-  return xml(plivo.buildAnswerXml(resolved.number));
+  await plivoLog.setRecordingRequested(resolved.jci, record);
+  const recCbUrl = record ? plivo.recordingCallbackUrl(resolved.jci) : null;
+
+  // AI Teleprompter (additive, flag-gated): if this web call is a guided
+  // teleprompter session AND the feature is on AND a wss base is configured, fork
+  // the call audio (listen-only) to the STT websocket for this session. Any
+  // failure/absence ⇒ streamWssUrl stays null ⇒ the exact previous <Dial> XML.
+  let streamWssUrl = null;
+  try {
+    if (resolved.teleprompterSessionId && teleprompter.enabled()) {
+      const base = aiCall.wsBase();
+      if (base) {
+        const t = teleprompter.signToken(resolved.teleprompterSessionId);
+        streamWssUrl = `${base}/teleprompter-stream?t=${encodeURIComponent(t)}`;
+        logger.info('Plivo web-answer: forking audio to teleprompter STT · session=' + resolved.teleprompterSessionId);
+      } else {
+        logger.warn('Plivo web-answer: teleprompter on but no wss base configured — no STT fork');
+      }
+    }
+  } catch (e) { logger.warn('Plivo web-answer: teleprompter stream setup failed (bridging normally) · ' + (e && e.message)); }
+
+  return xml(plivo.buildAnswerXml(resolved.number, { record, recordingCallbackUrl: recCbUrl, streamWssUrl }));
 }
 router.post('/web-answer', express.urlencoded({ extended: false }), webAnswer);
 router.get('/web-answer', webAnswer);
+
+/*
+ * /api/public/plivo/recording-callback — Plivo POSTs the recording URL/id here
+ * once the mp3 is ready (set via the <Record callbackUrl> in buildAnswerXml).
+ * Plivo params: RecordUrl / RecordingID / RecordingDuration. UNAUTHENTICATED;
+ * the signed `t` token (kind:'rec', carries jci) is the authorisation. Storing
+ * by jci is robust to whichever leg's call_uuid the recording is filed under —
+ * exactly why the old lazy call_uuid lookup failed for web calls. ALWAYS 200 so
+ * Plivo doesn't retry-storm; the DB write is best-effort.
+ */
+async function recordingCallback(req, res) {
+  const src = { ...req.query, ...(req.body || {}) };
+  const claims = plivo.verifyRecordingToken(req.query.t);
+  if (!claims || claims.jci == null) {
+    logger.warn('Plivo recording-callback: invalid/expired token · ignoring');
+    return res.status(200).type('text/plain').send('ok');
+  }
+  const url = src.RecordUrl || src.recording_url || null;
+  const id = src.RecordingID || src.recording_id || null;
+  const duration = src.RecordingDuration || src.recording_duration || null;
+  logger.info('Plivo recording-callback · jci=' + claims.jci + ' · id=' + (id || 'none') + ' · hasUrl=' + !!url);
+  if (url) await plivoLog.setRecording(claims.jci, { url, id, duration });
+  return res.status(200).type('text/plain').send('ok');
+}
+router.post('/recording-callback', express.urlencoded({ extended: false }), recordingCallback);
+router.get('/recording-callback', recordingCallback);
+
+/*
+ * /api/public/plivo/ai-answer — answer_url for the AI-calling TEST flow ONLY.
+ * SEPARATE from /answer (which bridges to a human via <Dial>): this returns
+ * <Stream> so Plivo pipes the call audio to our media websocket → OpenAI
+ * Realtime. Authorisation is the signed `t` JWT minted by
+ * ai-call-session.signToken (carries the sessionId). Any invalid/expired token,
+ * disabled feature, or missing wss base yields an empty <Response/> so Plivo
+ * never chokes and the existing bridge flow is entirely untouched.
+ */
+router.get('/ai-answer', async (req, res) => {
+  const xml = (body) => res.type('text/xml').send(body);
+  const empty = '<?xml version="1.0" encoding="UTF-8"?>\n<Response></Response>';
+
+  const claims = aiSession.verifyToken(req.query.t);
+  if (!claims || !claims.sid) {
+    logger.warn('Plivo ai-answer: invalid/expired token · returning empty Response');
+    return xml(empty);
+  }
+  if (!aiSession.enabled()) {
+    logger.warn('Plivo ai-answer: ai.calling.enabled is off · returning empty Response');
+    return xml(empty);
+  }
+  const base = aiCall.wsBase();
+  if (!base) {
+    logger.error('Plivo ai-answer: no wss callback base configured · returning empty Response');
+    return xml(empty);
+  }
+
+  // NOTE: we intentionally do NOT flip status to 'streaming' here. The call is
+  // answered but the media ws may still fail to connect (cap/gate/replica). The
+  // relay stamps 'streaming' (+ CallUUID) from its 'start' event once audio
+  // actually flows, so the session status stays truthful.
+  const wssUrl = `${base}/ai-voice-stream?t=${encodeURIComponent(req.query.t)}`;
+  logger.info('Plivo ai-answer: returning Stream XML · session=' + claims.sid);
+  return xml(aiCall.buildStreamXml(wssUrl));
+});
+
+// Plivo also POSTs the answer_url as a terminal/stream callback once the <Stream>
+// ends. The GET above is the real answer; reply to POST with an empty Response so
+// Plivo gets clean XML (a clean hangup) instead of a 404 + error log.
+router.post('/ai-answer', (req, res) =>
+  res.type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?>\n<Response></Response>'));
+
+/*
+ * /api/public/plivo/ai-recording — Plivo POSTs the finished recording here (set as
+ * recording_callback_url by plivo-ai-call.startRecording). We ack 200 immediately
+ * and persist off the live path via the bounded post-call queue.
+ */
+const aiPostCallQueue = require('../../services/ai-post-call-queue');
+router.post('/ai-recording', express.urlencoded({ extended: false }), (req, res) => {
+  const src = { ...req.query, ...(req.body || {}) };
+  const callUuid = src.CallUUID || src.call_uuid || null;
+  const recordUrl = src.RecordUrl || src.recording_url || null;
+  const duration = src.RecordingDuration || src.recording_duration || null;
+  res.status(200).type('text/plain').send('ok');
+  if (!callUuid || !recordUrl) { logger.warn('Plivo ai-recording: missing CallUUID/RecordUrl'); return; }
+  aiPostCallQueue.enqueueTask({
+    label: 'record:' + callUuid,
+    run: async () => {
+      const sessionId = await aiSession.getSessionIdByCallUuid(callUuid);
+      if (!sessionId) { logger.warn('Plivo ai-recording: no session for CallUUID=' + callUuid); return; }
+      await aiSession.saveRecording(sessionId, { url: recordUrl, duration });
+      logger.info('AI voice recording saved · session=' + sessionId + ' · dur=' + (duration || '?') + 's');
+    },
+  });
+});
 
 module.exports = router;

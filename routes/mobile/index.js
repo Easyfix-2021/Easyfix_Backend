@@ -1,5 +1,6 @@
 const router = require('express').Router();
 const Joi = require('joi');
+const { OFFER_STATUS } = require('../../services/offer-status');
 
 const validate = require('../../middleware/validate');
 const logger = require('../../logger');
@@ -7,6 +8,11 @@ const requireTechAuth = require('../../middleware/tech-auth');
 const { pool } = require('../../db');
 const techAuth = require('../../services/tech-auth.service');
 const jobService = require('../../services/job.service');
+const addressService = require('../../services/address.service');
+const jobCommentService = require('../../services/job-comment.service');
+const shareService = require('../../services/job-share.service');
+const voice = require('../../services/voice.service');
+const { dailyBridgeCapReached, persistBridgeCall } = require('../public/_public-call');
 const { modernOk, modernError } = require('../../utils/response');
 const { rateLimit } = require('../../middleware/rate-limit');
 
@@ -304,7 +310,7 @@ router.get('/jobs/rejected', async (req, res, next) => {
          LEFT JOIN tbl_service_type st ON st.service_type_id = j.fk_service_type_id
          LEFT JOIN tbl_address ad ON ad.address_id       = j.fk_address_id
          LEFT JOIN tbl_city ci    ON ci.city_id          = ad.city_id
-        WHERE jo.fk_easyfixter_id = ? AND jo.offer_status = 2
+        WHERE jo.fk_easyfixter_id = ? AND jo.offer_status = ${OFFER_STATUS.REJECTED}
         ORDER BY jo.responded_at DESC
         LIMIT 100`,
       [req.tech.efr_id],
@@ -352,7 +358,127 @@ router.get('/jobs/:id', async (req, res, next) => {
     const canView = job.fk_easyfixter_id === req.tech.efr_id
       || (await jobService.techHasOpenOffer(job.job_id, req.tech.efr_id));
     if (!canView) return modernError(res, 404, 'job not found');
+    // Defence-in-depth (2026-07-08): the app never shows or dials the customer
+    // number — it uses the masked /customer-call bridge — so the raw number
+    // must not even reach the device. Strip it MOBILE-ONLY here; the shared
+    // getById keeps it for the CRM's own /admin route, and the bridge resolves
+    // it server-side from tbl_customer, so nothing that needs it is affected.
+    if (job.customer_mob_no != null) job.customer_mob_no = null;
+    if (job.customer && typeof job.customer === 'object' && job.customer.phone != null) job.customer.phone = null;
     modernOk(res, job);
+  } catch (e) { next(e); }
+});
+
+// Mint a public "share job" link + ready-to-share message for a job the
+// technician OWNS (is assigned to). The link opens a NON-CONFIDENTIAL public
+// page (service, address + Navigate, masked Call to the customer). Non-owners
+// get 404 (no existence disclosure). buildShareBundle throws 410 for a
+// finished/cancelled job so the app can tell the tech it can't be shared.
+router.get('/jobs/:id/share-link', async (req, res, next) => {
+  try {
+    const jobId = Number(req.params.id);
+    logger.info('Mint job share link · id=' + jobId + ' · efr=' + req.tech.efr_id);
+    const job = await jobService.getById(jobId);
+    if (!job || job.fk_easyfixter_id !== req.tech.efr_id) {
+      return modernError(res, 404, 'job not found');
+    }
+    const bundle = await shareService.buildShareBundle(jobId, pool, { sharedByEfrId: req.tech.efr_id });
+    return modernOk(res, bundle);
+  } catch (e) {
+    return e && typeof e.status === 'number' ? modernError(res, e.status, e.message) : next(e);
+  }
+});
+
+// ─── Masked click-to-call: bridge the technician ⇄ customer ──────────
+// The app NEVER shows or dials the customer's number. from = the tech's on-file
+// efr_no (auto — no typing); to = customer (resolved server-side, never
+// returned), bridged via Plivo. Same masking posture as the CRM operator
+// click-to-call.
+//
+// SCOPE — the tech must OWN the job (it is assigned to them). An open offer is
+// deliberately NOT enough (tightened 2026-07-29).
+//
+// WHY: under the offer-pool model one job is offered to SEVERAL technicians at
+// once, and `fk_easyfixter_id` stays NULL until one accepts. While the previous
+// rule (`owner OR open offer`) leaked no phone number — the bridge is masked and
+// the raw number is stripped from the mobile payload — it did let EVERY offered
+// tech ring the same customer about a job only one of them will ever do, before
+// any of them had committed to it. Viewing the job (line ~359) and rejecting the
+// offer (line ~527) still accept an open offer, because a tech must be able to
+// review and decline; only CONTACTING the customer now requires acceptance.
+async function resolveMobileCallLegs(req, jobId) {
+  const job = await jobService.getById(jobId);
+  if (!job) return { error: { status: 404, msg: 'job not found' } };
+  const canCall = job.fk_easyfixter_id === req.tech.efr_id;
+  if (!canCall) return { error: { status: 404, msg: 'job not found' } };
+  const techMobile = req.tech.efr_no;
+  if (!techMobile) return { error: { status: 422, msg: 'No mobile number on file for your account' } };
+  const [[cust]] = await pool.query(
+    `SELECT c.customer_mob_no AS mobile,
+            COALESCE(j.job_customer_name, c.customer_name) AS name, j.job_status
+       FROM tbl_job j LEFT JOIN tbl_customer c ON c.customer_id = j.fk_customer_id
+      WHERE j.job_id = ? LIMIT 1`,
+    [jobId],
+  );
+  if (!cust || !cust.mobile) return { error: { status: 422, msg: 'No customer number on file to connect the call' } };
+  return { techMobile, customer: cust };
+}
+
+// Optional masked from(tech)→to(customer) preview for a confirm dialog.
+router.post('/jobs/:id/customer-call/preview', async (req, res, next) => {
+  try {
+    const legs = await resolveMobileCallLegs(req, Number(req.params.id));
+    if (legs.error) return modernError(res, legs.error.status, legs.error.msg);
+    const preview = await voice.previewCallLegs({ provider: 'plivo', from: legs.techMobile, to: legs.customer.mobile, alwaysApplyEnvOverride: true });
+    return modernOk(res, preview);
+  } catch (e) { next(e); }
+});
+
+// Place the masked bridge call (tech's phone rings first, then the customer).
+//
+// ALWAYS a PSTN bridge — deliberately independent of `voice.call.mode`. That
+// property is a CRM-ONLY feature gate (read solely in routes/admin/calls.js to
+// 409 the web-calling endpoints and pick the CRM panel); it is currently 'web'
+// because the CRM needs WebRTC. plivo.service.clickToCall() never reads it — it
+// only consults plivo.calling.enabled — so a 'web' setting has no effect here.
+// This MUST stay true: the technician has no browser leg, so if callMode() ever
+// gets wired into clickToCall, this route must pin mode='mobile' explicitly.
+router.post('/jobs/:id/customer-call', async (req, res, next) => {
+  try {
+    const jobId = Number(req.params.id);
+    const legs = await resolveMobileCallLegs(req, jobId);
+    if (legs.error) return modernError(res, legs.error.status, legs.error.msg);
+
+    if (await dailyBridgeCapReached(jobId)) {
+      return modernError(res, 429, 'Call limit reached for this job today. Please try again later.');
+    }
+
+    logger.info('Mobile customer bridge call · jobId=' + jobId + ' · efr=' + req.tech.efr_id);
+    const result = await voice.clickToCall({ provider: 'plivo', from: legs.techMobile, to: legs.customer.mobile, alwaysApplyEnvOverride: true });
+
+    const audit = {
+      jobId,
+      callId: result.callId,
+      fromMob: legs.techMobile,
+      fromName: req.tech.efr_name || 'Technician',
+      toMob: legs.customer.mobile,
+      toId: null,
+      toName: legs.customer.name || 'Customer',
+      jobStatus: legs.customer.job_status,
+      jobEfrId: req.tech.efr_id,
+      provider: result.provider,
+    };
+
+    if (!result.delivered && (result.suppressed || result.disabled)) {
+      await persistBridgeCall(audit);
+      return modernOk(res, { delivered: false, suppressed: true });
+    }
+    if (!result.delivered) {
+      logger.warn({ jobId, diagnostic: result.diagnostic, err: result.error }, 'mobile customer-call failed');
+      return modernError(res, 502, 'Could not place the call. Please try again.');
+    }
+    await persistBridgeCall(audit);
+    return modernOk(res, { delivered: true });
   } catch (e) { next(e); }
 });
 
@@ -470,7 +596,11 @@ router.post('/jobs/:id/eta', validate(Joi.object({
 // through the `extras` whitelist so the transition rules + stamps land
 // in a single shared UPDATE — no duplication of status-transition logic.
 router.post('/jobs/:id/checkin', validate(Joi.object({
-  gps: Joi.string().pattern(/^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/).required(),
+  // Location stamp is nice-to-have, NOT a gate — the customer PIN is the real
+  // check-in control. Requiring gps used to 400 the whole request before the PIN
+  // verify ran whenever coords were unavailable (GPS off / permission denied),
+  // effectively making check-in unreachable. Optional keeps the tech unblocked.
+  gps: Joi.string().pattern(/^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/).optional().allow('', null),
   address: Joi.string().max(500).optional(),
   pincode: Joi.string().pattern(/^[0-9]{6}$/).optional(),
   otp: Joi.string().optional(),
@@ -487,14 +617,21 @@ router.post('/jobs/:id/checkin', validate(Joi.object({
     const submittedOtp = req.body.otp == null ? '' : String(req.body.otp).trim();
     if (jobPin && jobPin !== submittedOtp) {
       logger.warn('Check-in blocked · id=' + req.params.id + ' · PIN mismatch');
-      return modernError(res, 409, 'Incorrect check-in PIN. Ask the customer for the PIN sent to them.');
+      // Structured error so the app re-prompts for the PIN specifically, instead
+      // of mislabelling every 4xx as "wrong PIN". modernError only auto-sets the
+      // HTTP-log hint for string errors, so set it manually for the object form.
+      if (res.locals) res.locals.logHint = 'check-in PIN mismatch';
+      return modernError(res, 409, {
+        message: 'Incorrect check-in PIN. Ask the customer for the PIN sent to them.',
+        code: 'INVALID_CHECKIN_PIN',
+      });
     }
     await jobService.setStatus(
       job.job_id,
       {
         status: 2 /* IN_PROGRESS */,
         extras: {
-          checkin_gps_location: req.body.gps,
+          checkin_gps_location: req.body.gps || null,
           checkin_address:      req.body.address || null,
           checkin_pincode:      req.body.pincode || null,
           fk_checkin_by:        req.tech.efr_id,
@@ -518,8 +655,9 @@ router.post('/jobs/:id/checkin', validate(Joi.object({
 //   else              → job_status 3  COMPLETED
 // `setStatus` fires the transition webhook + stamps checkout_date_time +
 // fk_checkout_by; the cash/problem/revisit columns ride through the extras
-// allowlist so everything lands in one UPDATE. (otherRemark has no tbl_job
-// column today, so it's accepted but not persisted — a future job-comment hook.)
+// allowlist so everything lands in one UPDATE. otherRemark has no tbl_job
+// column, so it's persisted below as a tbl_job_comment (comment_on=3, check-out)
+// after the transition. A revisit stamps both revisit_date + revisit_time_slot.
 router.post('/jobs/:id/checkout',
   validate(Joi.object({
     haveProblemWithJob:       Joi.boolean().default(false),
@@ -555,7 +693,15 @@ router.post('/jobs/:id/checkout',
     if (isRevisit) {
       if (b.easyfixerRevisitReasonId != null) extras.revisit_reason_id = b.easyfixerRevisitReasonId;
       if (b.requestedDateTime) {
-        extras.revisit_date = String(b.requestedDateTime).replace('T', ' ').slice(0, 19);
+        // App sends wall-clock 'yyyy-MM-ddTHH:mm:ss'. Legacy keeps the revisit
+        // appointment as two columns (revisit_date + revisit_time_slot). Split so
+        // the chosen time survives even if revisit_date is a DATE column, and so
+        // the work-progress read + the transition webhook's revisitTimeSlot stop
+        // returning NULL.
+        const dt = String(b.requestedDateTime).replace('T', ' ').slice(0, 19); // 'YYYY-MM-DD HH:mm:ss'
+        extras.revisit_date = dt;
+        const timePart = dt.slice(11); // 'HH:mm:ss' — empty when only a date was sent
+        if (timePart) extras.revisit_time_slot = timePart;
       }
     }
     await jobService.setStatus(
@@ -564,6 +710,25 @@ router.post('/jobs/:id/checkout',
       { user_id: req.tech.efr_id },
     );
     logger.info('Checked out · id=' + job.job_id + ' · status->' + (isRevisit ? 'REVISIT' : 'COMPLETED'));
+
+    // otherRemark has no tbl_job column — persist it as a check-out job comment
+    // (comment_on=3; addComment also mirrors it onto tbl_job.remarks). Best-effort:
+    // the status transition already committed, so a comment failure must NOT fail
+    // the checkout response.
+    const remark = b.otherRemark == null ? '' : String(b.otherRemark).trim();
+    if (remark) {
+      try {
+        await jobCommentService.addComment(job.job_id, {
+          comments: remark,
+          comment_on: 3, // check_out
+          efr_id: req.tech.efr_id,
+          job_stage: isRevisit ? 10 : 3,
+        });
+      } catch (ce) {
+        logger.warn('Checkout remark comment failed · id=' + job.job_id + ' · ' + ce.message);
+      }
+    }
+
     modernOk(res, {
       jobId: job.job_id,
       completedAt: extras.app_checkout_date_time,
@@ -677,17 +842,10 @@ router.get('/profile/percentage', async (req, res, next) => {
 // rows that the CRM doc view can't disambiguate.
 // tbl_address is a SHARED/polymorphic table (job rows + technician-personal rows)
 // and its column set can drift across deploys, so we probe the live columns once
-// and only ever write the ones that actually exist (mirrors job-magic-link's
-// addressHasInstruction). Resolves the `city` vs `city1` ambiguity automatically.
-let _addressColumnsCache = null;
-async function addressColumns() {
-  if (_addressColumnsCache) return _addressColumnsCache;
-  const [rows] = await pool.query(
-    `SELECT COLUMN_NAME FROM information_schema.columns
-      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tbl_address'`);
-  _addressColumnsCache = new Set(rows.map((r) => r.COLUMN_NAME));
-  return _addressColumnsCache;
-}
+// and only ever write the ones that actually exist. Resolves the `city` vs
+// `city1` ambiguity automatically. Probe lives in address.service — every
+// tbl_address writer needs it.
+const addressColumns = () => addressService.addressColumnSet(pool);
 
 async function upsertEasyfixerDocuments(conn, efrId, rows) {
   for (const [typeId, key] of rows) {
@@ -1025,6 +1183,15 @@ router.post('/profile/contact-info', validate(Joi.object({
     const cols = await addressColumns();
     // Candidate column → value; only columns that exist on the live table are written.
     // Both city1 + city are offered (whichever exists wins) to span schema drift.
+    //
+    // The WRITE stays hand-rolled and does NOT use address.service's write
+    // helpers, deliberately: this is the polymorphic technician row — keyed by
+    // user_id, not customer_id — and its column set (house_no / district / state
+    // / city1 / is_address_details_filled) is disjoint from every customer-address
+    // writer. Only the column probe is genuinely shared. Routing this through a
+    // common builder would mean accepting an arbitrary column→value map, i.e.
+    // `UPDATE ... SET` with extra steps, and would put the customer columns one
+    // typo away from a technician row.
     const candidates = {
       house_no:                   b.houseNo ?? null,
       locality:                   b.areaOrLocation ?? null,

@@ -241,8 +241,8 @@ router.get(
             (CASE WHEN EXISTS (
                 SELECT 1 FROM tbl_client_custom_properties
                  WHERE client_id = j.fk_client_id
-                   AND c_prop_name = 'auto_process_unconfirmed_order'
-                   AND LOWER(c_prop_values) = 'true'
+                   AND LOWER(TRIM(REPLACE(c_prop_name, '_', ' '))) = 'auto process unconfirmed order'
+                   AND LOWER(TRIM(c_prop_values)) = 'true'
                    AND status = 1
             ) THEN 1 ELSE 0 END) AS client_opted_in
            FROM tbl_job j

@@ -64,8 +64,8 @@ async function scopedAdvance(req, res, next) {
 // ─── GET /admin/advances — list with easyfixer + client join ────────
 router.get('/', async (req, res, next) => {
   try {
-    const { status, efrId } = req.query;
-    logger.info('Listing advance payments · status=' + (status ?? 'all') + ' efrId=' + (efrId ?? 'any'));
+    const { status, efrId, jobId } = req.query;
+    logger.info('Listing advance payments · status=' + (status ?? 'all') + ' efrId=' + (efrId ?? 'any') + ' jobId=' + (jobId ?? 'any'));
     const clauses = [];
     const params = [];
     // RBAC: scope by client (manage_clients) + city (manage_cities via
@@ -91,6 +91,11 @@ router.get('/', async (req, res, next) => {
     if (efrId != null && efrId !== '') {
       clauses.push('a.efr_id = ?');
       params.push(Number(efrId));
+    }
+    // Billing & Charges tab reads a single job's advances via ?jobId=<id>.
+    if (jobId != null && jobId !== '') {
+      clauses.push('a.job_id = ?');
+      params.push(Number(jobId));
     }
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
     const limit = Math.min(Number(req.query.limit) || 100, 500);

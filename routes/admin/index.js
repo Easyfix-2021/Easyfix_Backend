@@ -3,6 +3,7 @@ const router = require('express').Router();
 const requireAuth = require('../../middleware/auth');
 const { role } = require('../../middleware/role');
 const { buildRequestScopeWithHierarchy } = require('../../lib/scope');
+const { loadAllowedStages } = require('../../services/user.service');
 const maskMobile = require('../../middleware/mask-mobile');
 const rejectMaskedMobile = require('../../middleware/reject-masked-mobile');
 const { pool } = require('../../db');
@@ -38,8 +39,17 @@ router.use(rejectMaskedMobile);
 router.use(async (req, _res, next) => {
   // Hierarchy-aware scope: own manage_* ∪ every direct/indirect report's
   // manage_*. Bypass roles (Admin/Finance) get `undefined` = no row filter.
-  try { req.scope = await buildRequestScopeWithHierarchy(req, pool); }
-  catch (e) { return next(e); }
+  //
+  // Job Stage Access: also resolve req.allowedStages ONCE per request. Consumed
+  // by the jobs list/counts/attention (visibility) + middleware/require-stage
+  // (transitions). NOT subject to the Admin/Finance scope bypass — a stage
+  // grant is an explicit per-user setting, so it applies to whoever it was set
+  // on (see routes/auth.js for the full rationale). No rows → {mode:'all'} =
+  // unrestricted, which is still every user's default.
+  try {
+    req.scope = await buildRequestScopeWithHierarchy(req, pool);
+    req.allowedStages = await loadAllowedStages(req.user.user_id);
+  } catch (e) { return next(e); }
   next();
 });
 
@@ -60,6 +70,13 @@ router.use('/deep-skills',     require('./deep-skills'));
 router.use('/auto-allocation', require('./auto-allocation'));
 router.use('/jobs',          require('./jobs'));
 router.use('/jobs',          require('./job-magic-link')); // adds /:id/send-magic-link + /:id/magic-link-status under /jobs (see file for shape)
+// Billing & Charges job-workspace tab — Penalty/Travel/Incentive (job_material),
+// service billing approval (tbl_job_services.approval_by_client), and Job Sheet /
+// Purchase Order documents (tbl_job_image). Mutations gated by the
+// `job.charges.emails` property allowlist (FEATURES.canManageJobCharges); the
+// read is scope-only. Mounted under /jobs; both fall through from jobs.js.
+router.use('/jobs',          require('./job-charges'));
+router.use('/jobs',          require('./job-documents'));
 router.use('/customer-requests', require('./customer-requests')); // ops inbox for tbl_job_customer_request (cancel/reschedule signals)
 router.use('/auto-assign',   require('./auto-assign'));
 router.use('/notifications', require('./notifications'));
@@ -67,6 +84,10 @@ router.use('/webhooks',        require('./webhooks'));
 router.use('/quicksight',      require('./quicksight'));
 router.use('/maps',            require('./maps'));
 router.use('/finance',         require('./finance'));
+// Payout Requests — finance processor for technician wallet withdrawals
+// recorded by POST /api/mobile/withdraw. Gated Finance+Admin at the router
+// level; per-action FE gating via isPayoutRequestsView / isPayoutRequestsProcess.
+router.use('/withdrawals',     require('./withdrawals'));
 router.use('/advances',        require('./advances'));
 router.use('/clients',         require('./clients'));
 router.use('/customers',       require('./customers'));
@@ -80,6 +101,10 @@ router.use('/roles',           require('./roles'));
 // canDeleteEntities) — display-only; the gated routes enforce the allowlist
 // themselves. See routes/admin/access.js + services/feature-access.service.js.
 router.use('/access',          require('./access'));
+// Global (non-per-user) runtime UI toggles the CRM reads at render time:
+// customer-number visibility + map clickability. Read-only; flipped via
+// easyfix_properties. See routes/admin/config.js.
+router.use('/config',          require('./config'));
 // Admin Actions → OTP-gated Delete Easyfixer/User + Restore (tombstone + full
 // JSON archive). Gated PER-USER by the easyfix_properties allowlist
 // (access.entitydelete.emails) — NOT RBAC. See routes/admin/entity-deletion.js.
@@ -93,6 +118,10 @@ router.use('/settings',        require('./settings'));
 // (easyfix_properties.scheduled.jobs.visible.emails); no role/menu
 // permission seeded.
 router.use('/scheduled-jobs',  require('./scheduled-jobs'));
+router.use('/validate',        require('./validate')); // Validate Flows — property-gated test-push (validate.flows.emails)
+router.use('/skill-matrix',    require('./skill-matrix')); // Build Skill Matrix — property-gated AI build (skill.matrix.emails)
+router.use('/teleprompter',    require('./teleprompter')); // AI Teleprompter for Calls — property-gated (teleprompter.emails)
+router.use('/otp-channel',     require('./otp-channel')); // Login OTP channel (WhatsApp/SMS) — property-gated (access.otpchannel.emails)
 router.use('/reports',         require('./reports'));
 router.use('/aux',             require('./auxiliary'));
 router.use('/legacy',          require('./legacy'));

@@ -38,6 +38,21 @@ function callingEnabled() {
   return String(getProperty('plivo.calling.enabled')).toLowerCase() === 'true';
 }
 
+// Whether to record the bridged conversation. OFF by default — flip the
+// easyfix_properties key `plivo.recording.enabled` to 'true' ONLY after
+// compliance/consent sign-off (recording customer calls). No redeploy needed
+// (properties are DB-backed). See buildAnswerXml + GET /admin/calls/:id/recording.
+function recordingEnabled() {
+  return String(getProperty('plivo.recording.enabled')).toLowerCase() === 'true';
+}
+
+// Gate for the lazy call-transcription fetch (default off — opt-in AFTER the
+// Plivo Transcription API is verified for the account + transcription is turned
+// on for recordings). Read the same way as recordingEnabled.
+function transcriptionEnabled() {
+  return String(getProperty('plivo.transcription.enabled')).toLowerCase() === 'true';
+}
+
 // The publicly-reachable BACKEND base URL Plivo will call back on (NOT the CRM
 // UI). Must terminate at this Express app, e.g. https://core.easyfix.in.
 function callbackBase() {
@@ -138,12 +153,87 @@ function verifyCallToken(t) {
   try { return jwt.verify(t, tokenSecret()); } catch { return null; }
 }
 
+// Recording-callback token: carries the tbl_job_caller_info id (jci) so the
+// recording-ready callback can update the RIGHT call row regardless of which
+// leg's call_uuid the recording ends up filed under. Longer TTL than the 15-min
+// answer token because the recording callback fires AFTER the call ends (mp3
+// processing lag). `kind: 'rec'` isolates it from the answer/bridge token.
+function signRecordingToken(jci) {
+  return jwt.sign({ jci, kind: 'rec' }, tokenSecret(), { expiresIn: '2h' });
+}
+function verifyRecordingToken(t) {
+  try { const c = jwt.verify(t, tokenSecret()); return c && c.kind === 'rec' ? c : null; }
+  catch { return null; }
+}
+
+// Absolute URL Plivo POSTs the recording URL/id to once the mp3 is ready.
+// Null when no public callback base is configured.
+function recordingCallbackUrl(jci) {
+  const base = callbackBase();
+  if (!base) return null;
+  return `${base}/api/public/plivo/recording-callback?t=${encodeURIComponent(signRecordingToken(jci))}`;
+}
+
 // Plivo call-control XML the public answer route returns when the agent picks
 // up — bridges to the customer leg. callerId is the Plivo DID.
-function buildAnswerXml(dest) {
+//
+// Recording (FIXED 2026-07-13): a bridged Plivo call is recorded with the
+// <Record> ELEMENT placed BEFORE <Dial> — NOT via attributes on <Dial>. The
+// <Dial> element has NO record/recordFileFormat/recordingCallbackUrl attributes
+// (verified against Plivo's XML reference), so the previous `record="true"` on
+// <Dial> was SILENTLY IGNORED and NO recording was ever created — which is why
+// tbl_plivo_call_log.recording_url was NULL for every row (nothing to push, and
+// nothing for the pull to find).
+//   recordSession="true"     → records the whole session in the BACKGROUND, so
+//                              call flow continues straight to <Dial>.
+//   startOnDialAnswer="true" → recording begins when the customer (B-leg) picks
+//                              up (skips the ring/dead-air).
+//   recordChannelType="stereo" → 2-channel (each party on its own channel) —
+//                              needed for AWS Transcribe CALL ANALYTICS.
+//   callbackUrl + callbackMethod="POST" → Plivo POSTs RecordUrl / RecordingID /
+//                              RecordingDuration here when the mp3 is ready
+//                              (handled by /api/public/plivo/recording-callback,
+//                              keyed by the jci token — LEG-AGNOSTIC, so
+//                              web/WebRTC calls populate too). If no public
+//                              callback base is configured, recording still
+//                              happens and the play-time / sweep PULL
+//                              (fetchRecordingMeta by call_uuid) recovers it.
+// Gated on `plivo.recording.enabled` by the caller (DB property, no redeploy).
+// ⚠️ Recording customer calls needs compliance/consent sign-off.
+//
+// streamWssUrl (AI teleprompter, merged from AI-Teleprompter branch): optional
+// listen-only media fork — see the <Stream> block below. ADDITIVE; absent ⇒
+// identical XML to a plain recorded bridge.
+function buildAnswerXml(dest, { record = false, recordingCallbackUrl = null, streamWssUrl = null } = {}) {
   const callerId = process.env.PLIVO_CALLER_ID || '';
   const num = String(dest || '').replace(/[^0-9]/g, '');
-  return `<?xml version="1.0" encoding="UTF-8"?>\n<Response><Dial callerId="${callerId}"><Number>${num}</Number></Dial></Response>`;
+  let recordEl = '';
+  if (record) {
+    let recAttrs = ' recordSession="true" startOnDialAnswer="true"'
+      + ' fileFormat="mp3" recordChannelType="stereo"';
+    if (recordingCallbackUrl) {
+      // XML-attribute-escape (the URL query is `?t=<jwt>` — base64url has no
+      // XML specials, but escape defensively).
+      const escUrl = String(recordingCallbackUrl).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      recAttrs += ` callbackUrl="${escUrl}" callbackMethod="POST"`;
+    }
+    recordEl = `<Record${recAttrs}/>`;
+  }
+  // Optional listen-only media fork (AI teleprompter): stream the call audio to our
+  // STT websocket IN PARALLEL with the bridge. bidirectional="false" = we only
+  // listen (never inject audio); <Stream> is non-blocking so placing it BEFORE
+  // <Dial> starts the fork, then Plivo proceeds to bridge. keepCallAlive so the
+  // fork ending can't drop the call. ADDITIVE — absent streamWssUrl ⇒ byte-for-byte
+  // the previous XML, so non-teleprompter web/bridge calls are untouched.
+  let streamEl = '';
+  if (streamWssUrl) {
+    const escUrl = String(streamWssUrl).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    streamEl = `<Stream bidirectional="false" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000">${escUrl}</Stream>`;
+  }
+  // MERGE (2026-07-13): keep BOTH the <Record> element (Production recording-NULL
+  // fix) AND the <Stream> fork (teleprompter) before a clean <Dial callerId> —
+  // recording is NO LONGER a <Dial> attribute, and both are background/non-blocking.
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>${recordEl}${streamEl}<Dial callerId="${callerId}"><Number>${num}</Number></Dial></Response>`;
 }
 
 function authHeader() {
@@ -253,6 +343,151 @@ async function hangupCall({ callUuid }) {
   }
 }
 
+// Bound every Plivo HTTP lookup so a hung provider request can't stall the
+// caller — critical for the on-demand transcript fetch that runs INSIDE the
+// user-facing GET /calls/:id/analysis request. `AbortSignal.timeout` throws a
+// DOMException ('TimeoutError') that each function's try/catch already turns
+// into a graceful { ok: false } (→ null transcript → "no transcript"), so a
+// slow Plivo degrades to "not available" instead of hanging the request.
+const PLIVO_HTTP_TIMEOUT_MS = 8000;
+
+/*
+ * Look up a call's recording by CallUUID via the Plivo Recording API
+ * (GET /Account/{id}/Recording/?call_uuid=…). Returns the first recording's
+ * hosted URL + duration/id, or { url: null } when none exists yet (Plivo may
+ * lag a few seconds after hangup, or recording was off for this call).
+ */
+async function fetchRecordingMeta({ callUuid }) {
+  if (!callUuid) return { ok: false, error: 'callUuid required', url: null };
+  const auth = authHeader();
+  if (!auth || !process.env.PLIVO_AUTH_ID) {
+    return { ok: false, error: 'PLIVO_AUTH_ID / PLIVO_AUTH_TOKEN not configured', url: null };
+  }
+  const url = `${BASE}/Account/${encodeURIComponent(process.env.PLIVO_AUTH_ID)}/Recording/?call_uuid=${encodeURIComponent(callUuid)}`;
+  try {
+    const res = await fetch(url, { headers: { Authorization: auth }, signal: AbortSignal.timeout(PLIVO_HTTP_TIMEOUT_MS) });
+    if (!res.ok) {
+      logger.warn(`Plivo recording lookup FAIL · uuid=${callUuid} · http=${res.status}`);
+      return { ok: false, httpStatus: res.status, url: null };
+    }
+    const body = await res.json();
+    const first = Array.isArray(body?.objects) ? body.objects[0] : null;
+    return {
+      ok: true,
+      url: first?.recording_url || null,
+      recordingId: first?.recording_id || null,
+      duration: first?.recording_duration != null ? Number(first.recording_duration) : null,
+    };
+  } catch (err) {
+    logger.error(`Plivo recording lookup network error · uuid=${callUuid} · ${err.message}`);
+    return { ok: false, error: err.message, url: null };
+  }
+}
+
+/*
+ * Download the recording bytes from a Plivo-hosted recording URL. Plivo
+ * recording URLs sit on api.plivo.com and require the same HTTP Basic auth as
+ * every other call. Returns the raw Buffer + content-type for S3 upload.
+ */
+async function downloadRecording(recordingUrl) {
+  if (!recordingUrl) return { ok: false, error: 'recordingUrl required' };
+  const auth = authHeader();
+  try {
+    const res = await fetch(recordingUrl, { headers: auth ? { Authorization: auth } : {} });
+    if (!res.ok) {
+      logger.warn(`Plivo recording download FAIL · http=${res.status}`);
+      return { ok: false, httpStatus: res.status };
+    }
+    const buffer = Buffer.from(await res.arrayBuffer());
+    return { ok: true, buffer, contentType: res.headers.get('content-type') || 'audio/mpeg' };
+  } catch (err) {
+    logger.error(`Plivo recording download network error · ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
+/*
+ * Fetch a recording's transcription from the Plivo Transcription API
+ * (GET /Account/{id}/Transcription/{recording_id}/). Returns { ok, text } —
+ * `text` is null when Plivo has no transcription for that recording yet (404 —
+ * transcription must be requested at record time / is still processing).
+ *
+ * ⚠️ VERIFY against current Plivo docs for your account before enabling
+ * plivo.transcription.enabled: confirm the endpoint path + that the transcript
+ * text arrives under `transcription` in the JSON body. Same HTTP Basic auth as
+ * the Recording API.
+ */
+async function fetchTranscription({ recordingId }) {
+  if (!recordingId) return { ok: false, error: 'recordingId required', text: null };
+  const auth = authHeader();
+  if (!auth || !process.env.PLIVO_AUTH_ID) {
+    return { ok: false, error: 'PLIVO_AUTH_ID / PLIVO_AUTH_TOKEN not configured', text: null };
+  }
+  const url = `${BASE}/Account/${encodeURIComponent(process.env.PLIVO_AUTH_ID)}/Transcription/${encodeURIComponent(recordingId)}/`;
+  try {
+    const res = await fetch(url, { headers: { Authorization: auth }, signal: AbortSignal.timeout(PLIVO_HTTP_TIMEOUT_MS) });
+    // 404 = no transcription generated for this recording (not requested at
+    // record time, or still processing) — a normal "not available", not an error.
+    if (res.status === 404) return { ok: true, text: null, notAvailable: true };
+    if (!res.ok) {
+      logger.warn(`Plivo transcription lookup FAIL · recId=${recordingId} · http=${res.status}`);
+      return { ok: false, httpStatus: res.status, text: null };
+    }
+    const body = await res.json();
+    const text = typeof body?.transcription === 'string' ? body.transcription : null;
+    return { ok: true, text, transcriptionId: body?.transcription_id || null };
+  } catch (err) {
+    logger.error(`Plivo transcription lookup network error · recId=${recordingId} · ${err.message}`);
+    return { ok: false, error: err.message, text: null };
+  }
+}
+
+/*
+ * REQUEST Plivo to create a transcription for a recording (POST). Plivo does NOT
+ * auto-transcribe recordings — a transcript must be requested first, then
+ * retrieved via fetchTranscription() once Plivo finishes processing (seconds to
+ * minutes). This is the missing half of the pipeline: the <Record> element in
+ * buildAnswerXml only captures audio; without this POST the GET always 404s.
+ * (Comment corrected 2026-07-15 — it referenced `record="true"` on <Dial>, the
+ * pre-2026-07-13 construction that was silently ignored and recorded nothing.)
+ *
+ * Returns { ok, requested, alreadyExists, notEnabled }:
+ *   - requested     — Plivo accepted the create (transcript is now processing)
+ *   - alreadyExists — a transcription was already requested for this recording
+ *   - notEnabled    — transcription isn't enabled/billed on the account (402/403)
+ * Gated by plivo.transcription.enabled at the call sites (cron + on-demand).
+ */
+async function createTranscription({ recordingId }) {
+  if (!recordingId) return { ok: false, error: 'recordingId required' };
+  const auth = authHeader();
+  if (!auth || !process.env.PLIVO_AUTH_ID) {
+    return { ok: false, error: 'PLIVO_AUTH_ID / PLIVO_AUTH_TOKEN not configured' };
+  }
+  const url = `${BASE}/Account/${encodeURIComponent(process.env.PLIVO_AUTH_ID)}/Transcription/${encodeURIComponent(recordingId)}/`;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { Authorization: auth, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'auto' }),
+      signal: AbortSignal.timeout(PLIVO_HTTP_TIMEOUT_MS),
+    });
+    // 201/202 (or any 2xx) = creation accepted; transcript is now processing.
+    if (res.ok) return { ok: true, requested: true };
+    // 400/409 = a transcription already exists / is already in progress.
+    if (res.status === 400 || res.status === 409) return { ok: true, alreadyExists: true };
+    // 402/403 = transcription not enabled/billed on the account — don't retry forever.
+    if (res.status === 402 || res.status === 403) {
+      logger.warn(`Plivo transcription CREATE not permitted · recId=${recordingId} · http=${res.status} (account add-on?)`);
+      return { ok: false, httpStatus: res.status, notEnabled: true };
+    }
+    logger.warn(`Plivo transcription CREATE FAIL · recId=${recordingId} · http=${res.status}`);
+    return { ok: false, httpStatus: res.status };
+  } catch (err) {
+    logger.error(`Plivo transcription create network error · recId=${recordingId} · ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
 // ── Web (browser / WebRTC) calling ───────────────────────────────────────────
 // The Plivo Browser SDK logs in as a Plivo ENDPOINT (username/password) and
 // places calls into our Voice Application; the app's Answer URL then bridges to
@@ -309,11 +544,11 @@ function webAccessToken({ operatorId } = {}) {
 // number.
 const WEB_DIAL_TTL_MS = 2 * 60 * 1000;
 const _webDials = new Map();
-function stashWebDial({ number, jci }) {
+function stashWebDial({ number, jci, teleprompterSessionId = null }) {
   const now = Date.now();
   for (const [k, v] of _webDials) if (v.expires <= now) _webDials.delete(k); // sweep
   const id = crypto.randomBytes(16).toString('hex');
-  _webDials.set(id, { number, jci, expires: now + WEB_DIAL_TTL_MS });
+  _webDials.set(id, { number, jci, teleprompterSessionId, expires: now + WEB_DIAL_TTL_MS });
   return id;
 }
 function resolveWebDial(id) {
@@ -322,7 +557,7 @@ function resolveWebDial(id) {
   if (!v) return null;
   _webDials.delete(key); // one-time use
   if (v.expires <= Date.now()) return null;
-  return { number: v.number, jci: v.jci };
+  return { number: v.number, jci: v.jci, teleprompterSessionId: v.teleprompterSessionId || null };
 }
 
 module.exports = {
@@ -330,9 +565,18 @@ module.exports = {
   previewCallLegs,
   resolveCallLegs,
   hangupCall,
+  recordingEnabled,
+  fetchRecordingMeta,
+  downloadRecording,
+  fetchTranscription,
+  createTranscription,
+  transcriptionEnabled,
   normaliseIndianPhone,
   signCallToken,
   verifyCallToken,
+  signRecordingToken,
+  verifyRecordingToken,
+  recordingCallbackUrl,
   buildAnswerXml,
   callingEnabled,
   maskForDisplay,

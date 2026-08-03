@@ -108,22 +108,22 @@ async function getClientColumns() {
  * `extraClauses` / `extraParams` come from the route's RBAC + search
  * filter assembly. Pagination is enforced here (max 500 per page).
  */
-async function listClients({ extraClauses = [], extraParams = [], includeInactive, q, limit, offset, cityId }) {
+async function listClients({ extraClauses = [], extraParams = [], includeInactive, q, limit, offset, cityId, sortBy, sortDir }) {
   logger.info('List clients · q=' + (q || '') + ' cityId=' + (cityId || '') + ' includeInactive=' + !!includeInactive + ' limit=' + (limit || '') + ' offset=' + (offset || ''));
   const clauses = [...extraClauses];
   const params  = [...extraParams];
   if (!includeInactive) clauses.push('cl.client_status = 1');
   if (q) {
-    // Match client_name OR city_name OR any SPOC contact_name.
+    // Match client name / email / reference code / city / client id / SPOC contact name.
     // - City name needs the tbl_city JOIN in both COUNT and SELECT
     //   below (we add it unconditionally — JOIN cost is trivial vs.
     //   the operator confusion of "search Mumbai returns nothing").
     // - EXISTS keeps the row count stable on the contact match (no
     //   JOIN row-explosion when a client has many contacts).
     clauses.push(
-      '(cl.client_name LIKE ? OR ct.city_name LIKE ? OR EXISTS (SELECT 1 FROM tbl_client_contacts c WHERE c.client_id = cl.client_id AND c.contact_name LIKE ?))',
+      '(cl.client_name LIKE ? OR cl.client_email LIKE ? OR cl.reference_code LIKE ? OR ct.city_name LIKE ? OR CAST(cl.client_id AS CHAR) LIKE ? OR EXISTS (SELECT 1 FROM tbl_client_contacts c WHERE c.client_id = cl.client_id AND c.contact_name LIKE ?))',
     );
-    params.push(`%${q}%`, `%${q}%`, `%${q}%`);
+    params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
   }
   if (cityId) {
     // Legacy column name: `client_city_id` on tbl_client; tbl_city's
@@ -133,6 +133,25 @@ async function listClients({ extraClauses = [], extraParams = [], includeInactiv
     params.push(cityId);
   }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+
+  // Server-side ORDER BY over the COMPLETE result set (whitelisted columns
+  // only — the map is the SQL-injection guard). Default: client_name ASC.
+  // A client_id tiebreaker keeps paging deterministic when the sort col ties.
+  const SORT_MAP = {
+    client_id:     'cl.client_id',
+    client_name:   'cl.client_name',
+    client_email:  'cl.client_email',
+    city_name:     'ct.city_name',
+    client_status: 'cl.client_status',
+  };
+  let orderBy = 'ORDER BY cl.client_name ASC';
+  if (sortBy && SORT_MAP[sortBy]) {
+    const scol = SORT_MAP[sortBy];
+    const sdir = String(sortDir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+    orderBy = scol === 'cl.client_id'
+      ? `ORDER BY cl.client_id ${sdir}`
+      : `ORDER BY ${scol} ${sdir}, cl.client_id ASC`;
+  }
 
   // Query 1 — COUNT(*) for pagination. Same WHERE + JOIN as the SELECT
   // (the JOIN is needed so the `ct.city_name LIKE ?` clause resolves).
@@ -158,11 +177,24 @@ async function listClients({ extraClauses = [], extraParams = [], includeInactiv
     `SELECT cl.client_id, cl.client_name, cl.client_email, cl.client_status, cl.client_type,
             cl.reference_code, cl.booking_cut_off, cl.vertical_id, cl.collected_by,
             cl.client_city_id AS city_id, ct.city_name,
-            cl.monthly_revenue
+            cl.monthly_revenue,
+            /* Magic-link (job-completion) opt-in, shown at a glance on the
+               Manage Clients list so ops don't have to open each client's
+               Custom Properties tab. Single correlated EXISTS on the indexed
+               ccp.client_id (no N+1) — copied verbatim from the jobs LIST
+               client_opted_in projection (job.service.js). Strict status=1:
+               a soft-deleted (status=0) opt-in row must read as NOT enabled. */
+            (EXISTS (
+               SELECT 1 FROM tbl_client_custom_properties ccp
+                WHERE ccp.client_id = cl.client_id
+                  AND LOWER(TRIM(REPLACE(ccp.c_prop_name, '_', ' '))) = LOWER('Auto Process Unconfirmed Order')
+                  AND LOWER(TRIM(ccp.c_prop_values)) = 'true'
+                  AND ccp.status = 1
+            )) AS magic_link_enabled
        FROM tbl_client cl
        LEFT JOIN tbl_city ct ON ct.city_id = cl.client_city_id
        ${where}
-       ORDER BY cl.client_name
+       ${orderBy}
        LIMIT ? OFFSET ?`,
     pageParams,
   );
@@ -694,6 +726,7 @@ const CUSTOM_PROP_COLS_CANONICAL = {
   label: 'property_label',
   value: 'property_value',
   mandatory: 'is_mandatory',
+  isConfig: 'is_config', // only used if _customPropsHasIsConfig
   hasStatus: false,
 };
 const CUSTOM_PROP_COLS_LEGACY = {
@@ -702,6 +735,7 @@ const CUSTOM_PROP_COLS_LEGACY = {
   label: 'c_prop_label', // only used if _customPropsHasLegacyLabel
   value: 'c_prop_values',
   mandatory: 'c_prop_mandatory',
+  isConfig: 'is_config', // only used if _customPropsHasIsConfig
   hasStatus: true,
 };
 
@@ -711,6 +745,10 @@ async function customPropCols() {
   // Legacy schema may or may not have c_prop_label. Drop the column
   // when the probe says absent so INSERT/UPDATE doesn't reference it.
   if (legacy && !_customPropsHasLegacyLabel) cols.label = null;
+  // is_config is an optional additive column (migration 2026-07-10). Drop it
+  // when the probe says absent so INSERT/UPDATE never reference a missing
+  // column on a pre-migration deploy — exactly how c_prop_label is gated.
+  if (!_customPropsHasIsConfig) cols.isConfig = null;
   return cols;
 }
 
@@ -729,7 +767,27 @@ async function createCustomProperty(clientId, body) {
     insertVals.push(body.label || null);
   }
   insertCols.push(cols.value, cols.mandatory);
-  insertVals.push(body.value || null, body.mandatory ? 1 : 0);
+  // Legacy `c_prop_values` is NOT NULL — coerce a missing/empty value to '' on
+  // that shape (value-less flag rows like `branch_details` carry no client-level
+  // default). Canonical `property_value` is nullable, so keep null there.
+  // Trim the value so a stray space can never land in c_prop_values — the
+  // opt-in checks match it EXACTLY ('true'), so 'true ' silently disables the
+  // flag (the Greensoul trap). null → '' on legacy (c_prop_values is NOT NULL).
+  const trimmedValue = (body.value == null) ? '' : String(body.value).trim();
+  const valueCell = (trimmedValue === '')
+    ? (cols.hasStatus ? '' : null)
+    : trimmedValue;
+  insertVals.push(valueCell, body.mandatory ? 1 : 0);
+  // is_config discriminator (optional column — gated by the probe). Coerce a
+  // truthy body flag → 1, else 0. Absent column → cols.isConfig is null and
+  // this block no-ops (the DB DEFAULT 0 still applies on newer deploys).
+  if (cols.isConfig) {
+    insertCols.push(cols.isConfig);
+    // Force is_config=1 for the known control/config props (by normalized name),
+    // regardless of what the FE sent — these are ALWAYS config and must stay out
+    // of the client-dashboard bulk-upload template. Otherwise honour the flag.
+    insertVals.push((body.is_config || isConfigPropName(body.name)) ? 1 : 0);
+  }
   if (cols.hasStatus) {
     insertCols.push('status');
     insertVals.push(1);
@@ -744,6 +802,26 @@ async function createCustomProperty(clientId, body) {
 }
 
 /*
+ * The client-level CONFIG/CONTROL properties (vs per-booking data-entry custom
+ * fields). These are ALWAYS is_config=1 — they must never leak into the client-
+ * dashboard bulk-upload template. Matched on a NORMALIZED name (case-insensitive,
+ * `_` and `-` → space) so the snake_case stored form (auto_process_unconfirmed_order)
+ * and the Title-Case UI form ("Auto Process Unconfirmed Order", "Max Magic-Link
+ * Send Count") resolve identically. Keep in sync with the migration backfill
+ * (2026-07-10) and job-magic-link's CONFIG_PROP_KEYS.
+ */
+const CONFIG_PROP_NORMALIZED_NAMES = new Set([
+  'auto process unconfirmed order',
+  'max magic link send count',
+  'collected by',
+  'order confirmation mode',
+]);
+function isConfigPropName(name) {
+  const norm = String(name || '').trim().toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ');
+  return CONFIG_PROP_NORMALIZED_NAMES.has(norm);
+}
+
+/*
  * Body keys the route validator accepts. Each maps to the appropriate
  * column name picked by customPropCols() at runtime. `mandatory` /
  * `isMandatory` both map to the mandatory column for input flexibility.
@@ -754,6 +832,7 @@ const CUSTOM_PROP_BODY_KEY_TO_COL_KEY = {
   value: 'value',
   mandatory: 'mandatory',
   isMandatory: 'mandatory',
+  is_config: 'isConfig',
   // Canonical column names are also accepted (legacy callers).
   property_name: 'name',
   property_label: 'label',
@@ -773,11 +852,47 @@ async function updateCustomProperty(propId, body) {
     if (!dbCol) continue; // e.g. label on legacy without c_prop_label
     let v = val;
     if (colKey === 'mandatory') v = val ? 1 : 0;
+    else if (colKey === 'isConfig') v = val ? 1 : 0;
+    // Trim the value so a stray space can't land in c_prop_values — the opt-in
+    // checks match it EXACTLY ('true'), so 'true ' silently disables the flag
+    // (the Greensoul trap). null → '' on legacy (c_prop_values is NOT NULL).
+    else if (colKey === 'value') v = (v == null) ? (cols.hasStatus ? '' : null) : String(v).trim();
     sets.push(`${dbCol} = ?`);
     vals.push(v);
   }
+  // Force is_config=1 for the known control/config props (by normalized name) so
+  // a FE surface that omits the flag on edit can't leave a config row
+  // miscategorised (which would leak it into the client-dashboard bulk template).
+  // Resolve the name from the body, else from the existing row.
+  if (cols.isConfig) {
+    let effectiveName = body.name ?? body.property_name;
+    if (effectiveName == null) {
+      const [[row]] = await pool.query(
+        `SELECT ${cols.name} AS name FROM tbl_client_custom_properties WHERE ${cols.pk} = ? LIMIT 1`,
+        [propId],
+      );
+      effectiveName = row?.name;
+    }
+    if (isConfigPropName(effectiveName)) {
+      const idx = sets.indexOf(`${cols.isConfig} = ?`);
+      if (idx >= 0) vals[idx] = 1;
+      else { sets.push(`${cols.isConfig} = ?`); vals.push(1); }
+    }
+  }
   if (sets.length === 0) {
     throw Object.assign(new Error('nothing to update'), { status: 400 });
+  }
+  // Reactivate on edit (2026-07-09): a legacy soft-deleted row (status=0)
+  // that gets edited in the CRM should become active again. Otherwise a
+  // property that reads c_prop_values='true' but is still status=0 is
+  // silently ignored by every status=1 opt-in check (magic-link sweep,
+  // auto-process-unconfirmed-order) — the exact Greensoul trap. The new
+  // backend never sets status=0 (delete is a hard DELETE), so forcing 1 on
+  // update only ever HEALS a legacy soft-delete; it never re-enables a value
+  // the operator turned off (that lives in c_prop_values, not status).
+  if (cols.hasStatus) {
+    sets.push('status = ?');
+    vals.push(1);
   }
   vals.push(propId);
   const [r] = await pool.query(
@@ -833,6 +948,7 @@ async function getCustomPropertyClientId(propId) {
 let _customPropsColsProbed = false;
 let _customPropsLegacyShape = false; // true → c_prop_* columns
 let _customPropsHasLegacyLabel = false; // true → c_prop_label exists
+let _customPropsHasIsConfig = false; // true → is_config exists (migration 2026-07-10)
 async function detectCustomPropsShape() {
   if (_customPropsColsProbed) return _customPropsLegacyShape;
   try {
@@ -848,6 +964,15 @@ async function detectCustomPropsShape() {
     } catch (_e) {
       _customPropsHasLegacyLabel = false;
     }
+  }
+  // Probe the additive is_config column independently of schema shape — the
+  // migration adds it to whichever variant this deploy runs. Absent → the
+  // write paths null out cols.isConfig and never reference the column.
+  try {
+    await pool.query('SELECT is_config FROM tbl_client_custom_properties LIMIT 1');
+    _customPropsHasIsConfig = true;
+  } catch (_e) {
+    _customPropsHasIsConfig = false;
   }
   _customPropsColsProbed = true;
   return _customPropsLegacyShape;

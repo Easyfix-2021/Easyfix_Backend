@@ -7,6 +7,7 @@ const { createLoginOtp, verifyLoginOtp } = require('../services/auth.service');
 const { getRoleById } = require('../services/role.service');
 const { signUserToken } = require('../utils/jwt');
 const { modernOk, modernError } = require('../utils/response');
+const { FEATURES, emailAllowed } = require('../services/feature-access.service');
 const logger = require('../logger');
 
 /*
@@ -51,6 +52,23 @@ router.post('/login-otp', validate(loginOtpRequest), async (req, res, next) => {
         res,
         404,
         'This account is not registered in the CRM. Please check the email / mobile or contact your admin.'
+      );
+    }
+    /*
+     * `delivered` is the REAL outcome from the delivery ladder, not a constant.
+     * It used to be hardcoded true, so an OTP whose email was suppressed (no
+     * mailbox) and whose WhatsApp fallback also failed still answered
+     * "OTP sent" — the user then waited for a code no channel ever carried.
+     * A hard error is the honest answer: the OTP row exists, but nothing
+     * reached the user, so retrying or contacting an admin is the only way on.
+     */
+    if (!result.delivered) {
+      logger.error('Login OTP could not be delivered on any channel · channels=[' + (result.channelsTried || '') + ']');
+      return modernError(
+        res,
+        502,
+        'We generated your OTP but could not deliver it on any channel (email / WhatsApp / SMS). '
+        + 'Your registered email may have no mailbox, or no mobile number is on file. Please contact your admin.',
       );
     }
     logger.info('Login OTP issued · delivered');
@@ -146,6 +164,9 @@ router.get('/me', requireAuth, async (req, res, next) => {
         },
         hierarchy: { directReportsCount: 0, descendantsCount: 0 },
         scheduledJobsAccess: false,
+        canManageJobCharges: false,
+        // Job Stage Access — technicians carry no CRM stage restriction.
+        allowedStages: { mode: 'all', stages: [] },
       });
     }
 
@@ -154,8 +175,8 @@ router.get('/me', requireAuth, async (req, res, next) => {
     // menuIds as the sidebar allowlist and actionPermissions as the
     // button-gating Set.
     const { getEffectivePermissions } = require('../services/role.service');
-    const { parseScope, bypassesScope, mergeScopeRespectingCap } = require('../lib/scope');
-    const { findDescendantUserIds } = require('../services/user.service');
+    const { parseScope, bypassesScope, mergeScopeRespectingCap, expandStatesToCities } = require('../lib/scope');
+    const { findDescendantUserIds, loadAllowedStages } = require('../services/user.service');
     const { pool } = require('../db');
     const permissions = await getEffectivePermissions(req.user.user_id);
 
@@ -208,6 +229,14 @@ router.get('/me', requireAuth, async (req, res, next) => {
       }
     }
 
+    // Manage Regions: mirror the API scope-build (lib/scope.js) — a user scoped
+    // to specific Regions (states) gets ALL cities in those states as their
+    // effective city scope, so the FE scope object matches what the jobs API
+    // actually enforces. Bypass roles have states.mode='all' → no-op.
+    if (scope.states && scope.states.mode === 'allow') {
+      scope.cities = await expandStatesToCities(pool, scope.states);
+    }
+
     // scheduledJobsAccess (2026-06-06): mirrors the same email-allowlist
     // check used by routes/admin/scheduled-jobs.js. The FE reads this
     // boolean to decide whether to render the "Scheduled Jobs" entry
@@ -217,7 +246,28 @@ router.get('/me', requireAuth, async (req, res, next) => {
     const sj = require('../services/scheduled-jobs.service');
     const scheduledJobsAccess = sj.isAllowedUser(req.user);
 
-    logger.info('Returning identity · bypassScope=' + !!bypass + ' menuIds=' + ((permissions && permissions.menuIds && permissions.menuIds.length) || 0) + ' directReports=' + hierarchy.directReports.length + ' descendants=' + hierarchy.descendants.length + ' scheduledJobsAccess=' + scheduledJobsAccess);
+    // canManageJobCharges (2026-07-28): property-allowlist gate for the
+    // Billing & Charges job-workspace tab. Same fail-closed model as
+    // canBuildSkillMatrix — the FE reads this to show/hide the tab; every
+    // mutating charges/documents route independently enforces the same
+    // allowlist, so a forged flag buys nothing.
+    const canManageJobCharges = emailAllowed(FEATURES.canManageJobCharges, req.user.official_email);
+
+    /*
+     * Job Stage Access — the FE gates its stage tabs + row actions off this.
+     * Deliberately NOT subject to the Admin/Finance scope bypass: unlike
+     * manage_* (a broad data-visibility default those roles are expected to
+     * ignore), a stage grant is an explicit per-user setting an operator typed
+     * into the Manage Users form, and silently ignoring it for the very roles
+     * most likely to be edited made the picker look broken. No rows still means
+     * { mode:'all' } = unrestricted, so every Admin is unrestricted by default
+     * and Manage Users itself is never stage-gated — an over-restricted admin
+     * is always recoverable from there. The BE enforces the same thing
+     * regardless, so this is display-only.
+     */
+    const allowedStages = await loadAllowedStages(req.user.user_id);
+
+    logger.info('Returning identity · bypassScope=' + !!bypass + ' menuIds=' + ((permissions && permissions.menuIds && permissions.menuIds.length) || 0) + ' directReports=' + hierarchy.directReports.length + ' descendants=' + hierarchy.descendants.length + ' scheduledJobsAccess=' + scheduledJobsAccess + ' allowedStages=' + (allowedStages.mode === 'all' ? 'all' : allowedStages.stages.join(',')));
     modernOk(res, {
       user: req.user,
       role: role && {
@@ -233,6 +283,8 @@ router.get('/me', requireAuth, async (req, res, next) => {
         descendantsCount: hierarchy.descendants.length,
       },
       scheduledJobsAccess,
+      canManageJobCharges,
+      allowedStages,
     });
   } catch (err) {
     next(err);

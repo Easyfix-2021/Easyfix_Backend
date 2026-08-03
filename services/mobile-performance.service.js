@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const { OFFER_STATUS } = require('./offer-status');
 const logger = require('../logger');
 const gradeService = require('./grade.service');
 const performanceService = require('./performance.service');
@@ -76,9 +77,10 @@ async function getWeeklyPerformance(efrId, from, to) {
       logger.warn({ err: e.message, efrId }, 'mobile-performance rating failed');
       return 0;
     }),
-    // Acceptance rate (jobs accepted / offered) — reuses performance.service's
-    // scheduling_history definition so the Performance screen stays consistent
-    // with the dashboard ring. Omitted when the tech has no offer history yet.
+    // Acceptance rate (offers accepted / offered, from tbl_job_offer) — the SAME
+    // computeAcceptance the dashboard uses, so the acceptance chip, the dashboard
+    // stat, and the Your-Offers card all agree. Omitted when there's no offer
+    // history yet (caller falls back to OTA).
     performanceService.computeAcceptance(efrId).catch((e) => {
       logger.warn({ err: e.message, efrId }, 'mobile-performance acceptance failed');
       return { acceptanceRate: undefined };
@@ -195,9 +197,9 @@ async function getOfferStats(efrId) {
   try {
     const [[row]] = await pool.query(
       `SELECT COUNT(*) AS offered,
-              COUNT(CASE WHEN offer_status = 1 THEN 1 END) AS accepted,
-              COUNT(CASE WHEN offer_status = 2 THEN 1 END) AS rejected,
-              COUNT(CASE WHEN offer_status = 3 THEN 1 END) AS missed
+              COUNT(CASE WHEN offer_status = ${OFFER_STATUS.ACCEPTED} THEN 1 END) AS accepted,
+              COUNT(CASE WHEN offer_status = ${OFFER_STATUS.REJECTED} THEN 1 END) AS rejected,
+              COUNT(CASE WHEN offer_status = ${OFFER_STATUS.EXPIRED} THEN 1 END) AS missed
          FROM tbl_job_offer
         WHERE fk_easyfixter_id = ?`,
       [efrId],

@@ -71,6 +71,28 @@ const MOBILE_FIELDS = new Set([
   'manager_no',
 ]);
 
+/*
+ * CUSTOMER-facing subset of MOBILE_FIELDS. When the global
+ * `ui.customer.number.visible` flag is ON, middleware/mask-mobile.js passes
+ * `{ unmaskCustomer: true }` and these keys are returned RAW while every other
+ * mobile field (technician efr_no, client-SPOC contact_no, staff manager_no…)
+ * stays masked.
+ *
+ * ONLY unambiguous CUSTOMER-owned fields belong here. The tbl_job_caller_info
+ * call-audit legs (caller / reciever / receiver) are DELIBERATELY EXCLUDED:
+ * they are polymorphic — on an admin click-to-call `caller` holds the
+ * OPERATOR's own mobile, and `reciever` can be a customer, SPOC, or technician
+ * — so unmasking them would leak staff/technician numbers. The customer's
+ * number is still exposed via `customer_mob_no` (its own column in the
+ * call-info projection), so nothing customer-facing is lost by excluding them.
+ */
+const CUSTOMER_MOBILE_FIELDS = new Set([
+  'customer_mob_no',
+  'customer_mobile',
+  'customer_mob',
+  'alternate_no',   // tbl_job alternate CUSTOMER contact
+]);
+
 /* `visible` defaults to 4 to match the "first 4 digits" UI convention. */
 function maskMobile(s, visible = 4) {
   if (s == null || s === '') return s;
@@ -102,16 +124,20 @@ function maskMobile(s, visible = 4) {
  * for /admin/* throughput. If a hotspot emerges, we'd switch to a
  * stream-based JSON.stringify replacer instead.
  */
-function maskMobileInResponse(value) {
+function maskMobileInResponse(value, opts) {
+  // opts.unmaskCustomer — when true, keys in CUSTOMER_MOBILE_FIELDS are left
+  // RAW (customer-number visibility flag ON); all other mobile fields still
+  // mask. Default false → mask everything (the historical behaviour).
+  const unmaskCustomer = !!(opts && opts.unmaskCustomer);
   if (value == null) return value;
-  if (Array.isArray(value)) return value.map(maskMobileInResponse);
+  if (Array.isArray(value)) return value.map((v) => maskMobileInResponse(v, opts));
   if (typeof value === 'object') {
     const out = {};
     for (const [k, v] of Object.entries(value)) {
       if (MOBILE_FIELDS.has(k) && (typeof v === 'string' || typeof v === 'number')) {
-        out[k] = maskMobile(v);
+        out[k] = (unmaskCustomer && CUSTOMER_MOBILE_FIELDS.has(k)) ? v : maskMobile(v);
       } else {
-        out[k] = maskMobileInResponse(v);
+        out[k] = maskMobileInResponse(v, opts);
       }
     }
     return out;
@@ -119,4 +145,4 @@ function maskMobileInResponse(value) {
   return value;
 }
 
-module.exports = { maskMobile, maskMobileInResponse, MOBILE_FIELDS };
+module.exports = { maskMobile, maskMobileInResponse, MOBILE_FIELDS, CUSTOMER_MOBILE_FIELDS };

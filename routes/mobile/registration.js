@@ -56,6 +56,11 @@ router.post(
     state:        Joi.string().trim().max(100).optional(),
     addressLine1: Joi.string().trim().max(255).optional(),
     addressLine2: Joi.string().trim().max(255).optional(),
+    // Optional device GPS captured at submit (foreground fix). Accepted
+    // independently — a partial/absent pair just falls back to the pincode
+    // centroid downstream; it must never 400 the submit.
+    latitude:     Joi.number().min(-90).max(90).optional(),
+    longitude:    Joi.number().min(-180).max(180).optional(),
   })),
   async (req, res, next) => {
     try {

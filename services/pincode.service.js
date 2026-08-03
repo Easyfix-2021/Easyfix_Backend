@@ -180,8 +180,21 @@ function deriveStatus(activeEfrCount) {
 }
 
 // ─── List with filters + computed status ─────────────────────────────
-async function listPincodes({ q, status, cityId, includeInactive = false, limit = 100, offset = 0, sortBy, sortDir = 'asc' } = {}) {
-  logger.info('Listing pincodes · q=' + (q || '') + ' status=' + (status || '') + ' cityId=' + (cityId || '') + ' includeInactive=' + includeInactive + ' limit=' + limit + ' offset=' + offset);
+async function listPincodes({ q, status, cityId, createdByTech = false, includeInactive = false, limit = 100, offset = 0, sortBy, sortDir = 'asc' } = {}) {
+  logger.info('Listing pincodes · q=' + (q || '') + ' status=' + (status || '') + ' cityId=' + (cityId || '') + ' createdByTech=' + createdByTech + ' includeInactive=' + includeInactive + ' limit=' + limit + ' offset=' + offset);
+  // "Created By (technician)" tracking columns are a pending migration — guard
+  // the projection + filter on their presence so this query stays valid where
+  // the migration hasn't run (mirrors getByIdCore's vertical_id gate).
+  const hasCreator = await hasPincodeCreatorCol();
+  // created_by is a polymorphic id — created_by_type says which table to resolve
+  // the name from (technician→tbl_easyfixer, user→tbl_user).
+  const creatorSelect = hasCreator
+    ? "p.created_by, p.created_by_type, COALESCE(cbe.efr_name, cbu.user_name) AS created_by_name"
+    : 'NULL AS created_by, NULL AS created_by_type, NULL AS created_by_name';
+  const creatorJoin = hasCreator
+    ? `LEFT JOIN tbl_easyfixer cbe ON (p.created_by_type = 'technician' AND cbe.efr_id = p.created_by)
+       LEFT JOIN tbl_user      cbu ON (p.created_by_type = 'user'       AND cbu.user_id = p.created_by)`
+    : '';
   // Cap limit defensively. Bumped from 500 → 200000 to support the CRM
   // verification page's "load-all" dropdown (~155k rows post-seed). The
   // query is indexed on `pincode` (PK) and runs sub-second; pagination
@@ -203,14 +216,18 @@ async function listPincodes({ q, status, cityId, includeInactive = false, limit 
       where.push('p.pincode LIKE ?');
       params.push(`${term}%`);
     } else {
-      where.push('(c.city_name LIKE ? OR COALESCE(p.district, c.district) LIKE ?)');
-      params.push(`%${term}%`, `%${term}%`);
+      // Match LOCATION (area label), CITY, or district so a pincode is findable
+      // by any of Pincode / Location / City.
+      where.push('(p.location LIKE ? OR c.city_name LIKE ? OR COALESCE(p.district, c.district) LIKE ?)');
+      params.push(`%${term}%`, `%${term}%`, `%${term}%`);
     }
   }
   if (cityId) {
     where.push('p.city_id = ?');
     params.push(Number(cityId));
   }
+  // Only pincodes a technician minted on the fly.
+  if (createdByTech && hasCreator) where.push("p.created_by_type = 'technician'");
 
   // Whitelisted sort. Only map-resolved column literals + an ASC/DESC literal
   // are ever spliced into SQL — `sortBy`/`sortDir` are never interpolated raw
@@ -250,11 +267,13 @@ async function listPincodes({ q, status, cityId, includeInactive = false, limit 
         p.pincode_status,
         p.lat,
         p.lng,
-        zm.user_name AS zonal_manager_name
+        zm.user_name AS zonal_manager_name,
+        ${creatorSelect}
        FROM tbl_pincode    p
        LEFT JOIN tbl_city  c ON c.city_id  = p.city_id
        LEFT JOIN tbl_state s ON s.state_id = c.state_id
        LEFT JOIN tbl_user  zm ON zm.user_id = c.state_user
+       ${creatorJoin}
       WHERE ${where.join(' AND ')}
       ORDER BY ${nullClause}${sortCol} ${dir}, p.pincode ASC
       LIMIT ? OFFSET ?`,
@@ -293,6 +312,11 @@ async function listPincodes({ q, status, cityId, includeInactive = false, limit 
       // Each pincode → city → city.state_user (zonal/city manager). Blank for
       // a new city (state_user not yet assigned). Display-only column.
       zonal_manager_name: r.zonal_manager_name || null,
+      // Creator audit: created_by (id) + created_by_type ('technician'|'user')
+      // + resolved name. NULL for legacy/seed rows created before tracking.
+      created_by:      r.created_by != null ? Number(r.created_by) : null,
+      created_by_type: r.created_by_type || null,
+      created_by_name: r.created_by_name || null,
     };
   });
 
@@ -385,7 +409,7 @@ async function lookupManyByCode(pincodes) {
 
   const placeholders = clean.map(() => '?').join(',');
   const [items] = await pool.query(
-    `SELECT p.pincode_id, p.pincode, p.location AS pincode_location,
+    `SELECT p.pincode_id, p.pincode, p.location AS location,
             p.city_id, c.city_name, c.state_id, s.state_name
        FROM tbl_pincode    p
        LEFT JOIN tbl_city  c ON c.city_id  = p.city_id
@@ -455,9 +479,163 @@ async function findOrCreateStateByName(stateName, { userId = null } = {}) {
   return { state_id: r.insertId, created: true };
 }
 
-// Find a city by (state, name) or create it. NEW cities get a NULL state_user
-// (zonal manager) per spec — the Manage Pincodes table shows it blank.
-async function findOrCreateCityByName(cityName, stateId, { district = null } = {}) {
+/*
+ * A newly-created city's zonal manager (tbl_city.state_user) can NEVER be
+ * derived from a geocode — it's a manual business assignment. But every
+ * zonal-scoped report (QuickSight admin-dashboard / supply-gap / city- /
+ * client- / technician-performance / employee-productivity) AND technician
+ * scoping filters on `c.state_user`, so a NULL-manager city's pincodes and
+ * jobs silently vanish from all of those views. To avoid orphaning a new city,
+ * inherit the manager from an existing city in the SAME district (preferred),
+ * else the SAME state — picking the MOST COMMON assigned manager (mode), which
+ * is that area's real zonal owner. Returns null only when the state has no
+ * assigned manager at all (nothing to inherit — the city stays NULL and should
+ * be flagged for manual assignment).
+ */
+async function resolveInheritedStateUser(stateId, district = null) {
+  if (!stateId) return null;
+  const d = String(district || '').trim();
+  if (d) {
+    const [[byDistrict]] = await pool.query(
+      `SELECT state_user FROM tbl_city
+        WHERE state_user IS NOT NULL AND state_id = ? AND LOWER(TRIM(district)) = LOWER(?)
+        GROUP BY state_user ORDER BY COUNT(*) DESC LIMIT 1`,
+      [Number(stateId), d]
+    );
+    if (byDistrict) return Number(byDistrict.state_user);
+  }
+  const [[byState]] = await pool.query(
+    `SELECT state_user FROM tbl_city
+      WHERE state_user IS NOT NULL AND state_id = ?
+      GROUP BY state_user ORDER BY COUNT(*) DESC LIMIT 1`,
+    [Number(stateId)]
+  );
+  return byState ? Number(byState.state_user) : null;
+}
+
+/*
+ * FUZZY city matching (2026-07-03) — Google returns NAME VARIANTS the exact
+ * match misses ("Gurgaon Division" vs "Gurugram", "Ganeshpur (Purnea)" vs
+ * "Ganeshpur", "Bengaluru" vs "Bangalore"), which used to mint duplicate
+ * cities. So before creating, we normalise (drop parentheticals + admin words +
+ * apply a common-alias map) and match against existing cities IN THE SAME STATE
+ * (never cross-state). No UI picklist — the resolution is fully backend-auto.
+ */
+const CITY_ALIAS = {
+  gurgaon: 'gurugram', bengaluru: 'bangalore', calcutta: 'kolkata', bombay: 'mumbai',
+  madras: 'chennai', poona: 'pune', mysuru: 'mysore', mangaluru: 'mangalore',
+  belagavi: 'belgaum', vadodara: 'baroda', cochin: 'kochi', trivandrum: 'thiruvananthapuram',
+  pondicherry: 'puducherry', allahabad: 'prayagraj', banaras: 'varanasi', benares: 'varanasi',
+  vizag: 'visakhapatnam', vishakhapatnam: 'visakhapatnam', gauhati: 'guwahati', cawnpore: 'kanpur',
+};
+// Administrative / postal noise words that never distinguish two real cities.
+const CITY_NOISE = /\b(division|district|dist|tehsil|taluk|taluka|taluq|mandal|block|city|town)\b/g;
+// Sub-locality qualifier tokens — a name that extends an existing city with ONLY
+// these (+ numbers) is the same place ("Gurugram Sector 14" ⊃ "Gurugram"); a
+// name that adds a REAL word ("Rampur Bushahr" ⊃ "Rampur") is a different place.
+const LOCALITY_TAIL = new Set([
+  'sector', 'sec', 'phase', 'ph', 'part', 'block', 'nagar', 'colony', 'extension', 'extn',
+  'road', 'marg', 'enclave', 'vihar', 'puram', 'chowk', 'market', 'area', 'industrial',
+  'estate', 'gali', 'lane', 'no', 'number',
+]);
+function aliasTokens(x) { return x.split(' ').map((w) => CITY_ALIAS[w] || w).join(' '); }
+// The CORE city name for matching: drop parentheticals + admin noise + alias.
+function coreCityName(s) {
+  let x = String(s || '').toLowerCase().replace(/\(.*?\)/g, ' ').replace(CITY_NOISE, ' ');
+  x = x.replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
+  return aliasTokens(x);
+}
+// A district/qualifier token (for disambiguation): a plain word list, aliased.
+function normToken(s) {
+  const x = String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
+  return x ? aliasTokens(x) : '';
+}
+// The parenthetical qualifier in a name, e.g. "Ganeshpur (Purnea)" → "purnea".
+function parenQualifier(s) {
+  const m = String(s || '').match(/\(([^)]+)\)/);
+  return m ? normToken(m[1]) : '';
+}
+// ⚠️ Two same-named places in DIFFERENT districts are DIFFERENT places
+// ("Ganeshpur (Purnea)" ≠ "Ganeshpur (Saharsa)"). Only block a match when BOTH
+// districts are known AND differ; an unknown district on either side is permissive.
+function districtsCompatible(a, b) { return !(a && b && a !== b); }
+
+// Existing city_id in the SAME STATE whose CORE name matches (exact-normalised
+// preferred, else a length-guarded prefix) AND whose district is compatible.
+// Returns null → caller creates a new city.
+async function fuzzyMatchCity(name, stateId, district = null) {
+  const target = coreCityName(name);
+  // >=4 so a name whose only non-noise remainder is a short generic token
+  // ("New Town" → "new") never fuzzy-matches; exact match still handles real
+  // short names before we get here.
+  if (!target || target.length < 4) return null;
+  // Input qualifier = the name's parenthetical, else the geocoded district.
+  const inQual = parenQualifier(name) || normToken(district);
+  const [cities] = await pool.query(
+    'SELECT city_id, city_name FROM tbl_city WHERE state_id = ? AND (city_status = 1 OR city_status IS NULL)',
+    [Number(stateId)]
+  );
+  let best = null;
+  for (const c of cities) {
+    const cand = coreCityName(c.city_name);
+    if (!cand) continue;
+    // ⚠️ Use the candidate's NAME parenthetical only — tbl_city.district is
+    // unreliable (often holds the full city name). Empty on either side ⇒
+    // permissive (we can't prove they're different places).
+    const candQual = parenQualifier(c.city_name);
+    if (!districtsCompatible(inQual, candQual)) continue; // distinct places in different districts
+    let score = 0;
+    if (cand === target) score = 100;
+    else {
+      // WORD-BOUNDARY prefix, AND the extra tail must be ONLY sub-locality
+      // qualifiers: "gurugram sector 14" ⊃ "gurugram" matches, but "rampura" ⊅
+      // "rampur" (no space) and "rampur bushahr" ⊅ "rampur" (bushahr is a real
+      // distinguishing word, not a locality tag) do NOT merge.
+      const [shorter, longer] = cand.length <= target.length ? [cand, target] : [target, cand];
+      if (shorter.length >= 4 && longer.startsWith(shorter + ' ')) {
+        const tail = longer.slice(shorter.length + 1).split(' ').filter(Boolean);
+        if (tail.length && tail.every((t) => LOCALITY_TAIL.has(t) || /^\d+$/.test(t))) score = 70;
+      }
+    }
+    if (score > 0 && (!best || score > best.score || (score === best.score && Number(c.city_id) < best.city_id))) {
+      best = { city_id: Number(c.city_id), score };
+    }
+  }
+  return best ? best.city_id : null;
+}
+
+// Cached column probes for the tech-creator tracking columns (pending
+// migrations 2026-07-03-add-tech-creator-tracking.sql) — no-op stamping where
+// the column isn't present yet.
+// Probe the created_by_type discriminator (pending migration). tbl_city also
+// gets created_by + created_date in the same migration, so this one flag gates
+// the whole tracking. created_by (id) + created_date already exist on
+// tbl_pincode — only its created_by_type is new.
+let _hasCityCreatorCol = null;
+async function hasCityCreatorCol() {
+  if (_hasCityCreatorCol !== null) return _hasCityCreatorCol;
+  try { const [r] = await pool.query("SHOW COLUMNS FROM tbl_city LIKE 'created_by_type'"); _hasCityCreatorCol = r.length > 0; }
+  catch { _hasCityCreatorCol = false; }
+  return _hasCityCreatorCol;
+}
+let _hasPincodeCreatorCol = null;
+async function hasPincodeCreatorCol() {
+  if (_hasPincodeCreatorCol !== null) return _hasPincodeCreatorCol;
+  try { const [r] = await pool.query("SHOW COLUMNS FROM tbl_pincode LIKE 'created_by_type'"); _hasPincodeCreatorCol = r.length > 0; }
+  catch { _hasPincodeCreatorCol = false; }
+  return _hasPincodeCreatorCol;
+}
+
+// Find a city by (state, name) or create it. Resolution order: exact name →
+// FUZZY match (name variants/aliases, same state) → create. A newly-created
+// city INHERITS a zonal manager (state_user) from the same district/state so
+// it isn't orphaned from zonal-scoped reporting. Creator audit: a new city
+// records created_by (efr_id when a technician minted it, else the CRM user_id)
+// + created_by_type ('technician'|'user') + created_date — see hasCityCreatorCol.
+// (NOTE: the legacy `stateId` camelCase column is intentionally left NULL — it
+// holds inconsistent legacy values and NO CRM/QuickSight filter reads it; every
+// filter keys on `state_id`.)
+async function findOrCreateCityByName(cityName, stateId, { district = null, createdByEfrId = null, userId = null } = {}) {
   const name = String(cityName || '').trim();
   if (!name) throw badReq('City name is required to create a new city');
   if (!stateId) throw badReq('A state is required to create a new city');
@@ -466,11 +644,30 @@ async function findOrCreateCityByName(cityName, stateId, { district = null } = {
     [Number(stateId), name]
   );
   if (existing) return { city_id: Number(existing.city_id), created: false };
+  const fuzzy = await fuzzyMatchCity(name, stateId, district);
+  if (fuzzy) {
+    logger.info('Fuzzy-matched city "' + name + '" → existing city_id=' + fuzzy + ' · state_id=' + stateId);
+    return { city_id: fuzzy, created: false, matched: 'fuzzy' };
+  }
+  const inheritedStateUser = await resolveInheritedStateUser(stateId, district);
   const [r] = await pool.query(
-    'INSERT INTO tbl_city (city_name, state_id, district, city_status) VALUES (?, ?, ?, 1)',
-    [name, Number(stateId), district || null]
+    'INSERT INTO tbl_city (city_name, state_id, district, city_status, state_user) VALUES (?, ?, ?, 1, ?)',
+    [name, Number(stateId), district || null, inheritedStateUser]
   );
-  return { city_id: r.insertId, created: true };
+  const cityId = r.insertId;
+  // Creator audit (guarded — no-op where the pending migration is unrun).
+  if (await hasCityCreatorCol()) {
+    const creatorId = createdByEfrId || userId || null;
+    const creatorType = createdByEfrId ? 'technician' : (userId ? 'user' : null);
+    await pool.query(
+      'UPDATE tbl_city SET created_by = ?, created_by_type = ?, created_date = NOW() WHERE city_id = ?',
+      [creatorId, creatorType, cityId]
+    );
+  }
+  logger.info('Created city · id=' + cityId + ' name="' + name + '" state_id=' + stateId
+    + ' inherited_state_user=' + (inheritedStateUser ?? 'none')
+    + ' created_by=' + (createdByEfrId ? 'efr:' + createdByEfrId : (userId ? 'user:' + userId : 'none')));
+  return { city_id: cityId, created: true, state_user: inheritedStateUser };
 }
 
 /*
@@ -480,7 +677,8 @@ async function findOrCreateCityByName(cityName, stateId, { district = null } = {
  * pincode to `zoneIds` (the chosen zone suggestions). Duplicate pincode → 409.
  */
 async function createPincode(
-  { pincode, location, city_id, district, lat, lng, newCity, zoneIds, is_active = true }, { userId = null } = {}
+  { pincode, location, city_id, district, lat, lng, newCity, zoneIds, is_active = true },
+  { userId = null, createdByEfrId = null } = {}
 ) {
   logger.info('Creating pincode · pincode=' + pincode + ' city_id=' + (city_id || '') + ' is_active=' + is_active);
   if (!/^\d{6}$/.test(String(pincode))) throw badReq('Pincode must be exactly 6 digits');
@@ -507,7 +705,7 @@ async function createPincode(
     } else {
       stateId = (await findOrCreateStateByName(newCity.state_name, { userId })).state_id;
     }
-    resolvedCityId = (await findOrCreateCityByName(newCity.city_name, stateId, { district })).city_id;
+    resolvedCityId = (await findOrCreateCityByName(newCity.city_name, stateId, { district, createdByEfrId, userId })).city_id;
   } else {
     throw badReq('Either city_id or newCity (city_name + state) is required');
   }
@@ -515,16 +713,26 @@ async function createPincode(
   const latN = (lat != null && lat !== '') ? Number(lat) : null;
   const lngN = (lng != null && lng !== '') ? Number(lng) : null;
 
+  // Creator = the technician (efr_id) when this came from the self-service path,
+  // else the CRM operator (user_id). created_by holds the id; created_by_type
+  // (stamped below) disambiguates which table it points at.
+  const creatorId = createdByEfrId || userId || null;
   // pincode_status from the Add form's Status toggle (defaults Serviceable).
   const statusVal = is_active === false ? 0 : 1;
   const [result] = await pool.query(
     `INSERT INTO tbl_pincode
        (pincode, location, city_id, district, lat, lng, pincode_status, created_by, updated_by)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [String(pincode), location || null, resolvedCityId, district || null, latN, lngN, statusVal, userId, userId]
+    [String(pincode), location || null, resolvedCityId, district || null, latN, lngN, statusVal, creatorId, creatorId]
   );
   const pincodeId = result.insertId;
-  logger.info('Pincode created · id=' + pincodeId + ' pincode=' + pincode);
+  // Stamp WHICH table created_by points at (guarded — no-op where unrun).
+  if (creatorId && await hasPincodeCreatorCol()) {
+    const creatorType = createdByEfrId ? 'technician' : 'user';
+    await pool.query('UPDATE tbl_pincode SET created_by_type = ? WHERE pincode_id = ?', [creatorType, pincodeId]);
+  }
+  logger.info('Pincode created · id=' + pincodeId + ' pincode=' + pincode
+    + ' created_by=' + (createdByEfrId ? 'efr:' + createdByEfrId : (userId ? 'user:' + userId : 'none')));
 
   // Map the chosen suggested zones (optional). Reuses the validated junction
   // writer (its own txn); a zone-map hiccup leaves the pincode created.
@@ -558,7 +766,7 @@ async function createPincode(
  * Return shape (both branches):
  *   { pincode_id, pincode, city_id, city_name, state_name, lat, lng, created }
  */
-async function ensurePincode(pincodeRaw, { userId = null } = {}) {
+async function ensurePincode(pincodeRaw, { userId = null, createdByEfrId = null } = {}) {
   const pin = String(pincodeRaw || '').trim();
   logger.info('Ensuring pincode · pincode=' + pin);
   if (!/^\d{6}$/.test(pin)) throw badReq('Pincode must be exactly 6 digits');
@@ -620,20 +828,44 @@ async function ensurePincode(pincodeRaw, { userId = null } = {}) {
   const stateId = match.state?.state_id
     || (await findOrCreateStateByName(stateName, { userId })).state_id;
   const cityId  = match.city?.city_id
-    || (await findOrCreateCityByName(cityName, stateId, { district: match.district })).city_id;
+    || (await findOrCreateCityByName(cityName, stateId, { district: match.district, createdByEfrId, userId })).city_id;
 
-  const detail = await createPincode(
-    {
-      pincode:  pin,
-      location: cityName,
-      city_id:  cityId,
-      district: match.district,
-      lat:      match.lat,
-      lng:      match.lng,
-      is_active: true,
-    },
-    { userId },
-  );
+  let detail;
+  try {
+    detail = await createPincode(
+      {
+        pincode:  pin,
+        location: cityName,
+        city_id:  cityId,
+        district: match.district,
+        lat:      match.lat,
+        lng:      match.lng,
+        is_active: true,
+      },
+      { userId, createdByEfrId },
+    );
+  } catch (err) {
+    // Lost a create race: another caller inserted this pincode between our
+    // dedup check (above) and this INSERT. Treat 409 as the idempotent branch
+    // — re-read and return the existing row instead of propagating a conflict.
+    if (err && err.status === 409) {
+      const dup = await getPincodeByValue(pin);
+      if (dup) {
+        logger.info('Pincode create raced — returning existing · pincode=' + pin);
+        return {
+          pincode_id: dup.pincode_id,
+          pincode:    dup.pincode,
+          city_id:    dup.city_id,
+          city_name:  dup.city_name,
+          state_name: dup.state_name,
+          lat:        dup.lat,
+          lng:        dup.lng,
+          created:    false,
+        };
+      }
+    }
+    throw err;
+  }
 
   logger.info('Pincode ensured (created) · id=' + detail.pincode_id + ' pincode=' + pin);
   return {

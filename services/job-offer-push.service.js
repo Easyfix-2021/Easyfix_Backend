@@ -1,6 +1,6 @@
-const { pool } = require('../db');
 const logger = require('../logger');
-const fcmService = require('./fcm.service');
+const pushDelivery = require('./push-delivery.service');
+const alertFlags = require('./job-offer-alert-flags');
 
 /*
  * Job-offer push — fires an FCM data-push to a technician's device(s) when a
@@ -10,117 +10,89 @@ const fcmService = require('./fcm.service');
  * offer so the tech can accept/reject. The RN app listens for a push whose
  * data payload is { type: "job_offer", job_id } and opens the offer screen.
  *
- * Token resolution is cloned verbatim from registration-status-push.service.js
- * (the canonical fan-out): TWO sources, unioned + deduped —
- *   1. tbl_easyfixer_app.device_id — the CANONICAL per-technician push target.
- *   2. device_info.fire_base_token (is_logged_in='1', user_id = efr_id) — the
- *      token this Node backend writes on verify-otp / POST /mobile/device.
- * Reading both keeps fan-out correct while some rows only carry one of them.
+ * Token routing + the send/prune loop live in push-delivery.service.js (the one
+ * shared delivery layer); this module only builds the message and shapes the
+ * return. `type`/`job_id` route the NEW Expo app; `screen`/`key` mirror the
+ * LEGACY Flutter push contract (routes on data.screen==='NewTicket', reads
+ * data.key) so an offered job deep-links to the accept screen on BOTH apps.
  *
- * Best-effort by contract: every function swallows its own errors — a push
- * failure must NEVER break the assignment that triggered it.
+ * LOUD ALERT (2026-07-29): a job offer is the ONE push a technician loses money
+ * by missing, so — behind the `job.offer.loud_alert.*` property flags (see
+ * job-offer-alert-flags.js) — it is sent on a dedicated high-importance channel
+ * with its own sound. Two OPT-IN data keys tell the foregrounded app what to do
+ * with it:
+ *   data.loudAlert='1'  ← loudSoundEnabled()        → play the in-app buzzer/haptics
+ *   data.loudBanner='1' ← loudAlertMasterEnabled()  → show the top-strip banner
+ * The BANNER HAS NO SUB-FLAG — it is intrinsic to the loud alert and rides on
+ * the master alone, so "keep the banner, stop the sound" is a state but "sound
+ * with no banner" is not (see job-offer-alert-flags.js; don't add one).
+ * Both are OMITTED when their flag is off (the app reads a missing key as off),
+ * so with the master flag off — the default — this module emits the exact same
+ * FCM payload, byte for byte, that it always has. That is what makes flipping
+ * `job.offer.loud_alert.enabled` back to 'false' a true no-deploy revert.
+ *
+ * Best-effort by contract: never throws — a push failure must NEVER break the
+ * assignment that triggered it.
  */
-
-/*
- * Resolve the set of FCM tokens for a technician. Returns a deduped array of
- * non-empty token strings. Never throws — on any DB error logs + returns
- * whatever was gathered (possibly []).
- */
-async function resolveTokens(efrId) {
-  logger.info('Resolving FCM tokens for offer push · efrId=' + efrId);
-  const tokens = new Set();
-
-  // 1) Canonical: tbl_easyfixer_app.device_id (one row per technician).
-  try {
-    const [[appRow]] = await pool.query(
-      'SELECT device_id FROM tbl_easyfixer_app WHERE efr_id = ? LIMIT 1',
-      [efrId],
-    );
-    const t = appRow && appRow.device_id ? String(appRow.device_id).trim() : '';
-    if (t) tokens.add(t);
-  } catch (e) {
-    logger.warn({ efrId, err: e.message }, 'job-offer-push: tbl_easyfixer_app token lookup failed');
-  }
-
-  // 2) Active device_info rows (the token this backend writes on login).
-  //    user_id holds the efr_id for technicians (see verify-otp upsert).
-  try {
-    const [rows] = await pool.query(
-      `SELECT fire_base_token
-         FROM device_info
-        WHERE user_id = ? AND is_logged_in = '1' AND fire_base_token IS NOT NULL`,
-      [efrId],
-    );
-    for (const r of rows) {
-      const t = r.fire_base_token ? String(r.fire_base_token).trim() : '';
-      if (t) tokens.add(t);
-    }
-  } catch (e) {
-    logger.warn({ efrId, err: e.message }, 'job-offer-push: device_info token lookup failed');
-  }
-
-  logger.info('Resolved ' + tokens.size + ' device tokens · efrId=' + efrId);
-  return Array.from(tokens);
-}
-
-/*
- * Clear a token FCM has reported as NotRegistered / InvalidRegistration from
- * BOTH token stores so fan-out stops targeting a dead device. Scoped to the
- * technician so it never touches another user's rows. Best-effort — never throws.
- */
-async function pruneDeadToken(efrId, token) {
-  if (!efrId || !token) return;
-  logger.info('Pruning dead FCM token · efrId=' + efrId);
-  try {
-    await pool.query(
-      "UPDATE device_info SET fire_base_token = NULL, is_logged_in = '0' WHERE user_id = ? AND fire_base_token = ?",
-      [efrId, token],
-    );
-    await pool.query(
-      'UPDATE tbl_easyfixer_app SET device_id = NULL WHERE efr_id = ? AND device_id = ?',
-      [efrId, token],
-    );
-    logger.push(`job-offer · pruned dead token · efr=${efrId}`);
-  } catch (e) {
-    logger.warn({ efrId, err: e.message }, 'job-offer-push: dead-token prune failed');
-  }
-}
 
 /*
  * Notify a technician that a job has been OFFERED to them. Fully fire-and-forget:
  * wraps everything in try/catch, never throws, and is safe to call without
  * awaiting (or with `.catch(() => {})`). Returns a small summary object.
+ *
+ * `reminder` only changes the copy (an escalation re-push says so) and the log
+ * channel — the data payload, deep link, and alert styling are identical, so a
+ * reminder opens exactly the same screen as the original offer.
  */
-async function sendJobOfferPush(efrId, { jobId } = {}) {
+async function sendJobOfferPush(efrId, { jobId, reminder = false } = {}) {
   try {
-    logger.info('Sending job-offer push · efrId=' + efrId + ' · jobId=' + jobId);
+    logger.info('Sending job-offer push · efrId=' + efrId + ' · jobId=' + jobId + (reminder ? ' · reminder' : ''));
     if (!efrId) return { delivered: false, reason: 'no efrId' };
 
-    const tokens = await resolveTokens(efrId);
-    if (!tokens.length) {
+    // Read each flag ONCE per push so the sound styling and the data keys can
+    // never disagree with each other within a single send. The banner reads the
+    // MASTER — it has no sub-flag of its own.
+    const loud = alertFlags.loudSoundEnabled();
+    const banner = alertFlags.loudAlertMasterEnabled();
+
+    // Both alert keys are OPT-IN — present only while their flag is on. The app
+    // reads a missing key as off, so with the master off the payload is exactly
+    // the four legacy keys the pre-2026-07-29 backend sent.
+    const data = {
+      type: 'job_offer',
+      job_id: String(jobId),
+      key: String(jobId),
+      screen: 'NewTicket',
+      ...(loud ? { loudAlert: '1' } : {}),
+      ...(banner ? { loudBanner: '1' } : {}),
+    };
+
+    // Alert styling is attached ONLY when loud is on. Omitting these keys is
+    // what makes fcm.service emit today's exact payload — see buildMessage().
+    const body = reminder
+      ? 'Job offer still waiting — tap to accept'
+      : 'New job offer — tap to accept';
+    const message = { title: 'EasyFix', body, data };
+    if (loud) {
+      message.androidChannelId  = alertFlags.ANDROID_CHANNEL_ID;
+      message.sound             = alertFlags.ALERT_SOUND;
+      message.iosSound          = alertFlags.IOS_ALERT_SOUND;
+      message.interruptionLevel = alertFlags.INTERRUPTION_LEVEL;
+    }
+
+    const channel = reminder ? 'job-offer-reminder' : 'job-offer';
+    const r = await pushDelivery.deliverToEfr(
+      efrId,
+      message,
+      { channel, label: `${channel} · efr=${efrId} · job=${jobId}` },
+    );
+
+    if (r.reason === 'no tokens') {
       logger.info({ efrId, jobId }, 'job-offer-push: no device tokens — skipping');
       return { delivered: false, reason: 'no tokens' };
     }
-
-    const data = { type: 'job_offer', job_id: String(jobId) };
-
-    const results = await Promise.all(
-      tokens.map(async (token) => {
-        const r = await fcmService
-          .sendPush({ token, title: 'EasyFix', body: 'New job offer — tap to accept', data })
-          .catch((e) => ({ delivered: false, error: e.message }));
-        // Prune tokens FCM reports as permanently dead so we stop re-pushing to
-        // them. Skip when the send was redirected to a test device — that dead
-        // signal is about the test token, not the real one.
-        if (r && r.deadToken && !r.redirected) await pruneDeadToken(efrId, token);
-        return r;
-      }),
-    );
-
-    const deliveredCount = results.filter((r) => r && r.delivered).length;
-    logger.push(`job-offer · efr=${efrId} · job=${jobId} · ${deliveredCount}/${tokens.length} devices`);
-    logger.info('Job-offer push delivered to ' + deliveredCount + '/' + tokens.length + ' devices · jobId=' + jobId);
-    return { delivered: deliveredCount > 0, deliveredCount, tokenCount: tokens.length };
+    logger.info('Job-offer push delivered to ' + r.deliveredCount + '/' + r.tokenCount + ' devices · jobId=' + jobId);
+    return { delivered: r.delivered, deliveredCount: r.deliveredCount, tokenCount: r.tokenCount };
   } catch (e) {
     // Absolute backstop — called best-effort from assign() and must never throw.
     logger.warn({ efrId, jobId, err: e.message }, 'job-offer-push: send failed (swallowed)');
@@ -130,5 +102,7 @@ async function sendJobOfferPush(efrId, { jobId } = {}) {
 
 module.exports = {
   sendJobOfferPush,
-  resolveTokens,
+  // Back-compat shim: routes/admin/validate.js imports resolveTokens for its
+  // debug test-push (raw-token path, no prune). Same signature + string[] return.
+  resolveTokens: pushDelivery.resolveTokensForEfr,
 };

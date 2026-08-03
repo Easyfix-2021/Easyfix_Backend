@@ -15,8 +15,44 @@ const { getProperty } = require('./properties.service');
  * pass includeInactive=true for admin tooling that needs the full list.
  */
 
+/*
+ * ── Local query helpers (parameterised) ─────────────────────────────
+ * toIdArray  — normalise an optional id filter (Joi .single() may hand us
+ *              a scalar OR an array) to a clean positive-integer array.
+ * inFilter   — build a safe ` AND col IN (?,?)` fragment, pushing each
+ *              value onto `params`; returns '' for an empty list so the
+ *              clause simply vanishes (unset filter = no restriction).
+ * Same contract as services/quicksight/_shared.js::buildInFilter, kept
+ * local so this generic lookup layer needn't depend on report code. `col`
+ * is ALWAYS a trusted identifier from this file — never user input.
+ */
+function toIdArray(v) {
+  if (v == null) return [];
+  const arr = Array.isArray(v) ? v : [v];
+  return arr.map(Number).filter((n) => Number.isInteger(n) && n > 0);
+}
+function inFilter(col, values, params) {
+  if (!Array.isArray(values) || values.length === 0) return '';
+  for (const v of values) params.push(v);
+  return ` AND ${col} IN (${values.map(() => '?').join(',')})`;
+}
+
 // ─── Cities / States ─────────────────────────────────────────────────
-async function cities({ stateId, q, limit = 500, includeInactive = false } = {}) {
+async function cities({ stateId, q, ids, limit = 500, includeInactive = false } = {}) {
+  // Preselect resolve: fetch specific cities by id (the async CitySelect uses
+  // this to show a saved job's city name without preloading the whole table).
+  // NOT status-filtered — a preselected/legacy city must still resolve its name
+  // even if it has since been deactivated.
+  if (Array.isArray(ids) && ids.length) {
+    const [rows] = await pool.query(
+      `SELECT city_id, city_name, state_id FROM tbl_city
+        WHERE city_id IN (${ids.map(() => '?').join(',')})
+        ORDER BY city_name ASC`,
+      ids.map(Number)
+    );
+    logger.info(`Lookup cities · ids=[${ids.join(',')}] · found=${rows.length}`);
+    return rows;
+  }
   const clauses = [];
   const params = [];
   if (!includeInactive) clauses.push('city_status = 1');
@@ -25,9 +61,12 @@ async function cities({ stateId, q, limit = 500, includeInactive = false } = {})
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   params.push(Number(limit));
   logger.info(`Lookup cities · stateId=${stateId ?? '—'} · q=${q ?? '—'} · limit=${limit} · includeInactive=${includeInactive}`);
+  // Trimmed projection: every consumer of this lookup uses only id + name
+  // (+ state_id for manage-users / zones scope math). tier / district /
+  // reference_pincode / city_status are read from the admin Manage-Cities
+  // endpoint, never from this lookup — so we don't ship them here.
   const [rows] = await pool.query(
-    `SELECT city_id, city_name, state_id, city_status, tier, district, reference_pincode
-       FROM tbl_city ${where}
+    `SELECT city_id, city_name, state_id FROM tbl_city ${where}
        ORDER BY city_name ASC LIMIT ?`,
     params
   );
@@ -91,13 +130,19 @@ async function serviceCategories({ includeInactive = false } = {}) {
   return rows;
 }
 
-async function serviceTypes({ categoryId, includeInactive = false } = {}) {
+async function serviceTypes({ categoryId, includeInactive = false, display } = {}) {
   const clauses = [];
   const params = [];
   if (!includeInactive) clauses.push('service_type_status = 1');
   if (categoryId != null) { clauses.push('service_catg_id = ?'); params.push(categoryId); }
+  // OPT-IN display filter. tbl_service_type.display: 1=All, 0=CRM-only, 2=Tx-app.
+  // Deep-skill pickers pass display=2 so only Tx-app/deep-skill types surface
+  // (matches mobile-deepskill.service.js getHierarchy). Omitted ⇒ ALL display
+  // types returned — required by rate cards, client tabs, and the external
+  // Decathlon /v1 integration (NO-CLIENT-CHANGE rule), so NEVER hard-code it.
+  if (display != null) { clauses.push('display = ?'); params.push(display); }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
-  logger.info(`Lookup service types · categoryId=${categoryId ?? '—'} · includeInactive=${includeInactive}`);
+  logger.info(`Lookup service types · categoryId=${categoryId ?? '—'} · includeInactive=${includeInactive} · display=${display ?? '—'}`);
   const [rows] = await pool.query(
     `SELECT service_type_id, service_type_name, service_type_desc,
             service_type_status, service_catg_id, display
@@ -216,21 +261,54 @@ async function users({ q, roleGroup, limit = 100, offset = 0, includeInactive = 
 
 // ─── Zonal Managers (admin-scoped) ──────────────────────────────────
 /*
- * Zonal Managers picker — drives the Manage Easyfixers "User Mapped To City"
- * filter. A zonal manager is a tbl_user row that's referenced by at least
- * one tbl_city.state_user (i.e. mapped as the zonal owner of some city).
- * Active users only.
+ * Zonal Managers picker. A zonal manager is a tbl_user row referenced by at
+ * least one tbl_city.state_user (the zonal owner of some city). Active users
+ * only. TWO modes:
+ *
+ *  • UNSCOPED (no clientId/verticalId) → every zonal manager platform-wide.
+ *    Back-compat path for the Manage Easyfixers "User Mapped To City" filter,
+ *    which calls this with no args.
+ *
+ *  • SCOPED (clientId and/or verticalId) → only zonal owners of cities that
+ *    actually back jobs for the selected client(s)/vertical(s). Drives the
+ *    QuickSight Open Orders / City Performance / Client Performance "Zonal
+ *    Managers" dropdowns so the picker narrows to owners present in the report
+ *    once a client/vertical is chosen. Mirrors those reports' own row-scoping
+ *    chain exactly: job → address → city.state_user, and client → vertical.
  */
-async function zonalManagers() {
-  logger.info('Lookup zonal managers');
+async function zonalManagers({ clientId, verticalId } = {}) {
+  const clients   = toIdArray(clientId);
+  const verticals = toIdArray(verticalId);
+
+  if (!clients.length && !verticals.length) {
+    logger.info('Lookup zonal managers · global');
+    const [rows] = await pool.query(`
+      SELECT DISTINCT u.user_id, u.user_name
+        FROM tbl_user u
+        JOIN tbl_city c ON c.state_user = u.user_id
+       WHERE u.user_status = 1
+       ORDER BY u.user_name ASC
+    `);
+    logger.info(`Found ${rows.length} zonal managers`);
+    return rows;
+  }
+
+  const params = [];
+  let where = 'WHERE u.user_status = 1';
+  where += inFilter('j.fk_client_id', clients, params);
+  where += inFilter('c.vertical_id', verticals, params);
+  logger.info(`Lookup zonal managers · scoped · clients=${clients.length} verticals=${verticals.length}`);
   const [rows] = await pool.query(`
     SELECT DISTINCT u.user_id, u.user_name
-      FROM tbl_user u
-      JOIN tbl_city c ON c.state_user = u.user_id
-     WHERE u.user_status = 1
-     ORDER BY u.user_name ASC
-  `);
-  logger.info(`Found ${rows.length} zonal managers`);
+      FROM tbl_job j
+      JOIN tbl_address a ON a.address_id = j.fk_address_id
+      JOIN tbl_city cy ON cy.city_id = a.city_id
+      JOIN tbl_user u ON u.user_id = cy.state_user
+      LEFT JOIN tbl_client c ON c.client_id = j.fk_client_id
+    ${where}
+    ORDER BY u.user_name ASC
+  `, params);
+  logger.info(`Found ${rows.length} zonal managers (scoped)`);
   return rows;
 }
 
@@ -246,8 +324,10 @@ async function zonalManagers() {
  * NOTE: tbl_vertical_mapping.user_type is DISTINCT from tbl_user.user_type_id
  * — do not conflate. When `userType` is omitted, both 1 and 2 are returned.
  */
-async function projectManagers({ userType } = {}) {
-  logger.info(`Lookup project managers · userType=${userType ?? '—'}`);
+async function projectManagers({ userType, clientId, verticalId } = {}) {
+  const clients   = toIdArray(clientId);
+  const verticals = toIdArray(verticalId);
+  logger.info(`Lookup project managers · userType=${userType ?? '—'} · clients=${clients.length} verticals=${verticals.length}`);
   const clauses = ['u.user_status = 1'];
   const params = [];
   if (userType != null) {
@@ -256,11 +336,17 @@ async function projectManagers({ userType } = {}) {
   } else {
     clauses.push('vm.user_type IN (1, 2)');
   }
+  // SCOPED: narrow the SPOC picker to the selected client(s)/vertical(s) using
+  // the mapping's own keys (tbl_vertical_mapping carries client_id + vertical_id).
+  // Empty list ⇒ no clause ⇒ unchanged global behaviour (back-compat).
+  let where = `WHERE ${clauses.join(' AND ')}`;
+  where += inFilter('vm.client_id', clients, params);
+  where += inFilter('vm.vertical_id', verticals, params);
   const [rows] = await pool.query(
     `SELECT DISTINCT u.user_id, u.user_name
        FROM tbl_vertical_mapping vm
        JOIN tbl_user u ON u.user_id = vm.user_id
-      WHERE ${clauses.join(' AND ')}
+      ${where}
       ORDER BY u.user_name ASC`,
     params
   );
@@ -519,9 +605,26 @@ async function cancelReasons() {
 
 async function rescheduleReasons() {
   logger.info('Lookup reschedule reasons');
-  // Actual table is reschedule_reason_app (blueprint's tbl_reschedule_reason doesn't exist).
+  // Source: action_taken_reason, action_type = 8 — the "Reschedule" bucket seeded
+  // by migrations/executed/2026-07-10-seed-reschedule-reasons-action-type-8.sql.
+  //
+  // WHY THIS CHANGED (2026-07-29): the mobile dropdown used to read the legacy
+  // `reschedule_reason_app` table, whose 4 live rows had been seeded (in the
+  // legacy era) with CANCELLATION-flavoured text ("Work done by an outsider",
+  // "Customer denied work", …) — so techs saw cancel reasons under Reschedule.
+  // This now reads the same clean set the CRM Schedule & Assign dialog serves
+  // (routes/admin/jobs.js GET /reschedule-reasons), keeping the two consistent.
+  //
+  // Deliberately NO user_type filter (unlike rejectReasons' user_type=4): the
+  // action_type=8 bucket intentionally mixes customer/tech/ops perspectives and
+  // the CRM offers ALL active rows, so the app must too or it would show only a
+  // fraction of the list. `action_desc AS reason` keeps the exact response shape
+  // the app already consumes for reject reasons — no client change needed.
   const [rows] = await pool.query(
-    `SELECT id, reschedule_reason AS reason FROM reschedule_reason_app ORDER BY id ASC`
+    `SELECT id, action_desc AS reason
+       FROM action_taken_reason
+      WHERE action_type = 8 AND (status IS NULL OR status = 1)
+      ORDER BY id ASC`
   );
   logger.info(`Found ${rows.length} reschedule reasons`);
   return rows;

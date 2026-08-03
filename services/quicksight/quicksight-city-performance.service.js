@@ -664,4 +664,21 @@ function toXlsx(payload, flag) {
   return { columns, rows: flatRows };
 }
 
-module.exports = { getCityPerformance, getCityTatSummary, toXlsx };
+module.exports = {
+  getCityPerformance, getCityTatSummary, toXlsx,
+  /*
+   * Internals shared with quicksight-region-performance.service.js (the State +
+   * User scorecards), which are the SAME metrics over a different GROUP BY
+   * dimension. Exported rather than copied so the period windows, the legacy
+   * filter clause, the TAT SLA CASE and the rounding rules have exactly ONE
+   * definition — a parity fix here lands in all three reports.
+   *
+   * Nothing ABOVE this line changed when the new dimensions were added: this
+   * file is a faithful migration of two legacy endpoints with documented parity
+   * decisions and no test coverage, so it stays byte-identical by design.
+   */
+  _internals: {
+    buildPeriods, plusDaysIso, buildFilterClause, inClause, r0,
+    TAT_SLA_CASE, GROUPED_CAP, CITY_PAGE_CAP,
+  },
+};

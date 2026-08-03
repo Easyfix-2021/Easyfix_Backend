@@ -7,6 +7,11 @@ const kaleyra = require('../../services/kaleyra.service');
 const plivo = require('../../services/plivo.service');
 const voice = require('../../services/voice.service');
 const plivoLog = require('../../services/plivo-call-log.service');
+const recordingBackfill = require('../../services/recording-backfill.service');
+// The route layer talks ONLY to the mode service: it owns the transcript-vs-
+// recording branch, the provider clients behind each, and the provenance stamp.
+const analysisMode = require('../../services/call-analysis-mode.service');
+const callerScorecard = require('../../services/caller-scorecard.service');
 const propertiesSvc = require('../../services/properties.service');
 const { requirePropertyAllowlist } = require('../../middleware/require-property-allowlist');
 const { FEATURES } = require('../../services/feature-access.service');
@@ -18,7 +23,10 @@ function coarseFlow(body) {
   if (body.jobId) return 'job';
   if (body.customerId) return 'customer';
   if (body.efrId) return 'technician';
+  // Both SPOC shapes report the same flow — analytics cares that the operator
+  // called a client contact, not which table the number was read from.
   if (body.reportingContactId) return 'spoc';
+  if (body.spocJobId) return 'spoc';
   return null;
 }
 const { getEffectivePermissions } = require('../../services/role.service');
@@ -116,15 +124,15 @@ router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'
     // jobId / customerId / efrId / reportingContactId / page / limit and
     // silently strips unknowns. /preview consumes whichever of the four
     // identifiers the FE supplied — matching the click-to-call branches.
-    const { jobId, customerId, efrId, reportingContactId, useAlt, provider } = req.query;
-    logger.info('Preview call legs · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · efrId=' + (efrId ?? '—') + ' · contactId=' + (reportingContactId ?? '—') + ' · provider=' + (provider || 'default'));
+    const { jobId, customerId, efrId, reportingContactId, spocJobId, useAlt, provider } = req.query;
+    logger.info('Preview call legs · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · efrId=' + (efrId ?? '—') + ' · contactId=' + (reportingContactId ?? '—') + ' · spocJobId=' + (spocJobId ?? '—') + ' · provider=' + (provider || 'default'));
     // Boolean coercion — query strings carry primitives as strings.
     // Accept '1' or 'true' (case-insensitive) so callers don't have to
     // remember which truthy shape we expect.
     const useAltFlag = String(useAlt || '').toLowerCase() === 'true' || String(useAlt) === '1';
-    if (!jobId && !customerId && !efrId && !reportingContactId) {
+    if (!jobId && !customerId && !efrId && !reportingContactId && !spocJobId) {
       logger.warn('Preview rejected · no receiver identifier supplied');
-      return modernError(res, 400, 'one of jobId/customerId/efrId/reportingContactId is required');
+      return modernError(res, 400, 'one of jobId/customerId/efrId/reportingContactId/spocJobId is required');
     }
 
     // Resolve receiver real-mobile via the same lookups the POST handler
@@ -160,6 +168,13 @@ router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'
       );
       if (!efr) return modernError(res, 404, `Easyfixer ${efrId} not found`);
       receiverReal = efr.efr_no || null;
+    } else if (spocJobId) {
+      const [[job]] = await pool.query(
+        `SELECT client_spoc FROM tbl_job WHERE job_id = ? LIMIT 1`,
+        [spocJobId]
+      );
+      if (!job) return modernError(res, 404, `Job ${spocJobId} not found`);
+      receiverReal = job.client_spoc || null;
     } else {
       const [[ct]] = await pool.query(
         `SELECT contact_no FROM tbl_client_contacts WHERE id = ? LIMIT 1`,
@@ -201,8 +216,8 @@ router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'
 // server-side here. Returns { ok:true, receiverMobile, receiverName,
 // receiverCustomerId, jobIdToStore, jobStatusSnapshot, jobEfrId } on success,
 // or { ok:false, status, message } the caller turns into a modernError.
-async function resolveReceiver({ jobId, customerId, efrId, reportingContactId, useAlt }) {
-  logger.info('Resolve call receiver · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · efrId=' + (efrId ?? '—') + ' · contactId=' + (reportingContactId ?? '—') + ' · useAlt=' + !!useAlt);
+async function resolveReceiver({ jobId, customerId, efrId, reportingContactId, spocJobId, useAlt, jobContextId }) {
+  logger.info('Resolve call receiver · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · efrId=' + (efrId ?? '—') + ' · contactId=' + (reportingContactId ?? '—') + ' · spocJobId=' + (spocJobId ?? '—') + ' · useAlt=' + !!useAlt);
   if (jobId) {
     const [[job]] = await pool.query(
       `SELECT j.job_id, j.fk_customer_id, j.fk_easyfixter_id, j.job_status,
@@ -234,6 +249,33 @@ async function resolveReceiver({ jobId, customerId, efrId, reportingContactId, u
       jobEfrId: job.fk_easyfixter_id || null,
     };
   }
+  if (spocJobId) {
+    const [[job]] = await pool.query(
+      `SELECT job_id, job_status, fk_easyfixter_id, client_spoc, client_spoc_name
+         FROM tbl_job WHERE job_id = ? LIMIT 1`,
+      [spocJobId]
+    );
+    if (!job) logger.warn('Resolve receiver · job not found · spocJobId=' + spocJobId);
+    if (!job) return { ok: false, status: 404, message: `Job ${spocJobId} not found` };
+    if (!job.client_spoc) logger.warn('Resolve receiver · no client SPOC mobile · spocJobId=' + spocJobId);
+    if (!job.client_spoc) return { ok: false, status: 400, message: `Job ${spocJobId} has no client SPOC mobile on file` };
+    // receiverCustomerId stays NULL even though we know the job's customer:
+    // reciever_id holds a CUSTOMER id (GET / filters `customerId` straight onto
+    // it), and a client SPOC is not the customer — stamping it would surface
+    // this call under the customer's history. Matches the efr/contact paths.
+    // jobIdToStore is the job itself (jobContextId is ignored here, as on the
+    // jobId path): the SPOC is reached THROUGH a job, so the call belongs to
+    // that job's history, where resolveJobParties already labels a
+    // client_spoc-matching leg as 'Client SPOC'.
+    return {
+      ok: true,
+      receiverMobile: job.client_spoc,
+      receiverName: job.client_spoc_name || null,
+      receiverCustomerId: null,
+      jobIdToStore: job.job_id, jobStatusSnapshot: job.job_status,
+      jobEfrId: job.fk_easyfixter_id || null,
+    };
+  }
   if (customerId) {
     const [[cust]] = await pool.query(
       `SELECT customer_id, customer_name, customer_mob_no FROM tbl_customer WHERE customer_id = ? LIMIT 1`,
@@ -243,7 +285,7 @@ async function resolveReceiver({ jobId, customerId, efrId, reportingContactId, u
     if (!cust) return { ok: false, status: 404, message: `Customer ${customerId} not found` };
     if (!cust.customer_mob_no) logger.warn('Resolve receiver · no customer mobile · customerId=' + customerId);
     if (!cust.customer_mob_no) return { ok: false, status: 400, message: `Customer ${customerId} has no mobile on file` };
-    return { ok: true, receiverMobile: cust.customer_mob_no, receiverName: cust.customer_name || null, receiverCustomerId: cust.customer_id, jobIdToStore: null, jobStatusSnapshot: null, jobEfrId: null };
+    return { ok: true, receiverMobile: cust.customer_mob_no, receiverName: cust.customer_name || null, receiverCustomerId: cust.customer_id, jobIdToStore: jobContextId || null, jobStatusSnapshot: null, jobEfrId: null };
   }
   if (efrId) {
     const [[efr]] = await pool.query(
@@ -254,7 +296,7 @@ async function resolveReceiver({ jobId, customerId, efrId, reportingContactId, u
     if (!efr) return { ok: false, status: 404, message: `Easyfixer ${efrId} not found` };
     if (!efr.efr_no) logger.warn('Resolve receiver · no easyfixer mobile · efrId=' + efrId);
     if (!efr.efr_no) return { ok: false, status: 400, message: `Easyfixer ${efrId} has no mobile on file` };
-    return { ok: true, receiverMobile: efr.efr_no, receiverName: [efr.efr_first_name, efr.efr_last_name].filter(Boolean).join(' ').trim() || null, receiverCustomerId: null, jobIdToStore: null, jobStatusSnapshot: null, jobEfrId: null };
+    return { ok: true, receiverMobile: efr.efr_no, receiverName: [efr.efr_first_name, efr.efr_last_name].filter(Boolean).join(' ').trim() || null, receiverCustomerId: null, jobIdToStore: jobContextId || null, jobStatusSnapshot: null, jobEfrId: null };
   }
   const [[ct]] = await pool.query(
     `SELECT id, contact_name, contact_no FROM tbl_client_contacts WHERE id = ? LIMIT 1`,
@@ -264,15 +306,15 @@ async function resolveReceiver({ jobId, customerId, efrId, reportingContactId, u
   if (!ct) return { ok: false, status: 404, message: `Contact ${reportingContactId} not found` };
   if (!ct.contact_no) logger.warn('Resolve receiver · no contact mobile · contactId=' + reportingContactId);
   if (!ct.contact_no) return { ok: false, status: 400, message: `Contact ${reportingContactId} has no mobile on file` };
-  return { ok: true, receiverMobile: ct.contact_no, receiverName: ct.contact_name || null, receiverCustomerId: null, jobIdToStore: null, jobStatusSnapshot: null, jobEfrId: null };
+  return { ok: true, receiverMobile: ct.contact_no, receiverName: ct.contact_name || null, receiverCustomerId: null, jobIdToStore: jobContextId || null, jobStatusSnapshot: null, jobEfrId: null };
 }
 
 // ─── POST /click-to-call ─────────────────────────────────────────────
 router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody), async (req, res, next) => {
   try {
-    const { jobId, customerId, efrId, reportingContactId, callFrom, callTo, useAlt, provider } = req.body;
+    const { jobId, customerId, efrId, reportingContactId, spocJobId, callFrom, callTo, useAlt, provider, jobContextId } = req.body;
     const agent = req.user;
-    logger.info('Click-to-call request · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · efrId=' + (efrId ?? '—') + ' · contactId=' + (reportingContactId ?? '—') + ' · provider=' + (provider || 'default') + ' · useAlt=' + !!useAlt);
+    logger.info('Click-to-call request · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · efrId=' + (efrId ?? '—') + ' · contactId=' + (reportingContactId ?? '—') + ' · spocJobId=' + (spocJobId ?? '—') + ' · provider=' + (provider || 'default') + ' · useAlt=' + !!useAlt);
 
     // Three-tier number-resolution waterfall:
     //   1. QA prompt mode → FE MUST supply both callFrom + callTo, BE uses them.
@@ -311,7 +353,7 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
     // ── Resolve receiver mobile + name + (optional) job context ──
     // Shared with POST /web-start via resolveReceiver() so the two paths can't
     // drift. FE never sends the customer mobile — always looked up server-side.
-    const rr = await resolveReceiver({ jobId, customerId, efrId, reportingContactId, useAlt });
+    const rr = await resolveReceiver({ jobId, customerId, efrId, reportingContactId, spocJobId, useAlt, jobContextId });
     if (!rr.ok) return modernError(res, rr.status, rr.message);
     const {
       receiverMobile, receiverName, receiverCustomerId,
@@ -441,6 +483,7 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
         receiver_number: kaleyra.normaliseIndianPhone(receiverMobile),
         dialed_number: kaleyra.normaliseIndianPhone(dialTo),
         status: 'placed',
+        recording_requested: plivo.recordingEnabled() ? 1 : 0,
       });
     }
 
@@ -493,16 +536,16 @@ router.get('/web-credentials', requireClickToCallAction, (req, res) => {
 // number and bridges. Reuses resolveReceiver() so it can't drift from /click-to-call.
 router.post('/web-start', requireClickToCallAction, validate(clickToCallBody), async (req, res, next) => {
   try {
-    logger.info('Web call start request · jobId=' + (req.body.jobId ?? '—') + ' · customerId=' + (req.body.customerId ?? '—') + ' · efrId=' + (req.body.efrId ?? '—') + ' · contactId=' + (req.body.reportingContactId ?? '—'));
+    logger.info('Web call start request · jobId=' + (req.body.jobId ?? '—') + ' · customerId=' + (req.body.customerId ?? '—') + ' · efrId=' + (req.body.efrId ?? '—') + ' · contactId=' + (req.body.reportingContactId ?? '—') + ' · spocJobId=' + (req.body.spocJobId ?? '—'));
     if (voice.callMode() !== 'web') logger.warn('Web call rejected · web calling not enabled');
     if (voice.callMode() !== 'web') return modernError(res, 409, 'Web calling is not enabled.');
     if (!plivo.callingEnabled()) logger.warn('Web call rejected · Plivo not enabled');
     if (!plivo.callingEnabled()) return modernError(res, 409, 'Plivo is not enabled.');
 
-    const { jobId, customerId, efrId, reportingContactId, useAlt } = req.body;
+    const { jobId, customerId, efrId, reportingContactId, spocJobId, useAlt, jobContextId } = req.body;
     const agent = req.user;
 
-    const rr = await resolveReceiver({ jobId, customerId, efrId, reportingContactId, useAlt });
+    const rr = await resolveReceiver({ jobId, customerId, efrId, reportingContactId, spocJobId, useAlt, jobContextId });
     if (!rr.ok) return modernError(res, rr.status, rr.message);
 
     const receiver = plivo.normaliseIndianPhone(rr.receiverMobile);
@@ -549,7 +592,9 @@ router.post('/web-start', requireClickToCallAction, validate(clickToCallBody), a
 
     // Opaque, one-time id the browser dials; the answer route maps it → number.
     // In QA this is the TEST number; the audit row above kept the real customer.
-    const dialId = plivo.stashWebDial({ number: dialNumber, jci });
+    // teleprompterSessionId (optional) rides along so web-answer can fork the call
+    // audio to STT for a guided teleprompter call (additive; null ⇒ normal call).
+    const dialId = plivo.stashWebDial({ number: dialNumber, jci, teleprompterSessionId: req.body.teleprompterSessionId || null });
 
     // Dedicated Plivo call log (fail-soft) — for Plivo-only reconciliation.
     await plivoLog.record({
@@ -557,6 +602,7 @@ router.post('/web-start', requireClickToCallAction, validate(clickToCallBody), a
       caller_user_id: agent.user_id, caller_name: agent.user_name, receiver_name: rr.receiverName || null,
       receiver_number: receiver, dialed_number: dialNumber,
       status: 'initiated',
+      recording_requested: plivo.recordingEnabled() ? 1 : 0,
     });
 
     logger.info(`Web call started · agent=${agent.user_name}(#${agent.user_id}) → ${rr.receiverName || rr.receiverCustomerId || 'customer'} · row=${jci}`);
@@ -612,6 +658,41 @@ router.post('/default-provider', requirePropertyAllowlist(FEATURES.canSwitchCall
   } catch (e) { next(e); }
 });
 
+// ─── GET /analysis-mode — global call-analysis input mode + availability ─────
+// Which input the coaching analysis runs over by default: the Plivo TRANSCRIPT
+// (Sophy) or the RECORDING audio (Gemini direct). `modeAvailable.recording` is
+// false without GEMINI_API_KEY so the FE disables the option rather than offering
+// one that would only fall back. Same gate as View Analysis. Declared before the
+// '/:id/*' routes, alongside the other global-setting endpoints.
+router.get('/analysis-mode', requireClickToCallAction, (req, res) => {
+  logger.info('Get call-analysis mode');
+  return modernOk(res, { mode: analysisMode.globalMode(), modeAvailable: analysisMode.modeAvailable() });
+});
+
+// ─── POST /analysis-mode — set call.analysis.mode (Admin Action) ─────────────
+// Mirrors POST /default-provider: persists to easyfix_properties + flushes the
+// cache so it takes effect immediately (no restart). Refuses 'recording' when
+// Gemini isn't configured — storing a mode that can only fall back would be a
+// lie to every later reader.
+router.post('/analysis-mode', requirePropertyAllowlist(FEATURES.canSwitchCallMode, { label: 'Switch Call Mode' }), async (req, res, next) => {
+  try {
+    const mode = analysisMode.normaliseMode(req.body.mode);
+    logger.info('Set call-analysis mode · mode=' + (mode || '—'));
+    if (!analysisMode.isValidMode(mode)) {
+      logger.warn('Set call-analysis mode rejected · invalid mode');
+      return modernError(res, 400, "mode must be 'transcript' or 'recording'.");
+    }
+    if (mode === analysisMode.MODE_RECORDING && !analysisMode.modeAvailable().recording) {
+      logger.warn('Set call-analysis mode rejected · Gemini not configured');
+      return modernError(res, 409, 'Recording analysis needs GEMINI_API_KEY configured in this environment.');
+    }
+    await propertiesSvc.setProperty('call.analysis.mode', mode);
+    await propertiesSvc.flushCache();
+    logger.info(`call.analysis.mode set to '${mode}' by user #${req.user.user_id}`);
+    return modernOk(res, { mode: analysisMode.globalMode(), modeAvailable: analysisMode.modeAvailable() });
+  } catch (e) { next(e); }
+});
+
 // Terminal normalized statuses — once the row reaches one of these the FE can
 // stop polling. Mirrors the webhook's CallStatus→status mapping (plus the
 // operator-driven 'hungup'). Kept in sync with routes/webhook/plivo.js.
@@ -624,6 +705,21 @@ function parseRowId(raw) {
   const n = Number(raw);
   return Number.isInteger(n) && n > 0 ? n : null;
 }
+
+// ─── POST /recordings/backfill — recover missing recording URLs (admin) ───────
+// The Plivo push callback (<Dial recordingCallbackUrl>) never populated
+// recording_url (observed has_url=0). This sweeps rows that requested recording
+// but have no URL and PULLS each from the Plivo Recording API by call_uuid,
+// persisting it via setRecording. Request-triggered, so it runs even when
+// CRON_DISABLED (QA). ?limit (default 50, max 200) — sweep is sequential.
+// Declared BEFORE the '/:id/*' routes so ':id' can't capture 'recordings'.
+router.post('/recordings/backfill', requireClickToCallAction, async (req, res, next) => {
+  try {
+    const result = await recordingBackfill.backfillMissingRecordings({ limit: req.query.limit });
+    logger.info('Recording backfill (manual) · ' + JSON.stringify(result));
+    return modernOk(res, result);
+  } catch (e) { next(e); }
+});
 
 // ─── GET /:id/status — live status of one call (FE polling) ────────────
 // Returns the normalized caller_status + timestamps so the FE live panel can
@@ -670,6 +766,501 @@ router.get('/:id/status', requireClickToCallAction, async (req, res, next) => {
       terminal: status ? TERMINAL_STATUSES.has(status) : false,
       provider: row.provider || null,
     });
+  } catch (e) { next(e); }
+});
+
+// Column-presence probe for the transcription columns on tbl_plivo_call_log
+// (EasyFix-owned). Cached; lets the store step no-op until the
+// 2026-07-06-add-plivo-transcription migration runs.
+let _hasTranscriptionCol = null;
+async function hasTranscriptionColumn() {
+  if (_hasTranscriptionCol !== null) return _hasTranscriptionCol;
+  try {
+    const [rows] = await pool.query("SHOW COLUMNS FROM tbl_plivo_call_log LIKE 'transcription'");
+    _hasTranscriptionCol = rows.length > 0;
+  } catch (_e) { _hasTranscriptionCol = false; }
+  return _hasTranscriptionCol;
+}
+
+// Probe for the call-analysis columns on tbl_plivo_call_log (2026-07-06-add-
+// call-analysis migration). Cached; the analysis route no-ops until it runs.
+let _hasAnalysisCol = null;
+async function hasAnalysisColumn() {
+  if (_hasAnalysisCol !== null) return _hasAnalysisCol;
+  try {
+    const [rows] = await pool.query("SHOW COLUMNS FROM tbl_plivo_call_log LIKE 'call_analysis'");
+    _hasAnalysisCol = rows.length > 0;
+  } catch (_e) { _hasAnalysisCol = false; }
+  return _hasAnalysisCol;
+}
+
+// Probe for the Transcribe Call Analytics metric columns on tbl_plivo_call_log
+// (2026-07-06-add-call-metrics migration). Cached.
+let _hasMetricsCol = null;
+async function hasMetricsColumn() {
+  if (_hasMetricsCol !== null) return _hasMetricsCol;
+  try {
+    const [rows] = await pool.query("SHOW COLUMNS FROM tbl_plivo_call_log LIKE 'call_metrics'");
+    _hasMetricsCol = rows.length > 0;
+  } catch (_e) { _hasMetricsCol = false; }
+  return _hasMetricsCol;
+}
+
+// Best-effort: pull the Plivo transcription for a recording and store it on the
+// call's tbl_plivo_call_log row for later quality analysis. Gated by
+// plivo.transcription.enabled + column presence; NEVER throws + never blocks the
+// caller (recording playback must not wait on transcription).
+async function storeTranscriptionBestEffort({ jobCallerInfoId, recordingId }) {
+  try {
+    if (!recordingId || !plivo.transcriptionEnabled()) return;
+    if (!(await hasTranscriptionColumn())) return;
+    const tx = await plivo.fetchTranscription({ recordingId });
+    if (tx.ok && tx.text) {
+      await pool.query(
+        `UPDATE tbl_plivo_call_log
+            SET transcription = ?, transcription_status = 'completed', transcription_fetched_at = NOW()
+          WHERE job_caller_info_id = ?`,
+        [tx.text, jobCallerInfoId]
+      );
+      logger.info('Call transcription stored · jci=' + jobCallerInfoId);
+    } else if (tx.ok) {
+      // No transcript yet. Plivo does NOT auto-transcribe, so REQUEST one
+      // (phase 1) and mark 'processing' — the text is retrieved on a later cron
+      // / on-demand run (phase 2). Only when we've never requested (status still
+      // NULL) so a replay doesn't re-hit Plivo. Add-on missing → notEnabled →
+      // 'not_available' (correct terminal). BUG FIX: this branch previously set
+      // 'not_available' WITHOUT requesting, permanently poisoning the row — the
+      // cron and on-demand paths both skip 'not_available', so it never recovered.
+      const [[cur]] = await pool.query(
+        'SELECT transcription_status AS s FROM tbl_plivo_call_log WHERE job_caller_info_id = ? LIMIT 1',
+        [jobCallerInfoId]
+      );
+      if (!cur || cur.s == null) {
+        const created = await plivo.createTranscription({ recordingId });
+        const status = created.notEnabled ? 'not_available' : 'processing';
+        await pool.query(
+          "UPDATE tbl_plivo_call_log SET transcription_status = ?, transcription_fetched_at = NOW() WHERE job_caller_info_id = ?",
+          [status, jobCallerInfoId]
+        );
+      }
+    }
+  } catch (e) {
+    logger.warn('Transcription store failed · jci=' + jobCallerInfoId + ' · ' + e.message);
+  }
+}
+
+// On-demand transcript fetch for the analysis view: if the 30-min backfill cron
+// hasn't reached this call yet, pull its transcript NOW (transcript only — the
+// recording DOWNLOAD stays lazy) so the first "View Analysis" isn't blocked on
+// the cron cadence. Best-effort: returns the text or null, never throws, and
+// persists the result on the row so the next open is a cache hit.
+async function fetchTranscriptOnDemand({ jobCallerInfoId, callUuid, currentStatus }) {
+  try {
+    if (!callUuid || !plivo.transcriptionEnabled()) return null;
+    const meta = await plivo.fetchRecordingMeta({ callUuid });
+    if (!meta.ok || !meta.recordingId) return null;
+    const tx = await plivo.fetchTranscription({ recordingId: meta.recordingId });
+    if (tx.ok && tx.text) {
+      await pool.query(
+        "UPDATE tbl_plivo_call_log SET transcription = ?, transcription_status = 'completed', transcription_fetched_at = NOW() WHERE job_caller_info_id = ?",
+        [tx.text, jobCallerInfoId]
+      );
+      return tx.text;
+    }
+    // No transcript yet. If we've never requested one, REQUEST it now (Plivo
+    // doesn't auto-transcribe) and mark 'processing' — it'll be retrieved on the
+    // next View Analysis or by the backfill cron. Recording download stays lazy.
+    // Already 'processing' → wait; 'not_available' → terminal, don't re-request.
+    if (tx.ok && !currentStatus) {
+      const created = await plivo.createTranscription({ recordingId: meta.recordingId });
+      const status = created.notEnabled ? 'not_available' : 'processing';
+      await pool.query(
+        "UPDATE tbl_plivo_call_log SET transcription_status = ?, transcription_fetched_at = NOW() WHERE job_caller_info_id = ?",
+        [status, jobCallerInfoId]
+      );
+    }
+    return null;
+  } catch (e) {
+    logger.warn('On-demand transcript fetch failed · jci=' + jobCallerInfoId + ' · ' + e.message);
+    return null;
+  }
+}
+
+// Refresh the per-caller scorecard for the caller of ONE call. The Scorecard tab
+// reads ONLY the pre-aggregated tbl_caller_score_rollup, so an analysis that is
+// never rolled up is invisible there no matter what the call row says. Keyed on
+// tbl_plivo_call_log.caller_user_id — the exact column rollupForCaller aggregates
+// on; tbl_job_caller_info.caller_id is the fallback for a log row that never got
+// the operator stamped. Unresolvable → skip silently: a rollup we can't attribute
+// to a caller is worse than none. Never throws — same idiom as
+// teleprompter-postcall.service.js's step 3.
+async function rollupCallerBestEffort(jobCallerInfoId, callerUserIdFromLog) {
+  try {
+    let callerUserId = callerUserIdFromLog || null;
+    if (!callerUserId) {
+      const [[jci]] = await pool.query(
+        'SELECT caller_id FROM tbl_job_caller_info WHERE job_caller_info = ? LIMIT 1',
+        [jobCallerInfoId]
+      );
+      callerUserId = (jci && jci.caller_id) || null;
+    }
+    if (!callerUserId) {
+      logger.warn('Caller scorecard write-through skipped · no caller resolved · jci=' + jobCallerInfoId);
+      return;
+    }
+    await callerScorecard.rollupForCaller(callerUserId);
+  } catch (e) {
+    logger.warn('Caller scorecard write-through failed · jci=' + jobCallerInfoId + ' · ' + e.message);
+  }
+}
+
+/*
+ * Analyse → cache → roll up. Shared by GET /:id/analysis (first view) and
+ * POST /:id/reanalyse (forced refresh), and the ONLY analysis-persistence path
+ * for BOTH modes: what produced the JSON changes, what happens to it afterwards
+ * never does. The mode branch itself lives in ONE place upstream
+ * (call-analysis-mode.service.analyzeCall) — this function only stores.
+ *
+ * The rollup runs ONLY on a fresh generate; a cache hit would recompute identical
+ * numbers on every page view. `analysis_mode` provenance is already stamped in the
+ * JSON by the dispatcher — stored inside the existing column, no schema change,
+ * and inert for the scorecard (which reads only overall_score + dimensions).
+ *
+ * Returns the dispatcher result with `analysis` replaced by the STORED object.
+ */
+async function runAndStoreAnalysis({ id, transcript, mode, hasAnalysis, callerUserId }) {
+  logger.info('Generate call analysis · row=' + id + ' · mode=' + (mode || 'default'));
+  const out = await analysisMode.analyzeCall({ jobCallerInfoId: id, transcript, mode });
+  if (!out.analysis) {
+    // Only a real LLM failure marks the row failed — "no transcript yet" and
+    // "AI not configured" are environment states, not a failed generation.
+    if (out.reason === 'analysis_failed' && hasAnalysis) {
+      await pool.query("UPDATE tbl_plivo_call_log SET call_analysis_status = 'failed' WHERE job_caller_info_id = ?", [id]);
+    }
+    return out;
+  }
+  if (hasAnalysis) {
+    await pool.query(
+      "UPDATE tbl_plivo_call_log SET call_analysis = ?, call_analysis_status = 'ready', call_analysis_generated_at = NOW() WHERE job_caller_info_id = ?",
+      [JSON.stringify(out.analysis), id]
+    );
+    // Only meaningful once the analysis is actually STORED — rollupForCaller
+    // re-reads call_analysis off the table, so an unstored one aggregates nothing.
+    await rollupCallerBestEffort(id, callerUserId);
+  }
+  return out;
+}
+
+/*
+ * Parse the OPTIONAL per-call mode override off a request (?mode= on the read,
+ * body.mode on the re-analyse). Returns { override, invalid } — absent is fine
+ * (the global default then applies), but a value we don't recognise is a caller
+ * bug and 400s rather than silently resolving to something else.
+ */
+function readModeOverride(raw) {
+  if (raw == null || String(raw).trim() === '') return { override: null, invalid: false };
+  if (!analysisMode.isValidMode(raw)) return { override: null, invalid: true };
+  return { override: analysisMode.normaliseMode(raw), invalid: false };
+}
+
+/*
+ * Map a dispatcher reason code to the FE's status contract. Both handlers share
+ * it so the same failure never reads differently on the read and re-analyse paths.
+ */
+function statusForReason(reason) {
+  if (reason === 'no_transcript') return { status: 'no_transcript' };
+  if (reason === 'llm_disabled') {
+    return { status: 'llm_disabled', reason: 'Call-analysis AI is not configured in this environment.' };
+  }
+  return { status: 'failed', reason: 'Analysis could not be generated.' };
+}
+
+// Re-analyse only: drop THIS row's cached transcript so the shared acquisition
+// path (fetchTranscriptOnDemand, and the backfill cron behind it) sees a
+// never-fetched row and re-requests from the provider — the point of Re-analyse
+// is a better transcript, not just a re-run of the LLM over the old text.
+// Clearing the TEXT (not just the status) is required, not incidental: the
+// backfill cron's WHERE excludes rows that already have text, so a status-only
+// reset would strip 'not_available' and still never re-fetch. Safe because the
+// provider holds the transcript and this column is only a cache of it. Scoped to
+// the one requested job_caller_info_id — never a status-wide sweep.
+async function resetTranscriptForRefetch(jobCallerInfoId) {
+  await pool.query(
+    `UPDATE tbl_plivo_call_log
+        SET transcription = NULL, transcription_status = NULL, transcription_fetched_at = NULL
+      WHERE job_caller_info_id = ?`,
+    [jobCallerInfoId]
+  );
+}
+
+// ─── GET /:id/recording — lazy Plivo→S3 call-recording play URL ────────
+// On first play we fetch the recording from Plivo (by CallUUID), store it once
+// on our S3 under a stable key, persist that key on the row, and return a
+// short-lived presigned URL. Every later play is a cheap S3 cache hit (no Plivo
+// round-trip), so we only ever spend S3 on recordings someone actually listens
+// to. Recording must be enabled on the Plivo side (plivo.recording.enabled) and
+// only exists for calls placed AFTER that was turned on.
+router.get('/:id/recording', requireClickToCallAction, async (req, res, next) => {
+  try {
+    const s3 = require('../../utils/s3-storage');
+    const id = parseRowId(req.params.id);
+    if (!id) return modernError(res, 400, 'invalid call id');
+    logger.info('Get call recording · row=' + id);
+
+    const [[row]] = await pool.query(
+      `SELECT job_caller_info AS id, caller_id, provider, unique_id, recording
+         FROM tbl_job_caller_info WHERE job_caller_info = ? LIMIT 1`,
+      [id]
+    );
+    if (!row) return modernError(res, 404, 'call not found');
+
+    // Authorize: the operator who placed it, or an Admin (role_id 2). Same rule
+    // as GET /:id/status.
+    const isOwner = row.caller_id != null && Number(row.caller_id) === Number(req.user.user_id);
+    const isAdmin = Number(req.user.user_role) === 2;
+    if (!isOwner && !isAdmin) {
+      return modernError(res, 403, 'You can only listen to recordings of calls you placed');
+    }
+
+    // A Kaleyra row stores an https:// recording URL directly — hand it back.
+    if (row.recording && /^https?:\/\//i.test(String(row.recording))) {
+      return modernOk(res, { url: row.recording, source: 'external' });
+    }
+
+    if (!s3.isEnabled()) {
+      logger.warn('Call recording · S3 not configured · row=' + id);
+      return modernError(res, 409, 'Recording storage is not configured in this environment.');
+    }
+
+    // Cache hit: our S3 key already persisted → just re-presign (never cache the
+    // presigned URL itself — 5-min TTL).
+    if (row.recording && String(row.recording).startsWith('CallRecordings/') && await s3.exists(row.recording)) {
+      return modernOk(res, { url: await s3.getPresignedUrl(row.recording), source: 's3' });
+    }
+
+    // Cache miss. PREFER the callback-PUSHED recording URL (stored on
+    // tbl_plivo_call_log by the <Dial recordingCallbackUrl> callback) — robust
+    // for web/WebRTC calls where the recording is filed under a different leg
+    // than the stored call_uuid, which is why the lazy call_uuid lookup below
+    // returned nothing. Fall back to that lookup. Column-probed via try/catch
+    // so a pre-migration deploy still works via the legacy path.
+    let meta = null;
+    let pulled = false;
+    try {
+      const [[plog]] = await pool.query(
+        'SELECT recording_url, recording_id FROM tbl_plivo_call_log WHERE job_caller_info_id = ? AND recording_url IS NOT NULL ORDER BY id DESC LIMIT 1',
+        [id],
+      );
+      if (plog && plog.recording_url) meta = { ok: true, url: plog.recording_url, recordingId: plog.recording_id };
+    } catch (_e) { /* pre-migration: recording_url column absent — fall through */ }
+
+    if (!meta) {
+      if (row.provider !== 'plivo' || !row.unique_id) {
+        return modernError(res, 404, 'No recording available for this call');
+      }
+      meta = await plivo.fetchRecordingMeta({ callUuid: row.unique_id });
+      pulled = true;
+    }
+    if (!meta.ok || !meta.url) {
+      // Plivo can lag a few seconds after hangup, or recording was off.
+      return modernError(res, 404, 'No recording available yet — if the call just ended, try again shortly.');
+    }
+    // Backfill tbl_plivo_call_log.recording_url from this fresh PULL — the Plivo
+    // push callback (<Dial recordingCallbackUrl>) has proven unreliable (never
+    // populated the column), so playing a call self-heals its log row and clears
+    // it from the "missing recordings" report. Best-effort (setRecording is
+    // fail-soft). Only when we actually pulled (skip when meta came from the log).
+    if (pulled) await plivoLog.setRecording(id, { url: meta.url, id: meta.recordingId, duration: meta.duration });
+    const dl = await plivo.downloadRecording(meta.url);
+    if (!dl.ok || !dl.buffer) {
+      return modernError(res, 502, 'Failed to fetch the recording from the provider.');
+    }
+    const key = s3.buildCallRecordingKey(id);
+    await s3.putAtKey({ key, buffer: dl.buffer, contentType: dl.contentType || 'audio/mpeg' });
+    await pool.query(
+      'UPDATE tbl_job_caller_info SET recording = ? WHERE job_caller_info = ?',
+      [key, id]
+    );
+    logger.info('Call recording cached to S3 · row=' + id + ' · key=' + key);
+    // Best-effort background: also pull + store the transcription for later
+    // quality analysis. Fire-and-forget so playback isn't delayed.
+    void storeTranscriptionBestEffort({ jobCallerInfoId: id, recordingId: meta.recordingId });
+    return modernOk(res, { url: await s3.getPresignedUrl(key), source: 's3', fetched: true });
+  } catch (e) { next(e); }
+});
+
+// ─── GET /:id/analysis — LLM coaching analysis of the call ─────────────
+// On-demand (Call Analytics → View Analysis): returns the cached analysis, else
+// generates one and caches it. Needs the transcription/analysis columns
+// (2026-07-06 migrations) + a configured LLM; degrades gracefully.
+//
+// ?mode=transcript|recording is an OPTIONAL per-call override of the global
+// `call.analysis.mode`. Every response reports `mode` (what ACTUALLY produced the
+// analysis) + `modeAvailable` (what this environment can run) so the FE never
+// mislabels an analysis or offers an option that would only fall back.
+router.get('/:id/analysis', requireClickToCallAction, async (req, res, next) => {
+  try {
+    const id = parseRowId(req.params.id);
+    if (!id) return modernError(res, 400, 'invalid call id');
+    const { override, invalid } = readModeOverride(req.query.mode);
+    if (invalid) {
+      logger.warn('Get call analysis rejected · invalid mode · row=' + id);
+      return modernError(res, 400, "mode must be 'transcript' or 'recording'.");
+    }
+    const modeAvailable = analysisMode.modeAvailable();
+    const resolved = analysisMode.resolveMode(override);
+
+    // Transcription columns are the base surface; analysis (LLM) + metrics
+    // (Transcribe) are each conditionally present per their own migration.
+    if (!(await hasTranscriptionColumn())) {
+      return modernOk(res, {
+        status: 'unavailable', reason: 'Call analytics is not enabled in this environment.',
+        mode: resolved.mode, modeAvailable,
+      });
+    }
+    const hasAnalysis = await hasAnalysisColumn();
+    const hasMetrics = await hasMetricsColumn();
+    const analysisCol = hasAnalysis ? 'call_analysis' : 'NULL AS call_analysis';
+    const metricsSelect = hasMetrics ? ', call_metrics, call_metrics_status' : '';
+    const [[row]] = await pool.query(
+      `SELECT transcription, transcription_status, call_uuid, caller_user_id, ${analysisCol}${metricsSelect}
+         FROM tbl_plivo_call_log WHERE job_caller_info_id = ? ORDER BY id DESC LIMIT 1`,
+      [id]
+    );
+
+    // Objective metrics (Transcribe Call Analytics), precomputed by the
+    // call-metrics cron. Attached to EVERY response so the modal can show the
+    // metrics half even when the LLM coaching half isn't ready.
+    let metrics = null;
+    if (hasMetrics && row && row.call_metrics) {
+      try { metrics = JSON.parse(row.call_metrics); } catch (_e) { metrics = null; }
+    }
+    const metricsStatus = (hasMetrics && row) ? (row.call_metrics_status || null) : null;
+    const envelope = (obj, { mode = resolved.mode, fallbackReason = null } = {}) => ({
+      ...obj, metrics, metricsStatus, mode, modeAvailable,
+      ...(fallbackReason ? { modeFallbackReason: fallbackReason } : {}),
+    });
+
+    if (!row) return modernOk(res, envelope({ status: 'no_transcript' }));
+    // Cache hit — return the stored coaching (parse-guarded). An EXPLICIT ?mode=
+    // is a request for THAT mode, so a cache produced the other way is bypassed
+    // and regenerated; compared against the RESOLVED mode so asking for an
+    // unavailable recording doesn't re-generate the same transcript every view.
+    if (row.call_analysis) {
+      try {
+        const cached = JSON.parse(row.call_analysis);
+        const cachedMode = analysisMode.analysisModeOf(cached);
+        if (!override || resolved.mode === cachedMode) {
+          return modernOk(res, envelope({ status: 'ready', analysis: cached }, { mode: cachedMode }));
+        }
+      } catch (_e) { /* corrupt cache — fall through + regenerate */ }
+    }
+
+    // Transcript acquisition is LAZY: recording mode reads the audio and needs no
+    // transcript at all, so the thunk only runs if the transcript path is what
+    // actually executes. If the 30-min backfill cron hasn't reached this call, it
+    // pulls the transcript NOW (transcript only — the recording download stays
+    // lazy elsewhere) so the cron cadence doesn't block the first View Analysis.
+    const transcript = async () => {
+      if ((!row.transcription || String(row.transcription).trim().length < analysisMode.MIN_TRANSCRIPT_CHARS) && row.call_uuid) {
+        const fetched = await fetchTranscriptOnDemand({ jobCallerInfoId: id, callUuid: row.call_uuid, currentStatus: row.transcription_status });
+        if (fetched) row.transcription = fetched;
+      }
+      return row.transcription;
+    };
+
+    const out = await runAndStoreAnalysis({
+      id, transcript, mode: override, hasAnalysis, callerUserId: row.caller_user_id,
+    });
+    const opts = { mode: out.mode, fallbackReason: out.fallbackReason };
+    if (!out.analysis) return modernOk(res, envelope(statusForReason(out.reason), opts));
+    return modernOk(res, envelope({ status: 'ready', analysis: out.analysis }, opts));
+  } catch (e) { next(e); }
+});
+
+// ─── POST /:id/reanalyse — force a fresh transcript + fresh coaching ───
+// View Analysis is a CACHE on both halves: once call_analysis_status='ready' it
+// never regenerates, and a transcript in a TERMINAL state ('completed' /
+// 'not_available') is never re-requested. Both are right for the read path and
+// wrong when the TRANSCRIPT itself improves (a better STT provider re-run over
+// the same audio yields a better score). This is the explicit escape hatch —
+// reset this one row's transcript cache, then fall through the SAME acquisition
+// + analysis path the read uses.
+//
+// body.mode is the same OPTIONAL per-call override as the read's ?mode=. In
+// recording mode the transcript reset is skipped when the audio carries the
+// analysis — the audio is immutable, so there is nothing to re-request; the
+// reset only happens on the transcript leg that actually needs it.
+router.post('/:id/reanalyse', requireClickToCallAction, async (req, res, next) => {
+  try {
+    const id = parseRowId(req.params.id);
+    if (!id) return modernError(res, 400, 'invalid call id');
+    const { override, invalid } = readModeOverride(req.body && req.body.mode);
+    if (invalid) {
+      logger.warn('Re-analyse rejected · invalid mode · row=' + id);
+      return modernError(res, 400, "mode must be 'transcript' or 'recording'.");
+    }
+    const modeAvailable = analysisMode.modeAvailable();
+    const resolved = analysisMode.resolveMode(override);
+    if (!(await hasTranscriptionColumn())) {
+      return modernOk(res, {
+        status: 'unavailable', reason: 'Call analytics is not enabled in this environment.',
+        mode: resolved.mode, modeAvailable,
+      });
+    }
+
+    const [[jci]] = await pool.query(
+      'SELECT caller_id FROM tbl_job_caller_info WHERE job_caller_info = ? LIMIT 1',
+      [id]
+    );
+    if (!jci) return modernError(res, 404, 'call not found');
+    // Stronger gate than the read: this re-requests a PAID transcription, spends
+    // an LLM round-trip and rewrites the caller's rollup score. Same owner-or-admin
+    // rule the other per-call actions (/:id/recording, /:id/hangup) already use.
+    const isOwner = jci.caller_id != null && Number(jci.caller_id) === Number(req.user.user_id);
+    const isAdmin = Number(req.user.user_role) === 2;
+    if (!isOwner && !isAdmin) {
+      return modernError(res, 403, 'You can only re-analyse calls you placed');
+    }
+
+    const hasAnalysis = await hasAnalysisColumn();
+    const [[row]] = await pool.query(
+      `SELECT call_uuid, caller_user_id
+         FROM tbl_plivo_call_log WHERE job_caller_info_id = ? ORDER BY id DESC LIMIT 1`,
+      [id]
+    );
+    const envelope = (obj, { mode = resolved.mode, fallbackReason = null } = {}) => ({
+      ...obj, mode, modeAvailable,
+      ...(fallbackReason ? { modeFallbackReason: fallbackReason } : {}),
+    });
+    if (!row) return modernOk(res, envelope({ status: 'no_transcript' }));
+    logger.info('Re-analyse call · row=' + id + ' · mode=' + (override || 'default'));
+
+    // Lazy, and only on the transcript leg: recording mode re-runs the model over
+    // the SAME immutable audio, so resetting the transcript cache there would
+    // spend a paid re-transcription nobody reads.
+    const transcript = async () => {
+      await resetTranscriptForRefetch(id);
+      return row.call_uuid
+        ? fetchTranscriptOnDemand({ jobCallerInfoId: id, callUuid: row.call_uuid, currentStatus: null })
+        : null;
+    };
+
+    // Cache bypass is a READ-path difference, not a destructive write: we simply
+    // never consult call_analysis here, and only overwrite it on a successful
+    // generate — so a failed re-analyse leaves the previous analysis intact rather
+    // than blanking a row the operator still needs.
+    const out = await runAndStoreAnalysis({
+      id, transcript, mode: override, hasAnalysis, callerUserId: row.caller_user_id,
+    });
+    const opts = { mode: out.mode, fallbackReason: out.fallbackReason };
+    if (out.analysis) return modernOk(res, envelope({ status: 'ready', analysis: out.analysis }, opts));
+    if (out.reason === 'no_transcript') {
+      // Provider has nothing ready yet — the reset above left the row 'processing',
+      // so the backfill cron lands the text and a second Re-analyse picks it up.
+      return modernOk(res, envelope({ status: 'transcript_pending', reason: 'A fresh transcript has been requested — try Re-analyse again in a few minutes.' }, opts));
+    }
+    return modernOk(res, envelope(statusForReason(out.reason), opts));
   } catch (e) { next(e); }
 });
 
@@ -739,22 +1330,117 @@ router.post('/:id/hangup', requireClickToCallAction, async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// Last-10-digits key for phone-number comparison — strips +91 / spaces /
+// punctuation so the legacy-formatted `caller`/`reciever` columns compare
+// cleanly against a job's stored party numbers. Empty string when < 10 digits.
+function last10(v) {
+  const d = String(v ?? '').replace(/\D/g, '');
+  return d.length >= 10 ? d.slice(-10) : '';
+}
+
+/*
+ * resolveJobParties — for a single job, return every known counterparty the
+ * operator might have called, keyed by last-10-digits, so a job-scoped call
+ * list can label each row with WHO the call was with (Customer / Alternate /
+ * Client SPOC / Technician). All numbers live on tbl_job (+ two joins), so
+ * this is a single query. Priority order matters: the classifier keeps the
+ * FIRST role a number matches, so Customer wins over a duplicate Alternate.
+ */
+async function resolveJobParties(jobId) {
+  const [[j]] = await pool.query(
+    `SELECT cu.customer_mob_no,
+            COALESCE(j.job_customer_name, cu.customer_name) AS customer_name,
+            j.additional_number, j.additional_name,
+            j.client_spoc, j.client_spoc_name,
+            ef.efr_no   AS technician_mob,
+            ef.efr_name AS technician_name
+       FROM tbl_job j
+       LEFT JOIN tbl_customer  cu ON cu.customer_id = j.fk_customer_id
+       LEFT JOIN tbl_easyfixer ef ON ef.efr_id      = j.fk_easyfixter_id
+      WHERE j.job_id = ? LIMIT 1`,
+    [jobId]
+  );
+  if (!j) return [];
+  const parties = [];
+  const push = (num, role, name) => {
+    const d = last10(num);
+    if (d) parties.push({ digits: d, role, name: name || null });
+  };
+  push(j.customer_mob_no,   'Customer',    j.customer_name);
+  push(j.additional_number, 'Alternate',   j.additional_name || j.customer_name);
+  push(j.client_spoc,       'Client SPOC', j.client_spoc_name);
+  push(j.technician_mob,    'Technician',  j.technician_name);
+  return parties;
+}
+
 // ─── GET / — paginated call history ───────────────────────────────────
 router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
   try {
-    const { jobId, customerId, dateFrom, dateTo, page, limit } = req.query;
-    logger.info('List call history · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · from=' + (dateFrom || '—') + ' · to=' + (dateTo || '—') + ' · page=' + page + ' · limit=' + limit);
+    const { jobId, customerId, dateFrom, dateTo, mobile, flow, callerId, minScore, page, limit } = req.query;
+    const hasAnalysisFilter = /^(true|1)$/i.test(String(req.query.hasAnalysis || ''));
+    logger.info('List call history · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · mobile=' + (mobile ? '***' : '—') + ' · flow=' + (flow || '—') + ' · callerId=' + (callerId ?? '—') + ' · from=' + (dateFrom || '—') + ' · to=' + (dateTo || '—') + ' · page=' + page + ' · limit=' + limit);
     const where = [];
     const params = [];
     if (jobId)      { where.push('jci.job_id = ?');      params.push(jobId); }
     if (customerId) { where.push('jci.reciever_id = ?'); params.push(customerId); }
     if (dateFrom)   { where.push('jci.inserted_time >= ?'); params.push(dateFrom); }
     if (dateTo)     { where.push('jci.inserted_time < ?');  params.push(dateTo); }
+    // Number scope: match the last 10 digits against EITHER call leg (outbound
+    // → reciever = customer; inbound → caller = customer), robust to the +91 /
+    // space formatting variations stored in the legacy columns. Combined with
+    // jobId this yields exactly "calls on THIS number for THIS job" and, by
+    // construction, excludes calls on the same number for other jobs.
+    if (mobile) {
+      const digits = String(mobile).replace(/\D/g, '').slice(-10);
+      if (digits.length === 10) {
+        where.push("(RIGHT(REPLACE(REPLACE(jci.reciever, '+', ''), ' ', ''), 10) = ? OR RIGHT(REPLACE(REPLACE(jci.caller, '+', ''), ' ', ''), 10) = ?)");
+        params.push(digits, digits);
+      }
+    }
+    // Unified Call Analysis filters (all additive; call_flow is always present,
+    // the analysis-based ones are guarded on the column existing).
+    const hasTx = await hasTranscriptionColumn();
+    const hasAna = await hasAnalysisColumn();
+    if (flow)     { where.push('pcl.call_flow = ?');   params.push(flow); }
+    if (callerId) { where.push('jci.caller_id = ?');   params.push(callerId); }
+    if (hasAna && hasAnalysisFilter) where.push('pcl.call_analysis IS NOT NULL');
+    if (hasAna && minScore) {
+      where.push("CAST(JSON_UNQUOTE(JSON_EXTRACT(pcl.call_analysis, '$.overall_score')) AS UNSIGNED) >= ?");
+      params.push(minScore);
+    }
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
     const offset = (page - 1) * limit;
 
+    // Call Analytics is Plivo-only: transcription + coaching analysis live in
+    // tbl_plivo_call_log, so this list shows ONLY calls that have a Plivo log
+    // row — the "relevant" set — not every row in the ~940k-row shared
+    // caller-info audit table (dominated by null/legacy-provider rows). INNER
+    // JOIN restricts BOTH the count and the page to those; 1:1 with the call via
+    // job_caller_info_id. transcription_status is selected only when the
+    // 2026-07-06 migration added the column (guarded for pre-migration envs).
+    const txSelect = hasTx ? ',\n              pcl.transcription_status' : '';
+    // Flow (always present) + coaching score and its PROVENANCE (both extracted
+    // from the cached analysis JSON so the big blob isn't shipped per row) for the
+    // unified Call Analysis list.
+    //
+    // A stored analysis with NO `analysis_mode` marker is NOT unknown provenance:
+    // analyzeCall() stamps every analysis it produces, so an unstamped row can
+    // only predate recording mode — i.e. it was transcript-produced by
+    // construction. We therefore resolve it to 'transcript' here, matching
+    // call-analysis-mode.service.js's analysisModeOf(). Without this the SAME row
+    // read "no chip" in the list and "Transcript" in the modal.
+    // NULL is reserved for its one honest meaning: no analysis at all ⇒ no chip.
+    const flowSelect = ',\n              pcl.call_flow';
+    const anaSelect = hasAna
+      ? ",\n              pcl.call_analysis_status,\n              JSON_UNQUOTE(JSON_EXTRACT(pcl.call_analysis, '$.overall_score')) AS score"
+        + ",\n              CASE WHEN pcl.call_analysis IS NULL THEN NULL"
+        + "\n                   ELSE COALESCE(JSON_UNQUOTE(JSON_EXTRACT(pcl.call_analysis, '$.analysis_mode')), 'transcript')"
+        + "\n              END AS analysis_mode"
+      : '';
+    const plivoJoin = 'JOIN tbl_plivo_call_log pcl ON pcl.job_caller_info_id = jci.job_caller_info';
+
     const [[{ total }]] = await pool.query(
-      `SELECT COUNT(*) AS total FROM tbl_job_caller_info jci ${whereSql}`,
+      `SELECT COUNT(*) AS total FROM tbl_job_caller_info jci ${plivoJoin} ${whereSql}`,
       params
     );
     const [rows] = await pool.query(
@@ -777,16 +1463,50 @@ router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
               jci.location,
               jci.provider,
               jci.inserted_time,
-              jci.is_updated
+              jci.is_updated${txSelect}${flowSelect}${anaSelect}
          FROM tbl_job_caller_info jci
+         ${plivoJoin}
          ${whereSql}
          ORDER BY jci.inserted_time DESC
          LIMIT ? OFFSET ?`,
       [...params, limit, offset]
     );
 
+    // When scoped to ONE job, label each row with the party the operator was
+    // on the call with. The counterparty is the non-operator leg: reciever on
+    // OUT calls (operator dialled out), caller on IN calls. We match its last-10
+    // digits against the job's known numbers so the UI can show "Customer" /
+    // "Client SPOC" / "Technician" instead of a bare number. Falls back to the
+    // name stamped on the row at call time, then 'Other' for anything unmatched
+    // (e.g. a number that has since changed on the job).
+    if (jobId && rows.length) {
+      const byDigits = new Map();
+      for (const p of await resolveJobParties(jobId)) {
+        if (p.digits && !byDigits.has(p.digits)) byDigits.set(p.digits, p);
+      }
+      for (const r of rows) {
+        const isOut = String(r.call_type || '').toUpperCase() === 'OUT';
+        const counterparty = isOut ? r.receiver : r.caller;
+        const hit = byDigits.get(last10(counterparty));
+        r.party_role = hit ? hit.role : 'Other';
+        r.party_name = hit ? hit.name : (isOut ? r.receiver_name : r.caller_name) || null;
+      }
+    }
+
     logger.info('Returning ' + rows.length + ' call history rows · total=' + total);
     return modernOk(res, { total, page, limit, items: rows });
+  } catch (e) { next(e); }
+});
+
+// ─── GET /scorecard — per-caller (ops agent) coaching-score rollup ─────
+// "Who is improving, who is not." Reads the pre-aggregated tbl_caller_score_rollup
+// (refreshed after each analysed call). Same permission as View Analysis.
+router.get('/scorecard', requireClickToCallAction, async (req, res, next) => {
+  try {
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit || '50', 10)));
+    const offset = Math.max(0, parseInt(req.query.offset || '0', 10));
+    const items = await callerScorecard.list({ limit, offset });
+    return modernOk(res, { items });
   } catch (e) { next(e); }
 });
 
