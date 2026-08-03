@@ -936,13 +936,17 @@ function magicLinkDeliveryColumns(colsExist) {
  *
  * ── THE SUB-STATES (mutually exclusive; they partition the bucket) ──
  *   'offered'  ≥1 effectively-open offer                      → "Offered to Tx"
- *   'expired'  no open, none accepted, ≥1 effectively-dead     → "Expired"
- *   'pending'  no open, none accepted, none dead               → "Pending For Scheduling"
+ *   'expired'  no open, none accepted, ≥1 effectively-dead     → "Expired/Rejected"
+ *   'pending'  no open, none accepted, none dead               → "Pending to Scheduling"
  *
- * 'pending' is the catch-all, and that is deliberate: a job whose only offer
- * was REJECTED is back in the pool and must read as Pending For Scheduling, NOT
- * "Expired" — the documented ops intent. Same for a job whose only offer rows
- * are unresolvable (see the technician guard below): nobody is holding it.
+ * DEAD includes REJECTED as well as EXPIRED (2026-08-03, owner's rule). So
+ * 'pending' now means literally "no offer has ever been made", and a job whose
+ * offers were all declined reads as Expired/Rejected. The previous rule sent
+ * rejected-only jobs to 'pending' on the theory that a decline returns the job
+ * to the pool — but that made "nobody has been asked yet" and "everyone we asked
+ * said no" render identically, hiding the second. A job whose only offer rows
+ * are UNRESOLVABLE (see the technician guard below) still falls to 'pending':
+ * nobody is holding it and nothing was really offered.
  *
  * ⚠ "all expired" is NOT "none open". Open-ness is an EXISTS over rows, never
  * MAX(offer_status) and never a count comparison: a job holding 3 dead offers
@@ -1030,10 +1034,34 @@ function offerKindPredicate(kind, a, bind, expiry) {
         params,
       };
     case 'dead':
-      // expiry OFF ⇒ only rows an earlier ENABLED regime already swept are dead.
-      if (!expiry) return { sql: `${a}.offer_status = ${v(OFFER_STATUS.EXPIRED)}`, params };
+      /*
+       * DEAD = the offer is spent. REJECTED counts, alongside EXPIRED.
+       *
+       * ⚠ This changed on 2026-08-03 and reverses the earlier rule. It used to
+       * be EXPIRED only, so a job whose offers were all REJECTED fell through to
+       * 'pending' and its chip read "Pending to Scheduling" — on the theory that
+       * a declined offer puts the job back in the pool. The owner's rule is the
+       * opposite and is what ops actually triage on:
+       *   no offer rows at all            -> Pending to Scheduling
+       *   offers exist, none still open   -> Expired/Rejected
+       *   at least one open offer         -> Offered to Tx
+       * "Nobody has been asked yet" and "everyone we asked said no" are
+       * different problems, and collapsing them hid the second one.
+       *
+       * 'pending' is the exact complement of this predicate (see offerStateSql),
+       * so adding REJECTED here moves rejected-only jobs out of pending
+       * automatically — the two states cannot drift apart.
+       */
+      // expiry OFF ⇒ only rows an earlier ENABLED regime already swept are dead
+      // (plus rejections, which are a technician's answer, not a timer).
+      if (!expiry) {
+        return {
+          sql: `${a}.offer_status IN (${v(OFFER_STATUS.EXPIRED)}, ${v(OFFER_STATUS.REJECTED)})`,
+          params,
+        };
+      }
       return {
-        sql: `(${a}.offer_status = ${v(OFFER_STATUS.EXPIRED)}`
+        sql: `(${a}.offer_status IN (${v(OFFER_STATUS.EXPIRED)}, ${v(OFFER_STATUS.REJECTED)})`
            + ` OR (${a}.offer_status = ${v(OFFER_STATUS.OFFERED)}`
            + ` AND (${a}.offered_at IS NULL`
            + ` OR ${a}.offered_at < NOW() - INTERVAL ${v(OFFER_TTL_MINUTES)} MINUTE)))`,

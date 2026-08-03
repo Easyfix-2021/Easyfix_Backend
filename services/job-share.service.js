@@ -14,6 +14,7 @@
  */
 
 const { signJobShareToken } = require('../utils/jwt');
+const { hasTimeOfDay, formatClock12, deriveTimeSlot, canonicalSlot } = require('./time-slot');
 const urlShortener = require('./url-shortener.service');
 const logger = require('../logger');
 
@@ -36,6 +37,67 @@ function buildMapsSearchLink(gpsLocation, address) {
     return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(String(address).trim())}`;
   }
   return null;
+}
+
+/*
+ * ─── THE APPOINTMENT LINE ────────────────────────────────────────────────
+ *
+ * ONE builder for BOTH the public page's `schedule.appointment_label` and the
+ * WhatsApp/share-sheet blurb in buildShareMessage. They were two copies of
+ * `[requested_date_label, time_slot].join(' · ')` — the page's copy in the FE
+ * (Easyfix_CRM_UI shared-job page) and this file's in buildShareMessage — so a
+ * fix to one silently left the other wrong. The page now renders this string
+ * verbatim.
+ *
+ * ── WHY THE STORED BAND IS NOT USED ──
+ *
+ * tbl_job.time_slot is DERIVED: it is the band containing requested_date_time,
+ * and resolveTimeSlot re-derives it on every write. A stored value that
+ * disagrees with the appointment is therefore already dead — the next save
+ * discards it. Job #482491 stores requested_date_time 05:30 ('After Hours')
+ * with time_slot '3pm to 7pm', and this link published '3pm to 7pm' to whoever
+ * opened it. Same precedence as the writer-side gate and as jobDateLabel in
+ * whatsapp-conversation.service.js:
+ *
+ *   real time-of-day  → the band CONTAINING it (deriveTimeSlot)
+ *   date-only / 00:00 → the stored label, canonicalised for spelling only
+ *                       (canonicalSlot — a cosmetic fold, never an
+ *                       interpretation, so legacy vocabularies like
+ *                       'Morning 9 to 2' survive verbatim)
+ *
+ * ── WHY THE EXACT TIME IS ALSO SHOWN ──
+ *
+ * Owner request (2026-08-03): the shared page previously carried a DATE-ONLY
+ * label and they want the hour on it, so a timed job reads
+ *   'Tue, 5 Aug 2026, 5:30 AM · After Hours'
+ * and a date-only job keeps the band alone
+ *   'Tue, 5 Aug 2026 · 3PM to 7PM'.
+ * formatClock12 returns null on the 00:00 sentinel, which is what stops a
+ * date-only booking from claiming a "12 AM" appointment it never had.
+ *
+ * No SQL change was needed: requested_date_time is already projected as an IST
+ * wall-clock string ('%Y-%m-%d %H:%i:%s') beside the date label, which is
+ * exactly what these helpers parse.
+ */
+function buildAppointmentLabel(dateLabel, requestedDateTime, storedSlot) {
+  const date = dateLabel ? String(dateLabel).trim() : '';
+  if (!date) return null;
+  const band = hasTimeOfDay(requestedDateTime)
+    ? deriveTimeSlot(requestedDateTime)
+    : canonicalSlot(storedSlot);
+  const clock = formatClock12(requestedDateTime);
+  const head = clock ? `${date}, ${clock}` : date;
+  return band ? `${head} · ${band}` : head;
+}
+
+/* The band this job's appointment actually sits in — same precedence as above,
+ * exposed on its own so a consumer of `schedule.time_slot` can never pick up
+ * the stale stored string. '' collapses to null for the JSON payload. */
+function resolveDisplaySlot(requestedDateTime, storedSlot) {
+  const band = hasTimeOfDay(requestedDateTime)
+    ? deriveTimeSlot(requestedDateTime)
+    : canonicalSlot(storedSlot);
+  return band || null;
 }
 
 /*
@@ -116,7 +178,16 @@ async function fetchShareDetails(jobId, pool) {
     schedule: {
       requested_date_time: row.requested_date_time || null,
       requested_date_label: row.requested_date_label || null,
-      time_slot: row.time_slot || null,
+      /* The 12-hour appointment time ('5:30 AM'), or null on a date-only /
+       * midnight-sentinel booking. */
+      requested_time_label: formatClock12(row.requested_date_time),
+      /* The band the appointment ACTUALLY falls in — never the raw stored
+       * column. See buildAppointmentLabel. */
+      time_slot: resolveDisplaySlot(row.requested_date_time, row.time_slot),
+      /* The one composed line the page renders and the share message quotes. */
+      appointment_label: buildAppointmentLabel(
+        row.requested_date_label, row.requested_date_time, row.time_slot,
+      ),
     },
     address: {
       address: row.address || null,
@@ -138,8 +209,12 @@ async function fetchShareDetails(jobId, pool) {
  * its field is missing. NO customer name/number — only service + city +
  * appointment + link.
  *   "EasyFix job #511425 — AC Repair (Cooling) in Gurugram, scheduled
- *    Sat, 27 Jun 2026 · 12 PM - 3 PM.
+ *    Sat, 27 Jun 2026, 12 PM · 12PM to 3PM.
  *    View full details & navigate: <url>"
+ *
+ * The appointment clause is `schedule.appointment_label` — the SAME string the
+ * public page renders — so the blurb and the page it links to can never quote
+ * different windows. Do not re-join the schedule fields here.
  */
 function buildShareMessage(details, url) {
   const svc = (details.service_requested && details.service_requested[0]) || null;
@@ -151,7 +226,7 @@ function buildShareMessage(details, url) {
   const city = details.address && details.address.city_name;
   if (city) head += ` in ${city}`;
   const sched = details.schedule || {};
-  const when = [sched.requested_date_label, sched.time_slot].filter(Boolean).join(' · ');
+  const when = sched.appointment_label;
   if (when) head += `, scheduled ${when}`;
   head += '.';
   return `${head}\nView full details & navigate: ${url}`;

@@ -253,6 +253,19 @@ function compileBody(body, cursor) {
       () => () => true],                                       // rows are already this job's
     [new RegExp(`${a}\\.fk_easyfixter_id IS NOT NULL`),
       () => (row) => row.techId !== null],
+    /*
+     * IN (?, ?) — the 'dead' predicate since 2026-08-03, when REJECTED joined
+     * EXPIRED. Listed BEFORE the `= ?` atom: the combined regex is alternated in
+     * order, so a shorter atom placed first would match `offer_status ` and eat
+     * half of this one. Both placeholders are taken in left-to-right order, which
+     * is what keeps the interpreter's param cursor aligned with the real bindings.
+     */
+    [new RegExp(`${a}\\.offer_status IN \\(${NUM}, ${NUM}\\)`),
+      (m) => {
+        const a1 = cursor.take(m[1]);
+        const a2 = cursor.take(m[2]);
+        return (row) => row.status === a1 || row.status === a2;
+      }],
     [new RegExp(`${a}\\.offer_status = ${NUM}`),
       (m) => { const code = cursor.take(m[1]); return (row) => row.status === code; }],
     [new RegExp(`${a}\\.offered_at >= NOW\\(\\) - INTERVAL ${NUM} MINUTE`),
@@ -393,9 +406,27 @@ test('a job with NO offer rows is pending in BOTH regimes', () => {
   assert.equal(stateOf([], EXPIRY_OFF), 'pending');
 });
 
-test('a job whose only offer was REJECTED is pending in BOTH regimes — back in the pool, not "Expired"', () => {
-  assert.equal(stateOf([offer(REJECTED)], EXPIRY_ON), 'pending');
-  assert.equal(stateOf([offer(REJECTED)], EXPIRY_OFF), 'pending');
+/*
+ * REVERSED 2026-08-03 (owner's rule). This used to assert 'pending' on the
+ * theory that a declined offer returns the job to the pool. It does — but the
+ * CHIP has to distinguish "nobody has been asked yet" from "everyone we asked
+ * said no", and collapsing them hid the second. REJECTED is now DEAD, so
+ * 'pending' means literally no offer has ever been made.
+ */
+test('a job whose only offer was REJECTED reads Expired/Rejected in BOTH regimes', () => {
+  assert.equal(stateOf([offer(REJECTED)], EXPIRY_ON), 'expired');
+  assert.equal(stateOf([offer(REJECTED)], EXPIRY_OFF), 'expired');
+});
+
+test('a mix of REJECTED and EXPIRED, none open, is still Expired/Rejected', () => {
+  const rows = [offer(REJECTED, { techId: 1 }), offer(EXPIRED, { techId: 2 })];
+  assert.equal(stateOf(rows, EXPIRY_ON), 'expired');
+  assert.equal(stateOf(rows, EXPIRY_OFF), 'expired');
+});
+
+test('REJECTED does NOT beat a live offer — one open row still wins', () => {
+  const rows = [offer(REJECTED, { techId: 1 }), offer(OFFERED, { techId: 2, ageMinutes: FRESH })];
+  assert.equal(stateOf(rows, EXPIRY_ON), 'offered');
 });
 
 test('THE TRAP: 3 dead offers + 1 genuinely-open one is offered, NOT expired', () => {
@@ -567,12 +598,15 @@ test('CHIP: the reported row renders per regime — Expired when expiry is on, O
   const on = projectionStateFn(EXPIRY_ON);
   assert.equal(on([offer(OFFERED, { ageMinutes: STALE })]), 'expired');
   assert.equal(on([offer(OFFERED, { ageMinutes: FRESH })]), 'offered');
-  assert.equal(on([offer(REJECTED)]), 'pending');
-  assert.equal(on([]), 'pending');
+  // REJECTED is DEAD since 2026-08-03 — and the CHIP tracking the FILTER here
+  // without a second edit is the point of the shared builder: one definition,
+  // so the two can never disagree about a row again.
+  assert.equal(on([offer(REJECTED)]), 'expired');
+  assert.equal(on([]), 'pending');            // 'pending' now means: never offered
   const off = projectionStateFn(EXPIRY_OFF);
   assert.equal(off([offer(OFFERED, { ageMinutes: STALE })]), 'offered');
   assert.equal(off([offer(EXPIRED)]), 'expired');
-  assert.equal(off([offer(REJECTED)]), 'pending');
+  assert.equal(off([offer(REJECTED)]), 'expired');
   assert.equal(off([]), 'pending');
 });
 
@@ -677,7 +711,13 @@ const FILTER_ALIAS = /tbl_job_offer jos\b/;
 
 const OFFERED_PARAMS  = [OFFER_STATUS.OFFERED, OFFER_TTL_MINUTES];
 const ACCEPTED_PARAMS = [OFFER_STATUS.ACCEPTED];
-const DEAD_PARAMS     = [OFFER_STATUS.EXPIRED, OFFER_STATUS.OFFERED, OFFER_TTL_MINUTES];
+/*
+ * DEAD binds FOUR params since 2026-08-03: the IN (EXPIRED, REJECTED) pair, then
+ * the stale-open arm's OFFERED + TTL. REJECTED joined the predicate when the
+ * owner ruled that "everyone we asked said no" must read as Expired/Rejected
+ * rather than collapsing into Pending to Scheduling.
+ */
+const DEAD_PARAMS     = [OFFER_STATUS.EXPIRED, OFFER_STATUS.REJECTED, OFFER_STATUS.OFFERED, OFFER_TTL_MINUTES];
 
 test('offerState NARROWS the bucket — status=0 + assigned=false survive intact', async () => {
   await jobSvc.list({ status: 0, assigned: false, offerState: 'offered', limit: 10, offset: 0 });

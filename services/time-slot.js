@@ -148,6 +148,33 @@ function wallClockTime(dt) {
   return `${pad2(p.h)}:${pad2(p.mi)}`;
 }
 
+/*
+ * formatClock12(dt) → the human 12-hour appointment time — '5:30 AM', '3 PM' —
+ * or null when the value carries no REAL time-of-day.
+ *
+ * Whole hours drop the ':00' ("3 PM", not "3:00 PM"): that is how the approved
+ * WhatsApp template already reads the appointment back to the customer
+ * (whatsapp-conversation.service.js jobDateLabel), and the two must not diverge
+ * now that the public shared-job page states a time as well.
+ *
+ * Gated on hasTimeOfDay, NOT slotHour, so the 00:00 midnight sentinel returns
+ * null instead of rendering "12 AM" for a date-only booking that never had a
+ * time captured at all. A caller that gets null must show the band alone.
+ *
+ * Lives here rather than beside its callers because this module already owns
+ * every reading of an appointment's time columns (wallClockTime, slotHour) and
+ * is pure + dependency-free, so a display surface can require it without
+ * dragging a service graph along.
+ */
+function formatClock12(dt) {
+  if (!hasTimeOfDay(dt)) return null;
+  const p = parseWallClock(dt);
+  if (!p) return null;
+  const h12 = ((p.h + 11) % 12) + 1;
+  const suffix = p.h < 12 ? 'AM' : 'PM';
+  return p.mi === 0 ? `${h12} ${suffix}` : `${h12}:${pad2(p.mi)} ${suffix}`;
+}
+
 // ─── Band derivation ─────────────────────────────────────────────────
 /*
  * bandForHour(h) → one of the four bands.
@@ -181,9 +208,88 @@ function deriveTimeSlot(dt) {
   return bandForHour(h);
 }
 
+// ─── Cosmetic fold vs. interpretation ────────────────────────────────
+/*
+ * TWO DIFFERENT QUESTIONS, TWO DIFFERENT FUNCTIONS. They live side by side so
+ * the distinction is impossible to miss, and they must NEVER be merged or
+ * implemented in terms of each other.
+ *
+ *   canonicalSlot(v)      "are these two strings the SAME SPELLING of a band?"
+ *                         A purely COSMETIC fold — case and whitespace, nothing
+ *                         else. It never interprets: a value that is not one of
+ *                         the four bands modulo case/spacing comes back
+ *                         UNCHANGED. Safe on the READ side — comparing,
+ *                         grouping, deciding which chip renders selected,
+ *                         widening a SQL match.
+ *
+ *   normaliseSlotLabel(v) "what band does this label MEAN?" It parses an hour
+ *                         out of the label and answers with the CONTAINING
+ *                         band. That is a WRITER-SIDE JUDGEMENT — it picks a
+ *                         band on the caller's behalf — and it is what
+ *                         resolveTimeSlot uses at save time.
+ *
+ * They disagree on purpose, e.g. on '9-12':
+ *     canonicalSlot('9-12')      === '9-12'          (not a band spelling)
+ *     normaliseSlotLabel('9-12') === '9AM to 12PM'   (the band it denotes)
+ * …and on '3 PM–4 PM' (a 1-hour frame): canonicalSlot leaves it alone,
+ * normaliseSlotLabel answers '3PM to 7PM'.
+ *
+ * Swapping one for the other is a real bug in both directions. Using
+ * normaliseSlotLabel on the READ side silently re-labels the 79,364 rows of
+ * legacy free text this column carries; using canonicalSlot on the WRITE side
+ * would let a 1-hour frame label back into tbl_job.time_slot, which is the
+ * experiment the whole module exists to keep reversed.
+ */
+
+/*
+ * foldSlot(v) → the COMPARISON form of a slot string: lower-cased with ALL
+ * whitespace removed. Never stored, never displayed, never returned to a
+ * caller — it exists only to answer "do these two strings name the same band?".
+ *
+ * WHY IT HAS TO EXIST. MySQL's default collation is case-insensitive, so
+ * `time_slot = '9AM to 12PM'` DOES match a row storing '9am to 12pm' — but it
+ * does NOT match '9 am to 12 pm', because collation folds CASE, not SPACES.
+ * Prod carries both spellings of the morning band, so byte (or collation)
+ * equality silently drops rows that are unambiguously the same window.
+ *
+ * Byte-mirror of `foldSlot` in Easyfix_CRM_UI/src/lib/job-slots.ts, and mirrored
+ * again in SQL as REPLACE(LOWER(col), ' ', '') by the availability count in
+ * services/integration.service.js. Keep all three in step.
+ */
+function foldSlot(v) {
+  return String(v == null ? '' : v).toLowerCase().replace(/\s+/g, '');
+}
+
+/* Folded spelling → the canonical band it names. Built once, from the four. */
+const BAND_BY_FOLD = new Map(TIME_SLOT_BANDS.map((b) => [foldSlot(b), b]));
+
+/*
+ * canonicalSlot(value) → the canonical spelling of a stored slot when it names
+ * one of the four bands with only cosmetic differences ('3pm to 7pm' →
+ * '3PM to 7PM', '9 am to 12 pm' → '9AM to 12PM'); the TRIMMED INPUT otherwise,
+ * and '' for an absent value.
+ *
+ * DELIBERATELY NARROW — case and spacing only. 'Morning 9 to 2', '9-12' and
+ * '3 PM–4 PM' are genuinely different strings and pass through untouched.
+ * Folding those would mean PICKING a band on the caller's behalf, which is
+ * normaliseSlotLabel's job at save time, not something a read-side compare may
+ * do silently.
+ *
+ * READ-SIDE ONLY. It does not decide what gets stored — resolveTimeSlot has the
+ * final say on what lands in tbl_job.time_slot.
+ */
+function canonicalSlot(value) {
+  const raw = String(value == null ? '' : value).trim();
+  if (!raw) return '';
+  return BAND_BY_FOLD.get(foldSlot(raw)) || raw;
+}
+
 /*
  * normaliseSlotLabel(label) → the canonical band a slot LABEL denotes, or null
  * when the label carries no readable hour.
+ *
+ * ⚠ NOT canonicalSlot. This one INTERPRETS — see the comparison note above.
+ * It is a writer-side judgement; canonicalSlot is the read-side cosmetic fold.
  *
  * Accepts, without caring which picker produced it:
  *   - the four canonical bands (identity)
@@ -294,8 +400,12 @@ module.exports = {
   slotHour,
   hasTimeOfDay,
   wallClockTime,
+  formatClock12,
   bandForHour,
   deriveTimeSlot,
+  // READ-side cosmetic fold (case + spacing). NOT interchangeable with
+  // normaliseSlotLabel below — see the comparison note above canonicalSlot.
+  canonicalSlot,
   normaliseSlotLabel,
   resolveTimeSlot,
   conflictFrame,

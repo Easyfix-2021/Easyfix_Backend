@@ -201,10 +201,25 @@ function directoryObjectHasMailbox(user) {
  * crypto ONLY — Math.random is not a CSPRNG and a predictable first-sign-in
  * password on a mail-enabled account is a real takeover path.
  *
- * ⚠ The value is passed straight into the Graph create body and then dropped.
- * It is NEVER logged, NEVER persisted, and NEVER returned in an API response.
- * forceChangePasswordNextSignIn is true, so the operator resets it from the
- * M365 admin centre if the user needs it — that is the only supported route.
+ * ⚠ WHERE THIS VALUE MAY GO — the complete list (2026-08-03).
+ * It used to be generated inline in the Graph create body and dropped on the
+ * floor. That was safe and completely unusable: the mailbox we had just paid a
+ * licence for had a password that existed for one HTTP request and then existed
+ * nowhere, so the new joiner could not sign in. It now travels to EXACTLY ONE
+ * consumer, via the `onTempPassword` sink callback threaded through
+ * createEntraUser() → provisionUserMailbox(): the caller holds it as a local
+ * value for the life of the request and hands it to
+ * services/user-welcome-mail.service.js.
+ *
+ * It is still, on every path including errors:
+ *   - NEVER logged (no logger line in this file interpolates it);
+ *   - NEVER persisted — not to tbl_user_entra_provisioning, not anywhere;
+ *   - NEVER placed on the outcome object, which IS published in the
+ *     POST /api/admin/users response body;
+ *   - NEVER returned from createEntraUser(), so it cannot be picked up by a
+ *     future `{ ...created }` spread.
+ * forceChangePasswordNextSignIn stays true, so it is single-use by design and
+ * the M365 admin centre reset remains the fallback.
  *
  * Shape: 20 chars, at least two each of lower/upper/digit/symbol (Entra wants
  * 3 of 4 categories and 8–256 chars, so this clears it comfortably), from a
@@ -449,8 +464,18 @@ async function listSubscribedSkus() {
 /*
  * POST /v1.0/users — create the directory account.
  * ⚠ `password` is inside `body` and must never reach a log line or a response.
+ *
+ * `onTempPassword` is the ONLY way the generated password leaves this function.
+ * It is a SINK, not a return value, on purpose: a return value would end up in
+ * `created`, one careless `{ ...created }` away from the outcome object that is
+ * serialised into the HTTP response. A sink can only reach the one caller that
+ * deliberately supplies it. It fires ONLY after Graph confirmed the account was
+ * created — a failed create has no account and therefore no credential to share.
+ * The sink is invoked inside a try/catch so a throwing consumer can never turn a
+ * successful provisioning run into a failure.
  */
-async function createEntraUser({ userPrincipalName, displayName, mailNickname }) {
+async function createEntraUser({ userPrincipalName, displayName, mailNickname }, onTempPassword) {
+  const tempPassword = generateTempPassword();
   const body = {
     accountEnabled: true,
     displayName,
@@ -459,13 +484,22 @@ async function createEntraUser({ userPrincipalName, displayName, mailNickname })
     usageLocation: usageLocation(),
     passwordProfile: {
       forceChangePasswordNextSignIn: true,
-      password: generateTempPassword(),
+      password: tempPassword,
     },
   };
   const res = await graphRequest('/users', { method: 'POST', body });
   if (res.ok && res.json && res.json.id) {
     // Deliberately logs the UPN and NOTHING from passwordProfile.
     logger.info('Entra account created · upn=' + userPrincipalName + ' · objectId=' + res.json.id);
+    if (typeof onTempPassword === 'function') {
+      try {
+        onTempPassword(tempPassword);
+      } catch (e) {
+        // Never interpolate the password into this (or any) log line.
+        logger.warn('Temp-password sink threw · upn=' + userPrincipalName + ' · ' + e.message);
+      }
+    }
+    // NOTE: tempPassword is deliberately NOT on this object.
     return { ok: true, id: res.json.id, requestId: res.requestId };
   }
   const err = graphErrorToReason(res);
@@ -668,9 +702,16 @@ async function getProvisioning(userId) {
  * @param {string}  args.officialEmail   tbl_user.official_email (→ UPN)
  * @param {string} [args.trigger]        'create-user' | 'admin-retry' (logs only)
  * @param {number} [args.actorId]        who triggered it (logs only)
+ * @param {Function} [args.onTempPassword]
+ *        Sink for the temp password of a NEWLY created account. Called at most
+ *        once, only on the create path, only after Graph confirmed the account.
+ *        The value is NOT on the returned outcome (which is published in the
+ *        API response) and is NOT written to tbl_user_entra_provisioning — the
+ *        sink is the single exit. Omit it and the password is generated,
+ *        used in the Graph body, and dropped exactly as before.
  */
 async function provisionUserMailbox({
-  userId, userName, officialEmail, trigger = 'create-user', actorId,
+  userId, userName, officialEmail, trigger = 'create-user', actorId, onTempPassword,
 } = {}) {
   const base = {
     userId: Number(userId),
@@ -763,7 +804,10 @@ async function provisionUserMailbox({
     entraObjectId = decision.entraObjectId || null;
     logger.info('Entra account already exists — not creating a second one · upn=' + ident.userPrincipalName);
   } else {
-    const created = await createEntraUser(ident);
+    // The sink rides along ONLY on the create path — the reuse branch above
+    // mints nothing, so there is no credential to hand out for an account that
+    // already existed (see GATE 3 in services/user-welcome-mail.service.js).
+    const created = await createEntraUser(ident, onTempPassword);
     if (created.ok) {
       accountStatus = ACCOUNT_STATUS.CREATED;
       entraObjectId = created.id;

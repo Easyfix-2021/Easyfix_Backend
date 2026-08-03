@@ -5,6 +5,9 @@ const { parseAllowedRows, parseAllowedInput, NO_ACCESS_KEY } = require('../lib/j
 // Microsoft 365 mailbox provisioning. Fail-soft + fail-closed by design — see
 // the call site in createUser() for the rules it must obey.
 const entraProvisioning = require('./entra-provisioning.service');
+// "Your EasyFix account is ready" credential mail. Only ever called from the
+// create path, and only when the provisioning outcome says the mailbox is real.
+const welcomeMail = require('./user-welcome-mail.service');
 
 /*
  * Manage Users — internal-staff CRUD on tbl_user.
@@ -57,6 +60,184 @@ const PROVISION_INLINE_DEADLINE_MS = Math.max(
 );
 
 function mkErr(status, message) { const e = new Error(message); e.status = status; return e; }
+
+// ─── Personal contact (tbl_user_personal_details) ────────────────────
+/*
+ * PERSONAL EMAIL — the address we can actually reach a new joiner on.
+ *
+ * WHERE IT LIVES: tbl_user_personal_details, an EasyFix-owned SIDE TABLE keyed
+ * by user_id (migrations/2026-08-03-create-tbl-user-personal-details.sql). NOT
+ * a column on tbl_user — that table is legacy and shared by five services, and
+ * CLAUDE.md forbids altering it. Same pattern as tbl_user_allowed_stages and
+ * tbl_user_entra_provisioning.
+ *
+ * WHY IT EXISTS: the credential mail for a brand-new Microsoft 365 mailbox
+ * cannot be sent to that same mailbox — the user cannot read it yet. It goes to
+ * a personal address instead.
+ *
+ * REQUIREDNESS MATRIX (owner's decision — mirrored by the Joi schemas in
+ * routes/admin/users.js and by the asterisk on the Add/Edit User form):
+ *
+ *   Add User                                   → REQUIRED
+ *   Edit an ACTIVE user                        → REQUIRED
+ *   Edit an INACTIVE user                      → not required
+ *   The edit that DEACTIVATES a user           → not required
+ *
+ * The two exemptions are what keep the change shippable: ~7.5k active users
+ * have no personal address today, and offboarding someone who has already left
+ * must never require chasing them for one.
+ */
+const PERSONAL_EMAIL_RE = /^\S+@\S+\.\S+$/;
+
+/*
+ * THE single definition of the update-side rule, exported so the route layer
+ * enforces exactly the same thing rather than a lookalike. Joi alone cannot
+ * express it: whether the field is mandatory depends on the TARGET ROW's
+ * current status, which is a DB fact, not a payload fact.
+ *
+ * @param {number|boolean} currentUserStatus  tbl_user.user_status as loaded
+ * @param {boolean|undefined} isActiveInPayload  fields.is_active, if supplied
+ */
+function isPersonalEmailRequiredOnUpdate(currentUserStatus, isActiveInPayload) {
+  const deactivating = isActiveInPayload !== undefined && !isActiveInPayload;
+  return Number(currentUserStatus) === STATUS_ACTIVE && !deactivating;
+}
+
+/*
+ * Normalise + validate one personal_email value.
+ *   → { ok: true, value: 'a@b.com' | null }
+ *   → { ok: false, message }
+ * Lowercased for the same reason official_email is: it is a delivery address,
+ * every provider treats it case-insensitively, and two casings of one address
+ * must not read as two different people.
+ */
+function normalisePersonalEmail(raw, { required }) {
+  const value = String(raw ?? '').trim().toLowerCase();
+  if (!value) {
+    if (required) return { ok: false, message: 'personal_email is required' };
+    return { ok: true, value: null };
+  }
+  if (value.length > 255) return { ok: false, message: 'personal_email must be 255 characters or fewer' };
+  if (!PERSONAL_EMAIL_RE.test(value)) return { ok: false, message: `personal_email "${raw}" is not a valid email address` };
+  /*
+   * ── It must NOT be one of OUR OWN Microsoft 365 domains. ──────────────
+   * The whole point of this address is that it is reachable BEFORE the
+   * corporate mailbox is. Two concrete failures the shape check alone lets
+   * through, and the Add User form makes easy because the two fields sit side
+   * by side:
+   *
+   *   personal_email == official_email → the credential mail is delivered into
+   *     the very mailbox it unlocks, which the joiner cannot open without the
+   *     password inside it. Undeliverable by construction.
+   *   personal_email == a COLLEAGUE's @easyfix.in address → a working credential
+   *     for someone else's brand-new mailbox lands with an uninvolved employee.
+   *
+   * `entra.managed.domains` is the same list the provisioning service refuses to
+   * create accounts outside of, so the two can never disagree about what "ours"
+   * means. Personal providers (gmail.com, …) are unaffected.
+   */
+  if (entraProvisioning.isManagedDomain(value)) {
+    return {
+      ok: false,
+      message: 'personal_email must be a personal (non-company) address — '
+        + 'the sign-in details cannot be delivered to an EasyFix mailbox the user cannot open yet',
+    };
+  }
+  return { ok: true, value };
+}
+
+/*
+ * MySQL "table does not exist" — tbl_user_personal_details ships as a PENDING
+ * migration, so there is a real window in which this code is live and the table
+ * is not. See loadPersonalEmail() / upsertPersonalEmail() for the two different
+ * answers we give on the read and the write side.
+ */
+function isMissingContactTable(err) {
+  return Boolean(err) && (err.code === 'ER_NO_SUCH_TABLE' || err.errno === 1146);
+}
+
+const MIGRATION_HINT = 'has migrations/2026-08-03-create-tbl-user-personal-details.sql been applied?';
+
+/*
+ * READ side — FAIL-SOFT, exactly like entra-provisioning's getProvisioning().
+ *
+ * A host that has not yet applied the migration must lose ONE COLUMN, not the
+ * whole Manage Users surface: getUserById feeds the list, the detail view, every
+ * PATCH, the provision-mailbox repair endpoint and both bulk paths, so letting
+ * ER_NO_SUCH_TABLE escape from here would 500 all of them at once.
+ *
+ * Batched (one `IN (…)` for the page), not a per-row lookup — the reason the
+ * original LEFT JOIN existed. It is a separate statement rather than a join so
+ * the failure is containable: a join that throws takes the users query with it.
+ */
+async function loadPersonalEmails(userIds) {
+  const ids = [...new Set((userIds || []).map(Number).filter(Boolean))];
+  const out = new Map();
+  if (!ids.length) return out;
+  try {
+    const [rows] = await pool.query(
+      `SELECT user_id, personal_email FROM tbl_user_personal_details
+        WHERE user_id IN (${ids.map(() => '?').join(',')})`,
+      ids
+    );
+    for (const r of rows) out.set(Number(r.user_id), r.personal_email || null);
+  } catch (e) {
+    logger.warn('Could not read personal contacts · userIds=' + ids.length + ' · ' + (e.code || e.message)
+      + (isMissingContactTable(e) ? ' — ' + MIGRATION_HINT : ''));
+  }
+  return out;
+}
+
+/** Single-user variant, same fail-soft contract → null when unreadable. */
+async function loadPersonalEmail(userId) {
+  try {
+    const [[row]] = await pool.query(
+      'SELECT personal_email FROM tbl_user_personal_details WHERE user_id = ? LIMIT 1',
+      [Number(userId)]
+    );
+    return (row && row.personal_email) || null;
+  } catch (e) {
+    logger.warn('Could not read personal contact · userId=' + userId + ' · ' + (e.code || e.message)
+      + (isMissingContactTable(e) ? ' — ' + MIGRATION_HINT : ''));
+    return null;
+  }
+}
+
+/*
+ * WRITE side — idempotent upsert of the one row per CRM user. DATETIME columns
+ * are bound as `new Date()` so the pool's +05:30 session timezone stores the IST
+ * wall clock verbatim — never SQL NOW(), which would be the server's UTC clock.
+ *
+ * Takes a `runner` (pool OR a transaction connection) so createUser can write
+ * it inside the SAME transaction as the tbl_user INSERT: personal_email is
+ * MANDATORY on create, so a user row that exists without one would be a row
+ * that violates the rule the moment it is committed.
+ *
+ * NOT fail-soft, unlike the read side above, and the asymmetry is deliberate:
+ * personal_email is a MANDATORY value the operator just typed. Swallowing the
+ * write would accept it, report success and silently discard it — the worst of
+ * the three outcomes. Instead a missing table is re-thrown as a 503 that names
+ * the migration, so the operator gets an actionable message rather than an
+ * opaque 500 and no data is lost.
+ */
+async function upsertPersonalEmail(userId, personalEmail, runner = pool) {
+  const now = new Date();
+  try {
+    await runner.query(
+      `INSERT INTO tbl_user_personal_details (user_id, personal_email, created_on, updated_on)
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         personal_email = VALUES(personal_email),
+         updated_on     = VALUES(updated_on)`,
+      [Number(userId), personalEmail || null, now, now]
+    );
+  } catch (e) {
+    if (!isMissingContactTable(e)) throw e;
+    logger.warn('Personal contact write failed · userId=' + userId + ' · ' + e.code + ' — ' + MIGRATION_HINT);
+    throw mkErr(503, 'Personal email storage is unavailable on this host — apply '
+      + 'migrations/2026-08-03-create-tbl-user-personal-details.sql, then retry');
+  }
+}
 
 /*
  * Sortable-column whitelist. Same SQL-injection guardrail as cities — only
@@ -182,6 +363,25 @@ async function listUsers({
   q, roleId, cityId, includeInactive = false,
   limit = 200, offset = 0,
   sortBy = 'user_name', sortDir = 'asc',
+  /*
+   * Attach personal_email to each row? OFF BY DEFAULT, and the route turns it on
+   * only for the canonical Admin role.
+   *
+   * /api/admin/* is guarded by role(['admin']), which is a GROUP of ten role_ids
+   * (Executive Supply, Business Development, Finance, Zonal Field Team, Project
+   * Manager, …). Only roleByName(['Admin']) may create or edit a user, so only
+   * Admin can act on a missing personal address — but every one of the ten could
+   * previously call GET /api/admin/users?limit=1000&includeInactive=true and page
+   * out the HOME email address of all ~7.5k staff. maskMobile does not touch
+   * email keys, so the rows shipped verbatim.
+   *
+   * The edit form still gets the value from getUserById, so nothing in the
+   * feature depends on the list projection; this only removes the bulk-harvest
+   * surface. A caller without the flag sees the field absent — the FE renders
+   * its "—" placeholder, which is exactly what it already does for a user who
+   * has no address on record.
+   */
+  includePersonalEmail = false,
 } = {}) {
   limit  = Math.min(Math.max(Number(limit)  || 200, 1), 1000);
   offset = Math.max(Number(offset) || 0, 0);
@@ -205,6 +405,13 @@ async function listUsers({
   if (roleId) { where.push('u.user_role = ?'); params.push(Number(roleId)); }
   if (cityId) { where.push('u.city_id = ?');   params.push(Number(cityId)); }
 
+  /*
+   * personal_email is NOT joined here. It is fetched separately, batched, and
+   * only when the caller asked for it (see includePersonalEmail above) — the
+   * side table ships as a PENDING migration, and a LEFT JOIN onto a table that
+   * does not exist yet rejects the WHOLE query, taking Manage Users down rather
+   * than blanking one column.
+   */
   const [rows] = await pool.query(
     `SELECT
         u.user_id, u.user_code, u.user_name, u.official_email, u.mobile_no,
@@ -240,6 +447,13 @@ async function listUsers({
     r.allowed_stages = (!p || p.mode === 'all') ? null : p.stages;
   }
 
+  // Same batched shape as the stage permissions above, and fail-soft on a
+  // pre-migration host: the column reads blank, the screen still loads.
+  if (includePersonalEmail) {
+    const contacts = await loadPersonalEmails(rows.map((r) => r.user_id));
+    for (const r of rows) r.personal_email = contacts.get(Number(r.user_id)) ?? null;
+  }
+
   logger.info('Found ' + rows.length + ' users (total=' + total + ')');
   return { items: rows, total };
 }
@@ -261,6 +475,14 @@ async function getUserById(userId) {
     [userId, INTERNAL_USER_TYPE_ID]
   );
   if (!row) return null;
+  /*
+   * personal_email — a separate FAIL-SOFT read rather than a LEFT JOIN. Every
+   * write path routes through here (PATCH, the provision-mailbox repair
+   * endpoint, both bulk paths), so a join onto the still-pending side table
+   * would 500 all of them on a host that has not applied the migration. Absent
+   * table ⇒ null, and the edit form shows an empty field.
+   */
+  row.personal_email = await loadPersonalEmail(userId);
   /*
    * Job Stage Access. NULL = unrestricted; [] = explicit NO ACCESS; a non-empty
    * array = restricted to those stage_keys. The null-vs-[] distinction is
@@ -287,6 +509,12 @@ async function createUser({
   manage_clients, manage_cities, manage_states, manage_verticals,
   reporting_manager,
   allowed_stages,
+  /*
+   * MANDATORY on this path (see the requiredness matrix above). It is where the
+   * "your EasyFix account is ready" credential mail goes — the new corporate
+   * mailbox cannot be its own delivery address.
+   */
+  personal_email,
   createdBy,
   /*
    * Is the ACTING operator allowed to trigger a Microsoft 365 directory write?
@@ -313,6 +541,15 @@ async function createUser({
    * change one and the other silently wins.
    */
   if (!user_role) throw mkErr(400, 'user_role is required');
+
+  /*
+   * personal_email — REQUIRED here, and requiring it in the route's Joi schema
+   * is NOT enough on its own: this service is the deeper layer and, per the
+   * mobile_no lesson quoted just above, whichever layer is stricter is the one
+   * that actually decides. Both enforce it, both are tested.
+   */
+  const personalEmail = normalisePersonalEmail(personal_email, { required: true });
+  if (!personalEmail.ok) throw mkErr(400, personalEmail.message);
 
   // Validate role exists + is admin-group (we don't manage technicians or
   // client-dashboard users here — those have their own lifecycles).
@@ -352,26 +589,48 @@ async function createUser({
     throw mkErr(409, `An active user with mobile "${mob}" already exists`);
   }
 
-  const [r] = await pool.query(
-    `INSERT INTO tbl_user
-       (user_name, official_email, mobile_no, alternate_no,
-        user_role, user_type_id, city_id,
-        manage_clients, manage_cities, manage_states, manage_verticals,
-        reporting_manager,
-        user_status, insert_date, updated_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?)`,
-    [
-      // `mob || null` — store NULL, never '', for a mobile-less user. Matches
-      // how the 7 existing mobile-less rows are stored, and keeps the
-      // uniqueness probe above meaningful (NULL never equals NULL in SQL, so
-      // blank rows can't collide with each other).
-      name, email, mob || null, alternate_no || null,
-      Number(user_role), INTERNAL_USER_TYPE_ID, city_id ? Number(city_id) : null,
-      manage_clients || null, manage_cities || null, manage_states || null, manage_verticals || null,
-      reporting_manager ? Number(reporting_manager) : null,
-      STATUS_ACTIVE, createdBy || null,
-    ]
-  );
+  /*
+   * TRANSACTIONAL — the tbl_user row and its MANDATORY personal_email land
+   * together or not at all. Without the transaction a failure on the second
+   * statement (a host that has not yet applied
+   * migrations/2026-08-03-create-tbl-user-personal-details.sql being the
+   * realistic one) would leave a committed user violating the very rule we just
+   * validated, and nothing downstream could tell that from a legacy row. That
+   * case surfaces as the actionable 503 from upsertPersonalEmail rather than an
+   * opaque ER_NO_SUCH_TABLE 500 — see the note on the READ/WRITE asymmetry there.
+   */
+  const conn = await pool.getConnection();
+  let r;
+  try {
+    await conn.beginTransaction();
+    [r] = await conn.query(
+      `INSERT INTO tbl_user
+         (user_name, official_email, mobile_no, alternate_no,
+          user_role, user_type_id, city_id,
+          manage_clients, manage_cities, manage_states, manage_verticals,
+          reporting_manager,
+          user_status, insert_date, updated_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?)`,
+      [
+        // `mob || null` — store NULL, never '', for a mobile-less user. Matches
+        // how the 7 existing mobile-less rows are stored, and keeps the
+        // uniqueness probe above meaningful (NULL never equals NULL in SQL, so
+        // blank rows can't collide with each other).
+        name, email, mob || null, alternate_no || null,
+        Number(user_role), INTERNAL_USER_TYPE_ID, city_id ? Number(city_id) : null,
+        manage_clients || null, manage_cities || null, manage_states || null, manage_verticals || null,
+        reporting_manager ? Number(reporting_manager) : null,
+        STATUS_ACTIVE, createdBy || null,
+      ]
+    );
+    await upsertPersonalEmail(r.insertId, personalEmail.value, conn);
+    await conn.commit();
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
   // New active user could be a manager's direct report — invalidate so
   // the next hierarchy resolution picks up the new edge instead of
   // serving the pre-insert adjacency map for up to 60s.
@@ -401,10 +660,6 @@ async function createUser({
    *   - It ALWAYS records an outcome row, including the skip. That record is
    *     the actual root-cause fix for the reported bug: a user whose mailbox
    *     was never created stops being invisible.
-   *   - Fail-closed per PERSON too: `provisionMailbox` carries the acting
-   *     operator's `access.entraprovision.emails` verdict. Not on the list ⇒ the
-   *     skip is recorded and NO directory write happens, so Add User can't be
-   *     used to route around the allowlist the repair endpoint enforces.
    *   - TIME-BOUNDED: we never hold the operator's request open longer than
    *     PROVISION_INLINE_DEADLINE_MS. Past that it runs detached and records its
    *     own outcome (see the constant's comment for the 504-vs-409 trap).
@@ -412,9 +667,26 @@ async function createUser({
    * The outcome rides back on the returned row so POST /api/admin/users can
    * surface it, WITHOUT altering the success/failure semantics of user
    * creation itself.
+   *
+   * ── The credential mail is CHAINED to it, not raced ───────────────────
+   * The "your EasyFix account is ready" mail is attached to the SAME promise as
+   * provisioning, so a run that outlives the inline deadline still mails the
+   * user once it finishes. Only the REPORTING of it is time-bounded.
+   *
+   * ── THE TEMP PASSWORD ─────────────────────────────────────────────────
+   * `tempPassword` below is the ONLY place the generated password exists
+   * outside the Graph request body. It is written by the sink callback,
+   * consumed by the mail sender, and nulled immediately after. It is never
+   * logged, never bound into a SQL statement, and never attached to `row`,
+   * `provisioning` or the mail outcome — all three are serialised into the HTTP
+   * response. tests/user-welcome-mail.test.js asserts all of that against the
+   * real logger and the real DB call log rather than trusting this comment.
    */
   let provisioning = null;
+  let welcome = null;
   try {
+    let tempPassword = null;
+
     // `.catch` here (not only the outer try) because once the deadline expires
     // this promise is unawaited — an unhandled rejection would take the process
     // down on Node 18+.
@@ -424,9 +696,43 @@ async function createUser({
       officialEmail: email,
       trigger: 'create-user',
       actorId: createdBy || null,
+      onTempPassword: (pw) => { tempPassword = pw; },
+    }).then(async (outcome) => {
+      /*
+       * Send ONLY on mailboxReady — an account with no licence has no mailbox,
+       * so "here are your Outlook and Teams credentials" would be actively
+       * misleading (licence_status 'no_seats_available' is a real live case).
+       * The gate itself lives in the mail service so there is exactly one copy
+       * of it; every other outcome returns a `skipped` with the reason.
+       */
+      let mail;
+      try {
+        mail = await welcomeMail.sendWelcomeMail({
+          userId: r.insertId,
+          userName: name,
+          officialEmail: email,
+          personalEmail: personalEmail.value,
+          tempPassword,
+          provisioning: outcome,
+        });
+      } catch (e) {
+        // sendWelcomeMail is fail-soft by contract; this is the belt in case a
+        // future edit breaks that. Crucially it keeps the MAIL failure from
+        // being reported as a PROVISIONING failure by the outer .catch — the
+        // mailbox may well be fine, and saying otherwise would send an operator
+        // to re-provision an account that needs nothing.
+        mail = { status: welcomeMail.MAIL_STATUS.FAILED, reason: e.message };
+      } finally {
+        tempPassword = null; // done with it — do not retain past the send
+      }
+      return { outcome, mail };
     }).catch((e) => {
+      tempPassword = null;
       logger.warn('Mailbox provisioning threw after user create (user IS created) · userId=' + r.insertId + ' · ' + e.message);
-      return { attempted: false, accountStatus: 'failed', licenceStatus: 'not_attempted', mailboxReady: false, reason: e.message };
+      return {
+        outcome: { attempted: false, accountStatus: 'failed', licenceStatus: 'not_attempted', mailboxReady: false, reason: e.message },
+        mail: { status: welcomeMail.MAIL_STATUS.SKIPPED, reason: 'mailbox provisioning failed, so no credentials were issued' },
+      };
     });
 
     // A unique sentinel, so a (hypothetical) null/undefined outcome from the
@@ -437,12 +743,12 @@ async function createUser({
       timer = setTimeout(() => resolve(TIMED_OUT), PROVISION_INLINE_DEADLINE_MS);
       if (timer && typeof timer.unref === 'function') timer.unref();
     });
-    provisioning = await Promise.race([
+    const settled = await Promise.race([
       running.finally(() => { if (timer) clearTimeout(timer); }),
       deadline,
     ]);
 
-    if (provisioning === TIMED_OUT) {
+    if (settled === TIMED_OUT) {
       logger.warn('Mailbox provisioning exceeded the inline deadline — continuing in the background · userId='
         + r.insertId + ' · deadlineMs=' + PROVISION_INLINE_DEADLINE_MS);
       provisioning = {
@@ -455,12 +761,25 @@ async function createUser({
           + 'ms — the outcome will be recorded; read it from GET /api/admin/users/'
           + r.insertId + '/provisioning',
       };
+      welcome = {
+        status: welcomeMail.MAIL_STATUS.PENDING,
+        reason: 'waiting on mailbox provisioning — the sign-in details are mailed automatically if it completes',
+      };
+    } else {
+      provisioning = settled.outcome;
+      welcome = settled.mail;
     }
   } catch (e) {
     logger.warn('Mailbox provisioning threw after user create (user IS created) · userId=' + r.insertId + ' · ' + e.message);
     provisioning = { attempted: false, accountStatus: 'failed', licenceStatus: 'not_attempted', mailboxReady: false, reason: e.message };
+    welcome = { status: welcomeMail.MAIL_STATUS.SKIPPED, reason: 'mailbox provisioning failed, so no credentials were issued' };
   }
-  if (row) row.provisioning = provisioning;
+  if (row) {
+    row.provisioning = provisioning;
+    // Named `welcome_mail` to match the snake_case the rest of this payload
+    // uses. NEVER carries the password — see the block comment above.
+    row.welcome_mail = welcome;
+  }
   return row;
 }
 
@@ -498,8 +817,24 @@ function normaliseForCompare(key, val) {
   return s === '' ? null : s;
 }
 
+/**
+ * @param {Object}  [opts]
+ * @param {boolean} [opts.dryRun]
+ * @param {boolean} [opts.enforcePersonalEmail=true]
+ *   Whether the personal_email requiredness matrix applies to this edit.
+ *   DEFAULTS TO TRUE — a caller that forgets it gets the stricter behaviour.
+ *
+ *   The BULK paths (POST /api/admin/users/bulk-update and the users-bulk
+ *   spreadsheet upload) pass FALSE, deliberately. They exist to push scope
+ *   CSVs, a reporting manager or a role onto hundreds of EXISTING users, and
+ *   they never carry a personal_email — so enforcing it there would not
+ *   "backfill" anything, it would simply make every one of the ~7.5k
+ *   personal-email-less active users permanently un-bulk-updatable. The matrix
+ *   is about the Add/Edit User FORM, which is the surface that can actually
+ *   collect the address.
+ */
 async function updateUser(userId, fields, updatedBy, opts = {}) {
-  const { dryRun = false } = opts;
+  const { dryRun = false, enforcePersonalEmail = true } = opts;
   logger.info('Update user · userId=' + userId + ' · dryRun=' + dryRun);
 
   // Load every column we might compare against. The single round-trip
@@ -522,6 +857,52 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
   if (me.user_type_id !== INTERNAL_USER_TYPE_ID) {
     logger.warn('Update user rejected · not an internal CRM user · userId=' + userId);
     throw mkErr(403, 'This user is not an internal CRM user and can\'t be edited here');
+  }
+
+  /*
+   * ── personal_email requiredness ───────────────────────────────────────
+   * ACTIVE user  → REQUIRED.  INACTIVE user → not required.
+   * The edit that DEACTIVATES  → not required (offboarding someone who has
+   * already left must never require chasing them for a personal address).
+   *
+   * Enforced HERE as well as in the route's Joi, on purpose: this is the deeper
+   * layer, and the deeper layer silently wins. The mobile_no episode is the
+   * cautionary tale — the Joi schema was loosened, the service check was not,
+   * and the API kept answering "mobile_no is required" while the form showed the
+   * field as optional.
+   *
+   * NOTE the asymmetry with createUser: there the field must be PRESENT in the
+   * payload; here "required" means the row must not be left without one, which
+   * is the same thing for the form (it always posts the field) but does not
+   * punish an active user who already has an address on record.
+   */
+  const personalRequired = enforcePersonalEmail
+    && isPersonalEmailRequiredOnUpdate(me.user_status, fields.is_active);
+  const suppliedPersonalEmail = fields.personal_email !== undefined;
+  let personalEmailValue = null;   // the value to write, when we write one
+  let writePersonalEmail = false;  // true only when it actually changed
+
+  if (suppliedPersonalEmail || personalRequired) {
+    // FAIL-SOFT read (see loadPersonalEmail): on a pre-migration host this
+    // resolves to null rather than throwing, so an INACTIVE user — the path the
+    // matrix exempts — stays editable instead of 500-ing.
+    const current = String((await loadPersonalEmail(userId)) || '').trim().toLowerCase() || null;
+
+    if (suppliedPersonalEmail) {
+      const parsed = normalisePersonalEmail(fields.personal_email, { required: personalRequired });
+      if (!parsed.ok) {
+        logger.warn('Update user rejected · ' + parsed.message + ' · userId=' + userId);
+        throw mkErr(400, parsed.message);
+      }
+      personalEmailValue = parsed.value;
+      // Same no-change short-circuit the mutable columns get: an unchanged
+      // value must not bump updated_on or turn a genuine no-op into an update.
+      writePersonalEmail = personalEmailValue !== current;
+    } else if (!current) {
+      // Not supplied AND the row has none. This is the case the matrix forbids.
+      logger.warn('Update user rejected · personal_email required for an active user · userId=' + userId);
+      throw mkErr(400, 'personal_email is required when editing an active user');
+    }
   }
 
   const sets   = [];
@@ -584,10 +965,14 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
   const hasAllowedStages = fields.allowed_stages !== undefined;
   if (hasAllowedStages) suppliedCount++;
 
+  // personal_email lives in the side table, so it is counted (and no-op
+  // short-circuited) alongside allowed_stages rather than as a tbl_user column.
+  if (suppliedPersonalEmail) suppliedCount++;
+
   // Distinguish "operator sent nothing" (real 400) from "operator sent
   // values that all match" (no-op, return unchanged sentinel).
   if (suppliedCount === 0) throw mkErr(400, 'No mutable fields supplied');
-  if (!sets.length && !hasAllowedStages) {
+  if (!sets.length && !hasAllowedStages && !writePersonalEmail) {
     logger.info('Update user no-op · userId=' + userId + ' · all supplied values match');
     const row = await getUserById(userId);
     if (row) row.__unchanged = true;
@@ -621,6 +1006,13 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
     // user_type_id are all reachable via this update path; rather than
     // sniff which field changed, just clear unconditionally (rebuild ~1 ms).
     invalidateHierarchyCache();
+  }
+
+  // Personal contact upsert — side table, after the column write, and only when
+  // the value actually changed (see writePersonalEmail above).
+  if (writePersonalEmail) {
+    await upsertPersonalEmail(userId, personalEmailValue);
+    logger.info('Personal email updated · userId=' + userId + ' · cleared=' + (personalEmailValue === null));
   }
 
   // Job Stage Access reconcile — after the column write, atomically swaps the
@@ -904,6 +1296,13 @@ module.exports = {
   loadAllowedStages,
   loadAllowedStagesForUsers,
   reconcileAllowedStages,
+  // Personal contact — the ONE definition of the personal_email rules, shared
+  // with routes/admin/users.js so the route and the service cannot drift.
+  isPersonalEmailRequiredOnUpdate,
+  normalisePersonalEmail,
+  upsertPersonalEmail,
+  loadPersonalEmail,
+  loadPersonalEmails,
   // Hierarchy adjacency cache invalidation hook — call from any external
   // write path that mutates tbl_user beyond the create/update/deactivate
   // entrypoints here (e.g. a future bulk-import path that writes
