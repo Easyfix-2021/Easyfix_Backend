@@ -167,12 +167,11 @@ router.get('/lookup/reasons', async (req, res, next) => {
 
 router.get('/dashboard', async (req, res, next) => {
   try {
-    // scope=today: each active bucket is scoped to TODAY by its own date column —
-    //   New         = tickets created today   (ticket_created_date_time)
-    //   Scheduled   = appointment today        (requested_date_time)
-    //   In Progress = scheduled today           (scheduled_date_time)
-    //   Completed   = checked out today         (checkout_date_time)
-    // open / cancelled / total stay lifetime. Default (no scope) = all lifetime.
+    // The three "Today's jobs" tiles, each scoped to TODAY by its own date column
+    // (scope=today). Default (no scope) = lifetime totals.
+    //   New         = ANY ticket created today          (ticket_created_date_time)
+    //   In Progress = status 1/2/20, appointment today  (original_appointment_date_time)
+    //   Completed   = status 3/5, checked out today      (checkout_date_time)
     const todayOnly = String(req.query.scope || '') === 'today';
     const on = (col) => (todayOnly ? `AND DATE(${col}) = CURDATE()` : '');
 
@@ -193,13 +192,9 @@ router.get('/dashboard', async (req, res, next) => {
     logger.info('Fetch client dashboard stats · clientId=' + req.spoc.client_id + (todayOnly ? ' · scope=today' : '') + (Array.isArray(scopeIds) ? ' · scope=' + scopeIds.length + 'spoc' : ' · all'));
     const [[stats]] = await pool.query(`
       SELECT
-        SUM(CASE WHEN job_status = 9      ${on('ticket_created_date_time')} THEN 1 ELSE 0 END) AS newTickets,
-        SUM(CASE WHEN job_status = 1      ${on('requested_date_time')}      THEN 1 ELSE 0 END) AS scheduled,
-        SUM(CASE WHEN job_status = 2      ${on('scheduled_date_time')}      THEN 1 ELSE 0 END) AS inProgress,
-        SUM(CASE WHEN job_status IN (3,5) ${on('checkout_date_time')}       THEN 1 ELSE 0 END) AS completed,
-        SUM(CASE WHEN job_status IN (0,7,9) THEN 1 ELSE 0 END) AS open,
-        SUM(CASE WHEN job_status = 6        THEN 1 ELSE 0 END) AS cancelled,
-        COUNT(*) AS total
+        SUM(CASE WHEN ticket_created_date_time IS NOT NULL ${on('ticket_created_date_time')} THEN 1 ELSE 0 END) AS newTickets,
+        SUM(CASE WHEN job_status IN (1,2,20) ${on('original_appointment_date_time')} THEN 1 ELSE 0 END) AS inProgress,
+        SUM(CASE WHEN job_status IN (3,5)    ${on('checkout_date_time')}             THEN 1 ELSE 0 END) AS completed
        FROM tbl_job WHERE fk_client_id = ? ${mine}`, params);
     modernOk(res, stats);
   } catch (e) { next(e); }
