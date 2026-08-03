@@ -697,7 +697,15 @@ async function fetchPrefill(jobId, pool) {
     `SELECT j.job_id, j.fk_client_id, j.fk_address_id, j.requested_date_time,
             j.time_slot, j.job_desc, j.additional_name, j.additional_number,
             j.job_status,
-            COALESCE(j.job_customer_name, cu.customer_name) AS customer_name,
+            -- Customer name shown on a JOB surface = the name typed on the
+            -- booking form (tbl_job.job_customer_name), falling back to the
+            -- customer-master row. NULLIF(TRIM(…), '') is load-bearing:
+            -- COALESCE('', x) returns '' in MySQL, so a plain COALESCE would
+            -- render a BLANK name for any job whose job_customer_name was
+            -- written as an empty string. The column is fed from a form field
+            -- (validators/job.validator.js allows '' explicitly, and
+            -- job.service.js binds it verbatim), so guard the blank here.
+            COALESCE(NULLIF(TRIM(j.job_customer_name), ''), cu.customer_name) AS customer_name,
             cu.customer_mob_no, cu.customer_email,
             ad.address, ad.building, ad.landmark, ad.city_id, ad.pin_code,
             ad.gps_location, ${addrInstrSelect},
@@ -1017,7 +1025,13 @@ async function sendForJob(jobId, { action, override = false } = {}, pool) {
   // parses bubble to NULL → default.
   const [rows] = await pool.query(
     `SELECT j.job_id, j.fk_client_id, j.magic_link_sent_at, j.magic_link_send_count,
-            cu.customer_name, cu.customer_mob_no, cl.client_name,
+            -- Same job-scoped name rule as fetchPrefill() above: the WhatsApp
+            -- confirm_order greeting is addressed to the customer ON THIS JOB,
+            -- so it must use the booking-form name and only fall back to the
+            -- customer-master row. NULLIF(TRIM(…), '') guards the empty-string
+            -- case a plain COALESCE would let through as a blank greeting.
+            COALESCE(NULLIF(TRIM(j.job_customer_name), ''), cu.customer_name) AS customer_name,
+            cu.customer_mob_no, cl.client_name,
             COALESCE(
               (SELECT CAST(NULLIF(ccp_max.c_prop_values, '') AS UNSIGNED)
                  FROM tbl_client_custom_properties ccp_max

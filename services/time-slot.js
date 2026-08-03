@@ -175,6 +175,50 @@ function formatClock12(dt) {
   return p.mi === 0 ? `${h12} ${suffix}` : `${h12}:${pad2(p.mi)} ${suffix}`;
 }
 
+/*
+ * Customer-facing weekday / month spellings. DELIBERATELY hard-coded English
+ * rather than derived from Intl/toLocaleDateString: these strings land inside
+ * DLT-registered SMS bodies and WhatsApp templates whose surrounding literal
+ * text is registered with the operator, so they must not shift with the
+ * container's ICU data, locale or TZ. A silent locale change would re-word an
+ * approved template and the operator would start dropping the message.
+ */
+const WEEKDAY_ABBR = Object.freeze(['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']);
+const MONTH_ABBR = Object.freeze([
+  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+]);
+
+/*
+ * appointmentDateLabel(dt) → the human appointment DATE — 'Wed, 05 Aug 2026' —
+ * or null when the value is absent / not a date at all.
+ *
+ * The DATE sibling of formatClock12, and here for the same reason stated above
+ * it: this module already owns every reading of an appointment's columns and is
+ * pure + dependency-free, so a notification surface can require it without
+ * dragging a service graph along. The reschedule SMS
+ * (services/notification-orchestrator.service.js) needs a date beside the band
+ * and must not require whatsapp-conversation.service just to format one — that
+ * file pulls ai.service, maps.service, job-magic-link.service and S3 with it.
+ *
+ * Reads only the DATE part, so the 00:00 midnight sentinel is fine here: "no
+ * time-of-day was captured" still has a real date. It is the BAND that must
+ * never be derived from the sentinel (see displaySlot) — never the date.
+ *
+ * ⚠ BYTE-MIRROR of whatsapp-conversation.service.formatCustomerDateLabel
+ * (zero-padded day, 3-letter weekday and month, comma after the weekday, and
+ * null — never the string 'null' — on unparseable input, pinned by
+ * tests/whatsapp-conversation.test.js). That copy predates this one and should
+ * be folded into this helper the next time that file is touched; until then
+ * tests/time-slot.test.js asserts the two agree so they cannot drift silently.
+ */
+function appointmentDateLabel(dt) {
+  const p = parseWallClock(String(dt == null ? '' : dt).trim());
+  if (!p) return null;
+  const d = new Date(Date.UTC(p.y, p.mo - 1, p.d));
+  if (Number.isNaN(+d)) return null;
+  return `${WEEKDAY_ABBR[d.getUTCDay()]}, ${pad2(p.d)} ${MONTH_ABBR[p.mo - 1]} ${p.y}`;
+}
+
 // ─── Band derivation ─────────────────────────────────────────────────
 /*
  * bandForHour(h) → one of the four bands.
@@ -351,6 +395,61 @@ function resolveTimeSlot(inputSlot, requestedDateTime) {
   return deriveTimeSlot(requestedDateTime);
 }
 
+/*
+ * displaySlot(requestedDateTime, storedSlot) → the band to SHOW beside a job's
+ * appointment. '' when there is nothing trustworthy to show, so a caller can
+ * render its own dash, omit the line, or `|| null` it for a JSON payload.
+ *
+ * THE READ-SIDE SIBLING OF resolveTimeSlot — same precedence, no writing. It is
+ * a two-line COMPOSITION of the helpers above rather than new logic; it exists
+ * because every display surface was composing it independently and they drifted.
+ *
+ * ── WHY THE STORED COLUMN IS NOT SHOWN RAW ──
+ *
+ * tbl_job.time_slot is DERIVED, not authored: it is the band containing
+ * requested_date_time, and resolveTimeSlot re-derives it on every write. A
+ * stored value that disagrees with the appointment instant is therefore already
+ * dead — the next save discards it. Job #482491 is the recorded case:
+ * requested_date_time 05:30 ('After Hours') stored alongside time_slot
+ * '3pm to 7pm'. Every surface reading the column raw published '3pm to 7pm'
+ * against an 05:30 appointment — a window the system had already stopped
+ * promising.
+ *
+ * ── WHAT IT DELIBERATELY DOES NOT DO ──
+ *
+ * It does NOT swap the band for the exact minute. Customer-facing surfaces
+ * commit to a WINDOW, not to "the technician arrives at 5:30" — the band IS the
+ * promise (owner, 2026-08-03: "we don't want to commit that the technician will
+ * reach exactly at 5:30 as it can get late, but we are committing that they
+ * will reach in this slot"). The defect was only ever WHICH band. So this
+ * returns a band, always; it just refuses to return one the appointment
+ * contradicts.
+ *
+ * ── THE PRECEDENCE ──
+ *
+ *   1. A real time-of-day on requested_date_time WINS (deriveTimeSlot).
+ *   2. Date-only / the 00:00 midnight sentinel — where hasTimeOfDay is false and
+ *      "no time was ever captured", NOT midnight — falls back to the stored
+ *      label, canonicalised for SPELLING ONLY (canonicalSlot is a cosmetic fold,
+ *      never an interpretation, so the ~79k legacy 'Morning 9 to 2' rows survive
+ *      verbatim rather than being re-labelled from an hour nobody wrote down).
+ *
+ * ⚠ canonicalSlot, NOT normaliseSlotLabel — see the comparison note above
+ * canonicalSlot. This is a READ; picking a band on the caller's behalf is the
+ * writer-side judgement resolveTimeSlot owns.
+ *
+ * Byte-mirror of `displaySlot` in Easyfix_CRM_UI/src/lib/job-slots.ts (same
+ * name, same argument order, same '' for "nothing to show"). Keep the two in
+ * step. Current backend callers: services/job-share.service.js (the public
+ * shared-job page + its share message) and
+ * services/notification-orchestrator.service.js (the DLT CUSTOMER_NOT_REACHABLE
+ * SMS).
+ */
+function displaySlot(requestedDateTime, storedSlot) {
+  if (hasTimeOfDay(requestedDateTime)) return deriveTimeSlot(requestedDateTime) || '';
+  return canonicalSlot(storedSlot);
+}
+
 // ─── 1-hour conflict window ──────────────────────────────────────────
 /*
  * conflictFrame(dt) → { date: 'YYYY-MM-DD', hour: 0-23 } | null
@@ -401,6 +500,8 @@ module.exports = {
   hasTimeOfDay,
   wallClockTime,
   formatClock12,
+  // DATE sibling of formatClock12 — the customer-facing 'Wed, 05 Aug 2026'.
+  appointmentDateLabel,
   bandForHour,
   deriveTimeSlot,
   // READ-side cosmetic fold (case + spacing). NOT interchangeable with
@@ -408,6 +509,9 @@ module.exports = {
   canonicalSlot,
   normaliseSlotLabel,
   resolveTimeSlot,
+  // READ-side composition of the two above — the ONE band every display
+  // surface shows. Never writes; resolveTimeSlot stays the only writer gate.
+  displaySlot,
   conflictFrame,
   sameConflictFrame,
 };

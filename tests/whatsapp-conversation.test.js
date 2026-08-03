@@ -241,6 +241,28 @@ test('formatCustomerDateLabel renders a customer-friendly date', () => {
 });
 
 /*
+ * DRIFT GUARD. time-slot.appointmentDateLabel is the same formatter, added there
+ * because the reschedule SMS (notification-orchestrator.service) needs an
+ * appointment date and must not require THIS file to get one — it would drag
+ * ai.service, maps.service, job-magic-link.service and S3 into a notification
+ * path. Until this older twin is folded into that helper, the two must agree
+ * character for character: the customer can receive the WhatsApp template and
+ * the reschedule SMS about the same visit, and a one-day or one-spelling
+ * disagreement between them reads as two different appointments.
+ */
+test('formatCustomerDateLabel agrees with time-slot.appointmentDateLabel, character for character', () => {
+  const ts = require('../services/time-slot');
+  const inputs = [
+    '2026-08-05', '2026-08-05 15:00:00', '2026-08-05 00:00:00', '2026-08-05T09:30',
+    '2026-01-01', '2026-02-28', '2026-12-25',
+    null, undefined, '', 'garbage', '05-08-2026',
+  ];
+  for (const v of inputs) {
+    assert.equal(convo.formatCustomerDateLabel(v), ts.appointmentDateLabel(v), `disagreed on ${JSON.stringify(v)}`);
+  }
+});
+
+/*
  * PRECEDENCE 2026-07-31. The APPOINTMENT HOUR wins and the band is only the
  * fallback: the customer tapped a 1-hour frame, so echoing "3PM to 7PM" back at
  * them would read as if we had lost their choice.
@@ -273,6 +295,28 @@ test('jobDateLabel prefers the appointment hour, then falls back to time_slot', 
     'Wed, 05 Aug 2026, 4 PM',
     'the corrupted legacy requested_time is ignored in favour of the appointment instant',
   );
+});
+
+/*
+ * jobDateLabel no longer formats the clock itself — it hands the wall clock
+ * (appointment_date + appointment_time, two projections of the same column) to
+ * time-slot.formatClock12. These are the boundaries where the two used to have
+ * a chance of disagreeing, pinned on the composed customer string rather than
+ * on the formatter alone, so a future change to either side is caught here.
+ * See tests/time-slot.test.js for the formatter's own contract.
+ */
+test('jobDateLabel renders the shared formatter at every boundary that matters', () => {
+  const at = (appointment_time) => convo.jobDateLabel({ appointment_date: '2026-08-05', appointment_time });
+  assert.equal(at('12:00'), 'Wed, 05 Aug 2026, 12 PM', 'noon is 12 PM, never 0 PM');
+  assert.equal(at('12:30'), 'Wed, 05 Aug 2026, 12:30 PM');
+  assert.equal(at('00:30'), 'Wed, 05 Aug 2026, 12:30 AM', 'a real after-midnight visit still shows');
+  assert.equal(at('09:00'), 'Wed, 05 Aug 2026, 9 AM', 'a whole hour drops the :00');
+  assert.equal(at('09:05'), 'Wed, 05 Aug 2026, 9:05 AM', 'a part hour keeps zero-padded minutes');
+  assert.equal(at('23:59'), 'Wed, 05 Aug 2026, 11:59 PM');
+  assert.equal(at('00:00'), 'Wed, 05 Aug 2026', 'the sentinel yields no time at all');
+  assert.equal(at('lunchtime'), 'Wed, 05 Aug 2026', 'unparseable time → date alone, never "null"');
+  assert.equal(at(null), 'Wed, 05 Aug 2026');
+  assert.equal(at(''), 'Wed, 05 Aug 2026');
 });
 
 test('composeAddressLine strips newlines — WhatsApp rejects them in a template parameter', () => {

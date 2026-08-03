@@ -25,7 +25,22 @@ const { jobStatusLabel } = require('../../utils/job-status-label');
  * Joined-in display fields:
  *   tbl_easyfixer  → efr_name, efr_no (mobile)
  *   tbl_job        → job_status, job_type, job_customer_name
- *   tbl_customer   → customer_name, customer_mob_no
+ *   tbl_customer   → customer_mob_no
+ *
+ * customer_name (2026-08-03): this feed is JOB-scoped — every row is a
+ * call ABOUT a job — so the displayed name is the name typed on the
+ * booking page (tbl_job.job_customer_name), falling back to the
+ * customer-master name only when the job carries none. The alias stays
+ * `customer_name` so the FE (CallInfoModal) needs no change.
+ *
+ *   COALESCE(NULLIF(TRIM(j.job_customer_name), ''), cu.customer_name)
+ *
+ * The NULLIF(TRIM(…), '') wrapper is NOT optional. COALESCE only treats
+ * NULL as absent, so a plain COALESCE(j.job_customer_name, …) renders a
+ * BLANK name for any job whose job_customer_name is '' or whitespace —
+ * and '' is reachable: validators/job.validator.js allows '' for that
+ * field and services/job.service.js writes it through `??` (null-guard
+ * only). NULLIF+TRIM makes blank behave like missing.
  *
  * Legacy contract preserved: fromDate / toDate / optional callTo
  * filter. callTo now matches against efr_no (technician mobile) OR
@@ -62,7 +77,8 @@ router.get('/', async (req, res, next) => {
               e.efr_name, e.efr_no,
               j.job_status, j.job_type, j.job_customer_name,
               j.fk_easyfixter_id AS job_efr_id,
-              cu.customer_name, cu.customer_mob_no
+              COALESCE(NULLIF(TRIM(j.job_customer_name), ''), cu.customer_name) AS customer_name,
+              cu.customer_mob_no
          FROM tbl_easyfixer_call_record cr
          LEFT JOIN tbl_easyfixer e  ON e.efr_id     = cr.efr_id
          LEFT JOIN tbl_job j        ON j.job_id     = cr.job_id
@@ -132,7 +148,8 @@ router.get('/export.xlsx', async (req, res, next) => {
                 cr.job_id,
                 j.job_status, j.job_type, j.job_customer_name,
                 j.fk_easyfixter_id AS job_efr_id,
-                cu.customer_name, cu.customer_mob_no
+                COALESCE(NULLIF(TRIM(j.job_customer_name), ''), cu.customer_name) AS customer_name,
+                cu.customer_mob_no
            FROM tbl_easyfixer_call_record cr
            LEFT JOIN tbl_easyfixer e  ON e.efr_id     = cr.efr_id
            LEFT JOIN tbl_job j        ON j.job_id     = cr.job_id
@@ -164,7 +181,12 @@ router.get('/export.xlsx', async (req, res, next) => {
       efr_name:     r.efr_name || '',
       efr_no:       r.efr_no || '',
       job_id:       r.job_id ?? '',
-      customer:     r.customer_name || r.job_customer_name || '',
+      // `customer_name` is already the job-first resolution done in SQL
+      // (job_customer_name → customer-master). The old JS chain here was
+      // `r.customer_name || r.job_customer_name`, which preferred the MASTER
+      // name and so contradicted the on-screen table — the export and the
+      // modal now agree because both read this one resolved column.
+      customer:     r.customer_name || '',
       customer_mob: r.customer_mob_no || '',
       job_type:     r.job_type || '',
       // Split BOOKED by tech presence so the export matches the on-screen chip.

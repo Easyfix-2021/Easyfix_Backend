@@ -14,7 +14,7 @@
  */
 
 const { signJobShareToken } = require('../utils/jwt');
-const { hasTimeOfDay, formatClock12, deriveTimeSlot, canonicalSlot } = require('./time-slot');
+const { formatClock12, displaySlot } = require('./time-slot');
 const urlShortener = require('./url-shortener.service');
 const logger = require('../logger');
 
@@ -51,29 +51,38 @@ function buildMapsSearchLink(gpsLocation, address) {
  *
  * ── WHY THE STORED BAND IS NOT USED ──
  *
- * tbl_job.time_slot is DERIVED: it is the band containing requested_date_time,
- * and resolveTimeSlot re-derives it on every write. A stored value that
- * disagrees with the appointment is therefore already dead — the next save
- * discards it. Job #482491 stores requested_date_time 05:30 ('After Hours')
- * with time_slot '3pm to 7pm', and this link published '3pm to 7pm' to whoever
- * opened it. Same precedence as the writer-side gate and as jobDateLabel in
- * whatsapp-conversation.service.js:
+ * tbl_job.time_slot is DERIVED and can be stale — job #482491 stores
+ * requested_date_time 05:30 ('After Hours') with time_slot '3pm to 7pm', and
+ * this link published '3pm to 7pm' to whoever opened it. The band shown is
+ * therefore time-slot.js's `displaySlot`, the shared read-side composition
+ * (appointment instant wins; date-only/00:00 falls back to the stored label,
+ * canonicalised for spelling only). It lives there rather than here because the
+ * DLT CUSTOMER_NOT_REACHABLE SMS
+ * (services/notification-orchestrator.service.js) had the identical bug and now
+ * calls the same helper — see the note above displaySlot for the full rationale.
  *
- *   real time-of-day  → the band CONTAINING it (deriveTimeSlot)
- *   date-only / 00:00 → the stored label, canonicalised for spelling only
- *                       (canonicalSlot — a cosmetic fold, never an
- *                       interpretation, so legacy vocabularies like
- *                       'Morning 9 to 2' survive verbatim)
+ * ── WHY THE EXACT TIME IS *NOT* SHOWN ──
  *
- * ── WHY THE EXACT TIME IS ALSO SHOWN ──
+ * The label is DATE + BAND, never date + minute. It briefly carried the hour
+ * ('Tue, 5 Aug 2026, 5:30 AM · After Hours') and the owner reversed that on
+ * 2026-08-03: a customer-facing surface commits to a WINDOW, not to an arrival
+ * minute — "we don't want to commit that the technician will reach exactly at
+ * 5:30 as it can get late, but we are committing that they will reach in this
+ * slot". Quoting 5:30 turns a slot promise into a punctuality promise the
+ * business never made, and the page is world-reachable, so whoever opens the
+ * link reads it as the commitment.
  *
- * Owner request (2026-08-03): the shared page previously carried a DATE-ONLY
- * label and they want the hour on it, so a timed job reads
- *   'Tue, 5 Aug 2026, 5:30 AM · After Hours'
- * and a date-only job keeps the band alone
+ * So a timed job reads
+ *   'Tue, 5 Aug 2026 · After Hours'
+ * and a date-only job reads the same shape off its stored band
  *   'Tue, 5 Aug 2026 · 3PM to 7PM'.
- * formatClock12 returns null on the 00:00 sentinel, which is what stops a
- * date-only booking from claiming a "12 AM" appointment it never had.
+ * Both are date + band; the ONLY difference between them is where the band came
+ * from (the appointment instant vs. the stored label) — which is displaySlot's
+ * job, not this function's.
+ *
+ * Re-adding the clock here is a product decision, not a formatting tweak.
+ * tests/job-share-label.test.js asserts the minute is absent from BOTH this
+ * label and the share message, so a re-add has to be deliberate.
  *
  * No SQL change was needed: requested_date_time is already projected as an IST
  * wall-clock string ('%Y-%m-%d %H:%i:%s') beside the date label, which is
@@ -82,22 +91,15 @@ function buildMapsSearchLink(gpsLocation, address) {
 function buildAppointmentLabel(dateLabel, requestedDateTime, storedSlot) {
   const date = dateLabel ? String(dateLabel).trim() : '';
   if (!date) return null;
-  const band = hasTimeOfDay(requestedDateTime)
-    ? deriveTimeSlot(requestedDateTime)
-    : canonicalSlot(storedSlot);
-  const clock = formatClock12(requestedDateTime);
-  const head = clock ? `${date}, ${clock}` : date;
-  return band ? `${head} · ${band}` : head;
+  const band = displaySlot(requestedDateTime, storedSlot);
+  return band ? `${date} · ${band}` : date;
 }
 
-/* The band this job's appointment actually sits in — same precedence as above,
+/* The band this job's appointment actually sits in — same helper as above,
  * exposed on its own so a consumer of `schedule.time_slot` can never pick up
  * the stale stored string. '' collapses to null for the JSON payload. */
 function resolveDisplaySlot(requestedDateTime, storedSlot) {
-  const band = hasTimeOfDay(requestedDateTime)
-    ? deriveTimeSlot(requestedDateTime)
-    : canonicalSlot(storedSlot);
-  return band || null;
+  return displaySlot(requestedDateTime, storedSlot) || null;
 }
 
 /*
@@ -179,7 +181,14 @@ async function fetchShareDetails(jobId, pool) {
       requested_date_time: row.requested_date_time || null,
       requested_date_label: row.requested_date_label || null,
       /* The 12-hour appointment time ('5:30 AM'), or null on a date-only /
-       * midnight-sentinel booking. */
+       * midnight-sentinel booking.
+       *
+       * ⚠ RAW DATA, NOT THE COMMITMENT. Nothing renders this — the page and the
+       * share message both read `appointment_label`, which is date + band only
+       * (see buildAppointmentLabel for why the minute was pulled back out). It
+       * stays on the payload as the underlying value beside requested_date_time;
+       * it must NOT be spliced back into any customer-facing string. This is the
+       * one remaining use of formatClock12 in this file. */
       requested_time_label: formatClock12(row.requested_date_time),
       /* The band the appointment ACTUALLY falls in — never the raw stored
        * column. See buildAppointmentLabel. */
@@ -209,7 +218,7 @@ async function fetchShareDetails(jobId, pool) {
  * its field is missing. NO customer name/number — only service + city +
  * appointment + link.
  *   "EasyFix job #511425 — AC Repair (Cooling) in Gurugram, scheduled
- *    Sat, 27 Jun 2026, 12 PM · 12PM to 3PM.
+ *    Sat, 27 Jun 2026 · 12PM to 3PM.
  *    View full details & navigate: <url>"
  *
  * The appointment clause is `schedule.appointment_label` — the SAME string the

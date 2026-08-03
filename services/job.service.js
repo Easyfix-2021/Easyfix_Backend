@@ -259,6 +259,50 @@ const JOB_AGE_COLUMNS = `,
   ${JOB_AGE_DAYS_EXPR} AS ageDays,
   ${JOB_AGE_SECS_EXPR} AS ageSecs`;
 
+// ─── The customer name shown ON A JOB ───────────────────────────────
+/*
+ * A JOB's customer name is the name TYPED ON THAT BOOKING —
+ * `tbl_job.job_customer_name` — not the customer-master name. The master row
+ * (`tbl_customer`) is keyed on the mobile number and is shared by every job that
+ * number ever booked, so it drifts from what was actually entered for THIS
+ * order (a shared building number, a relative booking on someone's behalf, a
+ * bulk-upload sheet carrying its own name). The master is the FALLBACK: it is
+ * used only when the job carries no name of its own.
+ *
+ * ⚠ NULLIF(TRIM(...), '') IS LOAD-BEARING — do not "simplify" it back to a plain
+ * COALESCE. MySQL's COALESCE skips NULL and nothing else, so
+ * COALESCE('', cu.customer_name) returns '' — a BLANK customer name on screen,
+ * not the fallback. The empty string is reachable, not hypothetical:
+ *   · validators/job.validator.js declares job_customer_name as
+ *     `Joi.string().max(255).allow('', null)` on BOTH the create and update
+ *     schemas — '' is an accepted request value, twice over;
+ *   · create() stores `input.job_customer_name ?? input.customer?.customer_name`
+ *     and `??` only falls through on null/undefined, so a '' passes straight in;
+ *   · services/job-magic-link.service.js writes
+ *     `job_customer_name = COALESCE(?, job_customer_name)`, which likewise
+ *     stores '' verbatim when the public form posts an empty name.
+ * TRIM additionally catches the whitespace-only variant of the same paste.
+ *
+ * ONE definition, used by the LIST projection, the DETAIL projection, the
+ * `customer_name` sort key and the customer-name search terms — so what is
+ * displayed, what rows are ordered by and what a search matches cannot drift
+ * apart (a search that matched the MASTER name while the row displayed the JOB
+ * name would return rows the CRM's client-side re-filter then hides).
+ *
+ * Pure column arithmetic — no placeholders — so it is safe to interpolate into a
+ * SELECT list, an ORDER BY or a WHERE. It names only `j` and `cu`, both
+ * unconditionally present in LIST_JOIN / DETAIL_JOIN, and `cu.` stays textually
+ * inside it so the COUNT query's alias sniffing still adds the tbl_customer join
+ * wherever this expression appears in the WHERE.
+ *
+ * ⚠ SCOPE: this is "the customer ON THIS JOB". Customer-MASTER surfaces —
+ * Manage Customers, customer detail, customer lookup / autocomplete,
+ * dedupe-by-mobile — are keyed on tbl_customer, not tbl_job, and must keep
+ * reading `cu.customer_name` directly. Do not spread this expression there.
+ */
+const JOB_CUSTOMER_NAME_EXPR =
+  `COALESCE(NULLIF(TRIM(j.job_customer_name), ''), cu.customer_name)`;
+
 // ─── Server-side sort whitelist ─────────────────────────────────────
 /*
  * Maps the FE sort key → the qualified SQL expression the list ORDER BY uses.
@@ -294,7 +338,13 @@ const SORTABLE_COLUMNS = {
   scheduled_date_time: 'j.scheduled_date_time',
   checkin_date_time: 'j.checkin_date_time',
   checkout_date_time: 'j.checkout_date_time',
-  customer_name: 'cu.customer_name',
+  /*
+   * Customer name. Sorts on the SAME expression the projection emits, so the
+   * column the operator reads and the key the rows are ordered by are one
+   * definition. Sorting on `cu.customer_name` while displaying the job-row name
+   * would look like a broken sort on every job that overrides it.
+   */
+  customer_name: JOB_CUSTOMER_NAME_EXPR,
   customer_mob_no: 'cu.customer_mob_no',
   source_type: 'j.source_type',
   easyfixer_name: 'ef.efr_name',
@@ -343,7 +393,11 @@ const LIST_COLUMNS = `
   (EXISTS (SELECT 1 FROM scheduling_history sh
      WHERE sh.job_id = j.job_id
        AND sh.reschedule_reason LIKE '%Auto Rescheduled%')) AS auto_rescheduled,
-  j.fk_customer_id, cu.customer_name, cu.customer_mob_no,
+  /* customer_name = the name booked ON THIS JOB, master name as fallback.
+     Alias is unchanged (customer_name) — the CRM row key, the client-side
+     search field and the XLSX export all read that key. See
+     JOB_CUSTOMER_NAME_EXPR for why the NULLIF/TRIM guard is mandatory. */
+  j.fk_customer_id, ${JOB_CUSTOMER_NAME_EXPR} AS customer_name, cu.customer_mob_no,
   j.fk_client_id, cl.client_name,
   j.fk_service_catg_id, sc.service_catg_name AS service_category,
   j.fk_easyfixter_id, ef.efr_name AS easyfixer_name,
@@ -1544,7 +1598,14 @@ async function list({
     params.push(`%${pin}%`);
   }
   if (customerQ) {
-    clauses.push('(cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ?)');
+    /*
+     * Matches the name the row DISPLAYS (job-row name, master as fallback), not
+     * the master name alone — otherwise typing the name visible on screen would
+     * return nothing for every job that overrides it. Still exactly TWO
+     * placeholders / two bound params, and `cu.` remains textually present so
+     * the COUNT-join sniffing below still adds the tbl_customer join.
+     */
+    clauses.push(`(${JOB_CUSTOMER_NAME_EXPR} LIKE ? OR cu.customer_mob_no LIKE ?)`);
     params.push(`%${customerQ}%`, `%${customerQ}%`);
   }
   // Reopen — direct column on tbl_job, super cheap. Accepts boolean or
@@ -1672,7 +1733,16 @@ async function list({
     // searchable; added here so a SPOC-name search matches. No new JOIN (alias j
     // is always present), and since COUNT + data share this where/params the two
     // OR terms apply to both.
-    clauses.push('(CAST(j.job_id AS CHAR) LIKE ? OR j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ? OR cl.client_name LIKE ? OR ci.city_name LIKE ? OR ef.efr_name LIKE ? OR ow.user_name LIKE ? OR j.client_spoc_name LIKE ? OR j.client_spoc LIKE ?)');
+    // The customer-name term is JOB_CUSTOMER_NAME_EXPR, not `cu.customer_name`:
+    // the row displays (and the CRM's client-side re-filter reads) the job-row
+    // name, so matching the master name alone would return rows the browser then
+    // hides — the precise failure tests/job-search-parity.test.js exists to
+    // prevent. Placeholder count is unchanged (11), so the params.push below
+    // still binds exactly one value per LIKE. NOTE: that test's source-scraping
+    // regex only detects bare `alias.col LIKE ?` terms, so this one no longer
+    // shows up in its BE column list — the parity it asserts still holds (both
+    // sides now key on the same effective name), it simply cannot see it.
+    clauses.push(`(CAST(j.job_id AS CHAR) LIKE ? OR j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR ${JOB_CUSTOMER_NAME_EXPR} LIKE ? OR cu.customer_mob_no LIKE ? OR cl.client_name LIKE ? OR ci.city_name LIKE ? OR ef.efr_name LIKE ? OR ow.user_name LIKE ? OR j.client_spoc_name LIKE ? OR j.client_spoc LIKE ?)`);
     params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
   }
 
@@ -1769,7 +1839,13 @@ async function getByIdCore(jobId) {
     : `NULL AS enquiry_reason_name`;
   const [jobRows] = await pool.query(
     `SELECT j.*,
-            cu.customer_name, cu.customer_mob_no, cu.customer_email,
+            /* customer_name = the name booked ON THIS JOB, master as fallback —
+               same JOB_CUSTOMER_NAME_EXPR the list projects, so the modal and
+               the row it opened from can never show different names. tbl_job has
+               no customer_name column (only job_customer_name), so the j.* above
+               cannot shadow this alias; job_customer_name still arrives raw via
+               j.* for the Confirm-mode form fields that edit it. */
+            ${JOB_CUSTOMER_NAME_EXPR} AS customer_name, cu.customer_mob_no, cu.customer_email,
             ad.address, ad.building, ad.landmark, ad.locality, ad.pin_code,
             ad.gps_location, ${addrInstrSelect}, ad.city_id, ci.city_name,
             sc.service_catg_name AS service_category,
@@ -5041,6 +5117,15 @@ module.exports = {
    * arithmetic, no placeholders; requires the `j` (tbl_job) alias in scope.
    */
   JOB_AGE_END_EXPR, JOB_AGE_SECS_EXPR, JOB_AGE_DAYS_EXPR, JOB_AGE_COLUMNS,
+  /*
+   * The "customer name ON THIS JOB" expression. Exported for the same reason:
+   * any other job-keyed read that needs to show a customer name should reuse
+   * THIS expression rather than re-deriving it — and, critically, rather than
+   * re-deriving it as a plain COALESCE, which blanks the name for every job
+   * whose job_customer_name is an empty string. Requires the `j` (tbl_job) and
+   * `cu` (tbl_customer) aliases in scope. NOT for customer-master surfaces.
+   */
+  JOB_CUSTOMER_NAME_EXPR,
   // The jobs-list server-side sort whitelist. Exported so
   // validators/job.validator.js derives its `sortBy` valid() list from the SAME
   // keys — one source of truth, no BE-side both-sides-whitelist drift.

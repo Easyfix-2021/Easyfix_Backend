@@ -275,3 +275,112 @@ test('wallClockTime takes the time-of-day verbatim, with no timezone shift', () 
   assert.equal(ts.wallClockTime('2026-08-05'), null);
   assert.equal(ts.wallClockTime(null), null);
 });
+
+// ─── formatClock12 ───────────────────────────────────────────────────
+/*
+ * THE CUSTOMER-FACING FORMATTER. This is the string a customer reads back in
+ * the WhatsApp confirmation template (whatsapp-conversation.jobDateLabel) and
+ * on the public shared-job page (job-share.service). It used to be reimplemented
+ * inline at each of those call sites; the copies are gone, so these assertions
+ * are now the ONLY thing standing between an edit here and a wrong appointment
+ * time going out over WhatsApp. Treat a change to any expectation below as a
+ * change to a live customer message.
+ *
+ * Two rules carry the whole contract:
+ *   • a whole hour DROPS the ':00' — '3 PM', never '3:00 PM';
+ *   • 00:00 is the "no time was ever captured" SENTINEL, not midnight, so it
+ *     returns null and the caller shows the broad band instead.
+ */
+test('formatClock12 drops the :00 on a whole hour', () => {
+  assert.equal(ts.formatClock12('2026-08-05 15:00:00'), '3 PM');
+  assert.equal(ts.formatClock12('2026-08-05 09:00:00'), '9 AM');
+  assert.equal(ts.formatClock12('2026-08-05 18:00:00'), '6 PM');
+});
+
+test('formatClock12 keeps the minutes on a part hour, zero-padded', () => {
+  assert.equal(ts.formatClock12('2026-08-05 14:30:00'), '2:30 PM');
+  assert.equal(ts.formatClock12('2026-08-05 09:05:00'), '9:05 AM');
+  assert.equal(ts.formatClock12('2026-08-05 23:59:00'), '11:59 PM');
+});
+
+/* 12 is the hour the ((h + 11) % 12) + 1 wrap gets wrong if it is written as
+ * h % 12, which silently yields '0 PM'. Both ends of the wrap are pinned. */
+test('formatClock12 renders noon as 12 PM, not 0 PM', () => {
+  assert.equal(ts.formatClock12('2026-08-05 12:00:00'), '12 PM');
+  assert.equal(ts.formatClock12('2026-08-05 12:30:00'), '12:30 PM');
+  assert.equal(ts.formatClock12('2026-08-05 11:59:00'), '11:59 AM');
+  assert.equal(ts.formatClock12('2026-08-05 13:00:00'), '1 PM');
+});
+
+/*
+ * 00:30 is a REAL after-midnight visit (booked as 'After Hours'), so it must
+ * render — while exact 00:00 must not. The sentinel guard is on the whole
+ * time-of-day, not on the hour, which is what keeps these two apart.
+ */
+test('formatClock12 renders a genuine after-midnight visit as 12:xx AM', () => {
+  assert.equal(ts.formatClock12('2026-08-05 00:30:00'), '12:30 AM');
+  assert.equal(ts.formatClock12('2026-08-05 00:01:00'), '12:01 AM');
+});
+
+test('formatClock12 returns null for the 00:00 sentinel — never "12 AM"', () => {
+  assert.equal(ts.formatClock12('2026-08-05 00:00:00'), null);
+  assert.equal(ts.formatClock12('2026-08-05 00:00'), null);
+  assert.equal(ts.formatClock12('2026-08-05T00:00'), null);
+});
+
+test('formatClock12 returns null for absent, date-only and unparseable input', () => {
+  assert.equal(ts.formatClock12(null), null);
+  assert.equal(ts.formatClock12(undefined), null);
+  assert.equal(ts.formatClock12(''), null);
+  assert.equal(ts.formatClock12('2026-08-05'), null, 'a date-only booking has no time to show');
+  assert.equal(ts.formatClock12('rubbish'), null);
+  assert.equal(ts.formatClock12('lunchtime'), null);
+  assert.equal(ts.formatClock12(0), null);
+});
+
+test('formatClock12 accepts the datetime-local T separator as well as the SQL space', () => {
+  assert.equal(ts.formatClock12('2026-08-05T15:00'), '3 PM');
+  assert.equal(ts.formatClock12('2026-08-05T14:30'), '2:30 PM');
+});
+
+// ─── appointmentDateLabel — the DATE sibling of formatClock12 ─────────
+
+test('appointmentDateLabel renders the customer-facing date', () => {
+  assert.equal(ts.appointmentDateLabel('2026-08-05'), 'Wed, 05 Aug 2026');
+  assert.equal(ts.appointmentDateLabel('2026-08-05 05:30:00'), 'Wed, 05 Aug 2026');
+  assert.equal(ts.appointmentDateLabel('2026-08-05T15:00'), 'Wed, 05 Aug 2026');
+  assert.equal(ts.appointmentDateLabel('2026-01-01'), 'Thu, 01 Jan 2026', 'day is zero-padded');
+});
+
+/*
+ * THE SENTINEL IS A DATE QUESTION, NOT A TIME QUESTION. 00:00:00 means "no
+ * time-of-day was captured" — the DATE is still perfectly real, so the label
+ * renders it. It is the BAND that must never be derived from the sentinel (see
+ * displaySlot); conflating the two would strip the date off ~79k legacy
+ * date-only rows and leave a reschedule SMS with nothing to say.
+ */
+test('appointmentDateLabel renders the date on the 00:00 sentinel — unlike formatClock12', () => {
+  assert.equal(ts.appointmentDateLabel('2026-08-05 00:00:00'), 'Wed, 05 Aug 2026');
+  assert.equal(ts.formatClock12('2026-08-05 00:00:00'), null, 'the TIME half still refuses the sentinel');
+});
+
+test('appointmentDateLabel returns null — never the string "null" — on unusable input', () => {
+  assert.equal(ts.appointmentDateLabel(null), null);
+  assert.equal(ts.appointmentDateLabel(undefined), null);
+  assert.equal(ts.appointmentDateLabel(''), null);
+  assert.equal(ts.appointmentDateLabel('garbage'), null);
+  assert.equal(ts.appointmentDateLabel('05-08-2026'), null, 'DD-MM-YYYY is not the wall-clock spelling');
+  assert.equal(ts.appointmentDateLabel(0), null);
+});
+
+/*
+ * The spellings are hard-coded English on purpose — they land inside
+ * DLT-registered SMS bodies and WhatsApp templates whose literal text is
+ * registered with the operator. If this ever started coming from
+ * toLocaleDateString, a container with different ICU data would silently
+ * re-word an approved template and the operator would start dropping messages.
+ */
+test('appointmentDateLabel is not locale-derived — the spelling is fixed English', () => {
+  assert.equal(ts.appointmentDateLabel('2026-02-28'), 'Sat, 28 Feb 2026');
+  assert.equal(ts.appointmentDateLabel('2026-12-25'), 'Fri, 25 Dec 2026');
+});

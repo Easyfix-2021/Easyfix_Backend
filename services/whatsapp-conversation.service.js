@@ -189,6 +189,23 @@ function istTimeString(nowMs = Date.now()) {
  */
 const SLOT_START_HOURS = slotModel.SLOT_START_HOURS;
 
+/*
+ * hour12Label(h) → '9 AM', '12 PM', '7 PM' — ONE END of a frame label.
+ *
+ * ⚠ NOT time-slot.formatClock12, and deliberately not delegating to it.
+ *   • Different input: a bare 0–23 HOUR, not an IST wall-clock datetime.
+ *     Routing it through formatClock12 would mean fabricating a meaningless
+ *     calendar date ('2000-01-01 09:00') just to get the hour back out.
+ *   • Different midnight rule, which is the substantive one. formatClock12
+ *     treats 00:00 as the "no time was ever captured" SENTINEL and returns
+ *     null; here hour 0 is a real clock position and must render '12 AM'. The
+ *     two agree on every other hour (verified 0–24), so the divergence is
+ *     exactly midnight — and midnight is precisely where an 'After Hours'
+ *     frame would land if SLOT_START_HOURS is ever widened past 9 AM–7 PM.
+ *     Delegating would turn that into a label reading 'null–1 AM'.
+ * Today only hours 9–19 reach this (SLOT_START_HOURS and their +1), where the
+ * two are identical — but the sentinel semantics are not, so it stays local.
+ */
 function hour12Label(h) {
   const suffix = h < 12 ? 'AM' : 'PM';
   const h12 = ((h + 11) % 12) + 1;
@@ -651,19 +668,35 @@ async function loadJobForConversation(jobId, pool) {
 function jobDateLabel(job) {
   const dateLabel = formatCustomerDateLabel(job && job.appointment_date);
   if (!dateLabel) return null;
-  // appointment_time is 'HH:MM' projected off requested_date_time. '00:00' is
-  // the "no time captured" sentinel on legacy rows, so skip it.
-  const t = /^(\d{1,2}):(\d{2})/.exec(String((job && job.appointment_time) || '').trim());
-  if (t) {
-    const h = Number(t[1]);
-    const mins = t[2];
-    if (!(h === 0 && mins === '00') && h >= 0 && h <= 23) {
-      const h12 = ((h + 11) % 12) + 1;
-      const suffix = h < 12 ? 'AM' : 'PM';
-      return `${dateLabel}, ${mins === '00' ? `${h12} ${suffix}` : `${h12}:${mins} ${suffix}`}`;
-    }
-  }
-  const slot = job.time_slot && String(job.time_slot).trim();
+  /*
+   * appointment_date and appointment_time are two DATE_FORMAT projections of
+   * the SAME column, so pairing them back up reconstitutes the IST wall clock
+   * that time-slot.formatClock12 reads. That shared formatter owns both rules
+   * this used to repeat inline: the 00:00 "no time captured" sentinel yields
+   * null (so a legacy row falls through to its band instead of announcing
+   * "12 AM"), and a whole hour drops the ':00' — "3 PM", not "3:00 PM".
+   *
+   * slice(0, 10) takes the 'YYYY-MM-DD' prefix formatCustomerDateLabel has
+   * already validated; using the prefix rather than the whole value stops a
+   * stray 'T00:00:00Z' tail from being read as the time-of-day.
+   *
+   * Equivalence with the inline formatter this replaced was checked over all
+   * 1440 values DATE_FORMAT('%H:%i') can emit — byte-identical on every one.
+   * It does rely on that projection's zero-padding ('09:30', never '9:30');
+   * see the SELECT in loadJobForConversation.
+   */
+  const day = String((job && job.appointment_date) || '').trim().slice(0, 10);
+  const clock = slotModel.formatClock12(`${day} ${String((job && job.appointment_time) || '').trim()}`);
+  if (clock) return `${dateLabel}, ${clock}`;
+  /*
+   * Last resort: no readable clock, so the stored band is the only time signal
+   * we have. canonicalSlot folds CASE AND SPACING ONLY — '3pm to 7pm' becomes
+   * '3PM to 7PM' — so the customer never sees a lower-cased variant of a band
+   * every other surface spells one way. Anything that is not cosmetically one of
+   * the four bands ('Morning 9 to 2', '9-12') passes through untouched: this
+   * must not GUESS a band, only tidy the spelling of one already stored.
+   */
+  const slot = slotModel.canonicalSlot(job.time_slot);
   if (slot) return `${dateLabel}, ${slot}`;
   return dateLabel;
 }
