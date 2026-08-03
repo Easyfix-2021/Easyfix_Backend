@@ -2,6 +2,9 @@ const { pool } = require('../db');
 const logger = require('../logger');
 const roleService = require('./role.service');
 const { parseAllowedRows, parseAllowedInput, NO_ACCESS_KEY } = require('../lib/job-stages');
+// Microsoft 365 mailbox provisioning. Fail-soft + fail-closed by design — see
+// the call site in createUser() for the rules it must obey.
+const entraProvisioning = require('./entra-provisioning.service');
 
 /*
  * Manage Users — internal-staff CRUD on tbl_user.
@@ -29,6 +32,29 @@ const { parseAllowedRows, parseAllowedInput, NO_ACCESS_KEY } = require('../lib/j
 
 const INTERNAL_USER_TYPE_ID = 5;
 const STATUS_ACTIVE = 1;
+
+/*
+ * How long POST /api/admin/users is willing to WAIT for mailbox provisioning
+ * before letting it finish in the background.
+ *
+ * The worst provisioning path is 5 sequential Graph calls (lookup + alias probe
+ * + POST /users + GET /subscribedSkus + POST assignLicense), each bounded only
+ * by MS_GRAPH_TIMEOUT_MS (default 15000) — ~75 s, comfortably past a 60 s nginx
+ * / Azure Container Apps idle timeout. That 504 would tell the operator "Add
+ * User failed" for a user that WAS created, and their retry would then hit the
+ * duplicate-active-email guard and return 409 — two contradictory answers to one
+ * successful create.
+ *
+ * So the wait is capped well under any proxy timeout. On expiry the provisioning
+ * promise is NOT cancelled: it keeps running detached and still records its
+ * outcome in tbl_user_entra_provisioning, which is the surface an operator reads
+ * (GET /api/admin/users/:userId/provisioning). With the feature flag off — the
+ * default — provisionUserMailbox performs zero network calls and this never fires.
+ */
+const PROVISION_INLINE_DEADLINE_MS = Math.max(
+  1000,
+  Number(process.env.ENTRA_PROVISION_INLINE_TIMEOUT_MS) || 20000,
+);
 
 function mkErr(status, message) { const e = new Error(message); e.status = status; return e; }
 
@@ -262,6 +288,13 @@ async function createUser({
   reporting_manager,
   allowed_stages,
   createdBy,
+  /*
+   * Is the ACTING operator allowed to trigger a Microsoft 365 directory write?
+   * Resolved by the route from the same `access.entraprovision.emails` allowlist
+   * that guards POST /api/admin/users/:userId/provision-mailbox. Defaults FALSE:
+   * a future caller that forgets to pass it gets no directory write rather than a
+   * silent, ungated licence-seat spend.
+   */
 }) {
   logger.info('Create user · role=' + (user_role || '') + ' · cityId=' + (city_id || ''));
   const name  = String(user_name || '').trim();
@@ -269,7 +302,16 @@ async function createUser({
   const mob   = String(mobile_no || '').trim();
   if (!name)  throw mkErr(400, 'user_name is required');
   if (!email) throw mkErr(400, 'official_email is required');
-  if (!mob)   throw mkErr(400, 'mobile_no is required');
+  /*
+   * NO mobile_no guard — it became OPTIONAL on 2026-08-03 (tbl_user.mobile_no is
+   * nullable and active users already exist without one).
+   *
+   * This service-level check is why loosening the route's Joi schema alone did
+   * NOT work: the request passed validation and then died here with the same
+   * wording, so the API still answered "mobile_no is required" while the form
+   * showed the field as optional. A field's requiredness lives in BOTH places —
+   * change one and the other silently wins.
+   */
   if (!user_role) throw mkErr(400, 'user_role is required');
 
   // Validate role exists + is admin-group (we don't manage technicians or
@@ -290,12 +332,21 @@ async function createUser({
     throw mkErr(409, `An active user with email "${email}" already exists`);
   }
 
-  const [[dupMob]] = await pool.query(
+  /*
+   * Uniqueness only means something for a mobile that was actually supplied.
+   * Skipping the probe on a blank one is REQUIRED now that mobile is optional:
+   * otherwise the second blank-mobile user would match the first on
+   * `mobile_no = ''` and be rejected as a duplicate of it. (Today's 7
+   * mobile-less users store NULL, which never matches — so this would have
+   * stayed dormant until the first '' row was written, then broken every
+   * blank-mobile create after it.)
+   */
+  const [[dupMob]] = mob ? await pool.query(
     `SELECT user_id FROM tbl_user
       WHERE mobile_no = ? AND user_status = 1 AND user_type_id = ?
       LIMIT 1`,
     [mob, INTERNAL_USER_TYPE_ID]
-  );
+  ) : [[null]];
   if (dupMob) {
     logger.warn('Create user rejected · duplicate active mobile');
     throw mkErr(409, `An active user with mobile "${mob}" already exists`);
@@ -310,7 +361,11 @@ async function createUser({
         user_status, insert_date, updated_by)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?)`,
     [
-      name, email, mob, alternate_no || null,
+      // `mob || null` — store NULL, never '', for a mobile-less user. Matches
+      // how the 7 existing mobile-less rows are stored, and keeps the
+      // uniqueness probe above meaningful (NULL never equals NULL in SQL, so
+      // blank rows can't collide with each other).
+      name, email, mob || null, alternate_no || null,
       Number(user_role), INTERNAL_USER_TYPE_ID, city_id ? Number(city_id) : null,
       manage_clients || null, manage_cities || null, manage_states || null, manage_verticals || null,
       reporting_manager ? Number(reporting_manager) : null,
@@ -328,7 +383,85 @@ async function createUser({
     await reconcileAllowedStages(r.insertId, allowed_stages, createdBy);
   }
   logger.info('User created · id=' + r.insertId + ' · role=' + Number(user_role));
-  return getUserById(r.insertId);
+
+  const row = await getUserById(r.insertId);
+
+  /*
+   * ── Microsoft 365 mailbox provisioning ────────────────────────────────
+   * The CRM row above is the source of truth and is ALREADY COMMITTED. This
+   * step only ADDS visibility; it must never change that outcome:
+   *
+   *   - NOT in a transaction with the INSERT. A Graph outage, an expired
+   *     client secret or a licence shortage cannot roll back a created user.
+   *   - Fail-soft: provisionUserMailbox() never throws. The try/catch is a
+   *     second belt in case a future edit breaks that promise.
+   *   - Fail-closed: with easyfix_properties['entra.provisioning.enabled']
+   *     absent or 'false' (the seeded default) this performs ZERO network
+   *     calls and simply records "skipped: feature disabled".
+   *   - It ALWAYS records an outcome row, including the skip. That record is
+   *     the actual root-cause fix for the reported bug: a user whose mailbox
+   *     was never created stops being invisible.
+   *   - Fail-closed per PERSON too: `provisionMailbox` carries the acting
+   *     operator's `access.entraprovision.emails` verdict. Not on the list ⇒ the
+   *     skip is recorded and NO directory write happens, so Add User can't be
+   *     used to route around the allowlist the repair endpoint enforces.
+   *   - TIME-BOUNDED: we never hold the operator's request open longer than
+   *     PROVISION_INLINE_DEADLINE_MS. Past that it runs detached and records its
+   *     own outcome (see the constant's comment for the 504-vs-409 trap).
+   *
+   * The outcome rides back on the returned row so POST /api/admin/users can
+   * surface it, WITHOUT altering the success/failure semantics of user
+   * creation itself.
+   */
+  let provisioning = null;
+  try {
+    // `.catch` here (not only the outer try) because once the deadline expires
+    // this promise is unawaited — an unhandled rejection would take the process
+    // down on Node 18+.
+    const running = entraProvisioning.provisionUserMailbox({
+      userId: r.insertId,
+      userName: name,
+      officialEmail: email,
+      trigger: 'create-user',
+      actorId: createdBy || null,
+    }).catch((e) => {
+      logger.warn('Mailbox provisioning threw after user create (user IS created) · userId=' + r.insertId + ' · ' + e.message);
+      return { attempted: false, accountStatus: 'failed', licenceStatus: 'not_attempted', mailboxReady: false, reason: e.message };
+    });
+
+    // A unique sentinel, so a (hypothetical) null/undefined outcome from the
+    // orchestrator can never be mistaken for "the deadline expired".
+    const TIMED_OUT = Symbol('provision-inline-deadline');
+    let timer = null;
+    const deadline = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(TIMED_OUT), PROVISION_INLINE_DEADLINE_MS);
+      if (timer && typeof timer.unref === 'function') timer.unref();
+    });
+    provisioning = await Promise.race([
+      running.finally(() => { if (timer) clearTimeout(timer); }),
+      deadline,
+    ]);
+
+    if (provisioning === TIMED_OUT) {
+      logger.warn('Mailbox provisioning exceeded the inline deadline — continuing in the background · userId='
+        + r.insertId + ' · deadlineMs=' + PROVISION_INLINE_DEADLINE_MS);
+      provisioning = {
+        attempted: true,
+        pending: true,
+        accountStatus: 'pending',
+        licenceStatus: 'pending',
+        mailboxReady: false,
+        reason: 'still running after ' + PROVISION_INLINE_DEADLINE_MS
+          + 'ms — the outcome will be recorded; read it from GET /api/admin/users/'
+          + r.insertId + '/provisioning',
+      };
+    }
+  } catch (e) {
+    logger.warn('Mailbox provisioning threw after user create (user IS created) · userId=' + r.insertId + ' · ' + e.message);
+    provisioning = { attempted: false, accountStatus: 'failed', licenceStatus: 'not_attempted', mailboxReady: false, reason: e.message };
+  }
+  if (row) row.provisioning = provisioning;
+  return row;
 }
 
 // ─── Update ──────────────────────────────────────────────────────────

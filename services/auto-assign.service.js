@@ -1,6 +1,9 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const jobService = require('./job.service');
+// Shared appointment slot model — the 1-hour conflict window + the midnight
+// sentinel guard this legacy ranker now uses, same as candidate-ranking.
+const slotModel = require('./time-slot');
 
 /*
  * 3-layer auto-assignment pipeline (blueprint §5).
@@ -226,18 +229,45 @@ async function statsForCandidates(efrIds, jobRequestedTs, jobTimeSlot) {
   );
   const activeMap = new Map(activeRows.map((r) => [r.efr_id, Number(r.active_jobs)]));
 
-  // time-slot conflicts: any job on same date+slot
-  const reqDate = jobRequestedTs ? new Date(jobRequestedTs).toISOString().slice(0, 10) : null;
+  /*
+   * Booking conflict: another ACTIVE job whose 1-HOUR window OVERLAPS the
+   * proposed appointment. Identical predicate to the main engine
+   * (candidate-ranking.service.js) — see the long note there for why the old
+   * `DATE(requested_date_time) = ? AND time_slot = ?` band equality had to go
+   * (a 3-to-5-hour bucket, compared across ~12 incompatible slot vocabularies)
+   * and how the 00:00 midnight sentinel is kept from manufacturing conflicts.
+   *
+   * This also retires a second bug in the old two lines: reqDate came from
+   * `new Date(ts).toISOString()`, which shifts the calendar DAY on any non-UTC
+   * host. Bounds are computed on the IST wall clock now, host-independently.
+   *
+   * `jobTimeSlot` is no longer read — the slot STRING plays no part in
+   * conflict detection anywhere. Kept in the signature because callers pass it
+   * positionally and it still travels into the response payload.
+   */
+  /*
+   * SAME 1-HOUR FRAME = conflict — byte-identical to the rule in
+   * candidate-ranking.service.js. This is the SECOND ranker (it backs
+   * GET /admin/auto-assign/:jobId/candidates), and the two must never disagree
+   * about who is available, so both derive the frame from the one shared
+   * slotModel.conflictFrame(). Consecutive hours (09:00 vs 10:00) do NOT
+   * conflict; 10:00 and 10:30 share the 10:00 frame and DO.
+   * The midnight-sentinel guard is required on both sides for the same reason
+   * as there: a date-only row is not a booking at midnight.
+   */
   const conflictMap = new Map();
-  if (reqDate && jobTimeSlot) {
+  const conflictAt = slotModel.conflictFrame(jobRequestedTs);
+  if (conflictAt) {
     const [conflicts] = await pool.query(
       `SELECT DISTINCT fk_easyfixter_id AS efr_id
          FROM tbl_job
         WHERE fk_easyfixter_id IN (${placeholders})
+          AND job_status IN (0, 1, 2)
+          AND requested_date_time IS NOT NULL
+          AND TIME(requested_date_time) <> '00:00:00'
           AND DATE(requested_date_time) = ?
-          AND time_slot = ?
-          AND job_status IN (0, 1, 2)`,
-      [...efrIds, reqDate, jobTimeSlot]
+          AND HOUR(requested_date_time) = ?`,
+      [...efrIds, conflictAt.date, conflictAt.hour]
     );
     for (const r of conflicts) conflictMap.set(r.efr_id, true);
   }
@@ -382,7 +412,7 @@ async function getCandidates(jobId, { limit = 10, ignoreDistance = false } = {})
       rejected.push({ efr_id: e.efr_id, reason: `saturated (${s.active_jobs} active jobs)` }); continue;
     }
     if (s.has_conflict) {
-      rejected.push({ efr_id: e.efr_id, reason: 'time-slot conflict on requested date' }); continue;
+      rejected.push({ efr_id: e.efr_id, reason: 'already booked in an overlapping 1-hour window' }); continue;
     }
 
     // L3 scoring (normalised weights → final score in [0, 1])

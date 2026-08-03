@@ -4,6 +4,41 @@
  */
 
 const logger = require('../logger');
+// Slot-label → canonical band, so the legacy availability count keeps matching
+// jobs whose time_slot this backend now writes in the canonical vocabulary.
+const slotModel = require('./time-slot');
+
+/*
+ * The [fromHour, toHour) window a slot LABEL denotes, across BOTH vocabularies
+ * tbl_job.time_slot has ever spoken. Used ONLY to widen the availability COUNT
+ * in checkFirefoxAvailability — never to write anything.
+ *
+ * Keys are lower-cased/whitespace-collapsed so 'Morning 9 to 2' and
+ * 'morning  9 to 2' hit the same row. The canonical four bands are resolved via
+ * slotModel instead (they are what new rows store), so only the legacy
+ * word-leading labels — which normaliseSlotLabel deliberately refuses to guess
+ * at — need spelling out here. 'After Hours' is absent on purpose: it is the
+ * OVERNIGHT window (19:00 → 09:00), not a contiguous [from, to) range, so it
+ * falls back to plain label equality.
+ */
+const SLOT_HOURS = Object.freeze({
+  'morning 9 to 2':    [9, 14],
+  'morning 9 to 12':   [9, 12],
+  'afternoon 12 to 5': [12, 17],
+  'afternoon 12 to 2': [12, 14],
+  'evening 2 to 7':    [14, 19],
+});
+
+const CANONICAL_BAND_HOURS = Object.freeze({
+  '9AM to 12PM': [9, 12],
+  '12PM to 3PM': [12, 15],
+  '3PM to 7PM':  [15, 19],
+});
+
+function slotHourRange(rawSlot, bandSlot) {
+  const key = String(rawSlot || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  return SLOT_HOURS[key] || CANONICAL_BAND_HOURS[bandSlot] || null;
+}
 
 const STATUS_LABELS = {
   0: 'Unconfirmed', 1: 'Scheduled', 2: 'In-Progress',
@@ -80,15 +115,53 @@ async function checkFirefoxAvailability(pool, { pincode, requestedDate, timeSlot
   const pad = (n) => String(n).padStart(2, '0');
   const dateOnly = `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}`;
 
+  /*
+   * Slot match, widened 2026-07-31. tbl_job.time_slot is now written as one of
+   * four canonical BANDS ('9AM to 12PM' …) by every create path — INCLUDING the
+   * one this same integration posts through (routes/integration/v1 POST /jobs →
+   * job.service.create → resolveTimeSlot). So matching only the partner's
+   * verbatim string stopped counting the very bookings this endpoint creates,
+   * silently disabling per-city slot capacity gating: a partner could book 20
+   * jobs into a 5-slot city and keep being told "Yes".
+   *
+   * ⚠ THE BAND ALONE IS NOT ENOUGH. slotModel.normaliseSlotLabel is anchored on
+   * a LEADING DIGIT, so it returns null for exactly the word-leading vocabulary
+   * partners send ('Morning 9 to 2', 'Afternoon 12 to 5', 'Evening 2 to 7') —
+   * the widened predicate then collapsed straight back to raw equality. Hence
+   * SLOT_HOURS below: the explicit hour range each known label denotes, matched
+   * against the job's own appointment HOUR. That is the same "read the datetime,
+   * not the string" rule the rest of the codebase now follows, and it works for
+   * every stored vocabulary at once because none of them is read.
+   *
+   * Still a strict SUPERSET of the original `tj.time_slot = ?`: three ORed
+   * alternatives, the first of which is that predicate unchanged. The count can
+   * only go UP, so availability never gets looser than the legacy contract.
+   */
+  const rawSlot  = String(timeSlot || '');
+  const bandSlot = slotModel.normaliseSlotLabel(rawSlot);
+  const hours    = slotHourRange(rawSlot, bandSlot);
   const [[{ cnt }]] = await pool.query(
     `SELECT COUNT(*) AS cnt
        FROM tbl_job tj
        LEFT JOIN tbl_address ta ON ta.address_id = tj.fk_address_id
       WHERE tj.fk_service_catg_id = 21
         AND DATEDIFF(tj.requested_date_time, ?) = 0
-        AND tj.time_slot = ?
+        AND (
+              tj.time_slot = ?
+           OR (? IS NOT NULL AND tj.time_slot = ?)
+           OR (? IS NOT NULL
+               AND TIME(tj.requested_date_time) <> '00:00:00'
+               AND HOUR(tj.requested_date_time) >= ?
+               AND HOUR(tj.requested_date_time) <  ?)
+            )
         AND ta.city_id = ?`,
-    [dateOnly, String(timeSlot || ''), fcm.city_id]
+    [
+      dateOnly,
+      rawSlot,
+      bandSlot, bandSlot,
+      hours ? 1 : null, hours ? hours[0] : 0, hours ? hours[1] : 0,
+      fcm.city_id,
+    ]
   );
 
   logger.info('Firefox availability=' + (Number(cnt) < Number(fcm.no_of_slot) ? 'Yes' : 'No') + ' · booked=' + cnt + ' · slots=' + fcm.no_of_slot + ' · date=' + dateOnly);
