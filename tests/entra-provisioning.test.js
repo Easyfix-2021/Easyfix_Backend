@@ -713,3 +713,104 @@ test('a blank CRM name sends neither name field', () => withBodyCapturingGraph(a
   assert.equal('givenName' in body, false);
   assert.equal('surname' in body, false);
 }));
+
+// ── Licence assignment: ACCEPTED ≠ ASSIGNED ───────────────────────────────
+//
+// graphRequest sets `ok` from res.ok, which is true for ANY 2xx — including
+// 202 Accepted, which on assignLicense means "queued", not "the seat is on the
+// user". We recorded `assigned` off that and never looked again.
+//
+// Real case, anand.thakur@easyfix.in (2026-08-04): tbl_user_entra_provisioning
+// said assigned / O365_BUSINESS_ESSENTIALS while the M365 admin centre showed
+// every licence box unticked, and the account could open nothing until an admin
+// assigned Microsoft 365 Business Basic by hand.
+
+const SKU_BUSINESS_BASIC = '802384e1-3c01-4d3e-879f-0dc385e79031';
+
+function withLicenceGraph({ assignStatus = 202, licencesOnReadBack = [] }, fn) {
+  const originalFetch = globalThis.fetch;
+  const env = {
+    MS_GRAPH_TENANT_ID: process.env.MS_GRAPH_TENANT_ID,
+    MS_GRAPH_CLIENT_ID: process.env.MS_GRAPH_CLIENT_ID,
+    MS_GRAPH_CLIENT_SECRET: process.env.MS_GRAPH_CLIENT_SECRET,
+  };
+  process.env.MS_GRAPH_TENANT_ID = 'tenant-test';
+  process.env.MS_GRAPH_CLIENT_ID = 'client-test';
+  process.env.MS_GRAPH_CLIENT_SECRET = 'secret-test';
+
+  const seen = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url);
+    if (u.includes('login.microsoftonline.com')) {
+      return makeRes(200, { access_token: 'fake-token', expires_in: 3600 });
+    }
+    if (/assignLicense/.test(u)) {
+      seen.push('assign');
+      return makeRes(assignStatus, assignStatus === 202 ? null : { id: 'obj-1' });
+    }
+    if (/\/users\//.test(u) && String(init.method || 'GET').toUpperCase() === 'GET') {
+      seen.push('readback');
+      return makeRes(200, { id: 'obj-1', assignedLicenses: licencesOnReadBack.map((skuId) => ({ skuId })) });
+    }
+    return makeRes(404, { error: { code: 'Request_ResourceNotFound', message: 'unscripted' } });
+  };
+
+  return Promise.resolve(fn(seen)).finally(() => {
+    globalThis.fetch = originalFetch;
+    for (const [k, v] of Object.entries(env)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  });
+}
+
+test('a 202 with the seat visible on read-back is VERIFIED', () => withLicenceGraph(
+  { assignStatus: 202, licencesOnReadBack: [SKU_BUSINESS_BASIC] },
+  async (seen) => {
+    const res = await entra.assignLicense('obj-1', SKU_BUSINESS_BASIC);
+    assert.equal(res.ok, true);
+    assert.equal(res.verified, true, 'the seat was read back from Entra');
+    assert.ok(seen.includes('readback'), 'the acknowledgement alone is never enough');
+  },
+));
+
+test('a 202 with NO seat on read-back is accepted-but-UNVERIFIED, not assigned', () => withLicenceGraph(
+  { assignStatus: 202, licencesOnReadBack: [] },
+  async () => {
+    const res = await entra.assignLicense('obj-1', SKU_BUSINESS_BASIC);
+    assert.equal(res.ok, true, 'Graph did accept it — this is not a hard failure');
+    assert.equal(res.verified, false, '…but the seat never appeared');
+    assert.match(res.reason, /still not on the user/);
+  },
+));
+
+test('a read-back showing a DIFFERENT sku does not count as verified', () => withLicenceGraph(
+  { assignStatus: 200, licencesOnReadBack: ['ffffffff-0000-0000-0000-000000000000'] },
+  async () => {
+    const res = await entra.assignLicense('obj-1', SKU_BUSINESS_BASIC);
+    assert.equal(res.verified, false, 'holding SOME licence is not holding THIS one');
+  },
+));
+
+test('the sku match is case-insensitive — Graph casing must not cause a false alarm', () => withLicenceGraph(
+  { assignStatus: 200, licencesOnReadBack: [SKU_BUSINESS_BASIC.toUpperCase()] },
+  async () => {
+    const res = await entra.assignLicense('obj-1', SKU_BUSINESS_BASIC);
+    assert.equal(res.verified, true);
+  },
+));
+
+test('assigned_unconfirmed does NOT count as a working mailbox', () => {
+  // This is the load-bearing half. mailboxLikelyExists gates the OTP mailbox
+  // pre-check: treating an unconfirmed licence as ready would mail a login OTP
+  // into a mailbox that does not exist and suppress the WhatsApp/SMS fallback.
+  assert.equal(
+    entra.mailboxLikelyExists(entra.ACCOUNT_STATUS.CREATED, entra.LICENCE_STATUS.ASSIGNED_UNCONFIRMED),
+    false,
+  );
+  assert.equal(
+    entra.mailboxLikelyExists(entra.ACCOUNT_STATUS.CREATED, entra.LICENCE_STATUS.ASSIGNED),
+    true,
+  );
+  assert.notEqual(entra.LICENCE_STATUS.ASSIGNED_UNCONFIRMED, entra.LICENCE_STATUS.ASSIGNED);
+  assert.ok(entra.LICENCE_STATUS.ASSIGNED_UNCONFIRMED.length <= 32, 'licence_status is VARCHAR(32)');
+});

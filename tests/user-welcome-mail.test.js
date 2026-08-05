@@ -412,7 +412,7 @@ const SKU_FULL = { ...SKU_FREE, consumedUnits: 10 };
  * the password DID reach the create body (non-vacuous) and DID reach the mail
  * body, before asserting it reached nothing else.
  */
-function withScriptedGraph(sku, fn) {
+function withScriptedGraph(sku, fn, { seatVisibleOnReadBack = true } = {}) {
   const originalFetch = globalThis.fetch;
   process.env.MS_GRAPH_TENANT_ID = 'tenant-test';
   process.env.MS_GRAPH_CLIENT_ID = 'client-test';
@@ -433,6 +433,25 @@ function withScriptedGraph(sku, fn) {
     if (u.includes('/assignLicense'))            return makeRes(204, undefined);
     if (u.includes('/subscribedSkus'))           return makeRes(200, { value: [sku] });
     if (method === 'POST' && /\/v1\.0\/users$/.test(u)) return makeRes(201, { id: 'obj-9001' });
+    /*
+     * Licence READ-BACK. assignLicense no longer trusts its own 2xx — a 202 means
+     * "queued", not "the seat is on the user" — so it re-reads assignedLicenses
+     * and only reports `assigned` when the SKU is really there. Without this
+     * branch the read 404s, the licence records `assigned_unconfirmed`, and
+     * GATE 3 correctly suppresses the credential mail.
+     */
+    /*
+     * Matched on the EXACT select list. `assignedLicenses` also appears in the
+     * pre-existence lookup's select (findByUpn's race re-resolve), and a looser
+     * match answered THAT with a 200 — so the account read as already existing,
+     * the flow took the reuse path, and POST /users never happened.
+     */
+    if (method === 'GET' && u.includes('$select=id,assignedLicenses')) {
+      return makeRes(200, {
+        id: 'obj-9001',
+        assignedLicenses: seatVisibleOnReadBack ? [{ skuId: sku.skuId }] : [],
+      });
+    }
     if (u.includes('$filter='))                  return makeRes(200, { value: [] });
     return makeRes(404, { error: { code: 'Request_ResourceNotFound', message: 'not found' } });
   };
@@ -583,4 +602,38 @@ test('a throwing password sink cannot break provisioning', async () => {
     );
     assert.equal(created.ok, true, 'the account was still created; the sink is best-effort');
   });
+});
+
+/*
+ * GATE 3 now also covers "Graph accepted the licence but the seat never
+ * appeared". Previously that state recorded a clean `assigned` and the joiner
+ * got a credential mail for a mailbox they could not open — the reported bug on
+ * anand.thakur@easyfix.in, whose provisioning row said assigned /
+ * O365_BUSINESS_ESSENTIALS while every licence box in the admin centre was
+ * unticked.
+ *
+ * Suppressing is the right failure here: the credentials are useless until the
+ * seat lands, and the WARN + `assigned_unconfirmed` row makes it findable and
+ * re-runnable through the repair endpoint. A mail that looks like success is
+ * exactly what hid this for a day.
+ */
+test('no credential mail when the licence seat is not visible on read-back', async () => {
+  const log = captureLogger();
+  fake.reset();
+  let seen;
+  try {
+    await withScriptedGraph(
+      SKU_FREE,
+      async (requests) => { await userService.createUser({ ...CREATE_ARGS }); seen = requests; },
+      { seatVisibleOnReadBack: false },
+    );
+  } finally {
+    log.restore();
+  }
+  assert.ok(seen.find((r) => r.url.includes('/assignLicense')), 'the assignment WAS attempted');
+  assert.equal(
+    seen.find((r) => r.url.includes('/sendMail')),
+    undefined,
+    'but no credentials go out for a mailbox we could not confirm',
+  );
 });

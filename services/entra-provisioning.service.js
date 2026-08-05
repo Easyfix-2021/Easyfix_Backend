@@ -157,11 +157,31 @@ const LICENCE_STATUS = Object.freeze({
   SKU_NOT_ACTIVE:     'sku_not_active',
   NO_SEATS:           'no_seats_available',
   ALREADY_LICENSED:   'already_licensed',
-  ASSIGNED:           'assigned',
+  ASSIGNED:           'assigned',           // read back from Entra — the seat is REALLY there
+  /*
+   * Graph 2xx-ed the assignLicense call but a read-back could not see the SKU on
+   * the user. Observed on anand.thakur@easyfix.in (2026-08-04): this table said
+   * `assigned` with the right SKU while the M365 admin centre showed EVERY
+   * licence box unticked, and the user could not open anything until an admin
+   * ticked Microsoft 365 Business Basic by hand.
+   *
+   * NOT a synonym for `assigned`. It is the honest answer when Graph accepted
+   * the request and the seat did not appear — deliberately kept out of
+   * mailboxLikelyExists below so nothing downstream treats it as a live mailbox.
+   */
+  ASSIGNED_UNCONFIRMED: 'assigned_unconfirmed',
   FAILED:             'failed',
 });
 
-// A mailbox only exists once BOTH steps landed.
+/*
+ * A mailbox only exists once BOTH steps landed.
+ *
+ * ⚠ ASSIGNED_UNCONFIRMED is deliberately absent from `licenceOk`. This function
+ * gates the OTP mailbox pre-check, so calling an unconfirmed licence "ready"
+ * would mail a login OTP into a mailbox that does not exist and suppress the
+ * WhatsApp/SMS fallback — the exact failure this whole file was written to stop,
+ * one step further down the pipeline.
+ */
 function mailboxLikelyExists(accountStatus, licenceStatus) {
   const accountOk = accountStatus === ACCOUNT_STATUS.CREATED || accountStatus === ACCOUNT_STATUS.ALREADY_EXISTS;
   const licenceOk = licenceStatus === LICENCE_STATUS.ASSIGNED || licenceStatus === LICENCE_STATUS.ALREADY_LICENSED;
@@ -547,14 +567,82 @@ async function createEntraUser({ userPrincipalName, displayName, mailNickname, g
   return { ok: false, ...err };
 }
 
+/*
+ * How long to wait before re-reading the user, and how many times. Entra is
+ * eventually consistent: a seat assigned a moment ago is not always visible on
+ * the very next read. Two reads ~1.2s apart is enough for the normal case
+ * without turning an admin action into a long request.
+ */
+const LICENCE_VERIFY_ATTEMPTS = 2;
+const LICENCE_VERIFY_DELAY_MS = 1200;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/*
+ * Is `skuId` actually on the user's assignedLicenses RIGHT NOW?
+ * Read-back, not inference — see assignLicense() for why that distinction is
+ * the whole point here.
+ */
+async function holdsLicence(objectId, skuId) {
+  const res = await graphRequest(`/users/${encodeURIComponent(objectId)}?$select=id,assignedLicenses`);
+  if (!res.ok || !res.json || !Array.isArray(res.json.assignedLicenses)) {
+    return { readable: false, held: false, requestId: res.requestId };
+  }
+  const want = String(skuId).toLowerCase();
+  const held = res.json.assignedLicenses.some((l) => String(l && l.skuId).toLowerCase() === want);
+  return { readable: true, held, requestId: res.requestId };
+}
+
+/*
+ * assignLicense — and then CHECK THAT IT STUCK.
+ *
+ * THE BUG THIS EXISTS FOR. graphRequest sets `ok` from `res.ok`, which is true
+ * for ANY 2xx — including 202 Accepted, which on assignLicense means "queued for
+ * processing", not "the seat is on the user". We recorded `assigned` off that
+ * and never looked again. On anand.thakur@easyfix.in the provisioning row said
+ * `assigned` / O365_BUSINESS_ESSENTIALS while the admin centre showed no licence
+ * ticked at all, and the account could not open anything until an admin assigned
+ * it by hand. A 2xx told us Microsoft had heard the request. It never told us
+ * Microsoft had honoured it.
+ *
+ * This is the same "accepted ≠ done" trap the header of this file documents for
+ * mail (Graph 202-accepts a send to a mailbox that does not exist). Same lesson,
+ * one API further along: when the provider offers a way to OBSERVE the end
+ * state, observe it — do not infer it from the acknowledgement.
+ *
+ *   → { ok: true,  verified: true }   seat read back from Entra
+ *   → { ok: true,  verified: false }  Graph accepted it, seat not visible
+ *   → { ok: false, reason }           Graph refused it outright
+ */
 async function assignLicense(objectId, skuId) {
   const res = await graphRequest(`/users/${encodeURIComponent(objectId)}/assignLicense`, {
     method: 'POST',
     body: { addLicenses: [{ skuId, disabledPlans: [] }], removeLicenses: [] },
   });
-  if (res.ok) return { ok: true, requestId: res.requestId };
-  const err = graphErrorToReason(res);
-  return { ok: false, ...err };
+  if (!res.ok) {
+    const err = graphErrorToReason(res);
+    return { ok: false, ...err };
+  }
+
+  let last = { readable: false, held: false };
+  for (let attempt = 1; attempt <= LICENCE_VERIFY_ATTEMPTS; attempt++) {
+    last = await holdsLicence(objectId, skuId);
+    if (last.held) {
+      return { ok: true, verified: true, requestId: last.requestId || res.requestId };
+    }
+    if (attempt < LICENCE_VERIFY_ATTEMPTS) await sleep(LICENCE_VERIFY_DELAY_MS);
+  }
+
+  // Accepted but not observable. Report it as such — the caller records a
+  // status that does NOT claim a working mailbox.
+  return {
+    ok: true,
+    verified: false,
+    requestId: last.requestId || res.requestId,
+    reason: last.readable
+      ? `Graph accepted the assignment (HTTP ${res.status}) but the SKU is still not on the user after `
+        + `${LICENCE_VERIFY_ATTEMPTS} read-backs — check seat availability and usageLocation in the M365 admin centre`
+      : `Graph accepted the assignment (HTTP ${res.status}) but the user could not be re-read to confirm the seat`,
+  };
 }
 
 // ── OTP mailbox pre-check (Job 1b) ────────────────────────────────────────
@@ -917,9 +1005,20 @@ async function provisionUserMailbox({
       } else {
         const assigned = await assignLicense(entraObjectId, chosen.skuId);
         graphRequestId = assigned.requestId || graphRequestId;
-        if (assigned.ok) {
+        if (assigned.ok && assigned.verified) {
           licenceStatus = LICENCE_STATUS.ASSIGNED;
-          logger.info('Entra licence assigned · upn=' + ident.userPrincipalName + ' · sku=' + chosen.skuPartNumber);
+          logger.info('Entra licence assigned + verified · upn=' + ident.userPrincipalName + ' · sku=' + chosen.skuPartNumber);
+        } else if (assigned.ok) {
+          /*
+           * Accepted, not observed. WARN — this is the state that previously
+           * recorded a clean `assigned` and sent a new joiner to a mailbox they
+           * could not open. Distinct status so the row is findable and the
+           * repair endpoint can be re-run against exactly these users.
+           */
+          licenceStatus = LICENCE_STATUS.ASSIGNED_UNCONFIRMED;
+          licenceReason = assigned.reason;
+          logger.warn('Entra licence NOT confirmed · upn=' + ident.userPrincipalName
+            + ' · sku=' + chosen.skuPartNumber + ' · ' + assigned.reason);
         } else {
           licenceStatus = LICENCE_STATUS.FAILED;
           licenceReason = `licence assignment failed — ${assigned.reason}`;
