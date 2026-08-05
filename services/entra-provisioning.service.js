@@ -261,7 +261,7 @@ function generateTempPassword(length = 20) {
  * address nobody writes to, which is the bug we are fixing wearing a hat.
  * mailNickname (the Exchange alias seed) is allowed to differ and IS sanitised.
  *
- *   → { ok: true, userPrincipalName, mailNickname, displayName, domain }
+ *   → { ok: true, userPrincipalName, mailNickname, displayName, givenName, surname, domain }
  *   → { ok: false, reason, accountStatus }
  */
 function deriveIdentity({ user_name, official_email } = {}, domains = managedDomains()) {
@@ -287,9 +287,42 @@ function deriveIdentity({ user_name, official_email } = {}, domains = managedDom
   }
 
   const mailNickname = (local.replace(/[^a-z0-9._-]/g, '').replace(/\.{2,}/g, '.').replace(/^\.+|\.+$/g, '') || 'user').slice(0, 64);
-  const displayName = (String(user_name || '').trim().replace(/\s+/g, ' ') || local).slice(0, 256);
+  const fullName = String(user_name || '').trim().replace(/\s+/g, ' ');
+  const displayName = (fullName || local).slice(0, 256);
 
-  return { ok: true, userPrincipalName: email, mailNickname, displayName, domain };
+  /*
+   * givenName / surname — Entra's First name and Last name fields.
+   *
+   * These were simply never sent: the create body carried displayName and
+   * nothing else name-shaped, so every account landed with a full name in
+   * Display name and both name fields BLANK. That is visible in the Microsoft
+   * 365 admin centre, in Outlook's address book sort order, and in any Teams or
+   * SharePoint surface that renders first name — and it cannot be inferred back
+   * out of displayName by Microsoft.
+   *
+   * tbl_user has ONE name column, so the split is positional: the first
+   * whitespace-separated token is the given name, EVERYTHING after it is the
+   * surname. "Vijay Kumar Nailwal" → "Vijay" / "Kumar Nailwal". That is the
+   * right call for Indian names in a single-field system — a middle name
+   * belongs with the family name far more often than it belongs alone, and
+   * dropping it entirely would lose data the CRM holds.
+   *
+   * A single-word name yields a given name and NO surname, and the key is then
+   * omitted from the request rather than sent empty: Graph treats '' as a value
+   * to store, so sending it writes a blank where "absent" is the honest answer.
+   *
+   * When user_name is blank there is nothing to split. displayName falls back to
+   * the email local part above, but a local part is an ADDRESS, not a name —
+   * splitting "vijay.nailwal" on the dot would be inventing a first and last
+   * name from a mailbox alias. Both fields stay unset instead.
+   *
+   * 64 chars is Graph's limit on each field (displayName allows 256).
+   */
+  const nameParts = fullName ? fullName.split(' ') : [];
+  const givenName = nameParts.length ? nameParts[0].slice(0, 64) : null;
+  const surname = nameParts.length > 1 ? nameParts.slice(1).join(' ').slice(0, 64) : null;
+
+  return { ok: true, userPrincipalName: email, mailNickname, displayName, givenName, surname, domain };
 }
 
 /*
@@ -474,7 +507,7 @@ async function listSubscribedSkus() {
  * The sink is invoked inside a try/catch so a throwing consumer can never turn a
  * successful provisioning run into a failure.
  */
-async function createEntraUser({ userPrincipalName, displayName, mailNickname }, onTempPassword) {
+async function createEntraUser({ userPrincipalName, displayName, mailNickname, givenName, surname }, onTempPassword) {
   const tempPassword = generateTempPassword();
   const body = {
     accountEnabled: true,
@@ -487,6 +520,14 @@ async function createEntraUser({ userPrincipalName, displayName, mailNickname },
       password: tempPassword,
     },
   };
+  /*
+   * Only send a name field we actually have. Graph stores '' as a value, so an
+   * unconditional `givenName` would write an empty string for a user whose CRM
+   * name we could not split — indistinguishable in the admin centre from the
+   * blank-fields bug this fixes, but now deliberate. See deriveIdentity().
+   */
+  if (givenName) body.givenName = givenName;
+  if (surname) body.surname = surname;
   const res = await graphRequest('/users', { method: 'POST', body });
   if (res.ok && res.json && res.json.id) {
     // Deliberately logs the UPN and NOTHING from passwordProfile.
