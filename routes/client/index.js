@@ -663,6 +663,150 @@ router.get('/dashboard-summary', async (req, res, next) => {
       [req.spoc.client_id, ...teamIds]
     );
 
+    // ─── Performance by City / Store ─────────────────────────────────
+    // Per-city orders / completed / on-time% / avg TAT, team-scoped.
+    // On-time = a completed job checked out on or before its original
+    // committed appointment date. Avg TAT = ticket-created → checkout in
+    // 24h-days. Top 6 cities by volume.
+    const [cityRows] = await pool.query(
+      `SELECT ci.city_name AS city,
+              COUNT(*)                                              AS orders,
+              SUM(CASE WHEN j.job_status IN (3,5) THEN 1 ELSE 0 END) AS completed,
+              SUM(CASE WHEN j.job_status IN (3,5)
+                        AND j.checkout_date_time IS NOT NULL
+                        AND (j.original_appointment_date_time IS NULL
+                             OR DATE(j.checkout_date_time) <= DATE(j.original_appointment_date_time))
+                       THEN 1 ELSE 0 END)                           AS on_time,
+              AVG(CASE WHEN j.job_status IN (3,5) AND j.checkout_date_time IS NOT NULL
+                       THEN TIMESTAMPDIFF(HOUR, j.ticket_created_date_time, j.checkout_date_time)/24.0
+                       END)                                         AS avg_tat_days
+         FROM tbl_job j
+         LEFT JOIN tbl_address ad ON ad.address_id = j.fk_address_id
+         LEFT JOIN tbl_city    ci ON ci.city_id    = ad.city_id
+        WHERE j.fk_client_id        = ?
+          AND j.reporting_contact_id IN (${teamPlaceholders})
+          AND ci.city_name IS NOT NULL
+        GROUP BY ci.city_name
+        ORDER BY orders DESC
+        LIMIT 6`,
+      [req.spoc.client_id, ...teamIds]
+    );
+    const cityPerformance = cityRows.map((r) => {
+      const orders = Number(r.orders) || 0;
+      const completed = Number(r.completed) || 0;
+      const onTime = Number(r.on_time) || 0;
+      return {
+        city: r.city,
+        orders,
+        completed,
+        onTimePct: completed ? Math.round((onTime / completed) * 100) : null,
+        avgTatDays: r.avg_tat_days != null ? Number(Number(r.avg_tat_days).toFixed(1)) : null,
+      };
+    });
+
+    // ─── SLA breaches by aging ───────────────────────────────────────
+    // Active jobs (not completed/cancelled/enquiry) whose committed
+    // appointment (requested_date_time) is already in the past — i.e.
+    // overdue — bucketed by how many days late they are.
+    const [[sla]] = await pool.query(
+      `SELECT
+         SUM(CASE WHEN d BETWEEN 0 AND 1 THEN 1 ELSE 0 END) AS d01,
+         SUM(CASE WHEN d BETWEEN 2 AND 3 THEN 1 ELSE 0 END) AS d23,
+         SUM(CASE WHEN d BETWEEN 4 AND 7 THEN 1 ELSE 0 END) AS d47,
+         SUM(CASE WHEN d > 7            THEN 1 ELSE 0 END) AS d7plus
+       FROM (
+         SELECT DATEDIFF(NOW(), j.requested_date_time) AS d
+           FROM tbl_job j
+          WHERE j.fk_client_id        = ?
+            AND j.reporting_contact_id IN (${teamPlaceholders})
+            AND j.job_status IN (0,1,2,20,9,15,21)
+            AND j.requested_date_time IS NOT NULL
+            AND j.requested_date_time < NOW()
+       ) t`,
+      [req.spoc.client_id, ...teamIds]
+    );
+
+    // Invoices due (client-level) — feeds the "Needs attention" card.
+    const [[invDue]] = await pool.query(
+      `SELECT COUNT(*) AS cnt,
+              COALESCE(SUM(total_invoice_amount - COALESCE(total_paid_amount,0)),0) AS amt
+         FROM tbl_client_invoice
+        WHERE fk_client_id = ? AND is_raised = 1
+          AND (total_invoice_amount - COALESCE(total_paid_amount,0)) > 0`,
+      [req.spoc.client_id]
+    );
+
+    // Actionable order buckets for "Needs attention" — team-scoped.
+    //   estimatePending : status 15 — estimate awaiting the client's approval
+    //   noResponse      : call_later = 1 — customer not reachable / call not picked
+    //   onHold          : status 21 — fulfilment on hold (items/parts/approval pending)
+    //   revisit         : completed (3,5) with a revisit created, not yet billed
+    const [[attn]] = await pool.query(
+      `SELECT
+         SUM(CASE WHEN j.job_status = 15 THEN 1 ELSE 0 END) AS estimatePending,
+         SUM(CASE WHEN j.call_later = 1  THEN 1 ELSE 0 END) AS noResponse,
+         SUM(CASE WHEN j.job_status = 21 THEN 1 ELSE 0 END) AS onHold,
+         SUM(CASE WHEN j.job_status IN (3,5) AND j.sub_job_id IS NOT NULL
+                   AND j.ready_for_billing = 'No' THEN 1 ELSE 0 END) AS revisit,
+         SUM(CASE WHEN j.ready_for_billing = 'Yes' THEN 1 ELSE 0 END) AS qcDone
+         FROM tbl_job j
+        WHERE j.fk_client_id = ? AND j.reporting_contact_id IN (${teamPlaceholders})`,
+      [req.spoc.client_id, ...teamIds]
+    );
+
+    // ─── 30-day orders trend ─────────────────────────────────────────
+    // Received (created) vs Completed (checked out) per day, last 30 days,
+    // team-scoped. Grouped by day in SQL; JS fills the gap days with zero
+    // so the chart always has exactly 30 points.
+    const [createdRows] = await pool.query(
+      `SELECT DATE_FORMAT(j.ticket_created_date_time,'%Y-%m-%d') AS d, COUNT(*) AS n
+         FROM tbl_job j
+        WHERE j.fk_client_id = ? AND j.reporting_contact_id IN (${teamPlaceholders})
+          AND j.ticket_created_date_time >= DATE_SUB(CURDATE(), INTERVAL 29 DAY)
+        GROUP BY d`,
+      [req.spoc.client_id, ...teamIds]
+    );
+    const [completedRows] = await pool.query(
+      `SELECT DATE_FORMAT(j.checkout_date_time,'%Y-%m-%d') AS d, COUNT(*) AS n
+         FROM tbl_job j
+        WHERE j.fk_client_id = ? AND j.reporting_contact_id IN (${teamPlaceholders})
+          AND j.job_status IN (3,5)
+          AND j.checkout_date_time >= DATE_SUB(CURDATE(), INTERVAL 29 DAY)
+        GROUP BY d`,
+      [req.spoc.client_id, ...teamIds]
+    );
+    const createdMap   = new Map(createdRows.map((r) => [r.d, Number(r.n) || 0]));
+    const completedMap = new Map(completedRows.map((r) => [r.d, Number(r.n) || 0]));
+    const ymd = (dt) => `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
+    const trend = [];
+    const today = new Date();
+    for (let i = 29; i >= 0; i--) {
+      const dt = new Date(today);
+      dt.setDate(today.getDate() - i);
+      const key = ymd(dt);
+      trend.push({ date: key, created: createdMap.get(key) || 0, completed: completedMap.get(key) || 0 });
+    }
+
+    // Category & work-type mix — orders per service category. Replaces the
+    // status breakdown on the dashboard (status is already in the KPI cards).
+    // Team-scoped, top 6 by volume, colours pre-baked for the donut.
+    const CAT_COLORS = ['#2f6bff', '#10b981', '#7c5cff', '#F39C12', '#e11d48', '#06b6d4'];
+    const [catRows] = await pool.query(
+      `SELECT COALESCE(sc.service_catg_name, 'Other') AS name, COUNT(*) AS n
+         FROM tbl_job j
+         LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = j.fk_service_catg_id
+        WHERE j.fk_client_id = ? AND j.reporting_contact_id IN (${teamPlaceholders})
+        GROUP BY name
+        ORDER BY n DESC
+        LIMIT 6`,
+      [req.spoc.client_id, ...teamIds]
+    );
+    const categoryBreakdown = catRows.map((r, i) => ({
+      label: r.name,
+      count: Number(r.n) || 0,
+      color: CAT_COLORS[i % CAT_COLORS.length],
+    }));
+
     return modernOk(res, {
       boxes: {
         newTickets:           Number(jobBoxes.newTickets)           || 0,
@@ -671,6 +815,22 @@ router.get('/dashboard-summary', async (req, res, next) => {
         estimateApproved:     Number(estBoxes.estimateApproved)     || 0,
         estimateRejected:     Number(estBoxes.estimateRejected)     || 0,
       },
+      cityPerformance,
+      slaAging: {
+        d01:    Number(sla?.d01)    || 0,
+        d23:    Number(sla?.d23)    || 0,
+        d47:    Number(sla?.d47)    || 0,
+        d7plus: Number(sla?.d7plus) || 0,
+      },
+      attention: {
+        invoicesDue:     { count: Number(invDue?.cnt) || 0, amount: Number(invDue?.amt) || 0 },
+        estimatePending: Number(attn?.estimatePending) || 0,
+        noResponse:      Number(attn?.noResponse) || 0,
+        onHold:          Number(attn?.onHold) || 0,
+        revisit:         Number(attn?.revisit) || 0,
+        qcDone:          Number(attn?.qcDone) || 0,
+      },
+      trend,
       counts: {
         newTickets: Number(counts.newTickets) || 0,
         inProgress: Number(counts.inProgress) || 0,
@@ -679,11 +839,136 @@ router.get('/dashboard-summary', async (req, res, next) => {
         escalated:  Number(counts.escalated)  || 0,
       },
       statusBreakdown,
+      categoryBreakdown,
       recentEscalations,
       teamSize: teamIds.length, // for the "across N SPOCs" footer
     });
   } catch (e) { next(e); }
 });
+/*
+ * GET /api/client/invoices — the client's raised invoices + aging.
+ *
+ * Client-level (NOT team-scoped) — invoices live in tbl_client_invoice
+ * keyed by fk_client_id. Returns:
+ *   summary : billed / collected / outstanding totals + count
+ *   aging   : the OUTSTANDING amount split by days past the due date
+ *             (0–30 / 31–60 / 60+), for the "what's overdue" view
+ *   items   : the invoice list, newest first (blank numbers/dates in
+ *             legacy rows are normalised to null so the FE shows "—")
+ * Powers the /invoices page and the dashboard "invoice due" alert.
+ */
+router.get('/invoices', async (req, res, next) => {
+  try {
+    const clientId = req.spoc.client_id;
+    logger.info('Fetch client invoices · clientId=' + clientId);
+
+    const [[summary]] = await pool.query(
+      `SELECT COALESCE(SUM(total_invoice_amount),0)                                   AS billed,
+              COALESCE(SUM(total_paid_amount),0)                                       AS collected,
+              COALESCE(SUM(total_invoice_amount - COALESCE(total_paid_amount,0)),0)    AS outstanding,
+              COUNT(*)                                                                 AS count
+         FROM tbl_client_invoice
+        WHERE fk_client_id = ? AND is_raised = 1`,
+      [clientId]
+    );
+
+    const [[aging]] = await pool.query(
+      `SELECT COALESCE(SUM(CASE WHEN days <= 30           THEN due ELSE 0 END),0) AS a0_30,
+              COALESCE(SUM(CASE WHEN days BETWEEN 31 AND 60 THEN due ELSE 0 END),0) AS a31_60,
+              COALESCE(SUM(CASE WHEN days > 60            THEN due ELSE 0 END),0) AS a60plus,
+              COUNT(*)                                                            AS unpaid
+         FROM (SELECT (total_invoice_amount - COALESCE(total_paid_amount,0)) AS due,
+                      DATEDIFF(NOW(), amount_due_date)                        AS days
+                 FROM tbl_client_invoice
+                WHERE fk_client_id = ? AND is_raised = 1
+                  AND (total_invoice_amount - COALESCE(total_paid_amount,0)) > 0) t`,
+      [clientId]
+    );
+
+    const [rows] = await pool.query(
+      `SELECT id, invoice_number, invoice_date, amount_due_date,
+              total_invoice_amount, total_paid_amount,
+              (total_invoice_amount - COALESCE(total_paid_amount,0)) AS due_amount,
+              is_paid, file_path_pdf
+         FROM tbl_client_invoice
+        WHERE fk_client_id = ? AND is_raised = 1
+        ORDER BY (invoice_date IS NULL), invoice_date DESC, id DESC
+        LIMIT 300`,
+      [clientId]
+    );
+
+    const items = rows.map((r) => {
+      const total = Number(r.total_invoice_amount) || 0;
+      const paid  = Number(r.total_paid_amount) || 0;
+      const due   = Number(r.due_amount) || 0;
+      const status = (Number(r.is_paid) === 1 || due <= 0) ? 'paid' : (paid > 0 ? 'partial' : 'unpaid');
+      return {
+        id: r.id,
+        invoiceNumber: (String(r.invoice_number || '').trim()) || null,
+        invoiceDate: r.invoice_date,
+        dueDate: r.amount_due_date,
+        total, paid, due, status,
+        pdfPath: (r.file_path_pdf && String(r.file_path_pdf).trim()) ? r.file_path_pdf : null,
+      };
+    });
+
+    return modernOk(res, {
+      summary: {
+        billed:      Number(summary.billed) || 0,
+        collected:   Number(summary.collected) || 0,
+        outstanding: Number(summary.outstanding) || 0,
+        count:       Number(summary.count) || 0,
+      },
+      aging: {
+        a0_30:   Number(aging.a0_30) || 0,
+        a31_60:  Number(aging.a31_60) || 0,
+        a60plus: Number(aging.a60plus) || 0,
+        unpaid:  Number(aging.unpaid) || 0,
+      },
+      items,
+    });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/client/stores — the client's store / branch directory (active
+ * rows). Powers the store-code picker on the New Order form.
+ */
+router.get('/stores', async (req, res, next) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, store_code, store_name, contact_name, contact_no,
+              address, city_id, city_name, pin_code
+         FROM tbl_client_store
+        WHERE fk_client_id = ? AND status = 1
+        ORDER BY store_code`,
+      [req.spoc.client_id]
+    );
+    modernOk(res, { items: rows });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/client/stores/lookup?code=STR-142 — resolve one store by its
+ * code for the logged-in client. Returns { store: null } on no match so
+ * the New Order flow stays non-blocking.
+ */
+router.get('/stores/lookup', async (req, res, next) => {
+  try {
+    const code = String(req.query.code || '').trim();
+    if (!code) return modernOk(res, { store: null });
+    const [[row]] = await pool.query(
+      `SELECT id, store_code, store_name, contact_name, contact_no,
+              address, city_id, city_name, pin_code
+         FROM tbl_client_store
+        WHERE fk_client_id = ? AND status = 1 AND store_code = ?
+        LIMIT 1`,
+      [req.spoc.client_id, code]
+    );
+    modernOk(res, { store: row || null });
+  } catch (e) { next(e); }
+});
+
 // Per-service × city-tier TAT + SDA completion rates.
 //   TAT (Turn-Around Time): job age (24h days, ticket-created → completion/close)
 //        must be ≤ the pre-defined TAT for that category × tier. Denominator = all jobs.
