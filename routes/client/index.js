@@ -6,6 +6,7 @@ const requireSpocAuth = require('../../middleware/client-auth');
 const { pool } = require('../../db');
 const clientAuth = require('../../services/client-auth.service');
 const jobService = require('../../services/job.service');
+const holidayService = require('../../services/holiday.service');
 const { modernOk, modernError } = require('../../utils/response');
 const { sendXlsx } = require('../../utils/xlsx-export');
 const { STATUS_LABELS } = require('../../services/integration.service');
@@ -807,6 +808,31 @@ router.get('/dashboard-summary', async (req, res, next) => {
       color: CAT_COLORS[i % CAT_COLORS.length],
     }));
 
+    // Recent tickets — latest jobs (team-scoped) for the "Recent tickets"
+    // table, with real status codes the FE maps to pills.
+    const [recentRows] = await pool.query(
+      `SELECT j.job_id, j.client_ref_id, j.job_status, j.requested_date_time,
+              cu.customer_name, ci.city_name, ef.efr_name AS easyfixer_name
+         FROM tbl_job j
+         LEFT JOIN tbl_customer  cu ON cu.customer_id = j.fk_customer_id
+         LEFT JOIN tbl_address   ad ON ad.address_id  = j.fk_address_id
+         LEFT JOIN tbl_city      ci ON ci.city_id     = ad.city_id
+         LEFT JOIN tbl_easyfixer ef ON ef.efr_id      = j.fk_easyfixter_id
+        WHERE j.fk_client_id = ? AND j.reporting_contact_id IN (${teamPlaceholders})
+        ORDER BY j.job_id DESC
+        LIMIT 8`,
+      [req.spoc.client_id, ...teamIds]
+    );
+    const recentTickets = recentRows.map((r) => ({
+      jobId:    r.job_id,
+      ref:      r.client_ref_id,
+      customer: r.customer_name,
+      city:     r.city_name,
+      tech:     r.easyfixer_name,
+      status:   Number(r.job_status),
+      when:     r.requested_date_time,
+    }));
+
     return modernOk(res, {
       boxes: {
         newTickets:           Number(jobBoxes.newTickets)           || 0,
@@ -840,6 +866,7 @@ router.get('/dashboard-summary', async (req, res, next) => {
       },
       statusBreakdown,
       categoryBreakdown,
+      recentTickets,
       recentEscalations,
       teamSize: teamIds.length, // for the "across N SPOCs" footer
     });
@@ -966,6 +993,20 @@ router.get('/stores/lookup', async (req, res, next) => {
       [req.spoc.client_id, code]
     );
     modernOk(res, { store: row || null });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/client/holidays — upcoming holidays for the dashboard's
+ * holiday calendar. Uses the shared holiday.service (code-maintained
+ * Indian holiday list) — same source the admin holidays screen uses.
+ * `?days=` window, default 30, capped at 30 by the service.
+ */
+router.get('/holidays', async (req, res, next) => {
+  try {
+    const days = Number(req.query.days) > 0 ? Number(req.query.days) : 30;
+    const items = await holidayService.getUpcoming({ days });
+    modernOk(res, { items });
   } catch (e) { next(e); }
 });
 
