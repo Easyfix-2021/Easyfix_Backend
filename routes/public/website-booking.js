@@ -209,25 +209,32 @@ const FALLBACK_CLIENT_ID = 1; // RETAIL
  * is ignored — `photos` is the deliberate choice of a caller that knows about
  * the new field, so it cannot be the accidental one.
  *
- * ⚠ BODY-SIZE CEILING — THE HARD LIMIT IS server.js's GLOBAL 10 MB, AND IT
+ * ⚠ BODY-SIZE CEILING — THE HARD LIMIT IS server.js's GLOBAL 25 MB, AND IT
  * CANNOT BE OVERRIDDEN FROM HERE. This was TESTED, not assumed:
  *
- *   server.js:27 mounts `express.json({ limit: '10mb' })` at the APP level,
- *   before the /api/public mount at server.js:82. body-parser sets `req._body`
- *   once it has parsed, and every later express.json() instance short-circuits
- *   on that flag — so a router-level `express.json({ limit: '20mb' })` mounted
- *   here NEVER RUNS. Worse, the global parser reaches its limit first and
- *   throws `entity.too.large` (HTTP 413) before any handler in this file is
- *   reached. Reproduced with a 14 MB body against exactly this mount order:
- *   HTTP 413, type `entity.too.large`. A router-level override is therefore
- *   dead code that LOOKS load-bearing, and is deliberately NOT shipped.
+ *   server.js mounts `express.json({ limit: '25mb' })` at the APP level, before
+ *   the /api/public mount further down the same file. body-parser sets
+ *   `req._body` once it has parsed, and every later express.json() instance
+ *   short-circuits on that flag — so a router-level `express.json({...})`
+ *   mounted here NEVER RUNS. Worse, the global parser reaches its limit first
+ *   and throws `entity.too.large` (HTTP 413) before any handler in this file is
+ *   reached. Reproduced against exactly this mount order: the inner parser sees
+ *   `req._body` already true, and an over-limit body returns HTTP 413, type
+ *   `entity.too.large`, with the router-level middleware never invoked. A
+ *   router-level override is therefore dead code that LOOKS load-bearing, and
+ *   is deliberately NOT shipped.
  *
  *   The consequence is that MAX_TOTAL_PHOTO_BYTES must be small enough that a
- *   payload we would ACCEPT always fits in 10 MB of JSON — otherwise a valid
+ *   payload we would ACCEPT always fits in 25 MB of JSON — otherwise a valid
  *   booking dies at body-parser with an opaque 413 instead of our own message.
- *   See MAX_TOTAL_PHOTO_BYTES for the arithmetic. Raising it (or MAX_PHOTOS)
- *   past that budget requires raising the GLOBAL limit in server.js first,
- *   which is a whole-API decision and out of scope for this router.
+ *   See MAX_TOTAL_PHOTO_BYTES for the arithmetic. The global limit was raised
+ *   from 10 MB to 25 MB on 2026-08-07 SPECIFICALLY so this router could carry
+ *   the 12 MB combined photo budget the product wanted; that is a whole-API
+ *   decision (every route now buffers up to 25 MB) and the trade-off is
+ *   documented at the `express.json` line in server.js. Raising
+ *   MAX_TOTAL_PHOTO_BYTES or MAX_PHOTOS again means re-doing that arithmetic
+ *   and, if it no longer fits, raising the global limit again — do not raise
+ *   one without the other.
  */
 const MAX_PHOTO_BYTES = 5 * 1024 * 1024; // 5 MB DECODED, PER PHOTO
 
@@ -237,23 +244,27 @@ const MAX_PHOTOS = 5;
 /*
  * COMBINED decoded ceiling across all photos in one request.
  *
- * NOT 5 × MAX_PHOTO_BYTES (25 MB) and not the 12 MB originally specced —
- * both blow the global 10 MB JSON limit documented above, which we cannot
- * raise from this file. The budget works backwards from that limit:
+ * 12 MB — the value originally specced, restored on 2026-08-07 once the global
+ * JSON limit in server.js went from 10 MB to 25 MB. (It sat at 7 MB while the
+ * wire limit was 10 MB; that interim number is gone, do not reinstate it.)
  *
- *   10 MB body limit                              = 10,485,760 chars
- *   − slack for the non-photo fields (address 2000 + description 5000 +
- *     name/email/etc.), the JSON array syntax and the five ~24-char
- *     `data:image/jpeg;base64,` prefixes                 ≈    65,536
- *   = available for base64 photo characters        ≈ 10,420,224 chars
- *   × 3/4 (base64 emits 4 chars per 3 bytes)       ≈  7,815,168 bytes
+ * Still NOT 5 × MAX_PHOTO_BYTES (25 MB): that is the wire limit exactly, with
+ * zero room for the base64 expansion, so it could not fit by construction. The
+ * budget works backwards from the 25 MB limit:
  *
- * 7 MB decoded → 9,786,710 base64 chars, which leaves ~700 KB of headroom
- * inside the 10 MB limit even at the worst legal payload. So every request
- * this router ACCEPTS is guaranteed to survive body-parser, and the only
- * requests that hit a 413 are ones our own 400 would have rejected anyway.
+ *   12 MB decoded                                 = 12,582,912 bytes
+ *   × 4/3 (base64 emits 4 chars per 3 bytes)      = 16,777,216 chars
+ *   + the five ~24-char `data:image/jpeg;base64,` prefixes,
+ *     the JSON array syntax, and the non-photo fields
+ *     (address 2000 + description 5000 + name/email/…)  ≈    16,384
+ *   = worst-case legal body                       ≈ 16,793,600 chars
+ *   vs the 25 MB body limit                       = 26,214,400 chars
+ *
+ * ~9 MB of headroom at the worst legal payload. So every request this router
+ * ACCEPTS is guaranteed to survive body-parser, and the only requests that hit
+ * a 413 are ones our own 400 would have rejected anyway.
  */
-const MAX_TOTAL_PHOTO_BYTES = 7 * 1024 * 1024; // 7 MB DECODED, ALL PHOTOS
+const MAX_TOTAL_PHOTO_BYTES = 12 * 1024 * 1024; // 12 MB DECODED, ALL PHOTOS
 
 /*
  * The only three types accepted, both as the DECLARED data-URL MIME and as the
@@ -750,7 +761,7 @@ const bookingBody = Joi.object({
   /*
    * OPTIONAL array of customer photos — up to MAX_PHOTOS base64 DATA URL
    * STRINGS. See the MAX_PHOTO_BYTES / MAX_TOTAL_PHOTO_BYTES block above for
-   * the wire shape and the 10 MB body arithmetic.
+   * the wire shape and the 25 MB body arithmetic.
    *
    * Per item, `.max()` is declared BEFORE `.pattern()` so an oversized string
    * is cheap to reject. Both rules carry CUSTOM messages on purpose: Joi's

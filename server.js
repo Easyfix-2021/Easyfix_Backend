@@ -24,7 +24,67 @@ app.use(httpLog);
 
 app.use(cors);
 app.use(compression({ threshold: 1024 }));
-app.use(express.json({ limit: '10mb' }));
+/*
+ * ─── JSON BODY LIMIT: 25 MB, GLOBAL ──────────────────────────────────────────
+ *
+ * WHY 25 MB (2026-08-07, business-owner call). The only caller that needs it is
+ * the PUBLIC website-booking route (routes/public/website-booking.js), which
+ * accepts up to FIVE customer photos of the fault as base64 data URLs inline in
+ * the JSON body. Its combined DECODED ceiling is 12 MB; base64 emits 4 chars per
+ * 3 bytes, so a maximal legal booking is ≈16.8 M characters on the wire, plus
+ * the address / description / data-URL-prefix slack. 25 MB clears that with
+ * ~8 MB of headroom, so a booking we would ACCEPT can never die at body-parser
+ * with an opaque 413 instead of our own field-level 400.
+ *
+ * ⚠ BLAST RADIUS — THIS IS NOT SCOPED TO THAT ROUTE. It is the app-level parser,
+ * so it applies to EVERY route on this backend: /api/admin, /api/client,
+ * /api/mobile, /api/integration, /api/webhook, /api/public, /api/internal. Any
+ * endpoint will now buffer up to 25 MB of request body IN MEMORY before its
+ * handler — or even its Joi validator — sees a single field. Nothing about the
+ * per-route validators changed; the exposure is the buffering itself.
+ *
+ * What actually bounds the abuse is the rate limiting, not this number:
+ *   · /api/integration — 1200/min per Basic-Auth identity (mounted below)
+ *   · /api/mobile      — 600/min per IP
+ *   · /api/client      — 600/min per IP
+ *   · /api/public/website-booking — its OWN 8-per-10-min per-IP submit limiter
+ *     (routes/public/website-booking.js), which is the real cap on how much
+ *     photo payload one IP can push at us.
+ *   · /api/admin       — DELIBERATELY UNCAPPED (see the Phase 14 note below):
+ *     capping it would self-DoS a staff data-entry spree. Admin is authenticated
+ *     staff, so the 25 MB ceiling there is a trusted-caller footgun, not an
+ *     anonymous-attacker surface.
+ *
+ * ALTERNATIVE CONSIDERED AND NOT TAKEN — a PATH-SCOPED parser:
+ *
+ *     app.use('/api/public/website-booking', express.json({ limit: '25mb' }));
+ *     app.use(express.json({ limit: '10mb' }));            // global stays small
+ *
+ * mounted in THAT order (scoped one FIRST). That would confine the larger limit
+ * to the single route that needs it and leave every other endpoint at 10 MB. It
+ * was rejected only to keep one obvious, greppable number rather than two
+ * order-dependent ones — if the exposure above ever becomes a concern, this is
+ * the change to make, and the ORDER is the whole trick.
+ *
+ * What does NOT work, and was MEASURED rather than assumed: mounting a
+ * router-level `express.json({ limit: '25mb' })` inside routes/public/* AFTER
+ * this global parser. body-parser sets `req._body = true` once it has parsed,
+ * and every later express.json() instance short-circuits on that flag, so the
+ * inner parser never runs; and a body over the GLOBAL limit is rejected by this
+ * line with `entity.too.large` (HTTP 413) before the router is reached at all.
+ * Reproduced against this exact mount order: inner parser observed `req._body`
+ * already true on a small body, and a body over the global limit returned 413
+ * `entity.too.large` with the router-level middleware never invoked. A
+ * router-level override is therefore dead code that LOOKS load-bearing.
+ *
+ * urlencoded is DELIBERATELY LEFT AT 10 MB. Nothing posts photos (or anything
+ * else multi-MB) as form-encoded — website-booking is JSON-only, and file
+ * uploads elsewhere go through multer/multipart, which this parser never sees.
+ * Raising it would widen the buffered-body surface for zero benefit, and
+ * urlencoded is the more expensive parse per byte (qs key explosion). The two
+ * limits differing is intentional, not an oversight.
+ */
+app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(cookieParser());
 
