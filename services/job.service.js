@@ -1331,6 +1331,7 @@ async function list({
   pin,                       // text — LIKE on tbl_address.pin_code
   stateId,                   // FK   — tbl_city.state_id
   categoryId,                // FK   — j.fk_service_catg_id
+  sourceType,                // text — exact match on j.source_type (booking channel)
   verticalId,                // FK   — via EXISTS on tbl_vertical_mapping
   projectManagerId,          // FK   — tbl_vertical_mapping.user_id where user_type = 1
   zonalManagerId,            // FK   — tbl_city.state_user (the city's zonal owner)
@@ -1554,6 +1555,17 @@ async function list({
     }
   }
   if (categoryId != null)  { clauses.push('j.fk_service_catg_id = ?'); params.push(categoryId); }
+  /*
+   * sourceType — booking-channel filter (see the listQuery validator). Exact
+   * `=` rather than LIKE: the stored values are a small closed set of labels,
+   * so equality is both precise and index-friendly, and MySQL's default
+   * case-insensitive collation already makes 'website' match any casing.
+   *
+   * References only the `j` alias, so the COUNT-join detection below is
+   * unaffected — no extra join is needed for the COUNT query to stay
+   * WHERE-consistent with the data query.
+   */
+  if (sourceType) { clauses.push('j.source_type = ?'); params.push(sourceType); }
   if (stateId != null)     { clauses.push('ci.state_id = ?');        params.push(stateId); }
   // Vertical filter — tbl_vertical_mapping is many-to-many across
   // (client_id, vertical_id, [user_id]). EXISTS is cheaper than a

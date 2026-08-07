@@ -91,8 +91,6 @@ function normaliseInbound(body) {
   else if (lat != null && lng != null) type = 'location';
   else if (rawType === 'image' || (mediaObj && /image/i.test(mediaObj.mime || mediaObj.contentType || ''))) type = 'image';
   else if (rawType === 'video' || (mediaObj && /video/i.test(mediaObj.mime || mediaObj.contentType || ''))) type = 'video';
-  else if (rawType === 'image') type = 'image';
-  else if (rawType === 'video') type = 'video';
   else if (text) type = 'text';
 
   if (!from) return null;

@@ -73,5 +73,25 @@ router.use('/plivo', require('./plivo-answer'));
  * Full path: /api/public/app-version?platform=android
  */
 router.use('/app-version', require('./app-version'));
+/*
+ * Marketing-site QR booking (2026-08-07). UNAUTHENTICATED BY DESIGN and the
+ * only sub-router here that both WRITES and verifies no token — a customer
+ * scanning a QR on product packaging has no prior identity to mint one
+ * against, and the `?code=` on the link is a CLIENT reference printed on
+ * retail packaging, never a credential. Self-limits instead: per-IP rate
+ * limits (generous on the /context and /serviceability reads, strict on the
+ * write, which also caps both the Google Geocoding spend an unknown pincode
+ * can trigger and the customer photos one IP can push into S3) plus a honeypot
+ * field that returns a success-shaped 200 and creates nothing. Least
+ * privilege: it can ONLY ever produce status-9 (Unconfirmed) jobs — no
+ * updates, no status transitions, no way to address an existing job; the two
+ * GETs are advisory catalogue reads exposing no job/customer/client id — so a
+ * status-9 row stays inert until a human confirms it in the CRM. NEVER fails
+ * on client resolution (2026-08-07): an absent/unknown `code` falls back to
+ * client 1 (RETAIL) and ops re-maps from the CRM — there is no env override,
+ * the rule is just "client 1 unless the reference code matches". See
+ * routes/public/website-booking.js.
+ */
+router.use('/website-booking', require('./website-booking'));
 
 module.exports = router;
