@@ -2591,6 +2591,46 @@ async function recomputeClientServicesCsv(conn, jobId) {
 // favour of a single column on tbl_address).
 const insertAddress = addressService.insertCustomerAddress;
 
+/*
+ * Normalise the booking-time image field(s) on a create() payload into an
+ * ordered, de-duplicated list of filenames (or full S3 keys).
+ *
+ * TWO ACCEPTED SHAPES, both optional — a caller may send either, both, or
+ * neither:
+ *   · `job_image_filename`  — STRING. The original, pre-2026-08 field. A
+ *                             caller sending only this behaves EXACTLY as it
+ *                             always has: one entry out, one row written.
+ *   · `job_image_filenames` — ARRAY of strings. Added 2026-08-07 for callers
+ *                             that collect several photos in one submission
+ *                             (public website booking takes up to 5). Every
+ *                             entry becomes a `tbl_job_image` row inside the
+ *                             job's OWN transaction.
+ *
+ * The two are UNIONed (singular first, then the array in submission order)
+ * rather than one overriding the other, so a caller that populates both can't
+ * silently lose an image. Blank / non-string / whitespace-only entries are
+ * dropped and exact duplicates collapse, which keeps `null`, `undefined`,
+ * `''`, `[]` and `['']` all as the historical no-op.
+ *
+ * No cap here on purpose — the ceiling is a per-surface product decision and
+ * lives in the validators (createBody caps the array at 5, matching the
+ * website-booking photo limit). Silently truncating in the service would drop
+ * objects already written to storage with nothing pointing at them.
+ */
+function normaliseJobImageFilenames(input) {
+  const raw = [];
+  if (input.job_image_filename != null) raw.push(input.job_image_filename);
+  if (Array.isArray(input.job_image_filenames)) raw.push(...input.job_image_filenames);
+  const out = [];
+  for (const entry of raw) {
+    if (entry == null) continue;
+    const name = String(entry).trim();
+    if (!name) continue;
+    if (!out.includes(name)) out.push(name);
+  }
+  return out;
+}
+
 // ─── Create ─────────────────────────────────────────────────────────
 async function create(input, actor) {
   logger.info('Create job · clientId=' + (input.fk_client_id ?? '-') + ' · jobType=' + (input.job_type || 'Installation') + ' · initialStatus=' + (input.initial_status ?? 0) + ' · source=' + (input.source_type || 'manual') + ' · services=' + (Array.isArray(input.services) ? input.services.length : 0));
@@ -3002,24 +3042,40 @@ async function create(input, actor) {
     }
 
     /*
-     * Optional booking-time image (LEGACY path).
+     * Optional booking-time image(s).
      *
-     * 2026-05-14 update: the canonical job-image upload moved to the
+     * 2026-05-14: the canonical CRM job-image upload moved to the
      * dedicated endpoint `POST /admin/jobs/:id/images` which writes
-     * to S3 at Job_Images/<jobId>_<seq>. The frontend uses that
+     * to S3 at Job_Images/<jobId>_<seq>. The CRM frontend uses that
      * endpoint as a SECOND step after this create() commits.
      *
-     * This inline branch stays in place ONLY for any caller still
-     * sending the legacy `job_image_filename` field (e.g. shell
-     * scripts, integration tests). The dedicated endpoint is the
-     * supported path going forward; new code should not set this
-     * field on the create payload.
+     * 2026-08-07: this branch now takes N images, not one. It accepts
+     * BOTH the original scalar `job_image_filename` and the new array
+     * `job_image_filenames` (see normaliseJobImageFilenames above for
+     * the exact union/dedupe rules). The reason is atomicity: the
+     * public website booking accepts up to five photos, and inserting
+     * 2..N *after* create() returned meant a failure between COMMIT and
+     * those inserts left objects in S3 with no row pointing at them.
+     * Every row now lands inside the job's own transaction, so the
+     * booking and its photos survive or roll back together.
+     *
+     * ONE round trip regardless of N — a multi-row VALUES list rather
+     * than a loop of queries. The per-row column set and bound values
+     * are UNCHANGED from the single-image version (job_id, image,
+     * image_category='booking', job_stage=0, created_date=NOW()), so a
+     * caller sending only the scalar emits byte-identical SQL to
+     * before. `status` stays out of the column list deliberately:
+     * tbl_job_image.status is `int NULL DEFAULT 1`, and every existing
+     * image_category='booking' row carries status 1, so omitting it
+     * yields the same data. (routes/integration/v1/index.js names the
+     * column explicitly; that is the odd one out, not this.)
      */
-    if (input.job_image_filename && String(input.job_image_filename).trim()) {
+    const jobImageFilenames = normaliseJobImageFilenames(input);
+    if (jobImageFilenames.length > 0) {
       await conn.query(
         `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, created_date)
-         VALUES (?, ?, ?, ?, NOW())`,
-        [jobId, String(input.job_image_filename).trim(), 'booking', 0]
+         VALUES ${jobImageFilenames.map(() => '(?, ?, ?, ?, NOW())').join(', ')}`,
+        jobImageFilenames.flatMap((name) => [jobId, name, 'booking', 0])
       );
     }
 

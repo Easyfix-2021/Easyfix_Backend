@@ -565,7 +565,7 @@ function decodePhotos(rawList) {
 
 /*
  * Persist the decoded photo and return the value to store on
- * tbl_job_image.image (via jobService.create's `job_image_filename`).
+ * tbl_job_image.image (via jobService.create's `job_image_filenames`).
  *
  * NON-FATAL BY CONTRACT: returns null on ANY storage failure after logging a
  * warn. A customer must never lose a booking because an image write failed —
@@ -630,50 +630,6 @@ async function storePhotos(photos) {
     if (name) filenames.push(name);
   }
   return filenames;
-}
-
-/*
- * Attach photos 2..N to an already-created job.
- *
- * WHY THIS EXISTS: jobService.create() persists exactly ONE image — its
- * `job_image_filename` branch is a single INSERT (services/job.service.js). So
- * the first stored photo rides through create() inside the job's own
- * transaction, and any remainder is inserted here, immediately after.
- *
- * The column set and values MIRROR THAT BRANCH VERBATIM:
- *   INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, created_date)
- *   VALUES (?, ?, 'booking', 0, NOW())
- * so photo 1 and photos 2..N are indistinguishable in the table. `status` is
- * intentionally NOT in the list even though routes/integration/v1/index.js
- * names it explicitly: tbl_job_image.status is `int NULL DEFAULT 1`, so
- * omitting it yields status = 1 anyway — which is exactly what every existing
- * `image_category = 'booking'` row in prod carries (verified 2026-08-07:
- * 30/30 rows are job_stage 0, status 1). Adding it here would make these rows
- * differ from the create() row in SQL while being identical in data. No new
- * columns are invented.
- *
- * NON-FATAL: the job is already committed. A failed attach logs a warn and the
- * booking stands — same contract as storePhoto. Never throw from here.
- */
-async function attachExtraPhotos(jobId, filenames) {
-  let attached = 0;
-  for (const filename of filenames) {
-    try {
-      // eslint-disable-next-line no-await-in-loop -- one row per photo, max 4.
-      await pool.query(
-        `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, created_date)
-         VALUES (?, ?, ?, ?, NOW())`,
-        [jobId, filename, 'booking', 0],
-      );
-      attached += 1;
-    } catch (e) {
-      logger.warn(
-        { err: e && e.message, jobId },
-        'Website booking extra photo row failed — booking kept, image dropped',
-      );
-    }
-  }
-  return attached;
 }
 
 /*
@@ -1169,15 +1125,20 @@ router.post('/', submitRateLimit, validate(bookingBody), async (req, res, next) 
         requested_time: requestedTime,
         time_slot: b.timeSlot,
         /*
-         * FIRST booking-time photo only. create() INSERTs this verbatim into
-         * tbl_job_image (image_category 'booking', job_stage 0) inside the same
-         * transaction as the job — see the `job_image_filename` branch in
-         * services/job.service.js, which handles exactly ONE image. Photos
-         * 2..N are inserted by attachExtraPhotos() after the commit, with the
-         * identical column set. null/undefined ⇒ that branch is skipped
-         * entirely, which is exactly the no-photo and all-storage-failed case.
+         * EVERY stored booking photo, in submission order. create() INSERTs
+         * them verbatim into tbl_job_image (image_category 'booking',
+         * job_stage 0) as one multi-row statement INSIDE the job's own
+         * transaction — see the `job_image_filenames` branch in
+         * services/job.service.js. Nothing is attached after the commit any
+         * more: an image row that fails now rolls the booking back with it,
+         * instead of leaving objects in S3 that no row points at.
+         *
+         * undefined ⇒ the branch is skipped entirely, which is exactly the
+         * no-photo and the all-storage-failed case (storePhotos() returns []
+         * when every write failed — non-fatal by contract, so the booking
+         * still lands, just without images).
          */
-        job_image_filename: photoFilenames[0] || undefined,
+        job_image_filenames: photoFilenames.length ? photoFilenames : undefined,
         /*
          * Composed remarks — currently only the customer's preferred window.
          * undefined when they didn't pick one, which leaves tbl_job.remarks
@@ -1224,15 +1185,6 @@ router.post('/', submitRateLimit, validate(bookingBody), async (req, res, next) 
       { user_id: null },
     );
 
-    /*
-     * 9. Attach photos 2..N. AFTER the commit and deliberately not awaited into
-     *    the job's transaction: the booking is already safe, and an image row
-     *    failing here must not roll it back. Non-fatal by contract.
-     */
-    const extraAttached = photoFilenames.length > 1
-      ? await attachExtraPhotos(created.job_id, photoFilenames.slice(1))
-      : 0;
-
     logger.info(
       'Website booking created · jobId=' + created.job_id
       + ' · ref=' + (created.job_reference_id || '-')
@@ -1243,7 +1195,7 @@ router.post('/', submitRateLimit, validate(bookingBody), async (req, res, next) 
       + ' · preferredWindow=' + (preferredWindow || '-')
       + ' · gps=' + (gps ? 'yes' : (b.gps ? 'dropped' : 'none'))
       + ' · photos=' + photos.length + ' sent/'
-        + (photoFilenames.length ? 1 + extraAttached : 0) + ' attached'
+        + photoFilenames.length + ' attached'
       + ' · mobile=' + maskMobile(b.mobile),
     );
 

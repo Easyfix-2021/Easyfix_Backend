@@ -286,6 +286,15 @@ const createBody = Joi.object({
   // (no slashes / nulls) by file-storage on the upload step, so by the
   // time it reaches here it's safe to round-trip.
   job_image_filename: Joi.string().max(255).allow('', null).optional(),
+  // job_image_filenames (2026-08-07) — plural sibling of the field above,
+  // for callers that collect several booking photos in one submission.
+  // Each item mirrors the singular rule EXACTLY (string, max 255, ''/null
+  // tolerated so a form that pads empty slots isn't 400'd); job.service's
+  // normaliseJobImageFilenames() drops the blanks and de-duplicates against
+  // the singular field. Capped at 5 to match the public website-booking
+  // photo limit (routes/public/website-booking.js MAX_PHOTOS) — the only
+  // surface that sends more than one today.
+  job_image_filenames: Joi.array().items(Joi.string().max(255).allow('', null)).max(5).optional(),
   customer: customerBlock,
   address: addressBlock,
   services: Joi.array().items(serviceItem).optional(),

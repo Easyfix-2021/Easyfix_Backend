@@ -69,14 +69,25 @@ const KNOWN_PINCODES = {
   110001: { pincode_id: 10, city_id: 12, city_name: 'New Delhi', is_active: false },
 };
 
+/* The job_id the stubbed create() (and the fake tbl_job INSERT) hands back. */
+const NEW_JOB_ID = 918273;
+
 const fake = installFakePool([
   // findClientByCode — the ONE parameterised query this router runs itself.
   [/FROM\s+tbl_client/i, (_sql, params) => {
     const row = CLIENTS[String(params && params[0])];
     return row ? [row] : [];
   }],
-  // attachExtraPhotos' per-photo INSERT. Nothing reads the result; it exists so
-  // the statement is CAPTURED (see the photos-2..N assertions).
+  /*
+   * The rest of these exist ONLY for the one test that runs the REAL
+   * jobService.create (the in-transaction ordering proof at the end of §2).
+   * Every route test stubs create() out entirely, so nothing else reaches them.
+   * `\b` after tbl_job excludes tbl_job_services / tbl_job_image.
+   */
+  [/INSERT INTO tbl_job\b/i, () => ({ insertId: NEW_JOB_ID })],
+  [/SELECT customer_id FROM tbl_customer WHERE customer_id/i, [{ customer_id: 7 }]],
+  // The booking-image write itself. Nothing reads the result; it exists so the
+  // statement is CAPTURED, in order, alongside BEGIN/COMMIT.
   [/INSERT INTO tbl_job_image/i, () => ({ affectedRows: 1 })],
 ]);
 
@@ -89,6 +100,13 @@ const s3Storage = require('../utils/s3-storage');
 const fileStorage = require('../utils/file-storage');
 const { BAND_MORNING, BAND_AFTERNOON, BAND_EVENING } = require('../services/time-slot');
 const bookingRouter = require('../routes/public/website-booking');
+
+/*
+ * The REAL create(), captured before before() replaces it with the capture
+ * stub. The in-transaction ordering test calls this directly — it is the only
+ * place in this file where job.service's own SQL runs.
+ */
+const realJobCreate = jobService.create;
 
 // ─── Stub bookkeeping ────────────────────────────────────────────────
 /*
@@ -124,7 +142,7 @@ before(async () => {
   // ── the write. Records and returns; nothing reaches a database. ──
   stub(jobService, 'create', async (payload, actor) => {
     created = { payload, actor };
-    return { job_id: 918273, job_reference_id: 'EF-TEST-918273' };
+    return { job_id: NEW_JOB_ID, job_reference_id: 'EF-TEST-918273' };
   });
 
   // ── pincode ──
@@ -329,7 +347,10 @@ for (const declared of IMAGE_TYPES) {
     const res = await post(booking({ photos: [photoDataUrl(declared)] }));
     assert.equal(res.status, 200, `${declared} must be accepted`);
     assert.ok(created, 'a matching photo must not block the booking');
-    assert.ok(created.payload.job_image_filename, 'the photo rides along on create()');
+    assert.deepEqual(
+      created.payload.job_image_filenames.length, 1,
+      'the photo rides along on create(), as the plural field',
+    );
   });
 
   for (const actual of IMAGE_TYPES.filter((t) => t !== declared)) {
@@ -393,7 +414,8 @@ test('a BARE base64 string with no data: prefix is refused', async () => {
 test('the LEGACY singular `photo` still works, and `photos` wins when both are sent', async () => {
   const legacy = await post(booking({ photo: photoDataUrl('image/png') }));
   assert.equal(legacy.status, 200);
-  assert.ok(created.payload.job_image_filename, 'the legacy field must still attach an image');
+  assert.equal(created.payload.job_image_filenames.length, 1,
+    'the legacy field must still attach an image');
 
   // Both present: `photos` is the deliberate choice of a caller that knows about
   // the new field, so a BROKEN `photo` alongside a VALID `photos` must succeed.
@@ -404,19 +426,162 @@ test('the LEGACY singular `photo` still works, and `photos` wins when both are s
   assert.equal(both.status, 200);
 });
 
-test('photos 2..N are inserted into tbl_job_image AFTER the commit, not by create()', async () => {
+test('EVERY photo rides through create() — the router writes no image row itself', async () => {
   const res = await post(booking({
     photos: [photoDataUrl('image/jpeg'), photoDataUrl('image/png'), photoDataUrl('image/webp')],
   }));
   assert.equal(res.status, 200);
-  // create() carries exactly ONE image…
-  assert.equal(typeof created.payload.job_image_filename, 'string');
-  // …and the other two arrive as their own INSERTs, keyed to the created job.
+  // All three go to create() together, in submission order…
+  assert.equal(created.payload.job_image_filenames.length, 3);
+  assert.ok(created.payload.job_image_filenames.every((f) => typeof f === 'string' && f.length > 0));
+  // …on the PLURAL field only, so photo 1 can never be inserted twice.
+  assert.equal(created.payload.job_image_filename, undefined);
+  // …and the router issues ZERO tbl_job_image statements of its own. The
+  // post-commit attachExtraPhotos() helper is gone; if it ever comes back,
+  // this is the assertion that fails.
   const inserts = fake.calls.filter((c) => /INSERT INTO tbl_job_image/i.test(c.sql));
-  assert.equal(inserts.length, 2);
-  assert.ok(inserts.every((c) => c.params[0] === 918273), 'bound to the job create() returned');
-  assert.ok(inserts.every((c) => c.params[2] === 'booking' && c.params[3] === 0),
-    'image_category/job_stage must match create()\'s own branch exactly');
+  assert.equal(inserts.length, 0, 'no image row may be written outside create()\'s transaction');
+  assert.match(logLines.join('\n'), /photos=3 sent\/3 attached/);
+});
+
+test('create() writes EVERY image row INSIDE the transaction, before COMMIT', async () => {
+  /*
+   * THE REGRESSION THIS PINS. Until 2026-08-07 the router attached photos
+   * 2..N with its own pool.query AFTER create() had already committed. A
+   * failure in that window left objects in S3 with no tbl_job_image row
+   * pointing at them, and the customer's photos silently vanished while the
+   * booking stood. Ordering — not merely "the rows exist" — is the contract.
+   *
+   * This is the ONE test in the file that runs the REAL jobService.create
+   * (captured as realJobCreate before before() stubbed it out), over the same
+   * fake pool. The fake connection's beginTransaction/commit are no-ops that
+   * record nothing, so we wrap them to push BEGIN / COMMIT markers into the
+   * same captured-call list as the queries — and make commit THROW, which
+   * stops the run right there. Everything after COMMIT in create() is
+   * post-commit bookkeeping (getById + the fire-and-forget auto-assign) that
+   * this test has no interest in and must not let leak into later tests.
+   *
+   * The input is the minimal shape job-service-create.test.js established:
+   * a pre-existing customer_id + address_id + job_client_owner +
+   * branch_details, so the sub-inserts / SPOC lookup / branch-mandatory check
+   * are all skipped and the image INSERT is easy to isolate.
+   */
+  const db = require('../db');
+  const realGetConnection = db.pool.getConnection;
+  db.pool.getConnection = async () => {
+    const conn = await realGetConnection();
+    return {
+      ...conn,
+      beginTransaction: async () => { fake.calls.push({ sql: 'BEGIN', params: [] }); },
+      commit: async () => {
+        fake.calls.push({ sql: 'COMMIT', params: [] });
+        throw new Error('__STOP_AT_COMMIT__');
+      },
+    };
+  };
+  try {
+    await assert.rejects(
+      () => realJobCreate(
+        {
+          fk_client_id: 42,
+          customer: { customer_id: 7 },
+          address: { address_id: 55 },
+          job_client_owner: 9,     // skips the Primary-SPOC lookup
+          branch_details: 'B1',    // skips the branch-mandatory client lookup
+          job_image_filenames: ['wb-1.jpg', 'wb-2.png', 'wb-3.webp'],
+        },
+        { user_id: null },
+      ),
+      /__STOP_AT_COMMIT__/,
+    );
+  } finally {
+    db.pool.getConnection = realGetConnection;
+  }
+
+  const sqls = fake.calls.map((c) => c.sql);
+  const begin = sqls.indexOf('BEGIN');
+  const commit = sqls.indexOf('COMMIT');
+  assert.ok(begin >= 0, 'create() must open a transaction');
+  assert.ok(commit > begin, 'create() must reach its commit');
+
+  const imageStmts = fake.calls
+    .map((c, i) => ({ ...c, i }))
+    .filter((c) => /INSERT INTO tbl_job_image/i.test(c.sql));
+  assert.equal(imageStmts.length, 1, 'all three rows go out as ONE multi-row INSERT');
+
+  const stmt = imageStmts[0];
+  assert.ok(stmt.i > begin && stmt.i < commit,
+    'the image INSERT must sit BETWEEN begin and commit — never after it');
+  assert.equal((stmt.sql.match(/\(\?, \?, \?, \?, NOW\(\)\)/g) || []).length, 3,
+    'one VALUES group per photo, each still stamping created_date with NOW()');
+  assert.deepEqual(stmt.params, [
+    NEW_JOB_ID, 'wb-1.jpg', 'booking', 0,
+    NEW_JOB_ID, 'wb-2.png', 'booking', 0,
+    NEW_JOB_ID, 'wb-3.webp', 'booking', 0,
+  ], 'every row carries the SAME column values the single-image branch always did');
+  assert.ok(
+    !fake.calls.slice(commit + 1).some((c) => /INSERT INTO tbl_job_image/i.test(c.sql)),
+    'nothing may write an image row once the transaction has closed',
+  );
+});
+
+test('create() still honours the LEGACY scalar job_image_filename, unchanged', async () => {
+  /*
+   * Backward compatibility, pinned. /api/admin/jobs, /api/client/jobs,
+   * /api/integration/v1/jobs and both bulk-upload paths still send the
+   * singular string; it must emit exactly the statement it always did —
+   * one VALUES group, four bound params — and a null/absent value must
+   * still be a complete no-op.
+   */
+  const db = require('../db');
+  const realGetConnection = db.pool.getConnection;
+  db.pool.getConnection = async () => {
+    const conn = await realGetConnection();
+    return { ...conn, commit: async () => { throw new Error('__STOP_AT_COMMIT__'); } };
+  };
+  const runCreate = (imageFields) => assert.rejects(
+    () => realJobCreate(
+      {
+        fk_client_id: 42,
+        customer: { customer_id: 7 },
+        address: { address_id: 55 },
+        job_client_owner: 9,
+        branch_details: 'B1',
+        ...imageFields,
+      },
+      { user_id: null },
+    ),
+    /__STOP_AT_COMMIT__/,
+  );
+  const imageStmts = () => fake.calls.filter((c) => /INSERT INTO tbl_job_image/i.test(c.sql));
+
+  try {
+    await runCreate({ job_image_filename: '  legacy-one.jpg  ' });
+    assert.equal(imageStmts().length, 1);
+    assert.deepEqual(imageStmts()[0].params, [NEW_JOB_ID, 'legacy-one.jpg', 'booking', 0],
+      'still trimmed, still four params, still the same column values');
+    assert.match(imageStmts()[0].sql, /VALUES \(\?, \?, \?, \?, NOW\(\)\)$/);
+
+    for (const noop of [{}, { job_image_filename: null }, { job_image_filename: '' },
+      { job_image_filenames: [] }, { job_image_filenames: ['', null] }]) {
+      fake.calls.length = 0;
+      // eslint-disable-next-line no-await-in-loop -- each run needs a clean call log.
+      await runCreate(noop);
+      assert.equal(imageStmts().length, 0,
+        `${JSON.stringify(noop)} must write no image row at all`);
+    }
+
+    // Both shapes together: unioned, de-duplicated, singular first.
+    fake.calls.length = 0;
+    await runCreate({ job_image_filename: 'a.jpg', job_image_filenames: ['a.jpg', 'b.png'] });
+    assert.equal(imageStmts().length, 1);
+    assert.deepEqual(imageStmts()[0].params, [
+      NEW_JOB_ID, 'a.jpg', 'booking', 0,
+      NEW_JOB_ID, 'b.png', 'booking', 0,
+    ], 'the duplicate collapses instead of inserting the same image twice');
+  } finally {
+    db.pool.getConnection = realGetConnection;
+  }
 });
 
 // ═══ 3. PHOTO LIMITS ═════════════════════════════════════════════════
