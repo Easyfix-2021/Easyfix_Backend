@@ -1835,10 +1835,12 @@ router.get('/lookup/cities', async (req, res, next) => {
   try {
     const scope = String(req.query.scope || '').toLowerCase();
     if (scope === 'all') {
+      // Every city in tbl_city (no status filter) — the client wants the
+      // full master list available in the New Order form. Columns are still
+      // aliased to { id, name } for the FE dropdown contract.
       const [rows] = await pool.query(
         `SELECT city_id AS id, city_name AS name
            FROM tbl_city
-          WHERE city_status = 1
           ORDER BY city_name ASC`
       );
       return modernOk(res, { items: rows });
