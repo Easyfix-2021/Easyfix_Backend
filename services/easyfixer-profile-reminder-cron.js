@@ -9,7 +9,7 @@ const profileUpdateLink = require('./easyfixer-profile-update-link.service');
  * Runs once per day at 10:00 IST (see server/scheduler.js). For every
  * ACTIVE easyfixer whose profile is incomplete, sends a Gallabox
  * WhatsApp message using the pre-approved template
- * `skill_otp_tx1`. The template is a generic nudge — no
+ * `skill_otp_tx1_newvideo`. The template is a generic nudge — no
  * dynamic body values required from our side.
  *
  * "Incomplete profile" definition (verified against tbl_easyfixer

@@ -51,7 +51,15 @@ const s3Storage        = require('../utils/s3-storage');
  * {{profile_link}} to match `bodyValues` below. A key that doesn't match a
  * template variable EXACTLY (casing included) silently arrives empty.
  */
-const PROFILE_TEMPLATE_NAME = 'skill_otp_tx1';
+/*
+ * 2026-08-03: 'skill_otp_tx1' → 'skill_otp_tx1_newvideo' (ops request).
+ *
+ * ⚠ THIS MOVES THREE SENDERS, NOT ONE. Both reminder crons import this constant
+ * (easyfixer-profile-reminder-cron, easyfixer-skill-pincode-reminder-cron) —
+ * that single ownership is deliberate, see above. If ops wanted ONLY the
+ * profile-update form on the new template, the crons need their own constant.
+ */
+const PROFILE_TEMPLATE_NAME = 'skill_otp_tx1_newvideo';
 const logger          = require('../logger');
 const { getProperty } = require('./properties.service');
 
@@ -934,7 +942,7 @@ async function sendForEasyfixer(efrId, { action = 'first', override_mobile, bypa
       recipientName: fullName,
       templateName: PROFILE_TEMPLATE_NAME,
       bypassTestRedirect,
-      // Gallabox `skill_otp_tx1` uses NAMED body variables
+      // Gallabox `skill_otp_tx1_newvideo` uses NAMED body variables
       // ({{name}}, {{id}}, {{profile_link}}) — positional keys (1/2/3) don't
       // bind and arrive EMPTY, and so do names that don't match the template
       // exactly. The predecessor (tx_complete_profile) used {{Name}}/{{efr_id}};

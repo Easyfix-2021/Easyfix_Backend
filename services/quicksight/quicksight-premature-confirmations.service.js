@@ -109,7 +109,26 @@ async function getPrematureConfirmations(filters = {}) {
       j.time_slot,
       cl.client_name,
       ci.city_name,
-      cu.customer_name,
+      /*
+       * Every row of this report IS a job, and the "Customer" column identifies
+       * the customer ON THAT JOB — so it reads the booked name
+       * (tbl_job.job_customer_name) with the customer-master name as fallback,
+       * exactly like the jobs list and the job modal. Reviewers cross-check
+       * these rows against the job screen; two different names for one job id
+       * would make the report untrustworthy.
+       *
+       * NULLIF(TRIM(...), '') is required, not cosmetic: MySQL's COALESCE skips
+       * NULL only, so a plain COALESCE(j.job_customer_name, cu.customer_name)
+       * renders BLANK for any job whose booked name is an empty string — and ''
+       * is an accepted value on both the create and update validators. Shared
+       * definition: services/job.service.js JOB_CUSTOMER_NAME_EXPR (not imported
+       * here — the QuickSight services deliberately keep their SQL literal and
+       * self-contained).
+       *
+       * Alias stays customer_name: the FE table, the customer_name XLSX column
+       * below, and the owner-filter shaping all read that key.
+       */
+      COALESCE(NULLIF(TRIM(j.job_customer_name), ''), cu.customer_name) AS customer_name,
       cu.customer_mob_no,
       j.fk_created_by                          AS moved_by_id,
       cr.user_name                             AS moved_by,

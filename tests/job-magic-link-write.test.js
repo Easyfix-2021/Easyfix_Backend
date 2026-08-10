@@ -151,6 +151,75 @@ function withAutoReschedule(value, fn) {
   return (async () => { try { return await fn(); } finally { properties.getProperty = original; } })();
 }
 
+/*
+ * ─── tbl_job.time_slot IS ALWAYS A BAND ──────────────────────────────
+ *
+ * Both customer-submit writers run their slot through the shared writer-side
+ * gate (services/time-slot.js resolveTimeSlot), so a 1-hour frame label can no
+ * longer land in the column no matter which surface the customer used:
+ *   - acceptSubmission            ← the public magic-link FORM
+ *   - writeCustomerOrderDetails   ← the conversational WhatsApp flow
+ * The 1-hour choice is not lost: it is the appointment's time-of-day, carried
+ * by requested_date_time + requested_time.
+ */
+const BANDS = ['9AM to 12PM', '12PM to 3PM', '3PM to 7PM', 'After Hours'];
+
+function jobWriteFor(fake) {
+  const write = fake.calls.find((c) => /UPDATE tbl_job SET/.test(c.sql));
+  assert.ok(write, 'an UPDATE tbl_job must be issued');
+  return write;
+}
+
+/*
+ * The submitted label the live form actually sends is a BOOKING_BANDS value
+ * ('3PM to 7PM') — page.tsx renders BOOKING_BANDS and posts slot.value. It is no
+ * longer the en-dash display label, so a test asserting '3 PM – 7 PM' round-trips
+ * would be pinning an input no live submission can produce.
+ *
+ * booking_cut_off_time_slot must NOT echo whatever the form sent: that would put
+ * a fifth spelling into a column every other create path fills from
+ * job.service's deriveBookingCutoffSlot ('3 PM - 7 PM', plain hyphen). Both
+ * shapes are asserted below — the canonical band on time_slot, the legacy
+ * hyphenated window on the cut-off column.
+ */
+test('acceptSubmission stores the BAND in time_slot and the LEGACY window spelling on the cut-off column', async () => {
+  const run = async (submittedLabel) => {
+    const fake = makeFakePool(
+      [[/SELECT fk_address_id, fk_customer_id, fk_client_id FROM tbl_job/, [{ fk_address_id: 10, fk_customer_id: 20, fk_client_id: 30 }]]],
+      { stopOn: /UPDATE tbl_job SET/ },
+    );
+    await assert.rejects(() => magic.acceptSubmission(42, {
+      requested_date_time: '2026-08-05T15:00:00',
+      time_slot: submittedLabel,
+    }, fake.pool));
+    return jobWriteFor(fake);
+  };
+  // params[3] = time_slot, params[4] = booking_cut_off_time_slot (SET order).
+  for (const label of ['3PM to 7PM', '3 PM – 7 PM']) {
+    const write = await run(label);
+    assert.equal(write.params[3], '3PM to 7PM', `time_slot is canonicalised (submitted ${label})`);
+    assert.equal(write.params[4], '3 PM - 7 PM',
+      `booking_cut_off_time_slot uses deriveBookingCutoffSlot's spelling (submitted ${label})`);
+  }
+});
+
+test('writeCustomerOrderDetails (WhatsApp chat) stores the BAND, never the 1-hour frame', async () => {
+  const fake = makeFakePool(
+    [[/SELECT fk_address_id FROM tbl_job/, [{ fk_address_id: 10 }]]],
+    { stopOn: /UPDATE tbl_job SET/ },
+  );
+  await assert.rejects(() => magic.writeCustomerOrderDetails(42, {
+    requested_date_time: '2026-08-05 15:00:00',
+    time_slot: '3 PM\u20134 PM',        // a caller still handing over a 1-hour label
+    requested_time: '15:00',
+  }, fake.pool));
+  const write = jobWriteFor(fake);
+  // params[2] = requested_date_time, [3] = time_slot, [4] = requested_time.
+  assert.ok(BANDS.includes(write.params[3]), `time_slot=${write.params[3]} must be a band`);
+  assert.equal(write.params[3], '3PM to 7PM');
+  assert.equal(write.params[4], '15:00', 'the 1-hour START survives in requested_time');
+});
+
 test('autoRescheduleOnOpenIfLate — disabled by property never writes, and reports a DUE appointment', async () => {
   // The disabled path deliberately runs ONE read-only lookup so an already-due
   // appointment is still reported — otherwise the switch being off is invisible

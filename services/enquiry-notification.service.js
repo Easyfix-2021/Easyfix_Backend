@@ -79,7 +79,26 @@ async function loadEnquiryContext(jobId) {
         j.client_ref_id,
         j.fk_client_id,
         cl.client_name,
-        cu.customer_name,
+        /*
+         * Customer name on a JOB surface (2026-08-03). Both templates describe
+         * ONE job, so the name they carry is "the customer on THIS JOB" — the
+         * name typed on the booking page (tbl_job.job_customer_name, a per-job
+         * override; see MUTABLE_COLUMNS in services/job.service.js), with the
+         * customer-master name only as the fallback.
+         *
+         * NULLIF(TRIM(...), '') is load-bearing: MySQL COALESCE guards NULL
+         * only, so COALESCE('', cu.customer_name) returns '' — and a blank
+         * named variable is exactly what some BSPs reject (see the "reason"
+         * fallback below, which exists for the same reason). '' is reachable:
+         * validators/job.validator.js allows '' on create AND update,
+         * create() binds it via the ?? operator (which does not catch ''),
+         * and update()'s MUTABLE_COLUMNS loop binds input[col] verbatim.
+         *
+         * customer_master_name stays the raw tbl_customer value — it feeds
+         * Gallabox's recipient.name (contact-book identity), not the job copy.
+         */
+        COALESCE(NULLIF(TRIM(j.job_customer_name), ''), cu.customer_name) AS customer_name,
+        cu.customer_name AS customer_master_name,
         cu.customer_mob_no,
         cc.contact_name AS spoc_contact_name,
         cc.contact_no   AS spoc_contact_no,
@@ -117,7 +136,15 @@ async function sendEnquiryWhatsapp(jobId) {
   if (!ctx) { logger.warn('Enquiry WhatsApp: job not found · jobId=' + jobId); return; }
 
   const clientName   = ctx.client_name   || '';
+  // Job-scoped display name — goes into the template BODY of both messages.
   const customerName = ctx.customer_name || '';
+  /*
+   * Gallabox `recipient.name` is the CONTACT-BOOK display name for the person
+   * behind cu.customer_mob_no — "this customer record", not "the customer on
+   * this job" — so it deliberately keeps the tbl_customer master name and is
+   * unaffected by the per-job override above.
+   */
+  const customerContactName = ctx.customer_master_name || '';
   const clientRefId  = ctx.client_ref_id != null ? String(ctx.client_ref_id) : '';
   // Never send an empty named template variable (some BSPs reject the whole
   // template). Prefer action_taken_reason.action_desc; fall back to a generic
@@ -164,7 +191,7 @@ async function sendEnquiryWhatsapp(jobId) {
     try {
       await gallabox.sendTemplate({
         to: ctx.customer_mob_no,
-        recipientName: customerName,
+        recipientName: customerContactName,
         templateName: 'cx_enquiry',
         bodyValues: {
           customer_name: customerName,

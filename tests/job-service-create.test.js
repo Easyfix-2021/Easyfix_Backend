@@ -55,3 +55,59 @@ test('valid create reaches the tbl_job INSERT with the given customer + address 
   assert.equal(ins.params[1], 7, 'fk_customer_id is the resolved customer');
   assert.equal(ins.params[2], 55, 'fk_address_id is the supplied address');
 });
+
+/*
+ * ─── time_slot IS ALWAYS A BAND ──────────────────────────────────────
+ *
+ * The whole point of the 2026-07-31 rework: whatever slot vocabulary a caller
+ * arrives with, tbl_job.time_slot receives one of exactly four broad bands, and
+ * the 1-hour frame the operator/customer picked survives as the appointment
+ * time-of-day (requested_date_time + requested_time). See services/time-slot.js.
+ *
+ * The INSERT's positional params are asserted by VALUE rather than index — the
+ * shared column list is long and an index would be brittle — so these read the
+ * band out of the captured params and assert on the SET as a whole.
+ */
+const BANDS = ['9AM to 12PM', '12PM to 3PM', '3PM to 7PM', 'After Hours'];
+
+async function createWith(extra) {
+  fake.reset();
+  await assert.rejects(() => jobSvc.create({ ...VALID_INPUT(), ...extra }, { user_id: 1 }));
+  const ins = fake.calls.find((c) => /INSERT INTO tbl_job\b/.test(c.sql));
+  assert.ok(ins, 'the job row must be inserted');
+  return ins.params;
+}
+
+test('create stores a BAND in time_slot even when the caller sends a 1-hour frame', async () => {
+  // The Book-New-Call shape: a date-only UTC ISO plus the IST wall-clock time
+  // in requested_time, which combineDateTime() splices into the DATETIME.
+  const params = await createWith({
+    requested_date_time: '2026-08-05T00:00:00.000Z',
+    requested_time: '15:00',
+    time_slot: '3 PM–4 PM',
+  });
+  assert.ok(params.includes('3PM to 7PM'), 'the containing band is stored');
+  assert.ok(!params.includes('3 PM–4 PM'), 'the 1-hour frame label must never reach tbl_job.time_slot');
+});
+
+test('create derives the band from the appointment time when no slot is sent', async () => {
+  const params = await createWith({
+    requested_date_time: '2026-08-05T00:00:00.000Z',
+    requested_time: '10:30',
+  });
+  assert.ok(params.includes('9AM to 12PM'));
+});
+
+test('create never writes any of the retired backend band labels', async () => {
+  for (const hour of ['09:30', '11:30', '12:30', '14:30', '15:30', '18:30', '21:00', '03:00']) {
+    const params = await createWith({
+      requested_date_time: '2026-08-05T00:00:00.000Z',
+      requested_time: hour,
+      time_slot: 'Morning 9 to 2',   // a caller still speaking the legacy vocabulary
+    });
+    for (const retired of ['Morning 9 to 2', 'Evening 2 to 7', 'Afternoon 12 to 5']) {
+      assert.ok(!params.includes(retired), `${hour} wrote the retired label ${retired}`);
+    }
+    assert.ok(params.some((p) => BANDS.includes(p)), `${hour} wrote no canonical band`);
+  }
+});

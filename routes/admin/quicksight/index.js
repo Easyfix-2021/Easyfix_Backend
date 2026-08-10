@@ -48,6 +48,9 @@ router.use('/employee-productivity',  require('./employee-productivity'));
 router.use('/admin-dashboard',        require('./admin-dashboard'));
 router.use('/offer-acceptance',       require('./offer-acceptance'));
 router.use('/profile-update-requests', require('./profile-update-requests'));
+// Call effort audit: per-job and per-(day, user) call volume off the legacy
+// tbl_job_caller_info log — who called, whom, and at which job step.
+router.use('/call-tracking',          require('./call-tracking'));
 // Confirmation-quality audit: jobs pushed to Pending for Scheduling without the
 // customer ever confirming (no form submission / Unreachable, and no real call).
 router.use('/premature-confirmations', require('./premature-confirmations'));

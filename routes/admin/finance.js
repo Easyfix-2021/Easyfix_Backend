@@ -52,6 +52,13 @@ async function assertEfrInScope(req, efrId) {
 
 // Shared helper: load the invoice + client + flat line items used by
 // both /excel and /pdf. Keeps the two endpoints in lock-step.
+//
+// customer_name (2026-08-03): invoice lines are JOB rows, so the name
+// shown is the per-job name captured on the booking form
+// (tbl_job.job_customer_name), falling back to the customer master only
+// when the job-row copy is absent. NULLIF(TRIM(...), '') is required —
+// a plain COALESCE would render a BLANK name for a '' job_customer_name,
+// which the validators still permit (job.validator.js allows '').
 async function loadInvoiceArtifactData(invoiceId) {
   logger.info('Load invoice artifact data · invoiceId=' + invoiceId);
   const [[inv]] = await pool.query(
@@ -81,7 +88,8 @@ async function loadInvoiceArtifactData(invoiceId) {
       const [rows] = await pool.query(
         `SELECT j.job_id, j.job_reference_id, j.client_ref_id,
                 j.requested_date_time, j.checkout_date_time,
-                cu.customer_name, cu.customer_mob_no, ci.city_name
+                COALESCE(NULLIF(TRIM(j.job_customer_name), ''), cu.customer_name) AS customer_name,
+                cu.customer_mob_no, ci.city_name
            FROM tbl_job j
            LEFT JOIN tbl_customer cu ON cu.customer_id = j.fk_customer_id
            LEFT JOIN tbl_address  ad ON ad.address_id  = j.fk_address_id
@@ -96,7 +104,8 @@ async function loadInvoiceArtifactData(invoiceId) {
     const [rows] = await pool.query(
       `SELECT j.job_id, j.job_reference_id, j.client_ref_id,
               j.requested_date_time, j.checkout_date_time,
-              cu.customer_name, cu.customer_mob_no, ci.city_name
+              COALESCE(NULLIF(TRIM(j.job_customer_name), ''), cu.customer_name) AS customer_name,
+              cu.customer_mob_no, ci.city_name
          FROM tbl_job j
          LEFT JOIN tbl_customer cu ON cu.customer_id = j.fk_customer_id
          LEFT JOIN tbl_address  ad ON ad.address_id  = j.fk_address_id

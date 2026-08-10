@@ -191,8 +191,26 @@ router.post(
       const result = conversational
         ? await conversationService.startConversation(jobId, { action }, pool)
         : await magicLinkService.sendForJob(jobId, { action, override: !!override }, pool);
-      logger.info('Magic link sent · jobId=' + jobId + ' action=' + action + ' channel=' + (conversational ? 'conversation' : 'form'));
-      return modernOk(res, { ...result, channel: conversational ? 'conversation' : 'form' });
+      /*
+       * "Sent" is not the same as "accepted by the provider". This logged
+       * success unconditionally, so a WhatsApp rejection (HTTP 400 from
+       * Gallabox) produced an INFO line reading "Magic link sent" and a 200 —
+       * the operator saw a success toast for a message that never left.
+       *
+       * The status stays 200 on purpose: the conversation row IS created and an
+       * inbound reply still resolves against it, so this is a partial success,
+       * not a failed request. What changes is that the failure is now VISIBLE —
+       * WARN in the logs, and `delivered:false` + `error` in the payload for the
+       * CRM to surface.
+       */
+      const channel = conversational ? 'conversation' : 'form';
+      if (result && result.delivered === false && !result.suppressed) {
+        logger.warn('Magic link NOT delivered · jobId=' + jobId + ' action=' + action
+          + ' channel=' + channel + ' · ' + (result.error || 'provider rejected the message'));
+      } else {
+        logger.info('Magic link sent · jobId=' + jobId + ' action=' + action + ' channel=' + channel);
+      }
+      return modernOk(res, { ...result, channel });
     } catch (e) {
       logger.warn('Send magic link failed · jobId=' + req.params.id + ' · ' + e.message);
       return next(e);

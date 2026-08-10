@@ -250,13 +250,21 @@ async function saveSelfie(jobId, efrId, { selfieImageId }) {
  * search result card only needs the headline fields). Scoped to the
  * authed tech: a job belonging to someone else returns null, identical
  * to "not found", so a tech can't enumerate other techs' jobs.
+ *
+ * customerName (2026-08-03): this card describes a JOB, so it shows the
+ * per-job name captured on the booking form (tbl_job.job_customer_name)
+ * and only falls back to the customer master when that is absent.
+ * NULLIF(TRIM(...), '') is required — a plain COALESCE would render a
+ * BLANK name for a '' job_customer_name, which job.validator.js still
+ * permits on both the create and update paths.
  */
 async function searchByJobId(jobId, efrId) {
   logger.info('Search job by id · jobId=' + jobId);
   const [[row]] = await pool.query(
     `SELECT j.job_id, j.job_reference_id, j.client_ref_id, j.job_status,
             j.job_type, j.requested_date_time, j.time_slot, j.otp,
-            cu.customer_name, cu.customer_mob_no,
+            COALESCE(NULLIF(TRIM(j.job_customer_name), ''), cu.customer_name) AS customer_name,
+            cu.customer_mob_no,
             ad.address, ad.locality, ad.landmark, ad.pin_code, ad.gps_location,
             ci.city_name,
             cl.client_name,

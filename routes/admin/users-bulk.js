@@ -778,8 +778,17 @@ router.post('/bulk-upload',
         //   - __wouldUpdate → dry-run, real changes detected
         //   - (otherwise) → live UPDATE succeeded
         try {
+          /*
+           * enforcePersonalEmail: false — the personal_email requiredness
+           * matrix governs the Add/Edit User FORM, the only surface that can
+           * collect the address. This spreadsheet carries scope CSVs, a
+           * reporting manager and a role; it has no personal_email column, so
+           * enforcing the rule here would not backfill anything — it would just
+           * make every one of the ~7.5k active users who has none today
+           * permanently un-bulk-updatable.
+           */
           const result = await userService.updateUser(
-            userId, fields, req.user?.user_id, { dryRun },
+            userId, fields, req.user?.user_id, { dryRun, enforcePersonalEmail: false },
           );
           if (result && result.__unchanged) {
             unchanged++;

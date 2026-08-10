@@ -146,8 +146,23 @@ function previewCallLegs({ from, to, alwaysApplyEnvOverride = false }) {
 }
 
 // ── Call token: signs the destination + call row id into the callback URLs ──
-function signCallToken({ dest, jci }) {
-  return jwt.sign({ dest, jci }, tokenSecret(), { expiresIn: TOKEN_TTL_SEC });
+/*
+ * `conf` / `confId` (2026-08-04) — set when this leg is the OPERATOR leg of a
+ * Multi-Party Call. The answer route branches on their presence: with them it
+ * returns the <MultiPartyCall> join XML, without them the classic <Dial> bridge.
+ *
+ * Carried IN THE TOKEN rather than looked up by `jci` on the answer callback,
+ * for the same reason `dest` is: the callback then needs no query of its own and
+ * cannot be pointed at a different conference by anyone who guesses a URL. Both
+ * are optional, so every existing caller keeps the exact bridge it has today.
+ */
+function signCallToken({ dest, jci, conf = null, confId = null, destKind = null, destName = null }) {
+  const claims = { dest, jci };
+  // destKind/destName ride along ONLY in conference mode: the answer route adds
+  // the receiver as a participant once the operator is in the room, and the
+  // participant row needs to record WHO was dialled, not just the digits.
+  if (conf) { claims.conf = conf; claims.confId = confId; claims.destKind = destKind; claims.destName = destName; }
+  return jwt.sign(claims, tokenSecret(), { expiresIn: TOKEN_TTL_SEC });
 }
 function verifyCallToken(t) {
   try { return jwt.verify(t, tokenSecret()); } catch { return null; }
@@ -249,7 +264,15 @@ function authHeader() {
  * Returns the normalised contract (delivered / callId / diagnostic …) using
  * Plivo's request_uuid as callId.
  */
-async function clickToCall({ from, to, jobCallerInfoId, alwaysApplyEnvOverride = false }) {
+async function clickToCall({
+  from, to, jobCallerInfoId, alwaysApplyEnvOverride = false,
+  // Conference mode: when a friendlyName is supplied the operator's leg joins
+  // that MPC instead of bridging straight to `to`. The RECEIVER is then added as
+  // a participant by the caller (POST …/MultiPartyCall/name_X/Participant/), NOT
+  // by this call's answer XML — a <Dial> cannot be turned into a conference
+  // afterwards, which is the whole reason the join happens at answer time.
+  conferenceName = null, conferenceId = null, receiverKind = null, receiverName = null,
+}) {
   const callerReal = normaliseIndianPhone(from);
   const receiverReal = normaliseIndianPhone(to);
   if (!callerReal) return { delivered: false, error: `invalid caller phone "${from}"` };
@@ -272,7 +295,11 @@ async function clickToCall({ from, to, jobCallerInfoId, alwaysApplyEnvOverride =
   if (!legs.ok) return { delivered: false, error: legs.error };
   const { caller, receiver } = legs; // caller = agent leg, receiver = customer
 
-  const token = signCallToken({ dest: receiver, jci: jobCallerInfoId });
+  const token = signCallToken({
+    dest: receiver, jci: jobCallerInfoId,
+    conf: conferenceName, confId: conferenceId,
+    destKind: receiverKind, destName: receiverName,
+  });
   const cb = (path) => `${base}${path}?t=${encodeURIComponent(token)}`;
   const body = {
     from: process.env.PLIVO_CALLER_ID,
@@ -544,11 +571,23 @@ function webAccessToken({ operatorId } = {}) {
 // number.
 const WEB_DIAL_TTL_MS = 2 * 60 * 1000;
 const _webDials = new Map();
-function stashWebDial({ number, jci, teleprompterSessionId = null }) {
+function stashWebDial({
+  number, jci, teleprompterSessionId = null,
+  // Conference mode, web edition. Same contract as the mobile path's call
+  // token: the web-answer route branches on `conferenceName` to return the
+  // <MultiPartyCall> join XML instead of the <Dial> bridge. Carried in the
+  // SERVER-SIDE stash rather than the dialId itself, because the dialId crosses
+  // to the browser and the whole point of it is that it reveals nothing.
+  conferenceName = null, conferenceId = null, receiverKind = null, receiverName = null,
+}) {
   const now = Date.now();
   for (const [k, v] of _webDials) if (v.expires <= now) _webDials.delete(k); // sweep
   const id = crypto.randomBytes(16).toString('hex');
-  _webDials.set(id, { number, jci, teleprompterSessionId, expires: now + WEB_DIAL_TTL_MS });
+  _webDials.set(id, {
+    number, jci, teleprompterSessionId,
+    conferenceName, conferenceId, receiverKind, receiverName,
+    expires: now + WEB_DIAL_TTL_MS,
+  });
   return id;
 }
 function resolveWebDial(id) {
@@ -557,7 +596,14 @@ function resolveWebDial(id) {
   if (!v) return null;
   _webDials.delete(key); // one-time use
   if (v.expires <= Date.now()) return null;
-  return { number: v.number, jci: v.jci, teleprompterSessionId: v.teleprompterSessionId || null };
+  return {
+    number: v.number, jci: v.jci,
+    teleprompterSessionId: v.teleprompterSessionId || null,
+    conferenceName: v.conferenceName || null,
+    conferenceId: v.conferenceId || null,
+    receiverKind: v.receiverKind || null,
+    receiverName: v.receiverName || null,
+  };
 }
 
 module.exports = {

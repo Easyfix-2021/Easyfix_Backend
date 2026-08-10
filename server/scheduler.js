@@ -959,6 +959,64 @@ This task has no schedule and can only be started with "Trigger Now".`,
     ? 'manual only — this job has no schedule; use Trigger Now'
     : `manual only — and ENVIRONMENT is "${process.env.ENVIRONMENT || '(unset)'}", so it will refuse to run outside QA`;
 
+  // ─── Conference reaper — every 5 minutes ─────────────────────────────
+  // (Added 2026-08-04) COST BACKSTOP for Plivo conference calling. Every ops
+  // call is now a Multi-Party Call, an orphaned one bills every leg until
+  // Plivo's own max_duration fires, and /api/admin/* is rate-limit-exempt —
+  // so this is the only thing that force-ends a runaway room. It also frees
+  // conferences stranded in 'creating', which otherwise consume the
+  // concurrency cap (default 3) and block EVERY ops call.
+  const conferenceReaper = require('../services/conference-reaper-cron');
+  const conferenceReaperJob = registerJob({
+    id: 'conference-reaper',
+    name: 'Conference Reaper (Cost Backstop)',
+    description:
+`What this task does: Ops calls are now conference calls, and a conference that nobody hangs up keeps charging for every person still on the line. Every 5 minutes this task looks for calls that have overrun and shuts them down.
+
+Step by step:
+  1. Every 5 minutes, the task wakes up automatically.
+  2. It finds conference calls still running after an unreasonably long time. There is deliberately NO maximum-length setting — ops asked for no cap on how long a call may run, so this is not a limit being enforced. It is a leak detector, with a ceiling set high enough in code that a real conversation can never trip it.
+  3. It ends each of those with the phone provider, then reads the call back to confirm it really stopped. If the provider says the call is still running, the task leaves it marked as running and tries again next time, rather than pretending it succeeded.
+  4. It then checks calls stuck at "starting" — these are calls where the provider never told us the conference actually began. It asks the provider directly and either marks them running or clears them out, so the records match what really happened and a stuck row does not sit there looking live for ever.
+  5. Finally it clears out individual people stuck at "ringing" long after the phone should have stopped ringing.
+  6. It logs everything it changed — visible in the server logs and on this page under Last Run.
+
+Why this matters: this is the money guard, and since ops chose to have no maximum call length and no cap on participants, it is now the ONLY one besides the operator hanging up (which ends the call for everyone automatically). Conference calling has no on/off switch of its own — it is part of every ops call — so without this task a single stuck call could keep billing for hours unnoticed.
+
+Test button: leaving the ID blank does a DRY RUN — it reports what the next sweep would end, without touching anything. Entering a conference ID force-ends THAT conference for real (it will hang up a live call).
+
+Note: this runs automatically unless the property "plivo.conference.reaper.enabled" is set to "false" in easyfix_properties (checked once at server start — restart after changing). Trigger Now / Test still work either way.`,
+    cron: '*/5 * * * *',
+    runner: async () => {
+      const r = await conferenceReaper.run({ limit: 25 });
+      logger.info('Conference-reaper cron · ' + JSON.stringify(r));
+      return r;
+    },
+    tester: ({ sourceId }) => conferenceReaper.runTest({ sourceId }),
+    testSourceLabel: 'Conference ID (tbl_job_conference.id) — optional',
+    testSourceHelp:
+      'Leave BLANK for a dry run (reports what would be ended, changes nothing). Enter a conference ID to force-end that conference immediately — this really does hang up a live call, and is the only way to verify the provider teardown works.',
+  });
+  // Cost-safety infra cron → default-ON kill switch (set 'false' to disable),
+  // deliberately NOT an opt-in gate: an unseeded property must not leave the
+  // money guard switched off.
+  const conferenceReaperEnabled =
+    String(getProperty('plivo.conference.reaper.enabled') ?? '').toLowerCase() !== 'false';
+  if (cronDisabled) {
+    conferenceReaperJob.skipReason = 'CRON_DISABLED=true';
+  } else if (!conferenceReaperEnabled) {
+    conferenceReaperJob.skipReason = "property 'plivo.conference.reaper.enabled' is 'false' — set it to 'true' (or remove it) and restart to enable. ⚠ While off, runaway conferences are NOT force-ended.";
+    logger.warn("⚠ Conference-reaper cron SKIPPED — plivo.conference.reaper.enabled=false in easyfix_properties. Runaway conference calls will NOT be force-ended.");
+  } else {
+    conferenceReaperJob.task = cron.schedule(
+      conferenceReaperJob.cron,
+      () => invokeJob(conferenceReaperJob, 'cron'),
+      { timezone: TZ },
+    );
+    conferenceReaperJob.registered = true;
+    logger.info('Conference-reaper cron registered (every 5 min IST, cost backstop).');
+  }
+
   // ─── Deep Skill Image-Gen orphan reset — every 5 minutes ─────────────
   // Standalone cron (NOT registered via registerJob()). Deliberately
   // absent from the Scheduled Jobs admin page — this is infrastructure

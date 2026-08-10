@@ -246,7 +246,7 @@ async function runTest({ mobile, sourceId } = {}) {
     // Scheduled Jobs → Test: honour the operator's typed number on every env.
     bypassTestRedirect: true,
     // Named body vars (Name/efr_id/profile_link) — positional 1/2/3 don't bind.
-    // Keys MUST match skill_otp_tx1's variables exactly ({{name}}, {{id}},
+    // Keys MUST match skill_otp_tx1_newvideo's variables exactly ({{name}}, {{id}},
     // {{profile_link}}). A mismatched key binds to nothing and arrives EMPTY —
     // the predecessor used {{Name}}/{{efr_id}}, so casing matters here.
     bodyValues: { name: recipientName, id: String(efrId), profile_link: shortUrl },

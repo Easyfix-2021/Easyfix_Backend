@@ -45,6 +45,10 @@ const { maskMobile }   = require('../utils/mask-mobile');
 const s3Storage        = require('../utils/s3-storage');
 const addressService   = require('./address.service');
 const logger           = require('../logger');
+// The appointment slot model — TIME_SLOTS below are the customer-facing
+// DISPLAY labels; storage goes through resolveTimeSlot so tbl_job.time_slot
+// only ever holds one of the four canonical bands.
+const slotModel        = require('./time-slot');
 
 /*
  * Best-effort short-TTL presigned GET for a customer-uploaded media key.
@@ -355,14 +359,20 @@ async function resolveJobSpoc(jobId, pool) {
 }
 
 /**
- * Time-slot enum surfaced to the customer.
+ * Time-slot enum surfaced to the customer — the four broad BANDS, in the
+ * spaced-en-dash spelling the public form has always displayed.
  *
  * Hard-coded (vs. table-driven) because:
- *   - The slot labels are presentation-only — they're stored on tbl_job.time_slot
- *     as a VARCHAR matching what the CRM has historically written.
  *   - No corresponding lookup table exists in easyfix_core; the 5 legacy
  *     services all hard-code the same set.
  *   - Keeping it in code avoids an extra round-trip on every prefill fetch.
+ *
+ * ⚠ DISPLAY LABELS, NOT STORED VALUES (2026-07-31). What lands in
+ * tbl_job.time_slot is the CANONICAL band ('9AM to 12PM' …) produced by
+ * slotModel.resolveTimeSlot() on submit — see acceptSubmission. Presentation
+ * and storage are deliberately decoupled: the customer keeps the prettier
+ * label, the column keeps exactly four values. Nothing compares these strings
+ * to the column, so they are safe to reword.
  */
 const TIME_SLOTS = ['9 AM – 12 PM', '12 PM – 3 PM', '3 PM – 7 PM', 'After Hours'];
 
@@ -687,7 +697,15 @@ async function fetchPrefill(jobId, pool) {
     `SELECT j.job_id, j.fk_client_id, j.fk_address_id, j.requested_date_time,
             j.time_slot, j.job_desc, j.additional_name, j.additional_number,
             j.job_status,
-            COALESCE(j.job_customer_name, cu.customer_name) AS customer_name,
+            -- Customer name shown on a JOB surface = the name typed on the
+            -- booking form (tbl_job.job_customer_name), falling back to the
+            -- customer-master row. NULLIF(TRIM(…), '') is load-bearing:
+            -- COALESCE('', x) returns '' in MySQL, so a plain COALESCE would
+            -- render a BLANK name for any job whose job_customer_name was
+            -- written as an empty string. The column is fed from a form field
+            -- (validators/job.validator.js allows '' explicitly, and
+            -- job.service.js binds it verbatim), so guard the blank here.
+            COALESCE(NULLIF(TRIM(j.job_customer_name), ''), cu.customer_name) AS customer_name,
             cu.customer_mob_no, cu.customer_email,
             ad.address, ad.building, ad.landmark, ad.city_id, ad.pin_code,
             ad.gps_location, ${addrInstrSelect},
@@ -1007,7 +1025,13 @@ async function sendForJob(jobId, { action, override = false } = {}, pool) {
   // parses bubble to NULL → default.
   const [rows] = await pool.query(
     `SELECT j.job_id, j.fk_client_id, j.magic_link_sent_at, j.magic_link_send_count,
-            cu.customer_name, cu.customer_mob_no, cl.client_name,
+            -- Same job-scoped name rule as fetchPrefill() above: the WhatsApp
+            -- confirm_order greeting is addressed to the customer ON THIS JOB,
+            -- so it must use the booking-form name and only fall back to the
+            -- customer-master row. NULLIF(TRIM(…), '') guards the empty-string
+            -- case a plain COALESCE would let through as a blank greeting.
+            COALESCE(NULLIF(TRIM(j.job_customer_name), ''), cu.customer_name) AS customer_name,
+            cu.customer_mob_no, cl.client_name,
             COALESCE(
               (SELECT CAST(NULLIF(ccp_max.c_prop_values, '') AS UNSIGNED)
                  FROM tbl_client_custom_properties ccp_max
@@ -1334,6 +1358,35 @@ async function acceptSubmission(jobId, payload, pool) {
       const m = String(payload.requested_date_time || '').match(/T(\d{2}:\d{2})/);
       return m ? m[1] : null;
     })();
+    /*
+     * time_slot gets the canonical BAND, never the form's display label. The
+     * appointment instant decides it; the label is only consulted when the
+     * customer somehow submitted a slot without a time-of-day. This is the same
+     * writer-side gate create()/assign()/reschedule() use — see
+     * services/time-slot.js.
+     *
+     * booking_cut_off_time_slot is a separate LEGACY display column that legacy
+     * reports read verbatim. It is DERIVED here, not taken from payload.time_slot.
+     *
+     * ⚠ It used to store the raw submitted label, which was fine while the form
+     * sent its own en-dash spelling ('3 PM – 7 PM'). The form now sends the
+     * shared BOOKING_BANDS values ('3PM to 7PM'), so storing the label raw would
+     * have introduced a FIFTH spelling into this one column — matching neither
+     * the old '3 PM – 7 PM' nor the '3 PM - 7 PM' that job.service's
+     * deriveBookingCutoffSlot writes on every other create path. Same helper,
+     * same appointment instant, one spelling. Required lazily (as
+     * recomputeClientServicesCsv is below) to keep the module load order free of
+     * a job.service ⇄ job-magic-link cycle.
+     */
+    const bandForStorage = slotModel.resolveTimeSlot(
+      payload.time_slot, payload.requested_date_time,
+    );
+    const { deriveBookingCutoffSlot } = require('./job.service');
+    const cutoffSlot = deriveBookingCutoffSlot(
+      // deriveBookingCutoffSlot reads chars 11-12 as the hour, so it needs the
+      // 'YYYY-MM-DD HH:MM' shape — the form submits 'YYYY-MM-DDTHH:MM'.
+      String(payload.requested_date_time || '').replace('T', ' '),
+    ) || payload.time_slot || null;
     const jobSetClauses = [
       'customer_submitted_at      = ?',
       'customer_submitted_payload = ?',
@@ -1350,8 +1403,8 @@ async function acceptSubmission(jobId, payload, pool) {
       submittedAt,
       JSON.stringify(payload),
       payload.requested_date_time || null,
-      payload.time_slot || null,
-      payload.time_slot || null,   // booking_cut_off_time_slot = the chosen slot label
+      bandForStorage || null,      // time_slot = the canonical BAND
+      cutoffSlot,                  // booking_cut_off_time_slot = the LEGACY 'H AM - H PM' spelling
       reqTimeHHMM,                 // requested_time = HH:MM of the chosen slot
       payload.additional_name || null,
       payload.additional_number || null,
@@ -1713,9 +1766,19 @@ async function acceptSubmission(jobId, payload, pool) {
  * form or the chat.
  *
  * `fields` (all optional except none — COALESCE preserves existing on null):
- *   requested_date_time, time_slot, job_desc,
+ *   requested_date_time, time_slot, requested_time, job_desc,
  *   address, building, landmark, city_id, pin_code, gps_location, address_instruction,
  *   payload (object — snapshot stored as customer_submitted_payload JSON).
+ *
+ * `requested_time` is the legacy HH:MM TEXT column that mirrors the chosen
+ * slot's START time — the same pairing acceptSubmission() writes (see reqTimeHHMM
+ * there). The conversational flow supplies it so a chat-confirmed job's slot
+ * columns are as coherent as a form-confirmed one's; callers that omit it are
+ * unaffected (NULL → COALESCE keeps the existing value).
+ *
+ * `time_slot` is forced onto the four canonical BANDS here regardless of what
+ * the caller passed — the same writer-side gate every other path uses. A caller
+ * that hands over a 1-hour frame label gets the containing band stored instead.
  */
 async function writeCustomerOrderDetails(jobId, fields, pool) {
   logger.info('Write customer order details (chat flow) · jobId=' + jobId);
@@ -1739,6 +1802,7 @@ async function writeCustomerOrderDetails(jobId, fields, pool) {
          customer_submitted_payload = ?,
          requested_date_time        = COALESCE(?, requested_date_time),
          time_slot                  = COALESCE(?, time_slot),
+         requested_time             = COALESCE(?, requested_time),
          job_desc                   = COALESCE(?, job_desc),
          last_update_time           = ?
        WHERE job_id = ?`,
@@ -1746,7 +1810,8 @@ async function writeCustomerOrderDetails(jobId, fields, pool) {
         submittedAt,
         JSON.stringify(fields.payload || fields),
         fields.requested_date_time || null,
-        fields.time_slot || null,
+        slotModel.resolveTimeSlot(fields.time_slot, fields.requested_date_time) || null,
+        (fields.requested_time && String(fields.requested_time).trim()) ? fields.requested_time : null,
         (fields.job_desc && String(fields.job_desc).trim()) ? fields.job_desc : null,
         submittedAt,
         jobId,

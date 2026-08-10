@@ -54,6 +54,23 @@ router.post('/login-otp', validate(loginOtpRequest), async (req, res, next) => {
         'This account is not registered in the CRM. Please check the email / mobile or contact your admin.'
       );
     }
+    /*
+     * `delivered` is the REAL outcome from the delivery ladder, not a constant.
+     * It used to be hardcoded true, so an OTP whose email was suppressed (no
+     * mailbox) and whose WhatsApp fallback also failed still answered
+     * "OTP sent" — the user then waited for a code no channel ever carried.
+     * A hard error is the honest answer: the OTP row exists, but nothing
+     * reached the user, so retrying or contacting an admin is the only way on.
+     */
+    if (!result.delivered) {
+      logger.error('Login OTP could not be delivered on any channel · channels=[' + (result.channelsTried || '') + ']');
+      return modernError(
+        res,
+        502,
+        'We generated your OTP but could not deliver it on any channel (email / WhatsApp / SMS). '
+        + 'Your registered email may have no mailbox, or no mobile number is on file. Please contact your admin.',
+      );
+    }
     logger.info('Login OTP issued · delivered');
     return modernOk(
       res,

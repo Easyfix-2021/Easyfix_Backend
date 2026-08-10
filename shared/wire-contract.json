@@ -1,0 +1,50 @@
+{
+  "$doc": [
+    "THE FE↔BE WIRE CONTRACT — strings that must be byte-identical in",
+    "Easyfix_CRM_UI and EasyFix_Backend because they cross the network or land",
+    "in a shared database column. A type-checker cannot see across the two",
+    "repos, so these are the values that drift silently and fail in production.",
+    "",
+    "THIS FILE IS DUPLICATED, BYTE FOR BYTE, IN BOTH REPOS AT shared/wire-contract.json.",
+    "To change anything here: edit BOTH copies in the same change and run",
+    "`npm test` in BOTH repos. Each repo's tests/wire-contract.test.js asserts",
+    "its own constants against its own copy, and — when the sibling repo is",
+    "checked out beside it, which is the normal dev layout — asserts the two",
+    "copies are identical.",
+    "",
+    "WHAT THIS DOES AND DOES NOT GUARANTEE. In CI each repo can only see itself,",
+    "so CI catches the common failure: someone edits a constant in code and",
+    "forgets this file. It cannot catch a self-consistent edit made to one repo",
+    "alone — that is caught locally, where both repos are checked out."
+  ],
+
+  "revision": 1,
+
+  "bookingBands": {
+    "$doc": [
+      "tbl_job.time_slot — the BROAD booking band. EXACTLY these four values.",
+      "Spelling is deliberate: no spaces around the hour tokens, the word 'to'",
+      "as the separator, NOT an en-dash. Do not tidy them.",
+      "Windows are half-open [fromHour, toHour). 'After Hours' is everything",
+      "outside them and has no derivable window, hence null."
+    ],
+    "values": [
+      { "value": "9AM to 12PM", "fromHour": 9, "toHour": 12, "start": "09:00" },
+      { "value": "12PM to 3PM", "fromHour": 12, "toHour": 15, "start": "12:00" },
+      { "value": "3PM to 7PM", "fromHour": 15, "toHour": 19, "start": "15:00" },
+      { "value": "After Hours", "fromHour": null, "toHour": null, "start": "19:00" }
+    ]
+  },
+
+  "jobSortKeys": {
+    "$doc": [
+      "Values the FE sends as ?sortBy= on GET /admin/jobs. Each MUST be a key of",
+      "SORTABLE_COLUMNS in EasyFix_Backend/services/job.service.js, because the",
+      "list validator derives its allow-list from those keys — an unknown literal",
+      "is not a silent no-op, Joi rejects it and the whole page 400s.",
+      "This shipped once as 'ageSecs' (the projection alias) and blanked the jobs",
+      "grid for anyone who had ?sort=ageSecs:asc persisted in a bookmarked URL."
+    ],
+    "jobAge": "age"
+  }
+}

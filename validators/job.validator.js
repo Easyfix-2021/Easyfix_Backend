@@ -1,5 +1,5 @@
 const Joi = require('joi');
-const { ALL_STATUS_VALUES } = require('../services/job.service');
+const { ALL_STATUS_VALUES, SORTABLE_COLUMNS, OFFER_STATE_VALUES } = require('../services/job.service');
 
 const intId   = Joi.number().integer().positive();
 /*
@@ -61,6 +61,19 @@ const listQuery = Joi.object({
   // tab. URLSearchParams ships the value as the string 'true'/'false';
   // accept both shapes for parity with the other boolean-ish filters.
   noServices: Joi.alternatives(Joi.boolean(), Joi.string().valid('true', 'false')).optional(),
+  /*
+   * `offerState` (2026-07-31) — the Pending-for-Scheduling tab's SUB-STATE
+   * filter. That tab is a bucket (status=0 + assigned=false), so every job in
+   * it already shares one job_status; the axis worth filtering is the OFFER
+   * lifecycle inside the bucket:
+   *   'pending' → never offered   'offered' → an OPEN offer exists
+   *   'expired' → offers exist, none open
+   * It NARROWS — it never replaces the caller's status / assigned pins.
+   * `''` is allowed (and ignored) so the FE can clear the control without
+   * having to strip the key. Values derive from the service's
+   * OFFER_STATE_VALUES so the two sides cannot drift.
+   */
+  offerState: Joi.string().valid(...OFFER_STATE_VALUES).allow('').optional(),
   // clientId / cityId — single id OR CSV list (Pending-to-Start multi-select
   // Clients / Cities filters). csvIds keeps a lone id valid for back-compat.
   clientId: csvIds.optional(),
@@ -88,6 +101,23 @@ const listQuery = Joi.object({
   stateId:    intId.optional(),
   categoryId: intId.optional(),
   verticalId: intId.optional(),
+  /*
+   * `sourceType` (2026-08-07) — exact match on tbl_job.source_type, the
+   * booking-CHANNEL label ('website', 'Bulk Upload', 'Client_App',
+   * 'New Dashboard', 'PowerMax API', 'manual', …). The column was already
+   * projected + sortable on the list endpoint but not filterable.
+   *
+   * Added for the CRM's "Unmapped Website Bookings" preset, which combines it
+   * with `status=9` + `clientId=1` (the RETAIL catch-all) to surface public
+   * website bookings whose QR link carried no valid tbl_client.reference_code.
+   * Kept GENERIC on purpose — any channel is filterable, not just 'website' —
+   * so a future "all Client_App orders" view needs no new param.
+   *
+   * `max(50)` matches the column width and the create/update validators below.
+   * Comparison is a plain `=` in service.list(); MySQL's default collation is
+   * case-insensitive, so 'website' matches regardless of stored casing.
+   */
+  sourceType: Joi.string().max(50).optional(),
   dateType:   Joi.string().valid('booked', 'scheduled', 'completed', 'ticket', 'requested').optional(),
   // Phase-2 filters (2026-05-19).
   //   rating  — exact match against tbl_easyfixer_rating_by_customer.customer_rating
@@ -122,16 +152,24 @@ const listQuery = Joi.object({
     Joi.string().valid('now'),
     Joi.date().iso(),
   ).optional(),
-  // Server-side sort (whitelisted). sortBy must be one of the sortable list
-  // columns; sortDir asc|desc. Both optional — absent → default job_id DESC.
-  // The service also whitelists (SORT_COLUMN) so an unknown value is a safe
-  // no-op, never raw SQL.
-  sortBy: Joi.string().valid(
-    'job_id', 'job_reference_id', 'client_ref_id', 'created_date_time',
-    'client_name', 'city_name', 'job_status', 'job_type', 'requested_date_time',
-    'scheduled_date_time', 'checkin_date_time', 'checkout_date_time',
-    'customer_name', 'customer_mob_no', 'source_type', 'easyfixer_name', 'owner_name',
-  ).optional(),
+  /*
+   * Server-side sort (whitelisted). sortDir asc|desc. Both optional — absent →
+   * default job_id DESC.
+   *
+   * `sortBy` is derived from the SERVICE's SORTABLE_COLUMNS keys rather than
+   * being re-listed here. The two whitelists previously had to be maintained by
+   * hand on both sides, and a key present in only one of them is silently
+   * dropped — the list then falls back to the default job_id DESC order with no
+   * error, which is exactly the regression this endpoint hit before. Deriving
+   * makes BE-side drift structurally impossible. (Same pattern as
+   * routes/admin/tools.js, service-types.js, users.js, etc.)
+   *
+   * Includes 'age' — NOT a tbl_job column: the service maps it to
+   * JOB_AGE_SECS_EXPR (precise seconds), so same-day jobs order correctly
+   * instead of tying on the floored day value the UI displays. The FE keeps its
+   * own sortable-column list and must list 'age' there too.
+   */
+  sortBy: Joi.string().valid(...Object.keys(SORTABLE_COLUMNS)).optional(),
   sortDir: Joi.string().valid('asc', 'desc').optional(),
   limit: Joi.number().integer().min(1).max(500).default(50),
   offset: Joi.number().integer().min(0).default(0),
@@ -248,6 +286,15 @@ const createBody = Joi.object({
   // (no slashes / nulls) by file-storage on the upload step, so by the
   // time it reaches here it's safe to round-trip.
   job_image_filename: Joi.string().max(255).allow('', null).optional(),
+  // job_image_filenames (2026-08-07) — plural sibling of the field above,
+  // for callers that collect several booking photos in one submission.
+  // Each item mirrors the singular rule EXACTLY (string, max 255, ''/null
+  // tolerated so a form that pads empty slots isn't 400'd); job.service's
+  // normaliseJobImageFilenames() drops the blanks and de-duplicates against
+  // the singular field. Capped at 5 to match the public website-booking
+  // photo limit (routes/public/website-booking.js MAX_PHOTOS) — the only
+  // surface that sends more than one today.
+  job_image_filenames: Joi.array().items(Joi.string().max(255).allow('', null)).max(5).optional(),
   customer: customerBlock,
   address: addressBlock,
   services: Joi.array().items(serviceItem).optional(),
@@ -309,7 +356,18 @@ const updateBody = Joi.object({
   efr_special_notes: Joi.string().max(2000).optional(),
   exp_tat: Joi.string().max(50).optional(),
   booking_cut_off_time: Joi.number().integer().optional(),
-  booking_cut_off_time_slot: Joi.string().max(100).optional(),
+  /*
+   * booking_cut_off_time_slot was declared TWICE in this same object — once
+   * above as `.max(50).allow('', null)` and again here as `.max(100)`. The
+   * later key wins in an object literal, so the one in force was this one, and
+   * `.allow('', null)` was silently discarded: a caller sending '' or null for
+   * that legacy column got a 400 that the author 40 lines up had explicitly
+   * allowed. Found by ESLint's no-dupe-keys the first time this repo was linted.
+   *
+   * Removed rather than merged: the two sibling declarations of this key (here
+   * and in the create schema) both use max(50).allow('', null), so that is the
+   * intent, and the column is COALESCE-backfilled and routinely empty.
+   */
   // Services replacement — when present, tbl_job_services rows for this job
   // are wiped and these inserted. Used by the Unconfirmed-order Confirm flow.
   services: Joi.array().items(serviceItem).optional(),

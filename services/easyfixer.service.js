@@ -689,7 +689,25 @@ async function listTransactions(efrId, { limit = 10, offset = 0 } = {}) {
             J.scheduled_date_time   AS appointment_date_time,
             J.checkout_date_time    AS completion_date_time,
             J.job_status            AS job_status,
-            cu.customer_name        AS customer_name,
+            /*
+             * customer_name (2026-08-03) — every row here is ONE JOB's
+             * transaction, so the name shown is the one typed at booking
+             * (tbl_job.job_customer_name), falling back to the customer-master
+             * name only when the job carries none. Alias unchanged, so
+             * EasyfixerTransactionsModal.tsx (reads t.customer_name) is untouched.
+             *
+             * NULLIF(TRIM(...), '') is load-bearing: COALESCE treats only NULL
+             * as absent, so a plain COALESCE(J.job_customer_name, ...) would
+             * render a BLANK name whenever job_customer_name is '' or spaces.
+             * That value is reachable -- validators/job.validator.js allows ''
+             * and the create path binds it through the ?? operator, which
+             * guards null/undefined only. (No backtick characters in this
+             * comment -- it lives inside a JS template literal; see the
+             * LIST_COLUMNS note at the top of this file.)
+             * J is already joined below AND in the COUNT query above, so this
+             * projection adds no join and cannot break the paginated total.
+             */
+            COALESCE(NULLIF(TRIM(J.job_customer_name), ''), cu.customer_name) AS customer_name,
             cu.customer_mob_no      AS customer_mob_no,
             ad.address              AS customer_address,
             ad.building             AS customer_building,

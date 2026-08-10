@@ -7,6 +7,7 @@ const kaleyra = require('../../services/kaleyra.service');
 const plivo = require('../../services/plivo.service');
 const voice = require('../../services/voice.service');
 const plivoLog = require('../../services/plivo-call-log.service');
+const conference = require('../../services/plivo-conference.service');
 const recordingBackfill = require('../../services/recording-backfill.service');
 // The route layer talks ONLY to the mode service: it owns the transcript-vs-
 // recording branch, the provider clients behind each, and the provenance stamp.
@@ -30,7 +31,7 @@ function coarseFlow(body) {
   return null;
 }
 const { getEffectivePermissions } = require('../../services/role.service');
-const { clickToCallBody, callListQuery } = require('../../validators/calls.validator');
+const { clickToCallBody, callListQuery, webCallFailedBody } = require('../../validators/calls.validator');
 
 /*
  * /api/admin/calls — operator-driven outbound calls + call history.
@@ -403,15 +404,79 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
     const jci = insertResult.insertId;
     logger.info('Call audit row inserted · row=' + jci + ' · provider=' + resolvedProvider);
 
+    /*
+     * ── EVERY PLIVO CALL STARTS AS A ONE-PARTICIPANT CONFERENCE ──────────────
+     *
+     * Ops sees no difference: they click Call, it rings, they talk. But because
+     * the operator's leg is already a Multi-Party Call participant, a second or
+     * third person can be added MID-CALL. Plivo has no API to promote a live
+     * <Dial> into a conference, so a call that does not start this way can never
+     * gain one — the only recovery is hang up and redial, which is exactly the
+     * experience this feature exists to remove.
+     *
+     * Cost is unchanged: the same two legs (operator + receiver) as the classic
+     * bridge, so the same per-minute billing and the same concurrency slots.
+     *
+     * DB-only — createConference never calls Plivo. The room does not exist
+     * until the operator's answer XML joins it, which is why the friendly name
+     * has to be minted here, before the call is placed.
+     *
+     * FAIL-SOFT, DELIBERATELY. If the conference cannot be created (Plivo
+     * disabled, concurrency ceiling, DB error) the call still goes out on the
+     * classic <Dial> bridge. Ops loses the ability to add a participant to THAT
+     * call; they do not lose the call. Kaleyra has no live surface at all, so it
+     * never takes this path.
+     */
+    /*
+     * Which ROLE the receiver plays, derived from the identifier the caller
+     * supplied — resolveReceiver returns digits and a name but not a kind, and
+     * widening it would touch the web-call path that shares it. The participant
+     * row records this so the panel can label the leg ("technician", not just a
+     * number) and so an audit reads as people rather than digits.
+     */
+    const receiverKind = efrId ? 'technician'
+      : reportingContactId ? 'client_contact'
+      : spocJobId ? 'job_spoc'
+      : (jobId && useAlt) ? 'customer_alt'
+      : 'customer';
+
+    let conferenceId = null;
+    let conferenceName = null;
+    if (resolvedProvider === 'plivo' && conference.conferenceEnabled()) {
+      const conf = await conference.createConference({
+        jobId: jobIdToStore,
+        startedByUserId: agent.user_id,
+        jobCallerInfoId: jci,
+        jobStatusSnap: jobStatusSnapshot,
+        jobEfrIdSnap: jobEfrId,
+        operatorNumber: dialFrom,
+        operatorName: agent.user_name,
+      }, pool);
+      if (conf.ok) {
+        conferenceId = conf.conferenceId;
+        conferenceName = conf.friendlyName;
+        logger.info('Conference created · row=' + jci + ' · confId=' + conferenceId + ' · name=' + conferenceName);
+      } else {
+        logger.warn('Conference NOT created · row=' + jci + ' · ' + conf.code + ' · ' + conf.message
+          + ' — falling back to the classic bridge (this call cannot gain participants)');
+      }
+    }
+
     // ── Place the call via the provider factory ──
     // voice.clickToCall resolves the provider, stamps it on the result, and
     // (for Plivo) signs jobCallerInfoId into the callback token so the
-    // webhooks can find this exact row.
+    // webhooks can find this exact row. When a conference was minted above, its
+    // name rides the same token and the answer XML joins the MPC instead of
+    // dialling — see routes/public/plivo-answer.js.
     const callResult = await voice.clickToCall({
       provider,
       from: dialFrom,
       to:   dialTo,
       jobCallerInfoId: jci,
+      conferenceName,
+      conferenceId,
+      receiverKind,
+      receiverName,
     });
 
     if (!callResult.delivered) {
@@ -493,6 +558,10 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
       jobCallerInfoId: jci,
       callId: callResult.callId || null,
       provider: callResult.provider,
+      // The conference this leg joined, or null when it fell back to the classic
+      // bridge. The FE opens the participant section on this — a null means the
+      // call works but cannot gain participants, which is worth showing.
+      conferenceId,
       // supportsLiveStatus tells the FE whether to open the live status panel
       // (Plivo) or just toast (Kaleyra, post-call report only).
       supportsLiveStatus: !!callResult.supportsLiveStatus,
@@ -525,7 +594,185 @@ router.get('/web-credentials', requireClickToCallAction, (req, res) => {
   // callerId is the company DID the browser dials INTO (a valid phone number —
   // the SDK requires a real number as the destination); the answer URL ignores
   // it and bridges to the customer resolved from the X-PH-Dialid header.
-  return modernOk(res, { token, callerId: process.env.PLIVO_CALLER_ID || null });
+  /*
+   * PLIVO_WEB_APP_ID IS NOT VALIDATED ABOVE, AND ITS ABSENCE IS INVISIBLE.
+   *
+   * webAccessToken() sets the token's `app` claim only when this env var is
+   * present, and simply omits it when it is not. So an unset value produces a
+   * perfectly valid token, a successful SDK login, and then EVERY outgoing call
+   * failing at signalling — because Plivo has no Voice Application to route the
+   * browser leg to, and therefore never fetches our /web-answer URL. From the
+   * server's side that is indistinguishable from silence: no request, no log,
+   * nothing to debug against.
+   *
+   * Reported, NOT enforced. A hard 500 here would take web calling down in any
+   * environment that works today by way of an application assigned to the
+   * endpoint itself rather than pinned on the token — which is a legitimate
+   * Plivo setup. So: ERROR in the logs, and a `warnings` array on the payload so
+   * the operator's own screen can say what is missing instead of showing "Busy".
+   */
+  const warnings = [];
+  if (!(process.env.PLIVO_WEB_APP_ID || '').trim()) {
+    warnings.push('PLIVO_WEB_APP_ID is not set — the access token carries no `app` claim, so Plivo '
+      + 'has no Voice Application to route the browser leg to. Outgoing calls typically fail as '
+      + '"Busy" and /api/public/plivo/web-answer is never called.');
+  }
+  if (!(process.env.PLIVO_CALLER_ID || '').trim()) {
+    warnings.push('PLIVO_CALLER_ID is not set — the browser has no destination to dial.');
+  }
+  /*
+   * Read the env directly rather than calling plivo.callbackBase(): that helper
+   * exists but is NOT exported, so `plivo.callbackBase()` would throw a
+   * TypeError and take this endpoint — and with it all web calling — down
+   * completely. Worth recording because `no-undef` does NOT catch this: a
+   * property access on an imported object is valid to the linter, and only
+   * executing the line finds it. Same lesson as the 500 that started this.
+   */
+  if (!(process.env.PLIVO_CALLBACK_BASE_URL || process.env.PUBLIC_API_BASE_URL || '').trim()) {
+    warnings.push('PLIVO_CALLBACK_BASE_URL / PUBLIC_API_BASE_URL is not set — Plivo cannot reach '
+      + 'our callbacks even once the application routes the call.');
+  }
+  for (const w of warnings) logger.error('Web calling misconfigured · ' + w);
+
+  return modernOk(res, {
+    token,
+    callerId: process.env.PLIVO_CALLER_ID || null,
+    // Empty on a healthy environment. Non-empty means the browser will get a
+    // token it can log in with and calls that cannot complete.
+    warnings,
+  });
+});
+
+/* ─── GET /web-diagnostics — ask PLIVO what it thinks our setup is ────────
+ *
+ * ⚠ ON-DEMAND ONLY. This makes live provider calls; nothing polls it.
+ *
+ * WHY THIS EXISTS. Web calling failed for days with the browser SDK reporting
+ * "Busy" and our server logging NOTHING — because when Plivo cannot route the
+ * browser leg to a Voice Application it never fetches our answer URL, so there
+ * is no request to log. Every check we owned came back clean: the token was
+ * issued, the env vars were set, `warnings` was empty. All of which is true and
+ * none of which is the question. The question is what PLIVO has stored, and the
+ * only honest way to answer it is to ask Plivo.
+ *
+ * `warnings` on /web-credentials can only tell you a variable is UNSET. It
+ * cannot tell you the app id is set to an application that was deleted, or
+ * disabled, or whose Answer URL still points at last quarter's host. Those look
+ * identical from here and are the failures that survive a config review.
+ *
+ * Reports, never enforces, and never throws: this is the endpoint you open when
+ * calling is already broken, so it must not be capable of breaking anything.
+ * Secrets stay out of the response — an answer URL and an app name are
+ * configuration, not credentials, and the auth token is never echoed.
+ */
+router.get('/web-diagnostics', requireClickToCallAction, async (req, res) => {
+  logger.info('Plivo web diagnostics requested · by=' + req.user.user_id);
+  const checks = [];
+  const add = (name, ok, detail) => checks.push({ name, ok, detail });
+
+  const authId = (process.env.PLIVO_AUTH_ID || '').trim();
+  const authToken = (process.env.PLIVO_AUTH_TOKEN || '').trim();
+  const appId = (process.env.PLIVO_WEB_APP_ID || '').trim();
+  const endpointUser = (process.env.PLIVO_ENDPOINT_USERNAME || '').trim();
+  const base = (process.env.PLIVO_CALLBACK_BASE_URL || process.env.PUBLIC_API_BASE_URL || '').replace(/\/+$/, '');
+  const expectedAnswerUrl = base ? `${base}/api/public/plivo/web-answer` : null;
+
+  if (!authId || !authToken) {
+    add('Plivo credentials', false, 'PLIVO_AUTH_ID / PLIVO_AUTH_TOKEN are not set — nothing else can be checked.');
+    return modernOk(res, { checks, expectedAnswerUrl });
+  }
+
+  const auth = 'Basic ' + Buffer.from(`${authId}:${authToken}`).toString('base64');
+  const get = async (path) => {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 8000);
+    try {
+      const r = await fetch(`https://api.plivo.com/v1/Account/${encodeURIComponent(authId)}${path}`,
+        { method: 'GET', headers: { Authorization: auth }, signal: ctrl.signal });
+      const text = await r.text();
+      let json = null;
+      try { json = JSON.parse(text); } catch { /* non-JSON body */ }
+      return { httpStatus: r.status, ok: r.status >= 200 && r.status < 300, json, text };
+    } catch (e) {
+      return { httpStatus: 0, ok: false, json: null, text: String(e && e.message) };
+    } finally { clearTimeout(t); }
+  };
+
+  // ── The application the browser token pins the call to.
+  let appAnswerUrl = null;
+  if (!appId) {
+    add('PLIVO_WEB_APP_ID', false,
+      'Not set. The access token carries no `app` claim, so Plivo has no Voice Application '
+      + 'to route the browser leg to and never calls our answer URL.');
+  } else {
+    const r = await get(`/Application/${encodeURIComponent(appId)}/`);
+    if (r.httpStatus === 404) {
+      add('Voice Application', false, `Plivo has no application with id ${appId}. PLIVO_WEB_APP_ID points at something that does not exist.`);
+    } else if (!r.ok) {
+      add('Voice Application', false, `Could not read application ${appId} from Plivo (http=${r.httpStatus}).`);
+    } else {
+      const a = r.json || {};
+      appAnswerUrl = a.answer_url || null;
+      add('Voice Application', true, `"${a.app_name || '(unnamed)'}" (${appId})`);
+      // `enabled` is a real field and a disabled app routes nothing.
+      if (a.enabled === false) add('Application enabled', false, 'This application is DISABLED in Plivo.');
+      if (!appAnswerUrl) {
+        add('Answer URL', false, 'This application has NO answer URL, so Plivo has nothing to fetch when the browser leg connects.');
+      } else if (expectedAnswerUrl && appAnswerUrl.replace(/\/+$/, '') !== expectedAnswerUrl) {
+        add('Answer URL', false,
+          `Plivo will fetch ${appAnswerUrl} — this server expects ${expectedAnswerUrl}. `
+          + 'A call routed to a different host will never reach our conference code.');
+      } else {
+        add('Answer URL', true, appAnswerUrl + (a.answer_method ? ` (${a.answer_method})` : ''));
+      }
+      if (!a.hangup_url) {
+        add('Hangup URL', false, 'Not set — a leg that dies at Plivo is never reported back, so its row stays open until the reaper.');
+      }
+    }
+  }
+
+  // ── The endpoint the browser logs in as, and which application it carries.
+  if (!endpointUser) {
+    add('PLIVO_ENDPOINT_USERNAME', false, 'Not set — no browser endpoint to log in as.');
+  } else {
+    const r = await get('/Endpoint/');
+    const list = (r.json && (Array.isArray(r.json.objects) ? r.json.objects : [])) || [];
+    if (!r.ok) {
+      add('Browser endpoint', false, `Could not list endpoints from Plivo (http=${r.httpStatus}).`);
+    } else {
+      const mine = list.find((e) => String(e.username || '') === endpointUser);
+      if (!mine) {
+        add('Browser endpoint', false,
+          `No endpoint named "${endpointUser}" on this account (${list.length} exist). Note Plivo APPENDS a `
+          + '12-digit suffix at creation — PLIVO_ENDPOINT_USERNAME must be the full generated username.');
+      } else {
+        add('Browser endpoint', true, `"${endpointUser}" exists.`);
+        /*
+         * An endpoint carries its OWN application, and it is the fallback when
+         * the token pins none. Reporting a disagreement matters: an endpoint
+         * pointing at a different app than PLIVO_WEB_APP_ID is a setup that
+         * works until someone edits the app they think is in use.
+         */
+        const attached = String(mine.application || '');
+        if (!attached) {
+          add('Endpoint application', false, 'No application attached to this endpoint — routing depends entirely on the token\'s `app` claim.');
+        } else if (appId && !attached.includes(appId)) {
+          add('Endpoint application', false, `The endpoint is attached to ${attached}, which is NOT PLIVO_WEB_APP_ID (${appId}).`);
+        } else {
+          add('Endpoint application', true, attached);
+        }
+      }
+    }
+  }
+
+  if (!base) {
+    add('Callback base', false, 'PLIVO_CALLBACK_BASE_URL / PUBLIC_API_BASE_URL is not set — conference status callbacks are disabled.');
+  }
+
+  const failing = checks.filter((c) => !c.ok);
+  for (const c of failing) logger.error(`Plivo web diagnostics · ${c.name} · ${c.detail}`);
+  logger.info(`Plivo web diagnostics · ${checks.length - failing.length}/${checks.length} checks passed`);
+  return modernOk(res, { checks, expectedAnswerUrl, healthy: failing.length === 0 });
 });
 
 // ─── POST /web-start — begin a Web (browser WebRTC) call ───────────────
@@ -546,6 +793,13 @@ router.post('/web-start', requireClickToCallAction, validate(clickToCallBody), a
     const agent = req.user;
 
     const rr = await resolveReceiver({ jobId, customerId, efrId, reportingContactId, spocJobId, useAlt, jobContextId });
+    // Same role derivation as /click-to-call — the participant row records WHO,
+    // not just digits, so the panel can label the leg and an audit reads as people.
+    const webReceiverKind = efrId ? 'technician'
+      : reportingContactId ? 'client_contact'
+      : spocJobId ? 'job_spoc'
+      : (jobId && useAlt) ? 'customer_alt'
+      : 'customer';
     if (!rr.ok) return modernError(res, rr.status, rr.message);
 
     const receiver = plivo.normaliseIndianPhone(rr.receiverMobile);
@@ -594,7 +848,57 @@ router.post('/web-start', requireClickToCallAction, validate(clickToCallBody), a
     // In QA this is the TEST number; the audit row above kept the real customer.
     // teleprompterSessionId (optional) rides along so web-answer can fork the call
     // audio to STT for a guided teleprompter call (additive; null ⇒ normal call).
-    const dialId = plivo.stashWebDial({ number: dialNumber, jci, teleprompterSessionId: req.body.teleprompterSessionId || null });
+    /*
+     * EVERY WEB CALL STARTS AS A ONE-PARTICIPANT CONFERENCE TOO.
+     *
+     * The twin of the block in /click-to-call. Conferencing must not depend on
+     * which dialling mode ops happens to be in — voice.call.mode is an operator
+     * ergonomics setting (ring my phone vs ring my browser), and nobody would
+     * expect it to decide whether a call can gain a third person. Plivo cannot
+     * upgrade a live <Dial>, so if this is skipped here, web-mode calls are
+     * permanently un-conferenceable.
+     *
+     * Same fail-soft rule: no conference ⇒ the call still goes out on the
+     * classic bridge, it simply cannot gain participants.
+     */
+    let webConferenceId = null;
+    let webConferenceName = null;
+    /*
+     * No provider check here, unlike /click-to-call. The web path IS Plivo by
+     * definition — it is the Plivo Browser SDK, guarded above by
+     * voice.callMode() !== 'web', and it calls plivo.* directly throughout.
+     * (Copying the mobile block's `resolvedProvider === 'plivo' &&` verbatim is
+     * what 500'd this route: that variable exists in /click-to-call, which has a
+     * provider to resolve, and does not exist here.)
+     */
+    if (conference.conferenceEnabled()) {
+      const conf = await conference.createConference({
+        jobId: rr.jobIdToStore,
+        startedByUserId: agent.user_id,
+        jobCallerInfoId: jci,
+        jobStatusSnap: rr.jobStatusSnapshot,
+        jobEfrIdSnap: rr.jobEfrId,
+        operatorNumber: agent.mobile_no || null,
+        operatorName: agent.user_name,
+      }, pool);
+      if (conf.ok) {
+        webConferenceId = conf.conferenceId;
+        webConferenceName = conf.friendlyName;
+        logger.info('Conference created (web) · row=' + jci + ' · confId=' + webConferenceId + ' · name=' + webConferenceName);
+      } else {
+        logger.warn('Conference NOT created (web) · row=' + jci + ' · ' + conf.code + ' · ' + conf.message
+          + ' — falling back to the classic bridge (this call cannot gain participants)');
+      }
+    }
+
+    const dialId = plivo.stashWebDial({
+      number: dialNumber, jci,
+      teleprompterSessionId: req.body.teleprompterSessionId || null,
+      conferenceName: webConferenceName,
+      conferenceId: webConferenceId,
+      receiverKind: webReceiverKind,
+      receiverName: rr.receiverName || null,
+    });
 
     // Dedicated Plivo call log (fail-soft) — for Plivo-only reconciliation.
     await plivoLog.record({
@@ -608,6 +912,9 @@ router.post('/web-start', requireClickToCallAction, validate(clickToCallBody), a
     logger.info(`Web call started · agent=${agent.user_name}(#${agent.user_id}) → ${rr.receiverName || rr.receiverCustomerId || 'customer'} · row=${jci}`);
     return modernOk(res, {
       jobCallerInfoId: jci,
+      // null when the conference could not be minted — the FE shows the
+      // "this call can't add participants" notice on exactly this.
+      conferenceId: webConferenceId,
       dialId,
       toMasked: plivo.maskForDisplay(receiver),
       receiverName: rr.receiverName || null,
@@ -1330,12 +1637,261 @@ router.post('/:id/hangup', requireClickToCallAction, async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+/* ─── POST /:jobCallerInfoId/web-failed — the browser leg never came up ─────
+ *
+ * ─── WHY THIS ROUTE EXISTS ────────────────────────────────────────────────
+ *
+ * In Web mode the operator's browser IS the first leg, which means its failures
+ * happen entirely OUTSIDE this server. When Plivo has no Voice Application to
+ * route that leg to (an unset PLIVO_WEB_APP_ID — see GET /web-credentials), the
+ * SDK gets an instant SIP 486 "Busy", /api/public/plivo/web-answer is never
+ * fetched, the receiver is never dialled, and NOT ONE REQUEST reaches us. The
+ * diagnostic existed only in the operator's browser console, so on the server
+ * side a totally broken configuration and a customer who simply did not pick up
+ * were the same row: 'initiated', forever. That is why the root cause took as
+ * long as it did to find, and this route is the fix for that specific blindness
+ * — it is a REPORT, not a control: it changes no call, it only records one.
+ *
+ * OWNERSHIP IS STRICTER HERE THAN ON /:id/hangup, deliberately. Hangup is an
+ * ACT on a call, so an Admin may perform it on someone else's. This is a
+ * first-person account of what one browser did — only the operator whose leg it
+ * was has one, and an Admin reporting a failure on a leg they never held would
+ * be writing hearsay into the audit trail. So: the starter, or 403.
+ */
+router.post(
+  '/:jobCallerInfoId/web-failed',
+  requireClickToCallAction,
+  validate(webCallFailedBody),
+  async (req, res, next) => {
+    try {
+      const id = parseRowId(req.params.jobCallerInfoId);
+      if (!id) logger.warn('Web call failure report rejected · invalid call id');
+      if (!id) return modernError(res, 400, 'invalid call id');
+      const reason = req.body.reason;
+
+      // Same row resolution as /:id/status and /:id/hangup — one call is one
+      // tbl_job_caller_info row, and caller_id is who started it.
+      const [[row]] = await pool.query(
+        `SELECT job_caller_info AS id, caller_id, caller_status
+           FROM tbl_job_caller_info
+          WHERE job_caller_info = ?
+          LIMIT 1`,
+        [id]
+      );
+      if (!row) logger.warn('Web call failure report · row not found · row=' + id);
+      if (!row) return modernError(res, 404, 'call not found');
+
+      const isOwner = row.caller_id != null && Number(row.caller_id) === Number(req.user.user_id);
+      if (!isOwner) {
+        logger.warn('Web call failure report denied · not the operator who started this leg · row=' + id
+          + ' · by=' + req.user.user_id);
+        return modernError(res, 403, 'You can only report failures on calls you started');
+      }
+
+      /*
+       * THE LINE THIS ROUTE IS FOR. `error`, not warn: a browser leg that never
+       * came up is an outage of the calling feature for that operator, and it
+       * has to be as loud as any other 5xx-class event in this file, because
+       * for months it was as quiet as nothing at all.
+       */
+      logger.error('Web call leg failed · row=' + id + ' · reason=' + reason
+        + ' · by=' + req.user.user_id + ' · status=' + (row.caller_status || '—'));
+
+      /*
+       * IDEMPOTENT, TWICE OVER. The FE can report the same failure more than
+       * once (a retry, a re-mounted panel, two SDK error events for one call),
+       * and a second report must be a clean 200 that changes nothing:
+       *
+       *   • the read below decides what we TELL the caller, and
+       *   • the UPDATE's own NOT IN guard — the same list routes/webhook/
+       *     plivo.js:136 uses — decides what we WRITE, so even two concurrent
+       *     reports cannot overwrite a terminal row or double-stamp end_time.
+       *
+       * The guard is against TERMINAL statuses only, not against 'answered':
+       * whatever a call did before, the operator's own leg reporting failure
+       * ends it, and a row left 'initiated' forever is the bug being fixed.
+       */
+      const alreadyTerminal = row.caller_status ? TERMINAL_STATUSES.has(row.caller_status) : false;
+      if (!alreadyTerminal) {
+        await pool.query(
+          `UPDATE tbl_job_caller_info
+              SET caller_status = 'failed', end_time = COALESCE(end_time, NOW()), is_updated = 1
+            WHERE job_caller_info = ?
+              AND caller_status NOT IN ('completed','busy','no_answer','failed','hungup')`,
+          [id]
+        );
+        // The leg row through the service that owns this table's SQL — the
+        // reason lands in hangup_cause, where every other terminal reason on
+        // tbl_plivo_call_log already lives, so the Calls list reads it without
+        // knowing web calls exist.
+        await plivoLog.markTerminalByJci(id, {
+          status: plivoLog.LEG_STATUS.FAILED,
+          hangupCause: reason,
+        });
+      }
+
+      return modernOk(res, {
+        jobCallerInfoId: id,
+        recorded: true,
+        // The FE shows the same "call failed" state either way; this only says
+        // whether THIS report is the one that moved the row.
+        alreadyTerminal,
+      });
+    } catch (e) { next(e); }
+  },
+);
+
 // Last-10-digits key for phone-number comparison — strips +91 / spaces /
 // punctuation so the legacy-formatted `caller`/`reciever` columns compare
 // cleanly against a job's stored party numbers. Empty string when < 10 digits.
 function last10(v) {
   const d = String(v ?? '').replace(/\D/g, '');
   return d.length >= 10 ? d.slice(-10) : '';
+}
+
+/*
+ * ═══════════════════════════════════════════════════════════════════════════
+ * CONFERENCE LEGS ON THE CALL-HISTORY SURFACES
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Since 2026-08-04 an ops call can gain people mid-call. A conference is ONE
+ * call that gained participants, and the data model says so exactly:
+ *
+ *   • tbl_job_caller_info  — still exactly ONE row per call. Nothing that
+ *                            counts calls changes, here or in any report.
+ *   • tbl_plivo_call_log   — one row per LEG, all sharing that call's
+ *                            job_caller_info_id, each carrying conference_id +
+ *                            participant_role.
+ *
+ * That makes job_caller_info_id genuinely 1:N, which has one consequence this
+ * endpoint has to handle deliberately: the INNER JOIN below would FAN OUT and a
+ * 3-party conference would read as three calls — three near-identical rows all
+ * carrying the same jci id, and a `total` of 3. So the join is restricted to the
+ * PRIMARY leg and the extra legs are returned as NESTED DETAIL instead:
+ *
+ *   ONE row per call, exactly as before  ⇒  every count is unchanged.
+ *   legs[] on that row, labelled by role ⇒  the detail is not lost.
+ *
+ * `conference_id IS NULL` is true for every ordinary 1:1 call and for every row
+ * written before this feature existed, so for all historical data the restricted
+ * join selects precisely the rows the unrestricted one did. This is not a count
+ * change dressed up as a fix — it is the absence of one.
+ */
+
+// Leg role → the SAME human labels resolveJobParties() already produces, so a
+// leg and a top-level row never describe the same person two different ways.
+// 'custom' is an arbitrary number the operator typed: it is on the call, but it
+// is not one of the job's parties, so 'Other' is the honest label.
+const LEG_ROLE_LABEL = Object.freeze({
+  operator: 'Operator',
+  customer: 'Customer',
+  customer_alt: 'Alternate',
+  technician: 'Technician',
+  job_spoc: 'Client SPOC',
+  client_contact: 'Client Contact',
+  custom: 'Other',
+});
+
+// Legs per conference are 2–5 in practice. This bounds the batch read so a page
+// full of conferences can never fan out unboundedly; a hit cap is logged and
+// drops WHOLE conferences off the tail (the ORDER BY makes the cut fall between
+// rooms), never half a room's legs beside a full leg_count.
+const LEGS_PER_CONFERENCE_BUDGET = 12;
+
+/*
+ * Load every leg of the conferences appearing on ONE page of call history, in
+ * ONE query, and index them by conference_id.
+ *
+ * ⚠ NUMBERS ARE MASKED STRUCTURALLY, exactly as the live conference panel does
+ * it: neither dialed_number nor receiver_number is SELECTED — only the first
+ * four digits leave the database, as `number_prefix`, and the 9812•••••• form is
+ * rebuilt from them. Do not widen this projection.
+ *
+ * Fail-soft: a pre-migration environment has no conference_id column, so the
+ * probe short-circuits and every call simply renders with no legs — which is
+ * what it looked like before conferences existed.
+ */
+async function loadConferenceLegs(conferenceIds) {
+  const ids = [...new Set((conferenceIds || []).filter((v) => v != null).map(Number))];
+  if (!ids.length) return new Map();
+  if (!(await plivoLog.hasConferenceColumns())) return new Map();
+  const cap = Math.min(ids.length * LEGS_PER_CONFERENCE_BUDGET, 2000);
+  let rows = [];
+  try {
+    [rows] = await pool.query(
+      `SELECT id,
+              conference_id,
+              job_caller_info_id,
+              participant_role,
+              receiver_name AS display_name,
+              LEFT(RIGHT(dialed_number, 10), 4) AS number_prefix,
+              status,
+              hangup_cause,
+              call_flow,
+              initiated_on,
+              answered_on,
+              ended_on,
+              duration
+         FROM tbl_plivo_call_log
+        WHERE conference_id IN (${ids.map(() => '?').join(',')})
+        ORDER BY conference_id ASC, id ASC
+        LIMIT ?`,
+      [...ids, cap],
+    );
+  } catch (e) {
+    // A call list that 500s because the conference detail could not be loaded
+    // would be a worse outcome than a call list without the detail.
+    logger.warn('Conference legs load failed (call history renders without them) · ' + e.message);
+    return new Map();
+  }
+  if (rows.length >= cap) logger.warn(`Call history conference legs hit the ${cap}-row cap`);
+
+  const byConference = new Map();
+  for (const r of rows) {
+    const list = byConference.get(Number(r.conference_id)) || [];
+    list.push({
+      id: r.id,
+      conference_id: Number(r.conference_id),
+      job_caller_info_id: r.job_caller_info_id ?? null,
+      participant_role: r.participant_role || null,
+      // The label the UI shows. `party_role` is named to match the top-level
+      // row's own field, so a tooltip can render both with one code path.
+      party_role: LEG_ROLE_LABEL[r.participant_role] || 'Other',
+      display_name: r.display_name || null,
+      masked_number: r.number_prefix ? `${r.number_prefix}••••••` : null,
+      status: r.status || null,
+      hangup_cause: r.hangup_cause || null,
+      call_flow: r.call_flow || null,
+      initiated_on: r.initiated_on || null,
+      answered_on: r.answered_on || null,
+      ended_on: r.ended_on || null,
+      duration: r.duration ?? null,
+    });
+    byConference.set(Number(r.conference_id), list);
+  }
+  return byConference;
+}
+
+/*
+ * Attach the conference detail to a page of call-history rows.
+ *
+ * A row that is not a conference gets `legs: []` and `leg_count: 0` rather than
+ * nulls, so the FE never has to branch on shape — only on `is_conference`.
+ *
+ * `is_primary` marks the leg that IS this row (the operator's), so a consumer
+ * can render "and 2 others" without double-counting the call it is already
+ * showing. That flag is why the operator's leg is included at all: dropping it
+ * would make the array read as the whole room when it is the room minus one.
+ */
+async function attachConferenceLegs(rows) {
+  const legsByConference = await loadConferenceLegs(rows.map((r) => r.conference_id));
+  for (const r of rows) {
+    const legs = (r.conference_id != null && legsByConference.get(Number(r.conference_id))) || [];
+    r.is_conference = legs.length > 1;
+    r.leg_count = legs.length;
+    r.legs = legs.map((l) => ({ ...l, is_primary: Number(l.id) === Number(r.leg_id) }));
+  }
+  return rows;
 }
 
 /*
@@ -1437,7 +1993,32 @@ router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
         + "\n                   ELSE COALESCE(JSON_UNQUOTE(JSON_EXTRACT(pcl.call_analysis, '$.analysis_mode')), 'transcript')"
         + "\n              END AS analysis_mode"
       : '';
-    const plivoJoin = 'JOIN tbl_plivo_call_log pcl ON pcl.job_caller_info_id = jci.job_caller_info';
+    /*
+     * ⚠ THE PRIMARY-LEG RESTRICTION — see the CONFERENCE LEGS block above.
+     *
+     * Without it a conference fans this INNER JOIN out into one row per leg and
+     * `total` counts a 3-party call as three. With it, ONE row per call, and the
+     * extra legs come back as nested detail from attachConferenceLegs().
+     *
+     * It lives in the ON clause rather than the WHERE so `whereSql` (which the
+     * COUNT and the page share) stays exactly what the caller's filters built.
+     * Probe-gated: pre-migration the columns do not exist, the predicate is
+     * empty, and this query is byte-for-byte the one that shipped before.
+     *
+     * NOT COUNT(DISTINCT jci.job_caller_info), deliberately: the page and the
+     * count must select the same rows. A DISTINCT count with a fan-out page
+     * would print "1 call" above three rows, which is a different lie.
+     */
+    const hasConfCols = await plivoLog.hasConferenceColumns();
+    const primaryLegOnly = hasConfCols
+      ? " AND (pcl.conference_id IS NULL OR pcl.participant_role = 'operator')"
+      : '';
+    const plivoJoin = `JOIN tbl_plivo_call_log pcl ON pcl.job_caller_info_id = jci.job_caller_info${primaryLegOnly}`;
+    // leg_id identifies WHICH tbl_plivo_call_log row this call-history row came
+    // from, so attachConferenceLegs() can flag it `is_primary` among the legs.
+    const confSelect = hasConfCols
+      ? ',\n              pcl.id            AS leg_id,\n              pcl.conference_id,\n              pcl.participant_role'
+      : '';
 
     const [[{ total }]] = await pool.query(
       `SELECT COUNT(*) AS total FROM tbl_job_caller_info jci ${plivoJoin} ${whereSql}`,
@@ -1463,7 +2044,7 @@ router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
               jci.location,
               jci.provider,
               jci.inserted_time,
-              jci.is_updated${txSelect}${flowSelect}${anaSelect}
+              jci.is_updated${txSelect}${flowSelect}${anaSelect}${confSelect}
          FROM tbl_job_caller_info jci
          ${plivoJoin}
          ${whereSql}
@@ -1472,13 +2053,44 @@ router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
       [...params, limit, offset]
     );
 
-    // When scoped to ONE job, label each row with the party the operator was
-    // on the call with. The counterparty is the non-operator leg: reciever on
-    // OUT calls (operator dialled out), caller on IN calls. We match its last-10
-    // digits against the job's known numbers so the UI can show "Customer" /
-    // "Client SPOC" / "Technician" instead of a bare number. Falls back to the
-    // name stamped on the row at call time, then 'Other' for anything unmatched
-    // (e.g. a number that has since changed on the job).
+    /*
+     * ── The conference detail (decision 3) ──
+     *
+     * ONE extra query, and only when the page actually contains a conference.
+     * Each row gains legs[] — every party who was on that call, labelled by
+     * role, MASKED — plus leg_count and is_conference. `total` above is
+     * untouched: this is detail added, never a count changed.
+     *
+     * This is what the per-job call-history tooltip (the ⓘ on Job #) renders,
+     * and it is also why the technician who was conferenced in is no longer
+     * invisible there: the leg carries its OWN participant_role and
+     * receiver_name, rather than inheriting the original receiver stamped on
+     * tbl_job_caller_info at click-to-call time (which is identical for every
+     * leg and would label the whole room 'Customer').
+     */
+    if (rows.length) await attachConferenceLegs(rows);
+
+    /*
+     * When scoped to ONE job, label each row with the party the operator was
+     * on the call with. The counterparty is the non-operator leg: reciever on
+     * OUT calls (operator dialled out), caller on IN calls. We match its last-10
+     * digits against the job's known numbers so the UI can show "Customer" /
+     * "Client SPOC" / "Technician" instead of a bare number. Falls back to the
+     * name stamped on the row at call time, then 'Other' for anything unmatched
+     * (e.g. a number that has since changed on the job).
+     *
+     * ⚠ TWO CLASSIFIERS, AND EACH IS RIGHT FOR ITS OWN LEVEL — this is the part
+     * that is easy to get backwards:
+     *
+     *   • the ROW is the CALL, so its party is derived from jci.reciever, the
+     *     number the operator originally dialled. participant_role on the
+     *     primary leg is 'operator', which describes the LEG, not the person on
+     *     the other end — using it here would label every call "Operator".
+     *   • each LEG carries its OWN participant_role and receiver_name, so
+     *     legs[].party_role is derived from those (in loadConferenceLegs) and
+     *     never from jci.reciever, which is identical on every leg of the call
+     *     and would label the whole room "Customer".
+     */
     if (jobId && rows.length) {
       const byDigits = new Map();
       for (const p of await resolveJobParties(jobId)) {
