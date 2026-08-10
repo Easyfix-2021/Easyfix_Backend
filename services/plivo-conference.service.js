@@ -1084,6 +1084,15 @@ const _lastReconcileMs = new Map();
 const ABSENT_ROOM_GRACE_MS = 20000;
 
 /*
+ * Slack on top of Plivo's ring timeout before reconciliation is willing to call
+ * an un-joined leg a no-answer. Covers the gap between "we asked Plivo to dial"
+ * and "Plivo started ringing", plus clock skew between this process and theirs.
+ * Erring long costs a few seconds of a stale "Dialling"; erring short marks a
+ * ringing phone as unanswered while it is still ringing.
+ */
+const RING_OVERRUN_GRACE_SEC = 15;
+
+/*
  * reconcileParticipants(conferenceId, pool) → { ok, changed, code? }
  *
  * ⚠ THIS IS WHAT MAKES PARTICIPANT STATUS CORRECT WHEN THE WEBHOOK NEVER COMES,
@@ -1255,9 +1264,40 @@ async function reconcileParticipants(conferenceId, pool) {
        * stuck-leg sweep is what eventually retires one that never got an id.
        */
       if (!uuid && !member) continue;
+
+      /*
+       * ⚠ ABSENT ONLY MEANS "LEFT" IF THEY WERE EVER THERE.
+       *
+       * listParticipants returns who is IN the room — not who is being dialled
+       * towards it. So a leg that is still RINGING is absent by definition, and
+       * the first version of this closed it on the spot: a participant added by
+       * Other Number showed "Left" within two seconds while their phone was
+       * still ringing, and again while they were mid-conversation, because the
+       * roster had not caught up. It only spared the legs that happened to
+       * answer before the first reconcile — which is why it looked like a
+       * custom-number bug rather than a race.
+       *
+       * A leg we have never observed JOINED cannot have left. What it can do is
+       * ring forever, so it is still closed — but as the no-answer it actually
+       * is, and only once Plivo's own ring timeout has genuinely elapsed. Before
+       * that, the honest answer is "still ringing".
+       */
+      if (leg.status !== LEG_STATUS.JOINED) {
+        const startedMs = leg.created_on ? new Date(leg.created_on).getTime() : NaN;
+        const ringMs = (ringTimeoutSec() + RING_OVERRUN_GRACE_SEC) * 1000;
+        if (!Number.isFinite(startedMs) || Date.now() - startedMs < ringMs) continue;
+        changed += await legs.markConferenceLegStatus(leg.id, {
+          status: LEG_STATUS.NO_ANSWER,
+          from: [LEG_STATUS.DIALLING, LEG_STATUS.RINGING],
+          endedOn: true,
+          hangupCause: 'reconciled_no_answer',
+        }, pool);
+        continue;
+      }
+
       changed += await legs.markConferenceLegStatus(leg.id, {
         status: LEG_STATUS.LEFT,
-        from: ACTIVE_PARTICIPANT_STATUSES,
+        from: [LEG_STATUS.JOINED],
         endedOn: true,
         hangupCause: 'reconciled_absent',
       }, pool);

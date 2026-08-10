@@ -963,3 +963,71 @@ test('a RUNNING room promotes a dialling leg Plivo reports as present', async ()
   assert.equal(upd.params.includes('answered'), true);
   assert.equal(upd.params.includes('404'), true, 'and the member id lands, which un-breaks Remove From Call');
 });
+
+/*
+ * ── The ringing-leg race ──
+ *
+ * listParticipants returns who is IN the room, not who is being dialled toward
+ * it. Reconciliation closed anything absent from that list, so a leg that was
+ * merely still RINGING was stamped "Left" within seconds — visible in the panel
+ * as a participant marked gone while their phone was audibly ringing, and again
+ * while they were mid-conversation. It only spared legs that answered before the
+ * first reconcile, which disguised a race as a custom-number bug.
+ */
+test('a still-RINGING leg absent from the roster is NOT marked Left', async () => {
+  conferenceRow = freshConference({ id: 8805, status: 'live' });
+  legRows = [legRow({
+    id: 8815,
+    status: conf.LEG_STATUS.RINGING,
+    participant_uuid: 'cu-ringing',
+    member_id: null,
+    created_on: new Date(),          // dialled just now — still ringing
+  })];
+  nextResponses = [
+    reply(200, { status: 'active', mpc_uuid: 'mpc-live' }),
+    reply(200, { objects: [] }),     // nobody has JOINED yet — the normal case
+  ];
+
+  const r = await conf.reconcileParticipants(8805, dbPool);
+
+  assert.equal(r.ok, true);
+  assert.equal(r.changed, 0, 'absence from the roster is not an exit for someone who never entered');
+  assert.equal(sqlOf(/UPDATE tbl_plivo_call_log/i).length, 0);
+});
+
+test('a leg that has rung PAST the ring timeout is closed as no_answer, not as Left', async () => {
+  conferenceRow = freshConference({ id: 8806, status: 'live' });
+  legRows = [legRow({
+    id: 8816,
+    status: conf.LEG_STATUS.RINGING,
+    participant_uuid: 'cu-stale',
+    member_id: null,
+    created_on: new Date(Date.now() - 120000),   // 2 min: well past 45s + grace
+  })];
+  nextResponses = [
+    reply(200, { status: 'active', mpc_uuid: 'mpc-live' }),
+    reply(200, { objects: [] }),
+  ];
+
+  const r = await conf.reconcileParticipants(8806, dbPool);
+
+  assert.equal(r.changed, 1, 'a leg cannot ring forever — but it ends as what it was');
+  const upd = oneSql(/UPDATE tbl_plivo_call_log/i);
+  assert.equal(upd.params.includes('no_answer'), true, 'no_answer, because they never picked up');
+  assert.equal(upd.params.includes('completed'), false, '"Left" would claim they were once in the room');
+});
+
+test('a JOINED leg that Plivo no longer reports IS marked Left — the case that still works', async () => {
+  conferenceRow = freshConference({ id: 8807, status: 'live' });
+  legRows = [legRow({ id: 8817, status: conf.LEG_STATUS.JOINED, participant_uuid: 'cu-gone', member_id: '55' })];
+  nextResponses = [
+    reply(200, { status: 'active', mpc_uuid: 'mpc-live' }),
+    reply(200, { objects: [] }),     // they were here; now they are not
+  ];
+
+  const r = await conf.reconcileParticipants(8807, dbPool);
+
+  assert.equal(r.changed, 1);
+  const upd = oneSql(/UPDATE tbl_plivo_call_log/i);
+  assert.equal(upd.params.includes('completed'), true, 'observed in the room, then absent = they left');
+});
