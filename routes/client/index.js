@@ -2243,31 +2243,6 @@ const STAGE_LABEL = {
  * Routes through jobService.setStatus so it takes the same path ops uses —
  * job_status → 6 plus cancel_date_time / cancel_reason_id / cancel_comment.
  */
-router.post('/jobs/:id/cancel', validate(Joi.object({
-  comment: Joi.string().min(3).max(500).required(),
-  reasonId: Joi.number().integer().allow(null).optional(),
-})), async (req, res, next) => {
-  try {
-    const job = await jobService.getById(Number(req.params.id));
-    if (!job || job.fk_client_id !== req.spoc.client_id) {
-      logger.warn('Client cancel — job not found / not owned · id=' + req.params.id);
-      return modernError(res, 404, 'job not found');
-    }
-    if (job.job_status === 6) return modernError(res, 409, 'job is already cancelled');
-    if ([3, 5].includes(job.job_status)) return modernError(res, 409, 'cannot cancel a completed job');
-
-    // Legacy stamps cancel_by with the SPOC's linked USER (clientContact.getUser()).
-    const [[link]] = await pool.query('SELECT user_id FROM tbl_client_contacts WHERE id = ?', [req.spoc.id]);
-    logger.info('Client cancel job · id=' + job.job_id + ' · spoc=' + req.spoc.id + ' · user=' + (link?.user_id ?? '-'));
-    await jobService.setStatus(job.job_id, {
-      status: 6,
-      reasonId: req.body.reasonId ?? null,
-      comment: req.body.comment,
-    }, { user_id: link?.user_id ?? null });
-    modernOk(res, { cancelled: true, job_id: job.job_id });
-  } catch (e) { next(e); }
-});
-
 // ─── Job image upload (Book-a-service attachments) ───────────────────
 // Reuses the shared job-image service (same storage as the ops route: S3 with
 // a local-disk fallback + a tbl_job_image row). Scoped to the SPOC's client so
@@ -2277,20 +2252,6 @@ const jobImageService = require('../../services/job-image.service');
 const clientImageUpload = multerClientImg({
   storage: multerClientImg.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024, files: 1 },
-});
-
-router.post('/jobs/:id/images', clientImageUpload.single('file'), async (req, res, next) => {
-  const jobId = Number(req.params.id);
-  try {
-    const job = await jobService.getById(jobId);
-    if (!job || job.fk_client_id !== req.spoc.client_id) return modernError(res, 404, 'job not found');
-    const result = await jobImageService.uploadJobImage({ jobId, file: req.file, category: 'Booking' });
-    modernOk(res, result, 'image uploaded');
-  } catch (e) {
-    if (e?.code === 'LIMIT_FILE_SIZE') return modernError(res, 400, 'file exceeds 10MB');
-    if (e?.status === 400) return modernError(res, 400, e.message);
-    next(e);
-  }
 });
 
 // One canonical, stable URL for every job image regardless of storage backend
@@ -2396,28 +2357,6 @@ async function fireRejectEscalation(job, reason, spoc) {
  * code hardcoded that value; passing a `userType` query is allowed for
  * future flexibility but defaults to 3 for back-compat.
  */
-router.get('/lookup/reasons', async (req, res, next) => {
-  try {
-    const actionType = Number(req.query.actionType);
-    if (!Number.isInteger(actionType) || actionType <= 0) {
-      return modernError(res, 400, 'actionType (positive integer) is required');
-    }
-    const userType = Number(req.query.userType) || 3;
-    const [rows] = await pool.query(
-      `SELECT id, action_desc
-         FROM action_taken_reason
-        WHERE action_type = ? AND user_type = ?
-          AND (status IS NULL OR status = 1)
-        ORDER BY id ASC`,
-      [actionType, userType]
-    );
-    const items = rows
-      .map((r) => ({ id: r.id, label: String(r.action_desc || '').trim() }))
-      .filter((x) => x.label);
-    modernOk(res, items);
-  } catch (e) { next(e); }
-});
-
 /*
  * POST /api/client/jobs/:id/escalate
  * body: { reasonId: number, comment: string }
@@ -2433,75 +2372,6 @@ router.get('/lookup/reasons', async (req, res, next) => {
  * fireRejectEscalation helper so admins see the row immediately on the
  * Escalated Jobs dashboard.
  */
-router.post('/jobs/:id/escalate', validate(Joi.object({
-  reasonId: Joi.number().integer().positive().required(),
-  comment:  Joi.string().min(3).max(2000).required(),
-})), async (req, res, next) => {
-  try {
-    const job = await jobService.getById(Number(req.params.id));
-    if (!job || job.fk_client_id !== req.spoc.client_id) {
-      return modernError(res, 404, 'job not found');
-    }
-    const { reasonId, comment } = req.body;
-
-    // Resolve the human-readable reason once so the email is informative.
-    const [[reasonRow]] = await pool.query(
-      'SELECT action_desc FROM action_taken_reason WHERE id = ? LIMIT 1',
-      [reasonId]);
-    const reasonLabel = reasonRow?.action_desc || `Reason #${reasonId}`;
-
-    // Upsert escalation row — there's no unique constraint on (job_id),
-    // so we manually SELECT then UPDATE/INSERT. SPOC isn't a real
-    // tbl_user, so `escalated_by` is NULL and we tag `escalated_from`
-    // with the SPOC id for audit (legacy used the SPOC's user_id on the
-    // contact record, which most rows don't have).
-    const [[existing]] = await pool.query(
-      `SELECT table_id, no_of_escalations
-         FROM tbl_easyfixer_rating_by_customer
-        WHERE job_id = ?
-        LIMIT 1`,
-      [job.job_id]);
-    if (existing) {
-      await pool.query(
-        `UPDATE tbl_easyfixer_rating_by_customer
-            SET is_escalated      = 1,
-                escalated_time    = NOW(),
-                resolved_time     = NULL,
-                escalated_comments = ?,
-                no_of_escalations = COALESCE(no_of_escalations, 0) + 1,
-                escalated_from    = ?
-          WHERE table_id = ?`,
-        [`[${reasonLabel}] ${comment}`, `spoc:${req.spoc.id}`, existing.table_id]);
-    } else {
-      await pool.query(
-        `INSERT INTO tbl_easyfixer_rating_by_customer
-           (job_id, easyfixer_id, is_escalated, escalated_time,
-            escalated_comments, no_of_escalations, escalated_from)
-         VALUES (?, ?, 1, NOW(), ?, 1, ?)`,
-        [job.job_id, job.fk_easyfixter_id || null,
-         `[${reasonLabel}] ${comment}`, `spoc:${req.spoc.id}`]);
-    }
-
-    // Per-stage history row — mirrors what admin "Escalated Jobs"
-    // page reads via the GROUP_CONCAT(job_stage_history) subquery.
-    try {
-      await pool.query(
-        `INSERT INTO tbl_job_escalation_info
-           (job_id, escalation_time, job_stage)
-         VALUES (?, NOW(), ?)`,
-        [job.job_id, STATUS_LABELS_SAFE[job.job_status] || `Status ${job.job_status}`]);
-    } catch {
-      // History table is best-effort — don't fail the user's action if
-      // the table is missing on this environment.
-    }
-
-    // Same email shape as estimate reject, just relabelled. Best-effort.
-    fireRejectEscalation(job, `[Escalated by SPOC] ${reasonLabel}: ${comment}`, req.spoc).catch(() => {});
-
-    modernOk(res, { escalated: true }, 'Job Escalate Successfull');
-  } catch (e) { next(e); }
-});
-
 // Small status→label map used by the escalation history insert. Kept
 // local + lowercase-safe to avoid pulling the FE STATUS_LABELS over.
 const STATUS_LABELS_SAFE = {
@@ -3027,34 +2897,6 @@ router.get('/cities', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.get('/team', async (req, res, next) => {
-  try {
-    logger.info('List client team · clientId=' + req.spoc.client_id);
-    const [rows] = await pool.query(
-      `SELECT id, contact_name, contact_email, contact_no,
-              contact_desgn, manager_id, status, approval_by_client
-         FROM tbl_client_contacts
-        WHERE client_id = ?
-        ORDER BY contact_name`,
-      [req.spoc.client_id]);
-    const items = rows.map((r) => ({
-      id: r.id,
-      name: r.contact_name,
-      email: r.contact_email,
-      mobile: r.contact_no,
-      designation: r.contact_desgn,
-      managerId: r.manager_id,
-      status: r.status,
-      approvalByClient: r.approval_by_client,
-    }));
-    // isManager drives the Orders "Client Team" filter: only reporting managers
-    // (someone reports to them in the manager_id tree) get the team filter.
-    const { isManager } = await resolveClientHierarchy(req);
-    logger.info('Returning ' + items.length + ' team members · isManager=' + isManager);
-    modernOk(res, { items, isManager });
-  } catch (e) { next(e); }
-});
-
 // Per-SPOC booking breakdown for the Orders "Client Team" filter and the
 // per-SPOC Today's-jobs view. Lists everyone in the caller's reporting subtree
 // (themselves + all reports, recursively) with how many jobs each has booked
@@ -3167,34 +3009,6 @@ router.delete('/profile', async (req, res, next) => {
 // completed / cancelled, booking confirmed, …). Keyed by the SPOC's linked
 // Client user (req.clientUser.userId). Mirrors the legacy query exactly:
 //   WHERE user_id = ? GROUP BY job_id ORDER BY createdAt DESC.
-router.get('/notices', async (req, res, next) => {
-  try {
-    // Dashboard notifications for the logged-in CLIENT — matched by the client's
-    // jobs (dashboard_notification_log.job_id → tbl_job.fk_client_id), not by an
-    // individual user_id (those rows are keyed to whichever internal/SPOC user
-    // the event fired for, so a user-id filter misses the client's own events).
-    const [rows] = await pool.query(
-      `SELECT n.id, n.n_title, n.n_desc, n.status, n.job_id, n.createdAt
-         FROM dashboard_notification_log n
-         JOIN tbl_job j ON j.job_id = n.job_id
-        WHERE j.fk_client_id = ?
-        GROUP BY n.job_id
-        ORDER BY n.createdAt DESC
-        LIMIT 100`,
-      [req.spoc.client_id]);
-    const items = rows.map((r) => ({
-      notice_id: r.id,
-      title: r.n_title || 'Notification',
-      message: r.n_desc || null,
-      is_read: String(r.status).toLowerCase() === 'read',
-      created_at: r.createdAt,
-      job_id: r.job_id || null,
-    }));
-    logger.info('Notices · clientId=' + req.spoc.client_id + ' · count=' + items.length);
-    modernOk(res, { items });
-  } catch (e) { next(e); }
-});
-
 // Mark notifications read — a single id, or all of the client's notifications.
 // Scoped to the client's jobs (same matching as GET /notices).
 router.patch('/notices/read', async (req, res, next) => {
@@ -3253,21 +3067,6 @@ router.post('/device-token', async (req, res, next) => {
 // Customer lookup by mobile — powers the New Order auto-fill (name/email
 // prefill when the caller is an existing customer). Returns the most recent
 // matching customer, or { customer: null } when unknown.
-router.get('/customers/mobile/:mobile', async (req, res, next) => {
-  try {
-    const mobile = String(req.params.mobile || '').replace(/\D/g, '');
-    if (!/^\d{10}$/.test(mobile)) return modernOk(res, { customer: null });
-    const [[customer]] = await pool.query(
-      `SELECT customer_id, customer_name, customer_mob_no, customer_email
-         FROM tbl_customer
-        WHERE customer_mob_no = ?
-        ORDER BY customer_id DESC LIMIT 1`,
-      [mobile]);
-    logger.info('Customer lookup by mobile · found=' + (customer ? 'yes' : 'no'));
-    modernOk(res, { customer: customer || null });
-  } catch (e) { next(e); }
-});
-
 // Saved addresses for a customer, so Book-a-service can offer their previous
 // locations. Only the addresses used in this customer's LAST 3 jobs with THIS
 // client (deduped) — recent + relevant, never other clients' work.
