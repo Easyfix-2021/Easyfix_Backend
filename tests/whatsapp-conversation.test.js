@@ -6,10 +6,12 @@
  *
  *  1. BUTTON-PAYLOAD MATCHING — the approved Gallabox template
  *     `customer_interactive_msg` ships a MISSPELLED payload,
- *     "Need a Reschdeule". Gallabox matches on the payload string, so the
- *     outbound value must stay byte-for-byte wrong; inbound matching must be
- *     robust (case/whitespace) and must also survive a future re-approval that
- *     fixes the spelling. These tests are the tripwire against someone
+ *     "Need a Reschdeule". We send NO button component (the payloads are static
+ *     in the template — see the templateButtonValues test), so the constant is
+ *     load-bearing purely for INBOUND matching: the webhook reports whatever the
+ *     template defines, and our matcher must recognise it byte-for-byte while
+ *     also being robust to case/whitespace and surviving a future re-approval
+ *     that fixes the spelling. These tests are the tripwire against someone
  *     "correcting" the constant.
  *  2. PAST-DATE REJECTION — we must never write an appointment that has
  *     already gone by (the platform's past-appointment gate, in chat form).
@@ -43,12 +45,21 @@ test('the outbound reschedule payload keeps the UPSTREAM misspelling verbatim', 
   assert.equal(convo.BTN_PAYLOAD.NOT_REQUIRED, 'Service Not Required');
 });
 
-test('templateButtonValues sends three quick replies at indexes 0,1,2 in order', () => {
-  const bv = convo.templateButtonValues();
-  assert.equal(bv.length, 3);
-  assert.deepEqual(bv.map((b) => b.index), [0, 1, 2]);
-  assert.deepEqual(bv.map((b) => b.type), ['quick_reply', 'quick_reply', 'quick_reply']);
-  assert.deepEqual(bv.map((b) => b.payload), ['Yes, Confirm', 'Need a Reschdeule', 'Service Not Required']);
+test('templateButtonValues sends NO button component', () => {
+  /*
+   * It used to send [{index, type:'quick_reply', payload}] — and Gallabox
+   * rejected every send with HTTP 400: "buttonValues.0.parameters: Path
+   * `parameters` is required." (jobId 523247, 2026-08-03).
+   *
+   * A button component carries a VARIABLE into a button. These three quick
+   * replies have none — their payloads are baked into the Meta-approved
+   * template, which is precisely why RESCHEDULE stays misspelled. We were
+   * restating constants the template already owns, in a shape Gallabox rejects.
+   *
+   * Empty is not a guess: the legacy Java senders ship "buttonValues": [] for
+   * templates with no dynamic button data and those deliver in production.
+   */
+  assert.deepEqual(convo.templateButtonValues(), []);
 });
 
 test('matchTemplateChoice maps the three EXACT approved payloads', () => {
@@ -241,6 +252,28 @@ test('formatCustomerDateLabel renders a customer-friendly date', () => {
 });
 
 /*
+ * DRIFT GUARD. time-slot.appointmentDateLabel is the same formatter, added there
+ * because the reschedule SMS (notification-orchestrator.service) needs an
+ * appointment date and must not require THIS file to get one — it would drag
+ * ai.service, maps.service, job-magic-link.service and S3 into a notification
+ * path. Until this older twin is folded into that helper, the two must agree
+ * character for character: the customer can receive the WhatsApp template and
+ * the reschedule SMS about the same visit, and a one-day or one-spelling
+ * disagreement between them reads as two different appointments.
+ */
+test('formatCustomerDateLabel agrees with time-slot.appointmentDateLabel, character for character', () => {
+  const ts = require('../services/time-slot');
+  const inputs = [
+    '2026-08-05', '2026-08-05 15:00:00', '2026-08-05 00:00:00', '2026-08-05T09:30',
+    '2026-01-01', '2026-02-28', '2026-12-25',
+    null, undefined, '', 'garbage', '05-08-2026',
+  ];
+  for (const v of inputs) {
+    assert.equal(convo.formatCustomerDateLabel(v), ts.appointmentDateLabel(v), `disagreed on ${JSON.stringify(v)}`);
+  }
+});
+
+/*
  * PRECEDENCE 2026-07-31. The APPOINTMENT HOUR wins and the band is only the
  * fallback: the customer tapped a 1-hour frame, so echoing "3PM to 7PM" back at
  * them would read as if we had lost their choice.
@@ -273,6 +306,28 @@ test('jobDateLabel prefers the appointment hour, then falls back to time_slot', 
     'Wed, 05 Aug 2026, 4 PM',
     'the corrupted legacy requested_time is ignored in favour of the appointment instant',
   );
+});
+
+/*
+ * jobDateLabel no longer formats the clock itself — it hands the wall clock
+ * (appointment_date + appointment_time, two projections of the same column) to
+ * time-slot.formatClock12. These are the boundaries where the two used to have
+ * a chance of disagreeing, pinned on the composed customer string rather than
+ * on the formatter alone, so a future change to either side is caught here.
+ * See tests/time-slot.test.js for the formatter's own contract.
+ */
+test('jobDateLabel renders the shared formatter at every boundary that matters', () => {
+  const at = (appointment_time) => convo.jobDateLabel({ appointment_date: '2026-08-05', appointment_time });
+  assert.equal(at('12:00'), 'Wed, 05 Aug 2026, 12 PM', 'noon is 12 PM, never 0 PM');
+  assert.equal(at('12:30'), 'Wed, 05 Aug 2026, 12:30 PM');
+  assert.equal(at('00:30'), 'Wed, 05 Aug 2026, 12:30 AM', 'a real after-midnight visit still shows');
+  assert.equal(at('09:00'), 'Wed, 05 Aug 2026, 9 AM', 'a whole hour drops the :00');
+  assert.equal(at('09:05'), 'Wed, 05 Aug 2026, 9:05 AM', 'a part hour keeps zero-padded minutes');
+  assert.equal(at('23:59'), 'Wed, 05 Aug 2026, 11:59 PM');
+  assert.equal(at('00:00'), 'Wed, 05 Aug 2026', 'the sentinel yields no time at all');
+  assert.equal(at('lunchtime'), 'Wed, 05 Aug 2026', 'unparseable time → date alone, never "null"');
+  assert.equal(at(null), 'Wed, 05 Aug 2026');
+  assert.equal(at(''), 'Wed, 05 Aug 2026');
 });
 
 test('composeAddressLine strips newlines — WhatsApp rejects them in a template parameter', () => {
@@ -324,10 +379,10 @@ test('classifyReasonKeyword is the AI-unavailable fallback, not a guesser', () =
 
 // ── 7. Flow: the opening template send ──────────────────────────────────
 
-function stubTemplate() {
+function stubTemplate(result = { delivered: true }) {
   const sent = [];
   const original = gallabox.sendTemplate;
-  gallabox.sendTemplate = async (args) => { sent.push(args); return { delivered: true }; };
+  gallabox.sendTemplate = async (args) => { sent.push(args); return result; };
   return { sent, restore() { gallabox.sendTemplate = original; } };
 }
 
@@ -371,8 +426,18 @@ test('startConversation sends `customer_interactive_msg` with NAMED bodyValues +
     // JOB_ROW carries requested_time 15:00, which now outranks the band label.
     assert.equal(t.bodyValues.date, 'Wed, 05 Aug 2026, 3 PM');
     assert.equal(t.bodyValues.address, 'Flat 4B, Tower 2, Near Metro, Gurugram, 122003');
-    assert.deepEqual(t.buttonValues.map((b) => b.payload),
-      ['Yes, Confirm', 'Need a Reschdeule', 'Service Not Required']);
+    /*
+     * NO button component. The three quick replies carry no variable — their
+     * payloads live in the Meta-approved template — so sending one restates
+     * constants the template already owns. The old payload
+     * ({index, type:'quick_reply', payload}) had no `parameters` key, which
+     * Gallabox requires, and every send 400-ed. See templateButtonValues().
+     *
+     * The payload CONSTANTS stay load-bearing for INBOUND matching and are
+     * pinned by the BTN_PAYLOAD test at the top of this file — dropping the
+     * outbound component does not make the misspelling safe to "correct".
+     */
+    assert.deepEqual(t.buttonValues, [], 'no button component — payloads are static in the template');
 
     // The row opens at awaiting_choice, and the cadence stamp binds a JS Date
     // (pool timezone +05:30 → IST verbatim) instead of SQL NOW().
@@ -430,4 +495,56 @@ test('captureCustomerGps is best-effort — a junk pin or missing address writes
   const junk = makeFakePool([[/SELECT fk_address_id FROM tbl_job/, [{ fk_address_id: 10 }]]]);
   assert.equal(await convo.captureCustomerGps(42, { lat: 'x', lng: null }, junk.pool), null);
   assert.equal(junk.calls.length, 0, 'an unusable pin short-circuits before any query');
+});
+
+/*
+ * A PROVIDER REJECTION MUST NOT READ AS SUCCESS.
+ *
+ * This is the half of the customer_interactive_msg bug that let it run
+ * unnoticed: Gallabox answered HTTP 400 on every send, startConversation
+ * dropped the error and reported delivered:false at INFO, and the route logged
+ * "Magic link sent" and returned 200. The operator saw a success toast for a
+ * message that never left the building.
+ *
+ * The conversation row is still created on purpose — an inbound reply must
+ * resolve even when the provider ack was flaky — so this asserts a PARTIAL
+ * success: row created, delivered false, and the provider's reason preserved
+ * rather than swallowed.
+ */
+test('a rejected send reports delivered:false and preserves the provider error', async () => {
+  const stub = stubTemplate({ delivered: false, error: 'buttonValues.0.parameters is required' });
+  try {
+    const fake = makeFakePool([
+      [/FROM tbl_job j/, [JOB_ROW]],
+      [/SELECT conversation_id FROM tbl_whatsapp_conversation/, []],
+      [/INSERT INTO tbl_whatsapp_conversation/, { insertId: 11 }],
+    ]);
+    const res = await convo.startConversation(42, { action: 'first' }, fake.pool);
+
+    assert.equal(res.delivered, false, 'a 400 from the provider is NOT a delivery');
+    assert.equal(res.suppressed, false, 'not the dev NOTIFICATIONS_DISABLE path');
+    assert.match(res.error, /parameters/, 'the provider reason must reach the caller');
+    assert.equal(res.conversationId, 11, 'the row is still created so an inbound reply resolves');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('a dev-suppressed send is not reported as an error', async () => {
+  // NOTIFICATIONS_DISABLE is a deliberate silence, not a failure — it must not
+  // light up the operator's UI or the warn log.
+  const stub = stubTemplate({ delivered: false, disabled: true });
+  try {
+    const fake = makeFakePool([
+      [/FROM tbl_job j/, [JOB_ROW]],
+      [/SELECT conversation_id FROM tbl_whatsapp_conversation/, []],
+      [/INSERT INTO tbl_whatsapp_conversation/, { insertId: 12 }],
+    ]);
+    const res = await convo.startConversation(42, { action: 'first' }, fake.pool);
+    assert.equal(res.delivered, false);
+    assert.equal(res.suppressed, true);
+    assert.equal(res.error, undefined, 'suppression carries no error');
+  } finally {
+    stub.restore();
+  }
 });

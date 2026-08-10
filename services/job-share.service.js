@@ -14,6 +14,7 @@
  */
 
 const { signJobShareToken } = require('../utils/jwt');
+const { formatClock12, displaySlot } = require('./time-slot');
 const urlShortener = require('./url-shortener.service');
 const logger = require('../logger');
 
@@ -36,6 +37,69 @@ function buildMapsSearchLink(gpsLocation, address) {
     return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(String(address).trim())}`;
   }
   return null;
+}
+
+/*
+ * ─── THE APPOINTMENT LINE ────────────────────────────────────────────────
+ *
+ * ONE builder for BOTH the public page's `schedule.appointment_label` and the
+ * WhatsApp/share-sheet blurb in buildShareMessage. They were two copies of
+ * `[requested_date_label, time_slot].join(' · ')` — the page's copy in the FE
+ * (Easyfix_CRM_UI shared-job page) and this file's in buildShareMessage — so a
+ * fix to one silently left the other wrong. The page now renders this string
+ * verbatim.
+ *
+ * ── WHY THE STORED BAND IS NOT USED ──
+ *
+ * tbl_job.time_slot is DERIVED and can be stale — job #482491 stores
+ * requested_date_time 05:30 ('After Hours') with time_slot '3pm to 7pm', and
+ * this link published '3pm to 7pm' to whoever opened it. The band shown is
+ * therefore time-slot.js's `displaySlot`, the shared read-side composition
+ * (appointment instant wins; date-only/00:00 falls back to the stored label,
+ * canonicalised for spelling only). It lives there rather than here because the
+ * DLT CUSTOMER_NOT_REACHABLE SMS
+ * (services/notification-orchestrator.service.js) had the identical bug and now
+ * calls the same helper — see the note above displaySlot for the full rationale.
+ *
+ * ── WHY THE EXACT TIME IS *NOT* SHOWN ──
+ *
+ * The label is DATE + BAND, never date + minute. It briefly carried the hour
+ * ('Tue, 5 Aug 2026, 5:30 AM · After Hours') and the owner reversed that on
+ * 2026-08-03: a customer-facing surface commits to a WINDOW, not to an arrival
+ * minute — "we don't want to commit that the technician will reach exactly at
+ * 5:30 as it can get late, but we are committing that they will reach in this
+ * slot". Quoting 5:30 turns a slot promise into a punctuality promise the
+ * business never made, and the page is world-reachable, so whoever opens the
+ * link reads it as the commitment.
+ *
+ * So a timed job reads
+ *   'Tue, 5 Aug 2026 · After Hours'
+ * and a date-only job reads the same shape off its stored band
+ *   'Tue, 5 Aug 2026 · 3PM to 7PM'.
+ * Both are date + band; the ONLY difference between them is where the band came
+ * from (the appointment instant vs. the stored label) — which is displaySlot's
+ * job, not this function's.
+ *
+ * Re-adding the clock here is a product decision, not a formatting tweak.
+ * tests/job-share-label.test.js asserts the minute is absent from BOTH this
+ * label and the share message, so a re-add has to be deliberate.
+ *
+ * No SQL change was needed: requested_date_time is already projected as an IST
+ * wall-clock string ('%Y-%m-%d %H:%i:%s') beside the date label, which is
+ * exactly what these helpers parse.
+ */
+function buildAppointmentLabel(dateLabel, requestedDateTime, storedSlot) {
+  const date = dateLabel ? String(dateLabel).trim() : '';
+  if (!date) return null;
+  const band = displaySlot(requestedDateTime, storedSlot);
+  return band ? `${date} · ${band}` : date;
+}
+
+/* The band this job's appointment actually sits in — same helper as above,
+ * exposed on its own so a consumer of `schedule.time_slot` can never pick up
+ * the stale stored string. '' collapses to null for the JSON payload. */
+function resolveDisplaySlot(requestedDateTime, storedSlot) {
+  return displaySlot(requestedDateTime, storedSlot) || null;
 }
 
 /*
@@ -116,7 +180,23 @@ async function fetchShareDetails(jobId, pool) {
     schedule: {
       requested_date_time: row.requested_date_time || null,
       requested_date_label: row.requested_date_label || null,
-      time_slot: row.time_slot || null,
+      /* The 12-hour appointment time ('5:30 AM'), or null on a date-only /
+       * midnight-sentinel booking.
+       *
+       * ⚠ RAW DATA, NOT THE COMMITMENT. Nothing renders this — the page and the
+       * share message both read `appointment_label`, which is date + band only
+       * (see buildAppointmentLabel for why the minute was pulled back out). It
+       * stays on the payload as the underlying value beside requested_date_time;
+       * it must NOT be spliced back into any customer-facing string. This is the
+       * one remaining use of formatClock12 in this file. */
+      requested_time_label: formatClock12(row.requested_date_time),
+      /* The band the appointment ACTUALLY falls in — never the raw stored
+       * column. See buildAppointmentLabel. */
+      time_slot: resolveDisplaySlot(row.requested_date_time, row.time_slot),
+      /* The one composed line the page renders and the share message quotes. */
+      appointment_label: buildAppointmentLabel(
+        row.requested_date_label, row.requested_date_time, row.time_slot,
+      ),
     },
     address: {
       address: row.address || null,
@@ -138,8 +218,12 @@ async function fetchShareDetails(jobId, pool) {
  * its field is missing. NO customer name/number — only service + city +
  * appointment + link.
  *   "EasyFix job #511425 — AC Repair (Cooling) in Gurugram, scheduled
- *    Sat, 27 Jun 2026 · 12 PM - 3 PM.
+ *    Sat, 27 Jun 2026 · 12PM to 3PM.
  *    View full details & navigate: <url>"
+ *
+ * The appointment clause is `schedule.appointment_label` — the SAME string the
+ * public page renders — so the blurb and the page it links to can never quote
+ * different windows. Do not re-join the schedule fields here.
  */
 function buildShareMessage(details, url) {
   const svc = (details.service_requested && details.service_requested[0]) || null;
@@ -151,7 +235,7 @@ function buildShareMessage(details, url) {
   const city = details.address && details.address.city_name;
   if (city) head += ` in ${city}`;
   const sched = details.schedule || {};
-  const when = [sched.requested_date_label, sched.time_slot].filter(Boolean).join(' · ');
+  const when = sched.appointment_label;
   if (when) head += `, scheduled ${when}`;
   head += '.';
   return `${head}\nView full details & navigate: ${url}`;

@@ -118,6 +118,20 @@ const GRAPH = {
       { table: 'tbl_address', col: 'user_id' },
       { table: 'tbl_user_login_logout_logs', col: 'user_id' },
       { table: 'device_info', col: 'user_id' },
+      /*
+       * The user's PERSONAL (home) email address. Must be here, not merely in
+       * scrubColumns: scrubColumns only covers the parent tbl_user row, so
+       * without this line a delete would wipe user_name / official_email /
+       * mobile_no / alternate_no and leave the private address behind
+       * indefinitely — the one contact detail the person never gave us for
+       * operational use. Deletion is only reachable for a user with no
+       * operational footprint (typically a mistaken create), and personal_email
+       * is mandatory on create, so this row essentially always exists.
+       *
+       * Snapshotted → purged → restored verbatim with the rest of the record,
+       * and isMissingSchema() covers the pre-migration host.
+       */
+      { table: 'tbl_user_personal_details', col: 'user_id' },
     ],
     labelOf: (row) => [row.user_name, row.official_email].filter(Boolean).join(' · ') || `User #${row.user_id}`,
   },

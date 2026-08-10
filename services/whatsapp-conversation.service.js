@@ -142,16 +142,45 @@ const SESSION_HOURS = 24;
 const CONVERSATION_TEMPLATE_NAME = 'customer_interactive_msg';
 
 /*
- * buttonValues for the three template quick replies. Index order MUST match
- * the approved template (0 = confirm, 1 = reschedule, 2 = not required).
- * The Gallabox wrapper passes this through untouched.
+ * buttonValues for `customer_interactive_msg` — deliberately EMPTY.
+ *
+ * ─── WHY EMPTY, AND NOT "THE THREE QUICK REPLIES" ──────────────────────────
+ *
+ * This used to send:
+ *   [{ index: 0, type: 'quick_reply', payload: BTN_PAYLOAD.CONFIRM }, …]
+ * and Gallabox rejected EVERY send with HTTP 400:
+ *   whatsapp.template.buttonValues.0.parameters: Path `parameters` is required.
+ * (observed on jobId 523247, 2026-08-03 — a Mongoose "required path" error, so
+ * `parameters` is a hard schema requirement on each buttonValues entry.)
+ *
+ * A button component exists to carry a VARIABLE into a button. These three quick
+ * replies have no variable: their payloads are baked into the Meta-approved
+ * template — which is exactly why BTN_PAYLOAD.RESCHEDULE has to stay misspelled
+ * ("Need a Reschdeule"). We were sending a component to restate constants the
+ * template already owns, and getting the schema wrong doing it.
+ *
+ * The shape was wrong in two ways at once, which is worth recording so nobody
+ * "fixes" it by adding `parameters` to the old structure. Every working Gallabox
+ * call in the legacy Java services (ACD_APIs/WhatsNotificationUtil.java,
+ * EasyFix_CRM/NewAppAllNotification.java) uses:
+ *     { "index": 0, "sub_type": "url", "parameters": { "type": "text", "text": … } }
+ * — `sub_type`, not `type`, and `parameters` as an OBJECT, not an array. Those
+ * are all URL buttons carrying a real variable. No legacy sender uses
+ * quick_reply at all, so there is no in-repo evidence for a quick_reply
+ * parameter shape, and Gallabox's public docs do not specify one.
+ *
+ * `[]` is not a guess: the same legacy senders ship `"buttonValues": []` for
+ * templates with no dynamic button data (eta_sent_clone_clone, cancel_order) and
+ * those deliver in production. Inbound matching is unaffected — the webhook
+ * reports the button payload the TEMPLATE defines, which is what
+ * routes/webhook/whatsapp.js already matches on.
+ *
+ * If Meta ever re-approves this template with variable button payloads, the send
+ * will fail loudly with a button-parameter-count error rather than silently — at
+ * which point the correct shape must be confirmed against Gallabox, not guessed.
  */
 function templateButtonValues() {
-  return [
-    { index: 0, type: 'quick_reply', payload: BTN_PAYLOAD.CONFIRM },
-    { index: 1, type: 'quick_reply', payload: BTN_PAYLOAD.RESCHEDULE },
-    { index: 2, type: 'quick_reply', payload: BTN_PAYLOAD.NOT_REQUIRED },
-  ];
+  return [];
 }
 
 // ── Pure helpers (exported — unit-tested in tests/whatsapp-conversation.test.js) ──
@@ -189,6 +218,23 @@ function istTimeString(nowMs = Date.now()) {
  */
 const SLOT_START_HOURS = slotModel.SLOT_START_HOURS;
 
+/*
+ * hour12Label(h) → '9 AM', '12 PM', '7 PM' — ONE END of a frame label.
+ *
+ * ⚠ NOT time-slot.formatClock12, and deliberately not delegating to it.
+ *   • Different input: a bare 0–23 HOUR, not an IST wall-clock datetime.
+ *     Routing it through formatClock12 would mean fabricating a meaningless
+ *     calendar date ('2000-01-01 09:00') just to get the hour back out.
+ *   • Different midnight rule, which is the substantive one. formatClock12
+ *     treats 00:00 as the "no time was ever captured" SENTINEL and returns
+ *     null; here hour 0 is a real clock position and must render '12 AM'. The
+ *     two agree on every other hour (verified 0–24), so the divergence is
+ *     exactly midnight — and midnight is precisely where an 'After Hours'
+ *     frame would land if SLOT_START_HOURS is ever widened past 9 AM–7 PM.
+ *     Delegating would turn that into a label reading 'null–1 AM'.
+ * Today only hours 9–19 reach this (SLOT_START_HOURS and their +1), where the
+ * two are identical — but the sentinel semantics are not, so it stays local.
+ */
 function hour12Label(h) {
   const suffix = h < 12 ? 'AM' : 'PM';
   const h12 = ((h + 11) % 12) + 1;
@@ -651,19 +697,35 @@ async function loadJobForConversation(jobId, pool) {
 function jobDateLabel(job) {
   const dateLabel = formatCustomerDateLabel(job && job.appointment_date);
   if (!dateLabel) return null;
-  // appointment_time is 'HH:MM' projected off requested_date_time. '00:00' is
-  // the "no time captured" sentinel on legacy rows, so skip it.
-  const t = /^(\d{1,2}):(\d{2})/.exec(String((job && job.appointment_time) || '').trim());
-  if (t) {
-    const h = Number(t[1]);
-    const mins = t[2];
-    if (!(h === 0 && mins === '00') && h >= 0 && h <= 23) {
-      const h12 = ((h + 11) % 12) + 1;
-      const suffix = h < 12 ? 'AM' : 'PM';
-      return `${dateLabel}, ${mins === '00' ? `${h12} ${suffix}` : `${h12}:${mins} ${suffix}`}`;
-    }
-  }
-  const slot = job.time_slot && String(job.time_slot).trim();
+  /*
+   * appointment_date and appointment_time are two DATE_FORMAT projections of
+   * the SAME column, so pairing them back up reconstitutes the IST wall clock
+   * that time-slot.formatClock12 reads. That shared formatter owns both rules
+   * this used to repeat inline: the 00:00 "no time captured" sentinel yields
+   * null (so a legacy row falls through to its band instead of announcing
+   * "12 AM"), and a whole hour drops the ':00' — "3 PM", not "3:00 PM".
+   *
+   * slice(0, 10) takes the 'YYYY-MM-DD' prefix formatCustomerDateLabel has
+   * already validated; using the prefix rather than the whole value stops a
+   * stray 'T00:00:00Z' tail from being read as the time-of-day.
+   *
+   * Equivalence with the inline formatter this replaced was checked over all
+   * 1440 values DATE_FORMAT('%H:%i') can emit — byte-identical on every one.
+   * It does rely on that projection's zero-padding ('09:30', never '9:30');
+   * see the SELECT in loadJobForConversation.
+   */
+  const day = String((job && job.appointment_date) || '').trim().slice(0, 10);
+  const clock = slotModel.formatClock12(`${day} ${String((job && job.appointment_time) || '').trim()}`);
+  if (clock) return `${dateLabel}, ${clock}`;
+  /*
+   * Last resort: no readable clock, so the stored band is the only time signal
+   * we have. canonicalSlot folds CASE AND SPACING ONLY — '3pm to 7pm' becomes
+   * '3PM to 7PM' — so the customer never sees a lower-cased variant of a band
+   * every other surface spells one way. Anything that is not cosmetically one of
+   * the four bands ('Morning 9 to 2', '9-12') passes through untouched: this
+   * must not GUESS a band, only tidy the spelling of one already stored.
+   */
+  const slot = slotModel.canonicalSlot(job.time_slot);
   if (slot) return `${dateLabel}, ${slot}`;
   return dateLabel;
 }
@@ -756,8 +818,33 @@ async function startConversation(jobId, { action = 'first' } = {}, pool) {
     [new Date(), `conversation_${action}`, jobId],
   );
 
-  logger.info({ jobId, conversationId, delivered: result.delivered }, 'whatsapp-conversation: started');
-  return { delivered: !!result.delivered, suppressed: !!result.disabled, conversationId };
+  /*
+   * A NOT-DELIVERED send is a WARN, and the provider's reason is propagated.
+   *
+   * This returned `{delivered, suppressed, conversationId}` and dropped
+   * `result.error` on the floor, so a provider rejection left one WARN line from
+   * the Gallabox wrapper and an INFO line here saying the conversation started.
+   * The route then logged "Magic link sent" and answered 200. Every send of
+   * `customer_interactive_msg` was failing with an HTTP 400 and the CRM was
+   * reporting success — which is why it took a log read to notice at all.
+   *
+   * `suppressed` (NOTIFICATIONS_DISABLE in dev) stays INFO: that is a
+   * deliberately silenced send, not a failure.
+   */
+  const failed = !result.delivered && !result.disabled;
+  const logLine = { jobId, conversationId, delivered: !!result.delivered };
+  if (failed) {
+    logger.warn({ ...logLine, err: result.error }, 'whatsapp-conversation: started but NOT delivered');
+  } else {
+    logger.info(logLine, 'whatsapp-conversation: started');
+  }
+  return {
+    delivered: !!result.delivered,
+    suppressed: !!result.disabled,
+    conversationId,
+    // Surfaced so the caller can tell the operator the message did not go out.
+    error: failed ? (result.error || 'provider rejected the message') : undefined,
+  };
 }
 
 /*

@@ -28,7 +28,7 @@ const { getGraphToken, invalidateGraphToken } = require('./ms-graph-token.servic
  * ⚠ 202 ACCEPTED IS NOT DELIVERY. See the return-shape note on send() below.
  *
  * Kept contract:
- *   send({ to, subject, text, html, cc, bcc, category })
+ *   send({ to, subject, text, html, cc, bcc, category, saveToSentItems })
  *     → { accepted, deliveryConfirmed, delivered (alias of accepted), … }
  * — callers (notification-orchestrator, auth OTP delivery, deploy workflow,
  *   auto-assign failure notification) are unchanged.
@@ -96,7 +96,7 @@ function toRecipientArray(input) {
  *                      reachability itself: see the mailbox-existence
  *                      pre-check in services/otp-delivery.service.js.
  */
-async function send({ to, subject, text, html, cc, bcc, category, attachments }) {
+async function send({ to, subject, text, html, cc, bcc, category, attachments, saveToSentItems = true }) {
   const originalTo = to;
   logger.info('Send email · subject="' + subject + '"' + (category ? ' · category=' + category : '') + (Array.isArray(attachments) && attachments.length ? ' · attachments=' + attachments.length : ''));
   if (!to)             return { accepted: false, delivered: false, deliveryConfirmed: false, error: 'to is required' };
@@ -192,7 +192,21 @@ async function send({ to, subject, text, html, cc, bcc, category, attachments })
         'Authorization': `Bearer ${token}`,
         'Content-Type':  'application/json',
       },
-      body: JSON.stringify({ message, saveToSentItems: true }),
+      /*
+       * saveToSentItems defaults TRUE — the tenant Sent-Items folder of
+       * MS_GRAPH_SENDER_EMAIL is this service's only audit trail (Graph returns
+       * no messageId), and every existing caller relies on that.
+       *
+       * A caller may pass FALSE, and exactly one does: the credential mail in
+       * services/user-welcome-mail.service.js. Its body contains a LIVE
+       * temporary password, and the sender is a SHARED IT-helpdesk mailbox that
+       * nobody prunes — archiving a copy there would leave a working credential
+       * retrievable by anyone with delegated access, for every account whose
+       * owner has not yet completed the forced first sign-in. The mail's own
+       * recipients (the user + the ops CC) are the intended copies; a third,
+       * permanent one in a shared mailbox is not.
+       */
+      body: JSON.stringify({ message, saveToSentItems: saveToSentItems !== false }),
     });
 
     /*

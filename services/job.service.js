@@ -259,6 +259,50 @@ const JOB_AGE_COLUMNS = `,
   ${JOB_AGE_DAYS_EXPR} AS ageDays,
   ${JOB_AGE_SECS_EXPR} AS ageSecs`;
 
+// ─── The customer name shown ON A JOB ───────────────────────────────
+/*
+ * A JOB's customer name is the name TYPED ON THAT BOOKING —
+ * `tbl_job.job_customer_name` — not the customer-master name. The master row
+ * (`tbl_customer`) is keyed on the mobile number and is shared by every job that
+ * number ever booked, so it drifts from what was actually entered for THIS
+ * order (a shared building number, a relative booking on someone's behalf, a
+ * bulk-upload sheet carrying its own name). The master is the FALLBACK: it is
+ * used only when the job carries no name of its own.
+ *
+ * ⚠ NULLIF(TRIM(...), '') IS LOAD-BEARING — do not "simplify" it back to a plain
+ * COALESCE. MySQL's COALESCE skips NULL and nothing else, so
+ * COALESCE('', cu.customer_name) returns '' — a BLANK customer name on screen,
+ * not the fallback. The empty string is reachable, not hypothetical:
+ *   · validators/job.validator.js declares job_customer_name as
+ *     `Joi.string().max(255).allow('', null)` on BOTH the create and update
+ *     schemas — '' is an accepted request value, twice over;
+ *   · create() stores `input.job_customer_name ?? input.customer?.customer_name`
+ *     and `??` only falls through on null/undefined, so a '' passes straight in;
+ *   · services/job-magic-link.service.js writes
+ *     `job_customer_name = COALESCE(?, job_customer_name)`, which likewise
+ *     stores '' verbatim when the public form posts an empty name.
+ * TRIM additionally catches the whitespace-only variant of the same paste.
+ *
+ * ONE definition, used by the LIST projection, the DETAIL projection, the
+ * `customer_name` sort key and the customer-name search terms — so what is
+ * displayed, what rows are ordered by and what a search matches cannot drift
+ * apart (a search that matched the MASTER name while the row displayed the JOB
+ * name would return rows the CRM's client-side re-filter then hides).
+ *
+ * Pure column arithmetic — no placeholders — so it is safe to interpolate into a
+ * SELECT list, an ORDER BY or a WHERE. It names only `j` and `cu`, both
+ * unconditionally present in LIST_JOIN / DETAIL_JOIN, and `cu.` stays textually
+ * inside it so the COUNT query's alias sniffing still adds the tbl_customer join
+ * wherever this expression appears in the WHERE.
+ *
+ * ⚠ SCOPE: this is "the customer ON THIS JOB". Customer-MASTER surfaces —
+ * Manage Customers, customer detail, customer lookup / autocomplete,
+ * dedupe-by-mobile — are keyed on tbl_customer, not tbl_job, and must keep
+ * reading `cu.customer_name` directly. Do not spread this expression there.
+ */
+const JOB_CUSTOMER_NAME_EXPR =
+  `COALESCE(NULLIF(TRIM(j.job_customer_name), ''), cu.customer_name)`;
+
 // ─── Server-side sort whitelist ─────────────────────────────────────
 /*
  * Maps the FE sort key → the qualified SQL expression the list ORDER BY uses.
@@ -294,7 +338,13 @@ const SORTABLE_COLUMNS = {
   scheduled_date_time: 'j.scheduled_date_time',
   checkin_date_time: 'j.checkin_date_time',
   checkout_date_time: 'j.checkout_date_time',
-  customer_name: 'cu.customer_name',
+  /*
+   * Customer name. Sorts on the SAME expression the projection emits, so the
+   * column the operator reads and the key the rows are ordered by are one
+   * definition. Sorting on `cu.customer_name` while displaying the job-row name
+   * would look like a broken sort on every job that overrides it.
+   */
+  customer_name: JOB_CUSTOMER_NAME_EXPR,
   customer_mob_no: 'cu.customer_mob_no',
   source_type: 'j.source_type',
   easyfixer_name: 'ef.efr_name',
@@ -343,7 +393,11 @@ const LIST_COLUMNS = `
   (EXISTS (SELECT 1 FROM scheduling_history sh
      WHERE sh.job_id = j.job_id
        AND sh.reschedule_reason LIKE '%Auto Rescheduled%')) AS auto_rescheduled,
-  j.fk_customer_id, cu.customer_name, cu.customer_mob_no,
+  /* customer_name = the name booked ON THIS JOB, master name as fallback.
+     Alias is unchanged (customer_name) — the CRM row key, the client-side
+     search field and the XLSX export all read that key. See
+     JOB_CUSTOMER_NAME_EXPR for why the NULLIF/TRIM guard is mandatory. */
+  j.fk_customer_id, ${JOB_CUSTOMER_NAME_EXPR} AS customer_name, cu.customer_mob_no,
   j.fk_client_id, cl.client_name,
   j.fk_service_catg_id, sc.service_catg_name AS service_category,
   j.fk_easyfixter_id, ef.efr_name AS easyfixer_name,
@@ -1047,13 +1101,17 @@ function magicLinkDeliveryColumns(colsExist) {
  *
  * ── THE SUB-STATES (mutually exclusive; they partition the bucket) ──
  *   'offered'  ≥1 effectively-open offer                      → "Offered to Tx"
- *   'expired'  no open, none accepted, ≥1 effectively-dead     → "Expired"
- *   'pending'  no open, none accepted, none dead               → "Pending For Scheduling"
+ *   'expired'  no open, none accepted, ≥1 effectively-dead     → "Expired/Rejected"
+ *   'pending'  no open, none accepted, none dead               → "Pending to Scheduling"
  *
- * 'pending' is the catch-all, and that is deliberate: a job whose only offer
- * was REJECTED is back in the pool and must read as Pending For Scheduling, NOT
- * "Expired" — the documented ops intent. Same for a job whose only offer rows
- * are unresolvable (see the technician guard below): nobody is holding it.
+ * DEAD includes REJECTED as well as EXPIRED (2026-08-03, owner's rule). So
+ * 'pending' now means literally "no offer has ever been made", and a job whose
+ * offers were all declined reads as Expired/Rejected. The previous rule sent
+ * rejected-only jobs to 'pending' on the theory that a decline returns the job
+ * to the pool — but that made "nobody has been asked yet" and "everyone we asked
+ * said no" render identically, hiding the second. A job whose only offer rows
+ * are UNRESOLVABLE (see the technician guard below) still falls to 'pending':
+ * nobody is holding it and nothing was really offered.
  *
  * ⚠ "all expired" is NOT "none open". Open-ness is an EXISTS over rows, never
  * MAX(offer_status) and never a count comparison: a job holding 3 dead offers
@@ -1141,10 +1199,34 @@ function offerKindPredicate(kind, a, bind, expiry) {
         params,
       };
     case 'dead':
-      // expiry OFF ⇒ only rows an earlier ENABLED regime already swept are dead.
-      if (!expiry) return { sql: `${a}.offer_status = ${v(OFFER_STATUS.EXPIRED)}`, params };
+      /*
+       * DEAD = the offer is spent. REJECTED counts, alongside EXPIRED.
+       *
+       * ⚠ This changed on 2026-08-03 and reverses the earlier rule. It used to
+       * be EXPIRED only, so a job whose offers were all REJECTED fell through to
+       * 'pending' and its chip read "Pending to Scheduling" — on the theory that
+       * a declined offer puts the job back in the pool. The owner's rule is the
+       * opposite and is what ops actually triage on:
+       *   no offer rows at all            -> Pending to Scheduling
+       *   offers exist, none still open   -> Expired/Rejected
+       *   at least one open offer         -> Offered to Tx
+       * "Nobody has been asked yet" and "everyone we asked said no" are
+       * different problems, and collapsing them hid the second one.
+       *
+       * 'pending' is the exact complement of this predicate (see offerStateSql),
+       * so adding REJECTED here moves rejected-only jobs out of pending
+       * automatically — the two states cannot drift apart.
+       */
+      // expiry OFF ⇒ only rows an earlier ENABLED regime already swept are dead
+      // (plus rejections, which are a technician's answer, not a timer).
+      if (!expiry) {
+        return {
+          sql: `${a}.offer_status IN (${v(OFFER_STATUS.EXPIRED)}, ${v(OFFER_STATUS.REJECTED)})`,
+          params,
+        };
+      }
       return {
-        sql: `(${a}.offer_status = ${v(OFFER_STATUS.EXPIRED)}`
+        sql: `(${a}.offer_status IN (${v(OFFER_STATUS.EXPIRED)}, ${v(OFFER_STATUS.REJECTED)})`
            + ` OR (${a}.offer_status = ${v(OFFER_STATUS.OFFERED)}`
            + ` AND (${a}.offered_at IS NULL`
            + ` OR ${a}.offered_at < NOW() - INTERVAL ${v(OFFER_TTL_MINUTES)} MINUTE)))`,
@@ -1376,6 +1458,7 @@ async function list({
   pin,                       // text — LIKE on tbl_address.pin_code
   stateId,                   // FK   — tbl_city.state_id
   categoryId,                // FK   — j.fk_service_catg_id
+  sourceType,                // text — exact match on j.source_type (booking channel)
   verticalId,                // FK   — via EXISTS on tbl_vertical_mapping
   projectManagerId,          // FK   — tbl_vertical_mapping.user_id where user_type = 1
   zonalManagerId,            // FK   — tbl_city.state_user (the city's zonal owner)
@@ -1699,6 +1782,17 @@ async function list({
     }
   }
   if (categoryId != null)  { clauses.push('j.fk_service_catg_id = ?'); params.push(categoryId); }
+  /*
+   * sourceType — booking-channel filter (see the listQuery validator). Exact
+   * `=` rather than LIKE: the stored values are a small closed set of labels,
+   * so equality is both precise and index-friendly, and MySQL's default
+   * case-insensitive collation already makes 'website' match any casing.
+   *
+   * References only the `j` alias, so the COUNT-join detection below is
+   * unaffected — no extra join is needed for the COUNT query to stay
+   * WHERE-consistent with the data query.
+   */
+  if (sourceType) { clauses.push('j.source_type = ?'); params.push(sourceType); }
   if (stateId != null)     { clauses.push('ci.state_id = ?');        params.push(stateId); }
   // Vertical filter — tbl_vertical_mapping is many-to-many across
   // (client_id, vertical_id, [user_id]). EXISTS is cheaper than a
@@ -1743,7 +1837,14 @@ async function list({
     params.push(`%${pin}%`);
   }
   if (customerQ) {
-    clauses.push('(cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ?)');
+    /*
+     * Matches the name the row DISPLAYS (job-row name, master as fallback), not
+     * the master name alone — otherwise typing the name visible on screen would
+     * return nothing for every job that overrides it. Still exactly TWO
+     * placeholders / two bound params, and `cu.` remains textually present so
+     * the COUNT-join sniffing below still adds the tbl_customer join.
+     */
+    clauses.push(`(${JOB_CUSTOMER_NAME_EXPR} LIKE ? OR cu.customer_mob_no LIKE ?)`);
     params.push(`%${customerQ}%`, `%${customerQ}%`);
   }
   // Reopen — direct column on tbl_job, super cheap. Accepts boolean or
@@ -1871,7 +1972,16 @@ async function list({
     // searchable; added here so a SPOC-name search matches. No new JOIN (alias j
     // is always present), and since COUNT + data share this where/params the two
     // OR terms apply to both.
-    clauses.push('(CAST(j.job_id AS CHAR) LIKE ? OR j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ? OR cl.client_name LIKE ? OR ci.city_name LIKE ? OR ef.efr_name LIKE ? OR ow.user_name LIKE ? OR j.client_spoc_name LIKE ? OR j.client_spoc LIKE ?)');
+    // The customer-name term is JOB_CUSTOMER_NAME_EXPR, not `cu.customer_name`:
+    // the row displays (and the CRM's client-side re-filter reads) the job-row
+    // name, so matching the master name alone would return rows the browser then
+    // hides — the precise failure tests/job-search-parity.test.js exists to
+    // prevent. Placeholder count is unchanged (11), so the params.push below
+    // still binds exactly one value per LIKE. NOTE: that test's source-scraping
+    // regex only detects bare `alias.col LIKE ?` terms, so this one no longer
+    // shows up in its BE column list — the parity it asserts still holds (both
+    // sides now key on the same effective name), it simply cannot see it.
+    clauses.push(`(CAST(j.job_id AS CHAR) LIKE ? OR j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR ${JOB_CUSTOMER_NAME_EXPR} LIKE ? OR cu.customer_mob_no LIKE ? OR cl.client_name LIKE ? OR ci.city_name LIKE ? OR ef.efr_name LIKE ? OR ow.user_name LIKE ? OR j.client_spoc_name LIKE ? OR j.client_spoc LIKE ?)`);
     params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
   }
 
@@ -2114,7 +2224,13 @@ async function getByIdCore(jobId) {
     : `NULL AS enquiry_reason_name`;
   const [jobRows] = await pool.query(
     `SELECT j.*,
-            cu.customer_name, cu.customer_mob_no, cu.customer_email,
+            /* customer_name = the name booked ON THIS JOB, master as fallback —
+               same JOB_CUSTOMER_NAME_EXPR the list projects, so the modal and
+               the row it opened from can never show different names. tbl_job has
+               no customer_name column (only job_customer_name), so the j.* above
+               cannot shadow this alias; job_customer_name still arrives raw via
+               j.* for the Confirm-mode form fields that edit it. */
+            ${JOB_CUSTOMER_NAME_EXPR} AS customer_name, cu.customer_mob_no, cu.customer_email,
             ad.address, ad.building, ad.landmark, ad.locality, ad.pin_code,
             ad.gps_location, ${addrInstrSelect}, ad.city_id, ci.city_name,
             sc.service_catg_name AS service_category,
@@ -2889,6 +3005,46 @@ async function recomputeClientServicesCsv(conn, jobId) {
 // favour of a single column on tbl_address).
 const insertAddress = addressService.insertCustomerAddress;
 
+/*
+ * Normalise the booking-time image field(s) on a create() payload into an
+ * ordered, de-duplicated list of filenames (or full S3 keys).
+ *
+ * TWO ACCEPTED SHAPES, both optional — a caller may send either, both, or
+ * neither:
+ *   · `job_image_filename`  — STRING. The original, pre-2026-08 field. A
+ *                             caller sending only this behaves EXACTLY as it
+ *                             always has: one entry out, one row written.
+ *   · `job_image_filenames` — ARRAY of strings. Added 2026-08-07 for callers
+ *                             that collect several photos in one submission
+ *                             (public website booking takes up to 5). Every
+ *                             entry becomes a `tbl_job_image` row inside the
+ *                             job's OWN transaction.
+ *
+ * The two are UNIONed (singular first, then the array in submission order)
+ * rather than one overriding the other, so a caller that populates both can't
+ * silently lose an image. Blank / non-string / whitespace-only entries are
+ * dropped and exact duplicates collapse, which keeps `null`, `undefined`,
+ * `''`, `[]` and `['']` all as the historical no-op.
+ *
+ * No cap here on purpose — the ceiling is a per-surface product decision and
+ * lives in the validators (createBody caps the array at 5, matching the
+ * website-booking photo limit). Silently truncating in the service would drop
+ * objects already written to storage with nothing pointing at them.
+ */
+function normaliseJobImageFilenames(input) {
+  const raw = [];
+  if (input.job_image_filename != null) raw.push(input.job_image_filename);
+  if (Array.isArray(input.job_image_filenames)) raw.push(...input.job_image_filenames);
+  const out = [];
+  for (const entry of raw) {
+    if (entry == null) continue;
+    const name = String(entry).trim();
+    if (!name) continue;
+    if (!out.includes(name)) out.push(name);
+  }
+  return out;
+}
+
 // ─── Create ─────────────────────────────────────────────────────────
 async function create(input, actor) {
   logger.info('Create job · clientId=' + (input.fk_client_id ?? '-') + ' · jobType=' + (input.job_type || 'Installation') + ' · initialStatus=' + (input.initial_status ?? 0) + ' · source=' + (input.source_type || 'manual') + ' · services=' + (Array.isArray(input.services) ? input.services.length : 0));
@@ -3300,24 +3456,40 @@ async function create(input, actor) {
     }
 
     /*
-     * Optional booking-time image (LEGACY path).
+     * Optional booking-time image(s).
      *
-     * 2026-05-14 update: the canonical job-image upload moved to the
+     * 2026-05-14: the canonical CRM job-image upload moved to the
      * dedicated endpoint `POST /admin/jobs/:id/images` which writes
-     * to S3 at Job_Images/<jobId>_<seq>. The frontend uses that
+     * to S3 at Job_Images/<jobId>_<seq>. The CRM frontend uses that
      * endpoint as a SECOND step after this create() commits.
      *
-     * This inline branch stays in place ONLY for any caller still
-     * sending the legacy `job_image_filename` field (e.g. shell
-     * scripts, integration tests). The dedicated endpoint is the
-     * supported path going forward; new code should not set this
-     * field on the create payload.
+     * 2026-08-07: this branch now takes N images, not one. It accepts
+     * BOTH the original scalar `job_image_filename` and the new array
+     * `job_image_filenames` (see normaliseJobImageFilenames above for
+     * the exact union/dedupe rules). The reason is atomicity: the
+     * public website booking accepts up to five photos, and inserting
+     * 2..N *after* create() returned meant a failure between COMMIT and
+     * those inserts left objects in S3 with no row pointing at them.
+     * Every row now lands inside the job's own transaction, so the
+     * booking and its photos survive or roll back together.
+     *
+     * ONE round trip regardless of N — a multi-row VALUES list rather
+     * than a loop of queries. The per-row column set and bound values
+     * are UNCHANGED from the single-image version (job_id, image,
+     * image_category='booking', job_stage=0, created_date=NOW()), so a
+     * caller sending only the scalar emits byte-identical SQL to
+     * before. `status` stays out of the column list deliberately:
+     * tbl_job_image.status is `int NULL DEFAULT 1`, and every existing
+     * image_category='booking' row carries status 1, so omitting it
+     * yields the same data. (routes/integration/v1/index.js names the
+     * column explicitly; that is the odd one out, not this.)
      */
-    if (input.job_image_filename && String(input.job_image_filename).trim()) {
+    const jobImageFilenames = normaliseJobImageFilenames(input);
+    if (jobImageFilenames.length > 0) {
       await conn.query(
         `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, created_date)
-         VALUES (?, ?, ?, ?, NOW())`,
-        [jobId, String(input.job_image_filename).trim(), 'booking', 0]
+         VALUES ${jobImageFilenames.map(() => '(?, ?, ?, ?, NOW())').join(', ')}`,
+        jobImageFilenames.flatMap((name) => [jobId, name, 'booking', 0])
       );
     }
 
@@ -5427,6 +5599,15 @@ module.exports = {
    * arithmetic, no placeholders; requires the `j` (tbl_job) alias in scope.
    */
   JOB_AGE_END_EXPR, JOB_AGE_SECS_EXPR, JOB_AGE_DAYS_EXPR, JOB_AGE_COLUMNS,
+  /*
+   * The "customer name ON THIS JOB" expression. Exported for the same reason:
+   * any other job-keyed read that needs to show a customer name should reuse
+   * THIS expression rather than re-deriving it — and, critically, rather than
+   * re-deriving it as a plain COALESCE, which blanks the name for every job
+   * whose job_customer_name is an empty string. Requires the `j` (tbl_job) and
+   * `cu` (tbl_customer) aliases in scope. NOT for customer-master surfaces.
+   */
+  JOB_CUSTOMER_NAME_EXPR,
   // The jobs-list server-side sort whitelist. Exported so
   // validators/job.validator.js derives its `sortBy` valid() list from the SAME
   // keys — one source of truth, no BE-side both-sides-whitelist drift.

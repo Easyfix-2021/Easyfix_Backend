@@ -101,6 +101,23 @@ const listQuery = Joi.object({
   stateId:    intId.optional(),
   categoryId: intId.optional(),
   verticalId: intId.optional(),
+  /*
+   * `sourceType` (2026-08-07) — exact match on tbl_job.source_type, the
+   * booking-CHANNEL label ('website', 'Bulk Upload', 'Client_App',
+   * 'New Dashboard', 'PowerMax API', 'manual', …). The column was already
+   * projected + sortable on the list endpoint but not filterable.
+   *
+   * Added for the CRM's "Unmapped Website Bookings" preset, which combines it
+   * with `status=9` + `clientId=1` (the RETAIL catch-all) to surface public
+   * website bookings whose QR link carried no valid tbl_client.reference_code.
+   * Kept GENERIC on purpose — any channel is filterable, not just 'website' —
+   * so a future "all Client_App orders" view needs no new param.
+   *
+   * `max(50)` matches the column width and the create/update validators below.
+   * Comparison is a plain `=` in service.list(); MySQL's default collation is
+   * case-insensitive, so 'website' matches regardless of stored casing.
+   */
+  sourceType: Joi.string().max(50).optional(),
   dateType:   Joi.string().valid('booked', 'scheduled', 'completed', 'ticket', 'requested').optional(),
   // Phase-2 filters (2026-05-19).
   //   rating  — exact match against tbl_easyfixer_rating_by_customer.customer_rating
@@ -269,6 +286,15 @@ const createBody = Joi.object({
   // (no slashes / nulls) by file-storage on the upload step, so by the
   // time it reaches here it's safe to round-trip.
   job_image_filename: Joi.string().max(255).allow('', null).optional(),
+  // job_image_filenames (2026-08-07) — plural sibling of the field above,
+  // for callers that collect several booking photos in one submission.
+  // Each item mirrors the singular rule EXACTLY (string, max 255, ''/null
+  // tolerated so a form that pads empty slots isn't 400'd); job.service's
+  // normaliseJobImageFilenames() drops the blanks and de-duplicates against
+  // the singular field. Capped at 5 to match the public website-booking
+  // photo limit (routes/public/website-booking.js MAX_PHOTOS) — the only
+  // surface that sends more than one today.
+  job_image_filenames: Joi.array().items(Joi.string().max(255).allow('', null)).max(5).optional(),
   customer: customerBlock,
   address: addressBlock,
   services: Joi.array().items(serviceItem).optional(),
@@ -330,7 +356,18 @@ const updateBody = Joi.object({
   efr_special_notes: Joi.string().max(2000).optional(),
   exp_tat: Joi.string().max(50).optional(),
   booking_cut_off_time: Joi.number().integer().optional(),
-  booking_cut_off_time_slot: Joi.string().max(100).optional(),
+  /*
+   * booking_cut_off_time_slot was declared TWICE in this same object — once
+   * above as `.max(50).allow('', null)` and again here as `.max(100)`. The
+   * later key wins in an object literal, so the one in force was this one, and
+   * `.allow('', null)` was silently discarded: a caller sending '' or null for
+   * that legacy column got a 400 that the author 40 lines up had explicitly
+   * allowed. Found by ESLint's no-dupe-keys the first time this repo was linted.
+   *
+   * Removed rather than merged: the two sibling declarations of this key (here
+   * and in the create schema) both use max(50).allow('', null), so that is the
+   * intent, and the column is COALESCE-backfilled and routinely empty.
+   */
   // Services replacement — when present, tbl_job_services rows for this job
   // are wiped and these inserted. Used by the Unconfirmed-order Confirm flow.
   services: Joi.array().items(serviceItem).optional(),

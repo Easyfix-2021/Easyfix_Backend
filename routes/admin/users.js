@@ -5,6 +5,9 @@ const validate = require('../../middleware/validate');
 const { roleByName } = require('../../middleware/role');
 const userService = require('../../services/user.service');
 const entraProvisioning = require('../../services/entra-provisioning.service');
+// "Your EasyFix account is ready" — the sign-in-details mail. Used by the
+// mailbox-repair endpoint below; the create path calls it from the service.
+const welcomeMail = require('../../services/user-welcome-mail.service');
 const { STAGE_KEYS } = require('../../lib/job-stages');
 const { modernOk, modernError } = require('../../utils/response');
 const logger = require('../../logger');
@@ -23,6 +26,33 @@ const logger = require('../../logger');
  * Reused across create/update/bulk.
  */
 const allowedStagesField = Joi.array().items(Joi.string().valid(...STAGE_KEYS)).allow(null).optional();
+
+/*
+ * PERSONAL EMAIL — stored in tbl_user_personal_details (an EasyFix-owned side
+ * table; tbl_user is legacy and must not gain columns). It is where the
+ * "your EasyFix account is ready" credential mail goes, because a brand-new
+ * Microsoft 365 mailbox cannot be its own delivery address.
+ *
+ * REQUIREDNESS MATRIX — enforced HERE and, independently, in
+ * services/user.service.js. Both layers, on purpose: requiredness lives in two
+ * places in this codebase and the deeper one silently wins. Loosening only the
+ * Joi schema is exactly what made mobile_no keep answering "required" from a
+ * form that showed it as optional.
+ *
+ *   Add User                          → REQUIRED   (expressible in Joi: below)
+ *   Edit an ACTIVE user               → REQUIRED   ┐ depends on the TARGET ROW's
+ *   Edit an INACTIVE user             → optional   ├ status, which is a DB fact,
+ *   The edit that DEACTIVATES a user  → optional   ┘ not a payload fact — so the
+ *                                                    PATCH handler checks it
+ *                                                    explicitly, using the same
+ *                                                    exported predicate the
+ *                                                    service uses.
+ */
+const personalEmailCreateField = Joi.string().trim().lowercase().email().max(255).required();
+// On PATCH the FORMAT is enforced by Joi; PRESENCE is decided by the handler
+// below (and again by the service). '' / null mean "clear it", which is only
+// reachable for a user the matrix exempts.
+const personalEmailUpdateField = Joi.string().trim().lowercase().email().max(255).allow('', null).optional();
 
 /*
  * /api/admin/users — Manage Users settings surface.
@@ -80,6 +110,7 @@ const createBody = Joi.object({
   manage_verticals:  Joi.string().allow('', null).optional(),
   reporting_manager: Joi.number().integer().positive().allow(null).optional(),
   allowed_stages:    allowedStagesField,
+  personal_email:    personalEmailCreateField,
 });
 
 const updateBody = Joi.object({
@@ -94,6 +125,7 @@ const updateBody = Joi.object({
   reporting_manager: Joi.number().integer().positive().allow(null).optional(),
   is_active:         Joi.boolean().optional(),
   allowed_stages:    allowedStagesField,
+  personal_email:    personalEmailUpdateField,
 }).min(1);
 
 // ─── Bulk-update sub-router ──────────────────────────────────────────
@@ -142,11 +174,29 @@ router.get('/check-email', validate(checkEmailQuery, 'query'), async (req, res, 
   } catch (e) { next(e); }
 });
 
+/*
+ * Is the CALLER the canonical Admin role (as opposed to any other member of the
+ * `admin` GROUP)? `req.userRole` is resolved once by the group guard mounted in
+ * routes/admin/index.js, so this costs nothing extra.
+ */
+function isAdminRole(req) {
+  return String(req.userRole?.role_name || '').trim().toLowerCase() === 'admin';
+}
+
 // ─── READ ────────────────────────────────────────────────────────────
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
   logger.info('List users · q=' + (req.query.q || '') + ' roleId=' + (req.query.roleId || '') + ' cityId=' + (req.query.cityId || '') + ' includeInactive=' + req.query.includeInactive + ' limit=' + req.query.limit + ' offset=' + req.query.offset);
   try {
-    const data = await userService.listUsers(req.query);
+    /*
+     * personal_email is included ONLY for the Admin role. This route carries no
+     * roleByName guard — every one of the ten admin-group roles can read it —
+     * but only Admin can create or edit a user, so only Admin can act on a
+     * missing address. Shipping the home email of ~7.5k staff in a single
+     * limit=1000 page to roles that cannot use it is a bulk-harvest surface with
+     * no corresponding feature. The edit form reads the value from
+     * GET /:userId, so nothing here regresses.
+     */
+    const data = await userService.listUsers({ ...req.query, includePersonalEmail: isAdminRole(req) });
     modernOk(res, data);
   } catch (e) { next(e); }
 });
@@ -216,8 +266,18 @@ router.post('/', roleByName(['Admin']), validate(createBody), async (req, res, n
      * reads { accountStatus: 'skipped_disabled', … }.
      */
     const prov = created && created.provisioning;
+    /*
+     * `created.welcome_mail` is the sign-in-details mail outcome, attached by
+     * userService.createUser next to `provisioning` and shaped
+     * { status: 'sent'|'skipped'|'failed'|'pending', reason, to?, cc? }. It is
+     * reported, never fatal: a mail failure does not undo a created user. It
+     * NEVER carries the temporary password — that value reaches the mail body
+     * and nothing else (see services/user-welcome-mail.service.js).
+     */
+    const mail = created && created.welcome_mail;
     logger.info('User created · userId=' + (created && (created.user_id || created.id))
-      + (prov ? ' · mailbox=' + prov.accountStatus + '/' + prov.licenceStatus : ''));
+      + (prov ? ' · mailbox=' + prov.accountStatus + '/' + prov.licenceStatus : '')
+      + (mail ? ' · welcomeMail=' + mail.status : ''));
     let message = 'User added';
     if (prov && prov.pending) {
       // Provisioning outran the inline deadline and is finishing detached — the
@@ -226,6 +286,11 @@ router.post('/', roleByName(['Admin']), validate(createBody), async (req, res, n
       message = 'User added — Microsoft 365 mailbox provisioning is still running; check the Provisioning panel shortly';
     } else if (prov && prov.attempted && !prov.mailboxReady) {
       message = 'User added — but the Microsoft 365 mailbox is NOT ready: ' + (prov.reason || 'see provisioning outcome');
+    } else if (mail && mail.status === 'sent') {
+      message = 'User added — sign-in details emailed to ' + mail.to
+        + (mail.cc && mail.cc.length ? ' (cc ' + mail.cc.join(', ') + ')' : '');
+    } else if (mail && mail.status === 'failed') {
+      message = 'User added and the mailbox is ready, but the sign-in details could NOT be emailed: ' + mail.reason;
     }
     modernOk(res, created, message);
   } catch (e) {
@@ -241,6 +306,30 @@ router.patch('/:userId',
   async (req, res, next) => {
     logger.info('Update user · userId=' + req.params.userId + ' fields=' + Object.keys(req.body).join(','));
     try {
+      /*
+       * ── personal_email presence, per the matrix at the top of this file ──
+       * Joi already enforced the FORMAT; whether the field is MANDATORY depends
+       * on the target row's current status, which Joi cannot see. We resolve the
+       * row once (it also gives us the crisp 404) and apply the SAME predicate
+       * the service applies, so route and service can never drift.
+       *
+       * `target.personal_email` is the fail-soft side-table read inside
+       * getUserById, so an active user who already has one on record is not
+       * forced to re-send it — "required" here means the row must not be LEFT
+       * without one.
+       */
+      const target = await userService.getUserById(Number(req.params.userId));
+      if (!target) return modernError(res, 404, 'User not found');
+      if (userService.isPersonalEmailRequiredOnUpdate(target.user_status, req.body.is_active)) {
+        const effective = req.body.personal_email !== undefined
+          ? String(req.body.personal_email || '').trim()
+          : String(target.personal_email || '').trim();
+        if (!effective) {
+          logger.warn('Update user rejected · personal_email required for an active user · userId=' + req.params.userId);
+          return modernError(res, 400, 'personal_email is required when editing an active user');
+        }
+      }
+
       const updated = await userService.updateUser(
         Number(req.params.userId), req.body, req.user?.user_id
       );
@@ -321,7 +410,17 @@ router.post('/bulk-update', roleByName(['Admin']), validate(bulkUpdateBody), asy
     let updated = 0; let failed = 0; let unchanged = 0;
     for (const userId of userIds) {
       try {
-        const result = await userService.updateUser(Number(userId), fields, req.user?.user_id);
+        /*
+         * enforcePersonalEmail: false — see the matrix at the top of this file.
+         * The rule governs the Add/Edit User FORM. This modal applies scope
+         * CSVs / manager / role to up to 500 EXISTING users and has no
+         * personal_email field, so enforcing it here would not collect a single
+         * address; it would only make every active user who lacks one today
+         * impossible to bulk-update.
+         */
+        const result = await userService.updateUser(
+          Number(userId), fields, req.user?.user_id, { enforcePersonalEmail: false },
+        );
         if (result && result.__unchanged) {
           unchanged++;
           results.push({ userId, status: 'unchanged' });
@@ -430,22 +529,77 @@ router.post('/:userId/provision-mailbox',
       const user = await userService.getUserById(userId);
       if (!user) return modernError(res, 404, 'User not found');
 
+      /*
+       * ── THE TEMP PASSWORD, on the REPAIR path ─────────────────────────
+       * This endpoint exists to rescue a CRM row whose Entra account is absent
+       * (user 8735 / vijay.nailwal@easyfix.in is the case that prompted it).
+       * That is the CREATE branch inside provisionUserMailbox, so it mints a
+       * fresh 20-char CSPRNG password — and without a sink it would generate it,
+       * hand it to Graph and drop it, leaving the operator with a green "Mailbox
+       * is ready" and a user who still cannot sign in. That is precisely the
+       * dead end this feature was built to close, so the repair route sinks the
+       * password and mails it exactly like Add User does.
+       *
+       * Same containment as the create path: a local for the life of the
+       * request, handed straight to the mail sender, nulled after. Never logged,
+       * never bound into SQL, never on the response — `mail` below carries only
+       * { status, reason, to?, cc? }.
+       */
+      let tempPassword = null;
       const outcome = await entraProvisioning.provisionUserMailbox({
         userId,
         userName: user.user_name,
         officialEmail: user.official_email,
         trigger: 'admin-retry',
         actorId: req.user?.user_id,
+        onTempPassword: (pw) => { tempPassword = pw; },
       });
+
+      /*
+       * Fail-soft, and gated on mailboxReady inside the service — an account
+       * with no licence has no mailbox, so no credential mail goes out for it.
+       * An already-existing account mints nothing, so GATE 3 reports 'skipped'
+       * and tells the operator to reset from the M365 admin centre.
+       */
+      let mail;
+      try {
+        mail = await welcomeMail.sendWelcomeMail({
+          userId,
+          userName: user.user_name,
+          officialEmail: user.official_email,
+          personalEmail: user.personal_email,
+          tempPassword,
+          provisioning: outcome,
+        });
+      } catch (e) {
+        mail = { status: welcomeMail.MAIL_STATUS.FAILED, reason: e.message };
+      } finally {
+        tempPassword = null; // done with it — do not retain past the send
+      }
 
       // 200 either way — the caller asked us to TRY, and the outcome (including
       // "the licence step failed, here is exactly why") is the payload. A 5xx
       // would hide the reason behind the generic error handler.
-      const msg = outcome.mailboxReady
+      let msg = outcome.mailboxReady
         ? 'Mailbox is ready (' + outcome.accountStatus + ' / ' + outcome.licenceStatus + ')'
         : 'Mailbox NOT ready — ' + (outcome.reason || outcome.accountStatus + ' / ' + outcome.licenceStatus);
-      logger.info('Provision mailbox result · userId=' + userId + ' · ' + msg);
-      modernOk(res, { user_id: userId, official_email: user.official_email, provisioning: outcome }, msg);
+      if (mail.status === welcomeMail.MAIL_STATUS.SENT) {
+        msg += ' — sign-in details emailed to ' + mail.to
+          + (mail.cc && mail.cc.length ? ' (cc ' + mail.cc.join(', ') + ')' : '');
+      } else if (outcome.mailboxReady) {
+        // Only worth saying when the mailbox IS ready: otherwise "no mail" is a
+        // consequence of the line above, not a second thing to fix.
+        msg += mail.status === welcomeMail.MAIL_STATUS.FAILED
+          ? ' — but the sign-in details could NOT be emailed: ' + mail.reason
+          : ' — no sign-in details were emailed: ' + mail.reason;
+      }
+      logger.info('Provision mailbox result · userId=' + userId + ' · ' + msg + ' · welcomeMail=' + mail.status);
+      modernOk(res, {
+        user_id: userId,
+        official_email: user.official_email,
+        provisioning: outcome,
+        welcome_mail: mail,
+      }, msg);
     } catch (e) { next(e); }
   }
 );
@@ -461,3 +615,16 @@ router.delete('/:userId', roleByName(['Admin']), validate(idParam, 'params'), as
 });
 
 module.exports = router;
+
+/*
+ * TEST-ONLY handle on the request schemas. An Express Router IS a function, so
+ * hanging a property off it is inert at runtime — nothing in the request path
+ * reads it, and express only ever calls the function itself.
+ *
+ * It exists because the personal_email requiredness matrix lives in TWO places
+ * (this file's Joi and services/user.service.js) and both must be tested. A
+ * test that re-declared the schema would keep passing forever after someone
+ * edited the real one; this way tests/user-personal-email.test.js asserts the
+ * SHIPPED schemas.
+ */
+module.exports.__schemas = { createBody, updateBody, bulkUpdateBody };

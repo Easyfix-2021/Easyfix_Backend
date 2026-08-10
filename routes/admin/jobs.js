@@ -799,11 +799,38 @@ router.get('/escalated/export.xlsx', async (req, res, next) => {
       if (Number.isNaN(+dt)) return '';
       return dt.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: true });
     }
+    /*
+     * "Now" as an IST WALL-CLOCK string — the same 'YYYY-MM-DD HH:MM:SS' shape
+     * mysql2 hands back for a DATETIME (the pool runs `dateStrings: true`).
+     *
+     * WHY THIS EXISTS. `new Date('2026-08-03 16:02:29')` parses a space-separated
+     * datetime as SERVER LOCAL time. When BOTH ends of a duration come from the
+     * database that is harmless — both are misread by the same offset and it
+     * cancels. It stops cancelling the moment one end is a real instant:
+     * `new Date()` is the true now, while the stored end has been shifted.
+     *
+     * Measured on the actual code, for an escalation raised 3 hours ago:
+     *     container TZ=Asia/Kolkata → 180 mins  ✅
+     *     container TZ=UTC          →   0 mins  ❌   (production runs UTC)
+     * `Math.max(0, …)` clamps the negative result, so an unresolved escalation
+     * reads "0 mins" for its first five and a half hours and understates by
+     * 5h30m for ever after — silently, since 0 is a plausible-looking answer.
+     *
+     * Formatting through Intl with an explicit timeZone (rather than adding
+     * 5.5h to a Date) follows the same rule as services/quicksight/_shared.js
+     * istToday(): never do timezone arithmetic on a Date, because it runs in the
+     * server's own zone. 'sv-SE' is used only because its locale format IS
+     * 'YYYY-MM-DD HH:MM:SS'.
+     */
+    function istNowWallClock() {
+      return new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Kolkata' });
+    }
     function durationLabel(start, end) {
       if (!start) return '';
       const s = new Date(start);
       if (Number.isNaN(+s)) return '';
-      const e = end ? new Date(end) : new Date();
+      // Both ends must be read in the SAME frame — see istNowWallClock above.
+      const e = new Date(end || istNowWallClock());
       const ms = Math.max(0, +e - +s);
       const totalMins = Math.floor(ms / 60000);
       const days = Math.floor(totalMins / (60 * 24));
@@ -2103,11 +2130,30 @@ router.post('/:id/estimate/send-for-approval',
   }
 );
 
+/*
+ * Customer name on a JOB surface (2026-08-03).
+ *
+ * The name typed on the booking page lands on tbl_job.job_customer_name — a
+ * per-job override of the customer-master tbl_customer.customer_name (see the
+ * MUTABLE_COLUMNS note in services/job.service.js). Anywhere a name is shown
+ * as "the customer on THIS JOB" it must prefer the job-row copy; the master
+ * name is only the fallback. Customer-MASTER surfaces (Manage Customers,
+ * customer lookup/dedupe) keep reading cu.customer_name directly.
+ *
+ * NULLIF(TRIM(...), '') is load-bearing. MySQL COALESCE only guards NULL, so
+ * COALESCE('', cu.customer_name) returns '' and would render a BLANK name.
+ * Both job write paths can store '': validators/job.validator.js declares
+ * `job_customer_name: Joi.string().allow('', null)` on create AND update,
+ * job.service.js create() binds it through `??` (which does not catch ''),
+ * and the update() MUTABLE_COLUMNS loop binds input[col] verbatim.
+ */
 async function sendEstimateEmail(jobId, userId) {
   const [[j]] = await pool.query(
     `SELECT j.job_id, j.job_reference_id, j.client_ref_id, j.reporting_contact_id,
             j.client_spoc_email, j.fk_client_id,
-            cl.client_name, cu.customer_name, cu.customer_mob_no,
+            cl.client_name,
+            COALESCE(NULLIF(TRIM(j.job_customer_name), ''), cu.customer_name) AS customer_name,
+            cu.customer_mob_no,
             u.official_email AS owner_email
        FROM tbl_job j
        LEFT JOIN tbl_client   cl ON cl.client_id   = j.fk_client_id

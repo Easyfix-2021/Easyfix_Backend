@@ -157,11 +157,31 @@ const LICENCE_STATUS = Object.freeze({
   SKU_NOT_ACTIVE:     'sku_not_active',
   NO_SEATS:           'no_seats_available',
   ALREADY_LICENSED:   'already_licensed',
-  ASSIGNED:           'assigned',
+  ASSIGNED:           'assigned',           // read back from Entra — the seat is REALLY there
+  /*
+   * Graph 2xx-ed the assignLicense call but a read-back could not see the SKU on
+   * the user. Observed on anand.thakur@easyfix.in (2026-08-04): this table said
+   * `assigned` with the right SKU while the M365 admin centre showed EVERY
+   * licence box unticked, and the user could not open anything until an admin
+   * ticked Microsoft 365 Business Basic by hand.
+   *
+   * NOT a synonym for `assigned`. It is the honest answer when Graph accepted
+   * the request and the seat did not appear — deliberately kept out of
+   * mailboxLikelyExists below so nothing downstream treats it as a live mailbox.
+   */
+  ASSIGNED_UNCONFIRMED: 'assigned_unconfirmed',
   FAILED:             'failed',
 });
 
-// A mailbox only exists once BOTH steps landed.
+/*
+ * A mailbox only exists once BOTH steps landed.
+ *
+ * ⚠ ASSIGNED_UNCONFIRMED is deliberately absent from `licenceOk`. This function
+ * gates the OTP mailbox pre-check, so calling an unconfirmed licence "ready"
+ * would mail a login OTP into a mailbox that does not exist and suppress the
+ * WhatsApp/SMS fallback — the exact failure this whole file was written to stop,
+ * one step further down the pipeline.
+ */
 function mailboxLikelyExists(accountStatus, licenceStatus) {
   const accountOk = accountStatus === ACCOUNT_STATUS.CREATED || accountStatus === ACCOUNT_STATUS.ALREADY_EXISTS;
   const licenceOk = licenceStatus === LICENCE_STATUS.ASSIGNED || licenceStatus === LICENCE_STATUS.ALREADY_LICENSED;
@@ -201,10 +221,25 @@ function directoryObjectHasMailbox(user) {
  * crypto ONLY — Math.random is not a CSPRNG and a predictable first-sign-in
  * password on a mail-enabled account is a real takeover path.
  *
- * ⚠ The value is passed straight into the Graph create body and then dropped.
- * It is NEVER logged, NEVER persisted, and NEVER returned in an API response.
- * forceChangePasswordNextSignIn is true, so the operator resets it from the
- * M365 admin centre if the user needs it — that is the only supported route.
+ * ⚠ WHERE THIS VALUE MAY GO — the complete list (2026-08-03).
+ * It used to be generated inline in the Graph create body and dropped on the
+ * floor. That was safe and completely unusable: the mailbox we had just paid a
+ * licence for had a password that existed for one HTTP request and then existed
+ * nowhere, so the new joiner could not sign in. It now travels to EXACTLY ONE
+ * consumer, via the `onTempPassword` sink callback threaded through
+ * createEntraUser() → provisionUserMailbox(): the caller holds it as a local
+ * value for the life of the request and hands it to
+ * services/user-welcome-mail.service.js.
+ *
+ * It is still, on every path including errors:
+ *   - NEVER logged (no logger line in this file interpolates it);
+ *   - NEVER persisted — not to tbl_user_entra_provisioning, not anywhere;
+ *   - NEVER placed on the outcome object, which IS published in the
+ *     POST /api/admin/users response body;
+ *   - NEVER returned from createEntraUser(), so it cannot be picked up by a
+ *     future `{ ...created }` spread.
+ * forceChangePasswordNextSignIn stays true, so it is single-use by design and
+ * the M365 admin centre reset remains the fallback.
  *
  * Shape: 20 chars, at least two each of lower/upper/digit/symbol (Entra wants
  * 3 of 4 categories and 8–256 chars, so this clears it comfortably), from a
@@ -246,7 +281,7 @@ function generateTempPassword(length = 20) {
  * address nobody writes to, which is the bug we are fixing wearing a hat.
  * mailNickname (the Exchange alias seed) is allowed to differ and IS sanitised.
  *
- *   → { ok: true, userPrincipalName, mailNickname, displayName, domain }
+ *   → { ok: true, userPrincipalName, mailNickname, displayName, givenName, surname, domain }
  *   → { ok: false, reason, accountStatus }
  */
 function deriveIdentity({ user_name, official_email } = {}, domains = managedDomains()) {
@@ -272,9 +307,42 @@ function deriveIdentity({ user_name, official_email } = {}, domains = managedDom
   }
 
   const mailNickname = (local.replace(/[^a-z0-9._-]/g, '').replace(/\.{2,}/g, '.').replace(/^\.+|\.+$/g, '') || 'user').slice(0, 64);
-  const displayName = (String(user_name || '').trim().replace(/\s+/g, ' ') || local).slice(0, 256);
+  const fullName = String(user_name || '').trim().replace(/\s+/g, ' ');
+  const displayName = (fullName || local).slice(0, 256);
 
-  return { ok: true, userPrincipalName: email, mailNickname, displayName, domain };
+  /*
+   * givenName / surname — Entra's First name and Last name fields.
+   *
+   * These were simply never sent: the create body carried displayName and
+   * nothing else name-shaped, so every account landed with a full name in
+   * Display name and both name fields BLANK. That is visible in the Microsoft
+   * 365 admin centre, in Outlook's address book sort order, and in any Teams or
+   * SharePoint surface that renders first name — and it cannot be inferred back
+   * out of displayName by Microsoft.
+   *
+   * tbl_user has ONE name column, so the split is positional: the first
+   * whitespace-separated token is the given name, EVERYTHING after it is the
+   * surname. "Vijay Kumar Nailwal" → "Vijay" / "Kumar Nailwal". That is the
+   * right call for Indian names in a single-field system — a middle name
+   * belongs with the family name far more often than it belongs alone, and
+   * dropping it entirely would lose data the CRM holds.
+   *
+   * A single-word name yields a given name and NO surname, and the key is then
+   * omitted from the request rather than sent empty: Graph treats '' as a value
+   * to store, so sending it writes a blank where "absent" is the honest answer.
+   *
+   * When user_name is blank there is nothing to split. displayName falls back to
+   * the email local part above, but a local part is an ADDRESS, not a name —
+   * splitting "vijay.nailwal" on the dot would be inventing a first and last
+   * name from a mailbox alias. Both fields stay unset instead.
+   *
+   * 64 chars is Graph's limit on each field (displayName allows 256).
+   */
+  const nameParts = fullName ? fullName.split(' ') : [];
+  const givenName = nameParts.length ? nameParts[0].slice(0, 64) : null;
+  const surname = nameParts.length > 1 ? nameParts.slice(1).join(' ').slice(0, 64) : null;
+
+  return { ok: true, userPrincipalName: email, mailNickname, displayName, givenName, surname, domain };
 }
 
 /*
@@ -449,8 +517,18 @@ async function listSubscribedSkus() {
 /*
  * POST /v1.0/users — create the directory account.
  * ⚠ `password` is inside `body` and must never reach a log line or a response.
+ *
+ * `onTempPassword` is the ONLY way the generated password leaves this function.
+ * It is a SINK, not a return value, on purpose: a return value would end up in
+ * `created`, one careless `{ ...created }` away from the outcome object that is
+ * serialised into the HTTP response. A sink can only reach the one caller that
+ * deliberately supplies it. It fires ONLY after Graph confirmed the account was
+ * created — a failed create has no account and therefore no credential to share.
+ * The sink is invoked inside a try/catch so a throwing consumer can never turn a
+ * successful provisioning run into a failure.
  */
-async function createEntraUser({ userPrincipalName, displayName, mailNickname }) {
+async function createEntraUser({ userPrincipalName, displayName, mailNickname, givenName, surname }, onTempPassword) {
+  const tempPassword = generateTempPassword();
   const body = {
     accountEnabled: true,
     displayName,
@@ -459,27 +537,112 @@ async function createEntraUser({ userPrincipalName, displayName, mailNickname })
     usageLocation: usageLocation(),
     passwordProfile: {
       forceChangePasswordNextSignIn: true,
-      password: generateTempPassword(),
+      password: tempPassword,
     },
   };
+  /*
+   * Only send a name field we actually have. Graph stores '' as a value, so an
+   * unconditional `givenName` would write an empty string for a user whose CRM
+   * name we could not split — indistinguishable in the admin centre from the
+   * blank-fields bug this fixes, but now deliberate. See deriveIdentity().
+   */
+  if (givenName) body.givenName = givenName;
+  if (surname) body.surname = surname;
   const res = await graphRequest('/users', { method: 'POST', body });
   if (res.ok && res.json && res.json.id) {
     // Deliberately logs the UPN and NOTHING from passwordProfile.
     logger.info('Entra account created · upn=' + userPrincipalName + ' · objectId=' + res.json.id);
+    if (typeof onTempPassword === 'function') {
+      try {
+        onTempPassword(tempPassword);
+      } catch (e) {
+        // Never interpolate the password into this (or any) log line.
+        logger.warn('Temp-password sink threw · upn=' + userPrincipalName + ' · ' + e.message);
+      }
+    }
+    // NOTE: tempPassword is deliberately NOT on this object.
     return { ok: true, id: res.json.id, requestId: res.requestId };
   }
   const err = graphErrorToReason(res);
   return { ok: false, ...err };
 }
 
+/*
+ * How long to wait before re-reading the user, and how many times. Entra is
+ * eventually consistent: a seat assigned a moment ago is not always visible on
+ * the very next read. Two reads ~1.2s apart is enough for the normal case
+ * without turning an admin action into a long request.
+ */
+const LICENCE_VERIFY_ATTEMPTS = 2;
+const LICENCE_VERIFY_DELAY_MS = 1200;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/*
+ * Is `skuId` actually on the user's assignedLicenses RIGHT NOW?
+ * Read-back, not inference — see assignLicense() for why that distinction is
+ * the whole point here.
+ */
+async function holdsLicence(objectId, skuId) {
+  const res = await graphRequest(`/users/${encodeURIComponent(objectId)}?$select=id,assignedLicenses`);
+  if (!res.ok || !res.json || !Array.isArray(res.json.assignedLicenses)) {
+    return { readable: false, held: false, requestId: res.requestId };
+  }
+  const want = String(skuId).toLowerCase();
+  const held = res.json.assignedLicenses.some((l) => String(l && l.skuId).toLowerCase() === want);
+  return { readable: true, held, requestId: res.requestId };
+}
+
+/*
+ * assignLicense — and then CHECK THAT IT STUCK.
+ *
+ * THE BUG THIS EXISTS FOR. graphRequest sets `ok` from `res.ok`, which is true
+ * for ANY 2xx — including 202 Accepted, which on assignLicense means "queued for
+ * processing", not "the seat is on the user". We recorded `assigned` off that
+ * and never looked again. On anand.thakur@easyfix.in the provisioning row said
+ * `assigned` / O365_BUSINESS_ESSENTIALS while the admin centre showed no licence
+ * ticked at all, and the account could not open anything until an admin assigned
+ * it by hand. A 2xx told us Microsoft had heard the request. It never told us
+ * Microsoft had honoured it.
+ *
+ * This is the same "accepted ≠ done" trap the header of this file documents for
+ * mail (Graph 202-accepts a send to a mailbox that does not exist). Same lesson,
+ * one API further along: when the provider offers a way to OBSERVE the end
+ * state, observe it — do not infer it from the acknowledgement.
+ *
+ *   → { ok: true,  verified: true }   seat read back from Entra
+ *   → { ok: true,  verified: false }  Graph accepted it, seat not visible
+ *   → { ok: false, reason }           Graph refused it outright
+ */
 async function assignLicense(objectId, skuId) {
   const res = await graphRequest(`/users/${encodeURIComponent(objectId)}/assignLicense`, {
     method: 'POST',
     body: { addLicenses: [{ skuId, disabledPlans: [] }], removeLicenses: [] },
   });
-  if (res.ok) return { ok: true, requestId: res.requestId };
-  const err = graphErrorToReason(res);
-  return { ok: false, ...err };
+  if (!res.ok) {
+    const err = graphErrorToReason(res);
+    return { ok: false, ...err };
+  }
+
+  let last = { readable: false, held: false };
+  for (let attempt = 1; attempt <= LICENCE_VERIFY_ATTEMPTS; attempt++) {
+    last = await holdsLicence(objectId, skuId);
+    if (last.held) {
+      return { ok: true, verified: true, requestId: last.requestId || res.requestId };
+    }
+    if (attempt < LICENCE_VERIFY_ATTEMPTS) await sleep(LICENCE_VERIFY_DELAY_MS);
+  }
+
+  // Accepted but not observable. Report it as such — the caller records a
+  // status that does NOT claim a working mailbox.
+  return {
+    ok: true,
+    verified: false,
+    requestId: last.requestId || res.requestId,
+    reason: last.readable
+      ? `Graph accepted the assignment (HTTP ${res.status}) but the SKU is still not on the user after `
+        + `${LICENCE_VERIFY_ATTEMPTS} read-backs — check seat availability and usageLocation in the M365 admin centre`
+      : `Graph accepted the assignment (HTTP ${res.status}) but the user could not be re-read to confirm the seat`,
+  };
 }
 
 // ── OTP mailbox pre-check (Job 1b) ────────────────────────────────────────
@@ -668,9 +831,16 @@ async function getProvisioning(userId) {
  * @param {string}  args.officialEmail   tbl_user.official_email (→ UPN)
  * @param {string} [args.trigger]        'create-user' | 'admin-retry' (logs only)
  * @param {number} [args.actorId]        who triggered it (logs only)
+ * @param {Function} [args.onTempPassword]
+ *        Sink for the temp password of a NEWLY created account. Called at most
+ *        once, only on the create path, only after Graph confirmed the account.
+ *        The value is NOT on the returned outcome (which is published in the
+ *        API response) and is NOT written to tbl_user_entra_provisioning — the
+ *        sink is the single exit. Omit it and the password is generated,
+ *        used in the Graph body, and dropped exactly as before.
  */
 async function provisionUserMailbox({
-  userId, userName, officialEmail, trigger = 'create-user', actorId,
+  userId, userName, officialEmail, trigger = 'create-user', actorId, onTempPassword,
 } = {}) {
   const base = {
     userId: Number(userId),
@@ -763,7 +933,10 @@ async function provisionUserMailbox({
     entraObjectId = decision.entraObjectId || null;
     logger.info('Entra account already exists — not creating a second one · upn=' + ident.userPrincipalName);
   } else {
-    const created = await createEntraUser(ident);
+    // The sink rides along ONLY on the create path — the reuse branch above
+    // mints nothing, so there is no credential to hand out for an account that
+    // already existed (see GATE 3 in services/user-welcome-mail.service.js).
+    const created = await createEntraUser(ident, onTempPassword);
     if (created.ok) {
       accountStatus = ACCOUNT_STATUS.CREATED;
       entraObjectId = created.id;
@@ -832,9 +1005,20 @@ async function provisionUserMailbox({
       } else {
         const assigned = await assignLicense(entraObjectId, chosen.skuId);
         graphRequestId = assigned.requestId || graphRequestId;
-        if (assigned.ok) {
+        if (assigned.ok && assigned.verified) {
           licenceStatus = LICENCE_STATUS.ASSIGNED;
-          logger.info('Entra licence assigned · upn=' + ident.userPrincipalName + ' · sku=' + chosen.skuPartNumber);
+          logger.info('Entra licence assigned + verified · upn=' + ident.userPrincipalName + ' · sku=' + chosen.skuPartNumber);
+        } else if (assigned.ok) {
+          /*
+           * Accepted, not observed. WARN — this is the state that previously
+           * recorded a clean `assigned` and sent a new joiner to a mailbox they
+           * could not open. Distinct status so the row is findable and the
+           * repair endpoint can be re-run against exactly these users.
+           */
+          licenceStatus = LICENCE_STATUS.ASSIGNED_UNCONFIRMED;
+          licenceReason = assigned.reason;
+          logger.warn('Entra licence NOT confirmed · upn=' + ident.userPrincipalName
+            + ' · sku=' + chosen.skuPartNumber + ' · ' + assigned.reason);
         } else {
           licenceStatus = LICENCE_STATUS.FAILED;
           licenceReason = `licence assignment failed — ${assigned.reason}`;

@@ -2,10 +2,11 @@
   "name": "easyfix-backend",
   "version": "0.1.0",
   "private": true,
-  "description": "EasyFix unified backend API \u2014 serves CRM_UI, Client_UI, and EasyFixer_App from a single Express service",
+  "description": "EasyFix unified backend API — serves CRM_UI, Client_UI, and EasyFixer_App from a single Express service",
   "main": "server.js",
   "scripts": {
     "dev": "nodemon server.js",
+    "lint": "eslint . --max-warnings=0",
     "start": "NODE_ENV=production node server.js",
     "build": "node scripts/build-check.js",
     "test:db": "node scripts/test-db.js",
@@ -49,9 +50,10 @@
     "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   },
   "devDependencies": {
+    "eslint": "^9.39.5",
     "nodemon": "^3.1.7"
   },
-  "overridesComment": "exceljs (3.x and 4.x) depends on uuid ^8.3.0 which carries GHSA-w5hq-g745-h8pq (missing buffer bounds check in v3/v5/v6 generators). uuid 14.x patches it. We use uuid only transitively through exceljs's xlsx generation (Manage Zones / Manage Pincodes templates) which calls v4 random \u2014 the API surface is stable across uuid 7\u219214, so the override is safe. Remove this override only when exceljs itself bumps its uuid range to >=14.",
+  "overridesComment": "exceljs (3.x and 4.x) depends on uuid ^8.3.0 which carries GHSA-w5hq-g745-h8pq (missing buffer bounds check in v3/v5/v6 generators). uuid 14.x patches it. We use uuid only transitively through exceljs's xlsx generation (Manage Zones / Manage Pincodes templates) which calls v4 random — the API surface is stable across uuid 7→14, so the override is safe. Remove this override only when exceljs itself bumps its uuid range to >=14.",
   "overrides": {
     "uuid": "^14.0.0"
   }

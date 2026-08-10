@@ -117,6 +117,61 @@ test('deriveIdentity falls back to the local part when the name is blank', () =>
   assert.equal(id.displayName, 'ops.desk');
 });
 
+/*
+ * FIRST NAME / LAST NAME. These were never sent, so every account created by
+ * this service landed in Entra with a full name in Display name and both name
+ * fields blank — visible in the M365 admin centre, in Outlook's address-book
+ * sort, and anywhere Teams renders a first name.
+ *
+ * tbl_user holds ONE name column, so the split is positional and the tests
+ * below pin the rule rather than a single example.
+ */
+test('deriveIdentity splits the CRM name into givenName + surname', () => {
+  const id = entra.deriveIdentity({ user_name: 'Ankit Jha', official_email: 'ankitjha@easyfix.in' }, DOMAINS);
+  assert.equal(id.givenName, 'Ankit');
+  assert.equal(id.surname, 'Jha');
+  assert.equal(id.displayName, 'Ankit Jha', 'displayName still carries the whole name');
+});
+
+test('a middle name goes with the SURNAME, not the given name', () => {
+  // "Vijay Kumar Nailwal" → "Vijay" / "Kumar Nailwal". Dropping the middle name
+  // would lose data the CRM holds; attaching it to the given name would put it
+  // in the wrong field on every Indian three-part name.
+  const id = entra.deriveIdentity({ user_name: 'Vijay Kumar Nailwal', official_email: 'vijay.nailwal@easyfix.in' }, DOMAINS);
+  assert.equal(id.givenName, 'Vijay');
+  assert.equal(id.surname, 'Kumar Nailwal');
+});
+
+test('a single-word name yields a given name and NO surname', () => {
+  // null, not '' — Graph stores an empty string as a value, which would write a
+  // blank Last name that looks exactly like the bug this fixes.
+  const id = entra.deriveIdentity({ user_name: 'Priya', official_email: 'priya@easyfix.in' }, DOMAINS);
+  assert.equal(id.givenName, 'Priya');
+  assert.equal(id.surname, null);
+});
+
+test('a blank name sets NEITHER field — an email local part is not a name', () => {
+  // displayName falls back to 'ops.desk', but splitting that on the dot would
+  // invent a first and last name out of a mailbox alias.
+  const id = entra.deriveIdentity({ user_name: '   ', official_email: 'ops.desk@easyfix.in' }, DOMAINS);
+  assert.equal(id.givenName, null);
+  assert.equal(id.surname, null);
+});
+
+test('name splitting collapses whitespace the same way displayName does', () => {
+  const id = entra.deriveIdentity({ user_name: '  Priya   Sharma ', official_email: 'priya.sharma@easyfix.in' }, DOMAINS);
+  assert.equal(id.givenName, 'Priya');
+  assert.equal(id.surname, 'Sharma', 'the collapsed single space must not leave an empty token');
+});
+
+test('givenName and surname are capped at Graph\'s 64-char limit', () => {
+  const long = 'A'.repeat(80);
+  const id = entra.deriveIdentity({ user_name: `${long} ${long}`, official_email: 'long.name@easyfix.in' }, DOMAINS);
+  assert.equal(id.givenName.length, 64);
+  assert.equal(id.surname.length, 64);
+  assert.ok(id.displayName.length <= 256, 'displayName has its own, larger limit');
+});
+
 test('deriveIdentity REFUSES an unmanaged domain — a personal address cannot get a tenant mailbox', () => {
   const id = entra.deriveIdentity({ user_name: 'Priya', official_email: 'ur.priya@gmail.com' }, DOMAINS);
   assert.equal(id.ok, false);
@@ -577,4 +632,185 @@ test('provisionUserMailbox refuses an unmanaged domain even with the flag ON, wi
     assert.equal(seen.length, 0);
   });
   await setProps({ 'entra.provisioning.enabled': 'false' });
+});
+
+// ── The create BODY actually carries the name fields ──────────────────────
+//
+// deriveIdentity returning givenName/surname proves nothing on its own — the
+// bug was that the Graph request body never mentioned them. This drives the
+// real createEntraUser with a fetch stub that CAPTURES THE BODY, so the
+// assertion is on what would go over the wire to Microsoft.
+
+function withBodyCapturingGraph(fn) {
+  const originalFetch = globalThis.fetch;
+  const env = {
+    MS_GRAPH_TENANT_ID: process.env.MS_GRAPH_TENANT_ID,
+    MS_GRAPH_CLIENT_ID: process.env.MS_GRAPH_CLIENT_ID,
+    MS_GRAPH_CLIENT_SECRET: process.env.MS_GRAPH_CLIENT_SECRET,
+  };
+  process.env.MS_GRAPH_TENANT_ID = 'tenant-test';
+  process.env.MS_GRAPH_CLIENT_ID = 'client-test';
+  process.env.MS_GRAPH_CLIENT_SECRET = 'secret-test';
+
+  const posts = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url);
+    if (u.includes('login.microsoftonline.com')) {
+      return makeRes(200, { access_token: 'fake-token', expires_in: 3600 });
+    }
+    if (/\/users$/.test(u) && String(init.method).toUpperCase() === 'POST') {
+      posts.push(JSON.parse(init.body));
+      return makeRes(201, { id: 'obj-123' });
+    }
+    return makeRes(404, { error: { code: 'Request_ResourceNotFound', message: 'unscripted' } });
+  };
+
+  return Promise.resolve(fn(posts)).finally(() => {
+    globalThis.fetch = originalFetch;
+    for (const [k, v] of Object.entries(env)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  });
+}
+
+test('the Graph create body carries givenName and surname', () => withBodyCapturingGraph(async (posts) => {
+  const ident = entra.deriveIdentity(
+    { user_name: 'Vijay Kumar Nailwal', official_email: 'vijay.nailwal@easyfix.in' },
+    ['easyfix.in'],
+  );
+  const res = await entra.createEntraUser(ident);
+  assert.equal(res.ok, true);
+  assert.equal(posts.length, 1);
+  const body = posts[0];
+  assert.equal(body.displayName, 'Vijay Kumar Nailwal');
+  assert.equal(body.givenName, 'Vijay', 'First name in Entra');
+  assert.equal(body.surname, 'Kumar Nailwal', 'Last name in Entra');
+  assert.equal(body.userPrincipalName, 'vijay.nailwal@easyfix.in');
+}));
+
+test('a name field with no value is OMITTED from the body, never sent empty', () => withBodyCapturingGraph(async (posts) => {
+  // Graph stores '' as a value: sending an empty surname writes a blank Last
+  // name that is indistinguishable in the admin centre from the missing-fields
+  // bug this change fixes.
+  const ident = entra.deriveIdentity(
+    { user_name: 'Priya', official_email: 'priya@easyfix.in' },
+    ['easyfix.in'],
+  );
+  await entra.createEntraUser(ident);
+  const body = posts[0];
+  assert.equal(body.givenName, 'Priya');
+  assert.equal('surname' in body, false, 'the key must be absent, not present-and-empty');
+}));
+
+test('a blank CRM name sends neither name field', () => withBodyCapturingGraph(async (posts) => {
+  const ident = entra.deriveIdentity(
+    { user_name: '', official_email: 'ops.desk@easyfix.in' },
+    ['easyfix.in'],
+  );
+  await entra.createEntraUser(ident);
+  const body = posts[0];
+  assert.equal(body.displayName, 'ops.desk', 'displayName still falls back to the local part');
+  assert.equal('givenName' in body, false);
+  assert.equal('surname' in body, false);
+}));
+
+// ── Licence assignment: ACCEPTED ≠ ASSIGNED ───────────────────────────────
+//
+// graphRequest sets `ok` from res.ok, which is true for ANY 2xx — including
+// 202 Accepted, which on assignLicense means "queued", not "the seat is on the
+// user". We recorded `assigned` off that and never looked again.
+//
+// Real case, anand.thakur@easyfix.in (2026-08-04): tbl_user_entra_provisioning
+// said assigned / O365_BUSINESS_ESSENTIALS while the M365 admin centre showed
+// every licence box unticked, and the account could open nothing until an admin
+// assigned Microsoft 365 Business Basic by hand.
+
+const SKU_BUSINESS_BASIC = '802384e1-3c01-4d3e-879f-0dc385e79031';
+
+function withLicenceGraph({ assignStatus = 202, licencesOnReadBack = [] }, fn) {
+  const originalFetch = globalThis.fetch;
+  const env = {
+    MS_GRAPH_TENANT_ID: process.env.MS_GRAPH_TENANT_ID,
+    MS_GRAPH_CLIENT_ID: process.env.MS_GRAPH_CLIENT_ID,
+    MS_GRAPH_CLIENT_SECRET: process.env.MS_GRAPH_CLIENT_SECRET,
+  };
+  process.env.MS_GRAPH_TENANT_ID = 'tenant-test';
+  process.env.MS_GRAPH_CLIENT_ID = 'client-test';
+  process.env.MS_GRAPH_CLIENT_SECRET = 'secret-test';
+
+  const seen = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url);
+    if (u.includes('login.microsoftonline.com')) {
+      return makeRes(200, { access_token: 'fake-token', expires_in: 3600 });
+    }
+    if (/assignLicense/.test(u)) {
+      seen.push('assign');
+      return makeRes(assignStatus, assignStatus === 202 ? null : { id: 'obj-1' });
+    }
+    if (/\/users\//.test(u) && String(init.method || 'GET').toUpperCase() === 'GET') {
+      seen.push('readback');
+      return makeRes(200, { id: 'obj-1', assignedLicenses: licencesOnReadBack.map((skuId) => ({ skuId })) });
+    }
+    return makeRes(404, { error: { code: 'Request_ResourceNotFound', message: 'unscripted' } });
+  };
+
+  return Promise.resolve(fn(seen)).finally(() => {
+    globalThis.fetch = originalFetch;
+    for (const [k, v] of Object.entries(env)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  });
+}
+
+test('a 202 with the seat visible on read-back is VERIFIED', () => withLicenceGraph(
+  { assignStatus: 202, licencesOnReadBack: [SKU_BUSINESS_BASIC] },
+  async (seen) => {
+    const res = await entra.assignLicense('obj-1', SKU_BUSINESS_BASIC);
+    assert.equal(res.ok, true);
+    assert.equal(res.verified, true, 'the seat was read back from Entra');
+    assert.ok(seen.includes('readback'), 'the acknowledgement alone is never enough');
+  },
+));
+
+test('a 202 with NO seat on read-back is accepted-but-UNVERIFIED, not assigned', () => withLicenceGraph(
+  { assignStatus: 202, licencesOnReadBack: [] },
+  async () => {
+    const res = await entra.assignLicense('obj-1', SKU_BUSINESS_BASIC);
+    assert.equal(res.ok, true, 'Graph did accept it — this is not a hard failure');
+    assert.equal(res.verified, false, '…but the seat never appeared');
+    assert.match(res.reason, /still not on the user/);
+  },
+));
+
+test('a read-back showing a DIFFERENT sku does not count as verified', () => withLicenceGraph(
+  { assignStatus: 200, licencesOnReadBack: ['ffffffff-0000-0000-0000-000000000000'] },
+  async () => {
+    const res = await entra.assignLicense('obj-1', SKU_BUSINESS_BASIC);
+    assert.equal(res.verified, false, 'holding SOME licence is not holding THIS one');
+  },
+));
+
+test('the sku match is case-insensitive — Graph casing must not cause a false alarm', () => withLicenceGraph(
+  { assignStatus: 200, licencesOnReadBack: [SKU_BUSINESS_BASIC.toUpperCase()] },
+  async () => {
+    const res = await entra.assignLicense('obj-1', SKU_BUSINESS_BASIC);
+    assert.equal(res.verified, true);
+  },
+));
+
+test('assigned_unconfirmed does NOT count as a working mailbox', () => {
+  // This is the load-bearing half. mailboxLikelyExists gates the OTP mailbox
+  // pre-check: treating an unconfirmed licence as ready would mail a login OTP
+  // into a mailbox that does not exist and suppress the WhatsApp/SMS fallback.
+  assert.equal(
+    entra.mailboxLikelyExists(entra.ACCOUNT_STATUS.CREATED, entra.LICENCE_STATUS.ASSIGNED_UNCONFIRMED),
+    false,
+  );
+  assert.equal(
+    entra.mailboxLikelyExists(entra.ACCOUNT_STATUS.CREATED, entra.LICENCE_STATUS.ASSIGNED),
+    true,
+  );
+  assert.notEqual(entra.LICENCE_STATUS.ASSIGNED_UNCONFIRMED, entra.LICENCE_STATUS.ASSIGNED);
+  assert.ok(entra.LICENCE_STATUS.ASSIGNED_UNCONFIRMED.length <= 32, 'licence_status is VARCHAR(32)');
 });

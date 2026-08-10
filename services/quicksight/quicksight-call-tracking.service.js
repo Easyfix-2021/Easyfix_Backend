@@ -57,10 +57,105 @@
  * with the assigned flag, so the BOOKED split (Pending App Ack vs Pending for
  * Scheduling) reads the same here as in the job modal, the jobs list, and every
  * other export.
+ *
+ * ── CONFERENCE CALLS (2026-08-04) ──────────────────────────────────────────
+ *
+ * An ops call can now gain people mid-call. A conference is ONE call that gained
+ * participants, and the data model says so: tbl_job_caller_info still gets
+ * exactly ONE row per call, while each LEG is a tbl_plivo_call_log row sharing
+ * that call's job_caller_info_id plus a conference_id and a participant_role.
+ *
+ * ⚠ EVERY COUNT IN THIS REPORT IS THEREFORE UNCHANGED, BY CONSTRUCTION, AND
+ * DELIBERATELY STAYS THAT WAY. buildScope reads tbl_job_caller_info only, so a
+ * 3-party conference is ONE call in totals, byJob, byUser, byUserCombined and
+ * byDay — which is the right answer, and the reason tbl_plivo_call_log must NOT
+ * be joined into the scope. (Joining it would also drop every Kaleyra call, per
+ * the note above, so there are two independent reasons not to.)
+ *
+ * WHAT DOES CHANGE is the per-call DRILL-DOWN (getCallDetails), which now
+ * returns a nested `legs[]` per call: who else was on that call, labelled by
+ * role. Nested, never flattened into extra top-level rows — the drill-down
+ * reconciling with the count it was opened from is a hard invariant of this
+ * file, and adding rows would break it.
+ *
+ * ⚠ KNOWN AND ACCEPTED GAP: `partyRole` (the filter, the `parties` breakdown and
+ * the drill-down's own partyRole column) derives ONE counterparty from
+ * jci.reciever — the number originally dialled. A technician CONFERENCED IN
+ * later therefore does not make the call count as 'Technician', and the "Called
+ * To" breakdown under-reports composition on conference calls. That is left
+ * alone on purpose: making `parties` count LEGS would make it count a different
+ * thing from `calls` beside it, and the two would stop reconciling. The legs are
+ * visible in the drill-down instead, which is where composition belongs.
+ *
+ * ── PARTIES REACHED & CONFERENCE COST (2026-08-10) ─────────────────────────
+ *
+ * "Parties reached" IS now wanted as a number, and it arrived the way the note
+ * above predicted it would have to: as its OWN explicitly labelled metric, NOT
+ * as a redefinition of `parties`. Four fields on `totals`, produced by TWO
+ * SEPARATE aggregate queries keyed off the SAME buildScope. buildScope itself is
+ * untouched, so calls / connected / totalDurationSecs / byJob / byUser /
+ * byUserCombined / byDay are identical to what they were before this section
+ * existed — that is the acceptance property of the whole feature, and
+ * tests/quicksight-call-tracking-conference.test.js pins it.
+ *
+ *   partiesReached        HOW MANY PEOPLE we actually got on the line, counting
+ *                         everyone on a conference. Per call: the legs that
+ *                         reached the room (participant_role <> 'operator' AND
+ *                         status IN ('answered','completed')) — or, for a call
+ *                         with NO legs at all (Kaleyra, or a Plivo row from
+ *                         before conferencing existed), 1 when the call
+ *                         connected. That fallback rides a LEFT JOIN, and the
+ *                         direction is the Kaleyra guard: an INNER join would
+ *                         drop an entire provider here for exactly the reason it
+ *                         would in buildScope.
+ *                         INVARIANT: partiesReached >= connected, for any filter
+ *                         set. A 1:1 Plivo call has one non-operator leg, so it
+ *                         equals connected; a conference exceeds it.
+ *   conferenceCalls       scoped calls that were MULTI-party (more than one leg
+ *                         reached the room). Every ops call is technically an
+ *                         MPC (routes/admin/calls.js mints a room for each one),
+ *                         so a 1:1 call is deliberately NOT a conference for
+ *                         reporting purposes.
+ *   conferenceBilledSecs  SUM(tbl_job_conference.billed_leg_seconds) over the
+ *                         rooms whose job_caller_info_id is in scope — what
+ *                         conferencing actually cost.
+ *   conferenceBilledCalls how many of those rooms CONTRIBUTED a figure.
+ *                         billed_leg_seconds is NULL until the MPCEnd webhook
+ *                         lands, so a bare SUM silently under-reports; it
+ *                         therefore never ships without its own coverage count.
+ *                         A cost number without coverage is worse than no cost
+ *                         number, because it looks authoritative.
+ *
+ *   conferenceRooms       every room in scope, billed or not — the DENOMINATOR
+ *                         conferenceBilledCalls is read against.
+ *
+ * ⚠ conferenceBilledCalls counts ROOMS, and a room is minted for EVERY Plivo
+ * call, so it is NOT bounded by conferenceCalls and the two must never be
+ * rendered as a ratio of each other — that prints "3 of 2 rooms billed". Its
+ * denominator is conferenceRooms, which exists for exactly this reason: coverage
+ * has to be read over the same population the SUM was taken over. conferenceCalls
+ * answers a different question ("how many calls actually gained people") and is
+ * a smaller number over a different set.
+ *
+ * `partyRole` / `parties` are STILL not redefined, for the reason in the gap
+ * note above: they count CALLS by their originally-dialled counterparty and they
+ * reconcile with `calls`. partiesReached counts PEOPLE, under its own label.
+ * Different units — never summed, never compared, never merged.
+ *
+ * NOT ADDED to byJob / byUser / byUserCombined / byDay, deliberately: the tiles
+ * were the ask, and a per-row copy of a differently-grained number multiplies
+ * both the query surface and the number of ways two figures on one screen can
+ * disagree.
+ *
+ * FAIL-SOFT: both queries are wrapped, and a pre-migration environment (no
+ * tbl_job_conference, no conference columns on tbl_plivo_call_log) logs a warn
+ * and reports zeros. This report must never 500 over a metric that did not exist
+ * last month.
  */
 
 const { pool } = require('../../db');
 const logger = require('../../logger');
+const plivoLog = require('../plivo-call-log.service');
 const { buildInFilter, _dateHelpers } = require('./_shared');
 const { istToday, fmt, addDays } = _dateHelpers;
 const { jobStatusLabel } = require('../../utils/job-status-label');
@@ -80,6 +175,32 @@ const TREND_MAX_DAYS = 92;
 /* The derived receiver types, in match-priority order. Exported so the route's
  * Joi enum and the derivation below cannot drift apart. */
 const PARTY_ROLES = Object.freeze(['Customer', 'Alternate', 'Client SPOC', 'Technician', 'Other']);
+
+/*
+ * Conference LEG roles → display labels.
+ *
+ * Deliberately a SUPERSET of PARTY_ROLES, and deliberately NOT merged into it.
+ * PARTY_ROLES is the FILTER enum: every value in it must be something the SQL
+ * derivation above can actually match, and 'Operator' / 'Client Contact' are
+ * not (the first is our own side of the call, the second is a
+ * tbl_client_contacts row, which is a different thing from the job's
+ * client_spoc). Legs are nested detail, never filtered or aggregated on, so
+ * they can be labelled precisely without widening a filter that would then
+ * return nothing.
+ */
+const LEG_ROLE_LABEL = Object.freeze({
+  operator: 'Operator',
+  customer: 'Customer',
+  customer_alt: 'Alternate',
+  technician: 'Technician',
+  job_spoc: 'Client SPOC',
+  client_contact: 'Client Contact',
+  custom: 'Other',
+});
+
+// Legs per call are 2–5 in practice. Bounds the drill-down's leg read so a page
+// of 500 conference calls cannot fan out unboundedly.
+const LEGS_PER_CALL_BUDGET = 12;
 
 /*
  * VOICE-PROVIDER filter values — deliberately NOT a plain list of jci.provider
@@ -407,6 +528,167 @@ function groupBy(rows, keyOf, shape) {
   }, new Map());
 }
 
+/*
+ * ── The conference LEGS, aggregated to ONE ROW PER CALL ────────────────────
+ *
+ * The shape that lets a leg table be read WITHOUT multiplying the call it
+ * belongs to: collapse the legs first, join the collapsed row second. Whatever
+ * this returns, it returns at most one row per job_caller_info_id, so the LEFT
+ * JOIN below cannot fan a call out — which is the same property buildScope
+ * protects by not joining this table at all.
+ *
+ * `reached` counts the people who were ACTUALLY ON the call: not the operator
+ * (that is our own side, and counting it would add one to every call), and only
+ * legs whose status says they made it into the room. A leg that rang out or was
+ * declined is someone we tried to reach and did not.
+ *
+ * conference_id IS NOT NULL is load-bearing, not decorative: a pre-conference
+ * Plivo row has a call-log row with NO role and NO conference, and letting it
+ * through would give the call `legs = 1, reached = 0` — scoring an ordinary
+ * connected call as nobody reached, instead of letting it take the fallback.
+ */
+const LEG_REACH_SUBQUERY = `
+        SELECT job_caller_info_id AS call_id,
+               COUNT(*) AS legs,
+               COUNT(CASE WHEN participant_role <> 'operator'
+                           AND status IN ('answered', 'completed') THEN 1 END) AS reached
+          FROM tbl_plivo_call_log
+         WHERE conference_id IS NOT NULL
+           AND job_caller_info_id IS NOT NULL
+         GROUP BY job_caller_info_id`;
+
+/*
+ * PARTIES REACHED + CONFERENCE CALL COUNT — its OWN aggregate over the SAME
+ * scope. It counts PEOPLE, not calls, and it is the only query in this file that
+ * reads tbl_plivo_call_log for a number: every count remains a count of
+ * tbl_job_caller_info rows.
+ *
+ * The LEFT JOIN direction is the whole design. A Kaleyra call has no row in
+ * tbl_plivo_call_log at all, so it MUST still contribute — one party when it
+ * connected, none when it rang out — rather than vanish. Same for any Plivo call
+ * placed before conferencing shipped.
+ *
+ * Probe-gated the same way loadConferenceLegs is: on a pre-migration schema
+ * `conference_id` does not exist, and issuing a query that is guaranteed to fail
+ * on every request is not fail-soft, it is just noisy. The try/catch behind it
+ * is the second net (a table lock, a permissions change, anything).
+ */
+/*
+ * DEGRADE TO THE FALLBACK, NOT TO ZERO.
+ *
+ * When the conference columns are absent — or the leg query fails — the answer
+ * is NOT "nobody was reached". Every metric this report already had still knows
+ * that a connected call reached one party, and that branch needs no conference
+ * table at all. Returning 0 would put "Parties Reached 0" beside a non-zero
+ * Connected, which reads as a broken metric rather than an absent one, and an
+ * operator who sees one tile contradict another stops trusting the page.
+ *
+ * So the degraded answer is exactly `connected`: true, complete for a
+ * pre-conference world, and an understatement only of the thing that does not
+ * exist yet. conferenceCalls stays 0, which is also simply true there.
+ */
+async function partiesFallback(filters) {
+  try {
+    const s = buildScope(filters);
+    const [[r]] = await pool.query(
+      `SELECT COUNT(CASE WHEN COALESCE(jci.duration, 0) > 0 THEN 1 END) AS parties_reached
+         ${s.from} ${s.where}`,
+      s.params,
+    );
+    return { partiesReached: n(r && r.parties_reached), conferenceCalls: 0 };
+  } catch {
+    return { partiesReached: 0, conferenceCalls: 0 };
+  }
+}
+
+async function loadPartiesReached(filters) {
+  if (!(await plivoLog.hasConferenceColumns())) return partiesFallback(filters);
+  try {
+    const s = buildScope(filters);
+    const [[r]] = await pool.query(
+      `SELECT SUM(CASE WHEN lg.call_id IS NULL
+                       -- No legs: Kaleyra, or a pre-conference Plivo call. The
+                       -- call itself is the only evidence of who was reached,
+                       -- and a positive duration is what "connected" means
+                       -- everywhere else in this report (see CALL_AGG).
+                       THEN CASE WHEN COALESCE(jci.duration, 0) > 0 THEN 1 ELSE 0 END
+                       ELSE lg.reached END)                            AS parties_reached,
+              -- MULTI-party only. One reached leg is an ordinary 1:1 call that
+              -- happens to be carried by an MPC, and calling that a conference
+              -- would report the plumbing rather than what ops did.
+              COUNT(CASE WHEN COALESCE(lg.reached, 0) > 1 THEN 1 END)  AS conference_calls
+         ${s.from}
+         LEFT JOIN (${LEG_REACH_SUBQUERY}) lg ON lg.call_id = jci.job_caller_info
+         ${s.where}`,
+      s.params,
+    );
+    return { partiesReached: n(r && r.parties_reached), conferenceCalls: n(r && r.conference_calls) };
+  } catch (e) {
+    logger.warn('Call Tracking parties-reached aggregate failed (falling back to connected-call count) · ' + e.message);
+    return partiesFallback(filters);
+  }
+}
+
+/*
+ * CONFERENCE COST — billed seconds, and the coverage that makes them readable.
+ *
+ * billed_leg_seconds comes off the MPCEnd webhook (MPCBilledDuration) and is
+ * NULL until that webhook arrives — for a live room, for a room whose webhook
+ * was lost, and for every room on a provider that does not report it. So the SUM
+ * is ALWAYS accompanied by COUNT(billed_leg_seconds), i.e. how many of the rooms
+ * in scope actually contributed to it. Shipping the sum alone would present a
+ * partial spend as the whole spend, with nothing on screen to say so.
+ *
+ * The INNER JOIN is correct HERE and is not the hazard buildScope guards
+ * against: this query does not count calls, it selects rooms. Nothing about
+ * totals.calls passes through it.
+ */
+/*
+ * ⚠ THE DENOMINATOR IS `conferenceRooms`, NOT `conferenceCalls`. They count
+ * different populations and mixing them prints impossible coverage.
+ *
+ * routes/admin/calls.js mints a tbl_job_conference room for EVERY Plivo ops
+ * call, because a 1:1 call is a one-participant MPC — that is the whole reason
+ * conferencing works at all (Plivo cannot promote a live <Dial>). So:
+ *
+ *   conferenceRooms  — every room in scope. The population the SUM is taken over,
+ *                      and therefore the ONLY honest denominator for its coverage.
+ *   conferenceCalls  — only the calls that actually GAINED people. A different,
+ *                      smaller, and genuinely interesting number — but a coverage
+ *                      ratio built on it reads "3 of 2 rooms billed".
+ *
+ * And the SUM stays over ALL rooms deliberately. Narrowing it to multi-party
+ * rooms would under-report the exact spend this metric exists to expose: a 1:1
+ * ops call is billed as an MPC too, so its seconds are real money.
+ */
+async function loadConferenceBilling(filters) {
+  const zero = { conferenceBilledSecs: 0, conferenceBilledCalls: 0, conferenceRooms: 0 };
+  try {
+    const s = buildScope(filters);
+    const [[r]] = await pool.query(
+      `SELECT COALESCE(SUM(conf.billed_leg_seconds), 0) AS billed_secs,
+              -- COUNT(col) skips NULLs — that is exactly the coverage figure.
+              COUNT(conf.billed_leg_seconds)            AS billed_calls,
+              -- COUNT(*) counts every room, billed or not: the denominator.
+              COUNT(*)                                  AS rooms
+         ${s.from}
+         JOIN tbl_job_conference conf ON conf.job_caller_info_id = jci.job_caller_info
+         ${s.where}`,
+      s.params,
+    );
+    return {
+      conferenceBilledSecs: n(r && r.billed_secs),
+      conferenceBilledCalls: n(r && r.billed_calls),
+      conferenceRooms: n(r && r.rooms),
+    };
+  } catch (e) {
+    // Pre-migration there is no tbl_job_conference at all. Zeros, a warn, and a
+    // report that still renders.
+    logger.warn('Call Tracking conference-billing aggregate failed (tile reads 0) · ' + e.message);
+    return zero;
+  }
+}
+
 async function getCallTracking(filters = {}) {
   const w = windowOf(filters);
   logger.info('Building Call Tracking report · window=' + w.from + '..' + w.to
@@ -700,10 +982,35 @@ async function getCallTracking(filters = {}) {
     return { day, calls: n(r && r.calls), connected: n(r && r.connected), uniqueJobs: n(r && r.unique_jobs) };
   });
 
+  /*
+   * ── Conference metrics — TILES ONLY ──
+   * Two extra aggregates over the SAME scope, each self-contained and each
+   * fail-soft. They are read AFTER every existing query and folded into
+   * `totals` only: nothing above this line changes shape or value because of
+   * them, and byJob / byUser / byUserCombined / byDay deliberately do not carry
+   * per-row versions (see the header).
+   */
+  const reach = await loadPartiesReached(filters);
+  const billing = await loadConferenceBilling(filters);
+
   const totals = {
     ...shapeAgg(tot),
     uniqueJobs: n(tot && tot.unique_jobs),
     uniqueCallers: n(tot && tot.unique_callers),
+    /*
+     * All four are ALWAYS numbers, never null. The null/em-dash convention this
+     * report uses means "we cannot divide" — it belongs to averages. These are
+     * counts and sums: zero here means zero, and a zero that means "could not
+     * measure" is announced in the log by the warn its loader emitted.
+     */
+    partiesReached: reach.partiesReached,
+    conferenceCalls: reach.conferenceCalls,
+    conferenceBilledSecs: billing.conferenceBilledSecs,
+    conferenceBilledCalls: billing.conferenceBilledCalls,
+    // The denominator conferenceBilledCalls is read against. NOT conferenceCalls
+    // — see the header: a room exists for every ops call, so the two count
+    // different populations and a ratio of them prints "3 of 2".
+    conferenceRooms: billing.conferenceRooms,
   };
 
   const byJob = jobRows.map((r) => {
@@ -787,8 +1094,84 @@ async function getCallTracking(filters = {}) {
 
   logger.info('Returning ' + byJob.length + ' job rows · ' + byUser.length + ' day-user rows · '
     + byUserCombined.length + ' combined user rows · '
-    + byDay.length + ' trend days · ' + totals.calls + ' calls');
+    + byDay.length + ' trend days · ' + totals.calls + ' calls · '
+    + totals.partiesReached + ' parties reached across ' + totals.conferenceCalls + ' conference calls · '
+    + totals.conferenceBilledSecs + ' billed conf secs from ' + totals.conferenceBilledCalls + ' rooms');
   return { totals, byJob, byUser, byUserCombined, byDay };
+}
+
+/*
+ * Load the conference LEGS for one page of drill-down rows, in ONE query,
+ * indexed by job_caller_info_id.
+ *
+ * This is the surface the owner called out: "the extra legs must be visible
+ * where per-leg DETAIL is shown, labelled by role". Before this, a 3-party
+ * conference showed here as ONE row with ONE receiverName and ONE partyRole, and
+ * the other two legs were unreachable — there was no join, no id, nothing.
+ *
+ * ⚠ NO NUMBER IS SELECTED — not even a masked prefix. Every other surface masks;
+ * this report's contract (see the PRIVACY note in the header) is stricter still,
+ * because it feeds an export and a chart: it returns NAMES and derived ROLES
+ * only, and playback goes through the authorised call-audio endpoint where that
+ * permission check lives. Do not add dialed_number / receiver_number here.
+ *
+ * Fail-soft in both directions: a pre-migration environment has no conference_id
+ * column (the probe short-circuits) and a query failure logs and returns no
+ * legs. A drill-down that 500s because the composition detail was unavailable
+ * would be worse than one without it.
+ */
+async function loadConferenceLegs(callIds) {
+  const ids = [...new Set((callIds || []).map(Number).filter((v) => Number.isFinite(v) && v > 0))];
+  if (!ids.length) return new Map();
+  if (!(await plivoLog.hasConferenceColumns())) return new Map();
+  const cap = Math.min(ids.length * LEGS_PER_CALL_BUDGET, 2000);
+  let rows = [];
+  try {
+    [rows] = await pool.query(
+      `SELECT job_caller_info_id AS callId,
+              id                 AS legId,
+              conference_id      AS conferenceId,
+              participant_role   AS role,
+              receiver_name      AS name,
+              status,
+              duration,
+              answered_on        AS joinedAt,
+              ended_on           AS leftAt
+         FROM tbl_plivo_call_log
+        WHERE conference_id IS NOT NULL
+          AND job_caller_info_id IN (${ids.map(() => '?').join(',')})
+        ORDER BY job_caller_info_id ASC, id ASC
+        LIMIT ?`,
+      [...ids, cap],
+    );
+  } catch (e) {
+    logger.warn('Call Tracking conference legs load failed (drill-down renders without them) · ' + e.message);
+    return new Map();
+  }
+  if (rows.length >= cap) logger.warn(`Call Tracking drill-down legs hit the ${cap}-row cap`);
+
+  const byCall = new Map();
+  for (const r of rows) {
+    const key = n(r.callId);
+    const list = byCall.get(key) || [];
+    list.push({
+      legId: n(r.legId),
+      conferenceId: r.conferenceId == null ? null : n(r.conferenceId),
+      role: r.role || null,
+      // The label, in the same vocabulary the row's own partyRole uses wherever
+      // the two overlap — so a reader is never shown 'Technician' on the row and
+      // 'technician' on a leg.
+      partyRole: LEG_ROLE_LABEL[r.role] || 'Other',
+      name: (r.name && String(r.name).trim()) || null,
+      status: r.status || null,
+      durationSecs: r.duration == null ? null : Number(r.duration),
+      connected: n(r.duration) > 0,
+      joinedAt: r.joinedAt || null,
+      leftAt: r.leftAt || null,
+    });
+    byCall.set(key, list);
+  }
+  return byCall;
 }
 
 /*
@@ -853,10 +1236,22 @@ async function getCallDetails(filters = {}, selection = {}) {
   );
   const capped = rows.length >= DETAIL_CAP;
   if (capped) logger.warn(`Call Tracking drill-down hit the ${DETAIL_CAP}-row cap`);
-  logger.info('Returning ' + rows.length + ' call detail rows' + (capped ? ' (capped)' : ''));
+
+  /*
+   * ONE extra query, and only when the page contains a conference. The rows
+   * above are UNCHANGED in number — a conference is still exactly one of them,
+   * which is what keeps this list reconciling with the count it was opened
+   * from. `legs` is detail hung off that row, not additional rows.
+   */
+  const legsByCall = await loadConferenceLegs(rows.map((r) => n(r.id)));
+  const conferences = [...legsByCall.keys()].length;
+  logger.info('Returning ' + rows.length + ' call detail rows' + (capped ? ' (capped)' : '')
+    + (conferences ? ` · ${conferences} of them conference calls` : ''));
 
   return {
-    items: rows.map((r) => ({
+    items: rows.map((r) => {
+      const legs = legsByCall.get(n(r.id)) || [];
+      return {
       id: n(r.id),
       jobId: r.jobId == null ? null : n(r.jobId),
       callAt: r.callAt || null,
@@ -871,8 +1266,28 @@ async function getCallDetails(filters = {}, selection = {}) {
       connected: n(r.durationSecs) > 0,
       provider: r.provider || null,
       callerStatus: r.callerStatus || null,
+      /*
+       * The recording is the ROOM's, not a leg's — a Multi-Party Call produces
+       * ONE recording, filed on the primary leg by
+       * plivo-call-log.service::setRecording (which is scoped to that leg for
+       * exactly this reason). So this flag stays a property of the CALL, and
+       * `legs` deliberately carries no recording of its own: offering the same
+       * audio three times would be worse than offering it once.
+       */
       recordingAvailable: Number(r.recordingFlag) === 1,
-    })),
+      /*
+       * ── Conference composition (decision 3) ──
+       * Empty array, never null, on an ordinary 1:1 call — so a consumer
+       * branches on `isConference` and never on shape. `partyRole` above is
+       * still the call's ONE original counterparty (see the header's known-gap
+       * note); these are everyone who was actually on it.
+       */
+      conferenceId: legs.length ? legs[0].conferenceId : null,
+      isConference: legs.length > 1,
+      legCount: legs.length,
+      legs,
+      };
+    }),
     capped,
   };
 }
@@ -886,6 +1301,15 @@ async function getCallDetails(filters = {}, selection = {}) {
  * The nested arrays are flattened into readable single cells ('Priya (3), Amit
  * (1)') — a spreadsheet cell cannot hold a list, and an operator reading the
  * export should not have to go back to the CRM to see who called.
+ *
+ * ⚠ THE CONFERENCE TOTALS ARE NOT COLUMNS HERE, and that is a decision, not an
+ * omission. `sheets` is per-ROW material at three grains, and partiesReached /
+ * conferenceCalls / conferenceBilledSecs / conferenceBilledCalls are
+ * WINDOW-level figures with no per-row version (see the header on why per-row
+ * versions were not built). Repeating a window total on every row is how an
+ * export starts getting summed by whoever opens it. They ride the KPI band and
+ * the meta line of the first sheet instead — the export's existing home for
+ * window-level numbers — which the route assembles from `totals`.
  */
 function flatten(list, labelOf) {
   return (list || []).map((x) => `${labelOf(x)} (${x.calls})`).join(', ');

@@ -78,6 +78,8 @@ jobs:
           node --check services/zone.service.js           || true
           node --check services/zone-upload.service.js    || true
 
+      - name: Lint (no-undef — the copy-paste-across-handlers guard)
+        run: npm run lint
       # Characterization tests for the shared choke points (setStatus, create,
       # assign, offer, accept-offer, reschedule, magic-link write, + the
       # statusToEventName notification gate). Fake-pool based — no DB, no network,

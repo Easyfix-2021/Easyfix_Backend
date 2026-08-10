@@ -13,10 +13,31 @@
  *           byUserCombined: [per user, whole window + per-active-day averages],
  *           byDay: [trend] }
  *       (or a 3-sheet XLSX when format='xlsx')
+ *       totals additionally carries the conference tiles — partiesReached,
+ *       conferenceCalls, conferenceBilledSecs, conferenceBilledCalls (all
+ *       numbers, never null; see the service header for what each counts and
+ *       why conferenceBilledCalls is NOT a ratio against conferenceCalls).
  *
  *   POST /api/admin/quicksight/call-tracking/calls
  *     body: the SAME filters + { jobId? | selectedCallerId? | day? }
- *     → { items: [per call], capped }
+ *     → { items: [per call, each with legs[]], capped }
+ *
+ * CONFERENCE CALLS: a conference is ONE call that gained people, so it is ONE
+ * row everywhere a count is shown — every existing number in totals, byJob,
+ * byUser, byUserCombined, byDay and the XLSX is unchanged, because buildScope
+ * reads tbl_job_caller_info, which still has exactly one row per call. The extra
+ * PARTIES are returned as a nested `legs[]` on each drill-down item (role +
+ * name, never a number), never as extra rows: the drill-down reconciling with
+ * the count it was opened from is a hard invariant of the service. See the
+ * service header for the one accepted gap — `partyRole` still describes the
+ * originally-dialled counterparty, not everyone who ended up on the call.
+ *
+ * HOW MANY PEOPLE were reached is a SEPARATE, explicitly labelled set of tiles
+ * (partiesReached / conferenceCalls / conferenceBilledSecs /
+ * conferenceBilledCalls), computed by their own aggregates off the same scope —
+ * counts of PEOPLE and ROOMS beside counts of CALLS, never mixed into them.
+ * They are window-level, so in the XLSX they ride the first sheet's KPI band and
+ * meta line rather than being repeated down every row.
  *
  * The date window is NOT optional in effect: tbl_job_caller_info carries ~940k
  * rows, so the service defaults both edges to IST today rather than ever running
@@ -144,8 +165,19 @@ router.post('/summary', validate(summaryBody), async (req, res, next) => {
         wb = buildStyledWorkbook({
           wb,
           title: `EasyFix · Call Tracking — ${sheet.name}`,
+          /*
+           * The conference COST rides the meta line, not a KPI card, because it
+           * may not travel without its coverage: billed_leg_seconds is NULL
+           * until the MPCEnd webhook lands, so the sum is a floor, not a total.
+           * "(N rooms reported)" is that coverage, and a card has room for one
+           * number only. N counts ROOMS in scope — a room is minted for every
+           * Plivo call — so it is deliberately NOT phrased as a fraction of the
+           * conference count beside it.
+           */
           meta: i === 0
-            ? `${data.totals.calls} Calls · ${data.byJob.length} Jobs · ${data.totals.uniqueCallers} Callers · Connect ${data.totals.connectRate}% · Generated ${displayStamp()}`
+            ? `${data.totals.calls} Calls · ${data.byJob.length} Jobs · ${data.totals.uniqueCallers} Callers · Connect ${data.totals.connectRate}% · `
+              + `${data.totals.conferenceCalls} Conference Calls · Conf Billed ${data.totals.conferenceBilledSecs} Sec (${data.totals.conferenceBilledCalls} rooms reported) · `
+              + `Generated ${displayStamp()}`
             : undefined,
           sheetName: sheet.name,
           columns: decorateColumns(sheet.columns, COLUMN_RULES),
@@ -155,6 +187,12 @@ router.post('/summary', validate(summaryBody), async (req, res, next) => {
             { label: 'Connected', value: data.totals.connected, numFmt: FMT.COUNT, accent: 'FF10B981' },
             { label: 'Connect Rate', value: data.totals.connectRate, numFmt: FMT.PCT, accent: 'FF10B981' },
             { label: 'Avg Talk (Sec)', value: data.totals.avgDurationSecs != null ? data.totals.avgDurationSecs : 0, numFmt: FMT.COUNT },
+            /*
+             * PEOPLE, not calls — it sits next to Connected on purpose, because
+             * the pair is the point: they are equal until a call gains someone,
+             * and partiesReached >= connected always holds.
+             */
+            { label: 'Parties Reached', value: data.totals.partiesReached, numFmt: FMT.COUNT, accent: 'FF8B5CF6' },
           ] : undefined,
           emptyMessage: 'No Calls Found.',
         });

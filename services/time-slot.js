@@ -148,6 +148,77 @@ function wallClockTime(dt) {
   return `${pad2(p.h)}:${pad2(p.mi)}`;
 }
 
+/*
+ * formatClock12(dt) → the human 12-hour appointment time — '5:30 AM', '3 PM' —
+ * or null when the value carries no REAL time-of-day.
+ *
+ * Whole hours drop the ':00' ("3 PM", not "3:00 PM"): that is how the approved
+ * WhatsApp template already reads the appointment back to the customer
+ * (whatsapp-conversation.service.js jobDateLabel), and the two must not diverge
+ * now that the public shared-job page states a time as well.
+ *
+ * Gated on hasTimeOfDay, NOT slotHour, so the 00:00 midnight sentinel returns
+ * null instead of rendering "12 AM" for a date-only booking that never had a
+ * time captured at all. A caller that gets null must show the band alone.
+ *
+ * Lives here rather than beside its callers because this module already owns
+ * every reading of an appointment's time columns (wallClockTime, slotHour) and
+ * is pure + dependency-free, so a display surface can require it without
+ * dragging a service graph along.
+ */
+function formatClock12(dt) {
+  if (!hasTimeOfDay(dt)) return null;
+  const p = parseWallClock(dt);
+  if (!p) return null;
+  const h12 = ((p.h + 11) % 12) + 1;
+  const suffix = p.h < 12 ? 'AM' : 'PM';
+  return p.mi === 0 ? `${h12} ${suffix}` : `${h12}:${pad2(p.mi)} ${suffix}`;
+}
+
+/*
+ * Customer-facing weekday / month spellings. DELIBERATELY hard-coded English
+ * rather than derived from Intl/toLocaleDateString: these strings land inside
+ * DLT-registered SMS bodies and WhatsApp templates whose surrounding literal
+ * text is registered with the operator, so they must not shift with the
+ * container's ICU data, locale or TZ. A silent locale change would re-word an
+ * approved template and the operator would start dropping the message.
+ */
+const WEEKDAY_ABBR = Object.freeze(['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']);
+const MONTH_ABBR = Object.freeze([
+  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+]);
+
+/*
+ * appointmentDateLabel(dt) → the human appointment DATE — 'Wed, 05 Aug 2026' —
+ * or null when the value is absent / not a date at all.
+ *
+ * The DATE sibling of formatClock12, and here for the same reason stated above
+ * it: this module already owns every reading of an appointment's columns and is
+ * pure + dependency-free, so a notification surface can require it without
+ * dragging a service graph along. The reschedule SMS
+ * (services/notification-orchestrator.service.js) needs a date beside the band
+ * and must not require whatsapp-conversation.service just to format one — that
+ * file pulls ai.service, maps.service, job-magic-link.service and S3 with it.
+ *
+ * Reads only the DATE part, so the 00:00 midnight sentinel is fine here: "no
+ * time-of-day was captured" still has a real date. It is the BAND that must
+ * never be derived from the sentinel (see displaySlot) — never the date.
+ *
+ * ⚠ BYTE-MIRROR of whatsapp-conversation.service.formatCustomerDateLabel
+ * (zero-padded day, 3-letter weekday and month, comma after the weekday, and
+ * null — never the string 'null' — on unparseable input, pinned by
+ * tests/whatsapp-conversation.test.js). That copy predates this one and should
+ * be folded into this helper the next time that file is touched; until then
+ * tests/time-slot.test.js asserts the two agree so they cannot drift silently.
+ */
+function appointmentDateLabel(dt) {
+  const p = parseWallClock(String(dt == null ? '' : dt).trim());
+  if (!p) return null;
+  const d = new Date(Date.UTC(p.y, p.mo - 1, p.d));
+  if (Number.isNaN(+d)) return null;
+  return `${WEEKDAY_ABBR[d.getUTCDay()]}, ${pad2(p.d)} ${MONTH_ABBR[p.mo - 1]} ${p.y}`;
+}
+
 // ─── Band derivation ─────────────────────────────────────────────────
 /*
  * bandForHour(h) → one of the four bands.
@@ -181,9 +252,88 @@ function deriveTimeSlot(dt) {
   return bandForHour(h);
 }
 
+// ─── Cosmetic fold vs. interpretation ────────────────────────────────
+/*
+ * TWO DIFFERENT QUESTIONS, TWO DIFFERENT FUNCTIONS. They live side by side so
+ * the distinction is impossible to miss, and they must NEVER be merged or
+ * implemented in terms of each other.
+ *
+ *   canonicalSlot(v)      "are these two strings the SAME SPELLING of a band?"
+ *                         A purely COSMETIC fold — case and whitespace, nothing
+ *                         else. It never interprets: a value that is not one of
+ *                         the four bands modulo case/spacing comes back
+ *                         UNCHANGED. Safe on the READ side — comparing,
+ *                         grouping, deciding which chip renders selected,
+ *                         widening a SQL match.
+ *
+ *   normaliseSlotLabel(v) "what band does this label MEAN?" It parses an hour
+ *                         out of the label and answers with the CONTAINING
+ *                         band. That is a WRITER-SIDE JUDGEMENT — it picks a
+ *                         band on the caller's behalf — and it is what
+ *                         resolveTimeSlot uses at save time.
+ *
+ * They disagree on purpose, e.g. on '9-12':
+ *     canonicalSlot('9-12')      === '9-12'          (not a band spelling)
+ *     normaliseSlotLabel('9-12') === '9AM to 12PM'   (the band it denotes)
+ * …and on '3 PM–4 PM' (a 1-hour frame): canonicalSlot leaves it alone,
+ * normaliseSlotLabel answers '3PM to 7PM'.
+ *
+ * Swapping one for the other is a real bug in both directions. Using
+ * normaliseSlotLabel on the READ side silently re-labels the 79,364 rows of
+ * legacy free text this column carries; using canonicalSlot on the WRITE side
+ * would let a 1-hour frame label back into tbl_job.time_slot, which is the
+ * experiment the whole module exists to keep reversed.
+ */
+
+/*
+ * foldSlot(v) → the COMPARISON form of a slot string: lower-cased with ALL
+ * whitespace removed. Never stored, never displayed, never returned to a
+ * caller — it exists only to answer "do these two strings name the same band?".
+ *
+ * WHY IT HAS TO EXIST. MySQL's default collation is case-insensitive, so
+ * `time_slot = '9AM to 12PM'` DOES match a row storing '9am to 12pm' — but it
+ * does NOT match '9 am to 12 pm', because collation folds CASE, not SPACES.
+ * Prod carries both spellings of the morning band, so byte (or collation)
+ * equality silently drops rows that are unambiguously the same window.
+ *
+ * Byte-mirror of `foldSlot` in Easyfix_CRM_UI/src/lib/job-slots.ts, and mirrored
+ * again in SQL as REPLACE(LOWER(col), ' ', '') by the availability count in
+ * services/integration.service.js. Keep all three in step.
+ */
+function foldSlot(v) {
+  return String(v == null ? '' : v).toLowerCase().replace(/\s+/g, '');
+}
+
+/* Folded spelling → the canonical band it names. Built once, from the four. */
+const BAND_BY_FOLD = new Map(TIME_SLOT_BANDS.map((b) => [foldSlot(b), b]));
+
+/*
+ * canonicalSlot(value) → the canonical spelling of a stored slot when it names
+ * one of the four bands with only cosmetic differences ('3pm to 7pm' →
+ * '3PM to 7PM', '9 am to 12 pm' → '9AM to 12PM'); the TRIMMED INPUT otherwise,
+ * and '' for an absent value.
+ *
+ * DELIBERATELY NARROW — case and spacing only. 'Morning 9 to 2', '9-12' and
+ * '3 PM–4 PM' are genuinely different strings and pass through untouched.
+ * Folding those would mean PICKING a band on the caller's behalf, which is
+ * normaliseSlotLabel's job at save time, not something a read-side compare may
+ * do silently.
+ *
+ * READ-SIDE ONLY. It does not decide what gets stored — resolveTimeSlot has the
+ * final say on what lands in tbl_job.time_slot.
+ */
+function canonicalSlot(value) {
+  const raw = String(value == null ? '' : value).trim();
+  if (!raw) return '';
+  return BAND_BY_FOLD.get(foldSlot(raw)) || raw;
+}
+
 /*
  * normaliseSlotLabel(label) → the canonical band a slot LABEL denotes, or null
  * when the label carries no readable hour.
+ *
+ * ⚠ NOT canonicalSlot. This one INTERPRETS — see the comparison note above.
+ * It is a writer-side judgement; canonicalSlot is the read-side cosmetic fold.
  *
  * Accepts, without caring which picker produced it:
  *   - the four canonical bands (identity)
@@ -245,6 +395,61 @@ function resolveTimeSlot(inputSlot, requestedDateTime) {
   return deriveTimeSlot(requestedDateTime);
 }
 
+/*
+ * displaySlot(requestedDateTime, storedSlot) → the band to SHOW beside a job's
+ * appointment. '' when there is nothing trustworthy to show, so a caller can
+ * render its own dash, omit the line, or `|| null` it for a JSON payload.
+ *
+ * THE READ-SIDE SIBLING OF resolveTimeSlot — same precedence, no writing. It is
+ * a two-line COMPOSITION of the helpers above rather than new logic; it exists
+ * because every display surface was composing it independently and they drifted.
+ *
+ * ── WHY THE STORED COLUMN IS NOT SHOWN RAW ──
+ *
+ * tbl_job.time_slot is DERIVED, not authored: it is the band containing
+ * requested_date_time, and resolveTimeSlot re-derives it on every write. A
+ * stored value that disagrees with the appointment instant is therefore already
+ * dead — the next save discards it. Job #482491 is the recorded case:
+ * requested_date_time 05:30 ('After Hours') stored alongside time_slot
+ * '3pm to 7pm'. Every surface reading the column raw published '3pm to 7pm'
+ * against an 05:30 appointment — a window the system had already stopped
+ * promising.
+ *
+ * ── WHAT IT DELIBERATELY DOES NOT DO ──
+ *
+ * It does NOT swap the band for the exact minute. Customer-facing surfaces
+ * commit to a WINDOW, not to "the technician arrives at 5:30" — the band IS the
+ * promise (owner, 2026-08-03: "we don't want to commit that the technician will
+ * reach exactly at 5:30 as it can get late, but we are committing that they
+ * will reach in this slot"). The defect was only ever WHICH band. So this
+ * returns a band, always; it just refuses to return one the appointment
+ * contradicts.
+ *
+ * ── THE PRECEDENCE ──
+ *
+ *   1. A real time-of-day on requested_date_time WINS (deriveTimeSlot).
+ *   2. Date-only / the 00:00 midnight sentinel — where hasTimeOfDay is false and
+ *      "no time was ever captured", NOT midnight — falls back to the stored
+ *      label, canonicalised for SPELLING ONLY (canonicalSlot is a cosmetic fold,
+ *      never an interpretation, so the ~79k legacy 'Morning 9 to 2' rows survive
+ *      verbatim rather than being re-labelled from an hour nobody wrote down).
+ *
+ * ⚠ canonicalSlot, NOT normaliseSlotLabel — see the comparison note above
+ * canonicalSlot. This is a READ; picking a band on the caller's behalf is the
+ * writer-side judgement resolveTimeSlot owns.
+ *
+ * Byte-mirror of `displaySlot` in Easyfix_CRM_UI/src/lib/job-slots.ts (same
+ * name, same argument order, same '' for "nothing to show"). Keep the two in
+ * step. Current backend callers: services/job-share.service.js (the public
+ * shared-job page + its share message) and
+ * services/notification-orchestrator.service.js (the DLT CUSTOMER_NOT_REACHABLE
+ * SMS).
+ */
+function displaySlot(requestedDateTime, storedSlot) {
+  if (hasTimeOfDay(requestedDateTime)) return deriveTimeSlot(requestedDateTime) || '';
+  return canonicalSlot(storedSlot);
+}
+
 // ─── 1-hour conflict window ──────────────────────────────────────────
 /*
  * conflictFrame(dt) → { date: 'YYYY-MM-DD', hour: 0-23 } | null
@@ -294,10 +499,19 @@ module.exports = {
   slotHour,
   hasTimeOfDay,
   wallClockTime,
+  formatClock12,
+  // DATE sibling of formatClock12 — the customer-facing 'Wed, 05 Aug 2026'.
+  appointmentDateLabel,
   bandForHour,
   deriveTimeSlot,
+  // READ-side cosmetic fold (case + spacing). NOT interchangeable with
+  // normaliseSlotLabel below — see the comparison note above canonicalSlot.
+  canonicalSlot,
   normaliseSlotLabel,
   resolveTimeSlot,
+  // READ-side composition of the two above — the ONE band every display
+  // surface shows. Never writes; resolveTimeSlot stays the only writer gate.
+  displaySlot,
   conflictFrame,
   sameConflictFrame,
 };

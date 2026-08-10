@@ -93,6 +93,16 @@ router.use('/clients',         require('./clients'));
 router.use('/customers',       require('./customers'));
 router.use('/call-info',       require('./call-info'));
 router.use('/calls',           require('./calls'));
+// Ops conference calling (Plivo Multi-Party Call). NO new feature flag — the
+// operational switch is the EXISTING `plivo.calling.enabled` property (off ⇒
+// Kaleyra, which has no live surface and therefore no conferences). Gated by
+// Gated by the SAME RBAC key as calling — `isClickToCall`. There is deliberately
+// no conference-specific permission: every ops call is a conference, so a lesser
+// grant could only produce an operator who can place a call but not see its
+// participants. The custom-number arm still brings its own per-operator rate
+// limit because /api/admin/* is deliberately rate-limit-exempt.
+// See routes/admin/conferences.js.
+router.use('/conferences',     require('./conferences'));
 router.use('/menus',           require('./menus'));
 router.use('/products',        require('./products'));
 router.use('/users',           require('./users'));
