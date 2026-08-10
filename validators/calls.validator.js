@@ -130,4 +130,24 @@ const callListQuery = Joi.object({
   limit:    Joi.number().integer().min(1).max(200).default(20),
 });
 
-module.exports = { clickToCallBody, callListQuery };
+/*
+ * POST /api/admin/calls/:jobCallerInfoId/web-failed — the operator's BROWSER
+ * leg never came up (SIP 486, a signalling refusal, an SDK error).
+ *
+ * `reason` is the browser's own diagnostic, and it is the whole payload: the
+ * call is identified by the path id, and every other fact about it is already
+ * on the row. Bounded at 120 chars because it lands in a hangup_cause column
+ * beside provider causes of the same shape — a stack trace pasted into an
+ * audit column is not a reason, and an unbounded free-text field on a route
+ * anyone with calling access can POST to is an invitation.
+ *
+ * REQUIRED on purpose. A failure report with no reason would record only that
+ * something went wrong, which is what we already had: the reason for this route
+ * existing is that the diagnostic used to live in the operator's browser
+ * console and nowhere a server could ever see it.
+ */
+const webCallFailedBody = Joi.object({
+  reason: Joi.string().trim().max(120).required(),
+});
+
+module.exports = { clickToCallBody, callListQuery, webCallFailedBody };

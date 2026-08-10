@@ -45,6 +45,21 @@ const { jobStatusLabel } = require('../../utils/job-status-label');
  * Legacy contract preserved: fromDate / toDate / optional callTo
  * filter. callTo now matches against efr_no (technician mobile) OR
  * tbl_customer.customer_mob_no.
+ *
+ * ── CONFERENCE CALLS: THIS FEED IS UNAFFECTED (verified 2026-08-04) ────────
+ *
+ * The 2026-08-04 ops conference feature made tbl_job_caller_info 1:N against
+ * tbl_plivo_call_log, which fanned out every surface built on that join. This
+ * one is not: it reads tbl_easyfixer_call_record and touches NEITHER of those
+ * tables. It is the legacy TECHNICIAN-side call record, not the CRM outbound
+ * audit — a CRM click-to-call has never appeared here, and a conference does
+ * not either. The XLSX below is the same query and behaves identically.
+ *
+ * ⚠ AMBIGUITY WORTH KNOWING: the CRM's "Call Info" button opens a modal with
+ * TWO tabs. This endpoint feeds one of them; the other (ClickToCallTab) reads
+ * GET /api/admin/calls, which DID need the fix — see the CONFERENCE LEGS block
+ * in routes/admin/calls.js. "The Call Info modal is broken/fine" is therefore
+ * only ever half a statement; say which tab.
  */
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;

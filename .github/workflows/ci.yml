@@ -30,5 +30,7 @@ jobs:
       - run: npm ci
       - name: Build check (syntax-check all files)
         run: npm run build
+      - name: Lint (no-undef — the copy-paste-across-handlers guard)
+        run: npm run lint
       - name: Unit tests (characterization — no DB)
         run: npm test

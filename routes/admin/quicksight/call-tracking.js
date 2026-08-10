@@ -16,7 +16,17 @@
  *
  *   POST /api/admin/quicksight/call-tracking/calls
  *     body: the SAME filters + { jobId? | selectedCallerId? | day? }
- *     → { items: [per call], capped }
+ *     → { items: [per call, each with legs[]], capped }
+ *
+ * CONFERENCE CALLS: a conference is ONE call that gained people, so it is ONE
+ * row everywhere a count is shown — totals, byJob, byUser, byUserCombined,
+ * byDay and the XLSX are all unchanged, because buildScope reads
+ * tbl_job_caller_info, which still has exactly one row per call. The extra
+ * PARTIES are returned as a nested `legs[]` on each drill-down item (role +
+ * name, never a number), never as extra rows: the drill-down reconciling with
+ * the count it was opened from is a hard invariant of the service. See the
+ * service header for the one accepted gap — `partyRole` still describes the
+ * originally-dialled counterparty, not everyone who ended up on the call.
  *
  * The date window is NOT optional in effect: tbl_job_caller_info carries ~940k
  * rows, so the service defaults both edges to IST today rather than ever running

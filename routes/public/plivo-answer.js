@@ -4,6 +4,7 @@ const logger = require('../../logger');
 const { pool } = require('../../db');
 const plivo = require('../../services/plivo.service');
 const plivoLog = require('../../services/plivo-call-log.service');
+const conference = require('../../services/plivo-conference.service');
 const aiCall = require('../../services/plivo-ai-call.service');
 const aiSession = require('../../services/ai-call-session.service');
 const teleprompter = require('../../services/teleprompter.service');
@@ -61,6 +62,65 @@ router.get('/answer', async (req, res) => {
   logger.info('Plivo answer · jci=' + claims.jci + ' · CallUUID=' + (req.query.CallUUID || 'none') + ' · record=' + record);
   await plivoLog.markAnswered(claims.jci, req.query.CallUUID || null, record);
 
+  /*
+   * CONFERENCE MODE (2026-08-04). When the call token carries a conference the
+   * operator's leg JOINS that Multi-Party Call instead of bridging straight to
+   * the customer with <Dial>.
+   *
+   * THIS IS THE ONE LINE THAT MAKES CONFERENCES POSSIBLE AT ALL. Plivo has no
+   * API to promote a live <Dial> into a conference — they are different objects.
+   * So the decision has to be made HERE, at answer time, before any audio is
+   * bridged. Once this returns <Dial>, that call can never gain a third party
+   * without being hung up and redialled.
+   *
+   * The customer is NOT dialled by this XML; they are added as a participant by
+   * the caller that placed this leg. That is what leaves the room open for ops
+   * to add a technician later without touching the live audio.
+   *
+   * Falls through to the classic bridge whenever the token carries no
+   * conference, so every non-conference caller behaves exactly as before.
+   */
+  if (claims.conf) {
+    logger.info('Plivo answer: joining conference · jci=' + claims.jci + ' · conf=' + claims.conf);
+    xml(conference.operatorAnswerXml(claims.conf, { confId: claims.confId || null }));
+
+    /*
+     * NOW dial the receiver into the room — AFTER the XML has gone back, never
+     * before.
+     *
+     * This callback firing IS "the operator answered", which makes it the exact
+     * right trigger and preserves today's behaviour: the receiver's phone only
+     * rings once a human is actually on the line. Adding them when the call was
+     * PLACED would ring the customer even when the operator never picks up — a
+     * regression on the classic bridge, which dials the second leg only from
+     * this same moment.
+     *
+     * Deliberately not awaited before responding: Plivo is holding an HTTP
+     * request open waiting for call-control XML, and a slow participant-add
+     * would delay the operator's own audio. Fail-soft — if the add fails the
+     * operator is alone in a room with hold music, which the logs will say
+     * plainly, rather than the call dying.
+     */
+    conference.addParticipant({
+      conferenceId: claims.confId,
+      toNumber: claims.dest,
+      targetKind: claims.destKind || 'customer',
+      displayName: claims.destName || null,
+      jobCallerInfoId: claims.jci,
+    }, pool).then((r) => {
+      if (r && r.ok) {
+        logger.info('Conference: receiver dialled in · conf=' + claims.conf + ' · participantId=' + r.participantId);
+      } else {
+        logger.warn('Conference: receiver NOT added · conf=' + claims.conf
+          + ' · ' + ((r && r.code) || 'unknown') + ' · ' + ((r && r.message) || '')
+          + ' — the operator is in the room ALONE');
+      }
+    }).catch((e) => {
+      logger.error({ err: e && e.message, conf: claims.conf }, 'Conference: participant add threw');
+    });
+    return;
+  }
+
   logger.info('Plivo answer: bridging to customer · jci=' + claims.jci);
   // recordingCallbackUrl: Plivo pushes us the recording URL/id when ready, so
   // playback doesn't depend on guessing the recording's call_uuid.
@@ -114,6 +174,47 @@ async function webAnswer(req, res) {
   await plivoLog.markRinging(resolved.jci, src.CallUUID || null);
   await plivoLog.setRecordingRequested(resolved.jci, record);
   const recCbUrl = record ? plivo.recordingCallbackUrl(resolved.jci) : null;
+
+  /*
+   * CONFERENCE MODE — WEB EDITION. The exact twin of the branch in /answer.
+   *
+   * There are TWO answer routes, one per call mode (voice.call.mode =
+   * 'mobile' | 'web'), and each is an INDEPENDENT decision point: whatever XML
+   * it returns is what that call becomes for its whole life, because Plivo
+   * cannot promote a live <Dial> into a conference. Wiring only one of them
+   * would mean conferencing quietly worked or quietly did not depending on a
+   * property nobody would think to associate with it.
+   *
+   * The conference rides the SERVER-SIDE dial stash, not the dialId — the
+   * dialId crosses to the browser and is deliberately opaque.
+   */
+  if (resolved.conferenceName) {
+    logger.info('Plivo web-answer: joining conference · jci=' + resolved.jci + ' · conf=' + resolved.conferenceName);
+    xml(conference.operatorAnswerXml(resolved.conferenceName, { confId: resolved.conferenceId || null }));
+    /*
+     * Dial the receiver in only NOW — the operator's browser leg is connected.
+     * Same reasoning as the mobile branch: adding them when the call was PLACED
+     * would ring the receiver for a call the operator never joined.
+     */
+    conference.addParticipant({
+      conferenceId: resolved.conferenceId,
+      toNumber: resolved.number,
+      targetKind: resolved.receiverKind || 'customer',
+      displayName: resolved.receiverName || null,
+      jobCallerInfoId: resolved.jci,
+    }, pool).then((r) => {
+      if (r && r.ok) {
+        logger.info('Conference: receiver dialled in (web) · conf=' + resolved.conferenceName + ' · participantId=' + r.participantId);
+      } else {
+        logger.warn('Conference: receiver NOT added (web) · conf=' + resolved.conferenceName
+          + ' · ' + ((r && r.code) || 'unknown') + ' · ' + ((r && r.message) || '')
+          + ' — the operator is in the room ALONE');
+      }
+    }).catch((e) => {
+      logger.error({ err: e && e.message, conf: resolved.conferenceName }, 'Conference: participant add threw (web)');
+    });
+    return;
+  }
 
   // AI Teleprompter (additive, flag-gated): if this web call is a guided
   // teleprompter session AND the feature is on AND a wss base is configured, fork
