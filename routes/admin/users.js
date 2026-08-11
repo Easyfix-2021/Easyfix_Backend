@@ -175,6 +175,77 @@ router.get('/check-email', validate(checkEmailQuery, 'query'), async (req, res, 
 });
 
 /*
+ * ─── Microsoft 365 availability PRE-FLIGHT ──────────────────────────
+ *
+ * POST /api/admin/users/check-official-email
+ *   { email } → { available: true,  email, taken: false }
+ *             → { available: false, email, taken, suggested, reason }
+ *
+ * `taken` IS NOT `!available`, and that is the whole reason it is published.
+ * available:false covers two facts an operator has to be told apart: "Microsoft
+ * 365 already has this address" (taken:true — pick the suggestion) and "the
+ * directory could not tell us" (taken:false — a 403 before consent, a 429, a
+ * timeout, or a domain we do not own; nothing is wrong with the address). They
+ * need different words in front of a person, and the FE cannot derive one from
+ * the other. Do not collapse them back into one flag.
+ *
+ * WHY BEFORE THE CREATE, NOT DURING IT. Add User writes the tbl_user row and
+ * only then provisions, so discovering the collision mid-create would leave an
+ * orphan CRM row whose official_email can never get a mailbox. The operator has
+ * to be able to accept the suggested numbered address BEFORE anything is
+ * written — "first check … then proceed … then save in DB accordingly".
+ *
+ * ⚠ THIS IS NOT THE GUARD. A pre-flight the client is free to skip guards
+ * nothing; it is a courtesy that makes the good path pleasant. The actual guard
+ * is in decideAccountAction(), which refuses to reuse a directory object that is
+ * not recorded against this user_id no matter what the client did or did not
+ * ask first.
+ *
+ * SEPARATE FROM GET /check-email above, which asks a different question of a
+ * different system: that one is "is this address on another tbl_user row",
+ * this one is "does Microsoft 365 already have a mailbox here". Both can be
+ * true independently — a CRM row can exist with no mailbox (the whole reason
+ * tbl_user_entra_provisioning exists) and a mailbox can exist with no CRM row.
+ *
+ * Same authority as POST / (create user): only the canonical Admin role, which
+ * is who can act on the answer. Read-only — it performs no directory write.
+ */
+const checkOfficialEmailBody = Joi.object({
+  email: Joi.string().trim().lowercase().email().max(255).required(),
+});
+router.post('/check-official-email',
+  roleByName(['Admin']),
+  validate(checkOfficialEmailBody),
+  async (req, res, next) => {
+    logger.info('Check official email availability · domainOnly=' + String(req.body.email).split('@')[1]);
+    try {
+      const check = await entraProvisioning.isUpnAvailable(req.body.email);
+      // `taken: false` on the free path too, so the shape is the same on both
+      // branches and a client never has to treat the key as maybe-absent.
+      if (check.available) return modernOk(res, { available: true, email: check.email, taken: false });
+
+      /*
+       * A numbered variant is only meaningful when the address is DEFINITIVELY
+       * taken. When the check came back unavailable because the directory could
+       * not answer (403 before consent, 429, a timeout) or because the domain is
+       * not one we own, suggesting mohit.kumar2@ would be inventing an answer on
+       * top of a non-answer — `suggested` stays null and the reason says why.
+       */
+      let suggested = null;
+      let reason = check.reason;
+      if (check.taken) {
+        const s = await entraProvisioning.suggestAvailableUpn(check.email);
+        suggested = s.suggested;
+        if (!suggested && s.reason) reason = check.reason + ' — ' + s.reason;
+      }
+      logger.info('Official email NOT available · taken=' + (check.taken ? 'yes' : 'no')
+        + ' · suggested=' + (suggested ? 'yes' : 'no'));
+      modernOk(res, { available: false, email: check.email, taken: !!check.taken, suggested, reason });
+    } catch (e) { next(e); }
+  }
+);
+
+/*
  * Is the CALLER the canonical Admin role (as opposed to any other member of the
  * `admin` GROUP)? `req.userRole` is resolved once by the group guard mounted in
  * routes/admin/index.js, so this costs nothing extra.
@@ -543,39 +614,92 @@ router.post('/:userId/provision-mailbox',
        * Same containment as the create path: a local for the life of the
        * request, handed straight to the mail sender, nulled after. Never logged,
        * never bound into SQL, never on the response — `mail` below carries only
-       * { status, reason, to?, cc? }.
+       * { status, reason, to?, cc? }. It is now held for as long as the licence
+       * read-back waits (up to licenceVerifyBudgetMs(), ~90s) rather than ~4s, which
+       * changes the DURATION and nothing else: still one local, still nulled in
+       * the `finally` on every path including the throwing one.
+       *
+       * ── WHY THIS PATH IS RACED, NOT JUST AWAITED ──────────────────────────
+       * The licence read-back now backs off exponentially for ~90s so an
+       * eventually-consistent Graph write is actually observed (the user-8805
+       * incident: we gave up 1.2s in). Awaiting that inline would turn an admin
+       * click into a 90-second request and die at the proxy — the same 504 the
+       * create path's deadline exists to avoid.
+       *
+       * The alternative was to give the REPAIR path its own short budget, and
+       * that is the wrong trade: this endpoint is the rescue, and its create
+       * branch is the ONLY one that mints a credential for a user whose first
+       * run failed. Cutting its patience short would recreate the exact
+       * stranding it exists to fix. So it gets the same treatment the create
+       * path already has — respond at the deadline, keep provisioning (and the
+       * chained mail, with the password still in this closure) running.
        */
       let tempPassword = null;
-      const outcome = await entraProvisioning.provisionUserMailbox({
+      const running = entraProvisioning.provisionUserMailbox({
         userId,
         userName: user.user_name,
         officialEmail: user.official_email,
         trigger: 'admin-retry',
         actorId: req.user?.user_id,
         onTempPassword: (pw) => { tempPassword = pw; },
+      }).then(async (outcome) => {
+        /*
+         * Fail-soft, and gated on mailboxReady inside the service — an account
+         * with no licence has no mailbox, so no credential mail goes out for it.
+         * An already-existing account mints nothing, so GATE 3 reports 'skipped'
+         * and tells the operator to reset from the M365 admin centre.
+         */
+        let mail;
+        try {
+          mail = await welcomeMail.sendWelcomeMail({
+            userId,
+            userName: user.user_name,
+            officialEmail: user.official_email,
+            personalEmail: user.personal_email,
+            tempPassword,
+            provisioning: outcome,
+          });
+        } catch (e) {
+          mail = { status: welcomeMail.MAIL_STATUS.FAILED, reason: e.message };
+        } finally {
+          tempPassword = null; // done with it — do not retain past the send
+        }
+        return { outcome, mail };
+      }).catch((e) => {
+        /*
+         * `.catch` on the promise itself, not only the route's try/catch: past
+         * the deadline this promise is unawaited, and an unhandled rejection
+         * takes the process down on Node 18+.
+         */
+        tempPassword = null;
+        logger.warn('Mailbox provisioning threw on the repair path · userId=' + userId + ' · ' + e.message);
+        return {
+          outcome: { attempted: true, accountStatus: 'failed', licenceStatus: 'not_attempted', mailboxReady: false, reason: e.message },
+          mail: { status: welcomeMail.MAIL_STATUS.SKIPPED, reason: 'mailbox provisioning failed, so no credentials were issued' },
+        };
       });
 
-      /*
-       * Fail-soft, and gated on mailboxReady inside the service — an account
-       * with no licence has no mailbox, so no credential mail goes out for it.
-       * An already-existing account mints nothing, so GATE 3 reports 'skipped'
-       * and tells the operator to reset from the M365 admin centre.
-       */
-      let mail;
-      try {
-        mail = await welcomeMail.sendWelcomeMail({
-          userId,
-          userName: user.user_name,
-          officialEmail: user.official_email,
-          personalEmail: user.personal_email,
-          tempPassword,
-          provisioning: outcome,
-        });
-      } catch (e) {
-        mail = { status: welcomeMail.MAIL_STATUS.FAILED, reason: e.message };
-      } finally {
-        tempPassword = null; // done with it — do not retain past the send
+      const settled = await userService.withProvisionInlineDeadline(running);
+      if (settled.timedOut) {
+        const pending = 'Still provisioning after ' + userService.PROVISION_INLINE_DEADLINE_MS
+          + 'ms — it is STILL RUNNING, not abandoned. If it completes, the sign-in details are emailed '
+          + 'automatically; read the outcome from GET /api/admin/users/' + userId + '/provisioning';
+        logger.warn('Provision mailbox exceeded the inline deadline — continuing in the background · userId='
+          + userId + ' · deadlineMs=' + userService.PROVISION_INLINE_DEADLINE_MS);
+        return modernOk(res, {
+          user_id: userId,
+          official_email: user.official_email,
+          provisioning: {
+            attempted: true, pending: true, accountStatus: 'pending',
+            licenceStatus: 'pending', mailboxReady: false, reason: pending,
+          },
+          welcome_mail: {
+            status: welcomeMail.MAIL_STATUS.PENDING,
+            reason: 'waiting on mailbox provisioning — the sign-in details are mailed automatically if it completes',
+          },
+        }, pending);
       }
+      const { outcome, mail } = settled.value;
 
       // 200 either way — the caller asked us to TRY, and the outcome (including
       // "the licence step failed, here is exactly why") is the payload. A 5xx
@@ -600,6 +724,129 @@ router.post('/:userId/provision-mailbox',
         provisioning: outcome,
         welcome_mail: mail,
       }, msg);
+    } catch (e) { next(e); }
+  }
+);
+
+/*
+ * ── POST /api/admin/users/:userId/reset-mailbox-password ─────────────
+ *
+ * THE STRANDED-USER RESCUE. The welcome mail needs a mailbox AND a password in
+ * the same run, and a user whose first attempt failed after account creation can
+ * never have both: run 1 minted the password but had no mailbox yet, and every
+ * later run takes the REUSE branch, which mints nothing. mohit.kumar@easyfix.in
+ * is the case — account created, licence unconfirmed, retried 36 minutes later
+ * and completed cleanly, and not one credential mail was ever sent. No number of
+ * Provision Mailbox clicks can fix that, because the missing thing is a
+ * credential, not a mailbox.
+ *
+ * ⚠ A SEPARATE, EXPLICITLY NAMED ACTION — never folded into Provision Mailbox.
+ * This resets a live account's password. Doing it silently as part of a retry
+ * would lock out anyone already signed in to Outlook or Teams, so it has to be a
+ * deliberate click on a control that says what it does.
+ *
+ * Same authority as every other mutating route here (roleByName(['Admin']) on
+ * top of the mount's requireAuth + role(['admin'])). Logged with the actor id
+ * on entry and on completion: resetting somebody's password is an audited act.
+ *
+ * The password lives ONLY in a local for the life of the send, exactly as the
+ * create and repair paths do. It is never logged, never bound into SQL and
+ * never on the response — `welcomeMail` carries { status, reason } only.
+ */
+router.post('/:userId/reset-mailbox-password',
+  roleByName(['Admin']),
+  validate(idParam, 'params'),
+  async (req, res, next) => {
+    const userId = Number(req.params.userId);
+    const actorId = req.user?.user_id;
+    logger.info('Mailbox password reset requested · userId=' + userId + ' · actorId=' + (actorId || ''));
+    try {
+      const user = await userService.getUserById(userId);
+      if (!user) return modernError(res, 404, 'User not found');
+
+      // The master switch. Off means we do not touch the directory at all —
+      // same fail-closed rule the provisioning service applies.
+      if (!entraProvisioning.provisioningEnabled()) {
+        return modernError(res, 400, 'Microsoft 365 provisioning is turned off on this environment, so no mailbox password can be reset.');
+      }
+
+      /*
+       * The DB-only refusals come first, so the common "there is nothing to
+       * reset" cases cost no Graph round-trip.
+       */
+      const state = await entraProvisioning.getProvisioning(userId);
+      if (!state || !state.entra_object_id) {
+        return modernError(res, 400, 'No Microsoft 365 account is recorded for this user — run Provision Mailbox first, which creates the account and emails the sign-in details itself.');
+      }
+      if (!state.mailbox_ready) {
+        return modernError(res, 400, 'The mailbox is not ready (account=' + state.account_status
+          + ' / licence=' + state.licence_status + ') — a password is no use without a mailbox to sign in to. Run Provision Mailbox first.');
+      }
+
+      /*
+       * OWNERSHIP. Resetting a password is only safe against the object we know
+       * belongs to THIS user: if the address now resolves to a different object
+       * (or the directory cannot say), a reset would change a stranger's
+       * password. Same rule decideAccountAction applies before a create, applied
+       * again here because this is the one endpoint that writes a credential to
+       * an account it did not create.
+       */
+      const lookup = await entraProvisioning.findByUpn(user.official_email);
+      if (!lookup.found) {
+        return modernError(res, 409, 'Could not confirm ' + user.official_email + ' in the directory — '
+          + (lookup.reason || 'the lookup was inconclusive') + '. Refusing to reset a password we cannot attribute.');
+      }
+      if (String(lookup.user.id).toLowerCase() !== String(state.entra_object_id).toLowerCase()) {
+        return modernError(res, 409, user.official_email + ' belongs to a different Microsoft 365 account than the one recorded for this user — resetting it would change somebody else\'s password.');
+      }
+
+      let tempPassword = null;
+      let mail;
+      try {
+        const reset = await entraProvisioning.resetEntraPassword(
+          state.entra_object_id, (pw) => { tempPassword = pw; },
+        );
+        if (!reset.ok) {
+          logger.error('Mailbox password reset FAILED · userId=' + userId + ' · actorId=' + (actorId || '') + ' · ' + reset.reason);
+          return modernError(res, 502, 'Microsoft 365 refused the password reset — ' + reset.reason);
+        }
+        /*
+         * The EXISTING sender, deliberately — all three gates and the HR CC
+         * still apply, and there is exactly one copy of the mail wording and of
+         * the "never send a credential mail without a credential" rule. The
+         * provisioning outcome is synthesised from the RECORDED row (which we
+         * just verified is ready), so GATE 1 sees the same facts it would on a
+         * live run.
+         */
+        mail = await welcomeMail.sendWelcomeMail({
+          userId,
+          userName: user.user_name,
+          officialEmail: user.official_email,
+          personalEmail: user.personal_email,
+          tempPassword,
+          provisioning: {
+            mailboxReady: true,
+            accountStatus: state.account_status,
+            licenceStatus: state.licence_status,
+          },
+        });
+      } catch (e) {
+        mail = { status: welcomeMail.MAIL_STATUS.FAILED, reason: e.message };
+      } finally {
+        tempPassword = null; // done with it — do not retain past the send
+      }
+
+      const msg = mail.status === welcomeMail.MAIL_STATUS.SENT
+        ? 'Mailbox password reset — sign-in details emailed to ' + mail.to
+          + (mail.cc && mail.cc.length ? ' (cc ' + mail.cc.join(', ') + ')' : '')
+        : 'Mailbox password reset, but the sign-in details were NOT emailed: ' + mail.reason;
+      logger.info('Mailbox password reset done · userId=' + userId + ' · actorId=' + (actorId || '')
+        + ' · welcomeMail=' + mail.status);
+
+      // The password was just changed either way, so the caller must be told
+      // even when the mail failed — otherwise the user is locked out with a
+      // credential nobody holds.
+      modernOk(res, { ok: true, welcomeMail: { status: mail.status, reason: mail.reason } }, msg);
     } catch (e) { next(e); }
   }
 );

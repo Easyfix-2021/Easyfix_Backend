@@ -58,11 +58,30 @@ const userService = require('../services/user.service');
 const ENV_KEYS = [
   'MS_GRAPH_TENANT_ID', 'MS_GRAPH_CLIENT_ID', 'MS_GRAPH_CLIENT_SECRET', 'MS_GRAPH_SENDER_EMAIL',
   'NOTIFICATIONS_DISABLE', 'TEST_EMAILS', 'CRM_PUBLIC_BASE_URL', 'CRM_URL', 'MAGIC_LINK_BASE_URL',
+  // Restored like the rest: node --test forks per file today, but a runner that
+  // ever shares a process would otherwise hand the next file a 1s licence budget
+  // and a mysteriously "flaky" provisioning test.
+  'ENTRA_LICENCE_VERIFY_BUDGET_MS',
 ];
 const savedEnv = {};
 
 before(async () => {
   for (const k of ENV_KEYS) savedEnv[k] = process.env[k];
+  /*
+   * CLAMP THE LICENCE-VERIFY BUDGET, and this is correctness rather than speed.
+   *
+   * assignLicense now waits out Graph's eventual consistency with a backoff
+   * under a 90-second budget — deliberately longer than the 20s inline deadline,
+   * so a slow seat still gets its welcome mail from the background chain. That
+   * makes the seat-never-visible test here do two things it must not: stall the
+   * file for the full 20s deadline, and — worse — keep polling in the background
+   * AFTER `after()` restores the real globalThis.fetch, so a unit test would
+   * reach the real network.
+   *
+   * The budget is read lazily on purpose (see licenceVerifyBudgetMs), so setting
+   * it here takes effect even though the service was required above.
+   */
+  process.env.ENTRA_LICENCE_VERIFY_BUDGET_MS = '1000';
   props = {
     'entra.provisioning.enabled': 'true',
     'entra.managed.domains': 'easyfix.in',
