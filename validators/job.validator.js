@@ -244,6 +244,18 @@ const createBody = Joi.object({
   original_appointment_time:      Joi.string().max(20).allow('', null).optional(),
   client_ref_id: Joi.string().max(100).optional(),
   job_reference_id: Joi.string().max(100).optional(),
+  // Multi-category fan-out family link — the job_id of the FIRST sibling
+  // created in this booking. When present, create() records a
+  // linked_job(parent_job_id=primary, child_job_id=new) row and inherits the
+  // parent's custom_property if this sibling didn't send one. Absent on the
+  // parent's own create.
+  primary_job_id: intId.optional(),
+  // Flattened legacy custom-property string ("Label:Value|…", tbl_job
+  // .custom_property varchar(510)). CRM bookings usually leave it null (props
+  // land in dedicated columns like branch_details); accepted for forwards-compat
+  // and so a sibling can carry an inherited value. Coerced to real NULL for
+  // empty/'null' by the service layer.
+  custom_property: Joi.string().max(510).allow('', null).optional(),
   // Top-level per-job override of the customer's master name. See
   // services/job.service.js (`job_customer_name` MUTABLE_COLUMNS
   // comment) for why this is distinct from `customer.customer_name`.

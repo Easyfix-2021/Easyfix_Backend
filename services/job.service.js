@@ -780,6 +780,48 @@ async function stampJobPrimarySpoc(jobId, ownerUserId, conn) {
 }
 
 /*
+ * `linked_job` is a LEGACY table (columns: parent_job_id, child_job_id) written
+ * by the old Java CRM to relate multi-category sibling jobs. The new stack links
+ * siblings by shared client_ref_id + job_reference_id, but we also mirror the
+ * legacy row so any tooling/report that reads `linked_job` keeps working. The
+ * table is absent on some deploys (e.g. QA), so probe once + no-op where missing.
+ */
+let _hasLinkedJobTable = null;
+async function hasLinkedJobTable() {
+  if (_hasLinkedJobTable !== null) return _hasLinkedJobTable;
+  try {
+    const [rows] = await pool.query("SHOW TABLES LIKE 'linked_job'");
+    _hasLinkedJobTable = rows.length > 0;
+  } catch (_e) { _hasLinkedJobTable = false; }
+  return _hasLinkedJobTable;
+}
+/*
+ * Record a parent→child family link in `linked_job`. Best-effort + idempotent:
+ * no-ops where the table is absent, skips a duplicate (parent,child) pair on a
+ * retry, and NEVER throws — a linking failure must not affect the already-
+ * committed job. Mirrors legacy JobDaoImpl's
+ * `INSERT INTO linked_job(parent_job_id, child_job_id)`.
+ */
+async function linkJobToParent(parentJobId, childJobId) {
+  try {
+    if (!parentJobId || !childJobId || parentJobId === childJobId) return;
+    if (!(await hasLinkedJobTable())) return;
+    const [[existing]] = await pool.query(
+      'SELECT 1 AS ok FROM linked_job WHERE parent_job_id = ? AND child_job_id = ? LIMIT 1',
+      [parentJobId, childJobId],
+    );
+    if (existing) return;
+    await pool.query(
+      'INSERT INTO linked_job (parent_job_id, child_job_id) VALUES (?, ?)',
+      [parentJobId, childJobId],
+    );
+    logger.info('Linked sibling job · parent=' + parentJobId + ' child=' + childJobId);
+  } catch (e) {
+    logger.warn('linked_job insert skipped for child ' + childJobId + ': ' + e.message);
+  }
+}
+
+/*
  * Probe ONCE per process for the presence of `tbl_job_customer_request`.
  * That table only exists on deploys where migration
  * `2026-06-02-job-customer-requests.sql` has run. The LIST projection
@@ -2813,6 +2855,32 @@ async function create(input, actor) {
     // is present in custom_property, hoist its value into branch_details and
     // strip it from the string so reports/views reading tbl_job.branch_details
     // stay consistent regardless of where the job was booked.
+    //
+    // Multi-category sibling inheritance (2026-08-11): when this create is a
+    // sibling in a booking family (the FE fan-out passes the FIRST sibling's id
+    // as primary_job_id), inherit the parent's flattened custom_property when
+    // the caller didn't send one. CRM bookings usually leave custom_property
+    // null (props live in dedicated columns), so this is a no-op there; it
+    // matters for families whose parent DID carry a value. Runs BEFORE the
+    // branch-hoist so an inherited branch token is normalised too. Owner + SPOC
+    // already flow via job_owner. Read via pool — the parent committed in an
+    // earlier request.
+    const primaryJobId = Number(input.primary_job_id) > 0 ? Number(input.primary_job_id) : null;
+    if (primaryJobId
+        && (input.custom_property == null
+            || String(input.custom_property).trim() === ''
+            || input.custom_property === 'null')) {
+      try {
+        const [[parentRow]] = await pool.query(
+          'SELECT custom_property FROM tbl_job WHERE job_id = ? LIMIT 1', [primaryJobId],
+        );
+        const parentCp = parentRow && parentRow.custom_property;
+        if (parentCp != null && String(parentCp).trim() !== '' && parentCp !== 'null') {
+          input.custom_property = parentCp;
+        }
+      } catch (_e) { /* best-effort — leave custom_property as-is */ }
+    }
+
     if ((input.branch_details == null || String(input.branch_details).trim() === '') && input.custom_property) {
       const isBranchKey = (s) => {
         const k = String(s || '').toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
@@ -3106,6 +3174,13 @@ async function create(input, actor) {
       // Best-effort, post-commit: add this job's pincode to the pincode catalog
       // (geocoded) if it's new. Idempotent + never throws — see ensureJobPincode.
       ensureJobPincode(input.address?.pin_code, actor);
+      // Best-effort, post-commit: record the multi-category family link
+      // (parent→child) in the legacy `linked_job` table so tooling that reads it
+      // sees the sibling relationship. Guarded (table may be absent on QA) +
+      // never throws — see linkJobToParent.
+      if (Number(input.primary_job_id) > 0 && Number(input.primary_job_id) !== jobId) {
+        linkJobToParent(Number(input.primary_job_id), jobId);
+      }
     });
     // NOTE: enquiry WhatsApp is intentionally NOT fired here for a direct
     // book-as-ENQUIRY (initial_status=7). create() never stamps
