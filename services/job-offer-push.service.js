@@ -35,6 +35,48 @@ const alertFlags = require('./job-offer-alert-flags');
  * assignment that triggered it.
  */
 
+const DELIVERY_CONCURRENCY = 10;
+
+/*
+ * Build the one canonical job-offer message. Single-recipient, batch, and
+ * reminder sends all call this function so routing keys, copy, and loud-alert
+ * flags cannot drift between delivery paths.
+ */
+function buildJobOfferMessage(jobId, reminder = false) {
+  // Read each flag ONCE per push so the sound styling and the data keys can
+  // never disagree with each other within a single send. The banner reads the
+  // MASTER — it has no sub-flag of its own.
+  const loud = alertFlags.loudSoundEnabled();
+  const banner = alertFlags.loudAlertMasterEnabled();
+
+  // Both alert keys are OPT-IN — present only while their flag is on. The app
+  // reads a missing key as off, so with the master off the payload is exactly
+  // the four legacy keys the pre-2026-07-29 backend sent.
+  const data = {
+    type: 'job_offer',
+    job_id: String(jobId),
+    key: String(jobId),
+    screen: 'NewTicket',
+    ...(loud ? { loudAlert: '1' } : {}),
+    ...(banner ? { loudBanner: '1' } : {}),
+  };
+
+  // Alert styling is attached ONLY when loud is on. Omitting these keys is
+  // what makes fcm.service emit today's exact payload — see buildMessage().
+  const body = reminder
+    ? 'Job offer still waiting — tap to accept'
+    : 'New job offer — tap to accept';
+  const message = { title: 'EasyFix', body, data };
+  if (loud) {
+    message.androidChannelId  = alertFlags.ANDROID_CHANNEL_ID;
+    message.sound             = alertFlags.ALERT_SOUND;
+    message.iosSound          = alertFlags.IOS_ALERT_SOUND;
+    message.interruptionLevel = alertFlags.INTERRUPTION_LEVEL;
+  }
+
+  return { message, channel: reminder ? 'job-offer-reminder' : 'job-offer' };
+}
+
 /*
  * Notify a technician that a job has been OFFERED to them. Fully fire-and-forget:
  * wraps everything in try/catch, never throws, and is safe to call without
@@ -49,38 +91,7 @@ async function sendJobOfferPush(efrId, { jobId, reminder = false } = {}) {
     logger.info('Sending job-offer push · efrId=' + efrId + ' · jobId=' + jobId + (reminder ? ' · reminder' : ''));
     if (!efrId) return { delivered: false, reason: 'no efrId' };
 
-    // Read each flag ONCE per push so the sound styling and the data keys can
-    // never disagree with each other within a single send. The banner reads the
-    // MASTER — it has no sub-flag of its own.
-    const loud = alertFlags.loudSoundEnabled();
-    const banner = alertFlags.loudAlertMasterEnabled();
-
-    // Both alert keys are OPT-IN — present only while their flag is on. The app
-    // reads a missing key as off, so with the master off the payload is exactly
-    // the four legacy keys the pre-2026-07-29 backend sent.
-    const data = {
-      type: 'job_offer',
-      job_id: String(jobId),
-      key: String(jobId),
-      screen: 'NewTicket',
-      ...(loud ? { loudAlert: '1' } : {}),
-      ...(banner ? { loudBanner: '1' } : {}),
-    };
-
-    // Alert styling is attached ONLY when loud is on. Omitting these keys is
-    // what makes fcm.service emit today's exact payload — see buildMessage().
-    const body = reminder
-      ? 'Job offer still waiting — tap to accept'
-      : 'New job offer — tap to accept';
-    const message = { title: 'EasyFix', body, data };
-    if (loud) {
-      message.androidChannelId  = alertFlags.ANDROID_CHANNEL_ID;
-      message.sound             = alertFlags.ALERT_SOUND;
-      message.iosSound          = alertFlags.IOS_ALERT_SOUND;
-      message.interruptionLevel = alertFlags.INTERRUPTION_LEVEL;
-    }
-
-    const channel = reminder ? 'job-offer-reminder' : 'job-offer';
+    const { message, channel } = buildJobOfferMessage(jobId, reminder);
     const r = await pushDelivery.deliverToEfr(
       efrId,
       message,
@@ -100,9 +111,58 @@ async function sendJobOfferPush(efrId, { jobId, reminder = false } = {}) {
   }
 }
 
+/*
+ * Notify every technician in one offer fan-out. Token resolution remains two
+ * SQL queries for 1–50 technicians, then FCM sends run in serial chunks of ten.
+ * Like the single sender this is best-effort and never rejects into assignment.
+ */
+async function sendJobOfferPushBatch(efrIds, { jobId, reminder = false } = {}) {
+  try {
+    const ids = pushDelivery.normalizeTargetEfrIds(efrIds);
+    logger.info(
+      `Sending job-offer push batch · recipients=${ids.length} · jobId=${jobId}`
+        + (reminder ? ' · reminder' : ''),
+    );
+    if (!ids.length) return { delivered: false, reason: 'no efrIds' };
+    if (ids.length > pushDelivery.MAX_TARGETED_EFR_IDS) {
+      logger.warn(
+        { recipientCount: ids.length, limit: pushDelivery.MAX_TARGETED_EFR_IDS, jobId },
+        'job-offer-push: recipient limit exceeded',
+      );
+      return { delivered: false, reason: 'recipient limit exceeded' };
+    }
+
+    const recipients = await pushDelivery.resolveTokensForEfrs(ids);
+    if (!recipients.length) {
+      logger.info({ jobId, recipientCount: ids.length }, 'job-offer-push: no device tokens — skipping batch');
+      return { delivered: false, reason: 'no tokens' };
+    }
+
+    const { message, channel } = buildJobOfferMessage(jobId, reminder);
+    const r = await pushDelivery.deliver(
+      recipients,
+      message,
+      {
+        concurrency: DELIVERY_CONCURRENCY,
+        channel,
+        label: `${channel} · recipients=${ids.length} · job=${jobId}`,
+      },
+    );
+    logger.info(
+      `Job-offer batch push delivered to ${r.deliveredCount}/${r.tokenCount} devices · jobId=${jobId}`,
+    );
+    return { delivered: r.delivered, deliveredCount: r.deliveredCount, tokenCount: r.tokenCount };
+  } catch (e) {
+    logger.warn({ jobId, err: e.message }, 'job-offer-push: batch send failed (swallowed)');
+    return { delivered: false, error: e.message };
+  }
+}
+
 module.exports = {
   sendJobOfferPush,
+  sendJobOfferPushBatch,
   // Back-compat shim: routes/admin/validate.js imports resolveTokens for its
   // debug test-push (raw-token path, no prune). Same signature + string[] return.
   resolveTokens: pushDelivery.resolveTokensForEfr,
+  _internals: { buildJobOfferMessage },
 };

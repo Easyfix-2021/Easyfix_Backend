@@ -2,6 +2,7 @@ const { pool } = require('../db');
 const deepSkillService = require('./deep-skill.service');
 const logger = require('../logger');
 const registrationStatusPush = require('./registration-status-push.service');
+const lifecycle = require('./easyfixer-lifecycle.service');
 
 /*
  * Easyfixer Verification — service backing the "Self-Registration
@@ -515,46 +516,68 @@ async function saveBanking(efrId, body, actor) {
 }
 
 // Identity verification (matches updateIdentityDetailsVerificationStatusById).
+async function applyIdentityMutation(db, efrId, body, actor) {
+  const status = Number(body.verification_status);
+  const sets = [];
+  const params = [];
+  if (body.adhaar_card_number !== undefined) {
+    sets.push('adhaar_card_number = ?');
+    params.push(body.adhaar_card_number);
+  }
+  if (body.pan_card_number !== undefined) {
+    sets.push('pan_card_number = ?');
+    params.push(body.pan_card_number);
+  }
+  if (status === 1) {
+    sets.push(
+      'is_identity_details_verified_by_crm = 1',
+      'send_back_to_tx_reason_crm = NULL',
+      'efr_identity_details_perc = COALESCE(?, efr_identity_details_perc)',
+      'send_to_finance_date_time = NOW()',
+    );
+    params.push(body.progress ?? null);
+  } else if (status === 2) {
+    sets.push(
+      'is_identity_details_verified_by_crm = 2',
+      'send_back_to_tx_reason_crm = ?',
+    );
+    params.push(body.rejected_reason);
+  }
+  if (!sets.length) return;
+  sets.push('updated_by = ?', 'update_date = NOW()');
+  params.push(actor?.user_id || null, Number(efrId));
+  await db.query(
+    `UPDATE tbl_easyfixer SET ${sets.join(', ')} WHERE efr_id = ?`,
+    params,
+  );
+}
+
 async function saveIdentity(efrId, body, actor) {
   logger.info('Save identity verification · efrId=' + efrId + ' · verification_status=' + body.verification_status);
-  // Allow updating Aadhaar/Pan numbers inline.
-  if (body.adhaar_card_number !== undefined || body.pan_card_number !== undefined) {
-    const sets = [];
-    const params = [];
-    if (body.adhaar_card_number !== undefined) { sets.push('adhaar_card_number = ?'); params.push(body.adhaar_card_number); }
-    if (body.pan_card_number    !== undefined) { sets.push('pan_card_number = ?');    params.push(body.pan_card_number); }
-    sets.push('updated_by = ?', 'update_date = NOW()');
-    params.push(actor?.user_id || null, efrId);
-    await pool.query(`UPDATE tbl_easyfixer SET ${sets.join(', ')} WHERE efr_id = ?`, params);
-  }
-
   const status = Number(body.verification_status);
-  if (status === 1) {
-    await pool.query(
-      `UPDATE tbl_easyfixer
-          SET is_identity_details_verified_by_crm = 1,
-              send_back_to_tx_reason_crm = NULL,
-              efr_identity_details_perc = COALESCE(?, efr_identity_details_perc),
-              updated_by = ?, update_date = NOW(),
-              send_to_finance_date_time = NOW()
-        WHERE efr_id = ?`,
-      [body.progress ?? null, actor?.user_id || null, efrId]
-    );
-  } else if (status === 2 && body.rejected_reason) {
-    await pool.query(
-      `UPDATE tbl_easyfixer
-          SET is_identity_details_verified_by_crm = 2,
-              send_back_to_tx_reason_crm = ?,
-              updated_by = ?, update_date = NOW()
-        WHERE efr_id = ?`,
-      [body.rejected_reason, actor?.user_id || null, efrId]
-    );
-  }
-  // Identity verify/reject flips is_identity_details_verified_by_crm, which
-  // changes the registration-status gate (→ rejected, or clears it). Push
-  // the technician's app to re-fetch. Best-effort — never blocks the save.
   if (status === 1 || status === 2) {
-    registrationStatusPush.notifyRegistrationStatusChanged(efrId).catch(() => {});
+    const installed = await lifecycle.hasLifecycleSchema();
+    if (installed) {
+      await lifecycle.syncFromVerificationFlagsAtomic(efrId, {
+        ...(status === 2
+          ? {
+            status: 'VERIFICATION_REJECTED',
+            reasonCode: 'IDENTITY_VERIFICATION_REJECTED',
+            reason: body.rejected_reason || 'Identity verification rejected',
+          }
+          : {
+            reasonCode: 'IDENTITY_VERIFICATION_APPROVED',
+            reason: 'Identity verification approved',
+          }),
+        projectedRow: { is_identity_details_verified_by_crm: status },
+        mutate: (conn) => applyIdentityMutation(conn, efrId, body, actor),
+      }, actor);
+    } else {
+      await applyIdentityMutation(pool, efrId, body, actor);
+      registrationStatusPush.notifyRegistrationStatusChanged(efrId).catch(() => {});
+    }
+  } else {
+    await applyIdentityMutation(pool, efrId, body, actor);
   }
   logger.info('Identity verification updated · efrId=' + efrId + ' · status=' + status);
   return getVerificationPage(efrId);
@@ -570,59 +593,91 @@ async function setLeadVerification(efrId, body, actor) {
   const v = Number(body.personal_details_filled);
   if (![0, 1, 2].includes(v)) { logger.warn('Lead verification rejected · invalid personal_details_filled=' + body.personal_details_filled + ' · efrId=' + efrId); const e = new Error('invalid personal_details_filled'); e.status = 400; throw e; }
 
-  // Resolve user_id via tbl_easyfixer.user_id (needed to update tbl_user row).
-  const [[row]] = await pool.query(`SELECT user_id FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1`, [efrId]);
-  if (!row) { logger.warn('Lead verification failed · easyfixer not found · efrId=' + efrId); const e = new Error('easyfixer not found'); e.status = 404; throw e; }
-  // Idle bucket is user_id IS NULL OR = 0 — with no linked user account there's
-  // no tbl_user row to flip, so the lead-status write would silently no-op.
-  if (!row.user_id) { logger.warn('Lead verification failed · no linked user account · efrId=' + efrId); const e = new Error('easyfixer has no linked user account — lead status cannot be set'); e.status = 422; throw e; }
-
   // Auto-append the comment line that mirrors legacy "Accepted / Denied / ..."
   const statusText = v === 1 ? 'Accepted' : v === 2 ? 'Denied' : 'Not Eligible To New Lead';
   const comment = `${statusText}${body.reason ? ' <br> ' + body.reason : ''}`;
 
-  // All three writes are atomic on one connection — a partial apply would leave
-  // tbl_easyfixer / tbl_user / the comment thread inconsistent.
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-
+  const applyLeadMutation = async (conn, row) => {
+    if (!row.user_id) {
+      const error = new Error('easyfixer has no linked user account — lead status cannot be set');
+      error.status = 422;
+      throw error;
+    }
     if (v === 1 && body.efr_cityId) {
-      await conn.query(`UPDATE tbl_easyfixer SET efr_cityId = ?, updated_by = ?, update_date = NOW() WHERE efr_id = ?`,
-        [body.efr_cityId, actor?.user_id || null, efrId]);
+      await conn.query(
+        `UPDATE tbl_easyfixer
+            SET efr_cityId = ?, updated_by = ?, update_date = NOW()
+          WHERE efr_id = ?`,
+        [body.efr_cityId, actor?.user_id || null, efrId],
+      );
     }
     await conn.query(
       `UPDATE tbl_user
           SET personal_details_filled = ?, updated_by = ?, user_status = 1,
               released_on_date_time = NOW(), update_date = NOW()
         WHERE user_id = ?`,
-      [v, actor?.user_id || null, row.user_id]
+      [v, actor?.user_id || null, row.user_id],
     );
+    // A transport retry sees the locked pre-mutation value already equal to v
+    // and therefore cannot append the same status comment twice.
+    if (Number(row.user_personal_details_filled) !== v) {
+      await conn.query(
+        `INSERT INTO easyfixer_comments
+           (comment, commented_by, comment_in_section, commented_on, commented_by_id, easyfixer_id)
+         VALUES (?, ?, ?, NOW(), ?, ?)`,
+        [
+          comment,
+          actor?.user_name || actor?.name || 'system',
+          SECTION.LEAD,
+          actor?.user_id || null,
+          efrId,
+        ],
+      );
+    }
+  };
 
-    // Inline the comment INSERT on conn (addComment uses pool + returns a
-    // list, so it can't enroll in this txn). Mirrors addComment's columns.
-    await conn.query(
-      `INSERT INTO easyfixer_comments
-         (comment, commented_by, comment_in_section, commented_on, commented_by_id, easyfixer_id)
-       VALUES (?, ?, ?, NOW(), ?, ?)`,
-      [comment, actor?.user_name || actor?.name || 'system', SECTION.LEAD, actor?.user_id || null, efrId]
+  const lifecycleInstalled = await lifecycle.hasLifecycleSchema();
+  if (lifecycleInstalled) {
+    await lifecycle.syncFromVerificationFlagsAtomic(efrId, {
+      ...(v === 2
+        ? {
+          status: 'APPLICATION_REJECTED',
+          reasonCode: 'LEAD_APPLICATION_REJECTED',
+          reason: body.reason || 'Application rejected during lead verification',
+        }
+        : {
+          reasonCode: v === 1 ? 'LEAD_ACCEPTED' : 'LEAD_RESET',
+          reason: body.reason || statusText,
+        }),
+      projectedRow: { user_personal_details_filled: v },
+      mutate: applyLeadMutation,
+    }, actor);
+  } else {
+    const [[row]] = await pool.query(
+      'SELECT e.user_id, u.personal_details_filled AS user_personal_details_filled FROM tbl_easyfixer e LEFT JOIN tbl_user u ON u.user_id = e.user_id WHERE e.efr_id = ? LIMIT 1',
+      [efrId],
     );
-
-    await conn.commit();
-  } catch (e) {
-    await conn.rollback().catch(() => {});
-    logger.error('Lead verification transaction failed · efrId=' + efrId + ' · ' + e.message);
-    throw e;
-  } finally {
-    conn.release();
+    if (!row) {
+      const error = new Error('easyfixer not found');
+      error.status = 404;
+      throw error;
+    }
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await applyLeadMutation(conn, row);
+      await conn.commit();
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      logger.error('Lead verification transaction failed · efrId=' + efrId + ' · ' + error.message);
+      throw error;
+    } finally {
+      conn.release();
+    }
+    registrationStatusPush.notifyRegistrationStatusChanged(efrId).catch(() => {});
   }
 
   logger.info('Lead verification set · efrId=' + efrId + ' · status=' + statusText);
-
-  // Lead accept/deny changes tbl_user.personal_details_filled, which drives
-  // the registration-status gate (under_verification / not_eligible /
-  // in_progress). Nudge the app to re-fetch. Best-effort — never blocks.
-  registrationStatusPush.notifyRegistrationStatusChanged(efrId).catch(() => {});
 
   return getVerificationPage(efrId);
 }
@@ -657,6 +712,10 @@ async function proceedToActivation(efrId) {
 // ─── Activation save (Section 3) ────────────────────────────────────
 async function saveActivation(efrId, body, actor) {
   logger.info('Save activation · efrId=' + efrId + ' · activate=' + (body.activate === true));
+  let lifecycleInstalled = false;
+  if (body.activate === true) {
+    lifecycleInstalled = await lifecycle.hasLifecycleSchema();
+  }
   // Banking: easyfix_bank_name_id + beneficiary_id (Edit Finance Details).
   if (body.easyfix_bank_name_id !== undefined || body.beneficiary_id !== undefined) {
     const [[existing]] = await pool.query(
@@ -676,28 +735,32 @@ async function saveActivation(efrId, body, actor) {
 
   // Final activation toggle — replicates updateEasyfixerFinalAcceptComment.
   if (body.activate === true) {
-    await pool.query(
-      `UPDATE tbl_easyfixer
-          SET final_accept_comment = ?,
-              efr_type = COALESCE(?, efr_type),
-              is_technician_verified = 1,
-              profile_crm_activation_by = ?,
-              profile_activation_date_time = NOW(),
-              efr_status = 1,
-              is_eligible_for_offline_orders = COALESCE(?, is_eligible_for_offline_orders)
-        WHERE efr_id = ?`,
-      [
-        body.final_accept_comment || null,
-        body.grade || null,
-        actor?.user_id || null,
-        body.is_eligible_for_offline_orders ?? null,
-        efrId,
-      ]
-    );
-    // Final activation sets is_technician_verified = 1 → gate flips to
-    // `active`. Push the technician's app so it leaves the onboarding gate
-    // immediately. Best-effort — never blocks the activation.
-    registrationStatusPush.notifyRegistrationStatusChanged(efrId, { status: 'active' }).catch(() => {});
+    if (lifecycleInstalled) {
+      // Lifecycle service owns the transaction: verification flags, legacy
+      // efr_status projection and audit row commit atomically, then push fires.
+      await lifecycle.activateFromVerification(efrId, body, actor);
+    } else {
+      await pool.query(
+        `UPDATE tbl_easyfixer
+            SET final_accept_comment = ?,
+                efr_type = COALESCE(?, efr_type),
+                is_technician_verified = 1,
+                profile_crm_activation_by = ?,
+                profile_activation_date_time = NOW(),
+                efr_status = 1,
+                is_eligible_for_offline_orders = COALESCE(?, is_eligible_for_offline_orders)
+          WHERE efr_id = ?`,
+        [
+          body.final_accept_comment || null,
+          body.grade || null,
+          actor?.user_id || null,
+          body.is_eligible_for_offline_orders ?? null,
+          efrId,
+        ],
+      );
+      // Pre-migration fallback: keep the existing app refresh push.
+      registrationStatusPush.notifyRegistrationStatusChanged(efrId, { status: 'active' }).catch(() => {});
+    }
     logger.info('Technician activated · efrId=' + efrId);
   }
   return getVerificationPage(efrId);

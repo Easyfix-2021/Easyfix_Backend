@@ -1,5 +1,10 @@
 const Joi = require('joi');
-const { ALL_STATUS_VALUES, SORTABLE_COLUMNS, OFFER_STATE_VALUES } = require('../services/job.service');
+const {
+  ALL_STATUS_VALUES,
+  SORTABLE_COLUMNS,
+  OFFER_STATE_VALUES,
+  MAX_OFFER_RECIPIENTS,
+} = require('../services/job.service');
 
 const intId   = Joi.number().integer().positive();
 /*
@@ -432,7 +437,7 @@ const assignBody = Joi.object({
  * /assign (IST wall-clock string — see the assignBody note above).
  */
 const offerBody = Joi.object({
-  easyfixerIds: Joi.array().items(intId).min(1).max(50).required(),
+  easyfixerIds: Joi.array().items(intId).min(1).max(MAX_OFFER_RECIPIENTS).required(),
   requestedDateTime: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$/).max(40).optional(),
   timeSlot: Joi.string().max(200).allow('', null).optional(),
   // Where the offer was made from — the CRM sends `source` when the whole batch

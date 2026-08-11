@@ -61,7 +61,10 @@ const fake = installFakePool(
      * indistinguishable from the gate's, quietly turning the pass-through
      * tests green for the wrong reason.
      */
-    [/SELECT\s+efr_id\s+FROM\s+tbl_easyfixer/i, () => [{ efr_id: 7 }, { efr_id: 8 }]],
+    [/FROM\s+tbl_easyfixer\s+e\s+WHERE\s+e\.efr_id\s+IN/i, () => [
+      { efr_id: 7, efr_status: 1, is_technician_verified: 1, efr_manager_id: null },
+      { efr_id: 8, efr_status: 1, is_technician_verified: 1, efr_manager_id: null },
+    ]],
   ],
   { stopOn: /^\s*(UPDATE|INSERT|DELETE)\s/i },
 );

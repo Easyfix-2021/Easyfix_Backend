@@ -119,16 +119,54 @@ function dualChannelFromProperty() {
  * row — it's the source of truth and gets updated when DLT registrations change.
  */
 const FALLBACK_OTP_SMS = (otp) => `Dear Customer, Your OTP for login to the account is ${otp} - Team EasyFix`;
+const SMS_RETRIEVER_MAX_BYTES = 140;
+const SMS_RETRIEVER_HASH_PATTERN = /^[A-Za-z0-9+/]{11}$/;
 
-async function buildOtpSmsBody(otp) {
+function technicianSmsRetrieverEnabled(contextLabel) {
+  if (contextLabel !== 'technician') return false;
+  const appHash = String(process.env.TECHNICIAN_SMS_RETRIEVER_APP_HASH ?? '');
+  return SMS_RETRIEVER_HASH_PATTERN.test(appHash);
+}
+
+/**
+ * Add the Android SMS Retriever app hash to technician OTP messages only.
+ *
+ * The existing DLT body is preserved exactly as its prefix; an absent or
+ * malformed env value is a strict no-op for every caller. Google measures the
+ * limit in UTF-8 bytes (not JavaScript characters), so an enabled message that
+ * would exceed 140 bytes fails before reaching the SMS provider. The error is
+ * deliberately hash-free because delivery errors are logged by the channel
+ * fallback orchestration.
+ *
+ * @param {string} message Existing DB/DLT-filled SMS body.
+ * @param {string} contextLabel OTP caller context.
+ * @returns {string} Original body, or body + newline + app hash.
+ */
+function formatOtpSmsForContext(message, contextLabel) {
+  if (!technicianSmsRetrieverEnabled(contextLabel)) return message;
+
+  const appHash = String(process.env.TECHNICIAN_SMS_RETRIEVER_APP_HASH);
+  const formatted = `${message}\n${appHash}`;
+  const byteLength = Buffer.byteLength(formatted, 'utf8');
+  if (byteLength > SMS_RETRIEVER_MAX_BYTES) {
+    const err = new Error(
+      `technician OTP SMS exceeds the SMS Retriever ${SMS_RETRIEVER_MAX_BYTES}-byte limit`,
+    );
+    err.code = 'TECHNICIAN_SMS_RETRIEVER_MESSAGE_TOO_LONG';
+    throw err;
+  }
+  return formatted;
+}
+
+async function buildOtpSmsBody(otp, contextLabel = 'login') {
+  let body = null;
   try {
     const tmpl = await smsTemplate.getTemplate('mobileLoginOtp');
-    const body = smsTemplate.fill(tmpl, [otp]);
-    if (body) return body;
+    body = smsTemplate.fill(tmpl, [otp]);
   } catch (e) {
     logger.warn(`SMS template lookup failed — using inline fallback · ${e.message}`);
   }
-  return FALLBACK_OTP_SMS(otp);
+  return formatOtpSmsForContext(body || FALLBACK_OTP_SMS(otp), contextLabel);
 }
 
 function buildOtpEmailText(otp) {
@@ -212,10 +250,10 @@ async function tryWhatsApp({ mobile, name, otp }) {
   } catch (e) { return { delivered: false, error: e.message }; }
 }
 
-async function trySms({ mobile, otp }) {
+async function trySms({ mobile, otp, contextLabel }) {
   if (!mobile) return { delivered: false, skipped: 'no mobile' };
   try {
-    const message = await buildOtpSmsBody(otp);
+    const message = await buildOtpSmsBody(otp, contextLabel);
     return await smsService.send({ to: mobile, message });
   } catch (e) { return { delivered: false, error: e.message }; }
 }
@@ -370,6 +408,12 @@ async function tryEmail({ email, otp, contextLabel = 'login' }) {
  */
 async function deliverOtp({ identifier, email, mobile, name, otp, contextLabel = 'login' }) {
   const identifierIsEmail = /@/.test(String(identifier || ''));
+  // A valid app hash means the Android build is ready to auto-read only an SMS.
+  // Force the technician MOBILE flow into bounded two-channel delivery so an
+  // accepted WhatsApp request cannot starve the required SMS attempt. With the
+  // env unset/malformed, historical admin-selected fallback behavior is exact.
+  const retrieverSmsRequired = !identifierIsEmail
+    && technicianSmsRetrieverEnabled(contextLabel);
   const attempts = [];
   /*
    * Log the RESOLVED plan, not just the identifier type. Per-attempt outcomes
@@ -381,12 +425,13 @@ async function deliverOtp({ identifier, email, mobile, name, otp, contextLabel =
   if (identifierIsEmail) {
     logger.info('Deliver OTP · context=' + contextLabel + ' · via=email · plan=email→whatsapp');
   } else {
-    const dualNow = dualChannelEnabled();
+    const dualNow = dualChannelEnabled() || retrieverSmsRequired;
     const primaryNow = otpChannel();
     const fallbackNow = primaryNow === CHANNEL_WHATSAPP ? CHANNEL_SMS : CHANNEL_WHATSAPP;
     logger.info(
       'Deliver OTP · context=' + contextLabel + ' · via=mobile · dual=' + dualNow
-      + ' · plan=' + (dualNow ? 'whatsapp+sms (parallel)' : primaryNow + '→' + fallbackNow),
+      + ' · plan=' + (dualNow ? 'whatsapp+sms (parallel)' : primaryNow + '→' + fallbackNow)
+      + (retrieverSmsRequired ? ' · reason=sms-retriever' : ''),
     );
   }
 
@@ -432,12 +477,12 @@ async function deliverOtp({ identifier, email, mobile, name, otp, contextLabel =
   //   from Admin Actions and we revert to single-channel fallback — it is now a
   //   DB property, so that no longer needs a redeploy during an incident.
   const mobileTarget = mobile || identifier;
-  const dual = dualChannelEnabled();
+  const dual = dualChannelEnabled() || retrieverSmsRequired;
 
   if (dual) {
     const [a1, a2] = await Promise.all([
       tryWhatsApp({ mobile: mobileTarget, name, otp }),
-      trySms({ mobile: mobileTarget, otp }),
+      trySms({ mobile: mobileTarget, otp, contextLabel }),
     ]);
     attempts.push({ channel: 'whatsapp', ...a1 });
     attempts.push({ channel: 'sms', ...a2, parallel: true });
@@ -460,7 +505,7 @@ async function deliverOtp({ identifier, email, mobile, name, otp, contextLabel =
   const fallback = primary === CHANNEL_WHATSAPP ? CHANNEL_SMS : CHANNEL_WHATSAPP;
   const send = {
     [CHANNEL_WHATSAPP]: () => tryWhatsApp({ mobile: mobileTarget, name, otp }),
-    [CHANNEL_SMS]: () => trySms({ mobile: mobileTarget, otp }),
+    [CHANNEL_SMS]: () => trySms({ mobile: mobileTarget, otp, contextLabel }),
   };
 
   const a1 = await send[primary]();
@@ -481,4 +526,6 @@ module.exports = {
   // Exported for the Admin Action route (read + validate the stored channel).
   otpChannel, isValidChannel, normaliseChannel, CHANNELS, CHANNEL_WHATSAPP, CHANNEL_SMS,
   dualChannelEnabled, dualChannelFromProperty,
+  technicianSmsRetrieverEnabled,
+  buildOtpSmsBody, formatOtpSmsForContext, SMS_RETRIEVER_MAX_BYTES,
 };

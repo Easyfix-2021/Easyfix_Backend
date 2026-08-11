@@ -1,6 +1,7 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const deepSkillService = require('./deep-skill.service');
+const lifecycleService = require('./easyfixer-lifecycle.service');
 
 /*
  * Mobile Registration gate machine — collapses three legacy polls
@@ -64,6 +65,7 @@ function present(v) {
 
 // ─── Identity + flags fetch ─────────────────────────────────────────
 async function fetchGateRow(efrId) {
+  const lifecycleProjection = await lifecycleService.readProjection('e');
   const [[row]] = await pool.query(
     `SELECT e.efr_id,
             e.efr_first_name, e.efr_name, e.efr_no,
@@ -71,6 +73,8 @@ async function fetchGateRow(efrId) {
             e.efr_profile_perc,
             e.efr_status,
             e.last_inactive_date_time,
+            e.scheduled_reactivation_date,
+            e.efr_manager_id,
             e.is_technician_verified,
             e.is_identity_details_verified_by_crm,
             e.is_personal_details_verified_by_crm,
@@ -82,6 +86,7 @@ async function fetchGateRow(efrId) {
             e.efr_cityId,
             e.efr_pin_no,
             e.user_id,
+            ${lifecycleProjection},
             u.personal_details_filled       AS user_personal_details_filled,
             u.is_personal_detail_filled      AS user_is_personal_detail_filled,
             u.is_released                    AS user_is_released
@@ -256,6 +261,9 @@ async function getStatus(efrId) {
   };
 
   const status = deriveStatus(flags);
+  const lifecycle = lifecycleService.forTechnician(
+    lifecycleService.lifecycleFromRow(e),
+  );
 
   /*
    * Deactivation is reported ADDITIVELY — deliberately NOT as a new `status`
@@ -269,7 +277,7 @@ async function getStatus(efrId) {
    * the flag, and treating NULL as deactivated would wrongly lock out a large
    * slice of existing technicians.
    */
-  const deactivated = Number(e.efr_status) === 0;
+  const deactivated = e.efr_status != null && Number(e.efr_status) === 0;
 
   // Gate 2 (earning) unlock: CRM-verified AND the tech has the full identity
   // + skills + training the first job needs. Surfaced as a dashboard checklist
@@ -280,7 +288,7 @@ async function getStatus(efrId) {
   // what makes the deactivated experience correct on TODAY's app build with no
   // client change: they log in, reach the dashboard, and jobs are shown locked
   // instead of appearing available and silently never arriving.
-  const jobsUnlocked = !deactivated
+  const jobsUnlocked = lifecycle.jobsAllowed && !deactivated
     && flags.isTechnicianVerified && panPresent && hasSkills && trainingComplete;
 
   logger.info('Returning registration status · status=' + status + ' profilePct=' + pct(e.efr_profile_perc) + ' jobsUnlocked=' + jobsUnlocked + ' deactivated=' + deactivated);
@@ -299,6 +307,9 @@ async function getStatus(efrId) {
     // `inactive_comment` are Ops notes and are intentionally NOT surfaced to the
     // technician; the app shows a generic "contact support" message instead.
     deactivatedSince:     deactivated ? (e.last_inactive_date_time || null) : null,
+    // Additive v5.1 lifecycle contract. Old app versions ignore this field;
+    // new versions use it to render PAUSED/DORMANT/re-application experiences.
+    lifecycle,
     // Gate-2 unlock checklist for the dashboard (all true ⇒ jobsUnlocked).
     checklist: {
       verified:         flags.isTechnicianVerified,
@@ -455,6 +466,21 @@ async function savePersonalDetails(efrId, body) {
   return { ok: true };
 }
 
+async function finalizeGate1(efrId) {
+  logger.info('Finalize registration Gate 1 · efrId=' + efrId);
+  const result = await lifecycleService.finalizeMobileRegistrationGate1(efrId);
+  if (!result.schemaInstalled) {
+    // Before the additive migration the legacy derived gate remains the source
+    // of truth, so finalization is an intentional no-op.
+    return { finalized: false, schemaInstalled: false, lifecycle: null };
+  }
+  return {
+    finalized: result.changed === true,
+    schemaInstalled: true,
+    lifecycle: result.lifecycle,
+  };
+}
+
 // ─── PATCH language ─────────────────────────────────────────────────
 /*
  * Persist the technician's preferred language (English NAME, e.g.
@@ -468,7 +494,7 @@ async function savePersonalDetails(efrId, body) {
  * usable unique constraint beyond the efr_id PK, so we update first and
  * insert only when no row was touched.
  */
-async function setLanguage(efrId, language) {
+async function setLanguage(efrId, language, runner = pool) {
   const lang = String(language || '').trim();
   logger.info('Set preferred language · language=' + (lang || '-'));
   if (!lang) {
@@ -478,14 +504,14 @@ async function setLanguage(efrId, language) {
     throw err;
   }
 
-  const [upd] = await pool.query(
+  const [upd] = await runner.query(
     'UPDATE tbl_easyfixer_app SET language = ? WHERE efr_id = ?',
     [lang, efrId],
   );
   if (upd.affectedRows === 0) {
     // VERIFY: tbl_easyfixer_app PK column is `efr_id` (per legacy
     // EasyfixApp @Entity). Insert a minimal row carrying the language.
-    await pool.query(
+    await runner.query(
       `INSERT INTO tbl_easyfixer_app (efr_id, language, last_login_time)
        VALUES (?, ?, NOW())`,
       [efrId, lang],
@@ -500,5 +526,6 @@ module.exports = {
   getStatus,
   getRemaining,
   savePersonalDetails,
+  finalizeGate1,
   setLanguage,
 };

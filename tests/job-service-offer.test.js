@@ -16,7 +16,7 @@ const assert = require('node:assert/strict');
 const { installFakePool } = require('./helpers/fake-pool');
 
 const DEFAULTS = () => ({
-  verifyRows: [{ efr_id: 42 }],                                    // gate passes
+  verifyRows: [{ efr_id: 42, efr_status: 1, is_technician_verified: 1, efr_manager_id: null }],
   jobMeta: { job_id: 100, job_status: 0, fk_easyfixter_id: null }, // BOOKED, unowned
   techRow: { efr_id: 42, efr_status: 1 },                          // exists + active
 });
@@ -28,7 +28,7 @@ const fake = installFakePool(
     [/SHOW COLUMNS/i, []],
     [/efr_status FROM tbl_easyfixer WHERE efr_id = \?/, () => (scenario.techRow ? [scenario.techRow] : [])],
     [/SELECT job_id, job_status, fk_easyfixter_id/, () => (scenario.jobMeta ? [scenario.jobMeta] : [])],
-    [/is_technician_verified = 1/, () => scenario.verifyRows],
+    [/FROM tbl_easyfixer e\s+WHERE e\.efr_id IN/, () => scenario.verifyRows],
     // tbl_job_offer existence probe + per-tech latest-offer read: default [] →
     // table exists, no prior offer → fresh INSERT path.
   ],
@@ -37,7 +37,7 @@ const fake = installFakePool(
 
 const jobSvc = require('../services/job.service');
 
-const wrote = () => fake.calls.some((c) => /\b(INSERT|UPDATE)\b/i.test(c.sql));
+const wrote = () => fake.calls.some((c) => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(c.sql));
 
 beforeEach(() => { fake.reset(); Object.assign(scenario, DEFAULTS()); });
 
@@ -50,12 +50,26 @@ test('offer with an empty tech list is rejected 400 with ZERO DB calls', async (
 });
 
 test('offer to an UNVERIFIED technician is rejected before any write (security gate)', async () => {
-  scenario.verifyRows = []; // gate finds the tech is not verified
+  scenario.verifyRows = [{ efr_id: 42, efr_status: 1, is_technician_verified: 0, efr_manager_id: null }];
   await assert.rejects(
     () => jobSvc.offerToTechnicians(100, [42], { user_id: 1 }),
     (e) => e.status === 400 && e.code === 'TECH_NOT_VERIFIED',
   );
   assert.ok(!wrote(), 'no INSERT/UPDATE may run for an unverified tech');
+});
+
+test('pre-migration direct offer rejects a verified legacy-deleted technician', async () => {
+  scenario.verifyRows = [{
+    efr_id: 42,
+    efr_status: 3,
+    is_technician_verified: 1,
+    efr_manager_id: null,
+  }];
+  await assert.rejects(
+    () => jobSvc.offerToTechnicians(100, [42], { user_id: 1 }),
+    (e) => e.status === 400 && e.code === 'TECH_CANNOT_RECEIVE_JOBS',
+  );
+  assert.ok(!wrote(), 'deleted/status-drifted techs must fail before any write');
 });
 
 test('offer to a VERIFIED technician issues an INSERT tbl_job_offer and leaves the job BOOKED', async () => {
@@ -70,7 +84,7 @@ test('offer to a VERIFIED technician issues an INSERT tbl_job_offer and leaves t
 });
 
 test('assign to an UNVERIFIED technician is rejected before any write (shared gate)', async () => {
-  scenario.verifyRows = [];
+  scenario.verifyRows = [{ efr_id: 42, efr_status: 1, is_technician_verified: 0, efr_manager_id: null }];
   await assert.rejects(
     () => jobSvc.assign(100, { easyfixerId: 42 }, { user_id: 1 }),
     (e) => e.status === 400 && e.code === 'TECH_NOT_VERIFIED',

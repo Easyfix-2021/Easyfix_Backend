@@ -31,7 +31,7 @@ const fake = installFakePool([
   [/INFORMATION_SCHEMA/i, [{ n: 0 }]],
   [/SHOW COLUMNS/i, []],
   // The offer read under test — must come before the generic tbl_job_offer probe.
-  [/SELECT job_id, offered_at/i, () => OFFER_ROWS()],
+  [/SELECT jo\.job_id, jo\.offered_at/i, () => OFFER_ROWS()],
   [/SELECT COUNT\(\*\) AS total/i, [{ total: 2 }]],
   // list()'s data query is the only one ending in LIMIT ? OFFSET ?.
   [/LIMIT \? OFFSET \?/i, () => JOB_ROWS()],
@@ -44,14 +44,14 @@ beforeEach(() => fake.reset());
 
 test('the offer read projects offered_at and derives expires_at from OFFER_TTL_MINUTES', async () => {
   await jobService.listOfferedForTech(42);
-  const sel = fake.calls.find((c) => /SELECT job_id, offered_at/i.test(c.sql));
+  const sel = fake.calls.find((c) => /SELECT jo\.job_id, jo\.offered_at/i.test(c.sql));
   assert.ok(sel, 'the open-offer SELECT must run');
   assert.match(sel.sql, /offered_at/, 'offered_at must be projected, not just ordered by');
   // The TTL is interpolated from the ONE constant — a literal 30 here would be
   // the drift this assertion exists to catch.
   assert.match(
     sel.sql,
-    new RegExp(`DATE_ADD\\(offered_at, INTERVAL ${jobService.OFFER_TTL_MINUTES} MINUTE\\) AS expires_at`),
+    new RegExp(`DATE_ADD\\(jo\\.offered_at, INTERVAL ${jobService.OFFER_TTL_MINUTES} MINUTE\\) AS expires_at`),
     'expires_at must be derived in SQL from OFFER_TTL_MINUTES',
   );
   assert.match(sel.sql, /offer_status = 0/, 'only OPEN offers are listed');
@@ -73,6 +73,6 @@ test('each preview row carries snake_case offered_at + expires_at for its OWN of
 
 test('the countdown costs no extra round trip (still one offer read)', async () => {
   await jobService.listOfferedForTech(42);
-  const offerReads = fake.calls.filter((c) => /SELECT job_id, offered_at/i.test(c.sql));
+  const offerReads = fake.calls.filter((c) => /SELECT jo\.job_id, jo\.offered_at/i.test(c.sql));
   assert.equal(offerReads.length, 1, 'offered_at/expires_at ride along on the read that already happened');
 });

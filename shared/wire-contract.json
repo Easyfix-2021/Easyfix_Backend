@@ -18,7 +18,62 @@
     "alone — that is caught locally, where both repos are checked out."
   ],
 
-  "revision": 1,
+  "revision": 2,
+
+  "technicianLifecycle": {
+    "$doc": [
+      "Canonical technician lifecycle values shared by the unified backend and CRM.",
+      "The mobile app maps this additive object at its API boundary so legacy gate",
+      "statuses remain backward compatible. BLACKLISTED is irreversible; cron jobs",
+      "must never create BLACKLISTED or INACTIVE transitions."
+    ],
+    "statuses": [
+      "NEW",
+      "REGISTRATION_INCOMPLETE",
+      "TRAINING_PENDING",
+      "ASSESSMENT_FAILED",
+      "UNDER_VERIFICATION",
+      "VERIFICATION_REJECTED",
+      "ACTIVE",
+      "PAUSED",
+      "INACTIVE",
+      "REAPPLIED",
+      "APPLICATION_REJECTED",
+      "BLACKLISTED",
+      "DORMANT",
+      "UNDER_MASTER",
+      "OFFLINE",
+      "ON_BENCH",
+      "SUSPENDED"
+    ],
+    "snapshotFields": [
+      "status",
+      "reasonCode",
+      "reason",
+      "changedAt",
+      "until",
+      "version",
+      "pauseCount",
+      "reapplicationCount",
+      "jobsAllowed",
+      "canReapply",
+      "canClaimEarnings",
+      "source",
+      "capabilities",
+      "allowedTransitions"
+    ],
+    "capabilityFields": [
+      "receiveNewJobs",
+      "continueAssignedJobs",
+      "mutateAssignedJobs",
+      "markAttendance",
+      "editRegistration",
+      "claimMoney",
+      "reapply",
+      "readOnlyApp"
+    ],
+    "pushType": "registration_status"
+  },
 
   "bookingBands": {
     "$doc": [

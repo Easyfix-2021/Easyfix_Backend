@@ -7,6 +7,8 @@ const geocode = require('./pincode-geocode.service');
 // The appointment slot model — bands, the midnight-sentinel guard, and the
 // 1-hour conflict window this service's hard filter is built on.
 const slotModel = require('./time-slot');
+const easyfixerLifecycle = require('./easyfixer-lifecycle.service');
+const easyfixerWorkEligibility = require('./easyfixer-work-eligibility.service');
 // easyfix_properties — the ops-flippable kill switch for the booking-conflict
 // hard filter (see conflictFrame). Held as the MODULE, not a
 // destructured getProperty, so the flag is stubbable from tests (a destructured
@@ -386,7 +388,9 @@ async function l1Eligibility(job, { applyDeepSkill = true, zoneIds = null, zoneP
    * Params are pushed in WHERE order (scope → skill → exclude → history) so
    * the positional placeholders bind correctly.
    */
-  const where = ['e.efr_status = 1', 'e.is_technician_verified = 1'];
+  const lifecycleEligibility = await easyfixerWorkEligibility.sqlPredicate('e');
+  const lifecycleProjection = await easyfixerLifecycle.readProjection('e');
+  const where = [lifecycleEligibility];
   const params = [];
 
   // ── Geographic scope ──
@@ -516,13 +520,16 @@ async function l1Eligibility(job, { applyDeepSkill = true, zoneIds = null, zoneP
     `SELECT e.efr_id, e.efr_name, e.efr_no, e.efr_email,
             e.efr_cityId, c.city_name,
             e.current_balance,
-            e.is_technician_verified
+            e.efr_status, e.is_technician_verified, e.efr_manager_id,
+            ${lifecycleProjection}
        FROM tbl_easyfixer e
        LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId
       WHERE ${where.join('\n        AND ')}`,
     params
   );
-  return rows;
+  // SQL is the hot-path filter; this zero-I/O mirror is defense-in-depth for a
+  // stale/malformed row during migration and makes the API invariant explicit.
+  return rows.filter((row) => easyfixerWorkEligibility.fromRow(row).canOffer);
 }
 
 // ─── Layer 2 + ranking stats ─────────────────────────────────────────
@@ -1171,6 +1178,21 @@ function scoreOne({ avg_rating, avg_tat_hours, tat_history,
  *   job   — the job row (for payment_mode label)
  */
 function buildCandidateRow(tech, s, job) {
+  const { lifecycle, canOffer } = easyfixerWorkEligibility.fromRow(tech);
+  const inactiveReason = String(tech.inactive_reason ?? '').trim();
+  const legacyReason = [
+    tech.send_back_to_tx_reason_crm,
+    tech.inactive_comment,
+    // inactive_reason is commonly a numeric legacy FK. A bare "12" is not a
+    // useful operator explanation, so only surface it when the column itself
+    // carries human text; otherwise the status-specific fallback below wins.
+    /^\d+$/.test(inactiveReason) ? null : inactiveReason,
+  ].map((value) => String(value ?? '').trim()).find(Boolean) || null;
+  const lifecycleReason = lifecycle.reason
+    || legacyReason
+    || (!canOffer
+      ? `${String(lifecycle.status).replaceAll('_', ' ')} technicians cannot receive new job offers.`
+      : null);
   const out = scoreOne({
     avg_rating:          s.avg_rating,
     avg_tat_hours:       s.avg_tat_hours,
@@ -1191,6 +1213,10 @@ function buildCandidateRow(tech, s, job) {
     city_name:     tech.city_name,
     current_balance: Number(tech.current_balance ?? 0),
     account_balance: Number(tech.current_balance ?? 0),
+    lifecycle_status:      lifecycle.status,
+    lifecycle_reason_code: lifecycle.reasonCode,
+    lifecycle_reason:      lifecycleReason,
+    can_offer:             canOffer,
     active_jobs:   s.active_jobs,
     job_count:     s.job_count ?? 0, // completed jobs; "Fresher" chip when < 5
     avg_rating:    Number((s.avg_rating ?? 0).toFixed(2)),
@@ -1315,6 +1341,7 @@ async function diagnoseEmptyPool(job, rejected = []) {
   };
   try {
     const hasOffers = await jobOfferTableExists();
+    const lifecycleEligibility = await easyfixerWorkEligibility.sqlPredicate('e');
     const skillPredicate = (job.fk_service_catg_id || job.fk_service_type_id)
       ? `EXISTS (SELECT 1 FROM tbl_efr_deepskill_mapping m
                   WHERE m.easyfixer_id = e.efr_id AND m.is_repairing = 1
@@ -1334,7 +1361,7 @@ async function diagnoseEmptyPool(job, rejected = []) {
                            WHERE sh.job_id = ? AND sh.easyfixer_id = e.efr_id
                              AND sh.reschedule_reason IS NOT NULL AND sh.reschedule_reason <> '')) AS removedEarlier
          FROM tbl_easyfixer e
-        WHERE e.efr_status = 1 AND e.is_technician_verified = 1 AND e.efr_cityId = ?`,
+        WHERE ${lifecycleEligibility} AND e.efr_cityId = ?`,
       [job.job_id, job.city_id],
     );
     for (const k of Object.keys(counts)) {
@@ -1699,10 +1726,17 @@ async function rankCandidatesForJob(jobId, {
 
   if (scored.length === 0 && totalEligible === 0) {
     const emptyReason = await diagnoseEmptyPool(job, rejected);
-    logger.info('Returning 0 candidates · no eligible techs · jobId=' + jobId + ' · reason=' + emptyReason.code);
+    // Reassign mode still needs the incumbent as read-only context even when
+    // there are zero eligible replacements. This row is marked is_current and
+    // can_offer=false, so it does not become a recommendation or assignment
+    // target; it only tells Ops who currently owns the job.
+    const incumbentContext = assignedEfrId
+      ? await ensureAssignedFirst([], assignedEfrId, job, [])
+      : [];
+    logger.info('Returning ' + incumbentContext.length + ' context candidate(s) · no eligible techs · jobId=' + jobId + ' · reason=' + emptyReason.code);
     return {
       job: enrichedJob, alreadyAssigned, note: note ?? 'no_eligible_techs',
-      l1Count: 0, l2Count: 0, candidates: [], rejected: [],
+      l1Count: 0, l2Count: 0, candidates: incumbentContext, rejected: [],
       emptyReason,
       config: { ranking_order: RANKING_ORDER, performance_sub: PERFORMANCE_SUB },
     };
@@ -1795,12 +1829,16 @@ async function ensureAssignedFirst(candidatesList, assignedEfrId, job, scoredAll
 
   // Path B: the assigned tech was filtered out before scoring (e.g. by L1).
   // Re-fetch their basic profile + stats so we can still render the row.
+  const lifecycleProjection = await easyfixerLifecycle.readProjection('e');
   const [[techRow]] = await pool.query(
     `SELECT e.efr_id, e.efr_name, e.efr_no, e.efr_email,
-            e.efr_cityId, c.city_name, e.current_balance
+            e.efr_cityId, c.city_name, e.current_balance,
+            e.efr_status, e.is_technician_verified, e.efr_manager_id,
+            ${lifecycleProjection}
        FROM tbl_easyfixer e
        LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId
-      WHERE e.efr_id = ? LIMIT 1`,
+      WHERE e.efr_id = ? AND NOT (e.efr_status <=> 3)
+      LIMIT 1`,
     [assignedEfrId]
   );
   if (!techRow) return candidatesList;
@@ -2171,22 +2209,37 @@ async function searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit =
     pinClause = ' OR e.efr_pin_no = ?';
     params.push(q);
   }
-  // Search is a "match-anyone" override so ops can bypass the RANKING filters
+  const hasLifecycleSchema = await easyfixerLifecycle.hasLifecycleSchema();
+  const lifecycleProjection = await easyfixerLifecycle.readProjection('e');
+  // Pre-migration derivation needs the user onboarding flags. Once lifecycle is
+  // installed those columns are authoritative, so avoid an eq_ref tbl_user join
+  // on this wildcard-search hot path (QA baseline scans ~9.4k easyfixers).
+  const legacyLifecycleColumns = hasLifecycleSchema ? '' : `
+            e.user_id, e.adhaar_card_number, e.efr_profile_img,
+            e.is_identity_details_verified_by_crm,
+            e.scheduled_reactivation_date, e.insert_date, e.update_date,
+            u.personal_details_filled AS user_personal_details_filled,
+            u.is_personal_detail_filled AS user_is_personal_detail_filled,`;
+  const legacyLifecycleJoin = hasLifecycleSchema
+    ? ''
+    : 'LEFT JOIN tbl_user u ON u.user_id = e.user_id';
+  // Search is a "match-anyone" inspection path so ops can bypass the RANKING filters
   // (deep-skill match, distance, serviceable pincode, attendance, same-slot
   // conflict, max-concurrent, COD balance, scheduling_history rejection) and
-  // assign a specific tech. But it must still enforce the two IDENTITY gates
-  // that make a row an assignable technician at all — the same hard gates
-  // l1Eligibility applies: efr_status = 1 (ACTIVE — canonical, do NOT invert to
-  // 0) AND is_technician_verified = 1 (verified profile). Without these, search
-  // surfaced inactive / unverified / incomplete-profile ghosts (e.g. a NULL
-  // is_technician_verified row with no efr_name) that can never be assigned.
+  // locate a specific tech. Restricted technicians stay visible with lifecycle
+  // status/reason + can_offer=false; the write path independently enforces that
+  // flag, so visibility is never mistaken for permission. Only legacy-deleted
+  // efr_status=3 rows are hidden.
   const [techRows] = await pool.query(
     `SELECT e.efr_id, e.efr_name, e.efr_no, e.efr_email,
-            e.efr_cityId, c.city_name, e.current_balance
+            e.efr_cityId, c.city_name, e.current_balance,
+            e.efr_status, e.is_technician_verified, e.efr_manager_id,
+            e.inactive_comment, e.inactive_reason, e.send_back_to_tx_reason_crm,${legacyLifecycleColumns}
+            ${lifecycleProjection}
        FROM tbl_easyfixer e
        LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId
-      WHERE e.efr_status = 1
-        AND e.is_technician_verified = 1
+       ${legacyLifecycleJoin}
+      WHERE NOT (e.efr_status <=> 3)
         AND (e.efr_name LIKE ? OR e.efr_no LIKE ? OR c.city_name LIKE ?${idClause}${pinClause})
       ORDER BY e.efr_name ASC
       LIMIT ?`,

@@ -1,7 +1,13 @@
 const { pool } = require('../db');
 const logger = require('../logger');
-const { resolveLoginOtp, otpExpiryDate } = require('../utils/otp');
+const { resolveLoginOtp, otpExpiryDate, OTP_RESEND_SECONDS } = require('../utils/otp');
 const jwt = require('jsonwebtoken');
+const easyfixerLifecycle = require('./easyfixer-lifecycle.service');
+const { withMysqlNamedLock } = require('./mysql-named-lock.service');
+const {
+  TECH_ROLE_ID,
+  createCanonicalTechnicianUser,
+} = require('./technician-user.service');
 
 /*
  * Technician authentication — against tbl_easyfixer.
@@ -80,15 +86,37 @@ async function findByMobile(mobile, runner = pool) {
  * blocked downstream — see the note on findByMobile.
  */
 async function findById(id) {
+  const lifecycleProjection = await easyfixerLifecycle.readProjection('tbl_easyfixer');
   const [[row]] = await pool.query(
     `SELECT efr_id, efr_name, efr_no, efr_email, efr_cityId, efr_service_category,
-            efr_status, is_technician_verified
-       FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1`, [id]);
-  return row || null;
+            efr_status, is_technician_verified, efr_manager_id, user_id,
+            insert_date, update_date,
+            ${lifecycleProjection}
+       FROM tbl_easyfixer
+      WHERE efr_id = ? AND NOT (efr_status <=> 3)
+      LIMIT 1`, [id]);
+  if (!row) return null;
+  // readProjection() supplies raw snake_case columns for lifecycle derivation.
+  // GET /mobile/me serializes req.tech directly, so overwrite those aliases as
+  // well as redacting the nested snapshot; otherwise BLACKLISTED RCA text
+  // would remain available at the root of the response.
+  const technicianRow = easyfixerLifecycle.forTechnician(
+    easyfixerLifecycle.lifecycleFromRow(row),
+  );
+  return {
+    ...row,
+    lifecycle_reason_code: technicianRow.status === 'BLACKLISTED'
+      ? null
+      : row.lifecycle_reason_code,
+    lifecycle_reason: technicianRow.status === 'BLACKLISTED'
+      ? null
+      : row.lifecycle_reason,
+    // req.tech is also returned by GET /mobile/me. Redact BLACKLISTED RCA text
+    // at this shared boundary so auth middleware still receives capabilities
+    // without leaking internal CRM notes through another mobile endpoint.
+    lifecycle: technicianRow,
+  };
 }
-
-// Technician role_id in tbl_role (see CLAUDE.md role model — role 19 "Technician").
-const TECH_ROLE_ID = 19;
 
 /*
  * Self-onboarding for an unknown mobile.
@@ -118,19 +146,31 @@ const TECH_ROLE_ID = 19;
  * if a unique index is ever added on efr_no per the SCHEMA.md backfill note.
  * Returns the new (or concurrently-created) tech row in findByMobile's shape.
  */
-async function createStubTechnician(mobile) {
+async function createStubTechnician(mobile, pinnedRunner = null) {
   logger.info('Self-onboard stub technician for unknown mobile');
-  const conn = await pool.getConnection();
-  // GET_LOCK / RELEASE_LOCK are connection-scoped — both must run on the SAME
-  // pinned connection (never via pool.query). Mirrors easyfixer.service.create().
-  const lockName = `tech_stub_create_${mobile}`; // < 64 chars, mobile is 10 digits
+  // verifyLoginOtp already owns a named-lock connection. Reuse it when
+  // supplied so a burst of new-technician verifies cannot hold one pool slot
+  // each while waiting for a second slot (pool starvation). Standalone callers
+  // retain the original acquire/release behaviour.
+  const ownsConnection = !pinnedRunner;
+  const conn = pinnedRunner || await pool.getConnection();
+  // Standalone callers need the original identity-create lock. A pinned runner
+  // comes only from verifyLoginOtp, which already holds the stronger per-mobile
+  // OTP issue/verify lock; taking a second named lock on that same session is
+  // redundant and unsafe on older MySQL semantics where GET_LOCK replaced the
+  // connection's previously held lock.
+  const lockName = ownsConnection ? `tech_stub_create_${mobile}` : null;
+  let stubLockAcquired = false;
   try {
-    const [[lock]] = await conn.query('SELECT GET_LOCK(?, 5) AS got', [lockName]);
-    if (!lock || lock.got !== 1) {
-      logger.warn('Could not acquire onboarding lock for stub technician create');
-      const err = new Error('could not acquire onboarding lock for this mobile number, please retry');
-      err.status = 409;
-      throw err;
+    if (lockName) {
+      const [[lock]] = await conn.query('SELECT GET_LOCK(?, 5) AS got', [lockName]);
+      stubLockAcquired = Boolean(lock && lock.got === 1);
+      if (!stubLockAcquired) {
+        logger.warn('Could not acquire onboarding lock for stub technician create');
+        const err = new Error('could not acquire onboarding lock for this mobile number, please retry');
+        err.status = 409;
+        throw err;
+      }
     }
 
     /*
@@ -157,16 +197,13 @@ async function createStubTechnician(mobile) {
       // the DB default apply). user_status = 0: an un-vetted lead, matching the
       // legacy createUser default and keeping the ghost out of active-user
       // queries (e.g. client-verticals' "user_status <> 0" SPOC lookup).
-      const [userRes] = await conn.query(
-        `INSERT INTO tbl_user (mobile_no, user_role, is_personal_detail_filled, user_status, insert_date)
-         VALUES (?, ?, 0, 0, NOW())`,
-        [mobile, TECH_ROLE_ID]);
-      const userId = userRes.insertId;
+      const userId = await createCanonicalTechnicianUser(mobile, conn);
 
       // efr_no is NOT DB-unique today (dup active mobiles exist — see SCHEMA.md
       // + the lock comment above), so this ON DUPLICATE KEY clause is inert
-      // defense-in-depth; the GET_LOCK is the real race guard. It becomes active
-      // automatically if a UNIQUE index is ever added on efr_no.
+      // defense-in-depth; the surrounding per-mobile named lock (OTP lock for
+      // verify callers, stub lock for standalone callers) is the real guard. It
+      // becomes active automatically if a UNIQUE index is ever added on efr_no.
       await conn.query(
         `INSERT INTO tbl_easyfixer (efr_no, new_easy_fixer, efr_status, user_id, insert_date, update_date)
          VALUES (?, 1, 1, ?, NOW(), NOW())
@@ -185,8 +222,10 @@ async function createStubTechnician(mobile) {
     // row is returned in findByMobile's shape regardless of which insert won.
     return await findByMobile(mobile, conn);
   } finally {
-    try { await conn.query('SELECT RELEASE_LOCK(?)', [lockName]); } catch (_) { /* connection teardown releases it anyway */ }
-    conn.release();
+    if (stubLockAcquired) {
+      try { await conn.query('SELECT RELEASE_LOCK(?)', [lockName]); } catch (_) { /* connection teardown releases it anyway */ }
+    }
+    if (ownsConnection) conn.release();
   }
 }
 
@@ -219,27 +258,39 @@ async function createLoginOtp(mobile) {
   // (and may be NULL). Keying the upsert on mobile (not email) keeps exactly one
   // live OTP row per technician and matches verifyLoginOtp's lookup, so techs
   // with no efr_email on file can still receive and verify an OTP.
-  const [[existing]] = await pool.query(
-    `SELECT id FROM otp_details
-      WHERE user_mobile_no = ? AND otp_type = 'Mobile App Otp'
-      ORDER BY id DESC
-      LIMIT 1`,
-    [mobile]
-  );
-  if (existing) {
-    await pool.query(
-      `UPDATE otp_details
-          SET otp = ?, generated_on = ?, valid_up_to = ?, is_expired = 0,
-              count = count + 1
-        WHERE id = ?`,
-      [otp, now, expires, existing.id]
+  // otp_details is legacy MyISAM (verified 2026-08-11), so a SQL transaction
+  // cannot serialize issue/resend against verify. A short DB named lock does:
+  // it is shared with verifyLoginOtp below and also prevents two first-time
+  // sends from inserting separate rows for the same mobile.
+  const otpLockName = `tech_login_otp_${mobile}`;
+  const issued = await withMysqlNamedLock(otpLockName, async (runner) => {
+    const [[existing]] = await runner.query(
+      `SELECT id FROM otp_details
+        WHERE user_mobile_no = ? AND otp_type = 'Mobile App Otp'
+        ORDER BY id DESC
+        LIMIT 1`,
+      [mobile]
     );
-  } else {
-    await pool.query(
-      `INSERT INTO otp_details (otp, otp_type, user_email, user_mobile_no, generated_on, valid_up_to, is_expired, count)
-       VALUES (?, 'Mobile App Otp', ?, ?, ?, ?, 0, 1)`,
-      [otp, tech ? tech.efr_email : null, mobile, now, expires]
-    );
+    if (existing) {
+      await runner.query(
+        `UPDATE otp_details
+            SET otp = ?, generated_on = ?, valid_up_to = ?, is_expired = 0,
+                count = count + 1
+          WHERE id = ?`,
+        [otp, now, expires, existing.id]
+      );
+    } else {
+      await runner.query(
+        `INSERT INTO otp_details (otp, otp_type, user_email, user_mobile_no, generated_on, valid_up_to, is_expired, count)
+         VALUES (?, 'Mobile App Otp', ?, ?, ?, ?, 0, 1)`,
+        [otp, tech ? tech.efr_email : null, mobile, now, expires]
+      );
+    }
+  }, pool, { timeoutSeconds: 5 });
+  if (!issued.acquired) {
+    const err = new Error('OTP request already in progress, please retry');
+    err.status = 409;
+    throw err;
   }
   if (process.env.NODE_ENV !== 'production') {
     logger.event('🔑', 'cyan',
@@ -250,20 +301,52 @@ async function createLoginOtp(mobile) {
   // (WhatsApp first, SMS fallback) applies — email is only used if they have
   // one on file and prefer email templates (rare).
   const { deliverOtp } = require('./otp-delivery.service');
-  await deliverOtp({
-    identifier: mobile,
-    email: tech ? tech.efr_email : null,
-    mobile,
-    name: tech ? tech.efr_name : null,
-    otp,
-    contextLabel: 'technician',
-  });
+  let delivery;
+  try {
+    delivery = await deliverOtp({
+      identifier: mobile,
+      email: tech ? tech.efr_email : null,
+      mobile,
+      name: tech ? tech.efr_name : null,
+      otp,
+      contextLabel: 'technician',
+    });
+  } catch (deliveryError) {
+    logger.error({ err: deliveryError.message }, 'Technician login OTP delivery crashed');
+    const err = new Error('OTP could not be delivered, please retry');
+    err.status = 503;
+    err.code = 'OTP_DELIVERY_FAILED';
+    throw err;
+  }
+
+  // NOTIFICATIONS_DISABLE is an intentional QA/dev suppression: the code is
+  // available in non-production logs, so those hosts must still advance. Every
+  // real host, however, may claim success only when at least one provider did.
+  const delivered = Boolean(delivery?.finalDelivered || delivery?.disabled);
+  if (!delivered) {
+    const attemptedChannels = Array.isArray(delivery?.attempts)
+      ? delivery.attempts.map((attempt) => attempt.channel).filter(Boolean)
+      : [];
+    logger.warn(
+      { attemptedChannels },
+      'Technician login OTP rejected because every delivery channel failed',
+    );
+    const err = new Error('OTP could not be delivered, please retry');
+    err.status = 503;
+    err.code = 'OTP_DELIVERY_FAILED';
+    throw err;
+  }
 
   // `found` stays TRUE for an unknown number: it reports "an OTP was delivered",
   // which the route surfaces as `delivered`. It never meant "this number is
   // already registered", and the app relies on it to advance to the OTP screen.
   logger.info('Technician login OTP issued · ' + (tech ? 'efr_id=' + tech.efr_id : 'new number'));
-  return { found: true, expiresAt: expires };
+  return {
+    found: true,
+    delivered: true,
+    expiresAt: expires,
+    resendInSeconds: OTP_RESEND_SECONDS,
+  };
 }
 
 /*
@@ -279,7 +362,7 @@ async function createLoginOtp(mobile) {
  * legitimate first-time technician, so it onboards here instead of being
  * rejected.
  */
-async function verifyLoginOtp(mobile, otp) {
+async function verifyLoginOtp(mobile, otp, { onVerifiedTech } = {}) {
   logger.info('Verify technician login OTP');
   // Match on (mobile, otp_type) ALONE. The mobile number is the real login
   // identity for technicians; user_email is stored purely informationally
@@ -299,7 +382,13 @@ async function verifyLoginOtp(mobile, otp) {
     return { ok: false, reason: 'NO_OTP_ISSUED' };
   }
   if (row.is_expired || new Date(row.valid_up_to).getTime() < Date.now()) {
-    await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
+    // Conditional expiry cannot invalidate a freshly re-issued code that won
+    // the issue/verify named lock after this stale read.
+    await pool.query(
+      `UPDATE otp_details SET is_expired = 1
+        WHERE id = ? AND otp = ? AND is_expired = 0 AND valid_up_to < NOW()`,
+      [row.id, row.otp],
+    );
     logger.warn('OTP verify failed · reason=OTP_EXPIRED');
     return { ok: false, reason: 'OTP_EXPIRED' };
   }
@@ -309,26 +398,69 @@ async function verifyLoginOtp(mobile, otp) {
   }
 
   /*
-   * OTP proven. NOW resolve identity — creating one only if this number is
-   * genuinely unknown across tbl_easyfixer (any status) and tbl_user.
-   *
-   * The OTP is consumed AFTER this, not before: if onboarding hits a transient
-   * error the technician can retry with the same code instead of being told to
-   * request a new one. The replay window that opens is bounded by the per-mobile
-   * GET_LOCK inside createStubTechnician, so two racing verifies still produce
-   * exactly one row (both then receive a token for the same efr_id).
+   * otp_details is MyISAM, so SELECT ... FOR UPDATE cannot protect it. The same
+   * per-mobile DB named lock used by issue/resend serializes all replicas here.
+   * Re-read under the lock, persist optional profile data, then atomically
+   * consume with an is_expired=0 predicate. Exactly one racing verify can
+   * observe+consume the code and receive a token.
    */
-  let tech = await findByMobile(mobile);
-  if (!tech) {
-    tech = await createStubTechnician(mobile);
-    if (!tech) {
-      logger.warn('OTP verified but no technician could be resolved or created');
-      return { ok: false, reason: 'ONBOARDING_FAILED' };
+  const locked = await withMysqlNamedLock(`tech_login_otp_${mobile}`, async (runner) => {
+    const [[current]] = await runner.query(
+      `SELECT id, otp, valid_up_to, is_expired FROM otp_details
+        WHERE id = ? AND user_mobile_no = ? AND otp_type = 'Mobile App Otp'
+        LIMIT 1`,
+      [row.id, mobile],
+    );
+    if (!current) return { ok: false, reason: 'NO_OTP_ISSUED' };
+    if (current.is_expired || new Date(current.valid_up_to).getTime() < Date.now()) {
+      return { ok: false, reason: 'OTP_EXPIRED' };
     }
-    logger.info('Onboarded new technician after OTP verification · efr_id=' + tech.efr_id);
+    if (Number(current.otp) !== Number(otp)) {
+      return { ok: false, reason: 'OTP_MISMATCH' };
+    }
+
+    // OTP proven. NOW resolve identity — creating only when the mobile is
+    // genuinely unknown across both legacy identity tables.
+    let tech = await findByMobile(mobile, runner);
+    if (!tech) {
+      tech = await createStubTechnician(mobile, runner);
+      if (!tech) return { ok: false, reason: 'ONBOARDING_FAILED' };
+      logger.info('Onboarded new technician after OTP verification · efr_id=' + tech.efr_id);
+    }
+
+    // Profile writes happen before consumption so a validation/DB failure
+    // leaves the OTP reusable. The hook receives this pinned connection; its
+    // InnoDB transaction commits while the named lock is still held.
+    if (typeof onVerifiedTech === 'function') {
+      await onVerifiedTech(tech, { runner });
+    }
+
+    const [consumed] = await runner.query(
+      `UPDATE otp_details SET is_expired = 1
+        WHERE id = ?
+          AND user_mobile_no = ?
+          AND otp_type = 'Mobile App Otp'
+          AND otp = ?
+          AND is_expired = 0
+          AND valid_up_to >= NOW()`,
+      [current.id, mobile, current.otp],
+    );
+    if (Number(consumed.affectedRows) !== 1) {
+      return { ok: false, reason: 'OTP_ALREADY_USED' };
+    }
+    return { ok: true, tech };
+  }, pool, { timeoutSeconds: 5 });
+
+  if (!locked.acquired) {
+    logger.warn('OTP verify failed · reason=OTP_VERIFICATION_BUSY');
+    return { ok: false, reason: 'OTP_VERIFICATION_BUSY' };
+  }
+  if (!locked.result.ok) {
+    logger.warn('OTP verify failed · reason=' + locked.result.reason);
+    return locked.result;
   }
 
-  await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
+  const { tech } = locked.result;
   const token = jwt.sign(
     { sub: `efr:${tech.efr_id}`, name: tech.efr_name, mobile: tech.efr_no },
     process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRY || '30d' });

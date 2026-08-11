@@ -74,6 +74,12 @@ router.use('/plivo', require('./plivo-answer'));
  */
 router.use('/app-version', require('./app-version'));
 /*
+ * Pre-login technician pincode resolver. UNAUTHENTICATED by necessity: R.03
+ * resolves Home Pincode before OTP verification. Safe because it returns only
+ * city/state catalogue labels, never writes/geocodes, and self-rate-limits.
+ */
+router.use('/pincodes', require('./pincodes'));
+/*
  * Marketing-site QR booking (2026-08-07). UNAUTHENTICATED BY DESIGN and the
  * only sub-router here that both WRITES and verifies no token — a customer
  * scanning a QR on product packaging has no prior identity to mint one

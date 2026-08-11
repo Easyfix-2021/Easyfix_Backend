@@ -17,7 +17,7 @@ const assert = require('node:assert/strict');
 const { installFakePool } = require('./helpers/fake-pool');
 
 const DEFAULTS = () => ({
-  verifyRows: [{ efr_id: 42 }],
+  verifyRows: [{ efr_id: 42, efr_status: 1, is_technician_verified: 1, efr_manager_id: null }],
   jobMeta: { job_id: 100, job_status: 0, fk_easyfixter_id: null },
   techRow: { efr_id: 42, efr_status: 1 },
 });
@@ -29,7 +29,7 @@ const fake = installFakePool(
     [/SHOW COLUMNS/i, []],
     [/efr_status FROM tbl_easyfixer WHERE efr_id = \?/, () => (scenario.techRow ? [scenario.techRow] : [])],
     [/SELECT job_id, job_status, fk_easyfixter_id/, () => (scenario.jobMeta ? [scenario.jobMeta] : [])],
-    [/is_technician_verified = 1/, () => scenario.verifyRows],
+    [/FROM tbl_easyfixer e\s+WHERE e\.efr_id IN/, () => scenario.verifyRows],
     // Force the legacy path: the offer-table existence probe throws → caught →
     // jobOfferTableExists() = false → assign() uses its own UPDATE tbl_job.
     [/FROM tbl_job_offer LIMIT 1/, () => { throw new Error('tbl_job_offer absent (test)'); }],

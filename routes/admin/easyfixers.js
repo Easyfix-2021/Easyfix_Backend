@@ -4,6 +4,7 @@ const Joi = require('joi');
 
 const validate = require('../../middleware/validate');
 const easyfixer = require('../../services/easyfixer.service');
+const lifecycle = require('../../services/easyfixer-lifecycle.service');
 const verification = require('../../services/easyfixer-verification.service');
 const profileUpdateLink = require('../../services/easyfixer-profile-update-link.service');
 const { signEasyfixerProfileToken } = require('../../utils/jwt');
@@ -13,7 +14,9 @@ const jobLocation = require('../../services/job-location.service');
 const { modernOk, modernError } = require('../../utils/response');
 const logger = require('../../logger');
 const {
-  listQuery, registeredListQuery, createBody, updateBody, statusBody, idParam, listSubresourceQuery, efrIdsBody,
+  listQuery, registeredListQuery, createBody, updateBody, statusBody,
+  lifecycleStatusBody, lifecycleHistoryQuery,
+  idParam, listSubresourceQuery, efrIdsBody,
   commentBody, leadVerificationBody, professionalBody, personalFamilyBody,
   bankingVerificationBody, identityVerificationBody, activationBody, mapClientsBody, bgvReportBody,
   optionMappingsBody, serviceablePincodesBody,
@@ -301,7 +304,7 @@ router.get('/:id', validate(idParam, 'params'), async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.post('/', validate(createBody), async (req, res, next) => {
+router.post('/', validate(createBody), requireAction('isAddNew'), async (req, res, next) => {
   try {
     logger.info('Create easyfixer · cityId=' + req.body.efr_cityId);
     // On create, the new row's city must be within the caller's scope.
@@ -314,7 +317,11 @@ router.post('/', validate(createBody), async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.put('/:id', validate(idParam, 'params'), validate(updateBody), async (req, res, next) => {
+router.put('/:id',
+  validate(idParam, 'params'),
+  validate(updateBody),
+  requireAction('isEdit'),
+  async (req, res, next) => {
   try {
     logger.info('Update easyfixer · id=' + req.params.id);
     const existing = await easyfixer.getById(req.params.id);
@@ -324,8 +331,8 @@ router.put('/:id', validate(idParam, 'params'), validate(updateBody), async (req
     const updated = await easyfixer.update(req.params.id, req.body, req.user);
     logger.info('Easyfixer updated · id=' + req.params.id);
     modernOk(res, updated, 'easyfixer updated');
-  } catch (e) { next(e); }
-});
+    } catch (e) { next(e); }
+  });
 
 // ─── Transaction List (sub-resource) ────────────────────────────────
 // Feeds the "Transaction List" modal on the Easyfixer detail page.
@@ -388,9 +395,10 @@ router.get('/:id/mapped-clients',
 router.patch('/:id/status',
   validate(idParam, 'params'),
   validate(statusBody),
+  requireAction('isEdit'),
   // "Only Admins can auto-activate technicians": scheduling an auto-reactivation
-  // (reactivationDate present) requires the Admin-only seeded action; a plain
-  // activate/deactivate stays open to the admin group.
+  // (reactivationDate present) additionally requires the Admin-only seeded
+  // action; every activate/deactivate mutation already requires isEdit above.
   (req, res, next) => (req.body && req.body.reactivationDate
     ? requireAction('isEasyfixerTempInactive')(req, res, next)
     : next()),
@@ -417,6 +425,64 @@ async function loadAndAuthorize(req, res) {
   if (!guard.ok) { modernError(res, 404, 'easyfixer not found'); return null; }
   return row;
 }
+
+// ─── Technician lifecycle (v5.1) ───────────────────────────────────
+// These additive endpoints coexist with PATCH /:id/status. Reads degrade to a
+// deterministic legacy-derived status before the pending migration is applied;
+// writes fail clearly instead of pretending an unaudited transition succeeded.
+const requireTemporaryInactivityAction = requireAction('isEasyfixerTempInactive');
+
+function requireScheduledLifecyclePermission(req, res, next) {
+  const status = req.body && req.body.status;
+  const isScheduled = status === 'SUSPENDED'
+    || (status === 'PAUSED' && typeof req.body.until === 'string' && req.body.until.length > 0);
+  return isScheduled ? requireTemporaryInactivityAction(req, res, next) : next();
+}
+
+router.get('/:id/lifecycle-status',
+  validate(idParam, 'params'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndAuthorize(req, res))) return;
+      modernOk(res, { lifecycle: await lifecycle.getLifecycle(req.params.id) });
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message, e.details);
+      next(e);
+    }
+  });
+
+router.put('/:id/lifecycle-status',
+  validate(idParam, 'params'),
+  validate(lifecycleStatusBody),
+  requireAction('isEdit'),
+  requireScheduledLifecyclePermission,
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndAuthorize(req, res))) return;
+      const result = await lifecycle.transition(
+        req.params.id,
+        { ...req.body, source: 'CRM' },
+        req.user,
+      );
+      modernOk(res, result, result.changed ? 'technician lifecycle updated' : 'technician lifecycle unchanged');
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message, e.details);
+      next(e);
+    }
+  });
+
+router.get('/:id/lifecycle-history',
+  validate(idParam, 'params'),
+  validate(lifecycleHistoryQuery, 'query'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndAuthorize(req, res))) return;
+      modernOk(res, await lifecycle.getHistory(req.params.id, req.query));
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message, e.details);
+      next(e);
+    }
+  });
 
 router.get('/:id/verification',
   validate(idParam, 'params'),

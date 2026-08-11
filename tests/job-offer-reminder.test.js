@@ -30,6 +30,7 @@ let props = {};
 let now = 0;                 // fake "NOW()" in ms
 let offer = null;            // the single in-memory tbl_job_offer row
 let job = null;              // the tbl_job row the EXISTS clause checks
+let technician = null;       // the tbl_easyfixer row the lifecycle gate checks
 let selects = 0;             // how many eligibility SELECTs the runner issued
 
 // Mirror of ELIGIBLE_SQL, evaluated against the params the runner actually
@@ -42,7 +43,13 @@ function eligible([afterMin, maxAgeMin, intervalMin]) {
   if (!(offer.last_reminded_at == null || offer.last_reminded_at <= now - intervalMin * MIN)) return false;
   // The EXISTS on tbl_job — the offer row alone never says whether the JOB is
   // still offerable (nothing closes offers when a job is cancelled/assigned).
-  return !!job && job.job_id === offer.job_id && job.job_status === 0 && job.fk_easyfixter_id == null;
+  const jobEligible = !!job && job.job_id === offer.job_id
+    && job.job_status === 0 && job.fk_easyfixter_id == null;
+  const technicianEligible = !!technician
+    && technician.efr_id === offer.fk_easyfixter_id
+    && technician.efr_status === 1
+    && technician.is_technician_verified === 1;
+  return jobEligible && technicianEligible;
 }
 
 const fake = installFakePool([
@@ -95,6 +102,7 @@ beforeEach(() => {
   offer = freshOffer();
   // The matching job: still BOOKED (0) and owner-less, i.e. genuinely offerable.
   job = { job_id: 100, job_status: 0, fk_easyfixter_id: null };
+  technician = { efr_id: 42, efr_status: 1, is_technician_verified: 1 };
   selects = 0;
 });
 
@@ -189,6 +197,24 @@ test('a job already assigned to someone else is never reminded (losing offers st
   assert.equal(r.claimed, 0);
 });
 
+test('a lifecycle-restricted technician is never selected or reminded', async () => {
+  await setProps(FLAGS_ON);
+  technician.efr_status = 0;
+  now += reminderCron.REMINDER_AFTER_MINUTES * MIN;
+
+  const r = await reminderCron.runOfferReminders();
+
+  assert.equal(r.eligible, 0);
+  assert.equal(r.claimed, 0);
+  assert.equal(offer.last_reminded_at, null);
+  const select = fake.calls.find((call) => (
+    /SELECT job_offer_id, job_id, fk_easyfixter_id/i.test(call.sql)
+  ));
+  assert.match(select.sql, /EXISTS \(SELECT 1 FROM tbl_easyfixer ef/i);
+  assert.match(select.sql, /ef\.efr_status = 1/i);
+  assert.match(select.sql, /ef\.is_technician_verified = 1/i);
+});
+
 test('an open, unanswered offer inside the window IS claimed and stamped', async () => {
   await setProps(FLAGS_ON);
   now += reminderCron.REMINDER_AFTER_MINUTES * MIN;
@@ -204,6 +230,7 @@ test('an open, unanswered offer inside the window IS claimed and stamped', async
   assert.match(claim.sql, /offer_status = 0/, 'claim re-checks the offer is still OPEN');
   assert.match(claim.sql, /last_reminded_at IS NULL OR last_reminded_at <= NOW\(\)/, 'claim re-checks the spacing');
   assert.match(claim.sql, /EXISTS \(SELECT 1 FROM tbl_job j/, 'claim re-checks the job is still offerable');
+  assert.match(claim.sql, /EXISTS \(SELECT 1 FROM tbl_easyfixer ef/, 'claim re-checks technician lifecycle eligibility');
   assert.equal(claim.params[0], 7, 'claim is scoped to the one offer row');
 });
 

@@ -74,6 +74,19 @@ router.post(
   },
 );
 
+// POST /registration/finalize — server-owned Gate-1 handoff. The app cannot
+// choose a lifecycle target: the backend re-checks all persisted gates under
+// the lifecycle lock and advances only when every required field is present.
+router.post('/finalize', async (req, res, next) => {
+  try {
+    logger.info('Onboarding Gate 1 finalization requested');
+    modernOk(res, await registration.finalizeGate1(req.tech.efr_id));
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message, e.details);
+    next(e);
+  }
+});
+
 // PATCH /language — persist the technician's preferred language (English NAME).
 router.patch(
   '/language',

@@ -1,5 +1,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
+const lifecycleService = require('./easyfixer-lifecycle.service');
 
 /*
  * Easyfixer (technician) CRUD.
@@ -31,8 +32,12 @@ const LIST_COLUMNS = `
   e.efr_no, e.efr_email, e.efr_cityId, c.city_name AS city_name,
   e.efr_status, e.efr_service_category, e.efr_service_type,
   e.efr_profile_perc, e.is_technician_verified,
+  e.scheduled_reactivation_date,
   e.final_submission, e.new_easy_fixer,
   e.user_id,
+  U.is_personal_detail_filled AS lifecycle_personal_submitted,
+  (e.adhaar_card_number IS NOT NULL AND e.adhaar_card_number <> '') AS lifecycle_aadhaar_present,
+  (e.efr_profile_img IS NOT NULL AND e.efr_profile_img <> '') AS lifecycle_photo_present,
   /*
    * Column-name mapping (2026-06-08). The legacy Java DAO reads
    * personalDetailsFilled / isIdentityDetailsVerified -- names without
@@ -139,7 +144,7 @@ const DETAIL_COLUMNS = `
 // supplied, the easyfixer list is row-filtered by `e.efr_cityId` against
 // scope.cities (and `mode='none'` short-circuits to zero rows).
 async function list({
-  q, cityId, serviceCategory, isVerified, status,
+  q, cityId, serviceCategory, isVerified, status, lifecycleStatus,
   scope,
   limit = 50, offset = 0, includeInactive = false,
   // Manage Easyfixers parity filters (2026-06-08)
@@ -150,6 +155,7 @@ async function list({
   sortBy = 'efr_id', sortDir = 'desc',
 } = {}) {
   logger.info('List easyfixers · status=' + status + ' cityId=' + cityId + ' q=' + (q || '') + ' limit=' + limit + ' offset=' + offset + ' sortBy=' + sortBy);
+  const lifecycleProjection = await lifecycleService.readProjection('e');
   const clauses = [];
   const params = [];
 
@@ -194,8 +200,10 @@ async function list({
   // (the Idle / Not-Eligible filters below don't otherwise constrain efr_status).
   // NOT (… <=> 3) is NULL-safe — genuine NULL-status rows are NOT dropped.
   clauses.push('NOT (e.efr_status <=> 3)');
-  if (status == null && !includeInactive) {
-    // Default: status=1 Active
+  if (status == null && !includeInactive && !lifecycleStatus) {
+    // Default: status=1 Active — but NOT when a lifecycle-status filter is set
+    // (a PAUSED/INACTIVE lifecycle row has efr_status=0, so the default Active
+    // clause would AND it away to zero results).
     clauses.push('e.is_technician_verified = 1 AND e.efr_status = 1');
   } else if (status === 1) {
     clauses.push('e.is_technician_verified = 1 AND e.efr_status = 1');
@@ -226,6 +234,16 @@ async function list({
                   AND (U.personal_details_filled = 1 OR U.personal_details_filled IS NULL)`);
   }
   // status === 0 → All → no clause added (returns every row)
+  // Optional v5.1 lifecycle-status filter (Manage Easyfixers Status dropdown).
+  // Lazy-required + schema-guarded so it's a safe no-op before the lifecycle
+  // migration adds the column (and avoids a circular import at module load).
+  if (lifecycleStatus) {
+    const { hasLifecycleSchema } = require('./easyfixer-lifecycle.service');
+    if (await hasLifecycleSchema()) {
+      clauses.push('e.lifecycle_status = ?');
+      params.push(lifecycleStatus);
+    }
+  }
   if (q) {
     clauses.push('(e.efr_name LIKE ? OR e.efr_no LIKE ? OR e.efr_email LIKE ?)');
     params.push(`%${q}%`, `%${q}%`, `%${q}%`);
@@ -444,7 +462,8 @@ async function list({
 
   params.push(Number(limit), Number(offset));
   const [rows] = await pool.query(
-    `SELECT ${LIST_COLUMNS}
+    `SELECT ${LIST_COLUMNS},
+            ${lifecycleProjection}
        ${LIST_JOINS}
        ${sortJoin}
        ${where}
@@ -452,8 +471,13 @@ async function list({
        LIMIT ? OFFSET ?`,
     params
   );
-  logger.info('Returning ' + rows.length + ' easyfixers · total=' + total);
-  return { rows, total };
+  const items = rows.map((row) => ({
+    ...row,
+    pause_count: Number(row.lifecycle_pause_count) || 0,
+    lifecycle: lifecycleService.lifecycleFromRow(row),
+  }));
+  logger.info('Returning ' + items.length + ' easyfixers · total=' + total);
+  return { rows: items, total };
 }
 
 // ─── Detail ─────────────────────────────────────────────────────────
@@ -498,8 +522,36 @@ const MUTABLE_COLUMNS = [
   'experience_id', 'user_id',
 ];
 
+function hasOwn(input, key) {
+  return Object.prototype.hasOwnProperty.call(input, key);
+}
+
+function effectiveVerificationFlag(value) {
+  return value === true || Number(value) === 1;
+}
+
+function assertGenericVerificationUnchanged(input, lockedRow) {
+  if (!hasOwn(input, 'is_technician_verified')) return;
+  if (effectiveVerificationFlag(input.is_technician_verified)
+      !== effectiveVerificationFlag(lockedRow.is_technician_verified)) {
+    const err = new Error(
+      'technician verification can only be changed through the verification activation flow',
+    );
+    err.status = 409;
+    throw err;
+  }
+}
+
 async function create(input, actor) {
   logger.info('Create easyfixer · name=' + (input.efr_name || '') + ' cityId=' + input.efr_cityId);
+  const lifecycleInstalled = await lifecycleService.hasLifecycleSchema();
+  if (lifecycleInstalled && effectiveVerificationFlag(input.is_technician_verified)) {
+    const err = new Error(
+      'a new technician must be activated through the verification activation flow',
+    );
+    err.status = 409;
+    throw err;
+  }
   // efr_no has NO unique index (duplicates exist in prod data — see header
   // note), so the duplicate check below is a check-then-insert race under
   // concurrency (e.g. a double-clicked create button). Serialise per efr_no
@@ -534,6 +586,10 @@ async function create(input, actor) {
     const columns = [];
     const values = [];
     for (const col of MUTABLE_COLUMNS) {
+      // Once lifecycle is authoritative, generic CRUD never writes this flag.
+      // A false checkbox value is treated as the unchanged default NULL so a
+      // newly created technician remains visible in the registration queue.
+      if (lifecycleInstalled && col === 'is_technician_verified') continue;
       if (input[col] !== undefined) {
         columns.push(col);
         values.push(input[col]);
@@ -567,24 +623,60 @@ async function update(id, input, actor) {
     throw err;
   }
 
+  const lifecycleInstalled = await lifecycleService.hasLifecycleSchema();
+  const ownsManagerMapping = hasOwn(input, 'efr_manager_id');
+  const ownsVerificationFlag = hasOwn(input, 'is_technician_verified');
   const sets = [];
   const values = [];
   for (const col of MUTABLE_COLUMNS) {
+    // Verification is a tri-state legacy field. After the lifecycle migration,
+    // the generic editor may echo its current checkbox value but must never
+    // write it. The comparison is made against the row lock below so a stale
+    // form cannot undo a concurrent activation or rejection.
+    if (lifecycleInstalled && col === 'is_technician_verified') continue;
     if (input[col] !== undefined) {
       sets.push(`${col} = ?`);
       values.push(input[col]);
     }
   }
-  if (sets.length === 0) return existing; // nothing to change
+  let updateSql = null;
+  if (sets.length > 0) {
+    sets.push('updated_by = ?', 'update_date = ?');
+    values.push(actor?.user_id || null, new Date());
+    values.push(id);
+    updateSql = `UPDATE tbl_easyfixer SET ${sets.join(', ')} WHERE efr_id = ?`;
+  }
 
-  sets.push('updated_by = ?', 'update_date = ?');
-  values.push(actor?.user_id || null, new Date());
-  values.push(id);
-
-  await pool.query(
-    `UPDATE tbl_easyfixer SET ${sets.join(', ')} WHERE efr_id = ?`,
-    values
-  );
+  // Always take the lifecycle row lock when either lifecycle-owned input is
+  // present. Do not decide from the earlier detail read: another request may
+  // change the manager mapping or verification flag before this transaction.
+  if (lifecycleInstalled && (ownsManagerMapping || ownsVerificationFlag)) {
+    await lifecycleService.transition(id, {
+      source: 'CRM',
+      reasonCode: 'MANAGER_MAPPING_UPDATED',
+      reason: 'Technician manager mapping updated',
+      metadata: {
+        profileUpdate: Boolean(updateSql),
+        managerMappingInput: ownsManagerMapping,
+      },
+      _resolveStatus: (row, current) => {
+        assertGenericVerificationUnchanged(input, row);
+        // Project the new mapping into the locked row before both target
+        // resolution and the lifecycle invariant run.
+        if (ownsManagerMapping) row.efr_manager_id = input.efr_manager_id || null;
+        return current.status === 'ACTIVE' || current.status === 'UNDER_MASTER'
+          ? lifecycleService.operationalStatusForManager(row)
+          : current.status;
+      },
+      _beforeUpdate: updateSql
+        ? (conn) => conn.query(updateSql, values)
+        : undefined,
+      _protectLifecycle: (current, target) => current.status === target,
+    }, actor);
+  } else {
+    if (!updateSql) return existing; // nothing to change
+    await pool.query(updateSql, values);
+  }
   logger.info('Easyfixer updated · id=' + id + ' fields=' + sets.length);
   return getById(id);
 }
@@ -623,6 +715,41 @@ async function setStatus(id, { active, reasonId, comment, reactivationDate }, ac
     const err = new Error('easyfixer not found');
     err.status = 404;
     throw err;
+  }
+
+  // Once the additive lifecycle schema exists, the legacy binary endpoint is
+  // only an adapter: all writes, audit rows, optimistic versioning and pushes
+  // flow through the lifecycle authority. This keeps old CRM builds working
+  // without creating a second status mutation path.
+  const hasLifecycle = await lifecycleService.hasLifecycleSchema();
+  if (hasLifecycle) {
+    const target = active
+      ? (Number(existing.efr_manager_id || 0) > 0 ? 'UNDER_MASTER' : 'ACTIVE')
+      : (reactivationDate ? 'SUSPENDED' : 'INACTIVE');
+    const reason = active
+      ? (comment || 'Activated from legacy status control')
+      : (comment || (reactivationDate
+        ? 'Temporarily suspended from legacy status control'
+        : 'Deactivated from legacy status control'));
+    await lifecycleService.transition(id, {
+      status: target,
+      reasonCode: reasonId ? `LEGACY_REASON_${reasonId}` : 'LEGACY_STATUS_TOGGLE',
+      reason,
+      until: reactivationDate || null,
+      source: 'LEGACY',
+      metadata: { legacyBinaryStatus: true },
+    }, actor);
+    return getById(id);
+  }
+
+  // A scheduled lift must be auditable and race-safe. Refuse to create a new
+  // temporary suspension before the lifecycle migration is installed; plain
+  // activate/deactivate keeps the exact legacy fallback for staged deploys.
+  if (reactivationDate) {
+    throw Object.assign(
+      new Error('technician lifecycle schema is required for scheduled reactivation'),
+      { status: 503 },
+    );
   }
 
   const hasReactCol = await hasReactivationColumn();
@@ -1094,6 +1221,8 @@ const REGISTERED_JOINS = `
   ) tb ON tb.efr_id = e.efr_id
   /* video_id=3 is unique per easyfixer (easyfixer_id+video_id key) → no fan-out. */
   LEFT JOIN easyfixer_watched_video wvd ON wvd.easyfixer_id = e.efr_id AND wvd.video_id = 3
+  /* One cached performance row per technician (PK lookup; no fan-out). */
+  LEFT JOIN tbl_efr_grade_snapshot egs ON egs.efr_id = e.efr_id
 `;
 
 const REGISTERED_SORTS = Object.freeze({
@@ -1103,11 +1232,69 @@ const REGISTERED_SORTS = Object.freeze({
   city:            'U.city',
 });
 
+async function loadRegisteredLifetimeEarnings(efrIds) {
+  const ids = Array.from(new Set(
+    efrIds.map(Number).filter((id) => Number.isInteger(id) && id > 0),
+  ));
+  if (!ids.length) return new Map();
+  const placeholders = ids.map(() => '?').join(',');
+  const [rows] = await pool.query(
+    `SELECT j.fk_easyfixter_id AS efr_id,
+            COALESCE(SUM(t.efr_charge), 0) AS lifetime_earnings
+       FROM tbl_job j
+       JOIN tbl_job_transaction t ON t.fk_job_id = j.job_id
+      WHERE j.fk_easyfixter_id IN (${placeholders})
+        AND j.job_status IN (3, 5)
+      GROUP BY j.fk_easyfixter_id`,
+    ids,
+  );
+  return new Map(rows.map((row) => [
+    Number(row.efr_id),
+    Number(row.lifetime_earnings) || 0,
+  ]));
+}
+
+// Durable re-application provenance moved from a denormalized column
+// (lifecycle_reapplication_count, now dropped) to the audit log: a technician
+// has re-applied iff a transition INTO REAPPLIED was ever recorded. A single
+// set-based EXISTS keeps this one indexed lookup per row on the registered queue
+// (which genuinely filters on provenance) rather than an application-level N+1;
+// idx_efr_lifecycle_history / uq_efr_lifecycle_version both lead with efr_id.
+const reappliedProvenanceExists = (alias = 'e') => `EXISTS (
+    SELECT 1 FROM tbl_easyfixer_lifecycle_status_log lrc
+     WHERE lrc.efr_id = ${alias}.efr_id AND lrc.to_status = 'REAPPLIED')`;
+
+function registeredReapplicationFields(row, lifecycle, lifetimeEarnings = 0) {
+  const isReapplication = lifecycle.status === 'REAPPLIED'
+    || lifecycle.reapplicationCount > 0;
+  return {
+    is_reapplication: isReapplication,
+    previous_efr_id: isReapplication ? Number(row.efr_id) : null,
+    lifetime_earnings: isReapplication ? (Number(lifetimeEarnings) || 0) : 0,
+  };
+}
+
 // Shared WHERE builder for the registered queue (list + count + export).
-function buildRegisteredWhere(f = {}, scope) {
+function buildRegisteredWhere(f = {}, scope, lifecycleInstalled = false) {
+  const onboardingLifecycleSql = [
+    'NEW',
+    'REGISTRATION_INCOMPLETE',
+    'TRAINING_PENDING',
+    'ASSESSMENT_FAILED',
+    'UNDER_VERIFICATION',
+    'VERIFICATION_REJECTED',
+    'REAPPLIED',
+    'APPLICATION_REJECTED',
+  ].map((status) => `'${status}'`).join(',');
   const clauses = [
-    '(e.new_easy_fixer IS NOT NULL OR e.is_existing_easyfixer IS NOT NULL)',
-    'e.is_technician_verified IS NULL',
+    lifecycleInstalled
+      ? `(e.new_easy_fixer IS NOT NULL OR e.is_existing_easyfixer IS NOT NULL
+          OR e.lifecycle_status IN (${onboardingLifecycleSql})
+          OR ${reappliedProvenanceExists('e')})`
+      : '(e.new_easy_fixer IS NOT NULL OR e.is_existing_easyfixer IS NOT NULL)',
+    lifecycleInstalled
+      ? "(e.is_technician_verified IS NULL OR e.lifecycle_status = 'REAPPLIED')"
+      : 'e.is_technician_verified IS NULL',
   ];
   const params = [];
 
@@ -1143,6 +1330,7 @@ function buildRegisteredWhere(f = {}, scope) {
     case 7: clauses.push("tb.beneficiary_id IS NOT NULL AND tb.beneficiary_id <> '' AND tb.easyfix_bank_name_id IS NOT NULL AND e.is_identity_details_verified_by_crm = 1"); break;
     case 8: clauses.push("e.send_back_to_tx_reason_crm IS NOT NULL AND e.is_identity_details_verified_by_crm = 2"); break;
     case 9: clauses.push("wvd.watched_percentage = 100 AND e.efr_profile_perc = 100 AND e.efr_profile_img IS NOT NULL AND e.is_identity_details_verified_by_crm IS NULL AND tb.beneficiary_id IS NULL AND tb.easyfix_bank_name_id IS NULL"); break;
+    case 10: clauses.push(lifecycleInstalled ? reappliedProvenanceExists('e') : '1=0'); break;
     default: break;
   }
 
@@ -1165,7 +1353,9 @@ function buildRegisteredWhere(f = {}, scope) {
 
 async function listRegistered(f = {}, scope) {
   logger.info('List registered easyfixers · registrationStatus=' + (f.registrationStatus || '') + ' q=' + (f.q || '') + ' limit=' + (f.limit || 20) + ' offset=' + (f.offset || 0));
-  const { where, params } = buildRegisteredWhere(f, scope);
+  const lifecycleInstalled = await lifecycleService.hasLifecycleSchema();
+  const lifecycleProjection = await lifecycleService.readProjection('e');
+  const { where, params } = buildRegisteredWhere(f, scope, lifecycleInstalled);
   const sortCol = REGISTERED_SORTS[f.sortBy] || 'U.insert_date';
   const sortDir = String(f.sortDir).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
   // Page-size ceiling: 500 for the interactive list (matches the Joi cap).
@@ -1178,6 +1368,11 @@ async function listRegistered(f = {}, scope) {
   const [rows] = await pool.query(`
     SELECT
       e.efr_id,
+      e.efr_status,
+      e.is_technician_verified,
+      e.efr_manager_id,
+      e.user_id,
+      e.scheduled_reactivation_date,
       U.insert_date                          AS registered_date,
       U.user_name                            AS name,
       e.efr_no                               AS mobile,
@@ -1190,6 +1385,9 @@ async function listRegistered(f = {}, scope) {
       e.is_existing_easyfixer                AS is_existing_easyfixer,
       e.new_easy_fixer                       AS new_easy_fixer,
       U.personal_details_filled              AS personal_details_filled,
+      U.is_personal_detail_filled            AS lifecycle_personal_submitted,
+      (e.adhaar_card_number IS NOT NULL AND e.adhaar_card_number <> '') AS lifecycle_aadhaar_present,
+      (e.efr_profile_img IS NOT NULL AND e.efr_profile_img <> '') AS lifecycle_photo_present,
       e.is_identity_details_verified_by_crm  AS is_identity_details_verified,
       e.send_back_to_tx_reason_crm           AS send_back_to_tx_reason_crm,
       e.efr_profile_img                      AS efr_profile_img,
@@ -1199,10 +1397,15 @@ async function listRegistered(f = {}, scope) {
       e.efr_pin_no                           AS efr_pin_no,
       e.efr_cityId                           AS efr_cityId,
       e.profile_activation_date_time         AS profile_activation_date_time,
+      e.current_balance                      AS wallet_balance,
+      egs.grade                              AS previous_performance_grade,
+      egs.completed_jobs                     AS previous_completed_jobs,
       wvd.watched_percentage                 AS watched_percentage,
       tb.beneficiary_id                      AS beneficiary_id,
       tb.easyfix_bank_name_id                AS easyfix_bank_name_id,
-      tb.efr_bank_acc_num                    AS efr_bank_acc_num
+      tb.efr_bank_acc_num                    AS efr_bank_acc_num,
+      ${lifecycleProjection},
+      ${lifecycleInstalled ? reappliedProvenanceExists('e') : '0'} AS lifecycle_reapplication_count
     ${REGISTERED_JOINS}
     ${where}
     ORDER BY ${sortCol} ${sortDir}, e.efr_id DESC
@@ -1214,11 +1417,38 @@ async function listRegistered(f = {}, scope) {
     params
   );
 
-  const items = rows.map((r) => ({
-    ...r,
-    registration_status_label: registrationStatusLabel(r),
-    early_activation_eligible: earlyActivationEligible(r),
-  }));
+  // Page-bounded aggregate: at most the already-limited row ids, using the
+  // same completed statuses and efr_charge definition as aggregates(). This
+  // avoids a correlated per-row scan and never aggregates the full roster.
+  const lifetimeEarnings = await loadRegisteredLifetimeEarnings(
+    rows
+      .filter((row) => (
+        row.lifecycle_status === 'REAPPLIED'
+        || Number(row.lifecycle_reapplication_count) > 0
+      ))
+      .map((row) => row.efr_id),
+  );
+
+  const items = rows.map((r) => {
+    const lifecycle = lifecycleService.lifecycleFromRow(r);
+    const reapplication = registeredReapplicationFields(
+      r,
+      lifecycle,
+      lifetimeEarnings.get(Number(r.efr_id)),
+    );
+    return {
+      ...r,
+      pause_count: Number(r.lifecycle_pause_count) || 0,
+      lifecycle,
+      ...reapplication,
+      // Re-application deliberately reuses the same technician account so
+      // wallet/history ownership remains intact; this is the previous Tx ID.
+      registration_status_label: lifecycle.status === 'REAPPLIED'
+        ? 'Re-application'
+        : registrationStatusLabel(r),
+      early_activation_eligible: earlyActivationEligible(r),
+    };
+  });
   logger.info('Returning ' + items.length + ' registered easyfixers · total=' + (Number(total) || 0));
   return { rows: items, total: Number(total) || 0 };
 }
@@ -1242,7 +1472,11 @@ async function listRegisteredForExport(f = {}, scope, cap = 10000) {
 //   pending_member_verification=9.
 async function registeredStatusCounts(scope) {
   logger.info('Compute registered easyfixer status counts');
-  const { where, params } = buildRegisteredWhere({}, scope);
+  const lifecycleInstalled = await lifecycleService.hasLifecycleSchema();
+  const { where, params } = buildRegisteredWhere({}, scope, lifecycleInstalled);
+  const reapplicationCountSql = lifecycleInstalled
+    ? `SUM(CASE WHEN ${reappliedProvenanceExists('e')} THEN 1 ELSE 0 END)`
+    : '0';
   const [[row]] = await pool.query(`
     SELECT
       SUM(CASE WHEN U.pin_code IS NOT NULL AND U.user_name IS NOT NULL AND U.personal_details_filled IS NULL AND e.is_identity_details_verified_by_crm IS NULL AND U.city IS NOT NULL THEN 1 ELSE 0 END) AS new_lead,
@@ -1253,6 +1487,7 @@ async function registeredStatusCounts(scope) {
       SUM(CASE WHEN tb.beneficiary_id IS NOT NULL AND tb.beneficiary_id <> '' AND tb.easyfix_bank_name_id IS NOT NULL AND e.is_identity_details_verified_by_crm = 1 THEN 1 ELSE 0 END) AS activation_pending,
       SUM(CASE WHEN e.send_back_to_tx_reason_crm IS NOT NULL AND e.is_identity_details_verified_by_crm = 2 THEN 1 ELSE 0 END) AS not_suitable,
       SUM(CASE WHEN wvd.watched_percentage = 100 AND e.efr_profile_perc = 100 AND e.efr_profile_img IS NOT NULL AND e.is_identity_details_verified_by_crm IS NULL AND tb.beneficiary_id IS NULL AND tb.easyfix_bank_name_id IS NULL THEN 1 ELSE 0 END) AS pending_member_verification,
+      ${reapplicationCountSql} AS reapplications,
       COUNT(*) AS total
     ${REGISTERED_JOINS}
     ${where}
@@ -1267,6 +1502,7 @@ async function registeredStatusCounts(scope) {
     activation_pending:          Number(row.activation_pending) || 0,
     not_suitable:                Number(row.not_suitable) || 0,
     pending_member_verification: Number(row.pending_member_verification) || 0,
+    reapplications:              Number(row.reapplications) || 0,
     total:                       Number(row.total) || 0,
   };
 }
@@ -1288,4 +1524,10 @@ module.exports = {
   attendance,
   statusCounts,
   MUTABLE_COLUMNS,
+  _internals: {
+    buildRegisteredWhere,
+    registeredReapplicationFields,
+    effectiveVerificationFlag,
+    assertGenericVerificationUnchanged,
+  },
 };

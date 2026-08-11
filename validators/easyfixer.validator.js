@@ -1,4 +1,5 @@
 const Joi = require('joi');
+const { LIFECYCLE_STATUSES } = require('../services/easyfixer-lifecycle.service');
 
 const mobile = Joi.string().pattern(/^[0-9]{10}$/);
 const gpsPair = Joi.string().pattern(/^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/);
@@ -25,6 +26,9 @@ const listQuery = Joi.object({
    * 4 underlying columns per EasyfixerDaoImpl.java#475-505).
    */
   status: Joi.number().integer().valid(0, 1, 2, 3, 4, 5, 6).optional(),
+  // Filter the roster by the v5.1 lifecycle status (e.g. PAUSED, BLACKLISTED).
+  // Distinct from the legacy numeric `status` buckets above.
+  lifecycleStatus: Joi.string().valid(...LIFECYCLE_STATUSES).optional(),
   includeInactive: Joi.boolean().default(false),
   limit: Joi.number().integer().min(1).max(500).default(50),
   offset: Joi.number().integer().min(0).default(0),
@@ -114,7 +118,11 @@ const createBody = Joi.object({
 const updateBody = createBody.fork(
   ['efr_name', 'efr_no', 'efr_cityId', 'efr_service_category', 'efr_service_type'],
   (schema) => schema.optional()
-).min(1); // require at least one field
+).keys({
+  // 0/null explicitly removes an existing master mapping on edit; create still
+  // requires a positive id when a manager is supplied.
+  efr_manager_id: Joi.number().integer().min(0).allow(null).optional(),
+}).min(1); // require at least one field
 
 const statusBody = Joi.object({
   active:    Joi.boolean().required(),
@@ -125,6 +133,21 @@ const statusBody = Joi.object({
   // date. Kept a plain date string (no Joi.date() Date coercion) so it stores
   // verbatim into the DATE column with no timezone drift. Admins-only at the route.
   reactivationDate: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).when('active', { is: false, then: Joi.optional(), otherwise: Joi.forbidden() }),
+});
+
+const lifecycleStatusBody = Joi.object({
+  status: Joi.string().valid(...LIFECYCLE_STATUSES).required(),
+  reasonCode: Joi.string().trim().max(80).allow('', null).optional(),
+  reason: Joi.string().trim().max(500).allow('', null).optional(),
+  // DATE, not timestamp: remediation/suspension lifts are calendar-day based
+  // in IST. Keep the string verbatim to avoid timezone coercion.
+  until: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).allow(null).optional(),
+  expectedVersion: Joi.number().integer().min(0).optional(),
+});
+
+const lifecycleHistoryQuery = Joi.object({
+  limit: Joi.number().integer().min(1).max(100).default(50),
+  offset: Joi.number().integer().min(0).default(0),
 });
 
 const idParam = Joi.object({
@@ -195,7 +218,11 @@ const bankingVerificationBody = Joi.object({
 
 const identityVerificationBody = Joi.object({
   verification_status:  Joi.number().integer().valid(1, 2).optional(),
-  rejected_reason:      Joi.string().max(2000).allow('', null).optional(),
+  rejected_reason:      Joi.string().trim().max(2000).when('verification_status', {
+    is: 2,
+    then: Joi.string().trim().min(1).max(2000).required(),
+    otherwise: Joi.allow('', null).optional(),
+  }),
   adhaar_card_number:   Joi.string().pattern(/^[0-9]{12}$/).optional(),
   pan_card_number:      Joi.string().pattern(/^[A-Z]{5}[0-9]{4}[A-Z]$/i).optional(),
   progress:             Joi.number().integer().min(0).max(100).optional(),
@@ -256,14 +283,15 @@ const serviceablePincodesBody = Joi.object({
  * Registered Easyfixers queue (parity port of legacy efer-registration).
  *   registrationStatus: 1 New Lead · 2 In Progress · 3 Details Not Available ·
  *     5 Not Eligible · 6 Send To Finance · 7 Activation Pending ·
- *     8 Not Suitable · 9 Pending Member Verification (4 "Completed" unused).
+ *     8 Not Suitable · 9 Pending Member Verification · 10 Re-application
+ *     (4 "Completed" unused).
  *   easyfixerType: 0 all · 1 already-existing · 2 new.
  *   q: length-routed search (6→pincode, 10→mobile, ≤4 digits→id, else name/mobile).
  * Default page size 20 (legacy parity); default sort registered_date DESC.
  */
 const registeredListQuery = Joi.object({
   q:                  Joi.string().max(100).optional().allow(''),
-  registrationStatus: Joi.number().integer().valid(1, 2, 3, 5, 6, 7, 8, 9).optional(),
+  registrationStatus: Joi.number().integer().valid(1, 2, 3, 5, 6, 7, 8, 9, 10).optional(),
   easyfixerType:      Joi.number().integer().valid(0, 1, 2).optional(),
   dateFrom:           Joi.date().iso().optional(),
   dateTo:             Joi.date().iso().optional(),
@@ -275,7 +303,9 @@ const registeredListQuery = Joi.object({
 });
 
 module.exports = {
-  listQuery, registeredListQuery, createBody, updateBody, statusBody, idParam, listSubresourceQuery, efrIdsBody,
+  listQuery, registeredListQuery, createBody, updateBody, statusBody,
+  lifecycleStatusBody, lifecycleHistoryQuery,
+  idParam, listSubresourceQuery, efrIdsBody,
   commentBody, leadVerificationBody, professionalBody, personalFamilyBody,
   bankingVerificationBody, identityVerificationBody, activationBody,
   mapClientsBody, bgvReportBody, optionMappingsBody, serviceablePincodesBody,
