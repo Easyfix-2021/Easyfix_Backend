@@ -21,6 +21,7 @@ const {
   requireTechJobMutationCapability,
 } = require('../../middleware/require-tech-lifecycle-capability');
 const { otpFailureHttpStatus } = require('./otp-http-status');
+const { upsertEasyfixerDocuments } = require('../../services/easyfixer-document.service');
 
 const mobile = Joi.string().pattern(/^[0-9]{10}$/);
 
@@ -318,6 +319,10 @@ router.use('/notices', require('./notices'));
 
 // My Team — the authed technician's downline (efr_manager_id). Mobile-only.
 router.use('/team', require('./team'));
+
+// Registration Identity save is isolated so its atomic name+Aadhaar contract
+// and authoritative duplicate handling can be route-tested independently.
+router.use('/profile', require('./profile-identity'));
 
 // Technician order-lifecycle + estimate sub-routers (NEW 2026-06-15, mobile-only
 // — no CRM overlap). MOUNTED BEFORE the inline `/jobs` + `/jobs/:id` handlers
@@ -941,35 +946,12 @@ router.get('/profile/percentage', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// Upsert per-document rows into tbl_easyfixer_document (one row per efr_doc_type_id;
-// `rows` = array of [docTypeId, key], null/empty keys skipped). The table has NO
-// UNIQUE(efr_id, efr_doc_type_id) and schema changes are forbidden here, so callers
-// MUST hold a per-technician GET_LOCK across the surrounding transaction (see the
-// personal/identity handlers) — otherwise two concurrent SELECT-then-INSERT saves
-// (e.g. an offline-retry racing the live save) can insert duplicate (efr_id, type)
-// rows that the CRM doc view can't disambiguate.
 // tbl_address is a SHARED/polymorphic table (job rows + technician-personal rows)
 // and its column set can drift across deploys, so we probe the live columns once
 // and only ever write the ones that actually exist. Resolves the `city` vs
 // `city1` ambiguity automatically. Probe lives in address.service — every
 // tbl_address writer needs it.
 const addressColumns = () => addressService.addressColumnSet(pool);
-
-async function upsertEasyfixerDocuments(conn, efrId, rows) {
-  for (const [typeId, key] of rows) {
-    if (!key) continue;
-    const [[ex]] = await conn.query(
-      'SELECT efr_doc_id FROM tbl_easyfixer_document WHERE efr_id = ? AND efr_doc_type_id = ? LIMIT 1',
-      [efrId, typeId]);
-    if (ex) {
-      await conn.query('UPDATE tbl_easyfixer_document SET efr_document_name = ? WHERE efr_doc_id = ?', [key, ex.efr_doc_id]);
-    } else {
-      await conn.query(
-        'INSERT INTO tbl_easyfixer_document (efr_id, efr_doc_type_id, efr_document_name, created_date, created_by) VALUES (?, ?, ?, NOW(), ?)',
-        [efrId, typeId, key, efrId]);
-    }
-  }
-}
 
 // Personal-details — the profile-progression "personal" section (Flutter
 // `profilePersonalDetails`). Widened from the original name/marital-only save to
@@ -1333,74 +1315,6 @@ router.post('/profile/contact-info', validate(Joi.object({
     logger.info('Contact-info address saved · mode=' + (existing ? 'update' : 'insert'));
     modernOk(res, { updated: true });
   } catch (e) { next(e); }
-});
-
-// Identity step. Persists Aadhaar/PAN numbers + (on DigiLocker mismatch-accept)
-// name/DOB + the driving-licence flag on tbl_easyfixer, and the uploaded doc
-// keys as tbl_easyfixer_document rows. Doc-type ids (tbl_document_type): 13=Aadhaar
-// Front, 14=Aadhaar Back, 3=PAN, 12=Driving Licence. NEVER sets
-// is_identity_details_verified_by_crm — that is CRM-owned. Accepts both the app's
-// `aadhaarNumber/panNumber` and the legacy `aadhaar/pan` aliases.
-router.post('/profile/identity-details', validate(Joi.object({
-  aadhaarNumber: Joi.string().pattern(/^[0-9]{12}$/).optional(),
-  aadhaar: Joi.string().pattern(/^[0-9]{12}$/).optional(),
-  panNumber: Joi.string().pattern(/^[A-Za-z]{5}[0-9]{4}[A-Za-z]$/).optional(),
-  pan: Joi.string().pattern(/^[A-Za-z]{5}[0-9]{4}[A-Za-z]$/).optional(),
-  firstName: Joi.string().trim().max(255).optional(),
-  lastName: Joi.string().trim().max(255).optional(),
-  dob: Joi.string().trim().max(40).optional(),
-  haveDrivingLicence: Joi.boolean().optional(),
-  docs: Joi.object({
-    aadhaarFront: Joi.string().trim().max(255).optional(),
-    aadhaarBack: Joi.string().trim().max(255).optional(),
-    pan: Joi.string().trim().max(255).optional(),
-    drivingLicence: Joi.string().trim().max(255).optional(),
-  }).optional(),
-}).min(1)), async (req, res, next) => {
-  const efrId = req.tech.efr_id;
-  const lockKey = `efr_doc:${efrId}`;                 // serialize doc upserts per tech (no UNIQUE in schema)
-  const conn = await pool.getConnection();
-  try {
-    logger.info('Save identity-details profile section');
-    const b = req.body;
-    const aadhaar = b.aadhaarNumber || b.aadhaar || null;
-    const pan = (b.panNumber || b.pan) ? String(b.panNumber || b.pan).toUpperCase() : null;
-    const dl = b.haveDrivingLicence === undefined ? null : (b.haveDrivingLicence ? 1 : 0);
-    // Identity is "complete" once the Aadhaar number is captured (PAN is optional on
-    // the app). A name/DOB-only save (DigiLocker mismatch-accept before the number
-    // lands) must NOT flip the section to 100%.
-    const identityComplete = !!aadhaar;
-
-    await conn.query('SELECT GET_LOCK(?, 10)', [lockKey]);
-    await conn.beginTransaction();
-    await conn.query(
-      `UPDATE tbl_easyfixer
-          SET adhaar_card_number    = COALESCE(?, adhaar_card_number),
-              pan_card_number       = COALESCE(?, pan_card_number),
-              efr_first_name        = COALESCE(?, efr_first_name),
-              efr_last_name         = COALESCE(?, efr_last_name),
-              date_of_birth         = COALESCE(?, date_of_birth),
-              have_driving_lisence  = COALESCE(?, have_driving_lisence),
-              efr_identity_details_perc = COALESCE(?, efr_identity_details_perc)
-        WHERE efr_id = ?`,
-      [aadhaar, pan, b.firstName || null, b.lastName || null, b.dob || null, dl,
-       identityComplete ? 100 : null, efrId]);
-
-    const docs = b.docs || {};
-    await upsertEasyfixerDocuments(conn, efrId,
-      [[13, docs.aadhaarFront], [14, docs.aadhaarBack], [3, docs.pan], [12, docs.drivingLicence]]);
-
-    await conn.commit();
-    logger.info('Identity-details saved · complete=' + identityComplete);
-    modernOk(res, { updated: true });
-  } catch (e) {
-    logger.warn('Save identity-details failed · ' + e.message);
-    try { await conn.rollback(); } catch (_) { /* ignore */ }
-    next(e);
-  } finally {
-    try { await conn.query('SELECT RELEASE_LOCK(?)', [lockKey]); } catch (_) { /* lock auto-frees on release */ }
-    conn.release();
-  }
 });
 
 router.get('/bank-details', async (req, res, next) => {

@@ -1,6 +1,7 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const lifecycleService = require('./easyfixer-lifecycle.service');
+const { mapAadhaarUniqueViolation } = require('../utils/aadhaar-uniqueness');
 
 /*
  * Easyfixer (technician) CRUD.
@@ -606,6 +607,8 @@ async function create(input, actor) {
     );
     logger.info('Easyfixer created · id=' + result.insertId);
     return getById(result.insertId);
+  } catch (error) {
+    throw mapAadhaarUniqueViolation(error);
   } finally {
     try { await conn.query('SELECT RELEASE_LOCK(?)', [lockName]); } catch (_) { /* connection teardown releases it anyway */ }
     conn.release();
@@ -650,32 +653,36 @@ async function update(id, input, actor) {
   // Always take the lifecycle row lock when either lifecycle-owned input is
   // present. Do not decide from the earlier detail read: another request may
   // change the manager mapping or verification flag before this transaction.
-  if (lifecycleInstalled && (ownsManagerMapping || ownsVerificationFlag)) {
-    await lifecycleService.transition(id, {
-      source: 'CRM',
-      reasonCode: 'MANAGER_MAPPING_UPDATED',
-      reason: 'Technician manager mapping updated',
-      metadata: {
-        profileUpdate: Boolean(updateSql),
-        managerMappingInput: ownsManagerMapping,
-      },
-      _resolveStatus: (row, current) => {
-        assertGenericVerificationUnchanged(input, row);
-        // Project the new mapping into the locked row before both target
-        // resolution and the lifecycle invariant run.
-        if (ownsManagerMapping) row.efr_manager_id = input.efr_manager_id || null;
-        return current.status === 'ACTIVE' || current.status === 'UNDER_MASTER'
-          ? lifecycleService.operationalStatusForManager(row)
-          : current.status;
-      },
-      _beforeUpdate: updateSql
-        ? (conn) => conn.query(updateSql, values)
-        : undefined,
-      _protectLifecycle: (current, target) => current.status === target,
-    }, actor);
-  } else {
-    if (!updateSql) return existing; // nothing to change
-    await pool.query(updateSql, values);
+  try {
+    if (lifecycleInstalled && (ownsManagerMapping || ownsVerificationFlag)) {
+      await lifecycleService.transition(id, {
+        source: 'CRM',
+        reasonCode: 'MANAGER_MAPPING_UPDATED',
+        reason: 'Technician manager mapping updated',
+        metadata: {
+          profileUpdate: Boolean(updateSql),
+          managerMappingInput: ownsManagerMapping,
+        },
+        _resolveStatus: (row, current) => {
+          assertGenericVerificationUnchanged(input, row);
+          // Project the new mapping into the locked row before both target
+          // resolution and the lifecycle invariant run.
+          if (ownsManagerMapping) row.efr_manager_id = input.efr_manager_id || null;
+          return current.status === 'ACTIVE' || current.status === 'UNDER_MASTER'
+            ? lifecycleService.operationalStatusForManager(row)
+            : current.status;
+        },
+        _beforeUpdate: updateSql
+          ? (conn) => conn.query(updateSql, values)
+          : undefined,
+        _protectLifecycle: (current, target) => current.status === target,
+      }, actor);
+    } else {
+      if (!updateSql) return existing; // nothing to change
+      await pool.query(updateSql, values);
+    }
+  } catch (error) {
+    throw mapAadhaarUniqueViolation(error);
   }
   logger.info('Easyfixer updated · id=' + id + ' fields=' + sets.length);
   return getById(id);

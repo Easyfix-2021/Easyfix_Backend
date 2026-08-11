@@ -3,6 +3,7 @@ const deepSkillService = require('./deep-skill.service');
 const logger = require('../logger');
 const registrationStatusPush = require('./registration-status-push.service');
 const lifecycle = require('./easyfixer-lifecycle.service');
+const { mapAadhaarUniqueViolation } = require('../utils/aadhaar-uniqueness');
 
 /*
  * Easyfixer Verification — service backing the "Self-Registration
@@ -555,29 +556,33 @@ async function applyIdentityMutation(db, efrId, body, actor) {
 async function saveIdentity(efrId, body, actor) {
   logger.info('Save identity verification · efrId=' + efrId + ' · verification_status=' + body.verification_status);
   const status = Number(body.verification_status);
-  if (status === 1 || status === 2) {
-    const installed = await lifecycle.hasLifecycleSchema();
-    if (installed) {
-      await lifecycle.syncFromVerificationFlagsAtomic(efrId, {
-        ...(status === 2
-          ? {
-            status: 'VERIFICATION_REJECTED',
-            reasonCode: 'IDENTITY_VERIFICATION_REJECTED',
-            reason: body.rejected_reason || 'Identity verification rejected',
-          }
-          : {
-            reasonCode: 'IDENTITY_VERIFICATION_APPROVED',
-            reason: 'Identity verification approved',
-          }),
-        projectedRow: { is_identity_details_verified_by_crm: status },
-        mutate: (conn) => applyIdentityMutation(conn, efrId, body, actor),
-      }, actor);
+  try {
+    if (status === 1 || status === 2) {
+      const installed = await lifecycle.hasLifecycleSchema();
+      if (installed) {
+        await lifecycle.syncFromVerificationFlagsAtomic(efrId, {
+          ...(status === 2
+            ? {
+              status: 'VERIFICATION_REJECTED',
+              reasonCode: 'IDENTITY_VERIFICATION_REJECTED',
+              reason: body.rejected_reason || 'Identity verification rejected',
+            }
+            : {
+              reasonCode: 'IDENTITY_VERIFICATION_APPROVED',
+              reason: 'Identity verification approved',
+            }),
+          projectedRow: { is_identity_details_verified_by_crm: status },
+          mutate: (conn) => applyIdentityMutation(conn, efrId, body, actor),
+        }, actor);
+      } else {
+        await applyIdentityMutation(pool, efrId, body, actor);
+        registrationStatusPush.notifyRegistrationStatusChanged(efrId).catch(() => {});
+      }
     } else {
       await applyIdentityMutation(pool, efrId, body, actor);
-      registrationStatusPush.notifyRegistrationStatusChanged(efrId).catch(() => {});
     }
-  } else {
-    await applyIdentityMutation(pool, efrId, body, actor);
+  } catch (error) {
+    throw mapAadhaarUniqueViolation(error);
   }
   logger.info('Identity verification updated · efrId=' + efrId + ' · status=' + status);
   return getVerificationPage(efrId);
@@ -1069,7 +1074,9 @@ async function replaceOptionMappings(efrId, items, actor, externalConn = null) {
  * Per-easyfixer set of pincodes the technician will accept jobs in.
  * Schema (2026-06-10): single row per easyfixer with a `pincodes` TEXT
  * column holding the CSV of pincode strings directly. PK is easyfixer_id —
- * so INSERT … ON DUPLICATE KEY UPDATE is atomic and needs no transaction.
+ * the CSV itself is a single idempotent upsert. A short transaction also
+ * covers catalogue resolution and the immediate pincode-status activation;
+ * callers already holding a transaction inject their connection.
  *
  * The FE still talks in pincode IDs (it sources them from the
  * /shared/lookup/pincodes catalogue). On write we resolve IDs → pincode
@@ -1110,9 +1117,24 @@ async function listServiceablePincodes(efrId) {
   return { items };
 }
 
-async function replaceServiceablePincodes(efrId, pincodeIds, actor, externalConn = null) {
+async function replaceServiceablePincodesOnRunner(
+  efrId,
+  pincodeIds,
+  actor,
+  db,
+  { representation = 'id' } = {},
+) {
+  if (representation !== 'id' && representation !== 'value') {
+    const error = new Error('serviceable pincode representation must be id or value');
+    error.status = 400;
+    throw error;
+  }
   const list = Array.isArray(pincodeIds)
-    ? Array.from(new Set(pincodeIds.map(Number).filter((n) => Number.isInteger(n) && n > 0)))
+    ? Array.from(new Set(
+      representation === 'value'
+        ? pincodeIds.map((value) => String(value).trim()).filter((value) => /^\d{6}$/.test(value))
+        : pincodeIds.map(Number).filter((value) => Number.isInteger(value) && value > 0),
+    ))
     : [];
   logger.info('Replace serviceable pincodes · efrId=' + efrId + ' · requested=' + list.length);
   // created_by / updated_by: the CRM path passes a staff `actor` (its user_id);
@@ -1121,21 +1143,17 @@ async function replaceServiceablePincodes(efrId, pincodeIds, actor, externalConn
   // updated_by are plain INT NULL with no FK, so an efr_id is safe here; the
   // created_date/updated_date columns auto-populate via DB defaults.)
   const userId = actor?.user_id || efrId;
-  // Single-statement upsert — no begin/commit here. When an external
-  // connection is injected we run on it so the write joins the caller's txn.
-  const db = externalConn || pool;
-  // Resolve pincode IDs → pincode strings (the schema stores CSV of strings,
-  // not IDs). Dedupe + join. Empty list ⇒ persist empty CSV (legitimate clear).
-  // The WHERE clause matches on EITHER pincode_id PK (normal FE path) OR the
-  // 6-digit pincode value itself (Swagger / direct-API callers), so both
-  // representations resolve correctly.
+  // Resolve one explicit representation into pincode strings (the schema
+  // stores CSV values, not IDs). Never OR pincode_id and pincode together: a
+  // six-digit PIN can also be an unrelated row's numeric primary key.
   let csv = '';
   let resolvedCount = 0;
   if (list.length) {
     const placeholders = list.map(() => '?').join(',');
+    const lookupColumn = representation === 'value' ? 'pincode' : 'pincode_id';
     const [rows] = await db.query(
-      `SELECT pincode FROM tbl_pincode WHERE pincode_id IN (${placeholders}) OR pincode IN (${placeholders})`,
-      [...list, ...list]
+      `SELECT DISTINCT pincode FROM tbl_pincode WHERE ${lookupColumn} IN (${placeholders})`,
+      list,
     );
     const resolved = Array.from(new Set(rows.map((r) => String(r.pincode)).filter(Boolean)));
     csv = resolved.join(',');
@@ -1149,7 +1167,7 @@ async function replaceServiceablePincodes(efrId, pincodeIds, actor, externalConn
       err.statusCode = 400;
       throw err;
     }
-    // Partial resolution: some supplied ids matched no pincode (by PK or value).
+    // Partial resolution: some supplied identifiers matched no pincode.
     // Persist the ones that did, but warn so catalogue drift stays visible.
     if (resolvedCount < list.length) {
       logger.warn(
@@ -1174,15 +1192,45 @@ async function replaceServiceablePincodes(efrId, pincodeIds, actor, externalConn
   // Runs on `db` (externalConn or pool) to stay inside the caller's txn.
   if (list.length) {
     const placeholders = list.map(() => '?').join(',');
+    const lookupColumn = representation === 'value' ? 'pincode' : 'pincode_id';
     await db.query(
       `UPDATE tbl_pincode SET pincode_status = 1
-         WHERE (pincode_id IN (${placeholders}) OR pincode IN (${placeholders}))
+         WHERE ${lookupColumn} IN (${placeholders})
            AND pincode_status = 0`,
-      [...list, ...list]
+      list,
     );
   }
   logger.info('Serviceable pincodes replaced · efrId=' + efrId + ' · updated=' + resolvedCount);
   return { updated: resolvedCount };
+}
+
+async function replaceServiceablePincodes(
+  efrId,
+  pincodeIds,
+  actor,
+  externalConn = null,
+  options = {},
+) {
+  // A caller-provided connection already owns the surrounding transaction
+  // (CRM profile submit and mobile work-area use this path). Never nest or
+  // commit it here. Standalone callers receive one short transaction covering
+  // catalogue resolution, CSV replacement, and the serviceability flip.
+  if (externalConn) {
+    return replaceServiceablePincodesOnRunner(efrId, pincodeIds, actor, externalConn, options);
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const result = await replaceServiceablePincodesOnRunner(efrId, pincodeIds, actor, conn, options);
+    await conn.commit();
+    return result;
+  } catch (error) {
+    try { await conn.rollback(); } catch (_) { /* retain original failure */ }
+    throw error;
+  } finally {
+    conn.release();
+  }
 }
 
 // ─── BGV upload (stub) ──────────────────────────────────────────────

@@ -6,6 +6,23 @@ const { modernOk, modernError } = require('../../utils/response');
 const registration = require('../../services/mobile-registration.service');
 const logger = require('../../logger');
 
+const workAreaSchema = Joi.object({
+  // Optional so a brand-new technician can complete Work Area before Identity;
+  // when present it reuses the canonical personal-details name writer.
+  name: Joi.string().trim().min(1).max(150).optional(),
+  homePincode: Joi.string().trim().pattern(/^[0-9]{6}$/).required(),
+  pincodes: Joi.array()
+    .items(Joi.string().trim().pattern(/^[0-9]{6}$/))
+    .min(1)
+    .max(50)
+    .unique()
+    .required(),
+}).custom((value, helpers) => (
+  value.pincodes.includes(value.homePincode) ? value : helpers.error('any.invalid')
+)).messages({
+  'any.invalid': 'homePincode must be included in pincodes',
+});
+
 /*
  * /api/mobile/registration/* — Technician onboarding gate machine.
  *
@@ -74,13 +91,34 @@ router.post(
   },
 );
 
-// POST /registration/finalize — server-owned Gate-1 handoff. The app cannot
-// choose a lifecycle target: the backend re-checks all persisted gates under
-// the lifecycle lock and advances only when every required field is present.
+// PUT /registration/work-area — one replay-safe contract for the complete
+// profile card. Home location and the full serviceable set commit together;
+// finalization is derived after commit and no-ops until the other profile gates
+// are complete. Name is additive/optional so profile cards remain order-free.
+// The body is deliberately bounded for offline queue/storage and
+// for the pincode catalogue IN predicates used by the transaction.
+router.put(
+  '/work-area',
+  validate(workAreaSchema),
+  async (req, res, next) => {
+    try {
+      logger.info(`Save work area · count=${req.body.pincodes.length}`);
+      modernOk(res, await registration.saveWorkArea(req.tech.efr_id, req.body));
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+// POST /registration/finalize — server-owned Gate-1 convergence. The app calls
+// this after order-independent profile-card saves. Missing cards return 200
+// with pending/missing; transient failures still fail so the durable operation
+// retries. The app never chooses a lifecycle target.
 router.post('/finalize', async (req, res, next) => {
   try {
     logger.info('Onboarding Gate 1 finalization requested');
-    modernOk(res, await registration.finalizeGate1(req.tech.efr_id));
+    modernOk(res, await registration.finalizeGate1IfReady(req.tech.efr_id));
   } catch (e) {
     if (e.status) return modernError(res, e.status, e.message, e.details);
     next(e);

@@ -133,18 +133,32 @@ async function setProfileImage(efrId, imageId) {
  * disk via file-storage.writeBuffer('general', …) and stores that filename
  * as the key — resolveImageUrl reads either shape back correctly.
  */
-async function setProfileImageFromUpload(efrId, buffer, contentType, originalName) {
+async function setProfileImageFromUpload(
+  efrId,
+  buffer,
+  contentType,
+  originalName,
+  { storageToken = null } = {},
+) {
   logger.info('Upload profile image · contentType=' + contentType + ' bytes=' + (buffer ? buffer.length : 0));
   let key;
   if (s3Storage.isEnabled()) {
     key = await s3Storage.putAtKey({
-      key: `EasyfixerProfile/${Number(efrId)}_${Date.now()}`,
+      key: `EasyfixerProfile/${Number(efrId)}_${storageToken || Date.now()}`,
       buffer,
       contentType,
       originalName,
     });
   } else {
-    const saved = writeBuffer('general', buffer, originalName, contentType);
+    const saved = writeBuffer(
+      'general',
+      buffer,
+      originalName,
+      contentType,
+      storageToken
+        ? { deterministicStem: `EasyfixerProfile_${Number(efrId)}_${storageToken}` }
+        : undefined,
+    );
     key = saved.filename;
   }
 
@@ -507,27 +521,31 @@ async function getTrainingPercentages(efrId) {
  * Upsert a single video's watched % — legacy
  * `training-video/update-watched-percentage`.
  *
- * `easyfixer_watched_video` has no guaranteed unique key on
- * (easyfixer_id, video_id) — to stay correct regardless of constraint
- * presence we UPDATE-then-INSERT (same defensive pattern the device_info
- * upsert uses in routes/mobile/index.js). `update_date` is stamped NOW().
+ * migrations/2026-08-11-02-training-progress-uniqueness.sql guarantees one
+ * row per (easyfixer_id, video_id), and its database trigger prevents the
+ * legacy Java writer from lowering an existing value. This single-statement
+ * upsert is atomic for unified-backend concurrency; GREATEST also prevents a
+ * delayed offline replay from moving progress backwards.
  */
 async function setTrainingPercentage(efrId, videoId, watchedPercentage) {
   logger.info('Upsert training watched-% · videoId=' + videoId + ' watched=' + watchedPercentage);
-  const [upd] = await pool.query(
-    `UPDATE easyfixer_watched_video
-        SET watched_percentage = ?, update_date = NOW()
-      WHERE easyfixer_id = ? AND video_id = ?`,
-    [watchedPercentage, efrId, videoId],
+  await pool.query(
+    `INSERT INTO easyfixer_watched_video
+       (easyfixer_id, video_id, watched_percentage, update_date)
+     VALUES (?, ?, ?, NOW())
+     ON DUPLICATE KEY UPDATE
+       update_date = IF(
+         VALUES(watched_percentage) > COALESCE(watched_percentage, 0),
+         NOW(),
+         update_date
+       ),
+       watched_percentage = GREATEST(
+         COALESCE(watched_percentage, 0),
+         VALUES(watched_percentage)
+       )`,
+    [efrId, videoId, watchedPercentage],
   );
-  if (upd.affectedRows === 0) {
-    await pool.query(
-      `INSERT INTO easyfixer_watched_video (easyfixer_id, video_id, watched_percentage, update_date)
-       VALUES (?, ?, ?, NOW())`,
-      [efrId, videoId, watchedPercentage],
-    );
-  }
-  logger.info('Training watched-% saved · videoId=' + videoId + ' inserted=' + (upd.affectedRows === 0));
+  logger.info('Training watched-% saved · videoId=' + videoId);
   return { videoId, watchedPercentage };
 }
 

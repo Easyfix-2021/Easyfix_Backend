@@ -1,0 +1,8 @@
+#!/bin/sh
+# Fast, staged-tree guard. It never runs the backend, database, network, or a
+# browser; full offline contract tests remain an explicit pre-record step.
+
+set -eu
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+exec node "$REPO_ROOT/scripts/offline-reliability-sync.js" check --staged --if-relevant

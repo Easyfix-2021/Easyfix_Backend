@@ -141,8 +141,58 @@ const EXPECTED = {
     'current_balance', 'balance_updated',
     'adhaar_card_number', 'pan_card_number', 'have_driving_lisence',
     'is_technician_verified', 'is_email_verified', 'date_of_birth',
+    'active_aadhaar_unique',
+  ],
+  tbl_idempotency_key: [
+    'actor_type', 'actor_id', 'idempotency_key', 'method', 'path',
+    'request_fingerprint', 'state', 'lease_token', 'lease_expires_at',
+    'response_status', 'response_json', 'created_at', 'completed_at', 'expires_at',
+  ],
+  easyfixer_watched_video: [
+    'id', 'easyfixer_id', 'video_id', 'watched_percentage', 'update_date',
   ],
 };
+
+// These constraints are correctness requirements, not optional tuning. A
+// missing idempotency key UNIQUE can execute an offline mutation twice; a
+// missing training UNIQUE makes ON DUPLICATE KEY UPDATE insert duplicates; and
+// the active-Aadhaar UNIQUE is the authoritative cross-technician race guard.
+const REQUIRED_INDEXES = [
+  {
+    table: 'tbl_idempotency_key',
+    columns: ['actor_type', 'actor_id', 'idempotency_key'],
+    unique: true,
+  },
+  { table: 'tbl_idempotency_key', columns: ['expires_at'], unique: false },
+  {
+    table: 'easyfixer_watched_video',
+    columns: ['easyfixer_id', 'video_id'],
+    unique: true,
+  },
+  { table: 'tbl_easyfixer', columns: ['active_aadhaar_unique'], unique: true },
+];
+
+function canonicalSql(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/_utf8mb4|_utf8/g, '')
+    .replace(/[`\s()]/g, '');
+}
+
+function matchesActiveAadhaarGeneratedColumn(row) {
+  const generated = String(row?.is_generated || '').toUpperCase() === 'ALWAYS'
+    || String(row?.extra || '').toUpperCase().includes('GENERATED');
+  return generated && canonicalSql(row?.generation_expression) ===
+    "casewhennotefr_status<=>3thennulliftrimadhaar_card_number,''elsenullend";
+}
+
+function matchesTrainingMonotonicTrigger(row) {
+  return String(row?.action_timing || '').toUpperCase() === 'BEFORE'
+    && String(row?.event_manipulation || '').toUpperCase() === 'UPDATE'
+    && String(row?.event_object_table || '').toLowerCase() === 'easyfixer_watched_video'
+    && canonicalSql(row?.action_statement) ===
+      'setnew.watched_percentage=greatestcoalesceold.watched_percentage,0,coalescenew.watched_percentage,0';
+}
 
 // Tables the code GRACEFULLY HANDLES being missing — we don't fail
 // the verify run for these, just note them in the report.
@@ -184,6 +234,75 @@ async function verifySchemaAgainstLiveDb() {
     }
   }
 
+  for (const required of REQUIRED_INDEXES) {
+    const [rows] = await pool.query(
+      `SELECT INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME
+         FROM INFORMATION_SCHEMA.STATISTICS
+        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+        ORDER BY INDEX_NAME, SEQ_IN_INDEX`,
+      [dbName, required.table],
+    );
+    const indexes = new Map();
+    for (const row of rows) {
+      if (!indexes.has(row.INDEX_NAME)) {
+        indexes.set(row.INDEX_NAME, { unique: Number(row.NON_UNIQUE) === 0, columns: [] });
+      }
+      indexes.get(row.INDEX_NAME).columns.push(row.COLUMN_NAME);
+    }
+    const found = [...indexes.values()].some((index) => {
+      if (required.unique && !index.unique) return false;
+      // A non-unique lookup can use a wider index with this left prefix. A
+      // UNIQUE invariant must match exactly; UNIQUE(a,b,c) does not enforce
+      // uniqueness of (a,b).
+      if (required.unique && index.columns.length !== required.columns.length) return false;
+      return required.columns.every((column, i) => index.columns[i] === column);
+    });
+    if (!found) {
+      missing.push({
+        table: required.table,
+        col: `<${required.unique ? 'UNIQUE ' : ''}INDEX(${required.columns.join(',')})>`,
+      });
+      missingCount++;
+    }
+  }
+
+  const [generatedColumns] = await pool.query(
+    `SELECT IS_GENERATED AS is_generated,
+            GENERATION_EXPRESSION AS generation_expression,
+            EXTRA AS extra
+       FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = ?
+        AND TABLE_NAME = 'tbl_easyfixer'
+        AND COLUMN_NAME = 'active_aadhaar_unique'`,
+    [dbName],
+  );
+  if (!matchesActiveAadhaarGeneratedColumn(generatedColumns[0])) {
+    missing.push({
+      table: 'tbl_easyfixer',
+      col: '<GENERATED active_aadhaar_unique EXPRESSION>',
+    });
+    missingCount++;
+  }
+
+  const [trainingTriggers] = await pool.query(
+    `SELECT TRIGGER_NAME AS trigger_name,
+            EVENT_OBJECT_TABLE AS event_object_table,
+            ACTION_TIMING AS action_timing,
+            EVENT_MANIPULATION AS event_manipulation,
+            ACTION_STATEMENT AS action_statement
+       FROM INFORMATION_SCHEMA.TRIGGERS
+      WHERE TRIGGER_SCHEMA = ?
+        AND TRIGGER_NAME = 'trg_easyfixer_watched_video_monotonic'`,
+    [dbName],
+  );
+  if (!matchesTrainingMonotonicTrigger(trainingTriggers[0])) {
+    missing.push({
+      table: 'easyfixer_watched_video',
+      col: '<BEFORE UPDATE MONOTONIC TRIGGER>',
+    });
+    missingCount++;
+  }
+
   for (const [table, note] of Object.entries(OPTIONAL)) {
     const [rows] = await pool.query(
       'SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?',
@@ -195,6 +314,8 @@ async function verifySchemaAgainstLiveDb() {
   return {
     ok: missing.length === 0,
     columnsChecked: totalChecked,
+    indexesChecked: REQUIRED_INDEXES.length,
+    invariantsChecked: 2,
     tablesChecked: Object.keys(EXPECTED).length,
     requiredMismatches: missing,
     optionalMissing,
@@ -205,7 +326,7 @@ async function verifySchemaAgainstLiveDb() {
 // the script doesn't hang waiting on idle connections.
 async function cliMain() {
   const report = await verifySchemaAgainstLiveDb();
-  console.log(`\nChecked ${report.columnsChecked} columns across ${report.tablesChecked} required tables`);
+  console.log(`\nChecked ${report.columnsChecked} columns, ${report.indexesChecked} required indexes, and ${report.invariantsChecked} schema invariants across ${report.tablesChecked} required tables`);
   if (report.ok) {
     console.log('✅ All required columns exist in production schema.');
   } else {
@@ -222,7 +343,14 @@ async function cliMain() {
   await pool.end();
 }
 
-module.exports = { verifySchemaAgainstLiveDb };
+module.exports = {
+  verifySchemaAgainstLiveDb,
+  _internals: {
+    canonicalSql,
+    matchesActiveAadhaarGeneratedColumn,
+    matchesTrainingMonotonicTrigger,
+  },
+};
 
 // Run as CLI only when invoked directly (not when require()d from server.js)
 if (require.main === module) {

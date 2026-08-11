@@ -345,7 +345,10 @@ function resolveGate1Finalization(currentStatus, gates = {}) {
     if (!asBool(gates.personal_submitted)) missing.push('personal_details_confirmation');
     if (String(gates.adhaar_card_number || '').trim() === '') missing.push('aadhaar_number');
     if (String(gates.efr_profile_img || '').trim() === '') missing.push('profile_image');
-    throw httpError(409, 'registration Gate 1 is incomplete', { missing });
+    throw httpError(409, 'registration Gate 1 is incomplete', {
+      code: 'REGISTRATION_GATE1_INCOMPLETE',
+      missing,
+    });
   }
   return { ...decision, idempotent: false };
 }

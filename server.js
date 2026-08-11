@@ -236,7 +236,7 @@ async function start() {
         logger.error('Server will not start. Run migrations or set SKIP_SCHEMA_VERIFY=true to override.');
         process.exit(1);
       }
-      logger.info(`Schema parity OK — ${report.columnsChecked} columns / ${report.tablesChecked} tables verified` +
+      logger.info(`Schema parity OK — ${report.columnsChecked} columns / ${report.indexesChecked} indexes / ${report.tablesChecked} tables verified` +
         (report.optionalMissing.length ? ` (${report.optionalMissing.length} optional tables missing — handled gracefully)` : ''));
     } catch (err) {
       logger.error(`Schema verify crashed — ${err.message}. Server will not start.`);

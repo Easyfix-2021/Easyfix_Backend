@@ -53,6 +53,7 @@ const TZ = 'Asia/Kolkata';
  */
 const jobs = [];
 let orphanResetTask = null;
+let idempotencyCleanupTask = null;
 
 function registerJob({
   id, name, description, cron: cronExpr, runner, skipReason,
@@ -1079,6 +1080,27 @@ Note: this runs automatically unless the property "plivo.conference.reaper.enabl
     logger.info('Deep-skill image-gen orphan reset cron registered (every 5 min, hidden from admin page).');
   }
 
+  // ─── Idempotency response retention — hourly, bounded ───────────────
+  // Infrastructure housekeeping, not an operator workflow: one indexed
+  // DELETE capped at 1,000 rows. Fourteen-day expiry keeps responses beyond
+  // the app's seven-day outbox window without allowing the ledger to grow
+  // indefinitely. No timer is registered when CRON_DISABLED=true.
+  if (!cronDisabled) {
+    const idempotencyRetention = require('../services/idempotency-retention.service');
+    idempotencyCleanupTask = cron.schedule(
+      '17 * * * *',
+      async () => {
+        try {
+          await idempotencyRetention.run();
+        } catch (err) {
+          logger.warn({ err }, 'idempotency retention tick failed');
+        }
+      },
+      { timezone: TZ },
+    );
+    logger.info('Idempotency retention cron registered (hourly, max 1,000 rows, hidden from admin page).');
+  }
+
   const registeredCount = jobs.filter((j) => j.registered).length;
   logger.ready(`Scheduler started — ${registeredCount}/${jobs.length} task(s) registered (tz=${TZ}).`);
 }
@@ -1092,6 +1114,8 @@ function stop() {
   jobs.length = 0;
   try { orphanResetTask?.stop(); } catch { /* ignore */ }
   orphanResetTask = null;
+  try { idempotencyCleanupTask?.stop(); } catch { /* ignore */ }
+  idempotencyCleanupTask = null;
 }
 
 /*
