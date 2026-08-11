@@ -1180,22 +1180,15 @@ router.get('/jobs', async (req, res, next) => {
       statuses: req.query.statuses || req.query.bucket || undefined,
       cityIds:  req.query.cityIds  || req.query.city   || undefined,
       ownerIds,
-      // Server-derived from JWT — frontend cannot override (security).
-      // Mirrors legacy clientSpocId scoping to the SPOC's reports.
-      reportingContactIds: req._reportingContactIds,
       ticketFlag,
       startDate: req.query.startDate || undefined,
       endDate:   req.query.endDate   || undefined,
-      // Default the date-range column to `created_date_time` — that's
-      // what the legacy filter labelled "Ticket Created Date". Callers
-      // can override via `dateType=requested|scheduled|ticket`.
+      // Default the date-range column to `created_date_time` — that's what
+      // the legacy filter labelled "Ticket Created Date". Callers can override
+      // via `dateType=requested|scheduled|ticket` (e.g. the app passes
+      // dateType=ticket → ticket_created_date_time for its history window).
       dateType:  req.query.dateType  || 'created',
       q: req.query.q,
-      // Server-side date range (so the app can reach any historical date
-      // instead of only the recent window it can hold client-side).
-      dateType: req.query.dateType,          // 'ticket' → ticket_created_date_time
-      startDate: req.query.startDate,
-      endDate: req.query.endDate,
       limit: Math.min(Number(req.query.limit) || 50, 500),
       offset: Number(req.query.offset) || 0,
     });
