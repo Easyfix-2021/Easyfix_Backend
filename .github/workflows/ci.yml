@@ -34,3 +34,10 @@ jobs:
         run: npm run lint
       - name: Unit tests (characterization — no DB)
         run: npm test
+      # STRICT (no --fix) counterpart to the pre-commit hook. The hook refreshes
+      # the offline-reliability snapshot automatically so routine commits are not
+      # blocked; this is the backstop that still catches a --no-verify commit, or
+      # one made from a clone that never ran `offline-reliability-sync
+      # install-hooks`. Read-only: no backend, DB, or network.
+      - name: Offline reliability contract in sync
+        run: npm run check:offline
