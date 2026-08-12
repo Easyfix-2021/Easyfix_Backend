@@ -4,6 +4,7 @@ const logger = require('../../logger');
 const { modernOk, modernError } = require('../../utils/response');
 const { pool } = require('../../db');
 const convo = require('../../services/whatsapp-conversation.service');
+const { rateLimit, failureBreaker } = require('../../middleware/rate-limit');
 
 /*
  * Inbound WhatsApp webhook (Gallabox → us) for the conversational
@@ -80,6 +81,53 @@ function secretOk(req) {
  * about ours.
  */
 
+/*
+ * ── TWO LAYERS, BOUNDING TWO DIFFERENT THINGS ─────────────────────────────
+ *
+ * A misconfigured provider does not send one bad request; it retries. The log
+ * that prompted this shows twelve refusals in fifteen seconds, and it would
+ * have gone on indefinitely, because nothing here ever told Gallabox to stop.
+ *
+ *   breaker — charges ONLY refusals, and one authenticated request clears it.
+ *             This is the layer that matters: it opens fast on exactly the
+ *             failure we are in, and correct traffic can never trip it however
+ *             heavy, so a real burst of customer replies is never dropped.
+ *   ceiling — a plain per-IP cap on everything, deliberately generous. It is
+ *             not aimed at this incident but at the one the breaker cannot see:
+ *             a provider bug retry-storming messages that DO authenticate.
+ *
+ * Both are per-process (see middleware/rate-limit.js). With several replicas
+ * each holds its own view, so the effective limits are per-replica — fine for a
+ * backstop, and Redis is the answer if these ever need to be exact.
+ *
+ * KEYED ON IP. A shared secret has no identity to key on before it verifies,
+ * and by definition the requests being bounded are the ones we cannot attribute.
+ */
+const inboundCeiling = rateLimit({
+  windowMs: 60_000,
+  max: 600,                       // ~10/s sustained from one address
+  key: (req) => `wa-hook:${req.ip}`,
+});
+
+const authBreaker = failureBreaker({
+  windowMs: 60_000,
+  maxFailures: 20,
+  key: (req) => `wa-hook-fail:${req.ip}`,
+  /*
+   * Logged ONCE per window, at ERROR. Once at error beats twenty at warn: the
+   * per-request line is what buried the signal, and an integration that has
+   * been refusing every message for a minute is a real incident rather than a
+   * routine rejection.
+   */
+  onOpen: (info) => logger.error(
+    `WhatsApp webhook · CIRCUIT OPEN after ${info.failures} refused requests in `
+    + `${Math.round(info.windowMs / 1000)}s from one address — further requests get 429 + `
+    + `Retry-After ${info.retryAfterSec}s until a request authenticates. The cause is in the `
+    + 'refusal line logged just above this one; fix that and the breaker clears on the first '
+    + 'request that gets through.',
+  ),
+});
+
 function refuse(res, req, verdict, what) {
   if (verdict.cause === 'not_configured') {
     logger.error(`${what} · GALLABOX_WEBHOOK_SECRET is not set on this server — the WhatsApp webhook `
@@ -94,6 +142,12 @@ function refuse(res, req, verdict, what) {
     logger.warn(`${what} · secret MISMATCH — the value sent does not match GALLABOX_WEBHOOK_SECRET `
       + `(lengths ${verdict.sameLength ? 'match, so it is a different value' : 'differ, so it is truncated or a different secret entirely'}).`);
   }
+  /*
+   * Charged AFTER the cause has been logged, so the very refusal that opens the
+   * breaker still explains itself. Reversing these would open the circuit on a
+   * line that says only "429" — and the diagnosis would be gone with it.
+   */
+  authBreaker.recordFailure(req);
   return modernError(res, 401, 'unauthorized');
 }
 
@@ -185,16 +239,25 @@ function normaliseStatus(body) {
 }
 
 // Optional GET verify handshake (some BSPs ping the URL with the secret).
-router.get('/whatsapp', (req, res) => {
+router.get('/whatsapp', inboundCeiling, authBreaker.guard, (req, res) => {
   const verdict = secretOk(req);
   if (!verdict.ok) return refuse(res, req, verdict, 'WhatsApp verify handshake');
+  authBreaker.recordSuccess(req);
   logger.info('WhatsApp verify handshake · ok');
   return modernOk(res, { ok: true });
 });
 
-router.post('/whatsapp', async (req, res) => {
+router.post('/whatsapp', inboundCeiling, authBreaker.guard, async (req, res) => {
   const verdict = secretOk(req);
   if (!verdict.ok) return refuse(res, req, verdict, 'WhatsApp inbound webhook');
+  /*
+   * Clear the budget the moment anything authenticates. This is what makes the
+   * breaker safe to leave on: the instant the provider's header is fixed, the
+   * first request through returns the full allowance, and a legitimate backlog
+   * of queued customer replies is never penalised for the misconfiguration that
+   * preceded it.
+   */
+  authBreaker.recordSuccess(req);
 
   // Delivery-status callback FIRST — these were previously swallowed by the
   // "not actionable" branch below. Reflect the real WhatsApp outcome onto the
@@ -280,3 +343,11 @@ router.post('/whatsapp', async (req, res) => {
 });
 
 module.exports = router;
+/*
+ * Test seam, same convention as routes/webhook/plivo-conference.js. The breaker
+ * is module-scoped BY DESIGN (a per-request instance would reset its window on
+ * every call and bound nothing), so a test that drives refusals has to be able
+ * to clear it between cases — otherwise the cases leak into each other and the
+ * one that matters passes for the wrong reason.
+ */
+module.exports.__test = { authBreaker };

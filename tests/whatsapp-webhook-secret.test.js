@@ -70,7 +70,13 @@ after(async () => {
   fake.restore();
 });
 
-beforeEach(() => { lines = []; });
+beforeEach(() => {
+  lines = [];
+  // The breaker is module-scoped on purpose, so every test in this file shares
+  // its counter. Without this reset the refusal tests above would bleed into
+  // the breaker tests below and the thresholds would be met by accident.
+  whatsappRouter.__test.authBreaker.__state.clear();
+});
 
 /** Every captured log line flattened to one searchable string. */
 const logText = () => lines
@@ -177,5 +183,84 @@ test('the ?secret= query form is still accepted — trailing whitespace and all'
       body: JSON.stringify({ payload: { from: '919812345678', text: { body: 'hi' } } }),
     });
     assert.equal(res.status, 200, 'the trim on both sides is load-bearing — a pasted secret carries whitespace');
+  });
+});
+
+/* ═════════════ the circuit breaker on repeated refusals ═════════════════ */
+
+const MAX_FAILURES = 20;
+
+test('repeated refusals open the circuit — 429 with Retry-After, not another 401', async () => {
+  /*
+   * The reported incident: twelve refusals in fifteen seconds, and nothing ever
+   * told the provider to stop. A 401 is not a backoff signal; 429 + Retry-After
+   * is, so a well-behaved sender reduces the load at its source instead of us
+   * absorbing it indefinitely.
+   */
+  await withSecret(SECRET, async () => {
+    for (let i = 0; i < MAX_FAILURES; i++) {
+      assert.equal(await post({ 'x-webhook-secret': 'wrong' }), 401, `attempt ${i + 1} should still be a plain refusal`);
+    }
+    const res = await fetch(`${baseUrl}/webhook/whatsapp`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-webhook-secret': 'wrong' },
+      body: JSON.stringify({}),
+    });
+    assert.equal(res.status, 429, 'the breaker is open');
+    assert.ok(Number(res.headers.get('retry-after')) > 0, 'and says for how long');
+  });
+});
+
+test('opening the circuit logs ONCE, not once per request', async () => {
+  // Log volume is half the damage: a WARN per attempt, indefinitely, buries
+  // every other line in the file. Suppression is the feature, not a side effect.
+  await withSecret(SECRET, async () => {
+    for (let i = 0; i < MAX_FAILURES + 15; i++) await post({ 'x-webhook-secret': 'wrong' });
+    const opens = lines.filter((l) => /CIRCUIT OPEN/.test(
+      l.args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '),
+    ));
+    assert.equal(opens.length, 1, `expected exactly one CIRCUIT OPEN line, saw ${opens.length}`);
+    assert.equal(opens[0].lvl, 'error', 'a dead integration is an ERROR');
+  });
+});
+
+test('the refusal CAUSE is still logged on the request that opens the circuit', async () => {
+  // Ordering guard. If recordFailure ran before the cause was logged, the very
+  // request that trips the breaker would say only "429" and the diagnosis would
+  // vanish with it — which is the failure mode this whole change exists to end.
+  await withSecret(SECRET, async () => {
+    for (let i = 0; i < MAX_FAILURES; i++) await post({ 'x-webhook-secret': 'wrong' });
+    const t = logText();
+    assert.match(t, /MISMATCH/, 'the cause survives alongside the breaker line');
+    assert.match(t, /CIRCUIT OPEN/);
+  });
+});
+
+test('ONE authenticated request clears the budget in full', async () => {
+  /*
+   * THE PROPERTY THAT MAKES THIS SAFE TO LEAVE ON. The instant the provider's
+   * header is fixed, the queued backlog of real customer replies must not be
+   * throttled for the misconfiguration that preceded it. A decrement would make
+   * a correctly-configured sender serve out a penalty it no longer deserves.
+   */
+  await withSecret(SECRET, async () => {
+    for (let i = 0; i < MAX_FAILURES - 1; i++) await post({ 'x-webhook-secret': 'wrong' });
+    assert.equal(await post({ 'x-webhook-secret': SECRET }), 200, 'a good request gets through');
+
+    // Budget restored in full: another MAX_FAILURES-1 refusals must NOT open it.
+    for (let i = 0; i < MAX_FAILURES - 1; i++) {
+      assert.equal(await post({ 'x-webhook-secret': 'wrong' }), 401, 'still refusing, not breaking');
+    }
+  });
+});
+
+test('correct traffic NEVER trips the breaker, however much of it there is', async () => {
+  // A plain rate limiter would drop this. The thing being bounded is failure,
+  // not volume — a busy hour of genuine customer replies is exactly the traffic
+  // this endpoint exists to accept.
+  await withSecret(SECRET, async () => {
+    for (let i = 0; i < MAX_FAILURES * 3; i++) {
+      assert.equal(await post({ 'x-webhook-secret': SECRET }), 200, `good request ${i + 1} must not be throttled`);
+    }
   });
 });
