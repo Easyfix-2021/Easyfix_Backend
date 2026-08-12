@@ -23,6 +23,7 @@
     "hooks:install": "node scripts/offline-reliability-sync.js install-hooks",
     "upload:deepskill-images": "node scripts/upload-deepskill-images.js",
     "verify:schema": "node scripts/schema-verify.js",
+    "verify:schema:boot": "node scripts/schema-verify.js --boot-check",
     "verify:env": "node scripts/env-verify.js",
     "verify:all": "npm run build && npm run test:db && npm run verify:schema && npm run verify:migrations && npm run verify:env",
     "verify:migrations": "node scripts/migration-status.js"

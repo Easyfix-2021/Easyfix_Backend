@@ -349,16 +349,50 @@ async function verifySchemaAgainstLiveDb() {
   };
 }
 
-// CLI mode: print report and exit. Closes the pool on the way out so
-// the script doesn't hang waiting on idle connections.
+/**
+ * THE boot decision — the single source of truth for "will the server refuse to
+ * start with this schema?". server.js and the deploy pipeline's --boot-check
+ * BOTH call this, so the pre-swap gate can never drift from real boot behaviour.
+ * If these two ever disagreed, the pipeline would wave through a release that
+ * then crash-loops with no old container left to serve — the 2026-08-12 outage.
+ *
+ * Missing columns always block: the code's own SQL names them, so requests 500.
+ * Missing hardening invariants block only under REQUIRE_SCHEMA_INVARIANTS=true;
+ * otherwise every query still runs and behaviour merely degrades.
+ */
+function bootWouldFail(report, { strictInvariants } = {}) {
+  const strict = strictInvariants === undefined
+    ? String(process.env.REQUIRE_SCHEMA_INVARIANTS).toLowerCase() === 'true'
+    : strictInvariants === true;
+  return report.requiredMismatches.length > 0
+    || (strict && report.invariantMismatches.length > 0);
+}
+
+/*
+ * CLI mode: print report and exit. Closes the pool on the way out so
+ * the script doesn't hang waiting on idle connections.
+ *
+ * Two exit policies:
+ *   default        — STRICT. Any mismatch of either class exits 1. This is the
+ *                    pre-merge / audit gate: the schema should be perfect.
+ *   --boot-check   — Exits non-zero exactly when the SERVER WOULD REFUSE TO
+ *                    BOOT (see server.js): missing columns always, missing
+ *                    invariants only under REQUIRE_SCHEMA_INVARIANTS=true.
+ *                    The deploy pipeline uses this so the gate is a faithful
+ *                    prediction of "will the new container come up?" — it must
+ *                    not block a deploy for a degradation the server tolerates,
+ *                    or the pipeline reintroduces the very coupling that took
+ *                    production down (an unshippable release while a hardening
+ *                    migration waits on an audited Ops decision).
+ */
 async function cliMain() {
+  const bootCheck = process.argv.includes('--boot-check');
   const report = await verifySchemaAgainstLiveDb();
   console.log(`\nChecked ${report.columnsChecked} columns, ${report.indexesChecked} required indexes, and ${report.invariantsChecked} schema invariants across ${report.tablesChecked} required tables`);
   if (report.ok) {
     console.log('✅ All required columns, indexes and invariants exist in production schema.');
   } else {
-    // The CLI is the PRE-DEPLOY gate and stays strict: it exits non-zero for
-    // either class. Only the server's boot path treats them differently.
+    const strictInvariants = String(process.env.REQUIRE_SCHEMA_INVARIANTS).toLowerCase() === 'true';
     if (report.requiredMismatches.length > 0) {
       console.log(`✗ ${report.requiredMismatches.length} BOOT-BLOCKING mismatches (missing columns/tables — the code's SQL names these):`);
       for (const m of report.requiredMismatches) {
@@ -366,12 +400,21 @@ async function cliMain() {
       }
     }
     if (report.invariantMismatches.length > 0) {
-      console.log(`⚠ ${report.invariantMismatches.length} MISSING INVARIANTS (server still boots; behaviour degrades):`);
+      const blocks = strictInvariants || !bootCheck;
+      console.log(`${blocks ? '✗' : '⚠'} ${report.invariantMismatches.length} MISSING INVARIANTS (server still boots; behaviour degrades):`);
       for (const m of report.invariantMismatches) {
         console.log(`  ${m.table}.${m.col}${m.impact ? ` — ${m.impact}` : ''}`);
       }
+      console.log('  → run the pending migrations in migrations/ to restore these.');
     }
-    process.exitCode = 1;
+    // --boot-check mirrors server.js exactly (same bootWouldFail call), so a
+    // pass here means the new container WILL come up. Default (audit) mode
+    // stays strict on both classes.
+    const wouldFailBoot = bootWouldFail(report, { strictInvariants });
+    process.exitCode = bootCheck ? (wouldFailBoot ? 1 : 0) : 1;
+    if (bootCheck && !wouldFailBoot) {
+      console.log('\n✅ Boot check PASSED — the server will start with this schema.');
+    }
   }
   if (report.optionalMissing.length > 0) {
     console.log(`\nℹ ${report.optionalMissing.length} OPTIONAL tables missing (code handles gracefully):`);
@@ -382,6 +425,7 @@ async function cliMain() {
 
 module.exports = {
   verifySchemaAgainstLiveDb,
+  bootWouldFail,
   _internals: {
     ACTIVE_AADHAAR_GENERATED_COLUMN_SQL,
     canonicalSql,

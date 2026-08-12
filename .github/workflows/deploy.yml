@@ -421,6 +421,45 @@ jobs:
           echo "▶ Pulling $IMAGE_URI via docker compose"
           docker compose pull backend
 
+          # ─── PRE-SWAP SCHEMA GATE ───────────────────────────────────────
+          # WHY THIS EXISTS (2026-08-12 outage): the backend verifies its schema
+          # expectations at BOOT and exits when they are unmet. Because that
+          # happened AFTER \`compose up --force-recreate\` had already destroyed
+          # the outgoing container, a schema gap turned into a total outage —
+          # the new container crash-looped and there was no old one left to
+          # serve traffic. The health probe then failed for 12 attempts.
+          #
+          # THE FIX: run the NEW image's own schema check against the LIVE DB
+          # here, while the CURRENT container is still serving. A failure aborts
+          # the deploy and leaves the running container untouched, so the
+          # application keeps running on the old code — a failed DEPLOY instead
+          # of a failed SERVICE.
+          #
+          # \`compose run\` starts a throwaway container from the same service
+          # definition (same env_file, same network, so the same DB) but with
+          # the command overridden, so it never binds the port or joins the
+          # load-balanced set. --rm removes it, --no-deps leaves sidecars alone,
+          # -T disables TTY allocation (required under SSM's non-interactive
+          # shell).
+          #
+          # --boot-check makes the gate a faithful PREDICTION of boot: it fails
+          # only on what would actually stop the server (missing columns; plus
+          # missing invariants when REQUIRE_SCHEMA_INVARIANTS=true). Missing
+          # hardening invariants are reported but do not block, so a release is
+          # never held hostage to a migration awaiting an audited Ops decision.
+          echo "▶ Pre-swap schema gate — checking the NEW image against the live DB"
+          if docker compose run --rm --no-deps -T backend \
+               npm run --silent verify:schema:boot; then
+            echo "✓ Schema gate passed — the new container will boot; proceeding with swap"
+          else
+            echo "::error::Pre-swap schema gate FAILED — deployment aborted."
+            echo "::error::The running container was NOT touched; the application is still serving on the previous image."
+            echo "::error::Apply the pending migrations in migrations/ (see the mismatch list above), then re-run this deploy."
+            echo "── currently running (unchanged) ──"
+            docker compose ps backend || true
+            exit 1
+          fi
+
           # ─── Log history for Dozzle (rolling 7-day window) ──────────────
           # THE PROBLEM: \`compose up --force-recreate\` DESTROYS the outgoing
           # container, and json-file logs live in /var/lib/docker/containers/

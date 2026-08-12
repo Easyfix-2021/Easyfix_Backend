@@ -226,7 +226,7 @@ async function start() {
   // Override with SKIP_SCHEMA_VERIFY=true for emergency boots.
   if (String(process.env.SKIP_SCHEMA_VERIFY).toLowerCase() !== 'true') {
     try {
-      const { verifySchemaAgainstLiveDb } = require('./scripts/schema-verify');
+      const { verifySchemaAgainstLiveDb, bootWouldFail } = require('./scripts/schema-verify');
       const report = await verifySchemaAgainstLiveDb();
       if (report.requiredMismatches.length > 0) {
         logger.error(`Schema parity check FAILED — ${report.requiredMismatches.length} missing column(s)/table(s):`);
@@ -247,12 +247,12 @@ async function start() {
        * have landed to make the guarantee permanent and fail closed again.
        */
       if (report.invariantMismatches.length > 0) {
-        const strict = String(process.env.REQUIRE_SCHEMA_INVARIANTS).toLowerCase() === 'true';
         logger.warn(`Schema invariants MISSING — ${report.invariantMismatches.length} (run the pending migrations):`);
         for (const m of report.invariantMismatches) {
           logger.warn(`  ${m.table}.${m.col}${m.impact ? ` — ${m.impact}` : ''}`);
         }
-        if (strict) {
+        // Same shared decision the deploy pipeline's --boot-check gate uses.
+        if (bootWouldFail(report)) {
           logger.error('REQUIRE_SCHEMA_INVARIANTS=true — server will not start until the invariants exist.');
           process.exit(1);
         }
