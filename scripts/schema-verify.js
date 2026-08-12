@@ -180,11 +180,21 @@ function canonicalSql(value) {
 }
 
 function matchesActiveAadhaarGeneratedColumn(row) {
-  const generated = String(row?.is_generated || '').toUpperCase() === 'ALWAYS'
-    || String(row?.extra || '').toUpperCase().includes('GENERATED');
+  // EXTRA + GENERATION_EXPRESSION are shared by MySQL and MariaDB. MariaDB
+  // additionally exposes IS_GENERATED, but selecting that field makes MySQL
+  // abort the startup verifier before any invariant can be checked.
+  const generated = /\b(?:VIRTUAL|STORED|PERSISTENT)\b/i.test(String(row?.extra || ''));
   return generated && canonicalSql(row?.generation_expression) ===
     "casewhennotefr_status<=>3thennulliftrimadhaar_card_number,''elsenullend";
 }
+
+const ACTIVE_AADHAAR_GENERATED_COLUMN_SQL =
+  `SELECT GENERATION_EXPRESSION AS generation_expression,
+          EXTRA AS extra
+     FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = ?
+      AND TABLE_NAME = 'tbl_easyfixer'
+      AND COLUMN_NAME = 'active_aadhaar_unique'`;
 
 function matchesTrainingMonotonicTrigger(row) {
   return String(row?.action_timing || '').toUpperCase() === 'BEFORE'
@@ -267,13 +277,7 @@ async function verifySchemaAgainstLiveDb() {
   }
 
   const [generatedColumns] = await pool.query(
-    `SELECT IS_GENERATED AS is_generated,
-            GENERATION_EXPRESSION AS generation_expression,
-            EXTRA AS extra
-       FROM INFORMATION_SCHEMA.COLUMNS
-      WHERE TABLE_SCHEMA = ?
-        AND TABLE_NAME = 'tbl_easyfixer'
-        AND COLUMN_NAME = 'active_aadhaar_unique'`,
+    ACTIVE_AADHAAR_GENERATED_COLUMN_SQL,
     [dbName],
   );
   if (!matchesActiveAadhaarGeneratedColumn(generatedColumns[0])) {
@@ -346,6 +350,7 @@ async function cliMain() {
 module.exports = {
   verifySchemaAgainstLiveDb,
   _internals: {
+    ACTIVE_AADHAAR_GENERATED_COLUMN_SQL,
     canonicalSql,
     matchesActiveAadhaarGeneratedColumn,
     matchesTrainingMonotonicTrigger,
