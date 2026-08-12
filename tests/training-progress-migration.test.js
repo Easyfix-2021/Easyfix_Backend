@@ -3,10 +3,15 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
+// Applied to production 2026-08-12 and moved into migrations/executed/, which
+// is frozen. These assertions still guard the file's content: an executed
+// migration documents the schema that is actually live, so an edit here would
+// mean the SQL on disk no longer matches the deployed database.
 const migrationPath = path.join(
   __dirname,
   '..',
   'migrations',
+  'executed',
   '2026-08-11-02-training-progress-uniqueness.sql',
 );
 const migration = fs.readFileSync(migrationPath, 'utf8');

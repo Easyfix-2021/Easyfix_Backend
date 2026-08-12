@@ -521,7 +521,7 @@ async function getTrainingPercentages(efrId) {
  * Upsert a single video's watched % — legacy
  * `training-video/update-watched-percentage`.
  *
- * migrations/2026-08-11-02-training-progress-uniqueness.sql guarantees one
+ * migrations/executed/2026-08-11-02-training-progress-uniqueness.sql guarantees one
  * row per (easyfixer_id, video_id), and its database trigger prevents the
  * legacy Java writer from lowering an existing value. This single-statement
  * upsert is atomic for unified-backend concurrency; GREATEST also prevents a
