@@ -4,7 +4,12 @@ const Joi = require('joi');
 const validate = require('../../middleware/validate');
 const { modernOk, modernError } = require('../../utils/response');
 const attendanceService = require('../../services/mobile-attendance.service');
+const {
+  requireTechCapability,
+} = require('../../middleware/require-tech-lifecycle-capability');
 const logger = require('../../logger');
+
+const requireAttendanceMutation = requireTechCapability('markAttendance');
 
 /*
  * Technician attendance + leave sub-router.
@@ -70,6 +75,7 @@ router.post(
     morningSlot: Joi.boolean().required(),
     eveningSlot: Joi.boolean().required(),
   }).or('morningSlot', 'eveningSlot')),
+  requireAttendanceMutation,
   async (req, res, next) => {
     try {
       logger.info('Mark attendance · date=' + req.body.date + ' morning=' + req.body.morningSlot + ' evening=' + req.body.eveningSlot);
@@ -98,6 +104,7 @@ router.post(
     startDate: Joi.date().iso().required(),
     endDate: Joi.date().iso().required(),
   })),
+  requireAttendanceMutation,
   async (req, res, next) => {
     try {
       logger.info('Mark leave · startDate=' + req.body.startDate + ' endDate=' + req.body.endDate);
@@ -125,6 +132,7 @@ router.post(
     startDate: Joi.date().iso().required(),
     endDate: Joi.date().iso().required(),
   })),
+  requireAttendanceMutation,
   async (req, res, next) => {
     try {
       logger.info('Unmark leave · startDate=' + req.body.startDate + ' endDate=' + req.body.endDate);

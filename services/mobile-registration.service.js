@@ -1,6 +1,8 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const deepSkillService = require('./deep-skill.service');
+const lifecycleService = require('./easyfixer-lifecycle.service');
+const registrationProfile = require('./technician-registration-profile.service');
 
 /*
  * Mobile Registration gate machine — collapses three legacy polls
@@ -64,6 +66,7 @@ function present(v) {
 
 // ─── Identity + flags fetch ─────────────────────────────────────────
 async function fetchGateRow(efrId) {
+  const lifecycleProjection = await lifecycleService.readProjection('e');
   const [[row]] = await pool.query(
     `SELECT e.efr_id,
             e.efr_first_name, e.efr_name, e.efr_no,
@@ -71,6 +74,8 @@ async function fetchGateRow(efrId) {
             e.efr_profile_perc,
             e.efr_status,
             e.last_inactive_date_time,
+            e.scheduled_reactivation_date,
+            e.efr_manager_id,
             e.is_technician_verified,
             e.is_identity_details_verified_by_crm,
             e.is_personal_details_verified_by_crm,
@@ -82,6 +87,7 @@ async function fetchGateRow(efrId) {
             e.efr_cityId,
             e.efr_pin_no,
             e.user_id,
+            ${lifecycleProjection},
             u.personal_details_filled       AS user_personal_details_filled,
             u.is_personal_detail_filled      AS user_is_personal_detail_filled,
             u.is_released                    AS user_is_released
@@ -256,6 +262,9 @@ async function getStatus(efrId) {
   };
 
   const status = deriveStatus(flags);
+  const lifecycle = lifecycleService.forTechnician(
+    lifecycleService.lifecycleFromRow(e),
+  );
 
   /*
    * Deactivation is reported ADDITIVELY — deliberately NOT as a new `status`
@@ -269,7 +278,7 @@ async function getStatus(efrId) {
    * the flag, and treating NULL as deactivated would wrongly lock out a large
    * slice of existing technicians.
    */
-  const deactivated = Number(e.efr_status) === 0;
+  const deactivated = e.efr_status != null && Number(e.efr_status) === 0;
 
   // Gate 2 (earning) unlock: CRM-verified AND the tech has the full identity
   // + skills + training the first job needs. Surfaced as a dashboard checklist
@@ -280,7 +289,7 @@ async function getStatus(efrId) {
   // what makes the deactivated experience correct on TODAY's app build with no
   // client change: they log in, reach the dashboard, and jobs are shown locked
   // instead of appearing available and silently never arriving.
-  const jobsUnlocked = !deactivated
+  const jobsUnlocked = lifecycle.jobsAllowed && !deactivated
     && flags.isTechnicianVerified && panPresent && hasSkills && trainingComplete;
 
   logger.info('Returning registration status · status=' + status + ' profilePct=' + pct(e.efr_profile_perc) + ' jobsUnlocked=' + jobsUnlocked + ' deactivated=' + deactivated);
@@ -299,6 +308,9 @@ async function getStatus(efrId) {
     // `inactive_comment` are Ops notes and are intentionally NOT surfaced to the
     // technician; the app shows a generic "contact support" message instead.
     deactivatedSince:     deactivated ? (e.last_inactive_date_time || null) : null,
+    // Additive v5.1 lifecycle contract. Old app versions ignore this field;
+    // new versions use it to render PAUSED/DORMANT/re-application experiences.
+    lifecycle,
     // Gate-2 unlock checklist for the dashboard (all true ⇒ jobsUnlocked).
     checklist: {
       verified:         flags.isTechnicianVerified,
@@ -372,16 +384,15 @@ async function getRemaining(efrId) {
  * Persist the initial personal-details step. Splits `name` into
  * efr_first_name / efr_last_name (and keeps the full efr_name in sync),
  * stamps pincode (efr_pin_no) + address lines, and bumps
- * efr_personal_details_perc to 100. Optional city/state are textual
- * hints from the app — efr_cityId is a numeric FK, so we DON'T overwrite
- * it from a free-text city string here (CRM resolves the city FK during
- * lead verification). The textual city/state ride into efr_address only
- * if no explicit address line is provided.
+ * efr_personal_details_perc to 100. The legacy personal-details route never
+ * writes a numeric city FK from free text. The atomic Work Area contract can
+ * pass a catalogue-resolved location and then updates efr_cityId plus the
+ * linked user's pincode/city/state through this same helper.
  *
  * COALESCE-guards every optional column so a partial submit never blanks
  * a previously-saved value.
  */
-async function savePersonalDetails(efrId, body) {
+async function persistPersonalDetails(efrId, body, runner, location = null) {
   logger.info('Save personal details · hasName=' + Boolean(body.name) + ' hasPincode=' + (body.pincode != null) + ' hasAddress=' + Boolean(body.addressLine1 || body.addressLine2));
   const fullName  = String(body.name || '').trim();
   const firstName = fullName ? fullName.split(/\s+/)[0] : null;
@@ -395,12 +406,13 @@ async function savePersonalDetails(efrId, body) {
     .filter(Boolean)
     .join(', ') || null;
 
-  await pool.query(
+  await runner.query(
     `UPDATE tbl_easyfixer
         SET efr_name        = COALESCE(?, efr_name),
             efr_first_name  = COALESCE(?, efr_first_name),
             efr_last_name   = COALESCE(?, efr_last_name),
             efr_pin_no      = COALESCE(?, efr_pin_no),
+            efr_cityId      = COALESCE(?, efr_cityId),
             efr_address     = COALESCE(?, efr_address),
             efr_personal_details_perc = 100
       WHERE efr_id = ?`,
@@ -409,6 +421,7 @@ async function savePersonalDetails(efrId, body) {
       firstName,
       lastName,
       body.pincode != null ? String(body.pincode).trim() : null,
+      location?.cityId ?? null,
       addressLine,
       efrId,
     ],
@@ -417,16 +430,32 @@ async function savePersonalDetails(efrId, body) {
   // Mark the personal step as submitted on tbl_user so the gate machine
   // advances out of `personal_pending`. Only writes when a linked user
   // row exists (idle leads with no user account are a no-op).
-  const [[row]] = await pool.query(
+  const [[row]] = await runner.query(
     'SELECT user_id FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1',
     [efrId],
   );
   if (row?.user_id) {
-    await pool.query(
-      'UPDATE tbl_user SET is_personal_detail_filled = 1 WHERE user_id = ?',
-      [row.user_id],
+    await runner.query(
+      `UPDATE tbl_user
+          SET is_personal_detail_filled = 1,
+              pin_code = COALESCE(?, pin_code),
+              city = COALESCE(?, city),
+              state = COALESCE(?, state)
+        WHERE user_id = ?`,
+      [
+        location?.pincode ?? null,
+        location?.city ?? null,
+        location?.state ?? null,
+        row.user_id,
+      ],
     );
   }
+
+  return { userId: row?.user_id || null };
+}
+
+async function savePersonalDetails(efrId, body) {
+  const { userId } = await persistPersonalDetails(efrId, body, pool);
 
   // Best-effort location enrichment (2026-07-09): resolve the submitted
   // pincode into a city FK + state + GPS centroid so the CRM Registered-
@@ -443,7 +472,7 @@ async function savePersonalDetails(efrId, body) {
     enrichEasyfixerLocationFromPincode({
       efrId,
       pincode: body.pincode,
-      userId: row?.user_id || null,
+      userId,
       deviceLat: body.latitude,
       deviceLng: body.longitude,
     }).catch((err) => {
@@ -451,8 +480,180 @@ async function savePersonalDetails(efrId, body) {
     });
   }
 
-  logger.info('Personal details saved · efrId=' + efrId + ' personalStepMarked=' + Boolean(row?.user_id));
+  logger.info('Personal details saved · efrId=' + efrId + ' personalStepMarked=' + Boolean(userId));
   return { ok: true };
+}
+
+// ─── PUT work-area (atomic home + full serviceable set) ─────────────
+async function saveWorkArea(efrId, body, database = pool) {
+  // Lazy to avoid the verification -> registration-status-push -> this module
+  // cycle during process startup.
+  // eslint-disable-next-line global-require
+  const verificationService = require('./easyfixer-verification.service');
+  const name = String(body?.name || '').trim();
+  const homePincode = String(body?.homePincode || '').trim();
+  const pincodes = Array.isArray(body?.pincodes)
+    ? Array.from(new Set(body.pincodes.map((value) => String(value).trim())))
+    : [];
+
+  const invalidPincode = pincodes.some((pincode) => !/^\d{6}$/.test(pincode));
+  if (name.length > 150) {
+    const error = new Error('name must not exceed 150 characters');
+    error.status = 400;
+    throw error;
+  }
+  if (!/^\d{6}$/.test(homePincode)) {
+    const error = new Error('homePincode must be exactly 6 digits');
+    error.status = 400;
+    throw error;
+  }
+  if (pincodes.length === 0 || pincodes.length > 50 || invalidPincode) {
+    const error = new Error('pincodes must contain between 1 and 50 valid 6-digit pincodes');
+    error.status = 400;
+    throw error;
+  }
+  if (!pincodes.includes(homePincode)) {
+    const error = new Error('homePincode must be included in pincodes');
+    error.status = 400;
+    throw error;
+  }
+
+  const ownsConnection = typeof database.getConnection === 'function';
+  const conn = ownsConnection ? await database.getConnection() : database;
+  let transactionStarted = false;
+  let location;
+  let replacement;
+  try {
+    // Resolve through the existing one-query registration lookup before taking
+    // write locks. All actual profile + service-area writes remain inside the
+    // transaction below.
+    location = await registrationProfile.resolvePincode(homePincode, conn);
+    if (!location) {
+      const error = new Error('home pincode is not available in the pincode directory');
+      error.status = 422;
+      throw error;
+    }
+    if (!location.cityId || !location.city || !location.state) {
+      const error = new Error('home pincode has no complete city and state mapping');
+      error.status = 422;
+      throw error;
+    }
+
+    await conn.beginTransaction();
+    transactionStarted = true;
+    await persistPersonalDetails(
+      efrId,
+      { ...(name ? { name } : {}), pincode: homePincode },
+      conn,
+      location,
+    );
+    replacement = await verificationService.replaceServiceablePincodes(
+      efrId,
+      pincodes,
+      null,
+      conn,
+      { representation: 'value' },
+    );
+    if (Number(replacement.updated) !== pincodes.length) {
+      // The shared CRM helper intentionally tolerates a partial catalogue
+      // match. This endpoint is a full-replacement offline contract, so an ACK
+      // must mean every requested PIN was persisted. Roll back on catalogue
+      // drift instead of letting the app discard a PIN it believes was saved.
+      const error = new Error('one or more serviceable pincodes are not available in the pincode directory');
+      error.status = 422;
+      throw error;
+    }
+    await conn.commit();
+    transactionStarted = false;
+  } catch (error) {
+    if (transactionStarted) {
+      try { await conn.rollback(); } catch (_) { /* retain original failure */ }
+    }
+    throw error;
+  } finally {
+    if (ownsConnection) conn.release();
+  }
+
+  // Finalization is deliberately post-commit and derived from persisted gates.
+  // It is state-idempotent and simply reports finalized=false while Skills or
+  // Identity remain incomplete, so the three profile cards stay order-free.
+  const finalization = await finalizeGate1AfterSave(efrId);
+  return {
+    ok: true,
+    name: name || null,
+    homePincode,
+    pincodes,
+    location,
+    serviceablePincodesUpdated: replacement.updated,
+    finalization,
+  };
+}
+
+async function finalizeGate1(efrId) {
+  logger.info('Finalize registration Gate 1 · efrId=' + efrId);
+  const result = await lifecycleService.finalizeMobileRegistrationGate1(efrId);
+  if (!result.schemaInstalled) {
+    // Before the additive migration the legacy derived gate remains the source
+    // of truth, so finalization is an intentional no-op.
+    return { finalized: false, schemaInstalled: false, lifecycle: null };
+  }
+  return {
+    finalized: result.changed === true,
+    schemaInstalled: true,
+    lifecycle: result.lifecycle,
+  };
+}
+
+/**
+ * Automatic finalization runs after every order-independent profile card.
+ * Missing cards are expected and return a successful pending projection;
+ * transient/system failures still reject so the standalone durable finalize
+ * operation remains queued for retry.
+ */
+async function finalizeGate1IfReady(efrId) {
+  try {
+    return await finalizeGate1(efrId);
+  } catch (error) {
+    if (
+      Number(error?.status) === 409
+      && error?.details?.code === 'REGISTRATION_GATE1_INCOMPLETE'
+    ) {
+      return {
+        finalized: false,
+        schemaInstalled: true,
+        lifecycle: null,
+        pending: true,
+        missing: Array.isArray(error.details.missing) ? error.details.missing : [],
+      };
+    }
+    throw error;
+  }
+}
+
+/**
+ * Profile-card domain data has already committed before this derived
+ * transition runs. No finalization error may turn that applied write into a
+ * client failure: a durable client would otherwise dead-letter the save while
+ * the database already contains it. The explicit /registration/finalize
+ * endpoint remains strict and is the independently retryable convergence path.
+ */
+async function finalizeGate1AfterSave(efrId) {
+  try {
+    return await finalizeGate1IfReady(efrId);
+  } catch (error) {
+    logger.warn({
+      efrId,
+      status: Number(error?.status) || 500,
+      code: error?.details?.code || error?.code || 'REGISTRATION_FINALIZATION_DEFERRED',
+    }, 'Post-save Gate-1 finalization deferred');
+    return {
+      finalized: false,
+      schemaInstalled: null,
+      lifecycle: null,
+      pending: true,
+      errorCode: 'REGISTRATION_FINALIZATION_DEFERRED',
+    };
+  }
 }
 
 // ─── PATCH language ─────────────────────────────────────────────────
@@ -468,7 +669,7 @@ async function savePersonalDetails(efrId, body) {
  * usable unique constraint beyond the efr_id PK, so we update first and
  * insert only when no row was touched.
  */
-async function setLanguage(efrId, language) {
+async function setLanguage(efrId, language, runner = pool) {
   const lang = String(language || '').trim();
   logger.info('Set preferred language · language=' + (lang || '-'));
   if (!lang) {
@@ -478,14 +679,14 @@ async function setLanguage(efrId, language) {
     throw err;
   }
 
-  const [upd] = await pool.query(
+  const [upd] = await runner.query(
     'UPDATE tbl_easyfixer_app SET language = ? WHERE efr_id = ?',
     [lang, efrId],
   );
   if (upd.affectedRows === 0) {
     // VERIFY: tbl_easyfixer_app PK column is `efr_id` (per legacy
     // EasyfixApp @Entity). Insert a minimal row carrying the language.
-    await pool.query(
+    await runner.query(
       `INSERT INTO tbl_easyfixer_app (efr_id, language, last_login_time)
        VALUES (?, ?, NOW())`,
       [efrId, lang],
@@ -500,5 +701,9 @@ module.exports = {
   getStatus,
   getRemaining,
   savePersonalDetails,
+  saveWorkArea,
+  finalizeGate1,
+  finalizeGate1IfReady,
+  finalizeGate1AfterSave,
   setLanguage,
 };

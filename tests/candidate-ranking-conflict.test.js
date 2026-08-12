@@ -28,7 +28,15 @@ const properties = require('../services/properties.service');
 
 // One eligible technician, so statsForCandidates actually runs its batch
 // (it short-circuits to an empty Map when the eligible set is empty).
-const EFR = { efr_id: 101, efr_name: 'Tester', efr_no: '9999999999', current_balance: 0 };
+const EFR = {
+  efr_id: 101,
+  efr_name: 'Tester',
+  efr_no: '9999999999',
+  current_balance: 0,
+  efr_status: 1,
+  is_technician_verified: 1,
+  efr_manager_id: null,
+};
 
 const fake = installFakePool([
   [/INFORMATION_SCHEMA/i, [{ n: 0 }]],

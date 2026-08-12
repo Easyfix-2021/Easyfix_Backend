@@ -7,6 +7,8 @@ const geocode = require('./pincode-geocode.service');
 // The appointment slot model — bands, the midnight-sentinel guard, and the
 // 1-hour conflict window this service's hard filter is built on.
 const slotModel = require('./time-slot');
+const easyfixerLifecycle = require('./easyfixer-lifecycle.service');
+const easyfixerWorkEligibility = require('./easyfixer-work-eligibility.service');
 // easyfix_properties — the ops-flippable kill switch for the booking-conflict
 // hard filter (see conflictFrame). Held as the MODULE, not a
 // destructured getProperty, so the flag is stubbable from tests (a destructured
@@ -131,6 +133,25 @@ const DEFAULTS = {
 // signal. New technicians (no history) carry neutral default performance
 // sub-scores so they still rank fairly within the non-preferred group.
 const RANKING_ORDER = Object.freeze(['worked_for_vertical', 'worked_for_client', 'performance']);
+
+/*
+ * Lifecycle states hidden from the Schedule & Assign technician SEARCH
+ * (per ops 2026-08-11). Search is otherwise a deliberate "match-anyone"
+ * inspection surface — a blocked-but-onboarded technician (INACTIVE, PAUSED,
+ * BLACKLISTED, …) still appears so ops can find them, with the offer control
+ * disabled. These states are different: the technician either never completed
+ * onboarding in the new app (NEW / REGISTRATION_INCOMPLETE) or was rejected
+ * during it, so they are noise in a scheduling picker and can never be offered
+ * work. The top-10 ranking already excludes them via the work-eligibility
+ * predicate; this brings search in line for these states only.
+ */
+const SEARCH_HIDDEN_LIFECYCLE_STATUSES = new Set([
+  'NEW',
+  'REGISTRATION_INCOMPLETE',
+  'APPLICATION_REJECTED',
+  'VERIFICATION_REJECTED',
+  'ASSESSMENT_FAILED',
+]);
 // Performance composite (tiebreaker only + letter grade): Rating 30 / TAT 20 /
 // SDA 20, normalised to sum 1.0.
 const PERFORMANCE_SUB = Object.freeze({
@@ -386,7 +407,9 @@ async function l1Eligibility(job, { applyDeepSkill = true, zoneIds = null, zoneP
    * Params are pushed in WHERE order (scope → skill → exclude → history) so
    * the positional placeholders bind correctly.
    */
-  const where = ['e.efr_status = 1', 'e.is_technician_verified = 1'];
+  const lifecycleEligibility = await easyfixerWorkEligibility.sqlPredicate('e');
+  const lifecycleProjection = await easyfixerLifecycle.readProjection('e');
+  const where = [lifecycleEligibility];
   const params = [];
 
   // ── Geographic scope ──
@@ -516,13 +539,16 @@ async function l1Eligibility(job, { applyDeepSkill = true, zoneIds = null, zoneP
     `SELECT e.efr_id, e.efr_name, e.efr_no, e.efr_email,
             e.efr_cityId, c.city_name,
             e.current_balance,
-            e.is_technician_verified
+            e.efr_status, e.is_technician_verified, e.efr_manager_id,
+            ${lifecycleProjection}
        FROM tbl_easyfixer e
        LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId
       WHERE ${where.join('\n        AND ')}`,
     params
   );
-  return rows;
+  // SQL is the hot-path filter; this zero-I/O mirror is defense-in-depth for a
+  // stale/malformed row during migration and makes the API invariant explicit.
+  return rows.filter((row) => easyfixerWorkEligibility.fromRow(row).canOffer);
 }
 
 // ─── Layer 2 + ranking stats ─────────────────────────────────────────
@@ -620,6 +646,7 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
     [sdaRows],
     workedClientRowsResult,
     workedVerticalRowsResult,
+    workedSameVerticalRowsResult,
     attRowsResult,
     deepSkillResult,
     anySkillResult,
@@ -783,7 +810,13 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
         )
       : Promise.resolve([[]]),
 
-    // Worked-for-this-vertical before?
+    // Worked-in-this-SERVICE-CATEGORY before? (Carpentry, Electrician, …)
+    // NOTE: historically commented "worked-for-this-vertical", but the predicate
+    // is `fk_service_catg_id` — this has always been CATEGORY, not vertical, and
+    // it is what the "Worked in Category?" column renders. The genuine
+    // client-vertical check is the separate query below. The legacy
+    // `worked_for_vertical` field keeps feeding off THIS map so the ranking
+    // order (RANKING_ORDER) is unchanged.
     job.fk_service_catg_id
       ? pool.query(
           `SELECT DISTINCT fk_easyfixter_id AS efr_id
@@ -793,6 +826,39 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
               AND job_status IN (3, 5)`,
           [...efrIds, job.fk_service_catg_id]
         )
+      : Promise.resolve([[]]),
+
+    /*
+     * Worked for the same CLIENT VERTICAL before? Drives the "Worked for
+     * Vertical?" column. A vertical is a client grouping in
+     * tbl_vertical_mapping (many-to-many over client_id × vertical_id — see
+     * the verticalId filter in job.service.js), NOT a service category. So:
+     * has this technician completed a job for ANY client that shares a
+     * vertical with THIS job's client? The inner SELECT resolves this job's
+     * client's verticals inline, so no extra round-trip is needed. Display
+     * only — deliberately NOT wired into the ranking sort.
+     */
+    job.fk_client_id
+      ? pool.query(
+          `SELECT DISTINCT j.fk_easyfixter_id AS efr_id
+             FROM tbl_job j
+            WHERE j.fk_easyfixter_id IN (${placeholders})
+              AND j.job_status IN (3, 5)
+              AND EXISTS (
+                    SELECT 1
+                      FROM tbl_vertical_mapping vm_job
+                      JOIN tbl_vertical_mapping vm_other
+                        ON vm_other.vertical_id = vm_job.vertical_id
+                     WHERE vm_job.client_id = ?
+                       AND vm_other.client_id = j.fk_client_id
+                  )`,
+          [...efrIds, job.fk_client_id]
+        ).catch((e) => {
+          // Fail-soft: a missing/renamed tbl_vertical_mapping must degrade the
+          // single column to "No", never 500 the whole candidate list.
+          logger.warn({ err: e.message }, 'candidate-ranking: worked-for-vertical lookup failed');
+          return [[]];
+        })
       : Promise.resolve([[]]),
 
     // Attendance for the JOB DATE — green tick ONLY when a row exists for
@@ -903,6 +969,10 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
   for (const r of (workedClientRowsResult[0] || [])) workedClientMap.set(r.efr_id, true);
   const workedVerticalMap = new Map();
   for (const r of (workedVerticalRowsResult[0] || [])) workedVerticalMap.set(r.efr_id, true);
+  // Genuine client-vertical match (tbl_vertical_mapping) — distinct from the
+  // service-category map above despite that one's legacy "vertical" naming.
+  const workedSameVerticalMap = new Map();
+  for (const r of (workedSameVerticalRowsResult[0] || [])) workedSameVerticalMap.set(r.efr_id, true);
   // Membership = EXPLICITLY ABSENT (is_leave_marked = 1). Non-membership —
   // including "never marked attendance at all" — means present. See the query.
   const absentMap = new Map((attRowsResult[0] || []).map((r) => [r.efr_id, true]));
@@ -1077,7 +1147,10 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
       sda_rate:           sdaRow ? sdaRow.rate : null,
       sda_history:        !!sdaRow,
       worked_for_client:  workedClientMap.get(id) === true,
+      // Legacy field — SERVICE-CATEGORY match, kept as the ranking key.
       worked_for_vertical:workedVerticalMap.get(id) === true,
+      // True client-vertical match — display column only.
+      worked_for_same_vertical: workedSameVerticalMap.get(id) === true,
       // Drives the modal's "Attendance Today" tick/cross. Same rule as
       // attendance_for_job_date: a cross now means EXPLICITLY marked absent
       // (is_leave_marked=1), not merely "hasn't marked attendance".
@@ -1171,6 +1244,30 @@ function scoreOne({ avg_rating, avg_tat_hours, tat_history,
  *   job   — the job row (for payment_mode label)
  */
 function buildCandidateRow(tech, s, job) {
+  const { lifecycle, canOffer } = easyfixerWorkEligibility.fromRow(tech);
+  const inactiveReason = String(tech.inactive_reason ?? '').trim();
+  const legacyReason = [
+    tech.send_back_to_tx_reason_crm,
+    tech.inactive_comment,
+    // inactive_reason is commonly a numeric legacy FK. A bare "12" is not a
+    // useful operator explanation, so only surface it when the column itself
+    // carries human text; otherwise the status-specific fallback below wins.
+    /^\d+$/.test(inactiveReason) ? null : inactiveReason,
+  ].map((value) => String(value ?? '').trim()).find(Boolean) || null;
+  /*
+   * The reason line answers ONE question: why can this technician not be
+   * offered the job? The legacy RCA columns (send_back_to_tx_reason_crm /
+   * inactive_comment / inactive_reason) are NOT cleared when a technician is
+   * reactivated, so they are stale history on anyone who is working again.
+   * Surfacing them unconditionally printed "Rejected" under an ACTIVE,
+   * fully-offerable technician in the Schedule & Assign picker. Only consult
+   * them when the technician genuinely cannot receive offers.
+   */
+  const lifecycleReason = !canOffer
+    ? (lifecycle.reason
+      || legacyReason
+      || `${String(lifecycle.status).replaceAll('_', ' ')} technicians cannot receive new job offers.`)
+    : (lifecycle.reason || null);
   const out = scoreOne({
     avg_rating:          s.avg_rating,
     avg_tat_hours:       s.avg_tat_hours,
@@ -1191,6 +1288,10 @@ function buildCandidateRow(tech, s, job) {
     city_name:     tech.city_name,
     current_balance: Number(tech.current_balance ?? 0),
     account_balance: Number(tech.current_balance ?? 0),
+    lifecycle_status:      lifecycle.status,
+    lifecycle_reason_code: lifecycle.reasonCode,
+    lifecycle_reason:      lifecycleReason,
+    can_offer:             canOffer,
     active_jobs:   s.active_jobs,
     job_count:     s.job_count ?? 0, // completed jobs; "Fresher" chip when < 5
     avg_rating:    Number((s.avg_rating ?? 0).toFixed(2)),
@@ -1200,6 +1301,8 @@ function buildCandidateRow(tech, s, job) {
     sda_history:   s.sda_history,
     worked_for_client:   s.worked_for_client,
     worked_for_vertical: s.worked_for_vertical,
+    // "Worked for Vertical?" column — same CLIENT VERTICAL, not category.
+    worked_for_same_vertical: s.worked_for_same_vertical === true,
     has_deep_skill:      s.has_deep_skill,
     // ── Schedule & Assign widened columns ──
     current_pincode:        s.current_pincode ?? null,
@@ -1315,6 +1418,7 @@ async function diagnoseEmptyPool(job, rejected = []) {
   };
   try {
     const hasOffers = await jobOfferTableExists();
+    const lifecycleEligibility = await easyfixerWorkEligibility.sqlPredicate('e');
     const skillPredicate = (job.fk_service_catg_id || job.fk_service_type_id)
       ? `EXISTS (SELECT 1 FROM tbl_efr_deepskill_mapping m
                   WHERE m.easyfixer_id = e.efr_id AND m.is_repairing = 1
@@ -1334,7 +1438,7 @@ async function diagnoseEmptyPool(job, rejected = []) {
                            WHERE sh.job_id = ? AND sh.easyfixer_id = e.efr_id
                              AND sh.reschedule_reason IS NOT NULL AND sh.reschedule_reason <> '')) AS removedEarlier
          FROM tbl_easyfixer e
-        WHERE e.efr_status = 1 AND e.is_technician_verified = 1 AND e.efr_cityId = ?`,
+        WHERE ${lifecycleEligibility} AND e.efr_cityId = ?`,
       [job.job_id, job.city_id],
     );
     for (const k of Object.keys(counts)) {
@@ -1699,10 +1803,17 @@ async function rankCandidatesForJob(jobId, {
 
   if (scored.length === 0 && totalEligible === 0) {
     const emptyReason = await diagnoseEmptyPool(job, rejected);
-    logger.info('Returning 0 candidates · no eligible techs · jobId=' + jobId + ' · reason=' + emptyReason.code);
+    // Reassign mode still needs the incumbent as read-only context even when
+    // there are zero eligible replacements. This row is marked is_current and
+    // can_offer=false, so it does not become a recommendation or assignment
+    // target; it only tells Ops who currently owns the job.
+    const incumbentContext = assignedEfrId
+      ? await ensureAssignedFirst([], assignedEfrId, job, [])
+      : [];
+    logger.info('Returning ' + incumbentContext.length + ' context candidate(s) · no eligible techs · jobId=' + jobId + ' · reason=' + emptyReason.code);
     return {
       job: enrichedJob, alreadyAssigned, note: note ?? 'no_eligible_techs',
-      l1Count: 0, l2Count: 0, candidates: [], rejected: [],
+      l1Count: 0, l2Count: 0, candidates: incumbentContext, rejected: [],
       emptyReason,
       config: { ranking_order: RANKING_ORDER, performance_sub: PERFORMANCE_SUB },
     };
@@ -1795,12 +1906,16 @@ async function ensureAssignedFirst(candidatesList, assignedEfrId, job, scoredAll
 
   // Path B: the assigned tech was filtered out before scoring (e.g. by L1).
   // Re-fetch their basic profile + stats so we can still render the row.
+  const lifecycleProjection = await easyfixerLifecycle.readProjection('e');
   const [[techRow]] = await pool.query(
     `SELECT e.efr_id, e.efr_name, e.efr_no, e.efr_email,
-            e.efr_cityId, c.city_name, e.current_balance
+            e.efr_cityId, c.city_name, e.current_balance,
+            e.efr_status, e.is_technician_verified, e.efr_manager_id,
+            ${lifecycleProjection}
        FROM tbl_easyfixer e
        LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId
-      WHERE e.efr_id = ? LIMIT 1`,
+      WHERE e.efr_id = ? AND NOT (e.efr_status <=> 3)
+      LIMIT 1`,
     [assignedEfrId]
   );
   if (!techRow) return candidatesList;
@@ -2171,22 +2286,37 @@ async function searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit =
     pinClause = ' OR e.efr_pin_no = ?';
     params.push(q);
   }
-  // Search is a "match-anyone" override so ops can bypass the RANKING filters
+  const hasLifecycleSchema = await easyfixerLifecycle.hasLifecycleSchema();
+  const lifecycleProjection = await easyfixerLifecycle.readProjection('e');
+  // Pre-migration derivation needs the user onboarding flags. Once lifecycle is
+  // installed those columns are authoritative, so avoid an eq_ref tbl_user join
+  // on this wildcard-search hot path (QA baseline scans ~9.4k easyfixers).
+  const legacyLifecycleColumns = hasLifecycleSchema ? '' : `
+            e.user_id, e.adhaar_card_number, e.efr_profile_img,
+            e.is_identity_details_verified_by_crm,
+            e.scheduled_reactivation_date, e.insert_date, e.update_date,
+            u.personal_details_filled AS user_personal_details_filled,
+            u.is_personal_detail_filled AS user_is_personal_detail_filled,`;
+  const legacyLifecycleJoin = hasLifecycleSchema
+    ? ''
+    : 'LEFT JOIN tbl_user u ON u.user_id = e.user_id';
+  // Search is a "match-anyone" inspection path so ops can bypass the RANKING filters
   // (deep-skill match, distance, serviceable pincode, attendance, same-slot
   // conflict, max-concurrent, COD balance, scheduling_history rejection) and
-  // assign a specific tech. But it must still enforce the two IDENTITY gates
-  // that make a row an assignable technician at all — the same hard gates
-  // l1Eligibility applies: efr_status = 1 (ACTIVE — canonical, do NOT invert to
-  // 0) AND is_technician_verified = 1 (verified profile). Without these, search
-  // surfaced inactive / unverified / incomplete-profile ghosts (e.g. a NULL
-  // is_technician_verified row with no efr_name) that can never be assigned.
+  // locate a specific tech. Restricted technicians stay visible with lifecycle
+  // status/reason + can_offer=false; the write path independently enforces that
+  // flag, so visibility is never mistaken for permission. Only legacy-deleted
+  // efr_status=3 rows are hidden.
   const [techRows] = await pool.query(
     `SELECT e.efr_id, e.efr_name, e.efr_no, e.efr_email,
-            e.efr_cityId, c.city_name, e.current_balance
+            e.efr_cityId, c.city_name, e.current_balance,
+            e.efr_status, e.is_technician_verified, e.efr_manager_id,
+            e.inactive_comment, e.inactive_reason, e.send_back_to_tx_reason_crm,${legacyLifecycleColumns}
+            ${lifecycleProjection}
        FROM tbl_easyfixer e
        LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId
-      WHERE e.efr_status = 1
-        AND e.is_technician_verified = 1
+       ${legacyLifecycleJoin}
+      WHERE NOT (e.efr_status <=> 3)
         AND (e.efr_name LIKE ? OR e.efr_no LIKE ? OR c.city_name LIKE ?${idClause}${pinClause})
       ORDER BY e.efr_name ASC
       LIMIT ?`,
@@ -2197,8 +2327,18 @@ async function searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit =
   if (capped) {
     logger.warn({ jobId, term: q, cap }, 'searchTechniciansForJob: result set hit the cap — term too broad');
   }
-  const rows = techRows.slice(0, cap);
-  logger.info('Found ' + rows.length + ' matching technicians' + (capped ? ' (capped)' : ''));
+  // Drop never-onboarded / rejected-in-registration technicians before the
+  // stats fan-out — they can never be offered work, so they are noise in a
+  // scheduling picker (and skipping them saves their stats queries too).
+  const matchedRows = techRows.slice(0, cap);
+  const rows = matchedRows.filter((r) => {
+    const status = easyfixerWorkEligibility.fromRow(r)?.lifecycle?.status;
+    return !SEARCH_HIDDEN_LIFECYCLE_STATUSES.has(status);
+  });
+  const hiddenCount = matchedRows.length - rows.length;
+  logger.info('Found ' + rows.length + ' matching technicians'
+    + (hiddenCount > 0 ? ` (${hiddenCount} hidden: not onboarded / rejected)` : '')
+    + (capped ? ' (capped)' : ''));
   if (rows.length === 0) return { job: await searchJobHeader(job), candidates: [], capped };
 
   const stats = await statsForCandidates(rows.map((r) => r.efr_id), job, job.fk_client_id);

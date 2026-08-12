@@ -8,6 +8,10 @@ const svc = require('../../services/mobile-profile-extra.service');
 const withdrawalService = require('../../services/withdrawal.service');
 const { pool } = require('../../db');
 const logger = require('../../logger');
+const {
+  verifyIdempotencyUpload,
+  deterministicUploadToken,
+} = require('../../middleware/verify-idempotency-upload');
 
 // Profile-image multipart upload — memory storage, single image ≤10MB.
 // Images-only allowlist mirrors routes/mobile/uploads.js + admin job images.
@@ -83,7 +87,11 @@ router.patch('/profile/name', validate(Joi.object({
  * return { url, imageId } (imageId == the stored key). When S3 is
  * disabled (local dev) the service falls back to local disk.
  */
-router.post('/profile/image', profileImageUpload.single('file'), async (req, res, next) => {
+router.post(
+  '/profile/image',
+  profileImageUpload.single('file'),
+  verifyIdempotencyUpload,
+  async (req, res, next) => {
   try {
     if (!req.file) {
       logger.warn('Profile image upload rejected · missing "file" field');
@@ -95,6 +103,7 @@ router.post('/profile/image', profileImageUpload.single('file'), async (req, res
       req.file.buffer,
       req.file.mimetype,
       req.file.originalname,
+      { storageToken: deterministicUploadToken(req) },
     ));
   } catch (e) {
     if (e?.code === 'LIMIT_FILE_SIZE') {
@@ -107,7 +116,8 @@ router.post('/profile/image', profileImageUpload.single('file'), async (req, res
     }
     return next(e);
   }
-});
+  },
+);
 
 // Weekly performance chart — MOVED to routes/mobile/performance.js
 // (`GET /api/mobile/performance/weekly`), which the RN app actually calls and
@@ -299,7 +309,13 @@ router.put('/serviceable-pincodes', validate(Joi.object({
     logger.info('Replace serviceable pincodes · efr=' + req.tech.efr_id + ' · count=' + req.body.pincodes.length);
     // actor=null → the technician is acting on their own behalf; the helper
     // stamps their efr_id as created_by/updated_by.
-    await verificationService.replaceServiceablePincodes(req.tech.efr_id, req.body.pincodes, null);
+    await verificationService.replaceServiceablePincodes(
+      req.tech.efr_id,
+      req.body.pincodes,
+      null,
+      null,
+      { representation: 'value' },
+    );
     modernOk(res, await svc.getServiceablePincodes(req.tech.efr_id));
   } catch (e) { next(e); }
 });

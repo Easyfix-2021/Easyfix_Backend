@@ -7,27 +7,70 @@ const logger = require('../../logger');
 const requireTechAuth = require('../../middleware/tech-auth');
 const { pool } = require('../../db');
 const techAuth = require('../../services/tech-auth.service');
+const registrationProfile = require('../../services/technician-registration-profile.service');
 const jobService = require('../../services/job.service');
 const addressService = require('../../services/address.service');
 const jobCommentService = require('../../services/job-comment.service');
 const shareService = require('../../services/job-share.service');
 const voice = require('../../services/voice.service');
+const easyfixerLifecycle = require('../../services/easyfixer-lifecycle.service');
 const { dailyBridgeCapReached, persistBridgeCall } = require('../public/_public-call');
 const { modernOk, modernError } = require('../../utils/response');
 const { rateLimit } = require('../../middleware/rate-limit');
+const {
+  requireTechJobMutationCapability,
+} = require('../../middleware/require-tech-lifecycle-capability');
+const { otpFailureHttpStatus } = require('./otp-http-status');
+const { upsertEasyfixerDocuments } = require('../../services/easyfixer-document.service');
 
 const mobile = Joi.string().pattern(/^[0-9]{10}$/);
 
-// Abuse guard for the public login-otp surface (it now self-onboards unknown
-// numbers, so each hit can create a tbl_user + tbl_easyfixer row + send an OTP).
-// Keyed by mobile when present, else IP. The threshold is deliberately GENEROUS
-// — 20 requests / 10 min — so it curbs scripted abuse without ever biting active
-// QA testing (incl. QA_DETERMINISTIC_OTP=true loops). In-memory per-process;
-// swap for a Redis store if/when this runs multi-instance (see rate-limit.js).
-const loginOtpRateLimit = rateLimit({
+// These limiters execute before Joi so abusive requests are throttled before
+// route work. Never retain the raw pre-validation body as a Map key: /api/mobile
+// accepts JSON bodies up to 10 MB, and unique oversized `mobile` strings would
+// otherwise stay resident for the whole window. Valid mobiles get their own
+// fixed-size bucket; every malformed value collapses into the caller's bounded
+// IP bucket.
+function boundedIpPart(req) {
+  return String(req.ip ?? 'unknown').trim().slice(0, 64) || 'unknown';
+}
+
+function mobileOrIpRateKey(namespace, req) {
+  const candidate = typeof req.body?.mobile === 'string'
+    ? req.body.mobile.trim()
+    : '';
+  if (/^\d{10}$/.test(candidate)) return `${namespace}:mobile:${candidate}`;
+  return `${namespace}:invalid:${boundedIpPart(req)}`;
+}
+
+// OTP issue has two independent ceilings: per mobile controls resend/provider
+// spend for one account, while per IP stops attackers rotating valid numbers.
+// Unknown numbers receive an OTP for self-onboarding but create no identity row
+// until verification succeeds. In-memory per process; replace with a shared
+// store before running multiple backend replicas (see rate-limit.js).
+const loginOtpMobileRateLimit = rateLimit({
   windowMs: 10 * 60_000,
   max: 20,
-  key: (req) => req.body?.mobile || req.ip,
+  key: (req) => mobileOrIpRateKey('login-otp', req),
+});
+const loginOtpIpRateLimit = rateLimit({
+  windowMs: 10 * 60_000,
+  max: 60,
+  key: (req) => `login-otp:ip:${boundedIpPart(req)}`,
+});
+
+// OTP verification is public too. Two independent generous buckets prevent
+// brute force against one number AND high-cardinality probing from one IP,
+// while staying well above legitimate manual/QA retry volume.
+const verifyOtpMobileRateLimit = rateLimit({
+  windowMs: 10 * 60_000,
+  max: 30,
+  key: (req) => mobileOrIpRateKey('verify-otp', req),
+});
+const verifyOtpIpRateLimit = rateLimit({
+  windowMs: 10 * 60_000,
+  max: 120,
+  key: (req) => `verify-otp:ip:${boundedIpPart(req)}`,
 });
 
 // Mirror the FCM token into tbl_easyfixer_app.device_id — the CANONICAL
@@ -62,12 +105,16 @@ async function upsertEasyfixerAppToken(efrId, fcmToken) {
 }
 
 // ─── Auth (public) ─────────────────────────────────────────────────
-router.post('/auth/login-otp', loginOtpRateLimit, validate(Joi.object({ mobile: mobile.required() })), async (req, res, next) => {
+router.post('/auth/login-otp', loginOtpIpRateLimit, loginOtpMobileRateLimit, validate(Joi.object({ mobile: mobile.required() })), async (req, res, next) => {
   try {
     logger.info('Login OTP requested');
     const r = await techAuth.createLoginOtp(req.body.mobile);
-    logger.info('Login OTP processed · delivered=' + r.found);
-    modernOk(res, { delivered: r.found, expiresAt: r.expiresAt || null });
+    logger.info('Login OTP processed · delivered=' + r.delivered);
+    modernOk(res, {
+      delivered: r.delivered,
+      expiresAt: r.expiresAt || null,
+      resendInSeconds: r.resendInSeconds,
+    });
   } catch (e) { next(e); }
 });
 
@@ -83,7 +130,7 @@ router.post('/auth/login-otp', loginOtpRateLimit, validate(Joi.object({ mobile: 
 //   request: { userId, otp, deviceId, fireBaseToken, userName }
 //   response: { status, message, data: <session-with-device> }
 // Our modern envelope wraps the same fields under { success, data }.
-router.post('/auth/verify-otp', validate(Joi.object({
+router.post('/auth/verify-otp', verifyOtpIpRateLimit, verifyOtpMobileRateLimit, validate(Joi.object({
   mobile:        mobile.required(),
   otp:           Joi.number().integer().min(1000).max(9999).required(),
   // Optional device fields — when present, the device is registered for push
@@ -93,14 +140,44 @@ router.post('/auth/verify-otp', validate(Joi.object({
   fcmToken:      Joi.string().trim().max(4096).optional(),
   fireBaseToken: Joi.string().trim().max(4096).optional(),
   appVersion:    Joi.string().trim().max(50).optional(),
-  language:      Joi.string().trim().max(10).optional(),
+  language:      Joi.string().trim().max(50).optional(),
+  // Additive R.03 fields. Both pincode names are accepted during the app
+  // rollout; homePincode is canonical and old clients may omit everything.
+  homePincode:   Joi.string().trim().pattern(/^\d{6}$/).optional(),
+  pincode:       Joi.string().trim().pattern(/^\d{6}$/).optional(),
+  referralSource: Joi.string().trim().max(255).allow('').optional(),
 })), async (req, res, next) => {
   try {
     logger.info('Verify login OTP · hasDeviceId=' + Boolean(req.body.deviceId));
-    const r = await techAuth.verifyLoginOtp(req.body.mobile, req.body.otp);
+    if (req.body.homePincode && req.body.pincode
+        && req.body.homePincode !== req.body.pincode) {
+      return modernError(res, 400, 'homePincode and pincode must match when both are supplied');
+    }
+    const homePincode = req.body.homePincode || req.body.pincode || null;
+    const hasRegistrationProfile = Boolean(
+      homePincode || req.body.referralSource || req.body.language,
+    );
+    let verifiedProfile = null;
+    const r = await techAuth.verifyLoginOtp(
+      req.body.mobile,
+      req.body.otp,
+      hasRegistrationProfile ? {
+        onVerifiedTech: async (tech, { runner }) => {
+          verifiedProfile = await registrationProfile.persistVerifiedProfile(
+            tech.efr_id,
+            {
+              homePincode,
+              referralSource: req.body.referralSource,
+              language: req.body.language,
+            },
+            runner,
+          );
+        },
+      } : undefined,
+    );
     if (!r.ok) {
       logger.warn('Login OTP verification failed · ' + r.reason);
-      return modernError(res, 401, r.reason);
+      return modernError(res, otpFailureHttpStatus(r.reason), r.reason);
     }
 
     // Device-info upsert. device_info schema reality (verified 2026-05-27
@@ -196,6 +273,12 @@ router.post('/auth/verify-otp', validate(Joi.object({
         name:   r.tech.efr_name,
         mobile: r.tech.efr_no,
         email:  r.tech.efr_email,
+        ...(verifiedProfile?.location ? {
+          homePincode: verifiedProfile.location.pincode,
+          city: verifiedProfile.location.city,
+          state: verifiedProfile.location.state,
+        } : {}),
+        ...(verifiedProfile?.language ? { language: verifiedProfile.language } : {}),
       },
       // `registered` = the device was registered for push this login, via the
       // device_info session AND/OR the canonical tbl_easyfixer_app token. True
@@ -209,11 +292,20 @@ router.post('/auth/verify-otp', validate(Joi.object({
         fcmStored: Boolean(fcm),
       },
     });
-  } catch (e) { next(e); }
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    return next(e);
+  }
 });
 
 // ─── Protected ─────────────────────────────────────────────────────
 router.use(requireTechAuth);
+
+// Server-side counterpart to the app's lifecycle policy. All /jobs writes are
+// guarded here before any sub-router or inline handler can mutate state: offer
+// decisions require new-work eligibility; already-assigned work uses the
+// continuation capability. Reads stay available for restricted technicians.
+router.use(requireTechJobMutationCapability);
 
 // Idempotency layer (offline outbox) — keyed off req.tech (set above by
 // requireTechAuth). Retries of a same-keyed write replay the stored response
@@ -228,6 +320,10 @@ router.use('/notices', require('./notices'));
 // My Team — the authed technician's downline (efr_manager_id). Mobile-only.
 router.use('/team', require('./team'));
 
+// Registration Identity save is isolated so its atomic name+Aadhaar contract
+// and authoritative duplicate handling can be route-tested independently.
+router.use('/profile', require('./profile-identity'));
+
 // Technician order-lifecycle + estimate sub-routers (NEW 2026-06-15, mobile-only
 // — no CRM overlap). MOUNTED BEFORE the inline `/jobs` + `/jobs/:id` handlers
 // below so the literal paths (`/jobs/search`, `/jobs/:id/rate-card`,
@@ -238,6 +334,36 @@ router.use('/jobs', require('./jobs-lifecycle'));
 router.use('/jobs', require('./jobs-estimate'));
 
 router.get('/me', (req, res) => modernOk(res, { tech: req.tech }));
+
+// Technician-initiated re-application. The protected-router idempotency layer
+// above replays requests carrying an Idempotency-Key; the transactional
+// lifecycle transition is also state-idempotent when a client retries without
+// a header after losing the response.
+router.post('/reapply', validate(Joi.object({
+  reason: Joi.string().trim().max(500).allow('', null).optional(),
+})), async (req, res, next) => {
+  try {
+    const result = await easyfixerLifecycle.requestReapplication(
+      req.tech.efr_id,
+      req.body || {},
+    );
+    modernOk(res, result, result.changed ? 're-application submitted' : 're-application already submitted');
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message, e.details);
+    next(e);
+  }
+});
+
+// Wall-only scalar summary. No ledger rows are returned and the app fetches it
+// only for INACTIVE/DORMANT/REAPPLIED lifecycle screens.
+router.get('/reapplication-summary', async (req, res, next) => {
+  try {
+    modernOk(res, await easyfixerLifecycle.getReapplicationSummary(req.tech.efr_id));
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message, e.details);
+    next(e);
+  }
+});
 
 // Dashboard — aggregated payload (2026-05-25, repointed at the new
 // orchestrator). Replaces the older 4-counts query. The orchestrator
@@ -487,8 +613,8 @@ router.post('/jobs/:id/customer-call', async (req, res, next) => {
 // with fk_easyfixter_id NULL (no single owner), and each offered tech has an
 // OFFERED row on tbl_job_offer. So there is NO "this job belongs to me" check
 // to do here — fk_easyfixter_id is deliberately NULL until someone wins the
-// race. We only guard that the job exists; eligibility (does this tech have an
-// open offer? is the job still BOOKED+unowned?) is enforced inside
+// race. Existence and eligibility (does this tech have an open offer? is the
+// job still BOOKED+unowned?) are enforced inside
 // jobService.acceptOffer(), which performs the race-safe first-wins claim
 // (UPDATE … WHERE job_status=0 AND fk_easyfixter_id IS NULL): the winner's
 // offer flips to ACCEPTED and all other open offers EXPIRE; a loser gets a
@@ -497,10 +623,9 @@ router.post('/jobs/:id/customer-call', async (req, res, next) => {
 router.post('/jobs/:id/accept', async (req, res, next) => {
   try {
     logger.info('Accept job offer · id=' + req.params.id);
-    const job = await jobService.getById(Number(req.params.id));
-    if (!job) return modernError(res, 404, 'job not found');
-    await jobService.acceptOffer(Number(job.job_id), req.tech.efr_id);
-    logger.info('Job offer accepted · id=' + job.job_id);
+    const jobId = Number(req.params.id);
+    await jobService.acceptOffer(jobId, req.tech.efr_id);
+    logger.info('Job offer accepted · id=' + jobId);
     modernOk(res, { accepted: true });
   } catch (e) {
     // acceptOffer throws a status-bearing error when this tech can't claim the
@@ -516,34 +641,22 @@ router.post('/jobs/:id/accept', async (req, res, next) => {
   }
 });
 
-// Reject the job OFFER: nulls fk_easyfixter_id + drops to BOOKED + writes
-// scheduling_history AND stamps the offer row REJECTED (offer_status=2) with
-// the reason. Flows through shared jobService.unassign() — same code path CRM
-// uses when an admin "force-unassigns" a job (e.g. tech is sick). Single
-// transaction + single webhook fan-out (RescheduleTech) live in the shared
-// service. `reasonId` (a tbl-reason lookup id) is recorded on the offer row
-// alongside the free-text `reason`, so the rejection carries both.
+// Reject an open pool offer, or a legacy direct assignment when the offer table
+// is absent/unused. Ownership, job state and the latest offer are validated and
+// locked inside the service transaction; there is deliberately no read-then-
+// write authorization check in this route.
 router.post('/jobs/:id/reject', validate(Joi.object({
   reason: Joi.string().min(3).max(500).required(),
   reasonId: Joi.number().integer().optional(),
 })), async (req, res, next) => {
   try {
     logger.info('Reject job offer · id=' + req.params.id + ' · reasonId=' + (req.body.reasonId != null ? req.body.reasonId : 'none'));
-    const job = await jobService.getById(Number(req.params.id));
-    if (!job) return modernError(res, 404, 'job not found');
-    // Allow the rejecting tech through if they own the job OR have an open offer
-    // on it (offered jobs are fk-NULL until accepted).
-    const canReject = job.fk_easyfixter_id === req.tech.efr_id
-      || (await jobService.techHasOpenOffer(job.job_id, req.tech.efr_id));
-    if (!canReject) return modernError(res, 404, 'job not found');
-    // Pool reject: mark ONLY this tech's offer REJECTED (the job stays offered
-    // to the others). Legacy (no offer table) falls back to unassign() inside.
     await jobService.rejectOffer(
-      job.job_id,
+      Number(req.params.id),
       req.tech.efr_id,
       { reason: req.body.reason, reasonId: req.body.reasonId },
     );
-    logger.info('Job offer rejected · id=' + job.job_id);
+    logger.info('Job offer rejected · id=' + req.params.id);
     modernOk(res, { rejected: true });
   } catch (e) {
     if (e.status) {
@@ -833,35 +946,12 @@ router.get('/profile/percentage', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// Upsert per-document rows into tbl_easyfixer_document (one row per efr_doc_type_id;
-// `rows` = array of [docTypeId, key], null/empty keys skipped). The table has NO
-// UNIQUE(efr_id, efr_doc_type_id) and schema changes are forbidden here, so callers
-// MUST hold a per-technician GET_LOCK across the surrounding transaction (see the
-// personal/identity handlers) — otherwise two concurrent SELECT-then-INSERT saves
-// (e.g. an offline-retry racing the live save) can insert duplicate (efr_id, type)
-// rows that the CRM doc view can't disambiguate.
 // tbl_address is a SHARED/polymorphic table (job rows + technician-personal rows)
 // and its column set can drift across deploys, so we probe the live columns once
 // and only ever write the ones that actually exist. Resolves the `city` vs
 // `city1` ambiguity automatically. Probe lives in address.service — every
 // tbl_address writer needs it.
 const addressColumns = () => addressService.addressColumnSet(pool);
-
-async function upsertEasyfixerDocuments(conn, efrId, rows) {
-  for (const [typeId, key] of rows) {
-    if (!key) continue;
-    const [[ex]] = await conn.query(
-      'SELECT efr_doc_id FROM tbl_easyfixer_document WHERE efr_id = ? AND efr_doc_type_id = ? LIMIT 1',
-      [efrId, typeId]);
-    if (ex) {
-      await conn.query('UPDATE tbl_easyfixer_document SET efr_document_name = ? WHERE efr_doc_id = ?', [key, ex.efr_doc_id]);
-    } else {
-      await conn.query(
-        'INSERT INTO tbl_easyfixer_document (efr_id, efr_doc_type_id, efr_document_name, created_date, created_by) VALUES (?, ?, ?, NOW(), ?)',
-        [efrId, typeId, key, efrId]);
-    }
-  }
-}
 
 // Personal-details — the profile-progression "personal" section (Flutter
 // `profilePersonalDetails`). Widened from the original name/marital-only save to
@@ -1225,74 +1315,6 @@ router.post('/profile/contact-info', validate(Joi.object({
     logger.info('Contact-info address saved · mode=' + (existing ? 'update' : 'insert'));
     modernOk(res, { updated: true });
   } catch (e) { next(e); }
-});
-
-// Identity step. Persists Aadhaar/PAN numbers + (on DigiLocker mismatch-accept)
-// name/DOB + the driving-licence flag on tbl_easyfixer, and the uploaded doc
-// keys as tbl_easyfixer_document rows. Doc-type ids (tbl_document_type): 13=Aadhaar
-// Front, 14=Aadhaar Back, 3=PAN, 12=Driving Licence. NEVER sets
-// is_identity_details_verified_by_crm — that is CRM-owned. Accepts both the app's
-// `aadhaarNumber/panNumber` and the legacy `aadhaar/pan` aliases.
-router.post('/profile/identity-details', validate(Joi.object({
-  aadhaarNumber: Joi.string().pattern(/^[0-9]{12}$/).optional(),
-  aadhaar: Joi.string().pattern(/^[0-9]{12}$/).optional(),
-  panNumber: Joi.string().pattern(/^[A-Za-z]{5}[0-9]{4}[A-Za-z]$/).optional(),
-  pan: Joi.string().pattern(/^[A-Za-z]{5}[0-9]{4}[A-Za-z]$/).optional(),
-  firstName: Joi.string().trim().max(255).optional(),
-  lastName: Joi.string().trim().max(255).optional(),
-  dob: Joi.string().trim().max(40).optional(),
-  haveDrivingLicence: Joi.boolean().optional(),
-  docs: Joi.object({
-    aadhaarFront: Joi.string().trim().max(255).optional(),
-    aadhaarBack: Joi.string().trim().max(255).optional(),
-    pan: Joi.string().trim().max(255).optional(),
-    drivingLicence: Joi.string().trim().max(255).optional(),
-  }).optional(),
-}).min(1)), async (req, res, next) => {
-  const efrId = req.tech.efr_id;
-  const lockKey = `efr_doc:${efrId}`;                 // serialize doc upserts per tech (no UNIQUE in schema)
-  const conn = await pool.getConnection();
-  try {
-    logger.info('Save identity-details profile section');
-    const b = req.body;
-    const aadhaar = b.aadhaarNumber || b.aadhaar || null;
-    const pan = (b.panNumber || b.pan) ? String(b.panNumber || b.pan).toUpperCase() : null;
-    const dl = b.haveDrivingLicence === undefined ? null : (b.haveDrivingLicence ? 1 : 0);
-    // Identity is "complete" once the Aadhaar number is captured (PAN is optional on
-    // the app). A name/DOB-only save (DigiLocker mismatch-accept before the number
-    // lands) must NOT flip the section to 100%.
-    const identityComplete = !!aadhaar;
-
-    await conn.query('SELECT GET_LOCK(?, 10)', [lockKey]);
-    await conn.beginTransaction();
-    await conn.query(
-      `UPDATE tbl_easyfixer
-          SET adhaar_card_number    = COALESCE(?, adhaar_card_number),
-              pan_card_number       = COALESCE(?, pan_card_number),
-              efr_first_name        = COALESCE(?, efr_first_name),
-              efr_last_name         = COALESCE(?, efr_last_name),
-              date_of_birth         = COALESCE(?, date_of_birth),
-              have_driving_lisence  = COALESCE(?, have_driving_lisence),
-              efr_identity_details_perc = COALESCE(?, efr_identity_details_perc)
-        WHERE efr_id = ?`,
-      [aadhaar, pan, b.firstName || null, b.lastName || null, b.dob || null, dl,
-       identityComplete ? 100 : null, efrId]);
-
-    const docs = b.docs || {};
-    await upsertEasyfixerDocuments(conn, efrId,
-      [[13, docs.aadhaarFront], [14, docs.aadhaarBack], [3, docs.pan], [12, docs.drivingLicence]]);
-
-    await conn.commit();
-    logger.info('Identity-details saved · complete=' + identityComplete);
-    modernOk(res, { updated: true });
-  } catch (e) {
-    logger.warn('Save identity-details failed · ' + e.message);
-    try { await conn.rollback(); } catch (_) { /* ignore */ }
-    next(e);
-  } finally {
-    try { await conn.query('SELECT RELEASE_LOCK(?)', [lockKey]); } catch (_) { /* lock auto-frees on release */ }
-    conn.release();
-  }
 });
 
 router.get('/bank-details', async (req, res, next) => {

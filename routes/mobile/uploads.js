@@ -7,6 +7,10 @@ const { modernOk, modernError } = require('../../utils/response');
 const s3Storage = require('../../utils/s3-storage');
 const { writeBuffer } = require('../../utils/file-storage');
 const uploadLogger = require('../../logger');
+const {
+  verifyIdempotencyUpload,
+  deterministicUploadToken,
+} = require('../../middleware/verify-idempotency-upload');
 
 /*
  * /api/mobile/uploads — generic Technician-app image-upload primitive.
@@ -63,13 +67,15 @@ const upload = multer({
 // (<ts>_<rand8>) but namespaced under MobileUploads/ and prefixed with the
 // technician's efr_id for at-a-glance ownership in the bucket. crypto
 // randomness (NOT Math.random) keeps the suffix unguessable.
-function buildKey(efrId) {
+function buildKey(efrId, req) {
+  const stableToken = deterministicUploadToken(req);
+  if (stableToken) return `MobileUploads/${Number(efrId)}_${stableToken}`;
   const ts = Date.now();
   const rand = crypto.randomBytes(4).toString('hex');
   return `MobileUploads/${Number(efrId)}_${ts}_${rand}`;
 }
 
-router.post('/', upload.single('file'), async (req, res, next) => {
+router.post('/', upload.single('file'), verifyIdempotencyUpload, async (req, res, next) => {
   const efrId = req.tech.efr_id;
   try {
     if (!req.file) {
@@ -85,7 +91,7 @@ router.post('/', upload.single('file'), async (req, res, next) => {
 
     if (s3Storage.isEnabled()) {
       key = await s3Storage.putAtKey({
-        key: buildKey(efrId),
+        key: buildKey(efrId, req),
         buffer: req.file.buffer,
         contentType: req.file.mimetype,
         originalName: req.file.originalname,
@@ -95,11 +101,13 @@ router.post('/', upload.single('file'), async (req, res, next) => {
     } else {
       // Local fallback — return the bare filename as the key so the
       // downstream consumers persist a value resolveImageUrl can read back.
+      const stableToken = deterministicUploadToken(req);
       const saved = writeBuffer(
         'general',
         req.file.buffer,
         req.file.originalname,
         req.file.mimetype,
+        stableToken ? { deterministicStem: `MobileUpload_${Number(efrId)}_${stableToken}` } : undefined,
       );
       key = saved.filename;
       url = saved.url;
@@ -147,7 +155,7 @@ router.post('/', upload.single('file'), async (req, res, next) => {
  *
  *   →  modernOk { documentId, key, url }
  */
-router.post('/document', upload.single('file'), async (req, res, next) => {
+router.post('/document', upload.single('file'), verifyIdempotencyUpload, async (req, res, next) => {
   const efrId = req.tech.efr_id;
   try {
     if (!req.file) {
@@ -161,7 +169,7 @@ router.post('/document', upload.single('file'), async (req, res, next) => {
     let storage;
     if (s3Storage.isEnabled()) {
       key = await s3Storage.putAtKey({
-        key: buildKey(efrId),
+        key: buildKey(efrId, req),
         buffer: req.file.buffer,
         contentType: req.file.mimetype,
         originalName: req.file.originalname,
@@ -169,7 +177,14 @@ router.post('/document', upload.single('file'), async (req, res, next) => {
       url = await s3Storage.resolveImageUrl(key);
       storage = 's3';
     } else {
-      const saved = writeBuffer('general', req.file.buffer, req.file.originalname, req.file.mimetype);
+      const stableToken = deterministicUploadToken(req);
+      const saved = writeBuffer(
+        'general',
+        req.file.buffer,
+        req.file.originalname,
+        req.file.mimetype,
+        stableToken ? { deterministicStem: `MobileUpload_${Number(efrId)}_${stableToken}` } : undefined,
+      );
       key = saved.filename;
       url = saved.url;
       storage = 'local';
@@ -207,3 +222,4 @@ router.post('/document', upload.single('file'), async (req, res, next) => {
 });
 
 module.exports = router;
+module.exports._internals = { buildKey };

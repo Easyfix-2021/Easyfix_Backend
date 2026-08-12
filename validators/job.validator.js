@@ -1,5 +1,10 @@
 const Joi = require('joi');
-const { ALL_STATUS_VALUES, SORTABLE_COLUMNS, OFFER_STATE_VALUES } = require('../services/job.service');
+const {
+  ALL_STATUS_VALUES,
+  SORTABLE_COLUMNS,
+  OFFER_STATE_VALUES,
+  MAX_OFFER_RECIPIENTS,
+} = require('../services/job.service');
 
 const intId   = Joi.number().integer().positive();
 /*
@@ -244,6 +249,18 @@ const createBody = Joi.object({
   original_appointment_time:      Joi.string().max(20).allow('', null).optional(),
   client_ref_id: Joi.string().max(100).optional(),
   job_reference_id: Joi.string().max(100).optional(),
+  // Multi-category fan-out family link — the job_id of the FIRST sibling
+  // created in this booking. When present, create() records a
+  // linked_job(parent_job_id=primary, child_job_id=new) row and inherits the
+  // parent's custom_property if this sibling didn't send one. Absent on the
+  // parent's own create.
+  primary_job_id: intId.optional(),
+  // Flattened legacy custom-property string ("Label:Value|…", tbl_job
+  // .custom_property varchar(510)). CRM bookings usually leave it null (props
+  // land in dedicated columns like branch_details); accepted for forwards-compat
+  // and so a sibling can carry an inherited value. Coerced to real NULL for
+  // empty/'null' by the service layer.
+  custom_property: Joi.string().max(510).allow('', null).optional(),
   // Top-level per-job override of the customer's master name. See
   // services/job.service.js (`job_customer_name` MUTABLE_COLUMNS
   // comment) for why this is distinct from `customer.customer_name`.
@@ -420,7 +437,7 @@ const assignBody = Joi.object({
  * /assign (IST wall-clock string — see the assignBody note above).
  */
 const offerBody = Joi.object({
-  easyfixerIds: Joi.array().items(intId).min(1).max(50).required(),
+  easyfixerIds: Joi.array().items(intId).min(1).max(MAX_OFFER_RECIPIENTS).required(),
   requestedDateTime: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$/).max(40).optional(),
   timeSlot: Joi.string().max(200).allow('', null).optional(),
   // Where the offer was made from — the CRM sends `source` when the whole batch

@@ -1,0 +1,122 @@
+{
+  "schemaVersion": 1,
+  "watchFiles": [
+    "middleware/idempotency.js",
+    "middleware/verify-idempotency-upload.js",
+    "routes/mobile/index.js",
+    "scripts/schema-verify.js",
+    "server.js",
+    "server/scheduler.js",
+    "services/deep-skill.service.js",
+    "services/easyfixer-document.service.js",
+    "services/easyfixer-lifecycle.service.js",
+    "services/easyfixer.service.js",
+    "services/easyfixer-verification.service.js",
+    "services/idempotency-retention.service.js",
+    "services/mobile-identity.service.js",
+    "services/mobile-profile-extra.service.js",
+    "services/mobile-registration.service.js",
+    "tests/aadhaar-uniqueness-compat.test.js",
+    "tests/easyfixer-lifecycle.test.js",
+    "tests/idempotency-retention.test.js",
+    "tests/idempotency-route.test.js",
+    "tests/idempotency.test.js",
+    "tests/idempotent-upload.test.js",
+    "tests/mobile-identity-route.test.js",
+    "tests/mobile-identity.test.js",
+    "tests/mobile-registration-work-area-route.test.js",
+    "tests/mobile-registration-work-area.test.js",
+    "tests/offline-schema-invariants.test.js",
+    "tests/serviceable-pincodes-atomic.test.js",
+    "tests/training-progress-concurrency.test.js",
+    "tests/training-progress-migration.test.js",
+    "utils/aadhaar-uniqueness.js",
+    "utils/file-storage.js"
+  ],
+  "watchPrefixes": [
+    "migrations/",
+    "routes/mobile/"
+  ],
+  "contracts": [
+    {
+      "operation": "registration.skills",
+      "method": "POST",
+      "path": "/api/mobile/deepskill/skills",
+      "implementationFiles": [
+        "routes/mobile/deepskill.js",
+        "services/deep-skill.service.js"
+      ],
+      "testFiles": [
+        "tests/idempotency.test.js"
+      ]
+    },
+    {
+      "operation": "registration.workArea",
+      "method": "PUT",
+      "path": "/api/mobile/registration/work-area",
+      "implementationFiles": [
+        "routes/mobile/registration.js",
+        "services/mobile-registration.service.js"
+      ],
+      "testFiles": [
+        "tests/mobile-registration-work-area.test.js",
+        "tests/mobile-registration-work-area-route.test.js",
+        "tests/serviceable-pincodes-atomic.test.js"
+      ]
+    },
+    {
+      "operation": "registration.identity",
+      "method": "POST",
+      "path": "/api/mobile/profile/identity-details",
+      "implementationFiles": [
+        "routes/mobile/profile-identity.js",
+        "services/mobile-identity.service.js"
+      ],
+      "testFiles": [
+        "tests/aadhaar-uniqueness-compat.test.js",
+        "tests/mobile-identity.test.js",
+        "tests/mobile-identity-route.test.js"
+      ]
+    },
+    {
+      "operation": "registration.finalize",
+      "method": "POST",
+      "path": "/api/mobile/registration/finalize",
+      "implementationFiles": [
+        "routes/mobile/registration.js",
+        "services/mobile-registration.service.js",
+        "services/easyfixer-lifecycle.service.js"
+      ],
+      "testFiles": [
+        "tests/easyfixer-lifecycle.test.js",
+        "tests/mobile-registration-work-area.test.js"
+      ]
+    },
+    {
+      "operation": "training.progress",
+      "method": "POST",
+      "path": "/api/mobile/training-videos/percentage",
+      "implementationFiles": [
+        "routes/mobile/profile-extra.js",
+        "services/mobile-profile-extra.service.js"
+      ],
+      "testFiles": [
+        "tests/training-progress-concurrency.test.js",
+        "tests/training-progress-migration.test.js",
+        "tests/offline-schema-invariants.test.js"
+      ]
+    },
+    {
+      "operation": "profile.language",
+      "method": "PATCH",
+      "path": "/api/mobile/registration/language",
+      "implementationFiles": [
+        "routes/mobile/registration.js",
+        "services/mobile-registration.service.js"
+      ],
+      "testFiles": [
+        "tests/idempotency.test.js"
+      ]
+    }
+  ]
+}

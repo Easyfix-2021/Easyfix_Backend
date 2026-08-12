@@ -17,6 +17,12 @@ const { stageVisibleStatuses } = require('../lib/job-stages');
 // what tbl_job.time_slot / requested_time / requested_date_time each mean and
 // why the slot STRING is no longer load-bearing anywhere.
 const { deriveTimeSlot, resolveTimeSlot, hasTimeOfDay, wallClockTime } = require('./time-slot');
+const easyfixerLifecycle = require('./easyfixer-lifecycle.service');
+const easyfixerWorkEligibility = require('./easyfixer-work-eligibility.service');
+const {
+  persistJobOfferBatch,
+  MAX_OFFER_RECIPIENTS,
+} = require('./job-offer-persistence.service');
 
 /*
  * THE OFFER MODEL feature flag. ON by default — only the literal string
@@ -199,6 +205,13 @@ const CLOSED_STATES = new Set([STATUS.COMPLETED, STATUS.COMPLETED_ALT]);
 
 // Terminal states — `setStatus` to these sets stamp timestamps
 const COMPLETED_STATES = new Set([STATUS.COMPLETED, STATUS.COMPLETED_ALT]);
+// A completed/cancelled job must never be revived by the assignment endpoint.
+// Keep this deliberately aligned with the established public-share liveness
+// rule: statuses 3, 5 and 6 are the terminal states in the legacy job model.
+const NON_ASSIGNABLE_STATES = new Set([...COMPLETED_STATES, STATUS.CANCELLED]);
+// Reject is a pre-start acknowledgement, not a generic lifecycle rewind.
+// Dedicated endpoints own every state after SCHEDULED.
+const DIRECT_REJECTABLE_STATES = new Set([STATUS.BOOKED, STATUS.SCHEDULED]);
 
 // ─── Job Age ────────────────────────────────────────────────────────
 /*
@@ -777,6 +790,48 @@ async function stampJobPrimarySpoc(jobId, ownerUserId, conn) {
   const db = conn || pool;
   const [[u]] = await db.query('SELECT mobile_no FROM tbl_user WHERE user_id = ? LIMIT 1', [ownerUserId || 0]);
   await db.query('UPDATE tbl_job SET job_primary_spoc = ? WHERE job_id = ?', [u?.mobile_no || null, jobId]);
+}
+
+/*
+ * `linked_job` is a LEGACY table (columns: parent_job_id, child_job_id) written
+ * by the old Java CRM to relate multi-category sibling jobs. The new stack links
+ * siblings by shared client_ref_id + job_reference_id, but we also mirror the
+ * legacy row so any tooling/report that reads `linked_job` keeps working. The
+ * table is absent on some deploys (e.g. QA), so probe once + no-op where missing.
+ */
+let _hasLinkedJobTable = null;
+async function hasLinkedJobTable() {
+  if (_hasLinkedJobTable !== null) return _hasLinkedJobTable;
+  try {
+    const [rows] = await pool.query("SHOW TABLES LIKE 'linked_job'");
+    _hasLinkedJobTable = rows.length > 0;
+  } catch (_e) { _hasLinkedJobTable = false; }
+  return _hasLinkedJobTable;
+}
+/*
+ * Record a parent→child family link in `linked_job`. Best-effort + idempotent:
+ * no-ops where the table is absent, skips a duplicate (parent,child) pair on a
+ * retry, and NEVER throws — a linking failure must not affect the already-
+ * committed job. Mirrors legacy JobDaoImpl's
+ * `INSERT INTO linked_job(parent_job_id, child_job_id)`.
+ */
+async function linkJobToParent(parentJobId, childJobId) {
+  try {
+    if (!parentJobId || !childJobId || parentJobId === childJobId) return;
+    if (!(await hasLinkedJobTable())) return;
+    const [[existing]] = await pool.query(
+      'SELECT 1 AS ok FROM linked_job WHERE parent_job_id = ? AND child_job_id = ? LIMIT 1',
+      [parentJobId, childJobId],
+    );
+    if (existing) return;
+    await pool.query(
+      'INSERT INTO linked_job (parent_job_id, child_job_id) VALUES (?, ?)',
+      [parentJobId, childJobId],
+    );
+    logger.info('Linked sibling job · parent=' + parentJobId + ' child=' + childJobId);
+  } catch (e) {
+    logger.warn('linked_job insert skipped for child ' + childJobId + ': ' + e.message);
+  }
 }
 
 /*
@@ -2813,6 +2868,32 @@ async function create(input, actor) {
     // is present in custom_property, hoist its value into branch_details and
     // strip it from the string so reports/views reading tbl_job.branch_details
     // stay consistent regardless of where the job was booked.
+    //
+    // Multi-category sibling inheritance (2026-08-11): when this create is a
+    // sibling in a booking family (the FE fan-out passes the FIRST sibling's id
+    // as primary_job_id), inherit the parent's flattened custom_property when
+    // the caller didn't send one. CRM bookings usually leave custom_property
+    // null (props live in dedicated columns), so this is a no-op there; it
+    // matters for families whose parent DID carry a value. Runs BEFORE the
+    // branch-hoist so an inherited branch token is normalised too. Owner + SPOC
+    // already flow via job_owner. Read via pool — the parent committed in an
+    // earlier request.
+    const primaryJobId = Number(input.primary_job_id) > 0 ? Number(input.primary_job_id) : null;
+    if (primaryJobId
+        && (input.custom_property == null
+            || String(input.custom_property).trim() === ''
+            || input.custom_property === 'null')) {
+      try {
+        const [[parentRow]] = await pool.query(
+          'SELECT custom_property FROM tbl_job WHERE job_id = ? LIMIT 1', [primaryJobId],
+        );
+        const parentCp = parentRow && parentRow.custom_property;
+        if (parentCp != null && String(parentCp).trim() !== '' && parentCp !== 'null') {
+          input.custom_property = parentCp;
+        }
+      } catch (_e) { /* best-effort — leave custom_property as-is */ }
+    }
+
     if ((input.branch_details == null || String(input.branch_details).trim() === '') && input.custom_property) {
       const isBranchKey = (s) => {
         const k = String(s || '').toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
@@ -3106,6 +3187,13 @@ async function create(input, actor) {
       // Best-effort, post-commit: add this job's pincode to the pincode catalog
       // (geocoded) if it's new. Idempotent + never throws — see ensureJobPincode.
       ensureJobPincode(input.address?.pin_code, actor);
+      // Best-effort, post-commit: record the multi-category family link
+      // (parent→child) in the legacy `linked_job` table so tooling that reads it
+      // sees the sibling relationship. Guarded (table may be absent on QA) +
+      // never throws — see linkJobToParent.
+      if (Number(input.primary_job_id) > 0 && Number(input.primary_job_id) !== jobId) {
+        linkJobToParent(Number(input.primary_job_id), jobId);
+      }
     });
     // NOTE: enquiry WhatsApp is intentionally NOT fired here for a direct
     // book-as-ENQUIRY (initial_status=7). create() never stamps
@@ -4012,20 +4100,27 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
  *   opts   : { requestedDateTime?, timeSlot? } — OPTIONAL schedule edit applied
  *            in the SAME transaction (mirrors assign()'s Schedule & Offer flow)
  *
- * Skips any tech that already holds an OPEN (status=0) offer on this job so a
- * re-offer doesn't create duplicate live offers. Fires job-offer pushes
- * fire-and-forget AFTER commit, only to the techs we actually inserted.
+ * Re-opens the latest historical row per technician and expires stray older
+ * OPEN duplicates, so a re-offer never creates multiple live offers. Fires one
+ * bounded, set-based job-offer push batch after commit.
  *
  * Returns the full getById() payload.
  */
 async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, timeSlot, source, sourceByEfr } = {}) {
   const ids = Array.from(new Set((Array.isArray(efrIds) ? efrIds : [efrIds])
     .map((v) => Number(v))
-    .filter((n) => Number.isInteger(n) && n > 0)));
+    .filter((n) => Number.isInteger(n) && n > 0)))
+    .sort((a, b) => a - b);
   logger.info('Offer job to technicians · id=' + jobId + ' · techCount=' + ids.length + (requestedDateTime ? ' · reschedule=yes' : ''));
   if (!ids.length) {
     logger.warn('Offer rejected, no valid easyfixer · id=' + jobId);
     const err = new Error('at least one easyfixer is required to offer a job'); err.status = 400; throw err;
+  }
+  if (ids.length > MAX_OFFER_RECIPIENTS) {
+    const err = new Error(`a job can be offered to at most ${MAX_OFFER_RECIPIENTS} technicians at once`);
+    err.status = 400;
+    err.code = 'TOO_MANY_OFFER_RECIPIENTS';
+    throw err;
   }
 
   const existing = await getJobMeta(jobId);
@@ -4047,10 +4142,6 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
     return assign(jobId, { easyfixerId: ids[0], requestedDateTime, timeSlot }, actor);
   }
 
-  // Defense-in-depth: every tech in the offer pool must be verified+active.
-  // (The OFF path above delegates to assign(), which runs the same gate.)
-  await assertTechniciansVerified(ids);
-
   // Normalise the OPTIONAL schedule edit exactly as assign() does — an IST
   // wall-clock string stored as a literal "YYYY-MM-DD HH:mm:ss" (never a JS
   // Date, which would tz-shift on a UTC host). See assign() for the rationale.
@@ -4066,6 +4157,9 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
   }
   const hasSlot = timeSlot !== undefined && timeSlot !== null && timeSlot !== '';
 
+  // Resolve the schema-dependent projection before opening the transaction;
+  // the actual eligibility read happens under row locks below.
+  const lifecycleProjection = await easyfixerLifecycle.readProjection('e');
   const conn = await pool.getConnection();
   const offeredIds = [];
   // Who is putting this offer out — the SAME actor stamped onto the job's
@@ -4075,6 +4169,34 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
   const offeredBy = (actor && actor.user_id != null) ? actor.user_id : null;
   try {
     await conn.beginTransaction();
+
+    // Lifecycle and offer creation serialize on the technician rows. A status
+    // change between candidate-list load and submit therefore cannot leak a new
+    // offer to a PAUSED/INACTIVE/etc technician.
+    await assertTechniciansCanReceiveJobs(ids, conn, {
+      forUpdate: true,
+      lifecycleProjection,
+    });
+
+    // Lock order is technician(s), then job across offer/assign/accept. The
+    // earlier getJobMeta only selected the branch; this locked row is the
+    // authority for the write and closes the schedule-vs-assign race.
+    const [[lockedJob]] = await conn.query(
+      `SELECT job_id, job_status, fk_easyfixter_id
+         FROM tbl_job
+        WHERE job_id = ?
+        FOR UPDATE`,
+      [jobId],
+    );
+    if (!lockedJob) {
+      const err = new Error('job not found'); err.status = 404; throw err;
+    }
+    if (Number(lockedJob.job_status) !== STATUS.BOOKED || lockedJob.fk_easyfixter_id != null) {
+      const err = new Error('job must be BOOKED and unassigned before it can be offered');
+      err.status = 409;
+      err.code = 'JOB_NOT_OFFERABLE';
+      throw err;
+    }
 
     // The pool offer IS the ops "Schedule & Assign" action, so the schedule
     // AUDIT columns must be stamped here — scheduled_date_time ("Schedule On"),
@@ -4130,49 +4252,16 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
       await conn.query(`UPDATE tbl_job SET ${sets.join(', ')} WHERE job_id = ?`, values);
     }
 
-    // RE-OFFER SEMANTICS — ONE row per (job, tech) carrying the offer history:
-    //   offer_count = times (re)offered · created_on = FIRST offer · updated_on =
-    //   LAST offer · offered_at = LAST offer (drives the 30-min accept window).
-    // A manual re-offer (e.g. from Search Results) bumps the count + timestamps and
-    // REOPENS the offer so the tech can accept again within 30 min — whether the
-    // prior offer was stale-open, expired, or rejected. First-ever offer INSERTs.
-    // Any older stray open rows for the tech are collapsed so exactly one stays open.
-    for (const efrId of ids) {
-      // Per-tech offer source (top10 / search / auto): sourceByEfr wins, else the
-      // batch-wide source, else null. COALESCE on re-offer keeps the prior source
-      // when this offer didn't specify one.
-      const src = (sourceByEfr && sourceByEfr[efrId]) || source || null;
-      const [[latest]] = await conn.query(
-        `SELECT job_offer_id FROM tbl_job_offer
-          WHERE job_id = ? AND fk_easyfixter_id = ?
-          ORDER BY job_offer_id DESC LIMIT 1`,
-        [jobId, efrId],
-      );
-      if (latest) {
-        await conn.query(
-          `UPDATE tbl_job_offer
-              SET offer_status = ${OFFER_STATUS.OFFERED}, offered_at = NOW(), updated_on = NOW(),
-                  offer_count = offer_count + 1, offer_source = COALESCE(?, offer_source),
-                  offered_by_user_id = COALESCE(?, offered_by_user_id),
-                  responded_at = NULL, reject_reason = NULL, reject_reason_id = NULL
-            WHERE job_offer_id = ?`,
-          [src, offeredBy, latest.job_offer_id],
-        );
-        await conn.query(
-          `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
-            WHERE job_id = ? AND fk_easyfixter_id = ? AND job_offer_id <> ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
-          [jobId, efrId, latest.job_offer_id],
-        );
-      } else {
-        await conn.query(
-          `INSERT INTO tbl_job_offer
-             (job_id, fk_easyfixter_id, offer_status, offered_at, created_on, updated_on, offer_count, offer_source, offered_by_user_id)
-           VALUES (?, ?, 0, NOW(), NOW(), NOW(), 1, ?, ?)`,
-          [jobId, efrId, src, offeredBy],
-        );
-      }
-      offeredIds.push(efrId);
-    }
+    // Preserve the existing re-offer semantics, but keep SQL work constant for
+    // every supported batch size: one latest-row read plus at most three bulk
+    // writes. The technician locks above serialize overlapping batches.
+    offeredIds.push(...await persistJobOfferBatch(conn, {
+      jobId,
+      efrIds: ids,
+      source,
+      sourceByEfr,
+      offeredBy,
+    }));
 
     await conn.commit();
   } catch (e) {
@@ -4184,11 +4273,11 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
   }
 
   logger.info('Job offered · id=' + jobId + ' · newOffers=' + offeredIds.length);
-  // Fire-and-forget offer pushes AFTER commit — only to techs we actually
-  // inserted a fresh offer for. Never throws into the offer path.
-  for (const efrId of offeredIds) {
+  // Fire-and-forget offer pushes AFTER commit. Token resolution is set-based
+  // (two queries for up to 50 technicians) and FCM concurrency is bounded.
+  if (offeredIds.length) {
     require('./job-offer-push.service')
-      .sendJobOfferPush(efrId, { jobId })
+      .sendJobOfferPushBatch(offeredIds, { jobId })
       .catch(() => {});
   }
 
@@ -4198,39 +4287,62 @@ async function offerToTechnicians(jobId, efrIds, actor, { requestedDateTime, tim
 }
 
 /*
- * Defense-in-depth verified gate for the assignment/offer write path.
- * candidate-ranking.service.js + auto-assign.service.js already filter to
- * `efr_status=1 AND is_technician_verified=1` when BUILDING the technician
- * list, but the write endpoints historically trusted that list. Post the
- * onboarding redesign, many unverified techs live inside the app, so a
- * direct/stray call with an unverified efr_id must be rejected here too —
- * making "unverified technicians never get work" a hard invariant. Throws
- * 400 (code TECH_NOT_VERIFIED) naming the offending id(s). Accepts a scalar
- * or array; `runner` may be a pooled connection so it can run inside a txn.
+ * Server-authoritative receiveNewJobs gate for assign/offer/accept writes.
+ * Candidate rows are advisory and can be stale by submit time; this guard
+ * projects lifecycle state for the whole submitted set in ONE query and can
+ * lock those technician rows inside the caller's transaction.
  */
-async function assertTechniciansVerified(efrIds, runner = pool) {
+async function assertTechniciansCanReceiveJobs(
+  efrIds,
+  runner = pool,
+  { forUpdate = false, lifecycleProjection = null } = {},
+) {
   const ids = Array.from(new Set(
     (Array.isArray(efrIds) ? efrIds : [efrIds])
       .map((v) => Number(v))
       .filter((n) => Number.isInteger(n) && n > 0),
-  ));
+  )).sort((a, b) => a - b);
   if (!ids.length) return;
+  const projection = lifecycleProjection || await easyfixerLifecycle.readProjection('e');
   const [rows] = await runner.query(
-    `SELECT efr_id FROM tbl_easyfixer
-      WHERE efr_id IN (?) AND efr_status = 1 AND is_technician_verified = 1`,
+    `SELECT e.efr_id, e.efr_status, e.is_technician_verified, e.efr_manager_id,
+            ${projection}
+      FROM tbl_easyfixer e
+      WHERE e.efr_id IN (?)
+      ORDER BY e.efr_id ASC
+      ${forUpdate ? 'FOR UPDATE' : ''}`,
     [ids],
   );
-  const okIds = new Set(rows.map((r) => Number(r.efr_id)));
-  const bad = ids.filter((id) => !okIds.has(id));
-  if (bad.length) {
-    logger.warn('Assign/offer rejected, technician(s) not verified · efrIds=' + bad.join(','));
-    const err = new Error(
-      bad.length === 1
-        ? `easyfixer ${bad[0]} is not verified and cannot be assigned work`
-        : `easyfixers ${bad.join(', ')} are not verified and cannot be assigned work`,
+  const byId = new Map(rows.map((row) => [Number(row.efr_id), row]));
+  const blocked = ids.flatMap((id) => {
+    const row = byId.get(id);
+    if (!row) return [{ efrId: id, status: 'NOT_FOUND', reasonCode: null, reason: 'easyfixer not found' }];
+    const { lifecycle, canOffer } = easyfixerWorkEligibility.fromRow(row);
+    if (canOffer) return [];
+    return [{
+      efrId: id,
+      status: lifecycle.status,
+      reasonCode: lifecycle.reasonCode,
+      reason: lifecycle.reason,
+    }];
+  });
+  if (blocked.length) {
+    const idsText = blocked.map((item) => item.efrId).join(',');
+    const first = blocked[0];
+    logger.warn(
+      'Assign/offer rejected, technician lifecycle blocks new jobs · efrIds=' + idsText
+      + ' · statuses=' + blocked.map((item) => item.status).join(','),
     );
+    const reasonText = first.reason ? `: ${first.reason}` : '';
+    const err = new Error(blocked.length === 1
+      ? `easyfixer ${first.efrId} cannot receive new jobs while status is ${first.status}${reasonText}`
+      : `easyfixers ${idsText} cannot receive new jobs in their current lifecycle status`);
     err.status = 400;
-    err.code = 'TECH_NOT_VERIFIED';
+    err.code = blocked.every((item) => {
+      const row = byId.get(item.efrId);
+      return row && Number(row.is_technician_verified) !== 1;
+    }) ? 'TECH_NOT_VERIFIED' : 'TECH_CANNOT_RECEIVE_JOBS';
+    err.details = { technicians: blocked };
     throw err;
   }
 }
@@ -4258,28 +4370,10 @@ async function assertTechniciansVerified(efrIds, runner = pool) {
  */
 async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requestedDateTime, timeSlot }, actor) {
   logger.info('Assign job to technician · id=' + jobId + ' · easyfixerId=' + easyfixerId + (requestedDateTime ? ' · reschedule=yes' : ''));
-  // Check tech + job in parallel — they're independent lookups. Fails either
-  // way with the right 400/404, same as before, but cuts one round-trip.
-  const [[[tech]], existing] = await Promise.all([
-    pool.query(
-      'SELECT efr_id, efr_status FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1',
-      [easyfixerId]
-    ),
-    getJobMeta(jobId),
-  ]);
-  if (!tech) {
-    logger.warn('Assign rejected, easyfixer not found · id=' + jobId + ' · easyfixerId=' + easyfixerId);
-    const err = new Error(`easyfixer ${easyfixerId} not found`); err.status = 400; throw err;
-  }
-  if (!tech.efr_status) {
-    logger.warn('Assign rejected, easyfixer inactive · id=' + jobId + ' · easyfixerId=' + easyfixerId);
-    const err = new Error(`easyfixer ${easyfixerId} is inactive`); err.status = 400; throw err;
-  }
-  // Defense-in-depth verified gate (see assertTechniciansVerified). auto-assign
-  // + CRM both source ids from the verified candidate list; this rejects a
-  // direct/stray call with an unverified id.
-  await assertTechniciansVerified([easyfixerId]);
-  if (!existing) {
+  // This read chooses offer-vs-direct mode only. The selected path revalidates
+  // lifecycle + job state under row locks before writing.
+  const preloadedJob = await getJobMeta(jobId);
+  if (!preloadedJob) {
     logger.warn('Assign job not found · id=' + jobId);
     const err = new Error('job not found'); err.status = 404; throw err;
   }
@@ -4310,15 +4404,60 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
   // — the job stays BOOKED, fk_easyfixter_id stays NULL, the tech gets an
   // OFFERED row + push, and the legacy hard-schedule path below is skipped.
   // The optional schedule edit rides along in offerToTechnicians()'s own txn.
-  if (offerFlowEnabled() && (await jobOfferTableExists())) {
+  const hasOfferTable = await jobOfferTableExists();
+  if (offerFlowEnabled()
+      && hasOfferTable
+      && Number(preloadedJob.job_status) === STATUS.BOOKED
+      && preloadedJob.fk_easyfixter_id == null) {
     return offerToTechnicians(jobId, [easyfixerId], actor, { requestedDateTime, timeSlot });
   }
 
+  const lifecycleProjection = await easyfixerLifecycle.readProjection('e');
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
 
-    const isReassign = existing.fk_easyfixter_id && existing.fk_easyfixter_id !== easyfixerId;
+    await assertTechniciansCanReceiveJobs([easyfixerId], conn, {
+      forUpdate: true,
+      lifecycleProjection,
+    });
+
+    const [[lockedJob]] = await conn.query(
+      `SELECT job_id, job_status, fk_easyfixter_id
+         FROM tbl_job
+        WHERE job_id = ?
+        FOR UPDATE`,
+      [jobId],
+    );
+    if (!lockedJob) {
+      const err = new Error('job not found'); err.status = 404; throw err;
+    }
+
+    // getJobMeta() above decides whether this request follows offer or direct
+    // assignment semantics. Re-check the exact fields that made that decision
+    // after taking the job lock; otherwise an unassign/cancel/accept racing in
+    // between can be overwritten by this stale request.
+    const preloadedOwner = preloadedJob.fk_easyfixter_id == null
+      ? null
+      : Number(preloadedJob.fk_easyfixter_id);
+    const lockedOwner = lockedJob.fk_easyfixter_id == null
+      ? null
+      : Number(lockedJob.fk_easyfixter_id);
+    if (Number(lockedJob.job_status) !== Number(preloadedJob.job_status)
+        || lockedOwner !== preloadedOwner) {
+      const err = new Error('job assignment changed; refresh and try again');
+      err.status = 409;
+      err.code = 'JOB_ASSIGNMENT_CHANGED';
+      throw err;
+    }
+    if (NON_ASSIGNABLE_STATES.has(Number(lockedJob.job_status))) {
+      const err = new Error('completed or cancelled jobs cannot be assigned');
+      err.status = 409;
+      err.code = 'JOB_NOT_ASSIGNABLE';
+      throw err;
+    }
+
+    const isReassign = lockedJob.fk_easyfixter_id && lockedJob.fk_easyfixter_id !== easyfixerId;
     const now = new Date();
 
     // Build the SET list. The schedule edit (requested_date_time + time_slot)
@@ -4370,6 +4509,18 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
       `UPDATE tbl_job SET ${sets.join(', ')} WHERE job_id = ?`,
       values
     );
+
+    // Direct assignment/reassignment makes every prior pool offer obsolete.
+    // Close them while holding the job lock so flag changes and mixed-version
+    // replicas cannot leave a stale decision that another technician can see.
+    if (hasOfferTable) {
+      await conn.query(
+        `UPDATE tbl_job_offer
+            SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
+          WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
+        [jobId],
+      );
+    }
 
     await conn.query(
       `INSERT INTO scheduling_history (job_id, easyfixer_id, schedule_time, reason_id, reschedule_reason)
@@ -4429,72 +4580,100 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
  * Returns the full getById() payload so callers can use it for
  * response immediately.
  */
-async function unassign(jobId, { reason, reasonId }, actor) {
-  logger.info('Unassign job · id=' + jobId + (reasonId != null ? ' · reasonId=' + reasonId : ''));
+function normalizeUnassignReason(reason, jobId) {
   if (!reason || typeof reason !== 'string' || !reason.trim()) {
     logger.warn('Unassign rejected, reason required · id=' + jobId);
     const err = new Error('reason is required to unassign a job'); err.status = 400; throw err;
   }
-  const existing = await getJobMeta(jobId);
-  if (!existing) {
-    logger.warn('Unassign job not found · id=' + jobId);
-    const err = new Error('job not found'); err.status = 404; throw err;
-  }
-  if (!existing.fk_easyfixter_id) {
-    // Nothing to unassign — treat as a soft no-op rather than an
-    // error so retries are idempotent.
-    logger.info('Unassign no-op, job has no technician · id=' + jobId);
-    return getById(jobId);
-  }
-  const techIdAtUnassign = existing.fk_easyfixter_id;
+  return reason.trim();
+}
 
+/*
+ * Apply the shared direct-assignment rejection while the caller holds the job
+ * row lock. Keeping these writes in one helper lets admin/legacy unassign and
+ * mobile reject share the exact transaction without duplicating audit logic.
+ */
+async function applyUnassignLocked(conn, jobId, lockedJob, {
+  reason,
+  reasonId,
+  hasOfferTable,
+}) {
+  const techIdAtUnassign = lockedJob.fk_easyfixter_id;
+  if (techIdAtUnassign == null) return null;
+  if (!DIRECT_REJECTABLE_STATES.has(Number(lockedJob.job_status))) {
+    const err = new Error('only pre-start jobs can be rejected');
+    err.status = 409;
+    err.code = 'JOB_NOT_REJECTABLE';
+    throw err;
+  }
+  const now = new Date();
+  const [updated] = await conn.query(
+    `UPDATE tbl_job
+        SET fk_easyfixter_id = NULL,
+            scheduled_date_time = NULL,
+            job_status = ${STATUS.BOOKED},
+            last_update_time = ?
+      WHERE job_id = ? AND fk_easyfixter_id = ?`,
+    [now, jobId, techIdAtUnassign],
+  );
+  if (Number(updated.affectedRows) !== 1) {
+    const err = new Error('job assignment changed; refresh and try again');
+    err.status = 409;
+    err.code = 'JOB_ASSIGNMENT_CHANGED';
+    throw err;
+  }
+  await conn.query(
+    `INSERT INTO scheduling_history (job_id, easyfixer_id, schedule_time, reason_id, reschedule_reason)
+     VALUES (?, ?, ?, NULL, ?)`,
+    [jobId, techIdAtUnassign, now, reason],
+  );
+
+  if (hasOfferTable) {
+    // Historical duplicate OPEN rows must not all become fresh rejection
+    // decisions. Only the latest row can represent this technician's current
+    // offer, matching accept/list/membership semantics.
+    await conn.query(
+      `UPDATE tbl_job_offer
+          SET offer_status = ${OFFER_STATUS.REJECTED}, reject_reason = ?, reject_reason_id = ?, responded_at = NOW()
+        WHERE job_offer_id = (
+          SELECT latest_id FROM (
+            SELECT MAX(job_offer_id) AS latest_id
+              FROM tbl_job_offer
+             WHERE job_id = ? AND fk_easyfixter_id = ?
+          ) latest_offer
+        )
+          AND offer_status = ${OFFER_STATUS.OFFERED}`,
+      [reason, reasonId != null ? reasonId : null, jobId, techIdAtUnassign],
+    );
+  }
+  return Number(techIdAtUnassign);
+}
+
+async function unassign(jobId, { reason, reasonId }, actor) {
+  logger.info('Unassign job · id=' + jobId + (reasonId != null ? ' · reasonId=' + reasonId : ''));
+  const normalizedReason = normalizeUnassignReason(reason, jobId);
+  const hasOfferTable = await jobOfferTableExists();
   const conn = await pool.getConnection();
+  let techIdAtUnassign = null;
   try {
     await conn.beginTransaction();
-    await conn.query(
-      `UPDATE tbl_job
-          SET fk_easyfixter_id = NULL,
-              scheduled_date_time = NULL,
-              job_status = ${STATUS.BOOKED},
-              last_update_time = ?
-        WHERE job_id = ?`,
-      [new Date(), jobId],
+    const [[lockedJob]] = await conn.query(
+      `SELECT job_id, job_status, fk_easyfixter_id
+         FROM tbl_job
+        WHERE job_id = ?
+        FOR UPDATE`,
+      [jobId],
     );
-    // scheduling_history row records the unassignment with the reason.
-    // `easyfixer_id` here is the tech who's being REMOVED (so the
-    // audit trail keeps the per-tech timeline coherent).
-    await conn.query(
-      `INSERT INTO scheduling_history (job_id, easyfixer_id, schedule_time, reason_id, reschedule_reason)
-       VALUES (?, ?, ?, NULL, ?)`,
-      [jobId, techIdAtUnassign, new Date(), reason.trim()],
-    );
-
-    // THE OFFER MODEL — a tech REJECTing an offered job flows through here.
-    // Close that tech's OPEN offer as REJECTED (2) with the reason, inside the
-    // same transaction. Wrapped + table-probed so legacy unassign (no offer
-    // table / offer flow off) and any non-offer unassign are unaffected.
-    try {
-      if (await jobOfferTableExists()) {
-        await conn.query(
-          `UPDATE tbl_job_offer
-              SET offer_status = ${OFFER_STATUS.REJECTED}, reject_reason = ?, reject_reason_id = ?, responded_at = NOW()
-            WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
-          [reason.trim(), reasonId != null ? reasonId : null, jobId, techIdAtUnassign],
-        );
-      }
-    } catch (e) {
-      require('../logger').warn({ jobId, efrId: techIdAtUnassign, err: e.message }, 'unassign: tbl_job_offer reject write failed (swallowed)');
+    if (!lockedJob) {
+      logger.warn('Unassign job not found · id=' + jobId);
+      const err = new Error('job not found'); err.status = 404; throw err;
     }
-
+    techIdAtUnassign = await applyUnassignLocked(conn, jobId, lockedJob, {
+      reason: normalizedReason,
+      reasonId,
+      hasOfferTable,
+    });
     await conn.commit();
-    logger.info('Job unassigned · id=' + jobId + ' · removedTech=' + techIdAtUnassign);
-
-    // Reschedule-shaped event (job is leaving the tech's queue).
-    // Clients that already received a TechAssigned for this job will
-    // get a RescheduleTech to invalidate downstream state.
-    fireWebhook('RescheduleTech', jobId);
-
-    return getById(jobId);
   } catch (e) {
     await conn.rollback();
     logger.error('Unassign job failed, rolled back · id=' + jobId + ' · ' + e.message);
@@ -4502,6 +4681,18 @@ async function unassign(jobId, { reason, reasonId }, actor) {
   } finally {
     conn.release();
   }
+
+  if (techIdAtUnassign == null) {
+    // Nothing to unassign — treat as a soft no-op so retries remain idempotent.
+    logger.info('Unassign no-op, job has no technician · id=' + jobId);
+  } else {
+    logger.info('Job unassigned · id=' + jobId + ' · removedTech=' + techIdAtUnassign);
+    // Reschedule-shaped event (job is leaving the tech's queue).
+    // Clients that already received a TechAssigned for this job will
+    // get a RescheduleTech to invalidate downstream state.
+    fireWebhook('RescheduleTech', jobId);
+  }
+  return getById(jobId);
 }
 
 // ─── Accept a job offer (mobile accept path) ────────────────────────
@@ -4526,15 +4717,17 @@ async function unassign(jobId, { reason, reasonId }, actor) {
  *   jobId : the offered job
  *   efrId : the accepting technician (tbl_easyfixer.efr_id)
  *
- * Returns the full getById() payload on success; throws { status: 409 } when
- * another technician already accepted.
+ * Returns a compact acknowledgement on success; throws { status: 409 } when
+ * another technician already accepted. The mobile route does not consume a
+ * hydrated job, so avoiding getById() here prevents several post-commit detail
+ * and image queries from turning a successful claim into a false 500.
  */
 async function acceptOffer(jobId, efrId) {
   logger.info('Accept job offer · id=' + jobId + ' · efrId=' + efrId);
-  // Defense-in-depth: an unverified tech (e.g. de-verified after being offered)
-  // cannot claim a job. Cheap PK lookup before the txn.
-  await assertTechniciansVerified([efrId]);
-  const hasOfferTable = await jobOfferTableExists();
+  const [hasOfferTable, lifecycleProjection] = await Promise.all([
+    jobOfferTableExists(),
+    easyfixerLifecycle.readProjection('e'),
+  ]);
   const conn = await pool.getConnection();
   // `committed` guards the catch so a post-commit throw (the 409 path) doesn't
   // issue a ROLLBACK against an already-committed transaction.
@@ -4542,16 +4735,34 @@ async function acceptOffer(jobId, efrId) {
   try {
     await conn.beginTransaction();
 
+    // A technician can become restricted after receiving an offer. Lock and
+    // re-check lifecycle in the same transaction as the first-wins claim.
+    await assertTechniciansCanReceiveJobs([efrId], conn, {
+      forUpdate: true,
+      lifecycleProjection,
+    });
+
     if (!hasOfferTable) {
       // Legacy fallback: no offer pool. Single-assign already set the fk, so we
-      // can't gate on fk IS NULL — just bump a BOOKED job to SCHEDULED.
-      await conn.query(
-        `UPDATE tbl_job SET job_status = ${STATUS.SCHEDULED} WHERE job_id = ? AND job_status = ${STATUS.BOOKED}`,
-        [jobId],
+      // can't gate on fk IS NULL — but the accepting technician must still own
+      // the job. Otherwise any eligible technician could claim another tech's
+      // legacy BOOKED assignment by guessing its id.
+      const [legacyClaim] = await conn.query(
+        `UPDATE tbl_job
+            SET job_status = ${STATUS.SCHEDULED}
+          WHERE job_id = ?
+            AND job_status = ${STATUS.BOOKED}
+            AND fk_easyfixter_id = ?`,
+        [jobId, efrId],
       );
       await conn.commit();
       committed = true;
-      return getById(jobId);
+      if (Number(legacyClaim.affectedRows) !== 1) {
+        const err = new Error('This job offer is no longer available');
+        err.status = 409;
+        throw err;
+      }
+      return { accepted: true, jobId: Number(jobId) };
     }
 
     /*
@@ -4588,18 +4799,39 @@ async function acceptOffer(jobId, efrId) {
           AND EXISTS (
             SELECT 1 FROM tbl_job_offer jo
              WHERE jo.job_id = ? AND jo.fk_easyfixter_id = ?
-               AND jo.offer_status = ${OFFER_STATUS.OFFERED}${freshnessClause}
+               AND jo.offer_status = ${OFFER_STATUS.OFFERED}
+               AND jo.job_offer_id = (
+                 SELECT MAX(latest.job_offer_id)
+                   FROM tbl_job_offer latest
+                  WHERE latest.job_id = jo.job_id
+                    AND latest.fk_easyfixter_id = jo.fk_easyfixter_id
+               )${freshnessClause}
           )`,
       claimParams,
     );
 
     if (r.affectedRows === 1) {
-      // This tech claimed it: accept their offer, expire all sibling offers.
-      await conn.query(
-        `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.ACCEPTED}, responded_at = NOW()
-          WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
+      // This tech claimed it: accept ONLY their latest offer. Historical open
+      // rows can survive old retries/migrations; accepting all of them would
+      // contradict the latest-row membership rule used everywhere else.
+      const [acceptedOffer] = await conn.query(
+        `UPDATE tbl_job_offer
+            SET offer_status = ${OFFER_STATUS.ACCEPTED}, responded_at = NOW()
+          WHERE job_offer_id = (
+            SELECT latest_id FROM (
+              SELECT MAX(job_offer_id) AS latest_id
+                FROM tbl_job_offer
+               WHERE job_id = ? AND fk_easyfixter_id = ?
+            ) latest_offer
+          )
+            AND offer_status = ${OFFER_STATUS.OFFERED}`,
         [jobId, efrId],
       );
+      if (Number(acceptedOffer.affectedRows) !== 1) {
+        const err = new Error('This job offer is no longer available');
+        err.status = 409;
+        throw err;
+      }
       await conn.query(
         `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
           WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
@@ -4608,7 +4840,7 @@ async function acceptOffer(jobId, efrId) {
       await conn.commit();
       committed = true;
       logger.info('Job offer accepted (won race) · id=' + jobId + ' · efrId=' + efrId);
-      return getById(jobId);
+      return { accepted: true, jobId: Number(jobId) };
     }
 
     // Lost the race (someone else won, or the job already moved on). Expire this
@@ -4647,8 +4879,29 @@ async function acceptOffer(jobId, efrId) {
 async function techHasOpenOffer(jobId, efrId) {
   try {
     if (!(await jobOfferTableExists())) return false;
+    const lifecycleEligibility = await easyfixerWorkEligibility.sqlPredicate('e');
+    const freshnessClause = offerExpiryEnabled()
+      ? `AND jo.offered_at >= NOW() - INTERVAL ${OFFER_TTL_MINUTES} MINUTE`
+      : '';
     const [[row]] = await pool.query(
-      `SELECT 1 AS ok FROM tbl_job_offer WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = ${OFFER_STATUS.OFFERED} LIMIT 1`,
+      `SELECT 1 AS ok
+         FROM tbl_job_offer jo
+         JOIN tbl_easyfixer e ON e.efr_id = jo.fk_easyfixter_id
+         JOIN tbl_job j ON j.job_id = jo.job_id
+        WHERE jo.job_id = ?
+          AND jo.fk_easyfixter_id = ?
+          AND jo.offer_status = ${OFFER_STATUS.OFFERED}
+          AND jo.job_offer_id = (
+            SELECT MAX(latest.job_offer_id)
+              FROM tbl_job_offer latest
+             WHERE latest.job_id = jo.job_id
+               AND latest.fk_easyfixter_id = jo.fk_easyfixter_id
+          )
+          AND j.job_status = ${STATUS.BOOKED}
+          AND j.fk_easyfixter_id IS NULL
+          AND ${lifecycleEligibility}
+          ${freshnessClause}
+        LIMIT 1`,
       [jobId, efrId],
     );
     return !!row;
@@ -4664,16 +4917,136 @@ async function techHasOpenOffer(jobId, efrId) {
  */
 async function rejectOffer(jobId, efrId, { reason, reasonId } = {}) {
   logger.info('Reject job offer · id=' + jobId + ' · efrId=' + efrId + (reasonId != null ? ' · reasonId=' + reasonId : ''));
-  if (!(await jobOfferTableExists())) {
-    return unassign(jobId, { reason, reasonId }, { user_id: efrId });
+  const normalizedReason = normalizeUnassignReason(reason, jobId);
+  const hasOfferTable = await jobOfferTableExists();
+  // Resolve schema-dependent SQL before opening the transaction. Permission is
+  // re-evaluated from the technician row locked below, closing the middleware-
+  // to-write lifecycle transition race.
+  const lifecycleProjection = await easyfixerLifecycle.readProjection('e');
+  const conn = await pool.getConnection();
+  let unassignedTechId = null;
+  try {
+    await conn.beginTransaction();
+
+    // Use the same global lock order as offer/accept/lifecycle writes.
+    const [[tech]] = await conn.query(
+      `SELECT e.efr_id, e.efr_status, e.is_technician_verified,
+              e.efr_manager_id, e.scheduled_reactivation_date,
+              ${lifecycleProjection}
+         FROM tbl_easyfixer e
+        WHERE e.efr_id = ?
+        FOR UPDATE`,
+      [efrId],
+    );
+    if (!tech) {
+      const err = new Error('job not found'); err.status = 404; throw err;
+    }
+    const lockedLifecycle = easyfixerLifecycle.lifecycleFromRow(tech);
+    if (lockedLifecycle.capabilities.receiveNewJobs !== true
+        && lockedLifecycle.capabilities.mutateAssignedJobs !== true) {
+      const err = new Error(
+        `technician lifecycle ${lockedLifecycle.status} does not allow offer rejection`,
+      );
+      err.status = 403;
+      err.code = 'TECH_LIFECYCLE_CAPABILITY_REQUIRED';
+      err.details = {
+        capabilities: ['receiveNewJobs', 'mutateAssignedJobs'],
+        lifecycleStatus: lockedLifecycle.status,
+      };
+      throw err;
+    }
+    const [[lockedJob]] = await conn.query(
+      `SELECT job_id, job_status, fk_easyfixter_id
+         FROM tbl_job
+        WHERE job_id = ?
+        FOR UPDATE`,
+      [jobId],
+    );
+    if (!lockedJob) {
+      const err = new Error('job not found'); err.status = 404; throw err;
+    }
+
+    let latestOffer = null;
+    if (hasOfferTable) {
+      [[latestOffer]] = await conn.query(
+        `SELECT job_offer_id, offer_status
+           FROM tbl_job_offer
+          WHERE job_id = ? AND fk_easyfixter_id = ?
+          ORDER BY job_offer_id DESC
+          LIMIT 1
+          FOR UPDATE`,
+        [jobId, efrId],
+      );
+    }
+
+    const isPoolDecision = Number(lockedJob.job_status) === STATUS.BOOKED
+      && lockedJob.fk_easyfixter_id == null;
+    const isDirectOwner = Number(lockedJob.fk_easyfixter_id) === Number(efrId);
+
+    if (isPoolDecision) {
+      // Offer decisions are first-wins. An accept/expiry/re-offer that commits
+      // first changes either the locked job or latest row, so this request must
+      // return 409 rather than acknowledge a rejection that did not happen.
+      if (!latestOffer) {
+        const err = new Error('This job offer is no longer available'); err.status = 409; throw err;
+      }
+      const enforceTtl = offerExpiryEnabled();
+      const freshnessClause = enforceTtl
+        ? ' AND offered_at >= NOW() - INTERVAL ? MINUTE'
+        : '';
+      const updateParams = enforceTtl
+        ? [normalizedReason, reasonId != null ? reasonId : null, latestOffer.job_offer_id, OFFER_TTL_MINUTES]
+        : [normalizedReason, reasonId != null ? reasonId : null, latestOffer.job_offer_id];
+      const [rejected] = await conn.query(
+        `UPDATE tbl_job_offer
+            SET offer_status = ${OFFER_STATUS.REJECTED}, reject_reason = ?, reject_reason_id = ?, responded_at = NOW()
+          WHERE job_offer_id = ?
+            AND offer_status = ${OFFER_STATUS.OFFERED}${freshnessClause}`,
+        updateParams,
+      );
+      if (Number(rejected.affectedRows) !== 1) {
+        const err = new Error('This job offer is no longer available'); err.status = 409; throw err;
+      }
+    } else if (isDirectOwner) {
+      // Branch from the locked job, not historical offer rows. Direct
+      // assignments legitimately coexist with OPEN/REJECTED/EXPIRED history in
+      // rolling and kill-switch deployments. ACCEPTED is the exception: it
+      // proves an accept decision already won this job-lock race.
+      if (latestOffer && Number(latestOffer.offer_status) === OFFER_STATUS.ACCEPTED) {
+        const err = new Error('This job offer is no longer available'); err.status = 409; throw err;
+      }
+      unassignedTechId = await applyUnassignLocked(conn, jobId, lockedJob, {
+        reason: normalizedReason,
+        reasonId,
+        hasOfferTable,
+      });
+    } else {
+      const noLongerAvailable = lockedJob.fk_easyfixter_id == null || latestOffer != null;
+      const err = new Error(noLongerAvailable
+        ? 'This job offer is no longer available'
+        : 'job not found');
+      err.status = noLongerAvailable ? 409 : 404;
+      throw err;
+    }
+
+    await conn.commit();
+  } catch (e) {
+    await conn.rollback();
+    logger.error('Reject offer failed, rolled back · id=' + jobId + ' · efrId=' + efrId + ' · ' + e.message);
+    throw e;
+  } finally {
+    conn.release();
   }
-  await pool.query(
-    `UPDATE tbl_job_offer
-        SET offer_status = ${OFFER_STATUS.REJECTED}, reject_reason = ?, reject_reason_id = ?, responded_at = NOW()
-      WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
-    [reason || null, reasonId != null ? reasonId : null, jobId, efrId],
-  );
-  return getById(jobId);
+
+  if (unassignedTechId != null) fireWebhook('RescheduleTech', jobId);
+  // The mobile route returns its own compact acknowledgement and discards job
+  // detail. Avoid a post-commit full hydration here: it adds several queries
+  // and could turn a successful decision into a false 500 on read failure.
+  return {
+    rejected: true,
+    jobId: Number(jobId),
+    legacyUnassigned: unassignedTechId != null,
+  };
 }
 
 // ─── List the techs currently offered a job (CRM "Offered to N") ────
@@ -4891,15 +5264,43 @@ async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason
 async function listOfferedForTech(efrId, { limit = 50 } = {}) {
   logger.info('List offered jobs for technician · efrId=' + efrId + ' · limit=' + limit);
   if (!(await jobOfferTableExists())) return { items: [] };
-  // Most-recent open offers first; cap before hydrating the full preview.
+  const lifecycleEligibility = await easyfixerWorkEligibility.sqlPredicate('e');
+  const expiryEnabled = offerExpiryEnabled();
+  const freshnessClause = expiryEnabled
+    ? `AND jo.offered_at >= NOW() - INTERVAL ${OFFER_TTL_MINUTES} MINUTE`
+    : '';
+  const expiresAtProjection = expiryEnabled
+    ? `DATE_ADD(jo.offered_at, INTERVAL ${OFFER_TTL_MINUTES} MINUTE)`
+    : 'NULL';
+  const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 200);
+  // Start from this technician's OPEN rows in offered_at order (served by
+  // idx_job_offer_efr_status_open), then reject a row only when a newer history
+  // row exists for the same job. This makes work proportional to CURRENT
+  // offers and lets LIMIT stop the ordered index walk; the previous GROUP BY
+  // materialised the technician's entire offer lifetime before the outer
+  // LIMIT. The newer-row lookup is served by idx_job_offer_efr_job_latest.
   const [offerRows] = await pool.query(
-    `SELECT job_id, offered_at,
-            DATE_ADD(offered_at, INTERVAL ${OFFER_TTL_MINUTES} MINUTE) AS expires_at
-       FROM tbl_job_offer
-      WHERE fk_easyfixter_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}
-      ORDER BY offered_at DESC
+    `SELECT jo.job_id, jo.offered_at,
+            ${expiresAtProjection} AS expires_at
+       FROM tbl_job_offer jo
+       JOIN tbl_easyfixer e ON e.efr_id = jo.fk_easyfixter_id
+       JOIN tbl_job j ON j.job_id = jo.job_id
+      WHERE jo.fk_easyfixter_id = ?
+        AND jo.offer_status = ${OFFER_STATUS.OFFERED}
+        AND NOT EXISTS (
+          SELECT 1
+            FROM tbl_job_offer newer
+           WHERE newer.fk_easyfixter_id = jo.fk_easyfixter_id
+             AND newer.job_id = jo.job_id
+             AND newer.job_offer_id > jo.job_offer_id
+        )
+        AND j.job_status = ${STATUS.BOOKED}
+        AND j.fk_easyfixter_id IS NULL
+        AND ${lifecycleEligibility}
+        ${freshnessClause}
+      ORDER BY jo.offered_at DESC
       LIMIT ?`,
-    [efrId, Number(limit)],
+    [efrId, safeLimit],
   );
   const ids = offerRows.map((r) => Number(r.job_id));
   if (!ids.length) return { items: [] };
@@ -5170,6 +5571,7 @@ module.exports = {
   // The 30-min offer window. Exported so the offer-REMINDER cron can bound its
   // re-push window by the same constant instead of re-declaring it and drifting.
   OFFER_TTL_MINUTES,
+  MAX_OFFER_RECIPIENTS,
   tryAutoAssignOnCreate,
   fireWebhook, statusToEventName,
   hasClientVerticalIdColumn,

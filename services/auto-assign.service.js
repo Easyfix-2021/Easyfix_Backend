@@ -4,6 +4,8 @@ const jobService = require('./job.service');
 // Shared appointment slot model — the 1-hour conflict window + the midnight
 // sentinel guard this legacy ranker now uses, same as candidate-ranking.
 const slotModel = require('./time-slot');
+const easyfixerLifecycle = require('./easyfixer-lifecycle.service');
+const easyfixerWorkEligibility = require('./easyfixer-work-eligibility.service');
 
 /*
  * 3-layer auto-assignment pipeline (blueprint §5).
@@ -192,16 +194,18 @@ async function eligibleCandidates(job) {
     skillClauses.push(predicate);
   }
   const skillSql = skillClauses.length ? ` AND ${skillClauses.join(' AND ')}` : '';
+  const lifecycleEligibility = await easyfixerWorkEligibility.sqlPredicate('e');
+  const lifecycleProjection = await easyfixerLifecycle.readProjection('e');
 
   const placeholders = cityZoneIds.map(() => '?').join(',');
   const [rows] = await pool.query(
     `SELECT e.efr_id, e.efr_name, e.efr_no, e.efr_email,
             e.efr_zone_city_id,
             e.efr_service_category, e.efr_cityId,
-            e.is_technician_verified
+            e.efr_status, e.is_technician_verified, e.efr_manager_id,
+            ${lifecycleProjection}
        FROM tbl_easyfixer e
-      WHERE e.efr_status = 1
-        AND e.is_technician_verified = 1
+      WHERE ${lifecycleEligibility}
         AND e.efr_cityId = ?
         ${skillSql}
         AND e.efr_zone_city_id IN (${placeholders})
@@ -211,7 +215,7 @@ async function eligibleCandidates(job) {
         )`,
     [job.city_id, ...skillParams, ...cityZoneIds, job.job_id]
   );
-  return rows;
+  return rows.filter((row) => easyfixerWorkEligibility.fromRow(row).canOffer);
 }
 
 // ─── Layer 2 + 3: batch stats for candidates ────────────────────────
@@ -406,6 +410,7 @@ async function getCandidates(jobId, { limit = 10, ignoreDistance = false } = {})
   const rejected = [];
   for (const e of eligible) {
     const s = stats.get(e.efr_id);
+    const { lifecycle, canOffer } = easyfixerWorkEligibility.fromRow(e);
 
     // L2 filters (zone match already happened in L1 — only workload + slot conflict here)
     if (s.active_jobs >= CONFIG.MAX_CONCURRENT_JOBS) {
@@ -423,6 +428,10 @@ async function getCandidates(jobId, { limit = 10, ignoreDistance = false } = {})
       efr_id: e.efr_id,
       efr_name: e.efr_name,
       efr_no: e.efr_no,
+      lifecycle_status: lifecycle.status,
+      lifecycle_reason_code: lifecycle.reasonCode,
+      lifecycle_reason: lifecycle.reason,
+      can_offer: canOffer,
       active_jobs: s.active_jobs,
       avg_rating: Number(s.avg_rating.toFixed(2)),
       completion_ratio: Number(s.completion.toFixed(2)),

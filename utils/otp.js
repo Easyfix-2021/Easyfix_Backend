@@ -2,6 +2,7 @@ const crypto = require('crypto');
 
 const OTP_TTL_MINUTES = 5;
 const OTP_MAX_ATTEMPTS = 5;
+const OTP_RESEND_SECONDS = 30;
 
 // QA convenience constant — fixed OTP for any email login when
 // QA_DETERMINISTIC_OTP=true. Mobile logins use last 4 digits of the
@@ -151,4 +152,5 @@ module.exports = {
   otpExpiryDate,
   OTP_TTL_MINUTES,
   OTP_MAX_ATTEMPTS,
+  OTP_RESEND_SECONDS,
 };

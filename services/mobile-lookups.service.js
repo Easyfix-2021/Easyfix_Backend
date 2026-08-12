@@ -47,25 +47,22 @@ async function experience() {
  *
  * Pure DB — NO Google/Mappls call needed: tbl_pincode.city_id → tbl_city →
  * tbl_state already carries city + state (the geocode service is lat/lng-only).
- * Reuses the canonical resolver services/pincode.service.getPincodeByValue,
- * which returns { city_name, district, state_name, ... }. Returns null when the
- * pincode isn't seeded in tbl_pincode (caller surfaces "enter manually").
+ * Reuses technician-registration-profile's lightweight canonical resolver,
+ * which returns only the city/state projection registration needs. Returns
+ * null when the pincode isn't seeded in tbl_pincode.
  */
 async function resolvePincode(pincode) {
   logger.info('Resolve pincode · pincode=' + pincode);
+  // Keep authenticated profile forms and the public pre-login form on the
+  // exact same one-query resolver. The old pincode.service detail call also
+  // computed active-technician and zone counts that registration never uses.
   // eslint-disable-next-line global-require
-  const pincodeService = require('./pincode.service');
-  const row = await pincodeService.getPincodeByValue(pincode);
+  const registrationProfile = require('./technician-registration-profile.service');
+  const row = await registrationProfile.resolvePincode(pincode);
   if (!row) logger.info('Pincode not seeded · pincode=' + pincode);
   if (!row) return null;
-  logger.info('Pincode resolved · pincode=' + pincode + ' cityId=' + (row.city_id ?? '-'));
-  return {
-    pincode: row.pincode,
-    cityId: row.city_id ?? null,
-    city: row.city_name ?? null,
-    district: row.district ?? null,
-    state: row.state_name ?? null,
-  };
+  logger.info('Pincode resolved · pincode=' + pincode + ' cityId=' + (row.cityId ?? '-'));
+  return row;
 }
 
 module.exports = {

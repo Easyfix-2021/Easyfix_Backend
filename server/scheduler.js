@@ -53,6 +53,7 @@ const TZ = 'Asia/Kolkata';
  */
 const jobs = [];
 let orphanResetTask = null;
+let idempotencyCleanupTask = null;
 
 function registerJob({
   id, name, description, cron: cronExpr, runner, skipReason,
@@ -756,10 +757,10 @@ Note: this task only runs automatically if the property "attendance.reminder.ena
 
 Here's how it works, step by step:
   1. Every day at 1:00 AM IST, the task wakes up automatically.
-  2. It finds every technician who is currently Inactive (efr_status = 0), is verified, and has a scheduled reactivation date on or before today (IST).
-  3. For each, it flips them back to Active and clears the scheduled date + the stored inactivity reason, so the row is processed once and never re-fires.
-  4. Technicians deactivated permanently (no scheduled date) are never touched.
-  5. The task logs how many technicians were reactivated (visible in the server logs and on this page).
+  2. It finds a bounded batch of verified technicians whose lifecycle is SUSPENDED or PAUSED and whose scheduled reactivation date is on or before today (IST).
+  3. For each, it uses the same locked lifecycle transition as the CRM, writing the audit history and only sending the app refresh push after commit.
+  4. INACTIVE and BLACKLISTED technicians are never selected and the lifecycle service rejects those automatic transitions as a second safety layer.
+  5. It logs eligible, reactivated and failed counts (visible in the server logs and on this page).
 
 Why this matters: ops can put a technician on a fixed break (leave, temporary suspension) and have the system bring them back automatically on the agreed date, instead of relying on someone remembering to reactivate them.
 
@@ -769,7 +770,7 @@ Note: this task only runs automatically if the property "easyfixer.auto_reactiva
       const result = await easyfixerReactivationCron.runDailyReactivation();
       logger.info(
         `Easyfixer auto-reactivation cron · reactivated=${result.reactivated}` +
-        (result.skipped ? ' (skipped — column pre-migration)' : '')
+        (result.skipped ? ` (skipped — ${result.reason || 'lifecycle schema pre-migration'})` : '')
       );
       return result;
     },
@@ -793,6 +794,40 @@ Note: this task only runs automatically if the property "easyfixer.auto_reactiva
     );
     easyfixerReactivationJob.registered = true;
     logger.info('Easyfixer auto-reactivation cron registered (easyfixer.auto_reactivation.enabled=true, 01:00 IST).');
+  }
+
+  // ─── Technician lifecycle evaluation — daily at 02:00 IST ─────────
+  // Opt-in and bounded. Evaluates the documented PAUSED/DORMANT signals in
+  // set-based batches; the lifecycle service independently rejects any cron
+  // attempt to set INACTIVE/BLACKLISTED.
+  const lifecycleEvaluation = require('../services/easyfixer-lifecycle-evaluation-cron');
+  const lifecycleEvaluationJob = registerJob({
+    id: 'easyfixer-lifecycle-evaluation',
+    name: 'Technician Lifecycle Evaluation',
+    description:
+`What this task does: Reviews a bounded batch of Active / Under Master technicians and applies the automatic PAUSED or DORMANT rules from the Technician App v5.1 specification.
+
+It checks negative wallet balance, no job/attendance activity (90 days by default), D/E grade, two consecutive escalations, low margin, and — only when Ops explicitly configures both its denominator and window — no-show rate. Every change uses the same locked/audited transition as the CRM and sends the technician a post-commit refresh push. It can never automatically set INACTIVE or BLACKLISTED.
+
+The schedule is opt-in: set easyfixer.lifecycle.evaluation.enabled=true and restart. Batch size, bounded max batches/runtime, and thresholds are easyfix_properties values. Trigger Now runs the same bounded drain even when the schedule is disabled.`,
+    cron: '0 2 * * *',
+    runner: async () => lifecycleEvaluation.runDailyEvaluation(),
+  });
+  const lifecycleEvaluationEnabled =
+    String(getProperty('easyfixer.lifecycle.evaluation.enabled') ?? '').toLowerCase() === 'true';
+  if (cronDisabled) {
+    lifecycleEvaluationJob.skipReason = 'CRON_DISABLED=true';
+  } else if (!lifecycleEvaluationEnabled) {
+    lifecycleEvaluationJob.skipReason = "property 'easyfixer.lifecycle.evaluation.enabled' was not 'true' at server start — review thresholds, set true, and restart to enable";
+    logger.info('Technician lifecycle evaluation SKIPPED — easyfixer.lifecycle.evaluation.enabled is not true.');
+  } else {
+    lifecycleEvaluationJob.task = cron.schedule(
+      lifecycleEvaluationJob.cron,
+      () => invokeJob(lifecycleEvaluationJob, 'cron'),
+      { timezone: TZ },
+    );
+    lifecycleEvaluationJob.registered = true;
+    logger.info('Technician lifecycle evaluation registered (daily 02:00 IST).');
   }
 
   // ── Transcription backfill — fetch Plivo transcripts for EVERY completed
@@ -1045,6 +1080,27 @@ Note: this runs automatically unless the property "plivo.conference.reaper.enabl
     logger.info('Deep-skill image-gen orphan reset cron registered (every 5 min, hidden from admin page).');
   }
 
+  // ─── Idempotency response retention — hourly, bounded ───────────────
+  // Infrastructure housekeeping, not an operator workflow: one indexed
+  // DELETE capped at 1,000 rows. Fourteen-day expiry keeps responses beyond
+  // the app's seven-day outbox window without allowing the ledger to grow
+  // indefinitely. No timer is registered when CRON_DISABLED=true.
+  if (!cronDisabled) {
+    const idempotencyRetention = require('../services/idempotency-retention.service');
+    idempotencyCleanupTask = cron.schedule(
+      '17 * * * *',
+      async () => {
+        try {
+          await idempotencyRetention.run();
+        } catch (err) {
+          logger.warn({ err }, 'idempotency retention tick failed');
+        }
+      },
+      { timezone: TZ },
+    );
+    logger.info('Idempotency retention cron registered (hourly, max 1,000 rows, hidden from admin page).');
+  }
+
   const registeredCount = jobs.filter((j) => j.registered).length;
   logger.ready(`Scheduler started — ${registeredCount}/${jobs.length} task(s) registered (tz=${TZ}).`);
 }
@@ -1058,6 +1114,8 @@ function stop() {
   jobs.length = 0;
   try { orphanResetTask?.stop(); } catch { /* ignore */ }
   orphanResetTask = null;
+  try { idempotencyCleanupTask?.stop(); } catch { /* ignore */ }
+  idempotencyCleanupTask = null;
 }
 
 /*

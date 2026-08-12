@@ -24,6 +24,11 @@ const convo = require('../../services/whatsapp-conversation.service');
  * tolerant of several likely field paths so we can adapt without a rewrite.
  */
 
+// The header we read the shared secret from. Gallabox lets you configure a
+// custom header on the webhook, so this name has to be mirrored there — which
+// is why the refusal log names it rather than leaving ops to grep for it.
+const SECRET_HEADER = 'x-webhook-secret';
+
 function secretOk(req) {
   /*
    * TRIM BOTH SIDES. This is a value a human pastes into a .env file on one
@@ -38,11 +43,58 @@ function secretOk(req) {
   // Fail closed on an UNSET secret — a half-configured deploy must not accept
   // spoofed inbound traffic. (This is why a blank env var rejects every inbound
   // no matter how correctly the provider is configured.)
-  if (!expected) return false;
-  const got = String(req.get('x-webhook-secret') || req.query.secret || '').trim();
+  if (!expected) return { ok: false, cause: 'not_configured' };
+  const got = String(req.get(SECRET_HEADER) || req.query.secret || '').trim();
+  if (!got) return { ok: false, cause: 'absent' };
   const a = Buffer.from(got);
   const b = Buffer.from(expected);
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
+  const ok = a.length === b.length && crypto.timingSafeEqual(a, b);
+  return ok ? { ok: true } : { ok: false, cause: 'mismatch', sameLength: a.length === b.length };
+}
+
+/*
+ * ── ONE REFUSAL, THREE DIFFERENT INCIDENTS ────────────────────────────────
+ *
+ * secretOk() used to answer a bare boolean, so every rejection logged the same
+ * line: `bad secret, refused`. Three causes wear that label, they need three
+ * different people to do three different things, and the log could not tell
+ * them apart:
+ *
+ *   not_configured — OUR env var is blank, so the guard above refuses EVERY
+ *                    inbound however perfectly Gallabox is set up. The whole
+ *                    conversational flow is inert and every customer reply is
+ *                    dropped. That is a deployment gap, not a security event,
+ *                    and it is the one this wording most badly misrepresented:
+ *                    it reads like somebody probing us.
+ *   absent         — we hold a secret; the request carried none. Gallabox is
+ *                    not sending it, or is sending a DIFFERENTLY-NAMED header —
+ *                    so the header names present are logged (names only) and
+ *                    the one we expect is named outright.
+ *   mismatch       — both present, different. Almost always a paste that picked
+ *                    up or lost characters, which is why the length comparison
+ *                    is reported: equal lengths point at a wrong value, unequal
+ *                    at truncation.
+ *
+ * NEVER log either secret, at any level, in any branch. The length RELATION is
+ * a single bit about a value the caller already supplied and reveals nothing
+ * about ours.
+ */
+
+function refuse(res, req, verdict, what) {
+  if (verdict.cause === 'not_configured') {
+    logger.error(`${what} · GALLABOX_WEBHOOK_SECRET is not set on this server — the WhatsApp webhook `
+      + 'refuses EVERY inbound message while it is blank, so the conversational job-completion flow '
+      + 'cannot progress. Set it here AND on the Gallabox webhook, to the same value.');
+  } else if (verdict.cause === 'absent') {
+    logger.warn({ headerNames: Object.keys(req.headers || {}).slice(0, 40) },
+      `${what} · no secret on the request. We read the "${SECRET_HEADER}" header (or ?secret=); `
+      + 'the header names actually received are above — if Gallabox is sending its own differently '
+      + 'named header, configure the custom header on the webhook to match.');
+  } else {
+    logger.warn(`${what} · secret MISMATCH — the value sent does not match GALLABOX_WEBHOOK_SECRET `
+      + `(lengths ${verdict.sameLength ? 'match, so it is a different value' : 'differ, so it is truncated or a different secret entirely'}).`);
+  }
+  return modernError(res, 401, 'unauthorized');
 }
 
 // Best-effort normaliser: Gallabox wraps the WhatsApp message in an event
@@ -134,13 +186,15 @@ function normaliseStatus(body) {
 
 // Optional GET verify handshake (some BSPs ping the URL with the secret).
 router.get('/whatsapp', (req, res) => {
-  if (!secretOk(req)) { logger.warn('WhatsApp verify handshake · bad secret, refused'); return modernError(res, 401, 'unauthorized'); }
+  const verdict = secretOk(req);
+  if (!verdict.ok) return refuse(res, req, verdict, 'WhatsApp verify handshake');
   logger.info('WhatsApp verify handshake · ok');
   return modernOk(res, { ok: true });
 });
 
 router.post('/whatsapp', async (req, res) => {
-  if (!secretOk(req)) { logger.warn('WhatsApp inbound webhook · bad secret, refused'); return modernError(res, 401, 'unauthorized'); }
+  const verdict = secretOk(req);
+  if (!verdict.ok) return refuse(res, req, verdict, 'WhatsApp inbound webhook');
 
   // Delivery-status callback FIRST — these were previously swallowed by the
   // "not actionable" branch below. Reflect the real WhatsApp outcome onto the

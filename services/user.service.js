@@ -59,6 +59,45 @@ const PROVISION_INLINE_DEADLINE_MS = Math.max(
   Number(process.env.ENTRA_PROVISION_INLINE_TIMEOUT_MS) || 20000,
 );
 
+/*
+ * Race a provisioning promise against that deadline and say which won.
+ *
+ *   → { timedOut: false, value }  it settled in time; `value` is its result
+ *   → { timedOut: true }          still running — and STILL RUNNING is the point.
+ *                                 The promise is not cancelled: it keeps its temp
+ *                                 password in its own closure and still sends the
+ *                                 welcome mail when it finishes. That is what
+ *                                 lets the licence read-back in
+ *                                 services/entra-provisioning.service.js wait
+ *                                 ~90s for an eventually-consistent Graph write
+ *                                 while the operator's request still returns in
+ *                                 ~20s.
+ *
+ * Shared with POST /api/admin/users/:userId/provision-mailbox so there is ONE
+ * copy of the deadline and of this race — the repair path is the one that
+ * rescues a mailbox-less user, so it must not be the one that gets a shorter,
+ * differently-written wait.
+ *
+ * `promise` must not reject: every caller attaches its own .catch first, because
+ * once the deadline wins this promise is unawaited and an unhandled rejection
+ * takes the process down on Node 18+.
+ */
+async function withProvisionInlineDeadline(promise) {
+  // A unique sentinel, so a (hypothetical) null/undefined outcome from the
+  // orchestrator can never be mistaken for "the deadline expired".
+  const TIMED_OUT = Symbol('provision-inline-deadline');
+  let timer = null;
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(TIMED_OUT), PROVISION_INLINE_DEADLINE_MS);
+    if (timer && typeof timer.unref === 'function') timer.unref();
+  });
+  const settled = await Promise.race([
+    promise.finally(() => { if (timer) clearTimeout(timer); }),
+    deadline,
+  ]);
+  return settled === TIMED_OUT ? { timedOut: true } : { timedOut: false, value: settled };
+}
+
 function mkErr(status, message) { const e = new Error(message); e.status = status; return e; }
 
 // ─── Personal contact (tbl_user_personal_details) ────────────────────
@@ -673,6 +712,13 @@ async function createUser({
    * provisioning, so a run that outlives the inline deadline still mails the
    * user once it finishes. Only the REPORTING of it is time-bounded.
    *
+   * That is load-bearing, not incidental: the licence read-back now waits out an
+   * eventually-consistent Graph write for up to licenceVerifyBudgetMs() (~90s,
+   * see services/entra-provisioning.service.js), which is deliberately LONGER
+   * than the deadline below. The PENDING answer this returns at 20s promises the
+   * mail will follow — and it does, from this chain, with `tempPassword` still
+   * held in its closure.
+   *
    * ── THE TEMP PASSWORD ─────────────────────────────────────────────────
    * `tempPassword` below is the ONLY place the generated password exists
    * outside the Graph request body. It is written by the sink callback,
@@ -735,20 +781,9 @@ async function createUser({
       };
     });
 
-    // A unique sentinel, so a (hypothetical) null/undefined outcome from the
-    // orchestrator can never be mistaken for "the deadline expired".
-    const TIMED_OUT = Symbol('provision-inline-deadline');
-    let timer = null;
-    const deadline = new Promise((resolve) => {
-      timer = setTimeout(() => resolve(TIMED_OUT), PROVISION_INLINE_DEADLINE_MS);
-      if (timer && typeof timer.unref === 'function') timer.unref();
-    });
-    const settled = await Promise.race([
-      running.finally(() => { if (timer) clearTimeout(timer); }),
-      deadline,
-    ]);
+    const settled = await withProvisionInlineDeadline(running);
 
-    if (settled === TIMED_OUT) {
+    if (settled.timedOut) {
       logger.warn('Mailbox provisioning exceeded the inline deadline — continuing in the background · userId='
         + r.insertId + ' · deadlineMs=' + PROVISION_INLINE_DEADLINE_MS);
       provisioning = {
@@ -766,8 +801,8 @@ async function createUser({
         reason: 'waiting on mailbox provisioning — the sign-in details are mailed automatically if it completes',
       };
     } else {
-      provisioning = settled.outcome;
-      welcome = settled.mail;
+      provisioning = settled.value.outcome;
+      welcome = settled.value.mail;
     }
   } catch (e) {
     logger.warn('Mailbox provisioning threw after user create (user IS created) · userId=' + r.insertId + ' · ' + e.message);
@@ -1309,6 +1344,10 @@ module.exports = {
   // reporting_manager directly via pool.query without going through
   // updateUser). Internal write paths already self-invalidate.
   invalidateHierarchyCache,
+  // Mailbox provisioning inline deadline — exported so the repair route races
+  // the SAME number with the SAME code instead of growing a second copy.
+  withProvisionInlineDeadline,
+  PROVISION_INLINE_DEADLINE_MS,
   SORTABLE_COLUMNS,
   INTERNAL_USER_TYPE_ID,
 };

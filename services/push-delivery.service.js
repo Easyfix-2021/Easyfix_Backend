@@ -1,6 +1,7 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const fcmService = require('./fcm.service');
+const { MAX_OFFER_RECIPIENTS } = require('./job-offer-persistence.service');
 
 /*
  * Push delivery — THE single token-resolve + fan-out + dead-token-prune layer.
@@ -24,6 +25,84 @@ const fcmService = require('./fcm.service');
 // Default cap for a bulk fan-out so a runaway publish can't open an unbounded
 // number of FCM sockets in one tick.
 const DEFAULT_RECIPIENT_LIMIT = 5000;
+// Targeted offer fan-out is intentionally much smaller than a broadcast. This
+// keeps the IN lists, token result set, and subsequent FCM work bounded by the
+// same 50-technician ceiling enforced by the offer mutation.
+const MAX_TARGETED_EFR_IDS = MAX_OFFER_RECIPIENTS;
+
+function normalizeTargetEfrIds(efrIds) {
+  if (!Array.isArray(efrIds)) return [];
+  return Array.from(new Set(
+    efrIds
+      .map((value) => Number(value))
+      .filter((value) => Number.isSafeInteger(value) && value > 0),
+  )).sort((a, b) => a - b);
+}
+
+/*
+ * Resolve tokens for an arbitrary bounded technician-id set with exactly two
+ * set-based lookups (one per token store), independent of recipient count.
+ * Either lookup may fail without discarding tokens returned by the other.
+ * Tokens are globally deduped and retain the lowest matching efrId so dead-token
+ * pruning stays safely scoped and deterministic even if stores contain drift.
+ */
+async function resolveTokensForEfrs(efrIds) {
+  const ids = normalizeTargetEfrIds(efrIds);
+  if (!ids.length) return [];
+  if (ids.length > MAX_TARGETED_EFR_IDS) {
+    logger.warn(
+      { recipientCount: ids.length, limit: MAX_TARGETED_EFR_IDS },
+      'push-delivery: targeted token lookup exceeds recipient limit',
+    );
+    return [];
+  }
+
+  const placeholders = ids.map(() => '?').join(', ');
+  const appLookup = pool
+    .query(
+      `SELECT efr_id AS efrId, device_id AS token
+         FROM tbl_easyfixer_app
+        WHERE efr_id IN (${placeholders})
+          AND device_id IS NOT NULL`,
+      ids,
+    )
+    .then(([rows]) => rows)
+    .catch((e) => {
+      logger.warn({ err: e.message }, 'push-delivery: tbl_easyfixer_app bulk token lookup failed');
+      return [];
+    });
+  const deviceLookup = pool
+    .query(
+      `SELECT user_id AS efrId, fire_base_token AS token
+         FROM device_info
+        WHERE user_id IN (${placeholders})
+          AND is_logged_in = '1'
+          AND fire_base_token IS NOT NULL`,
+      ids,
+    )
+    .then(([rows]) => rows)
+    .catch((e) => {
+      logger.warn({ err: e.message }, 'push-delivery: device_info bulk token lookup failed');
+      return [];
+    });
+
+  const [appRows, deviceRows] = await Promise.all([appLookup, deviceLookup]);
+  const requestedIds = new Set(ids);
+  const byToken = new Map();
+  for (const row of [...appRows, ...deviceRows]) {
+    const efrId = Number(row && row.efrId);
+    const token = row && row.token ? String(row.token).trim() : '';
+    if (!requestedIds.has(efrId) || !token) continue;
+    const existing = byToken.get(token);
+    if (!existing || efrId < existing.efrId) byToken.set(token, { efrId, token });
+  }
+
+  const recipients = Array.from(byToken.values()).sort(
+    (a, b) => a.efrId - b.efrId || a.token.localeCompare(b.token),
+  );
+  logger.info(`Resolved ${recipients.length} targeted device token(s) for ${ids.length} technician(s)`);
+  return recipients;
+}
 
 /*
  * Resolve the FCM tokens for ONE technician. Returns a deduped array of
@@ -31,39 +110,10 @@ const DEFAULT_RECIPIENT_LIMIT = 5000;
  * error it logs and returns whatever was gathered (possibly []).
  */
 async function resolveTokensForEfr(efrId) {
-  const tokens = new Set();
-
-  // 1) Canonical: tbl_easyfixer_app.device_id (one row per technician).
-  try {
-    const [[appRow]] = await pool.query(
-      'SELECT device_id FROM tbl_easyfixer_app WHERE efr_id = ? LIMIT 1',
-      [efrId],
-    );
-    const t = appRow && appRow.device_id ? String(appRow.device_id).trim() : '';
-    if (t) tokens.add(t);
-  } catch (e) {
-    logger.warn({ efrId, err: e.message }, 'push-delivery: tbl_easyfixer_app token lookup failed');
-  }
-
-  // 2) Active device_info rows (the token this backend writes on login).
-  //    user_id holds the efr_id for technicians (see verify-otp upsert).
-  try {
-    const [rows] = await pool.query(
-      `SELECT fire_base_token
-         FROM device_info
-        WHERE user_id = ? AND is_logged_in = '1' AND fire_base_token IS NOT NULL`,
-      [efrId],
-    );
-    for (const r of rows) {
-      const t = r.fire_base_token ? String(r.fire_base_token).trim() : '';
-      if (t) tokens.add(t);
-    }
-  } catch (e) {
-    logger.warn({ efrId, err: e.message }, 'push-delivery: device_info token lookup failed');
-  }
-
-  logger.info('Resolve FCM tokens · efr=' + efrId + ' → ' + tokens.size);
-  return Array.from(tokens);
+  const recipients = await resolveTokensForEfrs([efrId]);
+  const tokens = recipients.map((recipient) => recipient.token);
+  logger.info('Resolve FCM tokens · efr=' + efrId + ' → ' + tokens.length);
+  return tokens;
 }
 
 /*
@@ -203,6 +253,9 @@ async function deliverToEfr(efrId, message, opts = {}) {
 }
 
 module.exports = {
+  MAX_TARGETED_EFR_IDS,
+  normalizeTargetEfrIds,
+  resolveTokensForEfrs,
   resolveTokensForEfr,
   resolveVerifiedTechnicianTokens,
   pruneDeadToken,

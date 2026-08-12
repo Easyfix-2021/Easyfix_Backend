@@ -4,6 +4,7 @@ const { OFFER_STATUS } = require('./offer-status');
 const { OFFER_TTL_MINUTES, STATUS } = require('./job.service');
 const { sendJobOfferPush } = require('./job-offer-push.service');
 const alertFlags = require('./job-offer-alert-flags');
+const easyfixerWorkEligibility = require('./easyfixer-work-eligibility.service');
 
 /*
  * Job-offer ESCALATION REMINDER cron (2026-07-29).
@@ -87,7 +88,7 @@ const CONCURRENCY = 10;
  * correlated on `tbl_job_offer.job_id` — unaliased in both statements — and
  * binds no parameters, so the bind order above is unchanged.
  */
-const ELIGIBLE_SQL = `
+const BASE_ELIGIBLE_SQL = `
      offer_status = ${OFFER_STATUS.OFFERED}
  AND offered_at <= NOW() - INTERVAL ? MINUTE
  AND offered_at >  NOW() - INTERVAL ? MINUTE
@@ -96,6 +97,13 @@ const ELIGIBLE_SQL = `
               WHERE j.job_id = tbl_job_offer.job_id
                 AND j.job_status = ${STATUS.BOOKED}
                 AND j.fk_easyfixter_id IS NULL)`;
+
+function eligibleSql(technicianPredicate) {
+  return `${BASE_ELIGIBLE_SQL}
+ AND EXISTS (SELECT 1 FROM tbl_easyfixer ef
+              WHERE ef.efr_id = tbl_job_offer.fk_easyfixter_id
+                AND ${technicianPredicate})`;
+}
 
 const ELIGIBLE_PARAMS = () => [
   REMINDER_AFTER_MINUTES,
@@ -127,11 +135,17 @@ async function runOfferReminders() {
 
   const t0 = Date.now();
   let rows;
+  let lifecycleAwareEligibility;
   try {
+    // Resolve once per sweep. Both the batch SELECT and every atomic claim use
+    // the exact same schema-aware predicate; there is no per-offer status read.
+    lifecycleAwareEligibility = eligibleSql(
+      await easyfixerWorkEligibility.sqlPredicate('ef'),
+    );
     [rows] = await pool.query(
       `SELECT job_offer_id, job_id, fk_easyfixter_id
          FROM tbl_job_offer
-        WHERE ${ELIGIBLE_SQL}
+        WHERE ${lifecycleAwareEligibility}
         ORDER BY offered_at ASC
         LIMIT ${BATCH_LIMIT}`,
       ELIGIBLE_PARAMS(),
@@ -150,7 +164,9 @@ async function runOfferReminders() {
 
   for (let i = 0; i < rows.length; i += CONCURRENCY) {
     const chunk = rows.slice(i, i + CONCURRENCY);
-    const outcomes = await Promise.all(chunk.map((r) => remindOne(r)));
+    const outcomes = await Promise.all(
+      chunk.map((r) => remindOne(r, lifecycleAwareEligibility)),
+    );
     for (const o of outcomes) {
       if (o.claimed) summary.claimed += 1;
       if (o.pushed) summary.pushed += 1;
@@ -177,13 +193,13 @@ async function runOfferReminders() {
  * ordering, where a crash between push and stamp re-pushes on the next tick and
  * spams the technician. Reminders are a nicety; duplicates are a nuisance.
  */
-async function remindOne(row) {
+async function remindOne(row, lifecycleAwareEligibility) {
   try {
     const [res] = await pool.query(
       `UPDATE tbl_job_offer
           SET last_reminded_at = NOW()
         WHERE job_offer_id = ?
-          AND ${ELIGIBLE_SQL}`,
+          AND ${lifecycleAwareEligibility}`,
       [row.job_offer_id, ...ELIGIBLE_PARAMS()],
     );
     if (!res.affectedRows) return { claimed: false, pushed: false, failed: false };
@@ -208,4 +224,5 @@ module.exports = {
   MAX_REMINDERS,
   MAX_REMINDER_AGE_MINUTES,
   BATCH_LIMIT,
+  _internals: { eligibleSql },
 };

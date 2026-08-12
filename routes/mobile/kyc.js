@@ -28,6 +28,7 @@ const Joi = require('joi');
 const multer = require('multer');
 
 const validate = require('../../middleware/validate');
+const { verifyIdempotencyUpload } = require('../../middleware/verify-idempotency-upload');
 const { modernOk, modernError } = require('../../utils/response');
 const kyc = require('../../services/mobile-kyc.service');
 const logger = require('../../logger');
@@ -84,7 +85,7 @@ router.get(
 // ─── 2. PAN OCR ─────────────────────────────────────────────────────
 
 // POST /pan-ocr (multipart field `file`) → { panNumber, name, fatherName, dob }
-router.post('/pan-ocr', upload.single('file'), async (req, res, next) => {
+router.post('/pan-ocr', upload.single('file'), verifyIdempotencyUpload, async (req, res, next) => {
   try {
     if (!req.file || !req.file.buffer) {
       logger.warn('PAN OCR rejected · missing image file');

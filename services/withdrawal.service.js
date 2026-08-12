@@ -37,66 +37,65 @@ function mkErr(status, code, message) {
  */
 async function requestWithdrawal(efrId, { amount }, pool) {
   logger.info('Withdrawal request · efrId=' + efrId + ' amount=' + amount);
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    // The technician PK is the per-account mutex. Every request locks it before
+    // checking the open queue, so two devices/replicas with different
+    // Idempotency-Keys cannot both observe "no pending request" and insert.
+    const [[tech]] = await conn.query(
+      `SELECT current_balance
+         FROM tbl_easyfixer
+        WHERE efr_id = ? AND NOT (efr_status <=> 3)
+        LIMIT 1 FOR UPDATE`,
+      [efrId],
+    );
+    if (!tech) throw mkErr(404, 'TECH_NOT_FOUND', 'Technician not found');
+    const currentBalance = Number(tech.current_balance ?? 0);
 
-  // 1) The technician must exist (and not be a deleted tombstone, efr_status=3).
-  //    Read the authoritative wallet balance in the same query.
-  const [[tech]] = await pool.query(
-    'SELECT current_balance FROM tbl_easyfixer WHERE efr_id = ? AND NOT (efr_status <=> 3) LIMIT 1',
-    [efrId],
-  );
-  if (!tech) {
-    logger.warn('Withdrawal rejected · technician not found · efrId=' + efrId);
-    throw mkErr(404, 'TECH_NOT_FOUND', 'Technician not found');
+    const [[bank]] = await conn.query(
+      'SELECT efr_bank_id FROM tbl_easyfixer_bank_details WHERE efr_Id = ? LIMIT 1',
+      [efrId],
+    );
+    if (!bank) throw mkErr(400, 'NO_BANK_ON_FILE', 'Add bank details before withdrawing');
+
+    const amt = Number(amount);
+    if (!Number.isFinite(amt) || amt <= 0 || amt > currentBalance) {
+      throw mkErr(400, 'INVALID_AMOUNT', 'Enter a valid amount within your available balance');
+    }
+
+    // Deliberately a consistent (non-locking) read. Finance processing locks
+    // request -> technician; waiting on the request here while holding the
+    // technician would invert that order and deadlock. Seeing a concurrently
+    // settling row as still requested is conservative: this attempt returns
+    // pending and the technician can retry after settlement.
+    const [[open]] = await conn.query(
+      `SELECT request_id
+         FROM tbl_easyfixer_withdrawal_request
+        WHERE fk_easyfixer_id = ? AND status IN (?)
+        LIMIT 1`,
+      [efrId, OPEN_STATUSES],
+    );
+    if (open) {
+      throw mkErr(409, 'WITHDRAWAL_PENDING', 'A withdrawal request is already pending');
+    }
+
+    const [ins] = await conn.query(
+      `INSERT INTO tbl_easyfixer_withdrawal_request
+         (fk_easyfixer_id, amount, status, requested_on)
+       VALUES (?, ?, 'requested', NOW())`,
+      [efrId, amt],
+    );
+    await conn.commit();
+    logger.info('Withdrawal request recorded · requestId=' + ins.insertId + ' amount=' + amt);
+    return { requestId: ins.insertId, amount: amt, status: 'requested' };
+  } catch (error) {
+    await conn.rollback().catch(() => {});
+    logger.warn('Withdrawal request rolled back · efrId=' + efrId + ' · ' + error.message);
+    throw error;
+  } finally {
+    conn.release();
   }
-  const currentBalance = Number(tech.current_balance ?? 0);
-
-  // 2) A payout needs a bank on file — this same table holds the CRM-verified
-  //    account finance pays out to. (efr_Id casing mirrors the UPI writes on
-  //    this table; MySQL column names are case-insensitive.)
-  const [[bank]] = await pool.query(
-    'SELECT efr_bank_id FROM tbl_easyfixer_bank_details WHERE efr_Id = ? LIMIT 1',
-    [efrId],
-  );
-  if (!bank) {
-    logger.warn('Withdrawal rejected · no bank on file · efrId=' + efrId);
-    throw mkErr(400, 'NO_BANK_ON_FILE', 'Add bank details before withdrawing');
-  }
-
-  // 3) Amount must be a positive number within the available balance. Joi
-  //    already guarantees positive+number at the route; the ceiling is
-  //    re-checked HERE against the live balance (the authoritative source).
-  const amt = Number(amount);
-  if (!Number.isFinite(amt) || amt <= 0 || amt > currentBalance) {
-    logger.warn('Withdrawal rejected · invalid amount=' + amount + ' balance=' + currentBalance);
-    throw mkErr(400, 'INVALID_AMOUNT', 'Enter a valid amount within your available balance');
-  }
-
-  // 4) One open request at a time — don't let a tech stack payouts while finance
-  //    is still settling the previous one. (Array param expands to a value list
-  //    under pool.query — same idiom as `job_status IN (?)` elsewhere.)
-  const [[open]] = await pool.query(
-    `SELECT request_id FROM tbl_easyfixer_withdrawal_request
-      WHERE fk_easyfixer_id = ? AND status IN (?) LIMIT 1`,
-    [efrId, OPEN_STATUSES],
-  );
-  if (open) {
-    logger.warn('Withdrawal rejected · request already pending · requestId=' + open.request_id);
-    throw mkErr(409, 'WITHDRAWAL_PENDING', 'A withdrawal request is already pending');
-  }
-
-  // 5) Record the request. NOTE: we intentionally DO NOT modify
-  //    tbl_easyfixer.current_balance here — the debit + the actual payout are a
-  //    downstream FINANCE/OPS step performed when the payout is settled. This
-  //    row is the auditable "please pay me" record finance works off; finance
-  //    later flips status → paid/rejected and stamps processed_on/remarks.
-  const [ins] = await pool.query(
-    `INSERT INTO tbl_easyfixer_withdrawal_request (fk_easyfixer_id, amount, status, requested_on)
-     VALUES (?, ?, 'requested', NOW())`,
-    [efrId, amt],
-  );
-
-  logger.info('Withdrawal request recorded · requestId=' + ins.insertId + ' amount=' + amt);
-  return { requestId: ins.insertId, amount: amt, status: 'requested' };
 }
 
 /* ─── FINANCE-SIDE PROCESSING (CRM Payout Requests) ──────────────────────

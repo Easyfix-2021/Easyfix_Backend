@@ -6,6 +6,19 @@ const validate = require('../../middleware/validate');
 const logger = require('../../logger');
 
 /*
+ * SERVICED_JOB_STATUSES — the job statuses that qualify an address as a real,
+ * "saved" service address: the customer actually had work there. IN_PROGRESS(2),
+ * COMPLETED(3), COMPLETED_ALT(5), REVISIT(10), plus the closed/settled variants
+ * 15, 20, 21. Deliberately EXCLUDES BOOKED(0)/SCHEDULED(1)/CANCELLED(6)/
+ * ENQUIRY(7)/CALL_LATER(9) so typo, cancelled, or never-serviced addresses do
+ * not surface in any saved-address list. Single source of truth for every
+ * saved-address surface (Book New Call, Confirm & Schedule, Manage Customers).
+ * Per ops query 2026-08-11.
+ */
+const SERVICED_JOB_STATUSES = [2, 3, 5, 10, 15, 20, 21];
+const SERVICED_STATUS_PLACEHOLDERS = SERVICED_JOB_STATUSES.map(() => '?').join(', ');
+
+/*
  * Manage Customers — minimal admin surface over tbl_customer + tbl_address.
  *
  * Legacy `customerList.vm` + `addEditCustomers.vm` had heavy multi-tab forms
@@ -66,8 +79,19 @@ router.get('/:id', async (req, res, next) => {
       return modernError(res, 404, 'Customer not found');
     }
     const [addresses] = await pool.query(
-      `SELECT * FROM tbl_address WHERE customer_id = ? ORDER BY address_id DESC LIMIT 50`,
-      [req.params.id]);
+      // Saved addresses = the ones the customer actually had SERVICE at (distinct
+      // fk_address_id across their tbl_job rows in SERVICED_JOB_STATUSES), not
+      // every tbl_address row on file (which includes typo / cancelled /
+      // never-used entries). Matches the Book New Call lookup below so every
+      // surface agrees. `fk_address_id IS NOT NULL` keeps the IN list clean.
+      `SELECT * FROM tbl_address
+        WHERE address_id IN (
+          SELECT DISTINCT fk_address_id FROM tbl_job
+           WHERE fk_customer_id = ? AND fk_address_id IS NOT NULL
+             AND job_status IN (${SERVICED_STATUS_PLACEHOLDERS})
+        )
+        ORDER BY address_id DESC LIMIT 50`,
+      [req.params.id, ...SERVICED_JOB_STATUSES]);
     logger.info('Returning customer · id=' + req.params.id + ' with ' + addresses.length + ' addresses');
     modernOk(res, { ...row, addresses });
   } catch (e) { next(e); }
@@ -116,15 +140,22 @@ router.get('/by-mobile/lookup', async (req, res, next) => {
     // city_id, pin_code, gps_location, mobile_number. Earlier I aliased
     // a non-existent `a.area` + wrong `a.pincode` — both fixed here.
     const [addresses] = await pool.query(
+      // Saved addresses = only where the customer actually had SERVICE (distinct
+      // fk_address_id across their jobs in SERVICED_JOB_STATUSES), not every row
+      // on file. Same rule as the /:id list above so every surface agrees.
       `SELECT a.address_id, a.address, a.building, a.landmark, a.locality,
               a.city_id, a.pin_code, a.gps_location,
               c.city_name
          FROM tbl_address a
          LEFT JOIN tbl_city c ON c.city_id = a.city_id
-        WHERE a.customer_id = ?
+        WHERE a.address_id IN (
+          SELECT DISTINCT fk_address_id FROM tbl_job
+           WHERE fk_customer_id = ? AND fk_address_id IS NOT NULL
+             AND job_status IN (${SERVICED_STATUS_PLACEHOLDERS})
+        )
         ORDER BY a.address_id DESC
         LIMIT 50`,
-      [customer.customer_id]
+      [customer.customer_id, ...SERVICED_JOB_STATUSES]
     );
     logger.info('Customer mobile lookup hit · id=' + customer.customer_id + ' with ' + addresses.length + ' addresses');
     return modernOk(res, { ...customer, addresses });

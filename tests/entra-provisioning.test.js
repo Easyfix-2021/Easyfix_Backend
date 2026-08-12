@@ -269,11 +269,50 @@ test('graphErrorToReason reads the request id out of innerError when the header 
 
 // ── 4. Idempotency decision (exists vs create) ────────────────────────────
 
-test('decideAccountAction REUSES an existing directory object instead of creating a second one', () => {
-  const d = entra.decideAccountAction({ found: true, status: 'found', user: { id: 'obj-1' } });
+/*
+ * ⚠ REUSE NOW REQUIRES PROOF OF OWNERSHIP, and this test used to assert the
+ * opposite. It called decideAccountAction with no context and expected `reuse`,
+ * which is exactly the behaviour that let a second employee of the same name be
+ * silently attached to the FIRST employee's mailbox — licence assigned to a
+ * stranger's account, that stranger's object id stored against the new user row.
+ *
+ * "An account exists at this address" and "this is my own earlier attempt" are
+ * different facts, and the old signature could not tell them apart because it
+ * was never given the one thing that distinguishes them: the object id already
+ * recorded for THIS user_id. Passing it is what makes reuse safe, so the test
+ * now passes it — and the collision case it used to hide is asserted below.
+ */
+test('decideAccountAction REUSES an existing object only when it is the one recorded for THIS user', () => {
+  const d = entra.decideAccountAction(
+    { found: true, status: 'found', user: { id: 'obj-1' } },
+    { recordedObjectId: 'obj-1' },
+  );
   assert.equal(d.action, 'reuse');
   assert.equal(d.accountStatus, entra.ACCOUNT_STATUS.ALREADY_EXISTS);
   assert.equal(d.entraObjectId, 'obj-1');
+});
+
+test('decideAccountAction REFUSES an existing object that belongs to someone else', () => {
+  // The address is taken by a DIFFERENT directory object. Reusing it would hand
+  // this new employee another employee's mailbox.
+  const other = entra.decideAccountAction(
+    { found: true, status: 'found', user: { id: 'obj-STRANGER' } },
+    { recordedObjectId: 'obj-1' },
+  );
+  assert.equal(other.action, 'collision');
+  assert.notEqual(other.entraObjectId, 'obj-STRANGER',
+    "a stranger's object id must never flow onward into recordProvisioning");
+
+  // And with NO recorded row at all: every one of our own attempts leaves a
+  // claim the moment Graph confirms an account, so an unclaimed account we did
+  // not record is somebody else's. Refusing is the fail-safe direction — the
+  // false positive is one clear message to an operator, the false negative is
+  // two people sharing a mailbox.
+  const unclaimed = entra.decideAccountAction(
+    { found: true, status: 'found', user: { id: 'obj-2' } },
+    { recordedObjectId: null },
+  );
+  assert.equal(unclaimed.action, 'collision');
 });
 
 test('decideAccountAction creates only on a DEFINITIVE miss', () => {
@@ -727,7 +766,13 @@ test('a blank CRM name sends neither name field', () => withBodyCapturingGraph(a
 
 const SKU_BUSINESS_BASIC = '802384e1-3c01-4d3e-879f-0dc385e79031';
 
-function withLicenceGraph({ assignStatus = 202, licencesOnReadBack = [] }, fn) {
+/*
+ * `visibleAfterReads` is the whole point of the backoff: Entra is eventually
+ * consistent, so the seat is genuinely absent for the first N read-backs and
+ * genuinely present afterwards. 0 (the default) keeps every pre-existing
+ * fixture's behaviour — visible immediately, or never.
+ */
+function withLicenceGraph({ assignStatus = 202, licencesOnReadBack = [], visibleAfterReads = 0 }, fn) {
   const originalFetch = globalThis.fetch;
   const env = {
     MS_GRAPH_TENANT_ID: process.env.MS_GRAPH_TENANT_ID,
@@ -739,6 +784,7 @@ function withLicenceGraph({ assignStatus = 202, licencesOnReadBack = [] }, fn) {
   process.env.MS_GRAPH_CLIENT_SECRET = 'secret-test';
 
   const seen = [];
+  let reads = 0;
   globalThis.fetch = async (url, init = {}) => {
     const u = String(url);
     if (u.includes('login.microsoftonline.com')) {
@@ -750,7 +796,9 @@ function withLicenceGraph({ assignStatus = 202, licencesOnReadBack = [] }, fn) {
     }
     if (/\/users\//.test(u) && String(init.method || 'GET').toUpperCase() === 'GET') {
       seen.push('readback');
-      return makeRes(200, { id: 'obj-1', assignedLicenses: licencesOnReadBack.map((skuId) => ({ skuId })) });
+      reads++;
+      const visible = reads > visibleAfterReads ? licencesOnReadBack : [];
+      return makeRes(200, { id: 'obj-1', assignedLicenses: visible.map((skuId) => ({ skuId })) });
     }
     return makeRes(404, { error: { code: 'Request_ResourceNotFound', message: 'unscripted' } });
   };
@@ -763,10 +811,18 @@ function withLicenceGraph({ assignStatus = 202, licencesOnReadBack = [] }, fn) {
   });
 }
 
+/*
+ * THE BUDGET, INJECTED. Every test that has to WAIT passes this instead of the
+ * shipped ~90s default. A test that really sleeps 90 seconds gets deleted by the
+ * next person and takes the guard with it, so the bound is proven on a scaled
+ * clock: same code, same branches, ~0.3s.
+ */
+const FAST_VERIFY = { budgetMs: 300, firstDelayMs: 10, maxDelayMs: 40 };
+
 test('a 202 with the seat visible on read-back is VERIFIED', () => withLicenceGraph(
   { assignStatus: 202, licencesOnReadBack: [SKU_BUSINESS_BASIC] },
   async (seen) => {
-    const res = await entra.assignLicense('obj-1', SKU_BUSINESS_BASIC);
+    const res = await entra.assignLicense('obj-1', SKU_BUSINESS_BASIC, FAST_VERIFY);
     assert.equal(res.ok, true);
     assert.equal(res.verified, true, 'the seat was read back from Entra');
     assert.ok(seen.includes('readback'), 'the acknowledgement alone is never enough');
@@ -776,7 +832,7 @@ test('a 202 with the seat visible on read-back is VERIFIED', () => withLicenceGr
 test('a 202 with NO seat on read-back is accepted-but-UNVERIFIED, not assigned', () => withLicenceGraph(
   { assignStatus: 202, licencesOnReadBack: [] },
   async () => {
-    const res = await entra.assignLicense('obj-1', SKU_BUSINESS_BASIC);
+    const res = await entra.assignLicense('obj-1', SKU_BUSINESS_BASIC, FAST_VERIFY);
     assert.equal(res.ok, true, 'Graph did accept it — this is not a hard failure');
     assert.equal(res.verified, false, '…but the seat never appeared');
     assert.match(res.reason, /still not on the user/);
@@ -786,8 +842,80 @@ test('a 202 with NO seat on read-back is accepted-but-UNVERIFIED, not assigned',
 test('a read-back showing a DIFFERENT sku does not count as verified', () => withLicenceGraph(
   { assignStatus: 200, licencesOnReadBack: ['ffffffff-0000-0000-0000-000000000000'] },
   async () => {
-    const res = await entra.assignLicense('obj-1', SKU_BUSINESS_BASIC);
+    const res = await entra.assignLicense('obj-1', SKU_BUSINESS_BASIC, FAST_VERIFY);
     assert.equal(res.verified, false, 'holding SOME licence is not holding THIS one');
+  },
+));
+
+/*
+ * ── The backoff: how LONG we look, never WHETHER we look ──────────────────
+ *
+ * LICENCE_VERIFY_ATTEMPTS = 2 / LICENCE_VERIFY_DELAY_MS = 1200 gave Microsoft
+ * 1.2 seconds to make an eventually-consistent write visible. Graph licence
+ * propagation routinely takes tens of seconds, so on user 8805 we recorded
+ * assigned_unconfirmed at 05:40:04, suppressed the welcome mail and threw the
+ * temp password away — not detecting a failure, giving up before the answer
+ * existed. The three tests below pin the replacement: return early on success,
+ * keep looking on absence, and STOP.
+ */
+
+test('assignLicense stops the instant the seat is observed — a backoff that ignored its own success would keep sleeping', () => withLicenceGraph(
+  { assignStatus: 202, licencesOnReadBack: [SKU_BUSINESS_BASIC] },
+  async (seen) => {
+    const startedAt = Date.now();
+    const res = await entra.assignLicense('obj-1', SKU_BUSINESS_BASIC, FAST_VERIFY);
+    assert.equal(res.verified, true);
+    assert.equal(res.reads, 1, 'the first read already answered');
+    assert.equal(seen.filter((s) => s === 'readback').length, 1,
+      'exactly ONE read-back — asserted on the count, so a loop that keeps going after success cannot pass');
+    assert.ok(Date.now() - startedAt < FAST_VERIFY.budgetMs,
+      'and it did not sleep once: a fast tenant is no slower than the old two-read version');
+  },
+));
+
+test('a seat that appears only on a LATER read is STILL verified — the whole point of waiting', () => withLicenceGraph(
+  { assignStatus: 202, licencesOnReadBack: [SKU_BUSINESS_BASIC], visibleAfterReads: 3 },
+  async (seen) => {
+    const res = await entra.assignLicense('obj-1', SKU_BUSINESS_BASIC, FAST_VERIFY);
+    assert.equal(res.verified, true,
+      'four reads in, Entra finally showed the seat — the old two-attempt version never got here');
+    assert.equal(res.reads, 4);
+    assert.equal(seen.filter((s) => s === 'readback').length, 4, 'and it stopped at the one that answered');
+  },
+));
+
+test('a seat that NEVER appears exhausts the budget and is honestly UNVERIFIED — the wait is bounded', () => withLicenceGraph(
+  { assignStatus: 202, licencesOnReadBack: [] },
+  async (seen) => {
+    const startedAt = Date.now();
+    const res = await entra.assignLicense('obj-1', SKU_BUSINESS_BASIC, FAST_VERIFY);
+    const elapsed = Date.now() - startedAt;
+
+    assert.equal(res.ok, true, 'Graph did accept the request');
+    assert.equal(res.verified, false,
+      'accepted-but-unobservable is STILL not a mailbox — waiting longer must never soften into trusting the 2xx');
+    assert.match(res.reason, /still not on the user/);
+    assert.ok(res.reads > 2, 'it really did keep looking (' + res.reads + ' reads)');
+    assert.equal(seen.filter((s) => s === 'readback').length, res.reads);
+
+    // THE BOUND. Without it this loop is an unbounded retry that pins a request
+    // (and a temp password) in memory forever.
+    assert.ok(elapsed >= FAST_VERIFY.firstDelayMs, 'it waited at all');
+    assert.ok(elapsed < FAST_VERIFY.budgetMs * 4,
+      'and it STOPPED — ' + elapsed + 'ms against a ' + FAST_VERIFY.budgetMs + 'ms budget');
+    assert.ok(res.waitedMs <= elapsed);
+  },
+));
+
+test('the per-sleep cap and the remaining budget both clamp the doubling', () => withLicenceGraph(
+  { assignStatus: 202, licencesOnReadBack: [] },
+  async () => {
+    // 2 → 4 → 8 … would run away without the cap; the budget then truncates the
+    // final sleep so the total never overshoots.
+    const startedAt = Date.now();
+    const res = await entra.assignLicense('obj-1', SKU_BUSINESS_BASIC, { budgetMs: 120, firstDelayMs: 5, maxDelayMs: 20 });
+    assert.equal(res.verified, false);
+    assert.ok(Date.now() - startedAt < 1000, 'a 120ms budget must not become a multi-second wait');
   },
 ));
 
@@ -798,6 +926,222 @@ test('the sku match is case-insensitive — Graph casing must not cause a false 
     assert.equal(res.verified, true);
   },
 ));
+
+/*
+ * ── THE INCIDENT, END TO END ──────────────────────────────────────────────
+ *
+ * user 8805 / mohit.kumar@easyfix.in. Account created 05:40:01. Licence assigned
+ * — Graph returned 200 — but the read-back could not see the SKU, so at 05:40:04
+ * provisioning recorded assigned_unconfirmed, mailboxReady=false, the welcome
+ * mail was suppressed at GATE 1 and the temp password was discarded. The 06:16
+ * retry found the licence had been there all along, but the reuse path mints no
+ * password, so GATE 3 suppressed the mail again. That user could never be mailed
+ * by any retry.
+ *
+ * This drives the REAL orchestrator against a Graph that behaves exactly like
+ * that — the SKU absent for the first two read-backs, present on the third — and
+ * then runs the caller's own chain (sink the password, hand it to
+ * sendWelcomeMail with the outcome; see services/user.service.js) to prove the
+ * mail goes out WITH a credential. Anything less than the full chain would pass
+ * while the user still got nothing.
+ */
+
+const SKU_SPB = {
+  skuId: 'sku-guid-spb', skuPartNumber: 'SPB', capabilityStatus: 'Enabled',
+  consumedUnits: 3, prepaidUnits: { enabled: 10, warning: 0, suspended: 0 },
+};
+
+function withProvisioningGraph({ sku = SKU_SPB, visibleAfterReads = 0 }, fn) {
+  const originalFetch = globalThis.fetch;
+  const env = {};
+  for (const k of ['MS_GRAPH_TENANT_ID', 'MS_GRAPH_CLIENT_ID', 'MS_GRAPH_CLIENT_SECRET',
+    'MS_GRAPH_SENDER_EMAIL', 'NOTIFICATIONS_DISABLE', 'TEST_EMAILS']) env[k] = process.env[k];
+  process.env.MS_GRAPH_TENANT_ID = 'tenant-test';
+  process.env.MS_GRAPH_CLIENT_ID = 'client-test';
+  process.env.MS_GRAPH_CLIENT_SECRET = 'secret-test';
+  process.env.MS_GRAPH_SENDER_EMAIL = 'ithelpdesk@easyfix.in';
+  delete process.env.NOTIFICATIONS_DISABLE;
+  delete process.env.TEST_EMAILS;
+
+  const seen = [];
+  let reads = 0;
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url);
+    const method = String(init.method || 'GET').toUpperCase();
+    const body = init.body === undefined ? '' : String(init.body);
+    seen.push({ url: u, method, body });
+
+    if (u.includes('login.microsoftonline.com')) return makeRes(200, { access_token: 'fake-token', expires_in: 3600 });
+    if (u.includes('/sendMail')) return makeRes(202, undefined);
+    if (u.includes('/assignLicense')) return makeRes(202, null);   // ACCEPTED, nothing more
+    if (u.includes('/subscribedSkus')) return makeRes(200, { value: [sku] });
+    if (method === 'POST' && /\/v1\.0\/users$/.test(u)) return makeRes(201, { id: 'obj-8805' });
+    /*
+     * The licence READ-BACK, matched on its EXACT select list: `assignedLicenses`
+     * also appears in the pre-existence lookup's select, and a looser match would
+     * answer THAT with a 200 — the account would read as already existing, the
+     * flow would take the reuse path and POST /users would never happen.
+     */
+    if (method === 'GET' && u.includes('$select=id,assignedLicenses')) {
+      reads++;
+      return makeRes(200, {
+        id: 'obj-8805',
+        assignedLicenses: reads > visibleAfterReads ? [{ skuId: sku.skuId }] : [],
+      });
+    }
+    if (u.includes('$filter=')) return makeRes(200, { value: [] });
+    return makeRes(404, { error: { code: 'Request_ResourceNotFound', message: 'not found' } });
+  };
+
+  return Promise.resolve(fn(seen)).finally(() => {
+    globalThis.fetch = originalFetch;
+    for (const [k, v] of Object.entries(env)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  });
+}
+
+/* Capture every line the REAL logger emits, without printing it. */
+function captureLogger() {
+  const logger = require('../logger');
+  const lines = [];
+  const original = {};
+  for (const [key, fn] of Object.entries(logger)) {
+    if (typeof fn !== 'function') continue;
+    original[key] = fn;
+    logger[key] = (...args) => { lines.push(args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ')); };
+  }
+  return { lines, restore: () => Object.assign(logger, original) };
+}
+
+const MOHIT = {
+  userId: 8805, userName: 'Mohit Kumar', officialEmail: 'mohit.kumar@easyfix.in',
+};
+
+test('THE INCIDENT: a licence visible only on a LATER read still reaches the welcome mail, WITH the credential', async () => {
+  await setProps({
+    'entra.provisioning.enabled': 'true',
+    'entra.managed.domains': 'easyfix.in',
+    'entra.provisioning.sku.part.number': 'SPB',
+  });
+  const welcomeMail = require('../services/user-welcome-mail.service');
+  const log = captureLogger();
+  fake.reset();
+
+  let sunk = null;
+  let out;
+  let mail;
+  let seen;
+  try {
+    await withProvisioningGraph({ visibleAfterReads: 2 }, async (requests) => {
+      out = await entra.provisionUserMailbox({
+        ...MOHIT,
+        trigger: 'create-user',
+        onTempPassword: (pw) => { sunk = pw; },
+        licenceVerify: FAST_VERIFY,
+      });
+      // The caller's chain, verbatim (services/user.service.js): the sink value
+      // is still in scope when provisioning resolves, which is the ONLY reason a
+      // wait longer than the HTTP response can still produce a credential mail.
+      mail = await welcomeMail.sendWelcomeMail({
+        userId: MOHIT.userId,
+        userName: MOHIT.userName,
+        officialEmail: MOHIT.officialEmail,
+        personalEmail: 'mohit.personal@gmail.com',
+        tempPassword: sunk,
+        provisioning: out,
+      });
+      seen = requests;
+    });
+  } finally {
+    log.restore();
+    await setProps({ 'entra.provisioning.enabled': 'false' });
+  }
+
+  // ── (a) The incident was REPRODUCED: the seat was not there at first. ────
+  const readbacks = seen.filter((r) => r.url.includes('$select=id,assignedLicenses'));
+  assert.equal(readbacks.length, 3,
+    'absent on two reads, present on the third — the old 2-attempt/1.2s version stopped one read short');
+
+  // ── (b) …and then FIXED. ────────────────────────────────────────────────
+  assert.equal(out.licenceStatus, entra.LICENCE_STATUS.ASSIGNED,
+    'not assigned_unconfirmed: we looked longer, and the seat was really there');
+  assert.equal(out.mailboxReady, true);
+
+  const mailReq = seen.find((r) => r.url.includes('/sendMail'));
+  assert.ok(mailReq, 'the welcome mail went out — GATE 1 passed because the mailbox is real');
+  assert.equal(mail.status, 'sent');
+  assert.equal(typeof sunk, 'string');
+  assert.ok(mailReq.body.includes(sunk),
+    'and it carries the temp password — a mail without the credential is the same dead end');
+
+  // ── (c) The password reached NOTHING else, on the long path either. ──────
+  assert.equal(JSON.stringify(out).includes(sunk), false,
+    'the provisioning outcome is published verbatim in the API response');
+  assert.equal(JSON.stringify(mail).includes(sunk), false, 'so is the mail outcome');
+  const leakedLog = log.lines.find((l) => l.includes(sunk));
+  assert.equal(leakedLog, undefined, 'no logger line may carry it — got: ' + String(leakedLog));
+  assert.ok(log.lines.length > 2, 'sanity: the logger really was capturing (' + log.lines.length + ' lines)');
+  const leakedSql = fake.calls.find((c) =>
+    String(c.sql).includes(sunk) || JSON.stringify(c.params ?? null).includes(sunk));
+  assert.equal(leakedSql, undefined, 'and it is never persisted, to any table');
+});
+
+test('…and when the seat NEVER appears, the budget expires into the honest state: no mailbox, no mail, no credential anywhere', async () => {
+  await setProps({
+    'entra.provisioning.enabled': 'true',
+    'entra.managed.domains': 'easyfix.in',
+    'entra.provisioning.sku.part.number': 'SPB',
+  });
+  const welcomeMail = require('../services/user-welcome-mail.service');
+  const log = captureLogger();
+  fake.reset();
+
+  let sunk = null;
+  let out;
+  let mail;
+  let seen;
+  try {
+    // Never visible: 999 reads' worth of absence against a 300ms budget.
+    await withProvisioningGraph({ visibleAfterReads: 999 }, async (requests) => {
+      out = await entra.provisionUserMailbox({
+        ...MOHIT,
+        trigger: 'create-user',
+        onTempPassword: (pw) => { sunk = pw; },
+        licenceVerify: FAST_VERIFY,
+      });
+      mail = await welcomeMail.sendWelcomeMail({
+        userId: MOHIT.userId,
+        userName: MOHIT.userName,
+        officialEmail: MOHIT.officialEmail,
+        personalEmail: 'mohit.personal@gmail.com',
+        tempPassword: sunk,
+        provisioning: out,
+      });
+      seen = requests;
+    });
+  } finally {
+    log.restore();
+    await setProps({ 'entra.provisioning.enabled': 'false' });
+  }
+
+  assert.equal(out.licenceStatus, entra.LICENCE_STATUS.ASSIGNED_UNCONFIRMED,
+    'waiting longer never turns "accepted" into "assigned" — the 2xx is still not evidence');
+  assert.equal(out.mailboxReady, false);
+  assert.equal(mail.status, 'skipped');
+  assert.match(mail.reason, /mailbox is not ready/);
+  assert.equal(seen.some((r) => r.url.includes('/sendMail')), false,
+    'no credential mail for a mailbox we could not confirm');
+
+  // The password WAS minted (the account got created), so this is not vacuous.
+  assert.equal(typeof sunk, 'string');
+  assert.equal(JSON.stringify(out).includes(sunk), false);
+  assert.equal(log.lines.find((l) => l.includes(sunk)), undefined);
+  assert.equal(
+    fake.calls.find((c) => String(c.sql).includes(sunk) || JSON.stringify(c.params ?? null).includes(sunk)),
+    undefined,
+  );
+});
 
 test('assigned_unconfirmed does NOT count as a working mailbox', () => {
   // This is the load-bearing half. mailboxLikelyExists gates the OTP mailbox

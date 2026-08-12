@@ -74,6 +74,12 @@ TEST_EMAILS=harshit@channelplay.in
 # Implemented in utils/otp.js::resolveLoginOtp().
 QA_DETERMINISTIC_OTP=true
 
+# Technician Android SMS Retriever (runtime, optional). Leave empty until the
+# production signing hash is confirmed and the final hash-suffixed SMS body is
+# DLT-approved. A valid value forces a bounded technician SMS attempt alongside
+# WhatsApp. Must be exactly 11 base64 characters; never paste it into logs.
+TECHNICIAN_SMS_RETRIEVER_APP_HASH=
+
 # QuickSight session bridge — HS256 secret shared with the EF-QuickSight
 # Angular app's API server. The CRM mints { session_proof, user_id }
 # tokens here; the QuickSight backend verifies them with this exact

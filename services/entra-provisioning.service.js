@@ -146,6 +146,23 @@ const ACCOUNT_STATUS = Object.freeze({
   SKIPPED_INVALID:    'skipped_invalid_email', // unusable official_email
   CREATED:            'created',
   ALREADY_EXISTS:     'already_exists',
+  /*
+   * The address is already held by a directory object that is NOT this user's.
+   *
+   * DISTINCT FROM ALREADY_EXISTS ON PURPOSE. `already_exists` means "our own
+   * earlier attempt for THIS user_id got there first" — an idempotent retry,
+   * safe to reuse and licence. This one means a DIFFERENT person owns the
+   * mailbox at that address, and reusing it would assign a licence to a
+   * stranger's account and store that stranger's objectId against the new CRM
+   * row. Two people called Mohit Kumar is all it takes. Nothing is written to
+   * the directory in this state; the operator has to pick another address (the
+   * numbered suggestion from suggestAvailableUpn is exactly that).
+   *
+   * ⚠ Not in the vocabulary list of migrations/executed/2026-07-30-create-tbl-
+   * user-entra-provisioning.sql — that file is frozen. account_status is a
+   * VARCHAR(32), so the value stores fine.
+   */
+  COLLISION:          'collision_other_object',
   FAILED:             'failed',
 });
 
@@ -405,16 +422,52 @@ function graphErrorToReason(result) {
  * write, so a second click (or a retry after a partial failure) never creates a
  * duplicate account.
  *
- *   found            → reuse it (already_exists), then check the licence
- *   definitely gone  → create
- *   can't tell       → ABORT. Creating while blind is how you end up with two
- *                      accounts; and if the lookup 403s the create would 403
- *                      too, so aborting loses nothing and reports a clean
- *                      reason the operator can fix.
+ *   found + it IS our object  → reuse it (already_exists), then check the licence
+ *   found + a DIFFERENT one   → COLLISION. Somebody else owns that mailbox.
+ *   definitely gone           → create
+ *   can't tell                → ABORT. Creating while blind is how you end up
+ *                               with two accounts; and if the lookup 403s the
+ *                               create would 403 too, so aborting loses nothing
+ *                               and reports a clean reason the operator can fix.
+ *
+ * `recordedObjectId` is the entra_object_id tbl_user_entra_provisioning already
+ * holds for THIS user_id, and it is the whole discriminator. `found` alone
+ * cannot tell "my own earlier attempt for this user" from "a different employee
+ * who already owns this address" — and before this argument existed it did not
+ * try to: ANY object at that UPN was reused, so a second Mohit Kumar would have
+ * been silently attached to the first one's mailbox.
+ *
+ * ⚠ NO RECORDED ID + THE ACCOUNT EXISTS IS A COLLISION, NOT A RETRY.
+ * That is the tempting branch to get wrong, because it looks like "first run,
+ * account already there, must be mine". It is not: recordProvisioning() writes
+ * a row on EVERY path — including every failure — and stamps entra_object_id
+ * the moment Graph confirms an account, so one of our own attempts always
+ * leaves a claim behind. "The directory has this address and we have never
+ * recorded owning it" therefore means somebody else's object.
+ * The residual false positive (account created, then the process died before
+ * the row was written) fails SAFE: we refuse, name the address, and an operator
+ * confirms it in the M365 admin centre. The false negative — licensing and
+ * mailing a new joiner into a stranger's mailbox — is not recoverable.
  */
-function decideAccountAction(lookup) {
+function decideAccountAction(lookup, { recordedObjectId = null } = {}) {
   if (lookup && lookup.found) {
-    return { action: 'reuse', accountStatus: ACCOUNT_STATUS.ALREADY_EXISTS, entraObjectId: lookup.user && lookup.user.id };
+    const foundId = String((lookup.user && lookup.user.id) || '').trim();
+    const ourId   = String(recordedObjectId || '').trim();
+    if (ourId && foundId && ourId.toLowerCase() === foundId.toLowerCase()) {
+      return { action: 'reuse', accountStatus: ACCOUNT_STATUS.ALREADY_EXISTS, entraObjectId: foundId };
+    }
+    const address = (lookup.user && (lookup.user.userPrincipalName || lookup.user.mail)) || 'this address';
+    return {
+      action: 'collision',
+      accountStatus: ACCOUNT_STATUS.COLLISION,
+      // Deliberately NOT returned as entraObjectId: a stranger's object id must
+      // not end up recorded against this user_id, which is the very outcome
+      // this branch exists to prevent.
+      foundObjectId: foundId || null,
+      reason: ourId
+        ? `${address} now belongs to a DIFFERENT directory object (${foundId || 'unknown id'}) than the one recorded for this user (${ourId})`
+        : `${address} already belongs to a different directory object (${foundId || 'unknown id'}) — this user has no Microsoft 365 account recorded, so the mailbox is somebody else's. Choose a different official email (e.g. a numbered variant) instead of taking over an existing mailbox`,
+    };
   }
   if (lookup && lookup.status === 'missing') {
     return { action: 'create' };
@@ -423,6 +476,118 @@ function decideAccountAction(lookup) {
     action: 'abort',
     accountStatus: ACCOUNT_STATUS.FAILED,
     reason: (lookup && lookup.reason) || 'directory lookup did not return a definitive answer',
+  };
+}
+
+/*
+ * ── Availability pre-flight (Add User) ────────────────────────────────────
+ *
+ * The owner's rule: check BEFORE the CRM row is written, and if the address is
+ * taken, offer a numbered alternative for the operator to confirm. Aborting
+ * mid-create would leave an orphan tbl_user row whose official_email no longer
+ * matches the directory, so this is a read-only pre-flight, not a mid-flight
+ * abort. The route publishing it is POST /api/admin/users/check-official-email.
+ *
+ * ⚠ "CANNOT TELL" IS NOT "AVAILABLE". Every inconclusive outcome — 403 before
+ * admin consent, 429, a 5xx, a network timeout, an unmanaged domain — answers
+ * unavailable WITH the reason. This is the same discipline decideAccountAction
+ * applies when it refuses to create blind, and it matters more here because the
+ * answer is TRUSTED: a check that says "free" when it does not know is worse
+ * than no check at all, since the operator stops looking.
+ *
+ *   → { available: true,  email }
+ *   → { available: false, email, taken, reason }
+ *
+ * `taken` is true ONLY for a definitive directory hit. It is what tells the
+ * caller a numbered suggestion makes sense — there is no point suggesting
+ * mohit.kumar2@ when the real problem is that Graph is down or the domain is
+ * not ours.
+ */
+async function isUpnAvailable(email) {
+  /*
+   * deriveIdentity does the validation this needs and nothing else does: an
+   * unusable local part or a domain we do not own can never become a mailbox,
+   * so both are reported as unavailable-with-a-reason rather than probed.
+   */
+  const ident = deriveIdentity({ official_email: email });
+  if (!ident.ok) {
+    return {
+      available: false,
+      email: String(email || '').trim().toLowerCase(),
+      taken: false,
+      reason: ident.reason,
+    };
+  }
+  const addr = ident.userPrincipalName;
+
+  /*
+   * findByUpn, NOT a bare GET /users/{upn}. It also runs the `mail` alias probe,
+   * and that is load-bearing here: an address that is free as a userPrincipalName
+   * but is some other mailbox's SMTP address is NOT free, and handing it out
+   * with full confidence is exactly the failure this endpoint is meant to stop.
+   */
+  const lookup = await findByUpn(addr, { select: 'id,mail,userPrincipalName,accountEnabled,proxyAddresses' });
+  if (lookup.found) {
+    const owner = (lookup.user && (lookup.user.userPrincipalName || lookup.user.mail)) || addr;
+    return {
+      available: false,
+      email: addr,
+      taken: true,
+      reason: `${addr} is already in use in Microsoft 365${owner && owner !== addr ? ` (as an address of ${owner})` : ''}`,
+    };
+  }
+  if (lookup.status === 'missing') return { available: true, email: addr };
+
+  return {
+    available: false,
+    email: addr,
+    taken: false,
+    reason: `the directory could not confirm that ${addr} is free — ${lookup.reason || 'lookup inconclusive'}`,
+  };
+}
+
+/*
+ * How many numbered variants to probe before giving up. Bounded rather than
+ * looping to the first free slot: each probe is one or two Graph round-trips on
+ * an operator's blocked form, and if twenty are taken the honest answer is a
+ * clear reason, not a hundred more calls.
+ */
+const MAX_UPN_SUGGESTION_PROBES = 20;
+
+/*
+ * Next free numbered variant of a taken address: mohit.kumar@ → mohit.kumar2@,
+ * mohit.kumar3@ … Numbering starts at 2 because the unnumbered address IS the
+ * first one, so the owner's own example (mohit.kumar3@ suggested) is the case
+ * where mohit.kumar@ and mohit.kumar2@ are both taken.
+ *
+ *   → { suggested: 'mohit.kumar3@easyfix.in', probes }
+ *   → { suggested: null, reason }
+ *
+ * An INCONCLUSIVE probe stops the walk instead of skipping to the next number:
+ * once the directory has stopped answering, every later "free" is a guess, and
+ * a guessed suggestion is the same trusted-but-wrong answer isUpnAvailable
+ * refuses to give.
+ */
+async function suggestAvailableUpn(email, { maxProbes = MAX_UPN_SUGGESTION_PROBES } = {}) {
+  const ident = deriveIdentity({ official_email: email });
+  if (!ident.ok) return { suggested: null, reason: ident.reason };
+
+  const at = ident.userPrincipalName.lastIndexOf('@');
+  const local = ident.userPrincipalName.slice(0, at);
+  const domain = ident.userPrincipalName.slice(at + 1);
+  const limit = Math.max(1, Math.min(50, Number(maxProbes) || MAX_UPN_SUGGESTION_PROBES));
+
+  for (let n = 2; n < 2 + limit; n++) {
+    const candidate = `${local}${n}@${domain}`;
+    const probe = await isUpnAvailable(candidate);
+    if (probe.available) return { suggested: candidate, probes: n - 1 };
+    if (!probe.taken) {
+      return { suggested: null, reason: `could not check ${candidate} — ${probe.reason}` };
+    }
+  }
+  return {
+    suggested: null,
+    reason: `${local}2@${domain} through ${local}${limit + 1}@${domain} are all in use — choose the address by hand`,
   };
 }
 
@@ -568,13 +733,112 @@ async function createEntraUser({ userPrincipalName, displayName, mailNickname, g
 }
 
 /*
- * How long to wait before re-reading the user, and how many times. Entra is
- * eventually consistent: a seat assigned a moment ago is not always visible on
- * the very next read. Two reads ~1.2s apart is enough for the normal case
- * without turning an admin action into a long request.
+ * PATCH /v1.0/users/{id} — mint a FRESH temp password for an account that
+ * already exists.
+ *
+ * WHY THIS EXISTS. The welcome mail has three gates, and a user whose first
+ * provisioning run failed AFTER the account was created can never satisfy all
+ * three: run 1 held the password but had no mailbox (GATE 1), and every later
+ * run takes the REUSE branch, which mints nothing (GATE 3). Observed on
+ * mohit.kumar@easyfix.in — account created 05:40:01, licence unconfirmed
+ * 05:40:04, retry at 06:16 completed cleanly, and no credential mail was ever
+ * sent to anyone. Without a way to issue a NEW password those users are
+ * stranded permanently.
+ *
+ * ⚠ DELIBERATE ACTION ONLY. This is wired to its own admin endpoint
+ * (POST /api/admin/users/:userId/reset-mailbox-password) and must NEVER become
+ * a silent fallback inside the existing retry: resetting the password of an
+ * account somebody is already using locks them out of Outlook and Teams.
+ *
+ * Same containment as createEntraUser: `onTempPassword` is a SINK and the only
+ * exit. The value is inside `body`, is not returned, is not persisted, and no
+ * log line in this function interpolates it. forceChangePasswordNextSignIn
+ * stays true, so it is single-use.
+ *
+ * Graph answers 204 (no content) on success.
  */
-const LICENCE_VERIFY_ATTEMPTS = 2;
-const LICENCE_VERIFY_DELAY_MS = 1200;
+async function resetEntraPassword(objectId, onTempPassword) {
+  const id = String(objectId || '').trim();
+  if (!id) return { ok: false, reason: 'no directory object id supplied' };
+
+  const tempPassword = generateTempPassword();
+  const res = await graphRequest(`/users/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: {
+      passwordProfile: {
+        forceChangePasswordNextSignIn: true,
+        password: tempPassword,
+      },
+    },
+  });
+  if (res.ok) {
+    // Deliberately logs the object id and NOTHING from passwordProfile.
+    logger.info('Entra password reset · objectId=' + id);
+    if (typeof onTempPassword === 'function') {
+      try {
+        onTempPassword(tempPassword);
+      } catch (e) {
+        // Never interpolate the password into this (or any) log line.
+        logger.warn('Temp-password sink threw on reset · objectId=' + id + ' · ' + e.message);
+      }
+    }
+    // NOTE: tempPassword is deliberately NOT on this object.
+    return { ok: true, requestId: res.requestId };
+  }
+  const err = graphErrorToReason(res);
+  return { ok: false, ...err };
+}
+
+/*
+ * How long to keep RE-READING the user after Graph accepts the assignment.
+ *
+ * THIS NUMBER WAS THE BUG. It used to be two reads 1200ms apart, above a comment
+ * claiming that was "enough for the normal case". It provably is not: Entra
+ * licence propagation routinely takes tens of seconds. On user 8805
+ * (mohit.kumar@easyfix.in) the account was created at 05:40:01, the seat was
+ * assigned, and at 05:40:04 the read-back still could not see it — so we recorded
+ * assigned_unconfirmed, skipped the welcome mail, and discarded the temp
+ * password. Every later retry took the REUSE branch, which mints no password, so
+ * that user could never be mailed by anyone. We were not detecting a failure; we
+ * were giving up 1.2 seconds before the answer existed.
+ *
+ * So the wait is now EXPONENTIAL — 2s, 4s, 8s, 16s, 32s, capped per sleep — under
+ * a total BUDGET, and it returns the instant the SKU is observed.
+ *
+ * WHY A BUDGET LONGER THAN THE HTTP RESPONSE IS SAFE. services/user.service.js
+ * races provisioning against PROVISION_INLINE_DEADLINE_MS (20s) and, when the
+ * deadline wins, answers welcome.status = PENDING with the words "the sign-in
+ * details are mailed automatically if it completes" — while the SAME promise
+ * carries on with the temp password still in its closure and its .then() still
+ * calling sendWelcomeMail. Outliving the response is precisely what makes that
+ * sentence true; no background job is needed. Do NOT "fix" this by raising the
+ * inline deadline — the operator's request must still return in ~20s.
+ *
+ * ⚠ THE READ-BACK ITSELF IS UNCHANGED. Only its DURATION moved. A 2xx from
+ * assignLicense still proves nothing (see assignLicense), and a budget that
+ * expires still answers verified:false — accepted-but-unobservable stays its own
+ * honest state and never becomes a mailbox.
+ *
+ * ⚠ RESIDUAL CASE, DELIBERATELY LEFT OPEN: a process restart mid-wait still
+ * loses the mail. The credential exists only in memory while the account now
+ * exists in the directory — exactly the stranded state above. The backoff
+ * shortens that window, it cannot close it, and the recovery is
+ * POST /api/admin/users/:userId/reset-mailbox-password, which mints a FRESH
+ * password and re-sends (see resetEntraPassword).
+ *
+ * Read LAZILY, like every other config reader in this file (propBool,
+ * configuredSkuPartNumber, managedDomains) rather than snapshotted at require
+ * time: a module-load snapshot cannot be overridden by a host — or a test —
+ * that sets the variable after this file is required, and the require graph here
+ * is deep enough that "after" is easy to hit by accident. Floor-guarded exactly
+ * like PROVISION_INLINE_DEADLINE_MS, so a typo'd 0 cannot silently disable the
+ * read-back loop.
+ */
+function licenceVerifyBudgetMs() {
+  return Math.max(1000, Number(process.env.ENTRA_LICENCE_VERIFY_BUDGET_MS) || 90000);
+}
+const LICENCE_VERIFY_FIRST_DELAY_MS = 2000;
+const LICENCE_VERIFY_MAX_DELAY_MS = 32000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /*
@@ -609,11 +873,19 @@ async function holdsLicence(objectId, skuId) {
  * one API further along: when the provider offers a way to OBSERVE the end
  * state, observe it — do not infer it from the acknowledgement.
  *
- *   → { ok: true,  verified: true }   seat read back from Entra
- *   → { ok: true,  verified: false }  Graph accepted it, seat not visible
- *   → { ok: false, reason }           Graph refused it outright
+ *   → { ok: true,  verified: true,  reads, waitedMs }   seat read back from Entra
+ *   → { ok: true,  verified: false, reads, waitedMs }   Graph accepted it, seat never visible
+ *   → { ok: false, reason }                             Graph refused it outright
+ *
+ * `opts` exists so the BOUND can be tested without a test that really sleeps for
+ * the production budget — such a test gets deleted by the next person and takes
+ * the guard with it. Production callers pass nothing.
  */
-async function assignLicense(objectId, skuId) {
+async function assignLicense(objectId, skuId, {
+  budgetMs = licenceVerifyBudgetMs(),
+  firstDelayMs = LICENCE_VERIFY_FIRST_DELAY_MS,
+  maxDelayMs = LICENCE_VERIFY_MAX_DELAY_MS,
+} = {}) {
   const res = await graphRequest(`/users/${encodeURIComponent(objectId)}/assignLicense`, {
     method: 'POST',
     body: { addLicenses: [{ skuId, disabledPlans: [] }], removeLicenses: [] },
@@ -623,25 +895,48 @@ async function assignLicense(objectId, skuId) {
     return { ok: false, ...err };
   }
 
+  const budget = Math.max(0, Number(budgetMs) || 0);
+  const startedAt = Date.now();
+  let delay = Math.max(1, Number(firstDelayMs) || LICENCE_VERIFY_FIRST_DELAY_MS);
   let last = { readable: false, held: false };
-  for (let attempt = 1; attempt <= LICENCE_VERIFY_ATTEMPTS; attempt++) {
+  let reads = 0;
+
+  /*
+   * The FIRST read is immediate — a seat that is already visible must cost no
+   * wait at all — and the loop returns the moment it is observed, so a fast
+   * tenant is no slower than the old two-read version. Only the failing path
+   * spends the budget. Each sleep is clamped to what is LEFT of the budget, so
+   * the total wait is bounded by `budget` however the doubling lands.
+   */
+  for (;;) {
     last = await holdsLicence(objectId, skuId);
+    reads++;
     if (last.held) {
-      return { ok: true, verified: true, requestId: last.requestId || res.requestId };
+      return {
+        ok: true, verified: true, reads, waitedMs: Date.now() - startedAt,
+        requestId: last.requestId || res.requestId,
+      };
     }
-    if (attempt < LICENCE_VERIFY_ATTEMPTS) await sleep(LICENCE_VERIFY_DELAY_MS);
+    const left = budget - (Date.now() - startedAt);
+    if (left <= 0) break;
+    await sleep(Math.min(delay, left));
+    delay = Math.min(delay * 2, Math.max(1, Number(maxDelayMs) || LICENCE_VERIFY_MAX_DELAY_MS));
   }
 
-  // Accepted but not observable. Report it as such — the caller records a
-  // status that does NOT claim a working mailbox.
+  // Accepted but not observable, even after waiting. Report it as such — the
+  // caller records a status that does NOT claim a working mailbox.
+  const waitedMs = Date.now() - startedAt;
   return {
     ok: true,
     verified: false,
+    reads,
+    waitedMs,
     requestId: last.requestId || res.requestId,
     reason: last.readable
       ? `Graph accepted the assignment (HTTP ${res.status}) but the SKU is still not on the user after `
-        + `${LICENCE_VERIFY_ATTEMPTS} read-backs — check seat availability and usageLocation in the M365 admin centre`
-      : `Graph accepted the assignment (HTTP ${res.status}) but the user could not be re-read to confirm the seat`,
+        + `${reads} read-backs over ${Math.round(waitedMs / 1000)}s — check seat availability and usageLocation in the M365 admin centre`
+      : `Graph accepted the assignment (HTTP ${res.status}) but the user could not be re-read to confirm the seat `
+        + `in ${reads} attempts over ${Math.round(waitedMs / 1000)}s`,
   };
 }
 
@@ -838,9 +1133,15 @@ async function getProvisioning(userId) {
  *        API response) and is NOT written to tbl_user_entra_provisioning — the
  *        sink is the single exit. Omit it and the password is generated,
  *        used in the Graph body, and dropped exactly as before.
+ * @param {Object} [args.licenceVerify]
+ *        Overrides for the licence read-back backoff ({ budgetMs, firstDelayMs,
+ *        maxDelayMs }) — forwarded verbatim to assignLicense. Exists so a test
+ *        can prove the wait is bounded without sleeping the real budget.
+ *        Production callers omit it.
  */
 async function provisionUserMailbox({
   userId, userName, officialEmail, trigger = 'create-user', actorId, onTempPassword,
+  licenceVerify,
 } = {}) {
   const base = {
     userId: Number(userId),
@@ -903,10 +1204,20 @@ async function provisionUserMailbox({
 
   // 3 ── IDEMPOTENCY: look before you leap. Also pulls assignedLicenses so a
   //      re-run on an already-licensed account is a no-op.
+  /*
+   * What this user_id ALREADY owns in the directory, read before the lookup so
+   * the decision below can tell our own retry from a collision with a different
+   * person's mailbox. getProvisioning is fail-soft (null on a missing table or
+   * a read error), and null means "we have no recorded claim on this address" —
+   * the conservative direction, which refuses rather than reuses.
+   */
+  const recorded = await getProvisioning(userId);
+  const recordedObjectId = (recorded && recorded.entra_object_id) || null;
+
   const lookup = await findByUpn(ident.userPrincipalName, {
     select: 'id,mail,userPrincipalName,accountEnabled,assignedLicenses',
   });
-  const decision = decideAccountAction(lookup);
+  const decision = decideAccountAction(lookup, { recordedObjectId });
 
   let accountStatus;
   let entraObjectId = null;
@@ -928,6 +1239,30 @@ async function provisionUserMailbox({
     return outcome;
   }
 
+  /*
+   * COLLISION — the address exists in the directory and it is not ours. Nothing
+   * is written: no account, no licence, and crucially no entra_object_id, since
+   * `base.entraObjectId` is still null and recording the stranger's id against
+   * this user_id is the exact damage being prevented. The operator's fix is a
+   * different official email — POST /api/admin/users/check-official-email will
+   * suggest the next free numbered one.
+   */
+  if (decision.action === 'collision') {
+    const outcome = {
+      ...base,
+      attempted: true,
+      accountStatus: ACCOUNT_STATUS.COLLISION,
+      licenceStatus: LICENCE_STATUS.NOT_ATTEMPTED,
+      mailboxReady: false,
+      reason: decision.reason,
+      graphRequestId,
+    };
+    logger.error('Entra provisioning refused — UPN belongs to another directory object · userId=' + userId
+      + ' · upn=' + ident.userPrincipalName + ' · ' + decision.reason);
+    await recordProvisioning({ ...outcome, lastError: decision.reason, countAttempt: true });
+    return outcome;
+  }
+
   if (decision.action === 'reuse') {
     accountStatus = ACCOUNT_STATUS.ALREADY_EXISTS;
     entraObjectId = decision.entraObjectId || null;
@@ -942,7 +1277,16 @@ async function provisionUserMailbox({
       entraObjectId = created.id;
       graphRequestId = created.requestId || graphRequestId;
     } else if (created.alreadyExists) {
-      // Lost a race (or an alias we couldn't see). Re-resolve rather than fail.
+      /*
+       * Lost a race (or an alias we couldn't see). Re-resolve rather than fail.
+       *
+       * NOT the collision case, despite there being no recorded object id: the
+       * lookup a moment ago was a DEFINITIVE miss, so the object appeared
+       * between that read and this write — which in practice is our own second
+       * concurrent attempt for this same user (a double-clicked Provision
+       * Mailbox). A different employee's long-standing mailbox would have been
+       * seen by the lookup and stopped at the collision branch above.
+       */
       const again = await findByUpn(ident.userPrincipalName, { select: 'id,mail,userPrincipalName,assignedLicenses' });
       accountStatus = again.found ? ACCOUNT_STATUS.ALREADY_EXISTS : ACCOUNT_STATUS.FAILED;
       entraObjectId = again.found ? again.user.id : null;
@@ -1003,7 +1347,7 @@ async function provisionUserMailbox({
         licenceStatus = LICENCE_STATUS.ALREADY_LICENSED;
         licenceReason = `already holds ${chosen.skuPartNumber}`;
       } else {
-        const assigned = await assignLicense(entraObjectId, chosen.skuId);
+        const assigned = await assignLicense(entraObjectId, chosen.skuId, licenceVerify);
         graphRequestId = assigned.requestId || graphRequestId;
         if (assigned.ok && assigned.verified) {
           licenceStatus = LICENCE_STATUS.ASSIGNED;
@@ -1067,9 +1411,13 @@ module.exports = {
   // OTP pre-check
   mailboxExists,
   clearMailboxCache,
+  // Add User pre-flight (availability + numbered suggestion)
+  isUpnAvailable,
+  suggestAvailableUpn,
   // graph calls
   findByUpn,
   createEntraUser,
+  resetEntraPassword,
   assignLicense,
   listSubscribedSkus,
   // pure helpers (unit-tested)
@@ -1085,6 +1433,7 @@ module.exports = {
   provisioningEnabled,
   mailboxPrecheckEnabled,
   configuredSkuPartNumber,
+  licenceVerifyBudgetMs,
   managedDomains,
   // vocabularies + property keys
   ACCOUNT_STATUS,

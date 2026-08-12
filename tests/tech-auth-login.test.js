@@ -23,12 +23,14 @@ process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
 
 const EFR_BY_NO    = /FROM tbl_easyfixer\s+WHERE efr_no = \?/i;
 const EFR_BY_USER  = /JOIN tbl_user u ON u\.user_id = e\.user_id/i;
-const EFR_BY_ID    = /FROM tbl_easyfixer WHERE efr_id = \?/i;
+const EFR_BY_ID    = /FROM tbl_easyfixer\s+WHERE efr_id = \?/i;
 const OTP_VERIFY   = /SELECT id, otp, valid_up_to, is_expired FROM otp_details/i;
+const OTP_CONSUME  = /UPDATE otp_details SET is_expired = 1[\s\S]*user_mobile_no = \?/i;
 const OTP_EXISTING = /SELECT id FROM otp_details/i;
 const INSERT_USER  = /INSERT INTO tbl_user/i;
 const INSERT_EFR   = /INSERT INTO tbl_easyfixer/i;
 const GET_LOCK     = /GET_LOCK/i;
+const RELEASE_LOCK = /RELEASE_LOCK/i;
 
 const DEACTIVATED = { efr_id: 11179, efr_name: 'Harshit', efr_no: '9013877370', efr_email: null, efr_status: 0,    is_technician_verified: null, user_id: 8500 };
 const VIA_USER    = { efr_id: 11079, efr_name: 'Harshit', efr_no: '9560966498', efr_email: null, efr_status: 1,    is_technician_verified: true, user_id: 8379 };
@@ -40,6 +42,7 @@ const DEFAULTS = () => ({
   otpRow: [{ id: 77, otp: 1234, valid_up_to: new Date(Date.now() + 5 * 60_000), is_expired: 0 }],
 });
 let scenario = DEFAULTS();
+let deliveryResult;
 
 const fake = installFakePool([
   [EFR_BY_USER,  () => scenario.byUserMobile],   // must precede EFR_BY_NO (both mention tbl_easyfixer)
@@ -47,6 +50,9 @@ const fake = installFakePool([
   [EFR_BY_ID,    () => scenario.byEfrNo],
   [OTP_VERIFY,   () => scenario.otpRow],
   [OTP_EXISTING, () => []],
+  [OTP_CONSUME,  () => ({ affectedRows: 1 })],
+  [GET_LOCK,     (sql) => (/AS got/i.test(sql) ? [{ got: 1 }] : [{ acquired: 1 }])],
+  [RELEASE_LOCK, () => [{ released: 1 }]],
 ]);
 
 // Stub OTP delivery before the service lazily requires it, so no test can reach
@@ -54,7 +60,7 @@ const fake = installFakePool([
 const deliveryPath = require.resolve('../services/otp-delivery.service');
 require.cache[deliveryPath] = {
   id: deliveryPath, filename: deliveryPath, loaded: true,
-  exports: { deliverOtp: async () => {} },
+  exports: { deliverOtp: async () => deliveryResult },
 };
 
 const techAuth = require('../services/tech-auth.service');
@@ -62,7 +68,15 @@ const techAuth = require('../services/tech-auth.service');
 const wroteIdentity = () =>
   fake.calls.some((c) => INSERT_USER.test(c.sql) || INSERT_EFR.test(c.sql));
 
-beforeEach(() => { scenario = DEFAULTS(); fake.reset(); });
+beforeEach(() => {
+  scenario = DEFAULTS();
+  deliveryResult = {
+    finalDelivered: true,
+    disabled: false,
+    attempts: [{ channel: 'sms', delivered: true }],
+  };
+  fake.reset();
+});
 
 // ── Identity resolution ────────────────────────────────────────────────
 
@@ -124,19 +138,81 @@ test('findById does NOT filter efr_status — deactivated tokens stay valid', as
     'a deactivated technician must keep a working token to see their status');
 });
 
+test('findById excludes deleted tombstones and attaches lifecycle capabilities', async () => {
+  scenario.byEfrNo = [VIA_USER];
+  const tech = await techAuth.findById(VIA_USER.efr_id);
+  const q = fake.calls.find((c) => EFR_BY_ID.test(c.sql));
+  assert.ok(q);
+  assert.match(whereClause(q.sql), /NOT \(efr_status <=> 3\)/);
+  assert.equal(tech.lifecycle.status, 'ACTIVE');
+  assert.equal(tech.lifecycle.capabilities.receiveNewJobs, true);
+  assert.equal(tech.lifecycle.capabilities.mutateAssignedJobs, true);
+});
+
+test('findById redacts BLACKLISTED RCA text from nested and root mobile aliases', async () => {
+  scenario.byEfrNo = [{
+    ...DEACTIVATED,
+    lifecycle_status: 'BLACKLISTED',
+    lifecycle_reason_code: 'INTERNAL_RCA',
+    lifecycle_reason: 'Sensitive investigation detail',
+    lifecycle_version: 4,
+  }];
+  const tech = await techAuth.findById(DEACTIVATED.efr_id);
+  assert.equal(tech.lifecycle.status, 'BLACKLISTED');
+  assert.equal(tech.lifecycle.reasonCode, null);
+  assert.equal(tech.lifecycle.reason, null);
+  assert.equal(tech.lifecycle_reason_code, null);
+  assert.equal(tech.lifecycle_reason, null);
+});
+
 // ── No identity writes before OTP proof ────────────────────────────────
 
 test('send-OTP writes NO identity row for an unknown number', async () => {
   const r = await techAuth.createLoginOtp('9000000001');
   assert.equal(r.found, true, 'an unknown number must still receive an OTP');
+  assert.equal(r.delivered, true, 'success must reflect a provider-reported delivery');
+  assert.equal(r.resendInSeconds, 30);
   assert.ok(!wroteIdentity(), 'send-OTP must not INSERT tbl_user / tbl_easyfixer');
-  assert.ok(!fake.calls.some((c) => GET_LOCK.test(c.sql)),
-    'send-OTP must not take the onboarding lock');
+  assert.ok(!fake.calls.some((c) => GET_LOCK.test(c.sql)
+    && String(c.params?.[0] || '').startsWith('tech_stub_create_')),
+  'send-OTP must not take the identity-onboarding lock');
 });
 
 test('send-OTP for a known technician also writes no identity row', async () => {
   scenario.byEfrNo = [DEACTIVATED];
   await techAuth.createLoginOtp('9013877370');
+  assert.ok(!wroteIdentity());
+});
+
+test('send-OTP fails closed when every real delivery channel fails', async () => {
+  deliveryResult = {
+    finalDelivered: false,
+    disabled: false,
+    attempts: [
+      { channel: 'whatsapp', delivered: false },
+      { channel: 'sms', delivered: false },
+    ],
+  };
+
+  await assert.rejects(
+    techAuth.createLoginOtp('9000000005'),
+    (err) => err.status === 503 && err.code === 'OTP_DELIVERY_FAILED',
+  );
+  assert.ok(!wroteIdentity(), 'delivery failure remains an unauthenticated no-identity-write path');
+});
+
+test('notification-disabled QA keeps send-OTP successful for logged-code testing', async () => {
+  deliveryResult = {
+    finalDelivered: false,
+    disabled: true,
+    attempts: [
+      { channel: 'whatsapp', delivered: false, disabled: true },
+      { channel: 'sms', delivered: false, disabled: true },
+    ],
+  };
+
+  const result = await techAuth.createLoginOtp('9000000006');
+  assert.equal(result.delivered, true);
   assert.ok(!wroteIdentity());
 });
 

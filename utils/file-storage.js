@@ -98,11 +98,19 @@ function resolveWithinCategory(category, filename) {
   return full;
 }
 
-function writeBuffer(category, buffer, originalName, mimetype) {
+function writeBuffer(category, buffer, originalName, mimetype, options = {}) {
   checkMime(mimetype);
   const root = ensureCategoryDir(category);
-  const filename = generateFilename(originalName);
-  const full = path.resolve(root, filename);
+  const deterministicStem = String(options?.deterministicStem || '').trim();
+  if (deterministicStem && !/^[A-Za-z0-9_-]{1,180}$/.test(deterministicStem)) {
+    const err = new Error('deterministic filename stem is invalid'); err.status = 400; throw err;
+  }
+  const filename = deterministicStem
+    ? `${deterministicStem}${safeExt(originalName)}`
+    : generateFilename(originalName);
+  const full = deterministicStem
+    ? resolveWithinCategory(category, filename)
+    : path.resolve(root, filename);
   fs.writeFileSync(full, buffer);
   return {
     category,
