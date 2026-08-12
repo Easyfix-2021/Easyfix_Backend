@@ -228,15 +228,37 @@ async function start() {
     try {
       const { verifySchemaAgainstLiveDb } = require('./scripts/schema-verify');
       const report = await verifySchemaAgainstLiveDb();
-      if (!report.ok) {
-        logger.error(`Schema parity check FAILED — ${report.requiredMismatches.length} mismatches:`);
+      if (report.requiredMismatches.length > 0) {
+        logger.error(`Schema parity check FAILED — ${report.requiredMismatches.length} missing column(s)/table(s):`);
         for (const m of report.requiredMismatches) {
           logger.error(`  ${m.table}.${m.col || m.missing}`);
         }
         logger.error('Server will not start. Run migrations or set SKIP_SCHEMA_VERIFY=true to override.');
         process.exit(1);
       }
-      logger.info(`Schema parity OK — ${report.columnsChecked} columns / ${report.indexesChecked} indexes / ${report.tablesChecked} tables verified` +
+      /*
+       * Hardening invariants (UNIQUE indexes / generated column / trigger) are
+       * reported but do NOT block the boot. Every query still executes without
+       * them — the behaviour degrades to what production did before the
+       * invariant existed. Blocking here once took production down for a
+       * migration that was itself blocked on an audited Ops decision, and the
+       * only recovery, SKIP_SCHEMA_VERIFY=true, ALSO disabled the missing-column
+       * protection above. Set REQUIRE_SCHEMA_INVARIANTS=true once the migrations
+       * have landed to make the guarantee permanent and fail closed again.
+       */
+      if (report.invariantMismatches.length > 0) {
+        const strict = String(process.env.REQUIRE_SCHEMA_INVARIANTS).toLowerCase() === 'true';
+        logger.warn(`Schema invariants MISSING — ${report.invariantMismatches.length} (run the pending migrations):`);
+        for (const m of report.invariantMismatches) {
+          logger.warn(`  ${m.table}.${m.col}${m.impact ? ` — ${m.impact}` : ''}`);
+        }
+        if (strict) {
+          logger.error('REQUIRE_SCHEMA_INVARIANTS=true — server will not start until the invariants exist.');
+          process.exit(1);
+        }
+        logger.warn('Continuing to boot (set REQUIRE_SCHEMA_INVARIANTS=true to enforce).');
+      }
+      logger.info(`Schema parity ${report.ok ? 'OK' : 'PARTIAL'} — ${report.columnsChecked} columns / ${report.indexesChecked} indexes / ${report.tablesChecked} tables verified` +
         (report.optionalMissing.length ? ` (${report.optionalMissing.length} optional tables missing — handled gracefully)` : ''));
     } catch (err) {
       logger.error(`Schema verify crashed — ${err.message}. Server will not start.`);

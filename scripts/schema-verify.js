@@ -157,6 +157,19 @@ const EXPECTED = {
 // missing idempotency key UNIQUE can execute an offline mutation twice; a
 // missing training UNIQUE makes ON DUPLICATE KEY UPDATE insert duplicates; and
 // the active-Aadhaar UNIQUE is the authoritative cross-technician race guard.
+//
+// SEVERITY (2026-08-12, after a production boot-loop): these are reported
+// SEPARATELY from missing columns. A missing COLUMN is a phantom-column bug —
+// the code's own SQL names it, so a request 500s the moment it runs; the server
+// must refuse to boot. A missing INDEX/TRIGGER/GENERATED COLUMN below is a
+// hardening invariant — every query still executes, the behaviour simply
+// degrades to what production did before the invariant existed. Blocking boot
+// on those coupled the server's availability to a migration that is itself
+// blocked on an audited Ops decision (the active-Aadhaar duplicates), so the
+// only way back up was SKIP_SCHEMA_VERIFY=true — which ALSO disables the
+// phantom-column protection this file exists for. They now warn loudly on every
+// boot and block only when REQUIRE_SCHEMA_INVARIANTS=true (set that once the
+// migrations have landed, to make the guarantee permanent).
 const REQUIRED_INDEXES = [
   {
     table: 'tbl_idempotency_key',
@@ -215,13 +228,20 @@ const OPTIONAL = {
 };
 
 /**
- * Returns { ok, requiredMismatches, optionalMissing, columnsChecked }.
+ * Returns { ok, requiredMismatches, invariantMismatches, optionalMissing, ... }.
+ *
+ * `requiredMismatches` = missing tables/columns → the code's own SQL names them,
+ *   so these are runtime 500s waiting to happen. Callers MUST refuse to boot.
+ * `invariantMismatches` = missing UNIQUE index / generated column / trigger →
+ *   queries still run, behaviour degrades. Callers warn; blocking is opt-in.
+ *
  * Does NOT exit the process — caller decides what to do.
  */
 async function verifySchemaAgainstLiveDb() {
   const dbName = process.env.DB_NAME;
-  let totalChecked = 0, missingCount = 0;
+  let totalChecked = 0;
   const missing = [];
+  const invariants = [];
   const optionalMissing = [];
 
   for (const [table, columns] of Object.entries(EXPECTED)) {
@@ -232,15 +252,11 @@ async function verifySchemaAgainstLiveDb() {
     const actual = new Set(rows.map((r) => r.COLUMN_NAME));
     if (actual.size === 0) {
       missing.push({ table, missing: '<TABLE DOES NOT EXIST>' });
-      missingCount += columns.length;
       continue;
     }
     for (const col of columns) {
       totalChecked++;
-      if (!actual.has(col)) {
-        missing.push({ table, col });
-        missingCount++;
-      }
+      if (!actual.has(col)) missing.push({ table, col });
     }
   }
 
@@ -268,11 +284,15 @@ async function verifySchemaAgainstLiveDb() {
       return required.columns.every((column, i) => index.columns[i] === column);
     });
     if (!found) {
-      missing.push({
+      invariants.push({
         table: required.table,
         col: `<${required.unique ? 'UNIQUE ' : ''}INDEX(${required.columns.join(',')})>`,
+        impact: required.table === 'tbl_idempotency_key'
+          ? 'an offline mutation can execute twice'
+          : required.table === 'easyfixer_watched_video'
+            ? 'ON DUPLICATE KEY UPDATE cannot fire — training saves insert duplicate rows'
+            : 'the cross-technician Aadhaar race guard is not enforced by the database',
       });
-      missingCount++;
     }
   }
 
@@ -281,11 +301,11 @@ async function verifySchemaAgainstLiveDb() {
     [dbName],
   );
   if (!matchesActiveAadhaarGeneratedColumn(generatedColumns[0])) {
-    missing.push({
+    invariants.push({
       table: 'tbl_easyfixer',
       col: '<GENERATED active_aadhaar_unique EXPRESSION>',
+      impact: 'no runtime query reads this column; only the DB-level uniqueness guard is absent',
     });
-    missingCount++;
   }
 
   const [trainingTriggers] = await pool.query(
@@ -300,11 +320,11 @@ async function verifySchemaAgainstLiveDb() {
     [dbName],
   );
   if (!matchesTrainingMonotonicTrigger(trainingTriggers[0])) {
-    missing.push({
+    invariants.push({
       table: 'easyfixer_watched_video',
       col: '<BEFORE UPDATE MONOTONIC TRIGGER>',
+      impact: 'the legacy Java writer can lower training progress already advanced by an offline replay',
     });
-    missingCount++;
   }
 
   for (const [table, note] of Object.entries(OPTIONAL)) {
@@ -316,12 +336,15 @@ async function verifySchemaAgainstLiveDb() {
   }
 
   return {
-    ok: missing.length === 0,
+    ok: missing.length === 0 && invariants.length === 0,
     columnsChecked: totalChecked,
     indexesChecked: REQUIRED_INDEXES.length,
     invariantsChecked: 2,
     tablesChecked: Object.keys(EXPECTED).length,
+    // Boot-blocking: the code's SQL names these, so they are runtime 500s.
     requiredMismatches: missing,
+    // Degradations: warn on boot; block only under REQUIRE_SCHEMA_INVARIANTS.
+    invariantMismatches: invariants,
     optionalMissing,
   };
 }
@@ -332,11 +355,21 @@ async function cliMain() {
   const report = await verifySchemaAgainstLiveDb();
   console.log(`\nChecked ${report.columnsChecked} columns, ${report.indexesChecked} required indexes, and ${report.invariantsChecked} schema invariants across ${report.tablesChecked} required tables`);
   if (report.ok) {
-    console.log('✅ All required columns exist in production schema.');
+    console.log('✅ All required columns, indexes and invariants exist in production schema.');
   } else {
-    console.log(`✗ ${report.requiredMismatches.length} required mismatches:`);
-    for (const m of report.requiredMismatches) {
-      console.log(`  ${m.table}.${m.col || m.missing}`);
+    // The CLI is the PRE-DEPLOY gate and stays strict: it exits non-zero for
+    // either class. Only the server's boot path treats them differently.
+    if (report.requiredMismatches.length > 0) {
+      console.log(`✗ ${report.requiredMismatches.length} BOOT-BLOCKING mismatches (missing columns/tables — the code's SQL names these):`);
+      for (const m of report.requiredMismatches) {
+        console.log(`  ${m.table}.${m.col || m.missing}`);
+      }
+    }
+    if (report.invariantMismatches.length > 0) {
+      console.log(`⚠ ${report.invariantMismatches.length} MISSING INVARIANTS (server still boots; behaviour degrades):`);
+      for (const m of report.invariantMismatches) {
+        console.log(`  ${m.table}.${m.col}${m.impact ? ` — ${m.impact}` : ''}`);
+      }
     }
     process.exitCode = 1;
   }
