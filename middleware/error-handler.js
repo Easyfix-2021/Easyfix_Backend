@@ -1,5 +1,6 @@
 const logger = require('../logger');
 const { modernError, legacyError } = require('../utils/response');
+const { redactUrl } = require('../utils/log-format');
 
 function isIntegrationRoute(req) {
   return req.originalUrl.startsWith('/api/integration/');
@@ -23,7 +24,10 @@ function errorHandler(err, req, res, _next) {
   logger.error(
     {
       err: { message: err.message, stack: err.stack, code: err.code },
-      url: req.originalUrl,
+      // Same shape-based redaction the access log uses: an unhandled error on a
+      // magic-link or customer-mobile route would otherwise write the token or
+      // phone number into the error log.
+      url: redactUrl(req.originalUrl),
       method: req.method,
     },
     'request error'

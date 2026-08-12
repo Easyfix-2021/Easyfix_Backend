@@ -7,12 +7,20 @@ const { modernOk, modernError } = require('../../utils/response');
 const identity = require('../../services/mobile-identity.service');
 const registration = require('../../services/mobile-registration.service');
 
+/*
+ * PII: Joi's default `string.pattern.base` message embeds the rejected value,
+ * and middleware/validate.js both logs and returns `details`. Report only the
+ * rule so an invalid Aadhaar/PAN never reaches a log or a response body.
+ */
+const AADHAAR_MESSAGE = { 'string.pattern.base': 'aadhaarNumber must be exactly 12 digits' };
+const PAN_MESSAGE = { 'string.pattern.base': 'panNumber must be 5 letters, 4 digits, then a letter' };
+
 const identityDetailsSchema = Joi.object({
   name: Joi.string().trim().min(1).max(255).optional(),
-  aadhaarNumber: Joi.string().pattern(/^[0-9]{12}$/).optional(),
-  aadhaar: Joi.string().pattern(/^[0-9]{12}$/).optional(),
-  panNumber: Joi.string().pattern(/^[A-Za-z]{5}[0-9]{4}[A-Za-z]$/).optional(),
-  pan: Joi.string().pattern(/^[A-Za-z]{5}[0-9]{4}[A-Za-z]$/).optional(),
+  aadhaarNumber: Joi.string().pattern(/^[0-9]{12}$/).optional().messages(AADHAAR_MESSAGE),
+  aadhaar: Joi.string().pattern(/^[0-9]{12}$/).optional().messages(AADHAAR_MESSAGE),
+  panNumber: Joi.string().pattern(/^[A-Za-z]{5}[0-9]{4}[A-Za-z]$/).optional().messages(PAN_MESSAGE),
+  pan: Joi.string().pattern(/^[A-Za-z]{5}[0-9]{4}[A-Za-z]$/).optional().messages(PAN_MESSAGE),
   firstName: Joi.string().trim().max(255).optional(),
   lastName: Joi.string().trim().max(255).optional(),
   dob: Joi.string().trim().max(40).optional(),

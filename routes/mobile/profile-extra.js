@@ -271,16 +271,26 @@ router.post('/upi-details', validate(Joi.object({
 // ─────────────────────────────────────────────────────────────────────
 
 /*
- * `:number` is a bare Aadhaar (12 digits) or PAN (ABCDE1234F). We
- * validate the param shape and exclude the caller's own row so a
- * re-save of an unchanged number isn't a false duplicate.
+ * `number` is a bare Aadhaar (12 digits) or PAN (ABCDE1234F). We validate its
+ * shape and exclude the caller's own row so a re-save of an unchanged number
+ * isn't a false duplicate.
+ *
+ * POST, not GET-with-a-path-param (changed 2026-08-12). middleware/http-log.js
+ * captures req.originalUrl and prints it for EVERY request, so a path param put
+ * the caller's Aadhaar/PAN into the access log on every check — the endpoint is
+ * a read, but the identifier is the PII. A request body is not logged.
+ *
+ * This remains ADVISORY only: it is a pre-submit convenience for the app and is
+ * inherently TOCTOU-racy. Enforcement lives in the write path
+ * (utils/aadhaar-uniqueness#assertActiveAadhaarAvailable), never here.
  */
-router.get('/kyc/aadhaar-pan-exists/:number', validate(Joi.object({
-  number: Joi.string().trim().pattern(/^([0-9]{12}|[A-Za-z]{5}[0-9]{4}[A-Za-z])$/).required(),
-}), 'params'), async (req, res, next) => {
+router.post('/kyc/aadhaar-pan-exists', validate(Joi.object({
+  number: Joi.string().trim().pattern(/^([0-9]{12}|[A-Za-z]{5}[0-9]{4}[A-Za-z])$/).required()
+    .messages({ 'string.pattern.base': 'number must be a 12-digit Aadhaar or a valid PAN' }),
+})), async (req, res, next) => {
   try {
-    logger.info(`KYC duplicate-check · type=${/^[0-9]{12}$/.test(req.params.number) ? 'aadhaar' : 'pan'}`);
-    modernOk(res, await svc.aadhaarPanExists(req.params.number, req.tech.efr_id));
+    logger.info(`KYC duplicate-check · type=${/^[0-9]{12}$/.test(req.body.number) ? 'aadhaar' : 'pan'}`);
+    modernOk(res, await svc.aadhaarPanExists(req.body.number, req.tech.efr_id));
   } catch (e) { next(e); }
 });
 

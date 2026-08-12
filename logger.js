@@ -28,7 +28,7 @@
  */
 
 const { current } = require('./utils/request-context');
-const { contextLine, methodTag } = require('./utils/log-format');
+const { contextLine, methodTag, redactUrl } = require('./utils/log-format');
 
 const isTTY = process.stdout.isTTY;
 
@@ -76,7 +76,10 @@ function renderExtras(obj) {
 function maybeHeader(req) {
   if (req._logHeaderEmitted) return;
   req._logHeaderEmitted = true;
-  console.log(contextLine(req, 'INFO', `${methodTag(req.method)} ${req.originalUrl}`));
+  // Redacted for the same reason as the access line in http-log.js: this header
+  // prints the URL for EVERY request that emits an app log, so an identity value
+  // in the path would be written out at request rate.
+  console.log(contextLine(req, 'INFO', `${methodTag(req.method)} ${redactUrl(req.originalUrl)}`));
 }
 
 function line(icon, color, arg1, arg2) {

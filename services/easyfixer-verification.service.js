@@ -3,7 +3,11 @@ const deepSkillService = require('./deep-skill.service');
 const logger = require('../logger');
 const registrationStatusPush = require('./registration-status-push.service');
 const lifecycle = require('./easyfixer-lifecycle.service');
-const { mapAadhaarUniqueViolation } = require('../utils/aadhaar-uniqueness');
+const {
+  mapAadhaarUniqueViolation,
+  normalizeAadhaar,
+  withActiveAadhaarGuard,
+} = require('../utils/aadhaar-uniqueness');
 
 /*
  * Easyfixer Verification — service backing the "Self-Registration
@@ -556,7 +560,24 @@ async function applyIdentityMutation(db, efrId, body, actor) {
 async function saveIdentity(efrId, body, actor) {
   logger.info('Save identity verification · efrId=' + efrId + ' · verification_status=' + body.verification_status);
   const status = Number(body.verification_status);
+  /*
+   * Aadhaar duplicate guard. This is the CRM operator hand-correction path —
+   * precisely where two operators can type the same number onto two different
+   * technicians. Two of the three branches below (:578, :582) run on the bare
+   * pool with no transaction and no lock at all, and verification_status is
+   * optional in the validator, so `{ adhaar_card_number }` alone is a live
+   * untransacted write.
+   *
+   * The guard sits HERE rather than in applyIdentityMutation so it completes
+   * before syncFromVerificationFlagsAtomic opens its transaction and takes
+   * `... FOR UPDATE` — a named lock must never be acquired while a row lock is
+   * held. Its connection holds only the value lock. No-op when no Aadhaar is
+   * being written.
+   */
+  const guardedAadhaar = normalizeAadhaar(body.adhaar_card_number);
+  const lockConn = guardedAadhaar ? await pool.getConnection() : null;
   try {
+    const applySave = async () => {
     if (status === 1 || status === 2) {
       const installed = await lifecycle.hasLifecycleSchema();
       if (installed) {
@@ -581,8 +602,14 @@ async function saveIdentity(efrId, body, actor) {
     } else {
       await applyIdentityMutation(pool, efrId, body, actor);
     }
+    };
+
+    if (lockConn) await withActiveAadhaarGuard(lockConn, guardedAadhaar, efrId, applySave);
+    else await applySave();
   } catch (error) {
     throw mapAadhaarUniqueViolation(error);
+  } finally {
+    if (lockConn) lockConn.release();
   }
   logger.info('Identity verification updated · efrId=' + efrId + ' · status=' + status);
   return getVerificationPage(efrId);

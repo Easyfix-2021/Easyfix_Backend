@@ -1452,15 +1452,38 @@ router.get('/training-videos', async (_req, res, next) => {
 });
 
 // Customer lookup by mobile (from tech app for OTP flows)
-router.get('/customers/mobile/:mobile', async (req, res, next) => {
+/*
+ * Customer lookup by mobile. The number travels in the BODY, not the path
+ * (2026-08-12): a URL is logged on every request, on every error, and by every
+ * upstream proxy/CDN we do not control, so a phone number in the path was
+ * written out at request rate. A query string would be no better — it is part
+ * of req.originalUrl too.
+ */
+async function lookupCustomerByMobile(rawMobile, res, next) {
   try {
     logger.info('Lookup customer by mobile');
+    const mobile = String(rawMobile || '').replace(/\D/g, '');
     const [[cust]] = await pool.query(
       'SELECT customer_id, customer_name, customer_mob_no, customer_email FROM tbl_customer WHERE customer_mob_no = ? LIMIT 1',
-      [req.params.mobile]);
+      [mobile]);
     logger.info('Customer lookup · found=' + Boolean(cust));
-    modernOk(res, cust || null);
-  } catch (e) { next(e); }
+    return modernOk(res, cust || null);
+  } catch (e) { return next(e); }
+}
+
+// Canonical.
+router.post('/customers/lookup', (req, res, next) => (
+  lookupCustomerByMobile(req.body?.mobile, res, next)
+));
+
+/*
+ * DEPRECATED alias. No caller exists in the technician app today, so this can be
+ * deleted as soon as that is re-confirmed — it is kept only so a client build we
+ * have not audited cannot 404 mid-rollout.
+ */
+router.get('/customers/mobile/:mobile', (req, res, next) => {
+  logger.warn('DEPRECATED GET /customers/mobile/:mobile — migrate to POST /customers/lookup');
+  return lookupCustomerByMobile(req.params.mobile, res, next);
 });
 
 // ─── Net-new technician sub-routers (2026-06-15, mobile-only) ───────
@@ -1478,7 +1501,7 @@ router.use(require('./attendance'));
 router.use(require('./lookups'));
 //   /profile/name · /profile/image · /earnings · /icard · /ratings
 //   /training-videos/percentage · /app-version · /logout · /upi-details
-//   /kyc/aadhaar-pan-exists/:number
+//   /kyc/aadhaar-pan-exists  (POST — the number travels in the body, never the URL)
 router.use(require('./profile-extra'));
 //   /performance/weekly  (live OTA/SDA weekly chart — net-new GAP #5)
 router.use('/performance', require('./performance'));

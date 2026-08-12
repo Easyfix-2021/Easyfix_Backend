@@ -4,14 +4,30 @@ const assert = require('node:assert/strict');
 const identity = require('../services/mobile-identity.service');
 const registration = require('../services/mobile-registration.service');
 const lifecycle = require('../services/easyfixer-lifecycle.service');
+const aadhaarUniqueness = require('../utils/aadhaar-uniqueness');
 
 const originalFinalize = lifecycle.finalizeMobileRegistrationGate1;
 
 afterEach(() => {
   lifecycle.finalizeMobileRegistrationGate1 = originalFinalize;
+  // The generated-column probe caches per process; clear it so each test picks
+  // its own schema shape rather than inheriting the previous test's.
+  aadhaarUniqueness._internals.resetActiveAadhaarColumnProbeForTests();
 });
 
-function identityDb({ failUpdate = null } = {}) {
+/**
+ * `conflict` — another technician already holds the number (the duplicate guard
+ * must reject before the UPDATE runs).
+ * `generatedColumn` — whether tbl_easyfixer.active_aadhaar_unique exists, which
+ * selects which of the two equivalent guard queries is issued.
+ * `failLock` — GET_LOCK returns 0 (contention on the same Aadhaar value).
+ */
+function identityDb({
+  failUpdate = null,
+  conflict = false,
+  generatedColumn = false,
+  failLock = null,
+} = {}) {
   const events = [];
   const conn = {
     async beginTransaction() { events.push({ type: 'begin' }); },
@@ -21,7 +37,15 @@ function identityDb({ failUpdate = null } = {}) {
     async query(sql, params) {
       const text = String(sql);
       events.push({ type: 'query', sql: text, params });
-      if (/GET_LOCK/i.test(text)) return [[{ acquired: 1 }], []];
+      if (/GET_LOCK/i.test(text)) {
+        const key = String(params?.[0] || '');
+        const denied = failLock && key.startsWith(failLock);
+        return [[{ acquired: denied ? 0 : 1 }], []];
+      }
+      if (/information_schema\.columns/i.test(text)) {
+        return [generatedColumn ? [{ 1: 1 }] : [], []];
+      }
+      if (/SELECT 1 AS conflict/i.test(text)) return [[conflict ? { conflict: 1 } : null].filter(Boolean), []];
       if (/^\s*UPDATE tbl_easyfixer/i.test(text)) {
         if (failUpdate) throw failUpdate;
         return [{ affectedRows: 1 }, []];
@@ -34,6 +58,13 @@ function identityDb({ failUpdate = null } = {}) {
   };
   return { events, conn, getConnection: async () => conn };
 }
+
+const guardQueries = (database) => database.events.filter((event) => (
+  event.type === 'query' && /SELECT 1 AS conflict/i.test(event.sql)
+));
+const lockNames = (database) => database.events
+  .filter((event) => event.type === 'query' && /GET_LOCK/i.test(event.sql))
+  .map((event) => String(event.params?.[0] || ''));
 
 test('atomically persists optional name with identity fields and documents before finalization', async () => {
   const database = identityDb();
@@ -123,13 +154,106 @@ test('maps the authoritative UNIQUE race to the same redacted 409', async () => 
 });
 
 test('does not mislabel an unrelated duplicate-key error as an Aadhaar conflict', async () => {
-  const duplicateError = new Error("Duplicate entry 'other' for key 'some_other_unique'");
+  // Still NOT a 409 — only the authoritative constraint maps to that. But the
+  // raw mysql2 error is no longer rethrown verbatim: its message embeds the
+  // rejected value, and logger.js renders every key with no redaction, so an
+  // identity-writing statement must never let one escape. Client behaviour is
+  // unchanged (a 500); only the log line loses the Aadhaar.
+  const duplicateError = new Error("Duplicate entry '123456789012' for key 'some_other_unique'");
   duplicateError.code = 'ER_DUP_ENTRY';
   const database = identityDb({ failUpdate: duplicateError });
 
   await assert.rejects(
     identity.saveIdentityDetails(8379, { aadhaarNumber: '123456789012' }, { database }),
-    (error) => error === duplicateError,
+    (error) => (
+      error.status === undefined
+      && error.code === 'ER_DUP_ENTRY'
+      && !error.message.includes('123456789012')
+    ),
+  );
+});
+
+test('rejects a duplicate Aadhaar before the UPDATE, without the DB index', async () => {
+  // The production reality this guard exists for: uq_easyfixer_active_aadhaar
+  // does not exist, so nothing downstream would have caught this.
+  const database = identityDb({ conflict: true });
+
+  await assert.rejects(
+    identity.saveIdentityDetails(8379, { aadhaarNumber: '123456789012' }, { database }),
+    (error) => (
+      error.status === 409
+      && error.details?.code === 'AADHAAR_ALREADY_REGISTERED'
+      && !error.message.includes('123456789012')
+    ),
+  );
+
+  assert.equal(
+    database.events.some((event) => event.type === 'query' && /^\s*UPDATE tbl_easyfixer/i.test(event.sql)),
+    false,
+    'the write must never be attempted once a conflict is known',
+  );
+  assert.ok(database.events.some((event) => event.type === 'rollback'));
+});
+
+test('the duplicate guard matches the generated column semantics', async () => {
+  const database = identityDb({ generatedColumn: false });
+  await identity.saveIdentityDetails(8379, { aadhaarNumber: ' 123456789012 ' }, { database });
+
+  const [guard] = guardQueries(database);
+  assert.ok(guard, 'the guard query must run');
+  // Soft-deleted rows do not reserve a number; TRIM/blank handled exactly as the
+  // generated column does; self-exclusion by efr_id. Never widened to PAN.
+  assert.match(guard.sql, /NOT \(efr_status <=> 3\)/i);
+  assert.match(guard.sql, /NULLIF\(TRIM\(adhaar_card_number\), ''\) = \?/i);
+  assert.match(guard.sql, /efr_id <> \?/i);
+  assert.doesNotMatch(guard.sql, /pan_card_number/i);
+  assert.deepEqual(guard.params, ['123456789012', 8379], 'value is trimmed, self excluded');
+});
+
+test('prefers the generated column when the migration has landed', async () => {
+  const database = identityDb({ generatedColumn: true });
+  await identity.saveIdentityDetails(8379, { aadhaarNumber: '123456789012' }, { database });
+
+  const [guard] = guardQueries(database);
+  assert.match(guard.sql, /active_aadhaar_unique = \?/i);
+  assert.doesNotMatch(guard.sql, /NULLIF/i);
+});
+
+test('serialises on the Aadhaar VALUE, not just the technician row', async () => {
+  const database = identityDb();
+  await identity.saveIdentityDetails(8379, { aadhaarNumber: '123456789012' }, { database });
+
+  const locks = lockNames(database);
+  // Coarse value lock BEFORE the fine per-row lock: that ordering is what makes
+  // the two named locks totally ordered and therefore deadlock-free.
+  assert.equal(locks.length, 2);
+  assert.match(locks[0], /^efr_aadhaar:[0-9a-f]{32}$/, 'value lock is a salted digest');
+  assert.equal(locks[1], 'efr_doc:8379');
+  assert.equal(
+    locks[0].includes('123456789012'),
+    false,
+    'the Aadhaar value must never appear in a lock name — they are visible in SHOW PROCESSLIST',
+  );
+});
+
+test('a doc-only save takes no value lock and runs no duplicate query', async () => {
+  // Without this gate every PAN-only/doc-only save would hash the empty string
+  // to one lock name and serialise the endpoint globally.
+  const database = identityDb();
+  await identity.saveIdentityDetails(8379, { docs: { pan: 'kyc/pan-key' } }, { database });
+
+  assert.deepEqual(lockNames(database), ['efr_doc:8379']);
+  assert.equal(guardQueries(database).length, 0);
+});
+
+test('value-lock contention surfaces as the generic in-progress 409', async () => {
+  // Deliberately indistinguishable from the row-lock message: a distinct "that
+  // Aadhaar is busy" reply would be a timing oracle.
+  const database = identityDb({ failLock: 'efr_aadhaar:' });
+
+  await assert.rejects(
+    identity.saveIdentityDetails(8379, { aadhaarNumber: '123456789012' }, { database }),
+    (error) => error.status === 409 && error.details?.code === 'IDENTITY_UPDATE_IN_PROGRESS',
   );
 });
 

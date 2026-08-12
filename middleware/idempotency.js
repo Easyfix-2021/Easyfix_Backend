@@ -212,6 +212,12 @@ function idempotency({ resolveActor = defaultResolveActor, database = pool } = {
       );
     }
 
+    // DO NOT apply redactUrl() here (or to the fingerprint at the top of this
+    // file). This value participates in idempotency identity: masking it would
+    // make two requests that differ ONLY by an identity value in the URL hash
+    // identically, so one caller's stored response could be replayed to another.
+    // Correctness outranks the log-hygiene concern, and keyed requests are
+    // mutations that carry their payload in the body, not the path.
     const path = req.originalUrl;
     const fingerprint = requestFingerprint(req, contentDigest);
     const owner = {

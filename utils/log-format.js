@@ -99,4 +99,45 @@ function contextLine(req, level, message) {
   return `${ts} ${rid} ${tag} ${id} ${arrow} ${lvl} ${message}`;
 }
 
-module.exports = { paint, ANSI, surfaceOf, identityOf, levelFromStatus, methodTag, contextLine, stamp };
+/*
+ * Redact identity-shaped values out of a URL before it is logged.
+ *
+ * WHY BY SHAPE, NOT BY PARAM NAME (2026-08-12): a request URL is logged on EVERY
+ * request (middleware/http-log.js) and on every unhandled error
+ * (middleware/error-handler.js), so any route that carries a sensitive value in
+ * its path writes that value into the access log at request rate. That is how an
+ * advisory Aadhaar duplicate-check endpoint ended up logging Aadhaar numbers on
+ * every call. Matching on the VALUE's shape rather than on a known parameter
+ * name means a new route cannot silently reintroduce the leak — no allowlist to
+ * remember to update.
+ *
+ * Live examples this covers today: GET /customers/mobile/:mobile (routes/mobile
+ * and routes/client) puts a customer phone number in the path, and the public
+ * magic-link routes (routes/public/shared-job.js, email-verify.js) put a
+ * bearer-equivalent TOKEN there — a credential, not merely PII.
+ *
+ * Ordering matters: the 12-digit Aadhaar rule runs before the 10-digit mobile
+ * rule. Numeric surrogate keys (job/user/client ids) are 1-9 digits and are
+ * deliberately NOT matched — redacting those would make the logs useless.
+ */
+const URL_REDACTIONS = [
+  // Aadhaar — exactly 12 digits.
+  [/(?<![0-9])[0-9]{12}(?![0-9])/g, '<aadhaar>'],
+  // PAN — 5 letters, 4 digits, 1 letter.
+  [/(?<![A-Za-z0-9])[A-Za-z]{5}[0-9]{4}[A-Za-z](?![A-Za-z0-9])/g, '<pan>'],
+  // Indian mobile — exactly 10 digits starting 6-9.
+  [/(?<![0-9])[6-9][0-9]{9}(?![0-9])/g, '<mobile>'],
+  // Opaque secret (magic-link / verification token). 24+ chars of base64url is
+  // never a human-meaningful path segment.
+  [/(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{24,}(?![A-Za-z0-9_-])/g, '<token>'],
+];
+
+function redactUrl(url) {
+  let out = String(url ?? '');
+  for (const [pattern, tag] of URL_REDACTIONS) out = out.replace(pattern, tag);
+  return out;
+}
+
+module.exports = {
+  paint, ANSI, surfaceOf, identityOf, levelFromStatus, methodTag, contextLine, stamp, redactUrl,
+};

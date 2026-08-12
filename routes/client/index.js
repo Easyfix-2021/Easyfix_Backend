@@ -1110,9 +1110,20 @@ router.post('/device-token', async (req, res, next) => {
 // Customer lookup by mobile — powers the New Order auto-fill (name/email
 // prefill when the caller is an existing customer). Returns the most recent
 // matching customer, or { customer: null } when unknown.
-router.get('/customers/mobile/:mobile', async (req, res, next) => {
+/*
+ * Customer lookup by mobile.
+ *
+ * The number travels in the BODY, not the path (2026-08-12). A request URL is
+ * written to the access log on every request and to the error log on every
+ * failure, and it also reaches every upstream proxy/CDN access log we do not
+ * control — so a phone number in the path was logged at request rate in places
+ * we cannot redact. (A query string is no better: it is part of req.originalUrl
+ * too.) Our own logs additionally mask mobile-shaped values via
+ * utils/log-format#redactUrl, but that only covers logs we own.
+ */
+async function lookupCustomerByMobile(rawMobile, res, next) {
   try {
-    const mobile = String(req.params.mobile || '').replace(/\D/g, '');
+    const mobile = String(rawMobile || '').replace(/\D/g, '');
     if (!/^\d{10}$/.test(mobile)) return modernOk(res, { customer: null });
     const [[customer]] = await pool.query(
       `SELECT customer_id, customer_name, customer_mob_no, customer_email
@@ -1121,8 +1132,24 @@ router.get('/customers/mobile/:mobile', async (req, res, next) => {
         ORDER BY customer_id DESC LIMIT 1`,
       [mobile]);
     logger.info('Customer lookup by mobile · found=' + (customer ? 'yes' : 'no'));
-    modernOk(res, { customer: customer || null });
-  } catch (e) { next(e); }
+    return modernOk(res, { customer: customer || null });
+  } catch (e) { return next(e); }
+}
+
+// Canonical.
+router.post('/customers/lookup', (req, res, next) => (
+  lookupCustomerByMobile(req.body?.mobile, res, next)
+));
+
+/*
+ * DEPRECATED alias — remove once Easyfix_client_UI and Easyfix_Client_App have
+ * shipped the POST call (both are updated to use it; this only covers the
+ * window where an older client build is still live, since the backend and the
+ * two frontends cannot deploy atomically). Behaviour is identical.
+ */
+router.get('/customers/mobile/:mobile', (req, res, next) => {
+  logger.warn('DEPRECATED GET /customers/mobile/:mobile — migrate to POST /customers/lookup');
+  return lookupCustomerByMobile(req.params.mobile, res, next);
 });
 
 // Saved addresses for a customer, so Book-a-service can offer their previous

@@ -31,7 +31,7 @@ const logger = require('../logger');
  * other reasons).
  */
 
-const { levelFromStatus, contextLine, methodTag } = require('../utils/log-format');
+const { levelFromStatus, contextLine, methodTag, redactUrl } = require('../utils/log-format');
 
 function quickHint(status) {
   if (status === 429) return ' · rate limit';
@@ -54,7 +54,11 @@ function hintFor(res, status) {
 
 module.exports = function httpLog(req, res, next) {
   const started = Date.now();
-  const path = req.originalUrl;
+  // Redact identity-shaped values (Aadhaar / PAN / mobile / magic-link token)
+  // ONCE at capture, so every downstream use below is safe by construction.
+  // Numeric surrogate ids are left intact, so the route-matching checks below
+  // (job location pings, AI-calling polls) are unaffected.
+  const path = redactUrl(req.originalUrl);
 
   res.on('finish', () => {
     const duration = Date.now() - started;
