@@ -170,7 +170,7 @@ router.get('/dashboard', async (req, res, next) => {
     // The three "Today's jobs" tiles, each scoped to TODAY by its own date column
     // (scope=today). Default (no scope) = lifetime totals.
     //   New         = ANY ticket created today          (ticket_created_date_time)
-    //   In Progress = status 1/2/20, appointment today  (original_appointment_date_time)
+    //   In Progress = status 0/1/2/20, appointment today (requested_date_time)
     //   Completed   = status 3/5, checked out today      (checkout_date_time)
     const todayOnly = String(req.query.scope || '') === 'today';
     const on = (col) => (todayOnly ? `AND DATE(${col}) = CURDATE()` : '');
@@ -193,7 +193,7 @@ router.get('/dashboard', async (req, res, next) => {
     const [[stats]] = await pool.query(`
       SELECT
         SUM(CASE WHEN ticket_created_date_time IS NOT NULL ${on('ticket_created_date_time')} THEN 1 ELSE 0 END) AS newTickets,
-        SUM(CASE WHEN job_status IN (1,2,20) ${on('original_appointment_date_time')} THEN 1 ELSE 0 END) AS inProgress,
+        SUM(CASE WHEN job_status IN (0,1,2,20) ${on('requested_date_time')} THEN 1 ELSE 0 END) AS inProgress,
         SUM(CASE WHEN job_status IN (3,5)    ${on('checkout_date_time')}             THEN 1 ELSE 0 END) AS completed
        FROM tbl_job WHERE fk_client_id = ? ${mine}`, params);
     modernOk(res, stats);
@@ -1126,8 +1126,10 @@ router.get('/customers/mobile/:mobile', async (req, res, next) => {
 });
 
 // Saved addresses for a customer, so Book-a-service can offer their previous
-// locations. Only the addresses used in this customer's LAST 3 jobs with THIS
-// client (deduped) — recent + relevant, never other clients' work.
+// locations. Distinct addresses from this customer's jobs at THIS client that
+// reached a real service stage (status 2/3/5/10/15/20/21) — skips new/pending/
+// cancelled/enquiry so we only surface addresses that were actually serviced.
+// Deduped, newest-first; never other clients' work.
 router.get('/customers/:customerId/addresses', async (req, res, next) => {
   try {
     const cid = Number(req.params.customerId);
@@ -1140,8 +1142,8 @@ router.get('/customers/:customerId/addresses', async (req, res, next) => {
                 SELECT fk_address_id, job_id
                   FROM tbl_job
                  WHERE fk_customer_id = ? AND fk_client_id = ?
+                   AND job_status IN (3,5,2,20,10,15,21)
                  ORDER BY job_id DESC
-                 LIMIT 3
               ) recent
          JOIN tbl_address a  ON a.address_id = recent.fk_address_id
          LEFT JOIN tbl_city ci ON ci.city_id = a.city_id
@@ -1149,7 +1151,7 @@ router.get('/customers/:customerId/addresses', async (req, res, next) => {
                  a.pin_code, a.gps_location, a.city_id, ci.city_name
         ORDER BY last_job DESC`,
       [cid, req.spoc.client_id]);
-    logger.info('Customer saved addresses (last 3 jobs) · customerId=' + cid + ' · count=' + rows.length);
+    logger.info('Customer saved addresses (serviced jobs) · customerId=' + cid + ' · count=' + rows.length);
     modernOk(res, { items: rows });
   } catch (e) { next(e); }
 });
