@@ -36,6 +36,20 @@ const SURFACES = ['crm', 'client', 'technician'];
 
 // `target_surfaces` is a CSV (e.g. "technician,client"). Returns true when
 // `surface` is one of its members.
+/*
+ * Should publishing this notice fan a push out to the Technician App?
+ *
+ * Treats an ABSENT flag as TRUE on purpose: rows written before the
+ * push_technician column existed, and any caller that doesn't set it, must keep
+ * the historic behaviour (targeting the technician surface has always pushed).
+ * Only an explicit 0/false suppresses it.
+ */
+function pushTechnicianWanted(notice) {
+  const flag = notice && notice.push_technician;
+  if (flag === undefined || flag === null) return true;
+  return Number(flag) === 1 || flag === true;
+}
+
 function surfacesInclude(targetSurfaces, surface) {
   return String(targetSurfaces || '')
     .split(',')
@@ -120,6 +134,10 @@ const ROW_SELECT = `
   n.target_surfaces, n.audience_scope, n.audience_ref_id,
   n.action_url, n.images, n.is_pinned, n.status,
   n.publish_at, n.expire_at,
+  -- event_date drives the dashboard's Upcoming Events rail; the push flags let
+  -- the CRM show what a notice was configured to send. Added here (the shared
+  -- projection) so list, detail AND the per-surface active feed all carry them.
+  n.event_date, n.push_technician, n.push_client,
   n.created_by, n.reviewed_by, n.published_by,
   n.created_at, n.updated_at,
   c.name  AS category_name,
@@ -344,6 +362,10 @@ async function createNotice(body, createdBy) {
     audience_scope = 'all', audience_ref_id = null,
     action_url = null, images = [], is_pinned = false,
     publish_at = null, expire_at = null,
+    // '' from an untouched date input must land as SQL NULL, not as the empty
+    // string (which MySQL would coerce to the zero-date '0000-00-00').
+    event_date = null,
+    push_technician = true, push_client = false,
     status_intent = 'draft',
   } = body;
 
@@ -404,12 +426,14 @@ async function createNotice(body, createdBy) {
        (title, body, category_id, target_surfaces,
         audience_scope, audience_ref_id, action_url, images, is_pinned,
         status, publish_at, expire_at,
+        event_date, push_technician, push_client,
         created_by, published_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       title, text, category_id, target_surfaces,
       audience_scope, audience_ref_id, action_url, imagesJson, is_pinned ? 1 : 0,
       status, resolvedPublishAt, expire_at,
+      event_date || null, push_technician ? 1 : 0, push_client ? 1 : 0,
       createdBy, resolvedPublishedBy,
     ],
   );
@@ -421,10 +445,15 @@ async function createNotice(body, createdBy) {
   // created already-published (publish intent with no future publish_at)
   // and targets the technician surface. Scheduled/future notices are NOT
   // pushed here (no scheduler fires them at publish_at yet).
+  // pushWanted(): the technician fan-out now also honours the explicit
+  // push_technician flag. It only NARROWS — the surface must still be targeted.
+  // Undefined (pre-migration rows / callers that never set it) counts as TRUE
+  // so historic behaviour is preserved.
   if (
     created
     && status === 'published'
     && surfacesInclude(created.target_surfaces, 'technician')
+    && pushTechnicianWanted(created)
   ) {
     const { pushNoticeToTechnicians } = require('./notice-push.service');
     pushNoticeToTechnicians(created).catch(() => {});
@@ -463,6 +492,7 @@ async function updateNotice(noticeId, fields) {
     'title', 'body', 'category_id', 'target_surfaces',
     'audience_scope', 'audience_ref_id', 'action_url', 'images',
     'is_pinned', 'publish_at', 'expire_at',
+    'event_date', 'push_technician', 'push_client',
   ];
   const sets = [];
   const params = [];
@@ -543,6 +573,7 @@ async function publishNotice(noticeId, { publish_at, expire_at }, publishedBy) {
     row
     && newStatus === 'published'
     && surfacesInclude(row.target_surfaces, 'technician')
+    && pushTechnicianWanted(row)
   ) {
     // Lazy require avoids any circular-require risk (mirrors how
     // job.service.js lazily requires its orchestrator). Fire-and-forget:
@@ -569,6 +600,50 @@ async function archiveNotice(noticeId) {
   );
   logger.info('Notice archived · id=' + noticeId);
   return getNoticeById(noticeId);
+}
+
+/*
+ * Permanently delete a notice.
+ *
+ * Distinct from archive: archiving keeps the row (and its read receipts) for
+ * the record and merely stops it appearing, whereas delete is for notices that
+ * should never have existed — a typo, a duplicate, a test broadcast. Ops asked
+ * for both because archiving a mistake still leaves it cluttering the list.
+ *
+ * The read receipts go with it. tbl_notice_read has no FK to tbl_notice (this
+ * schema deliberately carries none), so nothing cascades — orphan rows would
+ * accumulate forever and skew the read-percentage of a LATER notice if an id
+ * were ever reused. Both statements run in one transaction so a notice can
+ * never survive with its receipts already gone, or vice versa.
+ *
+ * Returns { deleted: true } or null when the id doesn't exist, so the route can
+ * 404 cleanly rather than reporting a successful no-op.
+ */
+async function deleteNotice(noticeId) {
+  logger.info('Delete notice · id=' + noticeId);
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [[existing]] = await conn.query(
+      'SELECT notice_id FROM tbl_notice WHERE notice_id = ? FOR UPDATE',
+      [noticeId],
+    );
+    if (!existing) {
+      await conn.rollback();
+      return null;
+    }
+    const [reads] = await conn.query('DELETE FROM tbl_notice_read WHERE notice_id = ?', [noticeId]);
+    await conn.query('DELETE FROM tbl_notice WHERE notice_id = ?', [noticeId]);
+    await conn.commit();
+    logger.info('Notice deleted · id=' + noticeId + ' · readReceiptsRemoved=' + (reads.affectedRows || 0));
+    return { deleted: true, notice_id: Number(noticeId) };
+  } catch (e) {
+    await conn.rollback();
+    logger.error('Delete notice failed, rolled back · id=' + noticeId + ' · ' + e.message);
+    throw e;
+  } finally {
+    conn.release();
+  }
 }
 
 // ─── Scheduled → published flip + push (cron) ───────────────────────
@@ -622,7 +697,7 @@ async function publishDueScheduled() {
       // Only push when the (now-published) notice targets technicians.
       if (surfacesInclude(n.target_surfaces, 'technician')) {
         const row = await getNoticeById(n.notice_id);
-        if (row) {
+        if (row && pushTechnicianWanted(row)) {
           // Lazy require mirrors createNotice/publishNotice — avoids any
           // circular-require risk. Fire-and-forget: never block the batch.
           const { pushNoticeToTechnicians } = require('./notice-push.service');
@@ -753,6 +828,7 @@ module.exports = {
   updateNotice,
   publishNotice,
   archiveNotice,
+  deleteNotice,
   publishDueScheduled,
   // Consumer
   listActiveForSurface,

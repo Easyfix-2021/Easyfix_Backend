@@ -33,6 +33,16 @@ const isoOrMysqlDate = Joi.alternatives().try(
   Joi.string().pattern(/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?$/),
 );
 
+/*
+ * event_date is DATE-only (the day a notice is ABOUT). Deliberately NOT
+ * isoOrMysqlDate: that helper's string branch REQUIRES a time component, so a
+ * plain "2026-08-14" from the date picker would fail. Accepting only
+ * YYYY-MM-DD also stops a timezone-bearing ISO instant sliding the day by one
+ * on the way into a DATE column.
+ */
+const dateOnly = Joi.string().trim().pattern(/^\d{4}-\d{2}-\d{2}$/)
+  .messages({ 'string.pattern.base': 'event_date must be YYYY-MM-DD' });
+
 // ─── Categories ──────────────────────────────────────────────────────
 const categoryCreate = Joi.object({
   name:                Joi.string().trim().min(2).max(60).required(),
@@ -97,6 +107,14 @@ const noticeCreate = Joi.object({
   is_pinned:       Joi.boolean().default(false),
   publish_at:      isoOrMysqlDate.allow(null).optional(),
   expire_at:       isoOrMysqlDate.allow(null).optional(),
+  // Optional calendar date the notice is ABOUT — drives the Upcoming Events rail.
+  event_date:      dateOnly.allow('', null).optional(),
+  // Explicit push intent. Both only NARROW: the matching surface must still be
+  // in target_surfaces for anything to send. push_technician defaults TRUE to
+  // preserve the historic implicit behaviour (publishing to the technician
+  // surface has always pushed).
+  push_technician: Joi.boolean().default(true),
+  push_client:     Joi.boolean().default(false),
   status_intent:   Joi.string().valid('draft', 'publish').default('draft'),
 }).custom((obj, helpers) => {
   if (obj.publish_at && obj.expire_at) {
@@ -123,6 +141,9 @@ const noticeUpdate = Joi.object({
   is_pinned:       Joi.boolean().optional(),
   publish_at:      isoOrMysqlDate.allow(null).optional(),
   expire_at:       isoOrMysqlDate.allow(null).optional(),
+  event_date:      dateOnly.allow('', null).optional(),
+  push_technician: Joi.boolean().optional(),
+  push_client:     Joi.boolean().optional(),
 }).min(1).custom((obj, helpers) => {
   if (obj.publish_at && obj.expire_at) {
     const p = new Date(obj.publish_at).getTime();

@@ -65,7 +65,21 @@ async function pushNoticeToTechnicians(notice) {
     // `screen:'notices'` is what the new Expo app's tap router matches (→ /notices);
     // `type`/`noticeId` are kept for foreground handlers + any future per-notice link.
     // (The old Flutter app has no notices screen, so it shows the notification only.)
+    /*
+     * Tap destination, WITHOUT requiring an app release:
+     *   - Expo app  → matches `screen:'notices'` and opens /notices.
+     *   - Flutter app → has no 'notices' case, so its switch falls through to
+     *     `default: SplashPage()` — i.e. the app home/login screen. That IS the
+     *     requested fallback behaviour, achieved by the existing default branch.
+     *
+     * `action_url` is carried purely FORWARD-COMPATIBLY. Neither app router has
+     * a URL/webview branch today, and both ignore unknown data keys, so adding
+     * it is inert now and becomes a real deep link the moment an app version
+     * chooses to honour it — no backend change needed then. It is NOT a working
+     * link-open today; do not promise ops that it is.
+     */
     const data = { type: 'notice', screen: 'notices', noticeId: String(notice.notice_id) };
+    if (notice.action_url) data.action_url = String(notice.action_url);
 
     const r = await pushDelivery.deliver(
       recipients,
