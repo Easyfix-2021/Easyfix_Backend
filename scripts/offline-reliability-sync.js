@@ -259,9 +259,34 @@ function record(mode) {
   console.log(`offline-reliability-sync: recorded ${snapshot.watchedFileCount} watched files from ${mode}`);
 }
 
+/*
+ * Per-clone git configuration. Both settings here are things git deliberately
+ * refuses to accept from a tracked file, because both execute arbitrary
+ * commands — a repository is not allowed to grant itself execution on clone.
+ * That is why they live in a script the developer chooses to run, and why
+ * `.gitattributes` alone is inert without this.
+ *
+ *   1. core.hooksPath → .githooks, so the pre-commit contract guard runs.
+ *
+ *   2. The `theirs` merge driver that .gitattributes names for
+ *      docs/offline-reliability-sync.json. That file records a SHA-256 over
+ *      the watched source, so both sides of a HotFix → QA → Production
+ *      promotion regenerate it and it conflicted on essentially every
+ *      cross-branch merge. Taking the INCOMING copy is the correct
+ *      resolution: promotion is one-directional, so the incoming hash is the
+ *      one that matches the incoming source. (Keeping "ours" would pin the
+ *      target branch's stale hash on top of new source, and `check:offline`
+ *      would then fail in CI by construction.)
+ *
+ *      Without this config the attribute does nothing and the file simply
+ *      conflicts exactly as it did before — a safe failure, not a broken
+ *      merge. CI never merges, so CI needs no configuration.
+ */
 function installHooks() {
   runGit(['config', 'core.hooksPath', '.githooks']);
+  runGit(['config', 'merge.theirs.driver', 'cp -- %B %A']);
   console.log('offline-reliability-sync: installed .githooks for this clone');
+  console.log(`offline-reliability-sync: configured the 'theirs' merge driver for ${STATE_RELATIVE}`);
 }
 
 const command = process.argv[2];

@@ -1,0 +1,47 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Merge behaviour for GENERATED files.
+#
+# docs/offline-reliability-sync.json is written by
+# scripts/offline-reliability-sync.js (`npm run offline:record`), never by
+# hand. It stores a SHA-256 over the CONTENTS of the watched source files
+# (194 at the time of writing), and CI recomputes that hash and fails the
+# build if it disagrees — .github/workflows/ci.yml → `npm run check:offline`.
+#
+# Because the pre-commit hook refreshes it on both sides of a
+# HotFix → QA → Production promotion, it conflicted on essentially every
+# cross-branch merge. This resolves it silently by taking the INCOMING copy.
+#
+# ─── Why "theirs" and not "ours" ─────────────────────────────────────────────
+#
+# The recorded hash is a function of the merged SOURCE tree, so the only
+# correct value is the one matching the code that ends up on the branch.
+# Promotion here is one-directional — HotFix is always ahead of QA and
+# Production (verified 2026-08-13: neither carries a commit HotFix lacks) —
+# so the incoming side's hash is the one that matches the incoming source.
+#
+# `merge=ours` would do the opposite: pin the target branch's OLD hash on top
+# of the incoming NEW source. `check:offline` would then mismatch by
+# construction, converting a 10-second merge conflict into a red CI run on
+# QA/Production — quieter at merge time and strictly worse.
+#
+# ─── ⚠ REQUIRED ONE-TIME SETUP, PER CLONE ───────────────────────────────────
+#
+# The attribute alone does NOTHING. Git ships no built-in "theirs" merge
+# driver, and merge drivers are deliberately never configured from a tracked
+# file (they run arbitrary commands, so a repo cannot grant itself execution
+# on clone). Each developer runs, once:
+#
+#     git config merge.theirs.driver 'cp -- %B %A'
+#
+# Without it the file simply conflicts exactly as it does today — a safe
+# failure mode, not a broken merge. CI never merges, so CI needs no setup.
+#
+# ─── When neither side is right ──────────────────────────────────────────────
+#
+# If a merge ever spans genuinely divergent source (both branches carrying
+# watched-file commits the other lacks), no parent's hash is correct — the
+# merged tree is a new tree. Regenerate after the merge instead:
+#
+#     npm run offline:record:worktree
+# ─────────────────────────────────────────────────────────────────────────────
+docs/offline-reliability-sync.json merge=theirs
