@@ -37,6 +37,11 @@ const GEOCODE_URL = 'https://maps.googleapis.com/maps/api/geocode/json';
 const MEM_TTL_MS = 60 * 60 * 1000;
 const memCache = new Map(); // pincode → { value: {lat,lng}|null, expires }
 
+// Max simultaneous Google Geocoding calls per batch. Matches the delivery
+// pool in services/job-offer-push.service.js — same reasoning, same order of
+// magnitude of third-party fan-out.
+const GEOCODE_CONCURRENCY = 8;
+
 function serverApiKey() {
   // Single server-side key, shared with services/maps.service.js.
   return process.env.GOOGLE_MAPS_API_KEY || null;
@@ -55,6 +60,49 @@ function toNum(v) {
   if (v === null || v === undefined || v === '') return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
+}
+
+/*
+ * Does tbl_pincode carry the provenance stamp yet?
+ * (migrations/2026-08-13-pincode-coords-provenance.sql)
+ *
+ * Probed ONCE per process and memoised, so this costs one INFORMATION_SCHEMA
+ * read at startup rather than a join on every candidate-list render. Cached as
+ * a promise, not a value, so N concurrent first-callers share one query.
+ *
+ * Deliberately fails CLOSED to the old behaviour: if the probe itself errors we
+ * report "no column", which trusts existing coordinates exactly as before.
+ * Reporting "column present" on a DB blip would treat every row as a cache miss
+ * and geocode the whole candidate list on every render, with the persist write
+ * failing too — an unbounded Google bill to fix a wrong number. A stale
+ * distance is the lesser failure.
+ */
+let provenanceProbe = null;
+async function hasProvenanceColumn() {
+  if (provenanceProbe) return provenanceProbe;
+  provenanceProbe = (async () => {
+    try {
+      const [rows] = await pool.query(
+        `SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.COLUMNS
+          WHERE TABLE_SCHEMA = DATABASE()
+            AND TABLE_NAME = 'tbl_pincode'
+            AND COLUMN_NAME = 'coords_geocoded_at'`,
+      );
+      const present = Number(rows?.[0]?.n || 0) > 0;
+      if (!present) {
+        logger.warn(
+          'pincode-geocode: tbl_pincode.coords_geocoded_at missing — centroid provenance OFF, '
+          + 'legacy (wrong) coordinates still trusted. Apply '
+          + 'migrations/2026-08-13-pincode-coords-provenance.sql to enable the fix.',
+        );
+      }
+      return present;
+    } catch (e) {
+      logger.warn({ err: e.message }, 'pincode-geocode: provenance-column probe failed; assuming absent');
+      return false;
+    }
+  })();
+  return provenanceProbe;
 }
 
 /*
@@ -86,15 +134,37 @@ async function getCentroids(pincodes) {
   if (wanted.length === 0) return result;
 
   // ── 1. DB cache lookup ───────────────────────────────────────────
+  //
+  // A ROW IS ONLY A CACHE HIT IF WE GEOCODED IT OURSELVES.
+  //
+  // The original design read "lat/lng NOT NULL" as "already resolved", because
+  // the 2026-06-15 migration that added the columns assumed nothing else ever
+  // wrote them. The legacy pincode master import had: 10,889 of 11,024
+  // populated rows carry its values, and they are wrong by tens to hundreds of
+  // km (413006 by 127 km, 413606 by 339 km — measured 2026-08-13). Trusting
+  // "non-NULL" made that permanent, since the lazy backfill only ever filled
+  // NULLs and had no way to CORRECT a populated-but-wrong row. Every Schedule
+  // & Assign "GPS Distance" off a legacy PIN was wrong, and wrong in a way
+  // that silently reorders the candidate list rather than showing an error.
+  //
+  // No plausibility check can substitute here. Both of those bad coordinates
+  // are valid latitudes and longitudes inside India — a bounding box, a range
+  // check, a NaN guard all pass them. Only provenance separates a coordinate
+  // we resolved from one we inherited.
   const dbHits = new Map(); // pin → {lat,lng}
+  const stamped = await hasProvenanceColumn();
   try {
     const placeholders = wanted.map(() => '?').join(',');
     const [rows] = await pool.query(
-      `SELECT pincode, lat, lng FROM tbl_pincode
+      `SELECT pincode, lat, lng${stamped ? ', coords_geocoded_at' : ''} FROM tbl_pincode
         WHERE pincode IN (${placeholders})`,
       wanted,
     );
     for (const r of rows) {
+      // Pre-migration the stamp doesn't exist, so behaviour is byte-identical
+      // to before: trust any populated coordinate. That keeps deploy order
+      // free — the fix switches on when the migration lands, not before.
+      if (stamped && r.coords_geocoded_at == null) continue;
       const lat = toNum(r.lat);
       const lng = toNum(r.lng);
       if (lat != null && lng != null) dbHits.set(String(r.pincode), { lat, lng });
@@ -132,15 +202,31 @@ async function getCentroids(pincodes) {
     return result;
   }
 
-  // Geocode sequentially-but-non-blocking via Promise.all; each call is
-  // independently fail-soft. A single PIN's failure yields null for that
-  // PIN only.
-  await Promise.all(misses.map(async (pin) => {
-    const centroid = await geocodeOne(pin, apiKey);
-    result.set(pin, centroid);
-    memCache.set(pin, { value: centroid, expires: Date.now() + MEM_TTL_MS });
-    if (centroid) await persistCentroid(pin, centroid);
-  }));
+  // Bounded fan-out; each call is independently fail-soft, so a single PIN's
+  // failure yields null for that PIN only.
+  //
+  // This used to be an unbounded Promise.all, which was fine when misses meant
+  // "the handful of PINs nobody has geocoded yet". Provenance-gating the cache
+  // changes the cold-start shape: until a PIN has been resolved once, EVERY
+  // distinct reference pincode in a candidate list is a miss, so a wide list
+  // would open one Google connection per technician simultaneously and risk
+  // OVER_QUERY_LIMIT — which fails soft to null and would show blank distances
+  // instead of wrong ones. Better, but still not the answer. A small pool keeps
+  // the warm-up orderly; it only costs latency on the first render per PIN.
+  const queue = misses.slice();
+  const worker = async () => {
+    for (;;) {
+      const pin = queue.shift();
+      if (pin === undefined) return;
+      const centroid = await geocodeOne(pin, apiKey);
+      result.set(pin, centroid);
+      memCache.set(pin, { value: centroid, expires: Date.now() + MEM_TTL_MS });
+      if (centroid) await persistCentroid(pin, centroid);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(GEOCODE_CONCURRENCY, queue.length) }, worker),
+  );
 
   return result;
 }
@@ -190,10 +276,25 @@ async function geocodeOne(pin, apiKey) {
  */
 async function persistCentroid(pin, { lat, lng }) {
   try {
-    await pool.query(
-      'UPDATE tbl_pincode SET lat = ?, lng = ? WHERE pincode = ?',
-      [lat, lng, pin],
-    );
+    // Stamp provenance alongside the value. Writing the coordinate WITHOUT the
+    // stamp would re-geocode this PIN on every render forever, so the two
+    // writes belong in one statement.
+    //
+    // `new Date()` (not NOW()): the pool runs at timezone '+05:30', so the
+    // driver serialises this as the IST wall-clock time, matching every other
+    // DATETIME in this schema.
+    const stamped = await hasProvenanceColumn();
+    if (stamped) {
+      await pool.query(
+        'UPDATE tbl_pincode SET lat = ?, lng = ?, coords_geocoded_at = ? WHERE pincode = ?',
+        [lat, lng, new Date(), pin],
+      );
+    } else {
+      await pool.query(
+        'UPDATE tbl_pincode SET lat = ?, lng = ? WHERE pincode = ?',
+        [lat, lng, pin],
+      );
+    }
   } catch (e) {
     logger.warn({ pin, err: e.message }, 'pincode-geocode: failed to persist centroid to tbl_pincode');
   }

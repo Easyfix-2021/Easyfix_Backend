@@ -1,0 +1,42 @@
+-- 2026-08-13 — provenance stamp for tbl_pincode centroids.
+--
+-- WHY. migrations/executed/2026-06-15-add-tbl-pincode-latlng.sql added lat/lng
+-- as a geocode cache and documented "NULL = not yet geocoded". That assumed
+-- the columns would only ever hold values WE geocoded. They don't: the legacy
+-- pincode master import had already populated them, and those values are wrong
+-- — measured 2026-08-13 against Google for the two PINs in a real complaint:
+--
+--     PIN     stored (tbl_pincode)   Google (truth)        error
+--     413006  18.5571, 75.2560       17.6480, 75.9812      126.9 km
+--     413606  20.7167, 75.5500       17.8438, 76.6182      338.6 km
+--
+--   distance 413006→413606 : 242.1 km from stored coords
+--                             70.9 km from Google coords
+--                             80.6 km actual road distance
+--
+-- Because the cache treats "non-NULL" as "trustworthy", the lazy backfill in
+-- services/pincode-geocode.service.js only ever filled the 25 rows that were
+-- NULL — it can never CORRECT a wrong one. 10,889 of 11,024 populated rows
+-- carry the legacy values, so effectively every Schedule & Assign "GPS
+-- Distance" keyed off a legacy pincode has been wrong since the feature
+-- shipped, and wrong in a way that silently reorders candidate technicians.
+--
+-- THE FIX. Cache validity stops being "is it non-NULL" and becomes "did we
+-- geocode it ourselves". This column is that record. lat/lng are left in place
+-- (nothing is destroyed, and a stale coordinate still beats a blank column on
+-- the Manage Pincodes screen); they simply stop being trusted as a cache until
+-- re-resolved. Rows re-geocode LAZILY on first use, so there is no bulk Google
+-- spend at deploy — only the PINs that actually appear in a candidate list.
+--
+-- SAFE TO DEPLOY IN EITHER ORDER. The service probes for this column once and
+-- falls back to today's exact behaviour when it is absent, so deploying the
+-- code before running this migration changes nothing; running this migration
+-- before the code deploy is equally inert. The fix activates when both are in.
+
+ALTER TABLE tbl_pincode ADD COLUMN coords_geocoded_at DATETIME NULL;
+
+-- Verification (read-only):
+-- SELECT COUNT(*) AS total,
+--        SUM(lat IS NOT NULL AND lng IS NOT NULL) AS with_coords,
+--        SUM(coords_geocoded_at IS NOT NULL)      AS self_geocoded
+--   FROM tbl_pincode;
