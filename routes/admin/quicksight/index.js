@@ -13,19 +13,17 @@
  * routes/admin/quicksight.js held only the /token session-bridge handler.
  * It was split into this folder so the native QuickSight reports rebuild
  * can give each of the 10 reports its OWN disjoint sub-router file
- * (parallel, conflict-free per-report work). The /token route is preserved
- * VERBATIM in ./token.js and mounted first so GET /api/admin/quicksight/token
- * resolves EXACTLY as before.
+ * (parallel, conflict-free per-report work).
+ *
+ * GET /api/admin/quicksight/token — the session bridge that minted a JWT
+ * handoff into the legacy Angular EF-QuickSight app — was retired once the
+ * native reports below fully replaced that app; it had no callers left.
  *
  * Sub-router base paths are the canonical urlBase values from
  * /tmp/qs/_registry.json — do not invent variants.
  */
 
 const router = require('express').Router();
-
-// Session-bridge token mint (legacy Angular EF-QuickSight handshake).
-// Preserved 1:1 — GET /api/admin/quicksight/token.
-router.use(require('./token'));
 
 // ─── Native report sub-routers (one per report family) ──────────────
 // Each is a disjoint file edited only by its own report agent in

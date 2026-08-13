@@ -79,19 +79,3 @@ QA_DETERMINISTIC_OTP=true
 # DLT-approved. A valid value forces a bounded technician SMS attempt alongside
 # WhatsApp. Must be exactly 11 base64 characters; never paste it into logs.
 TECHNICIAN_SMS_RETRIEVER_APP_HASH=
-
-# QuickSight session bridge — HS256 secret shared with the EF-QuickSight
-# Angular app's API server. The CRM mints { session_proof, user_id }
-# tokens here; the QuickSight backend verifies them with this exact
-# string. SOURCE THIS FROM the legacy CRM deploy box (grep
-# easyfix.properties for jwt/secret) or ops vault — DO NOT invent a
-# value because the verifier side won't match.
-# Empty value is safe — /admin/quicksight/token returns 503 and the
-# frontend shows a coming-soon page instead of dead-ending the button.
-QUICKSIGHT_JWT_SECRET=<secret>
-# Optional convenience URLs — only consumed if a server-side script asks
-# /admin/quicksight/token for fullUrl. Frontend bakes its own
-# NEXT_PUBLIC_*_QUICKSIGHT_URL pair at build time, so these don't have
-# to match — but they should, to keep ops outputs consistent.
-QUICKSIGHT_QA_URL=https://uat.easyfix.in
-QUICKSIGHT_PROD_URL=https://corporates.core.easyfix.in
