@@ -56,3 +56,35 @@ test('startup accepts only the monotonic BEFORE UPDATE training trigger', () => 
   }), false);
   assert.equal(matchesTrainingMonotonicTrigger({ ...correct, action_timing: 'AFTER' }), false);
 });
+
+/*
+ * The committed offline-reliability state must be a PURE FUNCTION of the
+ * watched source — nothing about which tree or which command produced it.
+ *
+ * It previously carried `source: 'staged' | 'worktree'`, and that single field
+ * made the file churn on nearly every commit: the pre-commit hook writes it
+ * from the staged tree, `offline:record:worktree` writes it from the worktree,
+ * so the value flip-flopped forever and produced a diff on a generated file
+ * even when not one watched byte had moved. Nothing read it — staleness is
+ * decided by schemaVersion, sourceHash and watchedFileCount alone.
+ *
+ * This pins the shape so the field cannot quietly return. If a future key is
+ * genuinely needed, add it here deliberately and make sure BOTH writers agree
+ * on its value for identical content, or the churn comes back with it.
+ */
+test('the offline state file records only content-derived keys', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const state = JSON.parse(fs.readFileSync(
+    path.join(__dirname, '..', 'docs', 'offline-reliability-sync.json'),
+    'utf8',
+  ));
+  assert.deepEqual(
+    Object.keys(state).sort(),
+    ['schemaVersion', 'sourceHash', 'watchedFileCount'],
+    'an extra key here churns the file on every commit unless both writers agree on it',
+  );
+  assert.equal(state.schemaVersion, 1);
+  assert.match(state.sourceHash, /^[0-9a-f]{64}$/);
+  assert.ok(Number.isInteger(state.watchedFileCount) && state.watchedFileCount > 0);
+});

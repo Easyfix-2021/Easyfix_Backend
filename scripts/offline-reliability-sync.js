@@ -182,17 +182,40 @@ function changedStagedPaths() {
   ));
 }
 
-function stateFor(mode, snapshot) {
+/*
+ * The persisted state deliberately does NOT record which tree produced it.
+ *
+ * It used to carry `source: 'staged' | 'worktree'`, and that one field made
+ * this file churn on essentially every commit. Two commands write it and they
+ * disagree on the label by construction: the pre-commit hook records from the
+ * STAGED tree, while `offline:record:worktree` (the promotion runbook's final
+ * step, and what anyone runs by hand) records from the WORKTREE. So the value
+ * flip-flopped staged → worktree → staged forever, producing a diff on a
+ * generated file even when not one watched byte had changed.
+ *
+ * Nothing ever read it. Staleness is decided by schemaVersion, sourceHash and
+ * watchedFileCount alone — see check() — so the label was pure metadata whose
+ * only measurable effect was noise in review and merge conflicts on a file
+ * that already needs a custom merge driver.
+ *
+ * Dropping it means the artifact is now a pure function of the watched source:
+ * two different commands looking at the same content write byte-identical
+ * files, and a diff here always means the contract genuinely moved.
+ *
+ * No schemaVersion bump: the reader never consumed `source`, so an older
+ * committed state that still carries it validates unchanged and simply loses
+ * the field the next time anything rewrites it.
+ */
+function stateFor(snapshot) {
   return {
     schemaVersion: 1,
-    source: mode,
     sourceHash: snapshot.sourceHash,
     watchedFileCount: snapshot.watchedFileCount,
   };
 }
 
-function writeState(mode, snapshot) {
-  const output = `${JSON.stringify(stateFor(mode, snapshot), null, 2)}\n`;
+function writeState(snapshot) {
+  const output = `${JSON.stringify(stateFor(snapshot), null, 2)}\n`;
   fs.writeFileSync(path.join(REPO_ROOT, STATE_RELATIVE), output);
 }
 
@@ -234,7 +257,7 @@ function check(mode, ifRelevant, fix) {
     || Number(recorded.watchedFileCount) !== actual.watchedFileCount;
 
   if (stale && fix) {
-    writeState(mode, actual);
+    writeState(actual);
     if (mode === 'staged') runGit(['add', '--', STATE_RELATIVE]);
     console.log(
       `offline-reliability-sync: refreshed ${STATE_RELATIVE} `
@@ -255,7 +278,7 @@ function record(mode) {
   const paths = treePaths(mode);
   const manifest = validateManifest(readJson(MANIFEST_RELATIVE, mode), mode, paths);
   const snapshot = computeSnapshot(mode, manifest, paths);
-  writeState(mode, snapshot);
+  writeState(snapshot);
   console.log(`offline-reliability-sync: recorded ${snapshot.watchedFileCount} watched files from ${mode}`);
 }
 
