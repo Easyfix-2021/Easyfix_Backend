@@ -57,19 +57,69 @@ function surfacesInclude(targetSurfaces, surface) {
     .includes(surface);
 }
 
-// Returns rough audience-reach count for each surface. Used by the
-// All-Notices table's "Reach" column and the Review & Send step's
-// "≈ N technicians" hint. Computed per request; small/fast (single
-// COUNT each, no joins, all indexed).
+/*
+ * Rough audience-reach per surface. Drives the All-Notices "Reach" column, the
+ * Read count's percentage tooltip, and the Review & Send "≈ N technicians" hint.
+ *
+ * CACHED for 5 minutes (2026-08-12). This runs THREE COUNT(*) queries, and
+ * InnoDB has no O(1) row count — each is a full index scan (tbl_easyfixer alone
+ * is ~9.4k rows). It was previously recomputed on EVERY admin list request and
+ * every getNoticeById, which meant three scans to render a page whose numbers
+ * are explicitly an approximation. Staff/technician/contact headcounts move a
+ * few times a day at most, so a 5-minute window is far finer than the data's
+ * real rate of change. Mirrors the cache pattern in role.service.js.
+ *
+ * The cache is per-process and read-only — nothing invalidates it, because a
+ * stale reach for a few minutes is harmless and self-corrects.
+ */
+const REACH_CACHE_TTL_MS = 5 * 60 * 1000;
+let reachCache = { loadedAt: 0, map: null };
+
 async function getSurfaceReachMap() {
+  if (reachCache.map && (Date.now() - reachCache.loadedAt) < REACH_CACHE_TTL_MS) {
+    return reachCache.map;
+  }
   const out = { crm: 0, client: 0, technician: 0 };
   try {
-    const [[{ n }]] = await pool.query(
-      'SELECT COUNT(*) AS n FROM tbl_user WHERE COALESCE(user_status, 1) = 1',
-    );
+    /*
+     * CRM reach = ACTIVE CRM STAFF, not every tbl_user row.
+     *
+     * tbl_user carries ~4,700 role_id=19 "Technician" rows that are legacy
+     * ghosts — technicians canonically live in tbl_easyfixer and authenticate
+     * against it (see CLAUDE.md "Role model"). They never sign into the CRM, so
+     * they can never read a CRM notice. Counting them inflated the denominator
+     * roughly threefold and was the main reason every notice reported 0% read.
+     *
+     * The admin group is derived from the same ROLE_ID_TO_GROUP map the auth
+     * guards use, so adding a role there keeps reach correct automatically.
+     * Lazily required to keep this module free of a load-order dependency.
+     */
+    const { ROLE_ID_TO_GROUP } = require('./role.service');
+    const adminRoleIds = Object.entries(ROLE_ID_TO_GROUP)
+      .filter(([, group]) => group === 'admin')
+      .map(([id]) => Number(id));
+    /*
+     * The role FK on tbl_user is `user_role` — NOT `role_id`. `role_id` is
+     * tbl_role's own primary key (see the join in user.service.js:
+     * `LEFT JOIN tbl_role r ON r.role_id = u.user_role`). Getting this wrong
+     * throws "Unknown column", which the catch below swallows into reach = 0.
+     */
+    const [[{ n }]] = adminRoleIds.length
+      ? await pool.query(
+        `SELECT COUNT(*) AS n FROM tbl_user
+          WHERE COALESCE(user_status, 1) = 1
+            AND user_role IN (${adminRoleIds.map(() => '?').join(',')})`,
+        adminRoleIds,
+      )
+      : await pool.query('SELECT COUNT(*) AS n FROM tbl_user WHERE COALESCE(user_status, 1) = 1');
     out.crm = Number(n) || 0;
   } catch (e) {
-    logger.warn({ err: e }, 'getSurfaceReachMap: tbl_user count failed; defaulting to 0');
+    /*
+     * Fails soft to 0 so a notice list still renders — but that is exactly how
+     * a bad column name hid as "Reach 0" instead of an error, so log the real
+     * message rather than just the object.
+     */
+    logger.warn({ err: e.message }, 'getSurfaceReachMap: tbl_user count failed; defaulting to 0');
   }
   try {
     const [[{ n }]] = await pool.query(
@@ -92,6 +142,14 @@ async function getSurfaceReachMap() {
     out.client = Number(n) || 0;
   } catch (e) {
     logger.warn({ err: e }, 'getSurfaceReachMap: tbl_client_contacts count failed; defaulting to 0');
+  }
+  /*
+   * Only cache a map that actually counted something. Each COUNT above fails
+   * soft to 0, so caching an all-zero result during a transient DB blip would
+   * pin "Reach 0 / 0% read" across every notice for the next five minutes.
+   */
+  if (out.crm || out.client || out.technician) {
+    reachCache = { loadedAt: Date.now(), map: out };
   }
   return out;
 }
@@ -280,8 +338,15 @@ async function decorate(rows, reachMap) {
       effective_status: effectiveStatus(r),
       read_count: readCount.get(r.notice_id) || 0,
       reach_estimate: reach,
+      /*
+       * ONE DECIMAL, not a whole number. Reach is in the thousands, so an
+       * integer percentage floors to 0 until ~1% of the audience has read —
+       * on a 2,800-strong CRM that is 14 people, and every notice sat at "0%"
+       * long after it had genuinely been read. A tenth of a percent is the
+       * coarsest unit that can still distinguish "nobody" from "a few".
+       */
       read_pct: reach > 0
-        ? Math.round(((readCount.get(r.notice_id) || 0) / reach) * 100)
+        ? Math.round(((readCount.get(r.notice_id) || 0) / reach) * 1000) / 10
         : 0,
     };
   }));
