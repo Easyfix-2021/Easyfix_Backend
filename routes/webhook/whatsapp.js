@@ -330,13 +330,55 @@ const DELIVERY_STATUS_STATES = new Set([
   'sent', 'delivered', 'read', 'failed', 'undelivered', 'deleted', 'accepted', 'queued',
 ]);
 
+/*
+ * Markers that identify a receipt when it carries NO status word at all.
+ * Production sends both of these shapes:
+ *   { id, status, timestamp, errors, recipient_id, message:{recipient_id} }
+ *   { id, timestamp,          recipient_id, message:{recipient_id}, localMessageId }
+ * The second has neither `status` nor `errors`, so the first version of this
+ * check missed it and it kept landing in UNPARSEABLE — harmless, but exactly the
+ * noise this function exists to stop.
+ */
+const RECEIPT_MARKERS = ['errors', 'localMessageId'];
+
+/*
+ * ⚠ `from` IS THE VETO, and it is what makes widening the markers safe.
+ *
+ * normaliseStatus runs BEFORE normaliseInbound in the route, so anything this
+ * returns truthy for never reaches the conversation handler. Calling a real
+ * customer message a receipt would therefore drop it silently — the worst
+ * outcome available here, and strictly worse than the log noise being fixed.
+ *
+ * The two are cleanly separable by direction: a RECEIPT is about a message WE
+ * sent, so it names a `recipient_id` and no sender. An INBOUND names `from`.
+ * Requiring the absence of a sender means a message can never be swallowed by a
+ * marker that a future provider payload happens to share.
+ */
 function looksLikeReceipt(p) {
   if (!p || typeof p !== 'object') return false;
+
+  /*
+   * THE VETO GOES FIRST, and it applies to the status word too.
+   *
+   * The obvious shape of this function is "known status word → receipt, else
+   * check markers", which returns early and lets `status` outrank a real sender.
+   * A body carrying BOTH would then be classified as a receipt and never reach
+   * the conversation handler — a customer reply dropped in silence, to save a
+   * log line. `status` is a generic key name; it is not ours to reserve.
+   *
+   * Neither production receipt shape carries a sender (both name only
+   * recipient_id), so vetoing on one costs us nothing and closes the hole.
+   */
+  const hasSender = p.from != null || p.sender != null || p.phone != null || p.mobile != null;
+  if (hasSender) return false;
+
+  const state = String(p.status || p.deliveryStatus || p.event || '').toLowerCase();
+  if (DELIVERY_STATUS_STATES.has(state)) return true;
+
   const hasRecipient = p.recipient_id != null
     || (p.message && typeof p.message === 'object' && p.message.recipient_id != null);
-  const state = String(p.status || p.deliveryStatus || p.event || '').toLowerCase();
-  // A status word we know, OR the recipient_id + errors envelope Gallabox sends.
-  return DELIVERY_STATUS_STATES.has(state) || (hasRecipient && 'errors' in p);
+  if (!hasRecipient) return false;
+  return RECEIPT_MARKERS.some((k) => k in p);
 }
 
 function normaliseStatus(body) {

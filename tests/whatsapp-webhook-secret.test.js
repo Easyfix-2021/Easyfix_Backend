@@ -396,3 +396,62 @@ test('a button reply nested one level deeper is still routed', async () => {
     assert.match(t, /buttonId="confirm_order"/);
   });
 });
+
+/* ═══ receipts that carry no status word at all ═════════════════════════ */
+
+/* The SECOND envelope production sends: no `status`, no `errors`. */
+const bareReceipt = () => ({
+  id: '6a7d8872d8d77f3c1831ec7b',
+  timestamp: '1786599311',
+  message: { recipient_id: '919310992052' },
+  recipient_id: '919310992052',
+  localMessageId: 'lm-42',
+});
+
+test('a receipt with NO status word is still recognised, via localMessageId', async () => {
+  /*
+   * Taken verbatim from a production bodyShape. The first cut of the receipt
+   * check wanted a known status word OR recipient_id + `errors`; this shape has
+   * neither, so it kept landing in UNPARSEABLE telling the reader to widen the
+   * probes about traffic that is entirely routine.
+   */
+  await withSecret(SECRET, async () => {
+    lines = [];
+    assert.equal(await postBody(bareReceipt()), 200);
+    const t = logText();
+    assert.equal(/UNPARSEABLE/.test(t), false, 'no longer mistaken for a customer message');
+    assert.equal(lines.some((l) => l.lvl === 'warn'), false, 'and routine traffic does not WARN');
+  });
+});
+
+test('a CUSTOMER message carrying the same markers is NEVER swallowed as a receipt', async () => {
+  /*
+   * THE RISK THIS GUARD EXISTS FOR, and it is worse than the noise it fixes:
+   * normaliseStatus runs BEFORE normaliseInbound, so anything classified as a
+   * receipt never reaches the conversation handler. Widening the markers without
+   * a veto would mean silently dropping replies.
+   *
+   * `from` is the veto — a receipt is about a message WE sent (recipient_id, no
+   * sender); an inbound names its sender. Same markers, opposite direction.
+   */
+  await withSecret(SECRET, async () => {
+    lines = [];
+    assert.equal(await postBody({
+      ...bareReceipt(),
+      from: '919310992052',          // ← the only difference
+      type: 'text',
+      text: { body: 'yes please' },
+    }), 200);
+    assert.match(logText(), /WhatsApp inbound · type=text/,
+      'a sender makes it a message, whatever else the body carries');
+  });
+
+  // And the same for the status-bearing shape, so neither arm can regress.
+  await withSecret(SECRET, async () => {
+    lines = [];
+    assert.equal(await postBody({
+      ...receipt('sent'), from: '919310992052', type: 'text', text: { body: 'confirm' },
+    }), 200);
+    assert.match(logText(), /type=text/, 'a known status word must not outrank a real sender');
+  });
+});
