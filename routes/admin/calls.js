@@ -1854,6 +1854,32 @@ async function loadConferenceLegs(conferenceIds) {
       conference_id: Number(r.conference_id),
       job_caller_info_id: r.job_caller_info_id ?? null,
       participant_role: r.participant_role || null,
+      /*
+       * ⚠ THE PARTICIPANT VOCABULARY IS THE CONTRACT — emit it here too.
+       *
+       * Every other leg projection (LEG_PUBLIC_COLUMNS and the conference
+       * roster queries) speaks target_kind / joined_at / left_at / created_on,
+       * and the shared FE contract — lib/call-legs.ts `CallLeg` — reads exactly
+       * those. This loader emitted only the raw column names, so call HISTORY
+       * legs arrived with `target_kind` undefined. Consequences, all of which
+       * ops saw at once on an ordinary 1:1 call:
+       *   - callLegRoleLabel(undefined) fell through to "Participant", so EVERY
+       *     leg was captioned "Participant" instead of Ops Agent / Customer;
+       *   - counterpartyLegs() filters `target_kind !== 'operator'`, and
+       *     undefined passes it, so the operator's own leg was listed as a
+       *     counterparty. That row carries the RECEIVER's name in
+       *     receiver_name, so the called party appeared TWICE under one name;
+       *   - the resulting 2-leg count made a plain 1:1 call render as
+       *     "Conference · 2 People".
+       * `created_on` being absent also silently disabled sortCallLegs' ordering.
+       *
+       * The raw keys are kept alongside so any existing consumer of this
+       * endpoint keeps working — this adds vocabulary, it does not rename.
+       */
+      target_kind: r.participant_role || null,
+      joined_at: r.answered_on || null,
+      left_at: r.ended_on || null,
+      created_on: r.initiated_on || null,
       // The label the UI shows. `party_role` is named to match the top-level
       // row's own field, so a tooltip can render both with one code path.
       party_role: LEG_ROLE_LABEL[r.participant_role] || 'Other',
