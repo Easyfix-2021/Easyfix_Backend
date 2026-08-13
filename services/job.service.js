@@ -770,11 +770,16 @@ function hasAddressInstructionColumn() {
 }
 
 /*
- * job_primary_spoc — a denormalised snapshot of the JOB OWNER's phone, shown to
- * the customer on the confirmation landing page. It's a PROD-only legacy column
- * (absent on some DBs incl. QA), so probe once + no-op where missing. Re-stamped
- * on every job_owner write (create + owner change) so it can't go stale after a
- * reassignment. Pending migration: migrations/2026-07-03-add-job-primary-spoc.sql.
+ * job_primary_spoc — a denormalised snapshot of the CLIENT'S VERTICAL HEAD's
+ * phone, shown to the customer on the confirmation landing page. It's a
+ * PROD-only legacy column (absent on some DBs incl. QA), so probe once + no-op
+ * where missing. Stamped once at create.
+ * Pending migration: migrations/2026-07-03-add-job-primary-spoc.sql.
+ *
+ * It used to snapshot the JOB OWNER's phone, which made the column wrong on
+ * EVERY row rather than only some: the owner (the CRM operator holding the job)
+ * and the client's head are different people by definition, so there was never
+ * a case where the two coincided.
  */
 let _hasJobPrimarySpocColumn = null;
 async function hasJobPrimarySpocColumn() {
@@ -785,11 +790,79 @@ async function hasJobPrimarySpocColumn() {
   } catch (_e) { _hasJobPrimarySpocColumn = false; }
   return _hasJobPrimarySpocColumn;
 }
-async function stampJobPrimarySpoc(jobId, ownerUserId, conn) {
+/*
+ * tbl_vertical_mapping.inserted_on is NOT written by the INSERTs in
+ * client-verticals.service.js — it is a DB default where it exists at all, and
+ * absent on some deploys. So probe it exactly the way the column above is
+ * probed, and pick the ORDER BY accordingly. Memoised per process; degrades to
+ * "absent" on probe failure, which only costs us the better ordering.
+ */
+let _hasVerticalMappingInsertedOn = null;
+async function hasVerticalMappingInsertedOnColumn() {
+  if (_hasVerticalMappingInsertedOn !== null) return _hasVerticalMappingInsertedOn;
+  try {
+    const [rows] = await pool.query("SHOW COLUMNS FROM tbl_vertical_mapping LIKE 'inserted_on'");
+    _hasVerticalMappingInsertedOn = rows.length > 0;
+  } catch (_e) { _hasVerticalMappingInsertedOn = false; }
+  return _hasVerticalMappingInsertedOn;
+}
+/*
+ * Stamp the snapshot for `jobId` from `clientId`'s vertical HEAD
+ * (tbl_vertical_mapping.user_type = 1; 2 is Project Manager — see
+ * services/client-verticals.service.js).
+ *
+ * WHY latest-wins when a client has several heads: the mapping is per
+ * (client, vertical) and A JOB HAS NO VERTICAL OF ITS OWN — a job's vertical is
+ * only ever derived as "this job's CLIENT is mapped to that vertical" (see the
+ * verticalId EXISTS clause in the list filter above). So there is no per-job
+ * way to choose between two heads, and latest-wins is the owner's deliberate
+ * tie-break. Do NOT "improve" this into a per-vertical join: that join has no
+ * job-side column to hang off and cannot exist.
+ *
+ * Ordering is always explicit — never a bare LIMIT 1. An unordered pick returns
+ * a different person on different days, which is indistinguishable from the
+ * owner-instead-of-head bug this replaced. Where `inserted_on` is missing we
+ * fall back to the mapping's own PK `id` (the same column the job_client_owner
+ * SPOC lookup in create() orders by), DESC because "latest" is the rule.
+ *
+ * LEFT JOIN, not JOIN: if the chosen head has no tbl_user row we want the
+ * LATEST head's (null) phone, not silently the next-latest head's real number.
+ *
+ * The status filter mirrors the job_client_owner SPOC lookup in create() on the
+ * same table: NULL tolerated (older mappings predate the column), 1 = active.
+ *
+ * Whole body is fail-soft: a job create must NEVER fail because this snapshot
+ * could not be resolved. On any error the column is left NULL — no number is
+ * better than a wrong one, because a wrong one looks right.
+ */
+async function stampJobPrimarySpoc(jobId, clientId, conn) {
   if (!jobId || !(await hasJobPrimarySpocColumn())) return;
   const db = conn || pool;
-  const [[u]] = await db.query('SELECT mobile_no FROM tbl_user WHERE user_id = ? LIMIT 1', [ownerUserId || 0]);
-  await db.query('UPDATE tbl_job SET job_primary_spoc = ? WHERE job_id = ?', [u?.mobile_no || null, jobId]);
+  try {
+    let mobile = null;
+    if (clientId) {
+      const orderBy = (await hasVerticalMappingInsertedOnColumn())
+        ? 'vm.inserted_on DESC, vm.id DESC'
+        : 'vm.id DESC';
+      const [[head]] = await db.query(
+        `SELECT u.mobile_no
+           FROM tbl_vertical_mapping vm
+           LEFT JOIN tbl_user u ON u.user_id = vm.user_id
+          WHERE vm.client_id = ? AND vm.user_type = 1
+            AND (vm.status IS NULL OR vm.status = 1)
+          ORDER BY ${orderBy}
+          LIMIT 1`,
+        [clientId],
+      );
+      mobile = head?.mobile_no || null;
+    }
+    await db.query('UPDATE tbl_job SET job_primary_spoc = ? WHERE job_id = ?', [mobile, jobId]);
+  } catch (e) {
+    logger.warn(
+      { jobId, clientId, err: e.message },
+      'job_primary_spoc stamp failed — leaving the snapshot untouched',
+    );
+  }
 }
 
 /*
@@ -3072,9 +3145,12 @@ async function create(input, actor) {
       }
     }
 
-    // Snapshot the owner's phone into job_primary_spoc (legacy-compat; no-op
-    // where the column is absent). Owner = explicit input else the operator.
-    await stampJobPrimarySpoc(jobId, input.job_owner || actor?.user_id || null, conn);
+    // Snapshot the CLIENT'S vertical head's phone into job_primary_spoc
+    // (legacy-compat; no-op where the column is absent). The client id is
+    // passed rather than re-read from tbl_job inside the helper: it is the
+    // exact value the INSERT above just bound, so a re-read would only spend a
+    // query to learn what we already know. A client-less job stamps NULL.
+    await stampJobPrimarySpoc(jobId, input.fk_client_id || null, conn);
 
     if (Array.isArray(input.services) && input.services.length > 0) {
       // Batch-load rate-card rows for all picked services in ONE query
@@ -5392,8 +5468,14 @@ async function changeOwner(jobId, { newOwnerId, reason }, actor) {
     [newOwnerId, actor?.user_id || null, reason, new Date(), new Date(), jobId]
   );
 
-  // Keep the denormalised owner-phone snapshot correct on reassignment.
-  await stampJobPrimarySpoc(jobId, newOwnerId);
+  /*
+   * job_primary_spoc is deliberately NOT re-stamped here. It used to be, back
+   * when it snapshotted the owner's phone. It now snapshots the CLIENT's
+   * vertical head, and an owner change moves the job between CRM operators
+   * without touching the client — so the head cannot have changed and the
+   * re-stamp would be two queries to write the identical value. A client
+   * change (not possible on this route) would be the event that invalidates it.
+   */
 
   logger.info('Job owner changed · id=' + jobId + ' · newOwnerId=' + newOwnerId);
   return getById(jobId);
