@@ -713,9 +713,24 @@ jobs:
             else echo "⚠ ${path} → $code (non-fatal)"; fi
           done'
 
+          # Decode to a file, never `base64 -d | bash` — see the long note on
+          # the deploy step's transport. This script has no stdin-reading
+          # command today, but the smoke test is precisely where a silent
+          # early exit is most dangerous: it would exit 0 without probing
+          # anything and report a healthy deploy it never tested.
           SCRIPT_B64=$(printf '%s' "$SMOKE_SCRIPT" | base64 -w0)
-          PARAMS_JSON=$(jq -n --arg b64 "$SCRIPT_B64" \
-            '{commands: ["echo \($b64) | base64 -d | bash"]}')
+          PARAMS_JSON=$(jq -n --arg b64 "$SCRIPT_B64" '{
+            commands: [
+              "set -e",
+              "SCRIPT=$(mktemp /tmp/easyfix-be-smoke.XXXXXX)",
+              "echo \($b64) | base64 -d > \"$SCRIPT\"",
+              "set +e",
+              "bash \"$SCRIPT\" </dev/null",
+              "RC=$?",
+              "rm -f \"$SCRIPT\"",
+              "exit $RC"
+            ]
+          }')
 
           CMD_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
@@ -732,11 +747,20 @@ jobs:
             case "$STATUS" in Success|Failed|Cancelled|TimedOut) break ;; esac
           done
 
-          aws ssm get-command-invocation \
+          SMOKE_OUT=$(aws ssm get-command-invocation \
             --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
-            --query 'StandardOutputContent' --output text || true
+            --query 'StandardOutputContent' --output text || true)
+          printf '%s\n' "$SMOKE_OUT"
 
           [[ "$STATUS" == "Success" ]] || { aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --query 'StandardErrorContent' --output text; exit 1; }
+
+          # Require the probe's own success line. Exit 0 alone would also be
+          # produced by a script that stopped before it ever probed, which is
+          # a green smoke test for an endpoint nobody called.
+          if ! grep -q '✓ /api/health' <<< "$SMOKE_OUT"; then
+            echo "::error::Smoke test exited 0 without recording a successful /api/health probe — treat this as a failed smoke test, not a pass."
+            exit 1
+          fi
 
       - name: Notify on failure
         # Skip when MAIL_USERNAME isn't configured — otherwise the action
