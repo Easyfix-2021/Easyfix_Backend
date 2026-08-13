@@ -62,9 +62,40 @@ const setContentBody = Joi.object({
   video_ids: Joi.array().items(Joi.number().integer().positive()).max(100).required(),
 });
 
+/*
+ * Duration is the operator's input; the DUE DATE is derived from it server
+ * side (lms.service::dueDateFrom). The CRM previews the same date with the
+ * same rules, but a client-supplied date is never accepted — it would be a
+ * deadline the server never agreed to, and one skewed laptop clock would set
+ * it wrong for a technician.
+ *
+ * At least one unit must be non-zero. An assignment with no deadline gets no
+ * reminder push and can never restrict the app, so it would silently opt out
+ * of the entire feature — better to reject it than to create one that looks
+ * enforced and is not. Bounds are sanity rails, not policy: five years and a
+ * year of days are both far past anything an operator means.
+ */
 const assignBody = Joi.object({
   course_id: Joi.number().integer().positive().required(),
   easyfixer_ids: Joi.array().items(Joi.number().integer().positive()).min(1).max(500).required(),
+  duration_months: Joi.number().integer().min(0).max(60).default(0),
+  duration_days: Joi.number().integer().min(0).max(365).default(0),
+}).custom((value, helpers) => {
+  if ((value.duration_months || 0) <= 0 && (value.duration_days || 0) <= 0) {
+    return helpers.message('set a duration — an assignment with no due date is never reminded or enforced');
+  }
+  return value;
+});
+
+/* Same duration shape as assignment; at least one unit must move the date. */
+const extendBody = Joi.object({
+  duration_months: Joi.number().integer().min(0).max(60).default(0),
+  duration_days: Joi.number().integer().min(0).max(365).default(0),
+}).custom((value, helpers) => {
+  if ((value.duration_months || 0) <= 0 && (value.duration_days || 0) <= 0) {
+    return helpers.message('set how far to extend the deadline');
+  }
+  return value;
 });
 
 const listAssignmentsQuery = Joi.object({
@@ -79,7 +110,9 @@ const reportQuery = Joi.object({
   courseId: Joi.number().integer().positive().optional(),
   easyfixerId: Joi.number().integer().positive().optional(),
   q: Joi.string().allow('', null).optional(),
-  status: Joi.string().valid('complete', 'incomplete').allow('', null).optional(),
+  // 'overdue' is evaluated in the same derived table as the other two, so the
+  // count and the page always describe the same set — see trainingReport.
+  status: Joi.string().valid('complete', 'incomplete', 'overdue').allow('', null).optional(),
   limit: Joi.number().integer().min(1).max(1000).default(200),
   offset: Joi.number().integer().min(0).default(0),
   sortBy: Joi.string().valid(...Object.keys(svc.REPORT_SORTABLE_COLUMNS)).default('technician'),
@@ -157,7 +190,26 @@ router.get('/assignments', validate(listAssignmentsQuery, 'query'), async (req, 
  */
 router.post('/assignments', roleByName(['Admin']), validate(assignBody), async (req, res, next) => {
   try {
-    modernOk(res, await svc.assignCourse(req.body.course_id, req.body.easyfixer_ids));
+    modernOk(res, await svc.assignCourse(req.body.course_id, req.body.easyfixer_ids, {
+      durationMonths: req.body.duration_months,
+      durationDays: req.body.duration_days,
+    }));
+  } catch (e) { next(e); }
+});
+
+/*
+ * Move an assignment's deadline. This is BOTH "extend to unblock a technician"
+ * and "correct a wrong deadline" — one row, one column, one outcome, so one
+ * endpoint. The service anchors the new date at max(today, current due date),
+ * which is what makes an extension work in both directions; see
+ * lms.service::extendAssignment.
+ */
+router.patch('/assignments/:courseId/:easyfixerId', roleByName(['Admin']), validate(assignmentParams, 'params'), validate(extendBody), async (req, res, next) => {
+  try {
+    modernOk(res, await svc.extendAssignment(req.params.courseId, req.params.easyfixerId, {
+      months: req.body.duration_months,
+      days: req.body.duration_days,
+    }));
   } catch (e) { next(e); }
 });
 

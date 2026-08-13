@@ -743,6 +743,71 @@ Note: this task only runs automatically if the property "attendance.reminder.ena
     logger.info(`Attendance-reminder cron registered (attendance.reminder.enabled=true, schedule="${attendanceCronExpr}" IST).`);
   }
 
+  /* ── Training reminder ───────────────────────────────────────────── */
+  const trainingReminderCron = require('../services/training-reminder-cron');
+  // Schedule configurable via property `training.reminder.cron` (default 10:00
+  // IST — an hour after the attendance nudge, so the two never land together).
+  const trainingCronExpr = (() => {
+    const raw = String(getProperty('training.reminder.cron') ?? '').trim();
+    return raw && cron.validate(raw) ? raw : '0 10 * * *';
+  })();
+  const trainingReminderJob = registerJob({
+    id: 'training-reminder-daily',
+    name: 'Technician Training Reminder',
+    description:
+`What this task does: Every morning at 10:00 AM IST, technicians who have been assigned LMS training they have not finished receive a push notification reminding them to complete it. It repeats EVERY DAY until the training is done — an assignment that is being ignored is exactly the one worth nudging.
+
+Here's how it works, step by step:
+  1. Every day at 10:00 AM IST, the task wakes up automatically.
+  2. It finds every technician holding at least one assigned course that is not yet complete. Courses with no videos in them are ignored — those cannot be completed, so reminding anyone about them would be futile.
+  3. It works out whether the due date has already passed for any of those courses.
+  4. If the deadline has NOT passed, the technician gets a nudge naming the date: "Finish Your Training — you have training to complete by <date>."
+  5. If the deadline HAS passed, the message says so plainly: "Training Overdue — App Restricted." That is not a scare tactic; by that point the app really is restricted (see below), and a cheerful reminder would leave them guessing why their work screen stopped working.
+  6. Tapping the notification opens the app on the Training screen.
+  7. The task logs how many technicians were eligible, reached, failed, and skipped (no registered device) — visible in the server logs and on this page (Last Run details below).
+
+What "restricted" means: once a technician is past the due date on assigned training, the backend withdraws their ability to receive new jobs, mutate assigned jobs and mark attendance. They keep Training, Claim Amount, and the ability to SKIP a job they are already holding — so they can release work they cannot do and still get paid. The restriction lifts by itself the moment they finish the training; nothing needs to be done in the CRM.
+
+Why this matters: training assigned with a deadline and never followed up is training that does not happen. The daily nudge plus the in-app prompt is what turns an assignment into a completion, and it pairs with the popup the technician sees when they open the app.
+
+Note: this task only runs automatically if the property "training.reminder.enabled" is set to "true" in easyfix_properties. The SEND TIME is configurable via the property "training.reminder.cron" (a cron expression, e.g. "0 10 * * *" for 10:00 AM IST; defaults to 10:00 AM if unset/invalid). Both properties are checked once at server start — after changing either, a server restart (redeploy) is required. If the enable flag is unset or "false", the schedule is OFF — but Trigger Now still works for manual testing.`,
+    cron: trainingCronExpr,
+    runner: async () => {
+      const result = await trainingReminderCron.runDailyReminder();
+      logger.info(
+        `Training-reminder cron · eligible=${result.eligible} · succeeded=${result.succeeded} · ` +
+        `failed=${result.failed} · skipped=${result.skipped}`
+      );
+      return result;
+    },
+    tester: ({ sourceId }) => trainingReminderCron.runTest({ sourceId }),
+    testSourceLabel: 'Easyfixer ID (efr_id)',
+    testSourceHelp:
+      'Required. Sends the training reminder to THIS easyfixer\'s registered device(s), whether or not they actually owe training today — so delivery can be proven without waiting for a real assignment. In a test environment with TEST_FCM_TOKEN set, every send is redirected to the operator token.',
+  });
+  /*
+   * Property gate — same shape as the attendance reminder. Default-off (unset
+   * OR not 'true' → unregistered) so adding the cron is a no-op until ops
+   * turns it on, which matters more than usual here: this one repeats daily
+   * and its overdue message tells technicians their app is restricted.
+   */
+  const trainingReminderEnabled =
+    String(getProperty('training.reminder.enabled') ?? '').toLowerCase() === 'true';
+  if (cronDisabled) {
+    trainingReminderJob.skipReason = 'CRON_DISABLED=true';
+  } else if (!trainingReminderEnabled) {
+    trainingReminderJob.skipReason = "property 'training.reminder.enabled' was not 'true' at server start — flip it to 'true' and restart the server to enable";
+    logger.info("Training-reminder cron SKIPPED — set training.reminder.enabled=true in easyfix_properties to enable (takes effect after restart).");
+  } else {
+    trainingReminderJob.task = cron.schedule(
+      trainingReminderJob.cron,
+      () => invokeJob(trainingReminderJob, 'cron'),
+      { timezone: TZ },
+    );
+    trainingReminderJob.registered = true;
+    logger.info(`Training-reminder cron registered (training.reminder.enabled=true, schedule="${trainingCronExpr}" IST).`);
+  }
+
   // ─── Easyfixer auto-reactivation — daily at 01:00 IST ───────────────
   // (Added 2026-07-13) Reactivates technicians set "Temporarily Inactive" with a
   // scheduled_reactivation_date that has arrived (efr_status 0 → 1, clears the

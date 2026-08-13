@@ -583,6 +583,16 @@ async function setTrainingPercentage(efrId, videoId, watchedPercentage) {
 async function maybeAdvanceTrainingLifecycle(efrId, watchedPercentage) {
   if (Number(watchedPercentage) < lms.COMPLETION_PERCENT) return;
   try {
+    /*
+     * Per-COURSE completion is stamped before the per-TECHNICIAN check,
+     * because they answer different questions and the course-level one is the
+     * finer grained. A technician with three assigned courses who just
+     * finished the second has completed that course — the report and the
+     * overdue restriction both need to know that now — while their overall
+     * training is still outstanding and the lifecycle must not advance.
+     * Idempotent, so a replayed ping re-stamps nothing.
+     */
+    await lms.stampCourseCompletions(efrId);
     const { complete, required, done } = await lms.isTrainingComplete(efrId);
     if (!complete) {
       logger.info('Training not yet complete · efrId=' + efrId + ' · ' + done + '/' + required);

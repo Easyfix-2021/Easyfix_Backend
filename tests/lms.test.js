@@ -165,6 +165,106 @@ test('non-YouTube and malformed links are rejected, not stored', () => {
   }
 });
 
+// ─── Due-date arithmetic ─────────────────────────────────────────────
+
+test('month arithmetic clamps to the last valid day instead of overflowing', () => {
+  // The bug this exists to prevent: naive setMonth turns 31 Jan + 1 month into
+  // 3 March, because February has no 31st. Anyone saying "a month from the
+  // 31st" means the end of February.
+  assert.equal(lms.dueDateFrom(1, 0, '2026-01-31'), '2026-02-28');
+  assert.equal(lms.dueDateFrom(1, 0, '2028-01-31'), '2028-02-29', 'leap year');
+  assert.equal(lms.dueDateFrom(1, 0, '2026-03-31'), '2026-04-30');
+});
+
+test('months are applied before days', () => {
+  // 31 Jan +1 month -> 28 Feb, then +1 day -> 1 Mar. Applying days first would
+  // give 1 Feb -> 1 Mar by luck here, but diverges on other dates; the order is
+  // pinned so the rule stays explainable to an operator.
+  assert.equal(lms.dueDateFrom(1, 1, '2026-01-31'), '2026-03-01');
+});
+
+test('plain day and month spans land where an operator expects', () => {
+  assert.equal(lms.dueDateFrom(0, 30, '2026-08-13'), '2026-09-12');
+  assert.equal(lms.dueDateFrom(3, 0, '2026-08-13'), '2026-11-13');
+  assert.equal(lms.dueDateFrom(0, 1, '2026-12-31'), '2027-01-01', 'year rollover');
+  assert.equal(lms.dueDateFrom(12, 0, '2026-08-13'), '2027-08-13');
+});
+
+test('a zero duration means NO deadline, not today', () => {
+  // Returning today would make the assignment instantly overdue and restrict
+  // the technician's app the moment it was created.
+  assert.equal(lms.dueDateFrom(0, 0, '2026-08-13'), null);
+  assert.equal(lms.dueDateFrom(null, undefined, '2026-08-13'), null);
+});
+
+// ─── Extending a deadline ────────────────────────────────────────────
+
+/*
+ * The anchor rule is the whole feature: extend from max(today, current due).
+ * Both directions are pinned because each has an opposite failure —
+ * anchoring an overdue row at its lapsed date can leave the new deadline
+ * still in the past (an "extension" that unblocks nobody), and anchoring a
+ * future row at today SHORTENS a deadline that was months out.
+ */
+async function extendWith(currentDue, months, days) {
+  fake.reset();
+  const restore = route([
+    [/FROM\s+easyfixer_courses ec\s+JOIN\s+courses c/i, [{
+      due_date: currentDue, completion_date: null, course_name: 'Induction',
+    }]],
+    [/^\s*UPDATE easyfixer_courses SET due_date/i, { affectedRows: 1 }],
+  ]);
+  const result = await lms.extendAssignment(1, 2, { months, days });
+  restore();
+  return result;
+}
+
+test('extending an OVERDUE assignment counts from today, so it really unblocks', async () => {
+  const today = lms.istToday();
+  const longPast = '2020-01-01';
+  const result = await extendWith(longPast, 0, 7);
+  assert.equal(result.previous_due_date, longPast);
+  assert.equal(result.due_date, lms.dueDateFrom(0, 7, today),
+    'anchored at today — from the lapsed date this would still be in 2020');
+  assert.ok(result.due_date > today, 'the new deadline must be in the future');
+  assert.equal(result.unblocked, true);
+});
+
+test('extending a FUTURE deadline adds to it rather than shortening it', async () => {
+  const future = lms.dueDateFrom(6, 0, lms.istToday());
+  const result = await extendWith(future, 1, 0);
+  assert.equal(result.due_date, lms.dueDateFrom(1, 0, future),
+    'anchored at the existing due date — from today this would cut 5 months off');
+  assert.ok(result.due_date > future);
+  assert.equal(result.unblocked, false, 'it was never blocked');
+});
+
+test('extending an assignment with no deadline sets a first one from today', async () => {
+  const result = await extendWith(null, 0, 30);
+  assert.equal(result.previous_due_date, null);
+  assert.equal(result.due_date, lms.dueDateFrom(0, 30, lms.istToday()));
+  assert.equal(result.unblocked, false);
+});
+
+// ─── Reminder copy switches at the deadline ──────────────────────────
+
+test('the reminder says "restricted" only once the deadline has passed', () => {
+  const cron = require('../services/training-reminder-cron');
+  const before = cron._internals.messageFor({
+    pending_courses: 1, overdue_courses: 0, earliest_due: '2026-09-01',
+  });
+  assert.match(before.title, /Finish Your Training/);
+  assert.match(before.body, /2026-09-01/, 'names the date while there is still time');
+  assert.doesNotMatch(before.body, /restricted/i);
+
+  const after = cron._internals.messageFor({
+    pending_courses: 2, overdue_courses: 1, earliest_due: '2026-07-01',
+  });
+  assert.match(after.title, /Overdue/i);
+  assert.match(after.body, /Claim Amount/i,
+    'an overdue technician must be told what they CAN still do');
+});
+
 // ─── TRAINING_PENDING entrance ───────────────────────────────────────
 
 test('registration with outstanding training finalises to TRAINING_PENDING', () => {

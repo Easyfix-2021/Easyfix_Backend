@@ -74,11 +74,13 @@ const SORTABLE_COLUMNS = Object.freeze({
  * completion_pct is computed, and `t` is the only scope where it exists.
  */
 const REPORT_SORTABLE_COLUMNS = Object.freeze({
-  technician:     't.technician_name',
-  course:         't.course_name',
-  completion_pct: 'completion_pct',
-  score:          't.score',
-  assigned_on:    't.assigned_on',
+  technician:      't.technician_name',
+  course:          't.course_name',
+  completion_pct:  'completion_pct',
+  score:           't.score',
+  assigned_on:     't.assigned_on',
+  due_date:        't.due_date',
+  completion_date: 't.completion_date',
 });
 
 // ─────────────────────────────────────────────────────────────────────
@@ -237,16 +239,27 @@ async function retireCourse(id) {
 // ─────────────────────────────────────────────────────────────────────
 
 async function getCourseVideos(courseId) {
+  /*
+   * video_url joins through the same legacy `document` row that listVideos
+   * uses — training_videos has no url column of its own. It is here so the
+   * course content editor can PREVIEW each video: curating a syllabus is
+   * exactly when someone needs to check that entry three is the video they
+   * think it is, and without the link they would have to leave the dialog
+   * and go find it in the catalogue.
+   */
   const [rows] = await pool.query(
     `SELECT cv.id, cv.video_id, cv.sequence,
-            tv.title, tv.sub_title, tv.description
+            tv.title, tv.sub_title, tv.description,
+            d.url AS video_url
        FROM course_videos cv
        LEFT JOIN training_videos tv ON tv.id = cv.video_id
+       LEFT JOIN document d ON d.id = tv.training_video_id AND d.document_type_id = 2
       WHERE cv.course_id = ?
       ORDER BY cv.sequence ASC, cv.id ASC`,
     [Number(courseId)],
   );
-  return rows;
+  // Same legacy scheme/host repair the catalogue and the app apply.
+  return rows.map((r) => ({ ...r, video_url: normalizeVideoUrl(r.video_url) || null }));
 }
 
 /*
@@ -435,9 +448,75 @@ async function listVideos({ q, limit = 200, offset = 0 } = {}) {
  * `score` is deliberately NOT touched on a repeat assign — re-assigning a
  * course a technician has already been scored on must not wipe their result.
  */
-async function assignCourse(courseId, easyfixerIds = []) {
+/*
+ * Today's IST calendar date as YYYY-MM-DD.
+ *
+ * Deadlines are calendar facts, not instants: "due in 30 days" means a date an
+ * operator in Bengaluru would name, so the arithmetic starts from the IST day
+ * rather than the server's UTC day. Between 18:30 and midnight UTC those two
+ * differ, and using the wrong one silently shifts every deadline created in
+ * the evening by a day.
+ */
+function istToday() {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date());
+}
+
+/*
+ * Derive the due date from an operator's "X months, Y days".
+ *
+ * MONTHS FIRST, CLAMPED, THEN DAYS. The order matters and so does the clamp:
+ * naive month arithmetic turns 31 Jan + 1 month into 3 March, because
+ * Date.setMonth overflows a day that does not exist in the target month.
+ * Clamping to the last valid day makes it 28 (or 29) February, which is what
+ * anyone means by "a month from the 31st".
+ *
+ * The day step then runs in UTC purely as safe integer date arithmetic — the
+ * value never leaves YYYY-MM-DD form, so no timezone can shift it.
+ *
+ * The BACKEND is authoritative. The CRM previews the same date with the same
+ * rules so the operator sees what they are about to commit to, but the stored
+ * value is computed here — a client-supplied date would be a deadline the
+ * server never agreed to, and clock skew on one laptop would set it wrong.
+ */
+function dueDateFrom(months = 0, days = 0, from = istToday()) {
+  const totalMonths = Number(months) || 0;
+  const totalDays = Number(days) || 0;
+  if (totalMonths <= 0 && totalDays <= 0) return null;
+
+  const [y, m, d] = String(from).split('-').map(Number);
+  const monthIndex = (m - 1) + totalMonths;
+  const year = y + Math.floor(monthIndex / 12);
+  const month = ((monthIndex % 12) + 12) % 12;
+  // Day 0 of the NEXT month is the last day of this one.
+  const lastDayOfTargetMonth = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+  const day = Math.min(d, lastDayOfTargetMonth);
+
+  const result = new Date(Date.UTC(year, month, day));
+  result.setUTCDate(result.getUTCDate() + totalDays);
+  return result.toISOString().slice(0, 10);
+}
+
+async function assignCourse(courseId, easyfixerIds = [], options = {}) {
   const id = Number(courseId);
   await getCourseById(id);
+
+  /*
+   * A course with no videos cannot be assigned.
+   *
+   * Assigning one is not a harmless no-op — it is actively harmful. The
+   * technician sees the course listed, has nothing to watch, and their
+   * completion is pinned at 0% forever; the LMS lifecycle wire then never
+   * advances them out of TRAINING_PENDING, and with a due date attached they
+   * would eventually be restricted to training-only for a course that cannot
+   * be finished. Refusing here is the only point where that is cheap to stop.
+   */
+  const [[{ n: videoCount }]] = await pool.query(
+    'SELECT COUNT(*) AS n FROM course_videos WHERE course_id = ?',
+    [id],
+  );
+  if (Number(videoCount) === 0) {
+    throw mkErr(409, 'this course has no videos — add content before assigning it');
+  }
 
   const ids = [...new Set(easyfixerIds.map(Number).filter((n) => Number.isInteger(n) && n > 0))];
   if (!ids.length) throw mkErr(400, 'select at least one technician');
@@ -455,19 +534,206 @@ async function assignCourse(courseId, easyfixerIds = []) {
   // created_at is what the Assign page and the report render as "Assigned On".
   // Left implicit it would be NULL on every new assignment.
   const now = new Date();
+  const durationMonths = Math.max(0, Number(options.durationMonths) || 0);
+  const durationDays = Math.max(0, Number(options.durationDays) || 0);
+  const dueDate = dueDateFrom(durationMonths, durationDays);
+  logger.info('Assign course · due=' + (dueDate ?? 'none')
+    + ' (' + durationMonths + 'm ' + durationDays + 'd)');
+
   let assigned = 0;
   for (const efrId of ids) {
+    /*
+     * Re-assigning REFRESHES the deadline but preserves the outcome.
+     *
+     * due_date is re-stated because re-assigning is one way an operator resets
+     * a deadline. score and completion_date are deliberately absent from the
+     * update list: a technician who already finished this course did finish
+     * it, and a re-assign must not erase that or reset their result.
+     *
+     * Only the derived DATE is stored — see extendAssignment for why the
+     * duration itself deliberately is not.
+     */
     const [r] = await pool.query(
-      `INSERT INTO easyfixer_courses (easyfixer_id, course_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?)
-       ON DUPLICATE KEY UPDATE updated_at = VALUES(updated_at)`,
-      [efrId, id, now, now],
+      `INSERT INTO easyfixer_courses
+         (easyfixer_id, course_id, created_at, updated_at, due_date)
+       VALUES (?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         updated_at = VALUES(updated_at),
+         due_date = VALUES(due_date)`,
+      [efrId, id, now, now, dueDate],
     );
     // affectedRows is 1 for a fresh insert, 2 for an update of an existing row.
     if (r.affectedRows === 1) assigned += 1;
   }
   logger.info('Course assigned · courseId=' + id + ' · new=' + assigned + ' · alreadyHeld=' + (ids.length - assigned));
-  return { requested: ids.length, assigned, alreadyAssigned: ids.length - assigned };
+  return {
+    requested: ids.length,
+    assigned,
+    alreadyAssigned: ids.length - assigned,
+    due_date: dueDate,
+  };
+}
+
+/*
+ * Stamp completion_date on every assigned course this technician has now
+ * finished. Idempotent — the WHERE only touches rows still NULL — so it is
+ * safe to call on every completing progress ping.
+ *
+ * "Finished" is the same rule the report uses: the course HAS content, and no
+ * video in it sits below COMPLETION_PERCENT. The `EXISTS` clause is what keeps
+ * an empty course from being stamped complete the moment it is assigned —
+ * vacuously true otherwise, since a course with no videos has no video below
+ * the threshold.
+ */
+async function stampCourseCompletions(efrId) {
+  const [r] = await pool.query(
+    `UPDATE easyfixer_courses ec
+        SET ec.completion_date = ?, ec.updated_at = ?
+      WHERE ec.easyfixer_id = ?
+        AND ec.completion_date IS NULL
+        AND EXISTS (SELECT 1 FROM course_videos cv WHERE cv.course_id = ec.course_id)
+        AND NOT EXISTS (
+              SELECT 1
+                FROM course_videos cv
+                LEFT JOIN easyfixer_watched_video w
+                       ON w.video_id = cv.video_id AND w.easyfixer_id = ec.easyfixer_id
+               WHERE cv.course_id = ec.course_id
+                 AND COALESCE(w.watched_percentage, 0) < ?
+            )`,
+    [new Date(), new Date(), Number(efrId), COMPLETION_PERCENT],
+  );
+  if (r.affectedRows > 0) {
+    logger.info('Training completion stamped · efrId=' + efrId + ' · courses=' + r.affectedRows);
+  }
+  return { stamped: r.affectedRows };
+}
+
+/*
+ * Everything this technician still owes, with its deadline. Feeds the app's
+ * open-on-launch prompt, the daily reminder push, and the overdue restriction.
+ *
+ * `overdue` is computed against the IST calendar day, and a NULL due_date is
+ * never overdue — an assignment without a deadline is a legitimate state and
+ * must not silently restrict anyone's app.
+ */
+async function pendingTraining(efrId) {
+  const today = istToday();
+  const [rows] = await pool.query(
+    `SELECT ec.course_id, c.name AS course_name, ec.due_date,
+            (SELECT COUNT(*) FROM course_videos cv WHERE cv.course_id = ec.course_id) AS videos_total,
+            (SELECT COUNT(*)
+               FROM course_videos cv
+               JOIN easyfixer_watched_video w
+                 ON w.video_id = cv.video_id AND w.easyfixer_id = ec.easyfixer_id
+              WHERE cv.course_id = ec.course_id
+                AND COALESCE(w.watched_percentage, 0) >= ?) AS videos_done
+       FROM easyfixer_courses ec
+       JOIN courses c ON c.id = ec.course_id
+      WHERE ec.easyfixer_id = ?
+        AND ec.completion_date IS NULL
+      ORDER BY (ec.due_date IS NULL), ec.due_date ASC`,
+    [COMPLETION_PERCENT, Number(efrId)],
+  );
+
+  const courses = rows
+    // A course with no content cannot be owed — nothing to watch.
+    .filter((r) => Number(r.videos_total) > 0)
+    .map((r) => ({
+      course_id: r.course_id,
+      course_name: r.course_name,
+      due_date: r.due_date,
+      videos_total: Number(r.videos_total),
+      videos_done: Number(r.videos_done),
+      overdue: Boolean(r.due_date && String(r.due_date).slice(0, 10) < today),
+    }));
+
+  return {
+    courses,
+    pending: courses.length,
+    overdue: courses.filter((c) => c.overdue).length,
+    today,
+  };
+}
+
+/*
+ * Is this technician locked out of everything except training?
+ *
+ * Deliberately a COUNT and nothing else: it runs on the mobile hot path (every
+ * authenticated request resolves lifecycle capabilities), so it must not pull
+ * rows or join the video tables. idx_efr_course_due covers it exactly.
+ */
+async function hasOverdueTraining(efrId) {
+  const [[row]] = await pool.query(
+    `SELECT COUNT(*) AS n
+       FROM easyfixer_courses
+      WHERE easyfixer_id = ?
+        AND completion_date IS NULL
+        AND due_date IS NOT NULL
+        AND due_date < ?`,
+    [Number(efrId), istToday()],
+  );
+  return Number(row.n) > 0;
+}
+
+/*
+ * Move an existing assignment's deadline — the CRM's "extend" action, and the
+ * same operation as "correct a deadline". There is no separate correct-vs-
+ * extend endpoint because there is no separate outcome: both set a new
+ * due_date on a row that already exists.
+ *
+ * ─── Where the extension counts FROM ─────────────────────────────────────
+ *
+ * From `max(today, current due_date)`, which is the only rule that behaves
+ * correctly in both directions:
+ *
+ *   already overdue (due < today)  → counts from TODAY, so "+7 days" really
+ *     does give seven days and the technician is unblocked immediately.
+ *     Counting from the lapsed date could land the new deadline still in the
+ *     past, leaving them restricted by an action named "extend".
+ *   not yet due (due >= today)     → counts from the EXISTING due date, so
+ *     "+1 month" adds a month to the deadline. Counting from today here would
+ *     SHORTEN a deadline that was three months out — an extension that
+ *     silently takes time away.
+ *
+ * A row with no deadline counts from today; there is nothing to extend, so
+ * this sets a first one.
+ *
+ * The duration is not persisted. It describes this one adjustment, not the
+ * row: after two extensions a stored "1 month" would be true of neither the
+ * original assignment nor the current deadline. due_date is the fact.
+ */
+async function extendAssignment(courseId, easyfixerId, { months = 0, days = 0 } = {}) {
+  const [[row]] = await pool.query(
+    `SELECT ec.due_date, ec.completion_date, c.name AS course_name
+       FROM easyfixer_courses ec
+       JOIN courses c ON c.id = ec.course_id
+      WHERE ec.course_id = ? AND ec.easyfixer_id = ?`,
+    [Number(courseId), Number(easyfixerId)],
+  );
+  if (!row) throw mkErr(404, 'assignment not found');
+
+  const today = istToday();
+  const current = row.due_date ? String(row.due_date).slice(0, 10) : null;
+  const anchor = current && current > today ? current : today;
+
+  const newDue = dueDateFrom(months, days, anchor);
+  if (!newDue) throw mkErr(400, 'set a duration to extend by');
+
+  await pool.query(
+    'UPDATE easyfixer_courses SET due_date = ?, updated_at = ? WHERE course_id = ? AND easyfixer_id = ?',
+    [newDue, new Date(), Number(courseId), Number(easyfixerId)],
+  );
+  logger.info('Assignment deadline moved · courseId=' + courseId + ' · efrId=' + easyfixerId
+    + ' · ' + (current ?? 'none') + ' → ' + newDue);
+
+  return {
+    course_id: Number(courseId),
+    easyfixer_id: Number(easyfixerId),
+    previous_due_date: current,
+    due_date: newDue,
+    /* True when this actually lifted a restriction, so the CRM can say so. */
+    unblocked: Boolean(current && current < today && !row.completion_date),
+  };
 }
 
 async function unassignCourse(courseId, easyfixerId) {
@@ -498,6 +764,7 @@ async function listAssignments({ courseId, easyfixerId, q, limit = 200, offset =
   const [rows] = await pool.query(
     `SELECT ec.id, ec.easyfixer_id, ec.course_id, ec.score,
             ec.created_at AS assigned_on,
+            ec.due_date, ec.completion_date,
             e.efr_name AS technician_name, e.efr_no AS technician_mobile,
             c.name AS course_name
        FROM easyfixer_courses ec
@@ -573,6 +840,7 @@ async function trainingReport({
   const select = `
     SELECT ec.id, ec.easyfixer_id, ec.course_id, ec.score,
            ec.created_at AS assigned_on,
+           ec.due_date, ec.completion_date,
            e.efr_name AS technician_name, e.efr_no AS technician_mobile,
            c.name AS course_name,
            (SELECT COUNT(*) FROM course_videos cv WHERE cv.course_id = ec.course_id) AS videos_total,
@@ -592,9 +860,30 @@ async function trainingReport({
    * table so the count and the page always describe the same set.
    */
   const completeExpr = 't.videos_total > 0 AND t.videos_done >= t.videos_total';
-  const statusCond = status === 'complete' ? `(${completeExpr})`
-    : status === 'incomplete' ? `NOT (${completeExpr})`
-      : '1=1';
+  /*
+   * 'overdue' judges the STAMPED completion, not the video maths.
+   *
+   * The two can legitimately disagree for a moment — a technician finishes the
+   * last video and `videos_done >= videos_total` before the next progress ping
+   * stamps completion_date — but the deadline is a contract about the recorded
+   * fact, and completion_date is that fact. Judging overdue on the video count
+   * would also mean a course whose CONTENT later grew retroactively made
+   * someone overdue for training they had already been told they finished.
+   *
+   * A NULL due_date is never overdue: an assignment without a deadline is a
+   * legitimate state and must not restrict anyone's app.
+   */
+  const overdueExpr = 't.completion_date IS NULL AND t.due_date IS NOT NULL AND t.due_date < ?';
+  const statusParams = [];
+  let statusCond = '1=1';
+  if (status === 'complete') {
+    statusCond = `(${completeExpr})`;
+  } else if (status === 'incomplete') {
+    statusCond = `NOT (${completeExpr})`;
+  } else if (status === 'overdue') {
+    statusCond = `(${overdueExpr})`;
+    statusParams.push(istToday());
+  }
 
   const derived = `(${select} ${base}) t`;
 
@@ -606,12 +895,12 @@ async function trainingReport({
       WHERE ${statusCond}
       ORDER BY ${sortExpr} ${dir}, t.id ASC
       LIMIT ? OFFSET ?`,
-    [...params, limit, offset],
+    [...params, ...statusParams, limit, offset],
   );
 
   const [[{ total }]] = await pool.query(
     `SELECT COUNT(*) AS total FROM ${derived} WHERE ${statusCond}`,
-    params,
+    [...params, ...statusParams],
   );
 
   logger.info('Training report · rows=' + rows.length + ' of ' + total);
@@ -780,6 +1069,11 @@ async function setVideoLink(videoId, rawUrl, actorUserId = null) {
 
 module.exports = {
   COMPLETION_PERCENT,
+  istToday,
+  dueDateFrom,
+  stampCourseCompletions,
+  pendingTraining,
+  hasOverdueTraining,
   parseYouTubeUrl,
   normalizeVideoUrl,
   setVideoLink,
@@ -798,6 +1092,7 @@ module.exports = {
   videoProgressCount,
   videoCourseCount,
   assignCourse,
+  extendAssignment,
   unassignCourse,
   listAssignments,
   trainingReport,

@@ -197,6 +197,32 @@ router.get('/ratings', validate(dateWindow, 'query'), async (req, res, next) => 
 // Training videos — watched %
 // ─────────────────────────────────────────────────────────────────────
 
+/*
+ * What this technician still owes, and by when.
+ *
+ * Single source for three surfaces that must agree: the prompt the app shows
+ * on open, the banner it keeps up while training is outstanding, and the
+ * restriction it renders once a deadline has passed. Computing any of those
+ * client-side from a video list would put the deadline logic — IST calendar
+ * days, the 100% threshold, courses with no content — in the app, where it
+ * would drift from the cron and the capability guard that enforce it.
+ *
+ * `overdue > 0` is the same condition that withdraws the technician's job
+ * capabilities (see tech-auth.service::findById), so the app can explain the
+ * restriction it is already subject to rather than guessing why a call 403'd.
+ */
+router.get('/training-status', async (req, res, next) => {
+  try {
+    logger.info('Training status requested · efrId=' + req.tech.efr_id);
+    const status = await lms.pendingTraining(req.tech.efr_id);
+    modernOk(res, {
+      ...status,
+      /* Echoed so the app never has to infer the restriction from a 403. */
+      restricted: status.overdue > 0,
+    });
+  } catch (e) { next(e); }
+});
+
 router.get('/training-videos/percentage', async (req, res, next) => {
   try {
     logger.info('Training video percentages requested');
