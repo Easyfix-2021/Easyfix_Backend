@@ -1415,14 +1415,13 @@ router.post('/device', validate(Joi.object({
 // (`core.easyfix_core.in`). The files all serve from the canonical static host
 // over https, so we rebuild from the `/easydoc/...` path.
 // Verified: https://core.easyfix.in/easydoc/... → 206 video/mp4 (range-supported).
-const TRAINING_VIDEO_HOST = 'https://core.easyfix.in';
-function normalizeTrainingVideoUrl(raw) {
-  if (!raw) return '';
-  const s = String(raw).trim();
-  const i = s.indexOf('/easydoc');
-  if (i >= 0) return TRAINING_VIDEO_HOST + s.slice(i);
-  return s.replace(/^http:\/\//i, 'https://'); // already-https / non-legacy paths pass through
-}
+//
+// Moved to services/lms.service.js (2026-08-13) once the CRM grew its own
+// video preview: the browser needs exactly the same repair the app does —
+// cleartext is mixed-content-blocked on an https CRM and the malformed host
+// resolves nowhere — and two copies of this would drift the moment either is
+// touched. Imported rather than reimplemented.
+const { normalizeVideoUrl: normalizeTrainingVideoUrl } = require('../../services/lms.service');
 router.get('/training-videos', async (_req, res, next) => {
   try {
     logger.info('List training videos');

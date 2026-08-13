@@ -415,7 +415,10 @@ async function listVideos({ q, limit = 200, offset = 0 } = {}) {
   );
 
   logger.info('Found ' + rows.length + ' training videos of ' + total);
-  return { rows, total, limit, offset };
+  // Repair legacy links on the way out so every consumer — the CRM preview and
+  // the technician app alike — receives something it can actually play.
+  const playable = rows.map((r) => ({ ...r, video_url: normalizeVideoUrl(r.video_url) || null }));
+  return { rows: playable, total, limit, offset };
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -694,6 +697,34 @@ function parseYouTubeUrl(raw) {
 }
 
 /*
+ * Make a stored link actually playable.
+ *
+ * Historic rows predate the YouTube-only rule and hold legacy files served
+ * from the Dropwizard static host. Two things are wrong with them as stored:
+ * the scheme is cleartext `http://` (blocked by Android's New Architecture,
+ * and mixed-content-blocked by a browser on an https CRM), and some carry a
+ * malformed host — `core.easyfix_core.in`, which does not resolve at all.
+ * Both are repaired by anchoring on the `/easydoc` path and rebuilding.
+ *
+ * This lived inside routes/mobile/index.js, where only the technician app
+ * benefited. The CRM now plays the same videos in its own preview, so it must
+ * apply the same repair or the three legacy rows are unplayable there —
+ * hence one shared implementation rather than a second copy that drifts.
+ *
+ * A YouTube link has no `/easydoc` segment and is already https, so it falls
+ * through the last line unchanged.
+ */
+const TRAINING_VIDEO_HOST = 'https://core.easyfix.in';
+
+function normalizeVideoUrl(raw) {
+  if (!raw) return '';
+  const value = String(raw).trim();
+  const index = value.indexOf('/easydoc');
+  if (index >= 0) return TRAINING_VIDEO_HOST + value.slice(index);
+  return value.replace(/^http:\/\//i, 'https://');
+}
+
+/*
  * Point a training video at a YouTube link.
  *
  * Writes through the legacy `document` row rather than adding a url column to
@@ -750,6 +781,7 @@ async function setVideoLink(videoId, rawUrl, actorUserId = null) {
 module.exports = {
   COMPLETION_PERCENT,
   parseYouTubeUrl,
+  normalizeVideoUrl,
   setVideoLink,
   isKnownVideo,
   invalidateVideoIdCache,
