@@ -1198,31 +1198,72 @@ async function suggestZonesForLocation({ cityId = null, lat = null, lng = null, 
   // whole junction). Bounded scan: only pincodes in the SAME city, or within a
   // ~1.5° (~165 km) bounding box of the new PIN.
   if (cid || point) {
+    /*
+     * The reference `point` is trustworthy — the Manage Pincodes add flow
+     * geocodes the NEW pincode fresh before calling this. It was the STORED
+     * side that was wrong: tbl_pincode.lat/lng is 98.5% legacy-import data,
+     * off by tens to hundreds of km (see
+     * migrations/2026-08-13-pincode-coords-provenance.sql). This function read
+     * those columns directly in TWO places — to prefilter candidates, and to
+     * rank them — so both are addressed below.
+     */
+    const stamped = await geocode.hasProvenanceColumn();
     const conds = [];
     const params = [];
     if (cid) { conds.push('p.city_id = ?'); params.push(cid); }
     if (point) {
       const D = 1.5;
-      conds.push('(p.lat BETWEEN ? AND ? AND p.lng BETWEEN ? AND ?)');
+      /*
+       * The coordinate prefilter can't go through the resolver — it IS the
+       * SELECT — so it is restricted to coordinates we actually resolved.
+       * Matching an unstamped row recalls a zone by where the legacy import
+       * THOUGHT its pincodes were: noise dressed as relevance, and it can just
+       * as easily exclude a genuinely near zone as include a far one. Recall
+       * recovers by itself as PINs get stamped by the Schedule & Assign path.
+       *
+       * Pre-migration `stamped` is false and this clause is byte-identical to
+       * before, so deploy order stays free.
+       */
+      const trusted = stamped ? ' AND p.coords_geocoded_at IS NOT NULL' : '';
+      conds.push(`(p.lat BETWEEN ? AND ? AND p.lng BETWEEN ? AND ?${trusted})`);
       params.push(point.lat - D, point.lat + D, point.lng - D, point.lng + D);
     }
     const [rows] = await pool.query(
-      `SELECT z.zone_id, z.zone_name, p.city_id AS p_city_id, p.lat, p.lng
+      `SELECT z.zone_id, z.zone_name, p.city_id AS p_city_id, p.pincode
          FROM tbl_zone_master z
          JOIN tbl_zone_pincode_mapping zpm ON zpm.zone_id = z.zone_id
          JOIN tbl_pincode p ON p.pincode_id = zpm.pincode_id
         WHERE z.zone_status = 1 AND (${conds.join(' OR ')})`,
       params
     );
+    // Group FIRST, resolve ONCE, then measure. Zones share pincodes, and the
+    // city branch deliberately returns rows whatever their stamp — so batching
+    // the lookup lets the resolver's cache + fan-out cap do the work instead of
+    // one geocode per row.
     const zones = new Map();
+    const pins = new Set();
     for (const r of rows) {
       const id = Number(r.zone_id);
       let z = zones.get(id);
-      if (!z) { z = { zone_id: id, zone_name: r.zone_name, sameCity: false, minDist: null }; zones.set(id, z); }
+      if (!z) { z = { zone_id: id, zone_name: r.zone_name, sameCity: false, minDist: null, pins: [] }; zones.set(id, z); }
       if (cid && Number(r.p_city_id) === cid) z.sameCity = true;
-      if (point && r.lat != null && r.lng != null) {
-        const d = geocode.haversineKm(point, { lat: Number(r.lat), lng: Number(r.lng) });
-        if (d != null && (z.minDist == null || d < z.minDist)) z.minDist = d;
+      // sameCity above needs no coordinates at all and was never affected.
+      if (point && r.pincode != null) {
+        const pin = String(r.pincode);
+        z.pins.push(pin);
+        pins.add(pin);
+      }
+    }
+    if (point && pins.size) {
+      const centroids = await geocode.getCentroids([...pins]);
+      for (const z of zones.values()) {
+        for (const pin of z.pins) {
+          // haversineKm returns null for a missing point, so an unresolvable
+          // pincode simply doesn't contribute a distance — it never falls back
+          // to the legacy value we declined to trust.
+          const d = geocode.haversineKm(point, centroids.get(pin) ?? null);
+          if (d != null && (z.minDist == null || d < z.minDist)) z.minDist = d;
+        }
       }
     }
     ranked = [...zones.values()].sort((a, b) => {

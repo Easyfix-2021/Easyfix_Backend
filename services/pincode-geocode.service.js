@@ -410,4 +410,9 @@ module.exports = {
   getCentroids,
   geocodePincodeDetail,
   haversineKm,
+  // Exported for callers that filter tbl_pincode rows in SQL and therefore
+  // can't go through getCentroids for the SELECT itself — they need to know
+  // whether the stamp is available to filter on. One memoised probe shared by
+  // everyone beats each caller rolling its own.
+  hasProvenanceColumn,
 };
