@@ -389,6 +389,75 @@ function magicLinkUrl(token) {
 }
 
 /**
+ * mintJobLink(jobId) → { token, url }
+ *
+ * THE ONE mint site. Pure CPU (no DB, no I/O) so it is safe to call before any
+ * cap reservation — sendForJob deliberately mints here, i.e. BEFORE the atomic
+ * reserve, exactly as it always did.
+ */
+function mintJobLink(jobId) {
+  const token = signJobToken({ jobId });
+  return { token, url: magicLinkUrl(token) };
+}
+
+/**
+ * shortenJobLink(url, jobId, pool) → the short URL, or `url` unchanged.
+ *
+ * THE ONE shortening site. Mints a tbl_url_shortener row tagged
+ * `purpose='unconfirmed_book'` with a TTL matching the JWT's own lifetime
+ * (MAGIC_LINK_TTL_HOURS, default 168h = 7d), so an expired link renders the
+ * friendly /book/<code> 410 page instead of redirecting to a JWT-expired
+ * landing page. The tag is what audit queries ("all customer-book links sent
+ * this week") and any future cleanup cron filter on, so it must stay identical
+ * across every send path — which is the reason this lives in one function
+ * rather than being retyped per caller.
+ *
+ * SOFT FALLBACK: a shortening failure (DB hiccup, network) returns the long JWT
+ * URL rather than throwing. The customer MUST receive a working link; ugly beats
+ * absent. Warning logged for ops.
+ */
+async function shortenJobLink(url, jobId, pool) {
+  try {
+    const ttlHours  = Number(process.env.MAGIC_LINK_TTL_HOURS) || 168;
+    const expiresAt = new Date(Date.now() + ttlHours * 3600 * 1000);
+    const { short_url } = await urlShortener.shortenUrl(
+      url,
+      { purpose: 'unconfirmed_book', expiresAt },
+      pool,
+    );
+    return short_url || url;
+  } catch (err) {
+    logger.warn(
+      { jobId, err: err && err.message },
+      'magic-link: URL shortening failed — falling back to long JWT URL',
+    );
+    return url;
+  }
+}
+
+/**
+ * buildShortLinkForJob(jobId, pool) → the customer-facing link, or null.
+ *
+ * For callers that need the LINK ALONE, without sendForJob's template, cap
+ * reservation and audit stamping — today that is the WhatsApp conversation
+ * service's free-form re-engagement reply.
+ *
+ * ⚠ It exists so the mint → url → shorten sequence has exactly ONE
+ * implementation. A second copy is how the two links drift apart: a differing
+ * `purpose` or TTL means one of them starts 404ing on a schedule nobody
+ * remembers setting.
+ *
+ * Throws only if the token itself cannot be signed (a missing JWT_SECRET is a
+ * misconfiguration, not a transient) — callers that must not fail loudly, like
+ * a webhook, catch it and send nothing.
+ */
+async function buildShortLinkForJob(jobId, pool) {
+  const { url } = mintJobLink(jobId);
+  if (!url) return null;
+  return await shortenJobLink(url, jobId, pool);
+}
+
+/**
  * Probe whether tbl_city has an is_active column.
  *
  * Why a runtime probe (vs assume): tbl_city schema has drifted across
@@ -1068,8 +1137,7 @@ async function sendForJob(jobId, { action, override = false } = {}, pool) {
   // within the existing varchar(20) column width.
   if (override) effectiveAction = 'resend-override';
 
-  const token = signJobToken({ jobId });
-  const url   = magicLinkUrl(token);
+  const { token, url } = mintJobLink(jobId);
 
   /*
    * Race-safety: do the 3-send cap check + increment in a SINGLE atomic
@@ -1132,37 +1200,11 @@ async function sendForJob(jobId, { action, override = false } = {}, pool) {
   // Shorten the long JWT URL for the WhatsApp body. Gallabox's
   // `confirm_order` template variable {{3}} renders the URL in-line and
   // long JWTs (~200 chars) blow past sensible message length + look
-  // suspicious to the customer. We mint a short URL row tagged
-  // `purpose='unconfirmed_book'` with a TTL matching the JWT's own
-  // lifetime (MAGIC_LINK_TTL_HOURS, default 168h = 7d) so an expired
-  // link returns the friendly /book/<code> 410 page rather than a stale
-  // redirect to a JWT-expired landing page.
-  //
-  // Soft fallback: if shortening fails (DB hiccup, network), we keep
-  // the long URL and proceed with the send rather than aborting — the
-  // customer MUST receive a working link. Warning logged for ops.
-  let bodyUrl = url;
-  try {
-    const ttlHours    = Number(process.env.MAGIC_LINK_TTL_HOURS) || 168;
-    const expiresAt   = new Date(Date.now() + ttlHours * 3600 * 1000);
-    // `purpose` = 'unconfirmed_book' tags this row in
-    // tbl_url_shortener as a customer Unconfirmed-Order booking link.
-    // Audit queries like "all customer-book links sent this week" or a
-    // future cleanup cron that targets just this flow filter on this
-    // exact string — keep it stable across send paths (admin manual,
-    // hourly cron, future "bulk send") so the bucket stays consistent.
-    const { short_url } = await urlShortener.shortenUrl(
-      url,
-      { purpose: 'unconfirmed_book', expiresAt },
-      pool,
-    );
-    bodyUrl = short_url;
-  } catch (err) {
-    logger.warn(
-      { jobId, err: err && err.message },
-      'magic-link: URL shortening failed — falling back to long JWT URL',
-    );
-  }
+  // suspicious to the customer. Shortening happens AFTER the reservation
+  // above on purpose: a send that is already at cap must not leave a
+  // shortener row behind for a link nobody will ever receive.
+  // See shortenJobLink for the purpose tag, the TTL and the soft fallback.
+  const bodyUrl = await shortenJobLink(url, jobId, pool);
 
   let response;
   try {
@@ -1859,6 +1901,21 @@ module.exports = {
   fetchPrefill,
   autoRescheduleOnOpenIfLate,
   sendForJob,
+  /*
+   * BOTH link builders are exported, and the choice between them is not stylistic.
+   *   mintJobLink        — token + url, NO shortener row. For callers that must
+   *                        not pollute click analytics (the Validate-Flows test
+   *                        send in job-magic-link-cron.js is exactly that).
+   *   buildShortLinkForJob — mints AND shortens. For anything a customer taps.
+   * mintJobLink was extracted but left unexported, which is worse than not
+   * extracting it: the caller it exists for would have resolved `undefined`, and
+   * that call site wraps its mint in a try/catch that swallows the TypeError and
+   * degrades to an unopenable sentinel URL, reporting the cause as "token mint
+   * failed". A half-landed refactor that fails silently beats no refactor only
+   * in the changelog.
+   */
+  mintJobLink,
+  buildShortLinkForJob,
   acceptSubmission,
   writeCustomerOrderDetails,
   resolveJobSpoc,

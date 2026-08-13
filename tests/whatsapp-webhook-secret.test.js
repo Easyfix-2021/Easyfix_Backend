@@ -264,3 +264,135 @@ test('correct traffic NEVER trips the breaker, however much of it there is', asy
     }
   });
 });
+
+/* ═════════ delivery receipts must not read as unparseable ══════════════ */
+
+const postBody = async (body) => {
+  const res = await fetch(`${baseUrl}/webhook/whatsapp`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-webhook-secret': SECRET },
+    body: JSON.stringify(body),
+  });
+  return res.status;
+};
+
+/* The exact envelope shape seen in production, from the logged bodyShape. */
+const receipt = (status) => ({
+  id: '6a7d6520ed7340bf133953a1',
+  status,
+  timestamp: '1786599311',
+  errors: {},
+  message: { recipient_id: '919812345678' },
+  recipient_id: '919812345678',
+});
+
+test('a sent/delivered/read receipt is acknowledged QUIETLY, never as UNPARSEABLE', async () => {
+  /*
+   * These fire for EVERY message we send, so roughly half the webhook log was a
+   * WARN saying "normaliseInbound found no actionable fields … widen the probes"
+   * — advice that is simply wrong, about traffic that is entirely normal. The
+   * cost was not CPU: it was that UNPARSEABLE stopped meaning anything, and it
+   * exists to say a CUSTOMER sent something we could not read.
+   */
+  await withSecret(SECRET, async () => {
+    for (const st of ['sent', 'delivered', 'read']) {
+      lines = [];
+      assert.equal(await postBody(receipt(st)), 200, `${st} receipt is accepted`);
+      const t = logText();
+      assert.equal(/UNPARSEABLE/.test(t), false, `a "${st}" receipt must not be called unparseable`);
+      assert.equal(lines.some((l) => l.lvl === 'warn'), false, `and must not WARN — it is routine`);
+    }
+  });
+});
+
+test('a FAILED receipt is still acted on — the quiet path must not swallow the one that matters', async () => {
+  // The whole reason receipts are read at all is the "Delivery Failed" chip.
+  // Quietening the routine ones must not quieten this one.
+  await withSecret(SECRET, async () => {
+    assert.equal(await postBody({ ...receipt('failed'), errors: [{ message: 'number not on WhatsApp' }] }), 200);
+    assert.match(logText(), /status callback · status=failed/i,
+      'a failure is still logged and still drives the DB update');
+  });
+});
+
+test('a real customer message still parses — the receipt guard must not eat inbound', async () => {
+  // The narrow risk of identifying receipts by shape is that a real message
+  // gets classified as one. This is the regression guard for that.
+  await withSecret(SECRET, async () => {
+    lines = [];
+    assert.equal(await postBody({ payload: { from: '919812345678', text: { body: 'yes please' } } }), 200);
+    assert.match(logText(), /WhatsApp inbound · type=text/, 'still recognised as a customer message');
+  });
+});
+
+test('a sender with NO readable content is reported with its shape, so the probe gap is findable', async () => {
+  /*
+   * type=unknown means a real customer sent something and normaliseInbound could
+   * not tell what. That is a probe gap, and it used to be invisible: the body
+   * shape was logged only on the fully-unparseable path, so the one case that
+   * could reveal where their reply lives was the one case that never printed it.
+   */
+  await withSecret(SECRET, async () => {
+    lines = [];
+    assert.equal(await postBody({ payload: { from: '919812345678', someNewShape: { body: 'yes' } } }), 200);
+    const t = logText();
+    assert.match(t, /CONTENT NOT FOUND/, 'the gap is named');
+    assert.match(t, /someNewShape/, 'and the key path where their reply actually is, is printed');
+    assert.equal(t.includes('yes'), false, 'keys only — never the words the customer typed');
+  });
+});
+
+/* ═══════ the nested `message` key must not shadow the envelope ═════════ */
+
+test('a top-level sender + text is found even when a nested `message` key exists', async () => {
+  /*
+   * THE REPORTED INCIDENT, reproduced. Job 523247 had a conversation row that
+   * was `active`, at `awaiting_choice`, expiring two days out — and
+   * `last_inbound_at` was NULL: not one reply had ever matched it. Meanwhile
+   * every inbound logged `type=unknown` and `no_active_conversation`.
+   *
+   * Cause: `const p = body.payload || body.message || body.data || body`. The
+   * real Gallabox envelope carries a `message` key, so it won the chain and
+   * every field was then read out of an object that does not hold them — the
+   * sender resolved to something other than the customer's number, and their
+   * words were at no probed path.
+   *
+   * The SAME defect sat in normaliseStatus and had silently broken delivery
+   * receipts for as long as they had existed. One idiom, two functions, two
+   * outages: an `||` chain over candidate envelopes asserts that the first
+   * non-null one is correct, and is silent when it is not.
+   */
+  await withSecret(SECRET, async () => {
+    lines = [];
+    const status = await postBody({
+      from: '919812345678',
+      id: 'wamid.TEST123',
+      type: 'text',
+      text: { body: 'Yes, confirm' },
+      // Present on the real envelope, and holds none of the above.
+      message: { recipient_id: '918888888888' },
+    });
+    assert.equal(status, 200);
+    const t = logText();
+    assert.match(t, /WhatsApp inbound · type=text/, 'the reply is read as text, not "unknown"');
+    assert.equal(/CONTENT NOT FOUND/.test(t), false, 'and its content is found');
+    assert.match(t, /messageId=wamid\.TEST123/, 'the id comes from the OUTER envelope, not the nested one');
+  });
+});
+
+test('a button reply nested one level deeper is still routed', async () => {
+  // Quick replies are the whole confirm/reschedule/not-required flow; the
+  // buttonId IS the routing key, so losing it to the same shadowing would send
+  // a confirming customer nowhere.
+  await withSecret(SECRET, async () => {
+    lines = [];
+    assert.equal(await postBody({
+      id: 'wamid.BTN',
+      payload: { from: '919812345678', interactive: { button_reply: { id: 'confirm_order' } } },
+      message: { recipient_id: '918888888888' },
+    }), 200);
+    const t = logText();
+    assert.match(t, /type=button/);
+    assert.match(t, /buttonId="confirm_order"/);
+  });
+});

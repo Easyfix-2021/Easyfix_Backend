@@ -8,7 +8,10 @@ const conversationService = require('./whatsapp-conversation.service');
 // for the real customer. A test must be side-effect-free against the source
 // row + must always go to the operator's typed number, not the customer's.
 const whatsappService = require('./gallabox.whatsapp.service');
-const { signJobToken } = require('../utils/jwt');
+// signJobToken is deliberately NOT imported here any more: this file no longer
+// mints its own link. magicLinkService.mintJobLink() owns the token AND the URL
+// shape, so importing the signer again would re-open the door to a fourth
+// hand-rolled copy the next time someone needs a link in this file.
 
 /*
  * Hourly cron — scans Unconfirmed (status=9) jobs whose client is
@@ -174,9 +177,19 @@ async function runTest({ mobile, sourceId } = {}) {
   let testUrl;
   if (jobIdForToken) {
     try {
-      const token = signJobToken({ jobId: jobIdForToken });
-      const base = process.env.MAGIC_LINK_BASE_URL || 'https://qa.easyfix.in';
-      testUrl = `${base.replace(/\/$/, '')}/public/job-completion/${token}`;
+      /*
+       * mintJobLink, NOT buildShortLinkForJob — the difference matters here.
+       * This is the Validate-Flows TEST send: it must create NO shortener row,
+       * or every operator running a flow check quietly adds a click-analytics
+       * entry for a link no customer ever saw. mintJobLink is the pure half
+       * (token + url, no I/O), which is precisely why it was split out.
+       *
+       * Hand-building this string was the third copy of the magic-link URL
+       * shape. Three copies means the day magicLinkUrl() changes, two of them
+       * keep emitting the old path and 404 for customers while every test still
+       * passes — the link is not covered by anything that would notice.
+       */
+      testUrl = magicLinkService.mintJobLink(jobIdForToken).url;
     } catch (e) {
       logger.warn({ err: e?.message }, 'magic-link TEST: token mint failed, falling back to sentinel URL');
       testUrl = `${(process.env.MAGIC_LINK_BASE_URL || 'https://qa.easyfix.in').replace(/\/$/, '')}/public/job-completion/test-link-please-ignore`;

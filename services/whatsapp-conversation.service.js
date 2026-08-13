@@ -65,8 +65,11 @@ const slotModel = require('./time-slot');
  * State lives in tbl_whatsapp_conversation (one active row per job).
  * `current_step` is VARCHAR(40) (migrations/executed/2026-06-03-whatsapp-
  * conversation.sql) — NOT an enum — so the new step names need no migration.
- * The state machine owns the flow + every DB write; ai.service only INTERPRETS
- * free text and never decides a write. All outbound sends honour
+ * The state machine owns the flow + every DB write. ai.service INTERPRETS
+ * inbound free text and, since 2026-08-13, also PHRASES the outbound step
+ * prompts and the closing confirmation — but it never decides a step and never
+ * decides a write. See `phrase()` below for the exact boundary and why it is a
+ * safety property rather than an implementation detail. All outbound sends honour
  * NOTIFICATIONS_DISABLE + TEST_MOBILE via the gallabox senders. The FIRST
  * message is a pre-approved template (24h-window rule); everything after is
  * free-form/interactive in-session.
@@ -595,15 +598,38 @@ function parseContext(row) {
   try { return JSON.parse(row.context); } catch { return {}; }
 }
 
-async function getActiveByMobile(mobile, pool) {
+/*
+ * THE ONE phone-matching rule, shared by every conversation lookup.
+ *
+ * Match on the LAST 10 DIGITS so 91-prefix / +91 / no-prefix variants all
+ * resolve to the same customer.
+ *
+ * ⚠ Both halves live here on purpose. getActiveByMobile below and the
+ * no-active-conversation DIAGNOSIS further down must match identically: if the
+ * two drifted, the diagnosis would describe a row the real lookup never
+ * considered — it would lie about the very lookup it exists to explain, which
+ * is the exact failure mode it was written to end.
+ *
+ * The SQL fragment is a module constant interpolated into the query text; the
+ * phone itself stays a bound `?` parameter.
+ *
+ * Not sargable (the expression wraps the column), so idx_wac_mob cannot serve
+ * either query — known and accepted: the table is small, and the diagnosis only
+ * ever runs on the unhappy path.
+ */
+const MOBILE_MATCH_SQL = "RIGHT(REPLACE(customer_mob_no, ' ', ''), 10) = ?";
+
+function mobileMatchKey(mobile) {
   const norm = gallabox.normaliseIndianPhone(mobile) || String(mobile || '');
-  const last10 = norm.replace(/\D/g, '').slice(-10);
-  // Match on the last 10 digits so 91-prefix / no-prefix variants both resolve.
+  return norm.replace(/\D/g, '').slice(-10);
+}
+
+async function getActiveByMobile(mobile, pool) {
   const [rows] = await pool.query(
     `SELECT * FROM tbl_whatsapp_conversation
-      WHERE status = 'active' AND RIGHT(REPLACE(customer_mob_no, ' ', ''), 10) = ?
+      WHERE status = 'active' AND ${MOBILE_MATCH_SQL}
       ORDER BY conversation_id DESC LIMIT 1`,
-    [last10],
+    [mobileMatchKey(mobile)],
   );
   return rows[0] || null;
 }
@@ -880,6 +906,300 @@ async function captureCustomerGps(jobId, location, pool) {
   }
 }
 
+// ── No ACTIVE conversation: say WHICH case, and re-engage a late reply ───
+
+/*
+ * `reason=no_active_conversation` used to cover FOUR situations that need four
+ * different responses, while distinguishing none of them:
+ *
+ *   never_started      no row has EVER existed for this number. The customer is
+ *                      texting us cold, or the mobile on the job is not the one
+ *                      they message from. Nothing to re-open.
+ *   expired            a row existed and OUR OWN 24h session on it lapsed
+ *                      (SESSION_HOURS — not Meta's customer service window,
+ *                      which the customer's inbound has just re-opened) —
+ *                      reported WITH AN AGE, because "expired 3h ago" and "9d
+ *                      ago" are different problems: the first says re-trigger
+ *                      the confirmation, the second says stop looking here.
+ *   completed          the customer already finished the flow. Their reply is
+ *                      conversation, not an unanswered prompt.
+ *   closed_no_service  they told us they do not need the service at all.
+ *
+ * Telling those apart by hand cost four wrong turns during the 2026-08 inbound
+ * incident — whose real cause was the envelope bug in routes/webhook/whatsapp.js
+ * (see its normaliseInbound comment). This string was not the bug; it was what
+ * made the bug unfalsifiable, twice supporting the wrong conclusion.
+ *
+ * ⚠ `reason` STAYS 'no_active_conversation' byte-for-byte: the webhook prints it
+ * into its NOT-handled WARN and tests assert on it. The case rides in `detail`,
+ * and the whole sentence in the INFO line below — which has to be actionable
+ * without opening this file, because the person reading it at 11pm will not.
+ */
+const NO_CONVO = Object.freeze({
+  NEVER_STARTED:     'never_started',
+  EXPIRED:           'expired',
+  COMPLETED:         'completed',
+  CLOSED_NO_SERVICE: 'closed_no_service',
+  UNKNOWN:           'diagnosis_failed',
+});
+
+/*
+ * Coarse age for a log line: '45m', '3h', '9d'. Coarse ON PURPOSE — the reader
+ * is deciding "re-trigger, or go looking somewhere else?", and that turns on the
+ * order of magnitude, never on the minutes.
+ */
+function humanAgo(sinceMs, nowMs = Date.now()) {
+  if (!Number.isFinite(sinceMs)) return null;
+  const mins = Math.max(0, Math.floor((nowMs - sinceMs) / 60000));
+  if (mins < 60) return mins + 'm';
+  const hours = Math.floor(mins / 60);
+  if (hours < 48) return hours + 'h';
+  return Math.floor(hours / 24) + 'd';
+}
+
+/*
+ * reengageExpired(row, pool) → outcome code
+ *
+ * A customer who replies after OUR conversation row expired otherwise gets
+ * silence: nothing reaches them, nothing reaches ops. They get a FREE-FORM
+ * reply carrying the confirmation link.
+ *
+ * ⚠ FREE-FORM IS LAWFUL HERE, AND A TEMPLATE WOULD BE A MISTAKE.
+ * Meta's 24-hour customer service window OPENS on a customer message and RESETS
+ * on each further one; inside it a business may send free-form service messages,
+ * and a template is required only OUTSIDE it. We are replying WHILE HANDLING
+ * THEIR INBOUND — their message just opened the window, so free-form is
+ * deliverable right now.
+ *
+ * `status = 'expired'` on the row is OUR OWN bookkeeping (SESSION_HOURS, measured
+ * from when WE started the conversation). It is not Meta's window and says
+ * nothing about what we may send.
+ *
+ * This used to call jml.sendForJob, which sends the approved `confirm_order`
+ * TEMPLATE and consumes the per-client "Max Magic-Link Send Count". That was not
+ * merely unnecessary, it was harmful: it burned the client's magic-link budget
+ * BECAUSE THE CUSTOMER TEXTED US. The cap exists to bound OUR outreach, so
+ * spending it on their inbound is backwards — and a chatty customer could drain
+ * the quota meant for other jobs. So: no template, no approval, no cap.
+ *
+ * ⚠ The LINK still comes from job-magic-link.service (buildShortLinkForJob), the
+ * one place that mints the token, builds the url and shortens it. Re-deriving it
+ * here is how the two links drift and one of them starts 404ing.
+ * (job-magic-link.service does not require this module back, so the long-standing
+ * `jml` import at the top of this file is not a cycle.)
+ *
+ * GUARD ORDER IS COST ORDER: the caller has already established EXPIRED from the
+ * row in hand; we then spend one read on the job, and only then claim the
+ * once-only marker. Nothing is claimed for a job we were never going to message.
+ */
+async function reengageExpired(row, pool) {
+  const jobId = row.job_id;
+  // Which side of the send a failure landed on. Without it, a DB hiccup on the
+  // guard reads as "the provider rejected our message" — the same
+  // one-string-four-causes mistake this whole change exists to undo.
+  let claimed = false;
+  try {
+    /*
+     * GUARD — still Unconfirmed. Past status 9 the visit is already settled and
+     * the confirmation link would ask the customer to complete something that no
+     * longer exists.
+     */
+    const [[job]] = await pool.query('SELECT job_status FROM tbl_job WHERE job_id = ? LIMIT 1', [jobId]);
+    if (!job || Number(job.job_status) !== 9) return 'job_not_unconfirmed';
+
+    /*
+     * GUARD — AT MOST ONCE per conversation row. A customer who texts five times
+     * must get one reply, not five, so the marker is CLAIMED (not merely read)
+     * before the send: a single conditional UPDATE, serialised by the InnoDB row
+     * lock, so two concurrent inbounds cannot both see "not yet re-engaged".
+     * affectedRows === 0 means someone else already holds it.
+     *
+     * The flag lives in the row's `context` JSON — no migration, and it travels
+     * with the conversation it describes. JSON_TYPE(...) = 'OBJECT' guards the
+     * rows whose context is NULL or a JSON scalar; JSON_SET on those would
+     * otherwise no-op and silently read as "already claimed".
+     *
+     * Bound as a JS Date, never NOW(): the pool is `timezone: '+05:30'`, so a JS
+     * Date serialises to the IST wall clock every other stamp in this file uses.
+     *
+     * Trade-off, deliberate: the marker is burned even if the send then fails.
+     * At-most-once is the property that protects the customer; a lost
+     * re-engagement is a missing nicety, five of them is spam. Nothing else is
+     * spent — this reply costs no template and no send-count slot.
+     */
+    const [claim] = await pool.query(
+      `UPDATE tbl_whatsapp_conversation
+          SET context = JSON_SET(IF(JSON_TYPE(context) = 'OBJECT', context, JSON_OBJECT()), '$.reengaged_at', ?)
+        WHERE conversation_id = ?
+          AND JSON_EXTRACT(IF(JSON_TYPE(context) = 'OBJECT', context, JSON_OBJECT()), '$.reengaged_at') IS NULL`,
+      [new Date(), row.conversation_id],
+    );
+    if (!claim || !claim.affectedRows) return 'already_reengaged';
+    claimed = true;
+
+    /*
+     * The link is built AFTER the claim so two concurrent inbounds cannot both
+     * mint a token (the loser's shortener row would be a link nobody receives).
+     *
+     * Its own try/catch, so a link failure is never reported as a SEND failure —
+     * the two want different fixes (a missing JWT_SECRET vs a provider outage),
+     * and one line covering both is how this path became unreadable the first
+     * time. Either way NOTHING is sent: a message telling the customer to tap
+     * something that is not there reads as a broken system and invites a call.
+     */
+    let link = null;
+    try {
+      link = await jml.buildShortLinkForJob(jobId, pool);
+    } catch (err) {
+      logger.warn({ jobId, conversationId: row.conversation_id, err: err && err.message },
+        'whatsapp-conversation: re-engagement link could not be built');
+    }
+    if (!link) {
+      logger.warn({ jobId, conversationId: row.conversation_id },
+        'whatsapp-conversation: re-engagement skipped — no confirmation link, so NOTHING was sent');
+      return 'no_link';
+    }
+
+    const res = await gallabox.sendText({
+      to: row.customer_mob_no,
+      body: 'Sorry — our earlier chat timed out, so we can’t carry on here.\n\n'
+        + `Please use this link to confirm your visit:\n${link}`,
+    });
+    // `disabled` is NOTIFICATIONS_DISABLE in dev — a deliberately silenced send,
+    // not a failure. Anything else not delivered must not read as 'sent': the
+    // claim is already burned, so this customer gets no second attempt.
+    if (res && !res.delivered && !res.disabled) {
+      logger.warn({ jobId, conversationId: row.conversation_id, err: res.error },
+        'whatsapp-conversation: re-engagement reply was REJECTED by the provider');
+      return 'send_failed';
+    }
+    /*
+     * AUDIT — leave a CRM-VISIBLE trace that we answered this customer.
+     *
+     * Everything else about this reply is invisible to ops: it touches no
+     * magic_link_* column (deliberately — it is not our outreach, see above),
+     * so without this the only evidence is a log line, and nobody browsing the
+     * job can tell whether the late customer was answered or ignored. The job
+     * comment thread is the surface ops already reads for exactly this, and the
+     * one this service already writes to for WhatsApp cancel/reschedule
+     * reasons — same call, same comment_on=1 (lifecycle). No new column, no
+     * migration.
+     *
+     * The LINK is deliberately NOT quoted in the comment: it carries a signed
+     * token, and a job comment is the wrong place to park credentials.
+     *
+     * Fail-soft, and the ORDER is the point: the message is already delivered,
+     * so a comment hiccup must neither undo it nor be reported as a send
+     * failure — this runs after the send and swallows its own error.
+     */
+    try {
+      await require('./job-comment.service').addComment(jobId, {
+        comments: 'Customer replied on WhatsApp after the confirmation chat had expired — '
+          + 'we answered with the confirmation link (free-form reply, so no template and no magic-link send-count slot was used).',
+        comment_on: 1,
+        commented_by: null,
+        appointment_on: null,
+      });
+    } catch (e) {
+      logger.warn({ jobId, conversationId: row.conversation_id, err: e && e.message },
+        'whatsapp-conversation: re-engagement audit comment failed — the reply WAS delivered');
+    }
+
+    logger.info({ jobId, conversationId: row.conversation_id },
+      'whatsapp-conversation: re-engaged a late-replying customer with a free-form confirmation link');
+    return 'sent';
+  } catch (err) {
+    // Fail-soft. This runs inside a webhook that must still
+    // answer 200; neither a provider outage nor a DB hiccup may become a 500.
+    if (claimed) {
+      logger.warn({ jobId, err: err && err.message }, 'whatsapp-conversation: re-engagement send failed');
+      return 'send_failed';
+    }
+    logger.warn({ jobId, err: err && err.message }, 'whatsapp-conversation: re-engagement guards could not be evaluated — nothing was sent');
+    return 'guard_failed';
+  }
+}
+
+/*
+ * explainNoActiveConversation(inbound, pool) → the handleInbound result
+ *
+ * ONE extra query, and it runs ONLY here — i.e. only after getActiveByMobile has
+ * already come back empty. The healthy path pays nothing for it. (The next
+ * reader will ask; tests/whatsapp-conversation-reengage.test.js asserts it on
+ * the captured SQL rather than trusting this sentence.)
+ */
+async function explainNoActiveConversation(inbound, pool) {
+  let row = null;
+  let lookupFailed = false;
+  try {
+    // The LATEST row for this number whatever its status — same matching rule as
+    // getActiveByMobile, minus the status filter that made it invisible.
+    // customer_mob_no is projected because reengageExpired replies to the number
+    // ON THE ROW: it is the same person by construction (the last-10-digit match
+    // above), stored in the form our own sender already normalises.
+    const [rows] = await pool.query(
+      `SELECT conversation_id, job_id, status, current_step, expires_at, customer_mob_no
+         FROM tbl_whatsapp_conversation
+        WHERE ${MOBILE_MATCH_SQL}
+        ORDER BY conversation_id DESC LIMIT 1`,
+      [mobileMatchKey(inbound.from)],
+    );
+    row = rows[0] || null;
+  } catch (err) {
+    // A DIAGNOSIS must never be the thing that breaks the webhook — and must
+    // never claim "never started" when it simply failed to look.
+    lookupFailed = true;
+    logger.warn({ err: err && err.message }, 'whatsapp-conversation: no-active-conversation diagnosis failed');
+  }
+
+  const status = row ? String(row.status || '') : null;
+  const jobId = row ? row.job_id : null;
+  let detail;
+  let age = null;
+  let note;
+  if (lookupFailed) {
+    detail = NO_CONVO.UNKNOWN;
+    note = 'could not read the conversation history for this number (see the warning above) — the case is UNKNOWN, not "never started"';
+  } else if (!row) {
+    detail = NO_CONVO.NEVER_STARTED;
+    note = 'no conversation has EVER been opened for this number — nothing to reply to. Check that the mobile on the job is the number they messaged from';
+  } else if (status === 'expired') {
+    detail = NO_CONVO.EXPIRED;
+    age = humanAgo(row.expires_at ? new Date(row.expires_at).getTime() : NaN);
+    note = 'the last conversation (job ' + jobId + ', parked at ' + row.current_step + ') EXPIRED '
+      + (age ? age + ' ago' : 'at an unrecorded time')
+      + ' — our own session bookkeeping, so the state machine has nowhere to route this reply';
+  } else if (status === 'completed') {
+    detail = NO_CONVO.COMPLETED;
+    note = 'the last conversation (job ' + jobId + ') was already COMPLETED by the customer — they are done, so this reply needs no automated answer';
+  } else if (status === 'closed_no_service') {
+    detail = NO_CONVO.CLOSED_NO_SERVICE;
+    note = 'the customer closed the last conversation (job ' + jobId + ') as SERVICE NOT REQUIRED — do not re-open it automatically';
+  } else {
+    // An unrecognised status is still a FACT, so print it rather than folding it
+    // into one of the four and being wrong in a new way.
+    detail = 'status_' + (status || 'unknown');
+    note = 'the last conversation (job ' + jobId + ') is in the unrecognised status "' + status + '"';
+  }
+
+  /*
+   * RE-ENGAGE ONLY THE EXPIRED CASE. completed / closed_no_service mean the
+   * customer already reached a decision; messaging them again would spam them and
+   * undo that decision. never_started has no job to link to.
+   */
+  const reengage = detail === NO_CONVO.EXPIRED ? await reengageExpired(row, pool) : 'not_applicable';
+  if (reengage === 'sent') note += '; we replied free-form with the confirmation link (their message re-opened the service window, so this cost no template and no send-count slot)';
+  else if (reengage === 'already_reengaged') note += '; already re-engaged once — not messaging them again';
+  else if (reengage === 'no_link') note += '; not re-engaging: no confirmation link could be built, and a message pointing at a missing link is worse than silence';
+  else if (reengage === 'job_not_unconfirmed') note += '; not re-engaging: the job is no longer Unconfirmed, so there is nothing left to confirm';
+  else if (reengage === 'send_failed') note += '; the re-engagement send FAILED after being claimed (see the warning above) — they get no second attempt';
+  else if (reengage === 'guard_failed') note += '; the re-engagement guards could not be read, so NOTHING was sent (see the warning above)';
+
+  logger.info({ jobId, conversationId: row ? row.conversation_id : null, detail, age, reengage },
+    'whatsapp-conversation: no ACTIVE conversation for this inbound — ' + note);
+  return { handled: false, reason: 'no_active_conversation', detail, age, jobId, reengage };
+}
+
 /*
  * handleInbound(inbound, pool)
  *
@@ -887,13 +1207,17 @@ async function captureCustomerGps(jobId, location, pool) {
  * builds:
  *   { from, messageId, type: 'text'|'button'|'location'|'image'|'video',
  *     text?, buttonId?, location?: {lat,lng}, media?: {url, kind:'image'|'video'} }
- * Returns { handled: boolean, step?, reason? }.
+ * Returns { handled: boolean, step?, reason? }. The no-active-conversation
+ * answer carries three more fields — detail / age / reengage — see
+ * explainNoActiveConversation above.
  */
 async function handleInbound(inbound, pool) {
   logger.info('Handling inbound WhatsApp message · type=' + (inbound && inbound.type));
   const convo = await getActiveByMobile(inbound.from, pool);
-  if (!convo) logger.info('No active WhatsApp conversation for inbound message');
-  if (!convo) return { handled: false, reason: 'no_active_conversation' };
+  // No active row is FOUR different situations, and one of them (an expired
+  // window) deserves a reply rather than silence. Diagnosing costs one query and
+  // only ever runs here — never on the path where the conversation resolves.
+  if (!convo) return await explainNoActiveConversation(inbound, pool);
 
   // Dedupe provider retries.
   if (inbound.messageId && convo.last_inbound_msg_id === inbound.messageId) {
@@ -901,11 +1225,32 @@ async function handleInbound(inbound, pool) {
     return { handled: false, reason: 'duplicate' };
   }
 
-  // Session expiry — free-form replies are only valid inside the 24h window.
+  // OUR session lapsed: the state machine's context is stale, so the row is
+  // retired rather than resumed. (This says nothing about DELIVERABILITY — the
+  // customer's inbound has just re-opened Meta's service window. Once the row is
+  // retired here, a further reply finds no active row and lands in
+  // explainNoActiveConversation, which answers the expired case free-form.)
   if (convo.expires_at && new Date(convo.expires_at).getTime() < Date.now()) {
     logger.info('WhatsApp conversation expired · job=' + convo.job_id);
     await updateConversation(convo.conversation_id, { status: 'expired' }, pool);
-    return { handled: false, reason: 'expired' };
+    /*
+     * ⚠ RE-ENGAGE HERE TOO — THIS is the message that arrives late.
+     *
+     * Without this the feature answers the wrong message. THIS branch handles a
+     * customer's FIRST text after the session lapsed: it flips the row to
+     * 'expired' and returns silently. Only their NEXT text finds no active row
+     * and reaches the re-engagement path below. So a customer who texts once —
+     * the ordinary case — got nothing at all, and the reply only ever went to
+     * someone who had already been ignored once.
+     *
+     * Safe to call from both sites: reengageExpired's claim is an atomic
+     * conditional UPDATE on `$.reengaged_at IS NULL`, so whichever path gets
+     * there first wins and the other is a no-op. The row is passed with the
+     * status we just wrote, because that is what it now is.
+     */
+    const reengage = await reengageExpired({ ...convo, status: 'expired' }, pool);
+    logger.info('WhatsApp late reply · job=' + convo.job_id + ' · reengage=' + reengage);
+    return { handled: false, reason: 'expired', reengage };
   }
 
   await updateConversation(convo.conversation_id, {
@@ -954,6 +1299,44 @@ async function handleInbound(inbound, pool) {
 
 // ── Prompts ─────────────────────────────────────────────────────────────
 
+/*
+ * phrase({ kind, ask, facts, fallback }) → the message body to send
+ *
+ * ⚠ THE BOUNDARY. AI PHRASES; IT NEVER DECIDES AND NEVER SUPPLIES FACTS.
+ *
+ * Every customer-facing message below still has its full deterministic copy
+ * written out inline — that copy is the PRODUCT, and it is what goes out
+ * whenever AI is off, unkeyed, erroring, slow, or writes something that fails
+ * validation. Generation is only ever allowed to improve on it.
+ *
+ * What crosses to ai.service is (a) the instruction the state machine chose and
+ * (b) the facts the state machine has already confirmed — never the job row,
+ * never the conversation history. What comes back is validated there (length,
+ * no unsupplied URL, no unsupplied digit sequence) before it can be returned.
+ * The reason is not stylistic: a model that invents an appointment time, a
+ * price, a technician name or a link has made a written commitment to a
+ * customer over WhatsApp that we then have to honour.
+ *
+ * NOTHING about the flow may depend on which text won. The step, the DB write
+ * and the next question are decided before this is called and are unchanged by
+ * its result (tests/whatsapp-conversation-phrasing.test.js drives the same
+ * inbound both ways and compares).
+ *
+ * ai.service.composeMessage already returns the fallback on every failure and
+ * never throws; the belt-and-braces guard here is what makes "AI off ⇒ today's
+ * bytes" true even if that contract is ever broken.
+ */
+async function phrase({ kind, ask, facts, fallback }) {
+  try {
+    const out = await ai.composeMessage({ kind, ask, facts, fallback });
+    if (out && out.generated && typeof out.text === 'string' && out.text.trim()) return out.text;
+    return fallback;
+  } catch (err) {
+    logger.warn({ kind, err: err && err.message }, 'whatsapp-conversation: ai phrasing failed — sending the deterministic copy');
+    return fallback;
+  }
+}
+
 // The three template choices, re-offered in-session when we could not read a
 // reply. The button IDs are the EXACT approved payload strings; the visible
 // TITLE spells "Reschedule" correctly (matchTemplateChoice accepts both, so the
@@ -974,14 +1357,22 @@ function sendChoiceButtons(to, body) {
 // frames, and this repo has no verified Gallabox interactive-LIST sender — so
 // we ask in text and parse the answer (deterministically first, ai.service as
 // the fallback for messy phrasing).
-function sendSlotPrompt(to, dateLabel, { retry = false } = {}) {
+async function sendSlotPrompt(to, dateLabel, { retry = false } = {}) {
   const head = retry
     ? 'Sorry, I couldn’t read that time.'
     : `Great — we’ll keep your visit on ${dateLabel}.`;
-  return gallabox.sendText({
-    to,
-    body: `${head}\n\nWhich 1-hour slot suits you best? Just reply with the start time (e.g. "10 AM" or "4 PM").\n\nAvailable slots:\n${ONE_HOUR_SLOT_LABELS.join('\n')}`,
+  const fallback = `${head}\n\nWhich 1-hour slot suits you best? Just reply with the start time (e.g. "10 AM" or "4 PM").\n\nAvailable slots:\n${ONE_HOUR_SLOT_LABELS.join('\n')}`;
+  const body = await phrase({
+    kind: retry ? 'ask_time_slot_retry' : 'ask_time_slot',
+    ask: retry
+      ? 'We could not read the time they just sent. Apologise in one line, then ask again which 1-hour slot they want, telling them to reply with the start time. List the available slots exactly as given, one per line.'
+      : 'Tell them their visit stays on the date given, then ask which 1-hour slot suits them, telling them to reply with the start time. List the available slots exactly as given, one per line.',
+    // The date is the one already in the conversation's context (what we asked
+    // them to confirm, or the future date they just gave us) — never re-derived.
+    facts: { 'visit date': dateLabel, 'available 1-hour slots': ONE_HOUR_SLOT_LABELS.join(', ') },
+    fallback,
   });
+  return gallabox.sendText({ to, body });
 }
 
 /*
@@ -997,21 +1388,33 @@ const RESCHEDULE_HEADS = Object.freeze({
   invalid:   'Let’s fix a date for your visit.',
   unclear:   'Sorry, I couldn’t read that date.',
 });
-function sendReschedulePrompt(to, { reason = null } = {}) {
+async function sendReschedulePrompt(to, { reason = null } = {}) {
   const head = RESCHEDULE_HEADS[reason] || 'No problem — we’ll move your visit.';
-  return gallabox.sendText({
-    to,
-    body: `${head}\n\nWhich date would you prefer? Please share a future date (e.g. "tomorrow", "5 Aug" or "05-08-2026").`,
+  const fallback = `${head}\n\nWhich date would you prefer? Please share a future date (e.g. "tomorrow", "5 Aug" or "05-08-2026").`;
+  const body = await phrase({
+    kind: 'ask_reschedule_date' + (reason ? `_${reason}` : ''),
+    // The WHY is the state machine's, not the model's — it already decided that
+    // the date passed / is missing / was unreadable.
+    ask: `Open with this, in your own words: "${head}" Then ask which future date they would prefer, and invite them to reply in any of the example formats given. Ask for a DATE only — the time is a separate question we ask next.`,
+    facts: { 'example date formats you may quote': 'tomorrow, 5 Aug, 05-08-2026' },
+    fallback,
   });
+  return gallabox.sendText({ to, body });
 }
 
-function sendCancelReasonPrompt(to, { retry = false } = {}) {
-  return gallabox.sendText({
-    to,
-    body: retry
-      ? 'Could you tell us in a few words why the service is not required? Your reply is passed on to our team as-is.'
-      : 'Understood. May I know the reason? Please reply in your own words — it helps us improve.',
+async function sendCancelReasonPrompt(to, { retry = false } = {}) {
+  const fallback = retry
+    ? 'Could you tell us in a few words why the service is not required? Your reply is passed on to our team as-is.'
+    : 'Understood. May I know the reason? Please reply in your own words — it helps us improve.';
+  const body = await phrase({
+    kind: retry ? 'ask_cancel_reason_retry' : 'ask_cancel_reason',
+    ask: retry
+      ? 'They did not give us a readable reason. Ask again, gently and in a few words, why the service is not required, and tell them their reply reaches our team as they wrote it. Do not argue or try to talk them out of it.'
+      : 'Acknowledge that they do not need the visit, then ask why, in their own words, explaining it helps us improve. Do not argue or try to talk them out of it.',
+    facts: {},
+    fallback,
   });
+  return gallabox.sendText({ to, body });
 }
 
 /*
@@ -1244,9 +1647,26 @@ async function finaliseConfirmed(convo, ctx, { date, slot }, to, pool, meta) {
     context: { ...payload, finalised: true },
   }, pool);
 
+  /*
+   * THE CLOSING MESSAGE — read back what we captured, warmly and CORRECTLY.
+   *
+   * ⚠ EVERY FACT HERE COMES FROM `payload`, i.e. from the values we JUST WROTE,
+   * never from anything the model remembers of the conversation. That is why
+   * the labels are re-derived from payload.confirmed_date / payload.slot_label
+   * rather than from `date` / `slot`: those two are the same values, but going
+   * through the payload makes it structurally true that the customer is read
+   * back the row, and keeps it true if the write path ever normalises a value.
+   */
+  const confirmedDateLabel = formatCustomerDateLabel(payload.confirmed_date);
+  const fallbackBody = `Your visit is confirmed ✅\n\n🗓️ ${confirmedDateLabel}\n⏰ ${payload.slot_label}\n\nOur technician will reach you within this 1-hour window. Thank you!`;
   await gallabox.sendText({
     to,
-    body: `Your visit is confirmed ✅\n\n🗓️ ${formatCustomerDateLabel(date)}\n⏰ ${slot.label}\n\nOur technician will reach you within this 1-hour window. Thank you!`,
+    body: await phrase({
+      kind: 'visit_confirmed',
+      ask: 'Confirm their visit is booked and read the details back clearly, on their own lines, so they can see the date and the time window at a glance. Say the technician will arrive within that 1-hour window, and close warmly. Add nothing else — no arrival promises, no names, no next steps.',
+      facts: { 'visit date': confirmedDateLabel, 'time window (1 hour)': payload.slot_label },
+      fallback: fallbackBody,
+    }),
   });
   await sendExtrasPrompt(to);
 

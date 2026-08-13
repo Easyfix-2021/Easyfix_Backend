@@ -151,16 +151,88 @@ function refuse(res, req, verdict, what) {
   return modernError(res, 401, 'unauthorized');
 }
 
+/*
+ * A body's KEY PATHS with the leaf VALUES replaced by their types. Shared by
+ * both diagnostic branches — the fully-unparseable one and the found-a-sender-
+ * but-no-content one — so a body can never be described one way in one log line
+ * and another way in the next.
+ *
+ * ⚠ KEYS ONLY, NEVER VALUES. An inbound WhatsApp body carries the customer's
+ * phone number and the words they typed. This is a diagnostic about SHAPE, and
+ * the moment it prints a value it becomes a PII leak in a log nobody audits.
+ */
+function shapeOf(o, depth = 0) {
+  if (!o || typeof o !== 'object' || depth > 2) return undefined;
+  const out = {};
+  for (const k of Object.keys(o).slice(0, 25)) {
+    const v = o[k];
+    out[k] = (v && typeof v === 'object' && !Array.isArray(v)) ? (shapeOf(v, depth + 1) || '{…}') : typeof v;
+  }
+  return out;
+}
+
 // Best-effort normaliser: Gallabox wraps the WhatsApp message in an event
 // envelope. We probe the common locations for each field.
+/*
+ * ⚠ SEARCH EVERY CANDIDATE ENVELOPE, don't commit to one.
+ *
+ * This was `const p = body.payload || body.message || body.data || body`, and
+ * `body.message` is present on the real Gallabox envelope — so it won the chain
+ * and every field was then read out of a nested object that does not hold them.
+ * The symptom was a conversation that existed, was `active`, and never once
+ * matched an inbound: `from` resolved to something other than the customer's
+ * number, and the reply text was at no probed path, so every message logged
+ * `type=unknown` and `no_active_conversation`.
+ *
+ * The identical defect was in normaliseStatus and had silently broken delivery
+ * receipts for as long as they have existed. One `||` chain over candidate
+ * envelopes, two functions, two outages — because the chain quietly asserts
+ * that the first non-null candidate is the right one, and says nothing when it
+ * is wrong.
+ *
+ * So: no choosing. Probe the SAME key names as before, across every plausible
+ * envelope, first hit wins. The key lists are deliberately unchanged — inventing
+ * new provider field names is the guess that started this. If a real reply still
+ * lands as `type=unknown`, the CONTENT NOT FOUND log prints the actual key paths
+ * and we widen from evidence.
+ */
+function inboundEnvelopes(body) {
+  const out = [];
+  const push = (o) => {
+    if (!o || typeof o !== 'object' || Array.isArray(o) || out.includes(o)) return;
+    out.push(o);
+    if (o.whatsapp && typeof o.whatsapp === 'object') out.push(o.whatsapp);
+  };
+  // Outermost first: a top-level field beats the same name nested inside
+  // `message`, which is where the previous chain went wrong.
+  push(body);
+  push(body.payload);
+  push(body.data);
+  push(body.message);
+  return out;
+}
+
+/** First non-empty value for any of `keys`, across all candidate envelopes. */
+function firstOf(envs, keys) {
+  for (const o of envs) {
+    for (const k of keys) {
+      const v = o[k];
+      if (v != null && v !== '') return v;
+    }
+  }
+  return null;
+}
+
 function normaliseInbound(body) {
   if (!body || typeof body !== 'object') return null;
-  const p = body.payload || body.message || body.data || body;
+  const envs = inboundEnvelopes(body);
+  // Kept so the existing per-field probes below read unchanged.
+  const p = envs[0];
   const wa = p.whatsapp || p;
 
-  const from = p.from || p.sender || p.phone || p.mobile || wa.from || null;
-  const messageId = p.id || p.messageId || wa.id || p.whatsappMessageId || null;
-  const rawType = (p.type || wa.type || '').toString().toLowerCase();
+  const from = firstOf(envs, ['from', 'sender', 'phone', 'mobile']);
+  const messageId = firstOf(envs, ['id', 'messageId', 'whatsappMessageId']);
+  const rawType = String(firstOf(envs, ['type']) || '').toLowerCase();
 
   // Interactive button reply — id is the stable thing we keyed our buttons on.
   //
@@ -170,27 +242,35 @@ function normaliseInbound(body) {
   // `title`/`text`. Probe all of them — whatsapp-conversation.service's
   // matchTemplateChoice() normalises case/whitespace and also accepts the raw
   // text, so any of these resolves to the right branch.
-  const interactive = p.interactive || wa.interactive || null;
-  const buttonReply = interactive?.button_reply || interactive?.reply || p.button || null;
+  const interactive = firstOf(envs, ['interactive']);
+  const buttonReply = interactive?.button_reply || interactive?.reply || firstOf(envs, ['button']);
   const buttonId = buttonReply?.id
     || buttonReply?.payload
     || buttonReply?.title
     || buttonReply?.text
-    || p.buttonId
+    || firstOf(envs, ['buttonId'])
     || p.payload?.id
     || null;
 
   // Location
-  const loc = p.location || wa.location || null;
+  const loc = firstOf(envs, ['location']);
   const lat = loc?.latitude ?? loc?.lat ?? null;
   const lng = loc?.longitude ?? loc?.lng ?? null;
 
   // Media (image/video) — Gallabox typically gives a hosted url.
-  const mediaObj = p.image || p.video || p.media || wa.image || wa.video || null;
+  const mediaObj = firstOf(envs, ['image', 'video', 'media']);
   const mediaUrl = mediaObj?.url || mediaObj?.link || mediaObj?.mediaUrl || null;
 
-  // Text
-  const text = (p.text && (p.text.body || p.text)) || p.body || wa.text?.body || null;
+  /*
+   * Text arrives either as a string or as { body }. Resolved across envelopes
+   * for the same reason as everything else above — the customer's words being
+   * one level further in than we looked is exactly what produced `type=unknown`
+   * on every real reply.
+   */
+  const textRaw = firstOf(envs, ['text', 'body']);
+  const text = (textRaw && typeof textRaw === 'object')
+    ? (textRaw.body || null)
+    : (textRaw || null);
 
   let type = 'unknown';
   if (buttonId) type = 'button';
@@ -224,13 +304,76 @@ function normaliseInbound(body) {
 // is optimistically seeded 'sent' at dispatch, so "no failure callback" already
 // reads as sent. Field-probing is tolerant of the envelope shape.
 const DELIVERY_FAILURE_STATES = new Set(['failed', 'undelivered']);
+
+/*
+ * ⚠ RECOGNISE a receipt even when we do not ACT on one.
+ *
+ * The paragraph above is right that only failures deserve a DB write — but the
+ * first version expressed that by returning null for every non-failure, which
+ * dropped `sent`/`delivered`/`read` into the UNPARSEABLE branch below. Those
+ * three fire for EVERY message we send, so roughly half the webhook log became
+ * a WARN reading "normaliseInbound found no actionable fields … widen the
+ * probes" — advice that is simply wrong. Nothing needs widening: a receipt is
+ * not a customer message and never will be.
+ *
+ * The cost is not CPU, it is that UNPARSEABLE stopped meaning anything. It
+ * exists to say "a customer sent something we could not read", which is a real
+ * and urgent thing, and it was firing constantly for traffic that is entirely
+ * normal. So receipts are identified here and acknowledged quietly; only
+ * failures carry `actionable`.
+ *
+ * Identified by SHAPE, not by an allow-list of status words: a delivery receipt
+ * carries a recipient and a message id and no message content. Guessing at the
+ * provider's vocabulary is what produced the original gap.
+ */
+const DELIVERY_STATUS_STATES = new Set([
+  'sent', 'delivered', 'read', 'failed', 'undelivered', 'deleted', 'accepted', 'queued',
+]);
+
+function looksLikeReceipt(p) {
+  if (!p || typeof p !== 'object') return false;
+  const hasRecipient = p.recipient_id != null
+    || (p.message && typeof p.message === 'object' && p.message.recipient_id != null);
+  const state = String(p.status || p.deliveryStatus || p.event || '').toLowerCase();
+  // A status word we know, OR the recipient_id + errors envelope Gallabox sends.
+  return DELIVERY_STATUS_STATES.has(state) || (hasRecipient && 'errors' in p);
+}
+
 function normaliseStatus(body) {
   if (!body || typeof body !== 'object') return null;
-  const p = body.payload || body.data || body.message || body;
+  /*
+   * ⚠ PICK THE ENVELOPE THAT ACTUALLY CARRIES THE STATUS, don't take the first
+   * truthy probe.
+   *
+   * This was `body.payload || body.data || body.message || body`, and the real
+   * Gallabox receipt is shaped:
+   *
+   *   { id, status, timestamp, errors, recipient_id, message: { recipient_id } }
+   *
+   * — status and errors at the TOP, and a nested `message` that holds only a
+   * recipient. So `body.message` won the || chain and shadowed the whole
+   * envelope: `p.status` was undefined, `s` was '', and the function returned
+   * null for EVERY receipt. Not just the routine ones — the FAILURES too, which
+   * means the "Delivery Failed" chip this code exists to drive has never once
+   * been populated for this provider.
+   *
+   * An || chain over candidate envelopes silently assumes the first non-null one
+   * is the right one. Choose by content instead: whichever candidate looks like
+   * a receipt is the receipt.
+   */
+  const candidates = [body.payload, body.data, body, body.message]
+    .filter((o) => o && typeof o === 'object');
+  const p = candidates.find(looksLikeReceipt) || candidates[0] || body;
   const s = String(p.status || p.deliveryStatus || p.event || '').toLowerCase();
-  if (!DELIVERY_FAILURE_STATES.has(s)) return null;
+  // Not a receipt at all → let the inbound normaliser have it.
+  if (!looksLikeReceipt(p) && !DELIVERY_FAILURE_STATES.has(s)) return null;
+  if (!DELIVERY_FAILURE_STATES.has(s)) {
+    // A receipt we deliberately do not act on. Returned rather than nulled so
+    // the route can acknowledge it without calling it unparseable.
+    return { actionable: false, status: s || 'unknown' };
+  }
   const msgId = p.whatsappMessageId || p.messageId || p.id || p.channelMessageId || null;
-  if (!msgId) return null;
+  if (!msgId) return { actionable: false, status: s };
   const errObj = p.failedReason || p.error || (Array.isArray(p.errors) ? p.errors[0] : null) || null;
   const reason = errObj
     ? String(errObj.message || errObj.title || errObj.reason || errObj.code || '').slice(0, 255)
@@ -265,6 +408,16 @@ router.post('/whatsapp', inboundCeiling, authBreaker.guard, async (req, res) => 
   // affectedRows 0, benign (covers non-magic-link sends). Always 200 so the BSP
   // doesn't retry-storm. Column-tolerant: pre-migration deploys just log + skip.
   const statusCb = normaliseStatus(req.body);
+  /*
+   * A receipt we do not act on: sent / delivered / read. Acknowledged at DEBUG
+   * so it stops drowning the log, and so UNPARSEABLE below goes back to meaning
+   * "a CUSTOMER sent something we could not read" — the only reading that is
+   * worth waking up for.
+   */
+  if (statusCb && statusCb.actionable === false) {
+    logger.debug('WhatsApp delivery receipt · status=' + statusCb.status + ' — noted, no action');
+    return modernOk(res, { received: true, status: statusCb.status, handled: false });
+  }
   if (statusCb) {
     try {
       const [r] = await pool.query(
@@ -272,7 +425,27 @@ router.post('/whatsapp', inboundCeiling, authBreaker.guard, async (req, res) => 
           WHERE magic_link_provider_msg_id = ?`,
         [statusCb.status, statusCb.reason, statusCb.msgId],
       );
-      logger.info('WhatsApp status callback · status=' + statusCb.status + ' msgId=' + statusCb.msgId + ' matchedJobs=' + (r && r.affectedRows != null ? r.affectedRows : 0));
+      const matched = (r && r.affectedRows != null) ? r.affectedRows : 0;
+      /*
+       * matchedJobs=0 ON A FAILURE IS NOT ROUTINE — it is the chip silently not
+       * lighting, and it deserves to be loud.
+       *
+       * The UPDATE keys on magic_link_provider_msg_id, seeded from the Gallabox
+       * SEND response; the receipt carries whatever id the RECEIPT uses. If those
+       * are different id spaces, this matches nothing, forever, and the whole
+       * delivery-failure surface stays blank while looking healthy. Zero is
+       * legitimate for a send this feature did not make (an OTP, a notification),
+       * so it cannot be an error — but on a genuine failure it is the one number
+       * worth reading, and at INFO nobody was going to.
+       */
+      if (matched === 0) {
+        logger.warn('WhatsApp status callback · status=' + statusCb.status + ' msgId=' + statusCb.msgId
+          + ' matchedJobs=0 — no job carries this provider message id. Either the send was not a '
+          + 'magic-link/conversation message, or the receipt id and the id stored at send time are '
+          + 'different id spaces, in which case the Delivery Failed chip can never light.');
+      } else {
+        logger.info('WhatsApp status callback · status=' + statusCb.status + ' msgId=' + statusCb.msgId + ' matchedJobs=' + matched);
+      }
     } catch (err) {
       logger.warn({ err: err && err.message }, 'whatsapp status callback update failed (pre-migration columns?)');
     }
@@ -297,16 +470,7 @@ router.post('/whatsapp', inboundCeiling, authBreaker.guard, async (req, res) => 
      * Keys only — never values. An inbound WhatsApp body carries the customer's
      * phone number and message text, and this log line is not the place for it.
      */
-    const shape = (o, depth = 0) => {
-      if (!o || typeof o !== 'object' || depth > 2) return undefined;
-      const out = {};
-      for (const k of Object.keys(o).slice(0, 25)) {
-        const v = o[k];
-        out[k] = (v && typeof v === 'object' && !Array.isArray(v)) ? (shape(v, depth + 1) || '{…}') : typeof v;
-      }
-      return out;
-    };
-    logger.warn({ bodyShape: shape(req.body) },
+    logger.warn({ bodyShape: shapeOf(req.body) },
       'WhatsApp inbound · UNPARSEABLE — normaliseInbound found no actionable fields. '
       + 'Compare the key paths above with normaliseInbound() and widen the probes.');
     return modernOk(res, { received: true, handled: false });
@@ -318,6 +482,23 @@ router.post('/whatsapp', inboundCeiling, authBreaker.guard, async (req, res) => 
     // a mismatch here is the difference between the reschedule branch and
     // nothing at all. It is not PII — it is one of three fixed constants.
     + (inbound.buttonId ? ' buttonId="' + String(inbound.buttonId).slice(0, 60) + '"' : ''));
+
+  /*
+   * `type=unknown` means we found a SENDER but no content — the message came
+   * from a real customer and normaliseInbound could not tell what they said.
+   * That is a probe gap, and it is invisible today: the shape is logged only on
+   * the fully-unparseable path, so the one case that could tell us where the
+   * text actually lives is the one case that never prints it.
+   *
+   * Keys only, same helper and same rule as below: an inbound body carries the
+   * customer's number and their words, and neither belongs in a log line.
+   */
+  if (inbound.type === 'unknown') {
+    logger.warn({ bodyShape: shapeOf(req.body) },
+      'WhatsApp inbound · CONTENT NOT FOUND — a real sender, but no text, button, '
+      + 'location or media at any probed path. The key paths above are where their '
+      + 'reply actually is; widen normaliseInbound() to match.');
+  }
   try {
     const result = await convo.handleInbound(inbound, pool);
     const handled = result && result.handled;

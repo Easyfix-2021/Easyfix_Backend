@@ -31,6 +31,23 @@ const logger = require('../logger');
  * so the caller falls back to a re-prompt (never crashes the conversation).
  * sophy.chatJson returns null on ANY failure, which maps to the same safe
  * 'unclear' outcome — the conversation always degrades to a plain re-ask.
+ *
+ * ─── TWO EXPORTS, TWO VERY DIFFERENT POWERS ────────────────────────────────
+ *
+ * interpretReply INTERPRETS inbound text. composeMessage (added 2026-08-13)
+ * PHRASES outbound text. The second one is the dangerous one, so the boundary
+ * is stated once, here, and enforced in code below:
+ *
+ *   AI PHRASES. IT NEVER DECIDES, AND IT NEVER SUPPLIES FACTS.
+ *
+ * The state machine still chooses the next step and still owns every DB write.
+ * composeMessage is handed the QUESTION to ask and the ALREADY-CONFIRMED facts,
+ * is told to use nothing else, and its output is VALIDATED (non-empty,
+ * length-bounded, no URL we did not supply, no digit-sequence absent from the
+ * supplied facts) before it can reach a customer. Anything that fails returns
+ * the caller's own deterministic copy instead. That matters because this text
+ * goes to a customer over WhatsApp, in writing: an invented appointment time, a
+ * price, a technician name or a link is a commitment we then have to honour.
  */
 
 const sophy = require('./sophy.service');
@@ -156,4 +173,204 @@ async function interpretReply({ step, text, timeSlots = [] }) {
   }
 }
 
-module.exports = { interpretReply, aiEnabled };
+// ── Outbound phrasing (composeMessage) ──────────────────────────────────
+
+/*
+ * A generated customer message is capped well under WhatsApp's 4096-char body
+ * limit. The cap is a SAFETY bound, not a formatting preference: a model that
+ * starts rambling (or echoes its own instructions back) must be rejected rather
+ * than delivered, and every message this flow sends is 2–6 short lines.
+ */
+const GEN_MAX_CHARS = 700;
+
+/*
+ * Hard ceiling on how long a customer waits for phrasing. Read per call (not
+ * captured at require time) so ops can retune it without a redeploy, and so
+ * tests can shrink it.
+ *
+ * ⚠ This is a bound on OUR WAIT, not a cancellation: the underlying fetch keeps
+ * running and its result is simply ignored. That is the correct trade here —
+ * the customer's reply must never sit behind a slow model, and abandoning one
+ * in-flight HTTP call costs nothing we care about.
+ */
+const genTimeoutMs = () => {
+  const n = Number(process.env.AI_CONVERSATION_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : 6000;
+};
+
+const TIMED_OUT = Symbol('sophy_timeout');
+
+function withTimeout(promise, ms) {
+  let timer = null;
+  const guard = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(TIMED_OUT), ms);
+    // Never hold the process open for a timer nobody is waiting on.
+    if (timer && typeof timer.unref === 'function') timer.unref();
+  });
+  return Promise.race([promise, guard]).finally(() => { if (timer) clearTimeout(timer); });
+}
+
+/*
+ * A URL in a customer message is a place we are sending them. The model may
+ * never choose one — so ANY link-shaped token that is not present verbatim in
+ * the supplied facts rejects the whole message.
+ *
+ * Deliberately over-broad (it matches bare "easyfix.in/xyz" and "www.…", not
+ * just http(s)): a false positive costs us the deterministic fallback, while a
+ * false negative sends a customer to an address a language model made up.
+ */
+const URL_RE = /(?:https?:\/\/|www\.)[^\s<>"')]+|\b[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.(?:com|in|net|org|io|co|me|app|link|xyz)\b[^\s<>"')]*/gi;
+
+// Digit runs, compared with leading zeros stripped so the '05' we supply in
+// "Wed, 05 Aug 2026" also licenses a natural "5 Aug". Everything else must
+// match a run we actually handed over.
+function digitRuns(s) {
+  return (String(s == null ? '' : s).match(/\d+/g) || []).map((d) => d.replace(/^0+(?=\d)/, ''));
+}
+
+/*
+ * validateGenerated(text, { allowed, maxChars })
+ *   → { ok: true, text } | { ok: false, reason }
+ *
+ * The gate every generated message passes before it can reach a customer.
+ * `allowed` is the concatenation of everything the state machine SUPPLIED (the
+ * instruction + the confirmed facts) — the model's entire permitted vocabulary
+ * of links and numbers.
+ *
+ * Each rejection reason is a distinct way to mislead someone, which is why they
+ * are reported separately rather than as one "invalid":
+ *   empty            — nothing to send
+ *   too_long         — a runaway generation, not a message
+ *   unsupplied_url   — a link we never minted (phishing-shaped, at best a 404)
+ *   unsupplied_number— a time, price, date or phone number we never confirmed
+ */
+function validateGenerated(text, { allowed, maxChars = GEN_MAX_CHARS } = {}) {
+  // Models like to wrap a one-line answer in quotes; strip that one wrapper
+  // before judging, since it is presentation noise rather than content.
+  let out = String(text == null ? '' : text).trim();
+  if (/^"[\s\S]+"$/.test(out) || /^'[\s\S]+'$/.test(out)) out = out.slice(1, -1).trim();
+  if (!out) return { ok: false, reason: 'empty' };
+  if (out.length > maxChars) return { ok: false, reason: 'too_long' };
+
+  const allowedText = String(allowed == null ? '' : allowed);
+  const allowedUrls = new Set((allowedText.match(URL_RE) || []).map((u) => u.toLowerCase()));
+  for (const url of out.match(URL_RE) || []) {
+    if (!allowedUrls.has(url.toLowerCase())) return { ok: false, reason: 'unsupplied_url' };
+  }
+  const allowedNums = new Set(digitRuns(allowedText));
+  for (const n of digitRuns(out)) {
+    if (!allowedNums.has(n)) return { ok: false, reason: 'unsupplied_number' };
+  }
+  return { ok: true, text: out };
+}
+
+/*
+ * composeMessage({ kind, ask, facts, fallback, maxChars })
+ *
+ * PHRASING ONLY — the generative twin of interpretReply, on the same Sophy
+ * client and the same per-feature key, with the same contract: it NEVER throws
+ * and ALWAYS returns a normalised result.
+ *
+ * kind     — a short label for the message being written (logged, and given to
+ *            the model as its purpose). Never a decision.
+ * ask      — what the message must DO, decided by the state machine.
+ * facts    — the ONLY facts the model may state. Values the state machine has
+ *            already confirmed (and, for a confirmation message, values it has
+ *            already WRITTEN). The model gets nothing else — no conversation
+ *            history, no job row, no customer record.
+ * fallback — the caller's deterministic copy. REQUIRED: without something safe
+ *            to fall back to there is nothing to gain by trying, so we do not.
+ *
+ * Returns { text, generated, reason }:
+ *   text      — what to send. The validated generation, or `fallback` verbatim.
+ *   generated — true only when a model wrote the text that is being returned.
+ *   reason    — why we fell back ('disabled' | 'no_fallback' | 'sophy_unavailable'
+ *               | 'timeout' | 'network' | a validateGenerated reason).
+ *
+ * AI off / key missing / Sophy erroring / Sophy slow ⇒ `fallback`, byte for
+ * byte. That is the whole safety story: the deterministic copy stays the
+ * product, and generation is only ever allowed to improve on it.
+ */
+async function composeMessage({ kind, ask, facts = {}, fallback, maxChars = GEN_MAX_CHARS } = {}) {
+  const safe = typeof fallback === 'string' ? fallback : '';
+  if (!safe.trim()) return { text: safe, generated: false, reason: 'no_fallback' };
+  if (!aiEnabled()) return { text: safe, generated: false, reason: 'disabled' };
+
+  // Only non-empty facts are offered — a "date: null" line invites the model to
+  // fill the blank, which is precisely what it must not do.
+  const factLines = Object.entries(facts || {})
+    .filter(([, v]) => v != null && String(v).trim() !== '')
+    .map(([k, v]) => `- ${k}: ${String(v).trim()}`);
+  const askText = String(ask || '').trim();
+
+  const system = [
+    'You are a customer-support agent for an Indian home-services company, writing ONE short WhatsApp message to a customer.',
+    'Write only the message itself — no preamble, no explanation, no surrounding quotes, no markdown headings.',
+    'Use ONLY the facts listed below. You know nothing else about this customer, this booking or this company.',
+    'NEVER invent or change a date, a time, a price, an amount, a name, a phone number, an address or a link. If a detail is not in the facts, do not mention it.',
+    'Do not include any URL, web address or phone number.',
+    'Do not promise anything the facts do not state — no discounts, no technician names, no arrival guarantees beyond what is given.',
+    `Keep it under ${maxChars} characters. Warm, plain, human English. A little emoji is fine. Line breaks are fine.`,
+    'Reply with the message text only.',
+  ].join('\n');
+
+  const user = [
+    `Purpose: ${kind || 'message'}`,
+    `What this message must do: ${askText}`,
+    factLines.length
+      ? `Confirmed facts (the ONLY facts you may state):\n${factLines.join('\n')}`
+      : 'Confirmed facts: none — state no specifics at all.',
+  ].join('\n');
+
+  // The model's entire permitted vocabulary of links and numbers: what we asked
+  // for, plus what we supplied. Nothing else may appear in the output.
+  const allowed = `${askText}\n${factLines.join('\n')}`;
+
+  try {
+    /*
+     * chatText, not chatJson — this is prose, and chatJson is just chatText plus
+     * a parse, so there is ONE HTTP path either way (sophy.chatText).
+     *
+     * A key configured JSON-mode at the Sophy end will still wrap the answer
+     * ({"message": "…"}), so the loose parser is tried on the way out and the
+     * `message` field unwrapped when present. A plain-prose reply parses to null
+     * and is used as-is — both key modes therefore work without a config here.
+     */
+    const raw = await withTimeout(
+      sophy.chatText({ system, user, maxTokens: 320, apiKey: conversationKey() }),
+      genTimeoutMs(),
+    );
+    if (raw === TIMED_OUT) {
+      logger.warn('AI phrasing timed out · kind=' + kind + ' — sending the deterministic copy');
+      return { text: safe, generated: false, reason: 'timeout' };
+    }
+    if (!raw) {
+      logger.warn('AI phrasing unavailable · kind=' + kind);
+      return { text: safe, generated: false, reason: 'sophy_unavailable' };
+    }
+    const wrapped = sophy.parseJsonLoose(raw);
+    const candidate = wrapped && typeof wrapped.message === 'string' ? wrapped.message : raw;
+
+    const check = validateGenerated(candidate, { allowed, maxChars });
+    if (!check.ok) {
+      // WARN, not INFO: a rejection means the model tried to tell a customer
+      // something we never gave it, and that is worth seeing in the logs.
+      logger.warn('AI phrasing REJECTED · kind=' + kind + ' · reason=' + check.reason + ' — sending the deterministic copy');
+      return { text: safe, generated: false, reason: check.reason };
+    }
+    logger.info('AI phrased message · kind=' + kind + ' · chars=' + check.text.length);
+    return { text: check.text, generated: true };
+  } catch (err) {
+    logger.warn('AI phrasing error · ' + (err && err.message));
+    return { text: safe, generated: false, reason: 'network' };
+  }
+}
+
+module.exports = {
+  interpretReply,
+  composeMessage,
+  aiEnabled,
+  // Exported for the phrasing tests — the validator is the safety property, so
+  // it is exercised directly as well as through composeMessage.
+  validateGenerated,
+};
