@@ -5,6 +5,11 @@ const { pool } = require('../../db');
 const logger = require('../../logger');
 const { modernOk, modernError } = require('../../utils/response');
 const { assertActiveAadhaarAvailable } = require('../../utils/aadhaar-uniqueness');
+// Training videos are the LMS content catalogue; the reference counts and the
+// list projection live with the rest of the LMS logic rather than being
+// restated here. The ROUTES stay in this file because the technician app and
+// the CRM have always read this table through /aux/training-videos.
+const lms = require('../../services/lms.service');
 
 /*
  * Auxiliary admin endpoints — attendance, training videos, materials,
@@ -150,14 +155,73 @@ router.delete('/materials/:id', async (req, res, next) => {
 });
 
 // ─── Training videos ────────────────────────────────────────────────
-router.get('/training-videos', async (req, res, next) => {
+/*
+ * The LMS content catalogue. Beyond the plain columns, each row carries:
+ *
+ *   progress_count — technicians holding watched progress against this video
+ *   course_count   — courses that include it
+ *
+ * Both exist so the CRM can show an operator WHY a delete will be refused
+ * before they click it, rather than surfacing a 409 as a surprise.
+ *
+ * Response shape is {rows, total, limit, offset}, not a bare array. Nothing
+ * consumed the previous array form (verified 2026-08-13 across the CRM and
+ * this repo) — the technician app reads the separate /api/mobile route.
+ */
+router.get('/training-videos', validate(Joi.object({
+  q: Joi.string().allow('', null).optional(),
+  limit: Joi.number().integer().min(1).max(1000).default(200),
+  offset: Joi.number().integer().min(0).default(0),
+}), 'query'), async (req, res, next) => {
   try {
-    logger.info('List training videos');
-    const [rows] = await pool.query(
-      'SELECT id, title, description, sub_title, sub_description FROM training_videos ORDER BY id DESC'
+    logger.info('List training videos · q=' + (req.query.q || ''));
+    modernOk(res, await lms.listVideos(req.query));
+  } catch (e) { next(e); }
+});
+
+router.patch('/training-videos/:id', validate(Joi.object({
+  id: Joi.number().integer().positive().required(),
+}), 'params'), validate(Joi.object({
+  title: Joi.string().trim().min(1).max(255).optional(),
+  description: Joi.string().max(2000).allow('', null).optional(),
+  sub_title: Joi.string().max(255).allow('', null).optional(),
+  sub_description: Joi.string().max(2000).allow('', null).optional(),
+  video_url: Joi.string().max(500).allow('', null).optional(),
+}).min(1)), async (req, res, next) => {
+  try {
+    /*
+     * video_url lives on the joined document row, so it is applied separately
+     * from the training_videos column writes. An edit that ONLY changes the
+     * link is legitimate, which is why the column UPDATE below is skipped
+     * rather than run with an empty SET (that would be a syntax error).
+     */
+    if (req.body.video_url !== undefined) {
+      await lms.setVideoLink(req.params.id, req.body.video_url, req.user?.user_id ?? null);
+    }
+    const sets = [];
+    const params = [];
+    /*
+     * Each field is written with a plain placeholder rather than
+     * COALESCE(?, col). COALESCE only falls back on NULL — an empty string
+     * passes through it and blanks the column while looking like a guard.
+     * Clearing a sub-title is a legitimate edit, so '' is stored as NULL
+     * explicitly and only the fields actually sent are touched.
+     */
+    for (const field of ['title', 'description', 'sub_title', 'sub_description']) {
+      if (req.body[field] === undefined) continue;
+      sets.push(`${field} = ?`);
+      params.push(req.body[field] === '' ? null : req.body[field]);
+    }
+    logger.info('Update training video · id=' + req.params.id + ' · fields=' + sets.length);
+    // A link-only edit leaves `sets` empty; setVideoLink already 404s on an
+    // unknown id, so there is nothing left to do and an empty SET would throw.
+    if (!sets.length) return modernOk(res, { updated: true });
+    const [r] = await pool.query(
+      `UPDATE training_videos SET ${sets.join(', ')} WHERE id = ?`,
+      [...params, req.params.id],
     );
-    logger.info('Found ' + rows.length + ' training videos');
-    modernOk(res, rows);
+    if (r.affectedRows === 0) return modernError(res, 404, 'video not found');
+    modernOk(res, { updated: true });
   } catch (e) { next(e); }
 });
 
@@ -166,27 +230,89 @@ router.post('/training-videos', validate(Joi.object({
   description: Joi.string().max(2000).allow('', null).optional(),
   sub_title: Joi.string().max(255).allow('', null).optional(),
   sub_description: Joi.string().max(2000).allow('', null).optional(),
+  // Stored via the legacy document row, not as a column here — see setVideoLink.
+  video_url: Joi.string().max(500).allow('', null).optional(),
 })), async (req, res, next) => {
   try {
     logger.info('Add training video · title=' + req.body.title);
+    /*
+     * Validate the link BEFORE inserting the row. setVideoLink would reject a
+     * non-YouTube URL with a 400 anyway, but by then the catalogue row exists
+     * and the operator gets an error on a video that was silently created —
+     * they retry, and end up with duplicates.
+     */
+    if (String(req.body.video_url || '').trim() && !lms.parseYouTubeUrl(req.body.video_url)) {
+      return modernError(res, 400, 'video link must be a YouTube URL');
+    }
     const [ins] = await pool.query(
       `INSERT INTO training_videos (title, description, sub_title, sub_description)
        VALUES (?, ?, ?, ?)`,
       [req.body.title, req.body.description || null,
        req.body.sub_title || null, req.body.sub_description || null]
     );
+    if (String(req.body.video_url || '').trim()) {
+      await lms.setVideoLink(ins.insertId, req.body.video_url, req.user?.user_id ?? null);
+    }
+    lms.invalidateVideoIdCache();
     logger.info('Training video created · id=' + ins.insertId);
     res.status(201);
     modernOk(res, { id: ins.insertId });
   } catch (e) { next(e); }
 });
 
+/*
+ * Deleting a training video is REFUSED while anything references it.
+ *
+ * This table and easyfixer_watched_video are both MyISAM. MySQL accepts
+ * foreign keys on MyISAM and then silently ignores them, so the constraints
+ * that appear on easyfixer_watched_video are decorative — they read as a
+ * guarantee and enforce nothing. This route was the only thing standing
+ * between an operator and orphaned progress, and it did not stand:
+ * 5 progress rows across 3 deleted video ids were already stranded before
+ * this guard existed (measured 2026-08-13).
+ *
+ * Refusal rather than soft-delete is deliberate. training_videos is a legacy
+ * Java table that the technician app reads directly through
+ * /api/mobile/training-videos; adding a status column would mean teaching
+ * every existing reader to filter on it, and a reader that forgot would keep
+ * serving withdrawn content. A 409 that names the blocking count costs the
+ * operator one extra step and cannot fail silently. The counts are also on
+ * the list response, so the CRM can disable the button before it is clicked.
+ *
+ * Escape hatch: unassign the video from its courses and the course side
+ * clears; progress rows are historical fact and are never bulk-deleted here.
+ */
 router.delete('/training-videos/:id', async (req, res, next) => {
   try {
     logger.info('Delete training video · id=' + req.params.id);
+    const [exists] = await pool.query('SELECT id FROM training_videos WHERE id = ?', [req.params.id]);
+    if (!exists.length) {
+      logger.warn('Training video not found · id=' + req.params.id);
+      return modernError(res, 404, 'video not found');
+    }
+
+    const [progressCount, courseCount] = await Promise.all([
+      lms.videoProgressCount(req.params.id),
+      lms.videoCourseCount(req.params.id),
+    ]);
+    if (progressCount > 0 || courseCount > 0) {
+      const blockers = [];
+      if (progressCount > 0) blockers.push(`${progressCount} technician progress record(s)`);
+      if (courseCount > 0) blockers.push(`${courseCount} course(s)`);
+      logger.warn('Training video delete refused · id=' + req.params.id
+        + ' · progress=' + progressCount + ' · courses=' + courseCount);
+      return modernError(
+        res, 409,
+        `cannot delete this video — it is referenced by ${blockers.join(' and ')}`,
+        { progress_count: progressCount, course_count: courseCount },
+      );
+    }
+
     const [r] = await pool.query('DELETE FROM training_videos WHERE id = ?', [req.params.id]);
-    if (r.affectedRows === 0) logger.warn('Training video not found · id=' + req.params.id);
     if (r.affectedRows === 0) return modernError(res, 404, 'video not found');
+    // Drop the id cache so the mobile validator cannot keep accepting progress
+    // for this video for the rest of its TTL.
+    lms.invalidateVideoIdCache();
     logger.info('Training video deleted · id=' + req.params.id);
     modernOk(res, { deleted: true });
   } catch (e) { next(e); }

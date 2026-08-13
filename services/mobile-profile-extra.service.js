@@ -2,6 +2,11 @@ const { pool } = require('../db');
 const logger = require('../logger');
 const s3Storage = require('../utils/s3-storage');
 const { writeBuffer } = require('../utils/file-storage');
+// LMS completion -> lifecycle wire; see maybeAdvanceTrainingLifecycle below.
+// Neither module requires this one, so these are plain top-level requires
+// rather than lazy ones — there is no cycle to break.
+const lms = require('./lms.service');
+const lifecycle = require('./easyfixer-lifecycle.service');
 
 /*
  * mobile-profile-extra.service — backing logic for routes/mobile/profile-extra.js.
@@ -546,7 +551,52 @@ async function setTrainingPercentage(efrId, videoId, watchedPercentage) {
     [efrId, videoId, watchedPercentage],
   );
   logger.info('Training watched-% saved · videoId=' + videoId);
+  await maybeAdvanceTrainingLifecycle(efrId, watchedPercentage);
   return { videoId, watchedPercentage };
+}
+
+/*
+ * LMS completion -> lifecycle. Advances a technician out of TRAINING_PENDING
+ * once every video of every course assigned to them is finished.
+ *
+ * Three properties this has to hold, in order of importance:
+ *
+ * 1. IT MUST NOT BREAK PROGRESS RECORDING. The upsert above has already
+ *    committed by the time this runs, and everything here is wrapped so a
+ *    failure degrades to a warning. A technician's progress being saved must
+ *    never depend on the lifecycle machinery being healthy — this endpoint is
+ *    part of the offline-reliability contract and the app replays it.
+ *
+ * 2. IT MUST NOT ADD QUERIES TO THE HOT PATH. Progress pings arrive
+ *    continuously while a video plays, and only the final one can possibly
+ *    complete anything. The threshold check below is a pure comparison on an
+ *    argument we already have, so an in-progress ping costs zero extra
+ *    round-trips and setTrainingPercentage stays the single atomic statement
+ *    its concurrency test asserts.
+ *
+ * 3. IT MUST BE IDEMPOTENT. Replays are expected. finalizeTrainingCompletion
+ *    resolves any non-TRAINING_PENDING status to itself, which the lifecycle
+ *    service turns into a protected no-op — no version bump, no log row — so
+ *    a repeated 100% ping after the technician has already advanced does
+ *    nothing at all.
+ */
+async function maybeAdvanceTrainingLifecycle(efrId, watchedPercentage) {
+  if (Number(watchedPercentage) < lms.COMPLETION_PERCENT) return;
+  try {
+    const { complete, required, done } = await lms.isTrainingComplete(efrId);
+    if (!complete) {
+      logger.info('Training not yet complete · efrId=' + efrId + ' · ' + done + '/' + required);
+      return;
+    }
+    const result = await lifecycle.finalizeTrainingCompletion(efrId);
+    if (result.changed) {
+      logger.info('Training complete → lifecycle advanced · efrId=' + efrId
+        + ' · from=' + result.transitionedFrom);
+    }
+  } catch (e) {
+    // Deliberately swallowed — see property 1 above.
+    logger.warn('Training completion lifecycle advance failed · efrId=' + efrId + ' · ' + e.message);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────

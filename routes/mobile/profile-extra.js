@@ -5,6 +5,7 @@ const multer = require('multer');
 const validate = require('../../middleware/validate');
 const { modernOk, modernError } = require('../../utils/response');
 const svc = require('../../services/mobile-profile-extra.service');
+const lms = require('../../services/lms.service');
 const withdrawalService = require('../../services/withdrawal.service');
 const { pool } = require('../../db');
 const logger = require('../../logger');
@@ -209,6 +210,25 @@ router.post('/training-videos/percentage', validate(Joi.object({
 })), async (req, res, next) => {
   try {
     logger.info(`Set training video percentage · videoId=${req.body.videoId} watched=${req.body.watchedPercentage}%`);
+    /*
+     * The id must name a real row in training_videos. Joi only proves it is a
+     * positive integer, and easyfixer_watched_video is MyISAM — its foreign
+     * keys are parsed and silently ignored — so nothing else stands between a
+     * wrong id and a permanently unmatchable progress row.
+     *
+     * That is not hypothetical: five such rows exist, all carrying
+     * `training_video_id` values (the FK into the legacy document table)
+     * where `training_videos.id` was expected. Two id spaces, one column.
+     *
+     * Rejected as 400 rather than swallowed. A silent accept would let a
+     * mis-integrated client believe progress was recorded while the LMS
+     * report never counts it, which is the failure mode that produced the
+     * existing bad rows.
+     */
+    if (!(await lms.isKnownVideo(req.body.videoId))) {
+      logger.warn('Rejected training progress for unknown videoId=' + req.body.videoId);
+      return modernError(res, 400, 'unknown training video', { videoId: req.body.videoId });
+    }
     modernOk(res, await svc.setTrainingPercentage(
       req.tech.efr_id,
       req.body.videoId,

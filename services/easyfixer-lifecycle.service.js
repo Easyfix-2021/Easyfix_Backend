@@ -1,6 +1,9 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const { OFFER_STATUS } = require('./offer-status');
+// LMS completion feeds both the entrance to and the exit from TRAINING_PENDING.
+// lms.service requires only db + logger, so there is no cycle here.
+const lms = require('./lms.service');
 
 /*
  * Technician lifecycle — the single mutation/read authority for the v5.1
@@ -310,21 +313,50 @@ function requiresReapplicationVerificationReset(currentStatus, target) {
     && REAPPLICATION_REENTRY_STATES.has(target);
 }
 
-function gate1FinalizationDecision(currentStatus, gates = {}) {
+/*
+ * `trainingOutstanding` is the ENTRANCE to TRAINING_PENDING.
+ *
+ * Until the LMS shipped, nothing ever put a technician into that state — it
+ * was reachable only by a manual CRM transition, so the bucket sat empty
+ * (verified 2026-08-13: zero rows) while the state machine still listed it.
+ * Registration finalization is the natural doorway: a technician who already
+ * has assigned course content they have not finished should be routed to
+ * TRAINING_PENDING rather than straight to UNDER_VERIFICATION, because there
+ * is no point queueing them for a human verification decision while they
+ * still owe training.
+ *
+ * The exit is the LMS completion wire (finalizeTrainingCompletion), which
+ * moves them on to UNDER_VERIFICATION once every assigned video is finished.
+ * Together those close the loop:
+ *
+ *   REGISTRATION_INCOMPLETE
+ *     --gate 1 complete, training outstanding--> TRAINING_PENDING
+ *     --all assigned videos watched-----------> UNDER_VERIFICATION
+ *     --CRM approves--------------------------> ACTIVE
+ *
+ * Default false, so a technician with NOTHING assigned finalizes to
+ * UNDER_VERIFICATION exactly as before. Courses are assigned by an operator,
+ * which normally happens after registration — so this diverts only the people
+ * who were deliberately given training up front, and changes nothing for
+ * everyone else. Making training mandatory for every new technician would
+ * need a "default course" concept that does not exist yet.
+ */
+function gate1FinalizationDecision(currentStatus, gates = {}, trainingOutstanding = false) {
   const complete = asBool(gates.personal_submitted)
     && String(gates.adhaar_card_number || '').trim() !== ''
     && String(gates.efr_profile_img || '').trim() !== '';
   const canFinalize = currentStatus === 'NEW'
     || currentStatus === 'REGISTRATION_INCOMPLETE'
     || currentStatus === 'VERIFICATION_REJECTED';
+  const finalized = trainingOutstanding ? 'TRAINING_PENDING' : 'UNDER_VERIFICATION';
   return {
     complete,
-    target: complete && canFinalize ? 'UNDER_VERIFICATION' : currentStatus,
+    target: complete && canFinalize ? finalized : currentStatus,
     clearIdentityRejection: complete && currentStatus === 'VERIFICATION_REJECTED',
   };
 }
 
-function resolveGate1Finalization(currentStatus, gates = {}) {
+function resolveGate1Finalization(currentStatus, gates = {}, trainingOutstanding = false) {
   if (currentStatus === 'UNDER_VERIFICATION') {
     return {
       complete: true,
@@ -339,7 +371,7 @@ function resolveGate1Finalization(currentStatus, gates = {}) {
   if (!supported) {
     throw httpError(409, `registration cannot be finalized from ${currentStatus}`);
   }
-  const decision = gate1FinalizationDecision(currentStatus, gates);
+  const decision = gate1FinalizationDecision(currentStatus, gates, trainingOutstanding);
   if (!decision.complete) {
     const missing = [];
     if (!asBool(gates.personal_submitted)) missing.push('personal_details_confirmation');
@@ -1091,14 +1123,21 @@ async function finalizeMobileRegistrationGate1(efrId) {
     reasonCode: 'MOBILE_GATE1_FINALIZED',
     reason: 'Technician confirmed registration details for verification',
     metadata: { mobileGate1Finalization: true },
-    _resolveStatus: (row, current) => {
+    _resolveStatus: async (row, current) => {
       // transition() already holds the easyfixer/user row lock and selected all
       // three gates; avoid a redundant second SELECT ... FOR UPDATE.
+      //
+      // The training probe is a plain read of the technician's own assignment
+      // rows, so it adds one indexed query to a flow that already runs once
+      // per registration — not a hot path. `required > 0` matters: a
+      // technician with nothing assigned is not "outstanding", they simply
+      // have no training, and must still finalize to UNDER_VERIFICATION.
+      const training = await lms.isTrainingComplete(efrId);
       const decision = resolveGate1Finalization(current.status, {
         personal_submitted: row.user_is_personal_detail_filled,
         adhaar_card_number: row.adhaar_card_number,
         efr_profile_img: row.efr_profile_img,
-      });
+      }, training.required > 0 && !training.complete);
       clearIdentityRejection = decision.clearIdentityRejection;
       return decision.target;
     },
@@ -1114,6 +1153,48 @@ async function finalizeMobileRegistrationGate1(efrId) {
         [Number(efrId)],
       );
     },
+    _protectLifecycle: (current, target) => current.status === target,
+  }, null);
+  return { schemaInstalled: true, ...result };
+}
+
+/*
+ * LMS completion advances a technician out of TRAINING_PENDING.
+ *
+ * TRAINING_PENDING previously had no exit that anything but a human could
+ * take: the CRM could move a technician on manually, but finishing the
+ * assigned videos changed nothing, so the state accumulated people who had
+ * actually completed their training. This closes that loop.
+ *
+ * Deliberately narrow. It advances TRAINING_PENDING -> UNDER_VERIFICATION and
+ * nothing else:
+ *
+ *   - It is NOT an activation. Verification stays a human decision, and
+ *     assertTransition would reject an onboarding -> ACTIVE jump anyway
+ *     ("onboarding activation must use the verification approval flow").
+ *     Completing a video proves the video was watched, not that the
+ *     technician's documents are genuine.
+ *   - Any other current status resolves to itself, which _protectLifecycle
+ *     then turns into a no-op — no version bump, no log row. So this is safe
+ *     to call on every progress ping, including for technicians who are
+ *     already ACTIVE and are simply re-watching content.
+ *
+ * source is SYSTEM rather than APP: the technician app can only ever request
+ * REAPPLIED (assertTransition enforces that), and this is the backend acting
+ * on an observed fact, not the app asking for a state.
+ */
+async function finalizeTrainingCompletion(efrId) {
+  if (!(await hasLifecycleSchema())) {
+    return { schemaInstalled: false, changed: false, lifecycle: null };
+  }
+  const result = await transition(efrId, {
+    source: 'SYSTEM',
+    reasonCode: 'TRAINING_COMPLETED',
+    reason: 'All assigned training completed',
+    metadata: { trainingCompletion: true },
+    _resolveStatus: (row, current) => (
+      current.status === 'TRAINING_PENDING' ? 'UNDER_VERIFICATION' : current.status
+    ),
     _protectLifecycle: (current, target) => current.status === target,
   }, null);
   return { schemaInstalled: true, ...result };
@@ -1308,6 +1389,7 @@ module.exports = {
   requestReapplication,
   getReapplicationSummary,
   finalizeMobileRegistrationGate1,
+  finalizeTrainingCompletion,
   activateFromVerification,
   syncFromVerificationFlags,
   syncFromVerificationFlagsAtomic,

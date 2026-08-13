@@ -1139,7 +1139,7 @@ async function statusCounts({ scope } = {}) {
       // No access — short-circuit to all-zero counts.
       return {
         active: 0, inactive: 0, idle: 0, not_eligible: 0,
-        not_suitable: 0, reg_in_progress: 0, total: 0,
+        not_suitable: 0, reg_in_progress: 0, training_pending: 0, total: 0,
       };
     }
     if (ci.mode === 'allow' && ci.ids.length) {
@@ -1149,8 +1149,29 @@ async function statusCounts({ scope } = {}) {
   }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
 
+  /*
+   * Training Pending is a LIFECYCLE bucket, not one of the six legacy status
+   * buckets above it — which is why it is selected conditionally rather than
+   * added to the list. `lifecycle_status` only exists once the technician
+   * lifecycle migration is installed, and this endpoint has to keep answering
+   * on an environment where it is not: referencing a missing column would
+   * throw and take the whole counts strip down, not just this one number.
+   *
+   * It earns a place in the strip because the LMS made it actionable. Before
+   * the completion wire, TRAINING_PENDING was a state nothing could clear
+   * automatically and the cohort was not a worklist. Now that finishing the
+   * assigned videos advances a technician out of it, whoever is left in it is
+   * precisely the set who have not finished their training — the people an
+   * operator needs to chase.
+   */
+  const lifecycleInstalled = await lifecycleService.hasLifecycleSchema();
+  const trainingPendingSql = lifecycleInstalled
+    ? `SUM(CASE WHEN e.lifecycle_status = 'TRAINING_PENDING' THEN 1 ELSE 0 END)`
+    : '0';
+
   const [[row]] = await pool.query(`
     SELECT
+      ${trainingPendingSql} AS training_pending,
       SUM(CASE WHEN e.is_technician_verified = 1 AND e.efr_status = 1
                THEN 1 ELSE 0 END) AS active,
       SUM(CASE WHEN e.is_technician_verified = 1 AND e.efr_status = 0
@@ -1183,6 +1204,12 @@ async function statusCounts({ scope } = {}) {
     not_eligible:    Number(row.not_eligible)    || 0,
     not_suitable:    Number(row.not_suitable)    || 0,
     reg_in_progress: Number(row.reg_in_progress) || 0,
+    // 0 both when nobody is in the bucket and when the lifecycle migration is
+    // absent — the two are indistinguishable from here, and the strip renders
+    // the entry either way. Note this legitimately reads 0 today: nothing
+    // currently moves a technician INTO TRAINING_PENDING (the LMS wire only
+    // moves them out), so the bucket is empty until an entrance exists.
+    training_pending: Number(row.training_pending) || 0,
     total:           Number(row.total)           || 0,
   };
 }

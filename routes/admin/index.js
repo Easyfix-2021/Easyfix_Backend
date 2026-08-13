@@ -142,6 +142,10 @@ router.use('/legacy',          require('./legacy'));
 router.use('/notice-categories', require('./notice-categories'));
 router.use('/notices',           require('./notices'));
 router.use('/holidays',          require('./holidays'));
+// LMS (added 2026-08-13) — courses, course content, assignment, completion
+// report. The training VIDEO catalogue stays on /aux/training-videos; this
+// router deliberately does not restate it.
+router.use('/lms',               require('./lms'));
 // router.use('/clients',        require('./clients'));     // later
 // router.use('/users',          require('./users'));       // later
 
