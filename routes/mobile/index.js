@@ -1477,14 +1477,18 @@ router.post('/customers/lookup', (req, res, next) => (
 ));
 
 /*
- * DEPRECATED alias. No caller exists in the technician app today, so this can be
- * deleted as soon as that is re-confirmed — it is kept only so a client build we
- * have not audited cannot 404 mid-rollout.
+ * The deprecated GET /customers/mobile/:mobile alias was removed 2026-08-12.
+ * It was unreachable rather than merely unused: this router is behind technician
+ * JWT auth, the only holder of such a token is the new RN technician app (not
+ * yet live, and it never called this), and the old Flutter app authenticates
+ * against the legacy secret so it cannot reach /api/mobile/* at all. Its
+ * deprecation warning could never fire.
+ *
+ * The equivalent alias on the CLIENT router is deliberately still in place:
+ * Easyfix_Client_App is an installed mobile binary, so builds predating the POST
+ * migration are still in the field and would 404. Retire that one only when its
+ * deprecation log line has been quiet across a full release cycle.
  */
-router.get('/customers/mobile/:mobile', (req, res, next) => {
-  logger.warn('DEPRECATED GET /customers/mobile/:mobile — migrate to POST /customers/lookup');
-  return lookupCustomerByMobile(req.params.mobile, res, next);
-});
 
 // ─── Net-new technician sub-routers (2026-06-15, mobile-only) ───────
 // Mounted AFTER the inline routes above so they can never shadow an existing

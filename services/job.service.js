@@ -597,6 +597,46 @@ async function jobServicesCreatedByColumn() {
 }
 
 /*
+ * Probe for the qty-updater audit columns (2026-08-12 migration). When present,
+ * the order-detail Services list can show "who last changed the quantity" and
+ * stamp updated_by/at on edits. Memoised once per process. Absent → the
+ * feature degrades to just updating the quantity (no audit), never breaks.
+ */
+let _jobServicesQtyUpd = undefined;
+async function jobServicesQtyUpdaterColumn() {
+  if (_jobServicesQtyUpd !== undefined) return _jobServicesQtyUpd;
+  try {
+    const [rows] = await pool.query(
+      "SHOW COLUMNS FROM tbl_job_services WHERE Field = 'updated_by'");
+    _jobServicesQtyUpd = rows.length > 0;
+  } catch { _jobServicesQtyUpd = false; }
+  return _jobServicesQtyUpd;
+}
+
+/*
+ * Client app: update service-line quantities on an editable job. The route has
+ * already verified ownership + editable status (New → Work Progress). Stamps
+ * updated_by / updated_on when those columns exist.
+ */
+async function updateServiceQuantities(jobId, items, spocId) {
+  const hasAudit = await jobServicesQtyUpdaterColumn();
+  for (const it of items || []) {
+    const id = Number(it.job_service_id);
+    const qty = Math.max(1, Number(it.quantity) || 1);
+    if (!id) continue;
+    if (hasAudit) {
+      await pool.query(
+        'UPDATE tbl_job_services SET quantity = ?, updated_by = ?, updated_on = NOW() WHERE job_service_id = ? AND job_id = ?',
+        [qty, spocId, id, jobId]);
+    } else {
+      await pool.query(
+        'UPDATE tbl_job_services SET quantity = ? WHERE job_service_id = ? AND job_id = ?',
+        [qty, id, jobId]);
+    }
+  }
+}
+
+/*
  * IST timezone helpers (2026-06-04).
  *
  * Platform convention (CLAUDE.md "Coding rules" §7):
@@ -2031,6 +2071,26 @@ async function getById(jobId) {
     billing_label:
       (s.effective_charge == null || Number(s.effective_charge) === 0) ? 'Free' : 'Paid',
   }));
+
+  // "Who last changed the quantity" — probe-gated (2026-08-12 migration). Kept
+  // as a small separate lookup so the main service SELECT above stays untouched.
+  if (shapedServices.length && await jobServicesQtyUpdaterColumn()) {
+    const ids = shapedServices.map((s) => s.job_service_id).filter(Boolean);
+    if (ids.length) {
+      const [uRows] = await pool.query(
+        `SELECT js.job_service_id, js.updated_by, js.updated_on,
+                cc.contact_name AS updated_by_name
+           FROM tbl_job_services js
+           LEFT JOIN tbl_client_contacts cc ON cc.id = js.updated_by
+          WHERE js.job_id = ? AND js.job_service_id IN (${ids.map(() => '?').join(',')})`,
+        [jobId, ...ids]);
+      const byId = new Map(uRows.map((r) => [r.job_service_id, r]));
+      shapedServices.forEach((s) => {
+        const u = byId.get(s.job_service_id);
+        if (u) { s.updated_by = u.updated_by; s.updated_on = u.updated_on; s.updated_by_name = u.updated_by_name; }
+      });
+    }
+  }
 
   // Resolve each stored image (an S3 key like `JobSupportings/Booking_<id>_<seq>`
   // or a legacy filename) into a directly-renderable URL: a short-lived S3
@@ -5563,7 +5623,7 @@ module.exports = {
   // tbl_job.client_services CSV in sync after the customer's self-submit
   // mutates tbl_job_services. Single source of truth, one helper.
   recomputeClientServicesCsv,
-  list, getById, getByIdCore, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, reschedule, unassign, acceptOffer, changeOwner,
+  list, getById, getByIdCore, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, reschedule, unassign, acceptOffer, changeOwner, updateServiceQuantities,
   // THE OFFER MODEL (pool offers): offer one job to many techs, list a job's
   // open offers, and list a tech's open offers.
   offerToTechnicians, listOffers, listOfferedForTech, techHasOpenOffer, rejectOffer,

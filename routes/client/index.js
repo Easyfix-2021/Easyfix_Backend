@@ -526,6 +526,31 @@ router.post('/jobs/:id/cancel', validate(Joi.object({
   } catch (e) { next(e); }
 });
 
+// ─── Update service-line quantities (client app) ─────────────────────
+// The order-detail Services list lets the client raise the product quantity.
+// Allowed ONLY before audit (New → Work Progress); once the job reaches Under
+// Audit / Completed the app hides Save and this guard rejects. Stamps who changed
+// it (updated_by) so the app can show "Updated by <name>".
+const QTY_EDITABLE_STATUSES = [9, 0, 1, 2, 20];
+router.patch('/jobs/:id/services', validate(Joi.object({
+  items: Joi.array().min(1).items(Joi.object({
+    job_service_id: Joi.number().integer().required(),
+    quantity: Joi.number().integer().min(1).required(),
+  })).required(),
+})), async (req, res, next) => {
+  try {
+    const jobId = Number(req.params.id);
+    const job = await jobService.getById(jobId);
+    if (!job || job.fk_client_id !== req.spoc.client_id) return modernError(res, 404, 'job not found');
+    if (!QTY_EDITABLE_STATUSES.includes(Number(job.job_status)))
+      return modernError(res, 409, 'quantity can no longer be changed at this stage');
+    await jobService.updateServiceQuantities(jobId, req.body.items, req.spoc.id);
+    logger.info('Service quantities updated · job=' + jobId + ' · by=' + req.spoc.id + ' · lines=' + req.body.items.length);
+    const updated = await jobService.getById(jobId);
+    modernOk(res, { services: updated.services }, 'quantities updated');
+  } catch (e) { next(e); }
+});
+
 // ─── Job image upload (Book-a-service attachments) ───────────────────
 // Reuses the shared job-image service (same storage as the ops route: S3 with
 // a local-disk fallback + a tbl_job_image row). Scoped to the SPOC's client so
