@@ -447,9 +447,22 @@ jobs:
           # missing invariants when REQUIRE_SCHEMA_INVARIANTS=true). Missing
           # hardening invariants are reported but do not block, so a release is
           # never held hostage to a migration awaiting an audited Ops decision.
+          #
+          # \`</dev/null\` IS LFAD-CRITICAL, NOT COSMETIC (2026-08-13). \`-T\`
+          # disables TTY ALLOCATION; it does NOT detach stdin. \`compose run\`
+          # still attaches it, so it happily reads — and discards — whatever
+          # the parent shell's stdin holds. When this script was piped into
+          # \`bash\` (\`base64 -d | bash\`), that stdin WAS the rest of the
+          # script: the gate silently ate every remaining line, bash hit EOF
+          # and exited 0, and the container swap below never ran while the
+          # workflow reported success. Every Production deploy between
+          # 2026-08-12 and 2026-08-13 was a no-op for exactly this reason.
+          # The transport now writes to a file instead of piping (see the
+          # send-command step), which removes the trap at its root; this
+          # redirect is the second lock on the same door.
           echo "▶ Pre-swap schema gate — checking the NEW image against the live DB"
           if docker compose run --rm --no-deps -T backend \
-               npm run --silent verify:schema:boot; then
+               npm run --silent verify:schema:boot </dev/null; then
             echo "✓ Schema gate passed — the new container will boot; proceeding with swap"
           else
             echo "::error::Pre-swap schema gate FAILED — deployment aborted."
@@ -532,18 +545,48 @@ jobs:
           done
 
           # Wait for the container's HEALTHCHECK to flip green.
+          #
+          # The loop used to fall through when health never flipped, leaving a
+          # crash-looping container behind a green deploy. Waiting without
+          # asserting is just a slower way of not checking.
+          HEALTH=unknown
           for i in 1 2 3 4 5 6 7 8 9 10; do
-            STATUS=\$(docker inspect --format '{{.State.Health.Status}}' easyfix-backend 2>/dev/null || echo unknown)
-            echo "[\$i/10] backend health: \$STATUS"
-            [[ "\$STATUS" == "healthy" ]] && break
+            HEALTH=\$(docker inspect --format '{{.State.Health.Status}}' easyfix-backend 2>/dev/null || echo unknown)
+            echo "[\$i/10] backend health: \$HEALTH"
+            [[ "\$HEALTH" == "healthy" ]] && break
             sleep 3
           done
+          if [[ "\$HEALTH" != "healthy" ]]; then
+            echo "::error::backend never reported healthy (last: \$HEALTH). The swap happened, so the new container IS the serving one — investigate the logs below before rolling back."
+            docker compose ps backend || true
+            docker compose logs --tail 60 backend || true
+            exit 1
+          fi
 
           # Reclaim disk — old images > 72h gone.
           docker image prune -af --filter "until=72h" >/dev/null 2>&1 || true
 
           docker compose ps backend
+
+          # ─── PROVE THE SWAP ACTUALLY HAPPENED ───────────────────────────
+          # The smoke test that follows this step CANNOT establish this. It
+          # curls /api/health, and the PREVIOUS container answers that just as
+          # happily as the new one — a deploy that changed nothing passes it
+          # perfectly. The only honest question is "which image is bound to
+          # the running container", so ask that directly.
+          RUNNING=\$(docker inspect --format '{{.Config.Image}}' easyfix-backend 2>/dev/null || echo none)
+          if [[ "\$RUNNING" != "$IMAGE_URI" ]]; then
+            echo "::error::Deploy did NOT take — easyfix-backend is running \$RUNNING but this deploy built $IMAGE_URI."
+            echo "::error::The application is still serving the OLD code. Nothing was broken, but nothing shipped either."
+            exit 1
+          fi
+          echo "✓ Verified running image: \$RUNNING"
           echo "✓ Deployed $IMAGE_URI"
+
+          # Machine-readable end-of-script marker, asserted by the runner.
+          # Its ABSENCE is the signal — it catches the one failure mode the
+          # exit code cannot: a script that stops early and still exits 0.
+          echo "EASYFIX-DEPLOY-COMPLETE $IMAGE_URI"
           EOF
           )
 
@@ -552,10 +595,36 @@ jobs:
           # multi-line script through JSON → SSM agent → sh → bash mangles
           # newlines (they arrive as literal `\n`, collapsing the whole
           # script onto one line). Base64 transport avoids every escape
-          # layer: encode here, pipe through `base64 -d | bash` on the box.
+          # layer: encode here, decode on the box.
+          #
+          # DECODE TO A FILE — NEVER `base64 -d | bash` (2026-08-13 incident).
+          # Piping a script into bash makes STDIN THE SCRIPT. Bash reads a
+          # compound statement in full before running it, so any command
+          # inside that block which reads stdin consumes the script's own
+          # remaining bytes; bash then sees EOF and exits 0. A truncated run
+          # is indistinguishable from a completed one — no error, no signal,
+          # exit code 0, and SSM reports Success.
+          #
+          # That is not hypothetical: `docker compose run` in the schema gate
+          # ate everything after it, so `--force-recreate` never executed and
+          # nine consecutive "successful" Production deploys shipped nothing.
+          #
+          # Running a FILE gives bash a seekable fd of its own and leaves the
+          # process stdin free, so no command in the script can ever eat it.
+          # `</dev/null` on the bash call keeps that stdin empty and closed.
           SCRIPT_B64=$(printf '%s' "$REMOTE_SCRIPT" | base64 -w0)
-          PARAMS_JSON=$(jq -n --arg b64 "$SCRIPT_B64" \
-            '{commands: ["echo \($b64) | base64 -d | bash"]}')
+          PARAMS_JSON=$(jq -n --arg b64 "$SCRIPT_B64" '{
+            commands: [
+              "set -e",
+              "SCRIPT=$(mktemp /tmp/easyfix-be-deploy.XXXXXX)",
+              "echo \($b64) | base64 -d > \"$SCRIPT\"",
+              "set +e",
+              "bash \"$SCRIPT\" </dev/null",
+              "RC=$?",
+              "rm -f \"$SCRIPT\"",
+              "exit $RC"
+            ]
+          }')
 
           CMD_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
@@ -577,9 +646,10 @@ jobs:
 
           echo
           echo "── Remote stdout ──"
-          aws ssm get-command-invocation \
+          REMOTE_OUT=$(aws ssm get-command-invocation \
             --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
-            --query 'StandardOutputContent' --output text || true
+            --query 'StandardOutputContent' --output text || true)
+          printf '%s\n' "$REMOTE_OUT"
           echo
           echo "── Remote stderr ──"
           aws ssm get-command-invocation \
@@ -587,6 +657,22 @@ jobs:
             --query 'StandardErrorContent' --output text || true
 
           [[ "$STATUS" == "Success" ]] || { echo "::error::SSM finished with $STATUS"; exit 1; }
+
+          # A Success exit code only tells us the script STOPPED cleanly, not
+          # that it RAN to the end — the 2026-08-12/13 no-op deploys exited 0
+          # having skipped the container swap entirely. The remote script's
+          # final line is a sentinel, so requiring it converts "stopped early
+          # and said nothing" into a failed deploy.
+          #
+          # (SSM caps StandardOutputContent at 24 KB. Normal output is ~2 KB;
+          # if a future change makes the remote script chatty enough to hit
+          # that cap, the sentinel would be truncated away and this check
+          # would misfire — keep the remote output terse.)
+          if ! grep -q 'EASYFIX-DEPLOY-COMPLETE' <<< "$REMOTE_OUT"; then
+            echo "::error::The remote script exited 0 but never reached its final line — the deploy stopped partway and the container swap may not have happened."
+            echo "::error::The application is still serving whatever it was serving before. Read the remote stdout above: the last line printed is where execution stopped."
+            exit 1
+          fi
 
       - name: Smoke-test deployed API
         run: |
