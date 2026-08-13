@@ -146,6 +146,8 @@ router.use('/holidays',          require('./holidays'));
 // report. The training VIDEO catalogue stays on /aux/training-videos; this
 // router deliberately does not restate it.
 router.use('/lms',               require('./lms'));
+// Rewards (added 2026-08-13) — shop catalogue, claims queue, points ledger.
+router.use('/rewards',           require('./rewards'));
 // router.use('/clients',        require('./clients'));     // later
 // router.use('/users',          require('./users'));       // later
 

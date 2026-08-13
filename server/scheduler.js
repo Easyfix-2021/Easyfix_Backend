@@ -808,6 +808,62 @@ Note: this task only runs automatically if the property "training.reminder.enabl
     logger.info(`Training-reminder cron registered (training.reminder.enabled=true, schedule="${trainingCronExpr}" IST).`);
   }
 
+  /* ── Rewards earning ─────────────────────────────────────────────── */
+  const rewardsService = require('../services/rewards.service');
+  const rewardsCronExpr = (() => {
+    const raw = String(getProperty('rewards.earn.cron') ?? '').trim();
+    return raw && cron.validate(raw) ? raw : '0 2 * * *';
+  })();
+  const rewardsEarnJob = registerJob({
+    id: 'rewards-earn-daily',
+    name: 'Rewards Points Earning',
+    description:
+`What this task does: Every night at 2:00 AM IST it awards reward points for what technicians earned that day — good ratings, same-day appointments, and referrals that have come good. Points are spent in the Rewards shop in the app; they are NOT money and can never be withdrawn.
+
+Here's how it works, step by step:
+  1. Every night at 2:00 AM IST the task wakes up automatically.
+  2. It looks back over a short window (3 days by default) — NOT over all history. This is deliberate and important: there are over 300,000 historical ratings in the database, and a task that read all of them would hand out millions of points on its first run. The window means the programme genuinely starts on the day it is switched on.
+  3. RATING POINTS: for every job rated 5 stars in that window where the job was NOT escalated, the technician is credited. The escalation check matters — roughly 9 in every 10 ratings are 5 stars, so without it this would simply pay for finishing a job rather than for doing it well.
+  4. SDA POINTS: for every completed job in that window where the technician checked in on the appointment's own calendar day. This uses exactly the same rule as the SDA percentage the technician already sees in the app, so the two can never disagree.
+  5. REFERRAL POINTS: when someone who joined using a technician's referral code completes their FIRST job, the referrer is credited. Not at signup — paying then would be an invitation to invent technicians. The referrer must still be an active technician at that moment.
+  6. Every award is recorded once and once only. The database itself refuses a second award for the same job or referral, so re-running the task — or an overlapping window — pays nobody twice. The log reports how many were already paid.
+
+Why the balance is never wrong: there is no stored balance anywhere. A technician's points are always the sum of their ledger, and corrections are added as new rows rather than by editing old ones — so "why did my points change?" always has a complete answer on their screen.
+
+How many points each thing is worth: a good rating is 10, a same-day appointment is 30, and a referral that comes good is 200. These values are FIXED IN CODE, not settings — they are the terms technicians are told and plan around, so changing one is a deliberate deploy rather than something that can drift mid-month. You can see them any time on the Reward Items page in the CRM.
+
+Note: this task runs automatically as long as the property "rewards.earn.enabled" is "true" in easyfix_properties, which it is by default — earning IS the programme, and a rewards system installed switched-off would show every technician a permanent zero. Setting it to "false" pauses the nightly awarding. The SEND TIME is configurable via "rewards.earn.cron" (default "0 2 * * *"). Both are read once at server start, so a restart is required after changing either. Trigger Now works regardless of the schedule.`,
+    cron: rewardsCronExpr,
+    runner: async () => {
+      const result = await rewardsService.runEarnCycle();
+      logger.info(
+        `Rewards-earning cron · enabled=${result.enabled} · rating=${result.rating} · ` +
+        `sda=${result.sda} · referral=${result.referral} · alreadyPaid=${result.skipped}`
+      );
+      return result;
+    },
+    tester: () => rewardsService.runEarnCycle(),
+    testSourceLabel: 'Not required',
+    testSourceHelp:
+      'No input needed. Trigger Now runs exactly the awarding pass the schedule would, over the same short look-back window. It is safe to run repeatedly: every award is recorded once and once only, so a second run pays nobody twice and simply reports them as already paid.',
+  });
+  const rewardsEarnEnabled =
+    String(getProperty('rewards.earn.enabled') ?? '').toLowerCase() === 'true';
+  if (cronDisabled) {
+    rewardsEarnJob.skipReason = 'CRON_DISABLED=true';
+  } else if (!rewardsEarnEnabled) {
+    rewardsEarnJob.skipReason = "property 'rewards.earn.enabled' was not 'true' at server start — flip it to 'true' and restart the server to enable";
+    logger.info("Rewards-earning cron SKIPPED — set rewards.earn.enabled=true in easyfix_properties to enable (takes effect after restart).");
+  } else {
+    rewardsEarnJob.task = cron.schedule(
+      rewardsEarnJob.cron,
+      () => invokeJob(rewardsEarnJob, 'cron'),
+      { timezone: TZ },
+    );
+    rewardsEarnJob.registered = true;
+    logger.info(`Rewards-earning cron registered (rewards.earn.enabled=true, schedule="${rewardsCronExpr}" IST).`);
+  }
+
   // ─── Easyfixer auto-reactivation — daily at 01:00 IST ───────────────
   // (Added 2026-07-13) Reactivates technicians set "Temporarily Inactive" with a
   // scheduled_reactivation_date that has arrived (efr_status 0 → 1, clears the

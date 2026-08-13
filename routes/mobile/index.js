@@ -1514,6 +1514,10 @@ router.post('/customers/lookup', (req, res, next) => (
 // requireTechAuth-scoped (inherited from line 128) and touch only mobile/legacy
 // shared tables for READ/WRITE — zero CRM route overlap.
 //   /deepskill/hierarchy/:categoryId · /deepskill/skills
+// Rewards (added 2026-08-13) — points balance, ledger, shop, claims, referral.
+// Every route inside scopes to req.tech.efr_id; nothing here converts points
+// to money, and nothing here ever should.
+router.use('/rewards', require('./rewards'));
 router.use('/deepskill', require('./deepskill'));
 //   /registration/status · /remaining · /personal-details · /language
 router.use('/registration', require('./registration'));
