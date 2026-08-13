@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "source": "worktree",
-  "sourceHash": "25a47dfcb7029a8c724410c152d02248d09dbd2bee7ca6ea280fd658c747cbfe",
+  "source": "staged",
+  "sourceHash": "9ce07e17201d60ea2b7f4665c0549497cb5415ee09191e194411aff869459db2",
   "watchedFileCount": 195
 }

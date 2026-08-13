@@ -135,7 +135,25 @@ const EXPECTED = {
   ],
   pincode_firefox_city_mapping: ['id', 'pincode', 'firefox_city_id'],
   firefox_city_mapping: ['id', 'city_name', 'city_id', 'no_of_slot'],
-  training_videos: ['id', 'title', 'description', 'sub_title', 'sub_description'],
+  // training_video_id is the FK into `document` that resolves a video's
+  // playable URL; services/lms.service.js both reads it and writes it
+  // (SET training_video_id = NULL / = ?), so it belongs here like any other
+  // column the code's own SQL names.
+  training_videos: [
+    'id', 'title', 'description', 'sub_title', 'sub_description',
+    'training_video_id',
+  ],
+  // ─── LMS (services/lms.service.js) ──────────────────────────────────────
+  // `courses` and `easyfixer_courses` pre-date the LMS work; only
+  // courses.status is new (migrations/executed/2026-08-13-lms-foundation.sql).
+  // course_videos is created wholesale by that migration. All three are read
+  // on the LMS list/detail/report paths, so a missing column here is a 500 on
+  // first request, not a degraded behaviour.
+  courses: ['id', 'name', 'description', 'status', 'created_at', 'updated_at'],
+  course_videos: ['id', 'course_id', 'video_id', 'sequence', 'created_at'],
+  easyfixer_courses: [
+    'id', 'easyfixer_id', 'course_id', 'score', 'created_at', 'updated_at',
+  ],
   tbl_easyfixer: [
     'efr_id', 'efr_name', 'efr_no', 'efr_status', 'efr_cityId',
     'current_balance', 'balance_updated',
@@ -183,6 +201,19 @@ const REQUIRED_INDEXES = [
     unique: true,
   },
   { table: 'tbl_easyfixer', columns: ['active_aadhaar_unique'], unique: true },
+  // assignCourse() does INSERT … ON DUPLICATE KEY UPDATE on easyfixer_courses,
+  // so this UNIQUE is the ONLY thing making re-assignment idempotent — exactly
+  // the easyfixer_watched_video story above. Without it, re-assigning a course
+  // inserts a second row and the report double-counts the technician.
+  {
+    table: 'easyfixer_courses',
+    columns: ['easyfixer_id', 'course_id'],
+    unique: true,
+  },
+  // setCourseVideos() DELETEs then re-INSERTs, so it does not depend on this
+  // for correctness — but it is what stops two writers racing a course into
+  // holding the same video twice.
+  { table: 'course_videos', columns: ['course_id', 'video_id'], unique: true },
 ];
 
 function canonicalSql(value) {
