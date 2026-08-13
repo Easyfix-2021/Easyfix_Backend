@@ -198,6 +198,38 @@ router.post(
   },
 );
 
+/*
+ * DELETE /admin/notices/:noticeId — permanent removal.
+ *
+ * Sits alongside archive rather than replacing it: archive retires a notice
+ * that legitimately ran, delete removes one that should never have existed
+ * (typo / duplicate / test broadcast). Same isNoticeManage gate; the service
+ * drops the read receipts in the same transaction.
+ */
+router.delete(
+  '/:noticeId',
+  requireNoticeManage,
+  validate(noticeIdParam, 'params'),
+  async (req, res, next) => {
+    try {
+      logger.info('Delete notice · id=' + req.params.noticeId);
+      const row = await svc.deleteNotice(Number(req.params.noticeId));
+      if (!row) {
+        logger.warn('Notice not found for delete · id=' + req.params.noticeId);
+        return modernError(res, 404, 'Notice not found');
+      }
+      logger.info('Notice deleted · id=' + req.params.noticeId);
+      modernOk(res, row, 'Notice deleted');
+    } catch (e) {
+      if (e.status) {
+        logger.warn('Notice delete rejected · id=' + req.params.noticeId + ' · ' + e.message);
+        return modernError(res, e.status, e.message);
+      }
+      next(e);
+    }
+  },
+);
+
 // ─── Image upload (S3 → Notices/ prefix; local fallback when S3 off) ──
 /*
  * POST /api/admin/notices/upload-image

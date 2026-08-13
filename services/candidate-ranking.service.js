@@ -136,21 +136,32 @@ const RANKING_ORDER = Object.freeze(['worked_for_vertical', 'worked_for_client',
 
 /*
  * Lifecycle states hidden from the Schedule & Assign technician SEARCH
- * (per ops 2026-08-11). Search is otherwise a deliberate "match-anyone"
- * inspection surface — a blocked-but-onboarded technician (INACTIVE, PAUSED,
- * BLACKLISTED, …) still appears so ops can find them, with the offer control
- * disabled. These states are different: the technician either never completed
- * onboarding in the new app (NEW / REGISTRATION_INCOMPLETE) or was rejected
- * during it, so they are noise in a scheduling picker and can never be offered
- * work. The top-10 ranking already excludes them via the work-eligibility
- * predicate; this brings search in line for these states only.
+ * (per ops 2026-08-12).
+ *
+ * The rule ops asked for: show every technician who was EVER active, with the
+ * reason they currently can't take work; hide anyone who was never verified or
+ * who was rejected during onboarding. So the hidden set is exactly the states
+ * that sit BEFORE a technician has ever been activated:
+ *
+ *   never got there  → NEW, REGISTRATION_INCOMPLETE, TRAINING_PENDING,
+ *                      UNDER_VERIFICATION
+ *   rejected on the  → ASSESSMENT_FAILED, VERIFICATION_REJECTED,
+ *   way in             APPLICATION_REJECTED
+ *
+ * Everything else (INACTIVE, PAUSED, DORMANT, SUSPENDED, OFFLINE, ON_BENCH,
+ * BLACKLISTED, UNDER_MASTER, REAPPLIED) STAYS VISIBLE — those technicians have
+ * a work history worth seeing. They are visibility-only: `can_offer` is false
+ * for all of them, the row renders its lifecycle reason, and the selection
+ * control stays disabled, so visibility is never mistaken for permission.
  */
 const SEARCH_HIDDEN_LIFECYCLE_STATUSES = new Set([
   'NEW',
   'REGISTRATION_INCOMPLETE',
-  'APPLICATION_REJECTED',
-  'VERIFICATION_REJECTED',
+  'TRAINING_PENDING',
+  'UNDER_VERIFICATION',
   'ASSESSMENT_FAILED',
+  'VERIFICATION_REJECTED',
+  'APPLICATION_REJECTED',
 ]);
 // Performance composite (tiebreaker only + letter grade): Rating 30 / TAT 20 /
 // SDA 20, normalised to sum 1.0.

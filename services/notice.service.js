@@ -36,6 +36,20 @@ const SURFACES = ['crm', 'client', 'technician'];
 
 // `target_surfaces` is a CSV (e.g. "technician,client"). Returns true when
 // `surface` is one of its members.
+/*
+ * Should publishing this notice fan a push out to the Technician App?
+ *
+ * Treats an ABSENT flag as TRUE on purpose: rows written before the
+ * push_technician column existed, and any caller that doesn't set it, must keep
+ * the historic behaviour (targeting the technician surface has always pushed).
+ * Only an explicit 0/false suppresses it.
+ */
+function pushTechnicianWanted(notice) {
+  const flag = notice && notice.push_technician;
+  if (flag === undefined || flag === null) return true;
+  return Number(flag) === 1 || flag === true;
+}
+
 function surfacesInclude(targetSurfaces, surface) {
   return String(targetSurfaces || '')
     .split(',')
@@ -43,19 +57,69 @@ function surfacesInclude(targetSurfaces, surface) {
     .includes(surface);
 }
 
-// Returns rough audience-reach count for each surface. Used by the
-// All-Notices table's "Reach" column and the Review & Send step's
-// "≈ N technicians" hint. Computed per request; small/fast (single
-// COUNT each, no joins, all indexed).
+/*
+ * Rough audience-reach per surface. Drives the All-Notices "Reach" column, the
+ * Read count's percentage tooltip, and the Review & Send "≈ N technicians" hint.
+ *
+ * CACHED for 5 minutes (2026-08-12). This runs THREE COUNT(*) queries, and
+ * InnoDB has no O(1) row count — each is a full index scan (tbl_easyfixer alone
+ * is ~9.4k rows). It was previously recomputed on EVERY admin list request and
+ * every getNoticeById, which meant three scans to render a page whose numbers
+ * are explicitly an approximation. Staff/technician/contact headcounts move a
+ * few times a day at most, so a 5-minute window is far finer than the data's
+ * real rate of change. Mirrors the cache pattern in role.service.js.
+ *
+ * The cache is per-process and read-only — nothing invalidates it, because a
+ * stale reach for a few minutes is harmless and self-corrects.
+ */
+const REACH_CACHE_TTL_MS = 5 * 60 * 1000;
+let reachCache = { loadedAt: 0, map: null };
+
 async function getSurfaceReachMap() {
+  if (reachCache.map && (Date.now() - reachCache.loadedAt) < REACH_CACHE_TTL_MS) {
+    return reachCache.map;
+  }
   const out = { crm: 0, client: 0, technician: 0 };
   try {
-    const [[{ n }]] = await pool.query(
-      'SELECT COUNT(*) AS n FROM tbl_user WHERE COALESCE(user_status, 1) = 1',
-    );
+    /*
+     * CRM reach = ACTIVE CRM STAFF, not every tbl_user row.
+     *
+     * tbl_user carries ~4,700 role_id=19 "Technician" rows that are legacy
+     * ghosts — technicians canonically live in tbl_easyfixer and authenticate
+     * against it (see CLAUDE.md "Role model"). They never sign into the CRM, so
+     * they can never read a CRM notice. Counting them inflated the denominator
+     * roughly threefold and was the main reason every notice reported 0% read.
+     *
+     * The admin group is derived from the same ROLE_ID_TO_GROUP map the auth
+     * guards use, so adding a role there keeps reach correct automatically.
+     * Lazily required to keep this module free of a load-order dependency.
+     */
+    const { ROLE_ID_TO_GROUP } = require('./role.service');
+    const adminRoleIds = Object.entries(ROLE_ID_TO_GROUP)
+      .filter(([, group]) => group === 'admin')
+      .map(([id]) => Number(id));
+    /*
+     * The role FK on tbl_user is `user_role` — NOT `role_id`. `role_id` is
+     * tbl_role's own primary key (see the join in user.service.js:
+     * `LEFT JOIN tbl_role r ON r.role_id = u.user_role`). Getting this wrong
+     * throws "Unknown column", which the catch below swallows into reach = 0.
+     */
+    const [[{ n }]] = adminRoleIds.length
+      ? await pool.query(
+        `SELECT COUNT(*) AS n FROM tbl_user
+          WHERE COALESCE(user_status, 1) = 1
+            AND user_role IN (${adminRoleIds.map(() => '?').join(',')})`,
+        adminRoleIds,
+      )
+      : await pool.query('SELECT COUNT(*) AS n FROM tbl_user WHERE COALESCE(user_status, 1) = 1');
     out.crm = Number(n) || 0;
   } catch (e) {
-    logger.warn({ err: e }, 'getSurfaceReachMap: tbl_user count failed; defaulting to 0');
+    /*
+     * Fails soft to 0 so a notice list still renders — but that is exactly how
+     * a bad column name hid as "Reach 0" instead of an error, so log the real
+     * message rather than just the object.
+     */
+    logger.warn({ err: e.message }, 'getSurfaceReachMap: tbl_user count failed; defaulting to 0');
   }
   try {
     const [[{ n }]] = await pool.query(
@@ -78,6 +142,14 @@ async function getSurfaceReachMap() {
     out.client = Number(n) || 0;
   } catch (e) {
     logger.warn({ err: e }, 'getSurfaceReachMap: tbl_client_contacts count failed; defaulting to 0');
+  }
+  /*
+   * Only cache a map that actually counted something. Each COUNT above fails
+   * soft to 0, so caching an all-zero result during a transient DB blip would
+   * pin "Reach 0 / 0% read" across every notice for the next five minutes.
+   */
+  if (out.crm || out.client || out.technician) {
+    reachCache = { loadedAt: Date.now(), map: out };
   }
   return out;
 }
@@ -120,6 +192,10 @@ const ROW_SELECT = `
   n.target_surfaces, n.audience_scope, n.audience_ref_id,
   n.action_url, n.images, n.is_pinned, n.status,
   n.publish_at, n.expire_at,
+  -- event_date drives the dashboard's Upcoming Events rail; the push flags let
+  -- the CRM show what a notice was configured to send. Added here (the shared
+  -- projection) so list, detail AND the per-surface active feed all carry them.
+  n.event_date, n.push_technician, n.push_client,
   n.created_by, n.reviewed_by, n.published_by,
   n.created_at, n.updated_at,
   c.name  AS category_name,
@@ -262,8 +338,15 @@ async function decorate(rows, reachMap) {
       effective_status: effectiveStatus(r),
       read_count: readCount.get(r.notice_id) || 0,
       reach_estimate: reach,
+      /*
+       * ONE DECIMAL, not a whole number. Reach is in the thousands, so an
+       * integer percentage floors to 0 until ~1% of the audience has read —
+       * on a 2,800-strong CRM that is 14 people, and every notice sat at "0%"
+       * long after it had genuinely been read. A tenth of a percent is the
+       * coarsest unit that can still distinguish "nobody" from "a few".
+       */
       read_pct: reach > 0
-        ? Math.round(((readCount.get(r.notice_id) || 0) / reach) * 100)
+        ? Math.round(((readCount.get(r.notice_id) || 0) / reach) * 1000) / 10
         : 0,
     };
   }));
@@ -344,6 +427,10 @@ async function createNotice(body, createdBy) {
     audience_scope = 'all', audience_ref_id = null,
     action_url = null, images = [], is_pinned = false,
     publish_at = null, expire_at = null,
+    // '' from an untouched date input must land as SQL NULL, not as the empty
+    // string (which MySQL would coerce to the zero-date '0000-00-00').
+    event_date = null,
+    push_technician = true, push_client = false,
     status_intent = 'draft',
   } = body;
 
@@ -404,12 +491,14 @@ async function createNotice(body, createdBy) {
        (title, body, category_id, target_surfaces,
         audience_scope, audience_ref_id, action_url, images, is_pinned,
         status, publish_at, expire_at,
+        event_date, push_technician, push_client,
         created_by, published_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       title, text, category_id, target_surfaces,
       audience_scope, audience_ref_id, action_url, imagesJson, is_pinned ? 1 : 0,
       status, resolvedPublishAt, expire_at,
+      event_date || null, push_technician ? 1 : 0, push_client ? 1 : 0,
       createdBy, resolvedPublishedBy,
     ],
   );
@@ -421,10 +510,15 @@ async function createNotice(body, createdBy) {
   // created already-published (publish intent with no future publish_at)
   // and targets the technician surface. Scheduled/future notices are NOT
   // pushed here (no scheduler fires them at publish_at yet).
+  // pushWanted(): the technician fan-out now also honours the explicit
+  // push_technician flag. It only NARROWS — the surface must still be targeted.
+  // Undefined (pre-migration rows / callers that never set it) counts as TRUE
+  // so historic behaviour is preserved.
   if (
     created
     && status === 'published'
     && surfacesInclude(created.target_surfaces, 'technician')
+    && pushTechnicianWanted(created)
   ) {
     const { pushNoticeToTechnicians } = require('./notice-push.service');
     pushNoticeToTechnicians(created).catch(() => {});
@@ -463,6 +557,7 @@ async function updateNotice(noticeId, fields) {
     'title', 'body', 'category_id', 'target_surfaces',
     'audience_scope', 'audience_ref_id', 'action_url', 'images',
     'is_pinned', 'publish_at', 'expire_at',
+    'event_date', 'push_technician', 'push_client',
   ];
   const sets = [];
   const params = [];
@@ -543,6 +638,7 @@ async function publishNotice(noticeId, { publish_at, expire_at }, publishedBy) {
     row
     && newStatus === 'published'
     && surfacesInclude(row.target_surfaces, 'technician')
+    && pushTechnicianWanted(row)
   ) {
     // Lazy require avoids any circular-require risk (mirrors how
     // job.service.js lazily requires its orchestrator). Fire-and-forget:
@@ -569,6 +665,50 @@ async function archiveNotice(noticeId) {
   );
   logger.info('Notice archived · id=' + noticeId);
   return getNoticeById(noticeId);
+}
+
+/*
+ * Permanently delete a notice.
+ *
+ * Distinct from archive: archiving keeps the row (and its read receipts) for
+ * the record and merely stops it appearing, whereas delete is for notices that
+ * should never have existed — a typo, a duplicate, a test broadcast. Ops asked
+ * for both because archiving a mistake still leaves it cluttering the list.
+ *
+ * The read receipts go with it. tbl_notice_read has no FK to tbl_notice (this
+ * schema deliberately carries none), so nothing cascades — orphan rows would
+ * accumulate forever and skew the read-percentage of a LATER notice if an id
+ * were ever reused. Both statements run in one transaction so a notice can
+ * never survive with its receipts already gone, or vice versa.
+ *
+ * Returns { deleted: true } or null when the id doesn't exist, so the route can
+ * 404 cleanly rather than reporting a successful no-op.
+ */
+async function deleteNotice(noticeId) {
+  logger.info('Delete notice · id=' + noticeId);
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [[existing]] = await conn.query(
+      'SELECT notice_id FROM tbl_notice WHERE notice_id = ? FOR UPDATE',
+      [noticeId],
+    );
+    if (!existing) {
+      await conn.rollback();
+      return null;
+    }
+    const [reads] = await conn.query('DELETE FROM tbl_notice_read WHERE notice_id = ?', [noticeId]);
+    await conn.query('DELETE FROM tbl_notice WHERE notice_id = ?', [noticeId]);
+    await conn.commit();
+    logger.info('Notice deleted · id=' + noticeId + ' · readReceiptsRemoved=' + (reads.affectedRows || 0));
+    return { deleted: true, notice_id: Number(noticeId) };
+  } catch (e) {
+    await conn.rollback();
+    logger.error('Delete notice failed, rolled back · id=' + noticeId + ' · ' + e.message);
+    throw e;
+  } finally {
+    conn.release();
+  }
 }
 
 // ─── Scheduled → published flip + push (cron) ───────────────────────
@@ -622,7 +762,7 @@ async function publishDueScheduled() {
       // Only push when the (now-published) notice targets technicians.
       if (surfacesInclude(n.target_surfaces, 'technician')) {
         const row = await getNoticeById(n.notice_id);
-        if (row) {
+        if (row && pushTechnicianWanted(row)) {
           // Lazy require mirrors createNotice/publishNotice — avoids any
           // circular-require risk. Fire-and-forget: never block the batch.
           const { pushNoticeToTechnicians } = require('./notice-push.service');
@@ -753,6 +893,7 @@ module.exports = {
   updateNotice,
   publishNotice,
   archiveNotice,
+  deleteNotice,
   publishDueScheduled,
   // Consumer
   listActiveForSurface,

@@ -1534,7 +1534,15 @@ router.post('/:id/offer', validate(idParam, 'params'), validate(offerBody), scop
 router.get('/:id/offers', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
   try {
     logger.info('List job offers · jobId=' + req.params.id);
-    const items = await job.listOffers(Number(req.params.id));
+    /*
+     * `?sweep=0` makes this a PURE read — no lazy expiry of stale offers.
+     * Used by the Pending-for-Scheduling hover card, which fires on mouse-over:
+     * without this, merely pointing at a row would mutate offer state and flip
+     * the list's own chip under the cursor. Default stays sweep-on so the
+     * Schedule & Assign modal (a surface that acts on offers) is unchanged.
+     */
+    const sweep = !['0', 'false', 'no'].includes(String(req.query.sweep || '').toLowerCase());
+    const items = await job.listOffers(Number(req.params.id), { sweep });
     logger.info('Returning ' + items.length + ' job offers · jobId=' + req.params.id);
     modernOk(res, { items });
   } catch (e) {

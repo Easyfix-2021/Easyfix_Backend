@@ -5060,13 +5060,22 @@ async function rejectOffer(jobId, efrId, { reason, reasonId } = {}) {
  *
  * Each row: { efr_id, efr_name, offered_at }.
  */
-async function listOffers(jobId) {
+async function listOffers(jobId, { sweep = true } = {}) {
   logger.info('List offers for job · id=' + jobId);
   if (!(await jobOfferTableExists())) return [];
-  // Lazy expiry: sweep THIS job's stale open offers before reading, so an offer
-  // older than 30 min surfaces as EXPIRED even when the scheduler cron is off
-  // (CRON_DISABLED) or between its 2-min ticks. Idempotent + job-scoped.
-  await expireStaleOffers(OFFER_TTL_MINUTES, jobId);
+  /*
+   * Lazy expiry: sweep THIS job's stale open offers before reading, so an offer
+   * older than 30 min surfaces as EXPIRED even when the scheduler cron is off
+   * (CRON_DISABLED) or between its 2-min ticks. Idempotent + job-scoped.
+   *
+   * `sweep:false` makes the read PURE. Added for the Pending-for-Scheduling
+   * hover card, which fires on mouse-over: sweeping there would let merely
+   * pointing at a row mutate offer state and flip the list's own chip from
+   * "Offered to Tx" to "Expired/Rejected" under the operator's cursor. Ops
+   * surfaces that ACT on offers keep the sweep; surfaces that merely LOOK
+   * do not.
+   */
+  if (sweep) await expireStaleOffers(OFFER_TTL_MINUTES, jobId);
   // Latest offer row PER technician — a re-offer can leave more than one row for
   // the same (job, tech), so MAX(job_offer_id) picks the current one. Surfaced
   // states: OFFERED (live), REJECTED, EXPIRED — the Schedule & Assign modal shows
@@ -5076,13 +5085,21 @@ async function listOffers(jobId) {
   const [rows] = await pool.query(
     `SELECT jo.fk_easyfixter_id AS efr_id, ef.efr_name, jo.offered_at, jo.responded_at,
             jo.offer_status, jo.offer_status_label, jo.offer_count, jo.offer_source,
-            jo.reject_reason
+            jo.reject_reason,
+            -- efr_no is the canonical technician mobile; the mask-mobile
+            -- middleware redacts it in transit, and click-to-call re-resolves
+            -- the real number server-side from efr_id, so the FE never holds it.
+            ef.efr_no AS mobile,
+            -- Who made the offer (NULL on offers predating the column, and on
+            -- anything the auto-assign engine offered).
+            jo.offered_by_user_id, ob.user_name AS offered_by_name
        FROM tbl_job_offer jo
        JOIN (SELECT fk_easyfixter_id, MAX(job_offer_id) AS mid
                FROM tbl_job_offer
               WHERE job_id = ?
               GROUP BY fk_easyfixter_id) latest ON latest.mid = jo.job_offer_id
        JOIN tbl_easyfixer ef ON ef.efr_id = jo.fk_easyfixter_id
+       LEFT JOIN tbl_user ob ON ob.user_id = jo.offered_by_user_id
       WHERE jo.offer_status IN (${OFFER_STATUS.OFFERED}, ${OFFER_STATUS.REJECTED}, ${OFFER_STATUS.EXPIRED})
       ORDER BY FIELD(jo.offer_status, ${OFFER_STATUS.OFFERED}, ${OFFER_STATUS.REJECTED}, ${OFFER_STATUS.EXPIRED}),
                jo.offered_at DESC`,
