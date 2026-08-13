@@ -2,6 +2,15 @@ node_modules/
 .env
 .env.local
 .env.*.local
+# Any BACKUP of a .env is still a file full of live credentials. The patterns
+# above match `.env` exactly and `.env.<something>.local`, so `.env.bak`,
+# `.env.bak.pre-sync`, `.env.2026-08-13` and friends were all untracked-but-
+# visible — one `git add -A` away from being committed. Cover the whole family.
+.env.bak*
+.env.*.bak
+.env.backup*
+.env.save
+.env.orig
 
 logs/
 uploads/
