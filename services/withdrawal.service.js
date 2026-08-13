@@ -44,7 +44,7 @@ async function requestWithdrawal(efrId, { amount }, pool) {
     // checking the open queue, so two devices/replicas with different
     // Idempotency-Keys cannot both observe "no pending request" and insert.
     const [[tech]] = await conn.query(
-      `SELECT current_balance
+      `SELECT current_balance, lifecycle_status
          FROM tbl_easyfixer
         WHERE efr_id = ? AND NOT (efr_status <=> 3)
         LIMIT 1 FOR UPDATE`,
@@ -54,7 +54,15 @@ async function requestWithdrawal(efrId, { amount }, pool) {
     const currentBalance = Number(tech.current_balance ?? 0);
 
     const [[bank]] = await conn.query(
-      'SELECT efr_bank_id FROM tbl_easyfixer_bank_details WHERE efr_Id = ? LIMIT 1',
+      `SELECT d.efr_bank_id, d.efr_bank_acc_num, d.efr_bank_acc_name,
+              d.efr_bank_ifsc, d.bank AS bank_id, n.bank_name
+         FROM tbl_easyfixer_bank_details d
+         LEFT JOIN bank_name n ON n.id = d.bank
+        WHERE d.efr_Id = ?
+          AND NULLIF(TRIM(d.efr_bank_acc_num), '') IS NOT NULL
+          AND NULLIF(TRIM(d.efr_bank_ifsc), '') IS NOT NULL
+          AND NULLIF(TRIM(d.efr_bank_acc_name), '') IS NOT NULL
+        LIMIT 1`,
       [efrId],
     );
     if (!bank) throw mkErr(400, 'NO_BANK_ON_FILE', 'Add bank details before withdrawing');
@@ -62,6 +70,13 @@ async function requestWithdrawal(efrId, { amount }, pool) {
     const amt = Number(amount);
     if (!Number.isFinite(amt) || amt <= 0 || amt > currentBalance) {
       throw mkErr(400, 'INVALID_AMOUNT', 'Enter a valid amount within your available balance');
+    }
+    // A blacklisted technician has one terminal settlement action: withdraw
+    // the entire authoritative wallet to the existing account. Compare in
+    // paise so floating-point representation cannot reject equal INR values.
+    if (String(tech.lifecycle_status || '').toUpperCase() === 'BLACKLISTED'
+        && Math.round(amt * 100) !== Math.round(currentBalance * 100)) {
+      throw mkErr(400, 'FULL_BALANCE_REQUIRED', 'Withdraw your full available balance');
     }
 
     // Deliberately a consistent (non-locking) read. Finance processing locks
@@ -82,9 +97,20 @@ async function requestWithdrawal(efrId, { amount }, pool) {
 
     const [ins] = await conn.query(
       `INSERT INTO tbl_easyfixer_withdrawal_request
-         (fk_easyfixer_id, amount, status, requested_on)
-       VALUES (?, ?, 'requested', NOW())`,
-      [efrId, amt],
+         (fk_easyfixer_id, amount, status, requested_on,
+          bank_details_id, bank_account_number, bank_ifsc,
+          bank_account_holder_name, bank_id, bank_name)
+       VALUES (?, ?, 'requested', NOW(), ?, ?, ?, ?, ?, ?)`,
+      [
+        efrId,
+        amt,
+        bank.efr_bank_id,
+        bank.efr_bank_acc_num,
+        bank.efr_bank_ifsc,
+        bank.efr_bank_acc_name,
+        bank.bank_id,
+        bank.bank_name,
+      ],
     );
     await conn.commit();
     logger.info('Withdrawal request recorded · requestId=' + ins.insertId + ' amount=' + amt);
@@ -117,6 +143,8 @@ const PROCESSABLE_STATUSES = OPEN_STATUSES;
 const REQUEST_SELECT = `
   SELECT w.request_id, w.fk_easyfixer_id, w.amount, w.status,
          w.requested_on, w.processed_on, w.processed_by, w.remarks,
+         w.bank_details_id, w.bank_account_number, w.bank_ifsc,
+         w.bank_account_holder_name, w.bank_id, w.bank_name,
          e.efr_name, e.efr_no, e.current_balance
     FROM tbl_easyfixer_withdrawal_request w
     LEFT JOIN tbl_easyfixer e ON e.efr_id = w.fk_easyfixer_id`;
@@ -202,7 +230,8 @@ async function processWithdrawal(requestId, { action, remarks }, actor, pool) {
     //    actionable — anything already paid/rejected returns 409 so a
     //    double-submit (or a second operator) can't reprocess it.
     const [[reqRow]] = await conn.query(
-      `SELECT request_id, fk_easyfixer_id, amount, status
+      `SELECT request_id, fk_easyfixer_id, amount, status,
+              bank_account_number, bank_ifsc, bank_account_holder_name
          FROM tbl_easyfixer_withdrawal_request
         WHERE request_id = ? FOR UPDATE`,
       [requestId],
@@ -218,6 +247,18 @@ async function processWithdrawal(requestId, { action, remarks }, actor, pool) {
     const amt   = Number(reqRow.amount);
 
     if (action === 'pay') {
+      // Settle only against the immutable destination captured when the
+      // technician submitted this request. Never fall back to the mutable
+      // current bank-details row: changing that row after submission must not
+      // silently redirect an already-approved payout.
+      const accountNumber = String(reqRow.bank_account_number ?? '').trim();
+      const ifsc = String(reqRow.bank_ifsc ?? '').trim();
+      const accountHolder = String(reqRow.bank_account_holder_name ?? '').trim();
+      if (!accountNumber || !ifsc || !accountHolder) {
+        throw mkErr(409, 'PAYOUT_DESTINATION_MISSING',
+          'Payout destination is missing; reject this request and ask the technician to submit it again');
+      }
+
       // 2) Lock the wallet row and verify funds against the LIVE balance
       //    (the authoritative source — the technician may have earned/spent
       //    since the request was raised).

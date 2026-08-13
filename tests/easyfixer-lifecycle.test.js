@@ -155,6 +155,12 @@ test('technician projection hides only internal BLACKLISTED reason fields', () =
     'technician-actionable reasons remain visible without cloning');
 });
 
+test('blacklisted technician can load the bounded payout summary', () => {
+  assert.doesNotThrow(() => {
+    lifecycle._internals.assertReapplicationSummaryAllowed('BLACKLISTED');
+  });
+});
+
 test('REAPPLIED remains protected from implicit verification derivation', () => {
   assert.equal(protectsVerificationSync('REAPPLIED', undefined), true);
   assert.equal(protectsVerificationSync('REAPPLIED', 'APPLICATION_REJECTED'), false);

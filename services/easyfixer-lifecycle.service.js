@@ -87,7 +87,15 @@ const REAPPLIED_CRM_TARGETS = new Set([
   'REGISTRATION_INCOMPLETE',
   'APPLICATION_REJECTED',
 ]);
-const REAPPLICATION_SUMMARY_STATES = new Set(['INACTIVE', 'DORMANT', 'REAPPLIED']);
+// This bounded, scalar wallet/work summary also powers the terminal
+// BLACKLISTED payout wall. It contains no lifecycle reason or ledger rows, so
+// allowing that state does not expose the internal CRM review note.
+const REAPPLICATION_SUMMARY_STATES = new Set([
+  'INACTIVE',
+  'DORMANT',
+  'REAPPLIED',
+  'BLACKLISTED',
+]);
 const SOURCES = new Set(['CRM', 'CRON', 'APP', 'SYSTEM', 'LEGACY', 'MIGRATION', 'DERIVED']);
 
 // Exactly the six additive columns the migration installs. The scheduled block

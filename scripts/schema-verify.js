@@ -113,6 +113,12 @@ const EXPECTED = {
     'transaction_type', 'transaction_date', 'amount', 'balance',
     'created_date', 'created_by', 'job_id', 'trans_reason_code',
   ],
+  tbl_easyfixer_withdrawal_request: [
+    'request_id', 'fk_easyfixer_id', 'amount', 'status',
+    'requested_on', 'processed_on', 'processed_by', 'remarks',
+    'bank_details_id', 'bank_account_number', 'bank_ifsc',
+    'bank_account_holder_name', 'bank_id', 'bank_name',
+  ],
   tbl_tools: [
     'tool_id', 'tool_name', 'tool_desc', 'tool_status', 'tool_img',
   ],
@@ -214,6 +220,11 @@ const REQUIRED_INDEXES = [
   // for correctness — but it is what stops two writers racing a course into
   // holding the same video twice.
   { table: 'course_videos', columns: ['course_id', 'video_id'], unique: true },
+  {
+    table: 'tbl_easyfixer_withdrawal_request',
+    columns: ['fk_easyfixer_id', 'status'],
+    unique: false,
+  },
 ];
 
 function canonicalSql(value) {

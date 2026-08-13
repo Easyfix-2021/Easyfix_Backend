@@ -1320,7 +1320,26 @@ router.post('/profile/contact-info', validate(Joi.object({
 router.get('/bank-details', async (req, res, next) => {
   try {
     logger.info('Load bank details');
-    const [[b]] = await pool.query('SELECT * FROM tbl_easyfixer_bank_details WHERE efr_id = ? LIMIT 1', [req.tech.efr_id]);
+    // Explicit additive projection: the new app receives one stable camelCase
+    // contract while legacy consumers can keep using their existing routes.
+    // Avoid SELECT * so new DB columns cannot leak through this mobile API.
+    const [[b]] = await pool.query(
+      `SELECT d.efr_bank_acc_num,
+              d.efr_bank_acc_name,
+              d.efr_bank_ifsc,
+              d.bank,
+              d.is_verified_by_app,
+              d.efr_bank_acc_num AS accountNumber,
+              d.efr_bank_acc_name AS accountHolderName,
+              d.efr_bank_ifsc AS ifscCode,
+              n.bank_name AS bankName,
+              d.is_verified_by_app AS isVerified
+         FROM tbl_easyfixer_bank_details d
+         LEFT JOIN bank_name n ON n.id = d.bank
+        WHERE d.efr_Id = ?
+        LIMIT 1`,
+      [req.tech.efr_id],
+    );
     modernOk(res, b || null);
   } catch (e) { next(e); }
 });
