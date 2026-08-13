@@ -391,8 +391,26 @@ async function listNotices({
     `SELECT ${ROW_SELECT}
        FROM tbl_notice n ${ROW_JOINS}
       WHERE ${where.join(' AND ')}
-      ORDER BY n.is_pinned DESC,
-               COALESCE(n.publish_at, n.created_at) DESC,
+      /*
+       * PUBLISH DATE ONLY — no is_pinned tie-break (2026-08-13).
+       *
+       * This is the ADMIN Notice Board list, and pinning is a reader-facing
+       * concept: it decides what surfaces first in the feed, not how the
+       * management list is browsed. Sorting by it here meant a pinned notice sat at
+       * the top of the management table permanently — including after it was
+       * archived or expired — so the newest notice an admin had just written
+       * was pushed below dead ones. The pin icon in the Title column still
+       * shows the flag; it just no longer drives the order.
+       *
+       * The active feed (getActiveNoticesFor, below) KEEPS is_pinned DESC:
+       * there it is the point, and that query already excludes archived and
+       * expired rows, so nothing can get stuck at the top forever.
+       *
+       * COALESCE(publish_at, created_at) is retained so drafts — which have no
+       * publish_at — still land in a sensible place instead of all collapsing
+       * to the bottom on a NULL.
+       */
+      ORDER BY COALESCE(n.publish_at, n.created_at) DESC,
                n.notice_id DESC
       LIMIT ? OFFSET ?`,
     [...params, limit, offset],
