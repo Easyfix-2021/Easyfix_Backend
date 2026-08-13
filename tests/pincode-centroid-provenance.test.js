@@ -59,6 +59,8 @@ const DEFAULTS = () => ({
   geocoded: [],             // PINs Google was asked for
   inFlight: 0,
   maxInFlight: 0,
+  fetchRejects: null,       // when set, the stub throws this instead of answering
+  sawSignal: false,         // did the caller pass an AbortSignal?
 });
 let scenario = DEFAULTS();
 
@@ -86,12 +88,19 @@ const realKey = process.env.GOOGLE_MAPS_API_KEY;
 process.env.GOOGLE_MAPS_API_KEY = 'test-key-not-used-fetch-is-stubbed';
 
 const realFetch = global.fetch;
-global.fetch = async (url) => {
+global.fetch = async (url, init) => {
   // geocodeOne builds the components param through encodeURIComponent, so the
   // colon arrives as %3A. Match both forms rather than the pretty one.
   const pin = String(url).match(/postal_code(?::|%3A)(\d{6})/i)?.[1];
   assert.ok(pin, `stub could not read a pincode out of the geocode URL: ${url}`);
+  scenario.sawSignal = !!init?.signal;
   scenario.geocoded.push(pin);
+  if (scenario.fetchRejects) {
+    // Stand-in for the AbortSignal firing: undici rejects the fetch promise.
+    const e = new Error(scenario.fetchRejects);
+    e.name = 'TimeoutError';
+    throw e;
+  }
   scenario.inFlight += 1;
   scenario.maxInFlight = Math.max(scenario.maxInFlight, scenario.inFlight);
   await new Promise((r) => setTimeout(r, 5)); // hold the slot so overlap is observable
@@ -183,6 +192,34 @@ test('PRE-MIGRATION the behaviour is unchanged — legacy coords still trusted',
   assert.deepEqual(scenario.geocoded, [], 'no column means no new behaviour, and no new spend');
   const km = geo.haversineKm(m.get(TECH_PIN), m.get(JOB_PIN));
   assert.ok(km > 200, `pre-migration still shows the legacy answer, got ${km.toFixed(1)}`);
+});
+
+/* ═══ the real-time path must stay bounded ══════════════════════════════ */
+
+test('the geocode call carries an abort signal — a hanging Google cannot hold the render', async () => {
+  await geo.getCentroids([TECH_PIN]);
+  assert.ok(scenario.sawSignal,
+    'fetch must be given an AbortSignal; node has no useful default request timeout, '
+    + 'and this now runs inline on the Schedule & Assign render');
+});
+
+test('a timed-out geocode yields NO distance rather than a wrong one', async () => {
+  /*
+   * The whole point of the provenance change is to stop showing confident
+   * wrong numbers. A failed lookup must therefore produce null — which the UI
+   * renders as '—' — and must NOT fall back to the legacy coordinate it just
+   * refused to trust, or write anything to the row.
+   */
+  scenario.fetchRejects = 'The operation was aborted due to timeout';
+
+  const m = await geo.getCentroids([TECH_PIN, JOB_PIN]);
+
+  assert.equal(m.get(TECH_PIN), null, 'a timeout is a missing distance, not a legacy one');
+  assert.equal(m.get(JOB_PIN), null);
+  assert.equal(geo.haversineKm(m.get(TECH_PIN), m.get(JOB_PIN)), null,
+    'haversine of a null point is null, so the column renders blank');
+  assert.equal(fake.calls.filter((c) => /UPDATE tbl_pincode SET lat/i.test(c.sql)).length, 0,
+    'nothing may be persisted or stamped when the lookup failed');
 });
 
 /* ═══ cold-start blast radius ═══════════════════════════════════════════ */

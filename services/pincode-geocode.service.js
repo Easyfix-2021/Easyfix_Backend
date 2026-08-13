@@ -42,6 +42,22 @@ const memCache = new Map(); // pincode → { value: {lat,lng}|null, expires }
 // magnitude of third-party fan-out.
 const GEOCODE_CONCURRENCY = 8;
 
+/*
+ * Per-call ceiling on the Google Geocoding request.
+ *
+ * This resolver now runs INLINE on the Schedule & Assign render for any
+ * pincode not yet self-geocoded, and node's fetch has no useful default
+ * request timeout — so without this, one hanging Google connection holds the
+ * candidate list open indefinitely. Measured round-trip is ~226ms median /
+ * ~611ms tail, so 3s is ~5x the tail: generous enough never to fire on a
+ * healthy call, short enough that a sick one degrades instead of hanging.
+ *
+ * Timing out is already a handled outcome — the abort surfaces as a throw in
+ * geocodeOne, which yields null for that PIN, which renders the distance as
+ * '—'. A missing distance is a fair trade for a page that returns.
+ */
+const GEOCODE_TIMEOUT_MS = 3000;
+
 function serverApiKey() {
   // Single server-side key, shared with services/maps.service.js.
   return process.env.GOOGLE_MAPS_API_KEY || null;
@@ -246,7 +262,7 @@ async function getCentroid(pincode) {
 async function geocodeOne(pin, apiKey) {
   try {
     const url = `${GEOCODE_URL}?components=${encodeURIComponent(`postal_code:${pin}|country:IN`)}&key=${apiKey}`;
-    const r = await fetch(url);
+    const r = await fetch(url, { signal: AbortSignal.timeout(GEOCODE_TIMEOUT_MS) });
     const data = await r.json();
     if (data.status !== 'OK') {
       // Don't echo error_message verbatim — it can contain the key on
@@ -333,7 +349,7 @@ async function geocodePincodeDetail(pincode) {
   }
   try {
     const url = `${GEOCODE_URL}?components=${encodeURIComponent(`postal_code:${pin}|country:IN`)}&key=${apiKey}`;
-    const r = await fetch(url);
+    const r = await fetch(url, { signal: AbortSignal.timeout(GEOCODE_TIMEOUT_MS) });
     const data = await r.json();
     if (data.status !== 'OK' || !data.results?.length) {
       logger.warn({ pin, status: data.status }, 'pincode-geocode: detail geocode non-OK');
