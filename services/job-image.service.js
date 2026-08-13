@@ -110,6 +110,7 @@ async function serveResolvedImage(res, storedValue) {
     const url = stored.includes('/')
       ? `${fileBase.replace(/\/+$/, '')}/${stored.replace(/^\/+/, '')}`
       : `${fileBase.replace(/\/+$/, '')}/upload_jobs/${stored}`;
+    logger.info({ stored, url }, 'serveResolvedImage → redirect URL');
     return res.redirect(url);
   }
 
