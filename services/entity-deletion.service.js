@@ -1,5 +1,30 @@
 const { pool } = require('../db');
 const logger = require('../logger');
+const {
+  assertActiveAadhaarAvailable,
+  mapAadhaarUniqueViolation,
+  normalizeAadhaar,
+} = require('../utils/aadhaar-uniqueness');
+
+/**
+ * Restore-flavoured Aadhaar conflict. Same 409 code as everywhere else so the
+ * client vocabulary stays uniform, but a different sentence: the operator needs
+ * to know this record cannot be un-deleted as-is. Carries no value and no
+ * holder id — returning either would make restore an enumeration oracle.
+ */
+async function assertRestorableAadhaar(runner, aadhaar, efrId) {
+  try {
+    await assertActiveAadhaarAvailable(runner, aadhaar, efrId);
+  } catch (error) {
+    if (error?.details?.code !== 'AADHAAR_ALREADY_REGISTERED') throw error;
+    const conflict = new Error(
+      "This technician's Aadhaar number has since been registered to another technician",
+    );
+    conflict.status = 409;
+    conflict.details = { code: 'AADHAAR_ALREADY_REGISTERED' };
+    throw conflict;
+  }
+}
 
 /*
  * Admin entity delete + restore (easyfixer / user) — TOMBSTONE strategy.
@@ -355,8 +380,41 @@ async function listDeleted({ type, limit = 50, offset = 0 } = {}) {
   return { items, total };
 }
 
-function buildInsert(table, row) {
-  const cols = Object.keys(row);
+/*
+ * Generated (VIRTUAL/STORED) columns must never appear in an INSERT or UPDATE
+ * column list — MySQL rejects that with errno 3105
+ * (ER_NON_DEFAULT_VALUE_FOR_GENERATED_COLUMN), and isMissingSchema() does not
+ * swallow it.
+ *
+ * This became a live restore failure on 2026-08-11: migration
+ * 2026-08-11-03-active-aadhaar-uniqueness.sql added the VIRTUAL column
+ * tbl_easyfixer.active_aadhaar_unique, snapshots are taken with `SELECT *`, and
+ * restore derives its column list from the snapshot's keys — so every technician
+ * tombstoned since then failed to restore. Probed from INFORMATION_SCHEMA rather
+ * than hard-coding the name, so a future generated column cannot reintroduce it.
+ * Cached per table for the process; a probe failure is treated as "none", which
+ * preserves the previous behaviour exactly.
+ */
+const generatedColumnCache = new Map();
+async function generatedColumnsFor(runner, table) {
+  if (generatedColumnCache.has(table)) return generatedColumnCache.get(table);
+  let columns = new Set();
+  try {
+    const [rows] = await runner.query(
+      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = ?
+          AND EXTRA LIKE '%GENERATED%'`,
+      [table],
+    );
+    columns = new Set(rows.map((row) => row.COLUMN_NAME));
+  } catch { /* treat as none — restores behave exactly as before the probe */ }
+  generatedColumnCache.set(table, columns);
+  return columns;
+}
+
+function buildInsert(table, row, skip = new Set()) {
+  const cols = Object.keys(row).filter((c) => !skip.has(c));
   const placeholders = cols.map(() => '?').join(', ');
   const colSql = cols.map((c) => `\`${c}\``).join(', ');
   const vals = cols.map((c) => coerce(row[c]));
@@ -385,9 +443,22 @@ async function restore(archiveId, admin) {
     const snapshot = JSON.parse(arch.snapshot_json);
     const g = graphFor(arch.entity_type);
     const parent = snapshot.parent;
+    // Older snapshots were taken with SELECT * AFTER the generated column
+    // existed, so they carry it; it can never be written back.
+    const generated = await generatedColumnsFor(conn, g.parentTable);
+
+    /*
+     * Aadhaar duplicate guard. Restore is the ONLY path that moves a row out of
+     * efr_status = 3, and therefore the only path that RE-RESERVES an Aadhaar
+     * under the generated column's semantics — the number may well have been
+     * claimed by an active technician while this row sat tombstoned.
+     */
+    if (g.parentTable === 'tbl_easyfixer' && normalizeAadhaar(parent.adhaar_card_number)) {
+      await assertRestorableAadhaar(conn, parent.adhaar_card_number, arch.entity_id);
+    }
 
     // Re-apply the full parent row (the tombstone row still occupies the id).
-    const setCols = Object.keys(parent).filter((c) => c !== g.pk);
+    const setCols = Object.keys(parent).filter((c) => c !== g.pk && !generated.has(c));
     const setSql = setCols.map((c) => `\`${c}\` = ?`).join(', ');
     const setVals = setCols.map((c) => coerce(parent[c]));
     const [upd] = await conn.query(
@@ -396,7 +467,7 @@ async function restore(archiveId, admin) {
     );
     if (upd.affectedRows === 0) {
       // Tombstone row was hard-removed out of band — re-insert it whole.
-      const { sql, vals } = buildInsert(g.parentTable, parent);
+      const { sql, vals } = buildInsert(g.parentTable, parent, generated);
       await conn.query(sql, vals);
     }
 
@@ -431,8 +502,11 @@ async function restore(archiveId, admin) {
     return { entityType: arch.entity_type, id: arch.entity_id, label: arch.entity_label };
   } catch (err) {
     await conn.rollback();
-    logger.warn('Restore failed · archiveId=' + archiveId + ' · ' + err.message);
-    throw err;
+    // Map BEFORE logging: a raw mysql2 ER_DUP_ENTRY message embeds the rejected
+    // Aadhaar, and this line would write it straight into the application log.
+    const safe = mapAadhaarUniqueViolation(err);
+    logger.warn('Restore failed · archiveId=' + archiveId + ' · ' + safe.message);
+    throw safe;
   } finally {
     conn.release();
   }

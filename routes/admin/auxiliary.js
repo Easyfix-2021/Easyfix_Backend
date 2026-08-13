@@ -4,6 +4,7 @@ const validate = require('../../middleware/validate');
 const { pool } = require('../../db');
 const logger = require('../../logger');
 const { modernOk, modernError } = require('../../utils/response');
+const { assertActiveAadhaarAvailable } = require('../../utils/aadhaar-uniqueness');
 
 /*
  * Auxiliary admin endpoints — attendance, training videos, materials,
@@ -191,44 +192,57 @@ router.delete('/training-videos/:id', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// ─── Aadhaar / PAN uniqueness ───────────────────────────────────────
-// VERIFIED tbl_easyfixer columns: adhaar_card_number (DB spelling
-// preserves the "adhaar" typo per CLAUDE.md), pan_card_number.
-router.get('/aadhaar-check/:number', async (req, res, next) => {
+/*
+ * ─── Aadhaar / PAN uniqueness ───────────────────────────────────────
+ * VERIFIED tbl_easyfixer columns: adhaar_card_number (DB spelling preserves the
+ * "adhaar" typo per CLAUDE.md), pan_card_number.
+ *
+ * Hardened 2026-08-12. Three defects, all fixed here:
+ *
+ *  1. GET with a path param put the Aadhaar into req.originalUrl, which
+ *     middleware/http-log.js prints on EVERY request — the value was in the
+ *     access log on every call. Now a POST body, which is not logged.
+ *  2. The response returned `existing_efr_id`, turning a yes/no check into an
+ *     Aadhaar-to-technician resolver. It now returns a bare boolean: an operator
+ *     needs to know the number is taken, not by whom.
+ *  3. The predicate ignored efr_status, so a soft-deleted (efr_status = 3)
+ *     technician still reported the number as taken — contradicting the
+ *     generated column, which frees a deleted row's number. Delegated to the
+ *     shared guard's semantics so this can no longer drift from the write path.
+ */
+router.post('/aadhaar-check', validate(Joi.object({
+  number: Joi.string().trim().pattern(/^([0-9]{12}|[A-Za-z]{5}[0-9]{4}[A-Za-z])$/).required()
+    .messages({ 'string.pattern.base': 'number must be a 12-digit Aadhaar or a valid PAN' }),
+})), async (req, res, next) => {
   try {
-    const n = req.params.number;
     logger.info('Aadhaar/PAN uniqueness check');
-    const [[r]] = await pool.query(
-      `SELECT COUNT(*) AS n, MIN(efr_id) AS existing_efr_id
-         FROM tbl_easyfixer
-        WHERE adhaar_card_number = ? OR pan_card_number = ?`,
-      [n, n]
-    );
-    logger.info('Aadhaar/PAN check result · exists=' + (r.n > 0) + ' · existingEfrId=' + (r.existing_efr_id ?? '—'));
-    modernOk(res, { exists: r.n > 0, existing_efr_id: r.existing_efr_id });
+    let exists = false;
+    try {
+      // excludeEfrId 0 — this is a pre-create check with no row of its own.
+      await assertActiveAadhaarAvailable(pool, req.body.number, 0);
+    } catch (error) {
+      if (error?.details?.code !== 'AADHAAR_ALREADY_REGISTERED') throw error;
+      exists = true;
+    }
+    logger.info('Aadhaar/PAN check result · exists=' + exists);
+    modernOk(res, { exists });
   } catch (e) { next(e); }
 });
 
-// ─── Aadhaar auto-fill (name+DOB lookup) ────────────────────────────
-// Legacy endpoint `/profile/name-dob-aadhaar` — returns name + DOB
-// stored against an aadhaar number on tbl_easyfixer. Useful for the
-// "I recognise this person" pre-fill flow.
-router.get('/aadhaar-prefill/:number', async (req, res, next) => {
-  try {
-    logger.info('Aadhaar prefill lookup');
-    const [[r]] = await pool.query(
-      `SELECT efr_id, efr_name, date_of_birth AS dob, adhaar_card_number, pan_card_number
-         FROM tbl_easyfixer
-        WHERE adhaar_card_number = ?
-        LIMIT 1`,
-      [req.params.number]
-    );
-    if (!r) logger.warn('Aadhaar prefill · no easyfixer matched');
-    if (!r) return modernError(res, 404, 'no easyfixer with this aadhaar');
-    logger.info('Aadhaar prefill matched · efr_id=' + r.efr_id);
-    modernOk(res, r);
-  } catch (e) { next(e); }
-});
+/*
+ * ─── Aadhaar auto-fill (name+DOB lookup) — REMOVED 2026-08-12 ────────
+ * `GET /aadhaar-prefill/:number` returned efr_id, name, date of birth,
+ * adhaar_card_number AND pan_card_number for whoever held a GUESSED Aadhaar,
+ * with no efr_status filter. Any CRM user could walk the 12-digit space and
+ * harvest full identity records — the number is the lookup key, so knowing it is
+ * the only "authorisation" the endpoint ever required. It had no caller in any
+ * repo (CRM UI, client UI, mobile app), so the "I recognise this person" prefill
+ * flow it was ported for was never built.
+ *
+ * Do not reintroduce a lookup keyed on an identity number. If a prefill flow is
+ * ever needed, key it on something the operator already legitimately holds (an
+ * efr_id from a list they can see) and return the minimum needed.
+ */
 
 // ─── Geocoding proxy (MapMyIndia) with simple in-memory token cache ─
 // The legacy geocoding flow has two endpoints: (1) get an OAuth token,

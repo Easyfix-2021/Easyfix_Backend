@@ -3,8 +3,17 @@ const { LIFECYCLE_STATUSES } = require('../services/easyfixer-lifecycle.service'
 
 const mobile = Joi.string().pattern(/^[0-9]{10}$/);
 const gpsPair = Joi.string().pattern(/^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/);
-const aadhaar = Joi.string().pattern(/^[0-9]{12}$/);
-const pan     = Joi.string().pattern(/^[A-Z]{5}[0-9]{4}[A-Z]$/i);
+/*
+ * PII: Joi's default `string.pattern.base` template EMBEDS the rejected value
+ * ("value" fails to match ...). middleware/validate.js collects those messages
+ * into `details`, logs them, AND returns them to the client — so an invalid
+ * Aadhaar/PAN would be written to the application log verbatim. Override the
+ * message so only the RULE is reported, never the input.
+ */
+const aadhaar = Joi.string().pattern(/^[0-9]{12}$/)
+  .messages({ 'string.pattern.base': 'Aadhaar number must be exactly 12 digits' });
+const pan     = Joi.string().pattern(/^[A-Z]{5}[0-9]{4}[A-Z]$/i)
+  .messages({ 'string.pattern.base': 'PAN must be 5 letters, 4 digits, then a letter' });
 
 /*
  * Column names below intentionally match the DB schema (snake_case,
@@ -223,8 +232,9 @@ const identityVerificationBody = Joi.object({
     then: Joi.string().trim().min(1).max(2000).required(),
     otherwise: Joi.allow('', null).optional(),
   }),
-  adhaar_card_number:   Joi.string().pattern(/^[0-9]{12}$/).optional(),
-  pan_card_number:      Joi.string().pattern(/^[A-Z]{5}[0-9]{4}[A-Z]$/i).optional(),
+  // Reuse the shared definitions so the PII-safe messages apply here too.
+  adhaar_card_number:   aadhaar.optional(),
+  pan_card_number:      pan.optional(),
   progress:             Joi.number().integer().min(0).max(100).optional(),
 }).min(1);
 

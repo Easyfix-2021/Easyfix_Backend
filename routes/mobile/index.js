@@ -1452,16 +1452,43 @@ router.get('/training-videos', async (_req, res, next) => {
 });
 
 // Customer lookup by mobile (from tech app for OTP flows)
-router.get('/customers/mobile/:mobile', async (req, res, next) => {
+/*
+ * Customer lookup by mobile. The number travels in the BODY, not the path
+ * (2026-08-12): a URL is logged on every request, on every error, and by every
+ * upstream proxy/CDN we do not control, so a phone number in the path was
+ * written out at request rate. A query string would be no better — it is part
+ * of req.originalUrl too.
+ */
+async function lookupCustomerByMobile(rawMobile, res, next) {
   try {
     logger.info('Lookup customer by mobile');
+    const mobile = String(rawMobile || '').replace(/\D/g, '');
     const [[cust]] = await pool.query(
       'SELECT customer_id, customer_name, customer_mob_no, customer_email FROM tbl_customer WHERE customer_mob_no = ? LIMIT 1',
-      [req.params.mobile]);
+      [mobile]);
     logger.info('Customer lookup · found=' + Boolean(cust));
-    modernOk(res, cust || null);
-  } catch (e) { next(e); }
-});
+    return modernOk(res, cust || null);
+  } catch (e) { return next(e); }
+}
+
+// Canonical.
+router.post('/customers/lookup', (req, res, next) => (
+  lookupCustomerByMobile(req.body?.mobile, res, next)
+));
+
+/*
+ * The deprecated GET /customers/mobile/:mobile alias was removed 2026-08-12.
+ * It was unreachable rather than merely unused: this router is behind technician
+ * JWT auth, the only holder of such a token is the new RN technician app (not
+ * yet live, and it never called this), and the old Flutter app authenticates
+ * against the legacy secret so it cannot reach /api/mobile/* at all. Its
+ * deprecation warning could never fire.
+ *
+ * The equivalent alias on the CLIENT router is deliberately still in place:
+ * Easyfix_Client_App is an installed mobile binary, so builds predating the POST
+ * migration are still in the field and would 404. Retire that one only when its
+ * deprecation log line has been quiet across a full release cycle.
+ */
 
 // ─── Net-new technician sub-routers (2026-06-15, mobile-only) ───────
 // Mounted AFTER the inline routes above so they can never shadow an existing
@@ -1478,7 +1505,7 @@ router.use(require('./attendance'));
 router.use(require('./lookups'));
 //   /profile/name · /profile/image · /earnings · /icard · /ratings
 //   /training-videos/percentage · /app-version · /logout · /upi-details
-//   /kyc/aadhaar-pan-exists/:number
+//   /kyc/aadhaar-pan-exists  (POST — the number travels in the body, never the URL)
 router.use(require('./profile-extra'));
 //   /performance/weekly  (live OTA/SDA weekly chart — net-new GAP #5)
 router.use('/performance', require('./performance'));

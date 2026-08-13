@@ -1,7 +1,11 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const lifecycleService = require('./easyfixer-lifecycle.service');
-const { mapAadhaarUniqueViolation } = require('../utils/aadhaar-uniqueness');
+const {
+  mapAadhaarUniqueViolation,
+  normalizeAadhaar,
+  withActiveAadhaarGuard,
+} = require('../utils/aadhaar-uniqueness');
 
 /*
  * Easyfixer (technician) CRUD.
@@ -561,6 +565,16 @@ async function create(input, actor) {
   const conn = await pool.getConnection();
   const lockName = `easyfixer_create_${input.efr_no}`; // < 64 chars, efr_no is a mobile number
   try {
+    /*
+     * Aadhaar duplicate guard. The efr_no lock below is keyed on the MOBILE
+     * number, so two creates with different mobiles but the SAME Aadhaar take
+     * different locks and both succeed — it cannot serialise this. The value
+     * lock is taken first (coarse before fine) so the two named locks have a
+     * total order and cannot deadlock; both precede any InnoDB lock. Passing
+     * excludeEfrId 0 because no row exists yet. No-op when no Aadhaar is
+     * supplied, which is the common case for a CRM create.
+     */
+    return await withActiveAadhaarGuard(conn, input.adhaar_card_number, 0, async () => {
     const [[lock]] = await conn.query('SELECT GET_LOCK(?, 5) AS got', [lockName]);
     if (!lock || lock.got !== 1) {
       logger.warn('Create easyfixer blocked · could not acquire mobile-number lock');
@@ -607,6 +621,7 @@ async function create(input, actor) {
     );
     logger.info('Easyfixer created · id=' + result.insertId);
     return getById(result.insertId);
+    });
   } catch (error) {
     throw mapAadhaarUniqueViolation(error);
   } finally {
@@ -650,10 +665,23 @@ async function update(id, input, actor) {
     updateSql = `UPDATE tbl_easyfixer SET ${sets.join(', ')} WHERE efr_id = ?`;
   }
 
+  /*
+   * Aadhaar duplicate guard. This path took NO lock at all before, on either
+   * branch. The guard runs on its OWN pinned connection and completes before
+   * transition() (which pins its own connection and takes `... FOR UPDATE`) or
+   * the bare pool.query below — never while an InnoDB row lock is held, which is
+   * the rule that keeps the named lock out of any row-lock wait cycle. Only pin
+   * a connection when an Aadhaar is actually being written; the overwhelmingly
+   * common edit does not touch it and must not pay for a lock or a pool slot.
+   */
+  const guardedAadhaar = normalizeAadhaar(input.adhaar_card_number);
+  const lockConn = guardedAadhaar ? await pool.getConnection() : null;
+
   // Always take the lifecycle row lock when either lifecycle-owned input is
   // present. Do not decide from the earlier detail read: another request may
   // change the manager mapping or verification flag before this transaction.
   try {
+    const applyUpdate = async () => {
     if (lifecycleInstalled && (ownsManagerMapping || ownsVerificationFlag)) {
       await lifecycleService.transition(id, {
         source: 'CRM',
@@ -681,8 +709,17 @@ async function update(id, input, actor) {
       if (!updateSql) return existing; // nothing to change
       await pool.query(updateSql, values);
     }
+    return null;
+    };
+
+    const nothingToChange = lockConn
+      ? await withActiveAadhaarGuard(lockConn, guardedAadhaar, id, applyUpdate)
+      : await applyUpdate();
+    if (nothingToChange) return nothingToChange;
   } catch (error) {
     throw mapAadhaarUniqueViolation(error);
+  } finally {
+    if (lockConn) lockConn.release();
   }
   logger.info('Easyfixer updated · id=' + id + ' fields=' + sets.length);
   return getById(id);

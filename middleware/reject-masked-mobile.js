@@ -25,6 +25,7 @@
  */
 
 const { MOBILE_FIELDS } = require('../utils/mask-mobile');
+const { redactUrl } = require('../utils/log-format');
 
 const BULLET = '•'; // •
 
@@ -65,7 +66,9 @@ function rejectMaskedMobileMiddleware(req, res, next) {
   const logger = require('../logger');
   logger.warn(
     {
-      route: req.originalUrl,
+      // This guard fires on mobile-number handling, so the URL is the last place
+      // an unredacted number should survive.
+      route: redactUrl(req.originalUrl),
       method: req.method,
       fields: hits.map((h) => h.field),
       actor: req.user?.user_id || req.tech?.efr_id || req.spoc?.id || 'unknown',

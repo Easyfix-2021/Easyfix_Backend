@@ -8,6 +8,7 @@
 
 const { modernError, legacyError } = require('../utils/response');
 const logger = require('../logger');
+const { redactUrl } = require('../utils/log-format');
 
 function isIntegrationRoute(req) {
   return req.originalUrl.startsWith('/api/integration/');
@@ -62,7 +63,9 @@ function validate(schema, source = 'body') {
       try {
         logger.warn({
           method: req.method,
-          url: req.originalUrl,
+          // A validation failure is exactly when a malformed identity value is
+          // in flight, so this line must not carry it.
+          url: redactUrl(req.originalUrl),
           source,
           details,
           sample: redactedSample(req[source]),
