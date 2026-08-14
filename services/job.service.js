@@ -4838,6 +4838,20 @@ async function acceptOffer(jobId, efrId) {
         err.status = 409;
         throw err;
       }
+      /*
+       * TechAssigned fires HERE, on acceptance — not when the offer was made.
+       *
+       * Legacy fired it the moment job_status became PENDING_TO_START (=1)
+       * with a technician attached (EasyfixerCallRecordServiceImpl.java:183),
+       * i.e. on the tech's accept, never on the nomination. assign()'s own
+       * fire covers the direct hard-schedule path, which performs the same
+       * BOOKED→SCHEDULED transition inline; the offer path returns before
+       * reaching it, so these are mutually exclusive and cannot double-fire.
+       *
+       * Post-commit deliberately: the dispatcher re-reads the job to build the
+       * payload, so firing inside the transaction would race its own write.
+       */
+      fireWebhook('TechAssigned', jobId);
       return { accepted: true, jobId: Number(jobId) };
     }
 
@@ -4916,6 +4930,9 @@ async function acceptOffer(jobId, efrId) {
       await conn.commit();
       committed = true;
       logger.info('Job offer accepted (won race) · id=' + jobId + ' · efrId=' + efrId);
+      // Acceptance = the legacy TechAssigned moment. See the note on the
+      // sibling claim path above; only the winner of the race reaches here.
+      fireWebhook('TechAssigned', jobId);
       return { accepted: true, jobId: Number(jobId) };
     }
 
