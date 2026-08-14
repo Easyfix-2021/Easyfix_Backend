@@ -12,6 +12,9 @@ const {
   formatLegacyDate,
   checkFirefoxAvailability,
   checkDecathlonServiceability,
+  clientServiceCatalog,
+  resolveCityId,
+  paymentCollectedByCode,
 } = require('../../../services/integration.service');
 const { writeBuffer } = require('../../../utils/file-storage');
 const logger = require('../../../logger');
@@ -21,34 +24,19 @@ router.use(basicAuth);
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
-// ─── /v1/services — Get service catalog ─────────────────────────────
+// ─── /v1/services — the client's own priced service catalogue ───────
+// The `service_id` values in the response are what POST /v1/jobs expects
+// back in `service_type.services[]`, so this endpoint is the entry point
+// for the whole integration: without it a client cannot book anything.
 router.get('/services', async (req, res, next) => {
   try {
-    logger.info('Integration: fetch service catalog');
-    const cats = await lookupService.serviceCategories();
-    const types = await lookupService.serviceTypes();
-    logger.info('Found ' + cats.length + ' categories, ' + types.length + ' service-types');
-    const byCatg = new Map();
-    for (const c of cats) {
-      byCatg.set(c.service_catg_id, {
-        service_catg_id: c.service_catg_id,
-        service_catg_name: c.service_catg_name,
-        service_catg_desc: c.service_catg_desc,
-        category_services: [],
-      });
-    }
-    for (const t of types) {
-      const entry = byCatg.get(t.service_catg_id);
-      if (!entry) continue;
-      entry.category_services.push({
-        service_type: {
-          service_type_id: t.service_type_id,
-          service_type_name: t.service_type_name,
-          services: [],  // filled from tbl_client_service scoped to this client
-        },
-      });
-    }
-    legacyOk(res, [...byCatg.values()]);
+    logger.info('Integration: fetch service catalog · clientId=' + req.integrationClient.id);
+    const data = await clientServiceCatalog(pool, {
+      clientId: req.integrationClient.id,
+      serviceTypeId: req.query.serviceTypeId,
+    });
+    logger.info('Returning ' + data.length + ' service categories');
+    legacyOk(res, data);
   } catch (e) { next(e); }
 });
 
@@ -84,6 +72,10 @@ router.post(['/jobs', '/jobs/newJob'], async (req, res, next) => {
     // Convert requested_date from "DD-MM-YYYY HH:mm" to JS Date
     const reqDt = parseLegacyDate(b.requested_date);
 
+    // Clients send the city by NAME ("Gurgaon"); city_id is the exception.
+    const { cityId, unknownName } = await resolveCityId(pool, addr.city);
+    if (unknownName) return legacyError(res, 400, `Unknown city "${unknownName}"`);
+
     const created = await jobService.create({
       fk_client_id: req.integrationClient.id,
       job_desc: b.jobDesc,
@@ -98,6 +90,13 @@ router.post(['/jobs', '/jobs/newJob'], async (req, res, next) => {
       additional_name: b.additionalName,
       additional_number: b.additionalNumber,
       helper_req: !!b.helperReq,
+      // Technician-facing note. Legacy mapped `specialComments` onto
+      // tbl_job.efr_special_notes — NOT onto job_desc.
+      efr_special_notes: b.specialComments,
+      // Legacy stored the raw integer; `bookingCutOffTime: 12` means noon.
+      booking_cut_off_time_slot: b.bookingCutOffTime != null ? String(b.bookingCutOffTime) : undefined,
+      // "Any" | "Serviceman" | "Easyfix" | "Client" → 0..3
+      collected_by: paymentCollectedByCode(b.paymentCollectedBy),
       service_type_ids: serviceIds.join(','),
       customer: {
         customer_name: customer.name,
@@ -107,15 +106,56 @@ router.post(['/jobs', '/jobs/newJob'], async (req, res, next) => {
       address: {
         address: addr.address,
         building: addr.building,
-        city_id: addr.city?.city_id || null, // legacy sometimes sends by name
+        city_id: cityId,
         pin_code: addr.pinCode,
         gps_location: addr.gps,
       },
+      /*
+       * Quantity 1 per line, and NO price from the request. Legacy copied the
+       * caller's `service_amount` / `job_charge_type` straight into
+       * tbl_job_services, so the documented payload (service_id only) booked
+       * every job at zero and let a client invent its own price. create()
+       * prices from the client's rate card instead — same service_id in,
+       * correct money out.
+       */
       services: serviceIds.map((id) => ({ service_id: id, quantity: 1 })),
     }, { user_id: null });
 
+    /*
+     * paid_by is not a create() input — it is meaningful only on this legacy
+     * contract, so it is stamped here rather than widening the shared job
+     * creation path for every caller. Same enum as collected_by.
+     */
+    if (b.paidBy != null && b.paidBy !== '') {
+      await pool.query('UPDATE tbl_job SET paid_by = ? WHERE job_id = ?', [Number(b.paidBy), created.job_id]);
+    }
+
+    /*
+     * jobImageIds — images uploaded BEFORE the job existed (the documented
+     * two-step flow) are adopted here. Scoped to this client's own orphan
+     * images: legacy did no ownership check at all, so any integrator who
+     * guessed an id could attach another client's photograph to their job.
+     */
+    const imageIds = (Array.isArray(b.jobImageIds) ? b.jobImageIds : []).map(Number).filter(Boolean);
+    if (imageIds.length) {
+      const [adopted] = await pool.query(
+        `UPDATE tbl_job_image
+            SET job_id = ?, updated_by = ?, updated_date = NOW()
+          WHERE image_id IN (?) AND job_id IS NULL AND created_by = ?`,
+        [created.job_id, req.integrationClient.id, imageIds, req.integrationClient.id]
+      );
+      logger.info('Integration: adopted ' + adopted.affectedRows + '/' + imageIds.length + ' pre-uploaded images');
+    }
+
     logger.info('Integration: job created · id=' + created.job_id + ' ref=' + (created.client_ref_id || '-'));
-    legacyOk(res, { jobId: created.job_id, reference_id: created.client_ref_id });
+    // `id` is an alias for `jobId`: the legacy service returned the job entity
+    // whose primary key was `id`, so integrators read both spellings.
+    legacyOk(res, {
+      jobId: created.job_id,
+      id: created.job_id,
+      reference_id: created.client_ref_id,
+      currentStatus: statusLabel(created.job_status),
+    });
   } catch (e) {
     if (e.status) {
       logger.warn('Integration: create job rejected · ' + e.message);
@@ -240,26 +280,37 @@ router.post('/jobImage/addJobImages', upload.single('file'), async (req, res, ne
   try {
     logger.info('Integration: add job image · jobId=' + (req.body.JobId || req.body.jobId || '-'));
     if (!req.file) return legacyError(res, 400, 'file required');
-    const jobId = Number(req.body.JobId || req.body.jobId);
-    if (!jobId) return legacyError(res, 400, 'JobId required');
-    const job = await jobService.getById(jobId);
-    if (!job || job.fk_client_id !== req.integrationClient.id) {
-      logger.warn('Integration: image upload target not found / not owned · jobId=' + jobId);
-      return legacyError(res, 404, 'Not Found');
+    /*
+     * JobId is OPTIONAL — the documented contract is "any one or both".
+     * Omitting it stores an unattached image whose id the client passes to
+     * POST /v1/jobs as `jobImageIds`, which is how photographs get attached
+     * to a job that does not exist yet. Both spellings accepted: legacy
+     * bound the multipart part as `jobId` while the published document says
+     * `JobId`, so real integrator traffic exists in both casings.
+     */
+    const jobId = Number(req.body.JobId || req.body.jobId) || null;
+    if (jobId) {
+      const job = await jobService.getById(jobId);
+      if (!job || job.fk_client_id !== req.integrationClient.id) {
+        logger.warn('Integration: image upload target not found / not owned · jobId=' + jobId);
+        return legacyError(res, 404, 'Not Found');
+      }
     }
 
     const saved = writeBuffer('job_files', req.file.buffer, req.file.originalname, req.file.mimetype);
+    // created_by is what scopes a later `jobImageIds` adoption to the client
+    // that actually uploaded the file, so it must be stamped here.
     const [ins] = await pool.query(
-      `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, status, created_date)
-       VALUES (?, ?, 'unconfirmed', 0, 1, NOW())`,
-      [jobId, saved.filename]
+      `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, status, created_by, updated_by, created_date)
+       VALUES (?, ?, 'unconfirmed', 0, 1, ?, ?, NOW())`,
+      [jobId, saved.filename, req.integrationClient.id, req.integrationClient.id]
     );
-    logger.info('Integration: job image saved · jobId=' + jobId + ' imageId=' + ins.insertId);
+    logger.info('Integration: job image saved · jobId=' + (jobId || 'unattached') + ' imageId=' + ins.insertId);
     legacyOk(res, {
       imageId: ins.insertId, jobStage: 0, image: saved.filename,
       status: 1, createdTimestamp: formatLegacyDate(new Date()),
       imageCategory: 'unconfirmed',
-      createdBy: null, updatedBy: null,
+      createdBy: req.integrationClient.id, updatedBy: req.integrationClient.id,
     });
   } catch (e) { next(e); }
 });

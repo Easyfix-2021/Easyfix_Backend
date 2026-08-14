@@ -253,6 +253,143 @@ async function checkDecathlonServiceability(pool, { pincode, clientName }) {
   }
 }
 
+/**
+ * The `GET /v1/services` catalogue — a client's own priced service list,
+ * nested category → service-type → services.
+ *
+ * VERIFIED against EasyFix_API ClientServicesDAO.java:76-142 +
+ * ServicesResource.java:81-100 (the `website`-role branch, which is the shape
+ * the published client documentation shows).
+ *
+ * ─── Why this is per-client and not a global catalogue ───────────────────
+ *
+ * Every row comes from `tbl_client_service`, which IS the client's rate card:
+ * the same service type carries a different `total_amount` for each client.
+ * Returning the global `tbl_service_type` list (which is what this endpoint
+ * did before) leaks nothing but is useless — it can't carry a price, so the
+ * `services` array came back empty and integrators had no service_id to book
+ * with. The client filter is therefore load-bearing, not a permission check.
+ *
+ * Legacy quirks deliberately preserved, because integrators built against them:
+ *   - `service_status = 1` only; LIMIT 100 (legacy `setMaxResults(100)`).
+ *   - `service_id` is `client_service_id` — the per-client row id, NOT a global
+ *     service id. It is what `POST /v1/jobs` expects back in service_type.services.
+ *   - `service_name` is the RATE CARD name (`crc_ratecard_name`), not the
+ *     service-type name.
+ *   - One entry per distinct service_type within a category.
+ *
+ * Deliberately NOT preserved: legacy grouped categories with a HashMap, so
+ * category order varied between identical calls. We order by category then
+ * type so responses are stable and diffable.
+ */
+async function clientServiceCatalog(pool, { clientId, serviceTypeId } = {}) {
+  const clauses = ['cs.client_id = ?', 'cs.service_status = 1'];
+  const params = [clientId];
+  if (Number(serviceTypeId) > 0) {
+    clauses.push('cs.service_type_id = ?');
+    params.push(Number(serviceTypeId));
+  }
+  const [rows] = await pool.query(
+    `SELECT cs.client_service_id, cs.service_type_id, cs.service_catg_id,
+            cs.charge_type, cs.total_amount,
+            st.service_type_name, st.service_type_tool_names,
+            sc.service_catg_name, sc.service_catg_desc,
+            rc.crc_ratecard_name
+       FROM tbl_client_service cs
+       LEFT JOIN tbl_service_type    st ON st.service_type_id = cs.service_type_id
+       LEFT JOIN tbl_service_catg    sc ON sc.service_catg_id = cs.service_catg_id
+       LEFT JOIN tbl_client_rate_card rc ON rc.crc_id         = cs.rate_card_id
+      WHERE ${clauses.join(' AND ')}
+      ORDER BY cs.service_catg_id ASC, cs.service_type_id ASC, cs.client_service_id ASC
+      LIMIT 100`,
+    params
+  );
+  logger.info('Integration service catalogue · clientId=' + clientId + ' · rows=' + rows.length);
+
+  // Two levels of grouping in one pass: category → service-type → services.
+  const categories = new Map();
+  for (const r of rows) {
+    if (!categories.has(r.service_catg_id)) {
+      categories.set(r.service_catg_id, {
+        service_catg_id: r.service_catg_id,
+        service_catg_name: r.service_catg_name,
+        service_catg_desc: r.service_catg_desc,
+        category_services: [],
+        _types: new Map(),
+      });
+    }
+    const cat = categories.get(r.service_catg_id);
+    if (!cat._types.has(r.service_type_id)) {
+      const entry = {
+        service_type: {
+          service_type_id: r.service_type_id,
+          service_type_name: r.service_type_name,
+          services: [],
+        },
+      };
+      // Legacy emitted this key camelCase and dropped it when NULL (Jackson
+      // NON_NULL). Matching that exactly so a client mapping the response onto
+      // a strict DTO doesn't see a new always-present field.
+      if (r.service_type_tool_names != null) {
+        entry.service_type.serviceTypeToolNames = r.service_type_tool_names;
+      }
+      cat._types.set(r.service_type_id, entry);
+      cat.category_services.push(entry);
+    }
+    cat._types.get(r.service_type_id).service_type.services.push({
+      service_id: r.client_service_id,
+      service_name: r.crc_ratecard_name,
+      // Legacy widened the INT column to a Java float, so the wire showed
+      // `500.0`. JSON has one number type and JS cannot re-add a trailing
+      // `.0`, so this serialises as `500`. Numerically identical — only a
+      // client doing raw STRING comparison on the body would notice.
+      service_amount: r.total_amount == null ? null : Number(r.total_amount),
+      job_charge_type: r.charge_type,
+    });
+  }
+
+  return [...categories.values()].map(({ _types, ...cat }) => cat);
+}
+
+/**
+ * Resolve `address.city.city_name` to a city id.
+ *
+ * Legacy (CitiesDAO.java:44-70) matched city_name with exact equality under a
+ * case-insensitive collation and, on no match, returned null so the job was
+ * created with a NULL city_id — an address nobody could route to, with no
+ * error raised. We keep the permissive lookup (trim + case-insensitive) but
+ * report the miss to the caller, which is the one place this diverges from
+ * legacy on purpose: silently storing an unroutable address costs a field
+ * visit, and an integrator that gets told "unknown city" can fix it.
+ */
+async function resolveCityId(pool, city) {
+  if (!city) return { cityId: null, unknownName: null };
+  if (Number(city.city_id) > 0) return { cityId: Number(city.city_id), unknownName: null };
+  const name = String(city.city_name || '').trim();
+  if (!name) return { cityId: null, unknownName: null };
+  const [[row]] = await pool.query(
+    'SELECT city_id FROM tbl_city WHERE TRIM(city_name) = ? ORDER BY city_id ASC LIMIT 1',
+    [name]
+  );
+  if (row) return { cityId: row.city_id, unknownName: null };
+  logger.warn('Integration: unknown city name · "' + name + '"');
+  return { cityId: null, unknownName: name };
+}
+
+/*
+ * `paymentCollectedBy` is a STRING on the wire and an int in the column.
+ * Verbatim from EasyfixAPIUtils.getPaymentCollectByByString (:459-473),
+ * including the silent fall-through to 0 for anything unrecognised.
+ */
+const PAYMENT_COLLECTED_BY = Object.freeze({
+  any: 0, serviceman: 1, easyfix: 2, client: 3,
+});
+
+function paymentCollectedByCode(raw) {
+  if (raw == null || String(raw).trim() === '') return null;
+  return PAYMENT_COLLECTED_BY[String(raw).trim().toLowerCase()] ?? 0;
+}
+
 module.exports = {
   STATUS_LABELS,
   statusLabel,
@@ -260,4 +397,8 @@ module.exports = {
   formatLegacyDate,
   checkFirefoxAvailability,
   checkDecathlonServiceability,
+  clientServiceCatalog,
+  resolveCityId,
+  paymentCollectedByCode,
+  PAYMENT_COLLECTED_BY,
 };

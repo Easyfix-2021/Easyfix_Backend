@@ -1,0 +1,1053 @@
+<title>EasyFix Partner API</title>
+<style>
+  :root {
+    --ground:      #FBFAF9;
+    --surface:     #FFFFFF;
+    --surface-alt: #F5F1F1;
+    --ink:         #1A1618;
+    --ink-muted:   #6B6167;
+    --ink-faint:   #938A8E;
+    --rule:        #E6DEDF;
+    --accent:      #C42430;
+    --accent-soft: #FBEDEE;
+    --ok:          #166E4D;
+    --ok-soft:     #E7F3ED;
+    --warn:        #8A5A00;
+    --warn-soft:   #FBF1DF;
+    --code-ground: #201B1D;
+    --code-ink:    #EDE6E7;
+    --code-dim:    #9E9296;
+    --code-str:    #F0A9A2;
+    --code-key:    #9CC7B4;
+    --code-num:    #E5C07B;
+
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+    --measure: 70ch;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:      #141112;
+      --surface:     #1C1819;
+      --surface-alt: #242021;
+      --ink:         #F2EDEE;
+      --ink-muted:   #A79DA1;
+      --ink-faint:   #7E7478;
+      --rule:        #322C2E;
+      --accent:      #F2646E;
+      --accent-soft: #2E1E20;
+      --ok:          #6FCFA4;
+      --ok-soft:     #17281F;
+      --warn:        #E0B063;
+      --warn-soft:   #2B2116;
+      --code-ground: #0E0C0D;
+      --code-ink:    #EDE6E7;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground:      #141112;
+    --surface:     #1C1819;
+    --surface-alt: #242021;
+    --ink:         #F2EDEE;
+    --ink-muted:   #A79DA1;
+    --ink-faint:   #7E7478;
+    --rule:        #322C2E;
+    --accent:      #F2646E;
+    --accent-soft: #2E1E20;
+    --ok:          #6FCFA4;
+    --ok-soft:     #17281F;
+    --warn:        #E0B063;
+    --warn-soft:   #2B2116;
+    --code-ground: #0E0C0D;
+    --code-ink:    #EDE6E7;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .shell {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 0 28px 96px;
+    display: grid;
+    grid-template-columns: 232px minmax(0, 1fr);
+    gap: 56px;
+    align-items: start;
+  }
+
+  /* ── Masthead ─────────────────────────────────────────── */
+  .masthead {
+    grid-column: 1 / -1;
+    padding: 56px 0 36px;
+    border-bottom: 2px solid var(--ink);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 28px;
+    align-items: flex-end;
+    justify-content: space-between;
+  }
+  .masthead h1 {
+    font-size: clamp(2rem, 4.4vw, 3rem);
+    line-height: 1.05;
+    letter-spacing: -0.025em;
+    margin: 8px 0 10px;
+    text-wrap: balance;
+  }
+  .masthead p { margin: 0; color: var(--ink-muted); max-width: 52ch; }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0;
+  }
+  .rev {
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    color: var(--ink-faint);
+    text-align: right;
+    line-height: 1.9;
+  }
+  .rev b { color: var(--ink); font-weight: 600; }
+
+  /* ── Index rail ───────────────────────────────────────── */
+  nav.rail {
+    position: sticky;
+    top: 24px;
+    padding-top: 40px;
+    font-size: 0.86rem;
+  }
+  nav.rail ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+  nav.rail .grp {
+    font-family: var(--mono);
+    font-size: 0.66rem;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin: 20px 0 6px;
+  }
+  nav.rail .grp:first-child { margin-top: 0; }
+  nav.rail a {
+    display: block;
+    padding: 3px 10px;
+    color: var(--ink-muted);
+    text-decoration: none;
+    border-left: 2px solid var(--rule);
+    transition: color .12s, border-color .12s;
+  }
+  nav.rail a:hover, nav.rail a:focus-visible { color: var(--accent); border-left-color: var(--accent); }
+
+  main { padding-top: 40px; min-width: 0; }
+
+  section { margin-bottom: 68px; scroll-margin-top: 24px; }
+  h2 {
+    font-size: 1.6rem;
+    letter-spacing: -0.018em;
+    margin: 0 0 8px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--rule);
+    text-wrap: balance;
+  }
+  h3 { font-size: 1.05rem; margin: 32px 0 8px; letter-spacing: -0.008em; }
+  h4 {
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin: 24px 0 8px;
+    font-weight: 600;
+  }
+  p, li { max-width: var(--measure); }
+  p { margin: 0 0 14px; }
+  ul, ol.prose { padding-left: 20px; margin: 0 0 14px; }
+  li { margin-bottom: 6px; }
+  a { color: var(--accent); }
+  strong { font-weight: 650; }
+
+  code {
+    font-family: var(--mono);
+    font-size: 0.855em;
+    background: var(--surface-alt);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 0.08em 0.36em;
+    word-break: break-word;
+  }
+
+  /* ── Endpoint cards ───────────────────────────────────── */
+  .ep {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+    padding: 22px 24px 24px;
+    margin-bottom: 22px;
+  }
+  .ep-head { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 6px; }
+  .verb {
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.07em;
+    padding: 3px 8px;
+    border-radius: 4px;
+    color: #fff;
+    flex-shrink: 0;
+  }
+  .verb.get    { background: #1F5F8B; }
+  .verb.post   { background: var(--ok); }
+  .verb.patch  { background: var(--warn); }
+  .verb.delete { background: var(--accent); }
+  .path {
+    font-family: var(--mono);
+    font-size: 1rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    word-break: break-all;
+  }
+  .ep > p:first-of-type { color: var(--ink-muted); }
+
+  /* ── Tables ───────────────────────────────────────────── */
+  .scroll { overflow-x: auto; margin: 12px 0 18px; border: 1px solid var(--rule); border-radius: 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.9rem; background: var(--surface); }
+  th, td { text-align: left; padding: 9px 14px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th {
+    font-family: var(--mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    background: var(--surface-alt);
+    white-space: nowrap;
+    font-weight: 600;
+  }
+  tr:last-child td { border-bottom: none; }
+  td.f { font-family: var(--mono); font-size: 0.85rem; white-space: nowrap; color: var(--ink); }
+  td.t { font-family: var(--mono); font-size: 0.8rem; color: var(--ink-faint); white-space: nowrap; }
+  td.num { font-variant-numeric: tabular-nums; }
+  .req { color: var(--accent); font-weight: 700; }
+
+  /* ── Code blocks ──────────────────────────────────────── */
+  pre {
+    background: var(--code-ground);
+    color: var(--code-ink);
+    border-radius: 8px;
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 0.83rem;
+    line-height: 1.62;
+    margin: 10px 0 18px;
+    tab-size: 2;
+  }
+  pre .c { color: var(--code-dim); }
+  pre .s { color: var(--code-str); }
+  pre .k { color: var(--code-key); }
+  pre .n { color: var(--code-num); }
+
+  /* ── Callouts ─────────────────────────────────────────── */
+  .note {
+    border-left: 3px solid var(--accent);
+    background: var(--accent-soft);
+    padding: 13px 17px;
+    border-radius: 0 8px 8px 0;
+    margin: 16px 0 20px;
+    font-size: 0.92rem;
+  }
+  .note.ok   { border-left-color: var(--ok);   background: var(--ok-soft); }
+  .note.warn { border-left-color: var(--warn); background: var(--warn-soft); }
+  .note p { margin: 0; max-width: none; }
+  .note p + p { margin-top: 9px; }
+  .note .lbl {
+    font-family: var(--mono);
+    font-size: 0.66rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    display: block;
+    margin-bottom: 3px;
+    font-weight: 700;
+  }
+  .note .lbl      { color: var(--accent); }
+  .note.ok .lbl   { color: var(--ok); }
+  .note.warn .lbl { color: var(--warn); }
+
+  /* ── Env cards ────────────────────────────────────────── */
+  .envs { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 14px; margin: 18px 0 22px; }
+  .env {
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+    padding: 16px 18px;
+    background: var(--surface);
+  }
+  .env.prod { border-color: var(--accent); }
+  .env .tag {
+    font-family: var(--mono);
+    font-size: 0.66rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    font-weight: 600;
+  }
+  .env.prod .tag { color: var(--accent); }
+  .env .url {
+    font-family: var(--mono);
+    font-size: 0.8rem;
+    margin-top: 6px;
+    /* Break only when there is genuinely no room, and never mid-token on a
+       narrow screen splitting "v1" across two lines. */
+    overflow-wrap: anywhere;
+    font-weight: 600;
+  }
+
+  .pill {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--rule);
+    background: var(--surface-alt);
+    color: var(--ink-muted);
+    white-space: nowrap;
+  }
+
+  /* ── Checklist ────────────────────────────────────────── */
+  ol.check { list-style: none; padding: 0; margin: 18px 0 0; counter-reset: step; }
+  ol.check li {
+    counter-increment: step;
+    position: relative;
+    padding: 0 0 16px 42px;
+    margin: 0;
+    border-left: 1px solid var(--rule);
+    max-width: var(--measure);
+  }
+  ol.check li:last-child { border-left-color: transparent; padding-bottom: 0; }
+  ol.check li::before {
+    content: counter(step);
+    position: absolute;
+    left: -13px;
+    top: 0;
+    width: 26px; height: 26px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #fff;
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    font-weight: 700;
+    display: grid;
+    place-items: center;
+  }
+  ol.check b { display: block; }
+
+  footer {
+    grid-column: 1 / -1;
+    border-top: 1px solid var(--rule);
+    padding-top: 20px;
+    color: var(--ink-faint);
+    font-size: 0.85rem;
+  }
+  footer p { max-width: none; }
+
+  a:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px; }
+
+  @media (max-width: 900px) {
+    .shell { grid-template-columns: 1fr; gap: 0; padding: 0 20px 64px; }
+    nav.rail { position: static; padding: 28px 0 0; border-bottom: 1px solid var(--rule); padding-bottom: 24px; }
+    nav.rail ol { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+    main { padding-top: 32px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+  }
+</style>
+
+<div class="shell">
+
+  <header class="masthead">
+    <div>
+      <p class="eyebrow">Partner Integration Guide</p>
+      <h1>EasyFix Partner API</h1>
+      <p>Book field-service jobs, track them to completion, and receive live status updates over webhooks.</p>
+    </div>
+    <div class="rev">
+      <b>v1</b> &middot; unified backend<br>
+      Updated 14 Aug 2026<br>
+      Replaces <code>core.easyfix.in/v1</code>
+    </div>
+  </header>
+
+  <nav class="rail" aria-label="Contents">
+    <ol>
+      <li class="grp">Start here</li>
+      <li><a href="#start">Getting started</a></li>
+      <li><a href="#auth">Authentication</a></li>
+      <li><a href="#conventions">Conventions</a></li>
+      <li><a href="#errors">Errors</a></li>
+
+      <li class="grp">Core endpoints</li>
+      <li><a href="#services">Service catalogue</a></li>
+      <li><a href="#create">Create a job</a></li>
+      <li><a href="#status">Job status</a></li>
+      <li><a href="#images">Upload images</a></li>
+
+      <li class="grp">More endpoints</li>
+      <li><a href="#more">Lookup &amp; tracking</a></li>
+      <li><a href="#statuses">Status reference</a></li>
+
+      <li class="grp">Webhooks</li>
+      <li><a href="#webhooks">How they work</a></li>
+      <li><a href="#events">Events</a></li>
+      <li><a href="#payload">Payload</a></li>
+
+      <li class="grp">Migrating</li>
+      <li><a href="#changes">What changed</a></li>
+      <li><a href="#checklist">Cutover checklist</a></li>
+    </ol>
+  </nav>
+
+  <main>
+
+    <!-- ═══════════ GETTING STARTED ═══════════ -->
+    <section id="start">
+      <h2>Getting started</h2>
+      <p>The Partner API is a small, stable REST surface. Most integrations use four endpoints: read your service catalogue, create a job, upload photographs, and check status &mdash; with webhooks pushing progress to you so you never have to poll.</p>
+
+      <h4>Base URLs</h4>
+      <div class="envs">
+        <div class="env prod">
+          <span class="tag">Production</span>
+          <div class="url">https://backend.easyfix.in/api/integration/v1</div>
+        </div>
+        <div class="env">
+          <span class="tag">QA &mdash; build against this first</span>
+          <div class="url">https://qa.backend.easyfix.in/api/integration/v1</div>
+        </div>
+      </div>
+
+      <p>Every path in this document is relative to that base. All requests are HTTPS; plain HTTP is not served.</p>
+
+      <h4>Your first call</h4>
+      <pre><span class="c"># Confirm your credentials reach us and see your service catalogue</span>
+curl -u <span class="s">'YOUR_USERNAME:YOUR_PASSWORD'</span> \
+  <span class="s">'https://qa.backend.easyfix.in/api/integration/v1/services'</span></pre>
+
+      <div class="note">
+        <span class="lbl">Moving from the old API?</span>
+        <p>Your credentials, service IDs, job IDs and webhook events are unchanged. The host and path prefix are new, and a few responses are more consistent than before. Jump to <a href="#changes">What changed</a> for the full list &mdash; it is short.</p>
+      </div>
+    </section>
+
+    <!-- ═══════════ AUTH ═══════════ -->
+    <section id="auth">
+      <h2>Authentication</h2>
+      <p>Every endpoint uses <strong>HTTP Basic authentication</strong>. Send your username and password on each request; there is no token exchange, no login call and nothing to refresh.</p>
+
+      <pre>Authorization: Basic <span class="c">&lt;base64 of "username:password"&gt;</span></pre>
+
+      <p>Your credentials identify your organisation. Everything you can see is automatically scoped to it &mdash; you will only ever read your own jobs, your own prices and your own invoices, and you cannot reference another partner's records even by ID.</p>
+
+      <p>Missing or wrong credentials return <strong>401</strong> with a <code>WWW-Authenticate</code> header:</p>
+      <pre>{ <span class="k">"status"</span>: <span class="s">"401"</span>, <span class="k">"message"</span>: <span class="s">"Invalid credentials"</span>, <span class="k">"data"</span>: null }</pre>
+
+      <div class="note warn">
+        <span class="lbl">Keep credentials server-side</span>
+        <p>These credentials can create real jobs that dispatch real technicians. Call the API from your backend only &mdash; never from a browser, a mobile app, or anywhere the username and password ship to a device.</p>
+      </div>
+
+      <h3>Rate limit</h3>
+      <p>1,200 requests per minute per set of credentials &mdash; roughly 20 per second, far above normal integration traffic. Exceeding it returns <strong>429</strong>; wait a moment and retry.</p>
+    </section>
+
+    <!-- ═══════════ CONVENTIONS ═══════════ -->
+    <section id="conventions">
+      <h2>Conventions</h2>
+
+      <h3>Response envelope</h3>
+      <p>Every response &mdash; success or failure &mdash; uses the same three-key envelope. Your real payload is always under <code>data</code>.</p>
+      <pre>{
+  <span class="k">"status"</span>:  <span class="s">"200"</span>,        <span class="c">// string, not a number</span>
+  <span class="k">"message"</span>: <span class="s">"OK"</span>,
+  <span class="k">"data"</span>:    { <span class="c">/* the payload, or null on failure */</span> }
+}</pre>
+      <p><code>status</code> mirrors the HTTP status code and is always a <strong>JSON string</strong>. Parse the HTTP status code, the <code>status</code> field, or both &mdash; they never disagree.</p>
+
+      <h3>Dates and times</h3>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Where</th><th>Format</th><th>Example</th></tr></thead>
+          <tbody>
+            <tr><td>REST request &amp; response bodies</td><td class="f">DD-MM-YYYY HH:mm</td><td class="f">17-10-2026 14:30</td></tr>
+            <tr><td>Date-only query parameters</td><td class="f">YYYY-MM-DD</td><td class="f">2026-10-17</td></tr>
+            <tr><td>Webhook payloads</td><td class="f">YYYY-MM-DD HH:mm:ss</td><td class="f">2026-10-17 14:30:00</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="note">
+        <span class="lbl">All times are IST</span>
+        <p>Every timestamp we send or accept is India Standard Time (UTC+05:30), written as local wall-clock time with no timezone suffix. Do not apply an offset when parsing, and send us IST rather than UTC &mdash; a job booked for <code>17-10-2026 09:00</code> is a 9am appointment in the customer's own morning.</p>
+      </div>
+
+      <h3>Identifiers</h3>
+      <ul>
+        <li><strong>Job ID</strong> &mdash; ours, returned when you create a job. Use it for every follow-up call.</li>
+        <li><strong><code>reference_id</code></strong> &mdash; yours. Send your own order or ticket number when creating a job and we echo it back on every response and webhook, so you can reconcile without storing our IDs.</li>
+        <li><strong><code>service_id</code></strong> &mdash; a line on <em>your</em> rate card, from <a href="#services">the catalogue</a>. It is specific to your organisation, not a global product code.</li>
+      </ul>
+    </section>
+
+    <!-- ═══════════ ERRORS ═══════════ -->
+    <section id="errors">
+      <h2>Errors</h2>
+      <p>Failures use the same envelope, with a human-readable <code>message</code> and <code>data: null</code>.</p>
+      <pre>{ <span class="k">"status"</span>: <span class="s">"400"</span>, <span class="k">"message"</span>: <span class="s">"Unknown city \"Gurgoan\""</span>, <span class="k">"data"</span>: null }</pre>
+
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Code</th><th>Meaning</th><th>What to do</th></tr></thead>
+          <tbody>
+            <tr><td class="f num">400</td><td>The request was understood but a value is unusable &mdash; an unknown city, a missing <code>jobId</code>.</td><td>Fix the value. Retrying unchanged will fail again.</td></tr>
+            <tr><td class="f num">401</td><td>Credentials missing, wrong, or deactivated.</td><td>Check the header; contact us if it persists.</td></tr>
+            <tr><td class="f num">403</td><td>The record exists but belongs to another partner.</td><td>Check the ID against your own records.</td></tr>
+            <tr><td class="f num">404</td><td>No such record for your organisation.</td><td>Treat as "not found" &mdash; do not retry.</td></tr>
+            <tr><td class="f num">429</td><td>Rate limit exceeded.</td><td>Back off briefly, then retry.</td></tr>
+            <tr><td class="f num">500</td><td>Something failed on our side.</td><td>Safe to retry with backoff. Send us the time and <code>reference_id</code> if it repeats.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note warn">
+        <span class="lbl">Retrying job creation</span>
+        <p>Job creation is not de-duplicated. If <code>POST /jobs</code> times out you cannot know whether the job was created, so <strong>check before retrying</strong> &mdash; call <a href="#more"><code>/jobs/tracking</code></a> and look for your <code>reference_id</code>. A blind retry dispatches a technician twice.</p>
+      </div>
+    </section>
+
+    <!-- ═══════════ SERVICES ═══════════ -->
+    <section id="services">
+      <h2>Service catalogue</h2>
+      <p>Start here. This returns the services your organisation is contracted for, with your prices, grouped by category and service type. The <code>service_id</code> values it returns are what you quote back when creating a job &mdash; nothing can be booked without them.</p>
+
+      <div class="ep">
+        <div class="ep-head"><span class="verb get">GET</span><span class="path">/services</span></div>
+        <p>Your priced service catalogue.</p>
+
+        <h4>Query parameters</h4>
+        <div class="scroll">
+          <table>
+            <thead><tr><th>Name</th><th>Type</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td class="f">serviceTypeId</td><td class="t">integer</td><td>Optional. Return only services of this type.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h4>Response</h4>
+        <pre>{
+  <span class="k">"status"</span>: <span class="s">"200"</span>,
+  <span class="k">"message"</span>: <span class="s">"OK"</span>,
+  <span class="k">"data"</span>: [
+    {
+      <span class="k">"service_catg_id"</span>: <span class="n">21</span>,
+      <span class="k">"service_catg_name"</span>: <span class="s">"Cycle &amp; Fitness Machine Services"</span>,
+      <span class="k">"service_catg_desc"</span>: <span class="s">"Gym Equipment Expert including Cycles &amp; Commercial Treadmills."</span>,
+      <span class="k">"category_services"</span>: [
+        {
+          <span class="k">"service_type"</span>: {
+            <span class="k">"service_type_id"</span>: <span class="n">7</span>,
+            <span class="k">"service_type_name"</span>: <span class="s">"Estimate On VISIT"</span>,
+            <span class="k">"services"</span>: [
+              { <span class="k">"service_id"</span>: <span class="n">24055</span>, <span class="k">"service_name"</span>: <span class="s">"Failed Visit Charges"</span>, <span class="k">"service_amount"</span>: <span class="n">500</span>, <span class="k">"job_charge_type"</span>: <span class="n">1</span> },
+              { <span class="k">"service_id"</span>: <span class="n">24056</span>, <span class="k">"service_name"</span>: <span class="s">"Incentive"</span>,            <span class="k">"service_amount"</span>: <span class="n">50</span>,  <span class="k">"job_charge_type"</span>: <span class="n">1</span> }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}</pre>
+
+        <h4>Fields</h4>
+        <div class="scroll">
+          <table>
+            <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td class="f">service_catg_id</td><td class="t">integer</td><td>Category identifier, e.g. a product family.</td></tr>
+              <tr><td class="f">service_catg_name</td><td class="t">string</td><td>Category name.</td></tr>
+              <tr><td class="f">service_catg_desc</td><td class="t">string</td><td>Longer description of what the category covers.</td></tr>
+              <tr><td class="f">service_type_id</td><td class="t">integer</td><td>Service type within the category.</td></tr>
+              <tr><td class="f">service_type_name</td><td class="t">string</td><td>How the type is charged, e.g. <em>Estimate On VISIT</em>.</td></tr>
+              <tr><td class="f">serviceTypeToolNames</td><td class="t">string</td><td>Tools the technician brings. <strong>Omitted</strong> when not configured.</td></tr>
+              <tr><td class="f">service_id</td><td class="t">integer</td><td><strong>The bookable identifier.</strong> Send this in <code>POST /jobs</code>.</td></tr>
+              <tr><td class="f">service_name</td><td class="t">string</td><td>The line's name on your rate card.</td></tr>
+              <tr><td class="f">service_amount</td><td class="t">number</td><td>Your contracted price in INR.</td></tr>
+              <tr><td class="f">job_charge_type</td><td class="t">integer</td><td>How the charge is applied, per your agreement.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="note ok">
+          <span class="lbl">Cache it, refresh it daily</span>
+          <p>The catalogue changes only when your contract does. Cache it rather than calling it before every booking &mdash; but do refresh it daily, because a <code>service_id</code> withdrawn from your rate card is rejected at booking time.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════ CREATE JOB ═══════════ -->
+    <section id="create">
+      <h2>Create a job</h2>
+      <p>The main endpoint. One call books a technician visit: who the customer is, where they are, when they want it, and which contracted services apply.</p>
+
+      <div class="ep">
+        <div class="ep-head"><span class="verb post">POST</span><span class="path">/jobs</span></div>
+        <p>Creates a job and returns its ID. <span class="pill">Content-Type: application/json</span></p>
+
+        <h4>Request</h4>
+        <pre>{
+  <span class="k">"jobDesc"</span>: <span class="s">"Treadmill installation - model X200"</span>,
+  <span class="k">"jobType"</span>: <span class="s">"Installation"</span>,
+  <span class="k">"requested_date"</span>: <span class="s">"17-10-2026 00:00"</span>,
+  <span class="k">"timeSlot"</span>: <span class="s">"Evening 2 to 7"</span>,
+  <span class="k">"sourceType"</span>: <span class="s">"partner API"</span>,
+  <span class="k">"reference_id"</span>: <span class="s">"YOUR-ORDER-10231"</span>,
+
+  <span class="k">"clientSpocName"</span>: <span class="s">"Vikash Gupta"</span>,
+  <span class="k">"clientSpocEmail"</span>: <span class="s">"vikash.gupta@example.com"</span>,
+  <span class="k">"clientSpocNumber"</span>: <span class="s">"9988765567"</span>,
+
+  <span class="k">"customer"</span>: {
+    <span class="k">"name"</span>: <span class="s">"Priyanka Sharma"</span>,
+    <span class="k">"mobile"</span>: <span class="s">"9999578666"</span>
+  },
+  <span class="k">"address"</span>: {
+    <span class="k">"address"</span>: <span class="s">"Sector 44, near Huda City Centre"</span>,
+    <span class="k">"building"</span>: <span class="s">"Building number 10"</span>,
+    <span class="k">"city"</span>: { <span class="k">"city_name"</span>: <span class="s">"Gurgaon"</span> },
+    <span class="k">"pinCode"</span>: <span class="s">"122001"</span>,
+    <span class="k">"gps"</span>: <span class="s">"28.4594965,77.0266383"</span>
+  },
+
+  <span class="k">"service_type"</span>: {
+    <span class="k">"services"</span>: [ { <span class="k">"service_id"</span>: <span class="n">24055</span> } ]
+  },
+
+  <span class="k">"paidBy"</span>: <span class="n">2</span>,
+  <span class="k">"paymentCollectedBy"</span>: <span class="s">"Easyfix"</span>,
+  <span class="k">"additionalName"</span>: <span class="s">"Alternate contact"</span>,
+  <span class="k">"additionalNumber"</span>: <span class="s">"9810833037"</span>,
+  <span class="k">"helperReq"</span>: true,
+  <span class="k">"specialComments"</span>: <span class="s">"Lift available until 6pm"</span>,
+  <span class="k">"bookingCutOffTime"</span>: <span class="n">12</span>,
+  <span class="k">"jobImageIds"</span>: []
+}</pre>
+
+        <h4>Fields</h4>
+        <div class="scroll">
+          <table>
+            <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td class="f">customer.mobile <span class="req">*</span></td><td class="t">string</td><td>10-digit Indian mobile. The technician calls this number.</td></tr>
+              <tr><td class="f">customer.name <span class="req">*</span></td><td class="t">string</td><td>Who the technician is visiting.</td></tr>
+              <tr><td class="f">address.address <span class="req">*</span></td><td class="t">string</td><td>Street address.</td></tr>
+              <tr><td class="f">address.pinCode <span class="req">*</span></td><td class="t">string</td><td>6-digit PIN. Determines serviceability and which technicians can be assigned.</td></tr>
+              <tr><td class="f">requested_date <span class="req">*</span></td><td class="t">string</td><td>Appointment date, <code>DD-MM-YYYY HH:mm</code> IST. Use <code>00:00</code> when only the date matters and let <code>timeSlot</code> carry the window.</td></tr>
+              <tr><td class="f">address.city.city_name</td><td class="t">string</td><td>City by name. Send <code>city_id</code> instead if you have it &mdash; it takes precedence. An unrecognised name returns <strong>400</strong>.</td></tr>
+              <tr><td class="f">address.building</td><td class="t">string</td><td>Building, flat or unit.</td></tr>
+              <tr><td class="f">address.gps</td><td class="t">string</td><td><code>"latitude,longitude"</code>. Materially improves first-visit success rates.</td></tr>
+              <tr><td class="f">jobType</td><td class="t">string</td><td><code>Installation</code>, <code>Repair</code>, <code>Uninstallation</code>. Defaults to <code>Installation</code>.</td></tr>
+              <tr><td class="f">timeSlot</td><td class="t">string</td><td>Preferred window, e.g. <code>Evening 2 to 7</code>.</td></tr>
+              <tr><td class="f">reference_id</td><td class="t">string</td><td>Your own order number. Echoed on every response and webhook.</td></tr>
+              <tr><td class="f">service_type.services</td><td class="t">array</td><td><code>service_id</code> values from <a href="#services">the catalogue</a>. Pricing is applied from your rate card.</td></tr>
+              <tr><td class="f">clientSpocName / Email / Number</td><td class="t">string</td><td>Who at your organisation owns this order. We contact them about exceptions.</td></tr>
+              <tr><td class="f">additionalName / Number</td><td class="t">string</td><td>Alternate contact if the customer is unreachable.</td></tr>
+              <tr><td class="f">paidBy</td><td class="t">integer</td><td>Who bears the cost. <code>0</code> Any &middot; <code>1</code> Serviceman &middot; <code>2</code> Easyfix &middot; <code>3</code> Client.</td></tr>
+              <tr><td class="f">paymentCollectedBy</td><td class="t">string</td><td>Who collects on site: <code>"Any"</code>, <code>"Serviceman"</code>, <code>"Easyfix"</code>, <code>"Client"</code>. Defaults to your account setting.</td></tr>
+              <tr><td class="f">helperReq</td><td class="t">boolean</td><td>Set <code>true</code> when the job needs two people &mdash; heavy equipment, upper floors without a lift.</td></tr>
+              <tr><td class="f">specialComments</td><td class="t">string</td><td>Shown to the technician on their app. Access notes, gate codes, parking.</td></tr>
+              <tr><td class="f">bookingCutOffTime</td><td class="t">integer</td><td>Latest booking hour (24h) for same-day scheduling.</td></tr>
+              <tr><td class="f">jobImageIds</td><td class="t">array</td><td>IDs from <a href="#images">image upload</a>, to attach photographs taken before the job existed.</td></tr>
+              <tr><td class="f">sourceType</td><td class="t">string</td><td>Free-text label for where the booking came from. Useful in reporting.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><span class="req">*</span> required &mdash; everything else is optional.</p>
+
+        <h4>Response &mdash; 200</h4>
+        <pre>{
+  <span class="k">"status"</span>: <span class="s">"200"</span>,
+  <span class="k">"message"</span>: <span class="s">"OK"</span>,
+  <span class="k">"data"</span>: {
+    <span class="k">"jobId"</span>: <span class="n">212251</span>,
+    <span class="k">"id"</span>: <span class="n">212251</span>,              <span class="c">// same value, for older clients</span>
+    <span class="k">"reference_id"</span>: <span class="s">"YOUR-ORDER-10231"</span>,
+    <span class="k">"currentStatus"</span>: <span class="s">"Unconfirmed"</span>
+  }
+}</pre>
+        <p>Store <code>jobId</code>. A new job starts as <strong>Unconfirmed</strong> and moves to <em>Scheduled</em> once a technician accepts &mdash; you will receive a <a href="#events"><code>TechAssigned</code></a> webhook when that happens.</p>
+      </div>
+    </section>
+
+    <!-- ═══════════ STATUS ═══════════ -->
+    <section id="status">
+      <h2>Job status</h2>
+      <div class="ep">
+        <div class="ep-head"><span class="verb get">GET</span><span class="path">/jobs/jobStatus</span></div>
+        <p>The current status of one job.</p>
+
+        <h4>Query parameters</h4>
+        <div class="scroll">
+          <table>
+            <thead><tr><th>Name</th><th>Type</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td class="f">jobId <span class="req">*</span></td><td class="t">integer</td><td>The ID returned when the job was created.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h4>Response</h4>
+        <pre>{
+  <span class="k">"status"</span>: <span class="s">"200"</span>,
+  <span class="k">"message"</span>: <span class="s">"OK"</span>,
+  <span class="k">"data"</span>: { <span class="k">"jobId"</span>: <span class="n">212251</span>, <span class="k">"currentStatus"</span>: <span class="s">"Unconfirmed"</span> }
+}</pre>
+
+        <div class="note ok">
+          <span class="lbl">Prefer webhooks over polling</span>
+          <p>This endpoint is for reconciliation and support lookups. For live progress, register <a href="#webhooks">webhooks</a> &mdash; you get each change as it happens instead of discovering it on your next poll.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════ IMAGES ═══════════ -->
+    <section id="images">
+      <h2>Upload images</h2>
+      <p>Attach photographs to a job &mdash; the product to be installed, the site, a damage report.</p>
+
+      <div class="ep">
+        <div class="ep-head"><span class="verb post">POST</span><span class="path">/jobImage/addJobImages</span></div>
+        <p>Uploads one image. <span class="pill">Content-Type: multipart/form-data</span></p>
+
+        <h4>Form fields</h4>
+        <div class="scroll">
+          <table>
+            <thead><tr><th>Name</th><th>Type</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td class="f">file <span class="req">*</span></td><td class="t">binary</td><td>The image. Maximum 10&nbsp;MB.</td></tr>
+              <tr><td class="f">JobId</td><td class="t">integer</td><td>Optional &mdash; attach immediately to an existing job. Omit it to upload first and attach later.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <pre>curl -u <span class="s">'USERNAME:PASSWORD'</span> \
+  -F <span class="s">'file=@/path/to/photo.jpg'</span> \
+  -F <span class="s">'JobId=212251'</span> \
+  <span class="s">'https://backend.easyfix.in/api/integration/v1/jobImage/addJobImages'</span></pre>
+
+        <h4>Response</h4>
+        <pre>{
+  <span class="k">"status"</span>: <span class="s">"200"</span>,
+  <span class="k">"message"</span>: <span class="s">"OK"</span>,
+  <span class="k">"data"</span>: {
+    <span class="k">"imageId"</span>: <span class="n">408397</span>,
+    <span class="k">"jobStage"</span>: <span class="n">0</span>,
+    <span class="k">"image"</span>: <span class="s">"27092026042715_4142_passbook.png"</span>,
+    <span class="k">"status"</span>: <span class="n">1</span>,
+    <span class="k">"createdTimestamp"</span>: <span class="s">"27-09-2026 16:27"</span>,
+    <span class="k">"imageCategory"</span>: <span class="s">"unconfirmed"</span>,
+    <span class="k">"createdBy"</span>: <span class="n">213</span>,
+    <span class="k">"updatedBy"</span>: <span class="n">213</span>
+  }
+}</pre>
+
+        <h3>Uploading before the job exists</h3>
+        <p>When you have photographs at order time, upload them first and attach them as you book:</p>
+        <ol class="prose">
+          <li>Upload each image <strong>without</strong> <code>JobId</code>, and keep the returned <code>imageId</code>.</li>
+          <li>Pass those IDs as <code>jobImageIds</code> in <a href="#create"><code>POST /jobs</code></a>.</li>
+        </ol>
+        <p>Only images you uploaded yourself, and which are not already attached to a job, can be adopted this way.</p>
+      </div>
+    </section>
+
+    <!-- ═══════════ MORE ═══════════ -->
+    <section id="more">
+      <h2>Lookup &amp; tracking</h2>
+      <p>Supporting endpoints. All are scoped to your organisation and use the same envelope.</p>
+
+      <div class="ep">
+        <div class="ep-head"><span class="verb get">GET</span><span class="path">/jobs/tracking</span></div>
+        <p>Your recent jobs with their current status. Optional <code>status</code> and <code>limit</code> (default 50, maximum 500). Use this to find a job by your own <code>reference_id</code> after a timeout.</p>
+      </div>
+
+      <div class="ep">
+        <div class="ep-head"><span class="verb get">GET</span><span class="path">/jobs/history</span></div>
+        <p>Jobs within a date range. Takes <code>startDate</code> and <code>endDate</code> as <code>YYYY-MM-DD</code>.</p>
+      </div>
+
+      <div class="ep">
+        <div class="ep-head"><span class="verb get">GET</span><span class="path">/jobs/{id}</span></div>
+        <p>Full detail for one job &mdash; status, job type, requested and scheduled times, the assigned technician's name, and your reference.</p>
+      </div>
+
+      <div class="ep">
+        <div class="ep-head"><span class="verb delete">DELETE</span><span class="path">/jobs/{id}</span></div>
+        <p>Cancels a job. Fires the <a href="#events"><code>CancelJob</code></a> webhook. Cancel as early as you can &mdash; a technician already travelling may still attract a visit charge under your contract.</p>
+      </div>
+
+      <div class="ep">
+        <div class="ep-head"><span class="verb get">GET</span><span class="path">/easyfixers/availability-status</span></div>
+        <p>Whether a slot can be served, before you commit to it. Takes <code>pincode</code>, <code>requestedDate</code> and <code>timeSlot</code>; returns <code>{"isAvailabil": "Yes"}</code> or <code>"No"</code>.</p>
+      </div>
+
+      <div class="ep">
+        <div class="ep-head"><span class="verb get">GET</span><span class="path">/cities</span></div>
+        <p>Serviceable cities with their <code>city_id</code> values &mdash; useful for validating an address before booking.</p>
+      </div>
+
+      <div class="ep">
+        <div class="ep-head"><span class="verb get">GET</span><span class="path">/clientInvoice</span></div>
+        <p>Your invoices, optionally filtered by <code>startDate</code> and <code>endDate</code>. Includes billing period, amounts due, payment state and links to the invoice PDF and master sheet.</p>
+      </div>
+    </section>
+
+    <!-- ═══════════ STATUS REFERENCE ═══════════ -->
+    <section id="statuses">
+      <h2>Status reference</h2>
+      <p>REST responses give a human-readable <code>currentStatus</code>. Webhooks carry the numeric <code>status</code>. Both describe the same lifecycle.</p>
+
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Numeric</th><th>Label</th><th>What it means</th></tr></thead>
+          <tbody>
+            <tr><td class="f num">0</td><td class="f">Unconfirmed</td><td>Booked and awaiting a technician.</td></tr>
+            <tr><td class="f num">1</td><td class="f">Scheduled</td><td>A technician has accepted and is assigned.</td></tr>
+            <tr><td class="f num">2</td><td class="f">In-Progress</td><td>The technician has reached the customer and started work.</td></tr>
+            <tr><td class="f num">3, 5</td><td class="f">Completed</td><td>Work finished on site.</td></tr>
+            <tr><td class="f num">6</td><td class="f">Cancelled</td><td>Cancelled by you or by us.</td></tr>
+            <tr><td class="f num">7</td><td class="f">Enquiry</td><td>Logged as an enquiry rather than a booked visit.</td></tr>
+            <tr><td class="f num">9</td><td class="f">Call Later</td><td>Parked &mdash; the customer asked to be contacted later.</td></tr>
+            <tr><td class="f num">10</td><td class="f">Revisit</td><td>Closed on the app without completion; a further visit is needed.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note warn">
+        <span class="lbl">These labels differ from the previous API</span>
+        <p>The old service returned strings such as <em>Pending to start</em>, <em>Pending to close on app</em> and <em>Audit &amp; complete</em>. Map against the table above rather than the strings you may have hard-coded, and treat any unrecognised label as "in progress" rather than failing.</p>
+      </div>
+    </section>
+
+    <!-- ═══════════ WEBHOOKS ═══════════ -->
+    <section id="webhooks">
+      <h2>Webhooks</h2>
+      <p>Rather than polling, give us an HTTPS endpoint and we will POST to it whenever one of your jobs moves. This is how most partners keep their own systems current.</p>
+
+      <h3>Setting them up</h3>
+      <p>Send us, for each event you want:</p>
+      <ul>
+        <li>The <strong>callback URL</strong> &mdash; HTTPS, reachable from the public internet.</li>
+        <li>An optional <strong>authorization value</strong>, which we send verbatim as the <code>Authorization</code> header on every delivery so you can verify the call is ours. Include any scheme you need &mdash; if you want <code>Bearer abc123</code>, give us exactly that string.</li>
+      </ul>
+      <p>You can register a different URL per event or point them all at one endpoint and branch on the <code>event</code> field.</p>
+
+      <h3>Delivery</h3>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Property</th><th>Value</th></tr></thead>
+          <tbody>
+            <tr><td>Method</td><td class="f">POST</td></tr>
+            <tr><td>Content type</td><td class="f">application/json</td></tr>
+            <tr><td>Timeout</td><td class="f">15 seconds</td></tr>
+            <tr><td>Retries</td><td>3 attempts &mdash; immediately, then after 30 seconds, then after 5 minutes</td></tr>
+            <tr><td>Success</td><td>Any 2xx response</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note">
+        <span class="lbl">What your endpoint should do</span>
+        <p><strong>Reply 200 immediately, then process.</strong> Acknowledge first and do your own work asynchronously &mdash; slow handlers hit the 15-second timeout and get treated as failures.</p>
+        <p><strong>Expect duplicates.</strong> A retry after a timeout can deliver an event you already handled. De-duplicate on <code>jobData.id</code> plus <code>event</code>.</p>
+        <p><strong>Ignore unknown fields.</strong> We add fields to payloads without notice. Never fail on a key you do not recognise.</p>
+      </div>
+    </section>
+
+    <!-- ═══════════ EVENTS ═══════════ -->
+    <section id="events">
+      <h2>Events</h2>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Event</th><th>Fires when</th></tr></thead>
+          <tbody>
+            <tr><td class="f">TechAssigned</td><td>A technician has <strong>accepted</strong> the job in their app. This is acceptance, not merely allocation &mdash; the visit is confirmed.</td></tr>
+            <tr><td class="f">TechStart</td><td>The technician has reached the customer and submitted the start PIN.</td></tr>
+            <tr><td class="f">RescheduleTech</td><td>The technician, or the appointment date or time, has changed.</td></tr>
+            <tr><td class="f">TechVisitComplete</td><td>Work was completed at the location.</td></tr>
+            <tr><td class="f">TechVisitInComplete</td><td>The visit ended without completion. <code>revisitDate</code> and the reason fields explain why.</td></tr>
+            <tr><td class="f">CancelJob</td><td>The job was cancelled, at any point.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ═══════════ PAYLOAD ═══════════ -->
+    <section id="payload">
+      <h2>Webhook payload</h2>
+      <p>Every event uses the same envelope: the event name, and the full job.</p>
+
+      <pre>{
+  <span class="k">"event"</span>: <span class="s">"TechVisitComplete"</span>,
+  <span class="k">"jobData"</span>: {
+    <span class="k">"id"</span>: <span class="n">212225</span>,
+    <span class="k">"referenceId"</span>: <span class="s">"REF-212225"</span>,
+    <span class="k">"clientReferenceId"</span>: <span class="s">"YOUR-ORDER-10231"</span>,
+    <span class="k">"ticketCreatedDateTime"</span>: <span class="s">"2026-09-06 17:56:34"</span>,
+    <span class="k">"requestedDateTime"</span>: <span class="s">"2026-09-07 00:00:00"</span>,
+    <span class="k">"scheduledDate"</span>: <span class="s">"2026-09-06 17:59:17"</span>,
+    <span class="k">"appCheckoutDateTime"</span>: <span class="s">"2026-09-14 17:56:34"</span>,
+    <span class="k">"canceledDateTime"</span>: null,
+    <span class="k">"jobType"</span>: <span class="s">"Installation"</span>,
+    <span class="k">"jobDescription"</span>: <span class="s">"Treadmill installation"</span>,
+    <span class="k">"easyfixerName"</span>: <span class="s">"Priyanka Gupta"</span>,
+    <span class="k">"status"</span>: <span class="n">3</span>,
+
+    <span class="k">"customer"</span>: {
+      <span class="k">"name"</span>: <span class="s">"Ravi Kumar"</span>,
+      <span class="k">"customerMobileNo"</span>: <span class="s">"9868932137"</span>,
+      <span class="k">"customerEmail"</span>: null
+    },
+    <span class="k">"scheduledBy"</span>: {
+      <span class="k">"userName"</span>: <span class="s">"Nitin Sharma"</span>,
+      <span class="k">"userEmail"</span>: <span class="s">"nitin@easyfix.in"</span>,
+      <span class="k">"mobileNo"</span>: null,
+      <span class="k">"alternateNo"</span>: null
+    },
+    <span class="k">"clientSpoc"</span>: {
+      <span class="k">"name"</span>: <span class="s">"Priyanka Gupta"</span>,
+      <span class="k">"mobileNo"</span>: <span class="s">"9810833038"</span>,
+      <span class="k">"email"</span>: <span class="s">"priyanka@example.com"</span>,
+      <span class="k">"alternateNo"</span>: <span class="s">""</span>
+    },
+    <span class="k">"jobImage"</span>: [
+      { <span class="k">"image"</span>: <span class="s">"https://.../212225_checkout_20260906180327.jpg"</span>, <span class="k">"image_category"</span>: <span class="s">"checkout"</span> },
+      { <span class="k">"image"</span>: <span class="s">"https://.../212225_checkin_20260906180319.jpg"</span>,  <span class="k">"image_category"</span>: <span class="s">"checkin"</span> }
+    ],
+    <span class="k">"jobServices"</span>: [
+      {
+        <span class="k">"quantity"</span>: <span class="n">3</span>,
+        <span class="k">"clientService"</span>: {
+          <span class="k">"rate_card_id"</span>: <span class="n">11456</span>,
+          <span class="k">"clientRateCard"</span>: { <span class="k">"serviceName"</span>: <span class="s">"Incentive"</span> }
+        },
+        <span class="k">"serviceType"</span>: { <span class="k">"serviceTypeName"</span>: <span class="s">"Estimate On VISIT"</span> }
+      }
+    ],
+
+    <span class="k">"rescheduleReasonId"</span>: null,
+    <span class="k">"rescheduleRemarks"</span>: null,
+    <span class="k">"jobRescheduleReason"</span>: null,
+    <span class="k">"problemReasonId"</span>: null,
+    <span class="k">"problemReason"</span>: null,
+    <span class="k">"revisitDate"</span>: null,
+    <span class="k">"revisitTimeSlot"</span>: null,
+    <span class="k">"cancelReasonId"</span>: null,
+    <span class="k">"cancelComment"</span>: null
+  }
+}</pre>
+
+      <h3>Key fields</h3>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Field</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td class="f">id</td><td>The EasyFix job ID &mdash; the same <code>jobId</code> returned at creation.</td></tr>
+            <tr><td class="f">clientReferenceId</td><td><strong>Your</strong> reference. Match on this to find the order in your system.</td></tr>
+            <tr><td class="f">referenceId</td><td>Our internal job reference.</td></tr>
+            <tr><td class="f">status</td><td>Numeric status &mdash; see the <a href="#statuses">status reference</a>.</td></tr>
+            <tr><td class="f">ticketCreatedDateTime</td><td>When the job was booked.</td></tr>
+            <tr><td class="f">requestedDateTime</td><td>The appointment the customer asked for.</td></tr>
+            <tr><td class="f">scheduledDate</td><td>When the technician was allocated.</td></tr>
+            <tr><td class="f">appCheckoutDateTime</td><td>When the technician closed the job on their app.</td></tr>
+            <tr><td class="f">easyfixerName</td><td>The assigned technician.</td></tr>
+            <tr><td class="f">scheduledBy</td><td>The EasyFix coordinator who scheduled the job.</td></tr>
+            <tr><td class="f">clientSpoc</td><td>Your contact for this order, as supplied at booking.</td></tr>
+            <tr><td class="f">jobImage</td><td>Site photographs as downloadable URLs, tagged <code>checkin</code>, <code>checkout</code> and similar. Links are time-limited &mdash; download rather than storing the URL.</td></tr>
+            <tr><td class="f">jobServices</td><td>Services performed, with quantity and rate-card line.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Reason fields</h3>
+      <p>Reason fields are present on every payload and populated when relevant: <code>rescheduleReasonId</code>, <code>rescheduleRemarks</code> and <code>jobRescheduleReason</code> on <code>RescheduleTech</code>; <code>problemReason</code>, <code>revisitDate</code> and <code>revisitTimeSlot</code> on <code>TechVisitInComplete</code>; <code>cancelReasonId</code>, <code>cancelComment</code> and <code>jobCancelBy</code> on <code>CancelJob</code>. They are <code>null</code> otherwise &mdash; the key is always there.</p>
+    </section>
+
+    <!-- ═══════════ CHANGES ═══════════ -->
+    <section id="changes">
+      <h2>What changed</h2>
+      <p>If you already integrate with <code>core.easyfix.in/v1</code>, this is everything you need to look at. Your credentials, service IDs, job IDs and webhook event names are unchanged.</p>
+
+      <h3>You must change</h3>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Change</th><th>Detail</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><strong>Base URL</strong></td>
+              <td>From <code>https://core.easyfix.in/v1</code> to <code>https://backend.easyfix.in/api/integration/v1</code>. Paths after the prefix are identical.</td>
+            </tr>
+            <tr>
+              <td><strong>Job creation response</strong></td>
+              <td>Previously HTTP <code>201</code> with the job object at the top level. Now HTTP <code>200</code> with the standard envelope &mdash; read <code>data.jobId</code> (<code>data.id</code> carries the same value).</td>
+            </tr>
+            <tr>
+              <td><strong>Status labels</strong></td>
+              <td>A shorter, clearer vocabulary. See the <a href="#statuses">status reference</a>. If you match on strings, update them.</td>
+            </tr>
+            <tr>
+              <td><strong>Unknown city names</strong></td>
+              <td>Previously accepted silently, leaving an address that could not be routed. Now returns <strong>400</strong>. Verify names against <code>/cities</code>.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Improvements you get for free</h3>
+      <ul>
+        <li><strong>Pricing comes from your rate card.</strong> Previously the amount in your request was written to the job, so a request sending only <code>service_id</code> booked at zero. Now we price every line from your contract &mdash; send <code>service_id</code> alone.</li>
+        <li><strong>Webhooks retry.</strong> A failed delivery is retried twice more, after 30 seconds and 5 minutes. Previously a single failure was lost silently.</li>
+        <li><strong>Webhook images are downloadable URLs</strong> rather than bare filenames.</li>
+        <li><strong>Uploaded images are protected.</strong> <code>jobImageIds</code> now only accepts images you uploaded yourself.</li>
+        <li><strong>Past appointment dates are no longer silently moved</strong> an hour into the future.</li>
+      </ul>
+    </section>
+
+    <!-- ═══════════ CHECKLIST ═══════════ -->
+    <section id="checklist">
+      <h2>Cutover checklist</h2>
+      <ol class="check">
+        <li><b>Point at QA</b>Change your base URL to <code>https://qa.backend.easyfix.in/api/integration/v1</code> and confirm <code>GET /services</code> returns your catalogue.</li>
+        <li><b>Book a test job</b>Create one job end to end and confirm you read <code>data.jobId</code> from the new envelope.</li>
+        <li><b>Register a QA webhook</b>Send us a QA callback URL and confirm you receive <code>TechAssigned</code> when we advance the test job.</li>
+        <li><b>Check your status handling</b>Ensure unrecognised status labels degrade gracefully instead of throwing.</li>
+        <li><b>Switch production</b>Change the base URL in production and tell us, so we can watch the first live traffic with you.</li>
+        <li><b>Keep the old URL live briefly</b>We keep <code>core.easyfix.in/v1</code> serving until you confirm the switch is stable. Nothing is turned off without your sign-off.</li>
+      </ol>
+    </section>
+
+    <footer>
+      <p>Questions, credentials, or webhook registration &mdash; contact your EasyFix account manager, and include your <code>reference_id</code> and the time of the request for anything you want investigated.</p>
+    </footer>
+
+  </main>
+</div>
