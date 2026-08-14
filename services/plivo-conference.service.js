@@ -885,6 +885,21 @@ async function addParticipant({
      * which the Participant object does not have, so it matched nothing ever.)
      * With no call_uuid either, there is nothing to correlate on and we wait for
      * ParticipantJoin or for reconcileParticipants() to catch it.
+     *
+     * ⚠ A MISS HERE IS THE NORMAL CASE, NOT A FAULT (2026-08-14). Plivo puts a
+     * participant in the room when they ANSWER, not when the dial is requested,
+     * and this read-back runs a few hundred milliseconds after the request —
+     * production shows +572ms — while the callee's phone is still ringing. So
+     * `participants=1` (the operator, alone) is exactly what a healthy add
+     * looks like at this instant. This branch is a BONUS: it only ever
+     * shortcuts the wait when the callee answered inside the round-trip.
+     *
+     * This used to log the miss at WARN with wording that read like a failed
+     * add. It fired on every added participant on every call, and when
+     * conference calling was investigated on 2026-08-14 it was the first thing
+     * found and the first thing blamed. A log line that is guaranteed to appear
+     * carries no information; one phrased as an error carries negative
+     * information. Kept at info, phrased as the wait it is.
      */
     const list = callUuid ? await listParticipants(conf.friendly_name) : { ok: false, participants: [] };
     if (list.ok) {
@@ -893,14 +908,25 @@ async function addParticipant({
         memberId = RESP.participantMemberId(match) || memberId;
         logger.info(`Conference member id recovered by read-back · conf=${conf.id} · member=${memberId}`);
       } else {
-        logger.warn(`⚠ Conference read-back found no leg for ${masked} · conf=${conf.id} · participants=${list.participants.length}`);
+        logger.info(`Conference leg ${masked} not in the room yet · conf=${conf.id} · participants=${list.participants.length} · still ringing — waiting for ParticipantJoin (expected)`);
       }
     }
   }
   if (!memberId) {
-    // Not a failure — the leg IS dialling — but it cannot be muted or kicked
-    // until a ParticipantJoin webhook supplies the id. Name it.
-    logger.warn(`⚠ Participant ${participantId} has no member_id yet · conf=${conf.id} — mute/drop unavailable until ParticipantJoin arrives`);
+    /*
+     * Not a failure — the leg IS dialling — but it cannot be muted or kicked
+     * until a ParticipantJoin webhook supplies the id. Name it.
+     *
+     * INFO, not WARN (2026-08-14). Like the read-back above, this fires on
+     * every added participant on every call, because a member_id does not
+     * exist until the callee answers. Paired with a ⚠ at WARN, the two lines
+     * read as a failed add and sent a conference-calling investigation down
+     * the wrong path for the length of a session. The genuine failure signals
+     * are the provider refusal recorded above (markConferenceLegFailed) and
+     * the no_answer that reconcileParticipants stamps once the ring window
+     * elapses — not this.
+     */
+    logger.info(`Participant ${participantId} awaiting member_id · conf=${conf.id} — mute/drop unavailable until ParticipantJoin arrives (expected while ringing)`);
   }
 
   await legs.stampConferenceLegIds(participantId, { memberId, callUuid }, pool);
