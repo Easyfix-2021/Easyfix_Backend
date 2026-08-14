@@ -429,6 +429,15 @@ async function createNotice(body, createdBy) {
     const { pushNoticeToTechnicians } = require('./notice-push.service');
     pushNoticeToTechnicians(created).catch(() => {});
   }
+  // Same fire-and-forget push to the CLIENT app when the notice targets clients.
+  if (
+    created
+    && status === 'published'
+    && surfacesInclude(created.target_surfaces, 'client')
+  ) {
+    const { pushNoticeToClients } = require('./notice-push.service');
+    pushNoticeToClients(created).catch(() => {});
+  }
 
   return created;
 }
@@ -550,6 +559,15 @@ async function publishNotice(noticeId, { publish_at, expire_at }, publishedBy) {
     const { pushNoticeToTechnicians } = require('./notice-push.service');
     pushNoticeToTechnicians(row).catch(() => {});
   }
+  // Same fire-and-forget push to the CLIENT app when the notice targets clients.
+  if (
+    row
+    && newStatus === 'published'
+    && surfacesInclude(row.target_surfaces, 'client')
+  ) {
+    const { pushNoticeToClients } = require('./notice-push.service');
+    pushNoticeToClients(row).catch(() => {});
+  }
 
   return row;
 }
@@ -619,14 +637,18 @@ async function publishDueScheduled() {
       if (res.affectedRows !== 1) continue;   // lost the race / already flipped
       summary.published += 1;
 
-      // Only push when the (now-published) notice targets technicians.
-      if (surfacesInclude(n.target_surfaces, 'technician')) {
+      // Push the (now-published) notice to each targeted app surface. Fetch the
+      // row once and fan out to technicians and/or clients as targeted.
+      const wantTech = surfacesInclude(n.target_surfaces, 'technician');
+      const wantClient = surfacesInclude(n.target_surfaces, 'client');
+      if (wantTech || wantClient) {
         const row = await getNoticeById(n.notice_id);
         if (row) {
           // Lazy require mirrors createNotice/publishNotice — avoids any
           // circular-require risk. Fire-and-forget: never block the batch.
-          const { pushNoticeToTechnicians } = require('./notice-push.service');
-          pushNoticeToTechnicians(row).catch(() => {});
+          const noticePush = require('./notice-push.service');
+          if (wantTech) noticePush.pushNoticeToTechnicians(row).catch(() => {});
+          if (wantClient) noticePush.pushNoticeToClients(row).catch(() => {});
           summary.pushed += 1;
         }
       }

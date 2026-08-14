@@ -162,6 +162,40 @@ async function resolveVerifiedTechnicianTokens({ limit = DEFAULT_RECIPIENT_LIMIT
 }
 
 /*
+ * Resolve one FCM token PER active client SPOC for a broadcast fan-out (client
+ * notice publish). Client devices register their token on tbl_client_contacts
+ * .fcm_token via POST /api/client/device-token. audience_scope is 'all' in v1,
+ * so this returns every active contact that has a token. Deduped by token.
+ * Never throws — on a DB error logs + returns [].
+ */
+async function resolveClientTokens({ limit = DEFAULT_RECIPIENT_LIMIT } = {}) {
+  try {
+    const [rows] = await pool.query(
+      `SELECT id AS contactId, fcm_token AS token
+         FROM tbl_client_contacts
+        WHERE fcm_token IS NOT NULL AND fcm_token <> ''
+          AND status = 1
+        LIMIT ?`,
+      [limit],
+    );
+    const seen = new Set();
+    const recipients = [];
+    for (const r of rows) {
+      const t = r.token ? String(r.token).trim() : '';
+      if (!t || seen.has(t)) continue;
+      seen.add(t);
+      // No efrId → deliver() never prunes these against the technician stores.
+      recipients.push({ contactId: r.contactId, token: t });
+    }
+    logger.info('Resolved ' + recipients.length + ' device tokens for client fan-out');
+    return recipients;
+  } catch (e) {
+    logger.warn({ err: e.message }, 'push-delivery: client token resolution failed');
+    return [];
+  }
+}
+
+/*
  * Clear a token FCM reported as permanently dead (404 / UNREGISTERED) from BOTH
  * token stores so fan-out stops targeting it. Scoped to the technician so it
  * never touches another user's rows. `channel` only labels the log line so each
@@ -258,6 +292,7 @@ module.exports = {
   resolveTokensForEfrs,
   resolveTokensForEfr,
   resolveVerifiedTechnicianTokens,
+  resolveClientTokens,
   pruneDeadToken,
   deliver,
   deliverToEfr,

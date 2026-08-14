@@ -22,3 +22,11 @@ coverage/
 dist/
 build/
 *.tsbuildinfo
+
+# Firebase credentials — NEVER commit. Service-account JSON holds a private key;
+# push.service.js loads it from FIREBASE_SERVICE_ACCOUNT_PATH on the server only.
+firebase-service-account*.json
+*serviceAccount*.json
+*service-account*.json
+google-services.json
+GoogleService-Info.plist

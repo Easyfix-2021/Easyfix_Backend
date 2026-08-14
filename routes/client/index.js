@@ -469,6 +469,23 @@ router.get('/lookup/reasons', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// Reschedule reasons for the client app's Reschedule sheet. The Client "Open
+// Due To" bucket is action_taken_reason.action_type = 38 / user_type = 3 (the
+// CRM "Job Schedule Remarks" dialog's Client party) — DISTINCT from the
+// mobile/tech reschedule set (action_type 8, served by lookup.rescheduleReasons()),
+// so this has its own query rather than reusing that lookup.
+router.get('/reschedule-reasons', async (_req, res, next) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, action_desc AS label
+         FROM action_taken_reason
+        WHERE action_type = 38 AND user_type = 3 AND status = 1
+        ORDER BY action_desc ASC`);
+    logger.info('Lookup client reschedule-reasons · count=' + rows.length);
+    modernOk(res, { items: rows });
+  } catch (e) { next(e); }
+});
+
 router.get('/dashboard', async (req, res, next) => {
   try {
     // The three "Today's jobs" tiles, each scoped to TODAY by its own date column
@@ -2256,6 +2273,45 @@ router.post('/jobs/:id/cancel', validate(Joi.object({
   } catch (e) { next(e); }
 });
 
+// ─── Reschedule an order (SPOC) ──────────────────────────────────────
+// Allowed ONLY before the job STARTS — i.e. before the technician checks in by
+// entering the customer OTP, which flips status to IN_PROGRESS (2) and stamps
+// checkin_date_time. So we permit the pre-start states only:
+//   0 BOOKED (pending scheduling) · 1 SCHEDULED (pending check-in) · 9 UNCONFIRMED.
+// Routes through jobService.reschedule() — the same slot re-derivation + offer
+// expiry + audit (scheduling_history + comment) path ops uses. Does NOT change
+// job_status; only moves requested_date_time / time_slot / scheduled_date_time.
+// requestedDateTime is an IST wall-clock string 'YYYY-MM-DD HH:MM' (never a UTC
+// instant) so the appointment day can't shift.
+const RESCHEDULE_ALLOWED_STATUSES = [0, 1, 9];
+router.post('/jobs/:id/reschedule', validate(Joi.object({
+  requestedDateTime: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$/).required(),
+  reasonId: Joi.number().integer().positive().allow(null).optional(),
+  remarks: Joi.string().min(1).max(500).required(),
+})), async (req, res, next) => {
+  try {
+    const job = await jobService.getById(Number(req.params.id));
+    if (!job || job.fk_client_id !== req.spoc.client_id) {
+      logger.warn('Client reschedule — job not found / not owned · id=' + req.params.id);
+      return modernError(res, 404, 'job not found');
+    }
+    if (!RESCHEDULE_ALLOWED_STATUSES.includes(Number(job.job_status))) {
+      return modernError(res, 409, 'this order can no longer be rescheduled — it has already started');
+    }
+
+    // Mirror cancel: audit the schedule move against the SPOC's linked user.
+    const [[link]] = await pool.query('SELECT user_id FROM tbl_client_contacts WHERE id = ?', [req.spoc.id]);
+    logger.info('Client reschedule job · id=' + job.job_id + ' · spoc=' + req.spoc.id + ' · to=' + req.body.requestedDateTime);
+    await jobService.reschedule(job.job_id, {
+      requestedDateTime: req.body.requestedDateTime,
+      reasonId: req.body.reasonId ?? null,
+      rescheduleReason: null,
+      remarks: req.body.remarks,
+    }, { user_id: link?.user_id ?? null });
+    modernOk(res, { rescheduled: true, job_id: job.job_id });
+  } catch (e) { next(e); }
+});
+
 // ─── Update service-line quantities (client app) ─────────────────────
 // The order-detail Services list lets the client raise the product quantity.
 // Allowed ONLY before audit (New → Work Progress); once the job reaches Under
@@ -3086,17 +3142,27 @@ router.patch('/notice-board/:noticeId/read', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// ─── Device id ───────────────────────────────────────────────────────
-// On login the client app reports a stable per-install device id; store it on
-// the SPOC's tbl_client_contacts row so we know which device is signed in.
+// ─── Device id + FCM push token ──────────────────────────────────────
+// On login the client app reports (a) a stable per-install device id and
+// (b) this device's FCM token for push. Both land here — device_id identifies
+// the signed-in device; fcm_token is what firebase-admin targets to send push.
+// Either may arrive alone (two fire-and-forget calls), so we UPDATE only the
+// column(s) present.
 router.post('/device-token', async (req, res, next) => {
   try {
-    const deviceId = req.body && (req.body.device_id || req.body.token);
-    if (!deviceId) return modernError(res, 400, 'device_id is required');
-    await pool.query(
-      'UPDATE tbl_client_contacts SET device_id = ? WHERE id = ?',
-      [String(deviceId), req.spoc.id]);
-    logger.info('Device id recorded · spocId=' + req.spoc.id);
+    const body = req.body || {};
+    const deviceId = body.device_id || body.token;
+    const fcmToken = body.fcm_token;
+    if (!deviceId && !fcmToken) return modernError(res, 400, 'device_id or fcm_token is required');
+
+    const sets = [];
+    const params = [];
+    if (deviceId) { sets.push('device_id = ?'); params.push(String(deviceId)); }
+    if (fcmToken) { sets.push('fcm_token = ?'); params.push(String(fcmToken)); }
+    params.push(req.spoc.id);
+
+    await pool.query(`UPDATE tbl_client_contacts SET ${sets.join(', ')} WHERE id = ?`, params);
+    logger.info('Device token recorded · spocId=' + req.spoc.id + (deviceId ? ' · device' : '') + (fcmToken ? ' · fcm' : ''));
     modernOk(res, { ok: true });
   } catch (e) { next(e); }
 });

@@ -81,8 +81,44 @@ async function pushNoticeToTechnicians(notice) {
   }
 }
 
+/*
+ * Push a published notice to all active client SPOCs that have a device token
+ * (tbl_client_contacts.fcm_token). Mirrors pushNoticeToTechnicians — same
+ * { type:'notice', screen:'notices' } data payload the client app's bell screen
+ * listens for. Fire-and-forget: returns a summary, never rejects.
+ */
+async function pushNoticeToClients(notice) {
+  try {
+    if (!notice || notice.notice_id == null) {
+      return { delivered: false, reason: 'no notice' };
+    }
+
+    logger.info('Push notice to clients · noticeId=' + notice.notice_id);
+    const recipients = await pushDelivery.resolveClientTokens({ limit: MAX_RECIPIENTS });
+    if (!recipients.length) {
+      logger.info({ noticeId: notice.notice_id }, 'notice-push(client): no device tokens — skipping');
+      return { delivered: false, reason: 'no tokens', recipients: 0 };
+    }
+
+    const title = notice.title || 'EasyFix';
+    const body = bodyExcerpt(notice.body);
+    const data = { type: 'notice', screen: 'notices', noticeId: String(notice.notice_id) };
+
+    const r = await pushDelivery.deliver(
+      recipients,
+      { title, body, data },
+      { concurrency: CHUNK_SIZE, prune: false, unit: 'recipients', label: `notice-client · noticeId=${notice.notice_id}` },
+    );
+    return { delivered: r.delivered, deliveredCount: r.deliveredCount, recipients: r.tokenCount };
+  } catch (e) {
+    logger.warn({ noticeId: notice && notice.notice_id, err: e.message }, 'notice-push(client): push failed (swallowed)');
+    return { delivered: false, error: e.message };
+  }
+}
+
 module.exports = {
   pushNoticeToTechnicians,
+  pushNoticeToClients,
   // Back-compat shim: preserves the historical string[] return shape.
   resolveRecipientTokens: async () =>
     (await pushDelivery.resolveVerifiedTechnicianTokens({ limit: MAX_RECIPIENTS })).map((r) => r.token),
