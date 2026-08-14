@@ -60,7 +60,7 @@ module.exports = async function basicAuth(req, res, next) {
     name: row.client_name || null,
     loginName: row.login_name,
     loginId: row.client_login_id,
-    role: await resolveLegacyRole(row.login_name, row.client_id),
+    role: await resolveLegacyRole(row.login_name),
   };
   next();
 };
@@ -78,26 +78,34 @@ module.exports = async function basicAuth(req, res, next) {
  * so the role has to be recovered even though it lives outside our own
  * credential table.
  *
- * Matched on login_name = user_name first: both columns ARE the login
- * identity, so an exact match is the same principal. Falls back to the
- * client's own row when the names diverge, since one client may hold several
- * logins.
+ * Matched on login_name = user_name ONLY — deliberately not falling back to
+ * the client id. Legacy authenticated against tbl_client_user by username, so
+ * the username IS the principal whose role decided the response shape. A
+ * client-id match would borrow some other login's role, and one client can
+ * hold several logins with different ones.
+ *
+ * Measured against QA (2026-08-14): of 250+ enabled logins in
+ * tbl_client_website, exactly two have a matching tbl_client_user row —
+ * `Decathlon` and `retail`, both role "website". That is expected rather than
+ * alarming: legacy could only ever authenticate logins present in
+ * tbl_client_user, so those two are the entire historical /v1 population.
+ * Every other login resolves to null and therefore takes the documented
+ * default shape, which is correct for a caller with no legacy expectation.
  *
  * Returns null — never throws — when the legacy tables are absent (a deploy
  * that never had them) or nothing matches. Callers decide the default; a
  * missing role must not be able to 500 an endpoint that only needs it to
  * pick a JSON shape.
  */
-async function resolveLegacyRole(loginName, clientId) {
+async function resolveLegacyRole(loginName) {
   try {
     const [[row]] = await pool.query(
       `SELECT cr.role_name
          FROM tbl_client_user cu
          JOIN tbl_client_role cr ON cr.role_id = cu.fk_role_id
-        WHERE cu.user_name = ? OR cu.fk_client_id = ?
-        ORDER BY (cu.user_name = ?) DESC
+        WHERE cu.user_name = ?
         LIMIT 1`,
-      [loginName, clientId, loginName]
+      [loginName]
     );
     return row?.role_name || null;
   } catch (err) {
