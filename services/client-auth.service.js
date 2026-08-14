@@ -9,6 +9,10 @@ const jwt = require('jsonwebtoken');
  * JWT claim `sub` is namespaced as `spoc:<id>` so auth.js can distinguish.
  */
 
+// Both lookups JOIN tbl_client and project `client_status` so callers can
+// reject login when the parent client account is inactive (status != 1).
+// Doing the JOIN here keeps the auth flow honest — every code path that
+// reads a SPOC also sees whether their client is enabled.
 async function findSpoc(identifier) {
   const raw = String(identifier || '').trim();
   const isEmail = /@/.test(raw);
@@ -33,6 +37,9 @@ async function findSpoc(identifier) {
 }
 
 async function findSpocById(id) {
+  // client_name added so the sidebar can show the company name on the
+  // Client Profile nav item without an extra round-trip. Cheap (single
+  // LEFT JOIN, indexed PK) and the row is already being assembled here.
   const [[row]] = await pool.query(
     `SELECT cc.id, cc.client_id, cc.contact_name, cc.contact_email, cc.contact_no,
             cl.client_name, cl.client_status

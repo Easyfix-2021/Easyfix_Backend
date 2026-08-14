@@ -36,6 +36,14 @@ router.use('/shared-job', require('./shared-job'));
 // job-completion flow's prefill+save POSTs.
 router.use('/easyfixer-profile-update', require('./easyfixer-profile-update'));
 router.use('/maps', require('./maps'));
+// Customer feedback page — public, jobId-scoped via the URL param.
+// See routes/public/feedback.js for the threat model + future
+// magic-link hardening notes.
+router.use('/feedback', require('./feedback'));
+// Customer/SPOC estimate-approval page — JWT-scoped via the URL token.
+// Token-only credential (same JWT_SECRET); see routes/public/estimate.js
+// for the threat model and idempotency guards.
+router.use('/estimate', require('./estimate'));
 // JSON resolver for the URL shortener. Reached at /api/public/book/:code
 // via the frontend's /api/* proxy — the customer-facing /book/<code>
 // short link lives on the Next.js origin and resolves through here.

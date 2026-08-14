@@ -29,7 +29,7 @@ router.get('/completed-jobs', async (req, res, next) => {
 
     if (wantsXlsx(req)) {
       logger.info('Exporting ' + rows.length + ' completed jobs as xlsx');
-      return sendXlsx(res, {
+      return await sendXlsx(res, {
         filename: `completed-jobs-${stamp()}.xlsx`,
         sheetName: 'Completed Jobs',
         columns: [
@@ -67,7 +67,7 @@ router.get('/easyfixer', async (req, res, next) => {
     logger.info('Found ' + rows.length + ' easyfixers');
 
     if (wantsXlsx(req)) {
-      return sendXlsx(res, {
+      return await sendXlsx(res, {
         filename: `easyfixer-report-${stamp()}.xlsx`,
         sheetName: 'Easyfixers',
         columns: [
@@ -100,7 +100,7 @@ router.get('/payout-sheet', async (req, res, next) => {
     logger.info('Found ' + rows.length + ' payout rows');
 
     if (wantsXlsx(req)) {
-      return sendXlsx(res, {
+      return await sendXlsx(res, {
         filename: `payout-sheet-${stamp()}.xlsx`,
         sheetName: 'Payout Sheet',
         columns: [
@@ -133,7 +133,7 @@ router.get('/city-analysis', async (req, res, next) => {
     logger.info('Found ' + rows.length + ' cities');
 
     if (wantsXlsx(req)) {
-      return sendXlsx(res, {
+      return await sendXlsx(res, {
         filename: `city-analysis-${stamp()}.xlsx`,
         sheetName: 'City Analysis',
         columns: [
@@ -204,7 +204,7 @@ router.get('/user-productivity', async (req, res, next) => {
     });
 
     if (wantsXlsx(req)) {
-      return sendXlsx(res, {
+      return await sendXlsx(res, {
         filename: `user-productivity-${stamp()}.xlsx`,
         sheetName: 'User Productivity',
         columns: [

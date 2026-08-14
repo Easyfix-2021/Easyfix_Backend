@@ -211,6 +211,7 @@ async function list({ categoryId, serviceTypeId, includeInactive = false } = {})
   `, params);
   // Fan out presigner calls for non-empty image keys. Promise.all keeps
   // latency O(1) for the typical batch size (<=500 skills per category).
+  // Canonical resolver: resolveImageUrlFromKey (Skills/ prefix) -> deep_skill_image_url.
   logger.info('Found ' + rows.length + ' deep skills');
   const urls = await Promise.all(
     rows.map((r) => resolveImageUrlFromKey(r.deepskill_image)),
@@ -248,6 +249,7 @@ async function getById(deepskillId) {
     'SELECT id, skill_option, status FROM tbl_deepskill_options WHERE deepskill_id = ? ORDER BY id',
     [deepskillId]
   );
+  row.deep_skill_image_url = await resolveImageUrlFromKey(row.deepskill_image);
   return { ...row, options };
 }
 

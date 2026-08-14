@@ -80,11 +80,8 @@ async function buildTemplateBuffer() {
   ];
   ws.addRow(headers);
   ws.getRow(1).font = { bold: true };
-  ws.getRow(1).fill = {
-    type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEEF2F7' },
-  };
   ws.columns = headers.map((h) => ({
-    width: Math.max(14, Math.min(40, h.length + 4)),
+    width: Math.max(18, Math.min(40, h.length + 4)),
   }));
 
   // Hidden vocabulary sheets — `state = 'veryHidden'` keeps them out

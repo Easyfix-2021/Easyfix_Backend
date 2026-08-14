@@ -358,7 +358,7 @@ router.get('/invoices/:id/excel', scopedInvoice, async (req, res, next) => {
     const data = await loadInvoiceArtifactData(Number(req.params.id));
     if (!data) return modernError(res, 404, 'invoice not found');
     const { inv, lines } = data;
-    sendXlsx(res, {
+    await sendXlsx(res, {
       filename: `invoice-${inv.invoice_number || inv.id}-mastersheet.xlsx`,
       sheetName: `Inv-${inv.id}`,
       columns: [
