@@ -3,9 +3,12 @@ const assert = require('node:assert/strict');
 const express = require('express');
 
 const identity = require('../services/mobile-identity.service');
+const rewards = require('../services/rewards.service');
 const originalSaveIdentityDetails = identity.saveIdentityDetails;
 const originalGetIdentityDetails = identity.getIdentityDetails;
+const originalQualifyReferral = rewards.qualifyReferralAfterProfileMutation;
 let received = null;
+let qualificationEfrId = null;
 let server;
 let baseUrl;
 
@@ -17,6 +20,10 @@ before(async () => {
   identity.saveIdentityDetails = async (efrId, body, options) => {
     received = { efrId, body, hasFinalize: typeof options?.finalize === 'function' };
     return { updated: true, finalization: { finalized: false } };
+  };
+  rewards.qualifyReferralAfterProfileMutation = async (efrId) => {
+    qualificationEfrId = efrId;
+    return { qualified: false, referred: false };
   };
   // eslint-disable-next-line global-require
   const router = require('../routes/mobile/profile-identity');
@@ -33,10 +40,14 @@ before(async () => {
 after(async () => {
   identity.getIdentityDetails = originalGetIdentityDetails;
   identity.saveIdentityDetails = originalSaveIdentityDetails;
+  rewards.qualifyReferralAfterProfileMutation = originalQualifyReferral;
   if (server) await new Promise((resolve) => server.close(resolve));
 });
 
-beforeEach(() => { received = null; });
+beforeEach(() => {
+  received = null;
+  qualificationEfrId = null;
+});
 
 async function post(body) {
   const response = await fetch(`${baseUrl}/profile/identity-details`, {
@@ -66,6 +77,7 @@ test('identity route accepts optional name in the existing payload and forwards 
   const response = await post(payload);
   assert.equal(response.status, 200);
   assert.deepEqual(received, { efrId: 8379, body: payload, hasFinalize: true });
+  assert.equal(qualificationEfrId, 8379, 'the committed Identity save retries referral qualification');
 });
 
 test('identity route preserves backward compatibility when name is omitted', async () => {

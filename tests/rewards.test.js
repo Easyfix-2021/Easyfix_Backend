@@ -249,6 +249,459 @@ test('an unknown referral code is refused', async () => {
   r.restore();
 });
 
+test('replaying the same referral code succeeds, but a different code remains immutable', async () => {
+  const same = route([
+    [/FROM reward_referral_codes WHERE code = \?/i, [{ easyfixer_id: 100 }]],
+    [/SELECT id, referrer_efr_id, code[\s\S]*FROM reward_referrals[\s\S]*FOR UPDATE/i,
+      [{ id: 55, referrer_efr_id: 100, code: 'EFFRIEND' }]],
+    [/SELECT id FROM reward_referrals WHERE referred_efr_id = \?/i, []],
+  ]);
+  const replay = await rewards.attachReferral(200, '  effriend ');
+  assert.equal(replay.idempotent, true);
+  assert.equal(replay.code, 'EFFRIEND');
+  assert.ok(!same.calls.some((call) => /INSERT INTO reward_referrals/i.test(call.sql)));
+  same.restore();
+
+  const different = route([
+    [/FROM reward_referral_codes WHERE code = \?/i, [{ easyfixer_id: 101 }]],
+    [/SELECT id, referrer_efr_id, code[\s\S]*FROM reward_referrals[\s\S]*FOR UPDATE/i,
+      [{ id: 55, referrer_efr_id: 100, code: 'EFFRIEND' }]],
+  ]);
+  await assert.rejects(
+    () => rewards.attachReferral(200, 'EFOTHER'),
+    (error) => error.status === 409 && /different referral code/i.test(error.message),
+  );
+  different.restore();
+});
+
+test('a concurrent same-code insert collision is retried on a fresh transaction', async () => {
+  const duplicate = Object.assign(new Error('concurrent attribution won'), { code: 'ER_DUP_ENTRY' });
+  let collisionObserved = false;
+  const r = route([
+    [/FROM reward_referral_codes WHERE code = \?/i, [{ easyfixer_id: 100 }]],
+    [/SELECT id, referrer_efr_id, code[\s\S]*FROM reward_referrals[\s\S]*FOR UPDATE/i,
+      () => (collisionObserved
+        ? [{ id: 55, referrer_efr_id: 100, code: 'EFFRIEND' }]
+        : [])],
+    [/INSERT INTO reward_referrals/i, () => {
+      collisionObserved = true;
+      return duplicate;
+    }],
+    [/SELECT id FROM reward_referrals WHERE referred_efr_id = \?/i, []],
+  ]);
+  const out = await rewards.attachReferral(200, 'EFFRIEND');
+  assert.equal(out.idempotent, true);
+  assert.equal(
+    r.calls.filter((call) => /SELECT id, referrer_efr_id, code[\s\S]*FROM reward_referrals/i.test(call.sql)).length,
+    2,
+    'the unique-key winner is re-read instead of surfacing a 500',
+  );
+  assert.equal(r.calls.filter((call) => /INSERT INTO reward_referrals/i.test(call.sql)).length, 1);
+  r.restore();
+});
+
+test('a referral attach lock-wait timeout is retried instead of leaking a 500', async () => {
+  const timeout = Object.assign(new Error('gap lock busy'), { code: 'ER_LOCK_WAIT_TIMEOUT' });
+  let timeoutObserved = false;
+  const r = route([
+    [/FROM reward_referral_codes WHERE code = \?/i, [{ easyfixer_id: 100 }]],
+    [/SELECT id, referrer_efr_id, code[\s\S]*FROM reward_referrals[\s\S]*FOR UPDATE/i,
+      () => (timeoutObserved
+        ? [{ id: 56, referrer_efr_id: 100, code: 'EFFRIEND' }]
+        : [])],
+    [/INSERT INTO reward_referrals/i, () => {
+      timeoutObserved = true;
+      return timeout;
+    }],
+    [/SELECT id FROM reward_referrals WHERE referred_efr_id = \?/i, []],
+  ]);
+  const out = await rewards.attachReferral(201, 'EFFRIEND');
+  assert.equal(out.idempotent, true);
+  assert.equal(out.referrerEfrId, 100);
+  r.restore();
+});
+
+test('applying a code after Complete Profile qualifies it immediately', async () => {
+  const r = route([
+    [/FROM reward_referral_codes WHERE code = \?/i, [{ easyfixer_id: 100 }]],
+    [/SELECT id, referrer_efr_id, code[\s\S]*FROM reward_referrals[\s\S]*FOR UPDATE/i, []],
+    [/INSERT INTO reward_referrals/i, { insertId: 55 }],
+    [/SELECT id, referrer_efr_id, referred_efr_id, qualified_at[\s\S]*FROM reward_referrals/i,
+      [{ id: 55, referrer_efr_id: 100, referred_efr_id: 200, qualified_at: null }]],
+    [/FROM tbl_easyfixer e[\s\S]*LEFT JOIN tbl_user u/i, [{
+      efr_id: 200,
+      efr_name: 'Referred Technician',
+      efr_no: '9999999999',
+      has_active_deep_skill: 1,
+      efr_service_category: null,
+      efr_service_type: null,
+      adhaar_card_number: '123412341234',
+      efr_profile_img: 'profile.jpg',
+      user_is_personal_detail_filled: 1,
+    }]],
+    [/SELECT efr_status[\s\S]*FROM tbl_easyfixer/i, [{ efr_status: 1 }]],
+    [/INSERT INTO reward_points_ledger/i, { insertId: 900 }],
+    [/UPDATE reward_referrals SET qualified_at/i, { affectedRows: 1 }],
+  ]);
+  const out = await rewards.attachReferral(200, 'EFFRIEND');
+  assert.equal(out.idempotent, false);
+  assert.equal(out.qualification.qualified, true);
+  assert.equal(out.qualification.awarded, true);
+  assert.ok(r.calls.some((call) => /UPDATE reward_referrals SET qualified_at/i.test(call.sql)));
+  r.restore();
+});
+
+function qualificationDatabase({ complete = true, duplicateLedger = null } = {}) {
+  const events = [];
+  const calls = [];
+  const referral = {
+    id: 55,
+    referrer_efr_id: 100,
+    referred_efr_id: 200,
+    qualified_at: null,
+  };
+  const profile = {
+    efr_id: 200,
+    efr_name: 'Referred Technician',
+    efr_no: '9999999999',
+    has_active_deep_skill: complete ? 1 : 0,
+    efr_service_category: null,
+    efr_service_type: null,
+    adhaar_card_number: complete ? '123412341234' : null,
+    efr_profile_img: complete ? 'profile.jpg' : null,
+    user_is_personal_detail_filled: complete ? 1 : 0,
+  };
+
+  const conn = {
+    async beginTransaction() { events.push('begin'); },
+    async commit() { events.push('commit'); },
+    async rollback() { events.push('rollback'); },
+    release() { events.push('release'); },
+    async query(sql) {
+      const text = String(sql);
+      calls.push(text);
+      if (/FROM reward_referrals[\s\S]*WHERE id = \?/i.test(text)) {
+        events.push('lock-referral');
+        return [[referral], []];
+      }
+      if (/FROM tbl_easyfixer e/i.test(text)) {
+        events.push('read-profile');
+        return [[profile], []];
+      }
+      if (/SELECT efr_status[\s\S]*FROM tbl_easyfixer/i.test(text)) {
+        events.push('read-referrer');
+        return [[{ efr_status: 1 }], []];
+      }
+      if (/INSERT INTO reward_points_ledger/i.test(text)) {
+        events.push('insert-ledger');
+        if (duplicateLedger !== null) {
+          throw Object.assign(new Error('duplicate'), { code: 'ER_DUP_ENTRY' });
+        }
+        return [{ insertId: 900 }, []];
+      }
+      if (/FROM reward_points_ledger/i.test(text)) {
+        events.push('verify-ledger');
+        return [[duplicateLedger], []];
+      }
+      if (/UPDATE reward_referrals SET qualified_at/i.test(text)) {
+        events.push('mark-qualified');
+        return [{ affectedRows: 1 }, []];
+      }
+      throw new Error(`Unexpected qualification SQL: ${text}`);
+    },
+  };
+  return {
+    events,
+    calls,
+    async query(sql) {
+      assert.match(String(sql), /SELECT id FROM reward_referrals WHERE referred_efr_id/i);
+      events.push('probe-referral');
+      return [[{ id: 55 }], []];
+    },
+    async getConnection() { events.push('connection'); return conn; },
+  };
+}
+
+test('profile qualification writes ledger and qualified_at atomically, in that order', async () => {
+  const database = qualificationDatabase();
+  const out = await rewards.qualifyReferralIfEligible(200, {
+    database,
+    config: { earningPaused: false, referral: 200 },
+  });
+  assert.equal(out.qualified, true);
+  assert.equal(out.awarded, true);
+  assert.ok(database.events.indexOf('insert-ledger') < database.events.indexOf('mark-qualified'));
+  assert.ok(database.events.indexOf('mark-qualified') < database.events.indexOf('commit'));
+  assert.ok(!database.events.includes('rollback'));
+  assert.match(
+    database.calls.find((sql) => /SELECT efr_status[\s\S]*FROM tbl_easyfixer/i.test(sql)),
+    /FOR UPDATE/i,
+    'active referrer eligibility is locked through the ledger insert',
+  );
+});
+
+test('an incomplete profile stays pending and writes no reward state', async () => {
+  const database = qualificationDatabase({ complete: false });
+  const out = await rewards.qualifyReferralIfEligible(200, {
+    database,
+    config: { earningPaused: false, referral: 200 },
+  });
+  assert.equal(out.qualified, false);
+  assert.equal(out.completion.profileComplete, false);
+  assert.ok(!database.events.includes('insert-ledger'));
+  assert.ok(!database.events.includes('mark-qualified'));
+  assert.ok(database.events.includes('commit'));
+});
+
+test('a duplicate referral ledger repairs qualified_at only when technician and points match', async () => {
+  const valid = qualificationDatabase({
+    duplicateLedger: { id: 900, easyfixer_id: 100, delta: 200 },
+  });
+  const repaired = await rewards.qualifyReferralIfEligible(200, {
+    database: valid,
+    config: { earningPaused: false, referral: 200 },
+  });
+  assert.equal(repaired.repaired, true);
+  assert.ok(valid.events.includes('mark-qualified'));
+  assert.ok(valid.events.includes('commit'));
+
+  const inconsistent = qualificationDatabase({
+    duplicateLedger: { id: 900, easyfixer_id: 999, delta: 200 },
+  });
+  await assert.rejects(
+    () => rewards.qualifyReferralIfEligible(200, {
+      database: inconsistent,
+      config: { earningPaused: false, referral: 200 },
+    }),
+    /ledger is inconsistent/i,
+  );
+  assert.ok(inconsistent.events.includes('rollback'));
+  assert.ok(!inconsistent.events.includes('mark-qualified'));
+});
+
+test('referral attribution is one lightweight read with no own-code generation or outgoing list', async () => {
+  const r = route([
+    [/FROM tbl_easyfixer e[\s\S]*LEFT JOIN reward_referrals r/i, [{
+      efr_id: 200,
+      efr_name: 'Referred',
+      efr_no: '9999999999',
+      has_active_deep_skill: 1,
+      efr_service_category: null,
+      efr_service_type: null,
+      adhaar_card_number: '123412341234',
+      efr_profile_img: 'profile.jpg',
+      user_is_personal_detail_filled: 1,
+      referral_code: 'EFFRIEND',
+      joined_at: new Date('2026-08-01T00:00:00Z'),
+      qualified_at: null,
+      referrer_name: 'Referrer',
+    }]],
+  ]);
+  const out = await rewards.referralAttribution(200);
+  assert.equal(out.referredBy.code, 'EFFRIEND');
+  assert.equal(out.qualification.profileComplete, true);
+  assert.equal(out.qualification.workAreaComplete, true);
+  assert.equal(r.calls.length, 1);
+  assert.ok(!r.calls.some((call) => /reward_referral_codes|INSERT INTO/i.test(call.sql)));
+  r.restore();
+});
+
+test('referral summary uses aggregate totals even when the recent list is capped at 50', async () => {
+  const recent = Array.from({ length: 50 }, (_, index) => ({
+    referred_efr_id: index + 1,
+    joined_at: new Date(),
+    qualified_at: index < 20 ? new Date() : null,
+    referred_name: `Tech ${index + 1}`,
+  }));
+  const r = route([
+    [/SELECT r\.referred_efr_id[\s\S]*WHERE r\.referrer_efr_id/i, recent],
+    [/SELECT COUNT\(\*\) AS joined/i, [{ joined: 123, qualified: 87 }]],
+    [/SELECT r\.code[\s\S]*WHERE r\.referred_efr_id/i, []],
+    [/SELECT code FROM reward_referral_codes WHERE easyfixer_id/i, [{ code: 'EFOWNER' }]],
+  ]);
+  const out = await rewards.referralSummary(100);
+  assert.equal(out.joined, 123);
+  assert.equal(out.qualified, 87);
+  assert.equal(out.referrals.length, 50);
+  r.restore();
+});
+
+test('CRM referral list is bounded, keyset-paginated and matches the page DTO', async () => {
+  const records = Array.from({ length: 201 }, (_, index) => ({
+    id: 500 - index,
+    code: 'EFFRIEND',
+    joined_at: new Date('2026-08-01T00:00:00Z'),
+    qualified_at: index === 0 ? new Date('2026-08-02T00:00:00Z') : null,
+    referrer_efr_id: 100,
+    referrer_name: 'Referrer',
+    referrer_mobile: '8882322333',
+    referred_efr_id: 200 + index,
+    referred_name: 'Referred',
+    referred_mobile: '9999999999',
+    has_active_deep_skill: 1,
+    efr_service_category: null,
+    efr_service_type: null,
+    adhaar_card_number: '123412341234',
+    efr_profile_img: 'profile.jpg',
+    user_is_personal_detail_filled: 1,
+  }));
+  const r = route([[/FROM reward_referrals r/i, records]]);
+  const out = await rewards.listReferrals({
+    status: 'pending', code: 'effriend', search: 'Referred', cursor: 800, limit: 999,
+  });
+  assert.equal(out.items.length, 200, 'hard page cap is 200');
+  assert.equal(out.hasMore, true);
+  assert.equal(typeof out.nextCursor, 'string');
+  assert.deepEqual(out.items[0].referrer, {
+    efrId: 100,
+    name: 'Referrer',
+    mobileMasked: '8882322333',
+  });
+  assert.deepEqual(out.items[0].profile, {
+    skillsComplete: true,
+    identityComplete: true,
+    workAreaComplete: true,
+    complete: true,
+  });
+  const query = r.calls[0];
+  assert.match(query.sql, /r\.qualified_at IS NULL/);
+  assert.match(query.sql, /r\.id < \?/);
+  assert.match(query.sql, /ORDER BY r\.id DESC[\s\S]*LIMIT \?/);
+  assert.equal(query.params.at(-1), 201, 'fetches only one look-ahead row');
+  r.restore();
+
+  const { maskMobileInResponse } = require('../utils/mask-mobile');
+  assert.equal(
+    maskMobileInResponse({ mobileMasked: '8882322333' }).mobileMasked,
+    '8882••••••',
+    'the inherited admin response masker covers the CRM DTO alias',
+  );
+});
+
+test('referral reconciliation examines at most 200 pending IDs in pages of 50', async () => {
+  const r = route([
+    [/SELECT GET_LOCK/i, [{ acquired: 1 }]],
+    [/SELECT RELEASE_LOCK/i, [{ released: 1 }]],
+    [/SELECT last_referral_id[\s\S]*FROM reward_reconciliation_state/i,
+      [{ last_referral_id: 0 }]],
+    [/SELECT id, referred_efr_id[\s\S]*FROM reward_referrals/i,
+      (_sql, params) => {
+        const cursor = Number(params[0]);
+        const take = Number(params.at(-1));
+        return Array.from({ length: take }, (_, index) => ({
+          id: cursor + index + 1,
+          referred_efr_id: 1000 + cursor + index + 1,
+        }));
+      }],
+    [/UPDATE reward_reconciliation_state/i, { affectedRows: 1 }],
+  ]);
+  const out = await rewards.reconcileReferralQualifications({
+    limit: 9999,
+    pageSize: 9999,
+    config: { earningPaused: false, referral: 200 },
+    qualify: async () => ({ qualified: false }),
+  });
+  assert.equal(out.cap, 200);
+  assert.equal(out.scanned, 200);
+  assert.equal(out.skipped, 200);
+  const candidateReads = r.calls.filter((call) => /FROM reward_referrals/i.test(call.sql));
+  assert.equal(candidateReads.length, 4);
+  assert.ok(candidateReads.every((call) => call.params.at(-1) <= 50));
+  assert.ok(candidateReads.every((call) => !/JOIN|tbl_easyfixer|tbl_user/i.test(call.sql)),
+    'the LIMIT is applied to indexed pending referral IDs before profile eligibility');
+  r.restore();
+});
+
+test('reconciliation counts incomplete rows and isolates a corrupt candidate', async () => {
+  const r = route([
+    [/SELECT GET_LOCK/i, [{ acquired: 1 }]],
+    [/SELECT RELEASE_LOCK/i, [{ released: 1 }]],
+    [/SELECT last_referral_id[\s\S]*FROM reward_reconciliation_state/i,
+      [{ last_referral_id: 0 }]],
+    [/SELECT id, referred_efr_id[\s\S]*FROM reward_referrals/i, [
+      { id: 1, referred_efr_id: 101 },
+      { id: 2, referred_efr_id: 102 },
+      { id: 3, referred_efr_id: 103 },
+    ]],
+    [/UPDATE reward_reconciliation_state/i, { affectedRows: 1 }],
+  ]);
+  const visited = [];
+  const out = await rewards.reconcileReferralQualifications({
+    limit: 10,
+    pageSize: 10,
+    config: { earningPaused: false, referral: 200 },
+    qualify: async (efrId) => {
+      visited.push(efrId);
+      if (efrId === 102) throw Object.assign(new Error('bad legacy row'), { code: 'ER_BAD_FIELD_ERROR' });
+      if (efrId === 103) return { awarded: true };
+      return { qualified: false, reason: 'profile_incomplete' };
+    },
+  });
+  assert.deepEqual(visited, [101, 102, 103], 'one bad row cannot poison later candidates');
+  assert.deepEqual(
+    { scanned: out.scanned, awarded: out.awarded, skipped: out.skipped, errors: out.errors },
+    { scanned: 3, awarded: 1, skipped: 1, errors: 1 },
+  );
+  r.restore();
+});
+
+test('reconciliation cursor wraps once and persists the last claimed ID', async () => {
+  const r = route([
+    [/SELECT GET_LOCK/i, [{ acquired: 1 }]],
+    [/SELECT RELEASE_LOCK/i, [{ released: 1 }]],
+    [/SELECT last_referral_id[\s\S]*FROM reward_reconciliation_state/i,
+      [{ last_referral_id: 50 }]],
+    [/SELECT id, referred_efr_id[\s\S]*FROM reward_referrals/i,
+      (sql) => (/id <= \?/i.test(sql)
+        ? [
+          { id: 10, referred_efr_id: 110 },
+          { id: 20, referred_efr_id: 120 },
+        ]
+        : [{ id: 70, referred_efr_id: 170 }])],
+    [/UPDATE reward_reconciliation_state/i, { affectedRows: 1 }],
+  ]);
+  const out = await rewards.reconcileReferralQualifications({
+    limit: 3,
+    pageSize: 2,
+    config: { earningPaused: false, referral: 200 },
+    qualify: async () => ({ qualified: false }),
+  });
+  assert.equal(out.scanned, 3);
+  assert.equal(out.wrapped, true);
+  assert.equal(out.cursor, 20);
+  const update = r.calls.find((call) => /UPDATE reward_reconciliation_state/i.test(call.sql));
+  assert.equal(update.params[0], 20);
+  r.restore();
+});
+
+test('a parallel reconciliation replica skips without reading candidate rows', async () => {
+  const r = route([[/SELECT GET_LOCK/i, [{ acquired: 0 }]]]);
+  const out = await rewards.reconcileReferralQualifications({
+    config: { earningPaused: false, referral: 200 },
+  });
+  assert.equal(out.lockSkipped, true);
+  assert.equal(out.scanned, 0);
+  assert.ok(!r.calls.some((call) => /FROM reward_referrals|reward_reconciliation_state/i.test(call.sql)));
+  r.restore();
+});
+
+test('CRM referral audit stays masked even when unmasked=true is supplied', () => {
+  const maskMobile = require('../middleware/mask-mobile');
+  let responseBody;
+  const req = {
+    path: '/rewards/referrals',
+    query: { unmasked: 'true' },
+  };
+  const res = {
+    json(body) { responseBody = body; return body; },
+  };
+  let continued = false;
+  maskMobile(req, res, () => { continued = true; });
+  assert.equal(continued, true);
+  res.json({ items: [{ referrer: { mobileMasked: '8882322333' } }] });
+  assert.equal(responseBody.items[0].referrer.mobileMasked, '8882••••••');
+});
+
 test('the referral alphabet stays speakable over a phone call', () => {
   const alphabet = rewards._internals.CODE_ALPHABET;
   /*

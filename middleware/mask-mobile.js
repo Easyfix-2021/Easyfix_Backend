@@ -59,8 +59,18 @@ const UNMASKED_PATH_PREFIXES = [
   '/users',          // list, detail, hierarchy, bulk-lookups, check-mobile/email
 ];
 
+// Read-only audit/report surfaces never need edit-form prefill. Keep them
+// masked even if a caller adds the generic ?unmasked=true escape hatch.
+const ALWAYS_MASKED_PATH_PREFIXES = [
+  '/rewards/referrals',
+];
+
 function isUnmaskedPath(reqPath) {
   return UNMASKED_PATH_PREFIXES.some((prefix) => reqPath === prefix || reqPath.startsWith(prefix + '/'));
+}
+
+function isAlwaysMaskedPath(reqPath) {
+  return ALWAYS_MASKED_PATH_PREFIXES.some((prefix) => reqPath === prefix || reqPath.startsWith(prefix + '/'));
 }
 
 /*
@@ -85,7 +95,8 @@ function isReportPath(reqPath) {
 }
 
 function maskMobileResponseMiddleware(req, res, next) {
-  const wantsUnmasked = String(req.query?.unmasked).toLowerCase() === 'true';
+  const wantsUnmasked = String(req.query?.unmasked).toLowerCase() === 'true'
+    && !isAlwaysMaskedPath(req.path);
   if (wantsUnmasked || isUnmaskedPath(req.path)) {
     // Short-circuit: edit-form opt-out OR whitelisted internal-staff
     // route. The route's own auth + role checks already gate this;

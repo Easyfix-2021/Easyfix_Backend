@@ -110,9 +110,8 @@ async function findById(id) {
    * OVERDUE TRAINING RESTRICTS THE APP.
    *
    * A technician past the due date on assigned training keeps only what they
-   * need to get unstuck or get paid: training itself, claiming money, and the
-   * skip/reject path out of anything already on their plate. New work,
-   * attendance and job mutation are withdrawn until they finish.
+   * need to get unstuck or get paid: training itself and claiming money. New
+   * work, attendance and every job mutation are withdrawn until they finish.
    *
    * Layered on top of the lifecycle capabilities rather than modelled as a
    * new lifecycle STATUS, for three reasons:

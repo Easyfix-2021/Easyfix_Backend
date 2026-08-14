@@ -19,6 +19,16 @@ const logger = require('../../logger');
 
 const idParam = Joi.object({ id: Joi.number().integer().positive().required() });
 
+const referralsQuery = Joi.object({
+  status: Joi.string().valid('pending', 'qualified').allow('', null).optional(),
+  code: Joi.string().trim().max(24).allow('', null).optional(),
+  search: Joi.string().trim().max(100).allow('', null).optional(),
+  // Temporary alias for callers built against the earlier internal draft.
+  q: Joi.string().trim().max(100).allow('', null).optional(),
+  cursor: Joi.number().integer().positive().optional(),
+  limit: Joi.number().integer().min(1).max(200).default(50),
+});
+
 /*
  * The published earn rates, read-only.
  *
@@ -41,6 +51,17 @@ router.get('/config', async (_req, res, next) => {
       // implying the numbers are editable somewhere an operator hasn't found.
       configurable: false,
     });
+  } catch (e) { next(e); }
+});
+
+/*
+ * Read-only referral operations view. It inherits the same authenticated admin
+ * permission and mobile-number masking as the other Rewards reads. Pagination
+ * is id-keyset based; no export-sized/unbounded response is available here.
+ */
+router.get('/referrals', validate(referralsQuery, 'query'), async (req, res, next) => {
+  try {
+    modernOk(res, await svc.listReferrals(req.query));
   } catch (e) { next(e); }
 });
 

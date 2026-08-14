@@ -139,6 +139,18 @@ router.get('/claims', validate(pageQuery, 'query'), async (req, res, next) => {
 
 // ─── Referral ────────────────────────────────────────────────────────
 
+/*
+ * Complete Profile needs only the immutable incoming attribution and the three
+ * completion flags. Keep this separate from /referral: it performs one bounded
+ * read, does not generate this technician's own share code, and does not load
+ * the outgoing referral list.
+ */
+router.get('/referral/attribution', async (req, res, next) => {
+  try {
+    modernOk(res, await svc.referralAttribution(req.tech.efr_id));
+  } catch (e) { next(e); }
+});
+
 /* Issues the code on first read, so a technician who never opens Rewards
  * never has one — there is nothing to generate in advance. */
 router.get('/referral', async (req, res, next) => {
@@ -150,9 +162,9 @@ router.get('/referral', async (req, res, next) => {
 const applyBody = Joi.object({ code: Joi.string().trim().min(4).max(24).required() });
 
 /*
- * Applying a code records the link and pays NOTHING. The referrer is credited
- * only once this technician completes their first job — paying at signup would
- * be an invitation to invent technicians.
+ * Applying a code records the immutable link. If all three Complete Profile
+ * cards are already done, the same request qualifies the referral after the
+ * attribution commit; otherwise the last profile-card mutation does it.
  */
 router.post('/referral/apply', validate(applyBody), async (req, res, next) => {
   try {

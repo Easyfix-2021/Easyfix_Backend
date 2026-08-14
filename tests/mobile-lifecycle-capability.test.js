@@ -128,6 +128,32 @@ test('job boundary separates offer decisions from already-assigned mutations', a
   assert.equal(unrelatedWrite.nextCalled, true, 'earnings/profile writes are not job-gated');
 });
 
+test('overdue training cannot bypass the offer-reject mutation gate', async () => {
+  const result = await invoke(requireTechJobMutationCapability, {
+    method: 'POST',
+    path: '/jobs/44/reject',
+    tech: {
+      lifecycle: {
+        status: 'ACTIVE',
+        trainingOverdue: true,
+        capabilities: {
+          receiveNewJobs: false,
+          mutateAssignedJobs: false,
+          claimMoney: true,
+        },
+      },
+    },
+  });
+
+  assert.equal(result.nextCalled, false);
+  assert.equal(result.res.statusCode, 403);
+  assert.equal(result.res.body.details.code, 'TECH_LIFECYCLE_CAPABILITY_REQUIRED');
+  assert.deepEqual(
+    result.res.body.details.capabilities,
+    ['receiveNewJobs', 'mutateAssignedJobs'],
+  );
+});
+
 test('every attendance and leave mutation mounts the markAttendance guard', () => {
   for (const path of ['/attendance', '/leave', '/leave/unmark']) {
     const layer = attendanceRouter.stack.find((entry) => (

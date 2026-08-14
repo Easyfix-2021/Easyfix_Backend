@@ -33,6 +33,9 @@ const MOBILE_FIELDS = new Set([
   'mobile_number',
   'mobileNumber',
   'efr_no',
+  // Read-only referral audit DTO. The value enters the response raw under a
+  // display-oriented alias and is masked here before JSON serialization.
+  'mobileMasked',
   // Aliased technician mobile that ships in /admin/jobs detail
   // (SELECT ef.efr_no AS easyfixer_mobile in services/job.service.js).
   // The raw column `efr_no` would already match above, but the alias

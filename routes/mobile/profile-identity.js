@@ -6,6 +6,7 @@ const logger = require('../../logger');
 const { modernOk, modernError } = require('../../utils/response');
 const identity = require('../../services/mobile-identity.service');
 const registration = require('../../services/mobile-registration.service');
+const rewards = require('../../services/rewards.service');
 
 /*
  * PII: Joi's default `string.pattern.base` message embeds the rejected value,
@@ -51,6 +52,7 @@ router.post('/identity-details', validate(identityDetailsSchema), async (req, re
     const result = await identity.saveIdentityDetails(efrId, req.body, {
       finalize: registration.finalizeGate1AfterSave,
     });
+    await rewards.qualifyReferralAfterProfileMutation(efrId, { source: 'identity' });
     return modernOk(res, result);
   } catch (error) {
     // Never log the raw database error: ER_DUP_ENTRY includes the Aadhaar value.

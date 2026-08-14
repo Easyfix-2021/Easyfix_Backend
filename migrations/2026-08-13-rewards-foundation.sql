@@ -133,7 +133,9 @@ CREATE TABLE reward_referral_codes (
 --
 -- qualified_at is separate from joined_at because the award is deliberately
 -- NOT paid at signup. It is paid when the referred technician completes their
--- first job — a milestone that costs real effort to fake.
+-- complete profile — Skills, Identity and Work Area must all be complete.
+-- This is late enough to reject install/signup spam while rewarding the
+-- referrer at the milestone the technician was actually invited to finish.
 CREATE TABLE reward_referrals (
   id INT NOT NULL AUTO_INCREMENT,
   referrer_efr_id INT NOT NULL,

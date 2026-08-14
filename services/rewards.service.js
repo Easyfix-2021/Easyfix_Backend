@@ -4,6 +4,8 @@ const logger = require('../logger');
 // time so a properties reload (and a test) can change the answer without the
 // module holding a stale binding.
 const properties = require('./properties.service');
+const profileCompletion = require('./profile-completion.service');
+const { withMysqlNamedLock } = require('./mysql-named-lock.service');
 
 /*
  * Rewards — points ledger, shop, claims and referrals.
@@ -48,10 +50,24 @@ const CLAIM_STATUSES = Object.freeze(['ORDERED', 'PACKED', 'SENT', 'DELIVERED', 
 const CLAIM_PIPELINE = Object.freeze(['ORDERED', 'PACKED', 'SENT', 'DELIVERED']);
 
 const COMPLETED_JOB_STATUSES = [3, 5];
+const REFERRAL_RECONCILE_LIMIT = 100;
+const REFERRAL_RECONCILE_PAGE_SIZE = 25;
+const REFERRAL_ATTACH_MAX_ATTEMPTS = 3;
+const REFERRAL_RECONCILE_TASK = 'profile_qualification';
+const REFERRAL_RECONCILE_LOCK = 'easyfix:rewards:referral-qualification';
 
 function propNumber(key, fallback) {
   const raw = Number(String(properties.getProperty(key) ?? '').trim());
   return Number.isFinite(raw) && raw >= 0 ? raw : fallback;
+}
+
+async function waitForReferralRetry(attempt) {
+  // A fresh transaction is required after deadlock/timeout. A tiny bounded
+  // backoff also gives the concurrent winner time to commit the immutable row
+  // that the next attempt will re-read. Maximum wait is under 40ms.
+  const waitMs = Math.min(10 * Math.max(Number(attempt) || 1, 1), 30)
+    + Math.floor(Math.random() * 6);
+  await new Promise((resolve) => { setTimeout(resolve, waitMs); });
 }
 
 /*
@@ -88,7 +104,7 @@ const EARN_RULES = Object.freeze([
     code: 'REFERRAL',
     points: POINTS.referral,
     label: 'Refer A Friend',
-    detail: 'Someone joins with your code and completes their first job.',
+    detail: 'Someone joins with your code and completes their profile.',
   },
   {
     code: 'SDA',
@@ -631,15 +647,194 @@ async function referralCodeFor(efrId) {
   throw mkErr(500, 'could not issue a referral code');
 }
 
+function normalizeReferralCode(code) {
+  return String(code || '').trim().toUpperCase();
+}
+
+async function matchingReferralLedger(conn, referral, expectedPoints) {
+  const [[row]] = await conn.query(
+    `SELECT id, easyfixer_id, delta
+       FROM reward_points_ledger
+      WHERE reason_code = ?
+        AND ref_type = 'referral'
+        AND ref_id = ?
+      LIMIT 1`,
+    [REASON.REFERRAL, Number(referral.id)],
+  );
+  return Boolean(
+    row
+    && Number(row.easyfixer_id) === Number(referral.referrer_efr_id)
+    && Number(row.delta) === Number(expectedPoints),
+  );
+}
+
 /*
- * Attach a referral at registration. Records the link; pays nothing.
+ * Qualify one referral from persisted Complete Profile state.
  *
- * Self-referral is refused, and uq_referred_once means the FIRST attribution
- * wins permanently — otherwise the code could be swapped after joining to
- * whoever is paying.
+ * The preliminary unique-key probe is intentionally outside a transaction:
+ * almost every profile save belongs to a technician who was not referred, so
+ * that common path costs one indexed point-read and does not occupy a pooled
+ * connection. If an attribution is attached concurrently after this probe,
+ * attachReferral performs the same qualification after its own commit.
+ *
+ * Once a row exists, the referral row is locked. The points insert and
+ * qualified_at update then commit together. uq_reward_award is still the
+ * authoritative exactly-once guard; a legacy half-state with an existing
+ * ledger row is repaired only after the row is verified to have the expected
+ * technician and points value.
+ */
+async function qualifyReferralIfEligible(
+  referredEfrId,
+  { database = pool, knownReferralId = null, config = pointsConfig() } = {},
+) {
+  if (config.earningPaused || Number(config.referral) <= 0) {
+    return { qualified: false, paused: true };
+  }
+
+  let referralId = knownReferralId == null ? null : Number(knownReferralId);
+  if (!referralId) {
+    const [[probe]] = await database.query(
+      'SELECT id FROM reward_referrals WHERE referred_efr_id = ? LIMIT 1',
+      [Number(referredEfrId)],
+    );
+    if (!probe) return { qualified: false, referred: false };
+    referralId = Number(probe.id);
+  }
+
+  const conn = await database.getConnection();
+  let transactionStarted = false;
+  try {
+    await conn.beginTransaction();
+    transactionStarted = true;
+    const [[referral]] = await conn.query(
+      `SELECT id, referrer_efr_id, referred_efr_id, qualified_at
+         FROM reward_referrals
+        WHERE id = ? AND referred_efr_id = ?
+        FOR UPDATE`,
+      [referralId, Number(referredEfrId)],
+    );
+    if (!referral) {
+      await conn.commit();
+      transactionStarted = false;
+      return { qualified: false, referred: false };
+    }
+    if (referral.qualified_at) {
+      await conn.commit();
+      transactionStarted = false;
+      return {
+        qualified: true,
+        alreadyQualified: true,
+        qualifiedAt: referral.qualified_at,
+      };
+    }
+
+    const completion = await profileCompletion.read(referredEfrId, { database: conn });
+    if (!completion || !completion.profileComplete) {
+      await conn.commit();
+      transactionStarted = false;
+      return { qualified: false, referred: true, completion };
+    }
+
+    const [[referrer]] = await conn.query(
+      `SELECT efr_status
+         FROM tbl_easyfixer
+        WHERE efr_id = ?
+        LIMIT 1
+        FOR UPDATE`,
+      [Number(referral.referrer_efr_id)],
+    );
+    // Preserve the existing policy: only an active technician may earn referral
+    // points at award time. A paused programme or inactive referrer remains
+    // pending for bounded reconciliation after the condition changes.
+    if (!referrer || Number(referrer.efr_status) !== 1) {
+      await conn.commit();
+      transactionStarted = false;
+      return {
+        qualified: false,
+        referred: true,
+        completion,
+        reason: 'referrer_inactive',
+      };
+    }
+
+    const out = await award({
+      efrId: referral.referrer_efr_id,
+      delta: config.referral,
+      reasonCode: REASON.REFERRAL,
+      refType: 'referral',
+      refId: referral.id,
+      note: `${completion.name || 'A technician'} completed their profile using your code`,
+    }, conn);
+
+    let repaired = false;
+    if (out.duplicate) {
+      if (!(await matchingReferralLedger(conn, referral, config.referral))) {
+        throw mkErr(500, 'referral reward ledger is inconsistent');
+      }
+      repaired = true;
+    }
+
+    const qualifiedAt = new Date();
+    await conn.query(
+      'UPDATE reward_referrals SET qualified_at = ? WHERE id = ? AND qualified_at IS NULL',
+      [qualifiedAt, Number(referral.id)],
+    );
+    await conn.commit();
+    transactionStarted = false;
+    logger.info(
+      'Referral qualified · referral=' + referral.id
+      + ' · referrer=' + referral.referrer_efr_id
+      + ' · repaired=' + repaired,
+    );
+    return {
+      qualified: true,
+      awarded: out.awarded === true,
+      repaired,
+      qualifiedAt,
+      completion,
+    };
+  } catch (error) {
+    if (transactionStarted) {
+      try { await conn.rollback(); } catch (_) { /* retain original failure */ }
+    }
+    throw error;
+  } finally {
+    conn.release();
+  }
+}
+
+/*
+ * Profile mutations have already committed when they call this. A rewards
+ * outage must not turn an applied offline/idempotent registration write into a
+ * false failure; the capped nightly reconciliation is the durable fallback.
+ */
+async function qualifyReferralAfterProfileMutation(
+  referredEfrId,
+  { knownReferralId = null, source = 'profile-mutation' } = {},
+) {
+  try {
+    return await qualifyReferralIfEligible(referredEfrId, { knownReferralId });
+  } catch (error) {
+    logger.warn({
+      efrId: Number(referredEfrId),
+      source,
+      code: error?.code || 'REFERRAL_QUALIFICATION_DEFERRED',
+    }, 'Post-profile referral qualification deferred');
+    return {
+      qualified: false,
+      pending: true,
+      errorCode: 'REFERRAL_QUALIFICATION_DEFERRED',
+    };
+  }
+}
+
+/*
+ * Attach a referral during profile completion. The first attribution remains
+ * immutable, but retrying the SAME code is a successful idempotent replay.
+ * A different code still conflicts, so a referral can never be swapped.
  */
 async function attachReferral(referredEfrId, code) {
-  const clean = String(code || '').trim().toUpperCase();
+  const clean = normalizeReferralCode(code);
   if (!clean) throw mkErr(400, 'enter a referral code');
 
   const [[owner]] = await pool.query(
@@ -651,60 +846,419 @@ async function attachReferral(referredEfrId, code) {
     throw mkErr(409, 'you cannot use your own referral code');
   }
 
-  try {
-    await pool.query(
-      `INSERT INTO reward_referrals (referrer_efr_id, referred_efr_id, code, joined_at)
-       VALUES (?, ?, ?, ?)`,
-      [Number(owner.easyfixer_id), Number(referredEfrId), clean, new Date()],
-    );
-  } catch (e) {
-    if (e && e.code === 'ER_DUP_ENTRY') {
-      throw mkErr(409, 'a referral code has already been applied to this account');
+  let referralId;
+  let idempotent = false;
+  let attached = false;
+  for (let attempt = 1; attempt <= REFERRAL_ATTACH_MAX_ATTEMPTS; attempt += 1) {
+    const conn = await pool.getConnection();
+    let transactionStarted = false;
+    try {
+      await conn.beginTransaction();
+      transactionStarted = true;
+      const [[existing]] = await conn.query(
+        `SELECT id, referrer_efr_id, code
+           FROM reward_referrals
+          WHERE referred_efr_id = ?
+          FOR UPDATE`,
+        [Number(referredEfrId)],
+      );
+      if (existing) {
+        if (normalizeReferralCode(existing.code) !== clean
+            || Number(existing.referrer_efr_id) !== Number(owner.easyfixer_id)) {
+          throw mkErr(409, 'a different referral code has already been applied to this account');
+        }
+        referralId = Number(existing.id);
+        idempotent = true;
+      } else {
+        const [insert] = await conn.query(
+          `INSERT INTO reward_referrals (referrer_efr_id, referred_efr_id, code, joined_at)
+           VALUES (?, ?, ?, ?)`,
+          [Number(owner.easyfixer_id), Number(referredEfrId), clean, new Date()],
+        );
+        referralId = Number(insert.insertId);
+      }
+      await conn.commit();
+      transactionStarted = false;
+      attached = true;
+      break;
+    } catch (error) {
+      if (transactionStarted) {
+        try { await conn.rollback(); } catch (_) { /* retain original failure */ }
+      }
+      const concurrentRetry = error?.code === 'ER_DUP_ENTRY'
+        || error?.code === 'ER_LOCK_DEADLOCK'
+        || error?.code === 'ER_LOCK_WAIT_TIMEOUT';
+      if (!concurrentRetry) throw error;
+      if (attempt === REFERRAL_ATTACH_MAX_ATTEMPTS) {
+        const unavailable = mkErr(503, 'referral code could not be applied right now; please retry');
+        unavailable.code = 'REFERRAL_ATTACH_RETRY_EXHAUSTED';
+        throw unavailable;
+      }
+      await waitForReferralRetry(attempt);
+    } finally {
+      conn.release();
     }
-    throw e;
   }
-  logger.info('Referral attached · referrer=' + owner.easyfixer_id + ' · referred=' + referredEfrId);
-  return { referrerEfrId: Number(owner.easyfixer_id), code: clean };
+  if (!attached) throw mkErr(503, 'referral code could not be applied right now; please retry');
+
+  const qualification = await qualifyReferralAfterProfileMutation(referredEfrId, {
+    knownReferralId: referralId,
+    source: 'referral-attach',
+  });
+  logger.info(
+    'Referral attached · referrer=' + owner.easyfixer_id
+    + ' · referred=' + referredEfrId
+    + ' · idempotent=' + idempotent,
+  );
+  return {
+    referrerEfrId: Number(owner.easyfixer_id),
+    code: clean,
+    idempotent,
+    qualification,
+  };
+}
+
+/* Lightweight registration read: no code generation and no outgoing list. */
+async function referralAttribution(efrId) {
+  const [[row]] = await pool.query(
+    `SELECT e.efr_id, e.efr_name, e.efr_no,
+            ${profileCompletion.projectionSql()},
+            r.code AS referral_code,
+            r.joined_at,
+            r.qualified_at,
+            ref.efr_name AS referrer_name
+       FROM tbl_easyfixer e
+       LEFT JOIN tbl_user u ON u.user_id = e.user_id
+       LEFT JOIN reward_referrals r ON r.referred_efr_id = e.efr_id
+       LEFT JOIN tbl_easyfixer ref ON ref.efr_id = r.referrer_efr_id
+      WHERE e.efr_id = ?
+      LIMIT 1`,
+    [Number(efrId)],
+  );
+  if (!row) throw mkErr(404, 'technician not found');
+  const completion = profileCompletion.fromRow(row);
+  return {
+    referredBy: row.referral_code
+      ? {
+        code: row.referral_code,
+        referrerName: row.referrer_name || null,
+        joinedAt: row.joined_at || null,
+        qualifiedAt: row.qualified_at || null,
+      }
+      : null,
+    qualification: {
+      skillsComplete: completion.skillsComplete,
+      identityComplete: completion.identityComplete,
+      workAreaComplete: completion.personalDetailsComplete,
+      profileComplete: completion.profileComplete,
+      qualified: Boolean(row.qualified_at),
+    },
+  };
 }
 
 /* What a technician sees about their own invitations. */
 async function referralSummary(efrId) {
-  const [rows] = await pool.query(
-    `SELECT r.referred_efr_id, r.joined_at, r.qualified_at, e.efr_name AS referred_name
-       FROM reward_referrals r
-       LEFT JOIN tbl_easyfixer e ON e.efr_id = r.referred_efr_id
-      WHERE r.referrer_efr_id = ?
-      ORDER BY r.joined_at DESC
-      LIMIT 50`,
-    [Number(efrId)],
-  );
-
-  /*
-   * The OTHER direction: was this technician themselves referred?
-   *
-   * Needed by the registration field, which would otherwise have no way to
-   * know a code is already applied and would offer an input that can only
-   * ever answer with a 409. Attribution is permanent (uq_referred_once), so
-   * once this is set the field shows it read-only rather than inviting an
-   * edit that cannot succeed.
-   */
-  const [[referredBy]] = await pool.query(
-    `SELECT r.code, r.joined_at, e.efr_name AS referrer_name
-       FROM reward_referrals r
-       LEFT JOIN tbl_easyfixer e ON e.efr_id = r.referrer_efr_id
-      WHERE r.referred_efr_id = ?`,
-    [Number(efrId)],
-  );
-
+  const [listResult, countResult, referredByResult, code] = await Promise.all([
+    pool.query(
+      `SELECT r.referred_efr_id, r.joined_at, r.qualified_at, e.efr_name AS referred_name
+         FROM reward_referrals r
+         LEFT JOIN tbl_easyfixer e ON e.efr_id = r.referred_efr_id
+        WHERE r.referrer_efr_id = ?
+        ORDER BY r.joined_at DESC, r.id DESC
+        LIMIT 50`,
+      [Number(efrId)],
+    ),
+    pool.query(
+      `SELECT COUNT(*) AS joined,
+              COALESCE(SUM(qualified_at IS NOT NULL), 0) AS qualified
+         FROM reward_referrals
+        WHERE referrer_efr_id = ?`,
+      [Number(efrId)],
+    ),
+    pool.query(
+      `SELECT r.code, r.joined_at, r.qualified_at, e.efr_name AS referrer_name
+         FROM reward_referrals r
+         LEFT JOIN tbl_easyfixer e ON e.efr_id = r.referrer_efr_id
+        WHERE r.referred_efr_id = ?
+        LIMIT 1`,
+      [Number(efrId)],
+    ),
+    referralCodeFor(efrId),
+  ]);
+  const rows = listResult[0];
+  const counts = countResult[0][0] || {};
+  const referredBy = referredByResult[0][0] || null;
   return {
-    code: await referralCodeFor(efrId),
-    joined: rows.length,
-    qualified: rows.filter((r) => r.qualified_at).length,
+    code,
+    joined: Number(counts.joined) || 0,
+    qualified: Number(counts.qualified) || 0,
     referrals: rows,
     referredBy: referredBy
-      ? { code: referredBy.code, referrerName: referredBy.referrer_name || null }
+      ? {
+        code: referredBy.code,
+        referrerName: referredBy.referrer_name || null,
+        qualifiedAt: referredBy.qualified_at || null,
+      }
       : null,
   };
+}
+
+/*
+ * Bounded, keyset-paginated CRM read. The endpoint fetches one extra row to
+ * produce hasMore/nextCursor without a separate COUNT over searched names.
+ */
+async function listReferrals({ status, code, search, q, cursor, limit = 50 } = {}) {
+  const take = Math.min(Math.max(Number(limit) || 50, 1), 200);
+  const where = ['1=1'];
+  const params = [];
+  if (status === 'qualified') where.push('r.qualified_at IS NOT NULL');
+  if (status === 'pending') where.push('r.qualified_at IS NULL');
+  if (code && String(code).trim()) {
+    where.push('r.code = ?');
+    params.push(normalizeReferralCode(code));
+  }
+  if (cursor) {
+    where.push('r.id < ?');
+    params.push(Number(cursor));
+  }
+  const searchText = String(search ?? q ?? '').trim();
+  if (searchText) {
+    // Prefix search keeps code/mobile/name predicates eligible for their
+    // indexes. A leading-wildcard contains search would eventually scan the
+    // full referral/technician population for every debounced keystroke.
+    const like = `${searchText}%`;
+    const numeric = /^\d+$/.test(searchText) ? Number(searchText) : null;
+    if (numeric != null && Number.isSafeInteger(numeric)) {
+      where.push(`(r.id = ? OR r.referrer_efr_id = ? OR r.referred_efr_id = ?
+        OR r.code LIKE ? OR ref.efr_no LIKE ? OR referred.efr_no LIKE ?
+        OR ref.efr_name LIKE ? OR referred.efr_name LIKE ?)`);
+      params.push(numeric, numeric, numeric, like, like, like, like, like);
+    } else {
+      where.push('(r.code LIKE ? OR ref.efr_name LIKE ? OR referred.efr_name LIKE ?)');
+      params.push(like, like, like);
+    }
+  }
+
+  const [rows] = await pool.query(
+    `SELECT r.id, r.code, r.joined_at, r.qualified_at,
+            r.referrer_efr_id, ref.efr_name AS referrer_name, ref.efr_no AS referrer_mobile,
+            r.referred_efr_id, referred.efr_name AS referred_name, referred.efr_no AS referred_mobile,
+            ${profileCompletion.projectionSql({ technicianAlias: 'referred', userAlias: 'referred_user' })}
+       FROM reward_referrals r
+       JOIN tbl_easyfixer ref ON ref.efr_id = r.referrer_efr_id
+       JOIN tbl_easyfixer referred ON referred.efr_id = r.referred_efr_id
+       LEFT JOIN tbl_user referred_user ON referred_user.user_id = referred.user_id
+      WHERE ${where.join(' AND ')}
+      ORDER BY r.id DESC
+      LIMIT ?`,
+    [...params, take + 1],
+  );
+  const hasMore = rows.length > take;
+  const page = rows.slice(0, take).map((row) => {
+    const completion = profileCompletion.fromRow(row);
+    return {
+      id: Number(row.id),
+      code: row.code,
+      status: row.qualified_at ? 'qualified' : 'pending',
+      joinedAt: row.joined_at,
+      qualifiedAt: row.qualified_at || null,
+      referrer: {
+        efrId: Number(row.referrer_efr_id),
+        name: row.referrer_name || null,
+        mobileMasked: row.referrer_mobile || null,
+      },
+      referred: {
+        efrId: Number(row.referred_efr_id),
+        name: row.referred_name || null,
+        mobileMasked: row.referred_mobile || null,
+      },
+      profile: {
+        skillsComplete: completion.skillsComplete,
+        identityComplete: completion.identityComplete,
+        workAreaComplete: completion.personalDetailsComplete,
+        complete: completion.profileComplete,
+      },
+    };
+  });
+  return {
+    items: page,
+    limit: take,
+    hasMore,
+    nextCursor: hasMore && page.length ? String(page[page.length - 1].id) : null,
+  };
+}
+
+/*
+ * Claim a bounded, rotating set of pending attribution IDs. The cursor row is
+ * locked only while IDs are selected and advanced; profile reads and rewards
+ * happen after commit. The caller holds a database-wide named lock for the
+ * complete pass, so another replica cannot wrap and re-claim these IDs while
+ * they are in flight. Advancing before processing means a corrupt row cannot
+ * poison every later referral. It is retried after the cursor wraps.
+ */
+async function claimReferralReconciliationCandidates({
+  database = pool,
+  cap,
+  pageSize,
+  taskName = REFERRAL_RECONCILE_TASK,
+}) {
+  const conn = await database.getConnection();
+  let transactionStarted = false;
+  try {
+    await conn.beginTransaction();
+    transactionStarted = true;
+    let [[state]] = await conn.query(
+      `SELECT last_referral_id
+         FROM reward_reconciliation_state
+        WHERE task_name = ?
+        FOR UPDATE`,
+      [taskName],
+    );
+    if (!state) {
+      await conn.query(
+        `INSERT INTO reward_reconciliation_state
+           (task_name, last_referral_id, updated_at)
+         VALUES (?, 0, ?)`,
+        [taskName, new Date()],
+      );
+      state = { last_referral_id: 0 };
+    }
+
+    const startCursor = Math.max(Number(state.last_referral_id) || 0, 0);
+    let cursor = startCursor;
+    let wrapped = false;
+    const candidates = [];
+
+    while (candidates.length < cap) {
+      const take = Math.min(pageSize, cap - candidates.length);
+      const [rows] = wrapped
+        ? await conn.query(
+          `SELECT id, referred_efr_id
+             FROM reward_referrals
+            WHERE qualified_at IS NULL
+              AND id > ?
+              AND id <= ?
+            ORDER BY id ASC
+            LIMIT ?`,
+          [cursor, startCursor, take],
+        )
+        : await conn.query(
+          `SELECT id, referred_efr_id
+             FROM reward_referrals
+            WHERE qualified_at IS NULL
+              AND id > ?
+            ORDER BY id ASC
+            LIMIT ?`,
+          [cursor, take],
+        );
+
+      if (rows.length) {
+        candidates.push(...rows.map((row) => ({
+          id: Number(row.id),
+          referred_efr_id: Number(row.referred_efr_id),
+        })));
+        cursor = Number(rows[rows.length - 1].id);
+      }
+
+      if (rows.length < take) {
+        if (!wrapped && startCursor > 0) {
+          wrapped = true;
+          cursor = 0;
+          continue;
+        }
+        break;
+      }
+    }
+
+    const nextCursor = candidates.length ? cursor : 0;
+    await conn.query(
+      `UPDATE reward_reconciliation_state
+          SET last_referral_id = ?, updated_at = ?
+        WHERE task_name = ?`,
+      [nextCursor, new Date(), taskName],
+    );
+    await conn.commit();
+    transactionStarted = false;
+    return { candidates, cursor: nextCursor, wrapped };
+  } catch (error) {
+    if (transactionStarted) {
+      try { await conn.rollback(); } catch (_) { /* retain original failure */ }
+    }
+    throw error;
+  } finally {
+    conn.release();
+  }
+}
+
+/*
+ * Durable fallback for post-commit profile triggers. Candidate selection uses
+ * only reward_referrals' indexed pending/id columns and stops at a hard cap;
+ * eligibility is checked per candidate inside the same locked award path used
+ * by online profile completion.
+ */
+async function reconcileReferralQualifications({
+  limit = REFERRAL_RECONCILE_LIMIT,
+  pageSize = REFERRAL_RECONCILE_PAGE_SIZE,
+  config = pointsConfig(),
+  database = pool,
+  qualify = qualifyReferralIfEligible,
+  lockRunner = withMysqlNamedLock,
+} = {}) {
+  const cap = Math.min(Math.max(Number(limit) || REFERRAL_RECONCILE_LIMIT, 1), 200);
+  const page = Math.min(Math.max(Number(pageSize) || REFERRAL_RECONCILE_PAGE_SIZE, 1), 50);
+  const result = {
+    awarded: 0,
+    repaired: 0,
+    skipped: 0,
+    errors: 0,
+    scanned: 0,
+    cap,
+    cursor: 0,
+    wrapped: false,
+    lockSkipped: false,
+  };
+  if (config.earningPaused || Number(config.referral) <= 0) return result;
+
+  const ownership = await lockRunner(
+    REFERRAL_RECONCILE_LOCK,
+    async () => {
+      const claimed = await claimReferralReconciliationCandidates({
+        database,
+        cap,
+        pageSize: page,
+      });
+      result.cursor = claimed.cursor;
+      result.wrapped = claimed.wrapped;
+      for (const row of claimed.candidates) {
+        result.scanned += 1;
+        try {
+          const out = await qualify(row.referred_efr_id, {
+            knownReferralId: row.id,
+            config,
+            database,
+          });
+          if (out.awarded) result.awarded += 1;
+          else if (out.repaired) result.repaired += 1;
+          else result.skipped += 1;
+        } catch (error) {
+          result.errors += 1;
+          logger.warn({
+            referralId: Number(row.id),
+            code: error?.code || 'REFERRAL_RECONCILE_FAILED',
+          }, 'Referral reconciliation candidate deferred');
+        }
+      }
+      return result;
+    },
+    database,
+    { timeoutSeconds: 0 },
+  );
+  if (!ownership.acquired) {
+    result.lockSkipped = true;
+    logger.info('Referral reconciliation skipped — another backend replica owns the pass');
+    return result;
+  }
+  return ownership.result;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -800,43 +1354,14 @@ async function runEarnCycle() {
     }
   }
 
-  // ── Referral: pays when the REFERRED technician completes their first job.
-  // Not at signup — that would be an invitation to invent technicians.
+  // ── Referral: pays when the REFERRED technician completes all three profile
+  // cards. The mobile writes trigger this immediately; this capped pass repairs
+  // transient post-commit misses without ever scanning an unbounded backlog.
   if (config.referral > 0) {
-    const [rows] = await pool.query(
-      `SELECT r.id, r.referrer_efr_id, r.referred_efr_id, e.efr_name AS referred_name
-         FROM reward_referrals r
-         JOIN tbl_easyfixer e ON e.efr_id = r.referred_efr_id
-         JOIN tbl_easyfixer ref ON ref.efr_id = r.referrer_efr_id
-        WHERE r.qualified_at IS NULL
-          -- The referrer must still be a real, active technician AT AWARD TIME,
-          -- not merely when the code was entered. A blacklisted account should
-          -- not be earning on invitations.
-          AND ref.efr_status = 1
-          AND EXISTS (
-                SELECT 1 FROM tbl_job j
-                 WHERE j.fk_easyfixter_id = r.referred_efr_id
-                   AND j.job_status IN (?)
-                   AND j.checkin_date_time IS NOT NULL
-              )`,
-      [COMPLETED_JOB_STATUSES],
-    );
-    for (const row of rows) {
-      const out = await award({
-        efrId: row.referrer_efr_id,
-        delta: config.referral,
-        reasonCode: REASON.REFERRAL,
-        refType: 'referral',
-        refId: row.id,
-        note: `${row.referred_name || 'A technician'} joined using your code`,
-      });
-      if (out.awarded) {
-        await pool.query('UPDATE reward_referrals SET qualified_at = ? WHERE id = ?', [new Date(), row.id]);
-        result.referral += 1;
-      } else {
-        result.skipped += 1;
-      }
-    }
+    const reconciliation = await reconcileReferralQualifications({ config });
+    result.referral += reconciliation.awarded;
+    result.skipped += reconciliation.skipped + reconciliation.repaired;
+    result.referralReconciliation = reconciliation;
   }
 
   logger.info('Rewards earning · rating=' + result.rating + ' · sda=' + result.sda
@@ -865,7 +1390,24 @@ module.exports = {
   updateClaim,
   referralCodeFor,
   attachReferral,
+  qualifyReferralIfEligible,
+  qualifyReferralAfterProfileMutation,
+  referralAttribution,
   referralSummary,
+  listReferrals,
+  reconcileReferralQualifications,
   runEarnCycle,
-  _internals: { parseSizes, randomCode, CODE_ALPHABET },
+  _internals: {
+    parseSizes,
+    randomCode,
+    CODE_ALPHABET,
+    normalizeReferralCode,
+    matchingReferralLedger,
+    claimReferralReconciliationCandidates,
+    REFERRAL_RECONCILE_LIMIT,
+    REFERRAL_RECONCILE_PAGE_SIZE,
+    REFERRAL_ATTACH_MAX_ATTEMPTS,
+    REFERRAL_RECONCILE_TASK,
+    REFERRAL_RECONCILE_LOCK,
+  },
 };

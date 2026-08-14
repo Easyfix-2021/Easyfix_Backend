@@ -3,6 +3,7 @@ const logger = require('../logger');
 const deepSkillService = require('./deep-skill.service');
 const lifecycleService = require('./easyfixer-lifecycle.service');
 const registrationProfile = require('./technician-registration-profile.service');
+const profileCompletion = require('./profile-completion.service');
 
 /*
  * Mobile Registration gate machine — collapses three legacy polls
@@ -212,7 +213,7 @@ async function fetchHasActiveSkills(efrId) {
   }
 }
 
-async function getStatus(efrId) {
+async function getStatus(efrId, authenticatedLifecycle = null) {
   logger.info('Registration status · efrId=' + efrId);
   const e = await fetchGateRow(efrId);
   if (!e) {
@@ -228,14 +229,17 @@ async function getStatus(efrId) {
     fetchHasActiveSkills(efrId),
   ]);
 
-  const aadhaarPresent = present(e.adhaar_card_number);
-  const photoPresent   = present(e.efr_profile_img);
+  const completion = profileCompletion.fromRow({
+    ...e,
+    has_active_deep_skill: hasActiveSkills,
+  });
+  const { aadhaarPresent, photoPresent } = completion;
   const panPresent     = present(e.pan_card_number);
   // "Has skills" = the tech declared at least a service category/type (the
   // matching key candidate-ranking needs). Folded into the Gate-2 checklist,
   // no longer a registration wall.
-  const hasSkills      = hasActiveSkills || present(e.efr_service_category) || present(e.efr_service_type);
-  const isPersonalDetailFilled = bool(e.user_is_personal_detail_filled);
+  const hasSkills      = completion.skillsComplete;
+  const isPersonalDetailFilled = completion.personalDetailsComplete;
   // Gate 1 = the merged registration screen: personal step submitted AND
   // Aadhaar + photo on file. All three are written together by that screen;
   // requiring all three defends against legacy rows that set the personal
@@ -262,7 +266,12 @@ async function getStatus(efrId) {
   };
 
   const status = deriveStatus(flags);
-  const lifecycle = lifecycleService.forTechnician(
+  // Auth already owns request-time overlays such as overdue training. Prefer
+  // that authoritative snapshot when this is an authenticated mobile request;
+  // background callers without req.tech keep the persisted-row projection.
+  // This is an in-memory handoff: no second overdue-training query and no
+  // duplicate capability logic on the registration hot path.
+  const lifecycle = authenticatedLifecycle || lifecycleService.forTechnician(
     lifecycleService.lifecycleFromRow(e),
   );
 
@@ -289,7 +298,7 @@ async function getStatus(efrId) {
   // what makes the deactivated experience correct on TODAY's app build with no
   // client change: they log in, reach the dashboard, and jobs are shown locked
   // instead of appearing available and silently never arriving.
-  const jobsUnlocked = lifecycle.jobsAllowed && !deactivated
+  const jobsUnlocked = lifecycle.capabilities?.receiveNewJobs === true && !deactivated
     && flags.isTechnicianVerified && panPresent && hasSkills && trainingComplete;
 
   logger.info('Returning registration status · status=' + status + ' profilePct=' + pct(e.efr_profile_perc) + ' jobsUnlocked=' + jobsUnlocked + ' deactivated=' + deactivated);

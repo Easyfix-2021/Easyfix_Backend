@@ -34,16 +34,6 @@ function requireOfferRejectCapability(req, res, next) {
   if (capabilities.receiveNewJobs === true || capabilities.mutateAssignedJobs === true) {
     return next();
   }
-  /*
-   * Overdue training withdraws mutateAssignedJobs, which would otherwise take
-   * the SKIP path down with it — leaving a restricted technician holding jobs
-   * they can neither work nor hand back. Skipping is explicitly part of what a
-   * training-blocked technician is still allowed to do: it releases work
-   * rather than creating it, so the sooner they can, the better for ops.
-   */
-  if (req.tech?.lifecycle?.trainingOverdue === true) {
-    return next();
-  }
   return modernError(
     res,
     403,

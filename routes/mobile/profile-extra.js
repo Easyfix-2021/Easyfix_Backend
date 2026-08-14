@@ -7,6 +7,7 @@ const { modernOk, modernError } = require('../../utils/response');
 const svc = require('../../services/mobile-profile-extra.service');
 const lms = require('../../services/lms.service');
 const withdrawalService = require('../../services/withdrawal.service');
+const rewards = require('../../services/rewards.service');
 const { pool } = require('../../db');
 const logger = require('../../logger');
 const {
@@ -99,13 +100,17 @@ router.post(
       return modernError(res, 400, 'missing "file" upload');
     }
     logger.info(`Profile image upload · type=${req.file.mimetype} bytes=${req.file.size}`);
-    return modernOk(res, await svc.setProfileImageFromUpload(
+    const result = await svc.setProfileImageFromUpload(
       req.tech.efr_id,
       req.file.buffer,
       req.file.mimetype,
       req.file.originalname,
       { storageToken: deterministicUploadToken(req) },
-    ));
+    );
+    // The selfie/photo may be the last missing Identity condition. Run the
+    // same post-commit, fail-soft referral convergence as the other cards.
+    await rewards.qualifyReferralAfterProfileMutation(req.tech.efr_id, { source: 'profile-image' });
+    return modernOk(res, result);
   } catch (e) {
     if (e?.code === 'LIMIT_FILE_SIZE') {
       logger.warn('Profile image upload rejected · file exceeds 10MB');

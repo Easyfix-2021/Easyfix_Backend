@@ -4,6 +4,7 @@ const Joi = require('joi');
 const validate = require('../../middleware/validate');
 const { modernOk, modernError } = require('../../utils/response');
 const registration = require('../../services/mobile-registration.service');
+const rewards = require('../../services/rewards.service');
 const logger = require('../../logger');
 
 const workAreaSchema = Joi.object({
@@ -45,7 +46,10 @@ const workAreaSchema = Joi.object({
 router.get('/status', async (req, res, next) => {
   try {
     logger.info('Onboarding status requested');
-    modernOk(res, await registration.getStatus(req.tech.efr_id));
+    // Auth has already resolved the effective lifecycle, including the
+    // overdue-training capability overlay. Reuse that request-scoped snapshot
+    // so this endpoint neither re-queries LMS nor re-implements the overlay.
+    modernOk(res, await registration.getStatus(req.tech.efr_id, req.tech.lifecycle));
   } catch (e) {
     if (e.status) return modernError(res, e.status, e.message);
     next(e);
@@ -103,7 +107,9 @@ router.put(
   async (req, res, next) => {
     try {
       logger.info(`Save work area · count=${req.body.pincodes.length}`);
-      modernOk(res, await registration.saveWorkArea(req.tech.efr_id, req.body));
+      const result = await registration.saveWorkArea(req.tech.efr_id, req.body);
+      await rewards.qualifyReferralAfterProfileMutation(req.tech.efr_id, { source: 'work-area' });
+      modernOk(res, result);
     } catch (e) {
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
@@ -118,7 +124,15 @@ router.put(
 router.post('/finalize', async (req, res, next) => {
   try {
     logger.info('Onboarding Gate 1 finalization requested');
-    modernOk(res, await registration.finalizeGate1IfReady(req.tech.efr_id));
+    const result = await registration.finalizeGate1IfReady(req.tech.efr_id);
+    // Finalize is a replay-safe convergence endpoint and therefore a useful
+    // retry point if an earlier profile-card save committed while the reward
+    // qualification check could not reach the database. Qualification itself
+    // remains idempotent and fail-soft.
+    await rewards.qualifyReferralAfterProfileMutation(req.tech.efr_id, {
+      source: 'registration-finalize',
+    });
+    modernOk(res, result);
   } catch (e) {
     if (e.status) return modernError(res, e.status, e.message, e.details);
     next(e);

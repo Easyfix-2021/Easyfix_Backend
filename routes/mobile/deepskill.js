@@ -5,6 +5,7 @@ const validate = require('../../middleware/validate');
 const logger = require('../../logger');
 const { modernOk, modernError } = require('../../utils/response');
 const deepSkillMobile = require('../../services/mobile-deepskill.service');
+const rewards = require('../../services/rewards.service');
 
 /*
  * /api/mobile/deepskill/* — Technician Deep-Skill selection.
@@ -66,6 +67,10 @@ router.post(
     try {
       logger.info('Apply deep-skill selections · categoryId=' + req.body.categoryId + ' · serviceTypes=' + (Array.isArray(req.body.serviceTypes) ? req.body.serviceTypes.length : 0));
       const result = await deepSkillMobile.applySkills(req.tech.efr_id, req.body);
+      // applySkills has committed and released its pinned connection. Referral
+      // qualification is fail-soft/idempotent and therefore cannot turn an
+      // acknowledged offline replay into a false write failure.
+      await rewards.qualifyReferralAfterProfileMutation(req.tech.efr_id, { source: 'skills' });
       logger.info('Deep-skill selections applied · categoryId=' + req.body.categoryId);
       modernOk(res, result);
     } catch (e) {
