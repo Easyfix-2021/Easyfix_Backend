@@ -23,9 +23,10 @@ const assert = require('node:assert/strict');
 const { installFakePool } = require('./helpers/fake-pool');
 
 const CLIENT_ID = 30;
-const OWNER_MOBILE = '9000000001'; // the job owner — must NEVER be stamped
-const HEAD_MOBILE = '9111111111';  // the client's vertical head — the right answer
-const OLDER_HEAD_MOBILE = '9222222222';
+const OWNER_USER_ID = 9;        // the CRM operator creating the job — must NEVER be stamped
+const HEAD_USER_ID = 4242;      // the client's vertical head — the right answer
+const OLDER_HEAD_USER_ID = 777; // a superseded head mapping
+const OWNER_MOBILE = '9000000001'; // kept only to prove no phone reaches the column
 
 const SVC_PATH = '../services/job.service';
 const HEAD_LOOKUP = /FROM tbl_vertical_mapping vm/;
@@ -34,7 +35,7 @@ const SPOC_UPDATE = /UPDATE tbl_job SET job_primary_spoc/;
 const DEFAULTS = () => ({
   hasSpocColumn: true,
   hasInsertedOn: true,
-  headRows: [{ mobile_no: HEAD_MOBILE }],
+  headRows: [{ user_id: HEAD_USER_ID }],
   headLookupThrows: false,
 });
 const scenario = DEFAULTS();
@@ -55,7 +56,7 @@ const fake = installFakePool(
     }],
     // Any other tbl_user read hands back the OWNER's number, so a regression to
     // the old owner-based lookup would visibly stamp OWNER_MOBILE.
-    [/FROM tbl_user\b/, [{ user_id: 9, user_name: 'Owner', user_role: 2, user_status: 1, mobile_no: OWNER_MOBILE }]],
+    [/FROM tbl_user\b/, [{ user_id: OWNER_USER_ID, user_name: 'Owner', user_role: 2, user_status: 1, mobile_no: OWNER_MOBILE }]],
     [/INSERT INTO tbl_job\b/, { insertId: 4242 }],
   ],
   // Sentinel one write PAST the stamp: the stamp is fail-soft and swallows its
@@ -101,18 +102,28 @@ const stampedValue = () => {
   assert.ok(u, 'the job_primary_spoc UPDATE must be issued');
   return u.params[0];
 };
-// The bug's fingerprint: the owner's number reaching ANY statement.
+/*
+ * The original bug's fingerprint: the owner's PHONE reaching any statement. The
+ * owner's user_id cannot be checked the same way — it legitimately appears as
+ * job_owner and fk_created_by on the INSERT — so the owner assertion is made
+ * against the stamped value specifically, in assertOwnerNotStamped below.
+ */
 const assertOwnerNeverBound = () => {
   const leak = fake.calls.find((c) => (c.params || []).some((p) => p === OWNER_MOBILE));
   assert.equal(leak, undefined, `the job owner's phone must never be bound (leaked in: ${leak && leak.sql})`);
+};
+const assertOwnerNotStamped = () => {
+  assert.notEqual(stampedValue(), OWNER_USER_ID,
+    'the operator holding the job is not the client\'s SPOC — stamping them made the column wrong on every row');
 };
 
 beforeEach(() => { fake.reset(); Object.assign(scenario, DEFAULTS()); });
 
 test("the CLIENT'S vertical head is stamped — never the job owner", async () => {
   await runCreate();
-  assert.equal(stampedValue(), HEAD_MOBILE, "job_primary_spoc must be the head's phone");
+  assert.equal(stampedValue(), HEAD_USER_ID, "job_primary_spoc must be the head's user_id");
   assertOwnerNeverBound();
+  assertOwnerNotStamped();
 
   const lookup = find(HEAD_LOOKUP);
   assert.ok(lookup, 'the head must be resolved from tbl_vertical_mapping');
@@ -124,12 +135,12 @@ test('several heads on one client → the latest inserted_on wins, via an explic
   // The mapping is per (client, vertical) and a job has no vertical of its own,
   // so there is no per-job tie-break — latest-wins is the deliberate rule, and
   // it has to live in the SQL because only the DB sees the other rows.
-  scenario.headRows = [{ mobile_no: HEAD_MOBILE }, { mobile_no: OLDER_HEAD_MOBILE }];
+  scenario.headRows = [{ user_id: HEAD_USER_ID }, { user_id: OLDER_HEAD_USER_ID }];
   await runCreate();
   const lookup = find(HEAD_LOOKUP);
   assert.match(lookup.sql, /ORDER BY vm\.inserted_on DESC/, 'latest inserted_on first');
   assert.match(lookup.sql, /LIMIT 1/, 'exactly one head is stamped');
-  assert.equal(stampedValue(), HEAD_MOBILE, 'the latest head is the one stamped');
+  assert.equal(stampedValue(), HEAD_USER_ID, 'the latest head is the one stamped');
   assertOwnerNeverBound();
 });
 
@@ -165,7 +176,7 @@ test('inserted_on absent → deterministic PK fallback, never a bare LIMIT 1', a
   const lookup = find(HEAD_LOOKUP);
   assert.doesNotMatch(lookup.sql, /inserted_on/, 'the absent column must not be referenced');
   assert.match(lookup.sql, /ORDER BY vm\.id DESC/, 'falls back to the mapping PK, latest first');
-  assert.equal(stampedValue(), HEAD_MOBILE);
+  assert.equal(stampedValue(), HEAD_USER_ID);
   assertOwnerNeverBound();
 });
 
@@ -182,4 +193,35 @@ after(() => {
   // Leave the module registry and the db singleton as we found them.
   delete require.cache[require.resolve(SVC_PATH)];
   fake.restore();
+});
+
+test('the stamped value fits the legacy int — a phone number here is a crash', async () => {
+  /*
+   * THE REGRESSION THIS PINS (2026-08-14). A revision of stampJobPrimarySpoc
+   * stamped the head's mobile_no. EasyFix_CRM's Jobs.java:395 declares
+   *
+   *     @JsonProperty("job_primary_spoc") private int jobPrimarySpoc;
+   *
+   * and an Indian mobile is 10 digits starting 6-9, i.e. at least 6,000,000,000
+   * — every one of them OVERFLOWS Java's int ceiling of 2,147,483,647. So the
+   * column did not merely hold the wrong KIND of value; each row was a
+   * deserialize failure waiting for the legacy CRM to read that job.
+   *
+   * Asserting "equals HEAD_USER_ID" alone would not catch a future change that
+   * swapped in some other over-long identifier, so this checks the SHAPE the
+   * consumer can actually accept.
+   */
+  // The column-absent test above leaves the module's memoised probe saying
+  // "absent"; re-require so this one runs against the default scenario.
+  reloadSvc();
+  await runCreate();
+  const v = stampedValue();
+
+  assert.notEqual(v, null, 'a resolvable head must be stamped');
+  const n = Number(v);
+  assert.ok(Number.isInteger(n), `job_primary_spoc must be an integer id, got ${JSON.stringify(v)}`);
+  assert.ok(n > 0 && n <= 2147483647,
+    `job_primary_spoc must fit a Java int (legacy Jobs.java reads it as one); got ${n}`);
+  assert.ok(String(v).length < 10,
+    'a 10-digit value is a phone number, which is exactly the bug this replaced');
 });

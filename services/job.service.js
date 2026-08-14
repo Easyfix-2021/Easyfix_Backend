@@ -770,16 +770,29 @@ function hasAddressInstructionColumn() {
 }
 
 /*
- * job_primary_spoc — a denormalised snapshot of the CLIENT'S VERTICAL HEAD's
- * phone, shown to the customer on the confirmation landing page. It's a
- * PROD-only legacy column (absent on some DBs incl. QA), so probe once + no-op
- * where missing. Stamped once at create.
- * Pending migration: migrations/2026-07-03-add-job-primary-spoc.sql.
+ * job_primary_spoc — a snapshot of WHICH USER was the client's primary SPOC
+ * when this job was created. It stores `tbl_user.user_id`.
  *
- * It used to snapshot the JOB OWNER's phone, which made the column wrong on
- * EVERY row rather than only some: the owner (the CRM operator holding the job)
- * and the client's head are different people by definition, so there was never
- * a case where the two coincided.
+ * WHAT IT IS FOR. Ownership follows the SPOC of the day: the jobs booked while
+ * X is the client's primary SPOC belong to X forever, and the day the mapping
+ * moves to Y, only jobs created from then on belong to Y. That is why this is
+ * stamped ONCE at create and deliberately never re-stamped (see the note in
+ * changeOwner) — re-stamping would retroactively hand X's history to Y.
+ *
+ * IT IS AN ID, NOT A PHONE — verified against the legacy consumer, not assumed.
+ * EasyFix_CRM's Jobs.java:395 declares `private int jobPrimarySpoc;` against
+ * @JsonProperty("job_primary_spoc"), so the legacy CRM has always read this as
+ * a numeric id. A previous revision of this function stamped the head's
+ * mobile_no here; an Indian mobile is 10 digits starting 6-9, i.e. at least
+ * 6,000,000,000, which OVERFLOWS Java's int ceiling of 2,147,483,647 — so every
+ * such row was a deserialize failure waiting for the legacy CRM to read it.
+ * Before that it stamped the JOB OWNER's phone, wrong on every row for a
+ * second reason: the owner (the CRM operator holding the job) and the client's
+ * head are different people by definition.
+ *
+ * PROD-only legacy column (absent on some DBs incl. QA), so probe once + no-op
+ * where missing. Pending migration:
+ * migrations/2026-07-03-add-job-primary-spoc.sql.
  */
 let _hasJobPrimarySpocColumn = null;
 async function hasJobPrimarySpocColumn() {
@@ -826,26 +839,33 @@ async function hasVerticalMappingInsertedOnColumn() {
  * SPOC lookup in create() orders by), DESC because "latest" is the rule.
  *
  * LEFT JOIN, not JOIN: if the chosen head has no tbl_user row we want the
- * LATEST head's (null) phone, not silently the next-latest head's real number.
+ * LATEST head's (null) id, not silently the next-latest head's real one.
  *
  * The status filter mirrors the job_client_owner SPOC lookup in create() on the
  * same table: NULL tolerated (older mappings predate the column), 1 = active.
  *
  * Whole body is fail-soft: a job create must NEVER fail because this snapshot
- * could not be resolved. On any error the column is left NULL — no number is
+ * could not be resolved. On any error the column is left NULL — no owner is
  * better than a wrong one, because a wrong one looks right.
  */
 async function stampJobPrimarySpoc(jobId, clientId, conn) {
   if (!jobId || !(await hasJobPrimarySpocColumn())) return;
   const db = conn || pool;
   try {
-    let mobile = null;
+    let headUserId = null;
     if (clientId) {
       const orderBy = (await hasVerticalMappingInsertedOnColumn())
         ? 'vm.inserted_on DESC, vm.id DESC'
         : 'vm.id DESC';
+      /*
+       * u.user_id, NOT vm.user_id — they are the same number when the mapping
+       * points at a live user, and they differ in exactly the case that
+       * matters: a mapping row whose user was deleted. The LEFT JOIN makes
+       * u.user_id NULL there, so we stamp NULL rather than an id that resolves
+       * to nobody. A dangling owner is worse than no owner.
+       */
       const [[head]] = await db.query(
-        `SELECT u.mobile_no
+        `SELECT u.user_id
            FROM tbl_vertical_mapping vm
            LEFT JOIN tbl_user u ON u.user_id = vm.user_id
           WHERE vm.client_id = ? AND vm.user_type = 1
@@ -854,9 +874,9 @@ async function stampJobPrimarySpoc(jobId, clientId, conn) {
           LIMIT 1`,
         [clientId],
       );
-      mobile = head?.mobile_no || null;
+      headUserId = head?.user_id ?? null;
     }
-    await db.query('UPDATE tbl_job SET job_primary_spoc = ? WHERE job_id = ?', [mobile, jobId]);
+    await db.query('UPDATE tbl_job SET job_primary_spoc = ? WHERE job_id = ?', [headUserId, jobId]);
   } catch (e) {
     logger.warn(
       { jobId, clientId, err: e.message },
@@ -3145,7 +3165,7 @@ async function create(input, actor) {
       }
     }
 
-    // Snapshot the CLIENT'S vertical head's phone into job_primary_spoc
+    // Snapshot WHICH USER is the client's vertical head into job_primary_spoc
     // (legacy-compat; no-op where the column is absent). The client id is
     // passed rather than re-read from tbl_job inside the helper: it is the
     // exact value the INSERT above just bound, so a re-read would only spend a
