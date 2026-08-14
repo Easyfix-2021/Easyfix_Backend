@@ -229,7 +229,9 @@ function normaliseImages(value) {
 
 /*
  * Resolve an array of stored image values to renderable URLs.
- *   - S3 keys ("Notices/...") → presigned GET URLs (5-min TTL)
+ *   - S3 keys ("Notices/...") → presigned GET URLs (1-h TTL; the default 5 min
+ *                                expired while the CRM still held the payload
+ *                                in state — see NOTICE_PRESIGN_TTL_SEC)
  *   - Local paths / URLs       → passthrough
  *   - null/empty               → dropped
  *

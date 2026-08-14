@@ -51,6 +51,37 @@ const BUCKET = process.env.S3_BUCKET_NAME || '';
 const REGION = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'ap-south-1';
 const PRESIGN_TTL_SEC = Number(process.env.S3_PRESIGN_TTL_SEC) || 300; // 5-min default
 
+/*
+ * Notice images get their OWN, longer TTL (2026-08-14).
+ *
+ * WHY THE DEFAULT IS TOO SHORT HERE, SPECIFICALLY. Every other presign is
+ * minted for something the user is about to click — a document link, a job
+ * photo — so it is fetched within seconds. Notice image URLs are different:
+ * they are embedded in the `/admin/notices/active` payload, and the CRM's
+ * NoticeFlash copies that payload into React state and deliberately does NOT
+ * refresh a card the operator is already reading. So the URL starts aging the
+ * moment the dashboard loads, and the <img> may not be requested until the
+ * operator has scrolled through a long notice — or worked through a queue of
+ * several. Measured in production 2026-08-14:
+ *
+ *   minted   2026-08-14T05:20:12Z
+ *   expired  2026-08-14T05:25:12Z
+ *   result   403 AccessDenied · "Request has expired"
+ *
+ * WHY NOT JUST RAISE PRESIGN_TTL_SEC. It is shared by 23 call sites, including
+ * client documents and job supporting files — those carry PII, and the short
+ * window there is a deliberate posture ("short enough that a leaked URL ages
+ * out before it's abusable"). Notice images are broadcast announcement
+ * graphics sent to every user of a surface; an hour is proportionate for them
+ * and would not be for a payout document.
+ *
+ * RESIDUAL: a tab left open longer than this with the notice never dismissed
+ * still expires. Fixing that completely means re-minting at render time rather
+ * than embedding URLs in a list payload — a bigger change, deliberately not
+ * bundled here.
+ */
+const NOTICE_PRESIGN_TTL_SEC = Number(process.env.S3_NOTICE_PRESIGN_TTL_SEC) || 3600; // 1 hour
+
 // Lazy SDK init so a misconfigured-but-disabled S3 doesn't crash boot.
 let _client = null;
 let _presigner = null;
@@ -248,11 +279,13 @@ async function exists(key) {
  * page session, short enough that a leaked URL ages out before it's
  * abusable. Re-mint on every image render.
  */
-async function getPresignedUrl(key) {
+async function getPresignedUrl(key, expiresIn = PRESIGN_TTL_SEC) {
   if (!isEnabled()) throw new Error('S3 is not configured');
   const { GetObjectCommand } = require('@aws-sdk/client-s3');
   const cmd = new GetObjectCommand({ Bucket: BUCKET, Key: key });
-  return await presigner()(client(), cmd, { expiresIn: PRESIGN_TTL_SEC });
+  // Defaulted, so all 23 existing call sites keep the short TTL untouched;
+  // only a caller that has a documented reason opts into a longer one.
+  return await presigner()(client(), cmd, { expiresIn });
 }
 
 /*
@@ -503,7 +536,10 @@ async function putNoticeImage({ buffer, contentType, originalName }) {
  * Resolve a stored notice-image value (either an S3 key or a local
  * URL) to a publicly-loadable URL the FE <img> can render.
  *
- *   - "Notices/<ts>_<rand>"   → presigned GET URL (5-min TTL)
+ *   - "Notices/<ts>_<rand>"   → presigned GET URL (NOTICE_PRESIGN_TTL_SEC,
+ *                                1 h — these are embedded in a list payload
+ *                                the CRM holds in state, so the default 5 min
+ *                                expired before the image was ever requested)
  *   - "/easydoc/<filename>"   → returned as-is (local fallback)
  *   - "https://…"             → returned as-is (external URL)
  *
@@ -526,7 +562,10 @@ async function resolveNoticeImageUrl(storedValue) {
   // S3 key shape — sign and return.
   if (isEnabled() && stored.startsWith('Notices/')) {
     try {
-      return await getPresignedUrl(stored);
+      // Longer TTL than the default — see NOTICE_PRESIGN_TTL_SEC. These URLs
+      // are embedded in a list payload the CRM holds in state, so they must
+      // outlive a reading session, not just a click.
+      return await getPresignedUrl(stored, NOTICE_PRESIGN_TTL_SEC);
     } catch (e) {
       // eslint-disable-next-line no-console
       console.warn('s3-storage.resolveNoticeImageUrl: presign failed', { stored, err: e?.message });
