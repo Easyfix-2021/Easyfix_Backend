@@ -19,7 +19,8 @@ const { modernOk } = require('../../utils/response');
  * Ops-flippable via easyfix_properties (NO deploy needed to force an update):
  *   app.android.min.version.code   minimum allowed versionCode (e.g. "50")
  *   app.android.store.url          override the store link (optional)
- *   (same shape for app.ios.* when iOS ships)
+ *   app.ios.min.version.code       same shape; compared against the iOS buildNumber
+ *   app.ios.store.url              override the store link (optional)
  *
  * FAIL-OPEN by design: a missing, empty, or unparseable property yields
  * minVersionCode 0, which blocks nobody. A force-update gate that failed CLOSED
@@ -29,9 +30,17 @@ const { modernOk } = require('../../utils/response');
  * error as "not blocked".
  */
 
+/*
+ * Live listings for both platforms. These are DEFAULTS — `app.{platform}.store.url`
+ * overrides either one without a deploy, which is what to use if a listing moves.
+ *
+ * The iOS URL is pinned to the `in` storefront because the technician base is
+ * India-only; Apple redirects other storefronts anyway, so this is the shortest
+ * correct link rather than a restriction.
+ */
 const DEFAULT_STORE_URL = {
   android: 'https://play.google.com/store/apps/details?id=com.dev.easyfix',
-  ios: '',
+  ios: 'https://apps.apple.com/in/app/easy-fix-handyman-technology/id1635539236',
 };
 
 /** Parse a property into a usable versionCode. Anything invalid → 0 (gate off). */
