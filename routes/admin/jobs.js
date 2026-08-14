@@ -1694,6 +1694,30 @@ const holdBody = require('joi').object({
 router.put('/:id/hold', validate(idParam, 'params'), validate(holdBody), scopedJob, async (req, res, next) => {
   try {
     logger.info('Place fulfillment hold · jobId=' + req.params.id);
+    /*
+     * ONE HOLD PER JOB, EVER — the guard legacy enforced at
+     * EasyFix_CRM JobDaoImpl.java:6106 (`if (j.getNoOffullfillments() == 0)`).
+     *
+     * Note what it does NOT gate on: status. A hold can be placed from any
+     * state. This counter is the whole state machine, and it is what makes
+     * the release safe — hold/release is a single 10 → 21 → 10 round trip, so
+     * releasing to a hardcoded 10 restores the job to where it started.
+     *
+     * Without the guard a job that had moved on could be dragged back to 21
+     * and then released to 10, rewriting its status to a state it had already
+     * left. Legacy skipped the write silently; this is an admin route rather
+     * than the frozen partner contract, so it reports the refusal instead of
+     * pretending to succeed.
+     */
+    const [[current]] = await pool.query(
+      'SELECT COALESCE(no_of_req_foh, 0) AS holds FROM tbl_job WHERE job_id = ?',
+      [req.params.id]
+    );
+    if (!current) return modernError(res, 404, 'Job not found');
+    if (Number(current.holds) > 0) {
+      logger.warn('Fulfillment hold refused · already held once · jobId=' + req.params.id);
+      return modernError(res, 409, 'This job has already been placed on fulfillment hold once.');
+    }
     await pool.query(
       `UPDATE tbl_job
           SET job_status = 21,
@@ -1702,7 +1726,7 @@ router.put('/:id/hold', validate(idParam, 'params'), validate(holdBody), scopedJ
               full_fillment_by = ?,
               full_fillment_created_time = NOW(),
               no_of_req_foh = COALESCE(no_of_req_foh, 0) + 1
-        WHERE job_id = ?`,
+        WHERE job_id = ? AND COALESCE(no_of_req_foh, 0) = 0`,
       [req.body.reason, req.body.appointment_time, req.user.user_id, req.params.id]
     );
     logger.info('Fulfillment hold placed · jobId=' + req.params.id + ' status=21');
