@@ -678,11 +678,32 @@ async function referralSummary(efrId) {
       LIMIT 50`,
     [Number(efrId)],
   );
+
+  /*
+   * The OTHER direction: was this technician themselves referred?
+   *
+   * Needed by the registration field, which would otherwise have no way to
+   * know a code is already applied and would offer an input that can only
+   * ever answer with a 409. Attribution is permanent (uq_referred_once), so
+   * once this is set the field shows it read-only rather than inviting an
+   * edit that cannot succeed.
+   */
+  const [[referredBy]] = await pool.query(
+    `SELECT r.code, r.joined_at, e.efr_name AS referrer_name
+       FROM reward_referrals r
+       LEFT JOIN tbl_easyfixer e ON e.efr_id = r.referrer_efr_id
+      WHERE r.referred_efr_id = ?`,
+    [Number(efrId)],
+  );
+
   return {
     code: await referralCodeFor(efrId),
     joined: rows.length,
     qualified: rows.filter((r) => r.qualified_at).length,
     referrals: rows,
+    referredBy: referredBy
+      ? { code: referredBy.code, referrerName: referredBy.referrer_name || null }
+      : null,
   };
 }
 
