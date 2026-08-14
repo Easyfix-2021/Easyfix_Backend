@@ -106,6 +106,29 @@
     text-wrap: balance;
   }
   .masthead p { margin: 0; color: var(--ink-muted); max-width: 52ch; }
+  /*
+   * The wordmark is cyan + WHITE on transparency — drawn for the CRM's dark
+   * sidebar. On a light ground the "Fix" half is invisible, so light mode
+   * gets a dark plaque behind it. Dark mode needs nothing: the page ground
+   * is already what the artwork was designed for.
+   *
+   * A plaque rather than a CSS filter, because filtering to darken the white
+   * would drag the cyan off-brand at the same time.
+   */
+  .logo {
+    display: block;
+    height: 34px;
+    width: auto;
+    margin-bottom: 18px;
+    background: var(--code-ground);
+    padding: 7px 11px;
+    border-radius: 7px;
+    box-sizing: content-box;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) .logo { background: none; padding: 0; }
+  }
+  :root[data-theme="dark"] .logo { background: none; padding: 0; }
   .eyebrow {
     font-family: var(--mono);
     font-size: 0.7rem;
@@ -398,12 +421,12 @@
 
   <header class="masthead">
     <div>
+      <img class="logo" src="data:image/png;base64,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" alt="EasyFix" width="139" height="34">
       <p class="eyebrow">Partner Integration Guide</p>
       <h1>EasyFix Partner API</h1>
       <p>Book field-service jobs, track them to completion, and receive live status updates over webhooks.</p>
     </div>
     <div class="rev">
-      <b>v1</b> &middot; unified backend<br>
       Updated 14 Aug 2026<br>
       Replaces <code>core.easyfix.in/v1</code>
     </div>
@@ -466,7 +489,20 @@ curl -u <span class="s">'YOUR_USERNAME:YOUR_PASSWORD'</span> \
 
       <div class="note">
         <span class="lbl">Moving from the old API?</span>
-        <p>Your credentials, service IDs, job IDs and webhook events are unchanged. The host and path prefix are new, and a few responses are more consistent than before. Jump to <a href="#changes">What changed</a> for the full list &mdash; it is short.</p>
+        <p><strong>Only the base URL changes.</strong> Every endpoint path, header, request body and response body stays exactly as it is today, as do your credentials, service IDs, job IDs and webhook events. See <a href="#changes">What changed</a>.</p>
+      </div>
+
+      <h4>This document</h4>
+      <p>The current version is always served by the API itself, so it can never fall out of step with the code:</p>
+      <div class="envs">
+        <div class="env prod">
+          <span class="tag">Production</span>
+          <div class="url">https://backend.easyfix.in/api/integration/docs</div>
+        </div>
+        <div class="env">
+          <span class="tag">QA</span>
+          <div class="url">https://qa.backend.easyfix.in/api/integration/docs</div>
+        </div>
       </div>
     </section>
 
@@ -496,7 +532,7 @@ curl -u <span class="s">'YOUR_USERNAME:YOUR_PASSWORD'</span> \
       <h2>Conventions</h2>
 
       <h3>Response envelope</h3>
-      <p>Every response &mdash; success or failure &mdash; uses the same three-key envelope. Your real payload is always under <code>data</code>.</p>
+      <p>Almost every response &mdash; success or failure &mdash; uses the same three-key envelope, with your real payload under <code>data</code>. The single exception is <a href="#create">job creation</a>, which returns the job object at the top level; that asymmetry is preserved from the previous API so existing integrations keep working.</p>
       <pre>{
   <span class="k">"status"</span>:  <span class="s">"200"</span>,        <span class="c">// string, not a number</span>
   <span class="k">"message"</span>: <span class="s">"OK"</span>,
@@ -736,18 +772,36 @@ curl -u <span class="s">'YOUR_USERNAME:YOUR_PASSWORD'</span> \
         </div>
         <p><span class="req">*</span> required &mdash; everything else is optional.</p>
 
-        <h4>Response &mdash; 200</h4>
-        <pre>{
-  <span class="k">"status"</span>: <span class="s">"200"</span>,
-  <span class="k">"message"</span>: <span class="s">"OK"</span>,
-  <span class="k">"data"</span>: {
-    <span class="k">"jobId"</span>: <span class="n">212251</span>,
-    <span class="k">"id"</span>: <span class="n">212251</span>,              <span class="c">// same value, for older clients</span>
-    <span class="k">"reference_id"</span>: <span class="s">"YOUR-ORDER-10231"</span>,
-    <span class="k">"currentStatus"</span>: <span class="s">"Unconfirmed"</span>
+        <h4>Response &mdash; 201 Created</h4>
+        <div class="note warn">
+          <span class="lbl">This one endpoint does not use the envelope</span>
+          <p>Job creation replies <strong>201</strong> with the job object at the <em>top level</em> &mdash; no <code>status</code> / <code>message</code> / <code>data</code> wrapper &mdash; and a <code>Location</code> header pointing at the new job. Read the ID from <code>id</code>. Every other endpoint uses the envelope.</p>
+        </div>
+        <pre><span class="c">HTTP/1.1 201 Created
+Location: /api/integration/v1/jobs/212251</span>
+
+{
+  <span class="k">"id"</span>: <span class="n">212251</span>,
+  <span class="k">"created_date"</span>: <span class="s">"14-08-2026 17:42"</span>,
+  <span class="k">"requested_date"</span>: <span class="s">"17-10-2026 00:00"</span>,
+  <span class="k">"requested_time"</span>: <span class="s">"00:00"</span>,
+  <span class="k">"reference_id"</span>: <span class="s">"YOUR-ORDER-10231"</span>,
+  <span class="k">"clientSpocName"</span>: <span class="s">"Vikash Gupta"</span>,
+  <span class="k">"clientSpocEmail"</span>: <span class="s">"vikash.gupta@example.com"</span>,
+  <span class="k">"clientSpocNumber"</span>: <span class="s">"9988765567"</span>,
+  <span class="k">"serviceTypeIds"</span>: <span class="s">"7"</span>,
+  <span class="k">"clientServices"</span>: <span class="s">"24055"</span>,
+  <span class="k">"customer"</span>: { <span class="k">"id"</span>: <span class="n">55</span>, <span class="k">"mobile"</span>: <span class="s">"9999578666"</span>, <span class="k">"name"</span>: <span class="s">"Priyanka Sharma"</span> },
+  <span class="k">"address"</span>: {
+    <span class="k">"address"</span>: <span class="s">"Sector 44, near Huda City Centre"</span>,
+    <span class="k">"building"</span>: <span class="s">"Building number 10"</span>,
+    <span class="k">"city"</span>: { <span class="k">"city_id"</span>: <span class="n">3</span>, <span class="k">"city_name"</span>: <span class="s">"Gurgaon"</span> },
+    <span class="k">"pinCode"</span>: <span class="s">"122001"</span>,
+    <span class="k">"gps"</span>: <span class="s">"28.4594965,77.0266383"</span>
   }
 }</pre>
-        <p>Store <code>jobId</code>. A new job starts as <strong>Unconfirmed</strong> and moves to <em>Scheduled</em> once a technician accepts &mdash; you will receive a <a href="#events"><code>TechAssigned</code></a> webhook when that happens.</p>
+        <p>Store <code>id</code>. Fields with no value are <strong>omitted</strong> rather than sent as <code>null</code>, so treat every key above as optional when parsing.</p>
+        <p>A new job starts as <strong>Pending for scheduling</strong> and moves on once a technician accepts &mdash; you will receive a <a href="#events"><code>TechAssigned</code></a> webhook when that happens.</p>
       </div>
     </section>
 
@@ -772,8 +826,15 @@ curl -u <span class="s">'YOUR_USERNAME:YOUR_PASSWORD'</span> \
         <pre>{
   <span class="k">"status"</span>: <span class="s">"200"</span>,
   <span class="k">"message"</span>: <span class="s">"OK"</span>,
-  <span class="k">"data"</span>: { <span class="k">"jobId"</span>: <span class="n">212251</span>, <span class="k">"currentStatus"</span>: <span class="s">"Unconfirmed"</span> }
+  <span class="k">"data"</span>: { <span class="k">"jobId"</span>: <span class="n">212251</span>, <span class="k">"currentStatus"</span>: <span class="s">"Pending to start"</span> }
 }</pre>
+
+        <div class="note warn">
+          <span class="lbl">This endpoint always returns HTTP 200</span>
+          <p>Failure is signalled in the body, not the HTTP status. An unknown job &mdash; or one belonging to another partner &mdash; returns:</p>
+          <pre>{ <span class="k">"status"</span>: <span class="s">"300"</span>, <span class="k">"message"</span>: <span class="s">"Incorrect jobId"</span>, <span class="k">"data"</span>: { <span class="k">"jobId"</span>: <span class="n">0</span> } }</pre>
+          <p>Branch on <code>status</code>, not on the HTTP code. Omitting <code>jobId</code> altogether returns an empty object, <code>{}</code>.</p>
+        </div>
 
         <div class="note ok">
           <span class="lbl">Prefer webhooks over polling</span>
@@ -881,24 +942,25 @@ curl -u <span class="s">'YOUR_USERNAME:YOUR_PASSWORD'</span> \
 
       <div class="scroll">
         <table>
-          <thead><tr><th>Numeric</th><th>Label</th><th>What it means</th></tr></thead>
+          <thead><tr><th>Numeric</th><th><code>currentStatus</code></th><th>What it means</th></tr></thead>
           <tbody>
-            <tr><td class="f num">0</td><td class="f">Unconfirmed</td><td>Booked and awaiting a technician.</td></tr>
-            <tr><td class="f num">1</td><td class="f">Scheduled</td><td>A technician has accepted and is assigned.</td></tr>
-            <tr><td class="f num">2</td><td class="f">In-Progress</td><td>The technician has reached the customer and started work.</td></tr>
-            <tr><td class="f num">3, 5</td><td class="f">Completed</td><td>Work finished on site.</td></tr>
+            <tr><td class="f num">0</td><td class="f">Pending for scheduling</td><td>Booked; no technician assigned yet.</td></tr>
+            <tr><td class="f num">0</td><td class="f">Pending app acknowledgement</td><td>A technician is assigned but has not accepted on their app.</td></tr>
+            <tr><td class="f num">1</td><td class="f">Pending to start</td><td>Accepted and scheduled; the visit has not begun.</td></tr>
+            <tr><td class="f num">2, 20</td><td class="f">Pending to close on app</td><td>The technician has started work on site.</td></tr>
+            <tr><td class="f num">3, 5</td><td class="f">Completed</td><td>Work finished.</td></tr>
+            <tr><td class="f num">3, 5</td><td class="f">Visit Completed</td><td>This visit finished, but a follow-up visit was raised.</td></tr>
             <tr><td class="f num">6</td><td class="f">Cancelled</td><td>Cancelled by you or by us.</td></tr>
             <tr><td class="f num">7</td><td class="f">Enquiry</td><td>Logged as an enquiry rather than a booked visit.</td></tr>
-            <tr><td class="f num">9</td><td class="f">Call Later</td><td>Parked &mdash; the customer asked to be contacted later.</td></tr>
-            <tr><td class="f num">10</td><td class="f">Revisit</td><td>Closed on the app without completion; a further visit is needed.</td></tr>
+            <tr><td class="f num">9</td><td class="f">Unconfirmed</td><td>Awaiting confirmation before scheduling.</td></tr>
+            <tr><td class="f num">10</td><td class="f">Audit &amp; complete</td><td>Closed on the app, pending our internal audit.</td></tr>
+            <tr><td class="f num">15</td><td class="f">Pending for approval</td><td>An on-site estimate is awaiting approval.</td></tr>
+            <tr><td class="f num">21</td><td class="f">Fulfillment on hold</td><td>Paused; we will contact your SPOC.</td></tr>
           </tbody>
         </table>
       </div>
 
-      <div class="note warn">
-        <span class="lbl">These labels differ from the previous API</span>
-        <p>The old service returned strings such as <em>Pending to start</em>, <em>Pending to close on app</em> and <em>Audit &amp; complete</em>. Map against the table above rather than the strings you may have hard-coded, and treat any unrecognised label as "in progress" rather than failing.</p>
-      </div>
+      <p>Note that status <code>0</code> and the pair <code>3</code>/<code>5</code> each produce two different labels &mdash; whether a technician is attached, and whether a follow-up visit was raised, decide which. An unrecognised status returns an empty string, so treat <code>""</code> as "in progress" rather than failing.</p>
     </section>
 
     <!-- ═══════════ WEBHOOKS ═══════════ -->
@@ -1050,37 +1112,35 @@ curl -u <span class="s">'YOUR_USERNAME:YOUR_PASSWORD'</span> \
       <h2>What changed</h2>
       <p>If you already integrate with <code>core.easyfix.in/v1</code>, this is everything you need to look at. Your credentials, service IDs, job IDs and webhook event names are unchanged.</p>
 
-      <h3>You must change</h3>
+      <div class="note ok">
+        <span class="lbl">One line of code</span>
+        <p>Change your base URL. Nothing else. Every endpoint path, header, request body and response body is unchanged &mdash; including the status label strings, the <code>201</code>-with-no-envelope reply from job creation, and the <code>{}</code> that <code>jobStatus</code> returns for a missing <code>jobId</code>.</p>
+      </div>
+
       <div class="scroll">
         <table>
-          <thead><tr><th>Change</th><th>Detail</th></tr></thead>
+          <thead><tr><th></th><th>Before</th><th>After</th></tr></thead>
           <tbody>
             <tr>
               <td><strong>Base URL</strong></td>
-              <td>From <code>https://core.easyfix.in/v1</code> to <code>https://backend.easyfix.in/api/integration/v1</code>. Paths after the prefix are identical.</td>
+              <td class="f">https://core.easyfix.in/v1</td>
+              <td class="f">https://backend.easyfix.in/api/integration/v1</td>
             </tr>
             <tr>
-              <td><strong>Job creation response</strong></td>
-              <td>Previously HTTP <code>201</code> with the job object at the top level. Now HTTP <code>200</code> with the standard envelope &mdash; read <code>data.jobId</code> (<code>data.id</code> carries the same value).</td>
-            </tr>
-            <tr>
-              <td><strong>Status labels</strong></td>
-              <td>A shorter, clearer vocabulary. See the <a href="#statuses">status reference</a>. If you match on strings, update them.</td>
-            </tr>
-            <tr>
-              <td><strong>Unknown city names</strong></td>
-              <td>Previously accepted silently, leaving an address that could not be routed. Now returns <strong>400</strong>. Verify names against <code>/cities</code>.</td>
+              <td><strong>Everything else</strong></td>
+              <td colspan="2">Unchanged &mdash; paths, Basic Auth credentials, headers, request bodies, response bodies, status strings, HTTP codes, service IDs, job IDs, webhook events and payloads.</td>
             </tr>
           </tbody>
         </table>
       </div>
 
       <h3>Improvements you get for free</h3>
+      <p>None of these require a change on your side.</p>
       <ul>
-        <li><strong>Pricing comes from your rate card.</strong> Previously the amount in your request was written to the job, so a request sending only <code>service_id</code> booked at zero. Now we price every line from your contract &mdash; send <code>service_id</code> alone.</li>
-        <li><strong>Webhooks retry.</strong> A failed delivery is retried twice more, after 30 seconds and 5 minutes. Previously a single failure was lost silently.</li>
+        <li><strong>Pricing comes from your rate card.</strong> Previously the amount in your request was written to the job, so a request sending only <code>service_id</code> &mdash; exactly what this document shows &mdash; booked the line at zero. Every line is now priced from your contract.</li>
+        <li><strong>Webhooks retry.</strong> A failed delivery is retried twice more, after 30 seconds and 5 minutes. Previously a single failure was lost silently, with no record kept.</li>
         <li><strong>Webhook images are downloadable URLs</strong> rather than bare filenames.</li>
-        <li><strong>Uploaded images are protected.</strong> <code>jobImageIds</code> now only accepts images you uploaded yourself.</li>
+        <li><strong>Uploaded images are protected.</strong> <code>jobImageIds</code> now only adopts images you uploaded yourself, so nobody else's photograph can be attached to your job.</li>
         <li><strong>Past appointment dates are no longer silently moved</strong> an hour into the future.</li>
       </ul>
     </section>
@@ -1090,9 +1150,8 @@ curl -u <span class="s">'YOUR_USERNAME:YOUR_PASSWORD'</span> \
       <h2>Cutover checklist</h2>
       <ol class="check">
         <li><b>Point at QA</b>Change your base URL to <code>https://qa.backend.easyfix.in/api/integration/v1</code> and confirm <code>GET /services</code> returns your catalogue.</li>
-        <li><b>Book a test job</b>Create one job end to end and confirm you read <code>data.jobId</code> from the new envelope.</li>
+        <li><b>Book a test job</b>Create one job end to end and confirm the <code>201</code> body and your <code>reference_id</code> come back exactly as they do today.</li>
         <li><b>Register a QA webhook</b>Send us a QA callback URL and confirm you receive <code>TechAssigned</code> when we advance the test job.</li>
-        <li><b>Check your status handling</b>Ensure unrecognised status labels degrade gracefully instead of throwing.</li>
         <li><b>Switch production</b>Change the base URL in production and tell us, so we can watch the first live traffic with you.</li>
         <li><b>Keep the old URL live briefly</b>We keep <code>core.easyfix.in/v1</code> serving until you confirm the switch is stable. Nothing is turned off without your sign-off.</li>
       </ol>

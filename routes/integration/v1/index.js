@@ -13,8 +13,11 @@ const {
   checkFirefoxAvailability,
   checkDecathlonServiceability,
   clientServiceCatalog,
+  catalogShapeForRole,
   resolveCityId,
   paymentCollectedByCode,
+  jobUiStatus,
+  legacyJobEntity,
 } = require('../../../services/integration.service');
 const { writeBuffer } = require('../../../utils/file-storage');
 const logger = require('../../../logger');
@@ -78,9 +81,18 @@ router.post(['/jobs', '/jobs/newJob'], async (req, res, next) => {
     // Convert requested_date from "DD-MM-YYYY HH:mm" to JS Date
     const reqDt = parseLegacyDate(b.requested_date);
 
-    // Clients send the city by NAME ("Gurgaon"); city_id is the exception.
+    /*
+     * Clients send the city by NAME ("Gurgaon"); city_id is the exception.
+     *
+     * An unrecognised name is NOT an error: legacy stored a NULL city_id and
+     * created the job anyway, so rejecting it here would fail requests the
+     * old service accepted. Logged loudly instead — the job is bookable but
+     * harder to route, and ops should see that.
+     */
     const { cityId, unknownName } = await resolveCityId(pool, addr.city);
-    if (unknownName) return legacyError(res, 400, `Unknown city "${unknownName}"`);
+    if (unknownName) {
+      logger.warn('Integration: job created with UNRESOLVED city · "' + unknownName + '" · client=' + req.integrationClient.id);
+    }
 
     const created = await jobService.create({
       fk_client_id: req.integrationClient.id,
@@ -154,14 +166,20 @@ router.post(['/jobs', '/jobs/newJob'], async (req, res, next) => {
     }
 
     logger.info('Integration: job created · id=' + created.job_id + ' ref=' + (created.client_ref_id || '-'));
-    // `id` is an alias for `jobId`: the legacy service returned the job entity
-    // whose primary key was `id`, so integrators read both spellings.
-    legacyOk(res, {
-      jobId: created.job_id,
-      id: created.job_id,
-      reference_id: created.client_ref_id,
-      currentStatus: statusLabel(created.job_status),
-    });
+
+    /*
+     * 201 + the bare job entity + a Location header — NOT the {status,message,
+     * data} envelope its sibling endpoints use. That asymmetry is the legacy
+     * contract (JobsResource.java:155-167): clients read `id` off the top
+     * level, so wrapping it would break every existing integration.
+     *
+     * Re-read rather than reshaping `created`: the entity carries the resolved
+     * customer id, city name and the server-derived requested_time, none of
+     * which the create call returns.
+     */
+    const persisted = await jobService.getById(created.job_id);
+    res.setHeader('Location', `${req.baseUrl}${req.path.replace(/\/$/, '')}/${created.job_id}`);
+    res.status(201).json(legacyJobEntity(persisted));
   } catch (e) {
     if (e.status) {
       logger.warn('Integration: create job rejected · ' + e.message);
@@ -176,17 +194,28 @@ router.get('/jobs/jobStatus', async (req, res, next) => {
   try {
     const jobId = Number(req.query.jobId);
     logger.info('Integration: fetch job status · jobId=' + (req.query.jobId || '-'));
-    if (!jobId) return legacyError(res, 400, 'jobId required');
+
+    /*
+     * Legacy answered HTTP 200 for EVERY outcome here, signalling failure only
+     * through the envelope's `status` field (JobsResource.java:605-635):
+     *
+     *   found            → 200 {status:"200", message:"OK",            data:{jobId, currentStatus}}
+     *   unknown / others' → 200 {status:"300", message:"Incorrect jobId", data:{jobId:0}}
+     *   jobId absent/<=0  → 200 {} — literally an empty body
+     *
+     * A client polling this treats a 404 as an outage, so the HTTP codes are
+     * reproduced as-is. "Not yours" and "does not exist" deliberately answer
+     * identically — that is the legacy behaviour AND it avoids confirming
+     * another partner's job ids exist.
+     */
+    if (!jobId || jobId <= 0) return res.json({});
+
     const job = await jobService.getById(jobId);
-    if (!job) {
-      logger.warn('Integration: job status not found · jobId=' + jobId);
-      return legacyError(res, 404, 'Not Found');
+    if (!job || job.fk_client_id !== req.integrationClient.id) {
+      logger.warn('Integration: job status not found / not owned · jobId=' + jobId);
+      return res.json({ status: '300', message: 'Incorrect jobId', data: { jobId: 0 } });
     }
-    if (job.fk_client_id !== req.integrationClient.id) {
-      logger.warn('Integration: job status forbidden · jobId=' + jobId);
-      return legacyError(res, 403, 'Forbidden');
-    }
-    legacyOk(res, { jobId: job.job_id, currentStatus: statusLabel(job.job_status) });
+    legacyOk(res, { jobId: job.job_id, currentStatus: jobUiStatus(job) });
   } catch (e) { next(e); }
 });
 

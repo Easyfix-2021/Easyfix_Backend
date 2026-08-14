@@ -50,6 +50,101 @@ function statusLabel(code) {
   return STATUS_LABELS[Number(code)] || 'Unknown';
 }
 
+/*
+ * The label vocabulary GET /v1/jobs/jobStatus has always returned.
+ *
+ * VERBATIM from EasyFix_API EasyfixAPIUtils.getJobUIStatus (:410-458). This is
+ * NOT the same mapping as statusLabel above — legacy carried two, and this is
+ * the one external clients see on jobStatus. Three cases are decided by more
+ * than the status code, which is why this takes the job row rather than an int:
+ *
+ *   status 0   splits on whether a technician is attached
+ *   status 3/5 splits on whether the job spawned a follow-up visit
+ *
+ * An unmapped code returns '' (empty string), exactly as legacy's `default:`
+ * branch did. Do not "improve" that to 'Unknown' — a client switching on the
+ * string would start taking a different branch.
+ */
+const JOB_UI_STATUS = {
+  1: 'Pending to start',
+  2: 'Pending to close on app',
+  20: 'Pending to close on app',
+  3: 'Completed',
+  5: 'Completed',
+  6: 'Cancelled',
+  7: 'Enquiry',
+  9: 'Unconfirmed',
+  10: 'Audit & complete',
+  15: 'Pending for approval',
+  21: 'Fulfillment on hold',
+};
+
+function jobUiStatus(job) {
+  const code = Number(job?.job_status);
+  const techId = Number(job?.fk_easyfixter_id) || 0;   // legacy column typo
+  const subJobId = Number(job?.sub_job_id) || 0;
+  if (code === 0) return techId > 0 ? 'Pending app acknowledgement' : 'Pending for scheduling';
+  if ((code === 3 || code === 5) && subJobId > 0) return 'Visit Completed';
+  return JOB_UI_STATUS[code] ?? '';
+}
+
+/*
+ * The job body POST /v1/jobs returns.
+ *
+ * Legacy replied 201 with the persisted Jobs entity serialised under
+ * JobsView.Public and Jackson's NON_NULL — NOT the {status,message,data}
+ * envelope its sibling endpoints use. Clients read `id` off the top level, so
+ * this reproduces that shape rather than wrapping it.
+ *
+ * NON_NULL is load-bearing: legacy omitted every null key entirely, so a
+ * client mapping onto a strict DTO never saw `"landmark": null`. dropNulls
+ * below reproduces that, recursively.
+ */
+function dropNulls(value) {
+  if (Array.isArray(value)) return value.map(dropNulls);
+  if (value && typeof value === 'object' && !(value instanceof Date)) {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (v === null || v === undefined) continue;
+      const cleaned = dropNulls(v);
+      // An object that emptied out is dropped too — legacy's serializer
+      // never emitted `"city": {}` for an unresolved city.
+      if (cleaned && typeof cleaned === 'object' && !Array.isArray(cleaned) && Object.keys(cleaned).length === 0) continue;
+      out[k] = cleaned;
+    }
+    return out;
+  }
+  return value;
+}
+
+function legacyJobEntity(job) {
+  return dropNulls({
+    id: job.job_id,
+    created_date: formatLegacyDate(job.created_date_time),
+    requested_date: formatLegacyDate(job.requested_date_time),
+    requested_time: job.requested_time || null,
+    reference_id: job.client_ref_id,
+    clientSpocName: job.client_spoc_name,
+    clientSpocEmail: job.client_spoc_email,
+    clientSpocNumber: job.client_spoc,
+    serviceTypeIds: job.service_type_ids,
+    clientServices: job.client_services,
+    customer: {
+      id: job.fk_customer_id,
+      mobile: job.customer_mob_no,
+      name: job.customer_name,
+    },
+    address: {
+      address: job.address,
+      building: job.building,
+      landmark: job.landmark,
+      city: { city_id: job.city_id, city_name: job.city_name },
+      pinCode: job.pin_code,
+      gps: job.gps_location,
+    },
+  });
+}
+
 // Dropwizard parses "DD-MM-YYYY HH:mm" (India common format). Use this for IN and OUT.
 function parseLegacyDate(s) {
   if (!s) return null;
@@ -432,6 +527,8 @@ function paymentCollectedByCode(raw) {
 module.exports = {
   STATUS_LABELS,
   statusLabel,
+  jobUiStatus,
+  legacyJobEntity,
   parseLegacyDate,
   formatLegacyDate,
   checkFirefoxAvailability,

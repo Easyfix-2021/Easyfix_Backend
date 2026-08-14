@@ -21,7 +21,87 @@ const {
   resolveCityId,
   paymentCollectedByCode,
   PAYMENT_COLLECTED_BY,
+  jobUiStatus,
+  legacyJobEntity,
 } = require('../services/integration.service');
+
+test('the integration router loads with every import resolved', () => {
+  // Guards the whole class of bug that `node --check` cannot see: a helper
+  // used in a handler but missing from the destructured require throws only
+  // when that route is first hit, i.e. in front of a partner.
+  const router = require('../routes/integration/v1/index.js');
+  assert.ok(router.stack.length > 20, 'routes registered');
+});
+
+// ─── jobStatus label vocabulary (legacy getJobUIStatus) ─────────────
+
+test('status 0 splits on whether a technician is attached', () => {
+  assert.equal(jobUiStatus({ job_status: 0, fk_easyfixter_id: 44 }), 'Pending app acknowledgement');
+  assert.equal(jobUiStatus({ job_status: 0, fk_easyfixter_id: null }), 'Pending for scheduling');
+  assert.equal(jobUiStatus({ job_status: 0, fk_easyfixter_id: 0 }), 'Pending for scheduling');
+});
+
+test('a completed job with a follow-up visit reads "Visit Completed"', () => {
+  assert.equal(jobUiStatus({ job_status: 3, sub_job_id: 991 }), 'Visit Completed');
+  assert.equal(jobUiStatus({ job_status: 5, sub_job_id: 991 }), 'Visit Completed');
+  assert.equal(jobUiStatus({ job_status: 3, sub_job_id: null }), 'Completed');
+  assert.equal(jobUiStatus({ job_status: 5, sub_job_id: 0 }), 'Completed');
+});
+
+test('the remaining codes map exactly as the legacy service did', () => {
+  const expected = {
+    1: 'Pending to start', 2: 'Pending to close on app', 20: 'Pending to close on app',
+    6: 'Cancelled', 7: 'Enquiry', 9: 'Unconfirmed', 10: 'Audit & complete',
+    15: 'Pending for approval', 21: 'Fulfillment on hold',
+  };
+  for (const [code, label] of Object.entries(expected)) {
+    assert.equal(jobUiStatus({ job_status: Number(code) }), label, `status ${code}`);
+  }
+});
+
+test('an unmapped status returns an empty string, not "Unknown"', () => {
+  // Legacy's `default:` branch. A client switching on the string would take a
+  // different branch if this became a word.
+  for (const code of [4, 8, 11, 14, 16, 19, 22, 99]) {
+    assert.equal(jobUiStatus({ job_status: code }), '', `status ${code}`);
+  }
+});
+
+// ─── POST /jobs response body ───────────────────────────────────────
+
+const PERSISTED_JOB = {
+  job_id: 212251, created_date_time: new Date(2026, 7, 14, 17, 42),
+  requested_date_time: new Date(2026, 9, 16, 10, 0), requested_time: '10:00',
+  client_ref_id: 'YOUR-ORDER-10231',
+  client_spoc_name: 'Vikash', client_spoc_email: 'v@example.com', client_spoc: '9988765567',
+  service_type_ids: '7,7', client_services: '24055,24056',
+  fk_customer_id: 55, customer_mob_no: '9999578666', customer_name: 'Priyanka',
+  address: 'Sector 44', building: 'Building 10', landmark: null,
+  city_id: 3, city_name: 'Gurgaon', pin_code: '122001', gps_location: '28.45,77.02',
+};
+
+test('the created job is returned as a bare entity keyed by id', () => {
+  const body = legacyJobEntity(PERSISTED_JOB);
+  // Clients read `id` off the TOP level — there is no envelope on this one.
+  assert.equal(body.id, 212251);
+  assert.ok(!('status' in body) && !('data' in body), 'not the {status,message,data} envelope');
+  assert.equal(body.reference_id, 'YOUR-ORDER-10231');
+  assert.equal(body.created_date, '14-08-2026 17:42', 'DD-MM-YYYY HH:mm');
+  assert.equal(body.requested_date, '16-10-2026 10:00');
+  assert.deepEqual(body.customer, { id: 55, mobile: '9999578666', name: 'Priyanka' });
+  assert.deepEqual(body.address.city, { city_id: 3, city_name: 'Gurgaon' });
+  assert.equal(body.address.pinCode, '122001');
+  assert.equal(body.address.gps, '28.45,77.02');
+});
+
+test('null fields are omitted entirely, as Jackson NON_NULL did', () => {
+  const body = legacyJobEntity(PERSISTED_JOB);
+  assert.ok(!('landmark' in body.address), 'a null landmark is absent, not null');
+  const sparse = legacyJobEntity({ job_id: 7, city_id: null, city_name: null });
+  assert.deepEqual(sparse, { id: 7 }, 'an emptied nested object is dropped too, never {}');
+});
+
+// ─── role → shape (legacy served TWO shapes from this one endpoint) ──
 
 // One client, two categories, three service types, four priced services.
 const CATALOG_ROWS = [
@@ -133,8 +213,6 @@ test('category ordering is stable across identical calls', async () => {
   assert.match(fake.calls[0].sql, /ORDER BY cs\.service_catg_id ASC/);
 });
 
-// ─── role → shape (legacy served TWO shapes from this one endpoint) ──
-
 test('only the website role gets the nested category tree', () => {
   assert.equal(catalogShapeForRole('website'), CATALOG_SHAPES.TREE);
   assert.equal(catalogShapeForRole('WebSite'), CATALOG_SHAPES.TREE, 'case-insensitive');
@@ -195,11 +273,13 @@ test('city_name resolves to an id', async () => {
   assert.deepEqual(fake.calls[0].params, ['Gurgaon'], 'trimmed before lookup');
 });
 
-test('an unknown city is reported rather than silently stored as NULL', async () => {
+test('an unknown city surfaces its name so the caller can react', async () => {
   const fake = makeFakePool([[/FROM tbl_city/i, []]]);
   const out = await resolveCityId(fake.pool, { city_name: 'Atlantis' });
-  assert.equal(out.cityId, null);
-  assert.equal(out.unknownName, 'Atlantis', 'caller can turn this into a 400');
+  assert.equal(out.cityId, null, 'stored as NULL, matching legacy');
+  // The route logs this rather than rejecting — legacy accepted such requests
+  // and created the job — but the name has to reach it to be logged at all.
+  assert.equal(out.unknownName, 'Atlantis');
 });
 
 test('a missing city block is not an error — pincode alone can carry the address', async () => {
