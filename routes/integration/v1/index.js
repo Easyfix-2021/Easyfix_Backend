@@ -30,12 +30,18 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 
 // for the whole integration: without it a client cannot book anything.
 router.get('/services', async (req, res, next) => {
   try {
-    logger.info('Integration: fetch service catalog · clientId=' + req.integrationClient.id);
+    // Shape follows the caller's legacy role — see catalogShapeForRole. Logged
+    // because a partner reporting "the response changed" is answered by this
+    // line alone.
+    const shape = catalogShapeForRole(req.integrationClient.role);
+    logger.info('Integration: fetch service catalog · clientId=' + req.integrationClient.id
+      + ' · role=' + (req.integrationClient.role || 'unresolved') + ' · shape=' + shape);
     const data = await clientServiceCatalog(pool, {
       clientId: req.integrationClient.id,
       serviceTypeId: req.query.serviceTypeId,
+      shape,
     });
-    logger.info('Returning ' + data.length + ' service categories');
+    logger.info('Returning ' + data.length + (shape === 'tree' ? ' service categories' : ' service types'));
     legacyOk(res, data);
   } catch (e) { next(e); }
 });

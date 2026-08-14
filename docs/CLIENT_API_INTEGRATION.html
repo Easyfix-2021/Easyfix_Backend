@@ -129,7 +129,19 @@
     top: 24px;
     padding-top: 40px;
     font-size: 0.86rem;
+    /* The index is taller than a short viewport, so it scrolls on its own.
+       Without this the last group (Migrating) is simply unreachable — the
+       sticky element clips at the fold with nowhere to scroll. */
+    max-height: calc(100vh - 48px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding-right: 8px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--rule) transparent;
   }
+  nav.rail::-webkit-scrollbar { width: 8px; }
+  nav.rail::-webkit-scrollbar-thumb { background: var(--rule); border-radius: 4px; }
+  nav.rail::-webkit-scrollbar-track { background: transparent; }
   nav.rail ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
   nav.rail .grp {
     font-family: var(--mono);
@@ -365,7 +377,15 @@
 
   @media (max-width: 900px) {
     .shell { grid-template-columns: 1fr; gap: 0; padding: 0 20px 64px; }
-    nav.rail { position: static; padding: 28px 0 0; border-bottom: 1px solid var(--rule); padding-bottom: 24px; }
+    /* Static below 900px, so the viewport-height cap and its scrollbar must
+       both be released — otherwise the index clips inside the flow. */
+    nav.rail {
+      position: static;
+      padding: 28px 0 24px;
+      border-bottom: 1px solid var(--rule);
+      max-height: none;
+      overflow-y: visible;
+    }
     nav.rail ol { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
     main { padding-top: 32px; }
   }
@@ -537,7 +557,7 @@ curl -u <span class="s">'YOUR_USERNAME:YOUR_PASSWORD'</span> \
     <!-- ═══════════ SERVICES ═══════════ -->
     <section id="services">
       <h2>Service catalogue</h2>
-      <p>Start here. This returns the services your organisation is contracted for, with your prices, grouped by category and service type. The <code>service_id</code> values it returns are what you quote back when creating a job &mdash; nothing can be booked without them.</p>
+      <p>Start here. This returns the services your organisation is contracted for, with your prices. The <code>service_id</code> values it returns are what you quote back when creating a job &mdash; nothing can be booked without them.</p>
 
       <div class="ep">
         <div class="ep-head"><span class="verb get">GET</span><span class="path">/services</span></div>
@@ -595,6 +615,39 @@ curl -u <span class="s">'YOUR_USERNAME:YOUR_PASSWORD'</span> \
               <tr><td class="f">job_charge_type</td><td class="t">integer</td><td>How the charge is applied, per your agreement.</td></tr>
             </tbody>
           </table>
+        </div>
+
+        <h3>Two response shapes</h3>
+        <p>This endpoint returns one of two shapes, decided by how your account is configured. Both carry <strong>identical</strong> <code>service_type</code> objects &mdash; the only difference is whether they are wrapped in categories.</p>
+        <div class="scroll">
+          <table>
+            <thead><tr><th>Shape</th><th><code>data</code> contains</th><th>Read services at</th></tr></thead>
+            <tbody>
+              <tr>
+                <td class="f">Grouped</td>
+                <td>Categories, each with a <code>category_services</code> array</td>
+                <td class="f">data[].category_services[].service_type.services</td>
+              </tr>
+              <tr>
+                <td class="f">Flat</td>
+                <td>Service types directly, with no category wrapper</td>
+                <td class="f">data[].service_type.services</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>The example above is the <strong>grouped</strong> shape. The flat shape is the same thing with the category level removed:</p>
+        <pre>{
+  <span class="k">"status"</span>: <span class="s">"200"</span>, <span class="k">"message"</span>: <span class="s">"OK"</span>,
+  <span class="k">"data"</span>: [
+    { <span class="k">"service_type"</span>: { <span class="k">"service_type_id"</span>: <span class="n">7</span>, <span class="k">"service_type_name"</span>: <span class="s">"Estimate On VISIT"</span>, <span class="k">"services"</span>: [ <span class="c">/* … */</span> ] } },
+    { <span class="k">"service_type"</span>: { <span class="k">"service_type_id"</span>: <span class="n">9</span>, <span class="k">"service_type_name"</span>: <span class="s">"Fixed Price"</span>,       <span class="k">"services"</span>: [ <span class="c">/* … */</span> ] } }
+  ]
+}</pre>
+
+        <div class="note ok">
+          <span class="lbl">Handle both, and you never have to care</span>
+          <p>Your shape is unchanged from the previous API, so existing code keeps working. If you are writing a fresh integration, one line makes it shape-proof &mdash; check whether the first element has <code>category_services</code>, and flatten if it does. Then a configuration change on our side can never break your parser.</p>
         </div>
 
         <div class="note ok">

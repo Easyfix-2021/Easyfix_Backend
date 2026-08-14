@@ -60,6 +60,48 @@ module.exports = async function basicAuth(req, res, next) {
     name: row.client_name || null,
     loginName: row.login_name,
     loginId: row.client_login_id,
+    role: await resolveLegacyRole(row.login_name, row.client_id),
   };
   next();
 };
+
+/*
+ * The caller's LEGACY role name, or null.
+ *
+ * ─── Why this needs its own lookup ───────────────────────────────────────
+ *
+ * We authenticate against tbl_client_website, which has no role column. The
+ * legacy Dropwizard service authenticated against a DIFFERENT table entirely
+ * — tbl_client_user — whose fk_role_id → tbl_client_role.role_name decided
+ * which response shape GET /v1/services returned ("website" got the nested
+ * category tree, "client" got a flat list). Partners parse one or the other,
+ * so the role has to be recovered even though it lives outside our own
+ * credential table.
+ *
+ * Matched on login_name = user_name first: both columns ARE the login
+ * identity, so an exact match is the same principal. Falls back to the
+ * client's own row when the names diverge, since one client may hold several
+ * logins.
+ *
+ * Returns null — never throws — when the legacy tables are absent (a deploy
+ * that never had them) or nothing matches. Callers decide the default; a
+ * missing role must not be able to 500 an endpoint that only needs it to
+ * pick a JSON shape.
+ */
+async function resolveLegacyRole(loginName, clientId) {
+  try {
+    const [[row]] = await pool.query(
+      `SELECT cr.role_name
+         FROM tbl_client_user cu
+         JOIN tbl_client_role cr ON cr.role_id = cu.fk_role_id
+        WHERE cu.user_name = ? OR cu.fk_client_id = ?
+        ORDER BY (cu.user_name = ?) DESC
+        LIMIT 1`,
+      [loginName, clientId, loginName]
+    );
+    return row?.role_name || null;
+  } catch (err) {
+    if (err.code === 'ER_NO_SUCH_TABLE') return null;
+    throw err;
+  }
+}

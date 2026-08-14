@@ -16,6 +16,8 @@ const { makeFakePool } = require('./helpers/fake-pool');
 
 const {
   clientServiceCatalog,
+  catalogShapeForRole,
+  CATALOG_SHAPES,
   resolveCityId,
   paymentCollectedByCode,
   PAYMENT_COLLECTED_BY,
@@ -129,6 +131,52 @@ test('category ordering is stable across identical calls', async () => {
   const fake = catalogPool();
   await clientServiceCatalog(fake.pool, { clientId: 213 });
   assert.match(fake.calls[0].sql, /ORDER BY cs\.service_catg_id ASC/);
+});
+
+// ─── role → shape (legacy served TWO shapes from this one endpoint) ──
+
+test('only the website role gets the nested category tree', () => {
+  assert.equal(catalogShapeForRole('website'), CATALOG_SHAPES.TREE);
+  assert.equal(catalogShapeForRole('WebSite'), CATALOG_SHAPES.TREE, 'case-insensitive');
+  assert.equal(catalogShapeForRole('client'), CATALOG_SHAPES.FLAT);
+  assert.equal(catalogShapeForRole('androidApp'), CATALOG_SHAPES.FLAT);
+  assert.equal(catalogShapeForRole('crm'), CATALOG_SHAPES.FLAT);
+});
+
+test('an unresolved role falls back to the DOCUMENTED (tree) shape', () => {
+  // The legacy role tables are separate from our credential table, so the
+  // role can genuinely be unknown. Defaulting to flat would silently break a
+  // partner who only ever had the published document to build against.
+  for (const unknown of [null, undefined, '', '   ']) {
+    assert.equal(catalogShapeForRole(unknown), CATALOG_SHAPES.TREE, `role=${JSON.stringify(unknown)}`);
+  }
+});
+
+test('flat shape drops the category wrapper and nothing else', async () => {
+  const tree = await clientServiceCatalog(catalogPool().pool, { clientId: 213, shape: CATALOG_SHAPES.TREE });
+  const flat = await clientServiceCatalog(catalogPool().pool, { clientId: 213, shape: CATALOG_SHAPES.FLAT });
+
+  // Every service_type entry survives, across ALL categories.
+  const treeTypes = tree.flatMap((c) => c.category_services);
+  assert.equal(flat.length, treeTypes.length);
+  assert.equal(flat.length, 3, 'two types in category 21 + one in category 30');
+
+  // Each element is still exactly { service_type: {...} } — byte-identical to
+  // the tree's inner object, so a partner reading service_type.services is
+  // unaffected by which branch it got.
+  assert.deepEqual(flat, treeTypes);
+  assert.deepEqual(Object.keys(flat[0]), ['service_type']);
+  assert.ok(!('service_catg_id' in flat[0]), 'no category wrapper survives');
+});
+
+test('flat shape preserves the tree ordering', async () => {
+  const flat = await clientServiceCatalog(catalogPool().pool, { clientId: 213, shape: CATALOG_SHAPES.FLAT });
+  assert.deepEqual(flat.map((e) => e.service_type.service_type_id), [7, 9, 12]);
+});
+
+test('shape defaults to tree when not specified', async () => {
+  const data = await clientServiceCatalog(catalogPool().pool, { clientId: 213 });
+  assert.ok('service_catg_id' in data[0], 'callers that omit shape get the documented tree');
 });
 
 // ─── city resolution ────────────────────────────────────────────────

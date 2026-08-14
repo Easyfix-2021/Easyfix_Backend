@@ -282,7 +282,39 @@ async function checkDecathlonServiceability(pool, { pincode, clientName }) {
  * category order varied between identical calls. We order by category then
  * type so responses are stable and diffable.
  */
-async function clientServiceCatalog(pool, { clientId, serviceTypeId } = {}) {
+/*
+ * Legacy served TWO shapes from this one endpoint, chosen by the caller's
+ * role (ServicesResource.java:57-72):
+ *
+ *   role `website`             → the nested category tree (what the published
+ *                                partner document shows)
+ *   role `client`/`androidApp` → a FLAT [{ service_type: {...} }] list with no
+ *                                category wrapper at all
+ *
+ * Both are reproduced. The inner `service_type` object is byte-identical
+ * between them — `flat` is literally the tree with the category level lifted
+ * off — so a partner reading `service_type.services` never notices, while one
+ * reading `data[].category_services` depends entirely on getting the right
+ * branch. Picking wrongly is a silent parse break, not an error, which is why
+ * the role is resolved per-caller rather than assumed.
+ */
+const CATALOG_SHAPES = Object.freeze({ TREE: 'tree', FLAT: 'flat' });
+
+/**
+ * Legacy role_name → the response shape it received.
+ *
+ * An UNRESOLVED role falls back to the tree, not the flat list. That is the
+ * shape the published partner document shows, so it is what an integrator
+ * who has only ever read the document built against — the better guess when
+ * the legacy role tables can't tell us otherwise.
+ */
+function catalogShapeForRole(roleName) {
+  const role = String(roleName || '').trim().toLowerCase();
+  if (!role) return CATALOG_SHAPES.TREE;
+  return role === 'website' ? CATALOG_SHAPES.TREE : CATALOG_SHAPES.FLAT;
+}
+
+async function clientServiceCatalog(pool, { clientId, serviceTypeId, shape = CATALOG_SHAPES.TREE } = {}) {
   const clauses = ['cs.client_id = ?', 'cs.service_status = 1'];
   const params = [clientId];
   if (Number(serviceTypeId) > 0) {
@@ -348,7 +380,14 @@ async function clientServiceCatalog(pool, { clientId, serviceTypeId } = {}) {
     });
   }
 
-  return [...categories.values()].map(({ _types, ...cat }) => cat);
+  const tree = [...categories.values()].map(({ _types, ...cat }) => cat);
+  if (shape === CATALOG_SHAPES.FLAT) {
+    // Lift the category level off. Legacy reached the same result by grouping
+    // only on service type and never building the category wrapper, so the
+    // ordering matches: categories ascending, types ascending within each.
+    return tree.flatMap((cat) => cat.category_services);
+  }
+  return tree;
 }
 
 /**
@@ -398,6 +437,8 @@ module.exports = {
   checkFirefoxAvailability,
   checkDecathlonServiceability,
   clientServiceCatalog,
+  catalogShapeForRole,
+  CATALOG_SHAPES,
   resolveCityId,
   paymentCollectedByCode,
   PAYMENT_COLLECTED_BY,
