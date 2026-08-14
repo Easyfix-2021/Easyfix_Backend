@@ -306,4 +306,15 @@ test('point values are fixed in code and exposed as published rules', () => {
   // awards would be a broken promise, not a display bug.
   const byCode = Object.fromEntries(config.rules.map((r) => [r.code, r.points]));
   assert.deepEqual(byCode, { RATING: 10, SDA: 30, REFERRAL: 200 });
+
+  // ORDER is part of the contract: both the CRM panel and the app screen
+  // render this array as-is, and "what earns the most?" is the question the
+  // list is read to answer, so the largest sits first.
+  assert.deepEqual(
+    config.rules.map((r) => r.code),
+    ['REFERRAL', 'SDA', 'RATING'],
+    'published rules must be ordered highest-value first',
+  );
+  const points = config.rules.map((r) => r.points);
+  assert.deepEqual(points, [...points].sort((a, b) => b - a), 'strictly descending');
 });

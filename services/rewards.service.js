@@ -73,14 +73,22 @@ const POINTS = Object.freeze({
   referral: 200,
 });
 
-/* Each rule stated the way it is explained to a technician, so the CRM panel
- * and the app screen describe the same programme in the same words. */
+/*
+ * Each rule stated the way it is explained to a technician, so the CRM panel
+ * and the app screen describe the same programme in the same words.
+ *
+ * Ordered by VALUE, highest first. Both surfaces render this array in order,
+ * and "what earns the most?" is the question anyone reads this list to answer
+ * — so the answer sits at the top rather than needing three numbers compared.
+ * The CRM sorts defensively as well, but shipping the array already ordered
+ * means the app gets it without repeating that logic.
+ */
 const EARN_RULES = Object.freeze([
   {
-    code: 'RATING',
-    points: POINTS.rating,
-    label: 'Good Rating',
-    detail: 'A customer rates the job 5 stars and the job was not escalated.',
+    code: 'REFERRAL',
+    points: POINTS.referral,
+    label: 'Refer A Friend',
+    detail: 'Someone joins with your code and completes their first job.',
   },
   {
     code: 'SDA',
@@ -89,10 +97,10 @@ const EARN_RULES = Object.freeze([
     detail: 'You check in on the same day the appointment was booked for.',
   },
   {
-    code: 'REFERRAL',
-    points: POINTS.referral,
-    label: 'Refer A Friend',
-    detail: 'Someone joins with your code and completes their first job.',
+    code: 'RATING',
+    points: POINTS.rating,
+    label: 'Good Rating',
+    detail: 'A customer rates the job 5 stars and the job was not escalated.',
   },
 ]);
 
