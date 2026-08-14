@@ -801,6 +801,12 @@ Location: /api/integration/v1/jobs/212251</span>
   }
 }</pre>
         <p>Store <code>id</code>. Fields with no value are <strong>omitted</strong> rather than sent as <code>null</code>, so treat every key above as optional when parsing.</p>
+
+        <div class="note">
+          <span class="lbl">If you currently call /jobs/newJob</span>
+          <p>Both paths still work and do the same thing. They now return <strong>the response shown above</strong> &mdash; previously <code>/jobs/newJob</code> replied with the <code>{status, message, data}</code> envelope instead. One contract on both paths means you can move to <code>/jobs</code> whenever convenient, or stay where you are.</p>
+          <p>This is the only response anywhere in the API whose shape differs from before, and it affects only <code>/jobs/newJob</code> callers.</p>
+        </div>
         <p>A new job starts as <strong>Pending for scheduling</strong> and moves on once a technician accepts &mdash; you will receive a <a href="#events"><code>TechAssigned</code></a> webhook when that happens.</p>
       </div>
     </section>
@@ -1114,7 +1120,8 @@ Location: /api/integration/v1/jobs/212251</span>
 
       <div class="note ok">
         <span class="lbl">One line of code</span>
-        <p>Change your base URL. Nothing else. Every endpoint path, header, request body and response body is unchanged &mdash; including the status label strings, the <code>201</code>-with-no-envelope reply from job creation, and the <code>{}</code> that <code>jobStatus</code> returns for a missing <code>jobId</code>.</p>
+        <p>Change your base URL. For almost every integration that is the whole migration &mdash; endpoint paths, headers, request bodies and response bodies are unchanged, including the status label strings, the <code>201</code>-with-no-envelope reply from job creation, and the <code>{}</code> that <code>jobStatus</code> returns for a missing <code>jobId</code>.</p>
+        <p>The one exception: if you book through <code>/jobs/newJob</code>, its response now matches <code>/jobs</code> instead of using the envelope. See <a href="#create">Create a job</a>.</p>
       </div>
 
       <div class="scroll">
@@ -1125,6 +1132,11 @@ Location: /api/integration/v1/jobs/212251</span>
               <td><strong>Base URL</strong></td>
               <td class="f">https://core.easyfix.in/v1</td>
               <td class="f">https://backend.easyfix.in/api/integration/v1</td>
+            </tr>
+            <tr>
+              <td><strong><code>/jobs/newJob</code> response</strong></td>
+              <td>The <code>{status, message, data}</code> envelope</td>
+              <td>Same as <code>/jobs</code> &mdash; <code>201</code> with the job at the top level</td>
             </tr>
             <tr>
               <td><strong>Everything else</strong></td>

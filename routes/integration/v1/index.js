@@ -69,6 +69,16 @@ router.get('/serviceType', async (req, res, next) => {
 });
 
 // ─── /v1/jobs — CREATE ───────────────────────────────────────────────
+/*
+ * ONE handler, two paths. Legacy exposed these as separate methods with
+ * DIFFERENT response shapes — /jobs returned the bare entity, /jobs/newJob
+ * returned the {status,message,data} envelope. Serving the /jobs shape from
+ * both is a deliberate choice: a partner then parses one contract whichever
+ * path they call, and can migrate between them without touching their parser.
+ *
+ * The trade is that existing /jobs/newJob callers see a changed body — the
+ * only shape change anywhere in this API — which the client guide calls out.
+ */
 router.post(['/jobs', '/jobs/newJob'], async (req, res, next) => {
   try {
     const b = req.body || {};

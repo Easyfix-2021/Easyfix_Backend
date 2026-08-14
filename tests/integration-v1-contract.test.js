@@ -33,6 +33,27 @@ test('the integration router loads with every import resolved', () => {
   assert.ok(router.stack.length > 20, 'routes registered');
 });
 
+test('/jobs and /jobs/newJob are the SAME handler, so they cannot drift', () => {
+  /*
+   * Legacy exposed these as two methods with two different response shapes:
+   * /jobs returned the bare entity, /jobs/newJob returned the envelope. We
+   * deliberately serve the /jobs shape from both, so a partner on either path
+   * parses one contract. Binding them to a single layer is what guarantees
+   * that — two handlers would eventually diverge.
+   */
+  const router = require('../routes/integration/v1/index.js');
+  const posts = router.stack.filter((l) => l.route?.methods?.post);
+  const create = posts.filter((l) => /jobs/.test(l.route.path) || Array.isArray(l.route.path));
+  const layer = create.find((l) => {
+    const p = l.route.path;
+    return Array.isArray(p) ? p.includes('/jobs') : p === '/jobs';
+  });
+  assert.ok(layer, 'a POST handler covers /jobs');
+  const paths = Array.isArray(layer.route.path) ? layer.route.path : [layer.route.path];
+  assert.ok(paths.includes('/jobs'), 'serves /jobs');
+  assert.ok(paths.includes('/jobs/newJob'), 'and /jobs/newJob from the same layer');
+});
+
 // ─── jobStatus label vocabulary (legacy getJobUIStatus) ─────────────
 
 test('status 0 splits on whether a technician is attached', () => {
