@@ -1712,6 +1712,14 @@ router.put('/:id/hold', validate(idParam, 'params'), validate(holdBody), scopedJ
 router.post('/:id/hold/release', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
   try {
     logger.info('Release fulfillment hold · jobId=' + req.params.id);
+    /*
+     * Written directly rather than through jobService.setStatus(), and that is
+     * deliberate: status 10 maps to the TechVisitInComplete webhook, which the
+     * client ALREADY received when the job first reached 10 before the hold.
+     * Routing this through setStatus would re-fire it and tell Decathlon /
+     * PowerMax / Green Soul that a second visit failed. Releasing a hold is a
+     * restoration, not a new lifecycle event.
+     */
     await pool.query('UPDATE tbl_job SET job_status = 10 WHERE job_id = ?', [req.params.id]);
     logger.info('Fulfillment hold released · jobId=' + req.params.id + ' status=10');
     modernOk(res, { released: true, status: 10 });
