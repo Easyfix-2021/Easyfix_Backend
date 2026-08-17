@@ -1529,6 +1529,9 @@ router.use(require('./lookups'));
 //   /training-videos/percentage · /app-version · /logout · /upi-details
 //   /kyc/aadhaar-pan-exists  (POST — the number travels in the body, never the URL)
 router.use(require('./profile-extra'));
+//   /phe/overview · /phe/months/:month/jobs · /phe/jobs/:jobId
+//   /phe/missed · /phe/withdrawals (bounded Performance/History/Earnings reads)
+router.use('/phe', require('./phe'));
 //   /performance/weekly  (live OTA/SDA weekly chart — net-new GAP #5)
 router.use('/performance', require('./performance'));
 //   /kyc/digilocker/* · /kyc/pan-ocr · /kyc/aadhaar/* · /kyc/bank/verify · /kyc/upi/verify
