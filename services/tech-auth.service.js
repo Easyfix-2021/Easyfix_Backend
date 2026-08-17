@@ -6,6 +6,7 @@ const easyfixerLifecycle = require('./easyfixer-lifecycle.service');
 // Overdue training restricts app capabilities — see findById.
 const lms = require('./lms.service');
 const { withMysqlNamedLock } = require('./mysql-named-lock.service');
+const { istIsPast } = require('../utils/ist-calendar');
 const {
   TECH_ROLE_ID,
   createCanonicalTechnicianUser,
@@ -434,7 +435,9 @@ async function verifyLoginOtp(mobile, otp, { onVerifiedTech } = {}) {
     logger.warn('OTP verify failed · reason=NO_OTP_ISSUED');
     return { ok: false, reason: 'NO_OTP_ISSUED' };
   }
-  if (row.is_expired || new Date(row.valid_up_to).getTime() < Date.now()) {
+  // istIsPast, not `new Date(str)` — see utils/ist-calendar.js. A bare parse
+  // of this IST wall-clock column gave every technician LOGIN otp 5h30m.
+  if (row.is_expired || istIsPast(row.valid_up_to)) {
     // Conditional expiry cannot invalidate a freshly re-issued code that won
     // the issue/verify named lock after this stale read.
     await pool.query(
@@ -465,7 +468,7 @@ async function verifyLoginOtp(mobile, otp, { onVerifiedTech } = {}) {
       [row.id, mobile],
     );
     if (!current) return { ok: false, reason: 'NO_OTP_ISSUED' };
-    if (current.is_expired || new Date(current.valid_up_to).getTime() < Date.now()) {
+    if (current.is_expired || istIsPast(current.valid_up_to)) {
       return { ok: false, reason: 'OTP_EXPIRED' };
     }
     if (Number(current.otp) !== Number(otp)) {

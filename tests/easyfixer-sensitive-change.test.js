@@ -339,18 +339,21 @@ test('the mobile change requires the NEW sensitive key, not the broad isEdit', a
 /* ────────────────────────────── bank ───────────────────────────────────── */
 
 /*
- * "YYYY-MM-DD HH:mm:ss" in the RUNNING PROCESS'S wall clock — the same shape
- * mysql2 hands back with dateStrings: true, and the same shape
- * easyfixer-profile-otp.service.js compares against with
- * `new Date() > new Date(row.profile_update_otp_valid_up_to)`. Built from
- * local getters rather than toISOString() so the fixture means the same thing
- * to that comparison whatever TZ the test host runs in.
+ * "YYYY-MM-DD HH:mm:ss" in IST — exactly what mysql2 hands back for a DATETIME
+ * under `dateStrings: true` with the pool's +05:30 session timezone.
+ *
+ * This used to build a PROCESS-LOCAL stamp, which matched the old
+ * `new Date(str)` comparison in easyfixer-profile-otp.service.js. That made
+ * the fixture a model of the BUG rather than of the database: it agreed with
+ * the code on a laptop set to Asia/Kolkata and disagreed on a UTC pod, so the
+ * suite could not have caught the 5h30m expiry drift.
+ *
+ * Built by shifting the instant into IST and formatting from the ISO string,
+ * so it produces the same value in every timezone.
  */
 function wallClock(ms) {
-  const d = new Date(ms);
-  const pad = (n) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} `
-    + `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+  return new Date(ms + IST_OFFSET_MS).toISOString().slice(0, 19).replace('T', ' ');
 }
 
 function validOtpScenario(otp = 8642) {

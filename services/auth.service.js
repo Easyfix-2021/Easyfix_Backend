@@ -2,6 +2,7 @@ const { pool } = require('../db');
 const logger = require('../logger');
 const { resolveLoginOtp, staticLoginOtpFor, otpExpiryDate } = require('../utils/otp');
 const { signUserToken } = require('../utils/jwt');
+const { istIsPast } = require('../utils/ist-calendar');
 
 /*
  * Auth model reality (2026-04-17):
@@ -227,7 +228,9 @@ async function verifyLoginOtp(identifier, otp) {
 
   if (!row) return { ok: false, reason: 'NO_OTP_ISSUED' };
   if (row.is_expired === true || row.is_expired === 1) return { ok: false, reason: 'OTP_EXPIRED' };
-  if (new Date(row.valid_up_to).getTime() < Date.now()) {
+  // istIsPast, not `new Date(str)`: valid_up_to is an IST wall-clock string,
+  // and a bare parse on a UTC pod grants this LOGIN otp an extra 5h30m.
+  if (istIsPast(row.valid_up_to)) {
     await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
     return { ok: false, reason: 'OTP_EXPIRED' };
   }

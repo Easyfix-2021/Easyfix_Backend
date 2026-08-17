@@ -15,6 +15,7 @@
 const { resolveMobileOtp, otpExpiryDate } = require('../utils/otp');
 const gallabox = require('./gallabox.whatsapp.service');
 const logger = require('../logger');
+const { istIsPast } = require('../utils/ist-calendar');
 
 /**
  * Generate a 4-digit OTP, write it to tbl_easyfixer.profile_update_otp /
@@ -117,8 +118,13 @@ async function verifyOtp(efrId, otp, pool) {
     return { valid: false };
   }
 
-  // Check TTL.
-  if (new Date() > new Date(row.profile_update_otp_valid_up_to)) {
+  /*
+   * Check TTL. istIsPast, not `new Date(str)` — the column is an IST
+   * wall-clock string and a bare parse resolves it in the PROCESS timezone,
+   * so on a UTC pod this 5-minute code lived 5h30m. Correct on a laptop set
+   * to Asia/Kolkata, wrong everywhere it matters.
+   */
+  if (istIsPast(row.profile_update_otp_valid_up_to)) {
     // Consume so it cannot be retried after expiry.
     await pool.query(
       `UPDATE tbl_easyfixer

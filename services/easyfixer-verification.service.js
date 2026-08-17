@@ -750,8 +750,18 @@ async function saveActivation(efrId, body, actor) {
   }
   // Banking: easyfix_bank_name_id + beneficiary_id (Edit Finance Details).
   if (body.easyfix_bank_name_id !== undefined || body.beneficiary_id !== undefined) {
+    /*
+     * `efr_bank_id`, not `id` — tbl_easyfixer_bank_details has no `id`
+     * column, so this threw ER_BAD_FIELD_ERROR and took the whole
+     * saveActivation call down whenever an operator edited Finance Details.
+     * Every other reader of this table uses efr_bank_id (see
+     * services/mobile-profile-extra.service.js:735).
+     *
+     * The value is only tested for truthiness — update-vs-insert — so the
+     * column choice never mattered beyond being a real one.
+     */
     const [[existing]] = await pool.query(
-      `SELECT id FROM tbl_easyfixer_bank_details WHERE efr_id = ? LIMIT 1`,
+      `SELECT efr_bank_id FROM tbl_easyfixer_bank_details WHERE efr_id = ? LIMIT 1`,
       [efrId]
     );
     if (existing) {
