@@ -12,7 +12,12 @@ const {
 } = require('../../validators/job.validator');
 const { assertEntityInScope } = require('../../lib/scope');
 const requireStageForTransition = require('../../middleware/require-stage');
+// Still used by GET /escalated/export.xlsx (small, styled, buffered — fine
+// at that size). The big Manage Job Report uses the streaming writer below.
 const { streamStyledXlsx } = require('../../utils/xlsx-styled-export');
+const { streamRowsToXlsx } = require('../../utils/xlsx-stream-export');
+const { EXPORT_COLUMNS, fetchExportChunk, mapExportRow } = require('../../services/job-export.service');
+const { todayIst } = require('../../utils/ist-calendar');
 const ttlCache = require('../../utils/ttl-cache');
 
 /*
@@ -316,19 +321,25 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
 /*
  * GET /api/admin/jobs/export.xlsx
  *
- * Styled XLSX export of the Filter-Job panel result set. Accepts every
- * filter the list endpoint accepts (validated by the same listQuery
- * schema, with pagination params dropped) and applies the same RBAC
- * scope, so the operator's export reflects exactly what they see in
- * the table — minus the page boundary.
+ * STREAMING XLSX export of the Filter-Job panel result set — the full
+ * 74-column Manage Job Report. Accepts every filter the list endpoint
+ * accepts (validated by the same listQuery schema, with pagination
+ * params dropped) and applies the same RBAC scope, so the operator's
+ * export reflects exactly what they see in the table — minus the page
+ * boundary.
  *
- * Soft cap: 100,000 rows. Lifted from the original 5,000 limit so
- * operators can export the entire active dataset without first
- * narrowing the filters — the legacy CRM didn't enforce a cap at all
- * here. 100k is still bounded (a styled xlsx for that count writes
- * ~50-80MB and finishes in ~30s), but the BE response includes a
- * `truncated` flag when the cap is hit so the FE can warn the
- * operator that not every matching row landed in the file.
+ * Memory model (this is the whole point of the rewrite): rows are pulled
+ * in keyset-paginated chunks and handed to the writer one at a time, so
+ * heap holds ONE chunk, never the result set. The previous version
+ * called job.list({ limit: 100000 }) and materialised the rows, the
+ * mapped rows, and a fully-built workbook simultaneously; the legacy
+ * Java exporter did the same with POI and took the box down.
+ *
+ * Keyset (job_id > cursor) rather than LIMIT/OFFSET: OFFSET 98000 makes
+ * MySQL walk and discard 98,000 rows on every page, so the last chunks
+ * of a big export cost the most. It also can't skip or duplicate rows
+ * when the underlying table changes mid-export.
+ *
  * Free-text `q` is honoured here unlike the escalated export — on the
  * jobs list `q` IS the operator-supplied filter, not an in-table
  * client-side search.
@@ -336,117 +347,79 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
  * Mounted BEFORE `/:id` so Express doesn't try to parse "export" as a
  * job id (same gotcha as `/counts`, `/escalated`, `/comment-reasons`).
  */
+
+// One DB round-trip per 2,000 rows. Sized against the two costs that pull
+// in opposite directions: mysql2 buffers a whole result set in memory
+// before we see it (so a chunk of 2,000 × ~74 columns is a few MB — bounded
+// and predictable), while a smaller chunk would turn a 100k-row export into
+// hundreds of round-trips, each paying the joins' fixed setup cost. 2,000
+// keeps a 100k export at ~50 queries with a flat memory profile.
+const EXPORT_CHUNK_SIZE = 2000;
+
+// Hard ceiling. Legacy had NO cap: a mis-set (or empty) filter would try to
+// stream the entire tbl_job history, which is how the old exporter took the
+// server down. The stream stops here and logs a warning rather than running
+// unbounded; 200k is comfortably above any legitimate operator export.
+const EXPORT_ROW_CEILING = 200000;
+
 router.get('/export.xlsx', validate(listQuery, 'query'), async (req, res, next) => {
+  const startedAt = Date.now();
   try {
-    const { buildRequestScopeWithHierarchy } = require('../../lib/scope');
-    const { pool } = require('../../db');
     logger.info('Export jobs xlsx · status=' + (req.query.status ?? '-') + ' clientId=' + (req.query.clientId ?? '-') + ' from=' + (req.query.startDate || '-') + ' to=' + (req.query.endDate || '-'));
-    const scope = await buildRequestScopeWithHierarchy(req, pool);
 
-    // Reuse the list() builder. Strip pagination — we want the
-    // complete filtered set up to the safety ceiling.
-    const EXPORT_CAP = 100000;
-    const { rows, total } = await job.list({
-      ...req.query,
-      limit: EXPORT_CAP,
-      offset: 0,
-      scope,
-      // Job Stage Access — the export mirrors exactly what the operator sees.
-      allowedStages: req.allowedStages,
+    // RBAC must survive the rewrite. req.scope is the hierarchy-unioned
+    // scope attached by routes/admin/index.js (same buildRequestScopeWithHierarchy
+    // the old handler called inline), and req.allowedStages is Job Stage
+    // Access. Drop either one and the export silently leaks rows the
+    // operator cannot see in the table.
+    const filters = { ...req.query, scope: req.scope, allowedStages: req.allowedStages };
+
+    let capped = false;
+
+    async function* exportRows() {
+      let afterJobId = null; // keyset cursor — null = first chunk
+      let seq = 1;           // 1-based serial number column
+      for (;;) {
+        const chunk = await fetchExportChunk({ filters, afterJobId, chunkSize: EXPORT_CHUNK_SIZE });
+        if (!Array.isArray(chunk) || chunk.length === 0) return;
+
+        for (const raw of chunk) {
+          if (seq > EXPORT_ROW_CEILING) {
+            capped = true;
+            logger.warn('Jobs export hit the ' + EXPORT_ROW_CEILING.toLocaleString('en-IN') + '-row safety ceiling — file truncated. Narrow the filters.');
+            return;
+          }
+          yield mapExportRow(raw, seq++);
+        }
+
+        // Short chunk = last page. Advance the cursor otherwise.
+        if (chunk.length < EXPORT_CHUNK_SIZE) return;
+        afterJobId = chunk[chunk.length - 1].job_id;
+      }
+    }
+
+    await streamRowsToXlsx(res, {
+      filename: `ManageJobReport_${todayIst()}.xlsx`,
+      sheetName: 'Report',
+      columns: EXPORT_COLUMNS,
+      rowSource: exportRows(),
+      onFinish: ({ rowCount, elapsedMs }) => {
+        logger.info('Jobs export finished · ' + rowCount.toLocaleString('en-IN') + ' rows in ' + elapsedMs + 'ms' + (capped ? ' (CAPPED)' : ''));
+      },
     });
-    const truncated = total > EXPORT_CAP;
-    logger.info('Streaming jobs export · ' + rows.length + ' rows (total=' + total + ', truncated=' + truncated + ')');
-
-    // Status enum → human label. Mirrors STATUS_LABEL in
-    // /escalated/export.xlsx + the FE statusLabel utility.
-    const STATUS_LABEL = {
-      0: 'Booked', 1: 'Scheduled', 2: 'In Progress',
-      3: 'Completed', 5: 'Completed', 6: 'Cancelled',
-      7: 'Enquiry', 9: 'Unconfirmed', 10: 'Revisit',
-      15: 'Estimate Pending', 20: 'Pending to Close', 21: 'Followup',
-    };
-    const dateOnly = (d) => {
-      if (!d) return '';
-      const dt = new Date(d);
-      if (Number.isNaN(+dt)) return String(d);
-      return dt.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
-    };
-    const timeOnly = (d) => {
-      if (!d) return '';
-      const dt = new Date(d);
-      if (Number.isNaN(+dt)) return '';
-      return dt.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: true });
-    };
-
-    const xlsxRows = rows.map((r) => ({
-      job_id:        r.job_id,
-      job_ref:       r.job_reference_id || '',
-      client_ref:    r.client_ref_id || '',
-      status:        STATUS_LABEL[r.job_status] || `Status ${r.job_status}`,
-      job_type:      r.job_type || '',
-      source:        r.source_type || '',
-      customer_name: r.customer_name || '',
-      customer_mob:  r.customer_mob_no || '',
-      client:        r.client_name || '',
-      city:          r.city_name || '',
-      easyfixer:     r.easyfixer_name || '',
-      job_owner:     r.owner_name || '',
-      booked_date:   dateOnly(r.created_date_time),
-      booked_time:   timeOnly(r.created_date_time),
-      appt_date:     dateOnly(r.requested_date_time),
-      appt_time:     timeOnly(r.requested_date_time),
-      scheduled:     r.scheduled_date_time ? dateOnly(r.scheduled_date_time) : '',
-      checkout:      r.checkout_date_time ? dateOnly(r.checkout_date_time) : '',
-      time_slot:     r.time_slot || '',
-      remarks:       r.remarks || '',
-    }));
-
-    const today = new Date().toISOString().slice(0, 10);
-    const filterBits = [];
-    if (req.query.status     != null) filterBits.push(`Status ${STATUS_LABEL[req.query.status] || req.query.status}`);
-    if (req.query.statuses   != null) filterBits.push(`Statuses ${req.query.statuses}`);
-    if (req.query.clientId   != null) filterBits.push(`Client #${req.query.clientId}`);
-    if (req.query.cityId     != null) filterBits.push(`City #${req.query.cityId}`);
-    if (req.query.stateId    != null) filterBits.push(`State #${req.query.stateId}`);
-    if (req.query.startDate)          filterBits.push(`From ${dateOnly(req.query.startDate)}`);
-    if (req.query.endDate)            filterBits.push(`To ${dateOnly(req.query.endDate)}`);
-    if (req.query.q)                  filterBits.push(`Search "${req.query.q}"`);
-    const meta = [
-      filterBits.length ? `Filters: ${filterBits.join(', ')}` : 'Filters: none',
-      `Generated: ${new Date().toLocaleString('en-IN')}`,
-      `Total: ${xlsxRows.length.toLocaleString('en-IN')} job${xlsxRows.length === 1 ? '' : 's'}${truncated ? ` (truncated — ${total.toLocaleString('en-IN')} match)` : ''}`,
-    ].join('    ·    ');
-
-    await streamStyledXlsx(res, `jobs_${today}.xlsx`, {
-      title: 'EasyFix  ·  Jobs',
-      meta,
-      sheetName: 'Jobs',
-      columns: [
-        { header: 'Job ID',         key: 'job_id',        width: 10, align: 'center' },
-        { header: 'Job Ref',        key: 'job_ref',       width: 16, align: 'left'   },
-        { header: 'Client Ref',     key: 'client_ref',    width: 18, align: 'left'   },
-        { header: 'Status',         key: 'status',        width: 14, align: 'center' },
-        { header: 'Type',           key: 'job_type',      width: 14, align: 'left'   },
-        { header: 'Source',         key: 'source',        width: 12, align: 'left'   },
-        { header: 'Customer',       key: 'customer_name', width: 22, align: 'left'   },
-        { header: 'Customer Mob',   key: 'customer_mob',  width: 14, align: 'left'   },
-        { header: 'Client',         key: 'client',        width: 22, align: 'left'   },
-        { header: 'City',           key: 'city',          width: 16, align: 'left'   },
-        { header: 'EasyFixer',      key: 'easyfixer',     width: 22, align: 'left'   },
-        { header: 'Job Owner',      key: 'job_owner',     width: 20, align: 'left'   },
-        { header: 'Booked Date',    key: 'booked_date',   width: 14, align: 'left'   },
-        { header: 'Booked Time',    key: 'booked_time',   width: 12, align: 'center' },
-        { header: 'Appt Date',      key: 'appt_date',     width: 14, align: 'left'   },
-        { header: 'Appt Time',      key: 'appt_time',     width: 12, align: 'center' },
-        { header: 'Scheduled',      key: 'scheduled',     width: 14, align: 'left'   },
-        { header: 'Checkout',       key: 'checkout',      width: 14, align: 'left'   },
-        { header: 'Time Slot',      key: 'time_slot',     width: 14, align: 'left'   },
-        { header: 'Remarks',        key: 'remarks',       width: 42, align: 'left'   },
-      ],
-      rows: xlsxRows,
-      emptyMessage: 'No jobs matched the current filters.',
-    });
-  } catch (e) { next(e); }
+  } catch (e) {
+    // Once bytes are on the wire the 200 + attachment headers are already
+    // sent, so there is no JSON error to fall back to — streamRowsToXlsx has
+    // logged the cause and destroyed the response. Handing it to next() here
+    // would only make Express attempt a second, impossible send.
+    // A failure on the FIRST chunk (nothing written yet) does NOT carry this
+    // flag, so a dead DB still produces a normal JSON 500.
+    if (e && e.xlsxStreamAborted) {
+      logger.warn('Jobs export ended without a complete file after ' + (Date.now() - startedAt) + 'ms');
+      return;
+    }
+    next(e);
+  }
 });
 
 /*
