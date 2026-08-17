@@ -632,7 +632,37 @@ async function listParticipants(friendlyName) {
  * provider-side ceiling, this attribute is the product-side one, and the reaper
  * is the backstop for a room that somehow outlives both.
  *
- * `opts` is optional so the documented one-argument call still works.
+ * RECORDING (added 2026-08-17). A <Record> ELEMENT placed BEFORE
+ * <MultiPartyCall>, exactly as the 1:1 bridge places it before <Dial>. Until
+ * now conference calls were NEVER recorded — this element did not exist here,
+ * and the service's own checklist said "we do not call Record" — so
+ * tbl_plivo_call_log.recording_url was NULL on every conference leg while the
+ * Call History UI still offered a Play button. Verified on job #528792: five
+ * legs, five blank recording_urls.
+ *
+ * WHY THE ELEMENT AND NOT AN ATTRIBUTE. This codebase has already paid for that
+ * lesson once: `<Dial record="true">` is not a real attribute, Plivo ignored it
+ * silently, and every recording was NULL for months (see buildAnswerXml's note
+ * in plivo.service.js). Adding `record="true"` to <MultiPartyCall> would be the
+ * same bet on the same table. <Record> is a documented element whose behaviour
+ * is already proven in production on the bridge path, and it needs no new API
+ * call, no `name_`-prefix guesswork, and no new endpoint.
+ *
+ * WHY NO startOnDialAnswer. On the bridge path that defers recording until the
+ * B-leg answers, skipping ring-time dead air. There is no <Dial> here, so the
+ * flag has nothing to key on; recordSession begins with the operator's session.
+ * A few seconds of the operator alone is the correct trade — participants join
+ * later and MUST be inside the recording.
+ *
+ * recordSession/stereo/fileFormat and the callbackUrl are the same values the
+ * bridge uses, so the EXISTING /api/public/plivo/recording-callback handler and
+ * plivoLog.setRecording() persist this with no change — and setRecording is
+ * already written for this case ("A Multi-Party Call has ONE recording of the
+ * room… it belongs on the operator's leg").
+ *
+ * `opts` is optional so the documented one-argument call still works, and
+ * omitting recordingCallbackUrl yields byte-for-byte the previous XML — so a
+ * caller that has not been updated is unchanged rather than broken.
  */
 function operatorAnswerXml(friendlyName, opts = {}) {
   const name = String(friendlyName || '').trim();
@@ -655,7 +685,17 @@ function operatorAnswerXml(friendlyName, opts = {}) {
     attrs.push(`statusCallbackMethod="${xmlAttr(XML.statusCallbackMethod)}"`);
     attrs.push(`statusCallbackEvents="${xmlAttr(XML.statusCallbackEvents)}"`);
   }
-  return `<?xml version="1.0" encoding="UTF-8"?>\n<Response><MultiPartyCall ${attrs.join(' ')}>${xmlText(name)}</MultiPartyCall></Response>`;
+  /*
+   * <Record> is background + non-blocking, so placing it first starts the
+   * session recording and Plivo proceeds straight into <MultiPartyCall>. Same
+   * ordering and the same attribute set the bridge path uses.
+   */
+  let recordEl = '';
+  if (opts.recordingCallbackUrl) {
+    recordEl = '<Record recordSession="true" fileFormat="mp3" recordChannelType="stereo"'
+      + ` callbackUrl="${xmlAttr(opts.recordingCallbackUrl)}" callbackMethod="POST"/>`;
+  }
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>${recordEl}<MultiPartyCall ${attrs.join(' ')}>${xmlText(name)}</MultiPartyCall></Response>`;
 }
 
 // ─────────────────────────── DB: create ────────────────────────────────────

@@ -81,8 +81,20 @@ router.get('/answer', async (req, res) => {
    * conference, so every non-conference caller behaves exactly as before.
    */
   if (claims.conf) {
-    logger.info('Plivo answer: joining conference · jci=' + claims.jci + ' · conf=' + claims.conf);
-    xml(conference.operatorAnswerXml(claims.conf, { confId: claims.confId || null }));
+    logger.info('Plivo answer: joining conference · jci=' + claims.jci + ' · conf=' + claims.conf
+      + ' · record=' + (record ? 'yes' : 'no'));
+    /*
+     * Recording rides the SAME switch and the SAME callback as the bridge below
+     * — plivo.recordingEnabled() and the jci-keyed token — so a conference is
+     * recorded exactly when a 1:1 call would be. Conferences were previously
+     * never recorded at all (no <Record> element existed in the MPC answer XML),
+     * which is why every conference leg had a NULL recording_url while the Call
+     * History UI still offered Play.
+     */
+    xml(conference.operatorAnswerXml(claims.conf, {
+      confId: claims.confId || null,
+      recordingCallbackUrl: record ? plivo.recordingCallbackUrl(claims.jci) : null,
+    }));
 
     /*
      * NOW dial the receiver into the room — AFTER the XML has gone back, never
@@ -189,8 +201,14 @@ async function webAnswer(req, res) {
    * dialId crosses to the browser and is deliberately opaque.
    */
   if (resolved.conferenceName) {
-    logger.info('Plivo web-answer: joining conference · jci=' + resolved.jci + ' · conf=' + resolved.conferenceName);
-    xml(conference.operatorAnswerXml(resolved.conferenceName, { confId: resolved.conferenceId || null }));
+    logger.info('Plivo web-answer: joining conference · jci=' + resolved.jci + ' · conf=' + resolved.conferenceName
+      + ' · record=' + (record ? 'yes' : 'no'));
+    // Same recording wiring as the mobile branch above — BOTH answer routes must
+    // carry it, or recording would silently depend on voice.call.mode.
+    xml(conference.operatorAnswerXml(resolved.conferenceName, {
+      confId: resolved.conferenceId || null,
+      recordingCallbackUrl: record ? plivo.recordingCallbackUrl(resolved.jci) : null,
+    }));
     /*
      * Dial the receiver in only NOW — the operator's browser leg is connected.
      * Same reasoning as the mobile branch: adding them when the call was PLACED
