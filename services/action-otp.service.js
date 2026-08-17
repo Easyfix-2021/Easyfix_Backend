@@ -1,6 +1,7 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const { resolveMobileOtp, otpExpiryDate } = require('../utils/otp');
+const { istIsPast } = require('../utils/ist-calendar');
 
 /*
  * Action-OTP service — sends a one-time code to the CURRENTLY logged-in
@@ -135,7 +136,10 @@ async function verifyActionOtp(admin, action, otp) {
 
   if (!row) return { valid: false, reason: 'NO_OTP_ISSUED' };
   if (row.is_expired === true || row.is_expired === 1) return { valid: false, reason: 'OTP_EXPIRED' };
-  if (new Date(row.valid_up_to).getTime() < Date.now()) {
+  // Explicit IST parse rather than relying on the process TZ pin in
+  // server.js. This is an auth path: it should stay correct even if a future
+  // entry point (a worker, a one-off script) never loads that file.
+  if (istIsPast(row.valid_up_to)) {
     await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
     return { valid: false, reason: 'OTP_EXPIRED' };
   }

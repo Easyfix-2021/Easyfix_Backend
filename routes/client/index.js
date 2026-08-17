@@ -11,6 +11,7 @@ const { sendXlsx } = require('../../utils/xlsx-export');
 const { STATUS_LABELS } = require('../../services/integration.service');
 const emailService = require('../../services/email.service');
 const logger = require('../../logger');
+const { istIsPast } = require('../../utils/ist-calendar');
 
 // ─── Public: SPOC OTP login ─────────────────────────────────────────
 const identifier = Joi.alternatives(Joi.string().email(), Joi.string().pattern(/^[0-9]{10}$/));
@@ -799,7 +800,8 @@ router.post('/profile/change-phone/verify-otp', async (req, res, next) => {
       `SELECT id, otp, valid_up_to, is_expired FROM otp_details
         WHERE user_mobile_no = ? AND otp_type = 'Change Number' ORDER BY id DESC LIMIT 1`, [phone]);
     if (!row) return modernError(res, 400, 'No OTP was requested for this number.');
-    if (row.is_expired || new Date(row.valid_up_to) < new Date()) {
+    // Explicit IST parse — valid_up_to is an IST wall-clock string.
+    if (row.is_expired || istIsPast(row.valid_up_to)) {
       await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
       return modernError(res, 400, 'OTP has expired. Please request a new one.');
     }

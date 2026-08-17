@@ -1,3 +1,43 @@
+/*
+ * ═══════════════════════════════════════════════════════════════════════
+ * PROCESS TIMEZONE — must be the FIRST thing this file does.
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ * This whole system speaks IST. The pool runs `timezone: '+05:30'` with
+ * `dateStrings: true`, so every DATETIME arrives as an IST WALL-CLOCK string
+ * carrying no offset — "2026-08-17 14:30:00" means half past two in India.
+ *
+ * `new Date("2026-08-17 14:30:00")` parses such a string in the PROCESS's
+ * timezone. The containers set no TZ and therefore run UTC, so every one of
+ * those parses landed 5 hours 30 minutes late. That is not theoretical: it
+ * gave every OTP in the system — staff login, technician login, profile
+ * update, bank change — a 5h35m life instead of 5 minutes, and the same
+ * class of error sits behind WhatsApp session windows, short-link expiry,
+ * notice publish windows and cached-snapshot TTLs.
+ *
+ * The reason it survived so long is that it is INVISIBLE IN DEVELOPMENT: a
+ * laptop set to Asia/Kolkata parses those strings correctly by accident, so
+ * the bug only exists where nobody is looking at it.
+ *
+ * Pinning TZ here makes the process agree with the database by default, so a
+ * plain `new Date(dbString)` is correct rather than accidentally correct. It
+ * is set in code rather than left to the container because the deployment
+ * that forgets it is exactly the one that breaks, and silently.
+ *
+ * Set BEFORE any require that might construct a Date — Node reads TZ lazily,
+ * so assigning it first is what makes it apply process-wide.
+ *
+ * An explicit TZ env var still wins, so a deployment can override this
+ * deliberately; it just cannot end up in UTC by omission.
+ *
+ * Code that already shifts an instant into IST by hand (utils/ist-calendar,
+ * job.service's formatMysqlDateTimeIST, whatsapp-conversation) is unaffected:
+ * every one of them reads the shifted value back through the getUTC getters
+ * or toISOString, both of which ignore the process timezone. Verified before
+ * setting this.
+ */
+process.env.TZ = process.env.TZ || 'Asia/Kolkata';
+
 require('dotenv').config();
 
 const express = require('express');

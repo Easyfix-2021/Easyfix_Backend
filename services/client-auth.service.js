@@ -2,6 +2,7 @@ const { pool } = require('../db');
 const logger = require('../logger');
 const { resolveLoginOtp, otpExpiryDate } = require('../utils/otp');
 const jwt = require('jsonwebtoken');
+const { istIsPast } = require('../utils/ist-calendar');
 
 /*
  * Client SPOC authentication — distinct from internal-user auth.
@@ -151,7 +152,9 @@ async function verifyLoginOtp(identifier, otp) {
   );
   if (!row) logger.warn('Verify login OTP · reason=NO_OTP_ISSUED · spocId=' + spoc.id);
   if (!row) return { ok: false, reason: 'NO_OTP_ISSUED' };
-  if (row.is_expired || new Date(row.valid_up_to).getTime() < Date.now()) {
+  // Explicit IST parse — see services/auth.service.js. Auth paths do not
+  // rely on the process TZ being pinned.
+  if (row.is_expired || istIsPast(row.valid_up_to)) {
     await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
     logger.warn('Verify login OTP · reason=OTP_EXPIRED · spocId=' + spoc.id);
     return { ok: false, reason: 'OTP_EXPIRED' };
