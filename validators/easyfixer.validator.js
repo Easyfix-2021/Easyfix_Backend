@@ -290,6 +290,47 @@ const serviceablePincodesBody = Joi.object({
 });
 
 /*
+ * ─── Sensitive change (mobile / bank) ──────────────────────────────
+ *
+ * Bodies for PATCH /:id/mobile and PATCH /:id/bank. `reason` is REQUIRED on
+ * both and is a real control, not paperwork: these two endpoints are account
+ * takeover (efr_no is the technician's login identity) and payment
+ * redirection, and the mobile path deliberately has no OTP — so the reason
+ * plus the audit row are what an investigation actually reads.
+ */
+const sensitiveMobileBody = Joi.object({
+  // Reuses the shared 10-digit `mobile` definition above, so this endpoint
+  // cannot diverge from what create/update accept.
+  mobile: mobile.required(),
+  reason: Joi.string().trim().min(1).max(500).required(),
+});
+
+const sensitiveBankBody = Joi.object({
+  // 4-digit WhatsApp OTP from services/easyfixer-profile-otp.service.js.
+  // Accepts string or number — verifyOtp compares numerically, and the column
+  // is an INT, but a JSON body may carry either.
+  otp: Joi.alternatives()
+    .try(
+      Joi.string().trim().pattern(/^[0-9]{4}$/),
+      Joi.number().integer().min(1000).max(9999),
+    )
+    .required()
+    .messages({ 'alternatives.match': 'OTP must be exactly 4 digits' }),
+  // Same account/IFSC patterns the app's first-time flow enforces
+  // (routes/mobile/index.js POST /bank-details) — one contract, two doors.
+  accountNumber: Joi.string().trim().pattern(/^[0-9]{9,18}$/).required()
+    .messages({ 'string.pattern.base': 'Account number must be 9-18 digits' }),
+  ifsc: Joi.string().trim().pattern(/^[A-Za-z]{4}0[A-Za-z0-9]{6}$/).required()
+    .messages({ 'string.pattern.base': 'IFSC must be 4 letters, a 0, then 6 characters' }),
+  bankName: Joi.string().trim().max(255).optional(),
+  // Optional: the vendor returns the name on the account, which is more
+  // authoritative than a transcription from a cheque. Supplied value wins;
+  // the vendor's is the fallback.
+  accountHolderName: Joi.string().trim().min(1).max(255).optional(),
+  reason: Joi.string().trim().min(1).max(500).required(),
+});
+
+/*
  * Registered Easyfixers queue (parity port of legacy efer-registration).
  *   registrationStatus: 1 New Lead · 2 In Progress · 3 Details Not Available ·
  *     5 Not Eligible · 6 Send To Finance · 7 Activation Pending ·
@@ -319,4 +360,5 @@ module.exports = {
   commentBody, leadVerificationBody, professionalBody, personalFamilyBody,
   bankingVerificationBody, identityVerificationBody, activationBody,
   mapClientsBody, bgvReportBody, optionMappingsBody, serviceablePincodesBody,
+  sensitiveMobileBody, sensitiveBankBody,
 };

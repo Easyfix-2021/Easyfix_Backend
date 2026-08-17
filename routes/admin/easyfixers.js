@@ -9,6 +9,7 @@ const verification = require('../../services/easyfixer-verification.service');
 const profileUpdateLink = require('../../services/easyfixer-profile-update-link.service');
 const { signEasyfixerProfileToken } = require('../../utils/jwt');
 const requireAction = require('../../middleware/require-action');
+const { rateLimit } = require('../../middleware/rate-limit');
 const { pool } = require('../../db');
 const jobLocation = require('../../services/job-location.service');
 const { modernOk, modernError } = require('../../utils/response');
@@ -20,7 +21,10 @@ const {
   commentBody, leadVerificationBody, professionalBody, personalFamilyBody,
   bankingVerificationBody, identityVerificationBody, activationBody, mapClientsBody, bgvReportBody,
   optionMappingsBody, serviceablePincodesBody,
+  sensitiveMobileBody, sensitiveBankBody,
 } = require('../../validators/easyfixer.validator');
+const sensitiveChange = require('../../services/easyfixer-sensitive-change.service');
+const profileOtp = require('../../services/easyfixer-profile-otp.service');
 const { buildRequestScope, assertEntityInScope } = require('../../lib/scope');
 
 // Local Joi schema for the profile-update-link send action. Mirrors
@@ -820,6 +824,177 @@ router.get('/:id/profile-update-link/dev-url',
     } catch (e) {
       if (e && typeof e.status === 'number') {
         logger.warn('Mint dev profile-update link failed · id=' + req.params.id + ' · ' + e.message);
+        return modernError(res, e.status, e.message || 'request failed');
+      }
+      next(e);
+    }
+  });
+
+/*
+ * ─── Sensitive details: MOBILE + BANK ────────────────────────────────
+ *
+ * These three endpoints are separated from the rest of this file — and from
+ * the `isEdit` permission — because of what they actually do:
+ *
+ *   • efr_no IS the technician's login identity. tech-auth resolves an
+ *     account by mobile alone (services/tech-auth.service.js), so changing it
+ *     changes who can log in as this technician. That is account takeover.
+ *   • the bank row is where this technician's money is sent. Changing it is
+ *     payment redirection.
+ *
+ * `isEdit` is broad and widely granted (name, address, skills, activation).
+ * Folding these in would silently hand takeover + redirection to every role
+ * that can fix a typo. Hence NEW, narrow keys, seeded to Admin only by
+ * migrations/2026-08-17-easyfixer-sensitive-change-log.sql.
+ *
+ * TWO keys, not one, because the two capabilities are not the same job:
+ * Finance may need to correct a payout account without ever being able to
+ * change who can log in as a technician, and a support operator may need the
+ * reverse. A single combined key forces an all-or-nothing grant and pushes
+ * ops toward over-granting. Splitting costs one extra seed row.
+ *
+ * Every one of them also runs the standard scope guard (loadAndAuthorize →
+ * 404 on out-of-scope, never 403, so an out-of-scope efr_id's existence is
+ * not leaked), and every mutation writes
+ * tbl_easyfixer_sensitive_change_log via
+ * services/easyfixer-sensitive-change.service.js.
+ */
+const requireMobileUpdate = requireAction('isEasyfixerMobileUpdate');
+const requireBankUpdate = requireAction('isEasyfixerBankUpdate');
+
+/*
+ * OTP sends go out over WhatsApp to a real technician's phone. Uncapped, a
+ * stuck FE retry loop (or an irritated operator) becomes a WhatsApp spam
+ * cannon pointed at one person, and /api/admin is the one tier with NO global
+ * rate limit (server.js). Keyed on the OPERATOR, not the IP — an office NATs
+ * to one address, and the thing being bounded is a person clicking a button.
+ * Instantiated once at module scope; rateLimit() closes over its own Map, so
+ * building it per-request would cap nothing.
+ */
+const bankOtpLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 5,
+  key: (req) => `efr-bank-otp:${req.user && req.user.user_id ? req.user.user_id : req.ip}`,
+});
+
+/*
+ * PATCH /:id/mobile — change the technician's login number.
+ *
+ * ⚠ NO OTP HERE, AND THAT IS THE PRODUCT DECISION, NOT AN OVERSIGHT.
+ *
+ * Ops performs this change precisely BECAUSE the technician lost the number.
+ * So consider what an OTP could be sent to:
+ *   • the OLD number — it is dead, stolen, or in someone else's hands. An OTP
+ *     there either never arrives (blocking the legitimate fix, permanently)
+ *     or is answered by exactly the person we are trying to lock out.
+ *   • the NEW number — it proves only that whoever asked for the change is
+ *     holding the phone they just named. That is a tautology, not consent.
+ * Neither is a control; a tick-box OTP here would buy the appearance of one.
+ *
+ * The REAL controls are: the isEasyfixerMobileUpdate permission (Admin
+ * only), the mandatory `reason`, and the audit row — which records the old
+ * number, the new number, the operator, their IP, and otp_verified = 0.
+ *
+ * Bank changes are different and DO require an OTP: the old number is
+ * assumed live there, and the technician is available to consent to their own
+ * money moving. See PATCH /:id/bank below.
+ *
+ * The response echoes the new number back MASKED — middleware/mask-mobile.js
+ * masks efr_no on every /api/admin response. That is intended: the operator
+ * just typed the number, and the CRM never displays a technician's mobile in
+ * full anywhere else.
+ */
+router.patch('/:id/mobile',
+  validate(idParam, 'params'),
+  validate(sensitiveMobileBody, 'body'),
+  requireMobileUpdate,
+  async (req, res, next) => {
+    try {
+      logger.info('Change easyfixer mobile · id=' + req.params.id);
+      if (!(await loadAndAuthorize(req, res))) return;
+      const data = await sensitiveChange.changeMobile(
+        Number(req.params.id),
+        req.body,
+        req.user,
+        { ipAddress: req.ip },
+      );
+      logger.info('Easyfixer mobile change applied · id=' + req.params.id + ' · changed=' + data.changed);
+      modernOk(res, data, data.changed ? 'mobile number updated' : 'mobile number unchanged');
+    } catch (e) {
+      if (e && typeof e.status === 'number') {
+        logger.warn('Change easyfixer mobile failed · id=' + req.params.id + ' · ' + e.message);
+        return modernError(res, e.status, e.message || 'request failed');
+      }
+      next(e);
+    }
+  });
+
+/*
+ * POST /:id/bank/otp — send the consent OTP to the technician's REGISTERED
+ * mobile (tbl_easyfixer.efr_no), over WhatsApp, via the same
+ * easyfixer-profile-otp service the public profile-update flow uses.
+ *
+ * Returns { sent: true } and NOTHING ELSE. The OTP value never leaves the
+ * database — an endpoint that returned it would let the operator complete the
+ * bank change without the technician ever being involved, which is the exact
+ * thing the OTP exists to prevent.
+ */
+router.post('/:id/bank/otp',
+  validate(idParam, 'params'),
+  requireBankUpdate,
+  bankOtpLimiter,
+  async (req, res, next) => {
+    try {
+      logger.info('Send bank-change OTP · id=' + req.params.id);
+      if (!(await loadAndAuthorize(req, res))) return;
+      await profileOtp.sendOtp(Number(req.params.id), pool);
+      logger.info('Bank-change OTP sent · id=' + req.params.id);
+      // Constructed literally, not spread from the service's return value, so
+      // no future field on that object can ride out to the client.
+      modernOk(res, { sent: true }, 'OTP sent to the technician on WhatsApp');
+    } catch (e) {
+      if (e && typeof e.status === 'number') {
+        logger.warn('Send bank-change OTP failed · id=' + req.params.id + ' · ' + e.message);
+        return modernError(res, e.status, e.message || 'request failed');
+      }
+      next(e);
+    }
+  });
+
+/*
+ * PATCH /:id/bank — change the payout account.
+ *
+ * Order of operations (enforced in the service, restated here because the
+ * order is the security property): OTP → vendor verification → write → audit,
+ * with the write and the audit in one transaction. A failed OTP is a 400 and
+ * a failed vendor verification is a 422, and NEITHER writes anything.
+ *
+ * The vendor call is services/mobile-kyc.service.js::bankVerify — the SAME
+ * aadhaarkyc.io call the technician app makes when adding a bank account for
+ * the first time. Same function, so the two paths verify identically by
+ * construction rather than by two implementations happening to agree. When
+ * SUREPASS_VERIFICATION_KEY is unset that service throws a clean 503, which
+ * is surfaced as a 503 here — never a 500.
+ */
+router.patch('/:id/bank',
+  validate(idParam, 'params'),
+  validate(sensitiveBankBody, 'body'),
+  requireBankUpdate,
+  async (req, res, next) => {
+    try {
+      logger.info('Change easyfixer bank details · id=' + req.params.id);
+      if (!(await loadAndAuthorize(req, res))) return;
+      const data = await sensitiveChange.changeBank(
+        Number(req.params.id),
+        req.body,
+        req.user,
+        { ipAddress: req.ip },
+      );
+      logger.info('Easyfixer bank details change applied · id=' + req.params.id);
+      modernOk(res, data, 'bank details updated');
+    } catch (e) {
+      if (e && typeof e.status === 'number') {
+        logger.warn('Change easyfixer bank failed · id=' + req.params.id + ' · ' + e.message);
         return modernError(res, e.status, e.message || 'request failed');
       }
       next(e);
