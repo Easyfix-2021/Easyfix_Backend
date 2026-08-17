@@ -758,17 +758,38 @@ const EXPORT_SELECT = `
   LEFT JOIN action_taken_reason atr3 ON atr3.id = J.enquiry_reason_id
   LEFT JOIN tbl_user TBU ON TBU.user_id = J.first_scheduled_by
   LEFT JOIN tbl_user cancelBy ON cancelBy.user_id = J.cancel_by
+  /*
+   * ─── Every derived table is scoped to THIS CHUNK's job_ids ──────────────
+   *
+   * Legacy ran one unbounded query, so materialising these three over the
+   * whole of tbl_job_assignee_history / tbl_estimate_details / tbl_job_offer
+   * cost one full scan each for the entire export. Chunking without this
+   * filter would repeat that scan PER CHUNK — 50 chunks of 2,000 rows would
+   * do 50× the work legacy did, which is how a memory fix turns into a
+   * throughput regression.
+   *
+   * Each id-list placeholder below takes the ids phase 1 already resolved
+   * (see fetchExportChunk), so a derived table sees at most chunkSize rows.
+   *
+   * NOTE: this comment is inside a template literal AND inside the SQL string.
+   * No backticks (they close the literal) and no question marks — mysql2's
+   * formatter scans for placeholders without skipping SQL comments, so a
+   * stray one here would silently swallow a bound parameter.
+   */
   LEFT JOIN (
     SELECT job_id, previous_efr,
            ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY id DESC) AS row_num
       FROM tbl_job_assignee_history
+     WHERE job_id IN (?)
   ) TJA1 ON TJA1.job_id = J.job_id AND TJA1.row_num = 1
   LEFT JOIN tbl_easyfixer TEP ON TEP.efr_id = TJA1.previous_efr
   LEFT JOIN (
     SELECT TED.sent_on, TED.job_id, TED.action_on, TED.status
       FROM tbl_estimate_details TED
-      INNER JOIN (SELECT job_id, MAX(id) AS max_id FROM tbl_estimate_details GROUP BY job_id) AS maxTED
+      INNER JOIN (SELECT job_id, MAX(id) AS max_id FROM tbl_estimate_details
+                   WHERE job_id IN (?) GROUP BY job_id) AS maxTED
               ON TED.job_id = maxTED.job_id AND TED.id = maxTED.max_id
+     WHERE TED.job_id IN (?)
   ) ESTST ON ESTST.job_id = J.job_id
   LEFT JOIN (
     SELECT jo.job_id,
@@ -779,8 +800,42 @@ const EXPORT_SELECT = `
            SUM(jo.offer_status = 3) AS offer_expired,
            MAX(CASE WHEN jo.offer_status = 1 THEN jo.fk_easyfixter_id END) AS accepted_tx
       FROM tbl_job_offer jo
+     WHERE jo.job_id IN (?)
      GROUP BY jo.job_id
   ) JO ON JO.job_id = J.job_id
+`;
+
+/*
+ * The join set the FILTERS can reference — nothing else.
+ *
+ * Phase 1 of fetchExportChunk resolves this chunk's job_ids and needs only
+ * the tables a WHERE clause can touch. Leaving out the three derived tables,
+ * the ten tbl_user self-joins, tbl_job_transaction, tbl_service_catg,
+ * tbl_state and the GROUP_CONCAT joins is the whole point: the id scan walks
+ * an index instead of building aggregates it will never select.
+ *
+ * MUST stay in sync with buildClauses(). If a new filter references an alias
+ * that is not joined here, phase 1 throws "Unknown column" — loudly, on the
+ * first request, which is the failure mode we want rather than a silently
+ * wrong row set.
+ */
+const FILTER_FROM = `
+  FROM tbl_job J
+  LEFT JOIN tbl_customer  C   ON C.customer_id   = J.fk_customer_id
+  LEFT JOIN tbl_client    CL  ON CL.client_id    = J.fk_client_id
+  LEFT JOIN tbl_easyfixer EFR ON EFR.efr_id      = J.fk_easyfixter_id
+  LEFT JOIN tbl_easyfixer_rating_by_customer TERBC ON TERBC.job_id = J.job_id
+  LEFT JOIN tbl_client_contacts contact ON contact.id = J.reporting_contact_id
+  LEFT JOIN action_taken_reason atr ON atr.id =
+    IF(J.cancel_date_time IS NOT NULL AND J.remarks_date_time IS NOT NULL,
+       IF(TIMEDIFF(J.cancel_date_time, J.remarks_date_time) > 0, J.cancel_reason_id, J.enum_reason_id),
+       IF(J.cancel_date_time IS NOT NULL AND J.remarks_date_time IS NULL, J.cancel_reason_id,
+          IF(J.remarks_date_time IS NOT NULL AND J.cancel_date_time IS NULL, J.enum_reason_id, NULL)))
+  LEFT JOIN user_type ut ON ut.id = atr.user_type
+  LEFT JOIN tbl_address A ON A.customer_id = J.fk_customer_id AND A.address_id = J.fk_address_id
+  LEFT JOIN tbl_city city ON city.city_id = A.city_id
+  LEFT JOIN tbl_vertical_mapping TVM ON TVM.client_id = CL.client_id
+  LEFT JOIN tbl_vertical V ON V.vertical_id = TVM.vertical_id
 `;
 
 const DEFAULT_CHUNK_SIZE = 1000;
@@ -821,14 +876,44 @@ async function fetchExportChunk({ filters = {}, afterJobId = null, chunkSize = D
     allParams.push(Number(afterJobId));
   }
 
-  const sql = `${EXPORT_SELECT}
+  const started = Date.now();
+
+  /*
+   * ─── PHASE 1 — resolve this chunk's ids, and nothing else ───────────────
+   *
+   * A "deferred join": narrow first on the cheap join set, then hydrate. The
+   * naive alternative — running the full 21-join projection with the filters
+   * inline — makes MySQL build the three derived-table aggregates before it
+   * knows which 2,000 rows it wants, so the expensive work scales with the
+   * whole table rather than with the chunk.
+   */
+  const idSql = `SELECT J.job_id ${FILTER_FROM}
     ${allClauses.length ? `WHERE ${allClauses.join(' AND ')}` : ''}
     GROUP BY J.job_id
     ORDER BY J.job_id DESC
     LIMIT ?`;
+  const [idRows] = await pool.query(idSql, [...allParams, size]);
+  if (idRows.length === 0) return [];
+  const ids = idRows.map((r) => Number(r.job_id));
 
-  const started = Date.now();
-  const [rows] = await pool.query(sql, [...allParams, size]);
+  /*
+   * ─── PHASE 2 — hydrate exactly those ids ────────────────────────────────
+   *
+   * The filters are NOT repeated here: phase 1 already applied them, and the
+   * id list is the authority. Re-running them would be redundant work and a
+   * second place for the two paths to disagree.
+   *
+   * Four `?` take the same id array — one per derived table (TJA1, ESTST's
+   * inner maxTED, ESTST's outer, JO) plus the driving IN. mysql2 expands an
+   * array into a placeholder list for `pool.query`, so each stays a single
+   * bound parameter rather than string-built SQL.
+   */
+  const sql = `${EXPORT_SELECT}
+    WHERE J.job_id IN (?)
+    GROUP BY J.job_id
+    ORDER BY J.job_id DESC`;
+  const [rows] = await pool.query(sql, [ids, ids, ids, ids, ids]);
+
   logger.info(
     `Manage-Job export chunk · rows=${rows.length} · afterJobId=${afterJobId ?? 'start'} · ${Date.now() - started}ms`,
   );
