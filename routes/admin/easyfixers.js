@@ -120,10 +120,26 @@ router.get('/status-counts', async (req, res, next) => {
 // "Status = All" download can't OOM the pod. Pagination params from the
 // query are intentionally ignored — the file is a single-shot snapshot.
 const EXPORT_HARD_CAP = 10000;
+/*
+ * NO MOBILE COLUMN, deliberately.
+ *
+ * `efr_no` is in utils/mask-mobile.js MOBILE_FIELDS, which masks it in every
+ * JSON response — including for operators, and even when the
+ * `ui.customer.number.visible` flag is ON. A technician's number is treated
+ * as always-secret in this system.
+ *
+ * The xlsx never got that treatment: masking hooks res.json, and a binary
+ * response never calls it. So the download was handing out in a spreadsheet
+ * the one field the UI refuses to show on screen — and a spreadsheet leaves
+ * the building. Operators who need to reach a technician use the click-to-call
+ * control on the list, which dials by efr_id and never exposes the number.
+ *
+ * If a mobile column is ever wanted back here, it must be masked in the sheet
+ * too; do not simply re-add the raw key.
+ */
 const EXPORT_COLUMNS = [
   { header: 'Easyfixer ID',           key: 'efr_id',                       width: 14 },
   { header: 'Name',                   key: 'efr_name',                     width: 28 },
-  { header: 'Mobile',                 key: 'efr_no',                       width: 16 },
   { header: 'Email',                  key: 'efr_email',                    width: 30 },
   { header: 'City',                   key: 'city_name',                    width: 20 },
   { header: 'State',                  key: 'state_name',                   width: 18 },
