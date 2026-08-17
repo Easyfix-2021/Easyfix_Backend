@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const { pool } = require('../db');
+const logger = require('../logger');
 const { legacyError } = require('../utils/response');
 
 /*
@@ -16,16 +17,7 @@ module.exports = async function basicAuth(req, res, next) {
   const [user, pass] = Buffer.from(header.slice(6), 'base64').toString('utf8').split(':', 2);
   if (!user || !pass) return legacyError(res, 401, 'Unauthorized');
 
-  // Pull client_name in the same query — Decathlon-only branches in
-  // /v1/easyfixers/availability-status-check gate on the literal name.
-  const [[row]] = await pool.query(
-    `SELECT cw.client_login_id, cw.client_id, cw.login_name, cw.login_password, c.client_name
-       FROM tbl_client_website cw
-       LEFT JOIN tbl_client c ON c.client_id = cw.client_id
-      WHERE cw.login_name = ? AND cw.status = 1
-      LIMIT 1`,
-    [user]
-  );
+  const row = await findCredential(user);
 
   /*
    * Password compared in Node (timing-safe) rather than in SQL — keeps the
@@ -59,11 +51,86 @@ module.exports = async function basicAuth(req, res, next) {
     id: row.client_id,
     name: row.client_name || null,
     loginName: row.login_name,
-    loginId: row.client_login_id,
-    role: await resolveLegacyRole(row.login_name),
+    loginId: row.login_id,
+    // When the credential came from tbl_client_user the role arrived on the
+    // same row — legacy read both from that one table. Only the fallback
+    // store needs the extra lookup.
+    role: row.role_name ?? (await resolveLegacyRole(row.login_name)),
   };
+  logger.info('Integration auth OK · login=' + row.login_name + ' · client=' + row.client_id
+    + ' · via=' + row.source + ' · role=' + (row.role_name || 'unresolved'));
   next();
 };
+
+/*
+ * Find an integration credential, preferring the store BOTH legacy services
+ * used.
+ *
+ * ─── Why two stores ──────────────────────────────────────────────────────
+ *
+ * The legacy Dropwizard /v1 API (EasyFix_API EasyFixAuthenticator →
+ * ClientLogin → tbl_client_user) and the legacy webhook relay (Webhook_2023
+ * auth.controller.js, same table) BOTH authenticate against tbl_client_user.
+ * This backend originally read tbl_client_website instead — a different table
+ * with a different population. Measured on QA: ~250 logins live in
+ * tbl_client_website, of which only two also exist in tbl_client_user. So a
+ * partner provisioned for legacy simply did not exist to this backend, and
+ * got a 401 on credentials that worked yesterday.
+ *
+ * tbl_client_user is therefore tried FIRST — it is the store the migrated
+ * /v1 contract was written against, and matching it is the whole point of
+ * the no-client-change rule.
+ *
+ * tbl_client_website is kept as a FALLBACK rather than dropped: it is what
+ * this backend has been accepting, and silently invalidating those logins
+ * would trade one outage for another. A login present in both resolves from
+ * tbl_client_user, so legacy wins any disagreement — which is the correct
+ * precedence while legacy is still serving traffic.
+ *
+ * ─── One real difference, deliberately preserved ─────────────────────────
+ *
+ * tbl_client_website has a `status` column and we gate on `status = 1`.
+ * tbl_client_user has no such column, so a legacy credential cannot be
+ * disabled by flipping a flag — it has to be removed. That is legacy's own
+ * behaviour and changing it here would mean this backend refusing logins the
+ * legacy service still honours. Flagged rather than fixed.
+ */
+async function findCredential(loginName) {
+  try {
+    const [[legacyRow]] = await pool.query(
+      `SELECT cu.id             AS login_id,
+              cu.fk_client_id   AS client_id,
+              cu.user_name      AS login_name,
+              cu.password       AS login_password,
+              cr.role_name      AS role_name,
+              c.client_name     AS client_name
+         FROM tbl_client_user cu
+         LEFT JOIN tbl_client_role cr ON cr.role_id  = cu.fk_role_id
+         LEFT JOIN tbl_client      c  ON c.client_id = cu.fk_client_id
+        WHERE cu.user_name = ?
+        LIMIT 1`,
+      [loginName]
+    );
+    if (legacyRow) return { ...legacyRow, source: 'tbl_client_user' };
+  } catch (err) {
+    // A deploy without the legacy tables must fall through to the store this
+    // backend owns, not 500 every integration request.
+    if (err.code !== 'ER_NO_SUCH_TABLE') throw err;
+  }
+
+  // Pull client_name in the same query — Decathlon-only branches in
+  // /v1/easyfixers/availability-status-check gate on the literal name.
+  const [[row]] = await pool.query(
+    `SELECT cw.client_login_id AS login_id, cw.client_id, cw.login_name,
+            cw.login_password, c.client_name
+       FROM tbl_client_website cw
+       LEFT JOIN tbl_client c ON c.client_id = cw.client_id
+      WHERE cw.login_name = ? AND cw.status = 1
+      LIMIT 1`,
+    [loginName]
+  );
+  return row ? { ...row, role_name: null, source: 'tbl_client_website' } : null;
+}
 
 /*
  * The caller's LEGACY role name, or null.
