@@ -787,8 +787,21 @@ test('getConference returns MASKED numbers, and the SQL itself never selects a w
    * here rather than leaking the customer's mobile to every operator.
    */
   const sel = oneSql(/FROM tbl_plivo_call_log WHERE conference_id = \? ORDER BY/i);
-  assert.match(sel.sql, /LEFT\(RIGHT\(dialed_number, 10\), 4\) AS number_prefix/,
-    'only the prefix leaves the DB, and it leaves as a computed value');
+  /*
+   * Asserted structurally rather than as one literal string. The projection now
+   * wraps the prefix in a CASE (the operator's leg gets NULL — the only number
+   * on its row is the CUSTOMER's, see LEG_PUBLIC_COLUMNS), so a fixed
+   * `LEFT(…) AS number_prefix` match would fail for a change that is entirely
+   * safe. What must hold is the PROPERTY, not the spelling: every single
+   * mention of dialed_number is wrapped in LEFT(RIGHT(…), 4), so no path
+   * through this SELECT can emit more than four digits.
+   */
+  assert.match(sel.sql, /AS number_prefix/, 'the prefix is still projected');
+  const mentions = (sel.sql.match(/dialed_number/g) || []).length;
+  const wrapped = (sel.sql.match(/LEFT\(RIGHT\(dialed_number, 10\), 4\)/g) || []).length;
+  assert.ok(mentions > 0, 'the prefix must still come from dialed_number');
+  assert.equal(wrapped, mentions,
+    `every dialed_number must be wrapped in LEFT(RIGHT(…), 4) — ${mentions} mention(s), ${wrapped} wrapped`);
   assert.doesNotMatch(sel.sql, /SELECT \*/, 'no star-select on a table holding real numbers');
   assert.doesNotMatch(sel.sql, /,\s*dialed_number\b/, 'dialed_number must never be projected as a column');
   assert.doesNotMatch(sel.sql, /\breceiver_number\b/, 'nor receiver_number');

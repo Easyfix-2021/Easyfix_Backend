@@ -94,6 +94,30 @@ const ACTIVE_LEG_STATUSES = [LEG_STATUS.DIALLING, LEG_STATUS.RINGING, LEG_STATUS
  * already speak (target_kind / display_name / joined_at / …), so a leg reads the
  * same whether it came from here or from the participant table this replaced.
  */
+/*
+ * ⚠ THE OPERATOR'S LEG IS NOT A ROW ABOUT THE OPERATOR.
+ *
+ * Exactly ONE call-log row is written when a call is placed
+ * (routes/admin/calls.js, both the web path and the mobile path), and it
+ * describes the person being CALLED: receiver_name and dialed_number are the
+ * CUSTOMER's, while the agent is recorded separately in caller_name /
+ * caller_user_id. dialed_number is the receiver on both flows —
+ * `dialTo = isCustomNumberMode ? callTo : receiverMobile` — never the agent's
+ * own number.
+ *
+ * adoptOperatorLeg() then RETAGS that same row as participant_role='operator'.
+ * So projecting receiver_name for every leg rendered the operator's leg as the
+ * CUSTOMER; and because the customer is separately inserted as their own leg,
+ * the roster showed the same human TWICE — once behind a headset icon, once
+ * behind a person icon, sharing one masked number. Reported from a Web Call
+ * panel listing "SAROJ MERANI 8080••••••" on two rows.
+ *
+ * So the operator takes their name from the column that actually holds it, and
+ * shows NO number: on a web call the operator is in the browser with no dialled
+ * number at all, and on a mobile call the only number on the row is the
+ * customer's. Masked digits belonging to the wrong person are worse than a
+ * blank — and one fewer place the customer's prefix is rendered.
+ */
 const LEG_PUBLIC_COLUMNS = `
        id,
        conference_id,
@@ -101,8 +125,10 @@ const LEG_PUBLIC_COLUMNS = `
        job_id,
        participant_role                  AS target_kind,
        participant_target_id             AS target_id,
-       receiver_name                     AS display_name,
-       LEFT(RIGHT(dialed_number, 10), 4) AS number_prefix,
+       CASE WHEN participant_role = 'operator' THEN caller_name
+            ELSE receiver_name END       AS display_name,
+       CASE WHEN participant_role = 'operator' THEN NULL
+            ELSE LEFT(RIGHT(dialed_number, 10), 4) END AS number_prefix,
        conference_member_id              AS member_id,
        call_uuid                         AS participant_uuid,
        caller_user_id                    AS added_by_user_id,
