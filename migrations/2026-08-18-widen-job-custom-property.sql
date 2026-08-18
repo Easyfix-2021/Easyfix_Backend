@@ -1,0 +1,39 @@
+-- 2026-08-18 — widen tbl_job.custom_property so a client's full custom-property
+-- set fits.
+--
+-- WHY. custom_property holds the flattened "Label:Value|Label:Value|…" string
+-- for every non-canonical client custom property on a job. Book New Call is
+-- gaining a generic renderer over those properties (previously only three
+-- hardcoded fields rendered, so the column never carried more than a handful).
+-- QA already shows ~14 distinct property names in use across clients; a client
+-- with several long labels would overflow varchar(510) and Joi would reject the
+-- whole booking with no useful message.
+--
+-- SAFE FOR THE LEGACY CONSUMER — checked, not assumed. tbl_job is shared with
+-- the legacy services, so CLAUDE.md's "never alter schema" applies and this
+-- needed evidence. EasyFix_CRM's Jobs.java:262 declares
+--     private String customProperty;
+-- an UNBOUNDED Java String, so a longer value cannot overflow it. (Contrast
+-- job_primary_spoc, declared `private int` at Jobs.java:395, where a 10-digit
+-- value silently exceeds the Java int ceiling — the reason that column now
+-- stores a user_id.)
+--
+-- SAFE FOR INNODB ROW SIZE — measured on the live schema:
+--     tbl_job in-row bytes today : ~11,349 of the 65,535 limit
+--                 (40 char/varchar columns; the 8 TEXT/BLOB columns are
+--                  stored off-page and cost ~20 bytes each in-row)
+--     after 510 → 2000 (utf8mb4, x4) : ~17,309 — 48KB of headroom left
+--
+-- 2000 is ~6x the longest value in production today (max observed: 345 chars
+-- across 13,761 populated rows) and 4x the current cap.
+--
+-- ⚠ A MODIFY cannot be verified by scripts/migration-status.js — it probes for
+-- artifacts (a column/index EXISTS), and this column existed before and after.
+-- Verify by hand with the query at the bottom.
+
+ALTER TABLE tbl_job MODIFY COLUMN custom_property VARCHAR(2000) NULL;
+
+-- Verification (read-only):
+-- SELECT COLUMN_NAME, COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS
+--  WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='tbl_job'
+--    AND COLUMN_NAME='custom_property';   -- expect varchar(2000)

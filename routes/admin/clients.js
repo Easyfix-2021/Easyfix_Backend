@@ -945,7 +945,15 @@ router.get('/:clientId/custom-properties', async (req, res, next) => {
       // `c_prop_mandatory` + `c_prop_id` PK). The fallback chain
       // covers both plus a few one-off historical aliases.
       name: String(r.property_name ?? r.c_prop_name ?? r.name ?? r.key ?? r.field_name ?? '').toLowerCase().trim(),
-      label: r.property_label ?? r.c_prop_label ?? r.label ?? r.display_name ?? null,
+      /*
+       * Falls back to the RAW (un-lowercased) property name. `name` above is
+       * lowercased for key matching, so without this a generic renderer would
+       * label the field "gstin/uin" instead of "GSTIN/UIN" — the operator sees
+       * the lookup key rather than the thing they were asked to collect.
+       * Mirrors routes/client/index.js, which already ends its chain in `raw`.
+       */
+      label: r.property_label ?? r.c_prop_label ?? r.label ?? r.display_name
+        ?? (String(r.property_name ?? r.c_prop_name ?? r.name ?? '').trim() || null),
       mandatory: truthy(r.is_mandatory ?? r.c_prop_mandatory ?? r.mandatory ?? r.required ?? r.is_required ?? r.is_required_field),
       value: r.property_value ?? r.c_prop_values ?? r.value ?? r.field_value ?? null,
       // is_config discriminator (0/1): 1 = client-level CONFIG/CONTROL row

@@ -287,7 +287,7 @@ const createBody = Joi.object({
   // land in dedicated columns like branch_details); accepted for forwards-compat
   // and so a sibling can carry an inherited value. Coerced to real NULL for
   // empty/'null' by the service layer.
-  custom_property: Joi.string().max(510).allow('', null).optional(),
+  custom_property: Joi.string().max(2000).allow('', null).optional(),
   // Top-level per-job override of the customer's master name. See
   // services/job.service.js (`job_customer_name` MUTABLE_COLUMNS
   // comment) for why this is distinct from `customer.customer_name`.
