@@ -13,6 +13,13 @@ const addressService = require('./address.service');
 // turns a user's allowed stage keys into the union of visible job_status codes,
 // AND-combined (intersected) with the tab/status filters in list/counts/attention.
 const { stageVisibleStatuses } = require('../lib/job-stages');
+const {
+  JOB_AGE_STATUS,
+  JOB_AGE_END_EXPR,
+  JOB_AGE_SECS_EXPR,
+  JOB_AGE_DAYS_EXPR,
+  JOB_AGE_COLUMNS,
+} = require('../utils/job-age-sql');
 // Appointment time-slot model (pure, no DB) — see services/time-slot.js for
 // what tbl_job.time_slot / requested_time / requested_date_time each mean and
 // why the slot STRING is no longer load-bearing anywhere.
@@ -189,8 +196,11 @@ async function expireStaleOffers(maxAgeMinutes = OFFER_TTL_MINUTES, jobId = null
  */
 const STATUS = {
   BOOKED: 0, SCHEDULED: 1, IN_PROGRESS: 2,
-  COMPLETED: 3, COMPLETED_ALT: 5, CANCELLED: 6,
-  ENQUIRY: 7, CALL_LATER: 9, REVISIT: 10,
+  COMPLETED: JOB_AGE_STATUS.COMPLETED,
+  COMPLETED_ALT: JOB_AGE_STATUS.COMPLETED_ALT,
+  CANCELLED: JOB_AGE_STATUS.CANCELLED,
+  ENQUIRY: JOB_AGE_STATUS.ENQUIRY,
+  CALL_LATER: 9, REVISIT: 10,
   // Canonical additions (DB-truth per 2026-04-20):
   UNCONFIRMED: 9,                 // alias for CALL_LATER
   CLOSED_FROM_APP: 10,            // alias for REVISIT
@@ -251,26 +261,9 @@ const DIRECT_REJECTABLE_STATES = new Set([STATUS.BOOKED, STATUS.SCHEDULED]);
  * `j` alias (tbl_job), which is present in LIST_JOIN, DETAIL_JOIN and the COUNT
  * join alike, so it introduces NO new join and cannot break COUNT/data parity.
  */
-const JOB_AGE_END_EXPR = `COALESCE(
-    CASE j.job_status
-      WHEN ${STATUS.COMPLETED}     THEN j.checkout_date_time
-      WHEN ${STATUS.COMPLETED_ALT} THEN j.checkout_date_time
-      WHEN ${STATUS.CANCELLED}     THEN j.cancel_date_time
-      WHEN ${STATUS.ENQUIRY}       THEN j.enquiry_date_time
-    END,
-    NOW()
-  )`;
-// Precise interval in SECONDS — the SORT key, and what the UI needs to render
-// sub-day ages ("5h") for a job younger than a day.
-const JOB_AGE_SECS_EXPR = `GREATEST(TIMESTAMPDIFF(SECOND, j.ticket_created_date_time, ${JOB_AGE_END_EXPR}), 0)`;
-// Floored whole DAYS — what operators read. Never sort on this: every job
-// created on the same day would tie and order arbitrarily.
-const JOB_AGE_DAYS_EXPR = `GREATEST(TIMESTAMPDIFF(DAY, j.ticket_created_date_time, ${JOB_AGE_END_EXPR}), 0)`;
-// Leading-comma projection fragment — appended to any SELECT that already has
-// the `j` alias in scope. One definition, so LIST and DETAIL cannot drift.
-const JOB_AGE_COLUMNS = `,
-  ${JOB_AGE_DAYS_EXPR} AS ageDays,
-  ${JOB_AGE_SECS_EXPR} AS ageSecs`;
+// The executable SQL fragments live in utils/job-age-sql.js so bounded mobile
+// reads and this CRM service cannot drift. They are imported above and kept
+// exported below for backward compatibility with existing consumers/tests.
 
 // ─── The customer name shown ON A JOB ───────────────────────────────
 /*
@@ -1869,8 +1862,30 @@ async function list({
   // to. Defaults to `created_date_time` for backward-compat with
   // callers that don't pass dateType.
   const dateCol = DATE_TYPE_COLUMN[String(dateType || '').toLowerCase()] || 'j.created_date_time';
-  if (startDate)           { clauses.push(`${dateCol} >= ?`); params.push(startDate); }
-  if (endDate)             { clauses.push(`${dateCol} <= ?`); params.push(endDate); }
+  /*
+   * IST CALENDAR-DAY BOUNDS, not raw instants (fixed 2026-08-18).
+   *
+   * `startDate`/`endDate` are Joi.date().iso(), so '2026-08-17' is parsed as
+   * UTC midnight and mysql2 then serialises that Date at the pool's +05:30 —
+   * MySQL actually received '2026-08-17 05:30:00'. Measured, not inferred.
+   *
+   * Two consequences, one visible and one not:
+   *   • start = end returned NOTHING, because the range collapsed to a single
+   *     instant at 05:30. That is the reported bug.
+   *   • EVERY range was skewed 5.5h: 17th→18th meant 17th 05:30 → 18th 05:30,
+   *     dropping the 17th's first 5.5 hours and including the 18th's. Silent,
+   *     and it applied to the export too.
+   *
+   * DATE(?) truncates the parameter to its IST calendar day (+05:30 never
+   * crosses midnight for a UTC-midnight input), and the upper bound becomes
+   * EXCLUSIVE next-day so the whole final day is inside the range — including
+   * 23:59:59, which a `<= DATE(?)` would have excluded just as surely.
+   *
+   * DATE() is applied to the PARAMETER, never the column, so the index on
+   * created_date_time (and every other dateType target) is still usable.
+   */
+  if (startDate)           { clauses.push(`${dateCol} >= DATE(?)`); params.push(startDate); }
+  if (endDate)             { clauses.push(`${dateCol} < DATE(?) + INTERVAL 1 DAY`); params.push(endDate); }
   if (q) {
     /*
      * `j.job_id` added (2026-06-10 fix) — operators routinely search by
