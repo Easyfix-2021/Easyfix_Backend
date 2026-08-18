@@ -958,8 +958,41 @@ router.get('/:clientId/custom-properties', async (req, res, next) => {
       id: r.id ?? r.c_prop_id ?? null,
       raw: r,
     })).filter((p) => p.name);
-    logger.info('Returning ' + normalised.length + ' custom properties');
-    modernOk(res, normalised);
+
+    /*
+     * ?bookingOnly=1 — OPT-IN, and opt-in on purpose.
+     *
+     * This endpoint has THREE consumers with genuinely different needs, which
+     * is why the filter cannot live in the route unconditionally:
+     *   • components/client/CustomPropsTab — the client-properties EDITOR
+     *     (GET/POST/PUT/DELETE on this path). It must see is_config rows so an
+     *     operator can manage Order Confirmation Mode / Auto Process
+     *     Unconfirmed Order at all. Filtering them out here would delete those
+     *     controls from the admin UI.
+     *   • JobModal Book New Call + the public job-completion form — booking
+     *     surfaces, which must NOT offer a backend switch as a data-entry
+     *     field, nor a soft-deleted property.
+     *
+     * Default stays UNFILTERED so the editor is byte-for-byte unchanged; the
+     * booking surfaces ask for the narrower set. Mirrors the filter
+     * routes/client/index.js:114 already applies for the client portal.
+     *
+     * Filtered in JS rather than SQL deliberately: `is_config` arrives from a
+     * 2026-07-10 migration and is absent on pre-migration deploys, where a
+     * WHERE clause naming it would 500 the whole page. An absent column reads
+     * as undefined here, which truthy() treats as "not config" — the safe
+     * default, matching the normalisation above.
+     */
+    const bookingOnly = ['1', 'true', 'yes'].includes(
+      String(req.query.bookingOnly ?? '').trim().toLowerCase(),
+    );
+    const out = bookingOnly
+      ? normalised.filter((p) => truthy(p.raw?.status ?? 1) && !truthy(p.is_config))
+      : normalised;
+
+    logger.info('Returning ' + out.length + ' custom properties'
+      + (bookingOnly ? ' (bookingOnly — ' + (normalised.length - out.length) + ' config/inactive hidden)' : ''));
+    modernOk(res, out);
   } catch (e) { next(e); }
 });
 
