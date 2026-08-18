@@ -14,9 +14,36 @@ const intId   = Joi.number().integer().positive();
  * The single-id alternative preserves back-compat with existing single-select
  * callers; the service layer (toIdArray) normalises both shapes to an IN (...).
  */
+/*
+ * ⚠ THE LIMIT IS A COUNT OF IDS, NOT A COUNT OF CHARACTERS (fixed 2026-08-18).
+ *
+ * This was `.max(200)` — 200 CHARACTERS. At roughly 4 chars per id ("123,")
+ * that rejected any selection past about FORTY, and there are 398 clients and
+ * 11,108 cities. Selecting all clients and unchecking one produced a ~1,592
+ * character CSV, Joi 400'd the request, and because useFetch deliberately keeps
+ * the previous rows on error (so a transient failure never blanks a populated
+ * table) the screen simply did not change. Reported as "data not updating",
+ * which is exactly what a silent 400 behind a stale table looks like.
+ *
+ * 500 covers "every client, minus one" with headroom while still refusing an
+ * absurd list — an IN() of 11,000 city ids is a real cost, and a CSV that long
+ * would breach common URL limits before it ever reached us. A caller who wants
+ * everything should send NO filter rather than enumerate the world.
+ */
+const CSV_IDS_MAX = 500;
 const csvIds  = Joi.alternatives(
   intId,
-  Joi.string().pattern(/^\d+(,\d+)*$/).max(200),
+  Joi.string()
+    .pattern(/^\d+(,\d+)*$/)
+    .custom((value, helpers) => {
+      const n = value.split(',').length;
+      if (n > CSV_IDS_MAX) {
+        return helpers.message(
+          `must not select more than ${CSV_IDS_MAX} ids at once (got ${n}) — clear the filter to include everything`,
+        );
+      }
+      return value;
+    }),
 );
 /*
  * INDIAN_MOBILE_REGEX (2026-06-03): tightened from `/^[0-9]{10}$/` to
