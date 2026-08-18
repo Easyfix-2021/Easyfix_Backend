@@ -337,6 +337,53 @@ const PARTY_NAME = `CASE
         ELSE jci.cp_name
       END`;
 
+/*
+ * ⚠ caller_id IS A FOREIGN KEY WITHOUT A DECLARED TABLE.
+ *
+ * Every query here joined it one way — LEFT JOIN tbl_user u ON u.user_id =
+ * jci.caller_id — which is right for rows THIS backend writes (routes/admin/
+ * calls.js stamps agent.user_id). It is wrong for rows the legacy CRM / mobile
+ * backend writes, which put an efr_id there instead. The two namespaces do not
+ * overlap in practice: tbl_user ids observed in production are two and three
+ * digits (2, 102, 148…), while efr_ids run to 2,000,313.
+ *
+ * A LEFT JOIN is the quietest way to get that wrong. A miss is indistinguishable
+ * from a legitimately absent name, so the COALESCE simply fell through to
+ * whatever caller_name the other writer had stamped — and the drill-down then
+ * rendered the unmatched id as "#352882" beside it, which ASSERTS a CRM user id
+ * that does not exist. Reported as "Called By and To Whom are the same person"
+ * on job 529116: the receiver was resolved correctly (PARTY_NAME matches the
+ * dialled number against the job's parties) while the caller was not resolved at
+ * all, so both cells ended up showing the same stamped string.
+ *
+ * The technician lookup is a SUBQUERY, deliberately, not a second LEFT JOIN.
+ * Two of the four consumers below aggregate (COUNT(*), COUNT(DISTINCT …)) and
+ * GROUP BY caller_id; a join that ever matched more than one row would silently
+ * inflate those counts, and an operational report that quietly over-counts is
+ * worse than one that leaves a name blank. A scalar subquery cannot multiply
+ * rows whatever the table's keys turn out to be.
+ *
+ * ORDER IS LOAD-BEARING: tbl_user first, so behaviour is byte-identical for
+ * every row this backend wrote, and the new lookup only ever fires where the old
+ * one already returned nothing.
+ */
+const CALLER_NAME = `COALESCE(
+        u.user_name,
+        (SELECT ec.efr_name FROM tbl_easyfixer ec WHERE ec.efr_id = jci.caller_id),
+        jci.caller_name)`;
+
+/*
+ * Which namespace actually answered — so a consumer can stop presenting an
+ * unmatched id as a user id. 'unresolved' is the honest answer for a legacy row
+ * whose caller matches neither table: we have a name stamped on the audit row
+ * and nothing to link it to.
+ */
+const CALLER_KIND = `CASE
+        WHEN u.user_id IS NOT NULL THEN 'user'
+        WHEN EXISTS (SELECT 1 FROM tbl_easyfixer ek WHERE ek.efr_id = jci.caller_id) THEN 'technician'
+        ELSE 'unresolved'
+      END`;
+
 // The snapshot assignment flag, emitted as 1/0 rather than relying on how the
 // driver types a bare boolean expression.
 const ASSIGNED_AT_CALL = `CASE WHEN jci.job_efr_id IS NOT NULL THEN 1 ELSE 0 END`;
@@ -746,7 +793,7 @@ async function getCallTracking(filters = {}) {
   const [userRows] = await pool.query(
     `SELECT ${DAY_EXPR} AS day,
             jci.caller_id AS userId,
-            MAX(COALESCE(u.user_name, jci.caller_name)) AS userName,
+            MAX(${CALLER_NAME}) AS userName,
             ${CALL_AGG},
             COUNT(DISTINCT NULLIF(jci.job_id, 0)) AS unique_jobs,
             MIN(jci.inserted_time) AS firstCallAt,
@@ -782,7 +829,7 @@ async function getCallTracking(filters = {}) {
   const sUC = buildScope(filters);
   const [combinedRows] = await pool.query(
     `SELECT jci.caller_id AS userId,
-            MAX(COALESCE(u.user_name, jci.caller_name)) AS userName,
+            MAX(${CALLER_NAME}) AS userName,
             ${ACTIVE_DAYS},
             ${CALL_AGG},
             COUNT(DISTINCT NULLIF(jci.job_id, 0)) AS unique_jobs,
@@ -820,7 +867,7 @@ async function getCallTracking(filters = {}) {
     const [callerRows] = await pool.query(
       `SELECT jci.job_id AS jobId,
               jci.caller_id AS userId,
-              MAX(COALESCE(u.user_name, jci.caller_name)) AS userName,
+              MAX(${CALLER_NAME}) AS userName,
               COUNT(*) AS calls
          ${sC.from}
          LEFT JOIN tbl_user u ON u.user_id = jci.caller_id
@@ -1215,7 +1262,8 @@ async function getCallDetails(filters = {}, selection = {}) {
             jci.job_id          AS jobId,
             jci.inserted_time   AS callAt,
             jci.caller_id       AS callerUserId,
-            COALESCE(u.user_name, jci.caller_name) AS callerName,
+            ${CALLER_NAME}      AS callerName,
+            ${CALLER_KIND}      AS callerKind,
             ${PARTY_NAME}       AS receiverName,
             ${PARTY_ROLE}       AS partyRole,
             jci.job_status      AS jobStatusAtCall,
@@ -1257,6 +1305,14 @@ async function getCallDetails(filters = {}, selection = {}) {
       callAt: r.callAt || null,
       callerUserId: r.callerUserId == null ? null : n(r.callerUserId),
       callerName: r.callerName || `User #${n(r.callerUserId)}`,
+      /*
+       * WHICH table answered — 'user' | 'technician' | 'unresolved'. The id
+       * alone cannot say: caller_id holds a tbl_user id on rows this backend
+       * writes and an efr_id on rows the legacy CRM writes. A consumer that
+       * renders the raw id has to know which, or it asserts a CRM user that
+       * does not exist. See CALLER_NAME above.
+       */
+      callerKind: r.callerKind || 'unresolved',
       // NAME only — never the number (see the privacy note in the header).
       receiverName: (r.receiverName && String(r.receiverName).trim()) || null,
       partyRole: r.partyRole || 'Other',
