@@ -56,8 +56,28 @@ const REFERRAL_ATTACH_MAX_ATTEMPTS = 3;
 const REFERRAL_RECONCILE_TASK = 'profile_qualification';
 const REFERRAL_RECONCILE_LOCK = 'easyfix:rewards:referral-qualification';
 
+/*
+ * A MISSING property must fall back — it must not read as zero.
+ *
+ * The previous body pushed an absent key through String(undefined ?? '') to
+ * '', and Number('') is 0, NOT NaN. The `raw >= 0` guard then accepted that
+ * zero as a legitimate configured value, so the fallback was unreachable for
+ * precisely the case it existed to cover.
+ *
+ * That is not theoretical: 'rewards.earn.lookback.days' was never seeded, so
+ * lookbackDays resolved to 0, the earning window collapsed to zero width, and
+ * the nightly pass awarded nothing from go-live on 2026-08-13 until
+ * 2026-08-18 while logging counts indistinguishable from a quiet night.
+ *
+ * Absent and blank are therefore settled BEFORE any numeric coercion. A
+ * present-but-unparseable value ('abc') still falls back via the isFinite
+ * guard, and an explicit '0' is still honoured — a deliberately configured
+ * zero is an operator's decision, unlike a key that was never created.
+ */
 function propNumber(key, fallback) {
-  const raw = Number(String(properties.getProperty(key) ?? '').trim());
+  const value = properties.getProperty(key);
+  if (value == null || String(value).trim() === '') return fallback;
+  const raw = Number(String(value).trim());
   return Number.isFinite(raw) && raw >= 0 ? raw : fallback;
 }
 
@@ -1283,7 +1303,17 @@ async function reconcileReferralQualifications({
  */
 async function runEarnCycle() {
   const config = pointsConfig();
-  const result = { paused: config.earningPaused, rating: 0, sda: 0, referral: 0, skipped: 0 };
+  const result = {
+    paused: config.earningPaused,
+    windowDays: config.lookbackDays,
+    windowFrom: null,
+    rating: 0,
+    ratingRows: 0,
+    sda: 0,
+    sdaRows: 0,
+    referral: 0,
+    skipped: 0,
+  };
 
   /*
    * Honoured here as well as at cron registration, so Trigger Now respects a
@@ -1300,6 +1330,27 @@ async function runEarnCycle() {
 
   const since = new Date(Date.now() - config.lookbackDays * 24 * 60 * 60 * 1000);
 
+  /*
+   * Report the window as the exact IST wall-clock string mysql2 will bind
+   * (the pool runs timezone '+05:30'), so the log answers "what did this run
+   * actually ask the database for?" without anyone re-deriving it.
+   *
+   * The zero-width guard is not hypothetical. When
+   * 'rewards.earn.lookback.days' was absent, propNumber coerced the missing
+   * value to 0, `since` became this instant, and both queries below asked for
+   * rows in the future. They returned nothing, raised nothing, and logged
+   * "rating=0 · sda=0" — indistinguishable from a quiet night. Only the award
+   * counts were ever printed, so a window of zero width stayed invisible for
+   * five days while eligible rows piled up.
+   */
+  result.windowFrom = new Date(since.getTime() + 5.5 * 60 * 60 * 1000)
+    .toISOString().slice(0, 19).replace('T', ' ');
+  if (!(config.lookbackDays > 0)) {
+    logger.warn('Rewards earning · lookback is ' + config.lookbackDays
+      + ' days — the window has zero width, so nothing can ever be awarded. '
+      + "Set 'rewards.earn.lookback.days' in easyfix_properties (3 is the intended default).");
+  }
+
   // ── Rating: 5★ only, and only when that job carries no escalation.
   // 88.6% of all ratings in this database are 5★, so without the escalation
   // filter this would pay on nearly every job and mean nothing.
@@ -1314,6 +1365,7 @@ async function runEarnCycle() {
           AND r.job_id IS NOT NULL`,
       [since],
     );
+    result.ratingRows = rows.length;
     for (const row of rows) {
       const out = await award({
         efrId: row.easyfixer_id,
@@ -1341,6 +1393,7 @@ async function runEarnCycle() {
           AND DATE(j.checkin_date_time) = DATE(COALESCE(j.original_appointment_date_time, j.requested_date_time))`,
       [COMPLETED_JOB_STATUSES, since],
     );
+    result.sdaRows = rows.length;
     for (const row of rows) {
       const out = await award({
         efrId: row.efr_id,
@@ -1364,7 +1417,16 @@ async function runEarnCycle() {
     result.referralReconciliation = reconciliation;
   }
 
-  logger.info('Rewards earning · rating=' + result.rating + ' · sda=' + result.sda
+  /*
+   * rating=awarded/scanned, not just awarded. The pair separates "no rows
+   * matched" (0/0 — a window, predicate or data problem) from "all of them
+   * were already paid" (0/862 — a healthy overlapping re-run). Those two look
+   * identical when only the award count is printed, and telling them apart is
+   * the whole diagnostic.
+   */
+  logger.info('Rewards earning · window=' + result.windowDays + 'd from ' + result.windowFrom
+    + ' · rating=' + result.rating + '/' + result.ratingRows
+    + ' · sda=' + result.sda + '/' + result.sdaRows
     + ' · referral=' + result.referral + ' · alreadyPaid=' + result.skipped);
   return result;
 }

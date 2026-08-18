@@ -837,8 +837,10 @@ Note: this task runs automatically as long as the property "rewards.earn.enabled
     runner: async () => {
       const result = await rewardsService.runEarnCycle();
       logger.info(
-        `Rewards-earning cron · enabled=${result.enabled} · rating=${result.rating} · ` +
-        `sda=${result.sda} · referral=${result.referral} · alreadyPaid=${result.skipped}`
+        `Rewards-earning cron · paused=${result.paused} · window=${result.windowDays}d ` +
+        `from ${result.windowFrom} · rating=${result.rating}/${result.ratingRows} · ` +
+        `sda=${result.sda}/${result.sdaRows} · referral=${result.referral} · ` +
+        `alreadyPaid=${result.skipped}`
       );
       return result;
     },

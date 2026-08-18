@@ -3,18 +3,25 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const indexMigrationPath = path.join(
-  __dirname,
-  '..',
-  'migrations',
-  '2026-08-14-referral-profile-qualification-indexes.sql',
-);
-const menuMigrationPath = path.join(
-  __dirname,
-  '..',
-  'migrations',
-  '2026-08-14-reward-referrals-menu.sql',
-);
+/*
+ * A migration lives in migrations/ while it is pending and moves to
+ * migrations/executed/ once applied. Pinning either location alone makes the
+ * test fail the day the migration ships — which is exactly backwards, since
+ * an applied migration is the one whose contents matter most. Resolve from
+ * both, and fail loudly if it has genuinely gone missing.
+ */
+function migrationPath(filename) {
+  const candidates = [
+    path.join(__dirname, '..', 'migrations', filename),
+    path.join(__dirname, '..', 'migrations', 'executed', filename),
+  ];
+  const found = candidates.find((p) => fs.existsSync(p));
+  assert.ok(found, `migration ${filename} not found in migrations/ or migrations/executed/`);
+  return found;
+}
+
+const indexMigrationPath = migrationPath('2026-08-14-referral-profile-qualification-indexes.sql');
+const menuMigrationPath = migrationPath('2026-08-14-reward-referrals-menu.sql');
 
 test('referral migration adds one idempotent read-only CRM leaf and Admin grant', () => {
   const sql = fs.readFileSync(menuMigrationPath, 'utf8');
