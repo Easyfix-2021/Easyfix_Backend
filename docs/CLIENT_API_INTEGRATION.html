@@ -372,6 +372,80 @@
     white-space: nowrap;
   }
 
+  /* ── API version switch ───────────────────────────────── */
+  /*
+   * The whole mechanism is one attribute on .shell, so switching version is a
+   * single DOM write rather than a walk over every section — and the document
+   * ships as data-apiver="1", which is exactly the v1 page. With JavaScript
+   * off, or before the script at the foot of the page runs, a reader still
+   * sees a complete, correct v1 document; nothing depends on the script to
+   * become readable.
+   *
+   * !important because these rules must beat any display set by a component's
+   * own rule (nav.rail a, .env, section …) regardless of where that rule sits.
+   */
+  [data-apiver="1"] [data-ver="2"],
+  [data-apiver="2"] [data-ver="1"] { display: none !important; }
+
+  .verswitch {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    gap: 4px 10px;
+    margin-bottom: 10px;
+    line-height: 1;
+  }
+  .verswitch-lbl {
+    font-family: var(--mono);
+    font-size: 0.66rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    font-weight: 600;
+  }
+  .verseg {
+    position: relative;
+    display: inline-flex;
+    gap: 2px;
+    padding: 3px;
+    border: 1px solid var(--rule);
+    border-radius: 999px;
+    background: var(--surface-alt);
+  }
+  /* Kept in the tab order and in the accessibility tree — visually replaced by
+     its label, not removed. `display:none` here would make the control
+     unreachable by keyboard. */
+  .verseg input {
+    position: absolute;
+    left: 0; top: 0;
+    width: 1px; height: 1px;
+    margin: 0;
+    opacity: 0;
+    pointer-events: none;
+  }
+  .verseg label {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    padding: 3px 13px;
+    border-radius: 999px;
+    border: 1px solid transparent;
+    color: var(--ink-muted);
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+    transition: color .12s, background-color .12s, border-color .12s;
+  }
+  .verseg label:hover { color: var(--ink); }
+  .verseg input:checked + label {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .verseg input:focus-visible + label { outline: 2px solid var(--accent); outline-offset: 2px; }
+
   /* ── Checklist ────────────────────────────────────────── */
   ol.check { list-style: none; padding: 0; margin: 18px 0 0; counter-reset: step; }
   ol.check li {
@@ -430,7 +504,7 @@
   }
 </style>
 
-<div class="shell">
+<div class="shell" data-apiver="1">
 
   <header class="masthead">
     <div>
@@ -442,7 +516,16 @@
       <p>Book field-service jobs, track them to completion, and receive live status updates over webhooks.</p>
     </div>
     <div class="rev">
-      Updated 14 Aug 2026<br>
+      <div class="verswitch" role="radiogroup" aria-labelledby="apiver-label">
+        <span class="verswitch-lbl" id="apiver-label">API version</span>
+        <span class="verseg">
+          <input type="radio" name="apiver" id="apiver-1" value="1" checked>
+          <label for="apiver-1">v1</label>
+          <input type="radio" name="apiver" id="apiver-2" value="2">
+          <label for="apiver-2">v2</label>
+        </span>
+      </div>
+      Updated 18 Aug 2026<br>
       Replaces <code>core.easyfix.in/v1</code>
     </div>
   </header>
@@ -457,9 +540,10 @@
 
       <li class="grp">Core endpoints</li>
       <li><a href="#services">Service catalogue</a></li>
-      <li><a href="#create">Create a job</a></li>
+      <li data-ver="1"><a href="#create">Create a job</a></li>
+      <li data-ver="2"><a href="#create-v2">Create a job</a></li>
       <li><a href="#status">Job status</a></li>
-      <li><a href="#images">Upload images</a></li>
+      <li data-ver="1"><a href="#images">Upload images</a></li>
 
       <li class="grp">More endpoints</li>
       <li><a href="#more">Lookup &amp; tracking</a></li>
@@ -481,17 +565,18 @@
     <!-- ═══════════ GETTING STARTED ═══════════ -->
     <section id="start">
       <h2>Getting started</h2>
-      <p>The Partner API is a small, stable REST surface. Most integrations use four endpoints: read your service catalogue, create a job, upload photographs, and check status &mdash; with webhooks pushing progress to you so you never have to poll.</p>
+      <p data-ver="1">The Partner API is a small, stable REST surface. Most integrations use four endpoints: read your service catalogue, create a job, upload photographs, and check status &mdash; with webhooks pushing progress to you so you never have to poll.</p>
+      <p data-ver="2">The Partner API is a small, stable REST surface. Most v2 integrations use three endpoints: read your service catalogue, create a job with its photographs in a single call, and check status &mdash; with webhooks pushing progress to you so you never have to poll.</p>
 
       <h4>Base URLs</h4>
       <div class="envs">
         <div class="env prod">
           <span class="tag">Production</span>
-          <div class="url">https://backend.easyfix.in/api/integration/v1</div>
+          <div class="url">https://backend.easyfix.in/api/integration/<span data-ver="1">v1</span><span data-ver="2">v2</span></div>
         </div>
         <div class="env">
           <span class="tag">QA &mdash; build against this first</span>
-          <div class="url">https://qa.backend.easyfix.in/api/integration/v1</div>
+          <div class="url">https://qa.backend.easyfix.in/api/integration/<span data-ver="1">v1</span><span data-ver="2">v2</span></div>
         </div>
       </div>
 
@@ -500,11 +585,17 @@
       <h4>Your first call</h4>
       <pre><span class="c"># Confirm your credentials reach us and see your service catalogue</span>
 curl -u <span class="s">'YOUR_USERNAME:YOUR_PASSWORD'</span> \
-  <span class="s">'https://qa.backend.easyfix.in/api/integration/v1/services'</span></pre>
+  <span class="s">'https://qa.backend.easyfix.in/api/integration/<span data-ver="1">v1</span><span data-ver="2">v2</span>/services'</span></pre>
 
-      <div class="note">
+      <div class="note" data-ver="1">
         <span class="lbl">Moving from the old API?</span>
         <p><strong>Only the base URL changes.</strong> Every endpoint path, header, request body and response body stays exactly as it is today, as do your credentials, service IDs, job IDs and webhook events. See <a href="#changes">What changed</a>.</p>
+      </div>
+
+      <div class="note ok" data-ver="2">
+        <span class="lbl">v2 is opt-in, and v1 is not deprecated</span>
+        <p><strong>If you already integrate on v1, you need do nothing.</strong> v1 is unchanged, fully supported, and has no retirement date. It is not in maintenance mode and it is not a lesser version &mdash; it is simply the two-step way of attaching images.</p>
+        <p>v2 changes exactly one thing: <a href="#create-v2">creating a job</a> can carry its images in the same request. Everything else on this page &mdash; authentication, the response envelope, dates, errors, the service catalogue, job status, lookups and every webhook &mdash; is byte-for-byte identical across the two versions. Move an integration to v2 when the single-call create is worth it to you, and not before.</p>
       </div>
 
       <h4>This document</h4>
@@ -547,7 +638,7 @@ curl -u <span class="s">'YOUR_USERNAME:YOUR_PASSWORD'</span> \
       <h2>Conventions</h2>
 
       <h3>Response envelope</h3>
-      <p>Almost every response &mdash; success or failure &mdash; uses the same three-key envelope, with your real payload under <code>data</code>. The single exception is <a href="#create">job creation</a>, which returns the job object at the top level; that asymmetry is preserved from the previous API so existing integrations keep working.</p>
+      <p>Almost every response &mdash; success or failure &mdash; uses the same three-key envelope, with your real payload under <code>data</code>. The single exception is <a href="#create" data-href-v2="#create-v2">job creation</a>, which returns the job object at the top level; that asymmetry is preserved from the previous API so existing integrations keep working.</p>
       <pre>{
   <span class="k">"status"</span>:  <span class="s">"200"</span>,        <span class="c">// string, not a number</span>
   <span class="k">"message"</span>: <span class="s">"OK"</span>,
@@ -708,8 +799,8 @@ curl -u <span class="s">'YOUR_USERNAME:YOUR_PASSWORD'</span> \
       </div>
     </section>
 
-    <!-- ═══════════ CREATE JOB ═══════════ -->
-    <section id="create">
+    <!-- ═══════════ CREATE JOB (v1) ═══════════ -->
+    <section id="create" data-ver="1">
       <h2>Create a job</h2>
       <p>The main endpoint. One call books a technician visit: who the customer is, where they are, when they want it, and which contracted services apply.</p>
 
@@ -826,6 +917,118 @@ Location: /api/integration/v1/jobs/212251</span>
       </div>
     </section>
 
+    <!-- ═══════════ CREATE JOB (v2) ═══════════ -->
+    <section id="create-v2" data-ver="2">
+      <h2>Create a job, with its images</h2>
+      <p>The main endpoint. One call books a technician visit &mdash; who the customer is, where they are, when they want it, and which contracted services apply &mdash; and attaches the photographs that go with it.</p>
+
+      <div class="note ok">
+        <span class="lbl">Why v2 exists</span>
+        <p>On v1, a partner with three photographs makes four calls: three uploads to collect <code>imageId</code> values, then the create call carrying them. Each is a round trip, and <strong>the job does not exist until the last one lands</strong> &mdash; so a partner whose second upload fails is left holding orphan images and no job, with no job ID to retry against and nothing to show a customer.</p>
+        <p>v2 is one request. The job and its images go up together, and an image that fails never costs you the job.</p>
+      </div>
+
+      <div class="ep">
+        <div class="ep-head"><span class="verb post">POST</span><span class="path">/jobs</span></div>
+        <p>Creates a job and attaches up to five images. <span class="pill">Content-Type: multipart/form-data</span></p>
+
+        <h4>Parts</h4>
+        <div class="scroll">
+          <table>
+            <thead><tr><th>Name</th><th>Type</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td class="f">payload <span class="req">*</span></td><td class="t">string</td><td>The job, as a JSON string. <strong>Exactly the body v1's <code>POST /jobs</code> takes</strong> &mdash; every field identical.</td></tr>
+              <tr><td class="f">images</td><td class="t">binary</td><td>One image. <strong>Repeat the part once per image</strong> &mdash; maximum 5 parts, maximum 10&nbsp;MB each.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="note">
+          <span class="lbl">The job body is unchanged</span>
+          <p>The <code>payload</code> part is the same JSON v1 accepts &mdash; the same fields, the same required set, the same defaults, the same <code>DD-MM-YYYY HH:mm</code> dates. Rather than repeat all twenty rows here, read them on <a href="#create">v1's field table</a>; following that link switches this page to v1.</p>
+          <p><code>jobImageIds</code> still works exactly as it does on v1, so images you uploaded earlier can be adopted at creation as well &mdash; the <code>images</code> parts are attached alongside them, not instead of them.</p>
+        </div>
+
+        <p>Repeating one part name is how an HTML <code>&lt;input type="file" multiple&gt;</code> posts a file selection, so every HTTP client and every language supports it natively. There is no base64 encoding and no JSON envelope wrapped around the bytes &mdash; the files go up as files.</p>
+
+        <h4>Example</h4>
+        <pre>curl -u <span class="s">'USER:PASS'</span> \
+  -F <span class="s">'payload={"jobDesc":"Treadmill install","jobType":"Installation","requested_date":"20-08-2026 10:00","reference_id":"YOUR-ORDER-10231","customer":{"name":"Priya Sharma","mobile":"9999578666"},"address":{"address":"Sector 44, near Huda City Centre","city":{"city_name":"Gurgaon"},"pinCode":"122001"},"service_type":{"services":[{"service_id":24055}]}};type=application/json'</span> \
+  -F <span class="s">'images=@front.jpg'</span> \
+  -F <span class="s">'images=@serial-plate.jpg'</span> \
+  <span class="s">'https://backend.easyfix.in/api/integration/v2/jobs'</span></pre>
+
+        <div class="note ok">
+          <span class="lbl">No images? Then skip multipart entirely</span>
+          <p>If you have no photographs to send, <code>POST</code> plain <code>application/json</code> with just the job body &mdash; byte for byte a v1 create call, aimed at the v2 URL. Multipart is only needed when there are actually files to carry.</p>
+        </div>
+
+        <h4>Response &mdash; 201 Created</h4>
+        <p>The same body v1's create returns, plus an <code>images</code> array &mdash; and, as on v1, at the <em>top level</em> with no <code>status</code> / <code>message</code> / <code>data</code> envelope, alongside a <code>Location</code> header pointing at the new job.</p>
+        <pre><span class="c">HTTP/1.1 201 Created
+Location: /api/integration/v2/jobs/212251</span>
+
+{
+  <span class="k">"id"</span>: <span class="n">212251</span>,
+  <span class="k">"created_date"</span>: <span class="s">"18-08-2026 11:04"</span>,
+  <span class="k">"requested_date"</span>: <span class="s">"20-08-2026 10:00"</span>,
+  <span class="k">"reference_id"</span>: <span class="s">"YOUR-ORDER-10231"</span>,
+  <span class="k">"customer"</span>: { <span class="k">"id"</span>: <span class="n">55</span>, <span class="k">"mobile"</span>: <span class="s">"9999578666"</span>, <span class="k">"name"</span>: <span class="s">"Priya Sharma"</span> },
+  <span class="k">"address"</span>: { <span class="k">"address"</span>: <span class="s">"Sector 44, near Huda City Centre"</span>, <span class="k">"city"</span>: { <span class="k">"city_id"</span>: <span class="n">3</span>, <span class="k">"city_name"</span>: <span class="s">"Gurgaon"</span> }, <span class="k">"pinCode"</span>: <span class="s">"122001"</span> },
+  <span class="k">"images"</span>: [
+    { <span class="k">"imageId"</span>: <span class="n">408397</span>, <span class="k">"image"</span>: <span class="s">"18082026110412_front.jpg"</span>, <span class="k">"originalName"</span>: <span class="s">"front.jpg"</span>, <span class="k">"status"</span>: <span class="s">"attached"</span> },
+    { <span class="k">"imageId"</span>: <span class="n">408398</span>, <span class="k">"image"</span>: <span class="s">"18082026110412_serial-plate.jpg"</span>, <span class="k">"originalName"</span>: <span class="s">"serial-plate.jpg"</span>, <span class="k">"status"</span>: <span class="s">"attached"</span> }
+  ]
+}</pre>
+        <p>Store <code>id</code>. As on v1, fields with no value are <strong>omitted</strong> rather than sent as <code>null</code>, so treat every key as optional when parsing.</p>
+
+        <h4>The <code>images</code> array</h4>
+        <div class="scroll">
+          <table>
+            <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td class="f">imageId</td><td class="t">integer</td><td>Our ID for the stored image. Present only when <code>status</code> is <code>attached</code>.</td></tr>
+              <tr><td class="f">image</td><td class="t">string</td><td>The stored filename.</td></tr>
+              <tr><td class="f">originalName</td><td class="t">string</td><td>The filename you sent &mdash; match on this to tell the entries apart. Entries are returned in the order you sent them.</td></tr>
+              <tr><td class="f">status</td><td class="t">string</td><td><code>"attached"</code> or <code>"failed"</code>.</td></tr>
+              <tr><td class="f">reason</td><td class="t">string</td><td>Why it failed. Present only when <code>status</code> is <code>"failed"</code>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="note warn">
+          <span class="lbl">A failed image does not fail the request</span>
+          <p><strong>The job is created either way.</strong> By the time an image is being stored the job already exists and you need its ID &mdash; replying <code>500</code> would leave you re-posting a job we have already booked, and dispatching a technician twice. So an image that cannot be stored comes back as an entry in the array rather than as an error:</p>
+          <pre>{ <span class="k">"originalName"</span>: <span class="s">"serial-plate.jpg"</span>, <span class="k">"status"</span>: <span class="s">"failed"</span>, <span class="k">"reason"</span>: <span class="s">"Storage rejected the file"</span> }</pre>
+          <p><strong>Check the array, not just the HTTP code.</strong> A <code>201</code> means the job exists; it does not on its own mean every photograph landed.</p>
+          <p>Retry a failed image on its own against the job ID you now hold, using v1's <a href="#images"><code>POST /jobImage/addJobImages</code></a> with <code>JobId</code> set &mdash; that endpoint is unchanged and works against jobs created on either version. Nothing needs re-creating.</p>
+        </div>
+
+        <h4>Errors</h4>
+        <p>The request is rejected outright &mdash; and no job is created &mdash; in these cases:</p>
+        <div class="scroll">
+          <table>
+            <thead><tr><th>Code</th><th>Cause</th><th>What to do</th></tr></thead>
+            <tbody>
+              <tr><td class="f num">400</td><td>More than 5 <code>images</code> parts.</td><td>Send five, create the job, then add the rest with <a href="#images">v1's image upload</a> against the returned job ID.</td></tr>
+              <tr><td class="f num">400</td><td>An image larger than 10&nbsp;MB.</td><td>Compress or resize it. The limit is per file, not per request.</td></tr>
+              <tr><td class="f num">400</td><td>The <code>payload</code> part is missing, or is not valid JSON.</td><td>Send it as a JSON string in a part named exactly <code>payload</code>.</td></tr>
+              <tr><td class="f num">400</td><td>An unknown city in the job body.</td><td>Check the name against <a href="#more"><code>/cities</code></a>, or send <code>city_id</code>.</td></tr>
+              <tr><td class="f num">401</td><td>Credentials missing, wrong, or deactivated.</td><td>Check the <code>Authorization</code> header. See <a href="#auth">Authentication</a>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Every other failure behaves exactly as it does on v1 &mdash; same codes, same envelope, same meanings. See <a href="#errors">Errors</a>.</p>
+
+        <div class="note warn">
+          <span class="lbl">Retrying is still not de-duplicated</span>
+          <p>As on v1, a create that times out leaves you unable to tell whether the job was booked. <strong>Check before retrying</strong> &mdash; call <a href="#more"><code>/jobs/tracking</code></a> and look for your <code>reference_id</code>. A blind retry dispatches a technician twice, and re-uploads the photographs with it.</p>
+        </div>
+
+        <p>A new job starts as <strong>Pending for scheduling</strong> and moves on once a technician accepts &mdash; you will receive a <a href="#events"><code>TechAssigned</code></a> webhook when that happens.</p>
+      </div>
+    </section>
+
     <!-- ═══════════ STATUS ═══════════ -->
     <section id="status">
       <h2>Job status</h2>
@@ -864,8 +1067,8 @@ Location: /api/integration/v1/jobs/212251</span>
       </div>
     </section>
 
-    <!-- ═══════════ IMAGES ═══════════ -->
-    <section id="images">
+    <!-- ═══════════ IMAGES (v1) ═══════════ -->
+    <section id="images" data-ver="1">
       <h2>Upload images</h2>
       <p>Attach photographs to a job &mdash; the product to be installed, the site, a damage report.</p>
 
@@ -1190,3 +1393,149 @@ Location: /api/integration/v1/jobs/212251</span>
 
   </main>
 </div>
+
+<script>
+/*
+ * API version switch.
+ *
+ * The document ships as v1 and stays readable with this script disabled — the
+ * script only ever flips `data-apiver` on .shell; the CSS does the hiding.
+ *
+ * Three rules, in order of authority:
+ *   1. An incoming #hash wins. Deep links to v1 sections are already in
+ *      partners' bookmarks, wikis and support tickets, so a hash naming a
+ *      section that belongs to one version puts the page in that version —
+ *      whatever was remembered from earlier.
+ *   2. sessionStorage remembers a reader's choice for the tab.
+ *   3. Otherwise v1, the default a first-time reader must land on.
+ */
+(function () {
+  'use strict';
+
+  var KEY = 'easyfix.partner-api.version';
+  var shell = document.querySelector('.shell');
+  if (!shell) return;
+
+  var radios = [].slice.call(document.querySelectorAll('input[name="apiver"]'));
+  var links  = [].slice.call(document.querySelectorAll('a[data-href-v2]'));
+
+  /* When a version flip hides the section you were reading, land on its
+     counterpart rather than wherever the reflow happened to leave you. */
+  var COUNTERPART = { 'create': 'create-v2', 'images': 'create-v2', 'create-v2': 'create' };
+
+  function current() { return shell.getAttribute('data-apiver') === '2' ? '2' : '1'; }
+
+  /* The version an element belongs to: its own data-ver, or its nearest
+     ancestor's. null means shared — visible in both. */
+  function versionOf(el) {
+    for (var n = el; n && n.nodeType === 1; n = n.parentNode) {
+      var v = n.getAttribute('data-ver');
+      if (v) return v;
+    }
+    return null;
+  }
+
+  function hashTarget() {
+    var h = window.location.hash;
+    if (!h || h.length < 2) return null;
+    try { return document.getElementById(decodeURIComponent(h.slice(1))); }
+    catch (e) { return document.getElementById(h.slice(1)); }
+  }
+
+  function apply(v) {
+    shell.setAttribute('data-apiver', v);
+    for (var i = 0; i < radios.length; i++) radios[i].checked = (radios[i].value === v);
+    /* Shared prose links that have a per-version destination. The v1 href is
+       what the markup ships with, so capture it once before overwriting. */
+    for (var j = 0; j < links.length; j++) {
+      var a = links[j];
+      if (!a.getAttribute('data-href-v1')) a.setAttribute('data-href-v1', a.getAttribute('href'));
+      a.setAttribute('href', a.getAttribute(v === '2' ? 'data-href-v2' : 'data-href-v1'));
+    }
+    try { window.sessionStorage.setItem(KEY, v); } catch (e) { /* private mode, file:// */ }
+  }
+
+  function visible(el) { return !!(el && el.getClientRects().length); }
+
+  /* Switching version adds or removes whole sections, so everything below the
+     change moves. Note where the reader is first, and put them back after.
+     At the top of the page there is nothing to preserve — and scrolling would
+     only push the masthead, and the switch itself, out of sight. */
+  function scrollTop() {
+    /* `||` would be wrong here: a genuine 0 is falsy and would fall through. */
+    if (typeof window.pageYOffset === 'number') return window.pageYOffset;
+    return (document.documentElement && document.documentElement.scrollTop) || 0;
+  }
+
+  function anchorState() {
+    if (scrollTop() <= 4) return null;
+    var secs = document.querySelectorAll('main > section');
+    for (var i = 0; i < secs.length; i++) {
+      if (visible(secs[i]) && secs[i].getBoundingClientRect().bottom > 8) {
+        return { el: secs[i], top: secs[i].getBoundingClientRect().top };
+      }
+    }
+    return null;
+  }
+
+  function restore(state) {
+    if (!state) return;
+    var el = state.el, top = state.top;
+    if (!visible(el)) {
+      /* The section being read belongs to the version just left — land on its
+         counterpart instead of wherever the reflow happened to leave things. */
+      el = COUNTERPART[el.id] ? document.getElementById(COUNTERPART[el.id]) : null;
+      if (!visible(el)) return;
+      top = 24; /* matches section { scroll-margin-top } */
+    }
+    window.scrollBy(0, el.getBoundingClientRect().top - top);
+  }
+
+  /* ── initial state ──────────────────────────────────── */
+  var v = '1';
+  try {
+    var saved = window.sessionStorage.getItem(KEY);
+    if (saved === '1' || saved === '2') v = saved;
+  } catch (e) { /* ignore */ }
+
+  var landing = hashTarget();
+  if (landing) v = versionOf(landing) || v;
+
+  apply(v);
+  /* Showing or hiding sections moves everything below them, so the browser's
+     own jump to the hash is now aimed at the wrong offset. Redo it. */
+  if (landing) landing.scrollIntoView();
+
+  /* ── the control ────────────────────────────────────── */
+  for (var k = 0; k < radios.length; k++) {
+    radios[k].addEventListener('change', function () {
+      if (!this.checked) return;
+      var keep = anchorState();
+      apply(this.value === '2' ? '2' : '1');
+      restore(keep);
+    });
+  }
+
+  /* ── links into the other version ───────────────────── */
+  /* A shared section can link to version-specific content ("v1's field
+     table"). Switch before the browser jumps, so it jumps to a laid-out page. */
+  document.addEventListener('click', function (e) {
+    var a = e.target && e.target.closest ? e.target.closest('a[href^="#"]') : null;
+    if (!a) return;
+    var id = a.getAttribute('href').slice(1);
+    if (!id) return;
+    var t = document.getElementById(id);
+    if (!t) return;
+    var tv = versionOf(t);
+    if (tv && tv !== current()) apply(tv);
+  });
+
+  /* Back/forward, and any hash we did not set ourselves. */
+  window.addEventListener('hashchange', function () {
+    var t = hashTarget();
+    if (!t) return;
+    var tv = versionOf(t);
+    if (tv && tv !== current()) { apply(tv); t.scrollIntoView(); }
+  });
+})();
+</script>
