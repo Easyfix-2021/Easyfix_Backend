@@ -47,6 +47,7 @@ const compression = require('compression');
 const logger = require('./logger');
 const cors = require('./cors');
 const { testConnection, closePool } = require('./db');
+const { verifyReadPool, closeReadPool } = require('./db-read');
 const routes = require('./routes');
 const { notFound, errorHandler } = require('./middleware/error-handler');
 const { rateLimit } = require('./middleware/rate-limit');
@@ -245,6 +246,10 @@ app.use(errorHandler);
 async function start() {
   try {
     await testConnection();
+    // Announced loudly because the failure mode here is SILENCE: an unset
+    // DB_READ_HOST and a misconfigured one both leave the app working.
+    // Never fatal — see db-read.js.
+    await verifyReadPool();
   } catch (err) {
     logger.error(`Could not connect to the database — ${err.message || err.code}. Server will not start.`);
     process.exit(1);
@@ -382,6 +387,7 @@ async function start() {
     // doesn't keep the pool alive past closePool().
     scheduler.stop();
     server.close(async () => {
+      await closeReadPool().catch(() => {});
       await closePool().catch(() => {});
       logger.shutdown('Server stopped. Goodbye.');
       process.exit(0);

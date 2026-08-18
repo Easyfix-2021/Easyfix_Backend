@@ -1,5 +1,6 @@
 const router = require('express').Router();
 const { pool, getPoolStats } = require('../db');
+const { getReadPoolStats, identify } = require('../db-read');
 const { modernOk, modernError } = require('../utils/response');
 const integrationRouter = require('./integration');
 const lookup = require('../services/lookup.service');
@@ -23,18 +24,54 @@ router.get('/health', (_req, res) => {
   });
 });
 
+/*
+ * Reports BOTH pools.
+ *
+ * The replica block is the answer to "is the read replica ever actually
+ * used?" — a question nothing else can answer, because a replica that is
+ * unreachable and a replica that is serving every read both leave the
+ * application working. `replica.reads` staying at 0 under real traffic is
+ * the alarm; `distinctFromPrimary: false` catches the subtler case of
+ * DB_READ_HOST pointing at the primary under another name, which sheds no
+ * load while looking perfectly healthy.
+ *
+ * A replica probe failure does NOT make this endpoint 503. The replica is an
+ * optimisation, and the service is healthy without it — reporting otherwise
+ * would page someone for a degradation that costs nothing but throughput.
+ */
 router.get('/health/db', async (_req, res) => {
   const started = Date.now();
   try {
     const [rows] = await pool.query('SELECT 1 AS ok, DATABASE() AS db, NOW() AS ts');
+
+    const replica = getReadPoolStats();
+    if (replica.configured) {
+      const t0 = Date.now();
+      try {
+        const id = await identify();
+        replica.reachable = true;
+        replica.latencyMs = Date.now() - t0;
+        replica.readOnly = id.readOnly;
+        replica.serverId = id.serverId;
+        replica.hostname = id.hostname;
+        replica.distinctFromPrimary = id.distinctFromPrimary;
+      } catch (err) {
+        replica.reachable = false;
+        replica.error = err.code || err.message;
+      }
+    }
+
     return modernOk(res, {
       db: rows[0].db,
       ts: rows[0].ts,
       latencyMs: Date.now() - started,
       pool: getPoolStats(),
+      replica,
     });
   } catch (err) {
-    return modernError(res, 503, 'database unavailable', { code: err.code, pool: getPoolStats() });
+    return modernError(res, 503, 'database unavailable', {
+      code: err.code, pool: getPoolStats(), replica: getReadPoolStats(),
+    });
   }
 });
 
