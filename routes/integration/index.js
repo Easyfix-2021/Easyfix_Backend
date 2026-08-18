@@ -52,4 +52,18 @@ router.get('/docs', (_req, res) => {
 // /api/integration/v1/* — HTTP Basic Auth, Dropwizard-contract replacement
 router.use('/v1', require('./v1'));
 
+/*
+ * /api/integration/v2/* — additive, opt-in, and NOT bound by the legacy
+ * contract above.
+ *
+ * v1 is frozen because real partners depend on it byte-for-byte. v2 exists so
+ * improvements have somewhere to live: today it collapses the four-request
+ * "upload each image, then create the job with their ids" dance into one
+ * multipart request. Same auth, same field mapping, same response body.
+ *
+ * Mounting it separately rather than adding routes to v1 is the point — a v1
+ * caller cannot be affected by anything that happens in here.
+ */
+router.use('/v2', require('./v2'));
+
 module.exports = router;
