@@ -134,17 +134,52 @@ function breakerOpen() {
   return true;
 }
 
+/*
+ * Open (or RE-open) the breaker once the failure threshold is met.
+ *
+ * The re-arm is the important half. `openedAt` is only cleared by a SUCCESS,
+ * so a guard of `openedAt === null` opens the breaker exactly once in the
+ * lifetime of the process: after the first cooldown lapses, breakerOpen()
+ * returns false, the next attempt fails, and nothing re-opens it — so every
+ * call from then on pays the full connect timeout. Stamping openedAt on every
+ * past-threshold failure keeps the cooldown rolling while the replica is down,
+ * and logs only on the transition so a long outage stays one line.
+ */
+function openBreaker(code) {
+  const wasOpen = breakerOpen();
+  state.openedAt = Date.now();
+  if (!wasOpen) {
+    logger.warn(
+      `DB read replica unreachable (${code}) after ${state.consecutiveFailures} `
+      + `attempts — serving reads from the PRIMARY for the next ${Math.round(BREAKER_COOLDOWN_MS / 1000)}s`,
+    );
+  }
+}
+
+/*
+ * A PROBE failure — /api/health/db or startup verification, not a real read.
+ *
+ * Deliberately does NOT touch `fallbacks`: that counter answers "how many
+ * reads fell back to the primary", and inflating it with health checks would
+ * destroy the one signal that says whether the replica is carrying traffic.
+ * It does feed the breaker, because otherwise nothing does while the read pool
+ * is unwired — which is exactly how /api/health/db came to pay a 5s timeout on
+ * every single call in production.
+ */
+function recordProbeFailure(err) {
+  state.consecutiveFailures += 1;
+  state.lastProbeAt = new Date();
+  state.lastProbeCode = err && err.code ? err.code : 'UNKNOWN';
+  if (state.consecutiveFailures >= BREAKER_THRESHOLD) openBreaker(state.lastProbeCode);
+}
+
 function recordFailure(err) {
   state.consecutiveFailures += 1;
   state.fallbacks += 1;
   state.lastFallbackAt = new Date();
   state.lastFallbackCode = err && err.code ? err.code : 'UNKNOWN';
-  if (state.consecutiveFailures >= BREAKER_THRESHOLD && state.openedAt === null) {
-    state.openedAt = Date.now();
-    logger.warn(
-      `DB read replica unreachable (${state.lastFallbackCode}) after ${state.consecutiveFailures} `
-      + `attempts — serving reads from the PRIMARY for the next ${Math.round(BREAKER_COOLDOWN_MS / 1000)}s`,
-    );
+  if (state.consecutiveFailures >= BREAKER_THRESHOLD) {
+    openBreaker(state.lastFallbackCode);
   } else if (state.fallbacks === 1 || state.fallbacks % 50 === 0) {
     // Rate-limited: one line per burst, not one per query.
     logger.warn(`DB read fell back to primary (${state.lastFallbackCode}) · total fallbacks: ${state.fallbacks}`);
@@ -197,9 +232,17 @@ async function readQuery(sql, params) {
  */
 async function identify() {
   if (!readPool) return null;
-  const [[replica]] = await readPool.query(
-    'SELECT @@server_id AS serverId, @@hostname AS hostname, @@read_only AS readOnly',
-  );
+  let replica;
+  try {
+    ([[replica]] = await readPool.query(
+      'SELECT @@server_id AS serverId, @@hostname AS hostname, @@read_only AS readOnly',
+    ));
+    recordSuccess();
+  } catch (err) {
+    // Feed the breaker, then rethrow so the caller still reports the reason.
+    if (isConnectionFailure(err)) recordProbeFailure(err);
+    throw err;
+  }
   let primaryServerId = null;
   try {
     const [[primary]] = await primaryPool.query('SELECT @@server_id AS serverId');
@@ -272,5 +315,6 @@ async function closeReadPool() {
 
 module.exports = {
   readPool, readQuery, getReadPoolStats, verifyReadPool, closeReadPool, identify,
+  breakerOpen,
   isConnectionFailure, isConfigured: () => CONFIGURED,
 };

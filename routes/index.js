@@ -1,6 +1,6 @@
 const router = require('express').Router();
 const { pool, getPoolStats } = require('../db');
-const { getReadPoolStats, identify } = require('../db-read');
+const { getReadPoolStats, identify, breakerOpen } = require('../db-read');
 const { modernOk, modernError } = require('../utils/response');
 const integrationRouter = require('./integration');
 const lookup = require('../services/lookup.service');
@@ -45,7 +45,26 @@ router.get('/health/db', async (_req, res) => {
     const [rows] = await pool.query('SELECT 1 AS ok, DATABASE() AS db, NOW() AS ts');
 
     const replica = getReadPoolStats();
-    if (replica.configured) {
+    /*
+     * Skip the probe while the breaker is OPEN.
+     *
+     * An unreachable replica costs DB_READ_CONNECT_TIMEOUT (5s) per probe, and
+     * this endpoint probed unconditionally — so on production, where the
+     * replica is currently unreachable, /api/health/db took 5,003ms on EVERY
+     * call. Any monitor or load-balancer check with a sub-5s timeout would
+     * declare the backend unhealthy over an optimisation that is deliberately
+     * wired to no flow at all.
+     *
+     * Reporting the last known state during the cooldown is not a loss of
+     * information: reachable:false with the recorded error code is exactly
+     * what the probe would have told us, arrived at without the wait. The
+     * cooldown still lets one probe through periodically, so recovery is
+     * detected on its own.
+     */
+    if (replica.configured && breakerOpen()) {
+      replica.reachable = false;
+      replica.probeSkipped = 'breaker open — reporting last known state without paying the connect timeout';
+    } else if (replica.configured) {
       const t0 = Date.now();
       try {
         const id = await identify();
