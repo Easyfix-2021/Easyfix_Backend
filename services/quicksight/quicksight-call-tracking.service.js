@@ -226,11 +226,125 @@ const LEGS_PER_CALL_BUDGET = 12;
  *   'kaleyra' → everything else, NULL included        (Kaleyra + old-CRM history)
  * Default ('' / absent) applies NO provider predicate, so both tabs include
  * every call from both vendors — which is the behaviour ops relies on.
+ *
+ * ── THE DISPLAY MUST USE THE SAME RULE (fixed 2026-08-19) ──────────────────
+ * The filter above knew all of this; the drill-down's Provider column did not.
+ * It projected the raw column, so the seven calls on job 529116 from 18 Aug
+ * 2026 rendered an EMPTY Provider cell — while filtering the very same report
+ * by Kaleyra returned those same seven rows. One file, two beliefs: the filter
+ * said "unstamped means Kaleyra" and the cell said "unstamped means nothing".
+ *
+ * So the rule is written ONCE, here, and BOTH the WHERE clause and the label
+ * are derived from it. `isPlivo` is the whole rule; everything else in
+ * PROVIDER_RULE is that one predicate re-used. Adding a second expression of
+ * the same knowledge anywhere below is how this bug comes back.
+ *
+ * ⚠ `notPlivo` spells the IS NULL arm out instead of writing NOT (isPlivo)
+ * because SQL is three-valued: NOT (NULL = 'plivo') is NULL, not TRUE, and the
+ * 941,968 unstamped rows ARE the Kaleyra history — they must not fall out of
+ * the Kaleyra tab. The two clauses PARTITION the rows (every row matches
+ * exactly one), which tests/quicksight-call-tracking-provider.test.js pins.
+ *
+ * ⚠ NO DATE BOUNDARY. The rule buckets on the VALUE alone. "NULL means the old
+ * CRM, which stopped 2026-06-04" is falsified by the very rows that were
+ * reported — they are from 18 Aug 2026. A cutoff date would relabel them
+ * 'Unknown' and reproduce the same contradiction with a different word in the
+ * cell, and would rot again the moment one more legacy row lands.
+ *
+ * ⚠ THREE SPELLINGS OF "NOTHING WAS STAMPED". NULL, '' and whitespace-only
+ * render identically but are NOT interchangeable to SQL — '' is invisible to
+ * IS NULL, and the measured data above contains '' rows. Every place that
+ * inspects the VALUE therefore reads `value` (NULLIF(TRIM(...), '')), so all
+ * three collapse to one state. The label needs no such guard: all three fall to
+ * the ELSE arm and come out 'Kaleyra' together.
+ *
+ * ⚠ INFERRED, NOT ASSERTED. `namedFlag` is 1 only when the column itself names
+ * a vendor ('plivo' / 'kaleyra'); NULL, '', whitespace and the 2021 telecom
+ * CARRIER values ('JIO', 'Airtel', …) are 0. The consumer emits that as
+ * providerAssumed so a reader can tell a stamped vendor from a deduced one, and
+ * the raw stored string is returned beside it rather than thrown away. The
+ * carriers are never PRINTED as the vendor — 'JIO' in a Provider column is
+ * simply wrong — but the fact that something was stored survives.
+ *
+ * ⚠ THIS RULE IS FOR DISPLAY AND FILTERING ONLY. The BEHAVIOURAL surfaces —
+ * recording playback, re-analyse, hangup, and GET /admin/calls
+ * (routes/admin/calls.js) — must keep reading the RAW column: an INFERRED
+ * vendor cannot be dialled, hung up, or fetched a recording from. If one of
+ * those ever wants a human label, it adds a NEW field beside the raw one. It
+ * never replaces it.
+ *
+ * WHERE THE UNSTAMPED-BUT-RECENT ROWS COME FROM: not from this repo. All four
+ * INSERT sites stamp a non-empty provider and no UPDATE can blank it; of those
+ * four, only the two admin inserts (routes/admin/calls.js) set caller_id, and
+ * buildScope's derived table requires caller_id IS NOT NULL. So within this
+ * codebase the intersection of "visible in this report" and "provider
+ * unstamped" is empty — those rows were written by something outside
+ * EasyFix_Backend. Do not go looking for a write-side bug here.
  */
 const PROVIDERS = Object.freeze(['plivo', 'kaleyra']);
+const PROVIDER_COLUMN = 'jci.provider';
+const PROVIDER_STAMP_PLIVO = 'plivo';
+const PROVIDER_STAMP_KALEYRA = 'kaleyra';
+// What a human reads in the Provider cell. Only two vendors have ever existed,
+// so this list is closed and the label is never empty.
+const PROVIDER_LABELS = Object.freeze({ plivo: 'Plivo', kaleyra: 'Kaleyra' });
+
+// The one predicate. Compared against a literal on the RAW column, deliberately
+// not the trimmed value: this exact text is what the Plivo filter has always
+// used, and rewriting it as NULLIF(TRIM(...)) = 'plivo' would change which rows
+// the filter returns for a leading-space value. The filter's row set is frozen.
+const PROVIDER_IS_PLIVO = `${PROVIDER_COLUMN} = '${PROVIDER_STAMP_PLIVO}'`;
+// The one normalisation, for the two places that read the VALUE rather than
+// test it: NULL / '' / whitespace-only are the same state — nothing stamped.
+const PROVIDER_VALUE = `NULLIF(TRIM(${PROVIDER_COLUMN}), '')`;
+
+const PROVIDER_RULE = Object.freeze({
+  isPlivo: PROVIDER_IS_PLIVO,
+  /*
+   * The exact complement of isPlivo, spelled out rather than written as
+   * NOT (isPlivo): SQL three-valued logic makes NOT (NULL = 'plivo') itself
+   * NULL, which would drop all 941,968 unstamped rows out of the Kaleyra tab —
+   * the very rows the tab exists to include. Built from the SAME two constants
+   * as isPlivo, so it cannot drift, but note it does NOT textually contain
+   * isPlivo; the agreement table in the test is what proves this arm.
+   */
+  notPlivo: `(${PROVIDER_COLUMN} IS NULL OR ${PROVIDER_COLUMN} <> '${PROVIDER_STAMP_PLIVO}')`,
+  value: PROVIDER_VALUE,
+  // Never NULL: every row lands on one of the two arms, which is precisely what
+  // stops the FE cell ({provider || '—'}) from blanking.
+  label: `CASE WHEN ${PROVIDER_IS_PLIVO} THEN '${PROVIDER_LABELS.plivo}'`
+    + ` ELSE '${PROVIDER_LABELS.kaleyra}' END`,
+  // 1/0 rather than a bare boolean expression, for the same reason as
+  // ASSIGNED_AT_CALL: the driver's typing of a 3-valued expression is not
+  // something this file should depend on (NULL OR NULL is NULL, not 0).
+  /*
+   * ⚠ ONE NORMALISATION FOR THE VENDOR TEST, and it is the FILTER's.
+   *
+   * This arm read the RAW column for plivo and the TRIMMED value for kaleyra,
+   * which put two beliefs about the same column inside the one rule that exists
+   * to end exactly that. A row stamped ' plivo' (leading space) then tested
+   * FALSE for plivo, fell to the ELSE, and was printed as **Kaleyra** — an
+   * actively wrong vendor name, where the old blank-prone cell at least printed
+   * the raw ' plivo' correctly.
+   *
+   * So both arms compare the raw column, the same way isPlivo/notPlivo do. The
+   * invariant that matters is THE CELL NAMES THE TAB THE ROW APPEARS IN, and
+   * that holds for every value only while the label and the filter share one
+   * comparison. A whitespace-padded stamp therefore lands in the Kaleyra tab,
+   * reads "Kaleyra", and is marked NOT stamped — which is the honest reading of
+   * a value the filter itself does not recognise, and providerRaw carries the
+   * ' plivo' through to the tooltip so no information is lost.
+   *
+   * PROVIDER_VALUE (trimmed) is kept for the RAW-VALUE passthrough only, never
+   * for deciding a vendor.
+   */
+  namedFlag: `CASE WHEN ${PROVIDER_IS_PLIVO}`
+    + ` OR ${PROVIDER_COLUMN} = '${PROVIDER_STAMP_KALEYRA}' THEN 1 ELSE 0 END`,
+});
+
 const PROVIDER_CLAUSE = Object.freeze({
-  plivo: " AND jci.provider = 'plivo'",
-  kaleyra: " AND (jci.provider IS NULL OR jci.provider <> 'plivo')",
+  plivo: ` AND ${PROVIDER_RULE.isPlivo}`,
+  kaleyra: ` AND ${PROVIDER_RULE.notPlivo}`,
 });
 
 const n = (v) => Number(v) || 0;
@@ -1269,7 +1383,18 @@ async function getCallDetails(filters = {}, selection = {}) {
             jci.job_status      AS jobStatusAtCall,
             ${ASSIGNED_AT_CALL} AS assignedFlag,
             jci.duration        AS durationSecs,
-            jci.provider        AS provider,
+            /*
+             * The vendor, through the SAME rule the provider FILTER uses (see
+             * PROVIDER_RULE): the never-NULL label the cell prints, whether the
+             * column actually named that vendor, and the raw stored string with
+             * NULL / empty / whitespace normalised to NULL. The raw column is
+             * deliberately no longer projected under the name provider: an
+             * unstamped row IS a Kaleyra row, and printing nothing for it is
+             * what the filter had already decided was wrong.
+             */
+            ${PROVIDER_RULE.label}     AS providerLabel,
+            ${PROVIDER_RULE.namedFlag} AS providerNamedFlag,
+            ${PROVIDER_RULE.value}     AS providerRaw,
             jci.caller_status   AS callerStatus,
             -- Whether a recording key was ever stored. The key itself is NOT
             -- returned: playback goes through the existing authorised call-audio
@@ -1320,7 +1445,26 @@ async function getCallDetails(filters = {}, selection = {}) {
       assignedAtCall: Number(r.assignedFlag) === 1,
       durationSecs: r.durationSecs == null ? null : Number(r.durationSecs),
       connected: n(r.durationSecs) > 0,
-      provider: r.provider || null,
+      /*
+       * NEVER NULL — the existing Provider cell renders {provider || '—'} and
+       * an em-dash beside a Kaleyra-only filter result is the reported bug. The
+       * `||` is a belt-and-braces fallback: PROVIDER_RULE.label has no NULL arm,
+       * so this can only fire if the column disappears from the projection, and
+       * defaulting to the inferred vendor is the same answer the filter gives.
+       */
+      provider: r.providerLabel || PROVIDER_LABELS.kaleyra,
+      /*
+       * ADDITIVE, and true for the overwhelming majority of rows: the column did
+       * not name a vendor, we DEDUCED one from "only two vendors have ever
+       * existed". A consumer can mark it '(assumed)'; the current FE ignores it.
+       */
+      providerAssumed: Number(r.providerNamedFlag) !== 1,
+      /*
+       * What was actually stored, or null when nothing was — including the 2021
+       * telecom-CARRIER values, which belong in a tooltip and never in the
+       * Provider cell itself ('JIO' is not a voice vendor).
+       */
+      providerRaw: (r.providerRaw && String(r.providerRaw).trim()) || null,
       callerStatus: r.callerStatus || null,
       /*
        * The recording is the ROOM's, not a leg's — a Multi-Party Call produces
@@ -1476,7 +1620,8 @@ module.exports = {
   PROVIDERS,
   /*
    * Test seam — the pure averaging helper and the SQL fragment that produces its
-   * denominator, so tests can pin "per day means per ACTIVE day" without a DB.
+   * denominator, plus the voice-vendor rule and the clauses derived from it, so
+   * a test can prove the FILTER and the LABEL still agree without a DB.
    */
-  _test: { perDay, ACTIVE_DAYS, DAY_EXPR },
+  _test: { perDay, ACTIVE_DAYS, DAY_EXPR, PROVIDER_RULE, PROVIDER_CLAUSE, PROVIDER_LABELS },
 };

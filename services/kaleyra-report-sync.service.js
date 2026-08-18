@@ -91,7 +91,29 @@ async function applyReportToRow(jobCallerInfoId, report) {
   const receiverSt = report.calleestate   || report.receiver_status || report.reciever_status || null;
   const recording  = report.recording || report.recording_url || null;
   const location   = report.location  || null;
-  const provider   = report.provider  || null;
+  /*
+   * `report.provider` is DELIBERATELY NOT READ (2026-08-19).
+   *
+   * It is Kaleyra's TELECOM CARRIER for the leg — 'JIO', 'Airtel', 'Vodafone',
+   * 'IDEA', 'BSNL' — not the voice VENDOR that placed the call, which is the
+   * only thing tbl_job_caller_info.provider means to the rest of the system.
+   * Writing it through `provider = COALESCE(?, provider)` could overwrite a
+   * correct 'kaleyra' stamp with 'Airtel', and that is almost certainly where
+   * the ~2,721 carrier-valued rows measured in 2021 came from (the count and
+   * the analysis live above PROVIDER_RULE in
+   * services/quicksight/quicksight-call-tracking.service.js).
+   *
+   * There is nothing to lose by dropping the write: the work-list query above
+   * only ever selects rows that are ALREADY known to be Kaleyra's
+   * (provider = 'kaleyra' OR provider IS NULL), so this cron can never learn a
+   * vendor it did not already know. Every write it could make is either a
+   * no-op or the corruption described.
+   *
+   * It does NOT back-stamp 'kaleyra' onto the NULL rows either. "Unstamped
+   * means Kaleyra" is an INFERENCE the report makes and marks as inferred; a
+   * cron that wrote it into the column would turn that inference into an
+   * assertion no later reader could tell apart from a real stamp.
+   */
 
   await pool.query(
     `UPDATE tbl_job_caller_info
@@ -102,12 +124,9 @@ async function applyReportToRow(jobCallerInfoId, report) {
             reciever_status = ?,
             recording       = ?,
             location        = ?,
-            -- COALESCE so a Kaleyra report (which carries no provider field)
-            -- never NULLs out the 'kaleyra' value the route stamps at insert.
-            provider        = COALESCE(?, provider),
             is_updated      = 1
       WHERE job_caller_info = ?`,
-    [startTime, endTime, duration, callerSt, receiverSt, recording, location, provider, jobCallerInfoId]
+    [startTime, endTime, duration, callerSt, receiverSt, recording, location, jobCallerInfoId]
   );
   logger.info(`Caller-info updated · id=${jobCallerInfoId} · duration=${duration ?? '—'}`);
 }
