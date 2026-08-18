@@ -54,7 +54,13 @@ const MOBILE = '919876543210';
 const DATE = '2099-03-04';
 const DATE_LABEL = convo.formatCustomerDateLabel(DATE);          // 'Wed, 04 Mar 2099'
 const SLOT_LABEL = convo.slotForHour(16).label;                  // '4 PM–5 PM' (en dash)
-const SLOT_LIST = convo.ONE_HOUR_SLOT_LABELS.join('\n');
+/*
+ * The slot question now offers a SHORTLIST, not all ten frames (product
+ * feedback, 2026-08-18). This fixture's context carries no `offered_hour`, so
+ * the shortlist is the fixed spread across the working day — written out
+ * literally here, like every other expected string in this file.
+ */
+const SLOT_LIST = ['9 AM–10 AM', '12 PM–1 PM', '3 PM–4 PM', '6 PM–7 PM'].join('\n');
 
 /* ── The copy as it stands today, written out in full ──────────────────────
  * Deliberately literal. Deriving these from the service would make the test
@@ -62,11 +68,11 @@ const SLOT_LIST = convo.ONE_HOUR_SLOT_LABELS.join('\n');
  */
 const TODAY = {
   slot: `Great — we’ll keep your visit on ${DATE_LABEL}.\n\n`
-    + 'Which 1-hour slot suits you best? Just reply with the start time (e.g. "10 AM" or "4 PM").\n\n'
-    + `Available slots:\n${SLOT_LIST}`,
+    + 'What time suits you best? Any 1-hour slot between 9 AM and 7 PM works — just reply with the start time (e.g. "10 AM" or "6.30 PM").\n\n'
+    + `For example:\n${SLOT_LIST}`,
   slotRetry: 'Sorry, I couldn’t read that time.\n\n'
-    + 'Which 1-hour slot suits you best? Just reply with the start time (e.g. "10 AM" or "4 PM").\n\n'
-    + `Available slots:\n${SLOT_LIST}`,
+    + 'What time suits you best? Any 1-hour slot between 9 AM and 7 PM works — just reply with the start time (e.g. "10 AM" or "6.30 PM").\n\n'
+    + `For example:\n${SLOT_LIST}`,
   reschedule: 'No problem — we’ll move your visit.\n\n'
     + 'Which date would you prefer? Please share a future date (e.g. "tomorrow", "5 Aug" or "05-08-2026").',
   cancelReason: 'Understood. May I know the reason? Please reply in your own words — it helps us improve.',

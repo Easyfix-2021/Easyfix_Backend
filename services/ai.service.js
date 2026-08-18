@@ -31,6 +31,9 @@ const logger = require('../logger');
  * so the caller falls back to a re-prompt (never crashes the conversation).
  * sophy.chatJson returns null on ANY failure, which maps to the same safe
  * 'unclear' outcome — the conversation always degrades to a plain re-ask.
+ * A disabled gate is ANNOUNCED once per process (warnDisabledOnce) naming the
+ * failing condition, because "off" and "on but could not read it" used to look
+ * identical in the logs.
  *
  * ─── TWO EXPORTS, TWO VERY DIFFERENT POWERS ────────────────────────────────
  *
@@ -56,9 +59,47 @@ const sophy = require('./sophy.service');
 // simply disabled rather than silently borrowing another feature's quota.
 const conversationKey = () => process.env.SOPHY_API_KEY_CONVERSATION;
 
+const CONVERSATION_FLAG = 'AI_CONVERSATION_ENABLED';
+const CONVERSATION_KEY_VAR = 'SOPHY_API_KEY_CONVERSATION';
+
+function flagOn() {
+  return String(process.env[CONVERSATION_FLAG]).toLowerCase() === 'true';
+}
+
 function aiEnabled() {
-  return String(process.env.AI_CONVERSATION_ENABLED).toLowerCase() === 'true'
-    && sophy.enabled(conversationKey());
+  return flagOn() && sophy.enabled(conversationKey());
+}
+
+/*
+ * ── A DISABLED AI MUST SAY SO — ONCE ────────────────────────────────────
+ *
+ * Until 2026-08-18 a disabled AI was INVISIBLE: interpretReply returned
+ * { intent: 'unclear', disabled: true } silently, which in the logs is
+ * indistinguishable from an AI that ran and could not read the customer's text.
+ * A customer typed "20th Aig" on job 523247, got a re-ask, and finding out WHY
+ * took a sweep of 676k lines of production log across 8 days — in which there
+ * is not one AI success, not one AI failure and not one mention of Sophy,
+ * because the feature has never been switched on in production.
+ *
+ * ⚠ ONCE PER PROCESS, not per call. This flow takes ~14,000 inbound messages a
+ * week; a per-message line would be pure noise and would bury the one signal it
+ * exists to give. A module-scope flag is therefore the whole mechanism.
+ *
+ * The line names WHICH condition failed — the flag, the key, or both — because
+ * a reader must not have to go and diff two env vars to find out which half is
+ * missing.
+ */
+let disabledStateWarned = false;
+
+function warnDisabledOnce(step) {
+  if (disabledStateWarned) return;
+  disabledStateWarned = true;
+  const missing = [
+    flagOn() ? null : `${CONVERSATION_FLAG} is not "true" (currently ${JSON.stringify(process.env[CONVERSATION_FLAG] ?? null)})`,
+    sophy.enabled(conversationKey()) ? null : `${CONVERSATION_KEY_VAR} is not set`,
+  ].filter(Boolean).join(' AND ');
+  logger.warn('AI NLU is DISABLED — free-text replies fall back to the deterministic parser and a re-ask · '
+    + missing + ' · first seen at step=' + step + ' · logged once per process');
 }
 
 // IST "today" context so the model can resolve relative dates ("tomorrow",
@@ -109,7 +150,12 @@ function istTodayContext() {
 async function interpretReply({ step, text, timeSlots = [] }) {
   const raw = String(text || '').trim();
   if (!raw) return { intent: 'unclear', confidence: 0 };
-  if (!aiEnabled()) return { intent: 'unclear', disabled: true, confidence: 0 };
+  if (!aiEnabled()) {
+    // Says so exactly once per process — see warnDisabledOnce. The RETURN VALUE
+    // is unchanged, so the caller degrades exactly as it does today.
+    warnDisabledOnce(step);
+    return { intent: 'unclear', disabled: true, confidence: 0 };
+  }
 
   const today = istTodayContext();
   // No model name logged: Sophy resolves the model from the key, so printing a
@@ -294,7 +340,18 @@ function validateGenerated(text, { allowed, maxChars = GEN_MAX_CHARS } = {}) {
 async function composeMessage({ kind, ask, facts = {}, fallback, maxChars = GEN_MAX_CHARS } = {}) {
   const safe = typeof fallback === 'string' ? fallback : '';
   if (!safe.trim()) return { text: safe, generated: false, reason: 'no_fallback' };
-  if (!aiEnabled()) return { text: safe, generated: false, reason: 'disabled' };
+  /*
+   * The PHRASING half has to announce itself too. It gates on the same
+   * aiEnabled() and runs on EVERY outbound prompt, so it is hit earlier and far
+   * more often than interpretReply — leaving it silent would half-fix the very
+   * defect this warning exists for ("off" and "on but unhelpful" reading the
+   * same in the log). Shared flag, so the pair still costs ONE line per process
+   * whichever of them is reached first.
+   */
+  if (!aiEnabled()) {
+    warnDisabledOnce('compose:' + (kind || 'unknown'));
+    return { text: safe, generated: false, reason: 'disabled' };
+  }
 
   // Only non-empty facts are offered — a "date: null" line invites the model to
   // fill the blank, which is precisely what it must not do.

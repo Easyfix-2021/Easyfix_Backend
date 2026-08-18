@@ -47,8 +47,9 @@ const slotModel = require('./time-slot');
  *                                reason categories (+ 'Other'), the VERBATIM
  *                                text is stored alongside → close
  *
- *   awaiting_extras            → PURELY OPTIONAL, runs AFTER the job is
- *                                already confirmed:
+ *   awaiting_extras            → asks DIRECTLY for the details that make the
+ *                                visit go well, but cannot block anything —
+ *                                it runs AFTER the job is already confirmed:
  *                                  • photos/videos → existing media ingest
  *                                  • location pin  → tbl_address.gps_location
  *                                  • silence       → still fully confirmed
@@ -190,6 +191,10 @@ function templateButtonValues() {
 
 const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+// Full month names, index-aligned with MONTHS. Only the typo-tolerant fallback
+// reads these: "septmber" is one edit from "september" but three from "sep".
+const MONTH_NAMES = ['january', 'february', 'march', 'april', 'may', 'june',
+  'july', 'august', 'september', 'october', 'november', 'december'];
 const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 // IST calendar day ('YYYY-MM-DD') for a UTC instant. IST is a fixed +05:30
@@ -260,6 +265,71 @@ function slotForHour(h) {
 
 const ONE_HOUR_SLOTS = Object.freeze(SLOT_START_HOURS.map(slotForHour));
 const ONE_HOUR_SLOT_LABELS = Object.freeze(ONE_HOUR_SLOTS.map((s) => s.label));
+
+/*
+ * ── THE PROMPT SHORTLIST ────────────────────────────────────────────────
+ *
+ * How many 1-hour frames the slot QUESTION lists. Product feedback 2026-08-18:
+ * ten frames is ten lines of a WhatsApp message and nobody reads them; show
+ * 3–5.
+ *
+ * ⚠ THIS NARROWS THE PROMPT, NEVER THE DOMAIN. parseOneHourSlot /
+ * slotByLabelOrStart still accept ANY frame in the working day — the live run
+ * that prompted this change had a customer type "6.30pm" in free text and be
+ * booked into 6 PM–7 PM. So the copy must say the list is a suggestion: a
+ * customer who reads it as the only choices has been narrowed by wording we
+ * did not intend, and will pick a worse time than the one they wanted.
+ */
+const SLOT_SHORTLIST_SIZE = 4;
+
+// "9 AM and 7 PM" — the full accepted window, stated in the prompt so the
+// shortlist cannot read as exhaustive. Derived from the slot model, so widening
+// SLOT_START_HOURS updates the sentence rather than making it a lie.
+const WORKING_DAY_LABEL = hour12Label(SLOT_START_HOURS[0])
+  + ' and ' + hour12Label(SLOT_START_HOURS[SLOT_START_HOURS.length - 1] + 1);
+
+/*
+ * shortlistSlots(aroundHour) → 3–5 slot descriptors to OFFER as examples.
+ *
+ * The appointment already on the job is the best evidence of what suits this
+ * customer, so when we know that hour the window is CENTRED on it (a customer
+ * being rescheduled from 4 PM is far likelier to want 3–6 PM than 9 AM).
+ *
+ * With no usable hour we fall back to an even spread across the working day —
+ * morning / midday / afternoon / evening — rather than the first N, which would
+ * always say 9 AM and would make an evening customer scroll for nothing.
+ */
+function shortlistSlots(aroundHour = null) {
+  const n = Math.max(1, Math.min(SLOT_SHORTLIST_SIZE, ONE_HOUR_SLOTS.length));
+  const last = ONE_HOUR_SLOTS.length - 1;
+
+  const anchor = ONE_HOUR_SLOTS.findIndex((s) => s.hour === Number(aroundHour));
+  if (anchor >= 0) {
+    // Centre, then clamp so the window never runs off either end of the day.
+    const start = Math.min(Math.max(anchor - Math.floor((n - 1) / 2), 0), last + 1 - n);
+    return ONE_HOUR_SLOTS.slice(start, start + n);
+  }
+
+  const step = n > 1 ? last / (n - 1) : 0;
+  const picked = [];
+  for (let i = 0; i < n; i++) picked.push(ONE_HOUR_SLOTS[Math.round(i * step)]);
+  return picked;
+}
+
+/*
+ * The 1-hour start hour recorded in the conversation context, or null.
+ * `offered_hour` is seeded from the job's existing appointment at
+ * startConversation. Null (missing on rows created before 2026-08-18, or the
+ * legacy 00:00 "no time captured" sentinel, or an hour outside the working day)
+ * means "no evidence" and the caller falls back to the fixed spread — an old
+ * in-flight row must still get a sensible prompt.
+ */
+function contextSlotHour(ctx) {
+  const m = /^(\d{1,2}):\d{2}/.exec(String((ctx && ctx.offered_hour) || '').trim());
+  if (!m) return null;
+  const h = Number(m[1]);
+  return SLOT_START_HOURS.includes(h) ? h : null;
+}
 
 /*
  * Normalise customer free text for parsing: lowercase, unicode dashes → '-',
@@ -371,9 +441,24 @@ function matchTemplateChoice(value) {
  *
  * When no year is given we take the current IST year and roll forward one year
  * if that lands in the past — so "5 Jan" in December means next January.
+ *
+ * ORDER OF RESOLUTION (2026-08-18): exact parse → FUZZY month-name parse →
+ * (caller) ai.service. The fuzzy pass below is what reads "20th Aig"; it runs
+ * only after everything here has failed, so no exact behaviour changes. The AI
+ * stays the last resort on purpose — it is off in production more often than
+ * not, so a one-character typo must not depend on it.
+ *
  * Returns null for anything ambiguous; the caller then asks ai.service.
  */
 function parseCustomerDate(text, nowMs = Date.now()) {
+  const exact = parseCustomerDateExact(text, nowMs);
+  if (exact) return exact;
+  return parseCustomerDateFuzzyMonth(text, nowMs);
+}
+
+// The ORIGINAL deterministic chain, unchanged. Kept intact and tried FIRST so
+// the fuzzy pass can only ever add matches, never move an existing one.
+function parseCustomerDateExact(text, nowMs = Date.now()) {
   const s = normaliseCustomerText(text);
   if (!s) return null;
   const today = istDateString(nowMs);
@@ -390,13 +475,13 @@ function parseCustomerDate(text, nowMs = Date.now()) {
   if (iso) return buildIsoDate(Number(iso[1]), Number(iso[2]), Number(iso[3]));
 
   // "5 Aug 2026" / "5 August" / "5th aug"
-  const dm = /\b(\d{1,2})(?:st|nd|rd|th)?[\s./-]*([a-z]{3,9})\.?(?:[\s,./-]*(\d{2,4}))?\b/.exec(s);
+  const dm = DAY_MONTH_RE.exec(s);
   if (dm) {
     const mon = monthIndex(dm[2]);
     if (mon != null) return resolveYear(Number(dm[1]), mon, dm[3], today);
   }
   // "Aug 5 2026" / "august 5th"
-  const md = /\b([a-z]{3,9})\.?[\s./-]*(\d{1,2})(?:st|nd|rd|th)?(?:[\s,./-]*(\d{2,4}))?\b/.exec(s);
+  const md = MONTH_DAY_RE.exec(s);
   if (md) {
     const mon = monthIndex(md[1]);
     if (mon != null) return resolveYear(Number(md[2]), mon, md[3], today);
@@ -406,7 +491,7 @@ function parseCustomerDate(text, nowMs = Date.now()) {
   if (numeric) return resolveYear(Number(numeric[1]), Number(numeric[2]) - 1, numeric[3], today);
 
   // Bare weekday → the NEXT occurrence strictly after today.
-  const wd = /\b(sun|mon|tues?|wed(nes)?|thur?s?|fri|sat(ur)?)(day)?\b/.exec(s);
+  const wd = WEEKDAY_RE.exec(s);
   if (wd) {
     const target = WEEKDAYS.findIndex((w) => wd[1].startsWith(w.toLowerCase().slice(0, 3))
       || w.toLowerCase().startsWith(wd[1].slice(0, 3)));
@@ -420,10 +505,163 @@ function parseCustomerDate(text, nowMs = Date.now()) {
   return null;
 }
 
+/*
+ * The two month-name date shapes, hoisted so the EXACT pass and the FUZZY pass
+ * read the same grammar — a typo must not also change which shapes we accept.
+ *   DAY_MONTH_RE — "5 Aug 2026" / "5th august" / "20th aig"
+ *   MONTH_DAY_RE — "Aug 5 2026" / "august 5th"
+ * No /g flag: these are used with .exec on a fresh string every time, and a
+ * sticky lastIndex would make the second caller silently skip a match.
+ */
+const DAY_MONTH_RE = /\b(\d{1,2})(?:st|nd|rd|th)?[\s./-]*([a-z]{3,9})\.?(?:[\s,./-]*(\d{2,4}))?\b/;
+const MONTH_DAY_RE = /\b([a-z]{3,9})\.?[\s./-]*(\d{1,2})(?:st|nd|rd|th)?(?:[\s,./-]*(\d{2,4}))?\b/;
+
+// One source for the weekday vocabulary: WEEKDAY_RE finds one inside a
+// sentence, WEEKDAY_TOKEN_RE tests whether a whole token IS one.
+const WEEKDAY_ALT = '(sun|mon|tues?|wed(nes)?|thur?s?|fri|sat(ur)?)(day)?';
+const WEEKDAY_RE = new RegExp('\\b' + WEEKDAY_ALT + '\\b');
+const WEEKDAY_TOKEN_RE = new RegExp('^' + WEEKDAY_ALT + '$');
+
 function monthIndex(name) {
   const n = String(name || '').slice(0, 3).toLowerCase();
   const i = MONTHS.findIndex((m) => m.toLowerCase() === n);
   return i >= 0 ? i : null;
+}
+
+/*
+ * ── TYPO-TOLERANT MONTH NAMES ───────────────────────────────────────────
+ *
+ * A customer typed "20th Aig" (job 523247, 2026-08-18). The exact parser could
+ * not read it, so they were told "Sorry, I couldn't read that date." and had to
+ * retype — and the AI fallback that was supposed to catch this is switched off
+ * in production, so nothing caught it.
+ *
+ * The tolerance is DELIBERATELY TINY. Edit distance 1 against a 3-letter
+ * abbreviation is already generous, so it is fenced in three ways, each of
+ * which prevents a specific way of booking the WRONG DAY:
+ *   • distance ≤ 1 only (MONTH_FUZZY_MAX_DISTANCE) — no "closest match wins".
+ *   • the token length must be within 1 of the candidate's, so a long word does
+ *     not creep onto a short abbreviation.
+ *   • a token within 1 edit of TWO different months is AMBIGUOUS and returns
+ *     null. "man" is one edit from both "mar" and "may"; guessing between them
+ *     silently books a visit two months away, which is far worse than a re-ask.
+ * A weekday is refused outright: "sun" is exactly one edit from "jun", and
+ * quietly turning Sunday into June is the same wrong-day failure.
+ */
+const MONTH_FUZZY_MAX_DISTANCE = 1;
+
+// Levenshtein distance, capped: anything above `max` is reported as max + 1
+// because the caller only ever compares against the cap. Inputs here are at
+// most nine characters, so the plain DP is the right amount of machinery.
+function editDistance(a, b, max) {
+  const n = a.length;
+  const m = b.length;
+  if (Math.abs(n - m) > max) return max + 1;
+  let prev = Array.from({ length: m + 1 }, (_, j) => j);
+  for (let i = 1; i <= n; i++) {
+    const row = [i];
+    let best = i;
+    for (let j = 1; j <= m; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      row[j] = Math.min(prev[j] + 1, row[j - 1] + 1, prev[j - 1] + cost);
+      if (row[j] < best) best = row[j];
+    }
+    // Every remaining cell can only grow from this row's minimum, so once the
+    // whole row is over the cap the answer is too — stop paying for it.
+    if (best > max) return max + 1;
+    prev = row;
+  }
+  return prev[m];
+}
+
+/*
+ * monthIndexFuzzy('aig') → 7 (August) · monthIndexFuzzy('man') → null
+ * Returns null for anything not UNIQUELY within one edit of exactly one month.
+ */
+function monthIndexFuzzy(name) {
+  const token = String(name == null ? '' : name).toLowerCase().replace(/[^a-z]/g, '');
+  // The regexes only ever hand us 3–9 letters; the guard keeps this honest if
+  // it is ever called from somewhere else.
+  if (token.length < 3) return null;
+  // "sun" is one edit from "jun". A weekday is never a misspelt month.
+  if (WEEKDAY_TOKEN_RE.test(token)) return null;
+
+  let hit = null;
+  for (let i = 0; i < MONTHS.length; i++) {
+    const near = [MONTHS[i].toLowerCase(), MONTH_NAMES[i]].some((form) => (
+      // Cheap length pre-filter first (a distance of 1 cannot bridge a bigger
+      // length gap anyway) — then the real, bounded distance.
+      Math.abs(form.length - token.length) <= MONTH_FUZZY_MAX_DISTANCE
+      && editDistance(token, form, MONTH_FUZZY_MAX_DISTANCE) <= MONTH_FUZZY_MAX_DISTANCE
+    ));
+    if (!near) continue;
+    // A second month equally close means we cannot tell which they meant.
+    if (hit != null) return null;
+    hit = i;
+  }
+  return hit;
+}
+
+/*
+ * The FALLBACK pass: the same two month-name shapes, resolved with the
+ * typo-tolerant matcher. Runs only after parseCustomerDateExact returned null.
+ */
+/*
+ * ⚠ A NEAR-MISS IS NOT A TYPO UNLESS THE CUSTOMER WAS WRITING A DATE.
+ *
+ * Edit distance alone CANNOT separate "aig" from "not". Both are one edit from
+ * exactly one month, so the ambiguity guard never fires for either. Measured on
+ * this very code before this gate existed: of the 17,576 three-letter tokens,
+ * 743 resolved to a month, and 157 of those are ordinary English words —
+ *
+ *     "in 5 day"        -> 2027-05-05   (day ~ may)
+ *     "20 not possible" -> 2026-11-20   (not ~ nov)
+ *     "15 can"          -> 2027-01-15   (can ~ jan)
+ *     "5 opt"           -> 2026-10-05   (opt ~ oct)
+ *     "flat no 5 apt 3" -> 2027-04-05   (apt ~ apr)
+ *
+ * — and validateAppointment has no forward horizon, so every one of those was
+ * ACCEPTED, echoed back as "we'll keep your visit on Fri, 20 Nov 2026", and
+ * written to tbl_job.requested_date_time on the customer's next reply. A
+ * customer declining a date would have been booked three months out. That is
+ * far worse than the re-ask this fuzziness exists to avoid.
+ *
+ * The separator is not the token, it is the CONTEXT. Look at what the live run
+ * actually sent: "20th Aig" and "20 aig 2026". Both carry an unmistakable
+ * date signal — an ORDINAL SUFFIX or an EXPLICIT YEAR — and not one of the
+ * false positives above does. So the fuzzy pass fires only when the customer
+ * was plainly writing a date and merely misspelled the month.
+ *
+ * The cost is real and accepted: bare "jly 5" no longer resolves fuzzily. It
+ * re-asks, or the AI reads it once a key is configured. A re-ask costs one
+ * message; a silently wrong month costs a technician sent on the wrong day and
+ * a customer who finds out by nobody arriving.
+ *
+ * The EXACT pass is untouched and still runs first, so every spelling that
+ * worked before still works — including "20th Aug" with no ordinal at all.
+ */
+const DAY_MONTH_ORD_RE = /\b(\d{1,2})(st|nd|rd|th)?[\s./-]*([a-z]{3,9})\.?(?:[\s,./-]*(\d{2,4}))?\b/;
+const MONTH_DAY_ORD_RE = /\b([a-z]{3,9})\.?[\s./-]*(\d{1,2})(st|nd|rd|th)?(?:[\s,./-]*(\d{2,4}))?\b/;
+
+function parseCustomerDateFuzzyMonth(text, nowMs = Date.now()) {
+  const s = normaliseCustomerText(text);
+  if (!s) return null;
+  const today = istDateString(nowMs);
+
+  // Same grammars as the exact pass, with the ordinal suffix CAPTURED so the
+  // date-shape gate above can be applied. Deliberately parallel rather than
+  // shared: widening one must not silently widen the other.
+  const dm = DAY_MONTH_ORD_RE.exec(s);
+  if (dm && (dm[2] || dm[4])) {
+    const mon = monthIndexFuzzy(dm[3]);
+    if (mon != null) return resolveYear(Number(dm[1]), mon, dm[4], today);
+  }
+  const md = MONTH_DAY_ORD_RE.exec(s);
+  if (md && (md[3] || md[4])) {
+    const mon = monthIndexFuzzy(md[1]);
+    if (mon != null) return resolveYear(Number(md[2]), mon, md[4], today);
+  }
+  return null;
 }
 
 function buildIsoDate(year, month1, day) {
@@ -808,6 +1046,12 @@ async function startConversation(jobId, { action = 'first' } = {}, pool) {
     offered_date: job.appointment_date || null,
     offered_date_label: dateLabel || null,
     offered_address: addressLine || null,
+    // The hour the job is already booked for ('HH:MM', projected off
+    // requested_date_time). Read ONLY to centre the slot shortlist we suggest
+    // later (contextSlotHour); never written back, never used as a default
+    // answer. Missing/00:00 on legacy rows just means the shortlist falls back
+    // to a spread across the day.
+    offered_hour: job.appointment_time || null,
   };
   const [existing] = await pool.query(
     `SELECT conversation_id FROM tbl_whatsapp_conversation
@@ -1353,23 +1597,35 @@ function sendChoiceButtons(to, body) {
   });
 }
 
-// Slot prompt. WhatsApp reply buttons cap at 3 and there are ten 1-hour
-// frames, and this repo has no verified Gallabox interactive-LIST sender — so
-// we ask in text and parse the answer (deterministically first, ai.service as
-// the fallback for messy phrasing).
-async function sendSlotPrompt(to, dateLabel, { retry = false } = {}) {
+/*
+ * Slot prompt. WhatsApp reply buttons cap at 3 and this repo has no verified
+ * Gallabox interactive-LIST sender — so we ask in text and parse the answer
+ * (deterministically first, ai.service as the fallback for messy phrasing).
+ *
+ * It used to list ALL TEN frames. It now offers a SHORTLIST (shortlistSlots,
+ * centred on `aroundHour` when the conversation knows the job's existing hour)
+ * and says in the copy that any start time in the working day is accepted —
+ * because it is. The parser is untouched: "6.30pm" still books 6 PM–7 PM even
+ * when the shortlist showed mornings.
+ */
+async function sendSlotPrompt(to, dateLabel, { retry = false, aroundHour = null } = {}) {
   const head = retry
     ? 'Sorry, I couldn’t read that time.'
     : `Great — we’ll keep your visit on ${dateLabel}.`;
-  const fallback = `${head}\n\nWhich 1-hour slot suits you best? Just reply with the start time (e.g. "10 AM" or "4 PM").\n\nAvailable slots:\n${ONE_HOUR_SLOT_LABELS.join('\n')}`;
+  const examples = shortlistSlots(aroundHour).map((s) => s.label);
+  const fallback = `${head}\n\nWhat time suits you best? Any 1-hour slot between ${WORKING_DAY_LABEL} works — just reply with the start time (e.g. "10 AM" or "6.30 PM").\n\nFor example:\n${examples.join('\n')}`;
   const body = await phrase({
     kind: retry ? 'ask_time_slot_retry' : 'ask_time_slot',
     ask: retry
-      ? 'We could not read the time they just sent. Apologise in one line, then ask again which 1-hour slot they want, telling them to reply with the start time. List the available slots exactly as given, one per line.'
-      : 'Tell them their visit stays on the date given, then ask which 1-hour slot suits them, telling them to reply with the start time. List the available slots exactly as given, one per line.',
+      ? `We could not read the time they just sent. Apologise in one line, then ask again what time suits them. Say any 1-hour slot between ${WORKING_DAY_LABEL} works and that they should reply with the start time. Give the example slots as EXAMPLES only, one per line — never say or imply they must choose from that list.`
+      : `Tell them their visit stays on the date given, then ask what time suits them. Say any 1-hour slot between ${WORKING_DAY_LABEL} works and that they should reply with the start time. Give the example slots as EXAMPLES only, one per line — never say or imply they must choose from that list.`,
     // The date is the one already in the conversation's context (what we asked
     // them to confirm, or the future date they just gave us) — never re-derived.
-    facts: { 'visit date': dateLabel, 'available 1-hour slots': ONE_HOUR_SLOT_LABELS.join(', ') },
+    facts: {
+      'visit date': dateLabel,
+      'hours we work': WORKING_DAY_LABEL,
+      'example 1-hour slots (suggestions, not the only choices)': examples.join(', '),
+    },
     fallback,
   });
   return gallabox.sendText({ to, body });
@@ -1418,15 +1674,27 @@ async function sendCancelReasonPrompt(to, { retry = false } = {}) {
 }
 
 /*
- * The OPTIONAL post-confirmation step. Sent as a location-request interactive
+ * The post-confirmation details step. Sent as a location-request interactive
  * message so the customer gets a native "Send location" button, while the body
- * also invites photos. Both are optional and may arrive in any order, or not
- * at all — the visit is already confirmed.
+ * also asks for photos. Either may arrive in any order, or not at all — the
+ * visit is already confirmed and nothing here can undo that.
+ *
+ * ⚠ THE COPY ASKS; IT DOES NOT OFFER (product feedback, 2026-08-18). It used to
+ * open "Two optional extras — feel free to ignore this message". A customer
+ * told something is optional answers "later" — and later is outside the 24-hour
+ * WhatsApp session window, where free-text replies stop working and the details
+ * can no longer reach us at all. Getting them inside THIS session is the entire
+ * point, so we ask for them directly, as the natural next step, framed by what
+ * they buy the customer: a technician who arrives prepared and can find them.
+ *
+ * Asking directly is the change; TRAPPING them is not. The state machine still
+ * completes on "Done" and completes anyway if they never send a thing
+ * (stepExtras) — see tests/whatsapp-conversation-ux.test.js.
  */
 function sendExtrasPrompt(to) {
   return gallabox.sendLocationRequest({
     to,
-    body: 'Two optional extras — your visit is already confirmed, so feel free to ignore this message:\n\n📷 Send photos of the item so the technician comes prepared.\n📍 Share your location pin so the technician can navigate to you (tap the button below).',
+    body: 'One quick thing so the technician arrives prepared:\n\n📍 Tap the button below to share your location pin, so they can find you.\n📷 Send a photo or two of the item, so they know what to expect.\n\nReply "Done" once you’ve sent them.',
   });
 }
 
@@ -1472,7 +1740,10 @@ async function stepChoice(convo, ctx, inbound, to, pool, meta) {
     }
     const nextCtx = { ...ctx, confirmed_date: offered, branch: 'confirm' };
     await updateConversation(convo.conversation_id, { current_step: STEP.SLOT, context: nextCtx }, pool);
-    await sendSlotPrompt(to, ctx.offered_date_label || formatCustomerDateLabel(offered));
+    // Centre the offered slots on the hour the job is ALREADY booked for — the
+    // customer is confirming that appointment, so it is the best evidence of
+    // what suits them.
+    await sendSlotPrompt(to, ctx.offered_date_label || formatCustomerDateLabel(offered), { aroundHour: contextSlotHour(ctx) });
     return { handled: true, step: STEP.SLOT };
   }
 
@@ -1515,7 +1786,9 @@ async function stepRescheduleDate(convo, ctx, inbound, to, pool, meta) {
   const nextCtx = { ...ctx, confirmed_date: date, branch: 'reschedule' };
   await updateConversation(convo.conversation_id, { current_step: STEP.SLOT, context: nextCtx }, pool);
   logger.info('Captured reschedule date · job=' + convo.job_id + ' · date=' + date);
-  await sendSlotPrompt(to, formatCustomerDateLabel(date));
+  // The date moved; the hour they were originally booked for still says more
+  // about their day than a fixed spread does.
+  await sendSlotPrompt(to, formatCustomerDateLabel(date), { aroundHour: contextSlotHour(ctx) });
   return { handled: true, step: STEP.SLOT };
 }
 
@@ -1552,11 +1825,11 @@ async function stepSlot(convo, ctx, inbound, to, pool, meta) {
         const nextCtx = { ...ctx, confirmed_date: newDate, branch: 'reschedule' };
         await updateConversation(convo.conversation_id, { context: nextCtx }, pool);
         logger.info('Date changed at the slot step · job=' + convo.job_id + ' · date=' + newDate);
-        await sendSlotPrompt(to, formatCustomerDateLabel(newDate));
+        await sendSlotPrompt(to, formatCustomerDateLabel(newDate), { aroundHour: contextSlotHour(ctx) });
         return { handled: true, step: STEP.SLOT };
       }
     }
-    await sendSlotPrompt(to, formatCustomerDateLabel(date), { retry: true });
+    await sendSlotPrompt(to, formatCustomerDateLabel(date), { retry: true, aroundHour: contextSlotHour(ctx) });
     return { handled: true, step: STEP.SLOT };
   }
 
@@ -1685,7 +1958,7 @@ async function stepExtras(convo, ctx, inbound, to, pool, meta) {
     await updateConversation(convo.conversation_id, { context: nextCtx }, pool);
     await gallabox.sendText({
       to,
-      body: 'Got your location 📍 The technician will use it to navigate to you. You can also send photos, or simply reply "Done".',
+      body: 'Got your location 📍 The technician will use it to find you. Now send a photo or two of the item so they know what to expect — or reply "Done" if you have none.',
     });
     return { handled: true, step: STEP.EXTRAS };
   }
@@ -1700,7 +1973,7 @@ async function stepExtras(convo, ctx, inbound, to, pool, meta) {
       await gallabox.sendText({ to, body: `You’ve reached the limit of ${MAX_PHOTOS} photos. Nothing else is needed — your visit is confirmed.` });
       return { handled: true, step: STEP.EXTRAS };
     }
-    await gallabox.sendText({ to, body: 'Got it ✅ Send another if you like, or reply "Done".' });
+    await gallabox.sendText({ to, body: 'Got it ✅ Send another, or reply "Done" when you’re finished.' });
     return { handled: true, step: STEP.EXTRAS };
   }
 
@@ -1717,7 +1990,7 @@ async function stepExtras(convo, ctx, inbound, to, pool, meta) {
   // already confirmed, so this can never block completion.
   await gallabox.sendText({
     to,
-    body: 'Your visit is already confirmed ✅ If you’d like, send photos of the item or share your location pin — otherwise just reply "Done".',
+    body: 'Your visit is confirmed ✅ Please share your location pin and a photo or two of the item so the technician arrives prepared — or reply "Done" if you’d rather not send them.',
   });
   return { handled: true, step: STEP.EXTRAS };
 }
@@ -2126,6 +2399,9 @@ module.exports = {
   CONVERSATION_TEMPLATE_NAME,
   ONE_HOUR_SLOTS,
   ONE_HOUR_SLOT_LABELS,
+  SLOT_SHORTLIST_SIZE,
+  shortlistSlots,
+  contextSlotHour,
   // Pure helpers (unit-tested).
   templateButtonValues,
   matchTemplateChoice,
