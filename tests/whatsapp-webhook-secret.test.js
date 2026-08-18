@@ -671,3 +671,103 @@ test('KNOWN LIMIT: the logged noise shape is still not silenced — it names no 
     });
   });
 });
+
+/* ═══ the sender is chosen by CONTENT, not by envelope position ═══════════ */
+
+/*
+ * THE OUTAGE THIS PINS.
+ *
+ * Production, 2026-08-18, job 523247: a conversation was opened
+ * (conversationId=9, delivered=true, status='active') and the customer's button
+ * reply arrived TEN SECONDS later. It parsed perfectly —
+ * `type=button buttonId="Need a Reschdeule"` — and was answered with
+ *
+ *     "no conversation has EVER been opened for this number"
+ *
+ * `never_started` comes from a lookup with NO status filter, so it means no row
+ * matched that number at all, ten seconds after one was written for it. Across
+ * the entire log corpus not one of 14,380 inbound messages had ever been
+ * handled, and the whole reschedule/slot/no-service state machine had therefore
+ * never executed once in production.
+ *
+ * The cause: firstOf() walks envelope-outer / key-inner, so Gallabox's TOP-LEVEL
+ * `sender` — which sits amongst contactId / senderType / contact.name, its own
+ * contact model — won before `whatsapp.from` was ever examined. The conversation
+ * lookup matches on the last ten digits of a mobile, so a contact id matched
+ * nothing, every time, silently.
+ */
+const GB_CONTACT_ID = '6a8475d2a5b73e16397217c3';   // 24-char Gallabox id, real shape
+const GB_CUSTOMER   = '919310992052';               // the number the row is keyed on
+
+// The envelope EXACTLY as production logs it (keys from the captured bodyShape).
+const gallaboxInbound = (over = {}) => ({
+  id: '6a84760a81ae7dd352e54e76',
+  conversationId: 'c-1',
+  accountId: 'a-1',
+  channelId: 'ch-1',
+  channelType: 'whatsapp',
+  localMessageId: 'lm-1',
+  contactId: GB_CONTACT_ID,
+  sender: GB_CONTACT_ID,          // ← NOT a phone number
+  senderType: 'contact',
+  contact: { name: 'Harshit M' },
+  whatsapp: { from: GB_CUSTOMER, type: 'text', text: { body: 'yes' } },
+  ...over,
+});
+
+/** The `resolvedFrom=` value the never_started diagnostic prints. */
+const resolvedFrom = () => {
+  const line = lines.find((l) => l.args.some((a) => a && typeof a === 'object' && 'resolvedFrom' in a));
+  const obj = line && line.args.find((a) => a && typeof a === 'object' && 'resolvedFrom' in a);
+  return obj ? obj.resolvedFrom : null;
+};
+
+test('the CUSTOMER number is resolved even when a contact id sits at the top level', async () => {
+  await withSecret(SECRET, async () => {
+    lines = [];
+    assert.equal(await postBody(gallaboxInbound()), 200);
+    const got = resolvedFrom();
+    assert.ok(got, 'the never_started diagnostic must print what it searched on');
+    // Masked form keeps the prefix AND the length — which is the whole point:
+    // a phone and a 24-char id are unmistakable at a glance.
+    assert.ok(got.startsWith('9193'), `expected the customer number, got ${got}`);
+    assert.equal(got.startsWith('6847'), false, 'the Gallabox contact id must never be used as the sender');
+  });
+});
+
+test('a top-level `from` that IS a phone still wins — the common shape is unchanged', async () => {
+  await withSecret(SECRET, async () => {
+    lines = [];
+    assert.equal(await postBody({ from: GB_CUSTOMER, text: { body: 'hi' } }), 200);
+    assert.ok(String(resolvedFrom() || '').startsWith('9193'));
+  });
+});
+
+test('FAIL SAFE: when NOTHING parses as a mobile, the old positional value is kept', async () => {
+  /*
+   * An envelope we do not understand must behave exactly as it did before —
+   * resolving the sender to null would turn a matching failure into a message
+   * that never reaches the conversation handler at all, which is strictly worse.
+   */
+  await withSecret(SECRET, async () => {
+    lines = [];
+    assert.equal(await postBody({ sender: 'not-a-number-at-all', text: { body: 'hi' } }), 200);
+    assert.match(logText(), /WhatsApp inbound · type=text/, 'it is still treated as a message');
+    const got = resolvedFrom();
+    assert.ok(got && got.startsWith('not-'), `expected the raw fallback, got ${got}`);
+  });
+});
+
+test('a button reply carries the customer number, so the reschedule branch is reachable', async () => {
+  // The exact failing interaction from production, minus the DB.
+  await withSecret(SECRET, async () => {
+    lines = [];
+    assert.equal(await postBody(gallaboxInbound({
+      whatsapp: { from: GB_CUSTOMER, type: 'interactive', interactive: { button_reply: { title: 'Need a Reschdeule' } } },
+    })), 200);
+    assert.match(logText(), /type=button/);
+    assert.match(logText(), /buttonId="Need a Reschdeule"/);
+    assert.ok(String(resolvedFrom() || '').startsWith('9193'),
+      'the button reply must look the conversation up by the CUSTOMER number');
+  });
+});

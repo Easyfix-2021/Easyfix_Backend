@@ -16,6 +16,7 @@ const convo = require('../../services/whatsapp-conversation.service');
  */
 const gallabox = require('../../services/gallabox.whatsapp.service');
 const { rateLimit, failureBreaker } = require('../../middleware/rate-limit');
+const { maskMobile } = require('../../utils/mask-mobile');
 
 /*
  * Inbound WhatsApp webhook (Gallabox → us) for the conversational
@@ -234,6 +235,58 @@ function firstOf(envs, keys) {
   return null;
 }
 
+/*
+ * ⚠ THE SENDER IS CHOSEN BY CONTENT, NOT BY POSITION.
+ *
+ * firstOf walks envelope-outer / key-inner, so a TOP-LEVEL `sender` wins before
+ * `whatsapp.from` is ever looked at. Gallabox's envelope carries both:
+ *
+ *   { id, conversationId, accountId, channelId, channelType, localMessageId,
+ *     contactId, sender, senderType, contact:{name},
+ *     whatsapp:{ to, time, status, type, interactive, … } }
+ *
+ * `sender` sits amongst `contactId` / `senderType` / `contact.name` — Gallabox's
+ * own contact model — so it is not guaranteed to be a dialable number, while the
+ * customer's actual number lives in the `whatsapp` sub-envelope. Resolving the
+ * sender positionally therefore hands a NON-PHONE to the conversation lookup,
+ * which matches on the last ten digits of a mobile and so matches nothing.
+ *
+ * That is not theoretical. Production, 2026-08-18: a conversation was opened for
+ * job 523247 (conversationId=9, delivered=true, status='active') and the
+ * customer's button reply arrived TEN SECONDS later, parsed correctly as
+ * `type=button buttonId="Need a Reschdeule"` — and was answered with "no
+ * conversation has EVER been opened for this number". `never_started` comes from
+ * a query with NO status filter, so it means no row was found for that number AT
+ * ALL, ten seconds after one was written. Across the whole log corpus not one of
+ * 14,380 inbound messages has ever been handled.
+ *
+ * This is the same defect this file has already been repaired for twice — the
+ * comments on normaliseStatus and normaliseInbound both describe an `||` chain
+ * over candidate envelopes that "silently assumes the first non-null one is the
+ * right one". Those repairs widened the SEARCH but kept positional precedence,
+ * so the assumption survived. The prescription in those comments is the fix:
+ * choose by content — whichever candidate is actually a phone number is the
+ * phone number.
+ *
+ * FAIL SAFE: if NO candidate parses as a mobile, this returns exactly what
+ * firstOf would have. An envelope we do not understand behaves as it does today
+ * rather than resolving the sender to null, which would turn a matching failure
+ * into a dropped message.
+ */
+function looksLikeMobile(v) {
+  if (v == null || (typeof v !== 'string' && typeof v !== 'number')) return false;
+  return gallabox.normaliseIndianPhone(String(v)) != null;
+}
+
+function firstPhoneOf(envs, keys) {
+  for (const o of envs) {
+    for (const k of keys) {
+      if (looksLikeMobile(o[k])) return o[k];
+    }
+  }
+  return firstOf(envs, keys);
+}
+
 function normaliseInbound(body) {
   if (!body || typeof body !== 'object') return null;
   const envs = inboundEnvelopes(body);
@@ -241,7 +294,9 @@ function normaliseInbound(body) {
   const p = envs[0];
   const wa = p.whatsapp || p;
 
-  const from = firstOf(envs, ['from', 'sender', 'phone', 'mobile']);
+  // `wa_id` / `waId` are Meta's own spellings and cost nothing to probe; the
+  // resolution is by content, so an extra key cannot pick a worse candidate.
+  const from = firstPhoneOf(envs, ['from', 'sender', 'phone', 'mobile', 'wa_id', 'waId']);
   const messageId = firstOf(envs, ['id', 'messageId', 'whatsappMessageId']);
   const rawType = String(firstOf(envs, ['type']) || '').toLowerCase();
 
@@ -710,9 +765,33 @@ router.post('/whatsapp', inboundCeiling, authBreaker.guard, async (req, res) => 
     if (handled) {
       logger.info('WhatsApp inbound handled · type=' + inbound.type);
     } else {
-      logger.warn('WhatsApp inbound NOT handled · type=' + inbound.type
+      /*
+       * `never_started` is the ONE drop reason that means we could not find the
+       * customer, rather than a decision we took about them: its query carries
+       * no status filter, so it fires only when NO row exists for that number.
+       * Every other reason (expired, completed, closed) is a real state.
+       *
+       * So that case — and only that case — prints what it looked the number up
+       * WITH. The masked form shows the prefix and the LENGTH, which is the
+       * whole diagnostic: a 10/12-digit `9310••••••••` is a phone that simply
+       * did not match a row, while a 24-character `6847••••••••••••••` is a
+       * Gallabox contact id that could never have matched anything. Diagnosing
+       * that distinction previously required pulling the log archive.
+       *
+       * The keys-only bodyShape rides along for the same reason it exists on the
+       * CONTENT NOT FOUND branch: if the number we resolved is wrong, the next
+       * question is always "then where is the right one".
+       */
+      const detail = result && result.detail;
+      const base = 'WhatsApp inbound NOT handled · type=' + inbound.type
         + ' reason=' + ((result && result.reason) || 'unknown')
-        + (inbound.buttonId ? ' buttonId="' + String(inbound.buttonId).slice(0, 60) + '"' : ''));
+        + (inbound.buttonId ? ' buttonId="' + String(inbound.buttonId).slice(0, 60) + '"' : '');
+      if (detail === 'never_started') {
+        logger.warn({ resolvedFrom: maskMobile(inbound.from), bodyShape: shapeOf(req.body) },
+          base + ' — no row for this number; the masked sender above is what we searched on');
+      } else {
+        logger.warn(base);
+      }
     }
     return modernOk(res, { received: true, ...result });
   } catch (err) {
