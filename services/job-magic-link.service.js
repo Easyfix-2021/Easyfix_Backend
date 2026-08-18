@@ -111,6 +111,44 @@ async function getRescheduleReasons(pool) { return fetchReasonList(pool, MAGIC_L
  * `custom_properties` map and is persisted only inside the
  * customer_submitted_payload JSON snapshot (no schema change needed).
  */
+/*
+ * maxSendCountSql(jobAlias) — the per-client send cap as a SQL scalar.
+ *
+ * ONE DEFINITION, TWO CALLERS, deliberately. This expression is used by the
+ * manual send path (below) AND by the hourly cron's eligibility query
+ * (services/job-magic-link-cron.js). The cron used to hardcode `< 3` and ignore
+ * the client's configured value entirely, so a client set to 2 still received 3
+ * automatic messages while the manual button correctly refused at 2 — two
+ * enforcement points on the same counter column, disagreeing.
+ *
+ * Copying the subquery into the cron would have re-created the exact drift this
+ * expression has already suffered once: the comment below records that matching
+ * on '_' alone missed hyphenated rows, so the cap "silently fell back to 3".
+ * A second copy is a second chance to make that mistake, so there is only one.
+ *
+ * NULLIF(…, 0) reproduces the JS `Number(x) || 3` that guarded the manual path:
+ *   no row / ''      → NULL → 3
+ *   non-numeric      → CAST yields 0 → 3
+ *   an explicit '0'  → 3  (0 would mean "never send", which no UI offers and
+ *                          which a typo could otherwise inflict silently)
+ *   '2'              → 2
+ */
+function maxSendCountSql(jobAlias = 'j') {
+  return `COALESCE(NULLIF((
+              SELECT CAST(NULLIF(ccp_max.c_prop_values, '') AS UNSIGNED)
+                FROM tbl_client_custom_properties ccp_max
+               WHERE ccp_max.client_id    = ${jobAlias}.fk_client_id
+                 -- Normalise BOTH '_' and '-' to spaces on both sides so the
+                 -- snake_case legacy name (max_magic_link_send_count) and the
+                 -- Title-Case 'Max Magic-Link Send Count' both match. (Was '_'
+                 -- only, so the hyphenated literal never matched snake_case rows
+                 -- → cap silently fell back to 3 and blocked resends.)
+                 AND LOWER(REPLACE(REPLACE(ccp_max.c_prop_name, '_', ' '), '-', ' '))
+                     = LOWER(REPLACE('Max Magic-Link Send Count', '-', ' '))
+                 AND (ccp_max.status IS NULL OR ccp_max.status = 1)
+               LIMIT 1), 0), 3)`;
+}
+
 const CONFIG_PROP_KEYS = Object.freeze(new Set([
   'auto_process_unconfirmed_order',
   'max_magic_link_send_count',
@@ -1101,21 +1139,7 @@ async function sendForJob(jobId, { action, override = false } = {}, pool) {
             -- case a plain COALESCE would let through as a blank greeting.
             COALESCE(NULLIF(TRIM(j.job_customer_name), ''), cu.customer_name) AS customer_name,
             cu.customer_mob_no, cl.client_name,
-            COALESCE(
-              (SELECT CAST(NULLIF(ccp_max.c_prop_values, '') AS UNSIGNED)
-                 FROM tbl_client_custom_properties ccp_max
-                WHERE ccp_max.client_id    = j.fk_client_id
-                  -- Normalise BOTH '_' and '-' to spaces on both sides so the
-                  -- snake_case legacy name (max_magic_link_send_count) and the
-                  -- Title-Case 'Max Magic-Link Send Count' both match. (Was '_'
-                  -- only, so the hyphenated literal never matched snake_case rows
-                  -- → cap silently fell back to 3 and blocked resends.)
-                  AND LOWER(REPLACE(REPLACE(ccp_max.c_prop_name, '_', ' '), '-', ' '))
-                      = LOWER(REPLACE('Max Magic-Link Send Count', '-', ' '))
-                  AND (ccp_max.status IS NULL OR ccp_max.status = 1)
-                LIMIT 1),
-              3
-            ) AS max_send_count
+            ${maxSendCountSql('j')} AS max_send_count
        FROM tbl_job j
        LEFT JOIN tbl_customer cu ON cu.customer_id = j.fk_customer_id
        LEFT JOIN tbl_client   cl ON cl.client_id   = j.fk_client_id
@@ -1898,6 +1922,9 @@ async function writeCustomerOrderDetails(jobId, fields, pool) {
 }
 
 module.exports = {
+  // Shared with services/job-magic-link-cron.js so the automatic and manual
+  // send paths enforce the SAME per-client cap from ONE definition.
+  maxSendCountSql,
   fetchPrefill,
   autoRescheduleOnOpenIfLate,
   sendForJob,

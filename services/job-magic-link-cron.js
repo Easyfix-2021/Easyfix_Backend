@@ -54,7 +54,21 @@ async function runHourlySweep() {
        WHERE j.job_status = 9
          AND j.customer_submitted_at IS NULL
          AND (j.magic_link_sent_at IS NULL OR j.magic_link_sent_at < NOW() - INTERVAL 24 HOUR)
-         AND j.magic_link_send_count < 3
+         /*
+          * PER-CLIENT CAP, not a hardcoded 3 (fixed 2026-08-17).
+          *
+          * This clause used to read '< 3' and ignore the client's configured
+          * 'Max Magic-Link Send Count' entirely — so a client set to 2 still
+          * received THREE automatic messages, while the manual Send button
+          * correctly refused the third. Two enforcement points on the same
+          * counter column, disagreeing, with only the manual one configurable.
+          *
+          * The expression is imported rather than copied: its own history shows
+          * why. It previously matched on '_' alone, missed hyphenated property
+          * rows, and the cap "silently fell back to 3" — a second copy is a
+          * second chance to make that mistake. See maxSendCountSql().
+          */
+         AND j.magic_link_send_count < ${magicLinkService.maxSendCountSql('j')}
        ORDER BY j.job_id ASC
        LIMIT 500
     `);
