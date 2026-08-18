@@ -593,8 +593,8 @@ curl -u <span class="s">'YOUR_USERNAME:YOUR_PASSWORD'</span> \
       </div>
 
       <div class="note ok" data-ver="2">
-        <span class="lbl">v2 is opt-in, and v1 is not deprecated</span>
-        <p><strong>If you already integrate on v1, you need do nothing.</strong> v1 is unchanged, fully supported, and has no retirement date. It is not in maintenance mode and it is not a lesser version &mdash; it is simply the two-step way of attaching images.</p>
+        <span class="lbl">v2 is opt-in &mdash; nothing on v1 stops working today</span>
+        <p><strong>If you already integrate on v1, nothing breaks and nothing is urgent.</strong> v1 is unchanged and fully supported. We do intend to retire the two-step image flow &mdash; upload each image, then create the job carrying their ids &mdash; but no date is set, and any retirement will carry a formal notice period. Every other v1 endpoint stays as it is.</p>
         <p>v2 changes exactly one thing: <a href="#create-v2">creating a job</a> can carry its images in the same request. Everything else on this page &mdash; authentication, the response envelope, dates, errors, the service catalogue, job status, lookups and every webhook &mdash; is byte-for-byte identical across the two versions. Move an integration to v2 when the single-call create is worth it to you, and not before.</p>
       </div>
 
@@ -803,6 +803,13 @@ curl -u <span class="s">'YOUR_USERNAME:YOUR_PASSWORD'</span> \
     <section id="create" data-ver="1">
       <h2>Create a job</h2>
       <p>The main endpoint. One call books a technician visit: who the customer is, where they are, when they want it, and which contracted services apply.</p>
+
+      <div class="note warn">
+        <span class="lbl">Planned for deprecation &mdash; move to v2 when you can</span>
+        <p><strong>Nothing changes for you today.</strong> This endpoint works exactly as documented and no retirement date is set. But the two-step flow &mdash; upload each image, collect its <code>imageId</code>, then create the job carrying them &mdash; is the part of v1 we intend to retire, and it will be given a formal notice period well before anything stops working.</p>
+        <p>The replacement is <a href="#create-v2">v2&rsquo;s combined create</a>: the job payload and up to five images travel in one request. A partner attaching three photographs goes from four round trips to one, and there is no window where uploaded images exist but the job does not.</p>
+        <p><strong>New integrations should start on v2.</strong> Existing ones can move whenever convenient &mdash; the job payload is identical field for field, so the only change is the envelope.</p>
+      </div>
 
       <div class="ep">
         <div class="ep-head"><span class="verb post">POST</span><span class="path">/jobs</span></div>
@@ -1071,6 +1078,13 @@ Location: /api/integration/v2/jobs/212251</span>
     <section id="images" data-ver="1">
       <h2>Upload images</h2>
       <p>Attach photographs to a job &mdash; the product to be installed, the site, a damage report.</p>
+
+      <div class="note warn">
+        <span class="lbl">Planned for deprecation &mdash; move to v2 when you can</span>
+        <p><strong>Nothing changes for you today</strong>, and no retirement date is set. This endpoint will keep working, with a formal notice period before that changes.</p>
+        <p>If you use this to attach images <em>at booking time</em>, <a href="#create-v2">v2&rsquo;s combined create</a> replaces it entirely: images ride along with the job payload in a single request, so there is no separate upload to fail and no orphaned image if it does.</p>
+        <p>Attaching an image to a job that <em>already exists</em> &mdash; a later site photograph, a damage report &mdash; stays here, and remains the right endpoint for that on both versions.</p>
+      </div>
 
       <div class="ep">
         <div class="ep-head"><span class="verb post">POST</span><span class="path">/jobImage/addJobImages</span></div>
