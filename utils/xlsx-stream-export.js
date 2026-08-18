@@ -74,6 +74,147 @@ function abortError(message) {
   return err;
 }
 
+/*
+ * ═══ WRITER SELF-TEST ═══════════════════════════════════════════════════
+ *
+ * ⚠ A 200 OK from this module has never proved the operator can OPEN the file.
+ *
+ * exceljs@3's `stream.xlsx.WorkbookWriter` emits a ZIP whose CENTRAL DIRECTORY
+ * declares an uncompressed size of 0 for every part except the worksheet — the
+ * compressed bytes are all present, but `[Content_Types].xml`, `xl/workbook.xml`
+ * and `xl/_rels/workbook.xml.rels` all read back as ZERO BYTES. `[Content_Types].xml`
+ * is the OOXML manifest, so Excel opens the package, finds no manifest, and
+ * refuses the file. Every Manage Job Report exported between the streaming
+ * rewrite and the exceljs@4 upgrade was unopenable, and NOTHING in this process
+ * noticed: the rows were fetched, the bytes were written, the request logged
+ * `200` and `Jobs export finished · 2,420 rows`. The only signal was an operator
+ * saying the file would not open.
+ *
+ * A per-request assertion is impossible by construction — the bytes are gone the
+ * moment they are written, and buffering them to check would rebuild the very
+ * exporter this module replaced. So the check runs ONCE per process against a
+ * throwaway two-row workbook built with the SAME writer options, and its result
+ * is cached. Cost: ~6KB and a few milliseconds, one time.
+ *
+ * It runs BEFORE any header is set and before the first row is pulled, so a
+ * failure lands in the "nothing written yet" half of the failure contract below
+ * and the route answers with an ordinary JSON 500. A loud error beats a silently
+ * corrupt download.
+ */
+
+// The OOXML manifest. If this part is empty the package is not a spreadsheet at
+// all, whatever the extension says — so it is the one part worth asserting on.
+const MANIFEST_PART = '[Content_Types].xml';
+
+// Upper bound on the one-off self-test. It writes ~6KB into memory, so this is
+// a deadlock backstop, not a performance budget.
+const SELF_TEST_TIMEOUT_MS = 5000;
+
+/*
+ * Read every entry's declared uncompressed size out of a ZIP's central
+ * directory — which is exactly where Excel reads them from, and exactly where
+ * the exceljs@3 bug puts a zero.
+ *
+ * Hand-rolled rather than pulling in a zip dependency: this walks a fixed
+ * little-endian record layout and is the whole reason the check can exist
+ * without adding a package to production for the sake of a self-test.
+ * Returns null when the structure is not understood — an unreadable central
+ * directory is reported as "cannot verify", never as "verified".
+ */
+function centralDirectorySizes(buf) {
+  // End of Central Directory: 'PK\x05\x06'. Scan backwards — the trailing
+  // comment field is almost always empty, so this hits on the first try.
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= 0 && i >= buf.length - 66000; i -= 1) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) return null;
+
+  const count = buf.readUInt16LE(eocd + 10);
+  let off = buf.readUInt32LE(eocd + 16);
+  const sizes = new Map();
+  for (let n = 0; n < count; n += 1) {
+    if (off + 46 > buf.length || buf.readUInt32LE(off) !== 0x02014b50) return null;
+    const uncompressed = buf.readUInt32LE(off + 24);
+    const nameLen      = buf.readUInt16LE(off + 28);
+    const extraLen     = buf.readUInt16LE(off + 30);
+    const commentLen   = buf.readUInt16LE(off + 32);
+    sizes.set(buf.toString('latin1', off + 46, off + 46 + nameLen), uncompressed);
+    off += 46 + nameLen + extraLen + commentLen;
+  }
+  return sizes;
+}
+
+// Cached across calls: the installed ExcelJS cannot change mid-process, so the
+// answer cannot either. Holds the PROMISE, not the result, so concurrent first
+// exports share one self-test instead of racing several.
+let selfTestPromise = null;
+
+async function assertWriterProducesValidPackage() {
+  const { PassThrough } = require('stream');
+  const sink = new PassThrough();
+  const chunks = [];
+  sink.on('data', (c) => chunks.push(c));
+
+  /*
+   * ⚠ Subscribe to 'end' BEFORE committing, not after.
+   *
+   * ExcelJS ends the stream on its way to resolving workbook.commit(), so 'end'
+   * has ALREADY fired by the time that await returns. Attaching the listener
+   * afterwards waits for an event that can never come again — the first export
+   * of the process then hangs forever, holding its request and its DB
+   * connection. Same shape as the workbook.commit()/'finish' hang guarded
+   * against in the main path below; measured here, not theorised.
+   */
+  const ended = new Promise((resolve) => { sink.once('end', resolve); sink.once('error', resolve); });
+
+  // Same options as the real export — a self-test built differently from the
+  // thing it certifies is not a self-test.
+  const wb = new ExcelJS.stream.xlsx.WorkbookWriter({
+    stream: sink, useStyles: true, useSharedStrings: false,
+  });
+  const ws = wb.addWorksheet('SelfTest');
+  ws.columns = [{ key: 'a', width: 10 }];
+  ws.addRow(['probe']).commit();
+  ws.commit();
+  await wb.commit();
+  // Belt and braces: never let a stalled writer wedge the first export. An
+  // in-memory 6KB workbook that has not finished in SELF_TEST_TIMEOUT_MS is not
+  // going to, and the size check below will fail honestly on what we did get.
+  await Promise.race([ended, new Promise((resolve) => setTimeout(resolve, SELF_TEST_TIMEOUT_MS).unref())]);
+
+  const sizes = centralDirectorySizes(Buffer.concat(chunks));
+  if (!sizes) {
+    throw new Error(
+      'xlsx writer self-test: could not read the ZIP central directory the writer produced — '
+      + 'refusing to stream an export that cannot be verified',
+    );
+  }
+  const manifestBytes = sizes.get(MANIFEST_PART);
+  if (!manifestBytes) {
+    throw new Error(
+      `xlsx writer self-test FAILED: the installed exceljs (${require('exceljs/package.json').version}) `
+      + `writes a ZIP whose central directory declares ${MANIFEST_PART} as ${manifestBytes === 0 ? '0 bytes' : 'absent'}. `
+      + 'Excel cannot open such a file. This is the exceljs@3 streaming-writer defect — upgrade to exceljs@4.',
+    );
+  }
+  logger.info('xlsx writer self-test passed · exceljs ' + require('exceljs/package.json').version
+    + ' · ' + MANIFEST_PART + '=' + manifestBytes + ' bytes');
+}
+
+function verifyWriterOnce() {
+  if (!selfTestPromise) {
+    // Cache the rejection too — but re-arm on failure so a fixed deployment
+    // does not need a restart to clear a stale negative. (It will not flap:
+    // the outcome only changes when node_modules does.)
+    selfTestPromise = assertWriterProducesValidPackage().catch((err) => {
+      selfTestPromise = null;
+      throw err;
+    });
+  }
+  return selfTestPromise;
+}
+
 function defaultWidth(col) {
   if (Number.isFinite(col.width)) return col.width;
   if (col.type === 'date') return 22;
@@ -144,6 +285,11 @@ async function streamRowsToXlsx(res, { filename, sheetName, columns, rowSource, 
   if (!rowSource || typeof rowSource[Symbol.asyncIterator] !== 'function') {
     throw new Error('streamRowsToXlsx: rowSource must be an async iterable');
   }
+
+  // Before the DB is touched and before a single header is set: prove the
+  // installed writer can produce an openable package at all. See the self-test
+  // block above for why this cannot be a per-request check.
+  await verifyWriterOnce();
 
   const startedAt = Date.now();
   const dl = safeFilename(filename);
