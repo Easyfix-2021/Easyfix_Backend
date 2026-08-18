@@ -4,6 +4,17 @@ const logger = require('../../logger');
 const { modernOk, modernError } = require('../../utils/response');
 const { pool } = require('../../db');
 const convo = require('../../services/whatsapp-conversation.service');
+/*
+ * Imported for normaliseIndianPhone ONLY — the sender-identity check below has
+ * to compare numbers the same way the rest of the codebase does, and a third
+ * private copy of India's dialling rules is how those comparisons drift apart.
+ *
+ * No cycle: this route already requires whatsapp-conversation.service, which
+ * itself requires this module, and nothing under services/ requires routes/.
+ * (Checked rather than assumed — a require cycle here would surface as an empty
+ * object at call time, i.e. a TypeError on the first webhook of the day.)
+ */
+const gallabox = require('../../services/gallabox.whatsapp.service');
 const { rateLimit, failureBreaker } = require('../../middleware/rate-limit');
 
 /*
@@ -342,6 +353,137 @@ const DELIVERY_STATUS_STATES = new Set([
 const RECEIPT_MARKERS = ['errors', 'localMessageId'];
 
 /*
+ * ⚠ A SENDER THAT IS US IS NOT A SENDER.
+ *
+ * Gallabox posts events ABOUT MESSAGES WE SENT to this same URL, and those
+ * carry a `from` — our OWN WhatsApp Business (WABA) number. Measured in
+ * production over one week: 9,631 of them, 67% of everything arriving on this
+ * endpoint, each one logging
+ *
+ *   "WhatsApp inbound · CONTENT NOT FOUND — a real sender, but no text, button,
+ *    location or media at any probed path"
+ *
+ * because the `from` cleared the veto below, normaliseInbound then found a
+ * sender and no content, and the route WARNed asking the reader to widen the
+ * probes. There is nothing to widen. Their bodyShape is
+ * `{ id, accountId, channelId, channelType, localMessageId, contactId … }` —
+ * an event about our own outbound, not a customer reply, and no probe will ever
+ * find words in it that a customer did not type. Two thirds of this endpoint's
+ * log was advice that could not be followed.
+ *
+ * The veto exists so a CUSTOMER message can never be classified as a receipt:
+ * normaliseStatus runs BEFORE normaliseInbound, so anything looksLikeReceipt
+ * returns true for never reaches the conversation handler, and a misclassified
+ * reply is dropped in silence — strictly worse than any amount of log noise.
+ * Narrowing it from "a sender" to "a sender that is not us" preserves that
+ * guarantee exactly: our own WABA number is the one number on WhatsApp that
+ * can never belong to a customer talking to us.
+ */
+
+/*
+ * Our own WABA sender number(s), as they appear in a `from`.
+ *
+ * ⚠ NOTHING EXISTING HOLDS THIS. GALLABOX_CHANNEL_ID is an opaque Gallabox
+ * channel ObjectId and META_WHATSAPP_PHONE_NUMBER_ID is Meta's internal numeric
+ * id — neither is the dialable number a payload names as its sender, so neither
+ * can be reused here. This is the first place the NUMBER itself is needed, and
+ * therefore the first place it is read; if a shared accessor for it is ever
+ * added, this should move to it rather than a second one growing alongside.
+ *
+ * Comma-separated: the Gallabox channel and the Meta phone number are
+ * configured independently (services/gallabox.whatsapp.service.js,
+ * services/meta.whatsapp.service.js) and are not required to be one number.
+ *
+ * Not in .env.example yet — adding it there is an ops follow-up. Until it is
+ * set, see ownWabaNumberKeys(): the behaviour is exactly today's.
+ */
+const OWN_WABA_NUMBER_ENV = 'WHATSAPP_BUSINESS_NUMBER';
+
+/*
+ * Compare by the LAST 10 DIGITS, the same key the rest of the codebase matches
+ * phone numbers on (services/whatsapp-conversation.service.js mobileMatchKey /
+ * MOBILE_MATCH_SQL), built on the same normaliser. "+91 98123 45678",
+ * "919812345678" and "9812345678" are one number and must produce one key.
+ *
+ * Null unless a full 10 digits survive, and that is load-bearing rather than
+ * tidy: a short key of '' would compare EQUAL to another '' and lift the veto
+ * for any body whose sender field is junk or an object — which is precisely the
+ * silent customer-message drop this guard exists to make impossible.
+ */
+const PHONE_KEY_DIGITS = 10;
+
+/*
+ * ⚠ NO RAW-DIGIT FALLBACK. The normaliser must SUCCEED, or there is no key.
+ *
+ * This read `normaliseIndianPhone(raw) || String(raw ?? '')`, and that fallback
+ * made the fail-safe claim below false in the one way that costs a customer
+ * their reply. Any string carrying ten digits produced a live key from its last
+ * ten:
+ *
+ *   phoneMatchKey('6239ce4aa43d5900047800d1')  ->  '9000478001'
+ *
+ * — that is a GALLABOX_CHANNEL_ID, the single most likely thing for an operator
+ * to paste into a new variable named WHATSAPP_BUSINESS_NUMBER. Set it and the
+ * genuine customer on 9000478001 has every reply classified as a receipt:
+ * never routed, never logged, gone. Reproduced against the mounted router, not
+ * reasoned about.
+ *
+ * Requiring the normaliser to parse the value means an unrecognisable token
+ * yields NO key, isOwnWabaNumber() is false for everything, and the veto
+ * reverts to its original all-senders form — noisy, and correct.
+ *
+ * Applied to BOTH sides on purpose. A payload `from` we cannot parse is not a
+ * number we can claim is ours, so it counts as a third-party sender and the
+ * message goes to the inbound handler. Every unparseable input therefore fails
+ * towards "this is a customer", which is the only direction that is safe.
+ */
+function phoneMatchKey(raw) {
+  const norm = gallabox.normaliseIndianPhone(raw);
+  if (!norm) return null;
+  const key = String(norm).replace(/\D/g, '').slice(-PHONE_KEY_DIGITS);
+  return key.length === PHONE_KEY_DIGITS ? key : null;
+}
+
+/*
+ * ⚠ FAIL SAFE — the most important line in this change.
+ *
+ * Unset, blank, or unparseable — a name, a Gallabox channel id, a shortcode —
+ * all yield NO keys, isOwnWabaNumber() is then false for every value, and the
+ * veto behaves EXACTLY as it did before any of this existed: any sender vetoes.
+ * (This sentence was WRONG until phoneMatchKey stopped falling back to raw
+ * digits: a channel id yielded a live key. It is true now because the
+ * normaliser has to parse the token, and it is pinned by a test that uses a
+ * digit-bearing unparseable value rather than a digit-free one.) A
+ * deployment that never sets the variable keeps the old log noise and keeps
+ * every customer message — it must never start swallowing replies as the price
+ * of a quieter log.
+ *
+ * Read per call, not cached at module load, so an env change takes effect on a
+ * restart-free config reload (and so a test can set one). The cost is splitting
+ * a short string on a path that has already parsed a JSON body.
+ */
+function ownWabaNumberKeys() {
+  return String(process.env[OWN_WABA_NUMBER_ENV] || '')
+    .split(',')
+    .map(phoneMatchKey)
+    .filter((k) => k != null);
+}
+
+function isOwnWabaNumber(value) {
+  const own = ownWabaNumberKeys();
+  if (!own.length) return false;   // not configured → nothing is "us" → old behaviour
+  const key = phoneMatchKey(value);
+  return key != null && own.includes(key);
+}
+
+/*
+ * The fields a body can name its sender in — the original inline chain, moved
+ * out so the veto can apply the SAME test to each one. The list is deliberately
+ * unchanged; only the test applied to each value has narrowed.
+ */
+const SENDER_KEYS = ['from', 'sender', 'phone', 'mobile'];
+
+/*
  * ⚠ `from` IS THE VETO, and it is what makes widening the markers safe.
  *
  * normaliseStatus runs BEFORE normaliseInbound in the route, so anything this
@@ -350,9 +492,14 @@ const RECEIPT_MARKERS = ['errors', 'localMessageId'];
  * outcome available here, and strictly worse than the log noise being fixed.
  *
  * The two are cleanly separable by direction: a RECEIPT is about a message WE
- * sent, so it names a `recipient_id` and no sender. An INBOUND names `from`.
- * Requiring the absence of a sender means a message can never be swallowed by a
- * marker that a future provider payload happens to share.
+ * sent, so it names a `recipient_id` and no sender OTHER THAN US. An INBOUND
+ * names a `from` belonging to someone else. Requiring the absence of a
+ * third-party sender means a message can never be swallowed by a marker that a
+ * future provider payload happens to share.
+ *
+ * "No sender at all" was the original rule and it is still the rule whenever
+ * OWN_WABA_NUMBER_ENV is unconfigured — see isOwnWabaNumber() above for the
+ * one, fail-safe exception and the 9,631-a-week reason it exists.
  */
 function looksLikeReceipt(p) {
   if (!p || typeof p !== 'object') return false;
@@ -369,7 +516,17 @@ function looksLikeReceipt(p) {
    * Neither production receipt shape carries a sender (both name only
    * recipient_id), so vetoing on one costs us nothing and closes the hole.
    */
-  const hasSender = p.from != null || p.sender != null || p.phone != null || p.mobile != null;
+  /*
+   * ANY sender that is not US vetoes — not merely the first sender field
+   * present. If a body ever carried both our number and a customer's, the
+   * customer's still wins and the body stays a message. The asymmetry is
+   * deliberate: guessing "message" costs a log line, guessing "receipt" costs a
+   * customer's reply.
+   *
+   * With OWN_WABA_NUMBER_ENV unset this reduces, value for value, to the
+   * original `p.from != null || p.sender != null || …`.
+   */
+  const hasSender = SENDER_KEYS.some((k) => p[k] != null && !isOwnWabaNumber(p[k]));
   if (hasSender) return false;
 
   const state = String(p.status || p.deliveryStatus || p.event || '').toLowerCase();

@@ -46,6 +46,68 @@ const now = () => new Date().toLocaleTimeString('en-GB', { hour12: false });
 // the event type still reads at a glance.
 const CORE_LEVEL = { 'ℹ': 'INFO', '⚠': 'WARN', '✗': 'ERROR', '·': 'DEBUG' };
 
+// Max characters of ONE structured value before it is cut. This cap is not
+// cosmetic: `logger.warn({ someObject }, …)` renders the whole object, so a
+// single stray payload on a hot path would otherwise blow the log line out at
+// request rate. Keep it tight for everything that has not opted out below.
+const EXTRA_VALUE_MAX = 120;
+
+/*
+ * Per-key overrides for EXTRA_VALUE_MAX. A map rather than a special case in the
+ * truncation expression so the NEXT diagnostic can opt in by adding one line
+ * here, instead of editing the rendering logic again.
+ *
+ * A key earns a place here only when BOTH hold: the field is useless unless it
+ * can be read whole, AND its exposure has been reasoned about — not assumed.
+ *
+ * `bodyShape` — emitted by the webhook diagnostics (routes/webhook/whatsapp.js
+ * x2, routes/webhook/plivo-conference.js) through their shapeOf()/shape()
+ * helpers. Those helpers replace every leaf VALUE with its `typeof`, so the
+ * words a customer typed and the number they typed them from cannot appear.
+ *
+ * ⚠ BUT "no values" IS NOT "no PII", and the distinction is the whole reason
+ * this paragraph is careful. KEY NAMES survive verbatim, so a body that used a
+ * phone number AS A KEY would print it:
+ *
+ *   shapeOf({ contacts: { '919812345678': { name: 'x' } } })
+ *     -> {"contacts":{"919812345678":{"name":"string"}}}
+ *
+ * Today's Gallabox and Plivo envelopes are fixed-schema — every key is a field
+ * name — so nothing leaks in practice, and that is the actual reason this key
+ * is safe to raise. It is a fact about those providers' payloads, NOT a
+ * guarantee shapeOf() makes. Anyone adding a key here must re-check that its
+ * emitter cannot produce data-derived key names; raising a cap raises the
+ * exposure ceiling by the same multiple.
+ *
+ * WHY IT HAD TO BE RAISED: at 120 chars every one of these lines was cut
+ * mid-key just after "contactId" — 9,631 times in a single week — so the one
+ * field whose entire purpose is to reveal an unrecognised envelope never once
+ * revealed it.
+ *
+ * WHY 4000, NOT UNLIMITED: real envelopes render small — the production receipt
+ * shape measures 126 characters, a full Gallabox inbound 518 — so 4000 is 8-30x
+ * headroom over anything actually seen. It still BOUNDS the pathological case,
+ * and that bound is load-bearing rather than decorative: the helpers cap the
+ * key COUNT per level (25 in whatsapp's shapeOf, 30 in plivo's shape) and the
+ * DEPTH at 2, but that still permits a saturated body serialising to ~316KB.
+ * A quarter-megabyte log line written at webhook rate is exactly what the cap
+ * exists to stop, so shapeOf() must not be mistaken for self-limiting.
+ *
+ * Null-prototype so a body key like `toString`, `constructor` or `valueOf` looks
+ * up as undefined and falls back to the default cap.
+ *
+ * With a plain object literal it would instead find the inherited
+ * Object.prototype FUNCTION, and the failure is the opposite of the obvious
+ * one: `val.length > cap` compares a number to a function, which is NaN-false,
+ * so the ternary takes the else branch and renders the value IN FULL AND
+ * UNBOUNDED. The slice is never reached — nothing is truncated to nothing;
+ * everything is truncated to nothing at all. Measured, not reasoned: a
+ * 400-character value under key `toString` renders at 400.
+ */
+const EXTRA_VALUE_MAX_BY_KEY = Object.assign(Object.create(null), {
+  bodyShape: 4000,
+});
+
 function splitArgs(arg1, arg2) {
   if (typeof arg1 === 'string') return { obj: arg2 && typeof arg2 === 'object' ? arg2 : null, msg: arg1 };
   if (arg1 && typeof arg1 === 'object') return { obj: arg1, msg: typeof arg2 === 'string' ? arg2 : '' };
@@ -64,7 +126,13 @@ function renderExtras(obj) {
       continue;
     }
     const val = typeof v === 'object' ? JSON.stringify(v) : String(v);
-    pairs.push(`${k}=${val.length > 120 ? val.slice(0, 117) + '…' : val}`);
+    // Unknown keys get EXTRA_VALUE_MAX — an unrecognised key must behave exactly
+    // as it does today. `slice(cap - 1) + '…'` keeps the rendered value at
+    // exactly `cap` characters: the ellipsis is ONE character and replaces the
+    // last one rather than being appended past the cap. (The old form sliced to
+    // 117 for a cap of 120, budgeting three chars for a one-char ellipsis.)
+    const cap = EXTRA_VALUE_MAX_BY_KEY[k] || EXTRA_VALUE_MAX;
+    pairs.push(`${k}=${val.length > cap ? val.slice(0, cap - 1) + '…' : val}`);
   }
   return pairs.length ? `  ${paint('dim', pairs.join(' '))}` : '';
 }

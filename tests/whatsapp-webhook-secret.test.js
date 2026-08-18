@@ -455,3 +455,219 @@ test('a CUSTOMER message carrying the same markers is NEVER swallowed as a recei
     assert.match(logText(), /type=text/, 'a known status word must not outrank a real sender');
   });
 });
+
+
+/* ═══ events about OUR OWN outbound: a `from` that is us is not a sender ═══ */
+
+/*
+ * Gallabox posts events ABOUT MESSAGES WE SENT to this same URL, carrying a
+ * `from` that is our own WABA number. In production that was 9,631 payloads in
+ * one week — 67% of everything hitting this endpoint — every one of them
+ * logging "CONTENT NOT FOUND … widen normaliseInbound()" about a body that
+ * never held a customer's words to begin with.
+ *
+ * The fix narrows the sender veto from "a sender" to "a sender that is not us".
+ * These tests pin BOTH halves of that: the noise stops, and the guarantee the
+ * veto exists for — a customer reply can never be classified as a receipt and
+ * dropped before the conversation handler — is untouched.
+ */
+
+const OUR_WABA = '918000000001';       // deliberately NOT the customer number
+const CUSTOMER = '919310992052';       // used elsewhere in this file as a customer
+
+const withOwnNumber = async (value, fn) => {
+  const saved = process.env.WHATSAPP_BUSINESS_NUMBER;
+  if (value === undefined) delete process.env.WHATSAPP_BUSINESS_NUMBER;
+  else process.env.WHATSAPP_BUSINESS_NUMBER = value;
+  try { return await fn(); } finally {
+    if (saved === undefined) delete process.env.WHATSAPP_BUSINESS_NUMBER;
+    else process.env.WHATSAPP_BUSINESS_NUMBER = saved;
+  }
+};
+
+/*
+ * An ALREADY-RECOGNISED receipt that also names US as the sender.
+ *
+ * ⚠ NOT the 9,631-a-week CONTENT NOT FOUND shape, despite what an earlier
+ * version of this comment claimed. bareReceipt() carries recipient_id, so it
+ * clears looksLikeReceipt's marker path on its own; adding `from` only tests
+ * that OUR number no longer vetoes it. That is a real case and worth pinning —
+ * it is just not the noisy one. The noisy shape is pinned separately below,
+ * including the part of it this change does NOT yet fix.
+ */
+const ownSenderReceipt = (from) => ({ ...bareReceipt(), from });
+
+/*
+ * The ACTUAL logged bodyShape behind the 9,631 CONTENT NOT FOUND warnings,
+ * reproduced key-for-key from production:
+ *   {"id":"string","accountId":"string","channelId":"string",
+ *    "channelType":"string","localMessageId":"string","contactId"…
+ * Note where it ENDS: the log line was cut at 120 characters mid-key, right
+ * after "contactId", so whether the real body goes on to carry recipient_id is
+ * genuinely unknown. That truncation is fixed in logger.js in the same change;
+ * until the next day of production logs arrives, this fixture is the whole of
+ * what was ever observable.
+ */
+const loggedNoiseShape = (from) => ({
+  id: '6a7d8872d8d77f3c1831ec7b',
+  accountId: 'acc-1',
+  channelId: '6239ce4aa43d5900047800d1',
+  channelType: 'whatsapp',
+  localMessageId: 'lm-42',
+  contactId: 'ct-1',
+  from,
+});
+
+test('an event about OUR OWN outbound is a receipt, not a customer with nothing to say', async () => {
+  await withSecret(SECRET, async () => {
+    await withOwnNumber(OUR_WABA, async () => {
+      lines = [];
+      assert.equal(await postBody(ownSenderReceipt(OUR_WABA)), 200);
+      const t = logText();
+      assert.equal(/CONTENT NOT FOUND/.test(t), false,
+        'the 9,631-a-week line: our own number is not "a real sender" with a missing message');
+      assert.equal(/UNPARSEABLE/.test(t), false);
+      assert.equal(/WhatsApp inbound · type=/.test(t), false,
+        'it must not reach the inbound branch at all');
+      assert.equal(lines.some((l) => l.lvl === 'warn'), false,
+        'and routine traffic about our own sends does not WARN');
+    });
+  });
+});
+
+test('91-prefixed, +91 and bare spellings of our number all match — last 10 digits', async () => {
+  // Gallabox, Meta and whoever fills the .env each spell a number differently.
+  // Matching on anything narrower than the last 10 digits would fix the noise
+  // on one deployment and leave it on the next.
+  await withSecret(SECRET, async () => {
+    for (const spelling of ['8000000001', '+91 80000 00001', '91-8000000001']) {
+      await withOwnNumber(spelling, async () => {
+        lines = [];
+        assert.equal(await postBody(ownSenderReceipt(OUR_WABA)), 200);
+        assert.equal(/CONTENT NOT FOUND/.test(logText()), false,
+          `"${spelling}" must resolve to the same number as ${OUR_WABA}`);
+      });
+    }
+  });
+});
+
+test('A CUSTOMER message carrying the SAME markers is STILL never swallowed', async () => {
+  /*
+   * THE REGRESSION THAT MATTERS. normaliseStatus runs before normaliseInbound,
+   * so a body classified as a receipt never reaches the conversation handler —
+   * a reply dropped in silence to save a log line. The narrowing must apply to
+   * our number and to nothing else, INCLUDING when it is configured.
+   */
+  await withSecret(SECRET, async () => {
+    await withOwnNumber(OUR_WABA, async () => {
+      lines = [];
+      assert.equal(await postBody({
+        ...bareReceipt(),
+        from: CUSTOMER,                 // a real customer, same receipt markers
+        type: 'text',
+        text: { body: 'yes please' },
+      }), 200);
+      assert.match(logText(), /WhatsApp inbound · type=text/,
+        'a sender who is not us still makes it a message, whatever else the body carries');
+    });
+  });
+});
+
+test('our number alone is NOT enough — it must still look like a receipt', async () => {
+  /*
+   * The narrowing changes the sender IDENTITY test and nothing else. "from ==
+   * us" is not a licence to discard a body: without a status word, or a
+   * recipient plus a receipt marker, it is still handed to the inbound path.
+   * Anything looser would let a shape we have never seen vanish unlogged.
+   */
+  await withSecret(SECRET, async () => {
+    await withOwnNumber(OUR_WABA, async () => {
+      lines = [];
+      assert.equal(await postBody({ from: OUR_WABA, type: 'text', text: { body: 'hello' } }), 200);
+      assert.match(logText(), /WhatsApp inbound · type=text/,
+        'no receipt markers → not a receipt, however familiar the sender');
+    });
+  });
+});
+
+test('UNSET or BLANK own-number → byte-for-byte the old behaviour: any sender vetoes', async () => {
+  /*
+   * THE FAIL-SAFE, and the reason this change is safe to ship ahead of the ops
+   * step that sets the variable. An unconfigured deployment keeps the old log
+   * noise — what it must NEVER do is start swallowing customer messages
+   * because a value nobody filled in compared equal to something.
+   */
+  await withSecret(SECRET, async () => {
+    for (const unconfigured of [undefined, '', '   ', 'not-a-number']) {
+      await withOwnNumber(unconfigured, async () => {
+        lines = [];
+        assert.equal(await postBody(ownSenderReceipt(OUR_WABA)), 200);
+        assert.match(logText(), /CONTENT NOT FOUND/,
+          `with own-number ${JSON.stringify(unconfigured)} the sender must still veto, exactly as before`);
+      });
+    }
+  });
+});
+
+test('an ops paste of the GALLABOX_CHANNEL_ID cannot swallow a customer — unparseable means NO key', async () => {
+  /*
+   * THE FAIL-SAFE, PINNED WITH A VALUE THAT ACTUALLY THREATENS IT.
+   *
+   * The first cut of this guard fell back to the raw string when
+   * normaliseIndianPhone rejected a token, so ANY value carrying ten digits
+   * produced a live match key from its last ten:
+   *
+   *   '6239ce4aa43d5900047800d1'  ->  '9000478001'
+   *
+   * That is a Gallabox channel id — the single most likely thing to be pasted
+   * into a variable named WHATSAPP_BUSINESS_NUMBER. With it set, the genuine
+   * customer on 9000478001 had every reply classified as a receipt: never
+   * routed, never logged, gone.
+   *
+   * A digit-free 'not-a-number' passes whatever the fallback does, which is why
+   * the original test could not catch this. This one uses the real id.
+   */
+  await withSecret(SECRET, async () => {
+    for (const junk of ['6239ce4aa43d5900047800d1', 'my-channel-2024-00123456789', 'not-a-number']) {
+      await withOwnNumber(junk, async () => {
+        lines = [];
+        assert.equal(await postBody({
+          ...bareReceipt(),
+          from: '919000478001',        // the number the channel id's last 10 digits collide with
+          type: 'text',
+          text: { body: 'yes please' },
+        }), 200);
+        assert.match(logText(), /WhatsApp inbound · type=text/,
+          `"${junk}" must yield no own-number key, so this customer reply still reaches the handler`);
+      });
+    }
+  });
+});
+
+test('KNOWN LIMIT: the logged noise shape is still not silenced — it names no recipient', async () => {
+  /*
+   * Deliberately pins what this change does NOT do, so nobody reads the 9,631
+   * figure in the source comments as "solved".
+   *
+   * Lifting the sender veto is necessary but not sufficient. looksLikeReceipt
+   * then needs one of two things: a known status word, or a recipient PLUS a
+   * receipt marker. The shape as LOGGED has neither — no status, and no
+   * recipient_id before the line was truncated — so it still falls through to
+   * the inbound branch and still warns.
+   *
+   * Whether the REAL body carries recipient_id past the cut is unknown today
+   * and knowable tomorrow, because the truncation that hid it is fixed in the
+   * same change. If it does, this test flips and the noise is gone with no
+   * further code. If it does not, the honest options are to accept the sender
+   * identity alone as sufficient, or to widen the markers — a decision that
+   * should be made against a real payload, not this fixture.
+   */
+  await withSecret(SECRET, async () => {
+    await withOwnNumber(OUR_WABA, async () => {
+      lines = [];
+      assert.equal(await postBody(loggedNoiseShape(OUR_WABA)), 200);
+      assert.match(logText(), /CONTENT NOT FOUND/,
+        'if this now passes, production sends a recipient_id and the noise is fixed — delete this test');
+    });
+  });
+});
