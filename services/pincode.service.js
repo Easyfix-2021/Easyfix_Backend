@@ -1,6 +1,7 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const geocode = require('./pincode-geocode.service');
+const coverage = require('./pincode-coverage.service');
 
 /*
  * Generic pincode catalog — `tbl_pincode` (created in
@@ -13,8 +14,11 @@ const geocode = require('./pincode-geocode.service');
  * service operates entirely on tbl_pincode.
  *
  * Status model (computed at read time, NOT stored):
- *   LOCAL    — row active AND ≥1 active+verified easyfixer maps to a zone
- *              covering this pincode's city.
+ *   LOCAL    — an active + verified technician either LIVES in this pincode
+ *              (tbl_easyfixer.efr_pin_no) or SERVICES it
+ *              (tbl_efr_serviceable_pincodes). Same rule the TAT engine uses
+ *              for Local vs Travel — see services/pincode-coverage.service.js,
+ *              which is now the single definition for both.
  *   TRAVEL   — row active but no qualifying tech.
  *   UNZONED  — pincode missing from this table. This service only lists
  *              rows that ARE present, so UNZONED is detected at job-create
@@ -43,24 +47,27 @@ const STATUS = Object.freeze({ LOCAL: 'LOCAL', TRAVEL: 'TRAVEL', UNZONED: 'UNZON
 // tbl_easyfixer table. Acceptable for an ops settings page.
 async function pincodeIdToActiveEfrCount(pincodeIds) {
   if (!pincodeIds.length) return new Map();
+  // Resolve ids → pincode strings, then ask the SHARED coverage module. This
+  // used to run its own FIND_IN_SET join, which differed from every other
+  // consumer in two ways: it ignored the technician's OWN pincode
+  // (tbl_easyfixer.efr_pin_no), and it did NOT strip spaces from the CSV — so
+  // '560001, 560002' matched only the first entry and the rest of that
+  // technician's coverage was invisible. Both are fixed by delegating.
   const placeholders = pincodeIds.map(() => '?').join(',');
   const [rows] = await pool.query(
-    `SELECT p.pincode_id, COUNT(DISTINCT e.efr_id) AS active_efr_count
-       FROM tbl_pincode p
-       LEFT JOIN tbl_efr_serviceable_pincodes sp
-              ON FIND_IN_SET(p.pincode, sp.pincodes) > 0
-       LEFT JOIN tbl_easyfixer e
-              ON e.efr_id = sp.easyfixer_id
-             AND e.efr_status = 1
-             AND e.is_technician_verified = 1
-      WHERE p.pincode_id IN (${placeholders})
-      GROUP BY p.pincode_id`,
-    pincodeIds
+    `SELECT pincode_id, pincode FROM tbl_pincode WHERE pincode_id IN (${placeholders})`,
+    pincodeIds,
   );
+  const covered = await coverage.getCoveredPincodes(rows.map((r) => r.pincode));
   const map = new Map();
-  for (const r of rows) map.set(Number(r.pincode_id), Number(r.active_efr_count) || 0);
+  for (const r of rows) {
+    // The caller only branches on > 0 (deriveStatus), so a boolean-as-count is
+    // sufficient and avoids a second query purely to produce a headcount.
+    map.set(Number(r.pincode_id), covered.has(String(r.pincode).trim()) ? 1 : 0);
+  }
   return map;
 }
+
 
 /*
  * List active+verified technicians who explicitly service a pincode.

@@ -841,6 +841,33 @@ async function hasVerticalMappingInsertedOnColumn() {
  * could not be resolved. On any error the column is left NULL — no owner is
  * better than a wrong one, because a wrong one looks right.
  */
+/*
+ * Snapshot the job's Local/Travel classification into tbl_job_tat_locality.
+ *
+ * Deliberately NOT awaited and deliberately outside the job transaction — see
+ * the call site. Swallows every error: the table is a new EasyFix-owned one and
+ * an environment where the migration has not run must still be able to create
+ * jobs.
+ */
+function stampJobLocality(jobId, pinCode) {
+  if (!jobId) return;
+  (async () => {
+    try {
+      const coverage = require('./pincode-coverage.service');
+      const covered = await coverage.getCoveredPincodes([pinCode]);
+      const isLocal = pinCode && covered.has(String(pinCode).trim()) ? 1 : 0;
+      await pool.query(
+        `INSERT INTO tbl_job_tat_locality (job_id, is_local, pincode, snapshot_source, resolved_on)
+         VALUES (?, ?, ?, 'booking', ?)
+         ON DUPLICATE KEY UPDATE job_id = job_id`,
+        [jobId, isLocal, pinCode || null, new Date()],
+      );
+    } catch (e) {
+      logger.warn('Job locality snapshot skipped · jobId=' + jobId + ' · ' + e.message);
+    }
+  })();
+}
+
 async function stampJobPrimarySpoc(jobId, clientId, conn) {
   if (!jobId || !(await hasJobPrimarySpocColumn())) return;
   const db = conn || pool;
@@ -3187,6 +3214,26 @@ async function create(input, actor) {
     // query to learn what we already know. A client-less job stamps NULL.
     await stampJobPrimarySpoc(jobId, input.fk_client_id || null, conn);
 
+    /*
+     * Freeze whether this job is LOCAL or TRAVEL — i.e. whether any active,
+     * verified technician covers its pincode right now.
+     *
+     * This does NOT wire TAT into job creation: the dependency is on
+     * pincode-coverage.service, a general platform fact ("is this pincode
+     * serviceable?") that also drives Settings → Manage Pincodes. The TAT
+     * engine happens to be its first consumer; nothing here knows about
+     * segments, targets or scores.
+     *
+     * It is frozen because coverage CHANGES. Onboarding a technician into an
+     * area would otherwise retroactively re-classify every past job there, and
+     * a scorecard nobody can reproduce is not a scorecard.
+     *
+     * Fire-and-forget, outside the transaction's success path: a job must never
+     * fail to be created because a reporting snapshot could not be written. A
+     * missing row simply falls back to live classification.
+     */
+    stampJobLocality(jobId, input.pin_code || null);
+
     if (Array.isArray(input.services) && input.services.length > 0) {
       // Batch-load rate-card rows for all picked services in ONE query
       // (avoids N+1) — then compute the 5 charge columns per row via
@@ -3862,6 +3909,7 @@ function statusToEventName(prevStatus, newStatus) {
  */
 const STATUS_EXTRAS_ALLOWLIST = new Set([
   // Check-in stamps (mobile /checkin path)
+  'checkin_date_time',
   'checkin_gps_location', 'checkin_address', 'checkin_pincode', 'fk_checkin_by',
   // Check-out stamps (mobile /checkout path)
   'app_checkout_date_time',
@@ -3878,6 +3926,23 @@ const STATUS_EXTRAS_ALLOWLIST = new Set([
   // Tech-side reassignment trigger
   'requested_date_time',
 ]);
+
+/*
+ * Extras columns that must keep their FIRST value, written with COALESCE.
+ *
+ * `checkin_date_time` anchors TAT Segment 1 (ticket created → check-in), which
+ * measures the FIRST visit. A revisit re-checks-in on the same job row, and an
+ * app retry can fire the endpoint twice within seconds — either would move the
+ * anchor forward and silently improve a Visit TAT that was already breached.
+ * Legacy avoided this with a `currentStatus == 1` gate rather than write-once
+ * semantics; write-once is the stronger guarantee because it does not depend on
+ * the caller reaching the endpoint in a particular state.
+ *
+ * (`checkout_date_time` gets the same treatment, but in the COMPLETED_STATES
+ * branch above, because it is stamped by the transition itself rather than
+ * passed through extras.)
+ */
+const WRITE_ONCE_EXTRAS = new Set(['checkin_date_time']);
 
 /*
  * Cached probe for `tbl_job.send_back_to_tx` column existence. The
@@ -4104,6 +4169,28 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
         try { require('../logger').debug?.({ col, jobId }, 'setStatus: ignoring non-whitelisted extras column'); } catch {}
         continue;
       }
+      /*
+       * WRITE-ONCE columns keep the FIRST value they were given. See
+       * WRITE_ONCE_EXTRAS for why each one is in there.
+       */
+      if (WRITE_ONCE_EXTRAS.has(col)) {
+        if (val === undefined) continue;
+        sets.push(`${col} = COALESCE(${col}, ?)`);
+        values.push(val);
+        continue;
+      }
+      /*
+       * `undefined` means the caller had nothing to say about this column —
+       * NOT "clear it". Binding it would throw (mysql2 rejects undefined bind
+       * params) or, worse, coerce to NULL and silently wipe a stored value.
+       * The mobile check-in path shipped exactly that bug: an optional stamp
+       * absent from the request nulled the previous visit's reading.
+       *
+       * An explicit `null` still writes NULL — that is a caller stating the
+       * column has no value for THIS event, which some stamps legitimately do
+       * (reschedule_remarks clears on each new reschedule).
+       */
+      if (val === undefined) continue;
       sets.push(`${col} = ?`);
       values.push(val);
     }

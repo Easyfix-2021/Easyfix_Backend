@@ -85,3 +85,60 @@ test('extras allowlist is the SQL-injection guard — unknown columns are droppe
   assert.match(upd.sql, /checkin_gps_location/, 'allowlisted extra must be applied');
   assert.doesNotMatch(upd.sql, /not_a_real_column/, 'non-allowlisted extra must be dropped');
 });
+
+/*
+ * Non-destructive extras (2026-08-19). The mobile check-in path used to build
+ * `checkin_gps_location: req.body.gps || null`, so a request without GPS wrote
+ * an explicit NULL and erased the previous visit's reading. The route now omits
+ * absent stamps; these pin the service half of that contract so a future caller
+ * can't reintroduce it: `undefined` = "nothing to say", explicit `null` = "clear
+ * it for this event" (reschedule_remarks relies on the latter).
+ */
+test('extras: an undefined value is skipped, not written as NULL', async () => {
+  try {
+    await jobSvc.setStatus(
+      42,
+      { status: 2, extras: { checkin_gps_location: undefined, fk_checkin_by: 7 } },
+      { user_id: 1 },
+    );
+  } catch (e) { if (!e.__stop) throw e; }
+  const upd = lastUpdate();
+  assert.ok(upd);
+  assert.doesNotMatch(upd.sql, /checkin_gps_location/, 'undefined extra must not reach the UPDATE');
+  assert.match(upd.sql, /fk_checkin_by/, 'a supplied extra alongside it still applies');
+  assert.ok(!upd.params.includes(undefined), 'no undefined may be bound (mysql2 rejects it)');
+});
+
+test('extras: an explicit null IS written — callers can still clear a column', async () => {
+  try {
+    await jobSvc.setStatus(
+      42,
+      { status: 2, extras: { reschedule_remarks: null } },
+      { user_id: 1 },
+    );
+  } catch (e) { if (!e.__stop) throw e; }
+  const upd = lastUpdate();
+  assert.ok(upd);
+  assert.match(upd.sql, /reschedule_remarks/, 'explicit null must still set the column');
+  assert.ok(upd.params.includes(null), 'null must be bound as the value');
+});
+
+test('extras: checkin_date_time is WRITE-ONCE — a revisit cannot move the TAT anchor', async () => {
+  // Segment 1 measures ticket-created → FIRST check-in. A revisit re-checks-in
+  // on the same row, and an app retry can fire the endpoint twice in seconds.
+  // A plain `col = ?` would move the anchor forward and silently improve a
+  // Visit TAT that was already breached.
+  try {
+    await jobSvc.setStatus(
+      42,
+      { status: 2, extras: { checkin_date_time: new Date(), checkin_pincode: '560001' } },
+      { user_id: 1 },
+    );
+  } catch (e) { if (!e.__stop) throw e; }
+  const upd = lastUpdate();
+  assert.ok(upd);
+  assert.match(upd.sql, /checkin_date_time = COALESCE\(checkin_date_time, \?\)/,
+    'the anchor must keep its FIRST value');
+  assert.match(upd.sql, /checkin_pincode = \?/,
+    'ordinary extras still overwrite — only the anchor is write-once');
+});

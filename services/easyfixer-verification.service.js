@@ -1221,6 +1221,15 @@ async function replaceServiceablePincodesOnRunner(
      ON DUPLICATE KEY UPDATE pincodes = VALUES(pincodes), updated_by = VALUES(updated_by)`,
     [efrId, csv, userId, userId]
   );
+
+  /*
+   * This write changes which pincodes are serviceable, which changes Manage
+   * Pincodes' status column AND the TAT engine's Local/Travel classification.
+   * Both read through a 60-second cache, so without this the operator saves a
+   * pincode list and the screen keeps showing the old answer for a minute —
+   * which reads as "the save didn't work".
+   */
+  try { require('./pincode-coverage.service').invalidateCoverage(); } catch { /* cache-only */ }
   // Immediate-serviceable hook: flip the just-added pincodes to Serviceable
   // (pincode_status = 1) right away so a technician/ops updating their set
   // sees them go live without waiting for the full nightly recompute. We only

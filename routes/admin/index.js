@@ -135,6 +135,7 @@ router.use('/branding',        require('./branding'));
 router.use('/scheduled-jobs',  require('./scheduled-jobs'));
 router.use('/validate',        require('./validate')); // Validate Flows — property-gated test-push (validate.flows.emails)
 router.use('/skill-matrix',    require('./skill-matrix')); // Build Skill Matrix — property-gated AI build (skill.matrix.emails)
+router.use('/tat',             require('./tat'));          // TAT Calculator — segment-wise TAT preview (isTatCalculatorView)
 router.use('/teleprompter',    require('./teleprompter')); // AI Teleprompter for Calls — property-gated (teleprompter.emails)
 router.use('/otp-channel',     require('./otp-channel')); // Login OTP channel (WhatsApp/SMS) — property-gated (access.otpchannel.emails)
 router.use('/reports',         require('./reports'));

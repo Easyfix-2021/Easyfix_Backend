@@ -822,6 +822,10 @@ async function setStatus(id, { active, reasonId, comment, reactivationDate }, ac
     values
   );
   logger.info('Easyfixer status updated · id=' + id + ' active=' + active);
+  // Status change flips whether this technician makes their pincodes
+  // serviceable — bust the shared coverage cache so Manage Pincodes and TAT
+  // reflect it immediately rather than up to 60s later.
+  try { require('./pincode-coverage.service').invalidateCoverage(); } catch { /* cache-only */ }
   return getById(id);
 }
 

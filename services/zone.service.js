@@ -1,5 +1,32 @@
 const { pool } = require('../db');
 const logger = require('../logger');
+const coverage = require('./pincode-coverage.service');
+
+/*
+ * Fill technician_count for a page of zones: ONE query for all their pincodes,
+ * then a cache lookup per zone. Replaces a per-zone correlated subquery.
+ */
+async function attachTechnicianCounts(zones) {
+  if (!zones.length) return zones;
+  const zoneIds = zones.map((z) => z.zone_id);
+  const [pins] = await pool.query(
+    `SELECT zpm.zone_id, p.pincode
+       FROM tbl_zone_pincode_mapping zpm
+       JOIN tbl_pincode p ON p.pincode_id = zpm.pincode_id
+      WHERE zpm.zone_id IN (${zoneIds.map(() => '?').join(',')})`,
+    zoneIds,
+  );
+  const byZone = new Map();
+  for (const r of pins) {
+    if (!byZone.has(r.zone_id)) byZone.set(r.zone_id, []);
+    byZone.get(r.zone_id).push(r.pincode);
+  }
+  for (const z of zones) {
+    const ids = await coverage.getTechnicianIdsForPincodes(byZone.get(z.zone_id) || []);
+    z.technician_count = ids.size;
+  }
+  return zones;
+}
 
 /*
  * Manage Zones — junction model (2026-06-15).
@@ -64,6 +91,18 @@ async function listZones({ q, limit = 1000, offset = 0, includeInactive = false 
   }
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
 
+  /*
+   * technician_count used to be a correlated subquery running
+   * FIND_IN_SET as a JOIN CONDITION across three tables — PER ZONE ROW, inside
+   * this paginated list. That is an unbounded nested product with no early exit
+   * and no row cap: the worst-shaped query in this file. It also lacked the
+   * REPLACE(pincodes,' ','') normalisation, so a technician whose CSV was saved
+   * with spaces contributed coverage for only their FIRST pincode.
+   *
+   * It is now two bounded reads: this list query (no supply join at all), then
+   * one pincode fetch for the page's zones, resolved against the shared
+   * coverage cache. Cost no longer scales with the number of zones on the page.
+   */
   const [rows] = await pool.query(`
     SELECT
       z.zone_id,
@@ -74,13 +113,7 @@ async function listZones({ q, limit = 1000, offset = 0, includeInactive = false 
       c.city_name,
       (SELECT COUNT(*) FROM tbl_zone_pincode_mapping zpm
         WHERE zpm.zone_id = z.zone_id) AS pincode_count,
-      (SELECT COUNT(DISTINCT e.efr_id)
-         FROM tbl_zone_pincode_mapping zpm
-         JOIN tbl_pincode p  ON p.pincode_id = zpm.pincode_id
-         JOIN tbl_efr_serviceable_pincodes sp ON FIND_IN_SET(p.pincode, sp.pincodes) > 0
-         JOIN tbl_easyfixer e ON e.efr_id = sp.easyfixer_id
-              AND e.efr_status = 1 AND e.is_technician_verified = 1
-        WHERE zpm.zone_id = z.zone_id) AS technician_count
+      NULL AS technician_count   -- filled in below; see the note above
       FROM tbl_zone_master z
       LEFT JOIN tbl_city   c ON c.city_id = z.city_id
       ${whereSql}
@@ -95,6 +128,7 @@ async function listZones({ q, limit = 1000, offset = 0, includeInactive = false 
       ${whereSql}
   `, whereParams);
 
+  await attachTechnicianCounts(rows);
   logger.info('Returning ' + rows.length + ' zones (total=' + Number(total) + ')');
   return { items: rows, total: Number(total) };
 }
@@ -126,19 +160,10 @@ async function getZoneDetail(zoneId) {
 
   // Technician count + pincode count (mirrors the list query) — handy for
   // detail-page summary cards without a second round-trip from the UI.
-  const [[counts]] = await pool.query(
-    `SELECT
-        (SELECT COUNT(*) FROM tbl_zone_pincode_mapping zpm
-          WHERE zpm.zone_id = ?) AS pincode_count,
-        (SELECT COUNT(DISTINCT e.efr_id)
-           FROM tbl_zone_pincode_mapping zpm
-           JOIN tbl_pincode p  ON p.pincode_id = zpm.pincode_id
-           JOIN tbl_efr_serviceable_pincodes sp ON FIND_IN_SET(p.pincode, sp.pincodes) > 0
-           JOIN tbl_easyfixer e ON e.efr_id = sp.easyfixer_id
-                AND e.efr_status = 1 AND e.is_technician_verified = 1
-          WHERE zpm.zone_id = ?) AS technician_count`,
-    [zoneId, zoneId]
-  );
+  // Same rewrite as the list query — the pincodes are already in hand from the
+  // SELECT above, so the technician count is a cache lookup, not a third join.
+  const technicianIds = await coverage.getTechnicianIdsForPincodes(pincodes.map((r) => r.pincode));
+  const counts = { pincode_count: pincodes.length, technician_count: technicianIds.size };
 
   logger.info('Found ' + pincodes.length + ' pincodes for zone · id=' + zoneId);
   return { ...zone, pincodes, ...counts };
@@ -220,15 +245,31 @@ async function listAssignablePincodes(zoneId, { q, limit = 50, offset = 0, inZon
  */
 async function searchEasyfixersInZone(zoneId, { q, limit = 200, activeOnly = true } = {}) {
   logger.info('Searching easyfixers in zone · zoneId=' + zoneId + ' q=' + (q || '') + ' limit=' + limit + ' activeOnly=' + activeOnly);
-  // Base filters applied directly in the JOIN ON clause (literal SQL, no params).
-  const efClauses = ['e.efr_status = 1', 'e.is_technician_verified = 1'];
-  if (!activeOnly) efClauses.length = 0; // caller opted out — return all who service the zone
+  /*
+   * Resolve WHICH technicians service this zone from the shared coverage cache,
+   * then fetch just those rows. Replaces a FIND_IN_SET join across
+   * tbl_zone_pincode_mapping x tbl_pincode x tbl_efr_serviceable_pincodes that
+   * could not use an index and had no row cap — and that, lacking the
+   * REPLACE(' ') normalisation, silently dropped every serviceable pincode
+   * after the first for any technician whose CSV contained spaces.
+   */
+  const [zonePins] = await pool.query(
+    `SELECT p.pincode
+       FROM tbl_zone_pincode_mapping zpm
+       JOIN tbl_pincode p ON p.pincode_id = zpm.pincode_id
+      WHERE zpm.zone_id = ?`,
+    [zoneId],
+  );
+  const ids = [...await coverage.getTechnicianIdsForPincodes(
+    zonePins.map((r) => r.pincode),
+    { activeOnly },
+  )];
+  if (!ids.length) {
+    logger.info('Found 0 easyfixers in zone · zoneId=' + zoneId);
+    return [];
+  }
 
-  // Params order matches the ? placeholders in the SQL below:
-  //   1. zoneId  → WHERE zpm.zone_id = ?
-  //   2+. LIKE   → if q provided, three LIKE params in the AND clause
-  //   last. limit → LIMIT ?
-  const params = [zoneId];
+  const params = [...ids];
   let searchFilter = '';
   if (q) {
     searchFilter = 'AND (e.efr_name LIKE ? OR e.efr_no LIKE ? OR e.efr_email LIKE ?)';
@@ -237,20 +278,15 @@ async function searchEasyfixersInZone(zoneId, { q, limit = 200, activeOnly = tru
   }
   params.push(Number(limit));
 
-  const efFilter = efClauses.length ? `AND ${efClauses.join(' AND ')}` : '';
-
   const [rows] = await pool.query(`
-    SELECT DISTINCT
+    SELECT
       e.efr_id, e.efr_name, e.efr_no, e.efr_email,
       e.efr_cityId, e.is_technician_verified, e.efr_profile_perc,
       e.efr_status,
       c.city_name
-      FROM tbl_zone_pincode_mapping zpm
-      JOIN tbl_pincode p  ON p.pincode_id = zpm.pincode_id
-      JOIN tbl_efr_serviceable_pincodes sp ON FIND_IN_SET(p.pincode, sp.pincodes) > 0
-      JOIN tbl_easyfixer e ON e.efr_id = sp.easyfixer_id ${efFilter}
+      FROM tbl_easyfixer e
       LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId
-     WHERE zpm.zone_id = ?
+     WHERE e.efr_id IN (${ids.map(() => '?').join(',')})
        ${searchFilter}
      ORDER BY e.efr_name ASC
      LIMIT ?

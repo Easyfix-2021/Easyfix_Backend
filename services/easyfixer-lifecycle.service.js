@@ -1068,6 +1068,11 @@ async function transition(efrId, input = {}, actor = null) {
     if (input._awaitPostCommitSideEffects === true) await effects;
     else effects.catch(() => {});
   }
+  // A lifecycle transition can activate or deactivate the technician, which
+  // changes pincode serviceability for Manage Pincodes and TAT.
+  if (result.changed) {
+    try { require('./pincode-coverage.service').invalidateCoverage(); } catch { /* cache-only */ }
+  }
   return result;
 }
 

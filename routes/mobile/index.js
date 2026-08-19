@@ -739,17 +739,53 @@ router.post('/jobs/:id/checkin', validate(Joi.object({
         code: 'INVALID_CHECKIN_PIN',
       });
     }
+    /*
+     * Location stamps are NON-DESTRUCTIVE — absence is not a value.
+     *
+     * These were built as `req.body.gps || null`, which turns "the technician
+     * didn't send a location" into an explicit `checkin_gps_location = NULL`
+     * in the UPDATE. tbl_job holds ONE set of check-in columns for the whole
+     * job, so that didn't merely fail to record the new reading — it ERASED
+     * the stored one. Two real paths hit it, both with GPS off or permission
+     * denied (which the schema above deliberately allows):
+     *   - an app retry moments after a check-in that DID capture coordinates;
+     *   - a revisit's second check-in, wiping visit 1's location.
+     * Either way the column ended up NULL with nothing put in its place.
+     *
+     * So only include a column when the technician actually supplied one; an
+     * omitted (or blank) field leaves whatever is stored untouched. This is
+     * the same shape the /checkout handler below already uses for its own
+     * optional stamps.
+     *
+     * fk_checkin_by stays unconditional: it always has a value (the
+     * authenticated tech) and SHOULD track the most recent check-in.
+     */
+    /*
+     * The check-in TIMESTAMP — the anchor for TAT Segment 1 (ticket created →
+     * check-in) and the start of Segment 2. This backend never wrote it: the
+     * only writer in the estate was the legacy Java mobile API, so any job
+     * worked through the new app had no Visit clock at all.
+     *
+     * Written WRITE-ONCE (setStatus COALESCEs it — see WRITE_ONCE_EXTRAS), so a
+     * revisit's second check-in or an app retry cannot move the anchor forward
+     * and quietly improve a Visit TAT that was already breached.
+     *
+     * Server clock, not a client-supplied one. Legacy trusted the app's
+     * `eventTimeStamp` when present, which makes an SLA anchor forgeable by the
+     * device being measured.
+     */
+    const extras = { fk_checkin_by: req.tech.efr_id, checkin_date_time: new Date() };
+    const stampIfPresent = (col, raw) => {
+      const v = typeof raw === 'string' ? raw.trim() : raw;
+      if (v !== null && v !== undefined && v !== '') extras[col] = v;
+    };
+    stampIfPresent('checkin_gps_location', req.body.gps);
+    stampIfPresent('checkin_address',      req.body.address);
+    stampIfPresent('checkin_pincode',      req.body.pincode);
+
     await jobService.setStatus(
       job.job_id,
-      {
-        status: 2 /* IN_PROGRESS */,
-        extras: {
-          checkin_gps_location: req.body.gps || null,
-          checkin_address:      req.body.address || null,
-          checkin_pincode:      req.body.pincode || null,
-          fk_checkin_by:        req.tech.efr_id,
-        },
-      },
+      { status: 2 /* IN_PROGRESS */, extras },
       { user_id: req.tech.efr_id },
     );
     logger.info('Checked in · id=' + job.job_id + ' · status->IN_PROGRESS');
