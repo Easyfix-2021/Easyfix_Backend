@@ -99,5 +99,13 @@ router.use('/pincodes', require('./pincodes'));
  * routes/public/website-booking.js.
  */
 router.use('/website-booking', require('./website-booking'));
+/*
+ * Festival theme for the login page (2026-08-18). Token-less by necessity —
+ * it is read while the LOGIN screen paints, before any session exists. Safe
+ * because it returns only chrome: a name, a date window and overlay geometry,
+ * plus an ornament URL presigned ONLY for keys under the `Branding/` prefix.
+ * No user, job, client or PII. Full path: /api/public/branding/active
+ */
+router.use('/branding', require('./branding'));
 
 module.exports = router;

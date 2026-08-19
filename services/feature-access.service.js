@@ -24,6 +24,13 @@ const FEATURES = {
   canRunTeleprompter: 'teleprompter.emails',
   canSwitchOtpChannel: 'access.otpchannel.emails',
   canManageJobCharges: 'job.charges.emails',
+  // Generate festival ornament art for Settings → Theme & Branding. Outside
+  // RBAC because it spends model credits and publishes an image to the
+  // UNAUTHENTICATED login page — a blast radius that should follow a person,
+  // not a role. Seeded EMPTY = deny-all
+  // (migrations/2026-08-18-settings-branding.sql). The rest of the Branding
+  // screen is ordinary RBAC (isBrandingView / isBrandingEdit).
+  canGenerateBrandArt: 'branding.ai.emails',
   // (Re)provision a CRM user's Microsoft 365 mailbox — it CREATES an Entra
   // directory account and spends a licence seat, so it stays outside RBAC and
   // is granted per person. Seeded EMPTY = deny-all

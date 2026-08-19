@@ -123,6 +123,11 @@ router.use('/rate-cards',      require('./rate-cards'));
 router.use('/quotations',      require('./quotations'));
 router.use('/questionnaires',  require('./questionnaires'));
 router.use('/settings',        require('./settings'));
+// Settings → Theme & Branding (2026-08-18) — banner copy, login tagline, and
+// the festival theme calendar the public login page reads. RBAC-gated
+// (isBrandingView / isBrandingEdit), NOT property-gated; only the AI art
+// generator is (FEATURES.canGenerateBrandArt → branding.ai.emails).
+router.use('/branding',        require('./branding'));
 // Scheduled Jobs admin (2026-06-06) — list + manual trigger for
 // node-cron tasks. Self-gates on the email allowlist
 // (easyfix_properties.scheduled.jobs.visible.emails); no role/menu
