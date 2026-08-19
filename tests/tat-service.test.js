@@ -535,3 +535,29 @@ test('open decisions are fully populated and uniquely keyed', () => {
 test('only statuses 3 and 5 count as completed', () => {
   assert.deepEqual(tat.COMPLETED_STATUSES, [3, 5]);
 });
+
+// ─── Stop reasons (spec §5) ──────────────────────────────────────────
+//
+// These are a FROZEN set, not a DB dropdown. The first attempt seeded them into
+// action_taken_reason and failed on `Unknown column 'reason'` — that table's
+// columns are (id, action_type, action_desc, user_type, status, is_new), and its
+// `action_type` is a bare integer bucket whose free values cannot be known
+// without a live SELECT. Constants remove the whole problem.
+
+test('§5 · the three stop triggers are frozen and fully specified', () => {
+  const p = tat.policy();
+  assert.equal(p.stopReasons.length, 3);
+  assert.deepEqual(p.stopReasons.map((r) => r.code).sort(),
+    ['ENTRY_PERMISSION', 'MATERIAL', 'OEM_PART']);
+  for (const r of p.stopReasons) {
+    assert.ok(r.code && r.label && r.owner, `stop reason ${r.code} is missing a field`);
+    assert.ok(p.stopOwners.includes(r.owner), `${r.code} defaults to an owner that is not offered`);
+  }
+});
+
+test('§5 · owners include OEM/Vendor — the member user_type does not have', () => {
+  // This is precisely why stop_owned_by is its own column rather than an FK to
+  // the platform's user_type vocabulary (EasyFix / Customer / Client /
+  // Technician), and why separating vendor-caused delay from ours is possible.
+  assert.deepEqual(tat.policy().stopOwners, ['EasyFix', 'Client', 'OEM/Vendor']);
+});

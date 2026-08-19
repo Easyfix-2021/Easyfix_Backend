@@ -5,7 +5,6 @@
 --   1. tbl_job_tat_stop      — TAT pause ledger (spec §5). MULTIPLE per job.
 --   2. tbl_job_tat_locality  — frozen Local/Travel classification, 1 per job.
 --   3. idx_efr_active_pin    — index the pincode-coverage read needs.
---   4. action_taken_reason   — three stop reasons under a new action_type.
 --
 -- Both tables are EasyFix-OWNED and referenced by no legacy service, which is
 -- the explicit carve-out in CLAUDE.md's "never alter schema, never add tables"
@@ -31,8 +30,18 @@
 -- member, and separating EasyFix-caused delays from vendor-caused ones is the
 -- entire reporting point of the field.
 --
--- `reason_code` is a stable classifier held ALONGSIDE the FK so that renaming a
--- dropdown row can never re-bucket historical stops.
+-- `reason_code` is the ONLY reason source today and is therefore NOT NULL. The
+-- spec fixes exactly three triggers, so they live as constants in
+-- services/tat.service.js rather than as an ops-editable dropdown:
+--   MATERIAL · OEM_PART · ENTRY_PERMISSION
+--
+-- `reason_id` is a nullable hook for the day ops DOES want an editable list. It
+-- would point at action_taken_reason — note that table's columns are
+-- (id, action_type, action_desc, user_type, status, is_new); `action_type` is a
+-- bare INTEGER bucket, and services/reason-codes.js warns explicitly against
+-- resolving a bucket by the legacy action_type.type STRING because it drifts.
+-- Allocating a free bucket integer needs a live SELECT, which is exactly why
+-- this migration does not seed one.
 CREATE TABLE IF NOT EXISTS tbl_job_tat_stop (
   stop_id         INT           NOT NULL AUTO_INCREMENT,
   job_id          INT           NOT NULL,
@@ -102,37 +111,8 @@ PREPARE stmt_active_pin FROM @ddl_active_pin;
 EXECUTE stmt_active_pin;
 DEALLOCATE PREPARE stmt_active_pin;
 
--- ─── 4. Stop reasons ────────────────────────────────────────────────
--- Reuses the platform's action_taken_reason registry rather than inventing a
--- private list. The action_type integer is resolved by NAME so this file does
--- not hardcode an id that differs per environment; if the bucket is absent the
--- seeds are skipped and the service falls back to reason_code alone (which is
--- why reason_code is NOT NULL and reason_id is).
-SET @stop_type := (SELECT id FROM action_type WHERE type = 'TAT Stop' LIMIT 1);
-
-INSERT INTO action_taken_reason (action_type, reason, status)
-SELECT @stop_type, 'Material / Part Unavailable', 1
- WHERE @stop_type IS NOT NULL
-   AND NOT EXISTS (SELECT 1 FROM action_taken_reason
-                    WHERE action_type = @stop_type AND reason = 'Material / Part Unavailable');
-
-INSERT INTO action_taken_reason (action_type, reason, status)
-SELECT @stop_type, 'OEM Part Required', 1
- WHERE @stop_type IS NOT NULL
-   AND NOT EXISTS (SELECT 1 FROM action_taken_reason
-                    WHERE action_type = @stop_type AND reason = 'OEM Part Required');
-
-INSERT INTO action_taken_reason (action_type, reason, status)
-SELECT @stop_type, 'Entry Permission Pending', 1
- WHERE @stop_type IS NOT NULL
-   AND NOT EXISTS (SELECT 1 FROM action_taken_reason
-                    WHERE action_type = @stop_type AND reason = 'Entry Permission Pending');
-
 -- ─── Verification ───────────────────────────────────────────────────
 -- Every `present` must be exactly 1, on the first run and on any repeat run.
--- EXCEPT `stop reasons seeded`, which is 3 when the 'TAT Stop' action_type
--- exists and 0 when it does not — see the note above. If it reads 0, create the
--- bucket (`INSERT INTO action_type (type) VALUES ('TAT Stop')`) and re-run.
 SELECT 'tbl_job_tat_stop table' AS what, COUNT(*) AS present
   FROM information_schema.tables
  WHERE table_schema = DATABASE() AND table_name = 'tbl_job_tat_stop'
@@ -144,8 +124,4 @@ UNION ALL
 SELECT 'idx_efr_active_pin index', COUNT(DISTINCT index_name)
   FROM information_schema.statistics
  WHERE table_schema = DATABASE() AND table_name = 'tbl_easyfixer'
-   AND index_name = 'idx_efr_active_pin'
-UNION ALL
-SELECT 'stop reasons seeded (expect 3, or 0 if the action_type is missing)', COUNT(*)
-  FROM action_taken_reason
- WHERE action_type = (SELECT id FROM action_type WHERE type = 'TAT Stop' LIMIT 1);
+   AND index_name = 'idx_efr_active_pin';

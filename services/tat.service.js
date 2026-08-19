@@ -141,8 +141,30 @@ const COMPLETED_STATUSES = [3, 5];
 const MAX_ROWS = 5000;
 const CLIENT_LOOKBACK_DAYS = 90;
 
-// Spec §5 — not implemented; see limit (3).
 const STOP_CLOCK_AVAILABLE = true;
+
+/*
+ * Spec §5 stop triggers — a FROZEN set, not an ops-editable dropdown.
+ *
+ * The spec names exactly three, each with a fixed owner, so they live here as
+ * constants and are stored on tbl_job_tat_stop.reason_code. There is
+ * deliberately no action_taken_reason seed: that table's `action_type` is a
+ * bare INTEGER bucket, allocating a free one needs a live SELECT, and
+ * services/reason-codes.js warns against resolving a bucket by the legacy
+ * action_type.type STRING because it drifts. `reason_id` on the ledger is a
+ * nullable hook for the day ops does want an editable list.
+ *
+ * `owner` is the DEFAULT for each trigger, not a constraint — an entry-permission
+ * delay is usually the client's, but a rescheduled site visit we failed to book
+ * is ours. The writer picks; this is what it should pre-select.
+ */
+const STOP_REASONS = Object.freeze([
+  { code: 'MATERIAL', label: 'Material / Part Unavailable', owner: 'OEM/Vendor' },
+  { code: 'OEM_PART', label: 'OEM Part Required', owner: 'OEM/Vendor' },
+  { code: 'ENTRY_PERMISSION', label: 'Entry Permission Pending', owner: 'Client' },
+]);
+
+const STOP_OWNERS = Object.freeze(['EasyFix', 'Client', 'OEM/Vendor']);
 
 /*
  * LOCAL when at least one active technician covers the job's pincode.
@@ -930,6 +952,8 @@ function policy() {
       ...Object.entries(DIMENSION_MODES).map(([key, d]) => ({ key, label: d.label, kind: 'lookup' })),
     ],
     stopClockAvailable: STOP_CLOCK_AVAILABLE,
+    stopReasons: STOP_REASONS,
+    stopOwners: STOP_OWNERS,
     clientLookbackDays: CLIENT_LOOKBACK_DAYS,
     assumptions: assumptions(),
     openDecisions: OPEN_DECISIONS,
@@ -955,6 +979,8 @@ module.exports = {
   OWNER,
   ROLLUP_DIMENSIONS,
   DIMENSION_MODES,
+  STOP_REASONS,
+  STOP_OWNERS,
   COMPLETED_STATUSES,
   CLIENT_LOOKBACK_DAYS,
   OPEN_DECISIONS,
