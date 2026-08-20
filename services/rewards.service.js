@@ -228,13 +228,42 @@ async function ledgerFor(efrId, { limit = 50, offset = 0 } = {}) {
 }
 
 /* Admin-side ledger: every technician, filterable, with names attached. */
-async function adminLedger({ easyfixerId, reasonCode, q, limit = 100, offset = 0 } = {}) {
+async function adminLedger({ easyfixerId, reasonCode, q, from, to, limit = 100, offset = 0 } = {}) {
   const take = Math.min(Math.max(Number(limit) || 100, 1), 1000);
   const skip = Math.max(Number(offset) || 0, 0);
   const where = ['1=1'];
   const params = [];
   if (easyfixerId) { where.push('l.easyfixer_id = ?'); params.push(Number(easyfixerId)); }
   if (reasonCode) { where.push('l.reason_code = ?'); params.push(String(reasonCode)); }
+  /*
+   * ── THE DATE WINDOW ────────────────────────────────────────────────────────
+   * This ledger grows ~441 rows a day and is append-only, so an unbounded read
+   * gets slower every single day and never recovers. The CRM page now asks for
+   * the current month on first load and lets an operator widen it.
+   *
+   * ⚠ THE DEFAULT LIVES IN THE CALLER, NOT HERE, AND THAT IS DELIBERATE.
+   * It would be easy to make this function assume "current month" when given no
+   * dates. That is the exact shape of the bug that took Manage Jobs Export down
+   * on 2026-08-20: a no-filter default that quietly substituted a DIFFERENT
+   * answer, so an operator asking for everything silently got a subset and had
+   * no way to tell. Every other consumer of adminLedger (and any future export
+   * or reconciliation job) still gets the whole ledger unless it asks otherwise.
+   * The page is explicit about the window it requests; the service only ever
+   * applies what it was given.
+   *
+   * DATE() is applied to the PARAMETER, never the column, so an index on
+   * created_at stays usable — and the upper bound is EXCLUSIVE next-day, so a
+   * row stamped 14:30 on the `to` date is included. A half-open window is
+   * honoured: either end may be sent on its own.
+   */
+  if (from != null && String(from).trim() !== '') {
+    where.push('l.created_at >= DATE(?)');
+    params.push(String(from).trim());
+  }
+  if (to != null && String(to).trim() !== '') {
+    where.push('l.created_at < DATE(?) + INTERVAL 1 DAY');
+    params.push(String(to).trim());
+  }
   if (q && String(q).trim()) {
     where.push('(e.efr_name LIKE ? OR e.efr_no LIKE ? OR l.note LIKE ?)');
     const like = `%${String(q).trim()}%`;

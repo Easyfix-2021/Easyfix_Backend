@@ -174,6 +174,17 @@ const ledgerQuery = Joi.object({
   easyfixerId: Joi.number().integer().positive().optional(),
   reasonCode: Joi.string().valid(...Object.values(svc.REASON)).allow('', null).optional(),
   q: Joi.string().allow('', null).optional(),
+  /*
+   * The ledger is append-only and grows ~441 rows a day, so the page asks for a
+   * WINDOW instead of everything. ISO yyyy-mm-dd, both ends OPTIONAL and
+   * INDEPENDENT — "everything since the 1st" is a real request, not a malformed
+   * one. No default is applied here on purpose: the service filters only on what
+   * it is given, so a caller sending neither still gets the whole ledger rather
+   * than a silently narrowed subset. See the block in services/rewards.service.js
+   * adminLedger() for why the default belongs to the page and not to the API.
+   */
+  from: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).allow('', null).optional(),
+  to: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).allow('', null).optional(),
   limit: Joi.number().integer().min(1).max(1000).default(100),
   offset: Joi.number().integer().min(0).default(0),
 });
