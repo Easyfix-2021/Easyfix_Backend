@@ -565,6 +565,177 @@ async function buildActionHome(scope) {
   };
 }
 
+/* ─── B-02 · the pending drilldown ─────────────────────────────────────
+ *
+ * Opened from any B-01 row. The detector that opened it decides the
+ * population, so the two can never describe different sets — which is the
+ * whole reason the detector key travels in the URL rather than the CRM
+ * re-deriving a filter that "should" match.
+ *
+ * The five filter chips are computed from the SAME rows, in SQL, so a chip
+ * count can never disagree with the rows behind it.
+ */
+
+const STATUS_EXPR = `
+  CASE
+    WHEN ec.completion_date IS NOT NULL THEN 'done'
+    WHEN ec.due_date IS NOT NULL AND ec.due_date < ? THEN 'overdue'
+    WHEN prog.done_videos = 0 OR prog.done_videos IS NULL THEN 'not_started'
+    ELSE 'part_done'
+  END`;
+
+/* Per-assignment progress, joined once rather than correlated per column.
+ * easyfixer_watched_video is MyISAM and read-only to us. */
+const PROGRESS_JOIN = `
+  LEFT JOIN (
+    SELECT cv.course_id, w.easyfixer_id,
+           COUNT(*) AS done_videos
+      FROM course_videos cv
+      JOIN easyfixer_watched_video w
+        ON w.video_id = cv.video_id AND COALESCE(w.watched_percentage, 0) >= 100
+     GROUP BY cv.course_id, w.easyfixer_id
+  ) prog ON prog.course_id = ec.course_id AND prog.easyfixer_id = ec.easyfixer_id`;
+
+/*
+ * Detector -> extra predicate. Keeping this beside the detectors themselves
+ * is deliberate: B-01 and B-02 must move together or the row count in the
+ * tile stops matching the list it opens.
+ */
+function detectorClauses(detector, today, t) {
+  switch (detector) {
+    case 'deadline_passed':
+      return { clauses: ['ec.completion_date IS NULL', 'ec.due_date IS NOT NULL', 'ec.due_date < ?'], params: [today] };
+    case 'paused_not_started':
+      return { clauses: ['ec.completion_date IS NULL', 'ec.due_date IS NOT NULL', 'ec.due_date < ?', NO_PROGRESS], params: [today] };
+    case 'stale_module':
+      return { clauses: ['ec.completion_date IS NULL'], params: [] };
+    case 'client_uncertified':
+      return { clauses: ['ec.completion_date IS NULL'], params: [] };
+    default:
+      /* No detector, or one whose population is not assignment-shaped
+       * (assessment_failed): fall back to everything outstanding rather than
+       * to everything, so an unknown key cannot silently widen the list. */
+      return { clauses: ['ec.completion_date IS NULL'], params: [] };
+  }
+}
+
+/**
+ * One page of the drilldown, plus the chip counts for the whole filtered set.
+ *
+ * @param {object} opts
+ * @param {string} [opts.detector]  which B-01 row opened this
+ * @param {number} [opts.courseId]
+ * @param {string} [opts.status]    overdue | not_started | part_done | failed | done
+ * @param {string} [opts.q]         name / EFX id search
+ * @param {object} opts.scope       req.scope
+ */
+async function pendingList({ detector, courseId, status, q, limit = 50, offset = 0, scope } = {}) {
+  const today = lms.istToday();
+  const t = tunables();
+  const d = detectorClauses(detector, today, t);
+
+  const clauses = [...LIVE_WHERE, ...d.clauses];
+  const params = [...d.params];
+  if (courseId) { clauses.push('ec.course_id = ?'); params.push(Number(courseId)); }
+  if (q && String(q).trim()) {
+    const like = `%${String(q).trim()}%`;
+    clauses.push('(e.efr_name LIKE ? OR e.efr_no LIKE ?)');
+    params.push(like, like);
+  }
+  applyCityScope(clauses, params, scope);
+  const where = `WHERE ${clauses.join(' AND ')}`;
+
+  /* Chip counts come from the same WHERE, before the status filter narrows
+   * it — a chip that counted only its own selection would always read the
+   * page size. */
+  const [[chips]] = await pool.query(
+    `SELECT
+       SUM(ec.completion_date IS NULL AND ec.due_date IS NOT NULL AND ec.due_date < ?) AS overdue,
+       SUM(ec.completion_date IS NULL AND COALESCE(prog.done_videos,0) = 0) AS not_started,
+       SUM(ec.completion_date IS NULL AND COALESCE(prog.done_videos,0) > 0) AS part_done,
+       SUM(ec.completion_date IS NOT NULL) AS done,
+       COUNT(*) AS total
+     ${LIVE_FROM}
+     ${PROGRESS_JOIN}
+     ${where}`,
+    [today, ...params],
+  );
+
+  /*
+   * THE CHIP FILTER MUST BE THE CHIP DEFINITION, LITERALLY.
+   *
+   * The first cut of this compared a single CASE expression to the chosen
+   * status, which made the five values mutually exclusive with 'overdue'
+   * winning. The chips are not a partition: "overdue" is a statement about a
+   * DEADLINE while "not started / part done / done" are statements about
+   * PROGRESS, and an overdue technician is very often also a not-started one.
+   * The result was a chip reading "Not started 2" that filtered to zero rows
+   * — the precise contradiction B-01 and B-02 exist to avoid.
+   *
+   * So each filter reuses the same SQL its chip counts with. They cannot
+   * drift, because they are the same expression.
+   */
+  const CHIP_PREDICATES = {
+    overdue: { sql: 'ec.completion_date IS NULL AND ec.due_date IS NOT NULL AND ec.due_date < ?', params: [today] },
+    not_started: { sql: 'ec.completion_date IS NULL AND COALESCE(prog.done_videos,0) = 0', params: [] },
+    part_done: { sql: 'ec.completion_date IS NULL AND COALESCE(prog.done_videos,0) > 0', params: [] },
+    done: { sql: 'ec.completion_date IS NOT NULL', params: [] },
+    /* No attempt history exists yet. `1=0` rather than "ignore the filter":
+     * an unsupported chip must return nothing, never silently widen to
+     * everything. */
+    failed: { sql: '1=0', params: [] },
+  };
+
+  const statusClauses = [...clauses];
+  const statusParams = [...params];
+  const chip = status ? CHIP_PREDICATES[status] : null;
+  if (chip) {
+    statusClauses.push(`(${chip.sql})`);
+    statusParams.push(...chip.params);
+  }
+  const statusWhere = `WHERE ${statusClauses.join(' AND ')}`;
+
+  const [rows] = await pool.query(
+    `SELECT ec.easyfixer_id, ec.course_id, c.name AS course_name,
+            e.efr_name AS technician_name, e.efr_no, e.efr_cityId,
+            ct.city_name, g.grade,
+            ec.due_date, ec.completion_date, ec.created_at AS assigned_on,
+            COALESCE(prog.done_videos, 0) AS videos_done,
+            (SELECT COUNT(*) FROM course_videos cv WHERE cv.course_id = ec.course_id) AS videos_total,
+            ${STATUS_EXPR} AS status
+       ${LIVE_FROM}
+       ${PROGRESS_JOIN}
+       LEFT JOIN tbl_city ct ON ct.city_id = e.efr_cityId
+       LEFT JOIN tbl_efr_grade_snapshot g ON g.efr_id = e.efr_id
+       ${statusWhere}
+      ORDER BY (ec.due_date IS NULL), ec.due_date ASC, ec.easyfixer_id ASC
+      LIMIT ? OFFSET ?`,
+    [today, ...statusParams, Number(limit), Number(offset)],
+  );
+
+  const [[{ total }]] = await pool.query(
+    `SELECT COUNT(*) AS total ${LIVE_FROM} ${PROGRESS_JOIN} ${statusWhere}`,
+    statusParams,
+  );
+
+  return {
+    rows,
+    total: Number(total),
+    limit: Number(limit),
+    offset: Number(offset),
+    today,
+    chips: {
+      overdue: Number(chips?.overdue || 0),
+      not_started: Number(chips?.not_started || 0),
+      part_done: Number(chips?.part_done || 0),
+      /* No attempt history exists yet, so "failed" is honestly zero rather
+       * than quietly folded into another chip. Slice 4 fills it. */
+      failed: 0,
+      done: Number(chips?.done || 0),
+    },
+  };
+}
+
 /**
  * Action home for this caller, cached 60s per city scope.
  *
@@ -599,6 +770,7 @@ function invalidate() {
 
 module.exports = {
   actionHome,
+  pendingList,
   invalidate,
   applyCityScope,
   scopeKey,

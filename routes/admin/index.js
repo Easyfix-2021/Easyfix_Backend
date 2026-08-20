@@ -152,6 +152,12 @@ router.use('/holidays',          require('./holidays'));
 // report. The training VIDEO catalogue stays on /aux/training-videos; this
 // router deliberately does not restate it.
 router.use('/lms',               require('./lms'));
+/* A SECOND router on the same prefix — the action tool (B-01/B-02/B-13 and
+ * the chase endpoints), split from lms.js by purpose rather than by table:
+ * lms.js is the CRUD that sets training up, lms-action.js is what the team
+ * looks at to find out what needs doing today. Same pattern /jobs already
+ * uses across several files. Order does not matter — the paths are disjoint. */
+router.use('/lms',               require('./lms-action'));
 // Rewards (added 2026-08-13) — shop catalogue, claims queue, points ledger.
 router.use('/rewards',           require('./rewards'));
 // router.use('/clients',        require('./clients'));     // later

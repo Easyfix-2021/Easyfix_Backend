@@ -215,3 +215,65 @@ test('owner: several distinct owners collapse to a count, none falls back to the
   assert.equal(describeOwner([undefined, null]), 'Training team');
   assert.equal(describeOwner([{ name: 'A' }, { name: 'A' }]), 'A', 'the same owner twice is one owner');
 });
+
+// ─── 7. B-02 chip parity ─────────────────────────────────────────────
+
+/*
+ * A chip that counts one thing and filters another is the exact failure this
+ * whole screen exists to avoid, and it shipped in the first draft: 'overdue'
+ * won a mutually-exclusive CASE, so "Not started 2" filtered to zero rows.
+ * The chips are NOT a partition — overdue is about a deadline, the other
+ * three are about progress, and an overdue technician is usually also a
+ * not-started one.
+ */
+
+test('chip filter: each status filters with the SAME predicate its chip counts with', async () => {
+  const seen = {};
+  for (const status of ['overdue', 'not_started', 'part_done', 'done']) {
+    fake.reset();
+    scenario = [[/.*/, [{ total: 0, overdue: 0, not_started: 0, part_done: 0, done: 0 }]]];
+    await action.pendingList({ detector: 'deadline_passed', courseId: 4, status });
+    const counts = fake.calls[0];                     // the chip-count query
+    const rows = fake.calls[1];                       // the filtered row query
+    seen[status] = { counts: counts.sql, rows: rows.sql };
+  }
+  // Every chip's SUM() expression must reappear verbatim in its filter.
+  assert.match(seen.not_started.rows, /COALESCE\(prog\.done_videos,0\) = 0/);
+  assert.match(seen.not_started.counts, /COALESCE\(prog\.done_videos,0\) = 0/);
+  assert.match(seen.part_done.rows, /COALESCE\(prog\.done_videos,0\) > 0/);
+  assert.match(seen.done.rows, /ec\.completion_date IS NOT NULL/);
+  assert.match(seen.overdue.rows, /ec\.due_date < \?/);
+});
+
+test('chip filter: an unsupported chip returns NOTHING, never everything', async () => {
+  fake.reset();
+  scenario = [[/.*/, [{ total: 0 }]]];
+  await action.pendingList({ detector: 'deadline_passed', status: 'failed' });
+  assert.match(fake.calls[1].sql, /1=0/,
+    'no attempt history exists yet — "failed" must be empty, not ignored, or the chip silently widens to the whole list');
+});
+
+test('chip filter: an UNKNOWN status is ignored rather than injected', async () => {
+  fake.reset();
+  scenario = [[/.*/, [{ total: 0 }]]];
+  await action.pendingList({ detector: 'deadline_passed', status: 'nonsense' });
+  assert.doesNotMatch(fake.calls[1].sql, /nonsense/, 'never interpolated into SQL');
+});
+
+test('drilldown: an unknown detector narrows to outstanding, it does not widen to everything', async () => {
+  fake.reset();
+  scenario = [[/.*/, [{ total: 0 }]]];
+  await action.pendingList({ detector: 'not_a_real_detector' });
+  assert.match(fake.calls[1].sql, /ec\.completion_date IS NULL/,
+    'a typo in a URL must not turn the chase list into a full export');
+});
+
+test('drilldown: city scope reaches the rows, the COUNT and the chip counts alike', async () => {
+  fake.reset();
+  scenario = [[/.*/, [{ total: 0 }]]];
+  await action.pendingList({ detector: 'deadline_passed', scope: { cities: { mode: 'allow', ids: [7, 9] } } });
+  for (const c of fake.calls) {
+    assert.match(c.sql, /efr_cityId IN/i, 'every statement in the drilldown must be scoped');
+    assert.ok(c.params.includes(7) && c.params.includes(9));
+  }
+});
