@@ -16,7 +16,9 @@ const requireStageForTransition = require('../../middleware/require-stage');
 // at that size). The big Manage Job Report uses the streaming writer below.
 const { streamStyledXlsx } = require('../../utils/xlsx-styled-export');
 const { streamRowsToXlsx } = require('../../utils/xlsx-stream-export');
-const { EXPORT_COLUMNS, fetchExportChunk, mapExportRow } = require('../../services/job-export.service');
+const {
+  EXPORT_COLUMNS, fetchExportChunk, mapExportRow, UNAPPLIED_FILTERS, buildExportWhere,
+} = require('../../services/job-export.service');
 const { todayIst } = require('../../utils/ist-calendar');
 const ttlCache = require('../../utils/ttl-cache');
 
@@ -328,6 +330,19 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
  * export reflects exactly what they see in the table — minus the page
  * boundary.
  *
+ * ⚠ THAT PARAGRAPH DESCRIBED AN INTENTION, NOT THE CODE, UNTIL 2026-08-20.
+ * The service spoke only the legacy Java panel's filter vocabulary, so
+ * every listQuery filter arrived undefined and the no-filter guard
+ * substituted "open jobs, last 6 months" for the request — a Closed-job
+ * export returned exactly the Open jobs. RBAC was passed in and never
+ * read. Both are fixed in services/job-export.service.js; the
+ * authoritative per-key ledger is FILTER_COVERAGE at the top of that
+ * file, and tests/job-export-filters.test.js derives its checks from
+ * the listQuery schema so a key added there cannot be dropped here in
+ * silence. If you change what this endpoint honours, change that ledger
+ * and this docblock in the same commit — a docblock that lies is worse
+ * than no docblock.
+ *
  * Memory model (this is the whole point of the rewrite): rows are pulled
  * in keyset-paginated chunks and handed to the writer one at a time, so
  * heap holds ONE chunk, never the result set. The previous version
@@ -342,7 +357,8 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
  *
  * Free-text `q` is honoured here unlike the escalated export — on the
  * jobs list `q` IS the operator-supplied filter, not an in-table
- * client-side search.
+ * client-side search. (True since 2026-08-20: buildClauses did not even
+ * destructure `q` before that.)
  *
  * Mounted BEFORE `/:id` so Express doesn't try to parse "export" as a
  * job id (same gotcha as `/counts`, `/escalated`, `/comment-reasons`).
@@ -365,13 +381,73 @@ const EXPORT_ROW_CEILING = 200000;
 router.get('/export.xlsx', validate(listQuery, 'query'), async (req, res, next) => {
   const startedAt = Date.now();
   try {
-    logger.info('Export jobs xlsx · status=' + (req.query.status ?? '-') + ' clientId=' + (req.query.clientId ?? '-') + ' from=' + (req.query.startDate || '-') + ' to=' + (req.query.endDate || '-'));
+    /*
+     * Log the filters the operator ACTUALLY sent, `statuses` included. The old
+     * line read only `status`, so the production evidence for the
+     * ignored-filters bug looked like this — the URL carrying
+     * `statuses=3,5&startDate=…` and the very next line printing `status=-`.
+     * A log that cannot show the filter that was dropped is a log that hides
+     * the bug it exists to catch.
+     */
+    logger.info('Export jobs xlsx · statuses=' + (req.query.statuses ?? req.query.status ?? '-')
+      + ' clientId=' + (req.query.clientId ?? '-')
+      + ' cityId=' + (req.query.cityId ?? '-')
+      + ' from=' + (req.query.startDate || '-') + ' to=' + (req.query.endDate || '-')
+      + ' q=' + (req.query.q ? 'yes' : '-')
+      + ' scoped=' + (req.scope ? 'yes' : 'bypass')
+      + ' stages=' + (req.allowedStages?.mode ?? '-'));
 
-    // RBAC must survive the rewrite. req.scope is the hierarchy-unioned
-    // scope attached by routes/admin/index.js (same buildRequestScopeWithHierarchy
-    // the old handler called inline), and req.allowedStages is Job Stage
-    // Access. Drop either one and the export silently leaks rows the
-    // operator cannot see in the table.
+    /*
+     * Say out loud which supplied filters the sheet does NOT reflect. See
+     * FILTER_COVERAGE in services/job-export.service.js for why each one is on
+     * the list. The original bug was invisible precisely because nothing ever
+     * announced that a filter had been dropped; "my filter did nothing" must
+     * be answerable from the log, not from a code read.
+     *
+     * `zonalId` is not unapplied — it IS honoured, under the LEGACY reading
+     * (tbl_city.state_user), which is not the reading list() gives the same
+     * name. Logged separately so the collision can never be silent.
+     */
+    const dropped = UNAPPLIED_FILTERS.filter((k) => req.query[k] !== undefined && req.query[k] !== '');
+    if (dropped.length) {
+      logger.warn('Jobs export cannot apply these filters, they are NOT reflected in the sheet: ' + dropped.join(', '));
+    }
+    /*
+     * ⚠ AND SAY WHEN WE NARROWED IT OURSELVES.
+     *
+     * An export with no bounding filter gets a default window (and, when the
+     * caller pinned no status, the open-jobs floor). That default is the reason
+     * the exporter has never taken the box down twice — but it is still a
+     * constraint the operator did not ask for, and an unexplained short sheet
+     * is exactly the complaint that started this work ("with Closed Job filter,
+     * downloaded Open orders data"). One line, on the same request id as the
+     * export, so "why is my sheet short" is answerable from the log.
+     */
+    const imposed = buildExportWhere(filters).appliedDefaults || [];
+    if (imposed.length) {
+      logger.info('Jobs export applied DEFAULT bounds the operator did not ask for: ' + imposed.join(' · '));
+    }
+    if (req.query.zonalId !== undefined && req.query.zonalId !== '') {
+      logger.warn('Jobs export received zonalId=' + req.query.zonalId
+        + ' and read it as a ZONAL MANAGER (tbl_city.state_user), which is the legacy meaning — the jobs LIST reads the same name as a ZONE. See ZONAL_ID_COLLISION in services/job-export.service.js.');
+    }
+
+    /*
+     * RBAC must survive the rewrite. req.scope is the hierarchy-unioned scope
+     * attached by routes/admin/index.js (the same buildRequestScopeWithHierarchy
+     * the old handler called inline), and req.allowedStages is Job Stage
+     * Access. Drop either one and the export silently leaks rows the operator
+     * cannot see in the table.
+     *
+     * ⚠ THAT IS NOT HYPOTHETICAL — it is what shipped. Both were passed here
+     * and the service never read them (`grep allowedStages
+     * services/job-export.service.js` returned nothing), so until 2026-08-20 a
+     * scope-restricted operator's sheet carried every client's rows. The
+     * consumer side is the RBAC block in buildClauses(); if you add a
+     * dimension to req.scope, add its predicate there too and keep
+     * tests/job-export-filters.test.js green — that test is what turns this
+     * comment into an enforced property instead of a hope.
+     */
     const filters = { ...req.query, scope: req.scope, allowedStages: req.allowedStages };
 
     let capped = false;

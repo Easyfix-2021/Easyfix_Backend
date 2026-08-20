@@ -39,11 +39,27 @@
  *   EXPORT_COLUMNS                                    → frozen [{header,key,type}]
  *   fetchExportChunk({filters, afterJobId, chunkSize}) → Promise<rawRows[]>
  *   mapExportRow(rawRow, seqNumber)                    → plain object keyed by EXPORT_COLUMNS[].key
- *   buildExportWhere(filters)                          → {where, params}
+ *   buildExportWhere(filters)             → {where, params, appliedDefaults}
  */
 
 const { pool } = require('../db');
 const logger = require('../logger');
+/*
+ * Job Stage Access. lib/job-stages.js is DB-free and requires nothing from
+ * services/, so pulling it in here cannot create a require cycle. Using the
+ * SAME helper services/job.service.js uses is the point: a second copy of the
+ * stage → status map is a second place for the sheet to disagree with the
+ * table.
+ */
+const { stageVisibleStatuses } = require('../lib/job-stages');
+/*
+ * ONE memoised probe for tbl_client.vertical_id, shared with list(). The
+ * verticals RBAC scope is skipped when the column is absent — if this module
+ * probed separately it could answer differently across a migration and scope
+ * the sheet differently from the screen. job.service does NOT require this
+ * module, so there is no cycle; routes/admin/jobs.js already loads both.
+ */
+const { hasClientVerticalIdColumn } = require('./job.service');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Column spec
@@ -411,68 +427,506 @@ function dayRange(col, from, to) {
 }
 
 /*
+ * ─────────────────────────────────────────────────────────────────────────────
+ * THE CRM UI's FILTER VOCABULARY
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * THE BUG (operator report, 2026-08-20): "Manage Job → Export. With Closed Job
+ * filter, downloaded Open orders data." That is not "the filter was ignored" —
+ * it is the EXACT COMPLEMENT of what was asked for, and here is the mechanism.
+ *
+ * routes/admin/jobs.js validates /export.xlsx with the SAME `listQuery` schema
+ * the jobs LIST uses and handed req.query straight to buildClauses(). But
+ * buildClauses only ever spoke the LEGACY Java "Filter Job" panel's vocabulary
+ * — clientIdFromUI, dateFrom, dateTo, custName, svcCatgId, and a `status` that
+ * is a free-text TOKEN matched by SUBSTRING (see STATUS_TOKEN_CODES). The UI
+ * speaks clientId, startDate, endDate, customerQ, categoryId, and NUMERIC
+ * `statuses`. Nothing translated between them, so every UI filter arrived
+ * `undefined`, no clause was emitted, and the no-filter guard at the bottom
+ * substituted "open jobs created in the last 6 months" for the request. From
+ * the production log, two consecutive lines:
+ *
+ *     GET /api/admin/jobs/export.xlsx?statuses=3%2C5&startDate=2026-08-01&endDate=2026-08-17
+ *     Export jobs xlsx · status=- clientId=- from=Sat Aug 01 2026 05:30:00 …
+ *
+ * `statuses=3,5` on the wire, `status=-` in the handler. The guard's second
+ * clause was `J.job_status NOT IN (3, 5, 6, 7)` — it excluded precisely the two
+ * codes she asked for. Measured before this change, EVERY one of these produced
+ * the identical WHERE:
+ *
+ *     buildExportWhere({ statuses:'3,5', startDate, endDate })  ┐
+ *     buildExportWhere({ q:'ravi' })                            ├ all →
+ *     buildExportWhere({ clientId:'12,34' })                    │
+ *     buildExportWhere({ scope, allowedStages })                ┘
+ *       WHERE J.created_date_time >= DATE_SUB(NOW(), INTERVAL 6 MONTH)
+ *         AND J.job_status NOT IN (3, 5, 6, 7)
+ *
+ * WHY BOTH VOCABULARIES SURVIVE. The legacy `status` is a free-text token
+ * ('completed', 'unconfirmed', 'acknowledge') matched by substring, and it
+ * carries behaviour numeric codes cannot express — most obviously the
+ * acknowledge/scheduling technician predicate below, a documented legacy bug
+ * reproduced on purpose. Reverse-mapping numeric codes into those tokens would
+ * be lossy. So a NUMERIC status/statuses takes a direct J.job_status IN (…)
+ * path that bypasses the token layer entirely, and a NON-numeric `status`
+ * keeps today's legacy behaviour untouched.
+ *
+ * REACHABILITY, so nobody mis-reads the risk: middleware/validate.js runs Joi
+ * with `stripUnknown: true`, so over HTTP only listQuery keys ever reach this
+ * function. The legacy names are unreachable from the route today; they exist
+ * for buildExportWhere()'s public contract and for direct callers. That is why
+ * the UI path was ADDED rather than the legacy path REPLACED.
+ *
+ * THE REFERENCE IMPLEMENTATION for every UI-vocabulary predicate below is
+ * services/job.service.js list(). The export is meant to be "the rows on
+ * screen, minus the page boundary"; where this file and list() disagree about
+ * what a filter MEANS, the sheet stops mirroring the table and nobody can see
+ * it from the file. Each mirrored predicate names list() in its comment, and
+ * tests/job-export-filters.test.js pins the pairs that matter.
+ */
+
+/*
+ * `dateType` → the column startDate/endDate apply to. MUST STAY IDENTICAL to
+ * DATE_TYPE_COLUMN in services/job.service.js (only the table alias differs:
+ * `j` there, `J` here). If the two drift, the sheet covers a different window
+ * than the table the operator was looking at. An unknown value falls back to
+ * created_date_time exactly as list() does, so a stale bookmark still works.
+ *
+ * This is a DIFFERENT map from the legacy DATE_TYPE_COLUMN above, whose keys
+ * are the legacy picker's tokens ('createddate', 'checkoutdatetime', …). The
+ * two token sets are disjoint, so both can be consulted without ambiguity: the
+ * legacy tokens pair with dateFrom/dateTo, these with startDate/endDate.
+ */
+const UI_DATE_TYPE_COLUMN = Object.freeze({
+  booked:    'J.created_date_time',
+  scheduled: 'J.scheduled_date_time',
+  completed: 'J.checkout_date_time',
+  ticket:    'J.ticket_created_date_time',
+  requested: 'J.requested_date_time',
+});
+
+/*
+ * "The customer name ON THIS JOB" — job.service's JOB_CUSTOMER_NAME_EXPR with
+ * this module's aliases. NOT imported: that constant has `j`/`cu` baked in, and
+ * MySQL table-alias case sensitivity is platform-dependent (it follows
+ * lower_case_table_names), so a fragment written for `j` cannot be trusted to
+ * bind to `J`. The SHAPE must match, and the NULLIF/TRIM is the load-bearing
+ * part — a plain COALESCE blanks the name for every job whose
+ * job_customer_name is an empty string rather than NULL.
+ */
+const JOB_CUSTOMER_NAME_EXPR = `COALESCE(NULLIF(TRIM(J.job_customer_name), ''), C.customer_name)`;
+
+/*
+ * `q` — the free-text search, one placeholder per term, in list()'s order.
+ * Same eleven terms, so a search that narrows the screen narrows the sheet by
+ * the same rule. Changing one side without the other is the "export is wider
+ * than the table" bug in its purest form.
+ *
+ * The owner term is an EXISTS rather than a join: FILTER_FROM deliberately
+ * omits the ten tbl_user self-joins (see its docblock), and a self-contained
+ * EXISTS keeps that promise — it introduces no outer alias and cannot fan a
+ * job out into extra rows.
+ */
+const Q_TERMS = Object.freeze([
+  'CAST(J.job_id AS CHAR) LIKE ?',
+  'J.job_reference_id LIKE ?',
+  'J.client_ref_id LIKE ?',
+  `${JOB_CUSTOMER_NAME_EXPR} LIKE ?`,
+  'C.customer_mob_no LIKE ?',
+  'CL.client_name LIKE ?',
+  'city.city_name LIKE ?',
+  'EFR.efr_name LIKE ?',
+  'EXISTS (SELECT 1 FROM tbl_user qow WHERE qow.user_id = J.job_owner AND qow.user_name LIKE ?)',
+  'J.client_spoc_name LIKE ?',
+  'J.client_spoc LIKE ?',
+]);
+
+/*
+ * Normalise a filter that may arrive as a single number, a single-id string, a
+ * CSV string ("12,34") or an array into a clean number[]. A local mirror of
+ * `toIdArray` in services/job.service.js — that one is not exported. If you
+ * change the parsing rule, change it in both.
+ *
+ * This is what `Number(clientIdFromUI) > 0` could not do: Number("12,34") is
+ * NaN, so the legacy single-id test silently DROPPED every multi-select
+ * filter instead of failing.
+ */
+function toIdArray(v) {
+  if (v === null || v === undefined || v === '') return [];
+  const raw = Array.isArray(v) ? v : String(v).split(',');
+  return raw.map((s) => Number(String(s).trim())).filter((n) => Number.isFinite(n));
+}
+
+// Truthy across the three shapes a boolean-ish query param arrives in (real
+// boolean, URLSearchParams string, numeric flag). Mirrors the assigned /
+// reopen / noServices coercions in job.service list().
+function isTrue(v) {
+  return v === true || v === 'true' || v === 1 || v === '1';
+}
+
+/*
+ * The NUMERIC status selection, or [] when the caller is speaking the legacy
+ * token vocabulary instead.
+ *
+ * `statuses` wins over `status` — the same precedence list() applies, so a UI
+ * that pins both (the composite tabs do) cannot produce a different row set in
+ * the sheet than on the screen.
+ *
+ * The /^\d+$/ test on `status` is the ONLY thing keeping the two vocabularies
+ * apart: without it a legacy 'completed' would take the numeric path, and a UI
+ * '3' would take the substring-token path — where it matches no token at all,
+ * emits no status clause, and exports everything.
+ */
+function numericStatusCodes({ statuses, status }) {
+  if (statuses !== null && statuses !== undefined && statuses !== '') {
+    /*
+     * SHORT-CIRCUIT, matching services/job.service.js list(): once `statuses`
+     * is present it OWNS the status dimension, even when it parses to nothing.
+     * Falling through to `status` on an empty list (an empty statuses[] array,
+     * say) would emit a status clause the screen does not have, making the
+     * sheet NARROWER than the table — the divergence this whole change exists
+     * to close, reintroduced on an edge case.
+     */
+    return toIdArray(statuses);
+  }
+  const s = String(status ?? '').trim();
+  if (/^\d+$/.test(s)) return [Number(s)];
+  return [];
+}
+
+/*
+ * ── THE listQuery COVERAGE LEDGER ────────────────────────────────────────────
+ *
+ * EVERY key validators/job.validator.js → listQuery accepts, and what this
+ * module does with it. This map is not documentation ABOUT the code, it IS the
+ * checked contract: tests/job-export-filters.test.js derives the key set from
+ * `listQuery.describe().keys` and fails if the two disagree, so a filter added
+ * to the schema tomorrow cannot be silently dropped here the way the whole UI
+ * vocabulary was. The same test proves every 'filter' key actually emits a
+ * predicate and every 'ignored' key emits none — a ledger that only claimed
+ * coverage would rebuild the original bug inside its own regression test.
+ *
+ *   'filter'   → emits its own predicate
+ *   'modifier' → changes another filter's predicate, emits none of its own
+ *   'ignored'  → deliberately emits nothing; the note says why
+ */
+const FILTER_COVERAGE = Object.freeze({
+  q:                ['filter',   'eleven-term OR, list()s columns — see Q_TERMS'],
+  status:           ['filter',   'numeric → J.job_status IN (…); non-numeric → legacy tokens'],
+  statuses:         ['filter',   'J.job_status IN (…); wins over status, as in list()'],
+  assigned:         ['filter',   'J.fk_easyfixter_id IS [NOT] NULL'],
+  noServices:       ['filter',   'job_status = 0 + NOT EXISTS an active tbl_job_services row'],
+  clientId:         ['filter',   'J.fk_client_id IN (…) — csvIds, single id OR CSV'],
+  cityId:           ['filter',   'A.city_id IN (…) — csvIds; the ADDRESS column, as in list()'],
+  projectManagerId: ['filter',   'EXISTS tbl_vertical_mapping with user_type = 1'],
+  zonalManagerId:   ['filter',   'city.state_user IN (…) — the citys zonal owner'],
+  ownerId:          ['filter',   'J.job_owner = ? (shared name with the legacy vocabulary)'],
+  easyfixerId:      ['filter',   'J.fk_easyfixter_id = ? (shared name)'],
+  customerId:       ['filter',   'J.fk_customer_id = ?'],
+  customerQ:        ['filter',   'job-customer-name / mobile LIKE %v%'],
+  clientRef:        ['filter',   'J.client_ref_id LIKE %v%'],
+  efrMobile:        ['filter',   'EFR.efr_no LIKE %v%'],
+  pin:              ['filter',   'A.pin_code LIKE %v%'],
+  stateId:          ['filter',   'city.state_id = ? (shared name)'],
+  categoryId:       ['filter',   'J.fk_service_catg_id = ?'],
+  verticalId:       ['filter',   'EXISTS tbl_vertical_mapping — independent of the verticals SCOPE'],
+  sourceType:       ['filter',   'J.source_type = ?'],
+  rating:           ['filter',   'TERBC.customer_rating (shared name; legacy predicate)'],
+  reopen:           ['filter',   'J.job_reopen_flag'],
+  dueTo:            ['filter',   'J.remarks LIKE — structured tag OR loose free text'],
+  zonalId:          ['filter',   'city.state_user = ? — LEGACY reading, see ZONAL_ID_COLLISION'],
+  startDate:        ['filter',   'dateCol >= DATE(?)'],
+  endDate:          ['filter',   'dateCol < DATE(?) + INTERVAL 1 DAY'],
+  quotationStatus:  ['filter',   'EXISTS quotation_details + list()s status carve-outs'],
+  requestedBefore:  ['filter',   'J.requested_date_time < NOW() / < ?'],
+  dateType:         ['modifier', 'picks the column startDate/endDate apply to'],
+  /*
+   * list() accepts isEscalated and deliberately emits NO clause (the flag is
+   * not a tbl_job column — see the long note in list()). Matching that no-op
+   * is what keeps export == table; "fixing" it here alone would break parity.
+   */
+  isEscalated:      ['ignored',  'list() emits no clause for it either'],
+  /*
+   * CANNOT SUPPORT. The canonical tri-state predicate (job.service
+   * offerStateSql → offerRowScope) hard-codes the outer alias `j`; this
+   * module's tbl_job alias is `J`, and MySQL table-alias case sensitivity
+   * follows lower_case_table_names — so re-binding the fragment would
+   * correlate correctly on one deploy and silently collapse to a self-join on
+   * another. Re-implementing the tri-state by hand is the second
+   * implementation this file exists to avoid. It only ever NARROWS the
+   * Pending-for-Scheduling bucket, whose status/assigned pins ARE honoured, so
+   * the sheet is a SUPERSET of the screen — never a leak. The route logs a
+   * warning when it is supplied, so the drop is loud rather than silent.
+   */
+  offerState:       ['ignored',  'cannot bind list()s j-aliased fragment to alias J'],
+  /*
+   * Keyset pagination requires the sort key to BE the cursor, and the cursor
+   * is J.job_id DESC (see fetchExportChunk). An arbitrary ORDER BY would skip
+   * and duplicate rows across chunks — silently, which is worse than
+   * unsorted. Sort the sheet in Excel.
+   */
+  sortBy:           ['ignored',  'the cursor IS the sort key; see fetchExportChunk'],
+  sortDir:          ['ignored',  'as sortBy'],
+  // The export streams the WHOLE result set in keyset chunks. A page boundary
+  // is the one thing it must not inherit; that is not a dropped filter.
+  limit:            ['ignored',  'the export is not paged'],
+  offset:           ['ignored',  'the export is not paged'],
+});
+
+/*
+ * The listQuery keys the operator can set that this endpoint cannot apply.
+ * The route logs them when present, so "my filter did nothing" is answerable
+ * from the log instead of from a code read — the original bug was invisible
+ * precisely because nothing ever said a filter had been dropped.
+ *
+ * limit/offset are NOT here (dropping the page boundary is the export's job),
+ * and neither is isEscalated (list() ignores it identically, so the sheet
+ * still matches the screen). Derived from FILTER_COVERAGE so the list cannot
+ * drift from the ledger.
+ */
+const UNAPPLIED_FILTERS = Object.freeze(
+  Object.keys(FILTER_COVERAGE).filter(
+    (k) => FILTER_COVERAGE[k][0] === 'ignored' && !['limit', 'offset', 'isEscalated'].includes(k),
+  ),
+);
+
+/*
+ * ZONAL_ID_COLLISION — `zonalId` means two different things in the two
+ * vocabularies, and it is the one name they cannot share:
+ *   legacy export UI  : the ZONAL MANAGER → tbl_city.state_user
+ *   listQuery / list() : the ZONE          → tbl_zone_master via
+ *                                            tbl_zone_city_mapping
+ *
+ * The LEGACY reading is kept, deliberately, because nothing reachable sends
+ * the other one: Easyfix_CRM_UI's "Zonal" control was rewired on 2026-08-18 to
+ * send `zonalManagerId` (its own comment: "Zonal MANAGERS, not zones"), and no
+ * control writes filters.zonalId any more — the export URL builder still
+ * forwards the field, but it is always ''. `zonalManagerId` carries the same
+ * city.state_user predicate under the name listQuery gives it, so the
+ * capability the UI actually uses is honoured either way.
+ *
+ * If a caller ever DOES send a zone id here it will be matched against user
+ * ids and quietly return the wrong rows, so the route logs `zonalId` when it
+ * is supplied. Revisit this the day a zone control ships.
+ */
+
+/*
+ * ── KEEPING THE EXPORT BOUNDED ───────────────────────────────────────────────
+ *
+ * Legacy had one rule: "any filter at all lifts the cap" (its `flage` flag).
+ * That rule is unsafe now that the UI's filters actually reach this function.
+ * `reopen=false` ALONE would satisfy it and emit
+ *   WHERE (J.job_reopen_flag = 0 OR J.job_reopen_flag IS NULL)
+ * over ~450k rows with no date and no status bound — as would assigned=false,
+ * sourceType, and a single-character `q` (listQuery allows length 1), which
+ * becomes eleven leading-wildcard LIKEs across a full scan. Before this change
+ * every export was capped, so shipping that would be a NEW production-load
+ * incident wearing a bug fix's clothes.
+ *
+ * ONE RULE: only a filter that BOUNDS THE ROW COUNT BY ITSELF lifts the
+ * default window, and there are exactly two kinds.
+ *
+ *   1. An EQUALITY on an identity column — one job, one customer, one
+ *      technician, one client reference. Bounded by what the entity is.
+ *   2. A COMPLETE date window (both ends). It replaces the default window
+ *      with the operator's own.
+ *
+ * Everything else — sets, ranges, LIKEs, booleans and dimension FKs (client,
+ * city, state, status, category, vertical, owner, PM, ZM, q) — NARROWS but
+ * does not BOUND, so the default window stays on top of it. A half-open window
+ * (startDate with no endDate, or the reverse) does not bound either; the
+ * default floor stays and simply wins whenever it is the stricter of the two.
+ *
+ * RBAC NEVER LIFTS ANYTHING. A scope is the boundary of what an operator may
+ * ever see, not a filter they chose; letting it lift the cap would mean a
+ * scoped operator with no filters pulls their entire client's history.
+ *
+ * WHAT AN OPERATOR GETS WITH NO FILTERS AT ALL: jobs created in the last 6
+ * months whose status is not one of 3/5/6/7 — i.e. exactly what every export
+ * returned before this change. That default is unchanged on purpose; it is the
+ * only reason the old exporter never took the box down a second time.
+ */
+const DEFAULT_WINDOW_MONTHS = 6;
+// 3/5 completed, 6 cancelled, 7 enquiry — the terminal statuses, which carry
+// years of history behind them.
+const TERMINAL_STATUSES = Object.freeze([3, 5, 6, 7]);
+
+/*
  * Build the WHERE clauses.
  *
- * `flage` / `flag` are legacy's two booleans, reproduced by name because the
- * two implicit guards at the bottom BRANCH ON THEM and the difference is
- * subtle: every filter sets `flage` (= "a WHERE exists"), but `flag` is only
- * set by the filter that emitted the FIRST clause, and stateId / openDueToReason
- * / rating never set it at all. Modelling both keeps the guards behaving
- * identically if the filter order is ever touched.
+ * Takes BOTH vocabularies (see the block above), plus the two RBAC inputs the
+ * route attaches — `scope` and `allowedStages` — which are NOT query params
+ * and must never be settable by one.
  */
 function buildClauses(filters = {}) {
   const {
-    jobsId, clientIdFromUI, easyfixerId, easyfixerMobileNumber, cityId, zonalId,
-    status, stateId, svcCatgId, ownerId, custName, clientReferenceId, pinCode,
+    // ── Legacy "Filter Job" panel vocabulary ────────────────────────────────
+    jobsId, clientIdFromUI, easyfixerMobileNumber,
+    status, svcCatgId, custName, clientReferenceId, pinCode,
     verticalIdentity, dateFrom, dateTo, dateType, bucketAgingRange, bucketStatus,
-    openDueToReason, rating,
+    openDueToReason,
+    // ── Shared names: identical meaning in both vocabularies ────────────────
+    easyfixerId, ownerId, cityId, stateId, zonalId, rating,
+    // ── CRM UI / listQuery vocabulary (see FILTER_COVERAGE) ─────────────────
+    q, statuses, assigned, noServices, clientId, projectManagerId, zonalManagerId,
+    customerId, customerQ, clientRef, efrMobile, pin, categoryId, verticalId,
+    sourceType, reopen, dueTo, startDate, endDate, quotationStatus, requestedBefore,
+    // ── RBAC, attached by the route ─────────────────────────────────────────
+    scope, allowedStages,
+    /*
+     * Whether tbl_client.vertical_id exists on this deploy. fetchExportChunk
+     * passes job.service's memoised probe so the verticals SCOPE behaves
+     * exactly as it does on the list. Defaults to TRUE for direct callers: if
+     * the column is genuinely absent the query fails loudly with "Unknown
+     * column", which is the failure mode we want — silently skipping an RBAC
+     * predicate is the one outcome that must never happen by default.
+     */
+    hasClientVerticalCol = true,
   } = filters;
 
   const clauses = [];
   const params = [];
-  let flage = false;   // legacy: "a WHERE clause has been emitted"
-  let flag = false;    // legacy: "the FIRST clause came from a filter that sets flag"
+  const push = (sql, ...vals) => { clauses.push(sql); params.push(...vals); };
 
-  // `push` marks flage; `pushPrimary` marks both, matching which legacy branch
-  // assigned which boolean.
-  const push = (sql, ...vals) => { clauses.push(sql); params.push(...vals); flage = true; };
-  const pushPrimary = (sql, ...vals) => { if (!flage) flag = true; push(sql, ...vals); };
+  /*
+   * The two facts the bound is decided from. See "KEEPING THE EXPORT BOUNDED".
+   * `pointIdentity` is set ONLY by equality-on-an-identity-column filters;
+   * `explicitWindow` only by a window with BOTH ends.
+   */
+  let pointIdentity = false;
+  let explicitWindow = false;
+  // Whether the caller pinned job_status themselves (either vocabulary, or a
+  // filter that implies a status). RBAC stage access does NOT count.
+  let statusPinned = false;
+  // Defaults this build imposed that the caller did not ask for — surfaced so a
+  // short sheet is explicable rather than mysterious.
+  const appliedDefaults = [];
+  // The column the fallback window lands on — the operator's axis when they
+  // chose one, so the default bound cannot contradict their own.
+  let defaultDateCol = 'J.created_date_time';
 
-  // Legacy called status.contains()/equalsIgnoreCase() on a possibly-null
-  // String further down and NPE'd; normalise once instead.
-  const statusStr = String(status ?? '').trim();
-  const statusLower = statusStr.toLowerCase();
-  const hasToken = (t) => statusLower.includes(t);
-
-  if (notEmpty(jobsId)) {
-    // Legacy switched on the literal "REF" appearing in the value — the
-    // reference ids look like "REF12345".
-    if (String(jobsId).toUpperCase().includes('REF')) {
-      pushPrimary('J.job_reference_id = ?', String(jobsId));
-    } else {
-      pushPrimary('J.job_id = ?', Number(jobsId));
+  // ── RBAC ──────────────────────────────────────────────────────────────────
+  /*
+   * ⚠ THIS SECTION WAS ENTIRELY ABSENT UNTIL 2026-08-20. The route passed
+   * req.scope and req.allowedStages and its own comment said "Drop either one
+   * and the export silently leaks rows the operator cannot see in the table" —
+   * and both WERE dropped: `grep allowedStages job-export.service.js` returned
+   * nothing. A scope-restricted operator's sheet carried every client's rows.
+   *
+   * Mirrors services/job.service.js list() column for column, and it is
+   * applied FIRST for the same reason list() does: an explicit clientId /
+   * cityId filter then NARROWS WITHIN the allowed set. A caller cannot widen
+   * their scope by naming a client outside it — the two predicates are ANDed,
+   * so an out-of-scope clientId yields zero rows, never that client's rows.
+   *
+   * These predicates land in buildClauses(), which phase 1 of fetchExportChunk
+   * uses to resolve job_ids. That is the only place they can work: phase 2
+   * hydrates BY ID and re-filters nothing.
+   */
+  if (scope) {
+    const c = scope.clients;
+    const ci = scope.cities;
+    const v = scope.verticals;
+    if (c) {
+      if (c.mode === 'none') push('1=0');
+      else if (c.mode === 'allow' && c.ids.length) {
+        push(`J.fk_client_id IN (${c.ids.map(() => '?').join(', ')})`, ...c.ids);
+      }
+    }
+    if (ci) {
+      if (ci.mode === 'none') push('1=0');
+      else if (ci.mode === 'allow' && ci.ids.length) {
+        /*
+         * A.city_id — tbl_address, the SAME column list() scopes on (ad.city_id)
+         * and the same one the cityId FILTER uses below. Two columns for one
+         * concept inside one function is how a job whose address city has no
+         * tbl_city row appears on screen and vanishes from the sheet; the
+         * legacy code filtered cityId on city.city_id while the address is
+         * where the value actually lives.
+         *
+         * NOTE the join asymmetry, which is deliberate and NOT changed here:
+         * FILTER_FROM joins tbl_address with an extra `A.customer_id =
+         * J.fk_customer_id` predicate that list()'s join does not have, and
+         * EXPORT_SELECT's projection join carries the same predicate — so
+         * phase 1 and phase 2 agree with each other. A job whose fk_address_id
+         * points at another customer's address row therefore gets a NULL
+         * address here and drops out of a city-scoped export while remaining
+         * visible in the table. That direction is FAIL-SAFE (fewer rows, never
+         * more); relaxing the join to match list() would widen a scoped
+         * export, which is the one change that must not be made casually.
+         */
+        push(`A.city_id IN (${ci.ids.map(() => '?').join(', ')})`, ...ci.ids);
+      }
+    }
+    if (v) {
+      if (v.mode === 'none') push('1=0');
+      else if (v.mode === 'allow' && v.ids.length && hasClientVerticalCol) {
+        /*
+         * CL.vertical_id — tbl_client's OWN vertical, which is what list()
+         * scopes on (cl.vertical_id). NOT TVM.vertical_id: tbl_vertical_mapping
+         * is MANY-TO-MANY and joined here without a user_type filter, so a
+         * client whose own vertical is 5 but which carries a mapping row for
+         * vertical 3 would be HIDDEN in the table and EXPORTED to an operator
+         * scoped to vertical 3. An RBAC fix that widens is worse than no fix.
+         */
+        push(`CL.vertical_id IN (${v.ids.map(() => '?').join(', ')})`, ...v.ids);
+      }
     }
   }
 
-  if (Number(clientIdFromUI) > 0)  pushPrimary('J.fk_client_id = ?', Number(clientIdFromUI));
-  if (notEmpty(easyfixerId))       pushPrimary('J.fk_easyfixter_id = ?', Number(easyfixerId));
-
   /*
-   * efr_no is a VARCHAR. Legacy inlined the mobile as a BARE NUMBER
-   * (`EFR.efr_no = 9876543210`), which forces MySQL to numerically coerce the
-   * whole column — non-SARGable, and it quietly matched rows with stray
-   * whitespace. Binding a string keeps the index usable and is the comparison
-   * that was actually intended. Deliberate, documented divergence.
+   * Job Stage Access — the union of statuses visible across the caller's
+   * allowed stages, ANDed with (never replacing) any status filter below.
+   * mode 'all' is unrestricted. An empty union means the caller may see no
+   * stage at all, which is zero rows, not "everything". Same helper
+   * (lib/job-stages.js) list() uses, so a stage's status set cannot mean one
+   * thing on screen and another in the sheet.
    */
-  if (notEmpty(easyfixerMobileNumber)) {
-    pushPrimary('EFR.efr_no = ?', String(easyfixerMobileNumber).trim());
+  if (allowedStages && allowedStages.mode === 'list') {
+    const visible = [...stageVisibleStatuses(allowedStages.stages)];
+    if (visible.length === 0) push('1=0');
+    else push(`J.job_status IN (${visible.map(() => '?').join(', ')})`, ...visible);
+    /*
+     * ⚠ A STAGE GRANT PINS THE STATUS DIMENSION, so the default terminal-status
+     * floor must NOT be ANDed on top of it.
+     *
+     * Without this the two predicates annihilate each other for any grant that
+     * lives inside the terminal set. lib/job-stages.js gives 'audit-complete'
+     * the visible set [3, 5] and 'cancelled' [6] — both entirely inside
+     * TERMINAL_STATUSES — so the audit team's ordinary grant produced
+     *
+     *     J.job_status IN (3, 5) AND J.job_status NOT IN (3, 5, 6, 7)
+     *
+     * which is zero rows, always, with no error and no warning: a permanently
+     * empty sheet for the people whose whole job is completed work. A MIXED
+     * grant is worse, because the file looks plausible — ['unconfirmed',
+     * 'audit-complete'] silently returned only the status-9 rows and dropped
+     * every Audit & Complete row the operator can see on screen.
+     *
+     * Suppressing the floor here cannot widen anything: J.job_status IN (…) is
+     * strictly narrower than no status predicate at all, and the DATE floor
+     * below is untouched — that is what actually bounds the row count. The
+     * status floor was only ever a default for "the caller said nothing about
+     * status", and a stage grant is the caller's boundary saying exactly that.
+     */
+    statusPinned = true;
   }
 
-  if (Number(cityId) > 0)  pushPrimary('city.city_id = ?', Number(cityId));
-  // zonalId is the ZONAL MANAGER (tbl_city.state_user), which is what legacy's
-  // `zonalManager` param filtered on — NOT tbl_zone_master. Same name the
-  // export UI sends; do not "correct" it to the zone-mapping table.
-  if (Number(zonalId) > 0) pushPrimary('city.state_user = ?', Number(zonalId));
+  // ── Status ────────────────────────────────────────────────────────────────
+  /*
+   * A numeric selection takes the direct path and, critically, BLANKS the
+   * legacy token string: the substring machinery below (and the status-driven
+   * date-column pick, and the bucketStatus sub-filter) must not try to read
+   * "3,5" as a token — it matches none of them, which is how a numeric status
+   * used to mean "no status filter at all".
+   */
+  const uiStatusCodes = numericStatusCodes({ statuses, status });
+  if (uiStatusCodes.length) {
+    push(`J.job_status IN (${uiStatusCodes.map(() => '?').join(', ')})`, ...uiStatusCodes);
+    statusPinned = true;
+  }
+  const statusStr = uiStatusCodes.length ? '' : String(status ?? '').trim();
+  const statusLower = statusStr.toLowerCase();
+  const hasToken = (t) => statusLower.includes(t);
 
   if (statusStr) {
     const codes = [];
@@ -493,44 +947,248 @@ function buildClauses(filters = {}) {
      */
     const requireEfr = hasToken('acknowledge') && !hasToken('scheduling');
     if (codes.length) {
-      pushPrimary(`J.job_status IN (${codes.map(() => '?').join(', ')})`, ...codes);
+      push(`J.job_status IN (${codes.map(() => '?').join(', ')})`, ...codes);
+      statusPinned = true;
       if (requireEfr) clauses.push('J.fk_easyfixter_id IS NOT NULL');
     }
     /*
      * If the caller sends a status that matches no token at all, legacy
      * appended a bare " ) " and the query died with a syntax error — no sheet,
      * no error message the user could act on. We emit no status clause instead;
-     * an unfiltered export beats a 500.
+     * an unfiltered export beats a 500. (It is still BOUNDED: no status pin
+     * means the default status floor below applies.)
      */
   }
 
-  // stateId is the one filter that sets `flage` but NOT `flag` — see the guard
-  // block at the bottom of this function.
-  if (Number(stateId) > 0)   push('city.state_id = ?', Number(stateId));
-  if (Number(svcCatgId) > 0) pushPrimary('J.fk_service_catg_id = ?', Number(svcCatgId));
-  if (Number(ownerId) > 0)   pushPrimary('J.job_owner = ?', Number(ownerId));
+  // ── Identity filters: the ones that BOUND the export by themselves ────────
+  if (notEmpty(jobsId)) {
+    // Legacy switched on the literal "REF" appearing in the value — the
+    // reference ids look like "REF12345".
+    if (String(jobsId).toUpperCase().includes('REF')) push('J.job_reference_id = ?', String(jobsId));
+    else push('J.job_id = ?', Number(jobsId));
+    pointIdentity = true;
+  }
+
+  if (notEmpty(easyfixerId)) { push('J.fk_easyfixter_id = ?', Number(easyfixerId)); pointIdentity = true; }
+
+  /*
+   * efr_no is a VARCHAR. Legacy inlined the mobile as a BARE NUMBER
+   * (`EFR.efr_no = 9876543210`), which forces MySQL to numerically coerce the
+   * whole column — non-SARGable, and it quietly matched rows with stray
+   * whitespace. Binding a string keeps the index usable and is the comparison
+   * that was actually intended. Deliberate, documented divergence.
+   */
+  if (notEmpty(easyfixerMobileNumber)) {
+    push('EFR.efr_no = ?', String(easyfixerMobileNumber).trim());
+    pointIdentity = true;
+  }
+
+  if (notEmpty(customerId)) { push('J.fk_customer_id = ?', Number(customerId)); pointIdentity = true; }
 
   if (notEmpty(custName)) {
     const v = String(custName).trim();
     // An all-digits value is a mobile number, anything else is a name. Legacy's
-    // exact test was `customer.matches("[0-9]+")`.
-    if (/^[0-9]+$/.test(v)) pushPrimary('C.customer_mob_no = ?', v);
-    else                    pushPrimary('C.customer_name LIKE ?', `%${v}%`);
+    // exact test was `customer.matches("[0-9]+")`. Only the mobile branch is an
+    // identity match; `%name%` can select any number of rows.
+    if (/^[0-9]+$/.test(v)) { push('C.customer_mob_no = ?', v); pointIdentity = true; }
+    else push('C.customer_name LIKE ?', `%${v}%`);
   }
 
   if (notEmpty(clientReferenceId)) {
     // branch_details doubles as a client reference on some clients; the
     // `<> ''` guard stops an empty search term matching every blank row.
     const v = String(clientReferenceId).trim();
-    pushPrimary("(J.client_ref_id = ? OR (J.branch_details = ? AND J.branch_details <> ''))", v, v);
+    push("(J.client_ref_id = ? OR (J.branch_details = ? AND J.branch_details <> ''))", v, v);
+    pointIdentity = true;
   }
 
+  // ── Dimension filters: they narrow, they do not bound ─────────────────────
+  // clientId (csvIds: single id OR CSV) and the legacy single-id form. Both
+  // land on J.fk_client_id, and both narrow WITHIN the clients scope above.
+  const clientIdList = toIdArray(clientId);
+  if (clientIdList.length) {
+    push(`J.fk_client_id IN (${clientIdList.map(() => '?').join(', ')})`, ...clientIdList);
+  }
+  if (Number(clientIdFromUI) > 0) push('J.fk_client_id = ?', Number(clientIdFromUI));
+
+  // cityId — csvIds. A.city_id, not city.city_id: see the cities-scope comment.
+  const cityIdList = toIdArray(cityId);
+  if (cityIdList.length) {
+    push(`A.city_id IN (${cityIdList.map(() => '?').join(', ')})`, ...cityIdList);
+  }
+
+  if (Number(stateId) > 0) push('city.state_id = ?', Number(stateId));
+
+  /*
+   * zonalId is the ZONAL MANAGER (tbl_city.state_user) in THIS vocabulary —
+   * NOT tbl_zone_master. See ZONAL_ID_COLLISION above before "correcting" it
+   * to the zone-mapping table; list() reads the same name differently and the
+   * route logs the param so the ambiguity is never silent.
+   */
+  if (Number(zonalId) > 0) push('city.state_user = ?', Number(zonalId));
+  // zonalManagerId — listQuery's name for exactly the predicate above, and the
+  // one the CRM's "Zonal" control actually sends. csvIds, as in list().
+  const zmIdList = toIdArray(zonalManagerId);
+  if (zmIdList.length) {
+    push(`city.state_user IN (${zmIdList.map(() => '?').join(', ')})`, ...zmIdList);
+  }
+
+  if (Number(svcCatgId) > 0) push('J.fk_service_catg_id = ?', Number(svcCatgId));
+  if (Number(categoryId) > 0) push('J.fk_service_catg_id = ?', Number(categoryId));
+  if (Number(ownerId) > 0) push('J.job_owner = ?', Number(ownerId));
+
   // Prefix LIKE — still index-usable, so it stays exactly as legacy had it.
-  if (notEmpty(pinCode)) pushPrimary('A.pin_code LIKE ?', `${String(pinCode).trim()}%`);
+  if (notEmpty(pinCode)) push('A.pin_code LIKE ?', `${String(pinCode).trim()}%`);
+  // listQuery's `pin` is list()'s CONTAINS form. Different name, different
+  // wrap, both deliberate: the sheet must match the table for `pin`.
+  if (notEmpty(pin)) push('A.pin_code LIKE ?', `%${String(pin).trim()}%`);
 
-  if (Number(verticalIdentity) > 0) pushPrimary('V.vertical_id = ?', Number(verticalIdentity));
+  // Legacy vertical filter: the mapping row reached through the FROM clause.
+  if (Number(verticalIdentity) > 0) push('V.vertical_id = ?', Number(verticalIdentity));
+  /*
+   * listQuery's verticalId, mirroring list(): an EXISTS on the many-to-many
+   * mapping, INDEPENDENT of the verticals SCOPE (which reads tbl_client). The
+   * two must stay independent — a scope written against TVM and a filter
+   * written against the V join can never both hold for different ids, and the
+   * sheet comes back empty with nothing to explain it.
+   */
+  if (Number(verticalId) > 0) {
+    push('EXISTS (SELECT 1 FROM tbl_vertical_mapping vm WHERE vm.client_id = J.fk_client_id AND vm.vertical_id = ?)', Number(verticalId));
+  }
+  // Project Manager — the user mapped to the job's client with user_type = 1.
+  // Self-contained EXISTS, same shape as list().
+  const pmIdList = toIdArray(projectManagerId);
+  if (pmIdList.length) {
+    push(
+      `EXISTS (SELECT 1 FROM tbl_vertical_mapping vm WHERE vm.client_id = J.fk_client_id AND vm.user_type = 1 AND vm.user_id IN (${pmIdList.map(() => '?').join(', ')}))`,
+      ...pmIdList,
+    );
+  }
 
-  // ── Date window ───────────────────────────────────────────────────────────
+  // Text CONTAINS filters — list()'s customary %v% wrap.
+  if (notEmpty(clientRef)) push('J.client_ref_id LIKE ?', `%${String(clientRef).trim()}%`);
+  if (notEmpty(efrMobile)) push('EFR.efr_no LIKE ?', `%${String(efrMobile).trim()}%`);
+  if (notEmpty(customerQ)) {
+    /*
+     * Matches the name the ROW DISPLAYS (job-row name, master as fallback),
+     * not the master name alone — same reason list() does: otherwise typing
+     * the name visible on screen returns nothing for every job that overrides
+     * it.
+     */
+    const v = `%${String(customerQ).trim()}%`;
+    push(`(${JOB_CUSTOMER_NAME_EXPR} LIKE ? OR C.customer_mob_no LIKE ?)`, v, v);
+  }
+
+  if (notEmpty(sourceType)) push('J.source_type = ?', String(sourceType));
+
+  if (assigned !== undefined && assigned !== null && assigned !== '') {
+    // Pool-offered jobs stay job_status = 0 with fk_easyfixter_id NULL until a
+    // tech ACCEPTS, so fk presence IS the accepted/assigned signal. Same rule
+    // as list(); the Pending-for-Scheduling tab sends status=0 + assigned=false.
+    clauses.push(isTrue(assigned) ? 'J.fk_easyfixter_id IS NOT NULL' : 'J.fk_easyfixter_id IS NULL');
+  }
+
+  if (isTrue(noServices)) {
+    /*
+     * Booked-No-Services drill-down. Pins job_status = 0 itself (so callers
+     * need not set status separately) AND anti-joins tbl_job_services —
+     * exactly the predicate the attention-summary counter uses, so the tile,
+     * the table and the sheet agree by construction.
+     */
+    clauses.push('J.job_status = 0');
+    clauses.push('NOT EXISTS (SELECT 1 FROM tbl_job_services js WHERE js.job_id = J.job_id AND js.job_service_status = 1)');
+    statusPinned = true;
+  }
+
+  if (reopen !== undefined && reopen !== null && reopen !== '') {
+    clauses.push(isTrue(reopen) ? 'J.job_reopen_flag = 1' : '(J.job_reopen_flag = 0 OR J.job_reopen_flag IS NULL)');
+  }
+
+  if (notEmpty(dueTo)) {
+    /*
+     * Accepts both shapes of remark, exactly as list() does:
+     *   structured tag from the AddRemarks dialog ("Due To: Client"), and
+     *   loose legacy free text ("… due to client said no …").
+     * MySQL's default collation is case-insensitive, so casing is irrelevant.
+     */
+    const lower = String(dueTo).toLowerCase();
+    const label = lower === 'easyfix' ? 'EasyFix' : lower.charAt(0).toUpperCase() + lower.slice(1);
+    push('(J.remarks LIKE ? OR J.remarks LIKE ?)', `%Due To: ${label}%`, `%due to ${lower}%`);
+  }
+
+  if (quotationStatus === 'approved') {
+    push('EXISTS (SELECT 1 FROM quotation_details qd WHERE qd.job_id = J.job_id AND qd.status = 1 AND qd.action_on IS NOT NULL)');
+    clauses.push('J.job_status NOT IN (2, 3, 5, 6)');
+    statusPinned = true;
+  } else if (quotationStatus === 'rejected') {
+    push('EXISTS (SELECT 1 FROM quotation_details qd WHERE qd.job_id = J.job_id AND qd.status = 0 AND qd.action_on IS NOT NULL)');
+    clauses.push('J.job_status NOT IN (3, 5, 6)');
+    statusPinned = true;
+  }
+
+  if (requestedBefore === 'now') {
+    clauses.push('J.requested_date_time IS NOT NULL AND J.requested_date_time < NOW()');
+  } else if (notEmpty(requestedBefore)) {
+    push('J.requested_date_time IS NOT NULL AND J.requested_date_time < ?', requestedBefore);
+  }
+
+  if (notEmpty(q)) {
+    // One bound value per term, in Q_TERMS order — eleven placeholders, eleven
+    // params. A term added on one side and not the other is a silent drift.
+    const v = `%${String(q).trim()}%`;
+    push(`(${Q_TERMS.join(' OR ')})`, ...Q_TERMS.map(() => v));
+  }
+
+  // ── Date windows ──────────────────────────────────────────────────────────
+  /*
+   * listQuery's startDate/endDate, applied EXACTLY as list() applies them:
+   * DATE() on the PARAMETER (never the column, so the index stays usable) and
+   * an EXCLUSIVE next-day upper bound.
+   *
+   * ⚠ DO NOT "simplify" this to a plain `>= ? AND <= ?`. startDate/endDate are
+   * Joi.date().iso(), so '2026-08-17' is a Date at UTC midnight and mysql2
+   * serialises it at the pool's +05:30 — MySQL receives '2026-08-17 05:30:00'.
+   * The raw comparison made start = end return NOTHING and skewed every other
+   * range by 5.5 hours, in the table AND in this sheet. Measured, fixed in
+   * list() on 2026-08-18, and mirrored here.
+   */
+  const uiDateCol = UI_DATE_TYPE_COLUMN[String(dateType || '').toLowerCase()] || 'J.created_date_time';
+  if (notEmpty(startDate)) push(`${uiDateCol} >= DATE(?)`, startDate);
+  if (notEmpty(endDate)) push(`${uiDateCol} < DATE(?) + INTERVAL 1 DAY`, endDate);
+  /*
+   * ⚠ NAMING A LIFECYCLE DATE AXIS IS ITSELF A STATEMENT ABOUT STATUS.
+   *
+   * checkout_date_time is populated ONLY on jobs that have checked out — i.e.
+   * exactly statuses 3 and 5, which the terminal-status floor removes. So
+   * "everything completed since 1 Aug" came back as
+   *
+   *     J.checkout_date_time >= DATE('2026-08-01')
+   *     AND J.created_date_time >= DATE_SUB(NOW(), INTERVAL 6 MONTH)
+   *     AND J.job_status NOT IN (3, 5, 6, 7)
+   *
+   * — every completed job removed from a query whose whole subject was
+   * completed jobs. Reachable in two clicks: both date inputs are optional and
+   * independent, so a half-open window ships dateType without pinning status.
+   *
+   * An operator who picks a lifecycle column AND a date has named the part of
+   * the lifecycle they mean; the floor's default no longer applies, and
+   * `defaultDateCol` keeps the fallback window on the SAME axis so the two
+   * bounds can never sit on different columns and cancel out.
+   *
+   * Gated on a date actually being supplied, because dateType is documented
+   * as a MODIFIER that emits nothing on its own — it selects the column the
+   * window applies to. Reading a status pin out of the modifier ALONE would
+   * make an operator who merely switched the dropdown silently change which
+   * jobs they get, which is the class of surprise this whole change exists
+   * to remove.
+   */
+  const uiWindowGiven = notEmpty(startDate) || notEmpty(endDate);
+  if (uiWindowGiven && uiDateCol !== 'J.created_date_time') statusPinned = true;
+  if (uiWindowGiven) defaultDateCol = uiDateCol;
+  if (notEmpty(startDate) && notEmpty(endDate)) explicitWindow = true;
+
+  // Legacy dateFrom/dateTo. Its own picker tokens, its own status-driven
+  // column choice; the two token sets are disjoint so they cannot collide.
   const from = normaliseDate(dateFrom);
   const to = normaliseDate(dateTo);
   // Legacy dereferenced dateType without a null check. The UI always sends it
@@ -539,24 +1197,28 @@ function buildClauses(filters = {}) {
   const isAll = dtRaw.toLowerCase() === 'all';
 
   if (from && to) {
+    explicitWindow = true;
     if (statusStr && isAll) {
       // One status tab + "All" → the date column that tab is ABOUT.
       const col = STATUS_DATE_COLUMN[statusLower] || 'J.requested_date_time';
       const r = dayRange(col, from, to);
-      pushPrimary(r.sql, ...r.params);
+      push(r.sql, ...r.params);
     } else if (!statusStr && isAll) {
       // No status tab + "All" → "did ANY milestone land in this window".
       const parts = ALL_DATE_COLUMNS.map((c) => dayRange(c, from, to));
-      pushPrimary(
+      push(
         `(${parts.map((p) => p.sql).join(' OR ')})`,
         ...parts.flatMap((p) => p.params),
       );
     } else if (!isAll) {
       const col = DATE_TYPE_COLUMN[dtRaw.toLowerCase()] || 'J.requested_date_time';
       const r = dayRange(col, from, to);
-      pushPrimary(r.sql, ...r.params);
+      push(r.sql, ...r.params);
       // Legacy pinned the completed statuses onto this one date type only.
-      if (dtRaw.toLowerCase() === 'checkoutdatetime') clauses.push('J.job_status IN (3, 5)');
+      if (dtRaw.toLowerCase() === 'checkoutdatetime') {
+        clauses.push('J.job_status IN (3, 5)');
+        statusPinned = true;
+      }
     }
   }
 
@@ -581,19 +1243,27 @@ function buildClauses(filters = {}) {
     if (buckets.includes('2')) bucketSql.push(`(DATE_SUB(NOW(), INTERVAL 48 HOUR) <= ${OADT} AND DATE_SUB(NOW(), INTERVAL 24 HOUR) >= ${OADT} AND ${OADT} <= NOW())`);
     if (buckets.includes('3')) bucketSql.push(`(DATE_SUB(NOW(), INTERVAL 72 HOUR) <= ${OADT} AND DATE_SUB(NOW(), INTERVAL 48 HOUR) >= ${OADT} AND ${OADT} <= NOW())`);
     if (buckets.includes('4')) bucketSql.push(`(DATE_SUB(NOW(), INTERVAL 72 HOUR) >= ${OADT} AND ${OADT} <= NOW())`);
-    if (bucketSql.length) pushPrimary(`(${bucketSql.join(' OR ')})`);
+    if (bucketSql.length) push(`(${bucketSql.join(' OR ')})`);
   }
 
-  // "Open due to" — user_type of the reason attached to the job.
+  // "Open due to" — user_type of the reason attached to the job. The LEGACY
+  // filter; listQuery's `dueTo` above is a different column and a different
+  // question, and both names are honoured under their own meaning.
   if (notEmpty(openDueToReason) && String(openDueToReason).toLowerCase() !== 'all') {
     push('ut.type = ?', String(openDueToReason));
   }
 
-  // Rating 1..5 is a literal match; anything above 5 is the UI's "not rated"
-  // pseudo-option and means IS NULL.
+  /*
+   * Rating 1..5 is a literal match; anything above 5 is the legacy UI's "not
+   * rated" pseudo-option and means IS NULL (listQuery caps the value at 5, so
+   * only a direct caller reaches that branch). list() expresses the same
+   * filter as an EXISTS; the joined form here is equivalent because phase 1
+   * GROUP BYs job_id, so a job with ANY matching rating row survives exactly
+   * once.
+   */
   if (Number(rating) > 0) {
     if (Number(rating) <= 5) push('TERBC.customer_rating = ?', Number(rating));
-    else                     push('TERBC.customer_rating IS NULL');
+    else push('TERBC.customer_rating IS NULL');
   }
 
   // Bucket-status sub-filter — legacy only honoured it on the Unconfirmed tab.
@@ -610,31 +1280,65 @@ function buildClauses(filters = {}) {
   }
 
   /*
-   * Implicit guards. Without them an unfiltered export means "every job ever",
-   * which is the query that takes the database down.
+   * ── THE BOUND ─────────────────────────────────────────────────────────────
+   * One rule, one expression. See "KEEPING THE EXPORT BOUNDED" above for why
+   * only these two things count, and why RBAC is not one of them.
    *
-   * The second guard (`flage && completed && !flag`) is UNREACHABLE with the
-   * current filter order — every filter evaluated before `status` also sets
-   * `flag`, so `flag` cannot be false while a status is present. It is kept
-   * because it is legacy's rule and because it becomes reachable again the
-   * moment someone reorders the filters above.
+   * This REPLACES legacy's `flage` / `flag` pair. Those two booleans meant
+   * "any filter was emitted" and "the first clause came from a flag-setting
+   * filter", and the guards branching on them are gone with them — including
+   * the `flage && completed && !flag` arm, which the previous comment already
+   * recorded as unreachable. The legacy vocabulary therefore loses its old
+   * cap-lifting behaviour too (clientIdFromUI no longer lifts the window on
+   * its own, for instance).
+   *
+   * ⚠ MEASURED, NOT ASSUMED, because the first attempt at this change claimed
+   * the legacy path was "byte-identical" and it was not. Running HEAD's module
+   * against this one over 42 legacy filter combinations, 25 differ. Most gain a
+   * default floor (a tightening). ONE WIDENS, and it is called out here rather
+   * than left to be discovered:
+   *
+   *   { status:'completed', dateFrom, dateTo, dateType:'All' }
+   *     HEAD: … AND J.created_date_time >= DATE_SUB(NOW(), INTERVAL 6 MONTH)
+   *     NOW : (no such clause)
+   *
+   * That clause came from a THIRD legacy guard — terminal statuses with no
+   * city/state filter got a 6-month cap on created_date_time. It is gone
+   * DELIBERATELY, because it was the same axis-mismatch bug this change fixes
+   * elsewhere: it capped CREATED while the operator's window was on CHECKOUT,
+   * so "completed jobs in Q1 2024" met a 6-month created floor and returned
+   * nothing at all. A load guard that silently empties historical queries is
+   * not a load guard, it is a second bug.
+   *
+   * What bounds that query now is the operator's own window, on their own
+   * axis. The residual risk is a window of arbitrary LENGTH (2015→2026), which
+   * is bounded only by EXPORT_ROW_CEILING; that is logged rather than clamped,
+   * because silently narrowing a range an operator explicitly typed is the
+   * exact behaviour this whole change exists to remove.
+   *
+   * The tightening applies to a path no HTTP caller can reach (validate.js runs
+   * Joi with stripUnknown, so only listQuery keys arrive), and one
+   * lifting rule for both vocabularies is the only version of this anyone can
+   * reason about.
    */
-  if (!flage) {
-    clauses.push('J.created_date_time >= DATE_SUB(NOW(), INTERVAL 6 MONTH)');
-    clauses.push('J.job_status NOT IN (3, 5, 6, 7)');
-  } else if (hasToken('completed') && !flag) {
-    clauses.push('J.created_date_time >= DATE_SUB(NOW(), INTERVAL 6 MONTH)');
-    clauses.push('J.job_status IN (3, 5)');
+  /*
+   * ⚠ THE DEFAULT WINDOW IS THE LAST SILENT NARROWING IN THIS PATH, so it
+   * reports itself. An operator whose sheet is shorter than their screen must
+   * be able to find out why from the log — the original bug was invisible
+   * precisely because nothing announced that a constraint had been swapped in.
+   * The route logs this alongside the unapplied-filter warning.
+   */
+  const boundedByCaller = pointIdentity || explicitWindow;
+  if (!boundedByCaller) {
+    appliedDefaults.push(`window:${DEFAULT_WINDOW_MONTHS}mo on ${defaultDateCol}`);
+    if (!statusPinned) appliedDefaults.push(`status:NOT IN (${TERMINAL_STATUSES.join(',')})`);
+  }
+  if (!boundedByCaller) {
+    clauses.push(`${defaultDateCol} >= DATE_SUB(NOW(), INTERVAL ${DEFAULT_WINDOW_MONTHS} MONTH)`);
+    if (!statusPinned) clauses.push(`J.job_status NOT IN (${TERMINAL_STATUSES.join(', ')})`);
   }
 
-  // Terminal statuses have years of history behind them; without a geography
-  // filter to narrow the scan, cap them at 6 months.
-  if ((hasToken('cancel') || hasToken('enquiry') || hasToken('completed'))
-      && !(Number(cityId) > 0) && !(Number(stateId) > 0)) {
-    clauses.push('J.created_date_time >= DATE_SUB(NOW(), INTERVAL 6 MONTH)');
-  }
-
-  return { clauses, params };
+  return { clauses, params, appliedDefaults };
 }
 
 /*
@@ -642,8 +1346,8 @@ function buildClauses(filters = {}) {
  * string when there is nothing to filter on) plus its bind values, in order.
  */
 function buildExportWhere(filters = {}) {
-  const { clauses, params } = buildClauses(filters);
-  return { where: clauses.length ? `WHERE ${clauses.join(' AND ')}` : '', params };
+  const { clauses, params, appliedDefaults } = buildClauses(filters);
+  return { where: clauses.length ? `WHERE ${clauses.join(' AND ')}` : '', params, appliedDefaults };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -867,7 +1571,17 @@ const MAX_CHUNK_SIZE = 5000;
  */
 async function fetchExportChunk({ filters = {}, afterJobId = null, chunkSize = DEFAULT_CHUNK_SIZE } = {}) {
   const size = Math.min(Math.max(Number(chunkSize) || DEFAULT_CHUNK_SIZE, 1), MAX_CHUNK_SIZE);
-  const { clauses, params } = buildClauses(filters);
+  /*
+   * Resolve the tbl_client.vertical_id probe ONCE per chunk (it is memoised
+   * per process after the first call) and hand the answer to buildClauses, so
+   * the verticals RBAC scope is applied here on exactly the condition list()
+   * applies it on. Awaiting a cached boolean costs nothing; guessing it costs
+   * an RBAC divergence between the sheet and the screen.
+   */
+  const { clauses, params } = buildClauses({
+    ...filters,
+    hasClientVerticalCol: await hasClientVerticalIdColumn(),
+  });
 
   const allClauses = clauses.slice();
   const allParams = params.slice();
@@ -1546,4 +2260,14 @@ function mapExportRow(r, seqNumber) {
   };
 }
 
-module.exports = { EXPORT_COLUMNS, fetchExportChunk, mapExportRow, buildExportWhere };
+module.exports = {
+  EXPORT_COLUMNS, fetchExportChunk, mapExportRow, buildExportWhere,
+  /*
+   * The listQuery coverage ledger and the subset of it the route logs.
+   * Exported so tests/job-export-filters.test.js can derive its checks from
+   * the SAME structure the code reads — a hand-typed copy of this list in the
+   * test would let a new listQuery key be dropped in silence with the suite
+   * green, which is the original bug rebuilt inside its own regression test.
+   */
+  FILTER_COVERAGE, UNAPPLIED_FILTERS,
+};
