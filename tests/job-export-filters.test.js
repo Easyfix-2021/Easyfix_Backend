@@ -692,3 +692,75 @@ test('Job Owner prefers the resolved name and falls back to the raw id', () => {
   const absent = mapExportRow({ job_id: 3 }, 3);
   assert.equal(absent.jobOwner, null, 'a DB without the column yields a blank cell');
 });
+
+/* ═══ the numeric q fast path, ported from list() ════════════════════════ */
+
+test('a digits-only q takes the typed path — no phone-substring strangers', () => {
+  /*
+   * THE REPORTED BUG, on the export side. Searching 530280 on the jobs list
+   * returned two extra jobs matched on their PHONE NUMBERS mid-digit
+   * (98453028|06 and 93|530280|25). This file held an INDEPENDENT COPY of the
+   * same eleven-term OR, so the export would have put those strangers in the
+   * operator's spreadsheet — where they are harder to spot than on screen.
+   */
+  const r = whereAndParams({ q: '530280' });
+  assert.match(r.where, /J\.job_id = \?/, 'the id is matched by EQUALITY, not LIKE');
+  assert.equal(/customer_mob_no/.test(r.where), false,
+    'a 6-digit term is an id, never a phone fragment');
+  assert.equal(r.params[0], 530280, 'bound as a number, so the PK index is usable');
+  // The eight name/city/client/owner columns are gone: a digits-only term is
+  // never a person's name, and each one was a full scan.
+  assert.equal(/city_name|client_name|efr_name|user_name/.test(r.where), false);
+});
+
+test('a term long enough to BE a phone matches it, PREFIX-anchored', () => {
+  const r = whereAndParams({ q: '9845302806' });
+  assert.match(r.where, /J\.fk_customer_id IN \(SELECT qmob\.customer_id/,
+    'an uncorrelated set lookup, not a column of the outer LEFT JOIN');
+  assert.ok(r.params.includes('9845302806%'),
+    'anchored at the START — this is what stops mid-number matching AND what '
+    + 'lets MySQL use a range scan on the mobile index');
+  /*
+   * The two REFERENCE columns legitimately bind '%9845302806%' — they are opaque
+   * client strings where a fragment is a real search. The assertion that matters
+   * is that the MOBILE param is the anchored one, so count the shapes instead of
+   * asserting no substring exists anywhere.
+   */
+  assert.equal(r.params.filter((x) => x === '%9845302806%').length, 2,
+    'job_reference_id and client_ref_id, and only those, match by substring');
+  assert.equal(r.params.filter((x) => x === '9845302806%').length, 1,
+    'exactly one anchored param — the mobile');
+});
+
+test('the mobile branch appears only at MOBILE_MIN_DIGITS or longer', () => {
+  // 8 digits is still an id-shaped term; 9 is where a phone fragment begins.
+  assert.equal(/customer_mob_no/.test(where({ q: '98453028' })), false);
+  assert.match(where({ q: '984530280' }), /customer_mob_no/);
+});
+
+test('the mobile length threshold is IMPORTED from list(), never redeclared', () => {
+  /*
+   * Two copies of "how long is a phone fragment" is exactly how this file ended
+   * up carrying a stale copy of the q clause in the first place.
+   */
+  const src = require('node:fs').readFileSync(
+    require('node:path').join(__dirname, '../services/job-export.service.js'), 'utf8');
+  assert.match(src, /MOBILE_MIN_DIGITS\s*\}\s*=\s*require\('\.\/job\.service'\)/,
+    'imported from job.service');
+  assert.equal(/const\s+MOBILE_MIN_DIGITS\s*=/.test(src), false, 'and not redeclared here');
+});
+
+test('a NON-numeric q keeps the eleven-column search byte for byte', () => {
+  const r = whereAndParams({ q: 'Kamothe' });
+  assert.match(r.where, /CAST\(J\.job_id AS CHAR\) LIKE \?/);
+  assert.match(r.where, /C\.customer_mob_no LIKE \?/, 'the text path is untouched');
+  assert.equal(r.params.filter((p) => p === '%Kamothe%').length, 11,
+    'eleven terms, eleven bound params — a term added on one side only is a silent drift');
+});
+
+test('the numeric path binds every value — wildcards and quotes are never inlined', () => {
+  for (const q of ['530280', '9845302806']) {
+    const r = whereAndParams({ q });
+    assert.equal(r.where.includes(q), false, `${q} must not appear inline in the SQL`);
+  }
+});

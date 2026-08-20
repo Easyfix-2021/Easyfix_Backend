@@ -59,7 +59,7 @@ const { stageVisibleStatuses } = require('../lib/job-stages');
  * the sheet differently from the screen. job.service does NOT require this
  * module, so there is no cycle; routes/admin/jobs.js already loads both.
  */
-const { hasClientVerticalIdColumn } = require('./job.service');
+const { hasClientVerticalIdColumn, MOBILE_MIN_DIGITS } = require('./job.service');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Column spec
@@ -1133,10 +1133,55 @@ function buildClauses(filters = {}) {
   }
 
   if (notEmpty(q)) {
-    // One bound value per term, in Q_TERMS order — eleven placeholders, eleven
-    // params. A term added on one side and not the other is a silent drift.
-    const v = `%${String(q).trim()}%`;
-    push(`(${Q_TERMS.join(' OR ')})`, ...Q_TERMS.map(() => v));
+    const term = String(q).trim();
+    /*
+     * ── A DIGITS-ONLY TERM IS AN IDENTIFIER, NOT A NAME ─────────────────────
+     * (2026-08-20. Ported from services/job.service.js list(), which carries the
+     * full reasoning and the measurements; this file held an INDEPENDENT COPY of
+     * the same eleven-term OR and therefore an independent copy of both bugs.)
+     *
+     * CORRECTNESS. Searching 530280 on the jobs list returned three jobs: the
+     * one wanted, plus two matched on their PHONE NUMBERS mid-digit —
+     * 98453028|06 and 93|530280|25. Any six-digit id has roughly five landing
+     * spots inside a ten-digit mobile, so the false-match rate grows with how
+     * many customers exist rather than with how unusual the term is. The export
+     * would have put those same strangers in the operator's spreadsheet, where
+     * they are harder to notice than on screen.
+     *
+     * SPEED. `C.customer_mob_no LIKE ?` names a column of the OUTER LEFT JOIN,
+     * so sitting inside an OR with tbl_job predicates it forced MySQL to join
+     * tbl_customer before it could rule any row out. Written as an uncorrelated
+     * IN (…) the predicate becomes pure-`J`, the subquery runs ONCE as a range
+     * scan on the mobile index, and the prefix anchor is what makes that range
+     * possible — the correctness fix is what unlocks the speed fix.
+     *
+     * MOBILE_MIN_DIGITS is IMPORTED, not redeclared. Two copies of "how long is
+     * a phone fragment" is precisely how this file ended up with a stale copy of
+     * the clause in the first place.
+     */
+    if (/^\d+$/.test(term)) {
+      const idTerms = ['J.job_id = ?', 'J.job_reference_id LIKE ?', 'J.client_ref_id LIKE ?'];
+      const idParams = [Number(term), `%${term}%`, `%${term}%`];
+      if (term.length >= MOBILE_MIN_DIGITS) {
+        /*
+         * ⚠ IN, never NOT IN. One NULL in a NOT IN subquery rejects EVERY row;
+         * with IN a NULL fk_customer_id is simply UNKNOWN and OR-composes the
+         * same way the old LIKE did on a NULL join.
+         */
+        idTerms.push(
+          'J.fk_customer_id IN (SELECT qmob.customer_id FROM tbl_customer qmob WHERE qmob.customer_mob_no LIKE ?)'
+        );
+        idParams.push(`${term}%`);
+      }
+      push(`(${idTerms.join(' OR ')})`, ...idParams);
+    } else {
+      // Anything containing a non-digit keeps the original eleven-column search,
+      // byte for byte. One bound value per term, in Q_TERMS order — eleven
+      // placeholders, eleven params. A term added on one side and not the other
+      // is a silent drift.
+      const v = `%${term}%`;
+      push(`(${Q_TERMS.join(' OR ')})`, ...Q_TERMS.map(() => v));
+    }
   }
 
   // ── Date windows ──────────────────────────────────────────────────────────

@@ -6042,6 +6042,9 @@ async function notifyCustomerNotReachable(jobId) {
 }
 
 module.exports = {
+  // Shared with services/job-export.service.js so the two q-clauses cannot
+  // drift on what counts as a phone fragment. See the block at its definition.
+  MOBILE_MIN_DIGITS,
   STATUS, ALL_STATUS_VALUES, MUTABLE_COLUMNS,
   // Cross-service helper — used by job-magic-link.service.js to keep the
   // tbl_job.client_services CSV in sync after the customer's self-submit
