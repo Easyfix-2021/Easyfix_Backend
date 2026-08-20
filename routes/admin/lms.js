@@ -2,7 +2,8 @@ const router = require('express').Router();
 const Joi = require('joi');
 
 const validate = require('../../middleware/validate');
-const { roleByName } = require('../../middleware/role');
+const requireAction = require('../../middleware/require-action');
+const { buildRequestScope } = require('../../lib/scope');
 const svc = require('../../services/lms.service');
 const { modernOk } = require('../../utils/response');
 const logger = require('../../logger');
@@ -10,8 +11,38 @@ const logger = require('../../logger');
 /*
  * LMS admin API — courses, course content, assignment and the completion
  * report. Mounted at /api/admin/lms, so it inherits requireAuth,
- * role(['admin']) and maskMobile from routes/admin/index.js; writes narrow
- * further to roleByName(['Admin']) exactly as the other master-data routes do.
+ * role(['admin']) and maskMobile from routes/admin/index.js.
+ *
+ * WRITE GATE — `isLmsManage`, not a role name (changed 2026-08-21)
+ *   Every write used to run `roleByName(['Admin'])`, an exact
+ *   tbl_role.role_name match. But 2026-08-13-lms-foundation.sql seeds a
+ *   `menu_action` row `isLmsManage` and grants it to role 2, and NOTHING
+ *   read it — so the grant was decorative. A role holding `isLmsManage`
+ *   got the LMS sidebar entry (menu_ids drives the sidebar) and then a 403
+ *   from every button on it: permission granted, permission denied, no way
+ *   for an operator to tell which was the truth. The seeded key is now the
+ *   real gate, so granting it is what actually confers write access, and
+ *   Manage Roles becomes the single place the answer lives.
+ *
+ *   For role 2 (Admin) this is a no-op — it already holds the grant. It
+ *   stops being a no-op the moment a second LMS role exists, which is
+ *   exactly what the action loop introduces.
+ *
+ *   Reads stay open to any admin-group user, matching the Notice Board
+ *   precedent (routes/admin/notices.js): consuming a list is not authoring
+ *   it. Row-level exposure on the two technician-grained reads is handled
+ *   by city scope below, not by the action key.
+ *
+ * READ SCOPE — city, on the two technician-grained reads
+ *   GET /assignments and GET /report list TECHNICIANS, so a geographically
+ *   scoped user must see only their own cities' rows; they returned every
+ *   city to every admin-group caller until 2026-08-21. Scope comes off the
+ *   per-request object computed once in routes/admin/index.js and is passed
+ *   into the service exactly as routes/admin/easyfixers.js does.
+ *
+ *   /courses and /courses/:id/videos are deliberately NOT scoped. A course
+ *   is master data with no city, and inventing one would hide content from
+ *   the very people who have to assign it.
  *
  * The training VIDEO catalogue is deliberately not served from here. Its CRUD
  * already lives at /api/admin/aux/training-videos and the technician app reads
@@ -24,6 +55,14 @@ const logger = require('../../logger');
  * technician_mobile fields in the assignment and report responses are masked
  * on the way out by the inherited maskMobile middleware — no per-route work.
  */
+
+/*
+ * One factory call, reused on all SEVEN writes. requireAction() returns a NAMED
+ * function (`actionGuard`) and route tests locate the guard by `fn.name` —
+ * see tests/easyfixer-lifecycle-route-auth.test.js — so it must never be wrapped
+ * in an anonymous arrow.
+ */
+const requireLmsManage = requireAction('isLmsManage');
 
 const idParam = Joi.object({ id: Joi.number().integer().positive().required() });
 
@@ -133,7 +172,7 @@ router.get('/courses/:id', validate(idParam, 'params'), async (req, res, next) =
   } catch (e) { next(e); }
 });
 
-router.post('/courses', roleByName(['Admin']), validate(createCourseBody), async (req, res, next) => {
+router.post('/courses', requireLmsManage, validate(createCourseBody), async (req, res, next) => {
   try {
     const created = await svc.createCourse(req.body);
     res.status(201);
@@ -141,7 +180,7 @@ router.post('/courses', roleByName(['Admin']), validate(createCourseBody), async
   } catch (e) { next(e); }
 });
 
-router.patch('/courses/:id', roleByName(['Admin']), validate(idParam, 'params'), validate(updateCourseBody), async (req, res, next) => {
+router.patch('/courses/:id', requireLmsManage, validate(idParam, 'params'), validate(updateCourseBody), async (req, res, next) => {
   try {
     modernOk(res, await svc.updateCourse(req.params.id, req.body));
   } catch (e) { next(e); }
@@ -152,7 +191,7 @@ router.patch('/courses/:id', roleByName(['Admin']), validate(idParam, 'params'),
  * progress history point at this course and must keep resolving — a
  * technician who completed a since-withdrawn course still completed it.
  */
-router.delete('/courses/:id', roleByName(['Admin']), validate(idParam, 'params'), async (req, res, next) => {
+router.delete('/courses/:id', requireLmsManage, validate(idParam, 'params'), async (req, res, next) => {
   try {
     logger.info('Retire course · id=' + req.params.id);
     modernOk(res, await svc.retireCourse(req.params.id));
@@ -167,7 +206,7 @@ router.get('/courses/:id/videos', validate(idParam, 'params'), async (req, res, 
   } catch (e) { next(e); }
 });
 
-router.put('/courses/:id/videos', roleByName(['Admin']), validate(idParam, 'params'), validate(setContentBody), async (req, res, next) => {
+router.put('/courses/:id/videos', requireLmsManage, validate(idParam, 'params'), validate(setContentBody), async (req, res, next) => {
   try {
     modernOk(res, await svc.setCourseVideos(req.params.id, req.body.video_ids));
   } catch (e) { next(e); }
@@ -175,9 +214,11 @@ router.put('/courses/:id/videos', roleByName(['Admin']), validate(idParam, 'para
 
 // ─── Assignment ──────────────────────────────────────────────────────
 
+// City-scoped: this lists TECHNICIANS. See the scope note in the header.
 router.get('/assignments', validate(listAssignmentsQuery, 'query'), async (req, res, next) => {
   try {
-    modernOk(res, await svc.listAssignments(req.query));
+    const scope = buildRequestScope(req);
+    modernOk(res, await svc.listAssignments({ ...req.query, scope }));
   } catch (e) { next(e); }
 });
 
@@ -188,7 +229,7 @@ router.get('/assignments', validate(listAssignmentsQuery, 'query'), async (req, 
  * assignment is a no-op by design (the unique key makes it an upsert that
  * leaves any existing score untouched).
  */
-router.post('/assignments', roleByName(['Admin']), validate(assignBody), async (req, res, next) => {
+router.post('/assignments', requireLmsManage, validate(assignBody), async (req, res, next) => {
   try {
     modernOk(res, await svc.assignCourse(req.body.course_id, req.body.easyfixer_ids, {
       durationMonths: req.body.duration_months,
@@ -204,7 +245,7 @@ router.post('/assignments', roleByName(['Admin']), validate(assignBody), async (
  * which is what makes an extension work in both directions; see
  * lms.service::extendAssignment.
  */
-router.patch('/assignments/:courseId/:easyfixerId', roleByName(['Admin']), validate(assignmentParams, 'params'), validate(extendBody), async (req, res, next) => {
+router.patch('/assignments/:courseId/:easyfixerId', requireLmsManage, validate(assignmentParams, 'params'), validate(extendBody), async (req, res, next) => {
   try {
     modernOk(res, await svc.extendAssignment(req.params.courseId, req.params.easyfixerId, {
       months: req.body.duration_months,
@@ -213,7 +254,7 @@ router.patch('/assignments/:courseId/:easyfixerId', roleByName(['Admin']), valid
   } catch (e) { next(e); }
 });
 
-router.delete('/assignments/:courseId/:easyfixerId', roleByName(['Admin']), validate(assignmentParams, 'params'), async (req, res, next) => {
+router.delete('/assignments/:courseId/:easyfixerId', requireLmsManage, validate(assignmentParams, 'params'), async (req, res, next) => {
   try {
     modernOk(res, await svc.unassignCourse(req.params.courseId, req.params.easyfixerId));
   } catch (e) { next(e); }
@@ -221,9 +262,11 @@ router.delete('/assignments/:courseId/:easyfixerId', roleByName(['Admin']), vali
 
 // ─── Report ──────────────────────────────────────────────────────────
 
+// City-scoped: one row per (technician, course). See the header scope note.
 router.get('/report', validate(reportQuery, 'query'), async (req, res, next) => {
   try {
-    modernOk(res, await svc.trainingReport(req.query));
+    const scope = buildRequestScope(req);
+    modernOk(res, await svc.trainingReport({ ...req.query, scope }));
   } catch (e) { next(e); }
 });
 

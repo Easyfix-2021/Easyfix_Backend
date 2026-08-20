@@ -1443,10 +1443,24 @@ router.post('/device', validate(Joi.object({
       "UPDATE device_info SET is_logged_in = '0' WHERE user_id = ? AND device_id <> ?",
       [req.tech.efr_id, req.body.deviceId],
     );
+    /*
+     * `app_version_name` must be refreshed on the UPDATE arm, not only written
+     * on the first INSERT: a device row is created once and re-upserted on every
+     * login and token rotation, so without this the recorded build is frozen at
+     * whatever the device was running the day it first registered — which is why
+     * the column carried no usable version at all.
+     *
+     * COALESCE, not a bare VALUES(): `appVersion` is optional in the Joi schema,
+     * so an older client (or any caller that omits it) sends NULL, and a bare
+     * VALUES() would let that NULL erase a version we already knew. Keeping the
+     * last known build is strictly better than forgetting it.
+     */
     await pool.query(
       `INSERT INTO device_info (user_id, device_id, fire_base_token, app_version_name, language, is_logged_in, last_login_time)
        VALUES (?, ?, ?, ?, ?, 1, NOW())
-       ON DUPLICATE KEY UPDATE fire_base_token = VALUES(fire_base_token), is_logged_in = 1, last_login_time = NOW()`,
+       ON DUPLICATE KEY UPDATE fire_base_token = VALUES(fire_base_token),
+                               app_version_name = COALESCE(VALUES(app_version_name), app_version_name),
+                               is_logged_in = 1, last_login_time = NOW()`,
       [req.tech.efr_id, req.body.deviceId, req.body.fcmToken, req.body.appVersion || null, req.body.language || 'en']);
     // Keep the canonical push target (tbl_easyfixer_app.device_id) in sync so
     // registration-status fan-out can reach this device. Best-effort — a

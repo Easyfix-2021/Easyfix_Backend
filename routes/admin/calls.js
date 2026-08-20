@@ -3,6 +3,7 @@ const { pool } = require('../../db');
 const logger = require('../../logger');
 const validate = require('../../middleware/validate');
 const { modernOk, modernError } = require('../../utils/response');
+const { assertEntityInScope } = require('../../lib/scope');
 const kaleyra = require('../../services/kaleyra.service');
 const plivo = require('../../services/plivo.service');
 const voice = require('../../services/voice.service');
@@ -217,7 +218,10 @@ router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'
 // server-side here. Returns { ok:true, receiverMobile, receiverName,
 // receiverCustomerId, jobIdToStore, jobStatusSnapshot, jobEfrId } on success,
 // or { ok:false, status, message } the caller turns into a modernError.
-async function resolveReceiver({ jobId, customerId, efrId, reportingContactId, spocJobId, useAlt, jobContextId }) {
+//
+// `req` is taken so the efrId branch can run the RBAC city-scope check.
+// Both call sites already have it; passing it beats reaching for a global.
+async function resolveReceiver(req, { jobId, customerId, efrId, reportingContactId, spocJobId, useAlt, jobContextId }) {
   logger.info('Resolve call receiver · jobId=' + (jobId ?? '—') + ' · customerId=' + (customerId ?? '—') + ' · efrId=' + (efrId ?? '—') + ' · contactId=' + (reportingContactId ?? '—') + ' · spocJobId=' + (spocJobId ?? '—') + ' · useAlt=' + !!useAlt);
   if (jobId) {
     const [[job]] = await pool.query(
@@ -290,11 +294,21 @@ async function resolveReceiver({ jobId, customerId, efrId, reportingContactId, s
   }
   if (efrId) {
     const [[efr]] = await pool.query(
-      `SELECT efr_id, efr_first_name, efr_last_name, efr_no FROM tbl_easyfixer WHERE efr_id = ? AND NOT (tbl_easyfixer.efr_status <=> 3) LIMIT 1`,
+      `SELECT efr_id, efr_first_name, efr_last_name, efr_no, efr_cityId FROM tbl_easyfixer WHERE efr_id = ? AND NOT (tbl_easyfixer.efr_status <=> 3) LIMIT 1`,
       [efrId]
     );
     if (!efr) logger.warn('Resolve receiver · easyfixer not found · efrId=' + efrId);
     if (!efr) return { ok: false, status: 404, message: `Easyfixer ${efrId} not found` };
+    // RBAC city scope. Until 2026-08-21 ANY efrId resolved for ANY admin-group
+    // caller, so a city-scoped user could dial — and, via the audit row, learn
+    // the name of — a technician in someone else's region by guessing an id.
+    // 404 with the SAME message as "not found", never 403: the two answers must
+    // be indistinguishable or the response itself confirms the id exists. This
+    // is the convention lib/scope.js documents and routes/admin/easyfixers.js
+    // follows on every per-row route.
+    const guard = assertEntityInScope(req, { city_id: efr.efr_cityId });
+    if (!guard.ok) logger.warn('Resolve receiver · easyfixer out of scope · efrId=' + efrId + ' · ' + guard.reason);
+    if (!guard.ok) return { ok: false, status: 404, message: `Easyfixer ${efrId} not found` };
     if (!efr.efr_no) logger.warn('Resolve receiver · no easyfixer mobile · efrId=' + efrId);
     if (!efr.efr_no) return { ok: false, status: 400, message: `Easyfixer ${efrId} has no mobile on file` };
     return { ok: true, receiverMobile: efr.efr_no, receiverName: [efr.efr_first_name, efr.efr_last_name].filter(Boolean).join(' ').trim() || null, receiverCustomerId: null, jobIdToStore: jobContextId || null, jobStatusSnapshot: null, jobEfrId: null };
@@ -354,7 +368,7 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
     // ── Resolve receiver mobile + name + (optional) job context ──
     // Shared with POST /web-start via resolveReceiver() so the two paths can't
     // drift. FE never sends the customer mobile — always looked up server-side.
-    const rr = await resolveReceiver({ jobId, customerId, efrId, reportingContactId, spocJobId, useAlt, jobContextId });
+    const rr = await resolveReceiver(req, { jobId, customerId, efrId, reportingContactId, spocJobId, useAlt, jobContextId });
     if (!rr.ok) return modernError(res, rr.status, rr.message);
     const {
       receiverMobile, receiverName, receiverCustomerId,
@@ -792,7 +806,7 @@ router.post('/web-start', requireClickToCallAction, validate(clickToCallBody), a
     const { jobId, customerId, efrId, reportingContactId, spocJobId, useAlt, jobContextId } = req.body;
     const agent = req.user;
 
-    const rr = await resolveReceiver({ jobId, customerId, efrId, reportingContactId, spocJobId, useAlt, jobContextId });
+    const rr = await resolveReceiver(req, { jobId, customerId, efrId, reportingContactId, spocJobId, useAlt, jobContextId });
     // Same role derivation as /click-to-call — the participant row records WHO,
     // not just digits, so the panel can label the leg and an audit reads as people.
     const webReceiverKind = efrId ? 'technician'

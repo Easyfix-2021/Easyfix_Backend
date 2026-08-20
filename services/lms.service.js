@@ -565,11 +565,31 @@ async function assignCourse(courseId, easyfixerIds = [], options = {}) {
     // affectedRows is 1 for a fresh insert, 2 for an update of an existing row.
     if (r.affectedRows === 1) assigned += 1;
   }
-  logger.info('Course assigned · courseId=' + id + ' · new=' + assigned + ' · alreadyHeld=' + (ids.length - assigned));
+  /*
+   * Close the assignment-time completion gap immediately — see
+   * stampCompletionsForCourse. Anyone who had already watched this course's
+   * content is marked complete now, rather than being counted as pending,
+   * then overdue, and finally blocked from working for training they had
+   * already done.
+   *
+   * Best-effort: a failure here must not fail the assignment the operator
+   * just made. The worst case is the pre-existing behaviour.
+   */
+  let alreadyComplete = 0;
+  try {
+    ({ stamped: alreadyComplete } = await stampCompletionsForCourse(id, ids));
+  } catch (e) {
+    logger.warn({ err: e.message, courseId: id },
+      'Assignment-time completion stamp failed — assignment stands; some technicians may show as pending despite having finished the content');
+  }
+
+  logger.info('Course assigned · courseId=' + id + ' · new=' + assigned + ' · alreadyHeld=' + (ids.length - assigned)
+    + ' · alreadyComplete=' + alreadyComplete);
   return {
     requested: ids.length,
     assigned,
     alreadyAssigned: ids.length - assigned,
+    alreadyComplete,
     due_date: dueDate,
   };
 }
@@ -604,6 +624,56 @@ async function stampCourseCompletions(efrId) {
   );
   if (r.affectedRows > 0) {
     logger.info('Training completion stamped · efrId=' + efrId + ' · courses=' + r.affectedRows);
+  }
+  return { stamped: r.affectedRows };
+}
+
+/*
+ * Stamp completion for ONE course across MANY technicians, in one statement.
+ *
+ * WHY THIS EXISTS — a real defect, not an optimisation.
+ *
+ * stampCourseCompletions() was reachable from exactly one place: the mobile
+ * progress ping (mobile-profile-extra.service.js). So a course assigned to a
+ * technician who had ALREADY watched every video in it was never stamped —
+ * completion_date stayed NULL until he happened to re-watch something and
+ * ping again, which he has no reason to do.
+ *
+ * That is not cosmetic. hasOverdueTraining() reads completion_date and runs on
+ * every authenticated mobile request; once the due date passed, the technician
+ * was blocked from receiving jobs, continuing jobs and marking attendance —
+ * for training he had already completed. On this dataset that is not
+ * hypothetical: 2,439 technicians have watched all three induction videos to
+ * 100%, so assigning the induction course to any of them armed exactly that
+ * trap.
+ *
+ * Same predicate as stampCourseCompletions, same idempotence (only rows still
+ * NULL are touched), narrowed to one course and the technicians just assigned.
+ */
+async function stampCompletionsForCourse(courseId, easyfixerIds = []) {
+  const ids = [...new Set(easyfixerIds.map(Number).filter(Number.isFinite))];
+  if (!ids.length) return { stamped: 0 };
+  const now = new Date();
+  const [r] = await pool.query(
+    `UPDATE easyfixer_courses ec
+        SET ec.completion_date = ?, ec.updated_at = ?
+      WHERE ec.course_id = ?
+        AND ec.easyfixer_id IN (${ids.map(() => '?').join(',')})
+        AND ec.completion_date IS NULL
+        AND EXISTS (SELECT 1 FROM course_videos cv WHERE cv.course_id = ec.course_id)
+        AND NOT EXISTS (
+              SELECT 1
+                FROM course_videos cv
+                LEFT JOIN easyfixer_watched_video w
+                       ON w.video_id = cv.video_id AND w.easyfixer_id = ec.easyfixer_id
+               WHERE cv.course_id = ec.course_id
+                 AND COALESCE(w.watched_percentage, 0) < ?
+            )`,
+    [now, now, Number(courseId), ...ids, COMPLETION_PERCENT],
+  );
+  if (r.affectedRows > 0) {
+    logger.info('Assignment-time completion stamped · courseId=' + courseId
+      + ' · alreadyComplete=' + r.affectedRows);
   }
   return { stamped: r.affectedRows };
 }
@@ -746,12 +816,41 @@ async function unassignCourse(courseId, easyfixerId) {
   return { unassigned: true };
 }
 
-async function listAssignments({ courseId, easyfixerId, q, limit = 200, offset = 0 } = {}) {
+/*
+ * RBAC city scope, shared by listAssignments and trainingReport.
+ *
+ * Both are TECHNICIAN-grained, so the dimension is CITY (tbl_easyfixer
+ * .efr_cityId) — never state. `scope.states` is already expanded to the
+ * equivalent city list by buildRequestScopeWithHierarchy, so cities is the
+ * only dimension either read has to consult.
+ *
+ * It mutates the caller's `where`/`params` in place rather than returning a
+ * fragment, because BOTH functions build one WHERE string and then hand it to
+ * a page query AND a COUNT query. A scope clause that reaches only one of the
+ * two is worse than none: the rows would be filtered and the total would not,
+ * so pagination would page over a set that does not exist. Applied FIRST, so
+ * any explicit courseId/easyfixerId/q filter narrows within the allowed set.
+ *
+ * Copies the canonical shape from services/easyfixer.service.js::list.
+ * `undefined` scope (bypass roles — Admin/Finance) adds nothing.
+ */
+function applyCityScope(where, params, scope) {
+  if (!scope?.cities) return;
+  const ci = scope.cities;
+  if (ci.mode === 'none') where.push('1=0');
+  else if (ci.mode === 'allow' && ci.ids.length) {
+    where.push(`e.efr_cityId IN (${ci.ids.map(() => '?').join(',')})`);
+    params.push(...ci.ids);
+  }
+}
+
+async function listAssignments({ courseId, easyfixerId, q, scope, limit = 200, offset = 0 } = {}) {
   limit = Math.min(Math.max(Number(limit) || 200, 1), 1000);
   offset = Math.max(Number(offset) || 0, 0);
 
   const where = ['1=1'];
   const params = [];
+  applyCityScope(where, params, scope);
   if (courseId) { where.push('ec.course_id = ?'); params.push(Number(courseId)); }
   if (easyfixerId) { where.push('ec.easyfixer_id = ?'); params.push(Number(easyfixerId)); }
   if (q && String(q).trim()) {
@@ -781,6 +880,10 @@ async function listAssignments({ courseId, easyfixerId, q, limit = 200, offset =
    * COUNT(*) FROM easyfixer_courses. The WHERE clause references aliases
    * `e` and `c`, so dropping their joins turns the count into an
    * "Unknown column" 500 the moment anyone filters by name.
+   *
+   * It also reuses the SAME `whereSql` and the SAME `params` array, which is
+   * what makes the city-scope clause land on both halves automatically — the
+   * scope filter and the total can never describe different sets.
    */
   const [[{ total }]] = await pool.query(
     `SELECT COUNT(*) AS total
@@ -808,9 +911,12 @@ async function listAssignments({ courseId, easyfixerId, q, limit = 200, offset =
  * A course with NO videos yet reports 0/0 and a completion_pct of 0 rather
  * than dividing by zero — an empty course is "not complete", which is the
  * honest answer while an operator is still building it.
+ *
+ * City-scoped via applyCityScope: the report names technicians, so a
+ * region-scoped user must not read another region's roster out of it.
  */
 async function trainingReport({
-  courseId, easyfixerId, q, status,
+  courseId, easyfixerId, q, status, scope,
   limit = 200, offset = 0,
   sortBy = 'technician', sortDir = 'asc',
 } = {}) {
@@ -820,8 +926,15 @@ async function trainingReport({
   const sortExpr = REPORT_SORTABLE_COLUMNS[sortBy] || REPORT_SORTABLE_COLUMNS.technician;
   const dir = String(sortDir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
 
+  /*
+   * `params` leads with COMPLETION_PERCENT because the derived table's SELECT
+   * binds it (the videos_done subquery) BEFORE the WHERE binds anything.
+   * Scope goes in first among the WHERE params so the placeholder order
+   * matches the clause order in `where`.
+   */
   const where = ['1=1'];
   const params = [COMPLETION_PERCENT];
+  applyCityScope(where, params, scope);
   if (courseId) { where.push('ec.course_id = ?'); params.push(Number(courseId)); }
   if (easyfixerId) { where.push('ec.easyfixer_id = ?'); params.push(Number(easyfixerId)); }
   if (q && String(q).trim()) {
@@ -858,6 +971,10 @@ async function trainingReport({
    * would come back short while `total` still counted them — pagination that
    * disagrees with its own rows. Both queries below wrap the same derived
    * table so the count and the page always describe the same set.
+   *
+   * The city-scope clause lives INSIDE that derived table (it is part of
+   * `whereSql`, hence of `base`), so it is structurally impossible for the
+   * page to be scoped and the total not to be.
    */
   const completeExpr = 't.videos_total > 0 AND t.videos_done >= t.videos_total';
   /*
@@ -1072,6 +1189,7 @@ module.exports = {
   istToday,
   dueDateFrom,
   stampCourseCompletions,
+  stampCompletionsForCourse,
   pendingTraining,
   hasOverdueTraining,
   parseYouTubeUrl,
