@@ -291,6 +291,52 @@ async function attachStops(rows) {
   return rows;
 }
 
+/*
+ * DECOMPOSITION — what a Segment 1 breach is actually made of.
+ *
+ * Seg1 measures ticket-created → check-in. Both endpoints are server clocks, but
+ * the interval BETWEEN them is not all ours:
+ *
+ *   ticket created ──[ we schedule ]──[ the wait the customer ASKED for ]──[ we arrive ]──> check-in
+ *
+ * A Monday booking for a Thursday slot reads ~72h however well we performed. So
+ * a 50h average and a sub-50% pass rate are unactionable on their own — you
+ * cannot tell whether we were slow or the customer simply chose a later date.
+ *
+ * These two figures split it:
+ *   bookingLeadHours   ticket created → the appointment.  PURELY the customer's
+ *                      choice. Not a target, not scored — context.
+ *   punctualityHours   appointment → check-in. OURS. Negative = arrived early.
+ *                      This is the same comparison SDA/OTA already make.
+ *
+ * ⚠ MIDNIGHT SENTINEL. Date-only bookings (website / QR flow) store the
+ * appointment as 'YYYY-MM-DD 00:00:00' with the real hour in `requested_time`.
+ * Comparing check-in against midnight would score every such job as late by the
+ * whole working day, so a sentinel appointment yields NULL rather than a number
+ * invented out of a placeholder.
+ *
+ * original_appointment_date_time is preferred over requested_date_time: it is
+ * the FIRST promise, frozen at creation and deliberately not moved by a
+ * reschedule, so punctuality is measured against what the customer was
+ * originally told rather than a date we may have moved ourselves.
+ */
+function isMidnightSentinel(ms) {
+  if (ms == null) return false;
+  const d = new Date(ms);
+  return d.getUTCHours() === 0 && d.getUTCMinutes() === 0 && d.getUTCSeconds() === 0;
+}
+
+function decompose(row, created, checkin) {
+  const appointment = toMs(row.original_appointment_date_time) ?? toMs(row.requested_date_time);
+  const usable = appointment != null && !isMidnightSentinel(appointment);
+  return {
+    appointmentAt: iso(appointment),
+    appointmentIsDateOnly: appointment != null && !usable,
+    bookingLeadHours: (created != null && usable) ? hoursBetween(created, appointment) : null,
+    punctualityHours: (checkin != null && usable) ? hoursBetween(appointment, checkin) : null,
+  };
+}
+
 /* MySQL DATETIME (or Date) → epoch ms, or null. Never throws. */
 function toMs(v) {
   if (v == null) return null;
@@ -436,6 +482,7 @@ function computeForRow(row) {
   })();
 
   const segments = [s1, s2, s3, s4];
+  const breakdown = decompose(row, created, checkin);
 
   // STEP 6 — EF Score. Seg1 + Seg2 + Seg4 only. N/A and Pending are excluded
   // from the denominator so the score is fair.
@@ -471,6 +518,7 @@ function computeForRow(row) {
     verticalName: row.vertical_name ?? null,
     jobType,
     localitySnapshotted: row.locality_snapshotted === true,
+    ...breakdown,
     checkoutDateTime: row.checkout_date_time,
     isEstimateSent: estimateSent,
     stopClockAvailable: STOP_CLOCK_AVAILABLE,
@@ -494,6 +542,7 @@ const JOB_SELECT = `
   SELECT
     j.job_id, j.job_reference_id, j.job_status,
     j.ticket_created_date_time, j.checkin_date_time,
+    j.requested_date_time, j.original_appointment_date_time,
     j.app_checkout_date_time, j.checkout_date_time,
     j.approval_sent_on_date_time, j.no_of_req_approval,
     j.approved_on_date_time, j.approval_reject_date_time,
@@ -533,6 +582,11 @@ function summarise(scored) {
   }));
 
   const labels = { Excellent: 0, Good: 0, Partial: 0, Poor: 0, Pending: 0 };
+  // Decomposition roll-up — see decompose(). Averaged over the jobs where each
+  // figure is measurable, NOT over all jobs, so a date-only booking cannot drag
+  // the mean toward zero.
+  let leadSum = 0; let leadN = 0;
+  let punctSum = 0; let punctN = 0; let onTimeArrivals = 0;
   let efMetSum = 0;
   let efTotalSum = 0;
   let clientYes = 0;
@@ -540,6 +594,11 @@ function summarise(scored) {
 
   for (const job of scored) {
     labels[job.performance] += 1;
+    if (job.bookingLeadHours != null) { leadSum += job.bookingLeadHours; leadN += 1; }
+    if (job.punctualityHours != null) {
+      punctSum += job.punctualityHours; punctN += 1;
+      if (job.punctualityHours <= 0) onTimeArrivals += 1;
+    }
     efMetSum += job.efMet;
     efTotalSum += job.efTotal;
     if (job.segments[2].status === STATUS.YES) clientYes += 1;
@@ -576,6 +635,16 @@ function summarise(scored) {
     efMet: efMetSum,
     efTotal: efTotalSum,
     clientScorePct: metPct(clientYes, clientNo),
+    /*
+     * The Visit breakdown. avgBookingLeadHours is the customer's own chosen
+     * wait; avgPunctualityHours is ours (negative = we arrived early). Together
+     * they explain the Visit MET %, which on its own cannot distinguish "we were
+     * slow" from "they booked for next week".
+     */
+    avgBookingLeadHours: leadN ? Number((leadSum / leadN).toFixed(1)) : null,
+    avgPunctualityHours: punctN ? Number((punctSum / punctN).toFixed(1)) : null,
+    arrivedOnTimePct: punctN ? Number(((100 * onTimeArrivals) / punctN).toFixed(1)) : null,
+    punctualityMeasurable: punctN,
     clientMet: clientYes,
     clientEvaluated: clientYes + clientNo,
     labels,

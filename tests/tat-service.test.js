@@ -561,3 +561,84 @@ test('§5 · owners include OEM/Vendor — the member user_type does not have', 
   // Technician), and why separating vendor-caused delay from ours is possible.
   assert.deepEqual(tat.policy().stopOwners, ['EasyFix', 'Client', 'OEM/Vendor']);
 });
+
+// ─── Visit decomposition ─────────────────────────────────────────────
+//
+// Seg1's MET% cannot distinguish "we were slow" from "the customer booked for
+// next week". These split the interval into the customer's chosen wait and our
+// punctuality. Neither is scored — both are context for reading a Visit NO.
+
+test('decomposition splits ticket→check-in into the customer\'s wait and ours', () => {
+  const r = tat.computeForRow(row({
+    ticket_created_date_time: new Date(T0),
+    original_appointment_date_time: new Date(T0 + 72 * H),   // customer chose 3 days out
+    checkin_date_time: new Date(T0 + 73 * H),                // we arrived 1h after the slot
+    checkout_date_time: new Date(T0 + 78 * H),
+  }));
+  assert.equal(seg(r, 1).hours, 73, 'the raw Visit clock is 73h — a breach');
+  assert.equal(seg(r, 1).status, NO);
+  assert.equal(r.bookingLeadHours, 72, '72 of those 73 hours were the customer\'s own choice');
+  assert.equal(r.punctualityHours, 1, 'we were 1h late against the promise');
+});
+
+test('arriving EARLY is a negative punctuality, not a clamped zero', () => {
+  const r = tat.computeForRow(row({
+    ticket_created_date_time: new Date(T0),
+    original_appointment_date_time: new Date(T0 + 48 * H),
+    checkin_date_time: new Date(T0 + 46 * H),     // 2h early
+    checkout_date_time: new Date(T0 + 50 * H),
+  }));
+  assert.equal(r.punctualityHours, -2, 'early must read as early — clamping would hide good performance');
+});
+
+test('original_appointment wins over requested — a reschedule cannot flatter punctuality', () => {
+  // requested_date_time moves on every reschedule; original_appointment is the
+  // FIRST promise and is deliberately frozen. Measuring against the moved date
+  // would let us reschedule our way to perfect punctuality.
+  const r = tat.computeForRow(row({
+    ticket_created_date_time: new Date(T0),
+    original_appointment_date_time: new Date(T0 + 24 * H),   // what we promised
+    requested_date_time: new Date(T0 + 96 * H),              // where we moved it
+    checkin_date_time: new Date(T0 + 30 * H),
+    checkout_date_time: new Date(T0 + 34 * H),
+  }));
+  assert.equal(r.punctualityHours, 6, 'measured against the ORIGINAL promise, so 6h late');
+});
+
+test('a midnight-sentinel appointment yields NULL, not a full-day breach', () => {
+  // Date-only bookings store 'YYYY-MM-DD 00:00:00' with the real hour in
+  // requested_time. Comparing against midnight would score every such job as
+  // late by the whole working day.
+  const midnight = Date.parse('2026-08-04T00:00:00Z');
+  const r = tat.computeForRow(row({
+    ticket_created_date_time: new Date(T0),
+    original_appointment_date_time: new Date(midnight),
+    checkin_date_time: new Date(midnight + 11 * H),
+    checkout_date_time: new Date(midnight + 15 * H),
+  }));
+  assert.equal(r.appointmentIsDateOnly, true, 'the sentinel must be flagged, not silently used');
+  assert.equal(r.punctualityHours, null, 'no punctuality invented out of a placeholder');
+  assert.equal(r.bookingLeadHours, null);
+});
+
+test('a job with no appointment at all decomposes to nulls', () => {
+  const r = tat.computeForRow(row({ original_appointment_date_time: null, requested_date_time: null }));
+  assert.equal(r.bookingLeadHours, null);
+  assert.equal(r.punctualityHours, null);
+  assert.equal(r.appointmentIsDateOnly, false);
+});
+
+test('the roll-up averages only MEASURABLE jobs, and counts early arrivals as on time', () => {
+  const mk = (over) => tat.computeForRow(row({
+    ticket_created_date_time: new Date(T0), checkout_date_time: new Date(T0 + 120 * H), ...over,
+  }));
+  const s = tat.summarise([
+    mk({ original_appointment_date_time: new Date(T0 + 48 * H), checkin_date_time: new Date(T0 + 46 * H) }), // 2h early
+    mk({ original_appointment_date_time: new Date(T0 + 24 * H), checkin_date_time: new Date(T0 + 30 * H) }), // 6h late
+    mk({ original_appointment_date_time: null, requested_date_time: null }),                                  // unmeasurable
+  ]);
+  assert.equal(s.punctualityMeasurable, 2, 'the appointment-less job is excluded, not counted as 0');
+  assert.equal(s.avgPunctualityHours, 2, '(-2 + 6) / 2');
+  assert.equal(s.avgBookingLeadHours, 36, '(48 + 24) / 2');
+  assert.equal(s.arrivedOnTimePct, 50, 'the early arrival counts as on time; the 6h-late one does not');
+});
