@@ -1,0 +1,38 @@
+-- ============================================================================
+-- tbl_customer.customer_mob_no — an index for lookups that are currently scans
+--
+-- WHY, AND WHAT IT DOES *NOT* FIX.
+--
+-- Manage Jobs quick search was slow and returned strangers: searching 530280
+-- matched two unrelated jobs on their phone numbers, mid-digit (98453028|06 and
+-- 93|530280|25). That correctness half is fixed in code — a digits-only term now
+-- takes a typed path (j.job_id = ?, primary key) and the mobile is matched only
+-- when the term is long enough to BE a phone fragment, PREFIX-ANCHORED.
+--
+-- ⚠ THIS INDEX DOES NOT MAKE QUICK SEARCH FAST BY ITSELF, and it would be
+-- dishonest to file it as if it did. The search clause is a single OR across
+-- several columns, two of which (job_reference_id, client_ref_id) are matched
+-- with a LEADING wildcard:
+--
+--     (j.job_id = ? OR j.job_reference_id LIKE '%t%'
+--                   OR j.client_ref_id LIKE '%t%'
+--                   OR cu.customer_mob_no LIKE 't%')
+--
+-- MySQL can only serve an OR from indexes when EVERY branch is index-usable
+-- (index_merge union). A leading wildcard is not, so the optimiser falls back to
+-- a scan for the whole predicate no matter how many indexes exist. The
+-- structural fix is to stop OR-ing indexable and non-indexable branches together
+-- — a UNION of per-branch lookups — which is a larger change and is not this.
+--
+-- WHAT THIS INDEX IS GENUINELY FOR: the eighteen other places that filter on
+-- this column, above all the equality lookup in services/job.service.js:2704
+--
+--     SELECT customer_id FROM tbl_customer WHERE customer_mob_no = ? LIMIT 1
+--
+-- which runs on every customer resolution during job creation and today scans
+-- tbl_customer. That is the payoff; the search prefix-match is a bonus.
+--
+-- Additive only: one index, no column altered, no data rewritten.
+-- ============================================================================
+
+CREATE INDEX idx_customer_mob_no ON tbl_customer (customer_mob_no);

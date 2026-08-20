@@ -115,6 +115,71 @@ export default [
       'no-undef': 'error',
 
       /*
+       * ── THE SECOND RULE, AND WHY no-undef WAS NOT ENOUGH ────────────────
+       *
+       * On 2026-08-20 the Manage Jobs export returned "Internal Server Error"
+       * for every operator, on every filter. The cause, in routes/admin/jobs.js:
+       *
+       *     const imposed = buildExportWhere(filters).appliedDefaults || [];  // 426
+       *     …
+       *     const filters = { ...req.query, scope: req.scope, … };            // 451
+       *
+       * `filters` was READ twenty-five lines ABOVE its own declaration — the
+       * TEMPORAL DEAD ZONE. `const` is not hoisted the way `var` is, so that is
+       * a throw, not undefined:
+       *
+       *     ReferenceError: Cannot access 'filters' before initialization
+       *
+       * no-undef does NOT catch it, and that is the whole point of adding this:
+       * the identifier IS declared and IS in scope, just later. To no-undef the
+       * code is correct. It is the ENGINE that objects, at runtime, on the line.
+       *
+       * The same properties that hid the web-start 500 hid this one: the module
+       * still IMPORTS cleanly (a dead-zone read only fires when the function
+       * RUNS), so `node --check` passed, `require()` printed nothing, and the
+       * 38 tests covering that export all exercised the service beneath the
+       * route rather than the handler itself. Everything was green through a
+       * total outage of the feature.
+       *
+       * It then happened a SECOND time the same day, in the same file, from a
+       * different author who had been told about the first one — which is the
+       * argument for a rule rather than a note. Knowing about this class does
+       * not prevent it; only a check that runs does.
+       *
+       * ⚠ `variables: false` IS THE LOAD-BEARING SETTING, and it reads backwards.
+       * It does NOT mean "don't check variables". Per the rule's own docs it
+       * means: ignore a reference when the declaration is in an UPPER scope.
+       *
+       * That is exactly the line this codebase needs drawn. Measured with
+       * `variables: true` first: 20 errors, and every single one was SAFE — a
+       * module-scope const referenced from inside a function defined above it,
+       * such as WEEKDAY_RE used at whatsapp-conversation.service.js:494 and
+       * declared at :522, or `pool` in this very file. Those functions only run
+       * after the module has finished evaluating, so the binding always exists.
+       * Zero of the 20 could ever throw. Turning the rule on that way would have
+       * failed CI on day one over twenty non-bugs — precisely the outcome the
+       * header of this file warns gets a linter --no-verify'd and then deleted.
+       *
+       * With `variables: false` the rule reports only a reference whose
+       * declaration is in the SAME scope — straight-line code inside one
+       * function body. That is the export bug exactly, and it is the only shape
+       * that actually throws. Measured after: ZERO hits repo-wide, so this goes
+       * on at no cleanup cost and the gate stays green.
+       *
+       * `functions: false` is deliberate — function DECLARATIONS are hoisted and
+       * calling one above its definition is a normal, safe idiom used widely in
+       * this codebase. Only let/const/class have a dead zone, so only those are
+       * reported. `classes: false` for the same reason as functions: this repo
+       * has no class-before-use pattern to protect, and reporting it would be a
+       * style opinion rather than a runtime failure.
+       */
+      'no-use-before-define': ['error', {
+        variables: false,  // see the note above — this is the load-bearing option
+        functions: false,  // hoisted; calling one above its definition is fine
+        classes: false,
+      }],
+
+      /*
        * ── Same family: guaranteed-runtime-failure ─────────────────────────
        * All of these are "the engine will throw" or "this code provably cannot
        * behave as written". None require judgement to triage.
