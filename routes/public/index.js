@@ -108,4 +108,13 @@ router.use('/website-booking', require('./website-booking'));
  */
 router.use('/branding', require('./branding'));
 
+// Customer feedback page — public, jobId-scoped via the URL param.
+// See routes/public/feedback.js for the threat model + future
+// magic-link hardening notes.
+router.use('/feedback', require('./feedback'));
+// Customer/SPOC estimate-approval page — JWT-scoped via the URL token.
+// Token-only credential (same JWT_SECRET); see routes/public/estimate.js
+// for the threat model and idempotency guards.
+router.use('/estimate', require('./estimate'));
+
 module.exports = router;

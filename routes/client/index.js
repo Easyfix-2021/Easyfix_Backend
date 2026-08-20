@@ -16,6 +16,10 @@ const { requireGrant } = require('../../services/client-access.service');
 const perfService = require('../../services/client-performance.service');
 const tatService = require('../../services/tat.service');
 const { getTargets, judgeAgainst } = require('../../services/client-target.service');
+const holidayService = require('../../services/holiday.service');
+const noticeService = require('../../services/notice.service');
+const clientService = require('../../services/client.service');
+const clientXlsx = require('../../services/client-xlsx.service');
 
 // ─── Public: SPOC OTP login ─────────────────────────────────────────
 const identifier = Joi.alternatives(Joi.string().email(), Joi.string().pattern(/^[0-9]{10}$/));
@@ -1545,6 +1549,1660 @@ router.get('/jobs/:id/estimate-preview', async (req, res, next) => {
       already_rejected: job.approval_reject_date_time != null,
     });
   } catch (e) { next(e); }
+});
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * CLIENT-DASHBOARD ENDPOINTS
+ *
+ * Ported from the `ClientDashboard_backend` branch, ADDITIVELY. That branch
+ * forked before ~119 commits of work landed here, so merging it wholesale would
+ * have replayed its older copies of routes this file has since improved — a
+ * trial merge silently reverted `uploadJobImage`, the `/lookup/service-categories`
+ * body and an export column before it was caught. Only the routes that exist
+ * NOWHERE on this branch were taken; all 41 routes the two branches share were
+ * left exactly as they are here.
+ *
+ * The client portal (Easyfix_client_UI) cannot render without these — its
+ * dashboard, invoicing, stores, holidays and notice-badge calls were all 404ing.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+function looksLikeEmail(v) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v || '').trim());
+}
+
+async function isEmailInUse(email, excludeContactId) {
+  const v = String(email || '').trim().toLowerCase();
+  const [[ctcRow]] = await pool.query(
+    `SELECT id FROM tbl_client_contacts WHERE LOWER(contact_email) = ? AND id <> ? LIMIT 1`,
+    [v, excludeContactId]);
+  if (ctcRow) return true;
+  const [[usrRow]] = await pool.query(
+    `SELECT user_id FROM tbl_user WHERE LOWER(official_email) = ? LIMIT 1`,
+    [v]);
+  return !!usrRow;
+}
+
+async function issueChangeOtp({ otpType, target, kind }) {
+  const { generateOtp, otpExpiryDate } = require('../../utils/otp');
+  const otp = generateOtp();
+  const now = new Date();
+  const expires = otpExpiryDate(now);
+  // For change-phone, target lives in user_mobile_no; for change-email
+  // it goes in user_email. The other column stays NULL so verify can
+  // disambiguate by inspecting only the relevant one.
+  const emailCol = kind === 'email' ? target : null;
+  const mobileCol = kind === 'phone' ? target : null;
+  const [[existing]] = await pool.query(
+    `SELECT id FROM otp_details
+       WHERE otp_type = ?
+         AND ${kind === 'email' ? 'user_email' : 'user_mobile_no'} = ?
+       LIMIT 1`,
+    [otpType, target]);
+  if (existing) {
+    await pool.query(
+      `UPDATE otp_details
+          SET otp = ?, generated_on = ?, valid_up_to = ?, is_expired = 0,
+              count = count + 1,
+              user_email = ?, user_mobile_no = ?
+        WHERE id = ?`,
+      [otp, now, expires, emailCol, mobileCol, existing.id]);
+  } else {
+    await pool.query(
+      `INSERT INTO otp_details (otp, otp_type, user_email, user_mobile_no, generated_on, valid_up_to, is_expired, count)
+       VALUES (?, ?, ?, ?, ?, ?, 0, 1)`,
+      [otp, otpType, emailCol, mobileCol, now, expires]);
+  }
+  // Dev-only log so QA can grab the code without an SMS/email round-trip.
+  if (process.env.NODE_ENV !== 'production') {
+    require('../../logger').event('🔁', 'cyan',
+      `${otpType} OTP for ${target}: ${otp} (valid 5 min) — dev only`);
+  }
+  const { deliverOtp } = require('../../services/otp-delivery.service');
+  const r = await deliverOtp({
+    identifier: target,
+    email: kind === 'email' ? target : null,
+    mobile: kind === 'phone' ? target : null,
+    name: null,
+    otp,
+    contextLabel: otpType.toLowerCase().replace(/\s+/g, '-'),
+  });
+  return { delivered: !!r.finalDelivered, expiresAt: expires };
+}
+
+async function verifyChangeOtp({ otpType, target, otp, kind, spocId }) {
+  const matchCol = kind === 'email' ? 'user_email' : 'user_mobile_no';
+  const [[row]] = await pool.query(
+    `SELECT id, otp, valid_up_to, is_expired FROM otp_details
+      WHERE otp_type = ? AND ${matchCol} = ?
+      LIMIT 1`,
+    [otpType, target]);
+  if (!row) return { ok: false, reason: 'NO_OTP_ISSUED' };
+  if (row.is_expired || new Date(row.valid_up_to).getTime() < Date.now()) {
+    await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
+    return { ok: false, reason: 'OTP_EXPIRED' };
+  }
+  if (Number(row.otp) !== Number(otp)) return { ok: false, reason: 'OTP_MISMATCH' };
+  await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
+  const updateCol = kind === 'email' ? 'contact_email' : 'contact_no';
+  await pool.query(
+    `UPDATE tbl_client_contacts SET ${updateCol} = ? WHERE id = ?`,
+    [target, spocId]);
+  return { ok: true };
+}
+
+// Reuses the multer binding this file already requires for client job images
+// (`multerClientImg`, above) rather than requiring the module a second time —
+// the ported branch called it plain `multer`.
+const contactUpload = multerClientImg({
+  storage: multerClientImg.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024, files: 1 },
+});
+
+async function loadOwnedContact(req, res) {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) {
+    modernError(res, 400, 'invalid contact id');
+    return null;
+  }
+  const [[row]] = await pool.query(
+    'SELECT id, client_id FROM tbl_client_contacts WHERE id = ? LIMIT 1',
+    [id]
+  );
+  if (!row || row.client_id !== req.spoc.client_id) {
+    modernError(res, 404, 'contact not found');
+    return null;
+  }
+  return row;
+}
+
+router.get('/notices/unread-count', async (req, res, next) => {
+  try {
+    // We could push this into the service, but a direct COUNT against
+    // the active-window filter is cheaper than fetching + decorating
+    // rows just to throw away everything except the unread total.
+    // Mirrors the same `is active for the client surface` predicate
+    // used inside listActiveForSurface for parity.
+    const [[{ unread }]] = await pool.query(
+      `SELECT COUNT(*) AS unread
+         FROM tbl_notice n
+        WHERE FIND_IN_SET('client', n.target_surfaces)
+          AND n.status IN ('published', 'scheduled')
+          AND (n.publish_at IS NULL OR n.publish_at <= NOW())
+          AND (n.expire_at  IS NULL OR n.expire_at  >  NOW())
+          AND NOT EXISTS (
+            SELECT 1 FROM tbl_notice_read r
+             WHERE r.notice_id   = n.notice_id
+               AND r.surface     = 'client'
+               AND r.reader_type = 'client'
+               AND r.reader_id   = ?
+          )`,
+      [req.spoc.id]
+    );
+    modernOk(res, { count: Number(unread) || 0 });
+  } catch (e) { next(e); }
+});
+
+router.patch('/notices/:id/read', async (req, res, next) => {
+  try {
+    const noticeId = Number(req.params.id);
+    if (!Number.isInteger(noticeId) || noticeId <= 0) {
+      return modernError(res, 400, 'invalid notice id');
+    }
+    // Idempotent — INSERT IGNORE inside markRead means duplicate
+    // taps are no-ops. We don't bother verifying the notice exists +
+    // is visible: a stale read-receipt row pointing at a deleted
+    // notice is harmless (and the FK-less schema tolerates it).
+    await noticeService.markRead({
+      noticeId,
+      surface: 'client',
+      readerType: 'client',
+      readerId: req.spoc.id,
+    });
+    modernOk(res, { ok: true });
+  } catch (e) { next(e); }
+});
+
+router.patch('/notices/read-all', async (req, res, next) => {
+  try {
+    // Bulk mark-all. One INSERT … SELECT covers the current active
+    // window in a single round-trip. The `WHERE NOT EXISTS` guard
+    // makes this idempotent without relying on the UNIQUE index
+    // throwing duplicate-key errors.
+    await pool.query(
+      `INSERT INTO tbl_notice_read (notice_id, surface, reader_type, reader_id)
+       SELECT n.notice_id, 'client', 'client', ?
+         FROM tbl_notice n
+        WHERE FIND_IN_SET('client', n.target_surfaces)
+          AND n.status IN ('published', 'scheduled')
+          AND (n.publish_at IS NULL OR n.publish_at <= NOW())
+          AND (n.expire_at  IS NULL OR n.expire_at  >  NOW())
+          AND NOT EXISTS (
+            SELECT 1 FROM tbl_notice_read r
+             WHERE r.notice_id   = n.notice_id
+               AND r.surface     = 'client'
+               AND r.reader_type = 'client'
+               AND r.reader_id   = ?
+          )`,
+      [req.spoc.id, req.spoc.id]
+    );
+    modernOk(res, { ok: true });
+  } catch (e) { next(e); }
+});
+
+/*
+ * SPOC-scoped Google Maps proxy.
+ *
+ * Thin wrappers around services/maps.service.* — the same service the
+ * admin and magic-link mounts use. SPOC JWT auth is already enforced
+ * by requireSpocAuth above, so no extra token gate is needed here.
+ *
+ *   GET /maps/autocomplete?q=<text>           — Places Autocomplete
+ *   GET /maps/reverse-geocode?latlng=lat,lng  — Reverse geocode
+ *   GET /maps/geocode?place_id=... | &address=... — Forward / by-id
+ *
+ * Keeps the GOOGLE_MAPS_API_KEY server-side; the FE never sees it.
+ */
+router.get('/maps/autocomplete', async (req, res, next) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    if (q.length < 3) return modernOk(res, { suggestions: [] });
+    const mapsService = require('../../services/maps.service');
+    const out = await mapsService.autocomplete(q);
+    modernOk(res, out);
+  } catch (e) {
+    if (e && e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
+router.get('/maps/reverse-geocode', async (req, res, next) => {
+  try {
+    const latlng = String(req.query.latlng || '').trim();
+    if (!/^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/.test(latlng)) {
+      return modernError(res, 400, 'latlng must be "lat,lng"');
+    }
+    const mapsService = require('../../services/maps.service');
+    const out = await mapsService.geocode({ latlng });
+    modernOk(res, out);
+  } catch (e) {
+    if (e && e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
+/*
+ * Forward geocode — used by the Select Address autocomplete flow:
+ * SPOC picks a Place suggestion, FE sends its place_id here, we resolve
+ * lat/lng + formatted_address + address_components in one shot.
+ */
+router.get('/maps/geocode', async (req, res, next) => {
+  try {
+    const place_id = req.query.place_id ? String(req.query.place_id) : null;
+    const address  = req.query.address  ? String(req.query.address)  : null;
+    if (!place_id && !address) {
+      return modernError(res, 400, 'place_id or address required');
+    }
+    const mapsService = require('../../services/maps.service');
+    const out = await mapsService.geocode({ place_id, address });
+    modernOk(res, out);
+  } catch (e) {
+    if (e && e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
+/*
+ * GET /api/client/customers/mobile/:mobile/addresses
+ *
+ * Saved-address book for a customer. Path:
+ *   customer mobile  → tbl_customer.customer_id
+ *   → tbl_job.fk_address_id  (rows for this customer at THIS client)
+ *   → tbl_address rows (deduped)
+ *
+ * Scoped to the SPOC's own client (j.fk_client_id = req.spoc.client_id)
+ * so a customer who has booked at multiple brands doesn't leak their
+ * address from brand A into brand B's portal.
+ *
+ * Returns the latest 20 distinct addresses. Empty array if the customer
+ * has never been booked at this client.
+ */
+router.get('/customers/mobile/:mobile/addresses', async (req, res, next) => {
+  try {
+    const mobile = String(req.params.mobile || '').trim();
+    if (!/^\d{10}$/.test(mobile)) {
+      return modernOk(res, { items: [] });
+    }
+    const [[cust]] = await pool.query(
+      'SELECT customer_id FROM tbl_customer WHERE customer_mob_no = ? ORDER BY customer_id DESC LIMIT 1',
+      [mobile]
+    );
+    if (!cust) return modernOk(res, { items: [] });
+
+    // GROUP BY in MySQL 5.7+ is permissive on the non-aggregated cols
+    // we pull; LIMIT 20 keeps the wire payload small for chatty
+    // customers with hundreds of historical bookings.
+    const [rows] = await pool.query(
+      `SELECT a.address_id, a.address, a.building, a.landmark, a.locality,
+              a.city_id, a.pin_code, a.gps_location, a.mobile_number,
+              c.city_name,
+              MAX(j.job_id) AS latest_job_id
+         FROM tbl_address a
+         JOIN tbl_job     j ON j.fk_address_id = a.address_id
+         LEFT JOIN tbl_city c ON c.city_id     = a.city_id
+        WHERE j.fk_customer_id = ?
+          AND j.fk_client_id   = ?
+        GROUP BY a.address_id
+        ORDER BY latest_job_id DESC
+        LIMIT 20`,
+      [cust.customer_id, req.spoc.client_id]
+    );
+    modernOk(res, { items: rows });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/client/dashboard-summary
+ *
+ * Powers the new Summary Dashboard landing page. Returns three
+ * payloads in a single round-trip so the FE renders without a
+ * cascade of fetches:
+ *
+ *   counts:           Headline KPI numbers (5 cards).
+ *   statusBreakdown:  Slice array for the donut chart, in display order.
+ *   recentEscalations: Top 5 most-recent escalated jobs, for the
+ *                      "Need attention" list.
+ *
+ * Scope (always team-wide for now — per design decision):
+ *   reporting_contact_id IN (req.spoc.id ∪ direct-reports-of-spoc)
+ *
+ * Date scope: omitted on v1 — counts are lifetime. A date picker
+ * would slot in here as `startDate`/`endDate` query params; the
+ * BETWEEN clause would attach to j.ticket_created_date_time. Left
+ * out for v1 simplicity.
+ *
+ * Performance: each sub-payload is a single COUNT/SELECT that hits
+ * the (fk_client_id, job_status) compound coverage on tbl_job. With
+ * the existing FK_tbl_job_client + idx_tbl_job_status indexes the
+ * planner can range-scan; on prod-sized tbl_job (~481k rows) the
+ * whole endpoint resolves in well under 200ms.
+ */
+router.get('/dashboard-summary', async (req, res, next) => {
+  try {
+    // Resolve the SPOC's team scope — themself + everyone who reports
+    // to them. Mirrors the legacy ClientController.java lines 101-111
+    // "my team's tickets" expansion. Stays in-process (no JOIN) so we
+    // can reuse the same id list across all three sub-queries.
+    const [reports] = await pool.query(
+      `SELECT id FROM tbl_client_contacts
+        WHERE client_id = ?
+          AND manager_id IS NOT NULL AND manager_id NOT IN ('', 'null')
+          AND CAST(manager_id AS UNSIGNED) = ?`,
+      [req.spoc.client_id, req.spoc.id]
+    );
+    const teamIds = reports.map((r) => r.id);
+    teamIds.push(req.spoc.id);
+    const teamPlaceholders = teamIds.map(() => '?').join(',');
+
+    // Single COUNT … FILTER over the team-scope. One scan, five
+    // SUM(CASE) — keeps the round-trips and join cost flat compared
+    // to firing five COUNT(*) queries.
+    const [[counts]] = await pool.query(
+      `SELECT
+         SUM(CASE WHEN j.job_status = 9                                 THEN 1 ELSE 0 END) AS newTickets,
+         SUM(CASE WHEN j.job_status IN (0, 1, 2, 20)                    THEN 1 ELSE 0 END) AS inProgress,
+         SUM(CASE WHEN j.job_status IN (3, 5)                           THEN 1 ELSE 0 END) AS completed,
+         SUM(CASE WHEN j.job_status = 6                                 THEN 1 ELSE 0 END) AS cancelled,
+         SUM(CASE WHEN r.is_escalated = 1                               THEN 1 ELSE 0 END) AS escalated
+       FROM   tbl_job j
+       LEFT   JOIN tbl_easyfixer_rating_by_customer r ON r.job_id = j.job_id
+       WHERE  j.fk_client_id        = ?
+         AND  j.reporting_contact_id IN (${teamPlaceholders})`,
+      [req.spoc.client_id, ...teamIds]
+    );
+
+    // Donut slices — return labels + colours pre-baked so the FE just
+    // maps to SVG. Order is the lifecycle-natural reading order.
+    // Colours match the brand palette + the badge colours used on
+    // the Order History "Status of Order" column.
+    const [breakdownRows] = await pool.query(
+      `SELECT j.job_status, COUNT(*) AS n
+         FROM tbl_job j
+        WHERE j.fk_client_id        = ?
+          AND j.reporting_contact_id IN (${teamPlaceholders})
+        GROUP BY j.job_status`,
+      [req.spoc.client_id, ...teamIds]
+    );
+    const STATUS_GROUPS = [
+      { label: 'New',         statuses: [9],            color: '#f59e0b' }, // amber
+      { label: 'Scheduled',   statuses: [0, 1],         color: '#3b82f6' }, // blue
+      { label: 'In Progress', statuses: [2, 20],        color: '#8b5cf6' }, // violet
+      { label: 'Completed',   statuses: [3, 5],         color: '#10b981' }, // emerald
+      { label: 'Under Audit', statuses: [10],           color: '#06b6d4' }, // cyan
+      { label: 'Cancelled',   statuses: [6],            color: '#ef4444' }, // rose
+      { label: 'On Hold',     statuses: [15, 21],       color: '#64748b' }, // slate
+    ];
+    const byStatus = new Map(breakdownRows.map((r) => [Number(r.job_status), Number(r.n)]));
+    const statusBreakdown = STATUS_GROUPS.map((g) => ({
+      label: g.label,
+      count: g.statuses.reduce((sum, s) => sum + (byStatus.get(s) || 0), 0),
+      color: g.color,
+    })).filter((s) => s.count > 0); // hide empty slices
+
+    // Top 5 most-recent escalations. Joined with the rating row to
+    // get the escalation reason, and with the customer for the
+    // display name. ORDER BY job_id DESC is a safe proxy for "most
+    // recent" without depending on rating_date_time (column legacy-
+    // unreliable on some rows).
+    const [recentEscalations] = await pool.query(
+      `SELECT j.job_id, j.client_ref_id, j.job_status,
+              cu.customer_name, cu.customer_mob_no,
+              ef.efr_name AS easyfixer_name,
+              r.review_comment, r.customer_rating
+         FROM tbl_job j
+         JOIN tbl_easyfixer_rating_by_customer r ON r.job_id = j.job_id
+         LEFT JOIN tbl_customer  cu ON cu.customer_id = j.fk_customer_id
+         LEFT JOIN tbl_easyfixer ef ON ef.efr_id      = j.fk_easyfixter_id
+        WHERE r.is_escalated         = 1
+          AND j.fk_client_id         = ?
+          AND j.reporting_contact_id IN (${teamPlaceholders})
+        ORDER BY j.job_id DESC
+        LIMIT 5`,
+      [req.spoc.client_id, ...teamIds]
+    );
+
+    // ─── Home-page KPI boxes ──────────────────────────────────────────
+    // New Tickets / Waiting for Allocation / Running Late — all derived
+    // from tbl_job over the same team scope (no rating join here, so a
+    // job with multiple rating rows can't double-count).
+    //   waitingForAllocation : requested time passed, still scheduled/
+    //                          unconfirmed (0,1), NO technician assigned.
+    //   runningLate          : same, but a technician IS assigned and the
+    //                          job still hasn't progressed.
+    const [[jobBoxes]] = await pool.query(
+      `SELECT
+         SUM(CASE WHEN j.job_status = 9 THEN 1 ELSE 0 END) AS newTickets,
+         SUM(CASE WHEN j.job_status IN (0,1)
+                   AND j.requested_date_time <= NOW()
+                   AND j.fk_easyfixter_id IS NULL     THEN 1 ELSE 0 END) AS waitingForAllocation,
+         SUM(CASE WHEN j.job_status IN (0,1)
+                   AND j.requested_date_time <= NOW()
+                   AND j.fk_easyfixter_id IS NOT NULL THEN 1 ELSE 0 END) AS runningLate
+         FROM tbl_job j
+        WHERE j.fk_client_id        = ?
+          AND j.reporting_contact_id IN (${teamPlaceholders})`,
+      [req.spoc.client_id, ...teamIds]
+    );
+
+    // Estimate Approved / Rejected — count the LATEST estimate per job
+    // (greatest sent_on, id as tie-breaker) whose job is still live
+    // (not completed/cancelled/enquiry: 3,5,6,7), team-scoped.
+    // tbl_estimate_details.status: 1 = Approved, 2 = Rejected (0 = Sent).
+    const [[estBoxes]] = await pool.query(
+      `SELECT
+         SUM(CASE WHEN ed.status = 1 THEN 1 ELSE 0 END) AS estimateApproved,
+         SUM(CASE WHEN ed.status = 2 THEN 1 ELSE 0 END) AS estimateRejected
+         FROM tbl_estimate_details ed
+         JOIN tbl_job j ON j.job_id = ed.job_id
+        WHERE j.fk_client_id        = ?
+          AND j.reporting_contact_id IN (${teamPlaceholders})
+          AND j.job_status NOT IN (3,5,6,7)
+          AND NOT EXISTS (
+            SELECT 1 FROM tbl_estimate_details e2
+             WHERE e2.job_id = ed.job_id
+               AND (e2.sent_on > ed.sent_on
+                    OR (e2.sent_on = ed.sent_on AND e2.id > ed.id))
+          )`,
+      [req.spoc.client_id, ...teamIds]
+    );
+
+    // ─── Performance by City / Store ─────────────────────────────────
+    // Per-city orders / completed / on-time% / avg TAT, team-scoped.
+    // On-time = a completed job checked out on or before its original
+    // committed appointment date. Avg TAT = ticket-created → checkout in
+    // 24h-days. Top 6 cities by volume.
+    const [cityRows] = await pool.query(
+      `SELECT ci.city_name AS city,
+              COUNT(*)                                              AS orders,
+              SUM(CASE WHEN j.job_status IN (3,5) THEN 1 ELSE 0 END) AS completed,
+              SUM(CASE WHEN j.job_status IN (3,5)
+                        AND j.checkout_date_time IS NOT NULL
+                        AND (j.original_appointment_date_time IS NULL
+                             OR DATE(j.checkout_date_time) <= DATE(j.original_appointment_date_time))
+                       THEN 1 ELSE 0 END)                           AS on_time,
+              AVG(CASE WHEN j.job_status IN (3,5) AND j.checkout_date_time IS NOT NULL
+                       THEN TIMESTAMPDIFF(HOUR, j.ticket_created_date_time, j.checkout_date_time)/24.0
+                       END)                                         AS avg_tat_days
+         FROM tbl_job j
+         LEFT JOIN tbl_address ad ON ad.address_id = j.fk_address_id
+         LEFT JOIN tbl_city    ci ON ci.city_id    = ad.city_id
+        WHERE j.fk_client_id        = ?
+          AND j.reporting_contact_id IN (${teamPlaceholders})
+          AND ci.city_name IS NOT NULL
+        GROUP BY ci.city_name
+        ORDER BY orders DESC
+        LIMIT 6`,
+      [req.spoc.client_id, ...teamIds]
+    );
+    const cityPerformance = cityRows.map((r) => {
+      const orders = Number(r.orders) || 0;
+      const completed = Number(r.completed) || 0;
+      const onTime = Number(r.on_time) || 0;
+      return {
+        city: r.city,
+        orders,
+        completed,
+        onTimePct: completed ? Math.round((onTime / completed) * 100) : null,
+        avgTatDays: r.avg_tat_days != null ? Number(Number(r.avg_tat_days).toFixed(1)) : null,
+      };
+    });
+
+    // ─── SLA breaches by aging ───────────────────────────────────────
+    // Active jobs (not completed/cancelled/enquiry) whose committed
+    // appointment (requested_date_time) is already in the past — i.e.
+    // overdue — bucketed by how many days late they are.
+    const [[sla]] = await pool.query(
+      `SELECT
+         SUM(CASE WHEN d BETWEEN 0 AND 1 THEN 1 ELSE 0 END) AS d01,
+         SUM(CASE WHEN d BETWEEN 2 AND 3 THEN 1 ELSE 0 END) AS d23,
+         SUM(CASE WHEN d BETWEEN 4 AND 7 THEN 1 ELSE 0 END) AS d47,
+         SUM(CASE WHEN d > 7            THEN 1 ELSE 0 END) AS d7plus
+       FROM (
+         SELECT DATEDIFF(NOW(), j.requested_date_time) AS d
+           FROM tbl_job j
+          WHERE j.fk_client_id        = ?
+            AND j.reporting_contact_id IN (${teamPlaceholders})
+            AND j.job_status IN (0,1,2,20,9,15,21)
+            AND j.requested_date_time IS NOT NULL
+            AND j.requested_date_time < NOW()
+       ) t`,
+      [req.spoc.client_id, ...teamIds]
+    );
+
+    // Invoices due (client-level) — feeds the "Needs attention" card.
+    const [[invDue]] = await pool.query(
+      `SELECT COUNT(*) AS cnt,
+              COALESCE(SUM(total_invoice_amount - COALESCE(total_paid_amount,0)),0) AS amt
+         FROM tbl_client_invoice
+        WHERE fk_client_id = ? AND is_raised = 1
+          AND (total_invoice_amount - COALESCE(total_paid_amount,0)) > 0`,
+      [req.spoc.client_id]
+    );
+
+    // Actionable order buckets for "Needs attention" — team-scoped.
+    //   estimatePending : status 15 — estimate awaiting the client's approval
+    //   noResponse      : call_later = 1 — customer not reachable / call not picked
+    //   onHold          : status 21 — fulfilment on hold (items/parts/approval pending)
+    //   revisit         : completed (3,5) with a revisit created, not yet billed
+    const [[attn]] = await pool.query(
+      `SELECT
+         SUM(CASE WHEN j.job_status = 15 THEN 1 ELSE 0 END) AS estimatePending,
+         SUM(CASE WHEN j.call_later = 1  THEN 1 ELSE 0 END) AS noResponse,
+         SUM(CASE WHEN j.job_status = 21 THEN 1 ELSE 0 END) AS onHold,
+         SUM(CASE WHEN j.job_status IN (3,5) AND j.sub_job_id IS NOT NULL
+                   AND j.ready_for_billing = 'No' THEN 1 ELSE 0 END) AS revisit,
+         SUM(CASE WHEN j.ready_for_billing = 'Yes' THEN 1 ELSE 0 END) AS qcDone
+         FROM tbl_job j
+        WHERE j.fk_client_id = ? AND j.reporting_contact_id IN (${teamPlaceholders})`,
+      [req.spoc.client_id, ...teamIds]
+    );
+
+    // ─── 30-day orders trend ─────────────────────────────────────────
+    // Received (created) vs Completed (checked out) per day, last 30 days,
+    // team-scoped. Grouped by day in SQL; JS fills the gap days with zero
+    // so the chart always has exactly 30 points.
+    const [createdRows] = await pool.query(
+      `SELECT DATE_FORMAT(j.ticket_created_date_time,'%Y-%m-%d') AS d, COUNT(*) AS n
+         FROM tbl_job j
+        WHERE j.fk_client_id = ? AND j.reporting_contact_id IN (${teamPlaceholders})
+          AND j.ticket_created_date_time >= DATE_SUB(CURDATE(), INTERVAL 29 DAY)
+        GROUP BY d`,
+      [req.spoc.client_id, ...teamIds]
+    );
+    const [completedRows] = await pool.query(
+      `SELECT DATE_FORMAT(j.checkout_date_time,'%Y-%m-%d') AS d, COUNT(*) AS n
+         FROM tbl_job j
+        WHERE j.fk_client_id = ? AND j.reporting_contact_id IN (${teamPlaceholders})
+          AND j.job_status IN (3,5)
+          AND j.checkout_date_time >= DATE_SUB(CURDATE(), INTERVAL 29 DAY)
+        GROUP BY d`,
+      [req.spoc.client_id, ...teamIds]
+    );
+    const createdMap   = new Map(createdRows.map((r) => [r.d, Number(r.n) || 0]));
+    const completedMap = new Map(completedRows.map((r) => [r.d, Number(r.n) || 0]));
+    const ymd = (dt) => `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
+    const trend = [];
+    const today = new Date();
+    for (let i = 29; i >= 0; i--) {
+      const dt = new Date(today);
+      dt.setDate(today.getDate() - i);
+      const key = ymd(dt);
+      trend.push({ date: key, created: createdMap.get(key) || 0, completed: completedMap.get(key) || 0 });
+    }
+
+    // Category & work-type mix — orders per service category. Replaces the
+    // status breakdown on the dashboard (status is already in the KPI cards).
+    // Team-scoped, top 6 by volume, colours pre-baked for the donut.
+    const CAT_COLORS = ['#2f6bff', '#10b981', '#7c5cff', '#F39C12', '#e11d48', '#06b6d4'];
+    const [catRows] = await pool.query(
+      `SELECT COALESCE(sc.service_catg_name, 'Other') AS name, COUNT(*) AS n
+         FROM tbl_job j
+         LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = j.fk_service_catg_id
+        WHERE j.fk_client_id = ? AND j.reporting_contact_id IN (${teamPlaceholders})
+        GROUP BY name
+        ORDER BY n DESC
+        LIMIT 6`,
+      [req.spoc.client_id, ...teamIds]
+    );
+    const categoryBreakdown = catRows.map((r, i) => ({
+      label: r.name,
+      count: Number(r.n) || 0,
+      color: CAT_COLORS[i % CAT_COLORS.length],
+    }));
+
+    // Recent tickets — latest jobs (team-scoped) for the "Recent tickets"
+    // table, with real status codes the FE maps to pills.
+    const [recentRows] = await pool.query(
+      `SELECT j.job_id, j.client_ref_id, j.job_status, j.requested_date_time,
+              cu.customer_name, ci.city_name, ef.efr_name AS easyfixer_name
+         FROM tbl_job j
+         LEFT JOIN tbl_customer  cu ON cu.customer_id = j.fk_customer_id
+         LEFT JOIN tbl_address   ad ON ad.address_id  = j.fk_address_id
+         LEFT JOIN tbl_city      ci ON ci.city_id     = ad.city_id
+         LEFT JOIN tbl_easyfixer ef ON ef.efr_id      = j.fk_easyfixter_id
+        WHERE j.fk_client_id = ? AND j.reporting_contact_id IN (${teamPlaceholders})
+        ORDER BY j.job_id DESC
+        LIMIT 8`,
+      [req.spoc.client_id, ...teamIds]
+    );
+    const recentTickets = recentRows.map((r) => ({
+      jobId:    r.job_id,
+      ref:      r.client_ref_id,
+      customer: r.customer_name,
+      city:     r.city_name,
+      tech:     r.easyfixer_name,
+      status:   Number(r.job_status),
+      when:     r.requested_date_time,
+    }));
+
+    return modernOk(res, {
+      boxes: {
+        newTickets:           Number(jobBoxes.newTickets)           || 0,
+        waitingForAllocation: Number(jobBoxes.waitingForAllocation) || 0,
+        runningLate:          Number(jobBoxes.runningLate)          || 0,
+        estimateApproved:     Number(estBoxes.estimateApproved)     || 0,
+        estimateRejected:     Number(estBoxes.estimateRejected)     || 0,
+      },
+      cityPerformance,
+      slaAging: {
+        d01:    Number(sla?.d01)    || 0,
+        d23:    Number(sla?.d23)    || 0,
+        d47:    Number(sla?.d47)    || 0,
+        d7plus: Number(sla?.d7plus) || 0,
+      },
+      attention: {
+        invoicesDue:     { count: Number(invDue?.cnt) || 0, amount: Number(invDue?.amt) || 0 },
+        estimatePending: Number(attn?.estimatePending) || 0,
+        noResponse:      Number(attn?.noResponse) || 0,
+        onHold:          Number(attn?.onHold) || 0,
+        revisit:         Number(attn?.revisit) || 0,
+        qcDone:          Number(attn?.qcDone) || 0,
+      },
+      trend,
+      counts: {
+        newTickets: Number(counts.newTickets) || 0,
+        inProgress: Number(counts.inProgress) || 0,
+        completed:  Number(counts.completed)  || 0,
+        cancelled:  Number(counts.cancelled)  || 0,
+        escalated:  Number(counts.escalated)  || 0,
+      },
+      statusBreakdown,
+      categoryBreakdown,
+      recentTickets,
+      recentEscalations,
+      teamSize: teamIds.length, // for the "across N SPOCs" footer
+    });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/client/invoices — the client's raised invoices + aging.
+ *
+ * Client-level (NOT team-scoped) — invoices live in tbl_client_invoice
+ * keyed by fk_client_id. Returns:
+ *   summary : billed / collected / outstanding totals + count
+ *   aging   : the OUTSTANDING amount split by days past the due date
+ *             (0–30 / 31–60 / 60+), for the "what's overdue" view
+ *   items   : the invoice list, newest first (blank numbers/dates in
+ *             legacy rows are normalised to null so the FE shows "—")
+ * Powers the /invoices page and the dashboard "invoice due" alert.
+ */
+router.get('/invoices', async (req, res, next) => {
+  try {
+    const clientId = req.spoc.client_id;
+    logger.info('Fetch client invoices · clientId=' + clientId);
+
+    const [[summary]] = await pool.query(
+      `SELECT COALESCE(SUM(total_invoice_amount),0)                                   AS billed,
+              COALESCE(SUM(total_paid_amount),0)                                       AS collected,
+              COALESCE(SUM(total_invoice_amount - COALESCE(total_paid_amount,0)),0)    AS outstanding,
+              COUNT(*)                                                                 AS count
+         FROM tbl_client_invoice
+        WHERE fk_client_id = ? AND is_raised = 1`,
+      [clientId]
+    );
+
+    const [[aging]] = await pool.query(
+      `SELECT COALESCE(SUM(CASE WHEN days <= 30           THEN due ELSE 0 END),0) AS a0_30,
+              COALESCE(SUM(CASE WHEN days BETWEEN 31 AND 60 THEN due ELSE 0 END),0) AS a31_60,
+              COALESCE(SUM(CASE WHEN days > 60            THEN due ELSE 0 END),0) AS a60plus,
+              COUNT(*)                                                            AS unpaid
+         FROM (SELECT (total_invoice_amount - COALESCE(total_paid_amount,0)) AS due,
+                      DATEDIFF(NOW(), amount_due_date)                        AS days
+                 FROM tbl_client_invoice
+                WHERE fk_client_id = ? AND is_raised = 1
+                  AND (total_invoice_amount - COALESCE(total_paid_amount,0)) > 0) t`,
+      [clientId]
+    );
+
+    const [rows] = await pool.query(
+      `SELECT id, invoice_number, invoice_date, amount_due_date,
+              total_invoice_amount, total_paid_amount,
+              (total_invoice_amount - COALESCE(total_paid_amount,0)) AS due_amount,
+              is_paid, file_path_pdf
+         FROM tbl_client_invoice
+        WHERE fk_client_id = ? AND is_raised = 1
+        ORDER BY (invoice_date IS NULL), invoice_date DESC, id DESC
+        LIMIT 300`,
+      [clientId]
+    );
+
+    const items = rows.map((r) => {
+      const total = Number(r.total_invoice_amount) || 0;
+      const paid  = Number(r.total_paid_amount) || 0;
+      const due   = Number(r.due_amount) || 0;
+      const status = (Number(r.is_paid) === 1 || due <= 0) ? 'paid' : (paid > 0 ? 'partial' : 'unpaid');
+      return {
+        id: r.id,
+        invoiceNumber: (String(r.invoice_number || '').trim()) || null,
+        invoiceDate: r.invoice_date,
+        dueDate: r.amount_due_date,
+        total, paid, due, status,
+        pdfPath: (r.file_path_pdf && String(r.file_path_pdf).trim()) ? r.file_path_pdf : null,
+      };
+    });
+
+    return modernOk(res, {
+      summary: {
+        billed:      Number(summary.billed) || 0,
+        collected:   Number(summary.collected) || 0,
+        outstanding: Number(summary.outstanding) || 0,
+        count:       Number(summary.count) || 0,
+      },
+      aging: {
+        a0_30:   Number(aging.a0_30) || 0,
+        a31_60:  Number(aging.a31_60) || 0,
+        a60plus: Number(aging.a60plus) || 0,
+        unpaid:  Number(aging.unpaid) || 0,
+      },
+      items,
+    });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/client/stores — the client's store / branch directory (active
+ * rows). Powers the store-code picker on the New Order form.
+ */
+router.get('/stores', async (req, res, next) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, store_code, store_name, contact_name, contact_no,
+              address, city_id, city_name, pin_code
+         FROM tbl_client_store
+        WHERE fk_client_id = ? AND status = 1
+        ORDER BY store_code`,
+      [req.spoc.client_id]
+    );
+    modernOk(res, { items: rows });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/client/stores/lookup?code=STR-142 — resolve one store by its
+ * code for the logged-in client. Returns { store: null } on no match so
+ * the New Order flow stays non-blocking.
+ */
+router.get('/stores/lookup', async (req, res, next) => {
+  try {
+    const code = String(req.query.code || '').trim();
+    if (!code) return modernOk(res, { store: null });
+    const [[row]] = await pool.query(
+      `SELECT id, store_code, store_name, contact_name, contact_no,
+              address, city_id, city_name, pin_code
+         FROM tbl_client_store
+        WHERE fk_client_id = ? AND status = 1 AND store_code = ?
+        LIMIT 1`,
+      [req.spoc.client_id, code]
+    );
+    modernOk(res, { store: row || null });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/client/holidays — upcoming holidays for the dashboard's
+ * holiday calendar. Uses the shared holiday.service (code-maintained
+ * Indian holiday list) — same source the admin holidays screen uses.
+ * `?days=` window, default 30, capped at 30 by the service.
+ */
+router.get('/holidays', async (req, res, next) => {
+  try {
+    const days = Number(req.query.days) > 0 ? Number(req.query.days) : 30;
+    const items = await holidayService.getUpcoming({ days });
+    modernOk(res, { items });
+  } catch (e) { next(e); }
+});
+
+// ─── My-New-Tickets tab counts ───────────────────────────────────────
+// Single endpoint returning all three tab counts so the Client_UI can
+// refresh the badges on a single round-trip after an Authorize action.
+// Mirrors the legacy SharedService.getBucketData([9], …) bus on the
+// Angular dashboard.
+//
+// Filters (cityIds, ownerIds, startDate/endDate, q) are respected so
+// the counts always agree with the visible table when those filters
+// are active. SQL: one SELECT, three COUNT(...) inside CASE — saves
+// two round-trips and keeps the WHERE clause identical across counts.
+router.get('/tickets/counts', async (req, res, next) => {
+  try {
+    // Shared filter clauses — NOT including the status=9 pin (legacy
+    // noResponse case doesn't pin it, so we apply per-CASE inside the
+    // SUM expressions below).
+    const where = [];
+    const params = [];
+    where.push('j.fk_client_id = ?'); params.push(req.spoc.client_id);
+
+    const toIdArr = (v) => String(v).split(',')
+      .map((s) => Number(s.trim())).filter((n) => !Number.isNaN(n));
+    if (req.query.cityIds) {
+      const arr = toIdArr(req.query.cityIds);
+      if (arr.length) { where.push(`ad.city_id IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
+    }
+    if (req.query.ownerIds) {
+      const arr = toIdArr(req.query.ownerIds);
+      if (arr.length) { where.push(`j.job_owner IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
+    }
+    if (req.query.startDate) { where.push('j.created_date_time >= ?'); params.push(req.query.startDate); }
+    if (req.query.endDate)   { where.push('j.created_date_time <= ?'); params.push(req.query.endDate); }
+    if (req.query.q) {
+      where.push('(j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ?)');
+      const v = `%${req.query.q}%`;
+      params.push(v, v, v, v);
+    }
+    // Apply the same "my team's tickets" scope as GET /jobs so the tab
+    // badges count what's actually visible inside each tab. Without
+    // this, counts would over-report (whole-client total) while the
+    // list shows only the SPOC's own + reports' rows.
+    {
+      const [reports] = await pool.query(
+        `SELECT id FROM tbl_client_contacts
+          WHERE client_id = ?
+            AND manager_id IS NOT NULL AND manager_id NOT IN ('', 'null')
+            AND CAST(manager_id AS UNSIGNED) = ?`,
+        [req.spoc.client_id, req.spoc.id]
+      );
+      const ids = reports.map((r) => r.id);
+      ids.push(req.spoc.id);
+      where.push(`j.reporting_contact_id IN (${ids.map(() => '?').join(',')})`);
+      params.push(...ids);
+    }
+
+    // Compose join set — only pull in tables WHERE references. The SUM
+    // expressions ALWAYS need ccs (for the unauthorized branch) and
+    // status pinning for the first two CASEs, so we join unconditionally.
+    const w = where.join(' AND ');
+    const needsCu = /\bcu\./.test(w);
+    const needsAd = /\bad\./.test(w);
+    const joins = `
+      FROM tbl_job j
+      ${needsCu ? 'LEFT JOIN tbl_customer cu ON cu.customer_id = j.fk_customer_id' : ''}
+      ${needsAd ? 'LEFT JOIN tbl_address  ad ON ad.address_id  = j.fk_address_id' : ''}
+      LEFT JOIN tbl_client_contacts ccs ON ccs.id = j.reporting_contact_id
+    `;
+
+    // Per-bucket CASE expressions mirror jobService.list ticketFlag SQL
+    // exactly — keep them in sync if you tweak one.
+    const [[row]] = await pool.query(
+      `SELECT
+         SUM(CASE WHEN j.job_status = 9
+                   AND j.approved_by_client = 0
+                   AND (j.call_later IS NULL OR j.call_later != 1)
+                   AND ccs.manager_id IS NOT NULL
+                   AND ccs.manager_id NOT IN ('', 'null')
+                   AND ccs.approval_by_client = 1
+                  THEN 1 ELSE 0 END) AS unauthorized,
+         SUM(CASE WHEN j.job_status = 9
+                   AND (j.approved_by_client != 0 OR j.approved_by_client IS NULL)
+                   AND (j.call_later IS NULL OR j.call_later != 1)
+                  THEN 1 ELSE 0 END) AS authorized,
+         SUM(CASE WHEN j.call_later = 1 THEN 1 ELSE 0 END) AS noResponse
+       ${joins}
+       WHERE ${w}`,
+      params
+    );
+    modernOk(res, {
+      unauthorized: Number(row.unauthorized || 0),
+      authorized:   Number(row.authorized   || 0),
+      noResponse:   Number(row.noResponse   || 0),
+    });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/client/orders/counts — tab counts for the My Order History page.
+ *
+ * Legacy parity: subscribes to bucketCountState$ on the Angular
+ * OrderHistoryComponent (ngOnInit lines 157-163) populating
+ * otherOrdersCount + completedForBillingOrdersCount.
+ *
+ * Returns:
+ *   { otherOrders: N, completedOrders: M }
+ *
+ * Filter contract identical to /jobs so badges stay in sync with the
+ * table. completedOrders is auto-scoped to the SPOC's team (matches
+ * legacy ClientController.java:101 + /jobs route).
+ */
+router.get('/orders/counts', async (req, res, next) => {
+  try {
+    // Lookup SPOC's direct reports once — used only for the
+    // completedOrders scope (otherOrders is whole-client per legacy).
+    const [reports] = await pool.query(
+      `SELECT id FROM tbl_client_contacts
+        WHERE client_id = ?
+          AND manager_id IS NOT NULL AND manager_id NOT IN ('', 'null')
+          AND CAST(manager_id AS UNSIGNED) = ?`,
+      [req.spoc.client_id, req.spoc.id]
+    );
+    const teamIds = reports.map((r) => r.id);
+    teamIds.push(req.spoc.id);
+    const teamPh = teamIds.map(() => '?').join(',');
+
+    // Shared filter clauses applied to both counts.
+    const sharedWhere = ['j.fk_client_id = ?'];
+    const sharedParams = [req.spoc.client_id];
+
+    const toIdArr = (v) => String(v).split(',')
+      .map((s) => Number(s.trim())).filter((n) => !Number.isNaN(n));
+    if (req.query.cityIds) {
+      const arr = toIdArr(req.query.cityIds);
+      if (arr.length) { sharedWhere.push(`ad.city_id IN (${arr.map(() => '?').join(',')})`); sharedParams.push(...arr); }
+    }
+    if (req.query.ownerIds) {
+      const arr = toIdArr(req.query.ownerIds);
+      if (arr.length) { sharedWhere.push(`j.job_owner IN (${arr.map(() => '?').join(',')})`); sharedParams.push(...arr); }
+    }
+    if (req.query.startDate) { sharedWhere.push('j.created_date_time >= ?'); sharedParams.push(req.query.startDate); }
+    if (req.query.endDate)   { sharedWhere.push('j.created_date_time <= ?'); sharedParams.push(req.query.endDate); }
+    if (req.query.q) {
+      sharedWhere.push('(j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ?)');
+      const v = `%${req.query.q}%`;
+      sharedParams.push(v, v, v, v);
+    }
+
+    const w = sharedWhere.join(' AND ');
+    const needsCu = /\bcu\./.test(w);
+    const needsAd = /\bad\./.test(w);
+    const joins = `
+      FROM tbl_job j
+      ${needsCu ? 'LEFT JOIN tbl_customer cu ON cu.customer_id = j.fk_customer_id' : ''}
+      ${needsAd ? 'LEFT JOIN tbl_address  ad ON ad.address_id  = j.fk_address_id' : ''}
+    `;
+
+    // Two parallel COUNTs — kept separate (rather than SUM(CASE)) because
+    // otherOrders is whole-client while completedOrders is team-scoped,
+    // so the WHERE shapes diverge.
+    const [[[other]], [[completed]]] = await Promise.all([
+      pool.query(`SELECT COUNT(*) AS n ${joins} WHERE ${w}`, sharedParams),
+      pool.query(
+        `SELECT COUNT(*) AS n ${joins}
+          WHERE ${w}
+            AND j.ready_for_billing = 'Yes'
+            AND j.sub_job_id IS NULL
+            AND j.reporting_contact_id IN (${teamPh})`,
+        [...sharedParams, ...teamIds]
+      ),
+    ]);
+
+    modernOk(res, {
+      otherOrders:     Number(other.n     || 0),
+      completedOrders: Number(completed.n || 0),
+    });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/client/appointments/counts — tab counts for the Committed
+ * Appointments page.
+ *
+ * Legacy parity: UpcomingAppointmentsComponent.ngOnInit subscribes to
+ * bucketCountState$ for unAllocatedJobsCount + allocatedJobsCount +
+ * ongoingOrders (status [0, 1]).
+ *
+ * Three tabs scoped to SPOC's team:
+ *   txUnallocated  — status=0, fk_easyfixter_id IS NULL
+ *   txAllocated    — status=0, fk_easyfixter_id IS NOT NULL
+ *   ongoingOrders  — status=1
+ */
+router.get('/appointments/counts', async (req, res, next) => {
+  try {
+    const [reports] = await pool.query(
+      `SELECT id FROM tbl_client_contacts
+        WHERE client_id = ?
+          AND manager_id IS NOT NULL AND manager_id NOT IN ('', 'null')
+          AND CAST(manager_id AS UNSIGNED) = ?`,
+      [req.spoc.client_id, req.spoc.id]
+    );
+    const teamIds = reports.map((r) => r.id);
+    teamIds.push(req.spoc.id);
+    const teamPh = teamIds.map(() => '?').join(',');
+
+    const where = ['j.fk_client_id = ?'];
+    const params = [req.spoc.client_id];
+
+    const toIdArr = (v) => String(v).split(',')
+      .map((s) => Number(s.trim())).filter((n) => !Number.isNaN(n));
+    if (req.query.cityIds) {
+      const arr = toIdArr(req.query.cityIds);
+      if (arr.length) { where.push(`ad.city_id IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
+    }
+    if (req.query.ownerIds) {
+      const arr = toIdArr(req.query.ownerIds);
+      if (arr.length) { where.push(`j.job_owner IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
+    }
+    if (req.query.startDate) { where.push('j.created_date_time >= ?'); params.push(req.query.startDate); }
+    if (req.query.endDate)   { where.push('j.created_date_time <= ?'); params.push(req.query.endDate); }
+    if (req.query.q) {
+      where.push('(j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ?)');
+      const v = `%${req.query.q}%`;
+      params.push(v, v, v, v);
+    }
+
+    const w = where.join(' AND ');
+    const needsCu = /\bcu\./.test(w);
+    const needsAd = /\bad\./.test(w);
+    const joins = `
+      FROM tbl_job j
+      ${needsCu ? 'LEFT JOIN tbl_customer cu ON cu.customer_id = j.fk_customer_id' : ''}
+      ${needsAd ? 'LEFT JOIN tbl_address  ad ON ad.address_id  = j.fk_address_id' : ''}
+    `;
+
+    // Bind order: SQL placeholders are consumed in textual order.
+    // The three SELECT CASE expressions come BEFORE the WHERE clause
+    // in the text, so their teamIds must be bound first, then the
+    // shared WHERE params.
+    const [[row]] = await pool.query(
+      `SELECT
+         SUM(CASE WHEN j.job_status = 0 AND j.fk_easyfixter_id IS NULL
+                   AND j.reporting_contact_id IN (${teamPh})
+                  THEN 1 ELSE 0 END) AS txUnallocated,
+         SUM(CASE WHEN j.job_status = 0 AND j.fk_easyfixter_id IS NOT NULL
+                   AND j.reporting_contact_id IN (${teamPh})
+                  THEN 1 ELSE 0 END) AS txAllocated,
+         SUM(CASE WHEN j.job_status = 1
+                   AND j.reporting_contact_id IN (${teamPh})
+                  THEN 1 ELSE 0 END) AS ongoingOrders
+       ${joins}
+       WHERE ${w}`,
+      [...teamIds, ...teamIds, ...teamIds, ...params]
+    );
+    modernOk(res, {
+      txUnallocated: Number(row.txUnallocated || 0),
+      txAllocated:   Number(row.txAllocated   || 0),
+      ongoingOrders: Number(row.ongoingOrders || 0),
+    });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/client/under-audit/counts — tab counts for the Under Audit page.
+ *
+ * Legacy parity: UnderAuditComponent.ngOnInit subscribes to
+ * bucketCountState$ for revisitJobsCount + txCompletedOnAppJobsCount.
+ *
+ * Two tabs scoped to SPOC's team:
+ *   revisit         — status IN (3, 5), sub_job_id NOT NULL,
+ *                     ready_for_billing = 'No'    (the "visit done" flag)
+ *   completedOnApp  — status = 10
+ */
+router.get('/under-audit/counts', async (req, res, next) => {
+  try {
+    const [reports] = await pool.query(
+      `SELECT id FROM tbl_client_contacts
+        WHERE client_id = ?
+          AND manager_id IS NOT NULL AND manager_id NOT IN ('', 'null')
+          AND CAST(manager_id AS UNSIGNED) = ?`,
+      [req.spoc.client_id, req.spoc.id]
+    );
+    const teamIds = reports.map((r) => r.id);
+    teamIds.push(req.spoc.id);
+    const teamPh = teamIds.map(() => '?').join(',');
+
+    const where = ['j.fk_client_id = ?'];
+    const params = [req.spoc.client_id];
+
+    const toIdArr = (v) => String(v).split(',')
+      .map((s) => Number(s.trim())).filter((n) => !Number.isNaN(n));
+    if (req.query.cityIds) {
+      const arr = toIdArr(req.query.cityIds);
+      if (arr.length) { where.push(`ad.city_id IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
+    }
+    if (req.query.ownerIds) {
+      const arr = toIdArr(req.query.ownerIds);
+      if (arr.length) { where.push(`j.job_owner IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
+    }
+    if (req.query.startDate) { where.push('j.created_date_time >= ?'); params.push(req.query.startDate); }
+    if (req.query.endDate)   { where.push('j.created_date_time <= ?'); params.push(req.query.endDate); }
+    if (req.query.q) {
+      where.push('(j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ?)');
+      const v = `%${req.query.q}%`;
+      params.push(v, v, v, v);
+    }
+
+    const w = where.join(' AND ');
+    const needsCu = /\bcu\./.test(w);
+    const needsAd = /\bad\./.test(w);
+    const joins = `
+      FROM tbl_job j
+      ${needsCu ? 'LEFT JOIN tbl_customer cu ON cu.customer_id = j.fk_customer_id' : ''}
+      ${needsAd ? 'LEFT JOIN tbl_address  ad ON ad.address_id  = j.fk_address_id' : ''}
+    `;
+
+    // Bind order: SELECT CASE placeholders fill before WHERE.
+    const [[row]] = await pool.query(
+      `SELECT
+         SUM(CASE WHEN j.job_status IN (3, 5)
+                   AND j.sub_job_id IS NOT NULL
+                   AND j.ready_for_billing = 'No'
+                   AND j.reporting_contact_id IN (${teamPh})
+                  THEN 1 ELSE 0 END) AS revisit,
+         SUM(CASE WHEN j.job_status = 10
+                   AND j.reporting_contact_id IN (${teamPh})
+                  THEN 1 ELSE 0 END) AS completedOnApp
+       ${joins}
+       WHERE ${w}`,
+      [...teamIds, ...teamIds, ...params]
+    );
+    modernOk(res, {
+      revisit:        Number(row.revisit        || 0),
+      completedOnApp: Number(row.completedOnApp || 0),
+    });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/client/client-delay/counts — tab counts for the Client Delay page.
+ *
+ * Legacy parity: MyApprovalsComponent.ngOnInit subscribes to
+ * bucketCountState$ for estimateJobsCount + fulfillmentJobCount +
+ * unAuthorisedJobsCount (status [15, 21, 9]).
+ *
+ * Filters: same shape as /jobs (date / city / team / search) so the
+ * badges reflect what the user will see when they click a tab.
+ *
+ * Scoping: all three tabs use "my team's tickets" scope.
+ */
+router.get('/client-delay/counts', async (req, res, next) => {
+  try {
+    // SPOC's team ids (self + direct reports)
+    const [reports] = await pool.query(
+      `SELECT id FROM tbl_client_contacts
+        WHERE client_id = ?
+          AND manager_id IS NOT NULL AND manager_id NOT IN ('', 'null')
+          AND CAST(manager_id AS UNSIGNED) = ?`,
+      [req.spoc.client_id, req.spoc.id]
+    );
+    const teamIds = reports.map((r) => r.id);
+    teamIds.push(req.spoc.id);
+    const teamPh = teamIds.map(() => '?').join(',');
+
+    const where = ['j.fk_client_id = ?'];
+    const params = [req.spoc.client_id];
+
+    const toIdArr = (v) => String(v).split(',')
+      .map((s) => Number(s.trim())).filter((n) => !Number.isNaN(n));
+    if (req.query.cityIds) {
+      const arr = toIdArr(req.query.cityIds);
+      if (arr.length) { where.push(`ad.city_id IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
+    }
+    if (req.query.ownerIds) {
+      const arr = toIdArr(req.query.ownerIds);
+      if (arr.length) { where.push(`j.job_owner IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
+    }
+    if (req.query.startDate) { where.push('j.created_date_time >= ?'); params.push(req.query.startDate); }
+    if (req.query.endDate)   { where.push('j.created_date_time <= ?'); params.push(req.query.endDate); }
+    if (req.query.q) {
+      where.push('(j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ?)');
+      const v = `%${req.query.q}%`;
+      params.push(v, v, v, v);
+    }
+    const w = where.join(' AND ');
+    const needsCu = /\bcu\./.test(w);
+    const needsAd = /\bad\./.test(w);
+    const joins = `
+      FROM tbl_job j
+      ${needsCu ? 'LEFT JOIN tbl_customer cu ON cu.customer_id = j.fk_customer_id' : ''}
+      ${needsAd ? 'LEFT JOIN tbl_address  ad ON ad.address_id  = j.fk_address_id' : ''}
+      LEFT JOIN tbl_client_contacts ccs ON ccs.id = j.reporting_contact_id
+    `;
+
+    const [[row]] = await pool.query(
+      `SELECT
+         SUM(CASE WHEN j.job_status = 15 AND j.reporting_contact_id IN (${teamPh})
+                  THEN 1 ELSE 0 END) AS approveEstimate,
+         SUM(CASE WHEN j.job_status = 21 AND j.reporting_contact_id IN (${teamPh})
+                  THEN 1 ELSE 0 END) AS fulfilmentOnHold,
+         SUM(CASE WHEN j.job_status = 9
+                   AND j.approved_by_client = 0
+                   AND (j.call_later IS NULL OR j.call_later != 1)
+                   AND ccs.manager_id IS NOT NULL
+                   AND ccs.manager_id NOT IN ('', 'null')
+                   AND ccs.approval_by_client = 1
+                   AND j.reporting_contact_id IN (${teamPh})
+                  THEN 1 ELSE 0 END) AS unauthorized
+       ${joins}
+       WHERE ${w}`,
+      // teamIds first — placeholders in SELECT CASE come before WHERE.
+      [...teamIds, ...teamIds, ...teamIds, ...params]
+    );
+    modernOk(res, {
+      approveEstimate:  Number(row.approveEstimate  || 0),
+      fulfilmentOnHold: Number(row.fulfilmentOnHold || 0),
+      unauthorized:     Number(row.unauthorized     || 0),
+    });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/client/technicians — easyfixers mapped to the SPOC's client.
+ *
+ * Mapped via tbl_client_easyfixer_mapping (one row per (client, easyfixer,
+ * service_type)). A single tech can carry many service types per client,
+ * so we DISTINCT on efr_id and GROUP_CONCAT service-type names into a
+ * single comma-separated column the FE shows as chips.
+ *
+ * Per-row payload:
+ *   id, name, mobile, email, city, status, skill_rating, tool_rating,
+ *   service_types (CSV string), avg_rating (NULL if never rated),
+ *   total_jobs (count for this client only).
+ *
+ * Query params:
+ *   status     — "true" (active only — default), "false" (inactive),
+ *                "all" (everyone). Matches the legacy ?status= contract.
+ *   cityIds    — CSV, narrows by efr city.
+ *   q          — substring search across name / mobile / email.
+ *   limit/offset — pagination (default 50, capped at 500).
+ */
+router.get('/technicians', async (req, res, next) => {
+  try {
+    const statusParam = String(req.query.status || 'true').toLowerCase();
+    const where = ['m.client_id = ?', 'm.mapping_status = 1'];
+    const params = [req.spoc.client_id];
+
+    if (statusParam === 'true')       { where.push('e.efr_status = 1'); }
+    else if (statusParam === 'false') { where.push('(e.efr_status = 0 OR e.efr_status IS NULL)'); }
+    // 'all' → no status clause
+
+    if (req.query.cityIds) {
+      const arr = String(req.query.cityIds).split(',')
+        .map((s) => Number(s.trim())).filter((n) => !Number.isNaN(n));
+      if (arr.length) {
+        where.push(`e.efr_cityId IN (${arr.map(() => '?').join(',')})`);
+        params.push(...arr);
+      }
+    }
+    if (req.query.q) {
+      where.push('(e.efr_name LIKE ? OR e.efr_no LIKE ? OR e.efr_email LIKE ?)');
+      const v = `%${req.query.q}%`;
+      params.push(v, v, v);
+    }
+
+    const limit  = Math.min(Number(req.query.limit) || 50, 500);
+    const offset = Number(req.query.offset) || 0;
+
+    // Total distinct count for pagination
+    const [[{ total }]] = await pool.query(
+      `SELECT COUNT(DISTINCT e.efr_id) AS total
+         FROM tbl_client_easyfixer_mapping m
+         JOIN tbl_easyfixer e ON e.efr_id = m.easyfixer_id
+         LEFT JOIN tbl_city ci ON ci.city_id = e.efr_cityId
+        WHERE ${where.join(' AND ')}`,
+      params
+    );
+
+    // List query — GROUP BY collapses duplicate mapping rows per efr.
+    //
+    // Chips on the FE card now show CATEGORIES (Carpentry, Electrician,
+    // …) instead of individual service types — a tech mapped to 8
+    // service types under "Carpentry" used to render 8 chips + "+5 more";
+    // collapsed to category-level it's just 1–2 chips, far cleaner.
+    //
+    // service_categories pulled via GROUP_CONCAT(DISTINCT) joining
+    // tbl_service_type → tbl_service_catg through service_catg_id.
+    // DISTINCT dedupes naturally so "Carpentry" appears once even when
+    // a tech has 10 carpentry-bucket service types.
+    //
+    // service_types is kept for callers that still need the granular
+    // list (e.g. potential future detail panel) — same field name as
+    // before, no breaking change.
+    //
+    // avg_rating + total_jobs are correlated subqueries scoped to THIS
+    // client only (legacy parity: client should see ratings on its own
+    // jobs, not a global average).
+    /*
+     * Perf rewrite (2026-06-10): the previous single-query version
+     * embedded TWO correlated subqueries (avg_rating + total_jobs)
+     * directly in the SELECT list. Each subquery scanned the 481k-row
+     * tbl_job — fine on a small client (12 techs × milliseconds) but
+     * on a tech-heavy client (~2,400+ mapped techs) the planner did
+     * scans even after LIMIT 12 was applied, pushing wall-clock time
+     * past 80 seconds and timing the route out → HTTP 500 on the FE.
+     *
+     * The rewrite splits into TWO round-trips:
+     *   (1) Page query — pure JOINs, no subqueries → returns 12 techs
+     *   (2) Aggregate query — single SELECT with IN-list of those 12
+     *       efr_ids → returns {avg_rating, total_jobs} per tech in
+     *       one shot.
+     * Then we merge in JS and return. Total wall-clock drops from
+     * ~90s to ~150ms on the same client.
+     */
+    const [rows] = await pool.query(
+      `SELECT e.efr_id AS id,
+              e.efr_name AS name,
+              e.efr_no AS mobile,
+              e.efr_email AS email,
+              e.efr_status AS status,
+              e.skill_rating,
+              e.tool_rating,
+              ci.city_name AS city,
+              GROUP_CONCAT(DISTINCT st.service_type_name ORDER BY st.service_type_name SEPARATOR ',') AS service_types,
+              GROUP_CONCAT(DISTINCT sc.service_catg_name ORDER BY sc.service_catg_name SEPARATOR ',') AS service_categories
+         FROM tbl_client_easyfixer_mapping m
+         JOIN tbl_easyfixer e   ON e.efr_id = m.easyfixer_id
+         LEFT JOIN tbl_city ci  ON ci.city_id = e.efr_cityId
+         LEFT JOIN tbl_service_type st ON st.service_type_id = m.service_type_id
+         LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = st.service_catg_id
+        WHERE ${where.join(' AND ')}
+        GROUP BY e.efr_id
+        ORDER BY e.efr_name ASC
+        LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+
+    // Step 2 — aggregate ratings + job counts for ONLY the page's
+    // 12 techs. One SELECT, two indexed (efr_id) IN-list scans. The
+    // ratings JOIN is scoped to the SPOC's own client so we don't
+    // mix in another client's reviews.
+    if (rows.length > 0) {
+      const efrIds = rows.map((r) => r.id);
+      const placeholders = efrIds.map(() => '?').join(',');
+      const [aggRows] = await pool.query(
+        `SELECT e.efr_id AS id,
+                (SELECT ROUND(AVG(r.customer_rating), 1)
+                   FROM tbl_easyfixer_rating_by_customer r
+                   JOIN tbl_job j2 ON j2.job_id = r.job_id
+                  WHERE r.easyfixer_id = e.efr_id
+                    AND j2.fk_client_id = ?
+                    AND r.customer_rating IS NOT NULL
+                    AND r.customer_rating > 0
+                ) AS avg_rating,
+                (SELECT COUNT(*) FROM tbl_job j3
+                  WHERE j3.fk_easyfixter_id = e.efr_id
+                    AND j3.fk_client_id = ?
+                ) AS total_jobs
+           FROM tbl_easyfixer e
+          WHERE e.efr_id IN (${placeholders})`,
+        [req.spoc.client_id, req.spoc.client_id, ...efrIds]
+      );
+      // Index by efr_id for O(1) merge below.
+      const aggBy = new Map(aggRows.map((a) => [a.id, a]));
+      rows.forEach((r) => {
+        const a = aggBy.get(r.id);
+        r.avg_rating = a?.avg_rating ?? null;
+        r.total_jobs = a?.total_jobs ?? 0;
+      });
+    }
+
+    modernOk(res, { items: rows, total });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/client/lookup/cities
+ *
+ * Two modes:
+ *   default      — cities the SPOC's client has actually raised jobs in
+ *                  (typically a handful; keeps filter dropdowns tight)
+ *   ?scope=all   — every active city in tbl_city (~472 rows). Used by
+ *                  the New Order form where the SPOC may book in a
+ *                  city the client hasn't operated in before.
+ */
+router.get('/lookup/cities', async (req, res, next) => {
+  try {
+    const scope = String(req.query.scope || '').toLowerCase();
+    if (scope === 'all') {
+      // Every city in tbl_city (no status filter) — the client wants the
+      // full master list available in the New Order form. Columns are still
+      // aliased to { id, name } for the FE dropdown contract.
+      const [rows] = await pool.query(
+        `SELECT city_id AS id, city_name AS name
+           FROM tbl_city
+          ORDER BY city_name ASC`
+      );
+      return modernOk(res, { items: rows });
+    }
+    const [rows] = await pool.query(
+      `SELECT DISTINCT ci.city_id AS id, ci.city_name AS name
+         FROM tbl_job j
+         LEFT JOIN tbl_address ad ON ad.address_id = j.fk_address_id
+         LEFT JOIN tbl_city    ci ON ci.city_id    = ad.city_id
+        WHERE j.fk_client_id = ? AND ci.city_id IS NOT NULL
+        ORDER BY ci.city_name ASC`,
+      [req.spoc.client_id]
+    );
+    modernOk(res, { items: rows });
+  } catch (e) { next(e); }
+});
+
+// Client team members eligible to own jobs — used by the "Client Team"
+// multi-select. Reuses tbl_client_contacts (the same table our SPOC
+// auth lives in) so the IDs returned here are job_owner-compatible.
+router.get('/team/members', async (req, res, next) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, contact_name AS name, contact_email AS email
+         FROM tbl_client_contacts
+        WHERE client_id = ? AND status = 1
+        ORDER BY contact_name ASC`,
+      [req.spoc.client_id]
+    );
+    modernOk(res, { items: rows });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/client/jobs/:id/images/:imageId — stream a job image to the
+ * browser. Scoped to SPOC's client_id (other clients' images 404 even
+ * when the imageId is known).
+ *
+ * Resolution mirrors the admin route (routes/admin/jobs.js:1831):
+ *   1. S3 (if enabled) — 302 to a presigned URL
+ *   2. Local file under UPLOAD_JOB_FILES — res.sendFile
+ *   3. FILE_BASE_URL absolute — 302 to Nginx-served path
+ *   4. 404
+ *
+ * Powers the Jobsheet button + the gallery thumbnails on the detail page.
+ */
+router.get('/jobs/:id/images/:imageId', async (req, res, next) => {
+  try {
+    const jobId   = Number(req.params.id);
+    const imageId = Number(req.params.imageId);
+    if (!Number.isInteger(jobId) || !Number.isInteger(imageId)) {
+      return modernError(res, 400, 'invalid id');
+    }
+
+    // Scope: image must belong to a job in this SPOC's client.
+    const [[row]] = await pool.query(
+      `SELECT i.image_id, i.job_id, i.image
+         FROM tbl_job_image i
+         JOIN tbl_job j ON j.job_id = i.job_id
+        WHERE i.image_id = ? AND i.job_id = ? AND j.fk_client_id = ?
+        LIMIT 1`,
+      [imageId, jobId, req.spoc.client_id]
+    );
+    if (!row || !row.image) return modernError(res, 404, 'image not found');
+
+    const stored = String(row.image).trim();
+    const path = require('path');
+    const fs = require('fs');
+
+    // (1) S3 — presigned URL redirect
+    try {
+      const s3Storage = require('../../utils/s3-storage');
+      if (s3Storage.isEnabled && s3Storage.isEnabled()) {
+        const candidates = [stored];
+        if (!stored.startsWith('Job_Images/') && !stored.startsWith('JobSupportings/')) {
+          candidates.push(`JobSupportings/${path.basename(stored)}`);
+          candidates.push(`Job_Images/${path.basename(stored)}`);
+        }
+        for (const key of candidates) {
+          try {
+            if (await s3Storage.exists(key)) {
+              const url = await s3Storage.getPresignedUrl(key);
+              return res.redirect(url);
+            }
+          } catch { /* fall through to local */ }
+        }
+      }
+    } catch { /* s3 module not available — fall through */ }
+
+    // (2) Local file
+    const rootCandidates = [
+      process.env.UPLOAD_JOB_FILES,
+      process.env.UPLOAD_ROOT_PATH,
+      './uploads/upload_jobs',
+      './uploads',
+    ].filter(Boolean);
+    const relForms = [stored, path.basename(stored)];
+    for (const root of rootCandidates) {
+      const absRoot = path.resolve(root);
+      for (const rel of relForms) {
+        const candidate = path.resolve(absRoot, rel.replace(/^\/+/, ''));
+        if (!candidate.startsWith(absRoot + path.sep) && candidate !== absRoot) continue;
+        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+          return res.sendFile(candidate);
+        }
+      }
+    }
+
+    // (3) Absolute FILE_BASE_URL — Nginx fallback
+    const fileBase = process.env.FILE_BASE_URL || '';
+    if (/^https?:\/\//i.test(fileBase)) {
+      const url = stored.includes('/')
+        ? `${fileBase.replace(/\/+$/, '')}/${stored.replace(/^\/+/, '')}`
+        : `${fileBase.replace(/\/+$/, '')}/upload_jobs/${stored}`;
+      return res.redirect(url);
+    }
+
+    return modernError(res, 404, 'image file not found on disk');
+  } catch (e) { next(e); }
+});
+
+router.post('/profile/change-email/send-otp', async (req, res, next) => {
+  try {
+    const newEmail = String(req.body?.new_email || '').trim().toLowerCase();
+    if (!looksLikeEmail(newEmail)) {
+      return modernError(res, 400, 'new_email must be a valid email address');
+    }
+    if (newEmail === String(req.spoc.contact_email || '').trim().toLowerCase()) {
+      return modernError(res, 400, 'This is already your current email');
+    }
+    if (await isEmailInUse(newEmail, req.spoc.id)) {
+      return modernError(res, 409, 'This email is already registered with another account');
+    }
+    const r = await issueChangeOtp({
+      otpType: 'Change Email',
+      target: newEmail,
+      kind: 'email',
+    });
+    modernOk(res, { delivered: r.delivered, expiresAt: r.expiresAt });
+  } catch (e) { next(e); }
+});
+
+router.post('/profile/change-email/verify-otp', async (req, res, next) => {
+  try {
+    const newEmail = String(req.body?.new_email || '').trim().toLowerCase();
+    const otp = Number(req.body?.otp);
+    if (!looksLikeEmail(newEmail)) {
+      return modernError(res, 400, 'new_email must be a valid email address');
+    }
+    if (!Number.isInteger(otp) || otp < 1000 || otp > 9999) {
+      return modernError(res, 400, 'otp must be a 4-digit number');
+    }
+    if (await isEmailInUse(newEmail, req.spoc.id)) {
+      return modernError(res, 409, 'This email is already registered with another account');
+    }
+    const r = await verifyChangeOtp({
+      otpType: 'Change Email',
+      target: newEmail,
+      otp,
+      kind: 'email',
+      spocId: req.spoc.id,
+    });
+    if (!r.ok) return modernError(res, 401, r.reason);
+    modernOk(res, { updated: true, contact_email: newEmail }, 'Email updated');
+  } catch (e) { next(e); }
+});
+
+router.get('/contacts', async (req, res, next) => {
+  try {
+    const rows = await clientService.listContacts(req.spoc.client_id);
+    // Project only the columns the FE table actually needs — keeps
+    // the wire payload small and hides legacy internal columns
+    // (manager_id, created_by, etc.) that the SPOC shouldn't see.
+    const items = rows.map((r) => ({
+      id: r.id,
+      contact_name:  r.contact_name,
+      contact_email: r.contact_email,
+      contact_no:    r.contact_no,
+      contact_alt_no: r.contact_alt_no,
+      contact_desgn: r.contact_desgn,
+      status:        r.status,
+    }));
+    modernOk(res, { items });
+  } catch (e) { next(e); }
+});
+
+router.delete('/contacts/:id', async (req, res, next) => {
+  try {
+    if (!(await loadOwnedContact(req, res))) return;
+    const affected = await clientService.deleteContact(req.params.id);
+    if (!affected) return modernError(res, 404, 'contact not found');
+    modernOk(res, { deleted: true });
+  } catch (e) { next(e); }
+});
+
+router.get('/contacts/template', async (req, res, next) => {
+  try {
+    const buf = await clientXlsx.buildSpocTemplate();
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="contacts-template.xlsx"');
+    res.send(buf);
+  } catch (e) { next(e); }
+});
+
+router.post('/contacts/bulk-upload', contactUpload.single('file'), async (req, res, next) => {
+  try {
+    if (!req.file) return modernError(res, 400, 'missing "file" upload');
+    const { rows } = await clientXlsx.parseSpocUpload(req.file.buffer);
+    const summary = { total: rows.length, created: 0, skipped: 0, invalid: 0 };
+    const results = [];
+    for (const r of rows) {
+      if (r.status === 'invalid') {
+        summary.invalid++;
+        results.push({ rowNumber: r.rowNumber, status: 'invalid', errors: r.errors });
+        continue;
+      }
+      // SPOC-side rule: designation mandatory. The shared XLSX parser
+      // leaves it optional (admin parity), so re-validate per row here.
+      if (!r.payload?.contactDesgn || !String(r.payload.contactDesgn).trim()) {
+        summary.invalid++;
+        results.push({
+          rowNumber: r.rowNumber,
+          status: 'invalid',
+          errors: ['designation is required'],
+        });
+        continue;
+      }
+      try {
+        const id = await clientService.createContact(req.spoc.client_id, r.payload);
+        summary.created++;
+        results.push({ rowNumber: r.rowNumber, status: 'created', contactId: id });
+      } catch (e) {
+        if (e.status === 409) {
+          summary.skipped++;
+          results.push({ rowNumber: r.rowNumber, status: 'skipped', reason: e.message });
+        } else {
+          summary.invalid++;
+          results.push({ rowNumber: r.rowNumber, status: 'failed', errors: [e.message] });
+        }
+      }
+    }
+    modernOk(res, { summary, results });
+  } catch (e) {
+    if (e.code === 'LIMIT_FILE_SIZE') return modernError(res, 400, 'file exceeds 10MB');
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
 });
 
 module.exports = router;

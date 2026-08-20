@@ -221,6 +221,59 @@ function verifyJobShareToken(token) {
   return { jobId: Number(claims.jobId) };
 }
 
+/**
+ * Verify a customer-facing estimate-approval link token.
+ *
+ * Production currently mints these tokens from the legacy Java
+ * backend. The payload shape is:
+ *   { sub: "<jobId>", clientContactId: <id>, iat, exp }
+ * — no `type` claim, no `jobId` claim (jobId lives in `sub`). We need
+ * to keep accepting that shape so existing email/SMS estimate links
+ * stay valid through the migration.
+ *
+ * We ALSO accept a future Node-minted variant that sets
+ * `type: 'estimate_approval'` + `jobId` for clarity; that path lets
+ * us re-mint tokens from the new backend later without touching this
+ * verifier again. Tokens carrying any OTHER `type` (e.g.
+ * 'job_completion' or a user JWT) are explicitly rejected so a leaked
+ * token from a different flow can't be replayed here.
+ *
+ * Returns { jobId, clientContactId } — clientContactId may be null
+ * if the legacy token didn't include it (older signing path).
+ *
+ * Throws plain `{status, message}` shapes (NOT Error instances) so
+ * public route handlers can `throw` directly into a small error
+ * mapper, matching the verifyJobToken contract above.
+ */
+function verifyEstimateToken(token) {
+  let claims;
+  try {
+    claims = jwt.verify(token, requireSecret());
+  } catch (_err) {
+    throw { status: 401, message: 'Estimate link is invalid or expired' };
+  }
+  if (!claims || typeof claims !== 'object') {
+    throw { status: 401, message: 'Estimate link is invalid' };
+  }
+  // Reject tokens from other flows. A bare token (no type) is permitted
+  // because the legacy Java mint doesn't set one — we infer estimate
+  // intent from the presence of `clientContactId` OR a bare numeric `sub`.
+  if (claims.type && claims.type !== 'estimate_approval') {
+    throw { status: 401, message: 'Estimate link type mismatch' };
+  }
+  // jobId can live in either `jobId` (new) or `sub` (legacy). Coerce
+  // to Number and refuse if neither is a positive integer.
+  const rawId = claims.jobId != null ? claims.jobId : claims.sub;
+  const jobId = Number(rawId);
+  if (!Number.isInteger(jobId) || jobId <= 0) {
+    throw { status: 401, message: 'Estimate link payload is malformed' };
+  }
+  const clientContactId = claims.clientContactId != null
+    ? Number(claims.clientContactId)
+    : null;
+  return { jobId, clientContactId };
+}
+
 module.exports = {
   signUserToken,
   verifyToken,
@@ -231,4 +284,5 @@ module.exports = {
   verifyEasyfixerProfileToken,
   signJobShareToken,
   verifyJobShareToken,
+  verifyEstimateToken,
 };
