@@ -644,3 +644,51 @@ test('`dateType` ALONE still emits nothing — it is a modifier, not a filter', 
   // merely switched a dropdown silently change which jobs they get.
   assert.equal(where({ dateType: 'completed' }), BASELINE);
 });
+
+// ─── Export cell formatting (2026-08-21) ─────────────────────────────
+//
+// Three reported defects in Manage Jobs → Export:
+//   Job Id, Current TX Id and Previous TX Id rendered with a thousands
+//   separator ("522,124"), and Job Owner showed a user id instead of a name.
+
+const { EXPORT_COLUMNS: COLS } = require('../services/job-export.service');
+
+test('identifier columns use type "id" so they carry NO thousands separator', () => {
+  // '#,##0' turns job 522124 into "522,124", which cannot be pasted back into
+  // a search box. Identifiers are numeric but are not quantities.
+  for (const key of ['jobId', 'txId', 'preTxId']) {
+    const col = COLS.find((c) => c.key === key);
+    assert.ok(col, `column ${key} must exist`);
+    assert.equal(col.type, 'id', `${key} must be type "id", not "number"`);
+  }
+});
+
+test('genuine quantities keep type "number" and their separator', () => {
+  // The fix must not strip grouping from counts and money.
+  for (const key of ['totalCharge', 'efShare', 'aging']) {
+    const col = COLS.find((c) => c.key === key);
+    assert.ok(col, `column ${key} must exist`);
+    assert.equal(col.type, 'number', `${key} is a quantity and must keep grouping`);
+  }
+});
+
+test('the exporter maps type "id" to a plain integer format', () => {
+  const src = require('node:fs').readFileSync(
+    require.resolve('../utils/xlsx-stream-export.js'), 'utf8',
+  );
+  assert.match(src, /const ID_NUM_FMT = '0';/, 'id columns must format as a bare integer');
+  assert.match(src, /c\.type === 'id'\s*\?\s*\{ numFmt: ID_NUM_FMT \}/, 'the id branch must be wired');
+});
+
+test('Job Owner prefers the resolved name and falls back to the raw id', () => {
+  const { mapExportRow } = require('../services/job-export.service');
+  const withName = mapExportRow({ job_id: 1, job_primary_spoc: '4471', job_primary_spoc_name: 'Bhawana' }, 1);
+  assert.equal(withName.jobOwner, 'Bhawana', 'a resolved name must win');
+
+  // A deleted user, or a pre-2026 non-numeric value, must not blank the cell.
+  const unresolved = mapExportRow({ job_id: 2, job_primary_spoc: '4471' }, 2);
+  assert.equal(unresolved.jobOwner, '4471', 'unresolved falls back to the id, never to empty');
+
+  const absent = mapExportRow({ job_id: 3 }, 3);
+  assert.equal(absent.jobOwner, null, 'a DB without the column yields a blank cell');
+});

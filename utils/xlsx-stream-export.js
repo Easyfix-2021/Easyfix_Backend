@@ -43,6 +43,13 @@ const BORDER_GREY   = 'FFE2E8F0';
 // Excel's format language spells the same thing this way.
 const DATE_NUM_FMT   = 'dd mmm yyyy hh:mm AM/PM';
 const NUMBER_NUM_FMT = '#,##0';
+/*
+ * IDENTIFIERS. Job ids, technician ids and the like are numeric but are NOT
+ * quantities — '#,##0' renders job 522124 as "522,124", which nobody can paste
+ * back into a search box. `type: 'id'` keeps them right-aligned and numeric
+ * (so they still sort as numbers) with no grouping separator.
+ */
+const ID_NUM_FMT = '0';
 
 const MIN_WIDTH = 10;
 const MAX_WIDTH = 44;
@@ -218,7 +225,7 @@ function verifyWriterOnce() {
 function defaultWidth(col) {
   if (Number.isFinite(col.width)) return col.width;
   if (col.type === 'date') return 22;
-  if (col.type === 'number') return 12;
+  if (col.type === 'number' || col.type === 'id') return 12;
   const byHeader = String(col.header || col.key || '').length + 4;
   return Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, byHeader));
 }
@@ -351,6 +358,7 @@ async function streamRowsToXlsx(res, { filename, sheetName, columns, rowSource, 
     width: defaultWidth(c),
     style:
       c.type === 'date'   ? { numFmt: DATE_NUM_FMT } :
+      c.type === 'id'     ? { numFmt: ID_NUM_FMT } :
       c.type === 'number' ? { numFmt: NUMBER_NUM_FMT } :
       undefined,
   }));

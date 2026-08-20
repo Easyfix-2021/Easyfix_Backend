@@ -105,7 +105,7 @@ const { hasClientVerticalIdColumn } = require('./job.service');
  */
 const EXPORT_COLUMNS = Object.freeze([
   { header: 'No.',                        key: 'no',                        type: 'number' },
-  { header: 'Job Id',                     key: 'jobId',                     type: 'number' },
+  { header: 'Job Id',                     key: 'jobId',                     type: 'id'      },
   { header: 'Job Reference Id',           key: 'jobRefId',                  type: 'string' },
   { header: 'Branch Details',             key: 'branchDetails',             type: 'string' },
   { header: 'Customer Name',              key: 'customerName',              type: 'string' },
@@ -149,9 +149,9 @@ const EXPORT_COLUMNS = Object.freeze([
   { header: 'Job Type',                   key: 'jobType',                   type: 'string' },
   { header: 'Client Comment',             key: 'clientComment',             type: 'string' },
   { header: 'Current TX Name',            key: 'txName',                    type: 'string' },
-  { header: 'Current TX Id',              key: 'txId',                      type: 'number' },
+  { header: 'Current TX Id',              key: 'txId',                      type: 'id'      },
   { header: 'Previous TX Name',           key: 'preTxName',                 type: 'string' },
-  { header: 'Previous TX Id',             key: 'preTxId',                   type: 'number' },
+  { header: 'Previous TX Id',             key: 'preTxId',                   type: 'id'      },
   { header: 'OTA',                        key: 'ota',                       type: 'number' },
   { header: 'Pre-Defined TAT',            key: 'preDefinedtat',             type: 'number' },
   { header: 'TAT Status',                 key: 'tatStatus',                 type: 'number' },
@@ -1627,10 +1627,55 @@ async function fetchExportChunk({ filters = {}, afterJobId = null, chunkSize = D
     GROUP BY J.job_id
     ORDER BY J.job_id DESC`;
   const [rows] = await pool.query(sql, [ids, ids, ids, ids, ids]);
+  await attachJobOwnerNames(rows);
 
   logger.info(
     `Manage-Job export chunk · rows=${rows.length} · afterJobId=${afterJobId ?? 'start'} · ${Date.now() - started}ms`,
   );
+  return rows;
+}
+
+/*
+ * Resolve the "Job Owner" column from a user id to a user NAME.
+ *
+ * `job_primary_spoc` holds a tbl_user.user_id, and the export was writing that
+ * id straight into a column headed "Job Owner" — so the sheet showed 4471 where
+ * it should say a person.
+ *
+ * It CANNOT be joined in the main SELECT. The column is PROD-only (absent on
+ * some DBs — see the note in mapExportRow), which is exactly why it is read off
+ * `J.*` rather than named; naming it in a JOIN condition would 500 the whole
+ * export wherever it is missing. So the lookup happens here, per chunk, against
+ * whatever ids actually arrived: no column name in SQL, and a DB without the
+ * column simply yields no ids and no query.
+ *
+ * Bounded by chunkSize, so this is one small extra query per chunk. Fails soft —
+ * a lookup error leaves the raw id rather than losing the export.
+ */
+async function attachJobOwnerNames(rows) {
+  const ids = [...new Set(
+    rows.map((r) => r.job_primary_spoc)
+      .filter((v) => v !== null && v !== undefined && String(v).trim() !== '')
+      // Pre-2026 rows are not guaranteed numeric (the column is a VARCHAR), so
+      // only genuine ids are looked up; anything else falls through unchanged.
+      .filter((v) => /^[0-9]+$/.test(String(v).trim()))
+      .map((v) => Number(String(v).trim())),
+  )];
+  if (!ids.length) return rows;
+  try {
+    const [users] = await pool.query(
+      `SELECT user_id, user_name FROM tbl_user WHERE user_id IN (${ids.map(() => '?').join(',')})`,
+      ids,
+    );
+    const byId = new Map(users.map((u) => [Number(u.user_id), u.user_name]));
+    for (const r of rows) {
+      const raw = r.job_primary_spoc;
+      if (raw === null || raw === undefined) continue;
+      r.job_primary_spoc_name = byId.get(Number(String(raw).trim())) ?? null;
+    }
+  } catch (e) {
+    logger.warn('Job-owner name lookup failed — exporting the raw id · ' + e.message);
+  }
   return rows;
 }
 
@@ -2167,10 +2212,13 @@ function mapExportRow(r, seqNumber) {
      * and the cell is blank.
      *
      * It holds a tbl_user.user_id — a snapshot of who the client's primary SPOC
-     * was the day the job was booked — kept as a string because the column is a
-     * VARCHAR and pre-2026 rows are not guaranteed numeric.
+     * was the day the job was booked. The NAME is resolved per chunk by
+     * attachJobOwnerNames (it cannot be joined in the SELECT without naming the
+     * PROD-only column). Falls back to the raw id if the user row is gone or
+     * the value was never numeric, so the cell is never silently emptied.
      */
-    jobOwner: r.job_primary_spoc !== null && r.job_primary_spoc !== undefined ? String(r.job_primary_spoc) : null,
+    jobOwner: r.job_primary_spoc_name
+      ?? (r.job_primary_spoc !== null && r.job_primary_spoc !== undefined ? String(r.job_primary_spoc) : null),
     scheduledBY: r.scheduled_by !== null && r.scheduled_by !== undefined ? String(r.scheduled_by) : '',
     auditBy: r.checkout_by !== null && r.checkout_by !== undefined ? String(r.checkout_by) : '',
     ticketCreatedDate: sheetDate(r.ticket_created_date_time),
