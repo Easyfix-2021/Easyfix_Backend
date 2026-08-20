@@ -922,14 +922,55 @@ router.put(
  * hand-copied list in the UI drifts the first time a role gains a surface.
  */
 router.get('/contacts/access-roles', (req, res) => {
-  const { ROLES, OVERRIDE_GRANTS } = require('../../services/client-access.service');
+  const { OVERRIDE_GRANTS, SURFACES, roleCatalogue } = require('../../services/client-access.service');
   return modernOk(res, {
-    roles: Object.values(ROLES).map((r) => ({
-      id: r.id, key: r.key, name: r.name, grants: r.grants, allStores: r.allStores,
-    })),
+    // AS CONFIGURED, not as coded — a role whose screens were changed from the
+    // CRM must read back changed, or the screen would show stale defaults and
+    // the next save would silently revert somebody's edit.
+    roles: roleCatalogue(),
+    // The full surface vocabulary, so the CRM renders a checkbox per screen
+    // without hard-coding the list and drifting from the server.
+    surfaces: SURFACES,
     overrides: Object.entries(OVERRIDE_GRANTS).map(([flag, surface]) => ({ flag, surface })),
   });
 });
+
+/*
+ * PUT /api/admin/clients/contacts/access-roles/:roleId
+ *
+ * Set which screens a ROLE grants by default. This is the tier above the
+ * per-SPOC overrides: a role change moves every SPOC holding it who has no
+ * override on that surface, which is the point — "Finance should see the
+ * performance book" is one edit, not one per person.
+ *
+ * Guarded by the same isClientEdit key as the rest of the Contacts tab.
+ *
+ * NOT settable: role 0 ("No Role"). It is the ABSENCE of configuration, and
+ * its behaviour is governed by UNASSIGNED_FAILS_OPEN in the service — a
+ * deliberate rollout posture, not a per-deployment toggle an operator should
+ * be able to flip from a form.
+ */
+router.put(
+  '/contacts/access-roles/:roleId',
+  requireClientEdit,
+  validate(v.setRoleAccessBody),
+  async (req, res, next) => {
+    try {
+      const svc = require('../../services/client-access.service');
+      const out = await svc.setRoleAccess(
+        Number(req.params.roleId),
+        req.body.surfaces,
+        req.body.allStores,
+        req.user && req.user.userId
+      );
+      logger.info('Role access updated · role=' + out.roleId + ' · surfaces=' + out.surfaces.join('|'));
+      return modernOk(res, out);
+    } catch (e) {
+      if (e && e.status === 400) return modernError(res, 400, e.message);
+      return next(e);
+    }
+  }
+);
 
 router.delete(
   '/contacts/:id',

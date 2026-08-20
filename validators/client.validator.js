@@ -242,6 +242,16 @@ const setContactAccessBody = Joi.object({
  * that wants a different tool, and an uncapped array is an easy way to build a
  * statement large enough to trip max_allowed_packet.
  */
+/*
+ * Role-level screen access. `surfaces` is the WHOLE set the role should grant,
+ * not a delta — a PUT replaces, so an omitted surface is a removal. Sending a
+ * delta would make "revoke" impossible to express.
+ */
+const setRoleAccessBody = Joi.object({
+  surfaces: Joi.array().items(Joi.string().max(32)).min(1).required(),
+  allStores: Joi.boolean().required(),
+});
+
 const setContactAccessBulkBody = Joi.object({
   contactIds: Joi.array().items(Joi.number().integer().positive()).min(1).max(500).required(),
   spocRole: Joi.number().integer().valid(1, 2, 3, 4).required(),
@@ -472,6 +482,7 @@ module.exports = {
   createContactBody,
   updateContactBody,
   setContactAccessBody,
+  setRoleAccessBody,
   setContactAccessBulkBody,
   createBillingBody,
   updateBillingBody,

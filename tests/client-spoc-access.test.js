@@ -31,17 +31,43 @@ after(() => fake.restore());
 
 const grantsOf = (row) => access.foldGrants(row).grants;
 
-test('no access row falls back to the least-privileged role, not to open access', () => {
+/*
+ * ROLLOUT POSTURE. An unconfigured SPOC resolves to the "No Role" pseudo-role,
+ * not to a real one, and what that GRANTS is governed by UNASSIGNED_FAILS_OPEN
+ * in the service. These assertions are written against that constant rather
+ * than against a hard-coded surface list, so flipping the posture to
+ * least-privilege after the role sweep keeps them honest instead of turning
+ * them red.
+ */
+test('no access row resolves to No Role, per the rollout posture', () => {
   const folded = access.foldGrants(null);
-  assert.equal(folded.role, 'store');
-  assert.equal(folded.allStores, false);
-  assert.ok(!folded.grants.includes('performance'), 'performance must not be granted by default');
-  assert.ok(!folded.grants.includes('invoicing'), 'invoicing must not be granted by default');
+  assert.equal(folded.role, 'none');
+  assert.equal(folded.unassigned, true, 'the portal renders this chip in red');
+  if (access.UNASSIGNED_FAILS_OPEN) {
+    assert.deepEqual([...folded.grants].sort(), [...access.SURFACES].sort(),
+      'while the posture is open, an unconfigured SPOC keeps every surface');
+  } else {
+    assert.ok(!folded.grants.includes('performance'), 'closed posture must withhold performance');
+    assert.ok(!folded.grants.includes('invoicing'), 'closed posture must withhold invoicing');
+  }
 });
 
-test('an unknown role id is treated as the least-privileged role', () => {
+test('an unknown role id is unconfigured, not a real role', () => {
   const folded = access.foldGrants({ spoc_role: 99 });
-  assert.equal(folded.role, 'store');
+  assert.equal(folded.role, 'none');
+  assert.equal(folded.unassigned, true);
+});
+
+/*
+ * The regression that hid behind Number(null) === 0. Once the unassigned role
+ * took key 0 in ROLES, a MISSING row looked like a declared role and skipped
+ * the fault branch entirely — which silently turned a DB fault into open
+ * access. Guard the distinction directly.
+ */
+test('a READ FAULT never widens access, whatever the posture says', () => {
+  const folded = access.foldGrants(null, { unconfigured: false });
+  assert.equal(folded.role, 'store', 'a fault takes the Store SPOC floor');
+  assert.ok(!folded.grants.includes('performance'));
   assert.ok(!folded.grants.includes('invoicing'));
 });
 
@@ -127,7 +153,8 @@ test('accessFromSpoc reads the columns findSpocById joins on, and a null role me
   const withRow = access.accessFromSpoc({ id: 1, spoc_role: access.ROLE_FINANCE });
   assert.ok(withRow.grants.includes('invoicing'));
   const noRow = access.accessFromSpoc({ id: 1, spoc_role: null });
-  assert.equal(noRow.role, 'store', 'LEFT JOIN miss must not inherit a stale role');
+  assert.equal(noRow.role, 'none', 'a LEFT JOIN miss is unconfigured, not a stale role');
+  assert.equal(noRow.unassigned, true);
 });
 
 test('resolveAccess reads the row when there is one', async () => {
@@ -170,12 +197,24 @@ test('the compatibility mode still withholds the brand-new surface', () => {
     'the reporting-hierarchy filter must keep applying exactly as it does today');
 });
 
-test('a missing ROW on a migrated environment is still least privilege', () => {
-  // access_model_available = 1 and spoc_role null: somebody HAS an access
-  // model and this SPOC is deliberately not in it.
+test('a missing ROW on a migrated environment is UNCONFIGURED, not a role', () => {
+  /*
+   * access_model_available = 1 with spoc_role null: the access model exists and
+   * this SPOC is not in it. That used to mean least privilege. During the
+   * rollout it means "No Role" — surfaced in red so it reads as a gap to close
+   * from CRM → Manage Clients → Contacts, rather than as a silent lockout of
+   * someone who was working yesterday.
+   */
   const folded = access.accessFromSpoc({ id: 1, access_model_available: 1, spoc_role: null });
-  assert.ok(!folded.grants.includes('invoicing'), 'an absent row is a deliberate absence');
-  assert.ok(!folded.grants.includes('performance'));
+  assert.equal(folded.role, 'none');
+  assert.equal(folded.unassigned, true);
+  if (access.UNASSIGNED_FAILS_OPEN) {
+    assert.ok(folded.grants.includes('invoicing'));
+    assert.ok(folded.grants.includes('performance'));
+  } else {
+    assert.ok(!folded.grants.includes('invoicing'));
+    assert.ok(!folded.grants.includes('performance'));
+  }
 });
 
 test('requireGrant lets a holder through and 403s everyone else', () => {
