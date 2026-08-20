@@ -1,6 +1,47 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
+/*
+ * ── A FUTURE DATE THAT CANNOT ROT ───────────────────────────────────────────
+ *
+ * assertTransition rejects a PAUSED/SUSPENDED `until` that is not strictly
+ * after today, and it compares against TODAY IN IST:
+ *
+ *     const todayIst = new Intl.DateTimeFormat('en-CA',
+ *       { timeZone: 'Asia/Kolkata' }).format(new Date());
+ *     if (!/^\d{4}-\d{2}-\d{2}$/.test(suppliedUntil) || suppliedUntil <= todayIst)
+ *       throw httpError(400, 'PAUSED until must be a future date');
+ *
+ * So any date LITERAL used as an `until` here is a bomb with a fuse on it.
+ * This file shipped `until: '2026-08-20'`, comfortably in the future when it
+ * was written, which became TODAY on 2026-08-20: the guard fired, the test
+ * failed, and it took the QA and Production deploy pipelines down with it.
+ * Bumping the literal to a later date only re-arms the same fuse, so the value
+ * is COMPUTED.
+ *
+ * It is derived from the same clock AND the same timezone the guard reads, so
+ * the two cannot disagree. A UTC-derived date would sit a day ahead of IST for
+ * five and a half hours every night — an intermittent bomb instead of a dated
+ * one, which is worse.
+ */
+function futureIstDate(daysAhead = 30) {
+  const todayIst = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' })
+    .format(new Date());
+  // Anchored at UTC midnight so this is pure calendar arithmetic. IST observes
+  // no DST, so no offset can shift the result by a day.
+  const d = new Date(todayIst + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + daysAhead);
+  return d.toISOString().slice(0, 10);
+}
+
+/*
+ * Resolved ONCE per run. A fixture and the transition that has to match it must
+ * be the same string; calling futureIstDate() twice either side of IST midnight
+ * would silently produce two different dates and fail somewhere unrelated.
+ */
+const FUTURE_UNTIL = futureIstDate(30);
+
+
 const lifecycle = require('../services/easyfixer-lifecycle.service');
 const evaluator = require('../services/easyfixer-lifecycle-evaluation-cron');
 const registrationPush = require('../services/registration-status-push.service');
@@ -58,6 +99,9 @@ test('legacy scheduled inactive rows derive SUSPENDED before migration', () => {
   assert.equal(lifecycle.deriveLegacyStatus({
     is_technician_verified: 1,
     efr_status: 0,
+    // NOT a bomb: deriveLegacyStatus tests PRESENCE only —
+    // `row.scheduled_reactivation_date ? 'SUSPENDED' : 'INACTIVE'` — so this is
+    // never compared to today and any non-empty string behaves identically.
     scheduled_reactivation_date: '2099-01-01',
   }), 'SUSPENDED');
 });
@@ -315,6 +359,9 @@ test('lifecycle history exposes the immutable scheduled-until date from metadata
     reason: 'Leave',
     source: 'CRM',
     actor_user_id: 7,
+    // NOT a bomb: this `until` is metadata carried through for DISPLAY and
+    // asserted against itself below. Nothing compares it to today, so a fixed
+    // literal is correct here — a derived value would assert nothing.
     metadata: JSON.stringify({ until: '2026-09-30', actorName: 'Ops' }),
     status_version: 3,
     created_at: '2026-08-10 12:00:00',
@@ -393,7 +440,7 @@ test('a same-status restricted transition repairs stale offers without a new lif
             // bomb — this pair was '2026-08-20' and began failing, and blocking
             // every deploy, at midnight on 2026-08-20. The assertions below never
             // read the date; it only has to be valid and match the fixture.
-            scheduled_reactivation_date: '2099-01-01',
+            scheduled_reactivation_date: FUTURE_UNTIL,
             lifecycle_version: 4,
             lifecycle_source: 'CRM',
           }]];
@@ -415,7 +462,7 @@ test('a same-status restricted transition repairs stale offers without a new lif
       status: 'PAUSED',
       reasonCode: 'MANUAL_PAUSE',
       reason: 'Planned leave',
-      until: '2099-01-01',   // must equal the fixture above, and never arrive
+      until: FUTURE_UNTIL,   // must equal the fixture above; both derived
       expectedVersion: 4,
       source: 'CRM',
     }, { user_id: 9 });
@@ -524,7 +571,7 @@ test('BLACKLISTED is fully reversible from CRM (admin decision) and SUSPENDED re
     /future until date/,
   );
   assert.doesNotThrow(() => assertTransition({ status: 'ACTIVE' }, 'SUSPENDED', {
-    source: 'CRM', reason: 'Temporary hold', until: '2099-01-01',
+    source: 'CRM', reason: 'Temporary hold', until: FUTURE_UNTIL,
   }));
 });
 

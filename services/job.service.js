@@ -306,6 +306,13 @@ const DIRECT_REJECTABLE_STATES = new Set([STATUS.BOOKED, STATUS.SCHEDULED]);
  * dedupe-by-mobile — are keyed on tbl_customer, not tbl_job, and must keep
  * reading `cu.customer_name` directly. Do not spread this expression there.
  */
+/*
+ * Shortest digits-only term treated as a PHONE fragment rather than a job id.
+ * Indian mobiles are 10 digits; job ids are currently 6. Nine keeps the two
+ * apart without needing to know how long ids will grow.
+ */
+const MOBILE_MIN_DIGITS = 9;
+
 const JOB_CUSTOMER_NAME_EXPR =
   `COALESCE(NULLIF(TRIM(j.job_customer_name), ''), cu.customer_name)`;
 
@@ -1687,7 +1694,7 @@ async function list({
     params.push(...clientIdList);
   }
   if (easyfixerId != null) { clauses.push('j.fk_easyfixter_id = ?'); params.push(easyfixerId); }
-  if (ownerId != null)     { clauses.push('j.job_owner = ?');        params.push(ownerId); }
+  if (ownerId != null)     { clauses.push('j.job_client_owner = ?');        params.push(ownerId); }
   if (Array.isArray(clientOwnerIds) && clientOwnerIds.length) {
     clauses.push(`j.job_client_owner IN (${clientOwnerIds.map(() => '?').join(',')})`);
     params.push(...clientOwnerIds);
@@ -1944,8 +1951,48 @@ async function list({
     // regex only detects bare `alias.col LIKE ?` terms, so this one no longer
     // shows up in its BE column list — the parity it asserts still holds (both
     // sides now key on the same effective name), it simply cannot see it.
-    clauses.push(`(CAST(j.job_id AS CHAR) LIKE ? OR j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR ${JOB_CUSTOMER_NAME_EXPR} LIKE ? OR cu.customer_mob_no LIKE ? OR cl.client_name LIKE ? OR ci.city_name LIKE ? OR ef.efr_name LIKE ? OR ow.user_name LIKE ? OR j.client_spoc_name LIKE ? OR j.client_spoc LIKE ?)`);
-    params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
+    /*
+     * ⚠ A PURELY NUMERIC TERM IS AN IDENTIFIER, NOT A SUBSTRING.
+     *
+     * Reported from production: searching 530280 returned THREE jobs. #530280
+     * was the one wanted; the other two matched because the floating LIKE hit
+     * their PHONE NUMBERS mid-digit — 98453028|06 and 93|530280|25 both contain
+     * "530280". Any 6-digit id has roughly five landing spots inside a 10-digit
+     * mobile, so the false-match rate grows with how many customers exist, not
+     * with how unusual the term is. At 153k jobs an id search nearly always
+     * drags in strangers.
+     *
+     * It was also slow for the same reason: eleven '%term%' predicates cannot
+     * use an index, so every search full-scanned tbl_job and five joined tables.
+     *
+     * So a digits-only term takes a typed path:
+     *   - j.job_id = ?  — a PRIMARY KEY lookup, exact and instant. This is what
+     *     the operator meant, and it is the whole reason the search felt slow.
+     *   - the two reference columns keep a substring match: they are opaque
+     *     client strings (WO1024566, 171-2677513-3675553) where a fragment is a
+     *     legitimate way to search.
+     *   - the mobile matches only a term long enough to BE a phone fragment
+     *     (>= MOBILE_MIN_DIGITS), and is anchored so it cannot match mid-number.
+     *   - name/city/client/owner columns are skipped entirely — a digits-only
+     *     term is never a person's name, and each one was a full scan.
+     * Anything containing a non-digit keeps the original eleven-column search.
+     */
+    const digitsOnly = /^\d+$/.test(q);
+    if (digitsOnly) {
+      const idTerms = ['j.job_id = ?', 'j.job_reference_id LIKE ?', 'j.client_ref_id LIKE ?'];
+      const idParams = [Number(q), `%${q}%`, `%${q}%`];
+      // A phone fragment, not an id. Anchored at the START so "530280" can
+      // never match the middle of 9845302806 — the reported bug.
+      if (q.length >= MOBILE_MIN_DIGITS) {
+        idTerms.push('cu.customer_mob_no LIKE ?');
+        idParams.push(`${q}%`);
+      }
+      clauses.push(`(${idTerms.join(' OR ')})`);
+      params.push(...idParams);
+    } else {
+      clauses.push(`(CAST(j.job_id AS CHAR) LIKE ? OR j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR ${JOB_CUSTOMER_NAME_EXPR} LIKE ? OR cu.customer_mob_no LIKE ? OR cl.client_name LIKE ? OR ci.city_name LIKE ? OR ef.efr_name LIKE ? OR ow.user_name LIKE ? OR j.client_spoc_name LIKE ? OR j.client_spoc LIKE ?)`);
+      params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
+    }
   }
 
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -2251,7 +2298,7 @@ async function getStatusCounts({ ownerId, easyfixerId, scope, allowedStages } = 
   // Falls back to the fk test on un-migrated deploys (offer table absent).
   const hasJobOffer = await jobOfferTableExists();
 
-  if (ownerId) { clauses.push('j.job_owner = ?'); params.push(ownerId); }
+  if (ownerId) { clauses.push('j.job_client_owner = ?'); params.push(ownerId); }
   // `easyfixerId` — scope counts to a single technician. Enables the
   // Mobile App's dashboard to reuse this exact counts engine (instead
   // of duplicating the SUM-CASE pattern in a tier-specific service).
@@ -5564,14 +5611,14 @@ async function changeOwner(jobId, { newOwnerId, reason }, actor) {
   logger.info('Change job owner · id=' + jobId + ' · newOwnerId=' + newOwnerId);
   // Skip the full detail load — we only need job_owner for the no-op check.
   const [[existing]] = await pool.query(
-    'SELECT job_id, job_owner FROM tbl_job WHERE job_id = ? LIMIT 1',
+    'SELECT job_id, job_client_owner FROM tbl_job WHERE job_id = ? LIMIT 1',
     [jobId]
   );
   if (!existing) {
     logger.warn('Change owner job not found · id=' + jobId);
     const err = new Error('job not found'); err.status = 404; throw err;
   }
-  if (existing.job_owner === newOwnerId) {
+  if (existing.job_client_owner === newOwnerId) {
     logger.warn('Change owner no-op, already owned · id=' + jobId + ' · ownerId=' + newOwnerId);
     const err = new Error(`job ${jobId} is already owned by user ${newOwnerId}`);
     err.status = 400; throw err;
@@ -5598,7 +5645,7 @@ async function changeOwner(jobId, { newOwnerId, reason }, actor) {
 
   await pool.query(
     `UPDATE tbl_job
-        SET job_owner = ?,
+        SET job_client_owner = ?,
             job_owner_change_by = ?,
             owner_change_reason = ?,
             owner_change_date = ?,

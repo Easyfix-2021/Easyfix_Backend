@@ -1638,6 +1638,29 @@ router.patch('/:id/owner', validate(idParam, 'params'), validate(ownerBody), sco
  * can bulk-transfer ownership. Other admin-group roles (Project
  * Manager, Finance, etc.) see the list but not the button.
  */
+/*
+ * TERMINAL (non-transferable) job statuses.
+ *
+ *   3, 5 — completed (two historical completion codes, both live)
+ *   6    — cancelled
+ *   7    — enquiry (never became a real job)
+ *
+ * A job in one of these states is FINISHED: nobody works it again, so handing
+ * it to a new owner only rewrites history and pollutes the new owner's queue
+ * and load figures. The product rule is "closed and completed orders can not
+ * be transferred".
+ *
+ * This is deliberately the SAME set as TERMINAL_STATUSES in
+ * services/job-export.service.js (~line 751), which is what the export and the
+ * Closed filter already mean by "closed". Kept as a LOCAL constant rather than
+ * an import on purpose: this route must not take a dependency on the export
+ * service just to read four integers, and a drifting copy is loud (four
+ * literals next to a comment) where a wrong import would be silent. If the
+ * platform's definition of closed ever changes, both places change together.
+ */
+const NON_TRANSFERABLE_JOB_STATUSES = Object.freeze([3, 5, 6, 7]);
+const NON_TRANSFERABLE_REASON = 'completed/cancelled jobs cannot be transferred';
+
 const bulkOwnerBody = require('joi').object({
   fromOwnerId: require('joi').number().integer().positive().required(),
   toOwnerId:   require('joi').number().integer().positive().required(),
@@ -1696,7 +1719,7 @@ router.post('/bulk-owner-transfer',
           // without aborting on the first mismatch.
           const { pool } = require('../../db');
           const [[row]] = await pool.query(
-            'SELECT job_owner FROM tbl_job WHERE job_id = ? LIMIT 1',
+            'SELECT job_client_owner, job_status FROM tbl_job WHERE job_id = ? LIMIT 1',
             [id]
           );
           if (!row) {
@@ -1704,9 +1727,42 @@ router.post('/bulk-owner-transfer',
             results.push({ jobId: id, status: 'skipped', reason: 'not found' });
             continue;
           }
-          if (row.job_owner !== fromOwnerId) {
+          /*
+           * TERMINAL-STATUS GUARD — the ONE choke point for both modes.
+           *
+           * It lives here, in the per-job loop, rather than in the target-id
+           * resolution above, because both modes converge on `targetIds` and
+           * every id then passes through this single fresh read of tbl_job.
+           * Guarding at resolution would need TWO implementations (one for the
+           * explicit-jobIds array, which has no status at all, and one over
+           * job.list()'s projection), and the filters-mode half would be
+           * trusting a projected field on rows the caller's own `filters` can
+           * shape — including pinning `status` to a terminal code. This read
+           * asks the table directly, one row at a time, at the moment of
+           * transfer, so neither a caller-chosen filter nor a projection change
+           * can route around it.
+           *
+           * Counted as `skipped`, not `failed`: the job was found and is simply
+           * ineligible. The summary stays truthful either way — every id lands
+           * in exactly one of transferred/failed/skipped.
+           *
+           * Number() because a driver/column change that hands back '3' as a
+           * string would make `includes` miss and silently reopen the hole.
+           */
+          if (NON_TRANSFERABLE_JOB_STATUSES.includes(Number(row.job_status))) {
             skipped++;
-            results.push({ jobId: id, status: 'skipped', reason: `current owner ${row.job_owner ?? 'NULL'} ≠ source ${fromOwnerId}` });
+            results.push({ jobId: id, status: 'skipped', reason: NON_TRANSFERABLE_REASON });
+            continue;
+          }
+          /*
+           * job_client_owner, NOT job_owner — this must read the SAME column
+           * services/job.service.js changeOwner() writes. Reading one and
+           * writing the other would let a bulk transfer select jobs by one
+           * owner and reassign a different owner's jobs.
+           */
+          if (row.job_client_owner !== fromOwnerId) {
+            skipped++;
+            results.push({ jobId: id, status: 'skipped', reason: `current owner ${row.job_client_owner ?? 'NULL'} ≠ source ${fromOwnerId}` });
             continue;
           }
           await job.changeOwner(id, { newOwnerId: toOwnerId, reason }, req.user);
