@@ -387,7 +387,13 @@ test('a same-status restricted transition repairs stale offers without a new lif
             lifecycle_changed_at: '2026-08-10 10:00:00',
             // The scheduled "until" is single-sourced from
             // scheduled_reactivation_date now (no lifecycle_until column).
-            scheduled_reactivation_date: '2026-08-20',
+            // Far-future sentinel, matching the `until` sent below. It must be a
+            // DATE THAT NEVER ARRIVES: assertTransition rejects a PAUSED `until`
+            // that is <= today in IST, so a plausible near-date here is a time
+            // bomb — this pair was '2026-08-20' and began failing, and blocking
+            // every deploy, at midnight on 2026-08-20. The assertions below never
+            // read the date; it only has to be valid and match the fixture.
+            scheduled_reactivation_date: '2099-01-01',
             lifecycle_version: 4,
             lifecycle_source: 'CRM',
           }]];
@@ -409,7 +415,7 @@ test('a same-status restricted transition repairs stale offers without a new lif
       status: 'PAUSED',
       reasonCode: 'MANUAL_PAUSE',
       reason: 'Planned leave',
-      until: '2026-08-20',
+      until: '2099-01-01',   // must equal the fixture above, and never arrive
       expectedVersion: 4,
       source: 'CRM',
     }, { user_id: 9 });
