@@ -1,0 +1,72 @@
+-- ============================================================================
+-- tbl_job — index the two columns the Client Ref filter actually seeks
+--
+-- ⚠ THIS IS NOT THE "MAKE QUICK SEARCH FAST" MIGRATION, and it would be
+-- dishonest to file it as one. That was the intent when this was queued; the
+-- measurements said otherwise and the scope changed. What follows is why.
+--
+-- ─── WHY job_reference_id IS DELIBERATELY *NOT* INDEXED ─────────────────────
+--
+-- Every reference to it in this codebase is `LIKE '%term%'`. A leading wildcard
+-- cannot seek, so no index shape serves it — not alone, and not inside an OR
+-- (index_merge requires every branch to produce a RANGE, and a leading-wildcard
+-- LIKE produces none).
+--
+-- The hoped-for win was a COVERING index scan: read a narrow index instead of
+-- dragging 345 MB of clustered rows through the buffer pool, measured elsewhere
+-- at 137 ms vs 600 ms. It does not apply here. The jobs list selects ~19
+-- columns, so an index on one column cannot cover the query; MySQL would scan
+-- the index and then look up every row, which is WORSE than the table scan it
+-- replaces. The optimiser would almost certainly decline it, and we would be
+-- paying write cost on every INSERT and UPDATE for an index nothing reads.
+--
+-- Measured on production, which settles it: 482,821 of 482,821 non-null values
+-- match 'REF-%'. The column is a redundant re-encoding of the PRIMARY KEY
+-- (formatJobReferenceId(job_id)), so any search that could use an index is
+-- already served by `j.job_id = ?` — which the numeric fast path now emits.
+--
+-- ─── WHAT *IS* INDEXED, AND WHY IT EARNS IT ─────────────────────────────────
+--
+-- services/job-export.service.js:1001, the Manage Jobs Export "Client Ref"
+-- filter, is the one place either column is seeked by EQUALITY:
+--
+--     (J.client_ref_id = ? OR (J.branch_details = ? AND J.branch_details <> ''))
+--
+-- Today that full-scans 529,049 rows every time an operator filters by Client
+-- Ref. Both sides are indexed here because index_merge needs BOTH: indexing
+-- only client_ref_id would leave the OR unservable and the scan in place.
+--
+-- ─── SIZING, FROM THE REAL DISTRIBUTION ─────────────────────────────────────
+--
+--   client_ref_id    varchar(255) latin1 · 513,453 non-null · 386,296 distinct
+--                    avg 13.4 chars, max 194
+--   branch_details   avg 0.8 chars, max 225 · 332,341 non-null · 5,050 distinct
+--
+-- latin1, not utf8mb4 — one byte per character. A full index is ~194 and ~225
+-- bytes worst case, far inside InnoDB's 3072-byte key limit, so NO PREFIX IS
+-- NEEDED and none is used. Had these been utf8mb4 the same varchar(255) would
+-- have meant 1020-byte entries and a prefix index would have been mandatory.
+--
+-- Both indexes are small because the VALUES are short: roughly 10 MB and 4 MB
+-- against an existing 250 MB index footprint on this table.
+--
+-- ⚠ branch_details is mostly the EMPTY STRING — 332,341 non-null but averaging
+-- 0.8 characters. The index therefore carries a large run of identical ''
+-- entries. That is acceptable and not an oversight: the query never seeks '',
+-- because `AND J.branch_details <> ''` excludes it, and the ~5,049 real values
+-- are highly selective (roughly a handful of rows each). The dead run costs
+-- storage, not lookups.
+--
+-- ─── OPERATIONAL ────────────────────────────────────────────────────────────
+--
+-- ADD INDEX is ALGORITHM=INPLACE on MySQL 8, so the table stays readable and
+-- writable throughout. It still takes a brief metadata lock at start and finish
+-- and will churn the buffer pool while it builds. RUN IT OFF-PEAK. On 529k rows
+-- expect seconds, not minutes.
+--
+-- Additive only: two indexes, no column altered, no row rewritten.
+-- ============================================================================
+
+CREATE INDEX idx_job_client_ref_id ON tbl_job (client_ref_id);
+
+CREATE INDEX idx_job_branch_details ON tbl_job (branch_details);
