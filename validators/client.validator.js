@@ -221,6 +221,36 @@ const contactDuplicateCheckQuery = Joi.object({
 
 /* ─── Client billing ──────────────────────────────────────────────── */
 
+/*
+ * Client SPOC portal access — role plus tri-state override flags.
+ *
+ * `.allow(null)` on every override is load-bearing, not defensive. null means
+ * "inherit the role", and it is the ONLY way an administrator can undo an
+ * override once set. Treating null as absent would make every override a
+ * one-way door.
+ */
+const setContactAccessBody = Joi.object({
+  spocRole: Joi.number().integer().valid(1, 2, 3, 4).required(),
+  canViewPerformance:  Joi.boolean().allow(null),
+  canViewInvoicing:    Joi.boolean().allow(null),
+  canApproveEstimates: Joi.boolean().allow(null),
+  canViewAllStores:    Joi.boolean().allow(null),
+});
+
+/*
+ * Bulk variant. `contactIds` is capped at 500 — a client with more SPOCs than
+ * that wants a different tool, and an uncapped array is an easy way to build a
+ * statement large enough to trip max_allowed_packet.
+ */
+const setContactAccessBulkBody = Joi.object({
+  contactIds: Joi.array().items(Joi.number().integer().positive()).min(1).max(500).required(),
+  spocRole: Joi.number().integer().valid(1, 2, 3, 4).required(),
+  canViewPerformance:  Joi.boolean().allow(null),
+  canViewInvoicing:    Joi.boolean().allow(null),
+  canApproveEstimates: Joi.boolean().allow(null),
+  canViewAllStores:    Joi.boolean().allow(null),
+});
+
 const createBillingBody = Joi.object({
   name:          Joi.string().max(255).required(),
   address:       Joi.string().max(500).required(),
@@ -441,6 +471,8 @@ module.exports = {
   updateClientBody,
   createContactBody,
   updateContactBody,
+  setContactAccessBody,
+  setContactAccessBulkBody,
   createBillingBody,
   updateBillingBody,
   createCustomPropertyBody,

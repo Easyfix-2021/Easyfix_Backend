@@ -33,15 +33,80 @@ async function findSpoc(identifier) {
   return row || null;
 }
 
+// The SPOC identity WITHOUT the access join — the fallback used when
+// easyfix_client_spoc_access has not been migrated onto an environment yet.
+const SPOC_BASE_SQL = `
+  SELECT cc.id, cc.client_id, cc.contact_name, cc.contact_email, cc.contact_no,
+         cl.client_name, cl.client_status
+    FROM tbl_client_contacts cc
+    LEFT JOIN tbl_client cl ON cl.client_id = cc.client_id
+   WHERE cc.id = ? AND cc.status = 1 LIMIT 1`;
+
+// Identity + access in ONE query. This runs on every authenticated client
+// request (requireSpocAuth calls it), so the access model must not cost a
+// second round trip. LEFT JOIN, not JOIN: a SPOC with no access row is still a
+// valid SPOC — client-access.service folds a missing row into least privilege.
+const SPOC_WITH_ACCESS_SQL = `
+  SELECT cc.id, cc.client_id, cc.contact_name, cc.contact_email, cc.contact_no,
+         cl.client_name, cl.client_status,
+         a.spoc_role, a.can_view_performance, a.can_view_invoicing,
+         a.can_approve_estimates, a.can_view_all_stores
+    FROM tbl_client_contacts cc
+    LEFT JOIN tbl_client cl ON cl.client_id = cc.client_id
+    LEFT JOIN easyfix_client_spoc_access a ON a.contact_id = cc.id
+   WHERE cc.id = ? AND cc.status = 1 LIMIT 1`;
+
+/*
+ * Flipped to false the first time the access table turns out to be MISSING, so
+ * an un-migrated environment pays that error once rather than on every request
+ * for the lifetime of the process.
+ *
+ * ONLY 1146 (ER_NO_SUCH_TABLE) makes it sticky. A permission error, a lock
+ * timeout or a transient connection fault must not permanently disable the
+ * access model for the whole process — those fall back for ONE request and
+ * the next request tries the join again.
+ */
+let accessTableMissing = false;
+
+/*
+ * ⚠ THIS FUNCTION GATES EVERY AUTHENTICATED CLIENT REQUEST.
+ *
+ * requireSpocAuth calls it on every hit, so ANY error escaping here is a total
+ * client-portal and client-app outage — login, jobs, invoices, all of it.
+ * The access join is a nice-to-have bolted onto an identity lookup that has
+ * worked for years, and it must never be able to take that lookup down.
+ *
+ * So the join failing is ALWAYS survivable: we log it and fall back to the
+ * plain identity query. The trade is that a SPOC briefly resolves to the
+ * pre-access-model grant set (see client-access.service LEGACY_GRANTS), which
+ * grants nothing they did not already have and still withholds Performance.
+ * A degraded permission read beats a dead portal.
+ */
 async function findSpocById(id) {
-  const [[row]] = await pool.query(
-    `SELECT cc.id, cc.client_id, cc.contact_name, cc.contact_email, cc.contact_no,
-            cl.client_name, cl.client_status
-       FROM tbl_client_contacts cc
-       LEFT JOIN tbl_client cl ON cl.client_id = cc.client_id
-      WHERE cc.id = ? AND cc.status = 1 LIMIT 1`,
-    [id]
-  );
+  if (!accessTableMissing) {
+    try {
+      const [[row]] = await pool.query(SPOC_WITH_ACCESS_SQL, [id]);
+      // Stamp that the access model EXISTS on this environment. A missing
+      // spoc_role now unambiguously means "no row for this SPOC" rather than
+      // "no access model yet" — two facts that need different answers.
+      if (row) row.access_model_available = 1;
+      return row || null;
+    } catch (e) {
+      if (e && e.errno === 1146) {
+        accessTableMissing = true;
+        logger.warn('easyfix_client_spoc_access missing — client access falls back to the pre-access-model grant set until the 2026-08-20 migration is applied');
+      } else {
+        // Transient / permissions / lock. Degrade THIS request only; the next
+        // one retries the join.
+        logger.warn('Client access join failed (' + (e && e.message) + ') — serving identity without access for this request');
+      }
+    }
+  }
+  const [[row]] = await pool.query(SPOC_BASE_SQL, [id]);
+  // No access resolved. client-access.service reads this and applies the
+  // PRE-access-model grant set, so neither a pending migration nor a blip
+  // strips Invoices from every SPOC.
+  if (row) row.access_model_available = 0;
   return row || null;
 }
 

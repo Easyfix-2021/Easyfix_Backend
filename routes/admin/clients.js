@@ -835,6 +835,102 @@ router.post(
   },
 );
 
+/*
+ * PUT /api/admin/clients/contacts/:id/access
+ *
+ * Assign or change a Client SPOC's portal access — the role that decides which
+ * tabs they see in the client dashboard, plus per-person override flags.
+ *
+ * SEPARATE FROM PUT /contacts/:id ON PURPOSE. That route writes
+ * tbl_client_contacts (a legacy table five services read). Access lives in
+ * easyfix_client_spoc_access, an EasyFix-owned side table. Keeping the two
+ * writes on separate routes means an access change never touches a row the
+ * legacy services depend on, and a contact edit can never accidentally reset
+ * somebody's permissions.
+ *
+ * OVERRIDES ARE TRI-STATE. null clears the override (inherit the role), true
+ * grants, false revokes. Joi must therefore ALLOW null rather than treat it as
+ * absent, or an administrator could never undo an override once set.
+ *
+ * Guarded by isClientEdit, the same action key the rest of the Contacts tab
+ * uses — whoever can edit a SPOC can set what that SPOC may see.
+ */
+router.put(
+  '/contacts/:id/access',
+  requireClientEdit,
+  validate(v.setContactAccessBody),
+  async (req, res, next) => {
+    try {
+      logger.info('Set client SPOC access · contactId=' + req.params.id);
+      const clientId = await svc.getContactClientId(req.params.id);
+      if (!(await guardRowByClientId(req, res, clientId, 'contact not found'))) return;
+      const out = await svc.setContactAccess(
+        Number(req.params.id), Number(clientId), req.body, req.user && req.user.userId,
+      );
+      logger.info('SPOC access saved · contactId=' + req.params.id + ' · role=' + out.spocRole);
+      modernOk(res, out, 'access updated');
+    } catch (e) {
+      // The access table is optional until the 2026-08-20 migration runs;
+      // say so plainly instead of surfacing a raw MySQL error to an operator.
+      if (e && e.errno === 1146) {
+        logger.warn('SPOC access write failed — easyfix_client_spoc_access not migrated');
+        return modernError(res, 503, 'Client access is not enabled on this environment yet. Apply migration 2026-08-20-client-spoc-access.sql.');
+      }
+      next(e);
+    }
+  },
+);
+
+/*
+ * PUT /api/admin/clients/:clientId/contacts/access/bulk
+ *
+ * Apply one role (and optionally one set of overrides) to many SPOCs at once.
+ * Mounted under :clientId rather than on bare /contacts so the existing
+ * loadAndGuardClient scope check applies — the service ALSO re-checks that
+ * every contactId belongs to this client, because a scope check on the client
+ * says nothing about a hand-crafted array of contact ids.
+ */
+router.put(
+  '/:clientId/contacts/access/bulk',
+  requireClientEdit,
+  validate(v.setContactAccessBulkBody),
+  async (req, res, next) => {
+    try {
+      logger.info('Bulk set client SPOC access · clientId=' + req.params.clientId
+        + ' · contacts=' + req.body.contactIds.length);
+      if (!(await loadAndGuardClient(req, res))) return;
+      const out = await svc.setContactAccessBulk(
+        Number(req.params.clientId), req.body.contactIds, req.body, req.user && req.user.userId,
+      );
+      logger.info('Bulk SPOC access saved · updated=' + out.updated + ' skipped=' + (out.skipped || 0));
+      modernOk(res, out, `Access updated for ${out.updated} SPOC${out.updated === 1 ? '' : 's'}`);
+    } catch (e) {
+      if (e && e.errno === 1146) {
+        logger.warn('Bulk SPOC access write failed — easyfix_client_spoc_access not migrated');
+        return modernError(res, 503, 'Client access is not enabled on this environment yet. Apply migration 2026-08-20-client-spoc-access.sql.');
+      }
+      next(e);
+    }
+  },
+);
+
+/*
+ * GET /api/admin/clients/contacts/access-roles
+ *
+ * The role catalogue, served from services/client-access.service.js so the
+ * CRM dropdown and the portal's own gate read the SAME definition. A
+ * hand-copied list in the UI drifts the first time a role gains a surface.
+ */
+router.get('/contacts/access-roles', (req, res) => {
+  const { ROLES, OVERRIDE_GRANTS } = require('../../services/client-access.service');
+  return modernOk(res, {
+    roles: Object.values(ROLES).map((r) => ({
+      id: r.id, key: r.key, name: r.name, grants: r.grants, allStores: r.allStores,
+    })),
+    overrides: Object.entries(OVERRIDE_GRANTS).map(([flag, surface]) => ({ flag, surface })),
+  });
+});
+
 router.delete(
   '/contacts/:id',
   requireClientEdit,

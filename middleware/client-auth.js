@@ -1,5 +1,6 @@
 const jwt = require('jsonwebtoken');
 const { findSpocById } = require('../services/client-auth.service');
+const { accessFromSpoc } = require('../services/client-access.service');
 const { modernError } = require('../utils/response');
 
 async function requireSpocAuth(req, res, next) {
@@ -28,6 +29,10 @@ async function requireSpocAuth(req, res, next) {
   }
 
   req.spoc = spoc;
+  // Effective surface grants, folded from the SPOC's role and its tri-state
+  // override flags (both already joined onto `spoc` by findSpocById, so this
+  // costs no query). Every gated route reads req.access via requireGrant().
+  req.access = accessFromSpoc(spoc);
   // Client (user_type_id = 3) identity carried in the token claims, for
   // role-based authorization on routes. Older tokens (pre-enrichment) lack
   // these claims — they resolve to null, so this is non-breaking.

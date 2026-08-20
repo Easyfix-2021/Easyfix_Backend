@@ -440,14 +440,158 @@ async function updateClient(clientId, body, actorId) {
 
 /* ─── Client Contacts (SPOCs) ─────────────────────────────────────── */
 
+/*
+ * Contacts, with each SPOC's portal ACCESS joined on.
+ *
+ * The access row lives in easyfix_client_spoc_access (an EasyFix-owned side
+ * table) rather than as columns on tbl_client_contacts, because the shared DB
+ * forbids altering legacy tables. LEFT JOIN, so a contact with no access row
+ * is still listed — client-access.service folds a null spoc_role into the
+ * least-privileged role.
+ *
+ * The join is wrapped: on an environment where the 2026-08-20 migration has
+ * not run, the table is missing and the plain contact list must still load.
+ * A Manage Clients tab that 500s because a migration is pending is a worse
+ * failure than a Role column that reads "Not Set".
+ */
+const CONTACTS_WITH_ACCESS_SQL = `
+  SELECT cc.*,
+         a.spoc_role, a.can_view_performance, a.can_view_invoicing,
+         a.can_approve_estimates, a.can_view_all_stores
+    FROM tbl_client_contacts cc
+    LEFT JOIN easyfix_client_spoc_access a ON a.contact_id = cc.id
+   WHERE cc.client_id = ? ORDER BY cc.id DESC`;
+
+let contactAccessJoinAvailable = true;
+
 async function listContacts(clientId) {
   logger.info('List client contacts · clientId=' + clientId);
+  if (contactAccessJoinAvailable) {
+    try {
+      const [rows] = await pool.query(CONTACTS_WITH_ACCESS_SQL, [clientId]);
+      logger.info('Found ' + rows.length + ' contacts (with access)');
+      return rows;
+    } catch (e) {
+      if (e && e.errno !== 1146) throw e; // only ER_NO_SUCH_TABLE is tolerated
+      contactAccessJoinAvailable = false;
+      logger.warn('easyfix_client_spoc_access missing — contacts listed without access until the 2026-08-20 migration is applied');
+    }
+  }
   const [rows] = await pool.query(
     'SELECT * FROM tbl_client_contacts WHERE client_id = ? ORDER BY id DESC',
     [clientId],
   );
   logger.info('Found ' + rows.length + ' contacts');
   return rows;
+}
+
+/*
+ * Set one SPOC's portal access.
+ *
+ * UPSERT, not UPDATE — most contacts have no access row until somebody first
+ * assigns them one, so the common path is an insert.
+ *
+ * Override flags are TRI-STATE and null is meaningful: it means "inherit the
+ * role". The caller must be able to send null to CLEAR an override, so this
+ * writes every column it is given rather than skipping falsy values. Passing
+ * `undefined` leaves a column alone; passing `null` sets it to inherit.
+ */
+async function setContactAccess(contactId, clientId, patch, actingUserId) {
+  const cols = ['can_view_performance', 'can_view_invoicing', 'can_approve_estimates', 'can_view_all_stores'];
+  const role = Number(patch.spocRole);
+
+  const values = cols.map((c) => {
+    const key = c.replace(/_([a-z])/g, (_, ch) => ch.toUpperCase());
+    const v = patch[key];
+    if (v === undefined) return undefined;
+    return v === null ? null : (v ? 1 : 0);
+  });
+
+  // Build the UPDATE list from only the keys the caller actually sent, so a
+  // partial patch cannot silently reset an override it did not mention.
+  const updates = ['spoc_role = VALUES(spoc_role)', 'updated_by = VALUES(updated_by)', 'updated_at = VALUES(updated_at)'];
+  cols.forEach((c, i) => { if (values[i] !== undefined) updates.push(`${c} = VALUES(${c})`); });
+
+  logger.info('Set SPOC access · contactId=' + contactId + ' · role=' + role);
+  await pool.query(
+    `INSERT INTO easyfix_client_spoc_access
+       (contact_id, client_id, spoc_role, can_view_performance, can_view_invoicing,
+        can_approve_estimates, can_view_all_stores, updated_by, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())
+     ON DUPLICATE KEY UPDATE ${updates.join(', ')}`,
+    [contactId, clientId, role,
+     values[0] === undefined ? null : values[0],
+     values[1] === undefined ? null : values[1],
+     values[2] === undefined ? null : values[2],
+     values[3] === undefined ? null : values[3],
+     actingUserId || null],
+  );
+  return { contactId, spocRole: role };
+}
+
+/*
+ * Set portal access for MANY SPOCs at once.
+ *
+ * A client with 200 store SPOCs is the normal case, not the exception, and
+ * assigning them one dialog at a time is not a workflow anybody will follow.
+ *
+ * ONE multi-row upsert rather than a loop of single upserts: 200 round trips
+ * become one statement, and the write is atomic — either every selected SPOC
+ * gets the role or none do, so a half-applied bulk change cannot leave a
+ * client's access in a state nobody intended.
+ *
+ * Partial-patch semantics match setContactAccess: a column the caller did not
+ * send is left alone on rows that already exist. That matters here because the
+ * common bulk action is "set everyone to Store SPOC" WITHOUT disturbing the
+ * one person who has a deliberate invoicing override.
+ */
+async function setContactAccessBulk(clientId, contactIds, patch, actingUserId) {
+  const ids = [...new Set(contactIds.map(Number).filter(Boolean))];
+  if (!ids.length) return { updated: 0 };
+
+  const cols = ['can_view_performance', 'can_view_invoicing', 'can_approve_estimates', 'can_view_all_stores'];
+  const role = Number(patch.spocRole);
+  const values = cols.map((c) => {
+    const key = c.replace(/_([a-z])/g, (_, ch) => ch.toUpperCase());
+    const v = patch[key];
+    if (v === undefined) return undefined;
+    return v === null ? null : (v ? 1 : 0);
+  });
+
+  const updates = ['spoc_role = VALUES(spoc_role)', 'updated_by = VALUES(updated_by)', 'updated_at = VALUES(updated_at)'];
+  cols.forEach((c, i) => { if (values[i] !== undefined) updates.push(`${c} = VALUES(${c})`); });
+
+  // Guard: only contacts that genuinely belong to this client may be touched.
+  // The route already scope-checks the client, but a crafted contactIds array
+  // must not be able to reach another tenant's SPOC.
+  const [owned] = await pool.query(
+    `SELECT id FROM tbl_client_contacts WHERE client_id = ? AND id IN (${ids.map(() => '?').join(',')})`,
+    [clientId, ...ids],
+  );
+  const ownedIds = owned.map((r) => Number(r.id));
+  if (!ownedIds.length) return { updated: 0, skipped: ids.length };
+
+  const rowSql = ownedIds.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, NOW())').join(', ');
+  const params = [];
+  for (const id of ownedIds) {
+    params.push(id, clientId, role,
+      values[0] === undefined ? null : values[0],
+      values[1] === undefined ? null : values[1],
+      values[2] === undefined ? null : values[2],
+      values[3] === undefined ? null : values[3],
+      actingUserId || null);
+  }
+
+  logger.info('Bulk set SPOC access · clientId=' + clientId + ' · contacts=' + ownedIds.length + ' · role=' + role);
+  await pool.query(
+    `INSERT INTO easyfix_client_spoc_access
+       (contact_id, client_id, spoc_role, can_view_performance, can_view_invoicing,
+        can_approve_estimates, can_view_all_stores, updated_by, updated_at)
+     VALUES ${rowSql}
+     ON DUPLICATE KEY UPDATE ${updates.join(', ')}`,
+    params,
+  );
+  return { updated: ownedIds.length, skipped: ids.length - ownedIds.length };
 }
 
 /*
@@ -1068,6 +1212,8 @@ module.exports = {
   getClientColumns,
   // contacts
   listContacts,
+  setContactAccess,
+  setContactAccessBulk,
   findDuplicateContact,
   createContact,
   updateContact,

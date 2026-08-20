@@ -903,6 +903,59 @@ async function forClient(clientId, days = CLIENT_LOOKBACK_DAYS) {
 }
 
 /*
+ * ─── Mode: one client, a CALENDAR WINDOW, optionally one reporting subtree ──
+ *
+ * forClient() answers "the last N days", which is the right shape for an ops
+ * diagnostic. The client portal asks a different question — "this month",
+ * "last month" — and a rolling lookback cannot answer it: on the 3rd of the
+ * month a 30-day window is mostly last month's work, reported under this
+ * month's heading.
+ *
+ * Same engine, same JOB_SELECT, same scoring. Only the WHERE differs:
+ *   • an inclusive checkout window rather than DATE_SUB(NOW())
+ *   • an optional tbl_job.reporting_contact_id filter, so a SPOC who does not
+ *     hold all-stores access sees only their own booking subtree — the same
+ *     scoping rule /api/client/jobs already applies.
+ *
+ * `to` is inclusive: the caller passes a date, and a job checked out at 18:40
+ * on that date belongs to it.
+ */
+async function forClientWindow({ clientId, from, to, reportingContactIds }) {
+  const [[client]] = await pool.query('SELECT client_id, client_name FROM tbl_client WHERE client_id = ?', [clientId]);
+  if (!client) {
+    const e = new Error('Client not found');
+    e.status = 404;
+    throw e;
+  }
+
+  const params = [clientId, from, to];
+  let scope = '';
+  if (Array.isArray(reportingContactIds) && reportingContactIds.length) {
+    scope = ` AND j.reporting_contact_id IN (${reportingContactIds.map(() => '?').join(',')})`;
+    params.push(...reportingContactIds);
+  }
+
+  logger.info('TAT compute · client-window · id=' + clientId + ' · ' + from + '..' + to
+    + (scope ? ' · subtree=' + reportingContactIds.length : ' · all'));
+
+  return aggregate({
+    sql: `${JOB_SELECT}
+           WHERE j.fk_client_id = ?
+             AND j.job_status IN (${COMPLETED_STATUSES.join(',')})
+             AND j.checkout_date_time IS NOT NULL
+             AND j.checkout_date_time >= ?
+             AND j.checkout_date_time < DATE_ADD(?, INTERVAL 1 DAY)
+             ${scope}
+           ORDER BY j.checkout_date_time DESC
+           LIMIT ${MAX_ROWS}`,
+    params,
+    mode: 'client-window',
+    subject: { id: client.client_id, name: client.client_name },
+    windowLabel: `Completed ${from} To ${to}`,
+  });
+}
+
+/*
  * Generic dimension modes — City, Category, Project Manager, Vertical.
  *
  * One table rather than four near-identical functions: each entry names the
@@ -1032,6 +1085,7 @@ function policy() {
 module.exports = {
   forJob,
   forClient,
+  forClientWindow,
   forTechnician,
   forDimension,
   policy,

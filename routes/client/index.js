@@ -11,7 +11,11 @@ const { sendXlsx } = require('../../utils/xlsx-export');
 const { STATUS_LABELS } = require('../../services/integration.service');
 const emailService = require('../../services/email.service');
 const logger = require('../../logger');
-const { istIsPast } = require('../../utils/ist-calendar');
+const { istIsPast, currentIstMonth, monthBounds, todayIst } = require('../../utils/ist-calendar');
+const { requireGrant } = require('../../services/client-access.service');
+const perfService = require('../../services/client-performance.service');
+const tatService = require('../../services/tat.service');
+const { getTargets, judgeAgainst } = require('../../services/client-target.service');
 
 // ─── Public: SPOC OTP login ─────────────────────────────────────────
 const identifier = Joi.alternatives(Joi.string().email(), Joi.string().pattern(/^[0-9]{10}$/));
@@ -75,7 +79,10 @@ router.post('/auth/support', validate(Joi.object({
 // ─── Protected ──────────────────────────────────────────────────────
 router.use(requireSpocAuth);
 
-router.get('/me', (req, res) => modernOk(res, { spoc: req.spoc }));
+// `access` is ADDITIVE — existing callers read res.data.spoc and are
+// untouched. Returning it here saves the portal a second round trip at boot,
+// which matters because nothing above the nav can render until it lands.
+router.get('/me', (req, res) => modernOk(res, { spoc: req.spoc, access: req.access }));
 
 /*
  * GET /api/client/me/custom-properties
@@ -201,7 +208,245 @@ router.get('/dashboard', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// Per-service × city-tier TAT + SDA completion rates.
+/*
+ * GET /api/client/access
+ *
+ * The caller's own effective grants. The client portal asks for this once at
+ * boot and hides every surface it does not hold, so the nav never offers a tab
+ * that would 403. The server still guards each gated route independently —
+ * hiding a tab is a courtesy, not a control.
+ */
+router.get('/access', (req, res) => modernOk(res, req.access));
+
+/*
+ * GET /api/client/action-queue
+ *
+ * Work that is blocked ON THE CLIENT — not the client's view of EasyFix's
+ * queue. Every item here is something no EasyFix action can clear.
+ *
+ * ONE ITEM TYPE, DELIBERATELY. A job is "awaiting your approval" when it has
+ * at least one approval-pending billing line (tbl_job_services.job_service_status = 1)
+ * and the client has neither approved nor rejected it (both timestamps null).
+ * That is the exact condition PATCH /jobs/:id/estimate/approve clears, so the
+ * queue and the action that empties it cannot drift apart.
+ *
+ * Site access, PO-pending and QC sign-off are real queue types on paper, but no
+ * column in tbl_job records them today. They are intentionally absent rather
+ * than approximated — a queue that invents items is worse than a short one.
+ * Adding them later is additive: give the row a different `type`.
+ *
+ * Query: ?limit=<1..100> (default 25)
+ */
+router.get('/action-queue', async (req, res, next) => {
+  try {
+    const limit = Math.min(Math.max(Number(req.query.limit) || 25, 1), 100);
+    const hier = await resolveClientHierarchy(req);
+    // A SPOC whose role (or override) grants all-stores visibility sees the
+    // whole client's queue; everyone else stays inside their booking subtree.
+    const scopeIds = req.access && req.access.allStores ? undefined : hierarchyFilter(hier, req);
+
+    const params = [req.spoc.client_id];
+    let mine = '';
+    if (Array.isArray(scopeIds)) {
+      mine = `AND J.reporting_contact_id IN (${scopeIds.map(() => '?').join(',')})`;
+      params.push(...scopeIds);
+    }
+    params.push(limit);
+
+    logger.info('Fetch client action queue · clientId=' + req.spoc.client_id + ' · limit=' + limit);
+    const [rows] = await pool.query(`
+      SELECT J.job_id, J.job_reference_id, J.client_ref_id, J.job_status,
+             J.ticket_created_date_time,
+             TIMESTAMPDIFF(HOUR, J.ticket_created_date_time, NOW()) DIV 24 AS age_days,
+             COALESCE(city.city_name, 'Unknown') AS city_name,
+             COALESCE(TSC.service_catg_name, 'Uncategorised') AS category,
+             ROUND(SUM(js.total_charge * COALESCE(js.quantity, 1) + COALESCE(js.material_charge, 0)), 2) AS estimate_value
+        FROM tbl_job J
+        JOIN tbl_job_services js ON js.job_id = J.job_id AND js.job_service_status = 1
+        LEFT JOIN tbl_address      A    ON A.customer_id = J.fk_customer_id AND A.address_id = J.fk_address_id
+        LEFT JOIN tbl_city         city ON city.city_id  = A.city_id
+        LEFT JOIN tbl_service_catg TSC  ON TSC.service_catg_id = J.fk_service_catg_id
+       WHERE J.fk_client_id = ?
+         ${mine}
+         AND J.approved_on_date_time IS NULL
+         AND J.approval_reject_date_time IS NULL
+         AND J.job_status NOT IN (3,5,6)
+       GROUP BY J.job_id
+       ORDER BY age_days DESC, J.job_id ASC
+       LIMIT ?`, params);
+
+    const items = rows.map((r) => ({
+      type: 'approval',
+      jobId: Number(r.job_id),
+      reference: r.job_reference_id || r.client_ref_id || null,
+      city: r.city_name,
+      category: r.category,
+      ageDays: Number(r.age_days || 0),
+      estimateValue: r.estimate_value == null ? null : Number(r.estimate_value),
+      // The action that clears this row, so the FE does not hard-code a mapping
+      // from type to endpoint.
+      action: { label: 'Approve', method: 'PATCH', path: `/api/client/jobs/${r.job_id}/estimate/approve` },
+    }));
+
+    logger.info('Action queue: ' + items.length + ' item(s) awaiting the client');
+    modernOk(res, { items, total: items.length, types: ['approval'] });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/client/performance
+ *
+ * The client's performance book. Composed from TWO sources, deliberately:
+ *
+ *   TAT / SLA / approval → services/tat.service.js via forClientWindow().
+ *     That engine is the ONE place TAT is computed. This route does not
+ *     re-derive a single hour of it. The retired category × city-tier day
+ *     count that used to live in client-performance.service.js is gone.
+ *
+ *   volume / age / FTFR  → services/client-performance.service.js.
+ *     Everything the TAT engine cannot answer, because it only loads
+ *     COMPLETED jobs and only scores segment targets.
+ *
+ * WHY THE PAGE SHOWS TWO SCORES. The engine splits ownership: segments 1, 2
+ * and 4 are EasyFix's clocks, segment 3 (estimate sent → client decided) is
+ * the CLIENT's. Folding them into one number would let a client's own slow
+ * approvals show up as an EasyFix SLA miss. So EF Score and Client Score are
+ * reported side by side and never averaged together.
+ *
+ * GATED. requireGrant('performance') 403s a SPOC whose role and overrides do
+ * not include it, naming the flag an administrator would set.
+ *
+ * Query: ?from=YYYY-MM-DD&to=YYYY-MM-DD (default: the current IST month)
+ *        ?dim=city|category|technician|jobType (default: city)
+ *        ?months=<1..24>                       (volume series, default 6)
+ */
+const CLIENT_ROLLUP_DIMS = {
+  city: 'City',
+  category: 'Category',
+  technician: 'Technician',
+  jobType: 'Local / Travel',
+};
+
+router.get('/performance', requireGrant('performance'), async (req, res, next) => {
+  try {
+    // The default window is the CURRENT IST MONTH, resolved with the shared
+    // IST helpers rather than `new Date().toISOString()`. A UTC date is the
+    // previous day between 00:00 and 05:30 IST, which would silently shift a
+    // month-to-date figure on the first of every month for anyone opening the
+    // page before breakfast.
+    const from = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.from || ''))
+      ? req.query.from
+      : monthBounds(currentIstMonth()).start;
+    const to = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.to || '')) ? req.query.to : todayIst();
+    const dim = Object.prototype.hasOwnProperty.call(CLIENT_ROLLUP_DIMS, String(req.query.dim))
+      ? String(req.query.dim) : 'city';
+
+    const hier = await resolveClientHierarchy(req);
+    const reportingContactIds = req.access && req.access.allStores ? undefined : hierarchyFilter(hier, req);
+    const scope = { clientId: req.spoc.client_id, from, to, reportingContactIds };
+
+    logger.info('Fetch client performance · clientId=' + req.spoc.client_id + ' · ' + from + '..' + to + ' · dim=' + dim);
+
+    const targets = await getTargets(req.spoc.client_id);
+    // Independent reads — run them together. The TAT engine is the heavy one
+    // (it scores every completed job in the window in JS), so serialising the
+    // three cheap SQL aggregates behind it would be pure added latency.
+    const [book, closure, ftf, series] = await Promise.all([
+      tatService.forClientWindow(scope),
+      perfService.closureStats(scope),
+      perfService.firstTimeFix(scope),
+      perfService.volume(scope, req.query.months),
+    ]);
+
+    const sum = book.summary;
+
+    modernOk(res, {
+      window: { from, to, label: book.windowLabel },
+      targets,
+
+      /*
+       * The engine's own output, passed through rather than reshaped. The
+       * segment list carries its own labels and owners, so the UI never has
+       * to hard-code "Seg 3 is the client's" — if the spec adds a segment the
+       * page grows a row without a frontend change.
+       */
+      tat: {
+        jobsAnalysed: sum.jobsAnalysed,
+        truncated: book.truncated,
+        rowCap: book.rowCap,
+        efScorePct: sum.efScorePct,
+        efMet: sum.efMet,
+        efTotal: sum.efTotal,
+        efStatus: judgeAgainst('sla_pct', sum.efScorePct, targets.sla_pct),
+        clientScorePct: sum.clientScorePct,
+        clientMet: sum.clientMet,
+        clientEvaluated: sum.clientEvaluated,
+        segments: sum.segments,
+        labels: sum.labels,
+        avgBookingLeadHours: sum.avgBookingLeadHours,
+        avgPunctualityHours: sum.avgPunctualityHours,
+        arrivedOnTimePct: sum.arrivedOnTimePct,
+        // Caveats travel WITH the numbers. A page that shows a score without
+        // saying "stop-clock is not implemented" is quietly overstating it.
+        assumptions: book.assumptions,
+      },
+
+      breakdown: {
+        dimension: dim,
+        label: CLIENT_ROLLUP_DIMS[dim],
+        rows: sum.rollups[dim] || [],
+      },
+      dimensions: Object.entries(CLIENT_ROLLUP_DIMS).map(([key, label]) => ({ key, label })),
+
+      closure: {
+        ...closure,
+        avgAgeStatus: judgeAgainst('avg_age_days', closure.avgAgeDays, targets.avg_age_days),
+      },
+      firstTimeFix: {
+        ...ftf,
+        ftfrStatus: judgeAgainst('ftfr_pct', ftf.ftfrPct, targets.ftfr_pct),
+        revisitStatus: judgeAgainst('revisit_pct', ftf.revisitPct, targets.revisit_pct),
+      },
+      volume: series,
+    });
+  } catch (e) {
+    if (e && e.status === 404) return modernError(res, 404, e.message);
+    next(e);
+  }
+});
+
+/*
+ * ⚠ DEPRECATED — GET /api/client/services/sda-tat
+ * ═══════════════════════════════════════════════════════════════════════════
+ * This route carries the RETIRED category × city-tier day-count definition of
+ * TAT. It is not the platform's TAT any more: services/tat.service.js
+ * (spec v1.0, four segments, hour targets, locality-based) is.
+ *
+ * NO LIVE CONSUMER REMAINS IN THIS ORGANISATION'S CODE. Easyfix_Client_App
+ * declared a ServiceTierTable component against it, but that component was
+ * never rendered — it was dead code, and as of 2026-08-21 it has been replaced
+ * by CategoryPerformanceTable, which reads
+ * GET /api/client/performance?dim=category from the TAT engine instead.
+ *
+ * WHY THE SHAPES COULD NOT SIMPLY BE SWAPPED:
+ *   • the engine deliberately has NO tier dimension — 86 of 680 tbl_city rows
+ *     have no tier, and inspection showed they are states and villages, not
+ *     cities. Coverage-based LOCAL / TRAVEL replaced it.
+ *   • the engine has no SDA metric at all; punctuality (Seg 1) is the nearest
+ *     equivalent and is measured differently.
+ * So the app got a new table rather than the same table with new numbers.
+ *
+ * WHY IT IS STILL MOUNTED. Older app builds already in the field, and any
+ * external caller nobody has inventoried, may still hit it. Removing a
+ * client-facing endpoint is a separate, deliberate decision from retiring the
+ * definition behind it.
+ *
+ * TO RETIRE IT: confirm no traffic in the access logs for a full release
+ * cycle, then delete this route and its inline thresholds. Until then this is
+ * the LAST copy of the old definition in the tree — do not add another.
+ *
+ * Per-service × city-tier TAT + SDA completion rates.
+ */
 //   TAT (Turn-Around Time): job age (24h days, ticket-created → completion/close)
 //        must be ≤ the pre-defined TAT for that category × tier. Denominator = all jobs.
 //   SDA (Same-Day Attendance): technician checked in on/before the appointment date.
