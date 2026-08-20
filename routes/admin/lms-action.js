@@ -10,6 +10,7 @@ const lms = require('../../services/lms.service');
 const pushDelivery = require('../../services/push-delivery.service');
 const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
+const { streamStyledXlsx } = require('../../utils/xlsx-styled-export');
 const logger = require('../../logger');
 
 /*
@@ -107,6 +108,92 @@ router.get('/action/pending', requireLmsAction, validate(pendingQuery, 'query'),
     }));
 
     modernOk(res, { ...page, rows });
+  } catch (e) { next(e); }
+});
+
+/*
+ * The drilldown as a spreadsheet.
+ *
+ * It takes THE SAME query parameters as the list and runs THE SAME service
+ * call — the export is a mirror of what is on screen, not a second query that
+ * happens to look similar. The CRM builds one URLSearchParams and uses it for
+ * both, so the two cannot describe different sets. (jobs/export.xlsx carries
+ * the same rule in a comment, and it is there because the two drifted once.)
+ *
+ * Mobile numbers are NOT included. The inherited maskMobile would mask them
+ * anyway, and a column of "9876••••••" is worse than no column: it looks like
+ * data and is useless for the one thing a phone number is for. The EFX id is
+ * the identifier that actually travels between systems.
+ */
+router.get('/action/pending/export.xlsx', requireLmsAction, validate(pendingQuery, 'query'), async (req, res, next) => {
+  try {
+    const scope = buildRequestScope(req);
+    /* The export ceiling is the endpoint's own max, not an invented one, so a
+     * sheet can never silently contain less than the list claims. */
+    const page = await action.pendingList({ ...req.query, limit: 500, offset: 0, scope });
+    /* Chase history is added by the LIST route, not by the service, so the
+     * export has to ask for it too — otherwise the Last Chased column is
+     * silently blank for everyone and reads as "never chased". */
+    const summary = await chase.chaseSummaryFor(page.rows.map((r) => r.easyfixer_id));
+    page.rows = page.rows.map((r) => ({
+      ...r,
+      last_chased_at: summary.get(Number(r.easyfixer_id))?.lastChasedAt ?? null,
+      chase_count_7d: summary.get(Number(r.easyfixer_id))?.count7d ?? 0,
+    }));
+    logger.info('Export LMS pending xlsx · detector=' + (req.query.detector ?? '-')
+      + ' · status=' + (req.query.status ?? '-') + ' · rows=' + page.rows.length + ' of ' + page.total);
+
+    const truncated = page.total > page.rows.length;
+    const meta = [
+      `Generated: ${page.today}`,
+      `Filter: ${req.query.detector || 'all outstanding'}${req.query.status ? ' · ' + req.query.status : ''}`,
+      /* Say it on the sheet, not just in a log. A silently truncated export
+       * reads as "this is everyone", which is how a chase list loses people. */
+      truncated
+        ? `Showing the first ${page.rows.length} of ${page.total} — narrow the filter to export the rest`
+        : `Total: ${page.total} row${page.total === 1 ? '' : 's'}`,
+    ];
+
+    await streamStyledXlsx(res, `lms-pending_${page.today}.xlsx`, {
+      title: 'EasyFix  ·  Training Pending',
+      meta,
+      sheetName: 'Pending',
+      columns: [
+        { header: 'EFX ID', key: 'efx_id', width: 12, align: 'center' },
+        { header: 'Technician', key: 'technician', width: 28, align: 'left' },
+        { header: 'City', key: 'city', width: 18, align: 'left' },
+        { header: 'Grade', key: 'grade', width: 10, align: 'center' },
+        { header: 'Module', key: 'course', width: 30, align: 'left' },
+        { header: 'Progress', key: 'progress', width: 12, align: 'center' },
+        { header: 'Status', key: 'status', width: 14, align: 'center' },
+        { header: 'Assigned On', key: 'assigned_on', width: 14, align: 'center' },
+        { header: 'Due Date', key: 'due_date', width: 14, align: 'center' },
+        { header: 'Days Late', key: 'days_late', width: 11, align: 'center' },
+        { header: 'Last Chased', key: 'last_chased', width: 18, align: 'center' },
+        { header: 'Chases (7d)', key: 'chases_7d', width: 12, align: 'center' },
+      ],
+      rows: page.rows.map((r) => {
+        const due = r.due_date ? String(r.due_date).slice(0, 10) : '';
+        const daysLate = due && due < page.today
+          ? Math.round((Date.parse(`${page.today}T00:00:00Z`) - Date.parse(`${due}T00:00:00Z`)) / 86400000)
+          : '';
+        return {
+          efx_id: r.easyfixer_id,
+          technician: r.technician_name || '',
+          city: r.city_name || '',
+          grade: r.grade || '',
+          course: r.course_name || '',
+          progress: `${r.videos_done}/${r.videos_total}`,
+          status: r.status,
+          assigned_on: r.assigned_on ? String(r.assigned_on).slice(0, 10) : '',
+          due_date: due,
+          days_late: daysLate,
+          last_chased: r.last_chased_at ? String(r.last_chased_at).slice(0, 16).replace('T', ' ') : 'Never',
+          chases_7d: r.chase_count_7d ?? 0,
+        };
+      }),
+      emptyMessage: 'Nothing outstanding for this filter.',
+    });
   } catch (e) { next(e); }
 });
 

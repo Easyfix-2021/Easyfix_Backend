@@ -51,6 +51,9 @@ async function demandedKey(method, path) {
 const EXPECTED = [
   ['get', '/action/home', 'isLmsAction'],
   ['get', '/action/pending', 'isLmsAction'],
+  // The export mirrors the list, so it needs exactly the list's permission —
+  // no more (it would leak) and no less (it would be unreachable).
+  ['get', '/action/pending/export.xlsx', 'isLmsAction'],
   ['get', '/field/my-city', 'isLmsAction'],
   ['post', '/chase/nudge', 'isLmsAction'],
   ['post', '/chase/mark-chased', 'isLmsAction'],
