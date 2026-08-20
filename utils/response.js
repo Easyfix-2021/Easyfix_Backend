@@ -3,7 +3,7 @@
  *
  *  modern  — used by /api/admin, /api/client, /api/mobile, /api/shared, /api/auth
  *              { success: true,  data: ..., message?: ... }
- *              { success: false, error: "msg", details?: {...} }
+ *              { success: false, error: "msg", code?: "APP_CODE", details?: {...} }
  *
  *  legacy  — used by /api/integration/v1/* ONLY
  *              Mirrors the Dropwizard :8090 contract exactly, byte-for-byte.

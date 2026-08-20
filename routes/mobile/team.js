@@ -61,6 +61,27 @@ router.get('/members', validate(memberListQuery, 'query'), async (req, res, next
 });
 
 router.get(
+  '/members/:memberId/jobs',
+  validate(Joi.object({
+    memberId: Joi.number().integer().positive().required(),
+  }), 'params'),
+  validate(memberListQuery, 'query'),
+  async (req, res, next) => {
+    try {
+      logger.info(`Fetching paged team member jobs · memberId=${req.params.memberId} page=${req.query.page}`);
+      modernOk(res, await team.getMemberJobs(
+        req.tech.efr_id,
+        Number(req.params.memberId),
+        req.query,
+      ));
+    } catch (error) {
+      if (error.status) return modernError(res, error.status, error.message);
+      return next(error);
+    }
+  },
+);
+
+router.get(
   '/members/:memberId',
   validate(Joi.object({
     memberId: Joi.number().integer().positive().required(),

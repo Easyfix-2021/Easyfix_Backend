@@ -6,6 +6,16 @@ function isIntegrationRoute(req) {
   return req.originalUrl.startsWith('/api/integration/');
 }
 
+const PUBLIC_ERROR_CODE = /^[A-Z][A-Z0-9_]{1,63}$/;
+const PRIVATE_ERROR_CODE = /^(?:ER_|ERR_|SQLSTATE|E(?:ACCES|CONN|EXIST|ISDIR|LOOP|MFILE|NOENT|NOTDIR|PERM|PIPE|TIMEDOUT))/;
+
+function safePublicErrorCode(err, status) {
+  if (status < 400 || status >= 500) return null;
+  const code = String(err?.code || '');
+  if (!PUBLIC_ERROR_CODE.test(code) || PRIVATE_ERROR_CODE.test(code)) return null;
+  return code;
+}
+
 function notFound(req, res) {
   // Distinguish an UNMATCHED ROUTE (Express fell through to here) from a
   // handler's resource-404. The message names the method so the log + the
@@ -41,8 +51,10 @@ function errorHandler(err, req, res, _next) {
     success: false,
     error: status >= 500 ? 'Internal Server Error' : err.message,
   };
+  const code = safePublicErrorCode(err, status);
+  if (code) body.code = code;
   if (err.details) body.details = err.details;
   return res.status(status).json(body);
 }
 
-module.exports = { notFound, errorHandler };
+module.exports = { notFound, errorHandler, _internals: { safePublicErrorCode } };

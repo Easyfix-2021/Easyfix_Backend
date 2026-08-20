@@ -7,6 +7,7 @@ function fakePool({
   openRequest = null,
   lifecycleStatus = 'ACTIVE',
   balance = 500,
+  panCardNumber = 'ABCDE1234F',
 } = {}) {
   const calls = [];
   const conn = {
@@ -20,7 +21,11 @@ function fakePool({
     async query(sql, params) {
       calls.push({ kind: 'query', sql, params });
       if (/SELECT current_balance/.test(sql)) {
-        return [[{ current_balance: balance, lifecycle_status: lifecycleStatus }]];
+        return [[{
+          current_balance: balance,
+          lifecycle_status: lifecycleStatus,
+          pan_card_number: panCardNumber,
+        }]];
       }
       if (/SELECT d\.efr_bank_id/.test(sql)) {
         return [[{
@@ -54,12 +59,39 @@ test('withdrawal creation serializes on technician without inverting finance loc
 
   const queries = db.calls.filter((call) => call.kind === 'query');
   assert.match(queries[0].sql, /tbl_easyfixer[\s\S]*FOR UPDATE/);
+  assert.match(queries[0].sql, /pan_card_number/);
   const pendingRead = queries.find((call) => /SELECT request_id/.test(call.sql));
   assert.ok(pendingRead);
   assert.doesNotMatch(pendingRead.sql, /FOR UPDATE/);
   assert.ok(
     queries.findIndex((call) => /SELECT current_balance/.test(call.sql))
       < queries.findIndex((call) => /SELECT request_id/.test(call.sql)),
+  );
+});
+
+test('withdrawal requires PAN before bank lookup or request mutation', async () => {
+  const db = fakePool({ panCardNumber: '   ' });
+  await assert.rejects(
+    withdrawal.requestWithdrawal(7, { amount: 100 }, db),
+    (error) => error.code === 'PAN_REQUIRED'
+      && error.status === 400
+      && error.message === 'Add PAN details before withdrawing',
+  );
+  assert.equal(db.conn.rolledBack, true);
+  assert.equal(db.conn.committed, false);
+  assert.equal(
+    db.calls.filter((call) => call.kind === 'query').length,
+    1,
+  );
+  assert.equal(
+    db.calls.some((call) => call.kind === 'query'
+      && /tbl_easyfixer_bank_details/.test(call.sql)),
+    false,
+  );
+  assert.equal(
+    db.calls.some((call) => call.kind === 'query'
+      && /tbl_easyfixer_withdrawal_request/.test(call.sql)),
+    false,
   );
 });
 

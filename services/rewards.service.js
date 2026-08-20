@@ -1,5 +1,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
+const s3Storage = require('../utils/s3-storage');
 // Namespace import, not a destructured one: `getProperty` is read at CALL
 // time so a properties reload (and a test) can change the answer without the
 // module holding a stale binding.
@@ -48,6 +49,8 @@ const REASON = Object.freeze({
 const CLAIM_STATUSES = Object.freeze(['ORDERED', 'PACKED', 'SENT', 'DELIVERED', 'REJECTED']);
 /* The forward pipeline the technician sees. REJECTED is an exit, not a step. */
 const CLAIM_PIPELINE = Object.freeze(['ORDERED', 'PACKED', 'SENT', 'DELIVERED']);
+const REWARD_IMAGE_RESOLUTION_CONCURRENCY = 5;
+const MOBILE_REWARD_SHOP_LIMIT = 50;
 
 const COMPLETED_JOB_STATUSES = [3, 5];
 const REFERRAL_RECONCILE_LIMIT = 100;
@@ -369,6 +372,89 @@ async function listItems({ q, includeRetired = false, limit = 200, offset = 0 } 
   };
 }
 
+/*
+ * The mobile Shop first paint needs only the active product cards. Keep this
+ * projection separate from `listItems`: the admin catalogue also needs retired
+ * rows, claim counts, pagination totals and audit timestamps, while calculating
+ * those on every technician summary request is unused work.
+ *
+ * There is deliberately no OFFSET or total-count query here. The current app
+ * renders one bounded catalogue and the server enforces the 50-card ceiling
+ * even if a future caller supplies a larger value.
+ */
+async function listMobileShopItems({ limit = MOBILE_REWARD_SHOP_LIMIT } = {}) {
+  const take = Math.min(
+    Math.max(Number(limit) || MOBILE_REWARD_SHOP_LIMIT, 1),
+    MOBILE_REWARD_SHOP_LIMIT,
+  );
+  const [rows] = await pool.query(
+    `SELECT i.id, i.name, i.description, i.image_key, i.points_cost, i.sizes, i.stock
+       FROM reward_items i
+      WHERE i.status = 1
+      ORDER BY i.points_cost ASC, i.id ASC
+      LIMIT ?`,
+    [take],
+  );
+  return itemsForMobile(rows.map(({ sizes, ...row }) => ({
+    ...row,
+    sizeOptions: parseSizes(sizes),
+  })));
+}
+
+/**
+ * Mobile DTO for a bounded shop page. Raw object-store keys stay server-side;
+ * one failed signature degrades only that product image, not the whole shop.
+ */
+async function resolveRewardImageUrl(storedValue) {
+  const stored = String(storedValue || '').trim();
+  if (!stored) return null;
+  if (/^(https?:\/\/|data:image\/)/i.test(stored) || stored.startsWith('/')) return stored;
+
+  /*
+   * `reward_items.image_key` stores an object key, not a job-image filename.
+   * Canonical keys can therefore be signed directly: probing every product
+   * with HeadObject first doubles S3 traffic and lets one 50-item shop paint
+   * fan out into 100+ AWS requests. Bare legacy values still use the shared
+   * resolver, whose HEAD-based migration fallback is bounded by the worker
+   * pool in `itemsForMobile` below.
+   */
+  if (s3Storage.isEnabled() && stored.includes('/')) {
+    return s3Storage.getPresignedUrl(stored);
+  }
+  return s3Storage.resolveImageUrl(stored);
+}
+
+async function itemsForMobile(rows = []) {
+  const source = Array.isArray(rows) ? rows : [];
+  const result = new Array(source.length);
+  let nextIndex = 0;
+
+  const worker = async () => {
+    while (nextIndex < source.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      const row = source[index];
+      const { image_key: imageKey, ...item } = row;
+      let imageUrl = null;
+      if (imageKey) {
+        try {
+          imageUrl = await resolveRewardImageUrl(imageKey);
+        } catch (error) {
+          logger.warn(
+            { err: error.message, rewardItemId: Number(row.id) },
+            'Reward item image URL resolution failed',
+          );
+        }
+      }
+      result[index] = { ...item, imageUrl };
+    }
+  };
+
+  const workerCount = Math.min(REWARD_IMAGE_RESOLUTION_CONCURRENCY, source.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return result;
+}
+
 async function getItem(id) {
   const [[row]] = await pool.query('SELECT * FROM reward_items WHERE id = ?', [Number(id)]);
   if (!row) throw mkErr(404, 'reward item not found');
@@ -443,10 +529,90 @@ async function retireItem(id) {
  * The delivery address is COPIED onto the claim. Where a parcel was sent must
  * not change when the technician later edits his profile.
  */
-async function claimItem(efrId, { itemId, size, address }) {
+async function claimItem(efrId, {
+  itemId,
+  size,
+  address,
+  idempotencyKey,
+}) {
+  const claimKey = String(idempotencyKey || '').trim();
+  if (!claimKey) throw mkErr(400, 'Idempotency-Key is required for reward claims');
+  if (claimKey.length > 128) throw mkErr(400, 'Idempotency-Key too long (max 128 chars)');
+
+  const chosenSize = String(size || '').trim();
+  const delivery = {
+    line: String(address?.line || '').trim(),
+    city: String(address?.city || '').trim(),
+    pincode: String(address?.pincode || '').trim(),
+    phone: String(address?.phone || '').replace(/\D/g, ''),
+  };
+  if (delivery.line.length < 5 || delivery.line.length > 500) {
+    throw mkErr(400, 'a complete delivery address is required');
+  }
+  if (delivery.city.length < 2 || delivery.city.length > 120) {
+    throw mkErr(400, 'a delivery city is required');
+  }
+  if (!/^[1-9]\d{5}$/.test(delivery.pincode)) {
+    throw mkErr(400, 'enter a valid 6-digit delivery pincode');
+  }
+  if (!/^[6-9]\d{9}$/.test(delivery.phone)) {
+    throw mkErr(400, 'enter a valid 10-digit delivery phone number');
+  }
+
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+
+    // Lock one row shared by EVERY claim for this technician before reading
+    // the derived points balance. Product locks alone only serialize claims
+    // for the same item; two different products could otherwise both spend
+    // the same points concurrently.
+    await conn.query(
+      'SELECT efr_id FROM tbl_easyfixer WHERE efr_id = ? FOR UPDATE',
+      [Number(efrId)],
+    );
+
+    /*
+     * The shared HTTP idempotency ledger normally replays the response before
+     * this service runs. This claim-owned key closes the remaining crash
+     * window: the claim transaction may commit and the generic response ledger
+     * may then fail to persist. A retry reaches this transaction, locks the
+     * same technician row, and finds the committed claim before touching
+     * product stock or writing a second points debit.
+     */
+    const [[existingClaim]] = await conn.query(
+      `SELECT id, item_id, size, points_spent,
+              address_line, address_city, address_pincode, address_phone
+         FROM reward_claims
+        WHERE easyfixer_id = ? AND idempotency_key = ?
+        LIMIT 1
+        FOR UPDATE`,
+      [Number(efrId), claimKey],
+    );
+    if (existingClaim) {
+      const samePayload = Number(existingClaim.item_id) === Number(itemId)
+        && String(existingClaim.size || '') === chosenSize
+        && String(existingClaim.address_line || '') === delivery.line
+        && String(existingClaim.address_city || '') === delivery.city
+        && String(existingClaim.address_pincode || '') === delivery.pincode
+        && String(existingClaim.address_phone || '') === delivery.phone;
+      if (!samePayload) {
+        throw mkErr(409, 'Idempotency-Key reused with a different reward claim', {
+          code: 'IDEMPOTENCY_KEY_REUSED',
+        });
+      }
+
+      const [[currentBalance]] = await conn.query(
+        'SELECT COALESCE(SUM(delta), 0) AS balance FROM reward_points_ledger WHERE easyfixer_id = ?',
+        [Number(efrId)],
+      );
+      await conn.commit();
+      return {
+        claimId: Number(existingClaim.id),
+        pointsSpent: Number(existingClaim.points_spent),
+        balance: Number(currentBalance.balance) || 0,
+      };
+    }
 
     const [[item]] = await conn.query(
       'SELECT id, name, points_cost, sizes, stock, status FROM reward_items WHERE id = ? FOR UPDATE',
@@ -456,7 +622,6 @@ async function claimItem(efrId, { itemId, size, address }) {
     if (Number(item.status) !== 1) throw mkErr(409, 'this reward is no longer available');
 
     const sizeOptions = parseSizes(item.sizes);
-    const chosenSize = String(size || '').trim();
     if (sizeOptions.length && !sizeOptions.includes(chosenSize)) {
       throw mkErr(400, 'choose a size', { sizes: sizeOptions });
     }
@@ -480,22 +645,20 @@ async function claimItem(efrId, { itemId, size, address }) {
     );
     if (stockUpdate.affectedRows === 0) throw mkErr(409, 'this reward is out of stock');
 
-    const line = String(address?.line || '').trim();
-    if (!line) throw mkErr(400, 'a delivery address is required');
-
     const now = new Date();
     const [ins] = await conn.query(
       `INSERT INTO reward_claims
-         (easyfixer_id, item_id, item_name, size, points_spent,
+         (easyfixer_id, item_id, item_name, size, points_spent, idempotency_key,
           address_line, address_city, address_pincode, address_phone,
           status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ORDERED', ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ORDERED', ?, ?)`,
       [
         Number(efrId), Number(itemId), item.name, chosenSize || null, cost,
-        line.slice(0, 500),
-        String(address?.city || '').trim().slice(0, 120) || null,
-        String(address?.pincode || '').trim().slice(0, 12) || null,
-        String(address?.phone || '').trim().slice(0, 20) || null,
+        claimKey,
+        delivery.line,
+        delivery.city,
+        delivery.pincode,
+        delivery.phone,
         now, now,
       ],
     );
@@ -523,7 +686,7 @@ async function claimsFor(efrId, { limit = 50, offset = 0 } = {}) {
   const skip = Math.max(Number(offset) || 0, 0);
   const [rows] = await pool.query(
     `SELECT id, item_id, item_name, size, points_spent, status, tracking_ref,
-            reject_reason, address_line, address_city, address_pincode,
+            reject_reason, address_line, address_city, address_pincode, address_phone,
             created_at, updated_at
        FROM reward_claims
       WHERE easyfixer_id = ?
@@ -531,7 +694,11 @@ async function claimsFor(efrId, { limit = 50, offset = 0 } = {}) {
       LIMIT ? OFFSET ?`,
     [Number(efrId), take, skip],
   );
-  return { rows, limit: take, offset: skip };
+  const [[{ total }]] = await pool.query(
+    'SELECT COUNT(*) AS total FROM reward_claims WHERE easyfixer_id = ?',
+    [Number(efrId)],
+  );
+  return { rows, total: Number(total) || 0, limit: take, offset: skip };
 }
 
 async function listClaims({ status, q, limit = 100, offset = 0 } = {}) {
@@ -1471,12 +1638,14 @@ module.exports = {
   adminLedger,
   adjustPoints,
   listItems,
+  listMobileShopItems,
   getItem,
   createItem,
   updateItem,
   retireItem,
   claimItem,
   claimsFor,
+  itemsForMobile,
   listClaims,
   updateClaim,
   referralCodeFor,

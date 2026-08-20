@@ -25,6 +25,7 @@ afterEach(() => {
 function identityDb({
   failUpdate = null,
   conflict = false,
+  panConflict = false,
   generatedColumn = false,
   failLock = null,
 } = {}) {
@@ -45,7 +46,10 @@ function identityDb({
       if (/information_schema\.columns/i.test(text)) {
         return [generatedColumn ? [{ 1: 1 }] : [], []];
       }
-      if (/SELECT 1 AS conflict/i.test(text)) return [[conflict ? { conflict: 1 } : null].filter(Boolean), []];
+      if (/SELECT 1 AS conflict/i.test(text)) {
+        const duplicate = /pan_card_number/i.test(text) ? panConflict : conflict;
+        return [[duplicate ? { conflict: 1 } : null].filter(Boolean), []];
+      }
       if (/^\s*UPDATE tbl_easyfixer/i.test(text)) {
         if (failUpdate) throw failUpdate;
         return [{ affectedRows: 1 }, []];
@@ -210,6 +214,108 @@ test('the duplicate guard matches the generated column semantics', async () => {
   assert.deepEqual(guard.params, ['123456789012', 8379], 'value is trimmed, self excluded');
 });
 
+test('PAN guard normalizes case, ignores deleted rows, and excludes the current technician', async () => {
+  const database = identityDb();
+  await identity.saveIdentityDetails(8379, { panNumber: ' abcde1234f ' }, { database });
+
+  const guard = guardQueries(database).find((event) => /pan_card_number/i.test(event.sql));
+  assert.ok(guard, 'the PAN conflict read must run before the write');
+  assert.match(guard.sql, /NOT \(efr_status <=> 3\)/i);
+  assert.match(guard.sql, /NULLIF\(UPPER\(TRIM\(pan_card_number\)\), ''\) = \?/i);
+  assert.match(guard.sql, /efr_id <> \?/i);
+  assert.deepEqual(guard.params, ['ABCDE1234F', 8379]);
+
+  const update = database.events.find((event) => (
+    event.type === 'query' && /^\s*UPDATE tbl_easyfixer/i.test(event.sql)
+  ));
+  assert.equal(update.params[2], 'ABCDE1234F');
+});
+
+test('rejects a duplicate PAN before UPDATE without exposing the PAN', async () => {
+  const database = identityDb({ panConflict: true });
+
+  await assert.rejects(
+    identity.saveIdentityDetails(8379, { panNumber: 'ABCDE1234F' }, { database }),
+    (error) => (
+      error.status === 409
+      && error.code === 'PAN_ALREADY_REGISTERED'
+      && error.details?.code === 'PAN_ALREADY_REGISTERED'
+      && !error.message.includes('ABCDE1234F')
+      && !String(error.stack || '').includes('ABCDE1234F')
+    ),
+  );
+
+  assert.equal(
+    database.events.some((event) => event.type === 'query' && /^\s*UPDATE tbl_easyfixer/i.test(event.sql)),
+    false,
+  );
+  assert.ok(database.events.some((event) => event.type === 'rollback'));
+});
+
+test('maps an authoritative PAN UNIQUE race to the same redacted 409', async () => {
+  const duplicateError = new Error(
+    "Duplicate entry 'ABCDE1234F' for key 'uq_easyfixer_active_pan'",
+  );
+  duplicateError.code = 'ER_DUP_ENTRY';
+  const database = identityDb({ failUpdate: duplicateError });
+
+  await assert.rejects(
+    identity.saveIdentityDetails(8379, { panNumber: 'ABCDE1234F' }, { database }),
+    (error) => (
+      error.status === 409
+      && error.code === 'PAN_ALREADY_REGISTERED'
+      && !error.message.includes('ABCDE1234F')
+      && !String(error.stack || '').includes('ABCDE1234F')
+    ),
+  );
+});
+
+test('scrubs unknown duplicate-key errors from PAN-bearing writes', async () => {
+  const duplicateError = new Error(
+    "Duplicate entry 'ABCDE1234F' for key 'some_other_unique'",
+  );
+  duplicateError.code = 'ER_DUP_ENTRY';
+  const database = identityDb({ failUpdate: duplicateError });
+
+  await assert.rejects(
+    identity.saveIdentityDetails(8379, { panNumber: 'ABCDE1234F' }, { database }),
+    (error) => (
+      error.status === undefined
+      && error.code === 'ER_DUP_ENTRY'
+      && !error.message.includes('ABCDE1234F')
+      && !String(error.stack || '').includes('ABCDE1234F')
+    ),
+  );
+});
+
+test('same PAN submissions share a redacted value lock across technician ids', async () => {
+  const first = identityDb();
+  const second = identityDb();
+  await identity.saveIdentityDetails(8379, { panNumber: 'abcde1234f' }, { database: first });
+  await identity.saveIdentityDetails(9912, { panNumber: 'ABCDE1234F' }, { database: second });
+
+  const firstLocks = lockNames(first);
+  const secondLocks = lockNames(second);
+  assert.match(firstLocks[0], /^efr_pan:[0-9a-f]{32}$/);
+  assert.equal(firstLocks[0], secondLocks[0], 'case variants must contend on the same value lock');
+  assert.equal(firstLocks[0].includes('ABCDE1234F'), false);
+  assert.equal(firstLocks[1], 'efr_doc:8379');
+  assert.equal(secondLocks[1], 'efr_doc:9912');
+});
+
+test('multi-field identity saves acquire Aadhaar then PAN then entity locks', async () => {
+  const database = identityDb();
+  await identity.saveIdentityDetails(8379, {
+    aadhaarNumber: '123456789012',
+    panNumber: 'ABCDE1234F',
+  }, { database });
+
+  const locks = lockNames(database);
+  assert.match(locks[0], /^efr_aadhaar:[0-9a-f]{32}$/);
+  assert.match(locks[1], /^efr_pan:[0-9a-f]{32}$/);
+  assert.equal(locks[2], 'efr_doc:8379');
+});
+
 test('prefers the generated column when the migration has landed', async () => {
   const database = identityDb({ generatedColumn: true });
   await identity.saveIdentityDetails(8379, { aadhaarNumber: '123456789012' }, { database });
@@ -237,13 +343,22 @@ test('serialises on the Aadhaar VALUE, not just the technician row', async () =>
 });
 
 test('a doc-only save takes no value lock and runs no duplicate query', async () => {
-  // Without this gate every PAN-only/doc-only save would hash the empty string
-  // to one lock name and serialise the endpoint globally.
+  // Without the blank gates every doc-only save would hash the empty string to
+  // one lock name and serialise the endpoint globally.
   const database = identityDb();
   await identity.saveIdentityDetails(8379, { docs: { pan: 'kyc/pan-key' } }, { database });
 
   assert.deepEqual(lockNames(database), ['efr_doc:8379']);
   assert.equal(guardQueries(database).length, 0);
+});
+
+test('PAN value-lock contention surfaces as the generic in-progress 409', async () => {
+  const database = identityDb({ failLock: 'efr_pan:' });
+
+  await assert.rejects(
+    identity.saveIdentityDetails(8379, { panNumber: 'ABCDE1234F' }, { database }),
+    (error) => error.status === 409 && error.details?.code === 'IDENTITY_UPDATE_IN_PROGRESS',
+  );
 });
 
 test('value-lock contention surfaces as the generic in-progress 409', async () => {

@@ -289,9 +289,10 @@ async function getStatus(efrId, authenticatedLifecycle = null) {
    */
   const deactivated = e.efr_status != null && Number(e.efr_status) === 0;
 
-  // Gate 2 (earning) unlock: CRM-verified AND the tech has the full identity
-  // + skills + training the first job needs. Surfaced as a dashboard checklist
-  // so the tech sees exactly what's left; job offers stay locked until true.
+  // Gate 2 (earning) unlock: CRM-verified AND the tech has the skills + training
+  // the first job needs. PAN is deliberately deferred until the first
+  // withdrawal: keep it in the checklist as payout-readiness information, but
+  // never block job access on it.
   const trainingComplete = !!trainingCompletedTime;
   // A deactivated technician can never be offered work (candidate-ranking and
   // job.service both require efr_status = 1), so report jobs as locked. This is
@@ -299,7 +300,7 @@ async function getStatus(efrId, authenticatedLifecycle = null) {
   // client change: they log in, reach the dashboard, and jobs are shown locked
   // instead of appearing available and silently never arriving.
   const jobsUnlocked = lifecycle.capabilities?.receiveNewJobs === true && !deactivated
-    && flags.isTechnicianVerified && panPresent && hasSkills && trainingComplete;
+    && flags.isTechnicianVerified && hasSkills && trainingComplete;
 
   logger.info('Returning registration status · status=' + status + ' profilePct=' + pct(e.efr_profile_perc) + ' jobsUnlocked=' + jobsUnlocked + ' deactivated=' + deactivated);
 
@@ -320,7 +321,8 @@ async function getStatus(efrId, authenticatedLifecycle = null) {
     // Additive v5.1 lifecycle contract. Old app versions ignore this field;
     // new versions use it to render PAUSED/DORMANT/re-application experiences.
     lifecycle,
-    // Gate-2 unlock checklist for the dashboard (all true ⇒ jobsUnlocked).
+    // Dashboard readiness checklist. `panPresent` is additive payout-readiness
+    // information and is not part of the jobsUnlocked predicate.
     checklist: {
       verified:         flags.isTechnicianVerified,
       panPresent,

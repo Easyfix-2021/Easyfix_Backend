@@ -134,9 +134,15 @@ test('member detail returns bounded paid jobs without unsupported commission cla
   const metricCall = calls.find((call) => /AS jobs_done/.test(call.sql));
   assert.match(metricCall.sql, /et\.job_id IS NOT NULL/);
   assert.match(metricCall.sql, /paid_job\.checkout_date_time >= \?/);
+  assert.match(metricCall.sql, /member\.efr_manager_id = \?/,
+    'the manager relation must be rechecked in the fact query');
   const jobsCall = calls.find((call) => /ORDER BY j\.checkout_date_time/.test(call.sql));
   assert.match(jobsCall.sql, /paid_job\.fk_easyfixter_id = \?/);
   assert.match(jobsCall.sql, /paid_job\.checkout_date_time >= \?/);
+  assert.match(jobsCall.sql, /member\.efr_manager_id = \?/,
+    'the manager relation must be rechecked in the bounded jobs query');
+  assert.match(jobsCall.sql, /rated_job\.checkout_date_time >= \?/,
+    'rating aggregation must stay inside the requested month');
 });
 
 test('mobile masking never returns the full number', () => {

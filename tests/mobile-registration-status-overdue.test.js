@@ -18,7 +18,7 @@ const gateRow = {
   is_identity_details_verified_by_crm: 1,
   is_personal_details_verified_by_crm: 1,
   adhaar_card_number: '123412341234',
-  pan_card_number: 'ABCDE1234F',
+  pan_card_number: null,
   efr_service_type: null,
   efr_service_category: '1',
   user_id: 99,
@@ -79,12 +79,40 @@ test('status overlays the request lifecycle and locks jobs without another overd
     'the effective receiveNewJobs capability must override the persisted jobsAllowed bit');
   assert.deepEqual(status.checklist, {
     verified: true,
-    panPresent: true,
+    panPresent: false,
     hasSkills: true,
     trainingComplete: true,
-  }, 'every non-lifecycle prerequisite is complete in this fixture');
+  }, 'PAN remains visible as payout readiness without affecting the lifecycle lock');
 
   assert.equal(fake.calls.length, 3, 'status keeps its existing bounded three-query budget');
   assert.ok(!fake.calls.some(({ sql }) => /FROM easyfixer_courses/i.test(sql)),
     'registration status must not perform a second overdue-training query');
+});
+
+test('verified technician with skills and training unlocks jobs without PAN', async () => {
+  const callsBefore = fake.calls.length;
+  const authenticatedLifecycle = {
+    status: 'ACTIVE',
+    jobsAllowed: true,
+    trainingOverdue: false,
+    capabilities: {
+      receiveNewJobs: true,
+      continueAssignedJobs: true,
+      mutateAssignedJobs: true,
+      markAttendance: true,
+      claimMoney: true,
+    },
+  };
+
+  const status = await registration.getStatus(8379, authenticatedLifecycle);
+
+  assert.equal(status.jobsUnlocked, true);
+  assert.deepEqual(status.checklist, {
+    verified: true,
+    panPresent: false,
+    hasSkills: true,
+    trainingComplete: true,
+  });
+  assert.equal(fake.calls.length - callsBefore, 3,
+    'removing the PAN job gate must not add status queries');
 });

@@ -101,6 +101,29 @@ PREPARE stmt_offer_response_window FROM @ddl_offer_response_window;
 EXECUTE stmt_offer_response_window;
 DEALLOCATE PREPARE stmt_offer_response_window;
 
+-- PHE active-month and monthly offer summaries filter by technician and then
+-- range directly on offered_at. The existing mobile-latest index has
+-- offer_status between those columns, so it cannot serve that different
+-- left-prefix. Keep both: each owns a distinct hot-path predicate. job_id and
+-- offer_status make the bounded aggregate covering after the date range.
+SET @has_offer_efr_offered = (
+  SELECT COUNT(*) FROM (
+    SELECT index_name FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'tbl_job_offer'
+     GROUP BY index_name
+    HAVING GROUP_CONCAT(column_name ORDER BY seq_in_index) = 'fk_easyfixter_id,offered_at'
+        OR GROUP_CONCAT(column_name ORDER BY seq_in_index) LIKE 'fk_easyfixter_id,offered_at,%'
+  ) equivalent_index
+);
+SET @ddl_offer_efr_offered = IF(
+  @has_offer_efr_offered = 0,
+  'ALTER TABLE tbl_job_offer ADD INDEX idx_job_offer_efr_offered (fk_easyfixter_id, offered_at, job_id, offer_status), ALGORITHM=INPLACE, LOCK=NONE',
+  'SELECT 1'
+);
+PREPARE stmt_offer_efr_offered FROM @ddl_offer_efr_offered;
+EXECUTE stmt_offer_efr_offered;
+DEALLOCATE PREPARE stmt_offer_efr_offered;
+
 SET @has_job_efr_checkout = (
   SELECT COUNT(*) FROM (
     SELECT index_name FROM information_schema.statistics

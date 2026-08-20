@@ -2,6 +2,10 @@ const { pool } = require('../db');
 const logger = require('../logger');
 const profileDetails = require('./mobile-profile-details.service');
 const { currentIstMonth, monthBounds } = require('../utils/ist-calendar');
+const {
+  JOB_AGE_DAYS_EXPR,
+  JOB_AGE_SECS_EXPR,
+} = require('../utils/job-age-sql');
 
 /*
  * Mobile "My Team" — a master technician's downline: the technicians whose
@@ -59,6 +63,31 @@ function pageValues({ page = 1, limit = 20 } = {}) {
   const p = Math.max(Number(page) || 1, 1);
   const l = Math.min(Math.max(Number(limit) || 20, 1), 50);
   return { page: p, limit: l, offset: (p - 1) * l };
+}
+
+function metricAvailability(recordedRevisitJobs = 0) {
+  return {
+    recordedRevisitJobs: num(recordedRevisitJobs),
+    rework: {
+      available: false,
+      value: null,
+      source: null,
+      reasonCode: 'NO_CANONICAL_REWORK_OUTCOME',
+    },
+    noShow: {
+      available: false,
+      value: null,
+      source: null,
+      reasonCode: 'NO_CANONICAL_JOB_NO_SHOW_OUTCOME',
+    },
+    gradeImpact: {
+      available: false,
+      points: null,
+      source: null,
+      reasonCode: 'GRADE_NOT_ATTRIBUTABLE_TO_TEAM_MEMBER',
+      explanationCode: 'CURRENT_GRADE_MODEL_HAS_NO_MEMBER_LEVEL_CAUSAL_LEDGER',
+    },
+  };
 }
 
 /*
@@ -140,6 +169,7 @@ async function listMembers(masterEfrId, { month, page, limit } = {}, db = pool) 
       `SELECT e.efr_id, e.efr_name, e.efr_no, e.efr_profile_img,
               COALESCE(j.jobs_done, 0) AS jobs_done,
               COALESCE(j.on_time_jobs, 0) AS on_time_jobs,
+              COALESCE(j.recorded_revisit_jobs, 0) AS recorded_revisit_jobs,
               j.on_time_pct,
               r.rating,
               COALESCE(p.earnings, 0) AS earnings
@@ -149,6 +179,7 @@ async function listMembers(masterEfrId, { month, page, limit } = {}, db = pool) 
                   COUNT(*) AS jobs_done,
                   SUM(j.checkin_date_time IS NOT NULL
                     AND j.checkin_date_time <= DATE_ADD(j.requested_date_time, INTERVAL 60 MINUTE)) AS on_time_jobs,
+                  SUM(COALESCE(j.visit_number, 1) > 1 OR j.revisit_reason_id IS NOT NULL) AS recorded_revisit_jobs,
                   ROUND(100 * SUM(j.checkin_date_time IS NOT NULL
                     AND j.checkin_date_time <= DATE_ADD(j.requested_date_time, INTERVAL 60 MINUTE)) / COUNT(*)) AS on_time_pct
              FROM tbl_job j
@@ -227,6 +258,7 @@ async function listMembers(masterEfrId, { month, page, limit } = {}, db = pool) 
       rating: row.rating == null ? null : Number(num(row.rating).toFixed(1)),
       onTime: num(row.on_time_jobs),
       earnings: money(row.earnings),
+      metricAvailability: metricAvailability(row.recorded_revisit_jobs),
     })),
     total: num(countResult[0]?.[0]?.total),
     page: pagination.page,
@@ -257,16 +289,7 @@ async function getMemberDetail(masterEfrId, memberEfrId, { month } = {}, db = po
 
   const [metricResult, jobsResult] = await Promise.all([
     db.query(
-      `SELECT
-         (SELECT COUNT(*)
-            FROM tbl_job j
-           WHERE j.fk_easyfixter_id = ? AND j.job_status IN (3, 5)
-             AND j.checkout_date_time >= ? AND j.checkout_date_time < ?) AS jobs_done,
-         (SELECT SUM(j.checkin_date_time IS NOT NULL
-                    AND j.checkin_date_time <= DATE_ADD(j.requested_date_time, INTERVAL 60 MINUTE))
-            FROM tbl_job j
-           WHERE j.fk_easyfixter_id = ? AND j.job_status IN (3, 5)
-             AND j.checkout_date_time >= ? AND j.checkout_date_time < ?) AS on_time_jobs,
+      `SELECT jm.jobs_done, jm.on_time_jobs, jm.recorded_revisit_jobs,
          (SELECT AVG(rc.customer_rating)
             FROM tbl_easyfixer_rating_by_customer rc
             JOIN tbl_job rated_job
@@ -283,12 +306,25 @@ async function getMemberDetail(masterEfrId, memberEfrId, { month } = {}, db = po
              AND paid_job.job_status IN (3, 5)
            WHERE et.easyfixer_id = ? AND et.transaction_type = 2
              AND et.job_id IS NOT NULL
-             AND paid_job.checkout_date_time >= ? AND paid_job.checkout_date_time < ?) AS earnings`,
+             AND paid_job.checkout_date_time >= ? AND paid_job.checkout_date_time < ?) AS earnings
+         FROM (
+           SELECT COUNT(*) AS jobs_done,
+                  SUM(j.checkin_date_time IS NOT NULL
+                    AND j.checkin_date_time <= DATE_ADD(j.requested_date_time, INTERVAL 60 MINUTE)) AS on_time_jobs,
+                  SUM(COALESCE(j.visit_number, 1) > 1 OR j.revisit_reason_id IS NOT NULL) AS recorded_revisit_jobs
+             FROM tbl_job j
+            WHERE j.fk_easyfixter_id = ? AND j.job_status IN (3, 5)
+              AND j.checkout_date_time >= ? AND j.checkout_date_time < ?
+         ) jm
+         JOIN tbl_easyfixer member
+           ON member.efr_id = ?
+          AND member.efr_manager_id = ?
+          AND member.efr_status = 1`,
       [
         memberEfrId, start, end,
         memberEfrId, start, end,
         memberEfrId, start, end,
-        memberEfrId, start, end,
+        memberEfrId, masterEfrId,
       ],
     ),
     db.query(
@@ -319,16 +355,37 @@ async function getMemberDetail(masterEfrId, memberEfrId, { month } = {}, db = po
          LEFT JOIN (
            SELECT rc.job_id, AVG(rc.customer_rating) AS job_rating
              FROM tbl_easyfixer_rating_by_customer rc
+             JOIN tbl_job rated_job
+               ON rated_job.job_id = rc.job_id
+              AND rated_job.fk_easyfixter_id = rc.easyfixer_id
+              AND rated_job.job_status IN (3, 5)
             WHERE rc.easyfixer_id = ?
+              AND rated_job.checkout_date_time >= ?
+              AND rated_job.checkout_date_time < ?
             GROUP BY rc.job_id
          ) r ON r.job_id = j.job_id
+         JOIN tbl_easyfixer member
+           ON member.efr_id = j.fk_easyfixter_id
+          AND member.efr_manager_id = ?
+          AND member.efr_status = 1
         WHERE j.fk_easyfixter_id = ? AND j.job_status IN (3, 5)
         ORDER BY j.checkout_date_time DESC, j.job_id DESC
         LIMIT 5`,
-      [memberEfrId, memberEfrId, start, end, memberEfrId, memberEfrId],
+      [
+        memberEfrId, memberEfrId, start, end,
+        memberEfrId, start, end,
+        masterEfrId, memberEfrId,
+      ],
     ),
   ]);
-  const metrics = metricResult[0]?.[0] || {};
+  const metrics = metricResult[0]?.[0];
+  if (!metrics) {
+    // The direct-report relation may have changed after the initial identity
+    // read. Never return the previously-read member data with stale access.
+    const error = new Error('team member not found');
+    error.status = 404;
+    throw error;
+  }
   return {
     efrId: Number(member.efr_id),
     name: member.efr_name || null,
@@ -341,6 +398,7 @@ async function getMemberDetail(masterEfrId, memberEfrId, { month } = {}, db = po
       rating: metrics.rating == null ? null : Number(num(metrics.rating).toFixed(1)),
       onTime: num(metrics.on_time_jobs),
       earnings: money(metrics.earnings),
+      metricAvailability: metricAvailability(metrics.recorded_revisit_jobs),
     },
     lastJobs: (jobsResult[0] || []).map((row) => ({
       jobId: Number(row.job_id),
@@ -353,10 +411,134 @@ async function getMemberDetail(masterEfrId, memberEfrId, { month } = {}, db = po
   };
 }
 
+async function getMemberJobs(masterEfrId, memberEfrId, { month, page, limit } = {}, db = pool) {
+  const selectedMonth = month || currentIstMonth();
+  const { start, end } = monthBounds(selectedMonth);
+  const pagination = pageValues({ page, limit });
+  logger.info(
+    `Team member jobs · master=${masterEfrId} member=${memberEfrId} month=${selectedMonth} page=${pagination.page}`,
+  );
+
+  const [[member]] = await db.query(
+    `SELECT efr_id
+       FROM tbl_easyfixer
+      WHERE efr_id = ?
+        AND efr_manager_id = ?
+        AND efr_status = 1
+      LIMIT 1`,
+    [memberEfrId, masterEfrId],
+  );
+  if (!member) {
+    const error = new Error('team member not found');
+    error.status = 404;
+    throw error;
+  }
+
+  const [rowsResult, countResult] = await Promise.all([
+    db.query(
+      `SELECT j.job_id,
+              COALESCE(sc.service_catg_name, st.service_type_name, CONCAT('Job #', j.job_id)) AS title,
+              cl.client_name, j.ticket_created_date_time, j.checkout_date_time,
+              ${JOB_AGE_DAYS_EXPR} AS age_days,
+              ${JOB_AGE_SECS_EXPR} AS age_secs,
+              j.visit_number, j.revisit_reason_id,
+              COUNT(tjt.fk_job_id) AS transaction_count,
+              COALESCE(SUM(tjt.efr_charge), 0) AS technician_earning,
+              r.job_rating,
+              (j.checkin_date_time IS NOT NULL
+                AND j.checkin_date_time <= DATE_ADD(j.requested_date_time, INTERVAL 60 MINUTE)) AS on_time,
+              (j.checkin_date_time IS NOT NULL
+                AND DATE(j.checkin_date_time) = DATE(COALESCE(j.original_appointment_date_time, j.requested_date_time))) AS same_day
+         FROM tbl_job j
+         JOIN tbl_easyfixer member
+           ON member.efr_id = j.fk_easyfixter_id
+          AND member.efr_manager_id = ?
+          AND member.efr_status = 1
+         LEFT JOIN tbl_job_transaction tjt ON tjt.fk_job_id = j.job_id
+         LEFT JOIN tbl_client cl ON cl.client_id = j.fk_client_id
+         LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = j.fk_service_catg_id
+         LEFT JOIN tbl_service_type st ON st.service_type_id = j.fk_service_type_id
+         LEFT JOIN (
+           SELECT rc.job_id, AVG(rc.customer_rating) AS job_rating
+             FROM tbl_easyfixer_rating_by_customer rc
+             JOIN tbl_job rated_job
+               ON rated_job.job_id = rc.job_id
+              AND rated_job.fk_easyfixter_id = rc.easyfixer_id
+              AND rated_job.job_status IN (3, 5)
+            WHERE rc.easyfixer_id = ?
+              AND rated_job.checkout_date_time >= ?
+              AND rated_job.checkout_date_time < ?
+            GROUP BY rc.job_id
+         ) r ON r.job_id = j.job_id
+        WHERE j.fk_easyfixter_id = ?
+          AND j.job_status IN (3, 5)
+          AND j.checkout_date_time >= ?
+          AND j.checkout_date_time < ?
+        GROUP BY j.job_id, sc.service_catg_name, st.service_type_name,
+                 cl.client_name, j.ticket_created_date_time, j.created_date_time,
+                 j.checkout_date_time, j.job_status, j.cancel_date_time,
+                 j.enquiry_date_time, j.visit_number, j.revisit_reason_id,
+                 r.job_rating, j.checkin_date_time, j.requested_date_time,
+                 j.original_appointment_date_time
+        ORDER BY j.checkout_date_time DESC, j.job_id DESC
+        LIMIT ? OFFSET ?`,
+      [
+        masterEfrId, memberEfrId, start, end, memberEfrId, start, end,
+        pagination.limit, pagination.offset,
+      ],
+    ),
+    db.query(
+      `SELECT COUNT(*) AS total
+         FROM tbl_job j
+         JOIN tbl_easyfixer member
+           ON member.efr_id = j.fk_easyfixter_id
+          AND member.efr_manager_id = ?
+          AND member.efr_status = 1
+        WHERE j.fk_easyfixter_id = ?
+          AND j.job_status IN (3, 5)
+          AND j.checkout_date_time >= ?
+          AND j.checkout_date_time < ?`,
+      [masterEfrId, memberEfrId, start, end],
+    ),
+  ]);
+
+  return {
+    month: selectedMonth,
+    memberEfrId: Number(memberEfrId),
+    items: (rowsResult[0] || []).map((row) => {
+      const amountAvailable = num(row.transaction_count) > 0;
+      return {
+        jobId: Number(row.job_id),
+        title: row.title,
+        clientName: row.client_name || null,
+        bookedAt: row.ticket_created_date_time || null,
+        completedAt: row.checkout_date_time || null,
+        ageDays: num(row.age_days),
+        ageSecs: num(row.age_secs),
+        amount: amountAvailable ? money(row.technician_earning) : null,
+        amountAvailability: {
+          available: amountAvailable,
+          source: amountAvailable ? 'tbl_job_transaction.efr_charge' : null,
+          reasonCode: amountAvailable ? null : 'NO_JOB_TRANSACTION',
+        },
+        rating: row.job_rating == null ? null : Number(num(row.job_rating).toFixed(1)),
+        onTime: Boolean(row.on_time),
+        sameDay: Boolean(row.same_day),
+        visitNumber: row.visit_number == null ? null : num(row.visit_number),
+        recordedRevisit: num(row.visit_number) > 1 || row.revisit_reason_id != null,
+      };
+    }),
+    total: num(countResult[0]?.[0]?.total),
+    page: pagination.page,
+    limit: pagination.limit,
+  };
+}
+
 module.exports = {
   getMyTeam,
   getTeamProfile,
   listMembers,
   getMemberDetail,
-  _internals: { maskMobile, pageValues },
+  getMemberJobs,
+  _internals: { maskMobile, pageValues, metricAvailability },
 };

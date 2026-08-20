@@ -44,7 +44,7 @@ async function requestWithdrawal(efrId, { amount }, pool) {
     // checking the open queue, so two devices/replicas with different
     // Idempotency-Keys cannot both observe "no pending request" and insert.
     const [[tech]] = await conn.query(
-      `SELECT current_balance, lifecycle_status
+      `SELECT current_balance, lifecycle_status, pan_card_number
          FROM tbl_easyfixer
         WHERE efr_id = ? AND NOT (efr_status <=> 3)
         LIMIT 1 FOR UPDATE`,
@@ -52,6 +52,9 @@ async function requestWithdrawal(efrId, { amount }, pool) {
     );
     if (!tech) throw mkErr(404, 'TECH_NOT_FOUND', 'Technician not found');
     const currentBalance = Number(tech.current_balance ?? 0);
+    if (!String(tech.pan_card_number ?? '').trim()) {
+      throw mkErr(400, 'PAN_REQUIRED', 'Add PAN details before withdrawing');
+    }
 
     const [[bank]] = await conn.query(
       `SELECT d.efr_bank_id, d.efr_bank_acc_num, d.efr_bank_acc_name,

@@ -29,28 +29,22 @@ const pageQuery = Joi.object({
 });
 
 /*
- * The W-01 payload in one call: balance, recent history and the shop.
- *
- * One request rather than three because this is the screen's first paint on a
- * field technician's phone — often on a poor connection — and three
- * round-trips would show three separate skeletons resolving at different
- * times. The pieces are all small.
+ * The W-01 first-paint payload: balance, bounded shop and referral summary.
+ * Earn history has its own paginated tab/endpoint, so eagerly loading its rows
+ * and count here made every Shop visit pay for data it did not render.
  */
 router.get('/summary', async (req, res, next) => {
   try {
     const efrId = req.tech.efr_id;
     logger.info('Rewards summary · efrId=' + efrId);
-    const [balance, ledger, items, referral] = await Promise.all([
+    const [balance, items, referral] = await Promise.all([
       svc.balanceFor(efrId),
-      svc.ledgerFor(efrId, { limit: 20 }),
-      svc.listItems({ limit: 50 }),
+      svc.listMobileShopItems({ limit: 50 }),
       svc.referralSummary(efrId),
     ]);
     modernOk(res, {
       balance,
-      history: ledger.rows,
-      historyTotal: ledger.total,
-      items: items.rows,
+      items,
       referral,
       /*
        * The published earn rates, sent with the screen rather than hardcoded
@@ -107,11 +101,26 @@ const claimBody = Joi.object({
   size: Joi.string().max(20).allow('', null).optional(),
   address: Joi.object({
     line: Joi.string().trim().min(5).max(500).required(),
-    city: Joi.string().max(120).allow('', null).optional(),
-    pincode: Joi.string().max(12).allow('', null).optional(),
-    phone: Joi.string().max(20).allow('', null).optional(),
+    city: Joi.string().trim().min(2).max(120).required(),
+    pincode: Joi.string().trim().pattern(/^[1-9]\d{5}$/).required(),
+    phone: Joi.string().trim().pattern(/^[6-9]\d{9}$/).required(),
   }).required(),
 });
+
+function requiredClaimIdempotencyKey(req) {
+  const key = String(req.headers?.['idempotency-key'] || '').trim();
+  if (!key) {
+    const error = new Error('Idempotency-Key header is required for reward claims');
+    error.status = 400;
+    throw error;
+  }
+  if (key.length > 128) {
+    const error = new Error('Idempotency-Key too long (max 128 chars)');
+    error.status = 400;
+    throw error;
+  }
+  return key;
+}
 
 /*
  * Confirming a claim debits the points in the same transaction that creates
@@ -120,11 +129,13 @@ const claimBody = Joi.object({
  */
 router.post('/claims', validate(claimBody), async (req, res, next) => {
   try {
+    const idempotencyKey = requiredClaimIdempotencyKey(req);
     logger.info('Reward claim · efrId=' + req.tech.efr_id + ' · item=' + req.body.item_id);
     const result = await svc.claimItem(req.tech.efr_id, {
       itemId: req.body.item_id,
       size: req.body.size,
       address: req.body.address,
+      idempotencyKey,
     });
     res.status(201);
     modernOk(res, result);

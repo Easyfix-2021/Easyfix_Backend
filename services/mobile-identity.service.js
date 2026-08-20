@@ -9,6 +9,14 @@ const {
   normalizeAadhaar,
   scrubDuplicateEntry,
 } = require('../utils/aadhaar-uniqueness');
+const {
+  activePanLockName,
+  assertActivePanAvailable,
+  isPanUniqueViolation,
+  normalizePan,
+  panConflictError,
+  scrubPanDuplicateEntry,
+} = require('../utils/pan-uniqueness');
 
 function lockUnavailableError() {
   const error = new Error('Identity details are currently being updated; please retry');
@@ -85,10 +93,12 @@ async function saveIdentityDetails(
   let lockAcquired = false;
   let valueLockKey = null;
   let valueLockAcquired = false;
+  let panValueLockKey = null;
+  let panValueLockAcquired = false;
   let transactionStarted = false;
   const aadhaar = body.aadhaarNumber || body.aadhaar || null;
   const panRaw = body.panNumber || body.pan;
-  const pan = panRaw ? String(panRaw).toUpperCase() : null;
+  const pan = normalizePan(panRaw) || null;
   const name = String(body.name || '').trim() || null;
   const drivingLicence = body.haveDrivingLicence === undefined
     ? null
@@ -109,18 +119,29 @@ async function saveIdentityDetails(
       if (!valueLockAcquired) throw lockUnavailableError();
     }
 
-    // 2. ENTITY lock (fine) — unchanged.
+    // 2. PAN VALUE lock. Aadhaar is always acquired before PAN, giving
+    //    multi-field saves a deterministic order. PAN-only submissions skip
+    //    the Aadhaar lock and still serialise across technicians.
+    if (pan) {
+      panValueLockKey = activePanLockName(pan);
+      const [[panValueLock]] = await conn.query('SELECT GET_LOCK(?, 5) AS acquired', [panValueLockKey]);
+      panValueLockAcquired = Number(panValueLock?.acquired) === 1;
+      if (!panValueLockAcquired) throw lockUnavailableError();
+    }
+
+    // 3. ENTITY lock (fine) — unchanged.
     const [[lock]] = await conn.query('SELECT GET_LOCK(?, 10) AS acquired', [lockKey]);
     lockAcquired = Number(lock?.acquired) === 1;
     if (!lockAcquired) throw lockUnavailableError();
 
-    // 3. Transaction, then 4. the check as its FIRST read — the REPEATABLE READ
+    // 4. Transaction, then 5. the checks as its FIRST reads — REPEATABLE READ
     //    snapshot opens here, so it observes every commit from a writer that has
     //    already released the value lock.
     await conn.beginTransaction();
     transactionStarted = true;
 
     await assertActiveAadhaarAvailable(conn, aadhaar, efrId);
+    await assertActivePanAvailable(conn, pan, efrId);
 
     await conn.query(
       `UPDATE tbl_easyfixer
@@ -161,14 +182,22 @@ async function saveIdentityDetails(
       try { await conn.rollback(); } catch (_) { /* retain original error */ }
     }
     if (isAadhaarUniqueViolation(error)) throw aadhaarConflictError();
+    if (isPanUniqueViolation(error)) throw panConflictError();
     // Fail closed: if the index ever lands under a different name the raw
-    // mysql2 message embeds the rejected Aadhaar, and the logger renders every
-    // key with no redaction. Scrub before it can escape this frame.
-    throw scrubDuplicateEntry(error, { aadhaarBound: Boolean(normalizeAadhaar(aadhaar)) });
+    // mysql2 message embeds the rejected identity value, and the logger renders
+    // every key with no redaction. Scrub before it can escape this frame.
+    const aadhaarSafe = scrubDuplicateEntry(error, {
+      aadhaarBound: Boolean(normalizeAadhaar(aadhaar)),
+    });
+    if (aadhaarSafe !== error) throw aadhaarSafe;
+    throw scrubPanDuplicateEntry(error, { panBound: Boolean(pan) });
   } finally {
     // Release fine-to-coarse, the reverse of acquisition.
     if (lockAcquired) {
       try { await conn.query('SELECT RELEASE_LOCK(?)', [lockKey]); } catch (_) { /* connection release frees it */ }
+    }
+    if (panValueLockAcquired) {
+      try { await conn.query('SELECT RELEASE_LOCK(?)', [panValueLockKey]); } catch (_) { /* connection release frees it */ }
     }
     if (valueLockAcquired) {
       try { await conn.query('SELECT RELEASE_LOCK(?)', [valueLockKey]); } catch (_) { /* connection release frees it */ }
@@ -185,5 +214,10 @@ async function saveIdentityDetails(
 module.exports = {
   getIdentityDetails,
   saveIdentityDetails,
-  _internals: { aadhaarConflictError, isAadhaarUniqueViolation, lockUnavailableError },
+  _internals: {
+    aadhaarConflictError,
+    isAadhaarUniqueViolation,
+    lockUnavailableError,
+    panConflictError,
+  },
 };

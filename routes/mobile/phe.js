@@ -31,6 +31,16 @@ router.get('/overview', validate(Joi.object({
   }
 });
 
+router.get('/in-qa', validate(pageQuery, 'query'), async (req, res, next) => {
+  try {
+    logger.info(`PHE Under Audit requested · page=${req.query.page} limit=${req.query.limit}`);
+    modernOk(res, await phe.getInQa(req.tech.efr_id, req.query));
+  } catch (error) {
+    if (error.status) return modernError(res, error.status, error.message);
+    return next(error);
+  }
+});
+
 router.get(
   '/months/:month/jobs',
   validate(Joi.object({ month: month.required() }), 'params'),

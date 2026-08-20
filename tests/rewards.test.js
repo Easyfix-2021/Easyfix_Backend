@@ -20,6 +20,13 @@ const { installFakePool } = require('./helpers/fake-pool');
 
 const fake = installFakePool([]);
 const rewards = require('../services/rewards.service');
+const s3Storage = require('../utils/s3-storage');
+const validClaimAddress = Object.freeze({
+  line: '12 Main Street',
+  city: 'Gurugram',
+  pincode: '122001',
+  phone: '9999999999',
+});
 
 after(() => fake.restore());
 
@@ -62,7 +69,172 @@ function route(routes) {
   };
 }
 
+test('mobile shop is one capped active-item projection without admin counts', async () => {
+  const r = route([
+    [/FROM reward_items i[\s\S]*WHERE i\.status = 1/i, [{
+      id: 1,
+      name: 'Helmet',
+      description: 'ISI marked',
+      image_key: null,
+      points_cost: 450,
+      sizes: 'M,L',
+      stock: 8,
+    }]],
+  ]);
+  try {
+    const rows = await rewards.listMobileShopItems({ limit: 999 });
+    assert.equal(r.calls.length, 1, 'mobile Shop must execute one catalogue query');
+    assert.equal(r.calls[0].params.at(-1), 50, 'the mobile catalogue has a hard 50-card cap');
+    assert.doesNotMatch(r.calls[0].sql, /COUNT\s*\(|reward_claims|created_at|updated_at/i);
+    assert.deepEqual(rows, [{
+      id: 1,
+      name: 'Helmet',
+      description: 'ISI marked',
+      points_cost: 450,
+      stock: 8,
+      sizeOptions: ['M', 'L'],
+      imageUrl: null,
+    }]);
+  } finally {
+    r.restore();
+  }
+});
+
+test('mobile rewards summary leaves ledger history to the paginated Earn endpoint', async () => {
+  const router = require('../routes/mobile/rewards');
+  const layer = router.stack.find((entry) => (
+    entry.route?.path === '/summary' && entry.route.methods?.get
+  ));
+  assert.ok(layer, 'GET /summary route must exist');
+  const handler = layer.route.stack.at(-1).handle;
+
+  const originals = {
+    balanceFor: rewards.balanceFor,
+    ledgerFor: rewards.ledgerFor,
+    listMobileShopItems: rewards.listMobileShopItems,
+    referralSummary: rewards.referralSummary,
+    pointsConfig: rewards.pointsConfig,
+  };
+  let ledgerCalls = 0;
+  rewards.balanceFor = async () => 720;
+  rewards.ledgerFor = async () => {
+    ledgerCalls += 1;
+    throw new Error('summary must not preload ledger history');
+  };
+  rewards.listMobileShopItems = async () => [{ id: 1, name: 'Helmet' }];
+  rewards.referralSummary = async () => ({ code: 'EFTEST', joined: 2, qualified: 1 });
+  rewards.pointsConfig = () => ({ rules: [], earningPaused: false });
+
+  let response;
+  let failure;
+  try {
+    await handler(
+      { tech: { efr_id: 8379 } },
+      { json: (body) => { response = body; return body; } },
+      (error) => { failure = error; },
+    );
+    assert.equal(failure, undefined);
+    assert.equal(ledgerCalls, 0);
+    assert.equal(response.success, true);
+    assert.deepEqual(response.data.items, [{ id: 1, name: 'Helmet' }]);
+    assert.ok(!Object.hasOwn(response.data, 'history'));
+    assert.ok(!Object.hasOwn(response.data, 'historyTotal'));
+  } finally {
+    Object.assign(rewards, originals);
+  }
+});
+
+test('mobile shop DTO resolves bounded image keys without exposing storage internals', async () => {
+  const originalEnabled = s3Storage.isEnabled;
+  const originalPresign = s3Storage.getPresignedUrl;
+  const originalResolve = s3Storage.resolveImageUrl;
+  s3Storage.isEnabled = () => true;
+  s3Storage.getPresignedUrl = async (key) => `https://signed.example/${key}`;
+  s3Storage.resolveImageUrl = async (key) => {
+    if (key === 'broken-key') throw new Error('signing unavailable');
+    return `https://cdn.example/${key}`;
+  };
+  try {
+    const rows = await rewards.itemsForMobile([
+      { id: 1, name: 'Helmet', image_key: 'Rewards/helmet-key' },
+      { id: 2, name: 'Bottle', image_key: 'broken-key' },
+    ]);
+    assert.equal(rows[0].imageUrl, 'https://signed.example/Rewards/helmet-key',
+      'canonical object keys are signed directly without an S3 HEAD probe');
+    assert.equal(rows[1].imageUrl, null, 'one bad image must not fail the shop');
+    assert.ok(rows.every((row) => !Object.hasOwn(row, 'image_key')),
+      'raw object-store keys must remain server-side');
+  } finally {
+    s3Storage.isEnabled = originalEnabled;
+    s3Storage.getPresignedUrl = originalPresign;
+    s3Storage.resolveImageUrl = originalResolve;
+  }
+});
+
+test('mobile shop bounds concurrent legacy image resolution', async () => {
+  const originalEnabled = s3Storage.isEnabled;
+  const originalResolve = s3Storage.resolveImageUrl;
+  let active = 0;
+  let peak = 0;
+  s3Storage.isEnabled = () => true;
+  s3Storage.resolveImageUrl = async (key) => {
+    active += 1;
+    peak = Math.max(peak, active);
+    await new Promise((resolve) => setImmediate(resolve));
+    active -= 1;
+    return `https://cdn.example/${key}`;
+  };
+  try {
+    const rows = await rewards.itemsForMobile(Array.from({ length: 17 }, (_, index) => ({
+      id: index + 1,
+      name: `Reward ${index + 1}`,
+      image_key: `legacy-${index + 1}`,
+    })));
+    assert.equal(rows.length, 17);
+    assert.ok(peak <= 5, `expected at most 5 concurrent legacy resolutions, saw ${peak}`);
+  } finally {
+    s3Storage.isEnabled = originalEnabled;
+    s3Storage.resolveImageUrl = originalResolve;
+  }
+});
+
+test('claim history is bounded, counted, and includes the frozen delivery destination', async () => {
+  const r = route([
+    [/SELECT id, item_id, item_name,[\s\S]*FROM reward_claims/i, [{
+      id: 9,
+      item_name: 'Helmet',
+      points_spent: 450,
+      status: 'ORDERED',
+      address_line: '12 Main Street',
+      address_city: 'Gurugram',
+      address_pincode: '122001',
+      address_phone: '9999999999',
+    }]],
+    [/SELECT COUNT\(\*\) AS total FROM reward_claims/i, [{ total: 1 }]],
+  ]);
+  try {
+    const result = await rewards.claimsFor(8379, { limit: 20, offset: 0 });
+    assert.equal(result.total, 1);
+    assert.equal(result.rows[0].address_phone, '9999999999');
+    assert.ok(r.calls.every((call) => call.params[0] === 8379),
+      'both page and count stay scoped to the authenticated technician');
+  } finally {
+    r.restore();
+  }
+});
+
 // ─── Spending ────────────────────────────────────────────────────────
+
+test('a claim requires a complete delivery snapshot before any database work', async () => {
+  await assert.rejects(
+    () => rewards.claimItem(8379, {
+      itemId: 1,
+      address: { line: '12 Main Street', city: '', pincode: '', phone: '' },
+      idempotencyKey: 'claim-invalid-address',
+    }),
+    (e) => e.status === 400 && /delivery city/i.test(e.message),
+  );
+});
 
 test('a claim is refused when the balance is short, and nothing is written', async () => {
   const r = route([
@@ -70,7 +242,11 @@ test('a claim is refused when the balance is short, and nothing is written', asy
     [/COALESCE\(SUM\(delta\), 0\) AS balance/i, [{ balance: 120 }]],
   ]);
   await assert.rejects(
-    () => rewards.claimItem(8379, { itemId: 1, address: { line: '12 Main Street' } }),
+    () => rewards.claimItem(8379, {
+      itemId: 1,
+      address: validClaimAddress,
+      idempotencyKey: 'claim-short-balance',
+    }),
     (e) => e.status === 409 && /more points/i.test(e.message),
   );
   assert.ok(
@@ -91,14 +267,114 @@ test('claiming debits in the SAME pass that creates the claim', async () => {
     [/UPDATE reward_items SET stock = stock - 1/i, { affectedRows: 1 }],
     [/INSERT INTO reward_claims/i, { insertId: 1042 }],
   ]);
-  const result = await rewards.claimItem(8379, { itemId: 1, size: 'M', address: { line: '12 Main Street' } });
+  const result = await rewards.claimItem(8379, {
+    itemId: 1,
+    size: 'M',
+    address: validClaimAddress,
+    idempotencyKey: 'claim-success-1042',
+  });
   assert.equal(result.claimId, 1042);
   assert.equal(result.balance, 840, 'the returned balance is already net of the spend');
 
   const debit = r.calls.find((c) => /INSERT INTO reward_points_ledger/i.test(c.sql));
   assert.ok(debit, 'the debit is written with the claim, not deferred to dispatch');
   assert.equal(debit.params[1], -400, 'the ledger delta is negative');
+  const technicianLock = r.calls.findIndex((c) => /FROM tbl_easyfixer WHERE efr_id = \? FOR UPDATE/i.test(c.sql));
+  const itemLock = r.calls.findIndex((c) => /FROM reward_items WHERE id = \? FOR UPDATE/i.test(c.sql));
+  const balanceRead = r.calls.findIndex((c) => /COALESCE\(SUM\(delta\), 0\) AS balance/i.test(c.sql));
+  assert.ok(technicianLock >= 0 && technicianLock < itemLock && itemLock < balanceRead,
+    'one technician-scoped mutex must serialize claims for different products before balance is read');
   r.restore();
+});
+
+test('domain claim replay survives generic idempotency response loss without a second debit', async () => {
+  let persistedClaim = null;
+  const r = route([
+    [/FROM reward_claims[\s\S]*idempotency_key = \?[\s\S]*FOR UPDATE/i,
+      () => (persistedClaim ? [persistedClaim] : [])],
+    [/FROM reward_items WHERE id = \? FOR UPDATE/i,
+      [{ id: 1, name: 'T-shirt', points_cost: 400, sizes: 'S,M,L', stock: 5, status: 1 }]],
+    [/COALESCE\(SUM\(delta\), 0\) AS balance/i,
+      () => [{ balance: persistedClaim ? 840 : 1240 }]],
+    [/UPDATE reward_items SET stock = stock - 1/i, { affectedRows: 1 }],
+    [/INSERT INTO reward_claims/i, (_sql, params) => {
+      persistedClaim = {
+        id: 1042,
+        item_id: params[1],
+        size: params[3],
+        points_spent: params[4],
+        address_line: params[6],
+        address_city: params[7],
+        address_pincode: params[8],
+        address_phone: params[9],
+      };
+      return { insertId: persistedClaim.id };
+    }],
+    [/INSERT INTO reward_points_ledger/i, { insertId: 7001 }],
+  ]);
+  try {
+    const request = {
+      itemId: 1,
+      size: 'M',
+      address: validClaimAddress,
+      idempotencyKey: 'claim-response-lost-1042',
+    };
+
+    const first = await rewards.claimItem(8379, request);
+    // Model the business commit followed by loss of the generic middleware's
+    // stored response: the same service request reaches the domain again.
+    const replay = await rewards.claimItem(8379, request);
+
+    assert.deepEqual(replay, first);
+    assert.equal(r.calls.filter((c) => /UPDATE reward_items SET stock = stock - 1/i.test(c.sql)).length, 1,
+      'a domain replay must not decrement stock again');
+    assert.equal(r.calls.filter((c) => /INSERT INTO reward_claims/i.test(c.sql)).length, 1,
+      'a domain replay must not create another claim');
+    assert.equal(r.calls.filter((c) => /INSERT INTO reward_points_ledger/i.test(c.sql)).length, 1,
+      'a domain replay must not debit points again');
+    assert.equal(r.calls.filter((c) => /FROM reward_items WHERE id = \? FOR UPDATE/i.test(c.sql)).length, 1,
+      'the replay must return before taking the product lock');
+  } finally {
+    r.restore();
+  }
+});
+
+test('a reward claim key cannot be reused with a different item, size, or address', async () => {
+  const existing = {
+    id: 1042,
+    item_id: 1,
+    size: 'M',
+    points_spent: 400,
+    address_line: validClaimAddress.line,
+    address_city: validClaimAddress.city,
+    address_pincode: validClaimAddress.pincode,
+    address_phone: validClaimAddress.phone,
+  };
+  const variants = [
+    { itemId: 2, size: 'M', address: validClaimAddress },
+    { itemId: 1, size: 'L', address: validClaimAddress },
+    { itemId: 1, size: 'M', address: { ...validClaimAddress, line: '99 Other Street' } },
+  ];
+
+  for (const variant of variants) {
+    const r = route([
+      [/FROM reward_claims[\s\S]*idempotency_key = \?[\s\S]*FOR UPDATE/i, [existing]],
+    ]);
+    try {
+      await assert.rejects(
+        () => rewards.claimItem(8379, {
+          ...variant,
+          idempotencyKey: 'claim-response-lost-1042',
+        }),
+        (error) => error.status === 409
+          && error.details?.code === 'IDEMPOTENCY_KEY_REUSED',
+      );
+      assert.ok(!r.calls.some((call) => /FROM reward_items|UPDATE reward_items|INSERT INTO reward_points_ledger/i.test(call.sql)),
+        'a mismatched replay must stop before product stock or points are touched');
+    } finally {
+      r.restore();
+    }
+  }
 });
 
 test('a sold-out item is caught by the conditional decrement, not a prior read', async () => {
@@ -110,7 +386,11 @@ test('a sold-out item is caught by the conditional decrement, not a prior read',
     [/UPDATE reward_items SET stock = stock - 1/i, { affectedRows: 0 }],
   ]);
   await assert.rejects(
-    () => rewards.claimItem(8379, { itemId: 1, address: { line: '12 Main Street' } }),
+    () => rewards.claimItem(8379, {
+      itemId: 1,
+      address: validClaimAddress,
+      idempotencyKey: 'claim-sold-out',
+    }),
     (e) => e.status === 409 && /out of stock/i.test(e.message),
   );
   assert.ok(!r.calls.some((c) => /INSERT INTO reward_claims/i.test(c.sql)));
@@ -122,7 +402,11 @@ test('a retired item cannot be claimed', async () => {
     [/FROM reward_items WHERE id = \? FOR UPDATE/i, [{ id: 1, name: 'Old', points_cost: 100, sizes: null, stock: 5, status: 0 }]],
   ]);
   await assert.rejects(
-    () => rewards.claimItem(8379, { itemId: 1, address: { line: '12 Main Street' } }),
+    () => rewards.claimItem(8379, {
+      itemId: 1,
+      address: validClaimAddress,
+      idempotencyKey: 'claim-retired',
+    }),
     (e) => e.status === 409 && /no longer available/i.test(e.message),
   );
   r.restore();

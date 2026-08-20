@@ -31,6 +31,7 @@
     "tests/training-progress-concurrency.test.js",
     "tests/training-progress-migration.test.js",
     "utils/aadhaar-uniqueness.js",
+    "utils/pan-uniqueness.js",
     "utils/file-storage.js"
   ],
   "watchPrefixes": [
@@ -70,7 +71,8 @@
       "path": "/api/mobile/profile/identity-details",
       "implementationFiles": [
         "routes/mobile/profile-identity.js",
-        "services/mobile-identity.service.js"
+        "services/mobile-identity.service.js",
+        "utils/pan-uniqueness.js"
       ],
       "testFiles": [
         "tests/aadhaar-uniqueness-compat.test.js",

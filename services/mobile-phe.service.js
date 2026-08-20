@@ -3,6 +3,10 @@ const logger = require('../logger');
 const s3Storage = require('../utils/s3-storage');
 const { OFFER_STATUS } = require('./offer-status');
 const {
+  JOB_AGE_DAYS_EXPR,
+  JOB_AGE_SECS_EXPR,
+} = require('../utils/job-age-sql');
+const {
   currentIstMonth,
   monthBounds,
   monthLabel,
@@ -12,12 +16,34 @@ const {
   todayIst,
 } = require('../utils/ist-calendar');
 
+// A job can expose at most twenty proof rows (ten before + ten after). Keep
+// signing/fallback I/O below that SQL bound so one detail request cannot fan
+// all of those legacy S3 HEAD probes out at once.
+const PROOF_IMAGE_RESOLUTION_CONCURRENCY = 4;
+const CANONICAL_JOB_PROOF_KEY = /^JobSupportings\/[A-Za-z][A-Za-z0-9]*_\d+_\d+$/;
+const UNDER_AUDIT_STATUS = 10;
+
+/*
+ * Status 10 is overloaded by the legacy application. QuickSight's canonical
+ * "Waiting Audit" cohort adds both request-counter gates; the mobile read
+ * model also excludes rows carrying a revisit reason so a revisit is never
+ * presented as quality review. This is an operations-audit signal, NOT a
+ * claim that the client has a dedicated QC workflow.
+ */
+const UNDER_AUDIT_PREDICATE = `j.job_status = ${UNDER_AUDIT_STATUS}
+  AND j.app_checkout_date_time IS NOT NULL
+  AND j.no_of_req_approval < 1
+  AND j.no_of_req_foh < 1
+  AND j.revisit_reason_id IS NULL`;
+const COMPONENT_NOT_STORED = 'PAYOUT_COMPONENT_NOT_STORED';
+
 /*
  * Performance + History + Earnings (PHE) read model for the technician app.
  *
  * This module deliberately composes existing source-of-truth tables rather
  * than creating another wallet/performance ledger:
- *   - paid money       tbl_easyfixer_transaction (type 2 = credit)
+ *   - job earnings     tbl_job_transaction.efr_charge
+ *   - paid timestamp   tbl_easyfixer_transaction (type 2 = wallet credit)
  *   - wallet balance   tbl_easyfixer.current_balance
  *   - withdrawals      tbl_easyfixer_withdrawal_request
  *   - job performance  tbl_job + tbl_job_offer + customer ratings
@@ -25,9 +51,9 @@ const {
  *
  * Every public function receives the authenticated efr id. There is no subject
  * id in query/body data. Reads are bounded and page-based where the result can
- * grow. QC is intentionally absent: the current schema has no authoritative
- * "client checking quality / money pending" state, and status 10 is overloaded
- * by legacy audit/revisit flows, so deriving QC would present guesses as money.
+ * grow. Client QC remains intentionally absent: the current schema has no
+ * authoritative client-quality state. The separately exposed Under Audit view
+ * uses the full legacy operations predicate above and labels that provenance.
  */
 
 function num(value) {
@@ -67,6 +93,98 @@ function withdrawalShape(row) {
   };
 }
 
+function unavailableMoneyComponent(reasonCode = COMPONENT_NOT_STORED) {
+  return {
+    available: false,
+    amount: null,
+    source: null,
+    reasonCode,
+  };
+}
+
+function payoutBreakdown(row) {
+  const transactionCount = num(row?.transaction_count);
+  const walletCreditCount = num(row?.wallet_credit_count);
+  return {
+    available: transactionCount > 0 || walletCreditCount > 0,
+    reasonCode: transactionCount > 0 || walletCreditCount > 0
+      ? null
+      : 'NO_JOB_PAYOUT_TRANSACTION',
+    components: {
+      basePayout: unavailableMoneyComponent(),
+      sameDayIncentive: unavailableMoneyComponent(),
+      visitationCharge: unavailableMoneyComponent(),
+      material: unavailableMoneyComponent(),
+      penalty: unavailableMoneyComponent(),
+      technicianEarning: transactionCount > 0 ? {
+        available: true,
+        amount: money(row.technician_earning),
+        source: 'tbl_job_transaction.efr_charge',
+        reasonCode: null,
+      } : unavailableMoneyComponent('NO_JOB_TRANSACTION'),
+      paidToTechnician: walletCreditCount > 0 ? {
+        available: true,
+        amount: money(row.paid_to_technician),
+        source: 'tbl_easyfixer_transaction.amount',
+        reasonCode: null,
+      } : unavailableMoneyComponent('NO_JOB_LINKED_WALLET_CREDIT'),
+    },
+  };
+}
+
+async function resolveProofImageUrl(storedValue) {
+  const stored = String(storedValue || '').trim();
+  if (!stored) return null;
+
+  /*
+   * Canonical JobSupportings keys were written by this backend after a
+   * successful PutObject, so signing them directly is safe and purely local.
+   * The shared resolver first sends HeadObject; skipping that network probe
+   * halves S3 operations on the common path. Old Job_Images keys and bare
+   * filenames still use resolveImageUrl so their S3/local-disk fallback stays
+   * byte-for-byte compatible.
+  */
+  if (s3Storage.isEnabled() && CANONICAL_JOB_PROOF_KEY.test(stored)) {
+    try {
+      return await s3Storage.getPresignedUrl(stored);
+    } catch {
+      // Preserve the existing resolver's local fallback on an exceptional
+      // credentials/signing failure; only the healthy canonical path skips
+      // the S3 existence probe.
+      return s3Storage.resolveImageUrl(stored);
+    }
+  }
+  return s3Storage.resolveImageUrl(stored);
+}
+
+async function resolveProofRows(rows, jobId = null) {
+  const source = Array.isArray(rows) ? rows : [];
+  const result = new Array(source.length);
+  let nextIndex = 0;
+
+  const worker = async () => {
+    while (nextIndex < source.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      const image = source[index];
+      let url = null;
+      try {
+        url = await resolveProofImageUrl(image.image);
+      } catch (error) {
+        logger.warn(
+          { err: error.message, jobId: jobId == null ? undefined : Number(jobId), imageId: Number(image.image_id) },
+          'PHE proof image URL resolution failed',
+        );
+      }
+      result[index] = { image, url };
+    }
+  };
+
+  const workerCount = Math.min(PROOF_IMAGE_RESOLUTION_CONCURRENCY, source.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return result;
+}
+
 function pageValues({ page = 1, limit = 20 } = {}) {
   const p = Math.max(Number(page) || 1, 1);
   const l = Math.min(Math.max(Number(limit) || 20, 1), 50);
@@ -96,8 +214,6 @@ async function getOverview(efrId, { before, limit = 6 } = {}, db = pool) {
   const exclusiveBefore = before || shiftMonth(currentIstMonth(), 1);
   monthParts(exclusiveBefore);
   const cappedLimit = Math.min(Math.max(Number(limit) || 6, 1), 12);
-  const monthKeys = monthsBefore(exclusiveBefore, cappedLimit);
-  const from = `${monthKeys[monthKeys.length - 1]}-01`;
   const to = `${exclusiveBefore}-01`;
 
   logger.info(`PHE overview · efrId=${efrId} before=${exclusiveBefore} limit=${cappedLimit}`);
@@ -118,25 +234,119 @@ async function getOverview(efrId, { before, limit = 6 } = {}, db = pool) {
     [efrId],
   );
 
-  // A Paid-month card is one reconcilable cohort: completed jobs in that
-  // month which have job-linked technician credits. This excludes manual
-  // wallet credits and keeps the card amount/count/rating aligned with the
-  // jobs opened from that card even when finance credits the job later.
-  const paidJobsPromise = db.query(
+  /*
+   * Wallet money needs three deliberately different labels in the app:
+   *
+   *   currentBalance   the accounting balance, which finance only debits on
+   *                    settlement;
+   *   claimableNow     what a second payout request may safely ask for now;
+   *   totalWithdrawn   requests finance has actually paid.
+   *
+   * A requested payout still leaves current_balance untouched, so presenting
+   * that raw column as "claimable" would invite a second request that the
+   * transactional withdrawal service must reject. This one technician-scoped
+   * aggregate keeps those meanings separate without per-row work.
+   */
+  const withdrawalSummaryPromise = db.query(
+    `SELECT COALESCE(SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END), 0) AS total_withdrawn,
+            COALESCE(MAX(CASE WHEN status = 'requested' THEN amount END), 0) AS pending_amount,
+            SUM(status = 'requested') AS open_count
+       FROM tbl_easyfixer_withdrawal_request
+      WHERE fk_easyfixer_id = ?`,
+    [efrId],
+  );
+
+  /*
+   * Lifetime job earnings is a job-performance metric, not a wallet metric.
+   * The canonical source used by CRM lifecycle/performance reporting is the
+   * technician share on completed job transactions. Manual wallet recharges
+   * and withdrawal bookkeeping therefore cannot inflate it.
+   */
+  const lifetimeJobEarningsPromise = db.query(
+    `SELECT COALESCE(SUM(CASE WHEN q.job_status IN (3, 5)
+                              THEN q.technician_earning ELSE 0 END), 0) AS lifetime_job_earnings,
+            SUM(q.is_under_audit) AS under_audit_jobs,
+            SUM(q.is_under_audit AND q.transaction_count > 0) AS under_audit_amount_known_jobs,
+            COALESCE(SUM(CASE WHEN q.is_under_audit = 1 AND q.transaction_count > 0
+                              THEN q.technician_earning ELSE 0 END), 0) AS under_audit_known_amount
+       FROM (
+         SELECT j.job_id, j.job_status,
+                (${UNDER_AUDIT_PREDICATE}) AS is_under_audit,
+                COUNT(tjt.fk_job_id) AS transaction_count,
+                COALESCE(SUM(tjt.efr_charge), 0) AS technician_earning
+           FROM tbl_job j
+           LEFT JOIN tbl_job_transaction tjt ON tjt.fk_job_id = j.job_id
+          WHERE j.fk_easyfixter_id = ?
+            AND (j.job_status IN (3, 5) OR j.job_status = ${UNDER_AUDIT_STATUS})
+          GROUP BY j.job_id, j.job_status, j.app_checkout_date_time,
+                   j.no_of_req_approval, j.no_of_req_foh, j.revisit_reason_id
+       ) q`,
+    [efrId],
+  );
+
+  /*
+   * Page over months that actually contain technician activity. Dense
+   * calendar windows used to stop at the first six-month inactive gap and
+   * made all older history unreachable. One extra row is the bounded has-more
+   * signal; every branch remains technician scoped.
+   */
+  const activityMonthsResult = await db.query(
+    `SELECT activity.month_key
+       FROM (
+         SELECT DATE_FORMAT(j.checkout_date_time, '%Y-%m') AS month_key
+           FROM tbl_job j
+          WHERE j.fk_easyfixter_id = ?
+            AND j.job_status IN (3, 5)
+            AND j.checkout_date_time < ?
+          GROUP BY DATE_FORMAT(j.checkout_date_time, '%Y-%m')
+         UNION
+         SELECT DATE_FORMAT(jo.offered_at, '%Y-%m') AS month_key
+           FROM tbl_job_offer jo
+          WHERE jo.fk_easyfixter_id = ?
+            AND jo.offered_at < ?
+          GROUP BY DATE_FORMAT(jo.offered_at, '%Y-%m')
+       ) activity
+      WHERE activity.month_key IS NOT NULL
+      ORDER BY activity.month_key DESC
+      LIMIT ?`,
+    [efrId, to, efrId, to, cappedLimit + 1],
+  ).catch(async (error) => {
+    if (error?.code !== 'ER_NO_SUCH_TABLE') throw error;
+    return db.query(
+      `SELECT DATE_FORMAT(j.checkout_date_time, '%Y-%m') AS month_key
+         FROM tbl_job j
+        WHERE j.fk_easyfixter_id = ?
+          AND j.job_status IN (3, 5)
+          AND j.checkout_date_time < ?
+        GROUP BY DATE_FORMAT(j.checkout_date_time, '%Y-%m')
+        ORDER BY month_key DESC
+        LIMIT ?`,
+      [efrId, to, cappedLimit + 1],
+    );
+  });
+  const activityMonths = (activityMonthsResult[0] || [])
+    .map((row) => row.month_key)
+    .filter(Boolean);
+  const hasMoreMonths = activityMonths.length > cappedLimit;
+  const monthKeys = activityMonths.slice(0, cappedLimit);
+  const from = monthKeys.length ? `${monthKeys[monthKeys.length - 1]}-01` : to;
+
+  // A Paid-month card uses completed jobs as the cohort, including legitimate
+  // zero-rupee warranty visits. The technician share comes from the same
+  // tbl_job_transaction.efr_charge source as CRM performance reporting. Wallet
+  // credits are settlement/audit records and must not redefine job earnings.
+  const paidJobsPromise = monthKeys.length ? db.query(
     `SELECT DATE_FORMAT(p.checkout_date_time, '%Y-%m') AS month_key,
-            COALESCE(SUM(p.paid_amount), 0) AS earnings,
+            COALESCE(SUM(p.technician_earning), 0) AS earnings,
             COUNT(*) AS completed,
             SUM(DATE(p.checkin_date_time) = DATE(COALESCE(p.original_appointment_date_time, p.requested_date_time))) AS same_day,
             AVG(r.job_rating) AS rating
        FROM (
          SELECT j.job_id, j.checkout_date_time, j.checkin_date_time,
                 j.original_appointment_date_time, j.requested_date_time,
-                SUM(ABS(et.amount)) AS paid_amount
+                COALESCE(SUM(tjt.efr_charge), 0) AS technician_earning
            FROM tbl_job j
-           JOIN tbl_easyfixer_transaction et
-             ON et.easyfixer_id = ?
-            AND et.job_id = j.job_id
-            AND et.transaction_type = 2
+           LEFT JOIN tbl_job_transaction tjt ON tjt.fk_job_id = j.job_id
           WHERE j.fk_easyfixter_id = ?
             AND j.job_status IN (3, 5)
             AND j.checkout_date_time >= ?
@@ -151,10 +361,10 @@ async function getOverview(efrId, { before, limit = 6 } = {}, db = pool) {
           GROUP BY rc.job_id
        ) r ON r.job_id = p.job_id
       GROUP BY month_key`,
-    [efrId, efrId, from, to, efrId],
-  );
+    [efrId, from, to, efrId],
+  ) : Promise.resolve([[]]);
 
-  const offersPromise = db.query(
+  const offersPromise = monthKeys.length ? db.query(
     `SELECT DATE_FORMAT(jo.offered_at, '%Y-%m') AS month_key,
             COUNT(DISTINCT jo.job_id) AS given_count,
             COUNT(DISTINCT CASE WHEN jo.offer_status = ${OFFER_STATUS.ACCEPTED}
@@ -168,10 +378,14 @@ async function getOverview(efrId, { before, limit = 6 } = {}, db = pool) {
   ).catch((error) => {
     if (error?.code === 'ER_NO_SUCH_TABLE') return [[]];
     throw error;
-  });
+  }) : Promise.resolve([[]]);
 
-  const [accountResult, paidJobResult, offerResult] = await Promise.all([
-    accountPromise, paidJobsPromise, offersPromise,
+  const [accountResult, withdrawalSummaryResult, lifetimeResult, paidJobResult, offerResult] = await Promise.all([
+    accountPromise,
+    withdrawalSummaryPromise,
+    lifetimeJobEarningsPromise,
+    paidJobsPromise,
+    offersPromise,
   ]);
   const account = accountResult[0]?.[0] || null;
   if (!account) {
@@ -182,6 +396,12 @@ async function getOverview(efrId, { before, limit = 6 } = {}, db = pool) {
 
   const paidJobs = new Map((paidJobResult[0] || []).map((r) => [r.month_key, r]));
   const offers = new Map((offerResult[0] || []).map((r) => [r.month_key, r]));
+  const withdrawalSummary = withdrawalSummaryResult[0]?.[0] || {};
+  const financialJobSummary = lifetimeResult[0]?.[0] || {};
+  const currentBalance = Math.max(money(account.current_balance), 0);
+  const hasOpenWithdrawal = num(withdrawalSummary.open_count) > 0;
+  const underAuditJobs = num(financialJobSummary.under_audit_jobs);
+  const underAuditKnownJobs = num(financialJobSummary.under_audit_amount_known_jobs);
 
   const items = monthKeys.map((month) => {
     const paid = paidJobs.get(month) || {};
@@ -199,73 +419,193 @@ async function getOverview(efrId, { before, limit = 6 } = {}, db = pool) {
   });
 
   return {
-    wallet: { availableToWithdraw: money(account.current_balance) },
+    wallet: {
+      // Compatibility field retained for older app builds. It now carries the
+      // safe claimable amount, not the raw accounting balance.
+      availableToWithdraw: hasOpenWithdrawal ? 0 : currentBalance,
+      claimableNow: hasOpenWithdrawal ? 0 : currentBalance,
+      canWithdraw: !hasOpenWithdrawal && currentBalance > 0,
+      currentBalance,
+      pendingWithdrawalAmount: money(withdrawalSummary.pending_amount),
+      totalWithdrawn: money(withdrawalSummary.total_withdrawn),
+      lifetimeJobEarnings: money(financialJobSummary.lifetime_job_earnings),
+      // This is only the transaction-backed amount for the strict operations
+      // Under Audit cohort. It must not be labelled as client QC.
+      workInProgress: underAuditJobs > 0
+        ? money(financialJobSummary.under_audit_known_amount)
+        : null,
+    },
+    qualityReview: {
+      available: true,
+      source: 'tbl_job legacy under-audit predicate',
+      semantics: 'OPERATIONS_UNDER_AUDIT_NOT_CLIENT_QC',
+      jobs: underAuditJobs,
+      amountKnownJobs: underAuditKnownJobs,
+      knownTechnicianEarning: money(financialJobSummary.under_audit_known_amount),
+      amountCoverageComplete: underAuditKnownJobs === underAuditJobs,
+    },
     latestWithdrawal: withdrawalShape(account),
     months: {
       items,
-      // Stop after the first all-empty page. This bounds historical paging
-      // without needing an unindexed global MIN scan on every overview read.
-      nextCursor: items.some(hasMonthActivity) && items.length
-        ? items[items.length - 1].month
-        : null,
+      nextCursor: hasMoreMonths && items.length ? items[items.length - 1].month : null,
     },
-    features: { qc: false },
+    features: {
+      qc: false,
+      inQa: true,
+      workInProgress: true,
+    },
+  };
+}
+
+async function getInQa(efrId, paging = {}, db = pool) {
+  const { page, limit, offset } = pageValues(paging);
+  logger.info(`PHE Under Audit · efrId=${efrId} page=${page} limit=${limit}`);
+
+  const [rowsResult, summaryResult] = await Promise.all([
+    db.query(
+      `SELECT j.job_id,
+              COALESCE(sc.service_catg_name, st.service_type_name, CONCAT('Job #', j.job_id)) AS title,
+              cl.client_name, j.app_checkout_date_time,
+              GREATEST(TIMESTAMPDIFF(DAY, j.app_checkout_date_time, NOW()), 0) AS review_age_days,
+              GREATEST(TIMESTAMPDIFF(SECOND, j.app_checkout_date_time, NOW()), 0) AS review_age_secs,
+              COUNT(tjt.fk_job_id) AS transaction_count,
+              COALESCE(SUM(tjt.efr_charge), 0) AS technician_earning
+         FROM tbl_job j
+         LEFT JOIN tbl_job_transaction tjt ON tjt.fk_job_id = j.job_id
+         LEFT JOIN tbl_client cl ON cl.client_id = j.fk_client_id
+         LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = j.fk_service_catg_id
+         LEFT JOIN tbl_service_type st ON st.service_type_id = j.fk_service_type_id
+        WHERE j.fk_easyfixter_id = ?
+          AND ${UNDER_AUDIT_PREDICATE}
+        GROUP BY j.job_id, sc.service_catg_name, st.service_type_name,
+                 cl.client_name, j.app_checkout_date_time
+        ORDER BY j.app_checkout_date_time DESC, j.job_id DESC
+        LIMIT ? OFFSET ?`,
+      [efrId, limit, offset],
+    ),
+    db.query(
+      `SELECT COUNT(*) AS total_jobs,
+              SUM(q.transaction_count > 0) AS amount_known_jobs,
+              COALESCE(SUM(CASE WHEN q.transaction_count > 0
+                                THEN q.technician_earning ELSE 0 END), 0) AS known_amount
+         FROM (
+           SELECT j.job_id, COUNT(tjt.fk_job_id) AS transaction_count,
+                  COALESCE(SUM(tjt.efr_charge), 0) AS technician_earning
+             FROM tbl_job j
+             LEFT JOIN tbl_job_transaction tjt ON tjt.fk_job_id = j.job_id
+            WHERE j.fk_easyfixter_id = ?
+              AND ${UNDER_AUDIT_PREDICATE}
+            GROUP BY j.job_id
+         ) q`,
+      [efrId],
+    ),
+  ]);
+
+  const summary = summaryResult[0]?.[0] || {};
+  const total = num(summary.total_jobs);
+  const amountKnownJobs = num(summary.amount_known_jobs);
+  return {
+    availability: {
+      available: true,
+      source: 'tbl_job legacy under-audit predicate',
+      semantics: 'OPERATIONS_UNDER_AUDIT_NOT_CLIENT_QC',
+      reasonCode: null,
+    },
+    items: (rowsResult[0] || []).map((row) => {
+      const amountAvailable = num(row.transaction_count) > 0;
+      return {
+        jobId: Number(row.job_id),
+        title: row.title,
+        clientName: row.client_name || null,
+        reviewStartedAt: row.app_checkout_date_time || null,
+        reviewAgeDays: num(row.review_age_days),
+        reviewAgeSecs: num(row.review_age_secs),
+        state: {
+          code: 'UNDER_AUDIT',
+          source: 'tbl_job.job_status + audit request counters',
+        },
+        action: {
+          required: false,
+          code: null,
+          reasonCode: 'NO_TECHNICIAN_ACTION_RECORDED',
+        },
+        amount: amountAvailable ? money(row.technician_earning) : null,
+        amountAvailability: {
+          available: amountAvailable,
+          source: amountAvailable ? 'tbl_job_transaction.efr_charge' : null,
+          reasonCode: amountAvailable ? null : 'NO_JOB_TRANSACTION',
+        },
+      };
+    }),
+    summary: {
+      jobs: total,
+      amountKnownJobs,
+      knownTechnicianEarning: money(summary.known_amount),
+      amountCoverageComplete: amountKnownJobs === total,
+    },
+    total,
+    page,
+    limit,
   };
 }
 
 async function getMonthJobs(efrId, month, paging = {}, db = pool) {
   const { start, end } = monthBounds(month);
   const { page, limit, offset } = pageValues(paging);
-  const paidJobs = `
-    SELECT et.job_id,
-           MIN(et.transaction_date) AS paid_at,
-           SUM(ABS(et.amount)) AS paid_amount
-      FROM tbl_easyfixer_transaction et
-      JOIN tbl_job paid_job
-        ON paid_job.job_id = et.job_id
-     WHERE et.easyfixer_id = ?
-       AND et.transaction_type = 2
-       AND et.job_id IS NOT NULL
-       AND paid_job.fk_easyfixter_id = ?
-       AND paid_job.job_status IN (3, 5)
-       AND paid_job.checkout_date_time >= ?
-       AND paid_job.checkout_date_time < ?
-     GROUP BY et.job_id`;
 
   const [rowsResult, countResult] = await Promise.all([
     db.query(
       `SELECT j.job_id,
               COALESCE(sc.service_catg_name, st.service_type_name, CONCAT('Job #', j.job_id)) AS title,
-              cl.client_name, j.checkout_date_time, p.paid_at, p.paid_amount,
-              r.job_rating,
+              cl.client_name, j.ticket_created_date_time, j.created_date_time,
+              j.checkout_date_time,
+              (SELECT MIN(et.transaction_date)
+                 FROM tbl_easyfixer_transaction et
+                WHERE et.easyfixer_id = ?
+                  AND et.transaction_type = 2
+                  AND et.job_id = j.job_id) AS paid_at,
+              COALESCE(SUM(tjt.efr_charge), 0) AS technician_earning,
+              ${JOB_AGE_DAYS_EXPR} AS age_days,
+              ${JOB_AGE_SECS_EXPR} AS age_secs,
+              j.visit_number, r.job_rating, COALESCE(r.is_escalated, 0) AS is_escalated,
               (j.checkin_date_time IS NOT NULL
                 AND j.checkin_date_time <= DATE_ADD(j.requested_date_time, INTERVAL 60 MINUTE)) AS on_time,
               (j.checkin_date_time IS NOT NULL
                 AND DATE(j.checkin_date_time) = DATE(COALESCE(j.original_appointment_date_time, j.requested_date_time))) AS same_day
-         FROM (${paidJobs}) p
-         JOIN tbl_job j ON j.job_id = p.job_id
+         FROM tbl_job j
+         LEFT JOIN tbl_job_transaction tjt ON tjt.fk_job_id = j.job_id
          LEFT JOIN tbl_client cl ON cl.client_id = j.fk_client_id
          LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = j.fk_service_catg_id
          LEFT JOIN tbl_service_type st ON st.service_type_id = j.fk_service_type_id
          LEFT JOIN (
-           SELECT rc.job_id, AVG(rc.customer_rating) AS job_rating
+           SELECT rc.job_id, AVG(rc.customer_rating) AS job_rating,
+                  MAX(COALESCE(rc.is_escalated, 0)) AS is_escalated
              FROM tbl_easyfixer_rating_by_customer rc
             WHERE rc.easyfixer_id = ?
             GROUP BY rc.job_id
          ) r ON r.job_id = j.job_id
         WHERE j.fk_easyfixter_id = ?
           AND j.job_status IN (3, 5)
+          AND j.checkout_date_time >= ?
+          AND j.checkout_date_time < ?
+        GROUP BY j.job_id, sc.service_catg_name, st.service_type_name,
+                 cl.client_name, j.ticket_created_date_time, j.created_date_time,
+                 j.checkout_date_time, j.job_status, j.cancel_date_time,
+                 j.enquiry_date_time, j.visit_number, r.job_rating, r.is_escalated,
+                 j.checkin_date_time, j.requested_date_time,
+                 j.original_appointment_date_time
         ORDER BY j.checkout_date_time DESC, j.job_id DESC
         LIMIT ? OFFSET ?`,
-      [efrId, efrId, start, end, efrId, efrId, limit, offset],
+      [efrId, efrId, efrId, start, end, limit, offset],
     ),
     db.query(
       `SELECT COUNT(*) AS total
-         FROM (${paidJobs}) p
-         JOIN tbl_job j ON j.job_id = p.job_id
+         FROM tbl_job j
         WHERE j.fk_easyfixter_id = ?
-          AND j.job_status IN (3, 5)`,
-      [efrId, efrId, start, end, efrId],
+          AND j.job_status IN (3, 5)
+          AND j.checkout_date_time >= ?
+          AND j.checkout_date_time < ?`,
+      [efrId, start, end],
     ),
   ]);
 
@@ -275,12 +615,18 @@ async function getMonthJobs(efrId, month, paging = {}, db = pool) {
       jobId: Number(r.job_id),
       title: r.title,
       clientName: r.client_name || null,
+      bookedAt: r.ticket_created_date_time || null,
+      recordCreatedAt: r.created_date_time || null,
+      ageDays: num(r.age_days),
+      ageSecs: num(r.age_secs),
       completedAt: r.checkout_date_time || null,
       paidAt: r.paid_at || null,
-      amount: money(r.paid_amount),
+      amount: money(r.technician_earning),
       rating: r.job_rating == null ? null : Number(num(r.job_rating).toFixed(1)),
       onTime: Boolean(r.on_time),
       sameDay: Boolean(r.same_day),
+      visitNumber: r.visit_number == null ? null : num(r.visit_number),
+      isEscalated: Boolean(r.is_escalated),
     })),
     total: num(countResult[0]?.[0]?.total),
     page,
@@ -292,11 +638,26 @@ async function getJobDetail(efrId, jobId, db = pool) {
   const [[row]] = await db.query(
     `SELECT j.job_id,
             COALESCE(sc.service_catg_name, st.service_type_name, CONCAT('Job #', j.job_id)) AS title,
-            cl.client_name, j.created_date_time, j.checkout_date_time,
-            p.paid_at, p.paid_amount,
+            cl.client_name, j.ticket_created_date_time, j.created_date_time,
+            j.job_status, j.checkout_date_time, j.app_checkout_date_time,
+            j.checkin_date_time AS reached_at,
+            j.visit_number, j.revisit_reason_id,
+            j.no_of_req_approval, j.no_of_req_foh,
+            ${JOB_AGE_DAYS_EXPR} AS age_days,
+            ${JOB_AGE_SECS_EXPR} AS age_secs,
+            wallet.paid_at, wallet.wallet_credit_count, wallet.paid_to_technician,
+            COALESCE(tx.technician_earning, 0) AS technician_earning,
+            tx.transaction_count, tx.gross_charge, tx.easyfix_charge, tx.client_charge,
+            accepted.offered_at, accepted.responded_at AS accepted_at,
+            CASE WHEN accepted.offered_at IS NOT NULL AND accepted.responded_at IS NOT NULL
+                 THEN GREATEST(TIMESTAMPDIFF(SECOND, accepted.offered_at, accepted.responded_at), 0)
+                 ELSE NULL END AS accepted_in_secs,
             r.customer_rating, COALESCE(NULLIF(r.comment, ''), r.review_comment) AS feedback,
+            COALESCE(r.is_escalated, 0) AS is_escalated,
             COALESCE(NULLIF(j.job_customer_name, ''), cu.customer_name) AS reviewer_name,
-            NULLIF(CONCAT_WS(', ', ad.address, ad.building, ad.locality, ci.city_name, ad.pin_code), '') AS full_address
+            NULLIF(CONCAT_WS(', ', ad.address, ad.building, ad.locality, ci.city_name, ad.pin_code), '') AS full_address,
+            ef.efr_id AS attendee_efr_id, ef.efr_name AS attendee_name,
+            rr.reason AS revisit_reason
        FROM tbl_job j
        LEFT JOIN tbl_client cl ON cl.client_id = j.fk_client_id
        LEFT JOIN tbl_customer cu ON cu.customer_id = j.fk_customer_id
@@ -305,12 +666,30 @@ async function getJobDetail(efrId, jobId, db = pool) {
        LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = j.fk_service_catg_id
        LEFT JOIN tbl_service_type st ON st.service_type_id = j.fk_service_type_id
        LEFT JOIN (
-         SELECT et.job_id, MIN(et.transaction_date) AS paid_at,
-                SUM(ABS(et.amount)) AS paid_amount
+         SELECT MIN(et.transaction_date) AS paid_at,
+                COUNT(*) AS wallet_credit_count,
+                SUM(ABS(et.amount)) AS paid_to_technician
            FROM tbl_easyfixer_transaction et
           WHERE et.easyfixer_id = ? AND et.transaction_type = 2 AND et.job_id = ?
-          GROUP BY et.job_id
-       ) p ON p.job_id = j.job_id
+       ) wallet ON 1 = 1
+       LEFT JOIN (
+         SELECT COUNT(*) AS transaction_count,
+                SUM(COALESCE(tjt.efr_charge, 0)) AS technician_earning,
+                SUM(COALESCE(tjt.total_charge, 0)) AS gross_charge,
+                SUM(COALESCE(tjt.ef_charge, 0)) AS easyfix_charge,
+                SUM(COALESCE(tjt.client_charge, 0)) AS client_charge
+           FROM tbl_job_transaction tjt
+          WHERE tjt.fk_job_id = ?
+       ) tx ON 1 = 1
+       LEFT JOIN (
+         SELECT jo.offered_at, jo.responded_at
+           FROM tbl_job_offer jo
+          WHERE jo.job_id = ?
+            AND jo.fk_easyfixter_id = ?
+            AND jo.offer_status = ${OFFER_STATUS.ACCEPTED}
+          ORDER BY jo.job_offer_id DESC
+          LIMIT 1
+       ) accepted ON 1 = 1
        LEFT JOIN tbl_easyfixer_rating_by_customer r
               ON r.id = (
                 SELECT r2.id
@@ -319,12 +698,16 @@ async function getJobDetail(efrId, jobId, db = pool) {
                  ORDER BY r2.insert_date_time DESC, r2.id DESC
                  LIMIT 1
               )
+       LEFT JOIN tbl_easyfixer ef ON ef.efr_id = j.fk_easyfixter_id
+       LEFT JOIN revisit_reason_by_app rr ON rr.id = j.revisit_reason_id
       WHERE j.job_id = ?
         AND j.fk_easyfixter_id = ?
-        AND j.job_status IN (3, 5)
-        AND p.job_id IS NOT NULL
+        AND (
+          j.job_status IN (3, 5)
+          OR (${UNDER_AUDIT_PREDICATE})
+        )
       LIMIT 1`,
-    [efrId, jobId, efrId, jobId, efrId],
+    [efrId, jobId, jobId, jobId, efrId, efrId, jobId, efrId],
   );
   if (!row) {
     const error = new Error('job not found');
@@ -361,18 +744,7 @@ async function getJobDetail(efrId, jobId, db = pool) {
   ).values()];
 
   const proof = { before: [], after: [] };
-  const resolvedImages = await Promise.all((imageRows || []).map(async (image) => {
-    let url = null;
-    try {
-      url = await s3Storage.resolveImageUrl(image.image);
-    } catch (error) {
-      logger.warn(
-        { err: error.message, jobId, imageId: Number(image.image_id) },
-        'PHE proof image URL resolution failed',
-      );
-    }
-    return { image, url };
-  }));
+  const resolvedImages = await resolveProofRows(imageRows, jobId);
   // Preserve SQL order even when signed-URL calls resolve out of order.
   // Deterministic evidence ordering prevents a refresh from visually shuffling
   // the same job's proof tiles.
@@ -397,15 +769,58 @@ async function getJobDetail(efrId, jobId, db = pool) {
     clientName: row.client_name || null,
     completedAt: row.checkout_date_time || null,
     paidAt: row.paid_at || null,
-    amount: money(row.paid_amount),
+    amount: money(row.technician_earning),
+    // The legacy transaction table does not split technician earnings into
+    // base pay, incentive and penalty columns. Expose only the sums it actually
+    // stores so clients never label an invented breakdown as authoritative.
+    earningsCalculation: num(row.transaction_count) > 0 ? {
+      technicianEarning: money(row.technician_earning),
+      grossJobCharge: money(row.gross_charge),
+      easyFixCharge: money(row.easyfix_charge),
+      clientCharge: money(row.client_charge),
+      transactionLines: num(row.transaction_count),
+    } : null,
+    payoutBreakdown: payoutBreakdown(row),
+    qualityReview: Number(row.job_status) === UNDER_AUDIT_STATUS ? {
+      state: 'UNDER_AUDIT',
+      source: 'tbl_job legacy under-audit predicate',
+      semantics: 'OPERATIONS_UNDER_AUDIT_NOT_CLIENT_QC',
+      startedAt: row.app_checkout_date_time || null,
+      action: {
+        required: false,
+        code: null,
+        reasonCode: 'NO_TECHNICIAN_ACTION_RECORDED',
+      },
+    } : null,
     customerFeedback: row.customer_rating == null && !row.feedback ? null : {
       rating: row.customer_rating == null ? null : Number(row.customer_rating),
       comment: row.feedback || null,
       reviewerDisplayName: maskPersonName(row.reviewer_name),
     },
     proof,
-    bookedAt: row.created_date_time || null,
-    attendedBy: 'You',
+    bookedAt: row.ticket_created_date_time || null,
+    recordCreatedAt: row.created_date_time || null,
+    ageDays: num(row.age_days),
+    ageSecs: num(row.age_secs),
+    offeredAt: row.offered_at || null,
+    acceptedAt: row.accepted_at || null,
+    acceptedInSecs: row.accepted_in_secs == null ? null : num(row.accepted_in_secs),
+    reachedAt: row.reached_at || null,
+    visitNumber: row.visit_number == null ? null : num(row.visit_number),
+    recordedRevisitReason: row.revisit_reason_id == null ? null : {
+      id: num(row.revisit_reason_id),
+      label: row.revisit_reason || null,
+    },
+    isEscalated: Boolean(row.is_escalated),
+    // Stable code lets each supported app language render its own self label.
+    // This technician-scoped endpoint cannot truthfully infer a different team
+    // attendee from the current schema.
+    attendedByType: 'SELF',
+    attendee: row.attendee_efr_id == null ? null : {
+      efrId: Number(row.attendee_efr_id),
+      displayName: row.attendee_name || null,
+      isSelf: Number(row.attendee_efr_id) === Number(efrId),
+    },
     address: row.full_address || null,
   };
 }
@@ -555,6 +970,7 @@ async function getWithdrawals(efrId, paging = {}, db = pool) {
 
 module.exports = {
   getOverview,
+  getInQa,
   getMonthJobs,
   getJobDetail,
   getMissed,
@@ -569,5 +985,10 @@ module.exports = {
     hasMonthActivity,
     maskPersonName,
     withdrawalShape,
+    resolveProofImageUrl,
+    resolveProofRows,
+    payoutBreakdown,
+    UNDER_AUDIT_PREDICATE,
+    PROOF_IMAGE_RESOLUTION_CONCURRENCY,
   },
 };
