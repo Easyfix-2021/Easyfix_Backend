@@ -277,3 +277,35 @@ test('drilldown: city scope reaches the rows, the COUNT and the chip counts alik
     assert.ok(c.params.includes(7) && c.params.includes(9));
   }
 });
+
+test('drilldown: clientId actually narrows — it was accepted and ignored until 2026-08-21', async () => {
+  fake.reset();
+  scenario = [[/.*/, [{ total: 0 }]]];
+  await action.pendingList({ detector: 'client_uncertified', courseId: 4, clientId: 77 });
+  const rows = fake.calls[1];
+  assert.match(rows.sql, /tbl_client_easyfixer_mapping/,
+    'the D5 "Push now" deep link carries clientId; without this clause it showed every outstanding assignment for the module, org-wide');
+  assert.match(rows.sql, /m\.easyfixer_id = ec\.easyfixer_id/,
+    'the mapping FK is easyfixer_id, not efr_id — the wrong one is a silent zero-match, not an error');
+  assert.ok(rows.params.includes(77));
+  // The chip counts must be narrowed by the same clause, or the chips would
+  // describe a bigger population than the rows.
+  assert.match(fake.calls[0].sql, /tbl_client_easyfixer_mapping/);
+});
+
+test('drilldown: the DEFAULT view is outstanding-only, but a chip can reach completed rows', async () => {
+  fake.reset();
+  scenario = [[/.*/, [{ total: 0 }]]];
+  await action.pendingList({ detector: 'deadline_passed', courseId: 4 });
+  assert.match(fake.calls[1].sql, /ec\.completion_date IS NULL/,
+    'a chase list that opens with completed rows in it buries its own point');
+
+  fake.reset();
+  await action.pendingList({ detector: 'deadline_passed', courseId: 4, status: 'done' });
+  const rowSql = fake.calls[1].sql;
+  assert.match(rowSql, /ec\.completion_date IS NOT NULL/);
+  // The old shape forced IS NULL into the base, so "Done" could only ever be
+  // zero — the same argument the shared lib makes about `failed`.
+  assert.doesNotMatch(rowSql.replace(/ec\.completion_date IS NOT NULL/g, ''), /ec\.completion_date IS NULL/,
+    'the outstanding-only default must not survive alongside an explicit chip');
+});

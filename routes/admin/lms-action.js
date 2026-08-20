@@ -55,13 +55,23 @@ const DETECTORS = [
 const CHIPS = ['overdue', 'not_started', 'part_done', 'failed', 'done'];
 
 const homeQuery = Joi.object({
-  /* The Refresh button, and nothing else, bypasses the 60s cache. */
-  fresh: Joi.boolean().default(false),
+  /*
+   * The Refresh button, and nothing else, bypasses the 60s cache.
+   *
+   * truthy(1)/falsy(0) because Joi 17 dropped numeric coercion for booleans:
+   * `?fresh=1` — the obvious thing for a caller to send, and what the first
+   * version of the CRM sent — 400s without it. Accepting both spellings costs
+   * nothing and removes a class of "why is Refresh broken" report.
+   */
+  fresh: Joi.boolean().truthy(1, '1').falsy(0, '0').default(false),
 });
 
 const pendingQuery = Joi.object({
   detector: Joi.string().valid(...DETECTORS).optional(),
   courseId: Joi.number().integer().positive().optional(),
+  /* Narrows to technicians mapped to this client — the D5 "Push now" row
+   * links here with it, and until 2026-08-21 it was accepted and then
+   * ignored, so that link showed the whole organisation. */
   clientId: Joi.number().integer().positive().optional(),
   status: Joi.string().valid(...CHIPS).optional(),
   q: Joi.string().allow('', null).optional(),
@@ -224,11 +234,25 @@ router.get('/field/my-city', requireLmsAction, async (req, res, next) => {
      * three modules is one person not earning. */
     const notEarning = new Set(overdue.rows.map((r) => Number(r.easyfixer_id)));
 
+    /*
+     * ONE array, not two.
+     *
+     * The spec lists "Paused" and "Overdue" as separate sections, and they
+     * will genuinely diverge once a push can opt out of blocking jobs. TODAY
+     * they are the same population by definition: overdue training is exactly
+     * what withdraws a technician's job capabilities. Sending the same 200
+     * rows under two keys would make the payload look like two facts and
+     * invite the reader to add them.
+     *
+     * So the server sends the assignments once; the screen presents them
+     * twice — grouped by technician for "not earning", flat per module for
+     * "overdue". `notEarningCount` is the grouped count, computed here so the
+     * headline sentence and the card count cannot disagree.
+     */
     modernOk(res, {
       today: overdue.today,
       notEarningCount: notEarning.size,
       headline: `${notEarning.size} technician${notEarning.size === 1 ? '' : 's'} in your city ${notEarning.size === 1 ? 'is' : 'are'} not earning because of pending training.`,
-      paused: overdue.rows,
       overdue: overdue.rows,
       pending: pending.rows,
       handedOff,

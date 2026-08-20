@@ -597,25 +597,37 @@ const PROGRESS_JOIN = `
   ) prog ON prog.course_id = ec.course_id AND prog.easyfixer_id = ec.easyfixer_id`;
 
 /*
- * Detector -> extra predicate. Keeping this beside the detectors themselves
- * is deliberate: B-01 and B-02 must move together or the row count in the
- * tile stops matching the list it opens.
+ * Detector -> the POPULATION predicate. Deliberately does NOT include
+ * "outstanding only".
+ *
+ * It used to. Every branch added `completion_date IS NULL`, and because the
+ * chips are counted over the same base, the "Done" chip was structurally
+ * incapable of being anything but zero — the same argument the shared lib
+ * makes about `failed`: a chip that can never be non-zero teaches people to
+ * stop reading chips.
+ *
+ * So: the detector defines WHO is in scope, the chips slice that population,
+ * and the default view (no chip selected) adds outstanding-only itself. Chip
+ * counts therefore describe the whole population while the default list shows
+ * the outstanding part of it — which is why the CRM labels that default "All
+ * Outstanding" rather than "All".
+ *
+ * Keeping this beside the detectors is deliberate: B-01 and B-02 must move
+ * together, or the count in the tile stops matching the list it opens.
  */
 function detectorClauses(detector, today, t) {
   switch (detector) {
     case 'deadline_passed':
-      return { clauses: ['ec.completion_date IS NULL', 'ec.due_date IS NOT NULL', 'ec.due_date < ?'], params: [today] };
+      return { clauses: ['ec.due_date IS NOT NULL', 'ec.due_date < ?'], params: [today] };
     case 'paused_not_started':
-      return { clauses: ['ec.completion_date IS NULL', 'ec.due_date IS NOT NULL', 'ec.due_date < ?', NO_PROGRESS], params: [today] };
+      return { clauses: ['ec.due_date IS NOT NULL', 'ec.due_date < ?', NO_PROGRESS], params: [today] };
     case 'stale_module':
-      return { clauses: ['ec.completion_date IS NULL'], params: [] };
     case 'client_uncertified':
-      return { clauses: ['ec.completion_date IS NULL'], params: [] };
+      return { clauses: [], params: [] };
     default:
-      /* No detector, or one whose population is not assignment-shaped
-       * (assessment_failed): fall back to everything outstanding rather than
-       * to everything, so an unknown key cannot silently widen the list. */
-      return { clauses: ['ec.completion_date IS NULL'], params: [] };
+      /* An unknown detector must not widen the list, so the default view's
+       * outstanding-only filter (applied below) is what bounds it. */
+      return { clauses: [], params: [] };
   }
 }
 
@@ -629,7 +641,7 @@ function detectorClauses(detector, today, t) {
  * @param {string} [opts.q]         name / EFX id search
  * @param {object} opts.scope       req.scope
  */
-async function pendingList({ detector, courseId, status, q, limit = 50, offset = 0, scope } = {}) {
+async function pendingList({ detector, courseId, clientId, status, q, limit = 50, offset = 0, scope } = {}) {
   const today = lms.istToday();
   const t = tunables();
   const d = detectorClauses(detector, today, t);
@@ -637,6 +649,22 @@ async function pendingList({ detector, courseId, status, q, limit = 50, offset =
   const clauses = [...LIVE_WHERE, ...d.clauses];
   const params = [...d.params];
   if (courseId) { clauses.push('ec.course_id = ?'); params.push(Number(courseId)); }
+  /*
+   * Client narrowing, via the eligibility mapping. EXISTS rather than a JOIN:
+   * tbl_client_easyfixer_mapping holds many rows per technician (client x
+   * service_type), so a join fans out and would need COUNT(DISTINCT) over the
+   * fan-out on every chip.
+   *
+   * NOTE the FK column is `easyfixer_id`, not `efr_id` — getting it wrong
+   * yields a silent zero-match rather than an error.
+   */
+  if (clientId) {
+    clauses.push(`EXISTS (SELECT 1 FROM tbl_client_easyfixer_mapping m
+                           WHERE m.easyfixer_id = ec.easyfixer_id
+                             AND m.client_id = ?
+                             AND (m.mapping_status IS NULL OR m.mapping_status <> 0))`);
+    params.push(Number(clientId));
+  }
   if (q && String(q).trim()) {
     const like = `%${String(q).trim()}%`;
     clauses.push('(e.efr_name LIKE ? OR e.efr_no LIKE ?)');
@@ -692,6 +720,10 @@ async function pendingList({ detector, courseId, status, q, limit = 50, offset =
   if (chip) {
     statusClauses.push(`(${chip.sql})`);
     statusParams.push(...chip.params);
+  } else {
+    /* The default view is outstanding work — this screen exists to chase, and
+     * a chase list that opens with completed rows in it buries the point. */
+    statusClauses.push('ec.completion_date IS NULL');
   }
   const statusWhere = `WHERE ${statusClauses.join(' AND ')}`;
 
