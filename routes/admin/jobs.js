@@ -412,21 +412,6 @@ router.get('/export.xlsx', validate(listQuery, 'query'), async (req, res, next) 
     if (dropped.length) {
       logger.warn('Jobs export cannot apply these filters, they are NOT reflected in the sheet: ' + dropped.join(', '));
     }
-    /*
-     * ⚠ AND SAY WHEN WE NARROWED IT OURSELVES.
-     *
-     * An export with no bounding filter gets a default window (and, when the
-     * caller pinned no status, the open-jobs floor). That default is the reason
-     * the exporter has never taken the box down twice — but it is still a
-     * constraint the operator did not ask for, and an unexplained short sheet
-     * is exactly the complaint that started this work ("with Closed Job filter,
-     * downloaded Open orders data"). One line, on the same request id as the
-     * export, so "why is my sheet short" is answerable from the log.
-     */
-    const imposed = buildExportWhere(filters).appliedDefaults || [];
-    if (imposed.length) {
-      logger.info('Jobs export applied DEFAULT bounds the operator did not ask for: ' + imposed.join(' · '));
-    }
     if (req.query.zonalId !== undefined && req.query.zonalId !== '') {
       logger.warn('Jobs export received zonalId=' + req.query.zonalId
         + ' and read it as a ZONAL MANAGER (tbl_city.state_user), which is the legacy meaning — the jobs LIST reads the same name as a ZONE. See ZONAL_ID_COLLISION in services/job-export.service.js.');
@@ -449,6 +434,27 @@ router.get('/export.xlsx', validate(listQuery, 'query'), async (req, res, next) 
      * comment into an enforced property instead of a hope.
      */
     const filters = { ...req.query, scope: req.scope, allowedStages: req.allowedStages };
+    /*
+     * ⚠ AND SAY WHEN WE NARROWED IT OURSELVES — *AFTER* `filters` EXISTS.
+     *
+     * An export with no bounding filter gets a default window (and, when the
+     * caller pinned no status, the open-jobs floor). That is still a constraint
+     * the operator did not ask for, and an unexplained short sheet is the
+     * complaint that started this work, so it is logged on the request.
+     *
+     * THIS BLOCK SAT 25 LINES ABOVE THE `const filters` DECLARATION and read it
+     * from the temporal dead zone: every single export threw
+     * "ReferenceError: Cannot access 'filters' before initialization" and the
+     * operator saw "Export failed: Internal Server Error". `const` is not
+     * hoisted the way `var` is — reading it before its declaration line is a
+     * throw, not undefined. Nothing caught it because the module still IMPORTS
+     * cleanly (the TDZ only fires when the handler RUNS) and the export suite
+     * exercises the service, never the route. Keep this below the declaration.
+     */
+    const imposed = buildExportWhere(filters).appliedDefaults || [];
+    if (imposed.length) {
+      logger.info('Jobs export applied DEFAULT bounds the operator did not ask for: ' + imposed.join(' · '));
+    }
 
     let capped = false;
 
