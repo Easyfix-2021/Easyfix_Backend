@@ -52,6 +52,25 @@ const EXPECTED = {
     'comment_id', 'job_id', 'comments', 'comment_on', 'created_on',
     'appointment_on', 'commented_by', 'enum_reason_id', 'efr_id',
   ],
+  /*
+   * tbl_job_logs — the job-history archive (1.7M rows, written since 2015).
+   * Until services/job-log.service.js there was not one reference to this table
+   * in any .js or .sql, and its absence from THIS list is why a source-level
+   * survey could not see it at all. The column list is the legacy JobsLog entity
+   * (EasyFix_CRM .../Jobs/model/JobsLog.java), confirmed against
+   * INFORMATION_SCHEMA. `event_received_date` is listed although the new backend
+   * does not write it: the old API does, and a reader of this history will meet
+   * it, so a deploy that lost the column should be REPORTED rather than surprise
+   * whoever builds the Job Log tab.
+   *
+   * Listed in FAIL_SOFT_TABLES below, so a gap here warns on every boot instead
+   * of stopping it — every write to this table is deliberately swallowed, so it
+   * cannot 500 a request and must not be able to block a deploy either.
+   */
+  tbl_job_logs: [
+    'job_log_id', 'log_for', 'old_data', 'new_data', 'comments',
+    'changed_by', 'change_date', 'job_id', 'eta_status', 'event_received_date',
+  ],
   tbl_customer_feedback: [
     'feedback_id', 'job_id', 'easyfixer_rating', 'easyfix_rating', 'happy_with_service',
   ],
@@ -177,6 +196,35 @@ const EXPECTED = {
   ],
 };
 
+/*
+ * Tables in EXPECTED whose column mismatches are a DEGRADATION, not a boot
+ * blocker — reported through the same softer channel the hardening invariants
+ * below use (invariantMismatches: warn loudly every boot, block only under
+ * REQUIRE_SCHEMA_INVARIANTS=true).
+ *
+ * The rule the rest of EXPECTED obeys is "the code's own SQL names this column,
+ * so a request 500s the moment it runs — refuse to boot". That rule is what
+ * makes the strictness correct, and it is exactly what does not hold for a table
+ * whose EVERY write is deliberately fail-soft: services/job-log.service.js
+ * swallows its own errors and returns null so a history row can never cost the
+ * job mutation it describes. A table that cannot break a REQUEST must not be
+ * able to break a DEPLOY — otherwise shipping into an environment where
+ * tbl_job_logs is missing or differently-shaped crash-loops the container
+ * instead of quietly losing log rows, and the only recovery,
+ * SKIP_SCHEMA_VERIFY=true, ALSO switches off the phantom-column protection for
+ * the twenty-odd tables where the strict rule DOES hold. That is the shape of
+ * the 2026-08-12 outage, and it is why this is a severity change and not a
+ * deletion: the columns are still checked and still reported on every boot.
+ *
+ * Anything added here must be able to justify the same sentence: every write is
+ * swallowed, and every read tolerates the table being absent.
+ */
+const FAIL_SOFT_TABLES = {
+  tbl_job_logs:
+    'history rows only — every write goes through services/job-log.service.js, '
+    + 'which swallows its own errors after the job mutation has committed',
+};
+
 // These constraints are correctness requirements, not optional tuning. A
 // missing idempotency key UNIQUE can execute an offline mutation twice; a
 // missing training UNIQUE makes ON DUPLICATE KEY UPDATE insert duplicates; and
@@ -274,8 +322,9 @@ const OPTIONAL = {
  *
  * `requiredMismatches` = missing tables/columns → the code's own SQL names them,
  *   so these are runtime 500s waiting to happen. Callers MUST refuse to boot.
- * `invariantMismatches` = missing UNIQUE index / generated column / trigger →
- *   queries still run, behaviour degrades. Callers warn; blocking is opt-in.
+ * `invariantMismatches` = missing UNIQUE index / generated column / trigger, or
+ *   a missing column on a FAIL_SOFT_TABLES table → queries still run, behaviour
+ *   degrades. Callers warn; blocking is opt-in (REQUIRE_SCHEMA_INVARIANTS).
  *
  * Does NOT exit the process — caller decides what to do.
  */
@@ -292,13 +341,17 @@ async function verifySchemaAgainstLiveDb() {
       [dbName, table]
     );
     const actual = new Set(rows.map((r) => r.COLUMN_NAME));
+    // Fail-soft tables report through the invariant channel — same two-class
+    // severity the indexes/trigger use. See FAIL_SOFT_TABLES.
+    const impact = FAIL_SOFT_TABLES[table];
+    const bucket = impact ? invariants : missing;
     if (actual.size === 0) {
-      missing.push({ table, missing: '<TABLE DOES NOT EXIST>' });
+      bucket.push({ table, col: '<TABLE DOES NOT EXIST>', missing: '<TABLE DOES NOT EXIST>', impact });
       continue;
     }
     for (const col of columns) {
       totalChecked++;
-      if (!actual.has(col)) missing.push({ table, col });
+      if (!actual.has(col)) bucket.push({ table, col, impact });
     }
   }
 
@@ -469,6 +522,10 @@ module.exports = {
   verifySchemaAgainstLiveDb,
   bootWouldFail,
   _internals: {
+    // Exported so a test can build a faithful INFORMATION_SCHEMA stand-in
+    // (every expected column present) and then take exactly one table away.
+    EXPECTED,
+    FAIL_SOFT_TABLES,
     ACTIVE_AADHAAR_GENERATED_COLUMN_SQL,
     canonicalSql,
     matchesActiveAadhaarGeneratedColumn,

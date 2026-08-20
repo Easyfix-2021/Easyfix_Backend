@@ -30,6 +30,11 @@ const {
   persistJobOfferBatch,
   MAX_OFFER_RECIPIENTS,
 } = require('./job-offer-persistence.service');
+// tbl_job_logs — the platform's job-history archive, written by the legacy Java
+// stack since 2015. Every convention (log_for vocabulary, new_data shape,
+// eta_status code, actor scheme) lives in that module; every call below is
+// FAIL-SOFT and post-COMMIT by its contract, so none of them can fail a mutation.
+const jobLog = require('./job-log.service');
 
 /*
  * THE OFFER MODEL feature flag. ON by default — only the literal string
@@ -1984,9 +1989,124 @@ async function list({
       // A phone fragment, not an id. Anchored at the START so "530280" can
       // never match the middle of 9845302806 — the reported bug.
       if (q.length >= MOBILE_MIN_DIGITS) {
-        idTerms.push('cu.customer_mob_no LIKE ?');
+        /*
+         * ── THE MOBILE BRANCH IS A SET LOOKUP, NOT A JOINED COLUMN ──
+         * (2026-08-20, measured against the 481k-row table — see the numbers
+         * in the block below.)
+         *
+         * It used to read `cu.customer_mob_no LIKE ?`, i.e. a column of the
+         * OUTER LEFT JOIN. Because it sat inside an OR with three tbl_job
+         * predicates, MySQL could not decide the row until tbl_customer had
+         * been joined, so EXPLAIN showed `cu eq_ref … Using where` and the
+         * server paid ~481k PK probes into tbl_customer for one search —
+         * whether or not any of them could match. That is what made a phone
+         * search the slowest thing on the page (2.0s data + 1.9s count).
+         *
+         * Written as an uncorrelated IN (…), the same rows come back but the
+         * predicate is now pure-`j`: MySQL runs the subquery ONCE as
+         * `range` on the customer_mob_no index (EXPLAIN: `2 SUBQUERY qmob
+         * type=range key=mobile_unique … Using index`) and probes the result.
+         * The prefix anchor is what makes the range possible — it is a
+         * correctness rule first (see above) and an index rule second.
+         *
+         * SAME ROWS, three-valued logic included: customer_id is the PK of
+         * tbl_customer, so `cu.customer_mob_no LIKE 't%'` is true for exactly
+         * the jobs whose fk_customer_id is in that set. A NULL or orphan
+         * fk_customer_id yields NULL/false on both sides (`NULL IN (…)` is
+         * UNKNOWN, `NULL LIKE …` is NULL) and OR-composes identically.
+         * ⚠ This is IN, never NOT IN — the NOT-IN/NULL trap does not apply,
+         * and must not be introduced here by "simplifying" it later.
+         *
+         * SIDE EFFECT, deliberate: the WHERE no longer names `cu.`, so the
+         * COUNT query's alias sniffing below stops adding the tbl_customer
+         * join to it as well. The subquery is self-contained, so COUNT and
+         * the data query still filter on exactly the same predicate — the
+         * totals were verified equal on real data for every term shape.
+         *
+         * Measured, min-of-5 interleaved, q = a real 10-digit mobile:
+         *              data query      COUNT query
+         *   before      2027 ms         1864 ms
+         *   after       1088 ms          865 ms
+         * and unchanged (~31 ms) on the selective tabs, because the plan is
+         * still free to drive from idx_tbl_job_status.
+         */
+        idTerms.push(
+          'j.fk_customer_id IN (SELECT qmob.customer_id FROM tbl_customer qmob WHERE qmob.customer_mob_no LIKE ?)'
+        );
         idParams.push(`${q}%`);
       }
+      /*
+       * ═══ WHY THIS IS STILL AN `OR`, AND NOT A UNION OF INDEXED BRANCHES ═══
+       *
+       * The obvious next move — and the one docs/migrations for the
+       * customer_mob_no index proposed — is to stop OR-ing indexable and
+       * non-indexable branches and instead feed the outer query a UNION of
+       * per-branch id lookups:
+       *
+       *   FROM tbl_job j … JOIN (
+       *        SELECT job_id FROM tbl_job WHERE job_id = ?
+       *   UNION SELECT job_id FROM tbl_job WHERE job_reference_id LIKE ?
+       *                                        OR client_ref_id LIKE ?
+       *   UNION SELECT … FROM tbl_customer … JOIN tbl_job …
+       *   ) qs ON qs.job_id = j.job_id
+       *
+       * It was built and MEASURED against the real 481k-row table before
+       * being rejected. Both halves of the premise turn out to be false:
+       *
+       * 1. IT CANNOT MAKE EVERY BRANCH INDEX-USABLE. job_reference_id and
+       *    client_ref_id are matched with a LEADING wildcard, which no index
+       *    shape can serve — not in an OR, not in a UNION branch, not
+       *    anywhere. Moving them into a subquery changes where the scan
+       *    happens, never whether it happens. (Neither column is indexed at
+       *    all today; even a covering index would only turn the clustered
+       *    scan into a narrower index-only one — measured 600 ms → 137 ms for
+       *    an equivalent full scan of a narrow secondary index. Worth doing
+       *    on its own merits; it does not change this conclusion.)
+       *
+       * 2. IT TAKES THE PLAN CHOICE AWAY FROM THE OPTIMISER. The derived
+       *    table has to be materialised before the join, so the UNION shape
+       *    costs one full scan of tbl_job — ~690 ms — NO MATTER WHAT ELSE IS
+       *    IN THE WHERE. The current OR is an ordinary per-row predicate, so
+       *    MySQL is free to drive from whichever filter is selective and
+       *    check the term on the few rows that survive. Quick search almost
+       *    always ships with a tab filter, and 9 of the 12 tabs are tiny
+       *    (status 0=430 rows, 1=432, 10=259, 21=78, 15=66, 2+20=48 …).
+       *
+       *    Endpoint latency, min-of-5 interleaved, real data, q=482507:
+       *                       today (OR)      UNION shape
+       *      no tab ('All')      896 ms          694 ms   ← UNION 1.3× better
+       *      status=5 (332k)    1259 ms          694 ms   ← UNION 1.8× better
+       *      status=0 (430)       33 ms          706 ms   ← UNION 21× WORSE
+       *      status=20 (4)        35 ms          729 ms   ← UNION 21× WORSE
+       *
+       *    A 1.3–1.8× win on two tabs bought with a 21× loss on nine is not a
+       *    trade worth making. Result parity was never the problem — the
+       *    UNION returned identical rows on every term shape tested — the
+       *    physics is.
+       *
+       * 3. `j.job_id IN (SELECT … UNION …)` — the same idea kept in the
+       *    WHERE so the optimiser could still choose — is worse than either:
+       *    MySQL 8.4 refuses to flatten a UNION subquery into a semi-join and
+       *    executes it as a DEPENDENT SUBQUERY, re-running the union per
+       *    outer row. Measured 5.1 s / 10.3 s. Do not resurrect it.
+       *
+       * THE `REF-` REDUNDANCY QUESTION. job_reference_id is normally
+       * `REF-{job_id}` (utils/job-reference.js), which makes it tempting to
+       * drop `j.job_reference_id LIKE ?` for a digits-only term as
+       * "already covered by j.job_id = ?". It is NOT covered, on two
+       * independent grounds:
+       *   • SEMANTICS. On auto rows the branch is effectively
+       *     `CAST(job_id AS CHAR) LIKE '%t%'` — a SUBSTRING match over the id
+       *     digits, strictly wider than equality. Searching "5302" returns
+       *     261 jobs today (453027, 415302, …); equality returns none of them.
+       *   • PROVENANCE. The value is only auto-generated when the caller
+       *     supplies neither `job_reference_id` nor `reuse_client_ref`
+       *     (create(), ~line 3255). On this database 3,768 rows of 481,043
+       *     carry a ref that is NOT `REF-{job_id}`, and a live search proves
+       *     the branch earns its place: q=999998 matches job 298642 even
+       *     though no such job id exists (max id is 482507).
+       * So the branch stays, and with it the one scan nothing can remove.
+       */
       clauses.push(`(${idTerms.join(' OR ')})`);
       params.push(...idParams);
     } else {
@@ -3368,6 +3488,10 @@ async function create(input, actor) {
     await conn.commit();
     logger.info('Job created · id=' + jobId + ' · status=' + effectiveStatus);
 
+    // 'new job' in tbl_job_logs — the same row the legacy CRM writes at the end
+    // of createJob(). Post-commit and on the shared pool, never `conn`.
+    await jobLog.logNewJob(jobId, actor);
+
     /*
      * Flag-based auto-assignment on job creation.
      *
@@ -4246,6 +4370,26 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
   values.push(jobId);
   await pool.query(`UPDATE tbl_job SET ${sets.join(', ')} WHERE job_id = ?`, values);
 
+  /*
+   * tbl_job_logs. Three rows are possible on one transition and they answer
+   * different questions, so they are not collapsed:
+   *   'status change'      — NEW event (the legacy stack never logged a generic
+   *                          transition; only CANCELLED left a dated row).
+   *                          Skipped by logStatusChange when nothing moved, which
+   *                          is what the mobile ETA / reschedule routes do when
+   *                          they pass the CURRENT status to ride the extras path.
+   *   'checkout'           — legacy vocabulary, on the visit being closed out.
+   *   'Re-visit Required'  — legacy vocabulary, on the visit needing another one.
+   * All three are fail-soft and run after the UPDATE has already committed.
+   */
+  await jobLog.logStatusChange(jobId, { from: existing.job_status, to: Number(status) }, actor);
+  if (COMPLETED_STATES.has(Number(status)) && !COMPLETED_STATES.has(Number(existing.job_status))) {
+    await jobLog.logCheckout(jobId, actor);
+  }
+  if (Number(status) === STATUS.REVISIT && Number(existing.job_status) !== STATUS.REVISIT) {
+    await jobLog.logRevisitRequired(jobId, { reasonId: extras?.revisit_reason_id }, actor);
+  }
+
   const eventName = statusToEventName(existing.job_status, Number(status));
   logger.info('Job status updated · id=' + jobId + ' · ' + existing.job_status + '->' + Number(status) + (eventName ? ' · event=' + eventName : ''));
   if (eventName) fireWebhook(eventName, jobId);
@@ -4781,6 +4925,22 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
     await conn.commit();
     logger.info('Job ' + (isReassign ? 'reassigned' : 'assigned') + ' · id=' + jobId + ' · easyfixerId=' + easyfixerId);
 
+    // tbl_job_logs: legacy splits these two the same way the webhook above does
+    // — a FIRST scheduling is 'schedule', a change of technician is
+    // 'Re-Scheduling' carrying who was on it before.
+    if (isReassign) {
+      // No Sched_by / Sched_date fragment here: the locked SELECT above reads
+      // only what the assignment itself needs, and re-reading the row after the
+      // UPDATE would report the NEW scheduling as the old one. logReschedule
+      // omits the parts it is not given rather than writing 'null' into them.
+      await jobLog.logReschedule(jobId, {
+        previousEasyfixerId: lockedJob.fk_easyfixter_id,
+        newEasyfixerId: easyfixerId,
+      }, actor);
+    } else {
+      await jobLog.logSchedule(jobId, actor);
+    }
+
     fireWebhook(isReassign ? 'RescheduleTech' : 'TechAssigned', jobId);
 
     // Assigning a technician is Ops handling the job — clear any pending request.
@@ -5021,6 +5181,11 @@ async function acceptOffer(jobId, efrId) {
        * payload, so firing inside the transaction would race its own write.
        */
       fireWebhook('TechAssigned', jobId);
+      // 'schedule' in tbl_job_logs. Under THE OFFER MODEL assign() delegates to
+      // offerToTechnicians() and returns without scheduling anyone, so the
+      // acceptance IS the scheduling event — log it here or the history loses
+      // 'schedule' entirely on every offer-flow job.
+      await jobLog.logSchedule(jobId, { efr_id: efrId });
       return { accepted: true, jobId: Number(jobId) };
     }
 
@@ -5102,6 +5267,8 @@ async function acceptOffer(jobId, efrId) {
       // Acceptance = the legacy TechAssigned moment. See the note on the
       // sibling claim path above; only the winner of the race reaches here.
       fireWebhook('TechAssigned', jobId);
+      // 'schedule' — see the note on the sibling claim path above.
+      await jobLog.logSchedule(jobId, { efr_id: efrId });
       return { accepted: true, jobId: Number(jobId) };
     }
 
@@ -5394,8 +5561,11 @@ async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason
   logger.info('Reschedule job · id=' + jobId + ' · reasonId=' + reasonId);
   // time_slot is read only as the FALLBACK for a date-only reschedule (no
   // time-of-day to derive a band from) — see resolveTimeSlot below.
+  // scheduled_date_time / fk_scheduled_by are read only to describe the schedule
+  // being REPLACED in the 'Re-Scheduling' history row at the end; both are
+  // overwritten by the UPDATE below, so they have to be captured up front.
   const [[existing]] = await pool.query(
-    'SELECT job_id, fk_easyfixter_id, time_slot FROM tbl_job WHERE job_id = ? LIMIT 1',
+    'SELECT job_id, fk_easyfixter_id, time_slot, scheduled_date_time, fk_scheduled_by FROM tbl_job WHERE job_id = ? LIMIT 1',
     [jobId],
   );
   if (!existing) { const err = new Error('job not found'); err.status = 404; throw err; }
@@ -5481,6 +5651,17 @@ async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason
   } finally {
     conn.release();
   }
+
+  // 'Re-Scheduling' in tbl_job_logs, with the other post-commit audits below.
+  // The technician is unchanged on this path (only the appointment moved), so it
+  // appears on BOTH sides of the row — which is what the legacy rows look like
+  // when only the time moved.
+  await jobLog.logReschedule(jobId, {
+    previousEasyfixerId: existing.fk_easyfixter_id,
+    newEasyfixerId: existing.fk_easyfixter_id,
+    previousScheduledBy: existing.fk_scheduled_by,
+    previousScheduledAt: existing.scheduled_date_time,
+  }, actor);
 
   // Audit (best-effort, post-commit). scheduling_history mirrors assign()'s shape
   // (reason_id + reschedule_reason label); easyfixer_id may be NULL on an
@@ -5609,7 +5790,25 @@ async function listOfferedForTech(efrId, { limit = 50 } = {}) {
 // Always captures reason + timestamp + actor for the audit trail.
 async function changeOwner(jobId, { newOwnerId, reason }, actor) {
   logger.info('Change job owner · id=' + jobId + ' · newOwnerId=' + newOwnerId);
-  // Skip the full detail load — we only need job_owner for the no-op check.
+  /*
+   * ⚠ THIS MOVES job_client_owner, NOT job_owner.
+   *
+   * tbl_job carries two owner columns and they are different things:
+   *   job_owner        — the internal EasyFix operator
+   *   job_client_owner — the CLIENT's Primary SPOC, auto-resolved at creation
+   *                      from tbl_vertical_mapping WHERE user_type = 1 (see
+   *                      create() above)
+   * Transfer Job Ownership wrote job_owner, which was the wrong column for
+   * what the feature is for; product confirmed job_client_owner is the target.
+   *
+   * The `ownerId` LIST filter was moved to the same column in the same change.
+   * That pairing is not cosmetic: routes/admin/jobs.js POST /bulk-owner-transfer
+   * resolves its filters-mode target set with job.list({ ownerId: fromOwnerId }),
+   * so if the list selected on one column while this wrote the other, a bulk
+   * transfer would pick jobs by one owner and reassign a different owner's
+   * jobs. Change one of these and you must change the other.
+   */
+  // Skip the full detail load — only the client owner matters for the no-op check.
   const [[existing]] = await pool.query(
     'SELECT job_id, job_client_owner FROM tbl_job WHERE job_id = ? LIMIT 1',
     [jobId]

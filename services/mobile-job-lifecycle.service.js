@@ -117,7 +117,13 @@ async function cancel(jobId, efrId, { reason, reasonId }) {
   await jobService.setStatus(
     jobId,
     { status: STATUS_CANCELLED, reasonId: reasonId || null, comment: reason || null },
-    { user_id: efrId },
+    // `efr_id` names the namespace `user_id` is carrying. Legacy columns
+    // (cancel_by, fk_checkout_by, commented_by) read user_id and keep storing an
+    // efr id in a tbl_user slot — a live defect this does not change. What it
+    // does is stop that ambiguity reaching tbl_job_logs.changed_by, where
+    // services/job-log.service.js uses efr_id to keep a technician out of a
+    // column that must only ever hold a tbl_user id.
+    { user_id: efrId, efr_id: efrId },
   );
 
   // Mirror the app-specific cancel reason + flag for legacy CRM reports.

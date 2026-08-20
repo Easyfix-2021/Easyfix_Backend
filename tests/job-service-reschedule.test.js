@@ -15,14 +15,22 @@ const { installFakePool } = require('./helpers/fake-pool');
 
 // `time_slot` is read by reschedule ONLY as the fallback for a date-only move
 // (no hour to band) — see resolveTimeSlot in services/time-slot.js.
-const DEFAULTS = () => ({ existing: { job_id: 42, fk_easyfixter_id: null, time_slot: null } });
+// `scheduled_date_time` / `fk_scheduled_by` are read alongside them to describe
+// the schedule being replaced in the tbl_job_logs 'Re-Scheduling' row (both are
+// overwritten by the UPDATE, so reschedule() has to capture them first).
+const DEFAULTS = () => ({
+  existing: {
+    job_id: 42, fk_easyfixter_id: null, time_slot: null,
+    scheduled_date_time: '2026-07-18 09:00:00', fk_scheduled_by: 9,
+  },
+});
 const scenario = DEFAULTS();
 
 const fake = installFakePool(
   [
     [/INFORMATION_SCHEMA/i, [{ n: 0 }]],
     [/SHOW COLUMNS/i, []],
-    [/SELECT job_id, fk_easyfixter_id, time_slot FROM tbl_job/, () => (scenario.existing ? [scenario.existing] : [])],
+    [/SELECT job_id, fk_easyfixter_id, time_slot.* FROM tbl_job/, () => (scenario.existing ? [scenario.existing] : [])],
   ],
   { stopOn: /UPDATE tbl_job\b/ }, // \b excludes UPDATE tbl_job_offer
 );

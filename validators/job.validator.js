@@ -434,10 +434,48 @@ const updateBody = Joi.object({
   }).optional(),
 }).min(1);
 
+/*
+ * PATCH /api/admin/jobs/:id/status — the ONLY consumer of this schema
+ * (routes/admin/jobs.js:1471; validators/easyfixer.validator.js has its own
+ * unrelated `statusBody`). It hands `req.body` straight to
+ * services/job.service.js#setStatus, which destructures
+ * `{ status, reasonId, comment, extras }`.
+ *
+ * `extras` HAD to be declared here (2026-08-20). middleware/validate.js runs Joi
+ * with `stripUnknown: true`, so an undeclared key is not rejected — it is
+ * silently deleted. setStatus reads `extras.revisit_reason_id` when a job moves
+ * into REVISIT, both to stamp tbl_job.revisit_reason_id and to name the reason
+ * on the tbl_job_logs 'Re-visit Required' row, and from this route that read was
+ * unconditionally `undefined`: every CRM "Mark InComplete" landed a revisit with
+ * no reason attached and nothing anywhere said why.
+ *
+ * ── Why a nested object and not a top-level `revisitReasonId` ───────────────
+ * setStatus's parameter is `extras`, and this validator cannot reshape a body
+ * into a shape the service does not read.
+ *
+ * ── Why exactly ONE key, and why NOT derived from `reasonId` ────────────────
+ * `extras` is a column→value map applied to tbl_job. setStatus whitelists the
+ * column NAMES (STATUS_EXTRAS_ALLOWLIST) against SQL injection, but that list
+ * spans the whole mobile check-in / check-out / ETA surface — GPS readings,
+ * check-in timestamps, cash amounts. Accepting a free-form object here would
+ * hand an operator endpoint the technician app's entire stamp set, so only the
+ * one key this route legitimately carries is declared; `stripUnknown` removes
+ * the rest, exactly as it removed `extras` itself before.
+ *
+ * It is deliberately NOT auto-filled from the sibling `reasonId`, even though
+ * that would spare the FE a change. They are ids in DIFFERENT namespaces:
+ * `reasonId` is an `action_taken_reason.id` (cancel / enquiry dropdowns, stored
+ * as enum_reason_id), while `revisit_reason_id` is FK to `revisit_reason_by_app`.
+ * Copying one into the other would silently store a cross-namespace id in an FK
+ * column and rename someone's revisit reason on the legacy screen.
+ */
 const statusBody = Joi.object({
   status: Joi.number().integer().valid(...ALL_STATUS_VALUES).required(),
   reasonId: intId.optional(),
   comment: Joi.string().max(500).optional(),
+  extras: Joi.object({
+    revisit_reason_id: intId.optional(),
+  }).optional(),
 });
 
 const assignBody = Joi.object({

@@ -690,7 +690,15 @@ router.post('/jobs/:id/eta', validate(Joi.object({
           eta_requested_time: new Date(req.body.etaTime || Date.now()),
         },
       },
-      { user_id: req.tech.efr_id },
+      /*
+       * `user_id` here is an efr_id, not a tbl_user id — a namespace collision
+       * that is already live on cancel_by / fk_checkout_by / commented_by and is
+       * NOT changed by this line. `efr_id` is added alongside it, on every
+       * technician actor in this router, purely to NAME the namespace: it is how
+       * services/job-log.service.js tells a technician from an operator and keeps
+       * tbl_job_logs.changed_by a tbl_user id and nothing else.
+       */
+      { user_id: req.tech.efr_id, efr_id: req.tech.efr_id },
     );
     logger.info('ETA signal stamped · id=' + job.job_id);
     modernOk(res, { sent: true });
@@ -786,7 +794,7 @@ router.post('/jobs/:id/checkin', validate(Joi.object({
     await jobService.setStatus(
       job.job_id,
       { status: 2 /* IN_PROGRESS */, extras },
-      { user_id: req.tech.efr_id },
+      { user_id: req.tech.efr_id, efr_id: req.tech.efr_id },
     );
     logger.info('Checked in · id=' + job.job_id + ' · status->IN_PROGRESS');
     modernOk(res, { checkedIn: true });
@@ -856,7 +864,7 @@ router.post('/jobs/:id/checkout',
     await jobService.setStatus(
       job.job_id,
       { status: isRevisit ? 10 /* REVISIT */ : 3 /* COMPLETED */, extras },
-      { user_id: req.tech.efr_id },
+      { user_id: req.tech.efr_id, efr_id: req.tech.efr_id },
     );
     logger.info('Checked out · id=' + job.job_id + ' · status->' + (isRevisit ? 'REVISIT' : 'COMPLETED'));
 
@@ -924,7 +932,7 @@ router.post('/jobs/:id/reschedule', validate(Joi.object({
           is_rescheduled_by_app: 1,
         },
       },
-      { user_id: req.tech.efr_id },
+      { user_id: req.tech.efr_id, efr_id: req.tech.efr_id },
     );
     await pool.query(
       `UPDATE tbl_job SET resch_job_count = COALESCE(resch_job_count, 0) + 1 WHERE job_id = ?`,
