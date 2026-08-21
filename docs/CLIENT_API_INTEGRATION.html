@@ -266,6 +266,44 @@
     letter-spacing: -0.01em;
     word-break: break-all;
   }
+  /*
+   * The full URL is printed on every endpoint, but the host and
+   * /api/integration prefix are identical on all of them — so they are set
+   * back to muted weight and the eye still lands on the version and the path,
+   * which are the only parts that differ. Copying the line still yields a URL
+   * that works as-is.
+   */
+  .path .host {
+    font-weight: 400;
+    color: var(--ink-faint);
+    font-size: 0.9rem;
+  }
+  .path .host .v {
+    /* The version is the one part of the prefix that is NOT constant, and
+       guessing it wrong is the single most common integration mistake. */
+    color: var(--ink-muted);
+    font-weight: 700;
+  }
+  /*
+   * Shown only under the v2 tab (the [data-apiver] rules above hide
+   * data-ver="2" on the v1 page). v2 adds exactly one endpoint; every other
+   * one on this page is still served from /v1, and a reader who has just
+   * flipped the switch needs to see that on the endpoint itself, not only in
+   * a note they may have scrolled past.
+   */
+  .v1badge {
+    font-family: var(--mono);
+    font-size: 0.66rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 3px 9px;
+    border-radius: 999px;
+    border: 1px solid var(--warn);
+    background: var(--warn-soft);
+    color: var(--warn);
+    white-space: nowrap;
+  }
   .ep > p:first-of-type { color: var(--ink-muted); }
 
   /* ── Tables ───────────────────────────────────────────── */
@@ -568,24 +606,30 @@
       <p data-ver="1">The Partner API is a small, stable REST surface. Most integrations use four endpoints: read your service catalogue, create a job, upload photographs, and check status &mdash; with webhooks pushing progress to you so you never have to poll.</p>
       <p data-ver="2">The Partner API is a small, stable REST surface. Most v2 integrations use three endpoints: read your service catalogue, create a job with its photographs in a single call, and check status &mdash; with webhooks pushing progress to you so you never have to poll.</p>
 
-      <h4>Base URLs</h4>
+      <h4>Hosts</h4>
       <div class="envs">
         <div class="env prod">
           <span class="tag">Production</span>
-          <div class="url">https://backend.easyfix.in/api/integration/<span data-ver="1">v1</span><span data-ver="2">v2</span></div>
+          <div class="url">https://backend.easyfix.in</div>
         </div>
         <div class="env">
           <span class="tag">QA &mdash; build against this first</span>
-          <div class="url">https://qa.backend.easyfix.in/api/integration/<span data-ver="1">v1</span><span data-ver="2">v2</span></div>
+          <div class="url">https://qa.backend.easyfix.in</div>
         </div>
       </div>
 
-      <p>Every path in this document is relative to that base. All requests are HTTPS; plain HTTP is not served.</p>
+      <p><strong>The version is part of the endpoint, not of the host.</strong> Every endpoint below is printed as a complete production URL you can copy &mdash; swap the host for the QA one above and it works unchanged. All requests are HTTPS; plain HTTP is not served.</p>
+
+      <div class="note warn" data-ver="2">
+        <span class="lbl">Only one endpoint is on /v2</span>
+        <p>v2 adds a single thing: <a href="#create-v2"><code>POST /v2/jobs</code></a>, which carries a job and its images in one request. <strong>Every other endpoint on this page &mdash; the service catalogue, job status, image upload, all the lookups &mdash; is served from <code>/v1</code> and always will be.</strong> They are marked <span class="v1badge">still on v1</span> throughout.</p>
+        <p>There is no <code>/v2</code> copy of them to move to. Pointing a v1 path at <code>/v2</code> returns <code>404 No matching route</code>, so use the full URL printed on each endpoint exactly as it appears.</p>
+      </div>
 
       <h4>Your first call</h4>
       <pre><span class="c"># Confirm your credentials reach us and see your service catalogue</span>
 curl -u <span class="s">'YOUR_USERNAME:YOUR_PASSWORD'</span> \
-  <span class="s">'https://qa.backend.easyfix.in/api/integration/<span data-ver="1">v1</span><span data-ver="2">v2</span>/services'</span></pre>
+  <span class="s">'https://qa.backend.easyfix.in/api/integration/v1/services'</span></pre>
 
       <div class="note" data-ver="1">
         <span class="lbl">Moving from the old API?</span>
@@ -595,7 +639,7 @@ curl -u <span class="s">'YOUR_USERNAME:YOUR_PASSWORD'</span> \
       <div class="note ok" data-ver="2">
         <span class="lbl">v2 is opt-in &mdash; nothing on v1 stops working today</span>
         <p><strong>If you already integrate on v1, nothing breaks and nothing is urgent.</strong> v1 is unchanged and fully supported. We do intend to retire the two-step image flow &mdash; upload each image, then create the job carrying their ids &mdash; but no date is set, and any retirement will carry a formal notice period. Every other v1 endpoint stays as it is.</p>
-        <p>v2 changes exactly one thing: <a href="#create-v2">creating a job</a> can carry its images in the same request. Everything else on this page &mdash; authentication, the response envelope, dates, errors, the service catalogue, job status, lookups and every webhook &mdash; is byte-for-byte identical across the two versions. Move an integration to v2 when the single-call create is worth it to you, and not before.</p>
+        <p>v2 changes exactly one thing: <a href="#create-v2">creating a job</a> can carry its images in the same request. Everything else on this page &mdash; authentication, the response envelope, dates, errors, the service catalogue, job status, lookups and every webhook &mdash; is untouched, and keeps being served from its existing <code>/v1</code> URL; a v2 integration calls <code>/v2</code> for the create and <code>/v1</code> for the rest. Move an integration to v2 when the single-call create is worth it to you, and not before.</p>
       </div>
 
       <h4>This document</h4>
@@ -702,7 +746,7 @@ curl -u <span class="s">'YOUR_USERNAME:YOUR_PASSWORD'</span> \
       <p>Start here. This returns the services your organisation is contracted for, with your prices. The <code>service_id</code> values it returns are what you quote back when creating a job &mdash; nothing can be booked without them.</p>
 
       <div class="ep">
-        <div class="ep-head"><span class="verb get">GET</span><span class="path">/services</span></div>
+        <div class="ep-head"><span class="verb get">GET</span><span class="path"><span class="host">https://backend.easyfix.in/api/integration/<span class="v">v1</span></span>/services</span><span class="v1badge" data-ver="2">still on v1</span></div>
         <p>Your priced service catalogue.</p>
 
         <h4>Query parameters</h4>
@@ -812,7 +856,7 @@ curl -u <span class="s">'YOUR_USERNAME:YOUR_PASSWORD'</span> \
       </div>
 
       <div class="ep">
-        <div class="ep-head"><span class="verb post">POST</span><span class="path">/jobs</span></div>
+        <div class="ep-head"><span class="verb post">POST</span><span class="path"><span class="host">https://backend.easyfix.in/api/integration/<span class="v">v1</span></span>/jobs</span></div>
         <p>Creates a job and returns its ID. <span class="pill">Content-Type: application/json</span></p>
 
         <h4>Request</h4>
@@ -936,7 +980,7 @@ Location: /api/integration/v1/jobs/212251</span>
       </div>
 
       <div class="ep">
-        <div class="ep-head"><span class="verb post">POST</span><span class="path">/jobs</span></div>
+        <div class="ep-head"><span class="verb post">POST</span><span class="path"><span class="host">https://backend.easyfix.in/api/integration/<span class="v">v2</span></span>/jobs</span></div>
         <p>Creates a job and attaches up to five images. <span class="pill">Content-Type: multipart/form-data</span></p>
 
         <h4>Parts</h4>
@@ -1040,7 +1084,7 @@ Location: /api/integration/v2/jobs/212251</span>
     <section id="status">
       <h2>Job status</h2>
       <div class="ep">
-        <div class="ep-head"><span class="verb get">GET</span><span class="path">/jobs/jobStatus</span></div>
+        <div class="ep-head"><span class="verb get">GET</span><span class="path"><span class="host">https://backend.easyfix.in/api/integration/<span class="v">v1</span></span>/jobs/jobStatus</span><span class="v1badge" data-ver="2">still on v1</span></div>
         <p>The current status of one job.</p>
 
         <h4>Query parameters</h4>
@@ -1087,7 +1131,7 @@ Location: /api/integration/v2/jobs/212251</span>
       </div>
 
       <div class="ep">
-        <div class="ep-head"><span class="verb post">POST</span><span class="path">/jobImage/addJobImages</span></div>
+        <div class="ep-head"><span class="verb post">POST</span><span class="path"><span class="host">https://backend.easyfix.in/api/integration/<span class="v">v1</span></span>/jobImage/addJobImages</span></div>
         <p>Uploads one image. <span class="pill">Content-Type: multipart/form-data</span></p>
 
         <h4>Form fields</h4>
@@ -1138,37 +1182,37 @@ Location: /api/integration/v2/jobs/212251</span>
       <p>Supporting endpoints. All are scoped to your organisation and use the same envelope.</p>
 
       <div class="ep">
-        <div class="ep-head"><span class="verb get">GET</span><span class="path">/jobs/tracking</span></div>
+        <div class="ep-head"><span class="verb get">GET</span><span class="path"><span class="host">https://backend.easyfix.in/api/integration/<span class="v">v1</span></span>/jobs/tracking</span><span class="v1badge" data-ver="2">still on v1</span></div>
         <p>Your recent jobs with their current status. Optional <code>status</code> and <code>limit</code> (default 50, maximum 500). Use this to find a job by your own <code>reference_id</code> after a timeout.</p>
       </div>
 
       <div class="ep">
-        <div class="ep-head"><span class="verb get">GET</span><span class="path">/jobs/history</span></div>
+        <div class="ep-head"><span class="verb get">GET</span><span class="path"><span class="host">https://backend.easyfix.in/api/integration/<span class="v">v1</span></span>/jobs/history</span><span class="v1badge" data-ver="2">still on v1</span></div>
         <p>Jobs within a date range. Takes <code>startDate</code> and <code>endDate</code> as <code>YYYY-MM-DD</code>.</p>
       </div>
 
       <div class="ep">
-        <div class="ep-head"><span class="verb get">GET</span><span class="path">/jobs/{id}</span></div>
+        <div class="ep-head"><span class="verb get">GET</span><span class="path"><span class="host">https://backend.easyfix.in/api/integration/<span class="v">v1</span></span>/jobs/{id}</span><span class="v1badge" data-ver="2">still on v1</span></div>
         <p>Full detail for one job &mdash; status, job type, requested and scheduled times, the assigned technician's name, and your reference.</p>
       </div>
 
       <div class="ep">
-        <div class="ep-head"><span class="verb delete">DELETE</span><span class="path">/jobs/{id}</span></div>
+        <div class="ep-head"><span class="verb delete">DELETE</span><span class="path"><span class="host">https://backend.easyfix.in/api/integration/<span class="v">v1</span></span>/jobs/{id}</span><span class="v1badge" data-ver="2">still on v1</span></div>
         <p>Cancels a job. Fires the <a href="#events"><code>CancelJob</code></a> webhook. Cancel as early as you can &mdash; a technician already travelling may still attract a visit charge under your contract.</p>
       </div>
 
       <div class="ep">
-        <div class="ep-head"><span class="verb get">GET</span><span class="path">/easyfixers/availability-status</span></div>
+        <div class="ep-head"><span class="verb get">GET</span><span class="path"><span class="host">https://backend.easyfix.in/api/integration/<span class="v">v1</span></span>/easyfixers/availability-status</span><span class="v1badge" data-ver="2">still on v1</span></div>
         <p>Whether a slot can be served, before you commit to it. Takes <code>pincode</code>, <code>requestedDate</code> and <code>timeSlot</code>; returns <code>{"isAvailabil": "Yes"}</code> or <code>"No"</code>.</p>
       </div>
 
       <div class="ep">
-        <div class="ep-head"><span class="verb get">GET</span><span class="path">/cities</span></div>
+        <div class="ep-head"><span class="verb get">GET</span><span class="path"><span class="host">https://backend.easyfix.in/api/integration/<span class="v">v1</span></span>/cities</span><span class="v1badge" data-ver="2">still on v1</span></div>
         <p>Serviceable cities with their <code>city_id</code> values &mdash; useful for validating an address before booking.</p>
       </div>
 
       <div class="ep">
-        <div class="ep-head"><span class="verb get">GET</span><span class="path">/clientInvoice</span></div>
+        <div class="ep-head"><span class="verb get">GET</span><span class="path"><span class="host">https://backend.easyfix.in/api/integration/<span class="v">v1</span></span>/clientInvoice</span><span class="v1badge" data-ver="2">still on v1</span></div>
         <p>Your invoices, optionally filtered by <code>startDate</code> and <code>endDate</code>. Includes billing period, amounts due, payment state and links to the invoice PDF and master sheet.</p>
       </div>
     </section>
