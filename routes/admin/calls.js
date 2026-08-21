@@ -137,54 +137,38 @@ router.get('/preview', requireClickToCallAction, validate(callListQuery, 'query'
       return modernError(res, 400, 'one of jobId/customerId/efrId/reportingContactId/spocJobId is required');
     }
 
-    // Resolve receiver real-mobile via the same lookups the POST handler
-    // uses (kept in sync deliberately — if you change one set of queries,
-    // change both).
-    let receiverReal = null;
-    if (jobId) {
-      // useAltFlag mirrors the POST handler's behaviour — the preview
-      // must show what we'd ACTUALLY dial, so the column read switches
-      // when the FE intends to dial the alternate. See the POST handler
-      // for the rationale + the "kept in sync" contract.
-      const [[job]] = await pool.query(
-        `SELECT c.customer_mob_no, j.additional_number
-           FROM tbl_job j
-      LEFT JOIN tbl_customer c ON c.customer_id = j.fk_customer_id
-          WHERE j.job_id = ?
-          LIMIT 1`,
-        [jobId]
-      );
-      if (!job) return modernError(res, 404, `Job ${jobId} not found`);
-      receiverReal = useAltFlag ? (job.additional_number || null) : (job.customer_mob_no || null);
-    } else if (customerId) {
-      const [[cust]] = await pool.query(
-        `SELECT customer_mob_no FROM tbl_customer WHERE customer_id = ? LIMIT 1`,
-        [customerId]
-      );
-      if (!cust) return modernError(res, 404, `Customer ${customerId} not found`);
-      receiverReal = cust.customer_mob_no || null;
-    } else if (efrId) {
-      const [[efr]] = await pool.query(
-        `SELECT efr_no FROM tbl_easyfixer WHERE efr_id = ? AND NOT (tbl_easyfixer.efr_status <=> 3) LIMIT 1`,
-        [efrId]
-      );
-      if (!efr) return modernError(res, 404, `Easyfixer ${efrId} not found`);
-      receiverReal = efr.efr_no || null;
-    } else if (spocJobId) {
-      const [[job]] = await pool.query(
-        `SELECT client_spoc FROM tbl_job WHERE job_id = ? LIMIT 1`,
-        [spocJobId]
-      );
-      if (!job) return modernError(res, 404, `Job ${spocJobId} not found`);
-      receiverReal = job.client_spoc || null;
-    } else {
-      const [[ct]] = await pool.query(
-        `SELECT contact_no FROM tbl_client_contacts WHERE id = ? LIMIT 1`,
-        [reportingContactId]
-      );
-      if (!ct) return modernError(res, 404, `Contact ${reportingContactId} not found`);
-      receiverReal = ct.contact_no || null;
-    }
+    /*
+     * Resolve the receiver through resolveReceiver — the SAME function both
+     * POST handlers use.
+     *
+     * This used to be a second, hand-maintained copy of all five lookups,
+     * with a comment asking the next editor to "change both". That contract
+     * failed exactly as such contracts do: when the efrId branch gained an
+     * RBAC city-scope check on 2026-08-21, the copy here did not, and
+     * GET /preview quietly became the remaining way for a city-scoped user to
+     * confirm that a technician in someone else's region exists — 404 versus
+     * 200 is an existence oracle even though the number itself comes back
+     * masked.
+     *
+     * One code path removes the leak and the class of bug that produced it.
+     *
+     * TWO ERROR SHAPES, DELIBERATELY TREATED DIFFERENTLY:
+     *
+     *   404 (not found / out of scope) — surfaced unchanged. resolveReceiver's
+     *   messages are already byte-identical to the ones this route used, so
+     *   nothing observable moves.
+     *
+     *   400 ("has no mobile on file") — swallowed, and the preview renders
+     *   with an empty receiver, which is what it did before. That is not
+     *   laziness: the preview's job is to show what WOULD be dialled, and a
+     *   dialog that refuses to open teaches the operator nothing about why.
+     *   The POST still refuses the call, so nobody dials a blank number.
+     */
+    const rr = await resolveReceiver(req, {
+      jobId, customerId, efrId, reportingContactId, spocJobId, useAlt: useAltFlag,
+    });
+    if (!rr.ok && rr.status !== 400) return modernError(res, rr.status, rr.message);
+    const receiverReal = rr.ok ? rr.receiverMobile : null;
 
     // Resolve the EXACT masked legs we'd dial via the shared voice factory
     // (voice.previewCallLegs) — the SAME code path clickToCall uses — so this
