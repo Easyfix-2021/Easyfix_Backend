@@ -1,0 +1,90 @@
+-- ─────────────────────────────────────────────────────────────────────
+-- 2026-08-24 — Bank change: make the CRM-side OTP a toggle (default OFF)
+--
+-- WHAT
+--   • ONE new easyfix_properties key, `bank.change.crm.otp.required`,
+--     seeded 'false'.
+--
+-- NOTHING IS ALTERED. No new table, no ALTER, no index. This file inserts a
+-- single property row. The shared-schema rule in CLAUDE.md is not in play.
+--
+-- WHY THIS EXISTS
+--   Until now EVERY bank change was OTP-gated, on both doors. Product has
+--   asked for the two doors to differ:
+--
+--     • APP (technician changes their own payout account) — OTP REQUIRED,
+--       unconditionally. Not covered by this flag at all; it is hardcoded in
+--       services/easyfixer-sensitive-change.service.js::changeBank. The
+--       technician is present by definition, and the JWT alone is not consent
+--       (it lives for JWT_EXPIRY, default 30 days).
+--
+--     • CRM (an operator changes it on the technician's behalf) — OTP NOT
+--       required. The operator does not have the technician sitting next to
+--       them, so demanding a WhatsApp OTP blocks the exact flow the CRM
+--       exists to serve: fixing a payout account the technician cannot fix
+--       themselves. The controls on that path remain the narrow
+--       `isEasyfixerBankUpdate` permission, the mandatory free-text `reason`,
+--       and the tbl_easyfixer_sensitive_change_log row.
+--
+--   A PROPERTY RATHER THAN A CODE DELETION, deliberately: if finance wants
+--   the stricter posture back — for all changes, or during an incident — it
+--   is a value edit, not a deploy. Same shape as `profile_update.otp.enabled`
+--   (services/easyfixer-profile-update-link.service.js::otpEnabled).
+--
+-- AUDIT TRAIL — READ THIS BEFORE INTERPRETING OLD ROWS
+--   tbl_easyfixer_sensitive_change_log.otp_verified now records the gate that
+--   ACTUALLY ran, instead of a hardcoded 1. The header of
+--   executed/2026-08-17-easyfixer-sensitive-change-log.sql still says
+--   "ALWAYS 1 for bank changes" — that line predates this toggle and is now
+--   stale, but executed migrations are frozen and must not be edited. The
+--   current truth is:
+--     • bank rows before 2026-08-24 → otp_verified = 1, always accurate
+--       (every path was gated then).
+--     • bank rows from 2026-08-24  → 1 means an OTP really was verified,
+--       0 means this flag was 'false' and a CRM operator made the change on
+--       the technician's authority instead of theirs.
+--
+-- TURNING IT ON
+--   UPDATE easyfix_properties SET property_value = 'true' WHERE property_key = 'bank.change.crm.otp.required';
+--   The cache in services/properties.service.js has a 1-HOUR TTL. Use the
+--   admin properties-reload endpoint (or the 10-click flush gesture) for the
+--   change to take effect immediately rather than within the hour.
+--
+-- HOW TO APPLY
+--   Run the statement below. Plain INSERT … SELECT … WHERE NOT EXISTS — no
+--   prepared statements, no @-variables, no PREPARE/EXECUTE, nothing
+--   MariaDB-specific. Works identically in MySQL CLI, DataGrip, DBeaver and
+--   Workbench.
+--
+-- IDEMPOTENCY
+--   Fully re-runnable. Only inserts when the key is absent, so a re-run never
+--   clobbers a value ops has already changed.
+-- ─────────────────────────────────────────────────────────────────────
+
+
+-- ─── 1. The toggle ───────────────────────────────────────────────────
+-- Seeded with the SAME value the code falls back to when the key is missing
+-- (crmOtpRequired() reads `?? 'false'`), so the default is visible and
+-- editable in Manage Properties rather than buried in a service file.
+
+INSERT INTO easyfix_properties (property_key, property_value)
+SELECT 'bank.change.crm.otp.required', 'false'
+WHERE NOT EXISTS (SELECT 1 FROM easyfix_properties WHERE property_key = 'bank.change.crm.otp.required');
+
+
+-- ─── 2. Verify (read-only) ───────────────────────────────────────────
+--
+-- 1. The key exists exactly once, with value 'false':
+-- SELECT property_key, property_value FROM easyfix_properties WHERE property_key = 'bank.change.crm.otp.required';
+--
+-- 2. NOTHING legacy changed — these must read exactly as they did before:
+-- SHOW CREATE TABLE tbl_easyfixer_bank_details;
+-- SELECT COUNT(*) FROM tbl_easyfixer;
+--
+-- 3. After the first CRM bank change with the flag OFF, the audit row must
+--    show otp_verified = 0 and changed_by_source = 'crm'. An app-initiated
+--    change must show otp_verified = 1 and changed_by_source = 'app':
+-- SELECT id, efr_id, change_type, changed_by_source, changed_by_user_id, otp_verified, created_at FROM tbl_easyfixer_sensitive_change_log WHERE change_type = 'bank' ORDER BY id DESC LIMIT 20;
+--
+-- 4. Masking must still hold — a full account number here is a defect:
+-- SELECT id, old_value, new_value FROM tbl_easyfixer_sensitive_change_log WHERE change_type = 'bank' ORDER BY id DESC LIMIT 20;

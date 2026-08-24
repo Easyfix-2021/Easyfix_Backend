@@ -37,10 +37,65 @@ const { pool } = require('../db');
 const logger = require('../logger');
 const kyc = require('./mobile-kyc.service');
 const profileOtp = require('./easyfixer-profile-otp.service');
+const { getProperty } = require('./properties.service');
+const { matchNames } = require('../utils/name-match');
 
 const SOURCE_CRM = 'crm';
+const SOURCE_APP = 'app';
 const CHANGE_MOBILE = 'mobile';
 const CHANGE_BANK = 'bank';
+
+/*
+ * Does a CRM-initiated bank change still require the technician's OTP?
+ *
+ * DEFAULT NO. An operator making the change on the technician's behalf does
+ * not have the technician sitting next to them, so demanding a WhatsApp OTP
+ * blocks the very flow the CRM exists to serve (correcting a payout account
+ * the technician cannot fix themselves).
+ *
+ * Kept as a flag rather than deleted so it can be re-tightened without a
+ * deploy if finance wants the stricter posture back — same shape as
+ * services/easyfixer-profile-update-link.service.js::otpEnabled(), which is
+ * the house pattern for exactly this toggle.
+ *
+ * The APP path has its OWN flag — see appOtpRequired below.
+ */
+function crmOtpRequired() {
+  return String(getProperty('bank.change.crm.otp.required') ?? 'false')
+    .trim().toLowerCase() === 'true';
+}
+
+/*
+ * Does an APP-initiated bank change require the technician's OTP?
+ *
+ * DEFAULT NO — and ONLY because of client rollout, not because the consent is
+ * optional. This gate is meant to be ON.
+ *
+ * THE ROLLOUT PROBLEM THIS SOLVES. Every technician app already installed
+ * predates the OTP and sends no `otp` field. The bank form is reachable in
+ * production at withdrawal time (BankDetailsForm), so the moment this backend
+ * ships with a hard requirement, every one of those installs starts failing
+ * its bank save with a 400 — on the money path, with no way for the technician
+ * to understand why. `/public/app-version` for the RN app is FAIL-OPEN, so
+ * nobody is forced onto a build that would send the code.
+ *
+ * WHAT IS STILL ENFORCED WITH THE FLAG OFF — and this is the important part:
+ *   • The vendor verification is UNCONDITIONAL. A non-existent account is
+ *     still a 422, and the caller can no longer assert `isVerified` itself.
+ *     The trust-boundary hole is closed regardless of this flag.
+ *   • An OTP that IS supplied is still verified. A new build submitting a
+ *     wrong or expired code is rejected exactly as if the flag were on; the
+ *     flag only decides whether an ABSENT code is tolerated.
+ * So the flag buys old clients a working save, and buys nothing for an
+ * attacker that they did not already have before this change.
+ *
+ * FLIP IT ON once the new build is the floor — the one-line UPDATE is in
+ * migrations/2026-08-24-bank-change-app-otp-rollout.sql.
+ */
+function appOtpRequired() {
+  return String(getProperty('bank.change.app.otp.required') ?? 'false')
+    .trim().toLowerCase() === 'true';
+}
 
 /**
  * Last-four-only rendering of an account number, e.g. "••••4471".
@@ -277,20 +332,52 @@ async function resolveBankId(db, bankName) {
  * must send a fresh OTP. That is the correct trade: a reusable OTP would let
  * an operator hold one valid consent and retry account numbers against it.
  *
+ * BOTH DOORS COME THROUGH HERE. The CRM (PATCH /api/admin/easyfixers/:id/bank)
+ * and the technician app (POST /api/mobile/bank-details) call this ONE
+ * function; neither owns any bank SQL of its own. `ctx.source` is the only
+ * thing that differs between them, and it drives exactly two things: whether
+ * the OTP gate runs, and what lands in the audit row's changed_by_source.
+ * That is deliberate — two doors verifying "identically" because two
+ * implementations happen to agree today is the bug this shape prevents.
+ *
  * @param {number} efrId
- * @param {object} body   — { otp, accountNumber, ifsc, bankName?, accountHolderName?, reason }
- * @param {object} actor  — req.user (tbl_user row)
- * @param {{ipAddress?: string, db?: object}} [ctx]
+ * @param {object} body   — { otp?, accountNumber, ifsc, bankName?, accountHolderName?, reason }
+ * @param {object} actor  — req.user (tbl_user row); NULL for app-initiated
+ *                          changes, where the technician is the actor and
+ *                          there is no tbl_user row to point at.
+ * @param {{ipAddress?: string, db?: object, source?: 'crm'|'app'}} [ctx]
  */
 async function changeBank(efrId, body, actor, ctx = {}) {
   const db = ctx.db || pool;
-  logger.info('Change easyfixer bank details · efrId=' + efrId);
+  const source = ctx.source === SOURCE_APP ? SOURCE_APP : SOURCE_CRM;
+  logger.info('Change easyfixer bank details · efrId=' + efrId + ' · source=' + source);
 
   // ── 1. OTP ────────────────────────────────────────────────────────
-  const { valid } = await profileOtp.verifyOtp(efrId, body.otp, db);
-  if (!valid) {
-    logger.warn('Change easyfixer bank rejected · efrId=' + efrId + ' · OTP invalid or expired');
-    throw httpError(400, 'Invalid or expired OTP');
+  /*
+   * WHO HAS TO CONSENT, AND WHY IT DIFFERS BY DOOR:
+   *   app — ALWAYS gated. The technician is redirecting their own money from
+   *         their own device. The JWT alone is not consent: it is minted once
+   *         and lives for JWT_EXPIRY (default 30d), so a stolen or stale token
+   *         would otherwise be enough. The OTP re-proves possession of efr_no
+   *         at the moment of the change.
+   *   crm — property-driven, default OFF (see crmOtpRequired above). The
+   *         controls on that path are the isEasyfixerBankUpdate permission,
+   *         the mandatory `reason`, and the audit row.
+   */
+  /*
+   * `body.otp != null` is deliberately part of this: a client that DID send a
+   * code always has it verified, whatever the flags say. Otherwise flipping a
+   * flag off would silently accept any garbage in the field, which is worse
+   * than not asking for one at all.
+   */
+  const otpRequired = body.otp != null
+    || (source === SOURCE_APP ? appOtpRequired() : crmOtpRequired());
+  if (otpRequired) {
+    const { valid } = await profileOtp.verifyOtp(efrId, body.otp, db);
+    if (!valid) {
+      logger.warn('Change easyfixer bank rejected · efrId=' + efrId + ' · OTP invalid or expired');
+      throw httpError(400, 'Invalid or expired OTP');
+    }
   }
 
   // ── 2. Vendor verification of the NEW account ─────────────────────
@@ -322,16 +409,27 @@ async function changeBank(efrId, body, actor, ctx = {}) {
   }
 
   /*
-   * The CRM verification flag follows the vendor, exactly as the app's
-   * first-time flow lets it: 1 = valid, 2 = invalid (the vocabulary
-   * services/easyfixer-verification.service.js::saveBanking already uses).
-   * NOT hardcoded to 1 — bankVerify only returns on a positive vendor
-   * envelope today, so this reads 1 in practice, but if the vendor ever
-   * starts returning a negative verdict in a 200 envelope the flag records
-   * what actually came back instead of asserting something we did not check.
+   * A NEGATIVE VERDICT IS A REJECTION, NOT A FLAG VALUE.
+   *
+   * The vendor returns `account_exists: false` inside a healthy 200 envelope
+   * (see mobile-kyc.service.js::bankVerify), so this is the only place that
+   * catch can happen. Storing such an account with a "2 = invalid" flag would
+   * satisfy the letter of step 2's promise while breaking its point: a typo'd
+   * or closed account must never become the payout destination, because the
+   * failure surfaces days later as a silently failed payout, by which time
+   * nobody connects it to this edit.
    */
-  const verifiedFlag = vendor.verified ? 1 : 2;
-  const bankId = await resolveBankId(db, body.bankName);
+  if (!vendor.verified) {
+    logger.warn('Change easyfixer bank rejected · efrId=' + efrId + ' · account does not exist');
+    throw httpError(422, vendor.remarks || 'Bank account could not be verified');
+  }
+  const verifiedFlag = 1;
+  // The app already knows the numeric bank id (it picks from a lookup list);
+  // the CRM only has the typed name. Accept either rather than forcing the
+  // app to round-trip a name back into the id it started from.
+  const bankId = Number.isInteger(body.bankId)
+    ? body.bankId
+    : await resolveBankId(db, body.bankName);
   /*
    * Body first, vendor name as fallback. Blank → null, NEVER '' — a
    * COALESCE(?, col) guards against NULL only; an empty string sails through
@@ -340,9 +438,47 @@ async function changeBank(efrId, body, actor, ctx = {}) {
   const holder = (body.accountHolderName && String(body.accountHolderName).trim())
     || vendor.accountHolderName
     || null;
+
+  /*
+   * NAME MATCH IS ADVISORY — RECORDED, NEVER A GATE.
+   *
+   * The bank has already confirmed the account exists; the holder name only
+   * tells us WHOSE it is. Blocking on a mismatch would reject a large number
+   * of legitimate accounts, because Indian bank records routinely disagree
+   * with HR records: initials ("R K Sharma"), honorifics ("Mr. VIKAS  KUMAR"
+   * — note the double space the vendor really sends), maiden vs married
+   * surnames, and surname-first ordering. So it is stored for CRM review
+   * instead, which is where a human can tell "Vikas Kumar" from a genuinely
+   * unrelated payee.
+   *
+   * Reuses utils/name-match.js — the SAME matcher the Aadhaar OCR path uses.
+   * It already does NFD/diacritic stripping, honorific removal, token-set
+   * comparison and initial expansion, and its max(2, …) divisor is what stops
+   * a single shared token ("Kumar") from passing as a match. Do not add a
+   * second threshold here; MATCH_THRESHOLD is the one knob.
+   */
+  const [[techRow]] = await db.query(
+    'SELECT efr_name FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1',
+    [efrId],
+  );
+  const nameCheck = matchNames(techRow?.efr_name ?? '', vendor.accountHolderName);
+  if (!nameCheck.matched) {
+    // Score only — NEVER the names themselves; both sides are PII.
+    logger.warn(
+      'Change easyfixer bank · name mismatch · efrId=' + efrId
+      + ' · score=' + nameCheck.score + ' · source=' + source,
+    );
+  }
+
   const verificationSummary = JSON.stringify({
-    verified: vendor.verified === true,
+    verified: true,
+    accountExists: vendor.accountExists ?? null,
     accountHolderName: vendor.accountHolderName ?? null,
+    nameMatch: nameCheck.matched ? 'match' : 'mismatch',
+    nameScore: nameCheck.score,
+    source,
+    otpVerified: otpRequired,
+    vendorClientId: vendor.clientId ?? null,
     // The vendor echoes the account number back; it is NOT stored here. The
     // masked pair in old_value/new_value is the record of which account.
     verifiedAt: new Date().toISOString(),
@@ -410,10 +546,20 @@ async function changeBank(efrId, body, actor, ctx = {}) {
       oldValue: existing ? existing.efr_bank_acc_num : null,
       newValue: accountNumber,
       changedByUserId: actor?.user_id ?? null,
-      changedBySource: SOURCE_CRM,
+      changedBySource: source,
       reason: body.reason,
       verificationResult: verificationSummary,
-      otpVerified: 1,
+      /*
+       * Follows the gate that ACTUALLY ran. Hardcoding 1 here (as this did
+       * until 2026-08-24) was safe only while every bank change was
+       * OTP-gated; with crmOtpRequired() defaulting off, a hardcoded 1 would
+       * make every CRM row claim a technician consent that never happened —
+       * an audit trail that lies is worse than no audit trail, because it is
+       * believed. NOTE: the executed migration's header still says "ALWAYS 1
+       * for bank changes"; that line predates the CRM toggle and cannot be
+       * edited (executed migrations are frozen). This is the current truth.
+       */
+      otpVerified: otpRequired ? 1 : 0,
       ipAddress: ctx.ipAddress ?? null,
     }, conn);
 
@@ -436,8 +582,14 @@ async function changeBank(efrId, body, actor, ctx = {}) {
     bank_id: bankId,
     account_holder_name: holder,
     verified: verifiedFlag === 1,
+    // Advisory — the CRM renders this so an operator can eyeball a mismatch.
+    // The mobile route deliberately does NOT echo the vendor's holder name
+    // (see routes/mobile/index.js POST /bank-details).
+    name_match: nameCheck.matched ? 'match' : 'mismatch',
+    name_score: nameCheck.score,
+    otp_verified: otpRequired,
     changed: true,
   };
 }
 
-module.exports = { recordChange, changeMobile, changeBank, maskAccount };
+module.exports = { recordChange, changeMobile, changeBank, maskAccount, crmOtpRequired, appOtpRequired };

@@ -44,8 +44,27 @@ const AADHAARKYC_BASE = 'https://kyc-api.aadhaarkyc.io';
 const VENDOR_TIMEOUT_MS = 15000;
 
 // ─── Auth / config ──────────────────────────────────────────────────
+/*
+ * The RAW token, with any "Bearer " the operator pasted in stripped off.
+ *
+ * SUREPASS_VERIFICATION_KEY is meant to hold the bare token — authHeaders()
+ * below adds the single `Bearer ` prefix the vendor expects. But the value is
+ * copied by hand out of a dashboard or a curl example, and those show it
+ * already prefixed, so `Bearer eyJ...` lands in the env sooner or later. That
+ * produced `Authorization: Bearer Bearer eyJ...` and a 401 from every vendor
+ * call — an auth failure whose cause is invisible in the env var, because the
+ * value LOOKS right.
+ *
+ * Normalising here means both forms work and neither can double up. Trailing
+ * whitespace and stray quotes go too: a key pasted into a .env as
+ * "eyJ..." (quoted) or with a trailing newline fails the same silent way.
+ */
 function verificationKey() {
-  return process.env.SUREPASS_VERIFICATION_KEY || '';
+  return String(process.env.SUREPASS_VERIFICATION_KEY || '')
+    .trim()
+    .replace(/^["']|["']$/g, '')
+    .replace(/^Bearer\s+/i, '')
+    .trim();
 }
 
 // Throws a clean 503 (NOT 500) when the shared Bearer token is missing.
@@ -326,11 +345,37 @@ async function bankVerify(efrId, accountNumber, ifsc) {
     ifsc_details: true,
   });
   const d = out.data || {};
-  logger.info('KYC bank account verified');
+  /*
+   * THE VERDICT IS IN THE BODY, NOT THE ENVELOPE.
+   *
+   * The vendor reports a non-existent / closed account as
+   * `data.account_exists: false` INSIDE a `success: true`, `status_code: 200`
+   * envelope. callVendorJson's isOk() check above therefore cannot catch it —
+   * it only sees a healthy envelope and returns normally. Until 2026-08-24
+   * this function returned `verified: true` unconditionally, so a typo'd or
+   * closed account was recorded as a verified payout destination and only
+   * surfaced days later as a silently failed payout.
+   *
+   * ponytail: only an EXPLICIT `false` is treated as a negative verdict. If
+   * the field is absent we keep the previous behaviour and log, rather than
+   * fail closed — the vendor contracts in this file were reverse-engineered
+   * from the legacy Flutter app and were never live-tested, so a field rename
+   * would otherwise take every bank save down at once. Tighten to
+   * `=== true` once the warn below has stayed silent in prod for a while.
+   */
+  if (d.account_exists === undefined) {
+    logger.warn('KYC bank verify · vendor omitted account_exists — treating as verified');
+  }
+  const verified = d.account_exists !== false;
+  logger.info('KYC bank account verify complete · exists=' + (d.account_exists ?? 'absent'));
   return {
-    verified: true,
+    verified,
+    accountExists: d.account_exists ?? null,
+    // NEVER logged — the holder name is PII (see utils/name-match.js header).
     accountHolderName: d.full_name || d.account_holder_name || null,
     accountNumber: d.account_number || accountNumber,
+    remarks: d.remarks || null,
+    clientId: d.client_id || null,
   };
 }
 

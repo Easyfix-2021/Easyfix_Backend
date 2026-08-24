@@ -384,7 +384,13 @@ test('reads identity prefill in one technician-scoped aggregate query', async ()
         dob: '1990-01-01',
         identity_verified: 1,
         aadhaar_doc_id: 41,
+        aadhaar_back_doc_id: 43,
         pan_doc_id: 42,
+        dl_doc_id: 44,
+        aadhaar_doc_key: 'MobileUploads/8379_1_front',
+        aadhaar_back_doc_key: 'MobileUploads/8379_1_back',
+        pan_doc_key: 'MobileUploads/8379_1_pan',
+        dl_doc_key: 'MobileUploads/8379_1_dl',
       }], []];
     },
   };
@@ -397,11 +403,48 @@ test('reads identity prefill in one technician-scoped aggregate query', async ()
     name: 'Ramesh Kumar',
     dob: '1990-01-01',
     aadhaarDocId: 41,
+    aadhaarBackDocId: 43,
     panDocId: 42,
+    drivingLicenceDocId: 44,
+    // S3 is unconfigured in the test process, so an S3-shaped key has no local
+    // file behind it — null, never a fabricated link. Presigned variants are
+    // covered in tests/mobile-identity-doc-urls.test.js.
+    aadhaarFrontUrl: null,
+    aadhaarBackUrl: null,
+    panUrl: null,
+    drivingLicenceUrl: null,
     isVerified: true,
   });
   assert.equal(calls.length, 1);
   assert.deepEqual(calls[0].params, [8379, 8379]);
   assert.match(calls[0].sql, /WHERE e\.efr_id = \?/i);
   assert.match(calls[0].sql, /WHERE efr_id = \?/i);
+});
+
+test('the prefill read selects EVERY doc type the save writes — 14 and 12 were written but never read', async () => {
+  const calls = [];
+  const database = {
+    async query(sql, params) {
+      calls.push({ sql: String(sql), params });
+      return [[{ identity_verified: 0 }], []];
+    },
+  };
+
+  await identity.getIdentityDetails(8379, { database });
+
+  const { sql } = calls[0];
+  // Both halves matter: the id restores the app's document reference, the key
+  // is what a URL can be minted from.
+  assert.match(sql, /efr_doc_type_id = 14 THEN efr_doc_id END\) AS aadhaar_back_doc_id/i);
+  assert.match(sql, /efr_doc_type_id = 14 THEN efr_document_name END\) AS aadhaar_back_doc_key/i);
+  // Type 12 (Driving Licence) had the identical write-without-read gap.
+  assert.match(sql, /efr_doc_type_id = 12 THEN efr_doc_id END\) AS dl_doc_id/i);
+  assert.match(sql, /efr_doc_type_id = 12 THEN efr_document_name END\) AS dl_doc_key/i);
+  for (const docType of [13, 3, 12]) {
+    assert.match(
+      sql,
+      new RegExp(`efr_doc_type_id = ${docType} THEN efr_document_name END`, 'i'),
+      `doc type ${docType} must also return its key`,
+    );
+  }
 });

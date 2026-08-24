@@ -82,8 +82,17 @@ const scenario = {
   storedOtp: null,        // tbl_easyfixer.profile_update_otp
   otpValidUpTo: null,
   bankRow: null,          // existing tbl_easyfixer_bank_details row, or null
-  vendorOk: true,
+  vendorOk: true,         // false ⇒ a NON-OK envelope (success:false)
   vendorMessage: 'Invalid account number',
+  /*
+   * data.account_exists — the vendor's ACTUAL verdict, and the reason this
+   * field is modelled separately from vendorOk. A closed or non-existent
+   * account comes back as account_exists:false inside a PERFECTLY HEALTHY
+   * success:true / status_code:200 envelope, so vendorOk alone cannot express
+   * it. Set to false to model "the envelope is fine, the account is not".
+   */
+  vendorAccountExists: true,
+  vendorFullName: 'RAVI KUMAR',
   auditFails: false,
 };
 
@@ -121,6 +130,10 @@ const fake = installFakePool([
   [/SELECT efr_name, efr_no/i, () => (scenario.easyfixer ? [scenario.easyfixer] : [])],
 
   // ── the sensitive-change service's own reads ──
+  // The technician's name on file — the reference side of the advisory name
+  // match in changeBank. Ordered BEFORE the generic tbl_easyfixer reads.
+  [/SELECT efr_name\s+FROM tbl_easyfixer WHERE efr_id/i,
+    () => (scenario.easyfixer ? [scenario.easyfixer] : [])],
   [/SELECT efr_id, efr_no\s+FROM tbl_easyfixer WHERE efr_id/i,
     () => (scenario.easyfixer ? [scenario.easyfixer] : [])],
   [/SELECT efr_id FROM tbl_easyfixer WHERE efr_no = \?/i,
@@ -161,7 +174,32 @@ dbModule.pool.getConnection = async () => {
 
 const express = require('express');
 const { invalidatePermissionsCache } = require('../services/role.service');
+const properties = require('../services/properties.service');
+const sensitiveChange = require('../services/easyfixer-sensitive-change.service');
 const easyfixersRouter = require('../routes/admin/easyfixers');
+
+/*
+ * The CRM-side OTP is now a property (bank.change.crm.otp.required), default
+ * OFF — see migrations/2026-08-24-bank-change-crm-otp-toggle.sql. flushCache()
+ * first because setProperty only writes through to a cache that already
+ * exists; on a cold cache it would be a no-op and the toggle would silently
+ * not apply. Reset in beforeEach so a test that turns it ON cannot leak into
+ * the next one.
+ */
+async function setCrmOtpRequired(on) {
+  await properties.flushCache();
+  await properties.setProperty('bank.change.crm.otp.required', on ? 'true' : 'false');
+}
+
+/*
+ * The APP-door gate ships OFF for client rollout (old installs send no code) —
+ * see migrations/2026-08-24-bank-change-app-otp-rollout.sql. flushCache first,
+ * same reason as above.
+ */
+async function setAppOtpRequired(on) {
+  await properties.flushCache();
+  await properties.setProperty('bank.change.app.otp.required', on ? 'true' : 'false');
+}
 
 let server;
 let baseUrl;
@@ -225,14 +263,44 @@ before(async () => {
     // services/mobile-kyc.service.js: { data, status_code, message_code,
     // message, success }.
     if (scenario.vendorOk) {
+      /*
+       * A REAL aadhaarkyc.io bank-verification response, copied from a live
+       * call rather than invented — including `account_exists`, `client_id`,
+       * `remarks` and the `ifsc_details` block. The previous fixture omitted
+       * account_exists entirely, which is precisely why the "verdict is in
+       * the body, not the envelope" bug survived: a fixture that cannot
+       * express a negative verdict cannot fail on one.
+       *
+       * Note `full_name` carries an honorific AND a double space in real
+       * vendor data ("Mr. VIKAS  KUMAR") — the name-match tests below rely on
+       * that being handled, so do not tidy it up here.
+       */
       return {
         status: 200,
         json: async () => ({
           success: true,
           status_code: 200,
           message_code: 'success',
-          message: 'Bank account verified',
-          data: { full_name: 'RAVI KUMAR', account_number: NEW_ACCOUNT },
+          message: null,
+          data: {
+            client_id: 'bank_validation_swguCUJBwohexGiWgFeg',
+            account_number: NEW_ACCOUNT,
+            account_exists: scenario.vendorAccountExists,
+            upi_id: null,
+            full_name: scenario.vendorFullName,
+            imps_ref_no: null,
+            remarks: scenario.vendorAccountExists ? '' : 'Invalid account',
+            status: scenario.vendorAccountExists ? 'success' : 'failure',
+            ifsc_details: {
+              ifsc: NEW_IFSC,
+              bank: 'HDFC Bank',
+              bank_name: 'HDFC Bank',
+              branch: 'MG ROAD',
+              city: 'BENGALURU',
+              state: 'KARNATAKA',
+              imps: true, rtgs: true, neft: true, upi: true, micr_check: true,
+            },
+          },
         }),
       };
     }
@@ -249,9 +317,11 @@ before(async () => {
   };
 });
 
-beforeEach(() => {
+beforeEach(async () => {
   fake.reset();
   invalidatePermissionsCache();
+  await setCrmOtpRequired(false);   // the shipped default
+  await setAppOtpRequired(false);   // ditto — off during client rollout
   scenario.actions = ['isEasyfixerMobileUpdate', 'isEasyfixerBankUpdate'];
   scenario.easyfixer = freshEasyfixer();
   scenario.mobileClash = null;
@@ -259,6 +329,8 @@ beforeEach(() => {
   scenario.otpValidUpTo = null;
   scenario.bankRow = null;
   scenario.vendorOk = true;
+  scenario.vendorAccountExists = true;
+  scenario.vendorFullName = 'RAVI KUMAR';
   scenario.auditFails = false;
   txn.began = false;
   txn.committed = false;
@@ -362,9 +434,16 @@ function validOtpScenario(otp = 8642) {
   return otp;
 }
 
+/*
+ * The DEFAULT body carries NO `otp` — matching what the CRM actually sends now
+ * that bank.change.crm.otp.required ships off (EasyfixerBankDialog omits the
+ * key entirely rather than sending ''). Tests that exercise the OTP pass one
+ * explicitly. This matters beyond tidiness: supplying a code opts INTO
+ * verification, so a default OTP here would have every unrelated test
+ * silently running the OTP path too.
+ */
 function bankBody(over = {}) {
   return {
-    otp: 8642,
     accountNumber: NEW_ACCOUNT,
     ifsc: NEW_IFSC,
     bankName: BANK_NAME,
@@ -374,7 +453,8 @@ function bankBody(over = {}) {
   };
 }
 
-test('a wrong OTP is a 400 that writes nothing and never reaches the vendor', async () => {
+test('with the CRM OTP toggle ON, a wrong OTP is a 400 that writes nothing and never reaches the vendor', async () => {
+  await setCrmOtpRequired(true);
   validOtpScenario(8642);
   let vendorCalled = false;
   const stubbed = globalThis.fetch;
@@ -397,7 +477,8 @@ test('a wrong OTP is a 400 that writes nothing and never reaches the vendor', as
   }
 });
 
-test('an expired OTP is a 400 — a stale consent is not consent', async () => {
+test('with the CRM OTP toggle ON, an expired OTP is a 400 — a stale consent is not consent', async () => {
+  await setCrmOtpRequired(true);
   scenario.storedOtp = 8642;
   scenario.otpValidUpTo = wallClock(Date.now() - 60_000);
 
@@ -406,6 +487,32 @@ test('an expired OTP is a 400 — a stale consent is not consent', async () => {
   assert.equal(res.status, 400);
   assert.equal(callsMatching(/(INSERT INTO|UPDATE) tbl_easyfixer_bank_details/i).length, 0);
   assert.equal(callsMatching(/INSERT INTO tbl_easyfixer_sensitive_change_log/i).length, 0);
+});
+
+/*
+ * THE REQUESTED ASYMMETRY, PINNED FROM BOTH SIDES.
+ *
+ * Product's rule: the CRM operator does not need the technician's OTP (they
+ * do not have the technician present); the technician changing their own
+ * payout account from the app ALWAYS does. These two tests are what stop that
+ * from silently inverting — the failure mode is not a crash, it is a door
+ * quietly losing its gate, which nothing else in this suite would notice.
+ */
+test('with the toggle OFF (the default), a CRM bank change needs no OTP and records otp_verified = 0', async () => {
+  scenario.storedOtp = null;          // no OTP was ever issued
+  scenario.otpValidUpTo = null;
+
+  const res = await api('PATCH', `/easyfixers/${EFR_ID}/bank`, bankBody());
+
+  assert.equal(res.status, 200);
+  assert.equal(txn.committed, true);
+
+  // The audit row must not claim a consent that never happened.
+  const audit = callsMatching(/INSERT INTO tbl_easyfixer_sensitive_change_log/i)[0];
+  assert.ok(audit);
+  const [, , , , , source, , , otpVerified] = audit.params;
+  assert.equal(source, 'crm');
+  assert.equal(otpVerified, 0, 'no OTP ran, so the log must say so');
 });
 
 test('a vendor rejection is a 422 carrying the vendor message, and writes nothing', async () => {
@@ -424,6 +531,216 @@ test('a vendor rejection is a 422 carrying the vendor message, and writes nothin
   assert.equal(callsMatching(/INSERT INTO tbl_easyfixer_sensitive_change_log/i).length, 0);
 });
 
+/*
+ * THE VERDICT IS IN THE BODY, NOT THE ENVELOPE.
+ *
+ * This is the regression test for the bug that made every other guarantee in
+ * this file hollow: bankVerify() used to return `verified: true` no matter
+ * what the vendor said, because the only check was on the ENVELOPE
+ * (success/status_code) and a non-existent account is reported as
+ * `data.account_exists: false` inside a perfectly healthy 200 envelope.
+ *
+ * The consequence was not a visible error — it was a closed or typo'd account
+ * being recorded as a VERIFIED payout destination, failing silently at payout
+ * time days later when nobody connects it back to this edit.
+ */
+test('account_exists:false in a healthy 200 envelope is a 422 that writes nothing', async () => {
+  scenario.vendorAccountExists = false;   // envelope stays success:true / 200
+  scenario.bankRow = { efr_bank_id: 88, efr_bank_acc_num: OLD_ACCOUNT };
+
+  const res = await api('PATCH', `/easyfixers/${EFR_ID}/bank`, bankBody());
+
+  assert.equal(res.status, 422, 'a negative verdict must not read as success');
+
+  // NOTHING may be written — this is the whole point.
+  assert.equal(callsMatching(/(INSERT INTO|UPDATE) tbl_easyfixer_bank_details/i).length, 0);
+  assert.equal(callsMatching(/is_bank_details_verified_by_crm/i).length, 0);
+  assert.equal(callsMatching(/INSERT INTO tbl_easyfixer_sensitive_change_log/i).length, 0);
+});
+
+/*
+ * NAME MISMATCH IS ADVISORY — IT RECORDS, IT DOES NOT BLOCK.
+ *
+ * The bank has already confirmed the account exists; the holder name only
+ * says whose it is. Indian bank records routinely disagree with HR records
+ * (initials, honorifics, maiden vs married surnames, surname-first order), so
+ * blocking here would reject legitimate accounts in bulk. The verdict is
+ * stored for a human to review in the CRM instead.
+ */
+test('a name mismatch still saves, but is recorded as mismatch for review', async () => {
+  scenario.vendorFullName = 'SUNITA SHARMA';        // not the technician
+  scenario.bankRow = { efr_bank_id: 88, efr_bank_acc_num: OLD_ACCOUNT };
+
+  const res = await api('PATCH', `/easyfixers/${EFR_ID}/bank`, bankBody());
+
+  assert.equal(res.status, 200, 'a name mismatch is not a rejection');
+  assert.equal(res.json.data.name_match, 'mismatch');
+  assert.equal(callsMatching(/UPDATE tbl_easyfixer_bank_details/i).length, 1);
+
+  const audit = callsMatching(/INSERT INTO tbl_easyfixer_sensitive_change_log/i)[0];
+  const verification = audit.params[7];
+  assert.match(String(verification), /"nameMatch":"mismatch"/);
+});
+
+/*
+ * The honorific + double-space form the vendor really sends ("Mr. VIKAS
+ * KUMAR") must still match a clean stored name. utils/name-match.js already
+ * strips honorifics and collapses whitespace; this pins that the bank path
+ * actually routes through it rather than doing its own string compare.
+ */
+test('an honorific and doubled spaces from the vendor still count as a match', async () => {
+  scenario.easyfixer = freshEasyfixer({ efr_name: 'Vikas Kumar' });
+  scenario.vendorFullName = 'Mr. VIKAS  KUMAR';
+  scenario.bankRow = { efr_bank_id: 88, efr_bank_acc_num: OLD_ACCOUNT };
+
+  const res = await api('PATCH', `/easyfixers/${EFR_ID}/bank`, bankBody());
+
+  assert.equal(res.status, 200);
+  assert.equal(res.json.data.name_match, 'match');
+});
+
+/* ─────────────── the APP door (source: 'app') ─────────────── */
+/*
+ * The app door is exercised at the SERVICE level rather than through
+ * routes/mobile/index.js, because the property under test IS the service's
+ * gate. The route is a thin delegator that owns no bank SQL — mounting it
+ * would only re-test express.
+ *
+ * These pin the half of the asymmetry the CRM tests cannot reach: whatever
+ * `bank.change.crm.otp.required` is set to, the technician's own door stays
+ * OTP-gated. The flag must never be able to unlock it.
+ */
+test("the app door has its OWN gate — the CRM toggle cannot unlock it", async () => {
+  await setCrmOtpRequired(false);          // the shipped default
+  await setAppOtpRequired(true);           // as it will be after client rollout
+  validOtpScenario(8642);
+  let vendorCalled = false;
+  const stubbed = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    if (!String(url).startsWith(baseUrl)) vendorCalled = true;
+    return stubbed(url, init);
+  };
+
+  try {
+    await assert.rejects(
+      () => sensitiveChange.changeBank(
+        EFR_ID,
+        { otp: 1111, accountNumber: NEW_ACCOUNT, ifsc: NEW_IFSC, bankName: BANK_NAME },
+        null,
+        { source: 'app' },
+      ),
+      (err) => err.status === 400 && /OTP/i.test(err.message),
+      'the CRM flag must not be able to unlock the technician-facing door',
+    );
+    assert.equal(vendorCalled, false, 'no consent means no vendor call');
+    assert.equal(callsMatching(/(INSERT INTO|UPDATE) tbl_easyfixer_bank_details/i).length, 0);
+    assert.equal(callsMatching(/INSERT INTO tbl_easyfixer_sensitive_change_log/i).length, 0);
+  } finally {
+    globalThis.fetch = stubbed;
+  }
+});
+
+test("an app-initiated change audits as source 'app' with a null operator", async () => {
+  await setCrmOtpRequired(false);
+  await setAppOtpRequired(true);
+  validOtpScenario(8642);
+  scenario.bankRow = { efr_bank_id: 88, efr_bank_acc_num: OLD_ACCOUNT };
+
+  const out = await sensitiveChange.changeBank(
+    EFR_ID,
+    { otp: 8642, accountNumber: NEW_ACCOUNT, ifsc: NEW_IFSC, bankName: BANK_NAME,
+      reason: 'Updated by technician from the app' },
+    null,                                   // no tbl_user actor exists for a technician
+    { source: 'app' },
+  );
+
+  assert.equal(out.changed, true);
+  assert.equal(out.otp_verified, true);
+
+  const audit = callsMatching(/INSERT INTO tbl_easyfixer_sensitive_change_log/i)[0];
+  assert.ok(audit);
+  const [, , , , byUser, source, , , otpVerified] = audit.params;
+  assert.equal(source, 'app');
+  assert.equal(byUser, null, 'the technician is not a tbl_user row');
+  assert.equal(otpVerified, 1, 'the app door always consumes a real OTP');
+});
+
+/*
+ * ⚠ THE CLIENT-ROLLOUT GATE, PINNED FROM BOTH SIDES.
+ *
+ * bank.change.app.otp.required ships OFF so the installed apps — which send no
+ * `otp` at all — keep working when this backend deploys. These two assert the
+ * exact boundary of that concession: an ABSENT code is tolerated, a WRONG one
+ * is never tolerated. If the second ever flips, the flag stopped being a
+ * rollout accommodation and became a hole.
+ */
+test('rollout: with the app gate OFF, an old client that sends NO otp still saves', async () => {
+  await setAppOtpRequired(false);
+  scenario.storedOtp = null;              // no code was ever issued
+  scenario.otpValidUpTo = null;
+
+  const out = await sensitiveChange.changeBank(
+    EFR_ID,
+    { accountNumber: NEW_ACCOUNT, ifsc: NEW_IFSC, bankName: BANK_NAME },
+    null,
+    { source: 'app' },
+  );
+
+  assert.equal(out.changed, true);
+  assert.equal(out.otp_verified, false);
+  // The vendor check is NOT part of the concession — it still ran.
+  assert.equal(out.verified, true);
+  const audit = callsMatching(/INSERT INTO tbl_easyfixer_sensitive_change_log/i)[0];
+  const [, , , , , source, , , otpVerified] = audit.params;
+  assert.equal(source, 'app');
+  assert.equal(otpVerified, 0, 'no OTP ran, so the log must not claim one');
+});
+
+test('rollout: a WRONG otp is rejected even with the app gate OFF', async () => {
+  await setAppOtpRequired(false);
+  validOtpScenario(8642);                 // a real code exists
+
+  await assert.rejects(
+    () => sensitiveChange.changeBank(
+      EFR_ID,
+      { otp: 1111, accountNumber: NEW_ACCOUNT, ifsc: NEW_IFSC, bankName: BANK_NAME },
+      null,
+      { source: 'app' },
+    ),
+    (err) => err.status === 400,
+    'supplying a code opts INTO verification — the flag only excuses its absence',
+  );
+  assert.equal(callsMatching(/(INSERT INTO|UPDATE) tbl_easyfixer_bank_details/i).length, 0);
+});
+
+/*
+ * ⚠ THE TRUST-BOUNDARY REGRESSION.
+ *
+ * The mobile route used to accept `isVerified` in its body and write it
+ * straight into is_verified_by_app — a flag the CRM reads as "this account
+ * passed vendor verification". Any technician could POST {isVerified: true}
+ * with any account. The field is gone from the route's schema, and the server
+ * decides; this asserts the SERVICE ignores it even if something upstream
+ * ever passes it again, and that a negative vendor verdict still wins.
+ */
+test('a caller-supplied isVerified cannot fake a verification', async () => {
+  await setCrmOtpRequired(false);
+  validOtpScenario(8642);
+  scenario.vendorAccountExists = false;     // the bank says: no such account
+
+  await assert.rejects(
+    () => sensitiveChange.changeBank(
+      EFR_ID,
+      { otp: 8642, accountNumber: NEW_ACCOUNT, ifsc: NEW_IFSC, isVerified: true },
+      null,
+      { source: 'app' },
+    ),
+    (err) => err.status === 422,
+    'the vendor decides, not the caller',
+  );
+  assert.equal(callsMatching(/(INSERT INTO|UPDATE) tbl_easyfixer_bank_details/i).length, 0);
+});
+
 test('an unconfigured vendor key is a 503, never a 500', async () => {
   validOtpScenario();
   const key = process.env.SUREPASS_VERIFICATION_KEY;
@@ -440,10 +757,14 @@ test('an unconfigured vendor key is a 503, never a 500', async () => {
 });
 
 test('a verified bank change writes the row and an audit entry with the account number MASKED', async () => {
-  validOtpScenario();
+  // Toggle ON so this exercises the FULL gate — OTP + vendor + masking — in
+  // one path, which is what it was written to prove. The toggle-OFF audit
+  // shape has its own test above.
+  await setCrmOtpRequired(true);
+  const otp = validOtpScenario();
   scenario.bankRow = { efr_bank_id: 88, efr_bank_acc_num: OLD_ACCOUNT };
 
-  const res = await api('PATCH', `/easyfixers/${EFR_ID}/bank`, bankBody());
+  const res = await api('PATCH', `/easyfixers/${EFR_ID}/bank`, bankBody({ otp }));
 
   assert.equal(res.status, 200);
   assert.equal(txn.committed, true);

@@ -22,6 +22,8 @@ const {
 } = require('../../middleware/require-tech-lifecycle-capability');
 const { otpFailureHttpStatus } = require('./otp-http-status');
 const { upsertEasyfixerDocuments } = require('../../services/easyfixer-document.service');
+const sensitiveChange = require('../../services/easyfixer-sensitive-change.service');
+const profileOtp = require('../../services/easyfixer-profile-otp.service');
 
 const mobile = Joi.string().pattern(/^[0-9]{10}$/);
 
@@ -1388,45 +1390,124 @@ router.get('/bank-details', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// Persist bank details. Columns verified against tbl_easyfixer_bank_details:
-// efr_bank_acc_num, efr_bank_acc_name (holder), efr_bank_ifsc, bank (numeric
-// bank id), is_verified_by_app (bit — READ by easyfixer-verification.service on
-// the CRM side). The old `is_bank_details_filled` write referenced a NON-EXISTENT
-// column (silent failure); completion is signalled by efr_bank_details_perc=100.
+/*
+ * Rate limit for the bank-change OTP. Keyed on the TECHNICIAN, not the IP:
+ * technicians share carrier NAT and office wifi, so an IP key would let one
+ * person's retries lock out everyone around them. 5/min is a person tapping
+ * "Resend", not a script — and each send costs a real WhatsApp message.
+ *
+ * Instantiated once at module scope; rateLimit() closes over its own Map, so
+ * building it per-request would cap nothing. (Note: the limiter is
+ * per-process, so the real ceiling is 5 × replicas — see middleware/rate-limit.js.)
+ */
+const bankOtpLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 5,
+  key: (req) => `mobile-bank-otp:${req.tech && req.tech.efr_id ? req.tech.efr_id : req.ip}`,
+});
+
+/*
+ * POST /bank-details/otp — send the technician their own bank-change OTP.
+ *
+ * WHY THIS EXISTS: POST /bank-details below is OTP-gated, and until this route
+ * was added there was NO way for the app to obtain that code. sendOtp was
+ * reachable only from the CRM (routes/admin/easyfixers.js POST /:id/bank/otp)
+ * and the public magic-link flow, so the app door demanded a code it could not
+ * ask for. The gate without this route is not a gate, it is a dead end.
+ *
+ * No :id — the technician is the JWT subject. A route that took a target id
+ * would let any authenticated technician spray OTPs at other people's phones.
+ *
+ * Returns { sent: true } and NOTHING ELSE. The OTP value never leaves the
+ * database; an endpoint that echoed it would make the whole gate theatre.
+ */
+router.post('/bank-details/otp', bankOtpLimiter, async (req, res, next) => {
+  try {
+    logger.info('Send bank-change OTP · source=app');
+    await profileOtp.sendOtp(req.tech.efr_id, pool);
+    logger.info('Bank-change OTP sent · source=app');
+    // Built literally, not spread from the service's return value, so no
+    // future field on that object can ride out to the client.
+    modernOk(res, { sent: true }, 'OTP sent on WhatsApp');
+  } catch (e) {
+    if (e && typeof e.status === 'number') {
+      logger.warn('Send bank-change OTP failed · ' + e.message);
+      return modernError(res, e.status, e.message || 'request failed');
+    }
+    next(e);
+  }
+});
+
+/*
+ * Persist the technician's payout account.
+ *
+ * THIS ROUTE OWNS NO BANK SQL. It delegates to the SAME
+ * easyfixer-sensitive-change.service::changeBank the CRM uses, passing
+ * source:'app'. That service does OTP → vendor verification → write → audit
+ * in one place, so the two doors cannot drift apart.
+ *
+ * WHAT CHANGED (2026-08-24) AND WHY:
+ *   • `isVerified` is GONE from the request body. It was a client-supplied
+ *     boolean written straight into `is_verified_by_app` — a flag the CRM
+ *     side reads as "this account passed vendor verification". Any technician
+ *     could POST {isVerified: true} with any account and have it stored as
+ *     verified. The server now decides, by actually calling the vendor.
+ *     Old app builds that still send the field are harmless: validate() runs
+ *     with stripUnknown, so it is dropped rather than 400'd.
+ *   • An OTP is now required. The JWT is not consent on its own — it lives
+ *     for JWT_EXPIRY (30d), so it proves who logged in a month ago, not who
+ *     is redirecting the money right now.
+ *
+ * Request the code first with POST /bank-details/otp (directly above), then
+ * submit it here alongside the account.
+ */
 router.post('/bank-details', validate(Joi.object({
+  otp: Joi.string().trim().pattern(/^[0-9]{4}$/).required()
+    .messages({ 'any.required': 'OTP is required', 'string.pattern.base': 'OTP must be 4 digits' }),
   accountNumber: Joi.string().trim().pattern(/^[0-9]{9,18}$/).required(),
   ifsc: Joi.string().trim().pattern(/^[A-Za-z]{4}0[A-Za-z0-9]{6}$/).required(),
   bankId: Joi.number().integer().positive().optional(),
   bankName: Joi.string().trim().max(255).optional(),
   accountHolderName: Joi.string().trim().min(1).max(255).required(),  // mandatory — name as per bank records
-  isVerified: Joi.boolean().optional(),
 })), async (req, res, next) => {
   try {
-    logger.info('Save bank details · bankId=' + (req.body.bankId != null ? req.body.bankId : 'none') + ' · verified=' + (req.body.isVerified === true));
-    const b = req.body;
-    const ifsc = String(b.ifsc).toUpperCase();
-    const holder = b.accountHolderName ? String(b.accountHolderName).trim() : null;
-    const verified = b.isVerified ? 1 : 0;
-    const bankId = b.bankId || null;
-    const [[existing]] = await pool.query('SELECT efr_bank_id FROM tbl_easyfixer_bank_details WHERE efr_id = ?', [req.tech.efr_id]);
-    if (existing) {
-      await pool.query(
-        `UPDATE tbl_easyfixer_bank_details
-            SET efr_bank_acc_num = ?, efr_bank_acc_name = COALESCE(?, efr_bank_acc_name),
-                efr_bank_ifsc = ?, bank = COALESCE(?, bank), is_verified_by_app = ?
-          WHERE efr_id = ?`,
-        [b.accountNumber, holder, ifsc, bankId, verified, req.tech.efr_id]);
-    } else {
-      await pool.query(
-        `INSERT INTO tbl_easyfixer_bank_details
-           (efr_bank_acc_num, efr_bank_acc_name, efr_bank_ifsc, bank, is_verified_by_app, efr_id)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [b.accountNumber, holder, ifsc, bankId, verified, req.tech.efr_id]);
+    logger.info('Save bank details · bankId=' + (req.body.bankId != null ? req.body.bankId : 'none'));
+    const data = await sensitiveChange.changeBank(
+      req.tech.efr_id,
+      {
+        otp: req.body.otp,
+        accountNumber: req.body.accountNumber,
+        ifsc: req.body.ifsc,
+        bankId: req.body.bankId,
+        bankName: req.body.bankName,
+        accountHolderName: req.body.accountHolderName,
+        // The CRM's `reason` is an operator justification; on this path the
+        // technician IS the actor, so the OTP is the authority and a fixed
+        // marker keeps the audit column meaningful rather than empty.
+        reason: 'Updated by technician from the app',
+      },
+      null,                                   // no tbl_user actor — see changeBank docblock
+      { source: 'app', ipAddress: req.ip },
+    );
+    logger.info('Bank details saved · source=app');
+    /*
+     * Deliberately NOT echoing the vendor's account-holder name back to the
+     * app. The technician chooses the account number they submit, so echoing
+     * the name would turn this into a lookup for accounts that are not
+     * theirs. The match verdict is enough for the UI to warn on.
+     */
+    modernOk(res, {
+      saved: true,
+      verified: data.verified,
+      name_match: data.name_match,
+    });
+  } catch (e) {
+    if (e && typeof e.status === 'number') {
+      logger.warn('Save bank details failed · ' + e.message);
+      return modernError(res, e.status, e.message || 'request failed');
     }
-    await pool.query('UPDATE tbl_easyfixer SET efr_bank_details_perc = 100 WHERE efr_id = ?', [req.tech.efr_id]);
-    logger.info('Bank details saved · mode=' + (existing ? 'update' : 'insert'));
-    modernOk(res, { saved: true });
-  } catch (e) { next(e); }
+    next(e);
+  }
 });
 
 router.post('/device', validate(Joi.object({

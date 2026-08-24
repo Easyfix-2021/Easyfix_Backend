@@ -652,6 +652,28 @@ async function update(id, input, actor) {
     // write it. The comparison is made against the row lock below so a stale
     // form cannot undo a concurrent activation or rejection.
     if (lifecycleInstalled && col === 'is_technician_verified') continue;
+    /*
+     * efr_no IS THE LOGIN IDENTITY, AND IT IS ALSO THE OTP DESTINATION.
+     *
+     * services/tech-auth.service.js::resolveByEfrNo resolves a technician by
+     * this number, and the bank-change OTP is delivered to it. Leaving it in
+     * the GENERIC editor meant anyone holding the broad, widely-granted
+     * `isEdit` could rewrite it with no OTP, no mandatory reason, no
+     * tbl_easyfixer_sensitive_change_log row and no duplicate guard — and
+     * then request a bank OTP that lands on a number they just chose. That
+     * defeats the bank OTP entirely, and it matters MORE now that the CRM
+     * bank path no longer requires one of its own.
+     *
+     * The audited path already exists: PATCH /api/admin/easyfixers/:id/mobile
+     * → easyfixer-sensitive-change.service::changeMobile, gated on the narrow
+     * `isEasyfixerMobileUpdate` permission. This skip routes every update
+     * through it.
+     *
+     * UPDATE ONLY — create() iterates this same list and legitimately needs
+     * to write efr_no, since a technician cannot exist without a mobile
+     * number. Removing it from MUTABLE_COLUMNS outright would break creation.
+     */
+    if (col === 'efr_no') continue;
     if (input[col] !== undefined) {
       sets.push(`${col} = ?`);
       values.push(input[col]);

@@ -1,6 +1,9 @@
 const { pool } = require('../db');
 const logger = require('../logger');
-const { upsertEasyfixerDocuments } = require('./easyfixer-document.service');
+const {
+  upsertEasyfixerDocuments,
+  resolveEasyfixerDocumentUrl,
+} = require('./easyfixer-document.service');
 const {
   aadhaarConflictError,
   isAadhaarUniqueViolation,
@@ -25,6 +28,29 @@ function lockUnavailableError() {
   return error;
 }
 
+/*
+ * Identity prefill for the mobile "Your Identity" screen.
+ *
+ * EVERY doc type saveIdentityDetails WRITES is now READ back here. Types 14
+ * (Aadhaar BACK) and 12 (Driving Licence) were both written on save and never
+ * selected, so a technician who uploaded them got nothing back and silently
+ * lost them on every re-open. That is a bug, not a missing feature, hence both
+ * are fixed in the same projection. If a new doc type is ever added to the
+ * upsert list below, add it here too — write-without-read is invisible until
+ * someone re-opens the screen and finds their upload gone.
+ *
+ * The ids alone can't render anything: `efr_document_name` stores an S3 KEY and
+ * no endpoint turns an id or a key into a fetchable URL. So the keys come back
+ * in the same aggregate and are resolved to short-TTL presigned GETs (the
+ * default 5-minute posture s3-storage applies to every PII document — these are
+ * Aadhaar and PAN photographs, not broadcast graphics). Existing fields are
+ * untouched for backwards compatibility.
+ *
+ * MAX() over the key mirrors the pre-existing MAX() over the id. The upsert
+ * helper keeps at most one row per (efr_id, doc type), so the two aggregates
+ * describe the same row in practice; only a legacy duplicate could split them,
+ * and that ambiguity already existed for the id.
+ */
 async function getIdentityDetails(efrId, { database = pool } = {}) {
   const [rows] = await database.query(
     `SELECT e.efr_name AS name,
@@ -33,12 +59,24 @@ async function getIdentityDetails(efrId, { database = pool } = {}) {
             e.date_of_birth AS dob,
             e.is_identity_details_verified_by_crm AS identity_verified,
             documents.aadhaar_doc_id,
-            documents.pan_doc_id
+            documents.aadhaar_back_doc_id,
+            documents.pan_doc_id,
+            documents.dl_doc_id,
+            documents.aadhaar_doc_key,
+            documents.aadhaar_back_doc_key,
+            documents.pan_doc_key,
+            documents.dl_doc_key
        FROM tbl_easyfixer e
        LEFT JOIN (
          SELECT efr_id,
                 MAX(CASE WHEN efr_doc_type_id = 13 THEN efr_doc_id END) AS aadhaar_doc_id,
-                MAX(CASE WHEN efr_doc_type_id = 3 THEN efr_doc_id END) AS pan_doc_id
+                MAX(CASE WHEN efr_doc_type_id = 14 THEN efr_doc_id END) AS aadhaar_back_doc_id,
+                MAX(CASE WHEN efr_doc_type_id = 3 THEN efr_doc_id END) AS pan_doc_id,
+                MAX(CASE WHEN efr_doc_type_id = 12 THEN efr_doc_id END) AS dl_doc_id,
+                MAX(CASE WHEN efr_doc_type_id = 13 THEN efr_document_name END) AS aadhaar_doc_key,
+                MAX(CASE WHEN efr_doc_type_id = 14 THEN efr_document_name END) AS aadhaar_back_doc_key,
+                MAX(CASE WHEN efr_doc_type_id = 3 THEN efr_document_name END) AS pan_doc_key,
+                MAX(CASE WHEN efr_doc_type_id = 12 THEN efr_document_name END) AS dl_doc_key
            FROM tbl_easyfixer_document
           WHERE efr_id = ?
           GROUP BY efr_id
@@ -53,13 +91,30 @@ async function getIdentityDetails(efrId, { database = pool } = {}) {
     error.status = 404;
     throw error;
   }
+  // Independent HEAD + signature per document, so resolve them together rather
+  // than paying three serial S3 round-trips. None of these can reject.
+  const [aadhaarFrontUrl, aadhaarBackUrl, panUrl, drivingLicenceUrl] = await Promise.all([
+    resolveEasyfixerDocumentUrl(row.aadhaar_doc_key),
+    resolveEasyfixerDocumentUrl(row.aadhaar_back_doc_key),
+    resolveEasyfixerDocumentUrl(row.pan_doc_key),
+    resolveEasyfixerDocumentUrl(row.dl_doc_key),
+  ]);
   return {
     aadhaarNumber: row.aadhaar_number || undefined,
     panNumber: row.pan_number || undefined,
     name: row.name || undefined,
     dob: row.dob || undefined,
     aadhaarDocId: row.aadhaar_doc_id == null ? undefined : Number(row.aadhaar_doc_id),
+    aadhaarBackDocId: row.aadhaar_back_doc_id == null ? undefined : Number(row.aadhaar_back_doc_id),
     panDocId: row.pan_doc_id == null ? undefined : Number(row.pan_doc_id),
+    drivingLicenceDocId: row.dl_doc_id == null ? undefined : Number(row.dl_doc_id),
+    // Explicitly null (not omitted) when unresolvable, so the app can tell
+    // "never uploaded" from "uploaded but not viewable right now" without a
+    // second call. Re-minted on every read — they expire in minutes.
+    aadhaarFrontUrl,
+    aadhaarBackUrl,
+    panUrl,
+    drivingLicenceUrl,
     isVerified: Number(row.identity_verified) === 1,
   };
 }

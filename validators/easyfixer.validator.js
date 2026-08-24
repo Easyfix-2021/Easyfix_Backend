@@ -306,15 +306,28 @@ const sensitiveMobileBody = Joi.object({
 });
 
 const sensitiveBankBody = Joi.object({
-  // 4-digit WhatsApp OTP from services/easyfixer-profile-otp.service.js.
-  // Accepts string or number — verifyOtp compares numerically, and the column
-  // is an INT, but a JSON body may carry either.
+  /*
+   * 4-digit WhatsApp OTP from services/easyfixer-profile-otp.service.js.
+   * Accepts string or number — verifyOtp compares numerically, and the column
+   * is an INT, but a JSON body may carry either.
+   *
+   * OPTIONAL AT THE VALIDATOR, DECIDED BY THE SERVICE (2026-08-24). Whether a
+   * CRM bank change needs an OTP is now the `bank.change.crm.otp.required`
+   * property, read in easyfixer-sensitive-change.service::crmOtpRequired().
+   * Keeping `.required()` here would 400 the request before the service ever
+   * got to apply that policy, pinning the CRM door open at "always required"
+   * no matter what the flag said.
+   *
+   * This does NOT weaken the gate: when the flag is ON, a missing or wrong
+   * code still fails verifyOtp and comes back as the same 400. The format
+   * rule below is unchanged — a malformed code is still rejected outright.
+   */
   otp: Joi.alternatives()
     .try(
       Joi.string().trim().pattern(/^[0-9]{4}$/),
       Joi.number().integer().min(1000).max(9999),
     )
-    .required()
+    .optional()
     .messages({ 'alternatives.match': 'OTP must be exactly 4 digits' }),
   // Same account/IFSC patterns the app's first-time flow enforces
   // (routes/mobile/index.js POST /bank-details) — one contract, two doors.

@@ -22,11 +22,28 @@ function isTrue(key, dflt) {
   return String(raw).trim().toLowerCase() === 'true';
 }
 
-// GET /api/admin/config/ui-flags → { customerNumberVisible, mapClickable }
+/*
+ * GET /api/admin/config/ui-flags
+ *   → { customerNumberVisible, mapClickable, bankChangeOtpRequired }
+ *
+ * bankChangeOtpRequired mirrors `bank.change.crm.otp.required`, the property
+ * that decides whether a CRM bank change demands the technician's OTP
+ * (services/easyfixer-sensitive-change.service.js::crmOtpRequired). It is
+ * surfaced here so EasyfixerBankDialog can render the right number of steps
+ * up front instead of hardcoding the default and discovering the truth from a
+ * 400 on submit — which makes the operator retype nothing but does make them
+ * hit an error to learn the rules.
+ *
+ * The default MUST match crmOtpRequired()'s own `?? 'false'`: if the two
+ * disagree, a missing property makes the UI and the server contradict each
+ * other, which is worse than either posture on its own. This is a render
+ * hint, never the gate — the server still enforces it regardless.
+ */
 router.get('/ui-flags', (req, res) => {
   return modernOk(res, {
     customerNumberVisible: isTrue('ui.customer.number.visible', false),
     mapClickable: isTrue('ui.map.clickable', true),
+    bankChangeOtpRequired: isTrue('bank.change.crm.otp.required', false),
   });
 });
 
