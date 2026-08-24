@@ -28,6 +28,8 @@
  */
 
 const logger = require('../logger');
+const sophy = require('./sophy.service');
+const { matchNames } = require('../utils/name-match');
 
 // ─── Vendor base URLs ───────────────────────────────────────────────
 // VENDOR: SurePass DigiLocker
@@ -350,6 +352,214 @@ async function upiVerify(efrId, upiId) {
   };
 }
 
+
+// ─── 6. Aadhaar OCR (AI extraction — Sophy, NOT a KYC vendor) ───────
+/*
+ * Reads the FRONT + BACK Aadhaar photos the technician just uploaded and asks
+ * Sophy (the central LLM gateway) to extract the printed fields, then compares
+ * the extracted name with the name the technician typed on the same screen.
+ *
+ * DIFFERENT PROVIDER, DIFFERENT KEY: this is the ONE function in this file that
+ * does NOT talk to SurePass/aadhaarkyc.io and does NOT call assertConfigured().
+ * It uses its own per-feature Sophy key (`SOPHY_API_KEY_AADHAAR_OCR`) per the
+ * gateway's no-global-fallback rule — no key ⇒ the feature is simply disabled.
+ *
+ * SOFT DEGRADE: every failure path (no key, gateway error, non-JSON reply,
+ * model refusal, nothing legible) returns `{available:false, extracted:null,
+ * nameMatch:null}` and the ROUTE still answers 200. A failed extraction must
+ * NEVER surface as a name match — matched:true requires a real extraction.
+ *
+ * READ-ONLY: nothing here is persisted. Saving the identity fields stays with
+ * the existing identity-details save.
+ *
+ * PII: the images, the extracted fields and the typed name are all PII. Log
+ * byte counts and booleans only — never a value.
+ */
+
+/*
+ * Payload ceilings, derived from SOPHY'S limit rather than guessed from what an
+ * Aadhaar photo happens to weigh.
+ *
+ * Sophy runs on Vercel, whose serverless functions reject a request body over
+ * 4.5 MB. Sophy's own upload route sets MAX_UPLOAD_BYTES = 4 MB with the comment
+ * "stays under the 4.5 MB function body cap" — so 4.5 MB is the hard wall for
+ * anything we POST to /v1/chat/completions too, images included.
+ *
+ * base64 inflates by 4/3, and it is plain ASCII inside the JSON body, so the
+ * combined base64 IS very nearly the whole request. Budgeting 3.5 MB leaves
+ * ~1 MB for the prompt and the JSON envelope.
+ *
+ * The per-image cap is then set so TWO images at the maximum still fit under the
+ * total: 1.25 MiB raw → ~1.67 MiB base64, × 2 = ~3.33 MiB < 3.5 MiB. That
+ * matters — with the previous 5 MB / 12 MiB pair the per-image limit was
+ * UNREACHABLE for a pair, so two images that each passed the documented 5 MB
+ * check still failed later with a different, numberless error.
+ *
+ * Headroom against the real client: the app compresses every upload to <= 500 KB
+ * (see prepareJpegUpload), i.e. ~683 KB of base64 each and ~1.33 MB combined —
+ * about 2.6x under the total, and 2.5x under the per-image cap.
+ *
+ * Going over these does not fail loudly upstream: Sophy would reject the body at
+ * its platform layer, chatVision would return null, and the endpoint would answer
+ * available:false — indistinguishable from "no key" or "unreadable card". So the
+ * bound has to be enforced HERE, where we can still say why.
+ */
+const AADHAAR_MAX_IMAGE_BYTES = Math.floor(1.25 * 1024 * 1024);
+const AADHAAR_MAX_TOTAL_BASE64 = Math.floor(3.5 * 1024 * 1024);
+const MB = (bytes) => `${Math.round((bytes / (1024 * 1024)) * 100) / 100} MB`;
+const AADHAAR_ALLOWED_MIME = new Set(['image/jpeg', 'image/png', 'image/webp']);
+
+// This feature's OWN Sophy key. No fallback to another feature's key.
+function aadhaarOcrKey() {
+  return process.env.SOPHY_API_KEY_AADHAAR_OCR || '';
+}
+
+// Logged once per process, not per request.
+let aadhaarOcrDisabledLogged = false;
+
+const AADHAAR_OCR_PROMPT = [
+  'You are reading photographs of an Indian Aadhaar card.',
+  'The FIRST image is the FRONT of the card, the SECOND image is the BACK.',
+  'Return STRICT JSON only — no markdown, no fences, no prose — with EXACTLY these keys:',
+  '{"name":null,"dob":null,"aadhaarNumber":null,"gender":null,"fatherName":null,"address":null}',
+  'Rules:',
+  '- Use null for ANY field you cannot read confidently. Never guess, never invent a value.',
+  '- "name" is the cardholder name in English/Latin script, exactly as printed.',
+  '- "dob" must be normalised to YYYY-MM-DD. If only a year of birth is printed, return null.',
+  '- "aadhaarNumber" is the 12 digits with every space removed. If you cannot read all 12, return null.',
+  '- "gender" is "M" for male, "F" for female, "O" for anything else.',
+  '- "fatherName" only when the card prints S/O, D/O, C/O or "Father"; otherwise null.',
+  '- "address" is the address printed on the back, flattened to one line.',
+  '- If these images are not an Aadhaar card, return every field as null.',
+].join('\n');
+
+function aadhaarImage(file, field) {
+  if (!file || !Buffer.isBuffer(file.buffer) || !file.buffer.length) {
+    const e = new Error(`Aadhaar ${field} image is required (multipart field "${field}")`);
+    e.status = 400;
+    throw e;
+  }
+  if (file.buffer.length > AADHAAR_MAX_IMAGE_BYTES) {
+    const e = new Error(`Aadhaar ${field} image must be ${MB(AADHAAR_MAX_IMAGE_BYTES)} or smaller`);
+    e.status = 400;
+    throw e;
+  }
+  const mimeType = AADHAAR_ALLOWED_MIME.has(String(file.mimetype || '').toLowerCase())
+    ? file.mimetype.toLowerCase()
+    : 'image/jpeg';
+  return { mimeType, base64: file.buffer.toString('base64') };
+}
+
+function cleanText(v, max) {
+  if (typeof v !== 'string') return null;
+  const t = v.replace(/\s+/g, ' ').trim();
+  return t && t.length <= max ? t : null;
+}
+
+// A real calendar date in YYYY-MM-DD, and not in the future.
+function cleanDob(v) {
+  if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(v.trim())) return null;
+  const t = v.trim();
+  const d = new Date(`${t}T00:00:00Z`);
+  if (Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== t) return null;
+  return d.getTime() > Date.now() ? null : t;
+}
+
+function cleanAadhaar(v) {
+  const digits = String(v == null ? '' : v).replace(/\D/g, '');
+  return digits.length === 12 ? digits : null;
+}
+
+/*
+ * The prompt asks for 'M' / 'F' / 'O' and nothing else, so the vocabulary is
+ * CLOSED: anything outside it is a field the model could not read, NOT an
+ * "other". Coercing it to 'O' invented a gender the card never printed AND kept
+ * an otherwise-illegible extraction alive, because validateExtraction needs only
+ * ONE non-null field. A card that genuinely prints a third gender still reads as
+ * 'O' through the spellings below. Matching is exact, never by prefix — 'MADE
+ * IN INDIA' is not male.
+ */
+function cleanGender(v) {
+  const g = String(v == null ? '' : v).replace(/\s+/g, ' ').trim().toUpperCase();
+  if (g === 'M' || g === 'MALE') return 'M';
+  if (g === 'F' || g === 'FEMALE') return 'F';
+  if (/^(O|OTHER|T|TG|TRANSGENDER|THIRD GENDER)$/.test(g)) return 'O';
+  return null;
+}
+
+/*
+ * Never trust the model's shape: coerce every field and drop whatever fails.
+ * Returns null when the reply is not an object, or when NOTHING legible came
+ * back — "parsed but empty" is not an extraction, so it degrades to
+ * available:false rather than an all-null "successful" read.
+ */
+function validateExtraction(parsed) {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const extracted = {
+    name: cleanText(parsed.name, 120),
+    dob: cleanDob(parsed.dob),
+    aadhaarNumber: cleanAadhaar(parsed.aadhaarNumber),
+    gender: cleanGender(parsed.gender),
+    fatherName: cleanText(parsed.fatherName, 120),
+    address: cleanText(parsed.address, 400),
+  };
+  return Object.values(extracted).some((v) => v !== null) ? extracted : null;
+}
+
+const AADHAAR_UNAVAILABLE = { available: false, extracted: null, nameMatch: null };
+
+async function aadhaarOcr(efrId, frontFile, backFile, typedName) {
+  const front = aadhaarImage(frontFile, 'front');
+  const back = aadhaarImage(backFile, 'back');
+  const expected = typeof typedName === 'string' ? typedName.trim() : '';
+
+  const apiKey = aadhaarOcrKey();
+  if (!sophy.enabled(apiKey)) {
+    if (!aadhaarOcrDisabledLogged) {
+      aadhaarOcrDisabledLogged = true;
+      logger.warn('KYC Aadhaar OCR is disabled · SOPHY_API_KEY_AADHAAR_OCR is not set');
+    }
+    return { ...AADHAAR_UNAVAILABLE };
+  }
+
+  if (front.base64.length + back.base64.length > AADHAAR_MAX_TOTAL_BASE64) {
+    const e = new Error(
+      `Aadhaar images are too large to process together — each must be `
+      + `${MB(AADHAAR_MAX_IMAGE_BYTES)} or smaller. Please retake them.`,
+    );
+    e.status = 400;
+    throw e;
+  }
+
+  logger.info(
+    'KYC Aadhaar OCR · frontBytes=' + frontFile.buffer.length
+    + ' · backBytes=' + backFile.buffer.length,
+  );
+  const reply = await sophy.chatVision({
+    system: AADHAAR_OCR_PROMPT,
+    user: 'Extract the fields from these two Aadhaar images.',
+    images: [front, back],
+    maxTokens: 700,
+    apiKey,
+  });
+  const extracted = validateExtraction(sophy.parseJsonLoose(reply));
+  if (!extracted) {
+    logger.warn({ efrId, available: false }, 'mobile-kyc: Aadhaar OCR produced no usable extraction');
+    return { ...AADHAAR_UNAVAILABLE };
+  }
+
+  // A verdict needs BOTH sides. No typed name ⇒ no verdict; a name the model
+  // could not READ is an ABSENT comparison too, not a failed one — reporting
+  // {matched:false, found:null} is indistinguishable on the wire from a genuine
+  // mismatch, and the app renders it as one.
+  const nameMatch = expected && extracted.name ? matchNames(expected, extracted.name) : null;
+  logger.info(
+    'KYC Aadhaar OCR completed · available=true · matched='
+    + (nameMatch ? nameMatch.matched : 'n/a'),
+  );
+  return { available: true, extracted, nameMatch };
+}
+
 module.exports = {
   digilockerInitialize,
   digilockerDownloadAadhaar,
@@ -358,4 +568,5 @@ module.exports = {
   aadhaarSubmitOtp,
   bankVerify,
   upiVerify,
+  aadhaarOcr,
 };
