@@ -5,6 +5,7 @@ const requireAuth = require('../../middleware/auth');
 const { role } = require('../../middleware/role');
 const validate = require('../../middleware/validate');
 const lookup = require('../../services/lookup.service');
+const pincode = require('../../services/pincode.service');
 const { modernOk } = require('../../utils/response');
 const { cached } = require('../../utils/ttl-cache');
 const { pool } = require('../../db');
@@ -12,6 +13,7 @@ const { buildRequestScopeWithHierarchy } = require('../../lib/scope');
 const {
   citiesQuery, serviceTypesQuery, clientsQuery, clientServicesQuery,
   usersQuery, banksQuery, simpleIncludeInactive, projectManagersQuery, zonalManagersQuery,
+  pincodesQuery,
 } = require('../../validators/lookup.validator');
 
 /*
@@ -47,6 +49,47 @@ router.get('/cities',             validate(citiesQuery, 'query'),          async
     const rows = await lookup.cities(req.query);
     logger.info('Found ' + rows.length + ' cities');
     modernOk(res, rows);
+  } catch (e) { next(e); }
+});
+
+// Serviceable PIN codes for ONE city, paged. Powers the technician app's Work
+// Area city → pincode picker (Registration › Work Area), which pages 50 at a
+// time and reads `total` to decide whether to show "Load more".
+//
+// Reuses services/pincode.service.listPincodes (the Manage Pincodes list) and
+// then PROJECTS THE ROW DOWN to the five catalogue fields the picker parses.
+// Everything the admin list also computes — pincode_id, the LOCAL/TRAVEL
+// mapping value, active_efr_count, zone_count, lat/lng, zonal_manager_name and
+// the created_by/_type/_name creator audit — is DROPPED here. Those describe
+// our technician supply and our internal ops, not the PIN catalogue, and a
+// technician JWT reaches this route.
+//
+// `includeInactive` is deliberately NOT part of the contract: listPincodes
+// defaults it false (WHERE p.pincode_status = 1), and a non-serviceable PIN is
+// not somewhere a technician may claim as their work area.
+//
+// NOT cached, on purpose: ttl-cache's Map never evicts, and the key space here
+// (cityId × limit × offset ≈ 11k cities × pages) is unbounded enough to be the
+// same hazard that makes the free-text lookups above bypass the cache. The app
+// already keeps an 8-entry LRU + in-flight dedupe for these pages client-side.
+router.get('/pincodes',           validate(pincodesQuery, 'query'),        async (req, res, next) => {
+  try {
+    const { cityId, limit, offset } = req.query;
+    logger.info('Lookup pincodes · cityId=' + cityId + ' limit=' + limit + ' offset=' + offset);
+    const { items, total } = await pincode.listPincodes({ cityId, limit, offset });
+    logger.info('Found ' + items.length + ' pincodes · total=' + total);
+    modernOk(res, {
+      items: items.map((p) => ({
+        pincode:    p.pincode,
+        city_id:    p.city_id,
+        city_name:  p.city_name,
+        district:   p.district,
+        state_name: p.state_name,
+      })),
+      total,
+      limit,
+      offset,
+    });
   } catch (e) { next(e); }
 });
 

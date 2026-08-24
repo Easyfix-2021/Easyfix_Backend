@@ -20,6 +20,17 @@ const citiesQuery = Joi.object({
   includeInactive: Joi.boolean().default(false),
 });
 
+// City → PIN catalogue page for the technician app's Work Area picker
+// (GET /api/shared/lookup/pincodes). cityId is REQUIRED — this is a per-city
+// page, never a full-table dump. The limit ceiling is the app's own
+// CITY_PINCODE_PAGE_MAX (ApiLookupService.getCityPincodes clamps to 50 before
+// it ever leaves the device), so anything larger is a client that has drifted.
+const pincodesQuery = Joi.object({
+  cityId: intId.required(),
+  limit: Joi.number().integer().min(1).max(50).default(50),
+  offset: Joi.number().integer().min(0).default(0),
+});
+
 const serviceTypesQuery = Joi.object({
   categoryId: intId.optional(),
   includeInactive: Joi.boolean().default(false),
@@ -76,6 +87,7 @@ const zonalManagersQuery = Joi.object({
 
 module.exports = {
   citiesQuery,
+  pincodesQuery,
   serviceTypesQuery,
   clientsQuery,
   clientServicesQuery,
