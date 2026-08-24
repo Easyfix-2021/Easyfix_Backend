@@ -103,8 +103,16 @@ async function findById(id) {
   // GET /mobile/me serializes req.tech directly, so overwrite those aliases as
   // well as redacting the nested snapshot; otherwise BLACKLISTED RCA text
   // would remain available at the root of the response.
-  const technicianRow = easyfixerLifecycle.forTechnician(
-    easyfixerLifecycle.lifecycleFromRow(row),
+  // Single-row/technician-facing read, so it also carries the INACTIVE
+  // open-job overlay: a technician deactivated while they still own open jobs
+  // keeps the operational app (continue / mutate / attendance) until the last
+  // one closes, and never regains `receiveNewJobs`. One bounded COUNT, and only
+  // when the status is INACTIVE — every other status returns without a query.
+  // Runs BEFORE the overdue-training overlay below so that restriction, which
+  // withdraws the same three capabilities, still wins.
+  const technicianRow = await easyfixerLifecycle.overlayOpenJobCapabilities(
+    easyfixerLifecycle.forTechnician(easyfixerLifecycle.lifecycleFromRow(row)),
+    row.efr_id,
   );
 
   /*

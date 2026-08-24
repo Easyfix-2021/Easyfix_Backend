@@ -61,6 +61,8 @@ const {
   managementAlertForTransition,
   managementAlertMessage,
   expireOpenOffersForRestrictedLifecycle,
+  overlayOpenJobCapabilities,
+  OPEN_JOB_STATUSES,
 } = lifecycle._internals;
 const {
   decide,
@@ -807,4 +809,154 @@ test('lifecycle evaluator reports backlog when the configured batch cap is reach
   assert.equal(result.remaining, 50);
   assert.equal(result.backlog, true);
   assert.equal(result.stopReason, 'max_batches');
+});
+
+
+/*
+ * ── INACTIVE MUST NOT STRAND WORK IN HAND ───────────────────────────────────
+ *
+ * INACTIVE stops NEW jobs; it must not hide or block jobs the technician is
+ * already on. The overlay takes an injected executor, so these characterize the
+ * real decision without a pool and without a DB.
+ */
+function fakeExecutor(rows, { fail = false } = {}) {
+  const calls = [];
+  return {
+    calls,
+    query: async (sql, params) => {
+      calls.push({ sql: String(sql), params });
+      if (fail) throw new Error('ER_LOCK_WAIT_TIMEOUT: lock wait timeout exceeded');
+      return [rows, []];
+    },
+  };
+}
+
+function snapshotFor(status) {
+  return { status, capabilities: lifecycle.capabilitiesForStatus(status) };
+}
+
+test('INACTIVE with open jobs keeps assigned work but never receives new jobs', async () => {
+  const db = fakeExecutor([{ open_jobs: 3 }]);
+  const out = await overlayOpenJobCapabilities(snapshotFor('INACTIVE'), 77, db);
+
+  assert.equal(out.status, 'INACTIVE', 'the lifecycle STATUS is unchanged');
+  assert.equal(out.capabilities.continueAssignedJobs, true);
+  assert.equal(out.capabilities.mutateAssignedJobs, true);
+  assert.equal(out.capabilities.markAttendance, true);
+  assert.equal(out.capabilities.receiveNewJobs, false, 'INACTIVE still blocks NEW work');
+  assert.equal(out.capabilities.readOnlyApp, false, 'mutations are allowed, so not read-only');
+  assert.equal(out.openJobs, 3);
+
+  assert.equal(db.calls.length, 1, 'exactly one bounded COUNT');
+  const [{ sql, params }] = db.calls;
+  assert.match(sql, /COUNT\(\*\) AS open_jobs/);
+  assert.match(sql, /fk_easyfixter_id = \?/, 'scoped to this technician');
+  assert.doesNotMatch(sql, /NOT IN/, 'positive IN list — no NULL-swallows-every-row trap');
+  // ASSERTION UPDATED (2026-08-21, deliberately): the set used to be the
+  // dashboard counter's (1, 2, 20) and stranded a technician whose only work
+  // sat in 15 / 21 / 10. "Work in hand" is now derived from the job status
+  // model — see the OPEN_JOB_STATUSES comment in the service.
+  assert.deepEqual([...OPEN_JOB_STATUSES], [1, 2, 10, 15, 20, 21]);
+  assert.deepEqual(params, [77, 1, 2, 10, 15, 20, 21]);
+});
+
+/*
+ * fakeExecutor() above returns a CANNED count, so it can never notice a status
+ * missing from the query. This one is honest about the SQL: it evaluates the
+ * status list the query actually binds against a single fixture job, exactly
+ * as `job_status IN (…)` would. A status that is not in OPEN_JOB_STATUSES
+ * therefore counts as ZERO — which IS the stranding bug.
+ */
+function jobAtStatus(jobStatus) {
+  return {
+    query: async (sql, params) => {
+      const [, ...statuses] = params.map(Number);
+      return [[{ open_jobs: statuses.includes(Number(jobStatus)) ? 1 : 0 }], []];
+    },
+  };
+}
+
+test('work still in hand counts as open — estimate-pending (15), on-hold (21), revisit (10)', async () => {
+  for (const [jobStatus, what] of [
+    [15, 'estimate sent by the technician, awaiting the SPOC decision'],
+    [21, 'fulfilment hold placed by Ops, fk_easyfixter_id untouched'],
+    [10, 'revisit owed / where a hold release lands'],
+  ]) {
+    const out = await overlayOpenJobCapabilities(snapshotFor('INACTIVE'), 77, jobAtStatus(jobStatus));
+    assert.equal(out.openJobs, 1, `job_status ${jobStatus} (${what}) must count as work in hand`);
+    assert.equal(out.capabilities.continueAssignedJobs, true, `job_status ${jobStatus}`);
+    assert.equal(out.capabilities.mutateAssignedJobs, true, `job_status ${jobStatus}`);
+    assert.equal(out.capabilities.markAttendance, true, `job_status ${jobStatus}`);
+    assert.equal(out.capabilities.readOnlyApp, false, `job_status ${jobStatus}`);
+    assert.equal(out.capabilities.receiveNewJobs, false, 'NEW work stays blocked regardless');
+  }
+});
+
+test('regression: hold (21) → release (10) never strands the deactivated technician', async () => {
+  // Ops holds the technician's only job (routes/admin/jobs.js PUT /jobs/:id/hold
+  // → job_status 21, tech unchanged); the technician is then deactivated.
+  const held = await overlayOpenJobCapabilities(snapshotFor('INACTIVE'), 77, jobAtStatus(21));
+  assert.equal(held.capabilities.mutateAssignedJobs, true, 'the job is still theirs to finish');
+
+  // The hold is released (POST /jobs/:id/hold/release → job_status 10). The
+  // capability must SURVIVE the release, not disappear into a second dead state.
+  const released = await overlayOpenJobCapabilities(snapshotFor('INACTIVE'), 77, jobAtStatus(10));
+  assert.equal(released.capabilities.mutateAssignedJobs, true, 'released back to a revisit still owed');
+  assert.equal(released.capabilities.markAttendance, true);
+});
+
+test('terminal and pre-assignment job statuses are still NOT work in hand', async () => {
+  // The set must not drift into "any row with my id on it". 3/5 completed,
+  // 6 cancelled and 7 enquiry are terminal; 0 is an open OFFER (expired by the
+  // restricting transition); 9 is unconfirmed, pre-assignment.
+  for (const jobStatus of [0, 3, 5, 6, 7, 9]) {
+    const out = await overlayOpenJobCapabilities(snapshotFor('INACTIVE'), 77, jobAtStatus(jobStatus));
+    assert.equal(out.openJobs, undefined, `job_status ${jobStatus} must grant nothing`);
+    assert.equal(out.capabilities.continueAssignedJobs, false, `job_status ${jobStatus}`);
+    assert.equal(out.capabilities.mutateAssignedJobs, false, `job_status ${jobStatus}`);
+    assert.equal(out.capabilities.markAttendance, false, `job_status ${jobStatus}`);
+  }
+});
+
+test('INACTIVE with zero open jobs falls back to the locked inactive screen', async () => {
+  const db = fakeExecutor([{ open_jobs: 0 }]);
+  const out = await overlayOpenJobCapabilities(snapshotFor('INACTIVE'), 77, db);
+
+  assert.equal(out.capabilities.continueAssignedJobs, false);
+  assert.equal(out.capabilities.mutateAssignedJobs, false);
+  assert.equal(out.capabilities.markAttendance, false);
+  assert.equal(out.capabilities.receiveNewJobs, false);
+  assert.equal(out.openJobs, undefined, 'nothing granted, nothing reported');
+});
+
+test('BLACKLISTED stays terminal even with open jobs, and costs no query', async () => {
+  const db = fakeExecutor([{ open_jobs: 9 }]);
+  const out = await overlayOpenJobCapabilities(snapshotFor('BLACKLISTED'), 77, db);
+
+  assert.equal(db.calls.length, 0, 'only INACTIVE may pay for the COUNT');
+  assert.equal(out.capabilities.continueAssignedJobs, false);
+  assert.equal(out.capabilities.mutateAssignedJobs, false);
+  assert.equal(out.capabilities.markAttendance, false);
+  assert.equal(out.capabilities.receiveNewJobs, false);
+});
+
+test('a failed open-job count fails CLOSED — it may never grant capabilities', async () => {
+  const db = fakeExecutor([], { fail: true });
+  const out = await overlayOpenJobCapabilities(snapshotFor('INACTIVE'), 77, db);
+
+  assert.equal(out.capabilities.continueAssignedJobs, false);
+  assert.equal(out.capabilities.mutateAssignedJobs, false);
+  assert.equal(out.capabilities.markAttendance, false);
+  assert.equal(out.capabilities.receiveNewJobs, false);
+  assert.equal(out.openJobs, undefined);
+});
+
+test('no other lifecycle status is re-interpreted, and none pays for the query', async () => {
+  for (const status of ['ACTIVE', 'PAUSED', 'DORMANT', 'SUSPENDED', 'OFFLINE', 'ON_BENCH', 'NEW']) {
+    const db = fakeExecutor([{ open_jobs: 4 }]);
+    const before = snapshotFor(status);
+    const after = await overlayOpenJobCapabilities(before, 77, db);
+    assert.equal(db.calls.length, 0, `${status} must skip the count query entirely`);
+    assert.equal(after, before, `${status} must be returned untouched`);
+  }
 });

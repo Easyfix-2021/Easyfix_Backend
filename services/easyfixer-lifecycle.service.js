@@ -517,6 +517,123 @@ async function loadLifecycleCounts(efrId, executor = pool) {
   };
 }
 
+/*
+ * WORK IN HAND — the tbl_job statuses that mean "this technician still owes
+ * someone a visit or a decision on a job that is already theirs".
+ *
+ * Derived from the job status model (the STATUS glossary in
+ * services/job.service.js), NOT from another feature's counter. The `open_jobs`
+ * bucket in quicksight-technician-performance.service.js and fetchDateCounts in
+ * mobile-dashboard.service.js both use (1, 2, 20), but those are DASHBOARD
+ * COUNTERS: a status missing there under-reports a tile, while a status missing
+ * HERE locks a technician out of a job the app still lists for them. A counter's
+ * exclusions must never be inherited by an authorization decision.
+ *
+ * IN — still actionable by the technician who holds it:
+ *    1  SCHEDULED                 accepted, not yet checked in
+ *    2  IN_PROGRESS / 20 ALT      checked in on the app
+ *   10  CLOSED_FROM_APP/REVISIT   their OWN checkout with isNextVisit=true lands
+ *                                 here with a revisit_date (routes/mobile/index.js),
+ *                                 and it is what a fulfilment hold RELEASES to
+ *                                 (routes/admin/jobs.js POST /jobs/:id/hold/release)
+ *                                 — a second visit still owed, still assigned.
+ *   15  ESTIMATE_PENDING_APPROVAL the TECHNICIAN moves the job here themselves
+ *                                 (mobile-job-estimate.service.js sendForApproval)
+ *                                 and resumes it once the SPOC decides.
+ *   21  ON_HOLD                   fulfilment hold with a future full_fillment_time
+ *                                 (routes/admin/jobs.js PUT /jobs/:id/hold);
+ *                                 fk_easyfixter_id is left untouched, so the job
+ *                                 never leaves the technician's hands.
+ *
+ * OUT — and why:
+ *   3 / 5 COMPLETED, 6 CANCELLED, 7 ENQUIRY — terminal, nothing left to do. Same
+ *     terminal set as TERMINAL_EXCLUSION in services/quicksight/_shared.js.
+ *   0 BOOKED — NEW work, not work in hand. Under the offer model an offered job
+ *     keeps fk_easyfixter_id NULL until acceptance (job.service.js assign() →
+ *     offerToTechnicians), and a restricting transition expires the open offers
+ *     in the same transaction (expireOpenOffersForRestrictedLifecycle), so
+ *     counting 0 would resurrect work that was just withdrawn.
+ *   9 UNCONFIRMED — booked from website / API / bulk upload with the customer not
+ *     yet confirmed: a pre-assignment queue state, no technician action attached.
+ *
+ * ALIGNMENT with what the app can show (checked, not assumed): GET
+ * /api/mobile/jobs (routes/mobile/index.js → jobService.list({ easyfixerId }))
+ * applies NO status filter, so it lists every job with fk_easyfixter_id = this
+ * technician at ANY status. Every listed status that still carries a technician
+ * action is in the set above; the only ones left out are the four terminal codes
+ * and 0 / 9 — none of which the technician can act on. Adding a job status that
+ * the mobile app can act on WITHOUT adding it here re-creates the stranding bug.
+ *
+ * Positive `IN` list on an indexed equality — no NOT IN, so the NULL-swallows-
+ * every-row trap does not apply here.
+ */
+const OPEN_JOB_STATUSES = Object.freeze([1, 2, 10, 15, 20, 21]);
+
+async function countOpenJobs(efrId, executor = pool) {
+  const [[row]] = await executor.query(
+    `SELECT COUNT(*) AS open_jobs
+       FROM tbl_job
+      WHERE fk_easyfixter_id = ?
+        AND job_status IN (${OPEN_JOB_STATUSES.map(() => '?').join(',')})`,
+    [Number(efrId), ...OPEN_JOB_STATUSES],
+  );
+  return Math.max(0, Number(row?.open_jobs) || 0);
+}
+
+/**
+ * INACTIVE stops NEW work; it must not strand work already in hand.
+ *
+ * A technician deactivated mid-route still owns jobs a customer is waiting on.
+ * Locking every capability made those jobs unreachable — they could not check
+ * in, close, or even mark attendance for the day they were already committed
+ * to. So while an open job remains, INACTIVE keeps the operational app and only
+ * `receiveNewJobs` stays false. When the last open job closes the count reaches
+ * zero, nothing is granted, and the app falls back to the inactive screen with
+ * the lifecycle reason — no cron, no transition, no log row.
+ *
+ * Applied ONLY on SINGLE-ROW reads: the mobile auth projection
+ * (services/tech-auth.service.js findById — the technician-facing one that
+ * actually gates the app) and getLifecycle, whose only caller is the CRM's
+ * GET /api/admin/easyfixers/:id/lifecycle-status detail read. On the CRM side
+ * this is informational — the UI reads only `receiveNewJobs`, which the overlay
+ * never grants — but it does mean that admin read pays the same one COUNT.
+ * lifecycleFromRow
+ * stays the pure, synchronous projection the hot bulk reads need — this is the
+ * same overlay pattern its own comment prescribes for loadLifecycleCounts.
+ *
+ * Costs exactly ONE bounded COUNT, and only for INACTIVE: every other status
+ * returns before the query. BLACKLISTED stays terminal, and PAUSED / DORMANT /
+ * SUSPENDED / OFFLINE / ON_BENCH are untouched.
+ *
+ * Fail-CLOSED, unlike the overdue-training overlay: this GRANTS capability, so
+ * a failed count must leave the technician exactly as locked out as before.
+ */
+async function overlayOpenJobCapabilities(snapshot, efrId, executor = pool) {
+  if (snapshot?.status !== 'INACTIVE') return snapshot;
+  let openJobs = 0;
+  try {
+    openJobs = await countOpenJobs(efrId, executor);
+  } catch (error) {
+    logger.warn('Open-job overlay failed; INACTIVE stays locked · efrId=' + efrId + ' · ' + error.message);
+    return snapshot;
+  }
+  if (openJobs <= 0) return snapshot;
+  return {
+    ...snapshot,
+    // Additive field: old app builds ignore it, ops and the next build can
+    // explain WHY a deactivated technician still has the operational app.
+    openJobs,
+    capabilities: {
+      ...snapshot.capabilities,
+      // receiveNewJobs stays exactly as capabilitiesForStatus left it (false).
+      continueAssignedJobs: true,
+      mutateAssignedJobs: true,
+      markAttendance: true,
+      readOnlyApp: false,
+    },
+  };
+}
+
 async function getLifecycle(efrId) {
   const projection = await readProjection('e');
   const [[row]] = await pool.query(
@@ -540,7 +657,9 @@ async function getLifecycle(efrId) {
   if (normalizeStatus(row.lifecycle_status) && (await hasLifecycleSchema())) {
     Object.assign(snapshot, await loadLifecycleCounts(efrId));
   }
-  return snapshot;
+  // Second single-row overlay: INACTIVE keeps already-assigned work. No-op
+  // (and no query) for every other status.
+  return overlayOpenJobCapabilities(snapshot, efrId);
 }
 
 function assertTransition(current, target, input) {
@@ -1398,6 +1517,7 @@ module.exports = {
   deriveLegacyStatus,
   operationalStatusForManager,
   getLifecycle,
+  overlayOpenJobCapabilities,
   transition,
   requestReapplication,
   getReapplicationSummary,
@@ -1428,6 +1548,9 @@ module.exports = {
     expireOpenOffersForRestrictedLifecycle,
     historyItemFromRow,
     loadLifecycleCounts,
+    countOpenJobs,
+    overlayOpenJobCapabilities,
+    OPEN_JOB_STATUSES,
     managementAlertForTransition,
     managementAlertMessage,
     loadAlertSummary,
