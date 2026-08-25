@@ -100,6 +100,17 @@ const QUICK_LOGIN_JS = `
       // ── Body + foot ──
       '.ef-body{padding:22px;overflow:auto;flex:1;font-size:14px;color:#1e293b;line-height:1.55}',
       '.ef-foot{padding:14px 22px;background:linear-gradient(180deg,#f8fafc 0%,#f1f5f9 100%);border-top:1px solid #e2e8f0;display:flex;gap:10px;justify-content:flex-end}',
+      // ── Environment picker (Quick Login step 1) ──
+      '.ef-env-row{display:flex;flex-direction:column;gap:8px;margin:8px 0 4px}',
+      '.ef-env-chip{display:flex;flex-direction:column;align-items:flex-start;gap:2px;width:100%;text-align:left;padding:10px 14px;border:1.5px solid #E6DEDF;border-radius:10px;background:#fff;cursor:pointer;transition:border-color .12s,background .12s;font-family:inherit}',
+      '.ef-env-chip:hover{border-color:#C42430;background:#FBEDEE}',
+      '.ef-env-chip.on{border-color:#C42430;background:#FBEDEE;box-shadow:inset 3px 0 0 #C42430}',
+      '.ef-env-name{font-size:13px;font-weight:600;color:#1A1618}',
+      '.ef-env-url{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;color:#6B6167}',
+      '.ef-note{font-size:12px;line-height:1.55;color:#8A5A00;background:#FBF1DF;border:1px solid #EBD9B4;border-radius:9px;padding:10px 12px;margin-top:10px}',
+      '.ef-tier-basic .ef-tier-icon{background:linear-gradient(135deg,#0f766e,#134e4a)}',
+      '.ef-btn-danger-ghost{color:#C42430!important;border-color:#F3C9CC!important}',
+      '.ef-btn-danger-ghost:hover{background:#FBEDEE!important;border-color:#C42430!important}',
       // ── Modal buttons ──
       '.ef-btn{padding:9px 18px;border-radius:9px;border:none;cursor:pointer;font-weight:700;font-size:13px;font-family:inherit;transition:all .15s ease;letter-spacing:.15px}',
       '.ef-btn:disabled{opacity:.55;cursor:not-allowed;transform:none!important}',
@@ -179,6 +190,28 @@ const QUICK_LOGIN_JS = `
     document.head.appendChild(s);
   }
 
+  // ── Body scroll lock ──────────────────────────────────────────────
+  // Without this the page scrolls BEHIND an open modal: the backdrop covers
+  // the viewport but does not absorb wheel events, so the pointer's scroll
+  // falls through to <body>. Reading position is then lost on close.
+  //
+  // Saved-value guard, not a bare 'auto' reset: openModal() calls closeModal()
+  // first, and modal-to-modal transitions would otherwise clobber whatever
+  // overflow the page actually had.
+  var EF_SCROLL_LOCK = null;
+
+  function lockScroll() {
+    if (EF_SCROLL_LOCK !== null) return;
+    EF_SCROLL_LOCK = document.body.style.overflow || '';
+    document.body.style.overflow = 'hidden';
+  }
+
+  function unlockScroll() {
+    if (EF_SCROLL_LOCK === null) return;
+    document.body.style.overflow = EF_SCROLL_LOCK;
+    EF_SCROLL_LOCK = null;
+  }
+
   // ── Modal scaffold (reusable for all three flows) ─────────────────
   function openModal(title) {
     closeModal();
@@ -224,6 +257,7 @@ const QUICK_LOGIN_JS = `
     document.addEventListener('keydown', escHandler);
 
     document.body.appendChild(backdrop);
+    lockScroll();
     return {
       backdrop: backdrop,
       body: body,
@@ -235,6 +269,7 @@ const QUICK_LOGIN_JS = `
   function closeModal() {
     var existing = document.getElementById('ef-modal-backdrop');
     if (existing) existing.remove();
+    unlockScroll();
   }
 
   function el(tag, props, kids) {
@@ -255,8 +290,63 @@ const QUICK_LOGIN_JS = `
 
   function showErr(box, msg) { box.textContent = msg; box.style.display = 'block'; }
 
+  // ── Environment ───────────────────────────────────────────────────
+  // Quick Login used to hardcode window.location.origin, so it could only ever
+  // log in to the environment whose docs you happened to be reading. The list
+  // comes from the spec's own servers block, so it can never drift from
+  // docs/openapi.yaml.
+  var EF_ENV_LS_KEY = 'ef-swagger-env';
+
+  function envs() {
+    try {
+      var list = window.ui.specSelectors.servers().toJS();
+      if (list && list.length) {
+        return list.map(function (x) {
+          return { url: x.url, label: x.description || x.url };
+        });
+      }
+    } catch (e) {}
+    return [{ url: window.location.origin + '/api', label: 'Current runtime' }];
+  }
+
+  function selectedEnv() {
+    var list = envs();
+    var saved = null;
+    try { saved = window.localStorage.getItem(EF_ENV_LS_KEY); } catch (e) {}
+    for (var i = 0; i < list.length; i++) if (list[i].url === saved) return list[i];
+    return list[0];
+  }
+
+  // Selecting an environment also drives Swagger UI's OWN server <select>, so
+  // "Try it out" lands where Quick Login just authenticated. Swagger exposes no
+  // public setter for the selected server, hence the DOM route.
+  function syncSwaggerServer(url) {
+    var sel = document.querySelector('.swagger-ui .servers select');
+    if (!sel) return false;
+    for (var i = 0; i < sel.options.length; i++) {
+      if (sel.options[i].value === url) {
+        if (sel.selectedIndex !== i) {
+          sel.selectedIndex = i;
+          sel.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function setEnv(url) {
+    try { window.localStorage.setItem(EF_ENV_LS_KEY, url); } catch (e) {}
+    syncSwaggerServer(url);
+  }
+
+  function isCrossOrigin(url) {
+    try { return new URL(url, window.location.href).origin !== window.location.origin; }
+    catch (e) { return false; }
+  }
+
   // ── HTTP helpers ──────────────────────────────────────────────────
-  function base() { return window.location.origin + '/api'; }
+  function base() { return selectedEnv().url; }
 
   // Read body as text first, then try JSON.parse. Preserves raw text on
   // parse failure (e.g. Nginx HTML error pages) so it can be surfaced in
@@ -289,17 +379,58 @@ const QUICK_LOGIN_JS = `
     m.setTitle('🔑 Quick Login · Select Tier');
     clear(m.body); clear(m.foot);
 
+    // ── Environment ──
+    // First thing on the screen, because it decides where the OTP is sent AND
+    // where every subsequent "Try it out" goes. Picking a tier first and the
+    // environment second is how you end up logged into the wrong one.
+    m.body.appendChild(el('div', { className: 'ef-label', textContent: 'Environment' }));
+    var envRow = el('div', { className: 'ef-env-row' });
+    var envList = envs();
+    var cur = selectedEnv();
+    var xorigin = el('div', { className: 'ef-note', style: 'display:none' });
+
+    envList.forEach(function (env) {
+      var on = env.url === cur.url;
+      var b = el('button', { className: 'ef-env-chip' + (on ? ' on' : ''), type: 'button' });
+      b.appendChild(el('span', { className: 'ef-env-name', textContent: env.label }));
+      b.appendChild(el('span', { className: 'ef-env-url', textContent: env.url }));
+      b.onclick = function () {
+        setEnv(env.url);
+        Array.prototype.slice.call(envRow.children).forEach(function (c) { c.className = 'ef-env-chip'; });
+        b.className = 'ef-env-chip on';
+        showXOrigin(env.url);
+      };
+      envRow.appendChild(b);
+    });
+    m.body.appendChild(envRow);
+
+    function showXOrigin(url) {
+      if (!isCrossOrigin(url)) { xorigin.style.display = 'none'; return; }
+      xorigin.style.display = 'block';
+      xorigin.textContent = 'Cross-origin: this page is served from '
+        + window.location.origin + ', so login and Try-it-out both need that '
+        + 'origin in the target environment\\'s CORS allowlist. A browser-only '
+        + 'failure with no server log is what a missing entry looks like.';
+    }
+    showXOrigin(cur.url);
+    m.body.appendChild(xorigin);
+
+    m.body.appendChild(el('div', { className: 'ef-label', style: 'margin-top:18px', textContent: 'Credential' }));
     m.body.appendChild(el('div', { style: 'margin-bottom:14px;font-size:13px;color:#64748b',
-      textContent: 'Choose which tier you\\'re logging in as. The token will auto-fill the matching Bearer scheme.' }));
+      textContent: 'Choose which tier you\\'re logging in as. The token auto-fills the matching scheme — there is no separate Authorize step.' }));
 
     var grid = el('div', { className: 'ef-tier-grid' });
     [
       { scheme: 'bearerAdmin',  cls: 'ef-tier-crm',    icon: '🏢', title: 'CRM Admin',  desc: 'Staff users — POST /api/auth/login-otp' },
       { scheme: 'bearerTech',   cls: 'ef-tier-tech',   icon: '🔧', title: 'Technician', desc: 'Mobile app — POST /api/mobile/auth/login-otp' },
       { scheme: 'bearerClient', cls: 'ef-tier-client', icon: '👤', title: 'Client SPOC',desc: 'Dashboard — POST /api/client/auth/login-otp' },
+      // The fourth credential the API accepts. It lived only behind the
+      // built-in Authorize dialog, which meant the one scheme with no OTP flow
+      // was also the one hidden in a different menu.
+      { scheme: 'basicIntegration', cls: 'ef-tier-basic', icon: '🔐', title: 'Integration (Basic)', desc: 'Partner clients — HTTP Basic on /v1/*', basic: true },
     ].forEach(function (t) {
       var btn = el('button', { className: 'ef-tier ' + t.cls, type: 'button',
-        onclick: function () { stepEnterIdentifier(m, t.scheme); } });
+        onclick: function () { t.basic ? stepBasicAuth(m) : stepEnterIdentifier(m, t.scheme); } });
       btn.appendChild(el('div', { className: 'ef-tier-icon', textContent: t.icon }));
       var text = el('div', { className: 'ef-tier-text' });
       text.appendChild(el('div', { className: 'ef-tier-title', textContent: t.title }));
@@ -476,6 +607,58 @@ const QUICK_LOGIN_JS = `
     }
   }
 
+  // ── Basic Integration (no OTP — a stored username/password pair) ──
+  function stepBasicAuth(m) {
+    m.setTitle('🔐 Quick Login · Integration (Basic)');
+    clear(m.body); clear(m.foot);
+
+    m.body.appendChild(el('div', { className: 'ef-note', textContent:
+      'HTTP Basic, /integration/v1/* only. These are PARTNER credentials, not a '
+      + 'CRM login — no staff account works here. Responses use the legacy '
+      + '{status: "200", message, data} envelope.' }));
+
+    m.body.appendChild(el('div', { className: 'ef-label', style: 'margin-top:16px', textContent: 'Username' }));
+    var u = el('input', { className: 'ef-input', type: 'text', autocomplete: 'off', placeholder: 'partner login name' });
+    m.body.appendChild(u);
+
+    m.body.appendChild(el('div', { className: 'ef-label', style: 'margin-top:12px', textContent: 'Password' }));
+    var pw = el('input', { className: 'ef-input', type: 'password', autocomplete: 'off', placeholder: '••••••••' });
+    m.body.appendChild(pw);
+
+    var errBox = el('div', { className: 'ef-error', style: 'display:none;margin-top:14px' });
+    m.body.appendChild(errBox);
+
+    function apply() {
+      var user = (u.value || '').trim();
+      var pass = pw.value || '';
+      if (!user || !pass) { showErr(errBox, 'Both username and password are required.'); return; }
+      try {
+        // preauthorizeBasic writes the same store the Authorize dialog did, so
+        // "Try it out" picks it up identically. There is no verify endpoint to
+        // call first — Basic is checked per-request, so the first real call is
+        // what proves the credential.
+        window.ui.preauthorizeBasic('basicIntegration', user, pass);
+      } catch (e) {
+        showErr(errBox, 'Could not apply credentials: ' + (e.message || e));
+        return;
+      }
+      m.setTitle('🎉 Ready');
+      clear(m.body); clear(m.foot);
+      m.body.appendChild(el('div', { className: 'ef-check-circle', textContent: '✓' }));
+      m.body.appendChild(el('div', { className: 'ef-success-title', textContent: 'Basic credentials applied' }));
+      m.body.appendChild(el('div', { className: 'ef-success-sub', textContent:
+        'Every /integration/v1/* call will now send Authorization: Basic for "' + user + '". '
+        + 'Nothing has validated them yet — the first request will.' }));
+      m.foot.appendChild(el('button', { className: 'ef-btn ef-btn-ghost', type: 'button', textContent: '‹ Back', onclick: function () { stepSelectTier(m); } }));
+      m.foot.appendChild(el('button', { className: 'ef-btn ef-btn-primary', type: 'button', textContent: 'Start Exploring →', onclick: closeModal }));
+    }
+
+    pw.onkeydown = function (e) { if (e.key === 'Enter') apply(); };
+    m.foot.appendChild(el('button', { className: 'ef-btn ef-btn-ghost', type: 'button', textContent: '‹ Back', onclick: function () { stepSelectTier(m); } }));
+    m.foot.appendChild(el('button', { className: 'ef-btn ef-btn-primary', type: 'button', textContent: 'Apply', onclick: apply }));
+    setTimeout(function () { u.focus(); }, 60);
+  }
+
   function stepSuccess(m, scheme, token, user, identifier) {
     m.setTitle('🎉 Welcome!');
     clear(m.body); clear(m.foot);
@@ -519,9 +702,9 @@ const QUICK_LOGIN_JS = `
         }
         try { window.localStorage.removeItem('authorized'); } catch (e) {}
         closeModal();
-        var t = openModal('🚪 Logged Out');
-        t.body.appendChild(el('div', { className: 'ef-success', textContent: 'All authorization schemes cleared.' }));
-        t.foot.appendChild(el('button', { className: 'ef-btn ef-btn-primary', type: 'button', textContent: 'Close', onclick: closeModal }));
+        // Back to the Token modal, which now shows its empty state — the
+        // clearing is visible as a result rather than asserted in a toast.
+        startShowToken();
       } catch (err) {
         showErr(errBox, 'Logout error: ' + (err.message || err));
       }
@@ -680,12 +863,58 @@ const QUICK_LOGIN_JS = `
           } catch (e) { fail(); }
         };
         copyRow.appendChild(copyBtn);
+
+        // Clear THIS scheme only. The reason Logout moved in here: it clears
+        // everything, and "everything" is rarely what you want when three
+        // tiers are live and one has expired.
+        var rmBtn = el('button', { className: 'ef-btn ef-btn-ghost ef-btn-danger-ghost', type: 'button', textContent: '✕ Remove' });
+        rmBtn.onclick = function () {
+          try {
+            window.ui.authActions.logout([scheme]);
+            startShowToken();
+          } catch (e) {
+            card.appendChild(el('div', { className: 'ef-error', textContent: 'Could not clear ' + scheme + ': ' + (e.message || e) }));
+          }
+        };
+        copyRow.appendChild(rmBtn);
         card.appendChild(copyRow);
 
         m.body.appendChild(card);
       });
     }
 
+    // Basic is a credential too, and it was invisible here while it lived
+    // behind the Authorize dialog. Username shown, password never.
+    var basic = auth && auth.basicIntegration && auth.basicIntegration.value;
+    if (basic) {
+      var bcard = el('div', { className: 'ef-scheme-card' });
+      var bhead = el('h4');
+      bhead.appendChild(document.createTextNode('basicIntegration'));
+      bhead.appendChild(pillWithDot('active', false));
+      bcard.appendChild(bhead);
+      var bkv = el('div', { className: 'ef-kv' });
+      bkv.appendChild(el('b', { textContent: 'username' }));
+      bkv.appendChild(el('span', { textContent: basic.username || '—' }));
+      bkv.appendChild(el('b', { textContent: 'password' }));
+      bkv.appendChild(el('span', { textContent: '•••••••• (never displayed)' }));
+      bkv.appendChild(el('b', { textContent: 'scope' }));
+      bkv.appendChild(el('span', { textContent: '/integration/v1/* only' }));
+      bcard.appendChild(bkv);
+      var brow = el('div', { className: 'ef-copy-row' });
+      var brm = el('button', { className: 'ef-btn ef-btn-ghost ef-btn-danger-ghost', type: 'button', textContent: '✕ Remove' });
+      brm.onclick = function () {
+        try { window.ui.authActions.logout(['basicIntegration']); startShowToken(); } catch (e) {}
+      };
+      brow.appendChild(brm);
+      bcard.appendChild(brow);
+      m.body.appendChild(bcard);
+    }
+
+    var anyCred = present.length > 0 || !!basic;
+
+    if (anyCred) {
+      m.foot.appendChild(el('button', { className: 'ef-btn ef-btn-danger', type: 'button', textContent: '🚪 Clear all', onclick: startLogout }));
+    }
     m.foot.appendChild(el('button', { className: 'ef-btn ef-btn-primary', type: 'button', textContent: 'Close', onclick: closeModal }));
   }
 
@@ -974,6 +1203,212 @@ const QUICK_LOGIN_JS = `
     observer.observe(root, { childList: true, subtree: true });
   }
 
+  // ── Sidebar rail: sections + tier filter ──────────────────────────
+  //
+  // Both are derived from ONE source — the tag names, which openapi-autogen
+  // mints as "Tier - Section" (see inferTag). So a new route group appears in
+  // the rail and in the filter without either being edited.
+  var EF_TIER_LS_KEY = 'ef-swagger-tiers';
+  var EF_RAIL_ID = 'ef-rail';
+
+  // The declared taxonomy, in the order openapi.yaml lists it. Tag inference
+  // is per-path and produces junk tiers for one-off routes ("Openapi.json",
+  // "Book"), so anything not declared is folded into Other rather than
+  // becoming its own filter chip.
+  var EF_TIERS = ['Auth', 'Admin', 'Mobile', 'Client', 'Shared', 'Integration'];
+
+  function tierOf(tag) {
+    var i = tag.indexOf(' — ');
+    var t = i === -1 ? tag : tag.slice(0, i);
+    return EF_TIERS.indexOf(t) === -1 ? 'Other' : t;
+  }
+
+  function sectionOf(tag) {
+    var i = tag.indexOf(' — ');
+    return i === -1 ? tag : tag.slice(i + 3);
+  }
+
+  // Live from the DOM rather than the spec: these are the groups Swagger UI
+  // actually rendered, so the rail can never list a section that isn't there.
+  function tagNodes() {
+    return Array.prototype.slice.call(
+      document.querySelectorAll('.swagger-ui .opblock-tag'));
+  }
+
+  function tagNameOf(node) {
+    return (node.getAttribute('data-tag') || node.textContent || '').trim();
+  }
+
+  function hiddenTiers() {
+    try {
+      var raw = window.localStorage.getItem(EF_TIER_LS_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch (e) { return []; }
+  }
+
+  function setHiddenTiers(list) {
+    try { window.localStorage.setItem(EF_TIER_LS_KEY, JSON.stringify(list)); } catch (e) {}
+    applyTierFilter();
+  }
+
+  // Hides the whole group: the tag header AND the operations under it. Swagger
+  // UI keeps them as siblings, not children, so both have to be walked.
+  function applyTierFilter() {
+    var hidden = hiddenTiers();
+    tagNodes().forEach(function (node) {
+      var off = hidden.indexOf(tierOf(tagNameOf(node))) !== -1;
+      node.style.display = off ? 'none' : '';
+      var sib = node.nextElementSibling;
+      while (sib && !sib.classList.contains('opblock-tag')) {
+        sib.style.display = off ? 'none' : '';
+        sib = sib.nextElementSibling;
+      }
+    });
+    var rail = document.getElementById(EF_RAIL_ID);
+    if (rail) {
+      Array.prototype.slice.call(rail.querySelectorAll('[data-ef-tier]')).forEach(function (a) {
+        a.style.display = hidden.indexOf(a.getAttribute('data-ef-tier')) !== -1 ? 'none' : '';
+      });
+      Array.prototype.slice.call(rail.querySelectorAll('[data-ef-grp]')).forEach(function (g) {
+        g.style.display = hidden.indexOf(g.getAttribute('data-ef-grp')) !== -1 ? 'none' : '';
+      });
+    }
+  }
+
+  function buildRail() {
+    var nodes = tagNodes();
+    if (!nodes.length) return false;
+
+    var existing = document.getElementById(EF_RAIL_ID);
+    if (existing) existing.remove();
+
+    var rail = el('nav', { id: EF_RAIL_ID, className: 'ef-rail' });
+
+    // ── Tier filter ──
+    var seen = [];
+    nodes.forEach(function (n) {
+      var t = tierOf(tagNameOf(n));
+      if (t && seen.indexOf(t) === -1) seen.push(t);
+    });
+    var tiers = EF_TIERS.filter(function (t) { return seen.indexOf(t) !== -1; });
+    if (seen.indexOf('Other') !== -1) tiers.push('Other');
+
+    var hidden = hiddenTiers();
+    rail.appendChild(el('div', { className: 'ef-rail-grp', textContent: 'Tier' }));
+    var filter = el('div', { className: 'ef-rail-filter' });
+    tiers.forEach(function (t) {
+      var on = hidden.indexOf(t) === -1;
+      var chip = el('button', { className: 'ef-tier-chip' + (on ? ' on' : ''), type: 'button', textContent: t });
+      chip.onclick = function () {
+        var h = hiddenTiers();
+        var i = h.indexOf(t);
+        if (i === -1) h.push(t); else h.splice(i, 1);
+        setHiddenTiers(h);
+        chip.className = 'ef-tier-chip' + (h.indexOf(t) === -1 ? ' on' : '');
+      };
+      filter.appendChild(chip);
+    });
+    rail.appendChild(filter);
+
+    var all = el('button', { className: 'ef-rail-all', type: 'button', textContent: 'Show all tiers' });
+    all.onclick = function () { setHiddenTiers([]); buildRail(); };
+    rail.appendChild(all);
+
+    // ── Sections, grouped by tier ──
+    // Sorted by tier so each heading appears once. Swagger renders tags
+    // alphabetically, which interleaves tiers and would repeat every heading.
+    nodes = nodes.slice().sort(function (a, b) {
+      var ta = tiers.indexOf(tierOf(tagNameOf(a)));
+      var tb = tiers.indexOf(tierOf(tagNameOf(b)));
+      if (ta !== tb) return ta - tb;
+      return tagNameOf(a).localeCompare(tagNameOf(b));
+    });
+
+    var lastTier = null;
+    nodes.forEach(function (n) {
+      var tag = tagNameOf(n);
+      var tier = tierOf(tag);
+      if (tier !== lastTier) {
+        rail.appendChild(el('div', { className: 'ef-rail-grp', 'data-ef-grp': tier, textContent: tier }));
+        lastTier = tier;
+      }
+      var a = el('a', { className: 'ef-rail-link', 'data-ef-tier': tier, textContent: sectionOf(tag) });
+      a.href = '#';
+      a.onclick = function (e) {
+        e.preventDefault();
+        n.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        // Collapsed groups scroll to a header that shows nothing; open it.
+        if (n.getAttribute('data-is-open') === 'false') n.click();
+      };
+      rail.appendChild(a);
+    });
+
+    document.body.appendChild(rail);
+    applyTierFilter();
+    return true;
+  }
+
+  // Swagger UI re-renders the operation list on filter/expand, which drops the
+  // rail's targets. Rebuild on mutation, debounced so a burst costs one pass.
+  function watchRail() {
+    var root = document.querySelector('#swagger-ui') || document.body;
+    var t = null;
+    new MutationObserver(function () {
+      clearTimeout(t);
+      t = setTimeout(function () {
+        var rail = document.getElementById(EF_RAIL_ID);
+        var n = tagNodes().length;
+        if (!n) return;
+        if (!rail || rail.querySelectorAll('.ef-rail-link').length !== n) buildRail();
+        else applyTierFilter();
+      }, 250);
+    }).observe(root, { childList: true, subtree: true });
+  }
+
+  function tryBuildRail(retries) {
+    if (buildRail()) { watchRail(); return; }
+    if (retries > 0) setTimeout(function () { tryBuildRail(retries - 1); }, 400);
+  }
+
+  // ── Masthead wordmark ─────────────────────────────────────────────
+  // The same base64 asset docs/CLIENT_API_INTEGRATION.html uses, so the
+  // Partner guide and this reference read as one product.
+  //
+  // The artwork is cyan + WHITE on transparency (drawn for the CRM's dark
+  // sidebar), so on this light ground the white half would vanish. It gets an
+  // ink plaque, exactly as the Partner guide does — a CSS filter would darken
+  // the white and drag the cyan off-brand at the same time.
+  var EF_WORDMARK = 'data:image/png;base64,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';
+
+  function mountWordmark() {
+    var title = document.querySelector('.swagger-ui .info .title');
+    if (!title || title.querySelector('.ef-wordmark')) return false;
+    var img = document.createElement('img');
+    img.className = 'ef-wordmark';
+    img.src = EF_WORDMARK;
+    img.alt = 'EasyFix';
+    // Replaces the word "EasyFix" in the heading so it reads as one lockup:
+    // [EasyFix] Backend API. alt keeps the heading a sentence for screen
+    // readers, which a decorative logo beside the text would not.
+    var walker = document.createTreeWalker(title, NodeFilter.SHOW_TEXT, null);
+    var node;
+    while ((node = walker.nextNode())) {
+      var i = node.nodeValue.indexOf('EasyFix');
+      if (i === -1) continue;
+      var after = node.splitText(i);
+      after.nodeValue = after.nodeValue.slice('EasyFix'.length);
+      node.parentNode.insertBefore(img, after);
+      return true;
+    }
+    title.insertBefore(img, title.firstChild);
+    return true;
+  }
+
+  function tryMountWordmark(retries) {
+    if (mountWordmark()) return;
+    if (retries > 0) setTimeout(function () { tryMountWordmark(retries - 1); }, 300);
+  }
+
   function ready() {
     if (!window.ui || typeof window.ui.preauthorizeApiKey !== 'function') {
       return setTimeout(ready, 300);
@@ -982,14 +1417,21 @@ const QUICK_LOGIN_JS = `
 
     injectStyles();
 
-    document.body.appendChild(makeBtn({ id: 'ef-quick-login-btn',  text: '🔑 Quick Login', title: 'OTP login → auto-fills Authorize',     variant: 'ef-cta-login',  right: 290, onClick: startQuickLogin }));
-    document.body.appendChild(makeBtn({ id: 'ef-show-token-btn',   text: '📋 Token',       title: 'Decode and inspect the current JWT(s)', variant: 'ef-cta-token',  right: 156, onClick: startShowToken  }));
-    document.body.appendChild(makeBtn({ id: 'ef-quick-logout-btn', text: '🚪 Logout',      title: 'Clear every Bearer + Basic scheme',     variant: 'ef-cta-logout', right: 24,  onClick: startLogout     }));
+    // Two buttons, not three. Logout moved INTO the Token modal: it is an
+    // operation on tokens, it belongs beside the tokens it clears, and the
+    // Token modal is the only place that can offer clearing one at a time.
+    document.body.appendChild(makeBtn({ id: 'ef-quick-login-btn',  text: '🔑 Quick Login', title: 'Pick an environment and tier, then authenticate', variant: 'ef-cta-login',  right: 156, onClick: startQuickLogin }));
+    document.body.appendChild(makeBtn({ id: 'ef-show-token-btn',   text: '📋 Token',       title: 'Inspect, clear one, or clear every credential',   variant: 'ef-cta-token',  right: 24,  onClick: startShowToken  }));
 
     // Kick off the JWT-tab + comparison-table mount + observer for
     // re-render survival. Self-bails out cleanly if markers absent.
     tryInitJwtTabs(15);
     watchInfoRerenders();
+    tryBuildRail(20);
+    tryMountWordmark(15);
+    // Re-apply the saved environment on load so the server selector and
+    // Quick Login agree before anyone touches either.
+    setTimeout(function () { syncSwaggerServer(selectedEnv().url); }, 600);
   }
 
   if (document.readyState === 'loading') {
@@ -1199,6 +1641,85 @@ const SWAGGER_THEME_CSS = [
   '.swagger-ui .auth-btn-wrapper .authorize{background:linear-gradient(135deg,#10b981 0%,#059669 100%)!important;color:#fff!important;border:none!important;border-radius:9px!important;padding:9px 20px!important;font-weight:800!important;box-shadow:0 4px 12px rgba(16,185,129,.35),inset 0 -1px 0 rgba(0,0,0,.1)!important;transition:all .15s ease}',
   '.swagger-ui .auth-btn-wrapper .authorize:hover{transform:translateY(-2px);box-shadow:0 8px 20px rgba(16,185,129,.5),inset 0 -1px 0 rgba(0,0,0,.1)!important}',
   '.swagger-ui .auth-btn-wrapper .btn-done svg,.swagger-ui .auth-btn-wrapper .authorize svg{display:none}',
+  // ══ Enterprise restyle — mirrors docs/CLIENT_API_INTEGRATION.html ══
+  // Same tokens as the Partner API guide so the two docs read as one product.
+  ':root{--ef-ground:#FBFAF9;--ef-surface:#FFFFFF;--ef-surface-alt:#F5F1F1;--ef-ink:#1A1618;--ef-ink-muted:#6B6167;--ef-ink-faint:#938A8E;--ef-rule:#E6DEDF;--ef-accent:#C42430;--ef-accent-soft:#FBEDEE;--ef-sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;--ef-mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace}',
+
+  // Flat paper ground, not the old three-stop gradient — the reference reads
+  // as a document, and a gradient behind dense tables reads as a dashboard.
+  // color-scheme:light is load-bearing, not cosmetic. swagger-ui ships no dark
+  // theme, so on a dark-mode browser the UA paints the root dark and renders
+  // form controls and scrollbars dark while every swagger surface stays light
+  // — the page comes out half-inverted. Declaring the scheme stops the UA
+  // theming rather than fighting it rule by rule.
+  // (The Partner guide DOES have a real dark mode; porting it here means
+  // theming swagger-ui's own components, which is its own piece of work.)
+  ':root{color-scheme:light}',
+  // !important is required, not sloppy: swagger-ui 5 ships its own
+  // @media(prefers-color-scheme:dark) block, and a media-query rule at equal
+  // specificity wins on source order. On a dark-mode browser that block paints
+  // .swagger-ui #1C2022 while every surface WE style stays paper — the page
+  // renders half-inverted, which is exactly what it did before this line.
+  'html{background:var(--ef-ground)!important}',
+  '.swagger-ui{background:var(--ef-ground)!important}',
+  '@media(prefers-color-scheme:dark){html,body,.swagger-ui{background:var(--ef-ground)!important;color:var(--ef-ink)!important}',
+  '.swagger-ui .opblock,.swagger-ui .opblock-tag,.swagger-ui table,.swagger-ui .model-box{background:var(--ef-surface)!important;color:var(--ef-ink)!important}',
+  '.swagger-ui .info .title,.swagger-ui .info p,.swagger-ui .info li,.swagger-ui table td,.swagger-ui table th{color:var(--ef-ink)!important}}',
+  'body{background:var(--ef-ground)!important;font-family:var(--ef-sans)!important;color:var(--ef-ink)!important;-webkit-font-smoothing:antialiased}',
+  '.swagger-ui,.swagger-ui .info,.swagger-ui .opblock-tag{font-family:var(--ef-sans)!important;color:var(--ef-ink)}',
+  '.swagger-ui .info .title{letter-spacing:-.025em!important;color:var(--ef-ink)!important;background:none!important;-webkit-text-fill-color:var(--ef-ink)!important}',
+
+  // Rail occupies the left gutter; content is pushed, not overlapped.
+  '@media(min-width:1180px){.swagger-ui .wrapper{max-width:1180px!important;padding-left:264px!important}}',
+
+  // ── Index rail ──
+  // Independent scroll: own max-height + overscroll-behavior:contain, so the
+  // page does not scroll when the rail reaches its end.
+  '.ef-rail{position:fixed;top:96px;left:max(16px,calc(50vw - 590px));width:232px;max-height:calc(100vh - 128px);overflow-y:auto;overscroll-behavior:contain;padding-right:8px;font-size:.86rem;z-index:40;scrollbar-width:thin;scrollbar-color:var(--ef-rule) transparent}',
+  '.ef-rail::-webkit-scrollbar{width:8px}',
+  '.ef-rail::-webkit-scrollbar-thumb{background:var(--ef-rule);border-radius:4px}',
+  '.ef-rail::-webkit-scrollbar-track{background:transparent}',
+  '@media(max-width:1179px){.ef-rail{display:none}}',
+  '.ef-rail-grp{font-family:var(--ef-mono);font-size:.66rem;letter-spacing:.13em;text-transform:uppercase;color:var(--ef-ink-faint);margin:20px 0 6px}',
+  '.ef-rail-grp:first-child{margin-top:0}',
+  '.ef-rail-link{display:block;padding:3px 10px;color:var(--ef-ink-muted);text-decoration:none;border-left:2px solid var(--ef-rule);transition:color .12s,border-color .12s;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+  '.ef-rail-link:hover{color:var(--ef-accent);border-left-color:var(--ef-accent)}',
+
+  // ── Tier filter (multi-select) ──
+  '.ef-rail-filter{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px}',
+  '.ef-tier-chip{font-family:var(--ef-sans);font-size:11px;font-weight:600;padding:3px 9px;border-radius:999px;border:1.5px solid var(--ef-rule);background:transparent;color:var(--ef-ink-faint);cursor:pointer;transition:all .12s}',
+  '.ef-tier-chip:hover{border-color:var(--ef-accent);color:var(--ef-accent)}',
+  '.ef-tier-chip.on{background:var(--ef-accent-soft);border-color:var(--ef-accent);color:var(--ef-accent)}',
+  '.ef-rail-all{font-family:var(--ef-sans);font-size:11px;color:var(--ef-ink-faint);background:none;border:0;padding:0 0 4px;cursor:pointer;text-decoration:underline}',
+  '.ef-rail-all:hover{color:var(--ef-accent)}',
+
+  // ── Built-in Authorize: removed ──
+  // Everything it offered now lives in Quick Login, including Basic. Two doors
+  // to one room is how a user ends up authorised in the wrong scheme.
+  '.swagger-ui .auth-wrapper{display:none!important}',
+
+  // ── Operation blocks — flatten to the reference's paper look ──
+  '.swagger-ui .opblock{border-radius:10px!important;border:1px solid var(--ef-rule)!important;box-shadow:none!important;background:var(--ef-surface)!important;margin:0 0 10px!important}',
+  '.swagger-ui .opblock .opblock-summary{border-color:var(--ef-rule)!important}',
+  '.swagger-ui .opblock-tag{font-size:1.05rem!important;font-weight:650!important;letter-spacing:-.01em;color:var(--ef-ink)!important;border-bottom:1px solid var(--ef-rule)!important}',
+  '.swagger-ui .opblock-summary-path,.swagger-ui .opblock-summary-path__deprecated{font-family:var(--ef-mono)!important;font-size:13px!important}',
+  '.swagger-ui .btn.execute{background:var(--ef-accent)!important;border-color:var(--ef-accent)!important;border-radius:8px!important}',
+  '.swagger-ui .btn.execute:hover{background:#A71F29!important;border-color:#A71F29!important}',
+  '.swagger-ui .filter .operation-filter-input{border:1.5px solid var(--ef-rule)!important;border-radius:9px!important;font-family:var(--ef-sans)!important}',
+  '.swagger-ui .filter .operation-filter-input:focus{border-color:var(--ef-accent)!important;outline:none!important}',
+
+  // ── Masthead ──
+  '.swagger-ui .info .title{display:flex;align-items:center;flex-wrap:wrap;gap:.06em .3em;font-size:clamp(2rem,4.4vw,3rem)!important;line-height:1.05!important}',
+  '.ef-wordmark{height:.82em;width:auto;background:var(--ef-ink);padding:.16em .24em;border-radius:.14em;box-sizing:content-box}',
+  '.swagger-ui .info .title small{display:none!important}',
+  '.swagger-ui .info{margin:0 0 28px!important;padding:56px 0 36px!important;border-bottom:2px solid var(--ef-ink)!important;background:none!important;box-shadow:none!important;border-radius:0!important}',
+  '.swagger-ui .info .description{color:var(--ef-ink-muted)!important}',
+  '.swagger-ui .info hgroup.main{margin:0!important}',
+  // The old hero card decorated .info with a 6px rainbow bar (::before) and a
+  // violet radial wash (::after). Both belonged to the gradient treatment this
+  // restyle replaced; left in place they read as artefacts on paper.
+  '.swagger-ui .info::before,.swagger-ui .info::after{display:none!important;content:none!important}',
+  '.swagger-ui .scheme-container{background:none!important;box-shadow:none!important;padding:0 0 24px!important;border-bottom:1px solid var(--ef-rule)!important;margin-bottom:24px!important}',
 ].join('');
 
 /*
