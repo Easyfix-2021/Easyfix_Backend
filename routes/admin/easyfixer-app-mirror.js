@@ -139,9 +139,22 @@ router.get('/:efrId/mirror/*', mirrorLimiter, async (req, res, next) => {
     /* ── Gate 2: path allowlist ───────────────────────────────────────────
      * Taken from req.path (raw, still percent-encoded) rather than
      * req.params[0] (which Express has already decoded) so the mobile router
-     * decodes exactly once, as it would for a real phone. */
+     * decodes exactly once, as it would for a real phone.
+     *
+     * The leading '/mobile' is then stripped. The app builds every request as
+     * <base> + '/mobile/...' — all 83 of them — because on a phone <base> is
+     * '<host>/api' and the mobile router is mounted at '/api/mobile'. Point
+     * that same client at this proxy and the '/mobile' rides along into the
+     * captured path, so what arrives here is '/mobile/registration/status'
+     * where both the allowlist and the mobile ROUTER want '/registration/
+     * status' — the router is invoked mounted, so a path carrying its own
+     * mount prefix matches nothing.
+     *
+     * Stripped once, unanchored to nothing else: '/mobile/mobile/jobs' becomes
+     * '/mobile/jobs', which the allowlist then refuses, as it should. */
     const marker = req.path.indexOf('/mirror/');
-    const subPath = marker === -1 ? '' : req.path.slice(marker + '/mirror'.length);
+    const raw = marker === -1 ? '' : req.path.slice(marker + '/mirror'.length);
+    const subPath = raw.startsWith('/mobile/') ? raw.slice('/mobile'.length) : raw;
     if (!isAllowedMirrorPath(subPath)) {
       logger.warn('App mirror path refused · efrId=' + efrId + ' · path=' + subPath);
       return modernError(res, 404, 'not found');

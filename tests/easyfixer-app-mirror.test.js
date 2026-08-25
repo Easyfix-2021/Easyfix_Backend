@@ -211,6 +211,38 @@ test('a successful GET returns the mobile envelope with NO second wrapper', asyn
   );
 });
 
+test('the path the APP actually sends — /mobile-prefixed — reaches the handler', async () => {
+  /*
+   * THE SHAPE THE CLIENT REALLY USES.
+   *
+   * Every other test here calls mirror(EFR_ID, '/experience'), i.e. the path
+   * already stripped of its mount prefix. The technician app does not send
+   * that. On a phone its base URL is '<host>/api' and the mobile router is
+   * mounted at '/api/mobile', so all 83 of its request paths are written
+   * '/mobile/...'. Pointed at this proxy, that prefix rides along into the
+   * captured path.
+   *
+   * So the real client sent '/mirror/mobile/experience' while every test
+   * asserted on '/mirror/experience' — and the suite was fully green while the
+   * mirrored app rendered an error screen on its first request. This test
+   * exists so the client's own shape is covered, not just the server's
+   * internal one.
+   */
+  scopeForRequest = allow(EFR_CITY);
+  const { status, body } = await mirror(EFR_ID, '/mobile/experience');
+  assert.equal(status, 200, JSON.stringify(body));
+  assert.deepEqual(body.data, EXPERIENCE_ROWS, 'the /mobile prefix must be stripped, not 404d');
+});
+
+test('the prefix is stripped exactly once — /mobile/mobile/... stays refused', async () => {
+  // The strip must not become a loop, or a caller could walk back to any path
+  // by repeating the prefix. One strip, then the allowlist decides.
+  scopeForRequest = allow(EFR_CITY);
+  const { status } = await mirror(EFR_ID, '/mobile/mobile/experience');
+  assert.equal(status, 404, 'a doubled prefix is off the allowlist');
+  assert.equal(mintedTokens.length, 0, 'refused before any token is minted');
+});
+
 test('the minted JWT appears nowhere in the response', async () => {
   /*
    * THE test. Everything else is a policy that can be re-argued; this one is
