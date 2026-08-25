@@ -318,15 +318,47 @@ async function searchByJobId(jobId, efrId) {
  * only post locations for their own active jobs. The point-in-time
  * checkin_gps_location on tbl_job is unaffected — this is the continuous trail.
  */
+/*
+ * Statuses a location ping is accepted for — the window from the technician
+ * ACCEPTING the job to finishing it.
+ *
+ * ─── WHY AN ALLOWLIST AND NOT `status < 3` ─────────────────────────────────
+ *
+ * A 409 here is not a soft failure: the app's background task treats it as
+ * "stop tracking" and self-terminates (src/lib/native/backgroundLocation.ts).
+ * That is the ONLY stop that works while the app is backgrounded with no
+ * screen mounted, so every terminal state MUST still 409. A range check would
+ * quietly admit any future status numbered below the terminal ones and break
+ * that guarantee without anyone noticing.
+ *
+ * SCHEDULED (1) is the accept→check-in window: the technician has taken the
+ * job and is travelling to it. It used to be rejected, which is why the CRM
+ * trail was empty for exactly the period an operator most wants it.
+ *
+ * IN_PROGRESS_ALT (20) is a genuine checked-in state (jobService's
+ * CHECKED_IN_STATES pairs it with 2), and the CRM has always offered the Live
+ * Location button for it — so a strict `!== 2` meant an operator could open a
+ * popover for a status-20 job whose pings the server was rejecting, and that
+ * 409 permanently killed the technician's tracker. Fixed here.
+ *
+ * DELIBERATELY EXCLUDED: ESTIMATE_PENDING_APPROVAL (15) and ON_HOLD (21).
+ * Both are real mid-job pauses, and both therefore stop tracking for good —
+ * a job that returns 21 → 2 only resumes when a screen mounts. That is the
+ * pre-existing behaviour for every non-2 status, not a regression, and
+ * widening it is a product decision about whether to track a technician who
+ * is not working.
+ */
+const LOCATION_PING_STATES = new Set([
+  jobService.STATUS.SCHEDULED,      // 1  — accepted, travelling
+  jobService.STATUS.IN_PROGRESS,    // 2  — checked in, working
+  jobService.STATUS.IN_PROGRESS_ALT, // 20 — the other checked-in state
+]);
+
 async function recordLocationPing(jobId, efrId, ping) {
   logger.info('Record location ping · jobId=' + jobId);
   const job = await getOwnedJob(jobId, efrId); // 404 if not the tech's job
-  // Only accept pings while the job is IN_PROGRESS (status 2). Once it leaves
-  // that state (completed/revisit/cancelled), return 409 — the app's background
-  // tracking task treats a 409 as "stop tracking", so it self-terminates the
-  // moment the job ends even if the app is backgrounded with no screen mounted.
-  if (Number(job.job_status) !== 2) {
-    logger.warn('Location ping rejected, job not in progress · jobId=' + jobId + ' status=' + job.job_status);
+  if (!LOCATION_PING_STATES.has(Number(job.job_status))) {
+    logger.warn('Location ping rejected, job outside tracking window · jobId=' + jobId + ' status=' + job.job_status);
     const e = new Error('job not in progress'); e.status = 409; throw e;
   }
   return jobLocation.addPing(jobId, efrId, ping);
