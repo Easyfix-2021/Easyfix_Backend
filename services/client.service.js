@@ -276,6 +276,18 @@ const CLIENT_INSERT_MAP = {
   client_type:        (b) => b.clientType ?? 'b2b',
   reference_code:     (b) => b.referenceCode ?? null,
   client_status:      ()  => 1,
+  /*
+   * Presentation names — how this client reads on each surface. All three
+   * stay NULL when unset and every consumer COALESCEs to client_name, so an
+   * unconfigured client renders exactly as it always has. billing_name is a
+   * pre-existing legacy column (ClientDaoImpl#updateClient writes it, the
+   * invoice module reads it as setInvoiceName); display_name and
+   * tech_app_name arrive with migrations/2026-08-25-client-profile-names.sql
+   * and are skipped by the column probe until it is applied.
+   */
+  display_name:       (b) => b.displayName ?? null,
+  billing_name:       (b) => b.billingName ?? null,
+  tech_app_name:      (b) => b.techAppName ?? null,
   // address parts
   building:           (b) => b.building ?? null,
   landmark:           (b) => b.landmark ?? null,
@@ -350,6 +362,12 @@ const UPDATE_ALLOWED = [
   // master
   'client_name', 'client_email', 'client_address', 'client_status',
   'client_type', 'reference_code',
+  // presentation names (see CLIENT_INSERT_MAP)
+  'display_name', 'billing_name', 'tech_app_name',
+  // billing terms — pre-existing legacy columns, surfaced by the Client
+  // Profile "Account & Payment" section. billing_raised is the legacy
+  // 0/1 "do we invoice this client" flag.
+  'billing_raised', 'billing_cycle', 'billing_start_date',
   // address parts
   'building', 'landmark', 'client_city_id', 'client_pincode',
   // commercial config
@@ -375,6 +393,14 @@ const CAMEL_TO_SNAKE = {
   clientStatus: 'client_status',
   clientType: 'client_type',
   referenceCode: 'reference_code',
+  // presentation names
+  displayName: 'display_name',
+  billingName: 'billing_name',
+  techAppName: 'tech_app_name',
+  // billing terms
+  billingRaised: 'billing_raised',
+  billingCycle: 'billing_cycle',
+  billingStartDate: 'billing_start_date',
   // address parts
   building: 'building',
   landmark: 'landmark',
@@ -422,6 +448,14 @@ async function updateClient(clientId, body, actorId) {
     // CSV serialise array values for `reporting_contact_ids`.
     let outVal = val;
     if (col === 'reporting_contact_ids' && Array.isArray(val)) outVal = val.join(',');
+    /*
+     * '' is a valid value for every text column here but NOT for a DATE:
+     * MySQL stores it as the zero date '0000-00-00' under a lax sql_mode and
+     * rejects the whole UPDATE under STRICT. Clearing the field has to mean
+     * NULL. The Joi schema already allows '' so the FE can send "cleared"
+     * without a second shape.
+     */
+    if (col === 'billing_start_date' && outVal === '') outVal = null;
     sets.push(`${col} = ?`);
     vals.push(outVal);
   }

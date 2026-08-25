@@ -46,10 +46,28 @@ router.post('/auth/verify-otp', validate(Joi.object({
     const r = await clientAuth.verifyLoginOtp(req.body.identifier, req.body.otp);
     if (!r.ok) {
       logger.warn('SPOC verify-OTP rejected · ' + r.reason);
-      if (r.reason === 'CLIENT_INACTIVE') {
-        return modernError(res, 403, 'This client account is inactive. Please contact your EasyFix SPOC.');
-      }
-      return modernError(res, 401, r.reason);
+      /*
+       * Reason codes are for the LOG. Users get a sentence.
+       *
+       * This route used to `return modernError(res, 401, r.reason)`, which put
+       * the bare code on screen — a mistyped OTP read "OTP_MISMATCH", and an
+       * unregistered identifier read "USER_NOT_FOUND". Same map shape as
+       * routes/auth.js#verify-otp, which has translated the CRM login's codes
+       * since it shipped; this one was simply never given the same treatment.
+       *
+       * USER_NOT_FOUND is now mostly unreachable from the web + mobile clients
+       * (both stop at login-otp's `delivered:false`), but it still fires for a
+       * SPOC deactivated BETWEEN the two steps, and for any direct API caller.
+       */
+      const REASON_MESSAGES = {
+        CLIENT_INACTIVE: [403, 'This client account is inactive. Please contact your EasyFix SPOC.'],
+        USER_NOT_FOUND:  [401, "This email or mobile isn't registered. Check with your EasyFix contact."],
+        NO_OTP_ISSUED:   [400, 'No active code — please request a new one.'],
+        OTP_EXPIRED:     [401, 'That code has expired — please request a new one.'],
+        OTP_MISMATCH:    [401, 'Incorrect code. Please check and try again.'],
+      };
+      const [status, message] = REASON_MESSAGES[r.reason] || [401, 'We could not sign you in. Please try again.'];
+      return modernError(res, status, message);
     }
     logger.info('SPOC verify-OTP ok · spocId=' + r.spoc.id + ' clientId=' + r.spoc.client_id);
     // Cookie name matches the frontend localStorage key (`client_auth_token`)
@@ -3200,6 +3218,323 @@ router.post('/contacts/bulk-upload', contactUpload.single('file'), async (req, r
     modernOk(res, { summary, results });
   } catch (e) {
     if (e.code === 'LIMIT_FILE_SIZE') return modernError(res, 400, 'file exceeds 10MB');
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
+
+/* ═══ Client Profile — the SPOC's OWN company ═══════════════════════════════
+ *
+ * Everything under /api/client/company is scoped to req.spoc.client_id and
+ * NEVER takes a client id from the caller. That is the whole security model
+ * here: a SPOC cannot address another tenant's row because there is no
+ * parameter through which to name one.
+ *
+ * ─── WHY MOST OF THE MASTER IS READ-ONLY ────────────────────────────────────
+ * tbl_client carries two very different kinds of field:
+ *   • The client's OWN facts — registered address, contact email, the name
+ *     they want on an invoice, their KYC documents. Theirs to correct, and
+ *     making them raise a ticket to fix a typo in their own address is the
+ *     kind of friction this portal exists to remove.
+ *   • EasyFix's COMMERCIAL CONFIG — collected_by (which party collects on a
+ *     job), booking_cut_off (dispatch lead time), client_type, reference_code
+ *     (which resolves their public booking link), max_orders, travel_distance,
+ *     monthly_revenue, and the invoice cycle. These are negotiated terms and
+ *     operational settings. A tenant editing them would be changing how
+ *     EasyFix dispatches and bills, from the outside.
+ * So COMPANY_WRITABLE is an ALLOWLIST, not a denylist: a column added to
+ * tbl_client tomorrow is read-only here by default, which is the safe way for
+ * that mistake to go.
+ *
+ * ─── WHY allStores GATES THE WRITES ─────────────────────────────────────────
+ * The access model's surfaces (home / open / completed / performance /
+ * actions / invoicing) are all about ORDERS; none of them means "may speak for
+ * the company". `allStores` is the closest existing signal — it is what
+ * separates Senior Leader and Finance from a Store or Regional SPOC, i.e. the
+ * people who represent the whole client from the people who represent one
+ * site. Reusing it avoids widening SURFACES (which is the CRM's Client Role
+ * Access vocabulary and would need a role-config sweep to land).
+ * ponytail: allStores as the company-write gate; add a real 'profile' surface
+ * to SURFACES in client-access.service.js if this needs its own toggle.
+ */
+
+const clientDocsSvc = require('../../services/client-documents.service');
+const clientS3 = require('../../utils/s3-storage');
+
+const companyDocUpload = multerClientImg({
+  storage: multerClientImg.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024, files: 1 },
+});
+
+const COMPANY_DOC_MIME = new Set([
+  'image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf',
+]);
+const COMPANY_DOC_TYPES = ['pan', 'tan', 'gstin', 'aadhaar', 'other'];
+
+// paid_by / collected_by share one legacy code space.
+const PARTY_LABELS = { 0: 'Any (Operator Picks)', 1: 'Easyfixer', 2: 'EasyFix', 3: 'Client' };
+const party = (code) => (code == null || code === ''
+  ? null
+  : { code: Number(code), label: PARTY_LABELS[Number(code)] ?? `Code ${code}` });
+
+/*
+ * camelCase key → tbl_client column. Everything the portal may write, and
+ * nothing else. Values are passed to clientService.updateClient(), which
+ * applies its OWN whitelist + column probe on top — so this list can only
+ * ever be narrower than the admin surface, never wider.
+ */
+const COMPANY_WRITABLE = {
+  clientEmail: 'clientEmail',
+  clientAddress: 'clientAddress',
+  building: 'building',
+  landmark: 'landmark',
+  pincode: 'pincode',
+  billingName: 'billingName',
+};
+
+const companyUpdateBody = Joi.object({
+  clientEmail:   Joi.string().email().max(255).optional().allow('', null),
+  clientAddress: Joi.string().max(500).optional().allow('', null),
+  building:      Joi.string().max(200).optional().allow('', null),
+  landmark:      Joi.string().max(200).optional().allow('', null),
+  pincode:       Joi.string().pattern(/^[0-9]{6}$/).optional().allow('', null)
+    .messages({ 'string.pattern.base': 'Pincode must be 6 digits' }),
+  billingName:   Joi.string().max(255).optional().allow('', null),
+}).min(1);
+
+/** 403 unless this SPOC speaks for the whole client. See the header note. */
+function requireCompanyWrite(req, res) {
+  if (req.access && req.access.allStores) return true;
+  modernError(res, 403,
+    'Only a Senior Leader or Finance contact can change your company profile. Ask them, or your EasyFix SPOC.');
+  return false;
+}
+
+/*
+ * GET /api/client/company — the company profile.
+ *
+ * SELECT * then project in JS, deliberately: tbl_client is a legacy table whose
+ * column set differs between environments (display_name / tech_app_name arrive
+ * with migrations/2026-08-25-client-profile-names.sql; coupon_code and
+ * monthly_revenue are absent on older ones). A named SELECT would 1054 on the
+ * environments that are behind; projecting a row that came back whole cannot.
+ *
+ * `editable` ships WITH the payload so the UI never has to re-derive who may
+ * write what — one definition, and a UI that cannot drift out of step with the
+ * gate the PUT actually applies.
+ */
+router.get('/company', async (req, res, next) => {
+  try {
+    const clientId = req.spoc.client_id;
+    logger.info('Fetch client company profile · clientId=' + clientId);
+
+    const [[row]] = await pool.query(
+      `SELECT cl.*, ci.city_name
+         FROM tbl_client cl
+         LEFT JOIN tbl_city ci ON ci.city_id = cl.client_city_id
+        WHERE cl.client_id = ?`,
+      [clientId],
+    );
+    if (!row) return modernError(res, 404, 'client not found');
+
+    const canWrite = !!(req.access && req.access.allStores);
+    const str = (v) => (v == null || v === '' ? null : String(v));
+
+    modernOk(res, {
+      clientId: row.client_id,
+      clientName: str(row.client_name),
+      /*
+       * The three presentation names. Each falls back to client_name so an
+       * unconfigured client reads consistently everywhere rather than showing
+       * blanks — the fallback is the CONTRACT, not a UI nicety.
+       */
+      displayName: str(row.display_name) ?? str(row.client_name),
+      billingName: str(row.billing_name) ?? str(row.client_name),
+      techAppName: str(row.tech_app_name) ?? str(row.client_name),
+      clientType: str(row.client_type),
+      referenceCode: str(row.reference_code),
+      email: str(row.client_email),
+      address: str(row.client_address),
+      building: str(row.building),
+      landmark: str(row.landmark),
+      city: row.client_city_id ? { id: row.client_city_id, name: str(row.city_name) } : null,
+      pincode: str(row.client_pincode),
+      status: Number(row.client_status),
+
+      /* Commercial config — READ-ONLY, and labelled as EasyFix's to change. */
+      terms: {
+        // HOURS of lead time, not a clock time. job.service.js consumes it as
+        // hours; rendering it as "4:00 PM" anywhere would be a different number.
+        bookingCutOffHours: row.booking_cut_off == null ? null : Number(row.booking_cut_off),
+        collectedBy: party(row.collected_by),
+        paidBy: party(row.paid_by),
+        travelDistanceKm: row.travel_distance == null ? null : Number(row.travel_distance),
+        maxOrders: row.max_orders == null ? null : Number(row.max_orders),
+        /*
+         * The legacy "Invoice Details" block. `cycle` is a CSV of days of the
+         * month with 40 meaning "last day" — a STRING, despite the legacy Java
+         * model also declaring an unrelated int billingCycle.
+         */
+        invoicing: {
+          raised: Number(row.billing_raised) === 1,
+          cycle: str(row.billing_cycle),
+          startDate: row.billing_start_date || null,
+        },
+      },
+
+      /* KYC identifiers, on their legacy column names. */
+      kyc: {
+        cin: str(row.tan_number),          // legacy: "CIN NO" is stored in tan_number
+        pan: str(row.client_pan_number),
+        mouContact: str(row.client_aadhaar), // legacy: "MOU Contact" in client_aadhaar
+      },
+
+      createdAt: row.insert_date || null,
+      updatedAt: row.update_date || null,
+
+      /* Who may write what, resolved server-side. */
+      canEdit: canWrite,
+      editable: canWrite ? Object.keys(COMPANY_WRITABLE) : [],
+    });
+  } catch (e) { next(e); }
+});
+
+/*
+ * PUT /api/client/company — correct your own company's details.
+ *
+ * Delegates to clientService.updateClient(), the same writer the CRM uses, so
+ * the column probe and the '' → NULL date coercion apply identically. Unknown
+ * keys are rejected by Joi BEFORE they reach it: `stripUnknown` is deliberately
+ * NOT used, because silently dropping `collectedBy` would tell the caller their
+ * write succeeded.
+ */
+router.put('/company', validate(companyUpdateBody), async (req, res, next) => {
+  try {
+    if (!requireCompanyWrite(req, res)) return;
+    const clientId = req.spoc.client_id;
+
+    const payload = {};
+    for (const [key, mapped] of Object.entries(COMPANY_WRITABLE)) {
+      if (Object.prototype.hasOwnProperty.call(req.body, key)) payload[mapped] = req.body[key];
+    }
+    if (Object.keys(payload).length === 0) return modernError(res, 400, 'nothing to update');
+
+    logger.info('Update client company profile · clientId=' + clientId
+      + ' · spocId=' + req.spoc.id + ' · fields=' + Object.keys(payload).join(','));
+    const affected = await clientService.updateClient(clientId, payload, req.clientUser?.userId ?? null);
+    if (!affected) return modernError(res, 404, 'client not found');
+    modernOk(res, { updated: true });
+  } catch (e) {
+    if (e.status) {
+      logger.warn('Company profile update rejected · ' + e.message);
+      return modernError(res, e.status, e.message);
+    }
+    next(e);
+  }
+});
+
+/*
+ * GET /api/client/company/documents — the client's own KYC / brand files.
+ *
+ * Same tbl_client_document rows the CRM's checklist manages, scoped to this
+ * SPOC's client. Presigned URLs come back ready for <img>/<a href>, so the
+ * portal never needs a bearer on the file request itself.
+ *
+ * A missing table is not an error here: this portal predates client documents
+ * on some environments, and an empty checklist that says so beats a 503 that
+ * takes the whole profile page down.
+ */
+router.get('/company/documents', async (req, res, next) => {
+  try {
+    logger.info('List client company documents · clientId=' + req.spoc.client_id);
+    if (!(await clientDocsSvc.hasTable())) {
+      return modernOk(res, { items: [], provisioned: false, canEdit: !!(req.access && req.access.allStores) });
+    }
+    const rows = await clientDocsSvc.listForClient(req.spoc.client_id);
+    modernOk(res, {
+      items: rows,
+      provisioned: true,
+      canEdit: !!(req.access && req.access.allStores),
+    });
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
+/*
+ * POST /api/client/company/documents — upload one KYC / brand file.
+ *   multipart: file (required), docType (pan|tan|gstin|aadhaar|other), docLabel
+ */
+router.post('/company/documents', companyDocUpload.single('file'), async (req, res, next) => {
+  try {
+    if (!requireCompanyWrite(req, res)) return;
+    if (!req.file) return modernError(res, 400, 'missing "file" upload');
+    if (!COMPANY_DOC_MIME.has(req.file.mimetype)) {
+      return modernError(res, 400, `mimetype "${req.file.mimetype}" is not allowed; use PNG/JPEG/WEBP/GIF/PDF`);
+    }
+    const docType = String(req.body.docType || 'other').toLowerCase();
+    if (!COMPANY_DOC_TYPES.includes(docType)) {
+      return modernError(res, 400, 'docType must be pan|tan|gstin|aadhaar|other');
+    }
+    if (!clientS3.isEnabled()) {
+      return modernError(res, 503, 'File storage is not configured on this environment');
+    }
+    const s3Key = await clientS3.putClientDocument({
+      buffer: req.file.buffer,
+      contentType: req.file.mimetype,
+      originalName: req.file.originalname,
+    });
+    const documentId = await clientDocsSvc.recordUpload(req.spoc.client_id, {
+      docType,
+      docLabel: req.body.docLabel || null,
+      s3Key,
+      originalFilename: req.file.originalname,
+      contentType: req.file.mimetype,
+      // The tbl_user id carried in the SPOC's token, NOT req.spoc.id — that is
+      // a tbl_client_contacts PK and uploaded_by is a tbl_user FK. Older tokens
+      // have no claim, and null is the honest answer for those.
+      uploadedBy: req.clientUser?.userId ?? null,
+    });
+    const url = await clientS3.resolveClientDocumentUrl(s3Key).catch(() => null);
+    logger.info('Client company document uploaded · id=' + documentId + ' · clientId=' + req.spoc.client_id);
+    res.status(201);
+    modernOk(res, { documentId, s3Key, url });
+  } catch (e) {
+    if (e?.code === 'LIMIT_FILE_SIZE') return modernError(res, 400, 'file exceeds 10MB');
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
+/*
+ * DELETE /api/client/company/documents/:id
+ *
+ * ⚠ OWNERSHIP IS CHECKED HERE, NOT IN THE SERVICE. softDelete() takes a bare
+ * document id and applies no client filter — it is safe in the CRM only
+ * because that route runs guardRowByClientId() first. Without the same check
+ * a SPOC could delete ANOTHER TENANT'S documents by counting upwards. The
+ * mismatch returns the same 404 as a missing row so the endpoint cannot be
+ * used to probe which ids exist.
+ */
+router.delete('/company/documents/:id', async (req, res, next) => {
+  try {
+    if (!requireCompanyWrite(req, res)) return;
+    const docId = Number(req.params.id);
+    if (!Number.isInteger(docId) || docId <= 0) return modernError(res, 404, 'document not found');
+
+    const ownerClientId = await clientService.getDocumentClientId(docId);
+    if (ownerClientId == null || Number(ownerClientId) !== Number(req.spoc.client_id)) {
+      logger.warn('Company document delete refused · docId=' + docId
+        + ' · spocClientId=' + req.spoc.client_id + ' · ownerClientId=' + ownerClientId);
+      return modernError(res, 404, 'document not found');
+    }
+    const affected = await clientDocsSvc.softDelete(docId);
+    if (!affected) return modernError(res, 404, 'document not found');
+    logger.info('Client company document deleted · id=' + docId + ' · clientId=' + req.spoc.client_id);
+    modernOk(res, { deleted: true });
+  } catch (e) {
     if (e.status) return modernError(res, e.status, e.message);
     next(e);
   }

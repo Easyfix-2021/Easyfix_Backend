@@ -109,6 +109,10 @@ const createClientBody = Joi.object({
   clientAddress:     Joi.string().max(500).optional().allow('', null),
   clientType:        Joi.string().max(50).optional().allow('', null),
   referenceCode:     Joi.string().max(50).optional().allow('', null),
+  // presentation names — all optional, all fall back to clientName on read
+  displayName:       Joi.string().max(255).optional().allow('', null),
+  billingName:       Joi.string().max(255).optional().allow('', null),
+  techAppName:       Joi.string().max(255).optional().allow('', null),
   // address parts
   building:          Joi.string().max(200).optional().allow('', null),
   landmark:          Joi.string().max(200).optional().allow('', null),
@@ -147,6 +151,26 @@ const updateClientBody = Joi.object({
   clientStatus:  Joi.number().integer().valid(0, 1).optional(),
   clientType:    Joi.string().max(50).optional().allow('', null),
   referenceCode: Joi.string().max(50).optional().allow('', null),
+  // presentation names
+  displayName:   Joi.string().max(255).optional().allow('', null),
+  billingName:   Joi.string().max(255).optional().allow('', null),
+  techAppName:   Joi.string().max(255).optional().allow('', null),
+  /*
+   * Billing terms — the legacy "Invoice Details" block on tbl_client.
+   *   billingRaised     0/1, and 0 NULLs the other three (ClientDaoImpl#
+   *                     updateClient does the same); the FE mirrors that.
+   *   billingCycle      comma-separated DAY-OF-MONTH numbers, not an int.
+   *                     `40` is the legacy sentinel for "last of the month".
+   *   billingStartDate  ISO yyyy-mm-dd as a STRING, deliberately not
+   *                     Joi.date(): Joi.date() coerces to a JS Date, which
+   *                     re-serialises in UTC and can walk an IST-entered date
+   *                     back a day before it reaches MySQL.
+   */
+  billingRaised: Joi.number().integer().valid(0, 1).optional(),
+  billingCycle:  Joi.string().max(100).pattern(/^\s*\d{1,2}(\s*,\s*\d{1,2})*\s*$/).optional().allow('', null)
+    .messages({ 'string.pattern.base': 'Enter comma-separated day numbers, e.g. "1,15" (use 40 for last of month)' }),
+  billingStartDate: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).optional().allow('', null)
+    .messages({ 'string.pattern.base': 'Must be a yyyy-mm-dd date' }),
   bookingCutOff: Joi.number().integer().min(0).max(48).optional(),
   maxOrders:     Joi.number().integer().min(0).optional(),
   minOrders:     Joi.number().integer().min(0).optional(),
