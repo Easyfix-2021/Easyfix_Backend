@@ -103,4 +103,114 @@ function judgeAgainst(metric, value, target) {
   return missedBy <= slack ? 'watch' : 'risk';
 }
 
-module.exports = { DEFAULT_TARGETS, TARGET_DIRECTION, getTargets, judge, judgeAgainst };
+/*
+ * ─── WRITES ────────────────────────────────────────────────────────────────
+ *
+ * A WRITE MUST NOT FAIL SOFT. getTargets() deliberately swallows a missing
+ * table and returns the platform defaults, because a Performance page that
+ * cannot render is worse than one showing assumed numbers. The opposite is
+ * true here: an operator who types "SLA 95%", sees a success toast and gets
+ * nothing persisted is strictly worse off than one who sees an error. So
+ * every failure path below THROWS.
+ */
+
+/** Tag an error so the route layer can map it to a status. */
+function unavailable() {
+  return Object.assign(
+    new Error('Client targets storage is not provisioned on this environment '
+      + '(run migrations/executed/2026-08-20-client-spoc-access.sql)'),
+    { status: 503 },
+  );
+}
+
+/**
+ * Upsert one client's contracted targets.
+ *
+ * client_id is the PRIMARY KEY, so ON DUPLICATE KEY UPDATE is the whole
+ * concurrency story — two operators saving at once cannot create a duplicate
+ * row, and the later write wins cleanly.
+ *
+ * `updated_at` is bound as a JS Date rather than SQL NOW(): the pool runs with
+ * timezone '+05:30' + dateStrings, so a Date lands as IST verbatim, whereas
+ * NOW() would follow whatever the MySQL session is set to. See the
+ * DATETIME-IST convention used by the OTP writers.
+ *
+ * Returns the row as it now stands, in the same shape getTargets() returns, so
+ * a caller never has to re-read to know what was stored.
+ */
+async function setTargets(clientId, values, actorId) {
+  logger.info('Set client targets · clientId=' + clientId);
+  if (!targetTableAvailable) throw unavailable();
+  const row = {
+    sla_pct: Number(values.sla_pct),
+    ftfr_pct: Number(values.ftfr_pct),
+    revisit_pct: Number(values.revisit_pct),
+    avg_age_days: Number(values.avg_age_days),
+    approval_response_hours: Number(values.approval_response_hours),
+  };
+  try {
+    await pool.query(
+      `INSERT INTO easyfix_client_target
+         (client_id, sla_pct, ftfr_pct, revisit_pct, avg_age_days,
+          approval_response_hours, updated_by, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         sla_pct = VALUES(sla_pct),
+         ftfr_pct = VALUES(ftfr_pct),
+         revisit_pct = VALUES(revisit_pct),
+         avg_age_days = VALUES(avg_age_days),
+         approval_response_hours = VALUES(approval_response_hours),
+         updated_by = VALUES(updated_by),
+         updated_at = VALUES(updated_at)`,
+      [
+        clientId, row.sla_pct, row.ftfr_pct, row.revisit_pct,
+        row.avg_age_days, row.approval_response_hours,
+        actorId ?? null, new Date(),
+      ],
+    );
+  } catch (e) {
+    if (e && e.errno === 1146) {
+      targetTableAvailable = false;
+      throw unavailable();
+    }
+    throw e;
+  }
+  logger.info('Client targets saved · clientId=' + clientId);
+  return { ...row, source: 'contracted' };
+}
+
+/**
+ * Drop a client's contracted row, returning them to the platform defaults.
+ *
+ * WHY THIS EXISTS AT ALL. getTargets() reports `source` as 'contracted' vs
+ * 'platform-default', and the UI leans on that distinction hard — a default
+ * shown as a commitment is the sentence nobody wants read back to them in a
+ * QBR. Without a delete there is no way BACK to 'platform-default' once
+ * anybody saves, so the first accidental save would permanently mark a client
+ * as contracted. Setting the fields to the default VALUES would not do it:
+ * the row would still exist, and `source` would still say 'contracted'.
+ *
+ * Returns true when a row was actually removed.
+ */
+async function clearTargets(clientId) {
+  logger.info('Clear client targets · clientId=' + clientId);
+  if (!targetTableAvailable) throw unavailable();
+  try {
+    const [r] = await pool.query(
+      'DELETE FROM easyfix_client_target WHERE client_id = ?', [clientId],
+    );
+    logger.info('Client targets cleared · clientId=' + clientId + ' affected=' + r.affectedRows);
+    return r.affectedRows > 0;
+  } catch (e) {
+    if (e && e.errno === 1146) {
+      targetTableAvailable = false;
+      throw unavailable();
+    }
+    throw e;
+  }
+}
+
+module.exports = {
+  DEFAULT_TARGETS, TARGET_DIRECTION, getTargets, judge, judgeAgainst,
+  setTargets, clearTargets,
+};

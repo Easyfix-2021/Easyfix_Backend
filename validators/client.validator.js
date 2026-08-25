@@ -206,6 +206,27 @@ const updateClientBody = Joi.object({
   collected_by:   Joi.number().integer().min(0).max(3).optional(),
 }).min(1);
 
+/* ─── Client performance targets ──────────────────────────────────── */
+
+/*
+ * All five are REQUIRED on a write. easyfix_client_target has NOT NULL columns
+ * with defaults, so a partial upsert would silently reset the fields the
+ * operator did not send back to the platform default — which looks like data
+ * loss and is impossible to distinguish from a deliberate change afterwards.
+ * The form always posts the whole set.
+ *
+ * Bounds are sanity rails, not policy: percentages are percentages, an age
+ * target beyond a year is a typo, and an approval window beyond 30 days is
+ * not a target anybody is measuring.
+ */
+const clientTargetsBody = Joi.object({
+  sla_pct:                 Joi.number().min(0).max(100).required(),
+  ftfr_pct:                Joi.number().min(0).max(100).required(),
+  revisit_pct:             Joi.number().min(0).max(100).required(),
+  avg_age_days:            Joi.number().min(0).max(365).required(),
+  approval_response_hours: Joi.number().integer().min(1).max(720).required(),
+}).options({ stripUnknown: true });
+
 /* ─── Client contacts (SPOCs) ─────────────────────────────────────── */
 
 const createContactBody = Joi.object({
@@ -492,6 +513,7 @@ const replaceVerticalsBody = Joi.object({
 });
 
 module.exports = {
+  clientTargetsBody,
   // params
   clientIdParam,
   clientOnlyIdParam,

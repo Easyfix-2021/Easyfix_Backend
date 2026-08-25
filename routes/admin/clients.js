@@ -12,7 +12,7 @@
  *   /collected-by-preference  (legacy collected_by code → label)
  *   /summary             (Client Profile headline figures — read-only)
  *   /stores              (branch directory from tbl_client_store — read-only)
- *   /targets             (contracted performance targets — read-only)
+ *   /targets             (contracted performance targets — GET/PUT/DELETE)
  *
  * Permissions:
  *   - READ routes are open to any authenticated admin-group user
@@ -1969,6 +1969,66 @@ router.get('/:clientId/stores', async (req, res, next) => {
 });
 
 /*
+ * PUT /:clientId/targets — set this client's contracted targets.
+ *
+ * Upsert; client_id is the table's PRIMARY KEY. Gated on isClientEdit, the
+ * same key that gates every other mutation on this router.
+ *
+ * The whole set is required on every write — see the validator note. A missing
+ * table 503s rather than reporting success, because the read path's fail-soft
+ * behaviour (serve platform defaults) is exactly wrong for a write.
+ */
+router.put(
+  '/:clientId/targets',
+  requireClientEdit,
+  validate(v.clientTargetsBody),
+  async (req, res, next) => {
+    try {
+      logger.info('Set client targets · clientId=' + req.params.clientId);
+      if (!(await loadAndGuardClient(req, res))) return;
+      const saved = await targetSvc.setTargets(
+        Number(req.params.clientId), req.body, req.user && req.user.user_id,
+      );
+      modernOk(res, { ...saved, directions: targetSvc.TARGET_DIRECTION });
+    } catch (e) {
+      if (e.status) logger.warn('Set client targets failed · ' + e.message);
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+/*
+ * DELETE /:clientId/targets — return this client to the platform defaults.
+ *
+ * NOT the same as writing the default VALUES: the row would still exist and
+ * getTargets() would keep reporting `source: 'contracted'`. Only removing the
+ * row puts a client back on 'platform-default', which is the distinction the
+ * whole SLA section is built around. Without this, the first accidental save
+ * would mark a client as contracted forever.
+ *
+ * Idempotent — deleting when no row exists is a 200 with removed:false, not a
+ * 404. "There is no contracted row" is the state the caller asked for.
+ */
+router.delete(
+  '/:clientId/targets',
+  requireClientEdit,
+  async (req, res, next) => {
+    try {
+      logger.info('Clear client targets · clientId=' + req.params.clientId);
+      if (!(await loadAndGuardClient(req, res))) return;
+      const removed = await targetSvc.clearTargets(Number(req.params.clientId));
+      const targets = await targetSvc.getTargets(Number(req.params.clientId));
+      modernOk(res, { removed, ...targets, directions: targetSvc.TARGET_DIRECTION });
+    } catch (e) {
+      if (e.status) logger.warn('Clear client targets failed · ' + e.message);
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+/*
  * GET /:clientId/targets — the client's contracted performance targets.
  *
  * Straight passthrough of services/client-target.service.js, which is the same
@@ -1980,9 +2040,9 @@ router.get('/:clientId/stores', async (req, res, next) => {
  * configured this client and the platform figures are standing in. The UI must
  * say which, or a default reads as a commitment.
  *
- * READ-ONLY. There is no writer for easyfix_client_target anywhere in the
- * platform yet, so this endpoint deliberately has no PUT sibling rather than
- * inventing an edit surface for a table nothing else writes.
+ * Its PUT and DELETE siblings are directly above. DELETE is the only way back
+ * to `source: 'platform-default'` — writing the default values would leave the
+ * row in place and keep reporting 'contracted'.
  */
 router.get('/:clientId/targets', async (req, res, next) => {
   try {
