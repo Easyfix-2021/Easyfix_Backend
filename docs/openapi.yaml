@@ -214,7 +214,12 @@ components:
       description: |
         **HTTP Basic Auth — `/integration/v1/*` only.**
 
-        - Credentials sourced from the legacy `tbl_client_website` table (NOT `tbl_user`)
+        - Credentials resolve from **`tbl_client_user` first**, falling back to `tbl_client_website` (`status = 1`).
+          `tbl_client_user` is the store BOTH legacy services authenticated against, so it wins any
+          disagreement while legacy still serves traffic. Neither is `tbl_user` — that is CRM staff,
+          and no CRM login works here.
+        - A `tbl_client_website`-only credential cannot carry a role, so `GET /v1/services` returns the
+          documented default shape for it. Only logins present in `tbl_client_user` get the role-driven shape.
         - Response envelope is the legacy `{status: "200", message, data}` shape — never mix with modern endpoints
         - Quick Login does NOT cover this scheme — open the Authorize dialog and enter username/password manually
 

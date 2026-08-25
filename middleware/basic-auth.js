@@ -137,13 +137,15 @@ async function findCredential(loginName) {
  *
  * ─── Why this needs its own lookup ───────────────────────────────────────
  *
- * We authenticate against tbl_client_website, which has no role column. The
- * legacy Dropwizard service authenticated against a DIFFERENT table entirely
- * — tbl_client_user — whose fk_role_id → tbl_client_role.role_name decided
- * which response shape GET /v1/services returned ("website" got the nested
- * category tree, "client" got a flat list). Partners parse one or the other,
- * so the role has to be recovered even though it lives outside our own
- * credential table.
+ * This runs ONLY for the tbl_client_website fallback. A credential resolved
+ * from tbl_client_user already carried its role on the same row (see the ??
+ * at the call site), because legacy read both from that one table.
+ *
+ * tbl_client_website has no role column, and the role decides which response
+ * shape GET /v1/services returns — "website" gets the nested category tree,
+ * "client" gets a flat list. Partners parse one or the other, so for a
+ * fallback credential the role has to be recovered from outside the table it
+ * authenticated against.
  *
  * Matched on login_name = user_name ONLY — deliberately not falling back to
  * the client id. Legacy authenticated against tbl_client_user by username, so
