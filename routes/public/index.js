@@ -21,6 +21,17 @@
 
 const router = require('express').Router();
 
+/*
+ * Privacy policy — the ONE deliberate exception to the self-verify rule above.
+ *
+ * A policy that required a token would not be a public policy, and Google Play
+ * requires a publicly reachable URL that discloses background location before
+ * it will accept the background-location declaration. Safe because the router
+ * is read-only and static: no database, no user data, no caller to scope to.
+ * Do not cite it as precedent for a sub-router that reads anything.
+ */
+router.use('/privacy', require('./privacy'));
+
 router.use('/job-completion', require('./job-completion'));
 /*
  * Technician "share job" surface. UNAUTHENTICATED — a public link a technician
