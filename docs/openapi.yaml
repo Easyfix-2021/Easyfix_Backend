@@ -161,7 +161,11 @@ servers:
     description: Local development
   - url: https://qa.backend.easyfix.in/api
     description: Staging
-  - url: https://core.easyfix.in/api
+  # backend.easyfix.in, NOT core.easyfix.in. core is the legacy Dropwizard host;
+  # Nginx rewrites core.easyfix.in/v1/* onto this app's /api/integration/v1/* for
+  # external clients, but nothing else of this API is served there — so a
+  # core.easyfix.in/api base 404s every "Try it out" on the Production server.
+  - url: https://backend.easyfix.in/api
     description: Production
 
 components:
