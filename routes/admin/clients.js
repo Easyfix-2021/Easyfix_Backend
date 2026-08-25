@@ -1986,9 +1986,15 @@ router.put(
     try {
       logger.info('Set client targets · clientId=' + req.params.clientId);
       if (!(await loadAndGuardClient(req, res))) return;
-      const saved = await targetSvc.setTargets(
+      await targetSvc.setTargets(
         Number(req.params.clientId), req.body, req.user && req.user.user_id,
       );
+      /*
+       * Re-read rather than echoing setTargets()'s return, so the PUT response
+       * has the SAME shape as the GET — including who/when. One cheap query
+       * buys a caller that never has to special-case which endpoint it used.
+       */
+      const saved = await targetSvc.getTargets(Number(req.params.clientId), { withAudit: true });
       modernOk(res, { ...saved, directions: targetSvc.TARGET_DIRECTION });
     } catch (e) {
       if (e.status) logger.warn('Set client targets failed · ' + e.message);
@@ -2018,7 +2024,7 @@ router.delete(
       logger.info('Clear client targets · clientId=' + req.params.clientId);
       if (!(await loadAndGuardClient(req, res))) return;
       const removed = await targetSvc.clearTargets(Number(req.params.clientId));
-      const targets = await targetSvc.getTargets(Number(req.params.clientId));
+      const targets = await targetSvc.getTargets(Number(req.params.clientId), { withAudit: true });
       modernOk(res, { removed, ...targets, directions: targetSvc.TARGET_DIRECTION });
     } catch (e) {
       if (e.status) logger.warn('Clear client targets failed · ' + e.message);
@@ -2048,7 +2054,7 @@ router.get('/:clientId/targets', async (req, res, next) => {
   try {
     logger.info('Client targets · clientId=' + req.params.clientId);
     if (!(await loadAndGuardClient(req, res))) return;
-    const targets = await targetSvc.getTargets(Number(req.params.clientId));
+    const targets = await targetSvc.getTargets(Number(req.params.clientId), { withAudit: true });
     modernOk(res, { ...targets, directions: targetSvc.TARGET_DIRECTION });
   } catch (e) {
     if (e.status) logger.warn('Client targets failed · ' + e.message);

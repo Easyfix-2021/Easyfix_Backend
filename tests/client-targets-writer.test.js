@@ -30,6 +30,7 @@ const { installFakePool } = require('./helpers/fake-pool');
 const CLIENT = 133;
 
 let missingTable = false;
+let contractedRow = null;          // null → the client has no contracted row
 const fake = installFakePool([
   [/easyfix_client_target/i, (sql) => {
     if (missingTable) {
@@ -39,9 +40,19 @@ const fake = installFakePool([
     }
     if (/^DELETE/i.test(sql.trim())) return { affectedRows: 1 };
     if (/^INSERT/i.test(sql.trim())) return { affectedRows: 1 };
-    return [];                     // SELECT → no contracted row
+    return contractedRow ? [contractedRow] : [];   // SELECT
   }],
 ]);
+
+/* What a contracted row looks like coming off the driver: DECIMALs as strings,
+   updated_at as an IST wall-clock STRING (the pool runs dateStrings). */
+const ROW = {
+  sla_pct: '95.00', ftfr_pct: '90.00', revisit_pct: '5.00',
+  avg_age_days: '2.00', approval_response_hours: 12,
+  updated_at: '2026-08-25 16:56:17',
+  updated_by: 7,
+  updated_by_name: 'Priya Sharma',
+};
 
 const svc = require('../services/client-target.service');
 
@@ -98,6 +109,53 @@ test('getTargets still FAILS SOFT to the platform defaults when nothing is confi
   assert.equal(t.source, 'platform-default');
   assert.equal(t.sla_pct, svc.DEFAULT_TARGETS.sla_pct,
     'a client with no contracted row must still render a Performance page');
+});
+
+test('the DEFAULT shape carries NO audit fields — the client portal shares this function', async () => {
+  fake.reset();
+  contractedRow = ROW;
+  const t = await svc.getTargets(CLIENT);
+  contractedRow = null;
+
+  assert.equal(t.source, 'contracted');
+  assert.equal('updatedBy' in t, false,
+    'updated_by is an EasyFix STAFF id; routes/client/index.js spreads this object straight into the tenant-facing /performance response');
+  assert.equal('updatedAt' in t, false);
+
+  const stmt = fake.calls.find((c) => /SELECT/i.test(c.sql) && /easyfix_client_target/i.test(c.sql));
+  assert.doesNotMatch(stmt.sql, /tbl_user/i,
+    'the default query must not even join the staff table');
+});
+
+test('withAudit returns who and when, resolved to a name', async () => {
+  fake.reset();
+  contractedRow = ROW;
+  const t = await svc.getTargets(CLIENT, { withAudit: true });
+  contractedRow = null;
+
+  assert.equal(t.updatedAt, '2026-08-25 16:56:17',
+    'passed through verbatim — it is already an IST wall clock, and every re-parse is a chance to shift it');
+  assert.deepEqual(t.updatedBy, { id: 7, name: 'Priya Sharma' });
+  assert.equal(t.sla_pct, 95, 'the DECIMAL string is still coerced to a number');
+});
+
+test('an updated_by pointing at a DELETED user keeps the row, with a null name', async () => {
+  fake.reset();
+  contractedRow = { ...ROW, updated_by_name: null };
+  const t = await svc.getTargets(CLIENT, { withAudit: true });
+  contractedRow = null;
+
+  assert.deepEqual(t.updatedBy, { id: 7, name: null },
+    'LEFT JOIN — losing the whole target row because an operator left the company would be absurd');
+});
+
+test('an unconfigured client still gets the audit KEYS under withAudit', async () => {
+  fake.reset();
+  const t = await svc.getTargets(CLIENT, { withAudit: true });
+  assert.equal(t.source, 'platform-default');
+  assert.equal(t.updatedAt, null);
+  assert.equal(t.updatedBy, null,
+    'a stable shape means the UI needs no separate branch for "never configured"');
 });
 
 /* ── Keep last: this latches the module-level availability memo ─────────── */

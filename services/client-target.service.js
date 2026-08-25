@@ -50,17 +50,39 @@ let targetTableAvailable = true;
  * `source` tells the caller which of those happened, so the UI can label a
  * target as contracted rather than assumed.
  */
-async function getTargets(clientId) {
+async function getTargets(clientId, opts = {}) {
+  /*
+   * ─── withAudit IS OPT-IN, AND THAT IS A PRIVACY BOUNDARY ──────────────────
+   *
+   * updated_by is a tbl_user id — an EASYFIX STAFF MEMBER. This function is
+   * shared: routes/client/index.js#/performance calls it and spreads the
+   * result straight into the CLIENT PORTAL response. Returning the auditor's
+   * name unconditionally would put an internal staff name in front of every
+   * tenant, silently, the moment this function grew the column.
+   *
+   * So the default shape is BYTE-IDENTICAL to what it has always been, and the
+   * two admin routes opt in. Fail-closed: a new caller gets no audit unless it
+   * asks, rather than getting it and having to remember to strip it.
+   */
+  const withAudit = opts.withAudit === true;
   const fallback = { ...DEFAULT_TARGETS, source: 'platform-default' };
+  if (withAudit) { fallback.updatedAt = null; fallback.updatedBy = null; }
   if (!targetTableAvailable) return fallback;
   try {
     const [[row]] = await pool.query(
-      `SELECT sla_pct, ftfr_pct, revisit_pct, avg_age_days, approval_response_hours
-         FROM easyfix_client_target WHERE client_id = ? LIMIT 1`,
+      withAudit
+        ? `SELECT t.sla_pct, t.ftfr_pct, t.revisit_pct, t.avg_age_days,
+                  t.approval_response_hours, t.updated_at, t.updated_by,
+                  u.user_name AS updated_by_name
+             FROM easyfix_client_target t
+             LEFT JOIN tbl_user u ON u.user_id = t.updated_by
+            WHERE t.client_id = ? LIMIT 1`
+        : `SELECT sla_pct, ftfr_pct, revisit_pct, avg_age_days, approval_response_hours
+             FROM easyfix_client_target WHERE client_id = ? LIMIT 1`,
       [clientId]
     );
     if (!row) return fallback;
-    return {
+    const out = {
       sla_pct: Number(row.sla_pct),
       ftfr_pct: Number(row.ftfr_pct),
       revisit_pct: Number(row.revisit_pct),
@@ -68,6 +90,20 @@ async function getTargets(clientId) {
       approval_response_hours: Number(row.approval_response_hours),
       source: 'contracted',
     };
+    if (withAudit) {
+      /*
+       * updated_at arrives as an IST wall-clock string ("YYYY-MM-DD HH:mm:ss")
+       * because the pool runs dateStrings + timezone '+05:30'. Passed through
+       * verbatim rather than re-parsed — every re-parse is a chance to shift it.
+       * LEFT JOIN, so an updated_by pointing at a since-deleted user still
+       * returns the id with a null name rather than dropping the row.
+       */
+      out.updatedAt = row.updated_at || null;
+      out.updatedBy = row.updated_by
+        ? { id: Number(row.updated_by), name: row.updated_by_name || null }
+        : null;
+    }
+    return out;
   } catch (e) {
     if (e && e.errno === 1146) {
       targetTableAvailable = false;
