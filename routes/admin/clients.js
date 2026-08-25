@@ -10,6 +10,9 @@
  *   /billing             (billing addresses)
  *   /custom-properties   (free-form key/value)
  *   /collected-by-preference  (legacy collected_by code → label)
+ *   /summary             (Client Profile headline figures — read-only)
+ *   /stores              (branch directory from tbl_client_store — read-only)
+ *   /targets             (contracted performance targets — read-only)
  *
  * Permissions:
  *   - READ routes are open to any authenticated admin-group user
@@ -36,6 +39,9 @@ const docsSvc = require('../../services/client-documents.service');
 const clientServicesSvc = require('../../services/client-services.service');
 const rateCardsSvc = require('../../services/client-rate-cards.service');
 const techMappingSvc = require('../../services/client-tech-mapping.service');
+// Same module the client portal's Performance book judges against — see the
+// GET /:clientId/targets handler for why this is a passthrough, not a copy.
+const targetSvc = require('../../services/client-target.service');
 const xlsxSvc = require('../../services/client-xlsx.service');
 const { pool } = require('../../db');
 const s3 = require('../../utils/s3-storage');
@@ -1810,5 +1816,185 @@ router.delete(
     }
   },
 );
+
+
+/* ─── Client Profile aggregates ───────────────────────────────────── */
+
+/*
+ * GET /:clientId/summary
+ *
+ * The headline figures on the Client Profile page. Three numbers, three
+ * cheap COUNT-shaped queries, one round trip.
+ *
+ *   outstanding      un-collected rupees across raised invoices
+ *   openOrders       jobs still in flight (statuses 0/1/2/20)
+ *   pendingClientQc  jobs blocked on THIS CLIENT approving a billing line
+ *
+ * WHY THE SLA FIGURE IS NOT HERE. The fourth tile on that strip is "SLA
+ * breaches (30d)", and it is deliberately fetched separately by the page from
+ * GET /api/admin/tat/client/:clientId?days=30. Two reasons: the TAT engine is
+ * the ONE definition of a breach and re-deriving it here would fork it, and it
+ * scans every completed job in the window — folding it in would make three
+ * instant numbers wait on the slow one. It also carries its own action gate
+ * (isTatCalculatorView), which this endpoint must not silently bypass.
+ *
+ * PENDING QC USES THE CLIENT PORTAL'S OWN DEFINITION — the exact predicate
+ * behind GET /api/client/action-queue: at least one approval-pending billing
+ * line (tbl_job_services.job_service_status = 1) with neither an approval nor
+ * a rejection stamped on the job. That is the condition PATCH
+ * /jobs/:id/estimate/approve clears, so what an operator reads here and what
+ * the client sees in their own queue cannot drift apart. No reporting-contact
+ * scoping: an operator looking at the client master wants the whole client,
+ * not one SPOC's subtree.
+ */
+router.get('/:clientId/summary', async (req, res, next) => {
+  try {
+    logger.info('Client profile summary · clientId=' + req.params.clientId);
+    if (!(await loadAndGuardClient(req, res))) return;
+    const clientId = Number(req.params.clientId);
+
+    /*
+     * tbl_client_invoice is a legacy table and is not present on every
+     * environment. A missing table means "we cannot say", which is NOT the
+     * same as zero outstanding — so it resolves to null and the tile renders
+     * a dash rather than a confident ₹0.
+     */
+    const invoiceTotals = (async () => {
+      try {
+        const [[row]] = await pool.query(
+          `SELECT COALESCE(SUM(total_invoice_amount), 0)                                  AS billed,
+                  COALESCE(SUM(COALESCE(total_paid_amount, 0)), 0)                        AS collected,
+                  COALESCE(SUM(total_invoice_amount - COALESCE(total_paid_amount, 0)), 0) AS outstanding,
+                  COUNT(*)                                                                AS invoices
+             FROM tbl_client_invoice
+            WHERE fk_client_id = ? AND is_raised = 1`,
+          [clientId],
+        );
+        return {
+          billed: Number(row.billed) || 0,
+          collected: Number(row.collected) || 0,
+          outstanding: Number(row.outstanding) || 0,
+          invoices: Number(row.invoices) || 0,
+        };
+      } catch (e) {
+        if (e && e.errno === 1146) {
+          logger.warn('tbl_client_invoice missing — outstanding reported as unavailable');
+          return null;
+        }
+        throw e;
+      }
+    })();
+
+    const orderCounts = pool.query(
+      `SELECT SUM(CASE WHEN job_status IN (0, 1, 2, 20) THEN 1 ELSE 0 END) AS openOrders,
+              SUM(CASE WHEN job_status IN (3, 5)        THEN 1 ELSE 0 END) AS completedOrders,
+              COUNT(*)                                                     AS totalOrders
+         FROM tbl_job
+        WHERE fk_client_id = ?`,
+      [clientId],
+    );
+
+    // COUNT(DISTINCT) — a job with three approval-pending lines is ONE item
+    // of client work, not three. Same reason the action queue GROUP BYs.
+    const pendingQc = pool.query(
+      `SELECT COUNT(DISTINCT J.job_id) AS pendingClientQc
+         FROM tbl_job J
+         JOIN tbl_job_services js ON js.job_id = J.job_id AND js.job_service_status = 1
+        WHERE J.fk_client_id = ?
+          AND J.approved_on_date_time IS NULL
+          AND J.approval_reject_date_time IS NULL
+          AND J.job_status NOT IN (3, 5, 6)`,
+      [clientId],
+    );
+
+    const [invoices, [[orders]], [[qc]]] = await Promise.all([invoiceTotals, orderCounts, pendingQc]);
+
+    modernOk(res, {
+      clientId,
+      invoices,                                        // null when the table is absent
+      outstanding: invoices ? invoices.outstanding : null,
+      openOrders: Number(orders.openOrders) || 0,
+      completedOrders: Number(orders.completedOrders) || 0,
+      totalOrders: Number(orders.totalOrders) || 0,
+      pendingClientQc: Number(qc.pendingClientQc) || 0,
+    });
+  } catch (e) {
+    if (e.status) logger.warn('Client summary failed · ' + e.message);
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
+/*
+ * GET /:clientId/stores — the client's branch / store directory.
+ *
+ * Read-only on purpose. tbl_client_store is populated by the client's own
+ * onboarding data load, and the client portal already reads it (GET
+ * /api/client/stores) to drive the store-code picker on New Order. This
+ * exposes the same rows to an operator so "which branch is STR-142?" is
+ * answerable from the client master instead of a DB console.
+ *
+ * Unlike the portal query this does NOT filter to status = 1 — an operator
+ * chasing a job booked against a since-retired branch needs to see it. The
+ * flag rides along so the UI can mark it.
+ */
+router.get('/:clientId/stores', async (req, res, next) => {
+  try {
+    logger.info('List client stores · clientId=' + req.params.clientId);
+    if (!(await loadAndGuardClient(req, res))) return;
+    let rows;
+    try {
+      [rows] = await pool.query(
+        `SELECT id, store_code, store_name, contact_name, contact_no,
+                address, city_id, city_name, pin_code, status
+           FROM tbl_client_store
+          WHERE fk_client_id = ?
+          ORDER BY status DESC, store_code`,
+        [Number(req.params.clientId)],
+      );
+    } catch (e) {
+      if (e && e.errno === 1146) {
+        logger.warn('tbl_client_store missing — returning an empty branch directory');
+        return modernOk(res, { items: [], provisioned: false });
+      }
+      throw e;
+    }
+    logger.info('Found ' + rows.length + ' stores');
+    modernOk(res, { items: rows, provisioned: true });
+  } catch (e) {
+    if (e.status) logger.warn('List client stores failed · ' + e.message);
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
+/*
+ * GET /:clientId/targets — the client's contracted performance targets.
+ *
+ * Straight passthrough of services/client-target.service.js, which is the same
+ * module the client portal's Performance book judges against. Reusing it means
+ * an operator and a client read one set of numbers.
+ *
+ * `source` is part of the contract, not decoration: 'contracted' means a row
+ * exists in easyfix_client_target, 'platform-default' means nobody has
+ * configured this client and the platform figures are standing in. The UI must
+ * say which, or a default reads as a commitment.
+ *
+ * READ-ONLY. There is no writer for easyfix_client_target anywhere in the
+ * platform yet, so this endpoint deliberately has no PUT sibling rather than
+ * inventing an edit surface for a table nothing else writes.
+ */
+router.get('/:clientId/targets', async (req, res, next) => {
+  try {
+    logger.info('Client targets · clientId=' + req.params.clientId);
+    if (!(await loadAndGuardClient(req, res))) return;
+    const targets = await targetSvc.getTargets(Number(req.params.clientId));
+    modernOk(res, { ...targets, directions: targetSvc.TARGET_DIRECTION });
+  } catch (e) {
+    if (e.status) logger.warn('Client targets failed · ' + e.message);
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
 
 module.exports = router;
