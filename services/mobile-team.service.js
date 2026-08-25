@@ -138,9 +138,14 @@ async function getTeamProfile(masterEfrId, { month } = {}, db = pool) {
     grade: profile.grade || null,
     rating: profile.rating == null ? null : Number(profile.rating),
     jobsDone: num(profile.completedJobs),
-    // Deep-skill mappings are the authoritative active skill selection. The
-    // legacy efr_service_category string can be stale or differently delimited.
-    categoriesCount: num(profile.skillCount),
+    // DISTINCT service categories (tbl_efr_deepskill_mapping.category_id), the
+    // same grouping the professional-profile screen shows. NOT profile
+    // .skillCount — that counts DEEP SKILLS, one level further down the
+    // category → service type → deep skill → option model, which is why this
+    // tile used to read ~98 for a platform with a handful of categories. The
+    // deep-skill mapping stays authoritative over the legacy
+    // efr_service_category CSV, which can be stale or differently delimited.
+    categoriesCount: num(profile.categoryCount),
     city: profile.city || null,
     easyFixSince: profile.memberSince || null,
     team: {

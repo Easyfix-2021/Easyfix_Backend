@@ -15,6 +15,7 @@ test('team profile labels direct reports credits as member earnings only', async
     rating: 4.7,
     completedJobs: 348,
     skillCount: 21,
+    categoryCount: 2,
     categories: ['AC', 'Appliances'],
     city: 'Gurgaon',
     memberSince: '2024-01-01',
@@ -32,8 +33,8 @@ test('team profile labels direct reports credits as member earnings only', async
     const result = await team.getTeamProfile(7, { month: '2026-08' }, db);
     assert.equal(result.team.memberEarnings, 24800);
     assert.equal(result.team.members, 4);
-    assert.equal(result.categoriesCount, 21,
-      'the authoritative deep-skill mapping count must win over the legacy category string');
+    assert.equal(result.categoriesCount, 2,
+      'the Categories tile counts DISTINCT mapped categories, never deep skills (skillCount)');
     assert.equal(result.easyFixSince, '2024-01-01');
     assert.equal(Object.hasOwn(result, 'memberSince'), false);
     assert.equal(result.mobileMasked.endsWith('210'), true);

@@ -185,12 +185,32 @@ function deriveStatus(flags) {
   if (Number(flags.personalDetailsFilled) === 2) return 'not_eligible';
   // Identity rejected by CRM — show the reason, let the tech resubmit.
   if (Number(flags.identityVerifiedByCrm) === 2) return 'rejected';
-  // Gate 1 incomplete (personal step + Aadhaar + photo) → merged reg screen.
-  if (!flags.gate1Complete) return 'personal_pending';
+  /*
+   * Gate 1 incomplete (personal step + Aadhaar + photo) → merged reg screen.
+   *
+   * ...UNLESS the CRM has already activated them. Ops verification gates JOB
+   * OFFERS, not the home screen: a technician the CRM has vetted and switched
+   * on is working, and walling them behind registration because one field is
+   * missing from the newer schema strands them in a flow they have already
+   * been through. They land on the dashboard instead, where the existing
+   * "Your Profile Is Under Review" banner and UnlockChecklist/ProgressNudges
+   * ask for whatever is missing — and jobsUnlocked below STILL requires
+   * hasSkills + trainingComplete, so nothing about work access is loosened.
+   *
+   * The bounce this fixes was not the gate router, which already sends an
+   * ACTIVE lifecycle to the dashboard. It was _layout.tsx's welcomeEligible,
+   * which treats status === 'personal_pending' as "new technician" and whose
+   * PostOtpWelcomeModal "Get Started" does
+   * router.replace('/(registration)/complete-profile'). Returning a truthful
+   * status for this population turns that modal off at the source.
+   *
+   * The ordering guard this relaxes ("verified checked LAST so an out-of-order
+   * flag cannot leak a tech past Gate 1") still holds for everyone who is NOT
+   * CRM-activated — which is the population it was written to protect.
+   */
+  if (!flags.gate1Complete && !flags.isTechnicianVerified) return 'personal_pending';
   // Gate 1 done but CRM hasn't activated → in the app, unverified (non-blocking).
   if (!flags.isTechnicianVerified) return 'pending_verification';
-  // CRM-activated. Verified is checked LAST so an out-of-order flag can never
-  // leak a tech past Gate 1 straight to active.
   return 'active';
 }
 
@@ -717,4 +737,8 @@ module.exports = {
   finalizeGate1IfReady,
   finalizeGate1AfterSave,
   setLanguage,
+  // Exposed for tests only: deriveStatus decides which route group the app
+  // mounts, so its precedence deserves direct assertions rather than being
+  // reachable only through a full getStatus fake-pool fixture.
+  _internals: { deriveStatus },
 };

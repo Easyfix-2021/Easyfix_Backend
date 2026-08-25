@@ -84,30 +84,48 @@ async function fetchExtraProfileFields(efrId) {
   }
 }
 
-// DISTINCT mapped deep-skill count for the technician. Documented column
-// inversion: the physical `parent_skill_id` column actually holds the
-// deepskill_id, so counting DISTINCT parent_skill_id yields distinct deep
-// skills. Best-effort: any failure (incl. missing table) degrades to 0.
-async function fetchSkillCount(efrId) {
+// DISTINCT mapped deep-skill AND service-category counts for the technician,
+// from one scan of the mapping table (both columns sit in the
+// idx_efr_dsm_efr_active_cover covering index, so this stays index-only).
+//
+// The two counts are at DIFFERENT levels of the 4-level skill model
+// (category → service type → deep skill → option) and are NOT
+// interchangeable:
+//   - skill_count    → DISTINCT deep skills. Documented column inversion: the
+//                      physical `parent_skill_id` column actually holds the
+//                      deepskill_id, so DISTINCT parent_skill_id yields
+//                      distinct deep skills. Powers Profile → "Skills".
+//   - category_count → DISTINCT service categories (m.category_id →
+//                      tbl_service_catg). Same grouping key the professional
+//                      prefill (GET /mobile/profile/professional) uses, so
+//                      "Categories" agrees across surfaces. There are only a
+//                      handful of categories platform-wide, so this is single
+//                      digits even for a technician with 100 deep skills.
+// Best-effort: any failure (incl. missing table) degrades to 0.
+async function fetchSkillCounts(efrId) {
   try {
     const [[row]] = await pool.query(
-      `SELECT COUNT(DISTINCT m.parent_skill_id) AS skill_count
+      `SELECT COUNT(DISTINCT m.parent_skill_id) AS skill_count,
+              COUNT(DISTINCT m.category_id)     AS category_count
          FROM tbl_efr_deepskill_mapping m
         WHERE m.easyfixer_id = ? AND m.is_repairing = 1`,
       [efrId],
     );
-    return Number(row?.skill_count ?? 0);
+    return {
+      skillCount: Number(row?.skill_count ?? 0),
+      categoryCount: Number(row?.category_count ?? 0),
+    };
   } catch (e) {
-    logger.info({ err: e.message, efrId }, 'fetchSkillCount failed; returning 0');
-    return 0;
+    logger.info({ err: e.message, efrId }, 'fetchSkillCounts failed; returning 0');
+    return { skillCount: 0, categoryCount: 0 };
   }
 }
 
 /*
  * Compose the profile-details payload the app expects:
  *   { efrId, name, mobile, email, city, photoUrl, rating, grade,
- *     completedJobs, skillCount, pincode, membershipType, memberSince,
- *     categories }
+ *     completedJobs, skillCount, categoryCount, pincode, membershipType,
+ *     memberSince, categories }
  *
  * The three independent reads (identity, performance, counts) plus the tiny
  * memberSince read run in a single Promise.all fan-out. Each is wrapped so one
@@ -122,7 +140,7 @@ async function getProfileDetails(efrId) {
 
   logger.info('Compose profile-details · efrId=' + efrId);
 
-  const [ident, performance, counts, extra, skillCount] = await Promise.all([
+  const [ident, performance, counts, extra, skillCounts] = await Promise.all([
     readIdentity(efrId),
     performanceService.getForTech(efrId).catch((e) => {
       logger.warn({ err: e.message, efrId }, 'profile-details performance failed');
@@ -133,13 +151,15 @@ async function getProfileDetails(efrId) {
       return { byStatus: {} };
     }),
     fetchExtraProfileFields(efrId),
-    fetchSkillCount(efrId),
+    fetchSkillCounts(efrId),
   ]);
 
   const completedJobs =
     Number(counts.byStatus?.['3'] ?? 0) + Number(counts.byStatus?.['5'] ?? 0);
 
-  logger.info('Returning profile-details · completedJobs=' + completedJobs + ' skillCount=' + (skillCount ?? 0));
+  logger.info('Returning profile-details · completedJobs=' + completedJobs
+    + ' skillCount=' + skillCounts.skillCount
+    + ' categoryCount=' + skillCounts.categoryCount);
 
   return {
     efrId:          ident?.efr_id ?? efrId,
@@ -153,7 +173,10 @@ async function getProfileDetails(efrId) {
     rating:         performance.rating ?? 0,
     grade:          performance.grade ?? null,
     completedJobs,
-    skillCount:     skillCount ?? 0,
+    skillCount:     skillCounts.skillCount,
+    // DISTINCT service categories — a different level of the skill model than
+    // skillCount. Read this (never skillCount) for a "Categories" figure.
+    categoryCount:  skillCounts.categoryCount,
     pincode:        extra?.efr_pin_no ?? null,
     membershipType: null,           // no such column on tbl_easyfixer
     memberSince:    extra?.insert_date ?? null,
