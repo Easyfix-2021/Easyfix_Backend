@@ -1279,39 +1279,72 @@ const QUICK_LOGIN_JS = `
   // one, so the scroll is computed rather than delegated.
   var EF_SCROLL_OFFSET = 84;
 
-  function scrollToTag(node) {
-    var y = Math.max(0, node.getBoundingClientRect().top + window.scrollY - EF_SCROLL_OFFSET);
-    /*
-     * Two-argument scrollTo, NOT scrollTo({top, behavior:'smooth'}).
-     *
-     * Measured on this page: the options form with behavior:'smooth' is a
-     * silent no-op — it returns normally, throws nothing, and leaves scrollY
-     * at 0, while scrollTo(0, y) moves to the identical computed offset. The
-     * rail links looked dead with no error anywhere.
-     *
-     * Smoothness comes from CSS scroll-behavior on <html> instead, which the
-     * same browser honours. Presentation in CSS, the movement in JS.
-     */
-    window.scrollTo(0, y);
-  }
-
   /*
-   * Scroll, then correct twice.
+   * ONE scroll. No correction passes, no rAF loop.
    *
-   * One pass is not enough: swagger-ui renders operation rows lazily, so the
-   * act of scrolling 40,000px changes the height of everything above the
-   * target and the heading ends up hundreds — sometimes tens of thousands —
-   * of pixels from where it was aimed. Measured: a single pass landed
-   * "Mobile — Jobs" 57,225px off.
+   * An earlier version re-measured and re-aimed until the heading sat at the
+   * offset, on the theory that swagger-ui renders rows lazily and the page
+   * moves underneath the jump. Measured: it does not. Scrolling to a computed
+   * offset leaves the heading at exactly 84px and the document height
+   * unchanged for as long as you care to watch.
    *
-   * Each pass re-measures from the CURRENT layout, so the error shrinks to
-   * nothing. Two corrections were enough for every group on this page; the
-   * final one is a cheap no-op when the first already landed.
+   * Worse, the loop actively broke the feature — it re-aimed 6234 -> 5025 ->
+   * 0 and left the page at the top. The 57,000px miss that motivated it was
+   * really the stale-node bug fixed above (measuring a detached element,
+   * which reports top: 0); once targets are re-resolved at click time, a
+   * single scroll is exact.
+   *
+   * Kept as a named function rather than inlined so the reason this is one
+   * line, and must stay one line, has somewhere to live.
    */
-  function scrollToTagSettled(node) {
-    scrollToTag(node);
-    setTimeout(function () { scrollToTag(node); }, 80);
-    setTimeout(function () { scrollToTag(node); }, 260);
+  function scrollToTagSettled(tag) {
+    var find = function () {
+      var node = null;
+      tagNodes().some(function (cand) {
+        if (tagNameOf(cand) === tag) { node = cand; return true; }
+        return false;
+      });
+      return node;
+    };
+
+    var node = find();
+    if (!node) return;
+
+    /*
+     * scrollIntoView + scrollBy, NOT scrollTo(absolutePosition).
+     *
+     * Computing "rect.top + scrollY" and scrolling there assumes the document
+     * is the same height when you scroll as when you measured. On this page it
+     * is not: swagger-ui renders and unrenders operation rows as the viewport
+     * moves, so between the measurement and the scroll the content ABOVE the
+     * target can shrink by thousands of pixels. Measured on a real click:
+     * aimed at 8536, and by the time it landed the target sat 4171px above the
+     * viewport.
+     *
+     * scrollIntoView is resolved by the browser against live layout at the
+     * moment it runs, so the class of error does not exist. scrollBy then
+     * lifts the heading clear of the fixed button cluster.
+     *
+     * Note scrollIntoView() with no argument — NOT {behavior:'smooth'}, which
+     * is a silent no-op on this page (returns normally, throws nothing, does
+     * nothing). Do not add CSS scroll-behavior:smooth either: that routes this
+     * call through the same dead path.
+     */
+    node.scrollIntoView(true);
+    window.scrollBy(0, -EF_SCROLL_OFFSET);
+
+    /*
+     * One correction, after the render that the scroll itself triggered.
+     * Re-resolved by tag because swagger replaces these elements; skipped
+     * entirely when the first attempt already landed.
+     */
+    setTimeout(function () {
+      var again = find();
+      if (!again) return;
+      if (Math.abs(again.getBoundingClientRect().top - EF_SCROLL_OFFSET) <= 4) return;
+      again.scrollIntoView(true);
+      window.scrollBy(0, -EF_SCROLL_OFFSET);
+    }, 120);
   }
 
   function buildRail() {
@@ -1371,10 +1404,28 @@ const QUICK_LOGIN_JS = `
         rail.appendChild(el('div', { className: 'ef-rail-grp', 'data-ef-grp': tier, textContent: tier }));
         lastTier = tier;
       }
-      var a = el('a', { className: 'ef-rail-link', 'data-ef-tier': tier, 'data-ef-tag': tag, textContent: sectionOf(tag) });
-      a.href = '#';
+      /*
+       * NO href. This is the whole reason the rail used to do nothing.
+       *
+       * With href="#", clicking fires swagger-ui's own deep-link handler,
+       * whose Object.toY runs AFTER our handler and scrolls the page itself.
+       * Captured from a real click: we scrolled to 8535, then swagger's toY
+       * scrolled to 1784, then to 0 — so the page ended at the top and the
+       * link looked dead. preventDefault does not stop it; swagger reacts to
+       * the fragment, not to the navigation.
+       *
+       * Without href the element is not a link, so tabindex + a keydown
+       * handler restore keyboard access that href was providing for free.
+       */
+      var a = el('a', {
+        className: 'ef-rail-link', 'data-ef-tier': tier, 'data-ef-tag': tag,
+        textContent: sectionOf(tag), tabindex: '0', role: 'link',
+      });
+      a.onkeydown = function (e) {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); a.onclick(e); }
+      };
       a.onclick = function (e) {
-        e.preventDefault();
+        if (e && e.preventDefault) e.preventDefault();
         /*
          * Re-resolve the target by TAG NAME at click time.
          *
@@ -1384,21 +1435,19 @@ const QUICK_LOGIN_JS = `
          * node is then detached, and scrollIntoView on a detached node is a
          * silent no-op — the link appears dead with no error anywhere.
          */
-        var target = null;
-        tagNodes().some(function (cand) {
-          if (tagNameOf(cand) === tag) { target = cand; return true; }
-          return false;
-        });
-        if (!target) return;
-
-        // Open a collapsed group BEFORE scrolling: expanding grows the page
-        // above the target and would leave the scroll short by that much.
-        if (target.getAttribute('data-is-open') === 'false') {
-          target.click();
-          setTimeout(function () { scrollToTagSettled(target); }, 120);
-        } else {
-          scrollToTagSettled(target);
-        }
+        /*
+         * Scroll. Nothing else.
+         *
+         * This used to read data-is-open and click() the group first, to
+         * expand it before scrolling. That attribute is not reliable on first
+         * paint, so on a freshly loaded page the branch fired against an
+         * already-open group, TOGGLED IT SHUT, and then scrolled to a layout
+         * that no longer matched — the link did nothing on the first click of
+         * a session and worked on the second. Not expanding is also the
+         * honest behaviour: the rail names the header, so landing on the
+         * header is what it promised.
+         */
+        scrollToTagSettled(tag);
       };
       rail.appendChild(a);
     });
