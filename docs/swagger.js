@@ -1275,6 +1275,45 @@ const QUICK_LOGIN_JS = `
     }
   }
 
+  // Offset for the fixed button cluster; scrollIntoView has no way to express
+  // one, so the scroll is computed rather than delegated.
+  var EF_SCROLL_OFFSET = 84;
+
+  function scrollToTag(node) {
+    var y = Math.max(0, node.getBoundingClientRect().top + window.scrollY - EF_SCROLL_OFFSET);
+    /*
+     * Two-argument scrollTo, NOT scrollTo({top, behavior:'smooth'}).
+     *
+     * Measured on this page: the options form with behavior:'smooth' is a
+     * silent no-op — it returns normally, throws nothing, and leaves scrollY
+     * at 0, while scrollTo(0, y) moves to the identical computed offset. The
+     * rail links looked dead with no error anywhere.
+     *
+     * Smoothness comes from CSS scroll-behavior on <html> instead, which the
+     * same browser honours. Presentation in CSS, the movement in JS.
+     */
+    window.scrollTo(0, y);
+  }
+
+  /*
+   * Scroll, then correct twice.
+   *
+   * One pass is not enough: swagger-ui renders operation rows lazily, so the
+   * act of scrolling 40,000px changes the height of everything above the
+   * target and the heading ends up hundreds — sometimes tens of thousands —
+   * of pixels from where it was aimed. Measured: a single pass landed
+   * "Mobile — Jobs" 57,225px off.
+   *
+   * Each pass re-measures from the CURRENT layout, so the error shrinks to
+   * nothing. Two corrections were enough for every group on this page; the
+   * final one is a cheap no-op when the first already landed.
+   */
+  function scrollToTagSettled(node) {
+    scrollToTag(node);
+    setTimeout(function () { scrollToTag(node); }, 80);
+    setTimeout(function () { scrollToTag(node); }, 260);
+  }
+
   function buildRail() {
     var nodes = tagNodes();
     if (!nodes.length) return false;
@@ -1332,13 +1371,34 @@ const QUICK_LOGIN_JS = `
         rail.appendChild(el('div', { className: 'ef-rail-grp', 'data-ef-grp': tier, textContent: tier }));
         lastTier = tier;
       }
-      var a = el('a', { className: 'ef-rail-link', 'data-ef-tier': tier, textContent: sectionOf(tag) });
+      var a = el('a', { className: 'ef-rail-link', 'data-ef-tier': tier, 'data-ef-tag': tag, textContent: sectionOf(tag) });
       a.href = '#';
       a.onclick = function (e) {
         e.preventDefault();
-        n.scrollIntoView({ behavior: 'smooth', block: 'start' });
-        // Collapsed groups scroll to a header that shows nothing; open it.
-        if (n.getAttribute('data-is-open') === 'false') n.click();
+        /*
+         * Re-resolve the target by TAG NAME at click time.
+         *
+         * Holding the node captured during build looks equivalent and is not:
+         * Swagger UI re-renders the operation list on expand, filter and
+         * server change, replacing every .opblock-tag element. The captured
+         * node is then detached, and scrollIntoView on a detached node is a
+         * silent no-op — the link appears dead with no error anywhere.
+         */
+        var target = null;
+        tagNodes().some(function (cand) {
+          if (tagNameOf(cand) === tag) { target = cand; return true; }
+          return false;
+        });
+        if (!target) return;
+
+        // Open a collapsed group BEFORE scrolling: expanding grows the page
+        // above the target and would leave the scroll short by that much.
+        if (target.getAttribute('data-is-open') === 'false') {
+          target.click();
+          setTimeout(function () { scrollToTagSettled(target); }, 120);
+        } else {
+          scrollToTagSettled(target);
+        }
       };
       rail.appendChild(a);
     });
@@ -1429,6 +1489,16 @@ const QUICK_LOGIN_JS = `
     watchInfoRerenders();
     tryBuildRail(20);
     tryMountWordmark(15);
+
+    // Delegated, not per-element: swagger-ui re-renders operation rows
+    // constantly, and a bound handler would need rebinding on every mutation.
+    document.addEventListener('click', function (e) {
+      var btn = e.target && e.target.closest && e.target.closest('.authorization__btn');
+      if (!btn) return;
+      e.preventDefault();
+      e.stopPropagation();
+      startQuickLogin();
+    }, true);
     // Re-apply the saved environment on load so the server selector and
     // Quick Login agree before anyone touches either.
     setTimeout(function () { syncSwaggerServer(selectedEnv().url); }, 600);
@@ -1655,6 +1725,12 @@ const SWAGGER_THEME_CSS = [
   // (The Partner guide DOES have a real dark mode; porting it here means
   // theming swagger-ui's own components, which is its own piece of work.)
   ':root{color-scheme:light}',
+  // NO scroll-behavior:smooth here, deliberately. Smooth scrolling is broken
+  // on this page in the same way the JS options form is: adding it made the
+  // working two-argument scrollTo(0, y) route through the same dead path and
+  // stop moving at all. An instant jump that lands is better than an animated
+  // one that does not.
+
   // !important is required, not sloppy: swagger-ui 5 ships its own
   // @media(prefers-color-scheme:dark) block, and a media-query rule at equal
   // specificity wins on source order. On a dark-mode browser that block paints
@@ -1664,7 +1740,8 @@ const SWAGGER_THEME_CSS = [
   '.swagger-ui{background:var(--ef-ground)!important}',
   '@media(prefers-color-scheme:dark){html,body,.swagger-ui{background:var(--ef-ground)!important;color:var(--ef-ink)!important}',
   '.swagger-ui .opblock,.swagger-ui .opblock-tag,.swagger-ui table,.swagger-ui .model-box{background:var(--ef-surface)!important;color:var(--ef-ink)!important}',
-  '.swagger-ui .info .title,.swagger-ui .info p,.swagger-ui .info li,.swagger-ui table td,.swagger-ui table th{color:var(--ef-ink)!important}}',
+  '.swagger-ui .info .title,.swagger-ui .info p,.swagger-ui .info li,.swagger-ui table td,.swagger-ui table th{color:var(--ef-ink)!important}',
+  '.swagger-ui .opblock-tag small,.swagger-ui .opblock-tag small p,.swagger-ui .opblock-tag>div>p,.swagger-ui .opblock-summary-description{color:var(--ef-ink-muted)!important}}',
   'body{background:var(--ef-ground)!important;font-family:var(--ef-sans)!important;color:var(--ef-ink)!important;-webkit-font-smoothing:antialiased}',
   '.swagger-ui,.swagger-ui .info,.swagger-ui .opblock-tag{font-family:var(--ef-sans)!important;color:var(--ef-ink)}',
   '.swagger-ui .info .title{letter-spacing:-.025em!important;color:var(--ef-ink)!important;background:none!important;-webkit-text-fill-color:var(--ef-ink)!important}',
@@ -1693,6 +1770,15 @@ const SWAGGER_THEME_CSS = [
   '.ef-rail-all{font-family:var(--ef-sans);font-size:11px;color:var(--ef-ink-faint);background:none;border:0;padding:0 0 4px;cursor:pointer;text-decoration:underline}',
   '.ef-rail-all:hover{color:var(--ef-accent)}',
 
+  // ── Per-operation padlock ──
+  // It opened the Authorize dialog, which Quick Login replaced — so it became
+  // a control that did nothing when clicked. The ICON still carries real
+  // information (this operation needs a credential), so it is rewired to open
+  // Quick Login rather than deleted: removing it would drop the signal along
+  // with the dead behaviour.
+  '.swagger-ui .authorization__btn{cursor:pointer!important;opacity:.55;transition:opacity .12s}',
+  '.swagger-ui .authorization__btn:hover{opacity:1}',
+
   // ── Built-in Authorize: removed ──
   // Everything it offered now lives in Quick Login, including Basic. Two doors
   // to one room is how a user ends up authorised in the wrong scheme.
@@ -1714,12 +1800,34 @@ const SWAGGER_THEME_CSS = [
   '.swagger-ui .info .title small{display:none!important}',
   '.swagger-ui .info{margin:0 0 28px!important;padding:56px 0 36px!important;border-bottom:2px solid var(--ef-ink)!important;background:none!important;box-shadow:none!important;border-radius:0!important}',
   '.swagger-ui .info .description{color:var(--ef-ink-muted)!important}',
+  // swagger-ui 5's dark block colours these #E4E6E6 — fine on its own dark
+  // ground, invisible on paper. The <p> inside the tag's <small> needs naming
+  // explicitly: styling .opblock-tag small alone loses to the more specific
+  // rule on the paragraph it wraps.
+  '.swagger-ui .opblock-tag small,.swagger-ui .opblock-tag small p,.swagger-ui .opblock-tag>div>p{color:var(--ef-ink-muted)!important}',
+  '.swagger-ui .opblock-tag small code{color:var(--ef-ink)!important;background:var(--ef-surface-alt)!important}',
+  '.swagger-ui .opblock .opblock-summary-description,.swagger-ui .parameter__name,.swagger-ui .parameter__type,.swagger-ui .response-col_status,.swagger-ui .response-col_description{color:var(--ef-ink-muted)!important}',
+  '.swagger-ui .opblock-description-wrapper p,.swagger-ui .opblock-external-docs-wrapper p,.swagger-ui .responses-inner h4,.swagger-ui .responses-inner h5{color:var(--ef-ink)!important}',
+  '.swagger-ui table thead tr th,.swagger-ui table tbody tr td{color:var(--ef-ink)!important}',
+  '.swagger-ui .download-url-button{background:var(--ef-accent)!important;color:#fff!important;border-color:var(--ef-accent)!important}',
   '.swagger-ui .info hgroup.main{margin:0!important}',
   // The old hero card decorated .info with a 6px rainbow bar (::before) and a
   // violet radial wash (::after). Both belonged to the gradient treatment this
   // restyle replaced; left in place they read as artefacts on paper.
   '.swagger-ui .info::before,.swagger-ui .info::after{display:none!important;content:none!important}',
-  '.swagger-ui .scheme-container{background:none!important;box-shadow:none!important;padding:0 0 24px!important;border-bottom:1px solid var(--ef-rule)!important;margin-bottom:24px!important}',
+  // The separator goes on the INNER .schemes.wrapper, never on
+  // .scheme-container. scheme-container is a full-bleed 100vw band sitting
+  // outside .wrapper, so a border on it draws straight across the fixed rail.
+  // The inner wrapper carries the same padding-left as the content column, so
+  // its rule starts where the text does.
+  '.swagger-ui .scheme-container{background:none!important;box-shadow:none!important;padding:0!important;border:0!important;margin-bottom:24px!important}',
+  // A pseudo-element, not a border. .schemes carries .wrapper's 264px
+  // padding-left, and a border draws on the BORDER box — which still begins
+  // at x=0, under the rail. A block child is laid out in the CONTENT box, so
+  // its rule starts exactly where the text does, at any viewport width, with
+  // no second breakpoint to keep in sync.
+  '.swagger-ui .scheme-container .schemes{padding-bottom:0!important;border:0!important}',
+  '.swagger-ui .scheme-container .schemes::after{content:"";display:block;border-bottom:1px solid var(--ef-rule);margin-top:24px}',
 ].join('');
 
 /*
