@@ -55,6 +55,13 @@ router.use(async (req, _res, next) => {
 
 router.use('/properties',      require('./properties'));
 router.use('/easyfixers',      require('./easyfixers'));
+/* A SECOND router on the same prefix (same split /jobs already uses): the
+ * READ-ONLY technician-app mirror, GET /easyfixers/:efrId/mirror/*. Paths are
+ * disjoint from easyfixers.js — nothing there matches three segments — so
+ * order does not matter. It replays the technician's own /api/mobile GETs
+ * in-process; see routes/admin/easyfixer-app-mirror.js for the gate and
+ * services/easyfixer-app-mirror.service.js for the security properties. */
+router.use('/easyfixers',      require('./easyfixer-app-mirror'));
 router.use('/zones',           require('./zones'));
 router.use('/pincodes',        require('./pincodes'));
 router.use('/cities',          require('./cities'));

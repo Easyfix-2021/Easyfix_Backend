@@ -675,6 +675,91 @@ async function overlayOpenJobCapabilities(snapshot, efrId, executor = pool) {
   };
 }
 
+/**
+ * OVERDUE TRAINING RESTRICTS THE APP — one overlay, for BOTH readers.
+ *
+ * This logic used to live inline in tech-auth.service.js findById, so it ran on
+ * the technician-token path ONLY. The CRM's own lifecycle read therefore could
+ * not see the single most common reason a technician's app is locked: it
+ * reported the plain lifecycle capabilities while the app showed the training
+ * wall. One function, called from both paths, removes that blind spot.
+ *
+ * A technician past the due date on assigned training keeps only what they need
+ * to get unstuck or get paid: training itself and claiming money. New work,
+ * attendance and every job mutation are withdrawn until they finish.
+ *
+ * Layered on top of the lifecycle capabilities rather than modelled as a new
+ * lifecycle STATUS, for three reasons:
+ *
+ *   - it is not a state of the technician's employment, it is a temporary
+ *     consequence of a deadline, and it clears itself the moment they finish —
+ *     no CRM transition, no log row, no reason code;
+ *   - `capabilitiesForStatus` is a pure, widely-tested function of status
+ *     alone, and threading an async training lookup through it would make every
+ *     caller async for a concern most of them do not have;
+ *   - the capability object is ALREADY the app's contract (the middleware
+ *     enforces it server-side and the app reads it to shape its UI), so
+ *     restricting here restricts every route and every screen at once.
+ *
+ * `claimMoney` is untouched: it is unconditionally true in the lifecycle model
+ * and withholding earned money over an unwatched video would be indefensible.
+ * `reapply` and `editRegistration` are also left alone — neither creates work.
+ *
+ * Deliberately NOT folded into getLifecycle(): transition() reads that function
+ * as the precondition for a state change, so withdrawing capabilities there
+ * would let a lapsed training deadline silently alter which CRM transitions are
+ * legal. Callers overlay it on the snapshot they SHOW, never on the one they
+ * DECIDE from.
+ *
+ * Three properties that must not drift — see the inline notes below and
+ * tests/easyfixer-training-overlay.test.js, which pins all three.
+ */
+async function overlayTrainingRestriction(snapshot, efrId) {
+  let overdue = false;
+  try {
+    overdue = await lms.hasOverdueTraining(efrId);
+  } catch (e) {
+    /*
+     * PROPERTY 1 — fail OPEN, by early RETURN rather than fall-through.
+     *
+     * Same outcome either way today, but the return makes the intent
+     * unfalsifiable: no later edit can quietly let a failed lookup reach the
+     * restriction below. A restriction is a punishment, and imposing one
+     * because a query failed is worse than briefly missing one.
+     * (overlayOpenJobCapabilities above is the mirror image: it GRANTS
+     * capability, so a failure there must fail CLOSED.)
+     */
+    logger.warn('Overdue-training check failed · efrId=' + efrId + ' · ' + e.message);
+    return snapshot;
+  }
+  /*
+   * PROPERTY 2 — no `trainingOverdue: false` on the happy path.
+   *
+   * The key only ever appears as `true`. Adding a `false` would change the
+   * /mobile/registration/status payload for every healthy technician, so the
+   * healthy path returns the snapshot untouched, not a rebuilt copy.
+   */
+  if (!overdue) return snapshot;
+  /*
+   * PROPERTY 3 — ORDERING. Callers must apply this AFTER
+   * overlayOpenJobCapabilities: both write the same operational capabilities,
+   * and the training restriction has to win over the INACTIVE-with-open-jobs
+   * re-grant. Spreading `snapshot.capabilities` last-write-wins only gives the
+   * right answer in that order.
+   */
+  return {
+    ...snapshot,
+    trainingOverdue: true,
+    capabilities: {
+      ...snapshot.capabilities,
+      receiveNewJobs: false,
+      continueAssignedJobs: false,
+      mutateAssignedJobs: false,
+      markAttendance: false,
+    },
+  };
+}
+
 async function getLifecycle(efrId) {
   const projection = await readProjection('e');
   const [[row]] = await pool.query(
@@ -1559,6 +1644,7 @@ module.exports = {
   operationalStatusForManager,
   getLifecycle,
   overlayOpenJobCapabilities,
+  overlayTrainingRestriction,
   transition,
   requestReapplication,
   getReapplicationSummary,
@@ -1591,6 +1677,7 @@ module.exports = {
     loadLifecycleCounts,
     countOpenJobs,
     overlayOpenJobCapabilities,
+    overlayTrainingRestriction,
     OPEN_JOB_STATUSES,
     managementAlertForTransition,
     managementAlertMessage,

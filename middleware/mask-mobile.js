@@ -65,12 +65,31 @@ const ALWAYS_MASKED_PATH_PREFIXES = [
   '/rewards/referrals',
 ];
 
+/*
+ * Same rule, for routes whose path carries an id and so has no static prefix.
+ *
+ * /easyfixers/:id/mirror/* replays the technician's own mobile screens into
+ * the CRM — their job list, their order detail — so its payload is a window
+ * onto every customer mobile that technician has ever touched. `?unmasked=true`
+ * is a bare query param any operator can append (see :98 below), and there is
+ * no edit form behind a read-only mirror, so the escape hatch has no
+ * legitimate use here and exactly one illegitimate one.
+ *
+ * Matched by pattern rather than by adding '/easyfixers' to the prefix list
+ * above: the rest of /easyfixers/* is edit forms that genuinely need the
+ * prefill, and blanket-masking them would break Manage Easyfixers.
+ */
+const ALWAYS_MASKED_PATH_PATTERNS = [
+  /^\/easyfixers\/\d+\/mirror(\/|$)/,
+];
+
 function isUnmaskedPath(reqPath) {
   return UNMASKED_PATH_PREFIXES.some((prefix) => reqPath === prefix || reqPath.startsWith(prefix + '/'));
 }
 
 function isAlwaysMaskedPath(reqPath) {
-  return ALWAYS_MASKED_PATH_PREFIXES.some((prefix) => reqPath === prefix || reqPath.startsWith(prefix + '/'));
+  return ALWAYS_MASKED_PATH_PREFIXES.some((prefix) => reqPath === prefix || reqPath.startsWith(prefix + '/'))
+    || ALWAYS_MASKED_PATH_PATTERNS.some((re) => re.test(reqPath));
 }
 
 /*

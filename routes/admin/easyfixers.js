@@ -459,12 +459,34 @@ function requireScheduledLifecyclePermission(req, res, next) {
   return isScheduled ? requireTemporaryInactivityAction(req, res, next) : next();
 }
 
+/*
+ * The lifecycle the TECHNICIAN's app is actually operating under.
+ *
+ * getLifecycle() alone is not that. It returns the stored status and the
+ * capabilities that follow from it — but the app also applies a training
+ * overlay that withdraws receiveNewJobs, continueAssignedJobs,
+ * mutateAssignedJobs and markAttendance whenever training is overdue.
+ *
+ * That overlay used to live inside the mobile auth path only, so a technician
+ * could be locked out of every job while this endpoint cheerfully reported an
+ * ACTIVE technician with full capabilities — and an overdue deadline is the
+ * single most common reason an app is locked. Ops had no way to see it.
+ *
+ * Applied to the RESPONSE, never inside getLifecycle(): transition() reads that
+ * function as the precondition for state changes, and withdrawing capabilities
+ * there would let a lapsed training deadline silently alter which transitions
+ * the CRM considers legal.
+ */
 router.get('/:id/lifecycle-status',
   validate(idParam, 'params'),
   async (req, res, next) => {
     try {
       if (!(await loadAndAuthorize(req, res))) return;
-      modernOk(res, { lifecycle: await lifecycle.getLifecycle(req.params.id) });
+      const stored = await lifecycle.getLifecycle(req.params.id);
+      // Fails OPEN — an unreachable training check returns `stored` untouched
+      // rather than inventing a restriction. See the function's own comment.
+      const effective = await lifecycle.overlayTrainingRestriction(stored, Number(req.params.id));
+      modernOk(res, { lifecycle: effective });
     } catch (e) {
       if (e.status) return modernError(res, e.status, e.message, e.details);
       next(e);

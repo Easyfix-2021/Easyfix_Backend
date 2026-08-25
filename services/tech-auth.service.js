@@ -3,8 +3,6 @@ const logger = require('../logger');
 const { resolveLoginOtp, otpExpiryDate, OTP_RESEND_SECONDS } = require('../utils/otp');
 const jwt = require('jsonwebtoken');
 const easyfixerLifecycle = require('./easyfixer-lifecycle.service');
-// Overdue training restricts app capabilities — see findById.
-const lms = require('./lms.service');
 const { withMysqlNamedLock } = require('./mysql-named-lock.service');
 const { istIsPast } = require('../utils/ist-calendar');
 const {
@@ -115,54 +113,18 @@ async function findById(id) {
     row.efr_id,
   );
 
-  /*
-   * OVERDUE TRAINING RESTRICTS THE APP.
-   *
-   * A technician past the due date on assigned training keeps only what they
-   * need to get unstuck or get paid: training itself and claiming money. New
-   * work, attendance and every job mutation are withdrawn until they finish.
-   *
-   * Layered on top of the lifecycle capabilities rather than modelled as a
-   * new lifecycle STATUS, for three reasons:
-   *
-   *   - it is not a state of the technician's employment, it is a temporary
-   *     consequence of a deadline, and it clears itself the moment they
-   *     finish — no CRM transition, no log row, no reason code;
-   *   - `capabilitiesForStatus` is a pure, widely-tested function of status
-   *     alone, and threading an async training lookup through it would make
-   *     every caller async for a concern most of them do not have;
-   *   - the capability object is ALREADY the app's contract (the middleware
-   *     enforces it server-side and the app reads it to shape its UI), so
-   *     restricting here restricts every route and every screen at once.
-   *
-   * `claimMoney` is untouched: it is unconditionally true in the lifecycle
-   * model and withholding earned money over an unwatched video would be
-   * indefensible. `reapply` and `editRegistration` are also left alone —
-   * neither creates work.
-   *
-   * Fail-OPEN. If this lookup throws, the technician keeps their normal
-   * capabilities. A restriction is a punishment; imposing one because a query
-   * failed would be worse than briefly missing one.
-   */
-  let trainingOverdue = false;
-  try {
-    trainingOverdue = await lms.hasOverdueTraining(row.efr_id);
-  } catch (e) {
-    logger.warn('Overdue-training check failed · efrId=' + row.efr_id + ' · ' + e.message);
-  }
-  const lifecycle = trainingOverdue
-    ? {
-      ...technicianRow,
-      trainingOverdue: true,
-      capabilities: {
-        ...technicianRow.capabilities,
-        receiveNewJobs: false,
-        continueAssignedJobs: false,
-        mutateAssignedJobs: false,
-        markAttendance: false,
-      },
-    }
-    : technicianRow;
+  // Then the overdue-training restriction, which withdraws receiveNewJobs,
+  // continueAssignedJobs, mutateAssignedJobs and markAttendance until the
+  // technician clears their deadline. The rationale, and the three properties
+  // that must not drift (fail-OPEN, never `trainingOverdue: false`, ordering),
+  // live with the function in easyfixer-lifecycle.service.js — it is shared
+  // with the CRM's lifecycle read so both paths compute capabilities the same
+  // way. `technicianRow` is already open-job-overlaid and forTechnician-
+  // redacted, so the required ordering holds by construction here.
+  const lifecycle = await easyfixerLifecycle.overlayTrainingRestriction(
+    technicianRow,
+    row.efr_id,
+  );
 
   return {
     ...row,
