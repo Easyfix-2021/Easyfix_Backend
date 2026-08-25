@@ -117,4 +117,16 @@ router.use('/feedback', require('./feedback'));
 // for the threat model and idempotency guards.
 router.use('/estimate', require('./estimate'));
 
+/*
+ * The I-Card QR target. Truly public: a customer scans the technician's card
+ * with their phone camera and gets an HTML page saying whether that person is
+ * a real EasyFix technician who is authorised RIGHT NOW. The token is an
+ * unguessable HMAC of the efr_id (see services/technician-verification.service),
+ * so this cannot be enumerated; the verdict is read live, so a deactivated or
+ * blacklisted technician's existing card reports "Not Authorised".
+ *
+ * Full path: /api/public/verify-technician/:token
+ */
+router.use('/verify-technician', require('./verify-technician'));
+
 module.exports = router;

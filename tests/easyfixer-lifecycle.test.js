@@ -960,3 +960,63 @@ test('no other lifecycle status is re-interpreted, and none pays for the query',
     assert.equal(after, before, `${status} must be returned untouched`);
   }
 });
+
+/*
+ * ⚠ FINALIZE IS A DURABLE OUTBOX MUTATION, SO A PERMANENT ERROR IS A DEAD LETTER.
+ *
+ * The app queues POST /registration/finalize behind every profile-card save
+ * (orderingKey "registration.profile"). An ACTIVE technician editing their
+ * identity therefore committed the save and then had the queued finalize
+ * rejected with 409 — which a retry can never clear, so the item dead-lettered
+ * and the technician was told "Couldn't save your identity" about data that was
+ * already written. Convergence on something already converged is success.
+ */
+test('gate-1 finalization is an idempotent no-op for every status past registration', () => {
+  const { resolveGate1Finalization } = lifecycle._internals;
+  const complete = {
+    personal_submitted: 1,
+    adhaar_card_number: '123456789012',
+    efr_profile_img: 'photo.jpg',
+  };
+
+  for (const status of [
+    'ACTIVE', 'UNDER_VERIFICATION', 'TRAINING_PENDING', 'UNDER_MASTER',
+    'PAUSED', 'INACTIVE', 'BLACKLISTED', 'SUSPENDED', 'DORMANT',
+    'OFFLINE', 'ON_BENCH',
+  ]) {
+    const decision = resolveGate1Finalization(status, complete, false);
+    assert.equal(decision.idempotent, true, `${status} must not throw`);
+    // target === current is what _protectLifecycle turns into "do not
+    // transition" — the no-op must never move anyone's lifecycle.
+    assert.equal(decision.target, status, `${status} must not be transitioned`);
+    assert.equal(decision.clearIdentityRejection, false);
+  }
+});
+
+test('gate-1 finalization still advances a technician who IS in registration', () => {
+  const { resolveGate1Finalization } = lifecycle._internals;
+  const complete = {
+    personal_submitted: 1,
+    adhaar_card_number: '123456789012',
+    efr_profile_img: 'photo.jpg',
+  };
+
+  // The real path is untouched: a complete Gate 1 still converges.
+  for (const status of ['NEW', 'REGISTRATION_INCOMPLETE', 'VERIFICATION_REJECTED']) {
+    assert.equal(resolveGate1Finalization(status, complete, false).target, 'UNDER_VERIFICATION');
+  }
+  // Outstanding training still diverts to TRAINING_PENDING rather than skipping it.
+  assert.equal(resolveGate1Finalization('NEW', complete, true).target, 'TRAINING_PENDING');
+  // An INCOMPLETE gate still THROWS (REGISTRATION_GATE1_INCOMPLETE) rather than
+  // silently converging — that guard is untouched.
+  assert.throws(
+    () => resolveGate1Finalization('NEW', { personal_submitted: 1 }, false),
+    /Gate 1 is incomplete/,
+  );
+  // And a REAPPLIED technician must STILL be refused: they owe the
+  // reapplication path, so a no-op here would strand them.
+  assert.throws(
+    () => resolveGate1Finalization('REAPPLIED', complete, false),
+    /cannot be finalized from REAPPLIED/,
+  );
+});

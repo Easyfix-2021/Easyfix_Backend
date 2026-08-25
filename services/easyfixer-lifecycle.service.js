@@ -46,6 +46,20 @@ const LEGACY_WORK_BLOCKED = new Set([
   'OFFLINE', 'ON_BENCH',
 ]);
 const REAPPLY_FROM = new Set(['INACTIVE', 'DORMANT', 'APPLICATION_REJECTED']);
+/*
+ * Statuses where Gate 1 is DEFINITIVELY behind the technician, so a
+ * registration-finalize call has nothing left to converge and must answer
+ * "already done" instead of erroring. See resolveGate1Finalization.
+ *
+ * REAPPLIED, ASSESSMENT_FAILED and APPLICATION_REJECTED are deliberately NOT
+ * here — each is a live decision point with its own path, and a silent no-op
+ * would hide it.
+ */
+const GATE1_SETTLED = new Set([
+  'UNDER_VERIFICATION', 'TRAINING_PENDING', 'ACTIVE', 'UNDER_MASTER',
+  'PAUSED', 'INACTIVE', 'BLACKLISTED', 'DORMANT', 'SUSPENDED',
+  'OFFLINE', 'ON_BENCH',
+]);
 const REASON_REQUIRED = new Set([
   'ASSESSMENT_FAILED',
   'VERIFICATION_REJECTED',
@@ -364,11 +378,38 @@ function gate1FinalizationDecision(currentStatus, gates = {}, trainingOutstandin
   };
 }
 
+/*
+ * FINALIZATION IS CONVERGENCE, SO "ALREADY THERE" IS SUCCESS — NOT A CONFLICT.
+ *
+ * GATE1_SETTLED is an explicit allowlist, NOT "everything that is not
+ * registration". REAPPLIED deliberately still throws: a returning technician
+ * has to travel the reapplication path, and silently no-op'ing their finalize
+ * would strand them mid-flow. ASSESSMENT_FAILED and APPLICATION_REJECTED are
+ * excluded for the same reason — they are decisions, not settled states.
+ *
+ * WHY THIS USED TO THROW 409, AND WHY THAT WAS WRONG. UNDER_VERIFICATION was
+ * special-cased as idempotent while everything else — ACTIVE included — threw
+ * `registration cannot be finalized from <status>`. But POST /registration/finalize
+ * is a DURABLE, REPLAY-SAFE outbox mutation: the app queues it behind every
+ * profile-card save with orderingKey "registration.profile" (see
+ * ApiRegistrationService.finalizeGateOne and ApiDeepSkillService), and its own
+ * comment calls it "a replay-safe no-op until every Gate-1 requirement exists".
+ *
+ * So an ACTIVE technician editing their identity committed the save, then had
+ * the queued finalize rejected 409 — a PERMANENT error handed to a retry queue,
+ * which dead-letters the item forever and surfaces to the technician as
+ * "Couldn't save your identity. Please try again." even though the identity had
+ * already been written. Retrying could never clear it.
+ *
+ * The endpoint's contract is the rule to follow: permanent non-applicability
+ * answers 200 with nothing changed; only TRANSIENT failures may error, because
+ * only those are worth a retry.
+ */
 function resolveGate1Finalization(currentStatus, gates = {}, trainingOutstanding = false) {
-  if (currentStatus === 'UNDER_VERIFICATION') {
+  if (GATE1_SETTLED.has(currentStatus)) {
     return {
       complete: true,
-      target: 'UNDER_VERIFICATION',
+      target: currentStatus,
       clearIdentityRejection: false,
       idempotent: true,
     };

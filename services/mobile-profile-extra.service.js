@@ -1,5 +1,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
+const verification = require('./technician-verification.service');
 const s3Storage = require('../utils/s3-storage');
 const { writeBuffer } = require('../utils/file-storage');
 // LMS completion -> lifecycle wire; see maybeAdvanceTrainingLifecycle below.
@@ -440,6 +441,14 @@ async function getICard(efrId) {
     memberSince: row.profile_activation_date_time ?? null, // VERIFY: activation date as "member since"
     rating,
     logos: [],
+    /*
+     * The QR target. Minted server-side ON PURPOSE: the old card built its QR
+     * on-device from the very data it was printing, so the code proved nothing
+     * that the card did not already claim. This URL resolves to a public page
+     * that re-reads the technician's status at scan time, which is what makes a
+     * deactivated or blacklisted card fail in a stranger's hands.
+     */
+    verifyUrl: verification.verifyUrlFor(row.efr_id ?? efrId),
   };
 }
 
