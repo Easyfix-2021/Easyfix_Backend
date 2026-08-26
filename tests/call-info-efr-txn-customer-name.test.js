@@ -429,3 +429,45 @@ test('the XLSX Customer column is fed by the RESOLVED alias, not the raw job col
   assert.equal(cellAt(1), 'Master Co', 'blank job name ⇒ the master name, never an empty cell');
   assert.equal(cellAt(2), 'Ravi Kumar', 'a job name ⇒ that job name');
 });
+
+/*
+ * ── listTransactions NAMES ONLY REAL COLUMNS ──────────────────────────────
+ *
+ * The Transactions modal 500'd for every technician: the query joined
+ * tbl_user on TJT.created_by, and tbl_job_transaction has no created_by.
+ * ORDER BY TJT.transaction_id was the same bug one line down — the PK is
+ * job_transaction_id — so fixing only the join would have moved the 500, not
+ * removed it.
+ *
+ * Both came from a comment that GUESSED the column list from a legacy DAO
+ * which only ever ran `SELECT *`, and so never had to name one. SELECT * is
+ * still fine; a JOIN or an ORDER BY is not. This pins the two that must be
+ * real, by name, against the live table's actual columns.
+ */
+const EFR_SRC = require('fs').readFileSync(
+  require('path').join(__dirname, '..', 'services/easyfixer.service.js'), 'utf8',
+);
+
+test('listTransactions joins and orders on columns tbl_job_transaction actually has', () => {
+  assert.match(EFR_SRC, /tx_user\.user_id = TJT\.updated_by/,
+    'the actor column is updated_by — there is no created_by on this table');
+  assert.match(EFR_SRC, /ORDER BY TJT\.job_transaction_id DESC/,
+    'the PK is job_transaction_id — there is no transaction_id');
+});
+
+test('neither phantom column survives anywhere in the transactions query', () => {
+  const fn = EFR_SRC.slice(EFR_SRC.indexOf('async function listTransactions('));
+  const body = fn.slice(0, fn.indexOf('\n}\n') + 3);
+  /*
+   * COMMENTS STRIPPED FIRST. The fix's own comment quotes the error verbatim
+   * ("Unknown column 'TJT.created_by'"), so a raw substring search matches the
+   * explanation and fails a file that is correct — the test would be reporting
+   * on prose, not on SQL. Only executable text is searched.
+   */
+  const sql = body.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  assert.equal(/TJT\.created_by/.test(sql), false, 'created_by does not exist');
+  assert.equal(/TJT\.transaction_id\b/.test(sql), false, 'transaction_id does not exist');
+  // And the check has teeth: the real column names ARE still there.
+  assert.match(sql, /TJT\.updated_by/);
+  assert.match(sql, /TJT\.job_transaction_id/);
+});

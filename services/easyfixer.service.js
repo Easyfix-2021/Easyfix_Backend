@@ -860,15 +860,23 @@ async function setStatus(id, { active, reasonId, comment, reactivationDate }, ac
 // `tbl_job_transaction` references) plus the labelled join columns the FE
 // modal needs verbatim.
 //
-// Assumptions:
-//   - tbl_job_transaction columns verified from CRM legacy DAO:
-//       fk_job_id, efr_charge, total_charge, ef_charge.
-//     Additional columns (transaction_id PK, ticket_created_date_time,
-//     amount, balance, description, created_by) are projected via SELECT *
-//     since legacy code only ever does `SELECT * from tbl_job_transaction
-//     where fk_job_id = ?` (JobDaoImpl.java#9018) without enumerating them.
-//   - Order by `TJT.transaction_id DESC` assumes that column exists; if
-//     not, the underlying error surfaces clearly.
+// tbl_job_transaction columns, read off the live table (2026-08-26) rather
+// than inferred — the whole column list is:
+//   job_transaction_id, fk_job_id, total_charge_and_tax, tax, total_charge,
+//   ef_charge, efr_charge, client_charge, collected_by, insert_date, updated_by
+//
+// The earlier note here guessed at "transaction_id PK ... created_by" from a
+// legacy DAO that only ever ran `SELECT *`, so it never had to name a column.
+// Both guesses were wrong, and both were used: the join on TJT.created_by made
+// this endpoint a hard 500 for every technician, and ORDER BY
+// TJT.transaction_id was the identical bug one line further down, waiting its
+// turn. It also predicted its own failure -- "assumes that column exists; if
+// not, the underlying error surfaces clearly" -- which it did, as a 500 in a
+// modal that opened and shut before anyone could read it.
+//
+// SELECT * is deliberate and unchanged: the FE renders whatever charge columns
+// exist. Only columns named in a JOIN or ORDER BY have to be real, and those
+// are now the two above.
 async function listTransactions(efrId, { limit = 10, offset = 0 } = {}) {
   logger.info('List easyfixer transactions · efrId=' + efrId + ' limit=' + limit + ' offset=' + offset);
   const [[{ total }]] = await pool.query(
@@ -911,15 +919,25 @@ async function listTransactions(efrId, { limit = 10, offset = 0 } = {}) {
             ad.landmark             AS customer_landmark,
             ad.pin_code             AS customer_pin_code,
             ci.city_name            AS location,
+            /*
+             * updated_by, NOT created_by — tbl_job_transaction has no
+             * created_by column at all, and the join on it made this endpoint
+             * a hard 500 for every technician (ER_BAD_FIELD_ERROR, "Unknown
+             * column 'TJT.created_by' in 'on clause'"). The real columns are
+             * job_transaction_id, fk_job_id, total_charge_and_tax, tax,
+             * total_charge, ef_charge, efr_charge, client_charge, collected_by,
+             * insert_date, updated_by. The alias trans_by is unchanged, so
+             * EasyfixerTransactionsModal.tsx is untouched.
+             */
             tx_user.user_name       AS trans_by
        FROM tbl_job_transaction TJT
        JOIN tbl_job J        ON J.job_id      = TJT.fk_job_id
        LEFT JOIN tbl_customer cu ON cu.customer_id = J.fk_customer_id
        LEFT JOIN tbl_address  ad ON ad.address_id  = J.fk_address_id
        LEFT JOIN tbl_city     ci ON ci.city_id     = ad.city_id
-       LEFT JOIN tbl_user     tx_user ON tx_user.user_id = TJT.created_by
+       LEFT JOIN tbl_user     tx_user ON tx_user.user_id = TJT.updated_by
       WHERE J.fk_easyfixter_id = ?
-      ORDER BY TJT.transaction_id DESC
+      ORDER BY TJT.job_transaction_id DESC
       LIMIT ? OFFSET ?`,
     [efrId, Number(limit), Number(offset)],
   );
