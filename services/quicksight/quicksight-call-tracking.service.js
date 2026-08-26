@@ -168,9 +168,42 @@ const { buildInFilter, _dateHelpers } = require('./_shared');
 const { istToday, fmt, addDays } = _dateHelpers;
 const { jobStatusLabel } = require('../../utils/job-status-label');
 
-// Row caps — named so the log line and the cap agree.
-const ROW_CAP = 5000;      // byJob rows, and byUser (day × user) rows
-const NESTED_CAP = 20000;  // breakdown rows stitched onto byJob / byUser
+/*
+ * A CALLER, not a sentinel. caller_id 0 means nobody on our side placed the
+ * call — it is how every INBOUND row is written — and an inbound call has no
+ * CRM user to attribute it to. Listing it here put a row called "Unattributed"
+ * in a table OF USERS, which is a category error: it is not a quiet user, it
+ * is the absence of one. Those calls are the Inbound tab's whole subject and
+ * are counted there, in totals, and in Missed Inbound.
+ */
+const REAL_CALLER = ' AND COALESCE(jci.caller_id, 0) > 0';
+
+/*
+ * ─── THE ROW CAPS ARE GONE (2026-08-26) ──────────────────────────────────
+ *
+ * ROW_CAP was 5000 on four grains and NESTED_CAP 20000 on the breakdowns
+ * stitched onto them. On an eight-month window three grains hit it — byJob
+ * alone wants 25,781 rows — and the truncation was SILENT: a warn in the log
+ * nobody reads, and a table that simply stopped, with footers summing the rows
+ * that survived. A report that quietly answers a smaller question than the one
+ * asked is worse than a slow one.
+ *
+ * They are removed together, deliberately. Removing only ROW_CAP would have
+ * moved the truncation rather than ended it: completeKeysOnly() dropped any key
+ * whose breakdown rows were cut at NESTED_CAP, so more parent rows with the
+ * same 20k nested budget means parents silently losing their To Whom and
+ * Called By columns. The caps were a matched pair and had to fall as one.
+ *
+ * WHAT THIS COSTS, MEASURED. Two years selected returns ~135k byJob rows and
+ * ~63k byUser rows in one response. That is a large payload and a very large
+ * table, and it will be slow. That is the honest trade the removal buys: the
+ * numbers are now complete at every window, and the cost is visible as
+ * slowness rather than hidden as a wrong total.
+ *
+ * DETAIL_CAP stays. It bounds ONE dialog's rows, is disclosed in the UI via
+ * `capped`, and is not a silent truncation of an aggregate.
+ */
+const DETAIL_CAP_ONLY_NOTE = true;
 const DETAIL_CAP = 500;    // per-call drill-down
 /*
  * Cap the daily trend so a very wide window cannot explode the chart. Set to a
@@ -738,7 +771,7 @@ const CALL_AGG = `
  *   they worked — which is the question "efficiency" is asking.
  *
  * It is COUNTED IN SQL, deliberately, and must stay that way: byUser is capped
- * at ROW_CAP day-rows, so deriving active days by counting a user's rows in that
+ * at a row cap, so deriving active days by counting a user's rows in that
  * array would UNDER-count the denominator the moment the cap bites and INFLATE
  * every average built on it. The cap can drop rows; COUNT(DISTINCT …) cannot.
  *
@@ -801,25 +834,15 @@ function foldSteps(rows) {
 }
 
 /*
- * Keep only breakdown rows whose stitch key is COMPLETE.
+ * The nested breakdown queries keep their `ORDER BY <stitch key>`.
  *
- * The nested queries below are ORDER BY <stitch key> precisely so the LIMIT
- * boundary falls BETWEEN keys. With the old global `ORDER BY calls DESC` a hit
- * cap dropped the smallest counts spread across keys that were still on screen,
- * so steps[] / parties[] silently under-reported and no longer summed to the
- * row's own `calls` (and the XLSX printed a partial list beside a full total).
- * Ordering by the key leaves exactly ONE key that the limit can still cut in
- * half — the last one — so when the cap is hit its rows are dropped outright:
- * that row stitches nothing (the cell reads '—') instead of showing numbers that
- * contradict the count next to them.
+ * The ordering was originally there so a LIMIT boundary fell BETWEEN keys
+ * rather than through the middle of one. The LIMITs are gone, so nothing can
+ * cut a key any more and the guard that dropped half-read keys
+ * (completeKeysOnly) has been deleted with them — every stitch key is complete
+ * by construction now. The ordering stays because groupBy() below walks the
+ * rows in order, and it costs nothing.
  */
-function completeKeysOnly(rows, keyOf, cap) {
-  if (rows.length < cap) return rows;
-  const lastKey = keyOf(rows[rows.length - 1]);
-  let end = rows.length;
-  while (end > 0 && keyOf(rows[end - 1]) === lastKey) end -= 1;
-  return rows.slice(0, end);
-}
 
 // Group breakdown rows by a stitch key, mapping each row through `shape`.
 function groupBy(rows, keyOf, shape) {
@@ -1048,11 +1071,9 @@ async function getCallTracking(filters = {}) {
        ${sJ.from} ${sJ.where}
         AND COALESCE(jci.job_id, 0) > 0
       GROUP BY jci.job_id
-      ORDER BY calls DESC, jci.job_id DESC
-      LIMIT ${ROW_CAP}`,
+      ORDER BY calls DESC, jci.job_id DESC`,
     sJ.params,
   );
-  if (jobRows.length >= ROW_CAP) logger.warn(`Call Tracking (by job) hit the ${ROW_CAP}-row cap`);
 
   /*
    * ── Per-(DAY, USER) grain ──
@@ -1072,13 +1093,11 @@ async function getCallTracking(filters = {}) {
             MAX(jci.inserted_time) AS lastCallAt
        ${sU.from}
        LEFT JOIN tbl_user u ON u.user_id = jci.caller_id
-       ${sU.where}
+       ${sU.where}${REAL_CALLER}
       GROUP BY ${DAY_EXPR}, jci.caller_id
-      ORDER BY day DESC, calls DESC
-      LIMIT ${ROW_CAP}`,
+      ORDER BY day DESC, calls DESC`,
     sU.params,
   );
-  if (userRows.length >= ROW_CAP) logger.warn(`Call Tracking (daily by user) hit the ${ROW_CAP}-row cap`);
 
   /*
    * ── Per-USER grain, WHOLE WINDOW ──
@@ -1086,7 +1105,7 @@ async function getCallTracking(filters = {}) {
    * entire window, carrying the per-day efficiency averages. Same buildScope, so
    * it is scoped by the SAME filters as the daily grain and the two reconcile —
    * SUM(byUser.calls) === SUM(byUserCombined.calls) for any filter set (as long
-   * as neither hit ROW_CAP, which is logged when it happens).
+   * as neither was truncated — the row caps are gone, see the header).
    *
    * It is its OWN grouped query rather than a JS roll-up of byUser for two
    * reasons: byUser is row-capped (a roll-up of a truncated array under-reports),
@@ -1109,13 +1128,11 @@ async function getCallTracking(filters = {}) {
             MAX(jci.inserted_time) AS lastCallAt
        ${sUC.from}
        LEFT JOIN tbl_user u ON u.user_id = jci.caller_id
-       ${sUC.where}
+       ${sUC.where}${REAL_CALLER}
       GROUP BY jci.caller_id
-      ORDER BY calls DESC, jci.caller_id
-      LIMIT ${ROW_CAP}`,
+      ORDER BY calls DESC, jci.caller_id`,
     sUC.params,
   );
-  if (combinedRows.length >= ROW_CAP) logger.warn(`Call Tracking (combined by user) hit the ${ROW_CAP}-row cap`);
 
   /*
    * ── Per-(DAY × CALLER × DIRECTION) grain, NO JOB ATTACHED ──
@@ -1131,7 +1148,7 @@ async function getCallTracking(filters = {}) {
    * one row that is mostly legacy inbound traffic under a caller who placed
    * none of it.
    *
-   * Same buildScope, same CALL_AGG, same ROW_CAP as every grain above — the
+   * Same buildScope and same CALL_AGG as every grain above — the
    * ONLY addition is NO_JOB, so these rows are exactly `totals` minus `byJob`'s
    * population and nothing double-counts.
    */
@@ -1148,11 +1165,9 @@ async function getCallTracking(filters = {}) {
        LEFT JOIN tbl_user u ON u.user_id = jci.caller_id
        ${sO.where}${NO_JOB}
       GROUP BY ${DAY_EXPR}, ${DIRECTION}, jci.caller_id
-      ORDER BY day DESC, calls DESC
-      LIMIT ${ROW_CAP}`,
+      ORDER BY day DESC, calls DESC`,
     sO.params,
   );
-  if (otherRows.length >= ROW_CAP) logger.warn(`Call Tracking (other calls) hit the ${ROW_CAP}-row cap`);
 
   /*
    * ── Nested breakdowns ──
@@ -1181,12 +1196,10 @@ async function getCallTracking(filters = {}) {
          LEFT JOIN tbl_user u ON u.user_id = jci.caller_id
          ${sC.where} AND jci.job_id IN (${jobIn})
         GROUP BY jci.job_id, jci.caller_id
-        ORDER BY jci.job_id, calls DESC
-        LIMIT ${NESTED_CAP}`,
+        ORDER BY jci.job_id, calls DESC`,
       [...sC.params, ...jobIds],
     );
-    if (callerRows.length >= NESTED_CAP) logger.warn(`Call Tracking (job callers) hit the ${NESTED_CAP}-row cap`);
-    callersByJob = groupBy(completeKeysOnly(callerRows, jobKey, NESTED_CAP), jobKey, (r) => ({
+    callersByJob = groupBy(callerRows, jobKey, (r) => ({
       userId: drillableUserId(r.userId),
       userName: r.userName || (drillableUserId(r.userId) == null ? 'Unattributed' : `User #${n(r.userId)}`),
       calls: n(r.calls),
@@ -1201,12 +1214,10 @@ async function getCallTracking(filters = {}) {
          ${sP.from}
          ${sP.where} AND jci.job_id IN (${jobIn})
         GROUP BY jci.job_id, ${PARTY_ROLE}
-        ORDER BY jci.job_id, calls DESC
-        LIMIT ${NESTED_CAP}`,
+        ORDER BY jci.job_id, calls DESC`,
       [...sP.params, ...jobIds],
     );
-    if (partyRows.length >= NESTED_CAP) logger.warn(`Call Tracking (job parties) hit the ${NESTED_CAP}-row cap`);
-    partiesByJob = groupBy(completeKeysOnly(partyRows, jobKey, NESTED_CAP), jobKey, (r) => ({ role: r.role || 'Other', calls: n(r.calls) }));
+    partiesByJob = groupBy(partyRows, jobKey, (r) => ({ role: r.role || 'Other', calls: n(r.calls) }));
 
     // AT WHICH STEP, per job — from the SNAPSHOT columns, so this is history,
     // not a re-read of today's status.
@@ -1217,19 +1228,17 @@ async function getCallTracking(filters = {}) {
          ${sS.from}
          ${sS.where} AND jci.job_id IN (${jobIn})
         GROUP BY jci.job_id, jci.job_status, ${ASSIGNED_AT_CALL}
-        ORDER BY jci.job_id, calls DESC
-        LIMIT ${NESTED_CAP}`,
+        ORDER BY jci.job_id, calls DESC`,
       [...sS.params, ...jobIds],
     );
-    if (stepRows.length >= NESTED_CAP) logger.warn(`Call Tracking (job steps) hit the ${NESTED_CAP}-row cap`);
-    const rawStepsByJob = groupBy(completeKeysOnly(stepRows, jobKey, NESTED_CAP), jobKey, (r) => r);
+    const rawStepsByJob = groupBy(stepRows, jobKey, (r) => r);
     stepsByJob = new Map([...rawStepsByJob].map(([k, v]) => [k, foldSteps(v)]));
   }
 
   // Per-(day, user) breakdowns. Keyed 'YYYY-MM-DD|userId'. Restricting on the
   // caller ids alone is enough — the day axis is already the scope window — and
   // any (day,user) pair the capped grain above dropped simply goes unstitched.
-  // These are ordered BY THAT KEY and passed through completeKeysOnly for the
+  // These are ordered BY THAT KEY for the
   // reason documented there: a partial breakdown under a full count lies.
   let partiesByUser = new Map();
   let stepsByUser = new Map();
@@ -1241,12 +1250,10 @@ async function getCallTracking(filters = {}) {
          ${sUP.from}
          ${sUP.where} AND jci.caller_id IN (${userIn})
         GROUP BY ${DAY_EXPR}, jci.caller_id, ${PARTY_ROLE}
-        ORDER BY day, jci.caller_id, calls DESC
-        LIMIT ${NESTED_CAP}`,
+        ORDER BY day, jci.caller_id, calls DESC`,
       [...sUP.params, ...userIds],
     );
-    if (upRows.length >= NESTED_CAP) logger.warn(`Call Tracking (user parties) hit the ${NESTED_CAP}-row cap`);
-    partiesByUser = groupBy(completeKeysOnly(upRows, userKey, NESTED_CAP), userKey, (r) => ({ role: r.role || 'Other', calls: n(r.calls) }));
+    partiesByUser = groupBy(upRows, userKey, (r) => ({ role: r.role || 'Other', calls: n(r.calls) }));
 
     const sUS = buildScope(filters);
     const [usRows] = await pool.query(
@@ -1255,12 +1262,10 @@ async function getCallTracking(filters = {}) {
          ${sUS.from}
          ${sUS.where} AND jci.caller_id IN (${userIn})
         GROUP BY ${DAY_EXPR}, jci.caller_id, jci.job_status, ${ASSIGNED_AT_CALL}
-        ORDER BY day, jci.caller_id, calls DESC
-        LIMIT ${NESTED_CAP}`,
+        ORDER BY day, jci.caller_id, calls DESC`,
       [...sUS.params, ...userIds],
     );
-    if (usRows.length >= NESTED_CAP) logger.warn(`Call Tracking (user steps) hit the ${NESTED_CAP}-row cap`);
-    const rawStepsByUser = groupBy(completeKeysOnly(usRows, userKey, NESTED_CAP), userKey, (r) => r);
+    const rawStepsByUser = groupBy(usRows, userKey, (r) => r);
     stepsByUser = new Map([...rawStepsByUser].map(([k, v]) => [k, foldSteps(v)]));
   }
 
@@ -1268,12 +1273,12 @@ async function getCallTracking(filters = {}) {
    * Per-USER (whole-window) breakdowns. Keyed on caller_id ALONE — the day is not
    * part of this grain. Same machinery as every other breakdown above: ONE
    * grouped query per breakdown, restricted to the caller ids this grain actually
-   * returned, ordered BY THE STITCH KEY and filtered through completeKeysOnly so
+   * returned, ordered BY THE STITCH KEY so
    * a hit cap drops whole keys instead of leaving a half-counted list beside a
    * full total.
    *
    * The ids come from combinedRows, NOT from the daily grain: if byUser hit
-   * ROW_CAP its caller set can be a strict subset, and stitching off it would
+   * a row cap its caller set could be a strict subset, and stitching off it would
    * leave the tail of the combined table with empty parties/steps.
    */
   const combinedUserIds = [...new Set(
@@ -1291,12 +1296,10 @@ async function getCallTracking(filters = {}) {
          ${sCP.from}
          ${sCP.where} AND jci.caller_id IN (${combIn})
         GROUP BY jci.caller_id, ${PARTY_ROLE}
-        ORDER BY jci.caller_id, calls DESC
-        LIMIT ${NESTED_CAP}`,
+        ORDER BY jci.caller_id, calls DESC`,
       [...sCP.params, ...combinedUserIds],
     );
-    if (cpRows.length >= NESTED_CAP) logger.warn(`Call Tracking (combined user parties) hit the ${NESTED_CAP}-row cap`);
-    partiesByCaller = groupBy(completeKeysOnly(cpRows, callerKey, NESTED_CAP), callerKey, (r) => ({ role: r.role || 'Other', calls: n(r.calls) }));
+    partiesByCaller = groupBy(cpRows, callerKey, (r) => ({ role: r.role || 'Other', calls: n(r.calls) }));
 
     const sCS = buildScope(filters);
     const [csRows] = await pool.query(
@@ -1305,18 +1308,16 @@ async function getCallTracking(filters = {}) {
          ${sCS.from}
          ${sCS.where} AND jci.caller_id IN (${combIn})
         GROUP BY jci.caller_id, jci.job_status, ${ASSIGNED_AT_CALL}
-        ORDER BY jci.caller_id, calls DESC
-        LIMIT ${NESTED_CAP}`,
+        ORDER BY jci.caller_id, calls DESC`,
       [...sCS.params, ...combinedUserIds],
     );
-    if (csRows.length >= NESTED_CAP) logger.warn(`Call Tracking (combined user steps) hit the ${NESTED_CAP}-row cap`);
-    const rawStepsByCaller = groupBy(completeKeysOnly(csRows, callerKey, NESTED_CAP), callerKey, (r) => r);
+    const rawStepsByCaller = groupBy(csRows, callerKey, (r) => r);
     stepsByCaller = new Map([...rawStepsByCaller].map(([k, v]) => [k, foldSteps(v)]));
   }
 
   /*
    * The no-job grain's `parties` breakdown — the SAME one grouped query,
-   * ordered by the stitch key and filtered through completeKeysOnly, that every
+   * ordered by the stitch key, that every
    * other breakdown above uses.
    *
    * NO `steps` counterpart, deliberately: jci.job_status is the snapshot of a
@@ -1345,12 +1346,10 @@ async function getCallTracking(filters = {}) {
          ${sOP.from}
          ${sOP.where}${NO_JOB} AND jci.caller_id IN (${otherIn})
         GROUP BY ${DAY_EXPR}, ${DIRECTION}, jci.caller_id, ${PARTY_ROLE}
-        ORDER BY day, direction, jci.caller_id, calls DESC
-        LIMIT ${NESTED_CAP}`,
+        ORDER BY day, direction, jci.caller_id, calls DESC`,
       [...sOP.params, ...otherCallerIds],
     );
-    if (opRows.length >= NESTED_CAP) logger.warn(`Call Tracking (other-call parties) hit the ${NESTED_CAP}-row cap`);
-    partiesByOther = groupBy(completeKeysOnly(opRows, otherKey, NESTED_CAP), otherKey, (r) => ({ role: r.role || 'Other', calls: n(r.calls) }));
+    partiesByOther = groupBy(opRows, otherKey, (r) => ({ role: r.role || 'Other', calls: n(r.calls) }));
   }
 
   /*
@@ -1506,7 +1505,15 @@ async function getCallTracking(filters = {}) {
       day: r.day,
       direction: r.direction,
       userId: id,
-      userName: id == null ? 'Unattributed' : (r.userName || `User #${n(r.userId)}`),
+      /*
+       * Name the row for what it IS, not for what it lacks. "Unattributed"
+       * described a missing caller_id — true, and useless to an operator: on an
+       * INBOUND row there was never going to be one, because nobody here placed
+       * the call. These are people ringing us.
+       */
+      userName: id == null
+        ? (r.direction === 'IN' ? 'Incoming caller' : 'No caller recorded')
+        : (r.userName || `User #${n(r.userId)}`),
       ...shapeAgg(r),
       parties: partiesByOther.get(otherKey(r)) || [],
       // RAW DB datetime strings, exactly as byJob / byUser return them — this
