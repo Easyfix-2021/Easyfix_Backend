@@ -348,6 +348,24 @@ const PROVIDER_CLAUSE = Object.freeze({
 });
 
 const n = (v) => Number(v) || 0;
+
+/*
+ * A caller id the CRM can actually drill on, or null.
+ *
+ * `jci.caller_id` is projected raw, and the column really does contain 0 for
+ * calls with no attributed caller — a sentinel, not a tbl_user id. Passing it
+ * through as 0 broke the CRM twice over: the drill-down guard tests
+ * `userId == null`, which 0 slips past, so the count rendered as a link and
+ * the request came back 400 ("selectedCallerId must be >= 1"); and the label
+ * fallback rendered "User #0". Normalising here fixes every consumer at once
+ * — both CRM tables, the XLSX export, and anything added later — instead of
+ * asking each one to remember that 0 is special.
+ */
+function drillableUserId(raw) {
+  const id = n(raw);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
 const pct = (part, whole) => (whole > 0 ? Math.round((part / whole) * 100) : 0);
 
 // 'YYYY-MM-DD' -> UTC-midnight Date (pairs with the UTC-based _dateHelpers, so
@@ -970,7 +988,6 @@ async function getCallTracking(filters = {}) {
   const userIds = [...new Set(userRows.map((r) => (r.userId == null ? null : n(r.userId))).filter((v) => v != null))];
   const jobIn = jobIds.map(() => '?').join(',');
   const userIn = userIds.map(() => '?').join(',');
-
   // WHO called, per job.
   let callersByJob = new Map();
   let partiesByJob = new Map();
@@ -993,8 +1010,8 @@ async function getCallTracking(filters = {}) {
     );
     if (callerRows.length >= NESTED_CAP) logger.warn(`Call Tracking (job callers) hit the ${NESTED_CAP}-row cap`);
     callersByJob = groupBy(completeKeysOnly(callerRows, jobKey, NESTED_CAP), jobKey, (r) => ({
-      userId: r.userId == null ? null : n(r.userId),
-      userName: r.userName || `User #${n(r.userId)}`,
+      userId: drillableUserId(r.userId),
+      userName: r.userName || (drillableUserId(r.userId) == null ? 'Unattributed' : `User #${n(r.userId)}`),
       calls: n(r.calls),
     }));
 
@@ -1200,8 +1217,8 @@ async function getCallTracking(filters = {}) {
     const top = steps[0] || null;
     return {
       day: r.day,
-      userId: r.userId == null ? null : n(r.userId),
-      userName: r.userName || `User #${n(r.userId)}`,
+      userId: drillableUserId(r.userId),
+      userName: r.userName || (drillableUserId(r.userId) == null ? 'Unattributed' : `User #${n(r.userId)}`),
       ...shapeAgg(r),
       uniqueJobs: n(r.unique_jobs),
       topStatus: top ? top.status : null,
@@ -1236,7 +1253,7 @@ async function getCallTracking(filters = {}) {
     const agg = shapeAgg(r);
     return {
       userId: id,
-      userName: r.userName || `User #${n(r.userId)}`,
+      userName: r.userName || (drillableUserId(r.userId) == null ? 'Unattributed' : `User #${n(r.userId)}`),
       activeDays,
       ...agg,
       uniqueJobs: n(r.unique_jobs),
