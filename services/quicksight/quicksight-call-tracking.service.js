@@ -448,6 +448,35 @@ const CP_NUM = `CASE WHEN UPPER(COALESCE(k.call_type, 'OUT')) = 'IN' THEN k.call
 const CP_NAME = `CASE WHEN UPPER(COALESCE(k.call_type, 'OUT')) = 'IN' THEN k.caller_name ELSE k.reciever_name END`;
 
 /*
+ * The customer this row NAMES, confirmed by the number actually dialled.
+ *
+ * ─── WHY THE ID IS NOT ENOUGH, AND THIS IS THE THIRD TIME ─────────────────
+ *
+ * A direct call to a customer — placed from the Customers list with no job in
+ * context — stores cust.customer_id in reciever_id (routes/admin/calls.js:277).
+ * So an id lookup looks like the obvious, cheap answer.
+ *
+ * It is a trap. customer_id and efr_id are separate auto-increment sequences
+ * and they collide numerically, so reading one as the other does not FAIL — it
+ * returns a confident wrong row. Measured on live job-less calls since 2025:
+ * of 9,685 whose reciever_id matches a tbl_customer row, 7,411 (77%) were
+ * dialled on the number of the EASYFIXER with that same id, and only 473 (5%)
+ * on the customer's. A bare `WHEN cu2.customer_id IS NOT NULL THEN 'Customer'`
+ * would have relabelled 7,411 technician calls as customer calls.
+ *
+ * (The same overlap bit `location.user_id` — read as an efr_id it showed one
+ * technician's position under another's name — and `caller_id`, which is why
+ * CALLER_KIND exists. Three columns, one lesson.)
+ *
+ * So the id only PINS a candidate; the dialled number CONFIRMS it. A scalar
+ * subquery on the primary key returns at most one row, so it cannot multiply
+ * the aggregates that read PARTY_ROLE — the same property the technician arm
+ * below relies on, and the reason neither is a join.
+ */
+const CUSTOMER_BY_ID_NUMBER = `(SELECT ${d10('cu2.customer_mob_no')}
+          FROM tbl_customer cu2 WHERE cu2.customer_id = jci.reciever_id)`;
+
+/*
  * Is this number a technician's, on a call with NO job to say so?
  *
  * ─── WHY A SEMI-JOIN AND NOT A JOIN ──────────────────────────────────────
@@ -497,6 +526,13 @@ const PARTY_ROLE = `CASE
          * answer, and this must never overrule them — a customer who happens to
          * share a number with some technician stays a Customer.
          */
+        /*
+         * Job-free arms. Below every job-derived arm, so a job's own parties
+         * always decide; Customer above Technician, matching the priority the
+         * job-derived arms already establish.
+         */
+        WHEN jci.cp_d10 IS NOT NULL
+         AND jci.cp_d10 = ${CUSTOMER_BY_ID_NUMBER}        THEN 'Customer'
         WHEN jci.cp_d10 IN ${EFR_NUMBERS}                THEN 'Technician'
         ELSE 'Other'
       END`;
@@ -519,6 +555,10 @@ const PARTY_NAME = `CASE
          * a shared number is arbitrary by necessity; showing one of 28 names as
          * if it were certain is the worse option.
          */
+        WHEN jci.cp_d10 IS NOT NULL
+         AND jci.cp_d10 = ${CUSTOMER_BY_ID_NUMBER}        THEN COALESCE(
+          (SELECT cu4.customer_name FROM tbl_customer cu4 WHERE cu4.customer_id = jci.reciever_id),
+          jci.cp_name)
         WHEN jci.cp_d10 IN ${EFR_NUMBERS}                THEN COALESCE(
           (SELECT MIN(ec3.efr_name) FROM tbl_easyfixer ec3 WHERE ${d10('ec3.efr_no')} = jci.cp_d10),
           jci.cp_name)
