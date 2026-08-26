@@ -1543,9 +1543,11 @@ router.get('/customers/:customerId/addresses', async (req, res, next) => {
 // preview). Column set mirrors what the SPOC sees in the dashboard table.
 // Status code is converted to legacy label so the spreadsheet reads
 // naturally to non-technical recipients.
-// Hard cap on an export. Named (not inlined) because the response now reports
-// it: a workbook that silently stops at N rows reads as a complete answer.
-const EXPORT_ROW_CAP = 5000;
+// Hard cap on an export. Named (not inlined) because the response REPORTS it:
+// a workbook that silently stops at N rows reads as a complete answer, and the
+// reader has no way to tell a full export from a truncated one by looking at
+// it. Raised 5,000 → 10,000 on 2026-08-26.
+const EXPORT_ROW_CAP = 10000;
 
 router.get('/export/jobs', async (req, res, next) => {
   try {
@@ -1564,7 +1566,24 @@ router.get('/export/jobs', async (req, res, next) => {
       ...clientJobFilters(req, hier),
       limit: EXPORT_ROW_CAP,
     });
-    if (total > rows.length) {
+    /*
+     * The truncation notice travels in HEADERS, because the body of this
+     * response is an .xlsx binary and there is nowhere in it to put a caveat
+     * the reader would see. The browser can read these off the fetch and say
+     * so on the page — see downloadBlob() in the portal's lib/api.ts.
+     *
+     * Access-Control-Expose-Headers is REQUIRED: the portal is served from a
+     * different origin to the API, and a cross-origin fetch cannot see any
+     * response header that is not named here. Without it these are set,
+     * delivered, and invisible — the exact failure this is meant to prevent.
+     */
+    const truncated = total > rows.length;
+    res.setHeader('X-Export-Row-Cap', String(EXPORT_ROW_CAP));
+    res.setHeader('X-Export-Total', String(total));
+    res.setHeader('X-Export-Truncated', truncated ? '1' : '0');
+    res.setHeader('Access-Control-Expose-Headers',
+      'X-Export-Row-Cap, X-Export-Total, X-Export-Truncated, Content-Disposition');
+    if (truncated) {
       logger.warn('Client export TRUNCATED · ' + rows.length + ' of ' + total + ' rows · clientId=' + req.spoc.client_id);
     }
     logger.info('Exporting ' + rows.length + ' jobs to xlsx');

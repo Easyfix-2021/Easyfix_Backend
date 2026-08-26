@@ -25,13 +25,23 @@ const { installFakePool } = require('./helpers/fake-pool');
 /* The caller's subtree. 42 is the SPOC, 43/44 report to them; 99 does NOT. */
 let subtree = [{ id: 42 }, { id: 43 }, { id: 44 }];
 let me = { manager_id: 7 };            // not top of the tree → scoped
+let matchingTotal = 3;                 // what COUNT(*) reports for the filter set
 
 const fake = installFakePool([
   [/SELECT manager_id FROM tbl_client_contacts/i, () => [me]],
   [/WITH RECURSIVE team/i, () => subtree],
-  [/SELECT COUNT\(\*\) AS total/i, () => [{ total: 3 }]],
+  [/SELECT COUNT\(\*\) AS total/i, () => [{ total: matchingTotal }]],
   [/INFORMATION_SCHEMA/i, []],
-  [/FROM tbl_job j/i, () => []],
+  /*
+   * The data query returns as many rows as its own LIMIT allows, exactly like
+   * a real DB would — the last two bound params are limit and offset. Returning
+   * a fixed [] made total > rows.length for ANY total, so the truncation flag
+   * was true even when nothing had been dropped.
+   */
+  [/FROM tbl_job j/i, (sql, params) => {
+    const limit = Number(params[params.length - 2]) || 50;
+    return Array.from({ length: Math.min(matchingTotal, limit) }, (_, i) => ({ job_id: i + 1 }));
+  }],
 ]);
 
 const router = require('../routes/client/index');
@@ -63,10 +73,19 @@ async function call(path, query = {}) {
 /* Every SELECT the handler ran against tbl_job, list + count alike. */
 const jobQueries = () => fake.calls.filter((c) => /FROM tbl_job j/i.test(c.sql));
 
+/*
+ * The paged data query, as opposed to its COUNT sibling. Discriminated on
+ * `LIMIT ? OFFSET ?`, which only the data query carries — NOT on the absence
+ * of "SELECT COUNT", because the LIST projection embeds a service_count
+ * subquery and that predicate quietly matched nothing at all.
+ */
+const listQuery = () => jobQueries().find((c) => /LIMIT \? OFFSET \?/.test(c.sql));
+
 beforeEach(() => {
   fake.reset();
   subtree = [{ id: 42 }, { id: 43 }, { id: 44 }];
   me = { manager_id: 7 };
+  matchingTotal = 3;
 });
 
 /* ─── the drop itself ──────────────────────────────────────────────────── */
@@ -210,4 +229,68 @@ test('/export/jobs honours the same filters as the list it was exported from', a
   assert.match(c.sql, /j\.job_status IN \(/, 'statuses');
   assert.match(c.sql, /ad\.city_id IN \(/, 'cityIds');
   assert.match(c.sql, /ready_for_billing/, 'flag');
+});
+
+/* ─── escalation: wired 2026-08-26, a documented no-op before that ──────── */
+
+test('flag=escalatedJobs filters on the ratings table — it used to list EVERY job', async () => {
+  await call('/jobs', { flag: 'escalatedJobs' });
+  for (const c of jobQueries()) {
+    assert.match(c.sql, /EXISTS \(\s*SELECT 1 FROM tbl_easyfixer_rating_by_customer/,
+      'the client was shown their whole book under an "Escalated Orders" header');
+    assert.match(c.sql, /esc_f\.is_escalated = 1/, 'the flag itself, not merely a rating row');
+  }
+});
+
+test('the escalation filter is EXISTS, never a join — a job with two rating rows must not double', async () => {
+  await call('/jobs', { flag: 'escalatedJobs' });
+  const countQ = jobQueries().find((c) => /SELECT COUNT\(\*\)/.test(c.sql));
+  assert.ok(countQ, 'the count must run');
+  assert.doesNotMatch(countQ.sql, /JOIN tbl_easyfixer_rating_by_customer/,
+    'a JOIN would multiply the row per rating and inflate the total');
+});
+
+test('escalation columns are appended ONLY when escalation is asked for', async () => {
+  await call('/jobs', { flag: 'escalatedJobs' });
+  const listQ = listQuery();
+  assert.match(listQ.sql, /escu\.user_name AS escalated_by_name/,
+    'the page renders this column and received nothing before');
+  assert.match(listQ.sql, /MAX\(e2\.table_id\)/,
+    'pick the LATEST rating row, not whichever the optimiser reached first');
+
+  fake.reset();
+  await call('/jobs', {});
+  const plain = listQuery();
+  assert.doesNotMatch(plain.sql, /escalated_by_name/,
+    'every other caller of jobService.list must be unaffected');
+  assert.doesNotMatch(plain.sql, /tbl_easyfixer_rating_by_customer/, 'and pay no join for it');
+});
+
+test("isEscalated=false is not an escalation filter — a URL carries booleans as text", async () => {
+  await call('/jobs', { isEscalated: 'false' });
+  for (const c of jobQueries()) {
+    assert.doesNotMatch(c.sql, /is_escalated/,
+      "the string 'false' is truthy; treating it as a filter is the classic coercion bug");
+  }
+});
+
+/* ─── the export cap is now visible to the caller ───────────────────────── */
+
+test('/export/jobs reports the cap and whether it bit', async () => {
+  const r = await call('/export/jobs', {});
+  assert.equal(r.headers['X-Export-Row-Cap'], '10000', 'raised from 5,000 on 2026-08-26');
+  assert.equal(r.headers['X-Export-Truncated'], '0', 'total 3 < cap, so nothing was dropped');
+  assert.equal(r.headers['X-Export-Total'], '3');
+});
+
+test('a truncated export SAYS SO, and the header is readable cross-origin', async () => {
+  // More rows match than the cap can return — the handler must notice.
+  matchingTotal = 42000;
+  const r = await call('/export/jobs', {});
+
+  assert.equal(r.headers['X-Export-Truncated'], '1',
+    'a capped workbook is indistinguishable from a complete one once it is open');
+  assert.equal(r.headers['X-Export-Total'], '42000');
+  assert.match(r.headers['Access-Control-Expose-Headers'] || '', /X-Export-Truncated/,
+    'the portal is a different origin — an unexposed header is set, sent and invisible');
 });

@@ -537,6 +537,46 @@ const LIST_JOIN = `
 `;
 
 /*
+ * ─── ESCALATION (2026-08-26) ────────────────────────────────────────────────
+ *
+ * The escalation record lives on tbl_easyfixer_rating_by_customer, keyed by
+ * job_id: is_escalated (0/1), escalated_by (tbl_user FK), escalated_time,
+ * no_of_escalations, escalated_comments.
+ *
+ * BOTH HALVES ARE OPT-IN, appended only when the caller actually filters by
+ * escalation. That is what let this land without changing one byte of any
+ * other caller's payload — the previous author left `isEscalated` as a
+ * documented no-op precisely because "implementing the proper join would touch
+ * the LIST projection too", and this is the way it does not.
+ *
+ * ⚠ THE FILTER IS AN `EXISTS`, NOT THIS JOIN. job_id is not unique on that
+ * table (routes/public/feedback.js probes with LIMIT 1 before deciding
+ * INSERT vs UPDATE, so nothing guarantees one row), and filtering through a
+ * JOIN would multiply a job's row per rating and inflate both the list and its
+ * COUNT. EXISTS is also why the COUNT query needs no escalation join at all:
+ * the subquery is self-contained.
+ *
+ * The PROJECTION join picks MAX(table_id) — the latest rating row — so the
+ * columns are deterministic rather than whichever row the optimiser reached
+ * first.
+ */
+function escalationColumns(want) {
+  if (!want) return '';
+  return `,
+  esc.is_escalated, esc.no_of_escalations, esc.escalated_time, esc.escalated_comments,
+  escu.user_name AS escalated_by_name`;
+}
+
+function escalationJoin(want) {
+  if (!want) return '';
+  return `
+  LEFT JOIN tbl_easyfixer_rating_by_customer esc ON esc.table_id = (
+    SELECT MAX(e2.table_id) FROM tbl_easyfixer_rating_by_customer e2
+     WHERE e2.job_id = j.job_id)
+  LEFT JOIN tbl_user escu ON escu.user_id = esc.escalated_by`;
+}
+
+/*
  * `tbl_client.vertical_id` is referenced by the verticals-scope filter
  * below. Some DB instances don't have this column — the canonical
  * client↔vertical mapping there lives in `tbl_vertical_mapping`
@@ -1592,12 +1632,21 @@ async function list({
   // aliases) so a SPOC/unconfirmed list never 500s pre-migration. See
   // magicLinkDeliveryColumns() above.
   const hasMagicLinkDeliveryCols = await magicLinkDeliveryColsExist();
+  /*
+   * '' / undefined / 'false' / '0' all mean "not filtering by escalation".
+   * A URL carries booleans as text, so `isEscalated=false` arrives as the
+   * STRING 'false', which is truthy — the one coercion worth spelling out.
+   */
+  const wantsEscalation = isEscalated !== undefined && isEscalated !== ''
+    && isEscalated !== false && String(isEscalated) !== 'false' && String(isEscalated) !== '0';
   const listColumns =
     LIST_COLUMNS + pendingRequestColumns(hasCustomerRequestTable) + offerColumns(hasJobOffer, offerExpiry)
     + magicLinkDeliveryColumns(hasMagicLinkDeliveryCols)
     // Job Age (ageDays + ageSecs) — unconditional; every column it touches is a
     // long-standing tbl_job column, so there is nothing to existence-probe.
-    + JOB_AGE_COLUMNS;
+    + JOB_AGE_COLUMNS
+    + escalationColumns(wantsEscalation);
+  const listJoin = LIST_JOIN + escalationJoin(wantsEscalation);
 
   // Apply RBAC scope FIRST so any explicit clientId/cityId filter
   // narrows within the allowed set (caller can't widen scope by passing
@@ -1901,22 +1950,20 @@ async function list({
     //   2nd: loose free-text ("due to client")
     params.push(`%Due To: ${label}%`, `%due to ${lower}%`);
   }
-  // `isEscalated` migration note: I initially wired this to
-  // `j.is_escalated`, but that column DOES NOT exist on `tbl_job`. The
-  // legacy CRM had it commented out across JobDaoImpl.java; the real
-  // escalation flag lives on `tbl_easyfixer_rating_by_customer.is_escalated`
-  // joined by `job_id`. Implementing the proper join here would touch
-  // the LIST projection too (we'd need to LEFT JOIN ratings just for
-  // the filter) and the legacy CRM itself didn't actively use the
-  // count — `escalatedJobs = jobService.getEscalatedJobsbyUser(...)`
-  // was commented out in HomeAction.java.
-  //
-  // For now: accept the param to keep the URL contract stable but
-  // emit no SQL clause. Returns the full unfiltered list, which is
-  // worse than the legacy 0-row count behaviour but at least doesn't
-  // 500. Wire the proper rating-table join in a focused follow-up.
-  if (isEscalated !== undefined && isEscalated !== '') {
-    // intentional no-op — see comment above
+  /*
+   * `isEscalated` — WIRED 2026-08-26. There is no j.is_escalated column (the
+   * legacy CRM had it commented out across JobDaoImpl.java); the real flag is
+   * tbl_easyfixer_rating_by_customer.is_escalated, keyed by job_id.
+   *
+   * This was a deliberate no-op for a long time, which meant the client
+   * portal's /tickets/escalated listed EVERY job while its header promised
+   * only escalated ones — telling a client their whole book is escalated. See
+   * escalationColumns/escalationJoin above for why EXISTS rather than a join.
+   */
+  if (wantsEscalation) {
+    clauses.push(`EXISTS (
+      SELECT 1 FROM tbl_easyfixer_rating_by_customer esc_f
+       WHERE esc_f.job_id = j.job_id AND esc_f.is_escalated = 1)`);
   }
   // `dateType` selects which date column the start/end range applies
   // to. Defaults to `created_date_time` for backward-compat with
@@ -2182,7 +2229,7 @@ async function list({
   const [[[{ total }]], [rows]] = await Promise.all([
     pool.query(`SELECT COUNT(*) AS total ${countJoin} ${where}`, params),
     pool.query(
-      `SELECT ${listColumns} ${LIST_JOIN} ${where}
+      `SELECT ${listColumns} ${listJoin} ${where}
        ${orderBy} LIMIT ? OFFSET ?`,
       dataParams
     ),
