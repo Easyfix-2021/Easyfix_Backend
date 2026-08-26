@@ -315,6 +315,34 @@ async function openOrders(filters = {}, actingUserId = null) {
  * Resolve rmTeamUserIds (RM + its team), defaulting to [-1] (= "all").
  * findUsersByReportingManagerId (UserRepository.java:92-96) + the RM itself.
  */
+/*
+ * Is this user a REPORTING MANAGER? Someone is one by RELATION, not by role:
+ * at least one active user names them in tbl_user.reporting_manager, and they
+ * are themselves an active user_type_id = 5.
+ *
+ * Deliberately the SAME predicate verticalManagers() uses to build the
+ * dropdown, so "can open this report" and "appears in the Reporting Manager
+ * list" cannot answer differently. Two definitions of who a manager is would
+ * eventually disagree, and the disagreement would be an access-control bug.
+ */
+async function isReportingManager(userId) {
+  const id = Number(userId) || 0;
+  if (id <= 0) return false;
+  const [rows] = await pool.query(
+    `SELECT 1
+       FROM tbl_user TU
+       JOIN tbl_user M ON M.user_id = TU.reporting_manager
+      WHERE TU.reporting_manager = ?
+        AND M.user_type_id = 5
+        AND M.user_status = 1
+        AND TU.reporting_manager IS NOT NULL
+        AND TU.reporting_manager != 0
+      LIMIT 1`,
+    [id],
+  );
+  return rows.length > 0;
+}
+
 async function resolveRmTeamUserIds(reportingManagerId) {
   const rmId = Number(reportingManagerId) || 0;
   if (rmId <= 0) return [-1];
@@ -834,6 +862,7 @@ async function rmTeamUsers(verticalId, reportingManagerId) {
 }
 
 module.exports = {
+  isReportingManager,
   openOrders,
   employeeProductivity,
   kraMetrics,

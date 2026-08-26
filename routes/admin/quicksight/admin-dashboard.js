@@ -49,21 +49,52 @@ router.use(requireQuickSight('isQuickSightAdminDashboardView'));
  * user's role via getRoleById (case-insensitive role_name match would also
  * work; role_id==2 is the verbatim legacy predicate).
  */
-async function requireAdmin(req, res, next) {
+async function requireAdminOrReportingManager(req, res, next) {
   try {
     if (!req.user || !req.user.user_id) {
       return modernError(res, 401, 'authentication required');
     }
     const roleRow = await getRoleById(req.user.user_role);
-    if (!roleRow || !roleRow.role_status || roleRow.role_id !== ADMIN_ROLE_ID) {
-      return modernError(res, 403, 'Access Denied. Only Admin can view this page.');
-    }
-    return next();
+    req.qsIsAdmin = Boolean(roleRow && roleRow.role_status && roleRow.role_id === ADMIN_ROLE_ID);
+    if (req.qsIsAdmin) return next();
+
+    /*
+     * A REPORTING MANAGER may now open this report too — their own team only.
+     * "Reporting manager" is a RELATION, not a role: somebody reports to them.
+     * The predicate is the same one that builds the dropdown, so the answers to
+     * "can you open this" and "are you in the list" cannot diverge.
+     */
+    if (await service.isReportingManager(req.user.user_id)) return next();
+
+    return modernError(res, 403, 'Access Denied. Only Admin can view this page.');
   } catch (err) {
     return next(err);
   }
 }
-router.use(requireAdmin);
+router.use(requireAdminOrReportingManager);
+
+/*
+ * THE SCOPE IS SERVER-SIDE, and it has to be.
+ *
+ * A reporting manager sees no Reporting Manager dropdown, but the field is
+ * still a request parameter — hiding a control does not stop anyone sending
+ * the value. So the id is OVERWRITTEN here for every non-Admin, on every route
+ * and every method, rather than trusted from the client.
+ *
+ * At the router level on purpose: a per-handler check is one a future endpoint
+ * forgets, and this file already has eight. Runs before validate(), so Joi sees
+ * the forced value like any other.
+ *
+ * resolveRmTeamUserIds(rmId) returns the manager's direct reports PLUS the
+ * manager, so pinning this one field yields exactly "me and my hierarchy".
+ */
+router.use((req, _res, next) => {
+  if (req.qsIsAdmin) return next();
+  const own = Number(req.user.user_id) || 0;
+  if (req.body && typeof req.body === 'object') req.body.reportingManagerId = own;
+  if (req.query && typeof req.query === 'object') req.query.reportingManagerId = String(own);
+  return next();
+});
 
 // ── Joi schemas (inline; the legacy FloorFilterDto) ──────────────────────
 const filterSchema = Joi.object({
@@ -120,8 +151,29 @@ const PRODUCTIVITY_XLSX_COLUMNS = decorateColumns(
 );
 
 // ── GET /access — mirrors loginToFloorDiscipline (isAdmin probe) ──────────
-// Reaching here means requireAdmin already passed (role_id==2), so isAdmin=true.
-router.get('/access', (req, res) => modernOk(res, { isAdmin: true }));
+// Reaching here means the gate passed: Admin, or a reporting manager scoped
+// to their own team by the router-level override above.
+/*
+ * isAdmin drives the FE: Admins get the Reporting Manager dropdown, reporting
+ * managers do not. It used to be a hardcoded `true`, which was honest while the
+ * router was Admin-only and is a lie now.
+ */
+router.get('/access', (req, res) => modernOk(res, {
+  isAdmin: Boolean(req.qsIsAdmin),
+  /*
+   * Reaching this handler AT ALL means the gate above admitted the caller, so
+   * canView is true by construction and a 403 is the "no" answer. That makes
+   * this the cheapest possible question for the QuickSight index to ask before
+   * it renders the Employee Productivity tile: one call, no payload.
+   *
+   * The alternative — asking the Reporting Manager dropdown endpoint and
+   * looking for yourself in it — answers the same question by shipping every
+   * manager's name to every caller, and re-derives access from a list built
+   * for a different purpose. This says it directly.
+   */
+  canView: true,
+  isReportingManager: !req.qsIsAdmin,
+}));
 
 // ── POST /open-orders — three bucket tiles ───────────────────────────────
 router.post('/open-orders', validate(filterSchema), async (req, res, next) => {
