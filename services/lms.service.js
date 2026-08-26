@@ -2397,12 +2397,20 @@ async function ackDocument(efrId, contentId) {
 async function coursesForTech(efrId) {
   const efr = Number(efrId);
   const [courses] = await pool.query(
-    `SELECT ec.course_id AS id, c.name, c.description,
+    `SELECT ec.course_id AS id, c.name, c.description, c.is_mandatory,
             ec.due_date, ec.completion_date, ec.score
        FROM easyfixer_courses ec
        JOIN courses c ON c.id = ec.course_id
       WHERE ec.easyfixer_id = ? AND c.status = 1
-      ORDER BY (ec.due_date IS NULL), ec.due_date ASC, c.name ASC`,
+      /*
+       * MANDATORY FIRST. These are the courses that gate a technician's work,
+       * so they lead the screen regardless of due date — a required course
+       * with no deadline sitting below an optional one with a near deadline
+       * reads as the optional one mattering more, which is backwards.
+       * Ordered here rather than in a client so every client agrees, and so a
+       * technician on an older build gets the same priority.
+       */
+      ORDER BY c.is_mandatory DESC, (ec.due_date IS NULL), ec.due_date ASC, c.name ASC`,
     [efr],
   );
   if (!courses.length) return { rows: [] };
