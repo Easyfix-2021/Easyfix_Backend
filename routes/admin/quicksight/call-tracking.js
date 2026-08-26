@@ -12,8 +12,10 @@
  *     → { totals, byJob: [per job], byUser: [per (day, user)],
  *           byUserCombined: [per user, whole window + per-active-day averages],
  *           byOther: [per (day, caller, direction) with NO job attached],
+ *           byProvider: [per (vendor, stack, direction) — the whole window
+ *             regrouped, so it reconciles with totals exactly],
  *           byDay: [trend] }
- *       (or a 4-sheet XLSX when format='xlsx')
+ *       (or a 5-sheet XLSX when format='xlsx')
  *       totals additionally carries the conference tiles — partiesReached,
  *       conferenceCalls, conferenceBilledSecs, conferenceBilledCalls (all
  *       numbers, never null; see the service header for what each counts and
@@ -257,6 +259,13 @@ const callsBody = withDateOrder(extendJobFilter({
    * selects itself without relaxing selectedCallerId's min(1).
    */
   direction: Joi.string().valid('IN', 'OUT').optional(),
+  /*
+   * The By Provider tab's third dimension — which stack placed the call. Enum
+   * from the service so a value cannot pass validation before the SQL clause
+   * that defines it exists. Combines with `provider` (already a FILTER key) and
+   * `direction` to select exactly one cell of that grain.
+   */
+  stack: Joi.string().valid(...service.STACKS).optional(),
   unattributed: Joi.boolean().optional(),
   /*
    * The Other Calls tab. Narrows the scope to calls with NO job attached — the
@@ -302,7 +311,8 @@ router.post('/calls', validate(callsBody), async (req, res, next) => {
       + ' day=' + (req.body.day ?? '-')
       + ' noJob=' + (req.body.noJob ? 'yes' : '-')
       + ' dir=' + (req.body.direction || '-')
-      + ' unattributed=' + (req.body.unattributed ? 'yes' : '-'));
+      + ' unattributed=' + (req.body.unattributed ? 'yes' : '-')
+      + ' stack=' + (req.body.stack || '-'));
     const data = await service.getCallDetails(filtersOf(req.body), {
       jobId: req.body.jobId,
       selectedCallerId: req.body.selectedCallerId,
@@ -310,6 +320,7 @@ router.post('/calls', validate(callsBody), async (req, res, next) => {
       noJob: req.body.noJob,
       direction: req.body.direction,
       unattributed: req.body.unattributed,
+      stack: req.body.stack,
     });
     return modernOk(res, data);
   } catch (e) {

@@ -87,7 +87,13 @@ test('every grain reaches the SQL — and reaches ALL FIVE queries, not just the
 });
 
 test('the grain list and the scopes are the same set — a tab cannot be exported without SQL behind it', () => {
-  assert.deepEqual([...service.CHART_GRAINS].sort(), ['direct', 'inbound', 'job', 'user']);
+  /*
+   * 'provider' is here even though its scope is the EMPTY string. That tab
+   * regroups the window rather than narrowing it, so it has no predicate — but
+   * the route's Joi enum is generated from these keys, so a tab missing from the
+   * scope map is a tab whose charts 400.
+   */
+  assert.deepEqual([...service.CHART_GRAINS].sort(), ['direct', 'inbound', 'job', 'provider', 'user']);
 });
 
 test('an unknown grain THROWS rather than quietly charting the whole window', async () => {
@@ -313,4 +319,60 @@ test('recordingFlag does NOT hard-reference the migration-gated recording_url co
    */
   const m = SRC.match(/CASE\s*\n\s*WHEN jci\.recording LIKE 'http%'[\s\S]*?END AS recordingFlag/);
   assert.equal(/recording_url/.test(m[0]), false);
+});
+
+/*
+ * ── THE BY PROVIDER GRAIN ─────────────────────────────────────────────────
+ *
+ * "How many calls went through Plivo and how many through Kaleyra, and how many
+ * of each came from the new CRM versus the old one."
+ *
+ * The stack half rests on a fact verified in the source of every stack that
+ * writes this table: in EasyFix_API (entity/Contact.java:100) and
+ * API_AngularClientDashboard (domain/Contact.java) the `provider` field is
+ * @Transient, so it is not in Hibernate's INSERT column list and those stacks
+ * CANNOT write it. A stamped provider therefore means the new backend wrote the
+ * row. That is a structural guarantee, not a heuristic, and these tests pin the
+ * expression that depends on it.
+ */
+test('the stack split reads the TRIMMED provider value, and only via IS NULL', () => {
+  // Built from the two labelled constants, not from inline literals, so the
+  // values the SQL emits and the values STACKS exports cannot drift apart.
+  assert.match(SRC, /const STACK = `CASE WHEN \$\{PROVIDER_VALUE\} IS NULL THEN '\$\{STACK_OLD\}' ELSE '\$\{STACK_NEW\}' END`;/);
+  assert.deepEqual([...service.STACKS].sort(), ['New CRM', 'Old CRM']);
+  /*
+   * IS NULL / IS NOT NULL, never = '' or <> ''. PROVIDER_VALUE already folds
+   * NULL / empty / whitespace into one state, and a definite null test is the
+   * one comparison three-valued logic cannot turn into a silent NULL — the trap
+   * notPlivo exists to document.
+   */
+  assert.match(SRC, /\[STACK_NEW\]: ` AND \$\{PROVIDER_VALUE\} IS NOT NULL`/);
+  assert.match(SRC, /\[STACK_OLD\]: ` AND \$\{PROVIDER_VALUE\} IS NULL`/);
+});
+
+test('the grain groups by the SAME expressions it selects', () => {
+  // A GROUP BY that drifts from the projection is how a grain starts reporting
+  // buckets that do not match their own labels.
+  const m = SRC.match(/SELECT \$\{PROVIDER_RULE\.label\} AS provider,[\s\S]*?ORDER BY calls DESC`/);
+  assert.ok(m, 'the byProvider query moved');
+  assert.match(m[0], /GROUP BY \$\{PROVIDER_RULE\.label\}, \$\{STACK\}, \$\{DIRECTION\}/);
+  // No predicate of its own: this grain partitions the window, so it must
+  // reconcile with totals exactly.
+  assert.equal(/\$\{NO_JOB\}|\$\{REAL_CALLER\}/.test(m[0]), false,
+    'a predicate here would stop the tab reconciling with the KPI band');
+});
+
+test('the drill key comes from the SAME vendor test as the label', () => {
+  /*
+   * providerKey is what the drill-down sends as the `provider` filter, and
+   * `provider` is what the cell prints. Deriving them from one test is what
+   * stops a row drilling into a vendor other than the one it names — the exact
+   * failure PROVIDER_RULE.label's own comment describes for ' plivo'.
+   */
+  assert.match(SRC, /CASE WHEN \$\{PROVIDER_RULE\.isPlivo\} THEN '\$\{PROVIDER_STAMP_PLIVO\}' ELSE '\$\{PROVIDER_STAMP_KALEYRA\}' END AS providerKey/);
+});
+
+test('the stack selection is read off a frozen allow-list, never interpolated', () => {
+  assert.match(SRC, /if \(STACK_CLAUSE\[selection\.stack\]\) where \+= STACK_CLAUSE\[selection\.stack\];/);
+  assert.match(SRC, /STACKS,/, 'the route generates its Joi enum from this export');
 });

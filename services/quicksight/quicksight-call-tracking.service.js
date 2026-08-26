@@ -379,6 +379,50 @@ const PROVIDER_CLAUSE = Object.freeze({
   kaleyra: ` AND ${PROVIDER_RULE.notPlivo}`,
 });
 
+/*
+ * ── WHICH STACK PLACED THE CALL ────────────────────────────────────────────
+ *
+ * Not a heuristic. It is a structural property of the writers, verified in the
+ * source of every stack that inserts into this table:
+ *
+ *   EasyFix_API                 entity/Contact.java:100   `provider` is @Transient
+ *   API_AngularClientDashboard  domain/Contact.java       `provider` is @Transient
+ *
+ * A @Transient field is not in Hibernate's INSERT column list, so neither legacy
+ * Java stack CAN write that column — not "does not", cannot. Both of them dial
+ * Kaleyra (api-voice.kaleyra.com/v1 dial.click2call), and the vendor is
+ * identifiable only from their code, never from the row they wrote. This
+ * backend is the only writer that stamps it.
+ *
+ * So a stamped provider means the new stack wrote the row, and an unstamped one
+ * means a legacy stack did. The QA data agrees from the other direction: every
+ * one of the 369,745 unstamped rows uses an UPPERCASE caller_status vocabulary
+ * with _LEG1/_LEG2 suffixes (ANSWER, NOANSWER_LEG2, IVR-ANSWER, OFF-HOUR) while
+ * the stamped rows use lowercase snake_case (completed, hungup, no_answer), and
+ * the two populations do not overlap in time.
+ *
+ * ⚠ Reads PROVIDER_VALUE (trimmed) rather than the raw column, unlike the
+ * vendor test above. Those two disagree only for a whitespace-padded stamp such
+ * as ' plivo', and they disagree CORRECTLY: something wrote that column, so the
+ * row is ours, while the vendor filter's frozen row set still calls it Kaleyra.
+ * The By Provider tab shows both facts side by side rather than reconciling
+ * them, because they are answers to different questions.
+ */
+const STACK_NEW = 'New CRM';
+const STACK_OLD = 'Old CRM';
+const STACKS = Object.freeze([STACK_NEW, STACK_OLD]);
+const STACK = `CASE WHEN ${PROVIDER_VALUE} IS NULL THEN '${STACK_OLD}' ELSE '${STACK_NEW}' END`;
+/*
+ * IS NULL / IS NOT NULL, never `= ''` or `<> ''`: PROVIDER_VALUE already folds
+ * NULL, empty and whitespace-only into one state, and a definite null test is
+ * the one comparison SQL's three-valued logic cannot turn into a silent NULL —
+ * the trap that notPlivo above exists to document.
+ */
+const STACK_CLAUSE = Object.freeze({
+  [STACK_NEW]: ` AND ${PROVIDER_VALUE} IS NOT NULL`,
+  [STACK_OLD]: ` AND ${PROVIDER_VALUE} IS NULL`,
+});
+
 const n = (v) => Number(v) || 0;
 
 /*
@@ -1412,6 +1456,46 @@ async function getCallTracking(filters = {}) {
   }
 
   /*
+   * ── Per-(VENDOR × STACK × DIRECTION) grain ──
+   *
+   * "How many calls went through Plivo and how many through Kaleyra, and how
+   * many of each came from the new CRM versus the old one."
+   *
+   * At most eight rows, and several of them are structurally empty rather than
+   * merely zero — which is the useful part. Plivo exists ONLY in this backend
+   * (the legacy stacks dial Kaleyra and cannot stamp the column at all), so
+   * Plivo × Old CRM can never be anything but absent, and every inbound row is
+   * legacy by the same argument. A tab that shows those as blank cells tells an
+   * operator more about the migration than one that hides them.
+   *
+   * Same buildScope and same CALL_AGG as every other grain, so it reconciles
+   * with totals exactly: this is the whole window partitioned three ways, with
+   * no predicate of its own.
+   */
+  const sPv = buildScope(filters);
+  const [providerRows] = await pool.query(
+    `SELECT ${PROVIDER_RULE.label} AS provider,
+            /*
+             * The FILTER key beside the display label, so the drill-down does
+             * not have to map 'Plivo' back to 'plivo' in the browser. Derived
+             * from the SAME isPlivo test the label is, so a row can never drill
+             * into a vendor other than the one its cell names.
+             */
+            CASE WHEN ${PROVIDER_RULE.isPlivo} THEN '${PROVIDER_STAMP_PLIVO}' ELSE '${PROVIDER_STAMP_KALEYRA}' END AS providerKey,
+            ${STACK} AS stack,
+            ${DIRECTION} AS direction,
+            ${CALL_AGG},
+            COUNT(DISTINCT NULLIF(jci.job_id, 0)) AS unique_jobs,
+            COUNT(DISTINCT ${CALLER_ID_EXPR}) AS unique_callers,
+            MIN(jci.inserted_time) AS firstCallAt,
+            MAX(jci.inserted_time) AS lastCallAt
+       ${sPv.from} ${sPv.where}
+      GROUP BY ${PROVIDER_RULE.label}, ${STACK}, ${DIRECTION}
+      ORDER BY calls DESC`,
+    sPv.params,
+  );
+
+  /*
    * ── Daily trend, GAP-FILLED ──
    * A GROUP BY only returns days that had calls, so every day in the window is
    * materialised here and missing days read as zero. Same approach as the Offer
@@ -1582,13 +1666,25 @@ async function getCallTracking(filters = {}) {
     };
   });
 
+  const byProvider = providerRows.map((r) => ({
+    provider: r.provider,
+    providerKey: r.providerKey,
+    stack: r.stack,
+    direction: r.direction,
+    ...shapeAgg(r),
+    uniqueJobs: n(r.unique_jobs),
+    uniqueCallers: n(r.unique_callers),
+    firstCallAt: r.firstCallAt || null,
+    lastCallAt: r.lastCallAt || null,
+  }));
+
   logger.info('Returning ' + byJob.length + ' job rows · ' + byUser.length + ' day-user rows · '
     + byUserCombined.length + ' combined user rows · '
-    + byOther.length + ' no-job rows · '
+    + byOther.length + ' no-job rows · ' + byProvider.length + ' provider rows · '
     + byDay.length + ' trend days · ' + totals.calls + ' calls · '
     + totals.partiesReached + ' parties reached across ' + totals.conferenceCalls + ' conference calls · '
     + totals.conferenceBilledSecs + ' billed conf secs from ' + totals.conferenceBilledCalls + ' rooms');
-  return { totals, byJob, byUser, byUserCombined, byOther, byDay };
+  return { totals, byJob, byUser, byUserCombined, byOther, byProvider, byDay };
 }
 
 
@@ -1627,6 +1723,14 @@ const GRAIN_SCOPE = Object.freeze({
   // The two halves of the no-job bucket, split the way the tabs split them.
   direct: `${NO_JOB} AND ${DIRECTION} = 'OUT'`,
   inbound: `${NO_JOB} AND ${DIRECTION} = 'IN'`,
+  /*
+   * The By Provider tab REGROUPS the window rather than narrowing it, so its
+   * scope is the empty string — every call, exactly like totals. It is listed
+   * here anyway rather than special-cased at the call site: the enum the route
+   * validates against is generated from these keys, so a tab missing from this
+   * object is a tab whose charts 400.
+   */
+  provider: '',
 });
 const CHART_GRAINS = Object.freeze(Object.keys(GRAIN_SCOPE));
 
@@ -1889,6 +1993,9 @@ async function getCallDetails(filters = {}, selection = {}) {
     params.push(selection.direction);
   }
   if (selection.unattributed) where += ` AND ${CALLER_ID_EXPR} IS NULL`;
+  // Which STACK wrote the row — the By Provider tab's third dimension. Read off
+  // a frozen allow-list, so nothing user-supplied reaches the SQL.
+  if (STACK_CLAUSE[selection.stack]) where += STACK_CLAUSE[selection.stack];
   if (selection.day) {
     // Narrows WITHIN the scope window (never widens it) — a single IST day.
     where += ' AND jci.inserted_time >= ?';
@@ -2209,6 +2316,29 @@ function toXlsx(data) {
           partiesLabel: flatten(r.parties, (x) => x.role),
         })),
       },
+      {
+        /*
+         * By Provider — vendor x stack x direction. At most eight rows, and the
+         * absences are the point: Plivo x Old CRM cannot exist (the legacy Java
+         * stacks dial Kaleyra and their provider field is @Transient), and every
+         * inbound row is legacy for the same reason.
+         */
+        name: 'By Provider',
+        columns: [
+          { key: 'provider', header: 'Provider', width: 14 },
+          { key: 'stack', header: 'Placed From', width: 14 },
+          { key: 'direction', header: 'Direction', width: 11 },
+          ...SHARED_COLS,
+          { key: 'uniqueJobs', header: 'Jobs', width: 10 },
+          { key: 'uniqueCallers', header: 'Callers', width: 10 },
+          { key: 'firstCallAt', header: 'First Call', width: 20 },
+          { key: 'lastCallAt', header: 'Last Call', width: 20 },
+        ],
+        rows: (data.byProvider || []).map((r) => ({
+          ...r,
+          avgDurationSecs: r.avgDurationSecs == null ? 0 : r.avgDurationSecs,
+        })),
+      },
     ],
   };
 }
@@ -2221,6 +2351,8 @@ module.exports = {
   // Exposed so the route's Joi enums stay in lockstep with the derivation above.
   PARTY_ROLES,
   PROVIDERS,
+  // The By Provider tab's stack dimension — the route's Joi enum reads this.
+  STACKS,
   // The Graphical View's tab scopes — the route's Joi enum reads this so a new
   // tab cannot be accepted by validation before the SQL scope for it exists.
   CHART_GRAINS,

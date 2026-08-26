@@ -354,7 +354,14 @@ test('toXlsx adds the By User (Combined) and Other Calls sheets for the combined
   };
   const { sheets } = service.toXlsx(data);
 
-  assert.deepEqual(sheets.map((s) => s.name), ['By Job', 'Daily By User', 'By User (Combined)', 'Other Calls']);
+  /*
+   * By Provider joins the four grain sheets. The fixture below has no
+   * byProvider array at all, which is the point of the assertion further down:
+   * an older cached payload must still export, with an empty sheet rather than
+   * a throw.
+   */
+  assert.deepEqual(sheets.map((s) => s.name),
+    ['By Job', 'Daily By User', 'By User (Combined)', 'Other Calls', 'By Provider']);
   const combined = sheets[2];
   const keys = combined.columns.map((c) => c.key);
   // Active Days sits BEFORE the averages it is the denominator of.
