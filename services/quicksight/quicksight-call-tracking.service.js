@@ -442,6 +442,18 @@ function drillableUserId(raw) {
   return Number.isInteger(id) && id > 0 ? id : null;
 }
 
+/*
+ * A job id the CRM can actually link to, or null. Same reasoning as
+ * drillableUserId above and the same sentinel: jci.job_id holds 0 for a call
+ * placed with no job context, and 0 is not a job. Everything derived from the
+ * job link — the number, the status snapshot, the assignment flag — has to be
+ * absent together, or the row describes a job that was never there.
+ */
+function drillableJobId(raw) {
+  const id = n(raw);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
 const pct = (part, whole) => (whole > 0 ? Math.round((part / whole) * 100) : 0);
 
 // 'YYYY-MM-DD' -> UTC-midnight Date (pairs with the UTC-based _dateHelpers, so
@@ -2096,7 +2108,13 @@ async function getCallDetails(filters = {}, selection = {}) {
       const legs = legsByCall.get(n(r.id)) || [];
       return {
       id: n(r.id),
-      jobId: r.jobId == null ? null : n(r.jobId),
+      /*
+       * NULL when there is no job, not 0. jci.job_id carries a literal 0 for a
+       * call placed with no job context, and passing it through rendered a red
+       * "#0" that looked like a job link to a job that does not exist. Same
+       * sentinel-as-data mistake drillableUserId exists to prevent.
+       */
+      jobId: drillableJobId(r.jobId),
       callAt: r.callAt || null,
       callerUserId: r.callerUserId == null ? null : n(r.callerUserId),
       /*
@@ -2120,8 +2138,31 @@ async function getCallDetails(filters = {}, selection = {}) {
       // NAME only — never the number (see the privacy note in the header).
       receiverName: (r.receiverName && String(r.receiverName).trim()) || null,
       partyRole: r.partyRole || 'Other',
-      jobStatusAtCall: r.jobStatusAtCall == null ? null : n(r.jobStatusAtCall),
-      assignedAtCall: Number(r.assignedFlag) === 1,
+      /*
+       * ⚠ A CALL WITH NO JOB HAS NO LIFECYCLE STATUS, and this is the guard
+       * that says so.
+       *
+       * jci.job_status is a SNAPSHOT column, but only on rows that snapshot
+       * something. On a job-less call it holds the column default. Measured on
+       * QA over 2025: of 28,848 job-less calls, 28,203 carry job_status = 0,
+       * 642 carry 100, and 3 are NULL. Nothing wrote those — they are what an
+       * INSERT that never mentioned the column leaves behind.
+       *
+       * Passed through, 0 became a REAL-LOOKING CHIP. Worse than a wrong number:
+       * jci.job_efr_id is also a leftover on these rows, so ASSIGNED_AT_CALL
+       * read 1, and the 0-with-a-tech branch renders "Pending App Ack" — a
+       * status the legacy flow no longer produces at all. Thousands of Direct
+       * and Inbound rows displayed a retired lifecycle stage, derived from two
+       * columns that were never written, beside a job number of #0. And 100
+       * printed as the literal "Status 100".
+       *
+       * assignedAtCall is nulled with it for exactly the same reason: it
+       * describes the JOB's technician, and there is no job.
+       */
+      jobStatusAtCall: drillableJobId(r.jobId) == null || r.jobStatusAtCall == null
+        ? null
+        : n(r.jobStatusAtCall),
+      assignedAtCall: drillableJobId(r.jobId) != null && Number(r.assignedFlag) === 1,
       durationSecs: r.durationSecs == null ? null : Number(r.durationSecs),
       connected: n(r.durationSecs) > 0,
       /*

@@ -376,3 +376,28 @@ test('the stack selection is read off a frozen allow-list, never interpolated', 
   assert.match(SRC, /if \(STACK_CLAUSE\[selection\.stack\]\) where \+= STACK_CLAUSE\[selection\.stack\];/);
   assert.match(SRC, /STACKS,/, 'the route generates its Joi enum from this export');
 });
+
+/*
+ * ── A CALL WITH NO JOB HAS NO JOB STATUS ──────────────────────────────────
+ *
+ * Reported from the drill-down: Direct and Inbound rows showed "Job # #0" beside
+ * a "Pending App Ack" chip. There is no job, so there is no lifecycle stage —
+ * both were read off columns that nothing wrote.
+ *
+ * Measured on QA over 2025, job-less calls: 28,203 carry job_status = 0, 642
+ * carry 100, 3 are NULL. Those are INSERT defaults. jci.job_efr_id is a leftover
+ * on the same rows, so ASSIGNED_AT_CALL read 1, and the 0-with-a-tech branch of
+ * jobStatusLabel renders 'Pending App Ack' — a stage the legacy flow no longer
+ * produces at all. 100 rendered as the literal 'Status 100'.
+ */
+test('the job id, its status and its assignment flag are nulled TOGETHER', () => {
+  assert.match(SRC, /jobId: drillableJobId\(r\.jobId\)/);
+  assert.match(SRC, /jobStatusAtCall: drillableJobId\(r\.jobId\) == null \|\| r\.jobStatusAtCall == null/);
+  assert.match(SRC, /assignedAtCall: drillableJobId\(r\.jobId\) != null && Number\(r\.assignedFlag\) === 1/);
+  // Passing the raw column through is what rendered "#0" as a job link.
+  assert.equal(/jobId: r\.jobId == null \? null : n\(r\.jobId\)/.test(SRC), false);
+});
+
+test('drillableJobId rejects the 0 sentinel, like drillableUserId', () => {
+  assert.match(SRC, /function drillableJobId\(raw\) \{[\s\S]*?id > 0 \? id : null;/);
+});
