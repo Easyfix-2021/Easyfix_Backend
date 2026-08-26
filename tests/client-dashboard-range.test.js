@@ -35,19 +35,19 @@ const DEFAULTS = {
     { reason: 'Customer unavailable', n: 5 }, { reason: 'Duplicate', n: 3 },
     { reason: 'Out of scope', n: 1 },         { reason: 'Not recorded', n: 1 },
   ],
-  prevCancelledRow: { n: 4 },
+  prevRow: { total: 80, completed: 40, cancelled: 4 },
 };
 let totalsRow = DEFAULTS.totalsRow;
 let cityRows = DEFAULTS.cityRows;
 let reasonRows = DEFAULTS.reasonRows;
-let prevCancelledRow = DEFAULTS.prevCancelledRow;
+let prevRow = DEFAULTS.prevRow;
 
 const fake = installFakePool([
   [/FROM tbl_client_contacts/i, [{ id: 11 }]],          // one direct report
   // DATE_SUB is unique to the prior-period count and must be matched BEFORE the
   // patterns below — the fake dispatches on FIRST match, and this query also
   // contains the tokens the totals/reasons routes look for.
-  [/DATE_SUB/i, () => [prevCancelledRow]],
+  [/DATE_SUB/i, () => [prevRow]],
   // `AS runningLate` is UNIQUE to the totals query. Matching on `AS completed`
   // instead would also catch the cities query, which selects the same alias —
   // the fake dispatches on first match, so a loose pattern silently answers
@@ -92,7 +92,7 @@ beforeEach(() => {
   totalsRow = DEFAULTS.totalsRow;
   cityRows = DEFAULTS.cityRows;
   reasonRows = DEFAULTS.reasonRows;
-  prevCancelledRow = DEFAULTS.prevCancelledRow;
+  prevRow = DEFAULTS.prevRow;
 });
 
 /* The selected window, as opposed to the prior-period comparison. */
@@ -125,7 +125,8 @@ test('the prior-period count is the SAME LENGTH immediately before, and equally 
     'same length as the selected window, not a hardcoded month');
   assert.match(q.sql, /ticket_created_date_time\s*<\s*\?/,
     'and it must END where the selected window begins, or the two overlap');
-  assert.match(q.sql, /j\.job_status = 6/, 'it compares CANCELLATIONS, not all work');
+  assert.match(q.sql, /SUM\(CASE WHEN j\.job_status = 6/,
+    'cancellations are a COLUMN of the prior aggregate now, not a filter on it');
   assert.match(q.sql, /j\.reporting_contact_id IN \(/,
     'an unscoped comparison would make every SPOC look better or worse than they are');
 });
@@ -252,23 +253,44 @@ test('no city filter means no join at all — the common path stays cheap', asyn
   assert.doesNotMatch(totals.sql, /ci2\./, 'the address/city join is opt-in');
 });
 
-test('previousCancelled is reported RAW, so the card owns the direction', async () => {
-  const d = await call();
-  assert.equal(d.cancellations.previousCancelled, 4, 'straight off the prior-window COUNT');
-  assert.equal(d.cancellations.cancelled, 10);
-  /*
-   * The route sends both numbers and no delta. Cancellations are the one tile
-   * where UP IS BAD, so the sign and its colour are a rendering decision the
-   * card makes — a server-computed "improvement" would have to encode that
-   * polarity, and every future consumer would inherit whichever way it guessed.
-   */
-  assert.equal(d.cancellations.delta, undefined);
-  assert.equal(d.cancellations.trend, undefined);
+test('ONE prior-period query serves all three cards', async () => {
+  await call();
+  const prior = jobQueries().filter((c) => /DATE_SUB/i.test(c.sql));
+  assert.equal(prior.length, 1,
+    'three separate prior queries is three chances for one card to compare against a different fortnight');
+  assert.match(prior[0].sql, /AS total/);
+  assert.match(prior[0].sql, /AS completed/);
+  assert.match(prior[0].sql, /AS cancelled/);
+  assert.doesNotMatch(prior[0].sql, /GROUP BY/,
+    'no per-city or per-reason breakdown — no card shows a delta at that grain');
 });
 
-test('a prior window with no cancellations is 0, not null — the card must still render', async () => {
-  prevCancelledRow = { n: 0 };
+test('previous is reported RAW, so each card owns its own direction', async () => {
   const d = await call();
-  assert.equal(d.cancellations.previousCancelled, 0);
-  assert.ok(Number.isFinite(d.cancellations.previousCancelled));
+  assert.deepEqual(d.previous, { total: 80, completed: 40, cancelled: 4 });
+  /*
+   * No deltas and no direction in the payload. The three cards DISAGREE about
+   * what a rise means — more cancellations is worse, a higher completion rate
+   * is better, and more work raised is neither — so a server-computed
+   * "improvement" would have to bake one polarity in and every consumer would
+   * inherit whichever way it guessed.
+   */
+  assert.equal(d.previous.delta, undefined);
+  assert.equal(d.previous.trend, undefined);
+  assert.equal(d.cancellations.previousCancelled, undefined,
+    'moved to the shared previous block when Performance and Work-by-city needed it too');
+});
+
+test('an empty prior window is zeroes, not nulls — the cards must still render', async () => {
+  prevRow = { total: 0, completed: 0, cancelled: 0 };
+  const d = await call();
+  assert.deepEqual(d.previous, { total: 0, completed: 0, cancelled: 0 });
+  for (const v of Object.values(d.previous)) assert.ok(Number.isFinite(v));
+});
+
+test('the prior window is not filtered to one status — Performance needs all of it', async () => {
+  await call();
+  const prior = jobQueries().find((c) => /DATE_SUB/i.test(c.sql));
+  assert.doesNotMatch(prior.sql, /WHERE[\s\S]*j\.job_status = 6/,
+    'it once counted only cancellations; completion rate needs the whole cohort');
 });

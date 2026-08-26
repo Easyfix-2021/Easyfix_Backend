@@ -3845,17 +3845,23 @@ router.get('/dashboard-range', validate(dashboardRangeQuery, 'query'), async (re
      * that moves a boundary by a day for anyone outside IST. DATEDIFF and
      * DATE_SUB compare the same calendar the column is written in.
      *
-     * Deliberately NOT the whole aggregate set again: the card shows one
-     * number from this window, so it costs one COUNT rather than a second
-     * three-query round.
+     * ONE query for all three cards. It mirrors the shape of `totals` rather
+     * than counting a single status, because every card below Today's Pulse now
+     * shows movement and they must all compare against the SAME window — three
+     * separate prior-period queries is three chances for one card to be
+     * comparing against a different fortnight than its neighbour.
+     *
+     * Still not the whole aggregate set: no city or reason breakdown, because
+     * no card shows a per-city or per-reason delta.
      */
-    const prevCancelled = pool.query(
-      `SELECT COUNT(*) AS n
+    const previous = pool.query(
+      `SELECT COUNT(*)                                                    AS total,
+              SUM(CASE WHEN j.job_status IN (3,5) THEN 1 ELSE 0 END)      AS completed,
+              SUM(CASE WHEN j.job_status = 6      THEN 1 ELSE 0 END)      AS cancelled
          FROM tbl_job j
          ${cityJoin}
         WHERE j.fk_client_id = ?
           AND j.reporting_contact_id IN (${team})
-          AND j.job_status = 6
           AND j.ticket_created_date_time >= DATE_SUB(?, INTERVAL (DATEDIFF(?, ?) + 1) DAY)
           AND j.ticket_created_date_time <  ?
           ${cityWhere}`,
@@ -3863,7 +3869,7 @@ router.get('/dashboard-range', validate(dashboardRangeQuery, 'query'), async (re
     );
 
     const [[[t]], [cityRows], [reasonRows], [[prev]]] =
-      await Promise.all([totals, cities, reasons, prevCancelled]);
+      await Promise.all([totals, cities, reasons, previous]);
 
     const n = (v) => Number(v) || 0;
     const total = n(t.total);
@@ -3905,10 +3911,23 @@ router.get('/dashboard-range', validate(dashboardRangeQuery, 'query'), async (re
           count: Math.max(0, cancelled - reasonRows.slice(0, 3).reduce((a, r) => a + n(r.n), 0)),
           reasons: Math.max(0, reasonRows.length - 3),
         },
-        // Same length, immediately before. The card labels this "vs previous
-        // period" rather than "vs last month" — with a selectable range, only
-        // the generic phrasing is true for every preset.
-        previousCancelled: n(prev && prev.n),
+      },
+
+      /*
+       * The same window LENGTH immediately before the selected one — the
+       * comparison every card below Today's Pulse renders its movement against.
+       *
+       * RAW COUNTS, NO DELTAS AND NO DIRECTION. Each card decides what a rise
+       * means, because they disagree: more cancellations is worse, a higher
+       * completion rate is better, and more work raised is neither — it is
+       * volume, and colouring it good or bad would be the dashboard inventing
+       * an opinion about the client's own business. A server-computed
+       * "improvement" would have to bake one polarity in for all three.
+       */
+      previous: {
+        total: n(prev && prev.total),
+        completed: n(prev && prev.completed),
+        cancelled: n(prev && prev.cancelled),
       },
     });
   } catch (e) { next(e); }
