@@ -448,6 +448,38 @@ const CP_NUM = `CASE WHEN UPPER(COALESCE(k.call_type, 'OUT')) = 'IN' THEN k.call
 const CP_NAME = `CASE WHEN UPPER(COALESCE(k.call_type, 'OUT')) = 'IN' THEN k.caller_name ELSE k.reciever_name END`;
 
 /*
+ * Is this number a technician's, on a call with NO job to say so?
+ *
+ * ─── WHY A SEMI-JOIN AND NOT A JOIN ──────────────────────────────────────
+ *
+ * A direct call to a technician — placed from Manage EasyFixers with no job in
+ * context — stores nothing that identifies them except the number dialled:
+ * routes/admin/calls.js:298 leaves reciever_id and job_efr_id null. The `ef`
+ * join cannot help, because it hangs off the JOB.
+ *
+ * So the match has to be on the number, and the number IS NOT UNIQUE. On live
+ * data four numbers are shared and one placeholder — 1111111111 — sits on 28
+ * easyfixer rows. PARTY_ROLE is evaluated inside buildScope, which four
+ * COUNT(*) aggregates and the partyRole filter all read, so a join that matched
+ * 28 rows would multiply one call into 28 across Total Calls, Connected and
+ * every per-row count. Silently.
+ *
+ * `IN (subquery)` is a SEMI-join: one input row yields at most one output row
+ * whatever the subquery returns, so multiplication is impossible by
+ * construction rather than by my having deduplicated it correctly. It is also
+ * uncorrelated, so MySQL materialises the 10k-row list once per query instead
+ * of probing per row.
+ *
+ * This is the same call tests/call-tracking-caller-identity.test.js already
+ * made for the CALLER lookup — "a scalar subquery cannot multiply rows whatever
+ * the table's keys are" — applied to the counterparty. I first wrote it as a
+ * GROUP BY derived table, which is also safe, and that test correctly refused
+ * it: the guard is about not reasoning your way to a safe join when a shape
+ * exists that cannot be unsafe.
+ */
+const EFR_NUMBERS = `(SELECT ${d10('ec2.efr_no')} FROM tbl_easyfixer ec2)`;
+
+/*
  * Receiver TYPE. The CASE arms are ordered Customer > Alternate > Client SPOC >
  * Technician, and a CASE stops at its first true arm — so the priority order IS
  * the arm order. Anything unmatched (a number since changed on the job, a QA
@@ -459,6 +491,13 @@ const PARTY_ROLE = `CASE
         WHEN jci.cp_d10 = ${d10('j.additional_number')}  THEN 'Alternate'
         WHEN jci.cp_d10 = ${d10('j.client_spoc')}        THEN 'Client SPOC'
         WHEN jci.cp_d10 = ${d10('ef.efr_no')}            THEN 'Technician'
+        /*
+         * A technician reached on a call with NO job. Last among the matching
+         * arms on purpose: when a job IS attached, its own parties decide the
+         * answer, and this must never overrule them — a customer who happens to
+         * share a number with some technician stays a Customer.
+         */
+        WHEN jci.cp_d10 IN ${EFR_NUMBERS}                THEN 'Technician'
         ELSE 'Other'
       END`;
 
@@ -474,6 +513,15 @@ const PARTY_NAME = `CASE
         WHEN jci.cp_d10 = ${d10('j.additional_number')}  THEN COALESCE(j.additional_name, j.job_customer_name, cu.customer_name, jci.cp_name)
         WHEN jci.cp_d10 = ${d10('j.client_spoc')}        THEN COALESCE(j.client_spoc_name, jci.cp_name)
         WHEN jci.cp_d10 = ${d10('ef.efr_no')}            THEN COALESCE(ef.efr_name, jci.cp_name)
+        /*
+         * Correlated, and safe to be: PARTY_NAME is used at exactly ONE site,
+         * the drill-down, which is capped — never in an aggregate. MIN() over
+         * a shared number is arbitrary by necessity; showing one of 28 names as
+         * if it were certain is the worse option.
+         */
+        WHEN jci.cp_d10 IN ${EFR_NUMBERS}                THEN COALESCE(
+          (SELECT MIN(ec3.efr_name) FROM tbl_easyfixer ec3 WHERE ${d10('ec3.efr_no')} = jci.cp_d10),
+          jci.cp_name)
         ELSE jci.cp_name
       END`;
 
