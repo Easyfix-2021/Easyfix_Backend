@@ -1390,6 +1390,22 @@ async function finalizeMobileRegistrationGate1(efrId) {
       // per registration — not a hot path. `required > 0` matters: a
       // technician with nothing assigned is not "outstanding", they simply
       // have no training, and must still finalize to UNDER_VERIFICATION.
+      /*
+       * Give a new technician the mandatory catalogue as it stands today,
+       * BEFORE probing completion — otherwise they finalize with nothing
+       * assigned and the gate has nothing to hold them to.
+       *
+       * Best-effort and idempotent. It writes on the pool rather than this
+       * transaction's connection, so a rollback leaves the assignment rows
+       * behind; that is the harmless direction (re-running assigns nothing new,
+       * and an assignment without a finalized registration simply waits).
+       * Failing here must never block a registration that is otherwise valid.
+       */
+      try {
+        await lms.assignMandatoryCourses(efrId);
+      } catch (e) {
+        logger.warn({ err: e.message, efrId }, 'gate1: mandatory course assignment failed');
+      }
       const training = await lms.isTrainingComplete(efrId);
       const decision = resolveGate1Finalization(current.status, {
         personal_submitted: row.user_is_personal_detail_filled,

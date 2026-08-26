@@ -441,7 +441,9 @@ router.get('/jobs/rejected', async (req, res, next) => {
         WHERE jo.fk_easyfixter_id = ? AND jo.offer_status = ${OFFER_STATUS.REJECTED}
         ORDER BY jo.responded_at DESC
         LIMIT 100`,
-      [req.tech.efr_id],
+      // VISIBLE_VIDEO_IDS_SQL binds the technician twice: once for the
+      // mandatory half, once for the assigned half.
+      [req.tech.efr_id, req.tech.efr_id],
     );
     logger.info('Found ' + items.length + ' rejected offers');
     modernOk(res, { items });
@@ -1579,8 +1581,19 @@ router.post('/device', validate(Joi.object({
 // cleartext is mixed-content-blocked on an https CRM and the malformed host
 // resolves nowhere — and two copies of this would drift the moment either is
 // touched. Imported rather than reimplemented.
-const { normalizeVideoUrl: normalizeTrainingVideoUrl } = require('../../services/lms.service');
-router.get('/training-videos', async (_req, res, next) => {
+const {
+  normalizeVideoUrl: normalizeTrainingVideoUrl,
+  parseYouTubeUrl: parseTrainingVideoYouTubeUrl,
+  VISIBLE_VIDEO_IDS_SQL,
+} = require('../../services/lms.service');
+/*
+ * SCOPED TO THE CALLER. This handler took `_req` and selected every row of
+ * training_videos with no WHERE, so one technician's assigned course showed up
+ * in every technician's app — reported from the field on 2026-08-26. The
+ * technician is already resolved by requireTechAuth on this same router; the
+ * endpoint simply never asked for it.
+ */
+router.get('/training-videos', async (req, res, next) => {
   try {
     logger.info('List training videos');
     // document_type_id = 2 is the "Video / Training Videos" type in `document_type`
@@ -1593,7 +1606,9 @@ router.get('/training-videos', async (_req, res, next) => {
          FROM training_videos tv
          LEFT JOIN document d
            ON d.id = tv.training_video_id AND d.document_type_id = 2
-         ORDER BY tv.id DESC`
+        WHERE tv.id IN (${VISIBLE_VIDEO_IDS_SQL})
+        ORDER BY tv.id DESC`,
+      [req.tech.efr_id],
     );
     const items = rows.map((r) => ({
       id: r.id,
@@ -1602,6 +1617,17 @@ router.get('/training-videos', async (_req, res, next) => {
       sub_title: r.sub_title,
       sub_description: r.sub_description,
       url: normalizeTrainingVideoUrl(r.doc_url),
+      /*
+       * Derived, never stored. Every card fell back to a grey placeholder
+       * because this response carried no thumbnail at all and the client reads
+       * `thumbnailUrl`. YouTube publishes a predictable still per video id, so
+       * one line here fixes every client at once; a non-YouTube row keeps null
+       * and its existing fallback.
+       */
+      thumbnailUrl: (() => {
+        const yt = parseTrainingVideoYouTubeUrl(r.doc_url);
+        return yt ? `https://img.youtube.com/vi/${yt.id}/hqdefault.jpg` : null;
+      })(),
     }));
     logger.info('Returning ' + items.length + ' training videos');
     modernOk(res, items);

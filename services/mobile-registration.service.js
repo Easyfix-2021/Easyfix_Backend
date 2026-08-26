@@ -4,6 +4,9 @@ const deepSkillService = require('./deep-skill.service');
 const lifecycleService = require('./easyfixer-lifecycle.service');
 const registrationProfile = require('./technician-registration-profile.service');
 const profileCompletion = require('./profile-completion.service');
+// One definition of "mandatory", shared with the mobile training list — two
+// copies of this SQL would drift the first time either was touched.
+const { MANDATORY_VIDEO_IDS_SQL } = require('./lms.service');
 
 /*
  * Mobile Registration gate machine — collapses three legacy polls
@@ -127,19 +130,45 @@ async function fetchTrainingCompletedTime(efrId) {
     // Complete only when the tech has a 100%-watched row for EVERY mandatory
     // training_videos row (video_id = training_videos.id). Returns the latest
     // completion timestamp, or null while any mandatory video is unfinished.
+    /*
+     * MANDATORY, not "every row in the table".
+     *
+     * This counted all of training_videos, which also holds LMS course
+     * content. Adding one course video therefore raised `total` for EVERY
+     * technician — 3 to 4 on 2026-08-26 — so ~2,600 people who had finished
+     * the real three fell to done < total, trainingCompletedTime went NULL,
+     * and jobsUnlocked (below) went false platform-wide. The video they were
+     * being asked for was a YouTube link the app could not play, so no action
+     * available to them could have cleared it.
+     *
+     * Both halves must use the same set. Scoping only `total` would let a
+     * technician who watched an ASSIGNED course video count it towards the
+     * mandatory tally and pass the gate without watching a mandatory one.
+     */
     const [[row]] = await pool.query(
-      `SELECT (SELECT COUNT(*) FROM training_videos) AS total,
-              COUNT(DISTINCT w.video_id)             AS done,
-              MAX(w.update_date)                     AS last_done
+      `SELECT (SELECT COUNT(*) FROM (${MANDATORY_VIDEO_IDS_SQL}) m) AS total,
+              COUNT(DISTINCT w.video_id)                            AS done,
+              MAX(w.update_date)                                    AS last_done
          FROM easyfixer_watched_video w
         WHERE w.easyfixer_id = ?
           AND w.watched_percentage = 100
-          AND w.video_id IN (SELECT id FROM training_videos)`,
-      [efrId],
+          AND w.video_id IN (${MANDATORY_VIDEO_IDS_SQL})`,
+      // Three binds: the total subquery, the watcher filter, then the IN subquery.
+      [efrId, efrId, efrId],
     );
     const total = Number(row?.total || 0);
     const done = Number(row?.done || 0);
-    return total > 0 && done >= total ? (row?.last_done || null) : null;
+    if (total === 0) {
+      /*
+       * Nothing is mandatory. Report NOT complete and say so loudly rather
+       * than failing open: an empty mandatory set means someone cleared
+       * is_global across the catalogue, and silently unlocking earning for
+       * everyone is the worse of the two wrong answers.
+       */
+      logger.warn({ efrId }, 'registration: mandatory training set is EMPTY — check training_videos.is_global');
+      return null;
+    }
+    return done >= total ? (row?.last_done || null) : null;
   } catch (e) {
     logger.info(
       { err: e.message, efrId },

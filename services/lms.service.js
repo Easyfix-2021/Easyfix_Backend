@@ -118,7 +118,7 @@ async function listCourses({
    * and scans more than two indexed counts.
    */
   const [rows] = await pool.query(
-    `SELECT c.id, c.name, c.description, c.status, c.created_at, c.updated_at,
+    `SELECT c.id, c.name, c.description, c.status, c.is_mandatory, c.created_at, c.updated_at,
             (SELECT COUNT(*) FROM course_videos cv WHERE cv.course_id = c.id) AS video_count,
             (SELECT COUNT(*) FROM easyfixer_courses ec WHERE ec.course_id = c.id) AS assigned_count
        FROM courses c
@@ -139,7 +139,7 @@ async function listCourses({
 
 async function getCourseById(id) {
   const [rows] = await pool.query(
-    `SELECT id, name, description, status, created_at, updated_at
+    `SELECT id, name, description, status, is_mandatory, created_at, updated_at
        FROM courses WHERE id = ?`,
     [Number(id)],
   );
@@ -147,7 +147,7 @@ async function getCourseById(id) {
   return rows[0];
 }
 
-async function createCourse({ name, description }) {
+async function createCourse({ name, description, is_mandatory = false }) {
   logger.info('Create course · name=' + name);
   const [dupe] = await pool.query(
     'SELECT id FROM courses WHERE name = ? AND status = 1',
@@ -169,8 +169,8 @@ async function createCourse({ name, description }) {
    */
   const now = new Date();
   const [ins] = await pool.query(
-    'INSERT INTO courses (name, description, status, created_at, updated_at) VALUES (?, ?, 1, ?, ?)',
-    [String(name).trim(), description || null, now, now],
+    'INSERT INTO courses (name, description, status, is_mandatory, created_at, updated_at) VALUES (?, ?, 1, ?, ?, ?)',
+    [String(name).trim(), description || null, is_mandatory ? 1 : 0, now, now],
   );
   logger.info('Course created · id=' + ins.insertId);
   return { id: ins.insertId };
@@ -200,6 +200,16 @@ async function updateCourse(id, patch = {}) {
   if (patch.description !== undefined) {
     sets.push('description = ?');
     params.push(patch.description || null);
+  }
+  /*
+   * Marking a course mandatory changes who its videos gate, for everyone.
+   * Writing the flag does NOT assign the course to anyone — assignment is a
+   * separate, explicit action (assignCourseToAll), so an operator flipping
+   * this cannot silently create thousands of assignment rows by accident.
+   */
+  if (patch.is_mandatory !== undefined) {
+    sets.push('is_mandatory = ?');
+    params.push(patch.is_mandatory ? 1 : 0);
   }
   if (patch.status !== undefined) {
     sets.push('status = ?');
@@ -650,15 +660,31 @@ async function stampCourseCompletions(efrId) {
  * Same predicate as stampCourseCompletions, same idempotence (only rows still
  * NULL are touched), narrowed to one course and the technicians just assigned.
  */
+/*
+ * `easyfixerIds = null` means EVERY assignee of the course.
+ *
+ * The array form guards against an unbounded UPDATE, which is right when the
+ * caller knows exactly who it just assigned. assignCourseToAll does not — it
+ * inserts with INSERT..SELECT and never learns the ids — and calling this with
+ * no argument silently did nothing at all, because the empty-array guard
+ * returned before the UPDATE. That left the assignment-time completion gap
+ * this function exists to close open on the one path that assigns thousands of
+ * people at once.
+ *
+ * The all-assignees form is still bounded: the UPDATE is scoped by course_id
+ * and only touches rows where completion_date IS NULL, so it is idempotent and
+ * re-running it is free.
+ */
 async function stampCompletionsForCourse(courseId, easyfixerIds = []) {
-  const ids = [...new Set(easyfixerIds.map(Number).filter(Number.isFinite))];
-  if (!ids.length) return { stamped: 0 };
+  const all = easyfixerIds === null;
+  const ids = all ? [] : [...new Set(easyfixerIds.map(Number).filter(Number.isFinite))];
+  if (!all && !ids.length) return { stamped: 0 };
   const now = new Date();
   const [r] = await pool.query(
     `UPDATE easyfixer_courses ec
         SET ec.completion_date = ?, ec.updated_at = ?
       WHERE ec.course_id = ?
-        AND ec.easyfixer_id IN (${ids.map(() => '?').join(',')})
+        ${all ? '' : `AND ec.easyfixer_id IN (${ids.map(() => '?').join(',')})`}
         AND ec.completion_date IS NULL
         AND EXISTS (SELECT 1 FROM course_videos cv WHERE cv.course_id = ec.course_id)
         AND NOT EXISTS (
@@ -1184,7 +1210,139 @@ async function setVideoLink(videoId, rawUrl, actorUserId = null) {
   return { video_url: parsed.url };
 }
 
+/*
+ * WHICH VIDEOS A TECHNICIAN MUST WATCH, AND WHICH THEY MAY SEE.
+ *
+ * `training_videos` holds two different things: the pre-LMS registration
+ * catalogue (is_global = 1) and LMS course content owned by `course_videos`.
+ * Nothing distinguished them until 2026-08-26, which is why adding one
+ * YouTube video locked earning platform-wide and why the mobile list served
+ * one technician's assigned course to everyone.
+ *
+ * MANDATORY = the global catalogue, plus every video of a course flagged
+ * mandatory. This is the set the registration gate counts.
+ *
+ * VISIBLE = mandatory, plus the videos of courses assigned to THIS
+ * technician. This is the set the mobile list may return.
+ */
+/*
+ * Assign a course to every technician who can hold work.
+ *
+ * This is the action behind the CRM's "assign to existing technicians too?"
+ * prompt. It is deliberately SEPARATE from writing is_mandatory: flipping a
+ * flag should not silently create thousands of assignment rows, and an
+ * operator who only wanted future registrations to get the course must be
+ * able to have exactly that.
+ *
+ * INSERT ... SELECT with a NOT EXISTS guard rather than a read-then-write:
+ * re-running it is a no-op, so the prompt is safe to answer "yes" to twice,
+ * and an existing assignee keeps their due date, progress and score.
+ */
+async function assignCourseToAll(courseId, { dueDate = null } = {}) {
+  const id = Number(courseId);
+  await getCourseById(id);
+  const now = new Date();
+  const [res] = await pool.query(
+    `INSERT INTO easyfixer_courses (easyfixer_id, course_id, created_at, updated_at, due_date)
+     SELECT e.efr_id, ?, ?, ?, ?
+       FROM tbl_easyfixer e
+      WHERE e.efr_status = 1
+        AND NOT EXISTS (
+          SELECT 1 FROM easyfixer_courses ec
+           WHERE ec.easyfixer_id = e.efr_id AND ec.course_id = ?)`,
+    [id, now, now, dueDate, id],
+  );
+  logger.info('Course assigned to all · courseId=' + id + ' newAssignments=' + res.affectedRows);
+  /*
+   * Same completion gap the single assignment closes: anyone who had already
+   * watched this content is stamped complete now, rather than counted pending,
+   * then overdue, and finally blocked from working for training they had done.
+   * Best-effort — a failure here must not fail an assignment that succeeded.
+   */
+  try {
+    // null = every assignee: this path never learns which ids it inserted.
+    await stampCompletionsForCourse(id, null);
+  } catch (e) {
+    logger.warn({ err: e.message, courseId: id }, 'assignCourseToAll: completion stamp failed');
+  }
+  return { assigned: res.affectedRows };
+}
+
+/*
+ * GATING FOLLOWS ASSIGNMENT, NOT THE FLAG.
+ *
+ * The first cut of this counted every mandatory course's videos for every
+ * technician. That reproduced the outage it was written to fix, with a
+ * checkbox in front of it: ticking Mandatory would raise `total` for all
+ * ~2,600 technicians at once and lock earning until each of them watched a
+ * course they had never been given.
+ *
+ * So `is_mandatory` means "assign this to technicians", and what a technician
+ * must complete is what they actually HOLD. New registrations get mandatory
+ * courses assigned as part of finishing registration; existing technicians get
+ * them only when an operator answers the CRM's prompt. A course flagged
+ * mandatory and assigned to nobody gates nobody, which is the safe direction
+ * for a flag to fail in.
+ *
+ * `c.status = 1` matters: retiring a course must actually stop it gating.
+ * Without it a retired-but-mandatory course keeps blocking work while being
+ * hidden from the operator who retired it precisely to stop that.
+ *
+ * Takes one `?` — the technician's efr_id.
+ */
+const MANDATORY_VIDEO_IDS_SQL = `
+  SELECT tv.id FROM training_videos tv WHERE tv.is_global = 1
+   UNION
+  SELECT cv.video_id FROM course_videos cv
+    JOIN courses c ON c.id = cv.course_id
+    JOIN easyfixer_courses ec ON ec.course_id = c.id
+   WHERE c.is_mandatory = 1 AND c.status = 1 AND ec.easyfixer_id = ?`;
+
+/*
+ * What the technician may SEE: everything they must complete, plus the videos
+ * of any course assigned to them (mandatory or not). Takes two `?` — the same
+ * efr_id twice.
+ */
+const VISIBLE_VIDEO_IDS_SQL = `
+  ${MANDATORY_VIDEO_IDS_SQL}
+   UNION
+  SELECT cv2.video_id FROM course_videos cv2
+    JOIN easyfixer_courses ec2 ON ec2.course_id = cv2.course_id
+   WHERE ec2.easyfixer_id = ?`;
+
+/*
+ * Give a technician every mandatory course they do not already hold.
+ *
+ * Called when registration completes, so a new technician is gated on the
+ * mandatory catalogue as it stands on the day they join. Same INSERT..SELECT
+ * NOT EXISTS shape as assignCourseToAll, so it is idempotent and never
+ * disturbs an existing assignment.
+ */
+async function assignMandatoryCourses(efrId) {
+  const id = Number(efrId);
+  if (!id) return { assigned: 0 };
+  const now = new Date();
+  const [res] = await pool.query(
+    `INSERT INTO easyfixer_courses (easyfixer_id, course_id, created_at, updated_at, due_date)
+     SELECT ?, c.id, ?, ?, NULL
+       FROM courses c
+      WHERE c.is_mandatory = 1 AND c.status = 1
+        AND NOT EXISTS (
+          SELECT 1 FROM easyfixer_courses ec
+           WHERE ec.easyfixer_id = ? AND ec.course_id = c.id)`,
+    [id, now, now, id],
+  );
+  if (res.affectedRows) {
+    logger.info('Mandatory courses assigned · efrId=' + id + ' count=' + res.affectedRows);
+  }
+  return { assigned: res.affectedRows };
+}
+
 module.exports = {
+  MANDATORY_VIDEO_IDS_SQL,
+  VISIBLE_VIDEO_IDS_SQL,
+  assignCourseToAll,
+  assignMandatoryCourses,
   COMPLETION_PERCENT,
   istToday,
   dueDateFrom,

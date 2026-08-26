@@ -1,0 +1,67 @@
+-- ─────────────────────────────────────────────────────────────────────
+-- 2026-08-26 — Make "mandatory" an explicit flag, not an accident of
+--              which table a row happens to sit in
+--
+-- WHY
+--   Adding ONE YouTube video to the training catalogue silently locked
+--   earning for every technician on the platform.
+--
+--   The registration gate reads:
+--       SELECT COUNT(*) FROM training_videos            -- "total"
+--   and requires a 100%-watched row for every one of them. That table
+--   holds TWO different things with nothing to tell them apart:
+--
+--     (a) the pre-LMS registration videos every technician must watch —
+--         3 rows, ~2,600 watch records each, owned by no course;
+--     (b) LMS course content, reachable only by its assignees —
+--         1 row today ("Deepskill update"), owned by 1 course, 0 watches.
+--
+--   So `total` went 3 -> 4. Every technician who had finished the real
+--   three now sits at done=3 < total=4, trainingCompletedTime is NULL,
+--   and jobsUnlocked (services/mobile-registration.service.js:322) is
+--   false. The app shows "Finish your training to unlock jobs" and the
+--   video it points at is a YouTube watch URL the app cannot play at all
+--   — so the technician cannot clear it by any action available to them.
+--
+--   The same absent distinction is why GET /api/mobile/training-videos
+--   serves one technician's assigned course to everybody: the endpoint
+--   has no way to ask which rows are global.
+--
+-- WHAT
+--   training_videos.is_global   1 = every technician must watch it.
+--                               DEFAULT 1 so the 3 legacy rows keep their
+--                               current meaning with no backfill, then the
+--                               UPDATE below demotes anything a course
+--                               already owns.
+--   courses.is_mandatory        1 = assigned to every technician, and its
+--                               videos gate registration. This is where
+--                               "mandatory" lives from now on; is_global
+--                               only carries the pre-LMS rows that predate
+--                               courses entirely.
+--
+--   Deliberately a FLAG rather than a derivation. "Mandatory = owned by no
+--   course" reads correctly today and has a cliff: put a legacy video into
+--   a course and the mandatory set becomes EMPTY, total=0, and jobsUnlocked
+--   goes false for everyone at once — the same outage as today, arrived at
+--   from the opposite direction, and silent because the gate consumes a
+--   timestamp rather than a boolean.
+--
+-- ENGINE NOTE
+--   training_videos is MyISAM and is read by the legacy Java service. ALTER
+--   on MyISAM takes a full table lock and copies the table; at 4 rows that
+--   is instant, but it still wants writer quiescence as a deployment
+--   precondition. courses is InnoDB and EasyFix-owned.
+--
+-- REVERSIBILITY
+--   Both columns are additive with defaults; dropping them restores the
+--   previous behaviour exactly, including the outage.
+-- ─────────────────────────────────────────────────────────────────────
+
+ALTER TABLE training_videos ADD COLUMN is_global TINYINT NOT NULL DEFAULT 1;
+
+ALTER TABLE courses ADD COLUMN is_mandatory TINYINT NOT NULL DEFAULT 0;
+
+-- Anything a course already owns is course content, not a global video.
+-- Today this demotes exactly one row: "Deepskill update", the video that
+-- caused the outage.
+UPDATE training_videos SET is_global = 0 WHERE id IN (SELECT video_id FROM course_videos);

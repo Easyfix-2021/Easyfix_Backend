@@ -245,8 +245,16 @@ router.post('/training-videos', validate(Joi.object({
       return modernError(res, 400, 'video link must be a YouTube URL');
     }
     const [ins] = await pool.query(
-      `INSERT INTO training_videos (title, description, sub_title, sub_description)
-       VALUES (?, ?, ?, ?)`,
+      /*
+       * is_global = 0. A catalogue row created here is CONTENT; it becomes
+       * something every technician must watch by being put into a course
+       * flagged mandatory, never by existing. The column defaults to 1 so the
+       * three pre-LMS rows kept their meaning through the migration — new rows
+       * must opt IN, or adding a video silently re-creates the 2026-08-26
+       * platform-wide earning lockout.
+       */
+      `INSERT INTO training_videos (title, description, sub_title, sub_description, is_global)
+       VALUES (?, ?, ?, ?, 0)`,
       [req.body.title, req.body.description || null,
        req.body.sub_title || null, req.body.sub_description || null]
     );

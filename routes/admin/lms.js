@@ -83,12 +83,14 @@ const listCoursesQuery = Joi.object({
 const createCourseBody = Joi.object({
   name: Joi.string().trim().min(2).max(150).required(),
   description: Joi.string().max(2000).allow('', null).optional(),
+  is_mandatory: Joi.boolean().optional(),
 });
 
 const updateCourseBody = Joi.object({
   name: Joi.string().trim().min(2).max(150).optional(),
   description: Joi.string().max(2000).allow('', null).optional(),
   status: Joi.boolean().optional(),
+  is_mandatory: Joi.boolean().optional(),
 }).min(1);
 
 /*
@@ -199,6 +201,24 @@ router.delete('/courses/:id', requireLmsManage, validate(idParam, 'params'), asy
 });
 
 // ─── Course content ──────────────────────────────────────────────────
+
+/*
+ * Assign a course to every active technician, as one explicit action.
+ *
+ * Separate from PATCH /courses/:id on purpose. Marking a course mandatory
+ * decides what FUTURE registrations must watch; back-filling it onto thousands
+ * of existing technicians is a different decision with a different blast
+ * radius, and the CRM asks before calling this. Idempotent, so answering the
+ * prompt twice costs nothing and never disturbs an existing assignee's due
+ * date, progress or score.
+ */
+router.post('/courses/:id/assign-all', requireLmsManage, validate(idParam, 'params'),
+  validate(Joi.object({ due_date: Joi.date().allow(null).optional() })), async (req, res, next) => {
+    try {
+      const result = await svc.assignCourseToAll(req.params.id, { dueDate: req.body.due_date ?? null });
+      modernOk(res, result);
+    } catch (e) { next(e); }
+  });
 
 router.get('/courses/:id/videos', validate(idParam, 'params'), async (req, res, next) => {
   try {
