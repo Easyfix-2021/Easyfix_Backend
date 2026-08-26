@@ -225,3 +225,47 @@ test('the stamped value fits the legacy int — a phone number here is a crash',
   assert.ok(String(v).length < 10,
     'a 10-digit value is a phone number, which is exactly the bug this replaced');
 });
+
+/*
+ * ── job_owner ON UNATTENDED BOOKINGS ──────────────────────────────────────
+ *
+ * A website, Website Bot or partner-API booking has no acting CRM operator, so
+ * `actor?.user_id` is undefined and job_owner went in NULL — the job landed in
+ * nobody's queue. Measured on QA: 173 of 185 'website' jobs, and every
+ * 'partner API' and 'integration_v2' row. Operator-placed sources (CRM, manual,
+ * excel) already showed zero missing, which is what says this is about the
+ * ABSENCE of an actor rather than about the binding being broken.
+ *
+ * The fallback is the client's Primary SPOC — the same person job_client_owner
+ * resolves to, a few lines above in the same function. Source-level because the
+ * defect is the ORDER of a `||` chain: any fixture that exercises it would pass
+ * against a chain that merely happened to reach the right value.
+ */
+const SPOC_SRC = require('fs').readFileSync(
+  require('path').join(__dirname, '..', 'services/job.service.js'), 'utf8',
+);
+
+test('job_owner falls back to the client SPOC, and only AFTER the acting operator', () => {
+  assert.match(
+    SPOC_SRC,
+    /input\.job_owner \|\| actor\?\.user_id \|\| resolvedJobClientOwner \|\| null,/,
+    'the precedence must be explicit owner -> acting operator -> client SPOC -> null',
+  );
+  // The old chain, which dropped straight to null with no actor.
+  assert.equal(
+    /input\.job_owner \|\| actor\?\.user_id \|\| null,/.test(SPOC_SRC),
+    false,
+    'an unattended booking would still land in nobody queue',
+  );
+});
+
+test('job_owner and job_client_owner stay DIFFERENT columns', () => {
+  /*
+   * The fallback must not be read as merging them. job_owner is the CRM
+   * operator holding the job; job_client_owner is the client's SPOC. They
+   * coincide only when there was no operator to record — everywhere else the
+   * actor wins, which is exactly what the ordering above guarantees.
+   */
+  assert.match(SPOC_SRC, /resolvedJobClientOwner \?\? null,/,
+    'job_client_owner keeps its own independent binding');
+});

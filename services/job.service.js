@@ -3362,7 +3362,24 @@ async function create(input, actor) {
         // else falls through to BOOKED so a typo can't accidentally
         // mark a job COMPLETED.
         effectiveStatus,
-        input.job_owner || actor?.user_id || null,
+        /*
+         * job_owner precedence: an explicit owner, else the CRM operator who
+         * placed the booking, else the client's Primary SPOC.
+         *
+         * That last arm is new (2026-08-26). Website, Website Bot and partner
+         * API bookings have NO acting operator, so they fell straight to null
+         * and landed in nobody's queue — measured on QA: 173 of 185 'website'
+         * jobs, and every 'partner API' and 'integration_v2' row. Operator-placed
+         * bookings are untouched: the actor still wins, and CRM / manual / excel
+         * sources already show zero missing owners.
+         *
+         * resolvedJobClientOwner is the same Primary SPOC job_client_owner gets,
+         * resolved a few lines above — so an unattended booking now belongs to
+         * the person who owns that client, rather than to no one. It is still a
+         * FALLBACK, not a merge: the two columns keep their distinct meanings
+         * wherever a real operator exists.
+         */
+        input.job_owner || actor?.user_id || resolvedJobClientOwner || null,
         resolvedJobClientOwner ?? null,
         input.job_type || 'Installation', input.source_type || 'manual',
         // job_reference_id (2026-06-03 per ops): the legacy DB column
