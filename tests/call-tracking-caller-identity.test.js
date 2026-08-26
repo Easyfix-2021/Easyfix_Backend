@@ -41,9 +41,10 @@ const constOf = (name) => {
 };
 
 test('the caller is resolved by ONE shared expression, used at every site', () => {
-  // Four consumers: daily-by-user, combined-by-user, job-callers, drill-down.
+  // Five consumers: daily-by-user, combined-by-user, job-callers, other-calls,
+  // drill-down.
   const uses = (SRC.match(/\$\{CALLER_NAME\}/g) || []).length;
-  assert.equal(uses, 4, `expected all 4 consumers to use CALLER_NAME, found ${uses}`);
+  assert.equal(uses, 5, `expected all 5 consumers to use CALLER_NAME, found ${uses}`);
   // and none of them still carries the old inline form
   assert.equal(
     /COALESCE\(u\.user_name, jci\.caller_name\)/.test(SRC), false,

@@ -11,16 +11,26 @@
  *             type, ''=all), format? }
  *     → { totals, byJob: [per job], byUser: [per (day, user)],
  *           byUserCombined: [per user, whole window + per-active-day averages],
+ *           byOther: [per (day, caller, direction) with NO job attached],
  *           byDay: [trend] }
- *       (or a 3-sheet XLSX when format='xlsx')
+ *       (or a 4-sheet XLSX when format='xlsx')
  *       totals additionally carries the conference tiles — partiesReached,
  *       conferenceCalls, conferenceBilledSecs, conferenceBilledCalls (all
  *       numbers, never null; see the service header for what each counts and
  *       why conferenceBilledCalls is NOT a ratio against conferenceCalls).
  *
  *   POST /api/admin/quicksight/call-tracking/calls
- *     body: the SAME filters + { jobId? | selectedCallerId? | day? }
+ *     body: the SAME filters + { jobId? | selectedCallerId? | day? | noJob? }
  *     → { items: [per call, each with legs[]], capped }
+ *
+ * OTHER CALLS (byOther): every call with NO job attached — the rows `totals` has
+ * always counted and no table could show, which is how an operator got "9 Total
+ * Calls" over a By Job table of 2. TWO populations share that bucket and the
+ * grain carries DIRECTION so the tab cannot mislabel the bigger one: staff
+ * DIRECT calls (caller_id > 0, 'OUT' — placed from Manage EasyFixers /
+ * Customers with no job context) and legacy INBOUND calls (caller_id 0, 'IN',
+ * written outside this backend). `noJob: true` on /calls applies the SAME
+ * predicate the grain is built on, so those counts drill like every other one.
  *
  * CONFERENCE CALLS: a conference is ONE call that gained people, so it is ONE
  * row everywhere a count is shown — every existing number in totals, byJob,
@@ -118,6 +128,8 @@ const COLUMN_RULES = [
     match: (k) => [
       'clientName', 'jobStatusLabel', 'userName', 'day', 'topStatusLabel',
       'callersLabel', 'partiesLabel', 'stepsLabel', 'firstCallAt', 'lastCallAt',
+      // Other Calls sheet — 'IN' / 'OUT', a label, not a number.
+      'direction',
     ].includes(k),
     hints: { align: 'left' },
   },
@@ -153,8 +165,9 @@ router.post('/summary', validate(summaryBody), async (req, res, next) => {
 
     if (req.body.format === 'xlsx') {
       /*
-       * THREE sheets — By Job / Daily By User / By User (Combined) — mirroring
-       * the on-screen grains.
+       * FOUR sheets — By Job / Daily By User / By User (Combined) / Other Calls
+       * — mirroring the on-screen grains. The last one carries the calls the
+       * KPI band counts and the other three cannot show (no job attached).
        * Each buildStyledWorkbook call after the first passes the SAME workbook,
        * then streamWorkbook ships it (see utils/xlsx-styled-export). The KPI band
        * rides on the first sheet only; repeating it would just be noise.
@@ -223,19 +236,45 @@ const callsBody = withDateOrder(extendJobFilter({
   // Selection — which cell was clicked. `callerId` above is the FILTER (an
   // array); `selectedCallerId` is the single user whose row was clicked.
   jobId: Joi.number().integer().min(1).optional(),
+  // min(1) is deliberate and stays: jci.caller_id holds 0 as a SENTINEL for "no
+  // attributed caller", not as a user id, so 0 must never reach the scope as a
+  // selection. The Other Calls tab's unattributed rows carry userId null for the
+  // same reason (drillableUserId) and drill on { noJob, day } instead.
   selectedCallerId: Joi.number().integer().min(1).optional(),
   day: DATE.optional(),
+  /*
+   * Complete the Other Calls grain, whose rows are (day × caller × direction).
+   * Without these a drill returns the union across directions and callers, and
+   * the list stops reconciling with the number that opened it — the invariant
+   * this endpoint exists to uphold. `unattributed` is how a caller-less row
+   * selects itself without relaxing selectedCallerId's min(1).
+   */
+  direction: Joi.string().valid('IN', 'OUT').optional(),
+  unattributed: Joi.boolean().optional(),
+  /*
+   * The Other Calls tab. Narrows the scope to calls with NO job attached — the
+   * same predicate the byOther grain is built on, applied to the same
+   * buildScope, which is what makes those counts clickable and reconciling.
+   * Combines with day / selectedCallerId; it is a scope narrowing, not a mode.
+   */
+  noJob: Joi.boolean().optional(),
 }));
 
 router.post('/calls', validate(callsBody), async (req, res, next) => {
   try {
     logger.info('Call Tracking drill-down · jobId=' + (req.body.jobId ?? '-')
       + ' caller=' + (req.body.selectedCallerId ?? '-')
-      + ' day=' + (req.body.day ?? '-'));
+      + ' day=' + (req.body.day ?? '-')
+      + ' noJob=' + (req.body.noJob ? 'yes' : '-')
+      + ' dir=' + (req.body.direction || '-')
+      + ' unattributed=' + (req.body.unattributed ? 'yes' : '-'));
     const data = await service.getCallDetails(filtersOf(req.body), {
       jobId: req.body.jobId,
       selectedCallerId: req.body.selectedCallerId,
       day: req.body.day,
+      noJob: req.body.noJob,
+      direction: req.body.direction,
+      unattributed: req.body.unattributed,
     });
     return modernOk(res, data);
   } catch (e) {

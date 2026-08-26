@@ -419,6 +419,7 @@ test('ACCEPTANCE — no core query so much as NAMES the leg or room tables', asy
     [/MAX\(c\.client_name\)/i, 'byJob'],
     [/AS active_days/i, 'byUserCombined'],
     [/AS day, COUNT\(\*\) AS calls/i, 'byDay'],
+    [/AS direction/i, 'byOther'],
   ];
   for (const [re, name] of core) {
     for (const q of sqlsWith(re)) {
@@ -434,12 +435,12 @@ test('ACCEPTANCE — no core query so much as NAMES the leg or room tables', asy
 
 test('the conference figures are TILES ONLY — no per-row copies appeared', async () => {
   mixedFixture();
-  const { byJob, byUser, byUserCombined, byDay } = await service.getCallTracking(WINDOW);
+  const { byJob, byUser, byUserCombined, byDay, byOther } = await service.getCallTracking(WINDOW);
 
   // Deliberate omission (see the service header): a per-row version of a
   // window-level figure multiplies the ways two numbers on one screen disagree.
   const NEW_KEYS = ['partiesReached', 'conferenceCalls', 'conferenceBilledSecs', 'conferenceBilledCalls'];
-  for (const rows of [byJob, byUser, byUserCombined, byDay]) {
+  for (const rows of [byJob, byUser, byUserCombined, byDay, byOther]) {
     for (const row of rows) {
       for (const k of NEW_KEYS) {
         assert.equal(Object.hasOwn(row, k), false, `${k} must not appear at row grain`);

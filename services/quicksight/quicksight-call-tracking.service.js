@@ -1,15 +1,23 @@
 /*
  * QuickSight — Call Tracking service.
  *
- * Answers four questions off ONE call log:
+ * Answers five questions off ONE call log:
  *   1. per JOB   — how much phoning did this job take, by whom, to whom, and at
  *                  which lifecycle step was each call made;
  *   2. per (DAY, USER) — how much calling did each CRM user do on each day, and
  *                  where in the job lifecycle was that effort mostly spent;
  *   3. per USER over the WHOLE window — the same effort collapsed to one row per
  *                  caller, plus the per-day efficiency averages (byUserCombined);
- *   4. per DAY   — a gap-filled volume/connect trend for the chart.
- * Plus a per-call drill-down behind every number, and a 3-sheet XLSX.
+ *   4. per DAY   — a gap-filled volume/connect trend for the chart;
+ *   5. per (DAY, CALLER, DIRECTION) with NO JOB attached (byOther) — the calls
+ *                  totals has always counted and no table could show. Two
+ *                  populations share that bucket, which is why DIRECTION is part
+ *                  of the grain: staff DIRECT calls (caller_id > 0, 'OUT',
+ *                  placed from Manage EasyFixers / Customers with no job) and
+ *                  legacy INBOUND calls (caller_id 0, 'IN'), the latter usually
+ *                  the majority. Before it, "9 Total Calls" sat above a By Job
+ *                  table of 2 rows with no route to the other 7.
+ * Plus a per-call drill-down behind every number, and a 4-sheet XLSX.
  *
  * ── Data rules (settled by the lead — do NOT re-litigate) ───────────────────
  * BASE TABLE is the LEGACY tbl_job_caller_info (alias jci), PK job_caller_info.
@@ -525,6 +533,35 @@ const ASSIGNED_AT_CALL = `CASE WHEN jci.job_efr_id IS NOT NULL THEN 1 ELSE 0 END
 const DAY_EXPR = `DATE_FORMAT(jci.inserted_time, '%Y-%m-%d')`;
 
 /*
+ * OUT / IN, normalised to exactly those two strings.
+ *
+ * Read through the SAME UPPER(COALESCE(…, 'OUT')) shape CP_NUM/CP_NAME use to
+ * pick the counterparty leg, so a row can never be counted as inbound here
+ * while its OUTBOUND number is the one resolved there.
+ *
+ * It exists for the no-job grain, where direction is the difference between two
+ * genuinely different populations sharing one bucket: staff DIRECT calls placed
+ * from Manage EasyFixers / Customers with no job context (caller_id > 0, 'OUT'),
+ * and INBOUND calls written by the legacy stack (caller_id 0, 'IN', often
+ * caller_status 'OFF-HOUR'). On a sampled production day the inbound rows were 7
+ * of 9, so a tab that did not split them would label the majority wrong.
+ */
+const DIRECTION = `CASE WHEN UPPER(COALESCE(jci.call_type, 'OUT')) = 'IN' THEN 'IN' ELSE 'OUT' END`;
+
+/*
+ * NO JOB ATTACHED — the exact complement of the byJob grain's
+ * `AND COALESCE(jci.job_id, 0) > 0`, written ONCE because three places need it:
+ * the byOther grain, its parties breakdown, and the drill-down's `noJob`
+ * selection. NULLIF folds the two spellings of "no job" into one state — a real
+ * NULL (a CRM click-to-call placed with no job context) and the 0 sentinel the
+ * legacy writer stores — which is why this is not `jci.job_id IS NULL`.
+ *
+ * Leading ' AND ': it is appended to a buildScope `where`, exactly like the
+ * byJob clause it complements.
+ */
+const NO_JOB = ' AND NULLIF(jci.job_id, 0) IS NULL';
+
+/*
  * ── buildScope(filters) ────────────────────────────────────────────────────
  * The shared FROM + WHERE + params for the call set matching the filters. Every
  * query below — including the drill-down — is built from this, so a detail list
@@ -879,7 +916,22 @@ async function getCallTracking(filters = {}) {
   const [[tot]] = await pool.query(
     `SELECT ${CALL_AGG},
             COUNT(DISTINCT NULLIF(jci.job_id, 0)) AS unique_jobs,
-            COUNT(DISTINCT jci.caller_id)         AS unique_callers
+            COUNT(DISTINCT jci.caller_id)         AS unique_callers,
+            /*
+             * Inbound reach. MISSED is defined as duration = 0, NOT as
+             * caller_status = 'OFF-HOUR' — see the header: caller_status is not
+             * comparable across providers ('answered' / 'hangup' / Kaleyra's own
+             * vocabulary / NULL on legacy rows), while a positive duration means
+             * the same thing on every row and is already this report's
+             * definition of CONNECTED. A metric built on the string would agree
+             * with the tile beside it only by luck.
+             *
+             * These count somebody ringing US and nobody picking up — a number
+             * no surface in this report has ever shown, and the likeliest place
+             * in it to find lost work.
+             */
+            SUM(CASE WHEN ${DIRECTION} = 'IN' THEN 1 ELSE 0 END)                          AS inbound_calls,
+            SUM(CASE WHEN ${DIRECTION} = 'IN' AND COALESCE(jci.duration, 0) = 0 THEN 1 ELSE 0 END) AS inbound_missed
        ${sT.from} ${sT.where}`,
     sT.params,
   );
@@ -976,6 +1028,43 @@ async function getCallTracking(filters = {}) {
     sUC.params,
   );
   if (combinedRows.length >= ROW_CAP) logger.warn(`Call Tracking (combined by user) hit the ${ROW_CAP}-row cap`);
+
+  /*
+   * ── Per-(DAY × CALLER × DIRECTION) grain, NO JOB ATTACHED ──
+   *
+   * The calls that `totals` has always counted and NO table has ever shown. An
+   * operator reading "9 Total Calls" over a By Job table with 2 rows had no way
+   * to reach the other 7 — they were not missing from the report, they were
+   * missing from every GRAIN in it, because byJob restricts to real job ids and
+   * byUser is the same rows sliced a different way.
+   *
+   * DIRECTION IS PART OF THE GRAIN, not a column beside it: this bucket holds
+   * two unrelated populations (see DIRECTION) and collapsing them would print
+   * one row that is mostly legacy inbound traffic under a caller who placed
+   * none of it.
+   *
+   * Same buildScope, same CALL_AGG, same ROW_CAP as every grain above — the
+   * ONLY addition is NO_JOB, so these rows are exactly `totals` minus `byJob`'s
+   * population and nothing double-counts.
+   */
+  const sO = buildScope(filters);
+  const [otherRows] = await pool.query(
+    `SELECT ${DAY_EXPR} AS day,
+            ${DIRECTION} AS direction,
+            jci.caller_id AS userId,
+            MAX(${CALLER_NAME}) AS userName,
+            ${CALL_AGG},
+            MIN(jci.inserted_time) AS firstCallAt,
+            MAX(jci.inserted_time) AS lastCallAt
+       ${sO.from}
+       LEFT JOIN tbl_user u ON u.user_id = jci.caller_id
+       ${sO.where}${NO_JOB}
+      GROUP BY ${DAY_EXPR}, ${DIRECTION}, jci.caller_id
+      ORDER BY day DESC, calls DESC
+      LIMIT ${ROW_CAP}`,
+    sO.params,
+  );
+  if (otherRows.length >= ROW_CAP) logger.warn(`Call Tracking (other calls) hit the ${ROW_CAP}-row cap`);
 
   /*
    * ── Nested breakdowns ──
@@ -1138,6 +1227,45 @@ async function getCallTracking(filters = {}) {
   }
 
   /*
+   * The no-job grain's `parties` breakdown — the SAME one grouped query,
+   * ordered by the stitch key and filtered through completeKeysOnly, that every
+   * other breakdown above uses.
+   *
+   * NO `steps` counterpart, deliberately: jci.job_status is the snapshot of a
+   * job, and these calls have no job. A steps list here would be one 'Unknown'
+   * entry on every row.
+   *
+   * ⚠ TODAY THIS ANSWERS 'Other' FOR EVERY ROW, and that is the honest answer
+   * rather than a bug: PARTY_ROLE matches the dialled number against the JOB's
+   * parties (cu / j / ef), and with no job those joins are all NULL. It is left
+   * as a real query instead of a hardcoded [{ role: 'Other' }] so that the day
+   * PARTY_ROLE gains a job-independent arm — matching a technician straight off
+   * tbl_easyfixer is the obvious next ask for a tab about staff direct calls —
+   * this tab starts telling the truth without anyone remembering it exists.
+   */
+  let partiesByOther = new Map();
+  const otherKey = (r) => `${r.day}|${r.direction}|${n(r.userId)}`;
+  // caller_id 0 is a legitimate VALUE here (the legacy inbound rows), not an
+  // absent id — it is filtered out of the drillable id, never out of the query.
+  const otherCallerIds = [...new Set(otherRows.map((r) => n(r.userId)))];
+  if (otherCallerIds.length > 0) {
+    const sOP = buildScope(filters);
+    const otherIn = otherCallerIds.map(() => '?').join(',');
+    const [opRows] = await pool.query(
+      `SELECT ${DAY_EXPR} AS day, ${DIRECTION} AS direction, jci.caller_id AS userId,
+              ${PARTY_ROLE} AS role, COUNT(*) AS calls
+         ${sOP.from}
+         ${sOP.where}${NO_JOB} AND jci.caller_id IN (${otherIn})
+        GROUP BY ${DAY_EXPR}, ${DIRECTION}, jci.caller_id, ${PARTY_ROLE}
+        ORDER BY day, direction, jci.caller_id, calls DESC
+        LIMIT ${NESTED_CAP}`,
+      [...sOP.params, ...otherCallerIds],
+    );
+    if (opRows.length >= NESTED_CAP) logger.warn(`Call Tracking (other-call parties) hit the ${NESTED_CAP}-row cap`);
+    partiesByOther = groupBy(completeKeysOnly(opRows, otherKey, NESTED_CAP), otherKey, (r) => ({ role: r.role || 'Other', calls: n(r.calls) }));
+  }
+
+  /*
    * ── Daily trend, GAP-FILLED ──
    * A GROUP BY only returns days that had calls, so every day in the window is
    * materialised here and missing days read as zero. Same approach as the Offer
@@ -1175,6 +1303,8 @@ async function getCallTracking(filters = {}) {
     ...shapeAgg(tot),
     uniqueJobs: n(tot && tot.unique_jobs),
     uniqueCallers: n(tot && tot.unique_callers),
+    inboundCalls: n(tot && tot.inbound_calls),
+    inboundMissed: n(tot && tot.inbound_missed),
     /*
      * All four are ALWAYS numbers, never null. The null/em-dash convention this
      * report uses means "we cannot divide" — it belongs to averages. These are
@@ -1270,12 +1400,41 @@ async function getCallTracking(filters = {}) {
     };
   });
 
+  /*
+   * The NO-JOB grain. Shares byUser's numeric block (shapeAgg over the same
+   * CALL_AGG), so `calls` here means what `calls` means everywhere else.
+   *
+   * ⚠ userName is NOT byUser's expression verbatim, and the difference is
+   * deliberate. CALLER_NAME's last resort is jci.caller_name, which on an
+   * INBOUND row is the name of whoever CALLED IN — the customer. byUser never
+   * meets that case (its rows are CRM-placed calls); this grain is half made of
+   * it, and printing a customer's name in a column headed "User" credits them
+   * with placing the call. So an unattributed row reads 'Unattributed', full
+   * stop, and the stamped name is simply not promoted into a caller slot.
+   */
+  const byOther = otherRows.map((r) => {
+    const id = drillableUserId(r.userId);
+    return {
+      day: r.day,
+      direction: r.direction,
+      userId: id,
+      userName: id == null ? 'Unattributed' : (r.userName || `User #${n(r.userId)}`),
+      ...shapeAgg(r),
+      parties: partiesByOther.get(otherKey(r)) || [],
+      // RAW DB datetime strings, exactly as byJob / byUser return them — this
+      // report formats no timestamp server-side.
+      firstCallAt: r.firstCallAt || null,
+      lastCallAt: r.lastCallAt || null,
+    };
+  });
+
   logger.info('Returning ' + byJob.length + ' job rows · ' + byUser.length + ' day-user rows · '
     + byUserCombined.length + ' combined user rows · '
+    + byOther.length + ' no-job rows · '
     + byDay.length + ' trend days · ' + totals.calls + ' calls · '
     + totals.partiesReached + ' parties reached across ' + totals.conferenceCalls + ' conference calls · '
     + totals.conferenceBilledSecs + ' billed conf secs from ' + totals.conferenceBilledCalls + ' rooms');
-  return { totals, byJob, byUser, byUserCombined, byDay };
+  return { totals, byJob, byUser, byUserCombined, byOther, byDay };
 }
 
 /*
@@ -1380,6 +1539,32 @@ async function getCallDetails(filters = {}, selection = {}) {
 
   if (selection.jobId != null) { where += ' AND jci.job_id = ?'; params.push(Number(selection.jobId)); }
   if (selection.selectedCallerId != null) { where += ' AND jci.caller_id = ?'; params.push(Number(selection.selectedCallerId)); }
+  /*
+   * The Other Calls tab's counts, made clickable. The SAME predicate the
+   * byOther grain is built on (NO_JOB), which is the whole reason the numbers
+   * reconcile. Independent of the keys around it: `noJob` + `day` is a cell in
+   * that tab, `noJob` + `selectedCallerId` is one caller's direct calls.
+   *
+   * `direction` and `unattributed` complete the grain.
+   *
+   * WITHOUT BOTH, THIS TAB BREAKS THE REPORT'S ONE HARD INVARIANT: that a
+   * drill-down list reconciles with the count it was opened from (see the route
+   * header). A byOther row is keyed on (day × caller × direction), so a drill
+   * carrying only `noJob` + `day` returns every job-less call that day from
+   * every caller in both directions. On the day this tab was built for —
+   * 7 unattributed inbound plus 2 staff-direct outbound — clicking the 7 opened
+   * a list of 9, and it broke on precisely the row the feature exists to show.
+   *
+   * `unattributed` is how a caller-less row selects itself. It cannot use
+   * selectedCallerId: that is min(1) on purpose, because 0 is a sentinel and
+   * not a user id, and relaxing it would let a 0 through on every other tab.
+   */
+  if (selection.noJob) where += NO_JOB;
+  if (selection.direction === 'IN' || selection.direction === 'OUT') {
+    where += ` AND ${DIRECTION} = ?`;
+    params.push(selection.direction);
+  }
+  if (selection.unattributed) where += ' AND COALESCE(jci.caller_id, 0) = 0';
   if (selection.day) {
     // Narrows WITHIN the scope window (never widens it) — a single IST day.
     where += ' AND jci.inserted_time >= ?';
@@ -1510,10 +1695,10 @@ async function getCallDetails(filters = {}, selection = {}) {
 }
 
 /*
- * XLSX payload — THREE sheets mirroring the on-screen grains (By Job, the daily
- * By User table, and its combined per-user sub-view), so the download carries
- * everything the report can show. The route walks `sheets` and hands each to
- * buildStyledWorkbook with a shared workbook.
+ * XLSX payload — FOUR sheets mirroring the on-screen grains (By Job, the daily
+ * By User table, its combined per-user sub-view, and Other Calls), so the
+ * download carries everything the report can show. The route walks `sheets` and
+ * hands each to buildStyledWorkbook with a shared workbook.
  *
  * The nested arrays are flattened into readable single cells ('Priya (3), Amit
  * (1)') — a spreadsheet cell cannot hold a list, and an operator reading the
@@ -1621,6 +1806,36 @@ function toXlsx(data) {
           avgCallsPerDay: r.avgCallsPerDay == null ? 0 : r.avgCallsPerDay,
           avgDurationPerDaySecs: r.avgDurationPerDaySecs == null ? 0 : r.avgDurationPerDaySecs,
           stepsLabel: flatten(r.steps, (x) => x.label),
+          partiesLabel: flatten(r.parties, (x) => x.role),
+        })),
+      },
+      /*
+       * The calls with NO job attached — the population the other three sheets
+       * cannot show at all (By Job restricts to real job ids; the two By User
+       * sheets are the same rows regrouped). Without it the workbook's KPI band
+       * counts calls that appear on none of its rows, which is the on-screen
+       * complaint this tab exists to answer, exported.
+       *
+       * Direction is a COLUMN here and part of the GRAIN in the service — it is
+       * what separates a staff direct call from a legacy inbound one, and the
+       * two are most of this sheet.
+       *
+       * No 'At Job Step' column: there is no job, so no snapshot status.
+       */
+      {
+        name: 'Other Calls',
+        columns: [
+          { key: 'day', header: 'Date', width: 14 },
+          { key: 'direction', header: 'Direction', width: 12 },
+          { key: 'userName', header: 'User', width: 26 },
+          ...SHARED_COLS,
+          { key: 'partiesLabel', header: 'Called To', width: 30 },
+          { key: 'firstCallAt', header: 'First Call', width: 20 },
+          { key: 'lastCallAt', header: 'Last Call', width: 20 },
+        ],
+        rows: (data.byOther || []).map((r) => ({
+          ...r,
+          avgDurationSecs: r.avgDurationSecs == null ? 0 : r.avgDurationSecs,
           partiesLabel: flatten(r.parties, (x) => x.role),
         })),
       },

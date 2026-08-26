@@ -341,7 +341,7 @@ test('parties / steps are ONE grouped query each, restricted to the returned cal
 
 // ─── XLSX ───────────────────────────────────────────────────────────
 
-test('toXlsx adds a third sheet for the combined grain and leaves the first two alone', () => {
+test('toXlsx adds the By User (Combined) and Other Calls sheets for the combined grain and leaves the first two alone', () => {
   const data = {
     byJob: [],
     byUser: [{ day: '2026-07-02', userName: 'Priya', calls: 4, avgDurationSecs: null, steps: [], parties: [] }],
@@ -354,7 +354,7 @@ test('toXlsx adds a third sheet for the combined grain and leaves the first two 
   };
   const { sheets } = service.toXlsx(data);
 
-  assert.deepEqual(sheets.map((s) => s.name), ['By Job', 'Daily By User', 'By User (Combined)']);
+  assert.deepEqual(sheets.map((s) => s.name), ['By Job', 'Daily By User', 'By User (Combined)', 'Other Calls']);
   const combined = sheets[2];
   const keys = combined.columns.map((c) => c.key);
   // Active Days sits BEFORE the averages it is the denominator of.
