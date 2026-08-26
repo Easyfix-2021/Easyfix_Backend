@@ -134,3 +134,58 @@ test('a cancelled job with no recorded reason is LABELLED, not dropped', async (
   assert.match(q.sql, /LEFT JOIN action_taken_reason/i,
     'an INNER JOIN would silently drop every reason-less cancellation');
 });
+
+// ─── scope narrowing ──────────────────────────────────────────────────────
+
+async function callWith(query) {
+  const r = res();
+  await handlerFor('/dashboard-range', 'get')(
+    { spoc: { id: 42, client_id: 133 }, access: { allStores: true, grants: ['home'] }, query },
+    r, (e) => { throw e; },
+  );
+  assert.equal(r.body?.success, true, JSON.stringify(r.body));
+  return r.body.data;
+}
+
+test('?spoc narrows to that member — but ONLY inside the caller\'s own subtree', async () => {
+  // The fake returns one direct report, id 11, so the subtree is [11, 42].
+  const inside = await callWith({ from: '2026-07-01', to: '2026-08-25', spoc: 11 });
+  assert.equal(inside.scope.spoc, 11);
+  const q = fake.calls.find((c) => /AS runningLate/i.test(c.sql));
+  assert.equal(q.params.filter((p) => p === 11).length, 1, 'the IN list should be just that member');
+  assert.equal(q.params.includes(42), false, 'the caller drops out when narrowed to someone else');
+});
+
+test('a spoc OUTSIDE the subtree is ignored, not honoured and not an error', async () => {
+  /*
+   * The security property. Honouring it would let a Store SPOC read a peer's
+   * book by guessing a contact id; erroring would confirm which ids exist.
+   * Ignoring degrades to the caller's own scope, which is the safe answer.
+   */
+  fake.reset();
+  const d = await callWith({ from: '2026-07-01', to: '2026-08-25', spoc: 9999 });
+  assert.equal(d.scope.spoc, null, 'the response must not claim a scope it did not apply');
+  const q = fake.calls.find((c) => /AS runningLate/i.test(c.sql));
+  assert.equal(q.params.includes(9999), false, 'the foreign id must never reach the query');
+  assert.ok(q.params.includes(42) && q.params.includes(11), 'falls back to the full subtree');
+});
+
+test('?city is applied to ALL four aggregates, or the percentages would lie', async () => {
+  fake.reset();
+  const d = await callWith({ from: '2026-07-01', to: '2026-08-25', city: 'Bengaluru' });
+  assert.equal(d.scope.city, 'Bengaluru');
+  const aggregates = fake.calls.filter((c) => /FROM tbl_job j/i.test(c.sql));
+  assert.equal(aggregates.length, 4);
+  for (const q of aggregates) {
+    assert.match(q.sql, /city_name = \?/,
+      'a city-scoped numerator over a client-wide denominator is a wrong percentage');
+    assert.ok(q.params.includes('Bengaluru'), 'and it must be a BOUND parameter');
+  }
+});
+
+test('no city filter means no join at all — the common path stays cheap', async () => {
+  fake.reset();
+  await callWith({ from: '2026-07-01', to: '2026-08-25' });
+  const totals = fake.calls.find((c) => /AS runningLate/i.test(c.sql));
+  assert.doesNotMatch(totals.sql, /ci2\./, 'the address/city join is opt-in');
+});

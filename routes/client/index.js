@@ -3576,6 +3576,10 @@ router.delete('/company/documents/:id', async (req, res, next) => {
 const dashboardRangeQuery = Joi.object({
   from: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).required(),
   to:   Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).required(),
+  // Optional scope narrowing. Both are OPT-IN: absent means "everything you
+  // can already see", never a widened view.
+  city: Joi.string().max(120).optional().allow(''),
+  spoc: Joi.number().integer().positive().optional(),
 }).messages({ 'string.pattern.base': 'Dates must be yyyy-mm-dd' });
 
 router.get('/dashboard-range', validate(dashboardRangeQuery, 'query'), async (req, res, next) => {
@@ -3592,9 +3596,38 @@ router.get('/dashboard-range', validate(dashboardRangeQuery, 'query'), async (re
           AND CAST(manager_id AS UNSIGNED) = ?`,
       [clientId, req.spoc.id]
     );
-    const teamIds = reports.map((r) => r.id);
+    let teamIds = reports.map((r) => r.id);
     teamIds.push(req.spoc.id);
+
+    /*
+     * ?spoc=<id> narrows to ONE team member — and the containment check is the
+     * whole security of it. Without `teamIds.includes(...)` a Store SPOC could
+     * read a peer's book by guessing a contact id. Same rule hierarchyFilter()
+     * applies on /jobs; an id outside the subtree is IGNORED rather than
+     * rejected, so the page degrades to the caller's own scope instead of
+     * erroring, and cannot be used to probe which ids exist.
+     */
+    const wantSpoc = Number(req.query.spoc) || null;
+    if (wantSpoc && teamIds.includes(wantSpoc)) teamIds = [wantSpoc];
     const team = teamIds.map(() => '?').join(',');
+
+    /*
+     * ?city=<name> filters on the job's ADDRESS city. The city list the UI
+     * offers comes from GET /cities, which is itself DISTINCT over this
+     * client's jobs — so a value that matches nothing is a stale tab, not an
+     * injection surface, and it is parameterised regardless.
+     *
+     * The join has to be added to all four queries, not just the city one, or
+     * the percentages would compare a city-scoped numerator against a
+     * client-wide denominator.
+     */
+    const city = String(req.query.city || '').trim();
+    const cityJoin = city
+      ? `LEFT JOIN tbl_address ad2 ON ad2.address_id = j.fk_address_id
+         LEFT JOIN tbl_city    ci2 ON ci2.city_id    = ad2.city_id`
+      : '';
+    const cityWhere = city ? 'AND ci2.city_name = ?' : '';
+    const cityParam = city ? [city] : [];
 
     /*
      * `to` is INCLUSIVE: a job raised at 18:40 on the end date belongs to the
@@ -3604,8 +3637,9 @@ router.get('/dashboard-range', validate(dashboardRangeQuery, 'query'), async (re
     const COHORT = `j.fk_client_id = ?
           AND j.reporting_contact_id IN (${team})
           AND j.ticket_created_date_time >= ?
-          AND j.ticket_created_date_time <  DATE_ADD(?, INTERVAL 1 DAY)`;
-    const params = [clientId, ...teamIds, from, to];
+          AND j.ticket_created_date_time <  DATE_ADD(?, INTERVAL 1 DAY)
+          ${cityWhere}`;
+    const params = [clientId, ...teamIds, from, to, ...cityParam];
 
     const totals = pool.query(
       `SELECT COUNT(*)                                                        AS total,
@@ -3619,6 +3653,7 @@ router.get('/dashboard-range', validate(dashboardRangeQuery, 'query'), async (re
               SUM(CASE WHEN r.is_escalated = 1         THEN 1 ELSE 0 END)     AS escalated
          FROM tbl_job j
          LEFT JOIN tbl_easyfixer_rating_by_customer r ON r.job_id = j.job_id
+         ${cityJoin}
         WHERE ${COHORT}`,
       params,
     );
@@ -3651,6 +3686,7 @@ router.get('/dashboard-range', validate(dashboardRangeQuery, 'query'), async (re
               COUNT(*)                                                    AS n
          FROM tbl_job j
          LEFT JOIN action_taken_reason atr ON atr.id = j.cancel_reason_id
+         ${cityJoin}
         WHERE ${COHORT}
           AND j.job_status = 6
         GROUP BY reason
@@ -3663,6 +3699,7 @@ router.get('/dashboard-range', validate(dashboardRangeQuery, 'query'), async (re
               COUNT(*)                                                  AS n
          FROM tbl_job j
          LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = j.fk_service_catg_id
+         ${cityJoin}
         WHERE ${COHORT}
         GROUP BY label
         ORDER BY n DESC, label ASC`,
@@ -3679,6 +3716,7 @@ router.get('/dashboard-range', validate(dashboardRangeQuery, 'query'), async (re
 
     modernOk(res, {
       window: { from, to },
+      scope: { city: city || null, spoc: teamIds.length === 1 && wantSpoc ? wantSpoc : null },
       performance: {
         total,
         completed: n(t.completed),
