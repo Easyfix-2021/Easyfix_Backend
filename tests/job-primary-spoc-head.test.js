@@ -269,3 +269,40 @@ test('job_owner and job_client_owner stay DIFFERENT columns', () => {
   assert.match(SPOC_SRC, /resolvedJobClientOwner \?\? null,/,
     'job_client_owner keeps its own independent binding');
 });
+
+/*
+ * ── ONE SPOC LOOKUP, THREE COLUMNS ────────────────────────────────────────
+ *
+ * job_primary_spoc, job_client_owner and (unattended) job_owner all name the
+ * same person. They were resolved by TWO copies of the lookup that disagreed:
+ * the create path ordered `id ASC` — the OLDEST mapping — and read vm.user_id
+ * directly; the stamp ordered newest-first through a LEFT JOIN on tbl_user.
+ *
+ * Measured on QA: 204 clients have a user_type = 1 mapping, none has more than
+ * one, and the two orderings disagree on 0 of them. So this is a latent defect,
+ * not a live one — which is exactly why it needs a test rather than a bug
+ * report. The day a client's SPOC is reassigned, one job would carry the old
+ * owner in one column and the new one in another, silently.
+ */
+test('one resolver feeds every owner column — no second copy of the lookup', () => {
+  assert.match(SPOC_SRC, /async function resolveClientPrimarySpoc\(/,
+    'the shared lookup must exist');
+  // The stamp and the create path both go through it.
+  assert.match(SPOC_SRC, /const headUserId = await resolveClientPrimarySpoc\(clientId, db\);/);
+  assert.match(SPOC_SRC, /await resolveClientPrimarySpoc\(input\.fk_client_id, conn\)/);
+  // And the create path's old private copy is gone.
+  assert.equal(
+    /ORDER BY id ASC LIMIT 1/.test(SPOC_SRC), false,
+    'the OLDEST-mapping ordering must not survive anywhere',
+  );
+});
+
+test('the shared lookup keeps the LEFT JOIN and the newest-first ordering', () => {
+  const body = SPOC_SRC.slice(SPOC_SRC.indexOf('async function resolveClientPrimarySpoc('));
+  const fn = body.slice(0, body.indexOf('\n}\n') + 3);
+  assert.match(fn, /LEFT JOIN tbl_user u ON u\.user_id = vm\.user_id/,
+    'a deleted user must yield NULL, never a dangling owner id');
+  assert.match(fn, /SELECT u\.user_id/, 'select the JOINED id, not vm.user_id');
+  assert.match(fn, /vm\.inserted_on DESC, vm\.id DESC/, 'newest mapping wins');
+  assert.match(fn, /vm\.status IS NULL OR vm\.status = 1/, 'inactive mappings are skipped');
+});

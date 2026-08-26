@@ -920,34 +920,50 @@ function stampJobLocality(jobId, pinCode) {
   })();
 }
 
+/*
+ * The client's Primary SPOC (tbl_vertical_mapping.user_type = 1), as a
+ * tbl_user.user_id, or null when none resolves.
+ *
+ * ONE definition, because THREE columns are stamped from it: job_primary_spoc,
+ * job_client_owner, and job_owner on a booking with no acting operator. There
+ * were two copies of this lookup and they disagreed in two ways — the create
+ * path ordered by `id ASC` (the OLDEST mapping) and read vm.user_id directly,
+ * while the stamp ordered newest-first THROUGH a LEFT JOIN.
+ *
+ * Latent rather than live: no client currently has more than one user_type = 1
+ * mapping (checked across all 204 that have any, 0 disagreements). But the day
+ * a client's SPOC is reassigned, the same job would carry the OLD owner in one
+ * column and the NEW one in another — and nothing would report an error.
+ *
+ * u.user_id, NOT vm.user_id: the same number when the mapping points at a live
+ * user, different in exactly the case that matters — a mapping whose user was
+ * deleted yields NULL, so we stamp no owner rather than one that resolves to
+ * nobody. A dangling owner is worse than no owner.
+ */
+async function resolveClientPrimarySpoc(clientId, conn) {
+  if (!clientId) return null;
+  const db = conn || pool;
+  const orderBy = (await hasVerticalMappingInsertedOnColumn())
+    ? 'vm.inserted_on DESC, vm.id DESC'
+    : 'vm.id DESC';
+  const [[head]] = await db.query(
+    `SELECT u.user_id
+       FROM tbl_vertical_mapping vm
+       LEFT JOIN tbl_user u ON u.user_id = vm.user_id
+      WHERE vm.client_id = ? AND vm.user_type = 1
+        AND (vm.status IS NULL OR vm.status = 1)
+      ORDER BY ${orderBy}
+      LIMIT 1`,
+    [clientId],
+  );
+  return head?.user_id ?? null;
+}
+
 async function stampJobPrimarySpoc(jobId, clientId, conn) {
   if (!jobId || !(await hasJobPrimarySpocColumn())) return;
   const db = conn || pool;
   try {
-    let headUserId = null;
-    if (clientId) {
-      const orderBy = (await hasVerticalMappingInsertedOnColumn())
-        ? 'vm.inserted_on DESC, vm.id DESC'
-        : 'vm.id DESC';
-      /*
-       * u.user_id, NOT vm.user_id — they are the same number when the mapping
-       * points at a live user, and they differ in exactly the case that
-       * matters: a mapping row whose user was deleted. The LEFT JOIN makes
-       * u.user_id NULL there, so we stamp NULL rather than an id that resolves
-       * to nobody. A dangling owner is worse than no owner.
-       */
-      const [[head]] = await db.query(
-        `SELECT u.user_id
-           FROM tbl_vertical_mapping vm
-           LEFT JOIN tbl_user u ON u.user_id = vm.user_id
-          WHERE vm.client_id = ? AND vm.user_type = 1
-            AND (vm.status IS NULL OR vm.status = 1)
-          ORDER BY ${orderBy}
-          LIMIT 1`,
-        [clientId],
-      );
-      headUserId = head?.user_id ?? null;
-    }
+    const headUserId = await resolveClientPrimarySpoc(clientId, db);
     await db.query('UPDATE tbl_job SET job_primary_spoc = ? WHERE job_id = ?', [headUserId, jobId]);
   } catch (e) {
     logger.warn(
@@ -3190,17 +3206,11 @@ async function create(input, actor) {
     let resolvedJobClientOwner = input.job_client_owner;
     if ((resolvedJobClientOwner == null || resolvedJobClientOwner === '') && input.fk_client_id) {
       try {
-        const [vmRows] = await conn.query(
-          `SELECT user_id FROM tbl_vertical_mapping
-            WHERE client_id = ? AND user_type = 1
-              AND (status IS NULL OR status = 1)
-            ORDER BY id ASC LIMIT 1`,
-          [input.fk_client_id]
-        );
-        if (vmRows.length > 0) {
-          const uid = Number(vmRows[0].user_id);
-          if (Number.isFinite(uid) && uid > 0) resolvedJobClientOwner = uid;
-        }
+        /* The SAME lookup job_primary_spoc is stamped from — see
+         * resolveClientPrimarySpoc. The two must not drift: they describe one
+         * person, and this row writes both columns. */
+        const uid = Number(await resolveClientPrimarySpoc(input.fk_client_id, conn));
+        if (Number.isFinite(uid) && uid > 0) resolvedJobClientOwner = uid;
       } catch (e) {
         // Non-fatal — leave null and let the booking proceed.
         require('../logger').warn(
