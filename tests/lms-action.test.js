@@ -309,3 +309,45 @@ test('drilldown: the DEFAULT view is outstanding-only, but a chip can reach comp
   assert.doesNotMatch(rowSql.replace(/ec\.completion_date IS NOT NULL/g, ''), /ec\.completion_date IS NULL/,
     'the outstanding-only default must not survive alongside an explicit chip');
 });
+
+// ─── 8. Membership and progress must count the SAME rows ─────────────
+
+/*
+ * Four reads in this file decide what a course IS: the "has content" test in
+ * LIVE_WHERE, the videos_total column, the done_videos join and NO_PROGRESS.
+ * They were briefly inconsistent — membership widened to every content kind
+ * while the three progress reads stayed kind = 'video' — which put a
+ * document- or assessment-only course on the chase list with videos_total = 0
+ * and done_videos = 0: permanently "not started", for a course with no video
+ * in it to start, chased forever by a state manager who cannot fix it.
+ *
+ * Half-widening is worse than either whole answer, so this pins that all four
+ * describe the same rows.
+ */
+test('a course with no VIDEOS is not reported as a course with no progress', async () => {
+  fake.reset();
+  scenario = [[/.*/, [{ total: 0, overdue: 0, not_started: 0, part_done: 0, done: 0 }]]];
+  await action.pendingList({ detector: 'paused_not_started', courseId: 4 });
+  const rows = fake.calls[1].sql;
+
+  const total = rows.match(/SELECT COUNT\(\*\) FROM lms_content lc[\s\S]*?\) AS videos_total/);
+  assert.ok(total, 'the denominator is read from lms_content');
+  assert.doesNotMatch(total[0], /kind = 'video'/,
+    'the denominator must count every item of the course, or a PPT-only course reads as 0 of 0');
+
+  // The progress side proves completion per kind, exactly as the gating reads
+  // in lms.service::itemCompleteSql do.
+  assert.match(rows, /watched_percentage, 0\) >= 100/, 'videos: watched to the end');
+  assert.match(rows, /lms_assessment_attempt aa\s+ON aa\.assessment_id = lc\.ref_id AND aa\.passed = 1/,
+    'assessments: a PASSING attempt');
+  assert.match(rows, /lms_document_ack da ON da\.content_id = lc\.id/,
+    'documents: an acknowledgement of the CONTENT row');
+  assert.match(rows, /COUNT\(DISTINCT content_id\)/,
+    'a second passing attempt at the same paper must not count twice and push done above total');
+
+  // NO_PROGRESS is the predicate this detector selects on.
+  assert.match(rows, /lms_assessment_attempt aa\s+WHERE lc\.kind = 'assessment'/,
+    '"not started" must consider a sat assessment to be a start');
+  assert.match(rows, /lms_document_ack da\s+WHERE lc\.kind = 'document'/,
+    'and an acknowledged document too');
+});

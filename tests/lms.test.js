@@ -20,7 +20,9 @@ const { installFakePool } = require('./helpers/fake-pool');
  *      recording, which is part of the offline-replay contract.
  */
 
-const COMPLETION_QUERY = /FROM\s+easyfixer_courses ec\s+JOIN\s+course_videos/i;
+// Content moved from course_videos to lms_content on 2026-08-26; the query
+// this matches is the same completion probe, now counting items of every kind.
+const COMPLETION_QUERY = /FROM\s+easyfixer_courses ec\s+JOIN\s+lms_content/i;
 const UPSERT = /^\s*INSERT INTO easyfixer_watched_video/i;
 
 const fake = installFakePool([

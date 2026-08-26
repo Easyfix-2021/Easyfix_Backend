@@ -1,5 +1,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
+const s3 = require('../utils/s3-storage');
 
 /*
  * LMS — courses, course content, assignment and completion reporting.
@@ -7,14 +8,24 @@ const logger = require('../logger');
  * ─── The data model, and why it is split across two engines ──────────────
  *
  *   courses            InnoDB   the course itself (id, name, description, status)
- *   course_videos      InnoDB   NEW — which videos a course contains, ordered
+ *   lms_content        InnoDB   the ORDERED CONTENT LIST — one row per item,
+ *                               (course_id, kind, ref_id, sequence). Replaced
+ *                               course_videos on 2026-08-26.
+ *   lms_document       InnoDB   a PPT/PDF item (title + S3 file_key)
+ *   lms_assessment     InnoDB   an MCQ item, with lms_question / lms_question_option
+ *   lms_assessment_attempt
+ *                      InnoDB   one row per attempt, never overwritten
+ *   lms_document_ack   InnoDB   "I have read this" per (technician, CONTENT row)
+ *   course_videos      InnoDB   LEGACY. Backfilled into lms_content and no longer
+ *                               read or written anywhere. Left in place by the
+ *                               migration as a rollback surface only.
  *   easyfixer_courses  InnoDB   which technician is assigned which course (+ score)
  *   training_videos    MyISAM   the video catalogue (legacy Java table)
  *   easyfixer_watched_video
  *                      MyISAM   per-technician, per-video watched_percentage
  *
- * The InnoDB half enforces its own referential integrity — course_videos and
- * easyfixer_courses both carry real foreign keys, so a deleted course cannot
+ * The InnoDB half enforces its own referential integrity — lms_content and
+ * easyfixer_courses both carry real keys, so a deleted course cannot
  * strand content or assignments.
  *
  * The MyISAM half CANNOT. MySQL parses foreign keys on MyISAM tables and then
@@ -26,8 +37,8 @@ const logger = require('../logger');
  * such rows were already orphaned before that guard existed.
  *
  * MyISAM also cannot participate in a transaction. Nothing here wraps a
- * progress read in one; the only transactional block is setCourseVideos,
- * which touches InnoDB exclusively.
+ * progress read in one; the only transactional blocks are setCourseContent and
+ * setAssessmentQuestions, which touch InnoDB exclusively.
  */
 
 function mkErr(status, message) { const e = new Error(message); e.status = status; return e; }
@@ -51,6 +62,89 @@ function mkErr(status, message) { const e = new Error(message); e.status = statu
  * this constant, so the invariant holds in one place.
  */
 const COMPLETION_PERCENT = 100;
+
+/*
+ * ─── "IS THIS ITEM DONE?" — ONE DEFINITION, EVERY CALLER ─────────────
+ *
+ * A course is no longer a list of videos, so "complete" is no longer one
+ * comparison. Each kind proves completion its own way:
+ *
+ *   video      easyfixer_watched_video.watched_percentage = COMPLETION_PERCENT
+ *   assessment a PASSING row in lms_assessment_attempt
+ *   document   a row in lms_document_ack for THIS CONTENT row
+ *
+ * Nothing stores a second copy of any of those — the legacy Java service also
+ * writes easyfixer_watched_video, and a mirrored per-item progress table would
+ * be a second truth that drifts from it.
+ *
+ * WHY ONE SHARED EXPRESSION AND NOT A PREDICATE PER CALL SITE. Six reads judge
+ * completion — the two completion stamps, the pending list, the report, the
+ * lifecycle probe and the mobile course list — and they gate EARNING: a
+ * technician whose training reads incomplete stops receiving work, and one
+ * that reads complete when it is not advances them out of TRAINING_PENDING
+ * untrained. Two of those six disagreeing is exactly the outage class this
+ * file already carries scar tissue for, so there is one expression and every
+ * read composes it.
+ *
+ * `efr` is an SQL EXPRESSION, not a bound value — every caller already joins
+ * easyfixer_courses and passes the column `ec.easyfixer_id`, so this
+ * contributes ZERO placeholders. That is deliberate: the report and the stamps
+ * build their parameter arrays positionally, and a fragment that silently
+ * consumed a `?` would put every later parameter one slot out.
+ *
+ * COMPLETION_PERCENT is interpolated for the same reason. It is a module
+ * constant with the value 100, never user input, and inlining it keeps this
+ * fragment parameter-free.
+ *
+ * Yields 1 or 0, so it SUMs as a count and negates as a boolean.
+ */
+function itemCompleteSql(efr) {
+  return `CASE lc.kind
+            WHEN 'video' THEN COALESCE((SELECT MAX(w.watched_percentage)
+                                          FROM easyfixer_watched_video w
+                                         WHERE w.video_id = lc.ref_id
+                                           AND w.easyfixer_id = ${efr}), 0) >= ${COMPLETION_PERCENT}
+            WHEN 'assessment' THEN EXISTS (SELECT 1 FROM lms_assessment_attempt aa
+                                            WHERE aa.assessment_id = lc.ref_id
+                                              AND aa.easyfixer_id = ${efr}
+                                              AND aa.passed = 1)
+            WHEN 'document' THEN EXISTS (SELECT 1 FROM lms_document_ack da
+                                          WHERE da.content_id = lc.id
+                                            AND da.easyfixer_id = ${efr})
+            ELSE 0
+          END`;
+}
+
+/*
+ * The course, from the perspective of a row of easyfixer_courses aliased `ec`.
+ *
+ * HAS_CONTENT is what stops an EMPTY course being vacuously complete: "no item
+ * of this course is unfinished" is trivially true when it has no items, and
+ * without this guard assigning a half-built course would stamp everyone
+ * complete the moment it was assigned.
+ *
+ * Retired items (status = 0) are excluded from both. Removing an item from a
+ * course must actually stop it gating — a retired item nobody can see would
+ * otherwise hold a technician at "incomplete" with no action available to them.
+ */
+const COURSE_HAS_CONTENT = `EXISTS (
+  SELECT 1 FROM lms_content lc WHERE lc.course_id = ec.course_id AND lc.status = 1)`;
+
+const COURSE_HAS_UNFINISHED_ITEM = `EXISTS (
+  SELECT 1 FROM lms_content lc
+   WHERE lc.course_id = ec.course_id AND lc.status = 1
+     AND NOT (${itemCompleteSql('ec.easyfixer_id')}))`;
+
+// How many items a course holds / how many this technician has finished.
+// Correlated on `ec`, so both are usable anywhere easyfixer_courses is joined.
+const COURSE_ITEMS_TOTAL = `(
+  SELECT COUNT(*) FROM lms_content lc WHERE lc.course_id = ec.course_id AND lc.status = 1)`;
+
+const COURSE_ITEMS_DONE = `(
+  SELECT COALESCE(SUM(${itemCompleteSql('ec.easyfixer_id')}), 0)
+    FROM lms_content lc WHERE lc.course_id = ec.course_id AND lc.status = 1)`;
+
+const CONTENT_KINDS = Object.freeze(['video', 'document', 'assessment']);
 
 /*
  * video_count and assigned_count are SELECT-list aliases over correlated
@@ -124,10 +218,15 @@ async function listCourses({
    * would multiply out (a course with 3 videos and 4 assignees would report
    * 12 of each), and the fix — COUNT(DISTINCT …) over a fan-out — reads worse
    * and scans more than two indexed counts.
+   *
+   * `video_count` now counts CONTENT ITEMS of every kind. The alias is kept
+   * because it is the CRM's column key and its sort key (SORTABLE_COLUMNS);
+   * renaming it would break the list page for a cosmetic gain, and the page
+   * itself is now called Content.
    */
   const [rows] = await pool.query(
     `SELECT c.id, c.name, c.description, c.status, c.is_mandatory, c.created_at, c.updated_at,
-            (SELECT COUNT(*) FROM course_videos cv WHERE cv.course_id = c.id) AS video_count,
+            (SELECT COUNT(*) FROM lms_content lc WHERE lc.course_id = c.id AND lc.status = 1) AS video_count,
             (SELECT COUNT(*) FROM easyfixer_courses ec WHERE ec.course_id = c.id) AS assigned_count
        FROM courses c
       WHERE ${whereSql}
@@ -256,70 +355,209 @@ async function retireCourse(id) {
 // Course content
 // ─────────────────────────────────────────────────────────────────────
 
-async function getCourseVideos(courseId) {
-  /*
-   * video_url joins through the same legacy `document` row that listVideos
-   * uses — training_videos has no url column of its own. It is here so the
-   * course content editor can PREVIEW each video: curating a syllabus is
-   * exactly when someone needs to check that entry three is the video they
-   * think it is, and without the link they would have to leave the dialog
-   * and go find it in the catalogue.
-   */
+/*
+ * A course's ordered content, every kind, with just enough of each item's own
+ * row to render and preview it in the CRM's content editor.
+ *
+ * The three kind tables are LEFT JOINed with the kind test in the ON clause
+ * rather than queried per row: a course holds single digits of items, and one
+ * statement that returns them in order beats N+1 lookups whose interleaving
+ * the caller would then have to rebuild.
+ *
+ * video_url joins through the same legacy `document` row that listVideos uses
+ * — training_videos has no url column of its own. It is here so the editor can
+ * PREVIEW each video: curating a syllabus is exactly when someone needs to
+ * check that entry three is the video they think it is.
+ */
+async function getCourseContent(courseId) {
   const [rows] = await pool.query(
-    `SELECT cv.id, cv.video_id, cv.sequence,
-            tv.title, tv.sub_title, tv.description,
-            d.url AS video_url
-       FROM course_videos cv
-       LEFT JOIN training_videos tv ON tv.id = cv.video_id
+    `SELECT lc.id, lc.kind, lc.ref_id, lc.sequence,
+            tv.title AS video_title, tv.sub_title, tv.description,
+            d.url AS video_url,
+            doc.title AS document_title, doc.file_key, doc.mime_type, doc.page_count,
+            a.title AS assessment_title, a.pass_percent, a.max_attempts,
+            -- Guarded on kind, not just filtered on the way out: ref_id is a
+            -- VIDEO id on a video row, and an unguarded count would happily
+            -- report the questions of the assessment that happens to share it.
+            (CASE WHEN lc.kind = 'assessment' THEN
+              (SELECT COUNT(*) FROM lms_question q
+                WHERE q.assessment_id = lc.ref_id AND q.status = 1) END) AS question_count
+       FROM lms_content lc
+       LEFT JOIN training_videos tv ON lc.kind = 'video' AND tv.id = lc.ref_id
        LEFT JOIN document d ON d.id = tv.training_video_id AND d.document_type_id = 2
-      WHERE cv.course_id = ?
-      ORDER BY cv.sequence ASC, cv.id ASC`,
+       LEFT JOIN lms_document doc ON lc.kind = 'document' AND doc.id = lc.ref_id
+       LEFT JOIN lms_assessment a ON lc.kind = 'assessment' AND a.id = lc.ref_id
+      WHERE lc.course_id = ? AND lc.status = 1
+      ORDER BY lc.sequence ASC, lc.id ASC`,
     [Number(courseId)],
   );
-  // Same legacy scheme/host repair the catalogue and the app apply.
-  return rows.map((r) => ({ ...r, video_url: normalizeVideoUrl(r.video_url) || null }));
+
+  return Promise.all(rows.map(async (r) => {
+    const base = { id: r.id, kind: r.kind, ref_id: r.ref_id, sequence: r.sequence };
+    if (r.kind === 'video') {
+      return {
+        ...base,
+        title: r.video_title,
+        sub_title: r.sub_title,
+        description: r.description,
+        // Same legacy scheme/host repair the catalogue and the app apply.
+        video_url: normalizeVideoUrl(r.video_url) || null,
+      };
+    }
+    if (r.kind === 'document') {
+      return {
+        ...base,
+        title: r.document_title,
+        mime_type: r.mime_type,
+        page_count: r.page_count,
+        url: await documentUrl(r.file_key),
+      };
+    }
+    return {
+      ...base,
+      title: r.assessment_title,
+      pass_percent: r.pass_percent,
+      max_attempts: r.max_attempts,
+      question_count: Number(r.question_count) || 0,
+    };
+  }));
 }
 
 /*
- * Replace a course's content with exactly `videoIds`, in the order given.
+ * Every id in `items` must name a row that exists, per kind.
  *
- * Delete-then-insert inside a transaction rather than a diff: the content of
- * a course is small (single digits), the ordering is positional, and a diff
- * would have to reconcile sequence numbers anyway. Both tables touched here
- * are InnoDB, so the transaction is real.
- *
- * Every id is validated against training_videos FIRST, because course_videos
- * cannot foreign-key to a MyISAM table — see the header note.
+ * For videos this is not belt-and-braces: lms_content cannot foreign-key to
+ * training_videos because it is MyISAM, and MySQL parses the constraint and
+ * silently ignores it — see the header note. Documents and assessments are
+ * InnoDB and could carry a real FK, but they are checked here anyway so the
+ * operator gets one 400 naming the bad id instead of a driver error naming a
+ * constraint.
  */
-async function setCourseVideos(courseId, videoIds = []) {
-  const id = Number(courseId);
-  await getCourseById(id);
-
-  const ids = [...new Set(videoIds.map(Number).filter((n) => Number.isInteger(n) && n > 0))];
-  logger.info('Set course content · courseId=' + id + ' · videos=' + ids.length);
-
-  if (ids.length) {
+async function assertRefsExist(items) {
+  const checks = [
+    ['video', 'training_videos', 'id', null],
+    ['document', 'lms_document', 'id', 'status = 1'],
+    ['assessment', 'lms_assessment', 'id', 'status = 1'],
+  ];
+  for (const [kind, table, idCol, extra] of checks) {
+    const ids = [...new Set(items.filter((i) => i.kind === kind).map((i) => Number(i.ref_id)))];
+    if (!ids.length) continue;
     const [found] = await pool.query(
-      `SELECT id FROM training_videos WHERE id IN (${ids.map(() => '?').join(',')})`,
+      `SELECT ${idCol} AS id FROM ${table}
+        WHERE ${idCol} IN (${ids.map(() => '?').join(',')})${extra ? ` AND ${extra}` : ''}`,
       ids,
     );
-    const known = new Set(found.map((r) => r.id));
+    const known = new Set(found.map((r) => Number(r.id)));
     const missing = ids.filter((v) => !known.has(v));
     if (missing.length) {
-      throw mkErr(400, `unknown training video id(s): ${missing.join(', ')}`);
+      // Kept verbatim for videos — the CRM matches on this message today.
+      if (kind === 'video') throw mkErr(400, `unknown training video id(s): ${missing.join(', ')}`);
+      throw mkErr(400, `unknown ${kind} id(s): ${missing.join(', ')}`);
     }
   }
 
+  /*
+   * AN ASSESSMENT WITH NO QUESTIONS IS NOT CONTENT.
+   *
+   * createAssessment makes the row before the paper is written, so a
+   * question-less assessment is a normal intermediate state — but attaching
+   * one to a course is exactly the trap assignCourse already refuses for an
+   * empty course. submitAssessment 409s on a paper with no questions, so it
+   * can never be passed; itemCompleteSql needs a PASSING attempt, so the
+   * course never completes; and the overdue restriction eventually withdraws
+   * work for training the technician had no way to finish.
+   *
+   * Checked here rather than in setCourseContent so the video-only save path
+   * (setCourseVideos, which re-submits the course's existing items) is covered
+   * by the same guard.
+   */
+  const assessmentIds = [...new Set(items.filter((i) => i.kind === 'assessment').map((i) => Number(i.ref_id)))];
+  if (assessmentIds.length) {
+    const [empty] = await pool.query(
+      `SELECT a.id FROM lms_assessment a
+        WHERE a.id IN (${assessmentIds.map(() => '?').join(',')})
+          AND NOT EXISTS (SELECT 1 FROM lms_question q
+                           WHERE q.assessment_id = a.id AND q.status = 1)`,
+      assessmentIds,
+    );
+    if (empty.length) {
+      const ids = empty.map((r) => Number(r.id)).join(', ');
+      throw mkErr(400, `assessment id(s) ${ids} have no questions — add the questions before putting them in a course`);
+    }
+  }
+}
+
+/*
+ * Replace a course's content with exactly `items`, in the order given.
+ *
+ * UPSERT-THEN-RETIRE, NOT DELETE-THEN-INSERT. The old video-only version
+ * deleted every row and reinserted, which was harmless when the row held
+ * nothing but a position. It is not harmless now: lms_document_ack is keyed on
+ * the CONTENT row id, so deleting and reinserting a document item would issue
+ * it a NEW id and orphan every technician's acknowledgement — silently moving
+ * them from complete back to incomplete, on a course they had finished, with
+ * the overdue restriction waiting behind it. The unique key
+ * uq_lms_content_item (course_id, kind, ref_id) makes the upsert land on the
+ * same row, so an item that survives a re-order keeps its id and its acks.
+ *
+ * Items dropped from the list are RETIRED (status = 0) rather than deleted,
+ * for the same reason: re-adding one later restores the acknowledgements that
+ * were true when it was made, instead of asking everyone to read it again.
+ *
+ * The whole thing is one transaction. Every table touched is InnoDB.
+ */
+async function setCourseContent(courseId, items = []) {
+  const id = Number(courseId);
+  await getCourseById(id);
+
+  /*
+   * De-duplicated on (kind, ref_id): the unique key would reject the second
+   * copy mid-transaction anyway, and the honest reading of "this course
+   * contains video 4 twice" is that it contains it once.
+   */
+  const seen = new Set();
+  const list = [];
+  for (const raw of items) {
+    const kind = String(raw?.kind || '');
+    const refId = Number(raw?.ref_id);
+    if (!CONTENT_KINDS.includes(kind)) throw mkErr(400, `unknown content kind: ${kind}`);
+    if (!Number.isInteger(refId) || refId <= 0) throw mkErr(400, 'content ref_id must be a positive integer');
+    const key = `${kind}:${refId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    list.push({ kind, ref_id: refId });
+  }
+
+  logger.info('Set course content · courseId=' + id + ' · items=' + list.length
+    + ' · kinds=' + CONTENT_KINDS.map((k) => k + '=' + list.filter((i) => i.kind === k).length).join(','));
+
+  await assertRefsExist(list);
+
+  const now = new Date();
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    await conn.query('DELETE FROM course_videos WHERE course_id = ?', [id]);
-    for (const [index, videoId] of ids.entries()) {
-      await conn.query(
-        'INSERT INTO course_videos (course_id, video_id, sequence) VALUES (?, ?, ?)',
-        [id, videoId, index + 1],
+    const keptIds = [];
+    for (const [index, item] of list.entries()) {
+      const [r] = await conn.query(
+        `INSERT INTO lms_content (course_id, kind, ref_id, sequence, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 1, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           sequence = VALUES(sequence), status = 1, updated_at = VALUES(updated_at), id = LAST_INSERT_ID(id)`,
+        [id, item.kind, item.ref_id, index + 1, now, now],
       );
+      // insertId is the existing row's id on the duplicate branch, because the
+      // upsert re-states it through LAST_INSERT_ID() — without that MySQL
+      // reports 0 for an update and the retire step below would drop the row
+      // that was just kept.
+      keptIds.push(r.insertId);
     }
+    await conn.query(
+      `UPDATE lms_content SET status = 0, updated_at = ?
+        WHERE course_id = ? AND status = 1
+          ${keptIds.length ? `AND id NOT IN (${keptIds.map(() => '?').join(',')})` : ''}`,
+      [now, id, ...keptIds],
+    );
     await conn.commit();
   } catch (e) {
     await conn.rollback();
@@ -329,6 +567,47 @@ async function setCourseVideos(courseId, videoIds = []) {
   }
 
   logger.info('Course content saved · courseId=' + id);
+  return getCourseContent(id);
+}
+
+async function getCourseVideos(courseId) {
+  const items = await getCourseContent(courseId);
+  // The legacy shape the CRM's video picker still reads: `video_id`, not
+  // `ref_id`. Kept as a projection over the same rows rather than a second
+  // query, so the two endpoints can never disagree about what a course holds.
+  return items
+    .filter((i) => i.kind === 'video')
+    .map((i) => ({
+      id: i.id,
+      video_id: i.ref_id,
+      sequence: i.sequence,
+      title: i.title,
+      sub_title: i.sub_title,
+      description: i.description,
+      video_url: i.video_url,
+    }));
+}
+
+/*
+ * The video-only editor's save, expressed over the full content list.
+ *
+ * PUT /courses/:id/videos carries only videos, so it cannot express where a
+ * document or an assessment sits relative to them. Rather than inventing an
+ * answer, the submitted videos take the head positions and every other kind
+ * keeps its existing relative order behind them — nothing is dropped, which is
+ * the property that matters, and the full-content endpoint is where
+ * interleaving is actually decided.
+ */
+async function setCourseVideos(courseId, videoIds = []) {
+  const id = Number(courseId);
+  const ids = [...new Set(videoIds.map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+  const [rest] = await pool.query(
+    `SELECT kind, ref_id FROM lms_content
+      WHERE course_id = ? AND status = 1 AND kind <> 'video'
+      ORDER BY sequence ASC, id ASC`,
+    [id],
+  );
+  await setCourseContent(id, [...ids.map((v) => ({ kind: 'video', ref_id: v })), ...rest]);
   return getCourseVideos(id);
 }
 
@@ -391,7 +670,7 @@ function invalidateVideoIdCache() {
 
 async function videoCourseCount(videoId) {
   const [[row]] = await pool.query(
-    'SELECT COUNT(*) AS n FROM course_videos WHERE video_id = ?',
+    "SELECT COUNT(*) AS n FROM lms_content WHERE kind = 'video' AND ref_id = ? AND status = 1",
     [Number(videoId)],
   );
   return Number(row.n) || 0;
@@ -431,7 +710,8 @@ async function listVideos({ q, limit = 200, offset = 0 } = {}) {
     `SELECT tv.id, tv.title, tv.description, tv.sub_title, tv.sub_description,
             tv.training_video_id, d.url AS video_url,
             (SELECT COUNT(*) FROM easyfixer_watched_video w WHERE w.video_id = tv.id) AS progress_count,
-            (SELECT COUNT(*) FROM course_videos cv WHERE cv.video_id = tv.id) AS course_count
+            (SELECT COUNT(*) FROM lms_content lc
+              WHERE lc.kind = 'video' AND lc.ref_id = tv.id AND lc.status = 1) AS course_count
        FROM training_videos tv
        LEFT JOIN document d ON d.id = tv.training_video_id AND d.document_type_id = 2
       WHERE ${whereSql}
@@ -519,21 +799,24 @@ async function assignCourse(courseId, easyfixerIds = [], options = {}) {
   await getCourseById(id);
 
   /*
-   * A course with no videos cannot be assigned.
+   * A course with no content cannot be assigned.
    *
    * Assigning one is not a harmless no-op — it is actively harmful. The
-   * technician sees the course listed, has nothing to watch, and their
-   * completion is pinned at 0% forever; the LMS lifecycle wire then never
-   * advances them out of TRAINING_PENDING, and with a due date attached they
-   * would eventually be restricted to training-only for a course that cannot
-   * be finished. Refusing here is the only point where that is cheap to stop.
+   * technician sees the course listed, has nothing to do, and their completion
+   * is pinned at 0% forever; the LMS lifecycle wire then never advances them
+   * out of TRAINING_PENDING, and with a due date attached they would
+   * eventually be restricted to training-only for a course that cannot be
+   * finished. Refusing here is the only point where that is cheap to stop.
+   *
+   * Counts ITEMS, not videos: a course made of a PPT and an assessment is
+   * perfectly assignable, and the old video-only count would have refused it.
    */
-  const [[{ n: videoCount }]] = await pool.query(
-    'SELECT COUNT(*) AS n FROM course_videos WHERE course_id = ?',
+  const [[{ n: itemCount }]] = await pool.query(
+    'SELECT COUNT(*) AS n FROM lms_content WHERE course_id = ? AND status = 1',
     [id],
   );
-  if (Number(videoCount) === 0) {
-    throw mkErr(409, 'this course has no videos — add content before assigning it');
+  if (Number(itemCount) === 0) {
+    throw mkErr(409, 'this course has no content — add content before assigning it');
   }
 
   const ids = [...new Set(easyfixerIds.map(Number).filter((n) => Number.isInteger(n) && n > 0))];
@@ -618,10 +901,11 @@ async function assignCourse(courseId, easyfixerIds = [], options = {}) {
  * safe to call on every completing progress ping.
  *
  * "Finished" is the same rule the report uses: the course HAS content, and no
- * video in it sits below COMPLETION_PERCENT. The `EXISTS` clause is what keeps
- * an empty course from being stamped complete the moment it is assigned —
- * vacuously true otherwise, since a course with no videos has no video below
- * the threshold.
+ * item of it is unfinished — judged per kind by itemCompleteSql, so a course
+ * whose last item is an assessment stamps on the passing attempt, not on the
+ * last video. The `EXISTS` clause is what keeps an empty course from being
+ * stamped complete the moment it is assigned — vacuously true otherwise, since
+ * a course with no items has no unfinished item.
  */
 async function stampCourseCompletions(efrId) {
   const [r] = await pool.query(
@@ -629,16 +913,9 @@ async function stampCourseCompletions(efrId) {
         SET ec.completion_date = ?, ec.updated_at = ?
       WHERE ec.easyfixer_id = ?
         AND ec.completion_date IS NULL
-        AND EXISTS (SELECT 1 FROM course_videos cv WHERE cv.course_id = ec.course_id)
-        AND NOT EXISTS (
-              SELECT 1
-                FROM course_videos cv
-                LEFT JOIN easyfixer_watched_video w
-                       ON w.video_id = cv.video_id AND w.easyfixer_id = ec.easyfixer_id
-               WHERE cv.course_id = ec.course_id
-                 AND COALESCE(w.watched_percentage, 0) < ?
-            )`,
-    [new Date(), new Date(), Number(efrId), COMPLETION_PERCENT],
+        AND ${COURSE_HAS_CONTENT}
+        AND NOT ${COURSE_HAS_UNFINISHED_ITEM}`,
+    [new Date(), new Date(), Number(efrId)],
   );
   if (r.affectedRows > 0) {
     logger.info('Training completion stamped · efrId=' + efrId + ' · courses=' + r.affectedRows);
@@ -694,16 +971,9 @@ async function stampCompletionsForCourse(courseId, easyfixerIds = []) {
       WHERE ec.course_id = ?
         ${all ? '' : `AND ec.easyfixer_id IN (${ids.map(() => '?').join(',')})`}
         AND ec.completion_date IS NULL
-        AND EXISTS (SELECT 1 FROM course_videos cv WHERE cv.course_id = ec.course_id)
-        AND NOT EXISTS (
-              SELECT 1
-                FROM course_videos cv
-                LEFT JOIN easyfixer_watched_video w
-                       ON w.video_id = cv.video_id AND w.easyfixer_id = ec.easyfixer_id
-               WHERE cv.course_id = ec.course_id
-                 AND COALESCE(w.watched_percentage, 0) < ?
-            )`,
-    [now, now, Number(courseId), ...ids, COMPLETION_PERCENT],
+        AND ${COURSE_HAS_CONTENT}
+        AND NOT ${COURSE_HAS_UNFINISHED_ITEM}`,
+    [now, now, Number(courseId), ...ids],
   );
   if (r.affectedRows > 0) {
     logger.info('Assignment-time completion stamped · courseId=' + courseId
@@ -722,25 +992,26 @@ async function stampCompletionsForCourse(courseId, easyfixerIds = []) {
  */
 async function pendingTraining(efrId) {
   const today = istToday();
+  /*
+   * videos_total / videos_done are now ITEM counts of every kind. The aliases
+   * are kept because the technician app reads them by name and an installed
+   * binary cannot be renamed alongside the server — the numbers still mean
+   * "how much of this course is left", which is all the banner renders.
+   */
   const [rows] = await pool.query(
     `SELECT ec.course_id, c.name AS course_name, ec.due_date,
-            (SELECT COUNT(*) FROM course_videos cv WHERE cv.course_id = ec.course_id) AS videos_total,
-            (SELECT COUNT(*)
-               FROM course_videos cv
-               JOIN easyfixer_watched_video w
-                 ON w.video_id = cv.video_id AND w.easyfixer_id = ec.easyfixer_id
-              WHERE cv.course_id = ec.course_id
-                AND COALESCE(w.watched_percentage, 0) >= ?) AS videos_done
+            ${COURSE_ITEMS_TOTAL} AS videos_total,
+            ${COURSE_ITEMS_DONE} AS videos_done
        FROM easyfixer_courses ec
        JOIN courses c ON c.id = ec.course_id
       WHERE ec.easyfixer_id = ?
         AND ec.completion_date IS NULL
       ORDER BY (ec.due_date IS NULL), ec.due_date ASC`,
-    [COMPLETION_PERCENT, Number(efrId)],
+    [Number(efrId)],
   );
 
   const courses = rows
-    // A course with no content cannot be owed — nothing to watch.
+    // A course with no content cannot be owed — nothing to do.
     .filter((r) => Number(r.videos_total) > 0)
     .map((r) => ({
       course_id: r.course_id,
@@ -961,13 +1232,13 @@ async function trainingReport({
   const dir = String(sortDir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
 
   /*
-   * `params` leads with COMPLETION_PERCENT because the derived table's SELECT
-   * binds it (the videos_done subquery) BEFORE the WHERE binds anything.
-   * Scope goes in first among the WHERE params so the placeholder order
-   * matches the clause order in `where`.
+   * `params` no longer leads with COMPLETION_PERCENT: the completion rule is
+   * a parameter-free SQL fragment (see itemCompleteSql), so the WHERE clause's
+   * placeholders are the only ones and their order is simply clause order.
+   * Scope goes in first so it matches the order of `where`.
    */
   const where = ['1=1'];
-  const params = [COMPLETION_PERCENT];
+  const params = [];
   applyCityScope(where, params, scope);
   if (courseId) { where.push('ec.course_id = ?'); params.push(Number(courseId)); }
   if (easyfixerId) { where.push('ec.easyfixer_id = ?'); params.push(Number(easyfixerId)); }
@@ -990,13 +1261,8 @@ async function trainingReport({
            ec.due_date, ec.completion_date,
            e.efr_name AS technician_name, e.efr_no AS technician_mobile,
            c.name AS course_name,
-           (SELECT COUNT(*) FROM course_videos cv WHERE cv.course_id = ec.course_id) AS videos_total,
-           (SELECT COUNT(*)
-              FROM course_videos cv
-              JOIN easyfixer_watched_video w
-                ON w.video_id = cv.video_id AND w.easyfixer_id = ec.easyfixer_id
-             WHERE cv.course_id = ec.course_id
-               AND COALESCE(w.watched_percentage, 0) >= ?) AS videos_done`;
+           ${COURSE_ITEMS_TOTAL} AS videos_total,
+           ${COURSE_ITEMS_DONE} AS videos_done`;
 
   /*
    * The complete/incomplete filter is applied in SQL against the derived
@@ -1067,24 +1333,73 @@ async function trainingReport({
  *     has not "finished training"; they have not started it. Returning true
  *     here would advance every newly registered technician the instant they
  *     watched nothing at all.
- *   - a course with no videos      → NOT complete, for the same reason.
- *   - otherwise                    → every video of every assigned course
- *     must be at COMPLETION_PERCENT.
+ *   - a course with no content     → NOT complete, for the same reason.
+ *   - otherwise                    → every ITEM of every assigned course must
+ *     be complete, judged per kind: videos at COMPLETION_PERCENT, assessments
+ *     passed, documents acknowledged. A course whose final item is an
+ *     assessment is not finished by watching its videos.
+ *
+ * `required` and `done` count ITEMS, not videos, and the JOIN is the inner one
+ * it always was — a course with no active content contributes no rows, so it
+ * cannot make `required` non-zero and cannot be vacuously satisfied either.
  */
 async function isTrainingComplete(efrId) {
   const [[row]] = await pool.query(
     `SELECT COUNT(*) AS required,
-            SUM(CASE WHEN COALESCE(w.watched_percentage, 0) >= ? THEN 1 ELSE 0 END) AS done
+            SUM(${itemCompleteSql('ec.easyfixer_id')}) AS done
        FROM easyfixer_courses ec
-       JOIN course_videos cv ON cv.course_id = ec.course_id
-       LEFT JOIN easyfixer_watched_video w
-              ON w.video_id = cv.video_id AND w.easyfixer_id = ec.easyfixer_id
+       JOIN lms_content lc ON lc.course_id = ec.course_id AND lc.status = 1
       WHERE ec.easyfixer_id = ?`,
-    [COMPLETION_PERCENT, Number(efrId)],
+    [Number(efrId)],
   );
   const required = Number(row.required) || 0;
   const done = Number(row.done) || 0;
   return { complete: required > 0 && done >= required, required, done };
+}
+
+/*
+ * ─── FINISHING AN ITEM: THE THREE STEPS, IN ONE PLACE ────────────────
+ *
+ * Every way a technician can finish a piece of content ends here — the 100%
+ * video ping, a passing assessment attempt, and a document acknowledgement.
+ * All three must do the SAME three things, in this order:
+ *
+ *   1. stamp per-COURSE completion   (finer grained; the report and the
+ *                                     overdue restriction read completion_date)
+ *   2. ask whether ALL training is now complete
+ *   3. if it is, advance the lifecycle out of TRAINING_PENDING
+ *
+ * WHY THIS IS A FUNCTION AND NOT THREE CALLS AT THREE CALL SITES. It already
+ * was three call sites, and one of them (ackDocument) only did step 1 — so a
+ * technician whose LAST outstanding item was a PPT had his course stamped
+ * complete and then sat in TRAINING_PENDING forever, because nothing asked
+ * step 2. The kind of content someone happens to finish last must not decide
+ * whether they are advanced.
+ *
+ * Idempotent throughout: the stamp only touches rows still NULL, and
+ * finalizeTrainingCompletion resolves any non-TRAINING_PENDING status to
+ * itself, which the lifecycle service turns into a protected no-op.
+ *
+ * THROWS. Callers decide how loud a failure is — each of the three is a
+ * best-effort tail on work that is already committed, so all three swallow it
+ * into a warning rather than turning a saved pass into a 500 the app retries.
+ */
+async function settleTrainingCompletion(efrId) {
+  const efr = Number(efrId);
+  await stampCourseCompletions(efr);
+  const { complete, required, done } = await isTrainingComplete(efr);
+  if (!complete) {
+    logger.info('Training not yet complete · efrId=' + efr + ' · ' + done + '/' + required);
+    return { complete: false, required, done, changed: false };
+  }
+  // Lazily required: easyfixer-lifecycle.service requires THIS module at its
+  // top level, so a top-level require here would be a cycle.
+  const result = await require('./easyfixer-lifecycle.service').finalizeTrainingCompletion(efr);
+  if (result.changed) {
+    logger.info('Training complete → lifecycle advanced · efrId=' + efr
+      + ' · from=' + result.transitionedFrom);
+  }
+  return { complete: true, required, done, changed: !!result.changed };
 }
 
 /*
@@ -1222,7 +1537,7 @@ async function setVideoLink(videoId, rawUrl, actorUserId = null) {
  * WHICH VIDEOS A TECHNICIAN MUST WATCH, AND WHICH THEY MAY SEE.
  *
  * `training_videos` holds two different things: the pre-LMS registration
- * catalogue (is_global = 1) and LMS course content owned by `course_videos`.
+ * catalogue (is_global = 1) and LMS course content owned by `lms_content`.
  * Nothing distinguished them until 2026-08-26, which is why adding one
  * YouTube video locked earning platform-wide and why the mobile list served
  * one technician's assigned course to everyone.
@@ -1328,22 +1643,30 @@ async function assignCourseToAll(courseId, { dueDate = null } = {}) {
 const MANDATORY_VIDEO_IDS_SQL = `
   SELECT tv.id FROM training_videos tv WHERE tv.is_global = 1
    UNION
-  SELECT cv.video_id FROM course_videos cv
-    JOIN courses c ON c.id = cv.course_id
+  SELECT lc.ref_id FROM lms_content lc
+    JOIN courses c ON c.id = lc.course_id
     JOIN easyfixer_courses ec ON ec.course_id = c.id
-   WHERE c.is_mandatory = 1 AND c.status = 1 AND ec.easyfixer_id = ?`;
+   WHERE lc.kind = 'video' AND lc.status = 1
+     AND c.is_mandatory = 1 AND c.status = 1 AND ec.easyfixer_id = ?`;
 
 /*
  * What the technician may SEE: everything they must complete, plus the videos
  * of any course assigned to them (mandatory or not). Takes two `?` — the same
  * efr_id twice.
+ *
+ * BOTH halves stay VIDEO-ONLY (`kind = 'video'`). These feed
+ * /api/mobile/training-videos, which returns rows of training_videos — a
+ * document or an assessment has no row there and no id in that space, so
+ * widening the filter would emit ids that resolve to the wrong video or to
+ * nothing. The other kinds reach the app through /api/mobile/lms/courses,
+ * which is content-aware.
  */
 const VISIBLE_VIDEO_IDS_SQL = `
   ${MANDATORY_VIDEO_IDS_SQL}
    UNION
-  SELECT cv2.video_id FROM course_videos cv2
-    JOIN easyfixer_courses ec2 ON ec2.course_id = cv2.course_id
-   WHERE ec2.easyfixer_id = ?`;
+  SELECT lc2.ref_id FROM lms_content lc2
+    JOIN easyfixer_courses ec2 ON ec2.course_id = lc2.course_id
+   WHERE lc2.kind = 'video' AND lc2.status = 1 AND ec2.easyfixer_id = ?`;
 
 /*
  * Give a technician every mandatory course they do not already hold.
@@ -1373,6 +1696,787 @@ async function assignMandatoryCourses(efrId) {
   return { assigned: res.affectedRows };
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Documents (PPT / PDF)
+// ─────────────────────────────────────────────────────────────────────
+
+/*
+ * A stored file_key resolved to something a browser or the app can open.
+ *
+ * The DB holds an S3 OBJECT KEY, never a URL — a stored URL either expires or
+ * has to be public, and both are wrong for training material. So every read
+ * mints a fresh presigned GET.
+ *
+ * Fails SOFT to null. This runs inside a list payload (the course editor, and
+ * the technician's whole course list): one unreachable object must degrade to
+ * one item without a link, not 500 the screen and hide the other nine.
+ *
+ * ONE HOUR, not the shared 5-minute default. Every caller here mints these
+ * into a SCREEN payload, not into an <img> that renders immediately —
+ * coursesForTech is the technician app's whole LMS screen in one call, and a
+ * technician who scrolls to the third course and opens the PPT six minutes
+ * later would otherwise get a dead link with no way to tell why. An hour is
+ * the same TTL notice images already use (NOTICE_PRESIGN_TTL_SEC) and is
+ * bounded by how long anyone keeps that screen open.
+ */
+const DOCUMENT_PRESIGN_TTL_SEC = Number(process.env.S3_LMS_PRESIGN_TTL_SEC) || 3600;
+
+async function documentUrl(fileKey) {
+  const key = String(fileKey || '').trim();
+  if (!key) return null;
+  // Local-dev rows written before S3 was configured hold a relative URL.
+  if (key.startsWith('/') || /^https?:\/\//i.test(key)) return key;
+  if (!s3.isEnabled()) return null;
+  try {
+    return await s3.getPresignedUrl(key, DOCUMENT_PRESIGN_TTL_SEC);
+  } catch (e) {
+    logger.warn('LMS document presign failed · key=' + key + ' · ' + e.message);
+    return null;
+  }
+}
+
+async function listDocuments({ q, limit = 200, offset = 0 } = {}) {
+  limit = Math.min(Math.max(Number(limit) || 200, 1), 1000);
+  offset = Math.max(Number(offset) || 0, 0);
+
+  const where = ['d.status = 1'];
+  const params = [];
+  if (q && String(q).trim()) {
+    where.push('d.title LIKE ?');
+    params.push(`%${String(q).trim()}%`);
+  }
+  const whereSql = where.join(' AND ');
+
+  const [rows] = await pool.query(
+    `SELECT d.id, d.title, d.file_key, d.mime_type, d.size_bytes, d.page_count,
+            d.created_at, d.created_by,
+            (SELECT COUNT(*) FROM lms_content lc
+              WHERE lc.kind = 'document' AND lc.ref_id = d.id AND lc.status = 1) AS course_count
+       FROM lms_document d
+      WHERE ${whereSql}
+      ORDER BY d.id DESC
+      LIMIT ? OFFSET ?`,
+    [...params, limit, offset],
+  );
+  const [[{ total }]] = await pool.query(
+    `SELECT COUNT(*) AS total FROM lms_document d WHERE ${whereSql}`,
+    params,
+  );
+
+  logger.info('Found ' + rows.length + ' LMS documents of ' + total);
+  /*
+   * NAMED PROJECTION, and file_key is not in it. The S3 object key never
+   * leaves the server — the client gets a presigned URL, which is the whole
+   * reason the column stores a key rather than a URL. A `...r` spread here
+   * would ship the key to every admin-group caller and quietly contradict the
+   * invariant coursesForTech states next door.
+   */
+  const withUrls = await Promise.all(rows.map(async (r) => ({
+    id: r.id,
+    title: r.title,
+    mime_type: r.mime_type,
+    size_bytes: r.size_bytes,
+    page_count: r.page_count,
+    created_at: r.created_at,
+    created_by: r.created_by,
+    course_count: r.course_count,
+    url: await documentUrl(r.file_key),
+  })));
+  return { rows: withUrls, total, limit, offset };
+}
+
+async function createDocument({ title, fileKey, mimeType, sizeBytes = null, pageCount = null, createdBy = null }) {
+  // created_at is written explicitly for the same reason createCourse does it:
+  // the column carries no DEFAULT, so an omitted value stores NULL and the
+  // list renders a blank "Added" column.
+  const [ins] = await pool.query(
+    `INSERT INTO lms_document (title, file_key, mime_type, size_bytes, page_count, status, created_at, created_by)
+     VALUES (?, ?, ?, ?, ?, 1, ?, ?)`,
+    [String(title).trim(), String(fileKey), String(mimeType), sizeBytes, pageCount, new Date(), createdBy],
+  );
+  logger.info('LMS document created · id=' + ins.insertId + ' · mime=' + mimeType);
+  return { id: ins.insertId };
+}
+
+async function updateDocument(id, { title }) {
+  const docId = Number(id);
+  const [r] = await pool.query(
+    'UPDATE lms_document SET title = ? WHERE id = ? AND status = 1',
+    [String(title).trim(), docId],
+  );
+  if (r.affectedRows === 0) throw mkErr(404, 'document not found');
+  logger.info('LMS document renamed · id=' + docId);
+  return { ok: true };
+}
+
+/*
+ * Retire, and REFUSE while a course still holds it.
+ *
+ * Not a soft warning: lms_document_ack rows point at the content row, and a
+ * technician's completion is derived from them. Retiring a document out from
+ * under a live course would make that course permanently unfinishable for
+ * anyone who had not yet acknowledged it, which ends in the overdue
+ * restriction. Empty the course of it first — that is a deliberate act with a
+ * visible consequence, which is the point.
+ */
+async function retireDocument(id) {
+  const docId = Number(id);
+  const [[{ n }]] = await pool.query(
+    "SELECT COUNT(*) AS n FROM lms_content WHERE kind = 'document' AND ref_id = ? AND status = 1",
+    [docId],
+  );
+  if (Number(n) > 0) throw mkErr(409, `this document is used by ${n} course${n === 1 ? '' : 's'} — remove it from them first`);
+  const [r] = await pool.query('UPDATE lms_document SET status = 0 WHERE id = ? AND status = 1', [docId]);
+  if (r.affectedRows === 0) throw mkErr(404, 'document not found');
+  logger.info('LMS document retired · id=' + docId);
+  return { retired: true };
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Assessments
+// ─────────────────────────────────────────────────────────────────────
+
+async function listAssessments({ q, limit = 200, offset = 0 } = {}) {
+  limit = Math.min(Math.max(Number(limit) || 200, 1), 1000);
+  offset = Math.max(Number(offset) || 0, 0);
+
+  const where = ['a.status = 1'];
+  const params = [];
+  if (q && String(q).trim()) {
+    where.push('(a.title LIKE ? OR a.description LIKE ?)');
+    const like = `%${String(q).trim()}%`;
+    params.push(like, like);
+  }
+  const whereSql = where.join(' AND ');
+
+  const [rows] = await pool.query(
+    `SELECT a.id, a.title, a.description, a.pass_percent, a.max_attempts, a.status,
+            a.created_at, a.updated_at,
+            (SELECT COUNT(*) FROM lms_question q
+              WHERE q.assessment_id = a.id AND q.status = 1) AS question_count,
+            (SELECT COUNT(*) FROM lms_content lc
+              WHERE lc.kind = 'assessment' AND lc.ref_id = a.id AND lc.status = 1) AS course_count
+       FROM lms_assessment a
+      WHERE ${whereSql}
+      ORDER BY a.id DESC
+      LIMIT ? OFFSET ?`,
+    [...params, limit, offset],
+  );
+  const [[{ total }]] = await pool.query(
+    `SELECT COUNT(*) AS total FROM lms_assessment a WHERE ${whereSql}`,
+    params,
+  );
+
+  logger.info('Found ' + rows.length + ' assessments of ' + total);
+  return { rows, total, limit, offset };
+}
+
+/*
+ * The FULL assessment, is_correct INCLUDED. Admin only.
+ *
+ * This is the answer key. It is reachable exclusively through
+ * /api/admin/lms/assessments/:id, which is behind requireAuth + the admin role
+ * + isLmsManage. The technician-facing read is a SEPARATE function
+ * (getAssessmentForTech) with its own projection — never this one with the
+ * answers stripped afterwards, because a stripping step is one forgotten
+ * `...spread` away from leaking the whole key.
+ */
+async function getAssessmentForAdmin(id) {
+  const aid = Number(id);
+  const [[assessment]] = await pool.query(
+    `SELECT id, title, description, pass_percent, max_attempts, status, created_at, updated_at
+       FROM lms_assessment WHERE id = ?`,
+    [aid],
+  );
+  if (!assessment) throw mkErr(404, 'assessment not found');
+
+  const [rows] = await pool.query(
+    `SELECT q.id AS question_id, q.question_text, q.sequence AS question_sequence,
+            o.id AS option_id, o.option_text, o.is_correct, o.sequence AS option_sequence
+       FROM lms_question q
+       LEFT JOIN lms_question_option o ON o.question_id = q.id
+      WHERE q.assessment_id = ? AND q.status = 1
+      ORDER BY q.sequence ASC, q.id ASC, o.sequence ASC, o.id ASC`,
+    [aid],
+  );
+
+  const byQuestion = new Map();
+  for (const r of rows) {
+    if (!byQuestion.has(r.question_id)) {
+      byQuestion.set(r.question_id, {
+        id: r.question_id,
+        question_text: r.question_text,
+        sequence: r.question_sequence,
+        options: [],
+      });
+    }
+    if (r.option_id) {
+      byQuestion.get(r.question_id).options.push({
+        id: r.option_id,
+        option_text: r.option_text,
+        is_correct: Number(r.is_correct) === 1,
+        sequence: r.option_sequence,
+      });
+    }
+  }
+  return { ...assessment, questions: [...byQuestion.values()] };
+}
+
+async function createAssessment({ title, description = null, pass_percent, max_attempts }) {
+  const now = new Date();
+  /*
+   * pass_percent and max_attempts fall through to the COLUMN DEFAULTS (70 / 3)
+   * when the operator does not state them, rather than being defaulted here.
+   * One place holds the number, and it is the one the migration documents.
+   */
+  const cols = ['title', 'description', 'status', 'created_at', 'updated_at'];
+  const vals = [String(title).trim(), description || null, 1, now, now];
+  if (pass_percent !== undefined) { cols.push('pass_percent'); vals.push(Number(pass_percent)); }
+  if (max_attempts !== undefined) { cols.push('max_attempts'); vals.push(Number(max_attempts)); }
+
+  const [ins] = await pool.query(
+    `INSERT INTO lms_assessment (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`,
+    vals,
+  );
+  logger.info('Assessment created · id=' + ins.insertId + ' · title=' + title);
+  return { id: ins.insertId };
+}
+
+async function updateAssessment(id, patch = {}) {
+  const aid = Number(id);
+
+  /*
+   * STATUS NEVER WRITES STRAIGHT THROUGH.
+   *
+   * retireAssessment is where the in-use 409 lives. A PATCH that set
+   * status = 0 on an assessment a live course holds would skip it entirely:
+   * getAssessmentForTech filters on status = 1, so the paper 404s for every
+   * technician on that course, no passing attempt can ever be recorded, and
+   * the course becomes permanently unfinishable — the exact outcome the
+   * DELETE endpoint refuses to cause. Same guard, whichever verb asks.
+   *
+   * Reinstating (status = 1) needs no guard — it can only ever unblock.
+   */
+  if (patch.status !== undefined) {
+    if (patch.status) {
+      const [r] = await pool.query(
+        'UPDATE lms_assessment SET status = 1, updated_at = ? WHERE id = ?',
+        [new Date(), aid],
+      );
+      if (r.affectedRows === 0) throw mkErr(404, 'assessment not found');
+      logger.info('Assessment reinstated · id=' + aid);
+    } else {
+      await retireAssessment(aid);
+    }
+  }
+
+  const sets = [];
+  const params = [];
+  // Plain placeholders, never COALESCE(?, col): COALESCE guards NULL only, so
+  // an empty description would read as a no-op while actually blanking it.
+  if (patch.title !== undefined) { sets.push('title = ?'); params.push(String(patch.title).trim()); }
+  if (patch.description !== undefined) { sets.push('description = ?'); params.push(patch.description || null); }
+  if (patch.pass_percent !== undefined) { sets.push('pass_percent = ?'); params.push(Number(patch.pass_percent)); }
+  if (patch.max_attempts !== undefined) { sets.push('max_attempts = ?'); params.push(Number(patch.max_attempts)); }
+  // No `status` here — see above.
+  if (!sets.length) {
+    if (patch.status !== undefined) return getAssessmentForAdmin(aid);
+    throw mkErr(400, 'nothing to update');
+  }
+
+  sets.push('updated_at = ?');
+  params.push(new Date());
+
+  const [r] = await pool.query(`UPDATE lms_assessment SET ${sets.join(', ')} WHERE id = ?`, [...params, aid]);
+  if (r.affectedRows === 0) throw mkErr(404, 'assessment not found');
+  logger.info('Assessment updated · id=' + aid + ' · fields=' + sets.length);
+  return getAssessmentForAdmin(aid);
+}
+
+/* Same refusal as retireDocument, and for the same reason — see there. */
+async function retireAssessment(id) {
+  const aid = Number(id);
+  const [[{ n }]] = await pool.query(
+    "SELECT COUNT(*) AS n FROM lms_content WHERE kind = 'assessment' AND ref_id = ? AND status = 1",
+    [aid],
+  );
+  if (Number(n) > 0) throw mkErr(409, `this assessment is used by ${n} course${n === 1 ? '' : 's'} — remove it from them first`);
+  const [r] = await pool.query('UPDATE lms_assessment SET status = 0, updated_at = ? WHERE id = ? AND status = 1', [new Date(), aid]);
+  if (r.affectedRows === 0) throw mkErr(404, 'assessment not found');
+  logger.info('Assessment retired · id=' + aid);
+  return { retired: true };
+}
+
+/*
+ * THE WAY OUT OF AN EXHAUSTED ASSESSMENT. Admin only.
+ *
+ * Without this, running out of attempts is terminal in the worst possible
+ * direction: submitAssessment 409s forever, itemCompleteSql needs a PASSING
+ * attempt so the course never stamps complete, and hasOverdueTraining then
+ * restricts the technician out of receiving work — with no action available
+ * to him OR to ops. Extending the deadline does not help; the paper is what
+ * is blocked, not the clock.
+ *
+ * The alternative shape — letting exhaustion silently complete the course —
+ * was rejected outright: it would mark someone trained for failing, which is
+ * precisely what the pass mark exists to prevent. A human decides instead.
+ *
+ * DELETES the attempt rows rather than flagging them. attempt_no is allocated
+ * from a fresh read against uq_lms_attempt, so leaving dead rows behind would
+ * keep the ceiling reached; and the honest reading of "reset his attempts" is
+ * that he has his attempts back.
+ *
+ * easyfixer_courses.score is deliberately LEFT ALONE. It holds the best score
+ * ever achieved, and a reset is a second chance, not an erasure of what
+ * happened.
+ */
+async function resetAssessmentAttempts(assessmentId, easyfixerId) {
+  const aid = Number(assessmentId);
+  const efr = Number(easyfixerId);
+  const [r] = await pool.query(
+    'DELETE FROM lms_assessment_attempt WHERE assessment_id = ? AND easyfixer_id = ?',
+    [aid, efr],
+  );
+  logger.info('Assessment attempts reset · assessmentId=' + aid + ' · efrId=' + efr
+    + ' · cleared=' + r.affectedRows);
+  return { cleared: r.affectedRows };
+}
+
+/*
+ * Replace an assessment's questions with exactly what arrives.
+ *
+ * DELETE-then-INSERT here, unlike course content: nothing references a
+ * question or an option id after the fact. lms_assessment_attempt records the
+ * SCORE, not the answers, precisely so that re-writing a paper cannot corrupt
+ * the history of who passed it. Both tables are InnoDB, so the transaction is
+ * real.
+ *
+ * The shape rules (at least one question, at least two options, exactly one
+ * correct) are enforced by Joi at the route — the single trust boundary — and
+ * not re-checked here.
+ */
+async function setAssessmentQuestions(assessmentId, questions = []) {
+  const aid = Number(assessmentId);
+  await getAssessmentForAdmin(aid);
+
+  logger.info('Set assessment questions · assessmentId=' + aid + ' · questions=' + questions.length);
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    // Options first — there is no ON DELETE CASCADE here, so dropping the
+    // questions first would strand every option row.
+    await conn.query(
+      'DELETE o FROM lms_question_option o JOIN lms_question q ON q.id = o.question_id WHERE q.assessment_id = ?',
+      [aid],
+    );
+    await conn.query('DELETE FROM lms_question WHERE assessment_id = ?', [aid]);
+
+    for (const [qi, q] of questions.entries()) {
+      const [qIns] = await conn.query(
+        'INSERT INTO lms_question (assessment_id, question_text, sequence, status) VALUES (?, ?, ?, 1)',
+        [aid, String(q.question_text), Number(q.sequence) || qi + 1],
+      );
+      for (const [oi, o] of (q.options || []).entries()) {
+        await conn.query(
+          'INSERT INTO lms_question_option (question_id, option_text, is_correct, sequence) VALUES (?, ?, ?, ?)',
+          [qIns.insertId, String(o.option_text), o.is_correct ? 1 : 0, Number(o.sequence) || oi + 1],
+        );
+      }
+    }
+    await conn.query('UPDATE lms_assessment SET updated_at = ? WHERE id = ?', [new Date(), aid]);
+    await conn.commit();
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
+
+  logger.info('Assessment questions saved · assessmentId=' + aid);
+  return getAssessmentForAdmin(aid);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Taking an assessment (technician)
+// ─────────────────────────────────────────────────────────────────────
+
+/*
+ * The paper as the technician sees it.
+ *
+ * *** is_correct IS NEVER SELECTED. ***
+ *
+ * Not "selected and then removed" — not selected at all. The projection below
+ * names every column that leaves this function, so the answer key cannot ride
+ * out inside an object spread, a `...row`, a debug log line or a future field
+ * added to the query by someone reading the admin version next door. A client
+ * that receives the answers can score itself, and the whole point of scoring
+ * server-side is that it cannot.
+ */
+/*
+ * WHICH OF THIS TECHNICIAN'S ASSIGNED COURSES CONTAIN THIS ITEM.
+ *
+ * Empty means he has no business with it: either nothing assigned to him holds
+ * it, or the item was removed from the course that did. Every technician-facing
+ * read and write below starts here — an id in a URL is a request, not an
+ * entitlement, and without this any signed-in technician could pull down and
+ * sit any assessment in the catalogue and have the pass counted.
+ *
+ * Returns course ids rather than a boolean because submitAssessment needs to
+ * know WHICH course an attempt belongs to, and the same assessment can sit in
+ * two.
+ */
+async function assignedCourseIdsFor(efrId, kind, refId) {
+  const [rows] = await pool.query(
+    `SELECT DISTINCT lc.course_id
+       FROM lms_content lc
+       JOIN easyfixer_courses ec ON ec.course_id = lc.course_id AND ec.easyfixer_id = ?
+      WHERE lc.kind = ? AND lc.ref_id = ? AND lc.status = 1`,
+    [Number(efrId), String(kind), Number(refId)],
+  );
+  return rows.map((r) => Number(r.course_id));
+}
+
+async function getAssessmentForTech(efrId, assessmentId) {
+  const aid = Number(assessmentId);
+  // 404 rather than 403: whether an assessment he was never assigned exists is
+  // not a technician's question to have answered.
+  if (!(await assignedCourseIdsFor(efrId, 'assessment', aid)).length) {
+    throw mkErr(404, 'assessment not found');
+  }
+  const [[assessment]] = await pool.query(
+    'SELECT id, title, description, pass_percent, max_attempts FROM lms_assessment WHERE id = ? AND status = 1',
+    [aid],
+  );
+  if (!assessment) throw mkErr(404, 'assessment not found');
+
+  const [rows] = await pool.query(
+    `SELECT q.id AS question_id, q.question_text, o.id AS option_id, o.option_text
+       FROM lms_question q
+       JOIN lms_question_option o ON o.question_id = q.id
+      WHERE q.assessment_id = ? AND q.status = 1
+      ORDER BY q.sequence ASC, q.id ASC, o.sequence ASC, o.id ASC`,
+    [aid],
+  );
+
+  const byQuestion = new Map();
+  for (const r of rows) {
+    if (!byQuestion.has(r.question_id)) {
+      byQuestion.set(r.question_id, { id: r.question_id, question_text: r.question_text, options: [] });
+    }
+    byQuestion.get(r.question_id).options.push({ id: r.option_id, option_text: r.option_text });
+  }
+
+  const [[used]] = await pool.query(
+    'SELECT COUNT(*) AS n FROM lms_assessment_attempt WHERE easyfixer_id = ? AND assessment_id = ?',
+    [Number(efrId), aid],
+  );
+
+  return {
+    id: assessment.id,
+    title: assessment.title,
+    description: assessment.description,
+    passPercent: Number(assessment.pass_percent),
+    maxAttempts: Number(assessment.max_attempts),
+    attemptsUsed: Number(used?.n) || 0,
+    questions: [...byQuestion.values()],
+  };
+}
+
+/*
+ * Score an attempt, record it, and return the outcome.
+ *
+ * SCORING HAPPENS HERE AND NOWHERE ELSE. The request carries the technician's
+ * ANSWERS, never a score — a client-sent score would make the whole assessment
+ * a formality, and this endpoint is what stands between an untrained
+ * technician and being marked trained.
+ *
+ * ATTEMPT NUMBERING. uq_lms_attempt (easyfixer_id, assessment_id, attempt_no)
+ * is the thing that makes "three attempts" mean three attempts, so the number
+ * is allocated against a fresh read and the INSERT is retried on ER_DUP_ENTRY.
+ * Two submits racing (a double tap, or the app retrying a request whose
+ * response was lost) both read `last = 1`, both try attempt 2, and one of them
+ * loses on the unique key — the loser re-reads, sees 2 taken, and either takes
+ * 3 or is refused because the ceiling is now reached. Without the retry the
+ * second submit would surface as a 500.
+ */
+async function submitAssessment(efrId, assessmentId, { courseId = null, answers = [] } = {}) {
+  const efr = Number(efrId);
+  const aid = Number(assessmentId);
+
+  /*
+   * THE COURSE IS RESOLVED, NEVER TRUSTED.
+   *
+   * The body's courseId used to be stored verbatim. It decides which
+   * easyfixer_courses row gets the score, so an arbitrary number would write a
+   * pass against a course this technician was never assigned — or against
+   * someone else's course entirely. It is treated as a HINT: honoured only if
+   * it is one of the assigned courses that actually contains this assessment,
+   * and otherwise resolved (one candidate → that one; several → none, because
+   * only the app knows which one it was working through).
+   */
+  const assignedCourseIds = await assignedCourseIdsFor(efr, 'assessment', aid);
+  if (!assignedCourseIds.length) throw mkErr(404, 'assessment not found');
+  const cid = assignedCourseIds.includes(Number(courseId))
+    ? Number(courseId)
+    : (assignedCourseIds.length === 1 ? assignedCourseIds[0] : null);
+
+  const [[assessment]] = await pool.query(
+    'SELECT id, pass_percent, max_attempts FROM lms_assessment WHERE id = ? AND status = 1',
+    [aid],
+  );
+  if (!assessment) throw mkErr(404, 'assessment not found');
+  const maxAttempts = Number(assessment.max_attempts);
+  const passPercent = Number(assessment.pass_percent);
+
+  /*
+   * The answer key, read on the SERVER side of the wire. One row per question:
+   * the write path guarantees exactly one correct option, and the Map collapses
+   * any historical row that violated that rather than inflating the
+   * denominator with a duplicate question.
+   */
+  const [correctRows] = await pool.query(
+    `SELECT q.id AS question_id, o.id AS option_id
+       FROM lms_question q
+       JOIN lms_question_option o ON o.question_id = q.id AND o.is_correct = 1
+      WHERE q.assessment_id = ? AND q.status = 1`,
+    [aid],
+  );
+  const key = new Map();
+  for (const r of correctRows) if (!key.has(Number(r.question_id))) key.set(Number(r.question_id), Number(r.option_id));
+  if (!key.size) throw mkErr(409, 'this assessment has no questions yet');
+
+  const given = new Map();
+  for (const a of answers) given.set(Number(a.questionId), Number(a.optionId));
+
+  let correct = 0;
+  for (const [questionId, optionId] of key) if (given.get(questionId) === optionId) correct += 1;
+  // Two decimals, matching score_pct DECIMAL(5,2) — rounding to an integer
+  // here would make 2/3 read as 67 while the stored row says 66.67.
+  const scorePct = Math.round((correct / key.size) * 10000) / 100;
+  const passed = scorePct >= passPercent;
+
+  const now = new Date();
+  let attemptNo = 0;
+  let attemptsUsed = 0;
+  for (let attempt = 1; ; attempt += 1) {
+    const [[tally]] = await pool.query(
+      `SELECT COUNT(*) AS n, COALESCE(MAX(attempt_no), 0) AS last
+         FROM lms_assessment_attempt WHERE easyfixer_id = ? AND assessment_id = ?`,
+      [efr, aid],
+    );
+    attemptsUsed = Number(tally?.n) || 0;
+    if (attemptsUsed >= maxAttempts) {
+      logger.warn('Assessment attempt refused · efrId=' + efr + ' · assessmentId=' + aid
+        + ' · used=' + attemptsUsed + '/' + maxAttempts);
+      throw mkErr(409, `no attempts remaining — all ${maxAttempts} have been used`);
+    }
+    attemptNo = (Number(tally?.last) || 0) + 1;
+    try {
+      await pool.query(
+        `INSERT INTO lms_assessment_attempt
+           (easyfixer_id, assessment_id, course_id, attempt_no, score_pct, passed, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [efr, aid, cid, attemptNo, scorePct, passed ? 1 : 0, now],
+      );
+      attemptsUsed += 1;
+      break;
+    } catch (e) {
+      if (e?.code !== 'ER_DUP_ENTRY') throw e;
+      if (attempt >= 3) throw mkErr(409, 'another attempt is already being recorded — try again');
+      logger.warn('Attempt number ' + attemptNo + ' was taken by a concurrent submit · efrId=' + efr
+        + ' · assessmentId=' + aid + ' · retrying');
+    }
+  }
+
+  logger.info('Assessment submitted · efrId=' + efr + ' · assessmentId=' + aid
+    + ' · attempt=' + attemptNo + ' · score=' + scorePct + '% · passed=' + passed);
+
+  /*
+   * BEST score, not latest, and GREATEST does it in the database.
+   *
+   * A read-then-write would let a failed retake overwrite a pass under
+   * concurrency, and easyfixer_courses.score is what the Training Report and
+   * the client-facing completion evidence render. A technician who scored 90
+   * and then tried again out of curiosity has still scored 90.
+   */
+  if (cid) {
+    await pool.query(
+      `UPDATE easyfixer_courses SET score = GREATEST(COALESCE(score, 0), ?), updated_at = ?
+        WHERE easyfixer_id = ? AND course_id = ?`,
+      [scorePct, now, efr, cid],
+    );
+  }
+
+  /*
+   * A pass can be the last thing a course was waiting on, so completion is
+   * settled here exactly as the 100% video ping settles it. Best-effort: the
+   * attempt is already recorded and committed, and a stamping failure must not
+   * turn a passed assessment into a 500 that the app retries — which would
+   * burn a second attempt.
+   */
+  if (passed) {
+    try {
+      await settleTrainingCompletion(efr);
+    } catch (e) {
+      logger.warn('Post-pass completion handling failed · efrId=' + efr + ' · ' + e.message);
+    }
+  }
+
+  return {
+    scorePct,
+    passed,
+    attemptNo,
+    attemptsRemaining: Math.max(0, maxAttempts - attemptsUsed),
+    passPercent,
+  };
+}
+
+/*
+ * "I have read this." The document equivalent of watching a video to the end.
+ *
+ * Keyed on the CONTENT row, not the document: the same PDF in two courses must
+ * be acknowledged for each, because a completion claim is about a course.
+ *
+ * Idempotent through uq_lms_doc_ack, and the first acknowledgement time is
+ * KEPT (the upsert re-states the row rather than moving the timestamp) — the
+ * fact being recorded is when they read it, not when they last tapped.
+ */
+async function ackDocument(efrId, contentId) {
+  const cid = Number(contentId);
+  /*
+   * Scoped to the caller's own assignments by the JOIN, not by a check
+   * afterwards: an acknowledgement is what makes a course complete, so an
+   * unscoped content id would let any signed-in technician tick off an item of
+   * a course he was never given.
+   */
+  const [[content]] = await pool.query(
+    `SELECT lc.id, lc.kind, lc.course_id
+       FROM lms_content lc
+       JOIN easyfixer_courses ec ON ec.course_id = lc.course_id AND ec.easyfixer_id = ?
+      WHERE lc.id = ? AND lc.status = 1`,
+    [Number(efrId), cid],
+  );
+  if (!content) throw mkErr(404, 'content item not found');
+  if (content.kind !== 'document') throw mkErr(400, 'only a document can be acknowledged');
+
+  await pool.query(
+    `INSERT INTO lms_document_ack (easyfixer_id, content_id, acknowledged_at)
+     VALUES (?, ?, ?)
+     ON DUPLICATE KEY UPDATE content_id = VALUES(content_id)`,
+    [Number(efrId), cid, new Date()],
+  );
+  logger.info('Document acknowledged · efrId=' + efrId + ' · contentId=' + cid);
+
+  /*
+   * The SAME three steps a passing attempt and a 100% video ping take — not
+   * just the per-course stamp. A technician whose last outstanding item is a
+   * PPT is as finished as one whose last item is a video, and stamping the
+   * course without asking whether ALL training is now complete left him in
+   * TRAINING_PENDING forever. Best-effort — the ack itself is committed.
+   */
+  try {
+    await settleTrainingCompletion(Number(efrId));
+  } catch (e) {
+    logger.warn('Post-ack completion handling failed · efrId=' + efrId + ' · ' + e.message);
+  }
+  return { ok: true };
+}
+
+/*
+ * Every course assigned to this technician, with its ordered content and each
+ * item's completion — the technician app's entire LMS screen in one call.
+ *
+ * TWO queries, not one per course and not one per item. The item query joins
+ * easyfixer_courses so `ec.easyfixer_id` is in scope, which is what lets the
+ * per-kind completion rule (itemCompleteSql) be the SAME expression the
+ * gating reads use. An app that computed completion itself from a watched
+ * percentage would be a fourth copy of the rule, and the one running on a
+ * phone that has not been updated in six months.
+ */
+async function coursesForTech(efrId) {
+  const efr = Number(efrId);
+  const [courses] = await pool.query(
+    `SELECT ec.course_id AS id, c.name, c.description,
+            ec.due_date, ec.completion_date, ec.score
+       FROM easyfixer_courses ec
+       JOIN courses c ON c.id = ec.course_id
+      WHERE ec.easyfixer_id = ? AND c.status = 1
+      ORDER BY (ec.due_date IS NULL), ec.due_date ASC, c.name ASC`,
+    [efr],
+  );
+  if (!courses.length) return { rows: [] };
+
+  const [items] = await pool.query(
+    `SELECT lc.id, lc.course_id, lc.kind, lc.ref_id, lc.sequence,
+            tv.title AS video_title, d.url AS video_url,
+            COALESCE((SELECT MAX(w.watched_percentage) FROM easyfixer_watched_video w
+                       WHERE w.video_id = lc.ref_id AND w.easyfixer_id = ec.easyfixer_id), 0) AS watched_percentage,
+            doc.title AS document_title, doc.file_key, doc.mime_type, doc.page_count,
+            a.title AS assessment_title, a.pass_percent, a.max_attempts,
+            (SELECT COUNT(*) FROM lms_assessment_attempt aa
+              WHERE aa.assessment_id = lc.ref_id AND aa.easyfixer_id = ec.easyfixer_id) AS attempts_used,
+            (SELECT MAX(aa.score_pct) FROM lms_assessment_attempt aa
+              WHERE aa.assessment_id = lc.ref_id AND aa.easyfixer_id = ec.easyfixer_id) AS best_score,
+            (${itemCompleteSql('ec.easyfixer_id')}) AS complete
+       FROM easyfixer_courses ec
+       JOIN lms_content lc ON lc.course_id = ec.course_id AND lc.status = 1
+       LEFT JOIN training_videos tv ON lc.kind = 'video' AND tv.id = lc.ref_id
+       LEFT JOIN document d ON d.id = tv.training_video_id AND d.document_type_id = 2
+       LEFT JOIN lms_document doc ON lc.kind = 'document' AND doc.id = lc.ref_id
+       LEFT JOIN lms_assessment a ON lc.kind = 'assessment' AND a.id = lc.ref_id
+      WHERE ec.easyfixer_id = ?
+      ORDER BY lc.course_id ASC, lc.sequence ASC, lc.id ASC`,
+    [efr],
+  );
+
+  const byCourse = new Map(courses.map((c) => [c.id, { ...c, items: [] }]));
+  for (const r of items) {
+    const course = byCourse.get(r.course_id);
+    // A retired course still has assignment rows; its items are skipped rather
+    // than surfaced under a course the technician cannot see.
+    if (!course) continue;
+    const base = {
+      id: r.id,
+      kind: r.kind,
+      ref_id: r.ref_id,
+      sequence: r.sequence,
+      complete: Number(r.complete) === 1,
+    };
+    if (r.kind === 'video') {
+      course.items.push({
+        ...base,
+        title: r.video_title,
+        url: normalizeVideoUrl(r.video_url) || null,
+        watchedPercent: Number(r.watched_percentage) || 0,
+      });
+    } else if (r.kind === 'document') {
+      // file_key deliberately stays server-side; the app gets a presigned URL.
+      course.items.push({
+        ...base,
+        title: r.document_title,
+        url: await documentUrl(r.file_key),
+        mimeType: r.mime_type,
+        pageCount: r.page_count,
+      });
+    } else {
+      course.items.push({
+        ...base,
+        title: r.assessment_title,
+        attemptsUsed: Number(r.attempts_used) || 0,
+        maxAttempts: Number(r.max_attempts),
+        passPercent: Number(r.pass_percent),
+        bestScore: r.best_score === null ? null : Number(r.best_score),
+      });
+    }
+  }
+
+  const rows = [...byCourse.values()];
+  logger.info('LMS courses for technician · efrId=' + efr + ' · courses=' + rows.length
+    + ' · items=' + items.length);
+  return { rows };
+}
+
 module.exports = {
   MANDATORY_VIDEO_IDS_SQL,
   VISIBLE_VIDEO_IDS_SQL,
@@ -1399,6 +2503,25 @@ module.exports = {
   retireCourse,
   getCourseVideos,
   setCourseVideos,
+  getCourseContent,
+  setCourseContent,
+  CONTENT_KINDS,
+  listDocuments,
+  createDocument,
+  updateDocument,
+  retireDocument,
+  documentUrl,
+  listAssessments,
+  getAssessmentForAdmin,
+  createAssessment,
+  updateAssessment,
+  retireAssessment,
+  resetAssessmentAttempts,
+  setAssessmentQuestions,
+  getAssessmentForTech,
+  submitAssessment,
+  ackDocument,
+  coursesForTech,
   listVideos,
   videoProgressCount,
   videoCourseCount,
@@ -1408,4 +2531,5 @@ module.exports = {
   listAssignments,
   trainingReport,
   isTrainingComplete,
+  settleTrainingCompletion,
 };

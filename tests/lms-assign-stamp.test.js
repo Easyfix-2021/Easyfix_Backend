@@ -41,7 +41,7 @@ function stampCall() {
 test('assignCourse stamps completion for technicians who already finished the content', async () => {
   fake.reset();
   scenario = [
-    [/FROM course_videos WHERE course_id/i, [{ n: 3 }]],
+    [/FROM lms_content WHERE course_id/i, [{ n: 3 }]],
     [/SELECT efr_id FROM tbl_easyfixer/i, (sql, params) => params.map((efr_id) => ({ efr_id }))],
     [/FROM courses/i, [{ id: 4, name: 'Induction', status: 1 }]],
     [/INSERT INTO easyfixer_courses/i, { affectedRows: 1 }],
@@ -57,7 +57,7 @@ test('assignCourse stamps completion for technicians who already finished the co
 test('the stamp is ONE statement for the whole batch, not one per technician', async () => {
   fake.reset();
   scenario = [
-    [/FROM course_videos WHERE course_id/i, [{ n: 3 }]],
+    [/FROM lms_content WHERE course_id/i, [{ n: 3 }]],
     [/SELECT efr_id FROM tbl_easyfixer/i, (sql, params) => params.map((efr_id) => ({ efr_id }))],
     [/FROM courses/i, [{ id: 4, name: 'Induction', status: 1 }]],
     [/INSERT INTO easyfixer_courses/i, { affectedRows: 1 }],
@@ -83,9 +83,9 @@ test('the stamp requires the course to HAVE content — an empty course is never
   scenario = [[STAMP, { affectedRows: 0 }]];
   await lms.stampCompletionsForCourse(4, [1]);
   const sql = stampCall().sql;
-  assert.match(sql, /EXISTS \(SELECT 1 FROM course_videos/,
-    'without this, a course with no videos has no video below the threshold and stamps instantly');
-  assert.match(sql, /NOT EXISTS/, 'and completion still means no video below COMPLETION_PERCENT');
+  assert.match(sql, /EXISTS \(\s*SELECT 1 FROM lms_content/,
+    'without this, a course with no items has no unfinished item and stamps instantly');
+  assert.match(sql, /NOT EXISTS/, 'and completion still means no item of the course is unfinished');
 });
 
 test('the stamp is scoped to the course and the technicians just assigned', async () => {
@@ -95,10 +95,13 @@ test('the stamp is scoped to the course and the technicians just assigned', asyn
   const call = stampCall();
   assert.match(call.sql, /ec\.course_id = \?/);
   assert.match(call.sql, /ec\.easyfixer_id IN \(\?,\?\)/);
-  // [now, now, courseId, ...ids, COMPLETION_PERCENT]
+  // [now, now, courseId, ...ids] — the completion rule is a parameter-free SQL
+  // fragment now (lms.service::itemCompleteSql), so the threshold is pinned in
+  // the statement text rather than trailing the parameter list.
   assert.equal(call.params[2], 7);
   assert.deepEqual(call.params.slice(3, 5), [101, 102]);
-  assert.equal(call.params[5], 100, 'COMPLETION_PERCENT is 100 and is not a tunable');
+  assert.equal(call.params.length, 5, 'no stray trailing parameter');
+  assert.match(call.sql, />= 100/, 'COMPLETION_PERCENT is 100 and is not a tunable');
 });
 
 test('an empty technician list issues no statement at all', async () => {
@@ -112,7 +115,7 @@ test('an empty technician list issues no statement at all', async () => {
 test('a failing stamp does NOT fail the assignment the operator just made', async () => {
   fake.reset();
   scenario = [
-    [/FROM course_videos WHERE course_id/i, [{ n: 3 }]],
+    [/FROM lms_content WHERE course_id/i, [{ n: 3 }]],
     [/SELECT efr_id FROM tbl_easyfixer/i, (sql, params) => params.map((efr_id) => ({ efr_id }))],
     [/FROM courses/i, [{ id: 4, name: 'Induction', status: 1 }]],
     [/INSERT INTO easyfixer_courses/i, { affectedRows: 1 }],

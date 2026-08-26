@@ -53,7 +53,8 @@ async function loadCandidates() {
        JOIN tbl_easyfixer e ON e.efr_id = ec.easyfixer_id
       WHERE ec.completion_date IS NULL
         AND NOT (e.efr_status <=> 3)
-        AND EXISTS (SELECT 1 FROM course_videos cv WHERE cv.course_id = ec.course_id)
+        AND EXISTS (SELECT 1 FROM lms_content lc
+                     WHERE lc.course_id = ec.course_id AND lc.status = 1)
       GROUP BY ec.easyfixer_id`,
     [lms.istToday()],
   );

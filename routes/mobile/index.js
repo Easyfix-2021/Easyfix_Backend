@@ -1706,5 +1706,10 @@ router.use('/kyc', require('./kyc'));
 router.use('/email', require('./email-verify'));
 //   /uploads  (generic S3 multipart upload primitive — net-new GAP #1)
 router.use('/uploads', require('./uploads'));
+//   /lms/courses · /lms/content/:id/ack · /lms/assessments/:id[/submit]
+// The content-aware LMS surface (videos + documents + assessments). The legacy
+// video-only endpoints stay where they are on profile-extra.js — the Flutter
+// app still calls them, and the two retire independently.
+router.use('/lms', require('./lms'));
 
 module.exports = router;

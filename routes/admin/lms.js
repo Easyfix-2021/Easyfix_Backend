@@ -1,11 +1,14 @@
 const router = require('express').Router();
 const Joi = require('joi');
+const multer = require('multer');
+const crypto = require('crypto');
 
 const validate = require('../../middleware/validate');
 const requireAction = require('../../middleware/require-action');
 const { buildRequestScope } = require('../../lib/scope');
 const svc = require('../../services/lms.service');
-const { modernOk } = require('../../utils/response');
+const s3 = require('../../utils/s3-storage');
+const { modernOk, modernError } = require('../../utils/response');
 const logger = require('../../logger');
 
 /*
@@ -57,10 +60,16 @@ const logger = require('../../logger');
  */
 
 /*
- * One factory call, reused on all SEVEN writes. requireAction() returns a NAMED
+ * One factory call, reused on EVERY write in this file — courses, content,
+ * documents, assessments and assignment alike. requireAction() returns a NAMED
  * function (`actionGuard`) and route tests locate the guard by `fn.name` —
  * see tests/easyfixer-lifecycle-route-auth.test.js — so it must never be wrapped
  * in an anonymous arrow.
+ *
+ * Documents and assessments deliberately do NOT get action keys of their own.
+ * They are the same job as building a course, done by the same person, and a
+ * second key would have to be seeded, granted and explained before anyone
+ * could use a feature that is already gated correctly.
  */
 const requireLmsManage = requireAction('isLmsManage');
 
@@ -102,6 +111,112 @@ const updateCourseBody = Joi.object({
  */
 const setContentBody = Joi.object({
   video_ids: Joi.array().items(Joi.number().integer().positive()).max(100).required(),
+});
+
+/*
+ * The kind-aware version of the same thing. ORDER IS ARRAY ORDER — the payload
+ * carries no `sequence`, because two clients disagreeing about whether
+ * sequence is 0- or 1-based is a bug that only shows up as a mis-ordered
+ * course. The position in the array IS the position in the course.
+ */
+const setCourseContentBody = Joi.object({
+  items: Joi.array().items(Joi.object({
+    kind: Joi.string().valid(...svc.CONTENT_KINDS).required(),
+    ref_id: Joi.number().integer().positive().required(),
+  })).max(100).required(),
+});
+
+// ─── Documents ───────────────────────────────────────────────────────
+
+/*
+ * 25 MB, single file. Larger than the 10 MB image cap next door because this
+ * is where a training deck actually lands — a 40-slide PPTX with photographs
+ * clears 10 MB routinely, and an operator who has to compress it first will
+ * instead email it round and skip the LMS entirely.
+ */
+const documentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024, files: 1 },
+});
+
+/*
+ * PDF and PowerPoint only. Deliberately NOT images (a slide exported as a JPEG
+ * has no page structure and cannot be read on a phone) and deliberately not
+ * SVG or HTML, which execute script in a viewer.
+ *
+ * `application/octet-stream` is accepted because browsers genuinely send it for
+ * .ppt/.pptx from some file pickers — the same allowance utils/file-storage
+ * makes, and the reason the extension is checked alongside it below.
+ */
+const DOCUMENT_MIME = new Set([
+  'application/pdf',
+  'application/vnd.ms-powerpoint',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'application/octet-stream',
+]);
+const DOCUMENT_EXT = /\.(pdf|ppt|pptx)$/i;
+
+const listDocumentsQuery = Joi.object({
+  q: Joi.string().allow('', null).optional(),
+  limit: Joi.number().integer().min(1).max(1000).default(200),
+  offset: Joi.number().integer().min(0).default(0),
+});
+
+const updateDocumentBody = Joi.object({
+  title: Joi.string().trim().min(2).max(255).required(),
+});
+
+// ─── Assessments ─────────────────────────────────────────────────────
+
+const listAssessmentsQuery = listDocumentsQuery;
+
+const createAssessmentBody = Joi.object({
+  title: Joi.string().trim().min(2).max(255).required(),
+  description: Joi.string().max(2000).allow('', null).optional(),
+  pass_percent: Joi.number().integer().min(1).max(100).optional(),
+  max_attempts: Joi.number().integer().min(1).max(20).optional(),
+});
+
+const updateAssessmentBody = Joi.object({
+  title: Joi.string().trim().min(2).max(255).optional(),
+  description: Joi.string().max(2000).allow('', null).optional(),
+  pass_percent: Joi.number().integer().min(1).max(100).optional(),
+  max_attempts: Joi.number().integer().min(1).max(20).optional(),
+  status: Joi.boolean().optional(),
+}).min(1);
+
+/*
+ * THE PAPER'S SHAPE IS ENFORCED HERE, AND ONLY HERE.
+ *
+ * A question with no correct option can never be answered right, so every
+ * technician fails the assessment forever and — since a course containing it
+ * can then never complete — is eventually restricted from working. A question
+ * with two correct options is the same trap wearing a different hat: the
+ * scorer picks one, and the other looks wrong to everyone who chose it. Both
+ * are cheap to prevent at save time and expensive to discover in the field, so
+ * "exactly one" is a hard validation rather than a warning in the CRM.
+ *
+ * Two options is the floor for the same reason a one-option question is not a
+ * question.
+ */
+const setQuestionsBody = Joi.object({
+  questions: Joi.array().min(1).max(100).items(Joi.object({
+    question_text: Joi.string().trim().min(1).max(2000).required(),
+    sequence: Joi.number().integer().min(0).optional(),
+    options: Joi.array().min(2).max(10).items(Joi.object({
+      option_text: Joi.string().trim().min(1).max(500).required(),
+      is_correct: Joi.boolean().default(false),
+      sequence: Joi.number().integer().min(0).optional(),
+    })).required().custom((options, helpers) => {
+      const correct = options.filter((o) => o.is_correct).length;
+      if (correct !== 1) {
+        return helpers.message(
+          `each question needs exactly one correct option (this one has ${correct})`,
+        );
+      }
+      return options;
+    }),
+  })).required(),
 });
 
 /*
@@ -232,6 +347,203 @@ router.put('/courses/:id/videos', requireLmsManage, validate(idParam, 'params'),
     modernOk(res, await svc.setCourseVideos(req.params.id, req.body.video_ids));
   } catch (e) { next(e); }
 });
+
+/*
+ * The kind-aware content list. GET/PUT /videos above are the same course seen
+ * through a video-only lens and are kept working for the existing CRM screen;
+ * these two are what the Content page uses.
+ *
+ * There is no third table behind them — both pairs read and write lms_content,
+ * so an operator cannot end up with a course that looks different depending on
+ * which screen opened it.
+ */
+router.get('/courses/:id/content', validate(idParam, 'params'), async (req, res, next) => {
+  try {
+    modernOk(res, await svc.getCourseContent(req.params.id));
+  } catch (e) { next(e); }
+});
+
+router.put('/courses/:id/content', requireLmsManage, validate(idParam, 'params'), validate(setCourseContentBody), async (req, res, next) => {
+  try {
+    modernOk(res, await svc.setCourseContent(req.params.id, req.body.items));
+  } catch (e) { next(e); }
+});
+
+// ─── Documents ───────────────────────────────────────────────────────
+
+router.get('/documents', validate(listDocumentsQuery, 'query'), async (req, res, next) => {
+  try {
+    modernOk(res, await svc.listDocuments(req.query));
+  } catch (e) { next(e); }
+});
+
+/*
+ * Upload a training document.
+ *
+ * multipart, because the alternative — a base64 body — inflates a 25 MB deck
+ * to 34 MB and would have to clear the JSON body limit that exists to stop
+ * exactly that.
+ *
+ * S3 IS REQUIRED, and its absence is a 503 rather than a local-disk fallback.
+ * The notice-image upload does fall back, because a missing decoration is
+ * cosmetic; a training document a technician cannot open is a course they
+ * cannot complete, and a file written to one container's ephemeral disk is
+ * unreadable from the next one. Better to refuse loudly at upload time than to
+ * accept a document that will 404 for its audience.
+ *
+ * The stored value is the OBJECT KEY, never a URL — see lms.service::documentUrl.
+ */
+router.post('/documents', requireLmsManage, documentUpload.single('file'), async (req, res, next) => {
+  try {
+    logger.info('Upload LMS document · mime=' + (req.file?.mimetype || 'none') + ' size=' + (req.file?.size ?? 0));
+    if (!req.file) return modernError(res, 400, 'missing "file" upload');
+    const title = String(req.body?.title || '').trim();
+    if (title.length < 2) return modernError(res, 400, 'title is required');
+
+    // MIME and extension together: browsers under-report .pptx as
+    // application/octet-stream, and octet-stream alone would accept anything.
+    const mimeOk = DOCUMENT_MIME.has(req.file.mimetype);
+    const extOk = DOCUMENT_EXT.test(req.file.originalname || '');
+    if (!mimeOk || !extOk) {
+      logger.warn('LMS document rejected · mime=' + req.file.mimetype + ' name=' + req.file.originalname);
+      return modernError(res, 400, 'only PDF and PowerPoint files are accepted');
+    }
+    if (!s3.isEnabled()) {
+      return modernError(res, 503, 'document storage is not configured (S3_BUCKET_NAME unset)');
+    }
+
+    const key = `LmsDocuments/${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+    await s3.putAtKey({
+      key,
+      buffer: req.file.buffer,
+      contentType: req.file.mimetype,
+      originalName: req.file.originalname,
+    });
+    const created = await svc.createDocument({
+      title,
+      fileKey: key,
+      mimeType: req.file.mimetype,
+      sizeBytes: req.file.size ?? null,
+      createdBy: req.user?.user_id ?? null,
+    });
+    logger.info('LMS document stored · id=' + created.id + ' · key=' + key);
+    res.status(201);
+    return modernOk(res, created, 'document uploaded');
+  } catch (e) {
+    if (e.code === 'LIMIT_FILE_SIZE') {
+      logger.warn('LMS document upload failed · file exceeds 25MB');
+      return modernError(res, 400, 'file exceeds 25MB');
+    }
+    return next(e);
+  }
+});
+
+router.patch('/documents/:id', requireLmsManage, validate(idParam, 'params'), validate(updateDocumentBody), async (req, res, next) => {
+  try {
+    modernOk(res, await svc.updateDocument(req.params.id, req.body));
+  } catch (e) { next(e); }
+});
+
+/*
+ * Retires (status = 0), and refuses with 409 while a course still holds it.
+ * The S3 object is deliberately left in place: an attempt or an
+ * acknowledgement recorded against this document is evidence, and evidence
+ * whose subject has been deleted is not evidence.
+ */
+router.delete('/documents/:id', requireLmsManage, validate(idParam, 'params'), async (req, res, next) => {
+  try {
+    logger.info('Retire LMS document · id=' + req.params.id);
+    modernOk(res, await svc.retireDocument(req.params.id));
+  } catch (e) { next(e); }
+});
+
+// ─── Assessments ─────────────────────────────────────────────────────
+
+router.get('/assessments', validate(listAssessmentsQuery, 'query'), async (req, res, next) => {
+  try {
+    modernOk(res, await svc.listAssessments(req.query));
+  } catch (e) { next(e); }
+});
+
+/*
+ * Includes is_correct — this is the answer key, and it is the ONLY endpoint
+ * that serves it. The technician-facing read is a different route on a
+ * different router built from a different projection
+ * (lms.service::getAssessmentForTech), never this response with the answers
+ * filtered out.
+ *
+ * requireLmsManage, EVEN THOUGH IT IS A READ — the one exception to the
+ * "reads stay open to any admin-group user" rule in the header. That rule is
+ * about consuming a list; this response is the answers to a paper that gates
+ * whether a technician is marked trained. Without the key here, the route
+ * inherits only requireAuth + role(['admin']), so every admin-group user —
+ * including geographically scoped operators who can also see technicians'
+ * names — could fetch it. The CRM hides the button, which is not a control:
+ * the URL is guessable and the response is the whole key.
+ */
+router.get('/assessments/:id', requireLmsManage, validate(idParam, 'params'), async (req, res, next) => {
+  try {
+    modernOk(res, await svc.getAssessmentForAdmin(req.params.id));
+  } catch (e) { next(e); }
+});
+
+router.post('/assessments', requireLmsManage, validate(createAssessmentBody), async (req, res, next) => {
+  try {
+    const created = await svc.createAssessment(req.body);
+    res.status(201);
+    modernOk(res, created);
+  } catch (e) { next(e); }
+});
+
+router.patch('/assessments/:id', requireLmsManage, validate(idParam, 'params'), validate(updateAssessmentBody), async (req, res, next) => {
+  try {
+    modernOk(res, await svc.updateAssessment(req.params.id, req.body));
+  } catch (e) { next(e); }
+});
+
+/*
+ * FULL replace of the paper. Not a per-question CRUD, because the shape rules
+ * ("at least one question", "exactly one correct option") are properties of
+ * the WHOLE paper: a per-question endpoint can only ever validate the question
+ * in front of it, and would happily leave an assessment with zero questions
+ * between two calls.
+ */
+router.put('/assessments/:id/questions', requireLmsManage, validate(idParam, 'params'), validate(setQuestionsBody), async (req, res, next) => {
+  try {
+    modernOk(res, await svc.setAssessmentQuestions(req.params.id, req.body.questions));
+  } catch (e) { next(e); }
+});
+
+router.delete('/assessments/:id', requireLmsManage, validate(idParam, 'params'), async (req, res, next) => {
+  try {
+    logger.info('Retire assessment · id=' + req.params.id);
+    modernOk(res, await svc.retireAssessment(req.params.id));
+  } catch (e) { next(e); }
+});
+
+/*
+ * Give one technician his attempts back on one assessment.
+ *
+ * THE ONLY WAY OUT of an exhausted paper. Running out of attempts is otherwise
+ * terminal: the submit 409s forever, the course can never stamp complete
+ * because completion needs a PASSING attempt, and the overdue restriction then
+ * withdraws work — with nothing the technician or the operator can do about
+ * it. Extending the deadline does not help; what is blocked is the paper.
+ *
+ * Deliberately NOT a bulk reset and not part of PATCH: it is one person, one
+ * paper, one decision, and it should read that way in the audit log.
+ */
+router.delete('/assessments/:id/attempts/:easyfixerId', requireLmsManage,
+  validate(Joi.object({
+    id: Joi.number().integer().positive().required(),
+    easyfixerId: Joi.number().integer().positive().required(),
+  }), 'params'), async (req, res, next) => {
+    try {
+      logger.info('Reset assessment attempts · assessmentId=' + req.params.id
+        + ' · efrId=' + req.params.easyfixerId + ' · by=' + (req.user?.user_id ?? 'unknown'));
+      modernOk(res, await svc.resetAssessmentAttempts(req.params.id, req.params.easyfixerId));
+    } catch (e) { next(e); }
+  });
 
 // ─── Assignment ──────────────────────────────────────────────────────
 

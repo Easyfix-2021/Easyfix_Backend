@@ -171,14 +171,42 @@ const EXPECTED = {
   // ─── LMS (services/lms.service.js) ──────────────────────────────────────
   // `courses` and `easyfixer_courses` pre-date the LMS work; only
   // courses.status is new (migrations/executed/2026-08-13-lms-foundation.sql).
-  // course_videos is created wholesale by that migration. All three are read
-  // on the LMS list/detail/report paths, so a missing column here is a 500 on
-  // first request, not a degraded behaviour.
+  // Both are read on the LMS list/detail/report paths, so a missing column
+  // here is a 500 on first request, not a degraded behaviour.
   courses: ['id', 'name', 'description', 'status', 'created_at', 'updated_at'],
-  course_videos: ['id', 'course_id', 'video_id', 'sequence', 'created_at'],
   easyfixer_courses: [
     'id', 'easyfixer_id', 'course_id', 'score', 'created_at', 'updated_at',
   ],
+  /*
+   * Course CONTENT (2026-08-26-lms-content-types-and-assessments.sql). These
+   * replaced course_videos, which is no longer read anywhere and is therefore
+   * no longer listed — the migration keeps the table as a rollback surface,
+   * not as something the code depends on.
+   *
+   * These belong under the STRICT rule, not the fail-soft one, and the reason
+   * is worth stating: lms_content is what isTrainingComplete,
+   * MANDATORY_VIDEO_IDS_SQL and both completion stamps now read, and those
+   * gate EARNING. Deploying this code against a database without these tables
+   * would not degrade — it would make every technician's training unreadable,
+   * which reads as incomplete, which stops them receiving work. Refusing to
+   * boot is the loud, recoverable failure; the quiet one locks the field out.
+   */
+  lms_content: ['id', 'course_id', 'kind', 'ref_id', 'sequence', 'status', 'created_at', 'updated_at'],
+  lms_document: [
+    'id', 'title', 'file_key', 'mime_type', 'size_bytes', 'page_count',
+    'status', 'created_at', 'created_by',
+  ],
+  lms_assessment: [
+    'id', 'title', 'description', 'pass_percent', 'max_attempts', 'status',
+    'created_at', 'updated_at',
+  ],
+  lms_question: ['id', 'assessment_id', 'question_text', 'sequence', 'status'],
+  lms_question_option: ['id', 'question_id', 'option_text', 'is_correct', 'sequence'],
+  lms_assessment_attempt: [
+    'id', 'easyfixer_id', 'assessment_id', 'course_id', 'attempt_no',
+    'score_pct', 'passed', 'created_at',
+  ],
+  lms_document_ack: ['id', 'easyfixer_id', 'content_id', 'acknowledged_at'],
   tbl_easyfixer: [
     'efr_id', 'efr_name', 'efr_no', 'efr_status', 'efr_cityId',
     'current_balance', 'balance_updated',
@@ -264,10 +292,20 @@ const REQUIRED_INDEXES = [
     columns: ['easyfixer_id', 'course_id'],
     unique: true,
   },
-  // setCourseVideos() DELETEs then re-INSERTs, so it does not depend on this
-  // for correctness — but it is what stops two writers racing a course into
-  // holding the same video twice.
-  { table: 'course_videos', columns: ['course_id', 'video_id'], unique: true },
+  // setCourseContent() UPSERTS onto this key — it is what makes a re-order
+  // keep each item's existing row id, and therefore what stops a saved course
+  // from orphaning every lms_document_ack that pointed at the old row.
+  { table: 'lms_content', columns: ['course_id', 'kind', 'ref_id'], unique: true },
+  // The ONLY thing making "three attempts" mean three attempts: submitAssessment
+  // allocates attempt_no from a read, and this key is what turns two racing
+  // submits into one ER_DUP_ENTRY retry instead of two attempt 2s.
+  {
+    table: 'lms_assessment_attempt',
+    columns: ['easyfixer_id', 'assessment_id', 'attempt_no'],
+    unique: true,
+  },
+  // Makes the document acknowledgement idempotent — the app replays it.
+  { table: 'lms_document_ack', columns: ['easyfixer_id', 'content_id'], unique: true },
   {
     table: 'tbl_easyfixer_withdrawal_request',
     columns: ['fk_easyfixer_id', 'status'],

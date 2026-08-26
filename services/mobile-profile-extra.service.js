@@ -4,10 +4,12 @@ const verification = require('./technician-verification.service');
 const s3Storage = require('../utils/s3-storage');
 const { writeBuffer } = require('../utils/file-storage');
 // LMS completion -> lifecycle wire; see maybeAdvanceTrainingLifecycle below.
-// Neither module requires this one, so these are plain top-level requires
-// rather than lazy ones — there is no cycle to break.
+// lms.service does not require this one, so it is a plain top-level require
+// rather than a lazy one — there is no cycle to break. The lifecycle service
+// is NOT required here: the advance goes through
+// lms.service::settleTrainingCompletion, which is the one copy of that
+// sequence.
 const lms = require('./lms.service');
-const lifecycle = require('./easyfixer-lifecycle.service');
 
 /*
  * mobile-profile-extra.service — backing logic for routes/mobile/profile-extra.js.
@@ -593,25 +595,20 @@ async function maybeAdvanceTrainingLifecycle(efrId, watchedPercentage) {
   if (Number(watchedPercentage) < lms.COMPLETION_PERCENT) return;
   try {
     /*
-     * Per-COURSE completion is stamped before the per-TECHNICIAN check,
-     * because they answer different questions and the course-level one is the
-     * finer grained. A technician with three assigned courses who just
-     * finished the second has completed that course — the report and the
-     * overdue restriction both need to know that now — while their overall
-     * training is still outstanding and the lifecycle must not advance.
-     * Idempotent, so a replayed ping re-stamps nothing.
+     * The three steps live in lms.service::settleTrainingCompletion, shared
+     * with the assessment-pass and document-acknowledgement paths. Per-COURSE
+     * completion is stamped before the per-TECHNICIAN check, because they
+     * answer different questions and the course-level one is finer grained: a
+     * technician with three assigned courses who just finished the second has
+     * completed that course — the report and the overdue restriction both need
+     * to know that now — while their overall training is still outstanding and
+     * the lifecycle must not advance. Idempotent, so a replayed ping re-stamps
+     * nothing.
+     *
+     * A copy of the sequence here is what let the document path drift into
+     * doing only step one; there is one copy now.
      */
-    await lms.stampCourseCompletions(efrId);
-    const { complete, required, done } = await lms.isTrainingComplete(efrId);
-    if (!complete) {
-      logger.info('Training not yet complete · efrId=' + efrId + ' · ' + done + '/' + required);
-      return;
-    }
-    const result = await lifecycle.finalizeTrainingCompletion(efrId);
-    if (result.changed) {
-      logger.info('Training complete → lifecycle advanced · efrId=' + efrId
-        + ' · from=' + result.transitionedFrom);
-    }
+    await lms.settleTrainingCompletion(efrId);
   } catch (e) {
     // Deliberately swallowed — see property 1 above.
     logger.warn('Training completion lifecycle advance failed · efrId=' + efrId + ' · ' + e.message);

@@ -107,11 +107,37 @@ function scopeKey(scope) {
  * cannot disagree about which assignments are even in play.
  *
  * `c.status = 1` excludes retired courses. The EXISTS on content is not
- * optional: a course with no videos can never be completed, so counting it as
+ * optional: a course with no content can never be completed, so counting it as
  * outstanding would put a technician on a list he has no way to leave.
  * assignCourse already refuses to create such assignments; rows predating
  * that guard still exist, and they surface deliberately under "Needs
  * decision" instead (arm 3), which is the only place they can be acted on.
+ *
+ * ─── ONE DEFINITION OF CONTENT, ALL FOUR PLACES (2026-08-26) ─────────
+ *
+ * Content moved from course_videos to lms_content, which now also holds
+ * documents and assessments. Four things in this file read it — the "has
+ * content" test above, the "no progress" predicate, the progress join and the
+ * total — and they must agree about WHICH ROWS ARE THE COURSE.
+ *
+ * They briefly did not. The membership test widened to any kind while the
+ * three progress reads stayed `kind = 'video'`, which put a document- or
+ * assessment-only course on the chase list with videos_total = 0 and
+ * done_videos = 0 — permanently "not started", for a course with no video in
+ * it to start. Half-widening is worse than either whole answer, so all four
+ * count items of every kind and each kind proves completion its own way:
+ *
+ *   video      watched_percentage >= 100
+ *   assessment a PASSING attempt
+ *   document   an acknowledgement of the CONTENT row
+ *
+ * Which is the same rule lms.service::itemCompleteSql applies for the gating
+ * reads — the chase list must not be able to disagree with the restriction it
+ * is chasing people out of.
+ *
+ * The column ALIASES stay `videos_total` / `done_videos`. They are read by
+ * name in the CRM and in the route tests, and they still mean "how much of
+ * this course is left"; renaming them would be a client change for no gain.
  */
 const LIVE_FROM = `
     FROM easyfixer_courses ec
@@ -120,7 +146,7 @@ const LIVE_FROM = `
 
 const LIVE_WHERE = [
   'NOT (e.efr_status <=> 3)',
-  'EXISTS (SELECT 1 FROM course_videos cv WHERE cv.course_id = ec.course_id)',
+  'EXISTS (SELECT 1 FROM lms_content lc WHERE lc.course_id = ec.course_id AND lc.status = 1)',
 ];
 
 function liveQuery(extraClauses = [], extraParams = [], scope) {
@@ -130,17 +156,25 @@ function liveQuery(extraClauses = [], extraParams = [], scope) {
   return { where: `WHERE ${clauses.join(' AND ')}`, params };
 }
 
-/* Zero recorded progress on this course, for this technician. The only
- * place easyfixer_watched_video is touched, and only over the already-narrow
- * overdue set. That table is MyISAM with a live monotonicity trigger — it is
- * read here and never written, and no index is added to it. */
+/* Zero recorded progress on this course, for this technician — of ANY kind.
+ * A technician who has opened nothing but has sat the assessment twice has
+ * started; calling that "not started" sends a chase for something he is
+ * visibly doing. easyfixer_watched_video is MyISAM with a live monotonicity
+ * trigger — it is read here and never written, and no index is added to it. */
 const NO_PROGRESS = `
   NOT EXISTS (
-    SELECT 1 FROM course_videos cv
-      JOIN easyfixer_watched_video w
-        ON w.video_id = cv.video_id AND w.easyfixer_id = ec.easyfixer_id
-     WHERE cv.course_id = ec.course_id
-       AND COALESCE(w.watched_percentage, 0) > 0)`;
+    SELECT 1 FROM lms_content lc
+     WHERE lc.course_id = ec.course_id AND lc.status = 1
+       AND (EXISTS (SELECT 1 FROM easyfixer_watched_video w
+                     WHERE lc.kind = 'video' AND w.video_id = lc.ref_id
+                       AND w.easyfixer_id = ec.easyfixer_id
+                       AND COALESCE(w.watched_percentage, 0) > 0)
+         OR EXISTS (SELECT 1 FROM lms_assessment_attempt aa
+                     WHERE lc.kind = 'assessment' AND aa.assessment_id = lc.ref_id
+                       AND aa.easyfixer_id = ec.easyfixer_id)
+         OR EXISTS (SELECT 1 FROM lms_document_ack da
+                     WHERE lc.kind = 'document' AND da.content_id = lc.id
+                       AND da.easyfixer_id = ec.easyfixer_id)))`;
 
 /* ─── Ownership ────────────────────────────────────────────────────────
  *
@@ -385,7 +419,7 @@ async function loadNeedsDecision(scope, today, t) {
     'NOT (e.efr_status <=> 3)',
     'ec.completion_date IS NULL',
     'ec.due_date IS NOT NULL',
-    'NOT EXISTS (SELECT 1 FROM course_videos cv WHERE cv.course_id = ec.course_id)',
+    'NOT EXISTS (SELECT 1 FROM lms_content lc WHERE lc.course_id = ec.course_id AND lc.status = 1)',
   ];
   const emptyParams = [];
   applyCityScope(emptyClauses, emptyParams, scope);
@@ -585,15 +619,35 @@ const STATUS_EXPR = `
   END`;
 
 /* Per-assignment progress, joined once rather than correlated per column.
- * easyfixer_watched_video is MyISAM and read-only to us. */
+ * easyfixer_watched_video is MyISAM and read-only to us.
+ *
+ * One branch per kind, UNIONed, then COUNT(DISTINCT content row) — the
+ * DISTINCT is load-bearing: a technician may hold several PASSING attempts at
+ * the same assessment (retaking after a pass is allowed while attempts
+ * remain), and counting rows would put done_videos above videos_total and
+ * report a course as more than finished. */
 const PROGRESS_JOIN = `
   LEFT JOIN (
-    SELECT cv.course_id, w.easyfixer_id,
-           COUNT(*) AS done_videos
-      FROM course_videos cv
-      JOIN easyfixer_watched_video w
-        ON w.video_id = cv.video_id AND COALESCE(w.watched_percentage, 0) >= 100
-     GROUP BY cv.course_id, w.easyfixer_id
+    SELECT course_id, easyfixer_id, COUNT(DISTINCT content_id) AS done_videos
+      FROM (
+        SELECT lc.course_id, lc.id AS content_id, w.easyfixer_id
+          FROM lms_content lc
+          JOIN easyfixer_watched_video w
+            ON w.video_id = lc.ref_id AND COALESCE(w.watched_percentage, 0) >= 100
+         WHERE lc.kind = 'video' AND lc.status = 1
+        UNION ALL
+        SELECT lc.course_id, lc.id, aa.easyfixer_id
+          FROM lms_content lc
+          JOIN lms_assessment_attempt aa
+            ON aa.assessment_id = lc.ref_id AND aa.passed = 1
+         WHERE lc.kind = 'assessment' AND lc.status = 1
+        UNION ALL
+        SELECT lc.course_id, lc.id, da.easyfixer_id
+          FROM lms_content lc
+          JOIN lms_document_ack da ON da.content_id = lc.id
+         WHERE lc.kind = 'document' AND lc.status = 1
+      ) done
+     GROUP BY course_id, easyfixer_id
   ) prog ON prog.course_id = ec.course_id AND prog.easyfixer_id = ec.easyfixer_id`;
 
 /*
@@ -733,7 +787,8 @@ async function pendingList({ detector, courseId, clientId, status, q, limit = 50
             ct.city_name, g.grade,
             ec.due_date, ec.completion_date, ec.created_at AS assigned_on,
             COALESCE(prog.done_videos, 0) AS videos_done,
-            (SELECT COUNT(*) FROM course_videos cv WHERE cv.course_id = ec.course_id) AS videos_total,
+            (SELECT COUNT(*) FROM lms_content lc
+              WHERE lc.course_id = ec.course_id AND lc.status = 1) AS videos_total,
             ${STATUS_EXPR} AS status
        ${LIVE_FROM}
        ${PROGRESS_JOIN}
