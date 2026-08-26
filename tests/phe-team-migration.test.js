@@ -3,12 +3,20 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const migration = fs.readFileSync(path.join(
-  __dirname,
-  '..',
-  'migrations',
-  '2026-08-17-phe-team-read-indexes.sql',
-), 'utf8');
+/*
+ * A migration lives in migrations/ while it is pending and moves to
+ * migrations/executed/ once applied. This file pinned the PENDING path alone,
+ * so it failed the day the migration shipped (commit "Moved Executed Files",
+ * 2026-08-26) — exactly backwards, since an applied migration is the one whose
+ * contents matter most. Resolved from both, matching
+ * tests/rewards-referral-migration.test.js.
+ */
+const migrationPath = [
+  path.join(__dirname, '..', 'migrations', '2026-08-17-phe-team-read-indexes.sql'),
+  path.join(__dirname, '..', 'migrations', 'executed', '2026-08-17-phe-team-read-indexes.sql'),
+].find((p) => fs.existsSync(p));
+assert.ok(migrationPath, '2026-08-17-phe-team-read-indexes.sql not found in migrations/ or migrations/executed/');
+const migration = fs.readFileSync(migrationPath, 'utf8');
 
 test('PHE/team index migration is guarded and additive only', () => {
   assert.match(migration, /information_schema\.statistics/i);
