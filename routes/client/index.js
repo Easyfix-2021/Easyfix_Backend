@@ -3540,4 +3540,173 @@ router.delete('/company/documents/:id', async (req, res, next) => {
   }
 });
 
+
+/* ═══ Home — the date-range block ═══════════════════════════════════════════
+ *
+ * GET /api/client/dashboard-range?from=YYYY-MM-DD&to=YYYY-MM-DD
+ *
+ * Powers the three cards under Today's Pulse: performance health, work by
+ * city, and cancellations. Today's Pulse itself does NOT read this — open
+ * orders are a live figure and a date range means nothing to them, which is
+ * why the range control sits below the pulse and not above it.
+ *
+ * ─── THE COHORT IS "RAISED IN THIS WINDOW" ──────────────────────────────────
+ * Every number here counts the same set of jobs: those whose
+ * ticket_created_date_time falls in the range. Completed, still in progress,
+ * now overdue, escalated, cancelled — all of that cohort. So the card reads as
+ * "of the work raised in this window, here is where it stands", and every
+ * figure moves together when the range changes.
+ *
+ * The alternative — each metric on its own most natural date (completed by
+ * checkout, escalated by escalation date) — was considered and rejected: the
+ * percentages stop reconciling, because the denominators are different sets of
+ * jobs. A share of cancellations is only meaningful against a total that
+ * contains the same rows.
+ *
+ * ─── WHY NOT REUSE /performance ─────────────────────────────────────────────
+ * It is range-aware and rolls up by city and category already, but it is gated
+ * on the `performance` grant while Home is ungated — a Store SPOC would get a
+ * 403 and three empty cards. It also runs the full TAT engine, scoring every
+ * completed job in the window in JS, which is far too heavy for a card that
+ * re-reads on every range change. These are four plain SQL aggregates.
+ *
+ * Team scope mirrors /dashboard-summary exactly (self + everyone reporting to
+ * you) so the numbers on this page reconcile with each other.
+ */
+const dashboardRangeQuery = Joi.object({
+  from: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).required(),
+  to:   Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).required(),
+}).messages({ 'string.pattern.base': 'Dates must be yyyy-mm-dd' });
+
+router.get('/dashboard-range', validate(dashboardRangeQuery, 'query'), async (req, res, next) => {
+  try {
+    const clientId = req.spoc.client_id;
+    const { from, to } = req.query;
+    logger.info('Client dashboard range · clientId=' + clientId + ' · ' + from + '..' + to);
+
+    // Same team expansion as /dashboard-summary — self plus direct reports.
+    const [reports] = await pool.query(
+      `SELECT id FROM tbl_client_contacts
+        WHERE client_id = ?
+          AND manager_id IS NOT NULL AND manager_id NOT IN ('', 'null')
+          AND CAST(manager_id AS UNSIGNED) = ?`,
+      [clientId, req.spoc.id]
+    );
+    const teamIds = reports.map((r) => r.id);
+    teamIds.push(req.spoc.id);
+    const team = teamIds.map(() => '?').join(',');
+
+    /*
+     * `to` is INCLUSIVE: a job raised at 18:40 on the end date belongs to the
+     * window. `< to + 1 day` rather than `DATE(...) <=` so the index on
+     * ticket_created_date_time stays usable.
+     */
+    const COHORT = `j.fk_client_id = ?
+          AND j.reporting_contact_id IN (${team})
+          AND j.ticket_created_date_time >= ?
+          AND j.ticket_created_date_time <  DATE_ADD(?, INTERVAL 1 DAY)`;
+    const params = [clientId, ...teamIds, from, to];
+
+    const totals = pool.query(
+      `SELECT COUNT(*)                                                        AS total,
+              SUM(CASE WHEN j.job_status IN (3,5)      THEN 1 ELSE 0 END)     AS completed,
+              SUM(CASE WHEN j.job_status IN (0,1,2,20) THEN 1 ELSE 0 END)     AS inProgress,
+              SUM(CASE WHEN j.job_status = 6           THEN 1 ELSE 0 END)     AS cancelled,
+              -- Overdue = still open AND its appointment has passed.
+              SUM(CASE WHEN j.job_status IN (0,1,2,20)
+                        AND j.requested_date_time IS NOT NULL
+                        AND j.requested_date_time < NOW()  THEN 1 ELSE 0 END) AS runningLate,
+              SUM(CASE WHEN r.is_escalated = 1         THEN 1 ELSE 0 END)     AS escalated
+         FROM tbl_job j
+         LEFT JOIN tbl_easyfixer_rating_by_customer r ON r.job_id = j.job_id
+        WHERE ${COHORT}`,
+      params,
+    );
+
+    // Every city in the window, not a top-N — the card shows a few and says
+    // how many more there are, so truncating here would make that count a lie.
+    const cities = pool.query(
+      `SELECT ci.city_name AS name,
+              COUNT(*)                                                    AS jobs,
+              SUM(CASE WHEN j.job_status IN (3,5) THEN 1 ELSE 0 END)      AS completed
+         FROM tbl_job j
+         LEFT JOIN tbl_address ad ON ad.address_id = j.fk_address_id
+         LEFT JOIN tbl_city    ci ON ci.city_id    = ad.city_id
+        WHERE ${COHORT}
+          AND ci.city_name IS NOT NULL AND ci.city_name <> ''
+        GROUP BY ci.city_name
+        ORDER BY jobs DESC, name ASC`,
+      params,
+    );
+
+    /*
+     * Cancellation reasons. cancel_reason_id points at action_taken_reason,
+     * the one reason table (the older per-flow tables are dead — see the
+     * action_taken_reason note in the CRM). A cancelled job with no reason
+     * recorded is kept and labelled rather than dropped: "we do not know" is
+     * itself a finding when it is a large share.
+     */
+    const reasons = pool.query(
+      `SELECT COALESCE(NULLIF(TRIM(atr.action_desc), ''), 'Not recorded') AS reason,
+              COUNT(*)                                                    AS n
+         FROM tbl_job j
+         LEFT JOIN action_taken_reason atr ON atr.id = j.cancel_reason_id
+        WHERE ${COHORT}
+          AND j.job_status = 6
+        GROUP BY reason
+        ORDER BY n DESC, reason ASC`,
+      params,
+    );
+
+    const categories = pool.query(
+      `SELECT COALESCE(NULLIF(TRIM(sc.service_catg_name), ''), 'Other') AS label,
+              COUNT(*)                                                  AS n
+         FROM tbl_job j
+         LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = j.fk_service_catg_id
+        WHERE ${COHORT}
+        GROUP BY label
+        ORDER BY n DESC, label ASC`,
+      params,
+    );
+
+    const [[[t]], [cityRows], [reasonRows], [catRows]] =
+      await Promise.all([totals, cities, reasons, categories]);
+
+    const n = (v) => Number(v) || 0;
+    const total = n(t.total);
+    const cancelled = n(t.cancelled);
+    const pctOf = (v, d) => (d > 0 ? Number(((100 * v) / d).toFixed(1)) : 0);
+
+    modernOk(res, {
+      window: { from, to },
+      performance: {
+        total,
+        completed: n(t.completed),
+        inProgress: n(t.inProgress),
+        runningLate: n(t.runningLate),
+        escalated: n(t.escalated),
+        cancelled,
+      },
+      cities: cityRows.map((r) => ({
+        name: r.name, jobs: n(r.jobs), completed: n(r.completed),
+      })),
+      cancellations: {
+        cancelled,
+        total,
+        // Share of the window's work, so it reconciles with performance.total.
+        sharePct: pctOf(cancelled, total),
+        // Top 3 by volume; pct is of CANCELLED jobs, not of all work — the card
+        // reads "of the cancellations, this is why".
+        topReasons: reasonRows.slice(0, 3).map((r) => ({
+          reason: r.reason, count: n(r.n), pct: pctOf(n(r.n), cancelled),
+        })),
+        reasonCount: reasonRows.length,
+        categories: catRows.map((r) => ({
+          label: r.label, count: n(r.n), pct: pctOf(n(r.n), total),
+        })),
+      },
+    });
+  } catch (e) { next(e); }
+});
+
 module.exports = router;
