@@ -3833,8 +3833,37 @@ router.get('/dashboard-range', validate(dashboardRangeQuery, 'query'), async (re
      * The query went with it rather than being left to run for a payload
      * nobody reads.
      */
-    const [[[t]], [cityRows], [reasonRows]] =
-      await Promise.all([totals, cities, reasons]);
+    /*
+     * The PREVIOUS comparable window — one COUNT, for the delta pill on the
+     * Cancellations card. "Same length, immediately before": a 60-day window is
+     * compared with the 60 days before it, a month-to-date with the equally
+     * many days before the 1st.
+     *
+     * The arithmetic stays in SQL. `from`/`to` are bare YYYY-MM-DD and the
+     * column is a zone-less IST DATETIME, so doing the shift in JS would mean
+     * parsing a calendar date into an instant and back — the exact round trip
+     * that moves a boundary by a day for anyone outside IST. DATEDIFF and
+     * DATE_SUB compare the same calendar the column is written in.
+     *
+     * Deliberately NOT the whole aggregate set again: the card shows one
+     * number from this window, so it costs one COUNT rather than a second
+     * three-query round.
+     */
+    const prevCancelled = pool.query(
+      `SELECT COUNT(*) AS n
+         FROM tbl_job j
+         ${cityJoin}
+        WHERE j.fk_client_id = ?
+          AND j.reporting_contact_id IN (${team})
+          AND j.job_status = 6
+          AND j.ticket_created_date_time >= DATE_SUB(?, INTERVAL (DATEDIFF(?, ?) + 1) DAY)
+          AND j.ticket_created_date_time <  ?
+          ${cityWhere}`,
+      [clientId, ...teamIds, from, to, from, from, ...cityParam],
+    );
+
+    const [[[t]], [cityRows], [reasonRows], [[prev]]] =
+      await Promise.all([totals, cities, reasons, prevCancelled]);
 
     const n = (v) => Number(v) || 0;
     const total = n(t.total);
@@ -3864,6 +3893,22 @@ router.get('/dashboard-range', validate(dashboardRangeQuery, 'query'), async (re
           reason: r.reason, count: n(r.n), pct: pctOf(n(r.n), cancelled),
         })),
         reasonCount: reasonRows.length,
+        /*
+         * The remainder, so the card can show a real "Other" row rather than a
+         * muted "+ N other reasons" footnote. EXACT, not an estimate: `cancelled`
+         * counts job_status = 6 and the reasons query groups the same cohort on
+         * the same predicate, so the reason counts sum to `cancelled` — a
+         * cancelled job with no reason recorded is LABELLED 'Not recorded', never
+         * dropped, which is what keeps the two reconcilable.
+         */
+        otherReasons: {
+          count: Math.max(0, cancelled - reasonRows.slice(0, 3).reduce((a, r) => a + n(r.n), 0)),
+          reasons: Math.max(0, reasonRows.length - 3),
+        },
+        // Same length, immediately before. The card labels this "vs previous
+        // period" rather than "vs last month" — with a selectable range, only
+        // the generic phrasing is true for every preset.
+        previousCancelled: n(prev && prev.n),
       },
     });
   } catch (e) { next(e); }

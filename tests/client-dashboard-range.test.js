@@ -22,15 +22,32 @@ const { test, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 const { installFakePool } = require('./helpers/fake-pool');
 
-let totalsRow = { total: 100, completed: 60, inProgress: 25, cancelled: 10, runningLate: 4, escalated: 3 };
-let cityRows = [{ name: 'Bengaluru', jobs: 40, completed: 30 }, { name: 'Pune', jobs: 12, completed: 9 }];
-let reasonRows = [
-  { reason: 'Customer unavailable', n: 5 }, { reason: 'Duplicate', n: 3 },
-  { reason: 'Out of scope', n: 1 },         { reason: 'Not recorded', n: 1 },
-];
+/*
+ * Canned rows, RESTORED in beforeEach. Several tests mutate these to set up a
+ * case, and without the restore the file passes only in its current order —
+ * inserting a test anywhere above a mutation silently breaks the ones below,
+ * which is exactly what happened when the Other-bucket tests were added.
+ */
+const DEFAULTS = {
+  totalsRow: { total: 100, completed: 60, inProgress: 25, cancelled: 10, runningLate: 4, escalated: 3 },
+  cityRows: [{ name: 'Bengaluru', jobs: 40, completed: 30 }, { name: 'Pune', jobs: 12, completed: 9 }],
+  reasonRows: [
+    { reason: 'Customer unavailable', n: 5 }, { reason: 'Duplicate', n: 3 },
+    { reason: 'Out of scope', n: 1 },         { reason: 'Not recorded', n: 1 },
+  ],
+  prevCancelledRow: { n: 4 },
+};
+let totalsRow = DEFAULTS.totalsRow;
+let cityRows = DEFAULTS.cityRows;
+let reasonRows = DEFAULTS.reasonRows;
+let prevCancelledRow = DEFAULTS.prevCancelledRow;
 
 const fake = installFakePool([
   [/FROM tbl_client_contacts/i, [{ id: 11 }]],          // one direct report
+  // DATE_SUB is unique to the prior-period count and must be matched BEFORE the
+  // patterns below — the fake dispatches on FIRST match, and this query also
+  // contains the tokens the totals/reasons routes look for.
+  [/DATE_SUB/i, () => [prevCancelledRow]],
   // `AS runningLate` is UNIQUE to the totals query. Matching on `AS completed`
   // instead would also catch the cities query, which selects the same alias —
   // the fake dispatches on first match, so a loose pattern silently answers
@@ -70,20 +87,64 @@ async function call(from, to) {
   return r.body.data;
 }
 
-beforeEach(() => fake.reset());
+beforeEach(() => {
+  fake.reset();
+  totalsRow = DEFAULTS.totalsRow;
+  cityRows = DEFAULTS.cityRows;
+  reasonRows = DEFAULTS.reasonRows;
+  prevCancelledRow = DEFAULTS.prevCancelledRow;
+});
 
-test('every aggregate shares ONE cohort window, on the creation date', async () => {
+/* The selected window, as opposed to the prior-period comparison. */
+const jobQueries = () => fake.calls.filter((c) => /FROM tbl_job j/i.test(c.sql));
+const currentWindow = () => jobQueries().filter((c) => !/DATE_SUB/i.test(c.sql));
+const priorWindow = () => jobQueries().find((c) => /DATE_SUB/i.test(c.sql));
+
+test('every CURRENT-window aggregate shares ONE cohort, on the creation date', async () => {
   await call('2026-07-01', '2026-08-25');
-  const aggregates = fake.calls.filter((c) => /FROM tbl_job j/i.test(c.sql));
   // Three, not four. The category breakdown of ALL work was removed from the
   // Cancellations card on 2026-08-26 and its query went with it — an aggregate
   // that runs for a payload nobody renders is pure latency.
-  assert.equal(aggregates.length, 3, 'totals, cities, reasons');
-  for (const q of aggregates) {
+  assert.equal(currentWindow().length, 3, 'totals, cities, reasons');
+  for (const q of currentWindow()) {
     assert.match(q.sql, /j\.ticket_created_date_time >= \?/,
       'a query on a different date column breaks every percentage on the card');
-    assert.match(q.sql, /j\.reporting_contact_id IN \(/, 'team scope must be applied to all four');
+    assert.match(q.sql, /j\.reporting_contact_id IN \(/, 'team scope must be applied to all three');
   }
+});
+
+test('the prior-period count is the SAME LENGTH immediately before, and equally scoped', async () => {
+  await call('2026-07-01', '2026-08-25');
+  const q = priorWindow();
+  assert.ok(q, 'the delta pill needs a comparison window');
+  // Length and shift are computed in SQL on purpose: `from`/`to` are bare
+  // calendar dates and the column is a zone-less IST DATETIME, so doing the
+  // arithmetic in JS means parsing a date into an instant and back — the round
+  // trip that moves a boundary by a day outside IST.
+  assert.match(q.sql, /DATE_SUB\(\?, INTERVAL \(DATEDIFF\(\?, \?\) \+ 1\) DAY\)/,
+    'same length as the selected window, not a hardcoded month');
+  assert.match(q.sql, /ticket_created_date_time\s*<\s*\?/,
+    'and it must END where the selected window begins, or the two overlap');
+  assert.match(q.sql, /j\.job_status = 6/, 'it compares CANCELLATIONS, not all work');
+  assert.match(q.sql, /j\.reporting_contact_id IN \(/,
+    'an unscoped comparison would make every SPOC look better or worse than they are');
+});
+
+test('the Other bucket closes the gap the top 3 leave, exactly', async () => {
+  // 10 cancelled across 4 reasons; the top 3 are 5 + 3 + 1 = 9.
+  const d = await call();
+  const top3 = d.cancellations.topReasons.reduce((a, r) => a + r.count, 0);
+  assert.equal(d.cancellations.otherReasons.count, d.cancellations.cancelled - top3,
+    'the four rows on the card must sum to the number in its title');
+  assert.equal(d.cancellations.otherReasons.reasons, 1, '4 distinct reasons less the 3 shown');
+});
+
+test('Other is 0 — not negative — when every reason already fits', async () => {
+  reasonRows = [{ reason: 'Customer unavailable', n: 6 }, { reason: 'Duplicate', n: 4 }];
+  const d = await call();
+  assert.equal(d.cancellations.otherReasons.count, 0, 'nothing left over');
+  assert.equal(d.cancellations.otherReasons.reasons, 0);
+  assert.ok(d.cancellations.otherReasons.count >= 0, 'a negative remainder would render as a row');
 });
 
 test('`to` is inclusive, and expressed so the index stays usable', async () => {
@@ -176,7 +237,7 @@ test('?city is applied to ALL four aggregates, or the percentages would lie', as
   const d = await callWith({ from: '2026-07-01', to: '2026-08-25', city: 'Bengaluru' });
   assert.equal(d.scope.city, 'Bengaluru');
   const aggregates = fake.calls.filter((c) => /FROM tbl_job j/i.test(c.sql));
-  assert.equal(aggregates.length, 3);
+  assert.equal(aggregates.length, 4, 'three current-window aggregates plus the prior-period count');
   for (const q of aggregates) {
     assert.match(q.sql, /city_name = \?/,
       'a city-scoped numerator over a client-wide denominator is a wrong percentage');
@@ -189,4 +250,25 @@ test('no city filter means no join at all — the common path stays cheap', asyn
   await callWith({ from: '2026-07-01', to: '2026-08-25' });
   const totals = fake.calls.find((c) => /AS runningLate/i.test(c.sql));
   assert.doesNotMatch(totals.sql, /ci2\./, 'the address/city join is opt-in');
+});
+
+test('previousCancelled is reported RAW, so the card owns the direction', async () => {
+  const d = await call();
+  assert.equal(d.cancellations.previousCancelled, 4, 'straight off the prior-window COUNT');
+  assert.equal(d.cancellations.cancelled, 10);
+  /*
+   * The route sends both numbers and no delta. Cancellations are the one tile
+   * where UP IS BAD, so the sign and its colour are a rendering decision the
+   * card makes — a server-computed "improvement" would have to encode that
+   * polarity, and every future consumer would inherit whichever way it guessed.
+   */
+  assert.equal(d.cancellations.delta, undefined);
+  assert.equal(d.cancellations.trend, undefined);
+});
+
+test('a prior window with no cancellations is 0, not null — the card must still render', async () => {
+  prevCancelledRow = { n: 0 };
+  const d = await call();
+  assert.equal(d.cancellations.previousCancelled, 0);
+  assert.ok(Number.isFinite(d.cancellations.previousCancelled));
 });
