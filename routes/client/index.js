@@ -708,6 +708,20 @@ function clientJobFilters(req, hier) {
      */
     readyForBilling: String(req.query.flag || '') === 'completedOrders',
     isEscalated: String(req.query.flag || '') === 'escalatedJobs' ? true : undefined,
+    /*
+     * Sort was dropped like the filters were, and it mattered most where a cap
+     * bites. /completed asks for the 500 rows of a window and then tells the
+     * reader they are "the most recent closures" — but with no sort the route
+     * fell back to `ORDER BY j.job_id DESC`, which is most recently CREATED.
+     * A job raised in January and closed in August has a low job_id, so the
+     * ones being dropped were not the old ones at all.
+     *
+     * Safe to pass through: jobService.list resolves sortBy against the
+     * SORTABLE_COLUMNS whitelist with a hasOwnProperty guard and coerces
+     * sortDir to ASC/DESC, so neither value reaches the SQL as text.
+     */
+    sortBy: req.query.sortBy,
+    sortDir: req.query.sortDir,
   };
 }
 
@@ -3810,20 +3824,17 @@ router.get('/dashboard-range', validate(dashboardRangeQuery, 'query'), async (re
       params,
     );
 
-    const categories = pool.query(
-      `SELECT COALESCE(NULLIF(TRIM(sc.service_catg_name), ''), 'Other') AS label,
-              COUNT(*)                                                  AS n
-         FROM tbl_job j
-         LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = j.fk_service_catg_id
-         ${cityJoin}
-        WHERE ${COHORT}
-        GROUP BY label
-        ORDER BY n DESC, label ASC`,
-      params,
-    );
-
-    const [[[t]], [cityRows], [reasonRows], [catRows]] =
-      await Promise.all([totals, cities, reasons, categories]);
+    /*
+     * There is NO fourth aggregate. A category breakdown of ALL work used to
+     * ship inside the Cancellations card and was removed from the design on
+     * 2026-08-26 — the card answers "how many cancelled, and why", and a mix of
+     * every job in the window sitting under a "N cancelled" title invited
+     * exactly the misreading it once caused ("89 carpentry CANCELLATIONS").
+     * The query went with it rather than being left to run for a payload
+     * nobody reads.
+     */
+    const [[[t]], [cityRows], [reasonRows]] =
+      await Promise.all([totals, cities, reasons]);
 
     const n = (v) => Number(v) || 0;
     const total = n(t.total);
@@ -3847,17 +3858,12 @@ router.get('/dashboard-range', validate(dashboardRangeQuery, 'query'), async (re
       cancellations: {
         cancelled,
         total,
-        // Share of the window's work, so it reconciles with performance.total.
-        sharePct: pctOf(cancelled, total),
         // Top 3 by volume; pct is of CANCELLED jobs, not of all work — the card
         // reads "of the cancellations, this is why".
         topReasons: reasonRows.slice(0, 3).map((r) => ({
           reason: r.reason, count: n(r.n), pct: pctOf(n(r.n), cancelled),
         })),
         reasonCount: reasonRows.length,
-        categories: catRows.map((r) => ({
-          label: r.label, count: n(r.n), pct: pctOf(n(r.n), total),
-        })),
       },
     });
   } catch (e) { next(e); }

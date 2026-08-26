@@ -294,3 +294,24 @@ test('a truncated export SAYS SO, and the header is readable cross-origin', asyn
   assert.match(r.headers['Access-Control-Expose-Headers'] || '', /X-Export-Truncated/,
     'the portal is a different origin — an unexposed header is set, sent and invisible');
 });
+
+/* ─── sort, which is what makes a capped page honest ───────────────────── */
+
+test('?sortBy reaches the ORDER BY — /completed calls its 500 "the most recent"', async () => {
+  await call('/jobs', { sortBy: 'checkout_date_time', sortDir: 'desc' });
+  const q = listQuery();
+  assert.match(q.sql, /ORDER BY j\.checkout_date_time DESC/,
+    'unsorted, the route falls back to job_id DESC — most recently CREATED, a different set');
+});
+
+test('an unknown sortBy falls back rather than reaching the SQL', async () => {
+  await call('/jobs', { sortBy: 'j.job_id; DROP TABLE tbl_job', sortDir: 'desc' });
+  const q = listQuery();
+  assert.doesNotMatch(q.sql, /DROP TABLE/, 'sortBy is whitelisted, never interpolated');
+  assert.match(q.sql, /ORDER BY j\.job_id DESC/, 'and an unknown key falls back to the default');
+});
+
+test('sortDir is coerced, not trusted', async () => {
+  await call('/jobs', { sortBy: 'checkout_date_time', sortDir: 'nonsense' });
+  assert.match(listQuery().sql, /checkout_date_time DESC/, 'anything but asc means desc');
+});

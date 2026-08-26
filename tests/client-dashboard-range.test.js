@@ -28,7 +28,6 @@ let reasonRows = [
   { reason: 'Customer unavailable', n: 5 }, { reason: 'Duplicate', n: 3 },
   { reason: 'Out of scope', n: 1 },         { reason: 'Not recorded', n: 1 },
 ];
-let catRows = [{ label: 'Carpentry Services', n: 96 }, { label: 'Other', n: 4 }];
 
 const fake = installFakePool([
   [/FROM tbl_client_contacts/i, [{ id: 11 }]],          // one direct report
@@ -39,7 +38,6 @@ const fake = installFakePool([
   [/AS runningLate/i, () => [totalsRow]],
   [/tbl_city/i, () => cityRows],
   [/action_taken_reason/i, () => reasonRows],
-  [/tbl_service_catg/i, () => catRows],
 ]);
 
 const router = require('../routes/client/index');
@@ -77,7 +75,10 @@ beforeEach(() => fake.reset());
 test('every aggregate shares ONE cohort window, on the creation date', async () => {
   await call('2026-07-01', '2026-08-25');
   const aggregates = fake.calls.filter((c) => /FROM tbl_job j/i.test(c.sql));
-  assert.equal(aggregates.length, 4, 'totals, cities, reasons, categories');
+  // Three, not four. The category breakdown of ALL work was removed from the
+  // Cancellations card on 2026-08-26 and its query went with it — an aggregate
+  // that runs for a payload nobody renders is pure latency.
+  assert.equal(aggregates.length, 3, 'totals, cities, reasons');
   for (const q of aggregates) {
     assert.match(q.sql, /j\.ticket_created_date_time >= \?/,
       'a query on a different date column breaks every percentage on the card');
@@ -96,10 +97,11 @@ test('`to` is inclusive, and expressed so the index stays usable', async () => {
 test('percentages reconcile against the cohort total', async () => {
   const d = await call();
   assert.equal(d.performance.total, 100);
-  assert.equal(d.cancellations.sharePct, 10, '10 of 100');
+  assert.equal(d.cancellations.cancelled, 10);
   // Reason % is of CANCELLED, not of all work — the card asks "of these, why".
   assert.equal(d.cancellations.topReasons[0].pct, 50, '5 of 10 cancellations');
-  assert.equal(d.cancellations.categories[0].pct, 96, '96 of 100 jobs');
+  assert.equal(d.cancellations.sharePct, undefined,
+    'removed with the card row that rendered it — a field nobody reads is a field that drifts');
 });
 
 test('top reasons are capped at 3, and reasonCount keeps the remainder honest', async () => {
@@ -113,20 +115,19 @@ test('top reasons are capped at 3, and reasonCount keeps the remainder honest', 
 
 test('an EMPTY window returns zeroes, never NaN', async () => {
   totalsRow = { total: 0, completed: 0, inProgress: 0, cancelled: 0, runningLate: 0, escalated: 0 };
-  cityRows = []; reasonRows = []; catRows = [];
+  cityRows = []; reasonRows = [];
   const d = await call();
   assert.equal(d.performance.total, 0);
-  assert.equal(d.cancellations.sharePct, 0, 'every pct divides by a count that can be 0');
+  assert.equal(d.cancellations.cancelled, 0, 'every pct divides by a count that can be 0');
   assert.deepEqual(d.cancellations.topReasons, []);
   assert.deepEqual(d.cities, []);
-  assert.ok(Number.isFinite(d.cancellations.sharePct));
 });
 
 test('a cancelled job with no recorded reason is LABELLED, not dropped', async () => {
   // "we don't know" is itself a finding when it is a large share of the total.
   totalsRow = { total: 10, completed: 0, inProgress: 0, cancelled: 4, runningLate: 0, escalated: 0 };
   reasonRows = [{ reason: 'Not recorded', n: 4 }];
-  cityRows = []; catRows = [];
+  cityRows = [];
   const d = await call();
   assert.equal(d.cancellations.topReasons[0].reason, 'Not recorded');
   assert.equal(d.cancellations.topReasons[0].pct, 100);
@@ -175,7 +176,7 @@ test('?city is applied to ALL four aggregates, or the percentages would lie', as
   const d = await callWith({ from: '2026-07-01', to: '2026-08-25', city: 'Bengaluru' });
   assert.equal(d.scope.city, 'Bengaluru');
   const aggregates = fake.calls.filter((c) => /FROM tbl_job j/i.test(c.sql));
-  assert.equal(aggregates.length, 4);
+  assert.equal(aggregates.length, 3);
   for (const q of aggregates) {
     assert.match(q.sql, /city_name = \?/,
       'a city-scoped numerator over a client-wide denominator is a wrong percentage');
