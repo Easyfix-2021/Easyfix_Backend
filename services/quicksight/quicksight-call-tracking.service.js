@@ -1027,7 +1027,14 @@ async function getCallTracking(filters = {}) {
   const [[tot]] = await pool.query(
     `SELECT ${CALL_AGG},
             COUNT(DISTINCT NULLIF(jci.job_id, 0)) AS unique_jobs,
-            COUNT(DISTINCT jci.caller_id)         AS unique_callers,
+            /*
+             * DISTINCT NULLIF(caller_id, 0), not DISTINCT caller_id: 0 is the
+             * "nobody here placed this" sentinel on legacy inbound rows, not a
+             * user id (see drillableUserId). Counting it added exactly one
+             * phantom caller to the tile for every window containing inbound
+             * traffic.
+             */
+            COUNT(DISTINCT NULLIF(jci.caller_id, 0)) AS unique_callers,
             /*
              * Inbound reach. MISSED is defined as duration = 0, NOT as
              * caller_status = 'OFF-HOUR' — see the header: caller_status is not
@@ -1532,6 +1539,170 @@ async function getCallTracking(filters = {}) {
   return { totals, byJob, byUser, byUserCombined, byOther, byDay };
 }
 
+
+/*
+ * ── GRAPHICAL VIEW, SCOPED TO THE ACTIVE TAB ───────────────────────────────
+ *
+ * The charts used to be derived in the browser from `byUser`, which meant they
+ * described ONE population — every call with a real caller — no matter which
+ * table was on screen. An operator on the Inbound tab read a donut and a trend
+ * built mostly out of outbound job calls, and the KPI tiles above them counted
+ * the whole window. The picture and the rows under it were answering different
+ * questions.
+ *
+ * These are the SAME aggregates, computed server-side over the tab's own
+ * population. Server-side and not a client filter for one reason that matters:
+ * `parties` and `steps` are per-CALL derivations (PARTY_ROLE compares numbers,
+ * the step is a per-row snapshot), and the response only carries them
+ * pre-summed against grains that no longer match the tab. Re-slicing them in
+ * the browser would mean re-deriving them from data that isn't there.
+ *
+ * ⚠ THIS IS A SEPARATE, LIGHT ENDPOINT — deliberately not a field on /summary.
+ * The row caps are gone (see the header), so /summary is now a very large
+ * response; refetching it on every tab click to move a donut would be a
+ * multi-megabyte round trip per click. These five queries are pure aggregates
+ * and return a few kilobytes whatever the window.
+ *
+ * Every one of them is built from the SAME buildScope as the tables, so a chart
+ * and the rows beneath it can never disagree about what the filters mean.
+ */
+const GRAIN_SCOPE = Object.freeze({
+  // The By Job table: calls that carry a real job id.
+  job: ' AND COALESCE(jci.job_id, 0) > 0',
+  // The By User table: every call SOMEBODY HERE placed, job or not. Its rows are
+  // exactly the ones REAL_CALLER admits, which is why it is that clause.
+  user: REAL_CALLER,
+  // The two halves of the no-job bucket, split the way the tabs split them.
+  direct: `${NO_JOB} AND ${DIRECTION} = 'OUT'`,
+  inbound: `${NO_JOB} AND ${DIRECTION} = 'IN'`,
+});
+const CHART_GRAINS = Object.freeze(Object.keys(GRAIN_SCOPE));
+
+/* Bars and slices stop being readable past ~10 categories. */
+const CHART_TOP_N = 10;
+
+async function getCallTrackingCharts(filters = {}, grain = 'job') {
+  const scope = GRAIN_SCOPE[grain];
+  // The route's Joi enum is generated from CHART_GRAINS, so this is a backstop
+  // for a direct caller — never a path a request can take.
+  if (scope == null) throw Object.assign(new Error(`Unknown chart grain '${grain}'`), { status: 400 });
+  logger.info('Call Tracking charts · grain=' + grain);
+
+  /*
+   * ⚠ unique_callers counts DISTINCT NULLIF(caller_id, 0), not DISTINCT
+   * caller_id. 0 is the "nobody here placed this" sentinel the legacy inbound
+   * writer stores (see drillableUserId) — counting it credits a whole window
+   * with one extra caller who does not exist, and on the Inbound grain, where
+   * every row carries it, it would print "1 caller" for calls nobody placed.
+   */
+  const sT = buildScope(filters);
+  const [[tot]] = await pool.query(
+    `SELECT ${CALL_AGG},
+            COUNT(DISTINCT NULLIF(jci.job_id, 0))    AS unique_jobs,
+            COUNT(DISTINCT NULLIF(jci.caller_id, 0)) AS unique_callers
+       ${sT.from} ${sT.where}${scope}`,
+    sT.params,
+  );
+
+  // Trend — gap-filled exactly like the summary's, over the same clamped axis.
+  const days = trendDays(filters);
+  const sD = buildScope({ ...filters, dateFrom: days[0], dateTo: days[days.length - 1] });
+  const [dayRows] = await pool.query(
+    `SELECT ${DAY_EXPR} AS day,
+            COUNT(*) AS calls,
+            COUNT(CASE WHEN COALESCE(jci.duration, 0) > 0 THEN 1 END) AS connected,
+            COUNT(DISTINCT NULLIF(jci.job_id, 0)) AS unique_jobs
+       ${sD.from} ${sD.where}${scope}
+      GROUP BY ${DAY_EXPR}`,
+    sD.params,
+  );
+  const dayMap = new Map(dayRows.map((r) => [r.day, r]));
+  const byDay = days.map((day) => {
+    const r = dayMap.get(day);
+    return { day, calls: n(r && r.calls), connected: n(r && r.connected), uniqueJobs: n(r && r.unique_jobs) };
+  });
+
+  // To whom — the same PARTY_ROLE the tables and the filter use.
+  const sP = buildScope(filters);
+  const [partyRows] = await pool.query(
+    `SELECT ${PARTY_ROLE} AS role, COUNT(*) AS calls
+       ${sP.from} ${sP.where}${scope}
+      GROUP BY ${PARTY_ROLE}
+      ORDER BY calls DESC`,
+    sP.params,
+  );
+
+  /*
+   * At which step — RESTRICTED TO CALLS THAT HAVE A JOB, on every grain.
+   *
+   * "Which step of the job lifecycle" is undefined for a call with no job: the
+   * snapshot column is NULL and jobStatusLabel folds it to 'Unknown'. The
+   * browser-side version had no such restriction, so its chart carried an
+   * 'Unknown' bar that was really "these calls had no job" — a bar labelled for
+   * our ignorance rather than for what it counted. On the two no-job grains
+   * this returns nothing and the chart correctly does not render.
+   */
+  const sS = buildScope(filters);
+  const [stepRows] = await pool.query(
+    `SELECT jci.job_status AS status,
+            ${ASSIGNED_AT_CALL} AS assignedFlag,
+            COUNT(*) AS calls
+       ${sS.from} ${sS.where}${scope}
+        AND COALESCE(jci.job_id, 0) > 0
+      GROUP BY jci.job_status, ${ASSIGNED_AT_CALL}
+      ORDER BY calls DESC`,
+    sS.params,
+  );
+
+  /*
+   * Top callers — people who PLACED calls, so REAL_CALLER always applies.
+   * (Redundant on the 'user' grain, which IS that clause; a repeated AND of the
+   * same predicate costs nothing and keeps the rule stated in one place rather
+   * than implied by which grain you happen to be on.) On the Inbound grain it
+   * correctly yields nothing: we placed none of those calls.
+   *
+   * LIMIT is a module constant, never interpolated input.
+   */
+  const sC = buildScope(filters);
+  const [callerRows] = await pool.query(
+    `SELECT jci.caller_id AS userId,
+            MAX(${CALLER_NAME}) AS userName,
+            COUNT(*) AS calls,
+            COUNT(CASE WHEN COALESCE(jci.duration, 0) > 0 THEN 1 END) AS connected
+       ${sC.from}
+       LEFT JOIN tbl_user u ON u.user_id = jci.caller_id
+       ${sC.where}${scope}${REAL_CALLER}
+      GROUP BY jci.caller_id
+      ORDER BY calls DESC
+      LIMIT ${CHART_TOP_N}`,
+    sC.params,
+  );
+
+  const out = {
+    grain,
+    totals: {
+      ...shapeAgg(tot),
+      uniqueJobs: n(tot && tot.unique_jobs),
+      uniqueCallers: n(tot && tot.unique_callers),
+    },
+    byDay,
+    // `value`, not `calls` — the donut's valueKey. Zero-call roles are dropped
+    // so the legend never describes a slice that isn't drawn.
+    parties: partyRows.map((r) => ({ name: r.role || 'Other', value: n(r.calls) })).filter((d) => d.value > 0),
+    // foldSteps collapses the (status, assignedFlag) split back to one entry per
+    // LABEL and sorts most-calls-first — the same fold the tables use.
+    steps: foldSteps(stepRows).slice(0, CHART_TOP_N).map((s) => ({ name: s.label, calls: s.calls })),
+    callers: callerRows.map((r) => ({
+      name: r.userName || `User #${n(r.userId)}`,
+      calls: n(r.calls),
+      connected: n(r.connected),
+    })),
+  };
+  logger.info('Call Tracking charts · grain=' + grain + ' · ' + out.totals.calls + ' calls · '
+    + out.byDay.length + ' trend days · ' + out.parties.length + ' party roles · '
+    + out.steps.length + ' steps · ' + out.callers.length + ' callers');
+  return out;
+}
 /*
  * Load the conference LEGS for one page of drill-down rows, in ONE query,
  * indexed by job_caller_info_id.
@@ -1940,11 +2111,15 @@ function toXlsx(data) {
 
 module.exports = {
   getCallTracking,
+  getCallTrackingCharts,
   getCallDetails,
   toXlsx,
   // Exposed so the route's Joi enums stay in lockstep with the derivation above.
   PARTY_ROLES,
   PROVIDERS,
+  // The Graphical View's tab scopes — the route's Joi enum reads this so a new
+  // tab cannot be accepted by validation before the SQL scope for it exists.
+  CHART_GRAINS,
   /*
    * Test seam — the pure averaging helper and the SQL fragment that produces its
    * denominator, plus the voice-vendor rule and the clauses derived from it, so

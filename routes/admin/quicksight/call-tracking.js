@@ -19,6 +19,13 @@
  *       numbers, never null; see the service header for what each counts and
  *       why conferenceBilledCalls is NOT a ratio against conferenceCalls).
  *
+ *   POST /api/admin/quicksight/call-tracking/charts
+ *     body: the SAME filters + { grain: 'job'|'user'|'direct'|'inbound' }
+ *     → { grain, totals, byDay, parties, steps, callers } — the Graphical View
+ *       aggregated over the ACTIVE TAB's calls, not the whole window. Its own
+ *       endpoint because /summary is uncapped and large; a tab click must not
+ *       refetch it to move a chart.
+ *
  *   POST /api/admin/quicksight/call-tracking/calls
  *     body: the SAME filters + { jobId? | selectedCallerId? | day? | noJob? }
  *     → { items: [per call, each with legs[]], capped }
@@ -259,6 +266,34 @@ const callsBody = withDateOrder(extendJobFilter({
    */
   noJob: Joi.boolean().optional(),
 }));
+
+/*
+ * POST /api/admin/quicksight/call-tracking/charts
+ *
+ * The Graphical View, scoped to the tab the operator is looking at. Body = the
+ * SAME filter schema as /summary plus { grain }.
+ *
+ * A SEPARATE endpoint on purpose. /summary now returns every row (the caps are
+ * gone), so it is a large response; switching a tab must not refetch it just to
+ * redraw a donut. This one is five pure aggregates and answers in kilobytes
+ * whatever the window — see the service's GRAIN_SCOPE block.
+ *
+ * The enum comes from the service so a grain cannot pass validation before the
+ * SQL scope that defines it exists.
+ */
+const chartsBody = withDateOrder(extendJobFilter({
+  ...FILTER_KEYS,
+  grain: Joi.string().valid(...service.CHART_GRAINS).required(),
+}));
+
+router.post('/charts', validate(chartsBody), async (req, res, next) => {
+  try {
+    const data = await service.getCallTrackingCharts(filtersOf(req.body), req.body.grain);
+    return modernOk(res, data);
+  } catch (e) {
+    next(e);
+  }
+});
 
 router.post('/calls', validate(callsBody), async (req, res, next) => {
   try {

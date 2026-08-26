@@ -41,10 +41,17 @@ const constOf = (name) => {
 };
 
 test('the caller is resolved by ONE shared expression, used at every site', () => {
-  // Five consumers: daily-by-user, combined-by-user, job-callers, other-calls,
-  // drill-down.
+  /*
+   * Six consumers: daily-by-user, combined-by-user, job-callers, other-calls,
+   * drill-down, and the charts' Top Callers bar.
+   *
+   * The count is a deliberate tripwire, not a tally worth keeping tidy. It goes
+   * red whenever a SEVENTH site starts naming a caller — which is precisely the
+   * moment somebody should check it reused this expression rather than writing
+   * COALESCE(u.user_name, …) again. Bump it only after reading the new site.
+   */
   const uses = (SRC.match(/\$\{CALLER_NAME\}/g) || []).length;
-  assert.equal(uses, 5, `expected all 5 consumers to use CALLER_NAME, found ${uses}`);
+  assert.equal(uses, 6, `expected all 6 consumers to use CALLER_NAME, found ${uses}`);
   // and none of them still carries the old inline form
   assert.equal(
     /COALESCE\(u\.user_name, jci\.caller_name\)/.test(SRC), false,
