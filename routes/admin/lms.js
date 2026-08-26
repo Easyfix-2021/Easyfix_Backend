@@ -74,6 +74,7 @@ const assignmentParams = Joi.object({
 const listCoursesQuery = Joi.object({
   q: Joi.string().allow('', null).optional(),
   includeInactive: Joi.boolean().default(false),
+  mandatoryOnly: Joi.boolean().default(false),
   limit: Joi.number().integer().min(1).max(1000).default(200),
   offset: Joi.number().integer().min(0).default(0),
   sortBy: Joi.string().valid(...Object.keys(svc.SORTABLE_COLUMNS)).default('name'),

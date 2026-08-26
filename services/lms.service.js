@@ -88,7 +88,7 @@ const REPORT_SORTABLE_COLUMNS = Object.freeze({
 // ─────────────────────────────────────────────────────────────────────
 
 async function listCourses({
-  q, includeInactive = false,
+  q, includeInactive = false, mandatoryOnly = false,
   limit = 200, offset = 0,
   sortBy = 'name', sortDir = 'asc',
 } = {}) {
@@ -96,6 +96,7 @@ async function listCourses({
   offset = Math.max(Number(offset) || 0, 0);
 
   logger.info('List courses · q=' + (q || '') + ' · includeInactive=' + includeInactive
+    + ' · mandatoryOnly=' + mandatoryOnly
     + ' · limit=' + limit + ' · offset=' + offset + ' · sortBy=' + sortBy + ' · sortDir=' + sortDir);
 
   const sortExpr = SORTABLE_COLUMNS[sortBy] || SORTABLE_COLUMNS.name;
@@ -104,6 +105,13 @@ async function listCourses({
   const where = ['1=1'];
   const params = [];
   if (!includeInactive) where.push('c.status = 1');
+  /*
+   * Answers "what is every technician held to?" — the one question the course
+   * list could not answer, and the one whose wrong answer is expensive.
+   * A plain WHERE rather than a sort key: is_mandatory is two values, so
+   * sorting by it just groups the list, while filtering removes the noise.
+   */
+  if (mandatoryOnly) where.push('c.is_mandatory = 1');
   if (q && String(q).trim()) {
     where.push('(c.name LIKE ? OR c.description LIKE ?)');
     params.push(`%${String(q).trim()}%`, `%${String(q).trim()}%`);
