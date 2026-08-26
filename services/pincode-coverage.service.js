@@ -176,6 +176,47 @@ async function getCoveredSet() {
   return new Set(covered);
 }
 
+/*
+ * HOW MANY dispatchable technicians cover each of `pincodes`?
+ * Returns Map<pincode, count>; a pincode with none is absent from the map.
+ *
+ * Manage Pincodes rendered "Local - 1 Technician" for every covered pincode,
+ * because its caller derived the figure as `covered.has(pin) ? 1 : 0` — a
+ * boolean wearing a count's clothes. It read as a real headcount on screen, so
+ * a pincode with forty technicians and one with a single technician looked
+ * identical, and the number was the one thing that column existed to say.
+ *
+ * ONE pass over the cached supply, not one call per pincode. Same cache as
+ * every other reader here, so this costs no query — and a technician is counted
+ * once per pincode however many of their entries match it.
+ */
+async function getCoverageCounts(pincodes) {
+  const wanted = new Set(normalise(pincodes));
+  if (!wanted.size) return new Map();
+  const { supply } = await loadSupply();
+  /*
+   * Sets of efr_id per pincode, collapsed to sizes at the end — NOT a running
+   * tally. One technician can reach the same pincode twice: once as their home
+   * pincode and again in their serviceable CSV, which are separate rows in the
+   * supply. Incrementing a counter double-counts that person, and a test caught
+   * exactly that. Identity is the thing being counted, so identity is what the
+   * structure has to hold.
+   */
+  const byPin = new Map();
+  for (const row of supply) {
+    if (!row.active) continue;
+    for (const pin of row.pins) {
+      if (!wanted.has(pin)) continue;
+      let ids = byPin.get(pin);
+      if (!ids) { ids = new Set(); byPin.set(pin, ids); }
+      ids.add(row.efrId);
+    }
+  }
+  const counts = new Map();
+  for (const [pin, ids] of byPin) counts.set(pin, ids.size);
+  return counts;
+}
+
 /* Single-pincode convenience. Same answer, same cache. */
 async function isCovered(pincode) {
   return (await getCoveredPincodes([pincode])).size > 0;
@@ -215,6 +256,7 @@ function invalidateCoverage() {
 module.exports = {
   getCoveredPincodes,
   getCoveredSet,
+  getCoverageCounts,
   getTechnicianIdsForPincodes,
   isCovered,
   invalidateCoverage,

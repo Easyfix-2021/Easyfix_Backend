@@ -58,12 +58,21 @@ async function pincodeIdToActiveEfrCount(pincodeIds) {
     `SELECT pincode_id, pincode FROM tbl_pincode WHERE pincode_id IN (${placeholders})`,
     pincodeIds,
   );
-  const covered = await coverage.getCoveredPincodes(rows.map((r) => r.pincode));
+  /*
+   * A REAL headcount, not `covered ? 1 : 0`. The old form was a boolean wearing
+   * a count's clothes: deriveStatus only branches on > 0, so it was sufficient
+   * for LOCAL/TRAVEL -- but the same value is rendered as "Local - N
+   * Technicians", where it always said 1. A pincode with forty technicians and
+   * one with a single technician looked identical, and the number is the whole
+   * point of that column.
+   *
+   * Still no extra query: getCoverageCounts walks the SAME cached supply in one
+   * pass and tallies per pincode.
+   */
+  const counts = await coverage.getCoverageCounts(rows.map((r) => r.pincode));
   const map = new Map();
   for (const r of rows) {
-    // The caller only branches on > 0 (deriveStatus), so a boolean-as-count is
-    // sufficient and avoids a second query purely to produce a headcount.
-    map.set(Number(r.pincode_id), covered.has(String(r.pincode).trim()) ? 1 : 0);
+    map.set(Number(r.pincode_id), counts.get(String(r.pincode).trim()) || 0);
   }
   return map;
 }

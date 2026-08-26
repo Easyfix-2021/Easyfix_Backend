@@ -184,3 +184,58 @@ test('a technician is counted once even when several of their pincodes match', a
   const ids = await coverage.getTechnicianIdsForPincodes(['560001', '560002', '560003']);
   assert.deepEqual([...ids], [50]);
 });
+
+/*
+ * ── A HEADCOUNT, NOT A BOOLEAN ────────────────────────────────────────────
+ *
+ * Manage Pincodes rendered "Local · 1 Technician" for every covered pincode.
+ * The FE pluralised correctly; it was simply always handed 1, because the
+ * backend derived the figure as `covered.has(pin) ? 1 : 0` — sufficient for the
+ * LOCAL/TRAVEL branch that only asks "> 0", and wrong for the column it was
+ * actually printed in. A pincode with four technicians and one with a single
+ * technician looked identical, and the number is what that column exists to say.
+ */
+test('counts every technician covering a pincode, not just the first', async () => {
+  scenario.home = [{ efr_id: 1, pin: '110001', ...ACTIVE }];
+  scenario.csv = [
+    { efr_id: 2, pincodes: '110001,560001', ...ACTIVE },
+    { efr_id: 3, pincodes: '110001', ...ACTIVE },
+  ];
+  const counts = await coverage.getCoverageCounts(['110001', '560001']);
+  assert.equal(counts.get('110001'), 3, 'one resident + two servicers');
+  assert.equal(counts.get('560001'), 1);
+});
+
+test('a technician is counted ONCE per pincode, however they reach it', async () => {
+  // Home pincode AND the same pincode in their serviceable CSV.
+  scenario.home = [{ efr_id: 7, pin: '110001', ...ACTIVE }];
+  scenario.csv = [{ efr_id: 7, pincodes: '110001,110001', ...ACTIVE }];
+  const counts = await coverage.getCoverageCounts(['110001']);
+  assert.equal(counts.get('110001'), 1, 'one person is one technician');
+});
+
+test('an uncovered pincode is ABSENT from the map, never 0-that-reads-as-covered', async () => {
+  scenario.csv = [{ efr_id: 2, pincodes: '560001', ...ACTIVE }];
+  const counts = await coverage.getCoverageCounts(['110001', '560001']);
+  assert.equal(counts.has('110001'), false);
+  assert.equal(counts.get('110001') ?? 0, 0);
+});
+
+test('inactive and unverified technicians are not counted', async () => {
+  scenario.csv = [
+    { efr_id: 2, pincodes: '110001', efr_status: 0, is_technician_verified: 1 },
+    { efr_id: 3, pincodes: '110001', efr_status: 1, is_technician_verified: 0 },
+    { efr_id: 4, pincodes: '110001', ...ACTIVE },
+  ];
+  const counts = await coverage.getCoverageCounts(['110001']);
+  assert.equal(counts.get('110001'), 1, 'only the dispatchable one counts');
+});
+
+test('the tally costs no extra query — same cached supply as everyone else', async () => {
+  scenario.home = [{ efr_id: 1, pin: '110001', ...ACTIVE }];
+  scenario.csv = [{ efr_id: 2, pincodes: '110001', ...ACTIVE }];
+  await coverage.getCoveredPincodes(['110001']);
+  const before = homeQueries + csvQueries;
+  await coverage.getCoverageCounts(['110001']);
+  assert.equal(homeQueries + csvQueries, before, 'no second read of the supply');
+});
