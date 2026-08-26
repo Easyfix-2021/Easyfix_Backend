@@ -168,15 +168,6 @@ const { buildInFilter, _dateHelpers } = require('./_shared');
 const { istToday, fmt, addDays } = _dateHelpers;
 const { jobStatusLabel } = require('../../utils/job-status-label');
 
-/*
- * A CALLER, not a sentinel. caller_id 0 means nobody on our side placed the
- * call — it is how every INBOUND row is written — and an inbound call has no
- * CRM user to attribute it to. Listing it here put a row called "Unattributed"
- * in a table OF USERS, which is a category error: it is not a quiet user, it
- * is the absence of one. Those calls are the Inbound tab's whole subject and
- * are counted there, in totals, and in Missed Inbound.
- */
-const REAL_CALLER = ' AND COALESCE(jci.caller_id, 0) > 0';
 
 /*
  * ─── THE ROW CAPS ARE GONE (2026-08-26) ──────────────────────────────────
@@ -670,6 +661,51 @@ const DAY_EXPR = `DATE_FORMAT(jci.inserted_time, '%Y-%m-%d')`;
 const DIRECTION = `CASE WHEN UPPER(COALESCE(jci.call_type, 'OUT')) = 'IN' THEN 'IN' ELSE 'OUT' END`;
 
 /*
+ * ⚠ caller_id IS A tbl_user ID ONLY ON AN OUTBOUND ROW.
+ *
+ * Measured on QA over 2025-01-01..2026-08-26, and the control is what makes it
+ * unarguable:
+ *
+ *   OUTBOUND   309,575 calls ·    535 distinct caller_id · 99.5% resolve to tbl_user
+ *   INBOUND     60,211 calls · 22,336 distinct caller_id ·   91% resolve to NEITHER
+ *                                                            tbl_user NOR tbl_easyfixer
+ *
+ * 535 distinct ids is a staff roster. 22,336 is a customer base. The legacy
+ * writer (EasyFix_API, the only place that stamps call_type 'IN') puts the
+ * identifier of whoever RANG US into the same column, from a different id
+ * space entirely.
+ *
+ * This is the FOURTH id-space collision in this codebase, and the most
+ * expensive kind: customer_id, efr_id and user_id are separate autoincrement
+ * sequences that overlap, so reading one as another returns a confident WRONG
+ * row rather than an error. 2,568 of those inbound calls collide numerically
+ * with a real tbl_user id and 4,436 with a technician — so before this, By User
+ * and Top Callers credited 623 NAMED members of staff with calls they never
+ * placed, and the name is exactly what made it look correct.
+ *
+ * The sentinel test the previous fix used (caller_id > 0) catches only the
+ * 11,170 rows written with a literal 0. DIRECTION is the property that actually
+ * decides it, so every surface that presents a caller identity reads these two
+ * and never jci.caller_id raw.
+ */
+const OUTBOUND_ONLY = ` AND ${DIRECTION} <> 'IN'`;
+
+/*
+ * A CALLER, not a sentinel and not somebody who rang US. An inbound call has no
+ * CRM user to attribute it to at all — those calls are the Inbound tab's whole
+ * subject and are counted there, in totals, and in Missed Inbound.
+ */
+const REAL_CALLER = ` AND COALESCE(jci.caller_id, 0) > 0${OUTBOUND_ONLY}`;
+
+/*
+ * The caller id as anything downstream may READ it: NULL unless this row is an
+ * outbound call placed by one of ours. Group by this rather than by
+ * jci.caller_id and every inbound row collapses into one honest "nobody here
+ * placed this" bucket instead of fanning out into thousands of phantom users.
+ */
+const CALLER_ID_EXPR = `CASE WHEN ${DIRECTION} = 'IN' THEN NULL ELSE NULLIF(jci.caller_id, 0) END`;
+
+/*
  * NO JOB ATTACHED — the exact complement of the byJob grain's
  * `AND COALESCE(jci.job_id, 0) > 0`, written ONCE because three places need it:
  * the byOther grain, its parties breakdown, and the drill-down's `noJob`
@@ -730,8 +766,13 @@ function buildScope(filters) {
   where += buildInFilter('j.fk_client_id', filters.clientId, params);
   where += buildInFilter('c.vertical_id', filters.verticalId, params);
   where += buildInFilter('j.fk_service_catg_id', filters.serviceCategoryId, params);
-  // Who MADE the call — tbl_user ids on jci.caller_id.
-  where += buildInFilter('jci.caller_id', filters.callerId, params);
+  /*
+   * Who MADE the call. Filtered through CALLER_ID_EXPR, not the raw column:
+   * caller_id is a tbl_user id only on an outbound row, so a filter on the raw
+   * column also matches every inbound row whose foreign id collides with the
+   * selected user's — measured at 2,568 such calls on QA.
+   */
+  where += buildInFilter(CALLER_ID_EXPR, filters.callerId, params);
   // Voice provider — see PROVIDER_CLAUSE for why 'kaleyra' is "not Plivo"
   // rather than a literal column match. No placeholder: the clause is a fixed
   // string chosen from a frozen allow-list, never interpolated user input.
@@ -1034,7 +1075,7 @@ async function getCallTracking(filters = {}) {
              * phantom caller to the tile for every window containing inbound
              * traffic.
              */
-            COUNT(DISTINCT NULLIF(jci.caller_id, 0)) AS unique_callers,
+            COUNT(DISTINCT ${CALLER_ID_EXPR}) AS unique_callers,
             /*
              * Inbound reach. MISSED is defined as duration = 0, NOT as
              * caller_status = 'OFF-HOUR' — see the header: caller_status is not
@@ -1163,7 +1204,7 @@ async function getCallTracking(filters = {}) {
   const [otherRows] = await pool.query(
     `SELECT ${DAY_EXPR} AS day,
             ${DIRECTION} AS direction,
-            jci.caller_id AS userId,
+            ${CALLER_ID_EXPR} AS userId,
             MAX(${CALLER_NAME}) AS userName,
             ${CALL_AGG},
             MIN(jci.inserted_time) AS firstCallAt,
@@ -1171,7 +1212,7 @@ async function getCallTracking(filters = {}) {
        ${sO.from}
        LEFT JOIN tbl_user u ON u.user_id = jci.caller_id
        ${sO.where}${NO_JOB}
-      GROUP BY ${DAY_EXPR}, ${DIRECTION}, jci.caller_id
+      GROUP BY ${DAY_EXPR}, ${DIRECTION}, ${CALLER_ID_EXPR}
       ORDER BY day DESC, calls DESC`,
     sO.params,
   );
@@ -1196,19 +1237,21 @@ async function getCallTracking(filters = {}) {
     const sC = buildScope(filters);
     const [callerRows] = await pool.query(
       `SELECT jci.job_id AS jobId,
-              jci.caller_id AS userId,
-              MAX(${CALLER_NAME}) AS userName,
+              ${CALLER_ID_EXPR} AS userId,
+              MAX(CASE WHEN ${DIRECTION} = 'IN' THEN NULL ELSE ${CALLER_NAME} END) AS userName,
               COUNT(*) AS calls
          ${sC.from}
          LEFT JOIN tbl_user u ON u.user_id = jci.caller_id
          ${sC.where} AND jci.job_id IN (${jobIn})
-        GROUP BY jci.job_id, jci.caller_id
+        GROUP BY jci.job_id, ${CALLER_ID_EXPR}
         ORDER BY jci.job_id, calls DESC`,
       [...sC.params, ...jobIds],
     );
     callersByJob = groupBy(callerRows, jobKey, (r) => ({
       userId: drillableUserId(r.userId),
-      userName: r.userName || (drillableUserId(r.userId) == null ? 'Unattributed' : `User #${n(r.userId)}`),
+      // A NULL caller here is an INBOUND call on this job — somebody rang US
+      // about it. Naming it for the column it lacks told an operator nothing.
+      userName: r.userName || (drillableUserId(r.userId) == null ? 'Incoming call' : `User #${n(r.userId)}`),
       calls: n(r.calls),
     }));
 
@@ -1255,7 +1298,7 @@ async function getCallTracking(filters = {}) {
     const [upRows] = await pool.query(
       `SELECT ${DAY_EXPR} AS day, jci.caller_id AS userId, ${PARTY_ROLE} AS role, COUNT(*) AS calls
          ${sUP.from}
-         ${sUP.where} AND jci.caller_id IN (${userIn})
+         ${sUP.where}${REAL_CALLER} AND jci.caller_id IN (${userIn})
         GROUP BY ${DAY_EXPR}, jci.caller_id, ${PARTY_ROLE}
         ORDER BY day, jci.caller_id, calls DESC`,
       [...sUP.params, ...userIds],
@@ -1267,7 +1310,7 @@ async function getCallTracking(filters = {}) {
       `SELECT ${DAY_EXPR} AS day, jci.caller_id AS userId, jci.job_status AS status,
               ${ASSIGNED_AT_CALL} AS assignedFlag, COUNT(*) AS calls
          ${sUS.from}
-         ${sUS.where} AND jci.caller_id IN (${userIn})
+         ${sUS.where}${REAL_CALLER} AND jci.caller_id IN (${userIn})
         GROUP BY ${DAY_EXPR}, jci.caller_id, jci.job_status, ${ASSIGNED_AT_CALL}
         ORDER BY day, jci.caller_id, calls DESC`,
       [...sUS.params, ...userIds],
@@ -1301,7 +1344,7 @@ async function getCallTracking(filters = {}) {
     const [cpRows] = await pool.query(
       `SELECT jci.caller_id AS userId, ${PARTY_ROLE} AS role, COUNT(*) AS calls
          ${sCP.from}
-         ${sCP.where} AND jci.caller_id IN (${combIn})
+         ${sCP.where}${REAL_CALLER} AND jci.caller_id IN (${combIn})
         GROUP BY jci.caller_id, ${PARTY_ROLE}
         ORDER BY jci.caller_id, calls DESC`,
       [...sCP.params, ...combinedUserIds],
@@ -1313,7 +1356,7 @@ async function getCallTracking(filters = {}) {
       `SELECT jci.caller_id AS userId, jci.job_status AS status,
               ${ASSIGNED_AT_CALL} AS assignedFlag, COUNT(*) AS calls
          ${sCS.from}
-         ${sCS.where} AND jci.caller_id IN (${combIn})
+         ${sCS.where}${REAL_CALLER} AND jci.caller_id IN (${combIn})
         GROUP BY jci.caller_id, jci.job_status, ${ASSIGNED_AT_CALL}
         ORDER BY jci.caller_id, calls DESC`,
       [...sCS.params, ...combinedUserIds],
@@ -1339,22 +1382,31 @@ async function getCallTracking(filters = {}) {
    * tbl_easyfixer is the obvious next ask for a tab about staff direct calls —
    * this tab starts telling the truth without anyone remembering it exists.
    */
+  /*
+   * The key is (day, direction, CALLER_ID_EXPR) — the same three expressions the
+   * grain above groups by, so a row and its breakdown cannot disagree about
+   * which bucket they belong to. `n()` folds a NULL caller to 0 on BOTH sides.
+   *
+   * ⚠ NO `IN (...)` RESTRICTION, unlike the job-keyed breakdowns. The key is
+   * NULLABLE now (every inbound row carries a NULL caller), and NULL never
+   * satisfies IN — the whole inbound half of this tab would silently lose its
+   * "To Whom" column. The restriction only ever existed to avoid fetching
+   * breakdowns for rows a cap had dropped, and the caps are gone: this query is
+   * scoped by exactly the same window and NO_JOB predicate as the grain, so it
+   * returns those keys and no others.
+   */
   let partiesByOther = new Map();
   const otherKey = (r) => `${r.day}|${r.direction}|${n(r.userId)}`;
-  // caller_id 0 is a legitimate VALUE here (the legacy inbound rows), not an
-  // absent id — it is filtered out of the drillable id, never out of the query.
-  const otherCallerIds = [...new Set(otherRows.map((r) => n(r.userId)))];
-  if (otherCallerIds.length > 0) {
+  if (otherRows.length > 0) {
     const sOP = buildScope(filters);
-    const otherIn = otherCallerIds.map(() => '?').join(',');
     const [opRows] = await pool.query(
-      `SELECT ${DAY_EXPR} AS day, ${DIRECTION} AS direction, jci.caller_id AS userId,
+      `SELECT ${DAY_EXPR} AS day, ${DIRECTION} AS direction, ${CALLER_ID_EXPR} AS userId,
               ${PARTY_ROLE} AS role, COUNT(*) AS calls
          ${sOP.from}
-         ${sOP.where}${NO_JOB} AND jci.caller_id IN (${otherIn})
-        GROUP BY ${DAY_EXPR}, ${DIRECTION}, jci.caller_id, ${PARTY_ROLE}
-        ORDER BY day, direction, jci.caller_id, calls DESC`,
-      [...sOP.params, ...otherCallerIds],
+         ${sOP.where}${NO_JOB}
+        GROUP BY ${DAY_EXPR}, ${DIRECTION}, ${CALLER_ID_EXPR}, ${PARTY_ROLE}
+        ORDER BY day, direction, userId, calls DESC`,
+      sOP.params,
     );
     partiesByOther = groupBy(opRows, otherKey, (r) => ({ role: r.role || 'Other', calls: n(r.calls) }));
   }
@@ -1599,7 +1651,7 @@ async function getCallTrackingCharts(filters = {}, grain = 'job') {
   const [[tot]] = await pool.query(
     `SELECT ${CALL_AGG},
             COUNT(DISTINCT NULLIF(jci.job_id, 0))    AS unique_jobs,
-            COUNT(DISTINCT NULLIF(jci.caller_id, 0)) AS unique_callers
+            COUNT(DISTINCT ${CALLER_ID_EXPR}) AS unique_callers
        ${sT.from} ${sT.where}${scope}`,
     sT.params,
   );
@@ -1665,14 +1717,14 @@ async function getCallTrackingCharts(filters = {}, grain = 'job') {
    */
   const sC = buildScope(filters);
   const [callerRows] = await pool.query(
-    `SELECT jci.caller_id AS userId,
+    `SELECT ${CALLER_ID_EXPR} AS userId,
             MAX(${CALLER_NAME}) AS userName,
             COUNT(*) AS calls,
             COUNT(CASE WHEN COALESCE(jci.duration, 0) > 0 THEN 1 END) AS connected
        ${sC.from}
        LEFT JOIN tbl_user u ON u.user_id = jci.caller_id
        ${sC.where}${scope}${REAL_CALLER}
-      GROUP BY jci.caller_id
+      GROUP BY ${CALLER_ID_EXPR}
       ORDER BY calls DESC
       LIMIT ${CHART_TOP_N}`,
     sC.params,
@@ -1804,7 +1856,13 @@ async function getCallDetails(filters = {}, selection = {}) {
   const params = [...s.params];
 
   if (selection.jobId != null) { where += ' AND jci.job_id = ?'; params.push(Number(selection.jobId)); }
-  if (selection.selectedCallerId != null) { where += ' AND jci.caller_id = ?'; params.push(Number(selection.selectedCallerId)); }
+  if (selection.selectedCallerId != null) {
+    // CALLER_ID_EXPR, not the raw column — the count this drill was opened from
+    // is derived that way, and a list that disagrees with its own number is the
+    // one thing this endpoint exists to prevent.
+    where += ` AND ${CALLER_ID_EXPR} = ?`;
+    params.push(Number(selection.selectedCallerId));
+  }
   /*
    * The Other Calls tab's counts, made clickable. The SAME predicate the
    * byOther grain is built on (NO_JOB), which is the whole reason the numbers
@@ -1830,7 +1888,7 @@ async function getCallDetails(filters = {}, selection = {}) {
     where += ` AND ${DIRECTION} = ?`;
     params.push(selection.direction);
   }
-  if (selection.unattributed) where += ' AND COALESCE(jci.caller_id, 0) = 0';
+  if (selection.unattributed) where += ` AND ${CALLER_ID_EXPR} IS NULL`;
   if (selection.day) {
     // Narrows WITHIN the scope window (never widens it) — a single IST day.
     where += ' AND jci.inserted_time >= ?';
@@ -1843,9 +1901,19 @@ async function getCallDetails(filters = {}, selection = {}) {
     `SELECT jci.job_caller_info AS id,
             jci.job_id          AS jobId,
             jci.inserted_time   AS callAt,
-            jci.caller_id       AS callerUserId,
-            ${CALLER_NAME}      AS callerName,
-            ${CALLER_KIND}      AS callerKind,
+            /*
+             * Direction-aware, like every other caller surface: on an INBOUND
+             * row caller_id is the id of whoever rang US, from a different id
+             * space, and CALLER_NAME would resolve it against tbl_user /
+             * tbl_easyfixer and print a colleague's name beside a call they had
+             * nothing to do with. The row still shows WHO rang in — that is
+             * receiverName, derived from the number, which is the one
+             * identification on an inbound row we can actually stand behind.
+             */
+            ${CALLER_ID_EXPR}   AS callerUserId,
+            CASE WHEN ${DIRECTION} = 'IN' THEN NULL ELSE ${CALLER_NAME} END AS callerName,
+            CASE WHEN ${DIRECTION} = 'IN' THEN 'inbound' ELSE ${CALLER_KIND} END AS callerKind,
+            ${DIRECTION}        AS direction,
             ${PARTY_NAME}       AS receiverName,
             ${PARTY_ROLE}       AS partyRole,
             jci.job_status      AS jobStatusAtCall,
@@ -1864,10 +1932,37 @@ async function getCallDetails(filters = {}, selection = {}) {
             ${PROVIDER_RULE.namedFlag} AS providerNamedFlag,
             ${PROVIDER_RULE.value}     AS providerRaw,
             jci.caller_status   AS callerStatus,
-            -- Whether a recording key was ever stored. The key itself is NOT
-            -- returned: playback goes through the existing authorised call-audio
-            -- endpoint, which is where that permission check lives.
-            CASE WHEN jci.recording IS NOT NULL AND TRIM(jci.recording) <> '' THEN 1 ELSE 0 END AS recordingFlag
+            /*
+             * Whether the ▶ button should be OFFERED — i.e. whether
+             * GET /admin/calls/:id/recording can actually answer. The key itself
+             * is never returned: playback goes through that authorised endpoint,
+             * which is where the permission check lives.
+             *
+             * ⚠ THIS IS NOT "the recording column is non-empty", which is what it
+             * used to be, and the difference was visible to operators as a play
+             * button that answered "No recording available for this call". The
+             * endpoint needs an https URL, one of OUR S3 keys, or a Plivo call it
+             * can lazily pull by uuid — a Kaleyra row whose recording column
+             * holds anything else 404s. It was wrong in the other direction too:
+             * a Plivo row with an empty column but a live unique_id says "No"
+             * while the endpoint would have pulled the file happily.
+             *
+             * The one case SQL cannot settle is an S3 key whose object has since
+             * gone; the endpoint falls through to a 404 there, and the button
+             * turns itself into "No" when that happens (see ListenButton).
+             *
+             * Deliberately does NOT probe tbl_plivo_call_log.recording_url. That
+             * column is behind a migration the endpoint guards with try/catch,
+             * and a hard reference here would 500 the whole drill-down on a
+             * pre-migration deploy. Nothing is lost: a row with a pushed URL is a
+             * Plivo call, so it already has a unique_id and matches the arm below.
+             */
+            CASE
+              WHEN jci.recording LIKE 'http%' THEN 1
+              WHEN jci.recording LIKE 'CallRecordings/%' THEN 1
+              WHEN ${PROVIDER_IS_PLIVO} AND NULLIF(TRIM(jci.unique_id), '') IS NOT NULL THEN 1
+              ELSE 0
+            END AS recordingFlag
        ${s.from}
        LEFT JOIN tbl_user u ON u.user_id = jci.caller_id
        ${where}
@@ -1897,7 +1992,16 @@ async function getCallDetails(filters = {}, selection = {}) {
       jobId: r.jobId == null ? null : n(r.jobId),
       callAt: r.callAt || null,
       callerUserId: r.callerUserId == null ? null : n(r.callerUserId),
-      callerName: r.callerName || `User #${n(r.callerUserId)}`,
+      /*
+       * 'Incoming call' when there is no caller of OURS — an inbound row. The
+       * previous fallback printed "User #0" there, inventing a user id for a
+       * call nobody here placed.
+       */
+      callerName: r.callerName
+        || (r.callerUserId == null ? 'Incoming call' : `User #${n(r.callerUserId)}`),
+      // 'IN' | 'OUT' — the property that decides whether callerUserId means
+      // anything at all, carried so a consumer never has to infer it.
+      direction: r.direction === 'IN' ? 'IN' : 'OUT',
       /*
        * WHICH table answered — 'user' | 'technician' | 'unresolved'. The id
        * alone cannot say: caller_id holds a tbl_user id on rows this backend

@@ -94,7 +94,13 @@ test('the drill-down says WHICH namespace answered, so the id stops asserting a 
   assert.match(k, /WHEN u\.user_id IS NOT NULL THEN 'user'/);
   assert.match(k, /THEN 'technician'/);
   assert.match(k, /ELSE 'unresolved'/);
-  assert.match(SRC, /\$\{CALLER_KIND\}\s+AS callerKind/);
+  /*
+   * CALLER_KIND is now reached through a direction guard — on an INBOUND row
+   * caller_id belongs to a different id space entirely (see OUTBOUND_ONLY), so
+   * resolving it against tbl_user / tbl_easyfixer names a colleague who had
+   * nothing to do with the call. 'inbound' is the honest namespace there.
+   */
+  assert.match(SRC, /THEN 'inbound' ELSE \$\{CALLER_KIND\} END\s+AS callerKind/);
   assert.match(SRC, /callerKind: r\.callerKind \|\| 'unresolved'/);
 });
 
