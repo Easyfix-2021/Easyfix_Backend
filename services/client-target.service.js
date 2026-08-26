@@ -118,7 +118,8 @@ async function getTargets(clientId, opts = {}) {
 /**
  * Judge a measured value against its target.
  * Returns 'ok' | 'watch' | 'risk' — the three states the Performance table
- * renders as On Track / Watch / At Risk.
+ * renders as On Track / Watch / At Risk — or NULL when there is nothing to
+ * judge.
  *
  * `watch` is the band within 10% (relative) of the target on the wrong side.
  * Anything worse is `risk`. One rule for both directions so a metric cannot be
@@ -130,7 +131,23 @@ function judge(metric, value) {
 }
 
 function judgeAgainst(metric, value, target) {
-  if (value == null || target == null) return 'ok';
+  /*
+   * ⚠ NULL, NOT 'ok'. This returned 'ok' — the SUCCESS state — whenever there
+   * was no value to judge, so a window with zero completed jobs rendered four
+   * KPIs reading "—" behind a GREEN on-track rule. Nothing was on track; there
+   * was simply nothing measured, and green is a claim about performance that
+   * no data supports.
+   *
+   * This file's sibling rule already said so: judgeRow() in the portal's
+   * performance page returns null for an unscored rollup row because "a row
+   * with nothing to score is not on track, it is unknown, and the table says
+   * so". The headline KPIs now follow the rule their own breakdown table
+   * follows.
+   *
+   * Callers must handle null. Every one of them today is a *Status field on
+   * GET /performance, and the portal maps a null status to its neutral accent.
+   */
+  if (value == null || target == null) return null;
   const higherIsBetter = TARGET_DIRECTION[metric] !== 'lower';
   const met = higherIsBetter ? value >= target : value <= target;
   if (met) return 'ok';

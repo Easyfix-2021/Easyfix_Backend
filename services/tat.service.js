@@ -920,7 +920,7 @@ async function forClient(clientId, days = CLIENT_LOOKBACK_DAYS) {
  * `to` is inclusive: the caller passes a date, and a job checked out at 18:40
  * on that date belongs to it.
  */
-async function forClientWindow({ clientId, from, to, reportingContactIds }) {
+async function forClientWindow({ clientId, from, to, reportingContactIds, city }) {
   const [[client]] = await pool.query('SELECT client_id, client_name FROM tbl_client WHERE client_id = ?', [clientId]);
   if (!client) {
     const e = new Error('Client not found');
@@ -934,9 +934,22 @@ async function forClientWindow({ clientId, from, to, reportingContactIds }) {
     scope = ` AND j.reporting_contact_id IN (${reportingContactIds.map(() => '?').join(',')})`;
     params.push(...reportingContactIds);
   }
+  /*
+   * City costs NO extra join: JOB_SELECT already LEFT JOINs tbl_address and
+   * tbl_city (aliased `city`) because the projection reports city_name and
+   * tier. The filter is a WHERE clause on a column the query already reads,
+   * which is why the client dashboard can finally scope these KPIs the same
+   * way it scopes every other card on that page.
+   */
+  const cityName = String(city || '').trim();
+  if (cityName) {
+    scope += ' AND city.city_name = ?';
+    params.push(cityName);
+  }
 
   logger.info('TAT compute · client-window · id=' + clientId + ' · ' + from + '..' + to
-    + (scope ? ' · subtree=' + reportingContactIds.length : ' · all'));
+    + (cityName ? ' · city=' + cityName : '')
+    + (Array.isArray(reportingContactIds) && reportingContactIds.length ? ' · subtree=' + reportingContactIds.length : ' · all'));
 
   return aggregate({
     sql: `${JOB_SELECT}

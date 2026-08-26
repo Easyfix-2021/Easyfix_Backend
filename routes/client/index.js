@@ -365,9 +365,22 @@ router.get('/performance', requireGrant('performance'), async (req, res, next) =
 
     const hier = await resolveClientHierarchy(req);
     const reportingContactIds = req.access && req.access.allStores ? undefined : hierarchyFilter(hier, req);
-    const scope = { clientId: req.spoc.client_id, from, to, reportingContactIds };
+    /*
+     * ?city= — added 2026-08-26 so the client dashboard's Performance health
+     * card obeys the same city chip its three neighbours do. Before this the
+     * card had to print "not narrowed by the city filter" beside itself,
+     * because /performance had no city dimension at all and would have ignored
+     * the chip silently.
+     *
+     * Matched on NAME, not id, because that is what GET /cities offers the
+     * picker — it is DISTINCT over the client's own jobs, so an unknown value
+     * selects nothing rather than reaching another tenant, and it is
+     * parameterised regardless.
+     */
+    const city = String(req.query.city || '').trim();
+    const scope = { clientId: req.spoc.client_id, from, to, reportingContactIds, city };
 
-    logger.info('Fetch client performance · clientId=' + req.spoc.client_id + ' · ' + from + '..' + to + ' · dim=' + dim);
+    logger.info('Fetch client performance · clientId=' + req.spoc.client_id + ' · ' + from + '..' + to + ' · dim=' + dim + (city ? ' · city=' + city : ''));
 
     const targets = await getTargets(req.spoc.client_id);
     // Independent reads — run them together. The TAT engine is the heavy one

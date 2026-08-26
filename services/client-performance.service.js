@@ -74,9 +74,17 @@ function closedWindowClause() {
  * @param mode 'closed'    — completed OR cancelled in the window (two branches)
  *             'completed' — completed only, so a single bare-column range
  */
-function scopeWhere({ clientId, from, to, reportingContactIds }, mode = 'closed') {
+function scopeWhere({ clientId, from, to, reportingContactIds, city }, mode = 'closed') {
   const params = [clientId];
   let clause = 'J.fk_client_id = ?';
+  /*
+   * `join` is returned ALONGSIDE the clause because these queries select
+   * `FROM tbl_job J` with no address join of their own — unlike the TAT
+   * engine, whose projection already reads city_name. A caller that
+   * interpolates the clause without the join gets a 500 on an unknown alias,
+   * so the two travel together and every caller spreads both.
+   */
+  let join = '';
 
   if (from && to) {
     if (mode === 'completed') {
@@ -92,7 +100,14 @@ function scopeWhere({ clientId, from, to, reportingContactIds }, mode = 'closed'
     clause += ` AND J.reporting_contact_id IN (${reportingContactIds.map(() => '?').join(',')})`;
     params.push(...reportingContactIds);
   }
-  return { clause, params };
+  const cityName = String(city || '').trim();
+  if (cityName) {
+    join = ` LEFT JOIN tbl_address AD ON AD.address_id = J.fk_address_id
+             LEFT JOIN tbl_city    CI ON CI.city_id    = AD.city_id`;
+    clause += ' AND CI.city_name = ?';
+    params.push(cityName);
+  }
+  return { clause, params, join };
 }
 
 /**
@@ -100,7 +115,7 @@ function scopeWhere({ clientId, from, to, reportingContactIds }, mode = 'closed'
  * One query — these three numbers always appear together on the page.
  */
 async function closureStats(scope) {
-  const { clause, params } = scopeWhere(scope, 'closed');
+  const { clause, params, join } = scopeWhere(scope, 'closed');
   // `|| {}` guards the destructure: a GROUP-less aggregate always yields one
   // row in MySQL, but a driver returning none would otherwise throw here
   // rather than degrade.
@@ -110,7 +125,7 @@ async function closureStats(scope) {
       SUM(CASE WHEN J.job_status = ${CANCELLED_STATUS} THEN 1 ELSE 0 END)    AS cancelled,
       AVG(CASE WHEN J.job_status IN ${COMPLETED_STATUSES}
                THEN TIMESTAMPDIFF(HOUR, J.ticket_created_date_time, J.checkout_date_time) / 24.0 END) AS avg_age_days
-    FROM tbl_job J
+    FROM tbl_job J${join}
     WHERE ${clause}`, params);
   const row = rows[0] || {};
 
@@ -154,11 +169,11 @@ async function firstTimeFix(scope) {
   if (!(await hasLinkedJob())) {
     return { ftfrPct: null, revisitPct: null, available: false };
   }
-  const { clause, params } = scopeWhere(scope, 'completed');
+  const { clause, params, join } = scopeWhere(scope, 'completed');
   const [rows] = await pool.query(`
     SELECT COUNT(*) AS completed,
            SUM(CASE WHEN lj.parent_job_id IS NULL THEN 1 ELSE 0 END) AS first_time_fixed
-      FROM tbl_job J
+      FROM tbl_job J${join}
       LEFT JOIN (SELECT DISTINCT parent_job_id FROM linked_job) lj ON lj.parent_job_id = J.job_id
      WHERE ${clause}`, params);
   const row = rows[0] || {};
@@ -191,9 +206,26 @@ async function volume(scope, months = 6) {
   const n = Number.isFinite(raw) && raw > 0 ? Math.min(Math.trunc(raw), 24) : 6;
   const params = [scope.clientId];
   let clause = 'J.fk_client_id = ?';
+  let join = '';
   if (Array.isArray(scope.reportingContactIds) && scope.reportingContactIds.length) {
     clause += ` AND J.reporting_contact_id IN (${scope.reportingContactIds.map(() => '?').join(',')})`;
     params.push(...scope.reportingContactIds);
+  }
+  /*
+   * City applies here too, even though this series deliberately ignores the
+   * WINDOW ("Rolling, not this period" on the page). Those are different
+   * decisions: the span is intentionally wider than the selection, but the
+   * SUBJECT must not be — a trend for the whole client sitting under KPIs
+   * scoped to one city would be two populations on one card. No caller drives
+   * a city here yet; leaving the one scope-blind query in a service that now
+   * takes city is how they drift apart later.
+   */
+  const cityName = String(scope.city || '').trim();
+  if (cityName) {
+    join = ` LEFT JOIN tbl_address AD ON AD.address_id = J.fk_address_id
+             LEFT JOIN tbl_city    CI ON CI.city_id    = AD.city_id`;
+    clause += ' AND CI.city_name = ?';
+    params.push(cityName);
   }
 
   /*
@@ -206,7 +238,7 @@ async function volume(scope, months = 6) {
     SELECT DATE_FORMAT(COALESCE(J.checkout_date_time, J.cancel_date_time), '%Y-%m') AS ym,
            SUM(CASE WHEN J.job_status IN ${COMPLETED_STATUSES} THEN 1 ELSE 0 END) AS completed,
            SUM(CASE WHEN J.job_status = ${CANCELLED_STATUS} THEN 1 ELSE 0 END)    AS cancelled
-      FROM tbl_job J
+      FROM tbl_job J${join}
      WHERE ${clause}
        AND (
          (J.job_status IN ${COMPLETED_STATUSES} AND J.checkout_date_time >= DATE_SUB(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL ${n - 1} MONTH))

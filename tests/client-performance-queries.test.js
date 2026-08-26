@@ -193,3 +193,104 @@ test('the TAT engine exposes the windowed client mode the portal depends on', ()
   // forClient stays — it is what the admin TAT Calculator uses.
   assert.equal(typeof tat.forClient, 'function');
 });
+
+/* ── ?city= (2026-08-26) ─────────────────────────────────────────────
+ *
+ * Added so the client dashboard's Performance health card obeys the same city
+ * chip its three neighbours do. Before this the card had to print a note
+ * admitting the chip did not reach it, because /performance had no city
+ * dimension and would have ignored the parameter silently.
+ */
+
+test('forClientWindow filters on city WITHOUT adding a join — JOB_SELECT already has one', async () => {
+  fake.reset();
+  await tat.forClientWindow({ ...SCOPE, city: 'Bengaluru' });
+
+  const q = lastMatching(/FROM tbl_job j/i);
+  assert.match(q.sql, /AND city\.city_name = \?/, 'the filter must apply');
+  assert.ok(q.params.includes('Bengaluru'), 'and be a BOUND parameter, never interpolated');
+  // The projection already reports city_name and tier, so the join exists.
+  // A second one would silently double every scored row.
+  const joins = q.sql.match(/LEFT JOIN tbl_city/gi) || [];
+  assert.equal(joins.length, 1, 'exactly one tbl_city join — a duplicate would double-count');
+});
+
+test('an absent city adds no clause at all', async () => {
+  fake.reset();
+  await tat.forClientWindow(SCOPE);
+  const q = lastMatching(/FROM tbl_job j/i);
+  assert.doesNotMatch(q.sql, /city_name = \?/, 'no city means no predicate, not an empty string match');
+  assert.deepEqual(q.params, [42, '2026-08-01', '2026-08-20']);
+});
+
+test('closureStats brings its OWN join when scoped by city', async () => {
+  // Unlike the TAT engine these select FROM tbl_job with no address join, so a
+  // clause referencing CI without the join is a 500 on an unknown alias.
+  fake.reset();
+  await perf.closureStats({ ...SCOPE, city: 'Pune' });
+  const q = lastMatching(/SUM\(CASE WHEN J\.job_status IN/i);
+  assert.ok(q, 'the aggregate should have run');
+  assert.match(q.sql, /LEFT JOIN tbl_address AD/i, 'the join must travel with the clause');
+  assert.match(q.sql, /LEFT JOIN tbl_city\s+CI/i, 'and reach tbl_city');
+  assert.match(q.sql, /CI\.city_name = \?/, 'the predicate itself');
+  assert.ok(q.params.includes('Pune'), 'bound, not interpolated');
+});
+
+test('EVERY scopeWhere consumer interpolates the join it is handed', () => {
+  /*
+   * Asserted against the SOURCE rather than by running each query, because
+   * firstTimeFix short-circuits on a memoised `SHOW TABLES LIKE 'linked_job'`
+   * probe and would need its own module registry to reach its SQL — a lot of
+   * scaffolding to catch a one-token omission.
+   *
+   * This is the real failure mode: scopeWhere returns { clause, params, join }
+   * and a caller that destructures the first two and forgets the third emits a
+   * WHERE on an alias nothing joined. It 500s only when a city is actually
+   * selected, so it would pass every unscoped test in this file.
+   */
+  const src = require('fs').readFileSync(
+    require('path').join(__dirname, '..', 'services/client-performance.service.js'), 'utf8');
+  const consumers = src.match(/const \{[^}]*\} = scopeWhere\(/g) || [];
+  assert.ok(consumers.length >= 2, 'expected closureStats and firstTimeFix at least');
+  for (const c of consumers) {
+    assert.match(c, /\bjoin\b/,
+      `a scopeWhere consumer ignores the join it is given: ${c.trim()}`);
+  }
+  /*
+   * And every FROM tbl_job J must carry it — scanned over CODE ONLY. The first
+   * pass counted a comment that quotes "FROM tbl_job J" while explaining why
+   * the join exists, and reported the docs as the bug.
+   */
+  const code = src.split('\n').filter((l) => {
+    const t = l.trim();
+    return !t.startsWith('*') && !t.startsWith('//') && !t.startsWith('/*');
+  }).join('\n');
+  const bare = (code.match(/FROM tbl_job J(?!\$\{join\})/g) || []);
+  assert.equal(bare.length, 0,
+    `every FROM tbl_job J must interpolate the join; ${bare.length} do not`);
+});
+
+test('volume is scoped by city too, even though it ignores the window on purpose', async () => {
+  fake.reset();
+  await perf.volume({ ...SCOPE, city: 'Pune' }, 6);
+  const q = lastMatching(/DATE_FORMAT\(COALESCE/i);
+  assert.match(q.sql, /CI\.city_name = \?/,
+    'a client-wide trend under city-scoped KPIs would be two populations on one card');
+  assert.match(q.sql, /LEFT JOIN tbl_address AD/i, 'and it needs the join as well');
+});
+
+/* ── judgeAgainst: a null is NOT a pass (2026-08-26) ──────────────── */
+
+test('judgeAgainst returns NULL when there is nothing to judge, never ok', () => {
+  const targets = require('../services/client-target.service');
+  assert.equal(targets.judgeAgainst('sla_pct', null, 90), null,
+    'this returned ok — the SUCCESS state — so an unscored window rendered four green KPIs');
+  assert.equal(targets.judgeAgainst('sla_pct', 85, null), null, 'no target is equally unjudgeable');
+  // The real judgements are untouched.
+  assert.equal(targets.judgeAgainst('sla_pct', 95, 90), 'ok');
+  assert.equal(targets.judgeAgainst('sla_pct', 85, 90), 'watch', 'within 10% of the target');
+  assert.equal(targets.judgeAgainst('sla_pct', 10, 90), 'risk');
+  // Lower-is-better still reads the other way round.
+  assert.equal(targets.judgeAgainst('avg_age_days', 2, 3), 'ok');
+  assert.equal(targets.judgeAgainst('avg_age_days', 9, 3), 'risk');
+});
