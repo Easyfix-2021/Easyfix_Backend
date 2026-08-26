@@ -1252,20 +1252,47 @@ async function assignCourseToAll(courseId, { dueDate = null } = {}) {
            WHERE ec.easyfixer_id = e.efr_id AND ec.course_id = ?)`,
     [id, now, now, dueDate, id],
   );
-  logger.info('Course assigned to all · courseId=' + id + ' newAssignments=' + res.affectedRows);
   /*
    * Same completion gap the single assignment closes: anyone who had already
    * watched this content is stamped complete now, rather than counted pending,
    * then overdue, and finally blocked from working for training they had done.
    * Best-effort — a failure here must not fail an assignment that succeeded.
    */
+  let alreadyComplete = 0;
   try {
     // null = every assignee: this path never learns which ids it inserted.
-    await stampCompletionsForCourse(id, null);
+    ({ stamped: alreadyComplete } = await stampCompletionsForCourse(id, null));
   } catch (e) {
     logger.warn({ err: e.message, courseId: id }, 'assignCourseToAll: completion stamp failed');
   }
-  return { assigned: res.affectedRows };
+
+  /*
+   * Counted AFTER the insert, not before.
+   *
+   * `requested` is the pool this action considered — every active technician.
+   * Counting afterwards keeps `assigned <= requested` true even if someone
+   * registered mid-flight: the insert would have picked them up, and the count
+   * then includes them. Counting first could report more assigned than
+   * requested, which reads as a bug in a toast.
+   *
+   * Reported as the same shape assignCourse returns, so a caller does not have
+   * to special-case which endpoint it called.
+   */
+  const [[pool_]] = await pool.query(
+    'SELECT COUNT(*) AS n FROM tbl_easyfixer WHERE efr_status = 1',
+  );
+  const requested = Number(pool_?.n || 0);
+  const assigned = res.affectedRows;
+  logger.info('Course assigned to all · courseId=' + id + ' · new=' + assigned
+    + ' · alreadyHeld=' + Math.max(0, requested - assigned)
+    + ' · alreadyComplete=' + alreadyComplete);
+  return {
+    requested,
+    assigned,
+    alreadyAssigned: Math.max(0, requested - assigned),
+    alreadyComplete,
+    due_date: dueDate,
+  };
 }
 
 /*
