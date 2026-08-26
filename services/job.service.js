@@ -1498,6 +1498,14 @@ function toIdArray(v) {
 
 async function list({
   q, status, statuses, assigned, clientId, cityId, ownerId, easyfixerId,
+  /*
+   * `readyForBilling` (2026-08-26) — the client portal's "In-Warranty Orders"
+   * tab. Two predicates, always together: ready_for_billing = 'Yes' AND
+   * sub_job_id IS NULL. They travel as ONE filter because the second is not a
+   * refinement of the first — a sub-job inherits its parent's billing flag, so
+   * without it every billable parent is counted twice.
+   */
+  readyForBilling,
   clientOwnerIds,            // number[] — restrict to jobs owned (job_client_owner) by these client users (reporting-manager scope)
   reportingContactIds,       // number[] — restrict to jobs booked by these SPOC contacts (tbl_job.reporting_contact_id) — client-app hierarchy scope
   customerId,
@@ -1544,6 +1552,15 @@ async function list({
   scope,
   allowedStages,             // Job Stage Access — { mode:'all'|'list', stages }
   sortBy, sortDir,           // server-side sort — whitelisted column + asc|desc
+  /*
+   * `countOnly` (2026-08-26) — return { rows: [], total } and skip the data
+   * query. For a caller that wants a TAB COUNT rather than a page: the count
+   * then comes from this function's own WHERE, so a badge and the list it sits
+   * above cannot describe different populations. The client portal's Order
+   * History had exactly that bug — a hand-written COUNT is a copy of the WHERE
+   * that has to be kept in step by hand, and it was not.
+   */
+  countOnly = false,
   limit = 50, offset = 0,
 } = {}) {
   logger.info('List jobs · status=' + (status ?? statuses ?? 'any') + ' · clientId=' + (clientId ?? '-') + ' · easyfixerId=' + (easyfixerId ?? '-') + ' · limit=' + limit + ' · offset=' + offset);
@@ -1644,6 +1661,10 @@ async function list({
   } else if (status != null) {
     clauses.push('j.job_status = ?');
     params.push(status);
+  }
+  if (readyForBilling) {
+    clauses.push("j.ready_for_billing = 'Yes'");
+    clauses.push('j.sub_job_id IS NULL');
   }
   /*
    * `assigned` splits BOOKED (and any other status) by whether a technician
@@ -2148,6 +2169,12 @@ async function list({
   const orderBy = sortCol
     ? `ORDER BY ${sortCol} ${sortDirSql}, j.job_id DESC`
     : 'ORDER BY j.job_id DESC';
+
+  if (countOnly) {
+    const [[{ total }]] = await pool.query(`SELECT COUNT(*) AS total ${countJoin} ${where}`, params);
+    logger.info('Counted ' + total + ' jobs (countOnly)');
+    return { rows: [], total };
+  }
 
   // Run COUNT and data query in parallel — they're independent, no reason to
   // serialize. Roughly halves wall-clock time on cold caches.

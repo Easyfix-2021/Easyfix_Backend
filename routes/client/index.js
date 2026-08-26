@@ -616,6 +616,101 @@ function hierarchyFilter(hier, req) {
   return hier.subtreeIds;
 }
 
+/*
+ * CSV → number[]. The empty-segment filter is load-bearing, not tidiness:
+ * ''.split(',') is [''], and Number('') is 0, which IS finite — so without it
+ * an ABSENT ownerIds parsed as [0], the intersection below emptied, and every
+ * request answered zero rows. Caught by tests/client-jobs-shared-filters.test.js.
+ */
+const csvIds = (v) => String(v == null ? '' : v).split(',')
+  .map((x) => x.trim())
+  .filter((x) => x !== '')
+  .map(Number)
+  .filter((n) => Number.isFinite(n));
+
+/*
+ * ─── ONE FILTER SET FOR EVERY ROUTE THAT LISTS A CLIENT'S JOBS ──────────────
+ *
+ * The list (/jobs), the export (/export/jobs) and the tab counts
+ * (/orders/counts) each used to build their own, and they had drifted so far
+ * apart that Order History rendered "Filters active" over completely
+ * unfiltered rows while the badge above it counted a different population
+ * again. Sharing the resolver is what makes them agree BY CONSTRUCTION rather
+ * than by two people remembering to edit both.
+ *
+ * ⚠ ownerIds ARE CONTACT IDS AND BELONG IN reportingContactIds.
+ *
+ * This is the trap that produced the original bug, and it is worth stating in
+ * full because the obvious fix is wrong twice over. tbl_job has three owner-ish
+ * columns in TWO different id spaces:
+ *
+ *   job_owner         tbl_user.user_id — the internal EasyFix operator.
+ *   job_client_owner  tbl_user.user_id — the EasyFix person who owns the
+ *                     account (resolved from tbl_vertical_mapping user_type=1).
+ *                     `jobService.list({ ownerId })` filters on THIS one.
+ *   reporting_contact_id  tbl_client_contacts.id — the CLIENT SPOC who booked
+ *                     the job. Written from req.spoc.id when the portal creates
+ *                     one.
+ *
+ * The portal's "Client Team" picker is fed by GET /team/members, which returns
+ * tbl_client_contacts.id. So routing ownerIds to either owner column compares
+ * two disjoint id spaces. /orders/counts did exactly that (`j.job_owner IN
+ * (...)`) and it could never have matched: the portal creates jobs with actor
+ * `{ user_id: null }`, so job_owner is NULL on every portal-booked row.
+ *
+ * ⚠ AND IT NARROWS THE HIERARCHY, IT DOES NOT REPLACE IT. Both the picked
+ * owners and the caller's own scope are lists of the same contact ids, so the
+ * filter is an INTERSECTION. Assigning ownerIds straight to
+ * reportingContactIds would let a Store SPOC read a peer's book by picking
+ * them in a dropdown. An empty intersection is a genuine zero-row answer and
+ * jobService.list turns it into `1=0` rather than dropping the clause, so
+ * "none of your team" cannot silently widen to "everyone".
+ */
+function clientJobFilters(req, hier) {
+  let reportingContactIds = hierarchyFilter(hier, req);
+  const pickedOwners = csvIds(req.query.ownerIds);
+  if (pickedOwners.length) {
+    reportingContactIds = Array.isArray(reportingContactIds)
+      // Intersect: never widen past what the hierarchy already allows.
+      ? reportingContactIds.filter((id) => pickedOwners.includes(id))
+      // Top of the tree — unrestricted, so the pick IS the restriction. Still
+      // safe: fk_client_id is always in the WHERE, so a foreign contact's id
+      // selects nothing rather than reaching another tenant.
+      : pickedOwners;
+  }
+  return {
+    clientId: req.spoc.client_id,
+    reportingContactIds,
+    // `statuses` (CSV) is what the portal sends; `status` (single) is kept for
+    // the mobile app and any caller still on the old shape.
+    statuses: req.query.statuses,
+    status: req.query.status != null ? Number(req.query.status) : undefined,
+    cityId: req.query.cityIds,
+    q: req.query.q,
+    // Server-side date range (so the app can reach any historical date
+    // instead of only the recent window it can hold client-side).
+    dateType: req.query.dateType,          // 'ticket' → ticket_created_date_time
+    startDate: req.query.startDate,
+    endDate: req.query.endDate,
+    /*
+     * `flag` is the portal's tab selector and carries three values:
+     *   completedOrders  Order History "In-Warranty" tab → readyForBilling.
+     *   otherOrders      Order History "All Orders" tab  → no extra predicate.
+     *   escalatedJobs    /tickets/escalated              → isEscalated.
+     *
+     * ⚠ isEscalated IS A DOCUMENTED NO-OP in jobService.list — tbl_job has no
+     * is_escalated column, the real flag lives on
+     * tbl_easyfixer_rating_by_customer, and wiring it needs a join in the LIST
+     * projection. It is forwarded anyway so the day that join lands the page
+     * starts filtering without another change here. Until then
+     * /tickets/escalated lists more than it claims — a pre-existing gap this
+     * commit neither introduces nor closes.
+     */
+    readyForBilling: String(req.query.flag || '') === 'completedOrders',
+    isEscalated: String(req.query.flag || '') === 'escalatedJobs' ? true : undefined,
+  };
+}
+
 router.get('/jobs', async (req, res, next) => {
   try {
     logger.info('List client jobs · status=' + (req.query.status ?? 'all') + ' q=' + (req.query.q || '-') + ' limit=' + (Math.min(Number(req.query.limit) || 50, 500)) + ' offset=' + (Number(req.query.offset) || 0));
@@ -624,17 +719,8 @@ router.get('/jobs', async (req, res, next) => {
     // else sees jobs booked by themselves + their team. `?spoc=<id>` narrows a
     // manager to one team member.
     const hier = await resolveClientHierarchy(req);
-    const reportingContactIds = hierarchyFilter(hier, req);
     const { rows, total } = await jobService.list({
-      clientId: req.spoc.client_id,
-      reportingContactIds,
-      status: req.query.status != null ? Number(req.query.status) : undefined,
-      q: req.query.q,
-      // Server-side date range (so the app can reach any historical date
-      // instead of only the recent window it can hold client-side).
-      dateType: req.query.dateType,          // 'ticket' → ticket_created_date_time
-      startDate: req.query.startDate,
-      endDate: req.query.endDate,
+      ...clientJobFilters(req, hier),
       limit: Math.min(Number(req.query.limit) || 50, 500),
       offset: Number(req.query.offset) || 0,
     });
@@ -1457,17 +1543,30 @@ router.get('/customers/:customerId/addresses', async (req, res, next) => {
 // preview). Column set mirrors what the SPOC sees in the dashboard table.
 // Status code is converted to legacy label so the spreadsheet reads
 // naturally to non-technical recipients.
+// Hard cap on an export. Named (not inlined) because the response now reports
+// it: a workbook that silently stops at N rows reads as a complete answer.
+const EXPORT_ROW_CAP = 5000;
+
 router.get('/export/jobs', async (req, res, next) => {
   try {
     logger.info('Export client jobs to xlsx · status=' + (req.query.status ?? 'all') + ' from=' + (req.query.startDate || '-') + ' to=' + (req.query.endDate || '-'));
-    const { rows } = await jobService.list({
-      clientId: req.spoc.client_id,
-      status: req.query.status != null ? Number(req.query.status) : undefined,
-      q: req.query.q,
-      startDate: req.query.startDate,
-      endDate: req.query.endDate,
-      limit: 5000, // hard cap; SPOC exports rarely exceed a few hundred
+    /*
+     * ⚠ THIS ROUTE HAD NO HIERARCHY SCOPE AT ALL until 2026-08-26 — it passed
+     * clientId and nothing else, so a Store SPOC who pressed Export received
+     * every order on the whole account, including other stores' work that the
+     * list view correctly hides from them. Sharing clientJobFilters closes
+     * that and picks up the dropped statuses/cityIds/ownerIds/flag in the
+     * same move: an export that does not match the list it was exported from
+     * is its own kind of wrong answer.
+     */
+    const hier = await resolveClientHierarchy(req);
+    const { rows, total } = await jobService.list({
+      ...clientJobFilters(req, hier),
+      limit: EXPORT_ROW_CAP,
     });
+    if (total > rows.length) {
+      logger.warn('Client export TRUNCATED · ' + rows.length + ' of ' + total + ' rows · clientId=' + req.spoc.client_id);
+    }
     logger.info('Exporting ' + rows.length + ' jobs to xlsx');
     const data = rows.map((r) => ({
       ...r,
@@ -2408,7 +2507,10 @@ router.get('/tickets/counts', async (req, res, next) => {
     }
     if (req.query.ownerIds) {
       const arr = toIdArr(req.query.ownerIds);
-      if (arr.length) { where.push(`j.job_owner IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
+      // reporting_contact_id, NOT job_owner — see clientJobFilters above:
+      // ?ownerIds are tbl_client_contacts ids, job_owner is a tbl_user id and is
+      // NULL on every portal-booked job, so the old clause could never match.
+      if (arr.length) { where.push(`j.reporting_contact_id IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
     }
     if (req.query.startDate) { where.push('j.created_date_time >= ?'); params.push(req.query.startDate); }
     if (req.query.endDate)   { where.push('j.created_date_time <= ?'); params.push(req.query.endDate); }
@@ -2492,68 +2594,49 @@ router.get('/tickets/counts', async (req, res, next) => {
  */
 router.get('/orders/counts', async (req, res, next) => {
   try {
-    // Lookup SPOC's direct reports once — used only for the
-    // completedOrders scope (otherOrders is whole-client per legacy).
-    const [reports] = await pool.query(
-      `SELECT id FROM tbl_client_contacts
-        WHERE client_id = ?
-          AND manager_id IS NOT NULL AND manager_id NOT IN ('', 'null')
-          AND CAST(manager_id AS UNSIGNED) = ?`,
-      [req.spoc.client_id, req.spoc.id]
-    );
-    const teamIds = reports.map((r) => r.id);
-    teamIds.push(req.spoc.id);
-    const teamPh = teamIds.map(() => '?').join(',');
+    /*
+     * The two tab badges on Order History. Both now come from
+     * jobService.list({ countOnly: true }) over clientJobFilters — the SAME
+     * WHERE the list below them uses — because this handler used to hand-roll
+     * its own SQL and the two had drifted into counting different populations
+     * on one screen.
+     *
+     * THREE THINGS CHANGED, and all three are the badge moving TOWARDS the
+     * list rather than the other way round:
+     *
+     * 1. otherOrders had NO hierarchy restriction — it counted the whole
+     *    client while the list showed only the caller's subtree, so a Store
+     *    SPOC read "All Orders 1,834" above "Showing 1–10 of 212". It is now
+     *    scoped like the list. This NARROWS the number, which is the safe
+     *    direction: nobody starts seeing a count they could not see before.
+     * 2. completedOrders scoped to self + DIRECT reports via its own
+     *    non-recursive query, while the list uses the full recursive subtree
+     *    from resolveClientHierarchy. It now uses the subtree, so a manager
+     *    with indirect reports sees a LARGER number than before — larger, but
+     *    equal to the rows they can actually open.
+     * 3. ?ownerIds filtered `j.job_owner IN (...)`, which is a tbl_user id
+     *    column being compared against tbl_client_contacts ids — and is NULL
+     *    on every portal-booked job anyway, so it could never match. It is now
+     *    an intersection into reportingContactIds. See clientJobFilters.
+     *
+     * `flag`/`statuses` are deliberately NOT taken from the query here. The
+     * page does not send them to this endpoint, and it should not: a badge
+     * that shrank with the Bucket filter would only ever restate the total
+     * already printed under the table. The badges answer "how big is the other
+     * tab", so each count sets its own readyForBilling and leaves the rest of
+     * the filters shared.
+     */
+    const hier = await resolveClientHierarchy(req);
+    const filters = clientJobFilters(req, hier);
 
-    // Shared filter clauses applied to both counts.
-    const sharedWhere = ['j.fk_client_id = ?'];
-    const sharedParams = [req.spoc.client_id];
-
-    const toIdArr = (v) => String(v).split(',')
-      .map((s) => Number(s.trim())).filter((n) => !Number.isNaN(n));
-    if (req.query.cityIds) {
-      const arr = toIdArr(req.query.cityIds);
-      if (arr.length) { sharedWhere.push(`ad.city_id IN (${arr.map(() => '?').join(',')})`); sharedParams.push(...arr); }
-    }
-    if (req.query.ownerIds) {
-      const arr = toIdArr(req.query.ownerIds);
-      if (arr.length) { sharedWhere.push(`j.job_owner IN (${arr.map(() => '?').join(',')})`); sharedParams.push(...arr); }
-    }
-    if (req.query.startDate) { sharedWhere.push('j.created_date_time >= ?'); sharedParams.push(req.query.startDate); }
-    if (req.query.endDate)   { sharedWhere.push('j.created_date_time <= ?'); sharedParams.push(req.query.endDate); }
-    if (req.query.q) {
-      sharedWhere.push('(j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR cu.customer_name LIKE ? OR cu.customer_mob_no LIKE ?)');
-      const v = `%${req.query.q}%`;
-      sharedParams.push(v, v, v, v);
-    }
-
-    const w = sharedWhere.join(' AND ');
-    const needsCu = /\bcu\./.test(w);
-    const needsAd = /\bad\./.test(w);
-    const joins = `
-      FROM tbl_job j
-      ${needsCu ? 'LEFT JOIN tbl_customer cu ON cu.customer_id = j.fk_customer_id' : ''}
-      ${needsAd ? 'LEFT JOIN tbl_address  ad ON ad.address_id  = j.fk_address_id' : ''}
-    `;
-
-    // Two parallel COUNTs — kept separate (rather than SUM(CASE)) because
-    // otherOrders is whole-client while completedOrders is team-scoped,
-    // so the WHERE shapes diverge.
-    const [[[other]], [[completed]]] = await Promise.all([
-      pool.query(`SELECT COUNT(*) AS n ${joins} WHERE ${w}`, sharedParams),
-      pool.query(
-        `SELECT COUNT(*) AS n ${joins}
-          WHERE ${w}
-            AND j.ready_for_billing = 'Yes'
-            AND j.sub_job_id IS NULL
-            AND j.reporting_contact_id IN (${teamPh})`,
-        [...sharedParams, ...teamIds]
-      ),
+    const [all, billable] = await Promise.all([
+      jobService.list({ ...filters, readyForBilling: false, countOnly: true }),
+      jobService.list({ ...filters, readyForBilling: true,  countOnly: true }),
     ]);
 
     modernOk(res, {
-      otherOrders:     Number(other.n     || 0),
-      completedOrders: Number(completed.n || 0),
+      otherOrders:     Number(all.total      || 0),
+      completedOrders: Number(billable.total || 0),
     });
   } catch (e) { next(e); }
 });
@@ -2595,7 +2678,10 @@ router.get('/appointments/counts', async (req, res, next) => {
     }
     if (req.query.ownerIds) {
       const arr = toIdArr(req.query.ownerIds);
-      if (arr.length) { where.push(`j.job_owner IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
+      // reporting_contact_id, NOT job_owner — see clientJobFilters above:
+      // ?ownerIds are tbl_client_contacts ids, job_owner is a tbl_user id and is
+      // NULL on every portal-booked job, so the old clause could never match.
+      if (arr.length) { where.push(`j.reporting_contact_id IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
     }
     if (req.query.startDate) { where.push('j.created_date_time >= ?'); params.push(req.query.startDate); }
     if (req.query.endDate)   { where.push('j.created_date_time <= ?'); params.push(req.query.endDate); }
@@ -2676,7 +2762,10 @@ router.get('/under-audit/counts', async (req, res, next) => {
     }
     if (req.query.ownerIds) {
       const arr = toIdArr(req.query.ownerIds);
-      if (arr.length) { where.push(`j.job_owner IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
+      // reporting_contact_id, NOT job_owner — see clientJobFilters above:
+      // ?ownerIds are tbl_client_contacts ids, job_owner is a tbl_user id and is
+      // NULL on every portal-booked job, so the old clause could never match.
+      if (arr.length) { where.push(`j.reporting_contact_id IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
     }
     if (req.query.startDate) { where.push('j.created_date_time >= ?'); params.push(req.query.startDate); }
     if (req.query.endDate)   { where.push('j.created_date_time <= ?'); params.push(req.query.endDate); }
@@ -2754,7 +2843,10 @@ router.get('/client-delay/counts', async (req, res, next) => {
     }
     if (req.query.ownerIds) {
       const arr = toIdArr(req.query.ownerIds);
-      if (arr.length) { where.push(`j.job_owner IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
+      // reporting_contact_id, NOT job_owner — see clientJobFilters above:
+      // ?ownerIds are tbl_client_contacts ids, job_owner is a tbl_user id and is
+      // NULL on every portal-booked job, so the old clause could never match.
+      if (arr.length) { where.push(`j.reporting_contact_id IN (${arr.map(() => '?').join(',')})`); params.push(...arr); }
     }
     if (req.query.startDate) { where.push('j.created_date_time >= ?'); params.push(req.query.startDate); }
     if (req.query.endDate)   { where.push('j.created_date_time <= ?'); params.push(req.query.endDate); }
@@ -2992,8 +3084,13 @@ router.get('/lookup/cities', async (req, res, next) => {
 });
 
 // Client team members eligible to own jobs — used by the "Client Team"
-// multi-select. Reuses tbl_client_contacts (the same table our SPOC
-// auth lives in) so the IDs returned here are job_owner-compatible.
+// multi-select.
+//
+// ⚠ THESE IDS ARE tbl_client_contacts.id. An earlier version of this comment
+// claimed they were "job_owner-compatible"; they are not, and that sentence is
+// what caused five handlers to filter ?ownerIds on j.job_owner — a tbl_user
+// column, NULL on every portal-booked job. The column these ids match is
+// tbl_job.reporting_contact_id. See clientJobFilters().
 router.get('/team/members', async (req, res, next) => {
   try {
     const [rows] = await pool.query(
