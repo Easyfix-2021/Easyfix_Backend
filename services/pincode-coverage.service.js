@@ -158,6 +158,24 @@ async function getCoveredPincodes(pincodes) {
   return hit;
 }
 
+/*
+ * The WHOLE covered set — every pincode at least one dispatchable technician
+ * services. Same cache as getCoveredPincodes; this is the "I don't have a
+ * candidate list to test" form of the same question.
+ *
+ * Exists for the Manage Pincodes LOCAL/TRAVEL filter, which has to narrow the
+ * query BEFORE pagination: deriving LOCAL/TRAVEL per row and filtering the page
+ * afterwards drops rows out of a page that is already cut to size, and leaves
+ * the total counting rows the filter rejected.
+ *
+ * Returned as a COPY. The cached Set is shared and long-lived; handing out the
+ * live object invites a caller to mutate coverage for the whole process.
+ */
+async function getCoveredSet() {
+  const { covered } = await loadSupply();
+  return new Set(covered);
+}
+
 /* Single-pincode convenience. Same answer, same cache. */
 async function isCovered(pincode) {
   return (await getCoveredPincodes([pincode])).size > 0;
@@ -196,6 +214,7 @@ function invalidateCoverage() {
 
 module.exports = {
   getCoveredPincodes,
+  getCoveredSet,
   getTechnicianIdsForPincodes,
   isCovered,
   invalidateCoverage,

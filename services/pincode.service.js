@@ -236,6 +236,40 @@ async function listPincodes({ q, status, cityId, createdByTech = false, includeI
   // Only pincodes a technician minted on the fly.
   if (createdByTech && hasCreator) where.push("p.created_by_type = 'technician'");
 
+  /*
+   * ── LOCAL / TRAVEL, IN THE QUERY ───────────────────────────────────────────
+   *
+   * This filter used to run in JS on the page that had ALREADY been cut by
+   * LIMIT/OFFSET, and `total` was counted before it. Both halves were wrong in
+   * the same direction: a 50-row page could return 3 rows while the pager still
+   * read "Showing 1–50 of 1,864" over 38 pages, and paging forward re-filtered a
+   * different arbitrary slice. The filter looked like it did nothing, because
+   * the only number on screen — the total — never moved.
+   *
+   * LOCAL means "at least one dispatchable technician services this pincode",
+   * which is a CSV-column question (tbl_efr_serviceable_pincodes) that no join
+   * here can ask. The coverage module already answers it from an in-memory
+   * cache, so the honest fix is to resolve the covered SET once and narrow the
+   * SQL with it — then LIMIT, COUNT and the filter all describe one population.
+   *
+   * TRIM(p.pincode), not p.pincode: the covered set is keyed on trimmed 6-digit
+   * strings (coverage.normalise) and so is the per-row status computed below. A
+   * bare column compare would let a padded value display LOCAL while the filter
+   * rejected it — the row and its own filter disagreeing. tbl_pincode is ~22k
+   * rows, so the lost index seek costs nothing on this settings page.
+   */
+  if (status) {
+    const wantLocal = String(status).toUpperCase() === STATUS.LOCAL;
+    const covered = [...(await coverage.getCoveredSet())];
+    if (covered.length === 0) {
+      // No coverage anywhere: nothing is LOCAL, everything is TRAVEL.
+      if (wantLocal) where.push('1=0');
+    } else {
+      where.push(`TRIM(p.pincode) ${wantLocal ? 'IN' : 'NOT IN'} (${covered.map(() => '?').join(',')})`);
+      params.push(...covered);
+    }
+  }
+
   // Whitelisted sort. Only map-resolved column literals + an ASC/DESC literal
   // are ever spliced into SQL — `sortBy`/`sortDir` are never interpolated raw
   // (MySQL can't parameterise identifiers). Unknown keys fall back to pincode.
@@ -327,15 +361,14 @@ async function listPincodes({ q, status, cityId, createdByTech = false, includeI
     };
   });
 
-  // In-app status filter. Applied after computation since status is virtual.
-  // For 100 rows per page this is fine; if pagination ever shows 5k rows in
-  // one page, push this into a HAVING clause on the main query.
-  const filtered = status
-    ? items.filter((it) => it.status === String(status).toUpperCase())
-    : items;
-
-  logger.info('Returning ' + filtered.length + ' pincodes · total=' + total);
-  return { items: filtered, total };
+  /*
+   * No post-pagination filter any more — `status` narrowed the SQL above, so
+   * every row here already matches and `total` counts the same population.
+   * deriveStatus still runs per row because the table DISPLAYS the value; it is
+   * no longer what selects the rows.
+   */
+  logger.info('Returning ' + items.length + ' pincodes · total=' + total);
+  return { items, total };
 }
 
 async function getPincodeById(pincodeId) {
