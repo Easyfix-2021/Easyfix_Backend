@@ -3,11 +3,33 @@
 --
 -- ── WHAT IS ALREADY RULED OUT ─────────────────────────────────────────────
 --
--- NOT a missed code path. There is exactly ONE `INSERT INTO tbl_job` in the
--- whole backend (services/job.service.js), and stampJobPrimarySpoc runs
--- immediately after it inside the same transaction. Bulk Upload, New Dashboard
--- and the partner APIs all route through it — "New Dashboard" is a source_type
--- string on that shared insert, not a second creator.
+-- ⚠ CORRECTION (2026-08-26, after reading every stack that writes tbl_job).
+-- An earlier version of this file said Bulk Upload / New Dashboard / the
+-- partner APIs "all route through" the Node backend's single insert. That is
+-- FALSE and it was the wrong place to start from:
+--
+--   Bulk Upload   → ACD_APIs JobServiceImpl.java:1344, a hardcoded literal.
+--                   The Node bulk upload writes 'excel'
+--                   (services/job-upload.service.js:121), so the string alone
+--                   proves the row is not ours.
+--   New Dashboard → TWO writers share the string: the old Angular dashboard
+--                   (→ ACD_APIs) and the new client portal (→ Node). Source
+--                   cannot tell them apart. Query 5 below can.
+--   Decathlon API → caller-supplied on BOTH stacks (ACD binds the DTO verbatim;
+--                   Node writes `b.sourceType || 'integration'` at
+--                   routes/integration/v1/index.js:112). Also query 5.
+--
+-- It is TRUE that the Node backend has exactly one INSERT INTO tbl_job and that
+-- stampJobPrimarySpoc runs immediately after it. It is not true that everything
+-- routes through it.
+--
+-- FIXED 2026-08-26 in ACD_APIs (commit 93746bf): job_primary_spoc was not a
+-- mapped property on its Job entity at all, so Hibernate omitted the column
+-- from every INSERT. Both of its create paths now stamp it from the same
+-- ownerId they already used for job_client_owner. NOT YET FIXED, same defect,
+-- same reason: EasyFix_API entity/Jobs.java maps neither column. That stack
+-- forces job_status = 9, so its rows are excluded by the NOT IN (7, 9) filter
+-- these queries use — check separately if that filter is ever relaxed.
 --
 -- NOT a regression from 3442fc5. That commit changed the SELECTED COLUMN
 -- (u.mobile_no -> u.user_id) and nothing else: the FROM, the WHERE and the
@@ -42,3 +64,18 @@ SELECT j.fk_client_id, c.client_name, SUM(CASE WHEN j.job_primary_spoc IS NOT NU
 -- look at the code — it would mean the stamp never succeeds any more, which is
 -- a different and much worse finding than a data gap.
 SELECT COUNT(*) AS stamped_since_fix, MIN(ticket_created_date_time) AS first, MAX(ticket_created_date_time) AS last FROM tbl_job WHERE job_primary_spoc IS NOT NULL AND job_primary_spoc <> 2147483647 AND ticket_created_date_time > '2026-08-14 23:59:59';
+
+-- 5. WHICH STACK WROTE IT — the discriminator, and the reason it works.
+--
+-- job_client_owner is resolved from the SAME user_type = 1 lookup on both
+-- stacks. ACD_APIs sets it and (before 93746bf) had no field for the spoc at
+-- all; the Node backend sets both from one helper. So:
+--
+--   owner NOT NULL + spoc NULL  -> ACD_APIs wrote it. Fixed by 93746bf.
+--   both NULL                   -> that client has no Primary SPOC mapped.
+--                                  An ops data gap; no code change moves it.
+--
+-- tat_locality corroborates independently: the Node backend inserts a
+-- tbl_job_tat_locality row for every job it creates (job.service.js:912) and
+-- ACD_APIs does not know that table exists.
+SELECT j.source_type, CASE WHEN j.job_client_owner IS NULL THEN 'both NULL — client has no Primary SPOC (ops)' ELSE 'owner set, spoc NULL — foreign stack wrote it (code)' END AS diagnosis, CASE WHEN l.job_id IS NULL THEN 'no' ELSE 'yes' END AS node_wrote_it, COUNT(*) AS jobs FROM tbl_job j LEFT JOIN tbl_job_tat_locality l ON l.job_id = j.job_id WHERE j.job_status NOT IN (7, 9) AND j.job_primary_spoc IS NULL AND j.ticket_created_date_time > '2026-08-14 23:59:59' GROUP BY 1, 2, 3 ORDER BY jobs DESC;
