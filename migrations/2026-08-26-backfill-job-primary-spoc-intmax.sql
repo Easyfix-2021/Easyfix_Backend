@@ -1,39 +1,68 @@
 -- Backfill job_primary_spoc rows stamped 2147483647.
 --
--- WHAT HAPPENED. job_primary_spoc is an INT holding tbl_user.user_id. Until
--- 3442fc5 (2026-08-14 20:57 IST) the create path stamped the SPOC's MOBILE
--- NUMBER there instead. An Indian mobile starts 6-9, so it is at least
--- 6,000,000,000 — past the signed INT ceiling of 2,147,483,647 — and MySQL
--- clamped every one of them to exactly that ceiling. So these rows are not a
--- weird user id; they are a phone number with its top bits sheared off, and the
--- original number is NOT recoverable from the stored value.
+-- REVISED 2026-08-26 after step 1 returned 41 rows on Production, not zero.
+-- The first draft of this file assumed today's vertical mapping was also the
+-- mapping at booking time. It is not, and this version does not rely on it.
 --
--- IT IS NOT STILL HAPPENING. There is exactly one writer of this column in the
--- repo (services/job.service.js stampJobPrimarySpoc) and it binds u.user_id.
--- The newest affected job was created 2026-08-14 16:08:09, four hours and
--- forty-nine minutes BEFORE that fix was committed. Run step 0 to confirm
--- against live data before running anything else.
+-- ── WHAT HAPPENED ─────────────────────────────────────────────────────────
+-- job_primary_spoc is an INT holding tbl_user.user_id. Between ed32e39
+-- (2026-07-05) and 3442fc5 (2026-08-14 20:57 IST) the create path stamped the
+-- SPOC's MOBILE NUMBER there. An Indian mobile starts 6-9, so it is at least
+-- 6,000,000,000 — past the signed INT ceiling — and MySQL clamped every one to
+-- exactly 2,147,483,647. These rows are a phone number with its top bits
+-- sheared off; the original number is NOT recoverable from what was stored.
 --
--- ⚠ THIS RE-DERIVES A SNAPSHOT FROM TODAY'S MAPPING. The column exists to
--- record who the client's head was AT CREATION, and is deliberately never
--- re-stamped, because re-stamping hands one owner's history to another. That
--- objection does not apply to a value of 2,147,483,647 — it resolves to nobody
--- and owns nothing — but it DOES mean these jobs get the head as of today. Run
--- step 1: if it returns no rows, no head mapping changed inside the affected
--- window and today's answer is also the answer at creation time.
+-- IT IS NOT STILL HAPPENING. One writer in the repo (stampJobPrimarySpoc), and
+-- it binds u.user_id. The newest affected job predates the fix by 4h49m. Step 0
+-- confirms that against live data.
+--
+-- ── WHY THE OBVIOUS FIX IS WRONG ──────────────────────────────────────────
+-- tbl_vertical_mapping KEEPS NO HISTORY, in either write path:
+--   * replaceAssignments  DELETEs every row for the client, then INSERTs.
+--   * upsertSpoc          UPDATEs user_id IN PLACE for user_type = 1.
+-- inserted_on is a plain datetime with no default and no ON UPDATE, so the
+-- in-place path does not even move the timestamp. There is no SPOC audit table,
+-- and the only trace of a change is a log line that records "primary=updated"
+-- without either user id. So the head as of 2026-08-14 CANNOT be read back out
+-- of this database — and step 1 proves at least 41 mappings moved since.
+--
+-- ── WHAT THIS USES INSTEAD ────────────────────────────────────────────────
+-- Jobs created AFTER the fix carry a correctly stamped snapshot. For each
+-- affected client, the earliest such job is the closest-in-time evidence of who
+-- that client's head was — a stamp, not a re-derivation, and anchored hours
+-- rather than weeks away from the affected rows.
+--
+-- ⚠ THIS IS STILL AN INFERENCE. For a client whose head moved BETWEEN a job's
+-- creation and the fix, both this and today's mapping are wrong, and nothing in
+-- the database can say so. Step 2 shows where the two sources disagree, which
+-- is the honest measure of how much doubt is left. If that set matters, a
+-- restore of a pre-2026-08-14 snapshot is the only real answer.
 
 -- Step 0 — is the write path really fixed? Expect ZERO rows.
 SELECT job_id, ticket_created_date_time FROM tbl_job WHERE job_primary_spoc = 2147483647 AND ticket_created_date_time > '2026-08-14 20:57:51' ORDER BY ticket_created_date_time DESC LIMIT 20;
 
--- Step 1 — did any head mapping move during the affected window? Expect ZERO rows.
-SELECT vm.client_id, vm.user_id, vm.inserted_on FROM tbl_vertical_mapping vm WHERE vm.user_type = 1 AND vm.inserted_on > (SELECT MIN(ticket_created_date_time) FROM tbl_job WHERE job_primary_spoc = 2147483647);
+-- Step 1 — per-client evidence. One row per affected client: how many jobs are
+-- affected, what the post-fix stamp says, and what today's mapping says.
+CREATE TEMPORARY TABLE tmp_spoc_evidence AS SELECT j.fk_client_id AS client_id, COUNT(*) AS affected_jobs, MIN(j.ticket_created_date_time) AS first_affected, MAX(j.ticket_created_date_time) AS last_affected, (SELECT n.job_primary_spoc FROM tbl_job n WHERE n.fk_client_id = j.fk_client_id AND n.ticket_created_date_time > '2026-08-14 20:57:51' AND n.job_primary_spoc IS NOT NULL AND n.job_primary_spoc BETWEEN 1 AND 2147483646 ORDER BY n.ticket_created_date_time ASC LIMIT 1) AS head_after_fix, (SELECT u.user_id FROM tbl_vertical_mapping vm LEFT JOIN tbl_user u ON u.user_id = vm.user_id WHERE vm.client_id = j.fk_client_id AND vm.user_type = 1 AND (vm.status IS NULL OR vm.status = 1) ORDER BY vm.id DESC LIMIT 1) AS head_today FROM tbl_job j WHERE j.job_primary_spoc = 2147483647 GROUP BY j.fk_client_id;
 
--- Step 2 — preview what the backfill would write. Read this before step 3.
-SELECT j.job_id, j.fk_client_id, j.job_primary_spoc AS current_value, (SELECT u.user_id FROM tbl_vertical_mapping vm LEFT JOIN tbl_user u ON u.user_id = vm.user_id WHERE vm.client_id = j.fk_client_id AND vm.user_type = 1 AND (vm.status IS NULL OR vm.status = 1) ORDER BY vm.id DESC LIMIT 1) AS would_become FROM tbl_job j WHERE j.job_primary_spoc = 2147483647 ORDER BY j.ticket_created_date_time DESC;
+-- Step 2 — READ THIS BEFORE WRITING ANYTHING.
+-- verdict tells you how much to trust each client's backfill.
+SELECT e.client_id, c.client_name, e.affected_jobs, e.first_affected, e.last_affected, e.head_after_fix, e.head_today, ua.user_name AS head_after_fix_name, ut.user_name AS head_today_name, CASE WHEN e.head_after_fix IS NULL AND e.head_today IS NULL THEN 'NO EVIDENCE — will write NULL' WHEN e.head_after_fix IS NULL THEN 'today''s mapping only — weaker' WHEN e.head_after_fix = e.head_today THEN 'AGREE — safe' ELSE 'DISAGREE — head moved; post-fix stamp is the closer one' END AS verdict FROM tmp_spoc_evidence e LEFT JOIN tbl_client c ON c.client_id = e.client_id LEFT JOIN tbl_user ua ON ua.user_id = e.head_after_fix LEFT JOIN tbl_user ut ON ut.user_id = e.head_today ORDER BY e.affected_jobs DESC;
 
--- Step 3 — the backfill. A client with no live head mapping stamps NULL, which
--- is the same thing the create path does today: no owner beats a dangling one.
-UPDATE tbl_job j SET j.job_primary_spoc = (SELECT u.user_id FROM tbl_vertical_mapping vm LEFT JOIN tbl_user u ON u.user_id = vm.user_id WHERE vm.client_id = j.fk_client_id AND vm.user_type = 1 AND (vm.status IS NULL OR vm.status = 1) ORDER BY vm.id DESC LIMIT 1) WHERE j.job_primary_spoc = 2147483647;
+-- Step 3 — the same thing as one line, so the shape of the risk is on screen.
+SELECT CASE WHEN head_after_fix IS NULL AND head_today IS NULL THEN 'no evidence' WHEN head_after_fix IS NULL THEN 'today only' WHEN head_after_fix = head_today THEN 'agree' ELSE 'disagree' END AS verdict, COUNT(*) AS clients, SUM(affected_jobs) AS jobs FROM tmp_spoc_evidence GROUP BY 1 ORDER BY jobs DESC;
 
--- Step 4 — verify. Expect ZERO rows.
+-- Step 4 — the backfill. Prefers the post-fix stamp, falls back to today's
+-- mapping, and writes NULL when there is no evidence at all: no owner beats an
+-- owner who resolves to nobody, which is what 2147483647 already is.
+UPDATE tbl_job j JOIN tmp_spoc_evidence e ON e.client_id = j.fk_client_id SET j.job_primary_spoc = COALESCE(e.head_after_fix, e.head_today) WHERE j.job_primary_spoc = 2147483647;
+
+-- Step 5 — a client-less affected job has no mapping to read; NULL it out so no
+-- row is left holding the sentinel.
+UPDATE tbl_job SET job_primary_spoc = NULL WHERE job_primary_spoc = 2147483647;
+
+-- Step 6 — verify. Expect ZERO.
 SELECT COUNT(*) AS still_intmax FROM tbl_job WHERE job_primary_spoc = 2147483647;
+
+-- Step 7 — housekeeping.
+DROP TEMPORARY TABLE tmp_spoc_evidence;
