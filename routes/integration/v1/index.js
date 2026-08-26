@@ -21,6 +21,7 @@ const {
 } = require('../../../services/integration.service');
 const { writeBuffer } = require('../../../utils/file-storage');
 const logger = require('../../../logger');
+const { maskMobile } = require('../../../utils/mask-mobile');
 
 // All /v1/* routes require HTTP Basic Auth against tbl_client_website
 router.use(basicAuth);
@@ -429,7 +430,46 @@ router.get('/users/all', async (_req, res) => legacyOk(res, []));
 router.get('/users/ById', async (_req, res) => legacyOk(res, []));
 router.get('/users/findUser', async (_req, res) => legacyOk(res, null));
 router.get('/users/getRecieverByjobId', async (_req, res) => legacyOk(res, null));
-router.post('/users/saveUserCallInfo', async (_req, res) => legacyOk(res, { saved: true }));
+/*
+ * ⚠️ THIS STUB DISCARDS REAL OPERATIONAL DATA, AND SAYS "saved".
+ *
+ * Every other route in this compat layer returns canned data for something the
+ * new app reimplemented elsewhere. This one is different: the legacy
+ * `/saveUserCallInfo` in EasyFix_API (UserResource.java:246-268) is the ONLY
+ * writer of INBOUND call rows anywhere in the estate —
+ *
+ *     con.setCalltype("IN");  userContactDao.saveJobCallerInfo(con);
+ *
+ * — and it is live today. Kaleyra posts every incoming call to it, which is
+ * where tbl_job_caller_info's call_type='IN' / caller_status='OFF-HOUR' rows
+ * come from. `setCalltype("IN")` appears exactly once across all repos.
+ *
+ * So if anyone ever repoints Kaleyra at THIS host, inbound call logging stops
+ * dead: this handler reads nothing, writes nothing, and answers
+ * { saved: true }. No error, no row, no alert — the Call Tracking report would
+ * simply go quiet, and it would look like the phones went quiet.
+ *
+ * Until it is implemented for real, it is at least LOUD. The WARN below fires
+ * on every hit with the mobile numbers masked, so a misrouted Kaleyra is
+ * visible in Dozzle within minutes instead of being inferred weeks later from
+ * a missing number.
+ *
+ * Implementing it properly is deliberately NOT done here: while Kaleyra still
+ * posts to EasyFix_API, a second writer on the same payload would double-count
+ * every inbound call. Repoint first, then implement — in that order.
+ */
+router.post('/users/saveUserCallInfo', async (req, res) => {
+  const b = req.body || {};
+  logger.warn(
+    'LEGACY STUB HIT · /v1/users/saveUserCallInfo — inbound call info DISCARDED.'
+    + ' If this is Kaleyra, it is pointed at the wrong host: the real writer is'
+    + ' EasyFix_API. callFrom=' + maskMobile(b.callfrom || b.caller)
+    + ' callTo=' + maskMobile(b.callto || b.reciever)
+    + ' jobId=' + (b.jobId ?? '-')
+    + ' uniqueId=' + (b.uniqueId ?? b.id ?? '-'),
+  );
+  return legacyOk(res, { saved: true });
+});
 router.post('/users/contactUsers', async (_req, res) => legacyOk(res, { accepted: true }));
 
 // ─── /v1/utils/* — DEAD CODE in legacy ──────────────────────────────
