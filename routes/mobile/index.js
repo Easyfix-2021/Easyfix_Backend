@@ -441,7 +441,7 @@ router.get('/jobs/rejected', async (req, res, next) => {
         WHERE jo.fk_easyfixter_id = ? AND jo.offer_status = ${OFFER_STATUS.REJECTED}
         ORDER BY jo.responded_at DESC
         LIMIT 100`,
-      // VISIBLE_VIDEO_IDS_SQL binds the technician twice: once for the
+      // visibleVideoIdsSql() binds the technician twice: once for the
       // mandatory half, once for the assigned half.
       [req.tech.efr_id, req.tech.efr_id],
     );
@@ -1584,7 +1584,7 @@ router.post('/device', validate(Joi.object({
 const {
   normalizeVideoUrl: normalizeTrainingVideoUrl,
   parseYouTubeUrl: parseTrainingVideoYouTubeUrl,
-  VISIBLE_VIDEO_IDS_SQL,
+  visibleVideoIdsSql,
 } = require('../../services/lms.service');
 /*
  * SCOPED TO THE CALLER. This handler took `_req` and selected every row of
@@ -1606,7 +1606,7 @@ router.get('/training-videos', async (req, res, next) => {
          FROM training_videos tv
          LEFT JOIN document d
            ON d.id = tv.training_video_id AND d.document_type_id = 2
-        WHERE tv.id IN (${VISIBLE_VIDEO_IDS_SQL})
+        WHERE tv.id IN (${await visibleVideoIdsSql()})
         ORDER BY tv.id DESC`,
       [req.tech.efr_id],
     );

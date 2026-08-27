@@ -6,7 +6,7 @@ const registrationProfile = require('./technician-registration-profile.service')
 const profileCompletion = require('./profile-completion.service');
 // One definition of "mandatory", shared with the mobile training list — two
 // copies of this SQL would drift the first time either was touched.
-const { MANDATORY_VIDEO_IDS_SQL } = require('./lms.service');
+const { mandatoryVideoIdsSql } = require('./lms.service');
 
 /*
  * Mobile Registration gate machine — collapses three legacy polls
@@ -145,14 +145,18 @@ async function fetchTrainingCompletedTime(efrId) {
      * technician who watched an ASSIGNED course video count it towards the
      * mandatory tally and pass the gate without watching a mandatory one.
      */
+    // Resolved ONCE and reused for both halves. Two awaits could straddle the
+    // probe's TTL and build the two subqueries from different answers, which
+    // is the same "both halves must use the same set" rule stated above.
+    const mandatorySql = await mandatoryVideoIdsSql();
     const [[row]] = await pool.query(
-      `SELECT (SELECT COUNT(*) FROM (${MANDATORY_VIDEO_IDS_SQL}) m) AS total,
+      `SELECT (SELECT COUNT(*) FROM (${mandatorySql}) m) AS total,
               COUNT(DISTINCT w.video_id)                            AS done,
               MAX(w.update_date)                                    AS last_done
          FROM easyfixer_watched_video w
         WHERE w.easyfixer_id = ?
           AND w.watched_percentage = 100
-          AND w.video_id IN (${MANDATORY_VIDEO_IDS_SQL})`,
+          AND w.video_id IN (${mandatorySql})`,
       // Three binds: the total subquery, the watcher filter, then the IN subquery.
       [efrId, efrId, efrId],
     );

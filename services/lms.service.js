@@ -44,6 +44,103 @@ const s3 = require('../utils/s3-storage');
 function mkErr(status, message) { const e = new Error(message); e.status = status; return e; }
 
 /*
+ * ─── COLUMN PROBES: THE TWO FLAGS THAT ARRIVE BY ALTER ───────────────
+ *
+ * `courses.is_mandatory` and `training_videos.is_global` are added by
+ * migrations/executed/2026-08-26-lms-mandatory-flags.sql. Everything else this
+ * file reads arrives with its table, so a missing table is caught at boot by
+ * scripts/schema-verify.js and the server refuses to start — the loud,
+ * recoverable failure that file argues for, and the right severity for
+ * lms_content, which gates earning.
+ *
+ * These two are different in kind. They are ALTERs on tables that already
+ * exist and are already being read, so their absence does not stop the server
+ * booting or the table resolving: it 500s exactly the requests whose SQL names
+ * them. That is a real deploy on 2026-08-26 — the course list shipped ahead of
+ * its migration and named c.is_mandatory in an unconditional SELECT, so the
+ * Content page did not degrade, it errored.
+ *
+ * So the flags are probed and the SQL is built around the answer. A missing
+ * flag reads as 0 everywhere: no course is mandatory, no video is global,
+ * nothing gates, and every page still renders.
+ *
+ * ON PROBE FAILURE, ASSUME PRESENT. The opposite default (plivo-call-log's
+ * hasRecordingRequestedColumn, which assumes false) is right there because a
+ * false answer only skips writing an optional flag. Here a false answer
+ * switches off mandatory training for everyone, so a transient
+ * information_schema hiccup must not be able to do it. Absent is only ever
+ * concluded from a query that actually came back and said so.
+ *
+ * PRIMED AT BOOT (server.js), so no REQUEST pays for it: services/
+ * mobile-registration.service.js#getStatus runs to a bounded three-query budget
+ * that tests/mobile-registration-status-overdue.test.js pins, and the
+ * technician's status call is not the place to discover the schema.
+ *
+ * TTL, not resolve-once: the migration is expected to land WHILE the process
+ * is running. A permanent negative would keep mandatory training off until
+ * someone restarted the container, turning a five-minute lag into an outage
+ * nobody thinks to look for. Positives are cached long because they never go
+ * back; negatives are re-checked in a minute.
+ */
+const SCHEMA_POSITIVE_TTL_MS = 60 * 60 * 1000;
+const SCHEMA_NEGATIVE_TTL_MS = 60 * 1000;
+
+const LMS_FLAG_COLUMNS = Object.freeze([
+  ['courses', 'is_mandatory'],
+  ['training_videos', 'is_global'],
+]);
+
+let _flagCache = null;
+
+async function lmsFlagColumns() {
+  const now = Date.now();
+  if (_flagCache) {
+    const ttl = _flagCache.stable ? SCHEMA_POSITIVE_TTL_MS : SCHEMA_NEGATIVE_TTL_MS;
+    if (now - _flagCache.checkedAt < ttl) return _flagCache.value;
+  }
+
+  // One round trip for both, not one per column: this sits in front of the
+  // course list and the technician's training screen.
+  const value = { courseMandatory: true, videoGlobal: true };
+  try {
+    const [rows] = await pool.query(
+      `SELECT table_name AS t, column_name AS c
+         FROM information_schema.columns
+        WHERE table_schema = DATABASE()
+          AND (${LMS_FLAG_COLUMNS.map(() => '(table_name = ? AND column_name = ?)').join(' OR ')})`,
+      LMS_FLAG_COLUMNS.flat(),
+    );
+    // Column names come back upper- or lower-cased depending on the server's
+    // lower_case_table_names / version, so match case-insensitively rather
+    // than trusting the alias.
+    const present = new Set(rows.map((r) => `${r.t}.${r.c}`.toLowerCase()));
+    value.courseMandatory = present.has('courses.is_mandatory');
+    value.videoGlobal = present.has('training_videos.is_global');
+    const missing = LMS_FLAG_COLUMNS
+      .filter(([t, c]) => !present.has(`${t}.${c}`))
+      .map(([t, c]) => `${t}.${c}`);
+    if (missing.length) {
+      logger.warn('LMS schema probe · missing ' + missing.join(', ')
+        + ' — treating the flag as 0 (run 2026-08-26-lms-mandatory-flags.sql)');
+    }
+    _flagCache = { value, checkedAt: now, stable: !missing.length };
+  } catch (e) {
+    /*
+     * See above: a failed probe is not evidence of absence, so the VALUE stays
+     * optimistic. The TTL does not — caching a guess for an hour would let one
+     * hiccup at boot decide the schema until the next restart. Short TTL, so
+     * the guess is re-tested a minute later.
+     */
+    logger.warn('LMS schema probe failed · ' + e.message + ' — assuming columns present');
+    _flagCache = { value, checkedAt: now, stable: false };
+  }
+  return _flagCache.value;
+}
+
+// Tests and the QA refresh drop/rebuild tables under a live process.
+function invalidateLmsSchemaCache() { _flagCache = null; }
+
+/*
  * What counts as "watched". Progress is monotonic (a BEFORE UPDATE trigger
  * plus a GREATEST() upsert mean it can never regress), so this compares
  * against the technician's high-water mark, not their latest ping.
@@ -205,7 +302,10 @@ async function listCourses({
    * A plain WHERE rather than a sort key: is_mandatory is two values, so
    * sorting by it just groups the list, while filtering removes the noise.
    */
-  if (mandatoryOnly) where.push('c.is_mandatory = 1');
+  const { courseMandatory } = await lmsFlagColumns();
+  // No column means no course is mandatory, so the filter must return nothing
+  // rather than everything — `1=0`, not a dropped clause.
+  if (mandatoryOnly) where.push(courseMandatory ? 'c.is_mandatory = 1' : '1=0');
   if (q && String(q).trim()) {
     where.push('(c.name LIKE ? OR c.description LIKE ?)');
     params.push(`%${String(q).trim()}%`, `%${String(q).trim()}%`);
@@ -225,7 +325,9 @@ async function listCourses({
    * itself is now called Content.
    */
   const [rows] = await pool.query(
-    `SELECT c.id, c.name, c.description, c.status, c.is_mandatory, c.created_at, c.updated_at,
+    `SELECT c.id, c.name, c.description, c.status,
+            ${courseMandatory ? 'c.is_mandatory' : '0 AS is_mandatory'},
+            c.created_at, c.updated_at,
             (SELECT COUNT(*) FROM lms_content lc WHERE lc.course_id = c.id AND lc.status = 1) AS video_count,
             (SELECT COUNT(*) FROM easyfixer_courses ec WHERE ec.course_id = c.id) AS assigned_count
        FROM courses c
@@ -245,8 +347,11 @@ async function listCourses({
 }
 
 async function getCourseById(id) {
+  const { courseMandatory } = await lmsFlagColumns();
   const [rows] = await pool.query(
-    `SELECT id, name, description, status, is_mandatory, created_at, updated_at
+    `SELECT id, name, description, status,
+            ${courseMandatory ? 'is_mandatory' : '0 AS is_mandatory'},
+            created_at, updated_at
        FROM courses WHERE id = ?`,
     [Number(id)],
   );
@@ -275,9 +380,19 @@ async function createCourse({ name, description, is_mandatory = false }) {
    * take the database server's own clock and bypass that conversion.
    */
   const now = new Date();
+  /*
+   * Column and value are dropped TOGETHER. Naming a column that is not there
+   * fails the whole INSERT, so pre-migration a course is still creatable — it
+   * just cannot be marked mandatory, which is the flag's own default anyway.
+   */
+  const { courseMandatory } = await lmsFlagColumns();
   const [ins] = await pool.query(
-    'INSERT INTO courses (name, description, status, is_mandatory, created_at, updated_at) VALUES (?, ?, 1, ?, ?, ?)',
-    [String(name).trim(), description || null, is_mandatory ? 1 : 0, now, now],
+    `INSERT INTO courses (name, description, status,
+                          ${courseMandatory ? 'is_mandatory,' : ''} created_at, updated_at)
+     VALUES (?, ?, 1, ${courseMandatory ? '?,' : ''} ?, ?)`,
+    courseMandatory
+      ? [String(name).trim(), description || null, is_mandatory ? 1 : 0, now, now]
+      : [String(name).trim(), description || null, now, now],
   );
   logger.info('Course created · id=' + ins.insertId);
   return { id: ins.insertId };
@@ -314,7 +429,7 @@ async function updateCourse(id, patch = {}) {
    * separate, explicit action (assignCourseToAll), so an operator flipping
    * this cannot silently create thousands of assignment rows by accident.
    */
-  if (patch.is_mandatory !== undefined) {
+  if (patch.is_mandatory !== undefined && (await lmsFlagColumns()).courseMandatory) {
     sets.push('is_mandatory = ?');
     params.push(patch.is_mandatory ? 1 : 0);
   }
@@ -1640,14 +1755,34 @@ async function assignCourseToAll(courseId, { dueDate = null } = {}) {
  *
  * Takes one `?` — the technician's efr_id.
  */
-const MANDATORY_VIDEO_IDS_SQL = `
-  SELECT tv.id FROM training_videos tv WHERE tv.is_global = 1
+/*
+ * A FUNCTION, not the constant this used to be, because both halves rest on a
+ * probed column and the answer is only known after a query.
+ *
+ * THE ARITY IS PART OF THE CONTRACT. Callers bind positionally — the mobile
+ * training screen passes the technician twice, the registration gate three
+ * times — so a missing column may never remove a `?`. Both flags therefore
+ * degrade by swapping the PREDICATE to `1=0`, which keeps each arm (and its
+ * placeholder) exactly where it was and simply returns no rows from it. The
+ * same rule itemCompleteSql states just above: a fragment that changes its
+ * placeholder count puts every later parameter one slot out.
+ *
+ * Pre-migration the whole set is therefore EMPTY, and empty is already a case
+ * every caller handles: services/mobile-registration.service.js treats a zero
+ * mandatory set as NOT complete and says so loudly, which is the safe
+ * direction — nobody is advanced out of training by a missing column.
+ */
+async function mandatoryVideoIdsSql() {
+  const { courseMandatory, videoGlobal } = await lmsFlagColumns();
+  return `
+  SELECT tv.id FROM training_videos tv WHERE ${videoGlobal ? 'tv.is_global = 1' : '1=0'}
    UNION
   SELECT lc.ref_id FROM lms_content lc
     JOIN courses c ON c.id = lc.course_id
     JOIN easyfixer_courses ec ON ec.course_id = c.id
    WHERE lc.kind = 'video' AND lc.status = 1
-     AND c.is_mandatory = 1 AND c.status = 1 AND ec.easyfixer_id = ?`;
+     AND ${courseMandatory ? 'c.is_mandatory = 1' : '1=0'} AND c.status = 1 AND ec.easyfixer_id = ?`;
+}
 
 /*
  * What the technician may SEE: everything they must complete, plus the videos
@@ -1661,12 +1796,14 @@ const MANDATORY_VIDEO_IDS_SQL = `
  * nothing. The other kinds reach the app through /api/mobile/lms/courses,
  * which is content-aware.
  */
-const VISIBLE_VIDEO_IDS_SQL = `
-  ${MANDATORY_VIDEO_IDS_SQL}
+async function visibleVideoIdsSql() {
+  return `
+  ${await mandatoryVideoIdsSql()}
    UNION
   SELECT lc2.ref_id FROM lms_content lc2
     JOIN easyfixer_courses ec2 ON ec2.course_id = lc2.course_id
    WHERE lc2.kind = 'video' AND lc2.status = 1 AND ec2.easyfixer_id = ?`;
+}
 
 /*
  * Give a technician every mandatory course they do not already hold.
@@ -1679,12 +1816,20 @@ const VISIBLE_VIDEO_IDS_SQL = `
 async function assignMandatoryCourses(efrId) {
   const id = Number(efrId);
   if (!id) return { assigned: 0 };
+  /*
+   * Guarded by the same ternary every other read uses rather than an early
+   * return. Without the flag `1=0` matches no course, the INSERT..SELECT
+   * inserts nothing and this still returns { assigned: 0 } — one code path
+   * instead of two, and no occurrence of the column that the source guard in
+   * tests/lms-schema-probe.test.js has to be taught to forgive.
+   */
+  const { courseMandatory } = await lmsFlagColumns();
   const now = new Date();
   const [res] = await pool.query(
     `INSERT INTO easyfixer_courses (easyfixer_id, course_id, created_at, updated_at, due_date)
      SELECT ?, c.id, ?, ?, NULL
        FROM courses c
-      WHERE c.is_mandatory = 1 AND c.status = 1
+      WHERE ${courseMandatory ? 'c.is_mandatory = 1' : '1=0'} AND c.status = 1
         AND NOT EXISTS (
           SELECT 1 FROM easyfixer_courses ec
            WHERE ec.easyfixer_id = ? AND ec.course_id = c.id)`,
@@ -2396,8 +2541,12 @@ async function ackDocument(efrId, contentId) {
  */
 async function coursesForTech(efrId) {
   const efr = Number(efrId);
+  // Probed: this is the technician's own LMS screen, and both the projection
+  // and the ordering below name a column that arrives by ALTER.
+  const { courseMandatory } = await lmsFlagColumns();
   const [courses] = await pool.query(
-    `SELECT ec.course_id AS id, c.name, c.description, c.is_mandatory,
+    `SELECT ec.course_id AS id, c.name, c.description,
+            ${courseMandatory ? 'c.is_mandatory' : '0 AS is_mandatory'},
             ec.due_date, ec.completion_date, ec.score
        FROM easyfixer_courses ec
        JOIN courses c ON c.id = ec.course_id
@@ -2409,8 +2558,12 @@ async function coursesForTech(efrId) {
        * reads as the optional one mattering more, which is backwards.
        * Ordered here rather than in a client so every client agrees, and so a
        * technician on an older build gets the same priority.
+       *
+       * Without the column nothing is mandatory, so the leading sort key is
+       * dropped rather than faked — the remaining due-date order is exactly
+       * what this screen showed before the flag existed.
        */
-      ORDER BY c.is_mandatory DESC, (ec.due_date IS NULL), ec.due_date ASC, c.name ASC`,
+      ORDER BY ${courseMandatory ? 'c.is_mandatory DESC, ' : ''}(ec.due_date IS NULL), ec.due_date ASC, c.name ASC`,
     [efr],
   );
   if (!courses.length) return { rows: [] };
@@ -2486,8 +2639,10 @@ async function coursesForTech(efrId) {
 }
 
 module.exports = {
-  MANDATORY_VIDEO_IDS_SQL,
-  VISIBLE_VIDEO_IDS_SQL,
+  mandatoryVideoIdsSql,
+  visibleVideoIdsSql,
+  lmsFlagColumns,
+  invalidateLmsSchemaCache,
   assignCourseToAll,
   assignMandatoryCourses,
   COMPLETION_PERCENT,

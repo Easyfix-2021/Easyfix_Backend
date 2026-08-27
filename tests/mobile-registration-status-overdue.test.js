@@ -48,6 +48,29 @@ lifecycleService.lifecycleFromRow = () => {
 deepSkillService.resolveImageUrlFromKey = async () => 'https://example.test/profiles/8379.jpg';
 
 const registration = require('../services/mobile-registration.service');
+const lms = require('../services/lms.service');
+
+/*
+ * The LMS flag probe is primed at BOOT (server.js) and cached for the process,
+ * so it is not per-request work and must not be counted against the budget
+ * below. Primed here for the same reason, against a fake that answers "both
+ * columns present" — the shape production runs in.
+ *
+ * The budget itself is unchanged and still means what it did: three queries per
+ * status call, and no second overdue-training query.
+ */
+async function primeLmsProbe() {
+  const db = require('../db');
+  const previous = db.pool.query;
+  db.pool.query = async () => [[
+    { t: 'courses', c: 'is_mandatory' },
+    { t: 'training_videos', c: 'is_global' },
+  ], []];
+  lms.invalidateLmsSchemaCache();
+  await lms.lmsFlagColumns();
+  db.pool.query = previous;
+  fake.reset();
+}
 
 after(() => {
   lifecycleService.readProjection = originalReadProjection;
@@ -57,6 +80,7 @@ after(() => {
 });
 
 test('status overlays the request lifecycle and locks jobs without another overdue query', async () => {
+  await primeLmsProbe();
   const authenticatedLifecycle = {
     status: 'ACTIVE',
     jobsAllowed: true,

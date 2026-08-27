@@ -244,6 +244,7 @@ router.post('/training-videos', validate(Joi.object({
     if (String(req.body.video_url || '').trim() && !lms.parseYouTubeUrl(req.body.video_url)) {
       return modernError(res, 400, 'video link must be a YouTube URL');
     }
+    const { videoGlobal } = await lms.lmsFlagColumns();
     const [ins] = await pool.query(
       /*
        * is_global = 0. A catalogue row created here is CONTENT; it becomes
@@ -253,8 +254,13 @@ router.post('/training-videos', validate(Joi.object({
        * must opt IN, or adding a video silently re-creates the 2026-08-26
        * platform-wide earning lockout.
        */
-      `INSERT INTO training_videos (title, description, sub_title, sub_description, is_global)
-       VALUES (?, ?, ?, ?, 0)`,
+      //
+      // Named only once the column is PROBED PRESENT. Omitting it is safe
+      // pre-migration (there is no column to default) and unsafe after — the
+      // DEFAULT is 1, so a dropped column here would make every new video
+      // globally mandatory. lms.lmsFlagColumns() is what tells the two apart.
+      `INSERT INTO training_videos (title, description, sub_title, sub_description${videoGlobal ? ', is_global' : ''})
+       VALUES (?, ?, ?, ?${videoGlobal ? ', 0' : ''})`,
       [req.body.title, req.body.description || null,
        req.body.sub_title || null, req.body.sub_description || null]
     );

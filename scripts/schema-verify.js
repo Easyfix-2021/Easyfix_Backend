@@ -164,16 +164,25 @@ const EXPECTED = {
   // playable URL; services/lms.service.js both reads it and writes it
   // (SET training_video_id = NULL / = ?), so it belongs here like any other
   // column the code's own SQL names.
+  //
+  // is_global is listed even though services/lms.service.js now PROBES it
+  // (2026-08-26-lms-mandatory-flags.sql). The probe stops a missing column
+  // 500ing a request; it does not make the column optional. Listing it here is
+  // what makes the gap visible at boot instead of as a silently empty
+  // mandatory set that nobody goes looking for.
   training_videos: [
     'id', 'title', 'description', 'sub_title', 'sub_description',
-    'training_video_id',
+    'training_video_id', 'is_global',
   ],
   // ─── LMS (services/lms.service.js) ──────────────────────────────────────
   // `courses` and `easyfixer_courses` pre-date the LMS work; only
   // courses.status is new (migrations/executed/2026-08-13-lms-foundation.sql).
   // Both are read on the LMS list/detail/report paths, so a missing column
   // here is a 500 on first request, not a degraded behaviour.
-  courses: ['id', 'name', 'description', 'status', 'created_at', 'updated_at'],
+  // is_mandatory: same migration, same reasoning as training_videos.is_global.
+  // Its absence from this list on 2026-08-26 is why the course list shipped
+  // ahead of its migration and 500'd rather than failing the boot check.
+  courses: ['id', 'name', 'description', 'status', 'created_at', 'updated_at', 'is_mandatory'],
   easyfixer_courses: [
     'id', 'easyfixer_id', 'course_id', 'score', 'created_at', 'updated_at',
   ],
@@ -185,7 +194,7 @@ const EXPECTED = {
    *
    * These belong under the STRICT rule, not the fail-soft one, and the reason
    * is worth stating: lms_content is what isTrainingComplete,
-   * MANDATORY_VIDEO_IDS_SQL and both completion stamps now read, and those
+   * mandatoryVideoIdsSql() and both completion stamps now read, and those
    * gate EARNING. Deploying this code against a database without these tables
    * would not degrade — it would make every technician's training unreadable,
    * which reads as incomplete, which stops them receiving work. Refusing to

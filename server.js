@@ -313,6 +313,26 @@ async function start() {
     logger.warn('Schema verify SKIPPED via SKIP_SCHEMA_VERIFY=true.');
   }
 
+  /*
+   * Resolve the two probed LMS flag columns before the first request.
+   *
+   * OUTSIDE the block above on purpose. SKIP_SCHEMA_VERIFY=true is the emergency
+   * boot that switches the parity check off wholesale — which is exactly when a
+   * runtime probe is the only thing left standing between a lagging migration
+   * and a 500 on the Content page.
+   *
+   * Priming here also keeps it off every request path: getStatus runs to a
+   * bounded three-query budget, and the technician's status call is not where
+   * the schema should be discovered. Non-fatal — the probe defaults to
+   * "present", so a failure here costs nothing the first request would not
+   * have paid anyway.
+   */
+  try {
+    await require('./services/lms.service').lmsFlagColumns();
+  } catch (err) {
+    logger.warn(`LMS schema probe could not be primed — ${err.message}`);
+  }
+
   const server = app.listen(PORT, () => {
     const env = process.env.NODE_ENV || 'development';
     logger.ready(`Server is ready — listening on http://localhost:${PORT} (${env} mode)`);
