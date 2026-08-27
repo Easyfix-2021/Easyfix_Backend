@@ -292,7 +292,25 @@ router.get('/action-queue', async (req, res, next) => {
          ${mine}
          AND J.approved_on_date_time IS NULL
          AND J.approval_reject_date_time IS NULL
-         AND J.job_status NOT IN (3,5,6)
+         /*
+          * ⚠ STATUS 15 ONLY. This was NOT IN (3,5,6), which admitted any
+          * non-terminal job that happened to carry an approval-pending billing
+          * line. Measured on QA that meant 6,832 ENQUIRIES (status 7) against
+          * 54 real approvals — a queue titled "Jobs waiting on you" that was
+          * 99% work the client could not act on, because no estimate had been
+          * sent for it.
+          *
+          * 15 is "estimate sent, not yet decided", which is the only state
+          * PATCH /jobs/:id/estimate/approve can clear. Queue membership and the
+          * action that empties it now describe the same set.
+          *
+          * Other queue types (site access, PO-pending, QC sign-off) remain
+          * absent rather than approximated; adding one later is additive — give
+          * the row a different type, which is why the label below is DERIVED
+          * rather than hardcoded. (No backticks in this comment: it lives
+          * inside a JS template literal, where one would end the string.)
+          */
+         AND J.job_status = 15
        GROUP BY J.job_id
        ORDER BY age_days DESC, J.job_id ASC
        LIMIT ?`, params);
@@ -309,10 +327,11 @@ router.get('/action-queue', async (req, res, next) => {
        * behind an Approve button, for work the client cannot approve because
        * no estimate has been sent.
        *
-       * The row stays — it does have an open billing line, and the reader may
-       * want to look — but it is labelled for what it is, and the action
-       * becomes View. `approvable` is the flag the card reads; the label is
-       * derived here so one definition serves every consumer.
+       * The WHERE above now admits only 15, so this is true for every row
+       * today. It is still DERIVED rather than hardcoded on purpose: if that
+       * filter is ever loosened, the labels stay honest by construction
+       * instead of every row silently reading "Estimate approval" again —
+       * which is exactly the bug this replaced.
        */
       type: Number(r.job_status) === 15 ? 'approval' : 'open',
       approvable: Number(r.job_status) === 15,

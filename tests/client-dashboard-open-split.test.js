@@ -83,44 +83,56 @@ test('both halves come from ONE query, so the segments cannot stop summing', asy
     'two queries is how the halves end up on different scopes and stop partitioning');
 });
 
-test('openTotal INCLUDES awaitingYou — the card subtracts rather than adds', async () => {
+test('the two counts are reported RAW and are allowed to overlap', async () => {
   const d = await call('/dashboard-summary');
   assert.equal(d.counts.openTotal, 20);
   assert.equal(d.counts.awaitingYou, 3);
-  assert.ok(d.counts.awaitingYou <= d.counts.openTotal,
-    'status 15 is non-terminal, so it is inside openTotal; adding the two would double it');
+  /*
+   * Status 15 is non-terminal, so it sits INSIDE openTotal — the card shows
+   * each figure exactly as its label names it, by decision. The route must not
+   * pre-subtract on the card's behalf: an earlier version did, and it produced
+   * an "EasyFix" number that no stated definition yields.
+   */
+  assert.ok(d.counts.awaitingYou <= d.counts.openTotal, 'the overlap is expected');
+  assert.equal(d.counts.pendingWithEasyfix, undefined, 'no pre-computed segment');
 });
 
 /* ── the queue ───────────────────────────────────────────────────────── */
 
-test('⚠ ONLY status 15 offers Approve — everything else offers View', async () => {
-  queueRows = [row(1, 15), row(2, 7), row(3, 0), row(4, 21)];
-  const d = await call('/action-queue');
-
-  const byId = Object.fromEntries(d.items.map((i) => [i.jobId, i]));
-  assert.equal(byId[1].action.label, 'Approve');
-  assert.equal(byId[1].action.method, 'PATCH');
-  assert.equal(byId[1].approvable, true);
-
-  for (const id of [2, 3, 4]) {
-    assert.equal(byId[id].action.label, 'View', `status ${byId[id].jobStatus} cannot be approved`);
-    assert.equal(byId[id].action.method, 'GET',
-      'a PATCH the server would reject is a button that lies');
-    assert.equal(byId[id].approvable, false);
-  }
+test('⚠ the QUERY admits status 15 and nothing else', async () => {
+  queueRows = [row(1, 15)];
+  await call('/action-queue');
+  const q = fake.calls.find((c) => /job_service_status = 1/i.test(c.sql));
+  assert.ok(q, 'the queue query should have run');
+  assert.match(q.sql, /J\.job_status = 15/,
+    'membership is status 15 — an estimate sent and not yet decided');
+  assert.doesNotMatch(q.sql, /job_status NOT IN \(3,5,6\)/,
+    'the old filter admitted 6,832 enquiries on QA against 54 real approvals');
 });
 
-test('an enquiry is typed as an open order, not an approval', async () => {
-  queueRows = [row(9, 7)];
+test('a status-15 row is an approval with the PATCH that clears it', async () => {
+  queueRows = [row(1, 15)];
+  const d = await call('/action-queue');
+  assert.equal(d.items[0].type, 'approval');
+  assert.equal(d.items[0].approvable, true);
+  assert.equal(d.items[0].action.label, 'Approve');
+  assert.equal(d.items[0].action.method, 'PATCH');
+  assert.match(d.items[0].action.path, /\/estimate\/approve$/,
+    'queue membership and the action that empties it must describe one set');
+});
+
+test('the label is DERIVED, so loosening the filter cannot resurrect the bug', async () => {
+  /*
+   * The WHERE admits only 15 today, so this row cannot occur in production.
+   * It is exercised anyway: the value of deriving the label rather than
+   * hardcoding it is precisely that a future filter change stays honest, and
+   * an untested branch is not a guarantee.
+   */
+  queueRows = [row(2, 7)];
   const d = await call('/action-queue');
   assert.equal(d.items[0].type, 'open');
-  assert.notEqual(d.items[0].type, 'approval',
-    '6,832 enquiries on QA carried the approval type and title');
-});
-
-test('non-approvable rows are KEPT, not filtered out', async () => {
-  queueRows = [row(1, 15), row(2, 7)];
-  const d = await call('/action-queue');
-  assert.equal(d.items.length, 2,
-    'they have a real open billing line and are worth looking at — they just cannot be approved');
+  assert.equal(d.items[0].approvable, false);
+  assert.equal(d.items[0].action.label, 'View');
+  assert.equal(d.items[0].action.method, 'GET',
+    'a PATCH the server would reject is a button that lies');
 });
