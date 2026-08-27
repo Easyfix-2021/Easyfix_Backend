@@ -50,6 +50,35 @@ const { withMysqlNamedLock } = require('./mysql-named-lock.service');
 const REPEAT_HOURS = 1;
 const STATE_KEY = 'plivo.balance.alert.last_sent_at';
 
+/*
+ * PRODUCTION ONLY.
+ *
+ * There is one Plivo account and every environment reads the same balance, so
+ * without this QA, staging and every developer's laptop would all mail ops
+ * about the same low balance — and an alert that arrives four times is one
+ * people build a filter for.
+ *
+ * Mirrors the QA database refresh, which runs only where ENVIRONMENT=qa and has
+ * no enable flag either: the host says what it is, and the job decides from
+ * that rather than from a property somebody could set wrongly per environment.
+ *
+ * EXACT MATCH, and therefore fail-closed: an unset or misspelled ENVIRONMENT
+ * sends nothing. That is the safe direction for a mailer but the dangerous one
+ * for an ALERT, so the silence is made loud elsewhere — the scheduler records a
+ * skipReason naming the actual value, which the admin Scheduled Jobs page
+ * shows, and logs it at boot. A production host with a wrong ENVIRONMENT is
+ * then one screen away from being spotted rather than being silently mute.
+ */
+const ALERT_ENVIRONMENT = 'production';
+
+function environmentName() {
+  return String(process.env.ENVIRONMENT || '').trim().toLowerCase();
+}
+
+function enabledForEnvironment() {
+  return environmentName() === ALERT_ENVIRONMENT;
+}
+
 function recipients() {
   const raw = String(props.getProperty('plivo.balance.alert.recipients') ?? '').trim();
   return raw.split(',').map((s) => s.trim()).filter(Boolean);
@@ -95,6 +124,18 @@ function body({ credits, threshold }) {
  * say what happened and a test can assert on it.
  */
 async function run() {
+  /*
+   * Checked HERE as well as at registration, because the admin Scheduled Jobs
+   * page has a Trigger Now button: without this, an operator on QA could fire
+   * the job by hand and mail ops from the wrong environment. The registration
+   * gate stops it running on a timer; this stops it running at all.
+   */
+  if (!enabledForEnvironment()) {
+    logger.info('Plivo balance alert skipped · ENVIRONMENT="' + environmentName()
+      + '" is not "' + ALERT_ENVIRONMENT + '"');
+    return { checked: false, skipped: 'environment', environment: environmentName() };
+  }
+
   const threshold = plivo.lowBalanceThreshold();
   const balance = await plivo.accountBalance();
 
@@ -170,4 +211,8 @@ async function runOnce() {
   return result;
 }
 
-module.exports = { run, runOnce, recipients, repeatHours, sentWithinCooldown, STATE_KEY, REPEAT_HOURS };
+module.exports = {
+  run, runOnce, recipients, repeatHours, sentWithinCooldown,
+  enabledForEnvironment, environmentName,
+  STATE_KEY, REPEAT_HOURS, ALERT_ENVIRONMENT,
+};

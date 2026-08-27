@@ -948,6 +948,8 @@ Step by step:
   3. If the credit is above the threshold, it clears any earlier alert so the next drop is reported immediately.
   4. If the credit is at or below the threshold, it emails the configured recipients — unless it already sent one recently, or the account has auto-recharge switched on.
 
+Where it runs: PRODUCTION ONLY. There is a single Plivo account shared by every environment, so if this ran on QA as well, the same low balance would be reported twice and people would start filtering it. On any other environment the task is registered but permanently skipped, and the reason shown above says which environment this host thinks it is.
+
 Settings (Setting -> Admin Actions, no deploy needed):
   plivo.balance.alert.recipients   who to email, comma separated. LEAVING THIS BLANK TURNS THE ALERT OFF — there is no separate on/off switch.
   plivo.balance.threshold          what counts as low (also drives the warning shown in the call panel)
@@ -967,6 +969,22 @@ While the balance stays low it repeats once an hour, and it resets as soon as th
    */
   if (cronDisabled) {
     plivoBalanceAlertJob.skipReason = 'CRON_DISABLED=true';
+  } else if (!plivoBalanceAlertCron.enabledForEnvironment()) {
+    /*
+     * One Plivo account, many environments. Without this, QA, staging and every
+     * developer's laptop would each mail ops about the same low balance.
+     *
+     * The skipReason NAMES the value it saw, and that matters more here than on
+     * the other jobs: this one is an ALERT, so a production host with a
+     * mis-set ENVIRONMENT would otherwise be silently mute exactly when it is
+     * needed. Surfaced on the admin Scheduled Jobs page and in the boot log, so
+     * the silence is one screen away from being noticed.
+     */
+    plivoBalanceAlertJob.skipReason =
+      `ENVIRONMENT is "${plivoBalanceAlertCron.environmentName() || '(unset)'}", not "${plivoBalanceAlertCron.ALERT_ENVIRONMENT}" — this alert runs on production only`;
+    logger.info('Plivo low-balance alert SKIPPED — ENVIRONMENT="'
+      + (plivoBalanceAlertCron.environmentName() || '(unset)')
+      + '" is not "' + plivoBalanceAlertCron.ALERT_ENVIRONMENT + '".');
   } else {
     plivoBalanceAlertJob.task = cron.schedule(
       plivoBalanceAlertJob.cron,
@@ -974,8 +992,8 @@ While the balance stays low it repeats once an hour, and it resets as soon as th
       { timezone: TZ },
     );
     plivoBalanceAlertJob.registered = true;
-    logger.info('Plivo low-balance alert registered (every 3h; silent while '
-      + 'plivo.balance.alert.recipients is blank).');
+    logger.info('Plivo low-balance alert registered (ENVIRONMENT=production, every 3h; '
+      + 'silent while plivo.balance.alert.recipients is blank).');
   }
 
   // ─── Technician lifecycle evaluation — daily at 02:00 IST ─────────

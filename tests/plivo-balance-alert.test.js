@@ -30,8 +30,65 @@ plivo.accountBalance = async () => scenario.balance;
 plivo.lowBalanceThreshold = () => Number(store.get('plivo.balance.threshold') ?? 5);
 email.send = async (msg) => { sent.push(msg); };
 
-beforeEach(() => { store.clear(); sent.length = 0; scenario.balance = { ok: true, cashCredits: 1, autoRecharge: false }; });
-after(() => {});
+const savedEnv = process.env.ENVIRONMENT;
+beforeEach(() => {
+  store.clear();
+  sent.length = 0;
+  scenario.balance = { ok: true, cashCredits: 1, autoRecharge: false };
+  // The job is production-only; the behaviour tests below are about what it
+  // does WHEN it runs, so put them on a production host.
+  process.env.ENVIRONMENT = 'production';
+});
+after(() => {
+  if (savedEnv === undefined) delete process.env.ENVIRONMENT;
+  else process.env.ENVIRONMENT = savedEnv;
+});
+
+// ─── Production only ─────────────────────────────────────────────────
+
+/*
+ * One Plivo account, many environments. Without this gate QA, staging and every
+ * developer's laptop would each mail ops about the same low balance — and an
+ * alert that arrives four times is one people build a filter for.
+ */
+test('every non-production environment is silent', async () => {
+  for (const env of ['qa', 'staging', 'local', 'dev', 'prod', 'productions', '']) {
+    store.clear(); sent.length = 0;
+    store.set('plivo.balance.alert.recipients', 'ops@x.com');
+    process.env.ENVIRONMENT = env;
+    const r = await cron.run();
+    assert.equal(r.skipped, 'environment', `ENVIRONMENT="${env}" must not alert`);
+    assert.equal(sent.length, 0);
+  }
+  /*
+   * "prod" and "productions" are deliberately in that list. The compose file
+   * says "production", and an EXACT match is what stops a near-miss from
+   * quietly half-working. Casing and surrounding whitespace ARE forgiven —
+   * environmentName() trims and lowercases — and that is asserted separately
+   * below rather than being assumed here.
+   */
+});
+
+test('an UNSET environment is silent too — fail closed', async () => {
+  store.set('plivo.balance.alert.recipients', 'ops@x.com');
+  delete process.env.ENVIRONMENT;
+  const r = await cron.run();
+  assert.equal(r.skipped, 'environment');
+  assert.equal(cron.environmentName(), '');
+  assert.equal(sent.length, 0,
+    'a host that cannot say what it is must not mail ops — the scheduler '
+    + 'surfaces the skipReason so this cannot be silent on production');
+});
+
+test('production alerts, and casing/whitespace do not break it', async () => {
+  for (const env of ['production', 'PRODUCTION', '  production  ']) {
+    store.clear(); sent.length = 0;
+    store.set('plivo.balance.alert.recipients', 'ops@x.com');
+    process.env.ENVIRONMENT = env;
+    const r = await cron.run();
+    assert.equal(r.sent, true, `ENVIRONMENT="${env}" should alert`);
+  }
+});
 
 test('a low balance emails the configured people', async () => {
   store.set('plivo.balance.alert.recipients', 'a@x.com, b@y.com');
