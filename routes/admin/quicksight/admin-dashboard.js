@@ -30,71 +30,26 @@ const router = require('express').Router();
 const Joi = require('joi');
 
 const requireQuickSight = require('../../../middleware/require-quicksight');
+const { adminOrReportingManager, forceOwnHierarchy } = require('../../../middleware/quicksight-admin-or-rm');
 const validate = require('../../../middleware/validate');
 const { modernOk, modernError } = require('../../../utils/response');
 const { streamStyledXlsx } = require('../../../utils/xlsx-styled-export');
-const { getRoleById } = require('../../../services/role.service');
 const { fileStamp, displayStamp, FMT, decorateColumns } = require('../../../services/quicksight/_shared');
 const service = require('../../../services/quicksight/quicksight-admin-dashboard.service');
 const logger = require('../../../logger');
 
-const ADMIN_ROLE_ID = 2; // legacy loginToFloorDiscipline gate: roleId == 2.
-
-// ── Access gate: ef-QuickSight family key + this report's per-report key ──
-router.use(requireQuickSight('isQuickSightAdminDashboardView'));
-
 /*
- * requireAdmin — strict Admin-only (legacy roleId==2). Mirrors the legacy
- * "Access Denied. Only Admin can view this page." 403. Resolves the acting
- * user's role via getRoleById (case-insensitive role_name match would also
- * work; role_id==2 is the verbatim legacy predicate).
+ * ACCESS: family key, then Admin OR the per-report key OR being a reporting
+ * manager, then the server-side hierarchy pin for everyone who is not Admin.
+ *
+ * Both middlewares now live in middleware/quicksight-admin-or-rm.js. They were
+ * written inline here first, and employee-productivity.js — the report the
+ * operator actually opens from the QuickSight page — was left on its
+ * per-report key alone. One definition, mounted twice.
  */
-async function requireAdminOrReportingManager(req, res, next) {
-  try {
-    if (!req.user || !req.user.user_id) {
-      return modernError(res, 401, 'authentication required');
-    }
-    const roleRow = await getRoleById(req.user.user_role);
-    req.qsIsAdmin = Boolean(roleRow && roleRow.role_status && roleRow.role_id === ADMIN_ROLE_ID);
-    if (req.qsIsAdmin) return next();
-
-    /*
-     * A REPORTING MANAGER may now open this report too — their own team only.
-     * "Reporting manager" is a RELATION, not a role: somebody reports to them.
-     * The predicate is the same one that builds the dropdown, so the answers to
-     * "can you open this" and "are you in the list" cannot diverge.
-     */
-    if (await service.isReportingManager(req.user.user_id)) return next();
-
-    return modernError(res, 403, 'Access Denied. Only Admin can view this page.');
-  } catch (err) {
-    return next(err);
-  }
-}
-router.use(requireAdminOrReportingManager);
-
-/*
- * THE SCOPE IS SERVER-SIDE, and it has to be.
- *
- * A reporting manager sees no Reporting Manager dropdown, but the field is
- * still a request parameter — hiding a control does not stop anyone sending
- * the value. So the id is OVERWRITTEN here for every non-Admin, on every route
- * and every method, rather than trusted from the client.
- *
- * At the router level on purpose: a per-handler check is one a future endpoint
- * forgets, and this file already has eight. Runs before validate(), so Joi sees
- * the forced value like any other.
- *
- * resolveRmTeamUserIds(rmId) returns the manager's direct reports PLUS the
- * manager, so pinning this one field yields exactly "me and my hierarchy".
- */
-router.use((req, _res, next) => {
-  if (req.qsIsAdmin) return next();
-  const own = Number(req.user.user_id) || 0;
-  if (req.body && typeof req.body === 'object') req.body.reportingManagerId = own;
-  if (req.query && typeof req.query === 'object') req.query.reportingManagerId = String(own);
-  return next();
-});
+router.use(requireQuickSight());
+router.use(adminOrReportingManager('isQuickSightAdminDashboardView'));
+router.use(forceOwnHierarchy);
 
 // ── Joi schemas (inline; the legacy FloorFilterDto) ──────────────────────
 const filterSchema = Joi.object({

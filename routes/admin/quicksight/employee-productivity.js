@@ -33,6 +33,7 @@ const router = require('express').Router();
 const Joi = require('joi');
 
 const requireQuickSight = require('../../../middleware/require-quicksight');
+const { adminOrReportingManager, forceOwnHierarchy } = require('../../../middleware/quicksight-admin-or-rm');
 const validate = require('../../../middleware/validate');
 const { modernOk, modernError } = require('../../../utils/response');
 const { streamStyledXlsx } = require('../../../utils/xlsx-styled-export');
@@ -45,8 +46,21 @@ const logger = require('../../../logger');
 // matching employee — referenced symbolically so it can't drift from the cap.
 const XLSX_EXPORT_SIZE = service.GROUPED_CAP;
 
-// Per-report access gate: ef-QuickSight family key + this report's own key.
-router.use(requireQuickSight('isQuickSightEmployeeProductivityView'));
+/*
+ * ACCESS: family key, then Admin OR the per-report key OR being a reporting
+ * manager. The relation matters because this report is a manager's view of
+ * their own team — a Project Manager with reportees is exactly its audience,
+ * and no role grant expresses "has people reporting to them".
+ *
+ * This used to be requireQuickSight('isQuickSightEmployeeProductivityView')
+ * alone, so a reporting manager whose role lacked that grant got an empty
+ * QuickSight page. The admin-or-RM gate had been written, but mounted on
+ * admin-dashboard.js — a DIFFERENT report — so the one the operator opens
+ * never had it.
+ */
+router.use(requireQuickSight());
+router.use(adminOrReportingManager('isQuickSightEmployeeProductivityView'));
+router.use(forceOwnHierarchy);
 
 // ── Joi schemas (inline) ─────────────────────────────────────────────
 // 'YYYY-MM-DD' date strings; ids default '0' (= All); findByDateType drives

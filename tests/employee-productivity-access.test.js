@@ -21,21 +21,37 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const ROUTE = fs.readFileSync(
-  path.join(__dirname, '..', 'routes/admin/quicksight/admin-dashboard.js'), 'utf8',
+/*
+ * The gate moved. It was written inline in admin-dashboard.js, and the report
+ * an operator actually opens from the QuickSight page — employee-productivity —
+ * was left gated on its per-report action key alone, so a reporting manager
+ * without that grant saw "No Reports Available". One definition now lives in
+ * middleware, and BOTH routers mount it; these assertions follow it there.
+ */
+const GATE = fs.readFileSync(
+  path.join(__dirname, '..', 'middleware/quicksight-admin-or-rm.js'), 'utf8',
 );
+const ROUTE = GATE;
+const MOUNTS = ['routes/admin/quicksight/admin-dashboard.js',
+                'routes/admin/quicksight/employee-productivity.js']
+  .map((rel) => [rel, fs.readFileSync(path.join(__dirname, '..', rel), 'utf8')]);
 const SERVICE = fs.readFileSync(
   path.join(__dirname, '..', 'services/quicksight/quicksight-admin-dashboard.service.js'), 'utf8',
 );
 
 test('the gate admits Admins AND reporting managers, and nobody else', () => {
-  assert.match(ROUTE, /async function requireAdminOrReportingManager\(/);
+  assert.match(ROUTE, /function adminOrReportingManager\(reportKey\)/,
+    'the gate is a factory now — it takes the per-report key');
   assert.match(ROUTE, /role_id === ADMIN_ROLE_ID/, 'Admin still passes on role');
-  assert.match(ROUTE, /await service\.isReportingManager\(req\.user\.user_id\)/,
+  assert.match(ROUTE, /await isReportingManager\(req\.user\.user_id\)/,
     'a reporting manager passes on the RELATION, not on a role');
   assert.match(ROUTE, /403, 'Access Denied\. Only Admin can view this page\.'/,
     'everyone else is still refused');
-  assert.match(ROUTE, /router\.use\(requireAdminOrReportingManager\)/,
+  for (const [rel, src] of MOUNTS) {
+    assert.match(src, /router\.use\(adminOrReportingManager\('isQuickSight\w+View'\)\)/,
+      `${rel} must mount the shared gate — the bug was one router having it and the other not`);
+  }
+  assert.match(ROUTE, /perms\.includes\(reportKey\)/,
     'mounted for the WHOLE router — a new route must not opt in by hand');
 });
 
@@ -45,11 +61,15 @@ test('a non-Admin cannot choose whose team they see — the id is overwritten', 
    * someone else's id gets their own back. This is the one test that would
    * fail if the scope were ever left to the client.
    */
-  const mw = ROUTE.slice(ROUTE.indexOf('router.use((req, _res, next) => {'));
-  const body = mw.slice(0, mw.indexOf('});') + 3);
+  const mw = ROUTE.slice(ROUTE.indexOf('function forceOwnHierarchy('));
+  const body = mw.slice(0, mw.indexOf('\n}\n') + 3);
   assert.match(body, /if \(req\.qsIsAdmin\) return next\(\);/, 'Admins keep their choice');
-  assert.match(body, /const own = Number\(req\.user\.user_id\) \|\| 0;/,
+  // Allows the null-guard the shared middleware adds; what matters is the
+  // SOURCE — req.user — never anything the caller sent.
+  assert.match(body, /const own = Number\(req\.user(?: && req\.user)?\.user_id\) \|\| 0;/,
     'the value comes from the SESSION');
+  assert.equal(/reportingManagerId\s*=\s*(?:req\.(?:body|query)|Number\(req\.(?:body|query))/.test(body), false,
+    'the override must never read the id back off the request it is overriding');
   assert.match(body, /req\.body\.reportingManagerId = own/);
   assert.match(body, /req\.query\.reportingManagerId = String\(own\)/,
     'GET routes carry it in the query, so both have to be pinned');
@@ -62,16 +82,22 @@ test('the override is router-level, ahead of every handler', () => {
    * SETS the flag and once in the scope override that reads it — so an indexOf
    * on that line finds the wrong one and the assertion measures nothing.
    */
-  const gate = ROUTE.indexOf('router.use(requireAdminOrReportingManager)');
-  const scope = ROUTE.indexOf('router.use((req, _res, next) => {');
-  const firstRoute = ROUTE.search(/router\.(get|post)\(/);
-  assert.ok(gate > -1 && scope > gate, 'scope runs after the gate that sets qsIsAdmin');
-  assert.ok(scope < firstRoute, 'and before the first route that could read the field');
+  for (const [rel, src] of MOUNTS) {
+    const gate = src.indexOf("router.use(adminOrReportingManager(");
+    const scope = src.indexOf('router.use(forceOwnHierarchy)');
+    const firstRoute = src.search(/router\.(get|post)\(/);
+    assert.ok(gate > -1, `${rel} mounts the gate`);
+    assert.ok(scope > gate, `${rel}: scope must run AFTER the gate that sets qsIsAdmin`);
+    assert.ok(firstRoute === -1 || scope < firstRoute,
+      `${rel}: scope must be mounted before the first route that could read the field`);
+  }
 });
 
 test('/access reports the REAL role, not a hardcoded true', () => {
-  assert.match(ROUTE, /isAdmin: Boolean\(req\.qsIsAdmin\)/);
-  assert.equal(/isAdmin: true/.test(ROUTE.replace(/\/\*[\s\S]*?\*\//g, '')), false,
+  // /access lives on the report router, not on the shared gate.
+  const ad = MOUNTS.find(([rel]) => rel.endsWith('admin-dashboard.js'))[1];
+  assert.match(ad, /isAdmin: Boolean\(req\.qsIsAdmin\)/);
+  assert.equal(/isAdmin: true/.test(ad.replace(/\/\*[\s\S]*?\*\//g, '')), false,
     'the old hardcoded value was honest only while the router was Admin-only');
 });
 
