@@ -294,3 +294,98 @@ test('judgeAgainst returns NULL when there is nothing to judge, never ok', () =>
   assert.equal(targets.judgeAgainst('avg_age_days', 2, 3), 'ok');
   assert.equal(targets.judgeAgainst('avg_age_days', 9, 3), 'risk');
 });
+
+/* ── first-time fix = SAME-DAY CLOSE (2026-08-27) ─────────────────────
+ *
+ * It used to mean "no child row in linked_job" — nobody came back. Measured
+ * over a year of completed jobs on QA that rule scored 98.4% against an 85%
+ * target, so it could not fail for anybody. The definition is whether the
+ * technician checked in and checked out on the SAME DAY: 55.0%.
+ *
+ * The tests below pin BOTH halves, because changing one without the other is
+ * the more damaging outcome: revisit was literally `100 - ftfr`, so a same-day
+ * ftfr would have made it report 45% of jobs needing a second visit against a
+ * target of 10%, when the real figure is 1.6%.
+ */
+
+/** Run firstTimeFix against a pool that reports linked_job present/absent. */
+async function withFtf(routes, fn) {
+  const iso = installFakePool(routes);
+  try {
+    delete require.cache[require.resolve('../services/client-performance.service')];
+    const svc = require('../services/client-performance.service');
+    const out = await fn(svc, iso);
+    return out;
+  } finally {
+    iso.restore();
+    delete require.cache[require.resolve('../services/client-performance.service')];
+  }
+}
+
+test('first-time fix is measured on same-day check-in/check-out, not on linked_job', async () => {
+  let q;
+  await withFtf([
+    [/^\s*SHOW TABLES LIKE 'linked_job'/i, [{ Tables_in_db: 'linked_job' }]],
+    [/FROM tbl_job J/i, [{ completed: 0, first_time_fixed: 0, revisited: 0 }]],
+  ], async (svc, iso) => {
+    await svc.firstTimeFix(SCOPE);
+    q = [...iso.calls].reverse().find((c) => /first_time_fixed/i.test(c.sql));
+  });
+
+  assert.ok(q, 'the aggregate should have run');
+  assert.match(q.sql, /DATE\(J\.checkin_date_time\) = DATE\(J\.checkout_date_time\)/,
+    'same DAY, not same timestamp — a visit that starts at 09:00 and ends at 17:00 is one visit');
+  assert.match(q.sql, /J\.checkin_date_time IS NOT NULL/,
+    'a job with no check-in was not fixed on a first visit that never happened');
+  assert.doesNotMatch(q.sql, /first_time_fixed[\s\S]{0,80}parent_job_id IS NULL/,
+    'ftfr must no longer be derived from the absence of a linked job');
+});
+
+test('revisit keeps the linked_job rule and is counted SEPARATELY, not 100 - ftfr', async () => {
+  let out; let q;
+  await withFtf([
+    [/^\s*SHOW TABLES LIKE 'linked_job'/i, [{ Tables_in_db: 'linked_job' }]],
+    // 100 completed: 55 closed same-day, 2 spawned a revisit.
+    [/FROM tbl_job J/i, [{ completed: 100, first_time_fixed: 55, revisited: 2 }]],
+  ], async (svc, iso) => {
+    out = await svc.firstTimeFix(SCOPE);
+    q = [...iso.calls].reverse().find((c) => /first_time_fixed/i.test(c.sql));
+  });
+
+  assert.match(q.sql, /parent_job_id IS NOT NULL/, 'revisit is still the linked_job fact');
+  assert.equal(out.ftfrPct, 55);
+  assert.equal(out.revisitPct, 2,
+    'NOT 45 — the two measure different things, and coupling them would claim '
+    + 'nearly half of all work needed a second visit');
+  assert.notEqual(out.revisitPct, 100 - out.ftfrPct, 'the old derivation is gone');
+});
+
+test('without linked_job, first-time fix still works and revisit is NULL', async () => {
+  let out; let q;
+  await withFtf([
+    [/^\s*SHOW TABLES LIKE 'linked_job'/i, []],   // table absent
+    [/FROM tbl_job J/i, [{ completed: 40, first_time_fixed: 30, revisited: null }]],
+  ], async (svc, iso) => {
+    out = await svc.firstTimeFix(SCOPE);
+    q = [...iso.calls].reverse().find((c) => /first_time_fixed/i.test(c.sql));
+  });
+
+  assert.ok(q, 'the aggregate must still run — ftfr no longer depends on that table');
+  assert.doesNotMatch(q.sql, /JOIN \(SELECT DISTINCT parent_job_id FROM linked_job\)/,
+    'no join to a table that does not exist');
+  assert.equal(out.ftfrPct, 75, 'same-day close needs only two core tbl_job columns');
+  assert.equal(out.revisitPct, null,
+    'NULL, not 0 — "we cannot measure this" is not "nobody came back"');
+  assert.equal(out.available, false, 'and the flag says which half is unmeasurable');
+});
+
+test('an empty window is nulls, never a fabricated 100%', async () => {
+  let out;
+  await withFtf([
+    [/^\s*SHOW TABLES LIKE 'linked_job'/i, [{ Tables_in_db: 'linked_job' }]],
+    [/FROM tbl_job J/i, [{ completed: 0, first_time_fixed: 0, revisited: 0 }]],
+  ], async (svc) => { out = await svc.firstTimeFix(SCOPE); });
+
+  assert.equal(out.ftfrPct, null, '0 of 0 is not 100% and is not 0%');
+  assert.equal(out.revisitPct, null);
+});
