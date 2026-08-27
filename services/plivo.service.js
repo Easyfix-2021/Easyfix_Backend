@@ -32,6 +32,7 @@ const { getProperty } = require('./properties.service');
  */
 
 const BASE = (process.env.PLIVO_BASE_URL || 'https://api.plivo.com/v1').replace(/\/+$/, '');
+const { cached } = require('../utils/ttl-cache');
 const TOKEN_TTL_SEC = 15 * 60; // answer/ring/hangup callbacks all fire well within 15 min
 
 function callingEnabled() {
@@ -256,6 +257,67 @@ function authHeader() {
   const token = process.env.PLIVO_AUTH_TOKEN;
   if (!id || !token) return null;
   return 'Basic ' + Buffer.from(`${id}:${token}`).toString('base64');
+}
+
+/*
+ * The Plivo account's remaining credit.
+ *
+ * WHY THIS IS A CALL-PATH CONCERN AND NOT AN ACCOUNTING ONE. A Plivo account
+ * that has run out of credit does not refuse the API call — /Call/ still
+ * returns, the conference is still created, our audit row is still written, and
+ * the browser leg then dies at signalling. The operator sees "Busy", the server
+ * logs a clean 200, and nothing anywhere says "you are out of money". That is
+ * the shape of a real production block: every call failing, every log green.
+ *
+ * So the balance is read PROACTIVELY, on the credentials call the panel already
+ * makes, and reported through the same `warnings` array that already carries
+ * the misconfiguration checks — the operator gets the reason before dialling
+ * rather than a hangup cause afterwards.
+ *
+ * FAILS SOFT AND SILENT. An unreachable billing endpoint means we do not know
+ * the balance, which is not the same as knowing it is low. Returning ok:false
+ * produces no warning at all: crying wolf here would train operators to ignore
+ * the one banner that matters.
+ *
+ * Timeout is deliberate. This sits in front of the panel opening, so a slow
+ * Plivo must degrade to "no balance info" rather than hang the operator's
+ * screen behind a billing API.
+ */
+async function accountBalance({ timeoutMs = 3000 } = {}) {
+  const auth = authHeader();
+  const id = process.env.PLIVO_AUTH_ID;
+  if (!auth || !id) return { ok: false, reason: 'not-configured' };
+  try {
+    const res = await fetch(`${BASE}/Account/${encodeURIComponent(id)}/`, {
+      headers: { Authorization: auth },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) {
+      logger.warn('Plivo balance lookup FAIL · http=' + res.status);
+      return { ok: false, httpStatus: res.status };
+    }
+    const body = await res.json();
+    // Plivo returns cash_credits as a STRING ("12.3456"). Number() on a missing
+    // field yields NaN, which must read as "unknown", never as zero — a false
+    // "out of credit" banner is worse than none.
+    const credits = Number(body && body.cash_credits);
+    if (!Number.isFinite(credits)) return { ok: false, reason: 'no-balance-field' };
+    return { ok: true, cashCredits: credits, autoRecharge: Boolean(body && body.auto_recharge) };
+  } catch (e) {
+    logger.warn('Plivo balance lookup error · ' + e.message);
+    return { ok: false, reason: 'error', error: e.message };
+  }
+}
+
+/*
+ * Cached for a minute. The panel fetches credentials every time it opens, and a
+ * balance does not move fast enough to justify a billing-API round trip each
+ * time. ttl-cache never stores a rejection; accountBalance never throws, so the
+ * "unknown" result is cached too — which is correct: a Plivo that is down stays
+ * down for more than a second.
+ */
+async function accountBalanceCached() {
+  return cached('plivo:account-balance', 60_000, () => accountBalance());
 }
 
 /*
@@ -607,6 +669,8 @@ function resolveWebDial(id) {
 }
 
 module.exports = {
+  accountBalance,
+  accountBalanceCached,
   clickToCall,
   previewCallLegs,
   resolveCallLegs,

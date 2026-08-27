@@ -575,12 +575,20 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
   } catch (e) { next(e); }
 });
 
+/*
+ * Warn below this much Plivo credit. Deliberately not zero: at zero the calls
+ * are already failing, and the point of the banner is to arrive BEFORE that.
+ * A minute of Indian voice is cents, so single digits is roughly "today".
+ * Tune with PLIVO_LOW_BALANCE_WARN without a deploy.
+ */
+const LOW_BALANCE_WARN = Number(process.env.PLIVO_LOW_BALANCE_WARN || 5);
+
 // ─── GET /web-credentials — Plivo Browser SDK login (Web Call mode) ────
 // Returns a PER-OPERATOR, short-lived Plivo access token (no shared endpoint
 // password crosses the wire) + the caller-id the browser dials. The SDK logs in
 // via client.loginWithAccessToken(). Gated by the click-to-call permission;
 // served ONLY when Web mode is on, Plivo is enabled, and the endpoint is set.
-router.get('/web-credentials', requireClickToCallAction, (req, res) => {
+router.get('/web-credentials', requireClickToCallAction, async (req, res) => {
   logger.info('Get Plivo web credentials');
   if (voice.callMode() !== 'web') logger.warn('Web credentials denied · web calling not enabled');
   if (voice.callMode() !== 'web') return modernError(res, 409, 'Web calling is not enabled (voice.call.mode != web).');
@@ -630,6 +638,39 @@ router.get('/web-credentials', requireClickToCallAction, (req, res) => {
     warnings.push('PLIVO_CALLBACK_BASE_URL / PUBLIC_API_BASE_URL is not set — Plivo cannot reach '
       + 'our callbacks even once the application routes the call.');
   }
+  /*
+   * BALANCE, not just configuration.
+   *
+   * An out-of-credit Plivo account produces the SAME symptom as a missing
+   * PLIVO_WEB_APP_ID and gives the operator even less to go on: the API accepts
+   * the call, the conference is created, our audit row is written, /web-start
+   * returns 200 in 29ms, and the browser leg dies at signalling with "Busy".
+   * Every log line is green. That is what blocked calling on production on
+   * 2026-08-27, and the only way anyone found out was by checking the Plivo
+   * console by hand.
+   *
+   * Reported through the same array the panel already renders, so no new UI
+   * path — and reported as its OWN sentence, because "top up the account" and
+   * "set an environment variable" go to different people.
+   *
+   * Only when we actually KNOW. accountBalanceCached() returns ok:false for an
+   * unreachable or unparseable billing response, and that produces no warning:
+   * not knowing the balance is not the same as knowing it is low, and a banner
+   * that cries wolf is one operators learn to scroll past.
+   */
+  try {
+    const balance = await plivo.accountBalanceCached();
+    if (balance.ok && balance.cashCredits <= LOW_BALANCE_WARN && !balance.autoRecharge) {
+      warnings.push(
+        `Plivo account credit is ${balance.cashCredits.toFixed(2)} — outgoing calls fail as `
+        + '"Busy" once it runs out, with no error anywhere. Top up the Plivo account.',
+      );
+    }
+  } catch (e) {
+    // Never let a billing lookup break the credentials the panel needs to log in.
+    logger.warn('Plivo balance check skipped · ' + e.message);
+  }
+
   for (const w of warnings) logger.error('Web calling misconfigured · ' + w);
 
   return modernOk(res, {
