@@ -54,8 +54,8 @@ const scenario = { callRows: [], txnRows: [] };
 
 const fake = installFakePool([
   [/FROM tbl_easyfixer_call_record/i, () => scenario.callRows],
-  [/^SELECT COUNT\(\*\) AS total\s+FROM tbl_job_transaction/i, [{ total: 1 }]],
-  [/FROM tbl_job_transaction TJT/i, () => scenario.txnRows],
+  [/^SELECT COUNT\(\*\) AS total FROM tbl_easyfixer_transaction/i, [{ total: 1 }]],
+  [/FROM tbl_easyfixer_transaction T/i, () => scenario.txnRows],
 ]);
 
 const efrSvc = require('../services/easyfixer.service');
@@ -69,14 +69,17 @@ const oneMatching = (re) => {
 };
 
 /*
- * listTransactions runs TWO statements over tbl_job_transaction — the paginated
- * data query and the separate COUNT. `FROM tbl_job_transaction TJT` appears in
- * both, so the data query is identified by its LIMIT ? OFFSET ? tail and the
- * COUNT by its projection. Keeping them distinct is the whole point of the
- * COUNT-parity test below.
+ * listTransactions runs TWO statements over tbl_easyfixer_transaction — the
+ * technician's money LEDGER — so the data query is identified by its
+ * LIMIT ? OFFSET ? tail and the COUNT by its projection.
+ *
+ * It used to read tbl_job_transaction, the per-job charge split. That table has
+ * no transaction_id, transaction_date, amount, balance or description, so six
+ * of the modal's eleven columns rendered an em dash on every row. See the
+ * ledger-source test at the bottom of this file.
  */
-const TXN_DATA = /FROM tbl_job_transaction TJT[\s\S]*LIMIT \? OFFSET \?/i;
-const TXN_COUNT = /^SELECT COUNT\(\*\) AS total\s+FROM tbl_job_transaction/i;
+const TXN_DATA = /FROM tbl_easyfixer_transaction T[\s\S]*LIMIT \? OFFSET \?/i;
+const TXN_COUNT = /^SELECT COUNT\(\*\) AS total FROM tbl_easyfixer_transaction/i;
 
 /*
  * Source with comments removed. The static sweep below looks for an unguarded
@@ -297,30 +300,41 @@ test('listTransactions projects the guarded form under the UNCHANGED alias', asy
   await efrSvc.listTransactions(7, { limit: 10, offset: 0 });
   const sql = oneMatching(TXN_DATA);
   assert.ok(
-    sql.includes("COALESCE(NULLIF(TRIM(J.job_customer_name), ''), cu.customer_name) AS customer_name"),
+    sql.includes("COALESCE(NULLIF(TRIM(J.job_customer_name), ''), C.customer_name) AS customer_name"),
     `exact shipped projection missing from:\n${sql}`,
   );
   // EasyfixerTransactionsModal.tsx reads `t.customer_name` — the alias IS the contract.
   assert.equal((sql.match(/\bAS customer_name\b/g) || []).length, 1, 'exactly one customer_name alias');
-  assert.match(sql, /AS customer_mob_no/, 'sibling columns untouched');
+  assert.match(sql, /AS customer_address/, 'sibling columns untouched');
 });
 
-test('COUNT-JOIN PARITY: tbl_job J is joined in BOTH listTransactions statements', async () => {
+test('the ledger COUNT needs no joins, and must not grow any', async () => {
   /*
-   * The recorded 500 is a projection that needs a join the SEPARATE COUNT query
-   * lacks. Here J was already joined by both (the efrId filter reads
-   * J.fk_easyfixter_id), so J.job_customer_name adds no join at all — asserted
-   * on both statements rather than assumed.
+   * The COUNT-parity rule is "the COUNT must carry every join its WHERE reads",
+   * and it used to bite here because the filter was J.fk_easyfixter_id — an
+   * alias that only exists via a join. The ledger filters on T.easyfixer_id,
+   * its own column, so the correct COUNT has NO joins at all. Adding them back
+   * would scan more and change nothing.
+   *
+   * The rule still applies to the DATA query: every alias it projects must be
+   * joined, which is asserted alongside.
    */
   await efrSvc.listTransactions(7, { limit: 10, offset: 0 });
   const count = oneMatching(TXN_COUNT);
   const data = oneMatching(TXN_DATA);
-  for (const [label, sql] of [['COUNT', count], ['data', data]]) {
-    assert.match(sql, /JOIN tbl_job J\s+ON J\.job_id\s+=\s+TJT\.fk_job_id/i, `${label} must join tbl_job J`);
-    assert.match(sql, /WHERE J\.fk_easyfixter_id = \?/, `${label} filter must be unchanged`);
+
+  assert.match(count, /WHERE T\.easyfixer_id = \?/, 'COUNT filters on the ledger itself');
+  assert.doesNotMatch(count, /\bLEFT JOIN\b/i, 'COUNT needs no join and must not acquire one');
+  assert.doesNotMatch(count, /tbl_customer|tbl_job\b/i, 'COUNT must stay a single-table scan');
+
+  assert.match(data, /WHERE T\.easyfixer_id = \?/, 'data query filter must match the COUNT');
+  for (const [alias, join] of [
+    ['J', /LEFT JOIN tbl_job\s+J\s+ON J\.job_id\s+=\s+T\.job_id/i],
+    ['C', /LEFT JOIN tbl_customer C\s+ON C\.customer_id\s+=\s+J\.fk_customer_id/i],
+    ['U', /LEFT JOIN tbl_user\s+U\s+ON U\.user_id\s+=\s+T\.created_by/i],
+  ]) {
+    assert.match(data, join, `data query projects ${alias}. — it must join it`);
   }
-  // The COUNT projects nothing, so it needs no customer join and must not grow one.
-  assert.doesNotMatch(count, /tbl_customer/i, 'COUNT must not have acquired a customer join');
 });
 
 test('both call-info statements project the guarded form under the alias the FE reads', async () => {
@@ -448,26 +462,32 @@ const EFR_SRC = require('fs').readFileSync(
   require('path').join(__dirname, '..', 'services/easyfixer.service.js'), 'utf8',
 );
 
-test('listTransactions joins and orders on columns tbl_job_transaction actually has', () => {
-  assert.match(EFR_SRC, /tx_user\.user_id = TJT\.updated_by/,
-    'the actor column is updated_by — there is no created_by on this table');
-  assert.match(EFR_SRC, /ORDER BY TJT\.job_transaction_id DESC/,
-    'the PK is job_transaction_id — there is no transaction_id');
-});
-
-test('neither phantom column survives anywhere in the transactions query', () => {
+test('listTransactions reads the LEDGER, not the per-job charge sheet', () => {
+  /*
+   * The modal's eleven column names are tbl_easyfixer_transaction's column
+   * names, verbatim — transaction_id, transaction_date, amount, balance,
+   * description. Pointing this at tbl_job_transaction (ef_charge / efr_charge /
+   * client_charge / tax) left six of them permanently blank while the endpoint
+   * returned 200, which is why it went unnoticed.
+   *
+   * This is also the legacy source: the old CRM called
+   * sp_ef_finance_geteasyfixer_transaction_by_Efr, which selects from this
+   * table with these joins.
+   */
   const fn = EFR_SRC.slice(EFR_SRC.indexOf('async function listTransactions('));
   const body = fn.slice(0, fn.indexOf('\n}\n') + 3);
-  /*
-   * COMMENTS STRIPPED FIRST. The fix's own comment quotes the error verbatim
-   * ("Unknown column 'TJT.created_by'"), so a raw substring search matches the
-   * explanation and fails a file that is correct — the test would be reporting
-   * on prose, not on SQL. Only executable text is searched.
-   */
+  // Comments stripped: the note above the query names the OLD table to explain
+  // the change, and a raw search would match that prose and fail correct code.
   const sql = body.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
-  assert.equal(/TJT\.created_by/.test(sql), false, 'created_by does not exist');
-  assert.equal(/TJT\.transaction_id\b/.test(sql), false, 'transaction_id does not exist');
-  // And the check has teeth: the real column names ARE still there.
-  assert.match(sql, /TJT\.updated_by/);
-  assert.match(sql, /TJT\.job_transaction_id/);
+
+  assert.match(sql, /FROM tbl_easyfixer_transaction T/, 'must read the ledger');
+  assert.equal(/tbl_job_transaction/.test(sql), false,
+    'the per-job charge sheet cannot populate this modal');
+  assert.match(sql, /ORDER BY T\.transaction_id DESC/, 'newest ledger entry first');
+
+  // The six columns that were blank must all be projected, by name.
+  for (const col of ['transaction_id', 'transaction_date', 'amount', 'balance', 'description']) {
+    assert.match(sql, new RegExp(`T\\.${col}\\b`), `${col} must come from the ledger`);
+  }
+  assert.match(sql, /AS transaction_by/, 'Trans. By is the created_by user name');
 });

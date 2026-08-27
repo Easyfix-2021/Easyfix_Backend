@@ -879,70 +879,87 @@ async function setStatus(id, { active, reasonId, comment, reactivationDate }, ac
 // are now the two above.
 async function listTransactions(efrId, { limit = 10, offset = 0 } = {}) {
   logger.info('List easyfixer transactions · efrId=' + efrId + ' limit=' + limit + ' offset=' + offset);
+
+  /*
+   * THE LEDGER, NOT THE JOB CHARGE SHEET.
+   *
+   * This reads `tbl_easyfixer_transaction` — the technician's running money
+   * ledger, one row per credit/debit with its own id, date, amount, balance
+   * and description. It is the source the legacy CRM used: the modal called
+   * financeService.getEfrTransactionListById(efrId, 2), which runs
+   * sp_ef_finance_geteasyfixer_transaction_by_Efr, which selects from this
+   * table. The joins below are that stored procedure's, minus the
+   * customer-address subquery it never actually read.
+   *
+   * It USED to read `tbl_job_transaction`, which is a different thing: the
+   * per-job charge split (ef_charge / efr_charge / client_charge / tax). That
+   * table has no transaction_id, no transaction_date, no amount, no balance
+   * and no description, so six of the modal's eleven columns could never be
+   * populated and rendered as an em dash on every row — Trans. Id, Trans.
+   * Date, Amount, Balance, Trans. By and Description. The column names in
+   * EasyfixerTransactionsModal.tsx were right all along; they are this
+   * table's column names, verbatim.
+   *
+   * The COUNT needs no joins: the only filter is on T itself, so adding them
+   * would cost a scan and change nothing.
+   */
   const [[{ total }]] = await pool.query(
-    `SELECT COUNT(*) AS total
-       FROM tbl_job_transaction TJT
-       JOIN tbl_job J ON J.job_id = TJT.fk_job_id
-      WHERE J.fk_easyfixter_id = ?`,
+    'SELECT COUNT(*) AS total FROM tbl_easyfixer_transaction T WHERE T.easyfixer_id = ?',
     [efrId],
   );
 
   const [rows] = await pool.query(
-    `SELECT TJT.*,
-            J.job_id                AS job_id,
-            J.job_reference_id      AS job_reference_id,
-            J.scheduled_date_time   AS appointment_date_time,
-            J.checkout_date_time    AS completion_date_time,
-            J.job_status            AS job_status,
+    `SELECT T.transaction_id,
+            T.transaction_date,
+            T.amount,
+            T.balance,
+            T.description,
+            T.transaction_type,
+            T.source,
+            T.job_id,
+            J.job_reference_id,
+            J.requested_date_time  AS appointment_date_time,
+            J.checkout_date_time   AS completion_date_time,
+            J.cancel_reason_id,
             /*
-             * customer_name (2026-08-03) — every row here is ONE JOB's
-             * transaction, so the name shown is the one typed at booking
-             * (tbl_job.job_customer_name), falling back to the customer-master
-             * name only when the job carries none. Alias unchanged, so
-             * EasyfixerTransactionsModal.tsx (reads t.customer_name) is untouched.
-             *
-             * NULLIF(TRIM(...), '') is load-bearing: COALESCE treats only NULL
-             * as absent, so a plain COALESCE(J.job_customer_name, ...) would
-             * render a BLANK name whenever job_customer_name is '' or spaces.
-             * That value is reachable -- validators/job.validator.js allows ''
-             * and the create path binds it through the ?? operator, which
-             * guards null/undefined only. (No backtick characters in this
-             * comment -- it lives inside a JS template literal; see the
-             * LIST_COLUMNS note at the top of this file.)
-             * J is already joined below AND in the COUNT query above, so this
-             * projection adds no join and cannot break the paginated total.
+             * Same customer-name rule the job list uses: the name typed at
+             * booking wins, the customer master is the fallback. NULLIF(TRIM())
+             * is load-bearing — COALESCE treats only NULL as absent, so a blank
+             * job_customer_name would otherwise render an empty cell.
              */
-            COALESCE(NULLIF(TRIM(J.job_customer_name), ''), cu.customer_name) AS customer_name,
-            cu.customer_mob_no      AS customer_mob_no,
-            ad.address              AS customer_address,
-            ad.building             AS customer_building,
-            ad.landmark             AS customer_landmark,
-            ad.pin_code             AS customer_pin_code,
-            ci.city_name            AS location,
-            /*
-             * updated_by, NOT created_by — tbl_job_transaction has no
-             * created_by column at all, and the join on it made this endpoint
-             * a hard 500 for every technician (ER_BAD_FIELD_ERROR, "Unknown
-             * column 'TJT.created_by' in 'on clause'"). The real columns are
-             * job_transaction_id, fk_job_id, total_charge_and_tax, tax,
-             * total_charge, ef_charge, efr_charge, client_charge, collected_by,
-             * insert_date, updated_by. The alias trans_by is unchanged, so
-             * EasyfixerTransactionsModal.tsx is untouched.
-             */
-            tx_user.user_name       AS trans_by
-       FROM tbl_job_transaction TJT
-       JOIN tbl_job J        ON J.job_id      = TJT.fk_job_id
-       LEFT JOIN tbl_customer cu ON cu.customer_id = J.fk_customer_id
-       LEFT JOIN tbl_address  ad ON ad.address_id  = J.fk_address_id
-       LEFT JOIN tbl_city     ci ON ci.city_id     = ad.city_id
-       LEFT JOIN tbl_user     tx_user ON tx_user.user_id = TJT.updated_by
-      WHERE J.fk_easyfixter_id = ?
-      ORDER BY TJT.job_transaction_id DESC
+            COALESCE(NULLIF(TRIM(J.job_customer_name), ''), C.customer_name) AS customer_name,
+            Ad.address             AS customer_address,
+            Ad.building            AS customer_building,
+            Ad.landmark            AS customer_landmark,
+            Ad.pin_code            AS customer_pin_code,
+            Act.city_name          AS location,
+            U.user_name            AS transaction_by
+       FROM tbl_easyfixer_transaction T
+       LEFT JOIN tbl_user     U   ON U.user_id      = T.created_by
+       LEFT JOIN tbl_job      J   ON J.job_id       = T.job_id
+       LEFT JOIN tbl_address  Ad  ON Ad.address_id  = J.fk_address_id
+       LEFT JOIN tbl_city     Act ON Act.city_id    = Ad.city_id
+       LEFT JOIN tbl_customer C   ON C.customer_id  = J.fk_customer_id
+      WHERE T.easyfixer_id = ?
+      ORDER BY T.transaction_id DESC
       LIMIT ? OFFSET ?`,
     [efrId, Number(limit), Number(offset)],
   );
-  logger.info('Returning ' + rows.length + ' transactions · total=' + total);
-  return { rows, total };
+
+  /*
+   * Cancellation-penalty rows name their job in the description, exactly as
+   * the legacy DAO did (cancel_reason_id 4). Without it the operator sees a
+   * debit with no way to tell which job caused it.
+   */
+  const items = rows.map((r) => ({
+    ...r,
+    description: Number(r.cancel_reason_id) === 4 && r.job_id
+      ? `${r.description || ''} · Job Id: ${r.job_id}`.trim()
+      : r.description,
+  }));
+
+  logger.info('Returning ' + items.length + ' transactions · total=' + total);
+  return { rows: items, total };
 }
 
 // ─── Sub-resource: Mapped Clients ───────────────────────────────────
