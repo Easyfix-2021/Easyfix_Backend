@@ -294,15 +294,48 @@ async function resolveSupplyStatusBatch(mobileNumbers) {
   );
   const efrNoSet = new Set(efrsByNo.map((e) => String(e.efr_no)));
 
-  // 3) tbl_easyfixer keyed by user_id (for the resolved-user branch).
+  /*
+   * 3) The resolved-user branch — the row resolveLabelForEfr() judges.
+   *
+   * IT SPANS TWO TABLES, and used to pretend it did not. This selected all nine
+   * fields from tbl_easyfixer alone, and SIX of them are not there:
+   *
+   *   city, user_name, pin_code, is_personal_detail_filled   live on tbl_user
+   *   personal_detail_filled_verified_by_crm                 does not exist at
+   *                                                          all — the real
+   *                                                          column is
+   *                                                          is_personal_details_verified_by_crm
+   *                                                          on tbl_easyfixer
+   *   status                                                 does not exist —
+   *                                                          it is efr_status
+   *
+   * So the report 500'd with "Unknown column 'city' in 'field list'" on every
+   * environment, not just production. It went unnoticed because this branch
+   * only runs when a mobile number resolves to a tbl_user row, which the
+   * Supply Status filter is what reliably reaches.
+   *
+   * The ALIASES are the contract: resolveLabelForEfr() reads efr.city,
+   * efr.user_name, efr.status and so on, so the real columns are renamed back
+   * to what it expects rather than the judgement being rewritten around new
+   * names. Every column here is now listed in scripts/schema-verify.js, so the
+   * next rename fails the boot check instead of one report.
+   */
   const efrByUserId = new Map();
   if (userIds.length > 0) {
     const uph = userIds.map(() => '?').join(',');
     const [efrsByUser] = await pool.query(
-      `SELECT user_id, city, user_name, pin_code, is_personal_detail_filled,
-              personal_detail_filled_verified_by_crm, is_technician_Verified,
-              is_identity_details_verified_by_crm, status
-         FROM tbl_easyfixer WHERE user_id IN (${uph}) AND NOT (tbl_easyfixer.efr_status <=> 3)`,
+      `SELECT E.user_id,
+              U.city                                  AS city,
+              U.user_name                             AS user_name,
+              U.pin_code                              AS pin_code,
+              U.is_personal_detail_filled             AS is_personal_detail_filled,
+              E.is_personal_details_verified_by_crm   AS personal_detail_filled_verified_by_crm,
+              E.is_technician_verified                AS is_technician_Verified,
+              E.is_identity_details_verified_by_crm   AS is_identity_details_verified_by_crm,
+              E.efr_status                            AS status
+         FROM tbl_easyfixer E
+         LEFT JOIN tbl_user U ON U.user_id = E.user_id
+        WHERE E.user_id IN (${uph}) AND NOT (E.efr_status <=> 3)`,
       userIds,
     );
     for (const e of efrsByUser) efrByUserId.set(e.user_id, e);

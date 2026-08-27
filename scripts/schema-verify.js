@@ -147,11 +147,18 @@ const EXPECTED = {
     'updayted_by', // legacy DB typo ("updayted", not "updated") — preserve
     'inserted_by', 'display_job_dashboard', 'logging_tracking',
   ],
+  // city / pin_code / is_personal_detail_filled feed the Supply Gap report's
+  // self-registration funnel (services/quicksight/quicksight-supply-gap.service
+  // .js). They were absent from this list, and the query that reads them named
+  // them on tbl_easyfixer instead — which 500'd the report on EVERY environment
+  // with "Unknown column 'city' in 'field list'". Listing them is what makes
+  // the next such rename fail the boot check rather than one report.
   tbl_user: [
     'user_id', 'user_name', 'official_email', 'mobile_no', 'alternate_no',
     'user_role', 'user_type_id', 'city_id', 'user_status',
     'manage_clients', 'manage_cities', 'manage_states', 'manage_verticals',
     'reporting_manager',
+    'city', 'pin_code', 'is_personal_detail_filled',
     'insert_date', 'update_date', 'updated_by',
   ],
   tbl_vertical: ['vertical_id', 'vertical_name', 'status'],
@@ -222,6 +229,10 @@ const EXPECTED = {
     'adhaar_card_number', 'pan_card_number', 'have_driving_lisence',
     'is_technician_verified', 'is_email_verified', 'date_of_birth',
     'active_aadhaar_unique',
+    // The CRM-review pair the Supply Gap funnel judges on (null / 1 / 2).
+    // `personal_detail_filled_verified_by_crm` -- the name the report used --
+    // exists in no table at all; this is the real one.
+    'is_personal_details_verified_by_crm', 'is_identity_details_verified_by_crm',
   ],
   tbl_idempotency_key: [
     'actor_type', 'actor_id', 'idempotency_key', 'method', 'path',
