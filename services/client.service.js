@@ -48,10 +48,28 @@ const logger = require('../logger');
  * deployment to an environment missing some legacy columns (e.g.
  * `logo_id`, `coupon_code`, `tan_number`) doesn't 500.
  *
- * Probed once per process via a cached Promise; subsequent calls
- * resolve instantly. No invalidation — schema changes require a
- * restart, which matches how every other column-probe in this
- * codebase works (see job.service.js#hasVerticalCol).
+ * Probed once per process via a cached Promise; subsequent calls resolve
+ * instantly. A SUCCESSFUL answer is cached for the life of the process —
+ * columns do not come and go under a running container.
+ *
+ * A FAILED probe is never cached, and never answers. Both callers are WRITES
+ * (createClient, updateClient) and both treat a column as absent by dropping
+ * it from the statement — updateClient literally does
+ * `if (!cols.has(col)) continue; // column missing on this DB — skip silently`.
+ *
+ * This used to catch the error and return a hardcoded 15-column set, memoised
+ * inside the promise. One transient information_schema hiccup on the first
+ * create or edit after boot therefore pinned that fallback for the rest of the
+ * process, and from then on EVERY client save silently discarded billing_name,
+ * billing_cycle, billing_start_date, PAN, TAN, Aadhaar, logo, display name,
+ * tech_app_name, reporting_contact_ids and client_city_id — while the UI
+ * answered "Client updated." An edit whose whole body fell outside the
+ * fallback threw a misleading 400 "nothing to update".
+ *
+ * So the error propagates. The operator gets one honest 500 and retries; the
+ * next call re-probes. A loud failure on one request is cheaper than silent,
+ * permanent data loss under a success toast — and unlike a missing column,
+ * "the probe did not answer" is not evidence of anything.
  */
 let _columnsPromise = null;
 async function getClientColumns() {
@@ -66,14 +84,11 @@ async function getClientColumns() {
         logger.info({ count: set.size }, '[client.service] tbl_client column probe');
         return set;
       } catch (e) {
-        logger.warn({ err: e?.message }, '[client.service] column probe failed — degrading to known-safe column set');
-        // Fallback: hardcode the columns from our existing INSERT.
-        return new Set([
-          'client_id', 'client_name', 'client_email', 'client_address',
-          'client_type', 'reference_code', 'booking_cut_off', 'client_status',
-          'insert_date', 'update_date', 'inserted_by', 'updated_by',
-          'vertical_id', 'collected_by', 'monthly_revenue',
-        ]);
+        // Clear BEFORE rethrowing so the next caller re-probes rather than
+        // awaiting this same rejected promise forever.
+        _columnsPromise = null;
+        logger.warn({ err: e?.message }, '[client.service] column probe failed — refusing to narrow the write');
+        throw e;
       }
     })();
   }

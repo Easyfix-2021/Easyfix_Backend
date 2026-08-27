@@ -37,8 +37,26 @@ async function hasTable() {
         logger.info({ present }, '[client-documents] tbl_client_document presence probe');
         return present;
       } catch (e) {
-        logger.warn({ err: e?.message }, '[client-documents] table probe failed — assuming absent');
-        return false;
+        /*
+         * NOT "assume absent", and NOT cached.
+         *
+         * A false here does not degrade — it asserts. The CRM Documents tab
+         * 503s "storage not provisioned" and the client portal answers
+         * { items: [], provisioned: false }, telling a client their KYC
+         * checklist is empty. Because the catch sat inside this memoised
+         * promise, a two-second blip made that permanent until the container
+         * restarted. Uploads were worse: routes/admin/clients.js writes the
+         * object to S3 BEFORE calling recordUpload, so every retry orphaned a
+         * PAN or Aadhaar file with no row pointing at it.
+         *
+         * If information_schema is unreachable the data query would fail too,
+         * so propagating costs one honest error instead of a confident lie.
+         * The genuinely un-migrated case is unaffected: that is a SUCCESSFUL
+         * probe returning false, which still short-circuits exactly as before.
+         */
+        _hasTablePromise = null;
+        logger.warn({ err: e?.message }, '[client-documents] table probe failed — not concluding absent');
+        throw e;
       }
     })();
   }

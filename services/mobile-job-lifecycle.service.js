@@ -67,10 +67,29 @@ async function hasJobColumn(colName) {
       [colName],
     );
     _colCache[colName] = rows.length > 0;
-  } catch {
-    _colCache[colName] = false;
+    return _colCache[colName];
+  } catch (e) {
+    /*
+     * Soft-fail to false is right for two of the three callers — cancel()
+     * only mirrors an optional reason/flag for legacy reports, and the status
+     * transition has already committed. It is wrong to make that PERMANENT.
+     *
+     * The old bare `catch { _colCache[colName] = false; }` did exactly that:
+     * the memo guard is `!= null`, and `false != null`, so one transient
+     * information_schema error pinned the column as missing for the rest of
+     * the process. saveSelfie turns a false into a hard 501 "selfie column not
+     * present on this deployment" — a claim that is simply untrue, since
+     * tx_selfie_id is present in production. A technician could not upload a
+     * reached-location selfie again until the container restarted.
+     *
+     * Not cached now, so the next call re-probes and the 501 is at worst a
+     * retryable blip. The bare catch also swallowed the error with no log at
+     * all, which is why this left no trace to find.
+     */
+    logger.warn('tbl_job column probe failed · ' + colName + ' · ' + e.message
+      + ' — treating as absent for this call only');
+    return false;
   }
-  return _colCache[colName];
 }
 
 // ─── Ownership guard ─────────────────────────────────────────────────
