@@ -128,6 +128,61 @@ async function recordUpload(clientId, {
   return ins.insertId;
 }
 
+/*
+ * Store the bytes AND record the row, or leave nothing behind.
+ *
+ * THE ORDERING PROBLEM. Both upload routes used to do this themselves: put the
+ * object in S3, then insert the row. When the insert failed the object stayed —
+ * a PAN or Aadhaar file sitting in the bucket with nothing pointing at it, and
+ * one more on every retry. Nobody could see them: the operator got an error and
+ * tried again, and the only trace was the S3 bill.
+ *
+ * WHY A COMPENSATING DELETE AND NOT A SWEEPER. "Find S3 objects with no row and
+ * remove them" is the obvious fix and it is dangerous here, because an object
+ * with no LIVE row is a NORMAL state: softDelete() only sets is_deleted = 1 and
+ * deliberately keeps the file, so deleting a client document is reversible and
+ * the bytes are retained for audit. A sweeper cannot tell that apart from an
+ * orphan. This can: it holds the key it just wrote, in a local variable, and
+ * removes only that one, only when the row it was written for never existed.
+ *
+ * WHY NOT REVERSE THE ORDER. Inserting first and uploading second trades an
+ * invisible orphan for a visible one — a row whose s3_key resolves to nothing,
+ * rendering as a broken document in the client's list. A missing file you can
+ * see is worse than a file nobody references.
+ *
+ * WHY THIS LIVES IN THE SERVICE. There are TWO callers — the CRM route and the
+ * client portal route — and they had identical copies of the two-step flow.
+ * A fix that must be remembered in both is a fix that will be missed in one.
+ *
+ * The cleanup NEVER masks the original failure: s3.deleteObject swallows its
+ * own errors and returns a result object, and the caller's error is rethrown
+ * either way. A cleanup that failed is logged, not raised — the operator needs
+ * to know the save failed, not that the tidying did.
+ */
+async function storeAndRecord(clientId, {
+  buffer, contentType, originalName, docType, docLabel, uploadedBy,
+}) {
+  const s3Key = await s3.putClientDocument({ buffer, contentType, originalName });
+  try {
+    const documentId = await recordUpload(clientId, {
+      docType,
+      docLabel,
+      s3Key,
+      originalFilename: originalName,
+      contentType,
+      uploadedBy,
+    });
+    return { documentId, s3Key };
+  } catch (e) {
+    const cleanup = await s3.deleteObject(s3Key);
+    logger.warn(
+      { clientId, s3Key, cleanedUp: cleanup?.deleted === true, cleanupReason: cleanup?.reason, err: e?.message },
+      '[client-documents] record failed after upload — rolled back the S3 object',
+    );
+    throw e;
+  }
+}
+
 async function softDelete(documentId) {
   logger.info('Soft-delete client document · id=' + documentId);
   if (!(await hasTable())) throw unavailableError();
@@ -143,5 +198,6 @@ module.exports = {
   hasTable,
   listForClient,
   recordUpload,
+  storeAndRecord,
   softDelete,
 };

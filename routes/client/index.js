@@ -3624,17 +3624,14 @@ router.post('/company/documents', companyDocUpload.single('file'), async (req, r
     if (!clientS3.isEnabled()) {
       return modernError(res, 503, 'File storage is not configured on this environment');
     }
-    const s3Key = await clientS3.putClientDocument({
+    // Same single call the CRM route uses — the compensating delete lives in
+    // the service so neither upload path can be fixed without the other.
+    const { documentId, s3Key } = await clientDocsSvc.storeAndRecord(req.spoc.client_id, {
       buffer: req.file.buffer,
       contentType: req.file.mimetype,
       originalName: req.file.originalname,
-    });
-    const documentId = await clientDocsSvc.recordUpload(req.spoc.client_id, {
       docType,
       docLabel: req.body.docLabel || null,
-      s3Key,
-      originalFilename: req.file.originalname,
-      contentType: req.file.mimetype,
       // The tbl_user id carried in the SPOC's token, NOT req.spoc.id — that is
       // a tbl_client_contacts PK and uploaded_by is a tbl_user FK. Older tokens
       // have no claim, and null is the honest answer for those.

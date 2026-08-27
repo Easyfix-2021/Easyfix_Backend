@@ -1771,17 +1771,15 @@ router.post(
       if (!s3.isEnabled()) {
         return modernError(res, 503, 'S3 storage not configured for client documents');
       }
-      const s3Key = await s3.putClientDocument({
+      // One call, so the object and the row cannot get out of step: if the
+      // record fails the just-uploaded file is removed rather than left in the
+      // bucket with nothing pointing at it. See storeAndRecord().
+      const { documentId, s3Key } = await docsSvc.storeAndRecord(req.params.clientId, {
         buffer: req.file.buffer,
         contentType: req.file.mimetype,
         originalName: req.file.originalname,
-      });
-      const documentId = await docsSvc.recordUpload(req.params.clientId, {
         docType,
         docLabel: req.body.docLabel || null,
-        s3Key,
-        originalFilename: req.file.originalname,
-        contentType: req.file.mimetype,
         uploadedBy: req.user.user_id,
       });
       const url = await s3.resolveClientDocumentUrl(s3Key).catch(() => null);
