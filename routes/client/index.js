@@ -298,7 +298,25 @@ router.get('/action-queue', async (req, res, next) => {
        LIMIT ?`, params);
 
     const items = rows.map((r) => ({
-      type: 'approval',
+      /*
+       * ⚠ ONLY STATUS 15 IS AN APPROVAL.
+       *
+       * Membership of this queue is "has an approval-pending billing line and
+       * no approve/reject stamp", which is the exact condition the approve
+       * endpoint clears — but that admits jobs in any non-terminal status. On
+       * QA it is dominated by ENQUIRIES: 6,832 rows at status 7 against 54 at
+       * status 15. Every one of them was rendering as "Estimate approval — …"
+       * behind an Approve button, for work the client cannot approve because
+       * no estimate has been sent.
+       *
+       * The row stays — it does have an open billing line, and the reader may
+       * want to look — but it is labelled for what it is, and the action
+       * becomes View. `approvable` is the flag the card reads; the label is
+       * derived here so one definition serves every consumer.
+       */
+      type: Number(r.job_status) === 15 ? 'approval' : 'open',
+      approvable: Number(r.job_status) === 15,
+      jobStatus: Number(r.job_status),
       jobId: Number(r.job_id),
       reference: r.job_reference_id || r.client_ref_id || null,
       city: r.city_name,
@@ -307,7 +325,12 @@ router.get('/action-queue', async (req, res, next) => {
       estimateValue: r.estimate_value == null ? null : Number(r.estimate_value),
       // The action that clears this row, so the FE does not hard-code a mapping
       // from type to endpoint.
-      action: { label: 'Approve', method: 'PATCH', path: `/api/client/jobs/${r.job_id}/estimate/approve` },
+      action: Number(r.job_status) === 15
+        ? { label: 'Approve', method: 'PATCH', path: `/api/client/jobs/${r.job_id}/estimate/approve` }
+        // GET, not PATCH: there is nothing to clear. The card opens the job
+        // drawer either way, but a row that offers to approve something the
+        // server would reject is a button that lies.
+        : { label: 'View', method: 'GET', path: `/api/client/jobs/${r.job_id}` },
     }));
 
     logger.info('Action queue: ' + items.length + ' item(s) awaiting the client');
@@ -2076,7 +2099,26 @@ router.get('/dashboard-summary', async (req, res, next) => {
          SUM(CASE WHEN j.job_status IN (0, 1, 2, 20)                    THEN 1 ELSE 0 END) AS inProgress,
          SUM(CASE WHEN j.job_status IN (3, 5)                           THEN 1 ELSE 0 END) AS completed,
          SUM(CASE WHEN j.job_status = 6                                 THEN 1 ELSE 0 END) AS cancelled,
-         SUM(CASE WHEN r.is_escalated = 1                               THEN 1 ELSE 0 END) AS escalated
+         SUM(CASE WHEN r.is_escalated = 1                               THEN 1 ELSE 0 END) AS escalated,
+         /*
+          * The Open-breakdown bar, which splits the open book into "pending
+          * with EasyFix" and "pending with you". Both come from THIS query so
+          * the two segments share one scan and one scope — the bar has to
+          * partition a single number, and two queries is how the halves stop
+          * summing to the whole.
+          *
+          * openTotal is every non-terminal job: not completed (3,5), not
+          * cancelled (6), not an enquiry (7). Deliberately WIDER than
+          * newTickets + inProgress, which the bar used to be built from and
+          * which silently omits 15, 21 and 10 — jobs that are open by any
+          * reading, just not in those two buckets.
+          *
+          * awaitingYou is status 15 — an estimate sent and not yet decided.
+          * It is the ONLY state no EasyFix action can clear, which is what
+          * "pending with you" means.
+          */
+         SUM(CASE WHEN j.job_status NOT IN (3, 5, 6, 7)                 THEN 1 ELSE 0 END) AS openTotal,
+         SUM(CASE WHEN j.job_status = 15                                THEN 1 ELSE 0 END) AS awaitingYou
        FROM   tbl_job j
        LEFT   JOIN tbl_easyfixer_rating_by_customer r ON r.job_id = j.job_id
        WHERE  j.fk_client_id        = ?
@@ -2378,6 +2420,11 @@ router.get('/dashboard-summary', async (req, res, next) => {
         completed:  Number(counts.completed)  || 0,
         cancelled:  Number(counts.cancelled)  || 0,
         escalated:  Number(counts.escalated)  || 0,
+        // The two halves of the Open-breakdown bar. openTotal INCLUDES
+        // awaitingYou — the card subtracts, so the segments partition rather
+        // than overlap.
+        openTotal:   Number(counts.openTotal)   || 0,
+        awaitingYou: Number(counts.awaitingYou) || 0,
       },
       statusBreakdown,
       categoryBreakdown,
