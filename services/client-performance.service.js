@@ -166,22 +166,65 @@ async function hasLinkedJob() {
  * correct; a fabricated 100% is not.
  */
 async function firstTimeFix(scope) {
-  if (!(await hasLinkedJob())) {
-    return { ftfrPct: null, revisitPct: null, available: false };
-  }
+  /*
+   * ⚠ FIRST-TIME FIX AND REVISIT ARE TWO DIFFERENT MEASUREMENTS. They used to
+   * be one: ftfr counted jobs with no child row in linked_job, and revisit was
+   * literally `100 - ftfr`. Both facts about that were wrong.
+   *
+   * FIRST-TIME FIX is CHECK-IN AND CHECK-OUT ON THE SAME DAY — did the
+   * technician finish the job in the visit they started it in. Measured on
+   * 2026-08-27 over a year of completed jobs: the old no-revisit rule scored
+   * 98.4%, the same-day rule scores 55.0%. Against an 85% target the old
+   * number could not fail for anybody, which is what a KPI is for.
+   *
+   * REVISIT keeps the linked_job rule, because that IS what a revisit is — a
+   * follow-up job hung off this one. It is 1.6%, not the 45% that
+   * `100 - ftfr` would now report. Leaving them coupled would have been the
+   * more damaging half of this change: a page claiming nearly half of all work
+   * needed a second visit, against a target of 10%.
+   *
+   * They overlap but do not agree: 30,410 of the 30,661 same-day jobs also had
+   * no revisit, so the two answer "finished in one visit" and "came back"
+   * separately, which is the point.
+   */
   const { clause, params, join } = scopeWhere(scope, 'completed');
+
+  /*
+   * `available` now gates the REVISIT half only. First-time fix reads
+   * check-in and check-out, two core tbl_job columns, so it is measurable on
+   * any deployment; revisit needs the linked_job table, which some do not
+   * have. One flag used to gate both because both came from that table.
+   */
+  const revisitMeasurable = await hasLinkedJob();
+  const revisitSelect = revisitMeasurable
+    ? 'SUM(CASE WHEN lj.parent_job_id IS NOT NULL THEN 1 ELSE 0 END)'
+    : 'NULL';
+  const revisitJoin = revisitMeasurable
+    ? 'LEFT JOIN (SELECT DISTINCT parent_job_id FROM linked_job) lj ON lj.parent_job_id = J.job_id'
+    : '';
+
   const [rows] = await pool.query(`
     SELECT COUNT(*) AS completed,
-           SUM(CASE WHEN lj.parent_job_id IS NULL THEN 1 ELSE 0 END) AS first_time_fixed
+           SUM(CASE WHEN J.checkin_date_time IS NOT NULL
+                     AND DATE(J.checkin_date_time) = DATE(J.checkout_date_time)
+                    THEN 1 ELSE 0 END)          AS first_time_fixed,
+           ${revisitSelect}                     AS revisited
       FROM tbl_job J${join}
-      LEFT JOIN (SELECT DISTINCT parent_job_id FROM linked_job) lj ON lj.parent_job_id = J.job_id
+      ${revisitJoin}
      WHERE ${clause}`, params);
   const row = rows[0] || {};
 
   const completed = Number(row.completed || 0);
-  if (!completed) return { ftfrPct: null, revisitPct: null, available: true };
-  const ftfr = Math.round((Number(row.first_time_fixed || 0) / completed) * 1000) / 10;
-  return { ftfrPct: ftfr, revisitPct: Math.round((100 - ftfr) * 10) / 10, available: true };
+  if (!completed) return { ftfrPct: null, revisitPct: null, available: revisitMeasurable };
+
+  const rate = (v) => Math.round((Number(v || 0) / completed) * 1000) / 10;
+  return {
+    ftfrPct: rate(row.first_time_fixed),
+    // NULL, not 0, when the table is absent — "we cannot measure this" is not
+    // "nobody came back", and the KPI card renders the two differently.
+    revisitPct: row.revisited == null ? null : rate(row.revisited),
+    available: revisitMeasurable,
+  };
 }
 
 /**
