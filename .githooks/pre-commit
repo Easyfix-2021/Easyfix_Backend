@@ -15,4 +15,36 @@
 set -eu
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+# ─── Lockfile sync ──────────────────────────────────────────────────────────
+#
+# `npm ci` refuses a tree whose package.json and package-lock.json disagree,
+# and both ci.yml and deploy.yml's precheck take that path. Local `npm test`
+# and `npm run build` do NOT catch it, because node_modules is already
+# populated on a developer machine — so drift ships green and dies on the
+# runner at the install step, before a single test runs.
+#
+# `npm ci --dry-run` performs that same validation and STOPS (~0.5s), and only
+# when a manifest is actually staged. NOT `npm ci`: the real thing deletes
+# node_modules and reinstalls, which is a minute of attention per commit and
+# would be switched off within a day.
+STAGED="$(git diff --cached --name-only --diff-filter=d)"
+case "$STAGED" in
+  *package.json*|*package-lock.json*)
+    printf 'pre-commit: package manifest staged — checking lockfile sync… '
+    if npm ci --dry-run >"/tmp/easyfix-be-lockcheck.$$" 2>&1; then
+      printf 'in sync\n'
+      rm -f "/tmp/easyfix-be-lockcheck.$$"
+    else
+      printf 'OUT OF SYNC\n\n'
+      grep -E 'Invalid:|Missing:|Extraneous:|are in sync' "/tmp/easyfix-be-lockcheck.$$" | head -8 || true
+      rm -f "/tmp/easyfix-be-lockcheck.$$"
+      printf '\n  Fix:   npm install && git add package-lock.json\n'
+      printf '  Skip:  git commit --no-verify   (CI still runs npm ci)\n\n'
+      exit 1
+    fi
+    ;;
+esac
+
 exec node "$REPO_ROOT/scripts/offline-reliability-sync.js" check --staged --if-relevant --fix
