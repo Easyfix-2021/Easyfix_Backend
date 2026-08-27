@@ -2092,22 +2092,119 @@ router.get('/customers/mobile/:mobile/addresses', async (req, res, next) => {
  * planner can range-scan; on prod-sized tbl_job (~481k rows) the
  * whole endpoint resolves in well under 200ms.
  */
+/*
+ * GET /api/client/unreachable-jobs
+ *
+ * The rows behind the "Customer Unreachable" tile: jobs where the customer
+ * could not be reached on THREE DIFFERENT DAYS inside a three-day span.
+ *
+ * ⚠ OPEN JOBS ONLY — job_status NOT IN (3,5,6,7). A completed or cancelled job
+ * carries the same unreachable history forever, and listing it here would put
+ * work nobody can act on in front of a client, which is the whole failure this
+ * dashboard has been unpicking. The tile's COUNT uses the same predicate, so
+ * the number and the list it opens cannot disagree.
+ *
+ * View only for now: no action buttons. The row carries what a reader needs to
+ * decide who to chase — attempts, the days they fell on, and how long the job
+ * has been open.
+ */
+router.get('/unreachable-jobs', async (req, res, next) => {
+  try {
+    const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
+    const hier = await resolveClientHierarchy(req);
+    const scopeIds = req.access && req.access.allStores ? undefined : hierarchyFilter(hier, req);
+    const scopeSql = Array.isArray(scopeIds)
+      ? `AND j.reporting_contact_id IN (${scopeIds.length ? scopeIds.map(() => '?').join(',') : 'NULL'})`
+      : '';
+    const scopeParams = Array.isArray(scopeIds) ? scopeIds : [];
+
+    logger.info('Fetch unreachable jobs · clientId=' + req.spoc.client_id + ' · limit=' + limit);
+
+    /*
+     * Same self-join as the tile's count: any anchor date with >= 3 DISTINCT
+     * dates in [anchor, anchor+2]. Kept as a derived set rather than repeated
+     * inline so the list and the count select the identical jobs.
+     */
+    const params = [req.spoc.client_id, ...scopeParams, req.spoc.client_id, ...scopeParams, limit];
+    const [rows] = await pool.query(`
+      WITH cl AS (
+        SELECT DISTINCT c.job_id, DATE(c.created_on) AS d
+          FROM tbl_job_comment c
+          JOIN tbl_job j ON j.job_id = c.job_id
+         WHERE c.comment_on = 16
+           AND j.fk_client_id = ?
+           ${scopeSql}
+           AND j.job_status NOT IN (3,5,6,7)
+      ), qualified AS (
+        SELECT a.job_id
+          FROM cl a
+          JOIN cl b ON b.job_id = a.job_id
+           AND b.d BETWEEN a.d AND DATE_ADD(a.d, INTERVAL 2 DAY)
+         GROUP BY a.job_id, a.d
+        HAVING COUNT(DISTINCT b.d) >= 3
+      )
+      SELECT j.job_id, j.job_reference_id, j.client_ref_id, j.job_status,
+             COALESCE(city.city_name, 'Unknown')            AS city_name,
+             COALESCE(TSC.service_catg_name, 'Uncategorised') AS category,
+             TIMESTAMPDIFF(HOUR, j.ticket_created_date_time, NOW()) DIV 24 AS age_days,
+             COUNT(DISTINCT DATE(c.created_on)) AS unreachable_days,
+             COUNT(c.comment_id)                AS attempts,
+             MAX(c.created_on)                  AS last_attempt
+        FROM tbl_job j
+        JOIN (SELECT DISTINCT job_id FROM qualified) q ON q.job_id = j.job_id
+        JOIN tbl_job_comment c ON c.job_id = j.job_id AND c.comment_on = 16
+        LEFT JOIN tbl_address      A    ON A.address_id = j.fk_address_id
+        LEFT JOIN tbl_city         city ON city.city_id = A.city_id
+        LEFT JOIN tbl_service_catg TSC  ON TSC.service_catg_id = j.fk_service_catg_id
+       WHERE j.fk_client_id = ?
+         ${scopeSql}
+         AND j.job_status NOT IN (3,5,6,7)
+       GROUP BY j.job_id
+       ORDER BY unreachable_days DESC, last_attempt DESC
+       LIMIT ?`, params);
+
+    modernOk(res, {
+      items: rows.map((r) => ({
+        jobId: r.job_id,
+        reference: r.job_reference_id || r.client_ref_id || null,
+        jobStatus: Number(r.job_status),
+        city: r.city_name,
+        category: r.category,
+        ageDays: Number(r.age_days) || 0,
+        unreachableDays: Number(r.unreachable_days) || 0,
+        attempts: Number(r.attempts) || 0,
+        lastAttempt: r.last_attempt,
+      })),
+      total: rows.length,
+    });
+  } catch (e) { next(e); }
+});
+
 router.get('/dashboard-summary', async (req, res, next) => {
   try {
-    // Resolve the SPOC's team scope — themself + everyone who reports
-    // to them. Mirrors the legacy ClientController.java lines 101-111
-    // "my team's tickets" expansion. Stays in-process (no JOIN) so we
-    // can reuse the same id list across all three sub-queries.
-    const [reports] = await pool.query(
-      `SELECT id FROM tbl_client_contacts
-        WHERE client_id = ?
-          AND manager_id IS NOT NULL AND manager_id NOT IN ('', 'null')
-          AND CAST(manager_id AS UNSIGNED) = ?`,
-      [req.spoc.client_id, req.spoc.id]
-    );
-    const teamIds = reports.map((r) => r.id);
-    teamIds.push(req.spoc.id);
-    const teamPlaceholders = teamIds.map(() => '?').join(',');
+    /*
+     * ⚠ THE SAME SCOPE EVERY OTHER SURFACE ON THIS PAGE USES.
+     *
+     * This resolved its own list — self plus DIRECT reports, non-recursive —
+     * and ignored req.access.allStores entirely. The action queue beside it
+     * uses `allStores ? undefined : hierarchyFilter(hier, req)`, i.e. the whole
+     * client for a Senior Leader and the full recursive subtree for everyone
+     * else. Two panels on one screen counting two different populations, which
+     * is how "Jobs Waiting for You" could show an approval that "Pending on
+     * you" counted as zero.
+     *
+     * `undefined` means unrestricted, so the filter collapses to an empty
+     * string rather than an impossible IN () — and an empty subtree array
+     * still emits the clause, so a SPOC who can see nothing counts nothing
+     * rather than everything.
+     */
+    const hier = await resolveClientHierarchy(req);
+    const scopeIds = req.access && req.access.allStores ? undefined : hierarchyFilter(hier, req);
+    const teamFilter = Array.isArray(scopeIds)
+      ? `AND j.reporting_contact_id IN (${scopeIds.length ? scopeIds.map(() => '?').join(',') : 'NULL'})`
+      : '';
+    const teamParams = Array.isArray(scopeIds) ? scopeIds : [];
+    const teamIds = Array.isArray(scopeIds) ? scopeIds : hier.subtreeIds;
 
     // Single COUNT … FILTER over the team-scope. One scan, five
     // SUM(CASE) — keeps the round-trips and join cost flat compared
@@ -2141,8 +2238,8 @@ router.get('/dashboard-summary', async (req, res, next) => {
        FROM   tbl_job j
        LEFT   JOIN tbl_easyfixer_rating_by_customer r ON r.job_id = j.job_id
        WHERE  j.fk_client_id        = ?
-         AND  j.reporting_contact_id IN (${teamPlaceholders})`,
-      [req.spoc.client_id, ...teamIds]
+         ${teamFilter}`,
+      [req.spoc.client_id, ...teamParams]
     );
 
     /*
@@ -2179,21 +2276,21 @@ router.get('/dashboard-summary', async (req, res, next) => {
                    JOIN tbl_job j ON j.job_id = c.job_id
                   WHERE c.comment_on = 16
                     AND j.fk_client_id = ?
-                    AND j.reporting_contact_id IN (${teamPlaceholders})
+                    ${teamFilter}
                     AND j.job_status NOT IN (3,5,6,7)) a
            JOIN (SELECT DISTINCT c.job_id, DATE(c.created_on) AS d
                    FROM tbl_job_comment c
                    JOIN tbl_job j ON j.job_id = c.job_id
                   WHERE c.comment_on = 16
                     AND j.fk_client_id = ?
-                    AND j.reporting_contact_id IN (${teamPlaceholders})
+                    ${teamFilter}
                     AND j.job_status NOT IN (3,5,6,7)) b
              ON b.job_id = a.job_id
             AND b.d BETWEEN a.d AND DATE_ADD(a.d, INTERVAL 2 DAY)
           GROUP BY a.job_id, a.d
          HAVING COUNT(DISTINCT b.d) >= 3
        ) q`,
-      [req.spoc.client_id, ...teamIds, req.spoc.client_id, ...teamIds]
+      [req.spoc.client_id, ...teamParams, req.spoc.client_id, ...teamParams]
     );
 
     // Donut slices — return labels + colours pre-baked so the FE just
@@ -2204,9 +2301,9 @@ router.get('/dashboard-summary', async (req, res, next) => {
       `SELECT j.job_status, COUNT(*) AS n
          FROM tbl_job j
         WHERE j.fk_client_id        = ?
-          AND j.reporting_contact_id IN (${teamPlaceholders})
+          ${teamFilter}
         GROUP BY j.job_status`,
-      [req.spoc.client_id, ...teamIds]
+      [req.spoc.client_id, ...teamParams]
     );
     const STATUS_GROUPS = [
       { label: 'New',         statuses: [9],            color: '#f59e0b' }, // amber
@@ -2240,10 +2337,10 @@ router.get('/dashboard-summary', async (req, res, next) => {
          LEFT JOIN tbl_easyfixer ef ON ef.efr_id      = j.fk_easyfixter_id
         WHERE r.is_escalated         = 1
           AND j.fk_client_id         = ?
-          AND j.reporting_contact_id IN (${teamPlaceholders})
+          ${teamFilter}
         ORDER BY j.job_id DESC
         LIMIT 5`,
-      [req.spoc.client_id, ...teamIds]
+      [req.spoc.client_id, ...teamParams]
     );
 
     // ─── Home-page KPI boxes ──────────────────────────────────────────
@@ -2265,8 +2362,8 @@ router.get('/dashboard-summary', async (req, res, next) => {
                    AND j.fk_easyfixter_id IS NOT NULL THEN 1 ELSE 0 END) AS runningLate
          FROM tbl_job j
         WHERE j.fk_client_id        = ?
-          AND j.reporting_contact_id IN (${teamPlaceholders})`,
-      [req.spoc.client_id, ...teamIds]
+          ${teamFilter}`,
+      [req.spoc.client_id, ...teamParams]
     );
 
     // Estimate Approved / Rejected — count the LATEST estimate per job
@@ -2280,7 +2377,7 @@ router.get('/dashboard-summary', async (req, res, next) => {
          FROM tbl_estimate_details ed
          JOIN tbl_job j ON j.job_id = ed.job_id
         WHERE j.fk_client_id        = ?
-          AND j.reporting_contact_id IN (${teamPlaceholders})
+          ${teamFilter}
           AND j.job_status NOT IN (3,5,6,7)
           AND NOT EXISTS (
             SELECT 1 FROM tbl_estimate_details e2
@@ -2288,7 +2385,7 @@ router.get('/dashboard-summary', async (req, res, next) => {
                AND (e2.sent_on > ed.sent_on
                     OR (e2.sent_on = ed.sent_on AND e2.id > ed.id))
           )`,
-      [req.spoc.client_id, ...teamIds]
+      [req.spoc.client_id, ...teamParams]
     );
 
     // ─── Performance by City / Store ─────────────────────────────────
@@ -2312,12 +2409,12 @@ router.get('/dashboard-summary', async (req, res, next) => {
          LEFT JOIN tbl_address ad ON ad.address_id = j.fk_address_id
          LEFT JOIN tbl_city    ci ON ci.city_id    = ad.city_id
         WHERE j.fk_client_id        = ?
-          AND j.reporting_contact_id IN (${teamPlaceholders})
+          ${teamFilter}
           AND ci.city_name IS NOT NULL
         GROUP BY ci.city_name
         ORDER BY orders DESC
         LIMIT 6`,
-      [req.spoc.client_id, ...teamIds]
+      [req.spoc.client_id, ...teamParams]
     );
     const cityPerformance = cityRows.map((r) => {
       const orders = Number(r.orders) || 0;
@@ -2346,12 +2443,12 @@ router.get('/dashboard-summary', async (req, res, next) => {
          SELECT DATEDIFF(NOW(), j.requested_date_time) AS d
            FROM tbl_job j
           WHERE j.fk_client_id        = ?
-            AND j.reporting_contact_id IN (${teamPlaceholders})
+            ${teamFilter}
             AND j.job_status IN (0,1,2,20,9,15,21)
             AND j.requested_date_time IS NOT NULL
             AND j.requested_date_time < NOW()
        ) t`,
-      [req.spoc.client_id, ...teamIds]
+      [req.spoc.client_id, ...teamParams]
     );
 
     // Invoices due (client-level) — feeds the "Needs attention" card.
@@ -2378,8 +2475,8 @@ router.get('/dashboard-summary', async (req, res, next) => {
                    AND j.ready_for_billing = 'No' THEN 1 ELSE 0 END) AS revisit,
          SUM(CASE WHEN j.ready_for_billing = 'Yes' THEN 1 ELSE 0 END) AS qcDone
          FROM tbl_job j
-        WHERE j.fk_client_id = ? AND j.reporting_contact_id IN (${teamPlaceholders})`,
-      [req.spoc.client_id, ...teamIds]
+        WHERE j.fk_client_id = ? ${teamFilter}`,
+      [req.spoc.client_id, ...teamParams]
     );
 
     // ─── 30-day orders trend ─────────────────────────────────────────
@@ -2389,19 +2486,19 @@ router.get('/dashboard-summary', async (req, res, next) => {
     const [createdRows] = await pool.query(
       `SELECT DATE_FORMAT(j.ticket_created_date_time,'%Y-%m-%d') AS d, COUNT(*) AS n
          FROM tbl_job j
-        WHERE j.fk_client_id = ? AND j.reporting_contact_id IN (${teamPlaceholders})
+        WHERE j.fk_client_id = ? ${teamFilter}
           AND j.ticket_created_date_time >= DATE_SUB(CURDATE(), INTERVAL 29 DAY)
         GROUP BY d`,
-      [req.spoc.client_id, ...teamIds]
+      [req.spoc.client_id, ...teamParams]
     );
     const [completedRows] = await pool.query(
       `SELECT DATE_FORMAT(j.checkout_date_time,'%Y-%m-%d') AS d, COUNT(*) AS n
          FROM tbl_job j
-        WHERE j.fk_client_id = ? AND j.reporting_contact_id IN (${teamPlaceholders})
+        WHERE j.fk_client_id = ? ${teamFilter}
           AND j.job_status IN (3,5)
           AND j.checkout_date_time >= DATE_SUB(CURDATE(), INTERVAL 29 DAY)
         GROUP BY d`,
-      [req.spoc.client_id, ...teamIds]
+      [req.spoc.client_id, ...teamParams]
     );
     const createdMap   = new Map(createdRows.map((r) => [r.d, Number(r.n) || 0]));
     const completedMap = new Map(completedRows.map((r) => [r.d, Number(r.n) || 0]));
@@ -2423,11 +2520,11 @@ router.get('/dashboard-summary', async (req, res, next) => {
       `SELECT COALESCE(sc.service_catg_name, 'Other') AS name, COUNT(*) AS n
          FROM tbl_job j
          LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = j.fk_service_catg_id
-        WHERE j.fk_client_id = ? AND j.reporting_contact_id IN (${teamPlaceholders})
+        WHERE j.fk_client_id = ? ${teamFilter}
         GROUP BY name
         ORDER BY n DESC
         LIMIT 6`,
-      [req.spoc.client_id, ...teamIds]
+      [req.spoc.client_id, ...teamParams]
     );
     const categoryBreakdown = catRows.map((r, i) => ({
       label: r.name,
@@ -2445,10 +2542,10 @@ router.get('/dashboard-summary', async (req, res, next) => {
          LEFT JOIN tbl_address   ad ON ad.address_id  = j.fk_address_id
          LEFT JOIN tbl_city      ci ON ci.city_id     = ad.city_id
          LEFT JOIN tbl_easyfixer ef ON ef.efr_id      = j.fk_easyfixter_id
-        WHERE j.fk_client_id = ? AND j.reporting_contact_id IN (${teamPlaceholders})
+        WHERE j.fk_client_id = ? ${teamFilter}
         ORDER BY j.job_id DESC
         LIMIT 8`,
-      [req.spoc.client_id, ...teamIds]
+      [req.spoc.client_id, ...teamParams]
     );
     const recentTickets = recentRows.map((r) => ({
       jobId:    r.job_id,

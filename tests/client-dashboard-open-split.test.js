@@ -21,9 +21,18 @@ const { installFakePool } = require('./helpers/fake-pool');
 let queueRows = [];
 
 const fake = installFakePool([
+  /*
+   * ⚠ ORDER MATTERS — the fake dispatches on FIRST match. The manager_id probe
+   * must be routed BEFORE the generic tbl_client_contacts pattern, or that one
+   * swallows it and returns a row with no manager_id — which resolves the SPOC
+   * as TOP of the tree, making hierarchyFilter return undefined and every scope
+   * assertion silently pass against an unscoped query.
+   *
+   * manager_id 7 = not top, so the subtree filter genuinely applies.
+   */
+  [/SELECT manager_id FROM tbl_client_contacts/i, [{ manager_id: 7 }]],
+  [/WITH RECURSIVE team/i, [{ id: 42 }, { id: 43 }]],
   [/FROM tbl_client_contacts/i, [{ id: 11 }]],
-  [/SELECT manager_id FROM tbl_client_contacts/i, [{ manager_id: null }]],
-  [/WITH RECURSIVE team/i, [{ id: 42 }]],
   [/job_service_status = 1/i, () => queueRows],
   [/AS newTickets/i, [{ newTickets: 2, inProgress: 5, completed: 9, cancelled: 1, escalated: 0, openTotal: 20, awaitingYou: 3 }]],
   /*
@@ -48,10 +57,10 @@ const res = () => ({
   status(c) { this.statusCode = c; return this; },
   json(b) { this.body = b; return this; },
 });
-async function call(path) {
+async function call(path, access = { allStores: true }) {
   const r = res();
   await handlerFor(path, 'get')(
-    { spoc: { id: 42, client_id: 133 }, access: { allStores: true }, query: {} },
+    { spoc: { id: 42, client_id: 133 }, access, query: {} },
     r, (e) => { throw e; });
   assert.equal(r.body?.success, true, JSON.stringify(r.body));
   return r.body.data;
@@ -180,8 +189,32 @@ test('only OPEN jobs count — a closed job is not still unreachable', async () 
   const q = fake.calls.find((c) => /comment_on = 16/i.test(c.sql));
   assert.match(q.sql, /j\.job_status NOT IN \(3,5,6,7\)/,
     'the job being open IS the recency filter; there is deliberately no date cutoff');
-  assert.match(q.sql, /j\.reporting_contact_id IN \(/,
-    'team-scoped like every other figure on the card');
+});
+
+/* ── scope: the bug that put two populations on one screen ───────────── */
+
+test('an allStores SPOC is UNRESTRICTED — no reporting-contact clause at all', async () => {
+  await call('/dashboard-summary', { allStores: true });
+  for (const q of fake.calls.filter((c) => /FROM\s+tbl_job/i.test(c.sql))) {
+    assert.doesNotMatch(q.sql, /reporting_contact_id IN \(/,
+      'a Senior Leader sees the whole client — the action queue beside this card already does');
+  }
+});
+
+test('⚠ a scoped SPOC gets the SAME subtree the action queue uses', async () => {
+  await call('/dashboard-summary', { allStores: false });
+  const q = fake.calls.find((c) => /AS newTickets/i.test(c.sql));
+  assert.match(q.sql, /j\.reporting_contact_id IN \(/, 'still scoped for everyone else');
+  /*
+   * This card used to resolve its OWN list — self plus DIRECT reports,
+   * non-recursive — and ignore allStores entirely, while the queue beside it
+   * used hierarchyFilter. Two panels counting two different populations, which
+   * is how "Jobs Waiting for You" could show an approval that "Pending on you"
+   * counted as zero.
+   */
+  const ownLookup = fake.calls.filter((c) => /CAST\(manager_id AS UNSIGNED\)/i.test(c.sql));
+  assert.equal(ownLookup.length, 0,
+    'no bespoke direct-reports query — resolveClientHierarchy is the one definition');
 });
 
 test('it is reported SEPARATELY from noResponse, not instead of it', async () => {
