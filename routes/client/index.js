@@ -2145,6 +2145,57 @@ router.get('/dashboard-summary', async (req, res, next) => {
       [req.spoc.client_id, ...teamIds]
     );
 
+    /*
+     * ─── REPEATEDLY UNREACHABLE ────────────────────────────────────────────
+     *
+     * Jobs where the customer could not be reached on THREE DIFFERENT DAYS
+     * inside a three-day span. Deliberately not any of the near-misses:
+     *
+     *   three calls in ONE day        no — that is one bad afternoon
+     *   one call across three days    no — that is a single attempt
+     *   three days, but months apart  no — the span is what makes it a pattern
+     *
+     * ⚠ tbl_job.call_later CANNOT ANSWER THIS. It is a bit(1) flag with no
+     * count and no dates, so `call_later = 1` says "unreachable at least once,
+     * ever" — which is why the old attention bucket built on it was inflating
+     * "pending on you" with jobs nobody could act on. The history lives in
+     * tbl_job_comment at comment_on = 16, one row per Unreachable outcome
+     * (see job-comment.service.js, which stamps the flag AND writes the row).
+     *
+     * The self-join finds any anchor date with >= 3 DISTINCT dates in
+     * [anchor, anchor+2]. DISTINCT is doing the work: it collapses several
+     * calls on one day to a single date, which is exactly the "three calls in
+     * one day" case that must not qualify.
+     *
+     * No recency filter, on purpose: the job being OPEN is the recency. A job
+     * unreachable three days running last week and still open is still a job
+     * the client should chase.
+     */
+    const [[unreachable]] = await pool.query(
+      `SELECT COUNT(*) AS n FROM (
+         SELECT a.job_id
+           FROM (SELECT DISTINCT c.job_id, DATE(c.created_on) AS d
+                   FROM tbl_job_comment c
+                   JOIN tbl_job j ON j.job_id = c.job_id
+                  WHERE c.comment_on = 16
+                    AND j.fk_client_id = ?
+                    AND j.reporting_contact_id IN (${teamPlaceholders})
+                    AND j.job_status NOT IN (3,5,6,7)) a
+           JOIN (SELECT DISTINCT c.job_id, DATE(c.created_on) AS d
+                   FROM tbl_job_comment c
+                   JOIN tbl_job j ON j.job_id = c.job_id
+                  WHERE c.comment_on = 16
+                    AND j.fk_client_id = ?
+                    AND j.reporting_contact_id IN (${teamPlaceholders})
+                    AND j.job_status NOT IN (3,5,6,7)) b
+             ON b.job_id = a.job_id
+            AND b.d BETWEEN a.d AND DATE_ADD(a.d, INTERVAL 2 DAY)
+          GROUP BY a.job_id, a.d
+         HAVING COUNT(DISTINCT b.d) >= 3
+       ) q`,
+      [req.spoc.client_id, ...teamIds, req.spoc.client_id, ...teamIds]
+    );
+
     // Donut slices — return labels + colours pre-baked so the FE just
     // maps to SVG. Order is the lifecycle-natural reading order.
     // Colours match the brand palette + the badge colours used on
@@ -2428,6 +2479,12 @@ router.get('/dashboard-summary', async (req, res, next) => {
         invoicesDue:     { count: Number(invDue?.cnt) || 0, amount: Number(invDue?.amt) || 0 },
         estimatePending: Number(attn?.estimatePending) || 0,
         noResponse:      Number(attn?.noResponse) || 0,
+        /*
+         * Distinct from noResponse, which is the bare call_later flag —
+         * "unreachable at least once, ever". This is the PATTERN: three
+         * different days inside a three-day span, on a job that is still open.
+         */
+        repeatedlyUnreachable: Number(unreachable?.n) || 0,
         onHold:          Number(attn?.onHold) || 0,
         revisit:         Number(attn?.revisit) || 0,
         qcDone:          Number(attn?.qcDone) || 0,

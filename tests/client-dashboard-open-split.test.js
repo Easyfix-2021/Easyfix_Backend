@@ -136,3 +136,57 @@ test('the label is DERIVED, so loosening the filter cannot resurrect the bug', a
   assert.equal(d.items[0].action.method, 'GET',
     'a PATCH the server would reject is a button that lies');
 });
+
+/* ── repeatedly unreachable ───────────────────────────────────────────
+ *
+ * "Three call-laters in three days" means three DIFFERENT DAYS inside a
+ * three-day span. The near misses are the specification, so they are what is
+ * pinned: three calls in one afternoon is one bad afternoon, and one call
+ * spread over three days is a single attempt.
+ */
+
+test('the count comes from the comment history, NOT the call_later flag', async () => {
+  await call('/dashboard-summary');
+  const q = fake.calls.find((c) => /comment_on = 16/i.test(c.sql));
+  assert.ok(q, 'the unreachable count should query tbl_job_comment');
+  /*
+   * tbl_job.call_later is a bit(1) with no count and no dates — it can only
+   * say "unreachable at least once, ever". Counting a PATTERN from it is
+   * impossible, which is why the old noResponse bucket built on it was
+   * inflating "pending on you" with jobs nobody could act on.
+   */
+  assert.match(q.sql, /tbl_job_comment/, 'the history table, which has one row per outcome');
+  assert.doesNotMatch(q.sql, /call_later/, 'the flag cannot express three days');
+});
+
+test('DISTINCT dates — three calls in ONE day must not qualify', async () => {
+  await call('/dashboard-summary');
+  const q = fake.calls.find((c) => /comment_on = 16/i.test(c.sql));
+  assert.match(q.sql, /DISTINCT[\s\S]*DATE\(c\.created_on\)/,
+    'collapsing several calls on one day to one date is what excludes the one-afternoon case');
+  assert.match(q.sql, /COUNT\(DISTINCT b\.d\) >= 3/,
+    'three distinct DATES, not three rows');
+});
+
+test('the three-day SPAN is enforced, so three dates months apart do not qualify', async () => {
+  await call('/dashboard-summary');
+  const q = fake.calls.find((c) => /comment_on = 16/i.test(c.sql));
+  assert.match(q.sql, /BETWEEN a\.d AND DATE_ADD\(a\.d, INTERVAL 2 DAY\)/,
+    'an anchor date plus two — three consecutive days, not any three dates ever');
+});
+
+test('only OPEN jobs count — a closed job is not still unreachable', async () => {
+  await call('/dashboard-summary');
+  const q = fake.calls.find((c) => /comment_on = 16/i.test(c.sql));
+  assert.match(q.sql, /j\.job_status NOT IN \(3,5,6,7\)/,
+    'the job being open IS the recency filter; there is deliberately no date cutoff');
+  assert.match(q.sql, /j\.reporting_contact_id IN \(/,
+    'team-scoped like every other figure on the card');
+});
+
+test('it is reported SEPARATELY from noResponse, not instead of it', async () => {
+  const d = await call('/dashboard-summary');
+  assert.ok('repeatedlyUnreachable' in d.attention, 'the pattern count');
+  assert.ok('noResponse' in d.attention,
+    'the bare flag stays — other consumers read it, and the two mean different things');
+});
