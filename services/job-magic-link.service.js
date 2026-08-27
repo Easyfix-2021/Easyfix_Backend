@@ -45,6 +45,7 @@ const { maskMobile }   = require('../utils/mask-mobile');
 const s3Storage        = require('../utils/s3-storage');
 const addressService   = require('./address.service');
 const logger           = require('../logger');
+const { isAbsentAnswer } = require('../utils/schema-absent-error');
 // The appointment slot model — TIME_SLOTS below are the customer-facing
 // DISPLAY labels; storage goes through resolveTimeSlot so tbl_job.time_slot
 // only ever holds one of the four canonical bands.
@@ -511,6 +512,17 @@ async function cityHasIsActive(pool) {
     await pool.query('SELECT city_id FROM tbl_city WHERE is_active = 1 LIMIT 1');
     _cityHasIsActive = true;
   } catch (_e) {
+    /*
+     * Probes by TRYING the column, so "not there" arrives as the error and
+     * IS the answer — cache it. Any other error is a fault, not an answer:
+     * leave _cityIsActiveProbed false so the next call asks again, instead of a
+     * two-second blip pinning this off until the container restarts.
+     */
+    if (!isAbsentAnswer(_e)) {
+      logger.warn('schema probe failed · _cityHasIsActive · ' + _e.message
+        + ' — treating as absent for this call only');
+      return false;
+    }
     _cityHasIsActive = false;
   }
   _cityIsActiveProbed = true;
@@ -549,6 +561,17 @@ async function addressHasInstruction(pool) {
     await pool.query('SELECT address_instruction FROM tbl_address LIMIT 1');
     _addrHasInstruction = true;
   } catch (_e) {
+    /*
+     * Probes by TRYING the column, so "not there" arrives as the error and
+     * IS the answer — cache it. Any other error is a fault, not an answer:
+     * leave _addrInstrProbed false so the next call asks again, instead of a
+     * two-second blip pinning this off until the container restarts.
+     */
+    if (!isAbsentAnswer(_e)) {
+      logger.warn('schema probe failed · _addrHasInstruction · ' + _e.message
+        + ' — treating as absent for this call only');
+      return false;
+    }
     _addrHasInstruction = false;
   }
   _addrInstrProbed = true;

@@ -114,7 +114,13 @@ async function hasProvenanceColumn() {
       }
       return present;
     } catch (e) {
-      logger.warn({ err: e.message }, 'pincode-geocode: provenance-column probe failed; assuming absent');
+      /*
+       * A failure is NOT cached. The success answer is frozen for the process because a column that exists does not vanish; a failure frozen the same way turns a two-second information_schema blip into a degraded mode that lasts until the container restarts, with nothing in the logs saying so.
+       * This memoises a PROMISE, so clearing the slot is what un-freezes it:
+       * otherwise every later caller awaits this same resolved-false promise.
+       */
+      provenanceProbe = null;
+      logger.warn({ err: e.message }, 'pincode-geocode: provenance-column probe failed; assuming absent for this call only');
       return false;
     }
   })();

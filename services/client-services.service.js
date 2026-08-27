@@ -33,6 +33,7 @@
 
 const { pool } = require('../db');
 const logger = require('../logger');
+const { isAbsentAnswer } = require('../utils/schema-absent-error');
 
 /**
  * Probe whether tbl_client_service has a service_type_ids column.
@@ -53,6 +54,17 @@ async function clientServiceHasTypeIds(pool) {
     await pool.query('SELECT service_type_ids FROM tbl_client_service LIMIT 1');
     _hasServiceTypeIds = true;
   } catch (_e) {
+    /*
+     * Probes by TRYING the column, so "not there" arrives as the error and
+     * IS the answer — cache it. Any other error is a fault, not an answer:
+     * leave _stIdsProbed false so the next call asks again, instead of a
+     * two-second blip pinning this off until the container restarts.
+     */
+    if (!isAbsentAnswer(_e)) {
+      logger.warn('schema probe failed · _hasServiceTypeIds · ' + _e.message
+        + ' — treating as absent for this call only');
+      return false;
+    }
     _hasServiceTypeIds = false;
   }
   _stIdsProbed = true;
@@ -83,6 +95,17 @@ async function clientServiceHasTypeIdSingular(pool) {
     await pool.query('SELECT service_type_id FROM tbl_client_service LIMIT 1');
     _hasServiceTypeIdSingular = true;
   } catch (_e) {
+    /*
+     * Probes by TRYING the column, so "not there" arrives as the error and
+     * IS the answer — cache it. Any other error is a fault, not an answer:
+     * leave _stIdSingularProbed false so the next call asks again, instead of a
+     * two-second blip pinning this off until the container restarts.
+     */
+    if (!isAbsentAnswer(_e)) {
+      logger.warn('schema probe failed · _hasServiceTypeIdSingular · ' + _e.message
+        + ' — treating as absent for this call only');
+      return false;
+    }
     _hasServiceTypeIdSingular = false;
   }
   _stIdSingularProbed = true;

@@ -38,6 +38,7 @@
 
 const { pool } = require('../db');
 const logger = require('../logger');
+const { isAbsentAnswer } = require('../utils/schema-absent-error');
 
 /* ─── Column-presence probe (cached) ──────────────────────────────── */
 
@@ -1142,12 +1143,24 @@ let _customPropsColsProbed = false;
 let _customPropsLegacyShape = false; // true → c_prop_* columns
 let _customPropsHasLegacyLabel = false; // true → c_prop_label exists
 let _customPropsHasIsConfig = false; // true → is_config exists (migration 2026-07-10)
+/*
+ * Three TRY-THE-QUERY probes. "The column is not there" arrives as
+ * ER_BAD_FIELD_ERROR, so for these the error IS the answer and caching it is
+ * right. Anything else — a dropped connection, a lock timeout — is not an
+ * answer: it returns without setting _customPropsColsProbed, so the next call
+ * probes again rather than this deploy being stuck on the wrong schema shape
+ * (which would silently write custom properties to the wrong columns).
+ */
 async function detectCustomPropsShape() {
   if (_customPropsColsProbed) return _customPropsLegacyShape;
   try {
     await pool.query('SELECT c_prop_name FROM tbl_client_custom_properties LIMIT 1');
     _customPropsLegacyShape = true;
   } catch (_e) {
+    if (!isAbsentAnswer(_e)) {
+      logger.warn({ err: _e.message }, '[client.service] custom-props shape probe failed — not caching');
+      return _customPropsLegacyShape;
+    }
     _customPropsLegacyShape = false;
   }
   if (_customPropsLegacyShape) {
@@ -1155,6 +1168,10 @@ async function detectCustomPropsShape() {
       await pool.query('SELECT c_prop_label FROM tbl_client_custom_properties LIMIT 1');
       _customPropsHasLegacyLabel = true;
     } catch (_e) {
+      if (!isAbsentAnswer(_e)) {
+        logger.warn({ err: _e.message }, '[client.service] c_prop_label probe failed — not caching');
+        return _customPropsLegacyShape;
+      }
       _customPropsHasLegacyLabel = false;
     }
   }
@@ -1165,6 +1182,10 @@ async function detectCustomPropsShape() {
     await pool.query('SELECT is_config FROM tbl_client_custom_properties LIMIT 1');
     _customPropsHasIsConfig = true;
   } catch (_e) {
+    if (!isAbsentAnswer(_e)) {
+      logger.warn({ err: _e.message }, '[client.service] is_config probe failed — not caching');
+      return _customPropsLegacyShape;
+    }
     _customPropsHasIsConfig = false;
   }
   _customPropsColsProbed = true;

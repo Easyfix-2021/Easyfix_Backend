@@ -1,6 +1,7 @@
 const { pool } = require('../db');
 const { OFFER_STATUS } = require('./offer-status');
 const logger = require('../logger');
+const { isAbsentAnswer } = require('../utils/schema-absent-error');
 const settings = require('./settings.service');
 const jobService = require('./job.service');
 const geocode = require('./pincode-geocode.service');
@@ -382,8 +383,23 @@ async function jobOfferTableExists() {
   try {
     await pool.query('SELECT 1 FROM tbl_job_offer LIMIT 1');
     _hasJobOfferTable = true;
-  } catch {
-    _hasJobOfferTable = false;
+  } catch (e){
+    /*
+     * This probes by TRYING THE QUERY, so "it is not there" arrives as an
+     * error — ER_NO_SUCH_TABLE / ER_BAD_FIELD_ERROR IS the answer, and caching
+     * it is right: the alternative re-probes on every hot-path call forever.
+     *
+     * Any OTHER error is not an answer. A connection blip or a lock timeout
+     * returns false for THIS call without being written into the memo, so the
+     * next call asks again instead of the feature staying off until restart.
+     */
+    if (isAbsentAnswer(e)) {
+      _hasJobOfferTable = false;
+      return _hasJobOfferTable;
+    }
+    logger.warn('schema probe failed · _hasJobOfferTable · ' + e.message
+      + ' — treating as absent for this call only');
+    return false;
   }
   return _hasJobOfferTable;
 }

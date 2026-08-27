@@ -101,10 +101,13 @@ async function hasJobStageColumn() {
         LIMIT 1`,
     );
     _jobStageColumnExists = rows.length > 0;
-  } catch {
-    _jobStageColumnExists = false;
+    return _jobStageColumnExists;
+  } catch (e) {
+    // A failure is NOT cached. The success answer is frozen for the process because a column that exists does not vanish; a failure frozen the same way turns a two-second information_schema blip into a degraded mode that lasts until the container restarts, with nothing in the logs saying so.
+    logger.warn('job-comment: job_stage probe failed · ' + e.message
+      + ' — treating as absent for this call only');
+    return false;
   }
-  return _jobStageColumnExists;
 }
 
 /*
@@ -140,10 +143,17 @@ async function hasJobColumn(colName) {
       [colName],
     );
     _colCache[colName] = rows.length > 0;
-  } catch {
-    _colCache[colName] = false;
+    return _colCache[colName];
+  } catch (e) {
+    /*
+     * A failure is NOT cached. The success answer is frozen for the process because a column that exists does not vanish; a failure frozen the same way turns a two-second information_schema blip into a degraded mode that lasts until the container restarts, with nothing in the logs saying so.
+     * The guard above is `!= null`, and `false != null` — so a cached failure
+     * pinned the column as missing for good.
+     */
+    logger.warn('job-comment: tbl_job column probe failed · ' + colName + ' · ' + e.message
+      + ' — treating as absent for this call only');
+    return false;
   }
-  return _colCache[colName];
 }
 
 // Back-compat: keep the original named helper used in addComment.

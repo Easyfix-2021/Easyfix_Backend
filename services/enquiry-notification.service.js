@@ -58,8 +58,11 @@ async function enquiryColumnsExist() {
     );
     _enquiryColsExist = Number(rows[0].n) === 3;
   } catch (err) {
-    logger.warn('Enquiry column probe failed — assuming absent · ' + (err && err.message ? err.message : err));
-    _enquiryColsExist = false;
+    // A failure is NOT cached. This asks the SCHEMA, so absence is zero rows and
+    // any error is a genuine fault — freezing it would disable this until restart.
+    logger.warn('Enquiry column probe failed — assuming absent for this call only · '
+      + (err && err.message ? err.message : err));
+    return false;
   }
   return _enquiryColsExist;
 }

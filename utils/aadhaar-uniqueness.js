@@ -120,10 +120,13 @@ async function hasActiveAadhaarColumn(runner) {
         LIMIT 1`,
     );
     hasGeneratedColumn = rows.length > 0;
-  } catch {
-    hasGeneratedColumn = false;
+    return hasGeneratedColumn;
+  } catch (e) {
+    // A failure is NOT cached. The success answer is frozen for the process because a column that exists does not vanish; a failure frozen the same way turns a two-second information_schema blip into a degraded mode that lasts until the container restarts, with nothing in the logs saying so.
+    logger.warn('aadhaar: active_aadhaar_unique probe failed · ' + e.message
+      + ' — treating as absent for this call only');
+    return false;
   }
-  return hasGeneratedColumn;
 }
 
 function resetActiveAadhaarColumnProbeForTests() {

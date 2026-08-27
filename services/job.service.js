@@ -1,5 +1,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
+const { isAbsentAnswer } = require('../utils/schema-absent-error');
 // Job-OTP generator — shared with the auth flow so we're not
 // duplicating the cryptographically-safe 4-digit primitive. See
 // utils/otp.js::generateOtp() for the implementation. Used at
@@ -609,8 +610,11 @@ async function hasOtpColumn() {
   try {
     const [rows] = await pool.query("SHOW COLUMNS FROM tbl_job LIKE 'otp'");
     _hasOtpColumn = rows.length > 0;
-  } catch {
-    _hasOtpColumn = false;
+  } catch (e){
+    // A failure is NOT cached — the memo above is for the ANSWER. Freezing a transient information_schema error would disable this until restart.
+    logger.warn('job: schema probe failed · _hasOtpColumn · ' + e.message
+      + ' — treating as absent for this call only');
+    return false;
   }
   return _hasOtpColumn;
 }
@@ -794,7 +798,9 @@ async function hasClientVerticalIdColumn() {
     // SHOW COLUMNS itself failed — be conservative and treat as missing.
     // eslint-disable-next-line no-console
     console.warn('[job.service] could not probe tbl_client.vertical_id:', e?.message);
-    _hasClientVerticalIdColumn = false;
+    // A failure is NOT cached. This asks the SCHEMA, so absence is zero rows and
+    // any error is a genuine fault — freezing it would disable this until restart.
+    return false;
   }
   if (!_hasClientVerticalIdColumn) {
     // eslint-disable-next-line no-console
@@ -845,7 +851,13 @@ async function hasJobPrimarySpocColumn() {
   try {
     const [rows] = await pool.query("SHOW COLUMNS FROM tbl_job LIKE 'job_primary_spoc'");
     _hasJobPrimarySpocColumn = rows.length > 0;
-  } catch (_e) { _hasJobPrimarySpocColumn = false; }
+  } catch (_e) {
+    // A failure is NOT cached. This asks the SCHEMA, so absence is zero rows and
+    // any error is a genuine fault — freezing it would disable this until restart.
+    logger.warn('schema probe failed · tbl_job.job_primary_spoc · ' + _e.message
+      + ' — treating as absent for this call only');
+    return false;
+  }
   return _hasJobPrimarySpocColumn;
 }
 /*
@@ -861,7 +873,13 @@ async function hasVerticalMappingInsertedOnColumn() {
   try {
     const [rows] = await pool.query("SHOW COLUMNS FROM tbl_vertical_mapping LIKE 'inserted_on'");
     _hasVerticalMappingInsertedOn = rows.length > 0;
-  } catch (_e) { _hasVerticalMappingInsertedOn = false; }
+  } catch (_e) {
+    // A failure is NOT cached. This asks the SCHEMA, so absence is zero rows and
+    // any error is a genuine fault — freezing it would disable this until restart.
+    logger.warn('schema probe failed · tbl_vertical_mapping.inserted_on · ' + _e.message
+      + ' — treating as absent for this call only');
+    return false;
+  }
   return _hasVerticalMappingInsertedOn;
 }
 /*
@@ -986,7 +1004,13 @@ async function hasLinkedJobTable() {
   try {
     const [rows] = await pool.query("SHOW TABLES LIKE 'linked_job'");
     _hasLinkedJobTable = rows.length > 0;
-  } catch (_e) { _hasLinkedJobTable = false; }
+  } catch (_e) {
+    // A failure is NOT cached. This asks the SCHEMA, so absence is zero rows and
+    // any error is a genuine fault — freezing it would disable this until restart.
+    logger.warn('schema probe failed · linked_job table · ' + _e.message
+      + ' — treating as absent for this call only');
+    return false;
+  }
   return _hasLinkedJobTable;
 }
 /*
@@ -1032,8 +1056,23 @@ async function customerRequestTableExists() {
   try {
     await pool.query('SELECT 1 FROM tbl_job_customer_request LIMIT 1');
     _hasCustomerRequestTable = true;
-  } catch {
-    _hasCustomerRequestTable = false;
+  } catch (e){
+    /*
+     * This probes by TRYING THE QUERY, so "it is not there" arrives as an
+     * error — ER_NO_SUCH_TABLE / ER_BAD_FIELD_ERROR IS the answer, and caching
+     * it is right: the alternative re-probes on every hot-path call forever.
+     *
+     * Any OTHER error is not an answer. A connection blip or a lock timeout
+     * returns false for THIS call without being written into the memo, so the
+     * next call asks again instead of the feature staying off until restart.
+     */
+    if (isAbsentAnswer(e)) {
+      _hasCustomerRequestTable = false;
+      return _hasCustomerRequestTable;
+    }
+    logger.warn('schema probe failed · _hasCustomerRequestTable · ' + e.message
+      + ' — treating as absent for this call only');
+    return false;
   }
   return _hasCustomerRequestTable;
 }
@@ -1084,8 +1123,23 @@ async function jobMediaTableExists() {
   try {
     await pool.query('SELECT 1 FROM tbl_job_media LIMIT 1');
     _hasJobMediaTable = true;
-  } catch {
-    _hasJobMediaTable = false;
+  } catch (e){
+    /*
+     * This probes by TRYING THE QUERY, so "it is not there" arrives as an
+     * error — ER_NO_SUCH_TABLE / ER_BAD_FIELD_ERROR IS the answer, and caching
+     * it is right: the alternative re-probes on every hot-path call forever.
+     *
+     * Any OTHER error is not an answer. A connection blip or a lock timeout
+     * returns false for THIS call without being written into the memo, so the
+     * next call asks again instead of the feature staying off until restart.
+     */
+    if (isAbsentAnswer(e)) {
+      _hasJobMediaTable = false;
+      return _hasJobMediaTable;
+    }
+    logger.warn('schema probe failed · _hasJobMediaTable · ' + e.message
+      + ' — treating as absent for this call only');
+    return false;
   }
   return _hasJobMediaTable;
 }
@@ -1101,8 +1155,23 @@ async function jobOfferTableExists() {
   try {
     await pool.query('SELECT 1 FROM tbl_job_offer LIMIT 1');
     _hasJobOfferTable = true;
-  } catch {
-    _hasJobOfferTable = false;
+  } catch (e){
+    /*
+     * This probes by TRYING THE QUERY, so "it is not there" arrives as an
+     * error — ER_NO_SUCH_TABLE / ER_BAD_FIELD_ERROR IS the answer, and caching
+     * it is right: the alternative re-probes on every hot-path call forever.
+     *
+     * Any OTHER error is not an answer. A connection blip or a lock timeout
+     * returns false for THIS call without being written into the memo, so the
+     * next call asks again instead of the feature staying off until restart.
+     */
+    if (isAbsentAnswer(e)) {
+      _hasJobOfferTable = false;
+      return _hasJobOfferTable;
+    }
+    logger.warn('schema probe failed · _hasJobOfferTable · ' + e.message
+      + ' — treating as absent for this call only');
+    return false;
   }
   return _hasJobOfferTable;
 }
@@ -1118,8 +1187,23 @@ async function magicLinkDeliveryColsExist() {
   try {
     await pool.query('SELECT magic_link_delivery_status FROM tbl_job LIMIT 1');
     _hasMagicLinkDeliveryCols = true;
-  } catch {
-    _hasMagicLinkDeliveryCols = false;
+  } catch (e){
+    /*
+     * This probes by TRYING THE QUERY, so "it is not there" arrives as an
+     * error — ER_NO_SUCH_TABLE / ER_BAD_FIELD_ERROR IS the answer, and caching
+     * it is right: the alternative re-probes on every hot-path call forever.
+     *
+     * Any OTHER error is not an answer. A connection blip or a lock timeout
+     * returns false for THIS call without being written into the memo, so the
+     * next call asks again instead of the feature staying off until restart.
+     */
+    if (isAbsentAnswer(e)) {
+      _hasMagicLinkDeliveryCols = false;
+      return _hasMagicLinkDeliveryCols;
+    }
+    logger.warn('schema probe failed · _hasMagicLinkDeliveryCols · ' + e.message
+      + ' — treating as absent for this call only');
+    return false;
   }
   return _hasMagicLinkDeliveryCols;
 }
@@ -4241,10 +4325,13 @@ async function hasSendBackToTxColumn() {
         LIMIT 1`,
     );
     _sendBackColumnExists = rows.length > 0;
-  } catch {
-    _sendBackColumnExists = false;
+    return _sendBackColumnExists;
+  } catch (e) {
+    // A failure is NOT cached. The success answer is frozen for the process because a column that exists does not vanish; a failure frozen the same way turns a two-second information_schema blip into a degraded mode that lasts until the container restarts, with nothing in the logs saying so.
+    logger.warn('job: send_back_to_tx probe failed · ' + e.message
+      + ' — treating as absent for this call only');
+    return false;
   }
-  return _sendBackColumnExists;
 }
 
 /*
@@ -4267,10 +4354,13 @@ async function hasEnquiryColumns() {
           AND COLUMN_NAME IN ('enquiry_reason_id', 'enquiry_comment', 'enquiry_date_time')`,
     );
     _enquiryColumnsExist = rows[0].n === 3;
-  } catch {
-    _enquiryColumnsExist = false;
+    return _enquiryColumnsExist;
+  } catch (e) {
+    // A failure is NOT cached. The success answer is frozen for the process because a column that exists does not vanish; a failure frozen the same way turns a two-second information_schema blip into a degraded mode that lasts until the container restarts, with nothing in the logs saying so.
+    logger.warn('job: enquiry column trio probe failed · ' + e.message
+      + ' — treating as legacy shape for this call only');
+    return false;
   }
-  return _enquiryColumnsExist;
 }
 
 /*
@@ -4291,10 +4381,13 @@ async function hasCallLaterColumn() {
         LIMIT 1`,
     );
     _callLaterColumnExists = rows.length > 0;
-  } catch {
-    _callLaterColumnExists = false;
+    return _callLaterColumnExists;
+  } catch (e) {
+    // A failure is NOT cached. The success answer is frozen for the process because a column that exists does not vanish; a failure frozen the same way turns a two-second information_schema blip into a degraded mode that lasts until the container restarts, with nothing in the logs saying so.
+    logger.warn('job: call_later probe failed · ' + e.message
+      + ' — treating as absent for this call only');
+    return false;
   }
-  return _callLaterColumnExists;
 }
 
 async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {

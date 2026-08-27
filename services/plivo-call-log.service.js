@@ -159,10 +159,13 @@ async function hasRecordingRequestedColumn() {
         LIMIT 1`,
     );
     _hasRecordingRequestedCol = rows.length > 0;
+    return _hasRecordingRequestedCol;
   } catch (e) {
-    _hasRecordingRequestedCol = false;
+    // A failure is NOT cached. The success answer is frozen for the process because a column that exists does not vanish; a failure frozen the same way turns a two-second information_schema blip into a degraded mode that lasts until the container restarts, with nothing in the logs saying so.
+    logger.warn('plivo-call-log: recording_requested probe failed · ' + e.message
+      + ' — treating as absent for this call only');
+    return false;
   }
-  return _hasRecordingRequestedCol;
 }
 
 /*
@@ -193,10 +196,13 @@ async function hasConferenceColumns() {
         LIMIT 1`,
     );
     _hasConferenceCols = rows.length > 0;
+    return _hasConferenceCols;
   } catch (e) {
-    _hasConferenceCols = false;
+    // A failure is NOT cached. The success answer is frozen for the process because a column that exists does not vanish; a failure frozen the same way turns a two-second information_schema blip into a degraded mode that lasts until the container restarts, with nothing in the logs saying so.
+    logger.warn('plivo-call-log: conference_id probe failed · ' + e.message
+      + ' — treating as absent for this call only');
+    return false;
   }
-  return _hasConferenceCols;
 }
 
 /*

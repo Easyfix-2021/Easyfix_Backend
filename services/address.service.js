@@ -40,6 +40,8 @@
  * Writers still TOUCH the column rather than omitting it, so a row flipped to 1
  * by older code resets to 0 — leaving stale 1s behind would defeat the invariant.
  */
+const logger = require('../logger');
+
 const IS_INSTRUCTION_ADDED = 0;
 
 // ─── Column probes ───────────────────────────────────────────────────
@@ -87,7 +89,13 @@ async function hasAddressInstructionColumn(executor, { cache = true, onProbeErro
     present = rows.length > 0;
   } catch (e) {
     if (onProbeError === 'throw') throw e;
-    present = false;
+    /*
+     * A failure is NOT cached. The success answer is frozen for the process because a column that exists does not vanish; a failure frozen the same way turns a two-second information_schema blip into a degraded mode that lasts until the container restarts, with nothing in the logs saying so.
+     * Returning early is what keeps it out of the memo below.
+     */
+    logger.warn('address: address_instruction probe failed · ' + e.message
+      + ' — treating as absent for this call only');
+    return false;
   }
   if (cache) _hasInstructionColumn = present;
   return present;

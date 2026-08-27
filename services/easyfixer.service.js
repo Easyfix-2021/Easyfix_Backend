@@ -767,7 +767,10 @@ async function hasReactivationColumn() {
     );
     _hasReactivationCol = rows.length > 0;
   } catch (e) {
-    _hasReactivationCol = false;
+    // A failure is NOT cached — the memo above is for the ANSWER. Freezing a transient information_schema error would disable this until restart.
+    logger.warn('easyfixer: schema probe failed · _hasReactivationCol · ' + e.message
+      + ' — treating as absent for this call only');
+    return false;
   }
   return _hasReactivationCol;
 }
