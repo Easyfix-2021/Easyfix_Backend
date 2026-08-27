@@ -16,15 +16,16 @@
 -- Friday, and a property is one edit in Setting -> Admin Actions instead of a
 -- redeploy.
 
--- Register the job at boot. The scheduler reads this ONCE at start, so flipping
--- it later needs a restart -- same contract as every other cron gate here.
-INSERT INTO easyfix_properties (property_key, property_value)
-SELECT 'plivo.balance.alert.enabled', 'true'
- WHERE NOT EXISTS (SELECT 1 FROM easyfix_properties WHERE property_key = 'plivo.balance.alert.enabled');
-
--- Who hears about it. Comma separated. The code falls back to these same two if
--- the key is missing or blank, so the alert can never end up addressed to
--- nobody through a config slip.
+-- Who hears about it, and whether it runs at all.
+--
+-- THIS KEY IS ALSO THE ON/OFF SWITCH. There is no separate enabled flag: the
+-- job is always registered, and blanking this list silences it. That is one
+-- switch instead of two, and it removes the state an alert can least afford --
+-- being quietly off while a second flag still reads "on".
+--
+-- Because it is the switch, the code has NO built-in fallback list. Seeding it
+-- here is what makes the alert work out of the box; clearing it here is what
+-- turns it off. If this row is missing, nobody is told.
 INSERT INTO easyfix_properties (property_key, property_value)
 SELECT 'plivo.balance.alert.recipients', 'priyanka@easyfix.in,harshit@channelplay.in'
  WHERE NOT EXISTS (SELECT 1 FROM easyfix_properties WHERE property_key = 'plivo.balance.alert.recipients');
@@ -37,14 +38,11 @@ INSERT INTO easyfix_properties (property_key, property_value)
 SELECT 'plivo.balance.threshold', '5'
  WHERE NOT EXISTS (SELECT 1 FROM easyfix_properties WHERE property_key = 'plivo.balance.threshold');
 
--- How often to repeat while it stays low. Clamped in code to 1..168 hours, so a
--- mistyped 0 cannot turn this into a mail loop and a mistyped 100000 cannot
--- silence it for a month.
-INSERT INTO easyfix_properties (property_key, property_value)
-SELECT 'plivo.balance.alert.repeat_hours', '12'
- WHERE NOT EXISTS (SELECT 1 FROM easyfix_properties WHERE property_key = 'plivo.balance.alert.repeat_hours');
+-- The repeat cadence is NOT a property: it is fixed at one hour in code. A knob
+-- there only invites a value that turns the alert into noise or into silence,
+-- and neither is worth a config row.
 
--- Verify -- expect 4 rows.
+-- Verify -- expect 2 rows.
 SELECT property_key, property_value
   FROM easyfix_properties
  WHERE property_key LIKE 'plivo.balance%'

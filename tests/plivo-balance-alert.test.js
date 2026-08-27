@@ -44,8 +44,38 @@ test('a low balance emails the configured people', async () => {
   assert.match(sent[0].text, /"Busy"/, 'the mail must name the symptom they will actually be told about');
 });
 
-test('with no recipients configured it falls back to the two who asked for it', () => {
-  assert.deepEqual(cron.recipients(), ['priyanka@easyfix.in', 'harshit@channelplay.in']);
+test('a BLANK recipient list is the off switch — nothing is sent', async () => {
+  /*
+   * The list is also the on/off control, so there must be no built-in
+   * fallback: with one, clearing the property would not turn the alert off and
+   * the documented switch would silently do nothing.
+   */
+  store.set('plivo.balance.alert.recipients', '   ');
+  const r = await cron.run();
+  assert.deepEqual(cron.recipients(), []);
+  assert.equal(r.sent, false);
+  assert.equal(r.reason, 'no-recipients');
+  assert.equal(sent.length, 0);
+});
+
+test('a MISSING recipient key is off too, not a default', async () => {
+  const r = await cron.run();
+  assert.equal(r.sent, false);
+  assert.equal(sent.length, 0,
+    'the migration seeds the addresses; the code must not smuggle them back in, '
+    + 'or blanking the property could never disable this');
+});
+
+test('it still notices the low balance while silenced', async () => {
+  const r = await cron.run();
+  assert.equal(r.low, true, 'off means "do not tell anyone", not "do not look"');
+});
+
+test('the repeat cadence is fixed at one hour, not configurable', () => {
+  assert.equal(cron.REPEAT_HOURS, 1);
+  store.set('plivo.balance.alert.repeat_hours', '99');
+  assert.equal(cron.repeatHours(), 1,
+    'a property here would only invite a value that makes the alert noise or silence');
 });
 
 test('an UNREADABLE balance never alerts', async () => {
@@ -73,12 +103,14 @@ test('a healthy balance is silent', async () => {
 });
 
 test('zero is LOW, not unknown — it is the case that blocked production', async () => {
+  store.set('plivo.balance.alert.recipients', 'ops@x.com');
   scenario.balance = { ok: true, cashCredits: 0 };
   const r = await cron.run();
   assert.equal(r.sent, true);
 });
 
 test('it does not repeat inside the cooldown', async () => {
+  store.set('plivo.balance.alert.recipients', 'ops@x.com');
   await cron.run();
   assert.equal(sent.length, 1);
   await cron.run();
@@ -86,14 +118,16 @@ test('it does not repeat inside the cooldown', async () => {
 });
 
 test('it repeats once the cooldown has passed', async () => {
+  store.set('plivo.balance.alert.recipients', 'ops@x.com');
   await cron.run();
-  const old = new Date(Date.now() - 13 * 3600 * 1000).toISOString();
+  const old = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
   store.set(cron.STATE_KEY, old);
   await cron.run();
   assert.equal(sent.length, 2, 'still low after the cadence — say so again');
 });
 
 test('recovery clears the stamp, so the NEXT dip alerts immediately', async () => {
+  store.set('plivo.balance.alert.recipients', 'ops@x.com');
   await cron.run();
   assert.ok(store.get(cron.STATE_KEY), 'stamped');
 
@@ -116,6 +150,7 @@ test('auto-recharge accounts are left alone', async () => {
 });
 
 test('a failed send is NOT stamped, so the next run retries', async () => {
+  store.set('plivo.balance.alert.recipients', 'ops@x.com');
   email.send = async () => { throw new Error('SMTP down'); };
   await assert.rejects(() => cron.run(), /SMTP down/);
   assert.equal(store.get(cron.STATE_KEY), undefined,
@@ -125,9 +160,4 @@ test('a failed send is NOT stamped, so the next run retries', async () => {
   assert.equal(sent.length, 1);
 });
 
-test('the repeat cadence is clamped against a mail loop', () => {
-  store.set('plivo.balance.alert.repeat_hours', '0');
-  assert.ok(cron.repeatHours() >= 1, '0 must not mean "every run"');
-  store.set('plivo.balance.alert.repeat_hours', '100000');
-  assert.ok(cron.repeatHours() <= 168, 'nor may it go quiet for a month');
-});
+

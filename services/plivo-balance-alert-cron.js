@@ -25,33 +25,37 @@ const { withMysqlNamedLock } = require('./mysql-named-lock.service');
  * This is the half that reaches the people who can top it up, while there is
  * still credit to work with.
  *
- * EVERYTHING IS CONFIGURED FROM easyfix_properties, so ops can change who is
- * told and how loudly without a deploy:
+ * TWO KNOBS, and the recipient list is also the ON/OFF SWITCH:
  *
- *   plivo.balance.alert.enabled       'true' to register the job at boot
- *   plivo.balance.alert.recipients    CSV; defaults to the two people who
- *                                     asked for it
+ *   plivo.balance.alert.recipients    CSV. BLANK OR MISSING MEANS OFF — there
+ *                                     is no separate enabled flag, because a
+ *                                     feature that is on with nobody to tell is
+ *                                     not on in any useful sense.
  *   plivo.balance.threshold           shared with the operator's banner, so the
  *                                     two cannot disagree about "low"
- *   plivo.balance.alert.repeat_hours  re-send cadence while it stays low
  *   plivo.balance.alert.last_sent_at  STATE, written by this job — not a knob
+ *
+ * There is deliberately NO code-level fallback list. One existed and was wrong:
+ * with a built-in default, clearing the property would not turn the alert off,
+ * so the documented switch would not work. The migration seeds the addresses;
+ * the property is the only source.
  */
 
-const DEFAULT_RECIPIENTS = 'priyanka@easyfix.in,harshit@channelplay.in';
+/*
+ * Fixed, not configurable. An hour is short enough that a balance draining
+ * during a shift is caught, and long enough that a low balance left over a
+ * weekend produces a readable thread rather than a wall. A knob here only
+ * invites a value that turns the alert into noise or into silence.
+ */
+const REPEAT_HOURS = 1;
 const STATE_KEY = 'plivo.balance.alert.last_sent_at';
 
 function recipients() {
-  const raw = String(props.getProperty('plivo.balance.alert.recipients') ?? '').trim()
-    || DEFAULT_RECIPIENTS;
+  const raw = String(props.getProperty('plivo.balance.alert.recipients') ?? '').trim();
   return raw.split(',').map((s) => s.trim()).filter(Boolean);
 }
 
-function repeatHours() {
-  const n = Number(props.getProperty('plivo.balance.alert.repeat_hours'));
-  // Floor of 1h so a misconfigured 0 cannot turn this into a mail loop; ceiling
-  // of a week so it cannot go quiet for a month either.
-  return Number.isFinite(n) && n > 0 ? Math.min(Math.max(n, 1), 168) : 12;
-}
+function repeatHours() { return REPEAT_HOURS; }
 
 /*
  * Have we already told them recently?
@@ -80,7 +84,7 @@ function body({ credits, threshold }) {
     '',
     'Action: top up the Plivo account.',
     '',
-    `This alert repeats every ${repeatHours()}h while the balance stays low, and resets`,
+    `This alert repeats hourly while the balance stays low, and resets`,
     'once it recovers.',
   ];
   return lines.join('\n');
@@ -133,7 +137,10 @@ async function run() {
 
   const to = recipients();
   if (!to.length) {
-    logger.warn('Plivo balance low but no recipients configured (plivo.balance.alert.recipients)');
+    // Not a misconfiguration — this IS the off switch. Logged at info so a
+    // deliberately-silenced alert does not look like a fault every hour.
+    logger.info('Plivo balance low · credits=' + credits.toFixed(2)
+      + ' — alert is OFF (plivo.balance.alert.recipients is blank)');
     return { checked: true, known: true, credits, low: true, sent: false, reason: 'no-recipients' };
   }
 
@@ -163,4 +170,4 @@ async function runOnce() {
   return result;
 }
 
-module.exports = { run, runOnce, recipients, repeatHours, sentWithinCooldown, STATE_KEY, DEFAULT_RECIPIENTS };
+module.exports = { run, runOnce, recipients, repeatHours, sentWithinCooldown, STATE_KEY, REPEAT_HOURS };

@@ -949,20 +949,24 @@ Step by step:
   4. If the credit is at or below the threshold, it emails the configured recipients — unless it already sent one recently, or the account has auto-recharge switched on.
 
 Settings (Setting -> Admin Actions, no deploy needed):
-  plivo.balance.alert.enabled      'true' to run this at all
-  plivo.balance.alert.recipients   who to email, comma separated
+  plivo.balance.alert.recipients   who to email, comma separated. LEAVING THIS BLANK TURNS THE ALERT OFF — there is no separate on/off switch.
   plivo.balance.threshold          what counts as low (also drives the warning shown in the call panel)
-  plivo.balance.alert.repeat_hours how often to repeat while it stays low`,
+
+While the balance stays low it repeats once an hour, and it resets as soon as the account is topped up.`,
     cron: '0 */3 * * *',
     runner: () => plivoBalanceAlertCron.runOnce(),
   });
-  const plivoBalanceAlertEnabled =
-    String(getProperty('plivo.balance.alert.enabled') ?? '').toLowerCase() === 'true';
+  /*
+   * NO PROPERTY GATE. Every other cron here needs one because it MUTATES —
+   * reactivating technicians, sending WhatsApp, writing rows — so an operator
+   * has to opt in before it touches anything. This one reads a balance and
+   * emails whoever is listed, and its off switch is that list being blank
+   * (services/plivo-balance-alert-cron.js). A second flag would only add a way
+   * for the alert to be silently off while the list says it is on, which is the
+   * failure mode an alert can least afford.
+   */
   if (cronDisabled) {
     plivoBalanceAlertJob.skipReason = 'CRON_DISABLED=true';
-  } else if (!plivoBalanceAlertEnabled) {
-    plivoBalanceAlertJob.skipReason = "property 'plivo.balance.alert.enabled' was not 'true' at server start — flip it to 'true' and restart the server to enable";
-    logger.info("Plivo low-balance alert SKIPPED — set plivo.balance.alert.enabled=true in easyfix_properties to enable (takes effect after restart).");
   } else {
     plivoBalanceAlertJob.task = cron.schedule(
       plivoBalanceAlertJob.cron,
@@ -970,7 +974,8 @@ Settings (Setting -> Admin Actions, no deploy needed):
       { timezone: TZ },
     );
     plivoBalanceAlertJob.registered = true;
-    logger.info('Plivo low-balance alert registered (plivo.balance.alert.enabled=true, every 3h).');
+    logger.info('Plivo low-balance alert registered (every 3h; silent while '
+      + 'plivo.balance.alert.recipients is blank).');
   }
 
   // ─── Technician lifecycle evaluation — daily at 02:00 IST ─────────
