@@ -242,6 +242,18 @@ const EXPECTED = {
   easyfixer_watched_video: [
     'id', 'easyfixer_id', 'video_id', 'watched_percentage', 'update_date',
   ],
+  /*
+   * The technician's Ratings screen. Its PK is `table_id`, NOT `id` — the query
+   * in services/mobile-profile-extra.service.js named `id`, threw
+   * ER_BAD_FIELD_ERROR on every call, and the catch around it swallowed that
+   * and returned an empty list. Every technician saw zero ratings, permanently,
+   * with one warn line and no error. Listed here so the next rename fails the
+   * boot check instead of going quiet for months.
+   */
+  tbl_easyfixer_rating_by_customer: [
+    'table_id', 'easyfixer_id', 'job_id', 'customer_rating', 'comment',
+    'review_comment', 'is_escalated', 'insert_date_time',
+  ],
 };
 
 /*

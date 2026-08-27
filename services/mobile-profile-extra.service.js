@@ -477,7 +477,15 @@ async function getRatings(efrId, { from, to } = {}) {
   let items = [];
   try {
     const [rows] = await pool.query(
-      `SELECT id, customer_rating, comment, review_comment,
+      /*
+       * table_id, NOT id. This table's primary key is `table_id`, and the
+       * query named `id` — so it threw ER_BAD_FIELD_ERROR every time. The
+       * catch below swallows that and returns an empty list, so every
+       * technician's Ratings screen has been permanently blank with nothing
+       * but a warn line to show for it. Aliased back to `id` because the
+       * mapper below reads r.id.
+       */
+      `SELECT table_id AS id, customer_rating, comment, review_comment,
               job_id, is_escalated
          FROM tbl_easyfixer_rating_by_customer
         WHERE easyfixer_id = ?
@@ -494,8 +502,15 @@ async function getRatings(efrId, { from, to } = {}) {
       isEscalated: Boolean(r.is_escalated),
     }));
   } catch (e) {
-    logger.warn({ err: e.message, efrId }, 'getRatings query failed');
-    logger.warn('Ratings query failed · ' + e.message);
+    /*
+     * Soft-fail is right — a broken ratings list must not take down the
+     * technician's profile screen. But it hid a PERMANENT break for as long as
+     * the query named a column that does not exist, because an empty list and
+     * a failed list look identical to the caller. Logged at ERROR now: a
+     * degraded screen is not routine, and warn was where it went to die.
+     */
+    logger.error({ err: e.message, efrId }, 'getRatings query failed — returning an EMPTY list');
+    logger.error('Ratings query failed · ' + e.message + ' — technician sees no ratings');
   }
   logger.info('Returning ' + items.length + ' rating(s)');
   return { items };
