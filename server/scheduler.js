@@ -919,6 +919,60 @@ Note: this task only runs automatically if the property "easyfixer.auto_reactiva
     logger.info('Easyfixer auto-reactivation cron registered (easyfixer.auto_reactivation.enabled=true, 01:00 IST).');
   }
 
+  // ─── Plivo low-balance alert — every 3 hours ────────────────────────
+  // Added 2026-08-27, after calling was dead on production with an empty Plivo
+  // account and nothing anywhere reporting it: the API accepted every call, the
+  // conference was created, /web-start returned 200, and the browser leg died
+  // at signalling. Operators saw "Busy" and every log line stayed green.
+  //
+  // The call panel now warns whoever opens it, but that only reaches somebody
+  // already blocked. This half reaches the people who can top the account up,
+  // while there is still credit left to work with.
+  //
+  // Everything is read from easyfix_properties so ops can retune without a
+  // deploy: recipients, threshold, and the repeat cadence. State (the last-sent
+  // stamp) lives there too, so the cooldown survives restarts and is shared
+  // across replicas — a MySQL named lock keeps two replicas from both sending.
+  const plivoBalanceAlertCron = require('../services/plivo-balance-alert-cron');
+  const plivoBalanceAlertJob = registerJob({
+    id: 'plivo-balance-alert',
+    name: 'Plivo Low-Balance Alert',
+    description:
+`What this task does: Every 3 hours it checks how much calling credit is left in the Plivo account, and emails a warning while there is still time to top it up.
+
+Why it exists: when the Plivo account runs out, calling does not fail in any visible way. Plivo still accepts each call, our server still records it and still answers "OK", and then the call quietly dies before anyone's phone rings. The operator sees "Busy" and there is no error anywhere to find. That is exactly what happened on 27 August 2026, and it was only discovered by someone opening the Plivo billing page by hand.
+
+Step by step:
+  1. It asks Plivo how much credit is left.
+  2. If Plivo cannot be reached, or does not answer with a balance, it does NOTHING. Not knowing the balance is not the same as knowing it is low, and a false alarm here would teach everyone to ignore the real one.
+  3. If the credit is above the threshold, it clears any earlier alert so the next drop is reported immediately.
+  4. If the credit is at or below the threshold, it emails the configured recipients — unless it already sent one recently, or the account has auto-recharge switched on.
+
+Settings (Setting -> Admin Actions, no deploy needed):
+  plivo.balance.alert.enabled      'true' to run this at all
+  plivo.balance.alert.recipients   who to email, comma separated
+  plivo.balance.threshold          what counts as low (also drives the warning shown in the call panel)
+  plivo.balance.alert.repeat_hours how often to repeat while it stays low`,
+    cron: '0 */3 * * *',
+    runner: () => plivoBalanceAlertCron.runOnce(),
+  });
+  const plivoBalanceAlertEnabled =
+    String(getProperty('plivo.balance.alert.enabled') ?? '').toLowerCase() === 'true';
+  if (cronDisabled) {
+    plivoBalanceAlertJob.skipReason = 'CRON_DISABLED=true';
+  } else if (!plivoBalanceAlertEnabled) {
+    plivoBalanceAlertJob.skipReason = "property 'plivo.balance.alert.enabled' was not 'true' at server start — flip it to 'true' and restart the server to enable";
+    logger.info("Plivo low-balance alert SKIPPED — set plivo.balance.alert.enabled=true in easyfix_properties to enable (takes effect after restart).");
+  } else {
+    plivoBalanceAlertJob.task = cron.schedule(
+      plivoBalanceAlertJob.cron,
+      () => invokeJob(plivoBalanceAlertJob, 'cron'),
+      { timezone: TZ },
+    );
+    plivoBalanceAlertJob.registered = true;
+    logger.info('Plivo low-balance alert registered (plivo.balance.alert.enabled=true, every 3h).');
+  }
+
   // ─── Technician lifecycle evaluation — daily at 02:00 IST ─────────
   // Opt-in and bounded. Evaluates the documented PAUSED/DORMANT signals in
   // set-based batches; the lifecycle service independently rejects any cron

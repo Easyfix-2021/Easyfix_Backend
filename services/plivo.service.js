@@ -316,6 +316,23 @@ async function accountBalance({ timeoutMs = 3000 } = {}) {
  * "unknown" result is cached too — which is correct: a Plivo that is down stays
  * down for more than a second.
  */
+/*
+ * The one low-balance threshold, so the operator's banner and the alert email
+ * cannot disagree about what "low" means.
+ *
+ * Property first (changeable without a deploy, which is the point of putting it
+ * in easyfix_properties), then the env var that shipped first, then 5. Not
+ * zero: at zero the calls are already failing and a warning has arrived too
+ * late — the whole value is in landing before that.
+ */
+function lowBalanceThreshold() {
+  const fromProperty = Number(getProperty('plivo.balance.threshold'));
+  if (Number.isFinite(fromProperty) && fromProperty >= 0) return fromProperty;
+  const fromEnv = Number(process.env.PLIVO_LOW_BALANCE_WARN);
+  if (Number.isFinite(fromEnv) && fromEnv >= 0) return fromEnv;
+  return 5;
+}
+
 async function accountBalanceCached() {
   return cached('plivo:account-balance', 60_000, () => accountBalance());
 }
@@ -669,6 +686,7 @@ function resolveWebDial(id) {
 }
 
 module.exports = {
+  lowBalanceThreshold,
   accountBalance,
   accountBalanceCached,
   clickToCall,

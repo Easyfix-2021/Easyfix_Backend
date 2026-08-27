@@ -575,14 +575,6 @@ router.post('/click-to-call', requireClickToCallAction, validate(clickToCallBody
   } catch (e) { next(e); }
 });
 
-/*
- * Warn below this much Plivo credit. Deliberately not zero: at zero the calls
- * are already failing, and the point of the banner is to arrive BEFORE that.
- * A minute of Indian voice is cents, so single digits is roughly "today".
- * Tune with PLIVO_LOW_BALANCE_WARN without a deploy.
- */
-const LOW_BALANCE_WARN = Number(process.env.PLIVO_LOW_BALANCE_WARN || 5);
-
 // ─── GET /web-credentials — Plivo Browser SDK login (Web Call mode) ────
 // Returns a PER-OPERATOR, short-lived Plivo access token (no shared endpoint
 // password crosses the wire) + the caller-id the browser dials. The SDK logs in
@@ -660,7 +652,7 @@ router.get('/web-credentials', requireClickToCallAction, async (req, res) => {
    */
   try {
     const balance = await plivo.accountBalanceCached();
-    if (balance.ok && balance.cashCredits <= LOW_BALANCE_WARN && !balance.autoRecharge) {
+    if (balance.ok && balance.cashCredits <= plivo.lowBalanceThreshold() && !balance.autoRecharge) {
       warnings.push(
         `Plivo account credit is ${balance.cashCredits.toFixed(2)} — outgoing calls fail as `
         + '"Busy" once it runs out, with no error anywhere. Top up the Plivo account.',
