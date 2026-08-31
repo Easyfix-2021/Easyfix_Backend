@@ -441,9 +441,7 @@ router.get('/jobs/rejected', async (req, res, next) => {
         WHERE jo.fk_easyfixter_id = ? AND jo.offer_status = ${OFFER_STATUS.REJECTED}
         ORDER BY jo.responded_at DESC
         LIMIT 100`,
-      // visibleVideoIdsSql() binds the technician twice: once for the
-      // mandatory half, once for the assigned half.
-      [req.tech.efr_id, req.tech.efr_id],
+      [req.tech.efr_id],
     );
     logger.info('Found ' + items.length + ' rejected offers');
     modernOk(res, { items });
@@ -1608,7 +1606,10 @@ router.get('/training-videos', async (req, res, next) => {
            ON d.id = tv.training_video_id AND d.document_type_id = 2
         WHERE tv.id IN (${await visibleVideoIdsSql()})
         ORDER BY tv.id DESC`,
-      [req.tech.efr_id],
+      // visibleVideoIdsSql() binds the technician TWICE: once for the mandatory
+      // half, once for the assigned half. One bind leaves the second `?`
+      // unsubstituted and MySQL rejects the whole statement.
+      [req.tech.efr_id, req.tech.efr_id],
     );
     const items = rows.map((r) => ({
       id: r.id,
