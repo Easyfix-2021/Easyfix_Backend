@@ -226,7 +226,7 @@ async function changeMobile(efrId, body, actor, ctx = {}) {
   logger.info('Change easyfixer mobile · efrId=' + efrId);
 
   const [[current]] = await db.query(
-    'SELECT efr_id, efr_no FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1',
+    'SELECT efr_id, efr_no, user_id FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1',
     [efrId],
   );
   if (!current) throw httpError(404, 'easyfixer not found');
@@ -273,6 +273,44 @@ async function changeMobile(efrId, body, actor, ctx = {}) {
     'UPDATE tbl_easyfixer SET efr_no = ?, updated_by = ?, update_date = NOW() WHERE efr_id = ?',
     [mobile, actor?.user_id ?? null, efrId],
   );
+
+  /*
+   * THE LINKED tbl_user ROW MOVES TOO.
+   *
+   * A technician's number lives in two places: tbl_easyfixer.efr_no, which
+   * tech-auth resolves logins by, and tbl_user.mobile_no on the linked account
+   * row. This wrote only the first, so every CRM mobile change left the two
+   * disagreeing — silently, because nothing reads them together and errors.
+   *
+   * The consequence is not cosmetic. Supply Gap resolves a technician by
+   * `SELECT user_id, mobile_no FROM tbl_user WHERE mobile_no IN (…) AND
+   * user_type_id = 4`, so after a change the technician stops matching their
+   * own number and the funnel reports them as an un-onboarded lead. Anything
+   * else keyed on tbl_user.mobile_no drifts the same way.
+   *
+   * Guarded, not assumed: a technician with no linked user row (user_id NULL
+   * or 0 — the Idle bucket) simply has nothing to update, and the update is
+   * scoped to user_type_id = 4 so a mis-set user_id can never rewrite a CRM
+   * staff account's number.
+   *
+   * Same `db` handle, so when the caller supplies a transaction this moves with
+   * the easyfixer row and the audit entry rather than half-committing.
+   */
+  const linkedUserId = Number(current.user_id) || 0;
+  if (linkedUserId > 0) {
+    const [res] = await db.query(
+      'UPDATE tbl_user SET mobile_no = ? WHERE user_id = ? AND user_type_id = 4',
+      [mobile, linkedUserId],
+    );
+    if (res.affectedRows) {
+      logger.info('Linked tbl_user mobile updated · efrId=' + efrId + ' · userId=' + linkedUserId);
+    } else {
+      // Not fatal — the login identity (efr_no) is already correct. Logged
+      // loudly because it means the two tables are now out of step.
+      logger.warn('Linked tbl_user NOT updated · efrId=' + efrId + ' · userId=' + linkedUserId
+        + ' · no user_type_id=4 row — tbl_user.mobile_no now differs from efr_no');
+    }
+  }
 
   await recordChange({
     efrId,

@@ -134,8 +134,18 @@ const fake = installFakePool([
   // match in changeBank. Ordered BEFORE the generic tbl_easyfixer reads.
   [/SELECT efr_name\s+FROM tbl_easyfixer WHERE efr_id/i,
     () => (scenario.easyfixer ? [scenario.easyfixer] : [])],
-  [/SELECT efr_id, efr_no\s+FROM tbl_easyfixer WHERE efr_id/i,
+  /*
+   * The projection gained `user_id` when changeMobile started syncing the
+   * linked tbl_user row — a technician's number lives in two tables and only
+   * one was being written. Matching the columns loosely so this route follows
+   * the query rather than pinning a column list that has to be edited every
+   * time one is added.
+   */
+  [/SELECT efr_id, efr_no,? ?[\w, ]*\s+FROM tbl_easyfixer WHERE efr_id/i,
     () => (scenario.easyfixer ? [scenario.easyfixer] : [])],
+  // The mirror write. Nothing here asserts on it — tests/easyfixer-mobile-user-
+  // sync.test.js owns that — but it must not fall through to the default.
+  [/UPDATE tbl_user SET mobile_no/i, { affectedRows: 1 }],
   [/SELECT efr_id FROM tbl_easyfixer WHERE efr_no = \?/i,
     () => (scenario.mobileClash ? [scenario.mobileClash] : [])],
 
