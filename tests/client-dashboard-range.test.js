@@ -42,8 +42,24 @@ let cityRows = DEFAULTS.cityRows;
 let reasonRows = DEFAULTS.reasonRows;
 let prevRow = DEFAULTS.prevRow;
 
+/*
+ * The reporting hierarchy. /dashboard-range resolves it through
+ * resolveClientHierarchy now, like every other surface on the page — it used
+ * to expand self plus DIRECT reports with its own query, non-recursive, and
+ * ignore the caller's role.
+ *
+ * ⚠ TWO ROUTES, NOT ONE. A single /FROM tbl_client_contacts/ pattern matches
+ * BOTH the manager_id probe and the recursive subtree query, and the fake
+ * dispatches on FIRST match — so the probe was answered with `{ id: 11 }`,
+ * `me.manager_id` came back undefined, the SPOC resolved as TOP OF TREE and
+ * every scope assertion below passed against an unscoped query.
+ */
+let me = { manager_id: 7 };                    // not top of the tree → scoped
+let subtree = [{ id: 42 }, { id: 11 }];        // self + one direct report
+
 const fake = installFakePool([
-  [/FROM tbl_client_contacts/i, [{ id: 11 }]],          // one direct report
+  [/SELECT manager_id FROM tbl_client_contacts/i, () => [me]],
+  [/WITH RECURSIVE team/i, () => subtree],
   // DATE_SUB is unique to the prior-period count and must be matched BEFORE the
   // patterns below — the fake dispatches on FIRST match, and this query also
   // contains the tokens the totals/reasons routes look for.
@@ -74,21 +90,30 @@ function res() {
   };
 }
 
-const req = (from = '2026-07-01', to = '2026-08-25') => ({
+/*
+ * ⚠ THE DEFAULT CALLER IS SCOPED (allStores: false), because that is the only
+ * caller for whom the scope assertions below MEAN anything. allStores is the
+ * role's "sees the whole client" switch, so an allStores fixture makes
+ * "reporting_contact_id IN (...)" correctly absent and an assertion that it is
+ * present tests nothing. The unrestricted case has its own test.
+ */
+const req = (from = '2026-07-01', to = '2026-08-25', allStores = false) => ({
   spoc: { id: 42, client_id: 133 },
-  access: { allStores: true, grants: ['home'] },
+  access: { allStores, grants: ['home'] },
   query: { from, to },
 });
 
-async function call(from, to) {
+async function call(from, to, allStores = false) {
   const r = res();
-  await handlerFor('/dashboard-range', 'get')(req(from, to), r, (e) => { throw e; });
+  await handlerFor('/dashboard-range', 'get')(req(from, to, allStores), r, (e) => { throw e; });
   assert.equal(r.body?.success, true, JSON.stringify(r.body));
   return r.body.data;
 }
 
 beforeEach(() => {
   fake.reset();
+  me = { manager_id: 7 };
+  subtree = [{ id: 42 }, { id: 11 }];
   totalsRow = DEFAULTS.totalsRow;
   cityRows = DEFAULTS.cityRows;
   reasonRows = DEFAULTS.reasonRows;
@@ -200,10 +225,10 @@ test('a cancelled job with no recorded reason is LABELLED, not dropped', async (
 
 // ─── scope narrowing ──────────────────────────────────────────────────────
 
-async function callWith(query) {
+async function callWith(query, allStores = false) {
   const r = res();
   await handlerFor('/dashboard-range', 'get')(
-    { spoc: { id: 42, client_id: 133 }, access: { allStores: true, grants: ['home'] }, query },
+    { spoc: { id: 42, client_id: 133 }, access: { allStores, grants: ['home'] }, query },
     r, (e) => { throw e; },
   );
   assert.equal(r.body?.success, true, JSON.stringify(r.body));
@@ -293,4 +318,36 @@ test('the prior window is not filtered to one status — Performance needs all o
   const prior = jobQueries().find((c) => /DATE_SUB/i.test(c.sql));
   assert.doesNotMatch(prior.sql, /WHERE[\s\S]*j\.job_status = 6/,
     'it once counted only cancellations; completion rate needs the whole cohort');
+});
+
+/*
+ * ─── the scope this route used to resolve for itself ──────────────────────
+ *
+ * It ran its OWN self-plus-direct-reports query and ignored the caller's role,
+ * so a Senior Leader's range cards covered a narrower book than the pulse
+ * cards directly above them — the third bespoke scope on one screen.
+ */
+
+test('allStores is unrestricted here too — the same book the pulse cards count', async () => {
+  await call('2026-07-01', '2026-08-25', true);
+  for (const q of jobQueries()) {
+    assert.doesNotMatch(q.sql, /reporting_contact_id IN \(/,
+      'a Senior Leader sees the whole client on Home; these cards sit ON Home');
+  }
+});
+
+test('no bespoke direct-reports query — resolveClientHierarchy is the one definition', async () => {
+  await call('2026-07-01', '2026-08-25');
+  assert.equal(fake.calls.filter((c) => /CAST\(manager_id AS UNSIGNED\)/i.test(c.sql)).length, 0,
+    'the hand-rolled expansion was non-recursive: a manager two levels up saw half their book');
+  assert.ok(fake.calls.some((c) => /WITH RECURSIVE team/i.test(c.sql)),
+    'and the recursive resolver must actually be the one that ran');
+});
+
+test('an allStores SPOC may name any of the client\'s SPOCs', async () => {
+  const d = await callWith({ from: '2026-07-01', to: '2026-08-25', spoc: 9999 }, true);
+  assert.equal(d.scope.spoc, 9999, 'the response reports the scope it applied');
+  const q = fake.calls.find((c) => /AS runningLate/i.test(c.sql));
+  assert.ok(q.params.includes(9999),
+    'someone who may already see the whole client is not spying by naming one of its SPOCs');
 });

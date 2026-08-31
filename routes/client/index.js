@@ -265,7 +265,7 @@ router.get('/action-queue', async (req, res, next) => {
     const hier = await resolveClientHierarchy(req);
     // A SPOC whose role (or override) grants all-stores visibility sees the
     // whole client's queue; everyone else stays inside their booking subtree.
-    const scopeIds = req.access && req.access.allStores ? undefined : hierarchyFilter(hier, req);
+    const scopeIds = hierarchyFilter(hier, req);   // undefined = whole client
 
     const params = [req.spoc.client_id];
     let mine = '';
@@ -406,7 +406,7 @@ router.get('/performance', requireGrant('performance'), async (req, res, next) =
       ? String(req.query.dim) : 'city';
 
     const hier = await resolveClientHierarchy(req);
-    const reportingContactIds = req.access && req.access.allStores ? undefined : hierarchyFilter(hier, req);
+    const reportingContactIds = hierarchyFilter(hier, req);   // undefined = whole client
     /*
      * ?city= — added 2026-08-26 so the client dashboard's Performance health
      * card obeys the same city chip its three neighbours do. Before this the
@@ -660,14 +660,33 @@ async function resolveClientHierarchy(req) {
 /**
  * Resolve the reporting-contact filter for a list/dashboard request given the
  * caller's hierarchy + an optional `?spoc=<contactId>` team filter.
- *   • ?spoc in my subtree → just that one SPOC
- *   • else if I'm top      → undefined (no filter → whole client)
- *   • else                 → my whole subtree
+ *   • ?spoc I may see        → just that one SPOC
+ *   • else allStores or top  → undefined (no filter → whole client)
+ *   • else                   → my whole subtree
+ *
+ * ⚠ allStores BELONGS HERE, NOT AT THE CALL SITES.
+ *
+ * It is the role's documented "sees the whole client vs only its own booking
+ * subtree" switch (client-access.service.js), so it is a property of THE
+ * SCOPE. But four routes wrote `allStores ? undefined : hierarchyFilter(...)`
+ * and every other caller wrote the bare call — so a Senior Leader's Home
+ * counted the whole client while /jobs, /export/jobs and /orders/counts
+ * counted only their booking subtree. "Total open · 6" opened a list of 2.
+ *
+ * Folding it in is what makes that unrepeatable: a new caller cannot forget a
+ * prefix that no longer exists.
+ *
+ * The ?spoc containment check widens with it. That check exists to stop a
+ * Store SPOC reading a peer's book by guessing a contact id — someone who may
+ * already see the whole client is not spying by naming one of its SPOCs. And
+ * fk_client_id is in every WHERE regardless, so a foreign id selects nothing
+ * rather than reaching another tenant.
  */
 function hierarchyFilter(hier, req) {
   const spocFilter = Number(req.query.spoc) || null;
-  if (spocFilter && hier.subtreeIds.includes(spocFilter)) return [spocFilter];
-  if (hier.isTop) return undefined;
+  const allStores = !!(req.access && req.access.allStores);
+  if (spocFilter && (allStores || hier.subtreeIds.includes(spocFilter))) return [spocFilter];
+  if (allStores || hier.isTop) return undefined;
   return hier.subtreeIds;
 }
 
@@ -721,6 +740,18 @@ const csvIds = (v) => String(v == null ? '' : v).split(',')
  * jobService.list turns it into `1=0` rather than dropping the clause, so
  * "none of your team" cannot silently widen to "everyone".
  */
+/*
+ * "Open" as a positive list, DERIVED from the canonical status set rather than
+ * typed out again. jobService.list filters with IN, and every place that can
+ * express the rule directly uses the negative form — job_status NOT IN
+ * (3,5,6,7) — so enumerating it by hand here is precisely how the two drift.
+ * A status added to STATUS is open unless it is added to the terminal list.
+ */
+const TERMINAL_STATUS_CODES = [3, 5, 6, 7];   // completed, completed-alt, cancelled, enquiry
+const OPEN_STATUS_CODES = [...jobService.ALL_STATUS_VALUES]
+  .filter((code) => !TERMINAL_STATUS_CODES.includes(code))
+  .sort((a, b) => a - b);
+
 function clientJobFilters(req, hier) {
   let reportingContactIds = hierarchyFilter(hier, req);
   const pickedOwners = csvIds(req.query.ownerIds);
@@ -2112,7 +2143,7 @@ router.get('/unreachable-jobs', async (req, res, next) => {
   try {
     const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
     const hier = await resolveClientHierarchy(req);
-    const scopeIds = req.access && req.access.allStores ? undefined : hierarchyFilter(hier, req);
+    const scopeIds = hierarchyFilter(hier, req);   // undefined = whole client
     const scopeSql = Array.isArray(scopeIds)
       ? `AND j.reporting_contact_id IN (${scopeIds.length ? scopeIds.map(() => '?').join(',') : 'NULL'})`
       : '';
@@ -2186,12 +2217,11 @@ router.get('/dashboard-summary', async (req, res, next) => {
      * ⚠ THE SAME SCOPE EVERY OTHER SURFACE ON THIS PAGE USES.
      *
      * This resolved its own list — self plus DIRECT reports, non-recursive —
-     * and ignored req.access.allStores entirely. The action queue beside it
-     * uses `allStores ? undefined : hierarchyFilter(hier, req)`, i.e. the whole
-     * client for a Senior Leader and the full recursive subtree for everyone
-     * else. Two panels on one screen counting two different populations, which
-     * is how "Jobs Waiting for You" could show an approval that "Pending on
-     * you" counted as zero.
+     * and ignored the caller's role entirely, while the action queue beside it
+     * used hierarchyFilter: the whole client for a Senior Leader and the full
+     * recursive subtree for everyone else. Two panels on one screen counting
+     * two different populations, which is how "Jobs Waiting for You" could
+     * show an approval that "Pending on you" counted as zero.
      *
      * `undefined` means unrestricted, so the filter collapses to an empty
      * string rather than an impossible IN () — and an empty subtree array
@@ -2199,7 +2229,7 @@ router.get('/dashboard-summary', async (req, res, next) => {
      * rather than everything.
      */
     const hier = await resolveClientHierarchy(req);
-    const scopeIds = req.access && req.access.allStores ? undefined : hierarchyFilter(hier, req);
+    const scopeIds = hierarchyFilter(hier, req);   // undefined = whole client
     const teamFilter = Array.isArray(scopeIds)
       ? `AND j.reporting_contact_id IN (${scopeIds.length ? scopeIds.map(() => '?').join(',') : 'NULL'})`
       : '';
@@ -2433,6 +2463,12 @@ router.get('/dashboard-summary', async (req, res, next) => {
     // Active jobs (not completed/cancelled/enquiry) whose committed
     // appointment (requested_date_time) is already in the past — i.e.
     // overdue — bucketed by how many days late they are.
+    //
+    // ⚠ The predicate is the NEGATIVE set, matching openTotal above and every
+    // other open-job count on this route. It used to enumerate
+    // IN (0,1,2,20,9,15,21) — the same seven codes, minus 10 — so a job that
+    // was open enough to be counted was not open enough to be aged, and this
+    // panel quietly disagreed with the card above it.
     const [[sla]] = await pool.query(
       `SELECT
          SUM(CASE WHEN d BETWEEN 0 AND 1 THEN 1 ELSE 0 END) AS d01,
@@ -2444,7 +2480,7 @@ router.get('/dashboard-summary', async (req, res, next) => {
            FROM tbl_job j
           WHERE j.fk_client_id        = ?
             ${teamFilter}
-            AND j.job_status IN (0,1,2,20,9,15,21)
+            AND j.job_status NOT IN (3,5,6,7)
             AND j.requested_date_time IS NOT NULL
             AND j.requested_date_time < NOW()
        ) t`,
@@ -2895,14 +2931,22 @@ router.get('/orders/counts', async (req, res, next) => {
     const hier = await resolveClientHierarchy(req);
     const filters = clientJobFilters(req, hier);
 
-    const [all, billable] = await Promise.all([
+    const [all, billable, open] = await Promise.all([
       jobService.list({ ...filters, readyForBilling: false, countOnly: true }),
       jobService.list({ ...filters, readyForBilling: true,  countOnly: true }),
+      jobService.list({ ...filters, statuses: OPEN_STATUS_CODES, readyForBilling: false, countOnly: true }),
     ]);
 
     modernOk(res, {
       otherOrders:     Number(all.total      || 0),
       completedOrders: Number(billable.total || 0),
+      /*
+       * The nav badge on the "Open jobs" tab. It used to read otherOrders —
+       * EVERY order on file — so the tab said "99+" over a page reading "209
+       * orders on file · 2 of them open". A badge on a tab named "Open jobs"
+       * has exactly one honest meaning.
+       */
+      openOrders:      Number(open.total     || 0),
     });
   } catch (e) { next(e); }
 });
@@ -3948,28 +3992,29 @@ router.get('/dashboard-range', validate(dashboardRangeQuery, 'query'), async (re
     const { from, to } = req.query;
     logger.info('Client dashboard range · clientId=' + clientId + ' · ' + from + '..' + to);
 
-    // Same team expansion as /dashboard-summary — self plus direct reports.
-    const [reports] = await pool.query(
-      `SELECT id FROM tbl_client_contacts
-        WHERE client_id = ?
-          AND manager_id IS NOT NULL AND manager_id NOT IN ('', 'null')
-          AND CAST(manager_id AS UNSIGNED) = ?`,
-      [clientId, req.spoc.id]
-    );
-    let teamIds = reports.map((r) => r.id);
-    teamIds.push(req.spoc.id);
-
     /*
-     * ?spoc=<id> narrows to ONE team member — and the containment check is the
-     * whole security of it. Without `teamIds.includes(...)` a Store SPOC could
-     * read a peer's book by guessing a contact id. Same rule hierarchyFilter()
-     * applies on /jobs; an id outside the subtree is IGNORED rather than
-     * rejected, so the page degrades to the caller's own scope instead of
-     * erroring, and cannot be used to probe which ids exist.
+     * THE SAME SCOPE THE REST OF THE PAGE USES — the third and last bespoke
+     * one on this screen. It expanded self plus DIRECT reports, non-recursive,
+     * and ignored the caller's role, so a Senior Leader's range cards covered
+     * a narrower book than the pulse cards directly above them.
+     *
+     * hierarchyFilter owns both halves of that: the recursive subtree, and the
+     * ?spoc containment check that stops a Store SPOC reading a peer's book by
+     * guessing a contact id (an id it will not allow is IGNORED, not rejected,
+     * so the page degrades to the caller's own scope rather than erroring and
+     * cannot be used to probe which ids exist).
+     *
+     * `undefined` = unrestricted, which has to become an ABSENT clause rather
+     * than IN () — and an empty array still emits `IN (NULL)`, so a SPOC who
+     * may see nothing counts nothing instead of everything.
      */
+    const hier = await resolveClientHierarchy(req);
+    const scopeIds = hierarchyFilter(hier, req);
+    const teamClause = Array.isArray(scopeIds)
+      ? `AND j.reporting_contact_id IN (${scopeIds.length ? scopeIds.map(() => '?').join(',') : 'NULL'})`
+      : '';
+    const teamIds = Array.isArray(scopeIds) ? scopeIds : [];
     const wantSpoc = Number(req.query.spoc) || null;
-    if (wantSpoc && teamIds.includes(wantSpoc)) teamIds = [wantSpoc];
-    const team = teamIds.map(() => '?').join(',');
 
     /*
      * ?city=<name> filters on the job's ADDRESS city. The city list the UI
@@ -3995,7 +4040,7 @@ router.get('/dashboard-range', validate(dashboardRangeQuery, 'query'), async (re
      * ticket_created_date_time stays usable.
      */
     const COHORT = `j.fk_client_id = ?
-          AND j.reporting_contact_id IN (${team})
+          ${teamClause}
           AND j.ticket_created_date_time >= ?
           AND j.ticket_created_date_time <  DATE_ADD(?, INTERVAL 1 DAY)
           ${cityWhere}`;
@@ -4091,7 +4136,7 @@ router.get('/dashboard-range', validate(dashboardRangeQuery, 'query'), async (re
          FROM tbl_job j
          ${cityJoin}
         WHERE j.fk_client_id = ?
-          AND j.reporting_contact_id IN (${team})
+          ${teamClause}
           AND j.ticket_created_date_time >= DATE_SUB(?, INTERVAL (DATEDIFF(?, ?) + 1) DAY)
           AND j.ticket_created_date_time <  ?
           ${cityWhere}`,

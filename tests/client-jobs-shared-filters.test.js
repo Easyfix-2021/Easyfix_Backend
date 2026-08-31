@@ -63,9 +63,9 @@ function res() {
   };
 }
 
-async function call(path, query = {}) {
+async function call(path, query = {}, access = {}) {
   const r = res();
-  const req = { spoc: { id: 42, client_id: 133 }, access: {}, query };
+  const req = { spoc: { id: 42, client_id: 133 }, access, query };
   await handlerFor(path, 'get')(req, r, (e) => { throw e; });
   return r;
 }
@@ -179,14 +179,17 @@ test('/orders/counts builds the SAME WHERE as /jobs for the same query', async (
   await call('/orders/counts', shared);
   const countWheres = jobQueries().map((c) => c.sql.split(/\bWHERE\b/)[1]);
 
-  assert.equal(countWheres.length, 2, 'one count per tab');
-  // The billing tab legitimately adds two predicates; strip them and the rest
-  // must be identical, character for character.
+  assert.equal(countWheres.length, 3, 'one per Order History tab, plus the open badge');
+  // Each count legitimately adds ONE predicate of its own — billing adds two,
+  // the open badge adds a status IN. Strip those and the rest must be
+  // identical, character for character: that is the whole property, because a
+  // badge over a table is a claim about the same rows.
   // The predicates can land anywhere in the clause list, so strip them with or
   // without a leading AND and tidy up whatever separator that leaves.
   const strip = (w) => w
     .replace(/j\.ready_for_billing = 'Yes'(\s+AND\s+)?/, '')
     .replace(/(\s+AND\s+)?j\.sub_job_id IS NULL/, '')
+    .replace(/(\s+AND\s+)?j\.job_status IN \([?,]+\)/, '')
     .replace(/^\s*AND\s+/, '')
     .replace(/\s+/g, ' ');
   for (const w of countWheres) {
@@ -206,10 +209,13 @@ test('/orders/counts is hierarchy-scoped — it used to count the whole client',
 test('/orders/counts runs COUNTs only — no wasted list projection', async () => {
   await call('/orders/counts', {});
   const q = jobQueries();
-  assert.equal(q.length, 2, 'exactly two queries, one per tab');
+  // Two Order History tab badges + the shell's "Open jobs" badge.
+  assert.equal(q.length, 3, 'exactly three queries, one per badge');
   for (const c of q) {
     assert.match(c.sql, /SELECT COUNT\(\*\) AS total/, 'countOnly must skip the data query');
   }
+  assert.ok(!q.some((c) => /LIMIT \? OFFSET \?/.test(c.sql)),
+    'a badge that pages rows it never reads is pure latency on every navigation');
 });
 
 /* ─── the export, which had no scope at all ────────────────────────────── */
@@ -314,4 +320,101 @@ test('an unknown sortBy falls back rather than reaching the SQL', async () => {
 test('sortDir is coerced, not trusted', async () => {
   await call('/jobs', { sortBy: 'checkout_date_time', sortDir: 'nonsense' });
   assert.match(listQuery().sql, /checkout_date_time DESC/, 'anything but asc means desc');
+});
+
+/* ─── scope: the same allStores rule the dashboard uses ────────────────── */
+
+/*
+ * WHY THESE EXIST. `allStores` is the role's documented "sees the whole client
+ * vs only its own booking subtree" switch, and four routes applied it as a
+ * `allStores ? undefined : hierarchyFilter(...)` prefix at the call site while
+ * every list route called hierarchyFilter bare. So a Senior Leader's Home read
+ * "Total open · 6" over the whole client and the /jobs list it links to
+ * returned the 2 in their own subtree.
+ *
+ * The rule now lives INSIDE hierarchyFilter, which is what makes these three
+ * routes correct without each remembering a prefix — so the assertions are on
+ * the SQL the handlers cause, not on the resolver in isolation.
+ */
+
+const LIST_ROUTES = ['/jobs', '/orders/counts', '/export/jobs'];
+
+for (const path of LIST_ROUTES) {
+  test(`${path} · an allStores SPOC is unrestricted, like their dashboard`, async () => {
+    await call(path, {}, { allStores: true });
+    const q = jobQueries();
+    assert.ok(q.length, 'the handler must query tbl_job');
+    for (const c of q) {
+      assert.doesNotMatch(c.sql, /reporting_contact_id IN \(/,
+        'Total open counted the whole client; this list must open on the same book');
+    }
+  });
+
+  test(`${path} · everyone else keeps the reporting-hierarchy filter`, async () => {
+    await call(path, {}, { allStores: false });
+    for (const c of jobQueries()) {
+      assert.match(c.sql, /reporting_contact_id IN \(/,
+        'allStores:false is exactly "the hierarchy filter stays in force"');
+    }
+  });
+}
+
+test('?spoc outside the subtree is IGNORED for a scoped SPOC', async () => {
+  await call('/jobs', { spoc: '99' }, { allStores: false });
+  const q = listQuery();
+  // 42/43/44 is the subtree; 99 reports to nobody in it.
+  assert.ok(q.params.includes(42) && q.params.includes(43) && q.params.includes(44),
+    'an id outside the subtree degrades to the caller own scope');
+  assert.ok(!q.params.includes(99),
+    'without the containment check a Store SPOC reads a peer book by guessing an id');
+});
+
+test('?spoc anywhere in the client is honoured for an allStores SPOC', async () => {
+  await call('/jobs', { spoc: '99' }, { allStores: true });
+  const q = listQuery();
+  assert.ok(q.params.includes(99),
+    'someone who may already see the whole client is not spying by naming one of its SPOCs');
+  assert.ok(!q.params.includes(43),
+    'and the pick NARROWS — it must not widen back to the subtree or the client');
+});
+
+test('an EMPTY scope counts nothing, never everything', async () => {
+  subtree = [];
+  me = { manager_id: 7 };
+  await call('/jobs', {}, { allStores: false });
+  for (const c of jobQueries()) {
+    assert.match(c.sql, /reporting_contact_id IN \(/,
+      'an empty subtree must still emit a clause — a dropped one means whole-client');
+  }
+});
+
+/* ─── the nav badge on the "Open jobs" tab ─────────────────────────────── */
+
+test('/orders/counts returns an OPEN count, not just every order on file', async () => {
+  const r = await call('/orders/counts', {}, { allStores: true });
+  const d = r.body.data;
+  assert.ok('openOrders' in d,
+    'the shell badged the "Open jobs" tab with otherOrders — EVERY order — so it read '
+    + '"99+" over a page saying "209 orders on file · 2 of them open"');
+  assert.ok('otherOrders' in d && 'completedOrders' in d,
+    'and the two Order History tab badges must keep working');
+});
+
+test('the open count is DERIVED from the canonical status set, not retyped', async () => {
+  await call('/orders/counts', {}, { allStores: true });
+  /*
+   * Every place that can express the rule directly uses the negative form —
+   * job_status NOT IN (3,5,6,7). jobService.list only filters with IN, so this
+   * one has to be a positive list; deriving it from ALL_STATUS_VALUES is what
+   * stops the two drifting. A new code is open unless it is declared terminal.
+   */
+  const { STATUS } = require('../services/job.service');
+  const expected = [...new Set(Object.values(STATUS))]
+    .filter((c) => ![3, 5, 6, 7].includes(c)).sort((a, b) => a - b);
+  const openQ = jobQueries().find((c) =>
+    expected.every((code) => c.params.includes(code)));
+  assert.ok(openQ, `one COUNT must bind exactly the open codes ${expected.join(',')}`);
+  for (const code of [3, 5, 6, 7]) {
+    assert.ok(!openQ.params.includes(code), `${code} is terminal and must not be counted as open`);
+  }
 });

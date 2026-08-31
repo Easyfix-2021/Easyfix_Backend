@@ -223,3 +223,16 @@ test('it is reported SEPARATELY from noResponse, not instead of it', async () =>
   assert.ok('noResponse' in d.attention,
     'the bare flag stays — other consumers read it, and the two mean different things');
 });
+
+/* ── one definition of "open" across the whole card ──────────────────── */
+
+test('the SLA-ageing bands use the SAME predicate the openTotal card counts', async () => {
+  await call('/dashboard-summary');
+  const q = fake.calls.find((c) => /AS d7plus/i.test(c.sql));
+  assert.ok(q, 'the ageing bands must be queried');
+  assert.match(q.sql, /j\.job_status NOT IN \(3,5,6,7\)/,
+    'this enumerated IN (0,1,2,20,9,15,21) — the same seven codes MINUS 10, so a job '
+    + 'open enough to be counted was not open enough to be aged');
+  assert.doesNotMatch(q.sql, /job_status IN \(0,1,2,20,9,15,21\)/,
+    'the positive list is what drifted; the negative set cannot');
+});
