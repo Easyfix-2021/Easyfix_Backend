@@ -418,3 +418,45 @@ test('the open count is DERIVED from the canonical status set, not retyped', asy
     assert.ok(!openQ.params.includes(code), `${code} is terminal and must not be counted as open`);
   }
 });
+
+/* ─── the tab-badge routes that hand-rolled their own scope ────────────── */
+
+/*
+ * These four counted self plus DIRECT reports with their own
+ * `CAST(manager_id AS UNSIGNED) = ?` query — non-recursive, and blind to
+ * allStores — while the lists their badges sit over resolve the full
+ * recursive subtree through hierarchyFilter. /tickets/counts even carried a
+ * comment claiming it applied "the same scope as GET /jobs".
+ *
+ * They embed the predicate inside SUM(CASE WHEN …) as well as in the WHERE,
+ * which is why scopePredicate returns a bare expression: an omitted clause
+ * would leave `CASE WHEN AND …`, so unrestricted has to be a literal TRUE.
+ */
+const BADGE_ROUTES = [
+  '/tickets/counts', '/appointments/counts', '/under-audit/counts', '/client-delay/counts',
+];
+
+for (const path of BADGE_ROUTES) {
+  test(`${path} · allStores is unrestricted, like the list it badges`, async () => {
+    await call(path, {}, { allStores: true });
+    const q = jobQueries();
+    assert.ok(q.length, 'the handler must query tbl_job');
+    for (const c of q) {
+      assert.doesNotMatch(c.sql, /reporting_contact_id IN \(/,
+        'a badge narrower than the list beneath it is the bug this fixes');
+      assert.doesNotMatch(c.sql, /CASE WHEN\s+AND/i,
+        'an omitted predicate inside a CASE is a syntax error, not an open filter');
+    }
+  });
+
+  test(`${path} · a scoped SPOC gets the RECURSIVE subtree`, async () => {
+    await call(path, {}, { allStores: false });
+    const q = jobQueries();
+    assert.ok(q.some((c) => /reporting_contact_id IN \(/.test(c.sql)), 'still scoped');
+    // 44 reports to 43, not to the caller — the hand-rolled expansion was
+    // non-recursive and would have missed exactly this row.
+    const scoped = q.find((c) => /reporting_contact_id IN \(/.test(c.sql));
+    assert.ok(scoped.params.includes(44),
+      'an indirect report must be inside the badge, as they are inside the list');
+  });
+}

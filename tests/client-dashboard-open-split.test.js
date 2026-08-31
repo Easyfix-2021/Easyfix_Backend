@@ -236,3 +236,28 @@ test('the SLA-ageing bands use the SAME predicate the openTotal card counts', as
   assert.doesNotMatch(q.sql, /job_status IN \(0,1,2,20,9,15,21\)/,
     'the positive list is what drifted; the negative set cannot');
 });
+
+/* ── the footer that captions the counts ─────────────────────────────── */
+
+test('⚠ "Across N SPOCs" counts the population the card actually counted', async () => {
+  /*
+   * It fell back to the caller's own subtree when the scope was unrestricted,
+   * so an allStores SPOC read "Across 2 SPOCs · live" over counts covering the
+   * whole client. True of something, just not of the page it captions.
+   */
+  const d = await call('/dashboard-summary', { allStores: true });
+  const probe = fake.calls.find((c) =>
+    /COUNT\(\*\) AS n FROM tbl_client_contacts/i.test(c.sql));
+  assert.ok(probe, 'unrestricted must count every SPOC of the client, not the subtree');
+  assert.match(probe.sql, /status = 1/,
+    'a deactivated colleague is not somebody this reader is "across"');
+  assert.equal(typeof d.teamSize, 'number');
+});
+
+test('a scoped SPOC counts their subtree, with no extra query', async () => {
+  const d = await call('/dashboard-summary', { allStores: false });
+  assert.equal(fake.calls.filter((c) =>
+    /COUNT\(\*\) AS n FROM tbl_client_contacts/i.test(c.sql)).length, 0,
+    'the subtree is already resolved — a second round-trip for its length is waste');
+  assert.equal(typeof d.teamSize, 'number');
+});

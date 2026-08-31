@@ -691,6 +691,25 @@ function hierarchyFilter(hier, req) {
 }
 
 /*
+ * The same scope as a BARE SQL predicate, for handlers that need it inside a
+ * SUM(CASE WHEN …) as well as in a WHERE.
+ *
+ * The `AND …` / empty-string form the WHERE-only callers use cannot go in a
+ * CASE — an omitted predicate leaves `CASE WHEN AND …`. So unrestricted is the
+ * literal TRUE, and an empty scope is FALSE: a SPOC who may see nothing counts
+ * nothing, never everything. Both bind no parameters, so a call site spreads
+ * `...scope.params` unconditionally and the placeholder count still matches.
+ */
+function scopePredicate(scopeIds) {
+  if (!Array.isArray(scopeIds)) return { sql: '1=1', params: [] };
+  if (!scopeIds.length)         return { sql: '1=0', params: [] };
+  return {
+    sql: `j.reporting_contact_id IN (${scopeIds.map(() => '?').join(',')})`,
+    params: scopeIds,
+  };
+}
+
+/*
  * CSV → number[]. The empty-segment filter is load-bearing, not tidiness:
  * ''.split(',') is [''], and Number('') is 0, which IS finite — so without it
  * an ABSENT ownerIds parsed as [0], the intersection below emptied, and every
@@ -2234,7 +2253,25 @@ router.get('/dashboard-summary', async (req, res, next) => {
       ? `AND j.reporting_contact_id IN (${scopeIds.length ? scopeIds.map(() => '?').join(',') : 'NULL'})`
       : '';
     const teamParams = Array.isArray(scopeIds) ? scopeIds : [];
-    const teamIds = Array.isArray(scopeIds) ? scopeIds : hier.subtreeIds;
+    /*
+     * ⚠ THE "Across N SPOCs" FOOTER MUST DESCRIBE THE POPULATION BELOW IT.
+     *
+     * This fell back to hier.subtreeIds when the scope was unrestricted, so an
+     * allStores SPOC read "Across 2 SPOCs · live" — their own little subtree —
+     * over counts covering the entire client. The number was true of something,
+     * just not of the page it captions.
+     *
+     * Unrestricted means every SPOC of the client, so that is what it counts.
+     * status = 1 matches the recursive resolver, which walks active contacts
+     * only: a deactivated colleague is not somebody this reader is "across".
+     */
+    let teamSize = Array.isArray(scopeIds) ? scopeIds.length : null;
+    if (teamSize === null) {
+      const [[everyone]] = await pool.query(
+        'SELECT COUNT(*) AS n FROM tbl_client_contacts WHERE client_id = ? AND status = 1',
+        [req.spoc.client_id]);
+      teamSize = Number(everyone.n) || 0;
+    }
 
     // Single COUNT … FILTER over the team-scope. One scan, five
     // SUM(CASE) — keeps the round-trips and join cost flat compared
@@ -2639,7 +2676,7 @@ router.get('/dashboard-summary', async (req, res, next) => {
       categoryBreakdown,
       recentTickets,
       recentEscalations,
-      teamSize: teamIds.length, // for the "across N SPOCs" footer
+      teamSize,                 // for the "across N SPOCs" footer
     });
   } catch (e) { next(e); }
 });
@@ -2821,22 +2858,22 @@ router.get('/tickets/counts', async (req, res, next) => {
       const v = `%${req.query.q}%`;
       params.push(v, v, v, v);
     }
-    // Apply the same "my team's tickets" scope as GET /jobs so the tab
-    // badges count what's actually visible inside each tab. Without
-    // this, counts would over-report (whole-client total) while the
-    // list shows only the SPOC's own + reports' rows.
+    /*
+     * The same scope as GET /jobs, so the tab badges count what is actually
+     * visible inside each tab.
+     *
+     * The comment here used to CLAIM that and the code no longer delivered it:
+     * this expanded self plus DIRECT reports with its own query, non-recursive,
+     * and ignored the caller's role, while /jobs resolves the full recursive
+     * subtree through hierarchyFilter and is unrestricted for allStores. A
+     * manager two levels up got a badge smaller than their own list; a Senior
+     * Leader got one smaller still.
+     */
     {
-      const [reports] = await pool.query(
-        `SELECT id FROM tbl_client_contacts
-          WHERE client_id = ?
-            AND manager_id IS NOT NULL AND manager_id NOT IN ('', 'null')
-            AND CAST(manager_id AS UNSIGNED) = ?`,
-        [req.spoc.client_id, req.spoc.id]
-      );
-      const ids = reports.map((r) => r.id);
-      ids.push(req.spoc.id);
-      where.push(`j.reporting_contact_id IN (${ids.map(() => '?').join(',')})`);
-      params.push(...ids);
+      const hier = await resolveClientHierarchy(req);
+      const scope = scopePredicate(hierarchyFilter(hier, req));
+      where.push(scope.sql);
+      params.push(...scope.params);
     }
 
     // Compose join set — only pull in tables WHERE references. The SUM
@@ -2966,16 +3003,14 @@ router.get('/orders/counts', async (req, res, next) => {
  */
 router.get('/appointments/counts', async (req, res, next) => {
   try {
-    const [reports] = await pool.query(
-      `SELECT id FROM tbl_client_contacts
-        WHERE client_id = ?
-          AND manager_id IS NOT NULL AND manager_id NOT IN ('', 'null')
-          AND CAST(manager_id AS UNSIGNED) = ?`,
-      [req.spoc.client_id, req.spoc.id]
-    );
-    const teamIds = reports.map((r) => r.id);
-    teamIds.push(req.spoc.id);
-    const teamPh = teamIds.map(() => '?').join(',');
+    /*
+     * The same scope /jobs uses, resolved once. This expanded self plus DIRECT
+     * reports with its own query — non-recursive, and blind to the caller's
+     * role — so a badge here could never agree with the list beside it for a
+     * manager with indirect reports, or for any allStores SPOC.
+     */
+    const hier = await resolveClientHierarchy(req);
+    const scope = scopePredicate(hierarchyFilter(hier, req));
 
     const where = ['j.fk_client_id = ?'];
     const params = [req.spoc.client_id];
@@ -3012,22 +3047,22 @@ router.get('/appointments/counts', async (req, res, next) => {
 
     // Bind order: SQL placeholders are consumed in textual order.
     // The three SELECT CASE expressions come BEFORE the WHERE clause
-    // in the text, so their teamIds must be bound first, then the
+    // in the text, so their scope params must be bound first, then the
     // shared WHERE params.
     const [[row]] = await pool.query(
       `SELECT
          SUM(CASE WHEN j.job_status = 0 AND j.fk_easyfixter_id IS NULL
-                   AND j.reporting_contact_id IN (${teamPh})
+                   AND ${scope.sql}
                   THEN 1 ELSE 0 END) AS txUnallocated,
          SUM(CASE WHEN j.job_status = 0 AND j.fk_easyfixter_id IS NOT NULL
-                   AND j.reporting_contact_id IN (${teamPh})
+                   AND ${scope.sql}
                   THEN 1 ELSE 0 END) AS txAllocated,
          SUM(CASE WHEN j.job_status = 1
-                   AND j.reporting_contact_id IN (${teamPh})
+                   AND ${scope.sql}
                   THEN 1 ELSE 0 END) AS ongoingOrders
        ${joins}
        WHERE ${w}`,
-      [...teamIds, ...teamIds, ...teamIds, ...params]
+      [...scope.params, ...scope.params, ...scope.params, ...params]
     );
     modernOk(res, {
       txUnallocated: Number(row.txUnallocated || 0),
@@ -3050,16 +3085,14 @@ router.get('/appointments/counts', async (req, res, next) => {
  */
 router.get('/under-audit/counts', async (req, res, next) => {
   try {
-    const [reports] = await pool.query(
-      `SELECT id FROM tbl_client_contacts
-        WHERE client_id = ?
-          AND manager_id IS NOT NULL AND manager_id NOT IN ('', 'null')
-          AND CAST(manager_id AS UNSIGNED) = ?`,
-      [req.spoc.client_id, req.spoc.id]
-    );
-    const teamIds = reports.map((r) => r.id);
-    teamIds.push(req.spoc.id);
-    const teamPh = teamIds.map(() => '?').join(',');
+    /*
+     * The same scope /jobs uses, resolved once. This expanded self plus DIRECT
+     * reports with its own query — non-recursive, and blind to the caller's
+     * role — so a badge here could never agree with the list beside it for a
+     * manager with indirect reports, or for any allStores SPOC.
+     */
+    const hier = await resolveClientHierarchy(req);
+    const scope = scopePredicate(hierarchyFilter(hier, req));
 
     const where = ['j.fk_client_id = ?'];
     const params = [req.spoc.client_id];
@@ -3100,14 +3133,14 @@ router.get('/under-audit/counts', async (req, res, next) => {
          SUM(CASE WHEN j.job_status IN (3, 5)
                    AND j.sub_job_id IS NOT NULL
                    AND j.ready_for_billing = 'No'
-                   AND j.reporting_contact_id IN (${teamPh})
+                   AND ${scope.sql}
                   THEN 1 ELSE 0 END) AS revisit,
          SUM(CASE WHEN j.job_status = 10
-                   AND j.reporting_contact_id IN (${teamPh})
+                   AND ${scope.sql}
                   THEN 1 ELSE 0 END) AS completedOnApp
        ${joins}
        WHERE ${w}`,
-      [...teamIds, ...teamIds, ...params]
+      [...scope.params, ...scope.params, ...params]
     );
     modernOk(res, {
       revisit:        Number(row.revisit        || 0),
@@ -3130,17 +3163,14 @@ router.get('/under-audit/counts', async (req, res, next) => {
  */
 router.get('/client-delay/counts', async (req, res, next) => {
   try {
-    // SPOC's team ids (self + direct reports)
-    const [reports] = await pool.query(
-      `SELECT id FROM tbl_client_contacts
-        WHERE client_id = ?
-          AND manager_id IS NOT NULL AND manager_id NOT IN ('', 'null')
-          AND CAST(manager_id AS UNSIGNED) = ?`,
-      [req.spoc.client_id, req.spoc.id]
-    );
-    const teamIds = reports.map((r) => r.id);
-    teamIds.push(req.spoc.id);
-    const teamPh = teamIds.map(() => '?').join(',');
+    /*
+     * The same scope /jobs uses, resolved once. This expanded self plus DIRECT
+     * reports with its own query — non-recursive, and blind to the caller's
+     * role — so a badge here could never agree with the list beside it for a
+     * manager with indirect reports, or for any allStores SPOC.
+     */
+    const hier = await resolveClientHierarchy(req);
+    const scope = scopePredicate(hierarchyFilter(hier, req));
 
     const where = ['j.fk_client_id = ?'];
     const params = [req.spoc.client_id];
@@ -3177,9 +3207,9 @@ router.get('/client-delay/counts', async (req, res, next) => {
 
     const [[row]] = await pool.query(
       `SELECT
-         SUM(CASE WHEN j.job_status = 15 AND j.reporting_contact_id IN (${teamPh})
+         SUM(CASE WHEN j.job_status = 15 AND ${scope.sql}
                   THEN 1 ELSE 0 END) AS approveEstimate,
-         SUM(CASE WHEN j.job_status = 21 AND j.reporting_contact_id IN (${teamPh})
+         SUM(CASE WHEN j.job_status = 21 AND ${scope.sql}
                   THEN 1 ELSE 0 END) AS fulfilmentOnHold,
          SUM(CASE WHEN j.job_status = 9
                    AND j.approved_by_client = 0
@@ -3187,12 +3217,12 @@ router.get('/client-delay/counts', async (req, res, next) => {
                    AND ccs.manager_id IS NOT NULL
                    AND ccs.manager_id NOT IN ('', 'null')
                    AND ccs.approval_by_client = 1
-                   AND j.reporting_contact_id IN (${teamPh})
+                   AND ${scope.sql}
                   THEN 1 ELSE 0 END) AS unauthorized
        ${joins}
        WHERE ${w}`,
-      // teamIds first — placeholders in SELECT CASE come before WHERE.
-      [...teamIds, ...teamIds, ...teamIds, ...params]
+      // Scope params first — placeholders in SELECT CASE come before WHERE.
+      [...scope.params, ...scope.params, ...scope.params, ...params]
     );
     modernOk(res, {
       approveEstimate:  Number(row.approveEstimate  || 0),
