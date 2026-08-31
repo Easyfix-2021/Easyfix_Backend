@@ -99,6 +99,70 @@ function derivedAliases(body) {
   return new Set([...body.matchAll(/\)\s*(?:AS\s+)?([A-Za-z][A-Za-z0-9_]*)/gi)].map((m) => m[1]));
 }
 
+/*
+ * SQL fragments assembled as JS STRINGS and interpolated later:
+ *
+ *   clauses.push('e.city_id = ?');            <- a real phantom, and invisible
+ *   where.push('(rc.status IS NULL)');           to the literal-SQL scan above
+ *   ...
+ *   `SELECT … WHERE ${clauses.join(' AND ')}`
+ *
+ * The alias is bound in the TEMPLATE, not in the fragment, so the fragment
+ * cannot be resolved on its own. It is resolved against the FILE's aliases
+ * instead — and conservatively: an alias bound to several tables across the
+ * file only counts as a phantom when the column is missing from ALL of them.
+ *
+ * That conservatism is deliberate. A file-wide alias map used for LITERAL SQL
+ * invented 17 findings on this codebase's first run, every one an artifact of
+ * an alias meaning different things in different queries. Requiring the column
+ * to be absent everywhere the alias could point removes that whole class, at
+ * the cost of missing a fragment whose column happens to exist on some other
+ * table the same letter names elsewhere. Under-reporting beats crying wolf.
+ */
+function fileAliasTables(src) {
+  const m = new Map();
+  const re = /\b(?:FROM|JOIN|UPDATE)\s+`?([a-z_][a-z0-9_]*)`?\s+(?:AS\s+)?([A-Za-z][A-Za-z0-9_]*)/gi;
+  for (const x of src.matchAll(re)) {
+    if (NOT_AN_ALIAS.has(x[2].toLowerCase())) continue;
+    if (!m.has(x[2])) m.set(x[2], new Set());
+    m.get(x[2]).add(x[1].toLowerCase());
+  }
+  return m;
+}
+
+/* Does this line put the string in a ternary? That is the guarded pattern. */
+function isTernaryBranch(line) {
+  return /\?[^?]*['"][^'"]*['"]\s*:/.test(line) || /:\s*['"][^'"]*['"]/.test(line);
+}
+
+function jsFragmentFindings(rel, src, cols) {
+  const out = [];
+  const aliases = fileAliasTables(src);
+  if (!aliases.size) return out;
+  const lines = src.split('\n');
+  lines.forEach((line, i) => {
+    if (isTernaryBranch(line)) return;               // probed / conditional
+    for (const str of line.matchAll(/'([^']{3,200})'|"([^"]{3,200})"/g)) {
+      const frag = str[1] || str[2];
+      // Only strings that read as SQL: a comparison, or a SQL operator.
+      if (!/[=<>]|\bIS\b|\bLIKE\b|\bIN\b|\bNOT\b/i.test(frag)) continue;
+      for (const ref of frag.matchAll(/\b([A-Za-z][A-Za-z0-9_]*)\.([a-z_][a-z0-9_]*)\b/g)) {
+        const [, alias, col] = ref;
+        const tables = aliases.get(alias);
+        if (!tables) continue;
+        const known = [...tables].filter((t) => cols.has(t));
+        if (!known.length) continue;
+        if (known.some((t) => cols.get(t).has(col.toLowerCase()))) continue;
+        out.push({
+          rel, kind: 'js-fragment', ref: `${alias}.${col}`,
+          table: known.join('|'), col, line: i + 1,
+        });
+      }
+    }
+  });
+  return out;
+}
+
 function scanFile(rel, src, cols) {
   const out = [];
   for (const body of sqlLiterals(strip(src))) {
@@ -134,6 +198,7 @@ function scanFile(rel, src, cols) {
       }
     }
   }
+  out.push(...jsFragmentFindings(rel, strip(src), cols));
   return out;
 }
 
@@ -191,7 +256,10 @@ async function cliMain() {
   process.exitCode = 1;
 }
 
-module.exports = { verifyPhantomColumns, scanFile, aliasMap, NOT_AN_ALIAS };
+module.exports = {
+  verifyPhantomColumns, scanFile, aliasMap, fileAliasTables,
+  jsFragmentFindings, isTernaryBranch, NOT_AN_ALIAS,
+};
 
 if (require.main === module) {
   cliMain().catch((e) => { console.error('FAIL', e.message); process.exit(2); }).finally(() => pool.end());
