@@ -164,7 +164,17 @@ async function verifyByToken(token, db = pool) {
             e.profile_activation_date_time,
             e.lifecycle_status, e.lifecycle_changed_at,
             e.adhaar_card_number, e.user_id,
-            e.is_identity_details_verified_by_crm, e.user_personal_details_filled,
+            e.is_identity_details_verified_by_crm,
+            /*
+             * e.user_personal_details_filled was selected here and read
+             * NOWHERE (no backticks in this comment -- it lives INSIDE a
+             * template literal, and one would end the string early) — the return below maps fields explicitly and never
+             * spreads the row. It is also not a column on tbl_easyfixer (the
+             * real one is tbl_user.is_personal_detail_filled), so it threw
+             * ER_BAD_FIELD_ERROR and took the whole query with it. Dropped
+             * rather than joined: adding tbl_user to serve a value no caller
+             * reads would be a round trip for nothing.
+             */
             c.city_name
        FROM tbl_easyfixer e
        LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId

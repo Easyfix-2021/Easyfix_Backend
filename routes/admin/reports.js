@@ -16,8 +16,25 @@ router.get('/completed-jobs', async (req, res, next) => {
     const params = [from, to];
     if (clientId != null) { clauses.push('j.fk_client_id = ?'); params.push(clientId); }
     const [rows] = await pool.query(
+      /*
+       * total_amount is NOT a column on tbl_job — it never was, so this report
+       * threw ER_BAD_FIELD_ERROR on every request, JSON and XLSX alike. Job
+       * money lives in tbl_job_transaction, which is where the Transactions
+       * modal reads it from too.
+       *
+       * A CORRELATED SUBQUERY, not a join. Only 1 job in 338,740 carries more
+       * than one transaction row, but a LEFT JOIN would silently duplicate
+       * that one job in a report people reconcile against — and the subquery
+       * needs no GROUP BY, so nothing else in the statement has to change.
+       * The alias is kept because the XLSX column is keyed on `total_amount`.
+       */
       `SELECT j.job_id, j.fk_client_id, cl.client_name, j.job_type, j.checkout_date_time,
-              ef.efr_name AS easyfixer, ci.city_name, j.total_amount
+              ef.efr_name AS easyfixer, ci.city_name,
+              (SELECT TJT.total_charge_and_tax
+                 FROM tbl_job_transaction TJT
+                WHERE TJT.fk_job_id = j.job_id
+                ORDER BY TJT.job_transaction_id DESC
+                LIMIT 1)                    AS total_amount
          FROM tbl_job j
          LEFT JOIN tbl_client    cl ON cl.client_id = j.fk_client_id
          LEFT JOIN tbl_easyfixer ef ON ef.efr_id    = j.fk_easyfixter_id

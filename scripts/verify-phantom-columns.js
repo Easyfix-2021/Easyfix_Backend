@@ -58,9 +58,29 @@ const SELECT_KEYWORDS = new Set([
   'else', 'end', 'asc', 'desc', 'true', 'false',
 ]);
 
+/*
+ * ${...} interpolations are BLANKED before scanning.
+ *
+ * What is inside them is JavaScript, not literal SQL, and it is conditional by
+ * construction — the drift-tolerant pattern this codebase uses for optional
+ * columns looks like:
+ *
+ *   ${hasCityNameCol ? 'e.city_name' : 'c.city_name AS city_name'}
+ *
+ * Reading that as literal SQL reports `e.city_name` as a phantom on a
+ * deployment that does not have it, which is precisely the case the code
+ * already handles. Flagging a working guard is how a checker gets allowlisted
+ * into uselessness.
+ *
+ * THE COST, stated plainly: a WHERE fragment assembled in a JS string and
+ * interpolated later is invisible here. That is real — client-tech-mapping's
+ * `clauses.push('e.city_id = ?')` was a genuine phantom this scan could not
+ * see, and it was found by reading. This checks literal SQL; it does not
+ * replace reading the code.
+ */
 function sqlLiterals(src) {
   return [...src.matchAll(/`([^`]*)`/g)]
-    .map((m) => m[1])
+    .map((m) => m[1].replace(/\$\{[^}]*\}/g, ' '))
     .filter((b) => /\bSELECT\b/i.test(b));
 }
 

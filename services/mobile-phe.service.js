@@ -691,11 +691,11 @@ async function getJobDetail(efrId, jobId, db = pool) {
           LIMIT 1
        ) accepted ON 1 = 1
        LEFT JOIN tbl_easyfixer_rating_by_customer r
-              ON r.id = (
-                SELECT r2.id
+              ON r.table_id = (
+                SELECT r2.table_id
                   FROM tbl_easyfixer_rating_by_customer r2
                  WHERE r2.easyfixer_id = ? AND r2.job_id = j.job_id
-                 ORDER BY r2.insert_date_time DESC, r2.id DESC
+                 ORDER BY r2.insert_date_time DESC, r2.table_id DESC
                  LIMIT 1
               )
        LEFT JOIN tbl_easyfixer ef ON ef.efr_id = j.fk_easyfixter_id

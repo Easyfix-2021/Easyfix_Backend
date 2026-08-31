@@ -185,8 +185,8 @@ async function eligibleCandidates(job) {
     let predicate = `EXISTS (
       SELECT 1
         FROM tbl_efr_deepskill_mapping m
-        JOIN tbl_deep_skill ds ON ds.deepskill_id = m.deepskill_id
-       WHERE m.efr_id = e.efr_id
+        JOIN tbl_deep_skill ds ON ds.deepskill_id = m.deep_skill_id
+       WHERE m.easyfixer_id = e.efr_id
          AND ds.status = 1`;
     if (job.fk_service_catg_id) { predicate += ' AND ds.category_id = ?';     skillParams.push(job.fk_service_catg_id); }
     if (job.fk_service_type_id) { predicate += ' AND ds.service_type_id = ?'; skillParams.push(job.fk_service_type_id); }

@@ -223,8 +223,22 @@ async function eligibleTechsFor(serviceTypeId, opts = {}) {
   const clauses = ['(e.efr_status IS NULL OR e.efr_status = 1)'];
   const params = [];
   if (opts.includeUnverified !== true) clauses.push('e.is_technician_verified = 1');
-  if (opts.cityId) { clauses.push('e.city_id = ?'); params.push(opts.cityId); }
-  if (opts.cityName) { clauses.push('e.city_name = ?'); params.push(opts.cityName); }
+  /*
+   * tbl_easyfixer's city FK is `efr_cityId`, and it has NO `city_id` and no
+   * `city_name` on this deployment — all three references here were phantoms
+   * and every call to this function threw ER_BAD_FIELD_ERROR.
+   *
+   * city_name follows the probe the rest of this file already uses
+   * (easyfixerHasCityNameCol): some deployments carry a denormalised copy on
+   * tbl_easyfixer, and where they do not, tbl_city is joined instead. city_id
+   * needs no probe — efr_cityId is the real FK everywhere.
+   */
+  if (opts.cityId) { clauses.push('e.efr_cityId = ?'); params.push(opts.cityId); }
+  const hasCityNameCol = await easyfixerHasCityNameCol(pool);
+  if (opts.cityName) {
+    clauses.push(hasCityNameCol ? 'e.city_name = ?' : 'c.city_name = ?');
+    params.push(opts.cityName);
+  }
   if (opts.query) {
     // tbl_easyfixer uses `efr_first_name` + `efr_last_name` per CLAUDE.md
     // glossary. Match either fragment or the operator code.
@@ -240,8 +254,10 @@ async function eligibleTechsFor(serviceTypeId, opts = {}) {
   const [rows] = await pool.query(
     `SELECT e.efr_id,
             e.efr_first_name, e.efr_last_name,
-            e.efr_no, e.city_name, e.is_technician_verified
+            e.efr_no, ${hasCityNameCol ? 'e.city_name' : 'c.city_name AS city_name'},
+            e.is_technician_verified
        FROM tbl_easyfixer e
+       ${hasCityNameCol ? '' : 'LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId'}
       WHERE ${clauses.join(' AND ')}
       ORDER BY e.efr_first_name ASC
       LIMIT 500`,

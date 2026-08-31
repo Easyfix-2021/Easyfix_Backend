@@ -79,6 +79,22 @@ test('SELECT * and function calls are skipped rather than guessed at', () => {
   assert.deepEqual(refs('const q = `SELECT COUNT(city) FROM tbl_easyfixer WHERE 1`;'), []);
 });
 
+test('a guarded ${...} expression is NOT a phantom', () => {
+  /*
+   * The drift-tolerant pattern this codebase uses for optional columns. Reading
+   * it as literal SQL flags a working guard, and a checker that flags working
+   * code gets allowlisted into uselessness.
+   */
+  const src = "const q = `SELECT ${has ? 'e.city_name' : 'c.city_name'} FROM tbl_easyfixer e`;";
+  assert.deepEqual(refs(src), []);
+});
+
+test('blanking interpolations does NOT hide a real phantom beside one', () => {
+  // The guarded expression is skipped; the literal phantom next to it is not.
+  const src = "const q = `SELECT ${has ? 'e.a' : 'c.a'}, e.city FROM tbl_easyfixer e`;";
+  assert.deepEqual(refs(src), ['e.city']);
+});
+
 test('an alias in a COMMENT does not count', () => {
   const src = '/* SELECT e.city FROM tbl_easyfixer e */\nconst q = `SELECT e.efr_id FROM tbl_easyfixer e`;';
   assert.deepEqual(refs(src), [], 'comments are stripped before scanning');

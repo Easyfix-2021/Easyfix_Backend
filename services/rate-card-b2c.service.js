@@ -26,11 +26,12 @@ function mkErr(status, message) { const e = new Error(message); e.status = statu
 
 const SORTABLE_COLUMNS = Object.freeze({
   rrc_id:               'rc.rrc_id',
-  rrc_service_name:     'rc.rrc_service_name',
-  rrc_service_price:    'rc.rrc_service_price',
+  rrc_service_name:     'rc.rrc_ratecard_name',
+  rrc_service_price:    'rc.rrc_ratecard_price',
   service_type_name:    'st.service_type_name',
   service_catg_name:    'sc.service_catg_name',
-  status:               'rc.status',
+  // `status` is deliberately absent — there is no such column to sort on. An
+  // unknown sortBy falls back to rrc_service_name, so an old caller still works.
 });
 
 async function listRateCards({
@@ -47,19 +48,34 @@ async function listRateCards({
   const dir      = String(sortDir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
   const orderBy  = `${sortExpr} ${dir}, rc.rrc_id ASC`;
 
-  const where  = ['(rc.status IS NULL OR rc.status <> 3)'];
+  /*
+   * NO STATUS FILTER. tbl_retail_rate_card has seven columns and none of them
+   * is `status` — this file's own header predicted the failure ("drop the
+   * WHERE/SET status clauses or add the column"), and every read here threw
+   * ER_BAD_FIELD_ERROR until now.
+   *
+   * Dropped rather than added: easyfix_core is the shared legacy database and
+   * CLAUDE.md's standing rule is never to alter its schema. Adding a column to
+   * a table five other services read is not a call this fix gets to make.
+   *
+   * `includeInactive` therefore has nothing to filter and is accepted as a
+   * no-op rather than removed, so the route contract and the CRM stay unchanged.
+   */
+  const where  = ['1=1'];
   const params = [];
-  if (!includeInactive) where.push('(rc.status IS NULL OR rc.status = 1)');
+  void includeInactive;
   if (serviceTypeId)    { where.push('rc.rrc_servicetype_id = ?'); params.push(Number(serviceTypeId)); }
   if (serviceCatgId)    { where.push('st.service_catg_id = ?');    params.push(Number(serviceCatgId)); }
   if (q) {
-    where.push('(rc.rrc_service_name LIKE ? OR st.service_type_name LIKE ?)');
+    where.push('(rc.rrc_ratecard_name LIKE ? OR st.service_type_name LIKE ?)');
     params.push(`%${q}%`, `%${q}%`);
   }
 
   const [rows] = await pool.query(
-    `SELECT rc.rrc_id, rc.rrc_servicetype_id, rc.rrc_service_name, rc.rrc_service_price,
-            rc.status,
+    `SELECT rc.rrc_id, rc.rrc_servicetype_id,
+            rc.rrc_ratecard_name  AS rrc_service_name,
+            rc.rrc_ratecard_price AS rrc_service_price,
+            NULL AS status,
             st.service_type_name, st.service_catg_id, sc.service_catg_name
        FROM tbl_retail_rate_card rc
        LEFT JOIN tbl_service_type st ON st.service_type_id = rc.rrc_servicetype_id
@@ -85,13 +101,15 @@ async function listRateCards({
 
 async function getRateCardById(id) {
   const [[row]] = await pool.query(
-    `SELECT rc.rrc_id, rc.rrc_servicetype_id, rc.rrc_service_name, rc.rrc_service_price,
-            rc.status,
+    `SELECT rc.rrc_id, rc.rrc_servicetype_id,
+            rc.rrc_ratecard_name  AS rrc_service_name,
+            rc.rrc_ratecard_price AS rrc_service_price,
+            NULL AS status,
             st.service_type_name, st.service_catg_id, sc.service_catg_name
        FROM tbl_retail_rate_card rc
        LEFT JOIN tbl_service_type st ON st.service_type_id = rc.rrc_servicetype_id
        LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = st.service_catg_id
-      WHERE rc.rrc_id = ? AND (rc.status IS NULL OR rc.status <> 3) LIMIT 1`,
+      WHERE rc.rrc_id = ? LIMIT 1`,
     [id]
   );
   return row || null;
@@ -115,8 +133,7 @@ async function createRateCard({ rrc_service_name, rrc_servicetype_id, rrc_servic
   const [[dup]] = await pool.query(
     `SELECT rrc_id FROM tbl_retail_rate_card
       WHERE rrc_servicetype_id = ?
-        AND LOWER(rrc_service_name) = LOWER(?)
-        AND (status IS NULL OR status <> 3)
+        AND LOWER(rrc_ratecard_name) = LOWER(?)
       LIMIT 1`,
     [rrc_servicetype_id, name]
   );
@@ -124,9 +141,9 @@ async function createRateCard({ rrc_service_name, rrc_servicetype_id, rrc_servic
 
   const [r] = await pool.query(
     `INSERT INTO tbl_retail_rate_card
-       (rrc_servicetype_id, rrc_service_name, rrc_service_price,
-        status, insert_date, update_date, updated_by)
-     VALUES (?, ?, ?, 1, NOW(), NOW(), ?)`,
+       (rrc_servicetype_id, rrc_ratecard_name, rrc_ratecard_price,
+        insert_date, update_date, updated_by)
+     VALUES (?, ?, ?, NOW(), NOW(), ?)`,
     [Number(rrc_servicetype_id), name, Math.round(price), createdBy || null]
   );
   logger.info('B2C rate card created · id=' + r.insertId);
@@ -146,7 +163,7 @@ async function updateRateCard(id, fields, updatedBy) {
   if (fields.rrc_service_name !== undefined) {
     const name = String(fields.rrc_service_name).trim();
     if (!name) throw mkErr(400, 'rrc_service_name cannot be blank');
-    sets.push('rrc_service_name = ?'); params.push(name);
+    sets.push('rrc_ratecard_name = ?'); params.push(name);
   }
   if (fields.rrc_servicetype_id !== undefined) {
     const [[st]] = await pool.query(
@@ -159,10 +176,19 @@ async function updateRateCard(id, fields, updatedBy) {
   if (fields.rrc_service_price !== undefined) {
     const price = Number(fields.rrc_service_price);
     if (!Number.isFinite(price) || price < 0) throw mkErr(400, 'rrc_service_price must be a non-negative number');
-    sets.push('rrc_service_price = ?'); params.push(Math.round(price));
+    sets.push('rrc_ratecard_price = ?'); params.push(Math.round(price));
   }
   if (fields.is_active !== undefined) {
-    sets.push('status = ?'); params.push(fields.is_active ? 1 : 0);
+    /*
+     * There is no `status` column on tbl_retail_rate_card, so this cannot be
+     * honoured. It used to emit `SET status = ?`, which failed the WHOLE
+     * update — a caller changing the name AND the flag lost the name too.
+     *
+     * Refused explicitly instead. 501 says "this deployment cannot do that",
+     * which is true and actionable, where ER_BAD_FIELD_ERROR said nothing.
+     */
+    throw mkErr(501, 'Activating or deactivating a B2C rate card is not supported on this '
+      + 'schema — tbl_retail_rate_card has no status column.');
   }
   if (!sets.length) throw mkErr(400, 'No mutable fields supplied');
 
@@ -173,16 +199,21 @@ async function updateRateCard(id, fields, updatedBy) {
   return getRateCardById(id);
 }
 
-async function deactivateRateCard(id, updatedBy) {
-  logger.info('Delete (soft) B2C rate card · id=' + id);
-  const [r] = await pool.query(
-    `UPDATE tbl_retail_rate_card
-        SET status = 3, update_date = NOW(), updated_by = ?
-      WHERE rrc_id = ? AND (status IS NULL OR status <> 3)`,
-    [updatedBy || null, id]
-  );
-  logger.info('B2C rate card deleted · id=' + id + ' · affected=' + r.affectedRows);
-  return r.affectedRows > 0;
+/*
+ * SOFT DELETE IS NOT AVAILABLE HERE, and saying so beats failing at the driver.
+ *
+ * This wrote `SET status = 3` to a table with no status column, so every call
+ * threw ER_BAD_FIELD_ERROR and the operator saw a 500 with no explanation.
+ *
+ * The column is not being ADDED: easyfix_core is the shared legacy database and
+ * CLAUDE.md's standing rule is never to alter its schema — five other services
+ * read this table. If retiring a B2C rate card becomes a real requirement, that
+ * is a migration and an owner decision, not a line in this file.
+ */
+async function deactivateRateCard(id) {
+  logger.warn('B2C rate card deactivate refused · id=' + id + ' · no status column on tbl_retail_rate_card');
+  throw mkErr(501, 'Retiring a B2C rate card is not supported on this schema — '
+    + 'tbl_retail_rate_card has no status column.');
 }
 
 module.exports = {

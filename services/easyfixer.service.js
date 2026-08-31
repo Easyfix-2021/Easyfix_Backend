@@ -986,7 +986,15 @@ async function listMappedClients(efrId, { limit = 50, offset = 0 } = {}) {
             m.easyfixer_id,
             m.service_type_id,
             m.mapping_status,
-            m.insert_date         AS mapped_at,
+            /*
+             * update_date, not insert_date. tbl_client_easyfixer_mapping has
+             * seven columns and no insert_date at all — this threw
+             * ER_BAD_FIELD_ERROR every time the Client Mapping modal opened.
+             * update_date is the only temporal column on the table, so it is
+             * the only thing "mapped_at" can mean here. Alias unchanged: the
+             * CRM reads mapped_at.
+             */
+            m.update_date         AS mapped_at,
             cl.client_name        AS client_name
        FROM tbl_client_easyfixer_mapping m
        LEFT JOIN tbl_client cl ON cl.client_id = m.client_id
