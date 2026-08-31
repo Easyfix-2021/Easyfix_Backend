@@ -54,19 +54,13 @@ test('allStores is not re-applied at any call site', () => {
  * with the reason it is exempt, so adding a new one is a deliberate act rather
  * than an omission. A new unscoped job route fails this test.
  *
- * The four PATCH /jobs/:id/* writes are tenancy-checked (fk_client_id) but NOT
- * hierarchy-checked, so a Store SPOC who guesses a job id can act on a peer's
- * job. That is a real gap, deliberately NOT widened or narrowed here — it is
- * an authorisation question about WRITES, separate from the counting bug this
- * file is about, and closing it changes who can approve what.
+ * The four PATCH /jobs/:id/* writes are NOT here: they go through
+ * loadJobForWrite, which applies the same resolver, so read scope and write
+ * scope give one answer. They used to check tenancy only, which let any SPOC
+ * who guessed a job id approve a colleague's job they could not see anywhere
+ * on the site.
  */
 const EXEMPT = new Set([
-  'PATCH /jobs/:id/approve',            // tenancy-only write — see note above
-  'PATCH /jobs/:id/reject',             // tenancy-only write
-  'PATCH /jobs/:id/estimate/approve',   // tenancy-only write
-  'PATCH /jobs/:id/estimate/reject',    // tenancy-only write
-  'GET /cities',                        // filter dropdown, client-wide by design
-  'GET /lookup/cities',                 // filter dropdown, client-wide by design
   'GET /team/bookings',                 // takes an explicit contact id
   'GET /notices',                       // notices are per-SPOC, not per-job
   'PATCH /notices/read',
@@ -92,7 +86,7 @@ test('every job-listing route routes through the shared scope', () => {
     // `new RegExp` per call: a /g literal's lastIndex persists across .test()
     // and would make every other route read as clean.
     if (!/tbl_job\b|jobService\.(list|getStatusCounts|getAttentionSummary)/.test(body)) return;
-    if (/hierarchyFilter\(|clientJobFilters\(/.test(body)) return;
+    if (/hierarchyFilter\(|clientJobFilters\(|loadJobForWrite\(/.test(body)) return;
     if (EXEMPT.has(s.label)) return;
     unscoped.push(s.label);
   });
@@ -103,12 +97,66 @@ test('every job-listing route routes through the shared scope', () => {
 });
 
 test('the EXEMPT list has no dead entries', () => {
-  const present = new Set();
-  RAW.split('\n').forEach((l) => {
+  /*
+   * Two ways an exemption goes stale, and both hide the next route that
+   * genuinely needs one: the route is gone, or the route has since been
+   * scoped and the exemption is now doing nothing.
+   */
+  const lines = RAW.split('\n');
+  const starts = [];
+  lines.forEach((l, i) => {
     const m = /^router\.(get|post|patch|put|delete)\('([^']*)'/.exec(l);
-    if (m) present.add(`${m[1].toUpperCase()} ${m[2]}`);
+    if (m) starts.push({ i, label: `${m[1].toUpperCase()} ${m[2]}` });
   });
-  const stale = [...EXEMPT].filter((e) => !present.has(e));
-  assert.deepEqual(stale, [],
-    'an exemption for a route that no longer exists hides the next one that needs it');
+
+  const present = new Set(starts.map((x) => x.label));
+  assert.deepEqual([...EXEMPT].filter((e) => !present.has(e)), [],
+    'an exemption for a route that no longer exists');
+
+  const nowScoped = [];
+  starts.forEach((s2, idx) => {
+    if (!EXEMPT.has(s2.label)) return;
+    const end = idx + 1 < starts.length ? starts[idx + 1].i : lines.length;
+    const body = lines.slice(s2.i, end)
+      .filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l)).join('\n');
+    if (/hierarchyFilter\(|clientJobFilters\(|loadJobForWrite\(/.test(body)) nowScoped.push(s2.label);
+  });
+  assert.deepEqual(nowScoped, [],
+    'these are scoped now — drop the exemption so it stops vouching for them');
+});
+
+/* ── read scope and write scope are ONE answer ────────────────────────── */
+
+test('every client write on a job goes through the shared ownership check', () => {
+  const lines = RAW.split('\n');
+  const starts = [];
+  lines.forEach((l, i) => {
+    const m = /^router\.(get|post|patch|put|delete)\('([^']*)'/.exec(l);
+    if (m) starts.push({ i, method: m[1], path: m[2] });
+  });
+
+  const bare = [];
+  starts.forEach((s2, idx) => {
+    if (s2.method === 'get') return;
+    if (!/^\/jobs\/:id\//.test(s2.path)) return;
+    const end = idx + 1 < starts.length ? starts[idx + 1].i : lines.length;
+    const body = lines.slice(s2.i, end)
+      .filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l)).join('\n');
+    if (!/jobService\.getById/.test(body)) return;
+    if (/loadJobForWrite\(/.test(body)) return;
+    bare.push(`${s2.method.toUpperCase()} ${s2.path}`);
+  });
+
+  assert.deepEqual(bare, [],
+    'a write that resolves a job by id and checks only fk_client_id lets any SPOC '
+    + "act on a colleague's job by guessing its id");
+});
+
+test('the ownership check refuses a job with no reporting contact, for scoped callers only', () => {
+  const fn = /async function loadJobForWrite[\s\S]*?\n}/.exec(RAW);
+  assert.ok(fn, 'the helper must exist');
+  assert.match(fn[0], /Array\.isArray\(scopeIds\)/,
+    'undefined means unrestricted — an allStores or top-of-tree SPOC must still act');
+  assert.match(fn[0], /404/,
+    '403 on an existing-but-foreign job confirms which ids exist');
 });

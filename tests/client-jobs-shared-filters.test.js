@@ -31,6 +31,15 @@ const fake = installFakePool([
   [/SELECT manager_id FROM tbl_client_contacts/i, () => [me]],
   [/WITH RECURSIVE team/i, () => subtree],
   [/SELECT COUNT\(\*\) AS total/i, () => [{ total: matchingTotal }]],
+  /*
+   * The /team DIRECTORY query — every contact on the client, including 99 who
+   * is outside the caller's subtree. That row is the whole point: without
+   * somebody out of scope, `inScope` could be hardcoded true and still pass.
+   */
+  [/SELECT id, contact_name, contact_email/i, () => [42, 43, 44, 99].map((id) => ({
+    id, contact_name: `Contact ${id}`, contact_email: null, contact_no: null,
+    contact_desgn: null, manager_id: null, status: 1, approval_by_client: 0,
+  }))],
   [/INFORMATION_SCHEMA/i, []],
   /*
    * The data query returns as many rows as its own LIMIT allows, exactly like
@@ -460,3 +469,73 @@ for (const path of BADGE_ROUTES) {
       'an indirect report must be inside the badge, as they are inside the list');
   });
 }
+
+/* ─── filter OPTIONS must match the rows the filter can return ─────────── */
+
+/*
+ * /cities, /lookup/cities and /team/members listed every city and SPOC on the
+ * CLIENT while the lists they filter are scoped to the caller's subtree, so a
+ * Store SPOC was offered choices that could only return zero rows — and an
+ * empty result reads as "this colleague has no jobs", not "you cannot see
+ * theirs". The options are scoped to the same book now.
+ */
+
+for (const path of ['/cities', '/lookup/cities']) {
+  test(`${path} · offers only cities the caller can actually reach`, async () => {
+    await call(path, {}, { allStores: false });
+    const q = fake.calls.find((c) => /FROM tbl_job j/i.test(c.sql));
+    assert.ok(q, 'the lookup must read the caller job book');
+    assert.match(q.sql, /reporting_contact_id IN \(/,
+      'a city with no visible jobs is a filter that returns nothing');
+  });
+
+  test(`${path} · an allStores SPOC sees the whole client`, async () => {
+    await call(path, {}, { allStores: true });
+    const q = fake.calls.find((c) => /FROM tbl_job j/i.test(c.sql));
+    assert.doesNotMatch(q.sql, /reporting_contact_id IN \(/, 'unrestricted stays unrestricted');
+  });
+}
+
+test('/lookup/cities?scope=all stays the FULL master list', async () => {
+  await call('/lookup/cities', { scope: 'all' }, { allStores: false });
+  const q = fake.calls.find((c) => /FROM tbl_city/i.test(c.sql));
+  assert.ok(q, 'the master list must still be reachable');
+  assert.doesNotMatch(q.sql, /reporting_contact_id/,
+    'New Order books into cities you have no jobs in yet — that is the whole point');
+  assert.doesNotMatch(q.sql, /FROM tbl_job/i, 'and it must not be derived from the job book');
+});
+
+test('/team/members offers the subtree, spelled for tbl_client_contacts', async () => {
+  await call('/team/members', {}, { allStores: false });
+  const q = fake.calls.find((c) => /FROM tbl_client_contacts/i.test(c.sql) && /contact_email/i.test(c.sql));
+  assert.ok(q, 'the team lookup must run');
+  assert.match(q.sql, /AND id IN \(/,
+    'the column here is tbl_client_contacts.id, not tbl_job.reporting_contact_id');
+  assert.ok(q.params.includes(43) && q.params.includes(44),
+    'the full RECURSIVE subtree — an indirect report is still on my team');
+});
+
+test('/team/members is unrestricted for an allStores SPOC', async () => {
+  await call('/team/members', {}, { allStores: true });
+  const q = fake.calls.find((c) => /FROM tbl_client_contacts/i.test(c.sql) && /contact_email/i.test(c.sql));
+  assert.doesNotMatch(q.sql, /AND id IN \(/, 'they may filter by anyone in the client');
+});
+
+/* ─── /team: one payload, a directory AND a picker ─────────────────────── */
+
+test('/team keeps every contact but marks which are in the caller\'s scope', async () => {
+  const r = await call('/team', {}, { allStores: false });
+  const items = r.body.data.items;
+  assert.ok(items.length > 1, 'the Client Profile renders this as the company directory');
+  const mine = items.filter((m) => m.inScope);
+  assert.ok(mine.length && mine.length < items.length,
+    'a scoped caller must see SOME in-scope and some not — otherwise the flag says nothing');
+  assert.ok(mine.every((m) => [42, 43, 44].includes(m.id)),
+    'in-scope is the recursive subtree, the same set every list uses');
+});
+
+test('/team marks everyone in scope for an allStores SPOC', async () => {
+  const r = await call('/team', {}, { allStores: true });
+  assert.ok(r.body.data.items.every((m) => m.inScope === true),
+    'they may scope to any SPOC of the client, so the picker must offer all of them');
+});

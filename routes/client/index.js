@@ -830,6 +830,51 @@ function clientJobFilters(req, hier) {
   };
 }
 
+/*
+ * ─── THE OWNERSHIP CHECK FOR CLIENT WRITES ─────────────────────────────────
+ *
+ * The four PATCH /jobs/:id/* endpoints checked TENANCY only — fk_client_id —
+ * so any SPOC who guessed a job id could approve or reject a colleague's job,
+ * including one they cannot see in any list on the site. Read scope and write
+ * scope were two different answers to the same question.
+ *
+ * They are one answer now: if the job is not in the set you may SEE, you may
+ * not act on it. Same resolver as every list.
+ *
+ * ⚠ A JOB WITH NO reporting_contact_id IS IN NOBODY'S SUBTREE. 9,400 of them
+ * exist — 52% of website bookings, 69% of the Reach Fitness API's — because
+ * they were not booked by a SPOC at all. They are already invisible to a
+ * scoped SPOC in every list (`reporting_contact_id IN (…)` never matches
+ * NULL), so refusing the write is the CONSISTENT answer rather than a new
+ * restriction, and an allStores or top-of-tree SPOC can still act on them.
+ * Zero status-15 jobs are in that state today, so no estimate approval is
+ * blocked by this; if that changes, the log line below says exactly why.
+ *
+ * 404, not 403, matching the tenancy branch: a distinguishable "exists but is
+ * not yours" confirms which ids exist. The LOG distinguishes them, because
+ * "wrong client" and "wrong subtree" need different fixes.
+ *
+ * Returns null once it has answered the request — callers `if (!job) return;`.
+ */
+async function loadJobForWrite(req, res, what) {
+  const job = await jobService.getById(Number(req.params.id));
+  if (!job || job.fk_client_id !== req.spoc.client_id) {
+    logger.warn(what + ' target not found / not owned · id=' + req.params.id);
+    modernError(res, 404, 'job not found');
+    return null;
+  }
+  const hier = await resolveClientHierarchy(req);
+  const scopeIds = hierarchyFilter(hier, req);
+  if (Array.isArray(scopeIds) && !scopeIds.includes(Number(job.reporting_contact_id))) {
+    logger.warn(what + ' target outside caller hierarchy · id=' + req.params.id
+      + ' · reporting_contact_id=' + job.reporting_contact_id
+      + ' · spoc=' + req.spoc.id);
+    modernError(res, 404, 'job not found');
+    return null;
+  }
+  return job;
+}
+
 router.get('/jobs', async (req, res, next) => {
   try {
     logger.info('List client jobs · status=' + (req.query.status ?? 'all') + ' q=' + (req.query.q || '-') + ' limit=' + (Math.min(Number(req.query.limit) || 50, 500)) + ' offset=' + (Number(req.query.offset) || 0));
@@ -869,11 +914,8 @@ router.get('/jobs/:id', async (req, res, next) => {
 router.patch('/jobs/:id/approve', async (req, res, next) => {
   try {
     logger.info('SPOC approve job · id=' + req.params.id);
-    const job = await jobService.getById(Number(req.params.id));
-    if (!job || job.fk_client_id !== req.spoc.client_id) {
-      logger.warn('Approve target not found / not owned · id=' + req.params.id);
-      return modernError(res, 404, 'job not found');
-    }
+    const job = await loadJobForWrite(req, res, 'Approve');
+    if (!job) return;
     await pool.query('UPDATE tbl_job SET approved_by_client_contact = ?, approved_on_date_time = NOW() WHERE job_id = ?',
       [req.spoc.id, job.job_id]);
     logger.info('Job approved by client · id=' + job.job_id);
@@ -884,11 +926,8 @@ router.patch('/jobs/:id/approve', async (req, res, next) => {
 router.patch('/jobs/:id/reject', validate(Joi.object({ reason: Joi.string().min(3).max(500).required() })), async (req, res, next) => {
   try {
     logger.info('SPOC reject job · id=' + req.params.id);
-    const job = await jobService.getById(Number(req.params.id));
-    if (!job || job.fk_client_id !== req.spoc.client_id) {
-      logger.warn('Reject target not found / not owned · id=' + req.params.id);
-      return modernError(res, 404, 'job not found');
-    }
+    const job = await loadJobForWrite(req, res, 'Reject');
+    if (!job) return;
     await pool.query(
       'UPDATE tbl_job SET approval_reject_reason = ?, approval_reject_date_time = NOW() WHERE job_id = ?',
       [req.body.reason, job.job_id]);
@@ -907,11 +946,8 @@ router.patch('/jobs/:id/reject', validate(Joi.object({ reason: Joi.string().min(
 router.patch('/jobs/:id/estimate/approve', async (req, res, next) => {
   try {
     logger.info('SPOC approve estimate · id=' + req.params.id);
-    const job = await jobService.getById(Number(req.params.id));
-    if (!job || job.fk_client_id !== req.spoc.client_id) {
-      logger.warn('Estimate-approve target not found / not owned · id=' + req.params.id);
-      return modernError(res, 404, 'job not found');
-    }
+    const job = await loadJobForWrite(req, res, 'Estimate-approve');
+    if (!job) return;
     if ([3, 5, 6].includes(job.job_status)) {
       logger.warn('Estimate-approve blocked · id=' + job.job_id + ' status=' + job.job_status);
       return modernError(res, 409, `cannot approve estimate on a ${job.job_status === 6 ? 'cancelled' : 'completed'} job`);
@@ -935,11 +971,8 @@ router.patch('/jobs/:id/estimate/approve', async (req, res, next) => {
 router.patch('/jobs/:id/estimate/reject', validate(Joi.object({ reason: Joi.string().min(3).max(500).required() })), async (req, res, next) => {
   try {
     logger.info('SPOC reject estimate · id=' + req.params.id);
-    const job = await jobService.getById(Number(req.params.id));
-    if (!job || job.fk_client_id !== req.spoc.client_id) {
-      logger.warn('Estimate-reject target not found / not owned · id=' + req.params.id);
-      return modernError(res, 404, 'job not found');
-    }
+    const job = await loadJobForWrite(req, res, 'Estimate-reject');
+    if (!job) return;
     if ([3, 5, 6].includes(job.job_status)) {
       logger.warn('Estimate-reject blocked · id=' + job.job_id + ' status=' + job.job_status);
       return modernError(res, 409, `cannot reject estimate on a ${job.job_status === 6 ? 'cancelled' : 'completed'} job`);
@@ -979,11 +1012,8 @@ router.post('/jobs/:id/cancel', validate(Joi.object({
   reasonId: Joi.number().integer().allow(null).optional(),
 })), async (req, res, next) => {
   try {
-    const job = await jobService.getById(Number(req.params.id));
-    if (!job || job.fk_client_id !== req.spoc.client_id) {
-      logger.warn('Client cancel — job not found / not owned · id=' + req.params.id);
-      return modernError(res, 404, 'job not found');
-    }
+    const job = await loadJobForWrite(req, res, 'Client cancel');
+    if (!job) return;
     if (job.job_status === 6) return modernError(res, 409, 'job is already cancelled');
     if ([3, 5].includes(job.job_status)) return modernError(res, 409, 'cannot cancel a completed job');
 
@@ -1013,8 +1043,8 @@ const clientImageUpload = multerClientImg({
 router.post('/jobs/:id/images', clientImageUpload.single('file'), async (req, res, next) => {
   const jobId = Number(req.params.id);
   try {
-    const job = await jobService.getById(jobId);
-    if (!job || job.fk_client_id !== req.spoc.client_id) return modernError(res, 404, 'job not found');
+    const job = await loadJobForWrite(req, res, 'Client image upload');
+    if (!job) return;
     const result = await jobImageService.uploadJobImage({ jobId, file: req.file, category: 'Booking' });
     modernOk(res, result, 'image uploaded');
   } catch (e) {
@@ -1052,11 +1082,8 @@ router.post('/jobs/:id/escalate', validate(Joi.object({
   comment: Joi.string().allow('').max(500).optional(),
 })), async (req, res, next) => {
   try {
-    const job = await jobService.getById(Number(req.params.id));
-    if (!job || job.fk_client_id !== req.spoc.client_id) {
-      logger.warn('Client escalate — job not found / not owned · id=' + req.params.id);
-      return modernError(res, 404, 'job not found');
-    }
+    const job = await loadJobForWrite(req, res, 'Client escalate');
+    if (!job) return;
     logger.info('Client escalate job · id=' + job.job_id + ' · reason=' + req.body.reasonId + ' · spoc=' + req.spoc.id);
     const escalatedBy = req.spoc.contact_name || null;
 
@@ -1345,14 +1372,28 @@ router.get('/contacts/managers',async (req, res, next) => {
 router.get('/cities', async (req, res, next) => {
   try {
     logger.info('List client cities · clientId=' + req.spoc.client_id);
+  /*
+   * ⚠ THE FILTER OPTIONS MUST MATCH THE ROWS THE FILTER CAN RETURN.
+   *
+   * This listed every city/SPOC on the CLIENT while the lists it filters are
+   * scoped to the caller's booking subtree, so a Store SPOC was offered
+   * choices that could only ever return zero rows — and an empty result reads
+   * as "this colleague has no jobs", not "you cannot see theirs". That is
+   * misinformation, not friction.
+   *
+   * Unrestricted callers are unaffected: hierarchyFilter returns undefined for
+   * allStores and top-of-tree, and the predicate collapses to TRUE.
+   */
+    const scope = scopePredicate(hierarchyFilter(await resolveClientHierarchy(req), req));
     const [rows] = await pool.query(
       `SELECT DISTINCT ci.city_name AS name
          FROM tbl_job j
          LEFT JOIN tbl_address a ON a.address_id = j.fk_address_id
          LEFT JOIN tbl_city    ci ON ci.city_id  = a.city_id
-        WHERE j.fk_client_id = ? AND ci.city_name IS NOT NULL AND ci.city_name <> ''
+        WHERE j.fk_client_id = ? AND ${scope.sql}
+          AND ci.city_name IS NOT NULL AND ci.city_name <> ''
         ORDER BY ci.city_name`,
-      [req.spoc.client_id]);
+      [req.spoc.client_id, ...scope.params]);
     logger.info('Returning ' + rows.length + ' cities');
     modernOk(res, { items: rows.map((r) => r.name) });
   } catch (e) { next(e); }
@@ -1368,6 +1409,25 @@ router.get('/team', async (req, res, next) => {
         WHERE client_id = ?
         ORDER BY contact_name`,
       [req.spoc.client_id]);
+    /*
+     * ⚠ TWO CONSUMERS, TWO NEEDS — WHICH IS WHY items STAYS CLIENT-WIDE.
+     *
+     * The Client Profile renders this as the company's SPOC DIRECTORY and
+     * genuinely wants everyone. The dashboard and Orders render it as the
+     * "viewing as" SPOC PICKER, which must only offer SPOCs whose book the
+     * caller can actually open — a manager could pick a colleague outside
+     * their subtree, hierarchyFilter would ignore the id, and the chip would
+     * name a scope the cards had not applied. The page states that rule about
+     * itself ("the chip and the cards must never disagree") and then broke it.
+     *
+     * So: the list keeps every contact, and each row says whether it is in the
+     * caller's scope. The picker filters on it; the directory ignores it. That
+     * is additive, so an older frontend keeps working unchanged — and a newer
+     * frontend against an older backend sees `undefined`, which it treats as
+     * in-scope rather than hiding every option.
+     */
+    const hier = await resolveClientHierarchy(req);
+    const scopeIds = hierarchyFilter(hier, req);
     const items = rows.map((r) => ({
       id: r.id,
       name: r.contact_name,
@@ -1377,10 +1437,11 @@ router.get('/team', async (req, res, next) => {
       managerId: r.manager_id,
       status: r.status,
       approvalByClient: r.approval_by_client,
+      inScope: !Array.isArray(scopeIds) || scopeIds.includes(Number(r.id)),
     }));
     // isManager drives the Orders "Client Team" filter: only reporting managers
     // (someone reports to them in the manager_id tree) get the team filter.
-    const { isManager } = await resolveClientHierarchy(req);
+    const { isManager } = hier;
     logger.info('Returning ' + items.length + ' team members · isManager=' + isManager);
     modernOk(res, { items, isManager });
   } catch (e) { next(e); }
@@ -3001,6 +3062,19 @@ router.get('/orders/counts', async (req, res, next) => {
  *   txAllocated    — status=0, fk_easyfixter_id IS NOT NULL
  *   ongoingOrders  — status=1
  */
+/*
+ * ⚠ PARKED, NOT DEAD — DO NOT DELETE ON A "NO CALLERS" SWEEP.
+ *
+ * Nothing in the portal calls this today, and a dead-code sweep will keep
+ * re-flagging it. Its caller is the "Committed Appointments" page, which was
+ * deliberately replaced by a ComingSoon stub whose own comment says the
+ * implementation "is preserved in git history; restore it with
+ * `git checkout <ref> -- ...`". Restore that page (src/app/(authed)/appointments/page.tsx,
+ * around dccf51f) and this endpoint is live again the same minute.
+ *
+ * It shares the one scope resolver, so when that page comes back its badges
+ * will already agree with the list beneath them.
+ */
 router.get('/appointments/counts', async (req, res, next) => {
   try {
     /*
@@ -3083,6 +3157,19 @@ router.get('/appointments/counts', async (req, res, next) => {
  *                     ready_for_billing = 'No'    (the "visit done" flag)
  *   completedOnApp  — status = 10
  */
+/*
+ * ⚠ PARKED, NOT DEAD — DO NOT DELETE ON A "NO CALLERS" SWEEP.
+ *
+ * Nothing in the portal calls this today, and a dead-code sweep will keep
+ * re-flagging it. Its caller is the "Completed & Under Audit" page, which was
+ * deliberately replaced by a ComingSoon stub whose own comment says the
+ * implementation "is preserved in git history; restore it with
+ * `git checkout <ref> -- ...`". Restore that page (src/app/(authed)/tickets/under-audit/page.tsx,
+ * around 8150dbf) and this endpoint is live again the same minute.
+ *
+ * It shares the one scope resolver, so when that page comes back its badges
+ * will already agree with the list beneath them.
+ */
 router.get('/under-audit/counts', async (req, res, next) => {
   try {
     /*
@@ -3160,6 +3247,19 @@ router.get('/under-audit/counts', async (req, res, next) => {
  * badges reflect what the user will see when they click a tab.
  *
  * Scoping: all three tabs use "my team's tickets" scope.
+ */
+/*
+ * ⚠ PARKED, NOT DEAD — DO NOT DELETE ON A "NO CALLERS" SWEEP.
+ *
+ * Nothing in the portal calls this today, and a dead-code sweep will keep
+ * re-flagging it. Its caller is the "Pending due to Client" page, which was
+ * deliberately replaced by a ComingSoon stub whose own comment says the
+ * implementation "is preserved in git history; restore it with
+ * `git checkout <ref> -- ...`". Restore that page (the buckets commented out in portal b166c9d,
+ * around b166c9d) and this endpoint is live again the same minute.
+ *
+ * It shares the one scope resolver, so when that page comes back its badges
+ * will already agree with the list beneath them.
  */
 router.get('/client-delay/counts', async (req, res, next) => {
   try {
@@ -3410,14 +3510,32 @@ router.get('/lookup/cities', async (req, res, next) => {
       );
       return modernOk(res, { items: rows });
     }
+  /*
+   * ⚠ THE FILTER OPTIONS MUST MATCH THE ROWS THE FILTER CAN RETURN.
+   *
+   * This listed every city/SPOC on the CLIENT while the lists it filters are
+   * scoped to the caller's booking subtree, so a Store SPOC was offered
+   * choices that could only ever return zero rows — and an empty result reads
+   * as "this colleague has no jobs", not "you cannot see theirs". That is
+   * misinformation, not friction.
+   *
+   * Unrestricted callers are unaffected: hierarchyFilter returns undefined for
+   * allStores and top-of-tree, and the predicate collapses to TRUE.
+   */
+  /*
+   * ?scope=all above is deliberately NOT scoped and must stay that way: it is
+   * the master city list for the New Order form, where the whole point is
+   * booking into a city you have no jobs in yet.
+   */
+    const hierScope = scopePredicate(hierarchyFilter(await resolveClientHierarchy(req), req));
     const [rows] = await pool.query(
       `SELECT DISTINCT ci.city_id AS id, ci.city_name AS name
          FROM tbl_job j
          LEFT JOIN tbl_address ad ON ad.address_id = j.fk_address_id
          LEFT JOIN tbl_city    ci ON ci.city_id    = ad.city_id
-        WHERE j.fk_client_id = ? AND ci.city_id IS NOT NULL
+        WHERE j.fk_client_id = ? AND ${hierScope.sql} AND ci.city_id IS NOT NULL
         ORDER BY ci.city_name ASC`,
-      [req.spoc.client_id]
+      [req.spoc.client_id, ...hierScope.params]
     );
     modernOk(res, { items: rows });
   } catch (e) { next(e); }
@@ -3433,12 +3551,34 @@ router.get('/lookup/cities', async (req, res, next) => {
 // tbl_job.reporting_contact_id. See clientJobFilters().
 router.get('/team/members', async (req, res, next) => {
   try {
+  /*
+   * ⚠ THE FILTER OPTIONS MUST MATCH THE ROWS THE FILTER CAN RETURN.
+   *
+   * This listed every city/SPOC on the CLIENT while the lists it filters are
+   * scoped to the caller's booking subtree, so a Store SPOC was offered
+   * choices that could only ever return zero rows — and an empty result reads
+   * as "this colleague has no jobs", not "you cannot see theirs". That is
+   * misinformation, not friction.
+   *
+   * Unrestricted callers are unaffected: hierarchyFilter returns undefined for
+   * allStores and top-of-tree, and the predicate collapses to TRUE.
+   */
+  /*
+   * The column here is tbl_client_contacts.id, not tbl_job.reporting_contact_id,
+   * so scopePredicate (which names the job column) does not fit — the same
+   * id set, spelled for this table.
+   */
+    const scopeIds = hierarchyFilter(await resolveClientHierarchy(req), req);
+    const scopeClause = Array.isArray(scopeIds)
+      ? `AND id IN (${scopeIds.length ? scopeIds.map(() => '?').join(',') : 'NULL'})`
+      : '';
     const [rows] = await pool.query(
       `SELECT id, contact_name AS name, contact_email AS email
          FROM tbl_client_contacts
         WHERE client_id = ? AND status = 1
+          ${scopeClause}
         ORDER BY contact_name ASC`,
-      [req.spoc.client_id]
+      [req.spoc.client_id, ...(Array.isArray(scopeIds) ? scopeIds : [])]
     );
     modernOk(res, { items: rows });
   } catch (e) { next(e); }
