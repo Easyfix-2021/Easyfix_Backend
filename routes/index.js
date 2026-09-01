@@ -109,6 +109,11 @@ router.use('/admin', require('./admin'));
 // route inside acts on req.user.user_id only; see routes/profile.js.
 router.use('/profile', require('./profile'));
 
+// Same '/profile' mount, separate router: the multipart photo surface. Paths do
+// not overlap ('/photo' exists in neither the other router nor this one twice),
+// so Express simply walks both. See routes/profile-photo.js.
+router.use('/profile', require('./profile-photo'));
+
 // Client Dashboard (SPOC) — auth via tbl_client_contacts + OTP.
 router.use('/client', require('./client'));
 

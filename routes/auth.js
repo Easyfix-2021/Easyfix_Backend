@@ -267,9 +267,36 @@ router.get('/me', requireAuth, async (req, res, next) => {
      */
     const allowedStages = await loadAllowedStages(req.user.user_id);
 
+    /*
+     * The header avatar. Resolved here because /auth/me is the one payload every
+     * authed page already has — the alternative is a second request from the
+     * navbar on every page load, or a 404 per page for the majority of users who
+     * have no photo.
+     *
+     * Cheap: presigning is a local signing operation, not a call to S3, so this
+     * adds no network round trip to identity resolution.
+     *
+     * FAIL-SOFT, and it must stay that way. /auth/me gates the entire
+     * application — every authed page waits on it — so an unconfigured or
+     * unreachable object store must cost the user their avatar and nothing else.
+     * null means "render initials", which is also the empty state, so the UI
+     * needs no separate degraded branch.
+     */
+    let photoUrl = null;
+    try {
+      const photos = require('../services/profile-photo.service');
+      const shot = await photos.getPhoto(req.user.user_id, pool);
+      photoUrl = (shot && shot.url) || null;
+    } catch (e) {
+      if (!e || e.code !== 'NO_PROFILE_PHOTO') {
+        logger.warn('Identity photo could not be resolved · userId=' + req.user.user_id
+          + ' · ' + ((e && e.code) || (e && e.message) || 'unknown'));
+      }
+    }
+
     logger.info('Returning identity · bypassScope=' + !!bypass + ' menuIds=' + ((permissions && permissions.menuIds && permissions.menuIds.length) || 0) + ' directReports=' + hierarchy.directReports.length + ' descendants=' + hierarchy.descendants.length + ' scheduledJobsAccess=' + scheduledJobsAccess + ' allowedStages=' + (allowedStages.mode === 'all' ? 'all' : allowedStages.stages.join(',')));
     modernOk(res, {
-      user: req.user,
+      user: { ...req.user, photo_url: photoUrl },
       role: role && {
         role_id: role.role_id,
         role_name: role.role_name,

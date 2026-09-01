@@ -391,8 +391,41 @@ async function getMyProfile(userId, runner = pool) {
     ? String(personal.date_of_birth).slice(0, 10)
     : null;
 
+  /*
+   * The avatar, resolved here so My Profile renders in ONE round trip instead
+   * of loading, then discovering it has a photo, then fetching it — which shows
+   * every returning user their own initials for a beat before the picture
+   * appears.
+   *
+   * FAIL-SOFT, deliberately, and it is the only fail-soft read on this endpoint.
+   * A presign needs S3 to be configured and reachable; an environment without it
+   * (or a transient failure) must cost the user their avatar, not their whole
+   * profile page. Every other field here comes from the database and has no such
+   * dependency, so nothing else earns the same treatment.
+   *
+   * Required inside the function rather than at module scope: profile-photo
+   * requires this module for nothing today, but a lazy require keeps that true
+   * even if it ever does.
+   */
+  let photoUrl = null;
+  try {
+    // eslint-disable-next-line global-require
+    const photos = require('./profile-photo.service');
+    const shot = await photos.getPhoto(userId, runner);
+    photoUrl = (shot && shot.url) || null;
+  } catch (e) {
+    // 404 NO_PROFILE_PHOTO is the normal state for most users, not a problem.
+    if (!e || e.code !== 'NO_PROFILE_PHOTO') {
+      logger.warn('Profile photo could not be resolved for the details payload · userId='
+        + userId + ' · ' + ((e && e.code) || (e && e.message) || 'unknown'));
+    }
+  }
+
   return {
     user_code:      user.user_code || null,
+    /* null = render the initials monogram. Never a placeholder image URL: a
+       broken <img> and "no photo set" must not look the same to the UI. */
+    photo_url:      photoUrl,
     mobile_no:      user.mobile_no || null,
     alternate_no:   user.alternate_no || null,
     personal_email: (personal && personal.personal_email) || null,
