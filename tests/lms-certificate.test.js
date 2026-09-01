@@ -41,18 +41,25 @@ test('no eligible row is a 404, never a blank certificate', async () => {
   await assert.rejects(() => svc.certificateData(3, 9), /no certificate available/);
 });
 
-test('all four "no certificate" conditions are in the one query', async () => {
+test('entitlement is the STAMP, not the course\'s current settings', async () => {
   fake.reset();
   await svc.certificateData(3, 9).catch(() => {});
   const sql = fake.calls.map((c) => c.sql).find((s) => /enrolment_id/.test(s)) || '';
-  assert.match(sql, /c\.status = 1/, 'a retired course must not certify');
-  assert.match(sql, /c\.certificate_enabled = 1/, 'the course must opt in');
-  assert.match(sql, /ec\.completion_date IS NOT NULL/, 'it must be finished');
+  assert.match(sql, /ec\.badge_earned_at IS NOT NULL/);
   assert.match(sql, /ec\.course_id = \?[\s\S]*ec\.easyfixer_id = \?/,
     'both the course and the technician must be named');
+  /*
+   * THE POINT OF THE CHANGE. Re-checking the course's live flags at download
+   * time let an admin revoke a certificate somebody had already earned, just by
+   * turning the toggle off or retiring the course.
+   */
+  assert.doesNotMatch(sql, /c\.certificate_enabled/,
+    'a flag flip must not revoke an earned certificate');
+  assert.doesNotMatch(sql, /c\.status = 1/,
+    'retiring a course must not revoke certificates already earned from it');
 });
 
-test('it rides the STAMPED completion, not the recomputed one', async () => {
+test('it rides a STAMP, never a recomputation', async () => {
   fake.reset();
   await svc.certificateData(3, 9).catch(() => {});
   const sql = fake.calls.map((c) => c.sql).find((s) => /enrolment_id/.test(s)) || '';
@@ -115,15 +122,6 @@ test('an IST datetime string is printed verbatim, never re-zoned', () => {
   assert.equal(formatDate('not a date'), '—');
 });
 
-test('the badge is derived — coursesForTech carries the course flag', () => {
-  const src = fs.readFileSync(path.join(ROOT, 'services/lms.service.js'), 'utf8');
-  const i = src.indexOf('async function coursesForTech');
-  assert.ok(i > 0);
-  assert.match(src.slice(i - 2000, i + 2000), /c\.certificate_enabled/,
-    'the trophy is (course opts in) AND (this technician finished it) — '
-    + 'there is no badge table to read instead');
-});
-
 test('REGRESSION: the certificate route validates BOTH path params', () => {
   /*
    * With validate(idParam) this route 400s on every request, because
@@ -150,7 +148,7 @@ test('the download is streamed, not JSON-wrapped, and not cached', () => {
     + 'line is already sent and an error can no longer become a 404');
 });
 
-test('the training report ships the fields the CRM needs to HIDE the button', () => {
+test('the training report ships the ONE field the CRM needs to HIDE the button', () => {
   /*
    * The download route is gated on three facts; the report row used to expose
    * only one of them, so the CRM could offer a certificate for a course that
@@ -162,6 +160,66 @@ test('the training report ships the fields the CRM needs to HIDE the button', ()
   const i = src.indexOf('async function trainingReport');
   assert.ok(i > 0, 'trainingReport must exist');
   const body = src.slice(i, i + 4000);
-  assert.match(body, /c\.certificate_enabled/, 'the course opt-in must reach the row');
-  assert.match(body, /c\.status AS course_status/, 'a retired course issues nothing');
+  assert.match(body, /ec\.badge_earned_at/,
+    'the download gates on the earn stamp, so the button must too');
+});
+
+/* ── Durability: the property the stamp exists to guarantee ───────────────── */
+
+test('the badge stamp only ever fills NULLs — an earn time is never rewritten', async () => {
+  fake.reset();
+  await svc.stampBadges({ efrIds: [9] });
+  const sql = fake.calls.map((c) => c.sql).find((x) => /badge_earned_at = \?/.test(x)) || '';
+  assert.match(sql, /ec\.badge_earned_at IS NULL/,
+    're-settling a completed course must not move the date it was earned');
+  assert.match(sql, /ec\.completion_date IS NOT NULL/, 'it must be finished');
+  assert.match(sql, /c\.certificate_enabled = 1/,
+    'the flag decides eligibility HERE, at earn time — and nowhere else');
+});
+
+test('the badge stamp refuses to run unscoped', async () => {
+  fake.reset();
+  const r = await svc.stampBadges({});
+  assert.equal(r.stamped, 0);
+  assert.equal(fake.calls.some((c) => /badge_earned_at = \?/.test(c.sql)), false,
+    'an unscoped run would back-date badges platform-wide the first time an '
+    + 'operator enables the flag on an old course');
+});
+
+test('the badge stamp narrows by course for the bulk path', async () => {
+  fake.reset();
+  await svc.stampBadges({ courseId: 3 });
+  const sql = fake.calls.map((c) => c.sql).find((x) => /badge_earned_at = \?/.test(x)) || '';
+  assert.match(sql, /ec\.course_id = \?/);
+  assert.doesNotMatch(sql, /ec\.easyfixer_id IN/);
+});
+
+test("the technician's course list ships the stamp, never the course flag", () => {
+  const src = fs.readFileSync(path.join(ROOT, 'services/lms.service.js'), 'utf8');
+  const i = src.indexOf('async function coursesForTech');
+  const block = src.slice(i - 2500, i + 1500);
+  assert.match(block, /ec\.badge_earned_at/);
+  /*
+   * Shipping certificate_enabled would let the app render a trophy for a course
+   * the technician has not earned — the flag says the course OFFERS one.
+   */
+  const projection = block.slice(block.indexOf('SELECT ec.course_id'), block.indexOf('FROM easyfixer_courses'));
+  assert.doesNotMatch(projection, /certificate_enabled/,
+    'the app must not be able to draw a trophy from the course\'s offer alone');
+});
+
+/* ── The technician's own download ────────────────────────────────────────── */
+
+test('the mobile certificate route takes NO technician id from the request', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'routes/mobile/lms.js'), 'utf8');
+  const i = src.indexOf("/courses/:courseId/certificate");
+  assert.ok(i > 0, 'the technician self-serve route must exist');
+  const block = src.slice(i, i + 1600);
+  assert.match(block, /req\.tech\.efr_id/, 'identity comes from the verified token');
+  assert.doesNotMatch(block, /req\.(params|query|body)\.(efrId|easyfixerId|efr_id)/,
+    'a request-supplied id would let any technician fetch another one\'s certificate');
+  assert.match(block, /application\/pdf/);
+  assert.match(block, /no-store/);
+  assert.match(block, /await lms\.certificateData[\s\S]*renderCertificatePdf/,
+    'fetch before piping — once the stream starts a 404 can no longer be sent');
 });

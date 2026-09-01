@@ -5,6 +5,7 @@ const validate = require('../../middleware/validate');
 const lms = require('../../services/lms.service');
 const { modernOk } = require('../../utils/response');
 const logger = require('../../logger');
+const { renderCertificatePdf } = require('../../utils/pdf-certificate');
 
 /*
  * LMS — technician API. Mounted at /api/mobile/lms, so every route here
@@ -31,6 +32,10 @@ const logger = require('../../logger');
  * content-aware replacement the Expo app calls, and keeping them apart means
  * neither retirement has to wait for the other.
  */
+
+const courseIdParam = Joi.object({
+  courseId: Joi.number().integer().positive().required(),
+});
 
 const contentIdParam = Joi.object({
   contentId: Joi.number().integer().positive().required(),
@@ -88,6 +93,50 @@ router.get('/assessments/:assessmentId', validate(assessmentIdParam, 'params'), 
     logger.info('Assessment requested · efrId=' + req.tech.efr_id + ' · assessmentId=' + req.params.assessmentId);
     modernOk(res, await lms.getAssessmentForTech(req.tech.efr_id, req.params.assessmentId));
   } catch (e) { next(e); }
+});
+
+/*
+ * The technician's own completion certificate, as a PDF.
+ *
+ * SELF-SCOPED BY CONSTRUCTION. The technician id comes from req.tech.efr_id and
+ * the URL carries only the course — there is no request shape that could ask
+ * for somebody else's certificate. That is the same rule as every other route
+ * on this router, and it matters more here: a certificate is a named document
+ * about a specific person.
+ *
+ * A 404 covers every "not yours / not earned" case without distinguishing
+ * them, so this cannot be used to probe who completed what.
+ *
+ * NOT modernOk() — the body is the document. Errors before the first byte
+ * become a normal JSON 404 via next(e); once the render begins the status line
+ * is already sent, which is why the data is fetched completely first and the
+ * render is the last statement.
+ */
+router.get('/courses/:courseId/certificate', validate(courseIdParam, 'params'), async (req, res, next) => {
+  try {
+    const efrId = req.tech.efr_id;
+    const courseId = Number(req.params.courseId);
+    logger.info('Certificate requested (technician) · efrId=' + efrId + ' · courseId=' + courseId);
+    const row = await lms.certificateData(courseId, efrId);
+
+    const safeName = String(row.course_name || 'course')
+      .replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'course';
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Content-Disposition',
+      `attachment; filename="EasyFix-Certificate-${safeName}.pdf"`);
+
+    renderCertificatePdf({
+      technician: { efr_name: row.efr_name, efr_no: row.efr_no },
+      course: { name: row.course_name },
+      completedOn: row.completion_date,
+      score: row.score,
+      stream: res,
+    });
+    return undefined;
+  } catch (e) {
+    return next(e);
+  }
 });
 
 /*

@@ -41,13 +41,34 @@
 --   per technician per course — and re-assignment preserves that id via
 --   ON DUPLICATE KEY UPDATE, so a re-assigned course cannot pay twice either.
 --
+-- ─── WHY THE BADGE IS STAMPED AND NOT DERIVED ──────────────────────────────
+--   The first cut computed the badge live from
+--       courses.certificate_enabled = 1 AND completion_date IS NOT NULL
+--   which tracks WHO and WHEN durably but leaves the eligibility half on a
+--   MUTABLE flag. Turning the toggle off — or retiring the course — would then
+--   retroactively erase every badge already earned, and revoke the certificates
+--   with them. That is wrong for a badge: a badge is something a technician
+--   holds, not something an admin switch can un-give.
+--
+--   easyfixer_courses.badge_earned_at fixes it by recording the moment. After
+--   that the flag governs only whether NEW completions earn one, earned badges
+--   survive any later edit, and "who earned what, and when" is a plain query
+--   rather than a re-derivation against today's settings.
+--
+--   NULL means "no badge" — either the course did not offer one when this
+--   technician finished, or they have not finished.
+--
 -- WHY THERE IS NO CERTIFICATE TABLE
 --   The certificate is rendered on demand from facts that already exist
---   (easyfixer_courses.completion_date, courses.name, tbl_easyfixer.efr_name),
---   so there is no issuance event to duplicate and generating it twice yields
---   the same document. Persisting it — or minting a serial — would create an
+--   (badge_earned_at, courses.name, tbl_easyfixer.efr_name), so there is no
+--   issuance event to duplicate and generating it twice yields the same
+--   document. Persisting the FILE — or minting a serial — would create an
 --   idempotency problem that does not otherwise exist. If a serial is ever
 --   demanded, use easyfixer_courses.id, the same value the award keys on.
+--
+--   Note the split: the ENTITLEMENT is stamped (badge_earned_at, above) because
+--   it must survive an admin's later edit; the DOCUMENT is not, because it is a
+--   pure function of that stamp.
 --
 -- DEFAULT 0, NOT NULL, for certificate_enabled
 --   Unlike reward_points there is no meaningful third state: a course either
@@ -71,12 +92,13 @@
 --   ON A RE-RUN, expect and ignore:
 --     ERROR 1060 (42S21): Duplicate column name 'reward_points'
 --     ERROR 1060 (42S21): Duplicate column name 'certificate_enabled'
+--     ERROR 1060 (42S21): Duplicate column name 'badge_earned_at'
 --
 -- IDEMPOTENCY
---   1. Preflight  read-only, always safe.
---   2/3. ALTERs   guarded by the preflight; re-running errors 1060, changes
---                 nothing.
---   4. Verify     read-only.
+--   1. Preflight    read-only, always safe.
+--   2/3/4. ALTERs   guarded by the preflight; re-running errors 1060, changes
+--                   nothing.
+--   5. Verify       read-only.
 --
 -- POST-APPLY
 --   Restart the backend. No backfill, no cache flush, no re-login. Every
@@ -85,12 +107,12 @@
 -- ============================================================================
 
 -- ─── 1. Preflight — which columns already exist? ────────────────────────────
--- Expect 0 rows on a fresh apply (run both ALTERs), 2 rows if fully applied.
+-- Expect 0 rows on a fresh apply (run all three ALTERs), 3 rows if applied.
 SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT
   FROM INFORMATION_SCHEMA.COLUMNS
  WHERE TABLE_SCHEMA = DATABASE()
-   AND TABLE_NAME = 'courses'
-   AND COLUMN_NAME IN ('reward_points', 'certificate_enabled');
+   AND ((TABLE_NAME = 'courses' AND COLUMN_NAME IN ('reward_points', 'certificate_enabled'))
+     OR (TABLE_NAME = 'easyfixer_courses' AND COLUMN_NAME = 'badge_earned_at'));
 
 -- ─── 2. Completion reward ───────────────────────────────────────────────────
 -- NULL or 0 = this course pays nothing. A positive value opts the course in
@@ -102,7 +124,12 @@ ALTER TABLE courses ADD COLUMN reward_points INT NULL;
 -- makes an e-certificate downloadable.
 ALTER TABLE courses ADD COLUMN certificate_enabled TINYINT NOT NULL DEFAULT 0;
 
--- ─── 4. Verification ────────────────────────────────────────────────────────
+-- ─── 4. Badge / certificate entitlement stamp ───────────────────────────────
+-- Set at the moment a technician completes a course that offers a certificate.
+-- NULL = no badge. Never cleared, so a later flag change cannot revoke one.
+ALTER TABLE easyfixer_courses ADD COLUMN badge_earned_at DATETIME NULL;
+
+-- ─── 5. Verification ────────────────────────────────────────────────────────
 -- Expect exactly two rows: reward_points int/YES/NULL, certificate_enabled
 -- tinyint/NO/0.
 SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT
@@ -124,3 +151,8 @@ SELECT COUNT(*)                                      AS total_courses,
 SELECT COUNT(*) AS course_awards
   FROM reward_points_ledger
  WHERE reason_code = 'COURSE';
+
+-- No badge can exist yet — nothing has been stamped. Expect 0.
+SELECT COUNT(*) AS badges_earned
+  FROM easyfixer_courses
+ WHERE badge_earned_at IS NOT NULL;

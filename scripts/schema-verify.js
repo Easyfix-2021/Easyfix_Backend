@@ -198,8 +198,12 @@ const EXPECTED = {
     'id', 'name', 'description', 'status', 'created_at', 'updated_at', 'is_mandatory',
     'reward_points', 'certificate_enabled',
   ],
+  // badge_earned_at: 2026-09-01-course-completion-rewards. The EARNED stamp —
+  // a badge/certificate entitlement, recorded so a later course edit cannot
+  // revoke one. Strict, like its two siblings on `courses`.
   easyfixer_courses: [
     'id', 'easyfixer_id', 'course_id', 'score', 'created_at', 'updated_at',
+    'badge_earned_at',
   ],
   /*
    * Course CONTENT (2026-08-26-lms-content-types-and-assessments.sql). These

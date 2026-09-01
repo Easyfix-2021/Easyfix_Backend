@@ -1090,6 +1090,74 @@ async function assignCourse(courseId, easyfixerIds = [], options = {}) {
  * Lazily required: rewards.service does not require this module today, but the
  * LMS↔rewards direction is exactly where a cycle would appear next.
  */
+/*
+ * Record that a badge was EARNED, so no later edit can un-earn it.
+ *
+ * The first cut derived the badge live from
+ *   courses.certificate_enabled = 1 AND ec.completion_date IS NOT NULL
+ * which tracks who and when durably, but leaves the eligibility half on a flag
+ * an admin can flip. Turning the toggle off — or retiring the course — then
+ * retroactively erased every badge already earned and revoked the certificates
+ * with them. A badge is something a technician holds; a switch must not be able
+ * to take it back.
+ *
+ * After this stamp the flag governs only whether NEW completions earn one, and
+ * "who earned what, when" is a plain query instead of a re-derivation against
+ * today's settings.
+ *
+ * Idempotent by the same rule as every other stamp here: only rows still NULL
+ * are touched, so re-settling a course changes nothing and the original earn
+ * time survives.
+ */
+async function stampBadges({ efrIds = null, courseId = null } = {}) {
+  const ids = efrIds == null ? null : [...new Set(efrIds.map(Number).filter(Number.isFinite))];
+  const course = Number(courseId) || null;
+  /* Same guard as the points award: an unscoped run would back-date badges
+   * across the whole platform the first time somebody enables a flag. */
+  if (ids === null && !course) return { stamped: 0 };
+  if (ids !== null && !ids.length) return { stamped: 0 };
+
+  const where = [
+    'ec.badge_earned_at IS NULL',
+    'ec.completion_date IS NOT NULL',
+    'c.certificate_enabled = 1',
+  ];
+  const params = [new Date()];
+  if (course) { where.push('ec.course_id = ?'); params.push(course); }
+  if (ids !== null) {
+    where.push(`ec.easyfixer_id IN (${ids.map(() => '?').join(',')})`);
+    params.push(...ids);
+  }
+  const [r] = await pool.query(
+    `UPDATE easyfixer_courses ec
+       JOIN courses c ON c.id = ec.course_id
+        SET ec.badge_earned_at = ?
+      WHERE ${where.join('\n        AND ')}`,
+    params,
+  );
+  if (r.affectedRows > 0) {
+    logger.info('Badges earned · rows=' + r.affectedRows
+      + ' · courseId=' + (course ?? 'any'));
+  }
+  return { stamped: r.affectedRows };
+}
+
+/*
+ * Both settlements, in the order that matters: the badge stamp FIRST, because
+ * the certificate reads it, and a technician who saw "complete" but could not
+ * download would file a ticket. Points can lag a tick; an entitlement cannot.
+ *
+ * Swallowed for the same reason settleCompletionPoints is — see below.
+ */
+async function settleBadges(scope) {
+  try {
+    return await stampBadges(scope);
+  } catch (e) {
+    logger.warn('Badge stamping failed · ' + JSON.stringify(scope) + ' · ' + e.message);
+    return { stamped: 0, failed: true };
+  }
+}
+
 async function settleCompletionPoints(scope) {
   try {
     return await require('./rewards.service').awardCourseCompletions(scope);
@@ -1113,6 +1181,7 @@ async function stampCourseCompletions(efrId) {
   if (r.affectedRows > 0) {
     logger.info('Training completion stamped · efrId=' + efrId + ' · courses=' + r.affectedRows);
   }
+  await settleBadges({ efrIds: [Number(efrId)] });
   await settleCompletionPoints({ efrIds: [Number(efrId)] });
   return { stamped: r.affectedRows };
 }
@@ -1173,9 +1242,11 @@ async function stampCompletionsForCourse(courseId, easyfixerIds = []) {
     logger.info('Assignment-time completion stamped · courseId=' + courseId
       + ' · alreadyComplete=' + r.affectedRows);
   }
-  await settleCompletionPoints(all
+  const badgeScope = all
     ? { courseId: Number(courseId) }
-    : { courseId: Number(courseId), efrIds: ids });
+    : { courseId: Number(courseId), efrIds: ids };
+  await settleBadges(badgeScope);
+  await settleCompletionPoints(badgeScope);
   return { stamped: r.affectedRows };
 }
 
@@ -1459,17 +1530,14 @@ async function trainingReport({
            e.efr_name AS technician_name, e.efr_no AS technician_mobile,
            c.name AS course_name,
            /*
-            * The certificate button on the report must be able to HIDE itself
-            * rather than 404 on click. certificateData() gates on
-            * (c.status = 1 AND c.certificate_enabled = 1 AND completion_date
-            * IS NOT NULL); the report row previously exposed only the third, so
-            * the CRM could offer a download for a course that does not issue
-            * one — or for a retired course — and the operator learned that from
-            * an error toast. Both halves ship here so the FE can gate on the
-            * same three facts the server checks.
+            * The certificate button must be able to HIDE itself rather than
+            * 404 on click, and this is now the ONE fact it needs: the download
+            * gates on badge_earned_at alone. It shipped as three columns
+            * briefly, back when the entitlement was re-derived from the
+            * course's live settings on every request — recording the earn
+            * instead collapsed the FE's gate to a null check.
             */
-           c.certificate_enabled,
-           c.status AS course_status,
+           ec.badge_earned_at,
            ${COURSE_ITEMS_TOTAL} AS videos_total,
            ${COURSE_ITEMS_DONE} AS videos_done`;
 
@@ -2702,23 +2770,25 @@ async function ackDocument(efrId, contentId) {
 /*
  * Everything a certificate prints, in one query — or a 404.
  *
- * FOUR ways this legitimately has no certificate, all of them a 404 rather
- * than a blank PDF: the enrolment does not exist, the course was retired, the
- * technician has not finished it, or the course does not offer a certificate.
- * Rendering an empty or half-filled document for any of those would put a
- * meaningless artifact in a technician's hands that looks official.
+ * ONE condition, because the entitlement is now a recorded fact rather than a
+ * re-derivation: badge_earned_at is set at the moment a technician completes a
+ * course that offered a certificate, and is never cleared.
  *
- * Reads the STAMPED completion_date, not the computed isTrainingComplete().
- * Those two can disagree — adding an item to a course makes the computed
- * answer regress while the stamp never un-stamps — and the stamped fact is
- * the one this codebase already rides for "overdue". Same rule, same reason:
- * a certificate that vanishes because an admin added a video next month is
- * worse than one issued against the course as it stood on the day.
+ * That single check subsumes what used to be four — enrolment exists, course
+ * active, course opted in, technician finished — AND fixes what they got wrong.
+ * Re-checking `certificate_enabled` and `c.status` at DOWNLOAD time meant an
+ * admin turning the toggle off, or retiring the course, revoked certificates
+ * from people who had already earned them. Nothing an operator does to a course
+ * next month can now unmake a certificate somebody earned last month.
+ *
+ * A missing row is still a 404 rather than a blank PDF: a half-filled document
+ * in a technician's hands looks official and says nothing true.
  */
 async function certificateData(courseId, efrId) {
   const [[row]] = await pool.query(
     `SELECT ec.id            AS enrolment_id,
             ec.completion_date,
+            ec.badge_earned_at,
             ec.score,
             c.name           AS course_name,
             e.efr_name,
@@ -2728,9 +2798,7 @@ async function certificateData(courseId, efrId) {
        JOIN tbl_easyfixer e  ON e.efr_id = ec.easyfixer_id
       WHERE ec.course_id = ?
         AND ec.easyfixer_id = ?
-        AND c.status = 1
-        AND c.certificate_enabled = 1
-        AND ec.completion_date IS NOT NULL`,
+        AND ec.badge_earned_at IS NOT NULL`,
     [Number(courseId), Number(efrId)],
   );
   if (!row) throw mkErr(404, 'no certificate available for this technician and course');
@@ -2747,14 +2815,16 @@ async function coursesForTech(efrId) {
             ${courseMandatory ? 'c.is_mandatory' : '0 AS is_mandatory'},
             ec.due_date, ec.completion_date, ec.score,
             /*
-             * The badge is a DERIVED VIEW, not a stored award: "this course
-             * offers a certificate" AND "this technician finished it". There
-             * is no badge table, no rows to keep in sync and no artwork to
-             * ship — the trophy the app renders is these two facts and the
-             * course's own name. A badges table would have to be backfilled
-             * from exactly this expression anyway.
+             * The EARNED STAMP, not the course's current flag. There is still
+             * no badge table — the trophy is this timestamp plus the course's
+             * own name — but the entitlement is recorded rather than re-derived,
+             * so a technician's badge cannot vanish because an admin edited the
+             * course after they earned it. NULL means no badge.
+             *
+             * certificate_enabled is deliberately NOT shipped: the app must not
+             * be able to render a trophy for a course somebody has not earned.
              */
-            c.certificate_enabled
+            ec.badge_earned_at
        FROM easyfixer_courses ec
        JOIN courses c ON c.id = ec.course_id
       WHERE ec.easyfixer_id = ? AND c.status = 1
@@ -2846,6 +2916,7 @@ async function coursesForTech(efrId) {
 }
 
 module.exports = {
+  stampBadges,
   certificateData,
   mandatoryVideoIdsSql,
   visibleVideoIdsSql,
