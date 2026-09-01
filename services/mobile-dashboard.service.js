@@ -41,6 +41,51 @@ const alertFlags = require('./job-offer-alert-flags');
 
 const NEW_REQUEST_LIMIT = 3;
 const ACTIVE_LIMIT = 2;
+
+/*
+ * WHICH DAY A JOB BELONGS TO — one expression, three buckets.
+ *
+ * "Today" is a question about the APPOINTMENT only until the technician starts
+ * the job. After that it is a question about the WORK: statuses 2 (in progress)
+ * and 20 (pending to close) mean they have checked in, and the appointment date
+ * stops describing anything. Bucketing those by appointment meant checking into
+ * a job booked for next week moved it OUT of "Today's Jobs" and into `upcoming`
+ * the moment work started — the technician started a job and watched it vanish
+ * from the only screen that lists it.
+ *
+ * But "started" is not the same as "started TODAY", and the difference is not
+ * academic: every started job in the QA database was checked into between 132
+ * and 287 days ago — abandoned work, not today's. Treating started-on-any-date
+ * as today would pin all of them to Home permanently, four of them on one
+ * technician. So a started job's day is the day it was STARTED.
+ *
+ * checkin_date_time carries that, and carries it reliably: of ~260k started or
+ * completed jobs, six have no stamp. Those six fall back to the appointment,
+ * which is what the column meant before check-in happened.
+ *
+ * A job the technician marks completed leaves by status, not by date — 3, 5 and
+ * 6 are not in the active set at all, so completion removes it from every
+ * bucket the same turn.
+ *
+ * Because all three buckets read this ONE expression, they still partition the
+ * technician's active jobs and `allJobs` can go on being their sum.
+ */
+const ACTIVE_STATUSES = '1,2,20';
+const STARTED_STATUSES = '2,20';
+const WORK_DATE_SQL = `DATE(CASE WHEN job_status IN (${STARTED_STATUSES})
+                                 THEN COALESCE(checkin_date_time, requested_date_time)
+                                 ELSE requested_date_time END)`;
+
+const isStarted = (row) => STARTED_STATUSES.split(',').includes(String(row?.job_status));
+
+/** The JS mirror of WORK_DATE_SQL, for the list half. */
+function workDateOf(row) {
+  if (!row) return null;
+  const raw = isStarted(row)
+    ? (row.checkin_date_time ?? row.requested_date_time)
+    : row.requested_date_time;
+  return raw == null ? null : raw;
+}
 const DEFAULT_NOTICES_LIMIT = 3;
 const MAX_NOTICES_LIMIT = 10;
 
@@ -96,6 +141,7 @@ async function getDashboard(efrId, opts = {}) {
     ident,
     newRequests,
     activeJobsList,
+    startedJobsList,
     attendance,
     performance,
     notices,
@@ -124,6 +170,22 @@ async function getDashboard(efrId, opts = {}) {
       easyfixerId: efrId,
       statuses: '1,2,20',
       dateType: 'requested',
+      startDate: today.start,
+      endDate: today.end,
+      limit: ACTIVE_LIMIT,
+    }).catch(() => ({ rows: [], total: 0 })),
+    /*
+     * Jobs the technician STARTED TODAY — the list half of the same rule the
+     * activeToday count applies, keyed on the check-in stamp. A job checked
+     * into ahead of its appointment is today's work and the requested-date
+     * query above cannot see it; a job checked into months ago is not, and an
+     * unbounded query would pin every abandoned one to Home for good.
+     * Merged below, started first.
+     */
+    jobService.list({
+      easyfixerId: efrId,
+      statuses: STARTED_STATUSES,
+      dateType: 'checkin',
       startDate: today.start,
       endDate: today.end,
       limit: ACTIVE_LIMIT,
@@ -204,8 +266,15 @@ async function getDashboard(efrId, opts = {}) {
     // slice to the preview size — guards against rows whose
     // requested_date_time falls outside the intended day (e.g. NULL or
     // a boundary edge) so "Today's Jobs" only ever previews today.
-    activeJobs:  (activeJobsList.rows  || [])
-      .filter(isRequestedToday)
+    // Started jobs lead — that is the work in hand — then today's scheduled
+    // ones. Both halves pass through `isTodaysWork`, the JS mirror of the SQL
+    // bucket rule, so a row with a NULL or boundary date cannot slip past the
+    // date range into a list that claims to be today's.
+    activeJobs:  dedupeById([
+      ...(startedJobsList.rows || []).filter(isStarted),
+      ...(activeJobsList.rows || []),
+    ])
+      .filter(isTodaysWork)
       .slice(0, ACTIVE_LIMIT)
       .map(mapJobForMobile),
     performance,
@@ -427,12 +496,28 @@ function todayRange() {
 // requested_date_time falls on the IST "today" date. Compares date
 // strings (YYYY-MM-DD) so it stays correct irrespective of the value's
 // time portion or the server timezone.
-function isRequestedToday(j) {
-  if (!j || j.requested_date_time == null) return false;
-  const today = istTodayString();
+/** First occurrence of each job_id wins — the caller orders by priority. */
+function dedupeById(rows) {
+  const seen = new Set();
+  return rows.filter((row) => {
+    const id = row?.job_id;
+    if (id == null || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+}
+
+/**
+ * Is this row today's work? The JS half of the bucket rule in `fetchDateCounts`
+ * — a started job is dated by its CHECK-IN, everything else by its appointment.
+ * Kept as one predicate so the list and the count cannot answer differently.
+ */
+function isTodaysWork(j) {
+  const workDate = workDateOf(j);
+  if (workDate == null) return false;
   const rowDay = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' })
-    .format(new Date(j.requested_date_time));
-  return rowDay === today;
+    .format(new Date(workDate));
+  return rowDay === istTodayString();
 }
 
 // ─── Date-sliced counts ──────────────────────────────────────────────
@@ -443,28 +528,34 @@ function isRequestedToday(j) {
  * consistent with the rest of the dashboard via the same
  * `fk_easyfixter_id = ?` filter.
  *
- *   activeToday    — IN_PROGRESS / SCHEDULED / IN_PROGRESS_ALT jobs
- *                    whose appointment is TODAY (requested date =
- *                    CURDATE()). Earlier the `<= CURDATE()` window
- *                    wrongly folded overdue (before-today) jobs into
- *                    this "today" count; those now surface in `delayed`.
- *                    (excludes sent-back jobs — those surface in
- *                    `actionRequired` instead).
- *   delayed        — same statuses, requested date is BEFORE today
- *                    (DATE(requested_date_time) < CURDATE()) — i.e.
- *                    overdue/carried-over jobs the tech still owns.
- *                    Distinct from `overdue` below, which is a
- *                    finer-grained "appointment instant already passed"
- *                    (NOW()) signal that can include today's earlier
- *                    slots.
- *   overdue        — same statuses, requested_date_time already
- *                    passed.
- *   upcoming       — same statuses, requested_date_time in the future.
+ *   activeToday    — active jobs whose WORK DATE is today (see
+ *                    WORK_DATE_SQL: check-in for a started job, the
+ *                    appointment otherwise). Excludes sent-back jobs —
+ *                    those surface in `actionRequired` instead.
+ *   delayed        — same statuses, work date BEFORE today: carried-over
+ *                    work the tech still owns, including a job started on
+ *                    an earlier day and never closed. Distinct from
+ *                    `overdue` below, which is the finer-grained
+ *                    "appointment instant already passed" (NOW()) signal
+ *                    and can include today's earlier slots.
+ *
+ *                    ⚠ NOTHING READS `delayed` (audited 2026-09-01 across
+ *                    every repo). The technician app's "Delayed" banner on
+ *                    the Jobs tab reads `counts.overdue`, not this. It
+ *                    exists to keep `allJobs` a sum, so if the bucket rule
+ *                    changes again, `overdue` is the count with a UI
+ *                    behind it and the one to re-check.
+ *   overdue        — same statuses, requested_date_time already passed.
+ *                    Deliberately still keyed on the APPOINTMENT, not the
+ *                    work date: "am I late" is a different question from
+ *                    "which day is this job's work", and a job started
+ *                    today against a Tuesday slot really is late.
+ *   upcoming       — same statuses, work date in the future.
  *   allJobs        — DERIVED (no extra SQL): activeToday + delayed +
  *                    upcoming — the tech's TOTAL non-completed/active jobs
- *                    across all dates (everything before Completed). The
- *                    three requested-date buckets partition the active
- *                    statuses by date, so their sum is the all-jobs count.
+ *                    across all dates (everything before Completed). All
+ *                    three read the SAME work-date expression, so they
+ *                    partition the active statuses and their sum holds.
  *   actionRequired — CRM has flagged a returned job for the tech to
  *                    re-handle (`send_back_to_tx = 1` AND `job_status
  *                    = 2`). Confirmed against live DB 2026-05-25 —
@@ -474,16 +565,16 @@ async function fetchDateCounts(efrId) {
   try {
     const [[row]] = await pool.query(
       `SELECT
-         COUNT(CASE WHEN job_status IN (1,2,20)
+         COUNT(CASE WHEN job_status IN (${ACTIVE_STATUSES})
                      AND (send_back_to_tx = 0 OR send_back_to_tx IS NULL)
-                     AND DATE(requested_date_time) = CURDATE() THEN 1 END) AS activeToday,
-         COUNT(CASE WHEN job_status IN (1,2,20)
+                     AND ${WORK_DATE_SQL} = CURDATE() THEN 1 END) AS activeToday,
+         COUNT(CASE WHEN job_status IN (${ACTIVE_STATUSES})
                      AND (send_back_to_tx = 0 OR send_back_to_tx IS NULL)
-                     AND DATE(requested_date_time) < CURDATE() THEN 1 END) AS \`delayed\`,
-         COUNT(CASE WHEN job_status IN (1,2,20)
-                     AND requested_date_time < NOW() THEN 1 END)           AS overdue,
-         COUNT(CASE WHEN job_status IN (1,2,20)
-                     AND DATE(requested_date_time) > CURDATE() THEN 1 END) AS upcoming,
+                     AND ${WORK_DATE_SQL} < CURDATE() THEN 1 END) AS \`delayed\`,
+         COUNT(CASE WHEN job_status IN (${ACTIVE_STATUSES})
+                     AND requested_date_time < NOW() THEN 1 END)  AS overdue,
+         COUNT(CASE WHEN job_status IN (${ACTIVE_STATUSES})
+                     AND ${WORK_DATE_SQL} > CURDATE() THEN 1 END) AS upcoming,
          COUNT(CASE WHEN send_back_to_tx = 1 AND job_status = 2 THEN 1 END) AS actionRequired
        FROM tbl_job
        WHERE fk_easyfixter_id = ?`,
@@ -631,4 +722,9 @@ function mapJobForMobile(j) {
 // the exact same identity row + defensive efr_profile_img fallback
 // WITHOUT duplicating the SQL. Behaviour is unchanged for getDashboard's
 // internal use.
-module.exports = { getDashboard, fetchIdentity };
+/*
+ * `_internals` exposes the "is this today's work" predicates so the rule can be
+ * asserted without a database. The count half lives in SQL and the list half in
+ * JS; these are the JS half, and they are the half that silently drops a job.
+ */
+module.exports = { getDashboard, fetchIdentity, _internals: { dedupeById, isStarted, isTodaysWork, workDateOf } };

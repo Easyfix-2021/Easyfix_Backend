@@ -49,6 +49,7 @@
 
 const { pool } = require('../db');
 const logger = require('../logger');
+const { persistedCategory } = require('../utils/job-image-buckets');
 
 // Job status codes (mirror services/job.service.js STATUS — duplicated as a
 // local const so this service has no circular dependency on job.service.js,
@@ -239,7 +240,10 @@ async function sendForApproval(jobId, efrId, { checkInImageRefs } = {}) {
         await conn.query(
           `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, created_date)
            VALUES (?, ?, ?, ?, NOW())`,
-          [jobId, String(ref).trim(), 'Booking', 0],
+          // Check-in evidence attached to an estimate. Stored under the one
+          // vocabulary every reader in the estate understands — see
+          // utils/job-image-buckets.js.
+          [jobId, String(ref).trim(), persistedCategory('Booking'), 0],
         );
       }
     }
@@ -267,6 +271,12 @@ async function sendForApproval(jobId, efrId, { checkInImageRefs } = {}) {
  * (matching the admin transaction-view STAGE_MAP: 5 → checkout). Multi-row
  * insert → transaction.
  *
+ * The category the app SENDS ('Booking' / 'Completion') is not the category
+ * STORED: `persistedCategory` maps it onto the legacy 'checkin' / 'checkout'
+ * vocabulary, so one column speaks one language. The S3 key convention is
+ * unchanged — it is a separate namespace and the presign path depends on its
+ * shape. See utils/job-image-buckets.js for why.
+ *
  * Returns { ok: true, inserted: <n> }.
  */
 async function recordImages(jobId, efrId, { category, refs }) {
@@ -291,7 +301,7 @@ async function recordImages(jobId, efrId, { category, refs }) {
       await conn.query(
         `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, created_date)
          VALUES (?, ?, ?, ?, NOW())`,
-        [jobId, ref, category, jobStage],
+        [jobId, ref, persistedCategory(category), jobStage],
       );
     }
     await conn.commit();

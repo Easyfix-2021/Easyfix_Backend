@@ -240,6 +240,7 @@ test('job proof detail returns bounded resolved media only and masks reviewer su
       if (/LOWER\(image_category\) IN \('completion'/.test(sql)) return [[
         { image_id: 2, image: 'secret-after-key', image_category: 'completion', job_stage: 5, created_date: '2026-08-12' },
       ]];
+      if (/LOWER\(image_category\) = 'feedback'/.test(sql)) return [[]];
       throw new Error(`unexpected SQL: ${sql}`);
     },
   };
@@ -276,13 +277,98 @@ test('job proof detail returns bounded resolved media only and masks reviewer su
     assert.equal(Object.hasOwn(result.proof.before[0], 'image'), false, 'raw storage field must not be returned');
     assert.equal(Object.hasOwn(result, 'customerMobile'), false);
     const proofCalls = calls.filter((sql) => /FROM tbl_job_image/.test(sql));
-    assert.equal(proofCalls.length, 2);
-    assert.ok(proofCalls.every((sql) => /LIMIT 10/.test(sql)), 'each proof bucket must cap URL signing work');
+    assert.equal(proofCalls.length, 3, 'two proof buckets plus the feedback document');
+    const bucketCalls = proofCalls.filter((sql) => /IN \(/.test(sql));
+    assert.equal(bucketCalls.length, 2);
+    assert.ok(bucketCalls.every((sql) => /LIMIT 10/.test(sql)), 'each proof bucket must cap URL signing work');
+    assert.ok(bucketCalls.every((sql) => /image NOT LIKE '%\.pdf'/.test(sql)),
+      'a PDF is a document and must never reach a photo tile');
     const detailCall = calls.find((sql) => /FROM tbl_job j/.test(sql));
     assert.match(detailCall, /SUM\(COALESCE\(tjt\.efr_charge, 0\)\)/,
       'detail calculation must use the canonical technician share');
     assert.match(detailCall, /TIMESTAMPDIFF\(SECOND, accepted\.offered_at, accepted\.responded_at\)/,
       'acceptance latency is derived from the accepted offer audit timestamps');
+  } finally {
+    s3Storage.resolveImageUrl = originalResolve;
+  }
+});
+
+/*
+ * Regression: job 529042 showed "Before 3 photos / After 1 photo" while the
+ * row set held 3 check-in photos, 6 check-out photos and one feedback PDF.
+ *
+ * The fixture above this one is why the defect shipped: it hands the service
+ * image_category 'booking' / 'completion' — the vocabulary THIS backend writes
+ * — so it passed while every row the field actually produces ('checkin' /
+ * 'checkout', both at job_stage 2) took the other path. The rows below are the
+ * real ones, and the stub EVALUATES the bucket predicate instead of answering
+ * per query, so a predicate that stops matching the data fails the test.
+ */
+const JOB_529042_IMAGE_ROWS = [
+  { image_id: 1622884, image: '529042_checkin_20260823060219.jpg', image_category: 'checkin', job_stage: 2, created_date: '2026-08-23 06:02:20' },
+  { image_id: 1622885, image: '529042_checkin_20260823060222.jpg', image_category: 'checkin', job_stage: 2, created_date: '2026-08-23 06:02:23' },
+  { image_id: 1622886, image: '529042_checkin_20260823060226.jpg', image_category: 'checkin', job_stage: 2, created_date: '2026-08-23 06:02:26' },
+  { image_id: 1622887, image: '529042_checkout_20260823060303.jpg', image_category: 'checkout', job_stage: 2, created_date: '2026-08-23 06:03:04' },
+  { image_id: 1622888, image: '529042_checkout_20260823060306.jpg', image_category: 'checkout', job_stage: 2, created_date: '2026-08-23 06:03:07' },
+  { image_id: 1622889, image: '529042_checkout_20260823060309.jpg', image_category: 'checkout', job_stage: 2, created_date: '2026-08-23 06:03:10' },
+  { image_id: 1622891, image: '529042_checkout_20260823060455.jpg', image_category: 'checkout', job_stage: 2, created_date: '2026-08-23 06:04:55' },
+  { image_id: 1622892, image: '529042_checkout_20260823060527.jpg', image_category: 'checkout', job_stage: 2, created_date: '2026-08-23 06:05:27' },
+  { image_id: 1622893, image: '529042_checkout_20260823060603.jpg', image_category: 'checkout', job_stage: 2, created_date: '2026-08-23 06:06:03' },
+  { image_id: 1623347, image: 'feedback529042.pdf', image_category: 'feedback', job_stage: 5, created_date: '2026-08-23 12:08:44' },
+];
+
+/** Apply a proof-bucket WHERE clause to the row set, the way MySQL would. */
+function runProofQuery(sql, rows) {
+  const inList = /LOWER\(image_category\) IN \(([^)]*)\)/.exec(sql);
+  const single = /LOWER\(image_category\) = '([^']*)'/.exec(sql);
+  const categories = new Set(
+    (inList ? inList[1] : single ? `'${single[1]}'` : '')
+      .split(',').map((v) => v.trim().replace(/^'|'$/g, '')).filter(Boolean),
+  );
+  const stageFallback = /job_stage = (\d+)/.exec(sql);
+  const excludesPdf = /image NOT LIKE '%\.pdf'/.test(sql);
+  const descending = /ORDER BY image_id DESC/.test(sql);
+  const limit = Number((/LIMIT (\d+)/.exec(sql) || [])[1] || rows.length);
+  const matched = rows.filter((row) => {
+    if (excludesPdf && /\.pdf$/i.test(row.image)) return false;
+    if (categories.has(String(row.image_category).toLowerCase())) return true;
+    return !!stageFallback && Number(row.job_stage) === Number(stageFallback[1]);
+  });
+  matched.sort((a, b) => (descending ? b.image_id - a.image_id : a.image_id - b.image_id));
+  return [matched.slice(0, limit)];
+}
+
+test('proof buckets follow the legacy checkin/checkout vocabulary, not job_stage', async () => {
+  const originalResolve = s3Storage.resolveImageUrl;
+  s3Storage.resolveImageUrl = async (key) => `https://media.invalid/${encodeURIComponent(key)}`;
+  const db = {
+    async query(sql) {
+      if (/SELECT j\.job_id/.test(sql)) return [[{
+        job_id: 529042, title: 'AC service', client_name: 'Hafele',
+        checkout_date_time: '2026-08-23 12:00:00', technician_earning: 697,
+        transaction_count: 1, gross_charge: 5597, easyfix_charge: 697,
+        client_charge: 5597, customer_rating: 5, reviewer_name: 'Uma Sharma',
+        age_days: 1, age_secs: 86400,
+      }]];
+      if (/FROM tbl_job_image/.test(sql)) return runProofQuery(sql, JOB_529042_IMAGE_ROWS);
+      throw new Error(`unexpected SQL: ${sql}`);
+    },
+  };
+  try {
+    const result = await phe.getJobDetail(8859, 529042, db);
+    assert.equal(result.proof.before.length, 3, 'every check-in photo is a before photo');
+    assert.equal(result.proof.after.length, 6, 'every check-out photo is an after photo');
+    const everyUrl = [...result.proof.before, ...result.proof.after].map((p) => p.url).join(' ');
+    assert.equal(/feedback529042\.pdf/.test(everyUrl), false,
+      'the customer feedback PDF is a document, not a proof photo');
+    assert.deepEqual(
+      result.proof.before.map((p) => p.imageId),
+      [1622884, 1622885, 1622886],
+      'before photos stay in capture order',
+    );
+    // The feedback PDF is not a proof photo — but it is not nothing either.
+    assert.match(result.customerFeedback.documentUrl, /feedback529042\.pdf/,
+      'the signed feedback form is exposed as a document, not as an after photo');
   } finally {
     s3Storage.resolveImageUrl = originalResolve;
   }

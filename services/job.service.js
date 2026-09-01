@@ -1620,6 +1620,12 @@ const DATE_TYPE_COLUMN = {
   completed: 'j.checkout_date_time',
   ticket:    'j.ticket_created_date_time',
   requested: 'j.requested_date_time',
+  // When the technician actually STARTED the job. For a job in progress this is
+  // the only date that means "now" — its appointment may be days either side,
+  // and the mobile Home screen has to ask "what am I working on today", not
+  // "what was booked for today". Written on every check-in and populated on
+  // essentially every started job (6 unstamped rows in 260k).
+  checkin:   'j.checkin_date_time',
 };
 
 /*

@@ -20,6 +20,7 @@ const {
   EXPORT_COLUMNS, fetchExportChunk, mapExportRow, UNAPPLIED_FILTERS, buildExportWhere,
 } = require('../../services/job-export.service');
 const { todayIst } = require('../../utils/ist-calendar');
+const { proofBucketOf } = require('../../utils/job-image-buckets');
 const ttlCache = require('../../utils/ttl-cache');
 
 /*
@@ -1190,7 +1191,17 @@ router.get('/:id/transaction', validate(idParam, 'params'), scopedJob, async (re
       4: 'signature',     signature: 'signature', cx_sign: 'signature', cxsign: 'signature',
       5: 'checkout',      checkout: 'checkout', checkin: 'start_job',
     };
+    /*
+     * Before/after comes from the SHARED classifier (utils/job-image-buckets),
+     * so 'booking' / 'unconfirmed' / 'completion' land in the right tile here
+     * by their own label instead of by the numeric fallback below — the same
+     * fallback that put a feedback PDF in the technician app's "after photos".
+     * The remaining five-way stage buckets stay local: they are the CRM's own
+     * taxonomy, not a proof-of-work question.
+     */
     const bucketFor = (row) => {
+      const proof = proofBucketOf(row);
+      if (proof) return proof === 'after' ? 'checkout' : 'start_job';
       const cat = String(row.image_category || '').toLowerCase().replace(/\s+/g, '_');
       if (cat && STAGE_MAP[cat]) return STAGE_MAP[cat];
       const st = Number(row.job_stage);

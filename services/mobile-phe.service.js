@@ -1,6 +1,12 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const s3Storage = require('../utils/s3-storage');
+const {
+  PROOF_AFTER_CATEGORIES,
+  PROOF_BEFORE_CATEGORIES,
+  proofBucketOf,
+  sqlCategoryList,
+} = require('../utils/job-image-buckets');
 const { OFFER_STATUS } = require('./offer-status');
 const {
   JOB_AGE_DAYS_EXPR,
@@ -22,6 +28,12 @@ const {
 const PROOF_IMAGE_RESOLUTION_CONCURRENCY = 4;
 const CANONICAL_JOB_PROOF_KEY = /^JobSupportings\/[A-Za-z][A-Za-z0-9]*_\d+_\d+$/;
 const UNDER_AUDIT_STATUS = 10;
+
+/*
+ * Before/after proof buckets. The vocabulary, the reasoning behind ignoring
+ * `job_stage`, and the PDF rule all live in utils/job-image-buckets.js so the
+ * CRM transaction view and this read model cannot drift apart again.
+ */
 
 /*
  * Status 10 is overloaded by the legacy application. QuickSight's canonical
@@ -718,12 +730,13 @@ async function getJobDetail(efrId, jobId, db = pool) {
   // Cap both SQL rows and URL-signing work. Reading each proof bucket
   // independently preserves the earliest "before" evidence and the latest
   // completion evidence even on jobs with a noisy historical image trail.
-  const [beforeResult, afterResult] = await Promise.all([
+  const [beforeResult, afterResult, feedbackDocResult] = await Promise.all([
     db.query(
       `SELECT image_id, image, image_category, job_stage, created_date
          FROM tbl_job_image
         WHERE job_id = ?
-          AND (LOWER(image_category) IN ('booking', 'before', 'checkin') OR job_stage = 0)
+          AND LOWER(image_category) IN (${sqlCategoryList(PROOF_BEFORE_CATEGORIES)})
+          AND image NOT LIKE '%.pdf'
         ORDER BY image_id ASC
         LIMIT 10`,
       [jobId],
@@ -732,9 +745,27 @@ async function getJobDetail(efrId, jobId, db = pool) {
       `SELECT image_id, image, image_category, job_stage, created_date
          FROM tbl_job_image
         WHERE job_id = ?
-          AND (LOWER(image_category) IN ('completion', 'after') OR job_stage = 5)
+          AND LOWER(image_category) IN (${sqlCategoryList(PROOF_AFTER_CATEGORIES)})
+          AND image NOT LIKE '%.pdf'
         ORDER BY image_id DESC
         LIMIT 10`,
+      [jobId],
+    ),
+    /*
+     * The customer's signed feedback form. It lives in tbl_job_image like the
+     * photos but is a DOCUMENT — 278k rows, every one a PDF — which is exactly
+     * why it must not be selected by either bucket above. Latest wins: a
+     * re-collected form supersedes the first. Nothing else reads it, so until
+     * now the one artefact stating what the customer actually signed off was
+     * reachable from no technician surface at all.
+     */
+    db.query(
+      `SELECT image_id, image, created_date
+         FROM tbl_job_image
+        WHERE job_id = ?
+          AND LOWER(image_category) = 'feedback'
+        ORDER BY image_id DESC
+        LIMIT 1`,
       [jobId],
     ),
   ]);
@@ -750,18 +781,31 @@ async function getJobDetail(efrId, jobId, db = pool) {
   // the same job's proof tiles.
   resolvedImages.forEach(({ image, url }) => {
     if (!url) return;
-    const category = String(image.image_category || '').toLowerCase();
     const item = {
       imageId: Number(image.image_id),
       url,
       createdAt: image.created_date || null,
     };
-    if (category === 'completion' || category === 'after' || Number(image.job_stage) === 5) {
-      proof.after.push(item);
-    } else if (category === 'booking' || category === 'before' || category === 'checkin' || Number(image.job_stage) === 0) {
-      proof.before.push(item);
-    }
+    // Same classifier the two bucket queries were built from, so the SQL and
+    // the in-memory split can never drift apart again.
+    const bucket = proofBucketOf(image);
+    if (bucket) proof[bucket].push(item);
   });
+
+  // Fails soft: a missing or unsignable document leaves the card exactly as it
+  // was rather than failing the whole job detail over an attachment.
+  const feedbackDocRow = (feedbackDocResult[0] || [])[0] || null;
+  let feedbackDocumentUrl = null;
+  if (feedbackDocRow) {
+    try {
+      feedbackDocumentUrl = await resolveProofImageUrl(feedbackDocRow.image);
+    } catch (error) {
+      logger.warn(
+        { err: error.message, jobId: Number(jobId), imageId: Number(feedbackDocRow.image_id) },
+        'PHE feedback document URL resolution failed',
+      );
+    }
+  }
 
   return {
     jobId: Number(row.job_id),
@@ -792,10 +836,13 @@ async function getJobDetail(efrId, jobId, db = pool) {
         reasonCode: 'NO_TECHNICIAN_ACTION_RECORDED',
       },
     } : null,
-    customerFeedback: row.customer_rating == null && !row.feedback ? null : {
+    customerFeedback: row.customer_rating == null && !row.feedback && !feedbackDocumentUrl ? null : {
       rating: row.customer_rating == null ? null : Number(row.customer_rating),
       comment: row.feedback || null,
       reviewerDisplayName: maskPersonName(row.reviewer_name),
+      // The signed feedback form, when one was collected. A short-lived
+      // presigned URL, same as every proof photo above.
+      documentUrl: feedbackDocumentUrl,
     },
     proof,
     bookedAt: row.ticket_created_date_time || null,
