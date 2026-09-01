@@ -35,6 +35,12 @@ let me = null;
 let contact = null;
 
 const ROUTES = [
+  // createUser now takes GET_LOCK('easyfix_emp_code', 5) around the employee-code
+  // duplicate check. An unrouted GET_LOCK returns no rows, which the service
+  // correctly reads as "not acquired" and turns into a 503 — so every create
+  // below would fail for a reason these tests are not about. 1 = acquired.
+  // The collision guard itself is characterized in tests/emp-code.test.js.
+  [/GET_LOCK/i, [{ got: 1 }]],
   // Must come BEFORE the tbl_user routes — "tbl_user_personal_details" would
   // otherwise be a substring hazard.
   [/FROM tbl_user_personal_details/i, () => (contact ? [contact] : [])],
@@ -80,7 +86,12 @@ async function runUpdate(fields, opts) {
 // ── 1. Add User — personal_email is REQUIRED ──────────────────────────────
 
 const CREATE_BASE = {
+  // user_code became MANDATORY on 2026-09-01 (operator-supplied, prefilled from
+  // GET /api/admin/users/next-emp-code). Present here only so these tests reach
+  // the personal_email checks they are actually about — the code's own rules
+  // live in tests/emp-code.test.js.
   user_name: 'Test User', official_email: 'test.user@easyfix.in', user_role: 2, createdBy: 99,
+  user_code: 'EF000123',
 };
 
 test('createUser REJECTS a missing personal_email — the service, not just the route, enforces it', async () => {
@@ -339,18 +350,18 @@ test('routes/admin/users.js Joi makes personal_email REQUIRED on create and form
 
   // CREATE — required, and the format is enforced.
   const missing = captured.createBody.validate({
-    user_name: 'Test User', official_email: 'a@easyfix.in', user_role: 2,
+    user_name: 'Test User', official_email: 'a@easyfix.in', user_role: 2, user_code: 'EF000123',
   });
   assert.ok(missing.error, 'create without personal_email is rejected by Joi too');
   assert.match(missing.error.message, /personal_email/);
 
   const bad = captured.createBody.validate({
-    user_name: 'Test User', official_email: 'a@easyfix.in', user_role: 2, personal_email: 'nope',
+    user_name: 'Test User', official_email: 'a@easyfix.in', user_role: 2, user_code: 'EF000123', personal_email: 'nope',
   });
   assert.ok(bad.error, 'malformed personal_email is rejected');
 
   const good = captured.createBody.validate({
-    user_name: 'Test User', official_email: 'a@easyfix.in', user_role: 2, personal_email: '  A.B@Gmail.com ',
+    user_name: 'Test User', official_email: 'a@easyfix.in', user_role: 2, user_code: 'EF000123', personal_email: '  A.B@Gmail.com ',
   });
   assert.equal(good.error, undefined);
   assert.equal(good.value.personal_email, 'a.b@gmail.com', 'Joi trims + lowercases it');

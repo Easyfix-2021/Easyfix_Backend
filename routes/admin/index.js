@@ -114,6 +114,14 @@ router.use('/menus',           require('./menus'));
 router.use('/products',        require('./products'));
 router.use('/users',           require('./users'));
 router.use('/roles',           require('./roles'));
+// HRMS → Approvals. The HR queue behind the self-service /api/profile surface:
+// one accumulating pending request per user (mobile / date of birth / bank),
+// approved or rejected as a unit. Action-key gated
+// (isProfileApprovalView / isProfileApprovalProcess).
+router.use('/profile-update-requests', require('./profile-update-requests'));
+// HRMS dashboard rail — upcoming birthdays from tbl_user_personal_details.
+// Month/day only; the birth year never leaves the database.
+router.use('/birthdays',       require('./birthdays'));
 // Per-user property-gated capability flags for the FE (canSwitchCallMode,
 // canDeleteEntities) — display-only; the gated routes enforce the allowlist
 // themselves. See routes/admin/access.js + services/feature-access.service.js.

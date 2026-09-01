@@ -32,6 +32,12 @@ let props = {};
 const CREATED_USER_ID = 9001;
 
 const fake = installFakePool([
+  // createUser now takes GET_LOCK('easyfix_emp_code', 5) around the employee-code
+  // duplicate check. An unrouted GET_LOCK returns no rows, which the service
+  // correctly reads as "not acquired" and turns into a 503 — so every create
+  // below would fail for a reason these tests are not about. 1 = acquired.
+  // The collision guard itself is characterized in tests/emp-code.test.js.
+  [/GET_LOCK/i, [{ got: 1 }]],
   [/FROM easyfix_properties/i, () =>
     Object.entries(props).map(([property_key, property_value]) => ({ property_key, property_value }))],
   [/SELECT role_id, role_name/i, [{ role_id: 2, role_name: 'Admin', role_status: 1, menu_ids: '' }]],
@@ -484,6 +490,11 @@ const CREATE_ARGS = {
   user_role: 2,
   personal_email: 'personal.inbox@gmail.com',
   createdBy: 99,
+  // MANDATORY since 2026-09-01 — operator-supplied, prefilled from
+  // GET /api/admin/users/next-emp-code. Present so these tests reach the
+  // provisioning and mail behaviour they are about; the code's own rules
+  // (format, collision, lock) live in tests/emp-code.test.js.
+  user_code: 'EF000123',
 };
 
 test('GUARD: the temp password reaches the Graph body and the mail body — and NOTHING else', async () => {

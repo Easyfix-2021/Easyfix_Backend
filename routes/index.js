@@ -103,6 +103,12 @@ router.use('/shared', require('./shared'));
 // Admin routes — requireAuth + role(['admin']) applied inside admin router.
 router.use('/admin', require('./admin'));
 
+// HRMS "My Profile" — SELF-SERVICE, for EVERY authenticated CRM user, so it
+// mounts here rather than under /admin (which is role-gated, scope-filtered and
+// mobile-masked — all three wrong for a user reading their own record). Every
+// route inside acts on req.user.user_id only; see routes/profile.js.
+router.use('/profile', require('./profile'));
+
 // Client Dashboard (SPOC) — auth via tbl_client_contacts + OTP.
 router.use('/client', require('./client'));
 

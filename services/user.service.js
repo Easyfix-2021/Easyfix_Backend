@@ -2,6 +2,16 @@ const { pool } = require('../db');
 const logger = require('../logger');
 const roleService = require('./role.service');
 const { parseAllowedRows, parseAllowedInput, NO_ACCESS_KEY } = require('../lib/job-stages');
+/*
+ * Employee code (tbl_user.user_code) — the format lives in ONE place. Never
+ * re-type the prefix-plus-six-digits pattern, and never hand-pad the count,
+ * here or in the route: import EMP_CODE_RE and formatEmpCode instead. See the
+ * header of lib/emp-code.js for why that matters more than usual: tbl_user has
+ * no UNIQUE index on user_code and we may not add one, so a drifted second copy
+ * of the regex would silently hand out a code that already exists.
+ * tests/emp-code.test.js fails the build if either signature reappears.
+ */
+const { EMP_CODE_RE, EMP_CODE_LOCK, parseEmpCode, nextEmpCode } = require('../lib/emp-code');
 // Microsoft 365 mailbox provisioning. Fail-soft + fail-closed by design — see
 // the call site in createUser() for the rules it must obey.
 const entraProvisioning = require('./entra-provisioning.service');
@@ -301,6 +311,15 @@ const MUTABLE_COLUMNS = Object.freeze([
   // own account. If renaming becomes a real ops need, add a dedicated
   // "transfer ownership" flow rather than a plain UPDATE.
   'mobile_no', 'alternate_no', 'user_role', 'city_id',
+  /*
+   * Employee code — operator-supplied and EDITABLE, unlike user_name and
+   * official_email above. The Add/Edit User form prefills it from
+   * GET /api/admin/users/next-emp-code and lets the operator change the count,
+   * so a typo has to be correctable after the fact. Uniqueness is probed in the
+   * loop below (see the user_code branch) because tbl_user has no UNIQUE index
+   * on it and adding one is forbidden.
+   */
+  'user_code',
   // Scope CSVs — drive row-level RBAC. Each accepts the legacy
   // wildcard "0" meaning "all". See lib/scope.js for the parser.
   'manage_clients', 'manage_cities', 'manage_states', 'manage_verticals',
@@ -533,6 +552,25 @@ async function getUserById(userId) {
   return row;
 }
 
+/*
+ * GET /api/admin/users/next-emp-code — the value the Add User form prefills.
+ *
+ * A SUGGESTION, NOT A RESERVATION, and the distinction is the whole reason the
+ * create path still locks and still probes. Nothing is held here: two admins
+ * who open the form at the same moment both get the same count, and whoever
+ * saves second is told the code is taken and picks another. Reserving instead
+ * would mean allocating a code to a form that is very often abandoned, leaving
+ * permanent holes in a sequence people read as a headcount.
+ *
+ * Reads on the POOL, not a pinned connection — correct precisely because it
+ * guarantees nothing about the future.
+ */
+async function suggestNextEmpCode() {
+  const code = await nextEmpCode(pool);
+  // parseEmpCode, not a second slice/parseInt — the parse has ONE home.
+  return { count: parseEmpCode(code), code };
+}
+
 // ─── Create ──────────────────────────────────────────────────────────
 /*
  * Uniqueness rules — enforced in app code, not in DB. tbl_user has no
@@ -545,6 +583,15 @@ async function getUserById(userId) {
 async function createUser({
   user_name, official_email, mobile_no, user_role,
   city_id, alternate_no,
+  /*
+   * MANDATORY, and OPERATOR-SUPPLIED — not generated here. The form prefills it
+   * from GET /api/admin/users/next-emp-code (a suggestion, which reserves
+   * nothing) and the operator may edit the count before saving, so two admins
+   * who open Add User at the same moment are genuinely handed the same value.
+   * The duplicate check inside the transaction below is the only thing between
+   * that and two users sharing a code.
+   */
+  user_code,
   manage_clients, manage_cities, manage_states, manage_verticals,
   reporting_manager,
   allowed_stages,
@@ -580,6 +627,20 @@ async function createUser({
    * change one and the other silently wins.
    */
   if (!user_role) throw mkErr(400, 'user_role is required');
+
+  /*
+   * Employee code FORMAT — enforced here as well as in the route's Joi, for the
+   * same reason personal_email is: requiredness and shape live in two layers in
+   * this codebase and the DEEPER one silently wins. Case-SENSITIVE on purpose;
+   * nothing normalises 'ef000123' up to 'EF000123', because a stored lowercase
+   * code would be invisible to parseEmpCode() and to every list filter that
+   * uses it. Reject it and let the operator retype.
+   */
+  const empCode = String(user_code || '').trim();
+  if (!empCode) throw mkErr(400, 'user_code is required');
+  if (!EMP_CODE_RE.test(empCode)) {
+    throw mkErr(400, `user_code must be "EF" followed by exactly 6 digits (e.g. EF000123) — got "${empCode}"`);
+  }
 
   /*
    * personal_email — REQUIRED here, and requiring it in the route's Joi schema
@@ -640,17 +701,80 @@ async function createUser({
    */
   const conn = await pool.getConnection();
   let r;
+  /*
+   * Tracks whether GET_LOCK actually SUCCEEDED, so the finally below releases
+   * exactly what we hold and nothing else. Releasing a lock we never acquired
+   * is not harmless bookkeeping: RELEASE_LOCK would return NULL here (we do not
+   * own it), but on a session that had legitimately taken the lock for another
+   * reason it would hand it away mid-write.
+   */
+  let empLockHeld = false;
   try {
     await conn.beginTransaction();
+
+    /*
+     * ── Employee-code collision guard ─────────────────────────────────────
+     *
+     * The lock is on THIS connection — the same one running the transaction —
+     * because MySQL named locks are CONNECTION-SCOPED. Taking it from the pool
+     * would pin an unrelated session and guard nothing at all.
+     *
+     * ⚠ THE RETURN VALUE MUST BE CHECKED. GET_LOCK returns 1 on success, 0 on
+     * TIMEOUT (all 5 seconds elapsed and someone else still holds it) and NULL
+     * on error. Only 1 means we hold it. Treating a 0 or a NULL as success is
+     * the entire bug this guard exists to prevent: the create would sail past a
+     * duplicate check that is racing another create, and both would INSERT the
+     * same user_code with no UNIQUE index to stop them.
+     *
+     * Number(null) === 0 and Number(undefined) is NaN, so `!== 1` rejects both
+     * the timeout and the error case without a second branch.
+     */
+    const [[lock]] = await conn.query('SELECT GET_LOCK(?, 5) AS got', [EMP_CODE_LOCK]);
+    if (Number(lock && lock.got) !== 1) {
+      logger.warn('Create user rejected · could not acquire ' + EMP_CODE_LOCK + ' within 5s · got=' + JSON.stringify(lock && lock.got));
+      throw mkErr(503, 'Could not reserve an employee code just now — another user is being created. Please retry.');
+    }
+    empLockHeld = true;
+
+    /*
+     * Deliberately NOT filtered by user_status or user_type_id, unlike the
+     * email/mobile probes above. An employee code identifies a PERSON for the
+     * life of the record: a deactivated ex-employee still owns theirs, and
+     * reissuing it would silently re-attribute their history in every report
+     * that joins on it. A recycled mobile number is fine; a recycled employee
+     * code is data corruption. This also keeps the probe consistent with
+     * nextEmpCode()'s MAX(), which scans the same unfiltered population — if
+     * the two disagreed, the suggestion would point straight at a code the
+     * check then rejects.
+     */
+    const [[dupCode]] = await conn.query(
+      'SELECT user_id FROM tbl_user WHERE user_code = ? LIMIT 1',
+      [empCode]
+    );
+    if (dupCode) {
+      logger.warn('Create user rejected · duplicate user_code · code=' + empCode + ' · heldBy=' + dupCode.user_id);
+      /*
+       * A DISTINCT machine-readable code, because this one call can 409 on the
+       * email, the mobile OR the employee code and the operator has to be told
+       * WHICH field to fix. Surfaced by the route as details.{code,field} — see
+       * the precedent in routes/admin/withdrawals.js.
+       */
+      const err = mkErr(409, `Employee code "${empCode}" is already in use — pick another`);
+      err.code  = 'USER_CODE_TAKEN';
+      err.field = 'user_code';
+      throw err;
+    }
+
     [r] = await conn.query(
       `INSERT INTO tbl_user
-         (user_name, official_email, mobile_no, alternate_no,
+         (user_code, user_name, official_email, mobile_no, alternate_no,
           user_role, user_type_id, city_id,
           manage_clients, manage_cities, manage_states, manage_verticals,
           reporting_manager,
           user_status, insert_date, updated_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?)`,
       [
+        empCode,
         // `mob || null` — store NULL, never '', for a mobile-less user. Matches
         // how the 7 existing mobile-less rows are stored, and keeps the
         // uniqueness probe above meaningful (NULL never equals NULL in SQL, so
@@ -668,6 +792,30 @@ async function createUser({
     await conn.rollback();
     throw e;
   } finally {
+    /*
+     * Released on EVERY path — commit, rollback, a throw from any statement
+     * above, and the 503 when the lock itself could not be taken (empLockHeld
+     * is false there, so this correctly does nothing).
+     *
+     * AFTER commit/rollback and BEFORE conn.release(), both load-bearing:
+     * releasing early would open the window between the duplicate check and the
+     * durable write that the lock exists to close, and releasing the CONNECTION
+     * first would return a lock-holding session to the pool. A named lock is
+     * dropped when its session ends, but a pooled connection does not end — it
+     * gets handed to the next request, which would then be holding a lock it
+     * knows nothing about until the process restarts.
+     *
+     * The release is itself wrapped: a failure to release must not mask the
+     * real error being thrown out of catch, and it must not turn a COMMITTED
+     * user into a reported failure.
+     */
+    if (empLockHeld) {
+      try {
+        await conn.query('SELECT RELEASE_LOCK(?) AS released', [EMP_CODE_LOCK]);
+      } catch (releaseErr) {
+        logger.warn('Employee-code lock release failed · ' + EMP_CODE_LOCK + ' · ' + releaseErr.message);
+      }
+    }
     conn.release();
   }
   // New active user could be a manager's direct report — invalidate so
@@ -878,7 +1026,15 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
   // never issue an UPDATE (no update_date bump, no updated_by churn,
   // no idempotent re-application of the same data on re-uploads).
   const [[me]] = await pool.query(
-    `SELECT user_id, user_type_id, mobile_no, alternate_no,
+    /*
+     * user_code is projected so the no-change short-circuit below can see it.
+     * Without it `me.user_code` is undefined, every PATCH that echoes the user's
+     * EXISTING code looks like a change, and the row gets a pointless UPDATE
+     * plus a duplicate probe on every save. (The probe would still be correct —
+     * it excludes the row being edited — but bumping update_date on a no-op is
+     * exactly what the short-circuit exists to prevent.)
+     */
+    `SELECT user_id, user_type_id, user_code, mobile_no, alternate_no,
             user_role, city_id,
             manage_clients, manage_cities, manage_states, manage_verticals,
             reporting_manager, user_status
@@ -978,6 +1134,61 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
         throw mkErr(409, `Another active user already uses mobile "${mob}"`);
       }
       val = mob;
+    }
+    if (key === 'user_code' && val) {
+      const code = String(val).trim();
+      if (!EMP_CODE_RE.test(code)) {
+        throw mkErr(400, `user_code must be "EF" followed by exactly 6 digits (e.g. EF000123) — got "${code}"`);
+      }
+      /*
+       * ── SELF-EXCLUSION — `user_id <> ?` ──────────────────────────────────
+       * This is the bug this shape of check usually ships with: without it, a
+       * user who re-saves the form with their OWN unchanged code matches their
+       * own row and gets told the code is taken, i.e. nobody can ever edit
+       * anything about themselves again.
+       *
+       * The equality short-circuit above ALREADY skips an unchanged code, so
+       * this looks redundant — it is not. It is the only guard that survives
+       * the short-circuit being bypassed (a bulk path that does not project
+       * user_code, a future caller that builds `sets` differently), and it was
+       * genuinely load-bearing until the SELECT above was widened to project
+       * user_code. Belt AND braces, deliberately.
+       *
+       * Unfiltered by status/type for the same reason as the create path: a
+       * code belongs to a person permanently, including an ex-employee's.
+       */
+      const [[dup]] = await pool.query(
+        'SELECT user_id FROM tbl_user WHERE user_code = ? AND user_id <> ? LIMIT 1',
+        [code, userId]
+      );
+      if (dup) {
+        logger.warn('Update user rejected · duplicate user_code · code=' + code + ' · heldBy=' + dup.user_id);
+        const err = mkErr(409, `Employee code "${code}" is already in use — pick another`);
+        err.code  = 'USER_CODE_TAKEN';
+        err.field = 'user_code';
+        throw err;
+      }
+      /*
+       * ponytail: check-then-UPDATE here is NOT under GET_LOCK, unlike the
+       * create path — a deliberate, bounded ceiling rather than an oversight.
+       * updateUser builds its SET list against the shared pool (no pinned
+       * connection and no transaction), so a named lock taken here would be
+       * acquired on one pool connection and the UPDATE issued on another,
+       * guarding nothing while looking like it guarded something.
+       *
+       * The residual race is also much narrower than the create one. Create
+       * races because the suggestion endpoint reserves nothing, so two admins
+       * opening Add User are HANDED the same code — the collision is the
+       * default outcome. To collide here two admins must independently TYPE the
+       * same code onto two different users within the same few milliseconds.
+       *
+       * Upgrade path if that ever shows up: pin updateUser onto a connection
+       * from pool.getConnection(), wrap it in a transaction, and reuse the
+       * create path's GET_LOCK(EMP_CODE_LOCK)/RELEASE_LOCK around the probe and
+       * the UPDATE — or hand the whole thing to withMysqlNamedLock, which
+       * already passes its pinned connection to the task.
+       */
+      val = code;
     }
     sets.push(`${key} = ?`);
     params.push(val === '' ? null : val);
@@ -1216,7 +1427,10 @@ async function buildHierarchyTree(rootUserId) {
 async function isMobileTakenByAnother(mobile, excludeUserId) {
   logger.info('Check mobile availability · excludeUserId=' + (excludeUserId || ''));
   const mob = String(mobile || '').trim();
-  if (!/^[0-9]{10}$/.test(mob)) return { available: false, reason: 'invalid' };
+  // Same canonical rule the routes enforce: an Indian mobile starts 6-9.
+  // A looser probe here would report a number 'available' that the create
+  // call then rejects, which reads to the operator as a backend bug.
+  if (!/^[6-9][0-9]{9}$/.test(mob)) return { available: false, reason: 'invalid' };
   const params = [mob, INTERNAL_USER_TYPE_ID];
   let sql = `SELECT user_id, user_name FROM tbl_user
               WHERE mobile_no = ? AND user_status = 1 AND user_type_id = ?`;
@@ -1325,6 +1539,9 @@ module.exports = {
   isMobileTakenByAnother,
   isEmailTakenByAnother,
   suggestAvailableEmail,
+  // Employee code — the prefill for the Add User form. The FORMAT itself lives
+  // in lib/emp-code.js and is imported, never re-declared, by both layers.
+  suggestNextEmpCode,
   findDescendantUserIds,
   buildHierarchyTree,
   // Job Stage Access — per-user allowed lifecycle stages.

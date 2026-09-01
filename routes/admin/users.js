@@ -9,6 +9,10 @@ const entraProvisioning = require('../../services/entra-provisioning.service');
 // mailbox-repair endpoint below; the create path calls it from the service.
 const welcomeMail = require('../../services/user-welcome-mail.service');
 const { STAGE_KEYS } = require('../../lib/job-stages');
+// Employee-code format. IMPORTED, never re-typed — lib/emp-code.js is the ONE
+// home for the regex, the parse and the padding (see its header for why a
+// drifted second copy would hand out a duplicate code).
+const { EMP_CODE_RE } = require('../../lib/emp-code');
 const { modernOk, modernError } = require('../../utils/response');
 const logger = require('../../logger');
 
@@ -55,6 +59,34 @@ const personalEmailCreateField = Joi.string().trim().lowercase().email().max(255
 const personalEmailUpdateField = Joi.string().trim().lowercase().email().max(255).allow('', null).optional();
 
 /*
+ * EMPLOYEE CODE — 'EF' + 6 digits, MANDATORY on create, editable on update.
+ *
+ * Prefilled, not generated: the form calls GET /api/admin/users/next-emp-code,
+ * renders 'EF' as a fixed chip (like the @easyfix.in suffix on Official Email)
+ * and lets the operator edit only the count. So the value arriving here is
+ * OPERATOR-SUPPLIED and a collision is a real case, not a theoretical one — the
+ * suggestion endpoint reserves nothing, so two admins opening the form at the
+ * same moment are handed the same count. The actual guard is the duplicate
+ * probe inside createUser's transaction, under GET_LOCK; this schema only
+ * decides shape.
+ *
+ * `.pattern(EMP_CODE_RE)` — no `.uppercase()`. Coercing 'ef000123' up would
+ * quietly accept a value the operator can see is wrong, and the point of a
+ * hand-editable identifier is that a typo fails loudly. The default Joi message
+ * for a pattern miss names the regex, which is not something to put in front of
+ * an operator, so both fields carry a written one.
+ *
+ * The service re-checks the same regex, on purpose. Requiredness and shape live
+ * in two layers in this codebase and the deeper one silently wins — see the
+ * mobile_no note in the personal-email matrix above.
+ */
+const EMP_CODE_MESSAGE = 'Employee Code must be "EF" followed by exactly 6 digits (e.g. EF000123)';
+const empCodeCreateField = Joi.string().trim().pattern(EMP_CODE_RE).required()
+  .messages({ 'string.pattern.base': EMP_CODE_MESSAGE, 'any.required': 'Employee Code is required' });
+const empCodeUpdateField = Joi.string().trim().pattern(EMP_CODE_RE).optional()
+  .messages({ 'string.pattern.base': EMP_CODE_MESSAGE });
+
+/*
  * /api/admin/users — Manage Users settings surface.
  *
  * Mount inherits:
@@ -81,8 +113,18 @@ const listQuery = Joi.object({
   sortDir:         Joi.string().lowercase().valid('asc', 'desc').default('asc'),
 });
 
+/*
+ * The canonical Indian-mobile rule, matching the CRM's INDIAN_MOBILE_REGEX in
+ * src/lib/format.ts. Staff numbers used to accept any ten digits, which let an
+ * operator save a number no SMS can reach — and tbl_user.mobile_no is an OTP
+ * LOGIN channel, so an unreachable one silently costs that employee one of
+ * their two ways in. Indian mobiles start 6-9; nothing else is a mobile.
+ */
+const INDIAN_MOBILE_REGEX = /^[6-9][0-9]{9}$/;
+
 const createBody = Joi.object({
   user_name:      Joi.string().trim().min(2).max(200).required(),
+  user_code:      empCodeCreateField,
   official_email: Joi.string().trim().lowercase().email().max(255).required(),
   /*
    * OPTIONAL as of 2026-08-03 (was .required()). tbl_user.mobile_no is nullable
@@ -96,8 +138,8 @@ const createBody = Joi.object({
    * their @easyfix.in mailbox does not exist they cannot log in at all. Keep
    * that in mind for anyone created without one.
    */
-  mobile_no:      Joi.string().trim().pattern(/^[0-9]{10}$/).allow('', null).optional(),
-  alternate_no:   Joi.string().trim().pattern(/^[0-9]{10}$/).allow('', null).optional(),
+  mobile_no:      Joi.string().trim().pattern(INDIAN_MOBILE_REGEX).allow('', null).optional(),
+  alternate_no:   Joi.string().trim().pattern(INDIAN_MOBILE_REGEX).allow('', null).optional(),
   user_role:      Joi.number().integer().positive().required(),
   city_id:        Joi.number().integer().positive().allow(null).optional(),
   // RBAC scope CSVs — comma-separated id strings (legacy varchar; no
@@ -114,8 +156,9 @@ const createBody = Joi.object({
 });
 
 const updateBody = Joi.object({
-  mobile_no:         Joi.string().trim().pattern(/^[0-9]{10}$/).optional(),
-  alternate_no:      Joi.string().trim().pattern(/^[0-9]{10}$/).allow('', null).optional(),
+  user_code:         empCodeUpdateField,
+  mobile_no:         Joi.string().trim().pattern(INDIAN_MOBILE_REGEX).optional(),
+  alternate_no:      Joi.string().trim().pattern(INDIAN_MOBILE_REGEX).allow('', null).optional(),
   user_role:         Joi.number().integer().positive().optional(),
   city_id:           Joi.number().integer().positive().allow(null).optional(),
   manage_clients:    Joi.string().allow('', null).optional(),
@@ -141,7 +184,7 @@ router.use(require('./users-bulk'));
 // validation — the operator finds out a mobile is taken before clicking
 // Save. Read-only, idempotent; safe for any admin-group user.
 const checkMobileQuery = Joi.object({
-  mobile:        Joi.string().trim().pattern(/^[0-9]{10}$/).required(),
+  mobile:        Joi.string().trim().pattern(INDIAN_MOBILE_REGEX).required(),
   excludeUserId: Joi.number().integer().positive().optional(),
 });
 router.get('/check-mobile', validate(checkMobileQuery, 'query'), async (req, res, next) => {
@@ -152,6 +195,37 @@ router.get('/check-mobile', validate(checkMobileQuery, 'query'), async (req, res
     );
     modernOk(res, result);
   } catch (e) { next(e); }
+});
+
+/*
+ * ─── Employee-code prefill ───────────────────────────────────────────
+ *
+ * GET /api/admin/users/next-emp-code → { count: 258124, code: 'EF258124' }
+ *
+ * Mounted BEFORE /:userId, like /check-mobile above, or Express hands
+ * "next-emp-code" to the param route and idParam rejects it as a non-integer.
+ *
+ * A SUGGESTION, NOT A RESERVATION. Nothing is held: two admins who open Add
+ * User at the same moment receive the same count, and the second one to save is
+ * told the code is taken. That is deliberate — reserving would burn codes on
+ * abandoned forms and leave permanent holes in a sequence people read as a
+ * headcount. The real guard is the duplicate probe inside createUser's
+ * transaction, under GET_LOCK.
+ *
+ * roleByName(['Admin']) — the same authority as POST / below. Only the
+ * canonical Admin role can create a user, so only they have any use for the
+ * next code; the read routes above are open to the whole admin group because
+ * they answer questions about data that role can already see.
+ */
+router.get('/next-emp-code', roleByName(['Admin']), async (req, res, next) => {
+  try {
+    const suggestion = await userService.suggestNextEmpCode();
+    logger.info('Next employee code suggested · code=' + suggestion.code);
+    modernOk(res, suggestion);
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
 });
 
 // ─── Real-time email uniqueness probe ───────────────────────────────
@@ -365,7 +439,15 @@ router.post('/', roleByName(['Admin']), validate(createBody), async (req, res, n
     }
     modernOk(res, created, message);
   } catch (e) {
-    if (e.status) return modernError(res, e.status, e.message);
+    /*
+     * `details` carries the machine-readable reason when the service set one.
+     * This call can 409 on THREE different fields — official_email, mobile_no
+     * and now user_code — and a bare message leaves the frontend guessing which
+     * input to mark. USER_CODE_TAKEN + field:'user_code' lets it attach the
+     * error to the Employee Code box specifically. Same shape as
+     * routes/admin/withdrawals.js.
+     */
+    if (e.status) return modernError(res, e.status, e.message, e.code ? { code: e.code, field: e.field } : undefined);
     next(e);
   }
 });
@@ -408,7 +490,9 @@ router.patch('/:userId',
       logger.info('User updated · userId=' + req.params.userId);
       modernOk(res, updated, 'User updated');
     } catch (e) {
-      if (e.status) return modernError(res, e.status, e.message);
+      // Same field-scoped 409 detail as the create path above — Edit User has
+      // the same Employee Code box and needs the error on the same input.
+      if (e.status) return modernError(res, e.status, e.message, e.code ? { code: e.code, field: e.field } : undefined);
       next(e);
     }
   }

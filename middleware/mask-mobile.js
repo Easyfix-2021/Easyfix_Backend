@@ -57,6 +57,26 @@ const { getProperty } = require('../services/properties.service');
  */
 const UNMASKED_PATH_PREFIXES = [
   '/users',          // list, detail, hierarchy, bulk-lookups, check-mobile/email
+  /*
+   * Profile update requests (2026-09-01). Same class of data as /users and the
+   * same reasoning: these are STAFF numbers, and the payload is one CRM user's
+   * own mobile awaiting HR approval.
+   *
+   * It is also not optional here. The whole screen exists so an approver can
+   * decide whether to write a number onto a colleague's record — and a decision
+   * about 9876•••••• is not a decision. Masked, the Approve button would be
+   * asking HR to rubber-stamp a value they were not shown.
+   *
+   * Left at route level rather than making the frontend append ?unmasked=true:
+   * the escape hatch works, but it puts the correctness of the screen in the
+   * caller's memory, and the next consumer of this route would silently get
+   * masked values back with no hint that they had opted out of anything.
+   *
+   * Scope is genuinely staff-only — the route reads tbl_user_profile_update_request,
+   * which has no customer or technician numbers in it — and access is already
+   * gated by isProfileApprovalView / isProfileApprovalProcess.
+   */
+  '/profile-update-requests',
 ];
 
 // Read-only audit/report surfaces never need edit-form prefill. Keep them
