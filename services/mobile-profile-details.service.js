@@ -3,6 +3,7 @@ const logger = require('../logger');
 const dashboardService = require('./mobile-dashboard.service');
 const performanceService = require('./performance.service');
 const jobService = require('./job.service');
+const { resolveServiceCategories } = require('./easyfixer-profile-update-link.service');
 
 /*
  * Mobile profile-details orchestrator — backs `GET /api/mobile/profile/details`.
@@ -180,10 +181,36 @@ async function getProfileDetails(efrId) {
     pincode:        extra?.efr_pin_no ?? null,
     membershipType: null,           // no such column on tbl_easyfixer
     memberSince:    extra?.insert_date ?? null,
-    categories:     ident?.efr_service_category
-      ? String(ident.efr_service_category).split(/[,|]/).map((s) => s.trim()).filter(Boolean)
-      : [],
+    /*
+     * NAMES, not the raw column. `efr_service_category` holds a category ID —
+     * on 2026-08-31 all 5,997 non-empty rows were a single numeric id, none a
+     * name — and splitting it on commas emitted that id as though it were a
+     * category. The app rendered it verbatim, so a technician's profile showed
+     * "21" where "Cycle & Fitness Machine Services" belonged.
+     *
+     * `resolveServiceCategories` is the resolver the profile-update magic-link
+     * form already uses on this same column: it maps numeric parts through
+     * tbl_service_catg, keeps non-numeric parts as literals (the column's older
+     * rows held names), preserves order and caches for 60s. Shared rather than
+     * reimplemented so the two readers of one messy column cannot disagree.
+     *
+     * FAIL-SOFT: a lookup failure returns the raw split rather than emptying
+     * the field — a stale id on screen is poor, but a section that silently
+     * vanishes is worse and much harder to notice.
+     */
+    categories:     await resolveCategoryNames(ident?.efr_service_category),
   };
+}
+
+async function resolveCategoryNames(raw) {
+  const value = String(raw || '').trim();
+  if (!value) return [];
+  try {
+    return await resolveServiceCategories(value, pool);
+  } catch (e) {
+    logger.warn({ err: e.message, value }, 'profile-details category resolve failed — falling back to raw');
+    return value.split(/[,|]/).map((s) => s.trim()).filter(Boolean);
+  }
 }
 
 module.exports = { getProfileDetails };

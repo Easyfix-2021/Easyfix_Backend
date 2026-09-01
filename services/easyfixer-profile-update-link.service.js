@@ -1169,4 +1169,9 @@ module.exports = {
   fetchDeepSkillCatalog,
   invalidateCatalogCaches,
   invalidateServiceCategoriesCache,
+  // Exposed for mobile-profile-details.service, which serves the same legacy
+  // column to the technician app. It lives here because the profile-update
+  // magic-link form needed it first; both callers must resolve that CSV the
+  // SAME way, and a second implementation is how they would drift apart.
+  resolveServiceCategories,
 };
