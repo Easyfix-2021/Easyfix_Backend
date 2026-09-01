@@ -46,6 +46,20 @@ const s3Storage = require('../../utils/s3-storage');
 const validate = require('../../middleware/validate');
 const { rateLimit } = require('../../middleware/rate-limit');
 const { getProperty } = require('../../services/properties.service');
+/*
+ * The shared public-call helpers. This file previously declared its own copies
+ * of all four — a byte-identical mapKnownError, the same failure sentence, the
+ * same cap constant, and a dailyBridgeCapReached whose SQL matched line for
+ * line. NOT persistBridgeCall, which stays local below: under the parameter
+ * renames it genuinely differs (a 'Customer' vs 'Caller' fallback name, and a
+ * receiver name that is not coalesced to null), so sharing it would be a
+ * behaviour change wearing a refactor's clothes.
+ */
+const {
+  mapKnownError,
+  dailyBridgeCapReached,
+  CALL_FAILED_PUBLIC_MSG,
+} = require('./_public-call');
 const logger = require('../../logger');
 const ttlCache = require('../../utils/ttl-cache');
 const candidateRanking = require('../../services/candidate-ranking.service');
@@ -102,53 +116,6 @@ async function verify(req) {
   const { jobId } = verifyJobToken(req.params.token);
   await requireUnconfirmedJob(jobId, pool);
   return jobId;
-}
-
-// Centralised error mapper for the thrown plain-object shape used by
-// verifyJobToken / requireUnconfirmedJob and the local logic below. Anything
-// without a `status` is treated as an unexpected server error and forwarded
-// to the global error handler via `next(e)`.
-function mapKnownError(res, next, e) {
-  if (e && typeof e.status === 'number') {
-    return modernError(res, e.status, e.message || 'request failed');
-  }
-  return next(e);
-}
-
-// Generic, provider-agnostic message returned to the PUBLIC client whenever a
-// bridge call fails for a real (non-suppressed) reason. The true diagnostic
-// (Kaleyra status, provider error, mis-normalised number) is logged
-// server-side only — never leaked to an unauthenticated magic-link client.
-const CALL_FAILED_PUBLIC_MSG = 'Could not place the call. Please try again.';
-
-// Per-job daily bridge-call cap. A leaked magic-link token is rate-limited per
-// the callRateLimit bucket (5 / 10 min) but that resets; this is a harder
-// ceiling on how many spoc+support bridge calls a single job can originate in
-// a rolling 24h window — cheap defence against a leaked token being used to
-// spam-dial. Counted from the tbl_job_caller_info rows Task 2 persists.
-const MAX_BRIDGE_CALLS_PER_JOB_PER_DAY = 10;
-
-// Returns true when the job is already at/over the daily bridge-call cap.
-// Counts CUSTOMER-initiated rows only (caller_id IS NULL — the signal Task 2
-// uses to mark a customer-originated bridge) inserted in the last 24h, so an
-// operator's own CRM click-to-calls don't burn the customer's public budget.
-// Best-effort: a count failure logs + returns false (fail-open) so a transient
-// DB hiccup never blocks a legitimate customer call.
-async function dailyBridgeCapReached(jobId) {
-  try {
-    const [[{ cnt }]] = await pool.query(
-      `SELECT COUNT(*) AS cnt
-         FROM tbl_job_caller_info
-        WHERE job_id = ?
-          AND caller_id IS NULL
-          AND inserted_time >= (NOW() - INTERVAL 1 DAY)`,
-      [jobId],
-    );
-    return Number(cnt) >= MAX_BRIDGE_CALLS_PER_JOB_PER_DAY;
-  } catch (e) {
-    logger.warn({ jobId, err: e && e.message }, 'magic-link: daily bridge-cap count failed — allowing call (fail-open)');
-    return false;
-  }
 }
 
 // Best-effort persist of a customer-initiated bridge call to
@@ -789,7 +756,7 @@ router.post(
       // Hard per-job daily ceiling on customer-initiated bridge calls — a
       // leaked token can't spam-dial beyond this even within the rate-limit
       // window. Checked before any provider work.
-      if (await dailyBridgeCapReached(jobId)) {
+      if (await dailyBridgeCapReached(jobId, { context: 'magic-link' })) {
         return modernError(res, 429, 'Call limit reached for this order today. Please try again later.');
       }
 
@@ -937,7 +904,7 @@ router.post(
 
       // Hard per-job daily ceiling on customer-initiated bridge calls. Shares
       // the same 24h budget as spoc-call (counts all caller_id IS NULL rows).
-      if (await dailyBridgeCapReached(jobId)) {
+      if (await dailyBridgeCapReached(jobId, { context: 'magic-link' })) {
         return modernError(res, 429, 'Call limit reached for this order today. Please try again later.');
       }
 

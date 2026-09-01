@@ -75,10 +75,23 @@ function mapKnownError(res, next, e) {
   return next(e);
 }
 
-// Returns true when the job is at/over the daily bridge-call cap. Counts
-// PUBLIC-initiated rows only (caller_id IS NULL) in the last 24h, so operators'
-// CRM click-to-calls don't burn the public budget. Fail-open on a count error.
-async function dailyBridgeCapReached(jobId, max = MAX_BRIDGE_CALLS_PER_JOB_PER_DAY) {
+/*
+ * Returns true when the job is at/over the daily bridge-call cap. Counts
+ * PUBLIC-initiated rows only (caller_id IS NULL) in the last 24h, so operators'
+ * CRM click-to-calls don't burn the public budget. Fail-open on a count error.
+ *
+ * `context` only labels the fail-open log line, and it earns its place: three
+ * flows now share this function (shared-job, magic-link job-completion, the
+ * technician app) and the thing you grep for when the cap silently stops
+ * working is which one was failing. job-completion.js carried a byte-identical
+ * private copy purely to keep its own 'magic-link:' prefix; a parameter buys
+ * that back without a second implementation to keep in step.
+ *
+ * An options object rather than positional args because `max` had never been
+ * passed by any caller — all four sites call this with a jobId alone — so a
+ * second positional would have been a trap the day someone needed both.
+ */
+async function dailyBridgeCapReached(jobId, { max = MAX_BRIDGE_CALLS_PER_JOB_PER_DAY, context = 'public-call' } = {}) {
   try {
     const [[{ cnt }]] = await pool.query(
       `SELECT COUNT(*) AS cnt
@@ -90,7 +103,7 @@ async function dailyBridgeCapReached(jobId, max = MAX_BRIDGE_CALLS_PER_JOB_PER_D
     );
     return Number(cnt) >= max;
   } catch (e) {
-    logger.warn({ jobId, err: e && e.message }, 'public-call: daily bridge-cap count failed — allowing call (fail-open)');
+    logger.warn({ jobId, err: e && e.message }, `${context}: daily bridge-cap count failed — allowing call (fail-open)`);
     return false;
   }
 }

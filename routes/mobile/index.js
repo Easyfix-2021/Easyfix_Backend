@@ -577,7 +577,9 @@ router.post('/jobs/:id/customer-call', async (req, res, next) => {
     const legs = await resolveMobileCallLegs(req, jobId);
     if (legs.error) return modernError(res, legs.error.status, legs.error.msg);
 
-    if (await dailyBridgeCapReached(jobId)) {
+    // 'mobile', not the 'public-call' default — this is the technician app,
+    // and the label is the thing you grep when the cap misbehaves.
+    if (await dailyBridgeCapReached(jobId, { context: 'mobile' })) {
       return modernError(res, 429, 'Call limit reached for this job today. Please try again later.');
     }
 
