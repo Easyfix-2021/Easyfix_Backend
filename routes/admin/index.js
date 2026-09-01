@@ -134,6 +134,12 @@ router.use('/config',          require('./config'));
 // JSON archive). Gated PER-USER by the easyfix_properties allowlist
 // (access.entitydelete.emails) — NOT RBAC. See routes/admin/entity-deletion.js.
 router.use('/entity-deletion', require('./entity-deletion'));
+// Admin Actions → Re-Key Encrypted Fields. Bulk re-wrap of every field-crypto
+// data key: rotate to a new operational key, recover from a lost one, or
+// re-seal to a new recovery key. RBAC-gated per route (isFieldRekeyRun /
+// isRecoveryKeyManage), no-store, hard rate limits, one audit row per run.
+// See routes/admin/field-rekey.js for the private-key handling rules.
+router.use('/field-rekey',     require('./field-rekey'));
 router.use('/rate-cards',      require('./rate-cards'));
 router.use('/quotations',      require('./quotations'));
 router.use('/questionnaires',  require('./questionnaires'));

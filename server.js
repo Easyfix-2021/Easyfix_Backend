@@ -333,6 +333,39 @@ async function start() {
     logger.warn(`LMS schema probe could not be primed — ${err.message}`);
   }
 
+  /*
+   * POINT THE FIELD ENCRYPTION AT THE RECOVERY KEY IN THE DATABASE.
+   *
+   * Without this call the store is WRITE-ONLY: an operator generates a new
+   * recovery keypair in Admin Actions, the UI reports success, the row lands in
+   * tbl_field_recovery_key — and every value written afterwards is still sealed
+   * to whatever EASYFIX_FIELD_RECOVERY_PUBLIC_KEY holds. The screen would be
+   * lying, and nothing would say so until someone needed break-glass and found
+   * their new private key opened nothing.
+   *
+   * Resolution order inside field-crypto is: active database row → the env var
+   * → fail closed. So this is what makes the database the source of truth, and
+   * env the bootstrap for a host that has never registered one.
+   *
+   * NON-FATAL on purpose. A failure here leaves the env key in force, which is
+   * a valid recovery path — just not the newest one. Refusing to boot over it
+   * would turn "the newest recovery key is not loaded" into a total outage,
+   * which is the worse of the two.
+   *
+   * The returned descriptor carries a FINGERPRINT and a source, never key
+   * material, so logging it is safe — and it is the only way to answer "which
+   * recovery key is this replica sealing to?" without decrypting something.
+   */
+  try {
+    const fieldCrypto = require('./lib/field-crypto');
+    const { recoveryKeyStore } = require('./services/field-rekey.service');
+    const desc = await fieldCrypto.resolveRecoveryPublicKey(recoveryKeyStore());
+    logger.info(`Field recovery key loaded · fingerprint=${desc.fingerprint} source=${desc.source}`);
+  } catch (err) {
+    logger.warn(`Field recovery key could not be resolved from the database — `
+      + `falling back to EASYFIX_FIELD_RECOVERY_PUBLIC_KEY · ${err.message}`);
+  }
+
   const server = app.listen(PORT, () => {
     const env = process.env.NODE_ENV || 'development';
     logger.ready(`Server is ready — listening on http://localhost:${PORT} (${env} mode)`);

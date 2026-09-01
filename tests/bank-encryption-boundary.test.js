@@ -67,7 +67,20 @@ const ALLOWED = new Set([
  * list, and unlike a name list it admits every correct caller automatically
  * while rejecting the careless one by default.
  */
-const CRYPTO_HELPERS = ['encryptBank', 'decryptBank'];
+const CRYPTO_HELPERS = [
+  'encryptBank', 'decryptBank',
+  // The re-key primitives move a protected value across the boundary too — they
+  // unwrap and re-wrap the DEK. Added 2026-09-01 when services/field-rekey.service.js
+  // arrived: it consumes them correctly and never handles a plaintext, but the guard
+  // flagged it because this list did not yet know they existed.
+  //
+  // Note what is NOT on this list: isEncrypted, maskAccountNumber, maskName. Those
+  // INSPECT a value without moving it, so importing one must not buy a file the right
+  // to write these columns. The list is "functions that carry the secret through the
+  // boundary", not "anything exported by lib/field-crypto.js" — which is why it is
+  // enumerated by hand rather than derived from the module's exports.
+  'rewrapToOperationalKey', 'resealToRecoveryKey',
+];
 
 function walk(dir) {
   const out = [];

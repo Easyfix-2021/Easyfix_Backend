@@ -3,9 +3,10 @@
 --
 -- ⚠ TWO OF THESE COLUMNS HOLD CIPHERTEXT, NOT VALUES. bank_account_number and
 --   bank_account_name are written and read ONLY through lib/field-crypto.js
---   (AES-256-GCM, `v1:<iv>:<tag>:<ct>`). Their widths and the extra
---   bank_account_last4 column below exist for that reason. Full rationale in
---   the column notes; the sibling audit table is
+--   (ENVELOPE ENCRYPTION —
+--   `v2:<op_fp>:<rec_fp>:<dek_iv>:<dek_tag>:<dek_ct>:<sealed_dek>:<iv>:<tag>:<ct>`).
+--   Their widths and the extra bank_account_last4 column below exist for that
+--   reason. Full rationale in the column notes; the sibling audit table is
 --   2026-09-01-hrms-03-create-tbl-sensitive-reveal-log.sql.
 --
 -- WHY HERE AND NOT ON tbl_user: tbl_user is the LEGACY table shared by five
@@ -32,23 +33,51 @@
 --                      grants exactly ONE free self-service set while this is
 --                      NULL; every later change goes through the approval
 --                      queue in tbl_user_profile_update_request.
--- bank_account_number  VARCHAR(255), holding a CIPHERTEXT, not a number. Indian
+-- bank_account_number  VARCHAR(2048), holding an ENVELOPE, not a number. Indian
 --                      account numbers run 9–18 digits and leading zeros are
 --                      significant, so the plaintext was always a STRING rather
---                      than an INT — but what actually lands here is the
---                      `v1:<iv>:<tag>:<ct>` envelope produced by
---                      lib/field-crypto.js, which is roughly 4x the plaintext
---                      (base64 of a 12-byte IV + a 16-byte tag + the payload).
---                      32 characters could not hold it; 255 fits the widest
---                      account number this feature accepts with room to spare,
---                      and lib/field-crypto refuses to emit anything longer so
---                      a non-STRICT host can never truncate a ciphertext into
---                      an undecryptable one.
+--                      than an INT — but what actually lands here is the v2
+--                      envelope produced by lib/field-crypto.js.
+--
+--                      WHY 2048 AND NOT 255. The envelope carries a per-value
+--                      DATA KEY twice over: wrapped under the operational key,
+--                      and sealed to an RSA-4096 RECOVERY PUBLIC KEY so the
+--                      value survives the operational key being lost. That
+--                      sealed copy alone is 512 bytes → 684 base64 characters.
+--                      Fixed overhead, in characters:
+--                            'v2'                             2
+--                            9 colons                         9
+--                            2 key fingerprints (8 hex each)  16
+--                            dek iv    12 B → ceil(12/3)*4    16
+--                            dek tag   16 B                   24
+--                            dek ct    32 B                   44
+--                            sealed dek 512 B                684
+--                            value iv  12 B                   16
+--                            value tag 16 B                   24
+--                            ────────────────────────────── = 835
+--                      plus the value at ceil(n/3)*4 for n PLAINTEXT BYTES.
+--                      Worst case is the 120-CHARACTER holder-name limit at 4
+--                      UTF-8 bytes per character: 480 B → 640 chars → 1475
+--                      total. 2048 is that number rounded up with real headroom
+--                      (573 chars ≈ 429 more plaintext bytes), because the
+--                      alternative to headroom is another ALTER on a table five
+--                      services read. A 32-digit account number is 879.
+--                      lib/field-crypto refuses to emit anything longer than
+--                      2048 (MAX_CIPHERTEXT_CHARS), so a non-STRICT host can
+--                      never truncate an envelope into an undecryptable one —
+--                      THOSE TWO NUMBERS MUST BE CHANGED TOGETHER.
+--                      Left on the table's default charset rather than forced to
+--                      ascii: the content is pure base64 so ascii would be
+--                      honest and would quarter the declared byte width, but
+--                      InnoDB DYNAMIC stores a long varchar off-page anyway, so
+--                      it buys nothing real and introduces a mixed-collation
+--                      comparison hazard that does not exist today.
 --                      Deliberately NOT indexed and NOT unique — a joint or
 --                      family account legitimately repeats across employees,
---                      and a random IV per value makes two rows holding the
---                      same account number differ anyway, so an index on this
---                      column could not answer a single useful question.
+--                      and a random IV and a random data key per value make two
+--                      rows holding the same account number differ anyway, so
+--                      an index on this column could not answer a single useful
+--                      question.
 -- bank_ifsc            VARCHAR(16), CLEAR. An IFSC is exactly 11 characters
 --                      (AAAA0BBBBBB); 16 is headroom, and the FORMAT is
 --                      enforced in the application
@@ -59,7 +88,7 @@
 --                      branch code, identical for every employee banking at
 --                      that branch. Encrypting it would protect nothing and
 --                      would make the column ungroupable and undebuggable.
--- bank_account_name    VARCHAR(255), holding a CIPHERTEXT. The name as it
+-- bank_account_name    VARCHAR(2048), holding an ENVELOPE. The name as it
 --                      appears at the bank, which is NOT always
 --                      tbl_user.user_name — that mismatch is the single most
 --                      common cause of a rejected payout, so it is captured
@@ -67,8 +96,14 @@
 --                      it is the PII that ties an account number to a person:
 --                      the number alone is a string, the number plus the holder
 --                      is a payment instruction. Widened from 120 for the same
---                      ~4x envelope reason as the account number; the PLAINTEXT
---                      limit stays 120 and is enforced in the application.
+--                      envelope reason as the account number, and it is this
+--                      column that SETS the width: the arithmetic above is
+--                      driven by the 120-character name limit, not by the
+--                      32-character account limit. The PLAINTEXT limit stays 120
+--                      CHARACTERS and is enforced in the application — which is
+--                      not 120 bytes, and the difference is the whole reason
+--                      the worst case above is computed at 4 bytes per
+--                      character rather than 1.
 -- bank_account_last4   VARCHAR(4), CLEAR, and clear ON PURPOSE. The masked
 --                      display ('••••1234') is what every list and profile read
 --                      renders, and deriving those four digits from the
@@ -91,10 +126,21 @@
 -- Encrypting the whole family would buy nothing and cost every grouping, every
 -- ORDER BY and every "which branch is this" support question.
 --
--- THE KEY IS NOT IN THE DATABASE. It is env EASYFIX_FIELD_ENC_KEY (32 raw bytes,
--- base64). A dump of this table without that env var yields no account numbers.
--- That is the entire threat model this buys: it does NOT protect against an
--- attacker who has the application's environment, and it is not meant to.
+-- THE OPERATIONAL KEY IS NOT IN THE DATABASE. It is env EASYFIX_FIELD_ENC_KEY
+-- (32 raw bytes, base64). A dump of this table without that env var yields no
+-- account numbers. That is the entire threat model this buys: it does NOT
+-- protect against an attacker who has the application's environment, and it is
+-- not meant to.
+--
+-- ── THE SECOND DOOR, AND WHY IT DOES NOT WEAKEN THE FIRST ───────────────
+-- Every envelope also carries its data key SEALED TO A RECOVERY PUBLIC KEY, so
+-- losing or rotating the operational key is not a data-loss event. That costs
+-- nothing in confidentiality: the seal can only be OPENED by the recovery
+-- PRIVATE key, which lives in the owner's notes and has never been on a server,
+-- in this repository, or in any environment. A dump of this table plus the whole
+-- application environment still yields nothing through that door — which is
+-- precisely why the recovery key had to be asymmetric rather than a second
+-- shared secret. See the header of lib/field-crypto.js.
 --
 -- All six are NULLABLE with no DEFAULT. Requiredness is an APPLICATION rule
 -- (routes/admin + services), exactly as personal_email is: a NOT NULL column
@@ -132,7 +178,7 @@ BEGIN
        AND column_name = 'bank_account_number'
   ) THEN
     ALTER TABLE tbl_user_personal_details
-      ADD COLUMN bank_account_number VARCHAR(255) NULL DEFAULT NULL AFTER date_of_birth;
+      ADD COLUMN bank_account_number VARCHAR(2048) NULL DEFAULT NULL AFTER date_of_birth;
   END IF;
 
   IF NOT EXISTS (
@@ -152,7 +198,7 @@ BEGIN
        AND column_name = 'bank_account_name'
   ) THEN
     ALTER TABLE tbl_user_personal_details
-      ADD COLUMN bank_account_name VARCHAR(255) NULL DEFAULT NULL AFTER bank_ifsc;
+      ADD COLUMN bank_account_name VARCHAR(2048) NULL DEFAULT NULL AFTER bank_ifsc;
   END IF;
 
   IF NOT EXISTS (
@@ -174,6 +220,41 @@ BEGIN
     ALTER TABLE tbl_user_personal_details
       ADD COLUMN bank_account_last4 VARCHAR(4) NULL DEFAULT NULL AFTER bank_name;
   END IF;
+
+  -- ── WIDEN AN EXISTING-BUT-NARROW CIPHERTEXT COLUMN ──────────────────────
+  -- An earlier draft of this same file created these two at VARCHAR(255), which
+  -- was correct for the single-key `v1:` envelope and is 1220 characters short
+  -- of the v2 one. The existence probes above are ADD-only: on a host that
+  -- already has the columns they are skipped, the column stays at 255, and the
+  -- first real write is TRUNCATED — silently, on any host not in STRICT mode —
+  -- into an envelope that fails its GCM tag forever after. That is an
+  -- unrecoverable row produced by a request that returned 200.
+  --
+  -- So the width is repaired here rather than left to the post-apply note below,
+  -- because a note is only read by someone who already suspects a problem.
+  -- Guarded on the LENGTH, so this is a no-op on a correct host and cannot
+  -- narrow anything: MODIFY only ever runs when the column is too small.
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_schema = DATABASE()
+       AND table_name = 'tbl_user_personal_details'
+       AND column_name = 'bank_account_number'
+       AND character_maximum_length < 2048
+  ) THEN
+    ALTER TABLE tbl_user_personal_details
+      MODIFY bank_account_number VARCHAR(2048) NULL DEFAULT NULL;
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_schema = DATABASE()
+       AND table_name = 'tbl_user_personal_details'
+       AND column_name = 'bank_account_name'
+       AND character_maximum_length < 2048
+  ) THEN
+    ALTER TABLE tbl_user_personal_details
+      MODIFY bank_account_name VARCHAR(2048) NULL DEFAULT NULL;
+  END IF;
 END$$
 
 DELIMITER ;
@@ -183,12 +264,12 @@ DROP PROCEDURE _ensure_hrms_personal_detail_columns;
 
 -- ── Read-only post-apply verification ─────────────────────────────────
 -- Must list all six new columns alongside the original three, and the two
--- encrypted ones must read character_maximum_length = 255. A 32 or a 120 there
--- means an OLDER version of this file was applied to this host first: the
--- ciphertext will not fit, and on a non-STRICT server it will be TRUNCATED
--- rather than rejected — silently unrecoverable. Widen before writing anything:
---   ALTER TABLE tbl_user_personal_details MODIFY bank_account_number VARCHAR(255) NULL DEFAULT NULL;
---   ALTER TABLE tbl_user_personal_details MODIFY bank_account_name   VARCHAR(255) NULL DEFAULT NULL;
+-- encrypted ones must read character_maximum_length = 2048. Anything smaller —
+-- 32, 120 or 255 — means the MODIFY guards above did not run, and the first real
+-- write will be TRUNCATED rather than rejected on a non-STRICT server, which is
+-- silently unrecoverable. Do not write anything until this reads 2048:
+--   ALTER TABLE tbl_user_personal_details MODIFY bank_account_number VARCHAR(2048) NULL DEFAULT NULL;
+--   ALTER TABLE tbl_user_personal_details MODIFY bank_account_name   VARCHAR(2048) NULL DEFAULT NULL;
 SELECT column_name, data_type, character_maximum_length, is_nullable
   FROM information_schema.columns
  WHERE table_schema = DATABASE()
@@ -196,11 +277,16 @@ SELECT column_name, data_type, character_maximum_length, is_nullable
  ORDER BY ordinal_position;
 
 -- Nothing may be readable here. Once the feature is live this must return only
--- `v1:`-prefixed envelopes and NULLs — a bare account number in either column
+-- `v2:`-prefixed envelopes and NULLs — a bare account number in either column
 -- means a write bypassed lib/field-crypto.js, which is a defect, not a variant.
+-- The two fingerprint fields are shown because they are safe to print (8 hex
+-- chars of a SHA-256 digest, not key material) and because they answer the two
+-- questions an incident starts with: which operational key would read this row,
+-- and which recovery key from the owner's notes could break-glass it.
 SELECT user_id,
-       LEFT(bank_account_number, 3) AS acct_prefix,
-       LEFT(bank_account_name, 3)   AS name_prefix,
+       SUBSTRING_INDEX(bank_account_number, ':', 3) AS acct_scheme_and_keys,
+       SUBSTRING_INDEX(bank_account_name,   ':', 3) AS name_scheme_and_keys,
+       LENGTH(bank_account_number) AS acct_len,
        bank_account_last4, bank_ifsc, bank_name
   FROM tbl_user_personal_details
  WHERE bank_account_number IS NOT NULL
