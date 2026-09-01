@@ -12,9 +12,16 @@
  *      test in this file, ship green, and leave those rows readable in the
  *      column forever — there is no later migration that un-leaks a dump.
  *
- *   2. EVERY WRITE HAS A RECOVERY PATH. A row sealed to no recovery key looks
- *      completely normal and is discovered on the single day it matters, so the
- *      absence of a recovery key is a WRITE OUTAGE rather than a degraded write.
+ *   2. THE SEAL IS OPTIONAL, AND OPTIONAL IS NOT BEST-EFFORT. This system runs
+ *      with ONE key by the owner's decision, so a write with NO recovery key
+ *      configured produces a SELF-DESCRIBING UNSEALED envelope rather than
+ *      throwing. The distinction that matters, and the one pinned hardest below:
+ *      a recovery key that IS configured and then FAILS to seal must still
+ *      throw. "None configured" is the only permitted no-seal case — anything
+ *      else would silently drop a break-glass path in an environment that has
+ *      one, and nothing downstream could ever tell the two apart.
+ *      The corollary is pinned too: an unsealed row is not a dead end. It can be
+ *      given a seal later with only the OPERATIONAL key.
  *
  *   3. THE RECOVERY PATH ACTUALLY WORKS, WITH ONLY THE PRIVATE KEY. Decrypting
  *      with the operational key absent or wrong is the entire promise of the
@@ -74,7 +81,8 @@ process.env.EASYFIX_FIELD_RECOVERY_PUBLIC_KEY =
 const {
   encryptField, decryptField, isEncrypted, maskAccountNumber, maskName,
   recoverField, rewrapField, rewrapToOperationalKey, resealToRecoveryKey,
-  resolveRecoveryPublicKey, recoveryKeyByFingerprint,
+  sealToRecoveryKey, resolveRecoveryPublicKey, recoveryKeyByFingerprint,
+  NO_SEAL,
 } = require('../lib/field-crypto');
 
 const ACCOUNT = '50100123456789';
@@ -249,9 +257,11 @@ test('a blank encrypts to null and decrypts to null — but the KEYS are still c
   return withKey(undefined, () => {
     assert.throws(() => encryptField(''), (e) => e.code === 'FIELD_ENC_UNAVAILABLE');
     assert.throws(() => decryptField(''), (e) => e.code === 'FIELD_ENC_UNAVAILABLE');
-    // …and the same for the recovery key, on the write side.
+    // The RECOVERY key is a different matter: absent is a supported
+    // configuration, so a blank is simply a blank. The operational gate above is
+    // the one a blank must not be able to skip.
     return withKey(KEY, () => withRecoveryPublic(undefined, () => {
-      assert.throws(() => encryptField(''), (e) => e.code === 'FIELD_ENC_UNAVAILABLE');
+      assert.equal(encryptField(''), null);
     }));
   });
 });
@@ -309,29 +319,106 @@ test('a SHORT or MALFORMED operational key is treated exactly like a missing one
   }
 });
 
-test('a MISSING recovery public key throws on WRITE — no row is written without a recovery path', async () => {
+test('NO recovery key configured is a SUPPORTED write — an unsealed envelope, not an outage', async () => {
   /*
-   * THE property behind the whole break-glass design. A row written with no
-   * sealed DEK looks exactly like every other row. Nothing about it is wrong
-   * until the operational key is gone, at which point it is the one value that
-   * cannot be recovered — and by then the write that caused it is months old.
-   * So it is an outage, now, loudly.
+   * THE OWNER'S DECISION, PINNED. One key, no recovery keypair anywhere. An
+   * earlier build refused every write in this state, which turned the chosen
+   * configuration into an outage.
+   *
+   * What must hold instead: the write succeeds, the value round-trips, and the
+   * envelope SAYS SO — a sentinel where the recovery fingerprint goes and an
+   * empty sealed field. Nothing is silently missing; the row describes itself.
    */
-  const ct = encryptField(ACCOUNT);
+  const sealedCt = encryptField(ACCOUNT);
   await withRecoveryPublic(undefined, () => {
+    const ct = encryptField(ACCOUNT);
+    assert.equal(typeof ct, 'string', 'a write with no recovery key must SUCCEED');
+    assert.equal(decryptField(ct), ACCOUNT, 'and round-trip on the operational key');
+
+    const p = parts(ct);
+    assert.equal(p.length, 10, 'still ten fields — the grammar did not change');
+    assert.equal(p[0], 'v2', 'still v2');
+    assert.equal(p[1], fpOf(KEY), 'still names the operational key');
+    assert.equal(p[2], NO_SEAL, 'the recovery slot carries the sentinel');
+    assert.equal(p[6], '', 'and the sealed DEK is empty');
+    // The wrap and the value are untouched by the absence — same lengths as ever.
+    assert.equal(Buffer.from(p[5], 'base64').length, 32, 'the DEK is still wrapped');
+    assert.equal(Buffer.from(p[7], 'base64').length, 12);
+
+    // Reads of rows written EARLIER, when a key WAS configured, keep working —
+    // the recovery key is a write-side input and never a read-side one.
+    assert.equal(decryptField(sealedCt), ACCOUNT);
+  });
+});
+
+test('the unsealed sentinel PARSES, and cannot be confused with a truncated envelope', async () => {
+  /*
+   * The reason the shape is `-` plus an EMPTY field rather than just a dropped
+   * field. A parser must be able to tell "written with no recovery key" from
+   * "this row lost a field somewhere", because the first is normal and the
+   * second is corruption, and treating either as the other is how a bad row
+   * gets written or a good one gets refused.
+   */
+  let unsealed;
+  await withRecoveryPublic(undefined, () => { unsealed = encryptField(ACCOUNT); });
+  const p = parts(unsealed);
+
+  assert.equal(isEncrypted(unsealed), true, 'the unsealed shape is a valid envelope');
+
+  // The two halves are pinned to EACH OTHER. Either alone is corruption.
+  assert.equal(isEncrypted([...p.slice(0, 2), fpOf(KEY), ...p.slice(3)].join(':')), false,
+    'a real fingerprint with an EMPTY seal is refused — that is a row that lost its seal');
+  const sealedReal = parts(encryptField(ACCOUNT));
+  assert.equal(isEncrypted([...sealedReal.slice(0, 2), NO_SEAL, ...sealedReal.slice(3)].join(':')),
+    false, 'and the sentinel with a seal ATTACHED is refused too');
+
+  // Nine fields — the field genuinely dropped rather than emptied.
+  assert.equal(isEncrypted([...p.slice(0, 6), ...p.slice(7)].join(':')), false,
+    'a truncated envelope must NOT read as unsealed');
+  assert.throws(() => decryptField([...p.slice(0, 6), ...p.slice(7)].join(':')),
+    (e) => e.code === 'FIELD_ENC_UNAVAILABLE');
+
+  // And the sentinel is not a fingerprint anyone could collide with.
+  assert.equal(NO_SEAL, '-');
+  assert.equal(/^[0-9a-f]{8}$/.test(NO_SEAL), false);
+});
+
+test('a CONFIGURED recovery key that FAILS TO SEAL throws — the seal is optional, not best-effort', async () => {
+  /*
+   * THE most important assertion in this change, and the one a lazy
+   * implementation gets wrong. Making the seal optional is one line away from
+   * making it best-effort: wrap the publicEncrypt in a try/catch, fall back to
+   * the sentinel, and every write in an environment WITH a recovery key quietly
+   * loses its break-glass path the day the key develops a problem — indexed by
+   * nothing, discovered on the day it matters, indistinguishable from the rows
+   * that were never meant to have one.
+   *
+   * So: a key that passes validation and then cannot encrypt must THROW. Built
+   * as a KeyObject-shaped stand-in that satisfies every check the module makes
+   * (public, RSA, 4096-bit, exports DER for the fingerprint) and then fails
+   * inside crypto.publicEncrypt, which is exactly the shape of the failure that
+   * a catch would swallow.
+   */
+  const brokenKey = {
+    type: 'public',
+    asymmetricKeyType: 'rsa',
+    asymmetricKeyDetails: { modulusLength: 4096 },
+    export: () => Buffer.from('not-a-real-spki-but-fingerprintable'),
+  };
+  await resolveRecoveryPublicKey(store([{ public_key: brokenKey, active: true }]));
+  try {
     let stored;
     assert.throws(
       () => { stored = encryptField(ACCOUNT); },
-      (e) => e.code === 'FIELD_ENC_UNAVAILABLE' && /recovery/i.test(e.message),
-      'a write with no recovery key must throw, and say so',
+      // Not a FIELD_ENC_UNAVAILABLE necessarily — it is whatever the crypto
+      // layer raised. The assertion is that it PROPAGATED.
+      (e) => e instanceof Error,
+      'a configured key that cannot seal must throw, never fall back to unsealed',
     );
-    assert.equal(stored, undefined, 'nothing storable may come back');
-
-    // READS are deliberately unaffected. The recovery key is a write-side
-    // input; refusing reads without it would turn a fixable write outage into a
-    // total outage of the payout path for no security gain.
-    assert.equal(decryptField(ct), ACCOUNT, 'reads do not need the recovery key');
-  });
+    assert.equal(stored, undefined, 'and nothing storable may come back');
+  } finally {
+    await resetRecoveryToEnv();
+  }
 });
 
 test('a MALFORMED recovery public key is treated exactly like a missing one', async () => {
@@ -341,9 +428,13 @@ test('a MALFORMED recovery public key is treated exactly like a missing one', as
   }).publicKey;
   const weakRsa = newRecoveryKeypair(1024).publicKey;
 
+  /*
+   * A key that is PRESENT and unusable is a fault and still refuses every write.
+   * That is what keeps "the seal is optional" from meaning "the seal is
+   * best-effort": the only no-seal case is NOTHING CONFIGURED, which is the
+   * blank checked separately below.
+   */
   const bad = {
-    'empty string': '',
-    'whitespace only': '   ',
     'not base64 at all': 'this is not a key!!',
     'base64 of nonsense': Buffer.from('hello there').toString('base64'),
     // Parses perfectly and then cannot seal — the confusing failure this
@@ -375,6 +466,19 @@ test('a MALFORMED recovery public key is treated exactly like a missing one', as
     assert.throws(() => encryptField(ACCOUNT),
       (e) => /PRIVATE key/.test(e.message) && /compromised/.test(e.message));
   });
+
+  /*
+   * BLANK IS NOT MALFORMED — and .env.example promises exactly this: "if you
+   * have already put garbage there, blank the value". A blank (or whitespace)
+   * variable is the supported no-recovery-key state and writes unsealed, which
+   * is what makes that instruction a real remedy rather than a second outage.
+   */
+  for (const blank of ['', '   ']) {
+    // eslint-disable-next-line no-await-in-loop -- one env value per case.
+    await withRecoveryPublic(blank, () => {
+      assert.equal(parts(encryptField(ACCOUNT))[2], NO_SEAL);
+    });
+  }
 });
 
 test('a NON-envelope stored value is REFUSED on read, never returned as-is', () => {
@@ -759,7 +863,143 @@ test('a re-key refuses a non-envelope rather than inventing one', () => {
       (e) => e.code === 'FIELD_ENC_UNAVAILABLE');
     assert.throws(() => resealToRecoveryKey(junk, RECOVERY.publicKey,
       { recoveryPrivateKey: RECOVERY.privateKey }), (e) => e.code === 'FIELD_ENC_UNAVAILABLE');
+    assert.throws(() => sealToRecoveryKey(junk, RECOVERY.publicKey),
+      (e) => e.code === 'FIELD_ENC_UNAVAILABLE');
   }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 5b. THE ONE-KEY LIFECYCLE — what the owner will actually do
+// ═══════════════════════════════════════════════════════════════════════
+/*
+ * These four are the change. Everything above says the unsealed envelope is
+ * well-formed; these say it is LIVEABLE — that the operations an owner running
+ * on one key will actually perform work on it, and that the one operation that
+ * CANNOT work says so clearly instead of failing somewhere inside RSA.
+ */
+
+/* An envelope written with no recovery key configured. */
+async function unsealedEnvelope(value = ACCOUNT) {
+  let out;
+  await withRecoveryPublic(undefined, () => { out = encryptField(value); });
+  return out;
+}
+
+test('ROTATE WORKS WITH NO RECOVERY KEY — the mode this deployment actually uses', async () => {
+  /*
+   * The operational key is the only key in this system, so rotating it is the
+   * only key operation that will ever be run — and it must not need the thing
+   * that is not configured. The seal fields are copied through as they are: the
+   * sentinel stays a sentinel, the empty seal stays empty, and the result is a
+   * valid envelope that reads on the new key.
+   */
+  const before = await unsealedEnvelope();
+  const newKey = crypto.randomBytes(32).toString('base64');
+
+  const after = rewrapToOperationalKey(before, newKey, { currentKey: KEY });
+
+  assert.equal(parts(after)[1], fpOf(newKey), 'the wrap moved to the new key');
+  assert.equal(parts(after)[2], NO_SEAL, 'and the row is still, honestly, unsealed');
+  assert.equal(parts(after)[6], '', 'with the seal field still empty, not invented');
+  assert.equal(isEncrypted(after), true, 'the result is a well-formed envelope');
+  assert.equal(valueCiphertext(after), valueCiphertext(before),
+    'and the value ciphertext is byte identical, as in every other re-key');
+
+  await withKey(newKey, () => {
+    assert.equal(decryptField(after), ACCOUNT, 'the new key reads it');
+  });
+  // The whole point of a rotation: the OLD key no longer opens it. And the
+  // error must not send anyone hunting for a break-glass key that was never
+  // created — "the recovery key -" is not an instruction.
+  assert.throws(() => decryptField(after), (e) => {
+    assert.equal(e.code, 'FIELD_KEY_NOT_IN_RING');
+    assert.match(e.message, /NO recovery key/, 'it says there is no second door');
+    assert.equal(e.message.includes(`recovery key ${NO_SEAL}`), false);
+    return true;
+  });
+});
+
+test('RECOVER REFUSES an unsealed row with its own code, not a confusing crypto failure', async () => {
+  /*
+   * There is no sealed data key, so no private key on earth opens this row. The
+   * remedy is completely different from every other recovery failure — it is
+   * "you cannot do this at all", not "wrong key" — so it gets its own code and
+   * a message that names the reason and the way forward.
+   */
+  const unsealed = await unsealedEnvelope();
+  const kp = newRecoveryKeypair();
+
+  for (const [what, fn] of [
+    ['recoverField', () => recoverField(unsealed, kp.privateKey)],
+    ['break-glass rewrap', () => rewrapToOperationalKey(unsealed, KEY, { recoveryPrivateKey: kp.privateKey })],
+    ['reseal', () => resealToRecoveryKey(unsealed, kp.publicKey, { recoveryPrivateKey: kp.privateKey })],
+  ]) {
+    assert.throws(fn, (e) => {
+      assert.equal(e.code, 'FIELD_NOT_SEALED', `${what} must use the distinct code`);
+      assert.match(e.message, /no recovery key configured/i, 'and say WHY');
+      assert.match(e.message, /sealToRecoveryKey/, 'and say what to do instead');
+      return true;
+    }, what);
+  }
+
+  // Not merely "an error" — it must not be the WRONG-KEY error, which would send
+  // an operator hunting through their notes for a key that would not have helped.
+  assert.throws(() => recoverField(unsealed, kp.privateKey),
+    (e) => e.code !== 'FIELD_RECOVERY_KEY_MISMATCH');
+});
+
+test('AN UNSEALED ROW CAN BE SEALED LATER, with ONLY the operational key', async () => {
+  /*
+   * The good news in this design, and the reason "no recovery key today" is not
+   * a one-way door: registering a keypair next year retro-protects everything
+   * written this year. No old private key is involved because there is no old
+   * seal to open — the operational key unwraps the data key and it is sealed to
+   * the new public half.
+   */
+  const unsealed = await unsealedEnvelope();
+  const later = newRecoveryKeypair();
+
+  const sealed = sealToRecoveryKey(unsealed, later.publicKey);
+
+  assert.equal(parts(sealed)[2], fpOfPublic(later.publicKey), 'the row now names the new key');
+  assert.equal(parts(sealed)[1], parts(unsealed)[1], 'the operational wrap is untouched…');
+  assert.deepEqual(parts(sealed).slice(3, 6), parts(unsealed).slice(3, 6), '…byte for byte');
+  assert.equal(valueCiphertext(sealed), valueCiphertext(unsealed),
+    'and the value ciphertext never moved');
+
+  // BOTH doors now open it — which is the entire claim.
+  assert.equal(decryptField(sealed), ACCOUNT, 'the operational key still reads it');
+  assert.equal(recoverField(sealed, later.privateKey), ACCOUNT, 'and break-glass works now');
+
+  // What it needs, stated as a test: a WORKING operational key. A row wrapped
+  // under a key nobody holds cannot be sealed — retro-protection is a door you
+  // open while you can still read the data, not after the fire.
+  const stranger = crypto.randomBytes(32).toString('base64');
+  assert.throws(() => sealToRecoveryKey(unsealed, later.publicKey, { operationalKey: stranger }),
+    (e) => e.code === 'FIELD_KEY_NOT_IN_RING');
+});
+
+test('seal and reseal refuse each other’s rows — two operations, not one with a flag', () => {
+  /*
+   * Sealing a row that has none and REPLACING the seal on a row that has one
+   * take different keys and answer different incidents. Confusing them at 2am is
+   * how a leaked recovery key gets left in place, so each refuses the other's
+   * input by name rather than doing something plausible.
+   */
+  const sealed = encryptField(ACCOUNT);          // sealed to RECOVERY, from env
+  const fresh = newRecoveryKeypair();
+
+  assert.throws(() => sealToRecoveryKey(sealed, fresh.publicKey), (e) => {
+    assert.equal(e.code, 'FIELD_ENC_UNAVAILABLE');
+    assert.match(e.message, /already sealed/, 'it names the state it found');
+    assert.match(e.message, /resealToRecoveryKey/, 'and points at the right function');
+    return true;
+  });
+
+  // And the working reseal still works — this did not narrow it.
+  const moved = resealToRecoveryKey(sealed, fresh.publicKey, { recoveryPrivateKey: RECOVERY.privateKey });
+  assert.equal(parts(moved)[2], fpOfPublic(fresh.publicKey));
+  assert.equal(recoverField(moved, fresh.privateKey), ACCOUNT);
 });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -806,11 +1046,29 @@ test('an EMPTY store falls back to env, and clears a previously primed key', asy
   }
 });
 
-test('NO store row and NO env is fail-closed, not a write without a recovery path', async () => {
+test("NO store row and NO env resolves to source 'none' — the boot log must not cry wolf", async () => {
+  /*
+   * The descriptor is what server.js logs. It has to be able to say "no recovery
+   * key is configured" as a STATEMENT OF FACT at info, because that is the
+   * chosen configuration and a warning on every boot teaches everyone to ignore
+   * warnings. A throw here would force the boot path to treat the normal state
+   * as an error — which is exactly what it used to do.
+   */
   await withRecoveryPublic(undefined, async () => {
-    await assert.rejects(() => resolveRecoveryPublicKey(store([])),
-      (e) => e.code === 'FIELD_ENC_UNAVAILABLE' && /recovery path/.test(e.message));
-    assert.throws(() => encryptField(ACCOUNT), (e) => e.code === 'FIELD_ENC_UNAVAILABLE');
+    const desc = await resolveRecoveryPublicKey(store([]));
+    assert.deepEqual(desc, { fingerprint: null, source: 'none' });
+    // And writes carry on, unsealed.
+    assert.equal(parts(encryptField(ACCOUNT))[2], NO_SEAL);
+  });
+  await resetRecoveryToEnv();
+});
+
+test('a CONFIGURED-but-broken store key still REJECTS — that is what keeps warn meaningful', async () => {
+  // The other half of the boot-log split: source 'none' is info, a throw is
+  // warn, and only a key someone actually configured can produce the throw.
+  await withRecoveryPublic(undefined, async () => {
+    await assert.rejects(() => resolveRecoveryPublicKey(store([{ public_key: 'not a key', active: true }])),
+      (e) => e.code === 'FIELD_ENC_UNAVAILABLE');
   });
   await resetRecoveryToEnv();
 });

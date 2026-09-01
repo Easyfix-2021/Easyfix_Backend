@@ -11,7 +11,7 @@ const { recordReveal } = require('./profile-self.service');
  * field-rekey — BULK RE-KEYING of every value protected by lib/field-crypto.js.
  *
  * Backs Admin Actions → "Re-Key Encrypted Fields" (routes/admin/field-rekey.js).
- * Three modes, ONE piece of machinery:
+ * Four modes, ONE piece of machinery:
  *
  *   rotate   The operational key is being replaced and THE CURRENT ONE STILL
  *            WORKS. Each data key is unwrapped with the current operational key
@@ -39,6 +39,28 @@ const { recordReveal } = require('./profile-self.service');
  *            unrecoverable in exactly the way this feature exists to prevent.
  *            There is no upside to balance that against: the store already has
  *            the authoritative copy.
+ *
+ *   seal     RETRO-PROTECTION. This system runs with NO recovery key by the
+ *            owner's decision, so rows are written UNSEALED — readable only
+ *            through the operational key. If a recovery key is registered later,
+ *            this mode gives those rows a break-glass door using ONLY THE
+ *            OPERATIONAL KEY: each data key is unwrapped with the key the row
+ *            already names and sealed to the ACTIVE recovery public key. NO
+ *            PRIVATE KEY IS ASKED FOR OR NEEDED, because there is no old seal to
+ *            open.
+ *
+ *            SEPARATE FROM `reseal` ON PURPOSE. reseal REPLACES a seal and needs
+ *            the old private key; seal ADDS one and needs none. They fail for
+ *            different reasons and are run on different days, and collapsing
+ *            them into one mode would mean prompting for a recovery private key
+ *            — an exposure — on the path that has no use for it. Each refuses
+ *            the other's rows by name: reseal skips unsealed rows, seal skips
+ *            sealed ones.
+ *
+ *            ⚠ It needs a WORKING operational key. If that is lost, unsealed
+ *            rows are gone — nothing can seal or read them. That is the whole
+ *            cost of the one-key decision, and this mode is how the window
+ *            closes rather than how it is survived.
  *
  * ── RE-WRAP, NOT RE-ENCRYPT ─────────────────────────────────────────────
  * Only the wrapped/sealed DATA KEY changes. The value ciphertext is byte
@@ -121,7 +143,12 @@ const FIELD_GROUPS = {
 };
 
 const GROUP_KEYS = Object.keys(FIELD_GROUPS);
-const REKEY_MODES = ['rotate', 'recover', 'reseal'];
+const REKEY_MODES = ['rotate', 'recover', 'reseal', 'seal'];
+
+/* The rec_fp an envelope carries when it was written with NO recovery key
+ * configured. Taken from the cipher rather than re-typed, so the sentinel has
+ * one definition. */
+const { NO_SEAL } = fieldCrypto;
 
 /*
  * 200 rows per SELECT. Small enough that the result set is bounded on a table
@@ -187,6 +214,12 @@ function recoveryFingerprint(publicKeyPem) {
  * fields that follow, that is a ~1-in-4-billion coincidence, and the fallback
  * is a needless re-wrap rather than a wrong one.
  *
+ * THE NO_SEAL SENTINEL IS RETURNED AS ITSELF, not folded into null. "written
+ * with no recovery key" and "I could not read this head" are different states
+ * with different remedies — the first is fixed by mode=seal, the second by
+ * looking at the row — and every count and skip decision below turns on telling
+ * them apart.
+ *
  * Returns nulls rather than throwing: an unparseable head is a value the caller
  * should skip, not an exception that aborts a bulk run at row 40,000.
  */
@@ -195,7 +228,9 @@ const FP_RE = new RegExp(`^[0-9a-f]{${FP_CHARS}}$`);
 function envelopeFingerprints(envelope) {
   const parts = String(envelope).split(':');
   const operational = FP_RE.test(parts[1] || '') ? parts[1] : null;
-  const recovery = FP_RE.test(parts[2] || '') ? parts[2] : null;
+  let recovery = null;
+  if (parts[2] === NO_SEAL) recovery = NO_SEAL;
+  else if (FP_RE.test(parts[2] || '')) recovery = parts[2];
   return { operational, recovery };
 }
 
@@ -221,10 +256,43 @@ function activeOperationalFingerprint() {
  * fail on row zero instead of after re-wrapping forty thousand rows and then
  * discovering the new key was mistyped. The private key is held in this closure
  * for the duration of the run and in nothing else.
+ *
+ * `needsWork(fps)` is each mode's ENTIRE scope rule, in one place: given the two
+ * fingerprints an envelope carries, is this row this run's business? It is what
+ * the dry-run probe, the pre-flight and the per-row transform all ask, so none
+ * of them can disagree about which rows are in scope — and it is what keeps
+ * `seal` off sealed rows and `reseal` off unsealed ones without a second walk.
  */
 function resolvePlan({ mode, newKey, recoveryPrivateKey }, activeRecovery) {
   if (!REKEY_MODES.includes(mode)) {
     throw mkErr(400, 'INVALID_MODE', `mode must be one of ${REKEY_MODES.join(', ')}`);
+  }
+
+  if (mode === 'seal') {
+    /*
+     * ADDS a seal to rows that have none. The only key it uses is the
+     * OPERATIONAL one, read from env by lib/field-crypto — so there is nothing
+     * to paste and nothing to leak, and the form must not ask for a private key
+     * here. Rows that ALREADY carry a seal are out of scope: moving one is
+     * `reseal`, and it needs a key this mode deliberately never sees.
+     */
+    if (!activeRecovery || !activeRecovery.public_key) {
+      throw mkErr(400, 'NO_ACTIVE_RECOVERY_KEY',
+        'no recovery public key is registered — generate one and register it first, then run'
+        + ' seal to bring the rows written before it under that key');
+    }
+    if (!process.env.EASYFIX_FIELD_ENC_KEY) {
+      throw mkErr(400, 'NO_CURRENT_KEY',
+        'EASYFIX_FIELD_ENC_KEY is not set, so there is no key to unwrap these data keys with.'
+        + ' An unsealed row has no other door — restore the operational key first');
+    }
+    const pem = activeRecovery.public_key;
+    return {
+      mode,
+      targetFingerprint: recoveryFingerprint(pem),
+      needsWork: (fps) => fps.recovery === NO_SEAL,
+      transform: (envelope) => fieldCrypto.sealToRecoveryKey(envelope, pem),
+    };
   }
 
   if (mode === 'reseal') {
@@ -244,11 +312,16 @@ function resolvePlan({ mode, newKey, recoveryPrivateKey }, activeRecovery) {
         'no recovery public key is registered — generate one and register it first');
     }
     const pem = activeRecovery.public_key;
+    const targetFingerprint = recoveryFingerprint(pem);
     return {
       mode,
-      targetFingerprint: recoveryFingerprint(pem),
-      // Compares the RECOVERY half: the operational wrap is not touched.
-      currentOf: (fps) => fps.recovery,
+      targetFingerprint,
+      /*
+       * Compares the RECOVERY half: the operational wrap is not touched. An
+       * UNSEALED row is skipped rather than attempted — the old private key
+       * cannot open a seal that does not exist, and `seal` is the mode for it.
+       */
+      needsWork: (fps) => fps.recovery !== NO_SEAL && fps.recovery !== targetFingerprint,
       transform: (envelope) => fieldCrypto.resealToRecoveryKey(envelope, pem, { recoveryPrivateKey }),
     };
   }
@@ -266,7 +339,7 @@ function resolvePlan({ mode, newKey, recoveryPrivateKey }, activeRecovery) {
     return {
       mode,
       targetFingerprint,
-      currentOf: (fps) => fps.operational,
+      needsWork: (fps) => fps.operational !== targetFingerprint,
       transform: (env) => fieldCrypto.rewrapToOperationalKey(env, newKey, { recoveryPrivateKey }),
     };
   }
@@ -286,7 +359,12 @@ function resolvePlan({ mode, newKey, recoveryPrivateKey }, activeRecovery) {
   return {
     mode,
     targetFingerprint,
-    currentOf: (fps) => fps.operational,
+    /*
+     * An UNSEALED row rotates like any other: the wrap moves, the '-' sentinel
+     * and the empty seal are copied through untouched. This is the mode the
+     * owner will actually use, and it must not need a recovery key to work.
+     */
+    needsWork: (fps) => fps.operational !== targetFingerprint,
     transform: (env) => fieldCrypto.rewrapToOperationalKey(env, newKey, { currentKey }),
   };
 }
@@ -295,7 +373,9 @@ function resolvePlan({ mode, newKey, recoveryPrivateKey }, activeRecovery) {
 /*
  * One stored column value → { value, changed, seen, skipped }.
  *
- * `seen` counts envelopes examined, `skipped` those already on the target key.
+ * `seen` counts envelopes examined, `skipped` those this mode has no work for —
+ * already on the target key, or (for `seal` / `reseal`) on the wrong side of the
+ * sealed/unsealed line, which is the same fact: nothing for this run to do.
  * A value that is not an envelope at all (NULL, '', or — a defect — plaintext)
  * is left strictly alone: re-keying is not the place to discover or to "fix"
  * that, and touching it would be the one write in this module that could lose
@@ -303,8 +383,7 @@ function resolvePlan({ mode, newKey, recoveryPrivateKey }, activeRecovery) {
  */
 function transformScalar(value, plan) {
   if (!fieldCrypto.isEncrypted(value)) return { value, changed: false, seen: 0, skipped: 0 };
-  const current = plan.currentOf(envelopeFingerprints(value));
-  if (current && current === plan.targetFingerprint) {
+  if (!plan.needsWork(envelopeFingerprints(value))) {
     return { value, changed: false, seen: 1, skipped: 1 };
   }
   return { value: plan.transform(value), changed: true, seen: 1, skipped: 0 };
@@ -538,7 +617,7 @@ async function findPendingEnvelope(def, plan, runner) {
       for (const col of spec.columns) {
         const consider = (v) => {
           if (found || !fieldCrypto.isEncrypted(v)) return;
-          if (plan.currentOf(envelopeFingerprints(v)) !== plan.targetFingerprint) found = v;
+          if (plan.needsWork(envelopeFingerprints(v))) found = v;
         };
         if (spec.json) collectJsonEnvelopes(row[col], consider);
         else consider(row[col]);
@@ -556,15 +635,20 @@ async function findPendingEnvelope(def, plan, runner) {
  * Both checks are about the same failure: a run that reports success while
  * having achieved nothing, or that fails halfway with the table in two states.
  *
- *   1. NOTHING LEFT TO DO. For `reseal` this is an ERROR, not a no-op. An
- *      operator re-sealing after a leak who sees "0 rows changed" cannot tell
- *      whether they are safe or whether they forgot to generate a new keypair —
- *      and the second is by far the likelier. So it fails, naming the
- *      fingerprint the rows already carry. For `rotate` / `recover`, "already
- *      done" is exactly what idempotency is supposed to look like on a re-run,
- *      so it returns an honest zero.
+ *   1. NOTHING LEFT TO DO. For `reseal` and `seal` this is an ERROR, not a
+ *      no-op. An operator re-sealing after a leak who sees "0 rows changed"
+ *      cannot tell whether they are safe or whether they forgot to generate a
+ *      new keypair — and the second is by far the likelier. For `rotate` /
+ *      `recover`, "already done" is exactly what idempotency is supposed to look
+ *      like on a re-run, so it returns an honest zero.
  *
- *   2. THE SUPPLIED KEY MUST ACTUALLY WORK. One envelope is transformed IN
+ *   2. THE MODE MUST BE POSSIBLE ON THESE ROWS. `recover` opens a SEALED data
+ *      key with a private key; a row written while no recovery key was
+ *      configured has no sealed data key at all, and no private key in the world
+ *      opens it. That is refused HERE, by its own code, rather than 200 lines
+ *      deeper inside RSA where the message would be about padding.
+ *
+ *   3. THE SUPPLIED KEY MUST ACTUALLY WORK. One envelope is transformed IN
  *      MEMORY and thrown away. A wrong recovery private key, or a `rotate`
  *      whose current key does not match what the rows name, fails here on one
  *      row with nothing written — rather than after re-wrapping some fraction
@@ -574,24 +658,47 @@ async function findPendingEnvelope(def, plan, runner) {
  * crypto primitive that was handed key material, and an error that travels to a
  * client and to a log is not a place to risk any of it appearing.
  */
+const NO_OP = {
+  reseal: ['RESEAL_NO_OP',
+    'every protected value is already sealed to the active recovery key'
+    + ' — this run would change nothing. If the old recovery key leaked, generate a NEW keypair,'
+    + ' register it, and re-seal to that.'],
+  seal: ['SEAL_NO_OP',
+    'every protected value already carries a recovery seal'
+    + ' — there is nothing here to bring under the active recovery key. Rows written from now on'
+    + ' are sealed to it automatically.'],
+};
+
 function preflight(plan, probe) {
   if (!probe) {
-    if (plan.mode !== 'reseal') return;
-    throw mkErr(409, 'RESEAL_NO_OP',
-      `every protected value is already sealed to the active recovery key ${plan.targetFingerprint}`
-      + ' — this run would change nothing. If the old recovery key leaked, generate a NEW keypair,'
-      + ' register it, and re-seal to that.');
+    const noOp = NO_OP[plan.mode];
+    if (!noOp) return;
+    throw mkErr(409, noOp[0], `${noOp[1]} (active key ${plan.targetFingerprint})`);
+  }
+  if (plan.mode === 'recover' && envelopeFingerprints(probe).recovery === NO_SEAL) {
+    throw mkErr(409, 'NO_SEAL_TO_RECOVER',
+      'these values were written with NO recovery key configured, so they carry no sealed data'
+      + ' key and a recovery private key cannot open them. Break-glass is not available for'
+      + ' them: the operational key is the only way in. If it still works, use mode=rotate —'
+      + ' and register a recovery key and run mode=seal so this is not true of them tomorrow.');
   }
   try {
     plan.transform(probe);
   } catch {
-    throw plan.mode === 'rotate'
-      ? mkErr(400, 'CURRENT_KEY_MISMATCH',
+    if (plan.mode === 'rotate') {
+      throw mkErr(400, 'CURRENT_KEY_MISMATCH',
         'the running EASYFIX_FIELD_ENC_KEY cannot unwrap these values, so a rotate cannot'
-        + ' re-wrap them — use recover mode with the recovery private key')
-      : mkErr(400, 'RECOVERY_KEY_MISMATCH',
-        'that recovery private key does not open these values — it is not the private half of'
-        + ' the recovery key they were sealed to. Nothing was written.');
+        + ' re-wrap them — use recover mode with the recovery private key');
+    }
+    if (plan.mode === 'seal') {
+      throw mkErr(400, 'CURRENT_KEY_MISMATCH',
+        'the running EASYFIX_FIELD_ENC_KEY cannot unwrap these values, so they cannot be sealed'
+        + ' to the recovery key. An unsealed row has no second door — restore the operational'
+        + ' key these rows name and run this again.');
+    }
+    throw mkErr(400, 'RECOVERY_KEY_MISMATCH',
+      'that recovery private key does not open these values — it is not the private half of'
+      + ' the recovery key they were sealed to. Nothing was written.');
   }
 }
 
@@ -609,7 +716,10 @@ function preflight(plan, probe) {
  */
 async function runReKey(params, actor, runner = pool, ipAddress = null) {
   const def = assertGroup(params.group);
-  const activeRecovery = params.mode === 'reseal' ? await readActiveRecoveryKey(runner) : null;
+  // Both seal and reseal target the ACTIVE store row; neither ever accepts a
+  // pasted public key. rotate and recover have no use for it.
+  const wantsRecoveryRow = params.mode === 'reseal' || params.mode === 'seal';
+  const activeRecovery = wantsRecoveryRow ? await readActiveRecoveryKey(runner) : null;
   const plan = resolvePlan(params, activeRecovery);
 
   const summary = {
@@ -617,7 +727,11 @@ async function runReKey(params, actor, runner = pool, ipAddress = null) {
     label: def.label,
     mode: plan.mode,
     target_fingerprint: plan.targetFingerprint,
-    recovery_mode_used: plan.mode !== 'rotate',
+    // Whether a recovery PRIVATE key was handled. `seal` uses only the
+    // operational key, so it is NOT a break-glass event and must not be logged
+    // as one — that flag is how an auditor finds the runs that touched the
+    // master key.
+    recovery_mode_used: plan.mode === 'recover' || plan.mode === 'reseal',
     tables: [],
     totals: { rows: 0, values: 0, changed: 0, skipped: 0 },
   };
@@ -814,8 +928,9 @@ async function storeRecoveryPublicKey({ publicKeyPem }, actor, runner = pool) {
     await conn.commit();
     logger.warn('Recovery public key registered · fingerprint=' + fingerprint
       + ' actor=' + ((actor && actor.user_id) || '-')
-      + ' — rows written BEFORE now are still sealed to the previous key; run mode=reseal'
-      + ' with the OLD private key to move them');
+      + ' — rows written BEFORE now are NOT under this key yet: run mode=seal (operational key'
+      + ' only) for rows written with no recovery key, or mode=reseal with the OLD private key'
+      + ' for rows sealed to a previous one');
     await primeRecoveryKey(runner);
     return { fingerprint, created_on: now, already_active: false };
   } catch (e) {
@@ -895,14 +1010,83 @@ async function primeRecoveryKey(runner) {
 }
 
 /*
- * What the GET endpoint returns: the fingerprint and when it was registered.
- * The PEM is public and would be harmless, but it is also not an answer to any
- * question the screen asks — the operator already has it — so it is not shipped.
+ * ARE THERE SEALED ROWS? ARE THERE UNSEALED ONES? — two booleans, not counts.
+ *
+ * Which re-key modes can possibly work is decided by exactly this, and by
+ * nothing else: `recover` needs a sealed row to open, `seal` needs an unsealed
+ * one to protect, `reseal` needs a sealed one to move. Counts are the DRY RUN's
+ * job (it reports the full fingerprint distribution, sentinel included); this is
+ * the cheap question the screen asks before it draws the form.
+ *
+ * ponytail: a scan, not an index — it STOPS the moment both answers are known,
+ * which on a homogeneous table (every row the same, the normal case) means one
+ * pass of two employee-sized tables, and on a mixed one means a handful of rows.
+ * Reuses scanTable/envelopeFingerprints so it cannot disagree with the run about
+ * what "sealed" means. If these tables ever grow past that, cache it or store a
+ * counter — do not reach for a LIKE pattern, which cannot tell a sentinel at a
+ * fixed offset from the same characters inside base64.
+ */
+async function sealCensus(runner = pool) {
+  const seals = { sealed: false, unsealed: false };
+  const done = () => seals.sealed && seals.unsealed;
+
+  for (const def of Object.values(FIELD_GROUPS)) {
+    for (const spec of def.tables) {
+      // eslint-disable-next-line no-await-in-loop -- sequential on purpose: each
+      // table can end the whole walk, and two answers is all this needs.
+      await scanTable(spec, runner, (row) => {
+        for (const col of spec.columns) {
+          const look = (v) => {
+            if (!fieldCrypto.isEncrypted(v)) return;
+            if (envelopeFingerprints(v).recovery === NO_SEAL) seals.unsealed = true;
+            else seals.sealed = true;
+          };
+          if (spec.json) collectJsonEnvelopes(row[col], look);
+          else look(row[col]);
+        }
+        return done() ? false : undefined;
+      });
+      if (done()) return seals;
+    }
+  }
+  return seals;
+}
+
+/*
+ * What the GET endpoint returns. The PEM is public and would be harmless, but it
+ * is also not an answer to any question the screen asks — the operator already
+ * has it — so it is not shipped.
+ *
+ * ⚠ SHAPE CHANGE (2026-09-01): this used to return `null` when no key was
+ * registered. It now always returns an object, because "no recovery key" is a
+ * SUPPORTED configuration rather than an unfinished setup, and the screen has to
+ * render something truthful for it. `active` is the boolean to branch on;
+ * `fingerprint` is null in that state.
+ *
+ * `modes` is the whole point: the UI shows only what can actually work, instead
+ * of offering `recover` on rows that carry no seal for a private key to open and
+ * turning a clear refusal into a support ticket.
  */
 async function getActiveRecoveryKey(runner = pool) {
   const row = await readActiveRecoveryKey(runner);
-  if (!row) return null;
-  return { fingerprint: row.fingerprint, created_on: row.created_on };
+  const seals = await sealCensus(runner);
+  return {
+    fingerprint: row ? row.fingerprint : null,
+    created_on: row ? row.created_on : null,
+    active: !!row,
+    seals,
+    modes: {
+      // Always offered: it needs only the operational key, and works on sealed
+      // and unsealed rows alike.
+      rotate: true,
+      // Needs something for a private key to open.
+      recover: seals.sealed,
+      // Needs a registered key to move rows ONTO, and sealed rows to move.
+      reseal: !!row && seals.sealed,
+      // Needs a registered key, and rows that have no seal yet.
+      seal: !!row && seals.unsealed,
+    },
+  };
 }
 
 module.exports = {

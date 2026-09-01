@@ -56,6 +56,15 @@ const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const { installFakePool } = require('./helpers/fake-pool');
 
+/*
+ * The Secrets Manager per-person allowlist. Declared before the fake pool
+ * because the pool serves it: the property is the SOLE source of who may reach
+ * any route in this file, on top of the RBAC action keys.
+ */
+const { FEATURES } = require('../services/feature-access.service');
+const SECRETS_PROPERTY = FEATURES.canManageSecrets;
+const ALLOWED_EMAILS = ['sundeep@easyfix.in', 'priyanka@easyfix.in'];
+
 // ── The in-memory tables the fake pool serves ───────────────────────────
 const store = {
   personal: [],
@@ -147,6 +156,15 @@ const fake = installFakePool([
   [/SELECT user_role FROM tbl_user/i, [{ user_role: 2 }]],
   [/FROM tbl_role/i, [{ role_id: 2, role_name: 'Admin', role_status: 1, menu_ids: '' }]],
   [/ma\.action_name/i, [{ action_name: 'isFieldRekeyRun' }, { action_name: 'isRecoveryKeyManage' }]],
+
+  /*
+   * The Secrets Manager allowlist. Read ONCE into properties.service's cache
+   * (flushCache in before()), which is why the guard costs no query per request
+   * — the property that makes "a denied caller triggers zero DB work" true.
+   */
+  [/FROM easyfix_properties/i, () => [
+    { property_key: SECRETS_PROPERTY, property_value: ALLOWED_EMAILS.join(',') },
+  ]],
 ]);
 
 /*
@@ -182,7 +200,13 @@ const realCrypto = {
   isEncrypted: fieldCrypto.isEncrypted,
   rewrapToOperationalKey: fieldCrypto.rewrapToOperationalKey,
   resealToRecoveryKey: fieldCrypto.resealToRecoveryKey,
+  sealToRecoveryKey: fieldCrypto.sealToRecoveryKey,
 };
+
+/* The rec_fp an envelope carries when it was written with NO recovery key. Taken
+ * from the real module, not typed here — the service reads it from the same
+ * place, and a test that re-declared it could pass while they disagreed. */
+const { NO_SEAL } = fieldCrypto;
 
 const svc = require('../services/field-rekey.service');
 const { operationalFingerprint, recoveryFingerprint, envelopeFingerprints } = svc._internals;
@@ -252,12 +276,33 @@ before(() => {
   };
 
   fieldCrypto.resealToRecoveryKey = (env, newPem, opts = {}) => {
+    if (part(env, 2) === NO_SEAL) throw new Error('this envelope has no seal to replace');
     if (!opts.recoveryPrivateKey) throw new Error('no recovery key supplied');
     if (recFpOfPrivate(opts.recoveryPrivateKey) !== part(env, 2)) {
       throw new Error('recovery key does not open this envelope');
     }
     return mkEnv(part(env, 1), recoveryFingerprint(newPem), part(env, 3));
   };
+
+  /*
+   * ADDS a seal using ONLY the operational key — the retro-protection path. The
+   * stand-in mirrors the real one's two refusals, which are what the service's
+   * mode boundaries are built on: a row that is already sealed is not this
+   * operation's business, and the OPERATIONAL key must be the one the row names.
+   */
+  fieldCrypto.sealToRecoveryKey = (env, newPem, opts = {}) => {
+    if (part(env, 2) !== NO_SEAL) throw new Error('this envelope is already sealed');
+    if (opts.recoveryPrivateKey) throw new Error('sealing must not ask for a private key');
+    const opKey = opts.operationalKey || process.env.EASYFIX_FIELD_ENC_KEY;
+    if (!opKey || operationalFingerprint(opKey) !== part(env, 1)) {
+      throw new Error('the operational key does not open this envelope');
+    }
+    return mkEnv(part(env, 1), recoveryFingerprint(newPem), part(env, 3));
+  };
+
+  /* Prime the properties cache from the fake pool once, so the allowlist guard
+   * is a pure in-process read for the rest of the file. */
+  return require('../services/properties.service').flushCache();
 });
 
 after(() => {
@@ -273,14 +318,14 @@ after(() => {
  * OLD_REC_FP. User 3 carries no bank details at all (the majority case in
  * production) and must never be selected.
  */
-function seed({ alreadyRotated = [] } = {}) {
+function seed({ alreadyRotated = [], recFp = OLD_REC_FP } = {}) {
   const opFor = (id) => (alreadyRotated.includes(id) ? NEW_FP : OLD_FP);
   store.personal = [1, 2, 3, 4].map((id) => (id === 3
     ? { user_id: id, bank_account_number: null, bank_account_name: null }
     : {
       user_id: id,
-      bank_account_number: mkEnv(opFor(id), OLD_REC_FP, `ACCT${id}`),
-      bank_account_name: mkEnv(opFor(id), OLD_REC_FP, `NAME${id}`),
+      bank_account_number: mkEnv(opFor(id), recFp, `ACCT${id}`),
+      bank_account_name: mkEnv(opFor(id), recFp, `NAME${id}`),
     }));
 
   store.requests = [10, 11].map((id) => ({
@@ -288,9 +333,9 @@ function seed({ alreadyRotated = [] } = {}) {
     changes: JSON.stringify({
       mobile_no: '9876543210',
       bank: {
-        account_number: mkEnv(OLD_FP, OLD_REC_FP, `REQACCT${id}`),
+        account_number: mkEnv(OLD_FP, recFp, `REQACCT${id}`),
         ifsc: 'HDFC0001234',
-        account_name: mkEnv(OLD_FP, OLD_REC_FP, `REQNAME${id}`),
+        account_name: mkEnv(OLD_FP, recFp, `REQNAME${id}`),
         bank_name: 'HDFC Bank',
         account_last4: '4321',
       },
@@ -315,6 +360,9 @@ beforeEach(() => {
   failWriteAfter = null;
   writeCount = 0;
   logLines = [];
+  // Back to an ALLOWED operator: a test that denies one must not leak into the
+  // next, or every route test after it would pass for the wrong reason.
+  actingUser = { user_id: 7, official_email: ALLOWED_EMAILS[0] };
   fake.reset();
   seed();
 });
@@ -501,6 +549,142 @@ test('reseal refuses when no recovery key is registered at all', async () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════
+// 4b. THE ONE-KEY DEPLOYMENT — UNSEALED ROWS
+// ════════════════════════════════════════════════════════════════════════
+/*
+ * This system runs with NO recovery key by the owner's decision, so the rows in
+ * production carry the '-' sentinel rather than a recovery fingerprint. Every
+ * test above uses sealed fixtures; these use the shape that actually exists.
+ */
+
+test('rotate works on UNSEALED rows — the mode this deployment actually runs', async () => {
+  seed({ recFp: NO_SEAL });
+  fake.reset();
+
+  const summary = await svc.runReKey({ group: 'bank', mode: 'rotate', newKey: NEW_KEY }, ACTOR);
+
+  assert.equal(summary.totals.changed, 5, 'no recovery key is needed to rotate');
+  assert.equal(summary.recovery_mode_used, false);
+  for (const row of store.personal.filter((r) => r.bank_account_number)) {
+    assert.equal(part(row.bank_account_number, 1), NEW_FP, 'the wrap moved');
+    assert.equal(part(row.bank_account_number, 2), NO_SEAL, 'and the row is still honestly unsealed');
+    assert.equal(part(row.bank_account_number, 3), `ACCT${row.user_id}`, 'value untouched');
+  }
+});
+
+test('recover REFUSES unsealed rows with a distinct code, before any write', async () => {
+  /*
+   * There is no sealed data key for a private key to open. Refused by NAME, with
+   * nothing written — rather than mapped onto RECOVERY_KEY_MISMATCH, which would
+   * send an operator hunting through their notes for a key that never existed.
+   */
+  seed({ recFp: NO_SEAL });
+  fake.reset();
+
+  await assert.rejects(
+    () => svc.runReKey({
+      group: 'bank', mode: 'recover', newKey: NEW_KEY, recoveryPrivateKey: oldRecovery.privateKey,
+    }, ACTOR),
+    (e) => {
+      assert.equal(e.code, 'NO_SEAL_TO_RECOVER');
+      assert.match(e.message, /no recovery key configured/i, 'it names the reason');
+      assert.match(e.message, /mode=seal/, 'and the way out');
+      return true;
+    },
+  );
+  assert.deepEqual(dataWrites(), [], 'and nothing was written');
+  assert.equal(store.audit.length, 1, 'the attempt is still audited');
+});
+
+test('SEAL brings unsealed rows under a newly registered key, with NO private key', async () => {
+  /*
+   * The retro-protection path, end to end: register a keypair (already the
+   * active store row in the fixture), then seal. It must use the OPERATIONAL key
+   * and never ask for — or accept — a recovery private key, because prompting
+   * for one is itself an exposure and this path has no use for it.
+   */
+  seed({ recFp: NO_SEAL });
+  fake.reset();
+  const seen = [];
+  const stub = fieldCrypto.sealToRecoveryKey;
+  fieldCrypto.sealToRecoveryKey = (env, pem, opts) => { seen.push(opts); return stub(env, pem, opts); };
+
+  const summary = await svc.runReKey({ group: 'bank', mode: 'seal' }, ACTOR);
+  fieldCrypto.sealToRecoveryKey = stub;
+
+  assert.equal(summary.mode, 'seal');
+  assert.equal(summary.target_fingerprint, NEW_REC_FP, 'the target is the ACTIVE store row');
+  assert.equal(summary.totals.changed, 5);
+  assert.equal(summary.recovery_mode_used, false,
+    'no master key was handled, so this is NOT a break-glass event in the audit');
+  assert.ok(seen.every((o) => !o || o.recoveryPrivateKey === undefined),
+    'sealing must never reach for a private key');
+
+  for (const row of store.personal.filter((r) => r.bank_account_number)) {
+    assert.equal(part(row.bank_account_number, 2), NEW_REC_FP, 'the row now has a seal');
+    assert.equal(part(row.bank_account_number, 1), OLD_FP, 'the operational wrap is untouched');
+    assert.equal(part(row.bank_account_number, 3), `ACCT${row.user_id}`, 'value untouched');
+  }
+  // And the nested request JSON came along, which is the half that gets forgotten.
+  assert.equal(part(JSON.parse(store.requests[0].changes).bank.account_number, 2), NEW_REC_FP);
+});
+
+test('seal needs a WORKING operational key, and a registered recovery key', async () => {
+  seed({ recFp: NO_SEAL });
+
+  store.recoveryKeys = [];
+  await assert.rejects(() => svc.runReKey({ group: 'bank', mode: 'seal' }, ACTOR),
+    (e) => e.code === 'NO_ACTIVE_RECOVERY_KEY');
+
+  seed({ recFp: NO_SEAL });
+  delete process.env.EASYFIX_FIELD_ENC_KEY;
+  await assert.rejects(() => svc.runReKey({ group: 'bank', mode: 'seal' }, ACTOR),
+    (e) => e.code === 'NO_CURRENT_KEY' && /no other door/.test(e.message));
+
+  // The wrong key gets as far as the pre-flight and is caught on ONE row.
+  process.env.EASYFIX_FIELD_ENC_KEY = crypto.randomBytes(32).toString('base64');
+  fake.reset();
+  await assert.rejects(() => svc.runReKey({ group: 'bank', mode: 'seal' }, ACTOR),
+    (e) => e.code === 'CURRENT_KEY_MISMATCH');
+  assert.deepEqual(dataWrites(), []);
+});
+
+test('seal and reseal stay out of each other’s rows', async () => {
+  /*
+   * A mixed table — some rows written before a recovery key existed, some sealed
+   * to a superseded one — is the state a half-finished migration leaves. Each
+   * mode must touch only its own half, or one of them fails on a row it was
+   * never able to handle and the run dies in the middle.
+   */
+  seed({ recFp: NO_SEAL });
+  store.personal[0].bank_account_number = mkEnv(OLD_FP, OLD_REC_FP, 'ACCT1');
+  store.personal[0].bank_account_name = mkEnv(OLD_FP, OLD_REC_FP, 'NAME1');
+  fake.reset();
+
+  const sealed = await svc.runReKey({ group: 'bank', mode: 'seal' }, ACTOR);
+  assert.equal(sealed.totals.changed, 4, 'user 1 is already sealed and is skipped, not attempted');
+  assert.equal(part(store.personal[0].bank_account_number, 2), OLD_REC_FP,
+    'the already-sealed row keeps the seal only reseal may move');
+
+  // Now the other half, with the old private key.
+  fake.reset();
+  const resealed = await svc.runReKey({
+    group: 'bank', mode: 'reseal', recoveryPrivateKey: oldRecovery.privateKey,
+  }, ACTOR);
+  assert.equal(resealed.totals.changed, 1, 'reseal touches only the row that had a seal');
+  assert.equal(part(store.personal[0].bank_account_number, 2), NEW_REC_FP);
+  // 10 envelopes in the group; user 1's two are the only ones this run moves.
+  assert.equal(resealed.totals.skipped, 8, 'the freshly sealed rows are already on the target');
+});
+
+test('seal refuses as a no-op when every row already has a seal', async () => {
+  // Fixtures are sealed to OLD_REC_FP — nothing for seal to do, and saying "0
+  // rows changed" would read as success to someone who just registered a key.
+  await assert.rejects(() => svc.runReKey({ group: 'bank', mode: 'seal' }, ACTOR),
+    (e) => e.code === 'SEAL_NO_OP' && /already carries a recovery seal/.test(e.message));
+});
+
+// ════════════════════════════════════════════════════════════════════════
 // 5. IDEMPOTENT BY FINGERPRINT
 // ════════════════════════════════════════════════════════════════════════
 test('a row already on the target fingerprint is SKIPPED, not re-wrapped', async () => {
@@ -648,8 +832,48 @@ test('a PRIVATE key pasted into the registration endpoint is refused, not stored
 
 test('the GET payload carries the fingerprint and no key material', async () => {
   const active = await svc.getActiveRecoveryKey();
-  assert.deepEqual(Object.keys(active).sort(), ['created_on', 'fingerprint']);
-  assert.ok(!JSON.stringify(active).includes('BEGIN'));
+  assert.deepEqual(Object.keys(active).sort(),
+    ['active', 'created_on', 'fingerprint', 'modes', 'seals']);
+  assert.equal(active.fingerprint, NEW_REC_FP);
+  assert.equal(active.active, true);
+  assert.ok(!JSON.stringify(active).includes('BEGIN'), 'never the PEM, and never a private half');
+});
+
+test('the GET payload tells the UI which modes can actually work', async () => {
+  /*
+   * THE POINT OF THE SHAPE. Offering `recover` on rows that carry no seal sends
+   * an operator to fetch their master key for a run that was never going to
+   * work — and pasting a recovery private key is itself the exposure this
+   * feature spends every other measure avoiding. So availability is computed
+   * from what the ROWS actually carry, not from what the schema allows.
+   */
+  // 1. Registered key, all rows unsealed — the state right after registering.
+  seed({ recFp: NO_SEAL });
+  let s = await svc.getActiveRecoveryKey();
+  assert.deepEqual(s.seals, { sealed: false, unsealed: true });
+  assert.deepEqual(s.modes, { rotate: true, recover: false, reseal: false, seal: true },
+    'seal is the only thing to do; recover has nothing to open');
+
+  // 2. No key registered and nothing sealed — this deployment's normal state.
+  store.recoveryKeys = [];
+  s = await svc.getActiveRecoveryKey();
+  assert.equal(s.active, false);
+  assert.equal(s.fingerprint, null, 'a payload, not null — "no key" is a supported state');
+  assert.deepEqual(s.modes, { rotate: true, recover: false, reseal: false, seal: false },
+    'only rotate is possible with one key and no seals');
+
+  // 3. Sealed rows, key registered — everything is on the table.
+  seed();
+  s = await svc.getActiveRecoveryKey();
+  assert.deepEqual(s.seals, { sealed: true, unsealed: false });
+  assert.deepEqual(s.modes, { rotate: true, recover: true, reseal: true, seal: false });
+
+  // 4. Mixed — both halves reported, so both modes are offered.
+  seed({ recFp: NO_SEAL });
+  store.personal[0].bank_account_number = mkEnv(OLD_FP, OLD_REC_FP, 'ACCT1');
+  s = await svc.getActiveRecoveryKey();
+  assert.deepEqual(s.seals, { sealed: true, unsealed: true });
+  assert.equal(s.modes.seal && s.modes.reseal, true);
 });
 
 // ════════════════════════════════════════════════════════════════════════
@@ -722,6 +946,16 @@ test('fingerprints are read from an envelope with one OR two of them', () => {
   // Not an envelope at all: nulls, never a throw, so a bulk run cannot be
   // aborted at row 40,000 by one odd value.
   assert.deepEqual(envelopeFingerprints('9876543210'), { operational: null, recovery: null });
+
+  /*
+   * The UNSEALED sentinel comes back AS ITSELF, not folded into null. "written
+   * with no recovery key" is a state with a remedy (mode=seal); "I could not
+   * read this head" is a row to look at. Every skip decision in the service
+   * turns on telling them apart, so collapsing them here would silently put
+   * unsealed rows into reseal's scope and break the run on the first one.
+   */
+  assert.deepEqual(envelopeFingerprints(`v2:aabbccdd:${NO_SEAL}:AAAA:BBBB`),
+    { operational: 'aabbccdd', recovery: NO_SEAL });
 });
 
 test('the operational fingerprint is derived from the RAW key bytes', () => {
@@ -744,10 +978,18 @@ let server;
 let baseUrl;
 let lastReq = null;
 
+/*
+ * Who the request is from. Swapped per test to exercise the Secrets Manager
+ * allowlist, which matches on official_email — the whole point being that the
+ * ROLE is identical in every case (the fake pool grants both action keys to
+ * everyone) and only the email decides.
+ */
+let actingUser = { user_id: 7, official_email: ALLOWED_EMAILS[0] };
+
 before(async () => {
   const app = express();
   app.use(express.json());
-  app.use((req, _res, next) => { lastReq = req; req.user = { user_id: 7 }; next(); });
+  app.use((req, _res, next) => { lastReq = req; req.user = { ...actingUser }; next(); });
   app.use('/api/admin/field-rekey', fieldRekeyRouter);
   await new Promise((resolve) => { server = app.listen(0, resolve); });
   baseUrl = `http://127.0.0.1:${server.address().port}/api/admin/field-rekey`;
@@ -821,6 +1063,113 @@ test('POST /dry-run over HTTP writes nothing and is no-store', async () => {
   assert.match(res.headers.get('cache-control'), /no-store/);
   assert.equal(body.data.totals.would_change, 5);
   assert.deepEqual(writes(), []);
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// 11b. THE SECRETS MANAGER ALLOWLIST — PER PERSON, AND *AND*, NOT *OR*
+// ════════════════════════════════════════════════════════════════════════
+/*
+ * Every route here is gated on easyfix_properties['secrets.manager.emails'] ON
+ * TOP OF the RBAC action keys. Two properties are worth more than "it returns
+ * 403", and both are asserted below:
+ *
+ *   · IT IS AND. The fake pool grants isFieldRekeyRun + isRecoveryKeyManage to
+ *     EVERY caller in this file, so a denial can only have come from the
+ *     allowlist. That is the property the owner is buying: taking someone off
+ *     the property revokes them while their role is untouched, and an OR would
+ *     hand that decision back to whoever administers roles.
+ *
+ *   · IT RUNS FIRST. A denied caller must not reach the handler that has their
+ *     pasted recovery private key in scope, and must not make this endpoint do
+ *     database work. "Zero queries" is how that is proved — a guard mounted
+ *     after requireAction would still 403, but the permission lookup would show
+ *     up in fake.calls. A test that only checked the status code could not tell
+ *     the two apart.
+ */
+const ALL_ROUTES = [
+  ['POST', '/dry-run', { group: 'bank' }],
+  ['POST', '/run', { group: 'bank', mode: 'rotate', newKey: null }],
+  ['POST', '/recovery-key', { publicKeyPem: null }],
+  ['GET', '/recovery-key', null],
+];
+
+test('an allowlisted operator passes every route', async () => {
+  actingUser = { user_id: 7, official_email: ALLOWED_EMAILS[1].toUpperCase() };
+
+  // Case-insensitively, because an email typed into a property is typed by a
+  // person and 'Priyanka@' must not be a different account from 'priyanka@'.
+  const dry = await post('/dry-run', { group: 'bank' });
+  assert.equal(dry.status, 200, await dry.text());
+
+  const get = await fetch(baseUrl + '/recovery-key');
+  assert.equal(get.status, 200);
+  assert.equal((await get.json()).data.fingerprint, NEW_REC_FP);
+});
+
+test('a caller NOT on the property is refused on EVERY route, with ZERO queries', async () => {
+  actingUser = { user_id: 7, official_email: 'someone.else@easyfix.in' };
+
+  for (const [method, path, body] of ALL_ROUTES) {
+    fake.reset();
+    // eslint-disable-next-line no-await-in-loop -- fake.calls is asserted per
+    // route; running these concurrently would pool everyone's queries together.
+    const res = await (method === 'GET'
+      ? fetch(baseUrl + path)
+      : post(path, {
+        ...body,
+        // A real secret on the wire for the two routes that take one.
+        ...(path === '/run' ? { newKey: NEW_KEY, recoveryPrivateKey: oldRecovery.privateKey } : {}),
+        ...(path === '/recovery-key' ? { publicKeyPem: newRecovery.publicKey } : {}),
+      }));
+    // eslint-disable-next-line no-await-in-loop
+    const text = await res.text();
+
+    assert.equal(res.status, 403, `${method} ${path} must be refused`);
+    assert.match(text, /Secrets Manager/, 'and name the list it is not on');
+    assert.deepEqual(fake.calls, [],
+      `${method} ${path} must not touch the database — the guard runs BEFORE the`
+      + ' permission lookup, not after it');
+
+    if (path === '/run') {
+      for (const f of keyFragments(oldRecovery.privateKey)) {
+        assert.ok(!text.includes(f), 'a refusal must not echo the key that came with it');
+      }
+      /*
+       * NOT asserted: that req.body was scrubbed. The scrub lives in the /run
+       * handler's `finally`, and the handler never ran — which is the stronger
+       * statement and the one the zero-queries assertion above already makes.
+       * The key sits in a request object that is about to be garbage collected,
+       * having reached no handler, no validator, no logger and no error handler.
+       */
+    }
+  }
+});
+
+test('the allowlist is AND: the action key alone does not open the door', async () => {
+  /*
+   * The same request, twice, differing ONLY in official_email. Both callers hold
+   * isFieldRekeyRun and isRecoveryKeyManage — the fake pool returns those for
+   * everybody — so a difference in outcome can only be the property.
+   */
+  actingUser = { user_id: 7, official_email: 'role-holder@easyfix.in' };
+  const denied = await post('/dry-run', { group: 'bank' });
+  assert.equal(denied.status, 403);
+
+  actingUser = { user_id: 7, official_email: ALLOWED_EMAILS[0] };
+  const allowed = await post('/dry-run', { group: 'bank' });
+  assert.equal(allowed.status, 200, 'same role, same action keys, different person');
+});
+
+test('an empty or missing property is deny-all — a fresh environment grants nobody', async () => {
+  const properties = require('../services/properties.service');
+  await properties.setProperty(SECRETS_PROPERTY, '');
+  try {
+    actingUser = { user_id: 7, official_email: ALLOWED_EMAILS[0] };
+    const res = await post('/dry-run', { group: 'bank' });
+    assert.equal(res.status, 403, 'fail CLOSED — an unseeded property must not mean "everyone"');
+  } finally {
+    await properties.setProperty(SECRETS_PROPERTY, ALLOWED_EMAILS.join(','));
+  }
 });
 
 // ════════════════════════════════════════════════════════════════════════

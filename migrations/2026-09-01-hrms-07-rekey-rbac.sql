@@ -84,10 +84,10 @@ SELECT id, menu_id, action_name, name, status, delete_status FROM menu_action WH
 -- 'adminAction' leaf inserts NOTHING instead of inserting a key with a NULL
 -- menu_id that Manage Roles could never display.
 INSERT INTO menu_action (menu_id, action_name, name, status, delete_status, created_on)
-SELECT m.menu_id, 'isFieldRekeyRun', 'Re-Key Encrypted Fields (Rotate / Recover / Re-Seal)', 1, 0, NOW() FROM tbl_menu m WHERE m.url = 'adminAction' AND NOT EXISTS (SELECT 1 FROM menu_action ma WHERE ma.action_name = 'isFieldRekeyRun');
+SELECT m.menu_id, 'isFieldRekeyRun', 'Secrets Manager — Re-Key Encrypted Fields (Rotate / Recover / Re-Seal)', 1, 0, NOW() FROM tbl_menu m WHERE m.url = 'adminAction' AND NOT EXISTS (SELECT 1 FROM menu_action ma WHERE ma.action_name = 'isFieldRekeyRun');
 
 INSERT INTO menu_action (menu_id, action_name, name, status, delete_status, created_on)
-SELECT m.menu_id, 'isRecoveryKeyManage', 'Manage the Field Encryption Recovery Key', 1, 0, NOW() FROM tbl_menu m WHERE m.url = 'adminAction' AND NOT EXISTS (SELECT 1 FROM menu_action ma WHERE ma.action_name = 'isRecoveryKeyManage');
+SELECT m.menu_id, 'isRecoveryKeyManage', 'Secrets Manager — Manage the Field Encryption Recovery Key', 1, 0, NOW() FROM tbl_menu m WHERE m.url = 'adminAction' AND NOT EXISTS (SELECT 1 FROM menu_action ma WHERE ma.action_name = 'isRecoveryKeyManage');
 
 
 -- ─── 4. Grant both to Admin (role_id 2) — revive, then insert ────────

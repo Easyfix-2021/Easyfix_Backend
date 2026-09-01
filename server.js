@@ -355,15 +355,33 @@ async function start() {
    * The returned descriptor carries a FINGERPRINT and a source, never key
    * material, so logging it is safe — and it is the only way to answer "which
    * recovery key is this replica sealing to?" without decrypting something.
+   *
+   * ── INFO FOR THE CHOSEN STATE, WARN FOR A BROKEN ONE ──────────────────
+   * source 'none' means no recovery key is configured anywhere. That is the
+   * OWNER'S DECISION (see .env.example), not a fault: values are written with no
+   * break-glass seal and the operational key is the only way in. Warning about
+   * it on every boot would teach everyone to scroll past warnings, so it is
+   * stated once, at info, as the fact it is.
+   *
+   * A key that IS configured and cannot be used — an unparseable PEM, the wrong
+   * key type, a store row disagreeing with its own fingerprint — still THROWS,
+   * and that is a real problem, so it keeps the warning.
    */
   try {
     const fieldCrypto = require('./lib/field-crypto');
     const { recoveryKeyStore } = require('./services/field-rekey.service');
     const desc = await fieldCrypto.resolveRecoveryPublicKey(recoveryKeyStore());
-    logger.info(`Field recovery key loaded · fingerprint=${desc.fingerprint} source=${desc.source}`);
+    if (desc.source === 'none') {
+      logger.info('Field encryption is running with NO recovery key · values are encrypted under '
+        + 'EASYFIX_FIELD_ENC_KEY alone and carry no break-glass seal · losing that key makes them '
+        + 'unreadable · register a recovery key in Admin Actions and run mode=seal to bring '
+        + 'existing rows under it');
+    } else {
+      logger.info(`Field recovery key loaded · fingerprint=${desc.fingerprint} source=${desc.source}`);
+    }
   } catch (err) {
-    logger.warn(`Field recovery key could not be resolved from the database — `
-      + `falling back to EASYFIX_FIELD_RECOVERY_PUBLIC_KEY · ${err.message}`);
+    logger.warn(`Field recovery key is CONFIGURED but could not be resolved — writes fall back to `
+      + `EASYFIX_FIELD_RECOVERY_PUBLIC_KEY, and REFUSE if that is the broken one · ${err.message}`);
   }
 
   const server = app.listen(PORT, () => {

@@ -31,6 +31,21 @@ const FEATURES = {
   // (migrations/2026-08-18-settings-branding.sql). The rest of the Branding
   // screen is ordinary RBAC (isBrandingView / isBrandingEdit).
   canGenerateBrandArt: 'branding.ai.emails',
+  /*
+   * Secrets Manager — re-key every encrypted field, and manage the recovery
+   * key. Outside RBAC for the same reason the others are, only more so: this
+   * screen can decrypt every bank account number in the company and rewrite
+   * the key that protects them. That blast radius should follow a PERSON, not
+   * a role — a role grant propagates to whoever is given that role next, and
+   * nobody re-reads what a role can do when they hand it out.
+   *
+   * The action keys isFieldRekeyRun / isRecoveryKeyManage still apply on top:
+   * RBAC says the screen exists, this allowlist says who may reach it, and
+   * BOTH must pass. Seeded with the two named operators
+   * (migrations/2026-09-01-hrms-08-secrets-manager-allowlist.sql); an absent
+   * or empty property is deny-all, so a fresh environment grants nobody.
+   */
+  canManageSecrets: 'secrets.manager.emails',
   // (Re)provision a CRM user's Microsoft 365 mailbox — it CREATES an Entra
   // directory account and spends a licence seat, so it stays outside RBAC and
   // is granted per person. Seeded EMPTY = deny-all

@@ -3,6 +3,8 @@ const Joi = require('joi');
 
 const validate = require('../../middleware/validate');
 const requireAction = require('../../middleware/require-action');
+const { requirePropertyAllowlist } = require('../../middleware/require-property-allowlist');
+const { FEATURES } = require('../../services/feature-access.service');
 const { rateLimit } = require('../../middleware/rate-limit');
 const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
@@ -12,14 +14,15 @@ const rekeyService = require('../../services/field-rekey.service');
 const { GROUP_KEYS, REKEY_MODES } = rekeyService;
 
 /*
- * /api/admin/field-rekey — Admin Actions → "Re-Key Encrypted Fields".
+ * /api/admin/field-rekey — Admin Actions → "Secrets Manager".
  *
  * The operator surface for services/field-rekey.service.js: rotate the
- * operational key, recover from a lost one, or re-seal to a new recovery key,
- * in bulk, without an SSH session. Mount inherits requireAuth + role(['admin'])
- * + scope from routes/admin/index.js; on top of that every route here carries
- * its own ACTION KEY, seeded on the Admin Actions hub and granted to role_id 2
- * by migrations/2026-09-01-hrms-07-rekey-rbac.sql:
+ * operational key, recover from a lost one, seal rows written without a
+ * recovery key, or re-seal to a new one — in bulk, without an SSH session.
+ * Mount inherits requireAuth + role(['admin']) + scope from
+ * routes/admin/index.js; on top of that every route here carries its own ACTION
+ * KEY, seeded on the Admin Actions hub and granted to role_id 2 by
+ * migrations/2026-09-01-hrms-07-rekey-rbac.sql:
  *
  *   isFieldRekeyRun      POST /dry-run, POST /run
  *   isRecoveryKeyManage  POST /recovery-key, GET /recovery-key
@@ -27,6 +30,30 @@ const { GROUP_KEYS, REKEY_MODES } = rekeyService;
  * An action key rather than a bare role check, because /api/admin/* already
  * admits ten roles and this is the single most sensitive endpoint in the
  * backend.
+ *
+ * ══════════════════════════════════════════════════════════════════════
+ * AND THE EMAIL ALLOWLIST ON TOP — AND, NEVER OR
+ * ══════════════════════════════════════════════════════════════════════
+ * Every route here also requires the caller's official_email to appear in
+ * easyfix_properties['secrets.manager.emails'] (FEATURES.canManageSecrets).
+ * RBAC says the screen EXISTS; the allowlist says WHO MAY REACH IT. Both must
+ * pass, and the allowlist is what makes removal effective: taking a person off
+ * the property revokes them immediately even though their role still carries
+ * the action key. An OR would hand that back to whoever administers roles,
+ * which is the opposite of the point — this screen can rewrite the key
+ * protecting every bank account number in the company, so its blast radius
+ * follows a PERSON, not a role that gets handed out later.
+ *
+ * IT IS MOUNTED router-wide AND FIRST, before the rate limiters, before
+ * validate(), before requireAction — deliberately:
+ *   · a denied caller never reaches a handler that has their pasted recovery
+ *     private key in scope, and never reaches validate(), whose error details
+ *     travel back to the client
+ *   · it costs ZERO queries (the property list is a cached in-process read),
+ *     so a rejected caller cannot make this endpoint do database work
+ * The GET is gated too. It is tempting to leave a read open, but it reports the
+ * active recovery key's fingerprint and whether rows carry a seal — precise
+ * reconnaissance for the one person being kept out, and free to close.
  *
  * ══════════════════════════════════════════════════════════════════════
  * THE PASTED PRIVATE KEY IS THE SECURITY BOUNDARY OF THIS FEATURE
@@ -70,9 +97,20 @@ const { GROUP_KEYS, REKEY_MODES } = rekeyService;
  *
  * ── THE MASTER KEY IS OPTIONAL, AND THE FORM MUST SAY SO ────────────────
  * `rotate` needs the NEW key and nothing else — the current operational key
- * still works and is what unwraps each data key. The recovery private key is
- * required ONLY by `recover` and `reseal`. Every time a recovery key is typed
- * somewhere is an exposure, and the default path must not create one.
+ * still works and is what unwraps each data key. `seal` needs NOTHING pasted at
+ * all: it uses the operational key from env and the active recovery key from the
+ * store. The recovery private key is required ONLY by `recover` and `reseal`.
+ * Every time a recovery key is typed somewhere is an exposure, and neither of
+ * the two ordinary paths may create one.
+ *
+ * ── WHICH MODES THE FORM MAY OFFER ──────────────────────────────────────
+ * This deployment runs with NO recovery key by the owner's decision, so rows are
+ * written UNSEALED and `recover` — which opens a SEALED data key with a private
+ * key — cannot work on them at all. GET /recovery-key answers that: it returns
+ * `active` (is a recovery key registered), `seals` (are there sealed rows,
+ * unsealed rows, or both) and a ready-made `modes` map. The UI must hide or
+ * disable a mode whose flag is false rather than let the operator find out by
+ * pasting their master key into a run that was never going to work.
  */
 
 const noStore = (_req, res, next) => {
@@ -81,6 +119,13 @@ const noStore = (_req, res, next) => {
   next();
 };
 router.use(noStore);
+
+/*
+ * THE PER-PERSON GATE. First real guard on every route in this file — see the
+ * header. Kept as a router.use rather than repeated per route so a route added
+ * later is gated by default rather than by remembering.
+ */
+router.use(requirePropertyAllowlist(FEATURES.canManageSecrets, { label: 'Secrets Manager' }));
 
 /* Same contract as the reveal routes' helper — see routes/profile.js. */
 function clientIp(req) {
@@ -134,6 +179,17 @@ const recoveryKeyLimiter = rateLimit({
   windowMs: 60 * 60_000,
   max: 5,
   key: (req) => `field-rekey-recovery-key:${(req.user && req.user.user_id) || req.ip}`,
+});
+
+/*
+ * The GET is a screen load, so it is far looser than the write above — but it is
+ * bounded, because answering "are any rows unsealed" is a scan of the protected
+ * columns (see sealCensus). Read-only, no key material, one operator.
+ */
+const recoveryStatusLimiter = rateLimit({
+  windowMs: 60 * 60_000,
+  max: 60,
+  key: (req) => `field-rekey-recovery-status:${(req.user && req.user.user_id) || req.ip}`,
 });
 
 // ── Schemas ─────────────────────────────────────────────────────────────
@@ -241,12 +297,20 @@ router.post('/run',
  * refuses a PEM that declares itself private rather than storing it — the one
  * paste mistake that would invert this whole feature.
  *
- * ROTATING DOES NOT RETROACTIVELY PROTECT EXISTING ROWS, and the UI says so:
- * every row already written has its data key sealed to the OLD public key. If
- * the old key LEAKED and is still held, POST /run with mode=reseal fixes that.
- * If it was LOST, those rows keep no break-glass path — the data is not lost,
- * the operational key still reads it perfectly, and the path returns as rows
- * are rewritten.
+ * REGISTERING DOES NOT BY ITSELF PROTECT EXISTING ROWS, and the UI says so.
+ * What fixes them depends on what they carry, and the two cases need different
+ * keys:
+ *
+ *   written with NO recovery key (this deployment's normal state) → POST /run
+ *   with mode=seal. It needs only the OPERATIONAL key, so registering a recovery
+ *   key TODAY retro-protects everything written before it. Nothing is pasted.
+ *
+ *   sealed to a PREVIOUS key that LEAKED and is still held → mode=reseal with
+ *   the OLD private key.
+ *
+ *   sealed to a previous key that was LOST → neither works; those rows keep the
+ *   old seal. The data is not lost, the operational key still reads it, and the
+ *   path moves as rows are rewritten.
  */
 router.post('/recovery-key',
   requireAction('isRecoveryKeyManage'),
@@ -265,14 +329,24 @@ router.post('/recovery-key',
 );
 
 /*
- * GET /recovery-key — the active key's fingerprint and when it was registered.
+ * GET /recovery-key — everything the screen needs to draw itself:
+ *
+ *   { fingerprint, created_on,        the active recovery key, or nulls
+ *     active,                         is one registered at all
+ *     seals: { sealed, unsealed },    what the stored rows actually carry
+ *     modes: { rotate, recover,       which re-key modes can work right now
+ *              reseal, seal } }
+ *
+ * ⚠ It no longer returns `null` when nothing is registered — "no recovery key"
+ * is a supported configuration here, not an unfinished setup, and the screen has
+ * to say so accurately. Branch on `active`, not on the payload being truthy.
  *
  * NEVER any private material, and not the PEM either: the operator already has
- * the public key, and the screen's only question is "which key are new rows
- * being sealed to". A fingerprint is a hash prefix, safe to print.
+ * the public key, and a fingerprint is a hash prefix, safe to print.
  */
 router.get('/recovery-key',
   requireAction('isRecoveryKeyManage'),
+  recoveryStatusLimiter,
   async (req, res, next) => {
     try {
       modernOk(res, await rekeyService.getActiveRecoveryKey(pool));
