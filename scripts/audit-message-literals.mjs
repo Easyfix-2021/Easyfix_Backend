@@ -137,25 +137,56 @@ function importsFrom(file, gt, target, root, text) {
 }
 
 /* ── RETIRED ─────────────────────────────────────────────────────────────── */
+const git = (root, args) => execFileSync('git', args,
+  { cwd: root, encoding: 'utf8', maxBuffer: 1 << 26, stdio: ['ignore', 'pipe', 'pipe'] });
+
+/*
+ * Is the declaration present in the file AS COMMITTED at HEAD? Answered from git
+ * itself rather than from an error message — see pastValues for why that is the
+ * whole point. `HEAD:./rel` resolves relative to cwd, exactly as -L's `:rel` does.
+ *
+ * A file that is not committed at all is equally "no history", so a failure to
+ * read it is `false` — but ONLY because the caller has already established that
+ * git works here. Do not call this without that check.
+ */
+function declaredAtHead(root, rel, name) {
+  let head;
+  try { head = git(root, ['show', `HEAD:./${rel}`]); } catch { return false; }
+  return new RegExp(`const\\s+${name}\\s*=`).test(head);
+}
+
 function pastValues(root, rel, name) {
   // `,+1` — NOT `,+0`, which git rejects as an empty range. That typo made every
   // lookup throw and the whole audit silently report clean.
   let out;
   try {
-    out = execFileSync('git', ['log', '--format=', '-L', `/const ${name}\\s*=/,+1:${rel}`],
-      { cwd: root, encoding: 'utf8', maxBuffer: 1 << 26, stdio: ['ignore', 'pipe', 'pipe'] });
+    out = git(root, ['log', '--format=', '-L', `/const ${name}\\s*=/,+1:${rel}`]);
   } catch (e) {
     /*
-     * "regexec() failed to match" means git could not find the declaration in
-     * the file AT HEAD — the constant exists only in the working tree, i.e. it
-     * is new and uncommitted. A brand-new constant genuinely has no past values,
-     * so that is an ANSWER, not a failure, and returning [] is correct here.
+     * git fails here for two completely different reasons, and conflating them
+     * is how this audit breaks in both directions:
      *
-     * Every other git failure still throws to the caller, which reports it as a
-     * finding. The distinction is the whole point: an earlier version caught all
-     * errors and returned [], so a broken invocation reported the repo clean.
+     *   an ANSWER   the declaration is not in the file at HEAD — the constant is
+     *               new and uncommitted, so it genuinely HAS no past values.
+     *   a FAILURE   anything else. An earlier version caught every error and
+     *               returned [], so a broken invocation reported the repo clean.
+     *
+     * This used to be told apart by matching the text "regexec() failed to
+     * match". THAT STRING IS NOT GIT'S. git prints whatever regerror(3) hands
+     * it, and regerror is libc- and locale-dependent: BSD libc says "regexec()
+     * failed to match", glibc says "No match". So the branch only ever fired on
+     * macOS; on the Ubuntu CI runner every uncommitted constant turned into a
+     * bogus "history lookup failed" finding, which is what reddened the deploy
+     * on 2026-09-01 — green on the developer's machine, red in CI, same commit.
+     *
+     * So ask git the QUESTION the message stood for instead of reading the
+     * message. Two probes, and only on the error path:
+     *   1. is git usable here at all? If not this is a real failure, and the
+     *      ORIGINAL error is surfaced rather than quietly answered "no history".
+     *   2. is the declaration committed? If not, [] is the correct answer.
      */
-    if (/regexec\(\) failed to match/.test(`${e.stderr || ''}${e.message || ''}`)) return [];
+    try { git(root, ['rev-parse', '--verify', 'HEAD']); } catch { throw e; }
+    if (!declaredAtHead(root, rel, name)) return [];
     throw e;
   }
   const vals = new Set();

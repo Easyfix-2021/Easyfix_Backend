@@ -159,6 +159,32 @@ test('a constant with no committed history is "no past values", not an error', (
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('a genuine lookup failure is still a FINDING, never a silent "no history"', () => {
+  /*
+   * The other half of the branch above — and the half that has already failed
+   * once: an earlier version caught EVERY git error and returned [], so a broken
+   * invocation reported the repo clean.
+   *
+   * It matters more since 2026-09-01, when the two cases stopped being told
+   * apart by the text of git's error. That text is not git's to begin with: git
+   * prints whatever regerror(3) hands it, and regerror is libc-dependent — BSD
+   * says "regexec() failed to match", glibc says "No match". The check was
+   * therefore macOS-only and reddened CI on Ubuntu. The split is now made by
+   * asking git whether the declaration is committed, so this control pins that
+   * the rewrite did not buy platform-independence by swallowing real failures.
+   *
+   * A directory that is not a git repo makes every lookup fail for real.
+   */
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'msglit-nogit-'));  // deliberately NOT git init
+  fs.writeFileSync(path.join(dir, 'a.js'),
+    "'use strict';\nconst SOME_PREFIX = 'QQ';\nmodule.exports = { SOME_PREFIX };\n");
+
+  const out = runAllowingFindings(dir, '--retired');
+  assert.match(out, /history lookup failed/, 'a broken lookup must surface, not read as clean');
+  assert.doesNotMatch(out, /: 0$/m, 'and must never be reported as zero findings');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 // ── 3. only now, the repo itself ─────────────────────────────────────────
 
 test('this repo names no retired value and hardcodes no owned one', () => {
