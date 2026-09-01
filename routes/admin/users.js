@@ -12,7 +12,7 @@ const { STAGE_KEYS } = require('../../lib/job-stages');
 // Employee-code format. IMPORTED, never re-typed — lib/emp-code.js is the ONE
 // home for the regex, the parse and the padding (see its header for why a
 // drifted second copy would hand out a duplicate code).
-const { EMP_CODE_RE } = require('../../lib/emp-code');
+const { EMP_CODE_RE, EMP_CODE_FORMAT_HINT } = require('../../lib/emp-code');
 const { modernOk, modernError } = require('../../utils/response');
 const logger = require('../../logger');
 
@@ -59,10 +59,11 @@ const personalEmailCreateField = Joi.string().trim().lowercase().email().max(255
 const personalEmailUpdateField = Joi.string().trim().lowercase().email().max(255).allow('', null).optional();
 
 /*
- * EMPLOYEE CODE — 'EF' + 6 digits, MANDATORY on create, editable on update.
+ * EMPLOYEE CODE — E + 6 digits, MANDATORY on create, editable on update. The
+ * shape and the wording of the failure both come from lib/emp-code.js.
  *
  * Prefilled, not generated: the form calls GET /api/admin/users/next-emp-code,
- * renders 'EF' as a fixed chip (like the @easyfix.in suffix on Official Email)
+ * renders the prefix as a fixed chip (like the @easyfix.in suffix on Official Email)
  * and lets the operator edit only the count. So the value arriving here is
  * OPERATOR-SUPPLIED and a collision is a real case, not a theoretical one — the
  * suggestion endpoint reserves nothing, so two admins opening the form at the
@@ -80,7 +81,7 @@ const personalEmailUpdateField = Joi.string().trim().lowercase().email().max(255
  * in two layers in this codebase and the deeper one silently wins — see the
  * mobile_no note in the personal-email matrix above.
  */
-const EMP_CODE_MESSAGE = 'Employee Code must be "EF" followed by exactly 6 digits (e.g. EF000123)';
+const EMP_CODE_MESSAGE = `Employee Code ${EMP_CODE_FORMAT_HINT}`;
 const empCodeCreateField = Joi.string().trim().pattern(EMP_CODE_RE).required()
   .messages({ 'string.pattern.base': EMP_CODE_MESSAGE, 'any.required': 'Employee Code is required' });
 const empCodeUpdateField = Joi.string().trim().pattern(EMP_CODE_RE).optional()
@@ -200,7 +201,7 @@ router.get('/check-mobile', validate(checkMobileQuery, 'query'), async (req, res
 /*
  * ─── Employee-code prefill ───────────────────────────────────────────
  *
- * GET /api/admin/users/next-emp-code → { count: 258124, code: 'EF258124' }
+ * GET /api/admin/users/next-emp-code → { count: 200244, code: 'E200244' }
  *
  * Mounted BEFORE /:userId, like /check-mobile above, or Express hands
  * "next-emp-code" to the param route and idParam rejects it as a non-integer.

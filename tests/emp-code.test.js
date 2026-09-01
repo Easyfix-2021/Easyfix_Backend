@@ -631,3 +631,71 @@ test('routes/admin/users.js Joi makes user_code REQUIRED on create and format-ch
   assert.equal(updateBody.validate({ user_code: 'E000123' }).error, undefined);
   assert.ok(updateBody.validate({ user_code: 'E12' }).error);
 });
+
+// ── 9. The message the operator actually reads ───────────────────────────
+
+/*
+ * WHY THIS EXISTS, given the tests above already prove every malformed code is
+ * rejected: they prove the 400 HAPPENS, not that what it SAYS is true.
+ *
+ * All three messages shipped to Production reading `"EF" followed by exactly 6
+ * digits (e.g. EF000123)` — the two-letter prefix, months after the format
+ * became E. The 2026-09-01 correction parameterised the regex and the SQL and
+ * stopped there, so validation was right and the advice was wrong: the operator
+ * typed the code the message asked for and the same regex rejected it again.
+ *
+ * The suite could not see it. The Joi test above asserted only
+ * /followed by exactly 6 digits/ — the half of the sentence that never drifts —
+ * and the two service tests asserted status 400 and nothing about the text.
+ * A message assertion that skips the part carrying the value is not an
+ * assertion about the value.
+ *
+ * The prefix is pinned as a LITERAL here, like the scheme test at the top of
+ * this file and for the same reason: derived from EMP_CODE_FORMAT_HINT this
+ * would agree with any prefix, including one changed by accident, which is
+ * exactly the failure it is meant to catch. The negative case is what makes it
+ * bite — a find-and-replace that rewrites the expectation rewrites 'EF' into
+ * 'E' too, and `doesNotMatch` then fails instead of passing vacuously.
+ */
+test('every rejection tells the operator the CURRENT prefix, not the retired one', async () => {
+  const says = (text, where) => {
+    assert.match(text, /"E" followed by exactly 6 digits \(e\.g\. E000123\)/,
+      `${where} must name the prefix in force`);
+    /*
+     * The ADVICE only. The service messages close with `— got "<what you sent>"`,
+     * which is worth keeping — it shows the operator the value the server
+     * actually received, trimming and all — but it means the probe below appears
+     * verbatim in the output, and a bare /EF/ over the whole string matches the
+     * echo rather than the guidance. Asserting on the un-split message would
+     * have failed on correct code, which is how this line got written twice.
+     */
+    assert.doesNotMatch(text.split(' — got ')[0], /EF/,
+      `${where} still advertises the retired two-letter prefix — a code typed from `
+      + 'this message is rejected by the very regex that produced it');
+  };
+
+  // 1 + 2. Joi, both directions. createBody and updateBody share EMP_CODE_MESSAGE,
+  // and sharing it is not a reason to check only one — they are separate schemas.
+  const { createBody, updateBody } = require('../routes/admin/users').__schemas;
+  const base = {
+    user_name: 'Test User', official_email: 'a@easyfix.in', user_role: 2,
+    personal_email: 'a.b@gmail.com',
+  };
+  says(createBody.validate({ ...base, user_code: 'EF000123' }).error.message, 'the create schema');
+  says(updateBody.validate({ user_code: 'EF000123' }).error.message, 'the update schema');
+
+  // 3. The service's create path — the deeper layer, which has its own copy of
+  // the sentence because it names the payload key rather than the form label.
+  fake.reset();
+  const created = await run(() => userService.createUser({ ...CREATE_BASE, user_code: 'EF000123' }));
+  assert.equal(created.status, 400);
+  says(created.rejected, 'createUser');
+
+  // 4. The service's update path. A separate throw site, and the one a
+  // find-and-replace is likeliest to miss — it sits inside a per-key loop.
+  fake.reset();
+  me = editableRow();
+  const updated = await run(() => userService.updateUser(501, { user_code: 'EF000123' }, 99));
+  assert.equal(updated.status, 400);
+  says(updated.rejected, 'updateUser');
+});

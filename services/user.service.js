@@ -11,7 +11,7 @@ const { parseAllowedRows, parseAllowedInput, NO_ACCESS_KEY } = require('../lib/j
  * of the regex would silently hand out a code that already exists.
  * tests/emp-code.test.js fails the build if either signature reappears.
  */
-const { EMP_CODE_RE, EMP_CODE_LOCK, parseEmpCode, nextEmpCode } = require('../lib/emp-code');
+const { EMP_CODE_RE, EMP_CODE_LOCK, EMP_CODE_FORMAT_HINT, parseEmpCode, nextEmpCode } = require('../lib/emp-code');
 // Microsoft 365 mailbox provisioning. Fail-soft + fail-closed by design — see
 // the call site in createUser() for the rules it must obey.
 const entraProvisioning = require('./entra-provisioning.service');
@@ -632,14 +632,14 @@ async function createUser({
    * Employee code FORMAT — enforced here as well as in the route's Joi, for the
    * same reason personal_email is: requiredness and shape live in two layers in
    * this codebase and the DEEPER one silently wins. Case-SENSITIVE on purpose;
-   * nothing normalises 'ef000123' up to 'EF000123', because a stored lowercase
+   * nothing normalises 'e000123' up to 'E000123', because a stored lowercase
    * code would be invisible to parseEmpCode() and to every list filter that
    * uses it. Reject it and let the operator retype.
    */
   const empCode = String(user_code || '').trim();
   if (!empCode) throw mkErr(400, 'user_code is required');
   if (!EMP_CODE_RE.test(empCode)) {
-    throw mkErr(400, `user_code must be "EF" followed by exactly 6 digits (e.g. EF000123) — got "${empCode}"`);
+    throw mkErr(400, `user_code ${EMP_CODE_FORMAT_HINT} — got "${empCode}"`);
   }
 
   /*
@@ -1138,7 +1138,7 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
     if (key === 'user_code' && val) {
       const code = String(val).trim();
       if (!EMP_CODE_RE.test(code)) {
-        throw mkErr(400, `user_code must be "EF" followed by exactly 6 digits (e.g. EF000123) — got "${code}"`);
+        throw mkErr(400, `user_code ${EMP_CODE_FORMAT_HINT} — got "${code}"`);
       }
       /*
        * ── SELF-EXCLUSION — `user_id <> ?` ──────────────────────────────────
