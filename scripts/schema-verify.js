@@ -189,7 +189,15 @@ const EXPECTED = {
   // is_mandatory: same migration, same reasoning as training_videos.is_global.
   // Its absence from this list on 2026-08-26 is why the course list shipped
   // ahead of its migration and 500'd rather than failing the boot check.
-  courses: ['id', 'name', 'description', 'status', 'created_at', 'updated_at', 'is_mandatory'],
+  // reward_points / certificate_enabled: 2026-09-01-course-completion-rewards.
+  // Listed STRICTLY, not probed. A wrong "absent" on is_mandatory silently
+  // disables mandatory training platform-wide, which is why that one is probed;
+  // a missing reward_points is a loud 500 the pre-swap boot gate catches before
+  // traffic moves, and silently paying nobody is the worse failure.
+  courses: [
+    'id', 'name', 'description', 'status', 'created_at', 'updated_at', 'is_mandatory',
+    'reward_points', 'certificate_enabled',
+  ],
   easyfixer_courses: [
     'id', 'easyfixer_id', 'course_id', 'score', 'created_at', 'updated_at',
   ],
@@ -216,7 +224,8 @@ const EXPECTED = {
     'id', 'title', 'description', 'pass_percent', 'max_attempts', 'status',
     'created_at', 'updated_at',
   ],
-  lms_question: ['id', 'assessment_id', 'question_text', 'sequence', 'status'],
+  // image_key: 2026-09-01-lms-question-image. S3 key, NULL for a text question.
+  lms_question: ['id', 'assessment_id', 'question_text', 'sequence', 'status', 'image_key'],
   lms_question_option: ['id', 'question_id', 'option_text', 'is_correct', 'sequence'],
   lms_assessment_attempt: [
     'id', 'easyfixer_id', 'assessment_id', 'course_id', 'attempt_no',

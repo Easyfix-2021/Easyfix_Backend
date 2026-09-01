@@ -8,6 +8,7 @@ const requireAction = require('../../middleware/require-action');
 const { buildRequestScope } = require('../../lib/scope');
 const svc = require('../../services/lms.service');
 const s3 = require('../../utils/s3-storage');
+const { renderCertificatePdf } = require('../../utils/pdf-certificate');
 const { modernOk, modernError } = require('../../utils/response');
 const logger = require('../../logger');
 
@@ -90,10 +91,26 @@ const listCoursesQuery = Joi.object({
   sortDir: Joi.string().lowercase().valid('asc', 'desc').default('asc'),
 });
 
+/*
+ * reward_points accepts '' and null as well as a number — an operator clearing
+ * the field sends the empty string, and rejecting it would leave a course that
+ * cannot be un-paid. The service normalizes every non-positive input to NULL.
+ * The 100000 ceiling is a fat-finger guard, not an economic limit: it is there
+ * so a stray keypress cannot mint a fortune across thousands of enrolments in
+ * one set-based INSERT.
+ */
+const rewardPoints = Joi.alternatives().try(
+  Joi.number().integer().min(0).max(100000),
+  Joi.string().valid(''),
+  Joi.valid(null),
+);
+
 const createCourseBody = Joi.object({
   name: Joi.string().trim().min(2).max(150).required(),
   description: Joi.string().max(2000).allow('', null).optional(),
   is_mandatory: Joi.boolean().optional(),
+  reward_points: rewardPoints.optional(),
+  certificate_enabled: Joi.boolean().optional(),
 });
 
 const updateCourseBody = Joi.object({
@@ -101,6 +118,8 @@ const updateCourseBody = Joi.object({
   description: Joi.string().max(2000).allow('', null).optional(),
   status: Joi.boolean().optional(),
   is_mandatory: Joi.boolean().optional(),
+  reward_points: rewardPoints.optional(),
+  certificate_enabled: Joi.boolean().optional(),
 }).min(1);
 
 /*
@@ -148,6 +167,23 @@ const documentUpload = multer({
  * .ppt/.pptx from some file pickers — the same allowance utils/file-storage
  * makes, and the reason the extension is checked alongside it below.
  */
+/*
+ * 5 MB, single file. Deliberately smaller than the 25 MB document cap: a
+ * question image is a photo of a part or a wiring diagram viewed on a phone,
+ * and anything above a few MB is an un-resized camera original that costs the
+ * technician his data allowance to download mid-assessment.
+ */
+const questionImageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024, files: 1 },
+});
+
+/*
+ * Raster images only. No SVG — it executes script in a viewer, and this file is
+ * rendered inside the technician app. Mirrors routes/admin/notices.js.
+ */
+const IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+
 const DOCUMENT_MIME = new Set([
   'application/pdf',
   'application/vnd.ms-powerpoint',
@@ -203,6 +239,13 @@ const setQuestionsBody = Joi.object({
   questions: Joi.array().min(1).max(100).items(Joi.object({
     question_text: Joi.string().trim().min(1).max(2000).required(),
     sequence: Joi.number().integer().min(0).optional(),
+    /*
+     * The S3 key returned by POST /assessments/images, round-tripped by the
+     * CRM. '' and null both mean "no image" — an operator removing a picture
+     * sends the empty string, and rejecting it would leave the image
+     * un-removable. Length matches lms_question.image_key.
+     */
+    image_key: Joi.string().max(512).allow('', null).optional(),
     options: Joi.array().min(2).max(10).items(Joi.object({
       option_text: Joi.string().trim().min(1).max(500).required(),
       is_correct: Joi.boolean().default(false),
@@ -393,6 +436,112 @@ router.get('/documents', validate(listDocumentsQuery, 'query'), async (req, res,
  *
  * The stored value is the OBJECT KEY, never a URL — see lms.service::documentUrl.
  */
+/*
+ * Upload one question image and return its S3 key. Nothing is written to the
+ * database here.
+ *
+ * WHY THE UPLOAD IS SEPARATE FROM THE SAVE. Questions are saved as a FULL
+ * REPLACE — every row deleted and re-inserted — so question ids do not survive
+ * an edit and a key derived from one would orphan its object on every save.
+ * The operator uploads first, the CRM holds the returned key in the draft, and
+ * the key round-trips unchanged on each save. A retried save re-sends the same
+ * key and produces the same rows.
+ *
+ * THE ORPHAN, STATED PLAINLY. Replacing or removing a question's image leaves
+ * the old object in S3 — the same trade retireDocument already makes (it flips
+ * status and never deletes). Diffing old-against-new key sets inside the
+ * replace transaction is exactly the bookkeeping that DELETE-then-INSERT
+ * exists to avoid, for a few KB per orphan. s3.deleteObject is there if a
+ * cleanup cron is ever actually wanted.
+ *
+ * S3 is REQUIRED — 503 rather than a local-disk fallback, for the same reason
+ * as documents below: a file on one container's ephemeral disk 404s from the
+ * next one, and an assessment whose image will not load is worse than one that
+ * refused to accept it.
+ */
+/*
+ * Stream one technician's completion certificate as a PDF.
+ *
+ * NOT modernOk(): the body is the document itself. Content-Disposition makes
+ * the browser save it with a readable name rather than "certificate".
+ *
+ * no-store, deliberately. The URL is stable and the document contains a named
+ * individual; a cached copy sitting in a shared-machine browser cache is a
+ * small privacy leak for no benefit, since regenerating costs one query and a
+ * few KB of pdfkit.
+ *
+ * Errors BEFORE the first byte become a normal JSON 404 via next(e). Once
+ * renderCertificatePdf has started piping, the status line is already sent —
+ * so nothing between here and doc.end() may throw a response. That is why the
+ * data is fetched completely first and the render is the last statement.
+ */
+/*
+ * assignmentParams, NOT idParam. validate() runs Joi with stripUnknown and then
+ * assigns the result back over req.params — so validating a two-parameter route
+ * against a one-key schema does not merely fail to check the second parameter,
+ * it DELETES it, and the handler reads undefined. Reusing the schema that
+ * already names both is the only correct option here.
+ */
+router.get('/courses/:courseId/certificate/:easyfixerId', requireLmsManage,
+  validate(assignmentParams, 'params'),
+  async (req, res, next) => {
+    try {
+      const courseId = Number(req.params.courseId);
+      const efrId = Number(req.params.easyfixerId);
+      logger.info('Certificate requested · courseId=' + courseId + ' · efrId=' + efrId);
+      const row = await svc.certificateData(courseId, efrId);
+
+      const safeName = String(row.course_name || 'course')
+        .replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'course';
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('Content-Disposition',
+        `attachment; filename="EasyFix-Certificate-${safeName}-${efrId}.pdf"`);
+
+      renderCertificatePdf({
+        technician: { efr_name: row.efr_name, efr_no: row.efr_no },
+        course: { name: row.course_name },
+        completedOn: row.completion_date,
+        score: row.score,
+        stream: res,
+      });
+      return undefined;
+    } catch (e) {
+      return next(e);
+    }
+  });
+
+router.post('/assessments/images', requireLmsManage, questionImageUpload.single('file'), async (req, res, next) => {
+  try {
+    logger.info('Upload question image · mime=' + (req.file?.mimetype || 'none')
+      + ' size=' + (req.file?.size ?? 0));
+    if (!req.file) return modernError(res, 400, 'missing "file" upload');
+    if (!IMAGE_MIME.has(req.file.mimetype)) {
+      logger.warn('Question image rejected · mime=' + req.file.mimetype);
+      return modernError(res, 400, 'only PNG, JPEG, WebP and GIF images are accepted');
+    }
+    if (!s3.isEnabled()) {
+      return modernError(res, 503, 'image storage is not configured (S3_BUCKET_NAME unset)');
+    }
+    const key = `LmsQuestions/${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+    await s3.putAtKey({
+      key,
+      buffer: req.file.buffer,
+      contentType: req.file.mimetype,
+      originalName: req.file.originalname,
+    });
+    logger.info('Question image stored · key=' + key);
+    res.status(201);
+    return modernOk(res, { key }, 'image uploaded');
+  } catch (e) {
+    if (e.code === 'LIMIT_FILE_SIZE') {
+      logger.warn('Question image upload failed · file exceeds 5MB');
+      return modernError(res, 400, 'image exceeds 5MB');
+    }
+    return next(e);
+  }
+});
+
 router.post('/documents', requireLmsManage, documentUpload.single('file'), async (req, res, next) => {
   try {
     logger.info('Upload LMS document · mime=' + (req.file?.mimetype || 'none') + ' size=' + (req.file?.size ?? 0));

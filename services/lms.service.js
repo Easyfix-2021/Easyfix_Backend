@@ -328,6 +328,7 @@ async function listCourses({
   const [rows] = await pool.query(
     `SELECT c.id, c.name, c.description, c.status,
             ${courseMandatory ? 'c.is_mandatory' : '0 AS is_mandatory'},
+            c.reward_points, c.certificate_enabled,
             c.created_at, c.updated_at,
             (SELECT COUNT(*) FROM lms_content lc WHERE lc.course_id = c.id AND lc.status = 1) AS video_count,
             (SELECT COUNT(*) FROM easyfixer_courses ec WHERE ec.course_id = c.id) AS assigned_count
@@ -352,6 +353,7 @@ async function getCourseById(id) {
   const [rows] = await pool.query(
     `SELECT id, name, description, status,
             ${courseMandatory ? 'is_mandatory' : '0 AS is_mandatory'},
+            reward_points, certificate_enabled,
             created_at, updated_at
        FROM courses WHERE id = ?`,
     [Number(id)],
@@ -360,7 +362,26 @@ async function getCourseById(id) {
   return rows[0];
 }
 
-async function createCourse({ name, description, is_mandatory = false }) {
+/*
+ * 0 and NULL both mean "this course pays nothing", and both must be storable.
+ *
+ * An operator clearing the field sends '' — which Number('') is 0, not NaN, the
+ * exact coercion that silently disabled the rewards earn cycle once already.
+ * Storing NULL for any non-positive input keeps one canonical "pays nothing"
+ * value instead of two that read differently in the DB and identically on
+ * screen. Negative points are not a debit tool; adjustPoints() is.
+ */
+function normalizeRewardPoints(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.trunc(n);
+}
+
+async function createCourse({
+  name, description, is_mandatory = false,
+  reward_points = null, certificate_enabled = false,
+}) {
   logger.info('Create course · name=' + name);
   const [dupe] = await pool.query(
     'SELECT id FROM courses WHERE name = ? AND status = 1',
@@ -387,13 +408,23 @@ async function createCourse({ name, description, is_mandatory = false }) {
    * just cannot be marked mandatory, which is the flag's own default anyway.
    */
   const { courseMandatory } = await lmsFlagColumns();
+  /*
+   * reward_points / certificate_enabled are NOT probe-guarded the way
+   * is_mandatory is. schema-verify lists them strictly, so a deploy missing
+   * them fails its boot check before serving traffic — whereas silently
+   * dropping them would create courses that look configured in the modal and
+   * pay nobody, which is the failure that is expensive to notice.
+   */
   const [ins] = await pool.query(
     `INSERT INTO courses (name, description, status,
-                          ${courseMandatory ? 'is_mandatory,' : ''} created_at, updated_at)
-     VALUES (?, ?, 1, ${courseMandatory ? '?,' : ''} ?, ?)`,
-    courseMandatory
-      ? [String(name).trim(), description || null, is_mandatory ? 1 : 0, now, now]
-      : [String(name).trim(), description || null, now, now],
+                          ${courseMandatory ? 'is_mandatory,' : ''}
+                          reward_points, certificate_enabled, created_at, updated_at)
+     VALUES (?, ?, 1, ${courseMandatory ? '?,' : ''} ?, ?, ?, ?)`,
+    [
+      String(name).trim(), description || null,
+      ...(courseMandatory ? [is_mandatory ? 1 : 0] : []),
+      normalizeRewardPoints(reward_points), certificate_enabled ? 1 : 0, now, now,
+    ],
   );
   logger.info('Course created · id=' + ins.insertId);
   return { id: ins.insertId };
@@ -433,6 +464,22 @@ async function updateCourse(id, patch = {}) {
   if (patch.is_mandatory !== undefined && (await lmsFlagColumns()).courseMandatory) {
     sets.push('is_mandatory = ?');
     params.push(patch.is_mandatory ? 1 : 0);
+  }
+  /*
+   * Lowering or clearing reward_points does NOT claw back points already paid
+   * — the ledger is append-only and a completion award is keyed to the
+   * enrolment, so past awards stand. It only changes what future completions
+   * are worth. Raising it does not top up either: uq_reward_award sees the
+   * enrolment as already paid and ignores the second insert. Both are the
+   * intended behaviour, not a gap.
+   */
+  if (patch.reward_points !== undefined) {
+    sets.push('reward_points = ?');
+    params.push(normalizeRewardPoints(patch.reward_points));
+  }
+  if (patch.certificate_enabled !== undefined) {
+    sets.push('certificate_enabled = ?');
+    params.push(patch.certificate_enabled ? 1 : 0);
   }
   if (patch.status !== undefined) {
     sets.push('status = ?');
@@ -1023,6 +1070,36 @@ async function assignCourse(courseId, easyfixerIds = [], options = {}) {
  * stamped complete the moment it is assigned — vacuously true otherwise, since
  * a course with no items has no unfinished item.
  */
+/*
+ * Pay the completion award, and NEVER let it break completion.
+ *
+ * Both stamp paths call this rather than their callers doing it, because
+ * completion is settled from several places and a call site is a call site
+ * somebody forgets — the reason stampCompletionsForCourse exists at all is
+ * that stampCourseCompletions was reachable from exactly one of the places
+ * that needed it.
+ *
+ * SWALLOWED ON PURPOSE. The stamp is already committed by the time we get
+ * here, and settleTrainingCompletion's own throw is what advances the
+ * technician's lifecycle out of TRAINING_PENDING. Letting a ledger failure
+ * propagate would leave a technician stamped complete but stuck in training
+ * limbo over points — trading a working lifecycle for a reward. The award is
+ * idempotent and re-attempted on the next settle, so swallowing loses nothing
+ * permanently; blocking the lifecycle would.
+ *
+ * Lazily required: rewards.service does not require this module today, but the
+ * LMS↔rewards direction is exactly where a cycle would appear next.
+ */
+async function settleCompletionPoints(scope) {
+  try {
+    return await require('./rewards.service').awardCourseCompletions(scope);
+  } catch (e) {
+    logger.warn('Course completion points failed · ' + JSON.stringify(scope)
+      + ' · ' + e.message);
+    return { awarded: 0, failed: true };
+  }
+}
+
 async function stampCourseCompletions(efrId) {
   const [r] = await pool.query(
     `UPDATE easyfixer_courses ec
@@ -1036,6 +1113,7 @@ async function stampCourseCompletions(efrId) {
   if (r.affectedRows > 0) {
     logger.info('Training completion stamped · efrId=' + efrId + ' · courses=' + r.affectedRows);
   }
+  await settleCompletionPoints({ efrIds: [Number(efrId)] });
   return { stamped: r.affectedRows };
 }
 
@@ -1095,6 +1173,9 @@ async function stampCompletionsForCourse(courseId, easyfixerIds = []) {
     logger.info('Assignment-time completion stamped · courseId=' + courseId
       + ' · alreadyComplete=' + r.affectedRows);
   }
+  await settleCompletionPoints(all
+    ? { courseId: Number(courseId) }
+    : { courseId: Number(courseId), efrIds: ids });
   return { stamped: r.affectedRows };
 }
 
@@ -2027,6 +2108,41 @@ async function listAssessments({ q, limit = 200, offset = 0 } = {}) {
  * answers stripped afterwards, because a stripping step is one forgotten
  * `...spread` away from leaking the whole key.
  */
+/*
+ * An empty string is not a key.
+ *
+ * The CRM sends '' for a question whose image was removed, and '' is a
+ * perfectly storable VARCHAR value — it would then presign to a broken URL
+ * rather than rendering as "no image". One canonical absent value, NULL.
+ */
+function normalizeImageKey(v) {
+  const k = String(v ?? '').trim();
+  return k ? k.slice(0, 512) : null;
+}
+
+/*
+ * Resolve every question's image_key to a presigned imageUrl.
+ *
+ * Concurrent, not sequential: presigning is a local HMAC in
+ * @aws-sdk/s3-request-presigner (getPresignedUrl issues no HeadObject), so a
+ * 100-question paper costs one tick rather than 100 round trips. If that ever
+ * stops being true this is the single place to bound it — the rest of the
+ * codebase's worker-pool pattern is in rewards.service::itemsForMobile.
+ *
+ * `dropKey` is what keeps the technician payload honest: the storage key is
+ * removed from the object rather than merely not selected, so the same helper
+ * can serve both audiences without the admin's round-trip key leaking into the
+ * app's response.
+ */
+async function withImageUrls(questions, { dropKey = false } = {}) {
+  return Promise.all(questions.map(async (q) => {
+    const imageUrl = q.image_key ? await documentUrl(q.image_key) : null;
+    const out = { ...q, imageUrl };
+    if (dropKey) delete out.image_key;
+    return out;
+  }));
+}
+
 async function getAssessmentForAdmin(id) {
   const aid = Number(id);
   const [[assessment]] = await pool.query(
@@ -2038,6 +2154,7 @@ async function getAssessmentForAdmin(id) {
 
   const [rows] = await pool.query(
     `SELECT q.id AS question_id, q.question_text, q.sequence AS question_sequence,
+            q.image_key,
             o.id AS option_id, o.option_text, o.is_correct, o.sequence AS option_sequence
        FROM lms_question q
        LEFT JOIN lms_question_option o ON o.question_id = q.id
@@ -2053,6 +2170,13 @@ async function getAssessmentForAdmin(id) {
         id: r.question_id,
         question_text: r.question_text,
         sequence: r.question_sequence,
+        /*
+         * The admin gets BOTH: image_key to re-send on the next full-replace
+         * save, imageUrl to render. Returning only the URL would silently drop
+         * every image the first time an operator edited a question's text,
+         * because the save would round-trip a presigned URL as the key.
+         */
+        image_key: r.image_key || null,
         options: [],
       });
     }
@@ -2065,7 +2189,8 @@ async function getAssessmentForAdmin(id) {
       });
     }
   }
-  return { ...assessment, questions: [...byQuestion.values()] };
+  const questions = await withImageUrls([...byQuestion.values()]);
+  return { ...assessment, questions };
 }
 
 async function createAssessment({ title, description = null, pass_percent, max_attempts }) {
@@ -2219,9 +2344,22 @@ async function setAssessmentQuestions(assessmentId, questions = []) {
     await conn.query('DELETE FROM lms_question WHERE assessment_id = ?', [aid]);
 
     for (const [qi, q] of questions.entries()) {
+      /*
+       * image_key round-trips from the client, and that is deliberate.
+       *
+       * This save is a full replace — every question is DELETEd and re-INSERTed
+       * — so question ids change on every edit. An S3 key derived from the
+       * question id (the Skills/Skill_<id>_<seq> shape used elsewhere) would
+       * orphan its object on each save. The upload happens first, as its own
+       * call, and the CRM holds the returned key in the draft and re-sends it
+       * unchanged. A retried save therefore re-sends the same key and produces
+       * the same rows, which is what makes the existing retry safe.
+       */
       const [qIns] = await conn.query(
-        'INSERT INTO lms_question (assessment_id, question_text, sequence, status) VALUES (?, ?, ?, 1)',
-        [aid, String(q.question_text), Number(q.sequence) || qi + 1],
+        `INSERT INTO lms_question (assessment_id, question_text, sequence, status, image_key)
+         VALUES (?, ?, ?, 1, ?)`,
+        [aid, String(q.question_text), Number(q.sequence) || qi + 1,
+          normalizeImageKey(q.image_key)],
       );
       for (const [oi, o] of (q.options || []).entries()) {
         await conn.query(
@@ -2297,7 +2435,7 @@ async function getAssessmentForTech(efrId, assessmentId) {
   if (!assessment) throw mkErr(404, 'assessment not found');
 
   const [rows] = await pool.query(
-    `SELECT q.id AS question_id, q.question_text, o.id AS option_id, o.option_text
+    `SELECT q.id AS question_id, q.question_text, q.image_key, o.id AS option_id, o.option_text
        FROM lms_question q
        JOIN lms_question_option o ON o.question_id = q.id
       WHERE q.assessment_id = ? AND q.status = 1
@@ -2308,7 +2446,16 @@ async function getAssessmentForTech(efrId, assessmentId) {
   const byQuestion = new Map();
   for (const r of rows) {
     if (!byQuestion.has(r.question_id)) {
-      byQuestion.set(r.question_id, { id: r.question_id, question_text: r.question_text, options: [] });
+      /*
+       * image_key is read but NEVER emitted here — the technician gets the
+       * presigned imageUrl only. Same discipline as is_correct next door: this
+       * projection names everything that leaves the function, so an internal
+       * storage key cannot ride out in a spread or a future added field.
+       */
+      byQuestion.set(r.question_id, {
+        id: r.question_id, question_text: r.question_text,
+        image_key: r.image_key, options: [],
+      });
     }
     byQuestion.get(r.question_id).options.push({ id: r.option_id, option_text: r.option_text });
   }
@@ -2325,7 +2472,7 @@ async function getAssessmentForTech(efrId, assessmentId) {
     passPercent: Number(assessment.pass_percent),
     maxAttempts: Number(assessment.max_attempts),
     attemptsUsed: Number(used?.n) || 0,
-    questions: [...byQuestion.values()],
+    questions: await withImageUrls([...byQuestion.values()], { dropKey: true }),
   };
 }
 
@@ -2540,6 +2687,44 @@ async function ackDocument(efrId, contentId) {
  * percentage would be a fourth copy of the rule, and the one running on a
  * phone that has not been updated in six months.
  */
+/*
+ * Everything a certificate prints, in one query — or a 404.
+ *
+ * FOUR ways this legitimately has no certificate, all of them a 404 rather
+ * than a blank PDF: the enrolment does not exist, the course was retired, the
+ * technician has not finished it, or the course does not offer a certificate.
+ * Rendering an empty or half-filled document for any of those would put a
+ * meaningless artifact in a technician's hands that looks official.
+ *
+ * Reads the STAMPED completion_date, not the computed isTrainingComplete().
+ * Those two can disagree — adding an item to a course makes the computed
+ * answer regress while the stamp never un-stamps — and the stamped fact is
+ * the one this codebase already rides for "overdue". Same rule, same reason:
+ * a certificate that vanishes because an admin added a video next month is
+ * worse than one issued against the course as it stood on the day.
+ */
+async function certificateData(courseId, efrId) {
+  const [[row]] = await pool.query(
+    `SELECT ec.id            AS enrolment_id,
+            ec.completion_date,
+            ec.score,
+            c.name           AS course_name,
+            e.efr_name,
+            e.efr_no
+       FROM easyfixer_courses ec
+       JOIN courses c        ON c.id = ec.course_id
+       JOIN tbl_easyfixer e  ON e.efr_id = ec.easyfixer_id
+      WHERE ec.course_id = ?
+        AND ec.easyfixer_id = ?
+        AND c.status = 1
+        AND c.certificate_enabled = 1
+        AND ec.completion_date IS NOT NULL`,
+    [Number(courseId), Number(efrId)],
+  );
+  if (!row) throw mkErr(404, 'no certificate available for this technician and course');
+  return row;
+}
+
 async function coursesForTech(efrId) {
   const efr = Number(efrId);
   // Probed: this is the technician's own LMS screen, and both the projection
@@ -2548,7 +2733,16 @@ async function coursesForTech(efrId) {
   const [courses] = await pool.query(
     `SELECT ec.course_id AS id, c.name, c.description,
             ${courseMandatory ? 'c.is_mandatory' : '0 AS is_mandatory'},
-            ec.due_date, ec.completion_date, ec.score
+            ec.due_date, ec.completion_date, ec.score,
+            /*
+             * The badge is a DERIVED VIEW, not a stored award: "this course
+             * offers a certificate" AND "this technician finished it". There
+             * is no badge table, no rows to keep in sync and no artwork to
+             * ship — the trophy the app renders is these two facts and the
+             * course's own name. A badges table would have to be backfilled
+             * from exactly this expression anyway.
+             */
+            c.certificate_enabled
        FROM easyfixer_courses ec
        JOIN courses c ON c.id = ec.course_id
       WHERE ec.easyfixer_id = ? AND c.status = 1
@@ -2640,6 +2834,7 @@ async function coursesForTech(efrId) {
 }
 
 module.exports = {
+  certificateData,
   mandatoryVideoIdsSql,
   visibleVideoIdsSql,
   lmsFlagColumns,

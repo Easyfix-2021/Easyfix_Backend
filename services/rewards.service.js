@@ -44,6 +44,13 @@ const REASON = Object.freeze({
   CLAIM: 'CLAIM',
   CLAIM_REFUND: 'CLAIM_REFUND',
   MANUAL: 'MANUAL',
+  /*
+   * Finishing a course that opted in via courses.reward_points. Keyed
+   * ('COURSE', 'course', easyfixer_courses.id) — the ENROLMENT row, never the
+   * course id; see awardCourseCompletions below for why that distinction is
+   * the whole idempotency guarantee.
+   */
+  COURSE: 'COURSE',
 });
 
 const CLAIM_STATUSES = Object.freeze(['ORDERED', 'PACKED', 'SENT', 'DELIVERED', 'REJECTED']);
@@ -210,6 +217,95 @@ async function award({ efrId, delta, reasonCode, refType = null, refId = null, n
     if (e && e.code === 'ER_DUP_ENTRY') return { awarded: false, duplicate: true };
     throw e;
   }
+}
+
+/*
+ * Pay every unpaid completed enrolment for these technicians, in ONE statement.
+ *
+ * ─── WHY ref_id IS THE ENROLMENT, NOT THE COURSE ────────────────────────────
+ * uq_reward_award is UNIQUE (reason_code, ref_type, ref_id) and is NOT scoped
+ * by easyfixer_id. Keying on course_id would therefore let exactly ONE
+ * technician on the platform ever be paid for a given course; every later
+ * award would hit the constraint and be swallowed as "already paid". Keying on
+ * easyfixer_courses.id — which UNIQUE (easyfixer_id, course_id) makes exactly
+ * one row per technician per course — makes the award once-per-person, and
+ * re-assignment keeps that id (ON DUPLICATE KEY UPDATE in assignCourse), so a
+ * re-assigned course cannot pay twice either.
+ *
+ * ─── WHY SET-BASED AND NOT award() IN A LOOP ────────────────────────────────
+ * assignCourseToAll stamps completion for every assignee at once — on this
+ * dataset 2,439 technicians have already watched all three induction videos,
+ * so the bulk path can settle thousands of enrolments in one call. A per-row
+ * award() would be thousands of round trips for a fact one INSERT expresses.
+ * Both callers share THIS function rather than one looping and one not,
+ * because two ledger-writing code paths for the same event is how the shapes
+ * drift apart.
+ *
+ * ─── WHY ON DUPLICATE KEY UPDATE AND NOT INSERT IGNORE ──────────────────────
+ * INSERT IGNORE downgrades EVERY error to a warning — a truncated value, a bad
+ * FK, a NOT NULL violation all vanish silently, and the ledger would simply be
+ * short a row nobody could explain. `ON DUPLICATE KEY UPDATE id = id` ignores
+ * precisely the duplicate and nothing else.
+ *
+ * Reads courses.reward_points, so it must not run before that column exists;
+ * schema-verify requires it and the boot check fails loudly if it is missing.
+ */
+async function awardCourseCompletions({ efrIds = null, courseId = null } = {}, executor = pool) {
+  const ids = efrIds == null ? null : (Array.isArray(efrIds) ? efrIds : [efrIds])
+    .map((n) => Number(n)).filter((n) => Number.isInteger(n) && n > 0);
+  const course = Number(courseId) || null;
+  /*
+   * At least one narrowing is REQUIRED. Both null would pay every completed
+   * enrolment on the platform — idempotent, so it would not double-pay, but it
+   * would back-pay history the moment an operator first sets reward_points on
+   * an old course, which is a business decision nobody made in a code path
+   * nobody is looking at. An empty (not absent) id list means "these zero
+   * technicians" and is a legitimate no-op.
+   */
+  if (ids === null && !course) return { awarded: 0, skipped: 'unscoped' };
+  if (ids !== null && !ids.length) return { awarded: 0, skipped: 'no-ids' };
+  /*
+   * The global pause is honoured here, not at the call sites. Course
+   * completion is settled from more than one place; a gate at each is a gate
+   * somebody forgets.
+   */
+  if (earningPaused()) return { awarded: 0, skipped: 'paused' };
+
+  const where = [
+    'ec.completion_date IS NOT NULL',
+    'c.reward_points IS NOT NULL',
+    'c.reward_points > 0',
+  ];
+  const params = [REASON.COURSE, new Date()];
+  if (course) { where.push('ec.course_id = ?'); params.push(course); }
+  if (ids !== null) {
+    where.push(`ec.easyfixer_id IN (${ids.map(() => '?').join(',')})`);
+    params.push(...ids);
+  }
+
+  const [r] = await executor.query(
+    `INSERT INTO reward_points_ledger
+       (easyfixer_id, delta, reason_code, ref_type, ref_id, note, created_by, created_at)
+     SELECT ec.easyfixer_id, c.reward_points, ?, 'course', ec.id,
+            CONCAT('Course completed: ', LEFT(COALESCE(c.name, ''), 180)), NULL, ?
+       FROM easyfixer_courses ec
+       JOIN courses c ON c.id = ec.course_id
+      WHERE ${where.join('\n        AND ')}
+     ON DUPLICATE KEY UPDATE reward_points_ledger.id = reward_points_ledger.id`,
+    params,
+  );
+  /*
+   * affectedRows counts 1 per inserted row and 0 per ignored duplicate, so on
+   * a re-settle of already-paid courses this is 0 — which is the normal case,
+   * not a problem, and is why it is logged only when non-zero.
+   */
+  const awarded = Number(r.affectedRows) || 0;
+  if (awarded > 0) {
+    logger.info('Course completion points awarded · ledgerRows=' + awarded
+      + ' · technicians=' + (ids === null ? 'all-assignees' : ids.length)
+      + ' · courseId=' + (course ?? 'any'));
+  }
+  return { awarded };
 }
 
 async function ledgerFor(efrId, { limit = 50, offset = 0 } = {}) {
@@ -1629,6 +1725,7 @@ async function runEarnCycle() {
 
 module.exports = {
   REASON,
+  awardCourseCompletions,
   CLAIM_STATUSES,
   CLAIM_PIPELINE,
   pointsConfig,
