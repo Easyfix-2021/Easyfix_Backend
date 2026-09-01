@@ -14,7 +14,7 @@ const jobCommentService = require('../../services/job-comment.service');
 const shareService = require('../../services/job-share.service');
 const voice = require('../../services/voice.service');
 const easyfixerLifecycle = require('../../services/easyfixer-lifecycle.service');
-const { dailyBridgeCapReached, persistBridgeCall } = require('../public/_public-call');
+const { dailyBridgeCapReached, persistBridgeCall, CALL_FAILED_PUBLIC_MSG } = require('../public/_public-call');
 const { modernOk, modernError } = require('../../utils/response');
 const { rateLimit } = require('../../middleware/rate-limit');
 const {
@@ -603,7 +603,16 @@ router.post('/jobs/:id/customer-call', async (req, res, next) => {
     }
     if (!result.delivered) {
       logger.warn({ jobId, diagnostic: result.diagnostic, err: result.error }, 'mobile customer-call failed');
-      return modernError(res, 502, 'Could not place the call. Please try again.');
+      /*
+       * The SHARED sentence, not a copy of it. This file already imported two
+       * things from _public-call and then spelt this one out, which is how the
+       * message drifts from the one the public routes send for the identical
+       * failure. Its wording is a security property — the real diagnostic
+       * (Kaleyra status, provider error, mis-normalised number) is logged on the
+       * line above and must never reach a client — so three independently
+       * editable copies is the wrong number of places to get that right.
+       */
+      return modernError(res, 502, CALL_FAILED_PUBLIC_MSG);
     }
     await persistBridgeCall(audit);
     return modernOk(res, { delivered: true });
