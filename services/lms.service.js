@@ -2827,7 +2827,23 @@ async function coursesForTech(efrId) {
             ec.badge_earned_at
        FROM easyfixer_courses ec
        JOIN courses c ON c.id = ec.course_id
-      WHERE ec.easyfixer_id = ? AND c.status = 1
+      /*
+       * A retired course still shows if this technician EARNED a badge from it.
+       *
+       * A bare c.status = 1 made the durability claim false on exactly the
+       * surface that matters most: retiring a course dropped the row from the
+       * technician's list altogether, taking the trophy AND the certificate
+       * button with it — the very revocation badge_earned_at exists to prevent.
+       * The CRM path and the download endpoint were already safe; this one was
+       * not, because it filters the LIST rather than the entitlement.
+       *
+       * It cannot resurrect work: a badge implies completion_date, so a
+       * retired-but-earned course renders as finished, never as something still
+       * owed. Retiring a course still hides it from everyone who had not
+       * finished it, which is the point of retiring one.
+       */
+      WHERE ec.easyfixer_id = ?
+        AND (c.status = 1 OR ec.badge_earned_at IS NOT NULL)
       /*
        * MANDATORY FIRST. These are the courses that gate a technician's work,
        * so they lead the screen regardless of due date — a required course

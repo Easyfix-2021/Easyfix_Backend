@@ -223,3 +223,20 @@ test('the mobile certificate route takes NO technician id from the request', () 
   assert.match(block, /await lms\.certificateData[\s\S]*renderCertificatePdf/,
     'fetch before piping — once the stream starts a 404 can no longer be sent');
 });
+
+test('a RETIRED course still reaches the technician if they earned its badge', () => {
+  /*
+   * The gap the durability claim actually had. certificateData() and the CRM
+   * were already safe, but the technician's own list filtered on c.status = 1 —
+   * so retiring a course removed the row entirely, taking the trophy and the
+   * download button with it. Filtering the LIST revoked what the entitlement
+   * was designed to keep.
+   */
+  const src = fs.readFileSync(path.join(ROOT, 'services/lms.service.js'), 'utf8');
+  const i = src.indexOf('async function coursesForTech');
+  const block = src.slice(i, i + 3000);
+  assert.match(block, /c\.status = 1 OR ec\.badge_earned_at IS NOT NULL/,
+    'an earned badge must outlive the course it came from, on every surface');
+  assert.doesNotMatch(block, /WHERE ec\.easyfixer_id = \? AND c\.status = 1\b/,
+    'the bare status filter is what revoked it');
+});
