@@ -30,8 +30,21 @@ jobs:
       # commit is HEAD, so every constant's history is exactly its current
       # value, `stale` is always empty, and the check cannot fire — it reports
       # a clean 0 while being structurally incapable of finding anything.
-      # Verified against a real --depth 1 clone: EMP_CODE_PREFIX's retired 'EF'
-      # is invisible there. 571 commits / 8 MiB, so this costs nothing.
+      # Verified against a real --depth 1 clone of THIS repo:
+      # CONVERSATION_TEMPLATE_NAME's retired 'confirm_order_flow' is visible in
+      # full history and invisible at depth 1, so the audit reports a clean 0
+      # there while being unable to see anything. Five constants currently carry
+      # a retired value (field-crypto VERSION and MAX_CIPHERTEXT_CHARS,
+      # EXPORT_ROW_CAP, PROFILE_TEMPLATE_NAME, CONVERSATION_TEMPLATE_NAME), so
+      # the RETIRED half has real work here — this is not a precaution.
+      #
+      # The example previously named here was EMP_CODE_PREFIX's retired 'EF'.
+      # That is true of the CRM, where 9c9b22b shipped 'EF' and e3b4526 corrected
+      # it, but NOT of this repo: 140c1af introduced the constant already holding
+      # 'E'. The conclusion was right and the evidence was borrowed — which is
+      # the same defect this audit exists to catch, one directory up.
+      #
+      # 571 commits / 8 MiB, so this costs nothing.
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       - uses: actions/setup-node@v4
