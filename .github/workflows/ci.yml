@@ -24,7 +24,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
+      # FULL history, not the default depth-1. The RETIRED half of the
+      # message-literal audit (scripts/audit-message-literals.mjs) asks
+      # `git log -L` what a constant USED to hold. In a depth-1 clone the only
+      # commit is HEAD, so every constant's history is exactly its current
+      # value, `stale` is always empty, and the check cannot fire — it reports
+      # a clean 0 while being structurally incapable of finding anything.
+      # Verified against a real --depth 1 clone: EMP_CODE_PREFIX's retired 'EF'
+      # is invisible there. 571 commits / 8 MiB, so this costs nothing.
       - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
       - uses: actions/setup-node@v4
         with: { node-version: 20, cache: 'npm' }
       - run: npm ci
