@@ -98,6 +98,78 @@ router.post('/auth/support', validate(Joi.object({
   } catch (e) { next(e); }
 });
 
+/*
+ * ─── SIGNUP — A REQUEST FOR ACCESS, NOT SELF-SERVICE ───────────────────────
+ *
+ * The landing page has always POSTed here and the route did not exist, so
+ * "Signup Now" 404'd and the form reported "Signup failed. Please contact your
+ * account manager." — which reads as a policy decision rather than a bug, and
+ * so was invisible.
+ *
+ * ⚠ IT DELIBERATELY DOES NOT CREATE ANYTHING. A portal SPOC is a row in
+ * tbl_client_contacts belonging to a specific client, and the client id is
+ * typed by whoever fills this form — an unauthenticated stranger. Provisioning
+ * on that input would let anyone attach themselves to any client and then
+ * receive that client's login OTPs. Access is granted by ops, so this routes
+ * the request to them, exactly as /auth/support does for a login problem.
+ *
+ * For the same reason the response never reveals whether the client id exists:
+ * it always reports "sent", so the form cannot be used to enumerate clients.
+ * The email itself says whether the id matched, because ops need that.
+ *
+ * Placed ABOVE requireSpocAuth — someone without an account cannot be
+ * authenticated by definition.
+ */
+router.post('/auth/signup', validate(Joi.object({
+  clientId: Joi.string().trim().min(1).max(120).required(),
+  email:    Joi.string().trim().max(150).pattern(/.+@.+\..+/).required()
+    .messages({ 'string.pattern.base': 'valid email required' }),
+})), async (req, res, next) => {
+  try {
+    const clientId = String(req.body.clientId).trim();
+    const email = String(req.body.email).trim();
+
+    /* Resolve for the EMAIL's benefit only — never for the response. Accepts a
+     * numeric id or a name, because the field says "Client ID" and people type
+     * their company. */
+    const asNum = Number(clientId);
+    const [[match]] = await pool.query(
+      Number.isInteger(asNum) && asNum > 0
+        ? 'SELECT client_id, client_name FROM tbl_client WHERE client_id = ? LIMIT 1'
+        : 'SELECT client_id, client_name FROM tbl_client WHERE client_name = ? LIMIT 1',
+      [Number.isInteger(asNum) && asNum > 0 ? asNum : clientId],
+    );
+
+    const known = match
+      ? `Matched client ${match.client_id} — ${match.client_name}.`
+      : 'No client matched that value; it was typed by the requester and is unverified.';
+    const text = `A client-portal access request came in from the public login page.
+
+`
+      + `Client ID entered : ${clientId}
+`
+      + `Email             : ${email}
+
+`
+      + `${known}
+
+`
+      + `No account has been created. To grant access, add them as a contact on
+`
+      + `the client (Manage Clients -> Contacts) — they can then sign in by OTP.`;
+
+    await require('../../services/email.service').send({
+      to: ['ithelpdesk@easyfix.in'],
+      cc: ['prem.rai@easyfix.in'],
+      subject: `Client Portal — access request${match ? ' – ' + match.client_name : ''}`,
+      text,
+      category: 'client-signup-request',
+    });
+    logger.info('Client portal signup request · clientId=' + clientId + ' · matched=' + (match ? match.client_id : 'no'));
+    modernOk(res, { sent: true });
+  } catch (e) { next(e); }
+});
+
 // ─── Protected ──────────────────────────────────────────────────────
 router.use(requireSpocAuth);
 
@@ -3748,6 +3820,107 @@ router.delete('/contacts/:id', async (req, res, next) => {
     if (!affected) return modernError(res, 404, 'contact not found');
     modernOk(res, { deleted: true });
   } catch (e) { next(e); }
+});
+
+/*
+ * ─── CREATE / UPDATE A SINGLE CONTACT ──────────────────────────────────────
+ *
+ * The Profile → Contacts editor has always POSTed and PUT here; the routes did
+ * not exist, so Add, Edit and the Activate/Deactivate toggle all 404'd. Only
+ * bulk-upload could create a contact and only DELETE could change one.
+ *
+ * ⚠ THE RULES MIRROR THE SPREADSHEET'S, DELIBERATELY. One contact typed into a
+ * form and one row of an uploaded sheet are the same object, and a sheet that
+ * rejects a 9-digit phone while the form accepts it produces two populations in
+ * one table. These are client-xlsx.service.js's checks, in Joi:
+ *   name required · email /.+@.+\..+/ · phone exactly 10 digits after stripping
+ *   non-digits · alt phone same if present · designation <= 100.
+ *
+ * The email regex is the sheet's, not Joi's stricter .email(), for the same
+ * reason — a row that uploads must not fail when it is edited.
+ *
+ * Dedupe, the 409 and the column allowlist all live in clientService, which
+ * bulk-upload already uses. Nothing here re-implements them.
+ */
+const TEN_DIGITS = /^\d{10}$/;
+const LOOSE_EMAIL = /.+@.+\..+/;
+const digits = (v) => String(v == null ? '' : v).replace(/\D/g, '');
+
+const contactFields = {
+  contactName:  Joi.string().trim().min(1).max(150),
+  contactEmail: Joi.string().trim().max(150).pattern(LOOSE_EMAIL)
+    .messages({ 'string.pattern.base': 'valid email required' }),
+  contactNo:    Joi.string().trim().max(20),
+  contactAltNo: Joi.string().trim().max(20).allow('', null),
+  contactDesgn: Joi.string().trim().max(100).allow('', null),
+};
+
+/* Phone arrives formatted from some browsers ("+91 98765 43210"); strip first,
+ * then require ten digits — exactly what the sheet parser does. */
+function normalisePhones(body, res) {
+  const out = { ...body };
+  const no = digits(out.contactNo);
+  if (out.contactNo !== undefined) {
+    if (!TEN_DIGITS.test(no)) { modernError(res, 400, 'phone must be 10 digits'); return null; }
+    out.contactNo = no;
+  }
+  if (out.contactAltNo) {
+    const alt = digits(out.contactAltNo);
+    if (!TEN_DIGITS.test(alt)) { modernError(res, 400, 'alt phone must be 10 digits'); return null; }
+    out.contactAltNo = alt;
+  } else if ('contactAltNo' in out) {
+    out.contactAltNo = null;
+  }
+  return out;
+}
+
+router.post('/contacts', validate(Joi.object({
+  contactName:  contactFields.contactName.required(),
+  contactEmail: contactFields.contactEmail.required(),
+  contactNo:    contactFields.contactNo.required(),
+  contactAltNo: contactFields.contactAltNo,
+  contactDesgn: contactFields.contactDesgn,
+})), async (req, res, next) => {
+  try {
+    const body = normalisePhones(req.body, res);
+    if (!body) return;
+    const id = await clientService.createContact(req.spoc.client_id, body);
+    logger.info('SPOC created contact · id=' + id + ' clientId=' + req.spoc.client_id);
+    modernOk(res, { id, created: true }, 'contact created');
+  } catch (e) {
+    // 409 carries the conflicting row so the editor can name it.
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
+/*
+ * PUT is BOTH the editor's save and the Activate/Deactivate toggle — the toggle
+ * sends only { status }. So every field is optional and at least one is
+ * required; `status` is on clientService's CONTACT_UPDATE_ALLOWED already.
+ *
+ * loadOwnedContact is the tenancy guard the DELETE beside this uses: a contact
+ * belonging to another client 404s rather than 403s, so an id cannot be probed.
+ */
+router.put('/contacts/:id', validate(Joi.object({
+  contactName:  contactFields.contactName,
+  contactEmail: contactFields.contactEmail,
+  contactNo:    contactFields.contactNo,
+  contactAltNo: contactFields.contactAltNo,
+  contactDesgn: contactFields.contactDesgn,
+  status:       Joi.number().valid(0, 1),
+}).min(1)), async (req, res, next) => {
+  try {
+    if (!(await loadOwnedContact(req, res))) return;
+    const body = normalisePhones(req.body, res);
+    if (!body) return;
+    const affected = await clientService.updateContact(req.params.id, body);
+    logger.info('SPOC updated contact · id=' + req.params.id + ' affected=' + affected);
+    modernOk(res, { updated: affected > 0, affected }, 'contact updated');
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
 });
 
 router.get('/contacts/template', async (req, res, next) => {
