@@ -3,6 +3,7 @@ const Joi = require('joi');
 
 const validate = require('../../middleware/validate');
 const requireAction = require('../../middleware/require-action');
+const { rateLimit } = require('../../middleware/rate-limit');
 const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
 const logger = require('../../logger');
@@ -93,6 +94,84 @@ router.post('/:id/process',
       // else is a genuine bug and falls through to the central handler.
       if (e.status) {
         logger.warn('Process profile update request failed · id=' + req.params.id
+          + ' · ' + e.message);
+        return modernError(res, e.status, e.message, e.code ? { code: e.code } : undefined);
+      }
+      next(e);
+    }
+  },
+);
+
+// ─── REVEAL (audited) ────────────────────────────────────────────────
+/*
+ * POST /:id/reveal — the bank values inside ONE request, decrypted.
+ *
+ * ── WHY isProfileApprovalProcess AND NOT isProfileApprovalView ──────────
+ * Seeing the queue and reading a colleague's account number are different
+ * privileges, and the queue is legitimately the wider grant — a reviewer or a
+ * reporting user can be given the list without ever being handed a payment
+ * instruction. APPROVING is what actually needs the number: the approver has to
+ * check it against whatever the employee sent them before writing it onto a
+ * record that money is paid from. So the reveal rides on the process key.
+ *
+ * ── WHAT CROSSES THE WIRE, AND WHEN ─────────────────────────────────────
+ * Nothing, by default. The list and the process response return
+ * '••••1234' / 'A•••• K••••' (services/profile-update-request.service::hydrate),
+ * and the ciphertext is never shipped either — "it is encrypted" is not a reason
+ * to hand a browser a decryptable secret. The full values exist in exactly one
+ * response, produced by exactly one deliberate click, which lands one row in
+ * tbl_sensitive_reveal_log naming the approver and the employee.
+ *
+ * That row is the control. Encryption stops the DATABASE being the leak; it can
+ * do nothing about an authorised person reading colleagues' account numbers
+ * through the screen built to show them, because that is indistinguishable from
+ * the approval it exists to support. Attribution afterwards is what makes it
+ * visible.
+ *
+ * POST rather than GET: a GET lands in browser history and proxy logs, is
+ * triggerable from an <img src>, and this call HAS a side effect — the audit row.
+ */
+const noStore = (_req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.setHeader('Pragma', 'no-cache');
+  next();
+};
+
+/*
+ * Tighter than the self-service limiter in routes/profile.js, deliberately:
+ * this one reveals SOMEONE ELSE'S details. Ten a minute is comfortably above
+ * any real approval rate and well below "export the directory one click at a
+ * time". Keyed on the OPERATOR, not the IP — an office NATs to one address and
+ * what is being bounded is a person. Instantiated ONCE at module scope;
+ * rateLimit() closes over its own Map, so a per-request instance caps nothing.
+ */
+const revealLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 10,
+  key: (req) => `hrms-request-reveal:${(req.user && req.user.user_id) || req.ip}`,
+});
+
+/* Same contract as the self route's helper — see routes/profile.js. */
+function adminClientIp(req) {
+  try {
+    return req.ip || (req.connection && req.connection.remoteAddress) || null;
+  } catch { return null; }
+}
+
+router.post('/:id/reveal',
+  requireAction('isProfileApprovalProcess'),
+  revealLimiter,
+  noStore,
+  validate(idParam, 'params'),
+  async (req, res, next) => {
+    try {
+      const data = await requestService.revealRequestBank(
+        Number(req.params.id), req.user, pool, adminClientIp(req),
+      );
+      modernOk(res, data);
+    } catch (e) {
+      if (e.status) {
+        logger.warn('Reveal profile update request bank failed · id=' + req.params.id
           + ' · ' + e.message);
         return modernError(res, e.status, e.message, e.code ? { code: e.code } : undefined);
       }

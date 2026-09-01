@@ -91,7 +91,7 @@ const CREATE_BASE = {
   // the personal_email checks they are actually about — the code's own rules
   // live in tests/emp-code.test.js.
   user_name: 'Test User', official_email: 'test.user@easyfix.in', user_role: 2, createdBy: 99,
-  user_code: 'EF000123',
+  user_code: 'E000123',
 };
 
 test('createUser REJECTS a missing personal_email — the service, not just the route, enforces it', async () => {
@@ -350,18 +350,18 @@ test('routes/admin/users.js Joi makes personal_email REQUIRED on create and form
 
   // CREATE — required, and the format is enforced.
   const missing = captured.createBody.validate({
-    user_name: 'Test User', official_email: 'a@easyfix.in', user_role: 2, user_code: 'EF000123',
+    user_name: 'Test User', official_email: 'a@easyfix.in', user_role: 2, user_code: 'E000123',
   });
   assert.ok(missing.error, 'create without personal_email is rejected by Joi too');
   assert.match(missing.error.message, /personal_email/);
 
   const bad = captured.createBody.validate({
-    user_name: 'Test User', official_email: 'a@easyfix.in', user_role: 2, user_code: 'EF000123', personal_email: 'nope',
+    user_name: 'Test User', official_email: 'a@easyfix.in', user_role: 2, user_code: 'E000123', personal_email: 'nope',
   });
   assert.ok(bad.error, 'malformed personal_email is rejected');
 
   const good = captured.createBody.validate({
-    user_name: 'Test User', official_email: 'a@easyfix.in', user_role: 2, user_code: 'EF000123', personal_email: '  A.B@Gmail.com ',
+    user_name: 'Test User', official_email: 'a@easyfix.in', user_role: 2, user_code: 'E000123', personal_email: '  A.B@Gmail.com ',
   });
   assert.equal(good.error, undefined);
   assert.equal(good.value.personal_email, 'a.b@gmail.com', 'Joi trims + lowercases it');

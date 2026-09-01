@@ -4,6 +4,7 @@ const { INTERNAL_USER_TYPE_ID } = require('./user.service');
 const {
   validateMobile, validateDateOfBirth, normaliseBank,
   parseJson, bankFromRow, istTimestamp, mkErr,
+  encryptBank, decryptBank, maskChangesBank, recordReveal,
 } = require('./profile-self.service');
 
 /*
@@ -74,6 +75,32 @@ function normaliseChanges(raw) {
 }
 
 /*
+ * ── THE REQUEST TABLE MUST NOT LEAK WHAT THE USER TABLE PROTECTS ────────
+ *
+ * `changes` and `old_values` carry the bank object as JSON in a plain TEXT
+ * column. An account number sitting in clear here, while the same number is
+ * encrypted one table over, means the encryption accomplished exactly nothing:
+ * an attacker reads the pending queue instead of the user record, and the
+ * queue has no masking layer, no permission on the raw column and a much
+ * longer retention (approved and rejected rows are never purged).
+ *
+ * So both directions go through the SAME helper the personal-details columns
+ * use, and these two functions are the only places a bank object crosses into
+ * or out of the JSON. `toStored` is applied before every JSON.stringify;
+ * `toPlain` is applied before the approve-time re-validation (normaliseBank
+ * would reject a ciphertext, correctly) and before a reveal.
+ */
+function changesToStored(plainChanges) {
+  if (!plainChanges || !plainChanges.bank) return plainChanges;
+  return { ...plainChanges, bank: encryptBank(plainChanges.bank) };
+}
+
+function changesToPlain(storedChanges) {
+  if (!storedChanges || !storedChanges.bank) return storedChanges;
+  return { ...storedChanges, bank: decryptBank(storedChanges.bank) };
+}
+
+/*
  * The SAME uniqueness rule services/user.service.js applies on create and on
  * update: an ACTIVE INTERNAL user's mobile is unique. Historical inactive rows
  * do not count. Run on submit (fail fast, before a request is stored) AND again
@@ -98,7 +125,8 @@ async function readCurrentValues(userId, runner) {
     'SELECT mobile_no FROM tbl_user WHERE user_id = ? LIMIT 1', [userId],
   );
   const [[personal]] = await runner.query(
-    `SELECT date_of_birth, bank_account_number, bank_ifsc, bank_account_name, bank_name
+    `SELECT date_of_birth, bank_account_number, bank_ifsc, bank_account_name, bank_name,
+            bank_account_last4
        FROM tbl_user_personal_details WHERE user_id = ? LIMIT 1`,
     [userId],
   );
@@ -106,6 +134,13 @@ async function readCurrentValues(userId, runner) {
     mobile_no: (user && user.mobile_no) || null,
     date_of_birth: personal && personal.date_of_birth
       ? String(personal.date_of_birth).slice(0, 10) : null,
+    /*
+     * ALREADY IN THE STORED SHAPE — the columns hold ciphertext, so this
+     * snapshot is copied into `old_values` as-is. Deliberately NOT decrypted
+     * and re-encrypted: that round trip would produce an identical value with
+     * a different IV, cost two AES operations and add a failure point to the
+     * one path whose entire job is to remember what was already there.
+     */
     bank: personal ? bankFromRow(personal) : null,
   };
 }
@@ -119,6 +154,15 @@ async function readCurrentValues(userId, runner) {
  */
 async function submitChanges(userId, rawChanges, poolRef = pool) {
   const changes = normaliseChanges(rawChanges);
+  /*
+   * ENCRYPT BEFORE ANYTHING ELSE HAPPENS. Deliberately outside the transaction
+   * and before the lock: a missing or malformed EASYFIX_FIELD_ENC_KEY throws
+   * here and the submission is refused, rather than being discovered halfway
+   * through with a row lock held. There is NO branch below that reaches
+   * JSON.stringify with a plaintext bank object — that is the whole point of
+   * doing the conversion once, here, on the way in.
+   */
+  const storedChanges = changesToStored(changes);
   logger.info('Profile update request submitted · userId=' + userId
     + ' fields=' + Object.keys(changes).join(','));
 
@@ -142,9 +186,12 @@ async function submitChanges(userId, rawChanges, poolRef = pool) {
       [userId],
     );
 
+    // Both sides are already in the STORED shape — `prevChanges` came out of
+    // the column, `storedChanges` was encrypted above — so the spread merges
+    // ciphertext with ciphertext and nothing plaintext can slip in.
     const prevChanges = (open && parseJson(open.changes)) || {};
     const prevOld     = (open && parseJson(open.old_values)) || {};
-    const merged      = { ...prevChanges, ...changes };
+    const merged      = { ...prevChanges, ...storedChanges };
 
     // Snapshot the "before" ONLY for keys entering the request for the first
     // time. A key already in old_values keeps its original value — that is what
@@ -184,8 +231,13 @@ async function submitChanges(userId, rawChanges, poolRef = pool) {
       + ' fields=' + Object.keys(merged).join(','));
     return {
       request_id: requestId,
-      changes: merged,
-      old_values: oldValues,
+      // MASKED on the way out, exactly like every other read of this record.
+      // The submitter typed these values a moment ago, so echoing them back in
+      // full buys nothing and would put the account number in a response body
+      // (and therefore in the network tab and any response-capturing error
+      // reporter) on a route that is not the audited reveal.
+      changes: maskChangesBank(merged),
+      old_values: maskChangesBank(oldValues),
       status: 'pending',
       merged: Boolean(open),
     };
@@ -244,8 +296,15 @@ function hydrate(row) {
   if (!row) return null;
   return {
     ...row,
-    changes:    parseJson(row.changes) || {},
-    old_values: parseJson(row.old_values) || {},
+    /*
+     * MASKED. This is the ONE conversion between the stored row and everything
+     * an approver's browser sees — the queue list and the row echoed back after
+     * approve/reject both come through here — so the ciphertext cannot reach a
+     * response by anyone forgetting to mask at a call site. HR sees '••••1234'
+     * and 'A•••• K••••'; the full values come from the audited reveal route.
+     */
+    changes:    maskChangesBank(parseJson(row.changes) || {}),
+    old_values: maskChangesBank(parseJson(row.old_values) || {}),
     // IST wall clock, verbatim — never a UTC/ISO conversion. See istTimestamp.
     requested_on: istTimestamp(row.requested_on),
     updated_on:   istTimestamp(row.updated_on),
@@ -305,6 +364,13 @@ async function listRequests({ status, q, page, limit } = {}, poolRef = pool) {
  * request actually carries — column names come from the fixed literal lists
  * below, never from the payload, so the interpolation cannot carry user input.
  * Untouched columns (personal_email in particular) are left alone.
+ *
+ * `changes` arrives PLAIN (processRequest decrypts and re-validates before
+ * calling), and the bank block is re-encrypted here on the way to the columns.
+ * Taking plaintext in and encrypting at the write is what keeps this function
+ * honest: the only way to reach the two encrypted columns is through
+ * encryptBank, which throws when the key is unavailable rather than writing
+ * what it was given.
  */
 async function applyChanges(userId, changes, conn) {
   if (changes.mobile_no) {
@@ -319,9 +385,11 @@ async function applyChanges(userId, changes, conn) {
     vals.push(changes.date_of_birth);
   }
   if (changes.bank) {
-    cols.push('bank_account_number', 'bank_ifsc', 'bank_account_name', 'bank_name');
-    vals.push(changes.bank.account_number, changes.bank.ifsc,
-      changes.bank.account_name, changes.bank.bank_name);
+    const stored = encryptBank(changes.bank);
+    cols.push('bank_account_number', 'bank_ifsc', 'bank_account_name', 'bank_name',
+      'bank_account_last4');
+    vals.push(stored.account_number, stored.ifsc,
+      stored.account_name, stored.bank_name, stored.account_last4);
   }
   if (!cols.length) return;
 
@@ -392,7 +460,16 @@ async function processRequest(requestId, { action, remarks }, actor, poolRef = p
       }
       let changes;
       try {
-        changes = normaliseChanges(stored);
+        /*
+         * DECRYPT FIRST. The stored bank block holds ciphertext, and
+         * normaliseBank would reject it as an invalid account number — which is
+         * exactly what it should do to a ciphertext, so the fix is to hand it
+         * the plaintext rather than to loosen the rule. A key that has gone
+         * missing or a value that has been altered in the table throws here and
+         * the APPROVAL is refused: better a blocked approval than writing a
+         * payout destination nobody can vouch for.
+         */
+        changes = normaliseChanges(changesToPlain(stored));
       } catch (e) {
         // Valid when submitted, not valid now. Refuse the APPROVAL rather than
         // write the bad value; the approver rejects and the user resubmits.
@@ -440,11 +517,75 @@ async function processRequest(requestId, { action, remarks }, actor, poolRef = p
   return hydrate(updated);
 }
 
+/*
+ * POST /api/admin/profile-update-requests/:id/reveal — the bank values in ONE
+ * request, decrypted, for the approver who is about to write them onto a
+ * colleague's record.
+ *
+ * Gated on isProfileApprovalProcess rather than the broader
+ * isProfileApprovalView, and that split is the point: seeing the queue and
+ * reading an account number are different privileges. APPROVING is what needs
+ * the number — an approver has to check it against whatever the employee sent
+ * them — so the reveal rides on the process key, and a view-only reviewer never
+ * gets it.
+ *
+ * Returns BOTH sides. Approving a bank change means comparing the new
+ * destination against the old one, and a reveal that showed only the new value
+ * would send the approver straight back for a second one.
+ *
+ * THE AUDIT ROW IS WRITTEN BEFORE THE VALUES ARE RETURNED, on the same
+ * connection, inside the same transaction as the read — see recordReveal. An
+ * audit written after the response is lost exactly when it matters.
+ */
+async function revealRequestBank(requestId, actor, poolRef = pool, ipAddress = null) {
+  const actorId = actor && Number.isFinite(Number(actor.user_id)) ? Number(actor.user_id) : null;
+  if (!actorId) throw mkErr(401, 'NO_ACTOR', 'Authentication required');
+
+  const conn = await poolRef.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [[row]] = await conn.query(
+      `SELECT request_id, user_id, changes, old_values
+         FROM tbl_user_profile_update_request
+        WHERE request_id = ?`,
+      [Number(requestId)],
+    );
+    if (!row) throw mkErr(404, 'REQUEST_NOT_FOUND', 'Profile update request not found');
+
+    const storedChanges = parseJson(row.changes) || {};
+    const storedOld     = parseJson(row.old_values) || {};
+    if (!storedChanges.bank && !storedOld.bank) {
+      throw mkErr(404, 'NO_BANK_DETAILS', 'This request carries no bank details');
+    }
+
+    // Throws on a missing key or a tampered value rather than handing back
+    // something that merely looks like an account number.
+    const bank     = storedChanges.bank ? decryptBank(storedChanges.bank) : null;
+    const oldBank  = storedOld.bank ? decryptBank(storedOld.bank) : null;
+
+    await recordReveal(conn, {
+      actorUserId:   actorId,
+      subjectUserId: row.user_id,
+      context:       'profile_update_request',
+      refId:         row.request_id,
+      ipAddress,
+    });
+    await conn.commit();
+    return { request_id: row.request_id, bank, old_bank: oldBank };
+  } catch (e) {
+    await conn.rollback().catch(() => {});
+    throw e;
+  } finally {
+    conn.release();
+  }
+}
+
 module.exports = {
   submitChanges,
   withdrawRequest,
   listRequests,
   processRequest,
+  revealRequestBank,
   normaliseChanges,
   FIELD_KEYS,
   REQUEST_STATUSES,

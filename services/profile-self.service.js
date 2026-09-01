@@ -1,6 +1,9 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const { todayIst } = require('../utils/ist-calendar');
+const {
+  encryptField, decryptField, maskAccountNumber, maskName,
+} = require('../lib/field-crypto');
 
 /*
  * profile-self.service — the SELF-SERVICE half of HRMS "My Profile".
@@ -186,18 +189,174 @@ function istTimestamp(value) {
 }
 
 // The personal-details columns this feature reads. tbl_user_personal_details is
-// EasyFix-owned; the four bank_* columns and date_of_birth are added by the
+// EasyFix-owned; the five bank_* columns and date_of_birth are added by the
 // HRMS migration alongside the pre-existing personal_email.
 const PERSONAL_COLUMNS = `personal_email, date_of_birth,
-         bank_account_number, bank_ifsc, bank_account_name, bank_name`;
+         bank_account_number, bank_ifsc, bank_account_name, bank_name,
+         bank_account_last4`;
 
+/*
+ * ═══════════════════════════════════════════════════════════════════════
+ * BANK DETAILS AT REST — THREE SHAPES, AND THE RULE FOR EACH
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ * A bank object exists in exactly three forms in this feature, and mixing them
+ * up is how a secret leaks. They are named consistently everywhere:
+ *
+ *   PLAIN    { account_number, ifsc, account_name, bank_name }
+ *            What the user typed and what normaliseBank() validates. Exists
+ *            ONLY inside a request/response cycle. NEVER written to a column,
+ *            NEVER written into request JSON, NEVER put in a log line.
+ *
+ *   STORED   { account_number: '<v1:…>', ifsc, account_name: '<v1:…>',
+ *              bank_name, account_last4 }
+ *            What sits in tbl_user_personal_details AND inside the `changes` /
+ *            `old_values` JSON of tbl_user_profile_update_request. The account
+ *            number and the holder name are AES-256-GCM ciphertext; the IFSC,
+ *            the bank name and the last four digits are clear on purpose.
+ *
+ *   MASKED   { account_number_masked, account_name_masked, ifsc, bank_name,
+ *              has_details }
+ *            The ONLY shape that crosses the wire by default — from
+ *            GET /api/profile/details, from the HR approvals list, from
+ *            everywhere. Never the ciphertext: "it is encrypted" is not a
+ *            reason to ship a decryptable secret to a browser, it is one
+ *            config leak away from being the plaintext.
+ *
+ * ── THE MISTAKE THIS LAYOUT EXISTS TO PREVENT ───────────────────────────
+ * Encrypting the COLUMN and forgetting the request JSON. The pending queue
+ * holds the same account number, in a table with no masking in front of it, and
+ * an attacker reads that instead. So encryptBank/decryptBank are used at BOTH
+ * write sites, and there is no path that JSON.stringify()s a PLAIN bank.
+ */
+
+/*
+ * A tbl_user_personal_details row → the STORED bank shape. The columns already
+ * hold ciphertext, so this is a projection, not a conversion: it is what gets
+ * copied verbatim into an `old_values` snapshot, with no decrypt/re-encrypt
+ * round trip (which would buy nothing and add a failure point on a path whose
+ * only job is to remember what was there).
+ */
 function bankFromRow(row) {
   return {
     account_number: (row && row.bank_account_number) || null,
     ifsc:           (row && row.bank_ifsc) || null,
     account_name:   (row && row.bank_account_name) || null,
     bank_name:      (row && row.bank_name) || null,
+    account_last4:  (row && row.bank_account_last4) || null,
   };
+}
+
+/*
+ * PLAIN → STORED. Throws if EASYFIX_FIELD_ENC_KEY is missing or malformed —
+ * see lib/field-crypto.js. There is deliberately no branch here that stores the
+ * plaintext when encryption is unavailable: the write fails, loudly, and the
+ * operator sets the key.
+ *
+ * `account_last4` is derived HERE, from the plaintext, and is the only part of
+ * the number that stays readable. Deriving it later would mean decrypting on
+ * every list render.
+ */
+function encryptBank(plain) {
+  return {
+    account_number: encryptField(plain.account_number),
+    ifsc:           plain.ifsc,
+    account_name:   encryptField(plain.account_name),
+    bank_name:      plain.bank_name,
+    account_last4:  String(plain.account_number).slice(-4),
+  };
+}
+
+/*
+ * STORED → PLAIN. Used on exactly two paths: the approve-time re-validation
+ * (normaliseBank rejects a ciphertext, and rightly so) and the two audited
+ * reveal endpoints. Throws on a missing key, a tampered value or anything that
+ * is not a v1 envelope — it never returns the stored bytes as if they were a
+ * number.
+ */
+function decryptBank(stored) {
+  if (!stored || typeof stored !== 'object') return null;
+  return {
+    account_number: decryptField(stored.account_number),
+    ifsc:           stored.ifsc || null,
+    account_name:   decryptField(stored.account_name),
+    bank_name:      stored.bank_name || null,
+  };
+}
+
+/*
+ * STORED → MASKED, and it CANNOT throw.
+ *
+ * This runs on every profile read and on every row of the HR queue, so a
+ * missing key or one corrupt row must not take a whole page down — but it also
+ * must not degrade into showing the value. A name that will not decrypt yields
+ * null and an error log; nothing else changes. That is still refusing: no
+ * plaintext and no ciphertext leaves this function on any path.
+ *
+ * The account number needs no decryption at all — the masked form is built from
+ * the clear last-four column, which is the entire reason that column exists.
+ */
+function maskBank(stored) {
+  const s = (stored && typeof stored === 'object') ? stored : {};
+  let accountNameMasked = null;
+  if (s.account_name) {
+    try {
+      accountNameMasked = maskName(decryptField(s.account_name));
+    } catch (e) {
+      logger.error('Bank account name could not be decrypted for display · ' + e.message);
+    }
+  }
+  return {
+    account_number_masked: s.account_last4 ? maskAccountNumber(s.account_last4) : null,
+    account_name_masked:   accountNameMasked,
+    ifsc:                  s.ifsc || null,
+    bank_name:             s.bank_name || null,
+    has_details:           Boolean(s.account_number),
+  };
+}
+
+/*
+ * A `changes` / `old_values` object with its bank block masked. Applied at
+ * EVERY point one of those objects becomes a response — the self profile's
+ * pending strip, the HR list, the row echoed back after approve/reject — so
+ * there is no reader that has to remember to do it.
+ */
+function maskChangesBank(obj) {
+  if (!obj || typeof obj !== 'object' || !obj.bank) return obj;
+  return { ...obj, bank: maskBank(obj.bank) };
+}
+
+/*
+ * One audit row per REVEAL, written on the caller's connection so it lands
+ * inside the same transaction as the read and BEFORE the response is sent.
+ *
+ * `conn` is required and is deliberately NOT defaulted to the pool: an audit
+ * written on a different connection is an audit that can commit while the read
+ * rolls back, or survive while the read fails — and one written after the
+ * response is the one that is missing exactly when the process dies mid-request.
+ * Making the connection an explicit argument is what stops that being an easy
+ * mistake at the next call site.
+ */
+async function recordReveal(conn, { actorUserId, subjectUserId, context, refId = null, ipAddress = null }) {
+  await conn.query(
+    `INSERT INTO tbl_sensitive_reveal_log
+       (actor_user_id, subject_user_id, context, ref_id, ip_address, revealed_on)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [Number(actorUserId), Number(subjectUserId), String(context),
+      refId == null ? null : Number(refId),
+      /*
+       * Truncated rather than rejected. The column is VARCHAR(64) and a
+       * forwarded-for chain can run longer; on a non-STRICT MySQL an oversized
+       * value truncates silently, and on a strict one it would throw and take
+       * the whole reveal transaction — and therefore the audit row — with it.
+       * Losing the row is the worse outcome of the two, so the address is
+       * clipped and the reveal still records.
+       */
+      ipAddress == null ? null : String(ipAddress).slice(0, 64),
+      new Date()],
+  );
+  logger.warn('Sensitive bank reveal · actor=' + actorUserId + ' subject=' + subjectUserId
+    + ' context=' + context + ' ref=' + (refId ?? '-'));
 }
 
 /*
@@ -246,17 +405,27 @@ async function getMyProfile(userId, runner = pool) {
      * combination (dob_locked:true, date_of_birth:null) cannot be produced.
      */
     dob_locked:     dob !== null,
-    bank:           bankFromRow(personal),
+    /*
+     * MASKED, always. The account number and the holder name are encrypted in
+     * the column and neither the ciphertext nor the plaintext belongs in this
+     * payload — a value that ships on every profile load is a value sitting in
+     * the browser cache, the devtools network tab and any error reporter that
+     * captures responses. The full values come from POST /bank/reveal, one
+     * deliberate click at a time, and every one of those is audited.
+     */
+    bank:           maskBank(bankFromRow(personal)),
     pending: pending ? {
       request_id:   pending.request_id,
-      changes:      parseJson(pending.changes) || {},
+      // Same rule inside the pending draft: a requested bank change carries the
+      // same secret as the live record, so it is masked the same way.
+      changes:      maskChangesBank(parseJson(pending.changes) || {}),
       /*
        * The "before" travels WITH the request rather than being inferred by
        * the FE from the live record. Comparing against the live record is
        * right today and wrong the moment an approver or an admin edits that
        * record while the request is still open.
        */
-      old_values:   parseJson(pending.old_values) || {},
+      old_values:   maskChangesBank(parseJson(pending.old_values) || {}),
       requested_on: istTimestamp(pending.requested_on),
       updated_on:   istTimestamp(pending.updated_on),
     } : null,
@@ -320,10 +489,56 @@ async function setDateOfBirthOnce(userId, raw, runner = pool) {
   return { date_of_birth: dob, dob_locked: true };
 }
 
+/*
+ * POST /api/profile/bank/reveal — the caller's OWN bank details, in full.
+ *
+ * `userId` is req.user.user_id and nothing else; there is no id parameter on
+ * this route, so "reveal my details" cannot become "reveal anyone's".
+ *
+ * THE AUDIT ROW IS WRITTEN BEFORE THE VALUE IS RETURNED, inside the same
+ * transaction as the read. Order matters more than it looks: an INSERT issued
+ * after the response — or on a different connection — is the one that is
+ * missing when the process is killed mid-request, the pool is exhausted, or the
+ * transaction rolls back, which is to say exactly during the incident the log
+ * exists to explain. A reveal that cannot be recorded does not happen.
+ *
+ * A self-reveal is logged as loudly as any other. It is unremarkable on its own,
+ * and it is the baseline that makes "this actor reveals other people's details"
+ * a query rather than a hunch.
+ */
+async function revealOwnBank(userId, poolRef = pool, ipAddress = null) {
+  const conn = await poolRef.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [[personal]] = await conn.query(
+      `SELECT ${PERSONAL_COLUMNS} FROM tbl_user_personal_details WHERE user_id = ? LIMIT 1`,
+      [Number(userId)],
+    );
+    const stored = bankFromRow(personal);
+    if (!stored.account_number) {
+      throw mkErr(404, 'NO_BANK_DETAILS', 'You have no bank details on file');
+    }
+    // Throws on a missing key or a tampered value — the reveal fails rather
+    // than returning something that only looks like an account number.
+    const plain = decryptBank(stored);
+    await recordReveal(conn, {
+      actorUserId: userId, subjectUserId: userId, context: 'profile_self', refId: null, ipAddress,
+    });
+    await conn.commit();
+    return plain;
+  } catch (e) {
+    await conn.rollback().catch(() => {});
+    throw e;
+  } finally {
+    conn.release();
+  }
+}
+
 module.exports = {
   getMyProfile,
   setAlternateNo,
   setDateOfBirthOnce,
+  revealOwnBank,
   // Field rules — imported by profile-update-request.service so submission and
   // approve-time re-validation share ONE definition.
   validateMobile,
@@ -336,4 +551,12 @@ module.exports = {
   MOBILE_RE,
   IFSC_RE,
   BANK_KEYS,
+  // Bank shape conversions — the ONE place PLAIN ⇄ STORED ⇄ MASKED happens, so
+  // profile-update-request.service cannot grow a second, drifting copy.
+  encryptBank,
+  decryptBank,
+  maskBank,
+  maskChangesBank,
+  recordReveal,
+  PERSONAL_COLUMNS,
 };

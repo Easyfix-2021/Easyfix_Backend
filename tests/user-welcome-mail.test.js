@@ -494,7 +494,7 @@ const CREATE_ARGS = {
   // GET /api/admin/users/next-emp-code. Present so these tests reach the
   // provisioning and mail behaviour they are about; the code's own rules
   // (format, collision, lock) live in tests/emp-code.test.js.
-  user_code: 'EF000123',
+  user_code: 'E000123',
 };
 
 test('GUARD: the temp password reaches the Graph body and the mail body — and NOTHING else', async () => {

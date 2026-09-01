@@ -39,9 +39,26 @@ const path = require('node:path');
 const { installFakePool } = require('./helpers/fake-pool');
 
 const {
-  EMP_CODE_RE, MAX_EMP_SEQ, EMP_CODE_LOCK,
+  EMP_CODE_PREFIX, EMP_CODE_DIGITS, EMP_CODE_RE, MAX_EMP_SEQ, EMP_CODE_LOCK,
   parseEmpCode, formatEmpCode, nextEmpCode,
 } = require('../lib/emp-code');
+
+/*
+ * The prefix is pinned to a LITERAL on purpose, even though everything else in
+ * this file derives from the constant. Deriving the expectation from the value
+ * under test would make the whole suite agree with any prefix, including one
+ * changed by accident — and the codes already in the business are E200244, not
+ * EF200244. Real employee codes are what this asserts against.
+ *
+ * If the scheme genuinely changes, change this line AND src/lib/emp-code.ts in
+ * the CRM in the same commit; the frontend prepends the prefix client-side.
+ */
+test('the code scheme is E + 6 digits, matching the codes already in use', () => {
+  assert.equal(EMP_CODE_PREFIX, 'E');
+  assert.equal(EMP_CODE_DIGITS, 6);
+  assert.ok(EMP_CODE_RE.test('E200244'), 'a real employee code must validate');
+  assert.ok(!EMP_CODE_RE.test('EF200244'), 'the old two-letter prefix must not');
+});
 
 // ── Fake DB ──────────────────────────────────────────────────────────────
 // Every knob a test turns lives here and is reset in beforeEach, so a test that
@@ -121,7 +138,7 @@ const CREATE_BASE = {
   user_role: 2,
   personal_email: 'test.user@gmail.com',
   createdBy: 99,
-  user_code: 'EF000123',
+  user_code: 'E000123',
 };
 
 /*
@@ -150,39 +167,40 @@ test('formatEmpCode and parseEmpCode round-trip across the whole valid range', (
   // leading zeros — the padding is the half most likely to regress.
   for (const seq of [0, 1, 9, 10, 99, 123, 1000, 258123, 999998, MAX_EMP_SEQ]) {
     const code = formatEmpCode(seq);
-    assert.equal(code.length, 8, `${code} must be EF + exactly 6 digits`);
+    assert.equal(code.length, EMP_CODE_PREFIX.length + EMP_CODE_DIGITS,
+      `${code} must be ${EMP_CODE_PREFIX} + exactly ${EMP_CODE_DIGITS} digits`);
     assert.ok(EMP_CODE_RE.test(code), `${code} must satisfy EMP_CODE_RE`);
     assert.equal(parseEmpCode(code), seq, `${code} must parse back to ${seq}`);
   }
 });
 
 test('formatEmpCode zero-pads to six digits — the shape ops and reports read', () => {
-  assert.equal(formatEmpCode(1), 'EF000001');
-  assert.equal(formatEmpCode(123), 'EF000123');
-  assert.equal(formatEmpCode(258123), 'EF258123');
-  assert.equal(formatEmpCode(MAX_EMP_SEQ), 'EF999999');
+  assert.equal(formatEmpCode(1), 'E000001');
+  assert.equal(formatEmpCode(123), 'E000123');
+  assert.equal(formatEmpCode(258123), 'E258123');
+  assert.equal(formatEmpCode(MAX_EMP_SEQ), 'E999999');
 });
 
 // ── 2. Format: everything that is NOT a code ─────────────────────────────
 
 test('parseEmpCode returns null for malformed codes rather than a wrong number', () => {
   const malformed = [
-    'EF25812',        // five digits — one short
-    'EF2581234',      // seven digits — one too many
+    'E25812',        // five digits — one short
+    'E2581234',      // seven digits — one too many
     'ef258123',       // lowercase prefix: a stored lowercase code would be
                       //   invisible to every filter that uses EMP_CODE_RE
     'Ef258123',
-    'EF25812a',       // a letter where a digit belongs
-    'EF-258123',
-    'EF 258123',
-    ' EF258123',      // untrimmed — the caller must trim, not the parser
-    'EF258123 ',
+    'E25812a',       // a letter where a digit belongs
+    'E-258123',
+    'E 258123',
+    ' E258123',      // untrimmed — the caller must trim, not the parser
+    'E258123 ',
     'XX258123',       // wrong prefix
     'U501',           // a real pre-EasyFix value from the legacy CRM
     '258123',         // digits with no prefix
-    'EF258123EF258123',
-    'EF+58123',       // '+' would survive a naive Number() cast
-    'EF０００１２３', // full-width digits: \d is ASCII-only, they must not pass
+    'E258123E258123',
+    'E+58123',        // '+' would survive a naive Number() cast
+    'E０００１２３', // full-width digits: \d is ASCII-only, they must not pass
     '',
   ];
   for (const bad of malformed) {
@@ -208,15 +226,15 @@ test('EMP_CODE_RE is not a global regex — a shared /g would make .test() state
    */
   assert.equal(EMP_CODE_RE.global, false);
   assert.equal(EMP_CODE_RE.lastIndex, 0);
-  assert.equal(EMP_CODE_RE.test('EF000123'), true);
-  assert.equal(EMP_CODE_RE.test('EF000123'), true, 'a second identical test must still pass');
+  assert.equal(EMP_CODE_RE.test('E000123'), true);
+  assert.equal(EMP_CODE_RE.test('E000123'), true, 'a second identical test must still pass');
 });
 
 // ── 3. Overflow ──────────────────────────────────────────────────────────
 
-test('formatEmpCode THROWS past EF999999 instead of emitting a seven-digit code', () => {
+test('formatEmpCode THROWS past E999999 instead of emitting a seven-digit code', () => {
   /*
-   * The failure being prevented: 'EF1000000' does not match EMP_CODE_RE, so
+   * The failure being prevented: 'E1000000' does not match EMP_CODE_RE, so
    * nextEmpCode's MAX would stop seeing the highest code and would re-issue one
    * already in use. A loud throw when the space runs out is recoverable; a
    * quiet overflow is a duplicate nobody notices for months.
@@ -233,7 +251,7 @@ test('formatEmpCode rejects anything that is not a non-negative integer', () => 
   }
 });
 
-test('nextEmpCode surfaces the overflow rather than wrapping to EF000000', async () => {
+test('nextEmpCode surfaces the overflow rather than wrapping to E000000', async () => {
   maxSeq = MAX_EMP_SEQ;
   await assert.rejects(() => nextEmpCode(fakeConn()), /exhausted/i);
 });
@@ -248,23 +266,23 @@ function fakeConn() {
 
 test('nextEmpCode takes MAX + 1 when codes already exist', async () => {
   maxSeq = 258123;
-  assert.equal(await nextEmpCode(fakeConn()), 'EF258124');
+  assert.equal(await nextEmpCode(fakeConn()), 'E258124');
 
   fake.reset();
   maxSeq = 7;
-  assert.equal(await nextEmpCode(fakeConn()), 'EF000008', 'the padding survives a small MAX');
+  assert.equal(await nextEmpCode(fakeConn()), 'E000008', 'the padding survives a small MAX');
 });
 
-test('nextEmpCode starts at EF000001 on a host where no row matches yet', async () => {
+test('nextEmpCode starts at E000001 on a host where no row matches yet', async () => {
   // MAX() over an empty set is SQL NULL — the cold start, not an error. Ops
   // seed the real codes manually first; this only ever runs ahead of them on a
   // fresh or QA database.
   maxSeq = null;
-  assert.equal(await nextEmpCode(fakeConn()), 'EF000001');
+  assert.equal(await nextEmpCode(fakeConn()), 'E000001');
 
   fake.reset();
   maxSeq = undefined;   // a driver that omits the column entirely
-  assert.equal(await nextEmpCode(fakeConn()), 'EF000001');
+  assert.equal(await nextEmpCode(fakeConn()), 'E000001');
 });
 
 test('nextEmpCode scans only rows that match the format, and does so on the passed connection', async () => {
@@ -278,19 +296,19 @@ test('nextEmpCode scans only rows that match the format, and does so on the pass
    * every future code past the end of the space.
    */
   assert.match(call.sql, /WHERE user_code REGEXP/i);
-  assert.match(call.sql, /\^EF\[0-9\]\{6\}\$/, 'the SQL pattern must mirror EMP_CODE_RE');
+  assert.match(call.sql, /\^E\[0-9\]\{6\}\$/, 'the SQL pattern must mirror EMP_CODE_RE');
 });
 
 test('suggestNextEmpCode returns the count AND the assembled code for the form prefill', async () => {
-  // The form renders 'EF' as a fixed chip and lets the operator edit only the
+  // The form renders the prefix as a fixed chip and lets the operator edit only the
   // count, so the endpoint has to publish both halves rather than making the
   // frontend slice the string (which would be a second copy of the parse).
   maxSeq = 258123;
-  assert.deepEqual(await userService.suggestNextEmpCode(), { count: 258124, code: 'EF258124' });
+  assert.deepEqual(await userService.suggestNextEmpCode(), { count: 258124, code: 'E258124' });
 
   fake.reset();
   maxSeq = null;
-  assert.deepEqual(await userService.suggestNextEmpCode(), { count: 1, code: 'EF000001' });
+  assert.deepEqual(await userService.suggestNextEmpCode(), { count: 1, code: 'E000001' });
 });
 
 test('the suggestion endpoint RESERVES NOTHING — no lock, no write', async () => {
@@ -326,7 +344,7 @@ test('GET /api/admin/users/next-emp-code is mounted BEFORE /:userId', () => {
 // ── 5. createUser — the lock, and what it guards ─────────────────────────
 
 test('createUser takes the named lock, probes for a duplicate, and INSERTs the code', async () => {
-  const out = await run(() => userService.createUser({ ...CREATE_BASE, user_code: 'EF000123' }));
+  const out = await run(() => userService.createUser({ ...CREATE_BASE, user_code: 'E000123' }));
   assert.equal(out.reachedWrite, true, out.rejected);
 
   const [lockCall] = matching(/GET_LOCK/i);
@@ -336,12 +354,12 @@ test('createUser takes the named lock, probes for a duplicate, and INSERTs the c
 
   const [probe] = matching(/WHERE user_code = \?/i);
   assert.ok(probe, 'the duplicate probe must run');
-  assert.deepEqual(probe.params, ['EF000123']);
+  assert.deepEqual(probe.params, ['E000123']);
 
   const [insert] = matching(/INSERT INTO tbl_user\s*\(/i);
   assert.ok(insert, 'the tbl_user INSERT must be reached');
   assert.match(insert.sql, /\(\s*user_code,/, 'user_code must be in the INSERT column list');
-  assert.equal(insert.params[0], 'EF000123', 'and bound as the first parameter');
+  assert.equal(insert.params[0], 'E000123', 'and bound as the first parameter');
   /*
    * BIND ARITY. Adding a column means adding BOTH a placeholder and a
    * parameter, and getting one of the two wrong is silent here (the fake pool
@@ -410,11 +428,11 @@ test('createUser 409s with its OWN error code when the operator-supplied code is
    * the field it belongs to.
    */
   dupCodeRow = { user_id: 8735 };
-  const out = await run(() => userService.createUser({ ...CREATE_BASE, user_code: 'EF000123' }));
+  const out = await run(() => userService.createUser({ ...CREATE_BASE, user_code: 'E000123' }));
   assert.equal(out.status, 409);
   assert.equal(out.code, 'USER_CODE_TAKEN');
   assert.equal(out.field, 'user_code');
-  assert.match(out.rejected, /EF000123/, 'the message names the offending code');
+  assert.match(out.rejected, /E000123/, 'the message names the offending code');
   assert.equal(matching(/INSERT INTO tbl_user\s*\(/i).length, 0, 'nothing is written');
   assert.equal(matching(/RELEASE_LOCK/i).length, 1, 'and the lock is still released');
 });
@@ -438,7 +456,7 @@ test('the duplicate probe is NOT narrowed to active internal users', async () =>
 test('createUser rejects a malformed user_code BEFORE taking the lock', async () => {
   // The service re-checks the format the route's Joi already checked, because
   // requiredness and shape live in two layers here and the deeper one wins.
-  for (const bad of ['EF25812', 'ef000123', '000123', 'EF00012X', '', '   ']) {
+  for (const bad of ['E25812', 'ef000123', '000123', 'E00012X', '', '   ']) {
     fake.reset();
     const out = await run(() => userService.createUser({ ...CREATE_BASE, user_code: bad }));
     assert.equal(out.status, 400, `${JSON.stringify(bad)} must be rejected`);
@@ -451,7 +469,7 @@ test('createUser rejects a malformed user_code BEFORE taking the lock', async ()
 
 function editableRow(overrides = {}) {
   return {
-    user_id: 501, user_type_id: 5, user_code: 'EF000501',
+    user_id: 501, user_type_id: 5, user_code: 'E000501',
     mobile_no: '9000000001', alternate_no: null,
     user_role: 2, city_id: 1,
     manage_clients: null, manage_cities: null, manage_states: null, manage_verticals: null,
@@ -467,8 +485,8 @@ test('updateUser lets a user KEEP their own existing code — the self-exclusion
    * anything about themselves again — and the message points at the one field
    * the operator did not touch.
    */
-  me = editableRow({ user_code: 'EF000501' });
-  const out = await run(() => userService.updateUser(501, { user_code: 'EF000501' }, 99));
+  me = editableRow({ user_code: 'E000501' });
+  const out = await run(() => userService.updateUser(501, { user_code: 'E000501' }, 99));
 
   assert.notEqual(out.status, 409, `a user's own code must not be a conflict: ${out.rejected}`);
 
@@ -483,20 +501,20 @@ test('updateUser EXCLUDES the edited row in the SQL, not only via the no-change 
   // Force the probe by changing the code, then assert the exclusion is written
   // into the statement — the short-circuit is an optimisation and must not be
   // the only thing keeping a user out of their own way.
-  me = editableRow({ user_code: 'EF000501' });
-  const out = await run(() => userService.updateUser(501, { user_code: 'EF000777' }, 99));
+  me = editableRow({ user_code: 'E000501' });
+  const out = await run(() => userService.updateUser(501, { user_code: 'E000777' }, 99));
   assert.equal(out.reachedWrite, true, out.rejected);
 
   const [probe] = matching(/WHERE user_code = \?/i);
   assert.ok(probe, 'a changed code must be probed');
   assert.match(probe.sql, /user_id <> \?/i, 'the probe must exclude the row being edited');
-  assert.deepEqual(probe.params, ['EF000777', 501]);
+  assert.deepEqual(probe.params, ['E000777', 501]);
 });
 
 test('updateUser 409s with USER_CODE_TAKEN when the code belongs to someone else', async () => {
-  me = editableRow({ user_code: 'EF000501' });
+  me = editableRow({ user_code: 'E000501' });
   dupCodeRow = { user_id: 8735 };
-  const out = await run(() => userService.updateUser(501, { user_code: 'EF000777' }, 99));
+  const out = await run(() => userService.updateUser(501, { user_code: 'E000777' }, 99));
   assert.equal(out.status, 409);
   assert.equal(out.code, 'USER_CODE_TAKEN');
   assert.equal(out.field, 'user_code');
@@ -505,7 +523,7 @@ test('updateUser 409s with USER_CODE_TAKEN when the code belongs to someone else
 
 test('updateUser rejects a malformed code without probing', async () => {
   me = editableRow();
-  const out = await run(() => userService.updateUser(501, { user_code: 'EF12' }, 99));
+  const out = await run(() => userService.updateUser(501, { user_code: 'E12' }, 99));
   assert.equal(out.status, 400);
   assert.equal(matching(/WHERE user_code = \?/i).length, 0);
 });
@@ -518,7 +536,7 @@ test("updateUser's row load projects user_code, so the no-change short-circuit c
    * row — but the churn is exactly what the short-circuit exists to prevent.
    */
   me = editableRow();
-  await run(() => userService.updateUser(501, { user_code: 'EF000777' }, 99));
+  await run(() => userService.updateUser(501, { user_code: 'E000777' }, 99));
   const [load] = matching(/FROM tbl_user WHERE user_id = \?/i);
   assert.ok(load);
   assert.match(load.sql, /\buser_code\b/, 'the row load must project user_code');
@@ -551,7 +569,7 @@ test('the regex and the padding exist EXACTLY ONCE in the repo', () => {
   // Plain substrings, compared with String.includes — NOT a shared /g regex.
   // A global regex reused across files carries lastIndex between .test() calls
   // and would report clean for every other file it scanned.
-  const SIGNATURES = ['EF\\d{6}', 'EF[0-9]{6}', "padStart(6"];
+  const SIGNATURES = ['E\\d{6}', 'E[0-9]{6}', "padStart(6"];
 
   const offenders = [];
   (function walk(dir) {
@@ -596,20 +614,20 @@ test('routes/admin/users.js Joi makes user_code REQUIRED on create and format-ch
   assert.ok(missing.error, 'create without user_code is rejected');
   assert.match(missing.error.message, /Employee Code is required/);
 
-  for (const bad of ['EF25812', 'ef000123', '000123', 'EF00012X']) {
+  for (const bad of ['E25812', 'ef000123', '000123', 'E00012X']) {
     const res = createBody.validate({ ...base, user_code: bad });
     assert.ok(res.error, `${bad} must be rejected by Joi`);
-    assert.match(res.error.message, /EF" followed by exactly 6 digits/,
+    assert.match(res.error.message, /followed by exactly 6 digits/,
       'the operator-facing message must not be a raw regex dump');
   }
 
-  const good = createBody.validate({ ...base, user_code: '  EF000123 ' });
+  const good = createBody.validate({ ...base, user_code: '  E000123 ' });
   assert.equal(good.error, undefined);
-  assert.equal(good.value.user_code, 'EF000123', 'Joi trims it');
+  assert.equal(good.value.user_code, 'E000123', 'Joi trims it');
 
   // UPDATE — optional (a PATCH that does not touch the code must pass) but the
   // format is still enforced when it IS supplied.
   assert.equal(updateBody.validate({ mobile_no: '9000000001' }).error, undefined);
-  assert.equal(updateBody.validate({ user_code: 'EF000123' }).error, undefined);
-  assert.ok(updateBody.validate({ user_code: 'EF12' }).error);
+  assert.equal(updateBody.validate({ user_code: 'E000123' }).error, undefined);
+  assert.ok(updateBody.validate({ user_code: 'E12' }).error);
 });

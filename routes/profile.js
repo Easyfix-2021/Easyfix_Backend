@@ -3,6 +3,7 @@ const Joi = require('joi');
 
 const requireAuth = require('../middleware/auth');
 const validate = require('../middleware/validate');
+const { rateLimit } = require('../middleware/rate-limit');
 const { pool } = require('../db');
 const { modernOk, modernError } = require('../utils/response');
 const logger = require('../logger');
@@ -156,6 +157,75 @@ router.delete('/update-requests/:id', validate(idParam, 'params'), async (req, r
     const data = await requestService.withdrawRequest(req.profileUserId, req.params.id, pool);
     modernOk(res, data, 'Request Withdrawn');
   } catch (e) { fail(res, next, e, 'Withdraw profile update request'); }
+});
+
+// ─── REVEAL ──────────────────────────────────────────────────────────
+/*
+ * POST /bank/reveal — the caller's OWN account number and holder name, in full.
+ *
+ * ── WHAT THIS DOES AND DOES NOT ACHIEVE ─────────────────────────────────
+ * A value the browser DISPLAYS must reach the browser, so once someone clicks
+ * "reveal" it is in their devtools. That is a property of the web, not of this
+ * design, and any scheme that "hides" it — encrypting the response, obfuscating
+ * the payload — ships the key to the same tab and buys the appearance of safety
+ * only. We do not build that.
+ *
+ * What is genuinely achieved, and is the reason this route exists at all:
+ *   • the value is NEVER in a list, a detail response or the profile payload —
+ *     everything else is masked by default (see maskBank);
+ *   • it crosses the wire ONLY on a deliberate click, one record at a time;
+ *   • the response is no-store, so it does not sit in the disk cache;
+ *   • the reveal is attributable afterwards, in tbl_sensitive_reveal_log.
+ * Not in the network tab as a matter of routine; in it at the moment someone
+ * chose to look, with their name on the row.
+ *
+ * POST rather than GET even though it reads: a GET lands in browser history,
+ * proxy logs and prefetchers, and it would be trivially triggerable from an
+ * <img src>. It also HAS a side effect — the audit row.
+ */
+const noStore = (_req, res, next) => {
+  // Belt and braces: `no-store` is the directive that keeps it out of the disk
+  // cache; the other two are for intermediaries that predate it.
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.setHeader('Pragma', 'no-cache');
+  next();
+};
+
+/*
+ * Keyed on the CALLER, not the IP — an office NATs to one address and the thing
+ * being bounded is a person clicking a button. Instantiated ONCE at module
+ * scope: rateLimit() closes over its own Map, so building it per request would
+ * cap nothing.
+ *
+ * Generous, because this is the user's OWN record and the cap is here to stop a
+ * stuck retry loop from filling the audit log, not to ration a legitimate look.
+ * The admin route's limit is the tighter one — that is where the reveal is of
+ * someone ELSE's details.
+ */
+const selfRevealLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 20,
+  key: (req) => `profile-bank-reveal:${(req.user && req.user.user_id) || req.ip}`,
+});
+
+/*
+ * The address the audit row records. `req.ip` already honours Express's trust-proxy
+ * setting, so it is the right value behind the load balancer; the raw socket address
+ * is the fallback for a direct hit. Never throws and never blocks the reveal — an
+ * audit row with a missing address is a worse row, but a reveal that fails because
+ * the address could not be read is a worse outcome.
+ */
+function clientIp(req) {
+  try {
+    return req.ip || (req.connection && req.connection.remoteAddress) || null;
+  } catch { return null; }
+}
+
+router.post('/bank/reveal', selfRevealLimiter, noStore, async (req, res, next) => {
+  try {
+    const data = await selfService.revealOwnBank(req.profileUserId, pool, clientIp(req));
+    modernOk(res, data);
+  } catch (e) { fail(res, next, e, 'Reveal own bank details'); }
 });
 
 module.exports = router;
