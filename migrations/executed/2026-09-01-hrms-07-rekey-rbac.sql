@@ -69,10 +69,15 @@
 
 
 -- ─── 1. Dry run: the hub leaf these keys attach to (read-only) ───────
--- Expect exactly one row. ZERO rows means 'adminAction' is not seeded on this
+-- Expect AT LEAST one row. This looks for BOTH tokens because the CRM's
+-- URL_MAP points 'adminAction' AND 'generateClientInvoice' at /admin-actions,
+-- and which one an environment actually carries is not knowable from here — QA
+-- carries 'generateClientInvoice' (menu 42, named 'Admin Action'). The first
+-- draft matched only 'adminAction', so the INSERT ... SELECT matched no rows,
+-- inserted nothing, and REPORTED SUCCESS. Zero rows means neither is seeded on this
 -- host and steps 3-4 below will insert nothing — fix that first, or the card
 -- has nowhere to live.
-SELECT menu_id, menu_name, parent_menu, menu_depth, url, menu_status FROM tbl_menu WHERE url = 'adminAction';
+SELECT menu_id, menu_name, parent_menu, menu_depth, url, menu_status FROM tbl_menu WHERE url IN ('adminAction', 'generateClientInvoice');
 
 
 -- ─── 2. Dry run: are the keys already here? Expect 0 rows first time ─
@@ -84,10 +89,10 @@ SELECT id, menu_id, action_name, name, status, delete_status FROM menu_action WH
 -- 'adminAction' leaf inserts NOTHING instead of inserting a key with a NULL
 -- menu_id that Manage Roles could never display.
 INSERT INTO menu_action (menu_id, action_name, name, status, delete_status, created_on)
-SELECT m.menu_id, 'isFieldRekeyRun', 'Secrets Manager — Re-Key Encrypted Fields (Rotate / Recover / Re-Seal)', 1, 0, NOW() FROM tbl_menu m WHERE m.url = 'adminAction' AND NOT EXISTS (SELECT 1 FROM menu_action ma WHERE ma.action_name = 'isFieldRekeyRun');
+SELECT m.menu_id, 'isFieldRekeyRun', 'Secrets Manager — Re-Key Encrypted Fields (Rotate / Recover / Re-Seal)', 1, 0, NOW() FROM tbl_menu m WHERE m.url IN ('adminAction', 'generateClientInvoice') AND NOT EXISTS (SELECT 1 FROM menu_action ma WHERE ma.action_name = 'isFieldRekeyRun');
 
 INSERT INTO menu_action (menu_id, action_name, name, status, delete_status, created_on)
-SELECT m.menu_id, 'isRecoveryKeyManage', 'Secrets Manager — Manage the Field Encryption Recovery Key', 1, 0, NOW() FROM tbl_menu m WHERE m.url = 'adminAction' AND NOT EXISTS (SELECT 1 FROM menu_action ma WHERE ma.action_name = 'isRecoveryKeyManage');
+SELECT m.menu_id, 'isRecoveryKeyManage', 'Secrets Manager — Manage the Field Encryption Recovery Key', 1, 0, NOW() FROM tbl_menu m WHERE m.url IN ('adminAction', 'generateClientInvoice') AND NOT EXISTS (SELECT 1 FROM menu_action ma WHERE ma.action_name = 'isRecoveryKeyManage');
 
 
 -- ─── 4. Grant both to Admin (role_id 2) — revive, then insert ────────
@@ -101,7 +106,7 @@ SELECT 2, ma.id, 0 FROM menu_action ma WHERE ma.action_name IN ('isFieldRekeyRun
 -- Every `ok` must be as noted. A 0 on either grant row means the endpoints
 -- return 403 to everybody, including Admin.
 SELECT 'both action keys seeded (expect 2)' AS what, COUNT(*) AS ok FROM menu_action WHERE action_name IN ('isFieldRekeyRun', 'isRecoveryKeyManage')
-UNION ALL SELECT 'keys hang off the adminAction leaf (expect 2)', COUNT(*) FROM menu_action ma JOIN tbl_menu m ON m.menu_id = ma.menu_id WHERE ma.action_name IN ('isFieldRekeyRun', 'isRecoveryKeyManage') AND m.url = 'adminAction'
+UNION ALL SELECT 'keys hang off the adminAction leaf (expect 2)', COUNT(*) FROM menu_action ma JOIN tbl_menu m ON m.menu_id = ma.menu_id WHERE ma.action_name IN ('isFieldRekeyRun', 'isRecoveryKeyManage') AND m.url IN ('adminAction', 'generateClientInvoice')
 UNION ALL SELECT 'admin holds both keys (expect 2)', COUNT(*) FROM role_menu_action rma JOIN menu_action ma ON ma.id = rma.menu_action_id WHERE rma.role_id = 2 AND rma.isDeleted = 0 AND ma.action_name IN ('isFieldRekeyRun', 'isRecoveryKeyManage')
 UNION ALL SELECT 'nobody else holds them (expect 0)', COUNT(*) FROM role_menu_action rma JOIN menu_action ma ON ma.id = rma.menu_action_id WHERE rma.role_id <> 2 AND rma.isDeleted = 0 AND ma.action_name IN ('isFieldRekeyRun', 'isRecoveryKeyManage')
-UNION ALL SELECT 'admin can reach the Admin Actions hub (expect 1)', COUNT(*) FROM tbl_role r JOIN tbl_menu m ON m.url = 'adminAction' WHERE r.role_id = 2 AND FIND_IN_SET(m.menu_id, COALESCE(r.menu_ids, '')) > 0;
+UNION ALL SELECT 'admin can reach the Admin Actions hub (expect 1)', COUNT(*) FROM tbl_role r JOIN tbl_menu m ON m.url IN ('adminAction', 'generateClientInvoice') WHERE r.role_id = 2 AND FIND_IN_SET(m.menu_id, COALESCE(r.menu_ids, '')) > 0;

@@ -231,8 +231,28 @@ test('the photo is bound to the JWT subject, not to anything in the request', as
   const upsert = events.find((e) => e.op === 'db:upsert');
   assert.equal(upsert.params[0], JWT_USER_ID,
     'the row written must be the token holder’s, whatever the request claims');
-  assert.ok(!JSON.stringify(events).includes(String(OTHER_USER_ID)),
-    'no id supplied by the caller may reach the DB or the S3 key');
+  /*
+   * Checked STRUCTURALLY, not by substring. The previous version asserted
+   * `!JSON.stringify(events).includes('999')`, and 999 is three digits: it
+   * collides with the 13-digit epoch and the random suffix inside the S3 key
+   * (measured at 0.2% of generated keys), and with the millisecond field of
+   * every stringified timestamp. That made this test fail roughly one run in a
+   * few hundred for a reason that had nothing to do with what it tests — and a
+   * test that cries wolf on a security property is worse than no test, because
+   * the next red build gets waved through.
+   *
+   * These assertions cannot collide with a number that merely appears
+   * somewhere: they look at the id positions themselves.
+   */
+  assert.ok(
+    !events.some((e) => Array.isArray(e.params) && e.params.includes(OTHER_USER_ID)),
+    'no caller-supplied id may be bound into a database statement',
+  );
+  const put = events.find((e) => e.op === 's3:put');
+  assert.match(put.key, new RegExp(`/u${JWT_USER_ID}_`),
+    'the S3 key must carry the token holder id');
+  assert.doesNotMatch(put.key, new RegExp(`/u${OTHER_USER_ID}_`),
+    'the S3 key must never carry an id the caller supplied');
 });
 
 test('a technician bearer cannot reach this CRM-only surface', async () => {
