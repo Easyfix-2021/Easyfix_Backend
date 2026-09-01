@@ -1430,6 +1430,19 @@ function buildRegisteredWhere(f = {}, scope, lifecycleInstalled = false) {
     'APPLICATION_REJECTED',
   ].map((status) => `'${status}'`).join(',');
   const clauses = [
+    /*
+     * ADMIN-DELETED TOMBSTONES ARE EXCLUDED, exactly as list() does.
+     *
+     * This queue had no efr_status clause at all, so a technician deleted
+     * through /api/admin/entity-deletion — whose PII the delete deliberately
+     * SCRUBS — vanished from the roster and went on appearing here by name and
+     * masked mobile. Two views of the same table disagreeing about whether a
+     * record exists, and the registration queue winning.
+     *
+     * NULL-safe: `NOT (… <=> 3)` keeps genuine NULL-status rows, which is most
+     * of this queue (a technician mid-registration has no efr_status yet).
+     */
+    'NOT (e.efr_status <=> 3)',
     lifecycleInstalled
       ? `(e.new_easy_fixer IS NOT NULL OR e.is_existing_easyfixer IS NOT NULL
           OR e.lifecycle_status IN (${onboardingLifecycleSql})
@@ -1456,9 +1469,25 @@ function buildRegisteredWhere(f = {}, scope, lifecycleInstalled = false) {
   // / free text — improved here).
   if (f.q) {
     const s = String(f.q).trim();
+    /*
+     * ANY all-digit term that is not a pincode or a mobile is an EFR ID.
+     *
+     * This used to be /^\d{1,4}$/ — ids 1..9999 only. efr_id passed 9,999 some
+     * time ago (max 10,795, with 796 rows above the old ceiling), so searching
+     * a five-digit technician here fell through to the name/mobile LIKE and
+     * matched nothing. A search box that silently stops recognising ids once
+     * they grow a digit is worse than one that never recognised them.
+     *
+     * Length-based, so it also covers 7-9 and 11+ digit terms that previously
+     * fell through. THE ONE COLLISION LEFT: a six-digit term is read as a
+     * pincode, so efr_id 100000+ will need a distinct field rather than a
+     * longer regex. At the current rate that is years away, and it is a
+     * deliberate trade — pincode search is used constantly and id search is
+     * exact, so the ambiguous length goes to the common case.
+     */
     if (/^\d{6}$/.test(s))       { clauses.push('U.pin_code LIKE ?'); params.push(`%${s}%`); }
     else if (/^\d{10}$/.test(s)) { clauses.push('e.efr_no LIKE ?');   params.push(`%${s}%`); }
-    else if (/^\d{1,4}$/.test(s)){ clauses.push('e.efr_id = ?');      params.push(Number(s)); }
+    else if (/^\d+$/.test(s))    { clauses.push('e.efr_id = ?');      params.push(Number(s)); }
     else                         { clauses.push('(U.user_name LIKE ? OR e.efr_no LIKE ?)'); params.push(`%${s}%`, `%${s}%`); }
   }
 
