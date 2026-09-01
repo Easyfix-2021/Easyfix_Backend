@@ -140,6 +140,8 @@ function scopeKey(scope) {
  * name in the CRM and in the route tests, and they still mean "how much of
  * this course is left"; renaming them would be a client change for no gain.
  */
+// entitlement-guard: the operational chase list. A retired course should stop
+// generating chase work for operators; it serves no technician entitlement.
 const LIVE_FROM = `
     FROM easyfixer_courses ec
     JOIN courses c        ON c.id = ec.course_id AND c.status = 1
@@ -301,6 +303,7 @@ async function detectPausedNotStarted(scope, today) {
 async function detectClientUncertified(scope) {
   const clauses = [
     'r.status = 1',
+    // entitlement-guard: chase detector — a retired course must stop being chased.
     'c.status = 1',
     '(m.mapping_status IS NULL OR m.mapping_status <> 0)',
     'NOT (e.efr_status <=> 3)',
@@ -404,6 +407,8 @@ async function loadCounters(scope, today) {
  * restricted for something they cannot possibly complete, which is precisely
  * why it needs a human.
  */
+// entitlement-guard: counters for the action tool. Retired courses drop out of the
+// operator's queue; no badge or certificate is read here.
 async function loadNeedsDecision(scope, today, t) {
   const failedClauses = ["e.lifecycle_status = 'ASSESSMENT_FAILED'", 'NOT (e.efr_status <=> 3)'];
   const failedParams = [];

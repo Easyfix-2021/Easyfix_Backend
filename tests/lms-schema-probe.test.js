@@ -253,3 +253,206 @@ test('no read of a probed column escapes the probe', async () => {
     'these name a column that arrives by ALTER without asking whether it is there yet — '
     + 'route them through lmsFlagColumns() (see services/lms.service.js)');
 });
+
+// ─── The entitlement OR-arm ──────────────────────────────────────────
+
+/*
+ * A technician's badge and certificate are an EARNED ENTITLEMENT, recorded once
+ * on easyfixer_courses.badge_earned_at and never cleared. Course settings —
+ * `status` (retired) and `certificate_enabled` — govern who can earn one NEXT;
+ * they must never revoke one already earned.
+ *
+ * Easy to state, easy to break, because the offending query looks completely
+ * ordinary. coursesForTech filtered `c.status = 1`, which reads as "don't show
+ * retired courses" and is right for a catalogue — but on a technician's OWN
+ * list it dropped the row entirely, taking the trophy AND the certificate
+ * button with it. Retiring a course silently un-earned it. Fixed by
+ *
+ *     AND (c.status = 1 OR ec.badge_earned_at IS NOT NULL)
+ *
+ * One mutation test covers that one query. This covers the CLASS: every future
+ * course-settings filter in the LMS services has to declare which kind it is —
+ * name badge_earned_at on the line (it serves an entitlement, so it carries the
+ * OR-arm), or carry a marker saying why it may be narrow:
+ *
+ *     // entitlement-guard: <why>
+ *
+ * Default-deny, because the two are indistinguishable in SQL and differ
+ * entirely in meaning — the author is the only one who knows which they wrote.
+ */
+
+const ENTITLEMENT_FILES = [
+  'services/lms.service.js',
+  'services/lms-action.service.js',
+];
+
+// A COMPARISON on a course setting. A bare projection (`c.status,`) is not a
+// filter and cannot revoke anything, so it is not matched.
+const COURSE_SETTING_FILTER = /\bc\.(?:status|certificate_enabled)\s*(?:=|<>|!=|>=|<=|>|<|\bIN\b)/;
+const ENTITLEMENT_MARKER = /entitlement-guard:/;
+const OR_ARM = /badge_earned_at/;
+
+/*
+ * The marker counts on the line itself, or in the unbroken comment block
+ * directly above it. A fixed lookback does not survive contact with real code:
+ * the filter worth marking is exactly the one needing a paragraph to justify,
+ * and the paragraph pushes the marker out of range. Any statement between the
+ * two ends the walk, so a marker cannot drift onto unrelated code. Same rule as
+ * scripts/verify-scope-predicates.js.
+ */
+const COMMENT_OR_BLANK = /^\s*(?:\/\/|\*|\/\*)|^\s*$/;
+// The nearest DECLARATION above the filter — a function, or a module-level
+// const holding a SQL fragment (LIVE_FROM and friends are not functions).
+const FUNCTION_START = /^(?:async\s+)?function\s+\w+\s*\(|^const\s+\w+\s*=/;
+
+function entitlementMarkedNear(lines, i) {
+  if (ENTITLEMENT_MARKER.test(lines[i])) return true;
+  for (let k = i - 1; k >= 0; k -= 1) {
+    if (!COMMENT_OR_BLANK.test(lines[k])) return false;
+    if (ENTITLEMENT_MARKER.test(lines[k])) return true;
+  }
+  return false;
+}
+
+/*
+ * The filter is often INSIDE a SQL template literal, where a `//` marker is
+ * impossible — it would be neither a JS comment nor valid SQL, and would ship
+ * to MySQL inside the query string. Those take a FUNCTION-level marker instead,
+ * in the comment block above the function that builds the SQL.
+ *
+ * That is the more honest scope anyway: "this whole builder is job gating, not
+ * an entitlement read" is a property of the function, not of one line of its
+ * WHERE clause. It still cannot drift — the walk stops at the function it is
+ * inside and reads only the unbroken comment block directly above it.
+ */
+function entitlementMarkedOnFunction(lines, i) {
+  let fn = -1;
+  for (let k = i; k >= 0; k -= 1) {
+    if (FUNCTION_START.test(lines[k])) { fn = k; break; }
+  }
+  if (fn < 0) return false;
+  for (let k = fn - 1; k >= 0; k -= 1) {
+    if (!COMMENT_OR_BLANK.test(lines[k])) return false;
+    if (ENTITLEMENT_MARKER.test(lines[k])) return true;
+  }
+  return false;
+}
+
+/* Blank comment BODIES so prose describing the rule is not mistaken for it —
+ * but keep any line carrying the marker, which is the whole point of a marker
+ * living in a comment. Line structure is preserved so numbers stay honest. */
+function stripProse(src) {
+  let inBlock = false;
+  return src.split('\n').map((line) => {
+    if (ENTITLEMENT_MARKER.test(line)) return line;
+    let out = '';
+    for (let i = 0; i < line.length; i += 1) {
+      if (inBlock) {
+        if (line[i] === '*' && line[i + 1] === '/') { inBlock = false; i += 1; }
+        out += ' ';
+        continue;
+      }
+      if (line[i] === '/' && line[i + 1] === '*') { inBlock = true; out += '  '; i += 1; continue; }
+      if (line[i] === '/' && line[i + 1] === '/') return out + ' '.repeat(line.length - i);
+      out += line[i];
+    }
+    return out;
+  }).join('\n');
+}
+
+function entitlementViolations(overrides = {}) {
+  const fs = require('fs');
+  const path = require('path');
+  const root = path.join(__dirname, '..');
+  const found = [];
+  /* With synthetic input, scan ONLY what was handed in. Scanning the real files
+   * too would make every self-check inherit production's findings and fail for
+   * a reason that has nothing to do with the case under test. */
+  const targets = Object.keys(overrides).length ? Object.keys(overrides) : ENTITLEMENT_FILES;
+  for (const rel of targets) {
+    const src = overrides[rel] ?? fs.readFileSync(path.join(root, rel), 'utf8');
+    const raw = src.split('\n');
+    const lines = stripProse(src).split('\n');
+    lines.forEach((line, i) => {
+      if (!COURSE_SETTING_FILTER.test(line)) return;
+      if (OR_ARM.test(line)) return;                     // serves the entitlement
+      if (entitlementMarkedNear(lines, i)) return;       // declared narrow, on purpose
+      if (entitlementMarkedOnFunction(lines, i)) return; // …or the whole builder is
+      found.push(`${rel}:${i + 1}  ${raw[i].trim()}`);
+    });
+  }
+  return found;
+}
+
+test('every course-settings filter either carries the OR-arm or says why not', () => {
+  assert.deepEqual(entitlementViolations(), [],
+    'a filter on c.status / c.certificate_enabled can revoke a badge somebody already '
+    + "earned. Add `OR ec.badge_earned_at IS NOT NULL` if it serves a technician's own "
+    + 'entitlement, or an `// entitlement-guard: <why>` comment if it legitimately '
+    + 'governs only who earns one NEXT (a catalogue, the award itself, or job gating).');
+});
+
+test('the guard FIRES on the exact query that shipped the bug', () => {
+  const regressed = [
+    'async function coursesForTech(efrId) {',
+    '  const [courses] = await pool.query(`SELECT ec.course_id AS id',
+    '       FROM easyfixer_courses ec',
+    '       JOIN courses c ON c.id = ec.course_id',
+    '      WHERE ec.easyfixer_id = ?',
+    '        AND c.status = 1`, [efrId]);',
+    '}',
+  ].join('\n');
+  const v = entitlementViolations({ 'services/lms.service.js': regressed });
+  assert.equal(v.length, 1, 'the bare status filter must be caught');
+  assert.match(v[0], /lms\.service\.js:6/);
+});
+
+test('the OR-arm and a marker each satisfy the guard, and prose does not', () => {
+  const withArm = '      WHERE ec.easyfixer_id = ?\n'
+    + '        AND (c.status = 1 OR ec.badge_earned_at IS NOT NULL)';
+  assert.deepEqual(entitlementViolations({ 'services/lms.service.js': withArm }), []);
+
+  const withMarker = '  // entitlement-guard: the CRM catalogue, not a technician entitlement\n'
+    + "  if (!includeInactive) where.push('c.status = 1');";
+  assert.deepEqual(entitlementViolations({ 'services/lms.service.js': withMarker }), []);
+
+  const prose = '  /* c.status = 1 matters here, and certificate_enabled too. */\n'
+    + "  where.push('c.status = 1');";
+  assert.equal(entitlementViolations({ 'services/lms.service.js': prose }).length, 1,
+    'prose about the rule must not satisfy the rule');
+});
+
+test('a function-level marker covers a filter inside a SQL template literal', () => {
+  const fnMarked = [
+    '/*',
+    ' * entitlement-guard: job gating — retiring a course must stop it gating work.',
+    ' */',
+    'async function mandatoryVideoIdsSql() {',
+    '  return `SELECT lc.ref_id FROM lms_content lc',
+    '    JOIN courses c ON c.id = lc.course_id',
+    '   WHERE c.status = 1`;',
+    '}',
+  ].join('\n');
+  assert.deepEqual(entitlementViolations({ 'services/lms.service.js': fnMarked }), []);
+
+  // Same function, marker removed — the guard must fire again.
+  const unmarked = fnMarked.split('\n').filter((l) => !/entitlement-guard/.test(l)).join('\n');
+  assert.equal(entitlementViolations({ 'services/lms.service.js': unmarked }).length, 1);
+});
+
+test('a marker cannot drift across a statement onto unrelated code', () => {
+  const drifted = [
+    '  // entitlement-guard: this justifies the line right below it',
+    "  where.push('lc.status = 1');",
+    '',
+    "  where.push('c.status = 1');",
+  ].join('\n');
+  assert.equal(entitlementViolations({ 'services/lms.service.js': drifted }).length, 1,
+    'a statement between the marker and the filter must end the walk');
+});
+
+test('a PROJECTION is not a filter — it can revoke nothing', () => {
+  const projection = '    `SELECT c.id, c.name, c.status, c.certificate_enabled\n'
+    + '       FROM courses c`';
+  assert.deepEqual(entitlementViolations({ 'services/lms.service.js': projection }), []);
+});

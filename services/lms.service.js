@@ -296,6 +296,8 @@ async function listCourses({
 
   const where = ['1=1'];
   const params = [];
+  // entitlement-guard: the CRM course catalogue. Hiding a retired course from an
+  // operator's list revokes nothing — no technician entitlement is read here.
   if (!includeInactive) where.push('c.status = 1');
   /*
    * Answers "what is every technician held to?" — the one question the course
@@ -1120,6 +1122,8 @@ async function stampBadges({ efrIds = null, courseId = null } = {}) {
   const where = [
     'ec.badge_earned_at IS NULL',
     'ec.completion_date IS NOT NULL',
+    // entitlement-guard: this IS the award. The flag decides who earns a badge
+    // NEXT; rows already stamped are excluded by badge_earned_at IS NULL above.
     'c.certificate_enabled = 1',
   ];
   const params = [new Date()];
@@ -1933,6 +1937,10 @@ async function assignCourseToAll(courseId, { dueDate = null } = {}) {
  * every caller handles: services/mobile-registration.service.js treats a zero
  * mandatory set as NOT complete and says so loudly, which is the safe
  * direction — nobody is advanced out of training by a missing column.
+ *
+ * entitlement-guard: job gating, not an entitlement read. Retiring a course must
+ * actually stop it blocking work (see above); no badge or certificate is served
+ * from here, so a status filter has nothing to revoke.
  */
 async function mandatoryVideoIdsSql() {
   const { courseMandatory, videoGlobal } = await lmsFlagColumns();
@@ -1974,6 +1982,9 @@ async function visibleVideoIdsSql() {
  * mandatory catalogue as it stands on the day they join. Same INSERT..SELECT
  * NOT EXISTS shape as assignCourseToAll, so it is idempotent and never
  * disturbs an existing assignment.
+ *
+ * entitlement-guard: assignment, not an entitlement read. A retired course must
+ * not be handed to anyone new; nobody's earned badge is filtered here.
  */
 async function assignMandatoryCourses(efrId) {
   const id = Number(efrId);
