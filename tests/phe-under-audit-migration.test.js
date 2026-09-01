@@ -1,12 +1,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
+const { readMigration } = require('./helpers/migration-file');
 
-const migration = fs.readFileSync(
-  path.join(__dirname, '..', 'migrations', '2026-08-20-phe-under-audit-read-index.sql'),
-  'utf8',
-);
+const migration = readMigration('2026-08-20-phe-under-audit-read-index.sql');
 
 test('Under Audit migration owns the full equality prefix before review-time ordering', () => {
   assert.match(

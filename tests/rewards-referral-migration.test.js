@@ -1,30 +1,13 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
+const { readMigration } = require('./helpers/migration-file');
 
-/*
- * A migration lives in migrations/ while it is pending and moves to
- * migrations/executed/ once applied. Pinning either location alone makes the
- * test fail the day the migration ships — which is exactly backwards, since
- * an applied migration is the one whose contents matter most. Resolve from
- * both, and fail loudly if it has genuinely gone missing.
- */
-function migrationPath(filename) {
-  const candidates = [
-    path.join(__dirname, '..', 'migrations', filename),
-    path.join(__dirname, '..', 'migrations', 'executed', filename),
-  ];
-  const found = candidates.find((p) => fs.existsSync(p));
-  assert.ok(found, `migration ${filename} not found in migrations/ or migrations/executed/`);
-  return found;
-}
-
-const indexMigrationPath = migrationPath('2026-08-14-referral-profile-qualification-indexes.sql');
-const menuMigrationPath = migrationPath('2026-08-14-reward-referrals-menu.sql');
+// Resolved from migrations/ or migrations/executed/ — see the helper for why.
+const indexMigration = readMigration('2026-08-14-referral-profile-qualification-indexes.sql');
+const menuMigration = readMigration('2026-08-14-reward-referrals-menu.sql');
 
 test('referral migration adds one idempotent read-only CRM leaf and Admin grant', () => {
-  const sql = fs.readFileSync(menuMigrationPath, 'utf8');
+  const sql = menuMigration;
   assert.match(sql, /'Referral Qualifications'.*'rewardReferrals'/s);
   assert.match(sql, /NOT EXISTS\s*\([\s\S]*c\.url = 'rewardReferrals'/);
   assert.match(sql, /'isRewardReferralsView'/);
@@ -39,7 +22,7 @@ test('referral migration adds one idempotent read-only CRM leaf and Admin grant'
 });
 
 test('referral migration guards equivalent indexes instead of adding duplicates', () => {
-  const sql = fs.readFileSync(indexMigrationPath, 'utf8');
+  const sql = indexMigration;
   for (const columns of [
     'qualified_at,id,referred_efr_id,referrer_efr_id',
     'code,id',
