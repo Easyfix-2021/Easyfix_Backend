@@ -35,6 +35,7 @@
  */
 
 const { pool } = require('../db');
+const { cityScopeSql } = require('../lib/scope');
 const logger = require('../logger');
 const properties = require('./properties.service');
 const lms = require('./lms.service');
@@ -83,7 +84,7 @@ function applyCityScope(clauses, params, scope, alias = 'e') {
   if (!ci) return;                                   // Admin / Finance bypass
   if (ci.mode === 'none') { clauses.push('1=0'); return; }
   if (ci.mode === 'allow' && ci.ids.length) {
-    clauses.push(`${alias}.efr_cityId IN (${ci.ids.map(() => '?').join(',')})`);
+    clauses.push(cityScopeSql(`${alias}.efr_cityId`, `${alias}.efr_id`, ci.ids));
     params.push(...ci.ids);
   }
 }

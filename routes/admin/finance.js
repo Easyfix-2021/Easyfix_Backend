@@ -8,7 +8,7 @@ const { sendXlsx } = require('../../utils/xlsx-export');
 const { renderInvoicePdf } = require('../../utils/pdf-invoice');
 const archiver = require('archiver');
 const { PassThrough } = require('stream');
-const { buildRequestScope, assertEntityInScope } = require('../../lib/scope');
+const { buildRequestScope, cityScopeSql, assertEntityInScope } = require('../../lib/scope');
 
 /*
  * Row-level scope guard for every invoice `/invoices/:id*` endpoint.
@@ -547,7 +547,7 @@ router.get('/efr-transactions', async (req, res, next) => {
       const ci = scope.cities;
       if (ci.mode === 'none') clauses.push('1=0');
       else if (ci.mode === 'allow' && ci.ids.length) {
-        clauses.push(`e.efr_cityId IN (${ci.ids.map(() => '?').join(',')})`);
+        clauses.push(cityScopeSql('e.efr_cityId', 'e.efr_id', ci.ids));
         params.push(...ci.ids);
       }
     }
@@ -748,7 +748,7 @@ router.get('/payouts', async (req, res, next) => {
       const ci = scope.cities;
       if (ci.mode === 'none') clauses.push('1=0');
       else if (ci.mode === 'allow' && ci.ids.length) {
-        clauses.push(`e.efr_cityId IN (${ci.ids.map(() => '?').join(',')})`);
+        clauses.push(cityScopeSql('e.efr_cityId', 'e.efr_id', ci.ids));
         params.push(...ci.ids);
       }
     }

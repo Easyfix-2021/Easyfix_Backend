@@ -3366,6 +3366,10 @@ router.get('/technicians', async (req, res, next) => {
       const arr = String(req.query.cityIds).split(',')
         .map((s) => Number(s.trim())).filter((n) => !Number.isNaN(n));
       if (arr.length) {
+        // scope-guard: user-supplied filter, not RBAC — must stay narrow.
+        // The CRM's operator scope admits technicians with no city (see
+        // lib/scope.js::cityScopeSql); this is a client picking cities for
+        // themselves, and widening it would show them unscoped technicians.
         where.push(`e.efr_cityId IN (${arr.map(() => '?').join(',')})`);
         params.push(...arr);
       }

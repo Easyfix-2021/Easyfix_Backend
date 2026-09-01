@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const { cityScopeSql } = require('../lib/scope');
 const logger = require('../logger');
 const s3 = require('../utils/s3-storage');
 
@@ -1259,7 +1260,7 @@ function applyCityScope(where, params, scope) {
   const ci = scope.cities;
   if (ci.mode === 'none') where.push('1=0');
   else if (ci.mode === 'allow' && ci.ids.length) {
-    where.push(`e.efr_cityId IN (${ci.ids.map(() => '?').join(',')})`);
+    where.push(cityScopeSql('e.efr_cityId', 'e.efr_id', ci.ids));
     params.push(...ci.ids);
   }
 }

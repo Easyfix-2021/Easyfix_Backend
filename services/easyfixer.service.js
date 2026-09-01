@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const { cityScopeSql } = require('../lib/scope');
 const logger = require('../logger');
 const lifecycleService = require('./easyfixer-lifecycle.service');
 const {
@@ -139,30 +140,6 @@ const LIST_JOINS = `
   ) team ON team.efr_manager_id = e.efr_id
 `;
 
-/*
- * The RBAC city-scope predicate, in ONE place because FIVE call sites use it —
- * the roster, the counts strip, the lazy aggregate fill, attendance, and the
- * registered queue — and they have to agree. When the counts and the list
- * disagreed about which rows exist, the strip advertised technicians the table
- * refused to show, and that took a day to find.
- *
- * A TECHNICIAN WITH NO CITY IS VISIBLE UNDER EVERY SCOPE.
- *
- * `e.efr_cityId IN (…)` is never true for NULL, so 2,427 technicians with no
- * city belonged to no operator's scope and were invisible to all of them —
- * including the people whose job is to give them one. Nobody owning a row is
- * not a reason to hide it from everybody.
- *
- * THIS DOES NOT WIDEN THE EXPLICIT City / State FILTERS, and it cannot:
- * choosing a city adds `e.efr_cityId = ?`, choosing a state adds
- * `c.state_id = ?` through a LEFT JOIN, and neither matches NULL. So a
- * city-less technician surfaces only when City and State are both All — which
- * is the intent, and is asserted in tests/easyfixer-city-scope.test.js.
- */
-function cityScopeSql(column, ids) {
-  return `(${column} IN (${ids.map(() => '?').join(',')}) OR ${column} IS NULL)`;
-}
-
 const DETAIL_COLUMNS = `
   e.*,
   c.city_name AS city_name
@@ -194,7 +171,7 @@ async function list({
     const ci = scope.cities;
     if (ci.mode === 'none') clauses.push('1=0');
     else if (ci.mode === 'allow' && ci.ids.length) {
-      clauses.push(cityScopeSql('e.efr_cityId', ci.ids));
+      clauses.push(cityScopeSql('e.efr_cityId', 'e.efr_id', ci.ids));
       params.push(...ci.ids);
     }
   }
@@ -1061,7 +1038,7 @@ async function aggregates(efrIds, { scope } = {}) {
     const ci = scope.cities;
     if (ci.mode === 'none') return { rows: [] };
     if (ci.mode === 'allow' && ci.ids.length) {
-      scopeClauses.push(cityScopeSql('e.efr_cityId', ci.ids));
+      scopeClauses.push(cityScopeSql('e.efr_cityId', 'e.efr_id', ci.ids));
       scopeParams.push(...ci.ids);
     }
   }
@@ -1176,7 +1153,7 @@ async function attendance(efrIds, { scope } = {}) {
       scopeClauses.push(`EXISTS (
         SELECT 1 FROM tbl_easyfixer e
          WHERE e.efr_id = att.easyfixer_id
-           AND ${cityScopeSql('e.efr_cityId', ci.ids)}
+           AND ${cityScopeSql('e.efr_cityId', 'e.efr_id', ci.ids)}
       )`);
       scopeParams.push(...ci.ids);
     }
@@ -1239,7 +1216,7 @@ async function statusCounts({ scope } = {}) {
       };
     }
     if (ci.mode === 'allow' && ci.ids.length) {
-      clauses.push(cityScopeSql('e.efr_cityId', ci.ids));
+      clauses.push(cityScopeSql('e.efr_cityId', 'e.efr_id', ci.ids));
       params.push(...ci.ids);
     }
   }
@@ -1483,7 +1460,7 @@ function buildRegisteredWhere(f = {}, scope, lifecycleInstalled = false) {
     const ci = scope.cities;
     if (ci.mode === 'none') clauses.push('1=0');
     else if (ci.mode === 'allow' && ci.ids.length) {
-      clauses.push(cityScopeSql('e.efr_cityId', ci.ids));
+      clauses.push(cityScopeSql('e.efr_cityId', 'e.efr_id', ci.ids));
       params.push(...ci.ids);
     }
   }

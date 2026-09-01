@@ -4,7 +4,7 @@ const logger = require('../../logger');
 const validate = require('../../middleware/validate');
 const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
-const { buildRequestScope, assertEntityInScope } = require('../../lib/scope');
+const { buildRequestScope, cityScopeSql, assertEntityInScope } = require('../../lib/scope');
 
 // Helper: load an advance + its scope-relevant fields (client/vertical/city).
 async function loadAdvanceForScope(advanceId) {
@@ -78,7 +78,7 @@ router.get('/', async (req, res, next) => {
         clauses.push(`a.client_id IN (${c.ids.map(() => '?').join(',')})`); params.push(...c.ids);
       }
       if (ci.mode === 'allow' && ci.ids.length) {
-        clauses.push(`e.efr_cityId IN (${ci.ids.map(() => '?').join(',')})`); params.push(...ci.ids);
+        clauses.push(cityScopeSql('e.efr_cityId', 'e.efr_id', ci.ids)); params.push(...ci.ids);
       }
       if (v.mode === 'allow' && v.ids.length) {
         clauses.push(`c.vertical_id IN (${v.ids.map(() => '?').join(',')})`); params.push(...v.ids);

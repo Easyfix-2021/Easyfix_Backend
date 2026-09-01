@@ -24,9 +24,10 @@
     "upload:deepskill-images": "node scripts/upload-deepskill-images.js",
     "verify:schema": "node scripts/schema-verify.js",
     "verify:phantom-columns": "node scripts/verify-phantom-columns.js",
+    "verify:scope-predicates": "node scripts/verify-scope-predicates.js",
     "verify:schema:boot": "node scripts/schema-verify.js --boot-check",
     "verify:env": "node scripts/env-verify.js",
-    "verify:all": "npm run build && npm run test:db && npm run verify:schema && npm run verify:phantom-columns && npm run verify:migrations && npm run verify:env",
+    "verify:all": "npm run build && npm run test:db && npm run verify:schema && npm run verify:phantom-columns && npm run verify:scope-predicates && npm run verify:migrations && npm run verify:env",
     "verify:migrations": "node scripts/migration-status.js",
     "test:tat": "node --test --test-force-exit tests/tat-service.test.js"
   },

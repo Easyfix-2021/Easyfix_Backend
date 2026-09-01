@@ -36,6 +36,20 @@ const fake = installFakePool([
   [/./, []],
 ]);
 const svc = require('../services/easyfixer.service');
+
+/*
+ * The predicate every scope site must emit, anchored.
+ *
+ * The anchor is not decoration. Most sites reach the technician through
+ * `LEFT JOIN tbl_easyfixer e`, where a NULL city means EITHER "this technician
+ * has no city" (must be visible) OR "no technician row matched at all" (must
+ * not be). tbl_easyfixer_transaction and tbl_service_payout outlive the
+ * technicians they reference, so the unanchored form would hand every
+ * city-scoped operator the money rows of admin-deleted technicians.
+ */
+const SCOPED_PREDICATE =
+  /\(e\.efr_cityId IN \(\?,\?\) OR \(e\.efr_id IS NOT NULL AND e\.efr_cityId IS NULL\)\)/;
+
 after(() => fake.restore());
 
 const SCOPED = { cities: { mode: 'allow', ids: [56, 77] } };
@@ -45,7 +59,7 @@ test('a scoped roster admits rows with no city', async () => {
   fake.reset();
   await svc.list({ status: 0, scope: SCOPED });
   const sql = sqlOf(/FROM tbl_easyfixer e/i);
-  assert.match(sql, /\(e\.efr_cityId IN \(\?,\?\) OR e\.efr_cityId IS NULL\)/,
+  assert.match(sql, SCOPED_PREDICATE,
     'a technician belonging to no city belongs to no scope — and must not '
     + 'therefore belong to nobody');
 });
@@ -56,7 +70,7 @@ test('choosing a City still excludes them — no extra branch needed', async () 
   const sql = sqlOf(/FROM tbl_easyfixer e/i);
   assert.match(sql, /e\.efr_cityId = \?/, 'the explicit filter is an equality');
   // Equality never matches NULL, so the scope's OR cannot leak them back in.
-  assert.match(sql, /\(e\.efr_cityId IN \(\?,\?\) OR e\.efr_cityId IS NULL\)/);
+  assert.match(sql, SCOPED_PREDICATE);
 });
 
 test('choosing a State still excludes them', async () => {
@@ -88,7 +102,7 @@ test('the counts strip uses the SAME predicate as the list', async () => {
   fake.reset();
   await svc.statusCounts({ scope: SCOPED });
   const sql = sqlOf(/FROM tbl_easyfixer/i);
-  assert.match(sql, /\(e\.efr_cityId IN \(\?,\?\) OR e\.efr_cityId IS NULL\)/,
+  assert.match(sql, SCOPED_PREDICATE,
     'counts that disagree with the list are how 7,504 unreachable technicians '
     + 'got advertised in the first place');
 });
@@ -97,14 +111,14 @@ test('the registered queue uses it too', async () => {
   fake.reset();
   await svc.listRegistered({}, SCOPED);
   const sql = sqlOf(/FROM tbl_easyfixer e/i);
-  assert.match(sql, /\(e\.efr_cityId IN \(\?,\?\) OR e\.efr_cityId IS NULL\)/);
+  assert.match(sql, SCOPED_PREDICATE);
 });
 
 test('the aggregate fill covers the rows the list now returns', async () => {
   fake.reset();
   await svc.aggregates([1, 2, 3], { scope: SCOPED });
   const sql = sqlOf(/FROM tbl_easyfixer/i);
-  assert.match(sql, /\(e\.efr_cityId IN \(\?,\?\) OR e\.efr_cityId IS NULL\)/,
+  assert.match(sql, SCOPED_PREDICATE,
     'otherwise Job Count / Earnings come back blank for exactly the rows that '
     + 'just became visible');
 });
@@ -113,5 +127,5 @@ test('attendance covers them as well', async () => {
   fake.reset();
   await svc.attendance([1, 2, 3], { scope: SCOPED });
   const sql = sqlOf(/tbl_easyfixer/i);
-  assert.match(sql, /\(e\.efr_cityId IN \(\?,\?\) OR e\.efr_cityId IS NULL\)/);
+  assert.match(sql, SCOPED_PREDICATE);
 });
