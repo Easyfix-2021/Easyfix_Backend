@@ -1458,6 +1458,18 @@ async function trainingReport({
            ec.due_date, ec.completion_date,
            e.efr_name AS technician_name, e.efr_no AS technician_mobile,
            c.name AS course_name,
+           /*
+            * The certificate button on the report must be able to HIDE itself
+            * rather than 404 on click. certificateData() gates on
+            * (c.status = 1 AND c.certificate_enabled = 1 AND completion_date
+            * IS NOT NULL); the report row previously exposed only the third, so
+            * the CRM could offer a download for a course that does not issue
+            * one — or for a retired course — and the operator learned that from
+            * an error toast. Both halves ship here so the FE can gate on the
+            * same three facts the server checks.
+            */
+           c.certificate_enabled,
+           c.status AS course_status,
            ${COURSE_ITEMS_TOTAL} AS videos_total,
            ${COURSE_ITEMS_DONE} AS videos_done`;
 

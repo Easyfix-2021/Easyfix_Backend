@@ -149,3 +149,19 @@ test('the download is streamed, not JSON-wrapped, and not cached', () => {
     'data must be fetched BEFORE piping — once the stream starts the status '
     + 'line is already sent and an error can no longer become a 404');
 });
+
+test('the training report ships the fields the CRM needs to HIDE the button', () => {
+  /*
+   * The download route is gated on three facts; the report row used to expose
+   * only one of them, so the CRM could offer a certificate for a course that
+   * does not issue one and the operator found out from an error toast. If this
+   * projection ever loses these two columns the button silently starts 404ing
+   * again, and nothing else in the suite would notice.
+   */
+  const src = fs.readFileSync(path.join(ROOT, 'services/lms.service.js'), 'utf8');
+  const i = src.indexOf('async function trainingReport');
+  assert.ok(i > 0, 'trainingReport must exist');
+  const body = src.slice(i, i + 4000);
+  assert.match(body, /c\.certificate_enabled/, 'the course opt-in must reach the row');
+  assert.match(body, /c\.status AS course_status/, 'a retired course issues nothing');
+});
