@@ -221,6 +221,35 @@ const realFetch = globalThis.fetch;
 const seenBodies = [];
 const issuedOtps = [];
 
+/*
+ * A 4-DIGIT SECRET NEEDS DIGIT BOUNDARIES, NOT A SUBSTRING SCAN (2026-09-02).
+ *
+ * This scan used `new RegExp(otp)`, which matches anywhere — including INSIDE
+ * a longer number. Every 10-digit mobile in these fixtures contains SEVEN
+ * 4-digit windows:
+ *
+ *   9876543210 → 9876 8765 7654 6543 5432 4321 3210
+ *   9812345678 → 9812 8123 1234 2345 3456 4567 5678
+ *
+ * plus the bare id 4471 in the same payload. The OTP is randomly generated per
+ * run, so ~15 of the 9000 possible codes made a PASSING suite fail, with no
+ * code change and nothing to reproduce. It duly did: commit 4fde355 passed on
+ * Production and failed on QA — the same bytes, a different random draw:
+ *
+ *   actual: {"efr_id":4471,"efr_no":"9876543210",...}
+ *   error:  OTP value in a response body
+ *
+ * Requiring a NON-DIGIT on each side keeps every tooth the scan had. A real
+ * leak is `"otp":"1234"` or `"code": 1234` — quotes, colons and braces, never
+ * more digits — so it still matches; digits swallowed by a phone number no
+ * longer do. Proven both ways by the control at the end of this file.
+ *
+ * ponytail: a BARE 4-digit id that happens to equal the OTP still matches
+ * (~1 in 9000 per issued OTP). Left alone: the fix would be a field allowlist
+ * that rots, and the OTP-shaped-field assertion below is the real guard.
+ */
+const asWholeNumber = (digits) => new RegExp(`(?<!\\d)${digits}(?!\\d)`);
+
 async function api(method, path, body) {
   const res = await realFetch(`${baseUrl}${path}`, {
     method,
@@ -880,7 +909,7 @@ test('sending the OTP returns { sent: true } and nothing that could be the code'
   const issuedOtp = String(write.params[0]);
   issuedOtps.push(issuedOtp);
   assert.match(issuedOtp, /^\d{4}$/);
-  assert.doesNotMatch(res.text, new RegExp(issuedOtp),
+  assert.doesNotMatch(res.text, asWholeNumber(issuedOtp),
     'the OTP value must never travel in a response body');
 });
 
@@ -897,7 +926,32 @@ test('no response body in this suite ever contained an OTP or a full account num
     assert.doesNotMatch(body, new RegExp(OLD_ACCOUNT), 'full account number in a response body');
     assert.doesNotMatch(body, /"?(profile_update_)?otp"?\s*:/i, 'an OTP-shaped field in a response body');
     for (const otp of otpValues) {
-      assert.doesNotMatch(body, new RegExp(otp), 'OTP value in a response body');
+      assert.doesNotMatch(body, asWholeNumber(otp), 'OTP value in a response body');
     }
+  }
+});
+
+test('the OTP scanner still has teeth — it catches a leak and ignores a phone number', () => {
+  /*
+   * The control for the scan above. Loosening a matcher to kill a flake can
+   * loosen it into uselessness, and a scan that can no longer fail reports
+   * "no leaks" forever. This asserts BOTH directions on the exact strings
+   * that mattered: the body that failed CI must pass, and the leak shapes an
+   * endpoint would actually emit must still be caught.
+   */
+  const otp = '9876'; // deliberately a window of NEW_MOBILE — the CI failure
+
+  const innocentBody =
+    `{"success":true,"data":{"efr_id":4471,"efr_no":"${NEW_MOBILE}","changed":true}}`;
+  assert.doesNotMatch(innocentBody, asWholeNumber(otp),
+    'digits inside a phone number are not a leak');
+
+  for (const leak of [
+    `{"data":{"otp":"${otp}"}}`,          // quoted string value
+    `{"data":{"code":${otp}}}`,           // bare numeric value
+    `{"message":"Your OTP is ${otp}"}`,   // interpolated into prose
+    `{"data":{"otp":"${otp}","x":1}}`,    // followed by more JSON
+  ]) {
+    assert.match(leak, asWholeNumber(otp), `a real leak must still be caught: ${leak}`);
   }
 });
