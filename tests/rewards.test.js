@@ -622,6 +622,8 @@ test('applying a code after Complete Profile qualifies it immediately', async ()
       adhaar_card_number: '123412341234',
       efr_profile_img: 'profile.jpg',
       user_is_personal_detail_filled: 1,
+      dob_present: 1,
+      serviceable_pincodes_present: 1,
     }]],
     [/SELECT efr_status[\s\S]*FROM tbl_easyfixer/i, [{ efr_status: 1 }]],
     [/INSERT INTO reward_points_ledger/i, { insertId: 900 }],
@@ -654,6 +656,17 @@ function qualificationDatabase({ complete = true, duplicateLedger = null } = {})
     adhaar_card_number: complete ? '123412341234' : null,
     efr_profile_img: complete ? 'profile.jpg' : null,
     user_is_personal_detail_filled: complete ? 1 : 0,
+    /*
+     * A complete profile now also carries a date of birth and at least one
+     * serviceable pincode — the two fields the app's own cards had always asked
+     * for and nothing had ever checked. A referral qualifies when the referred
+     * technician's profile is complete, so it qualifies on the SAME definition
+     * the technician is let past the Complete Profile screen on; a fixture
+     * still describing the old two-field version would keep passing while the
+     * two halves drifted.
+     */
+    dob_present: complete ? 1 : 0,
+    serviceable_pincodes_present: complete ? 1 : 0,
   };
 
   const conn = {
@@ -775,6 +788,8 @@ test('referral attribution is one lightweight read with no own-code generation o
       adhaar_card_number: '123412341234',
       efr_profile_img: 'profile.jpg',
       user_is_personal_detail_filled: 1,
+      dob_present: 1,
+      serviceable_pincodes_present: 1,
       referral_code: 'EFFRIEND',
       joined_at: new Date('2026-08-01T00:00:00Z'),
       qualified_at: null,
@@ -828,6 +843,8 @@ test('CRM referral list is bounded, keyset-paginated and matches the page DTO', 
     adhaar_card_number: '123412341234',
     efr_profile_img: 'profile.jpg',
     user_is_personal_detail_filled: 1,
+    dob_present: 1,
+    serviceable_pincodes_present: 1,
   }));
   const r = route([[/FROM reward_referrals r/i, records]]);
   const out = await rewards.listReferrals({

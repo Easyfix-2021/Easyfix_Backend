@@ -297,7 +297,14 @@ async function getStatus(efrId, authenticatedLifecycle = null) {
   // Aadhaar + photo on file. All three are written together by that screen;
   // requiring all three defends against legacy rows that set the personal
   // flag before Aadhaar/photo existed.
-  const gate1Complete  = isPersonalDetailFilled && aadhaarPresent && photoPresent;
+  /*
+   * Gate 1 now means the whole of what the app's first three cards promise —
+   * identity INCLUDING the date of birth, and a work area INCLUDING the
+   * serviceable set. It used to pass on two of identity's four fields and the
+   * work area's stored flag alone, so a technician with no DOB and no
+   * serviceable pincodes was told "4 of 4 steps done".
+   */
+  const gate1Complete  = completion.identityComplete && completion.workAreaComplete;
 
   const flags = {
     isPersonalDetailFilled,
@@ -312,6 +319,16 @@ async function getStatus(efrId, authenticatedLifecycle = null) {
     isTechnicianVerified:       bool(e.is_technician_verified),
     aadhaarPresent,
     photoPresent,
+    /*
+     * Both added 2026-09-02, because the app's completion cards were promising
+     * more than these flags checked: the identity card asks for a date of birth
+     * and the work-area card asks for the areas the technician wants jobs in,
+     * and neither was part of any completeness answer. See
+     * services/profile-completion.service.js for the measured impact.
+     */
+    dobPresent:                 completion.dobPresent,
+    serviceablePincodesPresent: completion.serviceablePincodesPresent,
+    workAreaComplete:           completion.workAreaComplete,
     panPresent,
     hasSkills,
     trainingCompletedTime,

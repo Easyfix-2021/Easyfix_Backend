@@ -220,6 +220,22 @@ async function getHierarchy(efrId, categoryId) {
  * active and untouched (legacy returned null here; we surface the real
  * count so the app can show "Unchanged: N").
  */
+/**
+ * May the APP write skills into this category?
+ *
+ * The whole one-category rule in one place, so it can be checked without a
+ * database standing behind it:
+ *   inThis  mappings the technician already has in the target category
+ *   inAny   mappings the technician has anywhere
+ *
+ * Editing a category they already hold is always fine; their FIRST category is
+ * the onboarding choice; a second one has to come from Ops.
+ */
+function categoryAllowedForApp({ inThis, inAny }) {
+  if (inThis > 0) return true;    // already theirs — editing skills
+  return inAny === 0;             // nothing yet — this is the one choice
+}
+
 async function applySkills(efrId, payload) {
   const categoryId = Number(payload.categoryId);
   logger.info('Apply deep skills · categoryId=' + categoryId + ' · serviceTypes=' + ((payload.serviceTypes || []).length));
@@ -241,6 +257,51 @@ async function applySkills(efrId, payload) {
     const err = new Error('service category not found');
     err.status = 404;
     throw err;
+  }
+
+  /*
+   * ONE CATEGORY FROM THE APP. EVER.
+   *
+   * The rule as stated by the business: a technician onboarding chooses ONE
+   * category. After that the app never adds another — Ops adds categories from
+   * the CRM, and the technician may then edit skills inside them. So both
+   * halves are the same question, asked of the categories the technician
+   * ALREADY has mappings in:
+   *
+   *   already mapped here          → allowed (editing skills, at any stage)
+   *   no mappings anywhere yet     → allowed (this is the onboarding choice)
+   *   mapped elsewhere, not here   → REJECTED (a second category from the app)
+   *
+   * Enforced here rather than only in the UI because the UI is a suggestion:
+   * this endpoint is reachable with any category id, and a rule that lives only
+   * in a screen is not a rule. Deleting is always allowed — a payload that adds
+   * nothing cannot create a category — so a technician can still clear skills
+   * in a category Ops later removes.
+   */
+  const adds = (payload.serviceTypes || []).some((st) =>
+    (st.deepSkills || []).some((ds) => (ds.selectedOptions || []).length > 0));
+  if (adds) {
+    const [[existing]] = await pool.query(
+      `SELECT
+         SUM(st.service_catg_id = ?) AS in_this_category,
+         COUNT(*)                    AS in_any_category
+         FROM tbl_efr_deepskill_mapping m
+         JOIN tbl_service_type st ON st.service_type_id = m.service_type_id
+        WHERE m.easyfixer_id = ?`,
+      [categoryId, Number(efrId)],
+    );
+    const inThis = Number(existing?.in_this_category || 0);
+    const inAny = Number(existing?.in_any_category || 0);
+    if (!categoryAllowedForApp({ inThis, inAny })) {
+      logger.warn('Apply deep skills rejected · second category from the app · efrId='
+        + efrId + ' · categoryId=' + categoryId);
+      const err = new Error(
+        'Your categories are set by the EasyFix team. You can add skills inside the '
+        + 'categories you already have; ask your manager to add a new category.',
+      );
+      err.status = 409;
+      throw err;
+    }
   }
 
   // Flatten the payload into the desired pair set:
@@ -362,4 +423,5 @@ async function applySkills(efrId, payload) {
   }
 }
 
-module.exports = { getHierarchy, applySkills };
+module.exports = {
+  _internals: { categoryAllowedForApp }, getHierarchy, applySkills };
