@@ -171,16 +171,46 @@ function capabilitiesForStatus(status) {
   const availabilityOnly = status === 'OFFLINE' || status === 'ON_BENCH';
   const editRegistration = EDIT_REGISTRATION.has(status);
   const reapply = REAPPLY_FROM.has(status);
+  /*
+   * "Is this technician USING the app" — the same condition readOnlyApp is the
+   * negation of. Capabilities that are part of ordinary app use hang off this,
+   * not off whether jobs may be received.
+   */
+  const usingTheApp = active || paused || availabilityOnly || editRegistration;
+  /*
+   * PAUSED is deliberately NOT here. Pause suspends AVAILABILITY while letting
+   * assigned work finish, and marking attendance is a declaration of exactly
+   * the availability that was suspended — so the two capabilities part company
+   * at PAUSED, and `tests/easyfixer-lifecycle.test.js` pins that.
+   */
+  const attendanceAllowed = active || availabilityOnly || editRegistration;
   return {
     receiveNewJobs: active,
     // A pause/availability change must never strand a job already assigned.
     continueAssignedJobs: active || paused || availabilityOnly,
     mutateAssignedJobs: active || paused || availabilityOnly,
-    markAttendance: active || availabilityOnly,
+    /*
+     * ATTENDANCE FOLLOWS APP ACCESS, NOT JOB ELIGIBILITY.
+     *
+     * It was `active || availabilityOnly`, which reads as "you may declare
+     * yourself available once you are allowed to work". But a technician
+     * awaiting verification is IN the app, on the dashboard, being asked to
+     * mark attendance by a card on that dashboard and by a 9am push — and the
+     * mutation was refused by middleware, so the answer was "Couldn't mark
+     * attendance. Please try again," which is untrue twice over: it was not a
+     * transient failure and trying again could never work.
+     *
+     * The rule is that reaching the dashboard means the app works; the only
+     * thing verification withholds is job OFFERS (receiveNewJobs, above).
+     * Statuses that never reach the dashboard — BLACKLISTED, SUSPENDED,
+     * INACTIVE, DORMANT, APPLICATION_REJECTED — are exactly the ones outside
+     * `usingTheApp`, so they stay refused without naming them here.
+     */
+    markAttendance: attendanceAllowed,
     editRegistration,
     claimMoney: true,
     reapply,
-    readOnlyApp: !active && !paused && !availabilityOnly && !editRegistration,
+    readOnlyApp: !usingTheApp,
   };
 }
 

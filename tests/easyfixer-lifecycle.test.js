@@ -151,6 +151,33 @@ test('persisted operational lifecycle drift fails every server work capability c
   assert.equal(paused.capabilities.markAttendance, false);
 });
 
+test('a technician still being verified can mark attendance — only job OFFERS wait', () => {
+  /*
+   * Reported from the dashboard: an UNDER_VERIFICATION technician tapped the
+   * availability toggle the dashboard itself puts in front of them and got
+   * "Couldn't mark attendance. Please try again." It was not transient and
+   * retrying could never work — the mutation is gated on this capability, and
+   * it read `active || availabilityOnly`, i.e. "you may declare yourself
+   * available once you are allowed to work".
+   *
+   * The rule is that reaching the dashboard means the app works; verification
+   * withholds job OFFERS and nothing else.
+   */
+  for (const status of ['UNDER_VERIFICATION', 'TRAINING_PENDING', 'NEW', 'REGISTRATION_INCOMPLETE']) {
+    const c = lifecycle.capabilitiesForStatus(status);
+    assert.equal(c.markAttendance, true, `${status} is in the app and must be able to mark attendance`);
+    assert.equal(c.receiveNewJobs, false, `${status} must still not be offered jobs`);
+  }
+});
+
+test('attendance parts company with assigned-work capability at PAUSED', () => {
+  // Pause suspends AVAILABILITY while letting assigned work finish, and
+  // attendance is a declaration of exactly that availability.
+  const c = lifecycle.capabilitiesForStatus('PAUSED');
+  assert.equal(c.mutateAssignedJobs, true, 'a pause must not strand assigned work');
+  assert.equal(c.markAttendance, false, 'but it does suspend availability');
+});
+
 test('legacy efr_status projection changes only for active and operational blocks', () => {
   assert.equal(legacyStatusForTransition('ACTIVE', 0), 1);
   assert.equal(legacyStatusForTransition('PAUSED', 1), 0);
