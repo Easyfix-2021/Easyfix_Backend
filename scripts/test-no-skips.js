@@ -67,7 +67,9 @@ const child = spawn(
 );
 
 const skippedTests = [];
+const todoTests = [];
 let skippedCount = null;
+let todoCount = null;
 let partial = '';
 
 // The whole stream is scanned line by line rather than a trailing buffer: with
@@ -78,10 +80,15 @@ function scan(line) {
   // The raw line is kept verbatim rather than picking the name out of it — the
   // line already carries the skip REASON, which is the actionable half.
   if (/^ok \d+ - .* # SKIP\b/.test(line) || /^\s*﹣ /.test(line)) skippedTests.push(line.trim());
+  // `test.todo()` is the same defect wearing a different word: a guard that is
+  // not running. tap: `ok 2 - name # TODO`  ·  spec: `✔ name (0.05ms) # TODO`.
+  if (/\s# TODO\b/.test(line)) todoTests.push(line.trim());
   // tap: `# skipped 2`   ·   spec: `ℹ skipped 2`. Anchored at column 0 so a
   // nested TAP subtest summary (indented) cannot overwrite the real total.
   const m = /^(?:#|ℹ) skipped (\d+)\s*$/.exec(line);
   if (m) skippedCount = Number(m[1]);
+  const t = /^(?:#|ℹ) todo (\d+)\s*$/.exec(line);
+  if (t) todoCount = Number(t[1]);
 }
 
 child.stdout.on('data', (buf) => {
@@ -102,17 +109,48 @@ child.on('close', (code, signal) => {
   // A real test failure is reported by the runner and passed straight through —
   // this wrapper never masks it, and never adds noise on top of it.
   if (code !== 0) process.exit(code);
-  if (skippedCount === null) {
-    console.error('\ncould not find the "skipped" summary line in the test output.'
+  if (skippedCount === null || todoCount === null) {
+    console.error('\ncould not find the "skipped"/"todo" summary lines in the test output.'
       + '\nThe runner exited 0, but this wrapper cannot confirm zero skips, so it fails'
       + '\nrather than reporting a clean it did not verify. Has the reporter format changed?');
     process.exit(1);
   }
-  if (skippedCount === 0) return;
-  console.error(`\n${skippedCount} test(s) SKIPPED. A skipped test is a guard that is not running,`
-    + '\nso this is a failure. Either make the test able to run here, or delete it —'
-    + '\nfor the cross-repo parity tests that means the workflow must clone'
-    + '\nEasyfix_CRM_UI into "$RUNNER_TEMP" and set EASYFIX_CRM_UI_DIR.\n');
-  for (const line of skippedTests) console.error(`  ${line}`);
+
+  /*
+   * THE COUNTER IS NOT ENOUGH — measured 2026-09-02, and this is the whole
+   * reason the checks below are not just `skippedCount > 0`.
+   *
+   *   describe.skip('name', () => { test('never runs', ...) })
+   *     ﹣ name (0.24ms) # SKIP
+   *     ℹ tests 0 · ℹ suites 1 · ℹ skipped 0        <- the counter says ZERO
+   *
+   * Node counts a skipped SUITE's inner tests not at all, so an entirely
+   * disabled file reported `skipped 0` and this wrapper exited 0 — the exact
+   * defect it exists to prevent, living inside it. The `# SKIP` line was already
+   * being collected and was then thrown away by an early `if (count === 0)`.
+   *
+   *   test.todo('a guard nobody wrote yet')
+   *     ✔ a guard nobody wrote yet (0.05ms) # TODO
+   *     ℹ skipped 0 · ℹ todo 1                      <- passes a skip-only gate
+   *
+   * A todo is a guard that is not running under a friendlier name, so it fails
+   * here too. Both are reported separately, because the fix differs: a skip
+   * usually means an unmet precondition, a todo means unwritten work.
+   */
+  const problems = [];
+  if (skippedCount > 0 || skippedTests.length > 0) {
+    problems.push([`${Math.max(skippedCount, skippedTests.length)} test(s) or suite(s) SKIPPED.`,
+      'A skipped test is a guard that is not running, so this is a failure. Either make',
+      'it able to run here, or delete it — for the cross-repo parity tests that means the',
+      'workflow must clone the sibling repo and set its directory env var.',
+      ...skippedTests.map((l) => `  ${l}`)].join('\n'));
+  }
+  if (todoCount > 0 || todoTests.length > 0) {
+    problems.push([`${Math.max(todoCount, todoTests.length)} test(s) marked TODO.`,
+      'A todo test never runs and never fails, so it protects nothing. Write it or drop it.',
+      ...todoTests.map((l) => `  ${l}`)].join('\n'));
+  }
+  if (problems.length === 0) return;
+  console.error(`\n${problems.join('\n\n')}\n`);
   process.exit(1);
 });
