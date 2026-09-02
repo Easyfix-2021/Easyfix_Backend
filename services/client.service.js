@@ -39,6 +39,7 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const { isAbsentAnswer } = require('../utils/schema-absent-error');
+const { invalidateClientsByVertical } = require('../lib/scope');
 
 /* ─── Column-presence probe (cached) ──────────────────────────────── */
 
@@ -362,6 +363,9 @@ async function createClient(body, actorId) {
 
   const sql = `INSERT INTO tbl_client (${insertCols.join(', ')}) VALUES (${placeholders.join(', ')})`;
   const [ins] = await pool.query(sql, values);
+  // A new client arrives carrying a vertical — same cache, same reason as in
+  // updateClient below.
+  invalidateClientsByVertical();
   logger.info('Client created · id=' + ins.insertId);
   return ins.insertId;
 }
@@ -484,6 +488,18 @@ async function updateClient(clientId, body, actorId) {
   const [r] = await pool.query(
     `UPDATE tbl_client SET ${sets.join(', ')} WHERE client_id = ?`, vals,
   );
+  /*
+   * A client's vertical decides WHO CAN SEE IT: lib/scope.js folds a user's
+   * manage_verticals into an explicit client allow-list and caches the
+   * client→vertical map for 60s. Re-pointing a client at another vertical is
+   * usually how somebody changes that visibility, so letting the cache expire on
+   * its own would leave operators scoped to the OLD vertical seeing this
+   * client's jobs for up to a minute afterwards — a scope leak with a timer on
+   * it. Busted unconditionally rather than only when vertical_id appears in
+   * `sets`: that check is one more thing to keep in step with the column
+   * whitelist, and dropping a 398-row cache costs one query on the next request.
+   */
+  invalidateClientsByVertical();
   logger.info('Client updated · clientId=' + clientId + ' affected=' + r.affectedRows);
   return r.affectedRows;
 }
