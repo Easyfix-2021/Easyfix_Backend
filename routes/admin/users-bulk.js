@@ -20,13 +20,15 @@ const logger = require('../../logger');
  *     in the "Select Users & Apply" tab. Active-only filters.
  *
  *   GET  /api/admin/users/bulk-upload-template[?userIds=121,122]
- *     Returns an xlsx template with 8 columns matching the spec
- *     spreadsheet (User Details Bulk Upload format(UserDetails).csv).
+ *     Returns an xlsx template with 14 columns — the 9 from the spec
+ *     spreadsheet (User Details Bulk Upload format(UserDetails).csv)
+ *     plus the five HR master-data identifiers.
  *     Locked dropdowns sourced from hidden vocab sheets so operators
  *     can only enter active values; multi-value comma-separated entries
  *     are allowed (errorStyle='information') for the four manage_*
  *     columns. If userIds is supplied, pre-populates rows with each
- *     user's current name + manage_* CSV strings.
+ *     user's current name + manage_* CSV strings + the three CLEAR HR
+ *     identifiers (never pan / aadhaar — see the row writer).
  *
  *   POST /api/admin/users/bulk-upload
  *     multipart/form-data: file=<xlsx|csv>
@@ -147,10 +149,13 @@ router.get('/bulk-lookups', async (req, res, next) => {
 // GET /api/admin/users/bulk-upload-template?userIds=121,122
 // ──────────────────────────────────────────────────────────────────────
 /*
- * Columns (matches the legacy CSV format the user provided):
+ * Columns (A..I match the legacy CSV format the user provided; J..N are
+ * the HR master-data identifiers on tbl_user_personal_details):
  *   A user ID                B user name             C Role
  *   D Reporting Manager      E Manage Vertical(s)    F Manage Client(s)
  *   G Manage State(s)        H Manage Cities         I Home City
+ *   J Date Of Joining        K UAN                   L PAN
+ *   M Aadhaar                N Address
  *
  * Cell validations (rows 2..1000):
  *   - Multi-select columns (E/F/G/H): list source from a hidden sheet,
@@ -163,8 +168,15 @@ router.get('/bulk-lookups', async (req, res, next) => {
  *
  * `userIds` query param: when supplied, pre-fills rows with each
  * user's current scope CSVs so operators don't start from scratch.
+ *
+ * ADMIN-ONLY, matching the POST sibling. This was a scope-only sheet the whole
+ * admin group could read; it now pre-fills Date Of Joining, UAN and Address, and
+ * `userIds` is uncapped — so without the guard any of the ten admin-group roles
+ * could pull the HR identifiers of every internal user as one .xlsx. Same line
+ * routes/admin/users.js draws with `includeIdentifiers: isAdminRole(req)`, and
+ * nothing is lost: only Admin can POST the sheet back, so only Admin can use it.
  */
-router.get('/bulk-upload-template', async (req, res, next) => {
+router.get('/bulk-upload-template', roleByName(['Admin']), async (req, res, next) => {
   try {
     logger.info('Build bulk-upload template · userIds=' + (req.query.userIds || ''));
     const wb = new ExcelJS.Workbook();
@@ -176,6 +188,10 @@ router.get('/bulk-upload-template', async (req, res, next) => {
       'user ID', 'user name', 'Role', 'Reporting Manager',
       'Manage Vertical(s)', 'Manage Client(s)', 'Manage State(s)',
       'Manage Cities', 'Home City',
+      // HR master-data identifiers. APPENDED, never inserted: the parser
+      // below reads cells positionally, so shifting an existing column would
+      // silently re-point every operator's saved copy of the old template.
+      'Date Of Joining', 'UAN', 'PAN', 'Aadhaar', 'Address',
     ];
     ws.addRow(headers);
     ws.getRow(1).font = { bold: true };
@@ -208,6 +224,35 @@ router.get('/bulk-upload-template', async (req, res, next) => {
       );
       logger.info('Found ' + rows.length + ' users to pre-populate template');
 
+      /*
+       * HR identifiers, read SEPARATELY rather than LEFT JOINed onto the query
+       * above so a host that has not yet applied
+       * 2026-09-02-add-hr-identifiers-user-personal-details.sql still hands the
+       * operator a usable template instead of a 500. Same fail-soft posture the
+       * Edit User form's identifier read takes, and for the same reason: a
+       * missing side table must cost five optional cells, never the download.
+       *
+       * pan / aadhaar are deliberately NOT in the projection — see the row
+       * writer below for why they must stay off this sheet entirely.
+       */
+      let hrById = new Map();
+      try {
+        const [hrRows] = await pool.query(
+          `SELECT user_id, date_of_joining, uan, address
+             FROM tbl_user_personal_details
+            WHERE user_id IN (${placeholders})`,
+          userIds,
+        );
+        hrById = new Map(hrRows.map((h) => [Number(h.user_id), h]));
+      } catch (e) {
+        // No directory in the hint on purpose: a migration moves from
+        // migrations/ to migrations/executed/ the moment it is applied
+        // somewhere, and it already has — an operator told to look in
+        // migrations/ finds nothing and reads the hint as stale.
+        logger.warn('Template HR identifier pre-fill skipped · ' + (e.code || e.message)
+          + ' — apply the 2026-09-02-add-hr-identifiers-user-personal-details.sql migration');
+      }
+
       // Decode scope CSVs from id-CSV → name-CSV for display. Loads
       // master maps once; "0" stays as the "All" sentinel.
       const [
@@ -229,6 +274,7 @@ router.get('/bulk-upload-template', async (req, res, next) => {
         return s.split(',').map((id) => map.get(id.trim()) || '').filter(Boolean).join(', ');
       };
       for (const r of rows) {
+        const hr = hrById.get(Number(r.user_id)) || {};
         ws.addRow([
           r.user_id, r.user_name, r.role_name || '',
           r.reporting_manager_name || '',
@@ -237,6 +283,34 @@ router.get('/bulk-upload-template', async (req, res, next) => {
           decode(r.manage_states,    sMap),
           decode(r.manage_cities,    ctMap),
           r.home_city_name || '',
+          // dateStrings:true on the pool already hands DATE back as
+          // 'YYYY-MM-DD'; the slice only guards a host configured otherwise,
+          // where a DATETIME-ish string would carry a time part the
+          // YYYY-MM-DD validator rejects on re-upload.
+          String(hr.date_of_joining || '').slice(0, 10),
+          hr.uan || '',
+          /*
+           * PAN and Aadhaar ship BLANK on a pre-populated template. That is the
+           * deliberate answer to "carry the current values", not an oversight:
+           *
+           *  1. PLAINTEXT IS OUT. This workbook is a file that leaves the
+           *     server and lands in Downloads, in email, in shared drives.
+           *     Decrypting government IDs into it would strip the AES-256-GCM
+           *     envelope off every selected employee in a single click — the
+           *     exact exposure the at-rest encryption exists to prevent.
+           *  2. A MASK ("XXXXXX1234") IS WORSE THAN BLANK, NOT SAFER. Blank is
+           *     this sheet's "leave unchanged" signal; a mask is a NON-EMPTY
+           *     cell the parser hands to normalisePan/normaliseAadhaar. So an
+           *     operator who edits one unrelated column and re-uploads either
+           *     FAILS the row on a bogus PAN, or — for any mask that happened
+           *     to satisfy the regex — OVERWRITES a real ID with asterisks.
+           *     A pre-populated template has to round-trip losslessly.
+           *  3. THE COST IS VISIBILITY ONLY. The Edit User form already shows
+           *     these masked from their clear last4 columns; this sheet exists
+           *     to SET them in bulk, and blank still means "leave as-is".
+           */
+          '', '',
+          hr.address || '',
         ]);
       }
     }
@@ -334,6 +408,15 @@ router.get('/bulk-upload-template', async (req, res, next) => {
       ['  · Single-pick columns (Reporting Manager, Home City) are unaffected — they use Excel\'s strict list validator.'],
       ['  · "All" can be typed at any time and overrides any existing CSV.'],
       ['  · Removing a value: pick it again from the dropdown — the macro detects the duplicate and removes it.'],
+      // Appended at the END on purpose: the bold/italic styling below addresses
+      // rows by NUMBER, so inserting these anywhere above would silently move
+      // the emphasis onto the wrong lines.
+      [''],
+      ['HR Details (Date Of Joining, UAN, PAN, Aadhaar, Address):'],
+      ['  · Free text — no dropdown. Date Of Joining must be YYYY-MM-DD (or a real Excel date cell).'],
+      ['  · UAN is 12 digits. PAN is ABCDE1234F. Aadhaar is 12 digits not starting with 0 or 1 (spaces and hyphens are fine).'],
+      ['  · PAN and Aadhaar are stored encrypted, so a pre-filled template leaves those two cells BLANK even when a value exists.'],
+      ['  · A blank cell NEVER clears a value — it means "leave unchanged". Use Edit User to remove one.'],
     ];
     lines.forEach((row) => instr.addRow(row));
     instr.getRow(1).font = { bold: true, size: 14 };
@@ -612,6 +695,39 @@ router.get('/bulk-upload-template', async (req, res, next) => {
 const bulkUploadBodyMeta = Joi.object({
   dryRun: Joi.boolean().default(false),
 });
+
+/*
+ * Date Of Joining (col J) → 'YYYY-MM-DD', the ONLY shape
+ * normaliseDateOfJoining accepts.
+ *
+ * Excel hands a date-formatted cell back as a JS Date, never a string, so the
+ * raw cell would reach the validator as "Mon May 04 1990 00:00:00 GMT+0000"
+ * and be rejected — the operator would see "must be a date in YYYY-MM-DD
+ * format" against a cell holding a perfectly good date. Text-typed cells and
+ * CSV uploads still arrive as strings, so BOTH shapes have to work.
+ *
+ * Which half of the Date to read is the real trap. exceljs builds an xlsx date
+ * serial at UTC midnight, but a Date parsed from a local-time string sits at
+ * LOCAL midnight — and on an IST host (+05:30) reading the UTC parts off that
+ * one yields the PREVIOUS DAY. Midnight-in-UTC is the discriminator: only the
+ * exceljs shape has it, so everything else is read in local time. Neither
+ * branch ever converts between zones, which is what would introduce the shift.
+ */
+function toYmd(v) {
+  if (v instanceof Date) {
+    if (Number.isNaN(v.getTime())) return '';
+    const utcMidnight = v.getUTCHours() === 0 && v.getUTCMinutes() === 0
+      && v.getUTCSeconds() === 0 && v.getUTCMilliseconds() === 0;
+    const y = utcMidnight ? v.getUTCFullYear()  : v.getFullYear();
+    const m = utcMidnight ? v.getUTCMonth() + 1 : v.getMonth() + 1;
+    const d = utcMidnight ? v.getUTCDate()      : v.getDate();
+    return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+  }
+  // Strings: a CSV export can carry a full ISO timestamp. Keep the date half
+  // and let normaliseDateOfJoining reject anything that is not a real date —
+  // guessing at other formats here would silently read 03-04-2026 as March.
+  return String(v ?? '').trim().split('T')[0].trim();
+}
 router.post('/bulk-upload',
   roleByName(['Admin']),
   upload.single('file'),
@@ -753,6 +869,33 @@ router.post('/bulk-upload',
         if (!cty.empty)  fields.manage_cities     = cty.value;
         if (!rm.empty)   fields.reporting_manager = rm.value;
         if (!home.empty) fields.city_id           = home.value;
+
+        /*
+         * HR master-data identifiers (cols J..N). No name→id resolution and no
+         * validation here on purpose: these are literal values, and
+         * services/user.service.js validates them via collectHrIdentifiers() —
+         * the SAME call the Add/Edit User form goes through, so the sheet and
+         * the form cannot drift into two different definitions of a valid PAN.
+         * A rejection surfaces as a thrown 400 caught per row below, which
+         * fails that ROW and leaves the rest of the upload running.
+         *
+         * Empty cell = leave unchanged, exactly like every column above. Note
+         * the deliberate gap: the service CAN clear an identifier (an explicit
+         * null), but this sheet has no way to express one, because a blank cell
+         * in a 500-row spreadsheet is overwhelmingly an operator with nothing
+         * to fill in rather than one asking to wipe somebody's PAN. Clearing
+         * stays on the Edit User form, where it takes an intentional click.
+         */
+        const doj     = toYmd(cells(10));
+        const uan     = String(cells(11) ?? '').trim();
+        const pan     = String(cells(12) ?? '').trim();
+        const aadhaar = String(cells(13) ?? '').trim();
+        const address = String(cells(14) ?? '').trim();
+        if (doj)     fields.date_of_joining = doj;
+        if (uan)     fields.uan             = uan;
+        if (pan)     fields.pan             = pan;
+        if (aadhaar) fields.aadhaar         = aadhaar;
+        if (address) fields.address         = address;
 
         // Vertical-without-client guard (same as bulk-update body).
         if (fields.manage_verticals !== undefined && fields.manage_clients === undefined) {

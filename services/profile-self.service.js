@@ -231,8 +231,11 @@ async function readPersonalRow(userId, runner) {
     return row;
   } catch (e) {
     if (!isMissingIdentifierColumn(e)) throw e;
+    // Bare filename, no directory: the migration has already moved from
+    // migrations/ into migrations/executed/, so a path here would send the
+    // operator to an empty directory and read as a stale hint.
     logger.warn('Profile identifier columns are missing on this host · userId=' + userId
-      + ' — apply migrations/2026-09-02-add-hr-identifiers-user-personal-details.sql');
+      + ' — apply the 2026-09-02-add-hr-identifiers-user-personal-details.sql migration');
     const [[row]] = await runner.query(
       `SELECT ${PERSONAL_COLUMNS_PRE_IDENTIFIERS} FROM tbl_user_personal_details WHERE user_id = ? LIMIT 1`,
       [Number(userId)],

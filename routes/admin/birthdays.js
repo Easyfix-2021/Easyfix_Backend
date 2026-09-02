@@ -147,8 +147,11 @@ router.get('/upcoming', validate(upcomingQuery, 'query'), async (req, res, next)
       );
     } catch (e) {
       if (e && (e.code === 'ER_BAD_FIELD_ERROR' || e.errno === 1054)) {
+        // Bare filename, no directory: the migration has already moved from
+        // migrations/ into migrations/executed/, so a path here would send the
+        // operator to an empty directory and read as a stale hint.
         logger.warn('Work anniversaries skipped — date_of_joining is missing on this host. '
-          + 'Apply migrations/2026-09-02-add-hr-identifiers-user-personal-details.sql');
+          + 'Apply the 2026-09-02-add-hr-identifiers-user-personal-details.sql migration');
       } else {
         throw e;
       }

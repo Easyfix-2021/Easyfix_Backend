@@ -627,8 +627,10 @@ async function upsertPersonalIdentifiers(userId, fields, runner = pool) {
   } catch (e) {
     if (!isMissingContactTable(e) && !isMissingIdentifierColumn(e)) throw e;
     logger.warn('Personal identifier write failed · userId=' + userId + ' · ' + e.code + ' — ' + IDENTIFIER_MIGRATION_HINT);
-    throw mkErr(503, 'HR identifier storage is unavailable on this host — apply '
-      + 'migrations/2026-09-02-add-hr-identifiers-user-personal-details.sql, then retry');
+    // Through the constant, not a second copy of the path — the log line right
+    // above already proved how easily the two drift.
+    throw mkErr(503, 'HR identifier storage is unavailable on this host — '
+      + IDENTIFIER_MIGRATION_HINT + ', then retry');
   }
 }
 
@@ -642,8 +644,11 @@ function isMissingIdentifierColumn(err) {
   return Boolean(err) && (err.code === 'ER_BAD_FIELD_ERROR' || err.errno === 1054);
 }
 
+/* No directory in the hint on purpose: an applied migration moves from
+   migrations/ to migrations/executed/, and this one already has — an operator
+   told to look in migrations/ finds nothing and reads the hint as stale. */
 const IDENTIFIER_MIGRATION_HINT =
-  'apply migrations/2026-09-02-add-hr-identifiers-user-personal-details.sql';
+  'apply the 2026-09-02-add-hr-identifiers-user-personal-details.sql migration';
 
 /*
  * READ side — FAIL-SOFT, matching loadPersonalEmail() rather than the write
