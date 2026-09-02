@@ -154,6 +154,22 @@ const createBody = Joi.object({
   reporting_manager: Joi.number().integer().positive().allow(null).optional(),
   allowed_stages:    allowedStagesField,
   personal_email:    personalEmailCreateField,
+  /*
+   * ── HR MASTER-DATA IDENTIFIERS ────────────────────────────────────
+   * Shape only. The REAL validation (12-digit UAN, PAN format, Aadhaar
+   * allocation rule, calendar-date check) lives in user.service.js and runs on
+   * both the create and the update path — per the mobile_no lesson, whichever
+   * layer is stricter is the one that decides, and duplicating the patterns
+   * here would create a second definition free to drift from it.
+   *
+   * `.allow('')` on every one is load-bearing: an empty string is how the form
+   * CLEARS a value. Rejecting it here would make a mistyped PAN permanent.
+   */
+  date_of_joining:   Joi.string().trim().allow('', null).optional(),
+  uan:               Joi.string().trim().allow('', null).optional(),
+  pan:               Joi.string().trim().allow('', null).optional(),
+  aadhaar:           Joi.string().trim().allow('', null).optional(),
+  address:           Joi.string().trim().max(512).allow('', null).optional(),
 });
 
 const updateBody = Joi.object({
@@ -170,6 +186,22 @@ const updateBody = Joi.object({
   is_active:         Joi.boolean().optional(),
   allowed_stages:    allowedStagesField,
   personal_email:    personalEmailUpdateField,
+  /*
+   * ── HR MASTER-DATA IDENTIFIERS ────────────────────────────────────
+   * Shape only. The REAL validation (12-digit UAN, PAN format, Aadhaar
+   * allocation rule, calendar-date check) lives in user.service.js and runs on
+   * both the create and the update path — per the mobile_no lesson, whichever
+   * layer is stricter is the one that decides, and duplicating the patterns
+   * here would create a second definition free to drift from it.
+   *
+   * `.allow('')` on every one is load-bearing: an empty string is how the form
+   * CLEARS a value. Rejecting it here would make a mistyped PAN permanent.
+   */
+  date_of_joining:   Joi.string().trim().allow('', null).optional(),
+  uan:               Joi.string().trim().allow('', null).optional(),
+  pan:               Joi.string().trim().allow('', null).optional(),
+  aadhaar:           Joi.string().trim().allow('', null).optional(),
+  address:           Joi.string().trim().max(512).allow('', null).optional(),
 }).min(1);
 
 // ─── Bulk-update sub-router ──────────────────────────────────────────
@@ -350,7 +382,8 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
 router.get('/:userId', validate(idParam, 'params'), async (req, res, next) => {
   logger.info('Get user · userId=' + req.params.userId);
   try {
-    const row = await userService.getUserById(Number(req.params.userId));
+    const row = await userService.getUserById(Number(req.params.userId),
+      { includeIdentifiers: isAdminRole(req) });
     if (!row) return modernError(res, 404, 'User not found');
     modernOk(res, row);
   } catch (e) { next(e); }

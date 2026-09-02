@@ -193,7 +193,62 @@ function istTimestamp(value) {
 // HRMS migration alongside the pre-existing personal_email.
 const PERSONAL_COLUMNS = `personal_email, date_of_birth,
          bank_account_number, bank_ifsc, bank_account_name, bank_name,
+         bank_account_last4,
+         date_of_joining, uan, address, pan_last4, aadhaar_last4`;
+
+/*
+ * The column list as it stood BEFORE the 2026-09-02 identifier migration, and
+ * the reason it still exists: this service deploys through GitHub Actions and
+ * the migration is applied by hand, so there is a real window — minutes on a
+ * good day — in which this code is live and the five columns are not. A plain
+ * SELECT of them in that window is ER_BAD_FIELD_ERROR, and it would take out
+ * the ENTIRE profile page (name, bank, everything) over five optional fields
+ * that are blank on every row anyway.
+ *
+ * readPersonalRow() below tries the full list once, falls back to this one on
+ * 1054, and logs. Delete both this constant and the fallback once the
+ * migration is applied everywhere — it is scaffolding with an expiry date, not
+ * a permanent compatibility layer.
+ */
+const PERSONAL_COLUMNS_PRE_IDENTIFIERS = `personal_email, date_of_birth,
+         bank_account_number, bank_ifsc, bank_account_name, bank_name,
          bank_account_last4`;
+
+/*
+ * MySQL "unknown column" — 1054. Narrower than catching everything: a genuine
+ * connection failure or a syntax error must still surface.
+ */
+function isMissingIdentifierColumn(err) {
+  return Boolean(err) && (err.code === 'ER_BAD_FIELD_ERROR' || err.errno === 1054);
+}
+
+async function readPersonalRow(userId, runner) {
+  try {
+    const [[row]] = await runner.query(
+      `SELECT ${PERSONAL_COLUMNS} FROM tbl_user_personal_details WHERE user_id = ? LIMIT 1`,
+      [Number(userId)],
+    );
+    return row;
+  } catch (e) {
+    if (!isMissingIdentifierColumn(e)) throw e;
+    logger.warn('Profile identifier columns are missing on this host · userId=' + userId
+      + ' — apply migrations/2026-09-02-add-hr-identifiers-user-personal-details.sql');
+    const [[row]] = await runner.query(
+      `SELECT ${PERSONAL_COLUMNS_PRE_IDENTIFIERS} FROM tbl_user_personal_details WHERE user_id = ? LIMIT 1`,
+      [Number(userId)],
+    );
+    return row;
+  }
+}
+
+/*
+ * NOTE WHAT IS ABSENT: `pan` and `aadhaar` themselves. Only their clear
+ * last4 columns are selected, because this projection feeds the profile page
+ * and there is no path on it that may return either plaintext. Selecting the
+ * ciphertext "just in case" would put it one careless spread away from the
+ * response body — the same reasoning that keeps bank_account_number out of
+ * every payload except the audited reveal.
+ */
 
 /*
  * ═══════════════════════════════════════════════════════════════════════
@@ -375,10 +430,7 @@ async function getMyProfile(userId, runner = pool) {
   );
   if (!user) throw mkErr(404, 'USER_NOT_FOUND', 'User not found');
 
-  const [[personal]] = await runner.query(
-    `SELECT ${PERSONAL_COLUMNS} FROM tbl_user_personal_details WHERE user_id = ? LIMIT 1`,
-    [userId],
-  );
+  const personal = await readPersonalRow(userId, runner);
   const [[pending]] = await runner.query(
     `SELECT request_id, changes, old_values, requested_on, updated_on
        FROM tbl_user_profile_update_request
@@ -430,6 +482,32 @@ async function getMyProfile(userId, runner = pool) {
     alternate_no:   user.alternate_no || null,
     personal_email: (personal && personal.personal_email) || null,
     date_of_birth:  dob,
+    /*
+     * ── HR MASTER DATA — READ-ONLY ON THIS PAGE ──────────────────────
+     * These five come off the HR master sheet and are maintained by HR in
+     * Manage Users, not by the employee. They are returned so the profile
+     * page can SHOW them (an employee needs to check their own UAN before a
+     * PF claim, and to spot a wrong PAN before payroll does), with no
+     * corresponding write path here — a correction goes to HR.
+     *
+     * That is why there is no `*_locked` flag beside them, unlike
+     * date_of_birth: locked/unlocked is a distinction that only means
+     * something for a field the employee can set at all.
+     */
+    date_of_joining: (personal && personal.date_of_joining)
+      ? String(personal.date_of_joining).slice(0, 10) : null,
+    uan:     (personal && personal.uan) || null,
+    address: (personal && personal.address) || null,
+    /*
+     * MASKED, always, and derived from the CLEAR last4 column — this code
+     * never touches the ciphertext, so there is no decrypt to get wrong. A
+     * PAN or an Aadhaar shipping in full on every profile load is one sitting
+     * in the browser cache and the devtools network tab, and neither has a
+     * reveal flow: the employee already knows their own number, and the only
+     * job this display does is let them confirm HR holds the right one.
+     */
+    pan_masked:     (personal && personal.pan_last4) ? `XXXXXX${personal.pan_last4}` : null,
+    aadhaar_masked: (personal && personal.aadhaar_last4) ? `XXXX XXXX ${personal.aadhaar_last4}` : null,
     /*
      * EXACTLY "a date_of_birth is currently stored" — nothing else. The free
      * set is spent the moment a value exists, and the FE treats this as
@@ -543,10 +621,7 @@ async function revealOwnBank(userId, poolRef = pool, ipAddress = null) {
   const conn = await poolRef.getConnection();
   try {
     await conn.beginTransaction();
-    const [[personal]] = await conn.query(
-      `SELECT ${PERSONAL_COLUMNS} FROM tbl_user_personal_details WHERE user_id = ? LIMIT 1`,
-      [Number(userId)],
-    );
+    const personal = await readPersonalRow(userId, conn);
     const stored = bankFromRow(personal);
     if (!stored.account_number) {
       throw mkErr(404, 'NO_BANK_DETAILS', 'You have no bank details on file');

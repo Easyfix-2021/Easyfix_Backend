@@ -140,6 +140,52 @@ const FIELD_GROUPS = {
       },
     ],
   },
+  /*
+   * PAN — the taxpayer identifier, added 2026-09-02 alongside the clear `uan`
+   * and `pan_last4` columns (migrations/2026-09-02-add-uan-pan-user-personal-details.sql).
+   *
+   * ONE table, unlike `bank`, and the asymmetry is the point: there is no PAN
+   * approval flow. HR sets it directly from Manage Users, so no copy of the
+   * ciphertext is ever parked in tbl_user_profile_update_request.changes. If a
+   * PAN ever becomes an employee-editable field that routes through the request
+   * queue, that table must be added HERE in the same commit — the bank entry
+   * above documents exactly what the half-re-keyed state looks like.
+   *
+   * pan_last4 is NOT listed: it holds four clear characters, not an envelope,
+   * and a re-key walk that tried to decrypt it would fail on every row.
+   */
+  pan: {
+    label: 'PAN',
+    tables: [
+      {
+        table: 'tbl_user_personal_details',
+        idColumn: 'user_id',
+        columns: ['pan'],
+      },
+    ],
+  },
+  /*
+   * AADHAAR — same table, same shape, deliberately a SEPARATE group rather
+   * than another column on `pan`. A group is the unit an operator re-keys and
+   * the unit the CRM dropdown offers, so folding two unrelated identifiers
+   * into one entry would mean "re-key the PAN" silently rewriting every
+   * Aadhaar too. Grouping is by what the operator means, not by what table
+   * the bytes happen to share.
+   *
+   * NOT the same as tbl_easyfixer.adhaar_card_number, which is a legacy CLEAR
+   * column holding technician Aadhaars. It carries no envelope, so it must
+   * never be listed here — a re-key walk would fail to decrypt every row.
+   */
+  aadhaar: {
+    label: 'Aadhaar',
+    tables: [
+      {
+        table: 'tbl_user_personal_details',
+        idColumn: 'user_id',
+        columns: ['aadhaar'],
+      },
+    ],
+  },
 };
 
 const GROUP_KEYS = Object.keys(FIELD_GROUPS);

@@ -12,12 +12,25 @@ const { parseAllowedRows, parseAllowedInput, NO_ACCESS_KEY } = require('../lib/j
  * tests/emp-code.test.js fails the build if either signature reappears.
  */
 const { EMP_CODE_RE, EMP_CODE_LOCK, EMP_CODE_FORMAT_HINT, parseEmpCode, nextEmpCode } = require('../lib/emp-code');
+/* PAN is stored as an AES-256-GCM envelope, same as the two bank columns —
+   see migrations/2026-09-02-add-uan-pan-user-personal-details.sql. */
+const fieldCrypto = require('../lib/field-crypto');
 // Microsoft 365 mailbox provisioning. Fail-soft + fail-closed by design — see
 // the call site in createUser() for the rules it must obey.
 const entraProvisioning = require('./entra-provisioning.service');
 // "Your EasyFix account is ready" credential mail. Only ever called from the
 // create path, and only when the provisioning outcome says the mailbox is real.
 const welcomeMail = require('./user-welcome-mail.service');
+const s3 = require('../utils/s3-storage');
+
+/*
+ * Avatar presign lifetime for the Manage Users LIST. Lives here rather than in
+ * utils/s3-storage.js because getPresignedUrl already takes `expiresIn` for
+ * exactly this — a caller with a documented reason opts out of the shared
+ * 5-minute default without the other 23 call sites having to care. The reason
+ * is written out at the call site in listUsers().
+ */
+const USER_PHOTO_PRESIGN_TTL_SEC = Number(process.env.S3_USER_PHOTO_PRESIGN_TTL_SEC) || 3600; // 1 hour
 
 /*
  * Manage Users — internal-staff CRUD on tbl_user.
@@ -139,6 +152,22 @@ function mkErr(status, message) { const e = new Error(message); e.status = statu
 const PERSONAL_EMAIL_RE = /^\S+@\S+\.\S+$/;
 
 /*
+ * The personal_email COLUMN WIDTH (VARCHAR(255) — see
+ * migrations/2026-08-03-create-tbl-user-personal-details.sql), named rather
+ * than written twice.
+ *
+ * It was a bare 255 in both the check and its message until the message-literals
+ * audit flagged the message: the number is also the RETIRED value of
+ * MAX_CIPHERTEXT_CHARS in lib/field-crypto.js (255 -> 2048), and this file
+ * started importing that module in 2026-09-02. The two 255s are unrelated —
+ * one is an email column, the other was a ciphertext ceiling — but "unrelated"
+ * is not something a text scan can see, and a bare literal that collides with a
+ * retired constant will keep costing someone the same investigation. Naming it
+ * ends that, and means the check and the sentence can never disagree.
+ */
+const PERSONAL_EMAIL_MAX_CHARS = 255;
+
+/*
  * THE single definition of the update-side rule, exported so the route layer
  * enforces exactly the same thing rather than a lookalike. Joi alone cannot
  * express it: whether the field is mandatory depends on the TARGET ROW's
@@ -166,7 +195,9 @@ function normalisePersonalEmail(raw, { required }) {
     if (required) return { ok: false, message: 'personal_email is required' };
     return { ok: true, value: null };
   }
-  if (value.length > 255) return { ok: false, message: 'personal_email must be 255 characters or fewer' };
+  if (value.length > PERSONAL_EMAIL_MAX_CHARS) {
+    return { ok: false, message: `personal_email must be ${PERSONAL_EMAIL_MAX_CHARS} characters or fewer` };
+  }
   if (!PERSONAL_EMAIL_RE.test(value)) return { ok: false, message: `personal_email "${raw}" is not a valid email address` };
   /*
    * ── It must NOT be one of OUR OWN Microsoft 365 domains. ──────────────
@@ -196,6 +227,149 @@ function normalisePersonalEmail(raw, { required }) {
 }
 
 /*
+ * ── THE HR MASTER-DATA IDENTIFIERS ──────────────────────────────────
+ * date_of_joining, uan, pan, aadhaar and address all live on
+ * tbl_user_personal_details (2026-09-02 migration) and all five are OPTIONAL
+ * everywhere, unlike personal_email: HR fills them in from the master
+ * spreadsheet as it is reconciled, so a user row must be creatable and
+ * editable without them.
+ *
+ * BLANK MEANS CLEAR, NOT REJECT. Every normaliser below returns
+ * { ok: true, value: null } for an empty input, because the form has to be
+ * able to remove a value that was entered by mistake. It is
+ * upsertPersonalIdentifiers() that distinguishes "cleared" (null) from
+ * "untouched" (key absent) — this layer never sees that difference.
+ *
+ * pan and aadhaar are ENCRYPTED at rest and the other three are not, for the
+ * reasons in the migration header. Nothing here depends on that; the envelope
+ * is applied in one place, at the write.
+ */
+
+/* A UAN is exactly 12 digits — an EPFO account number, never a range. */
+const UAN_RE = /^[0-9]{12}$/;
+
+/*
+ * PAN: five letters, four digits, one letter. The regex is the WHOLE
+ * validation deliberately — the fourth character encodes the holder type and
+ * the last is a checksum letter, but rejecting on those would fail real cards
+ * (the checksum algorithm is not published) and teach HR to work around the
+ * form.
+ */
+const PAN_RE = /^[A-Z]{5}[0-9]{4}[A-Z]$/;
+
+/* Aadhaar: 12 digits that never start with 0 or 1 — a UIDAI allocation rule,
+ * and the one cheap check that catches a mistyped or truncated number. */
+const AADHAAR_RE = /^[2-9][0-9]{11}$/;
+
+function normaliseUan(raw) {
+  const value = String(raw ?? '').trim();
+  if (!value) return { ok: true, value: null };
+  if (!UAN_RE.test(value)) {
+    return { ok: false, message: `uan "${raw}" must be exactly 12 digits` };
+  }
+  return { ok: true, value };
+}
+
+/*
+ * Uppercased before validating, not after: a PAN is case-insensitive on every
+ * document it appears on, and storing two casings of one number would read as
+ * two different people to any future lookup.
+ */
+function normalisePan(raw) {
+  const value = String(raw ?? '').trim().toUpperCase();
+  if (!value) return { ok: true, value: null };
+  if (!PAN_RE.test(value)) {
+    return { ok: false, message: `pan "${raw}" must be 10 characters — five letters, four digits, then a letter (e.g. ABCDE1234F)` };
+  }
+  return { ok: true, value };
+}
+
+/*
+ * Separators are STRIPPED, not rejected. Aadhaar is printed in 4-4-4 groups
+ * and the HR sheet holds it that way ("7307-8151-9521"), so a form that
+ * refused a hyphen would be refusing the exact string the operator is copying
+ * from. Twelve digits is the stored form.
+ */
+function normaliseAadhaar(raw) {
+  const value = String(raw ?? '').replace(/[\s-]/g, '').trim();
+  if (!value) return { ok: true, value: null };
+  if (!AADHAAR_RE.test(value)) {
+    return { ok: false, message: `aadhaar "${raw}" must be 12 digits and cannot start with 0 or 1` };
+  }
+  return { ok: true, value };
+}
+
+/*
+ * A joining date may legitimately be in the FUTURE — an offer accepted with a
+ * start date next month is exactly when HR creates the login — so unlike
+ * date_of_birth there is no upper bound beyond a typo guard. The lower bound
+ * catches the other common typo, a year typed as 0202 or 1900.
+ */
+function normaliseDateOfJoining(raw) {
+  const value = String(raw ?? '').trim();
+  if (!value) return { ok: true, value: null };
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return { ok: false, message: 'date_of_joining must be a date in YYYY-MM-DD format' };
+  }
+  /* Round-trip through Date to reject 2026-02-31, which the regex accepts. */
+  const d = new Date(`${value}T00:00:00Z`);
+  if (Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== value) {
+    return { ok: false, message: `date_of_joining "${raw}" is not a real calendar date` };
+  }
+  const year = Number(value.slice(0, 4));
+  if (year < 1950) {
+    return { ok: false, message: 'date_of_joining cannot be before 1950' };
+  }
+  return { ok: true, value };
+}
+
+/*
+ * The employee's PERSONAL address — deliberately free text, and deliberately
+ * NOT tbl_user's pin_code/city/state/district, which describe where they are
+ * POSTED and drive scoping. Newlines are collapsed so a pasted three-line
+ * address stores as one value the CRM can render in a table cell.
+ */
+function normaliseAddress(raw) {
+  const value = String(raw ?? '').replace(/\s+/g, ' ').trim();
+  if (!value) return { ok: true, value: null };
+  if (value.length > 512) {
+    return { ok: false, message: 'address must be 512 characters or fewer' };
+  }
+  return { ok: true, value };
+}
+
+/*
+ * The ONE place the five normalisers are applied, shared by createUser and
+ * updateUser so the two paths cannot drift into different validation.
+ *
+ * `undefined` means UNTOUCHED and is skipped entirely — that is what makes the
+ * omit/clear distinction reach upsertPersonalIdentifiers intact. An empty
+ * string is NOT undefined: it normalises to null and clears the column, which
+ * is how the form removes a value entered by mistake.
+ *
+ *   → { ok: true,  values: { …only the supplied keys… } }
+ *   → { ok: false, message }
+ */
+const HR_IDENTIFIER_NORMALISERS = Object.freeze({
+  date_of_joining: normaliseDateOfJoining,
+  uan:             normaliseUan,
+  pan:             normalisePan,
+  aadhaar:         normaliseAadhaar,
+  address:         normaliseAddress,
+});
+
+function collectHrIdentifiers(payload) {
+  const values = {};
+  for (const [key, normalise] of Object.entries(HR_IDENTIFIER_NORMALISERS)) {
+    if (!payload || payload[key] === undefined) continue;
+    const parsed = normalise(payload[key]);
+    if (!parsed.ok) return { ok: false, message: parsed.message };
+    values[key] = parsed.value;
+  }
+  return { ok: true, values };
+}
+
+/*
  * MySQL "table does not exist" — tbl_user_personal_details ships as a PENDING
  * migration, so there is a real window in which this code is live and the table
  * is not. See loadPersonalEmail() / upsertPersonalEmail() for the two different
@@ -205,7 +379,16 @@ function isMissingContactTable(err) {
   return Boolean(err) && (err.code === 'ER_NO_SUCH_TABLE' || err.errno === 1146);
 }
 
-const MIGRATION_HINT = 'has migrations/2026-08-03-create-tbl-user-personal-details.sql been applied?';
+/*
+ * TWO migrations sit behind this table, and a blank column can mean either.
+ * 2026-08-03 creates it (absent table ⇒ ER_NO_SUCH_TABLE / 1146); 2026-09-01
+ * adds profile_image_key by a separate, deliberately NON-idempotent ALTER, so a
+ * host can have the table and not the column (ER_BAD_FIELD_ERROR / 1054). The
+ * catch below swallows both — this hint names both so the next person debugging
+ * an empty avatar column is not sent to the wrong file.
+ */
+const MIGRATION_HINT = 'have migrations/2026-08-03-create-tbl-user-personal-details.sql '
+  + 'and migrations/2026-09-01-hrms-05-profile-photo.sql been applied?';
 
 /*
  * READ side — FAIL-SOFT, exactly like entra-provisioning's getProvisioning().
@@ -218,6 +401,12 @@ const MIGRATION_HINT = 'has migrations/2026-08-03-create-tbl-user-personal-detai
  * Batched (one `IN (…)` for the page), not a per-row lookup — the reason the
  * original LEFT JOIN existed. It is a separate statement rather than a join so
  * the failure is containable: a join that throws takes the users query with it.
+ *
+ * Returns Map<user_id, { personal_email, profile_image_key }>. The avatar rides
+ * along on the SAME statement because it lives on the SAME row — adding it cost
+ * one column in the projection and zero extra queries. The name stays
+ * loadPersonalEmails because it is an exported symbol pinned by
+ * tests/user-personal-email.test.js; renaming it is churn, not clarity.
  */
 async function loadPersonalEmails(userIds) {
   const ids = [...new Set((userIds || []).map(Number).filter(Boolean))];
@@ -225,11 +414,17 @@ async function loadPersonalEmails(userIds) {
   if (!ids.length) return out;
   try {
     const [rows] = await pool.query(
-      `SELECT user_id, personal_email FROM tbl_user_personal_details
+      `SELECT user_id, personal_email, profile_image_key FROM tbl_user_personal_details
         WHERE user_id IN (${ids.map(() => '?').join(',')})`,
       ids
     );
-    for (const r of rows) out.set(Number(r.user_id), r.personal_email || null);
+    for (const r of rows) {
+      out.set(Number(r.user_id), {
+        personal_email:    r.personal_email || null,
+        // NULL is the ONLY spelling of "no photo" (see the 2026-09-01 migration).
+        profile_image_key: r.profile_image_key || null,
+      });
+    }
   } catch (e) {
     logger.warn('Could not read personal contacts · userIds=' + ids.length + ' · ' + (e.code || e.message)
       + (isMissingContactTable(e) ? ' — ' + MIGRATION_HINT : ''));
@@ -285,6 +480,127 @@ async function upsertPersonalEmail(userId, personalEmail, runner = pool) {
     logger.warn('Personal contact write failed · userId=' + userId + ' · ' + e.code + ' — ' + MIGRATION_HINT);
     throw mkErr(503, 'Personal email storage is unavailable on this host — apply '
       + 'migrations/2026-08-03-create-tbl-user-personal-details.sql, then retry');
+  }
+}
+
+/*
+ * WRITE side for the five HR identifiers — a SEPARATE upsert from
+ * upsertPersonalEmail, and the separation is deliberate twice over.
+ *
+ * 1. ONLY THE SUPPLIED KEYS ARE WRITTEN. personal_email is always present on
+ *    the paths that write it, so its upsert can name the column
+ *    unconditionally. These are not: an Edit User submit that never touched
+ *    the PAN field must leave the stored PAN alone, and a
+ *    `pan = VALUES(pan)` with an absent value would blank it. So the column
+ *    list is built from the keys actually present in `fields` — pass
+ *    { pan: null } to CLEAR it, omit `pan` to LEAVE it.
+ *
+ *    COALESCE(?, pan) would NOT do this job. It guards NULL only, so the
+ *    empty string an operator types to clear a field still overwrites — the
+ *    opposite of the intended protection on the one input that needs it.
+ *
+ * 2. pan and aadhaar are ENCRYPTED here and their last4 derived here, from
+ *    the plaintext, in one place. Deriving last4 later would mean decrypting
+ *    on every list render; deriving it at a second call site would mean two
+ *    definitions of what "last4" means.
+ *
+ * Returns without touching the database when `fields` names none of the
+ * columns — the common case on an Edit submit, and one round trip saved.
+ */
+const ENCRYPTED_IDENTIFIERS = Object.freeze({ pan: 'pan_last4', aadhaar: 'aadhaar_last4' });
+const CLEAR_IDENTIFIERS = Object.freeze(['date_of_joining', 'uan', 'address']);
+
+async function upsertPersonalIdentifiers(userId, fields, runner = pool) {
+  const cols = [];
+  const vals = [];
+
+  for (const key of CLEAR_IDENTIFIERS) {
+    if (key in fields) {
+      cols.push(key);
+      vals.push(fields[key] || null);
+    }
+  }
+  for (const [key, last4Col] of Object.entries(ENCRYPTED_IDENTIFIERS)) {
+    if (key in fields) {
+      const plain = fields[key] || null;
+      cols.push(key, last4Col);
+      vals.push(plain ? fieldCrypto.encryptField(plain) : null,
+                plain ? String(plain).slice(-4) : null);
+    }
+  }
+  if (!cols.length) return;
+
+  const now = new Date();
+  const assignments = cols.map((c) => `${c} = VALUES(${c})`).join(',\n         ');
+  try {
+    await runner.query(
+      `INSERT INTO tbl_user_personal_details (user_id, ${cols.join(', ')}, created_on, updated_on)
+       VALUES (?, ${cols.map(() => '?').join(', ')}, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         ${assignments},
+         updated_on = VALUES(updated_on)`,
+      [Number(userId), ...vals, now, now]
+    );
+  } catch (e) {
+    if (!isMissingContactTable(e) && !isMissingIdentifierColumn(e)) throw e;
+    logger.warn('Personal identifier write failed · userId=' + userId + ' · ' + e.code + ' — ' + IDENTIFIER_MIGRATION_HINT);
+    throw mkErr(503, 'HR identifier storage is unavailable on this host — apply '
+      + 'migrations/2026-09-02-add-hr-identifiers-user-personal-details.sql, then retry');
+  }
+}
+
+/*
+ * MySQL "unknown column". The identifier columns ship as a PENDING migration,
+ * exactly like the table itself did, so there is a real window in which this
+ * code is live and the columns are not — and on that host the error is 1054,
+ * not the 1146 isMissingContactTable() catches.
+ */
+function isMissingIdentifierColumn(err) {
+  return Boolean(err) && (err.code === 'ER_BAD_FIELD_ERROR' || err.errno === 1054);
+}
+
+const IDENTIFIER_MIGRATION_HINT =
+  'apply migrations/2026-09-02-add-hr-identifiers-user-personal-details.sql';
+
+/*
+ * READ side — FAIL-SOFT, matching loadPersonalEmail() rather than the write
+ * path above. A missing table, a missing column or an unreadable row must cost
+ * the Edit User form five optional fields, never the whole user record.
+ *
+ * Returns the two protected identifiers MASKED, from their clear last4
+ * columns — never the ciphertext and never the plaintext. This feeds an admin
+ * form, and a full PAN or Aadhaar that ships on every user load is one sitting
+ * in the browser cache, the devtools network tab and any error reporter that
+ * captures responses. HR types a replacement to change one; there is no read
+ * path back to the plaintext short of the audited break-glass tooling.
+ */
+async function loadPersonalIdentifiers(userId, runner = pool) {
+  const empty = {
+    date_of_joining: null, uan: null, address: null,
+    pan_last4: null, pan_masked: null, aadhaar_last4: null, aadhaar_masked: null,
+  };
+  try {
+    const [[row]] = await runner.query(
+      `SELECT date_of_joining, uan, address, pan_last4, aadhaar_last4
+         FROM tbl_user_personal_details WHERE user_id = ? LIMIT 1`,
+      [Number(userId)]
+    );
+    if (!row) return empty;
+    return {
+      /* DATE column → 'YYYY-MM-DD'. Sliced from the string rather than passed
+         through Date, which would shift the day across a timezone. */
+      date_of_joining: row.date_of_joining ? String(row.date_of_joining).slice(0, 10) : null,
+      uan:             row.uan || null,
+      address:         row.address || null,
+      pan_last4:       row.pan_last4 || null,
+      pan_masked:      row.pan_last4 ? `XXXXXX${row.pan_last4}` : null,
+      aadhaar_last4:   row.aadhaar_last4 || null,
+      aadhaar_masked:  row.aadhaar_last4 ? `XXXX XXXX ${row.aadhaar_last4}` : null,
+    };
+  } catch (e) {
+    if (!isMissingContactTable(e) && !isMissingIdentifierColumn(e)) throw e;
+    logger.warn('Personal identifier read skipped · userId=' + userId + ' · ' + e.code + ' — ' + IDENTIFIER_MIGRATION_HINT);
+    return empty;
   }
 }
 
@@ -521,18 +837,65 @@ async function listUsers({
     r.allowed_stages = (!p || p.mode === 'all') ? null : p.stages;
   }
 
-  // Same batched shape as the stage permissions above, and fail-soft on a
-  // pre-migration host: the column reads blank, the screen still loads.
-  if (includePersonalEmail) {
-    const contacts = await loadPersonalEmails(rows.map((r) => r.user_id));
-    for (const r of rows) r.personal_email = contacts.get(Number(r.user_id)) ?? null;
+  /*
+   * Personal-details side table — ONE batched read for the page, same shape as
+   * the stage permissions above, and fail-soft on a pre-migration host: the
+   * columns read blank, the screen still loads.
+   *
+   * It runs UNCONDITIONALLY now, not only for includePersonalEmail. The avatar
+   * is not PII the way a home email address is — it is the same face the ten
+   * admin-group roles already see on every job row — so it ships to all of
+   * them, and only the email field stays behind the flag. The price is one
+   * PK-batched statement per page for the nine non-Admin roles that previously
+   * skipped it.
+   *
+   * photo_url, not profile_image_key: nothing on the FE can do anything with a
+   * raw key, and the key is deliberately unguessable-per-upload. The field name
+   * matches /auth/me and the profile-details payload so the CRM has ONE avatar
+   * contract, in which null means "render the initials monogram" — never a
+   * placeholder image URL, so that a broken <img> and "no photo set" stay
+   * distinguishable.
+   *
+   * TTL — the URL is signed for USER_PHOTO_PRESIGN_TTL_SEC (1 hour by default),
+   * NOT the shared 5-minute S3_PRESIGN_TTL_SEC. Manage Users holds its rows in
+   * React state and only refetches on a filter/sort/page change or a mutation,
+   * so a URL minted at load is still on screen minutes later; at 5 minutes an
+   * operator reading the grid for six gets a wall of 403 "Request has expired"
+   * avatars. That exact failure was measured on notice images in production on
+   * 2026-08-14, which is why S3_NOTICE_PRESIGN_TTL_SEC exists — this is the
+   * same payload shape and gets the same treatment. The shared default is NOT
+   * raised: it is read by call sites carrying client documents and job
+   * supporting files, where the short window is a deliberate posture. A
+   * presigned URL is unauthenticated and shareable for its whole lifetime, so
+   * the longer window is only justified because an avatar is at the
+   * low-sensitivity end of that scale.
+   *
+   * RESIDUAL, accepted: a tab left open past the hour with no refetch still
+   * expires. Fixing it properly means re-minting at render time instead of
+   * embedding URLs in a list payload, and the degraded state here is a monogram
+   * rather than an error — not worth it for an avatar column.
+   */
+  const details = await loadPersonalEmails(rows.map((r) => r.user_id));
+  for (const r of rows) {
+    const d = details.get(Number(r.user_id));
+    if (includePersonalEmail) r.personal_email = (d && d.personal_email) || null;
+    /*
+     * Fail-soft twice over. isEnabled() first: getPresignedUrl THROWS on a host
+     * with no S3_BUCKET_NAME, which is a supported local-dev configuration, and
+     * an unthrown throw here would 500 an operator's core screen over a missing
+     * avatar. Then .catch(() => null) for a transient signer failure. Most rows
+     * have no key at all and cost nothing — no presign, no S3 call.
+     */
+    r.photo_url = (d && d.profile_image_key && s3.isEnabled())
+      ? await s3.getPresignedUrl(d.profile_image_key, USER_PHOTO_PRESIGN_TTL_SEC).catch(() => null)
+      : null;
   }
 
   logger.info('Found ' + rows.length + ' users (total=' + total + ')');
   return { items: rows, total };
 }
 
-async function getUserById(userId) {
+async function getUserById(userId, { includeIdentifiers = false } = {}) {
   logger.info('Get user by id · userId=' + userId);
   const [[row]] = await pool.query(
     `SELECT u.user_id, u.user_code, u.user_name, u.official_email, u.mobile_no,
@@ -557,6 +920,19 @@ async function getUserById(userId) {
    * table ⇒ null, and the edit form shows an empty field.
    */
   row.personal_email = await loadPersonalEmail(userId);
+  /*
+   * The five HR identifiers, same fail-soft contract, and OFF BY DEFAULT.
+   *
+   * This route is open to the whole `admin` GROUP, but only the Admin ROLE can
+   * edit a user (roleByName(['Admin']) on PATCH) — so only the Admin role has
+   * any use for them. The list endpoint already draws that exact line for
+   * personal_email via includePersonalEmail: isAdminRole(req); this follows it
+   * rather than inventing a second, looser rule for five fields that are
+   * strictly more sensitive than an email address.
+   *
+   * pan and aadhaar arrive MASKED (see loadPersonalIdentifiers) even here.
+   */
+  if (includeIdentifiers) Object.assign(row, await loadPersonalIdentifiers(userId));
   /*
    * Job Stage Access. NULL = unrestricted; [] = explicit NO ACCESS; a non-empty
    * array = restricted to those stage_keys. The null-vs-[] distinction is
@@ -617,6 +993,12 @@ async function createUser({
    * mailbox cannot be its own delivery address.
    */
   personal_email,
+  /*
+   * The HR master-data identifiers — ALL OPTIONAL on this path. Omitting one
+   * leaves the column unset; passing '' explicitly stores nothing. They are
+   * validated by collectHrIdentifiers below, the same call updateUser makes.
+   */
+  date_of_joining, uan, pan, aadhaar, address,
   createdBy,
   /*
    * Is the ACTING operator allowed to trigger a Microsoft 365 directory write?
@@ -666,6 +1048,10 @@ async function createUser({
    */
   const personalEmail = normalisePersonalEmail(personal_email, { required: true });
   if (!personalEmail.ok) throw mkErr(400, personalEmail.message);
+
+  const identifiers = collectHrIdentifiers({ date_of_joining, uan, pan, aadhaar, address });
+  if (!identifiers.ok) throw mkErr(400, identifiers.message);
+  const hrIdentifiers = identifiers.values;
 
   // Validate role exists + is admin-group (we don't manage technicians or
   // client-dashboard users here — those have their own lifecycles).
@@ -803,6 +1189,12 @@ async function createUser({
       ]
     );
     await upsertPersonalEmail(r.insertId, personalEmail.value, conn);
+    /*
+     * The HR identifiers, in the SAME transaction. Only the keys the operator
+     * actually supplied are passed on, so Add User with the optional section
+     * left untouched issues no second write at all.
+     */
+    await upsertPersonalIdentifiers(r.insertId, hrIdentifiers, conn);
     await conn.commit();
   } catch (e) {
     await conn.rollback();
@@ -1086,6 +1478,17 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
   const personalRequired = enforcePersonalEmail
     && isPersonalEmailRequiredOnUpdate(me.user_status, fields.is_active);
   const suppliedPersonalEmail = fields.personal_email !== undefined;
+  /*
+   * HR identifiers, validated BEFORE any column write so a bad PAN rejects the
+   * whole edit rather than half-applying it.
+   */
+  const identifiers = collectHrIdentifiers(fields);
+  if (!identifiers.ok) {
+    logger.warn('Update user rejected · ' + identifiers.message + ' · userId=' + userId);
+    throw mkErr(400, identifiers.message);
+  }
+  const hrIdentifiers = identifiers.values;
+
   let personalEmailValue = null;   // the value to write, when we write one
   let writePersonalEmail = false;  // true only when it actually changed
 
@@ -1275,6 +1678,20 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
   if (writePersonalEmail) {
     await upsertPersonalEmail(userId, personalEmailValue);
     logger.info('Personal email updated · userId=' + userId + ' · cleared=' + (personalEmailValue === null));
+  }
+
+  /*
+   * HR identifiers. Keyed off the PAYLOAD, not off a diff against the stored
+   * row: pan and aadhaar are encrypted with a fresh IV every time, so the
+   * ciphertext of an unchanged value differs from what is stored and a
+   * value-comparison would report a change on every save. Absent keys are
+   * already skipped inside the upsert, which is the only "did it change"
+   * test this needs.
+   */
+  if (Object.keys(hrIdentifiers).length) {
+    await upsertPersonalIdentifiers(userId, hrIdentifiers);
+    logger.info('HR identifiers updated · userId=' + userId
+      + ' · fields=' + Object.keys(hrIdentifiers).join(','));
   }
 
   // Job Stage Access reconcile — after the column write, atomically swaps the
@@ -1569,6 +1986,14 @@ module.exports = {
   isPersonalEmailRequiredOnUpdate,
   normalisePersonalEmail,
   upsertPersonalEmail,
+  // The HR master-data identifiers — all optional, all on the same side table.
+  normaliseUan,
+  normalisePan,
+  normaliseAadhaar,
+  normaliseDateOfJoining,
+  normaliseAddress,
+  upsertPersonalIdentifiers,
+  loadPersonalIdentifiers,
   loadPersonalEmail,
   loadPersonalEmails,
   // Hierarchy adjacency cache invalidation hook — call from any external
