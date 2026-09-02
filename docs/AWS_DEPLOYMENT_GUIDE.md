@@ -169,7 +169,7 @@ GMAIL_PASS=<app-password>
 FCM_API_KEY=...
 
 # ─── Webhooks ──────────────────────────────────────────────────
-WEBHOOKS_DISABLE=false
+WEBHOOK_OUTBOUND_ENABLED=true
 
 # ─── Auto-assign weights (optional — DB rows take precedence) ──
 WEIGHT_WORKLOAD=0.45
@@ -291,7 +291,7 @@ Phase 1 + 2 with these substitutions:
 | `.env` `NODE_ENV=production`, `LOG_LEVEL=info` | same |
 | `.env` `TEST_EMAILS` / `TEST_MOBILE` | **REMOVE** these — real customers WILL get notifications |
 | `.env` `NOTIFICATIONS_DISABLE` | `false` |
-| `.env` `WEBHOOKS_DISABLE` | `false` |
+| `.env` `WEBHOOK_OUTBOUND_ENABLED` | `true` |
 | `.env` `JWT_SECRET` | DIFFERENT from QA — never share secrets across environments |
 | `.env` `CORS_ALLOWED_ORIGINS` | `https://crm.easyfix.in,https://client.easyfix.in,https://core.easyfix.in` |
 
@@ -428,7 +428,7 @@ If you want offsite log shipping: install the **CloudWatch Agent** (one-click fr
 - ☑ EC2 SG port 22 source restricted to admin IPs (no `0.0.0.0/0`)
 - ☑ HTTPS forced (Certbot redirect rule applied)
 - ☑ `CORS_ALLOWED_ORIGINS` is an explicit allowlist — never `*`
-- ☑ `WEBHOOKS_DISABLE=true` on initial deploy → flip to `false` only after smoke-testing endpoints
+- ☑ `WEBHOOK_OUTBOUND_ENABLED=false` on initial deploy → flip to `true` only after smoke-testing endpoints
 - ☑ Production has NO `TEST_EMAILS` / `TEST_MOBILE` set
 - ☑ CloudWatch alarms: CPU > 80% for 10 min → email; status check fail → email; HTTP 5xx rate > 1% → email
 - ☑ AWS root MFA on; day-to-day work uses an IAM user with restricted IAM policies

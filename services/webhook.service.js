@@ -160,7 +160,7 @@ function fmtDateTime(d) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-async function buildJobPayload(jobId) {
+async function buildJobPayload(jobId, eventName) {
   const [[job]] = await pool.query(
     `SELECT j.*,
             cu.customer_name, cu.customer_mob_no, cu.customer_email,
@@ -259,14 +259,27 @@ async function buildJobPayload(jobId) {
     },
     collectedBy: job.collected_by,
     jobCancelBy: job.job_cancel_reason_id_by_easyfixer,
-    jobServices: services.map((s) => ({
-      quantity: s.quantity,
-      serviceType: { serviceTypeName: s.service_type_name || '' },
-      clientService: {
-        rate_card_id: s.rate_card_id,
-        clientRateCard: { serviceName: s.rate_card_name || '' },
-      },
-    })),
+    /*
+     * jobServices is OMITTED for CancelJob — legacy Webhook_2023 did the same
+     * (src/services/job.service.js: `if (event !== "CancelJob")` gates the
+     * jobServices include). Sending it made the payload 39 top-level keys
+     * against legacy's 38 and Decathlon's endpoint rejected the whole body
+     * with HTTP 400 on every attempt.
+     *
+     * Spread rather than a conditional value: an explicit `undefined` would
+     * still create the key under JSON.stringify semantics in some shapes, and
+     * the contract here is about the key being ABSENT, not empty.
+     */
+    ...(eventName === EVENT_NAMES.CancelJob ? {} : {
+      jobServices: services.map((s) => ({
+        quantity: s.quantity,
+        serviceType: { serviceTypeName: s.service_type_name || '' },
+        clientService: {
+          rate_card_id: s.rate_card_id,
+          clientRateCard: { serviceName: s.rate_card_name || '' },
+        },
+      })),
+    }),
     referenceId: job.job_reference_id || `REF-${job.job_id}`,
     revisitDate: fmtDateTime(job.revisit_date),
     scheduledBy: {
@@ -329,6 +342,28 @@ async function logDelivery({ clientId, eventId, jobId, callBackUrl, jobData, htt
   );
 }
 
+/*
+ * Is another attempt with the SAME payload capable of a different outcome?
+ *
+ * 4xx says the server understood the request and rejected it — replaying an
+ * unchanged body cannot turn it into a 2xx, so a retry only multiplies the
+ * POSTs the client receives and the rows written to webhook_logs. A live 400
+ * from a partner endpoint was logged three times for one event, which read as
+ * three duplicate deliveries in an audit.
+ *
+ * The two exceptions are the 4xx codes that are explicitly about TIMING
+ * rather than the payload: 408 (server gave up waiting) and 429 (rate
+ * limited). Both can succeed unchanged once the backoff has elapsed.
+ *
+ * 5xx and anything else is treated as transient and retried — including a
+ * network-level throw, which never reaches this function and is retried by
+ * the catch branch.
+ */
+function isRetryable(status) {
+  if (status === 408 || status === 429) return true;
+  return !(status >= 400 && status < 500);
+}
+
 async function deliverWithRetry(context, attempt = 1) {
   const { mapping, event, jobId, payload } = context;
   try {
@@ -350,10 +385,13 @@ async function deliverWithRetry(context, attempt = 1) {
       callBackUrl: mapping.call_back_url,
       jobData: payload,
       httpStatus: res.status,
-      dlq: !ok && attempt >= MAX_ATTEMPTS,
+      dlq: !ok && (!isRetryable(res.status) || attempt >= MAX_ATTEMPTS),
     });
-    if (!ok && attempt < MAX_ATTEMPTS) {
+    if (!ok && isRetryable(res.status) && attempt < MAX_ATTEMPTS) {
       setTimeout(() => deliverWithRetry(context, attempt + 1), backoffMs(attempt + 1)).unref();
+    } else if (!ok) {
+      logger.warn(`Webhook not retried · ${who} · status=${res.status} · `
+        + (isRetryable(res.status) ? 'attempts exhausted' : 'non-retryable status'));
     }
   } catch (err) {
     logger.error(`Webhook error · client=${mapping.client_id} · event=${event.name} · job=${jobId} · attempt ${attempt} · ${err.message}`);
@@ -375,22 +413,60 @@ async function deliverWithRetry(context, attempt = 1) {
  * the returned promise resolves once the FIRST delivery attempt has been
  * scheduled, not when it completes. Retries run async in the background.
  */
+/*
+ * Record a dispatch that never became a delivery attempt.
+ *
+ * deliverWithRetry logs both success and failure, but every early return in
+ * dispatch() used to leave NO trace at all — so a client whose mapping was
+ * missing or inactive went silent with nothing in webhook_logs to show for
+ * it. That is indistinguishable from "the event never fired", which is the
+ * one question this table has to be able to answer once the legacy
+ * dispatcher is switched off.
+ *
+ * Written with call_back_url NULL (no URL was chosen) and the reason under
+ * __delivery.skipped, reusing the same envelope key that marks a row as
+ * written by this service rather than by legacy.
+ */
+async function logSkip({ clientId, eventId, jobId, reason }) {
+  try {
+    await pool.query(
+      `INSERT INTO webhook_logs (client_id, event_id, job_id, call_back_url, job_data, insert_date)
+       VALUES (?, ?, ?, NULL, ?, ?)`,
+      [clientId || null, eventId || null, jobId || null,
+       JSON.stringify({ __delivery: { skipped: reason } }), new Date()]
+    );
+  } catch (err) {
+    // Never let bookkeeping break a dispatch path that is already bailing out.
+    logger.warn(`Webhook skip-log failed · job=${jobId} · reason=${reason} · ${err.message}`);
+  }
+}
+
 async function dispatch({ eventName, jobId }) {
   logger.info('Dispatching webhook · event=' + eventName + ' · job=' + jobId);
-  if (String(process.env.WEBHOOKS_DISABLE).toLowerCase() === 'true') {
-    logger.test(`Webhook suppressed (WEBHOOKS_DISABLE) · event=${eventName} · job=${jobId}`);
+  /*
+   * Outbound kill switch. ENABLED-style flag: dispatch proceeds unless the
+   * value is explicitly falsy ("false"/"0"/"no"). An UNSET variable keeps
+   * webhooks ENABLED, which preserves the behaviour every environment has
+   * today — a rename must not silence production if one env file is missed.
+   * Set WEBHOOK_OUTBOUND_ENABLED=false everywhere except Prod.
+   */
+  const flag = String(process.env.WEBHOOK_OUTBOUND_ENABLED ?? '').trim().toLowerCase();
+  if (flag === 'false' || flag === '0' || flag === 'no') {
+    logger.test(`Webhook suppressed (WEBHOOK_OUTBOUND_ENABLED=${flag}) · event=${eventName} · job=${jobId}`);
     return { disabled: true };
   }
 
   const event = await getEventByName(eventName);
   if (!event) {
     logger.warn(`Webhook skipped · unknown event "${eventName}" · job=${jobId}`);
+    await logSkip({ jobId, reason: `unknown event "${eventName}"` });
     return { unknownEvent: true };
   }
 
-  const payload = await buildJobPayload(jobId);
+  const payload = await buildJobPayload(jobId, eventName);
   if (!payload) {
     logger.warn(`Webhook skipped · job ${jobId} not found · event=${eventName}`);
+    await logSkip({ eventId: event.id, jobId, reason: 'job not found' });
     return { jobMissing: true };
   }
   const clientId = payload._fk_client_id;
@@ -398,12 +474,14 @@ async function dispatch({ eventName, jobId }) {
 
   if (!clientId) {
     logger.debug({ eventName, jobId }, 'webhook skipped — job has no client_id');
+    await logSkip({ eventId: event.id, jobId, reason: 'job has no client_id' });
     return { noClient: true };
   }
 
   const mappings = await activeMappingsFor(clientId, event.id);
   if (mappings.length === 0) {
     logger.info('No active webhook mapping · client=' + clientId + ' · event=' + eventName + ' · job=' + jobId);
+    await logSkip({ clientId, eventId: event.id, jobId, reason: 'no active mapping' });
     return { dispatched: 0, reason: 'no active mapping' };
   }
 
@@ -424,7 +502,7 @@ async function manualDispatch({ eventName, jobId, mappingId }) {
   const event = await getEventByName(eventName);
   if (!event) logger.warn('Manual webhook dispatch skipped · unknown event "' + eventName + '"');
   if (!event) throw Object.assign(new Error('event not found'), { status: 404 });
-  const payload = await buildJobPayload(jobId);
+  const payload = await buildJobPayload(jobId, eventName);
   if (!payload) logger.warn('Manual webhook dispatch skipped · job ' + jobId + ' not found');
   if (!payload) throw Object.assign(new Error('job not found'), { status: 404 });
   delete payload._fk_client_id;

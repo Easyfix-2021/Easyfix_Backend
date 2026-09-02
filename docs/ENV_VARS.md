@@ -7,7 +7,7 @@ For the full server bootstrap see [`AWS_QA_BOOTSTRAP.md`](./AWS_QA_BOOTSTRAP.md)
 
 | Variable kind | Where | When read | Examples |
 |---|---|---|---|
-| Backend runtime secrets | `/opt/easyfix/backend.env` (chmod 600) on EC2 | Read by Node via `dotenv` when the backend container starts | `DB_PASSWORD`, `JWT_SECRET`, `MS_GRAPH_*`, `SUITE_URL`, `NOTIFICATIONS_DISABLE`, `WEBHOOKS_DISABLE`, `TEST_EMAILS` |
+| Backend runtime secrets | `/opt/easyfix/backend.env` (chmod 600) on EC2 | Read by Node via `dotenv` when the backend container starts | `DB_PASSWORD`, `JWT_SECRET`, `MS_GRAPH_*`, `SUITE_URL`, `NOTIFICATIONS_DISABLE`, `WEBHOOK_OUTBOUND_ENABLED`, `TEST_EMAILS` |
 | Image-tag pointers (workflow-managed) | `/opt/easyfix/.env` (chmod 644) on EC2 | At `docker compose pull/up` time | `BACKEND_IMAGE`, `CRM_UI_IMAGE` — auto-updated by GitHub Actions on every deploy. **Never edit these manually.** |
 | CI build-args (CRM-UI bundle) | **GitHub Environment "Organisation Level Secrets"** | At CI Docker build time, passed via `--build-arg` | `QA_API_URL` → baked into static JS chunks |
 | CI auth + targets | **GitHub Environment "Organisation Level Secrets"** | At CI runtime | `AWS_*`, `QA_INSTANCE_ID`, `ECR_*`, `MAIL_*` |

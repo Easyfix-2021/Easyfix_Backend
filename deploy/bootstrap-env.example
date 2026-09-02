@@ -64,7 +64,7 @@ MS_GRAPH_SENDER_EMAIL=ithelpdesk@easyfix.in
 
 # Provider feature flags — keep TRUE for QA until deliberate cutover
 NOTIFICATIONS_DISABLE=true
-WEBHOOKS_DISABLE=true
+WEBHOOK_OUTBOUND_ENABLED=false
 TEST_EMAILS=harshit@channelplay.in
 
 # QA-only auth conveniences. NEVER set on production — would be a complete

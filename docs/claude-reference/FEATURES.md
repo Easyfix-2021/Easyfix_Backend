@@ -143,7 +143,7 @@ Dispatch is **fire-and-forget via `setImmediate`** — the job API returns befor
 
 **Per-client authorization**: `webhook_client_url_mapping.authorization` holds bearer tokens (Decathlon's lives here: `c52aeadf5f8a4dae828e88bf508ea2b9a`). Dispatcher sets this as outbound `Authorization` header literally — the column value is used verbatim so clients can include `Bearer ` prefix or not as they prefer.
 
-**Dev guard**: `WEBHOOKS_DISABLE=true` env short-circuits `dispatch()` without hitting providers. Unlike notifications, webhook dispatch is NOT disabled in `.env` by default — events to real clients fire in dev only if mappings exist for the scratch client you're using. When testing, register a local receiver.
+**Dev guard**: `WEBHOOK_OUTBOUND_ENABLED=false` env short-circuits `dispatch()` without hitting providers (UNSET = enabled, so the guard must be set explicitly). Unlike notifications, webhook dispatch is NOT disabled in `.env` by default — events to real clients fire in dev only if mappings exist for the scratch client you're using. When testing, register a local receiver.
 
 ## Scheduled crons (`server/scheduler.js`)
 

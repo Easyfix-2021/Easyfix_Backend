@@ -271,7 +271,7 @@ The script prompts for one var at a time. Reference list (matches `deploy/bootst
 | `MS_GRAPH_CLIENT_SECRET` | (from Azure app reg) |
 | `MS_GRAPH_SENDER_EMAIL` | `ithelpdesk@easyfix.in` |
 | `NOTIFICATIONS_DISABLE` | `true` (KEEP for QA) |
-| `WEBHOOKS_DISABLE` | `true` (KEEP for QA) |
+| `WEBHOOK_OUTBOUND_ENABLED` | `false` (KEEP for QA) |
 | `TEST_EMAILS` | `harshit@channelplay.in` |
 
 Each one goes into `backend.env` (option 2 when prompted).
