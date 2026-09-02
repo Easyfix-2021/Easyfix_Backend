@@ -84,11 +84,26 @@ jobs:
 
       - name: Lint (no-undef — the copy-paste-across-handlers guard)
         run: npm run lint
+      # CROSS-REPO PARITY — see ci.yml for the full rationale. Short version:
+      # tests/wire-contract.test.js and tests/job-search-parity.test.js read two
+      # files out of the CRM repo, and THIS is the job that gates the deploy
+      # (build-and-push declares `needs: precheck`), so this is the run in which
+      # those checks have been silently skipping. They assert.fail() under CI now,
+      # which makes this step load-bearing rather than a nicety.
+      #
+      # --depth 1 because both tests are plain file reads with no `git log`;
+      # public repo, so no token and no secret; "$RUNNER_TEMP" and not the
+      # workspace because `npm run lint` above is `eslint .` from the repo root.
+      - name: Fetch Easyfix_CRM_UI for cross-repo parity
+        run: git clone --quiet --depth 1 https://github.com/Easyfix-2021/Easyfix_CRM_UI.git "$RUNNER_TEMP/easyfix-crm-ui"
       # Characterization tests for the shared choke points (setStatus, create,
       # assign, offer, accept-offer, reschedule, magic-link write, + the
       # statusToEventName notification gate). Fake-pool based — no DB, no network,
       # deterministic. A failure blocks the deploy (build-and-push needs precheck).
+      # `npm test` is now scripts/test-no-skips.js, which also fails on skipped>0.
       - name: Unit tests (characterization — no DB)
+        env:
+          EASYFIX_CRM_UI_DIR: ${{ runner.temp }}/easyfix-crm-ui
         run: npm test
 
   build-and-push:

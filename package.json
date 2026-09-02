@@ -16,7 +16,7 @@
     "test:job": "node --test --test-force-exit tests/job-service-setstatus.test.js",
     "test:stages": "node --test --test-force-exit tests/job-stages.test.js tests/job-stage-access-routes.test.js",
     "test:offline": "node --test --test-force-exit tests/aadhaar-uniqueness-compat.test.js tests/easyfixer-lifecycle.test.js tests/idempotency.test.js tests/idempotency-route.test.js tests/idempotency-retention.test.js tests/idempotent-upload.test.js tests/mobile-identity.test.js tests/mobile-identity-route.test.js tests/mobile-registration-work-area.test.js tests/mobile-registration-work-area-route.test.js tests/offline-schema-invariants.test.js tests/serviceable-pincodes-atomic.test.js tests/training-progress-concurrency.test.js tests/training-progress-migration.test.js",
-    "test": "node --test --test-force-exit tests/*.test.js",
+    "test": "node scripts/test-no-skips.js tests/*.test.js",
     "check:offline": "node scripts/offline-reliability-sync.js check --worktree",
     "offline:record": "npm run test:offline && node scripts/offline-reliability-sync.js record --staged",
     "offline:record:worktree": "npm run test:offline && node scripts/offline-reliability-sync.js record --worktree",

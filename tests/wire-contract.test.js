@@ -119,6 +119,23 @@ test("the job-age sort key maps to the SECONDS expression, not the day count", (
 
 // ─── cross-repo identity ──────────────────────────────────────────────────
 
+/*
+ * Env var FIRST, sibling checkout as the fallback:
+ *   EASYFIX_CRM_UI_DIR   CI. The workflow shallow-clones the CRM into
+ *                        RUNNER_TEMP (both repos are public — no token, no
+ *                        secret) and points this at it. RUNNER_TEMP and not the
+ *                        workspace, because `npm run lint` is `eslint .` from
+ *                        the repo root and would otherwise lint the CRM with
+ *                        this repo's config.
+ *   ../Easyfix_CRM_UI    a developer machine, where the repos are siblings.
+ *
+ * `||` rather than the try-each-root loop in job-search-parity.test.js: this
+ * function is the byte-mirror of siblingContract() in
+ * Easyfix_CRM_UI/tests/wire-contract.test.js pointing the other way, and the
+ * two are kept identical in shape. It also fails closed — a mistyped
+ * EASYFIX_CRM_UI_DIR reports "missing" instead of quietly reverting to the
+ * local layout and verifying a repo nobody asked about.
+ */
 function siblingContract() {
   const root = process.env.EASYFIX_CRM_UI_DIR
     || path.resolve(__dirname, '../../Easyfix_CRM_UI');
@@ -129,8 +146,20 @@ function siblingContract() {
 test('the CRM_UI copy of the contract is byte-identical', (t) => {
   const sibling = siblingContract();
   if (!sibling) {
-    // SKIPPED, NOT PASSED — in CI only this repo is checked out, so the check
-    // cannot run. Say so rather than letting a green tick imply otherwise.
+    /*
+     * SKIPPED, NOT PASSED — and only ever locally. This used to skip in CI too,
+     * because only this repo was checked out there, which meant cross-repo
+     * parity had never once been verified by the thing that gates the deploy.
+     * CI now clones Easyfix_CRM_UI into RUNNER_TEMP and sets EASYFIX_CRM_UI_DIR
+     * (see the "Fetch Easyfix_CRM_UI for cross-repo parity" step), so an absence
+     * HERE can only mean that step broke — a failure, not a shrug.
+     */
+    if (process.env.CI) {
+      assert.fail('Easyfix_CRM_UI is missing in CI. The "Fetch Easyfix_CRM_UI for cross-repo '
+        + 'parity" workflow step must clone it into "$RUNNER_TEMP" and set EASYFIX_CRM_UI_DIR '
+        + '— cross-repo parity must never degrade to a silent skip in the run that gates the '
+        + 'deploy.');
+    }
     t.skip('Easyfix_CRM_UI not found beside this repo — cross-repo parity NOT verified');
     return;
   }

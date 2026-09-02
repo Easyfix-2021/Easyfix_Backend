@@ -20,8 +20,26 @@
  *
  * Both halves are parsed from SOURCE rather than imported: the FE is a separate
  * repo written in TypeScript, so there is nothing this process can require().
- * When that repo isn't checked out beside this one, the cross-repo assertions
- * are skipped and the BE-side invariants still run.
+ *
+ * WHERE THE CRM IS FOUND. Two layouts, and as of 2026-09-01 CI is no longer one
+ * that gets to shrug:
+ *
+ *   EASYFIX_CRM_UI_DIR   CI. The workflow shallow-clones the CRM into
+ *                        RUNNER_TEMP — both repos are public, so this needs no
+ *                        token and no secret — and points this variable at it.
+ *                        RUNNER_TEMP, not the workspace: inside it, `npm run
+ *                        lint` (`eslint .` from the repo root) would lint the
+ *                        CRM with this repo's config and walk ~15k files that
+ *                        are not ours.
+ *   ../Easyfix_CRM_UI    a developer machine, where the two repos are siblings.
+ *
+ * This path used to be hardcoded to the sibling and commented "not configurable
+ * on purpose". That was defensible only while the skip was a developer-machine
+ * convenience. In CI only this repo was ever checked out, so the sibling never
+ * existed and the two PARITY tests below had never once executed in the run that
+ * gates the deploy — committed, green, enforcing nothing. Skipping is now a
+ * local convenience only; under CI an absent CRM is a failure, because it can
+ * only mean the clone step broke.
  *
  * Runner: `node --test`.
  */
@@ -32,11 +50,44 @@ const fs = require('fs');
 const path = require('path');
 
 const BE_FILE = path.join(__dirname, '..', 'services', 'job.service.js');
-// Sibling checkout. Not configurable on purpose — if the layout changes, the
-// skip message below tells you exactly what to fix.
-const FE_FILE = path.join(
-  __dirname, '..', '..', 'Easyfix_CRM_UI', 'src', 'lib', 'job-tabs.ts',
-);
+
+// Env var FIRST, sibling as the fallback — the same two-root shape as
+// resolveAudit() in Easyfix_CRM_UI/tests/message-literals.test.js, which is the
+// mirror image of this check pointing the other way across the repo boundary.
+const CRM_ROOTS = [
+  process.env.EASYFIX_CRM_UI_DIR,
+  path.join(__dirname, '..', '..', 'Easyfix_CRM_UI'),
+];
+
+function resolveFeFile() {
+  for (const root of CRM_ROOTS) {
+    if (!root) continue;
+    const p = path.join(root, 'src', 'lib', 'job-tabs.ts');
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
+/*
+ * Returns the FE file, or null after registering the outcome. GitHub Actions
+ * sets CI=true unconditionally, so an absent CRM there can only mean the "Fetch
+ * Easyfix_CRM_UI for cross-repo parity" workflow step broke — that is a red
+ * build, not a shrug. The t.skip below is unreachable in CI and stays purely for
+ * the developer machine.
+ */
+function resolveFeFileOrFail(t) {
+  const fe = resolveFeFile();
+  if (fe) return fe;
+  if (process.env.CI) {
+    assert.fail('Easyfix_CRM_UI is missing in CI. The "Fetch Easyfix_CRM_UI for cross-repo '
+      + 'parity" workflow step must clone it into "$RUNNER_TEMP" and set EASYFIX_CRM_UI_DIR. '
+      + 'This must never degrade to a silent skip here — that is how a guard ends up '
+      + `committed, green, and never run. Looked in: ${CRM_ROOTS.filter(Boolean).join(', ')}`);
+  }
+  t.skip(`CRM UI not checked out beside this repo (looked in ${CRM_ROOTS.filter(Boolean).join(', ')}) `
+    + '— cross-repo parity NOT verified');
+  return null;
+}
 
 /*
  * BE column → the field name the CRM row carries. The two differ because the BE
@@ -69,8 +120,8 @@ function beSearchColumns() {
 }
 
 // Pull the accessor field names out of JOB_SEARCH_FIELDS.
-function feSearchFields() {
-  const src = fs.readFileSync(FE_FILE, 'utf8');
+function feSearchFields(feFile) {
+  const src = fs.readFileSync(feFile, 'utf8');
   return new Set([...src.matchAll(/get:\s*\(j\)\s*=>\s*j\.([a-z_]+)/gi)].map((m) => m[1]));
 }
 
@@ -97,11 +148,9 @@ test('every BE-searched column is a known column with a FE counterpart mapping',
 });
 
 test('PARITY: the CRM client-side filter covers every column the BE searches', (t) => {
-  if (!fs.existsSync(FE_FILE)) {
-    t.skip(`CRM UI not checked out beside this repo (looked for ${FE_FILE}) — cross-repo parity not verified`);
-    return;
-  }
-  const fe = feSearchFields();
+  const feFile = resolveFeFileOrFail(t);
+  if (!feFile) return;
+  const fe = feSearchFields(feFile);
   assert.ok(fe.size > 0, 'parsed zero fields from JOB_SEARCH_FIELDS — has its shape changed?');
   const missing = beSearchColumns()
     .map((c) => BE_TO_FE[c])
@@ -112,12 +161,23 @@ test('PARITY: the CRM client-side filter covers every column the BE searches', (
     + 'that silently returns nothing. Add them to JOB_SEARCH_FIELDS in job-tabs.ts.');
 });
 
-test('PARITY: client SPOC specifically is searchable on both sides', (t) => {
+/*
+ * The SPOC pair is split across two tests ON PURPOSE. It used to be one test
+ * that asserted the BE half, THEN skipped, so on a skip the summary reported
+ * "skipped" for a test that had in fact enforced half its body — the worst of
+ * both readings. Two tests: the BE half always runs and is always reported as
+ * having run; the cross-repo half is the only part that can be skipped.
+ */
+test('client SPOC is searchable on the BE side', () => {
   const be = beSearchColumns();
   assert.ok(be.includes('j.client_spoc_name'), 'BE must search the SPOC name');
   assert.ok(be.includes('j.client_spoc'), 'BE must search the SPOC mobile');
-  if (!fs.existsSync(FE_FILE)) { t.skip('CRM UI not checked out beside this repo'); return; }
-  const fe = feSearchFields();
+});
+
+test('PARITY: client SPOC specifically is searchable on the CRM side too', (t) => {
+  const feFile = resolveFeFileOrFail(t);
+  if (!feFile) return;
+  const fe = feSearchFields(feFile);
   assert.ok(fe.has('client_spoc_name'), 'CRM filter must match the SPOC name');
   assert.ok(fe.has('client_spoc'), 'CRM filter must match the SPOC mobile');
 });
