@@ -20,7 +20,7 @@
  *   3. a value already on file SATISFIES the mandatory check, so HR is never
  *      asked to re-type a number the form is not allowed to show them.
  */
-const { test, before } = require('node:test');
+const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 
@@ -112,3 +112,109 @@ test('an explicit null CLEARS both the ciphertext and its last4', async () => {
   assert.equal(pan, null);
   assert.equal(last4, null, 'a stale last4 would keep showing a mask for a value that is gone');
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// THE DEACTIVATION EXEMPTION
+//
+// The owner's rule, verbatim: "if only Status is changed from Active to
+// Inactive, details will not be mandatory to add for existing users."
+//
+// This matters because ~1.2k active users have none of the six on file. Without
+// the exemption, offboarding any of them would demand a PAN and an Aadhaar for
+// somebody who has already left — data HR cannot get, on the one action that
+// must always be possible. The same exemption personal_email already carries.
+//
+// Driven through updateUser rather than asserting the predicate alone: the
+// predicate being right is worth nothing if it is wired to the wrong branch.
+// ═══════════════════════════════════════════════════════════════════════
+
+const { installFakePool } = require('./helpers/fake-pool');
+
+let currentUser = null;
+let storedIdentifiers = null;
+
+const GATE_ROUTES = [
+  [/GET_LOCK/i, [{ got: 1 }]],
+  // BEFORE the tbl_user routes — "tbl_user_personal_details" is a substring of
+  // neither, but the FROM-clause patterns below would still match it first.
+  [/FROM tbl_user_personal_details/i, () => (storedIdentifiers ? [storedIdentifiers] : [])],
+  [/INSERT INTO tbl_user_personal_details/i, () => ({ affectedRows: 1 })],
+  [/FROM tbl_user_allowed_stages/i, []],
+  [/SELECT role_id, role_name/i, [{ role_id: 2, role_name: 'Admin', role_status: 1, menu_ids: '' }]],
+  [/FROM tbl_user\s+WHERE user_id/i, () => (currentUser ? [currentUser] : [])],
+  [/FROM tbl_user\s+u/i, []],
+];
+
+/* stopOn fires at the column write, so "validation passed" is observable
+   without needing the rest of the update to be faked. */
+const gateFake = installFakePool(GATE_ROUTES, { stopOn: /UPDATE tbl_user SET/i });
+
+function userRow(overrides = {}) {
+  return {
+    user_id: 501, user_type_id: 5, user_name: 'Test User', mobile_no: '9000000001',
+    alternate_no: null, user_role: 2, city_id: 1,
+    manage_clients: null, manage_cities: null, manage_states: null, manage_verticals: null,
+    reporting_manager: null, user_status: 1, ...overrides,
+  };
+}
+
+async function runUpdate(fields) {
+  try {
+    const value = await userService.updateUser(501, fields, 99, { enforceHrIdentifiers: true });
+    return { completed: value };
+  } catch (e) {
+    if (e.__stop) return { reachedWrite: true };
+    return { rejected: e.message, status: e.status };
+  }
+}
+
+test('deactivating a user with NO personal details on file is ALLOWED', async () => {
+  currentUser = userRow({ user_status: 1 });   // currently ACTIVE
+  storedIdentifiers = null;                    // and nothing on file
+  const r = await runUpdate({ is_active: false });
+  assert.ok(!r.rejected,
+    `offboarding must never be blocked by missing details — got: ${r.rejected}`);
+});
+
+test('CONTROL — the SAME user, edited without deactivating, IS blocked', async () => {
+  currentUser = userRow({ user_status: 1 });
+  storedIdentifiers = null;
+  const r = await runUpdate({ mobile_no: '9000000002' });
+  assert.ok(r.rejected, 'an ordinary edit of a detail-less active user must be blocked');
+  assert.equal(r.status, 400);
+  assert.match(r.rejected, /required/i);
+  // Without this control the test above would pass against an enforcement
+  // that never runs at all.
+});
+
+test('an ALREADY-inactive user can be edited without the six', async () => {
+  currentUser = userRow({ user_status: 0 });   // already inactive
+  storedIdentifiers = null;
+  const r = await runUpdate({ mobile_no: '9000000003' });
+  assert.ok(!r.rejected, `an inactive user must stay editable — got: ${r.rejected}`);
+});
+
+test('deactivating is exempt even when OTHER fields change in the same submit', async () => {
+  // The owner said "if only Status is changed". The implementation is broader
+  // on purpose: the exemption keys off is_active === false, not off the payload
+  // being a single key. A submit that deactivates AND corrects a mobile is
+  // still an offboarding, and splitting it into two saves to satisfy a rule
+  // nobody can see would be the kind of workaround that teaches operators to
+  // distrust the form.
+  currentUser = userRow({ user_status: 1 });
+  storedIdentifiers = null;
+  const r = await runUpdate({ is_active: false, mobile_no: '9000000004' });
+  assert.ok(!r.rejected, `got: ${r.rejected}`);
+});
+
+test('a user WITH all six on file is editable normally — the mandate is satisfied, not skipped', async () => {
+  currentUser = userRow({ user_status: 1 });
+  storedIdentifiers = {
+    personal_email: 'a@b.com', date_of_birth: '1990-01-01', date_of_joining: '2020-01-01',
+    uan: '100717632403', address: '12 MG Road', pan_last4: '234F', aadhaar_last4: '9521',
+  };
+  const r = await runUpdate({ mobile_no: '9000000005' });
+  assert.ok(!r.rejected, `a complete record must edit cleanly — got: ${r.rejected}`);
+});
+
+after(() => gateFake.restore());
