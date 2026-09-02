@@ -295,6 +295,22 @@ async function upsertPersonalEmail(userId, personalEmail, runner = pool) {
  */
 const SORTABLE_COLUMNS = Object.freeze({
   user_id:        'u.user_id',
+  /*
+   * Employee code. Already on the list projection; sortable since the CRM's
+   * Manage Users table started rendering it as a column, because a column
+   * people scan down is a column they will try to sort.
+   *
+   * routes/admin/users.js:113 derives its Joi whitelist from these keys
+   * (`Joi.string().valid(...Object.keys(userService.SORTABLE_COLUMNS))`), so
+   * this one edit reaches the validator too — the two lists cannot drift.
+   *
+   * Sorts as TEXT, which is what the format wants: codes are E-prefixed and
+   * zero-padded (see lib/emp-code.js), so lexical order IS numeric order.
+   * NULL is a real state here — users created before the code existed have
+   * none — and MySQL sorts NULLs first ascending, which puts "no code yet" at
+   * the top of an ascending sort. That is the useful end to find them.
+   */
+  user_code:      'u.user_code',
   user_name:      'u.user_name',
   official_email: 'u.official_email',
   mobile_no:      'u.mobile_no',
