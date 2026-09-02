@@ -150,7 +150,18 @@ const listQuery = Joi.object({
    * case-insensitive, so 'website' matches regardless of stored casing.
    */
   sourceType: Joi.string().max(50).optional(),
-  dateType:   Joi.string().valid('booked', 'scheduled', 'completed', 'ticket', 'requested').optional(),
+  /*
+   * `dateType` — MUST list every key of DATE_TYPE_COLUMN (services/job.service.js)
+   * that a browser is allowed to send. Joi runs with stripUnknown but valid() is
+   * a hard whitelist, so a value present in the map and missing here 400s before
+   * the service ever sees it. `cancelled` (2026-09-02) targets
+   * tbl_job.cancel_date_time, which is NULL for never-cancelled jobs — the
+   * window therefore restricts to cancelled jobs too; see the note on the map.
+   * `checkin` is deliberately NOT here: it is an internal dateType used by
+   * services/mobile-dashboard.service.js, which calls list() directly and never
+   * crosses this layer.
+   */
+  dateType:   Joi.string().valid('booked', 'scheduled', 'completed', 'ticket', 'requested', 'cancelled').optional(),
   // Phase-2 filters (2026-05-19).
   //   rating  — exact match against tbl_easyfixer_rating_by_customer.customer_rating
   //   reopen  — boolean: jobs with job_reopen_flag = 1

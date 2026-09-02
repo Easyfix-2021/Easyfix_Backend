@@ -502,6 +502,14 @@ const UI_DATE_TYPE_COLUMN = Object.freeze({
   completed: 'J.checkout_date_time',
   ticket:    'J.ticket_created_date_time',
   requested: 'J.requested_date_time',
+  /*
+   * cancel_date_time is NULL on every job that was never cancelled, and
+   * `NULL >= DATE(?)` is NULL → false. So a window on this column is also a
+   * `job_status = 6` filter. Intended (see the fuller note on DATE_TYPE_COLUMN
+   * in services/job.service.js), and identical on both sides — which is the
+   * whole point of this map: the sheet must cover the same rows as the table.
+   */
+  cancelled: 'J.cancel_date_time',
 });
 
 /*

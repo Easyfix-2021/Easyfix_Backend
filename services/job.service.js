@@ -1611,6 +1611,7 @@ const DETAIL_JOIN = LIST_JOIN + `
  *   completed → j.checkout_date_time
  *   ticket    → j.ticket_created_date_time
  *   requested → j.requested_date_time
+ *   cancelled → j.cancel_date_time
  * Unknown values silently fall back to `created_date_time` rather
  * than 400 — keeps URL bookmarks robust across vocab changes.
  */
@@ -1626,6 +1627,25 @@ const DATE_TYPE_COLUMN = {
   // "what was booked for today". Written on every check-in and populated on
   // essentially every started job (6 unstamped rows in 260k).
   checkin:   'j.checkin_date_time',
+  /*
+   * THIS ONE ALSO FILTERS, not just re-aims the window.
+   *
+   * cancel_date_time is stamped only when a job moves to status 6 CANCELLED
+   * (docs/claude-reference/SCHEMA.md — alongside cancel_reason_id /
+   * cancel_comment / cancel_by; setStatus() is the single writer). It is NULL
+   * for every job that was never cancelled, and `NULL >= DATE(?)` evaluates to
+   * NULL, which WHERE treats as false. So a date range on dateType=cancelled
+   * silently drops every non-cancelled job — the window is simultaneously a
+   * `job_status = 6` filter.
+   *
+   * That is the INTENDED behaviour ("what did we cancel last week" wants
+   * exactly that set), and it is the reason this is written down: every other
+   * dateType above re-aims the window without changing which jobs are
+   * eligible, so an operator combining dateType=cancelled with a status tab
+   * gets an intersection, and combining it with the "All" tab gets cancelled
+   * jobs only. Nothing here special-cases that; it falls out of NULL semantics.
+   */
+  cancelled: 'j.cancel_date_time',
 };
 
 /*
