@@ -425,7 +425,7 @@ async function recordReveal(conn, { actorUserId, subjectUserId, context, refId =
  */
 async function getMyProfile(userId, runner = pool) {
   const [[user]] = await runner.query(
-    'SELECT user_code, mobile_no, alternate_no FROM tbl_user WHERE user_id = ? LIMIT 1',
+    'SELECT user_code, user_name, mobile_no, alternate_no FROM tbl_user WHERE user_id = ? LIMIT 1',
     [userId],
   );
   if (!user) throw mkErr(404, 'USER_NOT_FOUND', 'User not found');
@@ -475,6 +475,11 @@ async function getMyProfile(userId, runner = pool) {
 
   return {
     user_code:      user.user_code || null,
+    /* Carried so the edit dialog can seed the Full Name field and compare
+       against a pending request. The page's header still renders the name from
+       the session, which is why this was never needed until Full Name became
+       editable (2026-09-02). */
+    user_name:      user.user_name || null,
     /* null = render the initials monogram. Never a placeholder image URL: a
        broken <img> and "no photo set" must not look the same to the UI. */
     photo_url:      photoUrl,
@@ -552,6 +557,47 @@ async function getMyProfile(userId, runner = pool) {
  * affectedRows=0 for a no-op UPDATE (the pool does not set CLIENT_FOUND_ROWS),
  * so re-saving the same number would look like a missing user.
  */
+/*
+ * PERSONAL EMAIL — a DIRECT write, no approval (2026-09-02, owner's decision).
+ *
+ * It sits beside setAlternateNo rather than in the request queue for the same
+ * reason that one does: nothing downstream keys off it. A personal address is
+ * where we reach someone when their company mailbox cannot be read — losing an
+ * approval round-trip on it costs nothing and gains the employee the ability to
+ * fix their own contact details, which is the whole point of the page.
+ *
+ * Contrast mobile_no, which is an OTP delivery target and therefore an
+ * authentication factor, and date_of_birth, which is an identity claim. Those
+ * two still go through HR.
+ *
+ * Validation is normalisePersonalEmail from user.service — the SAME function
+ * the Admin form uses, including its rule that a personal address may not be
+ * one of our own Microsoft 365 domains. A self-service path that accepted
+ * addresses the admin path rejects would quietly create the exact records the
+ * admin rule exists to prevent.
+ *
+ * Required lazily: user.service requires THIS module for validateDateOfBirth,
+ * so a module-scope require here would close the cycle.
+ */
+async function setPersonalEmail(userId, raw, runner = pool) {
+  // eslint-disable-next-line global-require
+  const { normalisePersonalEmail } = require('./user.service');
+  const parsed = normalisePersonalEmail(raw, { required: false });
+  if (!parsed.ok) throw mkErr(400, 'INVALID_PERSONAL_EMAIL', parsed.message);
+
+  const now = new Date();
+  await runner.query(
+    `INSERT INTO tbl_user_personal_details (user_id, personal_email, created_on, updated_on)
+     VALUES (?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE personal_email = VALUES(personal_email),
+                             updated_on     = VALUES(updated_on)`,
+    [Number(userId), parsed.value, now, now],
+  );
+  logger.info('Profile personal email updated · userId=' + userId
+    + ' cleared=' + (parsed.value === null));
+  return { personal_email: parsed.value };
+}
+
 async function setAlternateNo(userId, raw, runner = pool) {
   const blank = raw == null || String(raw).trim() === '';
   const value = blank ? null : validateMobile(raw, 'alternate_no');
@@ -646,6 +692,7 @@ module.exports = {
   getMyProfile,
   setAlternateNo,
   setDateOfBirthOnce,
+  setPersonalEmail,
   revealOwnBank,
   // Field rules — imported by profile-update-request.service so submission and
   // approve-time re-validation share ONE definition.

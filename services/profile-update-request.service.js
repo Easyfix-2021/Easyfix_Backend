@@ -38,9 +38,13 @@ const {
  * the routes surface e.status plus a machine code the FE branches on.
  */
 
-// The only three things a request can carry. `bank` is ONE value (all four
+// The only four things a request can carry. `bank` is ONE value (all four
 // fields), approved or rejected as a unit — see normaliseBank.
-const FIELD_KEYS = ['mobile_no', 'date_of_birth', 'bank'];
+//
+// user_name joined them 2026-09-02. It is the one key here that does NOT live
+// on tbl_user_personal_details — like mobile_no it is a tbl_user column, and
+// applyChanges writes it with its own UPDATE for that reason.
+const FIELD_KEYS = ['user_name', 'mobile_no', 'date_of_birth', 'bank'];
 
 // pending is the only actionable state; approved/rejected are terminal.
 const REQUEST_STATUSES = ['pending', 'approved', 'rejected'];
@@ -55,6 +59,30 @@ const REQUEST_STATUSES = ['pending', 'approved', 'rejected'];
  *     a long-open request).
  * Throws 400 { code } on anything unusable.
  */
+/*
+ * A full name. Deliberately permissive about CHARACTERS — Indian names carry
+ * dots, hyphens, apostrophes and multiple scripts, and a regex tight enough to
+ * feel safe is a regex that rejects somebody's actual name. What is enforced is
+ * only what the column and the reader need: non-empty, not absurdly long, and
+ * whitespace collapsed so " Priya   Sharma " and "Priya Sharma" are one value.
+ *
+ * Digits are refused. They are never part of a name and their presence is the
+ * reliable signature of a pasted employee code or phone number.
+ */
+function validateUserName(raw) {
+  const value = String(raw ?? '').replace(/\s+/g, ' ').trim();
+  if (!value) {
+    throw mkErr(400, 'INVALID_USER_NAME', 'user_name cannot be empty');
+  }
+  if (value.length > 100) {
+    throw mkErr(400, 'INVALID_USER_NAME', 'user_name must be 100 characters or fewer');
+  }
+  if (/[0-9]/.test(value)) {
+    throw mkErr(400, 'INVALID_USER_NAME', 'user_name cannot contain digits');
+  }
+  return value;
+}
+
 function normaliseChanges(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     throw mkErr(400, 'INVALID_CHANGES', 'changes must be an object');
@@ -65,6 +93,7 @@ function normaliseChanges(raw) {
       `changes has unknown field(s): ${unknown.join(', ')} — allowed: ${FIELD_KEYS.join(', ')}`);
   }
   const out = {};
+  if ('user_name' in raw)     out.user_name     = validateUserName(raw.user_name);
   if ('mobile_no' in raw)     out.mobile_no     = validateMobile(raw.mobile_no, 'mobile_no');
   if ('date_of_birth' in raw) out.date_of_birth = validateDateOfBirth(raw.date_of_birth);
   if ('bank' in raw)          out.bank          = normaliseBank(raw.bank);
@@ -122,7 +151,7 @@ async function assertMobileFree(mobile, userId, runner) {
 /* The live values behind the three request keys — the `old_values` snapshot. */
 async function readCurrentValues(userId, runner) {
   const [[user]] = await runner.query(
-    'SELECT mobile_no FROM tbl_user WHERE user_id = ? LIMIT 1', [userId],
+    'SELECT user_name, mobile_no FROM tbl_user WHERE user_id = ? LIMIT 1', [userId],
   );
   const [[personal]] = await runner.query(
     `SELECT date_of_birth, bank_account_number, bank_ifsc, bank_account_name, bank_name,
@@ -131,6 +160,7 @@ async function readCurrentValues(userId, runner) {
     [userId],
   );
   return {
+    user_name: (user && user.user_name) || null,
     mobile_no: (user && user.mobile_no) || null,
     date_of_birth: personal && personal.date_of_birth
       ? String(personal.date_of_birth).slice(0, 10) : null,
@@ -373,6 +403,15 @@ async function listRequests({ status, q, page, limit } = {}, poolRef = pool) {
  * what it was given.
  */
 async function applyChanges(userId, changes, conn) {
+  /*
+   * user_name is a tbl_user column, like mobile_no — NOT part of the
+   * personal-details upsert below. Its own statement, for the same reason
+   * mobile_no has one.
+   */
+  if (changes.user_name) {
+    await conn.query('UPDATE tbl_user SET user_name = ? WHERE user_id = ?',
+      [changes.user_name, Number(userId)]);
+  }
   if (changes.mobile_no) {
     await conn.query('UPDATE tbl_user SET mobile_no = ? WHERE user_id = ?',
       [changes.mobile_no, Number(userId)]);

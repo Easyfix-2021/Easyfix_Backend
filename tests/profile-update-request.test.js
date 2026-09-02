@@ -78,6 +78,8 @@ const fieldCrypto = require('../lib/field-crypto');
 const USER_ID = 7;
 const OTHER_USER_ID = 999;
 const CURRENT_MOBILE = '9000000000';
+/* The name the snapshot reads now that Full Name is a requestable field. */
+const CURRENT_USER_NAME = 'Priya Sharma';
 const NEW_MOBILE = '9876543210';
 const DOB = '1994-03-08';
 const BANK = {
@@ -157,8 +159,8 @@ function fakeDb({
     if (/SELECT user_id FROM tbl_user\s+WHERE mobile_no = \?/.test(text)) {
       return [mobileTaken ? [{ user_id: OTHER_USER_ID }] : [], []];
     }
-    if (/SELECT mobile_no FROM tbl_user/.test(text)) {
-      return [[{ mobile_no: CURRENT_MOBILE }], []];
+    if (/SELECT user_name, mobile_no FROM tbl_user/.test(text)) {
+      return [[{ user_name: CURRENT_USER_NAME, mobile_no: CURRENT_MOBILE }], []];
     }
     if (/SELECT date_of_birth, bank_account_number/.test(text)) {
       return [personal ? [personal] : [], []];
@@ -187,6 +189,12 @@ function fakeDb({
       return [{ affectedRows: deleteRows }, []];
     }
     if (/UPDATE tbl_user SET mobile_no/.test(text)) {
+      return [{ affectedRows: 1 }, []];
+    }
+    /* Full Name is a requestable field (2026-09-02) and, like mobile_no, lives
+       on tbl_user rather than the personal-details side table — so approving
+       one issues its own UPDATE. */
+    if (/UPDATE tbl_user SET user_name/.test(text)) {
       return [{ affectedRows: 1 }, []];
     }
     if (/INSERT INTO tbl_user_personal_details/.test(text)) {
@@ -233,10 +241,10 @@ const fake = installFakePool([
     () => (routeScenario.pending ? [routeScenario.pending] : [])],
   [/SELECT request_id, user_id, changes, old_values[\s\S]*WHERE request_id = \?/,
     () => (routeScenario.revealRow ? [routeScenario.revealRow] : [])],
-  [/SELECT mobile_no FROM tbl_user/, () => [{ mobile_no: CURRENT_MOBILE }]],
+  [/SELECT user_name, mobile_no FROM tbl_user/, () => [{ user_name: CURRENT_USER_NAME, mobile_no: CURRENT_MOBILE }]],
   [/SELECT date_of_birth, bank_account_number/, () => []],
-  [/SELECT user_code, mobile_no, alternate_no FROM tbl_user/,
-    () => [{ user_code: 'E000007', mobile_no: CURRENT_MOBILE, alternate_no: null }]],
+  [/SELECT user_code, user_name, mobile_no, alternate_no FROM tbl_user/,
+    () => [{ user_code: 'E000007', user_name: CURRENT_USER_NAME, mobile_no: CURRENT_MOBILE, alternate_no: null }]],
   [/SELECT personal_email, date_of_birth/, () => (routeScenario.personal ? [routeScenario.personal] : [])],
   [/SELECT user_id FROM tbl_user\s+WHERE mobile_no = \?/, () => []],
   [/INSERT INTO tbl_user_profile_update_request/, () => ({ insertId: 55, affectedRows: 1 })],
@@ -375,7 +383,7 @@ test('a re-submitted field overwrites `changes` but NOT its original `old_values
   assert.equal(out.old_values.mobile_no, CURRENT_MOBILE,
     'the "before" is the value when the key FIRST entered the request, not the previous draft');
   // Nothing needed re-snapshotting, so no live read was issued.
-  assert.equal(sqlCount(db.calls, /SELECT mobile_no FROM tbl_user/), 0);
+  assert.equal(sqlCount(db.calls, /SELECT user_name, mobile_no FROM tbl_user/), 0);
 });
 
 test('submitting while a request is open NEVER 409s — merging is the behaviour', async () => {
@@ -701,8 +709,8 @@ test('GET /details reports dob_locked and a null pending when nothing is open', 
 test('dob_locked is exactly "a date is stored" — never true alongside a null date', async () => {
   const dbNoDob = fakeDb();
   dbNoDob.query = async (sql) => {
-    if (/SELECT user_code, mobile_no, alternate_no/.test(String(sql))) {
-      return [[{ user_code: 'E000007', mobile_no: CURRENT_MOBILE, alternate_no: null }], []];
+    if (/SELECT user_code, user_name, mobile_no, alternate_no/.test(String(sql))) {
+      return [[{ user_code: 'E000007', user_name: CURRENT_USER_NAME, mobile_no: CURRENT_MOBILE, alternate_no: null }], []];
     }
     return [[], []];
   };
@@ -713,8 +721,8 @@ test('dob_locked is exactly "a date is stored" — never true alongside a null d
   const dbWithDob = fakeDb();
   dbWithDob.query = async (sql) => {
     const text = String(sql);
-    if (/SELECT user_code, mobile_no, alternate_no/.test(text)) {
-      return [[{ user_code: 'E000007', mobile_no: CURRENT_MOBILE, alternate_no: null }], []];
+    if (/SELECT user_code, user_name, mobile_no, alternate_no/.test(text)) {
+      return [[{ user_code: 'E000007', user_name: CURRENT_USER_NAME, mobile_no: CURRENT_MOBILE, alternate_no: null }], []];
     }
     if (/SELECT personal_email, date_of_birth/.test(text)) {
       // A DATE read back with a time component must not defeat the check.
@@ -1146,4 +1154,39 @@ test('with NO encryption key, approving a bank request refuses rather than writi
     'and the request must NOT be flipped to approved — it stays pending, to be retried');
   assert.equal(db.conn.committed, false);
   assert.equal(db.conn.rolledBack, true);
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// FULL NAME — a requestable field that does NOT live on the side table
+// ═══════════════════════════════════════════════════════════════════════
+
+test('a name change is validated like every other requestable field', () => {
+  assert.deepEqual(requestService.normaliseChanges({ user_name: '  Priya   Sharma ' }),
+    { user_name: 'Priya Sharma' }, 'whitespace is collapsed, not preserved');
+  for (const bad of ['', '   ', 'Priya 2', 'x'.repeat(101)]) {
+    assert.throws(() => requestService.normaliseChanges({ user_name: bad }),
+      (e) => e.code === 'INVALID_USER_NAME', `must reject ${JSON.stringify(bad)}`);
+  }
+  // CONTROL: a real name with punctuation must still pass, or the rule above is
+  // just "reject everything" wearing a validator's clothes.
+  assert.deepEqual(requestService.normaliseChanges({ user_name: "D'Souza-Rao" }),
+    { user_name: "D'Souza-Rao" });
+});
+
+test('user_name is in FIELD_KEYS, so the queue and the FE agree on what is requestable', () => {
+  assert.ok(requestService.FIELD_KEYS.includes('user_name'));
+});
+
+test('approving a name change writes tbl_user, NOT the personal-details table', async () => {
+  const db = fakeDb({ requestRow: pendingRequestRow({ user_name: 'Priya Sharma' }) });
+  await requestService.processRequest(55, { action: 'approve' }, { user_id: 3 }, db);
+
+  const nameWrite = db.calls.find((c) => /UPDATE tbl_user SET user_name/.test(c.sql));
+  assert.ok(nameWrite, 'the approval must actually write the name');
+  assert.equal(nameWrite.params[0], 'Priya Sharma');
+
+  // The side table must not be touched for a name-only request — a stray
+  // personal-details upsert here would bump updated_on on a row this request
+  // has nothing to do with.
+  assert.equal(db.calls.filter((c) => /INSERT INTO tbl_user_personal_details/.test(c.sql)).length, 0);
 });

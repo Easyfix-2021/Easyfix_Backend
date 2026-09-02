@@ -106,6 +106,23 @@ router.patch('/alternate-no', validate(alternateNoBody), async (req, res, next) 
   } catch (e) { fail(res, next, e, 'Update alternate number'); }
 });
 
+/*
+ * Personal email — a direct write. `.allow('', null)` because clearing it is a
+ * legitimate action, and the service maps blank to NULL. Shape only: the real
+ * rule (format, and the ban on our own company domains) is
+ * normalisePersonalEmail, called by the service.
+ */
+const personalEmailBody = Joi.object({
+  personal_email: Joi.string().trim().max(255).allow('', null).required(),
+});
+
+router.patch('/personal-email', validate(personalEmailBody), async (req, res, next) => {
+  try {
+    const data = await selfService.setPersonalEmail(req.profileUserId, req.body.personal_email, pool);
+    modernOk(res, data, 'Personal Email Updated');
+  } catch (e) { fail(res, next, e, 'Update personal email'); }
+});
+
 const dobBody = Joi.object({
   date_of_birth: Joi.string().trim().required(),
 });

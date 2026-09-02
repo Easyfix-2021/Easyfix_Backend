@@ -165,6 +165,7 @@ const createBody = Joi.object({
    * `.allow('')` on every one is load-bearing: an empty string is how the form
    * CLEARS a value. Rejecting it here would make a mistyped PAN permanent.
    */
+  date_of_birth:     Joi.string().trim().allow('', null).optional(),
   date_of_joining:   Joi.string().trim().allow('', null).optional(),
   uan:               Joi.string().trim().allow('', null).optional(),
   pan:               Joi.string().trim().allow('', null).optional(),
@@ -197,6 +198,7 @@ const updateBody = Joi.object({
    * `.allow('')` on every one is load-bearing: an empty string is how the form
    * CLEARS a value. Rejecting it here would make a mistyped PAN permanent.
    */
+  date_of_birth:     Joi.string().trim().allow('', null).optional(),
   date_of_joining:   Joi.string().trim().allow('', null).optional(),
   uan:               Joi.string().trim().allow('', null).optional(),
   pan:               Joi.string().trim().allow('', null).optional(),
@@ -433,6 +435,12 @@ router.post('/', roleByName(['Admin']), validate(createBody), async (req, res, n
      */
     const created = await userService.createUser({
       ...req.body,
+      /*
+       * AFTER the spread, deliberately: a request body cannot turn the mandate
+       * off by sending its own enforceHrIdentifiers. (Joi would reject the
+       * unknown key too — this is the belt to that pair of braces.)
+       */
+      enforceHrIdentifiers: true,
       createdBy: req.user?.user_id,
     });
     res.status(201);
@@ -518,7 +526,10 @@ router.patch('/:userId',
       }
 
       const updated = await userService.updateUser(
-        Number(req.params.userId), req.body, req.user?.user_id
+        Number(req.params.userId), req.body, req.user?.user_id,
+        /* The FORM mandates the six personal details; the bulk routes, which
+           call updateUser directly with partial field sets, do not. */
+        { enforceHrIdentifiers: true },
       );
       if (!updated) return modernError(res, 404, 'User not found');
       logger.info('User updated · userId=' + req.params.userId);

@@ -329,6 +329,40 @@ function normaliseDateOfJoining(raw) {
  * POSTED and drive scoping. Newlines are collapsed so a pasted three-line
  * address stores as one value the CRM can render in a table cell.
  */
+/*
+ * DATE OF BIRTH — the admin-side wrapper around the EXISTING rule.
+ *
+ * The real validation (YYYY-MM-DD, a real calendar date, not in the future, at
+ * least MIN_AGE and at most MAX_AGE years ago, all against IST "today") lives
+ * in profile-self.service.js and is reused here rather than restated. Two
+ * copies of an age range is how the employee-facing form and the HR form start
+ * disagreeing about whose birthday is valid.
+ *
+ * The only adaptation is the SHAPE: validateDateOfBirth throws a 400-carrying
+ * error, and everything in this collector returns { ok, value | message }.
+ *
+ * ── WHY HR CAN OVERWRITE A "LOCKED" DOB ──────────────────────────────
+ * On the employee's own profile a date of birth can be set exactly ONCE and is
+ * then locked, because a birth date that changes is either a typo or a fraud.
+ * That lock is not bypassed here — it is RESOLVED here. The lock's escape hatch
+ * has always been "a correction needs HR approval", and this form IS HR. An
+ * admin write is the approval, arriving through a different door.
+ *
+ * The lazy require keeps the two modules acyclic even if profile-self ever
+ * grows a dependency on this one.
+ */
+function normaliseDateOfBirth(raw) {
+  const value = String(raw ?? '').trim();
+  if (!value) return { ok: true, value: null };
+  try {
+    // eslint-disable-next-line global-require
+    const { validateDateOfBirth } = require('./profile-self.service');
+    return { ok: true, value: validateDateOfBirth(value) };
+  } catch (e) {
+    return { ok: false, message: (e && e.message) || 'date_of_birth is not valid' };
+  }
+}
+
 function normaliseAddress(raw) {
   const value = String(raw ?? '').replace(/\s+/g, ' ').trim();
   if (!value) return { ok: true, value: null };
@@ -351,12 +385,61 @@ function normaliseAddress(raw) {
  *   → { ok: false, message }
  */
 const HR_IDENTIFIER_NORMALISERS = Object.freeze({
+  date_of_birth:   normaliseDateOfBirth,
   date_of_joining: normaliseDateOfJoining,
   uan:             normaliseUan,
   pan:             normalisePan,
   aadhaar:         normaliseAadhaar,
   address:         normaliseAddress,
 });
+
+/*
+ * Operator-facing names for the six, so a 400 says "PAN is required" rather
+ * than "pan is required" — the form's label is what the reader is looking at.
+ */
+const HR_IDENTIFIER_LABELS = Object.freeze({
+  date_of_birth:   'Date Of Birth',
+  date_of_joining: 'Date Of Joining',
+  uan:             'UAN',
+  pan:             'PAN',
+  aadhaar:         'Aadhaar',
+  address:         'Address',
+});
+
+/*
+ * Which of the six would be EMPTY once this payload is applied — the check
+ * behind "personal details are mandatory".
+ *
+ * ── IT IS A MERGE, NOT A PAYLOAD CHECK, AND THAT IS THE WHOLE POINT ──
+ * pan and aadhaar are never sent back to the browser except masked, so the Edit
+ * form CANNOT prefill them. If "required" meant "the payload must carry a
+ * value", every edit of a user who already has a PAN would force the operator
+ * to re-type it off a paper form — and the most likely outcome of that is a
+ * typo overwriting a correct number. So a field is satisfied when a value
+ * EXISTS AFTER the save: supplied now, or already stored.
+ *
+ * `stored` is what loadPersonalIdentifiers returns (pan/aadhaar are represented
+ * by their *_last4, which is present exactly when a value is stored). Pass {}
+ * on create, where nothing is stored yet and all six must be supplied.
+ *
+ * An explicitly CLEARED field (null, from the form's Remove control) counts as
+ * missing — clearing a mandatory field is the same as never setting it.
+ */
+function missingHrIdentifiers(supplied, stored = {}) {
+  const storedHas = {
+    date_of_birth:   Boolean(stored.date_of_birth),
+    date_of_joining: Boolean(stored.date_of_joining),
+    uan:             Boolean(stored.uan),
+    address:         Boolean(stored.address),
+    pan:             Boolean(stored.pan_last4),
+    aadhaar:         Boolean(stored.aadhaar_last4),
+  };
+  return Object.keys(HR_IDENTIFIER_LABELS).filter((key) => {
+    const suppliedValue = supplied[key];
+    if (suppliedValue === undefined) return !storedHas[key];  // untouched
+    return !suppliedValue;                                    // '' or null = cleared
+  });
+}
 
 function collectHrIdentifiers(payload) {
   const values = {};
@@ -508,7 +591,7 @@ async function upsertPersonalEmail(userId, personalEmail, runner = pool) {
  * columns — the common case on an Edit submit, and one round trip saved.
  */
 const ENCRYPTED_IDENTIFIERS = Object.freeze({ pan: 'pan_last4', aadhaar: 'aadhaar_last4' });
-const CLEAR_IDENTIFIERS = Object.freeze(['date_of_joining', 'uan', 'address']);
+const CLEAR_IDENTIFIERS = Object.freeze(['date_of_birth', 'date_of_joining', 'uan', 'address']);
 
 async function upsertPersonalIdentifiers(userId, fields, runner = pool) {
   const cols = [];
@@ -576,19 +659,20 @@ const IDENTIFIER_MIGRATION_HINT =
  */
 async function loadPersonalIdentifiers(userId, runner = pool) {
   const empty = {
-    date_of_joining: null, uan: null, address: null,
+    date_of_birth: null, date_of_joining: null, uan: null, address: null,
     pan_last4: null, pan_masked: null, aadhaar_last4: null, aadhaar_masked: null,
   };
   try {
     const [[row]] = await runner.query(
-      `SELECT date_of_joining, uan, address, pan_last4, aadhaar_last4
+      `SELECT date_of_birth, date_of_joining, uan, address, pan_last4, aadhaar_last4
          FROM tbl_user_personal_details WHERE user_id = ? LIMIT 1`,
       [Number(userId)]
     );
     if (!row) return empty;
     return {
-      /* DATE column → 'YYYY-MM-DD'. Sliced from the string rather than passed
+      /* DATE columns → 'YYYY-MM-DD'. Sliced from the string rather than passed
          through Date, which would shift the day across a timezone. */
+      date_of_birth:   row.date_of_birth ? String(row.date_of_birth).slice(0, 10) : null,
       date_of_joining: row.date_of_joining ? String(row.date_of_joining).slice(0, 10) : null,
       uan:             row.uan || null,
       address:         row.address || null,
@@ -998,7 +1082,15 @@ async function createUser({
    * leaves the column unset; passing '' explicitly stores nothing. They are
    * validated by collectHrIdentifiers below, the same call updateUser makes.
    */
-  date_of_joining, uan, pan, aadhaar, address,
+  date_of_birth, date_of_joining, uan, pan, aadhaar, address,
+  /*
+   * OPT-IN, defaulting to FALSE. The single-user Add User route passes true;
+   * every other caller (bulk update, bulk upload, any future importer) keeps
+   * the old behaviour. Defaulting to true would turn "set a role for 200 users"
+   * into "supply six identifiers for 200 users" and break those flows the day
+   * this shipped — the mandate is a rule about the FORM, not about the table.
+   */
+  enforceHrIdentifiers = false,
   createdBy,
   /*
    * Is the ACTING operator allowed to trigger a Microsoft 365 directory write?
@@ -1049,9 +1141,19 @@ async function createUser({
   const personalEmail = normalisePersonalEmail(personal_email, { required: true });
   if (!personalEmail.ok) throw mkErr(400, personalEmail.message);
 
-  const identifiers = collectHrIdentifiers({ date_of_joining, uan, pan, aadhaar, address });
+  const identifiers = collectHrIdentifiers({ date_of_birth, date_of_joining, uan, pan, aadhaar, address });
   if (!identifiers.ok) throw mkErr(400, identifiers.message);
   const hrIdentifiers = identifiers.values;
+
+  if (enforceHrIdentifiers) {
+    /* Nothing is stored yet, so every one of the six must arrive in the payload. */
+    const missing = missingHrIdentifiers(hrIdentifiers, {});
+    if (missing.length) {
+      const names = missing.map((k) => HR_IDENTIFIER_LABELS[k]).join(', ');
+      logger.warn('Create user rejected · missing personal details · ' + missing.join(','));
+      throw mkErr(400, `${names} ${missing.length === 1 ? 'is' : 'are'} required`);
+    }
+  }
 
   // Validate role exists + is admin-group (we don't manage technicians or
   // client-dashboard users here — those have their own lifecycles).
@@ -1425,7 +1527,7 @@ function normaliseForCompare(key, val) {
  *   collect the address.
  */
 async function updateUser(userId, fields, updatedBy, opts = {}) {
-  const { dryRun = false, enforcePersonalEmail = true } = opts;
+  const { dryRun = false, enforcePersonalEmail = true, enforceHrIdentifiers = false } = opts;
   logger.info('Update user · userId=' + userId + ' · dryRun=' + dryRun);
 
   // Load every column we might compare against. The single round-trip
@@ -1477,6 +1579,7 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
    */
   const personalRequired = enforcePersonalEmail
     && isPersonalEmailRequiredOnUpdate(me.user_status, fields.is_active);
+
   const suppliedPersonalEmail = fields.personal_email !== undefined;
   /*
    * HR identifiers, validated BEFORE any column write so a bad PAN rejects the
@@ -1488,6 +1591,31 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
     throw mkErr(400, identifiers.message);
   }
   const hrIdentifiers = identifiers.values;
+
+  /*
+   * PERSONAL DETAILS ARE MANDATORY ON EDIT — with the same two exemptions
+   * personal_email already carries, and for the same reason. An INACTIVE user,
+   * and the edit that DEACTIVATES one, are both excused: offboarding someone
+   * who has already left must never require chasing them for a PAN, and
+   * ~1.2k existing users have none of these six on file today, so a rule
+   * without the exemption would make every one of them unable to be
+   * deactivated at all.
+   *
+   * The check is a MERGE against what is stored (see missingHrIdentifiers), so
+   * an operator editing a user whose PAN is already on file is not asked to
+   * re-type a number the form is not allowed to show them.
+   */
+  if (enforceHrIdentifiers
+      && isPersonalEmailRequiredOnUpdate(me.user_status, fields.is_active)) {
+    const stored = await loadPersonalIdentifiers(userId);
+    const missing = missingHrIdentifiers(hrIdentifiers, stored);
+    if (missing.length) {
+      const names = missing.map((k) => HR_IDENTIFIER_LABELS[k]).join(', ');
+      logger.warn('Update user rejected · missing personal details · userId=' + userId
+        + ' · ' + missing.join(','));
+      throw mkErr(400, `${names} ${missing.length === 1 ? 'is' : 'are'} required`);
+    }
+  }
 
   let personalEmailValue = null;   // the value to write, when we write one
   let writePersonalEmail = false;  // true only when it actually changed
@@ -1634,10 +1762,31 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
   // short-circuited) alongside allowed_stages rather than as a tbl_user column.
   if (suppliedPersonalEmail) suppliedCount++;
 
+  /*
+   * The five HR identifiers are side-table writes too, and they must be counted
+   * on BOTH lines below or they are silently unreachable:
+   *
+   *   - suppliedCount: a PATCH carrying ONLY identifiers — the bulk sheet's
+   *     whole point, an HR run that fills in Date Of Joining and nothing else —
+   *     would otherwise 400 with "No mutable fields supplied" while the
+   *     operator is plainly supplying five fields.
+   *   - the no-op short-circuit: a PATCH whose tbl_user columns all match the
+   *     stored row would otherwise return the __unchanged sentinel and RETURN
+   *     BEFORE upsertPersonalIdentifiers ever runs — the identifiers dropped on
+   *     the floor and reported to the operator as a successful "unchanged".
+   *     That is silent data loss, the worst of the two.
+   *
+   * Presence, not a diff, for the same reason the write below is payload-keyed:
+   * pan/aadhaar re-encrypt to different ciphertext every time, so there is no
+   * cheap comparison that would not report a change on every save.
+   */
+  const hasHrIdentifiers = Object.keys(hrIdentifiers).length > 0;
+  if (hasHrIdentifiers) suppliedCount++;
+
   // Distinguish "operator sent nothing" (real 400) from "operator sent
   // values that all match" (no-op, return unchanged sentinel).
   if (suppliedCount === 0) throw mkErr(400, 'No mutable fields supplied');
-  if (!sets.length && !hasAllowedStages && !writePersonalEmail) {
+  if (!sets.length && !hasAllowedStages && !writePersonalEmail && !hasHrIdentifiers) {
     logger.info('Update user no-op · userId=' + userId + ' · all supplied values match');
     const row = await getUserById(userId);
     if (row) row.__unchanged = true;
@@ -1990,8 +2139,11 @@ module.exports = {
   normaliseUan,
   normalisePan,
   normaliseAadhaar,
+  normaliseDateOfBirth,
   normaliseDateOfJoining,
   normaliseAddress,
+  missingHrIdentifiers,
+  HR_IDENTIFIER_LABELS,
   upsertPersonalIdentifiers,
   loadPersonalIdentifiers,
   loadPersonalEmail,
