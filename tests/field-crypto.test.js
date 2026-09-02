@@ -237,7 +237,26 @@ test('isEncrypted recognises the envelope and nothing else', () => {
     // Fingerprint fields that are not 8 lowercase hex are not fingerprints.
     `v2:ZZZZZZZZ:${parts(real).slice(2).join(':')}`,
     `v2:abc:${parts(real).slice(2).join(':')}`,
-    `v2:${parts(real)[1].toUpperCase()}:${parts(real).slice(2).join(':')}`,
+    /*
+     * The uppercase case is a LITERAL, not `parts(real)[1].toUpperCase()`.
+     *
+     * The fingerprint is sha256(key) sliced to 8 hex chars, and KEY above is
+     * fresh random bytes per process — so ~2.3% of runs draw a fingerprint made
+     * entirely of decimal digits, where .toUpperCase() is the identity and the
+     * "negative" fixture is the real envelope verbatim. isEncrypted then answers
+     * true, correctly, and the assertion fails with the whole sealed envelope in
+     * the message — the flake that looked like a length or load problem.
+     *
+     * MEASURED: 4714/200000 random 32-byte keys (2.357%) yield a letter-free
+     * fingerprint, against (10/16)^8 = 2.328% predicted; driving this exact
+     * fixture over 5000 fresh keys failed 128 times (2.560%) with the derived
+     * form and 0 times with the literal below.
+     *
+     * Only the op-fingerprint slot differs from a real envelope, so the property
+     * under test — FP_FIELD is lowercase-only hex — is unchanged, and now it is
+     * actually exercised on every key instead of 97.7% of them.
+     */
+    `v2:DEADBEEF:${parts(real).slice(2).join(':')}`,
     // Nine fields — one short. The pre-addendum shape, with a single
     // fingerprint. It cannot be read: there is no way to know which recovery
     // key its sealed DEK belongs to, which is exactly why the field was added.
