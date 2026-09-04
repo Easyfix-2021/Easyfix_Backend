@@ -89,6 +89,15 @@ const SCHEMA_NEGATIVE_TTL_MS = 60 * 1000;
 const LMS_FLAG_COLUMNS = Object.freeze([
   ['courses', 'is_mandatory'],
   ['training_videos', 'is_global'],
+  /*
+   * Added 2026-09-04 with the column itself. The code and the migration ship
+   * separately here, and either order is possible — so an UNGUARDED read of a
+   * brand-new column is a self-inflicted outage on whichever environment
+   * deploys first: the assessments list 500s on "Unknown column", and, worse,
+   * createAssessment's INSERT names it, so nobody can make an assessment at all
+   * until someone runs the SQL.
+   */
+  ['lms_assessment', 'created_by'],
 ]);
 
 let _flagCache = null;
@@ -102,7 +111,7 @@ async function lmsFlagColumns() {
 
   // One round trip for both, not one per column: this sits in front of the
   // course list and the technician's training screen.
-  const value = { courseMandatory: true, videoGlobal: true };
+  const value = { courseMandatory: true, videoGlobal: true, assessmentCreatedBy: true };
   try {
     const [rows] = await pool.query(
       `SELECT table_name AS t, column_name AS c
@@ -117,6 +126,7 @@ async function lmsFlagColumns() {
     const present = new Set(rows.map((r) => `${r.t}.${r.c}`.toLowerCase()));
     value.courseMandatory = present.has('courses.is_mandatory');
     value.videoGlobal = present.has('training_videos.is_global');
+    value.assessmentCreatedBy = present.has('lms_assessment.created_by');
     const missing = LMS_FLAG_COLUMNS
       .filter(([t, c]) => !present.has(`${t}.${c}`))
       .map(([t, c]) => `${t}.${c}`);
@@ -2167,10 +2177,21 @@ async function listAssessments({ q, limit = 200, offset = 0 } = {}) {
   }
   const whereSql = where.join(' AND ');
 
+  /* Probed, not assumed — see LMS_FLAG_COLUMNS. Absent, the row still carries
+   * both keys as null, so the CRM renders its em dash rather than crashing on
+   * an undefined field. */
+  const { assessmentCreatedBy } = await lmsFlagColumns();
+  const creatorSelect = assessmentCreatedBy
+    ? 'a.created_by, cb.user_name AS created_by_name,'
+    : 'NULL AS created_by, NULL AS created_by_name,';
+  const creatorJoin = assessmentCreatedBy
+    ? 'LEFT JOIN tbl_user cb ON cb.user_id = a.created_by'
+    : '';
+
   const [rows] = await pool.query(
     `SELECT a.id, a.title, a.description, a.pass_percent, a.max_attempts, a.status,
             a.created_at, a.updated_at,
-            a.created_by, cb.user_name AS created_by_name,
+            ${creatorSelect}
             (SELECT COUNT(*) FROM lms_question q
               WHERE q.assessment_id = a.id AND q.status = 1) AS question_count,
             (SELECT COUNT(*) FROM lms_content lc
@@ -2180,7 +2201,7 @@ async function listAssessments({ q, limit = 200, offset = 0 } = {}) {
         * created_by NULL, and an INNER join would hide the entire back
         * catalogue from the list the moment this column was added. The same
         * applies to a since-deleted operator. */
-       LEFT JOIN tbl_user cb ON cb.user_id = a.created_by
+       ${creatorJoin}
       WHERE ${whereSql}
       ORDER BY a.id DESC
       LIMIT ? OFFSET ?`,
@@ -2243,8 +2264,8 @@ async function withImageUrls(questions, { dropKey = false } = {}) {
 async function getAssessmentForAdmin(id) {
   const aid = Number(id);
   const [[assessment]] = await pool.query(
-    `SELECT id, title, description, pass_percent, max_attempts, status, created_at, updated_at,
-            created_by
+    `SELECT id, title, description, pass_percent, max_attempts, status, created_at, updated_at
+            ${(await lmsFlagColumns()).assessmentCreatedBy ? ', created_by' : ''}
        FROM lms_assessment WHERE id = ?`,
     [aid],
   );
@@ -2298,8 +2319,12 @@ async function createAssessment({ title, description = null, pass_percent, max_a
    * when the operator does not state them, rather than being defaulted here.
    * One place holds the number, and it is the one the migration documents.
    */
-  const cols = ['title', 'description', 'status', 'created_at', 'updated_at', 'created_by'];
-  const vals = [String(title).trim(), description || null, 1, now, now, createdBy];
+  const cols = ['title', 'description', 'status', 'created_at', 'updated_at'];
+  const vals = [String(title).trim(), description || null, 1, now, now];
+  /* Guarded like the reads, and this one is the outage: an INSERT that names a
+   * column the schema does not have fails, so shipping this ahead of the
+   * migration would stop anyone creating an assessment at all. */
+  if ((await lmsFlagColumns()).assessmentCreatedBy) { cols.push('created_by'); vals.push(createdBy); }
   if (pass_percent !== undefined) { cols.push('pass_percent'); vals.push(Number(pass_percent)); }
   if (max_attempts !== undefined) { cols.push('max_attempts'); vals.push(Number(max_attempts)); }
 
