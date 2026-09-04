@@ -155,7 +155,7 @@ router.get('/bulk-lookups', async (req, res, next) => {
  *   D Reporting Manager      E Manage Vertical(s)    F Manage Client(s)
  *   G Manage State(s)        H Manage Cities         I Home City
  *   J Date Of Joining        K UAN                   L PAN
- *   M Aadhaar                N Address
+ *   M Aadhaar                N Address               O Date Of Birth
  *
  * Cell validations (rows 2..1000):
  *   - Multi-select columns (E/F/G/H): list source from a hidden sheet,
@@ -170,7 +170,8 @@ router.get('/bulk-lookups', async (req, res, next) => {
  * user's current scope CSVs so operators don't start from scratch.
  *
  * ADMIN-ONLY, matching the POST sibling. This was a scope-only sheet the whole
- * admin group could read; it now pre-fills Date Of Joining, UAN and Address, and
+ * admin group could read; it now pre-fills Date Of Birth, Date Of Joining, UAN
+ * and Address, and
  * `userIds` is uncapped — so without the guard any of the ten admin-group roles
  * could pull the HR identifiers of every internal user as one .xlsx. Same line
  * routes/admin/users.js draws with `includeIdentifiers: isAdminRole(req)`, and
@@ -192,6 +193,12 @@ router.get('/bulk-upload-template', roleByName(['Admin']), async (req, res, next
       // below reads cells positionally, so shifting an existing column would
       // silently re-point every operator's saved copy of the old template.
       'Date Of Joining', 'UAN', 'PAN', 'Aadhaar', 'Address',
+      // Date Of Birth arrived after the other five (2026-09-04) and so sits at
+      // the END rather than beside Date Of Joining where it reads better. Same
+      // rule as the block above: the parser addresses cells by INDEX, so
+      // inserting it at J would re-point every saved copy of the old template —
+      // an operator's UAN column would silently land in date_of_joining.
+      'Date Of Birth',
     ];
     ws.addRow(headers);
     ws.getRow(1).font = { bold: true };
@@ -238,7 +245,7 @@ router.get('/bulk-upload-template', roleByName(['Admin']), async (req, res, next
       let hrById = new Map();
       try {
         const [hrRows] = await pool.query(
-          `SELECT user_id, date_of_joining, uan, address
+          `SELECT user_id, date_of_birth, date_of_joining, uan, address
              FROM tbl_user_personal_details
             WHERE user_id IN (${placeholders})`,
           userIds,
@@ -311,6 +318,10 @@ router.get('/bulk-upload-template', roleByName(['Admin']), async (req, res, next
            */
           '', '',
           hr.address || '',
+          // Column O. Same slice guard as Date Of Joining above: a host without
+          // dateStrings:true hands DATE back with a time part the YYYY-MM-DD
+          // validator rejects on re-upload.
+          String(hr.date_of_birth || '').slice(0, 10),
         ]);
       }
     }
@@ -412,8 +423,8 @@ router.get('/bulk-upload-template', roleByName(['Admin']), async (req, res, next
       // rows by NUMBER, so inserting these anywhere above would silently move
       // the emphasis onto the wrong lines.
       [''],
-      ['HR Details (Date Of Joining, UAN, PAN, Aadhaar, Address):'],
-      ['  · Free text — no dropdown. Date Of Joining must be YYYY-MM-DD (or a real Excel date cell).'],
+      ['HR Details (Date Of Joining, UAN, PAN, Aadhaar, Address, Date Of Birth):'],
+      ['  · Free text — no dropdown. Date Of Joining and Date Of Birth must be YYYY-MM-DD (or real Excel date cells).'],
       ['  · UAN is 12 digits. PAN is ABCDE1234F. Aadhaar is 12 digits not starting with 0 or 1 (spaces and hyphens are fine).'],
       ['  · PAN and Aadhaar are stored encrypted, so a pre-filled template leaves those two cells BLANK even when a value exists.'],
       ['  · A blank cell NEVER clears a value — it means "leave unchanged". Use Edit User to remove one.'],
@@ -891,6 +902,9 @@ router.post('/bulk-upload',
         const pan     = String(cells(12) ?? '').trim();
         const aadhaar = String(cells(13) ?? '').trim();
         const address = String(cells(14) ?? '').trim();
+        // Column O — appended, so its index is one past Address.
+        const dob     = toYmd(cells(15));
+        if (dob)     fields.date_of_birth   = dob;
         if (doj)     fields.date_of_joining = doj;
         if (uan)     fields.uan             = uan;
         if (pan)     fields.pan             = pan;

@@ -79,9 +79,18 @@ const fake = installFakePool([
    * tbl_user route placed above these would swallow them.
    */
   [/INSERT INTO tbl_user_personal_details/i, () => ({ affectedRows: 1 })],
-  // The template's identifier read, matched on its projection so it is
-  // distinguishable from loadPersonalEmail's read of the same table.
-  [/SELECT user_id, date_of_joining, uan, address/i, () => {
+  /*
+   * The template's identifier read. Matched on the PRESENCE of date_of_joining
+   * rather than on the exact projection string, so it stays distinguishable
+   * from loadPersonalEmail's read of the same table without breaking every
+   * time a column is added.
+   *
+   * It broke exactly that way when Date Of Birth was added (2026-09-04): the
+   * literal regex stopped matching, this route fell through to the `=> []`
+   * below, and the failure surfaced as "Date Of Joining pre-fills: '' !==
+   * '2021-07-19'" — a fixture problem wearing the costume of a product bug.
+   */
+  [/SELECT user_id,[\s\S]*?date_of_joining[\s\S]*?FROM tbl_user_personal_details/i, () => {
     if (scenario.hrError) throw scenario.hrError;
     return scenario.hrRows;
   }],
@@ -129,6 +138,10 @@ const HEADERS = [
   'Manage Vertical(s)', 'Manage Client(s)', 'Manage State(s)',
   'Manage Cities', 'Home City',
   'Date Of Joining', 'UAN', 'PAN', 'Aadhaar', 'Address',
+  // Appended, never inserted — the parser reads cells by index, so a new
+  // column has to go last or every saved copy of the old template silently
+  // re-points (UAN into date_of_joining, PAN into uan, and so on).
+  'Date Of Birth',
 ];
 
 /* A data row with only user ID filled; callers set the cells they care about. */
@@ -414,7 +427,7 @@ test('identifiers still write when every tbl_user column in the row already matc
  *     normalisePan, so an untouched re-upload would either fail the row or
  *     overwrite a real ID with asterisks.
  */
-test('the template carries the five new headers and never the two protected values', async () => {
+test('the template carries the six HR headers and never the two protected values', async () => {
   scenario.templateRows = [{
     user_id: 501, user_name: 'Asha R', role_name: 'Admin',
     reporting_manager_name: 'Manager One',
@@ -425,6 +438,7 @@ test('the template carries the five new headers and never the two protected valu
   scenario.hrRows = [{
     user_id: 501, date_of_joining: '2021-07-19',
     uan: '123456789012', address: 'Flat 4, Nerul',
+    date_of_birth: '1990-03-14',
   }];
 
   const res = await fetch(`${baseUrl}/users/bulk-upload-template?userIds=501`);
@@ -443,6 +457,7 @@ test('the template carries the five new headers and never the two protected valu
   assert.equal(r.getCell(10).value, '2021-07-19', 'Date Of Joining pre-fills');
   assert.equal(r.getCell(11).value, '123456789012', 'UAN pre-fills');
   assert.equal(r.getCell(14).value, 'Flat 4, Nerul', 'Address pre-fills');
+  assert.equal(r.getCell(15).value, '1990-03-14', 'Date Of Birth pre-fills in column O');
   for (const [col, label] of [[12, 'PAN'], [13, 'Aadhaar']]) {
     const v = r.getCell(col).value;
     assert.ok(v === null || v === '',
@@ -501,6 +516,7 @@ test('a non-Admin admin-group role cannot download the template at all', async (
   scenario.hrRows = [{
     user_id: 501, date_of_joining: '2021-07-19',
     uan: '123456789012', address: 'Flat 4, Nerul',
+    date_of_birth: '1990-03-14',
   }];
 
   const res = await fetch(`${baseUrl}/users/bulk-upload-template?userIds=501`);
@@ -511,4 +527,64 @@ test('a non-Admin admin-group role cannot download the template at all', async (
     fake.calls.filter((c) => /date_of_joining/i.test(c.sql)).length, 0,
     'the identifier query must never run for a role that cannot have the answer',
   );
+});
+
+// ── 7. Date Of Birth (column O) ──────────────────────────────────────
+/*
+ * DOB arrived after the other five (2026-09-04) and so sits at the END of the
+ * sheet rather than beside Date Of Joining, where it would read better. That
+ * is deliberate: the parser addresses cells by INDEX, so inserting it at J
+ * would silently re-point every saved copy of the old template — an operator's
+ * UAN column would land in date_of_joining and their PAN in uan, with no error
+ * anywhere. These tests pin the POSITION as much as the parsing.
+ */
+
+test('Date Of Birth in column O is parsed and written', async () => {
+  const row = blankRow(501);
+  row[14] = '1990-03-14';           // column O — one past Address
+
+  const res = await postSheet(await xlsxBuffer([row]), 'users.xlsx');
+  assert.equal(res.status, 200, res.why());
+  assert.equal(res.body.data.results[0].status, 'updated', res.why());
+
+  const writes = identifierWrites();
+  assert.equal(writes.length, 1, 'expected exactly one identifier upsert');
+  assert.equal(writes[0].date_of_birth, '1990-03-14');
+});
+
+test('a blank Date Of Birth cell leaves the column alone', async () => {
+  // Home City changes so the row is genuinely written — otherwise this would
+  // pass for the unrelated reason that nothing was updated at all.
+  const row = blankRow(501);
+  row[8] = 'Mumbai';
+
+  const res = await postSheet(await xlsxBuffer([row]), 'users.xlsx');
+  assert.equal(res.status, 200, res.why());
+  assert.equal(res.body.data.results[0].status, 'updated', res.why());
+
+  for (const w of identifierWrites()) {
+    assert.ok(
+      !('date_of_birth' in w),
+      'a blank cell must mean "leave unchanged" — this sheet cannot express a clear',
+    );
+  }
+});
+
+test('DOB does not disturb the five columns before it', async () => {
+  // The regression that matters if anyone ever inserts rather than appends:
+  // every earlier column must still land in its own field with DOB present.
+  const row = blankRow(501);
+  row[9]  = '2021-07-19';
+  row[10] = 123456789012;
+  row[13] = 'Flat 4, Nerul';
+  row[14] = '1990-03-14';
+
+  const res = await postSheet(await xlsxBuffer([row]), 'users.xlsx');
+  assert.equal(res.status, 200, res.why());
+
+  const w = identifierWrites()[0];
+  assert.equal(w.date_of_joining, '2021-07-19', 'column J must not shift');
+  assert.equal(w.uan, '123456789012', 'column K must not shift');
+  assert.equal(w.address, 'Flat 4, Nerul', 'column N must not shift');
+  assert.equal(w.date_of_birth, '1990-03-14');
 });
