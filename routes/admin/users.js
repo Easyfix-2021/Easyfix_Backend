@@ -387,6 +387,22 @@ router.get('/:userId', validate(idParam, 'params'), async (req, res, next) => {
     const row = await userService.getUserById(Number(req.params.userId),
       { includeIdentifiers: isAdminRole(req) });
     if (!row) return modernError(res, 404, 'User not found');
+    /*
+     * personal_email is stripped for every role but Admin, because the LIST
+     * route one screen away already refuses it to exactly those roles
+     * (includePersonalEmail: isAdminRole above). Without this the same nine
+     * roles could read the same addresses one user at a time — the list would
+     * be enforcing a rule the detail route hands out, which is not a policy,
+     * it is a rate limit.
+     *
+     * STRIPPED HERE, AT THE TRANSPORT LAYER, and not inside getUserById. Five
+     * server-side callers depend on that function returning personal_email —
+     * most sharply the update route below, which reads target.personal_email
+     * to decide whether the address is mandatory for this edit. Gating it in
+     * the service would silently switch that rule off, and the symptom would
+     * read as "the form stopped asking" rather than as a permissions change.
+     */
+    if (!isAdminRole(req)) delete row.personal_email;
     modernOk(res, row);
   } catch (e) { next(e); }
 });
