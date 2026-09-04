@@ -53,7 +53,10 @@ jobs:
         with: { fetch-depth: 0 }
       - uses: actions/setup-node@v4
         with: { node-version: 20, cache: 'npm' }
-      - run: npm ci
+      # Same flags as deploy.yml's precheck, for the same measured reason: a
+      # warm cache was restored and then ignored while npm blocked on registry
+      # revalidation for 363s. See that file's precheck comment.
+      - run: npm ci --prefer-offline --no-audit --fund=false
       - name: Build check (syntax-check all files)
         run: npm run build
       - name: Lint (no-undef — the copy-paste-across-handlers guard)

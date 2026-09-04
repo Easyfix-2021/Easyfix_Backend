@@ -73,10 +73,16 @@ jobs:
     # watching for `status: completed` reads that as a successful deploy, which
     # is how QA sat on a stale SHA earlier the same day.
     #
-    # 15 is not the real fix: 301 locked packages should install in well under a
-    # minute, and `setup-node` finishing in 5s points at an npm cache miss
-    # forcing a cold download every run. This buys headroom so a slow registry
-    # cannot cancel a healthy deploy; the install itself still wants looking at.
+    # 15 is NOT the fix, and the cache theory that first sat here was wrong.
+    # Attempt-1 logs for BOTH failures show `Cache hit` on the same key,
+    # restored in under a second, then npm printing its deprecation warnings
+    # and emitting ZERO output for exactly 363 seconds until the job ceiling
+    # killed it. Identical signature twice.
+    #
+    # 363s is the CEILING doing the killing, not npm giving up: npm sets no
+    # timeout on registry requests, so it would have hung indefinitely. Raising
+    # this number therefore only buys a longer wait before the same kill — the
+    # `npm ci` flags below are what remove the request that hangs.
     timeout-minutes: 15
     steps:
       # FULL history — see ci.yml for why. `npm test` below runs the
@@ -86,7 +92,13 @@ jobs:
         with: { fetch-depth: 0 }
       - uses: actions/setup-node@v4
         with: { node-version: 20, cache: 'npm' }
-      - run: npm ci
+      # --prefer-offline: the cache above is restored warm, so USE it instead of
+      #   revalidating every packument against the registry. That revalidation
+      #   is the request observed hanging silently for 363s (twice, 2026-09-04),
+      #   which made a restored cache worth nothing.
+      # --no-audit / --fund=false: two further registry round trips that a
+      #   deploy has no use for. Neither changes what gets installed.
+      - run: npm ci --prefer-offline --no-audit --fund=false
       - name: Syntax check
         run: |
           node --check server.js                          || node --check server/index.js
