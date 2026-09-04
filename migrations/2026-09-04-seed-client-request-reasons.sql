@@ -29,27 +29,43 @@
 -- EXACTLY — resolution is by description, so a wording change here without the
 -- matching change there silently turns the feature off.
 --
--- ⚠ is_new = 0, AND THE OBVIOUS VALUE IS THE DANGEROUS ONE.
+-- ⚠ is_new = 0, AND IT HAS TO BE SET AT ALL.
 --
--- is_new is NOT NULL with no default on this table (the first run of this file
--- failed with "Field 'is_new' doesn't have a default value"), so it must be set.
--- Semantically these are new curated rows, which argues for 1. Do not.
+-- is_new is NOT NULL with no default on this table, so omitting it fails the
+-- whole statement: the first run of this file died with "Field 'is_new' doesn't
+-- have a default value". `npm run check:migrations` now catches that class
+-- before a migration is ever run.
+--
+-- Semantically these are new curated rows, which argues for 1. The reason to
+-- prefer 0 is below, and it is narrower than it first appeared.
 --
 -- GET /api/admin/jobs/cancel-reasons filters `is_new = MAX(is_new)` per
 -- (action_type, user_type) — "curated-else-legacy": show the curated set when a
--- bucket has one, else fall back to the migrated legacy rows. action_type 1 +
--- user_type 3 is the operator's "Cancellation Due To -> Client" dropdown. If
--- that bucket currently holds only legacy is_new = 0 rows, inserting a 1 flips
--- the MAX and the dropdown collapses to THIS ROW ALONE, hiding every existing
--- client-cancellation reason from ops. Nothing would report it; the list would
--- just be one item long.
+-- bucket has one, else fall back to the migrated legacy rows.
 --
--- 0 is safe in both directions. If the bucket is legacy, these sit alongside it
--- and ops can pick them, which is reasonable — a job cancelled because the
--- client asked is exactly this reason. If the bucket already has curated rows,
--- these are simply not offered in the dropdown, which costs nothing: the code
--- path that matters resolves them by (action_type, user_type, action_desc) and
--- does NOT filter is_new.
+-- ⚠ AN EARLIER VERSION OF THIS COMMENT OVERSTATED THE RISK, and the correction
+-- matters more than the original claim. It said a 1 would flip MAX and collapse
+-- the operator's "Cancellation Due To -> Client" dropdown to this row alone.
+-- Checked against the database after the seed ran, that is NOT what would have
+-- happened: action_type 1 + user_type 3 already holds 6 live rows, 4 of them
+-- curated, so MAX(is_new) was ALREADY 1 and a 1 here would have changed nothing
+-- about visibility. The collapse scenario is real for a bucket that is entirely
+-- legacy; these two buckets are not that.
+--
+-- So 0 is kept for the plainer reason: it keeps these BOOKKEEPING rows out of a
+-- dropdown ops never needs to pick them from. Both buckets have MAX(is_new) = 1
+-- (cancel 4 curated of 6, unreachable 4 of 5), so at is_new = 0 these are not
+-- offered to an operator at all — which costs nothing, because the path that
+-- matters resolves them by (action_type, user_type, action_desc) and does NOT
+-- filter is_new. Verified live: ids 318 and 319 resolve.
+--
+-- ⚠ OPEN QUESTION, deliberately not decided here. Because these are hidden,
+-- an operator cancelling a job BECAUSE the client asked cannot pick
+-- "Cancellation requested by client" as the cancel reason — they will pick
+-- something else. If ops wants that reason selectable, flip the cancel row (and
+-- only that one) to is_new = 1 with an UPDATE: it is safe in this bucket, for
+-- the reason above. The retry row should stay hidden either way — "client asked
+-- to retry" is not an Un Reachable outcome and would be noise in that dropdown.
 --
 -- Columns set: action_type, action_desc, user_type, status(=1 active), is_new.
 -- id is AUTO_INCREMENT and deliberately NOT hardcoded anywhere: it differs per
