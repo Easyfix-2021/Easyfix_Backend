@@ -563,8 +563,8 @@ async function menuVisibility() {
  * active rows; at ~60 bytes per row that's <300 KB, well within a cacheable
  * single lookup response. Search by name / mobile / email for typeahead.
  */
-async function easyfixers({ q, limit = 5000, includeInactive = false } = {}) {
-  logger.info(`Lookup easyfixers · q=${q ?? '—'} · limit=${limit} · includeInactive=${includeInactive}`);
+async function easyfixers({ q, limit = 5000, includeInactive = false, categoryId } = {}) {
+  logger.info(`Lookup easyfixers · q=${q ?? '—'} · limit=${limit} · includeInactive=${includeInactive} · categoryId=${categoryId ?? '—'}`);
   const clauses = [];
   const params = [];
   if (!includeInactive) clauses.push('e.efr_status = 1');
@@ -574,6 +574,45 @@ async function easyfixers({ q, limit = 5000, includeInactive = false } = {}) {
     const like = `%${q}%`;
     params.push(like, like, like);
   }
+
+  /*
+   * Category filter — SERVER-side, because the category is not on the wire.
+   * The projection below is deliberately compact (a picker needs a name and a
+   * city), so a caller cannot narrow by category in the browser however much it
+   * would like to: the fact is simply not there to filter on.
+   *
+   * The predicate is COPIED from candidate-ranking.service.js, the component
+   * that already has to answer "who can work this category" and has been
+   * answering it in production. Two parts matter beyond the join:
+   *   is_repairing = 1  a mapping records what a technician can REPAIR; without
+   *                     it the list includes people who merely install in that
+   *                     category.
+   *   the NOT EXISTS    a deep skill Ops retired (status 0) must stop
+   *                     qualifying its holders, or training keeps being
+   *                     assigned for work the business has withdrawn.
+   * EXISTS, not a JOIN: the mapping is many-per-technician, and a JOIN would
+   * list someone with four deep skills in one category four times.
+   */
+  /* The route hands `req.query` straight through with no schema, so a junk
+   * value must be IGNORED rather than bound: Number('abc') is NaN, which mysql2
+   * binds as NULL and would silently return zero technicians — a filter that
+   * looks like "nobody has this skill" instead of "that was not a category". */
+  const categoryFilter = Number(categoryId);
+  if (Number.isInteger(categoryFilter) && categoryFilter > 0) {
+    clauses.push(`EXISTS (
+      SELECT 1
+        FROM tbl_efr_deepskill_mapping m
+       WHERE m.easyfixer_id = e.efr_id
+         AND m.is_repairing = 1
+         AND m.category_id = ?
+         AND NOT EXISTS (
+           SELECT 1 FROM tbl_deep_skill ds
+            WHERE ds.deepskill_id = m.parent_skill_id AND ds.status = 0
+         )
+    )`);
+    params.push(categoryFilter);
+  }
+
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   params.push(Number(limit));
   const [rows] = await pool.query(

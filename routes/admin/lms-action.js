@@ -353,17 +353,45 @@ router.post('/chase/nudge', requireLmsAction, validate(chaseBody), async (req, r
     for (let i = 0; i < eligible.length; i += 50) {
       const slice = eligible.slice(i, i + 50);
       const recipients = await pushDelivery.resolveTokensForEfrs(slice.map((t) => t.efr_id));
+      /*
+       * PRUNE, unlike the notice broadcast this option block was copied from.
+       * `prune:false` is deliberate for notice — a broadcast should not reap
+       * tokens on someone else's behalf — but a chase is a TARGETED per-tech
+       * send, exactly like the job-offer and training-reminder senders, and
+       * those take the default true. Without it an UNREGISTERED token is left
+       * on the row, so the same technician is targeted again tomorrow, fails
+       * again, and can never be reached until they happen to reinstall: the
+       * "notification is not working" report with no end state.
+       */
       const out = await pushDelivery.deliver(recipients, message, {
-        concurrency: 10, prune: false, channel: 'lms-chase', unit: 'recipients',
+        concurrency: 10, channel: 'lms-chase', unit: 'recipients',
         label: 'lms-chase · batch=' + batchId,
       });
       delivered += out.deliveredCount || 0;
-      const reached = new Set(recipients.map((r) => Number(r.efrId)));
+
+      /*
+       * THREE outcomes, because there are three things that can happen — and
+       * until now the middle one was recorded as the first.
+       *
+       * `hadToken` used to be the whole test, so a technician FCM REJECTED was
+       * logged 'sent' exactly like one it accepted. That is not only a lie in
+       * the audit trail: withinCooldown and chaseSummaryFor both filter
+       * `outcome IN ('sent','noted','queued')`, so the false success then
+       * SUPPRESSED the retry that would have worked, and advanceHandoff moved
+       * the field-view status on for a push nobody received. 'failed' was
+       * already declared in OUTCOMES with nothing writing it.
+       */
+      const hadToken = new Set(recipients.map((r) => Number(r.efrId)));
+      const gotIt = out.deliveredEfrIds ?? new Set();
       for (const t of slice) {
+        const efrId = Number(t.efr_id);
+        const outcome = gotIt.has(efrId) ? 'sent' : hadToken.has(efrId) ? 'failed' : 'skipped';
         entries.push(baseEntry(req, t, batchId, {
           channel: chase.CHANNEL_NUDGE,
-          outcome: reached.has(Number(t.efr_id)) ? 'sent' : 'skipped',
-          outcomeDetail: reached.has(Number(t.efr_id)) ? null : 'no device token',
+          outcome,
+          outcomeDetail: outcome === 'sent' ? null
+            : outcome === 'failed' ? 'push rejected by FCM'
+              : 'no device token',
         }));
       }
     }

@@ -2237,7 +2237,8 @@ async function withImageUrls(questions, { dropKey = false } = {}) {
 async function getAssessmentForAdmin(id) {
   const aid = Number(id);
   const [[assessment]] = await pool.query(
-    `SELECT id, title, description, pass_percent, max_attempts, status, created_at, updated_at
+    `SELECT id, title, description, pass_percent, max_attempts, status, created_at, updated_at,
+            created_by
        FROM lms_assessment WHERE id = ?`,
     [aid],
   );
@@ -2284,15 +2285,15 @@ async function getAssessmentForAdmin(id) {
   return { ...assessment, questions };
 }
 
-async function createAssessment({ title, description = null, pass_percent, max_attempts }) {
+async function createAssessment({ title, description = null, pass_percent, max_attempts, createdBy = null }) {
   const now = new Date();
   /*
    * pass_percent and max_attempts fall through to the COLUMN DEFAULTS (70 / 3)
    * when the operator does not state them, rather than being defaulted here.
    * One place holds the number, and it is the one the migration documents.
    */
-  const cols = ['title', 'description', 'status', 'created_at', 'updated_at'];
-  const vals = [String(title).trim(), description || null, 1, now, now];
+  const cols = ['title', 'description', 'status', 'created_at', 'updated_at', 'created_by'];
+  const vals = [String(title).trim(), description || null, 1, now, now, createdBy];
   if (pass_percent !== undefined) { cols.push('pass_percent'); vals.push(Number(pass_percent)); }
   if (max_attempts !== undefined) { cols.push('max_attempts'); vals.push(Number(max_attempts)); }
 

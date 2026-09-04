@@ -638,7 +638,9 @@ router.get('/assessments/:id', requireLmsManage, validate(idParam, 'params'), as
 
 router.post('/assessments', requireLmsManage, validate(createAssessmentBody), async (req, res, next) => {
   try {
-    const created = await svc.createAssessment(req.body);
+    // Same source as the document upload's createdBy one route file over:
+    // the acting operator's tbl_user id, or NULL when the token carries none.
+    const created = await svc.createAssessment({ ...req.body, createdBy: req.user?.user_id ?? null });
     res.status(201);
     modernOk(res, created);
   } catch (e) { next(e); }

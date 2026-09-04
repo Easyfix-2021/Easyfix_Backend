@@ -1,0 +1,34 @@
+-- ─────────────────────────────────────────────────────────────────────
+-- 2026-09-04 — lms_assessment.created_by
+--
+-- lms_assessment was created by 2026-08-26-lms-content-types-and-assessments
+-- with eight columns and no author. Its sibling lms_document, defined twenty
+-- lines earlier in that same file, has carried `created_by INT NULL` from the
+-- start — so this is not a new convention, it is the one column of the pair
+-- that was missed.
+--
+-- ── SHAPE: copied, not chosen ────────────────────────────────────────
+-- `INT NULL`, no foreign key, exactly as lms_document has it. The value comes
+-- from `req.user?.user_id`, which is a tbl_user id, and tbl_user lives in the
+-- shared easyfix_core schema that five legacy services also read — a
+-- cross-schema FK is the reason none of the sibling audit columns declare one.
+-- Matching lms_document matters more than tightening it here would: two
+-- adjacent tables answering "who made this" two different ways is a worse
+-- outcome than a missing constraint.
+--
+-- ── EXISTING ROWS STAY NULL, DELIBERATELY ────────────────────────────
+-- Every assessment made before today has no recorded author, and there is no
+-- second source that knows: there is no per-row audit trail for this table and
+-- created_at alone cannot name a person. Backfilling to any particular user id
+-- would not recover the fact, it would INVENT one — and an invented audit value
+-- is indistinguishable from a real one the moment it is written. NULL says
+-- "unknown", which is the truth, and the column is nullable for exactly that
+-- reason rather than for convenience.
+--
+-- Nothing reads the column as mandatory: the admin detail read projects it and
+-- renders whatever is there, so a NULL row shows an empty author and behaves
+-- as it did yesterday.
+--
+-- Reversible: ALTER TABLE lms_assessment DROP COLUMN created_by;
+
+ALTER TABLE lms_assessment ADD COLUMN created_by INT NULL AFTER updated_at;

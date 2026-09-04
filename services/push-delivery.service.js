@@ -201,7 +201,12 @@ async function pruneDeadToken(efrId, token, channel = 'push') {
  *     channel     : label for the prune log line.
  *     label/unit  : when label is set, emit one `logger.push(`${label} · d/n ${unit}`)`
  *                   summary — mirrors each caller's existing delivery log line.
- * Returns { delivered, deliveredCount, tokenCount }. Never throws.
+ * Returns { delivered, deliveredCount, tokenCount, deliveredEfrIds }. Never throws.
+ *
+ * `deliveredEfrIds` is a Set of the technicians FCM actually accepted at least
+ * one token for. The counts alone cannot answer "did THIS technician get it",
+ * and a caller that logs per-recipient outcomes had no choice but to guess from
+ * whether a token existed — which records an FCM rejection as a success.
  */
 async function deliver(recipients, message, opts = {}) {
   const { concurrency = Infinity, prune = true, channel = 'push', label, unit = 'devices' } = opts;
@@ -218,6 +223,7 @@ async function deliver(recipients, message, opts = {}) {
   if (message.interruptionLevel) alertStyle.interruptionLevel = message.interruptionLevel;
 
   let deliveredCount = 0;
+  const deliveredEfrIds = new Set();
   for (let i = 0; i < list.length; i += chunkSize) {
     const chunk = list.slice(i, i + chunkSize);
     const results = await Promise.all(
@@ -233,11 +239,18 @@ async function deliver(recipients, message, opts = {}) {
         return r;
       }),
     );
-    deliveredCount += results.filter((r) => r && r.delivered).length;
+    results.forEach((result, index) => {
+      if (!result || !result.delivered) return;
+      deliveredCount += 1;
+      // A technician can hold several device tokens; one accepted token is
+      // enough for them to have been reached.
+      const { efrId } = chunk[index];
+      if (efrId !== undefined && efrId !== null) deliveredEfrIds.add(Number(efrId));
+    });
   }
 
   if (label) logger.push(`${label} · ${deliveredCount}/${list.length} ${unit}`);
-  return { delivered: deliveredCount > 0, deliveredCount, tokenCount: list.length };
+  return { delivered: deliveredCount > 0, deliveredCount, tokenCount: list.length, deliveredEfrIds };
 }
 
 /*
