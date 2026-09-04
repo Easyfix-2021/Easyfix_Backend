@@ -2,6 +2,7 @@ const router = require('express').Router();
 
 const validate = require('../../middleware/validate');
 const job = require('../../services/job.service');
+const clientRequest = require('../../services/client-request.service');
 const candidateRanking = require('../../services/candidate-ranking.service');
 const jobLocation = require('../../services/job-location.service');
 const { modernOk, modernError } = require('../../utils/response');
@@ -520,6 +521,61 @@ router.get('/export.xlsx', validate(listQuery, 'query'), async (req, res, next) 
  * different WHERE clause. Frontend passes `ownerId = currentUser.user_id`
  * when it detects `?scope=mine` on the URL.
  */
+/*
+ * GET /api/admin/jobs/unconfirmed-sections?ids=1,2,3
+ *
+ * Which of the five My Orders -> Unconfirmed sections each job belongs to.
+ * Deliberately a SEPARATE call rather than two derived columns on the generic
+ * jobs list: that list feeds eleven tabs, and neither the subqueries nor the
+ * reason-id lookup they need should be paid by ten tabs that never read the
+ * answer.
+ *
+ * Mounted beside /counts because it is a one-segment static path and must be
+ * declared before the bare `/:id` route below — Express matches in order, and
+ * `idParam` would reject "unconfirmed-sections" as a non-integer.
+ *
+ * The membership rules and the precedence chain live in
+ * services/client-request.service.js, so this page cannot drift from the writer
+ * that creates the rows it groups on.
+ */
+/*
+ * One page of the Unconfirmed tab, with headroom. Named rather than written
+ * twice: the cap appeared in the check AND in the operator's message, and the
+ * message-literal audit flagged it — correctly, even though the value it
+ * collided with was unrelated. A limit spelt out in its own error text is one
+ * edit away from telling the operator a number the code no longer enforces.
+ */
+const MAX_SECTION_IDS = 1000;
+
+router.get('/unconfirmed-sections', async (req, res, next) => {
+  try {
+    const ids = String(req.query.ids || '').split(',')
+      .map((s) => Number(s.trim())).filter((n) => Number.isInteger(n) && n > 0);
+    if (!ids.length) return modernOk(res, { sections: {}, meta: clientRequest.SECTION_META });
+    if (ids.length > MAX_SECTION_IDS) {
+      return modernError(res, 400, `too many ids (max ${MAX_SECTION_IDS})`);
+    }
+
+    /*
+     * ONE `today` for the whole response, in IST. Reading the clock per row
+     * would let a request that straddles midnight put two identical jobs in
+     * different sections; IST because the section a job sits in has to match
+     * the date ops reads off the row.
+     */
+    // Required INSIDE the handler, as five sibling handlers in this file do.
+    // There IS a module-scope `pool`, but it is declared ~1300 lines BELOW
+    // this route; a bare reference happens to work only because `const` is
+    // hoisted into the temporal dead zone and this body runs long after the
+    // module finished evaluating. Depending on that across 1300 lines is
+    // invisible to a reader and one reorder away from a ReferenceError, so
+    // this follows the local convention instead.
+    const { pool } = require('../../db');
+    const todayYmd = new Date(Date.now() + (5.5 * 60 * 60 * 1000)).toISOString().slice(0, 10);
+    const sections = await clientRequest.sectionsFor(pool, ids, todayYmd);
+    modernOk(res, { sections, meta: clientRequest.SECTION_META, today: todayYmd });
+  } catch (e) { next(e); }
+});
+
 router.get('/counts', async (req, res, next) => {
   try {
     const ownerId = req.query.ownerId ? Number(req.query.ownerId) : undefined;

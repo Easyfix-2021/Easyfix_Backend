@@ -191,7 +191,103 @@ async function insertRequest(db, { jobId, kind, jobStatus, authorName, comment, 
   return r.insertId;
 }
 
+
+/* ── Unconfirmed-page sections ─────────────────────────────────────────────
+ *
+ * My Orders -> Unconfirmed is one page split into five sections. EVERY job
+ * lands in EXACTLY ONE — ops asked for no overlap, so this is a precedence
+ * chain, not five independent filters. A job listed twice reads as two jobs,
+ * and the section counts stop summing to the tab count.
+ *
+ * PRECEDENCE (membership), which is NOT the display order:
+ *   1. actioned_by_client   the client has asked for something — that is the
+ *                           newest fact about the job and needs ops
+ *   2. pending_with_client  ops asked the client and is waiting
+ *   3. by appointment date  everything else
+ *
+ * The conversation sections win because a job blocked on a person is not
+ * usefully filed under a date. The DISPLAY order ops chose is
+ * actioned -> overdue -> upcoming -> future -> pending, and the page lets them
+ * drag it; that is a view concern and lives in the CRM.
+ *
+ * A job with NO appointment date goes to `future_unscheduled` (ops decision) —
+ * hence the section's name. Being Unconfirmed is often exactly why no date
+ * exists yet, so these are numerous, and dropping them would silently shrink
+ * the page.
+ */
+const SECTIONS = ['actioned_by_client', 'overdue', 'upcoming', 'future_unscheduled', 'pending_with_client'];
+
+/** Display order + labels. The CRM may reorder; these are the defaults. */
+const SECTION_META = [
+  { key: 'actioned_by_client', label: 'Actioned By Client' },
+  { key: 'overdue', label: 'Overdue Jobs' },
+  { key: 'upcoming', label: 'Upcoming Jobs' },
+  { key: 'future_unscheduled', label: 'Future & Unscheduled Jobs' },
+  { key: 'pending_with_client', label: 'Pending Action from Client' },
+];
+
+/**
+ * Which section a job belongs to. Pure, so it is testable without a DB.
+ *
+ * `today` is passed in rather than read from the clock so a test can pin it and
+ * so every row in one response is classified against the SAME day — a request
+ * that straddles midnight would otherwise put two identical jobs in different
+ * sections.
+ *
+ * Dates are compared as IST CALENDAR DAYS, not as instants: "tomorrow" means
+ * the date ops would read off the row, and an appointment at 23:00 tonight is
+ * today's problem, not tomorrow's.
+ */
+function sectionFor({ hasClientRequest, hasUnreachableOutcome, appointmentYmd }, todayYmd) {
+  if (hasClientRequest) return 'actioned_by_client';
+  if (hasUnreachableOutcome) return 'pending_with_client';
+  if (!appointmentYmd) return 'future_unscheduled';
+  if (appointmentYmd < todayYmd) return 'overdue';
+  const t = new Date(`${todayYmd}T00:00:00Z`);
+  t.setUTCDate(t.getUTCDate() + 1);
+  const tomorrowYmd = t.toISOString().slice(0, 10);
+  if (appointmentYmd === todayYmd || appointmentYmd === tomorrowYmd) return 'upcoming';
+  return 'future_unscheduled';
+}
+
+/**
+ * Classify a page of Unconfirmed job ids in ONE round trip.
+ *
+ * Two aggregates over tbl_job_comment rather than a query per job: the page
+ * shows up to a few hundred rows and a per-row lookup is the N+1 this codebase
+ * keeps being bitten by.
+ */
+async function sectionsFor(db, jobIds, todayYmd) {
+  const ids = [...new Set((jobIds || []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+  if (!ids.length) return {};
+  const reasons = await reasonIds(db);
+  const marks = new Map(ids.map((id) => [id, { hasClientRequest: false, hasUnreachableOutcome: false, appointmentYmd: null }]));
+
+  const ph = ids.map(() => '?').join(',');
+  const [rows] = await db.query(
+    `SELECT j.job_id,
+            DATE_FORMAT(j.requested_date_time, '%Y-%m-%d') AS appt_ymd,
+            MAX(c.comment_on = 16)                     AS unreachable,
+            MAX(${reasons ? 'c.enum_reason_id IN (?, ?)' : '0'}) AS client_req
+       FROM tbl_job j
+       LEFT JOIN tbl_job_comment c ON c.job_id = j.job_id
+      WHERE j.job_id IN (${ph})
+      GROUP BY j.job_id, appt_ymd`,
+    reasons ? [reasons.cancel, reasons.retry, ...ids] : ids,
+  );
+  for (const r of rows) {
+    marks.set(Number(r.job_id), {
+      hasClientRequest: !!Number(r.client_req),
+      hasUnreachableOutcome: !!Number(r.unreachable),
+      appointmentYmd: r.appt_ymd || null,
+    });
+  }
+  const out = {};
+  for (const [id, m] of marks) out[id] = sectionFor(m, todayYmd);
+  return out;
+}
+
 module.exports = {
-  KINDS, REASON, CHIP_LABEL, COMMENT_ON, SOURCE_TYPE,
-  reasonIds, buildComment, kindOfReasonId, insertRequest,
+  KINDS, REASON, CHIP_LABEL, COMMENT_ON, SOURCE_TYPE, SECTIONS, SECTION_META,
+  reasonIds, buildComment, kindOfReasonId, insertRequest, sectionFor, sectionsFor,
 };
