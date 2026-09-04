@@ -18,7 +18,18 @@ test.after(async () => {
  */
 const { dedupeById, isStarted, isTodaysWork } = dashboard._internals;
 
-const now = () => new Date().toISOString().slice(0, 19).replace('T', ' ');
+/*
+ * "Now" in IST, because that is what the service means by today.
+ *
+ * This was `new Date().toISOString()`, which is UTC — and India is UTC+05:30
+ * with no DST, so between 18:30 UTC and midnight UTC the UTC date string is
+ * ONE DAY BEHIND the IST date isTodaysWork() compares it against. The suite
+ * therefore passed for 18.5 hours a day and failed for 5.5 (00:00-05:30 IST),
+ * which reads as a flaky test rather than a wrong helper. Same +5.5h idiom the
+ * routes use to derive an IST `todayYmd`.
+ */
+const now = () => new Date(Date.now() + (5.5 * 60 * 60 * 1000))
+  .toISOString().slice(0, 19).replace('T', ' ');
 
 /** Checked in TODAY, booked for an appointment 16 days out — the reported job. */
 const startedFutureJob = {
