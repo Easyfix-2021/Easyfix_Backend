@@ -304,17 +304,28 @@ router.get('/:id/candidates/search',
   });
 
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
-  /*
-   * Resolve the client-request reason ids ONCE per request, only when a section
-   * filter is actually in play. sectionPredicate needs them and is synchronous;
-   * this is the async boundary. Cached in the service after the first hit, so
-   * the cost is one query on the first sectioned request per process.
-   */
-  if (req.query.section) {
-    const { pool } = require('../../db');
-    req.query.sectionIds = await clientRequest.reasonIds(pool);
-  }
   try {
+    /*
+     * Resolve the client-request reason ids ONCE per request, only when a
+     * section filter is actually in play. sectionPredicate needs them and is
+     * synchronous; this is the async boundary. Cached in the service after the
+     * first hit, so the cost is one query on the first sectioned request per
+     * process.
+     *
+     * ⚠ INSIDE THE try, AND THAT IS LOAD-BEARING. It was written above it, and
+     * an await above a handler's try is not a style choice here — it is a
+     * process crash. Express 4 does not attach a .catch to the promise an async
+     * handler returns, this repo registers no process-level
+     * 'unhandledRejection' listener (server.js has only SIGTERM/SIGINT), and
+     * the image runs Node 20, whose default is --unhandled-rejections=throw.
+     * So a rejection from this ONE line — a DB blip, a pool timeout — would
+     * take the whole server down instead of returning a 500 for one request.
+     * Reproduced against this repo's own express before moving it.
+     */
+    if (req.query.section) {
+      const { pool } = require('../../db');
+      req.query.sectionIds = await clientRequest.reasonIds(pool);
+    }
     // Row-level RBAC + reporting hierarchy: row-filter the list by the
     // UNION of (caller's own manage_* scope) ∪ (every direct/indirect
     // report's manage_* scope). Admin/Finance bypass via the bypass
