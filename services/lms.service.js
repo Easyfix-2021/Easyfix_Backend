@@ -2170,11 +2170,17 @@ async function listAssessments({ q, limit = 200, offset = 0 } = {}) {
   const [rows] = await pool.query(
     `SELECT a.id, a.title, a.description, a.pass_percent, a.max_attempts, a.status,
             a.created_at, a.updated_at,
+            a.created_by, cb.user_name AS created_by_name,
             (SELECT COUNT(*) FROM lms_question q
               WHERE q.assessment_id = a.id AND q.status = 1) AS question_count,
             (SELECT COUNT(*) FROM lms_content lc
               WHERE lc.kind = 'assessment' AND lc.ref_id = a.id AND lc.status = 1) AS course_count
        FROM lms_assessment a
+       /* LEFT, and it has to be: every assessment made before 2026-09-04 has
+        * created_by NULL, and an INNER join would hide the entire back
+        * catalogue from the list the moment this column was added. The same
+        * applies to a since-deleted operator. */
+       LEFT JOIN tbl_user cb ON cb.user_id = a.created_by
       WHERE ${whereSql}
       ORDER BY a.id DESC
       LIMIT ? OFFSET ?`,
