@@ -22,7 +22,11 @@ jobs:
   test:
     name: Syntax check & unit tests
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    # RAISED 8 -> 15 to match deploy.yml's precheck. Same job shape, same
+    # `npm ci`, same exposure to the 6m+ installs seen on 2026-09-04 — this one
+    # simply had not been unlucky yet. Leaving it at 8 would move the identical
+    # failure onto PRs instead of deploys.
+    timeout-minutes: 15
     steps:
       # FULL history, not the default depth-1. The RETIRED half of the
       # message-literal audit (scripts/audit-message-literals.mjs) asks

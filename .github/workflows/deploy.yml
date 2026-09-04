@@ -64,7 +64,20 @@ jobs:
   precheck:
     name: Lint & syntax check
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    # RAISED 6 -> 15 (2026-09-04). `npm ci` alone consumed 6m05s and 6m06s on
+    # two separate runs today and tripped the old 6-minute ceiling, cancelling
+    # one QA and one PRODUCTION deploy. The tests never ran in either; the
+    # re-runs passed unchanged, so the code was never at fault.
+    #
+    # A timed-out job reports `conclusion: cancelled`, NOT `failure` — anything
+    # watching for `status: completed` reads that as a successful deploy, which
+    # is how QA sat on a stale SHA earlier the same day.
+    #
+    # 15 is not the real fix: 301 locked packages should install in well under a
+    # minute, and `setup-node` finishing in 5s points at an npm cache miss
+    # forcing a cold download every run. This buys headroom so a slow registry
+    # cannot cancel a healthy deploy; the install itself still wants looking at.
+    timeout-minutes: 15
     steps:
       # FULL history — see ci.yml for why. `npm test` below runs the
       # message-literal audit, whose RETIRED half reads `git log -L`; a
