@@ -1,8 +1,8 @@
 /*
  * Client WRITES obey the same scope as client READS.
  *
- * The seven endpoints that mutate a job by id — approve, reject,
- * estimate/approve, estimate/reject, cancel, images, escalate — checked
+ * The endpoints that mutate a job by id — approve, reject, estimate/approve,
+ * estimate/reject, cancel, images, escalate, and now client-request — checked
  * TENANCY only: `job.fk_client_id === req.spoc.client_id`. Any SPOC who
  * guessed a job id could approve, escalate or CANCEL a colleague's job,
  * including one that appears in no list they can open. Read scope and write
@@ -10,6 +10,13 @@
  *
  * These drive the ROUTE HANDLERS, because the gap was in the handler and
  * nowhere else — jobService did exactly what it was asked.
+ *
+ * ⚠ THIS HEADER USED TO LIE, WHICH IS WHY THE LIST IS NOW CHECKED. It named
+ * `images` among the endpoints covered while WRITES did not contain it: the
+ * route WAS guarded, but nothing here proved it, and the sentence claiming
+ * otherwise is what stopped anyone looking. A completeness test below now reads
+ * the router and fails if any /jobs/:id write route is missing from WRITES, so
+ * the prose cannot drift ahead of the table again.
  */
 const { test, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
@@ -103,7 +110,42 @@ const WRITES = [
   ['/jobs/:id/estimate/reject',  'patch', { reason: 'too costly' }],
   ['/jobs/:id/cancel',           'post',  { comment: 'duplicate' }],
   ['/jobs/:id/escalate',         'post',  { reasonId: 1 }],
+  ['/jobs/:id/client-request',   'post',  { kind: 'retry' }],
+  ['/jobs/:id/images',           'post',  {}],
 ];
+
+/*
+ * THE LIST ABOVE IS HAND-MAINTAINED, so it drifts — and its drift is silent in
+ * the worst way: a new write route simply is not tested, and the suite stays
+ * green while the guarantee this file exists to make ("every client job write
+ * is scope-guarded") quietly stops being true. /jobs/:id/client-request was
+ * added on 2026-09-04 and was missed exactly like this until someone looked.
+ *
+ * So the list is now CHECKED against the router rather than trusted. Every
+ * `router.post|patch('/jobs/:id/...')` in routes/client/index.js must appear in
+ * WRITES, and a route that genuinely needs no scope guard has to say so out
+ * loud in EXEMPT — which is a line in a diff someone can question, unlike an
+ * omission, which looks like nothing at all.
+ */
+test('every /jobs/:id write route is covered by WRITES', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'routes', 'client', 'index.js'), 'utf8');
+
+  // Routes that write nothing job-specific, or are guarded elsewhere. Empty
+  // today; each entry needs its reason beside it.
+  const EXEMPT = new Set([]);
+
+  const found = new Set();
+  for (const m of src.matchAll(/router\.(post|patch)\(\s*'(\/jobs\/:id[^']*)'/g)) {
+    found.add(`${m[1]} ${m[2]}`);
+  }
+  const listed = new Set(WRITES.map(([p, meth]) => `${meth} ${p}`));
+  const missing = [...found].filter((k) => !listed.has(k) && !EXEMPT.has(k));
+  assert.deepEqual(missing, [],
+    'these job-write routes are not in WRITES, so nothing proves they are '
+    + 'scope-guarded:\n  ' + missing.join('\n  '));
+});
 
 for (const [path, method, body] of WRITES) {
   test(`${method.toUpperCase()} ${path} · a peer's job is 404, and nothing is written`, async () => {

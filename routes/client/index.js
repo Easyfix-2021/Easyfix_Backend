@@ -6,6 +6,7 @@ const requireSpocAuth = require('../../middleware/client-auth');
 const { pool } = require('../../db');
 const clientAuth = require('../../services/client-auth.service');
 const jobService = require('../../services/job.service');
+const clientRequest = require('../../services/client-request.service');
 const { modernOk, modernError } = require('../../utils/response');
 const { sendXlsx } = require('../../utils/xlsx-export');
 const { STATUS_LABELS } = require('../../services/integration.service');
@@ -1149,6 +1150,89 @@ router.get('/jobs/images/:imageId/file', async (req, res, next) => {
  * legacy Client Dashboard writes, so ops sees app + dashboard escalations in
  * one place. `escalated_from` marks the source as the mobile app.
  */
+/*
+ * POST /api/client/jobs/:id/client-request  { kind: 'cancel' | 'retry', comment? }
+ *
+ * The two things a client can ask ops to do about a job whose customer could
+ * not be reached. NEITHER CHANGES THE JOB — per ops, a client raises a request
+ * and ops acts on it, so this only writes a durable remark that surfaces to ops
+ * as a chip on My Orders -> Unconfirmed. There is no destructive path here and
+ * no status transition; if you are adding one, it belongs in the CRM.
+ *
+ * Column choices, and the two traps behind them, are documented in
+ * services/client-request.service.js. The short version: the request is
+ * identified by enum_reason_id (a real FK), never by its text; and commented_by
+ * is omitted, because it is a tbl_user FK and a client contact id would resolve
+ * to a same-numbered EMPLOYEE rather than to nothing.
+ */
+router.post('/jobs/:id/client-request', validate(Joi.object({
+  kind: Joi.string().valid(...clientRequest.KINDS).required(),
+  comment: Joi.string().allow('').max(500).optional(),
+})), async (req, res, next) => {
+  try {
+    const job = await loadJobForWrite(req, res, 'Client request');
+    if (!job) return;
+
+    /*
+     * OFFERED ONLY ON THE UNREACHABLE BUCKET, per ops. Re-checked HERE and not
+     * only in the UI: the portal decides which rows show the buttons, and a
+     * button is an affordance, never a guard. Without this a SPOC could raise a
+     * cancellation request against any job of theirs by calling the endpoint.
+     *
+     * Membership is the SAME rule the /unreachable-jobs list uses — an
+     * Unreachable outcome (comment_on = 16) on a job that is still open — so a
+     * row the client can see is a row they can act on. It is deliberately NOT
+     * the stricter three-days-in-three rule the dashboard TILE counts: the tile
+     * is a "worth your attention" signal, while this is "may I ask about it",
+     * and refusing an action on a job the client is looking at would read as a
+     * bug.
+     */
+    const [[reachable]] = await pool.query(
+      `SELECT 1 AS ok
+         FROM tbl_job_comment c
+        WHERE c.job_id = ? AND c.comment_on = 16
+        LIMIT 1`,
+      [job.job_id],
+    );
+    if (!reachable) {
+      logger.warn('Client request refused · not an unreachable job · id=' + job.job_id);
+      return modernError(res, 409, 'This action is only available on jobs where the customer could not be reached.');
+    }
+
+    /*
+     * The reason ids come from action_taken_reason. A miss means the seed
+     * migration has not run on this host — refuse rather than write an
+     * unmarked comment, because a request ops cannot see in its section is
+     * worse than one that visibly failed.
+     */
+    const ids = await clientRequest.reasonIds(pool);
+    if (!ids) {
+      logger.error('Client request unavailable · action_taken_reason rows missing · run migrations/2026-09-04-seed-client-request-reasons.sql');
+      return modernError(res, 503, 'This action is not available yet. Please contact support.');
+    }
+
+    const authorName = req.spoc.contact_name || null;
+    const commentId = await clientRequest.insertRequest(pool, {
+      jobId: job.job_id,
+      kind: req.body.kind,
+      jobStatus: job.job_status ?? null,
+      authorName,
+      comment: req.body.comment,
+      reasonId: ids[req.body.kind],
+    });
+    logger.info('Client request logged · job=' + job.job_id + ' · kind=' + req.body.kind
+      + ' · spoc=' + req.spoc.id + ' · comment_id=' + commentId);
+
+    modernOk(res, {
+      requested: true,
+      kind: req.body.kind,
+      job_id: job.job_id,
+      comment_id: commentId,
+      chip: clientRequest.CHIP_LABEL[req.body.kind],
+    });
+  } catch (e) { next(e); }
+});
+
 router.post('/jobs/:id/escalate', validate(Joi.object({
   reasonId: Joi.number().integer().required(),
   comment: Joi.string().allow('').max(500).optional(),
