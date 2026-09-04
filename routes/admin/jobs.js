@@ -304,6 +304,16 @@ router.get('/:id/candidates/search',
   });
 
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
+  /*
+   * Resolve the client-request reason ids ONCE per request, only when a section
+   * filter is actually in play. sectionPredicate needs them and is synchronous;
+   * this is the async boundary. Cached in the service after the first hit, so
+   * the cost is one query on the first sectioned request per process.
+   */
+  if (req.query.section) {
+    const { pool } = require('../../db');
+    req.query.sectionIds = await clientRequest.reasonIds(pool);
+  }
   try {
     // Row-level RBAC + reporting hierarchy: row-filter the list by the
     // UNION of (caller's own manage_* scope) ∪ (every direct/indirect

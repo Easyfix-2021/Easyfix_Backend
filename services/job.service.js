@@ -1,5 +1,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
+const clientRequest = require('./client-request.service');
 const { isAbsentAnswer } = require('../utils/schema-absent-error');
 // Job-OTP generator — shared with the auth flow so we're not
 // duplicating the cryptographically-safe 4-digit primitive. See
@@ -1770,6 +1771,8 @@ async function list({
   zonalId,                   // FK   — tbl_zone_master via tbl_zone_city_mapping
   // Dashboard AttentionSummary tile drill-downs (2026-05-22):
   quotationStatus,           // enum — 'approved' | 'rejected'
+  section,                   // enum — My Orders -> Unconfirmed section (client-request.service.js)
+  sectionIds,                // {cancel,retry} action_taken_reason ids, resolved by the caller
   requestedBefore,           // 'now' or ISO date — Running Late tile
   /*
    * `noServices` (2026-05-28) — Booked-No-Services tile drill-down.
@@ -2112,6 +2115,28 @@ async function list({
    * EXISTS keeps row cardinality stable when a job has multiple quotation
    * line items.
    */
+  /*
+   * `section` — one of the five My Orders -> Unconfirmed buckets.
+   *
+   * The predicate lives in client-request.service.js beside the JS classifier
+   * that answers the same question for rows already in the browser, so the two
+   * cannot drift apart unnoticed (a test runs both over one fixture and asserts
+   * they agree). It is applied here, as an ordinary clause, so the section
+   * composes with every other filter this list already supports — search, city,
+   * client, sort, limit/offset — rather than needing its own endpoint.
+   *
+   * The reason ids are resolved by the CALLER and passed in, because resolving
+   * them is async and this function is not: `sectionIds` arrives already looked
+   * up. Absent (migration not yet run) the predicate matches nothing for the
+   * client-request section rather than everything, so a missing seed under-fills
+   * a bucket instead of mis-filing every job into it.
+   */
+  if (section) {
+    const pred = clientRequest.sectionPredicate(section, sectionIds);
+    if (pred) { clauses.push(`(${pred.sql})`); params.push(...pred.params); }
+    else { clauses.push('1=0'); }   // unknown section: empty, never unfiltered
+  }
+
   if (quotationStatus === 'approved') {
     clauses.push(
       'EXISTS (SELECT 1 FROM quotation_details qd WHERE qd.job_id = j.job_id AND qd.status = 1 AND qd.action_on IS NOT NULL)',

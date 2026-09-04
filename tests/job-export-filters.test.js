@@ -421,6 +421,7 @@ const SAMPLE = {
   endDate: '2026-08-17',
   quotationStatus: 'approved',
   requestedBefore: 'now',
+  section: 'overdue',
   sortBy: 'job_id',
   sortDir: 'asc',
   limit: 50,
