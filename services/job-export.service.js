@@ -667,6 +667,24 @@ const FILTER_COVERAGE = Object.freeze({
    */
   offerState:       ['ignored',  'cannot bind list()s j-aliased fragment to alias J'],
   /*
+   * CANNOT SUPPORT, and unlike offerState the failure mode would be a LEAK
+   * rather than a superset — which is why it is not half-implemented.
+   *
+   * sectionPredicate() identifies a client-actioned job by enum_reason_id, and
+   * those ids are ROWS: reasonIds() reads them from action_taken_reason at
+   * runtime, because they differ per environment. This module's where() is
+   * synchronous and holds no pool, so it cannot do that lookup. The service's
+   * own no-ids fallback (`IN (0, 0)`) is safe where it lives — it makes the
+   * conversation sections empty and lets every job fall through to a date
+   * bucket — but here it would mean an operator exporting "Actioned By Client"
+   * receives a sheet of jobs the client never actioned. Wrong rows, presented
+   * as right ones.
+   *
+   * Dropping it instead yields every unconfirmed job matching the other
+   * filters: a superset of the section, and the route logs the drop.
+   */
+  section:          ['ignored',  'needs reason ids from a DB read where() cannot do'],
+  /*
    * Keyset pagination requires the sort key to BE the cursor, and the cursor
    * is J.job_id DESC (see fetchExportChunk). An arbitrary ORDER BY would skip
    * and duplicate rows across chunks — silently, which is worse than

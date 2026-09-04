@@ -287,7 +287,74 @@ async function sectionsFor(db, jobIds, todayYmd) {
   return out;
 }
 
+
+/*
+ * The same five sections, as SQL.
+ *
+ * ⚠ THIS IS A SECOND EXPRESSION OF sectionFor's RULE, and that is the whole
+ * risk in this file. The classifier answers for a page of ids the browser
+ * already has; this answers for a paged, searched, sorted query the browser has
+ * not fetched yet. Neither can be derived from the other — one is JavaScript
+ * over rows, the other is a WHERE clause the database evaluates — so they are
+ * pinned together by a test that runs BOTH over the same fixture and asserts
+ * they agree, row for row. If you change one, that test fails until you change
+ * the other. Do not "simplify" it by deleting one side.
+ *
+ * PRECEDENCE IS ENCODED AS MUTUAL EXCLUSION. sectionFor gets it free from an
+ * if-chain; SQL has no such ordering, so each date bucket must NOT-EXISTS its
+ * way past the two conversation sections explicitly. Miss one of those and a
+ * client-actioned job appears in TWO sections — the exact thing ops ruled out,
+ * and the counts stop summing to the tab total.
+ *
+ * DATES ARE IST CALENDAR DAYS. The pool runs at +05:30, so CURDATE() is the
+ * date ops reads off the row. Comparing DATE(j.requested_date_time) rather than
+ * the datetime keeps "tomorrow" meaning tomorrow's date rather than a moment
+ * 24 hours out — an appointment at 23:00 tonight is today's problem.
+ */
+function sectionPredicate(section, ids) {
+  const alias = 'j';
+  /*
+   * A client request is identified by enum_reason_id, never by comment text.
+   * With no seeded ids (migration not run on this host) the subquery must match
+   * NOTHING rather than everything: `IN (0, 0)` is empty, so every job falls
+   * through to the date buckets and nothing is silently mis-filed as actioned.
+   */
+  const reqIds = ids ? [ids.cancel, ids.retry] : [0, 0];
+  const hasRequest = `EXISTS (SELECT 1 FROM tbl_job_comment rq
+       WHERE rq.job_id = ${alias}.job_id AND rq.enum_reason_id IN (?, ?))`;
+  const hasUnreachable = `EXISTS (SELECT 1 FROM tbl_job_comment ur
+       WHERE ur.job_id = ${alias}.job_id AND ur.comment_on = 16)`;
+  // Not in either conversation section — the precondition every date bucket shares.
+  const noConversation = `NOT ${hasRequest} AND NOT ${hasUnreachable}`;
+  const appt = `DATE(${alias}.requested_date_time)`;
+
+  switch (section) {
+    case 'actioned_by_client':
+      return { sql: hasRequest, params: [...reqIds] };
+    case 'pending_with_client':
+      return { sql: `NOT ${hasRequest} AND ${hasUnreachable}`, params: [...reqIds] };
+    case 'overdue':
+      return { sql: `${noConversation} AND ${appt} IS NOT NULL AND ${appt} < CURDATE()`,
+        params: [...reqIds] };
+    case 'upcoming':
+      return { sql: `${noConversation} AND ${appt} IN (CURDATE(), DATE_ADD(CURDATE(), INTERVAL 1 DAY))`,
+        params: [...reqIds] };
+    case 'future_unscheduled':
+      /*
+       * The NULL branch is why this section is named for both. Being Unconfirmed
+       * is frequently the reason no appointment exists yet, so these are
+       * numerous — and a bucket set that omitted them would drop those jobs off
+       * the page with nothing reporting it.
+       */
+      return { sql: `${noConversation} AND (${appt} IS NULL OR ${appt} > DATE_ADD(CURDATE(), INTERVAL 1 DAY))`,
+        params: [...reqIds] };
+    default:
+      return null;
+  }
+}
+
 module.exports = {
   KINDS, REASON, CHIP_LABEL, COMMENT_ON, SOURCE_TYPE, SECTIONS, SECTION_META,
   reasonIds, buildComment, kindOfReasonId, insertRequest, sectionFor, sectionsFor,
+  sectionPredicate,
 };

@@ -185,6 +185,14 @@ const listQuery = Joi.object({
    * multiplication when a job has multiple line items).
    */
   quotationStatus: Joi.string().valid('approved', 'rejected').optional(),
+
+  /*
+   * `section` — one of the five My Orders -> Unconfirmed buckets. Valid values
+   * come from client-request.service.js so this schema cannot list a section
+   * the predicate does not implement (or miss one it does); an unknown value is
+   * rejected here rather than quietly returning an unfiltered list.
+   */
+  section: Joi.string().valid(...require('../services/client-request.service').SECTIONS).optional(),
   /*
    * `requestedBefore` — drives the AttentionSummary's Running Late tile.
    *   'now' → j.requested_date_time IS NOT NULL AND j.requested_date_time < NOW()
