@@ -162,6 +162,63 @@ async function expireStaleOffers(maxAgeMinutes = OFFER_TTL_MINUTES, jobId = null
 }
 
 /*
+ * WITHDRAW the open offers on a job that has just reached a state where they
+ * can no longer be accepted.
+ *
+ * ── THE BUG THIS EXISTS FOR ──────────────────────────────────────────
+ * A technician was shown "Accept job / Reject" for work that was already
+ * finished. Nothing ever closed an offer when its JOB ended: expireStaleOffers
+ * closes them on AGE, and `job.offer_expiry.enabled` is "false" in production,
+ * so in practice nothing closed them at all. Measured: 1,606 open offers on
+ * jobs already completed or cancelled, the youngest ~40 hours old, the oldest
+ * ~38 days.
+ *
+ * ── WHY THIS IS NOT GATED ON job.offer_expiry.enabled ────────────────
+ * That flag governs EXPIRY — "the technician did not answer in time" — and was
+ * switched off deliberately after an offer flipped to EXPIRED under an operator
+ * mid-conversation (see expireStaleOffers). This is a different fact: the job
+ * is over, so there is nothing left to accept. Gating this on that flag would
+ * tie "stop timing technicians out" to "keep advertising cancelled work", which
+ * are unrelated decisions that happen to touch one column.
+ *
+ * Re-enabling the TTL would ALSO not fix this: a job cancelled two minutes
+ * after an offer went out leaves that offer live for the rest of the window,
+ * and the technician can accept work that no longer exists.
+ *
+ * EXPIRED rather than a new code: "closed without a response, superseded by
+ * something outside the technician's control" is exactly what offer-status.js
+ * documents for EXPIRED. It also matters for fairness — candidate-ranking
+ * counts OFFERED and REJECTED when scoring acceptance, so a withdrawn offer
+ * must not read as a decline. An EXPIRED row correctly does not.
+ *
+ * FAIL-SOFT, like the log writes it sits beside: a status transition that has
+ * already committed must not report failure because a follow-up UPDATE on a
+ * different table did not land.
+ */
+async function withdrawOffersForClosedJob(jobId, status) {
+  if (!OFFER_WITHDRAWAL_STATES.has(Number(status))) return { withdrawn: 0, skipped: true };
+  try {
+    if (!(await jobOfferTableExists())) return { withdrawn: 0, skipped: true };
+    const [r] = await pool.query(
+      `UPDATE tbl_job_offer
+          SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
+        WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
+      [Number(jobId)],
+    );
+    const withdrawn = r.affectedRows || 0;
+    if (withdrawn > 0) {
+      logger.info('Withdrew open offers on a closed job · jobId=' + jobId
+        + ' · status=' + status + ' · offers=' + withdrawn);
+    }
+    return { withdrawn };
+  } catch (e) {
+    logger.warn('Offer withdrawal skipped · jobId=' + jobId + ' · '
+      + ((e && e.code) || (e && e.message)));
+    return { withdrawn: 0, failed: true };
+  }
+}
+
+/*
  * Job CRUD + status + assignment.
  *
  * Schema notes (tbl_job, 141 cols, ~384k rows as of 2026-04-17):
@@ -225,6 +282,22 @@ const COMPLETED_STATES = new Set([STATUS.COMPLETED, STATUS.COMPLETED_ALT]);
 // Keep this deliberately aligned with the established public-share liveness
 // rule: statuses 3, 5 and 6 are the terminal states in the legacy job model.
 const NON_ASSIGNABLE_STATES = new Set([...COMPLETED_STATES, STATUS.CANCELLED]);
+
+/*
+ * Statuses after which an OPEN offer can never be accepted, so it is withdrawn.
+ *
+ * Derived from NON_ASSIGNABLE_STATES rather than restating 3/5/6: both answer
+ * "can a technician still be put on this job?", and a second hand-written list
+ * is how the two drift apart.
+ *
+ * CLOSED_FROM_APP (10) is added on top. It is absent from NON_ASSIGNABLE_STATES
+ * on purpose — that set guards the ASSIGNMENT endpoint, where 10 has never been
+ * refused — but lib/job-stages.js gives status 10 no outgoing transitions, so it
+ * is terminal for THIS question. Production carried 9 open offers on status-10
+ * jobs. Widening the withdrawal set is safe in a way widening the assignment set
+ * would not be: the only consequence is closing an offer nobody can act on.
+ */
+const OFFER_WITHDRAWAL_STATES = new Set([...NON_ASSIGNABLE_STATES, STATUS.CLOSED_FROM_APP]);
 // Reject is a pre-start acknowledgement, not a generic lifecycle rewind.
 // Dedicated endpoints own every state after SCHEDULED.
 const DIRECT_REJECTABLE_STATES = new Set([STATUS.BOOKED, STATUS.SCHEDULED]);
@@ -4644,46 +4717,22 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
       logger.warn('Cancel audit comment failed (non-fatal) · id=' + jobId + ' · ' + e.message);
     }
 
-    /*
-     * Cancelling KILLS every still-open offer (2026-07-29). Without this, the
-     * OFFERED rows survived until the 30-min TTL swept them, so for up to half
-     * an hour after a cancellation the CRM list projection (offerColumns():
-     * is_offered / offered_count / offered_efr_name) still reported a LIVE offer
-     * on a dead job, and the technician could still see and act on it.
-     *
-     * Same expire shape as acceptOffer() / reschedule(): offer_status → EXPIRED
-     * with responded_at stamped. Idempotent — `offer_status = OFFERED` in the
-     * WHERE means the TTL sweep can never double-expire these — and scoped to
-     * the INTO-cancelled transition by the guard above, so a 6→6 re-submit
-     * doesn't re-stamp responded_at on rows this already closed.
-     *
-     * NOT transactional, deliberately: setStatus writes through the shared pool
-     * with no transaction (see the UPDATE above), so there is no connection to
-     * enlist — this is a second statement on the same pool, issued only after
-     * the cancellation itself has already committed. Non-fatal for the same
-     * reason: the job IS cancelled, and a failure here must never surface as a
-     * 500 on a cancel that actually happened (the TTL sweep remains the
-     * backstop). Missing table on an un-migrated instance degrades quietly via
-     * the memoised jobOfferTableExists() probe the rest of the offer code uses,
-     * with the ER_NO_SUCH_TABLE catch as belt-and-braces for a stale probe.
-     */
-    try {
-      if (await jobOfferTableExists()) {
-        const [r] = await pool.query(
-          `UPDATE tbl_job_offer
-              SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
-            WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
-          [jobId],
-        );
-        if (r.affectedRows) {
-          logger.info('Cancelled job expired ' + r.affectedRows + ' open offer(s) · id=' + jobId);
-        }
-      }
-    } catch (e) {
-      if (e?.code !== 'ER_NO_SUCH_TABLE') {
-        logger.warn('Expiring open offers on cancel failed (non-fatal) · id=' + jobId + ' · ' + e.message);
-      }
-    }
+  }
+
+  /*
+   * CLOSE THE OPEN OFFERS when the job ENTERS a state where they can no longer
+   * be accepted. This used to live inside the CANCELLED branch above and fired
+   * only on cancellation (2026-07-29); it now covers every terminal status,
+   * because the same defect was reported against a COMPLETED job — the
+   * technician app still offering Accept / Reject for finished work.
+   *
+   * ENTERING-only, exactly as the cancel version was: a 6→6 re-submit, or a
+   * 3→5 move between two terminal codes, must not re-stamp responded_at on
+   * rows a previous transition already closed.
+   */
+  if (OFFER_WITHDRAWAL_STATES.has(Number(status))
+      && !OFFER_WITHDRAWAL_STATES.has(Number(existing.job_status))) {
+    await withdrawOffersForClosedJob(jobId, Number(status));
   }
 
   // Ops took a deliberate status action (confirm 9→0, cancel, enquiry, …) — any
@@ -6274,7 +6323,7 @@ module.exports = {
   // THE OFFER MODEL (pool offers): offer one job to many techs, list a job's
   // open offers, and list a tech's open offers.
   offerToTechnicians, listOffers, listOfferedForTech, techHasOpenOffer, rejectOffer,
-  isOfferFlowActive, expireStaleOffers,
+  isOfferFlowActive, expireStaleOffers, withdrawOffersForClosedJob,
   // The 30-min offer window. Exported so the offer-REMINDER cron can bound its
   // re-push window by the same constant instead of re-declaring it and drifting.
   OFFER_TTL_MINUTES,

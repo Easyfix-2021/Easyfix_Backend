@@ -113,12 +113,46 @@ test('a cancelled → cancelled no-op does NOT re-expire (responded_at is not re
   assert.equal(offerUpdates().length, 0, 'only the transition INTO cancelled expires offers');
 });
 
-test('SCOPE: no other status transition touches tbl_job_offer', async () => {
-  for (const status of [0, 1, 2, 3, 7, 9, 10]) {
+test('SCOPE: every TERMINAL status closes the open offers, not just cancel', async () => {
+  /*
+   * WIDENED 2026-09-04, deliberately. This test previously asserted that ONLY
+   * cancellation touched tbl_job_offer. That scope was the bug: the same defect
+   * was reported against a COMPLETED job — the technician app still showing
+   * Accept / Reject for finished work — and production held 1,606 open offers
+   * on jobs that were already completed or cancelled.
+   *
+   * 3 COMPLETED · 5 COMPLETED_ALT · 6 CANCELLED · 10 CLOSED_FROM_APP —
+   * OFFER_WITHDRAWAL_STATES in services/job.service.js. Change both together.
+   */
+  for (const status of [3, 5, 6, 10]) {
     fake.reset();
     await runStatus(status, 1);
-    assert.equal(offerUpdates().length, 0, `status ${status} must not touch tbl_job_offer`);
+    assert.equal(offerUpdates().length, 1,
+      `terminal status ${status} must close the open offers`);
   }
+});
+
+test('SCOPE CONTROL: a LIVE status still touches nothing', async () => {
+  /*
+   * The expensive failure this guards: a withdrawal set that is too wide
+   * cancels every technician's real, actionable offer. Without this, an
+   * implementation that closed offers on EVERY transition would pass the test
+   * above perfectly.
+   */
+  for (const status of [0, 1, 2, 9]) {
+    fake.reset();
+    await runStatus(status, 1);
+    assert.equal(offerUpdates().length, 0, `live status ${status} must not touch tbl_job_offer`);
+  }
+});
+
+test('a move BETWEEN two terminal statuses does not re-stamp responded_at', async () => {
+  // 3 -> 5 is terminal -> terminal. The rows were closed by the first
+  // transition; re-closing them would overwrite the moment each was actually
+  // withdrawn, which is the audit value of responded_at.
+  fake.reset();
+  await runStatus(5, 3);
+  assert.equal(offerUpdates().length, 0, 'already-terminal jobs must not re-run the close');
 });
 
 test('the expire runs AFTER the job UPDATE — the cancellation is persisted first', async () => {
