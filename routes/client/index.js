@@ -2392,7 +2392,23 @@ router.get('/unreachable-jobs', async (req, res, next) => {
      * dates in [anchor, anchor+2]. Kept as a derived set rather than repeated
      * inline so the list and the count select the identical jobs.
      */
-    const params = [req.spoc.client_id, ...scopeParams, req.spoc.client_id, ...scopeParams, limit];
+    /*
+     * The two client-request reason ids, bound into the correlated subquery in
+     * the SELECT list. Their placeholders sit between the CTE's parameters and
+     * the outer WHERE's, so they go there in this array too — mysql2 binds
+     * positionally, and a `?` counted wrong shifts every later value silently.
+     *
+     * 0 when the seed migration has not run on this host: no row can have id 0,
+     * so the subquery yields NULL and every row reports no request — the same
+     * answer as "nobody has asked for anything", which is true there.
+     */
+    const reqIds = await clientRequest.reasonIds(pool);
+    const params = [
+      req.spoc.client_id, ...scopeParams,
+      reqIds?.cancel ?? 0, reqIds?.retry ?? 0,
+      req.spoc.client_id, ...scopeParams,
+      limit,
+    ];
     const [rows] = await pool.query(`
       WITH cl AS (
         SELECT DISTINCT c.job_id, DATE(c.created_on) AS d
@@ -2416,7 +2432,24 @@ router.get('/unreachable-jobs', async (req, res, next) => {
              TIMESTAMPDIFF(HOUR, j.ticket_created_date_time, NOW()) DIV 24 AS age_days,
              COUNT(DISTINCT DATE(c.created_on)) AS unreachable_days,
              COUNT(c.comment_id)                AS attempts,
-             MAX(c.created_on)                  AS last_attempt
+             MAX(c.created_on)                  AS last_attempt,
+             /*
+              * What this client has ALREADY asked for on this job, so the row
+              * can say so instead of offering the same button again. Without
+              * it the request is invisible the moment the page reloads, and the
+              * only feedback a client has that it worked is that nothing
+              * happened — which reliably produces duplicates.
+              *
+              * Correlated rather than another JOIN: the outer query already
+              * groups over comment_on = 16 rows, and joining the request rows
+              * in as well would multiply the attempt counts beside it.
+              */
+             (SELECT rq.enum_reason_id
+                FROM tbl_job_comment rq
+               WHERE rq.job_id = j.job_id
+                 AND rq.enum_reason_id IN (?, ?)
+               ORDER BY rq.comment_id DESC
+               LIMIT 1) AS client_request_reason_id
         FROM tbl_job j
         JOIN (SELECT DISTINCT job_id FROM qualified) q ON q.job_id = j.job_id
         JOIN tbl_job_comment c ON c.job_id = j.job_id AND c.comment_on = 16
@@ -2441,6 +2474,8 @@ router.get('/unreachable-jobs', async (req, res, next) => {
         unreachableDays: Number(r.unreachable_days) || 0,
         attempts: Number(r.attempts) || 0,
         lastAttempt: r.last_attempt,
+        // 'cancel' | 'retry' | null — what this client already asked for.
+        clientRequest: clientRequest.kindOfReasonId(reqIds, r.client_request_reason_id),
       })),
       total: rows.length,
     });
