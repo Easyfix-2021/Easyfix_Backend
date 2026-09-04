@@ -55,6 +55,33 @@
  * Usage (from package.json):  node scripts/test-no-skips.js tests/*.test.js
  * The wrapper supplies --test and --test-force-exit; pass only the files.
  */
+/*
+ * ─── THE FLOOR, AND THE RUN THAT MADE IT NECESSARY ─────────────────────────
+ *
+ * On 2026-09-04 a run reported `tests 2691 · pass 2691 · fail 0 · skipped 0`
+ * and exited 0. The suite has 2693. Two tests had not run — and they were the
+ * LAST TWO DECLARED in job-export-filters.test.js (lines 753 and 761 of 766),
+ * with the other 46 present. That is a truncated tail, not a missing file.
+ *
+ * The cause is the `--test-force-exit` this wrapper itself passes, which the
+ * header above already names as a race: it exits the runner once the tests it
+ * KNOWS about are done, and under load the last file's remaining results never
+ * land. The flag cannot simply be dropped — without it the suite hangs on an
+ * open DB pool, which is why it is here.
+ *
+ * Nothing else could see it. Every counter was internally consistent with the
+ * truncation: zero failed, zero skipped, and a total that is only wrong if you
+ * already know what it should be. Six consecutive re-runs then gave 2693, so
+ * this is rare — which makes it worse, not better. A gate that silently drops
+ * tests occasionally is one that will drop the wrong two eventually.
+ *
+ * So the wrapper is told what it should be. MIN_TESTS is a RATCHET, in the same
+ * spirit as the skip check: adding tests never touches it, because the total
+ * only rises. It has to be lowered by hand when tests are deliberately deleted,
+ * and that is the point — a suite that shrinks should say so out loud.
+ */
+const MIN_TESTS = 2693;
+
 const { spawn } = require('node:child_process');
 
 const child = spawn(
@@ -70,6 +97,7 @@ const skippedTests = [];
 const todoTests = [];
 let skippedCount = null;
 let todoCount = null;
+let testCount = null;
 let partial = '';
 
 // The whole stream is scanned line by line rather than a trailing buffer: with
@@ -89,6 +117,10 @@ function scan(line) {
   if (m) skippedCount = Number(m[1]);
   const t = /^(?:#|ℹ) todo (\d+)\s*$/.exec(line);
   if (t) todoCount = Number(t[1]);
+  // tap: `# tests 2693`  ·  spec: `ℹ tests 2693`. Same column-0 anchor as the
+  // others, so a nested subtest summary cannot overwrite the real total.
+  const n = /^(?:#|ℹ) tests (\d+)\s*$/.exec(line);
+  if (n) testCount = Number(n[1]);
 }
 
 child.stdout.on('data', (buf) => {
@@ -109,8 +141,8 @@ child.on('close', (code, signal) => {
   // A real test failure is reported by the runner and passed straight through —
   // this wrapper never masks it, and never adds noise on top of it.
   if (code !== 0) process.exit(code);
-  if (skippedCount === null || todoCount === null) {
-    console.error('\ncould not find the "skipped"/"todo" summary lines in the test output.'
+  if (skippedCount === null || todoCount === null || testCount === null) {
+    console.error('\ncould not find the "tests"/"skipped"/"todo" summary lines in the test output.'
       + '\nThe runner exited 0, but this wrapper cannot confirm zero skips, so it fails'
       + '\nrather than reporting a clean it did not verify. Has the reporter format changed?');
     process.exit(1);
@@ -138,6 +170,17 @@ child.on('close', (code, signal) => {
    * usually means an unmet precondition, a todo means unwritten work.
    */
   const problems = [];
+  if (testCount < MIN_TESTS) {
+    problems.push([`only ${testCount} test(s) ran; this suite has at least ${MIN_TESTS}.`,
+      'Nothing failed and nothing was skipped, which is exactly what a TRUNCATED run looks',
+      'like: the counters only count what the runner saw finish. Two likely causes —',
+      `  · the --test-force-exit race (see the header). Re-run; if it comes back at ${MIN_TESTS},`,
+      '    that was it, and the run that reported fewer proved nothing.',
+      '  · tests were deliberately deleted. Then lower MIN_TESTS in this file, in the same',
+      '    commit that removes them, so the suite never quietly shrinks again.',
+      'Note this wrapper is meant for the whole suite; a deliberate subset run will trip it.',
+    ].join('\n'));
+  }
   if (skippedCount > 0 || skippedTests.length > 0) {
     problems.push([`${Math.max(skippedCount, skippedTests.length)} test(s) or suite(s) SKIPPED.`,
       'A skipped test is a guard that is not running, so this is a failure. Either make',
