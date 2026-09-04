@@ -182,20 +182,31 @@ async function sendJobOfferPushBatch(efrIds, { jobId, reminder = false } = {}) {
  * Best-effort by the same contract as the offer pushes: never throws, safe to
  * call unawaited. A failed push must never break the reassign that caused it.
  */
-async function sendJobRemovedPush(efrId, { jobId } = {}) {
+async function sendJobRemovedPush(efrId, { jobId, reassigned = false } = {}) {
   try {
-    logger.info('Sending job-removed push · efrId=' + efrId + ' · jobId=' + jobId);
+    logger.info('Sending job-removed push · efrId=' + efrId + ' · jobId=' + jobId
+      + (reassigned ? ' · reassigned' : ''));
     if (!efrId) return { delivered: false, reason: 'no efrId' };
 
+    /*
+     * The two callers mean different things and the technician can act on the
+     * difference, so they do NOT share one sentence. A reassign hands the job
+     * to someone else and it is gone for good; a plain unassign returns it to
+     * the pool, where this same technician may well be offered it again. Saying
+     * "reassigned to another technician" on an unassign would be a plain
+     * untruth in the one place the technician has no way to check.
+     */
     const message = {
       title: 'EasyFix',
-      body: `Job #${jobId} has been reassigned to another technician and is no longer yours.`,
+      body: reassigned
+        ? `Job #${jobId} has been reassigned to another technician and is no longer yours.`
+        : `Job #${jobId} has been removed from your schedule.`,
       data: { type: 'job_removed', removedJobId: String(jobId) },
     };
     const r = await pushDelivery.deliverToEfr(
       efrId,
       message,
-      { channel: 'job-removed', label: `job-removed · efr=${efrId} · job=${jobId}` },
+      { channel: 'job-removed', label: `job-removed · efr=${efrId} · job=${jobId}` + (reassigned ? ' · reassigned' : '') },
     );
     if (r.reason === 'no tokens') {
       logger.info({ efrId, jobId }, 'job-removed-push: no device tokens — skipping');

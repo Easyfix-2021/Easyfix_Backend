@@ -5205,7 +5205,7 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
     // deliberately left alone here: this is the reassign path only.
     if (releasedTechId != null) {
       require('./job-offer-push.service')
-        .sendJobRemovedPush(releasedTechId, { jobId })
+        .sendJobRemovedPush(releasedTechId, { jobId, reassigned: true })
         .catch(() => {});
     }
     // The outgoing technician has genuinely left the queue (fk cleared), so log
@@ -5511,6 +5511,20 @@ async function unassign(jobId, { reason, reasonId }, actor) {
     logger.info('Unassign no-op, job has no technician · id=' + jobId);
   } else {
     logger.info('Job unassigned · id=' + jobId + ' · removedTech=' + techIdAtUnassign);
+    /*
+     * Same removal push the reassign path sends, for the same reason: the job
+     * leaves the technician's queue the moment this commits, and until now they
+     * found out only on their next refresh. `reassigned: false` — an unassign
+     * returns the job to the pool rather than handing it to someone else, and
+     * this technician may be offered it again.
+     *
+     * NOT sent from rejectOffer(), the third caller of applyUnassignLocked:
+     * there the technician is the one declining, so a push telling them they
+     * lost the job is noise about their own click.
+     */
+    require('./job-offer-push.service')
+      .sendJobRemovedPush(techIdAtUnassign, { jobId })
+      .catch(() => {});
     // Reschedule-shaped event (job is leaving the tech's queue).
     // Clients that already received a TechAssigned for this job will
     // get a RescheduleTech to invalidate downstream state.
