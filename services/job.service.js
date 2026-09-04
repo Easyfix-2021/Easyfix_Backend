@@ -5006,6 +5006,97 @@ async function assertTechniciansCanReceiveJobs(
 }
 
 /*
+ * Hand an OWNED job back to the pool so it can be re-offered.
+ *
+ * offerToTechnicians() refuses a job that still has an owner
+ * (JOB_NOT_OFFERABLE) and acceptOffer()'s first-wins claim is gated on
+ * `job_status = BOOKED AND fk_easyfixter_id IS NULL` — so a reassign can only
+ * become an offer if the outgoing technician's claim is released FIRST.
+ * Reuses applyUnassignLocked (the mobile-reject primitive): fk cleared,
+ * scheduled_date_time cleared, job back to BOOKED, plus the outgoing
+ * technician's scheduling_history row and their own still-open offer row.
+ *
+ * Runs in its own short transaction and COMMITS before the offer goes out,
+ * because offerToTechnicians() opens its own. The gap is safe by construction:
+ * anything that claims the job in between makes the follow-up offer fail its
+ * own locked JOB_NOT_OFFERABLE check instead of overwriting a live assignment.
+ *
+ * Returns the released technician id (never null — the caller gates on an
+ * owner being present).
+ */
+async function releaseOwnedJobForReoffer(jobId, preloadedJob, { reasonId, rescheduleReason }) {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [[lockedJob]] = await conn.query(
+      `SELECT job_id, job_status, fk_easyfixter_id
+         FROM tbl_job
+        WHERE job_id = ?
+        FOR UPDATE`,
+      [jobId],
+    );
+    if (!lockedJob) {
+      const err = new Error('job not found'); err.status = 404; throw err;
+    }
+    // Same drift guard the direct path applies: the unlocked read only SELECTED
+    // this branch, so an accept/unassign/cancel racing in between must 409
+    // rather than be silently overwritten by this stale request.
+    const lockedOwner = lockedJob.fk_easyfixter_id == null
+      ? null
+      : Number(lockedJob.fk_easyfixter_id);
+    if (Number(lockedJob.job_status) !== Number(preloadedJob.job_status)
+        || lockedOwner !== Number(preloadedJob.fk_easyfixter_id)) {
+      const err = new Error('job assignment changed; refresh and try again');
+      err.status = 409;
+      err.code = 'JOB_ASSIGNMENT_CHANGED';
+      throw err;
+    }
+    const releasedTechId = await applyUnassignLocked(conn, jobId, lockedJob, {
+      // The CRM reassign sends no reason (it is not a technician rejection), so
+      // scheduling_history would otherwise record the release with a NULL
+      // reason and read as an unexplained unassignment in the audit trail.
+      reason: rescheduleReason || 'Reassigned to another technician',
+      reasonId,
+      hasOfferTable: true,
+    });
+    /*
+     * Close every OTHER technician's still-open offer from the previous round
+     * while the job lock is held. persistJobOfferBatch only touches rows for
+     * the technicians being offered to, so a stale open decision would
+     * otherwise survive the release and let a third technician claim the job
+     * out from under the incoming offer.
+     *
+     * ── THIS WAS EXPLICITLY DECIDED, TWICE ──────────────────────────
+     * The owner first asked for the opposite (leave the old offers open and let
+     * whoever accepts first win), then confirmed this sweep instead
+     * (2026-09-04). Both are defensible — acceptOffer()'s claim is gated on
+     * `job_status = BOOKED AND fk_easyfixter_id IS NULL` under a row lock, so a
+     * free-for-all race would also have been SAFE, just less predictable for
+     * ops. Recorded because the code reads like an over-cautious tidy-up and is
+     * not: a future reader who "fixes" it back changes agreed behaviour.
+     *
+     * The outgoing technician's own row is already handled by
+     * applyUnassignLocked above, which rejects only the latest row for that
+     * technician — this sweep covers everyone else.
+     */
+    await conn.query(
+      `UPDATE tbl_job_offer
+          SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()
+        WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
+      [jobId],
+    );
+    await conn.commit();
+    return releasedTechId;
+  } catch (e) {
+    await conn.rollback();
+    logger.error('Release job for re-offer failed, rolled back · id=' + jobId + ' · ' + e.message);
+    throw e;
+  } finally {
+    conn.release();
+  }
+}
+
+/*
  * assign(jobId, body, actor)
  *
  * body:
@@ -5025,6 +5116,12 @@ async function assertTechniciansCanReceiveJobs(
  * offerToTechnicians() (job stays BOOKED, fk stays NULL, the tech gets an
  * offer + push) and the legacy hard-schedule path below is skipped entirely.
  * auto-assign.service.js calls assign() unchanged and transparently offers.
+ *
+ * A REASSIGN (the job already has a different technician, pre-start) is offered
+ * the same way: the outgoing claim is released back to the pool first, then the
+ * incoming technician is offered the job. The direct hard-schedule path below
+ * is therefore reached only with the flag OFF, without tbl_job_offer, when the
+ * same technician is re-assigned, or once the job has started.
  */
 async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requestedDateTime, timeSlot }, actor) {
   logger.info('Assign job to technician · id=' + jobId + ' · easyfixerId=' + easyfixerId + (requestedDateTime ? ' · reschedule=yes' : ''));
@@ -5067,6 +5164,50 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
       && hasOfferTable
       && Number(preloadedJob.job_status) === STATUS.BOOKED
       && preloadedJob.fk_easyfixter_id == null) {
+    return offerToTechnicians(jobId, [easyfixerId], actor, { requestedDateTime, timeSlot });
+  }
+
+  // THE OFFER MODEL, REASSIGN SIDE. Moving a job to a DIFFERENT technician has
+  // to ask the incoming one to accept or reject, exactly as a first assignment
+  // does — silently inheriting someone else's job is the defect this closes.
+  // Release the outgoing claim first (offerToTechnicians refuses an owned job),
+  // then offer: the incoming tech gets an OFFERED row + push, and their ACCEPT
+  // is what schedules the job.
+  //
+  // Deliberately narrow — three gates, each closing a specific blast radius:
+  //   • an owner exists AND differs from easyfixerId → a re-assign to the SAME
+  //     technician falls through to the direct path (re-stamps the schedule, no
+  //     pointless offer), and a first assignment was already handled above.
+  //   • DIRECT_REJECTABLE_STATES (BOOKED/SCHEDULED) → a started job is never
+  //     rewound to BOOKED; post-start reassigns keep the direct behaviour.
+  //   • offerFlowEnabled() + hasOfferTable → flag OFF or pre-migration deploy
+  //     behaves exactly as before.
+  // No automated allocator reaches this: assignTopCandidate 409s on an
+  // already-assigned job and bulkAssignUnassigned selects fk IS NULL only, so
+  // both auto-assign callers land in the first-assignment branch above.
+  const preloadedOwnerId = preloadedJob.fk_easyfixter_id == null
+    ? null
+    : Number(preloadedJob.fk_easyfixter_id);
+  if (offerFlowEnabled()
+      && hasOfferTable
+      && preloadedOwnerId != null
+      && preloadedOwnerId !== Number(easyfixerId)
+      && DIRECT_REJECTABLE_STATES.has(Number(preloadedJob.job_status))) {
+    // Eligibility is re-checked under lock inside offerToTechnicians, but check
+    // it BEFORE releasing too: otherwise an ineligible incoming technician
+    // leaves the job ownerless as the side effect of a request that then 400s.
+    await assertTechniciansCanReceiveJobs([easyfixerId]);
+    const releasedTechId = await releaseOwnedJobForReoffer(jobId, preloadedJob, { reasonId, rescheduleReason });
+    logger.info('Job released for re-offer · id=' + jobId + ' · from=' + releasedTechId + ' · to=' + easyfixerId);
+    // The outgoing technician has genuinely left the queue (fk cleared), so log
+    // and signal it the way unassign() does. offerToTechnicians() fires no job
+    // webhook by design — nomination is not assignment — so TechAssigned still
+    // waits for the accept.
+    await jobLog.logReschedule(jobId, {
+      previousEasyfixerId: releasedTechId,
+      newEasyfixerId: easyfixerId,
+    }, actor);
+    fireWebhook('RescheduleTech', jobId);
     return offerToTechnicians(jobId, [easyfixerId], actor, { requestedDateTime, timeSlot });
   }
 

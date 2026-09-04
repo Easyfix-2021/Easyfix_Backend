@@ -31,6 +31,9 @@ const fake = installFakePool([
   [/SELECT job_id, job_status, fk_easyfixter_id/, (sql) => [
     /FOR UPDATE/i.test(sql) ? scenario.lockedJob : scenario.preloadedJob,
   ]],
+  // applyUnassignLocked treats affectedRows !== 1 as lost-race drift, so the
+  // release has to report a hit or the reassign test never reaches its guard.
+  [/UPDATE tbl_job\s+SET fk_easyfixter_id = NULL/, { affectedRows: 1 }],
 ], { stopOn: /INSERT INTO (?:tbl_job_offer|scheduling_history)/ });
 
 const jobService = require('../services/job.service');
@@ -76,7 +79,13 @@ test('multi-tech offer locks sorted technicians then locks BOOKED/unowned job', 
   assert.ok(jobLock, 'job state must be revalidated under lock after technician locks');
 });
 
-test('assigned-job reassign stays direct and never creates an unacceptably stale pool offer', async () => {
+test('assigned-job reassign releases the outgoing claim under lock before any re-offer', async () => {
+  // A reassign is now an OFFER to the incoming technician (see
+  // tests/job-reassign-reoffer.test.js), which offerToTechnicians will only
+  // issue against a BOOKED, ownerless job. This file's stop-sentinel fires at
+  // the release's own scheduling_history INSERT, so what it still pins is the
+  // guard that matters here: the outgoing technician is removed while the job
+  // row lock is held, and the job is never hard-assigned to the incoming one.
   scenario.preloadedJob = { job_id: 100, job_status: 1, fk_easyfixter_id: 99 };
   scenario.lockedJob = { ...scenario.preloadedJob };
   await assert.rejects(
@@ -88,11 +97,14 @@ test('assigned-job reassign stays direct and never creates an unacceptably stale
     (error) => error.__stop === true,
   );
 
-  assert.ok(fake.calls.some((call) => /^\s*UPDATE tbl_job SET fk_easyfixter_id/.test(call.sql)));
-  assert.ok(!fake.calls.some((call) => /INSERT INTO tbl_job_offer/.test(call.sql)));
+  const jobLock = fake.calls.find((call) => /FROM tbl_job\s+WHERE job_id = \?\s+FOR UPDATE/.test(call.sql));
+  assert.ok(jobLock, 'the release must revalidate job state under lock');
+  const release = fake.calls.find((call) => /UPDATE tbl_job\s+SET fk_easyfixter_id = NULL/.test(call.sql));
+  assert.ok(release, 'the outgoing technician is released back to the pool');
+  assert.match(release.sql, /job_status = 0/);
   assert.ok(
-    fake.calls.some((call) => /^\s*UPDATE tbl_job_offer[\s\S]*offer_status = 3/.test(call.sql)),
-    'direct reassignment must expire every stale open pool offer while the job lock is held',
+    !fake.calls.some((call) => /^\s*UPDATE tbl_job SET fk_easyfixter_id = \?/.test(call.sql)),
+    'the incoming technician must not be hard-assigned — their accept schedules the job',
   );
 });
 
