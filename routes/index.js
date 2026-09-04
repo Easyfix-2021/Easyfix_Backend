@@ -15,6 +15,13 @@ router.get('/health', (_req, res) => {
   const overrideEmails = lookup._test.resolveMenuOverrideEmails();
   modernOk(res, {
     status: 'ok',
+    /*
+     * The commit this build came from, baked in by the Dockerfile's GIT_COMMIT
+     * build arg. 'unknown' on a local run or any image built without it —
+     * deliberately not omitted, because a MISSING field reads as "old build
+     * that predates this" and an explicit 'unknown' reads as what it is.
+     */
+    commit: process.env.GIT_COMMIT || 'unknown',
     uptime: process.uptime(),
     menuFilter: {
       enabled: visible !== null,

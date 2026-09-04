@@ -223,6 +223,11 @@ jobs:
           # to `linux/amd64,linux/arm64` (doubles build time, halves the
           # cache hit-rate on each push).
           platforms: linux/arm64
+          # Baked into the image and returned by GET /api/health, so a deploy
+          # can be confirmed by reading a SHA instead of inferring one from
+          # process uptime.
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
           tags: |
             ${{ steps.meta.outputs.image_uri }}
             ${{ steps.meta.outputs.moving_uri }}

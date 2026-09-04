@@ -50,8 +50,23 @@ COPY --chown=node:node . .
 
 # Tell PM2-less runtime + Express to listen on 0.0.0.0:5100. The compose
 # file maps host:5100 → container:5100.
+# The commit this image was built from, surfaced by GET /api/health.
+#
+# WHY: verifying a deploy previously meant inferring it from `uptime` — "the
+# process restarted about two minutes after I pushed, so it is probably the new
+# code". That is a correlation, not an answer, and it is unavailable the moment
+# anything else restarts the container. A SHA in the health payload turns
+# "did my change ship?" into one GET.
+#
+# Build ARG rather than a file read at runtime: the image has no .git, and
+# baking it at build time means the value cannot drift from the layers beside
+# it. Defaults to 'unknown' so a local `docker build` with no --build-arg still
+# works and says so honestly rather than claiming a commit it does not have.
+ARG GIT_COMMIT=unknown
+
 ENV NODE_ENV=production \
-    PORT=5100
+    PORT=5100 \
+    GIT_COMMIT=${GIT_COMMIT}
 
 EXPOSE 5100
 
