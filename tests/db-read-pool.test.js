@@ -17,11 +17,44 @@ const assert = require('node:assert');
 
 const OLD_ENV = { ...process.env };
 
+/*
+ * Every pool this file has caused to exist, in creation order. Dropping a db
+ * module from require.cache ORPHANS its pool: the next require builds a brand
+ * new one, and the old instance's mysql2 idle-reaper timer keeps running with
+ * nothing left holding a reference to it.
+ *
+ * That is invisible while the runner is launched with --test-force-exit, which
+ * kills the process regardless. Without that flag the orphans hold the event
+ * loop open and this file never exits — it was the ONLY file out of 220 that
+ * did so, and it kept the whole suite from terminating.
+ *
+ * So close each instance as it is discarded rather than only the last one.
+ */
+const orphanedPools = [];
+
+function retirePools() {
+  for (const k of Object.keys(require.cache)) {
+    if (!/db-read\.js$|[/\\]db\.js$/.test(k)) continue;
+    const exp = require.cache[k] && require.cache[k].exports;
+    // `readPool` is null when DB_READ_HOST is unset — that variant owns no pool.
+    for (const pool of [exp && exp.pool, exp && exp.readPool]) {
+      if (pool && typeof pool.end === 'function') orphanedPools.push(pool);
+    }
+    delete require.cache[k];
+  }
+}
+
+test.after(async () => {
+  // end() on an already-ended pool throws; the point is only that the timer is
+  // gone, so a throw here means it already is.
+  for (const pool of orphanedPools) {
+    try { await pool.end(); } catch (_) { /* already closed */ }
+  }
+});
+
 /** Load db-read fresh with the given env — module state is per-instance. */
 function loadWith(env) {
-  for (const k of Object.keys(require.cache)) {
-    if (/db-read\.js$|[/\\]db\.js$/.test(k)) delete require.cache[k];
-  }
+  retirePools();
   Object.assign(process.env, env);
   const db = require('../db');
   const mod = require('../db-read');

@@ -31,9 +31,9 @@
  * exact "pipe masks exit code" bug has already bitten this codebase once.
  *
  * Rejected: a custom reporter setting process.exitCode. It runs inside the
- * runner's process, and `--test-force-exit` calls process.exit() on a timer, so
- * whether the reporter's final flush lands first is a race. Clever, and someone
- * decodes it at 3am.
+ * runner's process, so its final flush raced `--test-force-exit`'s timed
+ * process.exit(). That flag is gone now (see below), but the objection stands
+ * on its own: clever, and someone decodes it at 3am.
  *
  * ─── THE PARSE, AND WHY IT MATCHES TWO FORMATS ─────────────────────────────
  *
@@ -53,7 +53,7 @@
  * anything must not report clean.
  *
  * Usage (from package.json):  node scripts/test-no-skips.js tests/*.test.js
- * The wrapper supplies --test and --test-force-exit; pass only the files.
+ * The wrapper supplies --test and the close-pool preload; pass only the files.
  */
 /*
  * ─── THE FLOOR, AND THE RUN THAT MADE IT NECESSARY ─────────────────────────
@@ -63,11 +63,21 @@
  * LAST TWO DECLARED in job-export-filters.test.js (lines 753 and 761 of 766),
  * with the other 46 present. That is a truncated tail, not a missing file.
  *
- * The cause is the `--test-force-exit` this wrapper itself passes, which the
- * header above already names as a race: it exits the runner once the tests it
- * KNOWS about are done, and under load the last file's remaining results never
- * land. The flag cannot simply be dropped — without it the suite hangs on an
- * open DB pool, which is why it is here.
+ * The cause was the `--test-force-exit` this wrapper used to pass: it exited
+ * the runner once the tests it KNEW about were done, and under load the last
+ * file's remaining results never landed.
+ *
+ * FIXED 2026-09-04. The flag is gone. It could not simply be dropped — without
+ * it the suite hung — so the hang was traced instead of worked around:
+ * `process.getActiveResourcesInfo()` showed that requiring db.js ALONE arms
+ * mysql2's idleTimeout reaper, and that single Timeout was the only thing
+ * holding the loop open (services added nothing). tests/helpers/close-pool.js
+ * now closes the pool in a root `after` hook, preloaded via --require into
+ * every test file's child process, so the runner exits on its own and every
+ * result lands.
+ *
+ * MIN_TESTS stays. The floor is what CAUGHT this, and it is the only thing
+ * that would notice if the truncation ever returned by another route.
  *
  * Nothing else could see it. Every counter was internally consistent with the
  * truncation: zero failed, zero skipped, and a total that is only wrong if you
@@ -86,7 +96,18 @@ const { spawn } = require('node:child_process');
 
 const child = spawn(
   process.execPath,
-  ['--test', '--test-force-exit', ...process.argv.slice(2)],
+  // `--require` loads tests/helpers/close-pool.js into EVERY test file's child
+  // process, where a root `after` hook closes the DB pool. That is what lets
+  // the runner exit on its own — see that file for the measurement showing
+  // mysql2's idleTimeout reaper is the only handle holding the loop open.
+  //
+  // `--test-force-exit` USED TO BE HERE and is deliberately gone. It exited the
+  // runner once the tests it knew about had finished, so under load the last
+  // file's results never landed: a truncated run reporting `fail 0, skipped 0`
+  // and a total nobody would question. Three runs of ea2705a counted 2651, 2661
+  // and 2693. Putting the flag back reintroduces exactly that, and MIN_TESTS
+  // below is the only thing that would notice.
+  ['--test', '--require', require.resolve('../tests/helpers/close-pool.js'), ...process.argv.slice(2)],
   // stdout piped so it can be parsed, stderr inherited. Output is written
   // through as it arrives rather than buffered, so a 20-second 2593-test run
   // still scrolls live in the Actions log.
@@ -173,11 +194,24 @@ child.on('close', (code, signal) => {
   if (testCount < MIN_TESTS) {
     problems.push([`only ${testCount} test(s) ran; this suite has at least ${MIN_TESTS}.`,
       'Nothing failed and nothing was skipped, which is exactly what a TRUNCATED run looks',
-      'like: the counters only count what the runner saw finish. Two likely causes —',
-      `  · the --test-force-exit race (see the header). Re-run; if it comes back at ${MIN_TESTS},`,
-      '    that was it, and the run that reported fewer proved nothing.',
+      'like: the counters only count what the runner saw finish.',
+      '',
+      'DO NOT JUST RE-RUN. That used to be the advice, because --test-force-exit made',
+      'this intermittent. That flag is gone (2026-09-04) and three consecutive runs now',
+      `give ${MIN_TESTS} every time, so a short count here is REPRODUCIBLE and means`,
+      'something real. Re-rolling until it passes only hides it — and cost two failed',
+      'deploys the day this was written.',
+      '',
+      'Three causes, in the order worth checking —',
       '  · tests were deliberately deleted. Then lower MIN_TESTS in this file, in the same',
       '    commit that removes them, so the suite never quietly shrinks again.',
+      '  · a test file no longer exits on its own, so the runner never collected its',
+      '    results. Find it with: for f in tests/*.test.js; do node --test "$f"; done',
+      '    and watch for one that does not return. The usual cause is a module that owns',
+      '    a pool or timer and is dropped from require.cache (see tests/db-read-pool.test.js)',
+      '    or never closed (see tests/helpers/close-pool.js).',
+      '  · something re-introduced --test-force-exit, or another flag that exits early.',
+      '',
       'Note this wrapper is meant for the whole suite; a deliberate subset run will trip it.',
     ].join('\n'));
   }
