@@ -1697,6 +1697,24 @@ async function rankCandidatesForJob(jobId, {
     city_id:           job.city_id          ?? null,
     city_name:         job.city_name        ?? null,
     pin_code:          job.pin_code         ?? null,
+    /*
+     * The remaining tbl_address columns exist here for ONE reason: Schedule &
+     * Assign now opens the same Edit Address dialog the job detail modal does,
+     * and that dialog SEEDS ITS FORM FROM THIS OBJECT. This payload is a
+     * hand-picked subset — NOT `j.*` — so a column missing here renders as an
+     * empty box over a stored value, and the map cannot centre on a pin it was
+     * never handed.
+     *
+     * Leaving them out was not destructive (the dialog sends `|| undefined` per
+     * field and the PATCH skips undefined keys), but "blank box, Save does
+     * nothing" is exactly what gets reported as data loss. Add a field to that
+     * dialog ⇒ add it to BOTH copies of this projection — the ranked header and
+     * the search-variant below are separate literals that must not drift.
+     */
+    building:            job.building            ?? null,
+    landmark:            job.landmark            ?? null,
+    gps_location:        job.gps_location        ?? null,
+    address_instruction: job.address_instruction ?? null,
     // Prefer the RESOLVED category name (from fk_service_catg_id) over the
     // legacy free-text job.service_category column, which is NULL on most
     // client-imported jobs (why the modal header showed "—").
@@ -2413,6 +2431,24 @@ async function searchJobHeader(job) {
     city_id:           job.city_id          ?? null,
     city_name:         job.city_name        ?? null,
     pin_code:          job.pin_code         ?? null,
+    /*
+     * The remaining tbl_address columns exist here for ONE reason: Schedule &
+     * Assign now opens the same Edit Address dialog the job detail modal does,
+     * and that dialog SEEDS ITS FORM FROM THIS OBJECT. This payload is a
+     * hand-picked subset — NOT `j.*` — so a column missing here renders as an
+     * empty box over a stored value, and the map cannot centre on a pin it was
+     * never handed.
+     *
+     * Leaving them out was not destructive (the dialog sends `|| undefined` per
+     * field and the PATCH skips undefined keys), but "blank box, Save does
+     * nothing" is exactly what gets reported as data loss. Add a field to that
+     * dialog ⇒ add it to BOTH copies of this projection — the ranked header and
+     * the search-variant below are separate literals that must not drift.
+     */
+    building:            job.building            ?? null,
+    landmark:            job.landmark            ?? null,
+    gps_location:        job.gps_location        ?? null,
+    address_instruction: job.address_instruction ?? null,
     service_category:  serviceCatgName ?? job.service_category ?? null,
     service_type:      serviceTypeName      ?? null,
     deep_skill_label:  deepSkillLabel       ?? null,
