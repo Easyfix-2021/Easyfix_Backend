@@ -943,6 +943,21 @@ router.post('/bulk-upload',
            * enforcing the rule here would not backfill anything — it would just
            * make every one of the ~7.5k active users who has none today
            * permanently un-bulk-updatable.
+           *
+           * enforceHrIdentifiers is likewise NOT passed, which means this
+           * spreadsheet is a route around the "fill the six identifiers before
+           * you can save" rule that routes/admin/users.js enforces on the
+           * Add/Edit User form. That was raised and DECIDED — deliberately off
+           * here for now (2026-09-04) — because the enforcement is merge-aware
+           * over the WHOLE person, so a row changing only a reporting manager
+           * would fail on an unrelated missing Aadhaar the uploader was never
+           * asked for and cannot see.
+           *
+           * Recorded because the asymmetry is otherwise indistinguishable from
+           * an oversight: the two single-user call sites pass the flag, this
+           * one does not, and the obvious "fix" is to add it. "For now" is the
+           * owner's word — revisit if bulk ever grows a way to show the
+           * operator WHICH identifiers a row is missing before it rejects it.
            */
           const result = await userService.updateUser(
             userId, fields, req.user?.user_id, { dryRun, enforcePersonalEmail: false },
