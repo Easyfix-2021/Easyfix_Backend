@@ -1615,6 +1615,90 @@ async function diagnoseEmptyPool(job, rejected = []) {
  * → efr_zone_city_id), excluding the city pool, and the same filters re-applied;
  * results merge and `note` is tagged 'zone_widened'. Net-new vs legacy.
  */
+/*
+ * buildJobHeader — THE Schedule & Assign job header, built in exactly one place.
+ *
+ * Two endpoints return this object and both feed the SAME <JobContextPanel>:
+ * the ranked top-10 (/candidates) and the technician search (/candidates/search).
+ * They used to be two hand-written object literals, and they had already
+ * drifted: the search copy was missing Client SPOC, Booked By, Booked On,
+ * Collected By, Additional Comments and assigned_efr_id.
+ *
+ * The drift is invisible at the call site and silent at runtime. This object is
+ * an ALLOWLIST over the getById payload — a field not copied here arrives at the
+ * modal as `undefined` and renders as an empty row, which is exactly how Booked
+ * By / Booked On / Client SPOC went blank once already. Nothing throws, so the
+ * only signal is an operator noticing a field that used to have a value.
+ *
+ * One builder, one place to add a field. tests/candidate-job-header.test.js
+ * pins that both callers still route through it.
+ */
+function buildJobHeader(job, {
+  serviceCatgName = null,
+  serviceTypeName = null,
+  deepSkillLabel = null,
+  jobSkillsByService = null,
+  // Only the ranked path knows whether the job is already assigned; the search
+  // header has no such concept, so it keeps A's "not assigned" value rather
+  // than inventing one from fk_easyfixter_id (a different question).
+  assignedEfrId = null,
+} = {}) {
+  return {
+    job_id:            job.job_id,
+    // `?? null` like every sibling: without it an absent column serialises
+    // AWAY (JSON.stringify drops undefined) rather than arriving as an
+    // explicit empty, and the client cannot tell "no value" from "no field".
+    fk_client_id:      job.fk_client_id     ?? null,
+    customer_name:     job.customer_name    ?? null,
+    customer_mob_no:   job.customer_mob_no  ?? null,
+    client_name:       job.client_name      ?? null,
+    client_ref_id:     job.client_ref_id    ?? null,
+    address:           job.address          ?? null,
+    city_id:           job.city_id          ?? null,
+    city_name:         job.city_name        ?? null,
+    pin_code:          job.pin_code         ?? null,
+    /*
+     * The remaining tbl_address columns are here for ONE reason: Schedule &
+     * Assign opens the same Edit Address dialog the job detail modal does, and
+     * that dialog SEEDS ITS FORM FROM THIS OBJECT. A column missing here renders
+     * as an empty box over a stored value, and the map cannot centre on a pin it
+     * was never handed. Add a field to that dialog => add it here.
+     */
+    building:            job.building            ?? null,
+    landmark:            job.landmark            ?? null,
+    gps_location:        job.gps_location        ?? null,
+    address_instruction: job.address_instruction ?? null,
+    // Prefer the RESOLVED category name (from fk_service_catg_id) over the
+    // legacy free-text job.service_category column, which is NULL on most
+    // client-imported jobs (why the modal header showed "—").
+    service_category:  serviceCatgName ?? job.service_category ?? null,
+    service_type:      serviceTypeName      ?? null,
+    deep_skill_label:  deepSkillLabel       ?? null,
+    services:          mapJobServices(job, jobSkillsByService),
+    job_type:          job.job_type         ?? null,
+    payment_mode:      paidByLabel(job.paid_by),
+    requested_date_time: job.requested_date_time ?? null,
+    time_slot:         job.time_slot        ?? null,
+    // The legacy "H AM - H PM" cut-off window — the Schedule & Assign modal shows
+    // THIS as the read-only Time Slot (the customer's booked slot), not a
+    // client-derived label. Reschedule re-derives it BE-side from the new time.
+    booking_cut_off_time_slot: job.booking_cut_off_time_slot ?? null,
+    job_desc:          job.job_desc         ?? null,
+    paid_by:           job.paid_by          ?? null,
+    paid_by_label:     paidByLabel(job.paid_by),
+    assigned_efr_id:   assignedEfrId,
+    // Schedule & Assign Job Details fields.
+    client_spoc:       job.client_spoc      ?? null,
+    client_spoc_name:  job.client_spoc_name ?? null,
+    created_by_name:   job.created_by_name  ?? null,
+    created_date_time: job.created_date_time ?? null,
+    // Who collects payment — per JOB. Shown against Paid service lines.
+    collected_by:      job.collected_by     ?? null,
+    // Technician-facing note, surfaced as "Additional Comments".
+    efr_special_notes: job.efr_special_notes ?? null,
+  };
+}
+
 async function rankCandidatesForJob(jobId, {
   limit = 10, jobDate, timeSlot,
   enforceMaxConcurrent = true, enforceCodBalance = false, enforceAttendance = true,
@@ -1686,67 +1770,9 @@ async function rankCandidatesForJob(jobId, {
 
   // Pre-build the enriched job payload used in ALL return paths (early-exit
   // on zero-eligible and the normal ranked return).
-  const enrichedJob = {
-    job_id:            job.job_id,
-    fk_client_id:      job.fk_client_id,
-    customer_name:     job.customer_name    ?? null,
-    customer_mob_no:   job.customer_mob_no  ?? null,
-    client_name:       job.client_name      ?? null,
-    client_ref_id:     job.client_ref_id    ?? null,
-    address:           job.address          ?? null,
-    city_id:           job.city_id          ?? null,
-    city_name:         job.city_name        ?? null,
-    pin_code:          job.pin_code         ?? null,
-    /*
-     * The remaining tbl_address columns exist here for ONE reason: Schedule &
-     * Assign now opens the same Edit Address dialog the job detail modal does,
-     * and that dialog SEEDS ITS FORM FROM THIS OBJECT. This payload is a
-     * hand-picked subset — NOT `j.*` — so a column missing here renders as an
-     * empty box over a stored value, and the map cannot centre on a pin it was
-     * never handed.
-     *
-     * Leaving them out was not destructive (the dialog sends `|| undefined` per
-     * field and the PATCH skips undefined keys), but "blank box, Save does
-     * nothing" is exactly what gets reported as data loss. Add a field to that
-     * dialog ⇒ add it to BOTH copies of this projection — the ranked header and
-     * the search-variant below are separate literals that must not drift.
-     */
-    building:            job.building            ?? null,
-    landmark:            job.landmark            ?? null,
-    gps_location:        job.gps_location        ?? null,
-    address_instruction: job.address_instruction ?? null,
-    // Prefer the RESOLVED category name (from fk_service_catg_id) over the
-    // legacy free-text job.service_category column, which is NULL on most
-    // client-imported jobs (why the modal header showed "—").
-    service_category:  serviceCatgName ?? job.service_category ?? null,
-    service_type:      serviceTypeName      ?? null,
-    deep_skill_label:  deepSkillLabel       ?? null,
-    services:          mapJobServices(job, jobSkillsByService),
-    job_type:          job.job_type         ?? null,
-    payment_mode:      paidByLabel(job.paid_by),
-    requested_date_time: job.requested_date_time ?? null,
-    time_slot:         job.time_slot        ?? null,
-    // The legacy "H AM - H PM" cut-off window — the Schedule & Assign modal shows
-    // THIS as the read-only Time Slot (the customer's booked slot), not a
-    // client-derived label. Reschedule re-derives it BE-side from the new time.
-    booking_cut_off_time_slot: job.booking_cut_off_time_slot ?? null,
-    job_desc:          job.job_desc         ?? null,
-    paid_by:           job.paid_by          ?? null,
-    paid_by_label:     paidByLabel(job.paid_by),
-    assigned_efr_id:   assignedEfrId,
-    // Schedule & Assign Job Details fields. This object is an ALLOWLIST over the
-    // getById payload — anything not copied here reaches the modal as undefined
-    // and renders blank, which is exactly what happened to Booked By / Booked On
-    // / Client SPOC. Add the field HERE too when the modal grows a column.
-    client_spoc:       job.client_spoc      ?? null,
-    client_spoc_name:  job.client_spoc_name ?? null,
-    created_by_name:   job.created_by_name  ?? null,
-    created_date_time: job.created_date_time ?? null,
-    // Who collects payment — per JOB. Shown against Paid service lines.
-    collected_by:      job.collected_by     ?? null,
-    // Technician-facing note, surfaced as "Additional Comments".
-    efr_special_notes: job.efr_special_notes ?? null,
-  };
+  const enrichedJob = buildJobHeader(job, {
+    serviceCatgName, serviceTypeName, deepSkillLabel, jobSkillsByService, assignedEfrId,
+  });
 
   // COD = customer pays the tech on-site (paid_by = Customer). Such techs
   // need cash on hand → optionally hard-filter balance > floor.
@@ -2420,48 +2446,9 @@ async function searchJobHeader(job) {
   const deepSkillLabel = [serviceCatgName, serviceTypeName].filter(Boolean).join(' › ') || null;
   // Same single batched Job Skill Matrix lookup the ranked header does.
   const jobSkillsByService = await loadJobSkillMatrix(job);
-  return {
-    job_id:            job.job_id,
-    fk_client_id:      job.fk_client_id,
-    customer_name:     job.customer_name    ?? null,
-    customer_mob_no:   job.customer_mob_no  ?? null,
-    client_name:       job.client_name      ?? null,
-    client_ref_id:     job.client_ref_id    ?? null,
-    address:           job.address          ?? null,
-    city_id:           job.city_id          ?? null,
-    city_name:         job.city_name        ?? null,
-    pin_code:          job.pin_code         ?? null,
-    /*
-     * The remaining tbl_address columns exist here for ONE reason: Schedule &
-     * Assign now opens the same Edit Address dialog the job detail modal does,
-     * and that dialog SEEDS ITS FORM FROM THIS OBJECT. This payload is a
-     * hand-picked subset — NOT `j.*` — so a column missing here renders as an
-     * empty box over a stored value, and the map cannot centre on a pin it was
-     * never handed.
-     *
-     * Leaving them out was not destructive (the dialog sends `|| undefined` per
-     * field and the PATCH skips undefined keys), but "blank box, Save does
-     * nothing" is exactly what gets reported as data loss. Add a field to that
-     * dialog ⇒ add it to BOTH copies of this projection — the ranked header and
-     * the search-variant below are separate literals that must not drift.
-     */
-    building:            job.building            ?? null,
-    landmark:            job.landmark            ?? null,
-    gps_location:        job.gps_location        ?? null,
-    address_instruction: job.address_instruction ?? null,
-    service_category:  serviceCatgName ?? job.service_category ?? null,
-    service_type:      serviceTypeName      ?? null,
-    deep_skill_label:  deepSkillLabel       ?? null,
-    services:          mapJobServices(job, jobSkillsByService),
-    job_type:          job.job_type         ?? null,
-    payment_mode:      paidByLabel(job.paid_by),
-    requested_date_time: job.requested_date_time ?? null,
-    time_slot:         job.time_slot        ?? null,
-    booking_cut_off_time_slot: job.booking_cut_off_time_slot ?? null,
-    job_desc:          job.job_desc         ?? null,
-    paid_by:           job.paid_by          ?? null,
-    paid_by_label:     paidByLabel(job.paid_by),
-  };
+  return buildJobHeader(job, {
+    serviceCatgName, serviceTypeName, deepSkillLabel, jobSkillsByService,
+  });
 }
 
 /*
@@ -2739,4 +2726,7 @@ module.exports = {
   RANKING_ORDER,
   PERFORMANCE_SUB,
   DEFAULTS,
+  // Exported for tests only: the Schedule & Assign header allowlist is the
+  // thing that silently drifted, so it needs to be assertable directly.
+  _internals: { buildJobHeader },
 };
