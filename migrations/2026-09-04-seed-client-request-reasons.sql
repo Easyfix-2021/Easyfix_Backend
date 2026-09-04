@@ -29,14 +29,36 @@
 -- EXACTLY — resolution is by description, so a wording change here without the
 -- matching change there silently turns the feature off.
 --
--- Columns set: action_type, action_desc, user_type, status(=1 active). id is
--- AUTO_INCREMENT and is deliberately NOT hardcoded anywhere: it differs per
+-- ⚠ is_new = 0, AND THE OBVIOUS VALUE IS THE DANGEROUS ONE.
+--
+-- is_new is NOT NULL with no default on this table (the first run of this file
+-- failed with "Field 'is_new' doesn't have a default value"), so it must be set.
+-- Semantically these are new curated rows, which argues for 1. Do not.
+--
+-- GET /api/admin/jobs/cancel-reasons filters `is_new = MAX(is_new)` per
+-- (action_type, user_type) — "curated-else-legacy": show the curated set when a
+-- bucket has one, else fall back to the migrated legacy rows. action_type 1 +
+-- user_type 3 is the operator's "Cancellation Due To -> Client" dropdown. If
+-- that bucket currently holds only legacy is_new = 0 rows, inserting a 1 flips
+-- the MAX and the dropdown collapses to THIS ROW ALONE, hiding every existing
+-- client-cancellation reason from ops. Nothing would report it; the list would
+-- just be one item long.
+--
+-- 0 is safe in both directions. If the bucket is legacy, these sit alongside it
+-- and ops can pick them, which is reasonable — a job cancelled because the
+-- client asked is exactly this reason. If the bucket already has curated rows,
+-- these are simply not offered in the dropdown, which costs nothing: the code
+-- path that matters resolves them by (action_type, user_type, action_desc) and
+-- does NOT filter is_new.
+--
+-- Columns set: action_type, action_desc, user_type, status(=1 active), is_new.
+-- id is AUTO_INCREMENT and deliberately NOT hardcoded anywhere: it differs per
 -- environment, so a literal that is right on QA is silently wrong on Production.
 
-INSERT INTO action_taken_reason (action_type, action_desc, user_type, status)
-SELECT 1, 'Cancellation requested by client', 3, 1
+INSERT INTO action_taken_reason (action_type, action_desc, user_type, status, is_new)
+SELECT 1, 'Cancellation requested by client', 3, 1, 0
  WHERE NOT EXISTS (SELECT 1 FROM action_taken_reason WHERE action_type = 1 AND action_desc = 'Cancellation requested by client');
 
-INSERT INTO action_taken_reason (action_type, action_desc, user_type, status)
-SELECT 25, 'Client asked to retry contacting the customer', 3, 1
+INSERT INTO action_taken_reason (action_type, action_desc, user_type, status, is_new)
+SELECT 25, 'Client asked to retry contacting the customer', 3, 1, 0
  WHERE NOT EXISTS (SELECT 1 FROM action_taken_reason WHERE action_type = 25 AND action_desc = 'Client asked to retry contacting the customer');
