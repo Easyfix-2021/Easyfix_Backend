@@ -5199,6 +5199,15 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
     await assertTechniciansCanReceiveJobs([easyfixerId]);
     const releasedTechId = await releaseOwnedJobForReoffer(jobId, preloadedJob, { reasonId, rescheduleReason });
     logger.info('Job released for re-offer · id=' + jobId + ' · from=' + releasedTechId + ' · to=' + easyfixerId);
+    // Tell the OUTGOING technician their job is gone. Fire-and-forget after the
+    // release has COMMITTED — a push that beat the commit would announce a
+    // removal that a rollback then undid. unassign() has the same gap and is
+    // deliberately left alone here: this is the reassign path only.
+    if (releasedTechId != null) {
+      require('./job-offer-push.service')
+        .sendJobRemovedPush(releasedTechId, { jobId })
+        .catch(() => {});
+    }
     // The outgoing technician has genuinely left the queue (fk cleared), so log
     // and signal it the way unassign() does. offerToTechnicians() fires no job
     // webhook by design — nomination is not assignment — so TechAssigned still

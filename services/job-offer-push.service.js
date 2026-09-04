@@ -158,9 +158,61 @@ async function sendJobOfferPushBatch(efrIds, { jobId, reminder = false } = {}) {
   }
 }
 
+/*
+ * ── THE OTHER HALF OF A REASSIGN ────────────────────────────────────
+ * When ops move an ACCEPTED job to a different technician, the outgoing one
+ * loses it the instant the button is clicked (assign() releases the claim
+ * before offering). Until this existed they learned only on their next
+ * refresh, so a technician could keep travelling to a job that was no longer
+ * theirs. This is the push that tells them.
+ *
+ * ROUTING KEYS ARE DELIBERATELY ABSENT, and that is the whole design:
+ *   - NO `job_id` / `jobId`. The Expo app's routeTap deep-links on that key
+ *     alone (useFcm.ts: `jobId != null && canOpenJob` → /order/[id]), and the
+ *     destination is a job this technician can no longer fetch. Carrying the
+ *     id under `removedJobId` keeps it available for correlation without
+ *     arming that branch — a tap falls through every branch and stays inert.
+ *   - NO `screen`. The LEGACY FLUTTER app — still what every technician
+ *     actually runs — switches on data.screen and its `default:` opens
+ *     SplashPage, i.e. the app home. Sending no screen is what selects that
+ *     default deliberately rather than by accident.
+ * Both apps therefore show the notification and open somewhere harmless. The
+ * MESSAGE is the payload here; the deep link is the part we do not want.
+ *
+ * Best-effort by the same contract as the offer pushes: never throws, safe to
+ * call unawaited. A failed push must never break the reassign that caused it.
+ */
+async function sendJobRemovedPush(efrId, { jobId } = {}) {
+  try {
+    logger.info('Sending job-removed push · efrId=' + efrId + ' · jobId=' + jobId);
+    if (!efrId) return { delivered: false, reason: 'no efrId' };
+
+    const message = {
+      title: 'EasyFix',
+      body: `Job #${jobId} has been reassigned to another technician and is no longer yours.`,
+      data: { type: 'job_removed', removedJobId: String(jobId) },
+    };
+    const r = await pushDelivery.deliverToEfr(
+      efrId,
+      message,
+      { channel: 'job-removed', label: `job-removed · efr=${efrId} · job=${jobId}` },
+    );
+    if (r.reason === 'no tokens') {
+      logger.info({ efrId, jobId }, 'job-removed-push: no device tokens — skipping');
+      return { delivered: false, reason: 'no tokens' };
+    }
+    logger.info('Job-removed push delivered to ' + r.deliveredCount + '/' + r.tokenCount + ' devices · jobId=' + jobId);
+    return { delivered: r.delivered, deliveredCount: r.deliveredCount, tokenCount: r.tokenCount };
+  } catch (e) {
+    logger.warn({ efrId, jobId, err: e.message }, 'job-removed-push: send failed (swallowed)');
+    return { delivered: false, error: e.message };
+  }
+}
+
 module.exports = {
   sendJobOfferPush,
   sendJobOfferPushBatch,
+  sendJobRemovedPush,
   // Back-compat shim: routes/admin/validate.js imports resolveTokens for its
   // debug test-push (raw-token path, no prune). Same signature + string[] return.
   resolveTokens: pushDelivery.resolveTokensForEfr,

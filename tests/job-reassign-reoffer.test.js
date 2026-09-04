@@ -258,3 +258,64 @@ test('ownership drift observed under lock aborts the release with a 409', async 
   );
   assert.ok(!has(RELEASE_UPDATE), 'a stale request must never release the current owner');
 });
+
+/*
+ * ── (d) THE OUTGOING TECHNICIAN IS TOLD ─────────────────────────────
+ * The release happens the instant the button is clicked, so without this push
+ * a technician can keep travelling to a job that is no longer theirs — they
+ * would learn only on their next app refresh.
+ *
+ * The push module is reached through `require(...)` AT CALL TIME inside
+ * assign(), so replacing the export here is enough to intercept it; a
+ * destructured import would have been captured at load and missed the stub.
+ */
+test('(d) the OUTGOING technician is pushed that the job has been taken away', async () => {
+  const pushSvc = require('../services/job-offer-push.service');
+  const real = pushSvc.sendJobRemovedPush;
+  const sent = [];
+  pushSvc.sendJobRemovedPush = async (efrId, opts) => { sent.push({ efrId, ...opts }); return { delivered: true }; };
+  try {
+    await assert.rejects(
+      () => jobSvc.assign(100, { easyfixerId: 42 }, { user_id: 9 }),
+      stopped,
+    );
+  } finally {
+    pushSvc.sendJobRemovedPush = real;
+  }
+
+  assert.equal(sent.length, 1, 'exactly one removal push');
+  assert.equal(sent[0].efrId, 99, 'it goes to the OUTGOING technician, never the incoming one');
+  assert.equal(sent[0].jobId, 100);
+});
+
+/*
+ * The removal message deliberately carries NO routing key, and that is load
+ * bearing on both apps — see the block comment on sendJobRemovedPush. A future
+ * edit that "helpfully" adds job_id to make the push deep-link would send the
+ * technician to a job they can no longer fetch, so pin it here rather than in
+ * prose.
+ */
+test('(d2) the removal push carries no deep-link key for a job the technician has lost', async () => {
+  const pushSvc = require('../services/job-offer-push.service');
+  const pushDelivery = require('../services/push-delivery.service');
+  const realDeliver = pushDelivery.deliverToEfr;
+  let captured = null;
+  pushDelivery.deliverToEfr = async (efrId, message) => {
+    captured = message;
+    return { delivered: true, deliveredCount: 1, tokenCount: 1 };
+  };
+  try {
+    await pushSvc.sendJobRemovedPush(99, { jobId: 100 });
+  } finally {
+    pushDelivery.deliverToEfr = realDeliver;
+  }
+
+  assert.ok(captured, 'the push must actually reach the delivery layer');
+  assert.equal(captured.data.type, 'job_removed');
+  assert.equal(captured.data.removedJobId, '100', 'the id travels under a NON-routing key');
+  // Expo routeTap deep-links on jobId ?? job_id; legacy Flutter switches on screen.
+  for (const key of ['job_id', 'jobId', 'screen']) {
+    assert.ok(!(key in captured.data), `data.${key} would deep-link into a job this technician has lost`);
+  }
+  assert.match(captured.body, /100/, 'the body names the job, since the tap cannot');
+});
