@@ -23,7 +23,8 @@ const easyfixerLifecycle = require('../../services/easyfixer-lifecycle.service')
 const lifecycle = require('../../services/mobile-job-lifecycle.service');
 const { dailyBridgeCapReached, persistBridgeCall, CALL_FAILED_PUBLIC_MSG } = require('../public/_public-call');
 const { modernOk, modernError, otpGuessCapError } = require('../../utils/response');
-const { rateLimit, attemptWindow } = require('../../middleware/rate-limit');
+const { rateLimit } = require('../../middleware/rate-limit');
+const { checkoutPin: checkoutPinAttempts } = require('../../services/attempt-window.service');
 const { stripCustomerMobiles } = require('../../utils/mask-mobile');
 const {
   requireTechJobMutationCapability,
@@ -785,15 +786,15 @@ const normalisePin = (v) => (v == null ? '' : String(v).trim());
  * rule as the login OTP. Without it the assigned technician could try all
  * 10,000 four-digit PINs and close the job without the customer. Keyed on the
  * job because the PIN belongs to the job. tbl_job is not ours to alter, so the
- * window is in memory (middleware/rate-limit.js attemptWindow). A missing PIN is
- * not a guess and is not counted. Ops can still close any job from the CRM.
+ * count lives in tbl_attempt_window (services/attempt-window.service.js),
+ * shared by every backend container; admins can clear it from Admin Actions →
+ * Unlock OTP / PIN. A missing PIN is not a guess and is not counted. Ops can
+ * still close any job from the CRM.
  *
  * ONE budget for every place the PIN is checked: the close (below) and a PIN
  * volunteered at check-in. Check-in answers `pinMatched`, so on its own budget
  * — or none, as before — it was an unlimited oracle for the close.
  */
-const checkoutPinAttempts = attemptWindow();
-
 router.post('/jobs/:id/checkin', validate(Joi.object({
   // Location stamp is nice-to-have, NOT a gate. Requiring gps used to 400 the
   // whole request whenever coords were unavailable (GPS off / permission
@@ -837,9 +838,9 @@ router.post('/jobs/:id/checkin', validate(Joi.object({
     let pinMatched = null;
     if (jobPin && submittedPin) {
       const pinKey = 'job:' + job.job_id;
-      if (!checkoutPinAttempts.claim(pinKey).locked) {
+      if (!(await checkoutPinAttempts.claim(pinKey)).locked) {
         pinMatched = jobPin === submittedPin;
-        if (pinMatched) checkoutPinAttempts.clear(pinKey);
+        if (pinMatched) await checkoutPinAttempts.clear(pinKey);
       }
     }
     if (pinMatched === false) {
@@ -1005,19 +1006,19 @@ router.post('/jobs/:id/checkout',
         { reason: 'PIN_MISSING' });
     }
     if (jobPin) {
-      // No await from here to the compare: the claim and the compare are one step.
+      // Claimed BEFORE the compare; the store makes the claim atomic.
       const pinKey = 'job:' + job.job_id;
-      const claim = checkoutPinAttempts.claim(pinKey);
+      const claim = await checkoutPinAttempts.claim(pinKey);
       if (claim.locked) return pinLocked(claim.retryAfterMinutes);
       if (jobPin !== submittedPin) {
-        const after = checkoutPinAttempts.state(pinKey);
+        const after = await checkoutPinAttempts.state(pinKey);
         if (after.locked) return pinLocked(after.retryAfterMinutes);
         const n = after.attemptsRemaining;
         return refusePin('PIN mismatch',
           `Incorrect closing PIN — ${n} attempt${n === 1 ? '' : 's'} left. Ask the customer for the PIN sent to them.`,
           { reason: 'PIN_MISMATCH', attemptsRemaining: n });
       }
-      checkoutPinAttempts.clear(pinKey);
+      await checkoutPinAttempts.clear(pinKey);
     }
     const b = req.body;
     const isRevisit = b.isNextVisit === true;

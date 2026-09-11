@@ -21,7 +21,7 @@
  *
  * ── WHERE THE STATE LIVES: two columns of otp_details ──────────────────
  *   failed_attempts  wrong codes in the current window. Added by
- *                    migrations/2026-09-10-otp-failed-attempts.sql.
+ *                    migrations/executed/2026-09-10-otp-failed-attempts.sql.
  *   updated_on       when the current window OPENED. An existing column: both
  *                    legacy JPA entities map it but no code ever sets it (they
  *                    only write back what they loaded), no Node code touches it,
@@ -76,7 +76,7 @@ async function columnPresent(db = pool) {
     }
     if (!_absentCheckedAt) {
       logger.warn('OTP attempt cap INACTIVE — otp_details.failed_attempts does not exist. Run '
-        + 'migrations/2026-09-10-otp-failed-attempts.sql; until then OTP guesses are unbounded.');
+        + 'migrations/executed/2026-09-10-otp-failed-attempts.sql; until then OTP guesses are unbounded.');
     }
     _absentCheckedAt = Date.now();
     return false;
@@ -97,6 +97,22 @@ function noteFailure(e) {
 }
 
 const OPEN = Object.freeze({ locked: false, attemptsRemaining: null, retryAfterMinutes: null });
+
+/*
+ * A row's state as the user sees it. A window that has closed is a full budget,
+ * whatever the count says — the lock lifts by itself, and the next attempt
+ * restarts the window at 1.
+ */
+function viewOf(r) {
+  const inWindow = !!r && (r.in_window === true || Number(r.in_window) === 1);
+  const used = inWindow ? Number(r.failed_attempts) || 0 : 0;
+  const locked = used >= OTP_MAX_ATTEMPTS;
+  return {
+    locked,
+    attemptsRemaining: Math.max(0, OTP_MAX_ATTEMPTS - used),
+    retryAfterMinutes: locked ? Math.max(1, Math.ceil((Number(r.secs_left) || 0) / 60)) : null,
+  };
+}
 
 /**
  * @param {number} rowId  otp_details.id of the user's OTP row
@@ -119,16 +135,7 @@ async function lockState(rowId, db = pool) {
          FROM otp_details WHERE id = ?`,
       [cutoff, now, OTP_ATTEMPT_WINDOW_MINUTES, rowId],
     );
-    // A window that has closed is a full budget, whatever the count says — the
-    // lock lifts by itself, and the next wrong code restarts the window at 1.
-    const inWindow = !!r && (r.in_window === true || Number(r.in_window) === 1);
-    const used = inWindow ? Number(r.failed_attempts) || 0 : 0;
-    const locked = used >= OTP_MAX_ATTEMPTS;
-    return {
-      locked,
-      attemptsRemaining: Math.max(0, OTP_MAX_ATTEMPTS - used),
-      retryAfterMinutes: locked ? Math.max(1, Math.ceil((Number(r.secs_left) || 0) / 60)) : null,
-    };
+    return viewOf(r);
   } catch (e) {
     noteFailure(e);
     logger.warn('OTP attempt-cap read failed · otp_details.id=' + rowId + ' · ' + e.message);
@@ -211,6 +218,45 @@ async function clearAttempts(rowId, db = pool) {
   }
 }
 
+/*
+ * ADMIN — Admin Actions → Unlock OTP / PIN (routes/admin/otp-locks.js).
+ *
+ * locksForIdentifier: every otp_details row for an email or mobile — one per
+ * OTP type (CRM login, client login, technician login, admin actions, change
+ * phone/email) — with its window state. `active: false` means the cap is not
+ * running here yet (no failed_attempts column), so nothing can be locked.
+ *
+ * unlockIdentifier: close every window for that identifier; returns how many
+ * rows it cleared. Deliberately not per OTP type: a person locked out is locked
+ * out, and the operator on the phone should not have to know which flow did it.
+ */
+async function locksForIdentifier(identifier, db = pool) {
+  if (!(await columnPresent(db))) return { active: false, rows: [] };
+  const now = new Date();
+  const cutoff = new Date(now.getTime() - WINDOW_MS);
+  const [rows] = await db.query(
+    `SELECT id, otp_type, failed_attempts,
+            (updated_on IS NOT NULL AND updated_on >= ?) AS in_window,
+            TIMESTAMPDIFF(SECOND, ?, DATE_ADD(updated_on, INTERVAL ? MINUTE)) AS secs_left
+       FROM otp_details
+      WHERE user_email = ? OR user_mobile_no = ?
+      ORDER BY id`,
+    [cutoff, now, OTP_ATTEMPT_WINDOW_MINUTES, identifier, identifier],
+  );
+  return { active: true, rows: rows.map((r) => ({ otpDetailsId: r.id, otpType: r.otp_type, ...viewOf(r) })) };
+}
+
+async function unlockIdentifier(identifier, db = pool) {
+  if (!(await columnPresent(db))) return 0;
+  const [res] = await db.query(
+    `UPDATE otp_details SET failed_attempts = 0, updated_on = NULL
+      WHERE (user_email = ? OR user_mobile_no = ?)
+        AND (failed_attempts <> 0 OR updated_on IS NOT NULL)`,
+    [identifier, identifier],
+  );
+  return Number(res && res.affectedRows) || 0;
+}
+
 /** Tests only — forget every cached probe answer. */
 function _resetProbeCache() { _present = false; _absentCheckedAt = 0; }
 
@@ -221,5 +267,7 @@ module.exports = {
   lockState,
   claimAttempt,
   clearAttempts,
+  locksForIdentifier,
+  unlockIdentifier,
   _resetProbeCache,
 };

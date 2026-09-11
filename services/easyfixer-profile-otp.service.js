@@ -16,17 +16,16 @@ const { resolveMobileOtp, otpExpiryDate } = require('../utils/otp');
 const gallabox = require('./gallabox.whatsapp.service');
 const logger = require('../logger');
 const { istIsPast } = require('../utils/ist-calendar');
-const { attemptWindow } = require('../middleware/rate-limit');
-
 /*
  * Guess cap: 5 attempts per technician per 30 minutes, the same rule as the
  * login OTP (services/otp-attempts.service.js). That one counts on the user's
  * otp_details row; this code lives on tbl_easyfixer, which is not ours to
- * alter, so the window is kept in memory. It guards the profile update AND the
- * bank-account change (services/easyfixer-sensitive-change.service.js), where a
- * guessed code redirects a technician's pay.
+ * alter, so the count lives in tbl_attempt_window (services/attempt-window.
+ * service.js), shared by every backend container. It guards the profile update
+ * AND the bank-account change (services/easyfixer-sensitive-change.service.js),
+ * where a guessed code redirects a technician's pay.
  */
-const profileOtpAttempts = attemptWindow();
+const { profileOtp: profileOtpAttempts } = require('./attempt-window.service');
 
 /**
  * Generate a 4-digit OTP, write it to tbl_easyfixer.profile_update_otp /
@@ -113,8 +112,9 @@ async function sendOtp(efrId, pool) {
  * @param {number|string} otp   — the 4-digit code the user submitted
  * @param {import('mysql2/promise').Pool} pool
  * Guess cap (profileOtpAttempts, above): the attempt is claimed before the
- * compare — synchronously, so parallel guesses cannot overshoot — and cleared
- * by a right code. A wrong one reports how many are left; the 5th, and anything
+ * compare — atomically, so parallel guesses cannot overshoot — and cleared by a
+ * right code. The injected `pool` is passed through, so a test's fake pool is
+ * the only database touched. A wrong one reports how many are left; the 5th, and anything
  * after it inside the window, reports when the lock lifts.
  *
  * @returns {Promise<{ valid: boolean, reason?: string,
@@ -154,9 +154,8 @@ async function verifyOtp(efrId, otp, pool) {
     return { valid: false };
   }
 
-  // No await from here to the compare: the claim and the compare are one step.
   const capKey = 'efr:' + efrId;
-  const claim = profileOtpAttempts.claim(capKey);
+  const claim = await profileOtpAttempts.claim(capKey, pool);
   if (claim.locked) {
     logger.warn({ efrId }, 'easyfixer-profile-otp: refused · OTP_ATTEMPTS_EXCEEDED');
     return { valid: false, reason: 'OTP_ATTEMPTS_EXCEEDED', retryAfterMinutes: claim.retryAfterMinutes };
@@ -165,11 +164,11 @@ async function verifyOtp(efrId, otp, pool) {
   // Integer comparison (OTP is a 4-digit INT).
   if (Number(row.profile_update_otp) !== Number(otp)) {
     logger.info({ efrId }, 'easyfixer-profile-otp: OTP mismatch');
-    const after = profileOtpAttempts.state(capKey);
+    const after = await profileOtpAttempts.state(capKey, pool);
     if (after.locked) return { valid: false, reason: 'OTP_ATTEMPTS_EXCEEDED', retryAfterMinutes: after.retryAfterMinutes };
     return { valid: false, reason: 'OTP_MISMATCH', attemptsRemaining: after.attemptsRemaining };
   }
-  profileOtpAttempts.clear(capKey);
+  await profileOtpAttempts.clear(capKey, pool);
 
   // Consume on success — one-shot.
   await pool.query(

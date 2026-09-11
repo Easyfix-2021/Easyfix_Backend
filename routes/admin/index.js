@@ -134,6 +134,8 @@ router.use('/config',          require('./config'));
 // JSON archive). Gated PER-USER by the easyfix_properties allowlist
 // (access.entitydelete.emails) — NOT RBAC. See routes/admin/entity-deletion.js.
 router.use('/entity-deletion', require('./entity-deletion'));
+// Admin Actions → Unlock OTP / PIN — RBAC action isOtpUnlock. See routes/admin/otp-locks.js.
+router.use('/otp-locks',       require('./otp-locks'));
 // Admin Actions → Re-Key Encrypted Fields. Bulk re-wrap of every field-crypto
 // data key: rotate to a new operational key, recover from a lost one, or
 // re-seal to a new recovery key. RBAC-gated per route (isFieldRekeyRun /

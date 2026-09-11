@@ -28,7 +28,7 @@
  *      miss, the clear after success — all inside the same verify function.
  *      That covers the otp_details verifies (SQL claim) and the two codes with
  *      no otp_details row — the profile/bank OTP and the closing PIN — which
- *      use an in-memory window and must not await between claim and compare.
+ *      claim through services/attempt-window.service.js.
  *   6. RESEND DOES NOT RESET. No claim or clear may live in a function that does
  *      not itself compare a code — that is where a send path's reset would go.
  *
@@ -257,17 +257,17 @@ const isVerdict = (n) => storedVsSubmitted(n) && n.operator === '===';
 /*
  * How each store is capped. otp_details codes go through the SQL claim
  * (services/otp-attempts.service.js). The two codes with no otp_details row —
- * the profile/bank OTP on tbl_easyfixer, the closing PIN on tbl_job — use an
- * in-memory attemptWindow (middleware/rate-limit.js), whose claim is atomic
- * only if NO await separates it from the compare.
+ * the profile/bank OTP on tbl_easyfixer, the closing PIN on tbl_job — claim
+ * through services/attempt-window.service.js (tbl_attempt_window, or memory
+ * until it exists). Either way the claim itself is atomic.
  */
 const SQL = { claim: ['otpAttempts', 'claimAttempt'], read: ['otpAttempts', 'lockState'],
-  clear: ['otpAttempts', 'clearAttempts'], lockMark: /OTP_ATTEMPTS_EXCEEDED/, inMemory: false };
+  clear: ['otpAttempts', 'clearAttempts'], lockMark: /OTP_ATTEMPTS_EXCEEDED/ };
 const API_BY_FILE = {
   'services/easyfixer-profile-otp.service.js': { claim: ['profileOtpAttempts', 'claim'], read: ['profileOtpAttempts', 'state'],
-    clear: ['profileOtpAttempts', 'clear'], lockMark: /OTP_ATTEMPTS_EXCEEDED/, inMemory: true },
+    clear: ['profileOtpAttempts', 'clear'], lockMark: /OTP_ATTEMPTS_EXCEEDED/ },
   'routes/mobile/index.js': { claim: ['checkoutPinAttempts', 'claim'], read: ['checkoutPinAttempts', 'state'],
-    clear: ['checkoutPinAttempts', 'clear'], lockMark: /pinLocked/, inMemory: true },
+    clear: ['checkoutPinAttempts', 'clear'], lockMark: /pinLocked/ },
 };
 const apiFor = (file) => API_BY_FILE[file] || SQL;
 
@@ -309,11 +309,6 @@ test('every compare CLAIMS first, REFUSES a lock by returning, reads after a mis
       && n.range[1] < s.node.range[0]);
     assert.equal(claim.length, 1, `${at}: expected exactly one \`const x = ${api.claim.join('.')}(...)\` before the compare`);
     const v = claim[0].id.name;
-    // (a') in memory, nothing may await between the claim and the compare
-    if (api.inMemory) {
-      const gap = collect(s.fn, (n) => n.type === 'AwaitExpression' && n.range[0] > claim[0].range[1] && n.range[1] < s.node.range[0]);
-      assert.equal(gap.length, 0, `${at}: an await between the in-memory claim and the compare lets parallel guesses overshoot`);
-    }
     // (b) `if (x.locked) … return` between the claim and the compare
     const refusal = collect(s.fn, (n) => n.type === 'IfStatement'
       && n.test.type === 'MemberExpression' && n.test.object.name === v && n.test.property.name === 'locked'
@@ -336,7 +331,7 @@ test('every compare CLAIMS first, REFUSES a lock by returning, reads after a mis
   }
 });
 
-test('a verdict-only PIN check claims first too, with no await before the compare', () => {
+test('a verdict-only PIN check claims first too', () => {
   // check-in's pinMatched: without a claim it was an unlimited oracle for the close.
   assert.ok(scan.verdicts.length >= 1, 'positive control: the check-in verdict was found');
   for (const s of scan.verdicts) {
@@ -344,8 +339,6 @@ test('a verdict-only PIN check claims first too, with no await before the compar
     const api = apiFor(s.file);
     const claims = collect(s.fn, (n) => isCall(n, api.claim) && n.range[1] < s.node.range[0]);
     assert.equal(claims.length, 1, `${at}: a verdict must be claimed against ${api.claim.join('.')} first`);
-    const gap = collect(s.fn, (n) => n.type === 'AwaitExpression' && n.range[0] > claims[0].range[1] && n.range[1] < s.node.range[0]);
-    assert.equal(gap.length, 0, `${at}: nothing may await between the claim and the compare`);
   }
 });
 
