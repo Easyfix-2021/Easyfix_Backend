@@ -142,3 +142,12 @@ test('an unknown category is 400', async () => {
   assert.equal(r.status, 400);
   assert.equal(uploads.length, 0);
 });
+
+test('a photo over 10 MB is a clear 400, not a 500 (multer rejects it before the handler)', async () => {
+  S.actions = ['isJobAfterPhotoUpload'];
+  const big = Buffer.concat([PNG, Buffer.alloc(10 * 1024 * 1024 + 1)]);
+  const r = await upload({ category: 'Completion', bytes: big });
+  assert.equal(r.status, 400);
+  assert.equal(r.body.error, 'file exceeds 10MB');
+  assert.equal(uploads.length, 0);
+});

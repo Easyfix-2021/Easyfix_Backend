@@ -3050,11 +3050,29 @@ function imageCategory(req, res, next) {
   return afterPhotoGuard(req, res, next);
 }
 
+/*
+ * multer rejects an oversize file with next(MulterError) from INSIDE its own
+ * middleware, so it never reaches the handler's catch — and MulterError has no
+ * .status, so the error handler answered 500 "Internal Server Error" and the
+ * CRM toast said nothing useful. Mapped here, where the error actually surfaces
+ * (the routes/mobile/kyc.js aadhaarUploadOr400 shape).
+ */
+function imageUploadOr400(req, res, next) {
+  imageUpload.single('file')(req, res, (err) => {
+    if (!err) return next();
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      uploadLogger.warn({ jobId: req.params.id }, 'job image upload rejected — exceeds 10MB');
+      return modernError(res, 400, 'file exceeds 10MB');
+    }
+    return next(err);
+  });
+}
+
 router.post(
   '/:id/images',
   validate(idParam, 'params'),
   scopedJob,
-  imageUpload.single('file'),
+  imageUploadOr400,
   imageCategory,
   async (req, res, next) => {
     const jobId = Number(req.params.id);
@@ -3068,10 +3086,6 @@ router.post(
       uploadLogger.upload({ jobId, imageId: result.image_id, storage: result.storage, image: result.image }, 'job image row inserted');
       modernOk(res, result, 'image uploaded');
     } catch (e) {
-      if (e?.code === 'LIMIT_FILE_SIZE') {
-        uploadLogger.warn({ jobId, bytes: req.file?.size }, 'job image upload rejected — exceeds 10MB');
-        return modernError(res, 400, 'file exceeds 10MB');
-      }
       if (e?.status === 400) return modernError(res, 400, e.message);
       uploadLogger.error({ jobId, err: e }, 'job image upload failed');
       next(e);
