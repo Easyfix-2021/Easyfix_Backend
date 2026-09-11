@@ -1310,15 +1310,20 @@ router.post('/profile/personal-details', validate(Joi.object({
 // the handler tolerant of legacy/extra fields the app may still send (hasTools,
 // serviceTypeIds).
 //
-// hasBike WAS one of those tolerated-and-dropped fields until 2026-09-11: the app
-// showed a Bike toggle, sent it, and this handler threw it away, while the CRM's
-// verification screen reads tbl_easyfixer.have_bike. Every technician's answer
-// since the new app went live was lost. It is written now, COALESCE'd like the
-// rest so an omitted flag keeps the stored one.
+// THE BIKE ANSWER IS `haveBike`, AND `hasBike` IS DROPPED ON PURPOSE.
+// Until 2026-09-11 the app's registration Step 1 sent `hasBike` and this handler
+// threw it away, while the CRM verification screen reads tbl_easyfixer.have_bike.
+// Writing `hasBike` (8e2e019) exposed a worse bug: that Step 1 never prefilled the
+// toggle, so every build that still has it sends `hasBike: false` whatever the
+// technician answered before — and there is no build header to tell those builds
+// apart. So the answer travels under a NEW name that only Edit Profile's
+// Professional Details section (which prefills it) sends; `hasBike` falls back
+// under unknown(true), tolerated and dropped as it always was. COALESCE'd like the
+// other flags, so an omitted haveBike keeps the stored answer.
 router.post('/profile/professional-details', validate(Joi.object({
   experienceId: Joi.number().integer().positive().optional(),
   useWhatsapp: Joi.boolean().optional(),
-  hasBike: Joi.boolean().optional(),
+  haveBike: Joi.boolean().optional(),
   toolIds: Joi.array().items(Joi.number().integer().positive()).optional(),
   // Per-tool photos (proof of possession): one entry per selected tool.
   tools: Joi.array().items(Joi.object({
@@ -1338,15 +1343,16 @@ router.post('/profile/professional-details', validate(Joi.object({
     logger.info('Save professional-details profile section');
     const b = req.body;
     const useWhatsapp = b.useWhatsapp === undefined ? null : (b.useWhatsapp ? 1 : 0);
-    const hasBike = b.hasBike === undefined ? null : (b.hasBike ? 1 : 0);
+    const haveBike = b.haveBike === undefined ? null : (b.haveBike ? 1 : 0);
     // Selected tool ids — prefer the rich per-tool `tools[]`, else the flat toolIds.
     const toolIdList = Array.isArray(b.tools) && b.tools.length
       ? b.tools.map((t) => t.toolId)
       : (Array.isArray(b.toolIds) ? b.toolIds : []);
     const toolsCsv = toolIdList.length ? toolIdList.join(',') : null;
-    // Mark the section complete only once an experience level is chosen (the one
-    // mandatory field here); a partial save leaves the prior perc untouched.
-    const professionalComplete = !!b.experienceId;
+    // The section is complete once an experience level is ON THE ROW (the one
+    // mandatory field) — judged after the update, in SQL, not from the request:
+    // Edit Profile sends experienceId only when it changed, so a request-based
+    // test left a technician who already had one short of 100 on every later save.
 
     await conn.query('SELECT GET_LOCK(?, 10)', [lockKey]);
     await conn.beginTransaction();
@@ -1356,9 +1362,10 @@ router.post('/profile/professional-details', validate(Joi.object({
          efr_tools     = COALESCE(?, efr_tools),
          use_whatsapp  = COALESCE(?, use_whatsapp),
          have_bike     = COALESCE(?, have_bike),
-         efr_professional_details_perc = COALESCE(?, efr_professional_details_perc)
+         efr_professional_details_perc = CASE WHEN COALESCE(?, experience_id) IS NOT NULL
+                                              THEN 100 ELSE efr_professional_details_perc END
        WHERE efr_id = ?`,
-      [b.experienceId || null, toolsCsv, useWhatsapp, hasBike, professionalComplete ? 100 : null, efrId]);
+      [b.experienceId || null, toolsCsv, useWhatsapp, haveBike, b.experienceId || null, efrId]);
 
     // Per-tool photos → tbl_easyfixer_document type 8, one row per tool with the
     // tool id stamped in efr_doc_text (schema-safe; no tool↔doc junction needed).
@@ -1401,7 +1408,7 @@ router.post('/profile/professional-details', validate(Joi.object({
     await upsertEasyfixerDocuments(conn, efrId, [[7, docs.education], [9, docs.toolBag]]);
 
     await conn.commit();
-    logger.info('Professional-details saved · tools=' + toolIdList.length + ' · complete=' + professionalComplete);
+    logger.info('Professional-details saved · tools=' + toolIdList.length + ' · experienceSent=' + !!b.experienceId);
     modernOk(res, { updated: true });
   } catch (e) {
     logger.warn('Save professional-details failed · ' + e.message);
@@ -1412,6 +1419,11 @@ router.post('/profile/professional-details', validate(Joi.object({
     if (conn) conn.release();
   }
 });
+
+// A BIT(1) flag as read through db.js's pool, whose typeCast already turns BIT(1)
+// into true / false / null. A Buffer (a pool without that cast) and 0/1 are read
+// too, so the answer does not depend on which pool served the row.
+const readBitFlag = (v) => (Buffer.isBuffer(v) ? v[0] === 1 : Number(v) === 1);
 
 // Professional prefill — experience level, WhatsApp and bike flags, the selected
 // tools (with name + whether a photo is already on file), whether the education
@@ -1456,12 +1468,10 @@ router.get('/profile/professional', async (req, res, next) => {
         ORDER BY c.service_catg_name ASC`, [efrId]);
 
     logger.info('Professional prefill · tools=' + tools.length + ' · categories=' + catRows.length);
-    // BIT(1) columns arrive as Buffers (see SCHEMA.md), so read the first byte.
-    const bit = (v) => (Buffer.isBuffer(v) ? v[0] === 1 : Number(v) === 1);
     modernOk(res, {
       experienceId: ef ? ef.experience_id : null,
-      useWhatsapp: bit(ef ? ef.use_whatsapp : null),
-      hasBike: bit(ef ? ef.have_bike : null),
+      useWhatsapp: readBitFlag(ef ? ef.use_whatsapp : null),
+      haveBike: readBitFlag(ef ? ef.have_bike : null),
       docs: { education: docTypes.has(7), toolBag: docTypes.has(9) },
       tools,
       categories: catRows.map((c) => ({
