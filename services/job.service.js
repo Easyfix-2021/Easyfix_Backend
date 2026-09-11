@@ -2053,6 +2053,39 @@ function toIdArray(v) {
   return raw.map((s) => Number(String(s).trim())).filter((n) => Number.isFinite(n));
 }
 
+/*
+ * jobIdOrRefPredicate — Manage Jobs' "Job Id" box as SQL (2026-09-11, per ops).
+ * Each comma-separated token is a job id OR a job booking reference, matched
+ * EXACTLY: a reference is an identifier, and exact is also the only form an
+ * index could ever serve. Returns { sql, params }, or null for an empty search.
+ *
+ * ⚠ DIGITS GO TO THE PRIMARY KEY ONLY. job_reference_id carries no index
+ * (SHOW INDEX, QA, 2026-09-11), so an OR that names it scans the table:
+ *     j.job_id IN (?)                                39 ms   const, PRIMARY
+ *     j.job_id IN (?) OR j.job_reference_id IN (?)  635 ms   ALL, 433k rows
+ * and a digits-only reference is not there to be found — 0 of 436,830 non-null
+ * values on QA, and every production value is `REF-{n}` (measured in
+ * migrations/executed/2026-08-21-job-client-ref-lookup-indexes.sql). So a number
+ * keeps the instant lookup, and only a token with a non-digit in it pays for the
+ * reference scan. Putting digits in the reference list too is the one-line
+ * change to make if job_reference_id is ever indexed.
+ *
+ * `alias` is a code constant ('j' here, 'J' for the XLSX export's aliasing),
+ * never input. Every value is bound. Exported so the export can emit the same
+ * search — one definition, so the sheet and the grid cannot disagree on which
+ * jobs it means.
+ */
+function jobIdOrRefPredicate(value, alias = 'j') {
+  const tokens = [...new Set(String(value ?? '').split(',').map((t) => t.trim()).filter(Boolean))];
+  if (!tokens.length) return null;
+  const ids = tokens.filter((t) => /^\d+$/.test(t));
+  const refs = tokens.filter((t) => !/^\d+$/.test(t));
+  const terms = [];
+  if (ids.length)  terms.push(`${alias}.job_id IN (${ids.map(() => '?').join(',')})`);
+  if (refs.length) terms.push(`${alias}.job_reference_id IN (${refs.map(() => '?').join(',')})`);
+  return { sql: `(${terms.join(' OR ')})`, params: [...ids.map(Number), ...refs] };
+}
+
 async function list({
   q, status, statuses, assigned, clientId, cityId, ownerId, easyfixerId,
   /*
@@ -2082,6 +2115,7 @@ async function list({
   reportingContactIds,       // number[] — restrict to jobs booked by these SPOC contacts (tbl_job.reporting_contact_id) — client-app hierarchy scope
   customerId,
   jobIds,                    // number[] — restrict to an explicit set of job ids
+  jobIdOrRef,                // CSV — Manage Jobs' Job Id box: each token a job id OR a job_reference_id
   isEscalated,
   // New filter params (2026-05-19) — match the legacy CRM "Filter Job"
   // panel. See the validator + the FE filter card.
@@ -2394,6 +2428,10 @@ async function list({
       params.push(...jobIds);
     }
   }
+  // Manage Jobs' Job Id box — see jobIdOrRefPredicate. `j.` only, so the COUNT
+  // query needs no extra join; it shares this clause and these params.
+  const idOrRef = jobIdOrRefPredicate(jobIdOrRef);
+  if (idOrRef) { clauses.push(idOrRef.sql); params.push(...idOrRef.params); }
   if (categoryId != null)  { clauses.push('j.fk_service_catg_id = ?'); params.push(categoryId); }
   /*
    * sourceType — booking-channel filter (see the listQuery validator). Exact
@@ -7148,6 +7186,8 @@ module.exports = {
   // Shared with services/job-export.service.js so the two q-clauses cannot
   // drift on what counts as a phone fragment. See the block at its definition.
   MOBILE_MIN_DIGITS,
+  // Same reason: the Job Id box's id-or-reference search, for the export.
+  jobIdOrRefPredicate,
   STATUS, ALL_STATUS_VALUES, MUTABLE_COLUMNS,
   // Cross-service helper — used by job-magic-link.service.js to keep the
   // tbl_job.client_services CSV in sync after the customer's self-submit

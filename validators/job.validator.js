@@ -128,6 +128,29 @@ const listQuery = Joi.object({
    * service needs no change at all.
    */
   jobIds: csvIds.optional().custom((value) => String(value).split(',').map(Number)),
+  /*
+   * jobIdOrRef — what that same box sends since 2026-09-11 (per ops): each
+   * comma-separated token is a job id OR a job booking reference (REF-482505,
+   * or a client-supplied value). jobIds above stays for any caller that wants
+   * the pure id list.
+   *
+   * A NEW key rather than a wider jobIds: list()'s jobIds is also the
+   * technician app's "Offered to you" set (listOfferedForTech) — an exact
+   * primary-key list that must never pick up another job by its reference.
+   *
+   * Charset only. The service splits, trims and drops empty tokens, so the
+   * trailing comma of an operator mid-way through a second id is not a 400
+   * behind a grid that keeps its previous rows on error. The class is the one
+   * the CRM box strips to; every job_reference_id on QA but one (a value with
+   * spaces in it) fits inside it.
+   */
+  jobIdOrRef: Joi.string().pattern(/^[A-Za-z0-9._/,-]+$/).custom((value, helpers) => {
+    const n = value.split(',').filter(Boolean).length;
+    if (n > CSV_IDS_MAX) {
+      return helpers.message(`must not search more than ${CSV_IDS_MAX} ids at once (got ${n})`);
+    }
+    return value;
+  }).optional(),
   clientId: csvIds.optional(),
   cityId: csvIds.optional(),
   // projectManagerId — the client's mapped PM in tbl_vertical_mapping

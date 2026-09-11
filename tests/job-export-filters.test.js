@@ -284,6 +284,8 @@ test('a WEAK filter must NOT lift the default window', () => {
     'startDate alone':   { startDate: new Date('2020-01-01T00:00:00.000Z') },
     'endDate alone':     { endDate: new Date('2026-08-17T00:00:00.000Z') },
     'RBAC scope':        { scope: SCOPE },
+    // Passes the validator, parses to no token: no predicate, so no bound.
+    'empty jobIdOrRef':  { jobIdOrRef: ',' },
   };
   for (const [label, filters] of Object.entries(weak)) {
     assert.ok(where(filters).includes(DEFAULT_FLOOR),
@@ -315,10 +317,31 @@ test('an EQUALITY on an identity column bounds the export by itself', () => {
     { easyfixerId: 55 },
     { easyfixerMobileNumber: '9876543210' },
     { clientReferenceId: 'ABC-1' },
+    { jobIdOrRef: '500043' },
+    { jobIdOrRef: 'REF-500043' },
   ]) {
     const w = where(filters);
     assert.ok(!w.includes(DEFAULT_FLOOR), `${JSON.stringify(filters)} is bounded by what it selects`);
   }
+});
+
+test('the Job Id box (jobIdOrRef) exports the grid’s jobs — old and closed ones too', () => {
+  /*
+   * list() has no default window and, on the All tab, no status pin. Keeping
+   * the export's two defaults on top of an exact id/ref list made an old or
+   * closed job one row on screen and an EMPTY sheet. The predicate is list()'s
+   * own (jobIdOrRefPredicate), re-aliased, never a copy.
+   */
+  const r = whereAndParams({ jobIdOrRef: '500043,REF-500044' });
+  assert.ok(r.where.includes('(J.job_id IN (?) OR J.job_reference_id IN (?))'), 'list()s predicate on the J alias');
+  assert.deepEqual(r.params, [500043, 'REF-500044'], 'ids as numbers, references as strings, all bound');
+  assert.ok(!r.where.includes(DEFAULT_FLOOR), 'no 6-month window the grid does not have');
+  assert.ok(!r.where.includes(DEFAULT_STATUS_FLOOR), 'and no terminal-status floor');
+  assert.deepEqual(r.appliedDefaults, []);
+  // It lifts the DEFAULTS only. A reference typed from another client's job
+  // still meets the operator's scope.
+  assert.match(where({ jobIdOrRef: 'REF-500044', scope: SCOPE }), /J\.fk_client_id IN \(\?, \?\)/,
+    'RBAC scope survives an identity search');
 });
 
 test('a status pin keeps the window but drops the status floor', () => {
@@ -440,6 +463,8 @@ const SAMPLE = {
   // number[], and the CSV shape is the one that would break a predicate built
   // with `= ?` instead of `IN (…)`.
   jobIds: '500043,500044',
+  // Both branches at once: an id for the primary key, a REF for the reference.
+  jobIdOrRef: '500043,REF-500044',
   status: 3,
   statuses: '3,5',
   assigned: 'false',

@@ -59,7 +59,7 @@ const { stageVisibleStatuses } = require('../lib/job-stages');
  * the sheet differently from the screen. job.service does NOT require this
  * module, so there is no cycle; routes/admin/jobs.js already loads both.
  */
-const { hasClientVerticalIdColumn, MOBILE_MIN_DIGITS } = require('./job.service');
+const { hasClientVerticalIdColumn, jobIdOrRefPredicate, MOBILE_MIN_DIGITS } = require('./job.service');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Column spec
@@ -637,6 +637,7 @@ const FILTER_COVERAGE = Object.freeze({
   statuses:         ['filter',   'J.job_status IN (…); wins over status, as in list()'],
   assigned:         ['filter',   'J.fk_easyfixter_id IS [NOT] NULL'],
   noServices:       ['filter',   'job_status = 0 + NOT EXISTS an active tbl_job_services row'],
+  jobIdOrRef:       ['filter',   'J.job_id IN (…) OR J.job_reference_id IN (…) — list()s jobIdOrRefPredicate; bounds by itself'],
   jobIds:           ['filter',   'J.job_id IN (…) — csvIds, normalised to number[] by the validator'],
   clientId:         ['filter',   'J.fk_client_id IN (…) — csvIds, single id OR CSV'],
   cityId:           ['filter',   'A.city_id IN (…) — csvIds; the ADDRESS column, as in list()'],
@@ -816,7 +817,7 @@ function buildClauses(filters = {}) {
     // ── Shared names: identical meaning in both vocabularies ────────────────
     easyfixerId, ownerId, cityId, stateId, zonalId, rating,
     // ── CRM UI / listQuery vocabulary (see FILTER_COVERAGE) ─────────────────
-    q, statuses, assigned, noServices, jobIds, clientId, projectManagerId, zonalManagerId,
+    q, statuses, assigned, noServices, jobIds, jobIdOrRef, clientId, projectManagerId, zonalManagerId,
     customerId, customerQ, clientRef, efrMobile, pin, categoryId, verticalId,
     sourceType, reopen, dueTo, startDate, endDate, quotationStatus, requestedBefore,
     // ── RBAC, attached by the route ─────────────────────────────────────────
@@ -1051,9 +1052,25 @@ function buildClauses(filters = {}) {
     pointIdentity = true;
   }
 
+  /*
+   * jobIdOrRef — Manage Jobs' Job Id box (2026-09-11). Emitted by list()'s own
+   * jobIdOrRefPredicate on this module's `J` alias, so the sheet and the grid
+   * mean the same jobs by the same search.
+   *
+   * It BOUNDS: exact job ids and exact booking references, at most 500 tokens
+   * (the validator's cap) — the legacy `jobsId` above already lifts the window
+   * for one id or REF. Left inside the default window, an old or closed job
+   * searched on the All tab was one row on screen and an empty sheet. An empty
+   * search is a null predicate and lifts nothing.
+   */
+  const idOrRef = jobIdOrRefPredicate(jobIdOrRef, 'J');
+  if (idOrRef) { push(idOrRef.sql, ...idOrRef.params); pointIdentity = true; }
+
   // ── Dimension filters: they narrow, they do not bound ─────────────────────
   /*
-   * jobIds — Manage Jobs' Job Id box, the same param its LIST sends.
+   * jobIds — the pure id list. Manage Jobs' Job Id box sent it until
+   * 2026-09-11; it now sends jobIdOrRef (above), and jobIds stays for callers
+   * that want ids alone.
    *
    * Wired here as well as in list() because the export is reached from that
    * same filter bar: filtering to one job and pressing Export would otherwise
