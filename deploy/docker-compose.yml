@@ -169,14 +169,12 @@ services:
   # DOZZLE_AUTH_PROVIDER=simple + a users.yml volume mount before doing
   # so. Search "Dozzle authentication" in dozzle.dev for the recipe.
   #
-  # EXACT tag, never :latest. `compose up` only pulls an image that is
-  # MISSING, so :latest froze each host at whatever it meant on its first
-  # pull — QA sat on v10.5.0 and Prod on v10.6.4 (2026-09-11) with nothing
-  # ever upgrading either. Bump this, docker-compose.prod-backend.yml and the
-  # prod UI host's dozzle-agent (UI repos) together: server and agent speak a
-  # gRPC protocol that changes between releases. See docs/dozzle-agent.md.
+  # :latest, and REFRESHED ON EVERY BACKEND DEPLOY (deploy.yml pulls it, then
+  # `up -d dozzle`). The tag alone upgrades nothing: `compose up` pulls only a
+  # MISSING image, which is how QA sat on v10.5.0 and Prod on v10.6.4 while
+  # v11.0.0 was out (2026-09-11). Tag policy + trade-off: docs/dozzle-agent.md.
   dozzle:
-    image: amir20/dozzle:v11.0.0
+    image: amir20/dozzle:latest
     container_name: easyfix-dozzle
     restart: unless-stopped
     environment:

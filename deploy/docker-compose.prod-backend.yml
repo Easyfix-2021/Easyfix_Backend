@@ -94,8 +94,8 @@ services:
   # never `:?` — a required var would fail every compose command on this box,
   # backend deploys included. Runbook: docs/dozzle-agent.md.
   dozzle:
-    # EXACT tag, never :latest — see the note in deploy/docker-compose.yml.
-    image: amir20/dozzle:v11.0.0
+    # :latest, refreshed on every deploy — see the note in deploy/docker-compose.yml.
+    image: amir20/dozzle:latest
     container_name: easyfix-dozzle
     restart: unless-stopped
     environment:

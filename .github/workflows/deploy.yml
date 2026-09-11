@@ -14,6 +14,8 @@
 #         c. docker compose up -d --no-deps --force-recreate backend
 #         d. wait for HEALTHY status
 #         e. docker image prune -af --filter "until=72h"
+#         f. docker compose pull dozzle + up -d dozzle — keeps Dozzle on
+#            amir20/dozzle:latest; non-fatal (docs/dozzle-agent.md)
 #   4. Smoke-test /api/health via second SSM call
 #
 # Required GitHub Environment (org-level, name "Organisation Level Secrets") secrets:
@@ -664,21 +666,6 @@ jobs:
           echo "▶ Recreating backend container (crm-ui untouched)"
           docker compose up -d --no-deps --force-recreate backend
 
-          # Auxiliary services — bring up if defined in compose but not
-          # currently running. Idempotent: no-op when already up AND unchanged.
-          # Adding \`dozzle\` here makes "fresh EC2 → first deploy" automatically
-          # start the log viewer. A changed definition (new image tag, new
-          # DOZZLE_REMOTE_AGENT in .env) makes compose pull + RECREATE it — that
-          # is how a Dozzle version bump reaches the host.
-          # \`|| true\` prevents an aux-service failure from blocking the
-          # main backend deploy.
-          for aux in dozzle; do
-            if docker compose config --services 2>/dev/null | grep -q "^\$aux\$"; then
-              echo "▶ Ensuring \$aux is up"
-              docker compose up -d --no-deps "\$aux" || true
-            fi
-          done
-
           # Wait for the container's HEALTHCHECK to flip green.
           #
           # The loop used to fall through when health never flipped, leaving a
@@ -717,6 +704,24 @@ jobs:
           fi
           echo "✓ Verified running image: \$RUNNING"
           echo "✓ Deployed $IMAGE_URI"
+
+          # ─── Dozzle: keep it on the newest amir20/dozzle:latest ─────────
+          # The tag alone upgrades nothing (\`compose up\` pulls only a MISSING
+          # image), so pull it on every deploy. \`up -d\` then recreates Dozzle
+          # only when the image or its definition changed (a new release, the
+          # DOZZLE_REMOTE_AGENT line in .env) and is a no-op otherwise. It is
+          # also what starts the log viewer on a fresh EC2.
+          #
+          # NON-FATAL, and deliberately AFTER the swap is proven above: a Docker
+          # Hub outage or rate limit must never fail an app deploy. Each command
+          # is the left side of \`||\`, which set -e exempts, and none is a
+          # pipeline, so pipefail has nothing to catch. \`timeout\` covers what
+          # \`||\` cannot: a pull that stalls instead of failing would outlast the
+          # 5-minute SSM poll on the runner and be reported as a failed deploy.
+          echo "▶ Refreshing Dozzle (amir20/dozzle:latest)"
+          timeout 60 docker compose pull -q dozzle || echo "⚠ Dozzle pull failed (non-fatal) — keeping the image it has"
+          timeout 30 docker compose up -d --no-deps dozzle || echo "⚠ Dozzle did not start (non-fatal)"
+          echo "Dozzle running: \$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}} {{.Image}}' easyfix-dozzle 2>/dev/null || echo 'not running')"
 
           # Machine-readable end-of-script marker, asserted by the runner.
           # Its ABSENCE is the signal — it catches the one failure mode the
