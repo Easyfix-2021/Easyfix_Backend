@@ -5,9 +5,11 @@
  * `if (j.getNoOffullfillments() == 0)` — and notably did NOT gate on status:
  * a hold can be placed from any state. The counter IS the state machine.
  *
- * That guard is what makes the release safe. `fullfillmentHoldCheckout` sets
- * job_status = 10 unconditionally, so hold/release is only correct as a single
- * 10 → 21 → 10 round trip. Allow a second hold and a job that had moved on
+ * That guard is what makes the release safe. Legacy `fullfillmentHoldCheckout`
+ * set job_status = 10 unconditionally, so hold/release is only correct as a
+ * single 10 → 21 → 10 round trip. (Since 2026-09-11 the release also requires
+ * the job to BE on hold and to carry an after-work photo — the every-close proof
+ * rule; behaviour pinned in job-after-photo-routes.test.js.) Allow a second hold and a job that had moved on
  * gets dragged back to 21, then released to 10 — a status it had already left.
  */
 
@@ -71,7 +73,7 @@ test('the hold is NOT gated on job status — matching legacy', () => {
     'no status precondition on the hold');
 });
 
-test('release restores status 10 unconditionally, as legacy did', () => {
+test('release restores status 10 only from hold (21), only with an after-work photo, not via setStatus', () => {
   const start = SRC.indexOf("router.post('/:id/hold/release'");
   assert.notEqual(start, -1, 'release route not found');
   // Bound to THIS handler — a fixed-width slice spills into the next route,
@@ -79,6 +81,11 @@ test('release restores status 10 unconditionally, as legacy did', () => {
   const next = SRC.indexOf('router.', SRC.indexOf('});', start));
   const body = codeOnly(SRC.slice(start, next === -1 ? SRC.length : next));
   assert.match(body, /SET job_status = 10 WHERE job_id = \?/);
+  assert.match(body, /SET job_status = 10 WHERE job_id = \? AND job_status = 21/, 'the write re-checks the hold (race)');
+  const guard = body.indexOf('!== 21');
+  const photo = body.indexOf('job.hasAfterWorkPhoto(');
+  const write = body.indexOf('SET job_status = 10');
+  assert.ok(guard !== -1 && photo !== -1 && guard < write && photo < write, 'both checks run before the write');
   // Deliberately not via setStatus: 10 maps to TechVisitInComplete, which the
   // client already received before the hold.
   assert.ok(!/setStatus\(/.test(body), 'must not route through setStatus and re-fire the webhook');

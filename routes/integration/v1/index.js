@@ -300,7 +300,11 @@ router.patch('/jobs', async (req, res, next) => {
       return legacyError(res, 400, `unknown action "${action}"`);
     }
 
-    const updated = await jobService.setStatus(jobId, { status: newStatus, comment: req.body.comment }, { user_id: null });
+    // { partnerApi: true }: the one caller exempt from the after-work-photo rule —
+    // external clients must notice no change (CLAUDE.md). See job.service.js setStatus.
+    const updated = await jobService.setStatus(
+      jobId, { status: newStatus, comment: req.body.comment }, { user_id: null }, { partnerApi: true },
+    );
     logger.info('Integration: job status updated · id=' + updated.job_id + ' status=' + updated.job_status);
     legacyOk(res, { jobId: updated.job_id, status: statusLabel(updated.job_status) });
   } catch (e) { next(e); }
