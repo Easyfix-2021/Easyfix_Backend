@@ -9,6 +9,31 @@ const { signUserToken } = require('../utils/jwt');
 const { modernOk, modernError, otpGuessCapError } = require('../utils/response');
 const { FEATURES, emailAllowed } = require('../services/feature-access.service');
 const logger = require('../logger');
+const { rateLimit } = require('../middleware/rate-limit');
+
+/*
+ * Per-IP ceilings on the CRM's two public login routes. They had none: a
+ * script could request codes (each one an SMS/email we pay for) and submit
+ * guesses as fast as the network allows. The per-USER guess cap
+ * (services/otp-attempts.service.js, 5 per 30 min) bounds guessing against
+ * ONE account; these bound one source spraying MANY accounts, and code spend.
+ *
+ * Generous on purpose: the CRM reaches this API over the VPN, where a whole
+ * office can share one address, and a CRM session lasts 30 days — so a real
+ * office never comes near 100 code requests in 10 minutes. Same shape and
+ * IP handling as the technician app's limiters (routes/mobile/index.js).
+ * In-memory, per process — see middleware/rate-limit.js.
+ */
+const ipPart = (req) => String(req.ip ?? 'unknown').trim().slice(0, 64) || 'unknown';
+const LIMIT_MESSAGE = 'Too many sign-in attempts from this network. Please wait a few minutes and try again.';
+const loginOtpIpRateLimit = rateLimit({
+  windowMs: 10 * 60_000, max: 100, message: LIMIT_MESSAGE,
+  key: (req) => `crm-login-otp:ip:${ipPart(req)}`,
+});
+const verifyOtpIpRateLimit = rateLimit({
+  windowMs: 10 * 60_000, max: 200, message: LIMIT_MESSAGE,
+  key: (req) => `crm-verify-otp:ip:${ipPart(req)}`,
+});
 
 /*
  * POST /api/auth/login
@@ -41,7 +66,7 @@ router.post('/login', (_req, res) => {
  * behind VPN auth; do NOT copy this pattern to externally-exposed
  * endpoints (client/mobile/integration) without re-evaluating.
  */
-router.post('/login-otp', validate(loginOtpRequest), async (req, res, next) => {
+router.post('/login-otp', loginOtpIpRateLimit, validate(loginOtpRequest), async (req, res, next) => {
   try {
     const { identifier } = req.body;
     logger.info('Login OTP requested');
@@ -87,7 +112,7 @@ router.post('/login-otp', validate(loginOtpRequest), async (req, res, next) => {
  * Body: { identifier, otp }
  * On success: issues JWT and sets httpOnly cookie.
  */
-router.post('/verify-otp', validate(verifyOtpRequest), async (req, res, next) => {
+router.post('/verify-otp', verifyOtpIpRateLimit, validate(verifyOtpRequest), async (req, res, next) => {
   try {
     const { identifier, otp } = req.body;
     logger.info('Verify OTP attempt');

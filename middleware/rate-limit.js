@@ -11,7 +11,8 @@
 
 const { modernError } = require('../utils/response');
 
-function rateLimit({ windowMs = 60_000, max = 600, key = (req) => req.ip } = {}) {
+// `message` is what the user reads — the login screens show `error` verbatim.
+function rateLimit({ windowMs = 60_000, max = 600, key = (req) => req.ip, message = 'rate limit exceeded' } = {}) {
   const hits = new Map(); // key → { count, resetAt }
   let lastSweep = Date.now();
   return (req, res, next) => {
@@ -30,7 +31,7 @@ function rateLimit({ windowMs = 60_000, max = 600, key = (req) => req.ip } = {})
     }
     if (entry.count >= max) {
       res.setHeader('Retry-After', Math.ceil((entry.resetAt - now) / 1000));
-      return modernError(res, 429, 'rate limit exceeded');
+      return modernError(res, 429, message);
     }
     entry.count++;
     next();
