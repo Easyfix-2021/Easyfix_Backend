@@ -644,7 +644,7 @@ Note: this task only runs if the property "job.share_expiry.enabled" is not set 
       const result = await jobShareDelegation.expireStaleShares();
       logger.info(
         `Job-share expiry cron · eligible=${result.eligible} · expired=${result.expired}`
-        + (result.skipped ? ' (skipped: no tbl_job_share_link)' : ` · ttlHours=${result.ttlHours}`),
+        + (result.skipped ? ' (skipped: delegation migration not applied)' : ` · ttlHours=${result.ttlHours}`),
       );
       return result;
     },

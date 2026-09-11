@@ -355,8 +355,9 @@ test('the mobile job list widens to delegated jobs, and only for the mobile list
     + '  Anything narrower hides a share he is expected to answer.',
   );
   // The widening must be OPT-IN: `easyfixerId` alone still means "assigned to",
-  // which is what the CRM's technician filter and export rely on.
-  assert.match(jobService, /if \(delegatedToEfrId != null\) \{/);
+  // which is what the CRM's technician filter and export rely on. It is also
+  // SCHEMA-GATED: tests/mobile-jobs-list.test.js runs list() both ways.
+  assert.match(jobService, /if \(delegatedToEfrId != null && await delegationColsExist\(\)\) \{/);
   const mobile = readSrc('routes/mobile/index.js');
   assert.match(mobile, /delegatedToEfrId: req\.tech\.efr_id/);
 

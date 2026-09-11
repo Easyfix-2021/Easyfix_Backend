@@ -70,7 +70,8 @@ const TERMINAL_STATUSES = Object.freeze(
 /* A job in one of these is finished — nothing left to delegate. Mirrors
  * job.service STATUS COMPLETED(3) / COMPLETED_ALT(5) / CANCELLED(6); imported
  * rather than retyped so a status renumber cannot silently diverge. */
-const { STATUS } = require('./job.service');
+const { STATUS, delegationColsExist } = require('./job.service');
+const { isAbsentAnswer } = require('../utils/schema-absent-error');
 const NON_SHAREABLE_JOB_STATUSES = new Set([
   STATUS.COMPLETED, STATUS.COMPLETED_ALT, STATUS.CANCELLED,
 ]);
@@ -156,8 +157,15 @@ function toShareJson(row, viewerEfrId = null) {
 }
 
 /* The one live share on a job, or null. `runner` lets a caller pass a
- * transaction connection; defaults to the pool. */
+ * transaction connection; defaults to the pool.
+ *
+ * Null too on a DB the delegation migration has not reached: no share can
+ * exist there, and SHARE_SELECT would 500 every read that funnels through here
+ * — GET /mobile/jobs/:id/share (the app fires it on every open order), the
+ * non-owner GET /mobile/jobs/:id, accept/reject/cancel, the CRM release. Same
+ * probe list() gates on, so the two cannot disagree. */
 async function findLiveShare(jobId, runner = pool) {
+  if (!(await delegationColsExist())) return null;
   const [[row]] = await runner.query(
     `${SHARE_SELECT} WHERE s.job_id = ? AND s.status IN (?, ?, ?) LIMIT 1`,
     [jobId, ...LIVE_STATUSES],
@@ -418,7 +426,10 @@ async function expireStaleShares({ hours = ttlHours(), limit = 200 } = {}) {
     }
     return { eligible: rows.length, expired, ttlHours: hours };
   } catch (e) {
-    if (e && e.code === 'ER_NO_SUCH_TABLE') return { eligible: 0, expired: 0, skipped: true };
+    // Table OR column absent (the delegation migration not yet run): nothing
+    // to sweep. ER_NO_SUCH_TABLE alone let the 10-minute cron throw on every
+    // tick against a table that exists without its delegation columns.
+    if (isAbsentAnswer(e)) return { eligible: 0, expired: 0, skipped: true };
     throw e;
   }
 }

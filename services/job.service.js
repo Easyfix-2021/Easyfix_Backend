@@ -1564,6 +1564,42 @@ async function magicLinkDeliveryColsExist() {
 }
 
 /*
+ * The delegation columns on tbl_job_share_link (migrations/2026-09-10-job-share-
+ * delegation.sql). Same try-the-query shape as the probe above and the same
+ * reason: list() names s.delegate_efr_id, and one missing column 500s the WHOLE
+ * mobile jobs list — which Production did on every GET /api/mobile/jobs from
+ * release 0afb837 (2026-09-10) until this gate existed.
+ *
+ * ONE DELIBERATE DIFFERENCE: "absent" is re-asked after
+ * DELEGATION_ABSENT_RECHECK_MS instead of being frozen for the process. This
+ * migration is applied to live servers without a restart, and a frozen "absent"
+ * would keep delegation dark until the next deploy. "Present" is cached for good
+ * — a column does not un-exist. Cost while absent: one failing query per window.
+ *
+ * Every delegation column any query READS, not only the two list() needs:
+ * job-share-delegation.service gates its reads on this same probe, and a
+ * half-applied migration must read as absent to both.
+ */
+const DELEGATION_ABSENT_RECHECK_MS = 30 * 1000;
+let _hasDelegationCols = false;
+let _delegationColsAbsentUntil = 0;
+async function delegationColsExist() {
+  if (_hasDelegationCols) return true;
+  if (Date.now() < _delegationColsAbsentUntil) return false;
+  try {
+    await pool.query('SELECT delegate_efr_id, contact_name, contact_number, status, responded_on, started_on, ended_on, end_reason FROM tbl_job_share_link LIMIT 1');
+    _hasDelegationCols = true;
+    return true;
+  } catch (e) {
+    // Absent is an ANSWER (cached for the window); anything else is not, so it
+    // is not cached at all — same split as the four probes above.
+    if (isAbsentAnswer(e)) _delegationColsAbsentUntil = Date.now() + DELEGATION_ABSENT_RECHECK_MS;
+    else logger.warn('schema probe failed · delegationColsExist · ' + e.message + ' — treating as absent for this call only');
+    return false;
+  }
+}
+
+/*
  * Builds the pending-customer-request projection columns for the LIST
  * query. When the table exists, emits correlated subqueries selecting the
  * latest PENDING request's type, reason + preferred (requested) datetime;
@@ -2294,7 +2330,9 @@ async function list({
     params.push(...clientIdList);
   }
   if (easyfixerId != null) {
-    if (delegatedToEfrId != null) {
+    // Un-migrated DB (probe says the columns are absent) → the plain
+    // pre-delegation clause below, never a 500. See delegationColsExist().
+    if (delegatedToEfrId != null && await delegationColsExist()) {
       // "assigned to me OR delegated to me" — see the parameter's note above.
       // EXISTS over the (delegate_efr_id, status) index; correlated on j.job_id
       // so no join is added and the COUNT query stays alias-compatible.
@@ -7134,6 +7172,9 @@ module.exports = {
   tryAutoAssignOnCreate,
   fireWebhook, statusToEventName,
   hasClientVerticalIdColumn,
+  // The delegation-schema gate. job-share-delegation.service reads through it
+  // too, so list() and the share reads agree on whether delegation exists.
+  delegationColsExist,
   notifyCustomerNotReachable,
   // Canonical IST wall-clock formatter (server-TZ independent). Exported so
   // route-layer guards can compare an appointment against "now" in IST without

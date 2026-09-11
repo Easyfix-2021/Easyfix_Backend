@@ -420,7 +420,10 @@ router.get(
 // Jobs assigned to me
 router.get('/jobs', async (req, res, next) => {
   try {
-    logger.info('List my jobs · status=' + (req.query.status != null ? req.query.status : 'any') + ' · limit=' + (req.query.limit != null ? req.query.limit : 50));
+    logger.info('List my jobs · status=' + (req.query.status != null ? req.query.status : 'active') + ' · limit=' + (req.query.limit != null ? req.query.limit : 50));
+    // Non-negative safe integer, else 0. It used to be DROPPED, so every
+    // load-more got page one again and the app re-requested it forever.
+    const offset = Number(req.query.offset);
     const { rows, total } = await jobService.list({
       easyfixerId: req.tech.efr_id,
       // …plus every job DELEGATED to him. A delegate never appears on
@@ -431,7 +434,11 @@ router.get('/jobs', async (req, res, next) => {
       // meaning "assigned to".
       delegatedToEfrId: req.tech.efr_id,
       status: req.query.status != null ? Number(req.query.status) : undefined,
+      // No status = the ACTIVE set the dashboard's Open Jobs card counts, not
+      // every job the technician ever had (completed/cancelled included).
+      statuses: req.query.status != null ? undefined : mobileDashboardService.ACTIVE_STATUSES,
       limit: Math.min(Number(req.query.limit) || 50, 200),
+      offset: Number.isSafeInteger(offset) && offset > 0 ? offset : 0,
     });
     logger.info('Found ' + rows.length + ' jobs · total=' + total);
     modernOk(res, { items: rows, total });
