@@ -1,4 +1,22 @@
 -- ─────────────────────────────────────────────────────────────────────
+-- STATUS (2026-09-11): run on PRODUCTION — confirmed from its logs: e18669a's
+-- column probe ran on two production CRM logins and reported no missing column
+-- and no error. NOT yet on QA — measured: the QA backend's database (`easyfix`
+-- at 10.30.2.30, per its boot log) has no failed_attempts column. QA gets it
+-- from the next qa-db-refresh (restored from the Production replica) or by
+-- running this file there. Until then the cap is inert on QA, never failing.
+--
+-- HOW THE COLUMN IS USED NOW (supersedes the column notes further down): it
+-- counts wrong codes in a 30-MINUTE WINDOW PER USER, across codes — owner's
+-- rule, "max 5 times in 30 mins so the user does not get blocked in any case".
+-- A resend does NOT reset it; a successful verify does; the lock lifts by itself
+-- 30 minutes after the first wrong code. The window's start is kept in the
+-- EXISTING column otp_details.updated_on, which nothing else writes: both legacy
+-- JPA entities map it but never set it, no Node code touched it, and it was NULL
+-- in all 10,928 QA rows. So this ALTER is the only schema change the cap needs.
+-- The COMMENT on the column below describes the first design and is left as it
+-- was executed; services/otp-attempts.service.js is the authority.
+--
 -- 2026-09-10 — Give OTP_MAX_ATTEMPTS something to count.
 --
 -- WHAT WAS WRONG: utils/otp.js has declared `OTP_MAX_ATTEMPTS = 5` since it
@@ -20,12 +38,9 @@
 -- existing increments mean.
 --
 -- ── Column notes ────────────────────────────────────────────────────
--- failed_attempts  Guesses made against THIS code since it was issued.
---                  Reset to 0 whenever a new OTP is written onto the row
---                  (a fresh code deserves a fresh budget — otherwise a
---                  legitimate user who mistyped five times could never log
---                  in again, and "resend" would be a button that does
---                  nothing).
+-- failed_attempts  (as first designed — see STATUS above for current use)
+--                  Guesses made against THIS code since it was issued,
+--                  reset to 0 whenever a new OTP was written onto the row.
 --                  NOT NULL DEFAULT 0 so every existing row starts with a
 --                  full budget the moment this runs; no backfill needed.
 --                  INT, not TINYINT: the cap is read from application code
@@ -42,7 +57,9 @@
 -- restart: an absent column is re-probed at most once a minute, so the cap
 -- switches itself on within ~60s and logs "OTP attempt cap now ACTIVE".
 --
--- Style: plain one-statement-per-line; idempotent (re-run = no-op).
+-- Style: plain one-statement-per-line. NOT idempotent: MySQL has no
+-- ADD COLUMN IF NOT EXISTS, so a re-run fails with ER_DUP_FIELDNAME (1060).
+-- That failure changes nothing, but it is an error, not a no-op.
 
 ALTER TABLE otp_details ADD COLUMN failed_attempts INT NOT NULL DEFAULT 0 COMMENT 'guesses made against the current code; reset when a new OTP is written';
 
@@ -53,5 +70,7 @@ ALTER TABLE otp_details ADD COLUMN failed_attempts INT NOT NULL DEFAULT 0 COMMEN
 --  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'otp_details'
 --    AND COLUMN_NAME = 'failed_attempts';
 --
--- After a few days, the cap in action — rows that hit the ceiling:
+-- After a few days, the cap in action — rows that reached the ceiling (a
+-- lock whose window has passed still shows here until the next wrong code
+-- restarts it or a successful login clears it):
 -- SELECT otp_type, COUNT(*) FROM otp_details WHERE failed_attempts >= 5 GROUP BY otp_type;

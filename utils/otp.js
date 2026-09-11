@@ -2,6 +2,10 @@ const crypto = require('crypto');
 
 const OTP_TTL_MINUTES = 5;
 const OTP_MAX_ATTEMPTS = 5;
+/* The window OTP_MAX_ATTEMPTS is counted over, per user. After this long from the
+ * FIRST wrong code the count resets on its own — nobody stays locked out. See
+ * services/otp-attempts.service.js. */
+const OTP_ATTEMPT_WINDOW_MINUTES = 30;
 const OTP_RESEND_SECONDS = 30;
 
 // QA convenience constant — fixed OTP for any email login when
@@ -152,5 +156,6 @@ module.exports = {
   otpExpiryDate,
   OTP_TTL_MINUTES,
   OTP_MAX_ATTEMPTS,
+  OTP_ATTEMPT_WINDOW_MINUTES,
   OTP_RESEND_SECONDS,
 };

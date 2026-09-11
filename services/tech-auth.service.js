@@ -304,12 +304,6 @@ async function createLoginOtp(mobile) {
           WHERE id = ?`,
         [otp, now, expires, existing.id]
       );
-      /* A NEW code gets a FRESH guess budget — see services/otp-attempts.service.js.
-       * Separate call rather than `failed_attempts = 0` in the UPDATE above: that
-       * column does not exist until the migration runs, and naming it here would
-       * 500 every OTP request in the meantime. Without the reset the cap counts per
-       * ROW rather than per CODE, and "Resend OTP" stops being able to help. */
-      await otpAttempts.clearAttempts(existing.id);
     } else {
       await runner.query(
         `INSERT INTO otp_details (otp, otp_type, user_email, user_mobile_no, generated_on, valid_up_to, is_expired, count)
@@ -425,15 +419,17 @@ async function verifyLoginOtp(mobile, otp, { onVerifiedTech } = {}) {
     logger.warn('OTP verify failed · reason=OTP_EXPIRED');
     return { ok: false, reason: 'OTP_EXPIRED' };
   }
-  // Guess cap — see services/otp-attempts.service.js.
-  if (await otpAttempts.isLockedOut(row.id)) {
+  // Guess cap — 5 wrong codes per 30 minutes (services/otp-attempts.service.js).
+  const lock = await otpAttempts.claimAttempt(row.id);
+  if (lock.locked) {
     logger.warn('OTP verify refused · reason=OTP_ATTEMPTS_EXCEEDED');
-    return { ok: false, reason: 'OTP_ATTEMPTS_EXCEEDED' };
+    return { ok: false, reason: 'OTP_ATTEMPTS_EXCEEDED', retryAfterMinutes: lock.retryAfterMinutes };
   }
   if (Number(row.otp) !== Number(otp)) {
     logger.warn('OTP verify failed · reason=OTP_MISMATCH');
-    await otpAttempts.recordFailedAttempt(row.id);
-    return { ok: false, reason: 'OTP_MISMATCH' };
+    const after = await otpAttempts.lockState(row.id);
+    if (after.locked) return { ok: false, reason: 'OTP_ATTEMPTS_EXCEEDED', retryAfterMinutes: after.retryAfterMinutes };
+    return { ok: false, reason: 'OTP_MISMATCH', attemptsRemaining: after.attemptsRemaining };
   }
 
   /*
@@ -498,6 +494,12 @@ async function verifyLoginOtp(mobile, otp, { onVerifiedTech } = {}) {
     logger.warn('OTP verify failed · reason=' + locked.result.reason);
     return locked.result;
   }
+
+  // Proven, consumed, and past every failure path — only now is the guess
+  // window cleared. (The in-lock OTP_MISMATCH above is deliberately NOT counted:
+  // it fires when a new code was issued between the two reads, so the user may
+  // have typed the old code correctly.)
+  await otpAttempts.clearAttempts(row.id);
 
   const { tech } = locked.result;
   const token = jwt.sign(

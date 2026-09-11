@@ -6,7 +6,7 @@ const { loginOtpRequest, verifyOtpRequest } = require('../validators/auth.valida
 const { createLoginOtp, verifyLoginOtp } = require('../services/auth.service');
 const { getRoleById } = require('../services/role.service');
 const { signUserToken } = require('../utils/jwt');
-const { modernOk, modernError } = require('../utils/response');
+const { modernOk, modernError, otpGuessCapError } = require('../utils/response');
 const { FEATURES, emailAllowed } = require('../services/feature-access.service');
 const logger = require('../logger');
 
@@ -100,6 +100,7 @@ router.post('/verify-otp', validate(verifyOtpRequest), async (req, res, next) =>
         OTP_EXPIRED:   [401, 'OTP expired — request a new one'],
         OTP_MISMATCH:  [401, 'incorrect OTP'],
       };
+      if (otpGuessCapError(res, result)) { logger.warn('Verify OTP failed · reason=' + result.reason); return; }
       const [status, message] = map[result.reason] || [401, 'authentication failed'];
       logger.warn('Verify OTP failed · reason=' + (result.reason || 'UNKNOWN') + ' status=' + status);
       return modernError(res, status, message);

@@ -22,7 +22,7 @@ const easyfixerLifecycle = require('../../services/easyfixer-lifecycle.service')
 // predates that split and calls straight into the same service.
 const lifecycle = require('../../services/mobile-job-lifecycle.service');
 const { dailyBridgeCapReached, persistBridgeCall, CALL_FAILED_PUBLIC_MSG } = require('../public/_public-call');
-const { modernOk, modernError } = require('../../utils/response');
+const { modernOk, modernError, otpGuessCapError } = require('../../utils/response');
 const { rateLimit } = require('../../middleware/rate-limit');
 const {
   requireTechJobMutationCapability,
@@ -186,7 +186,7 @@ router.post('/auth/verify-otp', verifyOtpIpRateLimit, verifyOtpMobileRateLimit, 
     );
     if (!r.ok) {
       logger.warn('Login OTP verification failed · ' + r.reason);
-      return modernError(res, otpFailureHttpStatus(r.reason), r.reason);
+      return otpGuessCapError(res, r) || modernError(res, otpFailureHttpStatus(r.reason), r.reason);
     }
 
     // Device-info upsert. device_info schema reality (verified 2026-05-27

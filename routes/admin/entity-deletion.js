@@ -4,7 +4,7 @@ const Joi = require('joi');
 const validate = require('../../middleware/validate');
 const { requirePropertyAllowlist } = require('../../middleware/require-property-allowlist');
 const { FEATURES } = require('../../services/feature-access.service');
-const { modernOk, modernError } = require('../../utils/response');
+const { modernOk, modernError, otpGuessCapError } = require('../../utils/response');
 const logger = require('../../logger');
 
 const actionOtp = require('../../services/action-otp.service');
@@ -100,8 +100,9 @@ router.post(
   async (req, res, next) => {
     try {
       logger.info('Confirm delete · entityType=' + req.body.entityType + ' id=' + req.body.id);
-      const { valid, reason: otpReason } = await actionOtp.verifyActionOtp(req.user, 'delete', req.body.otp);
-      if (!valid) { logger.warn('Confirm delete — OTP verification failed · id=' + req.body.id + ' · ' + otpReason); return modernError(res, 401, `OTP verification failed: ${otpReason}`); }
+      const otpResult = await actionOtp.verifyActionOtp(req.user, 'delete', req.body.otp);
+      const { valid, reason: otpReason } = otpResult;
+      if (!valid) { logger.warn('Confirm delete — OTP verification failed · id=' + req.body.id + ' · ' + otpReason); return otpGuessCapError(res, otpResult) || modernError(res, 401, `OTP verification failed: ${otpReason}`); }
 
       const result = await deletion.tombstoneDelete(
         req.body.entityType, req.body.id, req.body.reason, req.user,
@@ -163,8 +164,9 @@ router.post(
   async (req, res, next) => {
     try {
       logger.info('Confirm restore · archiveId=' + req.body.archiveId);
-      const { valid, reason: otpReason } = await actionOtp.verifyActionOtp(req.user, 'restore', req.body.otp);
-      if (!valid) { logger.warn('Confirm restore — OTP verification failed · archiveId=' + req.body.archiveId + ' · ' + otpReason); return modernError(res, 401, `OTP verification failed: ${otpReason}`); }
+      const otpResult = await actionOtp.verifyActionOtp(req.user, 'restore', req.body.otp);
+      const { valid, reason: otpReason } = otpResult;
+      if (!valid) { logger.warn('Confirm restore — OTP verification failed · archiveId=' + req.body.archiveId + ' · ' + otpReason); return otpGuessCapError(res, otpResult) || modernError(res, 401, `OTP verification failed: ${otpReason}`); }
       const result = await deletion.restore(req.body.archiveId, req.user);
       logger.info((result.entityType || 'record') + ' restored · id=' + result.id);
       return modernOk(res, { ...result, message: 'Record restored on its original id.' });

@@ -7,7 +7,8 @@ const { pool } = require('../../db');
 const clientAuth = require('../../services/client-auth.service');
 const jobService = require('../../services/job.service');
 const clientRequest = require('../../services/client-request.service');
-const { modernOk, modernError } = require('../../utils/response');
+const { modernOk, modernError, otpGuessCapError } = require('../../utils/response');
+const otpAttempts = require('../../services/otp-attempts.service');
 const { selectableCitySql } = require('../../lib/city-status');
 const { sendXlsx } = require('../../utils/xlsx-export');
 const { STATUS_LABELS } = require('../../services/integration.service');
@@ -68,6 +69,7 @@ router.post('/auth/verify-otp', validate(Joi.object({
         OTP_EXPIRED:     [401, 'That code has expired — please request a new one.'],
         OTP_MISMATCH:    [401, 'Incorrect code. Please check and try again.'],
       };
+      if (otpGuessCapError(res, r)) return;
       const [status, message] = REASON_MESSAGES[r.reason] || [401, 'We could not sign you in. Please try again.'];
       return modernError(res, status, message);
     }
@@ -1624,7 +1626,17 @@ router.post('/profile/change-phone/verify-otp', async (req, res, next) => {
       await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
       return modernError(res, 400, 'OTP has expired. Please request a new one.');
     }
-    if (Number(row.otp) !== otp) return modernError(res, 400, 'Incorrect OTP.');
+    // Guess cap — 5 wrong codes per 30 minutes (services/otp-attempts.service.js).
+    const lock = await otpAttempts.claimAttempt(row.id);
+    if (lock.locked) return otpGuessCapError(res, { reason: 'OTP_ATTEMPTS_EXCEEDED', retryAfterMinutes: lock.retryAfterMinutes });
+    if (Number(row.otp) !== otp) {
+      const after = await otpAttempts.lockState(row.id);
+      return otpGuessCapError(res, after.locked
+        ? { reason: 'OTP_ATTEMPTS_EXCEEDED', retryAfterMinutes: after.retryAfterMinutes }
+        : { reason: 'OTP_MISMATCH', attemptsRemaining: after.attemptsRemaining }, 400)
+        || modernError(res, 400, 'Incorrect OTP.');
+    }
+    await otpAttempts.clearAttempts(row.id);
     // Re-check right before writing (guards a race between two requests).
     if (await cn_alreadyRegistered(phone, req.spoc.id)) {
       return modernError(res, 409, 'This number is already registered. Please use a different one.');
@@ -2267,7 +2279,15 @@ async function verifyChangeOtp({ otpType, target, otp, kind, spocId }) {
     await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
     return { ok: false, reason: 'OTP_EXPIRED' };
   }
-  if (Number(row.otp) !== Number(otp)) return { ok: false, reason: 'OTP_MISMATCH' };
+  // Guess cap — 5 wrong codes per 30 minutes (services/otp-attempts.service.js).
+  const lock = await otpAttempts.claimAttempt(row.id);
+  if (lock.locked) return { ok: false, reason: 'OTP_ATTEMPTS_EXCEEDED', retryAfterMinutes: lock.retryAfterMinutes };
+  if (Number(row.otp) !== Number(otp)) {
+    const after = await otpAttempts.lockState(row.id);
+    if (after.locked) return { ok: false, reason: 'OTP_ATTEMPTS_EXCEEDED', retryAfterMinutes: after.retryAfterMinutes };
+    return { ok: false, reason: 'OTP_MISMATCH', attemptsRemaining: after.attemptsRemaining };
+  }
+  await otpAttempts.clearAttempts(row.id);
   await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
   const updateCol = kind === 'email' ? 'contact_email' : 'contact_no';
   await pool.query(
@@ -4076,7 +4096,7 @@ router.post('/profile/change-email/verify-otp', async (req, res, next) => {
       kind: 'email',
       spocId: req.spoc.id,
     });
-    if (!r.ok) return modernError(res, 401, r.reason);
+    if (!r.ok) return otpGuessCapError(res, r) || modernError(res, 401, r.reason);
     modernOk(res, { updated: true, contact_email: newEmail }, 'Email updated');
   } catch (e) { next(e); }
 });

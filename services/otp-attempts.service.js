@@ -1,53 +1,62 @@
 /*
- * OTP GUESS CAP — the storage and the rule behind utils/otp.js
- * OTP_MAX_ATTEMPTS, which until 2026-09-10 was declared, exported, and read
- * by nothing.
+ * OTP GUESS CAP — at most OTP_MAX_ATTEMPTS wrong codes per user within
+ * OTP_ATTEMPT_WINDOW_MINUTES (5 in 30 minutes), after which verification is
+ * refused until the window ends. It then resets BY ITSELF.
  *
- * Four services verify OTPs — auth (CRM), client-auth, tech-auth and
- * action-otp — and all four had the same unbounded shape: load the row for
- * this identifier, compare the submitted code, return OTP_MISMATCH. Nothing
- * counted the mismatches. A 4-digit code with a 5-minute window and no cap is
- * about ten thousand guesses against a live OTP.
+ * WHY IT EXISTS: utils/otp.js declared OTP_MAX_ATTEMPTS = 5 from the day it was
+ * written and nothing read it. Every OTP verify in this backend compared the
+ * submitted code and returned a mismatch without counting. A 4-digit code with
+ * no cap is about ten thousand guesses.
  *
- * This module is the ONE place the cap lives, because four copies of a
- * security rule is four chances to fix three of them.
+ * WHY PER USER, ACROSS CODES. Owner's requirement: "max 5 times in 30 minutes,
+ * so that the user does not get blocked in any case". An OTP lives
+ * OTP_TTL_MINUTES (5), so a 30-minute limit on one code can never bind — the
+ * code is dead first. Each user has ONE otp_details row, which every send path
+ * UPDATEs in place with the new code, so the count lives on that row and
+ * spans codes:
+ *   - sending a new code does NOT reset it (or Resend is the way around it);
+ *   - the lock lifts on its own, 30 minutes after the FIRST wrong code;
+ *   - a successful verify clears it;
+ *   - each wrong code reports how many attempts are left.
+ *
+ * ── WHERE THE STATE LIVES: two columns of otp_details ──────────────────
+ *   failed_attempts  wrong codes in the current window. Added by
+ *                    migrations/2026-09-10-otp-failed-attempts.sql.
+ *   updated_on       when the current window OPENED. An existing column: both
+ *                    legacy JPA entities map it but no code ever sets it (they
+ *                    only write back what they loaded), no Node code touches it,
+ *                    and on 2026-09-11 it was NULL in all 10,928 QA rows. So it
+ *                    had no meaning to break, and holding the window start there
+ *                    needs no schema change. A counter alone cannot do this: it
+ *                    knows HOW MANY, never WHEN, so it could never lift a lock
+ *                    by itself.
  *
  * ── IT FAILS OPEN, ON PURPOSE ──────────────────────────────────────────
- * `failed_attempts` arrives with migrations/2026-09-10-otp-failed-attempts.sql.
- * Until that has run, columnPresent() is false and every function here is a
- * no-op, so login behaves exactly as it did before.
+ * Until failed_attempts exists every function here is a no-op, and login
+ * behaves as it did before any cap. Failing closed would lock every user of
+ * every login surface out the moment the code outran the migration; naming a
+ * missing column would 500 them. A present column is cached; an absent answer is
+ * re-probed at most once a minute, so running the migration on a live
+ * environment switches the cap on by itself. If the column vanishes mid-process
+ * (qa-db-refresh restores QA from a replica), the first "unknown column" error
+ * forgets the cached answer, so the next call re-probes.
  *
- * That is the right direction for an auth path and it is a deliberate choice
- * rather than an oversight: failing CLOSED on a missing column would lock out
- * every user of every login surface the moment the code deployed ahead of the
- * SQL, and throwing would 500 them instead. The cost of failing open is that
- * the cap is not enforced until the migration runs — a return to exactly
- * today's behaviour, which is the worst case either way.
- *
- * ── THE PROBE HEALS ITSELF ─────────────────────────────────────────────
- * A PRESENT column is cached for the life of the process (columns do not get
- * dropped under a running service). An ABSENT one is re-probed at most once a
- * minute. Caching "absent" forever would mean the cap stayed off after the
- * migration ran on a live environment, until somebody happened to restart it —
- * the deploy order would be safe but the fix would be silently inert, and
- * nothing would say so.
- *
- * ── THE RESET IS NOT OPTIONAL ──────────────────────────────────────────
- * clearAttempts() must run wherever a NEW code is written onto an existing
- * row. Without it the counter is per-ROW rather than per-CODE: a user who
- * mistyped five times could never log in again, and "Resend OTP" would be a
- * button that changes nothing. That would be a lockout bug wearing a security
- * feature's clothes.
+ * ── ALL TIME ARITHMETIC IS IN SQL ──────────────────────────────────────
+ * The pool runs dateStrings:true + timezone '+05:30' (db.js): a DATETIME comes
+ * back as a bare IST string, and the SESSION time_zone is SYSTEM, not IST. So
+ * nothing here parses a returned date in JS and nothing calls NOW(). Every time
+ * is a JS Date passed as a parameter — serialized to the IST wall clock exactly
+ * as the stored value was — and MySQL does the subtraction.
  */
 
 const { pool } = require('../db');
 const logger = require('../logger');
-const { OTP_MAX_ATTEMPTS } = require('../utils/otp');
+const { OTP_MAX_ATTEMPTS, OTP_ATTEMPT_WINDOW_MINUTES } = require('../utils/otp');
 
-/** How long an ABSENT answer is trusted before asking again. */
 const ABSENT_RECHECK_MS = 60 * 1000;
+const WINDOW_MS = OTP_ATTEMPT_WINDOW_MINUTES * 60 * 1000;
 
-let _present = false;      // once true, stays true
+let _present = false;      // once true, stays true until an "unknown column" error
 let _absentCheckedAt = 0;  // epoch ms of the last "absent" answer; 0 = never asked
 
 async function columnPresent(db = pool) {
@@ -55,18 +64,19 @@ async function columnPresent(db = pool) {
   if (_absentCheckedAt && Date.now() - _absentCheckedAt < ABSENT_RECHECK_MS) return false;
   try {
     const [rows] = await db.query(
-      `SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'otp_details'
-          AND COLUMN_NAME = 'failed_attempts' LIMIT 1`,
+          AND COLUMN_NAME IN ('failed_attempts', 'updated_on')`,
     );
-    if (rows.length > 0) {
+    if (rows.length === 2) {
       _present = true;
-      if (_absentCheckedAt) logger.info('OTP attempt cap now ACTIVE — otp_details.failed_attempts appeared.');
+      logger.info(`OTP attempt cap now ACTIVE — max ${OTP_MAX_ATTEMPTS} wrong codes per `
+        + `${OTP_ATTEMPT_WINDOW_MINUTES} minutes per user.`);
       return true;
     }
     if (!_absentCheckedAt) {
-      logger.warn('OTP attempt cap INACTIVE — otp_details.failed_attempts is missing. '
-        + 'Run migrations/2026-09-10-otp-failed-attempts.sql; until then OTP guesses are unbounded.');
+      logger.warn('OTP attempt cap INACTIVE — otp_details.failed_attempts does not exist. Run '
+        + 'migrations/2026-09-10-otp-failed-attempts.sql; until then OTP guesses are unbounded.');
     }
     _absentCheckedAt = Date.now();
     return false;
@@ -78,73 +88,125 @@ async function columnPresent(db = pool) {
   }
 }
 
+/** A query error that means the column is gone — forget the cached "present". */
+function noteFailure(e) {
+  if (e && (e.code === 'ER_BAD_FIELD_ERROR' || e.errno === 1054)) {
+    _present = false;
+    _absentCheckedAt = 0;
+  }
+}
+
+const OPEN = Object.freeze({ locked: false, attemptsRemaining: null, retryAfterMinutes: null });
+
 /**
- * Has this row spent its guess budget?
- *
- * TAKES AN ID AND READS THE COLUMN ITSELF, rather than a pre-SELECTed row.
- * The obvious design was to add `failed_attempts` to the four existing
- * projections and pass the row in — but those SELECTs run BEFORE the migration
- * does, and naming a column that does not exist is a hard SQL error on every
- * login. That would turn the fail-open design into a total outage in exactly
- * the window it was written to survive.
- *
- * So: no change to any existing query, and one extra read by primary key only
- * when the cap is actually active.
+ * @param {number} rowId  otp_details.id of the user's OTP row
+ * @returns {Promise<{locked: boolean, attemptsRemaining: number|null, retryAfterMinutes: number|null}>}
+ *   attemptsRemaining: wrong codes still allowed now (null when the cap is inactive).
+ *   retryAfterMinutes: when locked, whole minutes until the window ends, rounded
+ *     UP and never below 1 — "try again in 0 minutes" while still refusing is the
+ *     message that makes people think the screen is broken.
+ * Never throws; an inactive or failed read is reported as unlocked.
  */
-async function isLockedOut(rowId, db = pool) {
-  if (!(await columnPresent(db))) return false;
+async function lockState(rowId, db = pool) {
+  if (!(await columnPresent(db))) return OPEN;
   try {
-    const [[r]] = await db.query('SELECT failed_attempts FROM otp_details WHERE id = ?', [rowId]);
-    return Number((r && r.failed_attempts) || 0) >= OTP_MAX_ATTEMPTS;
+    const now = new Date();
+    const cutoff = new Date(now.getTime() - WINDOW_MS);
+    const [[r]] = await db.query(
+      `SELECT failed_attempts,
+              (updated_on IS NOT NULL AND updated_on >= ?) AS in_window,
+              TIMESTAMPDIFF(SECOND, ?, DATE_ADD(updated_on, INTERVAL ? MINUTE)) AS secs_left
+         FROM otp_details WHERE id = ?`,
+      [cutoff, now, OTP_ATTEMPT_WINDOW_MINUTES, rowId],
+    );
+    // A window that has closed is a full budget, whatever the count says — the
+    // lock lifts by itself, and the next wrong code restarts the window at 1.
+    const inWindow = !!r && (r.in_window === true || Number(r.in_window) === 1);
+    const used = inWindow ? Number(r.failed_attempts) || 0 : 0;
+    const locked = used >= OTP_MAX_ATTEMPTS;
+    return {
+      locked,
+      attemptsRemaining: Math.max(0, OTP_MAX_ATTEMPTS - used),
+      retryAfterMinutes: locked ? Math.max(1, Math.ceil((Number(r.secs_left) || 0) / 60)) : null,
+    };
   } catch (e) {
-    // Same direction as everything else here: a broken counter must not lock
-    // out a user whose code may well be correct.
-    logger.warn('OTP attempt-cap read failed · rowId=' + rowId + ' · ' + e.message);
-    return false;
+    noteFailure(e);
+    logger.warn('OTP attempt-cap read failed · otp_details.id=' + rowId + ' · ' + e.message);
+    return OPEN;
   }
 }
 
 /**
- * Count one wrong guess. Returns the new total, or null when the cap is
- * inactive.
+ * Claim one guess BEFORE the code is compared. Call it after the expiry check,
+ * refuse without comparing when it says locked, and afterwards either
+ * clearAttempts (right code) or lockState (wrong code — nothing more to write,
+ * the guess is already counted; lockState says what to tell the user).
  *
- * The UPDATE is unconditional rather than read-modify-write: two concurrent
- * wrong guesses must both count, and `failed_attempts = failed_attempts + 1`
- * is atomic in a way `SELECT` then `SET n+1` is not. Brute force is the case
- * where concurrency is the point.
+ * WHY CLAIM FIRST. Reading the count, comparing, and only then counting lets a
+ * burst of parallel guesses all pass the read before any count lands — on a
+ * route with no rate limit (the CRM login) that is as many guesses as can be
+ * sent in the code's five minutes. Here the check and the count are ONE
+ * statement: InnoDB serialises concurrent UPDATEs of the row and evaluates each
+ * WHERE against the latest committed value, so at most OTP_MAX_ATTEMPTS claims
+ * succeed per window however many arrive at once.
+ *
+ * The SET: if the window has expired (or never opened) the count restarts at 1
+ * and a new window opens now; otherwise it increments. MySQL evaluates
+ * single-table UPDATE assignments left to right, and a later assignment sees an
+ * earlier one's NEW value, so failed_attempts is assigned FIRST and both IFs test
+ * the OLD window. Swapped, an expired window would reopen first and the count
+ * would carry on from the stale total (measured on MySQL: 6 instead of 1).
+ *
+ * @returns {Promise<{locked: boolean, attemptsRemaining: number|null, retryAfterMinutes: number|null}>}
+ *   locked:true — the window is full; refuse WITHOUT comparing.
  */
-async function recordFailedAttempt(rowId, db = pool) {
-  if (!(await columnPresent(db))) return null;
+async function claimAttempt(rowId, db = pool) {
+  if (!(await columnPresent(db))) return OPEN;
   try {
-    await db.query(
-      'UPDATE otp_details SET failed_attempts = failed_attempts + 1 WHERE id = ?', [rowId],
+    const now = new Date();
+    const cutoff = new Date(now.getTime() - WINDOW_MS);
+    const [res] = await db.query(
+      `UPDATE otp_details
+          SET failed_attempts = IF(updated_on IS NULL OR updated_on < ?, 1, failed_attempts + 1),
+              updated_on      = IF(updated_on IS NULL OR updated_on < ?, ?, updated_on)
+        WHERE id = ?
+          AND (updated_on IS NULL OR updated_on < ? OR failed_attempts < ?)`,
+      [cutoff, cutoff, now, rowId, cutoff, OTP_MAX_ATTEMPTS],
     );
-    const [[r]] = await db.query('SELECT failed_attempts FROM otp_details WHERE id = ?', [rowId]);
-    const n = Number(r && r.failed_attempts) || 0;
-    if (n >= OTP_MAX_ATTEMPTS) {
-      logger.warn(`OTP attempt cap reached · otpRowId=${rowId} · attempts=${n}/${OTP_MAX_ATTEMPTS} `
-        + '· further guesses against this code are refused until a new one is sent');
+    if (res && res.affectedRows > 0) return OPEN;
+    // Nothing claimed: the window is full — or the row has gone, which reads as
+    // unlocked below. Either way lockState has the minutes to show.
+    const state = await lockState(rowId, db);
+    if (state.locked) {
+      logger.warn(`OTP attempt refused · otp_details.id=${rowId} · ${OTP_MAX_ATTEMPTS} attempts used in `
+        + `${OTP_ATTEMPT_WINDOW_MINUTES}m · lifts in ~${state.retryAfterMinutes}m`);
     }
-    return n;
+    return state;
   } catch (e) {
+    noteFailure(e);
     // Losing the count is bad; failing the verify because the counter did not
     // write is worse — the user's code may well have been correct.
-    logger.warn('OTP attempt increment failed · rowId=' + rowId + ' · ' + e.message);
-    return null;
+    logger.warn('OTP attempt claim failed · otp_details.id=' + rowId + ' · ' + e.message);
+    return OPEN;
   }
 }
 
 /**
- * Give the row a fresh budget. Call wherever a NEW code is written onto an
- * existing row — see the header for why skipping this turns the cap into a
- * permanent lockout.
+ * Close the window — on a SUCCESSFUL verify, and only there. Deliberately NOT
+ * called when a new code is sent: that would let Resend bypass the cap.
+ * updated_on goes back to NULL, the value no other code ever wrote.
  */
 async function clearAttempts(rowId, db = pool) {
   if (!(await columnPresent(db))) return;
   try {
-    await db.query('UPDATE otp_details SET failed_attempts = 0 WHERE id = ?', [rowId]);
+    await db.query(
+      `UPDATE otp_details SET failed_attempts = 0, updated_on = NULL
+        WHERE id = ? AND (failed_attempts <> 0 OR updated_on IS NOT NULL)`,
+      [rowId],
+    );
   } catch (e) {
-    logger.warn('OTP attempt reset failed · rowId=' + rowId + ' · ' + e.message);
+    noteFailure(e);
+    logger.warn('OTP attempt reset failed · otp_details.id=' + rowId + ' · ' + e.message);
   }
 }
 
@@ -153,10 +215,10 @@ function _resetProbeCache() { _present = false; _absentCheckedAt = 0; }
 
 module.exports = {
   OTP_MAX_ATTEMPTS,
+  OTP_ATTEMPT_WINDOW_MINUTES,
   ABSENT_RECHECK_MS,
-  isLockedOut,
-  recordFailedAttempt,
+  lockState,
+  claimAttempt,
   clearAttempts,
-  columnPresent,
   _resetProbeCache,
 };
