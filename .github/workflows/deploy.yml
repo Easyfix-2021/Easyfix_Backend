@@ -23,6 +23,9 @@
 #   ECR_REGISTRY              902810393464.dkr.ecr.ap-south-1.amazonaws.com
 #   ECR_REPOSITORY_BACKEND    easyfix/backend
 #   MAIL_USERNAME / MAIL_PASSWORD   (optional — failure-alert SMTP)
+#   PROD_DOZZLE_REMOTE_AGENT  (optional) <prod-UI-host-private-ip>:7007 —
+#                             prod Dozzle also shows the UI host. Set it LAST,
+#                             once the agent answers: docs/dozzle-agent.md
 #
 # `environment: 'Organisation Level Secrets'` is REQUIRED on every job
 # that reads org-level environment secrets. Without it,
@@ -366,6 +369,8 @@ jobs:
 
       - name: SSM compose pull + up
         id: ssm
+        env:
+          PROD_DOZZLE_REMOTE_AGENT: ${{ secrets.PROD_DOZZLE_REMOTE_AGENT }}
         run: |
           set -euo pipefail
           INSTANCE_ID="${{ steps.target.outputs.instance_id }}"
@@ -381,6 +386,31 @@ jobs:
           REGISTRY="${{ secrets.ECR_REGISTRY || '902810393464.dkr.ecr.ap-south-1.amazonaws.com' }}"
           REPO="${{ secrets.ECR_REPOSITORY_BACKEND || 'easyfix/backend' }}"
           IMAGE_URI="${REGISTRY}/${REPO}:${IMAGE_TAG}"
+
+          # Address of the Dozzle agent on the prod UI host (<private-ip>:7007),
+          # so the prod Dozzle here lists crm-ui + client-ui too. A repo SECRET,
+          # not a variable: this repo is public, and a variable's value is
+          # printed unmasked in the step's env header of every deploy log.
+          # Always empty on QA, whose Dozzle already sees every container on
+          # its one box. Written into /opt/easyfix/.env by the remote script;
+          # see docs/dozzle-agent.md.
+          #
+          # It arrives through the step's env:, NOT as an Actions expression
+          # inside this script — that splices the raw value into bash before any
+          # check can run, which a test with a quote in the value proved. It is
+          # still spliced into the REMOTE script below (a root shell on the
+          # host), so refuse any character that could end a quoted string —
+          # ignored with a warning, not fatal: log visibility must never block
+          # a deploy.
+          DOZZLE_REMOTE_AGENT=""
+          if [[ "$ENV_NAME" == "production" ]]; then
+            DOZZLE_REMOTE_AGENT="${PROD_DOZZLE_REMOTE_AGENT:-}"
+          fi
+          AGENT_RE='^[A-Za-z0-9.:|,_-]*$'
+          if [[ ! "$DOZZLE_REMOTE_AGENT" =~ $AGENT_RE ]]; then
+            echo "::warning::PROD_DOZZLE_REMOTE_AGENT may only contain [A-Za-z0-9.:|,_-] — ignoring it, so Dozzle will show the backend host only."
+            DOZZLE_REMOTE_AGENT=""
+          fi
 
           if [[ -z "$INSTANCE_ID" ]]; then
             echo "::error::INSTANCE_ID secret missing for $ENV_NAME — confirm QA_INSTANCE_ID exists in the 'Organisation Level Secrets' environment"
@@ -436,6 +466,13 @@ jobs:
               sed -i "s|^BACKEND_IMAGE=.*|BACKEND_IMAGE=$IMAGE_URI|" /opt/easyfix/.env
             else
               echo "BACKEND_IMAGE=$IMAGE_URI" >> /opt/easyfix/.env
+            fi
+            # Dozzle agent address. Delete-then-append keeps the GitHub secret
+            # the ONLY source of truth: unset it and this removes the line, and
+            # the \`up -d dozzle\` below recreates Dozzle without the agent.
+            sed -i '/^DOZZLE_REMOTE_AGENT=/d' /opt/easyfix/.env
+            if [[ -n "$DOZZLE_REMOTE_AGENT" ]]; then
+              echo "DOZZLE_REMOTE_AGENT=$DOZZLE_REMOTE_AGENT" >> /opt/easyfix/.env
             fi
           ) 9>/opt/easyfix/.env.lock
 
@@ -628,9 +665,11 @@ jobs:
           docker compose up -d --no-deps --force-recreate backend
 
           # Auxiliary services — bring up if defined in compose but not
-          # currently running. Idempotent: no-op when already up. Adding
-          # \`dozzle\` here makes "fresh EC2 → first deploy" automatically
-          # start the log viewer; existing running container is unaffected.
+          # currently running. Idempotent: no-op when already up AND unchanged.
+          # Adding \`dozzle\` here makes "fresh EC2 → first deploy" automatically
+          # start the log viewer. A changed definition (new image tag, new
+          # DOZZLE_REMOTE_AGENT in .env) makes compose pull + RECREATE it — that
+          # is how a Dozzle version bump reaches the host.
           # \`|| true\` prevents an aux-service failure from blocking the
           # main backend deploy.
           for aux in dozzle; do

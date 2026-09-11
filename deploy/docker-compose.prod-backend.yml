@@ -6,7 +6,9 @@
 #                              client-ui + dozzle) per deploy/docker-compose.yml
 #   PROD (two EC2s)
 #     • PROD_BACKEND_INSTANCE_ID  ← THIS file: backend + dozzle ONLY
-#     • PROD_FRONTEND_INSTANCE_ID ← UI repos' compose (crm-ui + client-ui + dozzle)
+#     • PROD_FRONTEND_INSTANCE_ID ← UI repos' compose (crm-ui + client-ui +
+#                                   dozzle + dozzle-agent, which feeds THIS
+#                                   host's Dozzle)
 #
 # Why split: the prod BE EC2 doesn't run the UI containers, so listing
 # them here would (a) waste compose-pull cycles, (b) churn the
@@ -80,12 +82,25 @@ services:
   # Dozzle — log viewer at :8888. Same trust model as QA: network-only
   # auth, Docker socket mounted read-only, VPN-gated. Kept on the BE
   # host because that's where the highest-volume logs originate.
+  #
+  # It also lists the prod UI host (crm-ui + client-ui) by dialling the Dozzle
+  # agent there (`dozzle-agent` in the UI repos' prod-frontend compose) at
+  # DOZZLE_REMOTE_AGENT=<ui-host-private-ip>:7007. deploy.yml writes that line
+  # into /opt/easyfix/.env from the PROD_DOZZLE_REMOTE_AGENT repo secret.
+  # Empty ⇒ Dozzle shows this host only (an empty value parses to no agents).
+  # An unreachable agent is never fatal, but Dozzle re-dials it on EVERY page
+  # load and waits up to DOZZLE_TIMEOUT (10s) before listing anything — so
+  # the secret is set only after the agent answers (runbook). Must stay `:-`,
+  # never `:?` — a required var would fail every compose command on this box,
+  # backend deploys included. Runbook: docs/dozzle-agent.md.
   dozzle:
-    image: amir20/dozzle:latest
+    # EXACT tag, never :latest — see the note in deploy/docker-compose.yml.
+    image: amir20/dozzle:v11.0.0
     container_name: easyfix-dozzle
     restart: unless-stopped
     environment:
       DOZZLE_HOSTNAME: "EasyFix Prod-BE"
+      DOZZLE_REMOTE_AGENT: ${DOZZLE_REMOTE_AGENT:-}
     ports:
       - "8888:8080"
     volumes:

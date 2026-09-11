@@ -160,15 +160,23 @@ services:
   # SECURITY POSTURE — network-only:
   # No app-level auth. The EC2 is in a private subnet; reaching :8888
   # at all requires being on the AWS Client VPN, which is the trust
-  # boundary. The Docker socket is mounted READ-ONLY (`:ro`) so even
-  # if Dozzle had a vulnerability, it can't mutate Docker state — only
-  # read container metadata + logs.
+  # boundary. The Docker socket is mounted `:ro`, but that only protects
+  # the socket FILE — it does not restrict the Docker API. What keeps
+  # Dozzle read-only is DOZZLE_ENABLE_ACTIONS / DOZZLE_ENABLE_SHELL being
+  # off (the default), plus that network boundary.
   #
   # If you ever expose this EC2 to the public internet, add
   # DOZZLE_AUTH_PROVIDER=simple + a users.yml volume mount before doing
   # so. Search "Dozzle authentication" in dozzle.dev for the recipe.
+  #
+  # EXACT tag, never :latest. `compose up` only pulls an image that is
+  # MISSING, so :latest froze each host at whatever it meant on its first
+  # pull — QA sat on v10.5.0 and Prod on v10.6.4 (2026-09-11) with nothing
+  # ever upgrading either. Bump this, docker-compose.prod-backend.yml and the
+  # prod UI host's dozzle-agent (UI repos) together: server and agent speak a
+  # gRPC protocol that changes between releases. See docs/dozzle-agent.md.
   dozzle:
-    image: amir20/dozzle:latest
+    image: amir20/dozzle:v11.0.0
     container_name: easyfix-dozzle
     restart: unless-stopped
     environment:
