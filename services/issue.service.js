@@ -427,23 +427,27 @@ async function reopenIssue(issueId, { reopenNote }, actor) {
   // reorder it to DD-MM-YYYY HH:mm, never parse it — parsing is where a TZ shift gets in.
   const when = String(issue.closed_on || '').replace(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}).*$/, '$3-$2-$1 $4:$5');
   const closer = issue.closed_by_name || `user #${issue.closed_by}`;
-  const text = `Reopened: ${reopenNote}\n\nPreviously closed by ${closer}${when ? ` on ${when}` : ''}.`
+  // The close record is what the UPDATE erases, so it is never the part cut: at
+  // most ~1311 chars (255-char name, 1000-char note), and the validator caps the
+  // reason at 600, so the whole text fits VARCHAR(2000) and the slice is a backstop.
+  const tail = `\n\nPreviously closed by ${closer}${when ? ` on ${when}` : ''}.`
     + (issue.close_note ? ` Close note: ${issue.close_note}` : '');
+  const text = `Reopened: ${reopenNote}`.slice(0, Math.max(0, COMMENT_MAX - tail.length)) + tail;
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    // `closed_on <=> ?` binds the CLOSE this comment describes: if someone
+    // reopened and re-closed it since we read it, that newer close must not be
+    // erased under a comment about the old one — 409 instead.
     const [r] = await conn.query(
-      'UPDATE tbl_crm_issue SET status = ?, closed_by = NULL, closed_on = NULL, close_note = NULL WHERE id = ? AND status = ?',
-      [STATUS.OPEN, issueId, STATUS.CLOSED],
+      'UPDATE tbl_crm_issue SET status = ?, closed_by = NULL, closed_on = NULL, close_note = NULL WHERE id = ? AND status = ? AND closed_on <=> ?',
+      [STATUS.OPEN, issueId, STATUS.CLOSED, issue.closed_on],
     );
-    if (!r.affectedRows) throw badRequest('Issue is already open', 409);
+    if (!r.affectedRows) throw badRequest('This issue changed since you opened it — reload and try again', 409);
     await conn.query(
       'INSERT INTO tbl_crm_issue_comment (issue_id, comment_text, commented_by, created_on) VALUES (?, ?, ?, ?)',
-      // ponytail: a 2000-char reason plus a 1000-char close note can overflow
-      // the column, so the tail (the old note) is cut rather than 1406-ing the
-      // reopen. Lower the reopen_note max if a cut note ever matters.
-      [issueId, text.slice(0, COMMENT_MAX), actor.userId, new Date()],
+      [issueId, text, actor.userId, new Date()],
     );
     await conn.commit();
   } catch (e) {

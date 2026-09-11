@@ -39,6 +39,7 @@ function reset() {
   Object.assign(S, {
     status: 'closed',
     closeNote: 'Deployed a fix.',
+    closerName: 'Priyanka',
     updateAffected: 1,
     commentFails: false,
     perms: [],          // what role.service reports for the route test's caller
@@ -60,7 +61,7 @@ function issueRow() {
     closed_on: S.status === 'closed' ? '2026-09-10 15:20:00' : null,
     close_note: S.status === 'closed' ? S.closeNote : null,
     reported_by_name: 'Ravi',
-    closed_by_name: S.status === 'closed' ? 'Priyanka' : null,
+    closed_by_name: S.status === 'closed' ? S.closerName : null,
   };
 }
 
@@ -134,8 +135,9 @@ test('reporter reopens own closed issue: guarded UPDATE + history comment, in on
   const upd = updateCall();
   assert.ok(upd, 'expected the UPDATE to have been issued');
   assert.match(upd.sql, /closed_by = NULL, closed_on = NULL, close_note = NULL/, 'the single close slot is cleared');
-  assert.match(upd.sql, /WHERE id = \? AND status = \?$/, 'the UPDATE is guarded on the current status');
-  assert.deepEqual(upd.params, ['open', 7, 'closed'], 'status -> open, and only if it is still closed');
+  assert.match(upd.sql, /WHERE id = \? AND status = \? AND closed_on <=> \?$/, 'guarded on the status AND the close being undone');
+  assert.deepEqual(upd.params, ['open', 7, 'closed', '2026-09-10 15:20:00'],
+    'status -> open, only if it is still closed by the SAME close the comment describes');
 
   const ins = commentCall();
   assert.ok(ins, 'expected the history comment to have been inserted');
@@ -165,6 +167,35 @@ test('a manager reopens an issue someone else reported; no close note, no "Close
   assert.equal(by, MANAGER);
   assert.equal(text, 'Reopened: Reproduced again.\n\nPreviously closed by Priyanka on 10-09-2026 15:20.');
   assert.ok(kinds().includes('commit'));
+});
+
+test('worst case lengths: the close record the UPDATE erases always survives in full, within VARCHAR(2000)', async () => {
+  S.closerName = 'N'.repeat(255);                     // tbl_user.user_name varchar(255)
+  S.closeNote = 'C'.repeat(999) + 'Z';                // close_note varchar(1000); Z marks its END
+  await svc.reopenIssue(7, { reopenNote: 'R'.repeat(600) }, { userId: REPORTER, canManage: false });
+  const text = commentCall().params[1];
+  assert.ok(text.length <= 2000, `fits the column, got ${text.length}`);
+  assert.ok(text.startsWith('Reopened: ' + 'R'.repeat(600) + '\n\n'), 'the whole 600-char reason (the validator max) is kept');
+  assert.ok(text.endsWith(' Close note: ' + 'C'.repeat(999) + 'Z'), 'the whole close note is kept');
+  assert.ok(text.includes('Previously closed by ' + 'N'.repeat(255) + ' on 10-09-2026 15:20.'));
+
+  // Past the validator (a direct service call): the REASON is cut, never the close record.
+  reset(); fake.reset(); log.length = 0; S.closeNote = 'C'.repeat(999) + 'Z';
+  await svc.reopenIssue(7, { reopenNote: 'R'.repeat(1990) }, { userId: REPORTER, canManage: false });
+  const cut = commentCall().params[1];
+  assert.equal(cut.length, 2000);
+  assert.ok(cut.endsWith('C'.repeat(999) + 'Z'), 'the close note is intact');
+});
+
+test('a reopen racing a newer close (reopened + re-closed since the read) is 409, not an erased close', async () => {
+  S.updateAffected = 0;                               // closed_on no longer matches what we read
+  const e = await rejectsWith(
+    () => svc.reopenIssue(7, { reopenNote: 'x' }, { userId: REPORTER, canManage: false }),
+    409, 'stale close',
+  );
+  assert.match(e.message, /changed since you opened it/);
+  assert.equal(updateCall().params[3], '2026-09-10 15:20:00', 'the guard carries the close we read');
+  assert.equal(commentCall(), undefined);
 });
 
 // ─── REFUSALS — no write, no connection ──────────────────────────────────
@@ -221,7 +252,8 @@ test('issueReopen requires a non-blank reason, trimmed, within comment_text', ()
     assert.ok(error, `${JSON.stringify(body)} must be rejected`);
     assert.equal(error.details[0].message, 'Tell us what is still wrong');
   }
-  assert.ok(issueReopen.validate({ reopen_note: 'x'.repeat(2001) }).error, 'over 2000 is rejected');
+  assert.ok(issueReopen.validate({ reopen_note: 'x'.repeat(601) }).error, 'over 600 is rejected');
+  assert.equal(issueReopen.validate({ reopen_note: 'x'.repeat(600) }).error, undefined, '600 is accepted');
   const { value, error } = issueReopen.validate({ reopen_note: '  still broken  ' }, { convert: true });
   assert.equal(error, undefined);
   assert.equal(value.reopen_note, 'still broken');
