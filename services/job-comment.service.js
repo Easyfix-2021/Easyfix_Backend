@@ -42,6 +42,30 @@ const STAGES = Object.freeze({
   17: 'enquiry',
 });
 
+/*
+ * "Remarks For" — the legacy CRM's label for comment_on, verbatim from
+ * EasyFix_CRM src/main/webapp/pages/jobs/jobCommentList.vm:15-28. Any other
+ * code (0, 5, 7, 10, NULL) rendered a blank cell there, hence null here.
+ * NOTE 4 is 'Feedback' in legacy even though STAGES calls it in_progress:
+ * this map is the legacy DISPLAY, STAGES stays the write-side enum.
+ */
+const REMARKS_FOR = Object.freeze({
+  1: 'Scheduling',
+  2: 'CheckIn',
+  3: 'CheckOut',
+  4: 'Feedback',
+  6: 'Canceling',
+  8: 'TX Reschedule',
+  9: 'TX cancelled',
+  15: 'Approval',
+  16: 'Unconfirmed',
+  17: 'Inquiry',
+  18: 'TX Rejected',
+  19: 'Escalated',
+  20: 'Re-Opened Job',
+  21: 'ReScheduled',
+});
+
 function shapeRow(r) {
   return {
     id: r.id,
@@ -56,6 +80,13 @@ function shapeRow(r) {
     efr_id: r.efr_id,
     enum_reason_id: r.enum_reason_id,
     enum_desc: r.enum_desc,
+    // Legacy remarks-table columns — see listComments for the sources.
+    // addComment's re-read selects none of the reason_* / escalation / efr
+    // columns, so there these fall back to null / the tbl_user name.
+    remarks_for: REMARKS_FOR[r.comment_on] ?? null,
+    accountable: Number(r.reason_is_new) === 1 ? (r.reason_user_type || null) : null,
+    remark_by: r.user_name || r.job_escalated_by
+      || (r.commented_by == null ? r.efr_name : null) || null,
   };
 }
 
@@ -72,13 +103,37 @@ async function listComments(jobId) {
   // a wider type refactor; the FE just renders whatever string the BE
   // hands it. If `action_taken_reason` is absent on a legacy deploy
   // the LEFT JOIN simply yields NULL and the column renders blank.
+  //
+  // remarks_for / accountable / remark_by (built in shapeRow) reproduce the
+  // legacy stored procedure sp_ef_job_get_job_comments (body read from the QA
+  // DB 2026-09-11) as rendered by EasyFix_CRM jobCommentList.vm:
+  //   Accountable = user_type.type via the reason row, shown only when
+  //                 action_taken_reason.is_new = 1 (vm:31-35).
+  //   Remark By   = tbl_user.user_name if non-empty, else
+  //                 tbl_job_comment.job_escalated_by (vm:38-43). Escalations
+  //                 (comment_on 19/20) never set commented_by — all 14,480 QA
+  //                 rows carry the author's NAME in job_escalated_by instead,
+  //                 which is why user_name alone rendered "Unknown".
+  //   Beyond legacy: a row with NO commented_by falls back to the technician
+  //   in efr_id — the Node technician writers (mobile checkout remark,
+  //   cancel/reschedule asks) put the tech there on purpose, and the only
+  //   such legacy rows are source_type 'API_App'. Only when commented_by IS
+  //   NULL, so a deleted CRM user's remark is never pinned on the technician.
+  // The SP's second UNION branch (a synthetic 'Canceling' row built from
+  // tbl_job.cancel_*) is deliberately NOT reproduced: this listing's top row
+  // must stay the same row Manage Jobs' last_comment picks (see
+  // tests/manage-jobs-columns.test.js).
   const [rows] = await pool.query(
     `SELECT c.comment_id AS id, c.job_id, c.comments, c.comment_on, c.created_on,
             c.appointment_on, c.commented_by, c.enum_reason_id, c.efr_id,
-            u.user_name, atr.action_desc AS enum_desc
+            u.user_name, atr.action_desc AS enum_desc,
+            c.job_escalated_by, e.efr_name,
+            atr.is_new AS reason_is_new, ut.type AS reason_user_type
        FROM tbl_job_comment c
        LEFT JOIN tbl_user u ON u.user_id = c.commented_by
        LEFT JOIN action_taken_reason atr ON atr.id = c.enum_reason_id
+       LEFT JOIN user_type ut ON ut.id = atr.user_type
+       LEFT JOIN tbl_easyfixer e ON e.efr_id = c.efr_id
       WHERE c.job_id = ?
       ORDER BY c.created_on DESC, c.comment_id DESC`,
     [jobId]
