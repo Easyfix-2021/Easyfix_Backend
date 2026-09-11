@@ -1303,15 +1303,22 @@ router.post('/profile/personal-details', validate(Joi.object({
 });
 
 // Professional section. Persists experience level (experience_id FK), the
-// selected tool ids (CSV → efr_tools), the use_whatsapp flag, and the three
-// uploaded photos → tbl_easyfixer_document (7=Education Certificate, 8=Tools,
-// 9=Bag Your Tools). Categories/skills themselves persist via the separate
-// deep-skill flow (POST /profile/skills), NOT here. `unknown(true)` keeps the
-// handler tolerant of legacy/extra fields the app may still send (hasTools,
-// serviceTypeIds, hasBike) during the screen transition.
+// selected tool ids (CSV → efr_tools), the use_whatsapp and have_bike flags, and
+// the three uploaded photos → tbl_easyfixer_document (7=Education Certificate,
+// 8=Tools, 9=Bag Your Tools). Categories/skills themselves persist via the
+// separate deep-skill flow (POST /profile/skills), NOT here. `unknown(true)` keeps
+// the handler tolerant of legacy/extra fields the app may still send (hasTools,
+// serviceTypeIds).
+//
+// hasBike WAS one of those tolerated-and-dropped fields until 2026-09-11: the app
+// showed a Bike toggle, sent it, and this handler threw it away, while the CRM's
+// verification screen reads tbl_easyfixer.have_bike. Every technician's answer
+// since the new app went live was lost. It is written now, COALESCE'd like the
+// rest so an omitted flag keeps the stored one.
 router.post('/profile/professional-details', validate(Joi.object({
   experienceId: Joi.number().integer().positive().optional(),
   useWhatsapp: Joi.boolean().optional(),
+  hasBike: Joi.boolean().optional(),
   toolIds: Joi.array().items(Joi.number().integer().positive()).optional(),
   // Per-tool photos (proof of possession): one entry per selected tool.
   tools: Joi.array().items(Joi.object({
@@ -1331,6 +1338,7 @@ router.post('/profile/professional-details', validate(Joi.object({
     logger.info('Save professional-details profile section');
     const b = req.body;
     const useWhatsapp = b.useWhatsapp === undefined ? null : (b.useWhatsapp ? 1 : 0);
+    const hasBike = b.hasBike === undefined ? null : (b.hasBike ? 1 : 0);
     // Selected tool ids — prefer the rich per-tool `tools[]`, else the flat toolIds.
     const toolIdList = Array.isArray(b.tools) && b.tools.length
       ? b.tools.map((t) => t.toolId)
@@ -1347,9 +1355,10 @@ router.post('/profile/professional-details', validate(Joi.object({
          experience_id = COALESCE(?, experience_id),
          efr_tools     = COALESCE(?, efr_tools),
          use_whatsapp  = COALESCE(?, use_whatsapp),
+         have_bike     = COALESCE(?, have_bike),
          efr_professional_details_perc = COALESCE(?, efr_professional_details_perc)
        WHERE efr_id = ?`,
-      [b.experienceId || null, toolsCsv, useWhatsapp, professionalComplete ? 100 : null, efrId]);
+      [b.experienceId || null, toolsCsv, useWhatsapp, hasBike, professionalComplete ? 100 : null, efrId]);
 
     // Per-tool photos → tbl_easyfixer_document type 8, one row per tool with the
     // tool id stamped in efr_doc_text (schema-safe; no tool↔doc junction needed).
@@ -1404,16 +1413,24 @@ router.post('/profile/professional-details', validate(Joi.object({
   }
 });
 
-// Professional prefill — experience level, WhatsApp flag, the selected tools
-// (with name + whether a photo is already on file), and the selected service
+// Professional prefill — experience level, WhatsApp and bike flags, the selected
+// tools (with name + whether a photo is already on file), whether the education
+// certificate and tool-bag photos are on file, and the selected service
 // categories (with the count of chosen deep-skill options). The per-category
 // deep-skill DETAIL loads on demand via GET /deepskill/hierarchy/:categoryId.
+//
+// `docs` exists so Edit Profile can say "on file" for the two single photos the
+// way it does per tool. Without it the tiles read blank for a technician who
+// uploaded both, inviting him to upload them again.
 router.get('/profile/professional', async (req, res, next) => {
   try {
     logger.info('Load professional prefill');
     const efrId = req.tech.efr_id;
     const [[ef]] = await pool.query(
-      'SELECT experience_id, efr_tools, use_whatsapp FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1', [efrId]);
+      'SELECT experience_id, efr_tools, use_whatsapp, have_bike FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1', [efrId]);
+    const [docRows] = await pool.query(
+      'SELECT DISTINCT efr_doc_type_id FROM tbl_easyfixer_document WHERE efr_id = ? AND efr_doc_type_id IN (7, 9)', [efrId]);
+    const docTypes = new Set(docRows.map((r) => Number(r.efr_doc_type_id)));
 
     const toolIds = String(ef && ef.efr_tools ? ef.efr_tools : '')
       .split(',').map((s) => parseInt(s, 10)).filter((n) => Number.isInteger(n) && n > 0);
@@ -1439,10 +1456,13 @@ router.get('/profile/professional', async (req, res, next) => {
         ORDER BY c.service_catg_name ASC`, [efrId]);
 
     logger.info('Professional prefill · tools=' + tools.length + ' · categories=' + catRows.length);
-    const wa = ef ? ef.use_whatsapp : null;
+    // BIT(1) columns arrive as Buffers (see SCHEMA.md), so read the first byte.
+    const bit = (v) => (Buffer.isBuffer(v) ? v[0] === 1 : Number(v) === 1);
     modernOk(res, {
       experienceId: ef ? ef.experience_id : null,
-      useWhatsapp: Buffer.isBuffer(wa) ? wa[0] === 1 : Number(wa) === 1,
+      useWhatsapp: bit(ef ? ef.use_whatsapp : null),
+      hasBike: bit(ef ? ef.have_bike : null),
+      docs: { education: docTypes.has(7), toolBag: docTypes.has(9) },
       tools,
       categories: catRows.map((c) => ({
         categoryId: Number(c.categoryId), categoryName: c.categoryName, skillCount: Number(c.skillCount),
