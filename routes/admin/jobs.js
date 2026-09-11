@@ -3394,7 +3394,7 @@ router.post('/:id/share/release',
   validate(idParam, 'params'),
   scopedJob,
   requireAction('isJobShareRelease'),
-  // Its OWN key, seeded by migrations/2026-09-10-job-share-release-action.sql.
+  // Its OWN key, seeded by migrations/executed/2026-09-10-job-share-release-action.sql.
   // Borrowing isJobStatusChange would let anyone who can move a status seize a
   // job another technician delegated — and this is the only way to break a
   // share after the delegate has started work.

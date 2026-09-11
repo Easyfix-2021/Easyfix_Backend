@@ -16,8 +16,8 @@
  * routes (CRM routes/auth.js, technician app routes/mobile/index.js), whose
  * ceilings must hold across containers. Every other rateLimit() stays in memory.
  *
- * WHERE THE COUNT LIVES. tbl_attempt_window (migrations/2026-09-11-create-tbl-
- * attempt-window.sql), so every backend container counts in one place and the
+ * WHERE THE COUNT LIVES. tbl_attempt_window (migrations/executed/2026-09-11-
+ * create-tbl-attempt-window.sql), so every backend container counts in one place and the
  * admin "Unlock OTP / PIN" action clears it for all of them. Until that table
  * exists — and whenever a query against it fails — each process counts in its
  * own memory (middleware/rate-limit.js attemptWindow), as it did before the
@@ -76,7 +76,7 @@ async function tablePresent(db) {
     }
     if (!_absentCheckedAt) {
       logger.warn(`Guess windows and login rate limits counting PER PROCESS — ${TABLE} does not exist. Run `
-        + 'migrations/2026-09-11-create-tbl-attempt-window.sql before running more than one backend container.');
+        + 'migrations/executed/2026-09-11-create-tbl-attempt-window.sql before running more than one backend container.');
     }
   } catch (e) {
     logger.warn('Guess-window table probe failed · ' + e.message);

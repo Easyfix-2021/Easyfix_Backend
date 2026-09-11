@@ -23,7 +23,7 @@
  *   POST /job/:id/unlock                 lift it.
  *
  * GATING: RBAC action `isOtpUnlock` (menu "Admin Action"; seeded and granted to
- * Admin by migrations/2026-09-11-seed-otp-unlock-action.sql), on top of the
+ * Admin by migrations/executed/2026-09-11-seed-otp-unlock-action.sql), on top of the
  * admin-group floor every /api/admin route has. The job routes also pass
  * scopedJob — an operator can only unlock a job in their own scope, 404
  * otherwise, as on every other admin job route.
