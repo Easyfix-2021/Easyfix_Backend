@@ -37,6 +37,7 @@ const {
 // eta_status code, actor scheme) lives in that module; every call below is
 // FAIL-SOFT and post-COMMIT by its contract, so none of them can fail a mutation.
 const jobLog = require('./job-log.service');
+const { PROOF_AFTER_CATEGORIES, sqlCategoryList } = require('../utils/job-image-buckets');
 // Geofence derivation for the detail projection. job-location.service requires
 // only db/logger/properties, so this adds no require cycle.
 const jobLocation = require('./job-location.service');
@@ -5103,6 +5104,42 @@ async function hasCallLaterColumn() {
   }
 }
 
+/*
+ * PROOF OF WORK ON A CRM CLOSE (2026-09-11).
+ *
+ * A CRM user moving a job INTO a closed state — Check Out (→ 10, Under Audit)
+ * or Complete (→ 3 / 5) — must find at least one after-work photo on it. The
+ * CRM's Check Out button closed jobs with none (job 538541, 11 Sep: Check In
+ * then Check Out five seconds apart, no photo). The rule lives in setStatus,
+ * not on a button, so no CRM surface — hidden today, re-enabled later, or new —
+ * can close a job without proof.
+ *
+ * "After-work photo" is the technician app's own read-model predicate
+ * (services/mobile-phe.service.js): an after category (checkout / completion /
+ * after — utils/job-image-buckets.js) and not a PDF. Images are hard-deleted,
+ * so there is no status to filter.
+ *
+ * WHO IT APPLIES TO: CRM users only — jobLog.resolveActor gives a real tbl_user
+ * id for them and 0 for a technician (efr:N) and for no actor. So the
+ * technician app (it attaches its photos before /checkout, and its revisit
+ * outcome also lands on 10 with nothing to photograph) and the partner API
+ * (external clients must see no change — CLAUDE.md) are unchanged.
+ * Moving between closed states (5 → 10 re-audit, 3 ↔ 5) closes nothing new.
+ */
+const CLOSED_FOR_PROOF = new Set([STATUS.COMPLETED, STATUS.COMPLETED_ALT, STATUS.REVISIT]); // REVISIT = the CRM's Check Out
+
+async function hasAfterWorkPhoto(jobId) {
+  const [rows] = await pool.query(
+    `SELECT 1 FROM tbl_job_image
+      WHERE job_id = ?
+        AND LOWER(image_category) IN (${sqlCategoryList(PROOF_AFTER_CATEGORIES)})
+        AND image NOT LIKE '%.pdf'
+      LIMIT 1`,
+    [jobId],
+  );
+  return rows.length > 0;
+}
+
 async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
   logger.info('Set job status · id=' + jobId + ' · status=' + status + (reasonId != null ? ' · reasonId=' + reasonId : ''));
   if (!ALL_STATUS_VALUES.has(Number(status))) {
@@ -5114,6 +5151,16 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
   if (!existing) {
     logger.warn('Set status job not found · id=' + jobId);
     const err = new Error('job not found'); err.status = 404; throw err;
+  }
+
+  const closesJob = CLOSED_FOR_PROOF.has(Number(status))
+    && !COMPLETED_STATES.has(Number(existing.job_status))
+    && Number(existing.job_status) !== Number(status);
+  if (closesJob && jobLog.resolveActor(actor).changedBy > 0 && !(await hasAfterWorkPhoto(jobId))) {
+    logger.warn('Close refused, no after-work photo · id=' + jobId + ' · ' + existing.job_status + '->' + Number(status)
+      + ' · by=' + actor.user_id);
+    const err = new Error('Add at least one after-work photo to this job before checking it out or completing it.');
+    err.status = 409; err.code = 'AFTER_PHOTO_REQUIRED'; throw err;
   }
 
   const sets = ['job_status = ?', 'last_update_time = ?'];

@@ -40,6 +40,9 @@ const scenario = { jobMeta: null, offerUpdateError: null };
 // Install the fake BEFORE requiring the service so the captured `pool` is ours.
 const fake = installFakePool(
   [
+    // setStatus's proof-of-work check on a CRM close: these tests are about
+    // offers, so every job here already has an after-work photo.
+    [/FROM tbl_job_image[\s\S]*image_category/i, () => [{ 1: 1 }]],
     // Column-presence probes (hasOtpColumn / hasCallLaterColumn / …).
     [/INFORMATION_SCHEMA/i, () => [{ n: 3 }]],
     // The memoised jobOfferTableExists() probe. node runs each test file in its
