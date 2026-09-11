@@ -72,12 +72,14 @@ const issueClose = Joi.object({
 
 /*
  * REQUIRED, unlike close_note: a reopen with no reason puts a ticket back in
- * the queue with nothing for the manager to act on. Written into
- * tbl_crm_issue_comment.comment_text, hence comment_text's max.
+ * the queue with nothing for the manager to act on. 600, not comment_text's
+ * 2000: the reopen comment also carries the close it undoes (up to ~1311 chars:
+ * a 255-char name and a 1000-char close note), and all of it must fit
+ * VARCHAR(2000). The CRM textareas use the same 600.
  */
 const REOPEN_NOTE_MSG = 'Tell us what is still wrong';
 const issueReopen = Joi.object({
-  reopen_note: Joi.string().trim().min(1).max(2000).required()
+  reopen_note: Joi.string().trim().min(1).max(600).required()
     .messages({ 'any.required': REOPEN_NOTE_MSG, 'string.empty': REOPEN_NOTE_MSG }),
 });
 
