@@ -14,6 +14,8 @@ const {
 const { assertEntityInScope } = require('../../lib/scope');
 const requireStageForTransition = require('../../middleware/require-stage');
 const requireAction = require('../../middleware/require-action');
+const { getEffectivePermissions } = require('../../services/role.service');
+const { transitionAllowed } = require('../../lib/job-stages');
 // Job delegation (technician shares a job with another technician). Ops-side
 // force-release only — see POST /:id/share/release at the bottom of this file.
 const jobShareDelegation = require('../../services/job-share-delegation.service');
@@ -53,6 +55,47 @@ async function scopedJob(req, res, next) {
     req.scopedJob = j;
     return next();
   } catch (e) { next(e); }
+}
+
+// The CRM's isJobClosed: a completed job's service lines are its billing lines.
+const CLOSED_STATUSES = new Set([job.STATUS.COMPLETED, job.STATUS.COMPLETED_ALT]);
+
+/*
+ * Who may PUT/PATCH /:id (2026-09-11). Until now nothing but the admin group
+ * and scope: any admin-group user could write any field of any in-scope job,
+ * and ?action=edit opened a keyless form that did. One branch per CRM caller,
+ * so nobody loses what the CRM lets them do today (QA role matrix, 2026-09-11):
+ *   isJobEdit              description, address, S&A details and services
+ *   isJobConfirm on a 9    Confirm & Schedule: Book Call, Draft, Unreachable,
+ *   whose 9 → 0 is allowed   Enquiry. Its PATCH lands before PATCH /status.
+ *   { job_type } alone     the View modal's Services tab (keyless) retypes the
+ *   on a job not closed    job after adding lines; the services routes below
+ *                          carry the same status rule.
+ * Deliberately NOT any-of(isJobEdit, isJobConfirm): that would let a
+ * confirm-only user write every field at every status. After scopedJob, which
+ * supplies the status and 404s an out-of-scope job first.
+ */
+async function canPatchJob(req, res, next) {
+  try {
+    if (!req.user.permissions) req.user.permissions = await getEffectivePermissions(req.user.user_id);
+    const perms = (req.user.permissions && req.user.permissions.actionPermissions) || [];
+    const status = Number(req.scopedJob.job_status);
+    if (perms.includes('isJobEdit')) return next();
+    if (perms.includes('isJobConfirm') && status === job.STATUS.UNCONFIRMED
+      && transitionAllowed(req.allowedStages, status, job.STATUS.BOOKED)) return next();
+    const keys = Object.keys(req.body || {});
+    if (keys.length === 1 && keys[0] === 'job_type' && !CLOSED_STATUSES.has(status)) return next();
+    logger.warn('Job edit refused · jobId=' + req.params.id + ' status=' + status + ' fields=' + keys.join(','));
+    return modernError(res, 403, 'Missing permission: isJobEdit');
+  } catch (e) { next(e); }
+}
+
+// Service-line writes on a completed job: the CRM hides them, the server refuses them.
+function servicesEditable(req, res, next) {
+  if (CLOSED_STATUSES.has(Number(req.scopedJob.job_status))) {
+    return modernError(res, 409, 'Services cannot be changed on a completed job');
+  }
+  return next();
 }
 
 /*
@@ -1621,8 +1664,8 @@ const updateHandler = async (req, res, next) => {
     modernOk(res, updated, 'job updated');
   } catch (e) { next(e); }
 };
-router.put('/:id',   validate(idParam, 'params'), validate(updateBody), scopedJob, updateHandler);
-router.patch('/:id', validate(idParam, 'params'), validate(updateBody), scopedJob, updateHandler);
+router.put('/:id',   validate(idParam, 'params'), validate(updateBody), scopedJob, canPatchJob, updateHandler);
+router.patch('/:id', validate(idParam, 'params'), validate(updateBody), scopedJob, canPatchJob, updateHandler);
 
 router.patch('/:id/status', validate(idParam, 'params'), validate(statusBody), scopedJob, requireStageForTransition('status'), async (req, res, next) => {
   try {
@@ -2105,8 +2148,9 @@ router.get('/:id/service-breakdown', validate(idParam, 'params'), scopedJob, asy
  * around line 1187). Idempotent — restoring an already-active row
  * is a no-op (affectedRows=0) and still returns 200.
  *
- * No permission middleware applied — same as the rest of /admin/jobs
- * which rely on FE permission gating + scopedJob ownership check.
+ * No permission key: the View modal's Services tab offers it with none.
+ * scopedJob + servicesEditable (no writes on a completed job) guard all four
+ * service-line routes.
  */
 router.post('/:id/services/:jobServiceId/restore',
   validate(require('joi').object({
@@ -2114,6 +2158,7 @@ router.post('/:id/services/:jobServiceId/restore',
     jobServiceId: require('joi').number().integer().positive().required(),
   }), 'params'),
   scopedJob,
+  servicesEditable,
   async (req, res, next) => {
     try {
       const jobId = Number(req.params.id);
@@ -2149,6 +2194,7 @@ router.delete('/:id/services/:jobServiceId',
     jobServiceId: require('joi').number().integer().positive().required(),
   }), 'params'),
   scopedJob,
+  servicesEditable,
   async (req, res, next) => {
     try {
       const jobId = Number(req.params.id);
@@ -2212,6 +2258,7 @@ router.patch('/:id/services/:jobServiceId',
     quantity: require('joi').number().integer().min(1).max(100).required(),
   })),
   scopedJob,
+  servicesEditable,
   async (req, res, next) => {
     try {
       const jobId = Number(req.params.id);
@@ -2296,6 +2343,7 @@ router.post('/:id/services',
     quantity:            require('joi').number().integer().min(1).default(1),
   })),
   scopedJob,
+  servicesEditable,
   async (req, res, next) => {
     try {
       const jobId = Number(req.params.id);
