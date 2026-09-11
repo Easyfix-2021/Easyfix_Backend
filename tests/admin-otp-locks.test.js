@@ -6,7 +6,10 @@
  * otp_details flow and the technician's profile/bank OTP, from an email or a
  * mobile however it was typed; one unlock clears all of those; a job's PIN lock
  * is shown and cleared through scopedJob (out of scope → 404); nothing returns
- * a code.
+ * a code. For a mobile it also shows and clears the technician app's per-mobile
+ * login limits — proven by a round trip through the REAL limiters in
+ * routes/mobile/index.js, in memory and against the shared table — and never
+ * the per-IP ones.
  *
  * Runner: `node --test` (see npm test).
  */
@@ -19,6 +22,7 @@ const { installFakePool } = require('./helpers/fake-pool');
 
 const S = {};
 const reset = () => Object.assign(S, {
+  table: false,
   perms: ['isOtpUnlock'],
   scoped: true,
   tech: { efr_id: 55, efr_name: 'Ravi' },
@@ -31,7 +35,11 @@ reset();
 
 const fake = installFakePool([
   [/INFORMATION_SCHEMA\.COLUMNS/, () => [{ COLUMN_NAME: 'failed_attempts' }, { COLUMN_NAME: 'updated_on' }]],
-  [/INFORMATION_SCHEMA\.TABLES/, () => []],          // shared windows count in memory here
+  [/INFORMATION_SCHEMA\.TABLES/, () => (S.table ? [{ 1: 1 }] : [])],   // memory unless a test turns it on
+  [/INSERT IGNORE INTO tbl_attempt_window/, () => ({ affectedRows: 1 })],
+  [/UPDATE tbl_attempt_window/, () => ({ affectedRows: 1 })],
+  [/SELECT attempts,/, () => [{ attempts: 0, in_window: 0, secs_left: 0 }]],
+  [/DELETE FROM tbl_attempt_window/, () => ({ affectedRows: 1 })],
   [/FROM otp_details\s+WHERE user_email = \? OR user_mobile_no = \?/, () => S.otpRows],
   [/UPDATE otp_details SET failed_attempts = 0, updated_on = NULL\s+WHERE \(user_email = \? OR user_mobile_no = \?\)/,
     () => ({ affectedRows: 2 })],
@@ -51,6 +59,17 @@ stub('routes/admin/jobs', {
   },
 });
 const store = require('../services/attempt-window.service');
+const mobileRouter = require('../routes/mobile');   // registers the per-mobile limiters, as server.js does
+
+// The technician app's real limiters, in mount order: [ipLimit, mobileLimit].
+const limiters = (path) => mobileRouter.stack
+  .find((l) => l.route && l.route.path === path && l.route.methods.post).route.stack.slice(0, 2).map((l) => l.handle);
+const hit = async (mw, mobile, ip = '203.0.113.5') => {
+  let passed = false;
+  const res = { statusCode: 200, setHeader() {}, status(c) { this.statusCode = c; return this; }, json() { return this; } };
+  await mw({ ip, body: { mobile } }, res, () => { passed = true; });
+  return passed;
+};
 
 let server;
 let base;
@@ -122,6 +141,53 @@ test('a job: the closing-PIN lock is shown and cleared — never the PIN itself'
   assert.equal(r.status, 200);
   assert.equal(r.body.data.pin.locked, false);
   assert.equal((await store.checkoutPin.state('job:77')).locked, false);
+});
+
+test('a mobile shows the technician app\'s per-mobile login limits, each with its own ceiling; an email has none', async () => {
+  const d = (await get('/?identifier=9876500010')).body.data;
+  assert.deepEqual(d.appLoginLimits.map((x) => [x.limiter, x.locked, x.attemptsRemaining]),
+    [['login-otp', false, 20], ['verify-otp', false, 30]]);
+  assert.deepEqual((await get('/?identifier=someone@easyfix.in')).body.data.appLoginLimits, []);
+});
+
+test('Unlock lifts the app\'s own login limits — round trip through the real limiters — and never the per-IP one', async () => {
+  const m = '9876500001';
+  const ip = '203.0.113.77';
+  const [loginIp, loginMobile] = limiters('/auth/login-otp');
+  const [, verifyMobile] = limiters('/auth/verify-otp');
+  for (let i = 0; i < 20; i++) assert.equal(await hit(loginMobile, m), true);
+  for (let i = 0; i < 30; i++) assert.equal(await hit(verifyMobile, m), true);
+  for (let i = 0; i < 60; i++) assert.equal(await hit(loginIp, String(9000000100 + i), ip), true);
+  assert.equal(await hit(loginMobile, m), false, 'positive control: code requests locked');
+  assert.equal(await hit(verifyMobile, m), false, 'positive control: code entries locked');
+  assert.equal(await hit(loginIp, m, ip), false, 'positive control: the IP budget is spent');
+  const locked = (await get('/?identifier=' + m)).body.data.appLoginLimits;
+  assert.deepEqual(locked.map((x) => [x.limiter, x.locked]), [['login-otp', true], ['verify-otp', true]]);
+  assert.ok(locked.every((x) => x.retryAfterMinutes >= 1));
+
+  const r = await post('/unlock', { identifier: m });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.data.appLoginLimitsCleared, true);
+  assert.deepEqual(r.body.data.appLoginLimits.map((x) => x.locked), [false, false]);
+  assert.equal(await hit(loginMobile, m), true, 'the technician can request a code again');
+  assert.equal(await hit(verifyMobile, m), true, 'and enter one');
+  assert.equal(await hit(loginIp, '9000000999', ip), false, 'a PERSON\'s unlock never resets a network\'s budget');
+});
+
+test('with the shared table, Unlock deletes exactly the rows the limiters count on', async () => {
+  S.table = true; store._resetProbeCache();
+  try {
+    const m = '9876500002';
+    await hit(limiters('/auth/login-otp')[1], m);
+    await hit(limiters('/auth/verify-otp')[1], m);
+    const claimed = fake.calls.filter((c) => /UPDATE tbl_attempt_window/.test(c.sql)).map((c) => c.params[4]);
+    assert.deepEqual(claimed, ['rate:login-otp:mobile:9876500002', 'rate:verify-otp:mobile:9876500002']);
+    fake.calls.length = 0;
+    assert.equal((await post('/unlock', { identifier: m })).status, 200);
+    const deleted = fake.calls.filter((c) => /DELETE FROM tbl_attempt_window WHERE attempt_key/.test(c.sql))
+      .map((c) => c.params[0]).filter((k) => k.startsWith('rate:'));
+    assert.deepEqual(deleted, claimed, 'the unlock and the limiters build the same key');
+  } finally { S.table = false; store._resetProbeCache(); }
 });
 
 test('a job outside the operator\'s scope is 404, and nothing is cleared', async () => {

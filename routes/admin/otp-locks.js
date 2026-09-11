@@ -10,10 +10,15 @@
  *   GET  /?identifier=<email|mobile>     every OTP lock for that person: one
  *                                         row per otp_details flow (CRM, client
  *                                         and technician login, admin actions,
- *                                         change phone/email) and, if the mobile
- *                                         is a technician's, the profile/bank-
- *                                         change OTP lock.
- *   POST /unlock        { identifier }   lift all of those at once.
+ *                                         change phone/email); for a mobile, the
+ *                                         technician app's per-mobile login
+ *                                         limits (code requests 20 / code
+ *                                         entries 30 per 10 min — any mobile,
+ *                                         registered or onboarding); and, if the
+ *                                         mobile is a technician's, the profile/
+ *                                         bank-change OTP lock.
+ *   POST /unlock        { identifier }   lift all of those at once. The per-IP
+ *                                         login limits are never touched here.
  *   GET  /job/:id                        the job's closing-PIN lock.
  *   POST /job/:id/unlock                 lift it.
  *
@@ -35,7 +40,9 @@ const { maskMobile } = require('../../utils/mask-mobile');
 const logger = require('../../logger');
 const { pool } = require('../../db');
 const otpAttempts = require('../../services/otp-attempts.service');
-const { checkoutPin, profileOtp } = require('../../services/attempt-window.service');
+const {
+  checkoutPin, profileOtp, techLoginLimits, clearTechLoginLimits,
+} = require('../../services/attempt-window.service');
 const { scopedJob } = require('./jobs');
 
 router.use(requireAction('isOtpUnlock'));
@@ -74,6 +81,7 @@ async function lookup(identifier) {
     identifier,
     capActive: login.active,
     login: login.rows,
+    appLoginLimits: isMobile(identifier) ? await techLoginLimits(identifier) : [],
     technician: tech ? { ...tech, profileOtp: await profileOtp.state('efr:' + tech.efrId) } : null,
   };
 }
@@ -92,12 +100,17 @@ router.post('/unlock', validate(identifierQuery), async (req, res, next) => {
     const identifier = normaliseIdentifier(req.body.identifier);
     if (!identifier) return modernError(res, 400, 'Enter an email or a 10-digit mobile number');
     const loginRows = await otpAttempts.unlockIdentifier(identifier);
+    const appLimits = isMobile(identifier);
+    if (appLimits) await clearTechLoginLimits(identifier);
     const tech = await technicianFor(identifier);
     if (tech) await profileOtp.clear('efr:' + tech.efrId);
     logger.warn(`OTP UNLOCKED by user_id=${req.user && req.user.user_id} · identifier=${forLog(identifier)}`
-      + ` · login rows cleared=${loginRows}` + (tech ? ` · technician efr_id=${tech.efrId} profile/bank OTP cleared` : ''));
-    modernOk(res, { unlocked: true, loginRowsCleared: loginRows, technicianCleared: !!tech, ...(await lookup(identifier)) },
-      'Unlocked');
+      + ` · login rows cleared=${loginRows}` + (appLimits ? ' · app login limits cleared' : '')
+      + (tech ? ` · technician efr_id=${tech.efrId} profile/bank OTP cleared` : ''));
+    modernOk(res, {
+      unlocked: true, loginRowsCleared: loginRows, appLoginLimitsCleared: appLimits, technicianCleared: !!tech,
+      ...(await lookup(identifier)),
+    }, 'Unlocked');
   } catch (e) { next(e); }
 });
 

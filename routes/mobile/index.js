@@ -24,7 +24,7 @@ const lifecycle = require('../../services/mobile-job-lifecycle.service');
 const { dailyBridgeCapReached, persistBridgeCall, CALL_FAILED_PUBLIC_MSG } = require('../public/_public-call');
 const { modernOk, modernError, otpGuessCapError } = require('../../utils/response');
 const { rateLimit } = require('../../middleware/rate-limit');
-const { checkoutPin: checkoutPinAttempts, sharedRateLimit } = require('../../services/attempt-window.service');
+const { checkoutPin: checkoutPinAttempts, sharedRateLimit, techMobileRateKey } = require('../../services/attempt-window.service');
 const { stripCustomerMobiles } = require('../../utils/mask-mobile');
 const {
   requireTechJobMutationCapability,
@@ -50,7 +50,8 @@ function mobileOrIpRateKey(namespace, req) {
   const candidate = typeof req.body?.mobile === 'string'
     ? req.body.mobile.trim()
     : '';
-  if (/^\d{10}$/.test(candidate)) return `${namespace}:mobile:${candidate}`;
+  // The same builder the admin "Unlock OTP / PIN" clears with (perMobile below).
+  if (/^\d{10}$/.test(candidate)) return techMobileRateKey(namespace, candidate);
   return `${namespace}:invalid:${boundedIpPart(req)}`;
 }
 
@@ -63,6 +64,7 @@ function mobileOrIpRateKey(namespace, req) {
 const loginOtpMobileRateLimit = sharedRateLimit({
   windowMs: 10 * 60_000,
   max: 20,
+  perMobile: 'login-otp',
   key: (req) => mobileOrIpRateKey('login-otp', req),
 });
 const loginOtpIpRateLimit = sharedRateLimit({
@@ -77,6 +79,7 @@ const loginOtpIpRateLimit = sharedRateLimit({
 const verifyOtpMobileRateLimit = sharedRateLimit({
   windowMs: 10 * 60_000,
   max: 30,
+  perMobile: 'verify-otp',
   key: (req) => mobileOrIpRateKey('verify-otp', req),
 });
 const verifyOtpIpRateLimit = sharedRateLimit({
