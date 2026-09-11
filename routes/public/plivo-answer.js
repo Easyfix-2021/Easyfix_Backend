@@ -366,17 +366,26 @@ router.post('/ai-answer', (req, res) =>
 
 /*
  * /api/public/plivo/ai-recording — Plivo POSTs the finished recording here (set as
- * recording_callback_url by plivo-ai-call.startRecording). We ack 200 immediately
- * and persist off the live path via the bounded post-call queue.
+ * callback_url by plivo-ai-call.startRecording). We ack 200 immediately and
+ * persist off the live path via the bounded post-call queue.
+ *
+ * Field names are the Record API's callback params (call_uuid, record_url,
+ * recording_duration in SECONDS — the unit tbl_ai_call_session.recording_duration
+ * and the Validate Flows "· Ns" label use). The <Record callbackUrl> names are
+ * accepted as a fallback. `recording_url` was read here before, but it is a field
+ * of Plivo's Recording object, not of either callback, so no URL was ever stored.
  */
 const aiPostCallQueue = require('../../services/ai-post-call-queue');
 router.post('/ai-recording', express.urlencoded({ extended: false }), (req, res) => {
   const src = { ...req.query, ...(req.body || {}) };
-  const callUuid = src.CallUUID || src.call_uuid || null;
-  const recordUrl = src.RecordUrl || src.recording_url || null;
-  const duration = src.RecordingDuration || src.recording_duration || null;
+  const callUuid = src.call_uuid || src.CallUUID || null;
+  const recordUrl = src.record_url || src.RecordUrl || null;
+  const duration = src.recording_duration || src.RecordingDuration || null;
   res.status(200).type('text/plain').send('ok');
-  if (!callUuid || !recordUrl) { logger.warn('Plivo ai-recording: missing CallUUID/RecordUrl'); return; }
+  if (!callUuid || !recordUrl) {
+    logger.warn({ keys: Object.keys(src) }, 'Plivo ai-recording: missing call_uuid/record_url');
+    return;
+  }
   aiPostCallQueue.enqueueTask({
     label: 'record:' + callUuid,
     run: async () => {

@@ -492,11 +492,25 @@ async function fetchRecordingMeta({ callUuid }) {
     }
     const body = await res.json();
     const first = Array.isArray(body?.objects) ? body.objects[0] : null;
+    /*
+     * Only a number or a non-blank numeric string counts. Number() reads ' ' as
+     * 0 and 'abc' as NaN, and a NaN reaches setRecording's UPDATE as a bare
+     * `NaN` token that MySQL rejects — losing the recording URL with it.
+     */
+    const rawMs = first?.recording_duration_ms;
+    const ms = typeof rawMs === 'number' || (typeof rawMs === 'string' && rawMs.trim() !== '') ? Number(rawMs) : NaN;
     return {
       ok: true,
       url: first?.recording_url || null,
       recordingId: first?.recording_id || null,
-      duration: first?.recording_duration != null ? Number(first.recording_duration) : null,
+      /*
+       * SECONDS, like the XML callback's RecordingDuration this backfills. The
+       * Recording object has no `recording_duration` — it documents
+       * `recording_duration_ms` (a string, in ms) and `rounded_recording_duration`
+       * (rounded UP to 60 s billing blocks, so not a duration). Reading the
+       * absent field made every pulled duration NULL (2026-09-11).
+       */
+      duration: Number.isFinite(ms) ? Math.round(ms / 1000) : null,
     };
   } catch (err) {
     logger.error(`Plivo recording lookup network error · uuid=${callUuid} · ${err.message}`);
@@ -506,11 +520,34 @@ async function fetchRecordingMeta({ callUuid }) {
 
 /*
  * Download the recording bytes from a Plivo-hosted recording URL. Plivo
- * recording URLs sit on api.plivo.com and require the same HTTP Basic auth as
- * every other call. Returns the raw Buffer + content-type for S3 upload.
+ * recording URLs sit on *.plivo.com (stored ones are
+ * https://aps1.media.plivo.com/v1/Account/…/Recording/….mp3) and require the
+ * same HTTP Basic auth as every other call. Returns the raw Buffer +
+ * content-type for S3 upload.
+ *
+ * ⚠ The URL is DATA, and some of it arrives unauthenticated: /ai-recording
+ * (routes/public/plivo-answer.js) stores whatever record_url it is POSTed. So
+ * refuse anything but https on plivo.com or a subdomain BEFORE the fetch —
+ * otherwise playing a planted recording sends PLIVO_AUTH_ID/TOKEN to the
+ * planter's host (2026-09-11).
  */
+function isPlivoRecordingUrl(raw) {
+  try {
+    const u = new URL(String(raw));
+    // MEDIA hosts only (media.plivo.com and regional ones like aps1.media.plivo.com),
+    // not *.plivo.com: some plivo.com subdomains are run by third parties (a
+    // hosted status page, say), and this request carries our Basic-auth header.
+    return u.protocol === 'https:'
+      && (u.hostname === 'media.plivo.com' || u.hostname.endsWith('.media.plivo.com'));
+  } catch (_e) { return false; }
+}
+
 async function downloadRecording(recordingUrl) {
   if (!recordingUrl) return { ok: false, error: 'recordingUrl required' };
+  if (!isPlivoRecordingUrl(recordingUrl)) {
+    logger.warn('Plivo recording download REFUSED · not an https Plivo media URL · ' + JSON.stringify(String(recordingUrl).slice(0, 120)));
+    return { ok: false, error: 'not a Plivo recording URL' };
+  }
   const auth = authHeader();
   try {
     const res = await fetch(recordingUrl, { headers: auth ? { Authorization: auth } : {} });
