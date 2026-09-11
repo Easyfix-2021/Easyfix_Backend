@@ -136,6 +136,12 @@ test('every job that offers Stop actually stops when it is pressed mid-run', asy
         `${id}: offers Stop but hands its work no checkpoint and has no canceller`);
       assert.ok(s.byCanceller.length > 0,
         `${id}: its canceller touched nothing, so it cannot have stopped anything`);
+      // It must reach something that cancels, not merely something — wired to
+      // e.g. runQaDbRefresh it would START work instead. What the cancel then
+      // does is the service's to prove: tests/qa-db-refresh-stop.test.js presses
+      // this job's Stop at every phase against the real run.
+      assert.ok(s.byCanceller.some((c) => /cancel|abort|stop|kill/i.test(c.split('.').pop())),
+        `${id}: its canceller called ${s.byCanceller.join(', ')} — none of which is a cancel`);
       report.push(`${id}: canceller → ${s.byCanceller.join(', ')}`);
     }
   }

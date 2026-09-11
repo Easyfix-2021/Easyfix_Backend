@@ -213,6 +213,17 @@ function setPhase(phase) {
  * path — so the maintenance gate is lowered and the partial dump is cleaned up
  * by the same code that handles any other failure. We do NOT tear down state
  * here; letting the existing error path do it keeps one exit route.
+ *
+ * A Stop pressed while NO child is running — during the replica probe, while
+ * verifying the dump, or between two tools — has nothing to kill, so it only
+ * sets the flag. The flag is what then stops the run: runTool refuses to start
+ * any tool after it, and the run checks it once the dump is verified. Without
+ * both, Stop during 'verifying' carried on into the DROP DATABASE and then
+ * aborted before the restore — QA left empty, reported as "stopped".
+ *
+ * A Stop DURING the restore still kills it. By then QA's database has been
+ * dropped, so every way of stopping leaves it partial — that is the operator's
+ * call, and the run reports it.
  */
 function cancelRun() {
   if (!_run) return { cancelled: false, reason: 'nothing is running' };
@@ -234,6 +245,8 @@ function cancelRun() {
  * a multi-GB dump is otherwise uninterruptible for its whole duration.
  */
 function runTool(bin, args, { timeoutMs, password, stdout = null, stdin = null }) {
+  // After a Stop, nothing new starts — see cancelRun.
+  if (_run?.cancelled) return Promise.reject(new Error('cancelled by operator'));
   return new Promise((resolve, reject) => {
     const child = execFile(bin, args, {
       timeout: timeoutMs,
@@ -637,6 +650,10 @@ async function runQaDbRefresh({ dryRun = false } = {}) {
     setPhase('verifying');
     summary.dumpBytes = await verifyDump(partFile);
     logger.info(`QA refresh · dump verified · ${mb(summary.dumpBytes)}`);
+    // Verifying has no child to kill, so a Stop during it only set the flag.
+    // Honour it here: before a dry run reports success, and before the gate
+    // goes up or anything touches QA.
+    if (_run.cancelled) throw new Error('cancelled by operator');
 
     /*
      * DRY RUN stops here — everything up to this line is read-only with respect
@@ -666,7 +683,10 @@ async function runQaDbRefresh({ dryRun = false } = {}) {
     // picked up as a rollback copy or by the retention pruner.
     await fs.rename(partFile, file);
 
-    // Only now does anything destructive happen.
+    // Only now does anything destructive happen. The card said "Verifying" for
+    // the whole restore until this phase was set — the one moment an operator
+    // most needs to know what Stop would interrupt.
+    setPhase('restoring');
     maintenance.begin('QA database refresh');
     maintenanceRaised = true;
     await restoreIntoQa(file);
