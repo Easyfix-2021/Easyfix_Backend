@@ -37,6 +37,9 @@ const {
 // eta_status code, actor scheme) lives in that module; every call below is
 // FAIL-SOFT and post-COMMIT by its contract, so none of them can fail a mutation.
 const jobLog = require('./job-log.service');
+// The completion ledger: what entering 3 / 5 posts. Unlike jobLog it is NOT
+// fail-soft — it runs inside setStatus's transaction (see there).
+const jobLedger = require('./job-ledger.service');
 const { PROOF_AFTER_CATEGORIES, sqlCategoryList } = require('../utils/job-image-buckets');
 // Geofence derivation for the detail projection. job-location.service requires
 // only db/logger/properties, so this adds no require cycle.
@@ -5174,6 +5177,12 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { 
   const sets = ['job_status = ?', 'last_update_time = ?'];
   const values = [status, new Date()];
   const actorId = actor?.user_id || null;
+  // A tbl_user id or null — for the tbl_user FKs (fk_checkout_by, the ledger's
+  // created_by). A technician actor carries its efr_id in user_id, which those
+  // FKs reject or, worse, pin on an unrelated CRM user; jobLog's classifier is
+  // the one place that tells the two apart.
+  const crmUserId = jobLog.resolveActor(actor).changedBy || null;
+  const entersCompletion = COMPLETED_STATES.has(Number(status)) && !COMPLETED_STATES.has(Number(existing.job_status));
 
   if (Number(status) === STATUS.CANCELLED) {
     // enum_reason_id mirrors the picked action_taken_reason id — the same column
@@ -5278,7 +5287,7 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { 
     }
   } else if (COMPLETED_STATES.has(Number(status))) {
     sets.push('checkout_date_time = COALESCE(checkout_date_time, ?)', 'fk_checkout_by = COALESCE(fk_checkout_by, ?)');
-    values.push(new Date(), actorId);
+    values.push(new Date(), crmUserId);
     // Sent-back lifecycle (mobile app spec): when a tech re-closes a
     // job that was sent back from the CRM, reset the flag so the
     // "Action Required" tile stops counting it. Conditionally
@@ -5330,7 +5339,40 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { 
   }
 
   values.push(jobId);
-  await pool.query(`UPDATE tbl_job SET ${sets.join(', ')} WHERE job_id = ?`, values);
+  const updateSql = `UPDATE tbl_job SET ${sets.join(', ')} WHERE job_id = ?`;
+  /*
+   * ENTERING 3 / 5 POSTS THE LEDGER, IN THE SAME TRANSACTION (2026-09-11).
+   *
+   * services/job-ledger.service.js posts what the legacy Check Out posts. One
+   * transaction, so no job can sit at 3/5 without the postings it can have: a
+   * post that FAILS rolls the status back and the caller gets the error. A job
+   * that CANNOT be posted (no technician, collected_by not 1-3, completed
+   * straight out of CANCELLED) still completes, with nothing posted and a WARN
+   * naming it; scripts/backfill-completion-ledger.js finds it later by the same
+   * keys. Moving between 3 and 5 is not an entry, and posts nothing.
+   */
+  if (entersCompletion) {
+    const conn = await pool.getConnection();
+    let ledger;
+    try {
+      await conn.beginTransaction();
+      await conn.query(updateSql, values);
+      ledger = await jobLedger.postCompletionLedger(conn, {
+        jobId: Number(jobId), fromStatus: Number(existing.job_status), crmUserId,
+      });
+      await conn.commit();
+    } catch (e) {
+      try { await conn.rollback(); } catch (rbErr) { logger.warn('Completion rollback failed · id=' + jobId + ' · ' + rbErr.message); }
+      logger.warn('Completion refused, ledger post failed · id=' + jobId + ' · ' + e.message);
+      throw e;
+    } finally {
+      await jobLedger.releaseLedgerLock(conn);
+      conn.release();
+    }
+    if (ledger.unpostable) logger.warn('Completion ledger NOT posted · id=' + jobId + ' · ' + ledger.reason);
+  } else {
+    await pool.query(updateSql, values);
+  }
 
   /*
    * tbl_job_logs. Four rows are possible on one transition and they answer

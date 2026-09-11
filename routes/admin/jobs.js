@@ -1667,6 +1667,19 @@ const updateHandler = async (req, res, next) => {
 router.put('/:id',   validate(idParam, 'params'), validate(updateBody), scopedJob, canPatchJob, updateHandler);
 router.patch('/:id', validate(idParam, 'params'), validate(updateBody), scopedJob, canPatchJob, updateHandler);
 
+/*
+ * GET /admin/jobs/:id/completion-ledger — what completing this job would post
+ * (the job transaction row, the technician / EasyFix / client ledger moves),
+ * whether it can, and whether it already has. Read-only; the CRM's Complete
+ * Audit dialog shows it before ops confirm. The post itself happens inside
+ * PATCH /:id/status → setStatus (services/job-ledger.service.js).
+ */
+router.get('/:id/completion-ledger', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
+  try {
+    modernOk(res, await require('../../services/job-ledger.service').previewCompletionLedger(Number(req.params.id)));
+  } catch (e) { next(e); }
+});
+
 router.patch('/:id/status', validate(idParam, 'params'), validate(statusBody), scopedJob, requireStageForTransition('status'), async (req, res, next) => {
   try {
     logger.info('Change job status · jobId=' + req.params.id + ' status=' + req.body?.status);
