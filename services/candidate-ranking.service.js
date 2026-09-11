@@ -1,5 +1,6 @@
 const { pool } = require('../db');
 const { OFFER_STATUS } = require('./offer-status');
+const { ACTIVE_SERVICES_SQL } = require('./job-line-total');
 const logger = require('../logger');
 const { isAbsentAnswer } = require('../utils/schema-absent-error');
 const settings = require('./settings.service');
@@ -2238,6 +2239,13 @@ async function loadJobSkillMatrix(job) {
  * BACK to the existing category+type deep-skill match — so this can only ADD
  * precision where the matrix exists, never subtract eligibility where it doesn't
  * (the explicit product decision for the sparse-matrix rollout).
+ *
+ * ACTIVE ROWS ONLY (2026-09-11). Removing a service is a soft delete
+ * (job_service_status = 0), and this query used to read every row, so a
+ * removed service's deep skills kept steering the Top-10 after Schedule &
+ * Assign's Edit Services removed it — the panel dropped the line, the ranking
+ * did not. Unlike loadJobSkillMatrix below, nothing downstream re-filters this
+ * set, so the shared predicate has to be applied here.
  */
 async function matrixRequiredSkillIds(jobId) {
   if (!jobId || !(await skillMatrixReadable())) return new Set();
@@ -2251,7 +2259,8 @@ async function matrixRequiredSkillIds(jobId) {
               ON ssm.service_catg_id = cs.service_catg_id
              AND ssm.service_name    = TRIM(cr.crc_ratecard_name)
              AND ssm.status          = 1
-        WHERE js.job_id = ?`,
+        WHERE js.job_id = ?
+          AND ${ACTIVE_SERVICES_SQL('js')}`,
       [jobId],
     );
     return new Set(rows.map((r) => Number(r.deep_skill_id)).filter(Boolean));
@@ -2816,5 +2825,5 @@ module.exports = {
   DEFAULTS,
   // Exported for tests only: the Schedule & Assign header allowlist is the
   // thing that silently drifted, so it needs to be assertable directly.
-  _internals: { buildJobHeader },
+  _internals: { buildJobHeader, matrixRequiredSkillIds },
 };
