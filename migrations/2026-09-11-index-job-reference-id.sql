@@ -1,0 +1,17 @@
+-- Index tbl_job.job_reference_id for the Manage Jobs "Job Id / Ref Id" search.
+--
+-- WHY. Commit b17194d lets the Manage Jobs Job Id box match a booking
+-- reference (REF-538916) as well as a job id. Digit tokens use the job_id
+-- primary key; reference tokens match job_reference_id exactly — and that
+-- column has no index at all, so every reference search scans the whole table.
+-- Measured on QA (MySQL 8.4.9) before this ran:
+--
+--   EXPLAIN SELECT job_id FROM tbl_job WHERE job_reference_id IN ('REF-538916')
+--   type=ALL  key=NULL  rows≈433,635   587 ms
+--
+-- The list runs its data query and its COUNT in parallel, so one reference
+-- search in the grid costs two such scans.
+--
+-- ONLINE. MySQL 8 adds a secondary index with ALGORITHM=INPLACE, LOCK=NONE by
+-- default: reads and writes to tbl_job continue while it builds.
+CREATE INDEX idx_job_reference_id ON tbl_job (job_reference_id);
