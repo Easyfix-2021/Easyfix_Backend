@@ -797,13 +797,12 @@ async function loadLifecycleCounts(efrId, executor = pool) {
  *   9 UNCONFIRMED — booked from website / API / bulk upload with the customer not
  *     yet confirmed: a pre-assignment queue state, no technician action attached.
  *
- * ALIGNMENT with what the app can show (checked, not assumed): GET
- * /api/mobile/jobs (routes/mobile/index.js → jobService.list({ easyfixerId }))
- * applies NO status filter, so it lists every job with fk_easyfixter_id = this
- * technician at ANY status. Every listed status that still carries a technician
- * action is in the set above; the only ones left out are the four terminal codes
- * and 0 / 9 — none of which the technician can act on. Adding a job status that
- * the mobile app can act on WITHOUT adding it here re-creates the stranding bug.
+ * ALIGNMENT with what the app can show: GET /api/mobile/jobs with no `status`
+ * (routes/mobile/index.js — the app's Jobs list, its only list without one)
+ * DEFAULTS to this set, so that list and this check read one constant. It used
+ * to apply no status filter at all, completed and cancelled jobs included.
+ * Adding a job status that the mobile app can act on WITHOUT adding it here
+ * hides it from that list and re-creates the stranding bug.
  *
  * Positive `IN` list on an indexed equality — no NOT IN, so the NULL-swallows-
  * every-row trap does not apply here.
@@ -1984,6 +1983,7 @@ async function getHistory(efrId, { limit = 50, offset = 0 } = {}) {
 module.exports = {
   LIFECYCLE_STATUSES,
   LEGACY_ACTIVE_STATUSES,
+  OPEN_JOB_STATUSES,
   REAPPLY_FROM,
   statusDriftSql,
   reconciledWorkEligibleSql,

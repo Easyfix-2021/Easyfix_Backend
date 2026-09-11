@@ -12,8 +12,9 @@
  *   2. The route dropped `offset`, so load-more got page one back every time;
  *      one device re-requested it 34,348 times in one release.
  *   3. With no `status` the list was every job the technician ever had
- *      (completed and cancelled included), under a dashboard card that counts
- *      only the ACTIVE set.
+ *      (completed and cancelled included). It now defaults to his work in hand,
+ *      easyfixer-lifecycle's OPEN_JOB_STATUSES — NOT the dashboard's (1, 2, 20)
+ *      counter, which would list 10 / 15 / 21 nowhere in the app.
  *
  * The fake DB models the un-migrated schema the way MySQL does: while
  * `schema === 'absent'`, any query naming a delegation column THROWS
@@ -56,11 +57,15 @@ for (const [mod, exports] of [
   require.cache[id] = { id, filename: id, loaded: true, exports };
 }
 
-const { ACTIVE_STATUSES } = require('../services/mobile-dashboard.service');
+const { OPEN_JOB_STATUSES } = require('../services/easyfixer-lifecycle.service');
 
 const dataCall = () => fake.calls.find((c) => /LIMIT \? OFFSET \?/.test(c.sql));
 const countCall = () => fake.calls.find((c) => /SELECT COUNT\(\*\) AS total/i.test(c.sql));
 const probeCount = () => fake.calls.filter((c) => PROBE.test(c.sql)).length;
+// Everything after the LAST `WHERE`, minus ORDER BY. For a query whose WHERE
+// holds no subquery that is the whole top-level WHERE; if a subquery appears it
+// returns that subquery's tail instead, which fails an exact compare (closed).
+const lastWhere = (sql) => sql.slice(sql.lastIndexOf('WHERE') + 5).replace(/ORDER BY[\s\S]*$/, '').trim();
 
 /* The probe's memo is module state, so each scenario gets a FRESH module rather
  * than a test-only reset export. The router keeps the instance it loaded. */
@@ -81,10 +86,14 @@ test('columns ABSENT → the plain assigned-to clause in rows AND total, never a
   schema = 'absent';
   await freshList()(MOBILE_ARGS);   // rejects with the production error if ungated
   assert.equal(probeCount(), 1, 'the probe must have been asked — else "absent" was never measured');
-  for (const [name, call] of [['data', dataCall()], ['COUNT', countCall()]]) {
+  for (const [name, call, params] of [['data', dataCall(), [7, 20, 0]], ['COUNT', countCall(), [7]]]) {
     assert.ok(call, `the ${name} query must have run — an absent call makes the next lines vacuous`);
     assert.doesNotMatch(call.sql, /delegate_efr_id/, `${name}: no delegation column pre-migration`);
-    assert.match(call.sql, /j\.fk_easyfixter_id = \?/, `${name}: still scoped to the technician`);
+    // EXACTLY the pre-delegation clause. A fragment match also passes a widened
+    // `(j.fk_easyfixter_id = ? OR j.fk_easyfixter_id IS NULL)` — every unassigned
+    // job shown to every technician, on the path QA and Production run today.
+    assert.equal(lastWhere(call.sql), 'j.fk_easyfixter_id = ?', `${name}: exactly the assigned-to clause`);
+    assert.deepEqual(call.params, params, `${name}: bound to the technician only`);
   }
 });
 
@@ -208,13 +217,19 @@ test('offset reaches the query; anything that is not a non-negative integer is 0
   }
 });
 
-test('NO status → the dashboard\'s ACTIVE set, in rows AND total', async () => {
-  const want = ACTIVE_STATUSES.split(',').map(Number);
+test('NO status → the technician\'s work in hand (OPEN_JOB_STATUSES), in rows AND total', async () => {
+  const want = [...OPEN_JOB_STATUSES];
   const inList = new RegExp(`j\\.job_status IN \\(${want.map(() => '\\?').join(',')}\\)`);
   const { data, count } = await getJobs('?limit=20&offset=0');
   for (const [name, call] of [['data', data], ['COUNT', count]]) {
-    assert.match(call.sql, inList, `${name}: completed/cancelled jobs are not Bookings`);
-    assert.deepEqual(call.params.slice(0, want.length), want, `${name}: bound to ${ACTIVE_STATUSES}`);
+    const bound = call.params.slice(0, want.length);
+    assert.deepEqual(bound, want, `${name}: bound to OPEN_JOB_STATUSES`);
+    assert.match(call.sql, inList, `${name}: one placeholder per status`);
+    // Jobs is the app's only list with no status. 10 (revisit owed), 15
+    // (estimate pending, tech on site) and 21 (on hold) are still his, and no
+    // other list asks for them; terminal codes are not Bookings.
+    for (const s of [10, 15, 21]) assert.ok(bound.includes(s), `${name}: status ${s} must be listed`);
+    for (const s of [3, 5, 6]) assert.ok(!bound.includes(s), `${name}: status ${s} is terminal`);
     assert.doesNotMatch(call.sql, /j\.job_status = \?/);
   }
 });

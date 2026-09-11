@@ -759,6 +759,4 @@ function mapJobForMobile(j) {
  * asserted without a database. The count half lives in SQL and the list half in
  * JS; these are the JS half, and they are the half that silently drops a job.
  */
-// ACTIVE_STATUSES is also GET /mobile/jobs's default filter: the Open Jobs
-// card counts this set and opens that list, so both read the one constant.
-module.exports = { getDashboard, fetchIdentity, ACTIVE_STATUSES, _internals: { istDayOf, dedupeById, isStarted, isTodaysWork, workDateOf } };
+module.exports = { getDashboard, fetchIdentity, _internals: { istDayOf, dedupeById, isStarted, isTodaysWork, workDateOf } };

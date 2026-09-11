@@ -434,9 +434,11 @@ router.get('/jobs', async (req, res, next) => {
       // meaning "assigned to".
       delegatedToEfrId: req.tech.efr_id,
       status: req.query.status != null ? Number(req.query.status) : undefined,
-      // No status = the ACTIVE set the dashboard's Open Jobs card counts, not
-      // every job the technician ever had (completed/cancelled included).
-      statuses: req.query.status != null ? undefined : mobileDashboardService.ACTIVE_STATUSES,
+      // No status = his WORK IN HAND, not every job he ever had. NOT the
+      // dashboard's (1, 2, 20): that is a counter, and this is the app's only
+      // list without a status, so 10 revisit / 15 estimate pending / 21 on hold
+      // would be listed nowhere. See OPEN_JOB_STATUSES.
+      statuses: req.query.status != null ? undefined : easyfixerLifecycle.OPEN_JOB_STATUSES,
       limit: Math.min(Number(req.query.limit) || 50, 200),
       offset: Number.isSafeInteger(offset) && offset > 0 ? offset : 0,
     });
