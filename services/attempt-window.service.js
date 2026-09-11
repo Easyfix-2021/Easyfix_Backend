@@ -205,15 +205,42 @@ const checkoutPin = sharedAttemptWindow('checkout-pin');
 const profileOtp = sharedAttemptWindow('profile-otp');
 
 /*
+ * PER-MOBILE LOGIN LIMITS — the technician app's code-request and code-entry
+ * limiters (routes/mobile/index.js) pass `perMobile: '<limiter>'` and key each
+ * valid mobile with techMobileRateKey(). Registered here so the admin "Unlock
+ * OTP / PIN" (routes/admin/otp-locks.js) shows and clears exactly the rows they
+ * count on — one key builder for both, so they cannot drift apart. The per-IP
+ * limiters are not unlockable: unlocking a PERSON must not reset a network's
+ * budget, and the operator does not know the network anyway.
+ */
+const techMobileRateKey = (limiter, mobile) => `${limiter}:mobile:${mobile}`;
+const perMobileWindows = new Map();       // limiter → its window, in registration order
+
+/** Each per-mobile login limit on this mobile: [{ limiter, locked, attemptsRemaining, retryAfterMinutes }]. */
+async function techLoginLimits(mobile, db = pool) {
+  const out = [];
+  for (const [limiter, w] of perMobileWindows) out.push({ limiter, ...(await w.state(techMobileRateKey(limiter, mobile), db)) });
+  return out;
+}
+
+/** Lift them — the shared rows and this process's memory fallback. */
+async function clearTechLoginLimits(mobile, db = pool) {
+  for (const [limiter, w] of perMobileWindows) await w.clear(techMobileRateKey(limiter, mobile), db);
+}
+
+/*
  * rateLimit() (middleware/rate-limit.js) with its count in the shared table:
  * same options, same 429 + Retry-After. Build it ONCE at module scope.
  * Refusals are not logged here — http-log already logs every 429, and a flood
  * would otherwise be a WARN per request.
  * ponytail: a refused request still costs ~3 primary-key queries; if a flood
- * ever shows in the pool, cache "locked until" in memory (these are never cleared).
+ * ever shows in the pool, cache "locked until" in memory.
  */
-function sharedRateLimit({ windowMs = 60_000, max = 600, key = (req) => req.ip, message = 'rate limit exceeded' } = {}) {
+function sharedRateLimit({
+  windowMs = 60_000, max = 600, key = (req) => req.ip, message = 'rate limit exceeded', perMobile = null,
+} = {}) {
   const w = sharedAttemptWindow('rate', { max, windowMs, logRefusals: false });
+  if (perMobile) perMobileWindows.set(perMobile, w);
   return async (req, res, next) => {
     try {
       const r = await w.claim(String(key(req) || 'anon'));
@@ -229,5 +256,6 @@ function _resetProbeCache() { _present = false; _absentCheckedAt = 0; _lastSweep
 
 module.exports = {
   checkoutPin, profileOtp, sharedAttemptWindow, sharedRateLimit,
+  techMobileRateKey, techLoginLimits, clearTechLoginLimits,
   TABLE, ABSENT_RECHECK_MS, SWEEP_EVERY_MS, _resetProbeCache,
 };
