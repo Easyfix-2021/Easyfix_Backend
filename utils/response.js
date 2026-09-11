@@ -53,27 +53,37 @@ function legacyError(res, httpStatus, message, data = null) {
  * is absent) → null → the route's existing message, unchanged.
  *
  * mismatchStatus: the status the route ALREADY used for a wrong code — keep it,
- * clients may branch on it. change-phone has always answered 400.
+ * clients may branch on it. change-phone and the profile/bank OTP answer 400.
+ *
+ * otpGuessCapOutcome is the same decision as data ({ status, error, details,
+ * retryAfterSeconds } | null), for a service that throws rather than responds.
  */
-function otpGuessCapError(res, r, mismatchStatus = 401) {
+function otpGuessCapOutcome(r, mismatchStatus = 401) {
   if (!r) return null;
   if (r.reason === 'OTP_ATTEMPTS_EXCEEDED') {
     const m = Math.ceil(Number(r.retryAfterMinutes));
     if (!(m > 0)) {
-      return modernError(res, 429, 'Too many incorrect attempts. Please try again later.',
-        { code: 'OTP_ATTEMPTS_EXCEEDED' });
+      return { status: 429, error: 'Too many incorrect attempts. Please try again later.',
+        details: { code: 'OTP_ATTEMPTS_EXCEEDED' }, retryAfterSeconds: null };
     }
-    res.setHeader('Retry-After', String(m * 60));
-    return modernError(res, 429,
-      `Too many incorrect attempts. Please try again in ${m} minute${m === 1 ? '' : 's'}.`,
-      { code: 'OTP_ATTEMPTS_EXCEEDED', retryAfterMinutes: m });
+    return { status: 429,
+      error: `Too many incorrect attempts. Please try again in ${m} minute${m === 1 ? '' : 's'}.`,
+      details: { code: 'OTP_ATTEMPTS_EXCEEDED', retryAfterMinutes: m }, retryAfterSeconds: m * 60 };
   }
   if (r.reason === 'OTP_MISMATCH' && Number.isInteger(r.attemptsRemaining)) {
     const n = r.attemptsRemaining;
-    return modernError(res, mismatchStatus, `Incorrect OTP. ${n} attempt${n === 1 ? '' : 's'} left.`,
-      { code: 'OTP_MISMATCH', attemptsRemaining: n });
+    return { status: mismatchStatus, error: `Incorrect OTP. ${n} attempt${n === 1 ? '' : 's'} left.`,
+      details: { code: 'OTP_MISMATCH', attemptsRemaining: n }, retryAfterSeconds: null };
   }
   return null;
 }
 
-module.exports = { modernOk, modernError, legacyOk, legacyError, otpGuessCapError };
+/** Send otpGuessCapOutcome(r) and return the response, or null to let the route answer. */
+function otpGuessCapError(res, r, mismatchStatus) {
+  const o = otpGuessCapOutcome(r, mismatchStatus);
+  if (!o) return null;
+  if (o.retryAfterSeconds) res.setHeader('Retry-After', String(o.retryAfterSeconds));
+  return modernError(res, o.status, o.error, o.details);
+}
+
+module.exports = { modernOk, modernError, legacyOk, legacyError, otpGuessCapOutcome, otpGuessCapError };

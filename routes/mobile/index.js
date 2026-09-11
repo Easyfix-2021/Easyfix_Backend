@@ -23,7 +23,7 @@ const easyfixerLifecycle = require('../../services/easyfixer-lifecycle.service')
 const lifecycle = require('../../services/mobile-job-lifecycle.service');
 const { dailyBridgeCapReached, persistBridgeCall, CALL_FAILED_PUBLIC_MSG } = require('../public/_public-call');
 const { modernOk, modernError, otpGuessCapError } = require('../../utils/response');
-const { rateLimit } = require('../../middleware/rate-limit');
+const { rateLimit, attemptWindow } = require('../../middleware/rate-limit');
 const {
   requireTechJobMutationCapability,
 } = require('../../middleware/require-tech-lifecycle-capability');
@@ -536,6 +536,14 @@ router.get('/jobs/:id', async (req, res, next) => {
     // it server-side from tbl_customer, so nothing that needs it is affected.
     if (job.customer_mob_no != null) job.customer_mob_no = null;
     if (job.customer && typeof job.customer === 'object' && job.customer.phone != null) job.customer.phone = null;
+    /*
+     * Same for the customer PIN (tbl_job.otp, from getById's `j.*`). It is the
+     * CLOSING control: the technician must read it back from the customer. Sent
+     * here, every technician able to open the job — including anyone holding an
+     * open OFFER, since the PIN is minted at BOOKED — had it without asking,
+     * and the checkout guess cap guarded nothing. The app never reads it.
+     */
+    delete job.otp;
     modernOk(res, job);
   } catch (e) { next(e); }
 });
@@ -765,6 +773,20 @@ const normalisePin = (v) => (v == null ? '' : String(v).trim());
 // Mobile-specific stamps (GPS, address, pincode, fk_checkin_by) ride
 // through the `extras` whitelist so the transition rules + stamps land
 // in a single shared UPDATE — no duplication of status-transition logic.
+/*
+ * Guess cap on the closing PIN: 5 attempts per JOB per 30 minutes, the same
+ * rule as the login OTP. Without it the assigned technician could try all
+ * 10,000 four-digit PINs and close the job without the customer. Keyed on the
+ * job because the PIN belongs to the job. tbl_job is not ours to alter, so the
+ * window is in memory (middleware/rate-limit.js attemptWindow). A missing PIN is
+ * not a guess and is not counted. Ops can still close any job from the CRM.
+ *
+ * ONE budget for every place the PIN is checked: the close (below) and a PIN
+ * volunteered at check-in. Check-in answers `pinMatched`, so on its own budget
+ * — or none, as before — it was an unlimited oracle for the close.
+ */
+const checkoutPinAttempts = attemptWindow();
+
 router.post('/jobs/:id/checkin', validate(Joi.object({
   // Location stamp is nice-to-have, NOT a gate. Requiring gps used to 400 the
   // whole request whenever coords were unavailable (GPS off / permission
@@ -802,7 +824,17 @@ router.post('/jobs/:id/checkin', validate(Joi.object({
      */
     const jobPin = normalisePin(job.otp);
     const submittedPin = normalisePin(req.body.otp);
-    const pinMatched = (jobPin && submittedPin) ? jobPin === submittedPin : null;
+    // Checked against the close's guess budget (checkoutPinAttempts): a locked
+    // job answers null — "not checked" — rather than a verdict, so this cannot
+    // be used to find the PIN. Check-in itself is never blocked by it.
+    let pinMatched = null;
+    if (jobPin && submittedPin) {
+      const pinKey = 'job:' + job.job_id;
+      if (!checkoutPinAttempts.claim(pinKey).locked) {
+        pinMatched = jobPin === submittedPin;
+        if (pinMatched) checkoutPinAttempts.clear(pinKey);
+      }
+    }
     if (pinMatched === false) {
       logger.warn('Check-in PIN mismatch · id=' + req.params.id + ' · NOT blocking (PIN gates checkout)');
     }
@@ -946,20 +978,39 @@ router.post('/jobs/:id/checkout',
      */
     const jobPin = normalisePin(job.otp);
     const submittedPin = normalisePin(req.body.otp);
-    if (jobPin && jobPin !== submittedPin) {
-      logger.warn('Check out blocked · id=' + req.params.id + ' · PIN ' + (submittedPin ? 'mismatch' : 'missing'));
-      // Structured error so the app prompts for the PIN specifically instead of
-      // mislabelling every 4xx. modernError only auto-sets the HTTP-log hint for
-      // string errors, so set it manually for the object form.
-      if (res.locals) res.locals.logHint = 'checkout PIN ' + (submittedPin ? 'mismatch' : 'missing');
-      return modernError(res, 409, {
-        // One code for both cases: the app's action is identical (prompt for the
-        // PIN, offer Resend). Only the human-facing sentence differs.
-        message: submittedPin
-          ? 'Incorrect closing PIN. Ask the customer for the PIN sent to them.'
-          : 'Closing PIN required. Ask the customer for the PIN sent to them.',
-        code: 'INVALID_CHECKOUT_PIN',
-      });
+    /*
+     * Every refusal is a structured 409 INVALID_CHECKOUT_PIN, so the app shows
+     * its sentence in the PIN field (complete.tsx) instead of mislabelling every
+     * 4xx — including the lock, which the app therefore needs no release to
+     * show. `reason` tells a client which case it is. modernError only
+     * auto-sets the HTTP-log hint for string errors, so it is set here.
+     */
+    const refusePin = (hint, message, extra) => {
+      logger.warn('Check out blocked · id=' + req.params.id + ' · ' + hint);
+      if (res.locals) res.locals.logHint = 'checkout ' + hint;
+      return modernError(res, 409, { message, code: 'INVALID_CHECKOUT_PIN', ...extra });
+    };
+    const pinLocked = (m) => refusePin('PIN attempts exceeded',
+      `Too many incorrect PINs. Try again in ${m} minute${m === 1 ? '' : 's'}, or ask EasyFix to close the job.`,
+      { reason: 'PIN_ATTEMPTS_EXCEEDED', retryAfterMinutes: m });
+    if (jobPin && !submittedPin) {
+      return refusePin('PIN missing', 'Closing PIN required. Ask the customer for the PIN sent to them.',
+        { reason: 'PIN_MISSING' });
+    }
+    if (jobPin) {
+      // No await from here to the compare: the claim and the compare are one step.
+      const pinKey = 'job:' + job.job_id;
+      const claim = checkoutPinAttempts.claim(pinKey);
+      if (claim.locked) return pinLocked(claim.retryAfterMinutes);
+      if (jobPin !== submittedPin) {
+        const after = checkoutPinAttempts.state(pinKey);
+        if (after.locked) return pinLocked(after.retryAfterMinutes);
+        const n = after.attemptsRemaining;
+        return refusePin('PIN mismatch',
+          `Incorrect closing PIN — ${n} attempt${n === 1 ? '' : 's'} left. Ask the customer for the PIN sent to them.`,
+          { reason: 'PIN_MISMATCH', attemptsRemaining: n });
+      }
+      checkoutPinAttempts.clear(pinKey);
     }
     const b = req.body;
     const isRevisit = b.isNextVisit === true;

@@ -146,9 +146,10 @@ async function lockState(rowId, db = pool) {
  * burst of parallel guesses all pass the read before any count lands — on a
  * route with no rate limit (the CRM login) that is as many guesses as can be
  * sent in the code's five minutes. Here the check and the count are ONE
- * statement: InnoDB serialises concurrent UPDATEs of the row and evaluates each
- * WHERE against the latest committed value, so at most OTP_MAX_ATTEMPTS claims
- * succeed per window however many arrive at once.
+ * statement, and MySQL runs concurrent UPDATEs of the row one at a time, each
+ * WHERE evaluated against the latest value — otp_details is MyISAM (measured
+ * on QA, 2026-09-11), so by a TABLE lock; were it InnoDB, by a row lock. So at
+ * most OTP_MAX_ATTEMPTS claims succeed per window however many arrive at once.
  *
  * The SET: if the window has expired (or never opened) the count restarts at 1
  * and a new window opens now; otherwise it increments. MySQL evaluates

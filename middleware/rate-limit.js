@@ -138,4 +138,59 @@ function failureBreaker({
   };
 }
 
-module.exports = { rateLimit, failureBreaker };
+/*
+ * ── attemptWindow — "N wrong codes per window", for codes with no DB counter ─
+ *
+ * The same rule as the OTP guess cap (services/otp-attempts.service.js: 5 per
+ * 30 minutes, counted from the first attempt, lifting by itself, cleared by a
+ * right answer) for codes stored where there is no otp_details row to count on:
+ * the checkout PIN (tbl_job.otp) and the profile/bank-change OTP
+ * (tbl_easyfixer). Neither table is ours to alter.
+ *
+ * CLAIM BEFORE COMPARE, like the SQL version. claim() counts the attempt and
+ * refuses a full window in one synchronous step; call it with NO await between
+ * it and the compare, and a burst of parallel guesses cannot overshoot — Node
+ * runs each claim to completion before the next. Then clear() on a right
+ * answer, or read state() after a wrong one for what to tell the user.
+ *
+ * Per-process, like rateLimit: a restart forgets it, and with several replicas
+ * each counts on its own (a ceiling of N × replicas).
+ */
+function attemptWindow({ max = 5, windowMs = 30 * 60_000 } = {}) {
+  const windows = new Map(); // key → { count, startedAt }
+  let lastSweep = Date.now();
+  const live = (k, now) => {
+    if (now - lastSweep > windowMs) {
+      lastSweep = now;
+      for (const [mk, mv] of windows) if (now - mv.startedAt >= windowMs) windows.delete(mk);
+    }
+    const w = windows.get(k);
+    return w && now - w.startedAt < windowMs ? w : null;
+  };
+  const view = (w, now) => {
+    const used = w ? w.count : 0;
+    const locked = used >= max;
+    return {
+      locked,
+      attemptsRemaining: Math.max(0, max - used),
+      // Rounded UP and never 0: "try again in 0 minutes" while refusing reads as broken.
+      retryAfterMinutes: locked ? Math.max(1, Math.ceil((w.startedAt + windowMs - now) / 60_000)) : null,
+    };
+  };
+  const GRANTED = Object.freeze({ locked: false, attemptsRemaining: null, retryAfterMinutes: null });
+  return {
+    /** Count one attempt. `locked: true` → the window is full: refuse WITHOUT comparing. */
+    claim(key) {
+      const k = String(key), now = Date.now();
+      const w = live(k, now);
+      if (!w) { windows.set(k, { count: 1, startedAt: now }); return GRANTED; }
+      if (w.count >= max) return view(w, now);
+      w.count += 1;
+      return GRANTED;
+    },
+    state(key) { const now = Date.now(); return view(live(String(key), now), now); },
+    clear(key) { windows.delete(String(key)); },
+  };
+}
+
+module.exports = { rateLimit, failureBreaker, attemptWindow };

@@ -783,7 +783,7 @@ async function searchByJobId(jobId, efrId) {
   logger.info('Search job by id · jobId=' + jobId);
   const [[row]] = await pool.query(
     `SELECT j.job_id, j.job_reference_id, j.client_ref_id, j.job_status,
-            j.job_type, j.requested_date_time, j.time_slot, j.otp,
+            j.job_type, j.requested_date_time, j.time_slot,
             COALESCE(NULLIF(TRIM(j.job_customer_name), ''), cu.customer_name) AS customer_name,
             cu.customer_mob_no,
             ad.address, ad.locality, ad.landmark, ad.pin_code, ad.gps_location,
@@ -811,7 +811,6 @@ async function searchByJobId(jobId, efrId) {
     jobType:         row.job_type,
     requestedAt:     row.requested_date_time,
     timeSlot:        row.time_slot,
-    checkinPin:      row.otp ?? null,
     customerName:    row.customer_name,
     customerMobile:  row.customer_mob_no,
     address:         row.address,
