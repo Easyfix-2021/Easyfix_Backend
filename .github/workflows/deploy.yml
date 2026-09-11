@@ -369,6 +369,34 @@ jobs:
             echo "instance_id=${{ secrets.PROD_BACKEND_INSTANCE_ID }}" >> "$GITHUB_OUTPUT"
           fi
 
+      # ── KEEP COMMENTS INSIDE THIS run: SHORT (2026-09-11) ─────────────────
+      # A run: that contains ${{ }} is evaluated as ONE expression template, and
+      # GitHub rejects the whole workflow once that string passes 21,000
+      # characters: "workflow file issue", no jobs, no logs, and a failed run on
+      # every push to ANY branch (it cannot read the branch filter either).
+      # Dozzle comments added inside this script took it to 21,128 and broke
+      # every backend deploy. Long explanations live HERE — YAML comments do
+      # not count. tests/workflow-expression-length.test.js caps it at 20,000.
+      #
+      # DOZZLE_REMOTE_AGENT: the Dozzle agent on the prod UI host
+      # (<private-ip>:7007), so the prod Dozzle also lists crm-ui + client-ui.
+      # A repo SECRET, not a variable: this repo is public, and a variable's
+      # value is printed unmasked in the step's env header. Always empty on QA,
+      # whose Dozzle already sees every container on its one box. It arrives via
+      # the step's env:, never as an Actions expression inside the script (that
+      # splices the raw value into bash before any check runs); it is still
+      # spliced into the REMOTE root shell, so characters that could end a
+      # quoted string are refused — with a warning, never fatally. The remote
+      # script deletes-then-appends it in /opt/easyfix/.env, so the secret is
+      # the only source of truth. See docs/dozzle-agent.md.
+      #
+      # Dozzle refresh (end of the script): the :latest tag alone upgrades
+      # nothing — compose pulls only a MISSING image — so every deploy pulls it,
+      # and `up -d` recreates Dozzle only when the image or its definition
+      # changed. NON-FATAL, and after the swap is proven: each command is the
+      # left side of `||` (set -e exempts it; no pipeline for pipefail), and
+      # `timeout` covers a pull that stalls instead of failing, which would
+      # outlast the 5-minute SSM poll and read as a failed deploy.
       - name: SSM compose pull + up
         id: ssm
         env:
@@ -389,21 +417,7 @@ jobs:
           REPO="${{ secrets.ECR_REPOSITORY_BACKEND || 'easyfix/backend' }}"
           IMAGE_URI="${REGISTRY}/${REPO}:${IMAGE_TAG}"
 
-          # Address of the Dozzle agent on the prod UI host (<private-ip>:7007),
-          # so the prod Dozzle here lists crm-ui + client-ui too. A repo SECRET,
-          # not a variable: this repo is public, and a variable's value is
-          # printed unmasked in the step's env header of every deploy log.
-          # Always empty on QA, whose Dozzle already sees every container on
-          # its one box. Written into /opt/easyfix/.env by the remote script;
-          # see docs/dozzle-agent.md.
-          #
-          # It arrives through the step's env:, NOT as an Actions expression
-          # inside this script — that splices the raw value into bash before any
-          # check can run, which a test with a quote in the value proved. It is
-          # still spliced into the REMOTE script below (a root shell on the
-          # host), so refuse any character that could end a quoted string —
-          # ignored with a warning, not fatal: log visibility must never block
-          # a deploy.
+          # Dozzle agent address — see the YAML comment above this step.
           DOZZLE_REMOTE_AGENT=""
           if [[ "$ENV_NAME" == "production" ]]; then
             DOZZLE_REMOTE_AGENT="${PROD_DOZZLE_REMOTE_AGENT:-}"
@@ -469,9 +483,7 @@ jobs:
             else
               echo "BACKEND_IMAGE=$IMAGE_URI" >> /opt/easyfix/.env
             fi
-            # Dozzle agent address. Delete-then-append keeps the GitHub secret
-            # the ONLY source of truth: unset it and this removes the line, and
-            # the \`up -d dozzle\` below recreates Dozzle without the agent.
+            # Dozzle agent address: delete-then-append (see above this step).
             sed -i '/^DOZZLE_REMOTE_AGENT=/d' /opt/easyfix/.env
             if [[ -n "$DOZZLE_REMOTE_AGENT" ]]; then
               echo "DOZZLE_REMOTE_AGENT=$DOZZLE_REMOTE_AGENT" >> /opt/easyfix/.env
@@ -705,19 +717,7 @@ jobs:
           echo "✓ Verified running image: \$RUNNING"
           echo "✓ Deployed $IMAGE_URI"
 
-          # ─── Dozzle: keep it on the newest amir20/dozzle:latest ─────────
-          # The tag alone upgrades nothing (\`compose up\` pulls only a MISSING
-          # image), so pull it on every deploy. \`up -d\` then recreates Dozzle
-          # only when the image or its definition changed (a new release, the
-          # DOZZLE_REMOTE_AGENT line in .env) and is a no-op otherwise. It is
-          # also what starts the log viewer on a fresh EC2.
-          #
-          # NON-FATAL, and deliberately AFTER the swap is proven above: a Docker
-          # Hub outage or rate limit must never fail an app deploy. Each command
-          # is the left side of \`||\`, which set -e exempts, and none is a
-          # pipeline, so pipefail has nothing to catch. \`timeout\` covers what
-          # \`||\` cannot: a pull that stalls instead of failing would outlast the
-          # 5-minute SSM poll on the runner and be reported as a failed deploy.
+          # ─── Dozzle refresh: non-fatal — see the YAML comment above this step ───
           echo "▶ Refreshing Dozzle (amir20/dozzle:latest)"
           timeout 60 docker compose pull -q dozzle || echo "⚠ Dozzle pull failed (non-fatal) — keeping the image it has"
           timeout 30 docker compose up -d --no-deps dozzle || echo "⚠ Dozzle did not start (non-fatal)"
