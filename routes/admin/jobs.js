@@ -2562,8 +2562,12 @@ router.post('/:id/notify-unreachable', validate(idParam, 'params'), scopedJob, a
  *   he is now unable to CLOSE a job he has already finished — work done,
  *   customer gone, job stuck open and unbillable. His only self-serve escape
  *   is the app's own POST /mobile/jobs/:id/checkin-sms. When that fails (wrong
- *   number on file, customer deleted the SMS) ops had NO way to help, because
- *   the CRM can neither see nor re-send the PIN. This is that way.
+ *   number on file, customer deleted the SMS) ops needs a way to help. There
+ *   are two, both deliberate (owner's decision, 2026-09-11): the CRM job
+ *   detail SHOWS the PIN (JobModal "Customer PIN (Closes the Job)", while the
+ *   job is Pending to Start or Pending to Close), so an operator on the phone
+ *   can read it out; and this route re-sends it by SMS to the customer's own
+ *   number.
  *
  * WHY THE NAME IS NOT "checkin-sms"
  *   The mobile route is named for the transition that consumed the PIN. Once
@@ -2590,12 +2594,13 @@ router.post('/:id/notify-unreachable', validate(idParam, 'params'), scopedJob, a
  *   with an actionable sentence instead: nothing to close, nobody to read the
  *   PIN back, assign first.
  *
- * THE RESPONSE NEVER CARRIES THE PIN. Ops triggers the SMS; the code goes to
- *   the customer's phone and nowhere else — that is the entire reason this is
- *   a re-send rather than a "show me the PIN" panel. The payload is rebuilt
- *   here as a literal instead of spreading the service's return value, so a
- *   later change in that file (which this route does not own) cannot widen
- *   what ops sees.
+ * THE RESPONSE NEVER CARRIES THE PIN. It has no need to — CRM users already
+ *   see it in the job detail — and a SEND action that also returned the code
+ *   would make every caller of it a reader of it. The payload is rebuilt here
+ *   as a literal instead of spreading the service's return value, so a later
+ *   change in that file (which this route does not own) cannot widen it.
+ *   (The TECHNICIAN app is the other way round: it must never receive the PIN
+ *   — see routes/mobile/index.js GET /jobs/:id.)
  */
 
 // Bound: 3 ATTEMPTS per job per 5 minutes — charged on the way in, before the
