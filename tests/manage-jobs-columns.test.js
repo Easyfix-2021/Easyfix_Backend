@@ -157,10 +157,22 @@ test('Rating reuses the escalation row rather than joining that table twice', ()
   // tbl_easyfixer_rating_by_customer's job_id is NOT unique, which is why
   // escalationJoin resolves it through MAX(table_id). Joining it a second time
   // for the rating would both fan out and pick a different row.
-  assert.match(SRC, /const wantsEscalation = wantsManage \|\|/,
-    'the manage view must force the escalation join on');
+  assert.match(SRC, /const wantsEscalation = wantsManage \|\| filtersEscalated;/,
+    'the manage view must force the escalation JOIN on');
   assert.match(fragment('manageColumns', true, true), /esc\.customer_rating/,
     'and read the rating off that same alias');
+  /*
+   * ⚠ The JOIN, and only the join. This test's first version asserted
+   * `wantsEscalation = wantsManage || …` and stopped there — it pinned the
+   * line that shipped the regression, because that same flag ALSO gated the
+   * escalated-only WHERE. Manage Jobs listed escalated jobs only (97.3% of
+   * the book hidden on QA) and this file stayed green. The filter must key on
+   * the caller's own request, never on the view.
+   */
+  assert.match(SRC, /  if \(filtersEscalated\) \{\n    clauses\.push\(`EXISTS \(/,
+    'the is_escalated WHERE must be gated on the caller asking for it');
+  assert.doesNotMatch(SRC, /  if \(wantsEscalation\) \{\n    clauses\.push/,
+    'gating the WHERE on the join flag filters every Manage Jobs request to escalated jobs');
 });
 
 /* ─── delegation: no second copy of anything ───────────────────────────── */

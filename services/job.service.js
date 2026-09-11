@@ -2144,13 +2144,25 @@ async function list({
    */
   const wantsManage = String(view || '') === 'manage';
   /*
-   * The Rating column lives on tbl_easyfixer_rating_by_customer, the SAME row
-   * escalationColumns already resolves through MAX(table_id). Forcing that join
-   * on for this view reuses it instead of joining a table with a non-unique
-   * job_id twice — which would fan the list out.
+   * TWO QUESTIONS, TWO FLAGS — they were one, and that shipped a regression.
+   *
+   * filtersEscalated — did the CALLER ask for escalated jobs only? Drives the
+   *   `is_escalated = 1` WHERE below, and nothing else.
+   * wantsEscalation  — does any COLUMN need the escalation row? The filter's
+   *   own columns, and the Manage Jobs view's Rating and Escalted By, which
+   *   live on tbl_easyfixer_rating_by_customer — the same row escalationJoin
+   *   resolves through MAX(table_id), so it is joined once, not twice (its
+   *   job_id is not unique; a second join would fan the list out).
+   *
+   * Until 2026-09-11 a single `wantsEscalation` answered both, and forcing it on
+   * for view=manage to get the Rating join ALSO switched on the escalated-only
+   * WHERE. Manage Jobs then listed escalated jobs only: 12,910 of 481,048 on
+   * QA (97.3% of the book hidden), ~15,000 on Production, for every operator,
+   * with a total that agreed with the rows because COUNT shares the clauses.
    */
-  const wantsEscalation = wantsManage || (isEscalated !== undefined && isEscalated !== ''
-    && isEscalated !== false && String(isEscalated) !== 'false' && String(isEscalated) !== '0');
+  const filtersEscalated = isEscalated !== undefined && isEscalated !== ''
+    && isEscalated !== false && String(isEscalated) !== 'false' && String(isEscalated) !== '0';
+  const wantsEscalation = wantsManage || filtersEscalated;
   const listColumns =
     LIST_COLUMNS + pendingRequestColumns(hasCustomerRequestTable) + offerColumns(hasJobOffer, offerExpiry)
     + magicLinkDeliveryColumns(hasMagicLinkDeliveryCols)
@@ -2555,7 +2567,7 @@ async function list({
    * only escalated ones — telling a client their whole book is escalated. See
    * escalationColumns/escalationJoin above for why EXISTS rather than a join.
    */
-  if (wantsEscalation) {
+  if (filtersEscalated) {
     clauses.push(`EXISTS (
       SELECT 1 FROM tbl_easyfixer_rating_by_customer esc_f
        WHERE esc_f.job_id = j.job_id AND esc_f.is_escalated = 1)`);
