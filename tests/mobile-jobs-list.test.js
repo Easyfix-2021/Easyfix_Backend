@@ -16,28 +16,58 @@
  *      easyfixer-lifecycle's OPEN_JOB_STATUSES — NOT the dashboard's (1, 2, 20)
  *      counter, which would list 10 / 15 / 21 nowhere in the app.
  *
- * The fake DB models the un-migrated schema the way MySQL does: while
- * `schema === 'absent'`, any query naming a delegation column THROWS
- * ER_BAD_FIELD_ERROR. So a broken gate fails here with the production error
- * itself, not merely with a regex mismatch.
+ * The fake DB models the un-migrated schema the way MySQL does, PER COLUMN: a
+ * query naming a delegation column the schema lacks THROWS ER_BAD_FIELD_ERROR.
+ * So a broken gate fails here with the production error itself, not merely with
+ * a regex mismatch — and a HALF-applied migration (some columns, not all) can be
+ * modelled, which an all-or-nothing fake cannot tell apart from either end.
  */
 const { test, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 const express = require('express');
 const { installFakePool } = require('./helpers/fake-pool');
 
-let schema = 'present';   // 'present' | 'absent' — the delegation migration
+/* The eight columns migrations/2026-09-10-job-share-delegation.sql adds that any
+ * query reads (live_job_id is generated and read by nothing here). */
+const DELEGATION_COLUMNS = ['delegate_efr_id', 'contact_name', 'contact_number', 'status',
+  'responded_on', 'started_on', 'ended_on', 'end_reason'];
+
+// 'present' | 'absent' | [the columns a HALF-applied migration left behind]
+let schema = 'present';
 let fault = null;         // a NON-absent error code for tbl_job_share_link reads
 
 const PROBE = /FROM tbl_job_share_link LIMIT 1/i;
 const sqlError = (code, errno, message) => Object.assign(new Error(message), { code, errno });
+const missingColumns = () => DELEGATION_COLUMNS.filter((c) =>
+  schema !== 'present' && !(Array.isArray(schema) && schema.includes(c)));
+/*
+ * One bound value per placeholder, judged by the formatter pool.query really
+ * uses (mysql2 → sql-escaper). The fake never binds, so it cannot see a dropped
+ * parameter; MySQL can. Counting `?` characters is wrong here: the projection
+ * carries a `?` inside a SQL comment ("…magic-link-open rule?"), which the
+ * formatter rightly skips. So tag each param and add one spare: every tag must
+ * land exactly once (none dropped) and the spare must not (none unbound).
+ */
+const { format: mysqlFormat } = require('mysql2');
+function bindsExactly(sql, params) {
+  const tags = params.map((_, i) => `__p${i}__`);
+  const out = mysqlFormat(sql, [...tags, '__spare__']);
+  return tags.every((t) => out.split(`'${t}'`).length === 2) && !out.includes('__spare__');
+}
+
+test('bindsExactly is a real oracle: exact passes, dropped and spare fail, a comment `?` is skipped', () => {
+  const sql = 'SELECT /* rule? */ a FROM t WHERE b = ? LIMIT ? OFFSET ?';
+  assert.equal(bindsExactly(sql, [7, 20, 0]), true, 'three placeholders, three values');
+  assert.equal(bindsExactly(sql, [7, 20]), false, 'a value dropped leaves a placeholder unbound');
+  assert.equal(bindsExactly(sql, [7, 8, 20, 0]), false, 'a value too many is never consumed');
+});
 
 const fake = installFakePool([
   [/tbl_job_share_link/i, (sql) => {
     if (fault) throw sqlError(fault, undefined, `connect ${fault}`);
-    if (schema === 'absent' && /delegate_efr_id|responded_on/.test(sql)) {
-      throw sqlError('ER_BAD_FIELD_ERROR', 1054, "Unknown column 's.delegate_efr_id' in 'where clause'");
-    }
+    // \b on both sides: `s.status` names the share column, `j.job_status` does not.
+    const named = missingColumns().find((c) => new RegExp(`\\b${c}\\b`).test(sql));
+    if (named) throw sqlError('ER_BAD_FIELD_ERROR', 1054, `Unknown column '${named}' in 'field list'`);
     return /SELECT COUNT\(\*\) AS total/i.test(sql) ? [{ total: 0 }] : [];
   }],
   [/SELECT COUNT\(\*\) AS total/i, () => [{ total: 0 }]],
@@ -94,16 +124,48 @@ test('columns ABSENT → the plain assigned-to clause in rows AND total, never a
     // job shown to every technician, on the path QA and Production run today.
     assert.equal(lastWhere(call.sql), 'j.fk_easyfixter_id = ?', `${name}: exactly the assigned-to clause`);
     assert.deepEqual(call.params, params, `${name}: bound to the technician only`);
+    assert.ok(bindsExactly(call.sql, call.params), `${name}: one bound value per placeholder, as mysql2 binds them`);
   }
 });
 
-test('columns PRESENT → the delegated-to-me EXISTS in rows AND total', async () => {
-  await freshList()(MOBILE_ARGS);
-  for (const [name, call] of [['data', dataCall()], ['COUNT', countCall()]]) {
+test('columns PRESENT → the delegated-to-me EXISTS in rows AND total, bound owner-then-delegate', async () => {
+  // DIFFERENT owner and delegate ids. The route passes the same technician as
+  // both, so with one id a dropped, duplicated or swapped parameter binds the
+  // same number and the SQL still reads right — only the params can tell.
+  await freshList()({ ...MOBILE_ARGS, delegatedToEfrId: 8 });
+  for (const [name, call, params] of [['data', dataCall(), [7, 8, 20, 0]], ['COUNT', countCall(), [7, 8]]]) {
     assert.ok(call, `the ${name} query must have run`);
     assert.match(call.sql, /j\.fk_easyfixter_id = \? OR EXISTS \([\s\S]*s\.delegate_efr_id = \?/,
       `${name}: a delegate must see the job he was asked to do`);
+    assert.deepEqual(call.params, params, `${name}: owner, then delegate, then paging — in placeholder order`);
+    assert.ok(bindsExactly(call.sql, call.params), `${name}: one bound value per placeholder, as mysql2 binds them`);
   }
+});
+
+test('a HALF-applied migration reads as absent to every reader, not only to list()', async () => {
+  // The migration adds its columns one ALTER at a time. A run that stopped after
+  // the first few leaves delegate_efr_id and status — everything list() reads —
+  // without the six SHARE_SELECT also reads. A probe narrowed to list()'s two
+  // columns would call that "present", and every share read (GET /jobs/:id/share
+  // fires on each open order) would 500 with the production error.
+  schema = ['delegate_efr_id', 'status'];
+  // Positive control: the fake really is half-migrated — a share-only column
+  // errors, a list() column does not. Otherwise "no 500" below proves nothing.
+  const { pool } = require('../db');
+  await assert.rejects(pool.query('SELECT s.contact_name FROM tbl_job_share_link s'), { code: 'ER_BAD_FIELD_ERROR' });
+  await pool.query('SELECT s.delegate_efr_id, s.status FROM tbl_job_share_link s');
+  fake.reset();
+
+  const delegation = freshDelegation();
+  const { list } = require('../services/job.service');   // the instance delegation reads through
+  const shareSelects = () => fake.calls.filter((c) => /FROM tbl_job_share_link s\b/.test(c.sql)).length;
+
+  assert.equal(await delegation.getShareForViewer(4321, 7), null, 'GET /jobs/:id/share → { share: null }, not a 500');
+  assert.equal(await delegation.resolveLock(4321, 7), null, 'the lock falls through');
+  assert.equal(shareSelects(), 0, 'SHARE_SELECT must not run against a half-migrated table');
+  await list(MOBILE_ARGS);
+  assert.doesNotMatch(dataCall().sql, /delegate_efr_id/, 'list() agrees: delegation is not there yet');
+  assert.equal(probeCount(), 1, 'one probe answered for both readers');
 });
 
 test('"absent" is re-asked within 60s of a live migration; "present" is kept for good', async (t) => {
