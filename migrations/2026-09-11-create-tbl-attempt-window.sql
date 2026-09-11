@@ -16,18 +16,21 @@
 -- Referenced by exactly one module: services/attempt-window.service.js.
 --
 -- ── Column notes ────────────────────────────────────────────────────
--- attempt_key   '<namespace>:<id>' — 'checkout-pin:job:<job_id>' or
---               'profile-otp:efr:<efr_id>'. A string, not an FK: the two
---               stores are different tables, and an FK into a legacy table
---               would let this one block a legacy delete.
+-- attempt_key   '<namespace>:<id>' — 'checkout-pin:job:<job_id>',
+--               'profile-otp:efr:<efr_id>', or a login rate limit
+--               ('rate:crm-login-otp:ip:<ip>', 'rate:verify-otp:mobile:<no>', …
+--               added 2026-09-11 — the same fixed window, its own max). A
+--               string, not an FK: the stores are different tables, and an FK
+--               into a legacy table would let this one block a legacy delete.
 -- attempts      Attempts in the current window. Every attempt is claimed
 --               BEFORE its compare; a right answer deletes the row.
 -- window_start  When the current window opened. Written by the app as new
 --               Date() through the pool's +05:30 timezone (IST wall clock) and
 --               compared IN SQL against Date parameters — never NOW(): the
 --               session time_zone is SYSTEM, not IST.
--- updated_on    Last write, for housekeeping. Rows exist only while someone is
---               mid-window without having got it right.
+-- updated_on    Last granted claim. The service deletes rows idle longer than
+--               the longest window (30 min) every 10 minutes, so the table
+--               holds roughly the last half hour of attempts.
 --
 -- DEPLOY ORDER IS SAFE BOTH WAYS: the service probes for this table and, until
 -- it exists, keeps counting in memory exactly as before — never unlimited,

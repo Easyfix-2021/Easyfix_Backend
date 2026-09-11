@@ -10,6 +10,12 @@
  * window refuses without comparing; a right answer clears; the lock lifts by
  * itself 30 minutes after the window opened.
  *
+ * SHARED RATE LIMITS — sharedRateLimit() below is middleware/rate-limit.js's
+ * rateLimit() counted here instead: the same fixed window is the same claim
+ * with its own max and window ('rate:<limiter key>'). Used by the public LOGIN
+ * routes (CRM routes/auth.js, technician app routes/mobile/index.js), whose
+ * ceilings must hold across containers. Every other rateLimit() stays in memory.
+ *
  * WHERE THE COUNT LIVES. tbl_attempt_window (migrations/2026-09-11-create-tbl-
  * attempt-window.sql), so every backend container counts in one place and the
  * admin "Unlock OTP / PIN" action clears it for all of them. Until that table
@@ -27,6 +33,11 @@
  * as IST, as the stored value was) — never NOW(): the session time_zone is
  * SYSTEM, not IST.
  *
+ * HOUSEKEEPING. A row idle for longer than the longest window is an expired
+ * window, which a claim treats exactly like no row — so claims delete those, at
+ * most once per SWEEP_EVERY_MS per process. Without it every IP and mobile that
+ * ever hit a login would stay a row forever.
+ *
  * Every function takes an optional `db` so a caller with an injected pool (the
  * profile OTP service) keeps its test seam: a fake pool stays the only
  * database touched.
@@ -35,16 +46,21 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const { attemptWindow } = require('../middleware/rate-limit');
+const { modernError } = require('../utils/response');
+const { maskMobile } = require('../utils/mask-mobile');
 const { OTP_MAX_ATTEMPTS, OTP_ATTEMPT_WINDOW_MINUTES } = require('../utils/otp');
 
 const TABLE = 'tbl_attempt_window';
+const KEY_MAX_LENGTH = 100;               // attempt_key VARCHAR(100)
 const MAX = OTP_MAX_ATTEMPTS;
-const WINDOW_MINUTES = OTP_ATTEMPT_WINDOW_MINUTES;
-const WINDOW_MS = WINDOW_MINUTES * 60 * 1000;
+const WINDOW_MS = OTP_ATTEMPT_WINDOW_MINUTES * 60 * 1000;
 const ABSENT_RECHECK_MS = 60 * 1000;
+const SWEEP_EVERY_MS = 10 * 60 * 1000;
 
 let _present = false;
 let _absentCheckedAt = 0;
+let _lastSweepAt = 0;
+let _longestWindowMs = 0;                 // grows as windows are created
 
 async function tablePresent(db) {
   if (_present) return true;
@@ -55,11 +71,11 @@ async function tablePresent(db) {
     );
     if (rows.length > 0) {
       _present = true;
-      logger.info(`Guess windows now SHARED — counting in ${TABLE} (checkout PIN, profile/bank OTP).`);
+      logger.info(`Guess windows now SHARED — counting in ${TABLE} (checkout PIN, profile/bank OTP, login rate limits).`);
       return true;
     }
     if (!_absentCheckedAt) {
-      logger.warn(`Guess windows counting PER PROCESS — ${TABLE} does not exist. Run `
+      logger.warn(`Guess windows and login rate limits counting PER PROCESS — ${TABLE} does not exist. Run `
         + 'migrations/2026-09-11-create-tbl-attempt-window.sql before running more than one backend container.');
     }
   } catch (e) {
@@ -74,36 +90,56 @@ function noteFailure(e) {
   if (e && (e.code === 'ER_NO_SUCH_TABLE' || e.errno === 1146)) { _present = false; _absentCheckedAt = 0; }
 }
 
+/* Delete expired windows — fire-and-forget, so no claim waits on it. */
+function maybeSweep(db, now) {
+  if (now.getTime() - _lastSweepAt < SWEEP_EVERY_MS) return;
+  _lastSweepAt = now.getTime();
+  // updated_on is the last GRANTED claim, never before window_start: idle past
+  // the longest window means expired for every namespace.
+  db.query(`DELETE FROM ${TABLE} WHERE updated_on < ?`, [new Date(now.getTime() - _longestWindowMs)])
+    .catch((e) => logger.warn('Guess-window sweep failed · ' + e.message));
+}
+
 const GRANTED = Object.freeze({ locked: false, attemptsRemaining: null, retryAfterMinutes: null });
 
-function view(r) {
-  const inWindow = !!r && (r.in_window === true || Number(r.in_window) === 1);
-  const used = inWindow ? Number(r.attempts) || 0 : 0;
-  const locked = used >= MAX;
-  return {
-    locked,
-    attemptsRemaining: Math.max(0, MAX - used),
-    // Rounded UP and never 0: "try again in 0 minutes" while refusing reads as broken.
-    retryAfterMinutes: locked ? Math.max(1, Math.ceil((Number(r.secs_left) || 0) / 60)) : null,
+function sharedAttemptWindow(namespace, { max = MAX, windowMs = WINDOW_MS, logRefusals = true } = {}) {
+  const memory = attemptWindow({ max, windowMs });
+  _longestWindowMs = Math.max(_longestWindowMs, windowMs);
+  const full = (key) => {
+    const k = `${namespace}:${key}`;
+    // INSERT IGNORE would silently TRUNCATE a longer key, and a claim on the
+    // truncated row never matches — unlimited. Throwing lands in memory instead.
+    if (k.length > KEY_MAX_LENGTH) throw new Error(`attempt key longer than ${KEY_MAX_LENGTH}`);
+    return k;
   };
-}
+  // For logs: never throws, and a login limiter's mobile is masked.
+  const label = (key) => `${namespace}:${String(key).slice(0, KEY_MAX_LENGTH).replace(/\d{10}/g, (m) => maskMobile(m))}`;
 
-async function readState(fullKey, db) {
-  const now = new Date();
-  const cutoff = new Date(now.getTime() - WINDOW_MS);
-  const [[r]] = await db.query(
-    `SELECT attempts,
-            (window_start IS NOT NULL AND window_start >= ?) AS in_window,
-            TIMESTAMPDIFF(SECOND, ?, DATE_ADD(window_start, INTERVAL ? MINUTE)) AS secs_left
-       FROM ${TABLE} WHERE attempt_key = ?`,
-    [cutoff, now, WINDOW_MINUTES, fullKey],
-  );
-  return view(r);
-}
+  const view = (r) => {
+    const inWindow = !!r && (r.in_window === true || Number(r.in_window) === 1);
+    const used = inWindow ? Number(r.attempts) || 0 : 0;
+    const locked = used >= max;
+    return {
+      locked,
+      attemptsRemaining: Math.max(0, max - used),
+      // Rounded UP and never 0: "try again in 0 minutes" while refusing reads as broken.
+      retryAfterMinutes: locked ? Math.max(1, Math.ceil((Number(r.secs_left) || 0) / 60)) : null,
+    };
+  };
 
-function sharedAttemptWindow(namespace) {
-  const memory = attemptWindow({ max: MAX, windowMs: WINDOW_MS });
-  const full = (key) => `${namespace}:${key}`;
+  const readState = async (fullKey, db) => {
+    const now = new Date();
+    const cutoff = new Date(now.getTime() - windowMs);
+    const [[r]] = await db.query(
+      `SELECT attempts,
+              (window_start IS NOT NULL AND window_start >= ?) AS in_window,
+              TIMESTAMPDIFF(SECOND, ?, DATE_ADD(window_start, INTERVAL ? SECOND)) AS secs_left
+         FROM ${TABLE} WHERE attempt_key = ?`,
+      [cutoff, now, Math.round(windowMs / 1000), fullKey],
+    );
+    return view(r);
+  };
+
   return {
     namespace,
 
@@ -112,7 +148,8 @@ function sharedAttemptWindow(namespace) {
       if (!(await tablePresent(db))) return memory.claim(key);
       try {
         const now = new Date();
-        const cutoff = new Date(now.getTime() - WINDOW_MS);
+        const cutoff = new Date(now.getTime() - windowMs);
+        maybeSweep(db, now);
         await db.query(
           `INSERT IGNORE INTO ${TABLE} (attempt_key, attempts, window_start, updated_on) VALUES (?, 0, NULL, ?)`,
           [full(key), now],
@@ -127,15 +164,15 @@ function sharedAttemptWindow(namespace) {
                   updated_on   = ?
             WHERE attempt_key = ?
               AND (window_start IS NULL OR window_start < ? OR attempts < ?)`,
-          [cutoff, cutoff, now, now, full(key), cutoff, MAX],
+          [cutoff, cutoff, now, now, full(key), cutoff, max],
         );
         if (res && res.affectedRows > 0) return GRANTED;
         const st = await readState(full(key), db);
-        if (st.locked) logger.warn(`Attempt refused · ${full(key)} · lifts in ~${st.retryAfterMinutes}m`);
+        if (st.locked && logRefusals) logger.warn(`Attempt refused · ${label(key)} · lifts in ~${st.retryAfterMinutes}m`);
         return st;
       } catch (e) {
         noteFailure(e);
-        logger.warn(`Guess-window claim failed · ${full(key)} · counting in memory · ${e.message}`);
+        logger.warn(`Guess-window claim failed · ${label(key)} · counting in memory · ${e.message}`);
         return memory.claim(key);
       }
     },
@@ -145,7 +182,7 @@ function sharedAttemptWindow(namespace) {
       if (!(await tablePresent(db))) return memory.state(key);
       try { return await readState(full(key), db); } catch (e) {
         noteFailure(e);
-        logger.warn(`Guess-window read failed · ${full(key)} · ${e.message}`);
+        logger.warn(`Guess-window read failed · ${label(key)} · ${e.message}`);
         return memory.state(key);
       }
     },
@@ -156,7 +193,7 @@ function sharedAttemptWindow(namespace) {
       if (!(await tablePresent(db))) return;
       try { await db.query(`DELETE FROM ${TABLE} WHERE attempt_key = ?`, [full(key)]); } catch (e) {
         noteFailure(e);
-        logger.warn(`Guess-window clear failed · ${full(key)} · ${e.message}`);
+        logger.warn(`Guess-window clear failed · ${label(key)} · ${e.message}`);
       }
     },
   };
@@ -167,7 +204,30 @@ function sharedAttemptWindow(namespace) {
 const checkoutPin = sharedAttemptWindow('checkout-pin');
 const profileOtp = sharedAttemptWindow('profile-otp');
 
-/** Tests only — forget the cached table probe. */
-function _resetProbeCache() { _present = false; _absentCheckedAt = 0; }
+/*
+ * rateLimit() (middleware/rate-limit.js) with its count in the shared table:
+ * same options, same 429 + Retry-After. Build it ONCE at module scope.
+ * Refusals are not logged here — http-log already logs every 429, and a flood
+ * would otherwise be a WARN per request.
+ * ponytail: a refused request still costs ~3 primary-key queries; if a flood
+ * ever shows in the pool, cache "locked until" in memory (these are never cleared).
+ */
+function sharedRateLimit({ windowMs = 60_000, max = 600, key = (req) => req.ip, message = 'rate limit exceeded' } = {}) {
+  const w = sharedAttemptWindow('rate', { max, windowMs, logRefusals: false });
+  return async (req, res, next) => {
+    try {
+      const r = await w.claim(String(key(req) || 'anon'));
+      if (!r.locked) return next();
+      res.setHeader('Retry-After', r.retryAfterMinutes * 60);
+      return modernError(res, 429, message);
+    } catch (e) { return next(e); }
+  };
+}
 
-module.exports = { checkoutPin, profileOtp, sharedAttemptWindow, TABLE, ABSENT_RECHECK_MS, _resetProbeCache };
+/** Tests only — forget the cached table probe and the last sweep. */
+function _resetProbeCache() { _present = false; _absentCheckedAt = 0; _lastSweepAt = 0; }
+
+module.exports = {
+  checkoutPin, profileOtp, sharedAttemptWindow, sharedRateLimit,
+  TABLE, ABSENT_RECHECK_MS, SWEEP_EVERY_MS, _resetProbeCache,
+};

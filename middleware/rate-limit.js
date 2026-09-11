@@ -1,6 +1,8 @@
 /*
  * Simple in-memory rate limiter (per-process). Phase 14 scaffolding.
- * For multi-instance production: swap the Map for a Redis store.
+ * Where a ceiling must hold across containers (the public login routes), use
+ * services/attempt-window.service.js sharedRateLimit — same options, counted
+ * in tbl_attempt_window.
  * Expired entries are swept lazily, at most once per windowMs, to keep
  * the Map from growing unbounded on IP-keyed public surfaces.
  *

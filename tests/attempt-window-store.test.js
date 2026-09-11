@@ -74,7 +74,7 @@ test('the PIN and the profile OTP never share a count', async () => {
 
 test('clear() deletes the shared row', async () => {
   await store.profileOtp.clear('efr:9');
-  assert.deepEqual(calls(/DELETE FROM tbl_attempt_window/)[0].params, ['profile-otp:efr:9']);
+  assert.deepEqual(calls(/DELETE FROM tbl_attempt_window WHERE attempt_key/)[0].params, ['profile-otp:efr:9']);
 });
 
 test('WITHOUT the table it counts in memory — per process, never unlimited', async () => {
@@ -111,4 +111,92 @@ test('an injected pool is the only database touched', async () => {
   await store.profileOtp.claim('efr:42', own.pool);
   assert.ok(own.calls.some((c) => /UPDATE tbl_attempt_window/.test(c.sql)), 'the injected pool ran the claim');
   assert.equal(calls(/tbl_attempt_window/).length, 0, 'the shared pool saw nothing');
+});
+
+/* ── sharedRateLimit — the login limiters ──────────────────────────────── */
+
+const resDouble = () => ({
+  statusCode: 200, body: null, headers: {},
+  setHeader(n, v) { this.headers[n] = v; },
+  status(c) { this.statusCode = c; return this; },
+  json(b) { this.body = b; return this; },
+});
+const TEN_MIN = 10 * 60_000;
+const limiter = store.sharedRateLimit({
+  windowMs: TEN_MIN, max: 20, message: 'slow down', key: (req) => `login-otp:mobile:${req.body.mobile}`,
+});
+const hit = async (mobile) => {
+  const res = resDouble();
+  let passed = false;
+  await limiter({ ip: '203.0.113.1', body: { mobile } }, res, () => { passed = true; });
+  return { res, passed };
+};
+
+test('a limiter claims with ITS OWN max and window, under the rate: namespace', async () => {
+  assert.equal((await hit('9876543210')).passed, true);
+  const up = calls(/UPDATE tbl_attempt_window/)[0];
+  assert.ok(up, 'expected the claim');
+  const [cutoff, , now, , key, , max] = up.params;
+  assert.equal(key, 'rate:login-otp:mobile:9876543210');
+  assert.equal(max, 20);
+  assert.equal(now.getTime() - cutoff.getTime(), TEN_MIN);
+});
+
+test('past its ceiling it answers 429 with the message and a Retry-After', async () => {
+  S.affected = 0; S.attempts = 20; S.secsLeft = 301;
+  const { res, passed } = await hit('9876543211');
+  assert.equal(passed, false);
+  assert.equal(res.statusCode, 429);
+  assert.equal(res.body.error, 'slow down');
+  assert.equal(res.headers['Retry-After'], 360, 'minutes rounded up, in seconds');
+  assert.equal(calls(/SELECT attempts,/)[0].params[2], 600, 'the lock is read against ITS window, in seconds');
+});
+
+test('below its ceiling a refused UPDATE still passes (a window that just expired)', async () => {
+  S.affected = 0; S.attempts = 5;                  // ≥ the PIN max, < this limiter's 20
+  assert.equal((await hit('9876543212')).passed, true);
+});
+
+test('with no table it keeps the old per-process ceiling', async () => {
+  S.table = false;
+  for (let i = 0; i < 20; i++) assert.equal((await hit('9000000001')).passed, true, `hit ${i + 1}`);
+  assert.equal((await hit('9000000001')).res.statusCode, 429);
+});
+
+test('a key too long for the column counts in memory — never a truncated row', async () => {
+  const long = '9'.repeat(120);
+  for (let i = 0; i < 20; i++) assert.equal((await hit(long)).passed, true);
+  assert.equal((await hit(long)).res.statusCode, 429, 'never unlimited');
+  assert.equal(calls(/INSERT IGNORE|UPDATE tbl_attempt_window/).length, 0, 'nothing written with an over-long key');
+});
+
+test('a failure log masks the mobile in the key', async () => {
+  const logger = require('../logger');
+  const seen = [];
+  const orig = logger.warn;
+  logger.warn = (m) => { seen.push(String(m)); };
+  try {
+    S.fail = new Error('Lock wait timeout exceeded');
+    await hit('9876543213');
+  } finally { logger.warn = orig; }
+  const line = seen.find((m) => /claim failed/.test(m));
+  assert.ok(line, 'positive control: the failure was logged');
+  assert.doesNotMatch(line, /9876543213/);
+  assert.match(line, /rate:login-otp:mobile:/);
+});
+
+/* ── housekeeping ─────────────────────────────────────────────────────── */
+
+test('a claim sweeps rows idle past the LONGEST window — once per interval', async () => {
+  await hit('9876543214');                          // a 10-minute limiter triggers it…
+  const sweeps = calls(/DELETE FROM tbl_attempt_window WHERE updated_on < \?/);
+  assert.equal(sweeps.length, 1, 'positive control: the sweep ran');
+  const [cutoff] = sweeps[0].params;
+  assert.ok(cutoff instanceof Date);
+  const age = Date.now() - cutoff.getTime();
+  // …but must not delete a 30-minute PIN lock that is still running.
+  assert.ok(age >= 30 * 60_000 && age < 30 * 60_000 + 5_000, `cutoff is 30 min back, got ${age}ms`);
+  await hit('9876543215');
+  await store.checkoutPin.claim('job:sweep');
+  assert.equal(calls(/WHERE updated_on < \?/).length, 1, `at most once per ${store.SWEEP_EVERY_MS}ms`);
 });
