@@ -70,10 +70,22 @@ const issueClose = Joi.object({
   close_note: Joi.string().trim().max(1000).allow('').optional(),
 });
 
+/*
+ * REQUIRED, unlike close_note: a reopen with no reason puts a ticket back in
+ * the queue with nothing for the manager to act on. Written into
+ * tbl_crm_issue_comment.comment_text, hence comment_text's max.
+ */
+const REOPEN_NOTE_MSG = 'Tell us what is still wrong';
+const issueReopen = Joi.object({
+  reopen_note: Joi.string().trim().min(1).max(2000).required()
+    .messages({ 'any.required': REOPEN_NOTE_MSG, 'string.empty': REOPEN_NOTE_MSG }),
+});
+
 module.exports = {
   issueIdParam,
   issueCreate,
   issueListQuery,
   issueCommentCreate,
   issueClose,
+  issueReopen,
 };

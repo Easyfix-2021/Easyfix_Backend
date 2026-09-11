@@ -13,6 +13,7 @@ const {
   issueListQuery,
   issueCommentCreate,
   issueClose,
+  issueReopen,
 } = require('../../validators/issue.validator');
 
 /*
@@ -27,9 +28,10 @@ const {
  * belongs there because that is where the WHERE clauses live.
  *
  * ── AUTHORISATION ───────────────────────────────────────────────────────
- * Reporting, listing your own, reading your own and commenting on your own
- * need NO action key — every admin-group user may raise a bug. Reading
- * someone else's, listing with scope=all, and closing need `isIssueManage`.
+ * Reporting, listing your own, reading your own, commenting on your own and
+ * reopening your own need NO action key — every admin-group user may raise a
+ * bug. Reading, commenting on or reopening someone else's, listing with
+ * scope=all, and closing need `isIssueManage`.
  * The rule is enforced in the service, on the row it actually fetched, so a
  * future endpoint added here cannot forget it. requireAction below is a
  * fast-fail on the one route where the answer needs no row: it produces the
@@ -245,6 +247,31 @@ router.patch(
         actor,
       );
       return modernOk(res, result, 'Issue closed');
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+/*
+ * PATCH /api/admin/issues/:issueId/reopen — reporter or manager; 409 if
+ * already open. NO requireAction: the reporter holds no key, and the service
+ * applies the read rule on the fetched row.
+ */
+router.patch(
+  '/:issueId/reopen',
+  validate(issueIdParam, 'params'),
+  validate(issueReopen),
+  async (req, res, next) => {
+    try {
+      const actor = await svc.resolveActor(req);
+      const result = await svc.reopenIssue(
+        req.params.issueId,
+        { reopenNote: req.body.reopen_note },
+        actor,
+      );
+      return modernOk(res, result, 'Issue reopened');
     } catch (e) {
       if (e.status) return modernError(res, e.status, e.message);
       next(e);

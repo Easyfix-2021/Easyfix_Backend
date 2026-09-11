@@ -18,7 +18,7 @@ const { FEATURES, emailAllowed } = require('./feature-access.service');
  * THE OWNERSHIP RULE — STATED ONCE, ENFORCED ON THE ROW ACTUALLY FETCHED
  * ══════════════════════════════════════════════════════════════════════════
  *
- *   READ an issue, or ADD A COMMENT to it, if
+ *   READ an issue, ADD A COMMENT to it, or REOPEN it once closed, if
  *       issue.reported_by === actor.userId   OR   actor.canManage
  *   CLOSE it, or LIST with scope=all, only if
  *       actor.canManage
@@ -357,8 +357,8 @@ async function getIssueDetail(issueId, actor) {
  * point of the thread.
  *
  * Deliberately allowed on a CLOSED issue: "this came back" belongs on the
- * original issue, not in a new one, and re-opening is not a state this
- * feature has.
+ * original issue, not in a new one. A comment leaves the issue closed; to put
+ * it back in the open queue, reopenIssue() below.
  */
 async function addComment(issueId, { commentText }, actor) {
   await loadIssueForActor(issueId, actor);
@@ -396,6 +396,66 @@ async function closeIssue(issueId, { closeNote }, actor) {
   return { id: issueId, status: STATUS.CLOSED };
 }
 
+/** tbl_crm_issue_comment.comment_text is VARCHAR(2000). */
+const COMMENT_MAX = 2000;
+
+/*
+ * Reopen. The READ rule, not the close rule: the reporter is the person who
+ * finds out the fix did not work, and they hold no key. So the authorisation is
+ * loadIssueForActor (404 / 403) and nothing else — the rule stays in one place.
+ *
+ * NO SCHEMA CHANGE. tbl_crm_issue has one closed_by / closed_on / close_note
+ * slot, so the reopen CLEARS it — an open row carrying closed_on is the state
+ * hand-check 5 in migrations/executed/2026-09-10-crm-issue-reporter.sql says
+ * must never exist — and the close it undoes survives as a COMMENT by the
+ * reopener: their reason, then who closed it, when, and with what note.
+ *
+ * ONE transaction, because each half alone is a lie: a reopen without its
+ * comment erases the close note with no trace, and a comment without the
+ * reopen claims a state change that never happened. `AND status = 'closed'` is
+ * the race guard — two people reopening the same row both pass the status
+ * check, and the loser's UPDATE matches nothing: 409, rollback, no second
+ * comment.
+ */
+async function reopenIssue(issueId, { reopenNote }, actor) {
+  const issue = await loadIssueForActor(issueId, actor);
+  if (issue.status !== STATUS.CLOSED) {
+    throw badRequest('Issue is already open', 409);
+  }
+
+  // closed_on is the pool's IST wall-clock string (db.js dateStrings):
+  // reorder it to DD-MM-YYYY HH:mm, never parse it — parsing is where a TZ shift gets in.
+  const when = String(issue.closed_on || '').replace(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}).*$/, '$3-$2-$1 $4:$5');
+  const closer = issue.closed_by_name || `user #${issue.closed_by}`;
+  const text = `Reopened: ${reopenNote}\n\nPreviously closed by ${closer}${when ? ` on ${when}` : ''}.`
+    + (issue.close_note ? ` Close note: ${issue.close_note}` : '');
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [r] = await conn.query(
+      'UPDATE tbl_crm_issue SET status = ?, closed_by = NULL, closed_on = NULL, close_note = NULL WHERE id = ? AND status = ?',
+      [STATUS.OPEN, issueId, STATUS.CLOSED],
+    );
+    if (!r.affectedRows) throw badRequest('Issue is already open', 409);
+    await conn.query(
+      'INSERT INTO tbl_crm_issue_comment (issue_id, comment_text, commented_by, created_on) VALUES (?, ?, ?, ?)',
+      // ponytail: a 2000-char reason plus a 1000-char close note can overflow
+      // the column, so the tail (the old note) is cut rather than 1406-ing the
+      // reopen. Lower the reopen_note max if a cut note ever matters.
+      [issueId, text.slice(0, COMMENT_MAX), actor.userId, new Date()],
+    );
+    await conn.commit();
+  } catch (e) {
+    try { await conn.rollback(); } catch { /* the original error is the one to report */ }
+    throw e;
+  } finally {
+    conn.release();
+  }
+  logger.info('Issue reopened · id=' + issueId + ' by=' + actor.userId);
+  return { id: issueId, status: STATUS.OPEN };
+}
+
 /** Build the S3 key for a screenshot. Timestamp + 8 hex chars, no extension —
  *  the same shape buildNoticeKey / buildClientDocKey use. */
 function buildScreenshotKey() {
@@ -416,4 +476,5 @@ module.exports = {
   getIssueDetail,
   addComment,
   closeIssue,
+  reopenIssue,
 };
