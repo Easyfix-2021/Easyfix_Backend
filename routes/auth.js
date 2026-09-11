@@ -9,7 +9,7 @@ const { signUserToken } = require('../utils/jwt');
 const { modernOk, modernError, otpGuessCapError } = require('../utils/response');
 const { FEATURES, emailAllowed } = require('../services/feature-access.service');
 const logger = require('../logger');
-const { rateLimit } = require('../middleware/rate-limit');
+const { sharedRateLimit } = require('../services/attempt-window.service');
 
 /*
  * Per-IP ceilings on the CRM's two public login routes. They had none: a
@@ -22,15 +22,16 @@ const { rateLimit } = require('../middleware/rate-limit');
  * office can share one address, and a CRM session lasts 30 days — so a real
  * office never comes near 100 code requests in 10 minutes. Same shape and
  * IP handling as the technician app's limiters (routes/mobile/index.js).
- * In-memory, per process — see middleware/rate-limit.js.
+ * Counted in tbl_attempt_window, so the ceiling holds across containers —
+ * see services/attempt-window.service.js sharedRateLimit.
  */
 const ipPart = (req) => String(req.ip ?? 'unknown').trim().slice(0, 64) || 'unknown';
 const LIMIT_MESSAGE = 'Too many sign-in attempts from this network. Please wait a few minutes and try again.';
-const loginOtpIpRateLimit = rateLimit({
+const loginOtpIpRateLimit = sharedRateLimit({
   windowMs: 10 * 60_000, max: 100, message: LIMIT_MESSAGE,
   key: (req) => `crm-login-otp:ip:${ipPart(req)}`,
 });
-const verifyOtpIpRateLimit = rateLimit({
+const verifyOtpIpRateLimit = sharedRateLimit({
   windowMs: 10 * 60_000, max: 200, message: LIMIT_MESSAGE,
   key: (req) => `crm-verify-otp:ip:${ipPart(req)}`,
 });

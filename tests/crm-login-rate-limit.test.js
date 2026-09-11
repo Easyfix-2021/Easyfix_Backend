@@ -9,7 +9,10 @@
  *     Retry-After, and only past the ceiling;
  *   - it is PER IP, resolved as server.js resolves it (`trust proxy` 1), so one
  *     noisy source does not lock the rest of the office out;
- *   - the two routes have separate budgets.
+ *   - the two routes have separate budgets;
+ *   - with tbl_attempt_window present the count is SHARED (the store's own
+ *     semantics are pinned in attempt-window-store.test.js). Without it — the
+ *     first four tests — the same ceilings hold per process.
  * The auth service is stubbed: nothing is sent and no database is touched.
  *
  * Runner: `node --test` (see npm test).
@@ -20,7 +23,13 @@ const assert = require('node:assert/strict');
 const express = require('express');
 const { installFakePool } = require('./helpers/fake-pool');
 
-const fake = installFakePool([]);
+const S = { table: false, affected: 1 };
+const fake = installFakePool([
+  [/INFORMATION_SCHEMA\.TABLES/, () => (S.table ? [{ 1: 1 }] : [])],
+  [/UPDATE tbl_attempt_window/, () => ({ affectedRows: S.affected })],
+  [/SELECT attempts,/, () => [{ attempts: 100, in_window: 1, secs_left: 240 }]],
+]);
+const store = require('../services/attempt-window.service');
 const authSvcPath = require.resolve('../services/auth.service');
 require.cache[authSvcPath] = {
   id: authSvcPath, filename: authSvcPath, loaded: true,
@@ -85,4 +94,24 @@ test('the limiter runs before validation — malformed bodies spend the budget t
   for (let i = 0; i < 100; i++) await post('/login-otp', '203.0.113.12', {});
   const over = await post('/login-otp', '203.0.113.12', {});
   assert.equal(over.status, 429, 'a flood of garbage is throttled like any other flood');
+});
+
+test('with tbl_attempt_window the count is SHARED: per-IP keys, each route its own max', async () => {
+  S.table = true; store._resetProbeCache(); fake.calls.length = 0;
+  try {
+    assert.notEqual((await post('/login-otp', '203.0.113.20', LOGIN)).status, 429);
+    assert.notEqual((await post('/verify-otp', '203.0.113.20', VERIFY)).status, 429);
+    const claims = fake.calls.filter((c) => /UPDATE tbl_attempt_window/.test(c.sql))
+      .map((c) => ({ key: c.params[4], max: c.params[6], windowMs: c.params[2] - c.params[0] }));
+    assert.deepEqual(claims, [
+      { key: 'rate:crm-login-otp:ip:203.0.113.20', max: 100, windowMs: 10 * 60_000 },
+      { key: 'rate:crm-verify-otp:ip:203.0.113.20', max: 200, windowMs: 10 * 60_000 },
+    ]);
+
+    S.affected = 0;                                  // another container spent the budget
+    const over = await post('/login-otp', '203.0.113.21', LOGIN);
+    assert.equal(over.status, 429);
+    assert.equal(over.headers.get('retry-after'), '240');
+    assert.match((await over.json()).error, /Too many sign-in attempts/);
+  } finally { S.table = false; S.affected = 1; store._resetProbeCache(); }
 });

@@ -24,7 +24,7 @@ const lifecycle = require('../../services/mobile-job-lifecycle.service');
 const { dailyBridgeCapReached, persistBridgeCall, CALL_FAILED_PUBLIC_MSG } = require('../public/_public-call');
 const { modernOk, modernError, otpGuessCapError } = require('../../utils/response');
 const { rateLimit } = require('../../middleware/rate-limit');
-const { checkoutPin: checkoutPinAttempts } = require('../../services/attempt-window.service');
+const { checkoutPin: checkoutPinAttempts, sharedRateLimit } = require('../../services/attempt-window.service');
 const { stripCustomerMobiles } = require('../../utils/mask-mobile');
 const {
   requireTechJobMutationCapability,
@@ -57,14 +57,15 @@ function mobileOrIpRateKey(namespace, req) {
 // OTP issue has two independent ceilings: per mobile controls resend/provider
 // spend for one account, while per IP stops attackers rotating valid numbers.
 // Unknown numbers receive an OTP for self-onboarding but create no identity row
-// until verification succeeds. In-memory per process; replace with a shared
-// store before running multiple backend replicas (see rate-limit.js).
-const loginOtpMobileRateLimit = rateLimit({
+// until verification succeeds. All four login limiters count in
+// tbl_attempt_window, so they hold across backend containers
+// (services/attempt-window.service.js sharedRateLimit).
+const loginOtpMobileRateLimit = sharedRateLimit({
   windowMs: 10 * 60_000,
   max: 20,
   key: (req) => mobileOrIpRateKey('login-otp', req),
 });
-const loginOtpIpRateLimit = rateLimit({
+const loginOtpIpRateLimit = sharedRateLimit({
   windowMs: 10 * 60_000,
   max: 60,
   key: (req) => `login-otp:ip:${boundedIpPart(req)}`,
@@ -73,12 +74,12 @@ const loginOtpIpRateLimit = rateLimit({
 // OTP verification is public too. Two independent generous buckets prevent
 // brute force against one number AND high-cardinality probing from one IP,
 // while staying well above legitimate manual/QA retry volume.
-const verifyOtpMobileRateLimit = rateLimit({
+const verifyOtpMobileRateLimit = sharedRateLimit({
   windowMs: 10 * 60_000,
   max: 30,
   key: (req) => mobileOrIpRateKey('verify-otp', req),
 });
-const verifyOtpIpRateLimit = rateLimit({
+const verifyOtpIpRateLimit = sharedRateLimit({
   windowMs: 10 * 60_000,
   max: 120,
   key: (req) => `verify-otp:ip:${boundedIpPart(req)}`,
