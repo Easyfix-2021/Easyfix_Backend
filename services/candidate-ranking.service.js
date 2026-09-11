@@ -126,11 +126,15 @@ const _statsGate = { inFlight: () => statsInFlight, limit: () => STATS_QUERY_CON
  *     - Same-Vertical (10%)
  *     - Attendance Marked (10%)
  *
- *   Account balance: shown as informational column on the candidate row,
- *   NOT used to sort or filter the ranked list. The auto-assign commit
- *   path applies a "skip until balance >= floor" filter when the job's
- *   paid_by = 'customer' so the chosen tech can cover travel; that logic
- *   lives in pickAutoAssignCandidate() below, not in the ranking.
+ *   Account balance: shown on the candidate row, never a SORT key. It gates
+ *   twice when the customer pays (customerPays: paid_by = 2 OR collected_by
+ *   = 1), so the chosen tech can cover travel: the Top-10 drops techs below
+ *   the floor when a caller passes enforceCodBalance (the candidates route,
+ *   recommendSlotsForJob), and auto-assign's pickAutoAssignCandidate() skips
+ *   down the ranked list to the first tech at or above it. ONE boundary for
+ *   both — balance >= floor passes, the "₹500+" the modal tooltip promises.
+ *   The Top-10 used to reject AT the floor too, hiding a ₹500.00 tech that
+ *   auto-assign would pick (33 active techs on QA, 2026-09-11).
  *
  *   Deep-skill fallback: if ZERO techs pass the deep-skill filter, retry L1
  *   without the skill predicate and tag the result with note='no_deep_skill_match'
@@ -1455,7 +1459,7 @@ function buildCandidateRow(tech, s, job) {
  *   - overlapping 1-hour booking conflict      (ALWAYS)
  *   - not explicitly absent for the job date    (when enforceAttendance)
  *   - at/over Max Concurrent Jobs               (when enforceMaxConcurrent)
- *   - COD job + balance <= floor                (when enforceCodBalance)
+ *   - COD job + balance below floor             (when enforceCodBalance)
  */
 function filterAndScore(eligible, stats, job, opts) {
   const { enforceMaxConcurrent, enforceCodBalance, enforceAttendance, softAttendance, isCod, balanceFloor } = opts;
@@ -1495,8 +1499,12 @@ function filterAndScore(eligible, stats, job, opts) {
     if (enforceMaxConcurrent && s.active_jobs >= s.max_concurrent) {
       rejected.push({ efr_id: e.efr_id, efr_name: e.efr_name, reason: `saturated (${s.active_jobs} active jobs)` }); continue;
     }
-    if (enforceCodBalance && isCod && Number(e.current_balance ?? 0) <= balanceFloor) {
-      rejected.push({ efr_id: e.efr_id, efr_name: e.efr_name, reason: `COD job: balance ${Number(e.current_balance ?? 0)} <= ${balanceFloor}` }); continue;
+    // balance >= floor passes — pickAutoAssignCandidate's boundary. The per-tech
+    // figures sit in a TRAILING parenthetical so diagnoseEmptyPool groups every
+    // COD drop into one line (it strips that parenthetical to key by cause).
+    const balance = Number(e.current_balance ?? 0);
+    if (enforceCodBalance && isCod && balance < balanceFloor) {
+      rejected.push({ efr_id: e.efr_id, efr_name: e.efr_name, reason: `COD job: balance below floor (${balance} < ${balanceFloor})` }); continue;
     }
 
     scored.push(buildCandidateRow(e, s, job));
@@ -1675,8 +1683,8 @@ async function diagnoseEmptyPool(job, rejected = []) {
  *                          behaviour). The Schedule & Assign modal passes
  *                          FALSE — per the contract, concurrent count is a
  *                          DISPLAYED column there, not a hard filter.
- *   enforceCodBalance    — hard-exclude techs with balance <= floor when the
- *                          job is COD. DEFAULT false (legacy auto-assign
+ *   enforceCodBalance    — hard-exclude techs with balance below the floor
+ *                          when the job is COD. DEFAULT false (legacy auto-assign
  *                          applies the floor POST-rank via
  *                          pickAutoAssignCandidate, not as a ranked-list
  *                          exclude). The Schedule & Assign modal passes TRUE.
@@ -1774,8 +1782,13 @@ function buildJobHeader(job, {
     client_spoc_name:  job.client_spoc_name ?? null,
     created_by_name:   job.created_by_name  ?? null,
     created_date_time: job.created_date_time ?? null,
-    // Who collects payment — per JOB. Shown against Paid service lines.
+    // Who bears the cost — per JOB (1 Paid By Customer, 2 Free For Customer).
+    // The panel's Payment Mode reads it, and customerPays() gates COD on it.
     collected_by:      job.collected_by     ?? null,
+    // tbl_job.product_quantity — how many units the client booked. The panel's
+    // Quantity row read it but nothing projected it, so every Schedule &
+    // Assign / Reassign open showed "—" (2026-09-11).
+    product_quantity:  job.product_quantity ?? null,
     // Technician-facing note, surfaced as "Additional Comments".
     efr_special_notes: job.efr_special_notes ?? null,
   };
@@ -1856,9 +1869,9 @@ async function rankCandidatesForJob(jobId, {
     serviceCatgName, serviceTypeName, deepSkillLabel, jobSkillsByService, assignedEfrId,
   });
 
-  // COD = customer pays the tech on-site (paid_by = Customer). Such techs
-  // need cash on hand → optionally hard-filter balance > floor.
-  const isCod = paidByIsCustomer(job.paid_by);
+  // COD = the customer pays the tech on-site (customerPays). Such techs
+  // need cash on hand → optionally hard-filter to balance >= floor.
+  const isCod = customerPays(job);
   const balanceFloor = DEFAULTS.ACCOUNT_BALANCE_FLOOR;
 
   // Attendance window — technicians can only mark attendance for TODAY and
@@ -2101,13 +2114,12 @@ async function ensureAssignedFirst(candidatesList, assignedEfrId, job, scoredAll
  *     of jobs render this label, and "Not Set" says what's true (nobody
  *     populates the column) where "NA" reads like a system error. There is no
  *     "Cash" value in this enum on any tier — legacy included.
- * Labels only: paidByIsCustomer() keys on 2, so the COD/balance gate is
+ * Labels only: customerPays() keys on paid_by = 2, so the COD/balance gate is
  * untouched by the 1 and fallback rewordings.
  *
  * paidByLabel() converts whichever shape arrives (int from the DB, string
- * from older code paths, null) into the canonical human label. paidByIsCustomer()
- * is the single source of truth for the customer-paid customer-balance gate
- * applied in pickAutoAssignCandidate — accepts both 2 and 'Customer'/'customer'.
+ * from older code paths, null) into the canonical human label. customerPays()
+ * (next to it, below) is the single source of truth for both COD balance gates.
  */
 /*
  * Job Skill Matrix availability probe (2026-07-22).
@@ -2342,8 +2354,20 @@ function paidByLabel(raw) {
   if (s === 'easyfix')  return 'Easyfix';
   return 'Not Set';
 }
-function paidByIsCustomer(raw) {
-  return paidByLabel(raw) === 'Customer';
+/*
+ * customerPays(job) — does the customer pay the technician on site (COD)?
+ * The ONE answer for both cash gates: the Top-10 balance filter (isCod in
+ * rankCandidatesForJob) and the auto-assign pick (pickAutoAssignCandidate).
+ *
+ * EITHER signal is enough (product decision 2026-09-11):
+ *   paid_by = 2 (Customer)  OR  collected_by = 1 (the technician collects —
+ *   the CRM labels it "Paid By Customer", Easyfix_CRM_UI src/lib/collected-by.ts).
+ * paid_by alone almost never fired: on QA only 3,449 of the 82,371
+ * collected_by = 1 jobs also carry paid_by = 2. Both columns are tinyint;
+ * Number() still accepts a '1' string and reads null/absent as "not 1".
+ */
+function customerPays(job) {
+  return paidByLabel(job?.paid_by) === 'Customer' || Number(job?.collected_by) === 1;
 }
 
 /*
@@ -2351,7 +2375,7 @@ function paidByIsCustomer(raw) {
  *
  * Default behaviour: pick the top-ranked candidate.
  *
- * Customer-paid override: when the job's paid_by = Customer, the chosen
+ * Customer-paid override: when customerPays(job), the chosen
  * tech needs cash on hand to cover travel out-of-pocket — so we walk down
  * the ranked list and pick the first candidate whose current_balance is
  * AT LEAST the configured floor (default ₹500). If nobody meets the gate,
@@ -2362,16 +2386,25 @@ function paidByIsCustomer(raw) {
  * not an input to scoring. That keeps the modal consistent for human
  * operators (always see the best-ranked tech first) while giving auto-
  * assign the right cash-floor behaviour.
+ *
+ * paidBy / collectedBy default to the rank result's own job header (which
+ * carries both, see buildJobHeader): services/auto-assign.service.js passes
+ * only paidBy, and must still get the collected_by half of the gate.
  */
-function pickAutoAssignCandidate(rankResult, { paidBy, balanceFloor = DEFAULTS.ACCOUNT_BALANCE_FLOOR } = {}) {
+function pickAutoAssignCandidate(rankResult, {
+  paidBy = rankResult?.job?.paid_by,
+  collectedBy = rankResult?.job?.collected_by,
+  balanceFloor = DEFAULTS.ACCOUNT_BALANCE_FLOOR,
+} = {}) {
   const list = rankResult?.candidates ?? [];
-  logger.info('Pick auto-assign candidate · paymentMode=' + paidByLabel(paidBy) + ' candidates=' + list.length);
+  const cod = customerPays({ paid_by: paidBy, collected_by: collectedBy });
+  logger.info('Pick auto-assign candidate · paymentMode=' + paidByLabel(paidBy) + ' collectedBy=' + (collectedBy ?? '-') + ' cod=' + cod + ' candidates=' + list.length);
   if (!list.length) {
     logger.info('Auto-assign pick · none available');
     return null;
   }
 
-  if (!paidByIsCustomer(paidBy)) {
+  if (!cod) {
     logger.info('Auto-assign picked top rank · efr_id=' + list[0].efr_id);
     return { candidate: list[0], reason: 'top_rank', low_balance: false };
   }
@@ -2825,5 +2858,5 @@ module.exports = {
   DEFAULTS,
   // Exported for tests only: the Schedule & Assign header allowlist is the
   // thing that silently drifted, so it needs to be assertable directly.
-  _internals: { buildJobHeader, matrixRequiredSkillIds },
+  _internals: { buildJobHeader, matrixRequiredSkillIds, customerPays },
 };

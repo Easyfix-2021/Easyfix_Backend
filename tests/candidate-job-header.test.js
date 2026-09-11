@@ -32,6 +32,8 @@ const REQUIRED = [
   'city_id', 'city_name', 'pin_code',
   'service_category', 'service_type', 'deep_skill_label', 'services',
   'job_type', 'payment_mode', 'paid_by', 'paid_by_label', 'collected_by',
+  // Quantity row (2026-09-11): read by the panel, never projected until now.
+  'product_quantity',
   'requested_date_time', 'time_slot', 'booking_cut_off_time_slot',
   'job_desc', 'efr_special_notes',
   'created_by_name', 'created_date_time', 'assigned_efr_id',
