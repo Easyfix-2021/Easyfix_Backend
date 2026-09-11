@@ -1097,6 +1097,11 @@ router.post('/jobs/:id/checkout',
   } catch (e) {
     if (e.status) {
       logger.warn('Check out failed · id=' + req.params.id + ' · ' + e.message);
+      // The code travels too, in the same { error: { message, code } } shape as
+      // INVALID_CHECKOUT_PIN above — the app's api.ts reads it from there — so
+      // the app shows its translated "add an after photo" sentence on
+      // AFTER_PHOTO_REQUIRED (setStatus's every-close rule).
+      if (e.code === 'AFTER_PHOTO_REQUIRED') return modernError(res, e.status, { message: e.message, code: e.code });
       return modernError(res, e.status, e.message);
     }
     next(e);

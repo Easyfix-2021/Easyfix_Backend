@@ -2068,8 +2068,21 @@ router.post('/:id/hold/release', validate(idParam, 'params'), scopedJob, async (
      * Routing this through setStatus would re-fire it and tell Decathlon /
      * PowerMax / Green Soul that a second visit failed. Releasing a hold is a
      * restoration, not a new lifecycle event.
+     *
+     * But 10 is a CLOSED state, and a hold can be placed from any state — so
+     * Check In → Hold → Release reached Check Out with no photo, around the
+     * every-close proof rule in setStatus (2026-09-11). So: only a job that IS on
+     * hold (21) can be released, and it needs an after-work photo like any close.
      */
-    await pool.query('UPDATE tbl_job SET job_status = 10 WHERE job_id = ?', [req.params.id]);
+    if (Number(req.scopedJob.job_status) !== 21) {
+      return modernError(res, 409, 'This job is not on fulfillment hold.');
+    }
+    if (!(await job.hasAfterWorkPhoto(req.params.id))) {
+      logger.warn('Hold release refused, no after-work photo · jobId=' + req.params.id);
+      return next(job.afterPhotoRequiredError());
+    }
+    const [upd] = await pool.query('UPDATE tbl_job SET job_status = 10 WHERE job_id = ? AND job_status = 21', [req.params.id]);
+    if (!upd.affectedRows) return modernError(res, 409, 'This job is not on fulfillment hold.');
     logger.info('Fulfillment hold released · jobId=' + req.params.id + ' status=10');
     modernOk(res, { released: true, status: 10 });
   } catch (e) { next(e); }
@@ -3011,19 +3024,46 @@ const imageUpload = multerForImages({
   limits: { fileSize: 10 * 1024 * 1024, files: 1 },
 });
 
+/*
+ * `category` (a multipart text field): 'Booking' — the default, today's
+ * Book-New-Call attachment — or 'Completion', an AFTER-WORK PHOTO an operator
+ * adds so a job can be closed (2026-09-11: every close needs one, see
+ * setStatus). Stored lowercased as 'completion', an after category
+ * (utils/job-image-buckets.js); S3 key JobSupportings/Completion_<job>_<seq>.
+ *
+ * Completion is PROOF, so it takes its own RBAC key (isJobAfterPhotoUpload,
+ * migrations/2026-09-11-seed-job-after-photo-action.sql) and must be an image
+ * by its BYTES: the key has no extension, so the proof check's "not a PDF"
+ * test cannot see a PDF stored under it.
+ */
+const IMAGE_CATEGORIES = new Set(['Booking', 'Completion']);
+const afterPhotoGuard = requireAction('isJobAfterPhotoUpload');
+function imageCategory(req, res, next) {
+  const category = req.body && req.body.category ? String(req.body.category) : 'Booking';
+  if (!IMAGE_CATEGORIES.has(category)) return modernError(res, 400, 'category must be Booking or Completion');
+  req.imageCategory = category;
+  if (category !== 'Completion') return next();
+  const sniffed = req.file && require('../../services/job-image.service').sniffMime(req.file.buffer);
+  if (req.file && !(sniffed && sniffed.startsWith('image/'))) {
+    return modernError(res, 400, 'An after-work photo must be an image (PNG, JPEG, WEBP or GIF).');
+  }
+  return afterPhotoGuard(req, res, next);
+}
+
 router.post(
   '/:id/images',
   validate(idParam, 'params'),
   scopedJob,
   imageUpload.single('file'),
+  imageCategory,
   async (req, res, next) => {
     const jobId = Number(req.params.id);
     try {
       // Shared with the client Book-a-service route — one implementation of
-      // S3 (JobSupportings/Booking_<jobId>_<seq>) + local fallback + the
+      // S3 (JobSupportings/<Category>_<jobId>_<seq>) + local fallback + the
       // tbl_job_image insert.
       const result = await require('../../services/job-image.service').uploadJobImage({
-        jobId, file: req.file, category: 'Booking',
+        jobId, file: req.file, category: req.imageCategory,
       });
       uploadLogger.upload({ jobId, imageId: result.image_id, storage: result.storage, image: result.image }, 'job image row inserted');
       modernOk(res, result, 'image uploaded');

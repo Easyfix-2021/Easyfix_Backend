@@ -1,5 +1,5 @@
 /*
- * NO CRM CLOSE WITHOUT AN AFTER-WORK PHOTO — services/job.service.js setStatus.
+ * NO CLOSE WITHOUT AN AFTER-WORK PHOTO, IN ANY FLOW — services/job.service.js setStatus.
  *
  * The CRM's Check Out button closed job 538541 with no photo (11 Sep: Check In
  * then Check Out five seconds apart). The rule is in setStatus so no CRM
@@ -10,8 +10,9 @@
  *   - the photo test is the app's own after-photo predicate: after categories,
  *     no PDFs, bound job id;
  *   - moving between closed states (5 → 10 re-audit, 3 → 5) is not a close;
- *   - the technician app (efr actor) and the partner API (no actor) are
- *     unchanged — neither is asked;
+ *   - EVERY flow is held to it (owner: "every flow needs it") — the technician
+ *     app for completion AND the revisit outcome, and a caller with no actor —
+ *     except the partner API, the one explicit opt-out ({ partnerApi: true });
  *   - a transition that closes nothing costs no extra query;
  *   - the CRM receives the sentence and the code (error-handler passthrough).
  *
@@ -49,10 +50,10 @@ after(() => fake.restore());
 beforeEach(() => { fake.reset(); S.jobMeta = { ...META }; S.hasPhoto = false; });
 
 /** 'closed' when the job UPDATE was reached, else the error setStatus threw. */
-async function run(from, to, actor) {
+async function run(from, to, actor, opts) {
   S.jobMeta = { ...META, job_status: from };
   try {
-    await jobSvc.setStatus(42, { status: to }, actor);
+    await jobSvc.setStatus(42, { status: to }, actor, opts);
     return 'returned';                        // unreachable: stopOn fires first
   } catch (e) {
     if (e.__stop) return 'closed';
@@ -102,12 +103,29 @@ test('moving between closed states is not a close: re-audit 5 → 10, and 3 → 
   assert.equal(photoQueries().length, 0);
 });
 
-test('the technician app and the partner API are unchanged — neither is asked for a photo', async () => {
-  assert.equal(await run(2, 3, TECH), 'closed', 'technician completion');
-  assert.equal(await run(2, 10, TECH), 'closed', 'technician revisit outcome');
-  assert.equal(await run(2, 3, { user_id: 'efr:55' }), 'closed', 'efr:N principal');
-  assert.equal(await run(2, 3, { user_id: null }), 'closed', 'partner API');
-  assert.equal(photoQueries().length, 0);
+test('the technician app is held to it too — completion AND the revisit outcome, any efr principal', async () => {
+  for (const [to, actor] of [[3, TECH], [10, TECH], [3, { user_id: 'efr:55' }]]) {
+    fake.reset();
+    const e = await run(2, to, actor);
+    assert.equal(e && e.code, 'AFTER_PHOTO_REQUIRED', `technician 2 → ${to} must need a photo`);
+    assert.equal(jobUpdates().length, 0);
+  }
+  S.hasPhoto = true;
+  assert.equal(await run(2, 3, TECH), 'closed', 'with the photo the app attached, the close lands');
+});
+
+test('a caller with no actor is held to it; the partner API is the ONE opt-out', async () => {
+  const e = await run(2, 3, { user_id: null });
+  assert.equal(e && e.code, 'AFTER_PHOTO_REQUIRED', 'no actor is not an exemption — only the explicit flag is');
+  fake.reset();
+  assert.equal(await run(2, 3, { user_id: null }, { partnerApi: true }), 'closed', 'partner checkout: no change for external clients');
+  assert.equal(photoQueries().length, 0, 'the partner path is not even asked');
+});
+
+test('the partner route really passes the opt-out (routes/integration/v1 PATCH /jobs)', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, '..', 'routes', 'integration', 'v1', 'index.js'), 'utf8');
+  assert.match(src, /jobService\.setStatus\(\s*jobId, \{ status: newStatus, comment: req\.body\.comment \}, \{ user_id: null \}, \{ partnerApi: true \},?\s*\)/);
+  assert.equal(src.split(', { partnerApi: true }').length - 1, 1, 'exactly one call opts out');
 });
 
 test('a transition that closes nothing costs no photo query', async () => {
@@ -121,4 +139,13 @@ test('the CRM receives the sentence and AFTER_PHOTO_REQUIRED', async () => {
   errorHandler(e, { originalUrl: '/api/admin/jobs/42/status', method: 'PATCH' }, res, () => {});
   assert.equal(res.statusCode, 409);
   assert.deepEqual(res.body, { success: false, error: e.message, code: 'AFTER_PHOTO_REQUIRED' });
+});
+
+test('the technician checkout forwards the code, so the app can show its translated sentence', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, '..', 'routes', 'mobile', 'index.js'), 'utf8');
+  const start = src.indexOf("router.post('/jobs/:id/checkout'");
+  assert.ok(start !== -1, 'positive control: the checkout route exists');
+  const body = src.slice(start, src.indexOf('\n});', start));
+  // Same shape as INVALID_CHECKOUT_PIN — the app's api.ts reads error.code, not a top-level code.
+  assert.match(body, /if \(e\.code === 'AFTER_PHOTO_REQUIRED'\) return modernError\(res, e\.status, \{ message: e\.message, code: e\.code \}\);/);
 });

@@ -5105,28 +5105,37 @@ async function hasCallLaterColumn() {
 }
 
 /*
- * PROOF OF WORK ON A CRM CLOSE (2026-09-11).
+ * PROOF OF WORK ON EVERY CLOSE (2026-09-11).
  *
- * A CRM user moving a job INTO a closed state — Check Out (→ 10, Under Audit)
- * or Complete (→ 3 / 5) — must find at least one after-work photo on it. The
- * CRM's Check Out button closed jobs with none (job 538541, 11 Sep: Check In
- * then Check Out five seconds apart, no photo). The rule lives in setStatus,
- * not on a button, so no CRM surface — hidden today, re-enabled later, or new —
- * can close a job without proof.
+ * Moving a job INTO a closed state — Check Out / revisit outcome (→ 10) or
+ * Complete (→ 3 / 5) — needs at least one after-work photo on it. The CRM's
+ * Check Out button closed jobs with none (job 538541, 11 Sep: Check In then
+ * Check Out five seconds apart, no photo), and the owner's rule is "every flow
+ * needs it". It lives in setStatus, not on a button, so no surface — hidden
+ * today, re-enabled later, or new — can close a job without proof.
  *
  * "After-work photo" is the technician app's own read-model predicate
  * (services/mobile-phe.service.js): an after category (checkout / completion /
  * after — utils/job-image-buckets.js) and not a PDF. Images are hard-deleted,
- * so there is no status to filter.
+ * so there is no status to filter. Ops can supply one from the CRM
+ * (POST /api/admin/jobs/:id/images, category Completion).
  *
- * WHO IT APPLIES TO: CRM users only — jobLog.resolveActor gives a real tbl_user
- * id for them and 0 for a technician (efr:N) and for no actor. So the
- * technician app (it attaches its photos before /checkout, and its revisit
- * outcome also lands on 10 with nothing to photograph) and the partner API
- * (external clients must see no change — CLAUDE.md) are unchanged.
+ * WHO: every caller — the CRM and the technician app (which attaches its photos
+ * before /checkout) — EXCEPT the partner API, which passes { partnerApi: true }:
+ * external clients must notice no change (CLAUDE.md, the no-client-change rule).
+ * An opt-OUT, so a new caller is covered without remembering anything. The
+ * legacy Flutter app and legacy CRM write tbl_job directly, never through here.
  * Moving between closed states (5 → 10 re-audit, 3 ↔ 5) closes nothing new.
+ * POST /api/admin/jobs/:id/hold/release writes 10 directly and applies the same
+ * test through hasAfterWorkPhoto / afterPhotoRequiredError.
  */
-const CLOSED_FOR_PROOF = new Set([STATUS.COMPLETED, STATUS.COMPLETED_ALT, STATUS.REVISIT]); // REVISIT = the CRM's Check Out
+const CLOSED_FOR_PROOF = new Set([STATUS.COMPLETED, STATUS.COMPLETED_ALT, STATUS.REVISIT]);
+
+function afterPhotoRequiredError() {
+  const err = new Error('Add at least one after-work photo to this job before checking it out or completing it.');
+  err.status = 409; err.code = 'AFTER_PHOTO_REQUIRED';
+  return err;
+}
 
 async function hasAfterWorkPhoto(jobId) {
   const [rows] = await pool.query(
@@ -5140,7 +5149,7 @@ async function hasAfterWorkPhoto(jobId) {
   return rows.length > 0;
 }
 
-async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
+async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { partnerApi = false } = {}) {
   logger.info('Set job status · id=' + jobId + ' · status=' + status + (reasonId != null ? ' · reasonId=' + reasonId : ''));
   if (!ALL_STATUS_VALUES.has(Number(status))) {
     logger.warn('Set status rejected, invalid status · id=' + jobId + ' · status=' + status);
@@ -5156,11 +5165,10 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor) {
   const closesJob = CLOSED_FOR_PROOF.has(Number(status))
     && !COMPLETED_STATES.has(Number(existing.job_status))
     && Number(existing.job_status) !== Number(status);
-  if (closesJob && jobLog.resolveActor(actor).changedBy > 0 && !(await hasAfterWorkPhoto(jobId))) {
+  if (closesJob && !partnerApi && !(await hasAfterWorkPhoto(jobId))) {
     logger.warn('Close refused, no after-work photo · id=' + jobId + ' · ' + existing.job_status + '->' + Number(status)
-      + ' · by=' + actor.user_id);
-    const err = new Error('Add at least one after-work photo to this job before checking it out or completing it.');
-    err.status = 409; err.code = 'AFTER_PHOTO_REQUIRED'; throw err;
+      + ' · by=' + ((actor && (actor.efr_id ? 'efr:' + actor.efr_id : actor.user_id)) || 'none'));
+    throw afterPhotoRequiredError();
   }
 
   const sets = ['job_status = ?', 'last_update_time = ?'];
@@ -7241,6 +7249,7 @@ module.exports = {
   // mutates tbl_job_services. Single source of truth, one helper.
   recomputeClientServicesCsv,
   list, getById, getByIdCore, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, reschedule, unassign, acceptOffer, changeOwner,
+  hasAfterWorkPhoto, afterPhotoRequiredError,
   // THE OFFER MODEL (pool offers): offer one job to many techs, list a job's
   // open offers, and list a tech's open offers.
   offerToTechnicians, listOffers, listOfferedForTech, techHasOpenOffer, rejectOffer,
