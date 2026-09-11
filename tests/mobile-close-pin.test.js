@@ -178,3 +178,147 @@ test('the closing-PIN gate lives in the mobile route ONLY', async () => {
   assert.ok(!adminJobs.includes('INVALID_CHECKOUT_PIN'),
     'ops must be able to close a job the technician could not');
 });
+
+// ─── The guess cap on the closing PIN (2026-09-11) ───────────────────
+/*
+ * 5 attempts per JOB per 30 minutes (routes/mobile/index.js
+ * checkoutPinAttempts). Without it the assigned technician could try every
+ * four-digit PIN and close the job without the customer. Each test uses its
+ * own job id: the window is per job and lives for the whole process, and the
+ * tests above already spent attempts on job 42.
+ */
+async function checkoutJob(id, body) {
+  jobService.getById = async (jobId) => ({ ...JOB, job_id: Number(jobId) });
+  try {
+    const r = await fetch(`${baseUrl}/mobile/jobs/${id}/checkout`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return { status: r.status, body: await r.json() };
+  } finally {
+    jobService.getById = async () => ({ ...JOB });
+  }
+}
+
+test('each wrong PIN says how many attempts are left; the 5th locks, and then even the RIGHT PIN is refused', async () => {
+  for (let left = 4; left >= 1; left--) {
+    const r = await checkoutJob(101, { otp: '0000' });
+    assert.equal(r.status, 409);
+    assert.equal(r.body.error.code, 'INVALID_CHECKOUT_PIN', 'the app shows this code as a PIN-field error');
+    assert.equal(r.body.error.reason, 'PIN_MISMATCH');
+    assert.equal(r.body.error.attemptsRemaining, left);
+    assert.match(r.body.error.message, new RegExp(`${left} attempts? left`));
+  }
+  const fifth = await checkoutJob(101, { otp: '0000' });
+  assert.equal(fifth.body.error.reason, 'PIN_ATTEMPTS_EXCEEDED');
+  assert.equal(fifth.body.error.retryAfterMinutes, 30);
+  assert.match(fifth.body.error.message, /Try again in 30 minutes/);
+  const right = await checkoutJob(101, { otp: '1234' });
+  assert.equal(right.status, 409, 'a locked job refuses without comparing');
+  assert.equal(right.body.error.reason, 'PIN_ATTEMPTS_EXCEEDED');
+  assert.equal(captured, null, 'no status write while locked');
+});
+
+test('the lock lifts by itself after 30 minutes', async () => {
+  for (let i = 0; i < 5; i++) await checkoutJob(102, { otp: '0000' });
+  const realNow = Date.now;
+  Date.now = () => realNow() + 31 * 60_000;
+  try {
+    const r = await checkoutJob(102, { otp: '1234' });
+    assert.equal(r.status, 200, 'the window has passed');
+    assert.equal(captured.status, 3);
+  } finally { Date.now = realNow; }
+});
+
+test('a missing PIN is not a guess — it never counts toward the lock', async () => {
+  for (let i = 0; i < 10; i++) {
+    const r = await checkoutJob(103, {});
+    assert.equal(r.body.error.reason, 'PIN_MISSING');
+  }
+  const r = await checkoutJob(103, { otp: '1234' });
+  assert.equal(r.status, 200);
+});
+
+test('the right PIN clears the count', async () => {
+  for (let i = 0; i < 4; i++) await checkoutJob(104, { otp: '0000' });
+  assert.equal((await checkoutJob(104, { otp: '1234' })).status, 200);
+  const next = await checkoutJob(104, { otp: '0000' });
+  assert.equal(next.body.error.attemptsRemaining, 4, 'a fresh window after a success');
+});
+
+test('twenty parallel wrong PINs are compared at most five times', async () => {
+  // The claim and the compare run with no await between them, so however the
+  // requests interleave on getById's await, only five ever reach the compare.
+  const rs = await Promise.all(Array.from({ length: 20 }, () => checkoutJobParallel(105, { otp: '0000' })));
+  const reasons = rs.map((r) => r.body.error.reason);
+  assert.equal(reasons.filter((x) => x === 'PIN_MISMATCH').length, 4, reasons.join(','));
+  assert.equal(reasons.filter((x) => x === 'PIN_ATTEMPTS_EXCEEDED').length, 16);
+  assert.equal((await checkoutJobParallel(105, { otp: '1234' })).body.error.reason, 'PIN_ATTEMPTS_EXCEEDED');
+});
+
+// Parallel variant: getById stays swapped for the whole burst (checkoutJob
+// resets it per call, which would race).
+async function checkoutJobParallel(id, body) {
+  jobService.getById = async (jobId) => {
+    await new Promise((r) => setImmediate(r));   // a real await, so requests interleave
+    return { ...JOB, job_id: Number(jobId) };
+  };
+  const r = await fetch(`${baseUrl}/mobile/jobs/${id}/checkout`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return { status: r.status, body: await r.json() };
+}
+
+// ─── Nowhere else to read or test the PIN (2026-09-11) ───────────────
+/*
+ * A guess cap on the close is only a cap if the PIN cannot be READ, and cannot
+ * be TESTED somewhere uncapped. Found by a sweep of all 38 technician job
+ * routes: GET /jobs/:id sent the raw `otp` column (to the assigned tech, to
+ * anyone holding an open offer, to delegates), GET /jobs/search sent it as
+ * `checkinPin`, and a PIN volunteered at check-in came back as `pinMatched`
+ * with no limit — an oracle for the close.
+ */
+async function postJob(id, action, body) {
+  jobService.getById = async (jobId) => ({ ...JOB, job_id: Number(jobId) });
+  try {
+    const r = await fetch(`${baseUrl}/mobile/jobs/${id}/${action}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return { status: r.status, body: await r.json() };
+  } finally {
+    jobService.getById = async () => ({ ...JOB });
+  }
+}
+
+test('the job detail never carries the PIN', async () => {
+  const r = await fetch(`${baseUrl}/mobile/jobs/42`);
+  const body = await r.json();
+  assert.equal(r.status, 200, 'positive control: the job was served');
+  assert.equal(body.data.job_id, 42);
+  assert.ok(!('otp' in body.data), 'tbl_job.otp must not reach the device');
+  assert.ok(!JSON.stringify(body).includes(JOB.otp), 'the PIN value appears nowhere in the payload');
+});
+
+test('a PIN volunteered at check-in spends the SAME budget as the close — check-in is no oracle', async () => {
+  for (let i = 0; i < 5; i++) {
+    const r = await postJob(106, 'checkin', { otp: '0000' });
+    assert.equal(r.status, 200, 'the PIN never blocks check-in');
+    assert.equal(r.body.data.pinMatched, false);
+  }
+  const right = await postJob(106, 'checkin', { otp: '1234' });
+  assert.equal(right.status, 200, 'still checks in');
+  assert.equal(right.body.data.pinMatched, null, 'locked: "not checked", never a verdict');
+  const close = await checkoutJob(106, { otp: '1234' });
+  assert.equal(close.body.error.reason, 'PIN_ATTEMPTS_EXCEEDED', 'the guesses at check-in locked the close too');
+});
+
+test('a right PIN at check-in says so and clears the budget', async () => {
+  for (let i = 0; i < 3; i++) await postJob(107, 'checkin', { otp: '0000' });
+  assert.equal((await postJob(107, 'checkin', { otp: '1234' })).body.data.pinMatched, true);
+  assert.equal((await checkoutJob(107, { otp: '0000' })).body.error.attemptsRemaining, 4);
+});

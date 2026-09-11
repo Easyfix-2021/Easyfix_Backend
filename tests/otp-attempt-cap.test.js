@@ -22,10 +22,13 @@
  *      "30 minutes" into "never" or "always".
  *   4. retryAfterMinutes ROUNDS UP and is never 0 — "try again in 0 minutes"
  *      while still refusing is the message that makes users think it is broken.
- *   5. EVERY place a stored code is compared goes through the cap, checked per
+ *   5. EVERY place a stored code is compared goes through a cap, checked per
  *      site against the source's real structure (parsed, not pattern-matched):
  *      the claim, a refusal that RETURNS before the compare, the read after a
  *      miss, the clear after success — all inside the same verify function.
+ *      That covers the otp_details verifies (SQL claim) and the two codes with
+ *      no otp_details row — the profile/bank OTP and the closing PIN — which
+ *      use an in-memory window and must not await between claim and compare.
  *   6. RESEND DOES NOT RESET. No claim or clear may live in a function that does
  *      not itself compare a code — that is where a send path's reset would go.
  *
@@ -229,67 +232,88 @@ function walk(node, parent, visit) {
 const isFn = (n) => /^(FunctionDeclaration|FunctionExpression|ArrowFunctionExpression)$/.test(n.type);
 const enclosingFn = (n) => { let p = n.parent; while (p && !isFn(p)) p = p.parent; return p; };
 const inside = (inner, outer) => inner.range[0] >= outer.range[0] && inner.range[1] <= outer.range[1];
-const attemptsCall = (n, fn) => n.type === 'CallExpression' && n.callee.type === 'MemberExpression'
-  && n.callee.object.type === 'Identifier' && n.callee.object.name === 'otpAttempts'
+const isCall = (n, [obj, fn]) => !!n && n.type === 'CallExpression' && n.callee.type === 'MemberExpression'
+  && n.callee.object.type === 'Identifier' && n.callee.object.name === obj
   && n.callee.property.name === fn;
 /*
- * The structural marker: a compare of a STORED code against the submitted one —
- * `Number(row.otp) !== …` or `Number(row.profile_update_otp) !== …`. Every OTP
- * verify has to do this, whatever it is called. tech-auth's second, in-lock
- * compare (`current.otp`) is deliberately not matched — it fires on a
- * concurrent re-issue, not a guess.
+ * The structural marker: a compare of a STORED code against the submitted one.
+ * Two shapes exist — `Number(row.otp | row.profile_update_otp) !== …` (the OTP
+ * verifies) and `jobPin !== submittedPin` (the closing PIN, routes/mobile).
+ * tech-auth's second, in-lock compare (`current.otp`) is deliberately not
+ * matched — it fires on a concurrent re-issue, not a guess.
  */
-const isCompare = (n) => n.type === 'BinaryExpression' && n.operator === '!=='
-  && n.left.type === 'CallExpression' && n.left.callee.name === 'Number'
-  && n.left.arguments[0] && n.left.arguments[0].type === 'MemberExpression'
-  && n.left.arguments[0].object.name === 'row'
-  && /^(otp|profile_update_otp)$/.test(n.left.arguments[0].property.name);
+const storedVsSubmitted = (n) => n.type === 'BinaryExpression' && (
+  (n.left.type === 'CallExpression' && n.left.callee.name === 'Number'
+    && n.left.arguments[0] && n.left.arguments[0].type === 'MemberExpression'
+    && n.left.arguments[0].object.name === 'row'
+    && /^(otp|profile_update_otp)$/.test(n.left.arguments[0].property.name))
+  || (n.left.type === 'Identifier' && n.left.name === 'jobPin'
+    && n.right.type === 'Identifier' && n.right.name === 'submittedPin'));
+// A refusing verify: `if (stored !== submitted) { … }`.
+const isCompare = (n) => storedVsSubmitted(n) && n.operator === '!==';
+// A verdict-only check: check-in's `jobPin === submittedPin` answers pinMatched
+// and never refuses. It spends the same budget, so it is a verify site too.
+const isVerdict = (n) => storedVsSubmitted(n) && n.operator === '===';
 /*
- * The one compare the cap cannot cover: the technician profile-update OTP is
- * stored on tbl_easyfixer, not in otp_details, so there is no row for
- * failed_attempts to count on. Named here so the gap stays visible, and fenced
- * to exactly one site so it cannot quietly grow.
+ * How each store is capped. otp_details codes go through the SQL claim
+ * (services/otp-attempts.service.js). The two codes with no otp_details row —
+ * the profile/bank OTP on tbl_easyfixer, the closing PIN on tbl_job — use an
+ * in-memory attemptWindow (middleware/rate-limit.js), whose claim is atomic
+ * only if NO await separates it from the compare.
  */
-const UNCAPPED = { 'services/easyfixer-profile-otp.service.js': 1 };
+const SQL = { claim: ['otpAttempts', 'claimAttempt'], read: ['otpAttempts', 'lockState'],
+  clear: ['otpAttempts', 'clearAttempts'], lockMark: /OTP_ATTEMPTS_EXCEEDED/, inMemory: false };
+const API_BY_FILE = {
+  'services/easyfixer-profile-otp.service.js': { claim: ['profileOtpAttempts', 'claim'], read: ['profileOtpAttempts', 'state'],
+    clear: ['profileOtpAttempts', 'clear'], lockMark: /OTP_ATTEMPTS_EXCEEDED/, inMemory: true },
+  'routes/mobile/index.js': { claim: ['checkoutPinAttempts', 'claim'], read: ['checkoutPinAttempts', 'state'],
+    clear: ['checkoutPinAttempts', 'clear'], lockMark: /pinLocked/, inMemory: true },
+};
+const apiFor = (file) => API_BY_FILE[file] || SQL;
 
-const scan = { files: 0, sites: [], calls: [] };
+const scan = { files: 0, sites: [], verdicts: [], calls: [], legacy: [] };
 for (const f of [...jsFiles(path.join(ROOT, 'services')), ...jsFiles(path.join(ROOT, 'routes'))]) {
   const rel = path.relative(ROOT, f);
   const ast = espree.parse(fs.readFileSync(f, 'utf8'), { ecmaVersion: 'latest', sourceType: 'script', range: true, loc: true });
   scan.files += 1;
   walk(ast, null, (n) => {
     if (isCompare(n)) scan.sites.push({ file: rel, node: n, fn: enclosingFn(n) });
-    for (const name of ['claimAttempt', 'clearAttempts', 'lockState', 'recordFailedAttempt']) {
-      if (attemptsCall(n, name)) scan.calls.push({ file: rel, name, node: n, fn: enclosingFn(n) });
+    if (isVerdict(n)) scan.verdicts.push({ file: rel, node: n, fn: enclosingFn(n) });
+    for (const api of [SQL, ...Object.values(API_BY_FILE)]) {
+      if (isCall(n, api.claim)) scan.calls.push({ file: rel, kind: 'claim', node: n, fn: enclosingFn(n) });
+      if (isCall(n, api.clear)) scan.calls.push({ file: rel, kind: 'clear', node: n, fn: enclosingFn(n) });
     }
+    if (isCall(n, ['otpAttempts', 'recordFailedAttempt'])) scan.legacy.push({ file: rel, node: n });
   });
 }
-const capped = scan.sites.filter((s) => !UNCAPPED[s.file]);
 const where = (s) => `${s.file}:${s.node.loc.start.line}`;
 function collect(root, pred) { const out = []; walk(root, root.parent, (n) => { if (pred(n)) out.push(n); }); return out; }
 
 test('the parse saw the codebase — positive control on the locator', () => {
   assert.ok(scan.files > 100, `expected the services and routes, parsed ${scan.files} files`);
-  assert.ok(capped.length >= 6, `expected at least 6 capped compare sites, found ${capped.length}`);
-});
-
-test('the uncapped profile-update OTP is exactly the one known site', () => {
-  for (const [file, n] of Object.entries(UNCAPPED)) {
-    assert.equal(scan.sites.filter((s) => s.file === file).length, n,
-      `${file}: expected exactly ${n} compare site(s) outside the cap — a new one needs the cap`);
+  const bySql = scan.sites.filter((s) => !API_BY_FILE[s.file]).length;
+  assert.ok(bySql >= 6, `expected at least 6 otp_details compare sites, found ${bySql}`);
+  for (const file of Object.keys(API_BY_FILE)) {
+    assert.equal(scan.sites.filter((s) => s.file === file).length, 1, `${file}: expected exactly its one compare site`);
   }
 });
 
-test('every other compare CLAIMS first, REFUSES a lock by returning, reads after a miss, clears after success', () => {
-  for (const s of capped) {
+test('every compare CLAIMS first, REFUSES a lock by returning, reads after a miss, clears after success', () => {
+  for (const s of scan.sites) {
     const at = where(s);
+    const api = apiFor(s.file);
     assert.ok(s.fn, `${at}: compare outside any function`);
     // (a) the claim, before the compare, in the same function
     const claim = collect(s.fn, (n) => n.type === 'VariableDeclarator' && n.init
-      && n.init.type === 'AwaitExpression' && attemptsCall(n.init.argument, 'claimAttempt')
+      && (isCall(n.init, api.claim) || (n.init.type === 'AwaitExpression' && isCall(n.init.argument, api.claim)))
       && n.range[1] < s.node.range[0]);
-    assert.equal(claim.length, 1, `${at}: expected exactly one \`const x = await otpAttempts.claimAttempt(...)\` before the compare`);
+    assert.equal(claim.length, 1, `${at}: expected exactly one \`const x = ${api.claim.join('.')}(...)\` before the compare`);
     const v = claim[0].id.name;
+    // (a') in memory, nothing may await between the claim and the compare
+    if (api.inMemory) {
+      const gap = collect(s.fn, (n) => n.type === 'AwaitExpression' && n.range[0] > claim[0].range[1] && n.range[1] < s.node.range[0]);
+      assert.equal(gap.length, 0, `${at}: an await between the in-memory claim and the compare lets parallel guesses overshoot`);
+    }
     // (b) `if (x.locked) … return` between the claim and the compare
     const refusal = collect(s.fn, (n) => n.type === 'IfStatement'
       && n.test.type === 'MemberExpression' && n.test.object.name === v && n.test.property.name === 'locked'
@@ -302,22 +326,34 @@ test('every other compare CLAIMS first, REFUSES a lock by returning, reads after
     let ifNode = s.node.parent; while (ifNode && ifNode.type !== 'IfStatement') ifNode = ifNode.parent;
     assert.ok(ifNode && inside(s.node, ifNode.test), `${at}: the compare must be an if's condition`);
     const miss = ifNode.consequent;
-    assert.ok(collect(miss, (n) => attemptsCall(n, 'lockState')).length === 1, `${at}: a miss must read lockState for what to say`);
-    const src = JSON.stringify(collect(miss, (n) => n.type === 'Literal' || n.type === 'Identifier').map((n) => n.value || n.name));
-    assert.match(src, /OTP_ATTEMPTS_EXCEEDED/, `${at}: the 5th miss must say when the lock lifts`);
-    assert.match(src, /attemptsRemaining/, `${at}: a miss must say how many attempts are left`);
+    assert.equal(collect(miss, (n) => isCall(n, api.read)).length, 1, `${at}: a miss must read ${api.read.join('.')} for what to say`);
+    const words = JSON.stringify(collect(miss, (n) => n.type === 'Literal' || n.type === 'Identifier').map((n) => n.value || n.name));
+    assert.match(words, api.lockMark, `${at}: the 5th miss must say when the lock lifts`);
+    assert.match(words, /attemptsRemaining/, `${at}: a miss must say how many attempts are left`);
     // (d) success clears, after the miss branch, in the same function
-    const clear = collect(s.fn, (n) => attemptsCall(n, 'clearAttempts') && n.range[0] > ifNode.range[1]);
+    const clear = collect(s.fn, (n) => isCall(n, api.clear) && n.range[0] > ifNode.range[1]);
     assert.equal(clear.length, 1, `${at}: success must clear the window exactly once`);
   }
 });
 
+test('a verdict-only PIN check claims first too, with no await before the compare', () => {
+  // check-in's pinMatched: without a claim it was an unlimited oracle for the close.
+  assert.ok(scan.verdicts.length >= 1, 'positive control: the check-in verdict was found');
+  for (const s of scan.verdicts) {
+    const at = where(s);
+    const api = apiFor(s.file);
+    const claims = collect(s.fn, (n) => isCall(n, api.claim) && n.range[1] < s.node.range[0]);
+    assert.equal(claims.length, 1, `${at}: a verdict must be claimed against ${api.claim.join('.')} first`);
+    const gap = collect(s.fn, (n) => n.type === 'AwaitExpression' && n.range[0] > claims[0].range[1] && n.range[1] < s.node.range[0]);
+    assert.equal(gap.length, 0, `${at}: nothing may await between the claim and the compare`);
+  }
+});
+
 test('no claim or clear outside a verify — so neither a Resend nor anything else resets the count', () => {
-  const verifyFns = new Set(capped.map((s) => s.fn));
-  const stray = scan.calls.filter((c) => (c.name === 'claimAttempt' || c.name === 'clearAttempts')
-    && ![...verifyFns].some((f) => inside(c.node, f)));
-  assert.deepEqual(stray.map((c) => `${c.file}:${c.node.loc.start.line} ${c.name}`), [],
+  const verifyFns = [...scan.sites, ...scan.verdicts].map((s) => s.fn);
+  const stray = scan.calls.filter((c) => !verifyFns.some((f) => inside(c.node, f)));
+  assert.deepEqual(stray.map((c) => `${c.file}:${c.node.loc.start.line} ${c.kind}`), [],
     'a claim or clear in a function that compares no code is a reset outside a verify');
-  assert.equal(scan.calls.filter((c) => c.name === 'recordFailedAttempt').length, 0,
+  assert.equal(scan.legacy.length, 0,
     'recordFailedAttempt is gone — counting after the compare is the race the claim replaced');
 });

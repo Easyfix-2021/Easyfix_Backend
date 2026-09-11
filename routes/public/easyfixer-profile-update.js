@@ -28,7 +28,7 @@ const { verifyEasyfixerProfileToken } = require('../../utils/jwt');
 const profileUpdateLink = require('../../services/easyfixer-profile-update-link.service');
 const pincodeService = require('../../services/pincode.service');
 const otpSvc = require('../../services/easyfixer-profile-otp.service');
-const { modernOk, modernError } = require('../../utils/response');
+const { modernOk, modernError, otpGuessCapError } = require('../../utils/response');
 const validate = require('../../middleware/validate');
 const { rateLimit } = require('../../middleware/rate-limit');
 const logger = require('../../logger');
@@ -221,10 +221,12 @@ router.put(
           logger.warn('Easyfixer profile save rejected · OTP required but missing');
           return modernError(res, 400, 'OTP is required');
         }
-        const { valid } = await otpSvc.verifyOtp(efrId, req.body.otp, pool);
-        if (!valid) {
-          logger.warn('Easyfixer profile save rejected · invalid or expired OTP');
-          return modernError(res, 400, 'Invalid or expired OTP');
+        const otpResult = await otpSvc.verifyOtp(efrId, req.body.otp, pool);
+        if (!otpResult.valid) {
+          logger.warn('Easyfixer profile save rejected · ' + (otpResult.reason || 'invalid or expired OTP'));
+          // 400 for a wrong code, as before: the page keeps its OTP box open
+          // only on 400, and reads a 401 as "this link has expired".
+          return otpGuessCapError(res, otpResult, 400) || modernError(res, 400, 'Invalid or expired OTP');
         }
       }
 

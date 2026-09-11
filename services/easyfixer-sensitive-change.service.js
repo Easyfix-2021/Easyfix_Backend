@@ -39,6 +39,7 @@ const kyc = require('./mobile-kyc.service');
 const profileOtp = require('./easyfixer-profile-otp.service');
 const { getProperty } = require('./properties.service');
 const { matchNames } = require('../utils/name-match');
+const { otpGuessCapOutcome } = require('../utils/response');
 
 const SOURCE_CRM = 'crm';
 const SOURCE_APP = 'app';
@@ -411,10 +412,12 @@ async function changeBank(efrId, body, actor, ctx = {}) {
   const otpRequired = body.otp != null
     || (source === SOURCE_APP ? appOtpRequired() : crmOtpRequired());
   if (otpRequired) {
-    const { valid } = await profileOtp.verifyOtp(efrId, body.otp, db);
-    if (!valid) {
-      logger.warn('Change easyfixer bank rejected · efrId=' + efrId + ' · OTP invalid or expired');
-      throw httpError(400, 'Invalid or expired OTP');
+    const otpResult = await profileOtp.verifyOtp(efrId, body.otp, db);
+    if (!otpResult.valid) {
+      logger.warn('Change easyfixer bank rejected · efrId=' + efrId + ' · ' + (otpResult.reason || 'OTP invalid or expired'));
+      // 429 with the minutes, or "N attempts left" at the 400 this always used.
+      const capped = otpGuessCapOutcome(otpResult, 400);
+      throw httpError(capped ? capped.status : 400, capped ? capped.error : 'Invalid or expired OTP');
     }
   }
 
