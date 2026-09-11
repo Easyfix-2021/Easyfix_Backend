@@ -4,6 +4,7 @@ const ttlCache = require('../utils/ttl-cache');
 const { resolveLoginOtp, staticLoginOtpFor, otpExpiryDate } = require('../utils/otp');
 const { signUserToken } = require('../utils/jwt');
 const { istIsPast } = require('../utils/ist-calendar');
+const otpAttempts = require('./otp-attempts.service');
 
 /*
  * Auth model reality (2026-04-17):
@@ -297,6 +298,12 @@ async function createLoginOtp(identifier) {
         WHERE id = ?`,
       [otp, now, expires, existing.id]
     );
+    /* A NEW code gets a FRESH guess budget — see services/otp-attempts.service.js.
+     * Separate call rather than `failed_attempts = 0` in the UPDATE above: that
+     * column does not exist until the migration runs, and naming it here would
+     * 500 every OTP request in the meantime. Without the reset the cap counts per
+     * ROW rather than per CODE, and "Resend OTP" stops being able to help. */
+    await otpAttempts.clearAttempts(existing.id);
   } else {
     // First-ever OTP for this (email, mobile, otp_type) tuple — fresh INSERT.
     // We do NOT fall back to "INSERT if any partial-row exists" because
@@ -423,7 +430,21 @@ async function verifyLoginOtp(identifier, otp) {
     await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
     return { ok: false, reason: 'OTP_EXPIRED' };
   }
-  if (Number(row.otp) !== Number(otp)) return { ok: false, reason: 'OTP_MISMATCH' };
+  /*
+   * THE GUESS CAP. utils/otp.js has declared OTP_MAX_ATTEMPTS = 5 since it was
+   * written and nothing read it; a 4-digit code with a 5-minute window and no
+   * cap is ~10,000 guesses. Checked BEFORE the comparison so an exhausted code
+   * cannot be brute-forced further, and counted only on a genuine mismatch.
+   * Inactive (and silent) until the failed_attempts migration runs.
+   */
+  if (await otpAttempts.isLockedOut(row.id)) {
+    logger.warn('Login OTP refused · reason=OTP_ATTEMPTS_EXCEEDED · user_id=' + user.user_id);
+    return { ok: false, reason: 'OTP_ATTEMPTS_EXCEEDED' };
+  }
+  if (Number(row.otp) !== Number(otp)) {
+    await otpAttempts.recordFailedAttempt(row.id);
+    return { ok: false, reason: 'OTP_MISMATCH' };
+  }
 
   // Consume the OTP so it can't be reused.
   await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);

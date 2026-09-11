@@ -2,6 +2,7 @@ const { pool } = require('../db');
 const logger = require('../logger');
 const { resolveMobileOtp, otpExpiryDate } = require('../utils/otp');
 const { istIsPast } = require('../utils/ist-calendar');
+const otpAttempts = require('./otp-attempts.service');
 
 /*
  * Action-OTP service — sends a one-time code to the CURRENTLY logged-in
@@ -75,6 +76,12 @@ async function sendActionOtp(admin, action) {
         WHERE id = ?`,
       [otp, now, expires, existing.id],
     );
+    /* A NEW code gets a FRESH guess budget — see services/otp-attempts.service.js.
+     * Separate call rather than `failed_attempts = 0` in the UPDATE above: that
+     * column does not exist until the migration runs, and naming it here would
+     * 500 every OTP request in the meantime. Without the reset the cap counts per
+     * ROW rather than per CODE, and "Resend OTP" stops being able to help. */
+    await otpAttempts.clearAttempts(existing.id);
   } else {
     await pool.query(
       `INSERT INTO otp_details
@@ -143,7 +150,14 @@ async function verifyActionOtp(admin, action, otp) {
     await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
     return { valid: false, reason: 'OTP_EXPIRED' };
   }
-  if (Number(row.otp) !== Number(otp)) return { valid: false, reason: 'OTP_MISMATCH' };
+  // Guess cap — see services/otp-attempts.service.js.
+  if (await otpAttempts.isLockedOut(row.id)) {
+    return { valid: false, reason: 'OTP_ATTEMPTS_EXCEEDED' };
+  }
+  if (Number(row.otp) !== Number(otp)) {
+    await otpAttempts.recordFailedAttempt(row.id);
+    return { valid: false, reason: 'OTP_MISMATCH' };
+  }
 
   await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
   logger.info('Action OTP verified · action=' + action);

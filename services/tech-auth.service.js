@@ -5,6 +5,7 @@ const jwt = require('jsonwebtoken');
 const easyfixerLifecycle = require('./easyfixer-lifecycle.service');
 const { withMysqlNamedLock } = require('./mysql-named-lock.service');
 const { istIsPast } = require('../utils/ist-calendar');
+const otpAttempts = require('./otp-attempts.service');
 const {
   TECH_ROLE_ID,
   createCanonicalTechnicianUser,
@@ -303,6 +304,12 @@ async function createLoginOtp(mobile) {
           WHERE id = ?`,
         [otp, now, expires, existing.id]
       );
+      /* A NEW code gets a FRESH guess budget — see services/otp-attempts.service.js.
+       * Separate call rather than `failed_attempts = 0` in the UPDATE above: that
+       * column does not exist until the migration runs, and naming it here would
+       * 500 every OTP request in the meantime. Without the reset the cap counts per
+       * ROW rather than per CODE, and "Resend OTP" stops being able to help. */
+      await otpAttempts.clearAttempts(existing.id);
     } else {
       await runner.query(
         `INSERT INTO otp_details (otp, otp_type, user_email, user_mobile_no, generated_on, valid_up_to, is_expired, count)
@@ -418,8 +425,14 @@ async function verifyLoginOtp(mobile, otp, { onVerifiedTech } = {}) {
     logger.warn('OTP verify failed · reason=OTP_EXPIRED');
     return { ok: false, reason: 'OTP_EXPIRED' };
   }
+  // Guess cap — see services/otp-attempts.service.js.
+  if (await otpAttempts.isLockedOut(row.id)) {
+    logger.warn('OTP verify refused · reason=OTP_ATTEMPTS_EXCEEDED');
+    return { ok: false, reason: 'OTP_ATTEMPTS_EXCEEDED' };
+  }
   if (Number(row.otp) !== Number(otp)) {
     logger.warn('OTP verify failed · reason=OTP_MISMATCH');
+    await otpAttempts.recordFailedAttempt(row.id);
     return { ok: false, reason: 'OTP_MISMATCH' };
   }
 

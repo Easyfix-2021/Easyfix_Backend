@@ -79,6 +79,34 @@ const OFFER_CLOSED_REASON_LABEL = Object.freeze({
 const OFFER_CLOSED_REASON_MAX_LENGTH = 40;
 
 /*
+ * ...AND THE CONSTANT IS NOW ENFORCED, at require time, over the enum it
+ * describes.
+ *
+ * It was declared and exported on the day this file was written and read by
+ * nothing — found by scripts/dead-exports.js. The value is real: the column is
+ * VARCHAR(40), and MySQL would truncate or reject a longer reason depending on
+ * strict mode. No write path can violate it today, because closedReasonSet()
+ * only accepts OFFER_CLOSED_REASON's values. The ONE way to break it is to ADD
+ * a reason longer than the column — an edit a few lines above this, with
+ * nothing to stop it.
+ *
+ * So the check lives here, not at the write: it fires at boot, on the edit
+ * that could cause it, instead of on some technician's failed offer weeks
+ * later. Throwing at require is deliberate — a reason that cannot be stored
+ * cannot be read back, and a silent truncation in an audit column is worse
+ * than a container that refuses to start with this message in its log.
+ */
+for (const value of Object.values(OFFER_CLOSED_REASON)) {
+  if (String(value).length > OFFER_CLOSED_REASON_MAX_LENGTH) {
+    throw new Error(
+      `offer closed_reason "${value}" is ${String(value).length} chars, but `
+      + `tbl_job_offer.closed_reason is VARCHAR(${OFFER_CLOSED_REASON_MAX_LENGTH}). `
+      + 'Shorten the value or widen the column — do not let it truncate.',
+    );
+  }
+}
+
+/*
  * ─── THE COLUMN PROBE LIVES HERE, NOT IN EACH CALLER ───────────────────────
  *
  * Three files close offers (job.service, job-offer-persistence,

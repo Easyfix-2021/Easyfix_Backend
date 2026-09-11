@@ -1,0 +1,57 @@
+-- ─────────────────────────────────────────────────────────────────────
+-- 2026-09-10 — Give OTP_MAX_ATTEMPTS something to count.
+--
+-- WHAT WAS WRONG: utils/otp.js has declared `OTP_MAX_ATTEMPTS = 5` since it
+-- was written, exported it, and NOTHING has ever read it. There is no
+-- attempt cap on any of the four OTP login paths — CRM, client, technician
+-- and the action-OTP flow all compare the submitted code to the stored one
+-- and return OTP_MISMATCH, unboundedly. A 4-digit OTP with a 5-minute TTL
+-- and no cap is ~10,000 guesses against a live window.
+--
+-- The unused constant was the only evidence anyone had ever intended a cap.
+-- Found by scripts/dead-exports.js, which is why that sweep reports its
+-- findings instead of deleting them.
+--
+-- ── WHY A NEW COLUMN AND NOT otp_details.count ──────────────────────
+-- `count` already exists and is already incremented — on RESEND, by the
+-- four services' regeneration UPDATE (`count = count + 1`). It counts codes
+-- SENT, never guesses made, and nothing reads it either. Overloading it
+-- would conflate SMS spend with brute force and silently change what the
+-- existing increments mean.
+--
+-- ── Column notes ────────────────────────────────────────────────────
+-- failed_attempts  Guesses made against THIS code since it was issued.
+--                  Reset to 0 whenever a new OTP is written onto the row
+--                  (a fresh code deserves a fresh budget — otherwise a
+--                  legitimate user who mistyped five times could never log
+--                  in again, and "resend" would be a button that does
+--                  nothing).
+--                  NOT NULL DEFAULT 0 so every existing row starts with a
+--                  full budget the moment this runs; no backfill needed.
+--                  INT, not TINYINT: the cap is read from application code
+--                  and may be raised without an ALTER.
+--
+-- ── DEPLOY ORDER IS SAFE IN BOTH DIRECTIONS, DELIBERATELY ───────────
+-- services/otp-attempts.service.js PROBES for this column (a present answer
+-- is cached for good); when it is absent the cap FAILS OPEN and login behaves
+-- exactly as it does today. That is the deliberate choice for an auth path:
+-- a missing column must never lock every user out, and it must never 500 a
+-- login either. So this file may run before or after the code deploys.
+--
+-- Running it on an environment that is ALREADY serving the code needs no
+-- restart: an absent column is re-probed at most once a minute, so the cap
+-- switches itself on within ~60s and logs "OTP attempt cap now ACTIVE".
+--
+-- Style: plain one-statement-per-line; idempotent (re-run = no-op).
+
+ALTER TABLE otp_details ADD COLUMN failed_attempts INT NOT NULL DEFAULT 0 COMMENT 'guesses made against the current code; reset when a new OTP is written';
+
+
+-- ── Verification ────────────────────────────────────────────────────
+-- SELECT COLUMN_NAME, COLUMN_DEFAULT, IS_NULLABLE
+--   FROM INFORMATION_SCHEMA.COLUMNS
+--  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'otp_details'
+--    AND COLUMN_NAME = 'failed_attempts';
+--
+-- After a few days, the cap in action — rows that hit the ceiling:
+-- SELECT otp_type, COUNT(*) FROM otp_details WHERE failed_attempts >= 5 GROUP BY otp_type;

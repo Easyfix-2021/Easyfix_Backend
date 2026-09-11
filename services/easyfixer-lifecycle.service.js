@@ -1888,55 +1888,6 @@ async function activateFromVerification(efrId, body, actor = null) {
   }, actor);
 }
 
-async function syncFromVerificationFlags(efrId, {
-  status: requestedStatus,
-  reasonCode = 'VERIFICATION_STATUS_SYNC',
-  reason = 'Registration verification status updated',
-} = {}, actor = null) {
-  if (!(await hasLifecycleSchema())) {
-    return { schemaInstalled: false, changed: false, lifecycle: null };
-  }
-  const current = await getLifecycle(efrId);
-  // Verification owns onboarding states, not post-activation operational
-  // restrictions. In particular, no verification save may undo BLACKLISTED.
-  if (protectsVerificationSync(current.status, requestedStatus)) {
-    return { schemaInstalled: true, changed: false, lifecycle: current, protected: true };
-  }
-  // REAPPLIED is a management-approval queue. Ordinary lead/identity saves
-  // must not derive legacy INACTIVE (the account bit remains 0 while waiting)
-  // and silently undo that marker. A CRM lifecycle transition first admits the
-  // application back into onboarding; explicit rejection is still allowed.
-
-  let target = normalizeStatus(requestedStatus);
-  if (!target) {
-    const [[row]] = await pool.query(
-      `SELECT e.efr_status, e.is_technician_verified, e.efr_manager_id,
-              e.user_id, e.adhaar_card_number, e.efr_profile_img,
-              e.is_identity_details_verified_by_crm,
-              e.scheduled_reactivation_date, e.insert_date, e.update_date,
-              u.personal_details_filled AS user_personal_details_filled,
-              u.is_personal_detail_filled AS user_is_personal_detail_filled
-         FROM tbl_easyfixer e
-         LEFT JOIN tbl_user u ON u.user_id = e.user_id
-        WHERE e.efr_id = ? LIMIT 1`,
-      [Number(efrId)],
-    );
-    if (!row) throw httpError(404, 'easyfixer not found');
-    target = deriveLegacyStatus(row);
-  }
-
-  return {
-    schemaInstalled: true,
-    ...(await transition(efrId, {
-      status: target,
-      reasonCode,
-      reason,
-      source: 'SYSTEM',
-      metadata: { verificationSync: true },
-    }, actor)),
-  };
-}
-
 async function syncFromVerificationFlagsAtomic(efrId, {
   status: requestedStatus,
   reasonCode = 'VERIFICATION_STATUS_SYNC',
@@ -2055,7 +2006,6 @@ module.exports = {
   finalizeTrainingCompletion,
   activateFromVerification,
   reconcileLegacyStatus,
-  syncFromVerificationFlags,
   syncFromVerificationFlagsAtomic,
   getHistory,
   _internals: {

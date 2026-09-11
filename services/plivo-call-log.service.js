@@ -673,19 +673,6 @@ async function closeConferenceLegs(conferenceId, { status = LEG_STATUS.LEFT } = 
 
 // How many legs are still on the call. DERIVED, never stored: a counter column
 // that four writers incremented and decremented is a counter that drifts.
-async function countActiveConferenceLegs(conferenceId, db = pool) {
-  try {
-    const [rows] = await db.query(
-      `SELECT COUNT(*) AS n FROM tbl_plivo_call_log
-        WHERE conference_id = ? AND status IN (?, ?, ?)`,
-      [conferenceId, ...ACTIVE_LEG_STATUSES],
-    );
-    return Number(rows && rows[0] && rows[0].n) || 0;
-  } catch (e) {
-    logger.warn('⚠ Conference leg count failed · conf=' + conferenceId + ' · ' + e.message);
-    return null;
-  }
-}
 
 /*
  * The reaper's stuck-leg sweep: legs still dialling/ringing long past the ring
@@ -770,7 +757,6 @@ module.exports = {
   markConferenceLegStatus,
   markConferenceLegFailed,
   closeConferenceLegs,
-  countActiveConferenceLegs,
   listStuckConferenceLegs,
   countStuckConferenceLegs,
   hasConferenceColumns,
