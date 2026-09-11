@@ -21,7 +21,16 @@ const plivo = require('./plivo.service');
 // finishes in seconds–minutes; a call with no speech may never produce one).
 const PROCESSING_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
-async function runTranscriptionBackfill({ limit = 50 } = {}) {
+/*
+ * `shouldStop` — the cooperative-cancellation checkpoint, same contract as
+ * services/recording-backfill.service.js. Polled BETWEEN rows, never mid-row: a
+ * row is up to three sequential Plivo calls (recording lookup → transcript GET →
+ * create POST) and a write, and abandoning it after the POST but before the
+ * 'processing' UPDATE would request a second transcription next run. Stopping
+ * between rows loses nothing — the next run re-selects whatever is still
+ * un-transcribed. Optional and defaulted; existing callers are unaffected.
+ */
+async function runTranscriptionBackfill({ limit = 50, shouldStop = null } = {}) {
   if (!plivo.transcriptionEnabled()) {
     return { skipped: true, reason: 'plivo.transcription.enabled is off' };
   }
@@ -49,8 +58,15 @@ async function runTranscriptionBackfill({ limit = 50 } = {}) {
     return { skipped: true, reason: 'transcription columns missing' };
   }
 
-  const result = { eligible: rows.length, completed: 0, requested: 0, notAvailable: 0, pending: 0, failed: 0 };
-  for (const r of rows) {
+  const result = { eligible: rows.length, completed: 0, requested: 0, notAvailable: 0, pending: 0, failed: 0, stopped: false };
+  for (const [i, r] of rows.entries()) {
+    // First statement of the body, so the `continue` on the not-ready path
+    // cannot skip it.
+    if (typeof shouldStop === 'function' && shouldStop()) {
+      result.stopped = true;
+      logger.warn(`transcription-backfill: stop requested — halting after ${i} of ${rows.length} row(s)`);
+      break;
+    }
     try {
       const meta = await plivo.fetchRecordingMeta({ callUuid: r.callUuid });
       if (!meta.ok || !meta.recordingId) {

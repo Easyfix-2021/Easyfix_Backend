@@ -82,6 +82,11 @@ function registerJob({
   // Optional real-interrupt hook — see requestCancel(). Its presence is what
   // makes the FE show a Stop button for this job.
   canceller,
+  // Optional POLL half of the cancel contract: `true` says the runner reads
+  // isCancelRequested() at a checkpoint, and also earns the Stop button. It must
+  // be named here — registerJob copies only the keys it destructures, so at
+  // e18669a this was silently dropped and no cooperative job had a Stop button.
+  cooperativeCancel,
 }) {
   const job = {
     id, name, description,
@@ -89,6 +94,7 @@ function registerJob({
     runner,
     tester: tester || null,
     canceller: canceller || null,
+    cooperativeCancel: cooperativeCancel === true,
     running: false,
     runningSince: null,
     cancelRequested: false,
@@ -1261,8 +1267,14 @@ Step by step:
 
 Note: only runs automatically if easyfix_properties "plivo.transcription.enabled" = "true" (checked once at server start — restart after flipping). Trigger Now still works for manual testing. Transcriptions are customer PII — ensure a retention policy.`,
     cron: '*/30 * * * *',
+    // Cooperative cancellation — polled between calls, never mid-call (see
+    // services/call-transcription-cron.js).
+    cooperativeCancel: true,
     runner: async () => {
-      const result = await callTranscriptionCron.runTranscriptionBackfill({ limit: 50 });
+      const result = await callTranscriptionCron.runTranscriptionBackfill({
+        limit: 50,
+        shouldStop: () => isCancelRequested('transcription-backfill'),
+      });
       logger.info('Transcription-backfill cron · ' + JSON.stringify(result));
       return result;
     },

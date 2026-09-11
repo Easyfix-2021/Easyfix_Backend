@@ -16,7 +16,15 @@
  *   2. server/scheduler.js offered isCancelRequested() and promised "any job
  *      can READ isCancelRequested() at a checkpoint and bail cleanly". No job
  *      did, so requestCancel() had a live route behind it and no reader. The
- *      recording backfill now polls it between rows.
+ *      recording backfill now polls it between rows; since 2026-09-11 the
+ *      transcription backfill does too.
+ *
+ *      The first version of this file checked the scheduler by SOURCE TOKEN,
+ *      and passed while broken: registerJob never destructured
+ *      cooperativeCancel, so the flag was dropped on registration and no
+ *      polling job ever got a Stop button. The check below now registers a job
+ *      through the real registerJob and reads getJobs() — the effect, not the
+ *      spelling.
  *
  * Runner: `node --test` (see npm test).
  */
@@ -102,17 +110,78 @@ test('with no stop requested the backfill runs every row — the positive contro
   assert.equal(result.stopped, false);
 });
 
-test('the scheduler wires the checkpoint AND advertises the job as cancellable', () => {
-  /*
-   * Both halves, because either alone is a lie: a poll the scheduler never
-   * passes in makes Stop do nothing; a cancellable flag without the poll shows
-   * a Stop button that does nothing. Comments stripped so prose cannot pass.
-   */
+// ─── 3. the transcription backfill honours the same checkpoint ────────────
+function loadTranscription() {
+  /* Same seam as loadBackfill: stub plivo.service BEFORE requiring the service. */
+  const fetched = [];
+  const p = require.resolve(path.join(ROOT, 'services', 'plivo.service'));
+  require.cache[p] = { id: p, filename: p, loaded: true, exports: {
+    transcriptionEnabled: () => true,
+    fetchRecordingMeta: async ({ callUuid }) => { fetched.push(callUuid); return { ok: true, recordingId: `rec-${callUuid}` }; },
+    fetchTranscription: async () => ({ ok: true, text: 'hello' }),
+  } };
+  delete require.cache[require.resolve(path.join(ROOT, 'services', 'call-transcription-cron'))];
+  return { svc: require('../services/call-transcription-cron'), fetched };
+}
+
+const FIVE_CALLS = [1, 2, 3, 4, 5].map((i) => ({ id: i, callUuid: `uuid-${i}`, status: null, lastAt: null }));
+const TX_WRITE = /UPDATE tbl_plivo_call_log SET transcription = \?/;
+
+test('a stop request halts the transcription backfill BETWEEN rows — the started row still writes', async () => {
+  const fake = installFakePool([[/FROM tbl_job_caller_info/, () => FIVE_CALLS]]);
+  const { svc, fetched } = loadTranscription();
+  let asked = 0;
+  const result = await svc.runTranscriptionBackfill({ limit: 5, shouldStop: () => (asked++ >= 1) });
+  fake.restore();
+  assert.equal(fetched.length, 1, 'exactly one row may run before the stop is honoured');
+  assert.equal(fake.calls.filter((c) => TX_WRITE.test(c.sql)).length, 1,
+    'the row that started must finish its write — never abandoned mid-row');
+  assert.equal(result.stopped, true, 'a cancelled run must REPORT that it stopped');
+});
+
+test('with no stop requested the transcription backfill runs every row — the positive control', async () => {
+  const fake = installFakePool([[/FROM tbl_job_caller_info/, () => FIVE_CALLS]]);
+  const { svc, fetched } = loadTranscription();
+  const result = await svc.runTranscriptionBackfill({ limit: 5, shouldStop: () => false });
+  fake.restore();
+  assert.equal(fetched.length, 5);
+  assert.equal(fake.calls.filter((c) => TX_WRITE.test(c.sql)).length, 5);
+  assert.equal(result.stopped, false);
+});
+
+test('each polling job declares cooperativeCancel and its OWN checkpoint inside its own registration', () => {
   const src = fs.readFileSync(path.join(ROOT, 'server', 'scheduler.js'), 'utf8')
     .replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/^\s*\/\/.*$/gm, ' ');
-  assert.match(src, /shouldStop:\s*\(\)\s*=>\s*isCancelRequested\('recording-backfill'\)/,
-    'the recording backfill must be handed the cancellation check');
-  assert.match(src, /cooperativeCancel:\s*true/, 'the job must declare cooperative cancellation');
-  assert.match(src, /cancellable:\s*typeof j\.canceller === 'function' \|\| j\.cooperativeCancel === true/,
-    'a polling job must be offered a Stop button, or its checkpoint is unreachable');
+  for (const id of ['recording-backfill', 'transcription-backfill']) {
+    const at = src.indexOf(`id: '${id}'`);
+    assert.ok(at >= 0, `positive control: no registration found for ${id}`);
+    const next = src.indexOf('registerJob(', at);
+    const block = src.slice(at, next < 0 ? undefined : next);
+    assert.match(block, /cooperativeCancel:\s*true/, `${id} must declare cooperative cancellation`);
+    assert.ok(block.includes(`shouldStop: () => isCancelRequested('${id}')`), `${id} must be handed its own cancellation check`);
+  }
+});
+
+test('registerJob KEEPS cooperativeCancel, so getJobs() offers Stop', () => {
+  /*
+   * The source checks prove the flag is WRITTEN; this proves it ARRIVES. At
+   * e18669a registerJob omitted cooperativeCancel from its destructured list, so
+   * the flag was dropped and cancellable was false for every polling job while
+   * the source check passed. Compile the real file plus one line exposing
+   * registerJob; this copy's `jobs` array is private, so nothing leaks.
+   */
+  const file = path.join(ROOT, 'server', 'scheduler.js');
+  const mod = new Module(file, module);
+  mod.filename = file;
+  mod.paths = Module._nodeModulePaths(path.dirname(file));
+  mod._compile(fs.readFileSync(file, 'utf8') + '\nmodule.exports.__registerJob = registerJob;\n', file);
+  const { __registerJob, getJobs } = mod.exports;
+  const noop = async () => {};
+  __registerJob({ id: 'coop', name: 'c', cron: '* * * * *', runner: noop, cooperativeCancel: true });
+  __registerJob({ id: 'plain', name: 'p', cron: '* * * * *', runner: noop });
+  __registerJob({ id: 'real', name: 'r', cron: '* * * * *', runner: noop, canceller: () => {} });
+  const cancellable = Object.fromEntries(getJobs().map((j) => [j.id, j.cancellable]));
+  assert.equal(cancellable.real, true, 'control: a canceller job must be offered Stop (proves the projection is read)');
+  assert.equal(cancellable.plain, false, 'control: a job with neither half must NOT be offered Stop');
+  assert.equal(cancellable.coop, true, 'cooperativeCancel must survive registerJob into getJobs()');
 });
