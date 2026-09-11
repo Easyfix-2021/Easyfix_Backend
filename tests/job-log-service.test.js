@@ -43,6 +43,9 @@ const scenario = {
 };
 
 const fake = installFakePool([
+  // setStatus's proof-of-work check on a CRM close: these tests are about the
+  // history rows, so every job here already has an after-work photo.
+  [/FROM tbl_job_image[\s\S]*image_category/i, () => [{ 1: 1 }]],
   /*
    * The revisit-reason master. Ordered ABOVE the generic routes because the
    * fake takes the FIRST matching route.
