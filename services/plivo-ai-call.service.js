@@ -82,7 +82,7 @@ async function placeAiCall({ to, token }) {
 }
 
 // Start recording an in-progress AI call (Plivo Record API). Plivo POSTs the
-// finished recording to `recording_callback_url` → /api/public/plivo/ai-recording.
+// finished recording to `callback_url` → /api/public/plivo/ai-recording.
 // Best-effort + fully guarded — recording must NEVER disrupt the live call.
 async function startRecording(callUuid) {
   if (!callUuid) return { ok: false, error: 'callUuid required' };
@@ -91,9 +91,12 @@ async function startRecording(callUuid) {
   const base = httpBase();
   // time_limit: the Record API stops at 60 s when omitted — see RECORD_MAX_SEC.
   const body = { file_format: 'mp3', time_limit: RECORD_MAX_SEC };
+  // `callback_url`/`callback_method` are the Record API's documented names. This
+  // used to send `recording_callback_url`, which the API does not define, so
+  // Plivo had no URL to report the recording to (tests/plivo-ai-recording.test.js).
   if (base) {
-    body.recording_callback_url = `${base}/api/public/plivo/ai-recording`;
-    body.recording_callback_method = 'POST';
+    body.callback_url = `${base}/api/public/plivo/ai-recording`;
+    body.callback_method = 'POST';
   }
   const url = `${PLIVO_API}/Account/${encodeURIComponent(process.env.PLIVO_AUTH_ID)}/Call/${encodeURIComponent(callUuid)}/Record/`;
   try {
