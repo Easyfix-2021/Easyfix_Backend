@@ -87,7 +87,7 @@ const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const logger = require('../logger');
 const { getProperty } = require('./properties.service');
-const { normaliseIndianPhone, maskForDisplay, callingEnabled } = require('./plivo.service');
+const { normaliseIndianPhone, maskForDisplay, callingEnabled, RECORD_MAX_SEC } = require('./plivo.service');
 const legs = require('./plivo-call-log.service');
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -654,8 +654,10 @@ async function listParticipants(friendlyName) {
  * A few seconds of the operator alone is the correct trade — participants join
  * later and MUST be inside the recording.
  *
- * recordSession/stereo/fileFormat and the callbackUrl are the same values the
- * bridge uses, so the EXISTING /api/public/plivo/recording-callback handler and
+ * recordSession/maxLength/stereo/fileFormat and the callbackUrl are the same
+ * values the bridge uses (maxLength: without it Plivo cuts the recording at 60 s
+ * — see RECORD_MAX_SEC; job #538806 was this path), so the EXISTING
+ * /api/public/plivo/recording-callback handler and
  * plivoLog.setRecording() persist this with no change — and setRecording is
  * already written for this case ("A Multi-Party Call has ONE recording of the
  * room… it belongs on the operator's leg").
@@ -692,7 +694,7 @@ function operatorAnswerXml(friendlyName, opts = {}) {
    */
   let recordEl = '';
   if (opts.recordingCallbackUrl) {
-    recordEl = '<Record recordSession="true" fileFormat="mp3" recordChannelType="stereo"'
+    recordEl = `<Record recordSession="true" maxLength="${RECORD_MAX_SEC}" fileFormat="mp3" recordChannelType="stereo"`
       + ` callbackUrl="${xmlAttr(opts.recordingCallbackUrl)}" callbackMethod="POST"/>`;
   }
   return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>${recordEl}<MultiPartyCall ${attrs.join(' ')}>${xmlText(name)}</MultiPartyCall></Response>`;

@@ -190,6 +190,19 @@ function recordingCallbackUrl(jci) {
   return `${base}/api/public/plivo/recording-callback?t=${encodeURIComponent(signRecordingToken(jci))}`;
 }
 
+// Recording length cap, shared by EVERY recording site (this bridge <Record>,
+// the MPC <Record> in plivo-conference.service.js, the AI-call Record API in
+// plivo-ai-call.service.js). Omitted, Plivo stops a recording at 60 s — <Record
+// maxLength> and the Record API's time_limit both default to 60, and
+// recordSession does NOT lift it: Plivo's XML reference says a session recording
+// runs "until the call is hung up or maxLength is reached". So every recorded
+// call over a minute was cut at ~60 s: job #538806, a 236 s call with a 59 s
+// file whose ready-callback fired while the call was still live. 86400 is
+// Plivo's documented maximum recording duration (24 h, "Account and feature
+// limits"); a session recording still ends with the call, so this lifts the cap
+// without lengthening anything. Do not raise it past the documented ceiling.
+const RECORD_MAX_SEC = 86400;
+
 // Plivo call-control XML the public answer route returns when the agent picks
 // up — bridges to the customer leg. callerId is the Plivo DID.
 //
@@ -206,6 +219,7 @@ function recordingCallbackUrl(jci) {
 //                              up (skips the ring/dead-air).
 //   recordChannelType="stereo" → 2-channel (each party on its own channel) —
 //                              needed for AWS Transcribe CALL ANALYTICS.
+//   maxLength=RECORD_MAX_SEC → lifts Plivo's 60 s default cap (see above).
 //   callbackUrl + callbackMethod="POST" → Plivo POSTs RecordUrl / RecordingID /
 //                              RecordingDuration here when the mp3 is ready
 //                              (handled by /api/public/plivo/recording-callback,
@@ -226,7 +240,7 @@ function buildAnswerXml(dest, { record = false, recordingCallbackUrl = null, str
   let recordEl = '';
   if (record) {
     let recAttrs = ' recordSession="true" startOnDialAnswer="true"'
-      + ' fileFormat="mp3" recordChannelType="stereo"';
+      + ` maxLength="${RECORD_MAX_SEC}" fileFormat="mp3" recordChannelType="stereo"`;
     if (recordingCallbackUrl) {
       // XML-attribute-escape (the URL query is `?t=<jwt>` — base64url has no
       // XML specials, but escape defensively).
@@ -680,6 +694,7 @@ function resolveWebDial(id) {
 }
 
 module.exports = {
+  RECORD_MAX_SEC,
   lowBalanceThreshold,
   accountBalance,
   accountBalanceCached,

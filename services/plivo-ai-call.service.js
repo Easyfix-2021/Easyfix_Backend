@@ -8,7 +8,7 @@
  */
 
 const logger = require('../logger');
-const { normaliseIndianPhone, callingEnabled } = require('./plivo.service');
+const { normaliseIndianPhone, callingEnabled, RECORD_MAX_SEC } = require('./plivo.service');
 
 const PLIVO_API = (process.env.PLIVO_BASE_URL || 'https://api.plivo.com/v1').replace(/\/+$/, '');
 
@@ -89,7 +89,8 @@ async function startRecording(callUuid) {
   const auth = authHeader();
   if (!auth || !process.env.PLIVO_AUTH_ID) return { ok: false, error: 'Plivo not configured' };
   const base = httpBase();
-  const body = { file_format: 'mp3' };
+  // time_limit: the Record API stops at 60 s when omitted — see RECORD_MAX_SEC.
+  const body = { file_format: 'mp3', time_limit: RECORD_MAX_SEC };
   if (base) {
     body.recording_callback_url = `${base}/api/public/plivo/ai-recording`;
     body.recording_callback_method = 'POST';
