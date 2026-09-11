@@ -24,6 +24,7 @@ const lifecycle = require('../../services/mobile-job-lifecycle.service');
 const { dailyBridgeCapReached, persistBridgeCall, CALL_FAILED_PUBLIC_MSG } = require('../public/_public-call');
 const { modernOk, modernError, otpGuessCapError } = require('../../utils/response');
 const { rateLimit, attemptWindow } = require('../../middleware/rate-limit');
+const { stripCustomerMobiles } = require('../../utils/mask-mobile');
 const {
   requireTechJobMutationCapability,
 } = require('../../middleware/require-tech-lifecycle-capability');
@@ -443,7 +444,9 @@ router.get('/jobs', async (req, res, next) => {
       offset: Number.isSafeInteger(offset) && offset > 0 ? offset : 0,
     });
     logger.info('Found ' + rows.length + ' jobs · total=' + total);
-    modernOk(res, { items: rows, total });
+    // jobService.list is the CRM's list too, so it carries customer_mob_no.
+    // Not to the device — same rule as GET /jobs/:id below.
+    modernOk(res, { items: stripCustomerMobiles(rows), total });
   } catch (e) { next(e); }
 });
 
@@ -507,7 +510,9 @@ router.get('/jobs/offered', async (req, res, next) => {
     logger.info('List open job offers extended to me');
     const result = await jobService.listOfferedForTech(req.tech.efr_id);
     logger.info('Found ' + ((result && result.items ? result.items.length : 0)) + ' open offers');
-    modernOk(res, result);
+    // An OFFERED technician has not even accepted the job — the customer's
+    // number is not his to hold. Same list projection as GET /jobs.
+    modernOk(res, stripCustomerMobiles(result));
   } catch (e) { next(e); }
 });
 
@@ -534,7 +539,9 @@ router.get('/jobs/:id', async (req, res, next) => {
     // must not even reach the device. Strip it MOBILE-ONLY here; the shared
     // getById keeps it for the CRM's own /admin route, and the bridge resolves
     // it server-side from tbl_customer, so nothing that needs it is affected.
-    if (job.customer_mob_no != null) job.customer_mob_no = null;
+    // stripCustomerMobiles nulls EVERY customer-number field — customer_mob_no,
+    // and alternate_no, which getById's `j.*` also carries and this route used to
+    // miss (found 2026-09-11). customer.phone is a nested alias it cannot know.
     if (job.customer && typeof job.customer === 'object' && job.customer.phone != null) job.customer.phone = null;
     /*
      * Same for the customer PIN (tbl_job.otp, from getById's `j.*`). It is the
@@ -544,7 +551,7 @@ router.get('/jobs/:id', async (req, res, next) => {
      * and the checkout guess cap guarded nothing. The app never reads it.
      */
     delete job.otp;
-    modernOk(res, job);
+    modernOk(res, stripCustomerMobiles(job));
   } catch (e) { next(e); }
 });
 

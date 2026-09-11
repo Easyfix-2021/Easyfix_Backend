@@ -148,4 +148,25 @@ function maskMobileInResponse(value, opts) {
   return value;
 }
 
-module.exports = { maskMobile, maskMobileInResponse, MOBILE_FIELDS, CUSTOMER_MOBILE_FIELDS };
+/*
+ * TECHNICIAN-facing: NULL every CUSTOMER_MOBILE_FIELDS key, at any depth.
+ * Masking is for staff screens; the technician app never shows or dials the
+ * customer's number — it calls through the masked /customer-call bridge, which
+ * resolves the number server-side — so the number must not reach the device at
+ * all. Returns a new value; never mutates input (the rows may be shared with a
+ * cache or another consumer).
+ */
+function stripCustomerMobiles(value) {
+  if (value == null) return value;
+  if (Array.isArray(value)) return value.map(stripCustomerMobiles);
+  if (typeof value === 'object' && !(value instanceof Date)) {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = CUSTOMER_MOBILE_FIELDS.has(k) ? null : stripCustomerMobiles(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+module.exports = { maskMobile, maskMobileInResponse, stripCustomerMobiles, MOBILE_FIELDS, CUSTOMER_MOBILE_FIELDS };
