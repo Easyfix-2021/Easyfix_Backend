@@ -782,8 +782,15 @@ Note: this task only runs if the property "job.auto_unreachable.enabled" is "tru
 
 Why this matters: without this, recorded calls would show no recording in the CRM and would be missed by the "Missing Call Recordings" report and by call-quality transcription, even though Plivo has the audio.`,
     cron: '*/15 * * * *',
+    // Cooperative cancellation: this job polls isCancelRequested() between
+    // rows rather than being interrupted. See the contract note above
+    // requestCancel — this is the first job to implement its reader half.
+    cooperativeCancel: true,
     runner: async () => {
-      const result = await recordingBackfillSvc.backfillMissingRecordings({ limit: 100 });
+      const result = await recordingBackfillSvc.backfillMissingRecordings({
+        limit: 100,
+        shouldStop: () => isCancelRequested('recording-backfill'),
+      });
       logger.info(`Recording-backfill cron · recovered=${result.recovered} scanned=${result.scanned}` + (result.skipped ? ' (skipped: columns absent)' : ''));
       return result;
     },
@@ -1611,7 +1618,14 @@ function getJobs() {
     runningMs: j.runningSince ? Date.now() - j.runningSince : null,
     progressText: j.progressText || null,
     cancelRequested: !!j.cancelRequested,
-    cancellable: typeof j.canceller === 'function',
+    /*
+     * Cancellable if EITHER half of the contract is implemented: a canceller
+     * that interrupts the job for real, or a runner that polls
+     * isCancelRequested() at a checkpoint. Before 2026-09-10 only the first
+     * could ever be true, because nothing polled — so the poll half was
+     * unreachable from the UI even for a job that wanted it.
+     */
+    cancellable: typeof j.canceller === 'function' || j.cooperativeCancel === true,
     // Test-send surface (2026-06-06). `testable` drives whether the FE
     // renders a Test button next to Trigger Now; the label/help strings
     // drive the modal's optional source-id input copy. The lastTest*

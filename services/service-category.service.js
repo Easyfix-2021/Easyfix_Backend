@@ -22,9 +22,12 @@ const logger = require('../logger');
  * Two distinct write paths, mirroring the Manage Service Type sibling:
  *   - deleteCategory()     → status 3 (legacy /addDeleteServiceCatg "trash";
  *                            row leaves every list). Wired to DELETE.
- *   - deactivateCategory() → status 0 (Active toggle off; row still surfaces
- *                            under "include inactive"). Reached via PATCH
- *                            { is_active:false }; reactivate via is_active:true.
+ *   - updateCategory()     → carries is_active through as status 0/1 (Active
+ *                            toggle; the row still surfaces under "include
+ *                            inactive"). Reached via PATCH { is_active }.
+ *                            A dedicated deactivateCategory() existed until
+ *                            2026-09-10 and had had no caller since 2026-06-22,
+ *                            when the route moved to deleteCategory/updateCategory.
  */
 
 function mkErr(status, message) { const e = new Error(message); e.status = status; return e; }
@@ -188,24 +191,6 @@ async function activeTypeCount(id) {
   return row.n;
 }
 
-async function deactivateCategory(id) {
-  logger.info('Deactivate service category · id=' + id);
-  // Guard: don't deactivate while active service types reference this category.
-  const n = await activeTypeCount(id);
-  if (n > 0) {
-    logger.warn('Deactivate service category blocked · id=' + id + ' activeTypes=' + n);
-    throw mkErr(409,
-      `Cannot deactivate — ${n} active service type(s) still reference this category. Deactivate or reassign them first.`);
-  }
-
-  const [r] = await pool.query(
-    'UPDATE tbl_service_catg SET service_catg_status = 0 WHERE service_catg_id = ? AND service_catg_status <> 3',
-    [id]
-  );
-  if (r.affectedRows > 0) logger.info({ service_catg_id: id }, 'Service Category deactivated (status=0)');
-  return r.affectedRows > 0;
-}
-
 // Legacy "delete" = soft-delete to status 3 (row leaves every list). Mirrors
 // the legacy CRM trash action `UPDATE tbl_service_catg SET service_catg_status=3`
 // (ServiceCategoryDaoImpl) and the Manage Service Type sibling's deleteType().
@@ -234,7 +219,6 @@ module.exports = {
   getCategoryById,
   createCategory,
   updateCategory,
-  deactivateCategory,
   deleteCategory,
   SORTABLE_COLUMNS,
 };

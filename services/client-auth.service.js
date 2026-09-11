@@ -3,6 +3,7 @@ const logger = require('../logger');
 const { resolveLoginOtp, otpExpiryDate } = require('../utils/otp');
 const jwt = require('jsonwebtoken');
 const { istIsPast } = require('../utils/ist-calendar');
+const otpAttempts = require('./otp-attempts.service');
 
 /*
  * Client SPOC authentication — distinct from internal-user auth.
@@ -187,6 +188,12 @@ async function createLoginOtp(identifier) {
         WHERE id = ?`,
       [otp, now, expires, existing.id]
     );
+    /* A NEW code gets a FRESH guess budget — see services/otp-attempts.service.js.
+     * Separate call rather than `failed_attempts = 0` in the UPDATE above: that
+     * column does not exist until the migration runs, and naming it here would
+     * 500 every OTP request in the meantime. Without the reset the cap counts per
+     * ROW rather than per CODE, and "Resend OTP" stops being able to help. */
+    await otpAttempts.clearAttempts(existing.id);
   } else {
     await pool.query(
       `INSERT INTO otp_details (otp, otp_type, user_email, user_mobile_no, generated_on, valid_up_to, is_expired, count)
@@ -240,8 +247,17 @@ async function verifyLoginOtp(identifier, otp) {
     logger.warn('Verify login OTP · reason=OTP_EXPIRED · spocId=' + spoc.id);
     return { ok: false, reason: 'OTP_EXPIRED' };
   }
-  if (Number(row.otp) !== Number(otp)) logger.warn('Verify login OTP · reason=OTP_MISMATCH · spocId=' + spoc.id);
-  if (Number(row.otp) !== Number(otp)) return { ok: false, reason: 'OTP_MISMATCH' };
+  // Guess cap — see services/otp-attempts.service.js. Checked before the
+  // comparison; counted only on a real mismatch.
+  if (await otpAttempts.isLockedOut(row.id)) {
+    logger.warn('Verify login OTP · reason=OTP_ATTEMPTS_EXCEEDED · spocId=' + spoc.id);
+    return { ok: false, reason: 'OTP_ATTEMPTS_EXCEEDED' };
+  }
+  if (Number(row.otp) !== Number(otp)) {
+    logger.warn('Verify login OTP · reason=OTP_MISMATCH · spocId=' + spoc.id);
+    await otpAttempts.recordFailedAttempt(row.id);
+    return { ok: false, reason: 'OTP_MISMATCH' };
+  }
   await pool.query('UPDATE otp_details SET is_expired = 1 WHERE id = ?', [row.id]);
 
   // Enrich (does NOT gate login): resolve the SPOC's matching active Client

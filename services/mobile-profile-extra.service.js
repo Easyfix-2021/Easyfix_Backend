@@ -104,30 +104,6 @@ async function updateName(efrId, name) {
 }
 
 /*
- * Set the profile image — legacy `profile/profile-image-upload`.
- *
- * The RN screen uploads the binary via the generic doc/image upload
- * endpoint (multipart) first, then calls THIS with the resulting
- * `imageId` (an S3 key / file id). Here we just persist that reference
- * onto tbl_easyfixer.efr_profile_img and return the stored value.
- *
- * VERIFY: whether `efr_profile_img` stores a bare S3 key or a full URL
- * varies by legacy data — we store exactly what the app sends (the
- * upload endpoint already produced the canonical key/URL). The mobile
- * Bearer-auth image-rendering pattern fetches it via authenticated
- * fetch → Blob, so a bare key is fine.
- */
-async function setProfileImage(efrId, imageId) {
-  logger.info('Set profile image by reference · imageId=' + imageId);
-  await pool.query(
-    'UPDATE tbl_easyfixer SET efr_profile_img = ? WHERE efr_id = ?',
-    [imageId, efrId],
-  );
-  logger.info('Profile image set · efrId=' + efrId);
-  return { url: await s3Storage.resolveImageUrl(imageId), imageId };
-}
-
-/*
  * Set the profile image from a multipart byte upload — the direct path
  * the RN profile screen uses (POST /profile/image with a `file` part).
  *
@@ -815,7 +791,6 @@ async function getServiceablePincodes(efrId) {
 module.exports = {
   updateName,
   getServiceablePincodes,
-  setProfileImage,
   setProfileImageFromUpload,
   getWeeklyPerformance,
   getEarnings,

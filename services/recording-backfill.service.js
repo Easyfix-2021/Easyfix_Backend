@@ -27,7 +27,22 @@ const logger = require('../logger');
  * row is counted and skipped; the columns being pre-migration is a clean no-op.
  * Returns { scanned, recovered, stillMissing, errors, limit }.
  */
-async function backfillMissingRecordings({ limit = 50 } = {}) {
+/*
+ * `shouldStop` is the COOPERATIVE-CANCELLATION checkpoint. server/scheduler.js
+ * has offered isCancelRequested() since it was written — its own header
+ * promises "any job can READ isCancelRequested() at a checkpoint and bail
+ * cleanly" — and until 2026-09-10 no job did, so the cancel contract had a live
+ * writer (requestCancel, reachable from a route) and no reader at all. Found by
+ * scripts/dead-exports.js.
+ *
+ * Checked BETWEEN rows, never mid-row: a row is one Plivo fetch plus one write,
+ * and abandoning it half-done would leave a recording fetched and unrecorded.
+ * Stopping between rows loses nothing — the next run re-selects whatever is
+ * still missing.
+ *
+ * Optional and defaulted, so every existing caller is unaffected.
+ */
+async function backfillMissingRecordings({ limit = 50, shouldStop = null } = {}) {
   const lim = Math.min(Math.max(Number(limit) || 50, 1), 200);
   let rows;
   try {
@@ -54,7 +69,13 @@ async function backfillMissingRecordings({ limit = 50 } = {}) {
   let recovered = 0;
   let stillMissing = 0;
   let errors = 0;
+  let stopped = false;
   for (const r of rows) {
+    if (typeof shouldStop === 'function' && shouldStop()) {
+      stopped = true;
+      logger.warn(`recording-backfill: stop requested — halting after ${recovered + stillMissing + errors} of ${rows.length} row(s)`);
+      break;
+    }
     try {
       const meta = await plivo.fetchRecordingMeta({ callUuid: r.call_uuid });
       if (meta && meta.ok && meta.url) {
@@ -72,7 +93,10 @@ async function backfillMissingRecordings({ limit = 50 } = {}) {
     }
   }
   logger.info(`Recording backfill · scanned=${rows.length} recovered=${recovered} stillMissing=${stillMissing} errors=${errors}`);
-  return { scanned: rows.length, recovered, stillMissing, errors, limit: lim };
+  /* `stopped` so the operator can see the Stop took effect — a cancelled run
+   * that reports the same shape as a completed one is indistinguishable from
+   * a Stop button that did nothing. */
+  return { scanned: rows.length, recovered, stillMissing, errors, limit: lim, stopped };
 }
 
 module.exports = { backfillMissingRecordings };
