@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const dashboard = require('../services/mobile-dashboard.service');
+const { OPEN_JOB_STATUSES } = require('../services/easyfixer-lifecycle.service');
 const { pool } = require('../db');
 
 test.after(async () => {
@@ -84,15 +85,64 @@ test('a completed job is not today\'s work — completion removes it by status',
   const source = fs.readFileSync(
     path.join(__dirname, '..', 'services', 'mobile-dashboard.service.js'), 'utf8',
   );
-  const active = /const ACTIVE_STATUSES = '([^']+)'/.exec(source);
-  assert.ok(active, 'the active status set must be declared in one place');
-  const codes = active[1].split(',').map(Number);
+  const codes = dashboard._internals.ACTIVE_STATUSES.split(',').map(Number);
+  assert.ok(codes.length > 0, 'the active set must be non-empty — an empty IN () would count nothing');
   for (const closed of [3, 5, 6]) {
     assert.equal(codes.includes(closed), false,
       `status ${closed} is closed and must never be counted as an active job`);
   }
   assert.match(source, /statuses: STARTED_STATUSES/,
     'the list half must query the same started-status constant, not a literal');
+  assert.doesNotMatch(source, /statuses: '/,
+    'no list may query a literal status set — "Today\'s Jobs" did, and kept 1,2,20 when the counts moved');
+});
+
+/*
+ * EACH HOME TILE COUNTS WHAT THE BOOKINGS CHIP IT OPENS LISTS (2026-09-11).
+ *
+ * Open Jobs → All, Today's Jobs → Today, Delayed → Delayed. Production showed
+ * Open Jobs 1 over a Bookings list of 5: the tiles counted (1, 2, 20) while the
+ * list serves OPEN_JOB_STATUSES, so a revisit owed (10), an estimate pending with
+ * the technician on site (15) and a job on hold (21) were listed and not counted.
+ */
+test('Home counts the statuses Bookings lists, and each tile uses its chip\'s rule', async () => {
+  const { fetchDateCounts, ACTIVE_STATUSES } = dashboard._internals;
+  assert.equal(ACTIVE_STATUSES, OPEN_JOB_STATUSES.join(','),
+    'the active set IS the lifecycle\'s open set — read from it, never retyped');
+
+  // A row whose date buckets sum to 1 while five jobs are open: only a DIRECT
+  // count can put 5 on the tile. (The buckets drop sent-back jobs; Bookings does not.)
+  const calls = [];
+  const realQuery = pool.query;
+  pool.query = async (sql, params) => {
+    calls.push({ sql, params });
+    return [[{ activeToday: 1, delayed: 0, overdue: 0, upcoming: 0, allJobs: 5, actionRequired: 1 }], []];
+  };
+  let counts;
+  try {
+    counts = await fetchDateCounts(1736);
+  } finally {
+    pool.query = realQuery;
+  }
+  assert.equal(calls.length, 1, 'still one round trip');
+  assert.deepEqual(calls[0].params, [1736]);
+  assert.equal(counts.allJobs, 5, 'Open Jobs is the direct count, not activeToday + delayed + upcoming (1 here)');
+
+  const clauseOf = (alias) => {
+    const at = calls[0].sql.indexOf(`AS ${alias}`);
+    assert.ok(at > 0, `the ${alias} count must exist`);
+    return calls[0].sql.slice(calls[0].sql.lastIndexOf('COUNT(', at), at).replace(/\s+/g, ' ').trim();
+  };
+  assert.equal(clauseOf('allJobs'), `COUNT(CASE WHEN job_status IN (${OPEN_JOB_STATUSES.join(',')}) THEN 1 END)`,
+    'every open job, with no date or send-back condition — exactly what GET /mobile/jobs lists');
+
+  // Delayed = the Bookings Delayed chip's rule: late AND not begun.
+  const overdue = clauseOf('overdue');
+  assert.match(overdue, /requested_date_time < NOW\(\)/, 'late is keyed on the appointment');
+  assert.match(overdue, /job_status NOT IN \(2, 10, 20\)/,
+    'begun work is not late: in progress, pending to close, a revisit already worked');
+  assert.match(overdue, /NOT \(job_status = 15 AND checkin_date_time IS NOT NULL\)/,
+    'an estimate pending WITH a check-in is the technician on site, not late');
 });
 
 test('the two source lists merge with started jobs first and no duplicates', () => {
@@ -112,7 +162,7 @@ test('the two source lists merge with started jobs first and no duplicates', () 
 test('the activeToday count counts started jobs on any date, exactly once', () => {
   // The count half is SQL, so assert the SQL itself: a started job must be
   // counted by activeToday and must NOT also be counted by delayed/upcoming,
-  // or `allJobs` (their sum) double-counts it.
+  // or the three date buckets stop partitioning the open jobs.
   const source = fs.readFileSync(
     path.join(__dirname, '..', 'services', 'mobile-dashboard.service.js'), 'utf8',
   );
@@ -122,7 +172,7 @@ test('the activeToday count counts started jobs on any date, exactly once', () =
   assert.match(clause, /\$\{WORK_DATE_SQL\} = CURDATE\(\)/,
     'today is decided by the work date — check-in for a started job, appointment otherwise');
   // All three date buckets must read the SAME expression, or they stop
-  // partitioning and `allJobs` (their sum) double-counts or loses jobs.
+  // partitioning — a job counted twice, or in no bucket at all.
   for (const bucket of ['`delayed`', 'upcoming']) {
     const marker = new RegExp(`AS ${bucket.replace(/`/g, '\\\\`')}`).exec(source);
     assert.ok(marker, `${bucket} count must exist`);

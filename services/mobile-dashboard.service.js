@@ -4,6 +4,7 @@ const jobService = require('./job.service');
 const noticeService = require('./notice.service');
 const performanceService = require('./performance.service');
 const alertFlags = require('./job-offer-alert-flags');
+const { OPEN_JOB_STATUSES } = require('./easyfixer-lifecycle.service');
 
 /*
  * Mobile dashboard orchestrator — composes shared services into the
@@ -68,10 +69,33 @@ const ACTIVE_LIMIT = 2;
  * bucket the same turn.
  *
  * Because all three buckets read this ONE expression, they still partition the
- * technician's active jobs and `allJobs` can go on being their sum.
+ * technician's active jobs.
+ *
+ * THE ACTIVE SET IS HIS WORK IN HAND, and it is read from the lifecycle service
+ * rather than typed here. Each Home card opens a Bookings chip — Open Jobs → All,
+ * Today's Jobs → Today, Delayed → Delayed — and GET /mobile/jobs lists
+ * OPEN_JOB_STATUSES, so a card counting a narrower set promises a number the
+ * list it opens contradicts. Until 2026-09-11 this was (1, 2, 20): Open Jobs read
+ * 1 over a Bookings list of 5, the other four being a revisit owed (10), an
+ * estimate pending with the technician on site (15) and a job on hold (21).
+ *
+ * 10, 15 and 21 are deliberately NOT started statuses for the WORK DATE: the
+ * Bookings list dates them by their appointment, and a Home card that dated them
+ * differently would disagree with the chip it opens.
  */
-const ACTIVE_STATUSES = '1,2,20';
+const ACTIVE_STATUSES = OPEN_JOB_STATUSES.join(',');
 const STARTED_STATUSES = '2,20';
+/*
+ * "Late" is the Bookings Delayed chip's rule (the app's useMyOrders.bucketOf,
+ * through jobStage): the appointment has passed AND the work has not begun.
+ * Begun = in progress (2), pending to close (20), revisit (10), or estimate
+ * pending (15) WITH a check-in stamp — the list decides "checked in" from
+ * checkin_date_time alone, so this does too. Every other open status can be late,
+ * including any status added to the open set later: jobStage's default is "not
+ * started", the conservative direction, and this matches it.
+ */
+const NOT_STARTED_SQL = `(job_status NOT IN (2, 10, 20)
+                          AND NOT (job_status = 15 AND checkin_date_time IS NOT NULL))`;
 const WORK_DATE_SQL = `DATE(CASE WHEN job_status IN (${STARTED_STATUSES})
                                  THEN COALESCE(checkin_date_time, requested_date_time)
                                  ELSE requested_date_time END)`;
@@ -168,7 +192,7 @@ async function getDashboard(efrId, opts = {}) {
     // below is a belt-and-braces guard on the already-constrained rows.
     jobService.list({
       easyfixerId: efrId,
-      statuses: '1,2,20',
+      statuses: ACTIVE_STATUSES,
       dateType: 'requested',
       startDate: today.start,
       endDate: today.end,
@@ -242,15 +266,10 @@ async function getDashboard(efrId, opts = {}) {
       delayed:        dateCounts.delayed,
       overdue:        dateCounts.overdue,
       upcoming:       dateCounts.upcoming,
-      // `allJobs` — the tech's TOTAL non-completed (active) jobs across
-      // ALL dates, i.e. everything BEFORE Completed. It is exactly the
-      // sum of the three date buckets (activeToday + delayed + upcoming),
-      // which together partition the tech's active-status jobs (statuses
-      // 1,2,20) by requested date into today / before-today / after-today.
-      // Drives the home "All Jobs" tile, which previously mis-read the
-      // future-only `upcoming` count. (`overdue` is a NOW()-based finer
-      // slice that overlaps activeToday/delayed, so it is intentionally
-      // NOT part of this sum.)
+      // `allJobs` — the tech's TOTAL open jobs across ALL dates: every job
+      // in ACTIVE_STATUSES, counted directly. Drives the home "Open Jobs"
+      // tile, which opens the Bookings All list — the same statuses, so the
+      // number on the tile is the number of jobs the list holds.
       allJobs:        dateCounts.allJobs,
       // `send_back_to_tx` column confirmed present on tbl_job (live-DB
       // probe 2026-05-25, type tinyint). Count = jobs CRM has sent
@@ -577,17 +596,18 @@ function isTodaysWork(j) {
  *                    exists to keep `allJobs` a sum, so if the bucket rule
  *                    changes again, `overdue` is the count with a UI
  *                    behind it and the one to re-check.
- *   overdue        — same statuses, requested_date_time already passed.
- *                    Deliberately still keyed on the APPOINTMENT, not the
- *                    work date: "am I late" is a different question from
- *                    "which day is this job's work", and a job started
- *                    today against a Tuesday slot really is late.
+ *   overdue        — same statuses, requested_date_time already passed AND
+ *                    the work not begun (NOT_STARTED_SQL). Keyed on the
+ *                    APPOINTMENT, not the work date. It is the Home "Delayed"
+ *                    tile, which opens the Bookings Delayed chip, so it uses
+ *                    that chip's rule: late means late and not started. It
+ *                    used to count begun work too (2, 20), so the tile could
+ *                    read 1 over a Delayed chip that listed nothing.
  *   upcoming       — same statuses, work date in the future.
- *   allJobs        — DERIVED (no extra SQL): activeToday + delayed +
- *                    upcoming — the tech's TOTAL non-completed/active jobs
- *                    across all dates (everything before Completed). All
- *                    three read the SAME work-date expression, so they
- *                    partition the active statuses and their sum holds.
+ *   allJobs        — every job in the active statuses, counted DIRECTLY. It
+ *                    was activeToday + delayed + upcoming, but those two
+ *                    exclude sent-back jobs, which the Bookings list shows —
+ *                    so the sum undercounted the list the tile opens.
  *   actionRequired — CRM has flagged a returned job for the tech to
  *                    re-handle (`send_back_to_tx = 1` AND `job_status
  *                    = 2`). Confirmed against live DB 2026-05-25 —
@@ -604,26 +624,22 @@ async function fetchDateCounts(efrId) {
                      AND (send_back_to_tx = 0 OR send_back_to_tx IS NULL)
                      AND ${WORK_DATE_SQL} < CURDATE() THEN 1 END) AS \`delayed\`,
          COUNT(CASE WHEN job_status IN (${ACTIVE_STATUSES})
-                     AND requested_date_time < NOW() THEN 1 END)  AS overdue,
+                     AND requested_date_time < NOW()
+                     AND ${NOT_STARTED_SQL} THEN 1 END)           AS overdue,
          COUNT(CASE WHEN job_status IN (${ACTIVE_STATUSES})
                      AND ${WORK_DATE_SQL} > CURDATE() THEN 1 END) AS upcoming,
+         COUNT(CASE WHEN job_status IN (${ACTIVE_STATUSES}) THEN 1 END) AS allJobs,
          COUNT(CASE WHEN send_back_to_tx = 1 AND job_status = 2 THEN 1 END) AS actionRequired
        FROM tbl_job
        WHERE fk_easyfixter_id = ?`,
       [efrId],
     );
-    const activeToday = Number(row?.activeToday ?? 0);
-    const delayed     = Number(row?.delayed ?? 0);
-    const upcoming    = Number(row?.upcoming ?? 0);
     return {
-      activeToday,
-      delayed,
+      activeToday:    Number(row?.activeToday ?? 0),
+      delayed:        Number(row?.delayed ?? 0),
       overdue:        Number(row?.overdue ?? 0),
-      upcoming,
-      // Total non-completed (active-status) jobs across all dates — the
-      // three requested-date buckets together partition the tech's
-      // statuses 1,2,20, so their sum is the "All Jobs" count.
-      allJobs:        activeToday + delayed + upcoming,
+      upcoming:       Number(row?.upcoming ?? 0),
+      allJobs:        Number(row?.allJobs ?? 0),
       actionRequired: Number(row?.actionRequired ?? 0),
     };
   } catch (e) {
@@ -759,4 +775,7 @@ function mapJobForMobile(j) {
  * asserted without a database. The count half lives in SQL and the list half in
  * JS; these are the JS half, and they are the half that silently drops a job.
  */
-module.exports = { getDashboard, fetchIdentity, _internals: { istDayOf, dedupeById, isStarted, isTodaysWork, workDateOf } };
+module.exports = {
+  getDashboard, fetchIdentity,
+  _internals: { istDayOf, dedupeById, isStarted, isTodaysWork, workDateOf, fetchDateCounts, ACTIVE_STATUSES },
+};
