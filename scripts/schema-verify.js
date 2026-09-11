@@ -116,6 +116,9 @@ const EXPECTED = {
   tbl_job_comment: [
     'comment_id', 'job_id', 'comments', 'comment_on', 'created_on',
     'appointment_on', 'commented_by', 'enum_reason_id', 'efr_id',
+    // The escalation author's NAME, as text (escalation writers leave
+    // commented_by NULL) — listComments' legacy "Remark By" falls back to it.
+    'job_escalated_by',
   ],
   /*
    * tbl_job_logs — the job-history archive (1.7M rows, written since 2015).
