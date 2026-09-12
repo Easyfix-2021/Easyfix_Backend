@@ -5182,7 +5182,28 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { 
   // FKs reject or, worse, pin on an unrelated CRM user; jobLog's classifier is
   // the one place that tells the two apart.
   const crmUserId = jobLog.resolveActor(actor).changedBy || null;
+  /*
+   * WHO POSTS THE LEDGER (2026-09-11) — a CRM user moving a job INTO 3 / 5.
+   * Legacy posts at the ops Check Out, never at the technician's own close, so a
+   * technician-app or partner-API completion lands here unposted (the WARN below)
+   * and waits for ops: the next CRM move into 3 / 5 posts it (the SP's keys make
+   * a repeat attempt a no-op), and scripts/backfill-completion-ledger.js lists it.
+   * 3 ↔ 5 by a CRM user is included for exactly that reason.
+   */
+  const postsLedger = COMPLETED_STATES.has(Number(status)) && crmUserId != null;
   const entersCompletion = COMPLETED_STATES.has(Number(status)) && !COMPLETED_STATES.has(Number(existing.job_status));
+  let ledgerOutcome = null;   // told to the caller below, so the CRM can say what was posted
+  // A posted completion cannot be cancelled from here: nothing in this backend
+  // reverses a posting yet (legacy's Delete Job After Checkout does, through
+  // delete_job_data), and cancelling would leave the money in the wallet.
+  if (Number(status) === STATUS.CANCELLED && COMPLETED_STATES.has(Number(existing.job_status))) {
+    const [[posted]] = await pool.query('SELECT COUNT(*) AS n FROM tbl_job_transaction WHERE fk_job_id = ?', [jobId]);
+    if (Number(posted && posted.n) > 0) {
+      const err = new Error('This job\'s completion is posted to the ledger, so it cannot be cancelled here. Use Delete Job After Checkout in the legacy CRM, which reverses the posting.');
+      err.status = 409; err.code = 'COMPLETION_POSTED';
+      throw err;
+    }
+  }
 
   if (Number(status) === STATUS.CANCELLED) {
     // enum_reason_id mirrors the picked action_taken_reason id — the same column
@@ -5341,37 +5362,46 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { 
   values.push(jobId);
   const updateSql = `UPDATE tbl_job SET ${sets.join(', ')} WHERE job_id = ?`;
   /*
-   * ENTERING 3 / 5 POSTS THE LEDGER, IN THE SAME TRANSACTION (2026-09-11).
+   * A CRM MOVE INTO 3 / 5 POSTS THE LEDGER, IN THE SAME TRANSACTION (2026-09-11).
    *
    * services/job-ledger.service.js posts what the legacy Check Out posts. One
-   * transaction, so no job can sit at 3/5 without the postings it can have: a
-   * post that FAILS rolls the status back and the caller gets the error. A job
+   * transaction, so the status and the postings land together or not at all: a
+   * post that fails rolls the status back and the caller gets the error. A job
    * that CANNOT be posted (no technician, collected_by not 1-3, completed
-   * straight out of CANCELLED) still completes, with nothing posted and a WARN
-   * naming it; scripts/backfill-completion-ledger.js finds it later by the same
-   * keys. Moving between 3 and 5 is not an entry, and posts nothing.
+   * straight out of CANCELLED) is REFUSED with the reason, as legacy's Check
+   * Out refuses: ops fix it and complete again. Completing it anyway would put a
+   * job at 3 / 5 with no way to post it later — its services are locked there.
    */
-  if (entersCompletion) {
-    const conn = await pool.getConnection();
-    let ledger;
-    try {
-      await conn.beginTransaction();
+  if (postsLedger) {
+    /*
+     * AN UNPOSTABLE COMPLETION IS NOT REFUSED (2026-09-12). Legacy refuses this
+     * in its Check Out SCREEN (appCheckoutJobDetail.js: collected_by must be 1
+     * or 2) but not on the server — its SP posts zero-amount rows instead — and
+     * this backend has no screen where ops can set Collected By on a job that
+     * is ready to complete. Refusing here would block completions with no
+     * remedy: measured on QA, 0 of 2,699 jobs completed since go-live have it
+     * unset, but 53 OPEN jobs do (manual, excel, integration_v2, Client_App).
+     * So the status lands, nothing is posted, the reason is logged AND returned
+     * to the caller (job.ledger below) so the CRM can say so, and the next CRM
+     * move into 3/5 — or scripts/backfill-completion-ledger.js — posts it once
+     * the job is fixed.
+     */
+    ledgerOutcome = await jobLedger.inLedgerTransaction(async (conn) => {
       await conn.query(updateSql, values);
-      ledger = await jobLedger.postCompletionLedger(conn, {
+      return jobLedger.postCompletionLedger(conn, {
         jobId: Number(jobId), fromStatus: Number(existing.job_status), crmUserId,
       });
-      await conn.commit();
-    } catch (e) {
-      try { await conn.rollback(); } catch (rbErr) { logger.warn('Completion rollback failed · id=' + jobId + ' · ' + rbErr.message); }
-      logger.warn('Completion refused, ledger post failed · id=' + jobId + ' · ' + e.message);
-      throw e;
-    } finally {
-      await jobLedger.releaseLedgerLock(conn);
-      conn.release();
+    });
+    if (ledgerOutcome.unpostable) {
+      logger.warn('Completion ledger NOT posted · id=' + jobId + ' · ' + ledgerOutcome.reason
+        + ' · fix the job, then a CRM move into 3/5 or the backfill posts it');
     }
-    if (ledger.unpostable) logger.warn('Completion ledger NOT posted · id=' + jobId + ' · ' + ledger.reason);
   } else {
     await pool.query(updateSql, values);
+    if (entersCompletion) {
+      logger.warn('Completed without a CRM user · id=' + jobId + ' · ' + existing.job_status + '->' + Number(status)
+        + ' · ledger not posted; the next CRM move into 3/5 or the backfill posts it');
+    }
   }
 
   /*
@@ -5481,7 +5511,23 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { 
   // Ops took a deliberate status action (confirm 9→0, cancel, enquiry, …) — any
   // pending customer request on this job is now handled. See resolveCustomerRequests.
   await resolveCustomerRequests(jobId);
-  return getById(jobId);
+  const job = await getById(jobId);
+  /*
+   * What the completion posted, for the caller that asked for it. The CRM needs
+   * this to tell ops "posted ₹X to the technician" or "not posted: Collected By
+   * is not set" — a WARN in the container log is not an answer to a click.
+   * Absent on every other transition, so no existing response shape changes.
+   */
+  if (job && ledgerOutcome) {
+    job.ledger = {
+      posted: !!ledgerOutcome.ledgers,
+      job_transaction: !!ledgerOutcome.jobTransaction,
+      reason: ledgerOutcome.reason || null,
+      amounts: ledgerOutcome.amounts || null,
+      balances: ledgerOutcome.balances || null,
+    };
+  }
+  return job;
 }
 
 // ─── Assign / Reassign technician ───────────────────────────────────

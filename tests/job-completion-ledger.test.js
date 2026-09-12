@@ -44,6 +44,9 @@ function resetWorld() {
     tails: { efr: 100, ef: 1000, client: 50 },
     lockGot: 1,
     failOn: null,
+    failErrno: null,
+    postedAlready: false,
+    releaseFails: false,
   });
 }
 resetWorld();
@@ -61,6 +64,9 @@ const ROUTES = [
   }],
   [/SELECT 1 FROM tbl_easyfixer_transaction WHERE job_id/i, () => (W.efrLedger ? [{ 1: 1 }] : [])],
   [/GET_LOCK/i, () => [{ got: W.lockGot }]],
+  [/@@SESSION\.innodb_lock_wait_timeout/i, () => [{ wait: 50 }]],
+  [/FROM tbl_easyfixer WHERE efr_id = \? FOR UPDATE/i, () => [{ efr_id: 7 }]],
+  [/COUNT\(\*\) AS n FROM tbl_job_transaction/i, () => [{ n: W.postedAlready ? 1 : 0 }]],
   [/FROM tbl_easyfixer_transaction WHERE easyfixer_id/i, () => [{ balance: W.tails.efr }]],
   [/FROM tbl_easyfix_transaction ORDER BY/i, () => [{ balance: W.tails.ef }]],
   [/FROM tbl_client_transaction WHERE client_id/i, () => [{ balance: W.tails.client }]],
@@ -74,7 +80,12 @@ function scriptedConn(extraRoutes = []) {
     async query(sql, params) {
       const text = String(Array.isArray(sql) ? sql[0] : sql);
       calls.push({ sql: text.replace(/\s+/g, ' ').trim(), params });
-      if (W.failOn && W.failOn.test(text)) throw new Error('simulated DB failure');
+      if (W.releaseFails && /RELEASE_LOCK/i.test(text)) throw new Error('connection was killed');
+      if (W.failOn && W.failOn.test(text)) {
+        const e = new Error('simulated DB failure');
+        if (W.failErrno) { e.errno = W.failErrno; W.failOn = null; }   // retryable: fail once
+        throw e;
+      }
       for (const [re, resp] of routes) {
         if (re.test(text)) {
           const rows = resp(text, params);
@@ -88,6 +99,7 @@ function scriptedConn(extraRoutes = []) {
     commit: async () => { calls.push({ sql: 'COMMIT' }); },
     rollback: async () => { calls.push({ sql: 'ROLLBACK' }); },
     release: () => { calls.push({ sql: 'RELEASE' }); },
+    destroy: () => { calls.push({ sql: 'DESTROY' }); },
   };
 }
 
@@ -210,7 +222,10 @@ test('a clean completion posts the job row, three ledgers and the balance cache'
   assert.equal(inserted(conn, 'tbl_easyfix_transaction')[0].params[5], 1846, 'EasyFix tail 1000 + 846');
   assert.equal(inserted(conn, 'tbl_client_transaction')[0].params[6], 50, 'client tail 50 + 0');
   const [cache] = find(conn, /UPDATE tbl_easyfixer SET current_balance/i);
-  assert.deepEqual(cache.params, [454, 7], 'current_balance becomes the new ledger tail');
+  assert.equal(cache.params[0], 454, 'current_balance becomes the new ledger tail');
+  assert.equal(cache.params[2], 7);
+  assert.ok(cache.params[1] instanceof Date, 'balance_updated is stamped, as the SP does');
+  assert.match(cache.sql, /balance_updated = \?/);
 });
 
 test('collected_by 1 (technician collected) debits the technician the EasyFix + client shares', async () => {
@@ -268,27 +283,33 @@ test('unpostable jobs write nothing: no technician, collected_by unset, complete
   }
 });
 
-test('a busy ledger lock fails the post loudly instead of racing', async () => {
+test('a busy ledger lock fails the post loudly, with a message the caller is allowed to see', async () => {
   W.lines = [CHAIR]; W.lockGot = 0;
-  await assert.rejects(ledger.postCompletionLedger(scriptedConn(), { jobId: 42, fromStatus: 10 }), (e) => e.status === 503);
+  // 409, not 5xx: the error handler drops the sentence on anything >= 500, and
+  // "the ledger is busy, try again" is exactly what ops need to read.
+  await assert.rejects(ledger.postCompletionLedger(scriptedConn(), { jobId: 42, fromStatus: 10 }),
+    (e) => e.status === 409 && e.code === 'LEDGER_BUSY');
 });
 
 // ── 5. Locks ────────────────────────────────────────────────────────
 
-test('lock order and read kinds: plain existence reads, then the named lock, then LOCKING tails, balance cache last', async () => {
+test('lock order and read kinds: plain existence reads, named lock, TECHNICIAN ROW, then LOCKING tails', async () => {
   W.lines = [CHAIR];
   const conn = scriptedConn();
   await ledger.postCompletionLedger(conn, { jobId: 42, fromStatus: 10 });
   const jobLock = idx(conn, /FROM tbl_job WHERE job_id = \? FOR UPDATE/i);
   const named = idx(conn, /GET_LOCK/i);
+  const techRow = idx(conn, /FROM tbl_easyfixer WHERE efr_id = \? FOR UPDATE/i);
   const efrTail = idx(conn, /FROM tbl_easyfixer_transaction WHERE easyfixer_id/i);
   const efTail = idx(conn, /FROM tbl_easyfix_transaction ORDER BY/i);
   const clTail = idx(conn, /FROM tbl_client_transaction WHERE client_id/i);
   const firstInsert = idx(conn, /INSERT INTO tbl_easyfixer_transaction/i);
   const cache = idx(conn, /UPDATE tbl_easyfixer SET/i);
-  for (const [n, i] of Object.entries({ jobLock, named, efrTail, efTail, clTail, firstInsert, cache })) assert.ok(i >= 0, `${n} not found`);
-  assert.ok(jobLock < named && named < efrTail && efrTail < efTail && efTail < clTail && clTail < firstInsert && firstInsert < cache,
-    'job row → named lock → technician / EasyFix / client tails → inserts → technician row (the SP\'s own order)');
+  for (const [n, i] of Object.entries({ jobLock, named, techRow, efrTail, efTail, clTail, firstInsert, cache })) assert.ok(i >= 0, `${n} not found`);
+  assert.ok(jobLock < named && named < techRow && techRow < efrTail && efrTail < efTail && efTail < clTail && clTail < firstInsert && firstInsert < cache,
+    'job row → named lock → TECHNICIAN ROW → technician / EasyFix / client tails → inserts → balance cache. '
+    + 'The technician row precedes the tails because withdrawal pay, admin recharge, NDM approval and a legacy '
+    + 'Check Out\'s FK check all take it first; with it last, they hold it while waiting for the tail gap this post holds.');
   for (const i of [efrTail, efTail, clTail]) {
     assert.match(conn.calls[i].sql, /FOR UPDATE$/i, 'a tail read must be LOCKING, or it answers from a stale snapshot');
   }
@@ -314,6 +335,10 @@ function installPool(meta) {
     poolCalls.push({ sql: text.replace(/\s+/g, ' ').trim(), params });
     if (PHOTO.test(text)) return [[{ 1: 1 }], []];
     if (/INFORMATION_SCHEMA/i.test(text)) return [[{ n: 3 }], []];
+    // setStatus's cancel guard asks the POOL whether this job is posted.
+    if (/COUNT\(\*\) AS n FROM tbl_job_transaction/i.test(text)) return [[{ n: W.postedAlready ? 1 : 0 }], []];
+    // getById, which setStatus returns (and now hangs the ledger outcome on).
+    if (/WHERE\s+j\.job_id\s*=\s*\?\s*LIMIT\s+1/i.test(text)) return [[{ job_id: 42, job_status: 3 }], []];
     if (/FROM\s+tbl_job\s+WHERE\s+job_id/i.test(text)) return [[meta], []];
     return [[], []];
   };
@@ -358,28 +383,109 @@ test('a failed post rolls the completion back and surfaces the error', async () 
   assert.ok(seq.some((s) => /RELEASE_LOCK/i.test(s)) && seq.includes('RELEASE'), 'lock and connection still released');
 });
 
-test('an unpostable completion still lands, with nothing posted', async () => {
+test('a completion that cannot be posted still lands, posts nothing, and TELLS THE CALLER why', async () => {
+  /*
+   * Not refused: legacy's collected_by gate is in its check-out SCREEN, not its
+   * server (the SP posts zero-amount rows instead), and this backend has no
+   * screen where ops can set Collected By on a job that is ready to complete.
+   * Refusing would block completions with no remedy. So it lands, unposted, and
+   * says so — a WARN in a container log is not an answer to a click.
+   */
   installPool({ ...META });
   W.lines = [CHAIR]; W.job.collected_by = 0;
-  await jobSvc.setStatus(42, { status: 3 }, CRM);
+  const out = await jobSvc.setStatus(42, { status: 3 }, CRM);
   const seq = txConn.calls.map((c) => c.sql);
   assert.ok(seq.includes('COMMIT'), 'the status change commits');
-  assert.equal(seq.filter((s) => /INSERT INTO tbl_(easyfixer|easyfix|client)_transaction/i.test(s)).length, 0);
+  assert.equal(seq.filter((s) => /INSERT INTO tbl_(easyfixer|easyfix|client)_transaction/i.test(s)).length, 0, 'no money moved');
+  assert.equal(out.ledger.posted, false);
+  assert.match(out.ledger.reason, /collected_by/, 'the caller is told which fix unblocks it');
 });
 
-test('a technician completion never writes an efr id into a tbl_user FK', async () => {
+test('a posted completion reports what it posted', async () => {
+  installPool({ ...META });
+  W.lines = [CHAIR];
+  const out = await jobSvc.setStatus(42, { status: 3 }, CRM);
+  assert.equal(out.ledger.posted, true);
+  assert.equal(out.ledger.job_transaction, true);
+  assert.equal(out.ledger.amounts.efr, 354);
+  assert.equal(out.ledger.balances.efr, 454);
+});
+
+test('a CRM move into 3 / 5 posts even when the technician app completed the job first', async () => {
+  installPool({ ...META, job_status: 3 });
+  W.lines = [CHAIR]; W.job.job_status = 3;
+  await jobSvc.setStatus(42, { status: 5 }, CRM);
+  assert.equal(inserted(txConn, 'tbl_easyfixer_transaction').length, 1,
+    'ops moving 3 → 5 is the moment a technician-completed job gets its ledger');
+});
+
+test('a technician-app completion posts nothing, and never writes an efr id into a tbl_user FK', async () => {
   installPool({ ...META, job_status: 2 });
   W.lines = [CHAIR];
   await jobSvc.setStatus(42, { status: 3 }, TECH);
-  const u = txConn.calls.find((c) => /^UPDATE tbl_job SET/i.test(c.sql));
-  assert.equal(checkoutBy(u.sql, u.params), null, 'fk_checkout_by: NULL, not efr 55');
-  const [efr] = inserted(txConn, 'tbl_easyfixer_transaction');
-  assert.equal(efr.params[7], null, 'ledger created_by: NULL, not efr 55');
+  assert.equal(txConn.calls.length, 0, 'no transaction: legacy posts at the ops Check Out, not at the technician\'s close');
+  const u = poolCalls.find((c) => /^UPDATE tbl_job SET/i.test(c.sql));
+  assert.equal(checkoutBy(u.sql, u.params), null, 'fk_checkout_by: NULL, not efr 55 (a tbl_user FK)');
 });
 
-test('moving between 3 and 5 is not a completion: no transaction, no ledger', async () => {
+test('a partner-API completion posts nothing either', async () => {
+  installPool({ ...META, job_status: 2 });
+  W.lines = [CHAIR];
+  await jobSvc.setStatus(42, { status: 3 }, { user_id: null }, { partnerApi: true });
+  assert.equal(txConn.calls.length, 0);
+  assert.equal(poolCalls.filter((c) => /^UPDATE tbl_job SET/i.test(c.sql)).length, 1, 'the status still changes');
+});
+
+test('a posted completion cannot be cancelled here — nothing in this backend reverses a posting', async () => {
   installPool({ ...META, job_status: 3 });
-  await jobSvc.setStatus(42, { status: 5 }, CRM);
-  assert.equal(txConn.calls.length, 0, 'no connection was even taken');
-  assert.equal(poolCalls.filter((c) => /^UPDATE tbl_job SET/i.test(c.sql)).length, 1, 'the plain status write still happens');
+  W.postedAlready = true;
+  const guardSaw = () => poolCalls.filter((c) => /COUNT\(\*\) AS n FROM tbl_job_transaction/i.test(c.sql)).length;
+  await assert.rejects(jobSvc.setStatus(42, { status: 6 }, CRM),
+    (e) => e.status === 409 && e.code === 'COMPLETION_POSTED' && /legacy CRM/.test(e.message),
+    `the guard ran ${guardSaw()} time(s); pool saw: ${poolCalls.map((c) => c.sql.slice(0, 50)).join(' | ')}`);
+  assert.equal(guardSaw(), 1, 'positive control: the guard asked whether the job is posted');
+  assert.equal(poolCalls.filter((c) => /^UPDATE tbl_job SET/i.test(c.sql)).length, 0, 'refused before the write');
+
+  installPool({ ...META, job_status: 3 });
+  W.postedAlready = false;
+  await jobSvc.setStatus(42, { status: 6 }, CRM);           // unposted: cancelling is still allowed
+  assert.ok(poolCalls.some((c) => /^UPDATE tbl_job SET/i.test(c.sql)), 'the cancellation writes');
+});
+
+// ── 7. The transaction wrapper ──────────────────────────────────────
+
+test('a deadlock is retried once; a second one becomes LEDGER_BUSY, never a 500', async () => {
+  installPool({ ...META });
+  W.lines = [CHAIR]; W.failOn = /INSERT INTO tbl_easyfix_transaction/i; W.failErrno = 1213;  // clears itself: fails once
+  await jobSvc.setStatus(42, { status: 3 }, CRM);
+  assert.ok(txConn.calls.map((c) => c.sql).includes('COMMIT'), 'the retry committed');
+
+  installPool({ ...META });
+  W.lines = [CHAIR];
+  const always = new Error('deadlock'); always.errno = 1213;
+  await assert.rejects(
+    ledger.inLedgerTransaction(() => { throw always; }, { db: { getConnection: async () => txConn } }),
+    (e) => e.status === 409 && e.code === 'LEDGER_BUSY',
+  );
+  assert.equal(txConn.calls.filter((c) => c.sql === 'ROLLBACK').length, 2, 'two attempts, both rolled back');
+});
+
+test('row-lock waits are bounded below the named-lock timeout and the session is restored', async () => {
+  installPool({ ...META });
+  W.lines = [CHAIR];
+  await jobSvc.setStatus(42, { status: 3 }, CRM);
+  const sets = txConn.calls.filter((c) => /SET SESSION innodb_lock_wait_timeout/i.test(c.sql));
+  assert.deepEqual(sets.map((c) => c.params[0]), [5, 50],
+    'bounded to 5s inside the post, then put back — pooled connections are not reset on release');
+  assert.ok(txConn.calls.map((c) => c.sql).indexOf('COMMIT') < txConn.calls.findIndex((c) => /RELEASE_LOCK/i.test(c.sql)),
+    'the named lock outlives the commit, or another writer could read the tail before these rows are visible');
+});
+
+test('a connection whose lock release fails is destroyed, not handed back to the pool', async () => {
+  installPool({ ...META });
+  W.lines = [CHAIR]; W.releaseFails = true;
+  await jobSvc.setStatus(42, { status: 3 }, CRM);
+  const seq = txConn.calls.map((c) => c.sql);
+  assert.ok(seq.includes('DESTROY') && !seq.includes('RELEASE'),
+    'GET_LOCK is re-entrant per session: a pooled connection still holding it would block every other completion');
 });

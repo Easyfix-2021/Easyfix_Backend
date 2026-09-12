@@ -19,6 +19,17 @@
  * and the 208 old jobs with a ledger row but no job row. It never writes
  * tbl_job: status, checkout time, paid_by and material_charge stay as they are.
  *
+ * AND IT REFUSES WHAT THE LIVE PATH REFUSES. Same unpostableReason (no
+ * technician, collected_by not 1-3), plus two only a backfill can meet: a job
+ * whose 'status change' log shows it completed out of CANCELLED (the live path
+ * refuses those, so posting them here would contradict it), and a job that was
+ * cancelled at some point with no log to show how it completed — reported for
+ * review rather than posted.
+ *
+ * Each posted row names the CRM user who completed the job, taken from its
+ * 'checkout' log where there is one (the new backend has written those since
+ * 2026-08-20); older jobs post as the system, like legacy's own system rows.
+ *
  * READ THE DRY RUN BEFORE APPLYING. Postings change live gates at once:
  * credits can lift a technician over the ₹500 COD gate and unlock withdrawals;
  * a debit (collected_by 1, the technician kept the cash) can take one below
@@ -75,7 +86,8 @@ function parseArgs(argv) {
  */
 async function findCandidates(conn, { since, jobId }) {
   const [rows] = await conn.query(
-    `SELECT j.job_id, j.job_status, j.fk_easyfixter_id, j.collected_by, j.checkout_date_time
+    `SELECT j.job_id, j.job_status, j.fk_easyfixter_id, j.collected_by, j.fk_client_id,
+            j.checkout_date_time, j.cancel_date_time
        FROM tbl_job j
        LEFT JOIN tbl_job_transaction jt ON jt.fk_job_id = j.job_id
        LEFT JOIN (SELECT DISTINCT job_id FROM tbl_easyfixer_transaction WHERE job_id > 0) e ON e.job_id = j.job_id
@@ -92,13 +104,55 @@ async function findCandidates(conn, { since, jobId }) {
 
 const signedEfr = (moves) => (moves.efr.type === ledger.DEBIT ? -moves.efr.amount : moves.efr.amount);
 
+/*
+ * Two batched log reads for the whole candidate set (tbl_job_logs is indexed by
+ * job_id; tbl_easyfixer_transaction is not, which is why plan() does NOT re-ask
+ * whether a job is posted — findCandidates already excluded posted jobs with one
+ * scan, and the post itself re-checks under the job's lock):
+ *   - how the job entered 3/5, because the live path refuses to post a
+ *     completion out of CANCELLED and so must this;
+ *   - which CRM user completed it ('checkout' changed_by), so the backfilled
+ *     rows name them as legacy does instead of posting as the system.
+ */
+async function annotate(conn, candidates) {
+  const byId = new Map(candidates.map((c) => [Number(c.job_id), { ...c, fromCancelled: false, completedBy: null, sawStatusLog: false }]));
+  const ids = [...byId.keys()];
+  for (let i = 0; i < ids.length; i += 500) {
+    const chunk = ids.slice(i, i + 500);
+    const [moves] = await conn.query(
+      `SELECT job_id, MAX(old_data = 'Status: 6') AS from_cancelled
+         FROM tbl_job_logs
+        WHERE log_for = 'status change' AND new_data IN ('Status: 3', 'Status: 5') AND job_id IN (?)
+        GROUP BY job_id`, [chunk],
+    );
+    for (const m of moves) {
+      const c = byId.get(Number(m.job_id));
+      if (c) { c.sawStatusLog = true; c.fromCancelled = Number(m.from_cancelled) === 1; }
+    }
+    const [actors] = await conn.query(
+      `SELECT job_id, MAX(changed_by) AS changed_by
+         FROM tbl_job_logs WHERE log_for = 'checkout' AND job_id IN (?) GROUP BY job_id`, [chunk],
+    );
+    for (const a of actors) {
+      const c = byId.get(Number(a.job_id));
+      if (c && Number(a.changed_by) > 0) c.completedBy = Number(a.changed_by);
+    }
+  }
+  return [...byId.values()];
+}
+
 /** The plan: what each job would post, and each technician's balance before and after. */
 async function plan(conn, candidates) {
   const jobs = [];
-  for (const c of candidates) {
-    const p = await ledger.previewCompletionLedger(c.job_id, conn);
-    jobs.push({ ...c, postable: p.postable, reason: p.reason, amounts: p.amounts, moves: p.moves,
-      efrDelta: p.postable ? signedEfr(p.moves) : 0 });
+  for (const c of await annotate(conn, candidates)) {
+    // The live path's own test, plus the two the backfill alone can make:
+    // a completion out of CANCELLED, and one whose path no log can show.
+    let reason = ledger.unpostableReason(c);
+    if (!reason && c.fromCancelled) reason = 'completed out of CANCELLED';
+    if (!reason && c.cancel_date_time && !c.sawStatusLog) reason = 'was cancelled once and no log shows how it completed — review by hand';
+    const amounts = await ledger.computeCompletionAmounts(conn, c.job_id);
+    const moves = reason ? null : ledger.ledgerMoves(c.collected_by, amounts);
+    jobs.push({ ...c, postable: !reason, reason, amounts, moves, efrDelta: moves ? signedEfr(moves) : 0 });
   }
   const byTech = new Map();
   for (const j of jobs.filter((x) => x.postable)) {
@@ -150,24 +204,22 @@ function writeCsv(path, { jobs, techs }) {
 }
 
 /** Post each postable job in its own transaction. Returns the tally. */
-async function apply(pool, jobs) {
+async function apply(db, jobs) {
   const tally = { posted: 0, skipped: 0, failed: 0 };
   for (const j of jobs.filter((x) => x.postable)) {
-    const conn = await pool.getConnection();
     try {
-      await conn.beginTransaction();
-      const r = await ledger.postCompletionLedger(conn, {
-        jobId: j.job_id, crmUserId: null, at: new Date(), jobTransactionAt: j.checkout_date_time,
-      });
-      await conn.commit();
+      // The live path's wrapper: bounded lock waits, one retry, the named lock
+      // released after the commit, the connection destroyed if it cannot be.
+      const r = await ledger.inLedgerTransaction((conn) => ledger.postCompletionLedger(conn, {
+        jobId: j.job_id,
+        crmUserId: j.completedBy,            // the CRM user who completed it, where a log says so
+        at: new Date(),
+        jobTransactionAt: j.checkout_date_time,
+      }), { db });
       if (r.ledgers || r.jobTransaction) tally.posted += 1; else tally.skipped += 1;
     } catch (e) {
-      try { await conn.rollback(); } catch (_) { /* the post error is the one to report */ }
       tally.failed += 1;
       console.error(`job ${j.job_id}: ${e.message}`);
-    } finally {
-      await ledger.releaseLedgerLock(conn);
-      conn.release();
     }
   }
   return tally;
@@ -198,4 +250,4 @@ if (require.main === module) {
     .finally(() => require('../db').pool.end().catch(() => {}));
 }
 
-module.exports = { parseArgs, findCandidates, plan, apply, main, GO_LIVE };
+module.exports = { parseArgs, findCandidates, annotate, plan, apply, main, GO_LIVE };

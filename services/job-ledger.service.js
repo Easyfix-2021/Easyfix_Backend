@@ -56,6 +56,11 @@ const CREDIT = 2;
 const CANCELLED = 6;
 const LEDGER_LOCK = 'easyfix:completion-ledger';
 const LEDGER_LOCK_TIMEOUT_S = 10;
+// Row-lock waits inside a post are bounded BELOW the named-lock timeout: a post
+// stuck on one technician's row would otherwise hold the named lock for
+// innodb_lock_wait_timeout (50 s on QA) while every other completion 409s.
+const ROW_LOCK_WAIT_S = 5;
+const RETRYABLE_ERRNO = new Set([1213 /* ER_LOCK_DEADLOCK */, 1205 /* ER_LOCK_WAIT_TIMEOUT */]);
 const MIN_FEE_PARAM_ID = 6;       // tbl_easyfixer_rating_parameters_weightage: minimum_easyfixer_fee
 
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
@@ -258,24 +263,31 @@ async function postCompletionLedger(conn, { jobId, fromStatus, crmUserId = null,
   }
 
   /*
-   * LOCK ORDER — this job's row (held), the named lock, the three ledger tails
-   * in the SP's own insert order (technician, EasyFix, client), and the
-   * technician row last, as the SP's closing UPDATE does. A legacy Check Out
-   * racing this one therefore queues behind it instead of deadlocking.
+   * LOCK ORDER — this job's row (held), the named lock, the TECHNICIAN ROW,
+   * then the three ledger tails (technician, EasyFix, client).
+   *
+   * Technician row before the tails, because every other writer of this
+   * technician's balance takes it first: withdrawal pay, admin recharge and NDM
+   * approval lock it FOR UPDATE and then insert a ledger row, and a legacy
+   * Check Out's ledger INSERT takes it in share mode for its foreign key. With
+   * the row last, the post would hold the tail gap those inserts need while
+   * waiting for the row they hold — a cycle. First, they all queue on the row.
+   * (The one interleaving left — a legacy SP that already holds the row in
+   * share mode and then upgrades it — InnoDB detects; inLedgerTransaction
+   * retries once.)
    *
    * The tails are LOCKING reads for a reason. A plain read answers from the
    * snapshot this transaction took at its first plain read — before the named
    * lock was held — so it could miss a row another writer committed in
    * between: the very lost update this service exists to stop. The named lock
-   * is what keeps two of OUR writers from holding the tail gap at once (gap
-   * locks are compatible, so without it both would read one tail and both
-   * would insert).
+   * keeps two of OUR writers from holding a tail gap at once (gap locks are
+   * compatible, so without it both would read one tail and both would insert).
+   * Writers that read a tail WITHOUT locking — the legacy SPs — can still race
+   * each other and us; that is theirs to fix, not something Node can prevent.
    */
   const [[lock]] = await conn.query('SELECT GET_LOCK(?, ?) AS got', [LEDGER_LOCK, LEDGER_LOCK_TIMEOUT_S]);
-  if (Number(lock && lock.got) !== 1) {
-    const err = new Error('The ledger is busy; try completing the job again.');
-    err.status = 503; throw err;
-  }
+  if (Number(lock && lock.got) !== 1) throw ledgerBusy();
+  await conn.query('SELECT efr_id FROM tbl_easyfixer WHERE efr_id = ? FOR UPDATE', [efrId]);
 
   const tail = async (sql, params) => { const [[r]] = await conn.query(sql, params); return num(r && r.balance); };
   const efrBal = round2(await tail('SELECT balance FROM tbl_easyfixer_transaction WHERE easyfixer_id = ? ORDER BY transaction_id DESC LIMIT 1 FOR UPDATE', [efrId]) + signed(moves.efr));
@@ -301,18 +313,76 @@ async function postCompletionLedger(conn, { jobId, fromStatus, crmUserId = null,
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [job.fk_client_id, SOURCE_SYSTEM, desc, moves.client.type, at, moves.client.amount, clBal, createdBy, jobId],
   );
-  // current_balance is a cache of the ledger tail (3,926 of 3,927 technicians on QA).
-  await conn.query('UPDATE tbl_easyfixer SET current_balance = ? WHERE efr_id = ?', [efrBal, efrId]);
+  // current_balance is a cache of the ledger tail (3,926 of 3,927 technicians on
+  // QA); balance_updated is stamped with it, as the SP does (the CRM shows it).
+  await conn.query('UPDATE tbl_easyfixer SET current_balance = ?, balance_updated = ? WHERE efr_id = ?', [efrBal, at, efrId]);
 
   logger.info('Completion ledger posted · jobId=' + jobId + ' · efr=' + efrId + ' · collected_by=' + job.collected_by
     + ' · efr ' + (moves.efr.type === DEBIT ? '-' : '+') + moves.efr.amount + ' → ' + efrBal);
   return { posted: true, jobTransaction, ledgers: true, amounts, moves, balances: { efr: efrBal, ef: efBal, client: clBal } };
 }
 
-/** Safe to call whether or not the lock is held. Never throws. */
+function ledgerBusy() {
+  const err = new Error('The ledger is busy — try completing the job again in a moment.');
+  err.status = 409; err.code = 'LEDGER_BUSY';
+  return err;
+}
+
+/**
+ * Safe to call whether or not the lock is held. Never throws. Returns false
+ * when the release itself failed: that connection may still hold the lock, and
+ * GET_LOCK is re-entrant per session, so it must be destroyed, never pooled.
+ */
 async function releaseLedgerLock(conn) {
-  try { await conn.query('SELECT RELEASE_LOCK(?)', [LEDGER_LOCK]); } catch (e) {
+  try { await conn.query('SELECT RELEASE_LOCK(?)', [LEDGER_LOCK]); return true; } catch (e) {
     logger.warn('Completion ledger lock release failed · ' + e.message);
+    return false;
+  }
+}
+
+/**
+ * Run `fn(conn)` in one transaction on a dedicated connection, the way every
+ * ledger post must: row-lock waits bounded below the named-lock timeout, one
+ * retry on a deadlock or lock-wait timeout (then LEDGER_BUSY), the named lock
+ * released AFTER commit / rollback, the session restored before the connection
+ * goes back to the pool (mysql2 does not reset it), and a connection that could
+ * not be cleaned up destroyed rather than reused.
+ */
+async function inLedgerTransaction(fn, { db = pool, attempts = 2 } = {}) {
+  for (let attempt = 1; ; attempt += 1) {
+    const conn = await db.getConnection();
+    let healthy = true;
+    try {
+      /*
+       * Bound the row-lock wait ONLY when the old value can be read back, so
+       * the connection is never returned to the pool with a session this code
+       * could not restore (mysql2 does not reset one on release).
+       */
+      const [[waitRow]] = await conn.query('SELECT @@SESSION.innodb_lock_wait_timeout AS wait');
+      const previousWait = waitRow && waitRow.wait != null ? Number(waitRow.wait) : null;
+      if (previousWait != null) await conn.query('SET SESSION innodb_lock_wait_timeout = ?', [ROW_LOCK_WAIT_S]);
+      try {
+        await conn.beginTransaction();
+        const out = await fn(conn);
+        await conn.commit();
+        return out;
+      } catch (e) {
+        try { await conn.rollback(); } catch (rbErr) {
+          healthy = false;
+          logger.warn('Ledger rollback failed · ' + rbErr.message);
+        }
+        if (!RETRYABLE_ERRNO.has(e.errno)) throw e;
+        if (attempt >= attempts) { logger.warn('Ledger post gave up · ' + e.message); throw ledgerBusy(); }
+        logger.warn('Ledger post retrying · ' + e.message);   // falls through to the next attempt
+      } finally {
+        healthy = (await releaseLedgerLock(conn)) && healthy;
+        if (previousWait != null) {
+          try { await conn.query('SET SESSION innodb_lock_wait_timeout = ?', [previousWait]); } catch (_) { healthy = false; }
+        }
+      }
+    } finally {
+      if (healthy) conn.release(); else conn.destroy();
+    }
   }
 }
 
@@ -335,7 +405,7 @@ async function previewCompletionLedger(jobId, conn = pool) {
     collected_by: job ? job.collected_by : null,
     already: { job_transaction: Number(jt.n) > 0, technician_ledger: Number(led.n) > 0 },
     amounts,
-    moves: amounts ? ledgerMoves(job.collected_by, amounts) : null,
+    moves: amounts && !reason ? ledgerMoves(job.collected_by, amounts) : null,
   };
 }
 
@@ -345,6 +415,8 @@ module.exports = {
   computeCompletionAmounts,
   postCompletionLedger,
   releaseLedgerLock,
+  inLedgerTransaction,
+  ledgerBusy,
   previewCompletionLedger,
   unpostableReason,
   LEDGER_LOCK,
