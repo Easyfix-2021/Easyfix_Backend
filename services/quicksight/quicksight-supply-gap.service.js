@@ -905,9 +905,8 @@ async function txCount(cityId, catgId) {
  * "New Supply Request" + edit-while-Open, ported from the legacy
  * OpenCityController.saveOrUpdateOpenCity at ops' request. The header of
  * routes/admin/quicksight/supply-gap.js recorded the earlier decision to keep
- * this surface read-only; that decision was reversed for create/edit only.
- * Technician allocation (actionOnSupplyRequest) and remarks (addComment) are
- * still NOT ported.
+ * this surface read-only; that decision was reversed. Actions (allocation,
+ * cancel, complete, remarks, invites) follow further down.
  *
  * Side effects match legacy, but ordered so a notification failure can never
  * lose the request:
@@ -1105,6 +1104,191 @@ async function update(openCityId, { catgId, comments }, actor) {
   return { id: openCityId, whatsapp };
 }
 
+/*
+ * ── ACTIONS (2026-09-14) — legacy actionOnSupplyRequest + addComment + saveEfrInvite ──
+ *
+ * action_type doubles as the status it moves the request to, exactly as legacy:
+ *   1 Add A New Supply            → status 1 (In Progress)
+ *   2 Allocate An Existing Supply → status 2 (Assigned)
+ *   3 Cancel                      → status 3
+ *   4 Mark Complete               → status 4
+ *   9 Remark                      → no status change
+ *
+ * Which action is offered in which status also follows legacy's button matrix
+ * (opencity.component.html) — but is ENFORCED here, not just hidden in the UI:
+ *   Open (0)             → cancel, allocate existing, add new
+ *   In Progress / Assigned (1, 2) → cancel, complete, add new
+ *   Cancelled / Completed (3, 4)  → remarks only
+ *
+ * Every state change writes its supply_request_log line in the SAME transaction
+ * as the tbl_open_city update (and the allocation row), so the Action History
+ * can never disagree with the status. Notifications and the tbl_efr_invite
+ * audit row run after commit and never fail the action.
+ */
+
+const ACTIONS_BY_STATUS = {
+  0: [1, 2, 3],
+  1: [1, 3, 4],
+  2: [1, 3, 4],
+  3: [],
+  4: [],
+};
+
+/* Legacy isCompleteEnabled: a Job ID gap may only be closed once its job is. */
+const JOB_STATUSES_THAT_ALLOW_COMPLETE = new Set([3, 5, 6, 7, 10, 15, 21]);
+
+// Best-effort mirror of legacy's tbl_efr_invite audit row. Never throws.
+async function logEfrInvite({ name, mobile, remarks, inviteStatus, supplyId, userId }) {
+  try {
+    await pool.query(
+      `INSERT INTO tbl_efr_invite (efr_name, efr_mobile, remarks, invite_status, supply_id, invited_by, invited_on)
+       VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+      [name, mobile, remarks || null, String(inviteStatus).slice(0, 50), supplyId ?? null, userId ?? null],
+    );
+    return true;
+  } catch (err) {
+    logger.warn({ err: err.message }, 'EFR invite log failed (non-fatal)');
+    return false;
+  }
+}
+
+async function loadForAction(openCityId) {
+  const [[row]] = await pool.query(
+    `SELECT TOC.id, TOC.status, TOC.request_for, TOC.reference_id, TOC.city, TOC.category_id,
+            TJ.job_status AS job_status
+       FROM tbl_open_city TOC
+       LEFT JOIN tbl_job TJ ON TJ.job_id = TOC.reference_id AND TOC.request_for = 1
+      WHERE TOC.id = ?`,
+    [openCityId],
+  );
+  if (!row) throw badRequest('Supply gap not found', 404);
+  return row;
+}
+
+// ── 12) addRemark() — addRemarksForSupplyRequest (action_type 9) ──────────
+async function addRemark(openCityId, comment, actor) {
+  logger.info('Add supply gap remark · id=' + openCityId + ' by=' + actor?.user_id);
+  await loadForAction(openCityId);
+  await pool.query(
+    `INSERT INTO supply_request_log (sr_id, comment, action_type, user_id, insert_time, tx_details)
+     VALUES (?, ?, 9, ?, NOW(), NULL)`,
+    [openCityId, comment, actor?.user_id || null],
+  );
+  return { id: openCityId };
+}
+
+// ── 13) act() — actionOnSupplyRequest ────────────────────────────────────
+async function act(openCityId, body, actor) {
+  const { actionType, remarks } = body;
+  const userId = actor?.user_id || null;
+  logger.info('Supply gap action · id=' + openCityId + ' actionType=' + actionType + ' by=' + userId);
+
+  const row = await loadForAction(openCityId);
+  const allowed = ACTIONS_BY_STATUS[row.status] || [];
+  if (!allowed.includes(actionType)) {
+    throw badRequest('This action is not available for a request in its current status.', 409);
+  }
+  if (actionType === 4 && row.request_for === 1 && !JOB_STATUSES_THAT_ALLOW_COMPLETE.has(Number(row.job_status))) {
+    throw badRequest('You cannot close this request because its job is still open.', 409);
+  }
+
+  // Resolve the technician SERVER-SIDE — the browser only ever sends an efr id
+  // (existing) or the operator-typed name + number (new).
+  let tech = null;
+  if (actionType === 1) {
+    const status = await resolveSupplyStatus(body.newSupplyNumber);
+    if (status === 'Active') {
+      throw badRequest('This technician is already active — use "Allocate An Existing Supply" instead.', 409);
+    }
+    tech = { name: body.newSupplyName, mobile: body.newSupplyNumber, txDetails: `${body.newSupplyName}_${body.newSupplyNumber}` };
+  } else if (actionType === 2) {
+    const tx = await txDetails(body.oldSupplyId, row.category_id);
+    // Legacy's allocation checklist, enforced: same city, category match,
+    // Active, and (New City only) at most 10 orders.
+    const cityOk = (tx.cityName || '').trim().toLowerCase() === (row.city || '').trim().toLowerCase();
+    const ordersOk = row.request_for === 1 || tx.txOrderCount <= 10;
+    if (!cityOk || !tx.categoryMatch || tx.supplyStatus !== 'Active' || !ordersOk) {
+      throw badRequest('This technician does not pass the allocation checks (city, category, active, orders).', 409);
+    }
+    tech = { id: tx.efrId, name: tx.efrName, mobile: tx.efrNo, txDetails: `${tx.efrId} - ${tx.efrName}_${tx.efrNo}` };
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    if (actionType === 1 || actionType === 2) {
+      await conn.query(
+        `UPDATE tbl_open_city
+            SET action_by = ?, action_on = NOW(), action_remarks = ?, status = ?,
+                ${actionType === 1 ? 'new_supply_name = ?, new_supply_number = ?' : 'old_supply_id = ?'}
+          WHERE id = ?`,
+        actionType === 1
+          ? [userId, remarks, actionType, tech.name, tech.mobile, openCityId]
+          : [userId, remarks, actionType, tech.id, openCityId],
+      );
+      await conn.query(
+        `INSERT INTO tbl_supply_request_allocation (sr_id, supply_name, supply_no, remarks, supply_type, insert_by, insert_date)
+         VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+        [openCityId, tech.name, tech.mobile, remarks, actionType, userId],
+      );
+    } else {
+      await conn.query(
+        'UPDATE tbl_open_city SET closed_by = ?, closed_on = NOW(), closed_comments = ?, status = ? WHERE id = ?',
+        [userId, remarks, actionType, openCityId],
+      );
+    }
+    await conn.query(
+      `INSERT INTO supply_request_log (sr_id, comment, action_type, user_id, insert_time, tx_details)
+       VALUES (?, ?, ?, ?, NOW(), ?)`,
+      [openCityId, remarks, actionType, userId, tech ? tech.txDetails : null],
+    );
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+  logger.info('Supply gap action applied · id=' + openCityId + ' status=' + actionType);
+
+  let whatsapp = null;
+  if (tech) {
+    await logEfrInvite({
+      name: tech.name,
+      mobile: tech.mobile,
+      remarks,
+      inviteStatus: row.request_for === 1 ? `JobId-${row.reference_id ?? openCityId}` : `NewCity-${row.city ?? openCityId}`,
+      supplyId: openCityId,
+      userId,
+    });
+    if (actionType === 1) {
+      // Legacy 'supply_onboard1' — the onboarding nudge to the NEW technician.
+      try {
+        const gallabox = require('../gallabox.whatsapp.service');
+        const r = await gallabox.sendTemplate({
+          to: tech.mobile,
+          recipientName: tech.name,
+          templateName: 'supply_onboard1',
+          bodyValues: { name: tech.name },
+        });
+        whatsapp = { sent: Boolean(r?.delivered), reason: r?.error || (r?.disabled ? 'notifications disabled' : null) };
+      } catch (err) {
+        logger.warn({ err: err.message }, 'Supply onboarding WhatsApp failed · id=' + openCityId);
+        whatsapp = { sent: false, reason: err.message };
+      }
+    }
+  }
+  return { id: openCityId, status: actionType, whatsapp };
+}
+
+// ── 14) invite() — saveEfrInvite (header "Invite Sent", no gap attached) ──
+async function invite({ name, mobile, remarks }, actor) {
+  logger.info('Supply gap manual invite · by=' + actor?.user_id);
+  const ok = await logEfrInvite({ name, mobile, remarks, inviteStatus: 'Invite Sent', supplyId: null, userId: actor?.user_id });
+  if (!ok) throw badRequest('Could not save the invite. Please try again.', 500);
+  return { saved: true };
+}
+
 module.exports = {
   list,
   exportRows,
@@ -1118,6 +1302,9 @@ module.exports = {
   pinDetail,
   create,
   update,
+  addRemark,
+  act,
+  invite,
   XLSX_COLUMNS,
   // Exposed for reuse/tests.
   _internals: { findGapAge, resolveSupplyStatus, resolveSupplyStatusBatch, normaliseFilters },

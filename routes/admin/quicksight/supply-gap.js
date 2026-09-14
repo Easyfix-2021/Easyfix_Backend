@@ -14,8 +14,8 @@
  * SCOPE: read / report surface PLUS create + edit (2026-09-14, per ops). The
  * legacy OpenCityController write endpoints mutate tbl_open_city + fire
  * WhatsApp + transferJobOwnershipToZM. `addUpdate` is now ported (POST / and
- * PUT /:id — side effects documented in the service). `actionOnSupplyRequest`
- * (technician allocation) and `addComment` (remarks) are still NOT ported.
+ * PUT /:id — side effects documented in the service), as are
+ * `actionOnSupplyRequest`, `addComment` and `saveEfrInvite`.
  * Writes are gated by the same per-report view key as the reads (product
  * decision: anyone who can see the dashboard can raise a request).
  *
@@ -31,6 +31,9 @@
  *   GET /pin/:pin               ← map_my_india + findCityUser (New City prefill)
  *   POST /                      ← addUpdate (id = 0)
  *   PUT /:id                    ← addUpdate (id ≠ 0, Open requests only)
+ *   POST /:id/remarks           ← addComment
+ *   POST /:id/action            ← actionOnSupplyRequest (new / existing supply, cancel, complete)
+ *   POST /invite                ← saveEfrInvite (header "Invite Sent")
  */
 
 const router = require('express').Router();
@@ -164,6 +167,29 @@ const updateBody = Joi.object({
   comments: reason,
 });
 
+const remarks = Joi.string().trim().min(1).max(500).required()
+  .messages({ 'any.required': 'Remarks are required', 'string.empty': 'Remarks are required' });
+const techName = Joi.string().trim().pattern(/^[A-Za-z ]+$/).min(2).max(100)
+  .messages({ 'string.pattern.base': 'Technician name can contain only letters and spaces' });
+const techMobile = Joi.string().pattern(/^[5-9]\d{9}$/)
+  .messages({ 'string.pattern.base': 'Contact number must be 10 digits starting with 5–9' });
+
+const remarkBody = Joi.object({ comment: remarks });
+// actionType 1 new supply · 2 existing supply · 3 cancel · 4 complete.
+const actionBody = Joi.object({
+  actionType: Joi.number().integer().valid(1, 2, 3, 4).required(),
+  remarks,
+  newSupplyName: techName.when('actionType', { is: 1, then: Joi.required(), otherwise: Joi.forbidden() }),
+  newSupplyNumber: techMobile.when('actionType', { is: 1, then: Joi.required(), otherwise: Joi.forbidden() }),
+  oldSupplyId: Joi.number().integer().min(1)
+    .when('actionType', { is: 2, then: Joi.required(), otherwise: Joi.forbidden() }),
+});
+const inviteBody = Joi.object({
+  name: techName.required(),
+  mobile: techMobile.required(),
+  remarks: Joi.string().trim().allow('', null).max(500),
+});
+
 // ── GET / — primary report list (paginated) + ?format=xlsx export ────────
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
   try {
@@ -282,6 +308,38 @@ router.post('/', validate(createBody), async (req, res, next) => {
   try {
     const result = await service.create(req.body, req.user);
     logger.info('Returning created supply gap · id=' + result.id);
+    modernOk(res, result);
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
+// ── POST /invite — header "Invite Sent" (technician invite, no gap) ───────
+router.post('/invite', validate(inviteBody), async (req, res, next) => {
+  try {
+    modernOk(res, await service.invite(req.body, req.user));
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
+// ── POST /:id/remarks — "+ Add Remark" ───────────────────────────────────
+router.post('/:id/remarks', validate(idParam, 'params'), validate(remarkBody), async (req, res, next) => {
+  try {
+    modernOk(res, await service.addRemark(req.params.id, req.body.comment, req.user));
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
+// ── POST /:id/action — new supply / existing supply / cancel / complete ───
+router.post('/:id/action', validate(idParam, 'params'), validate(actionBody), async (req, res, next) => {
+  try {
+    const result = await service.act(req.params.id, req.body, req.user);
+    logger.info('Returning supply gap action · id=' + req.params.id + ' status=' + result.status);
     modernOk(res, result);
   } catch (e) {
     if (e.status) return modernError(res, e.status, e.message);
