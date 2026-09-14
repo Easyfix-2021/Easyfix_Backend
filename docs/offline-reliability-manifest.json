@@ -120,16 +120,6 @@
       "testFiles": [
         "tests/idempotency.test.js"
       ]
-    },
-    {
-      "operation": "lifecycle.activityLog",
-      "method": "POST",
-      "path": "/api/mobile/activity-log",
-      "implementationFiles": [
-        "routes/mobile/activity-log.js",
-        "services/activity-log.service.js"
-      ],
-      "testFiles": []
     }
   ]
 }
