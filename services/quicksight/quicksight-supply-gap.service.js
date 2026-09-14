@@ -655,6 +655,7 @@ async function detail(openCityId) {
     districtName: r.district,
     stateName: r.state,
     stateUser: r.state_user,
+    clientId: r.client_id,
     catgId: r.category_id,
     comments: r.comments,
     referenceId: r.reference_id,
@@ -792,7 +793,7 @@ async function jobDetail(jobId) {
         WHEN TJ.job_status = 7 THEN FLOOR(TIMESTAMPDIFF(MINUTE, TJ.ticket_created_date_time, TJ.enquiry_date_time) / 1440.0)
         ELSE FLOOR(TIMESTAMPDIFF(MINUTE, TJ.ticket_created_date_time, NOW()) / 1440.0)
       END AS job_age,
-      TJ.job_desc, TJ.fk_service_catg_id,
+      TJ.job_desc, TJ.fk_service_catg_id, TJ.fk_client_id,
       TC.city_id, TC.state_user,
       TJ.job_status
     FROM tbl_job TJ
@@ -819,6 +820,7 @@ async function jobDetail(jobId) {
   }
   return {
     referenceId: r.job_id,
+    clientId: r.fk_client_id,
     clientName: r.client_name,
     pin: r.pin_code,
     cityName: r.city_name,
@@ -897,6 +899,212 @@ async function txCount(cityId, catgId) {
   return rows[0] ? rows[0].cnt || 0 : 0;
 }
 
+/*
+ * ── WRITE FLOW (2026-09-14) ────────────────────────────────────────────────
+ *
+ * "New Supply Request" + edit-while-Open, ported from the legacy
+ * OpenCityController.saveOrUpdateOpenCity at ops' request. The header of
+ * routes/admin/quicksight/supply-gap.js recorded the earlier decision to keep
+ * this surface read-only; that decision was reversed for create/edit only.
+ * Technician allocation (actionOnSupplyRequest) and remarks (addComment) are
+ * still NOT ported.
+ *
+ * Side effects match legacy, but ordered so a notification failure can never
+ * lose the request:
+ *   1. tbl_open_city INSERT + supply_request_log (action_type 0 "Opened") in
+ *      ONE transaction — the request and its first history line land together.
+ *   2. Job ID requests only: job_client_owner → the Zonal Manager, via the
+ *      existing job.changeOwner() (validation + owner_change_* audit columns)
+ *      instead of legacy's bare UPDATE.
+ *   3. WhatsApp 'suppy_update_zm' (sic — the approved Gallabox template name)
+ *      to the Zonal Manager, via the existing gallabox.sendTemplate().
+ * Steps 2 and 3 run after commit and are best-effort: their outcome is
+ * reported in the response rather than failing a request that is already saved.
+ */
+
+// ── 9) pinDetail() — New City prefill (legacy map_my_india + findCityUser) ──
+// Legacy geocoded the PIN through MapMyIndia, then looked the city up BY NAME to
+// find its Zonal Manager. tbl_pincode already maps PIN → city_id, and the city
+// row carries state_user, so one indexed read replaces both round-trips and
+// cannot mis-match two cities that share a name.
+async function pinDetail(pin) {
+  logger.info('Supply Gap PIN prefill · pin=' + pin);
+  const [rows] = await pool.query(
+    `SELECT p.pincode, c.city_id, c.city_name,
+            COALESCE(p.district, c.district) AS district,
+            s.state_name, c.state_user, zm.user_name AS zonal_manager_name
+       FROM tbl_pincode   p
+       LEFT JOIN tbl_city  c  ON c.city_id  = p.city_id
+       LEFT JOIN tbl_state s  ON s.state_id = c.state_id
+       LEFT JOIN tbl_user  zm ON zm.user_id = c.state_user
+      WHERE p.pincode = ?
+      LIMIT 1`,
+    [String(pin)],
+  );
+  if (rows.length === 0) {
+    logger.warn('PIN code not found · pin=' + pin);
+    const e = new Error('This PIN code is not in the system.');
+    e.status = 404;
+    throw e;
+  }
+  const r = rows[0];
+  return {
+    pin: Number(r.pincode),
+    cityId: r.city_id,
+    cityName: r.city_name,
+    districtName: r.district,
+    stateName: r.state_name,
+    stateUser: r.state_user,
+    stateUserName: r.zonal_manager_name,
+  };
+}
+
+function badRequest(message, status = 400) {
+  const e = new Error(message);
+  e.status = status;
+  return e;
+}
+
+// WhatsApp the Zonal Manager. Never throws — returns what happened.
+async function notifyZonalManager(openCityId) {
+  try {
+    const [[r]] = await pool.query(
+      `SELECT TOC.pin, TOC.city, TOC.district, TOC.state, TOC.comments,
+              TU.user_name, TU.mobile_no, TSC.service_catg_name
+         FROM tbl_open_city TOC
+         LEFT JOIN tbl_user TU ON TU.user_id = TOC.state_user
+         LEFT JOIN tbl_service_catg TSC ON TSC.service_catg_id = TOC.category_id
+        WHERE TOC.id = ?`,
+      [openCityId],
+    );
+    if (!r || !r.mobile_no) {
+      logger.warn('Supply gap WhatsApp skipped · no Zonal Manager mobile · openCityId=' + openCityId);
+      return { sent: false, reason: 'Zonal Manager has no mobile number' };
+    }
+    const gallabox = require('../gallabox.whatsapp.service');
+    const result = await gallabox.sendTemplate({
+      to: r.mobile_no,
+      recipientName: r.user_name,
+      templateName: 'suppy_update_zm',
+      bodyValues: {
+        pin_code: String(r.pin ?? ''),
+        city: r.city || '',
+        district: r.district || '',
+        state: r.state || '',
+        category: r.service_catg_name || '',
+        reason: r.comments || 'N/A',
+      },
+    });
+    logger.info('Supply gap WhatsApp · openCityId=' + openCityId + ' delivered=' + Boolean(result?.delivered));
+    return { sent: Boolean(result?.delivered), reason: result?.error || (result?.disabled ? 'notifications disabled' : null) };
+  } catch (err) {
+    logger.warn({ err: err.message }, 'Supply gap WhatsApp failed · openCityId=' + openCityId);
+    return { sent: false, reason: err.message };
+  }
+}
+
+// ── 10) create() — saveOrUpdateOpenCity with id = 0 ──────────────────────
+async function create(body, actor) {
+  const { requestFor, catgId, comments } = body;
+  logger.info('Create supply gap request · requestFor=' + requestFor + ' by=' + actor?.user_id);
+
+  // Location + owner fields are resolved SERVER-SIDE from the job / PIN, never
+  // trusted from the form — the form only displays them.
+  let loc;
+  if (requestFor === 1) {
+    const job = await jobDetail(body.jobId);
+    if (job.id) throw badRequest(job.comments, 409);           // open request already exists
+    if (!job.referenceId) throw badRequest(job.comments);      // closed / cancelled job
+    loc = {
+      referenceId: String(job.referenceId),
+      clientId: job.clientId || null,
+      pin: job.pin,
+      city: job.cityName,
+      district: job.districtName,
+      state: job.stateName,
+      stateUser: body.stateUser || job.stateUser,
+    };
+  } else {
+    const p = await pinDetail(body.pin);
+    loc = {
+      referenceId: null,
+      clientId: body.clientId || null,
+      pin: p.pin,
+      city: p.cityName,
+      district: p.districtName,
+      state: p.stateName,
+      stateUser: body.stateUser || p.stateUser,
+    };
+  }
+  if (!loc.stateUser) throw badRequest('Please assign a Zonal Manager before submitting.');
+
+  const conn = await pool.getConnection();
+  let id;
+  try {
+    await conn.beginTransaction();
+    const [ins] = await conn.query(
+      `INSERT INTO tbl_open_city
+         (pin, city, district, state, state_user, category_id, comments,
+          reference_id, client_id, status, request_for, inserted_by, inserted_on)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NOW())`,
+      [loc.pin, loc.city, loc.district, loc.state, loc.stateUser, catgId, comments,
+        loc.referenceId, loc.clientId, requestFor, actor?.user_id || null],
+    );
+    id = ins.insertId;
+    await conn.query(
+      `INSERT INTO supply_request_log (sr_id, comment, action_type, user_id, insert_time, tx_details)
+       VALUES (?, ?, 0, ?, NOW(), NULL)`,
+      [id, comments, actor?.user_id || null],
+    );
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+  logger.info('Supply gap request created · id=' + id);
+
+  let ownerTransfer = null;
+  if (requestFor === 1) {
+    try {
+      const job = require('../job.service');
+      await job.changeOwner(Number(loc.referenceId), {
+        newOwnerId: loc.stateUser,
+        reason: 'Supply gap request #' + id,
+      }, actor);
+      ownerTransfer = { done: true };
+    } catch (err) {
+      // "already owned" is success for this purpose — the ZM already owns it.
+      const already = err.status === 400 && /already owned/i.test(err.message);
+      if (!already) logger.warn({ err: err.message }, 'Supply gap owner transfer failed · id=' + id);
+      ownerTransfer = { done: already, reason: already ? null : err.message };
+    }
+  }
+
+  const whatsapp = await notifyZonalManager(id);
+  return { id, ownerTransfer, whatsapp };
+}
+
+// ── 11) update() — saveOrUpdateOpenCity with id ≠ 0 (Open requests only) ──
+// Legacy opened the eye-icon modal EDITABLE only for status 0; every other
+// status was view-only. Only the fields that modal leaves editable (category,
+// reason) are updated. Like legacy, an edit re-notifies the Zonal Manager and
+// writes no history line.
+async function update(openCityId, { catgId, comments }, actor) {
+  logger.info('Update supply gap request · id=' + openCityId + ' by=' + actor?.user_id);
+  const [[row]] = await pool.query('SELECT id, status FROM tbl_open_city WHERE id = ?', [openCityId]);
+  if (!row) throw badRequest('Supply gap not found', 404);
+  if (row.status !== 0) throw badRequest('Only Open requests can be edited.', 409);
+  await pool.query(
+    'UPDATE tbl_open_city SET category_id = ?, comments = ? WHERE id = ? AND status = 0',
+    [catgId, comments, openCityId],
+  );
+  logger.info('Supply gap request updated · id=' + openCityId);
+  const whatsapp = await notifyZonalManager(openCityId);
+  return { id: openCityId, whatsapp };
+}
+
 module.exports = {
   list,
   exportRows,
@@ -907,6 +1115,9 @@ module.exports = {
   txDetails,
   txStatus,
   txCount,
+  pinDetail,
+  create,
+  update,
   XLSX_COLUMNS,
   // Exposed for reuse/tests.
   _internals: { findGapAge, resolveSupplyStatus, resolveSupplyStatusBatch, normaliseFilters },
