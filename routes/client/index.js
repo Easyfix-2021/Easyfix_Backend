@@ -2661,6 +2661,7 @@ router.get('/unreachable-jobs', async (req, res, next) => {
 
 router.get('/dashboard-summary', async (req, res, next) => {
   try {
+    
     /*
      * ⚠ THE SAME SCOPE EVERY OTHER SURFACE ON THIS PAGE USES.
      *
