@@ -818,6 +818,29 @@ async function jobDetail(jobId) {
     logger.info('Job not open for supply request · jobId=' + jobId + ' job_status=' + r.job_status);
     return { comments: 'This Job is either closed or cancelled' };
   }
+  /*
+   * Address with a PIN but no city_id (seen on QA: job 482512, PIN 122001).
+   * City / district / state / Zonal Manager all hang off the city, so without
+   * this the prefill shows only the PIN and create() rejects the request for
+   * having no Zonal Manager. tbl_pincode still maps the PIN to its city, so
+   * fill the location from there. No PIN match → leave the blanks; the form
+   * then asks the operator to pick a Zonal Manager, as legacy did.
+   */
+  if (r.city_id == null && r.pin_code) {
+    try {
+      const p = await pinDetail(r.pin_code);
+      r.city_name = p.cityName;
+      r.district = p.districtName;
+      r.state_name = p.stateName;
+      r.city_id = p.cityId;
+      r.state_user = p.stateUser;
+      r.user_name = p.stateUserName;
+      logger.info('Job location filled from PIN · jobId=' + jobId + ' pin=' + r.pin_code);
+    } catch (err) {
+      if (err.status !== 404) throw err;
+      logger.warn('Job has no city and PIN is unmapped · jobId=' + jobId + ' pin=' + r.pin_code);
+    }
+  }
   return {
     referenceId: r.job_id,
     clientId: r.fk_client_id,
@@ -1041,6 +1064,30 @@ async function create(body, actor) {
   let id;
   try {
     await conn.beginTransaction();
+    /*
+     * ONE OPEN REQUEST PER JOB. jobDetail() above already refused a job with an
+     * Open / In Progress / Assigned request, but that read ran OUTSIDE this
+     * transaction: two operators submitting the same job at the same moment
+     * both pass it and both insert. Locking the job row serialises concurrent
+     * creates for the same job, so the re-check below sees the winner's row.
+     * Cancelled / Completed requests don't count — a job whose earlier gap was
+     * closed can be raised again (legacy status IN (0,1,2) rule).
+     */
+    if (requestFor === 1) {
+      await conn.query('SELECT job_id FROM tbl_job WHERE job_id = ? FOR UPDATE', [loc.referenceId]);
+      const [[dup]] = await conn.query(
+        `SELECT id FROM tbl_open_city
+          WHERE request_for = 1 AND reference_id = ? AND status IN (0, 1, 2)
+          ORDER BY id DESC LIMIT 1`,
+        [loc.referenceId],
+      );
+      if (dup) {
+        logger.warn('Duplicate supply request blocked · jobId=' + loc.referenceId + ' existingId=' + dup.id);
+        const e = badRequest(`A request for this job is already open. Request ID: ${dup.id}`, 409);
+        e.existingId = dup.id;
+        throw e;
+      }
+    }
     const [ins] = await conn.query(
       `INSERT INTO tbl_open_city
          (pin, city, district, state, state_user, category_id, comments,
