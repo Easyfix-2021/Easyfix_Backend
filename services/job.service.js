@@ -922,6 +922,58 @@ function manageJoin(want) {
   LEFT JOIN user_type ut ON ut.id = atr.user_type`;
 }
 
+/*
+ * ── Tx name cell: WHO holds the offer (2026-09-15, ops issue #13) ──
+ *
+ * A job whose Bucket Status reads "Offered To Tx" rendered "unassigned" in the
+ * Tx name column: an offer does not set fk_easyfixter_id until a technician
+ * accepts, so the cell had nobody to name. Ops asked for the offerees' names
+ * there, and the accepter's once accepted.
+ *
+ * ONE batched query per PAGE, attached as `offer_efrs`, rather than a
+ * projection. A job carries up to MAX_OFFER_RECIPIENTS offer rows, so a list of
+ * names cannot be a JOIN (it fans out the list and its COUNT) and would have to
+ * be string-packed into a GROUP_CONCAT for a scalar subquery. The page's job
+ * ids are already in hand here, which is exactly what the export's derived
+ * table needs and a paginated projection cannot supply.
+ *
+ * OFFERED is the raw `offer_status = OFFERED`, the SAME predicate as the
+ * offer_pending aggregate that makes jobCurrentStatus print "Offered To Tx", so
+ * whenever that label renders the names render beside it. It is deliberately
+ * NOT offerColumns' TTL-aware 'live' predicate: with expiry ON, an unswept
+ * stale offer would read "Offered To Tx" in one cell and name nobody in the
+ * next. With expiry OFF (production) the two are identical anyway.
+ *
+ * The INNER JOIN on tbl_easyfixer drops rows with a NULL or dangling technician
+ * — there is no name to show — as listOffers() does. GROUP BY collapses a
+ * re-offer's duplicate rows for the same (job, technician, status).
+ */
+async function attachOfferEfrs(rows) {
+  const byJob = new Map();
+  for (const r of rows) {
+    r.offer_efrs = [];
+    byJob.set(Number(r.job_id), r.offer_efrs);
+  }
+  const ids = [...byJob.keys()].filter(Number.isInteger);
+  if (!ids.length) return;
+  const [offers] = await pool.query(
+    `SELECT jo.job_id, jo.fk_easyfixter_id AS efr_id, ef.efr_name, jo.offer_status,
+            MAX(jo.offered_at) AS offered_at
+       FROM tbl_job_offer jo
+       JOIN tbl_easyfixer ef ON ef.efr_id = jo.fk_easyfixter_id
+      WHERE jo.job_id IN (${ids.map(() => '?').join(',')})
+        AND jo.offer_status IN (${OFFER_STATUS.OFFERED}, ${OFFER_STATUS.ACCEPTED})
+      GROUP BY jo.job_id, jo.fk_easyfixter_id, ef.efr_name, jo.offer_status
+      ORDER BY jo.job_id, MAX(jo.offered_at) DESC`,
+    ids,
+  );
+  for (const o of offers) {
+    const list = byJob.get(Number(o.job_id));
+    if (list) list.push({ efr_id: o.efr_id, efr_name: o.efr_name, offer_status: o.offer_status, offered_at: o.offered_at });
+  }
+  logger.info('Attached ' + offers.length + ' offered/accepted technicians to ' + ids.length + ' jobs');
+}
+
 function escalationColumns(want) {
   if (!want) return '';
   return `,
@@ -2950,6 +3002,20 @@ async function list({
     } catch (e) {
       logger.warn('Bucket label derivation failed (columns render blank) · ' + ((e && e.message) || e));
       for (const r of rows) { r.bucket = null; r.bucket_status = null; }
+    }
+    /*
+     * The Tx name cell's offerees — see attachOfferEfrs. Fail-soft on the same
+     * terms as the labels above: null renders the cell as it was before.
+     */
+    if (hasJobOffer) {
+      try {
+        await attachOfferEfrs(rows);
+      } catch (e) {
+        logger.warn('Offer technician lookup failed (Tx name cell falls back) · ' + ((e && e.message) || e));
+        for (const r of rows) r.offer_efrs = null;
+      }
+    } else {
+      for (const r of rows) r.offer_efrs = [];
     }
   }
   return { rows, total };
