@@ -1523,6 +1523,57 @@ async function resolveCustomerRequests(jobId, runner = pool) {
   }
 }
 
+/*
+ * Clear a technician's APP REQUEST flags — the tbl_job.is_cancelled_by_app /
+ * is_rescheduled_by_app columns the mobile app raises (see
+ * services/mobile-job-lifecycle.service.js) and the CRM's "Technician Requests"
+ * section lists.
+ *
+ * WHY THIS HAS TO EXIST AT ALL. Until now nothing in this backend ever wrote
+ * either column to 0 — the only two writers both write 1. Two consequences,
+ * both live bugs rather than new requirements:
+ *   · buildAppRequest() deliberately ignores job_status (see its note), so a
+ *     job ops CANCELLED still told the technician's app "your cancellation ask
+ *     is open" forever, Accept/Reject buttons and all.
+ *   · the CRM's queue only empties because its predicate pins job_status = 1;
+ *     a REJECT, which by definition leaves the job at 1, had no way to resolve
+ *     anything. The flag is the handled test once a reject exists.
+ *
+ * WHICH OPS ACTIONS ANSWER WHICH ASK. Mirrors resolveCustomerRequests' rule —
+ * a deliberate ops action on the job handles the ask — but per-kind rather
+ * than blanket, because the two asks are not interchangeable:
+ *   · cancel (setStatus → 6): grants a cancellation ask and moots a reschedule
+ *     ask (there is no appointment left to argue about) → BOTH.
+ *   · reschedule: answers the appointment question only. A "please kill this
+ *     order" ask survives a new appointment and must stay on ops's queue.
+ *   · assign / reassign: the ask belonged to the PREVIOUS technician, who is
+ *     now off the job — the mobile writers pin `AND fk_easyfixter_id = ?`, so
+ *     leaving the flag set would show the incoming technician a banner for an
+ *     ask they never raised → BOTH.
+ *
+ * Best-effort and post-commit for the same reason as resolveCustomerRequests:
+ * clearing an audit flag must never fail the ops action that earned it. The
+ * guarded WHERE makes a double-clear a no-op rather than a second write.
+ */
+const APP_REQUEST_FLAG = Object.freeze({ cancel: 'is_cancelled_by_app', reschedule: 'is_rescheduled_by_app' });
+
+async function resolveAppRequests(jobId, kinds, runner = pool) {
+  const cols = kinds.map((k) => APP_REQUEST_FLAG[k]).filter(Boolean);
+  if (!cols.length) return 0;
+  try {
+    const [r] = await runner.query(
+      `UPDATE tbl_job SET ${cols.map((c) => `${c} = 0`).join(', ')}
+        WHERE job_id = ? AND (${cols.map((c) => `COALESCE(${c}, 0) = 1`).join(' OR ')})`,
+      [jobId],
+    );
+    if (r.affectedRows) logger.info('App request(s) cleared · id=' + jobId + ' · ' + cols.join(','));
+    return r.affectedRows;
+  } catch (e) {
+    logger.warn('resolveAppRequests failed (non-fatal) · id=' + jobId + ' · ' + (e && e.message));
+    return 0;
+  }
+}
+
 // Same memoised existence probe for tbl_job_media — new EasyFix-owned table
 // (videos shared via the conversational WhatsApp flow, see
 // migrations/2026-06-03-whatsapp-conversation.sql). On deploys without that
@@ -5577,6 +5628,12 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { 
   // Ops took a deliberate status action (confirm 9→0, cancel, enquiry, …) — any
   // pending customer request on this job is now handled. See resolveCustomerRequests.
   await resolveCustomerRequests(jobId);
+  // Cancelling GRANTS a technician's cancellation ask and moots any reschedule
+  // ask on the same job — this is the Approve half of the CRM's Technician
+  // Requests row, and the reason ops's own cancel no longer leaves the
+  // technician's app showing an open request. Cancel only: every other status
+  // leaves the ask genuinely unanswered.
+  if (Number(status) === STATUS.CANCELLED) await resolveAppRequests(jobId, ['cancel', 'reschedule']);
   const job = await getById(jobId);
   /*
    * What the completion posted, for the caller that asked for it. The CRM needs
@@ -6278,6 +6335,10 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
 
     // Assigning a technician is Ops handling the job — clear any pending request.
     await resolveCustomerRequests(jobId);
+    // Both app asks belonged to the technician who is no longer on this job (the
+    // mobile writers pin `AND fk_easyfixter_id = ?`), so leaving them set would
+    // show the INCOMING technician a banner for an ask they never raised.
+    await resolveAppRequests(jobId, ['cancel', 'reschedule']);
     return getById(jobId);
   } catch (e) {
     await conn.rollback();
@@ -7235,6 +7296,77 @@ async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason
   fireWebhook('RescheduleTech', jobId);
   // Ops rescheduled the job — directly handles a customer reschedule/cancel ask.
   await resolveCustomerRequests(jobId);
+  // The Approve half of a technician's RESCHEDULE ask: the appointment question
+  // is now answered, whether ops took the technician's proposed slot or another
+  // one. A cancellation ask is NOT answered by a new appointment, so it stays.
+  await resolveAppRequests(jobId, ['reschedule']);
+  return getById(jobId);
+}
+
+// ─── Reject a technician's app request (the CRM's Reject button) ────
+/*
+ * The other half of the Technician Requests row. APPROVE needs no endpoint of
+ * its own — it IS the ordinary cancel (setStatus → 6) or reschedule, both of
+ * which now clear the flag they answer. REJECT is the one decision with no
+ * existing home: ops declines the ask and the job carries on UNCHANGED, still
+ * at status 1, with the same technician and the same appointment.
+ *
+ * DELIBERATELY NARROW. The only column this writes is the one flag, because
+ * everything else the ask left behind is audit, not state: cancel_date_time /
+ * job_cancel_reason_id_by_easyfixer / reschedule_date_time_app / reschedule_at_app
+ * record that the technician asked and what for, and a rejected ask still
+ * happened. resch_job_count in particular is a lifetime counter of asks, not of
+ * moves — rolling it back would rewrite history to say the technician never
+ * pushed. What DOES disappear is the row from the queue, in both CRMs: legacy's
+ * approve/reject card keys on the same flag (appCheckoutJobDetail.vm:2662-2673),
+ * so one clear resolves the ask on both stacks.
+ *
+ * 409 rather than a silent no-op when the flag is already down: two operators
+ * on the same row must not both be told "rejected". The mobile writers have no
+ * "already asked" guard, so a technician can re-raise at any moment and the
+ * guarded UPDATE is the only thing that makes this safe.
+ *
+ * The audit is a tbl_job_comment at comment_on = 1 (Scheduling) — the same
+ * generic lifecycle code reschedule() uses. Legacy's 18 = 'TX Rejected' reads
+ * like the right code and is not: it means the TECHNICIAN rejected the JOB.
+ * The sentence carries the meaning; the category stays honest.
+ */
+const APP_REQUEST_REJECT_NOTE = Object.freeze({
+  cancel: "Technician's cancellation request rejected by ops.",
+  reschedule: "Technician's reschedule request rejected by ops.",
+});
+
+async function rejectAppRequest(jobId, { kind, remarks }, actor) {
+  const col = APP_REQUEST_FLAG[kind];
+  if (!col) { const e = new Error('kind must be cancel or reschedule'); e.status = 400; throw e; }
+  logger.info('Reject app request · id=' + jobId + ' · kind=' + kind);
+
+  const [[existing]] = await pool.query('SELECT job_id FROM tbl_job WHERE job_id = ? LIMIT 1', [jobId]);
+  if (!existing) { const e = new Error('job not found'); e.status = 404; throw e; }
+
+  const [r] = await pool.query(
+    `UPDATE tbl_job SET ${col} = 0 WHERE job_id = ? AND COALESCE(${col}, 0) = 1`,
+    [jobId],
+  );
+  if (!r.affectedRows) {
+    const e = new Error(kind === 'cancel'
+      ? 'There is no open cancellation request on this job. Someone may have actioned it already.'
+      : 'There is no open reschedule request on this job. Someone may have actioned it already.');
+    e.status = 409; e.code = 'APP_REQUEST_NOT_PENDING';
+    throw e;
+  }
+
+  // Best-effort, post-write — same contract as every other audit on this
+  // service. A legacy constraint on tbl_job_comment must not un-reject the ask.
+  try {
+    await require('./job-comment.service').addComment(jobId, {
+      comments: [APP_REQUEST_REJECT_NOTE[kind], String(remarks || '').trim()].filter(Boolean).join(' '),
+      comment_on: 1,
+      commented_by: actor?.user_id || null,
+    });
+  } catch (e) {
+    logger.warn('App request reject audit comment failed (non-fatal) · id=' + jobId + ' · ' + e.message);
+  }
   return getById(jobId);
 }
 
@@ -7595,6 +7727,10 @@ module.exports = {
   recomputeClientServicesCsv,
   list, getById, getByIdCore, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, reschedule, unassign, acceptOffer, changeOwner,
   hasAfterWorkPhoto, afterPhotoRequiredError,
+  // Technician app requests. rejectAppRequest is the Reject button; there is no
+  // approve twin because Approve is the ordinary cancel/reschedule, and
+  // resolveAppRequests is what makes those two clear the ask they answer.
+  rejectAppRequest, resolveAppRequests,
   // THE OFFER MODEL (pool offers): offer one job to many techs, list a job's
   // open offers, and list a tech's open offers.
   offerToTechnicians, listOffers, listOfferedForTech, techHasOpenOffer, rejectOffer,
