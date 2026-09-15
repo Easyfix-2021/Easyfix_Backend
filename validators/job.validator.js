@@ -635,6 +635,22 @@ const rescheduleBody = Joi.object({
 });
 
 /*
+ * PATCH /:id/app-request/reject — decline a technician's cancellation or
+ * reschedule ask. `kind` says WHICH ask is being declined and is required: a
+ * job can carry both flags, and an operator looking at a "Cancellation
+ * Requested" row must never clear the reschedule one because the request
+ * column happened to render the cancel (cancel outranks reschedule in
+ * appRequestOf / buildAppRequest). `remarks` is the operator's optional note,
+ * appended to the fixed audit sentence — unlike a reschedule, a rejection
+ * leaves the job untouched, so there is nothing for a mandatory reason to
+ * explain that the sentence does not already say.
+ */
+const appRequestRejectBody = Joi.object({
+  kind: Joi.string().valid('cancel', 'reschedule').required(),
+  remarks: Joi.string().trim().max(500).allow('').optional(),
+});
+
+/*
  * Query schema for GET /:id/slot-recommendations. `date` is a wall-clock IST
  * date — the service compares it as a plain string against DATE() values, so it
  * must NOT be UTC-converted anywhere on the way in.
@@ -647,5 +663,5 @@ const idParam = Joi.object({ id: intId.required() });
 
 module.exports = {
   listQuery, createBody, updateBody, statusBody, assignBody, offerBody, ownerBody, idParam,
-  rescheduleBody, candidatesQuery, candidatesSearchQuery, slotRecommendationsQuery,
+  rescheduleBody, appRequestRejectBody, candidatesQuery, candidatesSearchQuery, slotRecommendationsQuery,
 };
