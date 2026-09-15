@@ -26,13 +26,13 @@
 --   that leaf lives in (resolved by url, never a hard-coded menu_id — ids
 --   differ between QA and production).
 --
--- GRANTED TO EXACTLY THE ROLES THAT ALREADY SEE "Manage EasyFixers"
---   so visibility stays in lock-step with the existing page rather than
---   guessing role ids. Ops can widen/narrow later in Manage Roles.
+-- GRANTED TO ADMIN ONLY (role_id 2)
+--   New flows start with Admin, as the LMS / rewards menu migrations do.
+--   Other roles are granted later from Manage Roles in the CRM UI.
 --
 -- POST-APPLY
---   Operators must log out and back in — menu_ids resolve into the JWT at
---   login, so a live session keeps the old set. The CRM properties cache
+--   Role menu_ids are cached server-side for up to 5 minutes, so the leaf can
+--   take that long to appear. The CRM properties cache
 --   (new.crm.visible.menu.ids) has a 1-hour TTL; use the admin
 --   properties-reload endpoint (or the 10-click flush) for it to take effect
 --   immediately.
@@ -47,16 +47,17 @@ INSERT INTO tbl_menu (menu_name, parent_menu, menu_depth, has_child, url, menu_s
 SELECT 'New Registration 2', e.parent_menu, e.menu_depth, 0, 'newRegistration2', 1, e.sequence + 0.0005, 'fa-id-badge', 'newRegistration2'
   FROM tbl_menu e
  WHERE e.url = 'easyfixer'
-   AND NOT EXISTS (SELECT 1 FROM tbl_menu c WHERE c.url = 'newRegistration2');
+   AND NOT EXISTS (SELECT 1 FROM tbl_menu c WHERE c.url = 'newRegistration2')
+ ORDER BY e.menu_status DESC, e.menu_id
+ LIMIT 1;
 
 
--- ─── 2. Sidebar visibility — mirror every role that sees 'easyfixer' ──
+-- ─── 2. Sidebar visibility — Admin only (role_id 2) ──────────────────
 UPDATE tbl_role r
   JOIN tbl_menu nm ON nm.url = 'newRegistration2'
-  JOIN tbl_menu em ON em.url = 'easyfixer'
    SET r.menu_ids = CONCAT(COALESCE(r.menu_ids, ''), IF(r.menu_ids IS NULL OR r.menu_ids = '', '', ','), nm.menu_id)
- WHERE FIND_IN_SET(em.menu_id, COALESCE(r.menu_ids, ''))
-   AND NOT FIND_IN_SET(nm.menu_id, COALESCE(r.menu_ids, ''));
+ WHERE r.role_id = 2
+   AND NOT FIND_IN_SET(nm.menu_id, REPLACE(COALESCE(r.menu_ids, ''), ' ', ''));
 
 
 -- ─── 3. CRM visible-menu allowlist (append-only; no INSERT of the key) ─
@@ -73,9 +74,9 @@ UPDATE easyfix_properties p
 -- ─── 4. Verify (read-only) ───────────────────────────────────────────
 SELECT 'menu leaf newRegistration2' AS what, COUNT(*) AS present FROM tbl_menu WHERE url = 'newRegistration2'
 UNION ALL
-SELECT 'roles that now see it (= roles that see easyfixer)', COUNT(*)
+SELECT 'Admin role (role_id 2) sees it', COUNT(*)
   FROM tbl_role r JOIN tbl_menu nm ON nm.url = 'newRegistration2'
- WHERE FIND_IN_SET(nm.menu_id, COALESCE(r.menu_ids, ''))
+ WHERE r.role_id = 2 AND FIND_IN_SET(nm.menu_id, REPLACE(COALESCE(r.menu_ids, ''), ' ', ''))
 UNION ALL
 SELECT 'allowlist carries it (0 = allowlist inactive, also fine)', COUNT(*)
   FROM easyfix_properties p JOIN tbl_menu m ON m.url = 'newRegistration2'
