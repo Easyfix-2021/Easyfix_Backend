@@ -11,12 +11,13 @@
  * requireQuickSight. The list endpoint honours ?format=xlsx for a server-side
  * streamed download (replaces the legacy 5s-disk-URL hack).
  *
- * SCOPE: this is the READ / report surface only. The legacy OpenCityController
- * also exposes write endpoints (addUpdate / actionOnSupplyRequest / addComment)
- * that mutate tbl_open_city + fire WhatsApp + transferJobOwnershipToZM. Those
- * are the full-CRUD dashboard's write flow with orchestrator side-effects and
- * are intentionally NOT ported into the QuickSight rebuild (registry decision +
- * openQuestions). All endpoints below are read-only.
+ * SCOPE: read / report surface PLUS create + edit (2026-09-14, per ops). The
+ * legacy OpenCityController write endpoints mutate tbl_open_city + fire
+ * WhatsApp + transferJobOwnershipToZM. `addUpdate` is now ported (POST / and
+ * PUT /:id — side effects documented in the service), as are
+ * `actionOnSupplyRequest`, `addComment` and `saveEfrInvite`.
+ * Writes are gated by the same per-report view key as the reads (product
+ * decision: anyone who can see the dashboard can raise a request).
  *
  * Legacy mapping:
  *   GET /                       ← findAllOpenCities (+ downloadExcelSupplyRequest when format=xlsx)
@@ -27,6 +28,12 @@
  *   GET /tx/:efrId?catgId=      ← getAllocateTxDetails
  *   GET /tx-status?mobileNo=     ← getEasyfixerStatus
  *   GET /tx-count?cityId=&catgId= ← findTxCountByCityAndCategory
+ *   GET /pin/:pin               ← map_my_india + findCityUser (New City prefill)
+ *   POST /                      ← addUpdate (id = 0)
+ *   PUT /:id                    ← addUpdate (id ≠ 0, Open requests only)
+ *   POST /:id/remarks           ← addComment
+ *   POST /:id/action            ← actionOnSupplyRequest (new / existing supply, cancel, complete)
+ *   POST /invite                ← saveEfrInvite (header "Invite Sent")
  */
 
 const router = require('express').Router();
@@ -135,6 +142,53 @@ const txCountQuery = Joi.object({
   cityId: Joi.number().integer().min(1).required(),
   catgId: Joi.number().integer().min(1).required(),
 });
+const pinParam = Joi.object({ pin: Joi.string().pattern(/^\d{6}$/).required() });
+
+// Create — requestFor 1 = Job ID, 2 = New City. Location fields are resolved
+// server-side from the job / PIN, so the body carries only what the operator
+// actually chooses.
+const reason = Joi.string().trim().min(1).max(1000).required()
+  .messages({ 'any.required': 'Reason is required', 'string.empty': 'Reason is required' });
+const createBody = Joi.object({
+  requestFor: Joi.number().integer().valid(1, 2).required(),
+  jobId: Joi.number().integer().min(1)
+    .when('requestFor', { is: 1, then: Joi.required(), otherwise: Joi.forbidden() }),
+  pin: Joi.string().pattern(/^\d{6}$/)
+    .when('requestFor', { is: 2, then: Joi.required(), otherwise: Joi.forbidden() }),
+  clientId: Joi.number().integer().min(1).allow(null)
+    .when('requestFor', { is: 1, then: Joi.forbidden() }),
+  // Optional override; defaults to the city's Zonal Manager.
+  stateUser: Joi.number().integer().min(1).allow(null),
+  catgId: Joi.number().integer().min(1).required(),
+  comments: reason,
+});
+const updateBody = Joi.object({
+  catgId: Joi.number().integer().min(1).required(),
+  comments: reason,
+});
+
+const remarks = Joi.string().trim().min(1).max(500).required()
+  .messages({ 'any.required': 'Remarks are required', 'string.empty': 'Remarks are required' });
+const techName = Joi.string().trim().pattern(/^[A-Za-z ]+$/).min(2).max(100)
+  .messages({ 'string.pattern.base': 'Technician name can contain only letters and spaces' });
+const techMobile = Joi.string().pattern(/^[5-9]\d{9}$/)
+  .messages({ 'string.pattern.base': 'Contact number must be 10 digits starting with 5–9' });
+
+const remarkBody = Joi.object({ comment: remarks });
+// actionType 1 new supply · 2 existing supply · 3 cancel · 4 complete.
+const actionBody = Joi.object({
+  actionType: Joi.number().integer().valid(1, 2, 3, 4).required(),
+  remarks,
+  newSupplyName: techName.when('actionType', { is: 1, then: Joi.required(), otherwise: Joi.forbidden() }),
+  newSupplyNumber: techMobile.when('actionType', { is: 1, then: Joi.required(), otherwise: Joi.forbidden() }),
+  oldSupplyId: Joi.number().integer().min(1)
+    .when('actionType', { is: 2, then: Joi.required(), otherwise: Joi.forbidden() }),
+});
+const inviteBody = Joi.object({
+  name: techName.required(),
+  mobile: techMobile.required(),
+  remarks: Joi.string().trim().allow('', null).max(500),
+});
 
 // ── GET / — primary report list (paginated) + ?format=xlsx export ────────
 router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
@@ -239,6 +293,71 @@ router.get('/tx/:efrId', validate(txParam, 'params'), validate(txQuery, 'query')
 });
 
 // ── GET /:id/allocations — "Added Tx :N" popup ───────────────────────────
+// ── GET /pin/:pin — New City prefill (city, district, state, Zonal Manager) ──
+router.get('/pin/:pin', validate(pinParam, 'params'), async (req, res, next) => {
+  try {
+    modernOk(res, await service.pinDetail(req.params.pin));
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
+// ── POST / — New Supply Request ──────────────────────────────────────────
+router.post('/', validate(createBody), async (req, res, next) => {
+  try {
+    const result = await service.create(req.body, req.user);
+    logger.info('Returning created supply gap · id=' + result.id);
+    modernOk(res, result);
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
+// ── POST /invite — header "Invite Sent" (technician invite, no gap) ───────
+router.post('/invite', validate(inviteBody), async (req, res, next) => {
+  try {
+    modernOk(res, await service.invite(req.body, req.user));
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
+// ── POST /:id/remarks — "+ Add Remark" ───────────────────────────────────
+router.post('/:id/remarks', validate(idParam, 'params'), validate(remarkBody), async (req, res, next) => {
+  try {
+    modernOk(res, await service.addRemark(req.params.id, req.body.comment, req.user));
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
+// ── POST /:id/action — new supply / existing supply / cancel / complete ───
+router.post('/:id/action', validate(idParam, 'params'), validate(actionBody), async (req, res, next) => {
+  try {
+    const result = await service.act(req.params.id, req.body, req.user);
+    logger.info('Returning supply gap action · id=' + req.params.id + ' status=' + result.status);
+    modernOk(res, result);
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
+// ── PUT /:id — edit an Open request (category + reason) ──────────────────
+router.put('/:id', validate(idParam, 'params'), validate(updateBody), async (req, res, next) => {
+  try {
+    const result = await service.update(req.params.id, req.body, req.user);
+    modernOk(res, result);
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
 router.get('/:id/allocations', validate(idParam, 'params'), async (req, res, next) => {
   try {
     logger.info('Supply Gap allocations · id=' + req.params.id);

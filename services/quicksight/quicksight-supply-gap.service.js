@@ -655,6 +655,7 @@ async function detail(openCityId) {
     districtName: r.district,
     stateName: r.state,
     stateUser: r.state_user,
+    clientId: r.client_id,
     catgId: r.category_id,
     comments: r.comments,
     referenceId: r.reference_id,
@@ -792,7 +793,7 @@ async function jobDetail(jobId) {
         WHEN TJ.job_status = 7 THEN FLOOR(TIMESTAMPDIFF(MINUTE, TJ.ticket_created_date_time, TJ.enquiry_date_time) / 1440.0)
         ELSE FLOOR(TIMESTAMPDIFF(MINUTE, TJ.ticket_created_date_time, NOW()) / 1440.0)
       END AS job_age,
-      TJ.job_desc, TJ.fk_service_catg_id,
+      TJ.job_desc, TJ.fk_service_catg_id, TJ.fk_client_id,
       TC.city_id, TC.state_user,
       TJ.job_status
     FROM tbl_job TJ
@@ -817,8 +818,32 @@ async function jobDetail(jobId) {
     logger.info('Job not open for supply request · jobId=' + jobId + ' job_status=' + r.job_status);
     return { comments: 'This Job is either closed or cancelled' };
   }
+  /*
+   * Address with a PIN but no city_id (seen on QA: job 482512, PIN 122001).
+   * City / district / state / Zonal Manager all hang off the city, so without
+   * this the prefill shows only the PIN and create() rejects the request for
+   * having no Zonal Manager. tbl_pincode still maps the PIN to its city, so
+   * fill the location from there. No PIN match → leave the blanks; the form
+   * then asks the operator to pick a Zonal Manager, as legacy did.
+   */
+  if (r.city_id == null && r.pin_code) {
+    try {
+      const p = await pinDetail(r.pin_code);
+      r.city_name = p.cityName;
+      r.district = p.districtName;
+      r.state_name = p.stateName;
+      r.city_id = p.cityId;
+      r.state_user = p.stateUser;
+      r.user_name = p.stateUserName;
+      logger.info('Job location filled from PIN · jobId=' + jobId + ' pin=' + r.pin_code);
+    } catch (err) {
+      if (err.status !== 404) throw err;
+      logger.warn('Job has no city and PIN is unmapped · jobId=' + jobId + ' pin=' + r.pin_code);
+    }
+  }
   return {
     referenceId: r.job_id,
+    clientId: r.fk_client_id,
     clientName: r.client_name,
     pin: r.pin_code,
     cityName: r.city_name,
@@ -897,6 +922,420 @@ async function txCount(cityId, catgId) {
   return rows[0] ? rows[0].cnt || 0 : 0;
 }
 
+/*
+ * ── WRITE FLOW (2026-09-14) ────────────────────────────────────────────────
+ *
+ * "New Supply Request" + edit-while-Open, ported from the legacy
+ * OpenCityController.saveOrUpdateOpenCity at ops' request. The header of
+ * routes/admin/quicksight/supply-gap.js recorded the earlier decision to keep
+ * this surface read-only; that decision was reversed. Actions (allocation,
+ * cancel, complete, remarks, invites) follow further down.
+ *
+ * Side effects match legacy, but ordered so a notification failure can never
+ * lose the request:
+ *   1. tbl_open_city INSERT + supply_request_log (action_type 0 "Opened") in
+ *      ONE transaction — the request and its first history line land together.
+ *   2. Job ID requests only: job_client_owner → the Zonal Manager, via the
+ *      existing job.changeOwner() (validation + owner_change_* audit columns)
+ *      instead of legacy's bare UPDATE.
+ *   3. WhatsApp 'suppy_update_zm' (sic — the approved Gallabox template name)
+ *      to the Zonal Manager, via the existing gallabox.sendTemplate().
+ * Steps 2 and 3 run after commit and are best-effort: their outcome is
+ * reported in the response rather than failing a request that is already saved.
+ */
+
+// ── 9) pinDetail() — New City prefill (legacy map_my_india + findCityUser) ──
+// Legacy geocoded the PIN through MapMyIndia, then looked the city up BY NAME to
+// find its Zonal Manager. tbl_pincode already maps PIN → city_id, and the city
+// row carries state_user, so one indexed read replaces both round-trips and
+// cannot mis-match two cities that share a name.
+async function pinDetail(pin) {
+  logger.info('Supply Gap PIN prefill · pin=' + pin);
+  const [rows] = await pool.query(
+    `SELECT p.pincode, c.city_id, c.city_name,
+            COALESCE(p.district, c.district) AS district,
+            s.state_name, c.state_user, zm.user_name AS zonal_manager_name
+       FROM tbl_pincode   p
+       LEFT JOIN tbl_city  c  ON c.city_id  = p.city_id
+       LEFT JOIN tbl_state s  ON s.state_id = c.state_id
+       LEFT JOIN tbl_user  zm ON zm.user_id = c.state_user
+      WHERE p.pincode = ?
+      LIMIT 1`,
+    [String(pin)],
+  );
+  if (rows.length === 0) {
+    logger.warn('PIN code not found · pin=' + pin);
+    const e = new Error('This PIN code is not in the system.');
+    e.status = 404;
+    throw e;
+  }
+  const r = rows[0];
+  return {
+    pin: Number(r.pincode),
+    cityId: r.city_id,
+    cityName: r.city_name,
+    districtName: r.district,
+    stateName: r.state_name,
+    stateUser: r.state_user,
+    stateUserName: r.zonal_manager_name,
+  };
+}
+
+function badRequest(message, status = 400) {
+  const e = new Error(message);
+  e.status = status;
+  return e;
+}
+
+// WhatsApp the Zonal Manager. Never throws — returns what happened.
+async function notifyZonalManager(openCityId) {
+  try {
+    const [[r]] = await pool.query(
+      `SELECT TOC.pin, TOC.city, TOC.district, TOC.state, TOC.comments,
+              TU.user_name, TU.mobile_no, TSC.service_catg_name
+         FROM tbl_open_city TOC
+         LEFT JOIN tbl_user TU ON TU.user_id = TOC.state_user
+         LEFT JOIN tbl_service_catg TSC ON TSC.service_catg_id = TOC.category_id
+        WHERE TOC.id = ?`,
+      [openCityId],
+    );
+    if (!r || !r.mobile_no) {
+      logger.warn('Supply gap WhatsApp skipped · no Zonal Manager mobile · openCityId=' + openCityId);
+      return { sent: false, reason: 'Zonal Manager has no mobile number' };
+    }
+    const gallabox = require('../gallabox.whatsapp.service');
+    const result = await gallabox.sendTemplate({
+      to: r.mobile_no,
+      recipientName: r.user_name,
+      templateName: 'suppy_update_zm',
+      bodyValues: {
+        pin_code: String(r.pin ?? ''),
+        city: r.city || '',
+        district: r.district || '',
+        state: r.state || '',
+        category: r.service_catg_name || '',
+        reason: r.comments || 'N/A',
+      },
+    });
+    logger.info('Supply gap WhatsApp · openCityId=' + openCityId + ' delivered=' + Boolean(result?.delivered));
+    return { sent: Boolean(result?.delivered), reason: result?.error || (result?.disabled ? 'notifications disabled' : null) };
+  } catch (err) {
+    logger.warn({ err: err.message }, 'Supply gap WhatsApp failed · openCityId=' + openCityId);
+    return { sent: false, reason: err.message };
+  }
+}
+
+// ── 10) create() — saveOrUpdateOpenCity with id = 0 ──────────────────────
+async function create(body, actor) {
+  const { requestFor, catgId, comments } = body;
+  logger.info('Create supply gap request · requestFor=' + requestFor + ' by=' + actor?.user_id);
+
+  // Location + owner fields are resolved SERVER-SIDE from the job / PIN, never
+  // trusted from the form — the form only displays them.
+  let loc;
+  if (requestFor === 1) {
+    const job = await jobDetail(body.jobId);
+    if (job.id) throw badRequest(job.comments, 409);           // open request already exists
+    if (!job.referenceId) throw badRequest(job.comments);      // closed / cancelled job
+    loc = {
+      referenceId: String(job.referenceId),
+      clientId: job.clientId || null,
+      pin: job.pin,
+      city: job.cityName,
+      district: job.districtName,
+      state: job.stateName,
+      stateUser: body.stateUser || job.stateUser,
+    };
+  } else {
+    const p = await pinDetail(body.pin);
+    loc = {
+      referenceId: null,
+      clientId: body.clientId || null,
+      pin: p.pin,
+      city: p.cityName,
+      district: p.districtName,
+      state: p.stateName,
+      stateUser: body.stateUser || p.stateUser,
+    };
+  }
+  if (!loc.stateUser) throw badRequest('Please assign a Zonal Manager before submitting.');
+
+  const conn = await pool.getConnection();
+  let id;
+  try {
+    await conn.beginTransaction();
+    /*
+     * ONE OPEN REQUEST PER JOB. jobDetail() above already refused a job with an
+     * Open / In Progress / Assigned request, but that read ran OUTSIDE this
+     * transaction: two operators submitting the same job at the same moment
+     * both pass it and both insert. Locking the job row serialises concurrent
+     * creates for the same job, so the re-check below sees the winner's row.
+     * Cancelled / Completed requests don't count — a job whose earlier gap was
+     * closed can be raised again (legacy status IN (0,1,2) rule).
+     */
+    if (requestFor === 1) {
+      await conn.query('SELECT job_id FROM tbl_job WHERE job_id = ? FOR UPDATE', [loc.referenceId]);
+      const [[dup]] = await conn.query(
+        `SELECT id FROM tbl_open_city
+          WHERE request_for = 1 AND reference_id = ? AND status IN (0, 1, 2)
+          ORDER BY id DESC LIMIT 1`,
+        [loc.referenceId],
+      );
+      if (dup) {
+        logger.warn('Duplicate supply request blocked · jobId=' + loc.referenceId + ' existingId=' + dup.id);
+        const e = badRequest(`A request for this job is already open. Request ID: ${dup.id}`, 409);
+        e.existingId = dup.id;
+        throw e;
+      }
+    }
+    const [ins] = await conn.query(
+      `INSERT INTO tbl_open_city
+         (pin, city, district, state, state_user, category_id, comments,
+          reference_id, client_id, status, request_for, inserted_by, inserted_on)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NOW())`,
+      [loc.pin, loc.city, loc.district, loc.state, loc.stateUser, catgId, comments,
+        loc.referenceId, loc.clientId, requestFor, actor?.user_id || null],
+    );
+    id = ins.insertId;
+    await conn.query(
+      `INSERT INTO supply_request_log (sr_id, comment, action_type, user_id, insert_time, tx_details)
+       VALUES (?, ?, 0, ?, NOW(), NULL)`,
+      [id, comments, actor?.user_id || null],
+    );
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+  logger.info('Supply gap request created · id=' + id);
+
+  let ownerTransfer = null;
+  if (requestFor === 1) {
+    try {
+      const job = require('../job.service');
+      await job.changeOwner(Number(loc.referenceId), {
+        newOwnerId: loc.stateUser,
+        reason: 'Supply gap request #' + id,
+      }, actor);
+      ownerTransfer = { done: true };
+    } catch (err) {
+      // "already owned" is success for this purpose — the ZM already owns it.
+      const already = err.status === 400 && /already owned/i.test(err.message);
+      if (!already) logger.warn({ err: err.message }, 'Supply gap owner transfer failed · id=' + id);
+      ownerTransfer = { done: already, reason: already ? null : err.message };
+    }
+  }
+
+  const whatsapp = await notifyZonalManager(id);
+  return { id, ownerTransfer, whatsapp };
+}
+
+// ── 11) update() — saveOrUpdateOpenCity with id ≠ 0 (Open requests only) ──
+// Legacy opened the eye-icon modal EDITABLE only for status 0; every other
+// status was view-only. Only the fields that modal leaves editable (category,
+// reason) are updated. Like legacy, an edit re-notifies the Zonal Manager and
+// writes no history line.
+async function update(openCityId, { catgId, comments }, actor) {
+  logger.info('Update supply gap request · id=' + openCityId + ' by=' + actor?.user_id);
+  const [[row]] = await pool.query('SELECT id, status FROM tbl_open_city WHERE id = ?', [openCityId]);
+  if (!row) throw badRequest('Supply gap not found', 404);
+  if (row.status !== 0) throw badRequest('Only Open requests can be edited.', 409);
+  await pool.query(
+    'UPDATE tbl_open_city SET category_id = ?, comments = ? WHERE id = ? AND status = 0',
+    [catgId, comments, openCityId],
+  );
+  logger.info('Supply gap request updated · id=' + openCityId);
+  const whatsapp = await notifyZonalManager(openCityId);
+  return { id: openCityId, whatsapp };
+}
+
+/*
+ * ── ACTIONS (2026-09-14) — legacy actionOnSupplyRequest + addComment + saveEfrInvite ──
+ *
+ * action_type doubles as the status it moves the request to, exactly as legacy:
+ *   1 Add A New Supply            → status 1 (In Progress)
+ *   2 Allocate An Existing Supply → status 2 (Assigned)
+ *   3 Cancel                      → status 3
+ *   4 Mark Complete               → status 4
+ *   9 Remark                      → no status change
+ *
+ * Which action is offered in which status also follows legacy's button matrix
+ * (opencity.component.html) — but is ENFORCED here, not just hidden in the UI:
+ *   Open (0)             → cancel, allocate existing, add new
+ *   In Progress / Assigned (1, 2) → cancel, complete, add new
+ *   Cancelled / Completed (3, 4)  → remarks only
+ *
+ * Every state change writes its supply_request_log line in the SAME transaction
+ * as the tbl_open_city update (and the allocation row), so the Action History
+ * can never disagree with the status. Notifications and the tbl_efr_invite
+ * audit row run after commit and never fail the action.
+ */
+
+const ACTIONS_BY_STATUS = {
+  0: [1, 2, 3],
+  1: [1, 3, 4],
+  2: [1, 3, 4],
+  3: [],
+  4: [],
+};
+
+/* Legacy isCompleteEnabled: a Job ID gap may only be closed once its job is. */
+const JOB_STATUSES_THAT_ALLOW_COMPLETE = new Set([3, 5, 6, 7, 10, 15, 21]);
+
+// Best-effort mirror of legacy's tbl_efr_invite audit row. Never throws.
+async function logEfrInvite({ name, mobile, remarks, inviteStatus, supplyId, userId }) {
+  try {
+    await pool.query(
+      `INSERT INTO tbl_efr_invite (efr_name, efr_mobile, remarks, invite_status, supply_id, invited_by, invited_on)
+       VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+      [name, mobile, remarks || null, String(inviteStatus).slice(0, 50), supplyId ?? null, userId ?? null],
+    );
+    return true;
+  } catch (err) {
+    logger.warn({ err: err.message }, 'EFR invite log failed (non-fatal)');
+    return false;
+  }
+}
+
+async function loadForAction(openCityId) {
+  const [[row]] = await pool.query(
+    `SELECT TOC.id, TOC.status, TOC.request_for, TOC.reference_id, TOC.city, TOC.category_id,
+            TJ.job_status AS job_status
+       FROM tbl_open_city TOC
+       LEFT JOIN tbl_job TJ ON TJ.job_id = TOC.reference_id AND TOC.request_for = 1
+      WHERE TOC.id = ?`,
+    [openCityId],
+  );
+  if (!row) throw badRequest('Supply gap not found', 404);
+  return row;
+}
+
+// ── 12) addRemark() — addRemarksForSupplyRequest (action_type 9) ──────────
+async function addRemark(openCityId, comment, actor) {
+  logger.info('Add supply gap remark · id=' + openCityId + ' by=' + actor?.user_id);
+  await loadForAction(openCityId);
+  await pool.query(
+    `INSERT INTO supply_request_log (sr_id, comment, action_type, user_id, insert_time, tx_details)
+     VALUES (?, ?, 9, ?, NOW(), NULL)`,
+    [openCityId, comment, actor?.user_id || null],
+  );
+  return { id: openCityId };
+}
+
+// ── 13) act() — actionOnSupplyRequest ────────────────────────────────────
+async function act(openCityId, body, actor) {
+  const { actionType, remarks } = body;
+  const userId = actor?.user_id || null;
+  logger.info('Supply gap action · id=' + openCityId + ' actionType=' + actionType + ' by=' + userId);
+
+  const row = await loadForAction(openCityId);
+  const allowed = ACTIONS_BY_STATUS[row.status] || [];
+  if (!allowed.includes(actionType)) {
+    throw badRequest('This action is not available for a request in its current status.', 409);
+  }
+  if (actionType === 4 && row.request_for === 1 && !JOB_STATUSES_THAT_ALLOW_COMPLETE.has(Number(row.job_status))) {
+    throw badRequest('You cannot close this request because its job is still open.', 409);
+  }
+
+  // Resolve the technician SERVER-SIDE — the browser only ever sends an efr id
+  // (existing) or the operator-typed name + number (new).
+  let tech = null;
+  if (actionType === 1) {
+    const status = await resolveSupplyStatus(body.newSupplyNumber);
+    if (status === 'Active') {
+      throw badRequest('This technician is already active — use "Allocate An Existing Supply" instead.', 409);
+    }
+    tech = { name: body.newSupplyName, mobile: body.newSupplyNumber, txDetails: `${body.newSupplyName}_${body.newSupplyNumber}` };
+  } else if (actionType === 2) {
+    const tx = await txDetails(body.oldSupplyId, row.category_id);
+    // Legacy's allocation checklist, enforced: same city, category match,
+    // Active, and (New City only) at most 10 orders.
+    const cityOk = (tx.cityName || '').trim().toLowerCase() === (row.city || '').trim().toLowerCase();
+    const ordersOk = row.request_for === 1 || tx.txOrderCount <= 10;
+    if (!cityOk || !tx.categoryMatch || tx.supplyStatus !== 'Active' || !ordersOk) {
+      throw badRequest('This technician does not pass the allocation checks (city, category, active, orders).', 409);
+    }
+    tech = { id: tx.efrId, name: tx.efrName, mobile: tx.efrNo, txDetails: `${tx.efrId} - ${tx.efrName}_${tx.efrNo}` };
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    if (actionType === 1 || actionType === 2) {
+      await conn.query(
+        `UPDATE tbl_open_city
+            SET action_by = ?, action_on = NOW(), action_remarks = ?, status = ?,
+                ${actionType === 1 ? 'new_supply_name = ?, new_supply_number = ?' : 'old_supply_id = ?'}
+          WHERE id = ?`,
+        actionType === 1
+          ? [userId, remarks, actionType, tech.name, tech.mobile, openCityId]
+          : [userId, remarks, actionType, tech.id, openCityId],
+      );
+      await conn.query(
+        `INSERT INTO tbl_supply_request_allocation (sr_id, supply_name, supply_no, remarks, supply_type, insert_by, insert_date)
+         VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+        [openCityId, tech.name, tech.mobile, remarks, actionType, userId],
+      );
+    } else {
+      await conn.query(
+        'UPDATE tbl_open_city SET closed_by = ?, closed_on = NOW(), closed_comments = ?, status = ? WHERE id = ?',
+        [userId, remarks, actionType, openCityId],
+      );
+    }
+    await conn.query(
+      `INSERT INTO supply_request_log (sr_id, comment, action_type, user_id, insert_time, tx_details)
+       VALUES (?, ?, ?, ?, NOW(), ?)`,
+      [openCityId, remarks, actionType, userId, tech ? tech.txDetails : null],
+    );
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+  logger.info('Supply gap action applied · id=' + openCityId + ' status=' + actionType);
+
+  let whatsapp = null;
+  if (tech) {
+    await logEfrInvite({
+      name: tech.name,
+      mobile: tech.mobile,
+      remarks,
+      inviteStatus: row.request_for === 1 ? `JobId-${row.reference_id ?? openCityId}` : `NewCity-${row.city ?? openCityId}`,
+      supplyId: openCityId,
+      userId,
+    });
+    if (actionType === 1) {
+      // Legacy 'supply_onboard1' — the onboarding nudge to the NEW technician.
+      try {
+        const gallabox = require('../gallabox.whatsapp.service');
+        const r = await gallabox.sendTemplate({
+          to: tech.mobile,
+          recipientName: tech.name,
+          templateName: 'supply_onboard1',
+          bodyValues: { name: tech.name },
+        });
+        whatsapp = { sent: Boolean(r?.delivered), reason: r?.error || (r?.disabled ? 'notifications disabled' : null) };
+      } catch (err) {
+        logger.warn({ err: err.message }, 'Supply onboarding WhatsApp failed · id=' + openCityId);
+        whatsapp = { sent: false, reason: err.message };
+      }
+    }
+  }
+  return { id: openCityId, status: actionType, whatsapp };
+}
+
+// ── 14) invite() — saveEfrInvite (header "Invite Sent", no gap attached) ──
+async function invite({ name, mobile, remarks }, actor) {
+  logger.info('Supply gap manual invite · by=' + actor?.user_id);
+  const ok = await logEfrInvite({ name, mobile, remarks, inviteStatus: 'Invite Sent', supplyId: null, userId: actor?.user_id });
+  if (!ok) throw badRequest('Could not save the invite. Please try again.', 500);
+  return { saved: true };
+}
+
 module.exports = {
   list,
   exportRows,
@@ -907,6 +1346,12 @@ module.exports = {
   txDetails,
   txStatus,
   txCount,
+  pinDetail,
+  create,
+  update,
+  addRemark,
+  act,
+  invite,
   XLSX_COLUMNS,
   // Exposed for reuse/tests.
   _internals: { findGapAge, resolveSupplyStatus, resolveSupplyStatusBatch, normaliseFilters },
