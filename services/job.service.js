@@ -928,7 +928,14 @@ function manageJoin(want) {
  * A job whose Bucket Status reads "Offered To Tx" rendered "unassigned" in the
  * Tx name column: an offer does not set fk_easyfixter_id until a technician
  * accepts, so the cell had nobody to name. Ops asked for the offerees' names
- * there, and the accepter's once accepted.
+ * there (an accepted job already names its technician via fk_easyfixter_id).
+ *
+ * OFFERED ONLY — an ACCEPTED row is never returned. acceptOffer sets
+ * fk_easyfixter_id in the same transaction, so a live accept never reaches the
+ * CRM's unassigned cell; the only ACCEPTED row on a job with NO technician is a
+ * stale one. A reassign (releaseOwnedJobForReoffer → applyUnassignLocked) clears
+ * fk_easyfixter_id but only moves OFFERED rows, leaving the old accepter's row
+ * ACCEPTED — returning it named a technician who no longer holds the job.
  *
  * ONE batched query per PAGE, attached as `offer_efrs`, rather than a
  * projection. A job carries up to MAX_OFFER_RECIPIENTS offer rows, so a list of
@@ -962,7 +969,7 @@ async function attachOfferEfrs(rows) {
        FROM tbl_job_offer jo
        JOIN tbl_easyfixer ef ON ef.efr_id = jo.fk_easyfixter_id
       WHERE jo.job_id IN (${ids.map(() => '?').join(',')})
-        AND jo.offer_status IN (${OFFER_STATUS.OFFERED}, ${OFFER_STATUS.ACCEPTED})
+        AND jo.offer_status = ${OFFER_STATUS.OFFERED}
       GROUP BY jo.job_id, jo.fk_easyfixter_id, ef.efr_name, jo.offer_status
       ORDER BY jo.job_id, MAX(jo.offered_at) DESC`,
     ids,
@@ -971,7 +978,7 @@ async function attachOfferEfrs(rows) {
     const list = byJob.get(Number(o.job_id));
     if (list) list.push({ efr_id: o.efr_id, efr_name: o.efr_name, offer_status: o.offer_status, offered_at: o.offered_at });
   }
-  logger.info('Attached ' + offers.length + ' offered/accepted technicians to ' + ids.length + ' jobs');
+  logger.info('Attached ' + offers.length + ' offered technicians to ' + ids.length + ' jobs');
 }
 
 function escalationColumns(want) {
