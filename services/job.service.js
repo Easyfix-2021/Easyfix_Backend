@@ -133,7 +133,7 @@ const { OFFER_STATUS } = require('./offer-status');
  * Every EXPIRED write below records its cause; the SET fragment is empty until
  * the column exists, so the code may ship before or after the migration.
  */
-const { OFFER_CLOSED_REASON, OFFER_CLOSED_REASON_LABEL, closedReasonSet, hasOfferClosedReasonCol } = require('./offer-closed-reason');
+const { OFFER_CLOSED_REASON, closedReasonSet } = require('./offer-closed-reason');
 
 /*
  * Bulk-expire OPEN offers older than OFFER_TTL_MINUTES (offer_status 0 → 3
@@ -6888,177 +6888,16 @@ async function rejectOffer(jobId, efrId, { reason, reasonId } = {}) {
   };
 }
 
-// ─── List every tech a job was offered to, with each offer's outcome (CRM "Offered to N") ────
+// ─── List the techs currently offered a job (CRM "Offered to N") ────
 /*
- * What ONE listOffers() row says happened to that offer, for the Schedule &
- * Assign "Offered To" table and the Pending-for-Scheduling hover card. Pure:
- * listOffers() passes the row plus the two internal columns it selected, and
- * the route sends the result untouched. It lives here, not in the CRM, so the
- * reason wording has ONE source — OFFER_CLOSED_REASON_LABEL — and a second
- * copy in the frontend cannot drift from it.
+ * Returns every technician with a LIVE (open, status=0) offer on the given
+ * job — newest offer first — so the CRM can expand "Offered to N" into the
+ * actual roster. Returns [] when tbl_job_offer doesn't exist (un-migrated
+ * deploy), so callers never need their own table-probe.
  *
- *   row                : a listOffers() row (efr_id, offer_status,
- *                        offer_status_label, closed_reason)
- *   assignedEfrId      : tbl_job.fk_easyfixter_id — who holds the job NOW
- *   siblingAcceptMatch : 1 when the row matched another technician's accept
- *                        (see listOffers() — a heuristic, not a record)
+ *   jobId : the job whose open offers to list
  *
- * Returns { outcome, outcome_label, outcome_detail, outcome_inferred }. The
- * FIRST rule that matches wins, and the order is the point:
- *
- *   ACCEPTED, holds the job      → accepted             (stored label)
- *   ACCEPTED, job owner-less     → accepted_released    'Job later released'
- *   ACCEPTED, someone else holds → accepted_reassigned  'Job later reassigned'
- *   holds the job, other status  → assigned   ASSIGNED  'Assigned directly'
- *   OFFERED / REJECTED           → offered / rejected   (stored label)
- *   EXPIRED + sibling match      → closed     CLOSED    LABEL[sibling_accepted]
- *   EXPIRED + ttl_elapsed        → expired    EXPIRED   LABEL[ttl_elapsed]
- *   EXPIRED + NULL reason        → closed     CLOSED    'Cause not recorded'
- *   EXPIRED + sibling_accepted   → closed     CLOSED    (no detail)
- *   EXPIRED + another known key  → closed     CLOSED    LABEL[reason]
- *   EXPIRED + unknown string     → closed     CLOSED    (no detail)
- *
- * WHY each non-obvious rule:
- *
- *   • ACCEPTED is only "accepted" for the technician who still holds the job.
- *     Release, assign and unassign never touch an ACCEPTED row, so an old
- *     winner keeps it after the job moved on. The status word stays, but the
- *     outcome and detail say the job has since left them, so the row cannot
- *     be read as naming the job's owner.
- *
- *   • The holder on a NON-accepted row is ASSIGNED, whatever that row says.
- *     They did not get the job through this offer: offerToTechnicians refuses
- *     an owned job, and no writer touches an owner's ACCEPTED row, so a
- *     holder who won through an offer still reads ACCEPTED. One whose latest
- *     row says anything else was assigned directly, or by the legacy CRM.
- *     Showing their old REJECTED or EXPIRED next to the job they hold would
- *     read as a contradiction.
- *
- *   • EXPIRED is said ONLY for ttl_elapsed. With job.offer_expiry.enabled off
- *     nothing times an offer out, and "expired" reads as "the technician let
- *     it lapse" — a fairness claim about a named person (see
- *     services/offer-closed-reason.js). Every other closure is CLOSED.
- *
- *   • A sibling match OVERRIDES any stored reason. After an accept commits no
- *     OFFERED row survives on the job to be closed for another cause, so a
- *     different stored reason on a matching row is left over from before a
- *     re-open (persistJobOfferBatch re-opens in place and never clears
- *     closed_reason). outcome_inferred is true unless the stored reason agrees,
- *     so the CRM can say the cause was inferred rather than recorded.
- *
- *   • NULL is 'Cause not recorded', not "no reason": the row predates the
- *     column, or the writing process's column probe answered "absent" and
- *     cached it. "Cause" cannot be read as "the technician gave no reason".
- *
- *   • A STORED sibling_accepted with no match gets no detail. acceptOffer's
- *     lost-race branch records that reason when nobody accepted at all (the
- *     job moved on, or the offer went stale), so the label can be false. The
- *     deliberate trade-off: a TRUE stored sibling_accepted also loses its
- *     label once the former winner is re-offered, because the re-open erases
- *     the ACCEPTED row the match needs. A bare CLOSED is never false.
- *
- *   • An unknown string gets no detail rather than a raw code. The own-key
- *     check keeps a value like 'toString' from resolving to an
- *     Object.prototype member.
- *
- * Not exported: listOffers() is its only caller, and
- * tests/job-offers-list-outcome.test.js drives it through listOffers() so the
- * SQL's internal columns and this mapping are pinned together.
- */
-function describeOfferOutcome(row, assignedEfrId, siblingAcceptMatch) {
-  const LABEL = OFFER_CLOSED_REASON_LABEL;
-  const status = Number(row.offer_status);
-  const isAssignee = assignedEfrId != null && Number(assignedEfrId) === Number(row.efr_id);
-  const r = row.closed_reason;
-  const m = Number(siblingAcceptMatch) === 1;
-  const result = (outcome, label, detail, inferred) => ({
-    outcome,
-    outcome_label: label,
-    outcome_detail: detail,
-    outcome_inferred: inferred,
-  });
-
-  if (status === OFFER_STATUS.ACCEPTED) {
-    if (isAssignee) return result('accepted', row.offer_status_label, null, false);
-    if (assignedEfrId == null) return result('accepted_released', row.offer_status_label, 'Job later released', false);
-    return result('accepted_reassigned', row.offer_status_label, 'Job later reassigned', false);
-  }
-  if (isAssignee) return result('assigned', 'ASSIGNED', 'Assigned directly', false);
-  if (status === OFFER_STATUS.OFFERED) return result('offered', row.offer_status_label, null, false);
-  if (status === OFFER_STATUS.REJECTED) return result('rejected', row.offer_status_label, null, false);
-  if (status === OFFER_STATUS.EXPIRED) {
-    if (m) {
-      return result('closed', 'CLOSED', LABEL[OFFER_CLOSED_REASON.SIBLING_ACCEPTED],
-        r !== OFFER_CLOSED_REASON.SIBLING_ACCEPTED);
-    }
-    if (r === OFFER_CLOSED_REASON.TTL_ELAPSED) return result('expired', 'EXPIRED', LABEL[r], false);
-    if (r == null) return result('closed', 'CLOSED', 'Cause not recorded', false);
-    if (r === OFFER_CLOSED_REASON.SIBLING_ACCEPTED) return result('closed', 'CLOSED', null, false);
-    if (Object.prototype.hasOwnProperty.call(LABEL, r)) return result('closed', 'CLOSED', LABEL[r], false);
-    return result('closed', 'CLOSED', null, false);
-  }
-  return result(null, row.offer_status_label, null, false);
-}
-
-/*
- * Every technician this job has been offered to — ONE row per technician, their
- * latest offer — and what became of it, so the CRM can show who holds the job,
- * who accepted, who declined, and why an unanswered offer closed. Returns []
- * when tbl_job_offer doesn't exist (un-migrated deploy), so callers never need
- * their own table-probe.
- *
- *   jobId : the job whose offers to list
- *   sweep : false for a PURE read (see the note in the body)
- *
- * Each row: { efr_id, efr_name, offered_at, responded_at, offer_status,
- * offer_status_label, offer_count, offer_source, reject_reason, mobile,
- * offered_by_user_id, offered_by_name, closed_reason, outcome, outcome_label,
- * outcome_detail, outcome_inferred }. The job's holder sorts first, then
- * live → rejected → accepted → closed, newest offer first within each bucket.
- * closed_reason is projected for EXPIRED rows only; the outcome_* fields come
- * from describeOfferOutcome() above.
- *
- * ─── WHY ACCEPTED ROWS ARE LISTED (2026-09-15) ─────────────────────────────
- *
- * This used to list OFFERED/REJECTED/EXPIRED only, on the theory that an
- * accepted job "leaves this modal". It does not. Job 540158 was offered to two
- * technicians; one accepted and holds it, and the modal showed only
- * the other technician, as EXPIRED. The row that explained the closure was the
- * one hidden, and EXPIRED — with the timeout switched off — read as the second
- * technician letting the job lapse.
- *
- * ACCEPTED rows are shown, but they are NOT proof of who holds the job:
- *
- *   • They go stale. Release, assign and unassign never touch them —
- *     applyUnassignLocked rejects only an OFFERED latest row — so a released
- *     or reassigned job keeps its old winner's ACCEPTED row.
- *   • Re-offering a technician re-opens their latest row IN PLACE, whatever
- *     its status (persistJobOfferBatch). An ACCEPTED row flips back to
- *     OFFERED, which erases both the accept and every sibling's match to it.
- *   • The holder can have a non-ACCEPTED latest row, when they were assigned
- *     directly or by the legacy CRM.
- *
- * So the holder is read from tbl_job.fk_easyfixter_id (hence the join), and
- * the first sort key ignores offer status entirely.
- *
- * ─── THE SIBLING MATCH IS A HEURISTIC ──────────────────────────────────────
- *
- * The second technician's row on job 540158 carries a NULL closed_reason, so
- * no stored value says they lost a race. sibling_accept_match infers it from
- * the shape acceptOffer's winning path leaves: it marks the winner ACCEPTED
- * and closes every OFFERED sibling in the same transaction, but in a SECOND
- * statement with its own NOW() on a whole-second column, so the two
- * responded_at values normally land 0–1s apart. Normally, not always: between
- * the two statements acceptOffer awaits closedReasonSet(), which on a cold memo
- * runs its own SHOW COLUMNS on another pool connection, so under load the gap
- * can outgrow the window. That only MISSES the match — the row then shows its
- * stored reason or "Cause not recorded" — it never invents "another technician
- * accepted". After that commit no OFFERED rows remain
- * on the job, and all nine EXPIRED writers match only OFFERED rows, so another
- * closure inside that window takes a same-second coincidence. The offered_at
- * bound excludes an offer made after the accept (a later re-offer round). It
- * is still inference, which is why describeOfferOutcome() flags it
- * outcome_inferred unless the stored reason agrees.
+ * Each row: { efr_id, efr_name, offered_at }.
  */
 async function listOffers(jobId, { sweep = true } = {}) {
   logger.info('List offers for job · id=' + jobId);
@@ -7076,24 +6915,12 @@ async function listOffers(jobId, { sweep = true } = {}) {
    * do not.
    */
   if (sweep) await expireStaleOffers(OFFER_TTL_MINUTES, jobId);
-  // Name closed_reason only where the column exists. The writers degrade to an
-  // empty SET fragment before migrations/2026-09-10-job-offer-closed-reason.sql
-  // runs; a read that named the column would instead fail the whole list on
-  // such a host. Same shared memo the writers use, so the two cannot disagree.
-  const hasReasonCol = await hasOfferClosedReasonCol();
   // Latest offer row PER technician — a re-offer can leave more than one row for
-  // the same (job, tech), so MAX(job_offer_id) picks the current one. All four
-  // states are surfaced, ACCEPTED included; the docblock says why.
-  //
-  // closed_reason is projected for EXPIRED rows only: persistJobOfferBatch's
-  // re-open never clears it, so on a re-opened OFFERED row it is a leftover
-  // that describes an earlier offer, not this one.
-  //
-  // Order: the job's holder first, whatever their row says. CASE rather than a
-  // bare comparison, because with no holder the comparison is NULL and CASE
-  // sends it to ELSE 1. Then live → rejected → accepted → closed, newest-first
-  // within each bucket. All four statuses are named in FIELD() because FIELD
-  // returns 0 for an unlisted value, and that value would sort FIRST.
+  // the same (job, tech), so MAX(job_offer_id) picks the current one. Surfaced
+  // states: OFFERED (live), REJECTED, EXPIRED — the Schedule & Assign modal shows
+  // all three so ops can see who declined / timed out, not just live offers.
+  // ACCEPTED is excluded (that job is already assigned and leaves this modal).
+  // Order: live → rejected → expired, newest-first within each bucket.
   const [rows] = await pool.query(
     `SELECT jo.fk_easyfixter_id AS efr_id, ef.efr_name, jo.offered_at, jo.responded_at,
             jo.offer_status, jo.offer_status_label, jo.offer_count, jo.offer_source,
@@ -7104,39 +6931,21 @@ async function listOffers(jobId, { sweep = true } = {}) {
             ef.efr_no AS mobile,
             -- Who made the offer (NULL on offers predating the column, and on
             -- anything the auto-assign engine offered).
-            jo.offered_by_user_id, ob.user_name AS offered_by_name,
-            -- Internal, stripped before return: who holds the job now.
-            j.fk_easyfixter_id AS assigned_efr_id,
-            ${hasReasonCol ? `CASE WHEN jo.offer_status = ${OFFER_STATUS.EXPIRED} THEN jo.closed_reason END` : 'NULL'} AS closed_reason,
-            -- Internal, stripped before return: the sibling-accept heuristic
-            -- described in the docblock.
-            CASE WHEN jo.offer_status = ${OFFER_STATUS.EXPIRED} AND EXISTS (
-                   SELECT 1 FROM tbl_job_offer acc
-                    WHERE acc.job_id = jo.job_id
-                      AND acc.fk_easyfixter_id <> jo.fk_easyfixter_id
-                      AND acc.offer_status = ${OFFER_STATUS.ACCEPTED}
-                      AND jo.responded_at BETWEEN acc.responded_at AND acc.responded_at + INTERVAL 1 SECOND
-                      AND jo.offered_at <= acc.responded_at
-                 ) THEN 1 ELSE 0 END AS sibling_accept_match
+            jo.offered_by_user_id, ob.user_name AS offered_by_name
        FROM tbl_job_offer jo
        JOIN (SELECT fk_easyfixter_id, MAX(job_offer_id) AS mid
                FROM tbl_job_offer
               WHERE job_id = ?
               GROUP BY fk_easyfixter_id) latest ON latest.mid = jo.job_offer_id
        JOIN tbl_easyfixer ef ON ef.efr_id = jo.fk_easyfixter_id
-       JOIN tbl_job j ON j.job_id = jo.job_id
        LEFT JOIN tbl_user ob ON ob.user_id = jo.offered_by_user_id
-      WHERE jo.offer_status IN (${OFFER_STATUS.OFFERED}, ${OFFER_STATUS.ACCEPTED}, ${OFFER_STATUS.REJECTED}, ${OFFER_STATUS.EXPIRED})
-      ORDER BY CASE WHEN jo.fk_easyfixter_id = j.fk_easyfixter_id THEN 0 ELSE 1 END,
-               FIELD(jo.offer_status, ${OFFER_STATUS.OFFERED}, ${OFFER_STATUS.REJECTED}, ${OFFER_STATUS.ACCEPTED}, ${OFFER_STATUS.EXPIRED}),
+      WHERE jo.offer_status IN (${OFFER_STATUS.OFFERED}, ${OFFER_STATUS.REJECTED}, ${OFFER_STATUS.EXPIRED})
+      ORDER BY FIELD(jo.offer_status, ${OFFER_STATUS.OFFERED}, ${OFFER_STATUS.REJECTED}, ${OFFER_STATUS.EXPIRED}),
                jo.offered_at DESC`,
     [jobId],
   );
-  logger.info('Found ' + rows.length + ' offers (accepted+live+rejected+expired) · jobId=' + jobId);
-  return rows.map(({ assigned_efr_id, sibling_accept_match, ...item }) => ({
-    ...item,
-    ...describeOfferOutcome(item, assigned_efr_id, sibling_accept_match),
-  }));
+  logger.info('Found ' + rows.length + ' offers (live+rejected+expired) · jobId=' + jobId);
+  return rows;
 }
 
 // ─── Reschedule a job's appointment (Schedule & Assign → Reschedule) ─

@@ -1831,25 +1831,8 @@ router.post('/:id/offer', validate(idParam, 'params'), validate(offerBody), scop
 /*
  * GET /api/admin/jobs/:id/offers
  *
- * Lists the technicians a job has been offered to — one item per technician,
- * their latest offer — for the Schedule & Assign "Offered To" table and the
- * Pending-for-Scheduling hover card. Each item:
- *
- *   { efr_id, efr_name, offered_at, responded_at, offer_status,
- *     offer_status_label, offer_count, offer_source, reject_reason, mobile,
- *     offered_by_user_id, offered_by_name,
- *     closed_reason,     EXPIRED rows only; NULL otherwise or pre-column
- *     outcome,           offered | accepted | accepted_released |
- *                        accepted_reassigned | assigned | rejected |
- *                        expired | closed
- *     outcome_label,     the status word to show
- *     outcome_detail,    one line of why, or null
- *     outcome_inferred } true when the detail was inferred, not recorded
- *
- * ACCEPTED rows are included (job 540158 hid the technician who accepted), and
- * the technician who holds the job sorts first. Every outcome_* value, the
- * holder lookup and the sort are derived in job.listOffers — this handler only
- * passes them through, so the reason wording has one source. Returns an empty
+ * Lists the technicians a job has been offered to (the "Offered to Tx" panel
+ * on My Orders). Each item: { efr_id, efr_name, offered_at }. Returns an empty
  * list when the offer table is absent (service falls back to legacy behaviour).
  *
  * Literal-segment route under `/:id/` — second segment "offers" disambiguates
