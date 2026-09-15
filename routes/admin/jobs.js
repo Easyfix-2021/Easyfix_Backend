@@ -9,7 +9,7 @@ const { modernOk, modernError } = require('../../utils/response');
 const logger = require('../../logger');
 const {
   listQuery, createBody, updateBody, statusBody, assignBody, offerBody, ownerBody, rescheduleBody, idParam,
-  candidatesQuery, candidatesSearchQuery, slotRecommendationsQuery,
+  appRequestRejectBody, candidatesQuery, candidatesSearchQuery, slotRecommendationsQuery,
 } = require('../../validators/job.validator');
 const { assertEntityInScope } = require('../../lib/scope');
 const requireStageForTransition = require('../../middleware/require-stage');
@@ -1751,6 +1751,46 @@ router.patch('/:id/reschedule', validate(idParam, 'params'), validate(reschedule
     next(e);
   }
 });
+
+/*
+ * PATCH /api/admin/jobs/:id/app-request/reject
+ *
+ * Decline a technician's cancellation or reschedule ask (the Reject button on
+ * the CRM's Technician Requests rows). There is no matching /approve: APPROVE
+ * is the ordinary cancel (PATCH /:id/status → 6) or reschedule
+ * (PATCH /:id/reschedule) above, both of which now clear the flag they answer.
+ * Adding an approve alias would be a second cancel implementation to keep in
+ * step with the first.
+ *
+ * GATED ON ITS OWN ACTION KEY. Both approve paths are already gated — cancel by
+ * requireStageForTransition('status') (a stage-restricted user without 6 in its
+ * allowed targets cannot cancel), reschedule by
+ * requireStageForTransition('reschedule'). A reject is NOT a transition, so
+ * neither guard is reachable here and without requireAction this would be the
+ * one job write on this router any admin-group role could make. Seeded by
+ * migrations/2026-09-15-seed-job-app-request-action.sql.
+ *
+ * scopedJob stays for the usual reason: geo/client scope, so an operator
+ * cannot reject an ask on a job outside their patch.
+ */
+router.patch('/:id/app-request/reject',
+  validate(idParam, 'params'),
+  validate(appRequestRejectBody),
+  requireAction('isJobAppRequestResolve'),
+  scopedJob,
+  async (req, res, next) => {
+    try {
+      logger.info('Reject app request · jobId=' + req.params.id + ' kind=' + req.body?.kind);
+      const updated = await job.rejectAppRequest(Number(req.params.id), req.body, req.user);
+      modernOk(res, updated, 'request rejected');
+    } catch (e) {
+      // 409 APP_REQUEST_NOT_PENDING carries a code the CRM branches on, so it
+      // goes out through the shape that preserves one (plain modernError drops it).
+      if (e.code) return modernError(res, e.status || 400, { message: e.message, code: e.code });
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  });
 
 /*
  * POST /api/admin/jobs/:id/offer
