@@ -10,8 +10,9 @@
 --      tbl_easyfixer_sensitive_change_log. Existing services write to those;
 --      code also appends here for a unified feed.
 --   2. efr_id is backfilled via trigger: when a new technician registers (NEW
---      state), the trigger finds matching activity_log rows by mobile and sets
---      efr_id, linking LEAD → technician journey.
+--      state), the trigger finds activity_log rows whose mobile equals the new
+--      row's tbl_easyfixer.efr_no (the login mobile) and sets efr_id, linking
+--      LEAD → technician journey.
 --   3. from_stage / to_stage only populated for STATUS_CHANGED events
 --      (both NULL for COMMENT_ADDED, BANK_VERIFIED, etc.).
 --
@@ -22,8 +23,22 @@
 --   • CRM → POST COMMENT_ADDED, STATUS_CHANGED on decisions
 --   • Lifecycle & bank services → POST STATUS_CHANGED, BANK_VERIFIED (optional mirror)
 --
+-- ⚠ ALREADY RAN THE FIRST VERSION OF THIS FILE? RE-RUN IT.
+-- The first version created the trigger reading tbl_user.user_mobile, a column
+-- that does not exist, so every INSERT into tbl_easyfixer (app sign-up, CRM
+-- Add Easyfixer, legacy services) fails once it is installed. It also used
+-- CREATE TRIGGER IF NOT EXISTS, so only this version replaces it. Re-run the
+-- whole file (safe, see below) or at least the DROP/CREATE pair in section 2.
+-- Check: the trigger row in section 4 must report present = 1.
+--
+-- ── SAFE TO RE-RUN ───────────────────────────────────────────────────
+-- CREATE TABLE IF NOT EXISTS, and DROP ... IF EXISTS then CREATE for the
+-- trigger and the procedure (the pattern of
+-- executed/2026-08-11-02-training-progress-uniqueness.sql). Both bodies are a
+-- single statement: no DELIMITER, so this opens in DBeaver as well as the CLI.
+--
 -- POST-APPLY
---   • Restart the backend (to load trigger changes)
+--   • No backend restart needed: the trigger and procedure live in the database
 --   • Enable the mobile app to POST to /api/mobile/activity-log
 --   • Wire CRM onboarding decisions to activity log
 -- ─────────────────────────────────────────────────────────────────────
@@ -60,28 +75,25 @@ CREATE TABLE IF NOT EXISTS tbl_easyfixer_activity_log (
 -- When a new row is inserted into tbl_easyfixer (NEW state registration),
 -- find matching activity_log rows by mobile and set efr_id.
 -- This links LEAD invites to the eventual technician.
-DELIMITER $$
-CREATE TRIGGER IF NOT EXISTS tr_easyfixer_activity_backfill
-AFTER INSERT ON tbl_easyfixer FOR EACH ROW
-BEGIN
-  DECLARE v_mobile VARCHAR(20);
-  -- Extract mobile from tbl_user (newly created)
-  SELECT user_mobile INTO v_mobile FROM tbl_user WHERE user_id = NEW.user_id LIMIT 1;
-
-  -- Backfill all activity_log rows matching this mobile with the new efr_id
-  IF v_mobile IS NOT NULL THEN
-    UPDATE tbl_easyfixer_activity_log
-    SET efr_id = NEW.efr_id
-    WHERE mobile = v_mobile AND efr_id IS NULL;
-  END IF;
-END$$
-DELIMITER ;
+-- Reads NEW.efr_no (the login mobile, also what routes/mobile/activity-log.js
+-- stores in `mobile`), not tbl_user: mobile_no can differ and user_id can be NULL.
+-- Any trigger error fails the tbl_easyfixer INSERT, hence CONVERT + explicit
+-- COLLATE: an explicit collation outranks the column's, so no server/legacy
+-- collation default can raise an illegal-mix-of-collations error here.
+DROP TRIGGER IF EXISTS tr_easyfixer_activity_backfill;
+CREATE TRIGGER tr_easyfixer_activity_backfill
+AFTER INSERT ON tbl_easyfixer
+FOR EACH ROW
+UPDATE tbl_easyfixer_activity_log
+   SET efr_id = NEW.efr_id
+ WHERE mobile = CONVERT(NEW.efr_no USING utf8mb4) COLLATE utf8mb4_0900_ai_ci
+   AND efr_id IS NULL;
 
 
 -- ─── 3. Helper stored procedure: append activity log entry ──────────────
 -- Called from backend services to log an event atomically.
-DELIMITER $$
-CREATE PROCEDURE IF NOT EXISTS sp_activity_log_append(
+DROP PROCEDURE IF EXISTS sp_activity_log_append;
+CREATE PROCEDURE sp_activity_log_append(
   IN p_efr_id INT,
   IN p_mobile VARCHAR(20),
   IN p_supply_request_id BIGINT,
@@ -97,23 +109,20 @@ CREATE PROCEDURE IF NOT EXISTS sp_activity_log_append(
   IN p_summary VARCHAR(500),
   IN p_metadata JSON
 )
-BEGIN
-  INSERT INTO tbl_easyfixer_activity_log (
-    efr_id, mobile, supply_request_id, event_type, category, section,
-    from_stage, to_stage, source, actor_type, actor_user_id, actor_name,
-    summary, metadata, created_at
-  ) VALUES (
-    p_efr_id, p_mobile, p_supply_request_id, p_event_type, p_category, p_section,
-    p_from_stage, p_to_stage, p_source, p_actor_type, p_actor_user_id, p_actor_name,
-    p_summary, p_metadata, NOW()
-  );
-END$$
-DELIMITER ;
+INSERT INTO tbl_easyfixer_activity_log (
+  efr_id, mobile, supply_request_id, event_type, category, section,
+  from_stage, to_stage, source, actor_type, actor_user_id, actor_name,
+  summary, metadata, created_at
+) VALUES (
+  p_efr_id, p_mobile, p_supply_request_id, p_event_type, p_category, p_section,
+  p_from_stage, p_to_stage, p_source, p_actor_type, p_actor_user_id, p_actor_name,
+  p_summary, p_metadata, NOW()
+);
 
 
 -- ─── 4. Verify ─────────────────────────────────────────────────────────
 SELECT 'table tbl_easyfixer_activity_log' AS what, COUNT(*) AS present FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tbl_easyfixer_activity_log'
 UNION ALL
-SELECT 'trigger tr_easyfixer_activity_backfill', COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME = 'tr_easyfixer_activity_backfill'
+SELECT 'trigger tr_easyfixer_activity_backfill (reads efr_no)', COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME = 'tr_easyfixer_activity_backfill' AND ACTION_STATEMENT LIKE '%NEW.efr_no%'
 UNION ALL
 SELECT 'procedure sp_activity_log_append', COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = DATABASE() AND ROUTINE_NAME = 'sp_activity_log_append';

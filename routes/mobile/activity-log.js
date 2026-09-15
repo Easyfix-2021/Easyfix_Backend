@@ -27,6 +27,7 @@ router.post(
   validate(Joi.object({
     eventType: Joi.string()
       .trim()
+      .max(48)
       .required()
       .valid(
         'APP_FIRST_OPEN',
@@ -39,7 +40,7 @@ router.post(
         'TRAINING_COMPLETED',
         'ASSESSMENT_SUBMITTED',
       ),
-    section: Joi.string().trim().optional(),
+    section: Joi.string().trim().max(32).optional(),
     summary: Joi.string().trim().max(500).optional(),
     metadata: Joi.object().optional(),
   })),
@@ -50,7 +51,7 @@ router.post(
 
       const result = await activityLogService.appendEvent({
         efr_id: req.tech.efr_id,
-        mobile: req.tech.mobile,
+        mobile: req.tech.efr_no,
         event_type: eventType,
         category: 'LIFECYCLE',
         section,
