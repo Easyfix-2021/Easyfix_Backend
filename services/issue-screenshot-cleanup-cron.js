@@ -110,9 +110,22 @@ const CANDIDATE_SQL = `
    LIMIT ?
 `;
 
-async function sweep(runner = pool) {
+async function sweep(runner = pool, { dryRun = false } = {}) {
   const [rows] = await runner.query(CANDIDATE_SQL, [RETENTION_MONTHS, BATCH_LIMIT]);
-  if (!rows.length) return { eligible: 0, deleted: 0, failed: 0, rowsRemoved: 0 };
+  if (!rows.length) return { eligible: 0, deleted: 0, failed: 0, rowsRemoved: 0, dryRun };
+
+  /*
+   * DRY RUN — counts the candidate set and touches nothing. The one honest way
+   * to answer "what would this delete on Production?" before switching a
+   * destructive job on. It returns BEFORE the first s3.deleteObject rather than
+   * branching inside the loop, so there is no ordering in which a dry run can
+   * reach a delete.
+   */
+  if (dryRun) {
+    logger.info('Issue screenshot cleanup DRY RUN · would delete ' + rows.length
+      + ' image(s) across ' + new Set(rows.map((r) => r.issue_id)).size + ' closed issue(s)');
+    return { eligible: rows.length, deleted: 0, failed: 0, rowsRemoved: 0, dryRun: true };
+  }
 
   const purged = [];
   let failed = 0;
@@ -142,8 +155,22 @@ async function sweep(runner = pool) {
   return { eligible: rows.length, deleted: purged.length, failed, rowsRemoved };
 }
 
-async function runCleanup() {
+/*
+ * `manual` is true when an operator pressed Trigger Now on the Scheduled Jobs
+ * page, false for the cron's own tick (server/scheduler.js passes the kind).
+ *
+ * WHILE THE JOB IS DISABLED, A MANUAL TRIGGER IS A DRY RUN. That is the whole
+ * point of the distinction: the owner asked to watch one dry run before
+ * switching this on, and a Trigger Now that merely answered "skipped" would
+ * show nothing at all. The cron TICK stays a true no-op when disabled — a
+ * disabled job must not do work on a schedule, not even read work.
+ */
+async function runCleanup({ manual = false } = {}) {
   if (!cleanupEnabled()) {
+    if (manual) {
+      logger.info(`Issue screenshot cleanup DRY RUN — ${FLAG} is not 'true', so nothing will be deleted`);
+      return sweep(pool, { dryRun: true });
+    }
     logger.info(`Issue screenshot cleanup skipped — ${FLAG} is not 'true'`);
     return { skipped: true, reason: `${FLAG} not true`, eligible: 0, deleted: 0, failed: 0, rowsRemoved: 0 };
   }

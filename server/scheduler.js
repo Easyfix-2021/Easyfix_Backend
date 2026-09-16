@@ -157,7 +157,16 @@ async function invokeJob(job, kind /* 'cron' | 'manual' */) {
   job.cancelRequested = false;
   job.progressText = null;
   try {
-    const result = await job.runner();
+    /*
+     * The trigger kind reaches the runner (2026-09-16). All 23 runners were
+     * zero-arg, so this is purely additive — JS drops an unused argument — and
+     * it lets a DESTRUCTIVE job distinguish its scheduled tick from an
+     * operator pressing Trigger Now. The issue-screenshot cleanup uses it to
+     * make a manual trigger on a DISABLED job a dry run: it reports what it
+     * WOULD delete instead of doing nothing, which is the only way to inspect
+     * the candidate set before switching the job on.
+     */
+    const result = await job.runner(kind);
     job.lastDurationMs = Date.now() - t0;
     job.lastResult = result ?? { ok: true };
     return result;
@@ -1548,10 +1557,11 @@ You can also run it on demand from Manage Pincodes ("Refresh Status") or with Tr
       + 'Issue text, comments and close notes are untouched; only the images expire. '
       + `Up to ${issueScreenshotCleanup.BATCH_LIMIT} images per run, so a backlog drains over several hours.`,
     cron: '20 2 * * *',
-    runner: async () => {
-      const r = await issueScreenshotCleanup.runCleanup();
+    runner: async (kind) => {
+      // Trigger Now on a DISABLED job is a dry run — see runCleanup.
+      const r = await issueScreenshotCleanup.runCleanup({ manual: kind === 'manual' });
       logger.info(
-        `Issue screenshot cleanup · eligible=${r.eligible} · deleted=${r.deleted}`
+        `Issue screenshot cleanup${r.dryRun ? ' DRY RUN' : ''} · eligible=${r.eligible} · deleted=${r.deleted}`
         + ` · failed=${r.failed} · rowsRemoved=${r.rowsRemoved}`
         + (r.skipped ? ` (skipped: ${r.reason})` : ''),
       );
