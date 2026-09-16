@@ -167,12 +167,13 @@ async function expireStaleOffers(maxAgeMinutes = OFFER_TTL_MINUTES, jobId = null
   let jobClause = '';
   if (jobId != null) { jobClause = ' AND job_id = ?'; params.push(Number(jobId)); }
   const crTtl = await closedReasonSet(OFFER_CLOSED_REASON.TTL_ELAPSED);
+  const now = new Date();
   const [r] = await pool.query(
     `UPDATE tbl_job_offer
         SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = ?${crTtl.sql}
       WHERE offer_status = ${OFFER_STATUS.OFFERED}
-        AND offered_at < NOW() - INTERVAL ? MINUTE${jobClause}`,
-    [new Date(), ...crTtl.params, ...params],
+        AND offered_at < ? - INTERVAL ? MINUTE${jobClause}`,
+    [now, ...crTtl.params, now, ...params],
   );
   return { expired: r.affectedRows || 0 };
 }
@@ -1792,12 +1793,12 @@ function magicLinkDeliveryColumns(colsExist) {
  *   expiry ON (the default, and the normal configuration)
  *     An offer is EFFECTIVELY OPEN only while a technician could still actually
  *     accept it — exactly acceptOffer()'s race-safe claim gate:
- *         offer_status = OFFERED  AND  offered_at >= NOW() - INTERVAL <TTL> MINUTE
+ *         offer_status = OFFERED  AND  offered_at >= now - INTERVAL <TTL> MINUTE
  *     Same comparison, same OFFER_TTL_MINUTES constant, so the chip can never
  *     promise an offer the accept path would refuse, and it stays correct no
  *     matter how far behind the expiry sweep is. EFFECTIVELY DEAD is the exact
  *     complement — EXPIRED, or still OFFERED but past the TTL (expireStaleOffers
- *     sweeps with `offered_at < NOW() - INTERVAL ? MINUTE`) — so a row can never
+ *     sweeps with `offered_at < ? - INTERVAL ? MINUTE`) — so a row can never
  *     be neither.
  *
  *   expiry OFF (`job.offer_expiry.enabled` = 'false')
@@ -1901,15 +1902,24 @@ function offerRowScope(a) {
  * (WHERE fragments) vs inlined integers (projection fragments, which carry no
  * params). Params come out in placeholder order.
  */
-function offerKindPredicate(kind, a, bind, expiry) {
+function offerKindPredicate(kind, a, bind, expiry, now = new Date()) {
   const params = [];
-  const v = (n) => { if (!bind) return offerSqlInt(n); params.push(n); return '?'; };
+  // offered_at is app-written since cffaa49; a freshness read binds an app Date
+  // (`now`) instead of NOW(). bind=false (offerColumns) has no `?` slots, so
+  // pool.escape() inlines it the same way a bound param would format. Callers
+  // that combine 'live' and 'dead' in one statement pass ONE `now`, so the two
+  // stay exact complements the way a single statement's NOW() kept them.
+  const v = (n) => {
+    if (!bind) return (n instanceof Date) ? pool.escape(n) : offerSqlInt(n);
+    params.push(n);
+    return '?';
+  };
   switch (kind) {
     case 'live':
       // expiry OFF ⇒ no TTL term at all: an OFFERED row is open, full stop.
       return {
         sql: `${a}.offer_status = ${v(OFFER_STATUS.OFFERED)}`
-           + (expiry ? ` AND ${a}.offered_at >= NOW() - INTERVAL ${v(OFFER_TTL_MINUTES)} MINUTE` : ''),
+           + (expiry ? ` AND ${a}.offered_at >= ${v(now)} - INTERVAL ${v(OFFER_TTL_MINUTES)} MINUTE` : ''),
         params,
       };
     case 'dead':
@@ -1943,7 +1953,7 @@ function offerKindPredicate(kind, a, bind, expiry) {
         sql: `(${a}.offer_status IN (${v(OFFER_STATUS.EXPIRED)}, ${v(OFFER_STATUS.REJECTED)})`
            + ` OR (${a}.offer_status = ${v(OFFER_STATUS.OFFERED)}`
            + ` AND (${a}.offered_at IS NULL`
-           + ` OR ${a}.offered_at < NOW() - INTERVAL ${v(OFFER_TTL_MINUTES)} MINUTE)))`,
+           + ` OR ${a}.offered_at < ${v(now)} - INTERVAL ${v(OFFER_TTL_MINUTES)} MINUTE)))`,
         params,
       };
     case 'accepted':
@@ -1957,13 +1967,13 @@ function offerKindPredicate(kind, a, bind, expiry) {
 
 // scope + kind predicate — the WHERE body of every offer subquery. Exposed on
 // its own because the COUNT projections need the body without the EXISTS wrap.
-function offerRowWhere(kind, a, bind, expiry) {
-  const k = offerKindPredicate(kind, a, bind, expiry);
+function offerRowWhere(kind, a, bind, expiry, now) {
+  const k = offerKindPredicate(kind, a, bind, expiry, now);
   return { sql: offerRowScope(a) + (k.sql ? ` AND ${k.sql}` : ''), params: k.params };
 }
 
-function offerRowExists(kind, a, { bind = true, negate = false, expiry = true } = {}) {
-  const w = offerRowWhere(kind, a, bind, expiry);
+function offerRowExists(kind, a, { bind = true, negate = false, expiry = true, now } = {}) {
+  const w = offerRowWhere(kind, a, bind, expiry, now);
   return {
     sql: `${negate ? 'NOT ' : ''}EXISTS (SELECT 1 FROM tbl_job_offer ${a} WHERE ${w.sql})`,
     params: w.params,
@@ -1981,7 +1991,7 @@ function offerRowExists(kind, a, { bind = true, negate = false, expiry = true } 
  */
 function offerStateSql(state, { bind = true, alias = 'jos', expiry = true } = {}) {
   const [a1, a2, a3] = [alias, alias + '2', alias + '3'];
-  const o = { bind, expiry };
+  const o = { bind, expiry, now: new Date() };
   const all = (...parts) => ({
     sql: `(${parts.map((p) => p.sql).join(' AND ')})`,
     params: parts.flatMap((p) => p.params),
@@ -2044,11 +2054,11 @@ function offerColumns(tableExists, expiryEnabled = offerExpiryEnabled()) {
    * single-offer common case. The tbl_easyfixer JOIN lives INSIDE this scalar
    * subquery, so it cannot fan out the LIST.
    */
-  const e        = { bind: false, expiry: expiryEnabled };
+  const e        = { bind: false, expiry: expiryEnabled, now: new Date() };
   const live     = (a) => offerRowExists('live', a, e).sql;
   const accepted = (a) => offerRowExists('accepted', a, e).sql;
   const dead     = (a) => offerRowExists('dead', a, e).sql;
-  const where    = (kind, a) => offerRowWhere(kind, a, false, expiryEnabled).sql;
+  const where    = (kind, a) => offerRowWhere(kind, a, false, expiryEnabled, e.now).sql;
   return `, (${live('jo')}) AS is_offered`
        + `, (SELECT ef2.efr_name FROM tbl_job_offer jo2 JOIN tbl_easyfixer ef2 ON ef2.efr_id = jo2.fk_easyfixter_id`
        + `    WHERE ${where('live', 'jo2')}`
@@ -6728,10 +6738,10 @@ async function acceptOffer(jobId, efrId) {
      */
     const enforceTtl = offerExpiryEnabled();
     const freshnessClause = enforceTtl
-      ? ' AND jo.offered_at >= NOW() - INTERVAL ? MINUTE'
+      ? ' AND jo.offered_at >= ? - INTERVAL ? MINUTE'
       : '';
     const claimParams = enforceTtl
-      ? [efrId, jobId, jobId, efrId, OFFER_TTL_MINUTES]
+      ? [efrId, jobId, jobId, efrId, now, OFFER_TTL_MINUTES]
       : [efrId, jobId, jobId, efrId];
     const [r] = await conn.query(
       `UPDATE tbl_job
@@ -6828,9 +6838,12 @@ async function techHasOpenOffer(jobId, efrId) {
   try {
     if (!(await jobOfferTableExists())) return false;
     const lifecycleEligibility = await easyfixerWorkEligibility.sqlPredicate('e');
-    const freshnessClause = offerExpiryEnabled()
-      ? `AND jo.offered_at >= NOW() - INTERVAL ${OFFER_TTL_MINUTES} MINUTE`
+    const enforceTtl = offerExpiryEnabled();
+    const freshnessClause = enforceTtl
+      ? `AND jo.offered_at >= ? - INTERVAL ${OFFER_TTL_MINUTES} MINUTE`
       : '';
+    const params = [jobId, efrId];
+    if (enforceTtl) params.push(new Date());
     const [[row]] = await pool.query(
       `SELECT 1 AS ok
          FROM tbl_job_offer jo
@@ -6850,7 +6863,7 @@ async function techHasOpenOffer(jobId, efrId) {
           AND ${lifecycleEligibility}
           ${freshnessClause}
         LIMIT 1`,
-      [jobId, efrId],
+      params,
     );
     return !!row;
   } catch { return false; }
@@ -6940,11 +6953,11 @@ async function rejectOffer(jobId, efrId, { reason, reasonId } = {}) {
       }
       const enforceTtl = offerExpiryEnabled();
       const freshnessClause = enforceTtl
-        ? ' AND offered_at >= NOW() - INTERVAL ? MINUTE'
+        ? ' AND offered_at >= ? - INTERVAL ? MINUTE'
         : '';
       const respondedAt = new Date();
       const updateParams = enforceTtl
-        ? [normalizedReason, reasonId != null ? reasonId : null, respondedAt, latestOffer.job_offer_id, OFFER_TTL_MINUTES]
+        ? [normalizedReason, reasonId != null ? reasonId : null, respondedAt, latestOffer.job_offer_id, respondedAt, OFFER_TTL_MINUTES]
         : [normalizedReason, reasonId != null ? reasonId : null, respondedAt, latestOffer.job_offer_id];
       const [rejected] = await conn.query(
         `UPDATE tbl_job_offer
@@ -7319,7 +7332,7 @@ async function listOfferedForTech(efrId, { limit = 50 } = {}) {
   const lifecycleEligibility = await easyfixerWorkEligibility.sqlPredicate('e');
   const expiryEnabled = offerExpiryEnabled();
   const freshnessClause = expiryEnabled
-    ? `AND jo.offered_at >= NOW() - INTERVAL ${OFFER_TTL_MINUTES} MINUTE`
+    ? `AND jo.offered_at >= ? - INTERVAL ${OFFER_TTL_MINUTES} MINUTE`
     : '';
   const expiresAtProjection = expiryEnabled
     ? `DATE_ADD(jo.offered_at, INTERVAL ${OFFER_TTL_MINUTES} MINUTE)`
@@ -7352,7 +7365,7 @@ async function listOfferedForTech(efrId, { limit = 50 } = {}) {
         ${freshnessClause}
       ORDER BY jo.offered_at DESC
       LIMIT ?`,
-    [efrId, safeLimit],
+    expiryEnabled ? [efrId, new Date(), safeLimit] : [efrId, safeLimit],
   );
   const ids = offerRows.map((r) => Number(r.job_id));
   if (!ids.length) return { items: [] };

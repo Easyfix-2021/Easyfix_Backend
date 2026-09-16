@@ -81,7 +81,11 @@ const CONCURRENCY = 10;
  * BOTH the SELECT and the per-row claim UPDATE — if the two ever drifted, the
  * claim could stamp last_reminded_at on a row that was no longer eligible (or
  * refuse a row that was), which is exactly the class of bug that makes a
- * reminder cron double-push. Bind order: [afterMinutes, maxAgeMinutes, intervalMinutes].
+ * reminder cron double-push. Bind order: [now, afterMinutes, now, maxAgeMinutes,
+ * now, intervalMinutes] — offered_at and last_reminded_at are both app-written
+ * (new Date()) since cffaa49, so each comparison binds an app-side `now`
+ * instead of SQL NOW() (a different clock); the three share one instant per
+ * call (see ELIGIBLE_PARAMS), each with its own `?` at its own position.
  *
  * The job predicate is an EXISTS (rather than a JOIN) precisely so the ONE
  * fragment keeps working verbatim in the single-table claim UPDATE. It is
@@ -90,9 +94,9 @@ const CONCURRENCY = 10;
  */
 const BASE_ELIGIBLE_SQL = `
      offer_status = ${OFFER_STATUS.OFFERED}
- AND offered_at <= NOW() - INTERVAL ? MINUTE
- AND offered_at >  NOW() - INTERVAL ? MINUTE
- AND (last_reminded_at IS NULL OR last_reminded_at <= NOW() - INTERVAL ? MINUTE)
+ AND offered_at <= ? - INTERVAL ? MINUTE
+ AND offered_at >  ? - INTERVAL ? MINUTE
+ AND (last_reminded_at IS NULL OR last_reminded_at <= ? - INTERVAL ? MINUTE)
  AND EXISTS (SELECT 1 FROM tbl_job j
               WHERE j.job_id = tbl_job_offer.job_id
                 AND j.job_status = ${STATUS.BOOKED}
@@ -105,11 +109,14 @@ function eligibleSql(technicianPredicate) {
                 AND ${technicianPredicate})`;
 }
 
-const ELIGIBLE_PARAMS = () => [
-  REMINDER_AFTER_MINUTES,
-  MAX_REMINDER_AGE_MINUTES,
-  REMINDER_INTERVAL_MINUTES,
-];
+const ELIGIBLE_PARAMS = () => {
+  const now = new Date();
+  return [
+    now, REMINDER_AFTER_MINUTES,
+    now, MAX_REMINDER_AGE_MINUTES,
+    now, REMINDER_INTERVAL_MINUTES,
+  ];
+};
 
 /*
  * True when the sweep cannot run against this DB — tbl_job_offer missing

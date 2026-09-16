@@ -37,7 +37,15 @@ let lastStampedAt = null;    // the real bound Date from the last claim UPDATE
 // Mirror of ELIGIBLE_SQL, evaluated against the params the runner actually
 // bound. Keeping this driven by the runner's OWN params (rather than by the
 // test's constants) is what makes it a real test of the query.
-function eligible([afterMin, maxAgeMin, intervalMin]) {
+//
+// offered_at/last_reminded_at are app-written (new Date()) since cffaa49, so
+// each of the three window comparisons now binds its own app-side `now`
+// (a real Date) ahead of its minutes param — [now, afterMin, now, maxAgeMin,
+// now, intervalMin] — instead of the params array containing bare minute
+// counts. The boolean algebra below still runs against the test's own
+// simulated clock (the outer `now` in ms); the bound Date params are asserted
+// separately (see 'an open, unanswered offer... IS claimed and stamped').
+function eligible([, afterMin, , maxAgeMin, , intervalMin]) {
   if (!offer || offer.offer_status !== 0) return false;
   if (!(offer.offered_at <= now - afterMin * MIN)) return false;
   if (!(offer.offered_at > now - maxAgeMin * MIN)) return false;
@@ -234,12 +242,19 @@ test('an open, unanswered offer inside the window IS claimed and stamped', async
   const claim = fake.calls.find((c) => /UPDATE tbl_job_offer\s+SET last_reminded_at/i.test(c.sql));
   assert.ok(claim, 'the claim UPDATE must be issued');
   assert.match(claim.sql, /offer_status = 0/, 'claim re-checks the offer is still OPEN');
-  assert.match(claim.sql, /last_reminded_at IS NULL OR last_reminded_at <= NOW\(\)/, 'claim re-checks the spacing');
+  assert.match(claim.sql, /last_reminded_at IS NULL OR last_reminded_at <= \? - INTERVAL \? MINUTE/, 'claim re-checks the spacing');
+  assert.doesNotMatch(claim.sql, /NOW\(\)/, 'offered_at\/last_reminded_at are app-written; the claim must bind a Date, never SQL NOW()');
   assert.match(claim.sql, /EXISTS \(SELECT 1 FROM tbl_job j/, 'claim re-checks the job is still offerable');
   assert.match(claim.sql, /EXISTS \(SELECT 1 FROM tbl_easyfixer ef/, 'claim re-checks technician lifecycle eligibility');
   assert.match(claim.sql, /SET last_reminded_at = \?/, 'last_reminded_at is a bound Date, never SQL NOW()');
   assert.ok(lastStampedAt instanceof Date, 'the claim binds a real Date for last_reminded_at');
   assert.equal(claim.params[1], 7, 'claim is scoped to the one offer row');
+  // params: [stampedAt, offerId, now, afterMin, now, maxAgeMin, now, intervalMin]
+  const [, , windowNow1, , windowNow2, , windowNow3] = claim.params;
+  for (const boundNow of [windowNow1, windowNow2, windowNow3]) {
+    assert.ok(boundNow instanceof Date, 'each freshness comparison binds a real Date, not a minute count');
+    assert.ok(Math.abs(Date.now() - boundNow.getTime()) < 60000, 'the bound Date is ~now');
+  }
 });
 
 // ─── Idempotency + cap ───────────────────────────────────────────────

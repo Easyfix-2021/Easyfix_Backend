@@ -68,6 +68,7 @@ const {
   decide,
   dateMs,
   drainBatches,
+  loadSignals,
 } = evaluator._internals;
 
 test('list projection aliases derive an unverified complete profile as UNDER_VERIFICATION', () => {
@@ -1050,4 +1051,37 @@ test('gate-1 finalization still advances a technician who IS in registration', (
     () => resolveGate1Finalization('REAPPLIED', complete, false),
     /cannot be finalized from REAPPLIED/,
   );
+});
+
+test('loadSignals no-show window compares tbl_easyfixer_attendance.created_on against a bound Date, never NOW()', async () => {
+  const { pool } = require('../db');
+  const originalQuery = pool.query;
+  const calls = [];
+  try {
+    pool.query = async (sql, params) => {
+      calls.push({ sql: String(sql), params });
+      return [[]];
+    };
+    const cfg = { ...CFG, noShowEnabled: true, noShowWindowDays: 5 };
+    await loadSignals([{ efr_id: 10 }], cfg);
+
+    const noShowCall = calls.find((c) => /no_shows/i.test(c.sql));
+    assert.ok(noShowCall, 'expected the no-show attendance query to run');
+    assert.doesNotMatch(noShowCall.sql, /NOW\(\)/i);
+    assert.match(noShowCall.sql, /created_on >= DATE_SUB\(\?, INTERVAL \? DAY\)/i);
+    assert.equal(noShowCall.params.length, 3);
+    assert.equal(noShowCall.params[0], 10, 'the efr_id IN(...) placeholder binds first');
+    assert.ok(noShowCall.params[1] instanceof Date, 'created_on window compares against a bound Date');
+    assert.ok(Math.abs(Date.now() - noShowCall.params[1].getTime()) < 60000);
+    assert.equal(noShowCall.params[2], 5);
+
+    // insert_date_time (tbl_easyfixer_rating_by_customer) is a DIFFERENT
+    // column whose writer was not converted — its NOW() must stay untouched.
+    const escalationCall = calls.find((c) => /tbl_easyfixer_rating_by_customer/i.test(c.sql));
+    assert.ok(escalationCall, 'expected the escalation-window query to run');
+    assert.match(escalationCall.sql, /DATE_SUB\(NOW\(\), INTERVAL \? DAY\)/i,
+      'insert_date_time is intentionally left on SQL NOW() (not an app-written column)');
+  } finally {
+    pool.query = originalQuery;
+  }
 });

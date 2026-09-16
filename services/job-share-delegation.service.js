@@ -274,12 +274,13 @@ async function createShare(jobId, sharerEfrId, { delegateEfrId = null, contactNa
   try {
     const [res] = await pool.query(
       `INSERT INTO tbl_job_share_link
-         (job_id, fk_easyfixer_id, delegate_efr_id, contact_name, contact_number, status)
-       VALUES (?, ?, ?, ?, ?, 'pending')`,
+         (job_id, fk_easyfixer_id, delegate_efr_id, contact_name, contact_number, status, created_on)
+       VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
       [
         jobId, sharerEfrId, delegateEfrId,
         contactName ? String(contactName).slice(0, 150) : null,
         contactNumber ? String(contactNumber).slice(0, 15) : null,
+        new Date(),
       ],
     );
     logger.info(`Job share created · jobId=${jobId} · by=${sharerEfrId} · delegate=${delegateEfrId || contactNumber}`);
@@ -406,14 +407,15 @@ async function resolveLock(jobId, efrId) {
  */
 async function expireStaleShares({ hours = ttlHours(), limit = 200 } = {}) {
   try {
+    const now = new Date();
     const [rows] = await pool.query(
       `SELECT share_id, job_id, status
          FROM tbl_job_share_link
         WHERE status IN ('pending', 'accepted')
-          AND COALESCE(responded_on, created_on) < DATE_SUB(NOW(), INTERVAL ? HOUR)
+          AND COALESCE(responded_on, created_on) < DATE_SUB(?, INTERVAL ? HOUR)
         ORDER BY share_id ASC
         LIMIT ?`,
-      [hours, limit],
+      [now, hours, limit],
     );
     let expired = 0;
     for (const row of rows) {

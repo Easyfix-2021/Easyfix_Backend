@@ -389,3 +389,26 @@ test('the retired public share-link surface is gone, not merely unmounted', () =
   assert.doesNotMatch(readSrc('routes/public/index.js'), /shared-job/);
   assert.doesNotMatch(readSrc('routes/mobile/index.js'), /share-link/);
 });
+
+/* ─── The share row's clock ───────────────────────────────────────── */
+
+test('created_on is bound as a Date, and the TTL sweep compares against one', async () => {
+  properties.flushCache();
+  await properties.preload();                       // '901, 903'
+  jobRow = { job_id: 4321, job_status: 1, fk_easyfixter_id: 901 };
+  const from = fake.calls.length;
+  await delegation.createShare(4321, 901, { delegateEfrId: 902 }).catch(() => {});
+  const insert = fake.calls.slice(from).find((c) => /INSERT INTO tbl_job_share_link/i.test(c.sql));
+  assert.ok(insert, 'the share row is written');
+  assert.match(insert.sql, /status, created_on\)/i);
+  assert.doesNotMatch(insert.sql, /NOW\(\)/i);
+  assert.equal(insert.params.length, 6);
+  assert.ok(insert.params[5] instanceof Date && Math.abs(Date.now() - insert.params[5].getTime()) < 60000);
+
+  const before = fake.calls.length;
+  await delegation.expireStaleShares({ hours: 6, limit: 50 });
+  const select = fake.calls.slice(before).find((c) => /status IN \('pending', 'accepted'\)/i.test(c.sql));
+  assert.match(select.sql, /COALESCE\(responded_on, created_on\) < DATE_SUB\(\?, INTERVAL \? HOUR\)/i);
+  assert.ok(select.params[0] instanceof Date && Math.abs(Date.now() - select.params[0].getTime()) < 60000);
+  assert.deepEqual(select.params.slice(1), [6, 50]);
+});

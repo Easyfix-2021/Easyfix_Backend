@@ -782,17 +782,22 @@ async function fetchEscalationOrders(pf) {
   const params = [];
   const clientFrag = clientGuard('TJ.fk_client_id', pf, params);
   const scalarParams = [pf.verticalId, pf.verticalId, pf.zonalManagerId, pf.zonalManagerId];
-  const finalParams = [...scalarParams, ...params];
+  // escalated_time is app-written (routes/admin/jobs.js binds new Date()), so
+  // each NOW() comparing against it below shares this one bound `now`. These
+  // six params are textually first — the CASE sits before the WHERE clause.
+  const now = new Date();
+  const escalatedNowParams = [now, now, now, now, now, now];
+  const finalParams = [...escalatedNowParams, ...scalarParams, ...params];
   const sql =
     `SELECT escalation_bucket, COUNT(*) AS COUNT FROM (
         SELECT
           CASE
-            WHEN TIMESTAMPDIFF(HOUR, TRC.escalated_time, NOW()) <= 24 THEN '0-24 hrs'
-            WHEN TIMESTAMPDIFF(HOUR, TRC.escalated_time, NOW()) > 24
-              AND TIMESTAMPDIFF(HOUR, TRC.escalated_time, NOW()) <= 48 THEN '24-48 hrs'
-            WHEN TIMESTAMPDIFF(HOUR, TRC.escalated_time, NOW()) > 48
-              AND TIMESTAMPDIFF(HOUR, TRC.escalated_time, NOW()) <= 72 THEN '48-72 hrs'
-            WHEN TIMESTAMPDIFF(HOUR, TRC.escalated_time, NOW()) > 72 THEN '>72 hrs'
+            WHEN TIMESTAMPDIFF(HOUR, TRC.escalated_time, ?) <= 24 THEN '0-24 hrs'
+            WHEN TIMESTAMPDIFF(HOUR, TRC.escalated_time, ?) > 24
+              AND TIMESTAMPDIFF(HOUR, TRC.escalated_time, ?) <= 48 THEN '24-48 hrs'
+            WHEN TIMESTAMPDIFF(HOUR, TRC.escalated_time, ?) > 48
+              AND TIMESTAMPDIFF(HOUR, TRC.escalated_time, ?) <= 72 THEN '48-72 hrs'
+            WHEN TIMESTAMPDIFF(HOUR, TRC.escalated_time, ?) > 72 THEN '>72 hrs'
           END AS escalation_bucket
         FROM tbl_job TJ
         LEFT JOIN tbl_client TCL ON TCL.client_id = TJ.fk_client_id
