@@ -103,6 +103,36 @@ const ACTION_TYPE_BY_MODE = Object.freeze({
   unreachable: 25,
 });
 
+/*
+ * ── `dueTo=any`: an EXPLICIT "no party filter", only where it is needed ──
+ *
+ * THIS EXISTS BECAUSE THE DATA IS KNOWN-WRONG, NOT BECAUSE THE FILTER IS
+ * OPTIONAL. The six action_type = 8 rows carry user_type values seeded against
+ * the mapping DUE_TO_USER_TYPE later disproved (the `reschedule` note above has
+ * the whole story), so `dueTo=customer` legitimately returns an EMPTY list on
+ * today's catalogue. The owner has decided to leave those values as they are
+ * for now, so the CRM needs to reach the whole bucket through the same endpoint
+ * shape it already calls:
+ *     GET /admin/jobs/action-reasons?type=reschedule&dueTo=any
+ * which returns exactly what /reschedule-reasons returns — every active
+ * action_type = 8 row, in the same { id, label } shape.
+ *
+ * ⚠ DELETE THIS, AND THE BRANCH IN /action-reasons THAT READS IT, THE DAY THOSE
+ * SIX user_type VALUES ARE CORRECTED. It is a workaround for a data defect with
+ * a known fix, not part of the reason model: once the catalogue is right every
+ * party's list is correct and non-empty, and a lingering "any" would quietly
+ * let a due-to radio send no party at all.
+ *
+ * SCOPED TO THE MODES THAT OPT IN — `reschedule` alone today. Deliberately NOT
+ * a DUE_TO_USER_TYPE key: that would hand EVERY mode an unfiltered escape
+ * hatch, and Cancel / Add Remarks / Enquiry / Un Reachable all have correct
+ * per-party data and a radio that must keep meaning what it says. For every
+ * other mode `any` stays exactly what it is today — an unrecognised value,
+ * falling through to the user_type = 2 default like any other typo.
+ */
+const DUE_TO_ANY = 'any';
+const MODES_ALLOWING_DUE_TO_ANY = Object.freeze(['reschedule']);
+
 const ACTION_TYPE = Object.freeze({
   // Cancel Job → action_type = 1 bucket (CRM admin Cancel dialog). Reason is
   // picked per user_type via the "Cancellation Due To" radio, mirroring the
@@ -117,4 +147,9 @@ module.exports = {
   DUE_TO_USER_TYPE,
   ACTION_TYPE_BY_MODE,
   ACTION_TYPE,
+  // The temporary unfiltered-due-to escape hatch and the modes that opt into
+  // it. Exported together so the route cannot hardcode either half, and so
+  // removing the workaround is one edit in one file plus its branch.
+  DUE_TO_ANY,
+  MODES_ALLOWING_DUE_TO_ANY,
 };

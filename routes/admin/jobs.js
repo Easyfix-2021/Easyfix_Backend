@@ -1318,7 +1318,9 @@ router.patch('/escalated/:tableId', async (req, res, next) => {
  */
 // DUE_TO_USER_TYPE + ACTION_TYPE_BY_MODE now live in services/reason-codes.js
 // — promoted from this file 2026-06-04 so cross-tier callers share one map.
-const { DUE_TO_USER_TYPE, ACTION_TYPE_BY_MODE, ACTION_TYPE } = require('../../services/reason-codes');
+const {
+  DUE_TO_USER_TYPE, ACTION_TYPE_BY_MODE, ACTION_TYPE, DUE_TO_ANY, MODES_ALLOWING_DUE_TO_ANY,
+} = require('../../services/reason-codes');
 
 router.get('/comment-reasons', async (req, res, next) => {
   try {
@@ -1581,6 +1583,13 @@ router.get('/:id/transaction', validate(idParam, 'params'), scopedJob, async (re
  * user_type=2 (Client) so older callers without the param still get a
  * sensible list (matches the comment-reasons default).
  *
+ * ONE EXCEPTION, AND IT IS TEMPORARY: `?type=reschedule&dueTo=any` returns the
+ * WHOLE action_type = 8 bucket with no user_type filter — the same rows, in the
+ * same shape, as /reschedule-reasons. It exists only because those rows' seeded
+ * user_types are known-wrong (see DUE_TO_ANY in services/reason-codes.js) and
+ * goes away when they are corrected. `any` is NOT a general value: on every
+ * other mode it is an unrecognised string and behaves exactly as one.
+ *
  * Route-order note: declared BEFORE `/:id` so Express doesn't try to
  * validate the literal string "action-reasons" as a numeric job id —
  * same gotcha as `/bulk` vs `/:jobId` in routes/admin/auto-assign.js.
@@ -1607,18 +1616,33 @@ router.get('/action-reasons', async (req, res, next) => {
 
     const dueRaw = String(req.query.dueTo || '').toLowerCase().replace(/\s+/g, '');
     const userType = DUE_TO_USER_TYPE[dueRaw] || 2; // default = Customer (user_type 2); matches the pre-checked "By Customer" radio
+    /*
+     * `dueTo=any` — the WHOLE bucket, no party filter. TEMPORARY, and scoped to
+     * the modes that opt in (reschedule alone today). See DUE_TO_ANY in
+     * services/reason-codes.js for why it exists — the action_type = 8 rows'
+     * user_types were seeded against a mapping this repo later disproved, so
+     * dueTo=customer is legitimately empty until the catalogue is corrected —
+     * and delete both halves together when it is.
+     *
+     * The mode gate is what keeps this from leaking: for addremarks / enquiry /
+     * unreachable, `any` is not in DUE_TO_USER_TYPE and not in the opt-in list,
+     * so it falls through to the user_type = 2 default exactly as any other
+     * unrecognised value does today. Their behaviour is unchanged.
+     */
+    const unfiltered = dueRaw === DUE_TO_ANY && MODES_ALLOWING_DUE_TO_ANY.includes(modeKey);
 
     const [reasonRows] = await pool.query(
       `SELECT id, action_desc FROM action_taken_reason
-        WHERE action_type = ? AND user_type = ?
+        WHERE action_type = ?${unfiltered ? '' : ' AND user_type = ?'}
               AND (status IS NULL OR status = 1)
         ORDER BY id ASC`,
-      [actionTypeId, userType],
+      unfiltered ? [actionTypeId] : [actionTypeId, userType],
     );
     const items = reasonRows
       .map((r) => ({ id: r.id, label: String(r.action_desc || '').trim() }))
       .filter((x) => x.label);
-    logger.info('Returning ' + items.length + ' action reasons · type=' + type);
+    logger.info('Returning ' + items.length + ' action reasons · type=' + type
+      + (unfiltered ? ' · dueTo=any (unfiltered)' : ' · userType=' + userType));
     modernOk(res, items);
   } catch (e) { next(e); }
 });
