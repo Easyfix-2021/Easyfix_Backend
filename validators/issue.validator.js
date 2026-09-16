@@ -34,14 +34,15 @@ const Joi = require('joi');
  * before: this is the only writer of the column, so one rule on the way in is
  * the whole rule. The fragment goes because nothing in this CRM routes on it.
  *
- * THE COLUMN IS STILL VARCHAR(255) and the slice below keeps that true. A
- * filter URL carrying a 400-id CSV will lose its tail rather than 500 the
- * report; widening the column is a migration with a deploy-order hazard on
- * this very table (see project memory) and is a separate, deliberate step.
+ * THE COLUMN IS VARCHAR(2048) since migrations/2026-09-16-widen-crm-issue-
+ * page-path.sql, and the slice matches it. On a deploy where that SQL has not
+ * run yet, the service catches the 1406 and retries at 255 (createIssue), so
+ * the cap here is the column's and never a 500.
  */
-const pagePath = Joi.string().trim().max(2048).custom((value) => {
+const PAGE_PATH_MAX = 2048;
+const pagePath = Joi.string().trim().max(PAGE_PATH_MAX).custom((value) => {
   const noFragment = String(value).split('#')[0].trim();
-  return noFragment.slice(0, 255);
+  return noFragment.slice(0, PAGE_PATH_MAX);
 }, 'strip-fragment');
 
 const issueIdParam = Joi.object({
@@ -91,6 +92,7 @@ const issueReopen = Joi.object({
 });
 
 module.exports = {
+  PAGE_PATH_MAX,
   issueIdParam,
   issueCreate,
   issueListQuery,

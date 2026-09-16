@@ -193,13 +193,32 @@ async function loadIssueForActor(issueId, actor) {
  * (db.js) stores the IST wall clock verbatim, whereas NOW() would read the
  * container clock and mix two timezones into one column.
  */
+/*
+ * page_path is VARCHAR(2048) since 2026-09-16 — but this table has been bitten
+ * by deploy order before (the v2 image change, see project memory), so the
+ * insert is written to survive either order: on a column still at 255, MySQL
+ * answers 1406 ER_DATA_TOO_LONG in strict mode, and the row is retried with
+ * the value cut to the old width. Old truncation, never a 500, and nothing to
+ * sequence at deploy time. Column width, not a guess — from the MySQL error.
+ */
+const LEGACY_PAGE_PATH_MAX = 255;
+
 async function createIssue({ title, description, pagePath, screenshotKeys, userId }) {
   const keys = (screenshotKeys || []).filter(Boolean);
   const now = new Date();
-  const [r] = await pool.query(
+  const insert = (path) => pool.query(
     'INSERT INTO tbl_crm_issue (title, description, page_path, status, reported_by, created_on) VALUES (?, ?, ?, ?, ?, ?)',
-    [title, description, pagePath || null, STATUS.OPEN, userId, now],
+    [title, description, path || null, STATUS.OPEN, userId, now],
   );
+  let r;
+  try {
+    [r] = await insert(pagePath);
+  } catch (e) {
+    const tooLong = e && e.code === 'ER_DATA_TOO_LONG' && pagePath && pagePath.length > LEGACY_PAGE_PATH_MAX;
+    if (!tooLong) throw e;
+    logger.warn('Issue page_path cut to ' + LEGACY_PAGE_PATH_MAX + ' — the widen migration has not run here yet');
+    [r] = await insert(pagePath.slice(0, LEGACY_PAGE_PATH_MAX));
+  }
   if (keys.length) {
     await pool.query(
       'INSERT INTO tbl_crm_issue_image (issue_id, s3_key, sort_order, created_on) VALUES ?',
