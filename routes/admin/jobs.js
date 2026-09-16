@@ -3169,9 +3169,11 @@ router.put('/:id/feedback',
 router.get('/:id/customer-requests', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
   try {
     logger.info('List customer requests · jobId=' + req.params.id);
+    // preferred_slot exists only after its migration — NULL alias until then.
+    const slotCol = (await job.customerRequestSlotColumnExists()) ? 'preferred_slot' : 'NULL AS preferred_slot';
     const [rows] = await pool.query(
       `SELECT request_id, request_type, reason, remarks,
-              preferred_datetime, request_status, created_at
+              preferred_datetime, ${slotCol}, request_status, created_at
          FROM tbl_job_customer_request
         WHERE job_id = ?
         ORDER BY created_at DESC`,
