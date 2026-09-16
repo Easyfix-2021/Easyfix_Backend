@@ -2348,14 +2348,128 @@ const OFFER_STATE_VALUES = Object.freeze(['pending', 'offered', 'expired']);
  */
 const APP_REQUEST_VALUES = Object.freeze(['any', 'cancel', 'reschedule']);
 
+/*
+ * The two app-request FLAG tests, spelt once. appRequestClause and the
+ * Pending-to-Start buckets (ptsStateSql below) both read them, so "is a cancel
+ * pending" cannot mean one thing to the Technician Requests filter and another
+ * to the Cancellation tab. The alias is a code constant ('j' for list(), 'J'
+ * for the XLSX export's where()), never input.
+ */
+function appRequestFlagSql(alias = 'j') {
+  return {
+    cancel: `COALESCE(${alias}.is_cancelled_by_app, 0) = 1`,
+    resched: `COALESCE(${alias}.is_rescheduled_by_app, 0) = 1`,
+  };
+}
+
 function appRequestClause(appRequest) {
   if (!APP_REQUEST_VALUES.includes(appRequest)) return null;
-  const cancel = 'COALESCE(j.is_cancelled_by_app, 0) = 1';
-  const resched = 'COALESCE(j.is_rescheduled_by_app, 0) = 1';
+  const { cancel, resched } = appRequestFlagSql('j');
   const flag = appRequest === 'cancel' ? cancel
     : appRequest === 'reschedule' ? resched
       : `(${cancel} OR ${resched})`;
   return { sql: `(j.job_status = ? AND ${flag})`, params: [STATUS.SCHEDULED] };
+}
+
+/*
+ * ═══════════ PENDING TO START — six exclusive tabs (2026-09-16) ═══════════
+ *
+ * The CRM's Pending-to-Start page replaces its four overlapping sections with
+ * tabs that PARTITION status-1 jobs: every accepted job sits in exactly one.
+ * `all` is the page; the five below are its buckets, decided in this priority
+ * order when a job could qualify for several:
+ *
+ *   cancel      the technician's pending ask is to CANCEL
+ *   reschedule  the pending ask is to RESCHEDULE, and there is no cancel ask
+ *   missed      no pending ask, appointment before today 00:00:00 IST
+ *               — OR no appointment at all (see below)
+ *   today       no pending ask, appointment within today, IST
+ *   future      no pending ask, appointment from tomorrow 00:00:00 IST
+ *
+ * WHY AN ASK OUTRANKS THE DATE. A technician asking to cancel a job that is
+ * also overdue is a cancellation first: acting on the date (chasing the visit)
+ * would be acting against what the person doing the job has just said. And
+ * cancel outranks reschedule for the reason appRequestOf gives in the CRM — it
+ * is the ask that stops work, and it supersedes whatever appointment a
+ * reschedule was arguing about.
+ *
+ * ⚠ `cancel` IS appRequest=cancel VERBATIM — same flag, same status pin, same
+ * params, asserted in a test. `reschedule` is NOT appRequest=reschedule: that
+ * filter (the Technician Requests section) matches the reschedule flag alone,
+ * so a job carrying BOTH flags appears in it while the CRM renders it as a
+ * cancellation. Tabs must be exclusive, so this one excludes the cancel flag.
+ * appRequest itself is deliberately left as it is — changing it would silently
+ * move rows on a live screen.
+ *
+ * NULL requested_date_time GOES TO `missed`. A pending-to-start job with no
+ * appointment has no date to wait for, so nothing about it will resolve itself:
+ * it needs an operator, which is what `missed` is for. Parking it in `future`
+ * (where a NULL would otherwise go by elimination) would hide it behind jobs
+ * that are merely early. None exist on QA today (0 of 432) — this is the rule
+ * for when one does.
+ *
+ * THE STATUS PIN IS INSIDE EVERY FRAGMENT, as appRequestClause's is. So
+ * ptsState never needs the caller's status=1 to be right, and a caller that
+ * pins a DIFFERENT status gets an empty set — the honest answer, and the same
+ * behaviour appRequest has always had — rather than a 400.
+ *
+ * IST DAY BOUNDS are computed server-side from utils/ist-calendar (todayIst +
+ * shiftYmd), the repo's one IST calendar, once per request and bound as
+ * parameters. requested_date_time is a DATETIME holding IST wall-clock, and
+ * DATETIME comparisons ignore the session timezone, so an IST-literal bound is
+ * exact. "≤ today 23:59:59" is written `< tomorrow 00:00:00`: identical for a
+ * second-precision column, and it cannot miss a fractional second if one ever
+ * appears.
+ */
+const PTS_STATE_VALUES = Object.freeze(['cancel', 'reschedule', 'missed', 'today', 'future']);
+
+/* Today's and tomorrow's 00:00:00 in IST, as DATETIME literals. */
+function istDayBounds(now = new Date()) {
+  const { todayIst, shiftYmd } = require('../utils/ist-calendar');
+  const today = todayIst(now);
+  return { todayStart: `${today} 00:00:00`, tomorrowStart: `${shiftYmd(today, 1)} 00:00:00` };
+}
+
+/*
+ * One bucket as a WHERE fragment. Returns { sql, params } or null for an unknown
+ * state. The five are mutually exclusive and, over status-1 jobs, exhaustive —
+ * which is what lets ptsStateCaseSql below be nothing but these five in order.
+ */
+function ptsStateSql(state, { todayStart, tomorrowStart }, alias = 'j') {
+  const { cancel, resched } = appRequestFlagSql(alias);
+  const pinned = `${alias}.job_status = ?`;
+  const appt = `${alias}.requested_date_time`;
+  const noAsk = `NOT (${cancel} OR ${resched})`;
+  const S = STATUS.SCHEDULED;
+  switch (state) {
+    case 'cancel':
+      return { sql: `(${pinned} AND ${cancel})`, params: [S] };
+    case 'reschedule':
+      return { sql: `(${pinned} AND ${resched} AND NOT (${cancel}))`, params: [S] };
+    case 'missed':
+      return { sql: `(${pinned} AND ${noAsk} AND (${appt} IS NULL OR ${appt} < ?))`, params: [S, todayStart] };
+    case 'today':
+      return { sql: `(${pinned} AND ${noAsk} AND ${appt} >= ? AND ${appt} < ?)`, params: [S, todayStart, tomorrowStart] };
+    case 'future':
+      return { sql: `(${pinned} AND ${noAsk} AND ${appt} >= ?)`, params: [S, tomorrowStart] };
+    default:
+      return null;
+  }
+}
+
+/*
+ * The bucket as a GROUP BY key: a CASE whose WHEN arms ARE the five filter
+ * fragments, verbatim, in priority order. Because the fragments partition
+ * status-1 jobs, the first matching arm is the only matching arm — so a job's
+ * count bucket and the tab that lists it are the same SQL, not two definitions
+ * kept in step. Params come out in placeholder order.
+ */
+function ptsStateCaseSql(bounds, alias = 'j') {
+  const arms = PTS_STATE_VALUES.map((s) => ({ state: s, frag: ptsStateSql(s, bounds, alias) }));
+  return {
+    sql: `CASE ${arms.map((a) => `WHEN ${a.frag.sql} THEN '${a.state}'`).join(' ')} END`,
+    params: arms.flatMap((a) => a.frag.params),
+  };
 }
 
 function offerStateClause(offerState, expiryEnabled = offerExpiryEnabled()) {
@@ -2545,6 +2659,13 @@ async function list({
    * job_status itself.
    */
   appRequest,
+  /*
+   * `ptsState` (2026-09-16) — cancel | reschedule | missed | today | future.
+   * One of the Pending-to-Start page's exclusive tabs. Pins job_status = 1
+   * itself (as appRequest does), so a caller pinning another status gets an
+   * empty set. '' / unknown = no filter. See ptsStateSql above.
+   */
+  ptsState,
   startDate, endDate,
   scope,
   allowedStages,             // Job Stage Access — { mode:'all'|'list', stages }
@@ -2587,6 +2708,15 @@ async function list({
    * rather than a rule to remember.
    */
   groupByOfferState = false,
+  /*
+   * `groupByPtsState` (2026-09-16) — the Pending-to-Start tab strip's counts,
+   * the same idea as groupByOfferState: ONE GROUP BY over this function's own
+   * WHERE, keyed on ptsStateCaseSql, whose arms ARE the ptsState filter
+   * fragments. Returns { rows: [], total, counts }. Do NOT combine with
+   * `ptsState` — getPendingStartCounts' explicit parameter list makes that
+   * structural.
+   */
+  groupByPtsState = false,
   limit = 50, offset = 0,
 } = {}) {
   logger.info('List jobs · status=' + (status ?? statuses ?? 'any') + ' · clientId=' + (clientId ?? '-') + ' · easyfixerId=' + (easyfixerId ?? '-') + ' · limit=' + limit + ' · offset=' + offset);
@@ -2762,6 +2892,20 @@ async function list({
   if (appRequest) {
     const ac = appRequestClause(appRequest);
     if (ac) { clauses.push(ac.sql); params.push(...ac.params); }
+  }
+  /*
+   * The IST day bounds, computed ONCE for this request and shared by the
+   * ptsState filter and the groupByPtsState counts below, so a request that
+   * straddles midnight cannot filter against one day and count against another.
+   */
+  const ptsBounds = (ptsState || groupByPtsState) ? istDayBounds() : null;
+  /*
+   * `ptsState` — one Pending-to-Start tab. The same AND-ed, narrowing shape as
+   * appRequest above; every column is on `j`, so no join and no COUNT drift.
+   */
+  if (ptsState) {
+    const pc = ptsStateSql(ptsState, ptsBounds);
+    if (pc) { clauses.push(pc.sql); params.push(...pc.params); }
   }
   /*
    * Booked-No-Services filter (2026-05-28). Forces both job_status = 0
@@ -3382,6 +3526,40 @@ async function list({
     return { rows: [], total, counts };
   }
 
+  /*
+   * The Pending-to-Start TAB COUNTS — one GROUP BY over the WHERE built above,
+   * keyed on ptsStateCaseSql, whose WHEN arms are the ptsState filter fragments
+   * verbatim. The CASE's params are placeholders in the SELECT, so they bind
+   * BEFORE the WHERE's; that order is the whole reason they are kept separate.
+   *
+   * `all` is the SUM OF THE FIVE. Over status-1 jobs the five partition the set,
+   * so it equals COUNT(*); a NULL group (a row the CASE could not place — which
+   * requires a status other than 1, and the counts caller pins 1) is logged
+   * rather than silently counted in a tab that could not list it.
+   */
+  if (groupByPtsState) {
+    const counts = { all: 0, cancel: 0, reschedule: 0, missed: 0, today: 0, future: 0 };
+    const bucket = ptsStateCaseSql(ptsBounds);
+    const [groups] = await pool.query(
+      `SELECT ${bucket.sql} AS pts_state, COUNT(*) AS c ${countJoin} ${where} GROUP BY pts_state`,
+      [...bucket.params, ...params]
+    );
+    let total = 0;
+    for (const g of groups) {
+      const c = Number(g.c) || 0;
+      total += c;
+      if (PTS_STATE_VALUES.includes(g.pts_state)) counts[g.pts_state] += c;
+    }
+    counts.all = PTS_STATE_VALUES.reduce((sum, s) => sum + counts[s], 0);
+    if (total !== counts.all) {
+      logger.warn('Pending-to-start counts left ' + (total - counts.all) + ' job(s) in no tab');
+    }
+    logger.info('Counted pending-to-start jobs · all=' + counts.all + ' cancel=' + counts.cancel
+      + ' reschedule=' + counts.reschedule + ' missed=' + counts.missed
+      + ' today=' + counts.today + ' future=' + counts.future);
+    return { rows: [], total, counts };
+  }
+
   // Run COUNT and data query in parallel — they're independent, no reason to
   // serialize. Roughly halves wall-clock time on cold caches.
   const dataParams = [...params, Number(limit), Number(offset)];
@@ -3492,6 +3670,36 @@ async function getPendingSchedulingCounts({
     q, categoryId, cityId, clientId, zonalManagerId, scope, allowedStages,
     status: STATUS.BOOKED, assigned: false,
     groupByOfferState: true,
+  });
+  return counts;
+}
+
+/*
+ * ─── My Orders → Pending to Start: the TAB STRIP counts (2026-09-16) ───────
+ *
+ * { all, cancel, reschedule, missed, today, future } — one count per exclusive
+ * tab, `all` the sum of the five. Delegates to list() exactly as
+ * getPendingSchedulingCounts does, so the bucket pin, RBAC scope, Job Stage
+ * Access and every filter clause are built once and shared with the grid.
+ *
+ * THE STATUS IS PINNED HERE (status = 1, "Pending to Start"), not taken from
+ * the caller; ptsState's own fragments pin it again, which is harmless.
+ *
+ * THE FILTERS ARE AN EXPLICIT LIST: the grid's filter card on that page, plus
+ * ownerId (the page's "My Orders" scoping — j.job_client_owner, as list()
+ * reads it). Naming them is what keeps ptsState — which would collapse four
+ * of five numbers to zero — and a stray status structurally unable to arrive.
+ */
+async function getPendingStartCounts({
+  q, categoryId, cityId, clientId, zonalManagerId, ownerId, scope, allowedStages,
+} = {}) {
+  logger.info('Compute pending-to-start tab counts · clientId=' + (clientId ?? '-')
+    + ' cityId=' + (cityId ?? '-') + ' categoryId=' + (categoryId ?? '-')
+    + ' zonalManagerId=' + (zonalManagerId ?? '-') + ' ownerId=' + (ownerId ?? '-') + ' q=' + (q ? 'yes' : '-'));
+  const { counts } = await list({
+    q, categoryId, cityId, clientId, zonalManagerId, ownerId, scope, allowedStages,
+    status: STATUS.SCHEDULED,
+    groupByPtsState: true,
   });
   return counts;
 }
@@ -8105,7 +8313,7 @@ module.exports = {
   // tbl_job.client_services CSV in sync after the customer's self-submit
   // mutates tbl_job_services. Single source of truth, one helper.
   recomputeClientServicesCsv,
-  list, getById, getByIdCore, resolveSelfie, getStatusCounts, getPendingSchedulingCounts, getAttentionSummary, create, update, setStatus, assign, reschedule, unassign, acceptOffer, changeOwner,
+  list, getById, getByIdCore, resolveSelfie, getStatusCounts, getPendingSchedulingCounts, getPendingStartCounts, getAttentionSummary, create, update, setStatus, assign, reschedule, unassign, acceptOffer, changeOwner,
   /*
    * The job's inherited Project Manager / Zonal Manager display names. Exported
    * because they are DERIVED, not columns — every surface that shows either one
@@ -8192,6 +8400,14 @@ module.exports = {
   offerStateCaseSql,
   // The validator imports the vocabulary so the two sides cannot drift.
   APP_REQUEST_VALUES, appRequestClause,
+  /*
+   * Pending-to-Start's exclusive tabs. PTS_STATE_VALUES is the ONE list of
+   * literals the validator derives valid() from; ptsStateSql / istDayBounds are
+   * exported so the XLSX export emits the SAME bucket predicate (bound to its
+   * `J` alias) and the tests can execute it; ptsStateCaseSql for the tests that
+   * assert the counts' CASE arms ARE the filter fragments.
+   */
+  PTS_STATE_VALUES, ptsStateSql, ptsStateCaseSql, istDayBounds,
   /*
    * The app-REQUEST pair, exported for the same reason offerColumns is: the
    * LIST projection and the DETAIL decode are two answers to one question
