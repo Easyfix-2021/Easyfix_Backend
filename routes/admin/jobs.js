@@ -5,6 +5,8 @@ const job = require('../../services/job.service');
 // tbl_job_notes — the legacy free-text ops notepad, read+add only. Deliberately
 // separate from jobComments below: audit trail vs. operator-to-operator notes.
 const jobNotes = require('../../services/job-notes.service');
+// The one-list services editor (Uplifted tab): catalog read + complete-set PUT.
+const servicesEditor = require('../../services/job-services-editor.service');
 const clientRequest = require('../../services/client-request.service');
 const candidateRanking = require('../../services/candidate-ranking.service');
 const jobLocation = require('../../services/job-location.service');
@@ -2612,6 +2614,85 @@ router.post('/:id/services',
       res.status(201);
       modernOk(res, { added: true, job_service_id: ins.insertId, charges: ch });
     } catch (e) { next(e); }
+  });
+
+/*
+ * ─── THE ONE-LIST SERVICES EDITOR (Uplifted tab) ──────────────────────────
+ *
+ *   GET /api/admin/jobs/:id/service-catalog[?categoryId=]
+ *     → { category, categories, types, products, foreign }
+ *   PUT /api/admin/jobs/:id/services   { categoryId?, services: [{ service_id, quantity }] }
+ *     → { added, updated, removed }
+ *
+ * A NEW editor for the Schedule & Assign Uplifted tab only. POST /:id/services
+ * above and every other services writer are deliberately untouched — including
+ * POST's silent quantity overwrite, which is exactly what this pair avoids by
+ * taking the COMPLETE desired set and diffing it against the ACTIVE rows.
+ * services/job-services-editor.service.js carries the rules and the QA
+ * measurements that shaped them.
+ *
+ * Guards match the existing services endpoints: the /api/admin/* chain plus
+ * scopedJob (404 outside the caller's scope). The write also takes
+ * servicesEditable, so a completed job's services — its billing lines — cannot
+ * be changed, and the service re-checks that on the row it locks.
+ */
+/*
+ * require('joi') inline, as the neighbouring services routes do: this file's
+ * `const Joi` is declared further down, and these schemas are built at module
+ * load — reading it here would be a temporal-dead-zone ReferenceError at
+ * require time.
+ */
+const serviceCatalogQuery = require('joi').object({
+  // Used ONLY while the job resolves no category of its own (see the service).
+  categoryId: require('joi').number().integer().positive().optional(),
+});
+
+router.get('/:id/service-catalog',
+  validate(idParam, 'params'),
+  validate(serviceCatalogQuery, 'query'),
+  scopedJob,
+  async (req, res, next) => {
+    try {
+      const catalog = await servicesEditor.getServiceCatalog(req.scopedJob, { categoryId: req.query.categoryId });
+      modernOk(res, catalog);
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  });
+
+/*
+ * Joi guards the SHAPE; the service owns the business rules and answers them in
+ * plain sentences (an empty set, a duplicate service, a foreign add, a category
+ * that cannot change). `services: []` is therefore valid here on purpose — it is
+ * refused one layer down with "A job needs at least one service." rather than
+ * as an opaque "Validation failed".
+ */
+const QUANTITY_MESSAGE = 'Quantity must be a whole number from 1 to 100.';
+const replaceServicesBody = require('joi').object({
+  categoryId: require('joi').number().integer().positive().allow(null).optional(),
+  services: require('joi').array().items(require('joi').object({
+    service_id: require('joi').number().integer().positive().required(),
+    quantity: require('joi').number().integer().min(1).max(100).required().messages({
+      'number.base': QUANTITY_MESSAGE, 'number.integer': QUANTITY_MESSAGE,
+      'number.min': QUANTITY_MESSAGE, 'number.max': QUANTITY_MESSAGE,
+    }),
+  })).max(200).required(),
+});
+
+router.put('/:id/services',
+  validate(idParam, 'params'),
+  validate(replaceServicesBody),
+  scopedJob,
+  servicesEditable,
+  async (req, res, next) => {
+    try {
+      const result = await servicesEditor.replaceJobServices(req.params.id, req.body, req.user);
+      modernOk(res, result, 'Services saved');
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
   });
 
 router.post('/:id/estimate/send-for-approval',
