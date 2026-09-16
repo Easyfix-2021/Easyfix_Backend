@@ -52,5 +52,8 @@ router.use('/call-tracking',          require('./call-tracking'));
 // Confirmation-quality audit: jobs pushed to Pending for Scheduling without the
 // customer ever confirming (no form submission / Unreachable, and no real call).
 router.use('/premature-confirmations', require('./premature-confirmations'));
+// Employee Performance: an MIS-built snapshot (targets, TimeChamp, IVR are not in
+// easyfix_core), uploaded as data.js and rendered as the original dashboard page.
+router.use('/employee-performance',   require('./employee-performance'));
 
 module.exports = router;
