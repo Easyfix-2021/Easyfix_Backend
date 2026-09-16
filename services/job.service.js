@@ -1395,6 +1395,72 @@ async function resolveClientPrimarySpoc(clientId, conn) {
   return head?.user_id ?? null;
 }
 
+/*
+ * ─── THE TWO MANAGER NAMES A JOB CARRIES ──────────────────────────────────
+ *
+ * Neither is a column on tbl_job. A job INHERITS both — the Project Manager
+ * from its CLIENT, the Zonal Manager from the CITY of its address — which is
+ * why they are resolved rather than projected, and why either can be null for a
+ * perfectly ordinary job.
+ *
+ * ⚠ BOTH READ THE SOURCE THEIR LIST FILTER COMPARES AGAINST, and that is the
+ * whole point of putting them here rather than in the caller. A panel showing
+ * "Project Manager: X" beside a grid whose `projectManagerId=X` filter would not
+ * return that job is worse than showing nothing, because it looks authoritative.
+ * The two filters live in list() a few hundred lines below; keep this function
+ * beside them, and change both together or neither.
+ *
+ * PROJECT MANAGER — tbl_vertical_mapping (client_id = the job's client,
+ * user_type = 1), joined to tbl_user. Exactly the rows the `projectManagerId`
+ * filter's EXISTS matches, and exactly the set the CRM's own picker offers
+ * (/api/shared/lookup/project-managers?userType=1, which PendingToStartView
+ * calls with that literal). ⚠ user_type here is tbl_vertical_mapping's, NOT
+ * tbl_user.user_type_id — see lookup.service.js's note; and note that
+ * client-verticals.service.js calls user_type 1 "Head" and 2 "Project Manager".
+ * The CRM's Project Manager FILTER is 1, so 1 is what this must answer with, or
+ * the name and the filter describe different people.
+ *
+ * WHICH ONE, when a client has several. The mapping is per (client, vertical)
+ * and a job has no vertical of its own, so there is no per-job way to choose —
+ * the same problem, with the same answer, as the job-owner snapshot. So the pick
+ * IS resolveClientPrimarySpoc above: active-only, latest-wins, explicitly
+ * ordered, and NULL rather than the next-latest when the chosen mapping points
+ * at a user that no longer exists. Reusing it costs one small indexed query and
+ * buys the property that the PM this panel names is the same person the job's
+ * owner columns were stamped from. Re-ordering these rows a second time here is
+ * exactly the two-copies-that-disagree bug that docblock records.
+ *
+ * ZONAL MANAGER — tbl_city.state_user, the city's owner, joined to tbl_user.
+ * The `zonalManagerId` filter is `ci.state_user IN (…)` on the job's address
+ * city (see its note in list()), and lookup.zonalManagers() walks the identical
+ * chain job → address → city.state_user → tbl_user.
+ *
+ * NULL IS A REAL ANSWER for both — no client mapping, no address/city, a NULL
+ * state_user, or a mapping/owner pointing at a deleted tbl_user row. The INNER
+ * JOIN on the zonal side is deliberate and matches the picker: a city whose
+ * state_user resolves to nobody is not in the dropdown either, so naming it here
+ * would offer a filter value that does not exist.
+ */
+async function getJobManagerNames({ clientId, cityId } = {}, conn) {
+  const db = conn || pool;
+  const pmUserId = await resolveClientPrimarySpoc(clientId, conn);
+  // 0 for an absent id: it matches no row, so both arms answer NULL without
+  // needing a branch per arm (user_id / city_id are positive PKs).
+  const [[row]] = await db.query(
+    `SELECT
+       (SELECT pmu.user_name FROM tbl_user pmu WHERE pmu.user_id = ?) AS project_manager_name,
+       (SELECT zmu.user_name
+          FROM tbl_city zci
+          JOIN tbl_user zmu ON zmu.user_id = zci.state_user
+         WHERE zci.city_id = ? LIMIT 1) AS zonal_manager_name`,
+    [pmUserId ?? 0, cityId ?? 0],
+  );
+  return {
+    projectManagerName: row?.project_manager_name ?? null,
+    zonalManagerName:   row?.zonal_manager_name   ?? null,
+  };
+}
+
 async function stampJobPrimarySpoc(jobId, clientId, conn) {
   if (!jobId || !(await hasJobPrimarySpocColumn())) return;
   const db = conn || pool;
@@ -7786,6 +7852,13 @@ module.exports = {
   // mutates tbl_job_services. Single source of truth, one helper.
   recomputeClientServicesCsv,
   list, getById, getByIdCore, resolveSelfieUrl, getStatusCounts, getPendingSchedulingCounts, getAttentionSummary, create, update, setStatus, assign, reschedule, unassign, acceptOffer, changeOwner,
+  /*
+   * The job's inherited Project Manager / Zonal Manager display names. Exported
+   * because they are DERIVED, not columns — every surface that shows either one
+   * must read it from the same place its list filter compares against, and that
+   * place is this function. See its docblock.
+   */
+  getJobManagerNames,
   hasAfterWorkPhoto, afterPhotoRequiredError,
   // Technician app requests. rejectAppRequest is the Reject button; there is no
   // approve twin because Approve is the ordinary cancel/reschedule, and

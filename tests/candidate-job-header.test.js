@@ -42,6 +42,18 @@ const REQUIRED = [
   'original_appointment_date_time', 'original_appointment_time',
   'job_desc', 'efr_special_notes',
   'created_by_name', 'created_date_time', 'assigned_efr_id',
+  /*
+   * Job Age (2026-09-16) — camelCase because these are the SQL aliases
+   * utils/job-age-sql.js emits and the exact two keys the CRM's formatJobAge()
+   * reads. Renaming them into this file's snake_case majority would render the
+   * Age row as "—" with every value present, so the spelling is pinned here too.
+   */
+  'ageDays', 'ageSecs',
+  // The two INHERITED managers (2026-09-16): the PM from the client's vertical
+  // mapping, the ZM from the address city's owner — see getJobManagerNames.
+  // Passed as options, so buildJobHeader alone renders them null, which is what
+  // the null-not-undefined test below should see.
+  'project_manager_name', 'zonal_manager_name',
 ];
 
 test('the header carries every field the panel renders', () => {
@@ -73,4 +85,64 @@ test('both endpoints build the header through the one builder', () => {
   // A second hand-written literal of the same shape is the drift coming back.
   const literals = src.split('job_id:            job.job_id').length - 1;
   assert.equal(literals, 1, 'a second hand-written job-header literal is back — call buildJobHeader instead');
+  /*
+   * The manager names are the one part of the header the BUILDER cannot supply
+   * on its own — they are resolved per call site and passed in. So the same
+   * drift the rest of this file guards has one more door: a call site that
+   * forgets the resolver still returns a complete-looking header, with two
+   * silently null rows. Both sites must resolve them.
+   */
+  const resolves = src.split('jobService.getJobManagerNames(').length - 1;
+  assert.equal(resolves, 2, `both header paths must resolve the manager names, found ${resolves}`);
+});
+
+test('the age fields are COPIED from the row, never recomputed here', () => {
+  // The list, the detail modal and this header must all read the one SQL
+  // expression (utils/job-age-sql.js). A clock read or a date subtraction in
+  // this builder is how the popup starts disagreeing with the row it opened
+  // from — the whole reason those two aliases exist.
+  const header = buildJobHeader({ job_id: 1, ageDays: 12, ageSecs: 1080000 });
+  assert.equal(header.ageDays, 12);
+  assert.equal(header.ageSecs, 1080000);
+  const src = fs.readFileSync(path.join(__dirname, '..', 'services/candidate-ranking.service.js'), 'utf8');
+  const builder = src.slice(src.indexOf('function buildJobHeader(job, {'), src.indexOf('async function rankCandidatesForJob'));
+  assert.match(builder, /ageDays:\s+job\.ageDays\s*\?\?\s*null/, 'ageDays must come straight off the row');
+  assert.match(builder, /ageSecs:\s+job\.ageSecs\s*\?\?\s*null/, 'ageSecs must come straight off the row');
+  assert.doesNotMatch(builder, /new Date\(|Date\.now\(/, 'the header must not read a clock — the age is SQL\'s answer');
+});
+
+test('each manager name reads the source its own list filter compares against', () => {
+  /*
+   * The failure this prevents is not a crash — it is a panel that confidently
+   * names a Project Manager the grid's `projectManagerId=<that user>` filter
+   * would not return the job for. Both sides are checked here because both can
+   * move; the resolver lives beside the filters in job.service.js precisely so
+   * this stays one file to read.
+   */
+  const svc = fs.readFileSync(path.join(__dirname, '..', 'services/job.service.js'), 'utf8');
+  const fn = svc.slice(svc.indexOf('async function getJobManagerNames'), svc.indexOf('async function stampJobPrimarySpoc'));
+  assert.ok(fn.length > 0 && fn.length < 3000, 'getJobManagerNames must sit directly above stampJobPrimarySpoc');
+
+  // ZONAL: tbl_city.state_user, both here and in the list's zonalManagerId clause.
+  assert.match(fn, /zci\.state_user/, 'the zonal name must come off tbl_city.state_user');
+  assert.match(svc, /ci\.state_user IN \(/, 'the list filter still keys on tbl_city.state_user');
+
+  // PROJECT: the client's user_type = 1 mapping, picked by the ONE resolver.
+  assert.match(svc, /vm\.user_type = 1 AND vm\.user_id IN \(/, 'the list PM filter still keys on user_type = 1');
+  assert.match(fn, /resolveClientPrimarySpoc\(/, 'the PM pick must be the shared one');
+  assert.doesNotMatch(
+    fn, /tbl_vertical_mapping/,
+    'a second ordering of the mapping rows is the two-copies-that-disagree bug — reuse resolveClientPrimarySpoc',
+  );
+});
+
+test('the manager names arrive from the options, not from a tbl_job column', () => {
+  // Neither is a column on tbl_job — reading job.project_manager_name would be
+  // permanently null and look like a data problem rather than a wiring one.
+  const header = buildJobHeader(
+    { job_id: 1, project_manager_name: 'FROM THE ROW', zonal_manager_name: 'FROM THE ROW' },
+    { projectManagerName: 'Asha Rao', zonalManagerName: 'Vikram Shah' },
+  );
+  assert.equal(header.project_manager_name, 'Asha Rao');
+  assert.equal(header.zonal_manager_name, 'Vikram Shah');
 });
