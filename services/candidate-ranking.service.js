@@ -1773,6 +1773,21 @@ function buildJobHeader(job, {
     // THIS as the read-only Time Slot (the customer's booked slot), not a
     // client-derived label. Reschedule re-derives it BE-side from the new time.
     booking_cut_off_time_slot: job.booking_cut_off_time_slot ?? null,
+    /*
+     * The ORIGINAL appointment — the promise made at booking, snapshotted on
+     * create and preserved across every reschedule (requested_date_time moves,
+     * this does not; it is why TAT can tell a slipped job from a punctual one).
+     *
+     * Here because the panel's schedule section must show what was promised
+     * beside what is currently set — an operator re-scheduling a job cannot see
+     * that it has already slipped if the only date on screen is the one that
+     * moved. GET /jobs/:id returns both columns (j.*) and the CRM's JobModal
+     * already reads them; this header is an ALLOWLIST over that payload, so
+     * until now the same two fields reached Schedule & Assign as `undefined`.
+     * Straight off tbl_job — no query change, nothing new to join.
+     */
+    original_appointment_date_time: job.original_appointment_date_time ?? null,
+    original_appointment_time:      job.original_appointment_time      ?? null,
     job_desc:          job.job_desc         ?? null,
     paid_by:           job.paid_by          ?? null,
     paid_by_label:     paidByLabel(job.paid_by),

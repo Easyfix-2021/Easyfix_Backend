@@ -2007,6 +2007,34 @@ function offerStateSql(state, { bind = true, alias = 'jos', expiry = true } = {}
 }
 
 /*
+ * THE BUCKET LADDER — `offer_state` as a single expression.
+ *
+ * Extracted from offerColumns (where it was written inline) the moment a SECOND
+ * surface needed it: the Pending-for-Scheduling TAB COUNTS group rows by this
+ * expression, so a tab's number and the chip on the row it lists are produced by
+ * the same CASE, not by two ladders that happen to agree today.
+ *
+ * Exclusive top-down, which is what makes it identical to the three filter
+ * fragments offerStateSql emits (see the canonical docblock above):
+ *   live                      → 'offered'
+ *   ¬live ∧ accepted          → 'none'      (documented anomaly; no filter matches it)
+ *   ¬live ∧ ¬accepted ∧ dead  → 'expired'
+ *   otherwise                 → 'pending'
+ *
+ * Constants are INLINED (bind: false) — this is a projection / GROUP BY key, and
+ * both call sites append it to a query whose params are positional and already
+ * built, so it must contribute none. The three aliases are the caller's to
+ * choose so two uses in one statement cannot collide; `j` must be in scope.
+ */
+function offerStateCaseSql(expiryEnabled, [a1, a2, a3]) {
+  const e = { bind: false, expiry: expiryEnabled };
+  return `CASE WHEN ${offerRowExists('live', a1, e).sql} THEN 'offered'`
+       + `     WHEN ${offerRowExists('accepted', a2, e).sql} THEN 'none'`
+       + `     WHEN ${offerRowExists('dead', a3, e).sql} THEN 'expired'`
+       + `     ELSE 'pending' END`;
+}
+
+/*
  * `expiryEnabled` is passed in by list() so ONE property read serves both the
  * projection and the filter in a request (they must describe the same regime or
  * the chip and the filter disagree again). Defaulted for standalone callers.
@@ -2026,12 +2054,8 @@ function offerColumns(tableExists, expiryEnabled = offerExpiryEnabled()) {
    * implementation is what let the chip and the filter disagree (a rejected-only
    * job listed under the Expired filter but rendered a different chip).
    *
-   * The CASE ladder is exclusive top-down, which makes it identical to the three
-   * filter fragments:
-   *   live                      → 'offered'
-   *   ¬live ∧ accepted          → 'none'      (documented anomaly; no filter matches it)
-   *   ¬live ∧ ¬accepted ∧ dead  → 'expired'
-   *   otherwise                 → 'pending'
+   * The ladder itself is offerStateCaseSql above — shared with the
+   * Pending-for-Scheduling tab counts, which GROUP BY it.
    *
    * The counts stay for the FE tooltips only — offered_count feeds "Offered to N
    * technicians", expired/total feed the Expired tooltip. They now use the SAME
@@ -2046,8 +2070,6 @@ function offerColumns(tableExists, expiryEnabled = offerExpiryEnabled()) {
    */
   const e        = { bind: false, expiry: expiryEnabled };
   const live     = (a) => offerRowExists('live', a, e).sql;
-  const accepted = (a) => offerRowExists('accepted', a, e).sql;
-  const dead     = (a) => offerRowExists('dead', a, e).sql;
   const where    = (kind, a) => offerRowWhere(kind, a, false, expiryEnabled).sql;
   return `, (${live('jo')}) AS is_offered`
        + `, (SELECT ef2.efr_name FROM tbl_job_offer jo2 JOIN tbl_easyfixer ef2 ON ef2.efr_id = jo2.fk_easyfixter_id`
@@ -2056,10 +2078,7 @@ function offerColumns(tableExists, expiryEnabled = offerExpiryEnabled()) {
        + `, (SELECT COUNT(*) FROM tbl_job_offer jo3 WHERE ${where('live', 'jo3')}) AS offered_count`
        + `, (SELECT COUNT(*) FROM tbl_job_offer jo4 WHERE ${where('any', 'jo4')}) AS total_offer_count`
        + `, (SELECT COUNT(*) FROM tbl_job_offer jo5 WHERE ${where('dead', 'jo5')}) AS expired_offer_count`
-       + `, (CASE WHEN ${live('jo6')} THEN 'offered'`
-       + `        WHEN ${accepted('jo7')} THEN 'none'`
-       + `        WHEN ${dead('jo8')} THEN 'expired'`
-       + `        ELSE 'pending' END) AS offer_state`;
+       + `, (${offerStateCaseSql(expiryEnabled, ['jo6', 'jo7', 'jo8'])}) AS offer_state`;
 }
 
 /*
@@ -2338,6 +2357,28 @@ async function list({
    * that has to be kept in step by hand, and it was not.
    */
   countOnly = false,
+  /*
+   * `groupByOfferState` (2026-09-16) — countOnly's sibling for the
+   * Pending-for-Scheduling TAB STRIP. Returns { rows: [], total, counts } and
+   * skips the data query; `counts` is one number per offer sub-state, produced
+   * by ONE GROUP BY over this function's own WHERE.
+   *
+   * Same reasoning as countOnly, one step further. Four tabs over one bucket
+   * could have been four countOnly calls, or (worse) a second copy of the
+   * bucket's predicates in a hand-written COUNT — the shape that already
+   * desynchronised the client portal's Order History badge. Instead the rows are
+   * bucketed by offerStateCaseSql, the SAME ladder the list projects as each
+   * row's `offer_state` chip and the same algebra offerStateClause filters on,
+   * so a tab's number, the rows that tab lists and the chips on them cannot
+   * describe different populations.
+   *
+   * ⚠ Do NOT combine with `offerState`: that filter would narrow the population
+   * BEFORE the grouping, so three of the four numbers would come back 0. The
+   * counts caller (getPendingSchedulingCounts) forwards an explicit parameter
+   * list that has no offerState in it, which is what makes that structural
+   * rather than a rule to remember.
+   */
+  groupByOfferState = false,
   limit = 50, offset = 0,
 } = {}) {
   logger.info('List jobs · status=' + (status ?? statuses ?? 'any') + ' · clientId=' + (clientId ?? '-') + ' · easyfixerId=' + (easyfixerId ?? '-') + ' · limit=' + limit + ' · offset=' + offset);
@@ -3078,6 +3119,56 @@ async function list({
     return { rows: [], total };
   }
 
+  /*
+   * The offer-sub-state TAB COUNTS — one GROUP BY over the WHERE built above,
+   * so they cannot disagree with the list they sit on top of. See the parameter
+   * note for why this is not four calls.
+   *
+   * `all` is the SUM OF THE THREE, not COUNT(*), and the difference is the
+   * 'none' carve-out: a job holding an ACCEPTED offer but no technician. The
+   * accept path sets fk_easyfixter_id in the same write, which evicts the job
+   * from this bucket, so 'none' should be unreachable here — but if data ever
+   * produces one, no offerState filter matches it either (see offerStateSql), so
+   * counting it in a tab would advertise a row that tab cannot show. It is
+   * logged instead of being folded into a state it is not in.
+   */
+  if (groupByOfferState) {
+    const counts = { all: 0, pending: 0, offered: 0, expired: 0 };
+    /*
+     * tbl_job_offer absent on this deploy — the same memoised probe that turns
+     * the offer PROJECTION into NULL aliases and the offerState FILTER into a
+     * no-op. Nothing has ever been offered, so the whole bucket is 'pending'
+     * and the un-migrated environment gets an honest strip instead of a 500 on
+     * an unknown table.
+     */
+    if (!hasJobOffer) {
+      const [[{ total }]] = await pool.query(`SELECT COUNT(*) AS total ${countJoin} ${where}`, params);
+      logger.info('Counted ' + total + ' jobs by offer state (tbl_job_offer absent — all pending)');
+      return { rows: [], total, counts: { ...counts, all: total, pending: total } };
+    }
+    // Aliases of this fragment's own, disjoint from the count joins (cu/ad/ci/
+    // cl/ef/ow) and from the filter's `jos*`, so nothing can shadow anything.
+    const bucket = offerStateCaseSql(offerExpiry, ['josc', 'josc2', 'josc3']);
+    const [groups] = await pool.query(
+      `SELECT ${bucket} AS offer_state, COUNT(*) AS c ${countJoin} ${where} GROUP BY offer_state`,
+      params
+    );
+    let total = 0;
+    for (const g of groups) {
+      const c = Number(g.c) || 0;
+      total += c;
+      if (OFFER_STATE_VALUES.includes(g.offer_state)) counts[g.offer_state] += c;
+    }
+    counts.all = counts.pending + counts.offered + counts.expired;
+    if (total !== counts.all) {
+      logger.warn('Offer-state counts exclude ' + (total - counts.all)
+        + ' job(s) holding an accepted offer with no technician — no tab can list them');
+    }
+    logger.info('Counted jobs by offer state · all=' + counts.all + ' pending=' + counts.pending
+      + ' offered=' + counts.offered + ' expired=' + counts.expired);
+    return { rows: [], total, counts };
+  }
+
   // Run COUNT and data query in parallel — they're independent, no reason to
   // serialize. Roughly halves wall-clock time on cold caches.
   const dataParams = [...params, Number(limit), Number(offset)];
@@ -3135,6 +3226,61 @@ async function list({
     }
   }
   return { rows, total };
+}
+
+/*
+ * ─── My Orders → Pending for Scheduling: the TAB STRIP counts ─────────────
+ *
+ * Four tabs over ONE bucket — All / Not offered / Offered-waiting / No takers —
+ * which are exactly the four `offerState` values the list already accepts:
+ *   ''        all        the bucket, unfiltered
+ *   'pending' not offered        nobody has been asked yet
+ *   'offered' offered-waiting    ≥1 EFFECTIVELY OPEN offer (within the TTL)
+ *   'expired' no takers          offers exist, none open (expired or rejected)
+ * so a tab's count and the page that tab opens are the same question asked
+ * twice. They are answered by ONE definition: this delegates to list(), which
+ * builds the bucket pins, the RBAC scope, the stage access and every filter
+ * clause exactly once (see `groupByOfferState`).
+ *
+ * THE BUCKET IS PINNED HERE, NOT TAKEN FROM THE CALLER. status = 0 BOOKED +
+ * unassigned IS Pending-for-Scheduling (the list route receives it as
+ * status=0&assigned=false); an endpoint named for the bucket that let the
+ * caller choose a different one would be free to return counts for a page
+ * nobody is looking at.
+ *
+ * COST SHAPE (not measured on production data — stated so the next reader knows
+ * what to measure). The grouping evaluates three correlated EXISTS per row, the
+ * same three the LIST projection already evaluates for every row it returns —
+ * but over the whole bucket rather than one page of it. The bucket is
+ * job_status = 0 AND fk_easyfixter_id IS NULL, i.e. the work not yet scheduled,
+ * which is the small end of tbl_job (the status-0 tab measured in the hundreds
+ * when the list's own EXPLAIN work was done); the joins are only the ones the
+ * caller's filters actually reference, since this shares list()'s alias
+ * sniffing. Each EXISTS seeks idx_job_offer_job_status (job_id, offer_status) —
+ * the index added FOR this predicate shape in
+ * migrations/executed/2026-07-31-index-tbl-job-offer-job-status.sql, whose note
+ * on folding offered_at into it applies here for the same reason. If the bucket
+ * ever grows into the tens of thousands, this is the query to EXPLAIN.
+ *
+ * THE FILTERS ARE AN EXPLICIT LIST, NOT A SPREAD. Every one of them is the FE's
+ * own filter card on that page, forwarded verbatim so the strip narrows with
+ * the grid. Naming them is what makes `offerState` (which would collapse three
+ * of the four numbers to 0) and a stray `status` / `assigned` structurally
+ * unable to arrive — the route's schema strips them, and this signature would
+ * drop them even if it did not.
+ */
+async function getPendingSchedulingCounts({
+  q, categoryId, cityId, clientId, zonalManagerId, scope, allowedStages,
+} = {}) {
+  logger.info('Compute pending-for-scheduling offer-state counts · clientId=' + (clientId ?? '-')
+    + ' cityId=' + (cityId ?? '-') + ' categoryId=' + (categoryId ?? '-')
+    + ' zonalManagerId=' + (zonalManagerId ?? '-') + ' q=' + (q ? 'yes' : '-'));
+  const { counts } = await list({
+    q, categoryId, cityId, clientId, zonalManagerId, scope, allowedStages,
+    status: STATUS.BOOKED, assigned: false,
+    groupByOfferState: true,
+  });
+  return counts;
 }
 
 // ─── Detail ─────────────────────────────────────────────────────────
@@ -7599,7 +7745,7 @@ module.exports = {
   // tbl_job.client_services CSV in sync after the customer's self-submit
   // mutates tbl_job_services. Single source of truth, one helper.
   recomputeClientServicesCsv,
-  list, getById, getByIdCore, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, reschedule, unassign, acceptOffer, changeOwner,
+  list, getById, getByIdCore, getStatusCounts, getPendingSchedulingCounts, getAttentionSummary, create, update, setStatus, assign, reschedule, unassign, acceptOffer, changeOwner,
   hasAfterWorkPhoto, afterPhotoRequiredError,
   // Technician app requests. rejectAppRequest is the Reject button; there is no
   // approve twin because Approve is the ordinary cancel/reschedule, and
@@ -7664,6 +7810,12 @@ module.exports = {
    * rather than a comment.
    */
   OFFER_STATE_VALUES, offerStateClause, offerColumns,
+  /*
+   * The bucket ladder itself, exported for the tab-count tests: the counts GROUP
+   * BY it and the list projects it, so "a tab's number and the chips on the rows
+   * it lists come from one expression" is a checked property too.
+   */
+  offerStateCaseSql,
   // The validator imports the vocabulary so the two sides cannot drift.
   APP_REQUEST_VALUES, appRequestClause,
   /*
