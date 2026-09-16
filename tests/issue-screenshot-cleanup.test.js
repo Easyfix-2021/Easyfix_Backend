@@ -55,7 +55,9 @@ test('only CLOSED issues, and only those closed longer ago than the retention', 
   assert.match(sql, /i\.status = 'closed'/, 'an open issue keeps its screenshots however long triage takes');
   assert.match(sql, /i\.closed_on IS NOT NULL/,
     'status and closed_on are both required — a row with one but not the other is a data fault to skip, not to guess at');
-  assert.match(sql, /i\.closed_on < \(NOW\(\) - INTERVAL \? MONTH\)/);
+  // Clock rule: closed_on is bound as new Date() by issue.service.js's close
+  // path, so the cutoff binds the app clock (a `?`) instead of reading NOW().
+  assert.match(sql, /i\.closed_on < \(\? - INTERVAL \? MONTH\)/);
   assert.equal(cron.RETENTION_MONTHS, 1, "the owner's retention: closed + 1 month");
   // Bounded, so a first run against a bucket accumulating since 2026-09-10
   // drains over hours instead of one tick issuing thousands of deletes.

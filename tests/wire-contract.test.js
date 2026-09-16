@@ -284,8 +284,12 @@ test("the job-age sort key maps to the SECONDS expression, not the day count", (
    * day and collapse the entire sub-day population into one bucket, so the
    * order inside a day would be arbitrary — a sort that looks like it works.
    */
-  const expr = jobSvc.SORTABLE_COLUMNS[contract.jobSortKeys.jobAge];
-  assert.ok(expr, 'the age key must resolve to an expression');
+  const entry = jobSvc.SORTABLE_COLUMNS[contract.jobSortKeys.jobAge];
+  assert.ok(entry, 'the age key must resolve to an expression');
+  // The age expression binds the app clock at call time, so it is a function.
+  const expr = typeof entry === 'function' ? entry() : entry;
+  assert.equal(typeof expr, 'string');
+  assert.doesNotMatch(expr, /=>|function/, 'the evaluated SQL, not the function source');
   assert.equal(/TIMESTAMPDIFF\s*\(\s*SECOND/i.test(String(expr)), true,
     `expected a SECOND-granularity expression, got: ${expr}`);
 });

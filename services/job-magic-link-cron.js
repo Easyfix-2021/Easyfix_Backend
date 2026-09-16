@@ -18,7 +18,8 @@ const whatsappService = require('./gallabox.whatsapp.service');
  * opted in via tbl_client_custom_properties.auto_process_unconfirmed_order
  * and dispatches the WhatsApp magic link if eligible. Guards:
  *   - customer_submitted_at IS NULL (customer hasn't responded yet)
- *   - magic_link_sent_at IS NULL OR magic_link_sent_at < NOW() - INTERVAL 24 HOUR (24h cooldown)
+ *   - magic_link_sent_at IS NULL OR magic_link_sent_at < now - INTERVAL 24 HOUR (24h cooldown; `now`
+ *     is a bound app Date, not SQL NOW() — see the clock-rule comment below)
  *   - magic_link_send_count < 3 (cap at 3 sends per job)
  * LIMIT 500 per run to avoid choking on a backlog burst — next hour
  * picks up the rest.
@@ -37,6 +38,10 @@ async function runHourlySweep() {
   logger.info('Magic-link cron sweep start · status=9 · limit=500');
 
   try {
+    // Clock rule: magic_link_sent_at is bound as new Date() in
+    // job-magic-link.service.js / whatsapp-conversation.service.js — bind
+    // this instant instead of reading SQL NOW().
+    const now = new Date();
     const [rows] = await pool.query(`
       SELECT j.job_id, j.magic_link_sent_at, j.magic_link_send_count,
              (SELECT LOWER(REPLACE(cpm.c_prop_values, '_', ' '))
@@ -53,7 +58,7 @@ async function runHourlySweep() {
          AND cp.status = 1
        WHERE j.job_status = 9
          AND j.customer_submitted_at IS NULL
-         AND (j.magic_link_sent_at IS NULL OR j.magic_link_sent_at < NOW() - INTERVAL 24 HOUR)
+         AND (j.magic_link_sent_at IS NULL OR j.magic_link_sent_at < ? - INTERVAL 24 HOUR)
          /*
           * PER-CLIENT CAP, not a hardcoded 3 (fixed 2026-08-17).
           *
@@ -71,7 +76,7 @@ async function runHourlySweep() {
          AND j.magic_link_send_count < ${magicLinkService.maxSendCountSql('j')}
        ORDER BY j.job_id ASC
        LIMIT 500
-    `);
+    `, [now]);
     eligible = rows.length;
     logger.info('Found ' + eligible + ' eligible unconfirmed jobs');
 

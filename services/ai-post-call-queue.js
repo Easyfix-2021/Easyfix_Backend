@@ -60,6 +60,7 @@ function enqueueMapping({ sessionId, flow, transcript }) {
 async function recoverPending() {
   try {
     const [rows] = await pool.query(
+      // eslint-disable-next-line no-restricted-syntax -- tbl_ai_call_session.created_on is only ever written by its DEFAULT CURRENT_TIMESTAMP (DB clock)
       "SELECT session_id, flow, transcript FROM tbl_ai_call_session WHERE status = 'mapping' AND created_on > (NOW() - INTERVAL 1 DAY) ORDER BY created_on ASC LIMIT 500");
     for (const r of rows) {
       enqueueMapping({ sessionId: r.session_id, flow: resolveFlow(r.flow || DEFAULT_FLOW), transcript: r.transcript || '' });

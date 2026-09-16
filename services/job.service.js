@@ -886,7 +886,7 @@ function manageColumns(want, hasJobOffer) {
    * job-comment.service.js' own listing, so this cell and the job's comment
    * thread can never disagree about which comment is newest. Id order alone is
    * not enough — addComment lets the column default while two raw INSERTs pass
-   * NOW() explicitly, so id order and time order are not guaranteed to agree.
+   * created_on explicitly, so id order and time order are not guaranteed to agree.
    */
   (SELECT LEFT(jc.comments, 300) FROM tbl_job_comment jc
     WHERE jc.job_id = j.job_id
@@ -2614,7 +2614,7 @@ async function list({
     + magicLinkDeliveryColumns(hasMagicLinkDeliveryCols)
     // Job Age (ageDays + ageSecs) — unconditional; every column it touches is a
     // long-standing tbl_job column, so there is nothing to existence-probe.
-    + JOB_AGE_COLUMNS
+    + JOB_AGE_COLUMNS()
     + escalationColumns(wantsEscalation)
     + manageColumns(wantsManage, hasJobOffer);
   const listJoin = LIST_JOIN + escalationJoin(wantsEscalation) + manageJoin(wantsManage);
@@ -2962,7 +2962,8 @@ async function list({
   }
   // requestedBefore — Running Late tile filter.
   if (requestedBefore === 'now') {
-    clauses.push('j.requested_date_time IS NOT NULL AND j.requested_date_time < NOW()');
+    clauses.push('j.requested_date_time IS NOT NULL AND j.requested_date_time < ?');
+    params.push(new Date());
   } else if (requestedBefore) {
     clauses.push('j.requested_date_time IS NOT NULL AND j.requested_date_time < ?');
     params.push(requestedBefore);
@@ -3278,9 +3279,12 @@ async function list({
   // and why sorting can't affect the COUNT join. hasOwnProperty guards against
   // inherited keys ('constructor', '__proto__') reaching the SQL string even if
   // a caller ever bypasses the Joi layer.
-  const sortCol = Object.prototype.hasOwnProperty.call(SORTABLE_COLUMNS, sortBy)
+  const sortColRaw = Object.prototype.hasOwnProperty.call(SORTABLE_COLUMNS, sortBy)
     ? SORTABLE_COLUMNS[sortBy]
     : undefined;
+  // `age` is a function (see utils/job-age-sql.js — the SQL must bind the
+  // app clock fresh on every call); every other entry is a plain string.
+  const sortCol = typeof sortColRaw === 'function' ? sortColRaw() : sortColRaw;
   const sortDirSql = String(sortDir).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
   const orderBy = sortCol
     ? `ORDER BY ${sortCol} ${sortDirSql}, j.job_id DESC`
@@ -3531,7 +3535,7 @@ async function getByIdCore(jobId) {
                constant, so the detail modal and the list row always agree.
                JOB_AGE_COLUMNS is a LEADING-comma fragment, so the line above
                must NOT end in one. */
-            ${JOB_AGE_COLUMNS}
+            ${JOB_AGE_COLUMNS()}
      ${DETAIL_JOIN}
      WHERE j.job_id = ? LIMIT 1`,
     [jobId]
@@ -4076,14 +4080,15 @@ async function getAttentionSummary({ scope, allowedStages } = {}) {
   // 1. Running Late
   const runningLatePromise = (async () => {
     const f = buildScopeFragment('j');
+    const now = new Date();
     const where = ['j.requested_date_time IS NOT NULL',
-                   'j.requested_date_time < NOW()',
+                   'j.requested_date_time < ?',
                    'j.job_status IN (0, 1)',
                    ...f.clauses].join(' AND ');
     return safeCount(
       'runningLate',
       `SELECT COUNT(*) AS c FROM tbl_job j ${f.joins} WHERE ${where}`,
-      f.params,
+      [now, ...f.params],
     );
   })();
 

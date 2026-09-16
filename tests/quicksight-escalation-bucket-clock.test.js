@@ -50,9 +50,17 @@ test('employee-productivity escalation buckets compare escalated_time against a 
   assert.ok(esc, 'expected the escalation-bucket query to run');
   assertSixSharedNowBinds(esc.sql, esc.params);
 
-  // The sibling open-orders bucket (requested/original appointment dates) was
-  // NOT part of this change — its NOW() usages must stay untouched.
+  // The sibling open-orders bucket (requested/original appointment dates)
+  // was left on NOW() by an earlier round; a later round converted it too
+  // (quicksight-employee-productivity.service.js::fetchOpenOrders) — same
+  // rule, same clock, once requested_date_time/original_appointment_date_time
+  // were confirmed app-written.
   const openBucket = fake.calls.find((c) => /date_range/i.test(c.sql) && /requested_date_time/i.test(c.sql));
   assert.ok(openBucket, 'expected the open-orders aging query to run');
-  assert.match(openBucket.sql, /NOW\(\)/i, 'requested/original date columns intentionally left on NOW()');
+  assert.doesNotMatch(openBucket.sql, /NOW\(\)/i);
+  const openQMarkCount = (openBucket.sql.match(/\?/g) || []).length;
+  assert.equal(openQMarkCount, openBucket.params.length, 'placeholder count must match bound params');
+  const openNowParams = openBucket.params.filter((p) => p instanceof Date);
+  assert.equal(openNowParams.length, 4, 'expected the 4 age-bucket clock binds (Future + 3 TIMESTAMPDIFF branches)');
+  assert.ok(openNowParams.every((p) => p.getTime() === openNowParams[0].getTime()), 'all four share one clock read');
 });

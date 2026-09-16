@@ -768,6 +768,11 @@ async function jobDetail(jobId) {
     };
   }
 
+  // job_age's ELSE branch (open jobs) compares ticket_created_date_time — an
+  // app-written IST datetime (no DB default) — against "now", so it's a
+  // bound Date. It's in the SELECT, before the WHERE TJ.job_id = ? below, so
+  // its param goes first.
+  const now = new Date();
   const sql = `
     SELECT
       TJ.job_id, TCL.client_name,
@@ -791,7 +796,7 @@ async function jobDetail(jobId) {
         WHEN TJ.job_status IN (3, 5) THEN FLOOR(TIMESTAMPDIFF(MINUTE, TJ.ticket_created_date_time, TJ.checkout_date_time) / 1440.0)
         WHEN TJ.job_status = 6 THEN FLOOR(TIMESTAMPDIFF(MINUTE, TJ.ticket_created_date_time, TJ.cancel_date_time) / 1440.0)
         WHEN TJ.job_status = 7 THEN FLOOR(TIMESTAMPDIFF(MINUTE, TJ.ticket_created_date_time, TJ.enquiry_date_time) / 1440.0)
-        ELSE FLOOR(TIMESTAMPDIFF(MINUTE, TJ.ticket_created_date_time, NOW()) / 1440.0)
+        ELSE FLOOR(TIMESTAMPDIFF(MINUTE, TJ.ticket_created_date_time, ?) / 1440.0)
       END AS job_age,
       TJ.job_desc, TJ.fk_service_catg_id, TJ.fk_client_id,
       TC.city_id, TC.state_user,
@@ -805,7 +810,7 @@ async function jobDetail(jobId) {
     LEFT JOIN tbl_client TCL ON TCL.client_id = TJ.fk_client_id
     WHERE TJ.job_id = ?
   `;
-  const [rows] = await pool.query(sql, [jobId]);
+  const [rows] = await pool.query(sql, [now, jobId]);
   if (rows.length === 0) {
     logger.warn('Job ID does not exist · jobId=' + jobId);
     const e = new Error('This job ID does not exist.');

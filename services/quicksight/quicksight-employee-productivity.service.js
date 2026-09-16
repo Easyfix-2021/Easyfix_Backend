@@ -688,11 +688,18 @@ async function fetchOpenOrders(pf) {
            ELSE TJ.requested_date_time END)`;
 
   // Param order MUST match placeholder order in the SQL below:
-  //   dateExpr appears 5× (Future + 4 TIMESTAMPDIFF branches), each binding
-  //   :dateMode twice ⇒ 10 dateMode binds; then vertical ×2, zonal ×2, then
-  //   the manage_clients ids (via clientGuard which appends to `params`).
+  //   dateExpr appears 4× (Future + 3 TIMESTAMPDIFF branches — NOT 5×, a
+  //   stale count here previously pushed 10 dateMode binds against 8 real
+  //   ? in dateExpr, which shifted every filter after it: vertical_id was
+  //   silently bound to dateMode, state_user to verticalId, and so on. Each
+  //   dateExpr usage (2 dateMode ?) is now immediately followed by the one
+  //   clock ? (NOW() converted below — requested_date_time /
+  //   original_appointment_date_time are app-written IST datetimes, so it's
+  //   a bound Date), giving [dm, dm, now] × 4; then vertical ×2, zonal ×2,
+  //   then the manage_clients ids (via clientGuard which appends to `params`).
+  const now = new Date();
   const params = [];
-  for (let i = 0; i < 10; i++) params.push(dm);
+  for (let i = 0; i < 4; i++) params.push(dm, dm, now);
   params.push(pf.verticalId, pf.verticalId, pf.zonalManagerId, pf.zonalManagerId);
   const clientFrag = clientGuard('TJ.fk_client_id', pf, params); // pushes client ids
 
@@ -700,10 +707,10 @@ async function fetchOpenOrders(pf) {
     `SELECT date_range, COUNT(job_id) AS job_count FROM (
         SELECT TJ.job_id,
           CASE
-            WHEN ${dateExpr} > NOW() THEN 'Future'
-            WHEN TIMESTAMPDIFF(MINUTE, ${dateExpr}, NOW()) BETWEEN 0 AND 1440 THEN '0-1 days'
-            WHEN TIMESTAMPDIFF(MINUTE, ${dateExpr}, NOW()) BETWEEN 1441 AND 4320 THEN '2-3 days'
-            WHEN TIMESTAMPDIFF(MINUTE, ${dateExpr}, NOW()) BETWEEN 4321 AND 7200 THEN '4-5 days'
+            WHEN ${dateExpr} > ? THEN 'Future'
+            WHEN TIMESTAMPDIFF(MINUTE, ${dateExpr}, ?) BETWEEN 0 AND 1440 THEN '0-1 days'
+            WHEN TIMESTAMPDIFF(MINUTE, ${dateExpr}, ?) BETWEEN 1441 AND 4320 THEN '2-3 days'
+            WHEN TIMESTAMPDIFF(MINUTE, ${dateExpr}, ?) BETWEEN 4321 AND 7200 THEN '4-5 days'
             ELSE '>5 days'
           END AS date_range
         FROM tbl_job TJ

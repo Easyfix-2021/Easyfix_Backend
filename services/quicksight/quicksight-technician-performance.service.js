@@ -426,7 +426,11 @@ async function getAttendance(txIds) {
   const inFrag = txIds.map(() => '?').join(',');
   for (const id of txIds) params.push(id);
 
-  // Window: CURDATE() .. CURDATE()+2 days (covers today + tomorrow rows).
+  // Window: today .. today+2 days (covers today + tomorrow rows). created_on
+  // is app-written (mobile-attendance.service.js binds `?`, no DB default),
+  // so the window bound is a bound Date, not CURDATE().
+  const now = new Date();
+  params.push(now, now);
   const sql =
     `SELECT easyfixer_id,
             DATE(created_on) AS att_date,
@@ -435,8 +439,8 @@ async function getAttendance(txIds) {
             evening_slot
        FROM tbl_easyfixer_attendance
       WHERE easyfixer_id IN (${inFrag})
-        AND created_on >= CURDATE()
-        AND created_on < DATE_ADD(CURDATE(), INTERVAL 2 DAY)`;
+        AND created_on >= DATE(?)
+        AND created_on < DATE_ADD(DATE(?), INTERVAL 2 DAY)`;
   const [rows] = await pool.query(sql, params);
 
   // Resolve today's + tomorrow's ISO dates (server local date for DATE()).

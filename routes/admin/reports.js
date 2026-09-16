@@ -195,18 +195,23 @@ router.get('/user-productivity', async (req, res, next) => {
     const params = [from, to];
     if (userId != null) { clauses.push('l.user_id = ?'); params.push(userId); }
     if (roleId != null) { clauses.push('u.user_role = ?'); params.push(roleId); }
+    // Clock rule: login_date_time/logout_date_time (tbl_user_login_logout_logs)
+    // have no writer or DEFAULT in this repo — they're stamped by the legacy
+    // Java CRM's IST app clock, so an open session's "now" binds the same
+    // instant instead of reading SQL NOW().
+    const now = new Date();
     const [rows] = await pool.query(
       `SELECT u.user_id, u.user_name, u.user_code, u.official_email,
               r.role_name,
               COUNT(l.id) AS sessions,
-              SUM(TIMESTAMPDIFF(SECOND, l.login_date_time, COALESCE(l.logout_date_time, NOW()))) AS active_seconds
+              SUM(TIMESTAMPDIFF(SECOND, l.login_date_time, COALESCE(l.logout_date_time, ?))) AS active_seconds
          FROM tbl_user u
          JOIN tbl_user_login_logout_logs l ON l.user_id = u.user_id
          LEFT JOIN tbl_role r ON r.role_id = u.user_role
         WHERE ${clauses.join(' AND ')}
         GROUP BY u.user_id, u.user_name, u.user_code, u.official_email, r.role_name
         ORDER BY active_seconds DESC
-        LIMIT 1000`, params);
+        LIMIT 1000`, [now, ...params]);
     logger.info('Found ' + rows.length + ' user-productivity rows');
 
     const enriched = rows.map(r => {
