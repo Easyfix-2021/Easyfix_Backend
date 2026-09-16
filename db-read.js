@@ -123,6 +123,8 @@ const state = {
   lastFallbackAt: null,
   lastFallbackCode: null,
   probes: 0,
+  lastProbeAt: null,
+  lastProbeCode: null,
   serverId: null,
   hostname: null,
   distinctFromPrimary: null,
@@ -273,6 +275,16 @@ function getReadPoolStats() {
     lastFallbackAt: state.lastFallbackAt,
     lastFallbackCode: state.lastFallbackCode,
     probes: state.probes,
+    /*
+     * What feeds the breaker, made visible. `probes` counts only half-open
+     * trial READS, and health probes deliberately touch neither it nor
+     * `fallbacks` — so without these, a breaker being fed by /api/health/db
+     * failures and one being fed by nothing report identically (probes:0,
+     * fallbacks:0), which is how a working breaker was twice diagnosed as dead.
+     */
+    consecutiveFailures: state.consecutiveFailures,
+    lastProbeAt: state.lastProbeAt,
+    lastProbeCode: state.lastProbeCode,
     connectionLimit: parseInt(process.env.DB_READ_CONNECTION_LIMIT || '10', 10),
   };
 }
