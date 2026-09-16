@@ -414,8 +414,8 @@ async function verifyLoginOtp(mobile, otp, { onVerifiedTech } = {}) {
     // the issue/verify named lock after this stale read.
     await pool.query(
       `UPDATE otp_details SET is_expired = 1
-        WHERE id = ? AND otp = ? AND is_expired = 0 AND valid_up_to < NOW()`,
-      [row.id, row.otp],
+        WHERE id = ? AND otp = ? AND is_expired = 0 AND valid_up_to < ?`,
+      [row.id, row.otp, new Date()],
     );
     logger.warn('OTP verify failed · reason=OTP_EXPIRED');
     return { ok: false, reason: 'OTP_EXPIRED' };
@@ -478,8 +478,8 @@ async function verifyLoginOtp(mobile, otp, { onVerifiedTech } = {}) {
           AND otp_type = 'Mobile App Otp'
           AND otp = ?
           AND is_expired = 0
-          AND valid_up_to >= NOW()`,
-      [current.id, mobile, current.otp],
+          AND valid_up_to >= ?`,
+      [current.id, mobile, current.otp, new Date()],
     );
     if (Number(consumed.affectedRows) !== 1) {
       return { ok: false, reason: 'OTP_ALREADY_USED' };

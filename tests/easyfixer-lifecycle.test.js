@@ -1075,12 +1075,13 @@ test('loadSignals no-show window compares tbl_easyfixer_attendance.created_on ag
     assert.ok(Math.abs(Date.now() - noShowCall.params[1].getTime()) < 60000);
     assert.equal(noShowCall.params[2], 5);
 
-    // insert_date_time (tbl_easyfixer_rating_by_customer) is a DIFFERENT
-    // column whose writer was not converted — its NOW() must stay untouched.
+    // insert_date_time (tbl_easyfixer_rating_by_customer) is written by the
+    // legacy feedback flow on the IST app clock, so it binds a Date too.
     const escalationCall = calls.find((c) => /tbl_easyfixer_rating_by_customer/i.test(c.sql));
     assert.ok(escalationCall, 'expected the escalation-window query to run');
-    assert.match(escalationCall.sql, /DATE_SUB\(NOW\(\), INTERVAL \? DAY\)/i,
-      'insert_date_time is intentionally left on SQL NOW() (not an app-written column)');
+    assert.match(escalationCall.sql, /insert_date_time >= DATE_SUB\(\?, INTERVAL \? DAY\)/i);
+    assert.deepEqual([escalationCall.params[0], escalationCall.params[2]], [10, cfg.escalationWindowDays]);
+    assert.ok(escalationCall.params[1] instanceof Date);
   } finally {
     pool.query = originalQuery;
   }

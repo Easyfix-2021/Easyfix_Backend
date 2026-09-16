@@ -52,6 +52,8 @@ async function runDailyReminder() {
    * profile-completion nudge doesn't suppress a magic-link send). Good
    * enough for ant-spam — symmetric stamping is a follow-up if needed.
    */
+  // Clock rule: profile_update_sent_at is bound as new Date() by
+  // sendForEasyfixer — bind this instant instead of reading SQL NOW().
   const [rows] = await pool.query(`
     SELECT efr_id,
            COALESCE(NULLIF(TRIM(efr_name), ''),
@@ -67,8 +69,8 @@ async function runDailyReminder() {
        AND efr_no IS NOT NULL
        AND TRIM(efr_no) <> ''
        AND (profile_update_sent_at IS NULL
-            OR profile_update_sent_at < NOW() - INTERVAL 7 DAY)
-  `);
+            OR profile_update_sent_at < ? - INTERVAL 7 DAY)
+  `, [new Date()]);
 
   logger.info('Found ' + rows.length + ' eligible easyfixers for reminder');
 

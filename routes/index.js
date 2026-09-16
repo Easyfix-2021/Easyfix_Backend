@@ -72,6 +72,7 @@ router.get('/health/db', async (_req, res) => {
      * directly instead of it being inferred from a bad row.
      */
     const [rows] = await pool.query(
+      // eslint-disable-next-line no-restricted-syntax -- /api/health/db measures the DB clock and its zone on purpose
       `SELECT 1 AS ok, DATABASE() AS db, NOW() AS ts, UTC_TIMESTAMP() AS utc,
               UNIX_TIMESTAMP() AS epoch, TIMESTAMPDIFF(MINUTE, UTC_TIMESTAMP(), NOW()) AS offset_min,
               @@session.time_zone AS session_tz, @@system_time_zone AS system_tz`,

@@ -81,7 +81,9 @@ test('the 24h cooldown is untouched — this is a per-day sweep, not per-hour', 
   await cron.runHourlySweep();
   const q = fake.calls.find((c) => /FROM tbl_job j/i.test(c.sql));
 
-  assert.match(q.sql, /magic_link_sent_at\s*<\s*NOW\(\)\s*-\s*INTERVAL 24 HOUR/,
+  // Clock rule: magic_link_sent_at is bound as new Date() by the send paths,
+  // so the cooldown binds the app clock (a `?`) instead of reading NOW().
+  assert.match(q.sql, /magic_link_sent_at\s*<\s*\?\s*-\s*INTERVAL 24 HOUR/,
     'the per-job daily cooldown must survive');
   assert.match(q.sql, /j\.job_status = 9/, 'still scoped to unconfirmed jobs');
 });

@@ -40,6 +40,7 @@ async function syncPendingReports() {
   // with a Plivo uuid would always miss. `provider IS NULL` covers legacy rows
   // written before the provider column was populated (all Kaleyra historically).
   const [rows] = await pool.query(
+    // eslint-disable-next-line no-restricted-syntax -- tbl_job_caller_info.inserted_time is only ever written by its DEFAULT CURRENT_TIMESTAMP (DB clock)
     `SELECT job_caller_info, unique_id, inserted_time
        FROM tbl_job_caller_info
       WHERE is_updated = 0

@@ -157,10 +157,10 @@ async function verifyToken(token) {
 
     const [rows] = await conn.query(
       `SELECT id, efr_id FROM tbl_efr_email_verification
-        WHERE token = ? AND verified_at IS NULL AND valid_up_to >= NOW()
+        WHERE token = ? AND verified_at IS NULL AND valid_up_to >= ?
         LIMIT 1
         FOR UPDATE`,
-      [token],
+      [token, new Date()],
     );
     if (!rows.length) {
       logger.warn('Email token invalid, expired or already used');

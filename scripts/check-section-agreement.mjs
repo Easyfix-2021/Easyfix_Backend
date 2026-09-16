@@ -30,6 +30,7 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const cr = require('../services/client-request.service');
+const { todayIst, shiftYmd } = require('../utils/ist-calendar');
 
 const UNCONFIRMED_STATUS = 9;
 
@@ -38,12 +39,7 @@ const UNCONFIRMED_STATUS = 9;
  * Kept beside PLAN so the two descriptions of one row cannot drift.
  */
 function apptOf(row, todayYmd) {
-  const m = /INTERVAL (-?\d+) DAY/.exec(row.appt);
-  if (row.appt === 'NULL') return null;
-  const days = row.appt === 'CURDATE()' ? 0 : Number(m[1]);
-  const d = new Date(`${todayYmd}T00:00:00Z`);
-  d.setUTCDate(d.getUTCDate() + days);
-  return d.toISOString().slice(0, 10);
+  return row.days === null ? null : shiftYmd(todayYmd, row.days);
 }
 
 
@@ -68,14 +64,11 @@ try {
 
   /*
    * The JS side. Facts are read ONCE, in one query, and fed to sectionFor —
-   * the same shape sectionsFor() builds. `today` comes from the DATABASE
-   * (CURDATE()) rather than from this process, so both sides are answering
-   * about the same day even if the two clocks disagree.
+   * the same shape sectionsFor() builds. `today` is the IST day from the app
+   * clock — the same clock sectionPredicate() binds (DATE(?)) since 2026-09-16,
+   * so both sides are answering about the same day.
    */
-  const [[{ today }]] = await pool.query('SELECT CURDATE() AS today');
-  const todayYmd = today instanceof Date
-    ? new Date(today.getTime() - today.getTimezoneOffset() * 60000).toISOString().slice(0, 10)
-    : String(today);
+  const todayYmd = todayIst();
 
   /*
    * ─── SYNTHETIC BOOK ──────────────────────────────────────────────────────
@@ -88,7 +81,7 @@ try {
    * exercising 2 of 5 expressions.
    *
    * So before comparing the real book, build one. Eight jobs pinned to the
-   * DATABASE's own CURDATE() cover every section, both date boundaries, the
+   * app's IST day cover every section, both date boundaries, the
    * NULL-appointment branch, and the precedence rule that a client request wins
    * over an unreachable outcome — none of which today's data can test.
    *
@@ -119,18 +112,18 @@ try {
     const fixed = cols.filter((c) => !['job_status', 'requested_date_time'].includes(c.n));
 
     /*
-     * appt is SQL, evaluated by the database, so both sides of the comparison
-     * are answering about the same day even if this process's clock differs.
+     * `days` is an offset from the app's IST day; apptOf() turns it into the
+     * bound appointment and the JS side's expectation, so the two cannot drift.
      */
     const PLAN = [
-      { tag: 'req-only',       appt: 'NULL',                                        req: true,  unr: false, want: 'actioned_by_client' },
-      { tag: 'req-and-unr',    appt: 'DATE_ADD(CURDATE(), INTERVAL -3 DAY)',        req: true,  unr: true,  want: 'actioned_by_client' },
-      { tag: 'unr-only',       appt: 'DATE_ADD(CURDATE(), INTERVAL -3 DAY)',        req: false, unr: true,  want: 'pending_with_client' },
-      { tag: 'overdue',        appt: 'DATE_ADD(CURDATE(), INTERVAL -1 DAY)',        req: false, unr: false, want: 'overdue' },
-      { tag: 'today',          appt: 'CURDATE()',                                   req: false, unr: false, want: 'upcoming' },
-      { tag: 'tomorrow',       appt: 'DATE_ADD(CURDATE(), INTERVAL 1 DAY)',         req: false, unr: false, want: 'upcoming' },
-      { tag: 'day-after',      appt: 'DATE_ADD(CURDATE(), INTERVAL 2 DAY)',         req: false, unr: false, want: 'future_unscheduled' },
-      { tag: 'no-appointment', appt: 'NULL',                                        req: false, unr: false, want: 'future_unscheduled' },
+      { tag: 'req-only',       days: null, req: true,  unr: false, want: 'actioned_by_client' },
+      { tag: 'req-and-unr',    days: -3,   req: true,  unr: true,  want: 'actioned_by_client' },
+      { tag: 'unr-only',       days: -3,   req: false, unr: true,  want: 'pending_with_client' },
+      { tag: 'overdue',        days: -1,   req: false, unr: false, want: 'overdue' },
+      { tag: 'today',          days: 0,    req: false, unr: false, want: 'upcoming' },
+      { tag: 'tomorrow',       days: 1,    req: false, unr: false, want: 'upcoming' },
+      { tag: 'day-after',      days: 2,    req: false, unr: false, want: 'future_unscheduled' },
+      { tag: 'no-appointment', days: null, req: false, unr: false, want: 'future_unscheduled' },
     ];
 
     const made = [];
@@ -139,8 +132,8 @@ try {
       const vals = fixed.map((c) => filler(c.d));
       const [res] = await conn.query(
         `INSERT INTO tbl_job (${names.map((n) => `\`${n}\``).join(', ')})
-         VALUES (${vals.map(() => '?').join(', ')}, ?, ${row.appt})`,
-        [...vals, UNCONFIRMED_STATUS],
+         VALUES (${vals.map(() => '?').join(', ')}, ?, ?)`,
+        [...vals, UNCONFIRMED_STATUS, apptOf(row, todayYmd)],
       );
       const id = res.insertId;
       made.push({ ...row, id });

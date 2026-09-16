@@ -28,9 +28,11 @@
  *     at most 2 verticals x 4 age-cats = 8 rows in practice, so the cap is
  *     a pure guard, never a real truncation.
  *
- * All SQL is parameterised; the flag queries take NO user-bound params
- * (every WHERE literal is a constant), but we still run them through
- * pool.query with an explicit empty params array for consistency.
+ * All SQL is parameterised. The flag queries take no user-bound params, but
+ * each binds a single `now` (a JS Date, IST wall clock via the pool's
+ * +05:30 timezone) once per `?` in place of the CURDATE()/NOW() the legacy
+ * SQL used — a comparison must use the clock the compared column was
+ * written in, not the DB server's own.
  */
 
 const { pool } = require('../../db');
@@ -65,10 +67,10 @@ const FLAG_SQL = {
   waitingtx: `
     SELECT COUNT(TJ.job_id) AS job_count,
       CASE
-        WHEN DATEDIFF(CURDATE(), TJ.original_appointment_date_time) = 0 THEN 'Today'
-        WHEN DATEDIFF(CURDATE(), TJ.original_appointment_date_time) = 1 THEN 'Yesterday'
-        WHEN DATEDIFF(CURDATE(), TJ.original_appointment_date_time) BETWEEN 2 AND 7 THEN 'TwoToSeven'
-        WHEN DATEDIFF(CURDATE(), TJ.original_appointment_date_time) > 7 THEN 'MoreThanSeven'
+        WHEN DATEDIFF(DATE(?), TJ.original_appointment_date_time) = 0 THEN 'Today'
+        WHEN DATEDIFF(DATE(?), TJ.original_appointment_date_time) = 1 THEN 'Yesterday'
+        WHEN DATEDIFF(DATE(?), TJ.original_appointment_date_time) BETWEEN 2 AND 7 THEN 'TwoToSeven'
+        WHEN DATEDIFF(DATE(?), TJ.original_appointment_date_time) > 7 THEN 'MoreThanSeven'
       END AS job_age_category,
       CASE
         WHEN TC.vertical_id = 4 THEN 'Retail'
@@ -78,13 +80,13 @@ const FLAG_SQL = {
     LEFT JOIN tbl_client TC ON TJ.fk_client_id = TC.client_id
     WHERE TJ.job_status IN (0)
       AND TJ.fk_easyfixter_id IS NULL
-      AND TJ.original_appointment_date_time < CURDATE() + INTERVAL 1 DAY
+      AND TJ.original_appointment_date_time < DATE(?) + INTERVAL 1 DAY
     GROUP BY
       CASE
-        WHEN DATEDIFF(CURDATE(), TJ.original_appointment_date_time) = 0 THEN 'Today'
-        WHEN DATEDIFF(CURDATE(), TJ.original_appointment_date_time) = 1 THEN 'Yesterday'
-        WHEN DATEDIFF(CURDATE(), TJ.original_appointment_date_time) BETWEEN 2 AND 7 THEN 'TwoToSeven'
-        WHEN DATEDIFF(CURDATE(), TJ.original_appointment_date_time) > 7 THEN 'MoreThanSeven'
+        WHEN DATEDIFF(DATE(?), TJ.original_appointment_date_time) = 0 THEN 'Today'
+        WHEN DATEDIFF(DATE(?), TJ.original_appointment_date_time) = 1 THEN 'Yesterday'
+        WHEN DATEDIFF(DATE(?), TJ.original_appointment_date_time) BETWEEN 2 AND 7 THEN 'TwoToSeven'
+        WHEN DATEDIFF(DATE(?), TJ.original_appointment_date_time) > 7 THEN 'MoreThanSeven'
       END,
       CASE
         WHEN TC.vertical_id = 4 THEN 'Retail'
@@ -98,10 +100,10 @@ const FLAG_SQL = {
   runninglate: `
     SELECT COUNT(TJ.job_id) AS job_count,
       CASE
-        WHEN DATEDIFF(CURDATE(), TJ.requested_date_time) = 0 THEN 'Today'
-        WHEN DATEDIFF(CURDATE(), TJ.requested_date_time) = 1 THEN 'Yesterday'
-        WHEN DATEDIFF(CURDATE(), TJ.requested_date_time) BETWEEN 2 AND 7 THEN 'TwoToSeven'
-        WHEN DATEDIFF(CURDATE(), TJ.requested_date_time) > 7 THEN 'MoreThanSeven'
+        WHEN DATEDIFF(DATE(?), TJ.requested_date_time) = 0 THEN 'Today'
+        WHEN DATEDIFF(DATE(?), TJ.requested_date_time) = 1 THEN 'Yesterday'
+        WHEN DATEDIFF(DATE(?), TJ.requested_date_time) BETWEEN 2 AND 7 THEN 'TwoToSeven'
+        WHEN DATEDIFF(DATE(?), TJ.requested_date_time) > 7 THEN 'MoreThanSeven'
       END AS job_age_category,
       CASE
         WHEN TC.vertical_id = 4 THEN 'Retail'
@@ -111,13 +113,13 @@ const FLAG_SQL = {
     LEFT JOIN tbl_client TC ON (TJ.fk_client_id = TC.client_id)
     WHERE TJ.job_status IN (0, 1)
       AND TJ.fk_easyfixter_id IS NOT NULL
-      AND TJ.requested_date_time < CURDATE() + INTERVAL 1 DAY
+      AND TJ.requested_date_time < DATE(?) + INTERVAL 1 DAY
     GROUP BY
       CASE
-        WHEN DATEDIFF(CURDATE(), TJ.requested_date_time) = 0 THEN 'Today'
-        WHEN DATEDIFF(CURDATE(), TJ.requested_date_time) = 1 THEN 'Yesterday'
-        WHEN DATEDIFF(CURDATE(), TJ.requested_date_time) BETWEEN 2 AND 7 THEN 'TwoToSeven'
-        WHEN DATEDIFF(CURDATE(), TJ.requested_date_time) > 7 THEN 'MoreThanSeven'
+        WHEN DATEDIFF(DATE(?), TJ.requested_date_time) = 0 THEN 'Today'
+        WHEN DATEDIFF(DATE(?), TJ.requested_date_time) = 1 THEN 'Yesterday'
+        WHEN DATEDIFF(DATE(?), TJ.requested_date_time) BETWEEN 2 AND 7 THEN 'TwoToSeven'
+        WHEN DATEDIFF(DATE(?), TJ.requested_date_time) > 7 THEN 'MoreThanSeven'
       END,
       CASE
         WHEN TC.vertical_id = 4 THEN 'Retail'
@@ -131,10 +133,10 @@ const FLAG_SQL = {
   openonapp: `
     SELECT COUNT(TJ.job_id) AS job_count,
       CASE
-        WHEN DATEDIFF(CURDATE(), TJ.requested_date_time) = 0 THEN 'Today'
-        WHEN DATEDIFF(CURDATE(), TJ.requested_date_time) = 1 THEN 'Yesterday'
-        WHEN DATEDIFF(CURDATE(), TJ.requested_date_time) BETWEEN 2 AND 7 THEN 'TwoToSeven'
-        WHEN DATEDIFF(CURDATE(), TJ.requested_date_time) > 7 THEN 'MoreThanSeven'
+        WHEN DATEDIFF(DATE(?), TJ.requested_date_time) = 0 THEN 'Today'
+        WHEN DATEDIFF(DATE(?), TJ.requested_date_time) = 1 THEN 'Yesterday'
+        WHEN DATEDIFF(DATE(?), TJ.requested_date_time) BETWEEN 2 AND 7 THEN 'TwoToSeven'
+        WHEN DATEDIFF(DATE(?), TJ.requested_date_time) > 7 THEN 'MoreThanSeven'
       END AS job_age_category,
       CASE
         WHEN TC.vertical_id = 4 THEN 'Retail'
@@ -143,14 +145,14 @@ const FLAG_SQL = {
     FROM tbl_job TJ
     LEFT JOIN tbl_client TC ON (TJ.fk_client_id = TC.client_id)
     WHERE TJ.job_status IN (2, 20)
-      AND TJ.requested_date_time < CURDATE() + INTERVAL 1 DAY
-      AND TIMESTAMPDIFF(HOUR, TJ.checkin_date_time, NOW()) > 12
+      AND TJ.requested_date_time < DATE(?) + INTERVAL 1 DAY
+      AND TIMESTAMPDIFF(HOUR, TJ.checkin_date_time, ?) > 12
     GROUP BY
       CASE
-        WHEN DATEDIFF(CURDATE(), TJ.requested_date_time) = 0 THEN 'Today'
-        WHEN DATEDIFF(CURDATE(), TJ.requested_date_time) = 1 THEN 'Yesterday'
-        WHEN DATEDIFF(CURDATE(), TJ.requested_date_time) BETWEEN 2 AND 7 THEN 'TwoToSeven'
-        WHEN DATEDIFF(CURDATE(), TJ.requested_date_time) > 7 THEN 'MoreThanSeven'
+        WHEN DATEDIFF(DATE(?), TJ.requested_date_time) = 0 THEN 'Today'
+        WHEN DATEDIFF(DATE(?), TJ.requested_date_time) = 1 THEN 'Yesterday'
+        WHEN DATEDIFF(DATE(?), TJ.requested_date_time) BETWEEN 2 AND 7 THEN 'TwoToSeven'
+        WHEN DATEDIFF(DATE(?), TJ.requested_date_time) > 7 THEN 'MoreThanSeven'
       END,
       CASE
         WHEN TC.vertical_id = 4 THEN 'Retail'
@@ -164,10 +166,10 @@ const FLAG_SQL = {
   underaudit: `
     SELECT COUNT(TJ.job_id) AS job_count,
       CASE
-        WHEN DATEDIFF(CURDATE(), TJ.app_checkout_date_time) = 0 THEN 'Today'
-        WHEN DATEDIFF(CURDATE(), TJ.app_checkout_date_time) = 1 THEN 'Yesterday'
-        WHEN DATEDIFF(CURDATE(), TJ.app_checkout_date_time) BETWEEN 2 AND 7 THEN 'TwoToSeven'
-        WHEN DATEDIFF(CURDATE(), TJ.app_checkout_date_time) > 7 THEN 'MoreThanSeven'
+        WHEN DATEDIFF(DATE(?), TJ.app_checkout_date_time) = 0 THEN 'Today'
+        WHEN DATEDIFF(DATE(?), TJ.app_checkout_date_time) = 1 THEN 'Yesterday'
+        WHEN DATEDIFF(DATE(?), TJ.app_checkout_date_time) BETWEEN 2 AND 7 THEN 'TwoToSeven'
+        WHEN DATEDIFF(DATE(?), TJ.app_checkout_date_time) > 7 THEN 'MoreThanSeven'
       END AS job_age_category,
       CASE
         WHEN TC.vertical_id = 4 THEN 'Retail'
@@ -178,10 +180,10 @@ const FLAG_SQL = {
     WHERE TJ.job_status IN (10)
     GROUP BY
       CASE
-        WHEN DATEDIFF(CURDATE(), TJ.app_checkout_date_time) = 0 THEN 'Today'
-        WHEN DATEDIFF(CURDATE(), TJ.app_checkout_date_time) = 1 THEN 'Yesterday'
-        WHEN DATEDIFF(CURDATE(), TJ.app_checkout_date_time) BETWEEN 2 AND 7 THEN 'TwoToSeven'
-        WHEN DATEDIFF(CURDATE(), TJ.app_checkout_date_time) > 7 THEN 'MoreThanSeven'
+        WHEN DATEDIFF(DATE(?), TJ.app_checkout_date_time) = 0 THEN 'Today'
+        WHEN DATEDIFF(DATE(?), TJ.app_checkout_date_time) = 1 THEN 'Yesterday'
+        WHEN DATEDIFF(DATE(?), TJ.app_checkout_date_time) BETWEEN 2 AND 7 THEN 'TwoToSeven'
+        WHEN DATEDIFF(DATE(?), TJ.app_checkout_date_time) > 7 THEN 'MoreThanSeven'
       END,
       CASE
         WHEN TC.vertical_id = 4 THEN 'Retail'
@@ -245,7 +247,11 @@ async function getVerticalOpenOrders(flags) {
     // undefined query.
     if (!sql) continue;
 
-    const [rows] = await pool.query(sql, []);
+    // Every ? in this flag's SQL is the same "today" clock read (DATEDIFF's
+    // CURDATE()/NOW() converted to a bound Date — see FLAG_SQL comments).
+    const now = new Date();
+    const params = Array((sql.match(/\?/g) || []).length).fill(now);
+    const [rows] = await pool.query(sql, params);
     if (rows.length >= GROUPED_ROW_CAP) {
       logger.warn(
         { report: 'quicksight-vertical-orders', flag, rowCount: rows.length, cap: GROUPED_ROW_CAP },

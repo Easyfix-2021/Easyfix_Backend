@@ -166,6 +166,7 @@ async function list({
 } = {}) {
   logger.info('List easyfixers · status=' + status + ' cityId=' + cityId + ' q=' + (q || '') + ' limit=' + limit + ' offset=' + offset + ' sortBy=' + sortBy);
   const lifecycleProjection = await lifecycleService.readProjection('e');
+  const now = new Date();
   const clauses = [];
   const params = [];
 
@@ -385,36 +386,40 @@ async function list({
     clauses.push(`EXISTS (
       SELECT 1 FROM tbl_easyfixer_attendance att
        WHERE att.easyfixer_id = e.efr_id
-         AND att.created_on >= CURDATE()
-         AND att.created_on <  CURDATE() + INTERVAL 1 DAY
+         AND att.created_on >= DATE(?)
+         AND att.created_on <  DATE(?) + INTERVAL 1 DAY
          AND (att.morning_slot = 1 OR att.evening_slot = 1)
          AND (att.is_leave_marked IS NULL OR att.is_leave_marked = 0)
     )`);
+    params.push(now, now);
   } else if (attendance === 'absent') {
     clauses.push(`EXISTS (
       SELECT 1 FROM tbl_easyfixer_attendance att
        WHERE att.easyfixer_id = e.efr_id
-         AND att.created_on >= CURDATE()
-         AND att.created_on <  CURDATE() + INTERVAL 1 DAY
+         AND att.created_on >= DATE(?)
+         AND att.created_on <  DATE(?) + INTERVAL 1 DAY
          AND (att.morning_slot IS NULL OR att.morning_slot = 0)
          AND (att.evening_slot IS NULL OR att.evening_slot = 0)
          AND (att.is_leave_marked IS NULL OR att.is_leave_marked = 0)
     )`);
+    params.push(now, now);
   } else if (attendance === 'on_leave') {
     clauses.push(`EXISTS (
       SELECT 1 FROM tbl_easyfixer_attendance att
        WHERE att.easyfixer_id = e.efr_id
-         AND att.created_on >= CURDATE()
-         AND att.created_on <  CURDATE() + INTERVAL 1 DAY
+         AND att.created_on >= DATE(?)
+         AND att.created_on <  DATE(?) + INTERVAL 1 DAY
          AND att.is_leave_marked = 1
     )`);
+    params.push(now, now);
   } else if (attendance === 'no_information') {
     clauses.push(`NOT EXISTS (
       SELECT 1 FROM tbl_easyfixer_attendance att
        WHERE att.easyfixer_id = e.efr_id
-         AND att.created_on >= CURDATE()
-         AND att.created_on <  CURDATE() + INTERVAL 1 DAY
+         AND att.created_on >= DATE(?)
+         AND att.created_on <  DATE(?) + INTERVAL 1 DAY
     )`);
+    params.push(now, now);
   }
 
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -1169,6 +1174,7 @@ async function attendance(efrIds, { scope } = {}) {
   const scopeWhere = scopeClauses.length ? ` AND ${scopeClauses.join(' AND ')}` : '';
 
   const placeholders = ids.map(() => '?').join(',');
+  const now = new Date();
 
   const [rows] = await pool.query(
     `SELECT att.easyfixer_id     AS efr_id,
@@ -1178,9 +1184,9 @@ async function attendance(efrIds, { scope } = {}) {
             att.created_on       AS att_created_on
        FROM tbl_easyfixer_attendance att
       WHERE att.easyfixer_id IN (${placeholders})
-        AND att.created_on >= CURDATE()
-        AND att.created_on <  CURDATE() + INTERVAL 1 DAY${scopeWhere}`,
-    [...ids, ...scopeParams],
+        AND att.created_on >= DATE(?)
+        AND att.created_on <  DATE(?) + INTERVAL 1 DAY${scopeWhere}`,
+    [...ids, now, now, ...scopeParams],
   );
 
   logger.info('Returning attendance for ' + rows.length + ' easyfixers');

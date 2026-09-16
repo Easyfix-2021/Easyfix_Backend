@@ -70,6 +70,7 @@ async function runCallMetrics({ startLimit = 10, pollLimit = 25 } = {}) {
   let pending = [];
   try {
     [pending] = await pool.query(
+      // eslint-disable-next-line no-restricted-syntax -- tbl_job_caller_info.inserted_time is only ever written by its DEFAULT CURRENT_TIMESTAMP (DB clock)
       `SELECT jci.job_caller_info AS jci, jci.unique_id AS callUuid, jci.recording AS recording
          FROM tbl_plivo_call_log pcl
          JOIN tbl_job_caller_info jci ON jci.job_caller_info = pcl.job_caller_info_id

@@ -661,7 +661,7 @@ const FILTER_COVERAGE = Object.freeze({
   startDate:        ['filter',   'dateCol >= DATE(?)'],
   endDate:          ['filter',   'dateCol < DATE(?) + INTERVAL 1 DAY'],
   quotationStatus:  ['filter',   'EXISTS quotation_details + list()s status carve-outs'],
-  requestedBefore:  ['filter',   'J.requested_date_time < NOW() / < ?'],
+  requestedBefore:  ['filter',   'J.requested_date_time < now / < ?'],
   /*
    * SUPPORTED, unlike offerState below. The predicate is three columns on
    * tbl_job, so it re-binds to alias J directly — there is no j-aliased
@@ -843,6 +843,9 @@ function buildClauses(filters = {}) {
   const clauses = [];
   const params = [];
   const push = (sql, ...vals) => { clauses.push(sql); params.push(...vals); };
+  // One bound instant for every clock comparison this call adds — all land in
+  // the same outer WHERE, i.e. the same statement NOW() would evaluate once for.
+  const now = new Date();
 
   /*
    * The two facts the bound is decided from. See "KEEPING THE EXPORT BOUNDED".
@@ -1236,7 +1239,7 @@ function buildClauses(filters = {}) {
   }
 
   if (requestedBefore === 'now') {
-    clauses.push('J.requested_date_time IS NOT NULL AND J.requested_date_time < NOW()');
+    push('J.requested_date_time IS NOT NULL AND J.requested_date_time < ?', now);
   } else if (notEmpty(requestedBefore)) {
     push('J.requested_date_time IS NOT NULL AND J.requested_date_time < ?', requestedBefore);
   }
@@ -1393,11 +1396,12 @@ function buildClauses(filters = {}) {
   if (buckets) {
     const OADT = 'J.original_appointment_date_time';
     const bucketSql = [];
-    if (buckets.includes('1')) bucketSql.push(`(DATE_SUB(NOW(), INTERVAL 24 HOUR) <= ${OADT} AND ${OADT} <= NOW())`);
-    if (buckets.includes('2')) bucketSql.push(`(DATE_SUB(NOW(), INTERVAL 48 HOUR) <= ${OADT} AND DATE_SUB(NOW(), INTERVAL 24 HOUR) >= ${OADT} AND ${OADT} <= NOW())`);
-    if (buckets.includes('3')) bucketSql.push(`(DATE_SUB(NOW(), INTERVAL 72 HOUR) <= ${OADT} AND DATE_SUB(NOW(), INTERVAL 48 HOUR) >= ${OADT} AND ${OADT} <= NOW())`);
-    if (buckets.includes('4')) bucketSql.push(`(DATE_SUB(NOW(), INTERVAL 72 HOUR) >= ${OADT} AND ${OADT} <= NOW())`);
-    if (bucketSql.length) push(`(${bucketSql.join(' OR ')})`);
+    const bucketParams = [];
+    if (buckets.includes('1')) { bucketSql.push(`(DATE_SUB(?, INTERVAL 24 HOUR) <= ${OADT} AND ${OADT} <= ?)`); bucketParams.push(now, now); }
+    if (buckets.includes('2')) { bucketSql.push(`(DATE_SUB(?, INTERVAL 48 HOUR) <= ${OADT} AND DATE_SUB(?, INTERVAL 24 HOUR) >= ${OADT} AND ${OADT} <= ?)`); bucketParams.push(now, now, now); }
+    if (buckets.includes('3')) { bucketSql.push(`(DATE_SUB(?, INTERVAL 72 HOUR) <= ${OADT} AND DATE_SUB(?, INTERVAL 48 HOUR) >= ${OADT} AND ${OADT} <= ?)`); bucketParams.push(now, now, now); }
+    if (buckets.includes('4')) { bucketSql.push(`(DATE_SUB(?, INTERVAL 72 HOUR) >= ${OADT} AND ${OADT} <= ?)`); bucketParams.push(now, now); }
+    if (bucketSql.length) push(`(${bucketSql.join(' OR ')})`, ...bucketParams);
   }
 
   // "Open due to" — user_type of the reason attached to the job. The LEGACY
@@ -1488,7 +1492,7 @@ function buildClauses(filters = {}) {
     if (!statusPinned) appliedDefaults.push(`status:NOT IN (${TERMINAL_STATUSES.join(',')})`);
   }
   if (!boundedByCaller) {
-    clauses.push(`${defaultDateCol} >= DATE_SUB(NOW(), INTERVAL ${DEFAULT_WINDOW_MONTHS} MONTH)`);
+    push(`${defaultDateCol} >= DATE_SUB(?, INTERVAL ${DEFAULT_WINDOW_MONTHS} MONTH)`, now);
     if (!statusPinned) clauses.push(`J.job_status NOT IN (${TERMINAL_STATUSES.join(', ')})`);
   }
 
@@ -1590,7 +1594,7 @@ const EXPORT_SELECT = `
      * projection and to job-comment.service.js' own listing, so the sheet cell,
      * the grid cell and the job's comment thread can never disagree about which
      * comment is newest. Id order alone would not do: addComment lets created_on
-     * default while two raw INSERTs pass NOW() explicitly.
+     * default while two raw INSERTs bind created_on explicitly.
      */
     (SELECT LEFT(jc.comments, 300) FROM tbl_job_comment jc
       WHERE jc.job_id = J.job_id

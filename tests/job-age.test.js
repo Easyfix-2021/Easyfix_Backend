@@ -3,12 +3,14 @@
  * LIST + DETAIL projections, and the `age` server-side sort key.
  *
  * Age = elapsed time from j.ticket_created_date_time to the job's TERMINAL
- * event, or to NOW() while the job is still open:
+ * event, or to the current instant while the job is still open (bound as an
+ * app Date via pool.escape() — never SQL NOW(), which follows the DB
+ * session's own timezone rather than the pool's +05:30 option):
  *
  *   job_status 3 / 5 (Completed / Completed-alt) → j.checkout_date_time
  *   job_status 6     (Cancelled)                 → j.cancel_date_time
  *   job_status 7     (Enquiry)                   → j.enquiry_date_time
- *   anything else    (OPEN)                      → NOW()
+ *   anything else    (OPEN)                      → the bound "now"
  *
  * What this file is guarding, in order of how badly it would hurt:
  *
@@ -62,10 +64,18 @@ const { listQuery } = require('../validators/job.validator');
 // Collapse newlines/indentation so the assertions read like the SQL does.
 const flat = (s) => String(s).replace(/\s+/g, ' ').trim();
 
+// JOB_AGE_END_EXPR/SECS_EXPR/DAYS_EXPR/COLUMNS are FUNCTIONS (see
+// utils/job-age-sql.js) — each call binds a fresh pool.escape(new Date())
+// literal for the OPEN-job fallback, so two independent calls never produce
+// byte-identical SQL even a millisecond apart. Structural assertions below
+// normalise that literal to a placeholder before comparing text.
+const NOW_LITERAL = /'[0-9]{4}-[0-9]{2}-[0-9]{2}[^']*'/g;
+const stripNow = (s) => flat(s).replace(NOW_LITERAL, '<NOW>');
+
 // ─── The end-anchor CASE ────────────────────────────────────────────
 
 test('the END anchor maps each terminal status to its own timestamp column', () => {
-  const sql = flat(JOB_AGE_END_EXPR);
+  const sql = flat(JOB_AGE_END_EXPR());
   assert.match(sql, new RegExp(`WHEN ${STATUS.COMPLETED} THEN j\\.checkout_date_time`));
   assert.match(sql, new RegExp(`WHEN ${STATUS.COMPLETED_ALT} THEN j\\.checkout_date_time`));
   assert.match(sql, new RegExp(`WHEN ${STATUS.CANCELLED} THEN j\\.cancel_date_time`));
@@ -78,18 +88,19 @@ test('the END anchor maps each terminal status to its own timestamp column', () 
   assert.match(sql, /WHEN 7 THEN j\.enquiry_date_time/);
 });
 
-test('an OPEN job (no CASE branch) falls through to NOW(), so age keeps ticking', () => {
-  const sql = flat(JOB_AGE_END_EXPR);
+test('an OPEN job (no CASE branch) falls through to the bound "now", so age keeps ticking', () => {
+  const sql = flat(JOB_AGE_END_EXPR());
   // No ELSE — an open job yields NULL from the CASE and COALESCE turns it into
-  // NOW(). That same fall-through is the robustness net for a terminal row
-  // whose anchor is NULL (there is exactly one such enquiry row in prod): it
-  // ages against NOW() rather than emitting NULL.
+  // the bound instant. That same fall-through is the robustness net for a
+  // terminal row whose anchor is NULL (there is exactly one such enquiry row
+  // in prod): it ages against "now" rather than emitting NULL.
   assert.doesNotMatch(sql, /\bELSE\b/i);
-  assert.match(sql, /^COALESCE\( CASE j\.job_status .* END, NOW\(\) \)$/);
+  assert.match(sql, new RegExp(`^COALESCE\\( CASE j\\.job_status .* END, ${NOW_LITERAL.source} \\)$`));
+  assert.doesNotMatch(sql, /NOW\(\)/);
 });
 
 test('no status OTHER than 3/5/6/7 gets a terminal anchor', () => {
-  const branches = flat(JOB_AGE_END_EXPR).match(/WHEN (\d+) THEN/g) || [];
+  const branches = flat(JOB_AGE_END_EXPR()).match(/WHEN (\d+) THEN/g) || [];
   const codes = branches.map((b) => Number(b.match(/\d+/)[0])).sort((a, b) => a - b);
   assert.deepEqual(codes, [3, 5, 6, 7]);
   // Explicitly: the live/open statuses must NOT appear as terminal anchors.
@@ -103,12 +114,12 @@ test('no status OTHER than 3/5/6/7 gets a terminal anchor', () => {
 // ─── Interval + granularity ─────────────────────────────────────────
 
 test('both intervals start at ticket_created_date_time and end at the same anchor', () => {
-  for (const expr of [JOB_AGE_SECS_EXPR, JOB_AGE_DAYS_EXPR]) {
-    assert.match(flat(expr), /TIMESTAMPDIFF\((SECOND|DAY), j\.ticket_created_date_time,/);
-    assert.ok(flat(expr).includes(flat(JOB_AGE_END_EXPR)), 'must reuse the shared END anchor');
+  for (const exprFn of [JOB_AGE_SECS_EXPR, JOB_AGE_DAYS_EXPR]) {
+    assert.match(flat(exprFn()), /TIMESTAMPDIFF\((SECOND|DAY), j\.ticket_created_date_time,/);
+    assert.ok(stripNow(exprFn()).includes(stripNow(JOB_AGE_END_EXPR())), 'must reuse the shared END anchor');
   }
   // Not created_date_time — the ticket timestamp is the agreed start.
-  assert.doesNotMatch(flat(JOB_AGE_SECS_EXPR), /TIMESTAMPDIFF\(SECOND, j\.created_date_time/);
+  assert.doesNotMatch(flat(JOB_AGE_SECS_EXPR()), /TIMESTAMPDIFF\(SECOND, j\.created_date_time/);
 });
 
 test('days are floored with TIMESTAMPDIFF(DAY, …), NEVER DATEDIFF', () => {
@@ -120,22 +131,23 @@ test('days are floored with TIMESTAMPDIFF(DAY, …), NEVER DATEDIFF', () => {
    * TIMESTAMPDIFF over exactly 24h = 1, over 23h59m = 0, over 23:00→01:00 = 0,
    * where DATEDIFF on that same 2-hour span returns 1.
    */
-  assert.match(flat(JOB_AGE_DAYS_EXPR), /TIMESTAMPDIFF\(DAY,/);
-  assert.doesNotMatch(flat(JOB_AGE_DAYS_EXPR), /DATEDIFF/i);
-  assert.doesNotMatch(flat(JOB_AGE_SECS_EXPR), /DATEDIFF/i);
+  assert.match(flat(JOB_AGE_DAYS_EXPR()), /TIMESTAMPDIFF\(DAY,/);
+  assert.doesNotMatch(flat(JOB_AGE_DAYS_EXPR()), /DATEDIFF/i);
+  assert.doesNotMatch(flat(JOB_AGE_SECS_EXPR()), /DATEDIFF/i);
 });
 
 test('both intervals are clamped at 0 — a back-dated correction never renders negative', () => {
-  assert.match(flat(JOB_AGE_SECS_EXPR), /^GREATEST\(TIMESTAMPDIFF\(SECOND, .*\), 0\)$/);
-  assert.match(flat(JOB_AGE_DAYS_EXPR), /^GREATEST\(TIMESTAMPDIFF\(DAY, .*\), 0\)$/);
+  assert.match(flat(JOB_AGE_SECS_EXPR()), /^GREATEST\(TIMESTAMPDIFF\(SECOND, .*\), 0\)$/);
+  assert.match(flat(JOB_AGE_DAYS_EXPR()), /^GREATEST\(TIMESTAMPDIFF\(DAY, .*\), 0\)$/);
 });
 
 // ─── Safe to interpolate ────────────────────────────────────────────
 
 test('the expressions are pure column arithmetic — no placeholders, no new alias', () => {
-  for (const [name, expr] of Object.entries({
+  for (const [name, exprFn] of Object.entries({
     JOB_AGE_END_EXPR, JOB_AGE_SECS_EXPR, JOB_AGE_DAYS_EXPR, JOB_AGE_COLUMNS,
   })) {
+    const expr = exprFn();
     // A '?' would silently shift every positional param once interpolated into
     // the SELECT / ORDER BY, mis-binding the entire query.
     assert.ok(!expr.includes('?'), `${name} must contain no placeholder`);
@@ -149,28 +161,29 @@ test('the expressions are pure column arithmetic — no placeholders, no new ali
 // ─── Projection fragment ────────────────────────────────────────────
 
 test('the projection fragment emits ageDays from DAY and ageSecs from SECOND', () => {
-  assert.ok(JOB_AGE_COLUMNS.trimStart().startsWith(','), 'must be a leading-comma fragment');
-  assert.ok(flat(JOB_AGE_COLUMNS).includes(`${flat(JOB_AGE_DAYS_EXPR)} AS ageDays`));
-  assert.ok(flat(JOB_AGE_COLUMNS).includes(`${flat(JOB_AGE_SECS_EXPR)} AS ageSecs`));
+  assert.ok(JOB_AGE_COLUMNS().trimStart().startsWith(','), 'must be a leading-comma fragment');
+  assert.ok(stripNow(JOB_AGE_COLUMNS()).includes(`${stripNow(JOB_AGE_DAYS_EXPR())} AS ageDays`));
+  assert.ok(stripNow(JOB_AGE_COLUMNS()).includes(`${stripNow(JOB_AGE_SECS_EXPR())} AS ageSecs`));
   // The obvious inversion, called out explicitly.
-  assert.ok(!flat(JOB_AGE_COLUMNS).includes(`${flat(JOB_AGE_DAYS_EXPR)} AS ageSecs`));
+  assert.ok(!stripNow(JOB_AGE_COLUMNS()).includes(`${stripNow(JOB_AGE_DAYS_EXPR())} AS ageSecs`));
 });
 
 // ─── Display value and sort key are ONE definition ──────────────────
 
 test('the `age` sort key IS the same expression the projection emits as ageSecs', () => {
   // Reference identity, not a lookalike string: the sort key and the projected
-  // value come from the one constant, so they cannot be edited apart.
+  // value come from the one constant (a function — see utils/job-age-sql.js),
+  // so they cannot be edited apart.
   assert.equal(SORTABLE_COLUMNS.age, JOB_AGE_SECS_EXPR);
-  assert.ok(flat(JOB_AGE_COLUMNS).includes(`${flat(SORTABLE_COLUMNS.age)} AS ageSecs`));
+  assert.ok(stripNow(JOB_AGE_COLUMNS()).includes(`${stripNow(SORTABLE_COLUMNS.age())} AS ageSecs`));
 });
 
 test('sorting uses SECONDS, not the floored days', () => {
   // Sorting on ageDays would tie every job created on the same day and collapse
   // the whole sub-day population into a single bucket.
   assert.notEqual(SORTABLE_COLUMNS.age, JOB_AGE_DAYS_EXPR);
-  assert.match(flat(SORTABLE_COLUMNS.age), /TIMESTAMPDIFF\(SECOND,/);
-  assert.doesNotMatch(flat(SORTABLE_COLUMNS.age), /TIMESTAMPDIFF\(DAY,/);
+  assert.match(flat(SORTABLE_COLUMNS.age()), /TIMESTAMPDIFF\(SECOND,/);
+  assert.doesNotMatch(flat(SORTABLE_COLUMNS.age()), /TIMESTAMPDIFF\(DAY,/);
 });
 
 // ─── The both-sides whitelist ───────────────────────────────────────
@@ -219,7 +232,7 @@ test('list() projects ageDays + ageSecs and its COUNT query stays join-clean', a
 
   assert.match(flat(dataSql), /AS ageDays/);
   assert.match(flat(dataSql), /AS ageSecs/);
-  assert.ok(flat(dataSql).includes(flat(JOB_AGE_COLUMNS).replace(/^,\s*/, '')));
+  assert.ok(stripNow(dataSql).includes(stripNow(JOB_AGE_COLUMNS()).replace(/^,\s*/, '')));
 
   // THE COUNT TRAP: age must not have pulled a new alias into the COUNT, and
   // the COUNT must not have grown an ORDER BY (it has none to grow).
@@ -233,8 +246,8 @@ test('list({sortBy:"age"}) orders by the seconds expression with the stable tieb
   fake.reset();
   await jobService.list({ sortBy: 'age', sortDir: 'desc', limit: 50, offset: 0 });
   const dataSql = fake.calls.map((c) => c.sql).find((s) => /AS ageSecs/.test(s));
-  const order = flat(dataSql).slice(flat(dataSql).lastIndexOf('ORDER BY'));
-  assert.ok(order.includes(flat(JOB_AGE_SECS_EXPR)), 'ORDER BY must use the seconds expression');
+  const order = stripNow(dataSql).slice(stripNow(dataSql).lastIndexOf('ORDER BY'));
+  assert.ok(order.includes(stripNow(JOB_AGE_SECS_EXPR())), 'ORDER BY must use the seconds expression');
   assert.match(order, /DESC, j\.job_id DESC LIMIT \? OFFSET \?$/);
 
   fake.reset();
@@ -259,5 +272,5 @@ test('the DETAIL query projects the SAME two age fields as the list', async () =
   assert.match(flat(detailSql), /AS ageDays/);
   assert.match(flat(detailSql), /AS ageSecs/);
   // Same fragment, so the modal and the row can never disagree.
-  assert.ok(flat(detailSql).includes(flat(JOB_AGE_COLUMNS).replace(/^,\s*/, '')));
+  assert.ok(stripNow(detailSql).includes(stripNow(JOB_AGE_COLUMNS()).replace(/^,\s*/, '')));
 });

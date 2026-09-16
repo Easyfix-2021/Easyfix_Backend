@@ -94,10 +94,8 @@ function cleanupEnabled() {
  * the date the retention is measured from, and a row with one but not the other
  * is a data fault this job must skip rather than guess at.
  *
- * NOW() is correct here despite the project's usual "never NOW()" rule: that
- * rule is about STORING a timestamp (where NOW() reads the container clock and
- * mixes timezones into a column). This is a COMPARISON between two values that
- * are already in the same column's timezone, and there is nothing to write.
+ * closed_on is bound as new Date() by issue.service.js's close path, so the
+ * retention cutoff below binds that same clock instead of reading SQL NOW().
  */
 const CANDIDATE_SQL = `
   SELECT m.id, m.s3_key, m.issue_id
@@ -105,13 +103,13 @@ const CANDIDATE_SQL = `
     JOIN tbl_crm_issue i ON i.id = m.issue_id
    WHERE i.status = 'closed'
      AND i.closed_on IS NOT NULL
-     AND i.closed_on < (NOW() - INTERVAL ? MONTH)
+     AND i.closed_on < (? - INTERVAL ? MONTH)
    ORDER BY m.id
    LIMIT ?
 `;
 
 async function sweep(runner = pool, { dryRun = false } = {}) {
-  const [rows] = await runner.query(CANDIDATE_SQL, [RETENTION_MONTHS, BATCH_LIMIT]);
+  const [rows] = await runner.query(CANDIDATE_SQL, [new Date(), RETENTION_MONTHS, BATCH_LIMIT]);
   if (!rows.length) return { eligible: 0, deleted: 0, failed: 0, rowsRemoved: 0, dryRun };
 
   /*

@@ -306,8 +306,8 @@ async function sectionsFor(db, jobIds, todayYmd) {
  * client-actioned job appears in TWO sections — the exact thing ops ruled out,
  * and the counts stop summing to the tab total.
  *
- * DATES ARE IST CALENDAR DAYS. The pool runs at +05:30, so CURDATE() is the
- * date ops reads off the row. Comparing DATE(j.requested_date_time) rather than
+ * DATES ARE IST CALENDAR DAYS. The pool runs at +05:30, so DATE(?) of a bound
+ * Date is the date ops reads off the row. Comparing DATE(j.requested_date_time) rather than
  * the datetime keeps "tomorrow" meaning tomorrow's date rather than a moment
  * 24 hours out — an appointment at 23:00 tonight is today's problem.
  */
@@ -320,6 +320,7 @@ function sectionPredicate(section, ids) {
    * through to the date buckets and nothing is silently mis-filed as actioned.
    */
   const reqIds = ids ? [ids.cancel, ids.retry] : [0, 0];
+  const now = new Date();
   const hasRequest = `EXISTS (SELECT 1 FROM tbl_job_comment rq
        WHERE rq.job_id = ${alias}.job_id AND rq.enum_reason_id IN (?, ?))`;
   const hasUnreachable = `EXISTS (SELECT 1 FROM tbl_job_comment ur
@@ -334,11 +335,11 @@ function sectionPredicate(section, ids) {
     case 'pending_with_client':
       return { sql: `NOT ${hasRequest} AND ${hasUnreachable}`, params: [...reqIds] };
     case 'overdue':
-      return { sql: `${noConversation} AND ${appt} IS NOT NULL AND ${appt} < CURDATE()`,
-        params: [...reqIds] };
+      return { sql: `${noConversation} AND ${appt} IS NOT NULL AND ${appt} < DATE(?)`,
+        params: [...reqIds, now] };
     case 'upcoming':
-      return { sql: `${noConversation} AND ${appt} IN (CURDATE(), DATE_ADD(CURDATE(), INTERVAL 1 DAY))`,
-        params: [...reqIds] };
+      return { sql: `${noConversation} AND ${appt} IN (DATE(?), DATE_ADD(DATE(?), INTERVAL 1 DAY))`,
+        params: [...reqIds, now, now] };
     case 'future_unscheduled':
       /*
        * The NULL branch is why this section is named for both. Being Unconfirmed
@@ -346,8 +347,8 @@ function sectionPredicate(section, ids) {
        * numerous — and a bucket set that omitted them would drop those jobs off
        * the page with nothing reporting it.
        */
-      return { sql: `${noConversation} AND (${appt} IS NULL OR ${appt} > DATE_ADD(CURDATE(), INTERVAL 1 DAY))`,
-        params: [...reqIds] };
+      return { sql: `${noConversation} AND (${appt} IS NULL OR ${appt} > DATE_ADD(DATE(?), INTERVAL 1 DAY))`,
+        params: [...reqIds, now] };
     default:
       return null;
   }

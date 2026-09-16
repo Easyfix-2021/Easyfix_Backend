@@ -425,9 +425,10 @@ async function getActiveVariant() {
     `SELECT id, name, starts_on, ends_on, ornament_key, anchor_x, anchor_y, scale, animated, render_mode
        FROM easyfix_theme_variant
       WHERE enabled = 1
-        AND CURDATE() BETWEEN starts_on AND ends_on
+        AND DATE(?) BETWEEN starts_on AND ends_on
       ORDER BY starts_on DESC, id DESC
       LIMIT 1`,
+    [new Date()],
   );
   const variant = mapVariant(rows[0]);
   if (!variant) return null;
