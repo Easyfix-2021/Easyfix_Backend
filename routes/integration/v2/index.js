@@ -183,10 +183,11 @@ router.post('/jobs', acceptImages, async (req, res, next) => {
     const images = [];
     if (files.length) {
       const rows = [];
+      const now = new Date();
       for (const f of files) {
         try {
           const saved = writeBuffer('job_files', f.buffer, f.originalname, f.mimetype);
-          rows.push([created.job_id, saved.filename, req.integrationClient.id, req.integrationClient.id]);
+          rows.push([created.job_id, saved.filename, req.integrationClient.id, req.integrationClient.id, now]);
           images.push({ image: saved.filename, originalName: f.originalname, status: 'attached' });
         } catch (e) {
           logger.warn('Integration v2: image store failed · ' + (f.originalname || '?') + ' · ' + e.message);
@@ -197,7 +198,7 @@ router.post('/jobs', acceptImages, async (req, res, next) => {
         try {
           const [ins] = await pool.query(
             `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, status, created_by, updated_by, created_date)
-             VALUES ${rows.map(() => "(?, ?, 'unconfirmed', 0, 1, ?, ?, NOW())").join(', ')}`,
+             VALUES ${rows.map(() => "(?, ?, 'unconfirmed', 0, 1, ?, ?, ?)").join(', ')}`,
             rows.flat(),
           );
           // mysql2 returns the FIRST id of a multi-row insert; the rest follow

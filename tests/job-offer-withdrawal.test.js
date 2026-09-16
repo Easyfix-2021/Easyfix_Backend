@@ -65,10 +65,13 @@ test('it closes ONLY offers still open, and stamps responded_at', async () => {
   // offer_status 0 = OFFERED -> 3 = EXPIRED (services/offer-status.js)
   assert.match(sql, /offer_status\s*=\s*3/, 'must close as EXPIRED');
   assert.match(sql, /offer_status\s*=\s*0/, 'must match only offers still OPEN');
-  assert.match(sql, /responded_at\s*=\s*NOW\(\)/,
+  assert.match(sql, /responded_at\s*=\s*\?/,
     'a closed offer with a NULL responded_at is the exact shape being cleaned up');
+  assert.doesNotMatch(sql, /responded_at\s*=\s*NOW\(\)/, 'must be a bound Date, never SQL NOW()');
   assert.match(sql, /job_id\s*=\s*\?/, 'scoped to one job');
-  assert.deepEqual(params, [4242]);
+  assert.equal(params.length, 2);
+  assert.ok(params[0] instanceof Date, 'responded_at is bound as a Date');
+  assert.equal(params[1], 4242);
   // It must NOT reach for accepted or rejected rows.
   assert.doesNotMatch(sql, /offer_status\s+IN/i,
     'an accepted or rejected offer is already answered and must be left alone');

@@ -205,3 +205,15 @@ test('a missing job is 404', async () => {
   const r = await call('/jobs/:id/approve', 'patch', { access: { allStores: true } });
   assert.equal(r.statusCode, 404);
 });
+
+/* ─── approved_on_date_time is a bound Date, never SQL NOW() ──────────── */
+
+test('approve stamps approved_on_date_time as a bound Date, never SQL NOW()', async () => {
+  jobRow = job();
+  await call('/jobs/:id/approve', 'patch', { access: { allStores: true } });
+  const upd = fake.calls.find((c) => /UPDATE tbl_job SET approved_by_client_contact/i.test(c.sql));
+  assert.ok(upd, 'the approve UPDATE must have run');
+  assert.match(upd.sql, /approved_on_date_time = \?/);
+  assert.doesNotMatch(upd.sql, /approved_on_date_time = NOW\(\)/);
+  assert.ok(upd.params[1] instanceof Date, 'approved_on_date_time is bound as a Date');
+});

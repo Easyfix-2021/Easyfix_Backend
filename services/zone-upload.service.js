@@ -217,8 +217,8 @@ async function processUpload(buffer, { dryRun = false, userId = null } = {}) {
         } else {
           const [zr] = await conn.query(
             `INSERT INTO tbl_zone_master (zone_name, city_id, zone_status, created_date)
-             VALUES (?, ?, 1, NOW())`,
-            [zoneName, cityId]
+             VALUES (?, ?, 1, ?)`,
+            [zoneName, cityId, new Date()]
           );
           await conn.query(
             'INSERT INTO tbl_zone_city_mapping (zone_id, city_id) VALUES (?, ?)',
@@ -262,8 +262,8 @@ async function processUpload(buffer, { dryRun = false, userId = null } = {}) {
 
       const [ins] = await conn.query(
         `INSERT IGNORE INTO tbl_zone_pincode_mapping (zone_id, pincode_id, created_on, created_by)
-         VALUES (?, ?, NOW(), ?)`,
-        [zone.zone_id, p.pincode_id, userId]
+         VALUES (?, ?, ?, ?)`,
+        [zone.zone_id, p.pincode_id, new Date(), userId]
       );
       if (ins.affectedRows > 0) {
         results.push({ rowNumber, status: 'assigned', pincode, zone_name: zoneName, city_name: cityName });

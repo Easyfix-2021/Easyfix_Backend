@@ -677,7 +677,9 @@ test('expireStaleOffers still sweeps normally when expiry is enabled', async () 
   const upd = fake.calls.find((c) => /UPDATE tbl_job_offer/i.test(c.sql));
   assert.ok(upd, 'the sweep must run when the business switch is on');
   assert.match(upd.sql, /offered_at < NOW\(\) - INTERVAL \? MINUTE/, 'same TTL comparison as always');
-  assert.deepEqual(upd.params, [OFFER_TTL_MINUTES, 521866]);
+  assert.equal(upd.params.length, 3);
+  assert.ok(upd.params[0] instanceof Date, 'responded_at is bound as a Date, never SQL NOW()');
+  assert.deepEqual(upd.params.slice(1), [OFFER_TTL_MINUTES, 521866]);
   await setProps({});
 });
 

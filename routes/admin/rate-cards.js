@@ -30,8 +30,8 @@ router.post('/client', async (req, res, next) => {
     logger.info('Create client rate card · name=' + (b.name ?? '-') + ' serviceTypeId=' + (b.serviceTypeId ?? '-'));
     if (!b.name || !b.serviceTypeId) { logger.warn('Create client rate card rejected · name and serviceTypeId required'); return modernError(res, 400, 'name and serviceTypeId required'); }
     const [ins] = await pool.query(
-      `INSERT INTO tbl_client_rate_card (crc_ratecard_name, crc_servicetype_id, status, insert_date, inserted_by) VALUES (?, ?, 1, NOW(), ?)`,
-      [b.name, b.serviceTypeId, req.user.user_id]);
+      `INSERT INTO tbl_client_rate_card (crc_ratecard_name, crc_servicetype_id, status, insert_date, inserted_by) VALUES (?, ?, 1, ?, ?)`,
+      [b.name, b.serviceTypeId, new Date(), req.user.user_id]);
     logger.info('Client rate card created · id=' + ins.insertId);
     res.status(201);
     modernOk(res, { crc_id: ins.insertId });
@@ -47,8 +47,8 @@ router.put('/client/:id', async (req, res, next) => {
     if (b.serviceTypeId) { sets.push('crc_servicetype_id = ?'); vals.push(b.serviceTypeId); }
     if (b.status !== undefined) { sets.push('status = ?'); vals.push(b.status ? 1 : 0); }
     if (sets.length === 0) { logger.warn('Update client rate card rejected · nothing to update · id=' + req.params.id); return modernError(res, 400, 'nothing to update'); }
-    sets.push('update_date = NOW()', 'updated_by = ?');
-    vals.push(req.user.user_id, req.params.id);
+    sets.push('update_date = ?', 'updated_by = ?');
+    vals.push(new Date(), req.user.user_id, req.params.id);
     await pool.query(`UPDATE tbl_client_rate_card SET ${sets.join(', ')} WHERE crc_id = ?`, vals);
     logger.info('Client rate card updated · id=' + req.params.id);
     modernOk(res, { updated: true });
@@ -58,8 +58,8 @@ router.put('/client/:id', async (req, res, next) => {
 router.delete('/client/:id', async (req, res, next) => {
   try {
     logger.info('Deactivate client rate card · id=' + req.params.id);
-    await pool.query(`UPDATE tbl_client_rate_card SET status = 0, update_date = NOW(), updated_by = ? WHERE crc_id = ?`,
-      [req.user.user_id, req.params.id]);
+    await pool.query(`UPDATE tbl_client_rate_card SET status = 0, update_date = ?, updated_by = ? WHERE crc_id = ?`,
+      [new Date(), req.user.user_id, req.params.id]);
     logger.info('Client rate card deactivated · id=' + req.params.id);
     modernOk(res, { deactivated: true });
   } catch (e) { next(e); }

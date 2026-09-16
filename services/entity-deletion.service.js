@@ -336,9 +336,9 @@ async function tombstoneDelete(entityType, id, reason, admin) {
       `INSERT INTO tbl_admin_deleted_archive
          (entity_type, entity_id, entity_label, snapshot_json, deletion_reason, strategy,
           status, deleted_by, deleted_by_name, deleted_at)
-       VALUES (?, ?, ?, ?, ?, 'tombstone', 'deleted', ?, ?, NOW())`,
+       VALUES (?, ?, ?, ?, ?, 'tombstone', 'deleted', ?, ?, ?)`,
       [entityType, id, label, JSON.stringify(snapshot), reason,
-        admin.user_id || null, admin.user_name || null],
+        admin.user_id || null, admin.user_name || null, new Date()],
     );
 
     await conn.commit();
@@ -521,9 +521,9 @@ async function restore(archiveId, admin) {
 
     await conn.query(
       `UPDATE tbl_admin_deleted_archive
-          SET status = 'restored', restored_by = ?, restored_by_name = ?, restored_at = NOW()
+          SET status = 'restored', restored_by = ?, restored_by_name = ?, restored_at = ?
         WHERE id = ?`,
-      [admin.user_id || null, admin.user_name || null, archiveId],
+      [admin.user_id || null, admin.user_name || null, new Date(), archiveId],
     );
 
     await conn.commit();

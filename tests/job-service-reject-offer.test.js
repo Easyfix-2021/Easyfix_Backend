@@ -89,7 +89,14 @@ test('locks technician, then job, then latest offer and rejects exactly that row
   assert.match(latest.sql, /ORDER BY job_offer_id DESC\s+LIMIT 1\s+FOR UPDATE/i);
 
   const rejected = fake.calls[rejectWrite];
-  assert.deepEqual(rejected.params, ['Already booked', 7, 901, 30]);
+  assert.equal(rejected.params.length, 5);
+  assert.ok(rejected.params[2] instanceof Date, 'responded_at is bound as a Date, never SQL NOW()');
+  assert.deepEqual(
+    [rejected.params[0], rejected.params[1], rejected.params[3], rejected.params[4]],
+    ['Already booked', 7, 901, 30],
+  );
+  assert.match(rejected.sql, /responded_at = \?/);
+  assert.doesNotMatch(rejected.sql, /responded_at = NOW\(\)/);
   assert.match(rejected.sql, /WHERE job_offer_id = \?/i);
   assert.match(rejected.sql, new RegExp(`offer_status = ${OFFER_STATUS.OFFERED}\\b`));
   assert.doesNotMatch(rejected.sql, /WHERE job_id = \?/i,

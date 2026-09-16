@@ -1,0 +1,47 @@
+/*
+ * mobile-job-estimate.service.js — regression coverage for the NOW()-to-
+ * bound-Date conversion (db.js pool is timezone: '+05:30', dateStrings: true;
+ * a bound Date serializes as the IST wall clock, SQL NOW() does not).
+ *
+ * No test file existed for this module before; this pins the sendForApproval
+ * writer, which stamps THREE columns (one datetime, two timestamp) that must
+ * all share the same instant.
+ */
+const { test, after } = require('node:test');
+const assert = require('node:assert/strict');
+const { installFakePool } = require('./helpers/fake-pool');
+
+const fake = installFakePool([
+  [/SELECT job_id, fk_client_id, fk_easyfixter_id, job_status\s+FROM tbl_job/i,
+    () => [{ job_id: 100, fk_client_id: 5, fk_easyfixter_id: 42, job_status: 2 }]],
+  [/^\s*UPDATE tbl_job\b/i, () => ({ affectedRows: 1 })],
+  [/^\s*INSERT INTO tbl_job_image/i, () => ({ affectedRows: 1 })],
+]);
+
+const { sendForApproval } = require('../services/mobile-job-estimate.service');
+
+after(() => fake.restore());
+
+test('sendForApproval binds ONE Date shared by approval_sent_on_date_time, last_update_time and the check-in image, never SQL NOW()', async () => {
+  fake.reset();
+  await sendForApproval(100, 42, { checkInImageRefs: ['a.jpg'] });
+
+  const upd = fake.calls.find((c) => /^\s*UPDATE tbl_job\b/i.test(c.sql));
+  assert.ok(upd, 'the tbl_job stamp must have run');
+  assert.match(upd.sql, /approval_sent_on_date_time = \?/);
+  assert.match(upd.sql, /last_update_time = \?/);
+  assert.doesNotMatch(upd.sql, /NOW\(\)/, 'no SQL NOW() may remain');
+  const [approvalSentOn, , lastUpdateTime] = upd.params;
+  assert.ok(approvalSentOn instanceof Date, 'approval_sent_on_date_time is a bound Date');
+  assert.ok(lastUpdateTime instanceof Date, 'last_update_time is a bound Date');
+  assert.equal(approvalSentOn.getTime(), lastUpdateTime.getTime(),
+    'both columns must share the SAME instant, not two separate new Date() calls');
+
+  const img = fake.calls.find((c) => /^\s*INSERT INTO tbl_job_image/i.test(c.sql));
+  assert.ok(img, 'the check-in image row must have run');
+  assert.doesNotMatch(img.sql, /NOW\(\)/);
+  const createdDate = img.params[4];
+  assert.ok(createdDate instanceof Date, 'created_date is a bound Date');
+  assert.equal(createdDate.getTime(), approvalSentOn.getTime(),
+    'the whole send-for-approval action shares one instant');
+});

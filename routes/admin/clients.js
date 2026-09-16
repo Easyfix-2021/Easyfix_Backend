@@ -589,8 +589,8 @@ router.post(
         } else {
           try {
             await pool.query(
-              'UPDATE tbl_client SET monthly_revenue = ?, update_date = NOW() WHERE client_id = ?',
-              [monthlyRevenue, clientId],
+              'UPDATE tbl_client SET monthly_revenue = ?, update_date = ? WHERE client_id = ?',
+              [monthlyRevenue, new Date(), clientId],
             );
             out.updated++;
             results.push({ rowNumber: r.rowNumber, status: 'updated', clientId, clientName: client.client_name, monthlyRevenue });

@@ -25,10 +25,9 @@
  *     configure is one that will eventually be configured to zero.
  *
  *     Its windows are also the place the IST/UTC trap bites. A cutoff must be
- *     computed in the clock the COLUMN was written in, and the two tables this
- *     sweep touches do NOT share one: tbl_job_conference is app-written (IST
- *     wall clock) and needs a JS Date, while tbl_plivo_call_log is NOW()-written
- *     and needs NOW() arithmetic. Get either backwards and the sweep matches
+ *     computed in the clock the COLUMN was written in, and both tables this
+ *     sweep touches are app-written (IST wall clock), so every window is a JS
+ *     Date. Compare either to NOW() on a non-IST server and the sweep matches
  *     NOTHING, reaps NOTHING, and the leak goes undetected while everything
  *     looks healthy. That is a test, not a comment.
  *
@@ -336,8 +335,12 @@ test('a participant-join event marks the participant joined and lands the member
    * leg without knowing conferences exist.
    */
   assert.ok(upd[0].params.includes('answered'), "the leg moves to the call log's own 'answered'");
-  assert.match(upd[0].sql, /answered_on = COALESCE\(answered_on, NOW\(\)\)/i,
+  // 2026-09-16: tbl_plivo_call_log.answered_on (datetime) is now a bound Date,
+  // never SQL NOW() — see services/plivo-call-log.service.js::markConferenceLegStatus.
+  assert.match(upd[0].sql, /answered_on = COALESCE\(answered_on, \?\)/i,
     'and stamps when they picked up, COALESCEd so a duplicate join cannot move the clock');
+  assert.doesNotMatch(upd[0].sql, /NOW\(\)/, 'answered_on/updated_on are bound Dates, not SQL NOW()');
+  assert.ok(upd[0].params.some((p) => p instanceof Date), 'the stamp is an app-side Date');
   // The member id is the ONLY thing that makes a later mute/drop possible, so
   // landing it is the load-bearing half of this event. It is a DIFFERENT column
   // from call_uuid — they are different Plivo identifiers.
@@ -648,23 +651,15 @@ test('the ceiling is an internal constant — nothing reads a property to find i
 });
 
 /*
- * THE CLOCK TRAP, PINNED — AND IT HAS TWO CORRECT ANSWERS, NOT ONE.
+ * THE CLOCK TRAP, PINNED.
  *
- * A window must be computed in the clock the COLUMN was written in. The two
- * tables this sweep touches do not share a clock:
- *
- *   • tbl_job_conference is written APP-SIDE (new Date() + the pool's +05:30
- *     session timezone), so its columns hold the IST wall clock. NOW() is the
- *     DB server's zone — comparing them skews by 5.5 hours, and on a window
- *     narrower than that the sweep matches NOTHING and silently never reaps.
- *     Passes A and B must use a JS Date.
- *   • tbl_plivo_call_log is NOW()-written throughout (its own convention since
- *     2026-06-19), so `NOW() - INTERVAL n SECOND` compares the server clock to
- *     itself and is exact by construction. Handing pass C an IST Date would
- *     introduce the very skew the first rule avoids.
- *
- * An earlier version of this test asserted "no NOW() anywhere", which was right
- * only while every conference column was app-written. Now it asserts the RULE.
+ * A window must be computed in the clock the COLUMN was written in. Both tables
+ * this sweep touches are written APP-SIDE (new Date() + the pool's +05:30
+ * session timezone), so their columns hold the IST wall clock. NOW() is the DB
+ * server's zone — on a non-IST server comparing them skews by the offset, and on
+ * a window narrower than that the sweep matches NOTHING and silently never
+ * reaps. tbl_plivo_call_log was NOW()-written (and pass C NOW()-relative) until
+ * 2026-09-16; its writers and this window moved to the app clock together.
  */
 test('each sweep uses the clock its own table was written in', async () => {
   conferencesById = {};
@@ -683,14 +678,14 @@ test('each sweep uses the clock its own table was written in', async () => {
   const ageSec = (Date.now() - sweep.params[3].getTime()) / 1000;
   assert.ok(Math.abs(ageSec - CEILING_SEC) < 5, `cutoff should be ~${CEILING_SEC}s ago, was ${ageSec}s`);
 
-  // ── tbl_plivo_call_log: NOW()-relative, because that column is NOW()-written.
+  // ── tbl_plivo_call_log: also app-written now, so also an app-side Date.
   const legSweep = fake.calls.find((c) => /JOIN tbl_job_conference c ON/i.test(c.sql));
   assert.ok(legSweep, 'the stuck-leg pass ran');
-  assert.match(legSweep.sql, /initiated_on < NOW\(\) - INTERVAL \? SECOND/i,
-    'the leg column is NOW()-written, so NOW() arithmetic compares the server clock to itself — exact');
-  assert.ok(!legSweep.params.some((p) => p instanceof Date),
-    'an IST Date here would re-introduce the skew the other rule exists to avoid');
-  assert.equal(legSweep.params[2], 45 + 300, 'ring timeout + 5 minutes of grace');
+  assert.match(legSweep.sql, /initiated_on < \?/i);
+  assert.doesNotMatch(legSweep.sql, /NOW\(\)|INTERVAL/i,
+    'initiated_on is a bound IST Date, so a NOW()-relative window would skew on a non-IST server');
+  const legAgeSec = (Date.now() - legSweep.params[2].getTime()) / 1000;
+  assert.ok(Math.abs(legAgeSec - (45 + 300)) < 5, `ring timeout + 5 minutes of grace, was ${legAgeSec}s`);
 });
 
 test('a conference Plivo still reports as running is NOT marked ended — it stays for the next sweep', async () => {

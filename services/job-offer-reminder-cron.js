@@ -44,7 +44,7 @@ const easyfixerWorkEligibility = require('./easyfixer-work-eligibility.service')
  * tapping that push would land the tech on an offer acceptOffer() refuses.
  *
  * IDEMPOTENCY: each row is CLAIMED with a conditional
- * `UPDATE … SET last_reminded_at = NOW() WHERE job_offer_id = ? AND <same predicate>`
+ * `UPDATE … SET last_reminded_at = ? WHERE job_offer_id = ? AND <same predicate>`
  * and pushed ONLY if that UPDATE reported affectedRows = 1. Because the claim
  * re-checks the predicate it just read, two replicas (or an overlapping tick)
  * racing the same offer produce exactly one push — the loser sees affectedRows 0
@@ -197,10 +197,10 @@ async function remindOne(row, lifecycleAwareEligibility) {
   try {
     const [res] = await pool.query(
       `UPDATE tbl_job_offer
-          SET last_reminded_at = NOW()
+          SET last_reminded_at = ?
         WHERE job_offer_id = ?
           AND ${lifecycleAwareEligibility}`,
-      [row.job_offer_id, ...ELIGIBLE_PARAMS()],
+      [new Date(), row.job_offer_id, ...ELIGIBLE_PARAMS()],
     );
     if (!res.affectedRows) return { claimed: false, pushed: false, failed: false };
   } catch (e) {

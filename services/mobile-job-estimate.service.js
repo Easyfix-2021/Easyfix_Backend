@@ -146,7 +146,7 @@ async function getRateCard(jobId, efrId) {
  *
  * status defaults to 1 (active, pending approval) — same default the admin
  * route uses. easyfxer_id (legacy typo) stamps the technician who raised
- * the line. sent_on = NOW() marks it raised-from-app.
+ * the line. sent_on = now marks it raised-from-app.
  *
  * Returns { lineId }.
  */
@@ -167,10 +167,10 @@ async function addQuotationLine(jobId, efrId, { type, itemId, name, quantity, am
         tx_charge, client_charge, margin,
         status, easyfxer_id, sent_on,
         job_id, client_service_id, material_id)
-     VALUES (?, ?, ?, ?, 0, 0, 0, 1, ?, NOW(), ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, 0, 0, 0, 1, ?, ?, ?, ?, ?)`,
     [
       type, name || null, quantity, amount,
-      efrId,
+      efrId, new Date(),
       jobId, clientServiceId, materialId,
     ],
   );
@@ -207,7 +207,7 @@ async function deleteQuotationLine(jobId, efrId, lineId) {
 
 /* ─── Send estimate for SPOC approval ───────────────────────────────────
  * Marks the estimate "sent for approval": stamps
- * tbl_job.approval_sent_on_date_time = NOW(), bumps no_of_req_approval,
+ * tbl_job.approval_sent_on_date_time = now, bumps no_of_req_approval,
  * and moves the order into ESTIMATE_PENDING_APPROVAL (15). This is the
  * single source of "estimate sent" the admin quotations expiry endpoint
  * reads (routes/admin/quotations.js GET /expiry/:jobId).
@@ -228,15 +228,16 @@ async function sendForApproval(jobId, efrId, { checkInImageRefs } = {}) {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    const now = new Date();
 
     await conn.query(
       `UPDATE tbl_job
-          SET approval_sent_on_date_time = NOW(),
+          SET approval_sent_on_date_time = ?,
               no_of_req_approval = COALESCE(no_of_req_approval, 0) + 1,
               job_status = ?,
-              last_update_time = NOW()
+              last_update_time = ?
         WHERE job_id = ? AND fk_easyfixter_id = ?`,
-      [STATUS_ESTIMATE_PENDING_APPROVAL, jobId, efrId],
+      [now, STATUS_ESTIMATE_PENDING_APPROVAL, now, jobId, efrId],
     );
 
     if (Array.isArray(checkInImageRefs) && checkInImageRefs.length) {
@@ -244,11 +245,11 @@ async function sendForApproval(jobId, efrId, { checkInImageRefs } = {}) {
         if (!ref || !String(ref).trim()) continue;
         await conn.query(
           `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, created_date)
-           VALUES (?, ?, ?, ?, NOW())`,
+           VALUES (?, ?, ?, ?, ?)`,
           // Check-in evidence attached to an estimate. Stored under the one
           // vocabulary every reader in the estate understands — see
           // utils/job-image-buckets.js.
-          [jobId, String(ref).trim(), persistedCategory('Booking'), 0],
+          [jobId, String(ref).trim(), persistedCategory('Booking'), 0, now],
         );
       }
     }
@@ -302,11 +303,12 @@ async function recordImages(jobId, efrId, { category, refs }) {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    const createdDate = new Date();
     for (const ref of cleaned) {
       await conn.query(
         `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, created_date)
-         VALUES (?, ?, ?, ?, NOW())`,
-        [jobId, ref, persistedCategory(category), jobStage],
+         VALUES (?, ?, ?, ?, ?)`,
+        [jobId, ref, persistedCategory(category), jobStage, createdDate],
       );
     }
     await conn.commit();
@@ -488,6 +490,7 @@ async function submitQuestionnaire(jobId, efrId, answers) {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    const now = new Date();
     let count = 0;
     for (const a of list) {
       const qid = Number(a?.questionId);
@@ -512,9 +515,9 @@ async function submitQuestionnaire(jobId, efrId, answers) {
       // UPDATE first (one answer per question per job)…
       const [upd] = await conn.query(
         `UPDATE tbl_questionaire_answer
-            SET c_qd_ans = ?, c_qd_comments = ?, updated_by = ?, update_date = NOW()
+            SET c_qd_ans = ?, c_qd_comments = ?, updated_by = ?, update_date = ?
           WHERE job_id = ? AND c_qd_id = ?`,
-        [answer, comments, efrId, jobId, qid],
+        [answer, comments, efrId, now, jobId, qid],
       );
       // …INSERT if no existing row.
       if (upd.affectedRows === 0) {
@@ -522,8 +525,8 @@ async function submitQuestionnaire(jobId, efrId, answers) {
           `INSERT INTO tbl_questionaire_answer
              (c_qd_id, job_id, c_questionaire_id, c_qd_ans, c_qd_comments,
               inserted_by, insert_date)
-           VALUES (?, ?, ?, ?, ?, ?, NOW())`,
-          [qid, jobId, questionaireId, answer, comments, efrId],
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [qid, jobId, questionaireId, answer, comments, efrId, now],
         );
       }
       count += 1;

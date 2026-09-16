@@ -86,6 +86,10 @@ test('verified profile atomically updates both location stores and first-touch m
   assert.ok(attribution, 'referral must use the additive attribution table');
   assert.match(attribution.sql, /ON DUPLICATE KEY UPDATE referral_source = referral_source/i,
     'a repeat login must not overwrite the original referral');
+  // db.js pool binds a Date as the IST wall clock; SQL NOW() takes the DB
+  // session's own (SYSTEM) zone. captured_at is DATETIME (2026-09-16).
+  assert.doesNotMatch(attribution.sql, /NOW\(\)/, 'captured_at must not be SQL NOW()');
+  assert.ok(attribution.params[2] instanceof Date, 'captured_at is the third bound value');
   assert.ok(queries.some((event) => /UPDATE tbl_easyfixer_app SET language = \?/i.test(event.sql)),
     'language must use the canonical tbl_easyfixer_app writer');
   assert.equal(queries.some((event) => /INSERT INTO tbl_user/i.test(event.sql)), false,
@@ -108,11 +112,20 @@ test('verified Home PIN atomically repairs a missing legacy tbl_user link', asyn
   const queries = db.events.filter((event) => event.type === 'query');
   const createUser = queries.find((event) => /INSERT INTO tbl_user/i.test(event.sql));
   assert.ok(createUser, 'missing link must create the shared canonical user row');
-  assert.deepEqual(createUser.params, ['9013877370', 19]);
+  // tbl_user.insert_date is TIMESTAMP, converted the same as a DATETIME
+  // column (2026-09-16): a bound Date, never SQL NOW().
+  assert.doesNotMatch(createUser.sql, /NOW\(\)/, 'insert_date must not be SQL NOW()');
+  assert.ok(createUser.params[2] instanceof Date, 'insert_date is the third bound value');
+  assert.deepEqual(createUser.params.slice(0, 2), ['9013877370', 19]);
 
-  const link = queries.find((event) => /SET user_id = \?, update_date = NOW\(\)/i.test(event.sql));
+  const link = queries.find((event) => /SET user_id = \?, update_date = \?/i.test(event.sql));
   assert.ok(link, 'new user must be linked back to the locked easyfixer row');
-  assert.deepEqual(link.params, [9001, 11179, null]);
+  // db.js pool binds a Date as the IST wall clock; SQL NOW() takes the DB
+  // session's own (SYSTEM) zone. tbl_easyfixer.update_date is TIMESTAMP,
+  // converted the same as a DATETIME column (2026-09-16).
+  assert.doesNotMatch(link.sql, /NOW\(\)/, 'update_date must not be SQL NOW()');
+  assert.ok(link.params[1] instanceof Date, 'update_date is the second bound value');
+  assert.deepEqual([link.params[0], ...link.params.slice(2)], [9001, 11179, null]);
 
   const userLocation = queries.find((event) => /UPDATE tbl_user SET pin_code/i.test(event.sql));
   assert.equal(userLocation.params[3], 9001, 'location must target the repaired user row');
@@ -131,9 +144,10 @@ test('a dangling legacy user id is replaced in the same repair transaction', asy
 
   await registrationProfile.persistVerifiedProfile(11179, { homePincode: '110001' }, db);
   const link = db.events.find((event) => (
-    event.type === 'query' && /SET user_id = \?, update_date = NOW\(\)/i.test(event.sql)
+    event.type === 'query' && /SET user_id = \?, update_date = \?/i.test(event.sql)
   ));
-  assert.deepEqual(link.params, [9001, 11179, 7777]);
+  assert.ok(link.params[1] instanceof Date, 'update_date is the second bound value');
+  assert.deepEqual([link.params[0], ...link.params.slice(2)], [9001, 11179, 7777]);
 });
 
 test('unknown pincode rolls back before either legacy profile table is changed', async () => {

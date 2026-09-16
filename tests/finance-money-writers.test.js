@@ -236,8 +236,13 @@ test('lock order: the recharge row, then the named lock, then the technician row
 test('a new-CRM recharge defaults to CREDIT, and an undefined type is refused', async () => {
   let r = await call('/ndm-recharges', 'post', { efrId: 7, rechargeAmount: 500 });
   assert.equal(r.statusCode, 201);
-  assert.equal(find(/INSERT INTO tbl_ndm_recharge/i).params[3], 2,
+  const ins = find(/INSERT INTO tbl_ndm_recharge/i);
+  assert.equal(ins.params[4], 2,
     'defaulted to 1 (debit) before — so a new-CRM recharge would have debited the technician on approval');
+  // recharge_date is DATETIME — bound as a Date, never NOW() (pool is IST wall
+  // clock; NOW() would resolve in the DB session zone instead).
+  assert.doesNotMatch(ins.sql, /recharge_date = NOW\(\)|recharge_date\) VALUES[^)]*NOW\(\)/i);
+  assert.ok(ins.params[3] instanceof Date, 'recharge_date must be a bound Date');
   fake.reset();
   r = await call('/ndm-recharges', 'post', { efrId: 7, rechargeAmount: 500, rechargeType: 3 });
   assert.equal(r.statusCode, 400);

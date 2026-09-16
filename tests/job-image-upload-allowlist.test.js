@@ -140,6 +140,16 @@ test('octet-stream does NOT launder a file that is not on the list', async () =>
   await rejects(file(EXE, 'application/octet-stream', 'thing.pdf'), /unsupported file type/i);
 });
 
+test('created_date is bound as a Date, never SQL NOW()', async () => {
+  fake.reset();
+  await jobImage.uploadJobImage({ jobId: 5001, file: file(PNG, 'image/png', 'gate-pass.png'), category: 'Permission' });
+  const ins = fake.calls.find((c) => /INSERT INTO tbl_job_image/i.test(c.sql));
+  assert.ok(ins, 'the INSERT must have run');
+  assert.doesNotMatch(ins.sql, /NOW\(\)/);
+  assert.match(ins.sql, /VALUES \(\?, \?, \?, \?, \?\)/);
+  assert.ok(ins.params[4] instanceof Date, 'created_date is bound as a Date');
+});
+
 /* ─── 4. THE PRODUCTION BRANCH — the whole point of the file ──────────── */
 
 test('the S3 branch is covered too, and stores the SNIFFED Content-Type', async () => {

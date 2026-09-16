@@ -422,7 +422,11 @@ test('restricting lifecycle expiry closes all open offers in one set-based write
   assert.match(captured.sql, /WHERE fk_easyfixter_id = \?/i);
   assert.match(captured.sql, /AND offer_status = \?/i);
   assert.doesNotMatch(captured.sql, /updated_on/i, 'works with the base offer-table schema');
-  assert.deepEqual(captured.params, [3, 77, 0]);
+  assert.match(captured.sql, /responded_at = COALESCE\(responded_at, \?\)/, 'responded_at is a bound Date, never SQL NOW()');
+  assert.equal(captured.params.length, 4);
+  assert.equal(captured.params[0], 3);
+  assert.ok(captured.params[1] instanceof Date);
+  assert.deepEqual(captured.params.slice(2), [77, 0]);
 });
 
 test('offer expiry remains compatible before the offer table is installed', async () => {

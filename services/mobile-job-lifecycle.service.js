@@ -951,6 +951,7 @@ async function submitQuestionnaire(jobId, efrId, answers) {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    const now = new Date();
     for (const a of answers) {
       const ansStr = a.answer ? '1' : '0';
       const remark = a.remark || '';
@@ -960,9 +961,9 @@ async function submitQuestionnaire(jobId, efrId, answers) {
       );
       if (existing) {
         await conn.query(
-          `UPDATE tbl_questionaire_answer SET c_qd_ans = ?, c_qd_comments = ?, update_date = NOW()
+          `UPDATE tbl_questionaire_answer SET c_qd_ans = ?, c_qd_comments = ?, update_date = ?
             WHERE c_qd_ans_id = ?`,
-          [ansStr, remark, existing.c_qd_ans_id],
+          [ansStr, remark, now, existing.c_qd_ans_id],
         );
       } else {
         await conn.query(

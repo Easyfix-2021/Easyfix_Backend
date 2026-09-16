@@ -130,7 +130,25 @@ test('a PAID payout can no longer be rejected, and a rejection uses the row\'s t
   assert.equal(r.statusCode, 200);
   const upd = find(/UPDATE tbl_service_payout/i);
   assert.ok(upd, 'the rejection must be written');
-  assert.deepEqual(upd.params, [12, 55, 7], 'efr 7 from the row, not 999 from the body');
+  // fin_reject_date is DATETIME — bound as a Date, never NOW() (the pool is
+  // IST wall clock; NOW() would resolve in the DB session zone instead).
+  assert.doesNotMatch(upd.sql, /fin_reject_date = NOW\(\)/i);
+  assert.ok(upd.params[1] instanceof Date, 'fin_reject_date must be a bound Date');
+  assert.equal(upd.params[0], 12, 'fin_rejected_by');
+  assert.deepEqual([upd.params[2], upd.params[3]], [55, 7], 'efr 7 from the row, not 999 from the body');
+});
+
+test('creating a payout binds pm_req_date as a Date, not NOW()', async () => {
+  const r = await call('/payouts', 'post', {
+    efrId: 7, efrBalance: 100, opsAmount: 50, pmRequestAmount: 50,
+  });
+  assert.equal(r.statusCode, 201);
+  const ins = find(/INSERT INTO tbl_service_payout/i);
+  assert.ok(ins, 'the payout row must be inserted');
+  // pm_req_date is DATETIME — bound as a Date, never NOW() (the pool is IST
+  // wall clock; NOW() would resolve in the DB session zone instead).
+  assert.doesNotMatch(ins.sql, /pm_req_date = NOW\(\)|pm_req_date\) VALUES[^)]*NOW\(\)/i);
+  assert.ok(ins.params[3] instanceof Date, 'pm_req_date must be a bound Date');
 });
 
 test('ops approval refuses only an already-paid payout, so reject-then-fix still works', async () => {

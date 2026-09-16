@@ -536,21 +536,22 @@ async function getTrainingPercentages(efrId) {
  */
 async function setTrainingPercentage(efrId, videoId, watchedPercentage) {
   logger.info('Upsert training watched-% · videoId=' + videoId + ' watched=' + watchedPercentage);
+  const now = new Date();
   await pool.query(
     `INSERT INTO easyfixer_watched_video
        (easyfixer_id, video_id, watched_percentage, update_date)
-     VALUES (?, ?, ?, NOW())
+     VALUES (?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE
        update_date = IF(
          VALUES(watched_percentage) > COALESCE(watched_percentage, 0),
-         NOW(),
+         ?,
          update_date
        ),
        watched_percentage = GREATEST(
          COALESCE(watched_percentage, 0),
          VALUES(watched_percentage)
        )`,
-    [efrId, videoId, watchedPercentage],
+    [efrId, videoId, watchedPercentage, now, now],
   );
   logger.info('Training watched-% saved · videoId=' + videoId);
   await maybeAdvanceTrainingLifecycle(efrId, watchedPercentage);
@@ -722,11 +723,12 @@ async function getUpiDetails(efrId) {
  */
 async function addUpiDetail(efrId, upiId) {
   logger.info('Upsert UPI detail · efrId=' + efrId);
+  const now = new Date();
   await pool.query(
     `INSERT INTO tbl_easyfixer_bank_details (efr_Id, upi_or_mobile_number, insert_date, update_date)
-     VALUES (?, ?, NOW(), NOW())
-     ON DUPLICATE KEY UPDATE upi_or_mobile_number = ?, update_date = NOW()`,
-    [efrId, upiId, upiId],
+     VALUES (?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE upi_or_mobile_number = ?, update_date = ?`,
+    [efrId, upiId, now, now, upiId, now],
   );
   const [[row]] = await pool.query(
     'SELECT efr_bank_id FROM tbl_easyfixer_bank_details WHERE efr_Id = ? LIMIT 1',

@@ -39,12 +39,13 @@ const COLUMNS = [
   'billing_name', 'billing_cycle', 'billing_raised', 'billing_start_date',
   'tech_app_name',            // migrated
   // 'display_name'           // ← deliberately absent: migration not applied
-  'update_date', 'updated_by',
+  'insert_date', 'update_date', 'updated_by',
 ].map((c) => ({ COLUMN_NAME: c }));
 
 const fake = installFakePool([
   [/INFORMATION_SCHEMA\.COLUMNS/i, COLUMNS],
   [/^UPDATE tbl_client/i, { affectedRows: 1 }],
+  [/^INSERT INTO tbl_client/i, () => ({ insertId: 999 })],
 ]);
 
 const svc = require('../services/client.service');
@@ -72,7 +73,7 @@ function boundValue(col) {
   let paramIndex = 0;
   for (const a of assignments) {
     const [name, rhs] = a.split(' = ');
-    if (rhs !== '?') continue;               // e.g. `update_date = NOW()`
+    if (rhs !== '?') continue;               // e.g. a bare SQL literal, not a bound param
     if (name === col) return stmt.params[paramIndex];
     paramIndex += 1;
   }
@@ -98,6 +99,14 @@ test("an empty billingStartDate is written as NULL, never ''", () => {
     "'' in a DATE column is the zero date under a lax sql_mode and a hard error under STRICT");
 });
 
+test('update_date is bound as a Date, not NOW()', () => {
+  // tbl_client.update_date is TIMESTAMP — bound as a Date, never NOW(): the
+  // pool is `timezone: '+05:30'`, so a JS Date serialises to the IST wall
+  // clock the column expects, whereas NOW() resolves in the DB session zone.
+  assert.doesNotMatch(stmt.sql, /update_date = NOW\(\)/i);
+  assert.ok(boundValue('update_date') instanceof Date, 'update_date must be a bound Date');
+});
+
 test('display_name is DROPPED while its migration is unapplied', () => {
   assert.ok(!/display_name/.test(stmt.sql),
     'emitting a column this DB lacks would fail the whole save with ER_BAD_FIELD_ERROR 1054');
@@ -110,4 +119,20 @@ test('the unapplied column does not shift the other bindings', () => {
   assert.equal(boundValue('billing_name'), 'Brightline Retail Private Limited');
   assert.equal(boundValue('billing_raised'), 1);
   assert.equal(stmt.params[stmt.params.length - 1], 133, 'client_id must be the last binding');
+});
+
+test('createClient binds insert_date and update_date as the SAME Date, not NOW()', async () => {
+  fake.reset();
+  await svc.createClient({ clientName: 'New Co' }, 7);
+  const ins = fake.calls.find((c) => /^INSERT INTO tbl_client/i.test(c.sql));
+  assert.ok(ins, 'createClient must emit exactly one INSERT');
+  assert.doesNotMatch(ins.sql, /NOW\(\)/, 'insert_date/update_date must be bound Dates, not NOW()');
+  const cols = ins.sql.replace(/^INSERT INTO tbl_client \(/i, '').split(')')[0].split(', ');
+  const insertDateIdx = cols.indexOf('insert_date');
+  const updateDateIdx = cols.indexOf('update_date');
+  assert.ok(insertDateIdx >= 0 && updateDateIdx >= 0, 'both audit columns must be emitted');
+  assert.ok(ins.params[insertDateIdx] instanceof Date, 'insert_date must be a bound Date');
+  assert.ok(ins.params[updateDateIdx] instanceof Date, 'update_date must be a bound Date');
+  assert.equal(ins.params[insertDateIdx].getTime(), ins.params[updateDateIdx].getTime(),
+    'a new client stamps insert_date and update_date identically');
 });

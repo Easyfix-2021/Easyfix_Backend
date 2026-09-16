@@ -94,11 +94,11 @@ router.post('/product', validate(productBody), async (req, res, next) => {
       `INSERT INTO quotation_details
          (type, name, unit, unit_price, tx_charge, client_charge, margin,
           status, sent_by, sent_on, job_id, client_service_id, job_service_id)
-       VALUES ('product', ?, ?, ?, ?, ?, ?, 1, ?, NOW(), ?, ?, ?)`,
+       VALUES ('product', ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`,
       [
         req.body.name, req.body.unit, req.body.unitPrice,
         req.body.txCharge || 0, req.body.clientCharge || 0,
-        req.body.margin || 0, req.user.user_id,
+        req.body.margin || 0, req.user.user_id, new Date(),
         req.body.jobId,
         req.body.clientServiceId || null,
         req.body.jobServiceId || null,
@@ -122,11 +122,11 @@ router.post('/material', validate(productBody.fork(['name'], (s) => s)
       `INSERT INTO quotation_details
          (type, name, unit, unit_price, tx_charge, client_charge, margin,
           status, sent_by, sent_on, job_id, material_id, job_service_id)
-       VALUES ('material', ?, ?, ?, ?, ?, ?, 1, ?, NOW(), ?, ?, ?)`,
+       VALUES ('material', ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`,
       [
         req.body.name, req.body.unit, req.body.unitPrice,
         req.body.txCharge || 0, req.body.clientCharge || 0,
-        req.body.margin || 0, req.user.user_id,
+        req.body.margin || 0, req.user.user_id, new Date(),
         req.body.jobId,
         req.body.materialId || null,
         req.body.jobServiceId || null,
@@ -148,9 +148,9 @@ router.patch('/:id/approve', validate(Joi.object({
     if (!guard.ok) return modernError(res, 404, 'quotation not found');
     const [r] = await pool.query(
       `UPDATE quotation_details
-          SET approved_charge = ?, action_by = ?, action_on = NOW(), status = 1
+          SET approved_charge = ?, action_by = ?, action_on = ?, status = 1
         WHERE id = ?`,
-      [req.body.approvedCharge, req.user.user_id, req.params.id]
+      [req.body.approvedCharge, req.user.user_id, new Date(), req.params.id]
     );
     if (r.affectedRows === 0) return modernError(res, 404, 'quotation not found');
     logger.info('Quotation approved · id=' + req.params.id);
@@ -165,9 +165,9 @@ router.patch('/:id/reject', async (req, res, next) => {
     if (!guard.ok) return modernError(res, 404, 'quotation not found');
     const [r] = await pool.query(
       `UPDATE quotation_details
-          SET status = 0, action_by = ?, action_on = NOW()
+          SET status = 0, action_by = ?, action_on = ?
         WHERE id = ?`,
-      [req.user.user_id, req.params.id]
+      [req.user.user_id, new Date(), req.params.id]
     );
     if (r.affectedRows === 0) return modernError(res, 404, 'quotation not found');
     logger.info('Quotation rejected · id=' + req.params.id);

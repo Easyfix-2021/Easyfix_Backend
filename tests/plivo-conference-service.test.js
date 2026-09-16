@@ -322,7 +322,12 @@ test('createConference writes NO participant row — it adopts the operator’s 
   const adopt = oneSql(/UPDATE tbl_plivo_call_log[\s\S]*participant_role = 'operator'/i);
   assert.match(adopt.sql, /WHERE job_caller_info_id = \? AND conference_id IS NULL/i,
     'idempotent by construction — after the first run there is no unattached row left to adopt');
-  assert.deepEqual(adopt.params, [77, 5001]);
+  // updated_on (2026-09-16): a bound Date, never SQL NOW() — see
+  // services/plivo-call-log.service.js::adoptOperatorLeg.
+  assert.doesNotMatch(adopt.sql, /NOW\(\)/);
+  assert.equal(adopt.params[0], 77);
+  assert.ok(adopt.params[1] instanceof Date, 'updated_on is the second bound value');
+  assert.equal(adopt.params[2], 5001);
 });
 
 /*
@@ -588,7 +593,11 @@ test('a non-2xx marks the leg failed with the status AND body, and never throws'
   // terminal reason on this table lives; the full body is in the log.
   const upd = oneSql(/UPDATE tbl_plivo_call_log[\s\S]*hangup_cause = COALESCE/i);
   assert.ok(upd.params.includes('failed'), 'the leg lands in the call-log failure status');
-  assert.match(String(upd.params[1]), /http=400/);
+  // ended_on/updated_on (2026-09-16): bound Dates, never SQL NOW() — see
+  // services/plivo-call-log.service.js::markConferenceLegFailed.
+  assert.doesNotMatch(upd.sql, /NOW\(\)/);
+  assert.ok(upd.params[1] instanceof Date, 'ended_on is the second bound value');
+  assert.match(String(upd.params[2]), /http=400/);
 });
 
 /*

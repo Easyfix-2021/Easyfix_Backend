@@ -359,8 +359,8 @@ async function createZone({ zone_name, city_id }) {
 
     const [r] = await conn.query(
       `INSERT INTO tbl_zone_master (zone_name, city_id, zone_status, created_date)
-       VALUES (?, ?, 1, NOW())`,
-      [trimmed, Number(city_id)]
+       VALUES (?, ?, 1, ?)`,
+      [trimmed, Number(city_id), new Date()]
     );
     const zoneId = r.insertId;
 
@@ -494,9 +494,10 @@ async function setPincodeMapping(zoneId, pincodeIds, { userId = null } = {}) {
         [zoneId, ...acceptable]
       );
       // Idempotently add the wanted rows for THIS zone.
-      const values = acceptable.map(() => '(?, ?, NOW(), ?)').join(', ');
+      const values = acceptable.map(() => '(?, ?, ?, ?)').join(', ');
+      const now = new Date();
       const params = [];
-      for (const id of acceptable) params.push(zoneId, id, userId);
+      for (const id of acceptable) params.push(zoneId, id, now, userId);
       await conn.query(
         `INSERT IGNORE INTO tbl_zone_pincode_mapping
            (zone_id, pincode_id, created_on, created_by)

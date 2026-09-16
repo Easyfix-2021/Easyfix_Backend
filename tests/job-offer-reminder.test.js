@@ -32,6 +32,7 @@ let offer = null;            // the single in-memory tbl_job_offer row
 let job = null;              // the tbl_job row the EXISTS clause checks
 let technician = null;       // the tbl_easyfixer row the lifecycle gate checks
 let selects = 0;             // how many eligibility SELECTs the runner issued
+let lastStampedAt = null;    // the real bound Date from the last claim UPDATE
 
 // Mirror of ELIGIBLE_SQL, evaluated against the params the runner actually
 // bound. Keeping this driven by the runner's OWN params (rather than by the
@@ -58,8 +59,12 @@ const fake = installFakePool([
 
   // The per-row claim. Routed BEFORE the SELECT so the more specific write wins.
   [/UPDATE tbl_job_offer\s+SET last_reminded_at/i, (_sql, params) => {
-    const [offerId, ...windowParams] = params;
+    const [stampedAt, offerId, ...windowParams] = params;
     if (offer && offer.job_offer_id === offerId && eligible(windowParams)) {
+      lastStampedAt = stampedAt;
+      // The fake clock (`now`, in simulated ms) drives eligibility elsewhere in
+      // this file, so the row keeps that domain — the assertions below check
+      // the REAL bound value (a Date) via lastStampedAt instead.
       offer.last_reminded_at = now;
       return { affectedRows: 1 };
     }
@@ -104,6 +109,7 @@ beforeEach(() => {
   job = { job_id: 100, job_status: 0, fk_easyfixter_id: null };
   technician = { efr_id: 42, efr_status: 1, is_technician_verified: 1 };
   selects = 0;
+  lastStampedAt = null;
 });
 
 // ─── Window arithmetic ───────────────────────────────────────────────
@@ -231,7 +237,9 @@ test('an open, unanswered offer inside the window IS claimed and stamped', async
   assert.match(claim.sql, /last_reminded_at IS NULL OR last_reminded_at <= NOW\(\)/, 'claim re-checks the spacing');
   assert.match(claim.sql, /EXISTS \(SELECT 1 FROM tbl_job j/, 'claim re-checks the job is still offerable');
   assert.match(claim.sql, /EXISTS \(SELECT 1 FROM tbl_easyfixer ef/, 'claim re-checks technician lifecycle eligibility');
-  assert.equal(claim.params[0], 7, 'claim is scoped to the one offer row');
+  assert.match(claim.sql, /SET last_reminded_at = \?/, 'last_reminded_at is a bound Date, never SQL NOW()');
+  assert.ok(lastStampedAt instanceof Date, 'the claim binds a real Date for last_reminded_at');
+  assert.equal(claim.params[1], 7, 'claim is scoped to the one offer row');
 });
 
 // ─── Idempotency + cap ───────────────────────────────────────────────

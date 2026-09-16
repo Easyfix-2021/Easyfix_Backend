@@ -164,11 +164,14 @@ test('RUNTIME: the reason binds in the SET clause, before the WHERE params', asy
     const whereIdx = upd.sql.search(/INTERVAL \? MINUTE/);
     assert.ok(setIdx > -1 && whereIdx > -1);
     assert.ok(setIdx < whereIdx, 'the SET placeholder precedes the WHERE placeholder in the SQL');
-    assert.equal(upd.params[0], 'ttl_elapsed',
-      `params must lead with the reason; got ${JSON.stringify(upd.params)} — a swapped order `
+    // responded_at's own bound Date leads (it is the first SET placeholder,
+    // ahead of closed_reason), then the reason, then the WHERE params.
+    assert.ok(upd.params[0] instanceof Date, 'responded_at is bound as a Date, never SQL NOW()');
+    assert.equal(upd.params[1], 'ttl_elapsed',
+      `params must follow responded_at with the reason; got ${JSON.stringify(upd.params)} — a swapped order `
       + 'would make the TTL "ttl_elapsed" (0 minutes) and expire EVERY open offer');
-    assert.equal(upd.params[1], 30, 'then the TTL');
-    assert.equal(upd.params[2], 4242, 'then the job id');
+    assert.equal(upd.params[2], 30, 'then the TTL');
+    assert.equal(upd.params[3], 4242, 'then the job id');
   } finally {
     db.pool.query = real;
     for (const m of ['services/offer-closed-reason', 'services/job.service']) {
