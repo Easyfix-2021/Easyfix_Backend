@@ -204,52 +204,10 @@ router.get('/:id/selfie-url',
       const selfieId = req.scopedJob.tx_selfie_id;
       if (!selfieId) return modernOk(res, { selfieId: null, url: null });
 
-      const { pool } = require('../../db');
-      const s3Storage = require('../../utils/s3-storage');
-      const [[doc]] = await pool.query(
-        'SELECT `path`, url FROM document WHERE id = ? LIMIT 1',
-        [selfieId],
-      );
-      if (!doc) return modernOk(res, { selfieId, url: null });
-
-      /*
-       * S3 key lives in `path`; presign on read. Fall back to a legacy url.
-       *
-       * The existence CHECK is the fix (2026-09-09). Presigning is a local
-       * signing operation — it never contacts S3 — so it succeeds for a key
-       * that does not exist, `url` came back non-null, and the documented
-       * "fall back to a legacy stored url" below could never run. The endpoint
-       * logged `has=true`, returned 200, and the browser got a URL that 404s.
-       * A success that cannot fail is not a resolution.
-       *
-       * One HEAD per selfie view, only when a key is present, and only on this
-       * endpoint — it is opened by a human looking at one job, not in a list.
-       * A HEAD that throws is treated as "unknown, keep the presign" rather
-       * than as absent, so an IAM or network fault degrades to today's
-       * behaviour instead of hiding a selfie that is really there.
-       */
-      const key = String(doc.path || '').trim();
-      let url = null;
-      if (key && s3Storage.isEnabled()) {
-        let present = true;
-        try { present = await s3Storage.exists(key); }
-        catch (e) {
-          logger.warn('Selfie existence check failed, assuming present · jobId=' + req.params.id + ' · ' + e.message);
-        }
-        if (present) {
-          try { url = await s3Storage.getPresignedUrl(key); }
-          catch (e) { logger.warn('Selfie presign failed · jobId=' + req.params.id + ' · ' + e.message); }
-        } else {
-          logger.info('Selfie key absent in S3, falling back to the stored url · jobId=' + req.params.id);
-        }
-      }
-      // Legacy rows store an absolute URL on the old file host. Upgrade http →
-      // https: the CRM is served over https and a browser blocks an http image
-      // on an https page, so an un-upgraded fallback would swap one invisible
-      // image for another.
-      if (!url && doc.url) {
-        url = String(doc.url).replace(/^http:\/\//i, 'https://');
-      }
+      // One HEAD per selfie view — opened by a human looking at one job, not a
+      // list. The resolver (and why it HEADs before presigning) is shared with
+      // the technician's GET /mobile/jobs/:id.
+      const url = await job.resolveSelfieUrl(selfieId, req.params.id);
       logger.info('Resolved selfie url · jobId=' + req.params.id + ' · has=' + !!url);
       modernOk(res, { selfieId, url });
     } catch (e) {
