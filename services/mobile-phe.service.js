@@ -659,7 +659,7 @@ async function getJobDetail(efrId, jobId, db = pool) {
             ${JOB_AGE_SECS_EXPR} AS age_secs,
             wallet.paid_at, wallet.wallet_credit_count, wallet.paid_to_technician,
             COALESCE(tx.technician_earning, 0) AS technician_earning,
-            tx.transaction_count, tx.gross_charge, tx.easyfix_charge, tx.client_charge,
+            tx.transaction_count,
             accepted.offered_at, accepted.responded_at AS accepted_at,
             CASE WHEN accepted.offered_at IS NOT NULL AND accepted.responded_at IS NOT NULL
                  THEN GREATEST(TIMESTAMPDIFF(SECOND, accepted.offered_at, accepted.responded_at), 0)
@@ -686,10 +686,7 @@ async function getJobDetail(efrId, jobId, db = pool) {
        ) wallet ON 1 = 1
        LEFT JOIN (
          SELECT COUNT(*) AS transaction_count,
-                SUM(COALESCE(tjt.efr_charge, 0)) AS technician_earning,
-                SUM(COALESCE(tjt.total_charge, 0)) AS gross_charge,
-                SUM(COALESCE(tjt.ef_charge, 0)) AS easyfix_charge,
-                SUM(COALESCE(tjt.client_charge, 0)) AS client_charge
+                SUM(COALESCE(tjt.efr_charge, 0)) AS technician_earning
            FROM tbl_job_transaction tjt
           WHERE tjt.fk_job_id = ?
        ) tx ON 1 = 1
@@ -817,13 +814,6 @@ async function getJobDetail(efrId, jobId, db = pool) {
     // The legacy transaction table does not split technician earnings into
     // base pay, incentive and penalty columns. Expose only the sums it actually
     // stores so clients never label an invented breakdown as authoritative.
-    earningsCalculation: num(row.transaction_count) > 0 ? {
-      technicianEarning: money(row.technician_earning),
-      grossJobCharge: money(row.gross_charge),
-      easyFixCharge: money(row.easyfix_charge),
-      clientCharge: money(row.client_charge),
-      transactionLines: num(row.transaction_count),
-    } : null,
     payoutBreakdown: payoutBreakdown(row),
     qualityReview: Number(row.job_status) === UNDER_AUDIT_STATUS ? {
       state: 'UNDER_AUDIT',
