@@ -570,9 +570,13 @@ router.get('/jobs/:id', async (req, res, next) => {
      * every technician it is offered to. (An ACCEPTED delegate passes: the lock
      * middleware has rewritten efr_id to the owner's, and they are doing the work.)
      */
-    job.selfie_url = job.tx_selfie_id && job.fk_easyfixter_id === req.tech.efr_id
-      ? await jobService.resolveSelfieUrl(job.tx_selfie_id, job.job_id)
+    const selfie = job.tx_selfie_id && job.fk_easyfixter_id === req.tech.efr_id
+      ? await jobService.resolveSelfie(job.tx_selfie_id, job.job_id)
       : null;
+    job.selfie_url = selfie?.url ?? null;
+    // When it was recorded (document.created_on, IST wall clock), so a stale
+    // selfie from an earlier visit is distinguishable from today's. Same owner rule.
+    job.selfie_recorded_at = selfie?.recordedAt ?? null;
     modernOk(res, stripCustomerMobiles(job));
   } catch (e) { next(e); }
 });

@@ -15,8 +15,14 @@ const assert = require('node:assert/strict');
 const express = require('express');
 const { installFakePool } = require('./helpers/fake-pool');
 
-const fake = installFakePool([[/FROM document WHERE id = \?/, (_sql, [id]) =>
-  id === 555 ? [{ path: null, url: 'http://media.easyfix.in/selfie/555.jpg' }] : []]]);
+// The row answers only the columns the SELECT names — a fixture that hands back
+// created_on regardless would let a resolver that never reads it pass.
+const DOC_555 = { path: null, url: 'http://media.easyfix.in/selfie/555.jpg', created_on: '2026-09-16 10:42:07' };
+const fake = installFakePool([[/FROM document WHERE id = \?/, (sql, [id]) => {
+  if (id !== 555) return [];
+  const cols = /SELECT (.+) FROM document/.exec(sql)[1].split(',').map((c) => c.trim().replace(/`/g, ''));
+  return [Object.fromEntries(cols.map((c) => [c, DOC_555[c]]))];
+}]]);
 
 for (const [rel, exports] of [
   ['../middleware/tech-auth', (req, _res, next) => { req.tech = { efr_id: 7 }; next(); }],
@@ -62,6 +68,8 @@ test('the owner gets the recorded selfie as a renderable https URL', async () =>
   const { status, body } = await getDetail();
   assert.equal(status, 200);
   assert.equal(body.data.selfie_url, 'https://media.easyfix.in/selfie/555.jpg');
+  // Verbatim IST wall clock — no zone added, no conversion; the app renders it as-is.
+  assert.equal(body.data.selfie_recorded_at, '2026-09-16 10:42:07');
 });
 
 test('a technician holding only an OFFER can open the job but never gets the selfie', async () => {
@@ -71,10 +79,11 @@ test('a technician holding only an OFFER can open the job but never gets the sel
   assert.equal(status, 200, 'positive control: the offered technician may still view the job');
   assert.equal(body.data.job_id, 42);
   assert.equal(body.data.selfie_url, null);
+  assert.equal(body.data.selfie_recorded_at, null, 'nor when it was recorded');
   assert.equal(documentReads(), 0, 'the document is not even looked up for a non-owner');
 });
 
-test('resolveSelfieUrl: no selfie id or no document row → null, no guess', async () => {
-  assert.equal(await jobService.resolveSelfieUrl(null, 1), null);
-  assert.equal(await jobService.resolveSelfieUrl(777, 1), null);
+test('resolveSelfie: no selfie id or no document row → null, no guess', async () => {
+  assert.equal(await jobService.resolveSelfie(null, 1), null);
+  assert.equal(await jobService.resolveSelfie(777, 1), null);
 });
