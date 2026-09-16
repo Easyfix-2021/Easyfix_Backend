@@ -17,25 +17,32 @@ const Joi = require('joi');
  */
 
 /*
- * PATHNAME ONLY. Query strings in this CRM carry job and client ids
- * (?jobId=…, ?clientId=…), and an issue queue that every issue manager can
- * read must not become a side-channel listing which jobs a given user was
- * looking at. The strip happens HERE, at the trust boundary, rather than in
- * the service: this is the only writer of the column, so stripping once on the
- * way in means no reader anywhere has to remember to sanitise it, and the
- * stored value cannot disagree with the rule.
+ * PATH AND QUERY, fragment dropped (owner, 2026-09-16: "capture the page URL
+ * from where the issue is reported").
  *
- * Order matters — the fragment is cut before the query, because a URL may
- * carry `#/foo?bar=1` and cutting on '?' first would leave the fragment's own
- * query behind. Both are removed regardless of order of appearance.
+ * Until now this kept the PATHNAME ONLY, on purpose: query strings in this CRM
+ * carry job and client ids (?jobId=…, ?clientId=…), and an issue queue that
+ * every issue manager can read must not become a side-channel listing which
+ * jobs a given user was looking at. That trade-off is now decided the other
+ * way, deliberately: `/my-orders?tab=pending-start&action=reassign&jobId=509493`
+ * IS the reproduction — which tab, which modal, which job — and a path alone
+ * sent every triager back to the reporter to ask. The audience is the three
+ * named managers behind the two-lock gate (services/issue.service.js
+ * resolveActor), not every CRM user.
  *
- * The result is truncated to the column width AFTER stripping, so a long query
- * string can never push the pathname out of the column.
+ * The strip still happens HERE, at the trust boundary, for the same reason as
+ * before: this is the only writer of the column, so one rule on the way in is
+ * the whole rule. The fragment goes because nothing in this CRM routes on it.
+ *
+ * THE COLUMN IS STILL VARCHAR(255) and the slice below keeps that true. A
+ * filter URL carrying a 400-id CSV will lose its tail rather than 500 the
+ * report; widening the column is a migration with a deploy-order hazard on
+ * this very table (see project memory) and is a separate, deliberate step.
  */
 const pagePath = Joi.string().trim().max(2048).custom((value) => {
-  const stripped = String(value).split('#')[0].split('?')[0].trim();
-  return stripped.slice(0, 255);
-}, 'strip-query-and-fragment');
+  const noFragment = String(value).split('#')[0].trim();
+  return noFragment.slice(0, 255);
+}, 'strip-fragment');
 
 const issueIdParam = Joi.object({
   issueId: Joi.number().integer().positive().required(),
