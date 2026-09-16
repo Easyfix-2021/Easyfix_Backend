@@ -64,7 +64,19 @@ router.get('/health', (_req, res) => {
 router.get('/health/db', async (_req, res) => {
   const started = Date.now();
   try {
-    const [rows] = await pool.query('SELECT 1 AS ok, DATABASE() AS db, NOW() AS ts');
+    /*
+     * The clock columns ride the SAME round-trip. Every DATETIME written with
+     * NOW() takes the DB session's wall clock, while `new Date()` writes are
+     * pinned to IST by the pool's timezone option — so a DB whose session zone
+     * is not +05:30 silently skews every NOW() writer. `dbTime` shows that
+     * directly instead of it being inferred from a bad row.
+     */
+    const [rows] = await pool.query(
+      `SELECT 1 AS ok, DATABASE() AS db, NOW() AS ts, UTC_TIMESTAMP() AS utc,
+              UNIX_TIMESTAMP() AS epoch, TIMESTAMPDIFF(MINUTE, UTC_TIMESTAMP(), NOW()) AS offset_min,
+              @@session.time_zone AS session_tz, @@system_time_zone AS system_tz`,
+    );
+    const r = rows[0];
 
     const replica = getReadPoolStats();
     /*
@@ -103,8 +115,18 @@ router.get('/health/db', async (_req, res) => {
     }
 
     return modernOk(res, {
-      db: rows[0].db,
-      ts: rows[0].ts,
+      db: r.db,
+      ts: r.ts,
+      dbTime: {
+        now: r.ts, // session wall clock, verbatim (dateStrings)
+        utc: r.utc,
+        offsetMinutes: Number(r.offset_min), // 330 = IST
+        sessionTimeZone: r.session_tz,
+        systemTimeZone: r.system_tz,
+        // App clock minus DB clock; > 0 = app ahead. Sampled before the query,
+        // so round-trip latency can add up to latencyMs of apparent skew.
+        appSkewSeconds: Math.round(started / 1000) - Number(r.epoch),
+      },
       latencyMs: Date.now() - started,
       pool: getPoolStats(),
       replica,
