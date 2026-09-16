@@ -1,0 +1,216 @@
+/*
+ * QuickSight — Employee Performance (uploaded snapshot).
+ *
+ * Unlike every other QuickSight report this one is NOT computed from
+ * easyfix_core. MIS builds it off-platform: a raw workbook (Open/Close order,
+ * targets, emp detail, TimeChamp, CRM counts, IVR) goes through build_data.py,
+ * which writes `data.js` — a single `const D={...};` literal that the
+ * dashboard page (assets/quicksight/employee-performance/dashboard.html)
+ * renders. Half of those sources do not exist in the DB, so the report is a
+ * snapshot that an authorised operator uploads, not a query.
+ *
+ * WHAT IS STORED. Never the uploaded file itself. The upload is parsed as
+ * JSON (after stripping the `const D=` / `;` wrapper) and shape-checked, then
+ * RE-SERIALISED — so the stored object is pure data, whatever the file held.
+ * `<` is escaped as < on the way out, which keeps the JSON valid and
+ * makes it impossible for a string inside it to close the <script> element the
+ * dashboard is injected into. Stored gzipped: the JSON compresses ~10x.
+ *
+ * WHERE. Private S3 (`QuickSight/EmployeePerformance/`) — it attributes
+ * revenue to named employees, so it must never sit under the public
+ * /easydoc tree. When S3 is not configured (local dev) it falls back to a
+ * private directory on disk; that copy does not survive a container redeploy.
+ *
+ * meta.json is written AFTER the data object and is what readers key on, so
+ * a failed data write never advertises a snapshot that is not there.
+ */
+
+const fs = require('node:fs');
+const path = require('node:path');
+const zlib = require('node:zlib');
+
+const s3 = require('../../utils/s3-storage');
+const logger = require('../../logger');
+
+const S3_PREFIX = 'QuickSight/EmployeePerformance';
+const DATA_NAME = 'data.json.gz';
+const META_NAME = 'meta.json';
+
+const TEMPLATE_PATH = path.join(__dirname, '..', '..', 'assets', 'quicksight', 'employee-performance', 'dashboard.html');
+// The one line build_data.py's README says was changed in the original page.
+const DATA_HOOK = '<script src="data.js"></script>';
+
+// A gzip bomb must not be able to exhaust memory: cap what we inflate.
+const MAX_INFLATED_BYTES = 200 * 1024 * 1024;
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const MONTH_RE = /^\d{4}-\d{2}$/;
+
+const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+// Top-level keys build_data.py emits and dashboard.html reads.
+const SHAPE = {
+  employees: isPlainObject,
+  verticals: Array.isArray,
+  months: Array.isArray,
+  dates: Array.isArray,
+  primarySpocs: Array.isArray,
+  zonalManagers: Array.isArray,
+  teamMembers: isPlainObject,
+  displayNames: isPlainObject,
+  txRows: Array.isArray,
+  unassigned: Array.isArray,
+  zmBreakdown: Array.isArray,
+};
+
+function badRequest(message) {
+  return Object.assign(new Error(message), { status: 400 });
+}
+
+function localDir() {
+  return process.env.QS_EMPLOYEE_PERFORMANCE_DIR
+    || path.join(__dirname, '..', '..', 'uploads', 'private', 'quicksight-employee-performance');
+}
+
+/*
+ * Buffer (data.js / data.json, optionally gzipped) → { data, summary }.
+ * Throws a 400-status error with an operator-readable message on anything
+ * that is not a dashboard data file.
+ */
+function parseDashboardData(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length === 0) throw badRequest('The uploaded file is empty');
+
+  let raw = buffer;
+  if (raw[0] === 0x1f && raw[1] === 0x8b) {
+    try {
+      raw = zlib.gunzipSync(raw, { maxOutputLength: MAX_INFLATED_BYTES });
+    } catch (e) {
+      throw badRequest(e.code === 'ERR_BUFFER_TOO_LARGE' ? 'The uploaded file is too large' : 'The uploaded file is not a valid gzip archive');
+    }
+  }
+
+  const text = raw.toString('utf8')
+    .replace(/^﻿/, '')
+    .trim()
+    .replace(/^(?:(?:const|let|var)\s+D|window\.D)\s*=\s*/, '')
+    .replace(/;\s*$/, '');
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw badRequest('This is not a dashboard data file. Upload the data.js written by update_dashboard.bat.');
+  }
+  if (!isPlainObject(data)) throw badRequest('This is not a dashboard data file. Upload the data.js written by update_dashboard.bat.');
+
+  const problems = Object.entries(SHAPE)
+    .filter(([key, check]) => !check(data[key]))
+    .map(([key]) => key);
+  if (problems.length) {
+    throw badRequest(`The data file is missing or has invalid: ${problems.join(', ')}`);
+  }
+  if (data.dates.length === 0 || !data.dates.every((d) => typeof d === 'string' && DATE_RE.test(d))) {
+    throw badRequest('The data file has no valid dates (expected YYYY-MM-DD)');
+  }
+  if (!data.months.every((m) => typeof m === 'string' && MONTH_RE.test(m))) {
+    throw badRequest('The data file has invalid months (expected YYYY-MM)');
+  }
+  if (Object.keys(data.employees).length === 0) throw badRequest('The data file has no employees');
+
+  return {
+    data,
+    summary: {
+      dateFrom: data.dates[0],
+      dateTo: data.dates[data.dates.length - 1],
+      employeeCount: Object.keys(data.employees).length,
+      spocCount: data.primarySpocs.length,
+    },
+  };
+}
+
+// JSON that is safe to place verbatim inside a <script> element.
+function toScriptSafeJson(data) {
+  return JSON.stringify(data).replace(/</g, '\\u003c');
+}
+
+// ─── storage (S3, or a private local directory when S3 is off) ──────────
+
+async function writeObject(name, buffer, contentType) {
+  if (s3.isEnabled()) {
+    await s3.putAtKey({ key: `${S3_PREFIX}/${name}`, buffer, contentType });
+    return;
+  }
+  const dir = localDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const target = path.join(dir, name);
+  const tmp = `${target}.tmp`;
+  fs.writeFileSync(tmp, buffer);
+  fs.renameSync(tmp, target);
+}
+
+async function readObject(name) {
+  if (s3.isEnabled()) return s3.getObjectBuffer(`${S3_PREFIX}/${name}`);
+  try {
+    return fs.readFileSync(path.join(localDir(), name));
+  } catch (e) {
+    if (e.code === 'ENOENT') return null;
+    throw e;
+  }
+}
+
+// ─── public API ─────────────────────────────────────────────────────────
+
+async function saveSnapshot({ buffer, originalName, user }) {
+  const { data, summary } = parseDashboardData(buffer);
+  const json = toScriptSafeJson(data);
+
+  if (!s3.isEnabled()) {
+    logger.warn('Employee Performance snapshot stored on local disk (S3 disabled) — it will not survive a redeploy', { dir: localDir() });
+  }
+
+  await writeObject(DATA_NAME, zlib.gzipSync(json), 'application/gzip');
+
+  const meta = {
+    ...summary,
+    uploadedAt: new Date().toISOString(),
+    uploadedBy: { userId: user?.user_id ?? null, name: user?.user_name || null },
+    originalName: originalName ? String(originalName).slice(0, 200) : null,
+    sizeBytes: Buffer.byteLength(json),
+  };
+  await writeObject(META_NAME, Buffer.from(JSON.stringify(meta)), 'application/json');
+  return meta;
+}
+
+async function getMeta() {
+  const buf = await readObject(META_NAME);
+  return buf ? JSON.parse(buf.toString('utf8')) : null;
+}
+
+let templateCache = null;
+function dashboardTemplate() {
+  if (templateCache) return templateCache;
+  const html = fs.readFileSync(TEMPLATE_PATH, 'utf8');
+  if (!html.includes(DATA_HOOK)) {
+    throw new Error(`Employee Performance template has no ${DATA_HOOK} line to inject data into`);
+  }
+  templateCache = html;
+  return html;
+}
+
+// Template with the stored data inlined, or null when nothing is uploaded.
+async function getDashboardHtml() {
+  const gz = await readObject(DATA_NAME);
+  if (!gz) return null;
+  const json = zlib.gunzipSync(gz).toString('utf8');
+  // Function replacer: a string replacement would expand `$&`-style patterns
+  // occurring inside the data.
+  return dashboardTemplate().replace(DATA_HOOK, () => `<script>const D=${json};</script>`);
+}
+
+module.exports = {
+  parseDashboardData,
+  saveSnapshot,
+  getMeta,
+  getDashboardHtml,
+  _internals: { toScriptSafeJson, dashboardTemplate, DATA_HOOK },
+};
