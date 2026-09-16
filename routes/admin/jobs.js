@@ -1589,7 +1589,16 @@ router.get('/action-reasons', async (req, res, next) => {
   try {
     const type = String(req.query.type || '').trim().toLowerCase();
     logger.info('Fetch action reasons · type=' + (type || '-') + ' dueTo=' + (req.query.dueTo || '-'));
-    if (!type) return modernError(res, 400, 'type is required (unreachable|enquiry)');
+    /*
+     * The accepted modes are LISTED FROM THE MAP, not typed out. The literal
+     * read "(unreachable|enquiry)" and was already one mode short the moment
+     * `reschedule` was registered — an error message that names a smaller set
+     * than the code accepts sends the caller looking for an endpoint that is
+     * right in front of them.
+     */
+    if (!type) {
+      return modernError(res, 400, 'type is required (' + Object.keys(ACTION_TYPE_BY_MODE).join('|') + ')');
+    }
     // Strip whitespace/underscores/dashes so 'un_reachable' / 'un-reachable' /
     // 'unreachable' / 'Un Reachable' all map to the same bucket.
     const modeKey = type.replace(/[\s_-]/g, '');
@@ -1625,6 +1634,13 @@ router.get('/action-reasons', async (req, res, next) => {
  * UNLIKE /action-reasons this deliberately does NOT filter by user_type — the
  * Reschedule dialog has a single reason dropdown (no "due to" Customer/Client/
  * EasyFix/Technician radio), so ALL active action_type=8 reasons are offered.
+ *
+ * ⚠ THE DUE-TO-FILTERED ANSWER NOW EXISTS, and it is not this endpoint.
+ * `reschedule` was registered in ACTION_TYPE_BY_MODE (2026-09-16), so
+ *     GET /action-reasons?type=reschedule&dueTo=<customer|client|easyfix|technician>
+ * returns the same bucket narrowed to one party. A dialog that grows the radio
+ * should move to that call; this one stays exactly as it is for the dialog that
+ * has not, because narrowing it in place would silently shrink a live list.
  *
  * Literal-segment route — declared before the `/:id` wildcard (same reason as
  * /action-reasons above, so Express doesn't try to parse "reschedule-reasons"

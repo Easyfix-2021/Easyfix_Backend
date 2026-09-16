@@ -1738,6 +1738,16 @@ function buildJobHeader(job, {
    */
   projectManagerName = null,
   zonalManagerName = null,
+  /*
+   * The timeline's resolved actors, from jobService.getJobTimelineActors — two
+   * tbl_user ids turned into names, plus the acceptance that lives on
+   * tbl_job_offer rather than on tbl_job. Options for the same reason as the
+   * managers above: none of the four is a column on the row handed in here.
+   */
+  firstScheduledByName = null,
+  checkinByName = null,
+  acceptedDateTime = null,
+  acceptedEfrName = null,
   // Only the ranked path knows whether the job is already assigned; the search
   // header has no such concept, so it keeps A's "not assigned" value rather
   // than inventing one from fk_easyfixter_id (a different question).
@@ -1801,6 +1811,27 @@ function buildJobHeader(job, {
     job_desc:          job.job_desc         ?? null,
     paid_by:           job.paid_by          ?? null,
     paid_by_label:     paidByLabel(job.paid_by),
+    /*
+     * THE EFFECTIVE PAYMENT ANSWER, and the reason it is a fourth field rather
+     * than a correction to `payment_mode`.
+     *
+     * payment_mode / paid_by_label read paid_by ALONE, so they say "Not Set" on
+     * a job whose collected_by is 1 — and this very request treats that job as
+     * customer-paid: customerPays() is `paid_by = 2 OR collected_by = 1`, and it
+     * is what gates the COD balance filter on the candidate list below. So the
+     * panel could print "Not Set" beside a technician list that had just been
+     * narrowed to people carrying enough cash. On QA only 3,449 of the 82,371
+     * collected_by = 1 jobs also carry paid_by = 2, so that is the common case,
+     * not the corner.
+     *
+     * customerPays() itself — never a second reading of the two columns, which
+     * is exactly how the label and the gate came apart in the first place.
+     *
+     * ADDITIVE: payment_mode, paid_by, paid_by_label and collected_by all keep
+     * their current values. The CRM decides which to render; anything already
+     * reading the old three is untouched.
+     */
+    payment_label:     customerPays(job) ? 'Paid By Customer' : paidByLabel(job.paid_by),
     assigned_efr_id:   assignedEfrId,
     // Schedule & Assign Job Details fields.
     client_spoc:       job.client_spoc      ?? null,
@@ -1836,6 +1867,29 @@ function buildJobHeader(job, {
     // source has to be the one the list's PM / ZM filters compare against.
     project_manager_name: projectManagerName,
     zonal_manager_name:   zonalManagerName,
+    /*
+     * ─── THE JOB'S TIMELINE ───────────────────────────────────────────────
+     *
+     * Four instants and three actors, in the order they happen: raised →
+     * first scheduled → accepted → checked in. Ops reconstruct a job's history
+     * from these, and until now the console showed only the appointment — the
+     * one date that MOVES — with nothing to say when the ticket was raised or
+     * who has touched it since.
+     *
+     * The DATES are plain tbl_job columns, already in getByIdCore's `j.*`, so
+     * they are copied through like every other column above. The NAMES are not:
+     * two are user ids and the acceptance is not on tbl_job at all. They arrive
+     * as options from getJobTimelineActors — see that function for each one's
+     * source, the fk_checkin_by-is-a-user-id trap, and why the accepted pair is
+     * null on essentially every job this console opens.
+     */
+    ticket_created_date_time:      job.ticket_created_date_time      ?? null,
+    original_scheduling_date_time: job.original_scheduling_date_time ?? null,
+    first_scheduled_by_name:       firstScheduledByName,
+    accepted_date_time:            acceptedDateTime,
+    accepted_efr_name:             acceptedEfrName,
+    checkin_date_time:             job.checkin_date_time             ?? null,
+    checkin_by_name:               checkinByName,
   };
 }
 
@@ -1905,15 +1959,22 @@ async function rankCandidatesForJob(jobId, {
   }
 
   /*
-   * Required deep skill(s) per service, in ONE batched query for the whole job
-   * (never per-service; empty Map when the job carries no services), and the
-   * job's inherited Project / Zonal manager names. Independent of each other, so
-   * they go out together — this is the header's own fixed cost on every
-   * modal-open and there is no reason to pay it serially.
+   * The header's three independent lookups, issued together: the deep skill(s)
+   * per service (ONE batched query for the whole job, never per-service; empty
+   * Map when the job carries no services), the inherited Project / Zonal manager
+   * names, and the timeline's actors. None of them feeds another, and this is
+   * fixed cost on every modal-open — there is no reason to pay it serially.
    */
-  const [jobSkillsByService, { projectManagerName, zonalManagerName }] = await Promise.all([
+  const [
+    jobSkillsByService,
+    { projectManagerName, zonalManagerName },
+    { firstScheduledByName, checkinByName, acceptedDateTime, acceptedEfrName },
+  ] = await Promise.all([
     loadJobSkillMatrix(job),
     jobService.getJobManagerNames({ clientId: job.fk_client_id, cityId: job.city_id }),
+    jobService.getJobTimelineActors({
+      jobId: job.job_id, firstScheduledBy: job.first_scheduled_by, checkinBy: job.fk_checkin_by,
+    }),
   ]);
 
   // Pre-build the enriched job payload used in ALL return paths (early-exit
@@ -1921,6 +1982,7 @@ async function rankCandidatesForJob(jobId, {
   const enrichedJob = buildJobHeader(job, {
     serviceCatgName, serviceTypeName, deepSkillLabel, jobSkillsByService, assignedEfrId,
     projectManagerName, zonalManagerName,
+    firstScheduledByName, checkinByName, acceptedDateTime, acceptedEfrName,
   });
 
   // COD = the customer pays the tech on-site (customerPays). Such techs
@@ -2627,15 +2689,23 @@ async function searchJobHeader(job) {
     serviceCatgName = labels?.catg_name ?? null;
   }
   const deepSkillLabel = [serviceCatgName, serviceTypeName].filter(Boolean).join(' › ') || null;
-  // Same single batched Job Skill Matrix lookup, and the same manager-name
-  // resolver, the ranked header does — in parallel, for the same reason.
-  const [jobSkillsByService, { projectManagerName, zonalManagerName }] = await Promise.all([
+  // The same three lookups the ranked header does, through the same resolvers
+  // and in parallel for the same reason.
+  const [
+    jobSkillsByService,
+    { projectManagerName, zonalManagerName },
+    { firstScheduledByName, checkinByName, acceptedDateTime, acceptedEfrName },
+  ] = await Promise.all([
     loadJobSkillMatrix(job),
     jobService.getJobManagerNames({ clientId: job.fk_client_id, cityId: job.city_id }),
+    jobService.getJobTimelineActors({
+      jobId: job.job_id, firstScheduledBy: job.first_scheduled_by, checkinBy: job.fk_checkin_by,
+    }),
   ]);
   return buildJobHeader(job, {
     serviceCatgName, serviceTypeName, deepSkillLabel, jobSkillsByService,
     projectManagerName, zonalManagerName,
+    firstScheduledByName, checkinByName, acceptedDateTime, acceptedEfrName,
   });
 }
 
