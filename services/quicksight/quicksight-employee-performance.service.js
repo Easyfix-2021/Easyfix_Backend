@@ -197,14 +197,38 @@ function dashboardTemplate() {
   return html;
 }
 
+/*
+ * The composed page is ~6.5 MB, which the browser needs seconds to parse and
+ * paint. The iframe's own `load` event fires BEFORE that paint, so the CRM
+ * cannot use it to know when to reveal the frame — it showed a blank white box
+ * instead. This script is the frame saying "I am drawn". Sandboxed frames have
+ * an opaque origin, so it posts to '*' and the CRM matches on the message value
+ * alone (revealing a frame is all the message can do).
+ *
+ * Two animation frames after load is the accurate "first paint has happened"
+ * signal, but requestAnimationFrame is SUSPENDED while the window is hidden —
+ * a background tab would then never reveal its frame, which is how this was
+ * first seen. The timer is therefore not a nicety: whichever fires first wins,
+ * and `sent` keeps it to one message.
+ */
+const READY_MESSAGE = 'ef-employee-performance-ready';
+const READY_SIGNAL = '<script>(function(){var sent=false;'
+  + `var send=function(){if(sent){return;}sent=true;try{parent.postMessage('${READY_MESSAGE}','*');}catch(e){}};`
+  + 'var after=function(){if(typeof requestAnimationFrame==="function"){'
+  + 'requestAnimationFrame(function(){requestAnimationFrame(send);});}setTimeout(send,150);};'
+  + 'if(document.readyState==="complete"){after();}else{window.addEventListener("load",after);}})();</script>';
+
 // Template with the stored data inlined, or null when nothing is uploaded.
 async function getDashboardHtml() {
   const gz = await readObject(DATA_NAME);
   if (!gz) return null;
   const json = zlib.gunzipSync(gz).toString('utf8');
-  // Function replacer: a string replacement would expand `$&`-style patterns
-  // occurring inside the data.
-  return dashboardTemplate().replace(DATA_HOOK, () => `<script>const D=${json};</script>`);
+  // Function replacers throughout: a string replacement would expand
+  // `$&`-style patterns occurring inside the data.
+  const html = dashboardTemplate().replace(DATA_HOOK, () => `<script>const D=${json};</script>`);
+  return html.includes('</body>')
+    ? html.replace('</body>', () => `${READY_SIGNAL}</body>`)
+    : html + READY_SIGNAL;
 }
 
 module.exports = {
@@ -212,5 +236,6 @@ module.exports = {
   saveSnapshot,
   getMeta,
   getDashboardHtml,
+  READY_MESSAGE,
   _internals: { toScriptSafeJson, dashboardTemplate, DATA_HOOK },
 };

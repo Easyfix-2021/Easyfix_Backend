@@ -116,3 +116,21 @@ test('round trip: upload → meta → page carries the same D, script-safe', asy
   assert.equal((html.match(/alert\(1\)<\/script>/g) || []).length, 0, 'data cannot close the script element');
   assert.deepEqual(extractD(html), hostile, 'D reaches the page unchanged');
 });
+
+test('the page signals the CRM when it is drawn, without depending on rAF', async () => {
+  /*
+   * The CRM keeps a "preparing" panel over the frame until this message
+   * arrives, because the iframe's own load event fires before the ~6.5 MB page
+   * has painted. requestAnimationFrame is SUSPENDED in a hidden window, so a
+   * signal built on it alone never fires in a background tab and the panel
+   * would sit there forever — which is exactly what happened in testing. The
+   * timer is the part that must survive.
+   */
+  const html = await service.getDashboardHtml();
+  const signal = html.slice(html.lastIndexOf('<script>'));
+  assert.match(signal, /setTimeout\(send,\s*\d+\)/, 'a timer path exists');
+  assert.match(signal, /requestAnimationFrame/, 'the accurate post-paint path exists too');
+  assert.match(signal, new RegExp(`postMessage\\('${service.READY_MESSAGE}'`), 'posts the agreed message');
+  assert.match(signal, /if\(sent\)\{return;\}/, 'the two paths cannot both post');
+  assert.ok(html.trimEnd().endsWith('</html>'), 'the signal sits inside the document');
+});
