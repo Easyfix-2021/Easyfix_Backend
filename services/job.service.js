@@ -3414,6 +3414,49 @@ async function getById(jobId) {
 }
 
 /*
+ * Resolve a reached-location selfie (tbl_job.tx_selfie_id → document.id) to
+ * `{ url, recordedAt }`, or null when there is no document row. `url` may still
+ * be null (key absent, no legacy url). `recordedAt` is document.created_on — the
+ * UPLOAD moment, an IST wall-clock string (pool dateStrings + '+05:30'), which
+ * the app shows under the thumbnail. ONE resolver for both readers: the CRM's
+ * GET /admin/jobs/:id/selfie-url and the technician's GET /mobile/jobs/:id,
+ * which shows the recorded selfie back on Start Work so it can be kept or
+ * retaken (2026-09-16).
+ *
+ * S3 key lives in `document.path`; presign on read. The existence CHECK is the
+ * fix (2026-09-09): presigning is a local signing operation that succeeds for a
+ * key that does not exist, so without the HEAD the "fall back to a legacy stored
+ * url" branch could never run and the caller got a URL that 404s. A HEAD that
+ * throws is treated as "unknown, keep the presign" rather than as absent, so an
+ * IAM or network fault degrades instead of hiding a selfie that is really there.
+ *
+ * Legacy rows store an absolute URL on the old file host — upgraded http →
+ * https, because an https page blocks an http image.
+ */
+async function resolveSelfie(selfieId, jobId) {
+  if (!selfieId) return null;
+  const s3Storage = require('../utils/s3-storage');
+  const [[doc]] = await pool.query('SELECT `path`, url, created_on FROM document WHERE id = ? LIMIT 1', [selfieId]);
+  if (!doc) return null;
+
+  const key = String(doc.path || '').trim();
+  let url = null;
+  if (key && s3Storage.isEnabled()) {
+    let present = true;
+    try { present = await s3Storage.exists(key); }
+    catch (e) { logger.warn('Selfie existence check failed, assuming present · jobId=' + jobId + ' · ' + e.message); }
+    if (present) {
+      try { url = await s3Storage.getPresignedUrl(key); }
+      catch (e) { logger.warn('Selfie presign failed · jobId=' + jobId + ' · ' + e.message); }
+    } else {
+      logger.info('Selfie key absent in S3, falling back to the stored url · jobId=' + jobId);
+    }
+  }
+  if (!url && doc.url) url = String(doc.url).replace(/^http:\/\//i, 'https://');
+  return { url, recordedAt: doc.created_on || null };
+}
+
+/*
  * Lightweight existence + status check. Used by setStatus / assign before they
  * mutate — skipping the 7-way join saves ~150-300ms per status change and
  * avoids loading services+images we don't use in those paths.
@@ -7599,7 +7642,7 @@ module.exports = {
   // tbl_job.client_services CSV in sync after the customer's self-submit
   // mutates tbl_job_services. Single source of truth, one helper.
   recomputeClientServicesCsv,
-  list, getById, getByIdCore, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, reschedule, unassign, acceptOffer, changeOwner,
+  list, getById, getByIdCore, resolveSelfie, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, reschedule, unassign, acceptOffer, changeOwner,
   hasAfterWorkPhoto, afterPhotoRequiredError,
   // Technician app requests. rejectAppRequest is the Reject button; there is no
   // approve twin because Approve is the ordinary cancel/reschedule, and

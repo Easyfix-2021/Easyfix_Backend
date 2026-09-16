@@ -556,6 +556,27 @@ router.get('/jobs/:id', async (req, res, next) => {
      * and the checkout guess cap guarded nothing. The app never reads it.
      */
     delete job.otp;
+    /*
+     * The reached-location selfie, as a renderable URL (2026-09-16). The app had
+     * only `tx_selfie_id`, so Start Work could say "already recorded" but never
+     * show WHAT was recorded — and the technician could not judge whether to
+     * keep it or retake it. Presigned (5-min TTL), same as `images[].image_url`
+     * on this payload, so the device loads it without a bearer. Only jobs that
+     * HAVE a selfie pay the lookup.
+     *
+     * OWNER ONLY. canView above also admits a technician holding an open OFFER
+     * or a PENDING delegation, and tx_selfie_id survives an unassign — so a
+     * re-offered job would otherwise show the previous technician's face to
+     * every technician it is offered to. (An ACCEPTED delegate passes: the lock
+     * middleware has rewritten efr_id to the owner's, and they are doing the work.)
+     */
+    const selfie = job.tx_selfie_id && job.fk_easyfixter_id === req.tech.efr_id
+      ? await jobService.resolveSelfie(job.tx_selfie_id, job.job_id)
+      : null;
+    job.selfie_url = selfie?.url ?? null;
+    // When it was recorded (document.created_on, IST wall clock), so a stale
+    // selfie from an earlier visit is distinguishable from today's. Same owner rule.
+    job.selfie_recorded_at = selfie?.recordedAt ?? null;
     modernOk(res, stripCustomerMobiles(job));
   } catch (e) { next(e); }
 });
