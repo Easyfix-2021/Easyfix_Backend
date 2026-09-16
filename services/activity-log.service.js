@@ -59,7 +59,7 @@ async function appendEvent(payload) {
         efr_id, mobile, supply_request_id, event_type, category, section,
         from_stage, to_stage, source, actor_type, actor_user_id, actor_name,
         summary, metadata, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         efr_id || null,
         mobile || null,
@@ -75,6 +75,7 @@ async function appendEvent(payload) {
         actor_name || null,
         summary || null,
         metadata ? JSON.stringify(metadata) : null,
+        new Date(),
       ],
     );
 
