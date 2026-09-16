@@ -59,7 +59,8 @@ const { stageVisibleStatuses } = require('../lib/job-stages');
  * the sheet differently from the screen. job.service does NOT require this
  * module, so there is no cycle; routes/admin/jobs.js already loads both.
  */
-const { hasClientVerticalIdColumn, jobIdOrRefPredicate, MOBILE_MIN_DIGITS } = require('./job.service');
+const {
+  hasClientVerticalIdColumn, jobIdOrRefPredicate, ptsStateSql, istDayBounds, MOBILE_MIN_DIGITS } = require('./job.service');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Column spec
@@ -669,6 +670,15 @@ const FILTER_COVERAGE = Object.freeze({
    * rather than imported, deliberately; see the note there.
    */
   appRequest:       ['filter',   'J.job_status = 1 + (is_cancelled_by_app OR is_rescheduled_by_app), per value'],
+  /*
+   * SUPPORTED, and through list()'s OWN fragment rather than a re-typed copy.
+   * ptsStateSql is plain columns on tbl_job — job_status, the two app-request
+   * flags, requested_date_time — with no correlated subquery, so binding it to
+   * this module's `J` alias is exactly as safe as appRequest's hand-written
+   * version above, and sharing it means the sheet exported from the "Today"
+   * tab contains today's jobs by the SAME IST boundaries the tab used.
+   */
+  ptsState:         ['filter',   'list()s ptsStateSql bound to alias J — status 1 + app-request flags + IST day bounds'],
   dateType:         ['modifier', 'picks the column startDate/endDate apply to'],
   /*
    * list() accepts isEscalated and deliberately emits NO clause (the flag is
@@ -826,7 +836,7 @@ function buildClauses(filters = {}) {
     // ── CRM UI / listQuery vocabulary (see FILTER_COVERAGE) ─────────────────
     q, statuses, assigned, noServices, jobIds, jobIdOrRef, clientId, projectManagerId, zonalManagerId,
     customerId, customerQ, clientRef, efrMobile, pin, categoryId, verticalId,
-    sourceType, reopen, dueTo, startDate, endDate, quotationStatus, requestedBefore, appRequest,
+    sourceType, reopen, dueTo, startDate, endDate, quotationStatus, requestedBefore, appRequest, ptsState,
     // ── RBAC, attached by the route ─────────────────────────────────────────
     scope, allowedStages,
     /*
@@ -1206,6 +1216,19 @@ function buildClauses(filters = {}) {
     clauses.push(appRequest === 'cancel' ? cancel
       : appRequest === 'reschedule' ? resched
         : `(${cancel} OR ${resched})`);
+    statusPinned = true;
+  }
+
+  /*
+   * Pending-to-Start tabs — list()'s ptsStateSql, bound to `J`. The fragment
+   * pins job_status = 1 itself, so this counts as a status pin and the legacy
+   * "open jobs, last 6 months" default must not be layered on top of it.
+   * istDayBounds() is computed here, per export, from the same IST calendar
+   * list() reads, so an export taken from a tab matches that tab to the second.
+   */
+  const ptsFrag = ptsState ? ptsStateSql(ptsState, istDayBounds(), 'J') : null;
+  if (ptsFrag) {
+    push(ptsFrag.sql, ...ptsFrag.params);
     statusPinned = true;
   }
 

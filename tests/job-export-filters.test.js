@@ -509,6 +509,9 @@ const SAMPLE = {
   // that is what the CRM's Technician Requests section sends and the widest
   // of the three still has to emit a predicate.
   appRequest: 'any',
+  // Pending-to-Start tabs (2026-09-16). 'today' because it binds BOTH IST day
+  // bounds, so it is the widest of the five in parameters.
+  ptsState: 'today',
 };
 
 test('THE LEDGER IS DERIVED, NOT TYPED: every listQuery key is accounted for', () => {

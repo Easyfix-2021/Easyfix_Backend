@@ -13,7 +13,7 @@ const logger = require('../../logger');
 const {
   listQuery, createBody, updateBody, statusBody, assignBody, offerBody, ownerBody, rescheduleBody, idParam,
   appRequestRejectBody, candidatesQuery, candidatesSearchQuery, slotRecommendationsQuery,
-  pendingSchedulingCountsQuery,
+  pendingSchedulingCountsQuery, pendingStartCountsQuery,
 } = require('../../validators/job.validator');
 const { assertEntityInScope } = require('../../lib/scope');
 const requireStageForTransition = require('../../middleware/require-stage');
@@ -812,6 +812,46 @@ router.get('/pending-scheduling/counts', validate(pendingSchedulingCountsQuery, 
      * /counts and /attention-summary handlers.
      */
     const counts = await job.getPendingSchedulingCounts({
+      ...req.query,
+      scope: req.scope,
+      allowedStages: req.allowedStages,
+    });
+    modernOk(res, counts);
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/admin/jobs/pending-start/counts
+ *
+ * The six tab counts above My Orders → Pending to Start:
+ *
+ *   { all, cancel, reschedule, missed, today, future }   all = sum of the five
+ *
+ * Each key (bar `all`) IS a `ptsState` value the list endpoint takes, so each
+ * tab is one query-string change on the grid beneath it, and the five partition
+ * status-1 jobs — every accepted job is counted in exactly one tab, in the
+ * priority order cancel → reschedule → missed → today → future. Day boundaries
+ * are IST, computed server-side. See ptsStateSql in services/job.service.js for
+ * the predicates, and why a job with no appointment counts as `missed`.
+ *
+ * Accepts the grid's filters — q, categoryId, cityId, clientId, zonalManagerId,
+ * ownerId — validated by schemas extracted from listQuery; NOT ptsState, which
+ * the schema strips. Status 1, RBAC scope and Job Stage Access are applied by
+ * the service through job.list()'s own WHERE, and the counts are ONE GROUP BY
+ * whose CASE arms are the ptsState filter fragments, so a tab's number and the
+ * rows that tab lists are the same SQL.
+ *
+ * Two static segments, mounted beside /counts and /pending-scheduling/counts,
+ * above the bare `/:id` route.
+ */
+router.get('/pending-start/counts', validate(pendingStartCountsQuery, 'query'), async (req, res, next) => {
+  try {
+    logger.info('Fetch pending-to-start tab counts · clientId=' + (req.query.clientId ?? '-')
+      + ' cityId=' + (req.query.cityId ?? '-') + ' ownerId=' + (req.query.ownerId ?? '-')
+      + ' q=' + (req.query.q ? 'yes' : '-'));
+    // req.scope: the hierarchy-unioned scope routes/admin/index.js built for
+    // THIS request — the same source the pending-scheduling strip reads.
+    const counts = await job.getPendingStartCounts({
       ...req.query,
       scope: req.scope,
       allowedStages: req.allowedStages,
