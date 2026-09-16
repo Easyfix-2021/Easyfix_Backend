@@ -1497,6 +1497,32 @@ async function customerRequestTableExists() {
 }
 
 /*
+ * Same try-the-query probe for tbl_job_customer_request.preferred_slot
+ * (migration 2026-09-16-customer-request-preferred-slot.sql). The customer
+ * reschedule writer and the three request readers name the column only when
+ * this says it exists, so shipping the code before the migration runs cannot
+ * 500 the reschedule form or the Unconfirmed list. An absent answer is cached
+ * for the process — the next deploy (restart) picks the column up.
+ */
+let _hasPreferredSlotColumn = null;
+async function customerRequestSlotColumnExists() {
+  if (_hasPreferredSlotColumn !== null) return _hasPreferredSlotColumn;
+  try {
+    await pool.query('SELECT preferred_slot FROM tbl_job_customer_request LIMIT 0');
+    _hasPreferredSlotColumn = true;
+  } catch (e) {
+    if (isAbsentAnswer(e)) {
+      _hasPreferredSlotColumn = false;
+      return _hasPreferredSlotColumn;
+    }
+    logger.warn('schema probe failed · _hasPreferredSlotColumn · ' + e.message
+      + ' — treating as absent for this call only');
+    return false;
+  }
+  return _hasPreferredSlotColumn;
+}
+
+/*
  * Mark a job's PENDING customer requests as 'actioned' — called when Ops takes a
  * deliberate action on the job (confirm/cancel/enquiry via setStatus, assign,
  * offer, reschedule). Scenario: a customer submits a cancel request, then phones
@@ -1731,17 +1757,26 @@ async function delegationColsExist() {
  * j.requested_date_time (the current/live appointment) — a reschedule
  * REQUEST does not move the live appointment until Ops actions it, so the
  * UI must surface the requested date separately or the row looks stale.
- * All three subqueries share the same ORDER BY created_at DESC LIMIT 1, so
+ * `pending_request_preferred_slot` is that request's band label (NULL before
+ * the preferred_slot migration, and on rows written before it).
+ * All the subqueries share the same ORDER BY created_at DESC LIMIT 1, so
  * they resolve to the same latest-pending row.
  */
-function pendingRequestColumns(tableExists) {
+function pendingRequestColumns(tableExists, slotColumnExists) {
   if (!tableExists) {
     return `,
   NULL AS pending_request_type,
   NULL AS pending_request_reason,
-  NULL AS pending_request_preferred_datetime`;
+  NULL AS pending_request_preferred_datetime,
+  NULL AS pending_request_preferred_slot`;
   }
+  const slotColumn = slotColumnExists
+    ? `(SELECT cr.preferred_slot FROM tbl_job_customer_request cr
+    WHERE cr.job_id = j.job_id AND cr.request_status = 'pending'
+    ORDER BY cr.created_at DESC LIMIT 1)`
+    : 'NULL';
   return `,
+  ${slotColumn} AS pending_request_preferred_slot,
   (SELECT cr.request_type FROM tbl_job_customer_request cr
     WHERE cr.job_id = j.job_id AND cr.request_status = 'pending'
     ORDER BY cr.created_at DESC LIMIT 1) AS pending_request_type,
@@ -2363,6 +2398,7 @@ async function list({
   // aliases when the table is absent). Keeps the unconfirmed list from 500ing
   // on un-migrated deploys. See pendingRequestColumns() above.
   const hasCustomerRequestTable = await customerRequestTableExists();
+  const hasPreferredSlotColumn = hasCustomerRequestTable && await customerRequestSlotColumnExists();
   // Probe ONCE for tbl_job_offer presence too, appending the offer projection
   // (is_offered / offered_efr_name, or NULL aliases). See offerColumns() above.
   const hasJobOffer = await jobOfferTableExists();
@@ -2406,7 +2442,7 @@ async function list({
     && isEscalated !== false && String(isEscalated) !== 'false' && String(isEscalated) !== '0';
   const wantsEscalation = wantsManage || filtersEscalated;
   const listColumns =
-    LIST_COLUMNS + pendingRequestColumns(hasCustomerRequestTable) + offerColumns(hasJobOffer, offerExpiry)
+    LIST_COLUMNS + pendingRequestColumns(hasCustomerRequestTable, hasPreferredSlotColumn) + offerColumns(hasJobOffer, offerExpiry)
     + magicLinkDeliveryColumns(hasMagicLinkDeliveryCols)
     // Job Age (ageDays + ageSecs) — unconditional; every column it touches is a
     // long-standing tbl_job column, so there is nothing to existence-probe.
@@ -7652,6 +7688,9 @@ async function notifyCustomerNotReachable(jobId) {
 }
 
 module.exports = {
+  // preferred_slot column probe — shared by the customer reschedule writer and
+  // the admin request readers (routes/public/job-completion.js, routes/admin/).
+  customerRequestSlotColumnExists,
   // Shared with services/job-export.service.js so the two q-clauses cannot
   // drift on what counts as a phone fragment. See the block at its definition.
   MOBILE_MIN_DIGITS,
