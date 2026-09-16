@@ -168,9 +168,9 @@ function recordClick(code, pool) {
     pool.query(
       `UPDATE tbl_url_shortener
           SET click_count     = click_count + 1,
-              last_clicked_at = NOW()
+              last_clicked_at = ?
         WHERE short_code = ?`,
-      [code],
+      [new Date(), code],
     ).catch((err) => {
       logger.debug({ code, err: err && err.message }, 'url-shortener: recordClick UPDATE failed (non-fatal)');
     });

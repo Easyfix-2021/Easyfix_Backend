@@ -187,13 +187,15 @@ async function computeRating(efrId) {
   // `created_date` — common gotcha across EasyFix tables. Window
   // matches candidate-ranking.service.js (90 days) for consistency
   // with the auto-allocation engine's rating computation.
+  // insert_date_time is written by the legacy feedback flow on the IST app
+  // clock, so the window binds an app Date rather than NOW().
   const [[row]] = await pool.query(
     `SELECT AVG(customer_rating) AS avgRating
        FROM tbl_easyfixer_rating_by_customer
       WHERE easyfixer_id = ?
         AND customer_rating IS NOT NULL
-        AND insert_date_time >= DATE_SUB(NOW(), INTERVAL ? DAY)`,
-    [efrId, RATING_WINDOW_DAYS],
+        AND insert_date_time >= DATE_SUB(?, INTERVAL ? DAY)`,
+    [efrId, new Date(), RATING_WINDOW_DAYS],
   );
   return Number(row?.avgRating ?? 0);
 }

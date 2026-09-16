@@ -103,12 +103,12 @@ router.post('/hangup', async (req, res) => {
       await pool.query(
         `UPDATE tbl_job_caller_info
             SET caller_status = ?,
-                end_time = NOW(),
+                end_time = ?,
                 duration = ?,
                 is_updated = 1,
                 unique_id = COALESCE(?, unique_id)
           WHERE job_caller_info = ?`,
-        [status, duration, req.body.CallUUID || null, claims.jci]
+        [status, new Date(), duration, req.body.CallUUID || null, claims.jci]
       );
     } catch (err) {
       logger.warn({ jci: claims.jci, err: err && err.message }, 'plivo hangup webhook: update failed');
@@ -145,10 +145,10 @@ router.post('/web-hangup', async (req, res) => {
     try {
       await pool.query(
         `UPDATE tbl_job_caller_info
-            SET caller_status = ?, end_time = NOW(), duration = ?, is_updated = 1
+            SET caller_status = ?, end_time = ?, duration = ?, is_updated = 1
           WHERE unique_id = ?
             AND caller_status NOT IN ('completed','busy','no_answer','failed','hungup')`,
-        [status, duration, callUuid]
+        [status, new Date(), duration, callUuid]
       );
     } catch (err) {
       logger.warn({ callUuid, err: err && err.message }, 'plivo web-hangup webhook: update failed');

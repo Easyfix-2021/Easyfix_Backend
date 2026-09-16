@@ -39,9 +39,6 @@ let updates = [];
 let updateAffected = 1;
 
 const fake = installFakePool([
-  [/SELECT property_key, property_value FROM easyfix_properties/i, () => ([
-    { property_key: 'job.share.delegate.efr_ids', property_value: '901, 903' },
-  ])],
   [/UPDATE tbl_job_share_link/i, (sql, params) => {
     updates.push({ sql: sql.replace(/\s+/g, ' ').trim(), params });
     return { affectedRows: updateAffected };
@@ -53,7 +50,6 @@ const fake = installFakePool([
 ]);
 
 const delegation = require('../services/job-share-delegation.service');
-const properties = require('../services/properties.service');
 const {
   requireTechJobMutationCapability,
 } = require('../middleware/require-tech-lifecycle-capability');
@@ -167,8 +163,12 @@ test('a legal transition writes a status pinned to the status it validated', asy
   await delegation.acceptShare(4321, 902);
   assert.equal(updates.length, 1);
   const [u] = updates;
-  assert.match(u.sql, /SET status = \?, responded_on = NOW\(\) WHERE share_id = \? AND status = \?/);
-  assert.deepEqual(u.params, ['accepted', 77, 'pending'],
+  assert.match(u.sql, /SET status = \?, responded_on = \? WHERE share_id = \? AND status = \?/);
+  assert.doesNotMatch(u.sql, /NOW\(\)/, 'responded_on is a bound Date, never SQL NOW()');
+  assert.equal(u.params.length, 4);
+  assert.equal(u.params[0], 'accepted');
+  assert.ok(u.params[1] instanceof Date, 'responded_on is bound as a Date');
+  assert.deepEqual([u.params[2], u.params[3]], [77, 'pending'],
     'the WHERE must pin the FROM status, or two devices can both win');
 });
 
@@ -188,25 +188,26 @@ test('only the named party may drive their own transition', async () => {
   assert.equal(updates.length, 0);
 });
 
-/* ─── The create gate ─────────────────────────────────────────────── */
+/* ─── No create gate ──────────────────────────────────────────────── */
 
-test('creating a share is fail-closed on the easyfix_properties allowlist', async () => {
-  properties.flushCache();
-  await properties.preload();                       // '901, 903'
-  assert.equal(delegation.canCreateShare(901), true);
-  assert.equal(delegation.canCreateShare(902), false, 'not on the list — denied');
-
+test('any technician may create a share — there is no allowlist', async () => {
   jobRow = { job_id: 4321, job_status: 1, fk_easyfixter_id: 902 };
-  await assert.rejects(
-    () => delegation.createShare(4321, 902, { delegateEfrId: 901 }),
-    (e) => e.status === 403 && e.details.code === 'share_not_enabled',
-  );
+  const from = fake.calls.length;
+  await delegation.createShare(4321, 902, { contactNumber: '9289333404', contactName: 'Jyoti' });
+  const calls = fake.calls.slice(from);
+  const insert = calls.find((c) => /INSERT INTO tbl_job_share_link/i.test(c.sql));
+  assert.ok(insert, 'the share row is written');
+  assert.doesNotMatch(insert.sql, /NOW\(\)/i, 'created_on is a bound Date, never SQL NOW() or the column DEFAULT');
+  assert.match(insert.sql, /\(job_id, fk_easyfixer_id, delegate_efr_id, contact_name, contact_number, status, created_on\)/i);
+  assert.equal(insert.params.length, 6);
+  assert.deepEqual(insert.params.slice(0, 5), [4321, 902, null, 'Jyoti', '9289333404']);
+  assert.ok(insert.params[5] instanceof Date, 'created_on is bound as a Date');
+  assert.ok(Math.abs(Date.now() - insert.params[5].getTime()) < 60000);
+  assert.equal(calls.some((c) => /easyfix_properties/i.test(c.sql)), false,
+    'createShare must not consult easyfix_properties');
 });
 
 test('a share needs a live job the sharer actually owns, and a real delegate', async () => {
-  properties.flushCache();
-  await properties.preload();
-
   jobRow = { job_id: 4321, job_status: 1, fk_easyfixter_id: 555 };
   await assert.rejects(() => delegation.createShare(4321, 901, { delegateEfrId: 902 }),
     (e) => e.status === 404, 'not his job — 404, never 403, so ids cannot be probed');
@@ -266,7 +267,10 @@ test('an accepted DELEGATE acts as the owner — and his first write closes the 
     'identity is substituted, so all 15 ownership checks pass unmodified');
   assert.equal(req.tech.actual_efr_id, 902, 'the real caller stays available');
   assert.equal(updates.length, 1, 'accepted → started on the first mutating touch');
-  assert.deepEqual(updates[0].params, ['started', 77, 'accepted']);
+  assert.equal(updates[0].params.length, 4);
+  assert.equal(updates[0].params[0], 'started');
+  assert.ok(updates[0].params[1] instanceof Date, 'started_on is bound as a Date, never SQL NOW()');
+  assert.deepEqual([updates[0].params[2], updates[0].params[3]], [77, 'accepted']);
 });
 
 test('a delegate GET substitutes identity but does NOT start the job', async () => {
@@ -381,4 +385,20 @@ test('the retired public share-link surface is gone, not merely unmounted', () =
     'the job_share token type must not survive its only consumer');
   assert.doesNotMatch(readSrc('routes/public/index.js'), /shared-job/);
   assert.doesNotMatch(readSrc('routes/mobile/index.js'), /share-link/);
+});
+
+/* ─── The TTL sweep's clock ───────────────────────────────────────── */
+
+test('expireStaleShares compares the stall window against a bound Date, never SQL NOW()', async () => {
+  const from = fake.calls.length;
+  await delegation.expireStaleShares({ hours: 6, limit: 50 });
+  const calls = fake.calls.slice(from);
+  const select = calls.find((c) => /status IN \('pending', 'accepted'\)/i.test(c.sql));
+  assert.ok(select, 'expected the stale-share SELECT to run');
+  assert.doesNotMatch(select.sql, /NOW\(\)/i, 'the stall window must not compare against SQL NOW()');
+  assert.match(select.sql, /COALESCE\(responded_on, created_on\) < DATE_SUB\(\?, INTERVAL \? HOUR\)/i);
+  assert.equal(select.params.length, 3);
+  assert.ok(select.params[0] instanceof Date, 'DATE_SUB compares against a bound Date');
+  assert.ok(Math.abs(Date.now() - select.params[0].getTime()) < 60000);
+  assert.deepEqual(select.params.slice(1), [6, 50]);
 });

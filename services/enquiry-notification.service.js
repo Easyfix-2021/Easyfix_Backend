@@ -109,7 +109,7 @@ async function loadEnquiryContext(jobId) {
         j.client_spoc,
         atr.action_desc AS enquiry_reason,
         DATE_FORMAT(j.ticket_created_date_time, '%d-%m-%Y %H:%i') AS ticket_created_fmt,
-        TIMESTAMPDIFF(DAY, j.ticket_created_date_time, COALESCE(j.enquiry_date_time, NOW())) AS age_days
+        TIMESTAMPDIFF(DAY, j.ticket_created_date_time, COALESCE(j.enquiry_date_time, ?)) AS age_days
        FROM tbl_job j
        LEFT JOIN tbl_client          cl  ON cl.client_id   = j.fk_client_id
        LEFT JOIN tbl_customer        cu  ON cu.customer_id = j.fk_customer_id
@@ -117,7 +117,9 @@ async function loadEnquiryContext(jobId) {
        LEFT JOIN action_taken_reason atr ON atr.id         = j.enquiry_reason_id
       WHERE j.job_id = ?
       LIMIT 1`,
-    [jobId],
+    // Clock rule: enquiry_date_time is bound as new Date() in job.service.js
+    // — bind the same instant here instead of reading SQL NOW().
+    [new Date(), jobId],
   );
   return row || null;
 }

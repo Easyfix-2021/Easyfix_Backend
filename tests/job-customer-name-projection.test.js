@@ -258,7 +258,13 @@ test('COUNT-JOIN PARITY: the override needs no new join — `j` is the base tabl
   // Exactly the four joins that were there before; none added.
   assert.equal((sql.match(/LEFT JOIN/g) || []).length, 4, 'no JOIN may be added or removed');
   assert.match(sql, /LEFT JOIN tbl_customer\s+cu\b/, 'the cu join the fallback needs already existed');
-  assert.deepEqual(contextQuery().params, [4242], 'job id stays a bound placeholder');
+  // Clock rule: enquiry_date_time's COALESCE fallback binds the app's current
+  // instant (see services/enquiry-notification.service.js) ahead of the job
+  // id in the params array, since it sits earlier in the SELECT list.
+  const params = contextQuery().params;
+  assert.equal(params.length, 2, 'job id stays a bound placeholder alongside the bound "now"');
+  assert.ok(params[0] instanceof Date, 'the age_days fallback binds an app Date, not SQL NOW()');
+  assert.equal(params[1], 4242);
 });
 
 test('the job name is read, never bound — no user input is concatenated', async () => {

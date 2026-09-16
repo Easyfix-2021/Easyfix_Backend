@@ -139,12 +139,13 @@ async function createRateCard({ rrc_service_name, rrc_servicetype_id, rrc_servic
   );
   if (dup) throw mkErr(409, `B2C rate card "${name}" already exists for this service type`);
 
+  const createNow = new Date();
   const [r] = await pool.query(
     `INSERT INTO tbl_retail_rate_card
        (rrc_servicetype_id, rrc_ratecard_name, rrc_ratecard_price,
         insert_date, update_date, updated_by)
-     VALUES (?, ?, ?, NOW(), NOW(), ?)`,
-    [Number(rrc_servicetype_id), name, Math.round(price), createdBy || null]
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [Number(rrc_servicetype_id), name, Math.round(price), createNow, createNow, createdBy || null]
   );
   logger.info('B2C rate card created · id=' + r.insertId);
   return getRateCardById(r.insertId);
@@ -192,8 +193,8 @@ async function updateRateCard(id, fields, updatedBy) {
   }
   if (!sets.length) throw mkErr(400, 'No mutable fields supplied');
 
-  sets.push('update_date = NOW()', 'updated_by = ?');
-  params.push(updatedBy || null, id);
+  sets.push('update_date = ?', 'updated_by = ?');
+  params.push(new Date(), updatedBy || null, id);
   await pool.query(`UPDATE tbl_retail_rate_card SET ${sets.join(', ')} WHERE rrc_id = ?`, params);
   logger.info('B2C rate card updated · id=' + id);
   return getRateCardById(id);

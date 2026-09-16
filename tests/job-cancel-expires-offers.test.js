@@ -94,11 +94,14 @@ test('cancelling a job expires its OPEN offers — scoped to this job, parameter
   const [upd] = upds;
 
   // job_id is BOUND, never concatenated (CLAUDE.md: parameterised SQL only).
-  assert.deepEqual(upd.params, [42]);
+  assert.equal(upd.params.length, 2);
+  assert.ok(upd.params[0] instanceof Date, 'responded_at is bound as a Date, never SQL NOW()');
+  assert.equal(upd.params[1], 42);
   assert.match(upd.sql, /WHERE job_id = \?/, 'the job id must be a bind parameter');
   assert.doesNotMatch(upd.sql, /job_id = 42/, 'the job id must never be interpolated');
   // responded_at is stamped, matching acceptOffer()/reschedule()'s expire shape.
-  assert.match(upd.sql, /responded_at = NOW\(\)/);
+  assert.match(upd.sql, /responded_at = \?/);
+  assert.doesNotMatch(upd.sql, /responded_at = NOW\(\)/);
 });
 
 test('the expire uses the OFFER_STATUS constants, not bare 0/3 literals', async () => {

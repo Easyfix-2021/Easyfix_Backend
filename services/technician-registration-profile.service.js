@@ -132,9 +132,9 @@ async function persistVerifiedProfile(efrId, fields = {}, database = pool) {
         linkedUserId = await createCanonicalTechnicianUser(identity.efr_no, conn);
         const [linked] = await conn.query(
           `UPDATE tbl_easyfixer
-              SET user_id = ?, update_date = NOW()
+              SET user_id = ?, update_date = ?
             WHERE efr_id = ? AND user_id <=> ?`,
-          [linkedUserId, id, identity.user_id ?? null],
+          [linkedUserId, new Date(), id, identity.user_id ?? null],
         );
         if (Number(linked.affectedRows) !== 1) {
           throw httpError(409, 'technician user profile changed during verification');
@@ -171,9 +171,9 @@ async function persistVerifiedProfile(efrId, fields = {}, database = pool) {
       await conn.query(
         `INSERT INTO tbl_easyfixer_registration_attribution
            (efr_id, referral_source, captured_at)
-         VALUES (?, ?, NOW())
+         VALUES (?, ?, ?)
          ON DUPLICATE KEY UPDATE referral_source = referral_source`,
-        [id, referralSource],
+        [id, referralSource, new Date()],
       );
     }
 

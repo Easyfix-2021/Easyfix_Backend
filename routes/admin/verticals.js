@@ -120,11 +120,12 @@ router.post('/', roleByName(['Admin']), validate(createBody), async (req, res, n
     );
     if (dup) throw mkErr(409, `Vertical "${name}" already exists`);
 
+    const now = new Date();
     const [r] = await pool.query(
       `INSERT INTO tbl_vertical
          (vertical_name, vertical_desc, inserted_on, inserted_by, updated_on, updated_by, status)
-       VALUES (?, ?, NOW(), ?, NOW(), ?, 1)`,
-      [name, desc, userId, userId]
+       VALUES (?, ?, ?, ?, ?, ?, 1)`,
+      [name, desc, now, userId, now, userId]
     );
     const created = await getById(r.insertId);
     logger.info('Vertical created · id=' + r.insertId);
@@ -167,7 +168,7 @@ router.patch('/:id', roleByName(['Admin']), validate(idParam, 'params'), validat
     }
     if (!sets.length) return modernError(res, 400, 'No mutable fields supplied');
 
-    sets.push('updated_on = NOW()');
+    sets.push('updated_on = ?'); params.push(new Date());
     sets.push('updated_by = ?'); params.push(userId);
 
     params.push(id);
@@ -188,8 +189,8 @@ router.delete('/:id', roleByName(['Admin']), validate(idParam, 'params'), async 
     logger.info('Deactivate vertical · id=' + id);
     const userId = req.user && req.user.user_id ? req.user.user_id : null;
     const [r] = await pool.query(
-      'UPDATE tbl_vertical SET status = 0, updated_on = NOW(), updated_by = ? WHERE vertical_id = ?',
-      [userId, id]
+      'UPDATE tbl_vertical SET status = 0, updated_on = ?, updated_by = ? WHERE vertical_id = ?',
+      [new Date(), userId, id]
     );
     if (r.affectedRows === 0) return modernError(res, 404, 'Vertical not found');
     logger.info('Vertical deleted · id=' + id);

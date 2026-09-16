@@ -268,16 +268,19 @@ async function chaseSummaryFor(efrIds = []) {
   if (!ids.length) return summary;
 
   try {
+    // Clock rule: created_at is bound as new Date() by recordChase() below,
+    // so this window binds the same instant rather than reading SQL NOW().
+    const now = new Date();
     const [rows] = await pool.query(
       `SELECT efr_id,
               MAX(created_at) AS last_chased_at,
-              SUM(created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)) AS count_7d,
+              SUM(created_at >= DATE_SUB(?, INTERVAL 7 DAY)) AS count_7d,
               SUBSTRING_INDEX(GROUP_CONCAT(channel ORDER BY created_at DESC), ',', 1) AS last_channel
          FROM lms_chase_log
         WHERE efr_id IN (${ids.map(() => '?').join(',')})
           AND outcome IN ('sent', 'noted', 'queued')
         GROUP BY efr_id`,
-      ids,
+      [now, ...ids],
     );
     for (const r of rows) {
       summary.set(Number(r.efr_id), {
@@ -315,8 +318,8 @@ async function withinCooldown(efrIds = [], channel) {
         WHERE efr_id IN (${ids.map(() => '?').join(',')})
           AND channel = ?
           AND outcome IN ('sent', 'noted', 'queued')
-          AND created_at >= DATE_SUB(NOW(), INTERVAL ? HOUR)`,
-      [...ids, channel, hours],
+          AND created_at >= DATE_SUB(?, INTERVAL ? HOUR)`,
+      [...ids, channel, new Date(), hours],
     );
     for (const r of rows) skip.add(Number(r.efr_id));
   } catch (err) {

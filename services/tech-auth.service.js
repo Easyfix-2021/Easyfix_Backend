@@ -157,7 +157,7 @@ async function findById(id) {
  *                   queries). FK target that mobile-registration.service.js
  *                   LEFT JOINs for the gate.
  *   tbl_easyfixer — efr_no = mobile, new_easy_fixer = 1, efr_status = 1,
- *                   insert/update_date = NOW(), user_id FK → the new tbl_user.
+ *                   insert/update_date = a bound Date, user_id FK → the new tbl_user.
  *                   is_technician_verified + the *_verified_by_crm flags are
  *                   left NULL (un-vetted lead — CRM stamps them later).
  *
@@ -229,11 +229,12 @@ async function createStubTechnician(mobile, pinnedRunner = null) {
       // defense-in-depth; the surrounding per-mobile named lock (OTP lock for
       // verify callers, stub lock for standalone callers) is the real guard. It
       // becomes active automatically if a UNIQUE index is ever added on efr_no.
+      const now = new Date();
       await conn.query(
         `INSERT INTO tbl_easyfixer (efr_no, new_easy_fixer, efr_status, user_id, insert_date, update_date)
-         VALUES (?, 1, 1, ?, NOW(), NOW())
+         VALUES (?, 1, 1, ?, ?, ?)
          ON DUPLICATE KEY UPDATE efr_id = efr_id`,
-        [mobile, userId]);
+        [mobile, userId, now, now]);
 
       await conn.commit();
       logger.info('Stub technician created · efr_id=' + (userId ? '(user_id=' + userId + ')' : '?'));
@@ -413,8 +414,8 @@ async function verifyLoginOtp(mobile, otp, { onVerifiedTech } = {}) {
     // the issue/verify named lock after this stale read.
     await pool.query(
       `UPDATE otp_details SET is_expired = 1
-        WHERE id = ? AND otp = ? AND is_expired = 0 AND valid_up_to < NOW()`,
-      [row.id, row.otp],
+        WHERE id = ? AND otp = ? AND is_expired = 0 AND valid_up_to < ?`,
+      [row.id, row.otp, new Date()],
     );
     logger.warn('OTP verify failed · reason=OTP_EXPIRED');
     return { ok: false, reason: 'OTP_EXPIRED' };
@@ -477,8 +478,8 @@ async function verifyLoginOtp(mobile, otp, { onVerifiedTech } = {}) {
           AND otp_type = 'Mobile App Otp'
           AND otp = ?
           AND is_expired = 0
-          AND valid_up_to >= NOW()`,
-      [current.id, mobile, current.otp],
+          AND valid_up_to >= ?`,
+      [current.id, mobile, current.otp, new Date()],
     );
     if (Number(consumed.affectedRows) !== 1) {
       return { ok: false, reason: 'OTP_ALREADY_USED' };

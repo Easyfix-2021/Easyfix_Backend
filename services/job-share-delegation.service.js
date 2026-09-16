@@ -36,7 +36,6 @@
 
 const { pool } = require('../db');
 const logger = require('../logger');
-const { getProperty } = require('./properties.service');
 
 /* Live = the original is locked out. Terminal = the job is his again (or the
  * delegate finished it). This list is the code half of the CASE expression in
@@ -79,11 +78,6 @@ const NON_SHAREABLE_JOB_STATUSES = new Set([
 /* Default time a share may sit unstarted before the sweep takes it back. */
 const DEFAULT_TTL_HOURS = 24;
 
-/* easyfix_properties key holding the CSV of efr_ids allowed to CREATE a share.
- * Empty / missing → nobody (fail CLOSED), same contract as every other
- * property allowlist in this backend. `*` opens it to all technicians. */
-const CREATE_GATE_PROPERTY = 'job.share.delegate.efr_ids';
-
 function err(status, message, details) {
   const e = new Error(message);
   e.status = status;
@@ -97,19 +91,6 @@ function ttlHours() {
   const raw = Number(process.env.JOB_SHARE_TTL_HOURS);
   if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_TTL_HOURS;
   return Math.min(raw, 24 * 30);
-}
-
-/*
- * May THIS technician create a share? CSV of efr_ids in easyfix_properties,
- * deny-all when unset. Reuses the same trim/split/lowercase parse the email
- * allowlists use rather than inventing a second CSV dialect — ids are digits,
- * so lowercasing is a no-op on them.
- */
-function canCreateShare(efrId) {
-  const raw = String(getProperty(CREATE_GATE_PROPERTY) ?? '').trim();
-  if (!raw) return false;
-  const allowed = new Set(raw.split(',').map((s) => s.trim()).filter(Boolean));
-  return allowed.has('*') || allowed.has(String(efrId));
 }
 
 /* One projection for every read, so the API shape can never depend on which
@@ -200,9 +181,10 @@ async function applyTransition(share, to, { endReason = null, runner = pool } = 
 
   const sets = ['status = ?'];
   const params = [to];
-  if (to === 'accepted' || to === 'rejected') sets.push('responded_on = NOW()');
-  if (to === 'started') sets.push('started_on = NOW()');
-  if (TERMINAL_STATUSES.includes(to)) sets.push('ended_on = NOW()');
+  const now = new Date();
+  if (to === 'accepted' || to === 'rejected') { sets.push('responded_on = ?'); params.push(now); }
+  if (to === 'started') { sets.push('started_on = ?'); params.push(now); }
+  if (TERMINAL_STATUSES.includes(to)) { sets.push('ended_on = ?'); params.push(now); }
   if (endReason != null) { sets.push('end_reason = ?'); params.push(String(endReason).slice(0, 32)); }
   params.push(share.share_id, from);
 
@@ -222,16 +204,14 @@ async function applyTransition(share, to, { endReason = null, runner = pool } = 
 /* ─── Create ──────────────────────────────────────────────────────── */
 
 /*
- * The sharer must own a LIVE job and be on the allowlist. A delegate technician
- * must exist, be active, and not be the sharer himself.
+ * The sharer must own a LIVE job. Any technician may share — there is no
+ * allowlist. A delegate technician must exist, be active, and not be the
+ * sharer himself.
  *
  * 404 (not 403) when the job is not his: an ownership failure must not confirm
  * that a job id exists, matching every other /mobile/jobs ownership check.
  */
 async function createShare(jobId, sharerEfrId, { delegateEfrId = null, contactName = null, contactNumber = null } = {}) {
-  if (!canCreateShare(sharerEfrId)) {
-    throw err(403, 'Sharing a job is not enabled for your account yet.', { code: 'share_not_enabled' });
-  }
   if (delegateEfrId == null && !contactNumber) {
     throw err(400, 'Choose a technician or enter a contact number.', { code: 'share_no_delegate' });
   }
@@ -273,12 +253,13 @@ async function createShare(jobId, sharerEfrId, { delegateEfrId = null, contactNa
   try {
     const [res] = await pool.query(
       `INSERT INTO tbl_job_share_link
-         (job_id, fk_easyfixer_id, delegate_efr_id, contact_name, contact_number, status)
-       VALUES (?, ?, ?, ?, ?, 'pending')`,
+         (job_id, fk_easyfixer_id, delegate_efr_id, contact_name, contact_number, status, created_on)
+       VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
       [
         jobId, sharerEfrId, delegateEfrId,
         contactName ? String(contactName).slice(0, 150) : null,
         contactNumber ? String(contactNumber).slice(0, 15) : null,
+        new Date(),
       ],
     );
     logger.info(`Job share created · jobId=${jobId} · by=${sharerEfrId} · delegate=${delegateEfrId || contactNumber}`);
@@ -405,14 +386,15 @@ async function resolveLock(jobId, efrId) {
  */
 async function expireStaleShares({ hours = ttlHours(), limit = 200 } = {}) {
   try {
+    const now = new Date();
     const [rows] = await pool.query(
       `SELECT share_id, job_id, status
          FROM tbl_job_share_link
         WHERE status IN ('pending', 'accepted')
-          AND COALESCE(responded_on, created_on) < DATE_SUB(NOW(), INTERVAL ? HOUR)
+          AND COALESCE(responded_on, created_on) < DATE_SUB(?, INTERVAL ? HOUR)
         ORDER BY share_id ASC
         LIMIT ?`,
-      [hours, limit],
+      [now, hours, limit],
     );
     let expired = 0;
     for (const row of rows) {
@@ -438,8 +420,6 @@ module.exports = {
   LIVE_STATUSES,
   TERMINAL_STATUSES,
   TRANSITIONS,
-  CREATE_GATE_PROPERTY,
-  canCreateShare,
   toShareJson,
   findLiveShare,
   createShare,

@@ -94,6 +94,7 @@ function mapKnownError(res, next, e) {
 async function dailyBridgeCapReached(jobId, { max = MAX_BRIDGE_CALLS_PER_JOB_PER_DAY, context = 'public-call' } = {}) {
   try {
     const [[{ cnt }]] = await pool.query(
+      // eslint-disable-next-line no-restricted-syntax -- tbl_job_caller_info.inserted_time is only ever written by its DEFAULT CURRENT_TIMESTAMP (DB clock)
       `SELECT COUNT(*) AS cnt
          FROM tbl_job_caller_info
         WHERE job_id = ?

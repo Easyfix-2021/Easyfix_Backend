@@ -388,6 +388,34 @@ export default [
     rules: { 'no-console': 'off' },
   },
 
+  // ── SQL clock functions (2026-09-16) ────────────────────────────────────
+  // Every timestamp this backend writes is a bound JS Date: the pool's
+  // `timezone: '+05:30'` serialises it as the IST wall clock on any host.
+  // NOW() / CURDATE() read the DB SESSION zone (SYSTEM), which is IST only
+  // because the host happens to be. A comparison must use the clock the column
+  // was written in, so SQL clock functions in runtime code are a latent
+  // off-by-5.5h the day the DB zone changes — bind `new Date()` instead
+  // (`NOW()` → `?`, `CURDATE()` → `DATE(?)`).
+  // Escape hatch, one line with a reason, for the two legitimate shapes:
+  // reading the DB clock ON PURPOSE (/api/health/db), or comparing a column
+  // that only a DB DEFAULT CURRENT_TIMESTAMP ever writes.
+  {
+    files: ['routes/**/*.js', 'services/**/*.js', 'middleware/**/*.js', 'lib/**/*.js',
+      'utils/**/*.js', 'workers/**/*.js', 'server/**/*.js', 'shared/**/*.js', 'db.js', 'server.js'],
+    rules: {
+      'no-restricted-syntax': ['error',
+        {
+          selector: 'Literal[value=/(^|[^.\\w])(NOW|CURDATE|CURTIME|SYSDATE|UTC_TIMESTAMP|LOCALTIMESTAMP|UNIX_TIMESTAMP|CURRENT_TIMESTAMP|CURRENT_DATE)\\s*\\(/i]',
+          message: 'SQL clock function: bind a JS Date instead (the pool stores it as IST). See eslint.config.mjs "SQL clock functions".',
+        },
+        {
+          selector: 'TemplateElement[value.raw=/(^|[^.\\w])(NOW|CURDATE|CURTIME|SYSDATE|UTC_TIMESTAMP|LOCALTIMESTAMP|UNIX_TIMESTAMP|CURRENT_TIMESTAMP|CURRENT_DATE)\\s*\\(/i]',
+          message: 'SQL clock function: bind a JS Date instead (the pool stores it as IST). See eslint.config.mjs "SQL clock functions".',
+        },
+      ],
+    },
+  },
+
   // ── Tests ────────────────────────────────────────────────────────────────
   // node:test's describe/it/before/after are IMPORTED here, not injected as
   // globals (`node --test` does not create them), so no extra globals are

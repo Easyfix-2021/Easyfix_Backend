@@ -165,7 +165,11 @@ async function grid(reqUser, filters = {}, { pageNo = 1, pageSize = 10 } = {}) {
   const offset = (pageNo - 1) * pageSize;
 
   // ── GRID rows (JobRepository.java:849-887) ────────────────────────────
-  const gridParams = [];
+  // The 4 age-bucket NOW()s are in the SELECT, textually before the WHERE
+  // dim/owner placeholders and the trailing LIMIT/OFFSET, so their `now`s go
+  // first in gridParams to match ? position.
+  const now = new Date();
+  const gridParams = [now, now, now, now];
   const gridDim = buildDimensionFilters(filters, gridParams);
   const gridOwner = buildOwnerFilter(scope, gridParams);
   gridParams.push(pageSize, offset);
@@ -174,10 +178,10 @@ async function grid(reqUser, filters = {}, { pageNo = 1, pageSize = 10 } = {}) {
       TCY.city_id,
       TCY.city_name,
       TS.state_name,
-      COUNT(CASE WHEN TIMESTAMPDIFF(DAY, TJ.ticket_created_date_time, NOW()) = 0 THEN 1 END) AS today_count,
-      COUNT(CASE WHEN TIMESTAMPDIFF(DAY, TJ.ticket_created_date_time, NOW()) = 1 THEN 1 END) AS yesterday_count,
-      COUNT(CASE WHEN TIMESTAMPDIFF(DAY, TJ.ticket_created_date_time, NOW()) BETWEEN 2 AND 7 THEN 1 END) AS days_2_to_7_count,
-      COUNT(CASE WHEN TIMESTAMPDIFF(DAY, TJ.ticket_created_date_time, NOW()) > 7 THEN 1 END) AS greater_than_7_count,
+      COUNT(CASE WHEN TIMESTAMPDIFF(DAY, TJ.ticket_created_date_time, ?) = 0 THEN 1 END) AS today_count,
+      COUNT(CASE WHEN TIMESTAMPDIFF(DAY, TJ.ticket_created_date_time, ?) = 1 THEN 1 END) AS yesterday_count,
+      COUNT(CASE WHEN TIMESTAMPDIFF(DAY, TJ.ticket_created_date_time, ?) BETWEEN 2 AND 7 THEN 1 END) AS days_2_to_7_count,
+      COUNT(CASE WHEN TIMESTAMPDIFF(DAY, TJ.ticket_created_date_time, ?) > 7 THEN 1 END) AS greater_than_7_count,
       COUNT(TJ.job_id) AS total_count
     FROM tbl_job TJ
 ${GEO_JOINS}
@@ -286,7 +290,10 @@ async function cityJobs(reqUser, filters = {}) {
   logger.info('Priority Jobs city drill-down · cityId=' + JSON.stringify(filters.cityId || []));
   const scope = resolveOwnerScope(reqUser, filters.ownerId);
 
-  const params = [];
+  // job_age's DATE(?) is in the SELECT, before the WHERE dim/owner
+  // placeholders and the trailing LIMIT, so its `now` goes first.
+  const now = new Date();
+  const params = [now];
   const dim = buildDimensionFilters(filters, params);
   const owner = buildOwnerFilter(scope, params);
   params.push(LIST_LIMIT);
@@ -306,7 +313,7 @@ async function cityJobs(reqUser, filters = {}) {
       UO.user_id,
       TC.client_name,
       e.efr_name,
-      DATEDIFF(CURDATE(), TJ.ticket_created_date_time) AS job_age,
+      DATEDIFF(DATE(?), TJ.ticket_created_date_time) AS job_age,
       UO.user_name AS job_current_owner
     FROM tbl_job TJ
     LEFT JOIN tbl_address TA ON TA.address_id = TJ.fk_address_id
@@ -366,7 +373,10 @@ async function copyData(reqUser, filters = {}) {
   logger.info('Priority Jobs export · serviceCategoryId=' + JSON.stringify(filters.serviceCategoryId || []) + ' stateId=' + JSON.stringify(filters.stateId || []) + ' cityId=' + JSON.stringify(filters.cityId || []));
   const scope = resolveOwnerScope(reqUser, filters.ownerId);
 
-  const params = [];
+  // job_age's ? (replacing NOW()) is in the SELECT, before the WHERE
+  // dim/owner placeholders and the trailing LIMIT, so its `now` goes first.
+  const now = new Date();
+  const params = [now];
   const dim = buildDimensionFilters(filters, params);
   const owner = buildOwnerFilter(scope, params);
   params.push(EXPORT_LIMIT);
@@ -407,7 +417,7 @@ async function copyData(reqUser, filters = {}) {
       TJ.remarks_date_time,
       TJ.job_desc,
       TC.client_name,
-      FLOOR(TIMESTAMPDIFF(MINUTE, TJ.ticket_created_date_time, NOW()) / 1440.0) AS job_age,
+      FLOOR(TIMESTAMPDIFF(MINUTE, TJ.ticket_created_date_time, ?) / 1440.0) AS job_age,
       TU1.user_name AS job_current_owner
     FROM tbl_job TJ
     LEFT JOIN tbl_easyfixer TE ON TE.efr_id = TJ.fk_easyfixter_id

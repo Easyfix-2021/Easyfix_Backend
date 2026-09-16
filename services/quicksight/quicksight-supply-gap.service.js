@@ -768,6 +768,11 @@ async function jobDetail(jobId) {
     };
   }
 
+  // job_age's ELSE branch (open jobs) compares ticket_created_date_time — an
+  // app-written IST datetime (no DB default) — against "now", so it's a
+  // bound Date. It's in the SELECT, before the WHERE TJ.job_id = ? below, so
+  // its param goes first.
+  const now = new Date();
   const sql = `
     SELECT
       TJ.job_id, TCL.client_name,
@@ -791,7 +796,7 @@ async function jobDetail(jobId) {
         WHEN TJ.job_status IN (3, 5) THEN FLOOR(TIMESTAMPDIFF(MINUTE, TJ.ticket_created_date_time, TJ.checkout_date_time) / 1440.0)
         WHEN TJ.job_status = 6 THEN FLOOR(TIMESTAMPDIFF(MINUTE, TJ.ticket_created_date_time, TJ.cancel_date_time) / 1440.0)
         WHEN TJ.job_status = 7 THEN FLOOR(TIMESTAMPDIFF(MINUTE, TJ.ticket_created_date_time, TJ.enquiry_date_time) / 1440.0)
-        ELSE FLOOR(TIMESTAMPDIFF(MINUTE, TJ.ticket_created_date_time, NOW()) / 1440.0)
+        ELSE FLOOR(TIMESTAMPDIFF(MINUTE, TJ.ticket_created_date_time, ?) / 1440.0)
       END AS job_age,
       TJ.job_desc, TJ.fk_service_catg_id, TJ.fk_client_id,
       TC.city_id, TC.state_user,
@@ -805,7 +810,7 @@ async function jobDetail(jobId) {
     LEFT JOIN tbl_client TCL ON TCL.client_id = TJ.fk_client_id
     WHERE TJ.job_id = ?
   `;
-  const [rows] = await pool.query(sql, [jobId]);
+  const [rows] = await pool.query(sql, [now, jobId]);
   if (rows.length === 0) {
     logger.warn('Job ID does not exist · jobId=' + jobId);
     const e = new Error('This job ID does not exist.');
@@ -1088,19 +1093,20 @@ async function create(body, actor) {
         throw e;
       }
     }
+    const createNow = new Date();
     const [ins] = await conn.query(
       `INSERT INTO tbl_open_city
          (pin, city, district, state, state_user, category_id, comments,
           reference_id, client_id, status, request_for, inserted_by, inserted_on)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NOW())`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
       [loc.pin, loc.city, loc.district, loc.state, loc.stateUser, catgId, comments,
-        loc.referenceId, loc.clientId, requestFor, actor?.user_id || null],
+        loc.referenceId, loc.clientId, requestFor, actor?.user_id || null, createNow],
     );
     id = ins.insertId;
     await conn.query(
       `INSERT INTO supply_request_log (sr_id, comment, action_type, user_id, insert_time, tx_details)
-       VALUES (?, ?, 0, ?, NOW(), NULL)`,
-      [id, comments, actor?.user_id || null],
+       VALUES (?, ?, 0, ?, ?, NULL)`,
+      [id, comments, actor?.user_id || null, createNow],
     );
     await conn.commit();
   } catch (err) {
@@ -1189,8 +1195,8 @@ async function logEfrInvite({ name, mobile, remarks, inviteStatus, supplyId, use
   try {
     await pool.query(
       `INSERT INTO tbl_efr_invite (efr_name, efr_mobile, remarks, invite_status, supply_id, invited_by, invited_on)
-       VALUES (?, ?, ?, ?, ?, ?, NOW())`,
-      [name, mobile, remarks || null, String(inviteStatus).slice(0, 50), supplyId ?? null, userId ?? null],
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [name, mobile, remarks || null, String(inviteStatus).slice(0, 50), supplyId ?? null, userId ?? null, new Date()],
     );
     return true;
   } catch (err) {
@@ -1218,8 +1224,8 @@ async function addRemark(openCityId, comment, actor) {
   await loadForAction(openCityId);
   await pool.query(
     `INSERT INTO supply_request_log (sr_id, comment, action_type, user_id, insert_time, tx_details)
-     VALUES (?, ?, 9, ?, NOW(), NULL)`,
-    [openCityId, comment, actor?.user_id || null],
+     VALUES (?, ?, 9, ?, ?, NULL)`,
+    [openCityId, comment, actor?.user_id || null, new Date()],
   );
   return { id: openCityId };
 }
@@ -1261,33 +1267,34 @@ async function act(openCityId, body, actor) {
   }
 
   const conn = await pool.getConnection();
+  const now = new Date();
   try {
     await conn.beginTransaction();
     if (actionType === 1 || actionType === 2) {
       await conn.query(
         `UPDATE tbl_open_city
-            SET action_by = ?, action_on = NOW(), action_remarks = ?, status = ?,
+            SET action_by = ?, action_on = ?, action_remarks = ?, status = ?,
                 ${actionType === 1 ? 'new_supply_name = ?, new_supply_number = ?' : 'old_supply_id = ?'}
           WHERE id = ?`,
         actionType === 1
-          ? [userId, remarks, actionType, tech.name, tech.mobile, openCityId]
-          : [userId, remarks, actionType, tech.id, openCityId],
+          ? [userId, now, remarks, actionType, tech.name, tech.mobile, openCityId]
+          : [userId, now, remarks, actionType, tech.id, openCityId],
       );
       await conn.query(
         `INSERT INTO tbl_supply_request_allocation (sr_id, supply_name, supply_no, remarks, supply_type, insert_by, insert_date)
-         VALUES (?, ?, ?, ?, ?, ?, NOW())`,
-        [openCityId, tech.name, tech.mobile, remarks, actionType, userId],
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [openCityId, tech.name, tech.mobile, remarks, actionType, userId, now],
       );
     } else {
       await conn.query(
-        'UPDATE tbl_open_city SET closed_by = ?, closed_on = NOW(), closed_comments = ?, status = ? WHERE id = ?',
-        [userId, remarks, actionType, openCityId],
+        'UPDATE tbl_open_city SET closed_by = ?, closed_on = ?, closed_comments = ?, status = ? WHERE id = ?',
+        [userId, now, remarks, actionType, openCityId],
       );
     }
     await conn.query(
       `INSERT INTO supply_request_log (sr_id, comment, action_type, user_id, insert_time, tx_details)
-       VALUES (?, ?, ?, ?, NOW(), ?)`,
-      [openCityId, remarks, actionType, userId, tech ? tech.txDetails : null],
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [openCityId, remarks, actionType, userId, now, tech ? tech.txDetails : null],
     );
     await conn.commit();
   } catch (err) {

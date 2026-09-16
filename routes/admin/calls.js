@@ -1265,9 +1265,9 @@ async function storeTranscriptionBestEffort({ jobCallerInfoId, recordingId }) {
     if (tx.ok && tx.text) {
       await pool.query(
         `UPDATE tbl_plivo_call_log
-            SET transcription = ?, transcription_status = 'completed', transcription_fetched_at = NOW()
+            SET transcription = ?, transcription_status = 'completed', transcription_fetched_at = ?
           WHERE job_caller_info_id = ?`,
-        [tx.text, jobCallerInfoId]
+        [tx.text, new Date(), jobCallerInfoId]
       );
       logger.info('Call transcription stored · jci=' + jobCallerInfoId);
     } else if (tx.ok) {
@@ -1286,8 +1286,8 @@ async function storeTranscriptionBestEffort({ jobCallerInfoId, recordingId }) {
         const created = await plivo.createTranscription({ recordingId });
         const status = created.notEnabled ? 'not_available' : 'processing';
         await pool.query(
-          "UPDATE tbl_plivo_call_log SET transcription_status = ?, transcription_fetched_at = NOW() WHERE job_caller_info_id = ?",
-          [status, jobCallerInfoId]
+          "UPDATE tbl_plivo_call_log SET transcription_status = ?, transcription_fetched_at = ? WHERE job_caller_info_id = ?",
+          [status, new Date(), jobCallerInfoId]
         );
       }
     }
@@ -1309,8 +1309,8 @@ async function fetchTranscriptOnDemand({ jobCallerInfoId, callUuid, currentStatu
     const tx = await plivo.fetchTranscription({ recordingId: meta.recordingId });
     if (tx.ok && tx.text) {
       await pool.query(
-        "UPDATE tbl_plivo_call_log SET transcription = ?, transcription_status = 'completed', transcription_fetched_at = NOW() WHERE job_caller_info_id = ?",
-        [tx.text, jobCallerInfoId]
+        "UPDATE tbl_plivo_call_log SET transcription = ?, transcription_status = 'completed', transcription_fetched_at = ? WHERE job_caller_info_id = ?",
+        [tx.text, new Date(), jobCallerInfoId]
       );
       return tx.text;
     }
@@ -1322,8 +1322,8 @@ async function fetchTranscriptOnDemand({ jobCallerInfoId, callUuid, currentStatu
       const created = await plivo.createTranscription({ recordingId: meta.recordingId });
       const status = created.notEnabled ? 'not_available' : 'processing';
       await pool.query(
-        "UPDATE tbl_plivo_call_log SET transcription_status = ?, transcription_fetched_at = NOW() WHERE job_caller_info_id = ?",
-        [status, jobCallerInfoId]
+        "UPDATE tbl_plivo_call_log SET transcription_status = ?, transcription_fetched_at = ? WHERE job_caller_info_id = ?",
+        [status, new Date(), jobCallerInfoId]
       );
     }
     return null;
@@ -1388,8 +1388,8 @@ async function runAndStoreAnalysis({ id, transcript, mode, hasAnalysis, callerUs
   }
   if (hasAnalysis) {
     await pool.query(
-      "UPDATE tbl_plivo_call_log SET call_analysis = ?, call_analysis_status = 'ready', call_analysis_generated_at = NOW() WHERE job_caller_info_id = ?",
-      [JSON.stringify(out.analysis), id]
+      "UPDATE tbl_plivo_call_log SET call_analysis = ?, call_analysis_status = 'ready', call_analysis_generated_at = ? WHERE job_caller_info_id = ?",
+      [JSON.stringify(out.analysis), new Date(), id]
     );
     // Only meaningful once the analysis is actually STORED — rollupForCaller
     // re-reads call_analysis off the table, so an unstored one aggregates nothing.
@@ -1736,7 +1736,7 @@ router.post('/:id/reanalyse', requireClickToCallAction, async (req, res, next) =
 // ─── POST /:id/hangup — terminate a live call from the UI ──────────────
 // Only meaningful for providers that support hangup (Plivo). Loads the row,
 // asks the provider factory to terminate by stored unique_id (CallUUID), and
-// on success stamps caller_status='hungup' + end_time=NOW(). Kaleyra returns
+// on success stamps caller_status='hungup' + end_time=now. Kaleyra returns
 // unsupported → 409.
 router.post('/:id/hangup', requireClickToCallAction, async (req, res, next) => {
   try {
@@ -1790,9 +1790,9 @@ router.post('/:id/hangup', requireClickToCallAction, async (req, res, next) => {
 
     await pool.query(
       `UPDATE tbl_job_caller_info
-          SET caller_status = 'hungup', end_time = NOW(), is_updated = 1
+          SET caller_status = 'hungup', end_time = ?, is_updated = 1
         WHERE job_caller_info = ?`,
-      [id]
+      [new Date(), id]
     );
     logger.info(`Click-to-call hung up · row=${id} · provider=${row.provider} · by=${req.user.user_id}`);
     return modernOk(res, { success: true });
@@ -1877,10 +1877,10 @@ router.post(
       if (!alreadyTerminal) {
         await pool.query(
           `UPDATE tbl_job_caller_info
-              SET caller_status = 'failed', end_time = COALESCE(end_time, NOW()), is_updated = 1
+              SET caller_status = 'failed', end_time = COALESCE(end_time, ?), is_updated = 1
             WHERE job_caller_info = ?
               AND caller_status NOT IN ('completed','busy','no_answer','failed','hungup')`,
-          [id]
+          [new Date(), id]
         );
         // The leg row through the service that owns this table's SQL — the
         // reason lands in hangup_cause, where every other terminal reason on

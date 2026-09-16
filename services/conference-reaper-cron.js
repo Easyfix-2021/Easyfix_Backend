@@ -52,25 +52,17 @@ const legs = require('./plivo-call-log.service');
  * FAILS changes nothing, and a conference Plivo still reports as running is
  * never marked ended.
  *
- * ─── ⚠ TWO CLOCKS, TWO CORRECT ANSWERS ───────────────────────────────────
+ * ─── ⚠ ONE CLOCK: THE APP'S ──────────────────────────────────────────────
  *
- * A cutoff must be computed in the clock the COLUMN was written in, and the two
- * tables this sweep touches do not use the same one:
- *
- *   • tbl_job_conference (passes A and B) is written app-side — new Date() plus
- *     the pool's +05:30 session timezone (db.js) — so its columns hold the IST
- *     WALL CLOCK. NOW() is whatever zone the DB server runs in (UTC), so
- *     `NOW() - INTERVAL n SECOND` here would skew by 5.5 hours; on a
- *     minutes-wide window that means matching NOTHING, silently never reaping,
- *     and the cost leak going uncaught. These passes use an app-side JS Date,
- *     which mysql2 formats in the connection timezone — IST vs IST, exact.
- *   • tbl_plivo_call_log (pass C) is NOW()-written throughout, by its own
- *     convention since 2026-06-19. There, `NOW() - INTERVAL n SECOND` compares
- *     the server clock to itself and is exact by construction, while handing it
- *     an IST Date would introduce the very skew the first rule avoids.
- *
- * Both are therefore zone-independent, and neither depends on the two tables
- * agreeing about what time it is.
+ * A cutoff must be computed in the clock the COLUMN was written in. Both tables
+ * this sweep touches — tbl_job_conference (passes A and B) and, since
+ * 2026-09-16, tbl_plivo_call_log (pass C; NOW()-written before that) — are
+ * written app-side: new Date() plus the pool's +05:30 session timezone (db.js),
+ * so their columns hold the IST WALL CLOCK. NOW() is whatever zone the DB
+ * server runs in (IST today, but not guaranteed), so `NOW() - INTERVAL n SECOND`
+ * would skew by that offset; on a minutes-wide window that means matching
+ * NOTHING, silently never reaping, and the cost leak going uncaught. Every pass
+ * uses an app-side JS Date — IST vs IST, exact on any server zone.
  */
 
 /*
@@ -270,8 +262,8 @@ async function reconcileCreating({ limit = CREATING_LIMIT } = {}) {
  * services/plivo-call-log.service.js. Two things follow from that and both are
  * improvements rather than compromises:
  *
- *   • the window is NOW()-relative, because that column is NOW()-written (see
- *     the two-clocks note at the top);
+ *   • the window is an app-side Date, because that column is app-written (see
+ *     the clock note at the top);
  *   • there is no participant_count to decrement. The live count is derived
  *     from these very rows, so closing one IS the decrement — the class of bug
  *     where a counter and the rows it counts disagree cannot occur.

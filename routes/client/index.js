@@ -279,7 +279,8 @@ router.get('/dashboard', async (req, res, next) => {
     //   In Progress = status 0/1/2/20, appointment today (requested_date_time)
     //   Completed   = status 3/5, checked out today      (checkout_date_time)
     const todayOnly = String(req.query.scope || '') === 'today';
-    const on = (col) => (todayOnly ? `AND DATE(${col}) = CURDATE()` : '');
+    const now = new Date();
+    const on = (col) => (todayOnly ? `AND DATE(${col}) = DATE(?)` : '');
 
     // Visibility for the "Today's jobs" counts — same reporting hierarchy as
     // Orders (tbl_client_contacts.manager_id, attributed via reporting_contact_id):
@@ -288,7 +289,7 @@ router.get('/dashboard', async (req, res, next) => {
     //   • ?spoc=<id> (a member)  → just that one SPOC's counts (team drill-down).
     const hier = await resolveClientHierarchy(req);
     const scopeIds = hierarchyFilter(hier, req);   // undefined = whole client
-    const params = [req.spoc.client_id];
+    const params = todayOnly ? [now, now, now, req.spoc.client_id] : [req.spoc.client_id];
     let mine = '';
     if (Array.isArray(scopeIds)) {
       mine = `AND reporting_contact_id IN (${scopeIds.map(() => '?').join(',')})`;
@@ -343,7 +344,8 @@ router.get('/action-queue', async (req, res, next) => {
     // whole client's queue; everyone else stays inside their booking subtree.
     const scopeIds = hierarchyFilter(hier, req);   // undefined = whole client
 
-    const params = [req.spoc.client_id];
+    const now = new Date();
+    const params = [now, req.spoc.client_id];
     let mine = '';
     if (Array.isArray(scopeIds)) {
       mine = `AND J.reporting_contact_id IN (${scopeIds.map(() => '?').join(',')})`;
@@ -355,7 +357,7 @@ router.get('/action-queue', async (req, res, next) => {
     const [rows] = await pool.query(`
       SELECT J.job_id, J.job_reference_id, J.client_ref_id, J.job_status,
              J.ticket_created_date_time,
-             TIMESTAMPDIFF(HOUR, J.ticket_created_date_time, NOW()) DIV 24 AS age_days,
+             TIMESTAMPDIFF(HOUR, J.ticket_created_date_time, ?) DIV 24 AS age_days,
              COALESCE(city.city_name, 'Unknown') AS city_name,
              COALESCE(TSC.service_catg_name, 'Uncategorised') AS category,
              ROUND(SUM(js.total_charge * COALESCE(js.quantity, 1) + COALESCE(js.material_charge, 0)), 2) AS estimate_value
@@ -608,9 +610,10 @@ router.get('/performance', requireGrant('performance'), async (req, res, next) =
 router.get('/services/sda-tat', async (req, res, next) => {
   try {
     const days = Number(req.query.days) > 0 ? Number(req.query.days) : null;
-    const params = [req.spoc.client_id];
+    const now = new Date();
+    const params = [now, req.spoc.client_id];
     let windowClause = '';
-    if (days) { windowClause = 'AND J.ticket_created_date_time >= DATE_SUB(CURDATE(), INTERVAL ? DAY)'; params.push(days); }
+    if (days) { windowClause = 'AND J.ticket_created_date_time >= DATE_SUB(DATE(?), INTERVAL ? DAY)'; params.push(now, days); }
     logger.info('Fetch client service SDA/TAT (tiered) · clientId=' + req.spoc.client_id + (days ? ' · days=' + days : ''));
     const [rows] = await pool.query(`
       SELECT
@@ -629,7 +632,7 @@ router.get('/services/sda-tat', async (req, res, next) => {
           /* In TAT? job age (24h days) <= pre-defined TAT for category × tier */
           CASE WHEN
             (CASE
-                WHEN J.job_status IN (9,1,0,2,20,10,15,21) THEN TIMESTAMPDIFF(HOUR, J.ticket_created_date_time, NOW()) DIV 24
+                WHEN J.job_status IN (9,1,0,2,20,10,15,21) THEN TIMESTAMPDIFF(HOUR, J.ticket_created_date_time, ?) DIV 24
                 WHEN J.job_status IN (3,5) THEN TIMESTAMPDIFF(HOUR, J.ticket_created_date_time, J.checkout_date_time) DIV 24
                 WHEN J.job_status = 6 THEN TIMESTAMPDIFF(HOUR, J.ticket_created_date_time, J.cancel_date_time) DIV 24
                 WHEN J.job_status = 7 THEN TIMESTAMPDIFF(HOUR, J.ticket_created_date_time, J.enquiry_date_time) DIV 24
@@ -1008,8 +1011,8 @@ router.patch('/jobs/:id/approve', async (req, res, next) => {
     logger.info('SPOC approve job · id=' + req.params.id);
     const job = await loadJobInScope(req, res, 'Approve');
     if (!job) return;
-    await pool.query('UPDATE tbl_job SET approved_by_client_contact = ?, approved_on_date_time = NOW() WHERE job_id = ?',
-      [req.spoc.id, job.job_id]);
+    await pool.query('UPDATE tbl_job SET approved_by_client_contact = ?, approved_on_date_time = ? WHERE job_id = ?',
+      [req.spoc.id, new Date(), job.job_id]);
     logger.info('Job approved by client · id=' + job.job_id);
     modernOk(res, await jobService.getById(job.job_id), 'approved');
   } catch (e) { next(e); }
@@ -1021,8 +1024,8 @@ router.patch('/jobs/:id/reject', validate(Joi.object({ reason: Joi.string().min(
     const job = await loadJobInScope(req, res, 'Reject');
     if (!job) return;
     await pool.query(
-      'UPDATE tbl_job SET approval_reject_reason = ?, approval_reject_date_time = NOW() WHERE job_id = ?',
-      [req.body.reason, job.job_id]);
+      'UPDATE tbl_job SET approval_reject_reason = ?, approval_reject_date_time = ? WHERE job_id = ?',
+      [req.body.reason, new Date(), job.job_id]);
     // Fire escalation email to ops + the owner (legacy
     // sendemailClitoClientUrgentRequest replacement). Non-blocking —
     // failure here must not block the API response.
@@ -1053,8 +1056,8 @@ router.patch('/jobs/:id/estimate/approve', async (req, res, next) => {
       return modernError(res, 409, 'estimate already rejected; cannot approve');
     }
     await pool.query(
-      'UPDATE tbl_job SET approved_by_client_contact = ?, approved_on_date_time = NOW() WHERE job_id = ?',
-      [req.spoc.id, job.job_id]);
+      'UPDATE tbl_job SET approved_by_client_contact = ?, approved_on_date_time = ? WHERE job_id = ?',
+      [req.spoc.id, new Date(), job.job_id]);
     logger.info('Estimate approved · id=' + job.job_id);
     modernOk(res, { approved: true });
   } catch (e) { next(e); }
@@ -1078,8 +1081,8 @@ router.patch('/jobs/:id/estimate/reject', validate(Joi.object({ reason: Joi.stri
       return modernError(res, 409, 'estimate already rejected');
     }
     await pool.query(
-      'UPDATE tbl_job SET approval_reject_reason = ?, approval_reject_date_time = NOW() WHERE job_id = ?',
-      [req.body.reason, job.job_id]);
+      'UPDATE tbl_job SET approval_reject_reason = ?, approval_reject_date_time = ? WHERE job_id = ?',
+      [req.body.reason, new Date(), job.job_id]);
     fireRejectEscalation(job, req.body.reason, req.spoc).catch(() => {});
     logger.info('Estimate rejected · id=' + job.job_id);
     modernOk(res, { rejected: true });
@@ -1408,16 +1411,18 @@ router.post('/jobs/:id/escalate', validate(Joi.object({
     if (!job) return;
     logger.info('Client escalate job · id=' + job.job_id + ' · reason=' + req.body.reasonId + ' · spoc=' + req.spoc.id);
     const escalatedBy = req.spoc.contact_name || null;
+    const escalatedAt = new Date();
 
     // 1) the escalation record itself (job_stage here is the human-readable label)
     const [r] = await pool.query(
       `INSERT INTO tbl_job_escalation_info
          (job_id, easyfixer_id, escalation_time, job_stage, escalated_by,
           escalated_by_name, escalated_comments, escalated_from, escalation_reason)
-       VALUES (?, ?, NOW(), ?, 0, ?, ?, 'Client App', ?)`,
+       VALUES (?, ?, ?, ?, 0, ?, ?, 'Client App', ?)`,
       [
         job.job_id,
         job.fk_easyfixter_id || null,   // note: column name has the legacy "easyfixter" typo
+        escalatedAt,
         STAGE_LABEL[job.job_status] || String(job.job_status ?? ''),
         escalatedBy,
         req.body.comment || null,
@@ -1429,8 +1434,8 @@ router.post('/jobs/:id/escalate', validate(Joi.object({
     await pool.query(
       `INSERT INTO tbl_job_comment
          (job_id, enum_reason_id, comments, comment_on, created_on, job_stage, job_escalated_by)
-       VALUES (?, ?, ?, 19, NOW(), ?, ?)`,
-      [job.job_id, req.body.reasonId, req.body.comment || null, job.job_status ?? null, escalatedBy]);
+       VALUES (?, ?, ?, 19, ?, ?, ?)`,
+      [job.job_id, req.body.reasonId, req.body.comment || null, escalatedAt, job.job_status ?? null, escalatedBy]);
 
     modernOk(res, { escalated: true, escalation_info_id: r.insertId, job_id: job.job_id });
   } catch (e) { next(e); }
@@ -1787,7 +1792,8 @@ router.get('/team/bookings', async (req, res, next) => {
   try {
     const hier = await resolveClientHierarchy(req);
     const todayOnly = String(req.query.scope || '') === 'today';
-    const dateClause = todayOnly ? 'AND DATE(j.ticket_created_date_time) = CURDATE()' : '';
+    const now = new Date();
+    const dateClause = todayOnly ? 'AND DATE(j.ticket_created_date_time) = DATE(?)' : '';
     const placeholders = hier.subtreeIds.map(() => '?').join(',');
     logger.info('Team bookings · clientId=' + req.spoc.client_id + ' · subtree=' + hier.subtreeIds.length + (todayOnly ? ' · today' : ''));
     // ONE grouped scan of tbl_job (not 56 correlated COUNT subqueries — with no
@@ -1804,7 +1810,7 @@ router.get('/team/bookings', async (req, res, next) => {
          ) b ON b.rc = c.id
         WHERE c.id IN (${placeholders})
         ORDER BY (c.id = ?) DESC, bookings DESC, c.contact_name`,
-      [...hier.subtreeIds, ...hier.subtreeIds, req.spoc.id]);
+      [...hier.subtreeIds, ...(todayOnly ? [now] : []), ...hier.subtreeIds, req.spoc.id]);
     const members = rows.map((r) => ({
       id: r.id,
       name: r.contact_name,
@@ -2328,13 +2334,14 @@ router.get('/notices/unread-count', async (req, res, next) => {
     // rows just to throw away everything except the unread total.
     // Mirrors the same `is active for the client surface` predicate
     // used inside listActiveForSurface for parity.
+    const now = new Date();
     const [[{ unread }]] = await pool.query(
       `SELECT COUNT(*) AS unread
          FROM tbl_notice n
         WHERE FIND_IN_SET('client', n.target_surfaces)
           AND n.status IN ('published', 'scheduled')
-          AND (n.publish_at IS NULL OR n.publish_at <= NOW())
-          AND (n.expire_at  IS NULL OR n.expire_at  >  NOW())
+          AND (n.publish_at IS NULL OR n.publish_at <= ?)
+          AND (n.expire_at  IS NULL OR n.expire_at  >  ?)
           AND NOT EXISTS (
             SELECT 1 FROM tbl_notice_read r
              WHERE r.notice_id   = n.notice_id
@@ -2342,7 +2349,7 @@ router.get('/notices/unread-count', async (req, res, next) => {
                AND r.reader_type = 'client'
                AND r.reader_id   = ?
           )`,
-      [req.spoc.id]
+      [now, now, req.spoc.id]
     );
     modernOk(res, { count: Number(unread) || 0 });
   } catch (e) { next(e); }
@@ -2374,14 +2381,15 @@ router.patch('/notices/read-all', async (req, res, next) => {
     // window in a single round-trip. The `WHERE NOT EXISTS` guard
     // makes this idempotent without relying on the UNIQUE index
     // throwing duplicate-key errors.
+    const now = new Date();
     await pool.query(
       `INSERT INTO tbl_notice_read (notice_id, surface, reader_type, reader_id)
        SELECT n.notice_id, 'client', 'client', ?
          FROM tbl_notice n
         WHERE FIND_IN_SET('client', n.target_surfaces)
           AND n.status IN ('published', 'scheduled')
-          AND (n.publish_at IS NULL OR n.publish_at <= NOW())
-          AND (n.expire_at  IS NULL OR n.expire_at  >  NOW())
+          AND (n.publish_at IS NULL OR n.publish_at <= ?)
+          AND (n.expire_at  IS NULL OR n.expire_at  >  ?)
           AND NOT EXISTS (
             SELECT 1 FROM tbl_notice_read r
              WHERE r.notice_id   = n.notice_id
@@ -2389,7 +2397,7 @@ router.patch('/notices/read-all', async (req, res, next) => {
                AND r.reader_type = 'client'
                AND r.reader_id   = ?
           )`,
-      [req.spoc.id, req.spoc.id]
+      [req.spoc.id, now, now, req.spoc.id]
     );
     modernOk(res, { ok: true });
   } catch (e) { next(e); }
@@ -2576,9 +2584,12 @@ router.get('/unreachable-jobs', async (req, res, next) => {
      * answer as "nobody has asked for anything", which is true there.
      */
     const reqIds = await clientRequest.reasonIds(pool);
+    const now = new Date();
     const params = [
-      // ORDER MIRRORS THE SQL: the correlated reason-id subquery sits in the
-      // SELECT list, which mysql2 reads before the outer WHERE.
+      // ORDER MIRRORS THE SQL: age_days' bound "now" and the correlated
+      // reason-id subquery both sit in the SELECT list, which mysql2 reads
+      // before the outer WHERE — age_days comes first, textually.
+      now,
       reqIds?.cancel ?? 0, reqIds?.retry ?? 0,
       req.spoc.client_id, ...scopeParams,
       limit,
@@ -2607,7 +2618,7 @@ router.get('/unreachable-jobs', async (req, res, next) => {
       SELECT j.job_id, j.job_reference_id, j.client_ref_id, j.job_status,
              COALESCE(city.city_name, 'Unknown')            AS city_name,
              COALESCE(TSC.service_catg_name, 'Uncategorised') AS category,
-             TIMESTAMPDIFF(HOUR, j.ticket_created_date_time, NOW()) DIV 24 AS age_days,
+             TIMESTAMPDIFF(HOUR, j.ticket_created_date_time, ?) DIV 24 AS age_days,
              COUNT(DISTINCT DATE(c.created_on)) AS unreachable_days,
              COUNT(c.comment_id)                AS attempts,
              MAX(c.created_on)                  AS last_attempt,
@@ -2840,19 +2851,20 @@ router.get('/dashboard-summary', async (req, res, next) => {
     //                          unconfirmed (0,1), NO technician assigned.
     //   runningLate          : same, but a technician IS assigned and the
     //                          job still hasn't progressed.
+    const boxesNow = new Date();
     const [[jobBoxes]] = await pool.query(
       `SELECT
          SUM(CASE WHEN j.job_status = 9 THEN 1 ELSE 0 END) AS newTickets,
          SUM(CASE WHEN j.job_status IN (0,1)
-                   AND j.requested_date_time <= NOW()
+                   AND j.requested_date_time <= ?
                    AND j.fk_easyfixter_id IS NULL     THEN 1 ELSE 0 END) AS waitingForAllocation,
          SUM(CASE WHEN j.job_status IN (0,1)
-                   AND j.requested_date_time <= NOW()
+                   AND j.requested_date_time <= ?
                    AND j.fk_easyfixter_id IS NOT NULL THEN 1 ELSE 0 END) AS runningLate
          FROM tbl_job j
         WHERE j.fk_client_id        = ?
           ${teamFilter}`,
-      [req.spoc.client_id, ...teamParams]
+      [boxesNow, boxesNow, req.spoc.client_id, ...teamParams]
     );
 
     // Estimate Approved / Rejected — count the LATEST estimate per job
@@ -2928,6 +2940,7 @@ router.get('/dashboard-summary', async (req, res, next) => {
     // IN (0,1,2,20,9,15,21) — the same seven codes, minus 10 — so a job that
     // was open enough to be counted was not open enough to be aged, and this
     // panel quietly disagreed with the card above it.
+    const slaNow = new Date();
     const [[sla]] = await pool.query(
       `SELECT
          SUM(CASE WHEN d BETWEEN 0 AND 1 THEN 1 ELSE 0 END) AS d01,
@@ -2935,15 +2948,15 @@ router.get('/dashboard-summary', async (req, res, next) => {
          SUM(CASE WHEN d BETWEEN 4 AND 7 THEN 1 ELSE 0 END) AS d47,
          SUM(CASE WHEN d > 7            THEN 1 ELSE 0 END) AS d7plus
        FROM (
-         SELECT DATEDIFF(NOW(), j.requested_date_time) AS d
+         SELECT DATEDIFF(?, j.requested_date_time) AS d
            FROM tbl_job j
           WHERE j.fk_client_id        = ?
             ${teamFilter}
             AND j.job_status NOT IN (3,5,6,7)
             AND j.requested_date_time IS NOT NULL
-            AND j.requested_date_time < NOW()
+            AND j.requested_date_time < ?
        ) t`,
-      [req.spoc.client_id, ...teamParams]
+      [slaNow, req.spoc.client_id, ...teamParams, slaNow]
     );
 
     // Invoices due (client-level) — feeds the "Needs attention" card.
@@ -2978,22 +2991,23 @@ router.get('/dashboard-summary', async (req, res, next) => {
     // Received (created) vs Completed (checked out) per day, last 30 days,
     // team-scoped. Grouped by day in SQL; JS fills the gap days with zero
     // so the chart always has exactly 30 points.
+    const trendNow = new Date();
     const [createdRows] = await pool.query(
       `SELECT DATE_FORMAT(j.ticket_created_date_time,'%Y-%m-%d') AS d, COUNT(*) AS n
          FROM tbl_job j
         WHERE j.fk_client_id = ? ${teamFilter}
-          AND j.ticket_created_date_time >= DATE_SUB(CURDATE(), INTERVAL 29 DAY)
+          AND j.ticket_created_date_time >= DATE_SUB(DATE(?), INTERVAL 29 DAY)
         GROUP BY d`,
-      [req.spoc.client_id, ...teamParams]
+      [req.spoc.client_id, ...teamParams, trendNow]
     );
     const [completedRows] = await pool.query(
       `SELECT DATE_FORMAT(j.checkout_date_time,'%Y-%m-%d') AS d, COUNT(*) AS n
          FROM tbl_job j
         WHERE j.fk_client_id = ? ${teamFilter}
           AND j.job_status IN (3,5)
-          AND j.checkout_date_time >= DATE_SUB(CURDATE(), INTERVAL 29 DAY)
+          AND j.checkout_date_time >= DATE_SUB(DATE(?), INTERVAL 29 DAY)
         GROUP BY d`,
-      [req.spoc.client_id, ...teamParams]
+      [req.spoc.client_id, ...teamParams, trendNow]
     );
     const createdMap   = new Map(createdRows.map((r) => [r.d, Number(r.n) || 0]));
     const completedMap = new Map(completedRows.map((r) => [r.d, Number(r.n) || 0]));
@@ -3136,11 +3150,11 @@ router.get('/invoices', async (req, res, next) => {
               COALESCE(SUM(CASE WHEN days > 60            THEN due ELSE 0 END),0) AS a60plus,
               COUNT(*)                                                            AS unpaid
          FROM (SELECT (total_invoice_amount - COALESCE(total_paid_amount,0)) AS due,
-                      DATEDIFF(NOW(), amount_due_date)                        AS days
+                      DATEDIFF(?, amount_due_date)                        AS days
                  FROM tbl_client_invoice
                 WHERE fk_client_id = ? AND is_raised = 1
                   AND (total_invoice_amount - COALESCE(total_paid_amount,0)) > 0) t`,
-      [clientId]
+      [new Date(), clientId]
     );
 
     const [rows] = await pool.query(
@@ -4708,13 +4722,13 @@ router.get('/dashboard-range', validate(dashboardRangeQuery, 'query'), async (re
               -- Overdue = still open AND its appointment has passed.
               SUM(CASE WHEN j.job_status IN (0,1,2,20)
                         AND j.requested_date_time IS NOT NULL
-                        AND j.requested_date_time < NOW()  THEN 1 ELSE 0 END) AS runningLate,
+                        AND j.requested_date_time < ?  THEN 1 ELSE 0 END) AS runningLate,
               SUM(CASE WHEN r.is_escalated = 1         THEN 1 ELSE 0 END)     AS escalated
          FROM tbl_job j
          LEFT JOIN tbl_easyfixer_rating_by_customer r ON r.job_id = j.job_id
          ${cityJoin}
         WHERE ${COHORT}`,
-      params,
+      [new Date(), ...params],
     );
 
     // Every city in the window, not a top-N — the card shows a few and says

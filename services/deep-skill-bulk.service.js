@@ -498,12 +498,13 @@ async function processBuffer(buffer, { commit = false, actor = null } = {}) {
              (category_id, service_type_id, deepskill_name, deepskill_description,
               deepskill_tag_words, status, inserted_by, inserted_on,
               deepskill_image, skill_options)
-           VALUES (?, ?, ?, ?, ?, 1, ?, NOW(), '', '[]')`,
+           VALUES (?, ?, ?, ?, ?, 1, ?, ?, '', '[]')`,
           [
             cat.id, typ.id, r.skill,
             r.keyWords || null,
             r.tagWords || null,
             actor?.user_id || null,
+            new Date(),
           ],
         );
         const newSkillId = ins.insertId;

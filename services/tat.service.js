@@ -888,14 +888,16 @@ async function forClient(clientId, days = CLIENT_LOOKBACK_DAYS) {
     throw e;
   }
   return aggregate({
+    // Clock rule: checkout_date_time is bound as new Date() in
+    // job.service.js — bind this window's instant instead of SQL NOW().
     sql: `${JOB_SELECT}
            WHERE j.fk_client_id = ?
              AND j.job_status IN (${COMPLETED_STATUSES.join(',')})
              AND j.checkout_date_time IS NOT NULL
-             AND j.checkout_date_time >= DATE_SUB(NOW(), INTERVAL ? DAY)
+             AND j.checkout_date_time >= DATE_SUB(?, INTERVAL ? DAY)
            ORDER BY j.checkout_date_time DESC
            LIMIT ${MAX_ROWS}`,
-    params: [clientId, days],
+    params: [clientId, new Date(), days],
     mode: 'client',
     subject: { id: client.client_id, name: client.client_name },
     windowLabel: `Completed In The Last ${days} Days`,
@@ -912,7 +914,7 @@ async function forClient(clientId, days = CLIENT_LOOKBACK_DAYS) {
  * month's heading.
  *
  * Same engine, same JOB_SELECT, same scoring. Only the WHERE differs:
- *   • an inclusive checkout window rather than DATE_SUB(NOW())
+ *   • an inclusive checkout window rather than the rolling DATE_SUB(?, …) lookback
  *   • an optional tbl_job.reporting_contact_id filter, so a SPOC who does not
  *     hold all-stores access sees only their own booking subtree — the same
  *     scoping rule /api/client/jobs already applies.
@@ -1022,14 +1024,16 @@ async function forDimension(dimension, id, days = CLIENT_LOOKBACK_DAYS) {
     throw e;
   }
   return aggregate({
+    // Clock rule: checkout_date_time is bound as new Date() in
+    // job.service.js — bind this window's instant instead of SQL NOW().
     sql: `${JOB_SELECT}
            WHERE ${dim.where}
              AND j.job_status IN (${COMPLETED_STATUSES.join(',')})
              AND j.checkout_date_time IS NOT NULL
-             AND j.checkout_date_time >= DATE_SUB(NOW(), INTERVAL ? DAY)
+             AND j.checkout_date_time >= DATE_SUB(?, INTERVAL ? DAY)
            ORDER BY j.checkout_date_time DESC
            LIMIT ${MAX_ROWS}`,
-    params: [id, days],
+    params: [id, new Date(), days],
     mode: dimension,
     subject: { id: Number(id), name: found.name },
     windowLabel: `${dim.label} · Completed In The Last ${days} Days`,

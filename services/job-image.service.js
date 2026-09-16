@@ -250,8 +250,8 @@ async function uploadJobImage({ jobId, file, category = 'Booking' }) {
 
   const [ins] = await pool.query(
     `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, created_date)
-     VALUES (?, ?, ?, ?, NOW())`,
-    [jobId, image, String(category).toLowerCase(), 0]);
+     VALUES (?, ?, ?, ?, ?)`,
+    [jobId, image, String(category).toLowerCase(), 0, new Date()]);
 
   logger.info('Job image stored · job=' + jobId + ' · seq=' + seq + ' · storage=' + storage
     + ' · type=' + contentType);

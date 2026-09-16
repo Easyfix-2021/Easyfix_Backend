@@ -102,9 +102,9 @@ jobs:
       # FULL history — see ci.yml for why. `npm test` below runs the
       # message-literal audit, whose RETIRED half reads `git log -L`; a
       # depth-1 checkout makes it silently unable to find anything.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with: { fetch-depth: 0 }
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: 20, cache: 'npm' }
       # --prefer-offline: the cache above is restored warm, so USE it instead of
       #   revalidating every packument against the registry. That revalidation
@@ -207,7 +207,7 @@ jobs:
       image_tag:   ${{ steps.meta.outputs.image_tag }}
       env_name:    ${{ steps.target.outputs.env_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Resolve target
         id: target
@@ -300,7 +300,7 @@ jobs:
       # to the EC2 on every deploy. Otherwise commits to that file never
       # propagate (the workflow used to only sed-update BACKEND_IMAGE in
       # /opt/easyfix/.env, leaving compose.yml frozen at first-bootstrap).
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Encode docker-compose.yml for transport
         id: compose

@@ -175,22 +175,25 @@ router.post('/', validate(Joi.object({
       logger.warn('Advance initiate blocked · client or easyfixer outside scope · efrId=' + b.efrId);
       return modernError(res, 403, 'client or easyfixer outside your scope');
     }
+    const now = new Date();
     const [ins] = await pool.query(
       `INSERT INTO tbl_efr_advance_payment
          (client_id, job_id, efr_id, adv_status,
           job_total_amt, advance_amt,
           initiated_on, initiated_by, pm_remarks,
           supporting_document, updated_on, updated_by)
-       VALUES (?, ?, ?, 0, ?, ?, NOW(), ?, ?, ?, NOW(), ?)`,
+       VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         clientId || null,
         b.jobId,
         b.efrId,
         b.jobTotalAmt,
         b.advanceAmt,
+        now,
         req.user.user_id,
         b.pmRemarks || null,
         b.supportingDocument || null,
+        now,
         req.user.user_id,
       ]
     );
@@ -216,16 +219,17 @@ router.post('/:id/ops-approve', validate(Joi.object({
       logger.warn('Ops-approve rejected · advance not pending · id=' + id + ' status=' + row.adv_status);
       return modernError(res, 409, `advance is not pending (current status ${row.adv_status})`);
     }
+    const now = new Date();
     const [r] = await pool.query(
       `UPDATE tbl_efr_advance_payment
           SET adv_status = 1,
-              ops_action_on = NOW(),
+              ops_action_on = ?,
               ops_action_by = ?,
               ops_remarks = ?,
-              updated_on = NOW(),
+              updated_on = ?,
               updated_by = ?
         WHERE advance_id = ? AND adv_status = 0`,
-      [req.user.user_id, req.body.remarks || null, req.user.user_id, id]
+      [now, req.user.user_id, req.body.remarks || null, now, req.user.user_id, id]
     );
     if (r.affectedRows === 0) {
       logger.warn('Ops-approve lost race · advance no longer pending · id=' + id);
@@ -253,20 +257,23 @@ router.post('/:id/fin-approve', validate(Joi.object({
       logger.warn('Finance-approve rejected · advance not ops-approved · id=' + id + ' status=' + row.adv_status);
       return modernError(res, 409, `advance is not in ops-approved state (current status ${row.adv_status})`);
     }
+    const now = new Date();
     const [r] = await pool.query(
       `UPDATE tbl_efr_advance_payment
           SET adv_status = 2,
-              fin_action_on = NOW(),
+              fin_action_on = ?,
               fin_action_by = ?,
               fin_remarks = ?,
               transaction_id = ?,
-              updated_on = NOW(),
+              updated_on = ?,
               updated_by = ?
         WHERE advance_id = ? AND adv_status = 1`,
       [
+        now,
         req.user.user_id,
         req.body.remarks || null,
         req.body.transactionId || null,
+        now,
         req.user.user_id,
         id,
       ]
@@ -300,26 +307,29 @@ router.post('/:id/reject', validate(Joi.object({
       logger.warn('Reject blocked · advance is terminal · id=' + id + ' status=' + current);
       return modernError(res, 409, `advance cannot be rejected from current status ${current}`);
     }
+    const now = new Date();
     const sql = current === 0
       ? `UPDATE tbl_efr_advance_payment
             SET adv_status = 3,
-                ops_action_on = NOW(),
+                ops_action_on = ?,
                 ops_action_by = ?,
                 ops_remarks = ?,
-                updated_on = NOW(),
+                updated_on = ?,
                 updated_by = ?
           WHERE advance_id = ? AND adv_status = 0`
       : `UPDATE tbl_efr_advance_payment
             SET adv_status = 3,
-                fin_action_on = NOW(),
+                fin_action_on = ?,
                 fin_action_by = ?,
                 fin_remarks = ?,
-                updated_on = NOW(),
+                updated_on = ?,
                 updated_by = ?
           WHERE advance_id = ? AND adv_status = 1`;
     const [r] = await pool.query(sql, [
+      now,
       req.user.user_id,
       req.body.remarks || null,
+      now,
       req.user.user_id,
       id,
     ]);

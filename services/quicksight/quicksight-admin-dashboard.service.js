@@ -166,13 +166,17 @@ async function openOrders(filters = {}, actingUserId = null) {
   const clientPH = inPlaceholders(clientList);
 
   // QUERY A — Open Orders aging buckets (fetchOpenOrders, repo:20-99).
+  // requested_date_time / original_appointment_date_time are app-written IST
+  // datetimes, so each NOW() they're compared against is a bound Date, same
+  // value for every ? in this statement.
+  const openNow = new Date();
   const openSql = `
     SELECT
       CASE
-        WHEN (CASE WHEN ? = 'requested' THEN TJ.requested_date_time WHEN ? = 'original' THEN TJ.original_appointment_date_time ELSE TJ.requested_date_time END) > NOW() THEN 'Future'
-        WHEN TIMESTAMPDIFF(MINUTE,(CASE WHEN ? = 'requested' THEN TJ.requested_date_time WHEN ? = 'original' THEN TJ.original_appointment_date_time ELSE TJ.requested_date_time END),NOW()) BETWEEN 0 AND 1440 THEN '0-1 days'
-        WHEN TIMESTAMPDIFF(MINUTE,(CASE WHEN ? = 'requested' THEN TJ.requested_date_time WHEN ? = 'original' THEN TJ.original_appointment_date_time ELSE TJ.requested_date_time END),NOW()) BETWEEN 1441 AND 4320 THEN '2-3 days'
-        WHEN TIMESTAMPDIFF(MINUTE,(CASE WHEN ? = 'requested' THEN TJ.requested_date_time WHEN ? = 'original' THEN TJ.original_appointment_date_time ELSE TJ.requested_date_time END),NOW()) BETWEEN 4321 AND 7200 THEN '4-5 days'
+        WHEN (CASE WHEN ? = 'requested' THEN TJ.requested_date_time WHEN ? = 'original' THEN TJ.original_appointment_date_time ELSE TJ.requested_date_time END) > ? THEN 'Future'
+        WHEN TIMESTAMPDIFF(MINUTE,(CASE WHEN ? = 'requested' THEN TJ.requested_date_time WHEN ? = 'original' THEN TJ.original_appointment_date_time ELSE TJ.requested_date_time END),?) BETWEEN 0 AND 1440 THEN '0-1 days'
+        WHEN TIMESTAMPDIFF(MINUTE,(CASE WHEN ? = 'requested' THEN TJ.requested_date_time WHEN ? = 'original' THEN TJ.original_appointment_date_time ELSE TJ.requested_date_time END),?) BETWEEN 1441 AND 4320 THEN '2-3 days'
+        WHEN TIMESTAMPDIFF(MINUTE,(CASE WHEN ? = 'requested' THEN TJ.requested_date_time WHEN ? = 'original' THEN TJ.original_appointment_date_time ELSE TJ.requested_date_time END),?) BETWEEN 4321 AND 7200 THEN '4-5 days'
         ELSE '>5 days'
       END AS date_range,
       COUNT(TJ.job_id) AS job_count
@@ -189,10 +193,10 @@ async function openOrders(filters = {}, actingUserId = null) {
     GROUP BY date_range
     ORDER BY CASE date_range WHEN 'Future' THEN 1 WHEN '0-1 days' THEN 2 WHEN '2-3 days' THEN 3 WHEN '4-5 days' THEN 4 WHEN '>5 days' THEN 5 END`;
   const openParams = [
-    dateMode, dateMode, // Future CASE
-    dateMode, dateMode, // 0-1
-    dateMode, dateMode, // 2-3
-    dateMode, dateMode, // 4-5
+    dateMode, dateMode, openNow, // Future CASE
+    dateMode, dateMode, openNow, // 0-1
+    dateMode, dateMode, openNow, // 2-3
+    dateMode, dateMode, openNow, // 4-5
     verticalId, verticalId,
     zonalManagerId, zonalManagerId,
     applyClientFilter, ...clientList,
@@ -234,13 +238,16 @@ async function openOrders(filters = {}, actingUserId = null) {
   const [callLaterRows] = await pool.query(callLaterSql, callLaterParams);
 
   // QUERY C — Escalation buckets (fetchEscalationOrders, repo:145-179).
+  // escalated_time is app-written (routes/admin/jobs.js binds new Date()), so
+  // each NOW() comparing against it is bound to the same `now` Date below.
+  const now = new Date();
   const escalationSql = `
     SELECT
       CASE
-        WHEN TIMESTAMPDIFF(HOUR, TRC.escalated_time, NOW()) <= 24 THEN '0-24 hrs'
-        WHEN TIMESTAMPDIFF(HOUR, TRC.escalated_time, NOW()) > 24 AND TIMESTAMPDIFF(HOUR, TRC.escalated_time, NOW()) <= 48 THEN '24-48 hrs'
-        WHEN TIMESTAMPDIFF(HOUR, TRC.escalated_time, NOW()) > 48 AND TIMESTAMPDIFF(HOUR, TRC.escalated_time, NOW()) <= 72 THEN '48-72 hrs'
-        WHEN TIMESTAMPDIFF(HOUR, TRC.escalated_time, NOW()) > 72 THEN '>72 hrs'
+        WHEN TIMESTAMPDIFF(HOUR, TRC.escalated_time, ?) <= 24 THEN '0-24 hrs'
+        WHEN TIMESTAMPDIFF(HOUR, TRC.escalated_time, ?) > 24 AND TIMESTAMPDIFF(HOUR, TRC.escalated_time, ?) <= 48 THEN '24-48 hrs'
+        WHEN TIMESTAMPDIFF(HOUR, TRC.escalated_time, ?) > 48 AND TIMESTAMPDIFF(HOUR, TRC.escalated_time, ?) <= 72 THEN '48-72 hrs'
+        WHEN TIMESTAMPDIFF(HOUR, TRC.escalated_time, ?) > 72 THEN '>72 hrs'
       END AS escalation_bucket,
       COUNT(*) AS COUNT
     FROM tbl_job TJ
@@ -256,6 +263,7 @@ async function openOrders(filters = {}, actingUserId = null) {
     GROUP BY escalation_bucket
     ORDER BY CASE escalation_bucket WHEN '0-24 hrs' THEN 1 WHEN '24-48 hrs' THEN 2 WHEN '48-72 hrs' THEN 3 WHEN '>72 hrs' THEN 4 END`;
   const escalationParams = [
+    now, now, now, now, now, now,
     verticalId, verticalId,
     zonalManagerId, zonalManagerId,
     applyClientFilter, ...clientList,

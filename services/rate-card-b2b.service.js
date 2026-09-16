@@ -122,11 +122,12 @@ async function createRateCard({ crc_ratecard_name, crc_servicetype_id, createdBy
   );
   if (dup) throw mkErr(409, `B2B rate card "${name}" already exists for this service type`);
 
+  const createNow = new Date();
   const [r] = await pool.query(
     `INSERT INTO tbl_client_rate_card
        (crc_servicetype_id, crc_ratecard_name, status, insert_date, update_date, updated_by)
-     VALUES (?, ?, 1, NOW(), NOW(), ?)`,
-    [Number(crc_servicetype_id), name, createdBy || null]
+     VALUES (?, ?, 1, ?, ?, ?)`,
+    [Number(crc_servicetype_id), name, createNow, createNow, createdBy || null]
   );
   logger.info('B2B rate card created · id=' + r.insertId);
   return getRateCardById(r.insertId);
@@ -160,8 +161,8 @@ async function updateRateCard(id, fields, updatedBy) {
   }
   if (!sets.length) throw mkErr(400, 'No mutable fields supplied');
 
-  sets.push('update_date = NOW()', 'updated_by = ?');
-  params.push(updatedBy || null, id);
+  sets.push('update_date = ?', 'updated_by = ?');
+  params.push(new Date(), updatedBy || null, id);
   await pool.query(`UPDATE tbl_client_rate_card SET ${sets.join(', ')} WHERE crc_id = ?`, params);
   logger.info('B2B rate card updated · id=' + id);
   return getRateCardById(id);
@@ -174,9 +175,9 @@ async function deactivateRateCard(id, updatedBy) {
   // addDeleteClientRateCard which sets status=3 directly.
   const [r] = await pool.query(
     `UPDATE tbl_client_rate_card
-        SET status = 3, update_date = NOW(), updated_by = ?
+        SET status = 3, update_date = ?, updated_by = ?
       WHERE crc_id = ? AND status <> 3`,
-    [updatedBy || null, id]
+    [new Date(), updatedBy || null, id]
   );
   logger.info('B2B rate card deleted · id=' + id + ' · affected=' + r.affectedRows);
   return r.affectedRows > 0;

@@ -615,24 +615,25 @@ function isTodaysWork(j) {
  */
 async function fetchDateCounts(efrId) {
   try {
+    const now = new Date();
     const [[row]] = await pool.query(
       `SELECT
          COUNT(CASE WHEN job_status IN (${ACTIVE_STATUSES})
                      AND (send_back_to_tx = 0 OR send_back_to_tx IS NULL)
-                     AND ${WORK_DATE_SQL} = CURDATE() THEN 1 END) AS activeToday,
+                     AND ${WORK_DATE_SQL} = DATE(?) THEN 1 END) AS activeToday,
          COUNT(CASE WHEN job_status IN (${ACTIVE_STATUSES})
                      AND (send_back_to_tx = 0 OR send_back_to_tx IS NULL)
-                     AND ${WORK_DATE_SQL} < CURDATE() THEN 1 END) AS \`delayed\`,
+                     AND ${WORK_DATE_SQL} < DATE(?) THEN 1 END) AS \`delayed\`,
          COUNT(CASE WHEN job_status IN (${ACTIVE_STATUSES})
-                     AND requested_date_time < NOW()
+                     AND requested_date_time < ?
                      AND ${NOT_STARTED_SQL} THEN 1 END)           AS overdue,
          COUNT(CASE WHEN job_status IN (${ACTIVE_STATUSES})
-                     AND ${WORK_DATE_SQL} > CURDATE() THEN 1 END) AS upcoming,
+                     AND ${WORK_DATE_SQL} > DATE(?) THEN 1 END) AS upcoming,
          COUNT(CASE WHEN job_status IN (${ACTIVE_STATUSES}) THEN 1 END) AS allJobs,
          COUNT(CASE WHEN send_back_to_tx = 1 AND job_status = 2 THEN 1 END) AS actionRequired
        FROM tbl_job
        WHERE fk_easyfixter_id = ?`,
-      [efrId],
+      [now, now, now, now, efrId],
     );
     return {
       activeToday:    Number(row?.activeToday ?? 0),
