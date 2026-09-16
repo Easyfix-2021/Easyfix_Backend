@@ -8211,6 +8211,9 @@ module.exports = {
   // tbl_job.client_services CSV in sync after the customer's self-submit
   // mutates tbl_job_services. Single source of truth, one helper.
   recomputeClientServicesCsv,
+  // The tbl_job_services audit-column probe create() stamps with — exported so
+  // the one-list services editor stamps new rows the same way.
+  jobServicesCreatedByColumn,
   list, getById, getByIdCore, getStatusCounts, getPendingSchedulingCounts, getPendingStartCounts, getAttentionSummary, create, update, setStatus, assign, reschedule, unassign, acceptOffer, changeOwner,
   /*
    * The job's inherited Project Manager / Zonal Manager display names. Exported
