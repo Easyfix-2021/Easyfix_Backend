@@ -31,9 +31,11 @@
  *   — we deliberately do NOT match by that string (it's drift-prone)
  *   and use the integer IDs only.
  *     5  → Job CheckOut Remarks  (the "Add Remarks" / comments popup)
- *     8  → Reschedule            (Schedule & Assign → Reschedule)
  *     24 → Enquiry               (JobOutcomeDialog mode='enquiry')
  *     25 → Un Reachable          (JobOutcomeDialog mode='unreachable')
+ *     29 → Reschedule Before Start from CRM  (the per-party Reschedule dialog)
+ *   and NOT 8 ("Reject & Reschedule"), which /admin/jobs/reschedule-reasons
+ *   still serves unfiltered for the older dialog — see the `reschedule` note.
  */
 
 const DUE_TO_USER_TYPE = Object.freeze({
@@ -50,45 +52,50 @@ const ACTION_TYPE_BY_MODE = Object.freeze({
   // name without re-hardcoding.
   addremarks: 5,
   /*
-   * Reschedule → action_type = 8, the bucket seeded by
-   * migrations/executed/2026-07-10-seed-reschedule-reasons-action-type-8.sql.
+   * ── Reschedule → action_type 29, "Reschedule Before Start from CRM" ──
    *
-   * ⚠⚠ THE SEEDED user_type VALUES FOLLOW THE MAPPING THIS FILE LATER
-   * DISPROVED, so `?type=reschedule&dueTo=…` is wired correctly and will
-   * nonetheless return the WRONG PARTY'S list until the rows are corrected.
-   * The migration is dated 2026-07-10 and its own header cites
-   * "1=Customer, 2=Client, 3=EasyFix, 4=Technician"; DUE_TO_USER_TYPE above was
-   * corrected against the legacy .vm source four days later, on 2026-07-14, to
-   * 1=EasyFix, 2=Customer, 3=Client. Reading the six seeded rows through the
-   * corrected map:
-   *   user_type 1  the three "Customer requested / not reachable / not
-   *                available" reasons → served under dueTo=easyfix
-   *   user_type 3  "Spare / parts not available", "Operational / scheduling
-   *                delay" (both EasyFix-side) → served under dueTo=client
-   *   user_type 4  "Technician unavailable / reassigned" → dueTo=technician ✓
-   *   user_type 2  nothing at all → dueTo=customer returns an EMPTY list
-   * Technician lines up in both schemes, which is precisely what masked the
-   * original error and will mask this one: the radio looks like it works.
+   * THIS WAS 8 FOR ONE COMMIT AND IS NOW 29, and the reason is worth keeping:
+   * 8's rows cannot answer a "Rescheduling Due To" radio and 29's already can.
+   * Both buckets profiled on QA, 2026-09-16:
    *
-   * THIS IS DATA, NOT CODE. The fix is an UPDATE of those six rows' user_type
-   * (1→2 for the customer-worded ones, 3→1 for the EasyFix-worded ones) run by
-   * whoever owns the reason catalogue, and it must land BEFORE the CRM points a
-   * "Rescheduling Due To" radio at this mode. Nothing here should compensate
-   * for it: a per-mode fudge of DUE_TO_USER_TYPE would make this map mean two
-   * different things, which is the whole disease.
+   *   action_type 8  "Reject & Reschedule" — 7 rows, ALL user_type 1
+   *       (ids 47-51, 62, 68; is_new = 0). So dueTo=easyfix would return all
+   *       seven and customer / client / technician each return NOTHING. Two of
+   *       the seven are customer-worded ("Customer has postponed", "Customer is
+   *       not responding") while sitting under EasyFix, so its parties are both
+   *       incomplete AND partly wrong.
+   *   action_type 29 "Reschedule Before Start from CRM" — 16 rows, is_new = 1,
+   *       all status 1: EasyFix 3 · Customer 6 · Client 2 · Technician 5. All
+   *       four parties populated.
    *
-   * Registering the mode here is the whole change: it makes the EXISTING
-   * generic endpoint answer for reschedule too —
-   *     GET /admin/jobs/action-reasons?type=reschedule&dueTo=<party>
-   * which is action_type = 8 narrowed by user_type through DUE_TO_USER_TYPE
-   * above. That is what the Reschedule dialog needs once it grows a
-   * "Rescheduling Due To" radio like Cancel and Add Remarks already have.
+   * 29'S PARTIES ARE RIGHT, and the WORDING proves it rather than asserting it:
+   * all six user_type = 2 rows are prefixed "CX" and all five user_type = 4 rows
+   * are prefixed "TX". Under the map this file disproved, 2 would mean Client
+   * and every one of those CX rows would be misfiled — they are not. 29 was
+   * seeded against the CORRECTED convention, which is exactly what the radio
+   * needs and what 8 cannot give it.
    *
-   * GET /admin/jobs/reschedule-reasons IS DELIBERATELY UNCHANGED. It returns
-   * action_type = 8 with NO user_type filter, which is the right answer for the
-   * single-dropdown dialog shipping today; narrowing it would silently shrink a
-   * live list to one party's reasons. Two endpoints, two questions — the FE
-   * moves when its dialog does.
+   * ⚠ 29 IS OLDER THAN IT LOOKS, AND DORMANT RATHER THAN NEW. It carries
+   * 142,434 comments to 8's 37,873, but its last use was 2026-04-29 — the
+   * legacy-CRM cutover — while 8 is still written today because
+   * /reschedule-reasons hardcodes it. So this is not "move to the newer
+   * bucket": it is adopting the better-organised bucket the legacy CRM used and
+   * this stack never picked up. Ops will recognise the reasons, which is half
+   * the point.
+   *
+   * GET /admin/jobs/reschedule-reasons STAYS ON 8, deliberately. The Current
+   * tab's Reschedule dialog still calls it with one unfiltered dropdown, and
+   * repointing it would swap the list under a live screen. Two endpoints, two
+   * buckets, until the owner retires the old one:
+   *     /action-reasons?type=reschedule&dueTo=<party>   → 29, per party  (NEW)
+   *     /reschedule-reasons                             → 8,  unfiltered (OLD)
+   *
+   * The seed migration that put six rows into bucket 8
+   * (migrations/executed/2026-07-10-…-action-type-8.sql) is NOT applied on QA —
+   * none of its six descriptions is present — so bucket 8 there is the legacy
+   * seven above. Check prod before assuming otherwise: if it DID run there,
+   * bucket 8 holds thirteen rows written under two different party conventions,
+   * which is one more reason the new dialog should not be pointed at it.
    *
    * No new column and nothing to write: due-to is recoverable from the reason
    * id itself (action_taken_reason.user_type), and reschedule already stores
@@ -96,7 +103,7 @@ const ACTION_TYPE_BY_MODE = Object.freeze({
    * no dueTo field, and adding one would create a second, desynchronisable
    * record of the same fact.
    */
-  reschedule: 8,
+  reschedule: 29,
   // JobOutcomeDialog modes — keys match the FE `mode` value verbatim
   // after lowercasing + whitespace/underscore/dash stripping.
   enquiry: 24,
@@ -106,22 +113,22 @@ const ACTION_TYPE_BY_MODE = Object.freeze({
 /*
  * ── `dueTo=any`: an EXPLICIT "no party filter", only where it is needed ──
  *
- * THIS EXISTS BECAUSE THE DATA IS KNOWN-WRONG, NOT BECAUSE THE FILTER IS
- * OPTIONAL. The six action_type = 8 rows carry user_type values seeded against
- * the mapping DUE_TO_USER_TYPE later disproved (the `reschedule` note above has
- * the whole story), so `dueTo=customer` legitimately returns an EMPTY list on
- * today's catalogue. The owner has decided to leave those values as they are
- * for now, so the CRM needs to reach the whole bucket through the same endpoint
- * shape it already calls:
+ * IT IS NOW REDUNDANT FOR ITS ORIGINAL PURPOSE, AND KEPT ON PURPOSE. It was
+ * added while `reschedule` still pointed at action_type 8, whose rows sit
+ * entirely under one party, so `dueTo=customer` returned an empty list and the
+ * CRM needed a way to fall back to the whole bucket through the endpoint shape
+ * it already called:
  *     GET /admin/jobs/action-reasons?type=reschedule&dueTo=any
- * which returns exactly what /reschedule-reasons returns — every active
- * action_type = 8 row, in the same { id, label } shape.
+ * Pointing the mode at 29 fixes that at the source — all four parties have
+ * rows — so nothing should NEED this any more. It stays until the owner
+ * retires bucket 8 and the old dialog with it, because a CRM already shipped
+ * against this call must not start 400ing (it does not 400 today either: `any`
+ * is stripped to the user_type = 2 default on the other modes) or, worse, start
+ * silently returning one party's list where it used to return all of them.
  *
- * ⚠ DELETE THIS, AND THE BRANCH IN /action-reasons THAT READS IT, THE DAY THOSE
- * SIX user_type VALUES ARE CORRECTED. It is a workaround for a data defect with
- * a known fix, not part of the reason model: once the catalogue is right every
- * party's list is correct and non-empty, and a lingering "any" would quietly
- * let a due-to radio send no party at all.
+ * ⚠ DELETE THIS, AND THE BRANCH IN /action-reasons THAT READS IT, when the old
+ * Reschedule dialog goes. It is a workaround, not part of the reason model: a
+ * lingering "any" quietly lets a due-to radio send no party at all.
  *
  * SCOPED TO THE MODES THAT OPT IN — `reschedule` alone today. Deliberately NOT
  * a DUE_TO_USER_TYPE key: that would hand EVERY mode an unfiltered escape

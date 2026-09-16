@@ -7332,6 +7332,28 @@ async function listOffers(jobId, { sweep = true } = {}) {
    * do not.
    */
   if (sweep) await expireStaleOffers(OFFER_TTL_MINUTES, jobId);
+  /*
+   * WHY an offer closed — beside the EXPIRED chip, which says only THAT it did.
+   *
+   * offer_status = 3 is written by EIGHT distinct code paths and only one of
+   * them is the 30-minute timeout; the rest fire when the job is assigned,
+   * rescheduled, released, withdrawn, re-offered, or when a sibling technician
+   * accepts. So the chip alone cannot answer the question this modal is opened
+   * to ask — "did this technician ignore the job?" — and on job 538177 it
+   * answered it wrongly. tbl_job_offer.closed_reason was added to record the
+   * difference, and until now nothing read it back.
+   *
+   * THE PROBE IS THE SHARED ONE, never a fourth copy: services/
+   * offer-closed-reason.js owns this column and memoises ONE answer for every
+   * reader and writer (its docblock explains why three copies would be three
+   * memos that can disagree). Column absent ⇒ a NULL alias, so the row shape is
+   * identical on a deploy predating
+   * migrations/2026-09-10-job-offer-closed-reason.sql.
+   */
+  const closedReason = require('./offer-closed-reason');
+  const closedReasonSelect = (await closedReason.hasOfferClosedReasonCol())
+    ? 'jo.closed_reason'
+    : 'NULL AS closed_reason';
   // Latest offer row PER technician — a re-offer can leave more than one row for
   // the same (job, tech), so MAX(job_offer_id) picks the current one. Surfaced
   // states: OFFERED (live), REJECTED, EXPIRED — the Schedule & Assign modal shows
@@ -7341,7 +7363,7 @@ async function listOffers(jobId, { sweep = true } = {}) {
   const [rows] = await pool.query(
     `SELECT jo.fk_easyfixter_id AS efr_id, ef.efr_name, jo.offered_at, jo.responded_at,
             jo.offer_status, jo.offer_status_label, jo.offer_count, jo.offer_source,
-            jo.reject_reason,
+            jo.reject_reason, ${closedReasonSelect},
             -- efr_no is the canonical technician mobile; the mask-mobile
             -- middleware redacts it in transit, and click-to-call re-resolves
             -- the real number server-side from efr_id, so the FE never holds it.
@@ -7361,6 +7383,22 @@ async function listOffers(jobId, { sweep = true } = {}) {
                jo.offered_at DESC`,
     [jobId],
   );
+  /*
+   * The human label beside the raw value, never instead of it. The FE renders
+   * the label under the chip; the raw token is what a report, a filter or a
+   * future bug hunt keys on, and it is the value the writer actually stored.
+   *
+   * NULLS ARE PRESERVED, and the distinction matters: on an EXPIRED row NULL
+   * means "closed before this column existed", not "unknown cause" — every
+   * current writer sets it. An unrecognised token (a value a newer deploy
+   * wrote and this one has no label for) also yields a null LABEL rather than
+   * echoing the raw token dressed up as prose.
+   */
+  for (const r of rows) {
+    r.closed_reason_label = r.closed_reason == null
+      ? null
+      : (closedReason.OFFER_CLOSED_REASON_LABEL[r.closed_reason] ?? null);
+  }
   logger.info('Found ' + rows.length + ' offers (live+rejected+expired) · jobId=' + jobId);
   return rows;
 }
