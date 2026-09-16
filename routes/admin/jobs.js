@@ -10,6 +10,7 @@ const logger = require('../../logger');
 const {
   listQuery, createBody, updateBody, statusBody, assignBody, offerBody, ownerBody, rescheduleBody, idParam,
   appRequestRejectBody, candidatesQuery, candidatesSearchQuery, slotRecommendationsQuery,
+  pendingSchedulingCountsQuery,
 } = require('../../validators/job.validator');
 const { assertEntityInScope } = require('../../lib/scope');
 const requireStageForTransition = require('../../middleware/require-stage');
@@ -717,6 +718,55 @@ router.get('/counts', async (req, res, next) => {
     // (routes/admin/index.js). Admin/Finance get undefined → no row filter.
     const counts = await job.getStatusCounts({
       ownerId: Number.isFinite(ownerId) ? ownerId : undefined,
+      scope: req.scope,
+      allowedStages: req.allowedStages,
+    });
+    modernOk(res, counts);
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/admin/jobs/pending-scheduling/counts
+ *
+ * The four tab counts above My Orders → Pending for Scheduling:
+ *
+ *   { all, pending, offered, expired }        all = pending + offered + expired
+ *
+ * The keys ARE the `offerState` values the list endpoint takes, so each tab is
+ * one query-string change on the grid beneath it:
+ *   all      → (no offerState)   the bucket, unfiltered
+ *   pending  → offerState=pending   "Not offered"      nobody asked yet
+ *   offered  → offerState=offered   "Offered-waiting"  an offer is still open
+ *   expired  → offerState=expired   "No takers"        offered, none open
+ *
+ * Accepts the SAME filters the grid sends (q, categoryId, cityId, clientId,
+ * zonalManagerId — validated by schemas extracted from listQuery itself) and
+ * NOT offerState, which would collapse three of the four numbers to zero; the
+ * schema drops it rather than 400ing a client that forwards its whole query
+ * string. The bucket (status 0 + unassigned), the RBAC scope and Job Stage
+ * Access are applied by the service through job.list()'s own WHERE, so the
+ * strip and the page can never describe different populations.
+ *
+ * `all` is the sum of the three rather than a COUNT(*) — see
+ * getPendingSchedulingCounts for the one row shape where those differ.
+ *
+ * Mounted beside /counts, i.e. ABOVE the bare `/:id` route: two static segments,
+ * so `idParam` never sees "pending-scheduling" (the /counts, /escalated and
+ * /export.xlsx gotcha).
+ */
+router.get('/pending-scheduling/counts', validate(pendingSchedulingCountsQuery, 'query'), async (req, res, next) => {
+  try {
+    logger.info('Fetch pending-for-scheduling tab counts · clientId=' + (req.query.clientId ?? '-')
+      + ' cityId=' + (req.query.cityId ?? '-') + ' q=' + (req.query.q ? 'yes' : '-'));
+    /*
+     * req.scope — the hierarchy-unioned scope the global admin middleware
+     * already built for THIS request (routes/admin/index.js), the same value
+     * the list handler recomputes from the same function on the same request.
+     * Admin/Finance get undefined → no row filter. Same source as the sibling
+     * /counts and /attention-summary handlers.
+     */
+    const counts = await job.getPendingSchedulingCounts({
+      ...req.query,
       scope: req.scope,
       allowedStages: req.allowedStages,
     });

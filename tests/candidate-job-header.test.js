@@ -35,6 +35,11 @@ const REQUIRED = [
   // Quantity row (2026-09-11): read by the panel, never projected until now.
   'product_quantity',
   'requested_date_time', 'time_slot', 'booking_cut_off_time_slot',
+  // The ORIGINAL appointment (2026-09-16): what was promised at booking, shown
+  // beside the appointment that may since have moved. Both columns already
+  // reach GET /jobs/:id through j.*; the allowlist is what kept them out of
+  // this payload, which is the failure mode this file exists for.
+  'original_appointment_date_time', 'original_appointment_time',
   'job_desc', 'efr_special_notes',
   'created_by_name', 'created_date_time', 'assigned_efr_id',
 ];

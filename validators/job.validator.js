@@ -290,6 +290,36 @@ const listQuery = Joi.object({
   offset: Joi.number().integer().min(0).default(0),
 });
 
+/*
+ * ── The Pending-for-Scheduling TAB STRIP (2026-09-16) ─────────────────────
+ *
+ * GET /jobs/pending-scheduling/counts answers "how many jobs sit behind each of
+ * the four tabs" for the page the operator is looking at, so it has to be
+ * filtered by exactly what that page is filtered by — and validated by exactly
+ * the same rules, or a value the grid accepts could 400 the strip above it (or
+ * the reverse) and the two would describe different populations.
+ *
+ * So each key is EXTRACTED from listQuery rather than re-declared. A tightened
+ * bound, a widened CSV cap or a new custom message on the list's `cityId`
+ * arrives here automatically; a hand-copied `csvIds.optional()` would not, and
+ * nothing would say so — the CSV_IDS_MAX note above is what a drifting copy of
+ * one of these limits looks like from the operator's side.
+ *
+ * `offerState` is NOT in the list, deliberately: this endpoint returns one count
+ * PER state, so accepting the filter that selects a single state would be
+ * accepting a parameter that can only make three of its four numbers wrong.
+ * validate() runs with stripUnknown, so a client that sends it anyway (the same
+ * query string as the grid, say) is served correctly rather than 400'd — the key
+ * is dropped before the service is called.
+ *
+ * The bucket pins (status = 0 + unassigned) are NOT accepted either: they are
+ * the endpoint's identity, applied by getPendingSchedulingCounts.
+ */
+const PENDING_SCHEDULING_COUNT_FILTERS = ['q', 'categoryId', 'cityId', 'clientId', 'zonalManagerId'];
+const pendingSchedulingCountsQuery = Joi.object(Object.fromEntries(
+  PENDING_SCHEDULING_COUNT_FILTERS.map((key) => [key, listQuery.extract(key)]),
+));
+
 const customerBlock = Joi.object({
   customer_id: intId.optional(),
   customer_name: Joi.string().max(255).when('customer_id', { is: Joi.exist(), then: Joi.optional(), otherwise: Joi.required() }),
@@ -677,4 +707,7 @@ const idParam = Joi.object({ id: intId.required() });
 module.exports = {
   listQuery, createBody, updateBody, statusBody, assignBody, offerBody, ownerBody, idParam,
   rescheduleBody, appRequestRejectBody, candidatesQuery, candidatesSearchQuery, slotRecommendationsQuery,
+  // The tab-strip schema plus the key list it is built from — exported together
+  // so a test can assert the strip honours every filter the grid sends.
+  pendingSchedulingCountsQuery, PENDING_SCHEDULING_COUNT_FILTERS,
 };
