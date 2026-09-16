@@ -340,6 +340,49 @@ router.get('/:id/candidates',
   });
 
 /*
+ * GET /api/admin/jobs/:id/header
+ *
+ * The Schedule & Assign console's job header with NONE of the ranking work
+ * /candidates does: no stale-offer expiry, no technician ranking, no offer-flow
+ * or offerability resolution. Accepted jobs (status 1) are the main consumer —
+ * they already have a technician, so ranking the pool to draw their header was
+ * pure cost.
+ *
+ *   { job }   where job =
+ *     exactly the object buildJobHeader produces for /candidates (services with
+ *     unit_price / line_total, timeline, managers, age, payment), PLUS
+ *     job_status, is_cancelled_by_app, is_rescheduled_by_app, cancel_date_time,
+ *     reschedule_at_app, reschedule_date_time_app, app_request_reason — under
+ *     the /admin/jobs LIST's names, so the CRM's appRequestOf(job) works on it
+ *     unchanged — PLUS efr_id, efr_name, efr_mobile for the assigned technician
+ *     (nulls while unassigned; efr_mobile masked in transit).
+ *
+ * Guarded exactly as /candidates is: the /api/admin/* chain plus scopedJob,
+ * which 404s a job outside the caller's scope before the header is built. Not a
+ * write, so no stage or action guard — the same as /candidates.
+ *
+ * Read-only by construction: /candidates' lazy expireStaleOffers is a WRITE and
+ * is deliberately NOT called here. A header is drawn on every console open, and
+ * a GET that mutates offer state on a mouse-driven path is the hover-card bug
+ * listOffers' `sweep:false` was added to avoid.
+ *
+ * Literal second segment "header", so no collision with `/:id`.
+ */
+router.get('/:id/header',
+  validate(idParam, 'params'),
+  scopedJob,
+  async (req, res, next) => {
+    try {
+      logger.info('Build console header · jobId=' + req.params.id);
+      const header = await candidateRanking.consoleHeaderForJob(req.scopedJob);
+      modernOk(res, { job: header });
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  });
+
+/*
  * GET /api/admin/jobs/:id/slot-recommendations?date=YYYY-MM-DD
  *
  * Which of the four booking windows can actually be STAFFED on that date.
