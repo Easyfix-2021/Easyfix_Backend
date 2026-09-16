@@ -207,7 +207,7 @@ router.get('/:id/selfie-url',
       // One HEAD per selfie view — opened by a human looking at one job, not a
       // list. The resolver (and why it HEADs before presigning) is shared with
       // the technician's GET /mobile/jobs/:id.
-      const url = await job.resolveSelfieUrl(selfieId, req.params.id);
+      const url = (await job.resolveSelfie(selfieId, req.params.id))?.url ?? null;
       logger.info('Resolved selfie url · jobId=' + req.params.id + ' · has=' + !!url);
       modernOk(res, { selfieId, url });
     } catch (e) {

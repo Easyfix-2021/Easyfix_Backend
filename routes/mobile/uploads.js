@@ -193,10 +193,16 @@ router.post('/document', upload.single('file'), verifyIdempotencyUpload, async (
     // Persist a document row so a numeric FK can reference it. S3 KEY → `path`
     // (resolver presigns from it); url + document_type_id left NULL. created_by
     // is the technician's efr_id (nullable column — matches the legacy insert).
+    //
+    // created_on is BOUND, not SQL NOW() (2026-09-16). Start Work now shows the
+    // arrival selfie's "Recorded" time from this column, so it must be IST.
+    // NOW() is the DB SESSION zone (SYSTEM — the host clock, IST on QA when
+    // probed, unverified elsewhere); a bound Date goes through the pool's
+    // explicit timezone '+05:30' and is IST on any host.
     const [ins] = await pool.query(
       'INSERT INTO document (`path`, url, file_name, created_on, created_by, document_type_id) '
-      + 'VALUES (?, NULL, ?, NOW(), ?, NULL)',
-      [key, req.file.originalname || null, efrId || null],
+      + 'VALUES (?, NULL, ?, ?, ?, NULL)',
+      [key, req.file.originalname || null, new Date(), efrId || null],
     );
     const documentId = ins.insertId;
 

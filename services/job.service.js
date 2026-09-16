@@ -3414,8 +3414,11 @@ async function getById(jobId) {
 }
 
 /*
- * Resolve a reached-location selfie (tbl_job.tx_selfie_id → document.id) to a
- * renderable URL, or null. ONE resolver for both readers: the CRM's
+ * Resolve a reached-location selfie (tbl_job.tx_selfie_id → document.id) to
+ * `{ url, recordedAt }`, or null when there is no document row. `url` may still
+ * be null (key absent, no legacy url). `recordedAt` is document.created_on — the
+ * UPLOAD moment, an IST wall-clock string (pool dateStrings + '+05:30'), which
+ * the app shows under the thumbnail. ONE resolver for both readers: the CRM's
  * GET /admin/jobs/:id/selfie-url and the technician's GET /mobile/jobs/:id,
  * which shows the recorded selfie back on Start Work so it can be kept or
  * retaken (2026-09-16).
@@ -3430,10 +3433,10 @@ async function getById(jobId) {
  * Legacy rows store an absolute URL on the old file host — upgraded http →
  * https, because an https page blocks an http image.
  */
-async function resolveSelfieUrl(selfieId, jobId) {
+async function resolveSelfie(selfieId, jobId) {
   if (!selfieId) return null;
   const s3Storage = require('../utils/s3-storage');
-  const [[doc]] = await pool.query('SELECT `path`, url FROM document WHERE id = ? LIMIT 1', [selfieId]);
+  const [[doc]] = await pool.query('SELECT `path`, url, created_on FROM document WHERE id = ? LIMIT 1', [selfieId]);
   if (!doc) return null;
 
   const key = String(doc.path || '').trim();
@@ -3450,7 +3453,7 @@ async function resolveSelfieUrl(selfieId, jobId) {
     }
   }
   if (!url && doc.url) url = String(doc.url).replace(/^http:\/\//i, 'https://');
-  return url;
+  return { url, recordedAt: doc.created_on || null };
 }
 
 /*
@@ -7639,7 +7642,7 @@ module.exports = {
   // tbl_job.client_services CSV in sync after the customer's self-submit
   // mutates tbl_job_services. Single source of truth, one helper.
   recomputeClientServicesCsv,
-  list, getById, getByIdCore, resolveSelfieUrl, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, reschedule, unassign, acceptOffer, changeOwner,
+  list, getById, getByIdCore, resolveSelfie, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, reschedule, unassign, acceptOffer, changeOwner,
   hasAfterWorkPhoto, afterPhotoRequiredError,
   // Technician app requests. rejectAppRequest is the Reject button; there is no
   // approve twin because Approve is the ordinary cancel/reschedule, and
