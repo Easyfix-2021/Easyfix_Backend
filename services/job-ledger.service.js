@@ -49,8 +49,9 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const { ACTIVE_SERVICES_SQL } = require('./job-line-total');
+const { SOURCE } = require('./ledger-source');
 
-const SOURCE_SYSTEM = 1;          // tbl_*_transaction.source: 1 = from system (what the SP is passed)
+const SOURCE_SYSTEM = SOURCE.SYSTEM;   // tbl_*_transaction.source: 1 = from system (what the SP is passed)
 const DEBIT = 1;
 const CREDIT = 2;
 const CANCELLED = 6;
@@ -386,6 +387,89 @@ async function inLedgerTransaction(fn, { db = pool, attempts = 2 } = {}) {
   }
 }
 
+function badLedgerType(type) {
+  const err = new Error('ledger transaction_type must be 1 (debit) or 2 (credit), got ' + type);
+  err.status = 400; err.code = 'LEDGER_BAD_TYPE';
+  return err;
+}
+
+/**
+ * Take THE ledger lock — the one every Node writer of these tails must hold.
+ *
+ * Two writers under two different lock names are not serialised at all: they
+ * read one tail and both append from it, and the chain forks permanently. That
+ * is what finance.js's own `client_ledger_<id>` lock did against this service's
+ * lock, so both are now this one name.
+ *
+ * Call it INSIDE inLedgerTransaction — which releases it after commit/rollback
+ * and destroys the connection if the release fails, because GET_LOCK is
+ * re-entrant per session and a leaked lock would travel to the next borrower —
+ * and AFTER any domain row the caller locks first (the recharge row, the
+ * withdrawal request, the job), which is the order postCompletionLedger uses.
+ */
+async function acquireLedgerLock(conn) {
+  const [[lock]] = await conn.query('SELECT GET_LOCK(?, ?) AS got', [LEDGER_LOCK, LEDGER_LOCK_TIMEOUT_S]);
+  if (Number(lock && lock.got) !== 1) throw ledgerBusy();
+}
+
+/**
+ * Append ONE row to a technician's ledger and re-point the cache at it.
+ *
+ * `tbl_easyfixer.current_balance` is a CACHE of the ledger tail, nothing more
+ * (3,926 of 3,927 technicians on QA). So the balance is derived from the tail —
+ * read FOR UPDATE, never from the cache — and the cache is then set to it
+ * ABSOLUTELY. A relative `current_balance = current_balance - ?` looks
+ * equivalent and is not: it preserves whatever drift the cache already carried,
+ * and an increment with no ledger row (what NDM approval used to do) is erased
+ * by the next writer that recomputes the cache from the tail.
+ *
+ * `amount` is always the positive MAGNITUDE; the sign lives in `type`, exactly
+ * as legacy stores it (0 negative amounts in 330,844 QA client rows).
+ * Returns null when the technician row does not exist, so the caller can refuse
+ * rather than credit an orphan.
+ */
+async function appendTechnicianLedgerEntry(conn, {
+  efrId, type, amount, description, source = SOURCE.SYSTEM, createdBy = null, jobId = 0, at = new Date(),
+}) {
+  if (type !== DEBIT && type !== CREDIT) throw badLedgerType(type);
+  const [[tech]] = await conn.query('SELECT efr_id FROM tbl_easyfixer WHERE efr_id = ? FOR UPDATE', [efrId]);
+  if (!tech) return null;
+  const [[tailRow]] = await conn.query(
+    'SELECT balance FROM tbl_easyfixer_transaction WHERE easyfixer_id = ? ORDER BY transaction_id DESC LIMIT 1 FOR UPDATE',
+    [efrId],
+  );
+  const amt = round2(amount);
+  const balance = round2(num(tailRow && tailRow.balance) + signed({ type, amount: amt }));
+  const [ins] = await conn.query(
+    `INSERT INTO tbl_easyfixer_transaction
+       (easyfixer_id, source, description, transaction_type, transaction_date, amount, balance, created_date, created_by, job_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [efrId, source, description || null, type, at, amt, balance, at, createdBy, jobId],
+  );
+  await conn.query('UPDATE tbl_easyfixer SET current_balance = ?, balance_updated = ? WHERE efr_id = ?', [balance, at, efrId]);
+  return { transactionId: ins.insertId, balance };
+}
+
+/** The client-side twin of appendTechnicianLedgerEntry. No cache column exists here. */
+async function appendClientLedgerEntry(conn, {
+  clientId, type, amount, description, source = SOURCE.SYSTEM, createdBy = null, jobId = null, at = new Date(),
+}) {
+  if (type !== DEBIT && type !== CREDIT) throw badLedgerType(type);
+  const [[tailRow]] = await conn.query(
+    'SELECT balance FROM tbl_client_transaction WHERE client_id = ? ORDER BY client_trans_id DESC LIMIT 1 FOR UPDATE',
+    [clientId],
+  );
+  const amt = round2(amount);
+  const balance = round2(num(tailRow && tailRow.balance) + signed({ type, amount: amt }));
+  const [ins] = await conn.query(
+    `INSERT INTO tbl_client_transaction
+       (client_id, job_id, source, transaction_type, amount, balance, description, transaction_date, created_date, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [clientId, jobId, source, type, amt, balance, description || null, at, at, createdBy],
+  );
+  return { transactionId: ins.insertId, balance };
+}
+
 /**
  * What completing this job would post, and whether it can — for the CRM's
  * Complete Audit dialog and the backfill dry run. Writes nothing.
@@ -416,10 +500,14 @@ module.exports = {
   postCompletionLedger,
   releaseLedgerLock,
   inLedgerTransaction,
+  acquireLedgerLock,
+  appendTechnicianLedgerEntry,
+  appendClientLedgerEntry,
   ledgerBusy,
   previewCompletionLedger,
   unpostableReason,
   LEDGER_LOCK,
+  SOURCE,
   DEBIT,
   CREDIT,
 };
