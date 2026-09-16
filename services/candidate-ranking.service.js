@@ -1728,6 +1728,16 @@ function buildJobHeader(job, {
   serviceTypeName = null,
   deepSkillLabel = null,
   jobSkillsByService = null,
+  /*
+   * The job's inherited managers, resolved by jobService.getJobManagerNames —
+   * options rather than row columns because neither is on tbl_job (the PM comes
+   * from the client's vertical mapping, the ZM from the address city's owner)
+   * and this builder is synchronous. Absent ⇒ null, like every other option, so
+   * a caller that forgets to resolve them renders two empty rows rather than
+   * dropping the fields.
+   */
+  projectManagerName = null,
+  zonalManagerName = null,
   // Only the ranked path knows whether the job is already assigned; the search
   // header has no such concept, so it keeps A's "not assigned" value rather
   // than inventing one from fk_easyfixter_id (a different question).
@@ -1806,6 +1816,26 @@ function buildJobHeader(job, {
     product_quantity:  job.product_quantity ?? null,
     // Technician-facing note, surfaced as "Additional Comments".
     efr_special_notes: job.efr_special_notes ?? null,
+    /*
+     * JOB AGE — the SAME two fields the jobs LIST emits per row, off the SAME
+     * `j`-aliased expression (utils/job-age-sql.js's JOB_AGE_COLUMNS, which
+     * getByIdCore already selects for the detail modal). Copied through, never
+     * recomputed: the CRM renders both surfaces with one formatJobAge(), and an
+     * age derived a second way here would let the popup and the row it opened
+     * from disagree about how old the same ticket is.
+     *
+     * The KEY NAMES ARE CAMELCASE, deliberately out of step with every
+     * snake_case sibling above. They are the SQL aliases, and formatJobAge reads
+     * exactly `ageDays` / `ageSecs` — renaming them to match local style would
+     * make the panel render "—" while every value was present.
+     */
+    ageDays:           job.ageDays ?? null,
+    ageSecs:           job.ageSecs ?? null,
+    // The two INHERITED managers — see getJobManagerNames in job.service.js for
+    // where each comes from, why each can legitimately be null, and why the
+    // source has to be the one the list's PM / ZM filters compare against.
+    project_manager_name: projectManagerName,
+    zonal_manager_name:   zonalManagerName,
   };
 }
 
@@ -1874,14 +1904,23 @@ async function rankCandidatesForJob(jobId, {
     serviceCatgName = labels?.catg_name ?? null;
   }
 
-  // Required deep skill(s) per service, in ONE batched query for the whole job
-  // (never per-service). Empty Map when the job carries no services.
-  const jobSkillsByService = await loadJobSkillMatrix(job);
+  /*
+   * Required deep skill(s) per service, in ONE batched query for the whole job
+   * (never per-service; empty Map when the job carries no services), and the
+   * job's inherited Project / Zonal manager names. Independent of each other, so
+   * they go out together — this is the header's own fixed cost on every
+   * modal-open and there is no reason to pay it serially.
+   */
+  const [jobSkillsByService, { projectManagerName, zonalManagerName }] = await Promise.all([
+    loadJobSkillMatrix(job),
+    jobService.getJobManagerNames({ clientId: job.fk_client_id, cityId: job.city_id }),
+  ]);
 
   // Pre-build the enriched job payload used in ALL return paths (early-exit
   // on zero-eligible and the normal ranked return).
   const enrichedJob = buildJobHeader(job, {
     serviceCatgName, serviceTypeName, deepSkillLabel, jobSkillsByService, assignedEfrId,
+    projectManagerName, zonalManagerName,
   });
 
   // COD = the customer pays the tech on-site (customerPays). Such techs
@@ -2588,10 +2627,15 @@ async function searchJobHeader(job) {
     serviceCatgName = labels?.catg_name ?? null;
   }
   const deepSkillLabel = [serviceCatgName, serviceTypeName].filter(Boolean).join(' › ') || null;
-  // Same single batched Job Skill Matrix lookup the ranked header does.
-  const jobSkillsByService = await loadJobSkillMatrix(job);
+  // Same single batched Job Skill Matrix lookup, and the same manager-name
+  // resolver, the ranked header does — in parallel, for the same reason.
+  const [jobSkillsByService, { projectManagerName, zonalManagerName }] = await Promise.all([
+    loadJobSkillMatrix(job),
+    jobService.getJobManagerNames({ clientId: job.fk_client_id, cityId: job.city_id }),
+  ]);
   return buildJobHeader(job, {
     serviceCatgName, serviceTypeName, deepSkillLabel, jobSkillsByService,
+    projectManagerName, zonalManagerName,
   });
 }
 
