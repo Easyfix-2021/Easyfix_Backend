@@ -2435,7 +2435,29 @@ function mapJobServices(job, skillsByJobService = new Map()) {
         service_catg: s.service_catg_name ?? null,
         service_type: s.service_type_name ?? null,
         quantity:     s.quantity          ?? null,
+        // UNCHANGED, and it is the price of ONE unit despite its name — see
+        // unit_price / line_total below. Kept for every consumer that reads it.
         total_charge: s.total_charge      ?? null,
+        /*
+         * THE TWO PRICES, NAMED FOR WHAT THEY ARE (2026-09-16).
+         *
+         * tbl_job_services.total_charge holds the price of ONE unit:
+         * utils/rate-card-calc.js writes Math.round(unitPrice) into it on every
+         * create / add / quantity change, and a quantity change never moves it.
+         * total_cost is unit × quantity. This card rendered total_charge as the
+         * line's charge, so a qty-2 ₹1,000 line read ₹1,000 here while Edit
+         * Services read ₹2,000 for the same row (job 482657, QA).
+         *
+         *   unit_price  = total_charge   the price of one unit
+         *   line_total  = total_cost     what the line bills — unit × quantity
+         *
+         * line_total is the STORED column, never unit_price × quantity
+         * recomputed here: total_charge is rounded to an integer while
+         * total_cost keeps four decimals, so the product would drift from the
+         * figure billing actually reads on any non-integer rate.
+         */
+        unit_price:   s.total_charge      ?? null,
+        line_total:   s.total_cost        ?? null,
         // Free/Paid per service, derived by job.service.js getById from
         // effective_charge. This mapper is an ALLOWLIST — a field absent here is
         // dropped no matter what getById projects, which is why the modal's

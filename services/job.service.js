@@ -3642,7 +3642,15 @@ async function getById(jobId) {
       // row, not js.total_charge which is often 0, so the app showed every order as
       // "Free"/blank). Existing columns — incl. js.total_charge the CRM reads — are
       // unchanged, so the CRM Job Transaction view is unaffected.
-      `SELECT js.job_service_id, js.service_id, js.quantity, js.total_charge,
+      // ADDITIVE (2026-09-16): js.total_cost — the LINE total (unit price ×
+      // quantity). js.total_charge is the price of ONE unit despite its name
+      // (utils/rate-card-calc.js writes Math.round(unitPrice) into it), so a
+      // qty-2 ₹1,000 line read ₹1,000 on Schedule & Assign while Edit Services
+      // showed ₹2,000. Measured on QA: of 8,437 active qty>1 rows, total_charge
+      // equals the unit price on 7,894 and unit × qty on 7; total_cost equals
+      // unit × qty on 7,898. So the line total was always stored — it just was
+      // not selected.
+      `SELECT js.job_service_id, js.service_id, js.quantity, js.total_charge, js.total_cost,
               js.job_service_status, js.service_category_id, js.service_type_id,
               st.service_type_name, sc.service_catg_name,
               CR.crc_ratecard_name AS service_name,
