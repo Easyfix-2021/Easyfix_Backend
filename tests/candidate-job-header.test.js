@@ -283,3 +283,63 @@ test('the acceptance is read off the ACCEPTED offer row, and listOffers still ex
   assert.ok(statuses, 'listOffers must still pin the statuses it surfaces');
   assert.doesNotMatch(statuses[1], /ACCEPTED/, 'listOffers must keep excluding accepted offers');
 });
+
+/* ── Services: the one-unit price and the line total, named apart ───────── */
+
+/*
+ * tbl_job_services.total_charge is the price of ONE unit despite its name;
+ * total_cost is unit × quantity. The card rendered total_charge as the line's
+ * charge, so a qty-2 ₹1,000 line (job 482657 on QA) read ₹1,000 here and
+ * ₹2,000 in Edit Services for the same row.
+ */
+// Both real callers always hand buildJobHeader a skill map; mirror that.
+const NO_SKILLS = { jobSkillsByService: new Map() };
+
+const FUR_LINE = {
+  job_service_id: 652574, job_service_status: 1, service_name: 'FUR - Large / Installation',
+  service_catg_name: 'Carpentry Services', service_type_name: 'Modular Packed Furniture',
+  quantity: 2, total_charge: 1000, total_cost: 2000,
+};
+
+test('each service carries unit_price (one unit) and line_total (unit × quantity)', () => {
+  const [svc] = buildJobHeader({ job_id: 482657, services: [FUR_LINE] }, NO_SKILLS).services;
+  assert.equal(svc.unit_price, 1000, 'unit_price is total_charge — the price of one unit');
+  assert.equal(svc.line_total, 2000, 'line_total is total_cost — what the line bills');
+});
+
+test('total_charge is kept exactly as it was', () => {
+  // Additive: every consumer already reading total_charge keeps its value.
+  const [svc] = buildJobHeader({ job_id: 482657, services: [FUR_LINE] }, NO_SKILLS).services;
+  assert.equal(svc.total_charge, 1000);
+  assert.equal(svc.quantity, 2);
+});
+
+test('line_total is the STORED column, never unit_price × quantity recomputed', () => {
+  // total_charge is an integer column (Math.round of the unit price) while
+  // total_cost keeps four decimals, so the product drifts from what billing
+  // reads on any non-integer rate. A ₹137.5 unit × 3 stores total_charge 138
+  // and total_cost 412.5 — 138 × 3 = 414 would be wrong by ₹1.50.
+  const [svc] = buildJobHeader({
+    job_id: 1,
+    services: [{ ...FUR_LINE, quantity: 3, total_charge: 138, total_cost: 412.5 }],
+  }, NO_SKILLS).services;
+  assert.equal(svc.line_total, 412.5);
+  assert.notEqual(svc.line_total, svc.unit_price * svc.quantity);
+});
+
+test('an absent price is null on both, never undefined or a computed zero', () => {
+  const [svc] = buildJobHeader({
+    job_id: 1, services: [{ job_service_id: 9, job_service_status: 1, quantity: 1 }],
+  }, NO_SKILLS).services;
+  assert.equal(svc.unit_price, null);
+  assert.equal(svc.line_total, null);
+  assert.ok('unit_price' in svc && 'line_total' in svc, 'both keys ship even when empty');
+});
+
+test('the detail query SELECTs total_cost, or line_total could never be filled', () => {
+  // mapJobServices is an allowlist over getById's services rows; a column the
+  // query does not select arrives as undefined and renders as a blank cell.
+  const svc = fs.readFileSync(path.join(__dirname, '..', 'services/job.service.js'), 'utf8');
+  const getById = bodyOf(svc, 'async function getById(jobId)');
+  assert.match(getById, /js\.total_charge,\s*js\.total_cost/, 'getById must project js.total_cost');
+});
