@@ -1436,10 +1436,23 @@ async function resolveClientPrimarySpoc(clientId, conn) {
  * chain job → address → city.state_user → tbl_user.
  *
  * NULL IS A REAL ANSWER for both — no client mapping, no address/city, a NULL
- * state_user, or a mapping/owner pointing at a deleted tbl_user row. The INNER
- * JOIN on the zonal side is deliberate and matches the picker: a city whose
- * state_user resolves to nobody is not in the dropdown either, so naming it here
- * would offer a filter value that does not exist.
+ * state_user, or a mapping/owner pointing at a deleted tbl_user row.
+ *
+ * BOTH ARMS REACH tbl_user THROUGH A *LEFT* JOIN, which is how every other
+ * reader of these two columns in this repo does it (job-export.service.js's
+ * `stateUser`, pincode.service.js's `zm`, lookup.service.js). The zonal arm used
+ * an inner JOIN; as a one-column scalar subquery that produced the same NULL
+ * either way, so this is a consistency fix rather than a behaviour change — but
+ * an inner join is one added column away from dropping the row instead of the
+ * name, and that failure would be silent. The project arm reaches tbl_user
+ * inside resolveClientPrimarySpoc, which already LEFT JOINs for the same reason.
+ *
+ * ⚠ AND WHEN THE ZONAL NAME COMES BACK NULL, THE USUAL CAUSE IS NOT A BUG HERE.
+ * It is tbl_city.state_user simply not being set on that city — the same gap
+ * pincode.service.js documents when it sorts its Zonal Manager column
+ * (NULLs last, because plenty of rows have none). That is client data for the
+ * business to fill in, not something this code should paper over: inventing a
+ * fallback owner would put a name against a city nobody actually owns.
  */
 async function getJobManagerNames({ clientId, cityId } = {}, conn) {
   const db = conn || pool;
@@ -1451,13 +1464,97 @@ async function getJobManagerNames({ clientId, cityId } = {}, conn) {
        (SELECT pmu.user_name FROM tbl_user pmu WHERE pmu.user_id = ?) AS project_manager_name,
        (SELECT zmu.user_name
           FROM tbl_city zci
-          JOIN tbl_user zmu ON zmu.user_id = zci.state_user
+          LEFT JOIN tbl_user zmu ON zmu.user_id = zci.state_user
          WHERE zci.city_id = ? LIMIT 1) AS zonal_manager_name`,
     [pmUserId ?? 0, cityId ?? 0],
   );
   return {
     projectManagerName: row?.project_manager_name ?? null,
     zonalManagerName:   row?.zonal_manager_name   ?? null,
+  };
+}
+
+/*
+ * ─── THE JOB TIMELINE'S ACTORS ────────────────────────────────────────────
+ *
+ * Three names/instants a job-timeline view needs and cannot read off tbl_job:
+ * two of them are user ids that have to be resolved, and the third is not on
+ * tbl_job at all. The DATES beside them (ticket_created_date_time,
+ * original_scheduling_date_time, checkin_date_time) are plain columns and are
+ * projected straight from the row by the caller — only the parts that need a
+ * lookup are here.
+ *
+ * FIRST SCHEDULED BY — tbl_job.first_scheduled_by → tbl_user.user_name. Written
+ * COALESCE-style on the first assign (SCHEMA.md's assign flow), so it is the
+ * person who first put a technician on this job, and it does NOT move on a
+ * later reassignment. The Jobs export resolves it the same way
+ * (job-export.service.js's `TBU` join, aliased firstScheduleBY).
+ *
+ * CHECKED IN BY — tbl_job.fk_checkin_by → tbl_user.user_name. ⚠ That column is
+ * a tbl_user.user_id, NOT an efr_id, despite the technician being the one who
+ * checks in: MEASURED on the live schema (tests/admin-ops-checkin.test.js) at
+ * 348,619 populated rows, 223,012 of them equal to tbl_easyfixer.user_id and 29
+ * to an efr_id. The legacy CRM's own reader joins it to tbl_user and prints a
+ * user_name (JobDaoImpl:1712), which is the shape reproduced here. Those 29
+ * legacy rows will resolve to whoever holds that user_id, or to nobody — a
+ * known, bounded wart of the column, not of this join.
+ *
+ * ACCEPTED — NOT ON tbl_job. Acceptance lives on the offer: the tbl_job_offer
+ * row at offer_status = ACCEPTED carries `responded_at` (when the technician
+ * took it) and names the technician through fk_easyfixter_id. listOffers()
+ * deliberately EXCLUDES accepted rows — by the time one exists the job has left
+ * the Schedule & Assign modal — so this reads that row separately rather than
+ * widening the modal's own query, which would put an accepted offeree into a
+ * list whose whole purpose is showing who has NOT taken the job.
+ *
+ * Every arm is a LEFT/NULL-tolerant lookup: a dangling user id or efr id yields
+ * a NULL NAME, never a dropped row. And on a job with no accepted offer — which
+ * is every job the console opens, since accepting sets fk_easyfixter_id and
+ * evicts the job from the unassigned bucket — both accepted fields are simply
+ * null. That is the normal answer, not a failure.
+ *
+ * ONE ROUND TRIP: scalar subqueries rather than joins onto tbl_job, so the
+ * caller does not have to own a `j` alias and this composes anywhere. The two
+ * offer arms read the same row twice; both seek idx_job_offer_job_status
+ * (job_id, offer_status), which is the index that exists for exactly this shape.
+ */
+async function getJobTimelineActors({ jobId, firstScheduledBy, checkinBy } = {}, conn) {
+  const db = conn || pool;
+  /*
+   * Same memoised probe that turns the offer projection into NULL aliases and
+   * the offerState filter into a no-op. On a deploy without tbl_job_offer the
+   * two accepted fields are NULL rather than an unknown-table 500 — the header
+   * must render on an un-migrated environment like everything else does.
+   */
+  const hasOffers = await jobOfferTableExists();
+  // ORDER BY, never a bare LIMIT 1: a job should hold at most one accepted
+  // offer, but an unordered pick from a set that turned out not to be unique
+  // returns a different answer on different days, which reads as a data bug.
+  const acceptedCols = hasOffers
+    ? `,
+       (SELECT ao.responded_at FROM tbl_job_offer ao
+         WHERE ao.job_id = ? AND ao.offer_status = ${OFFER_STATUS.ACCEPTED}
+         ORDER BY ao.job_offer_id DESC LIMIT 1) AS accepted_date_time,
+       (SELECT aef.efr_name FROM tbl_job_offer ao2
+          LEFT JOIN tbl_easyfixer aef ON aef.efr_id = ao2.fk_easyfixter_id
+         WHERE ao2.job_id = ? AND ao2.offer_status = ${OFFER_STATUS.ACCEPTED}
+         ORDER BY ao2.job_offer_id DESC LIMIT 1) AS accepted_efr_name`
+    : `, NULL AS accepted_date_time, NULL AS accepted_efr_name`;
+  // 0 for an absent id — matches no row, so each arm answers NULL on its own
+  // without a branch per arm (user_id is a positive PK).
+  const params = [firstScheduledBy || 0, checkinBy || 0];
+  if (hasOffers) params.push(jobId || 0, jobId || 0);
+  const [[row]] = await db.query(
+    `SELECT
+       (SELECT fsu.user_name FROM tbl_user fsu WHERE fsu.user_id = ?) AS first_scheduled_by_name,
+       (SELECT cbu.user_name FROM tbl_user cbu WHERE cbu.user_id = ?) AS checkin_by_name${acceptedCols}`,
+    params,
+  );
+  return {
+    firstScheduledByName: row?.first_scheduled_by_name ?? null,
+    checkinByName:        row?.checkin_by_name         ?? null,
+    acceptedDateTime:     row?.accepted_date_time      ?? null,
+    acceptedEfrName:      row?.accepted_efr_name       ?? null,
   };
 }
 
@@ -7862,6 +7959,13 @@ module.exports = {
    * place is this function. See its docblock.
    */
   getJobManagerNames,
+  /*
+   * The job timeline's ACTORS — the two user ids that need resolving and the
+   * acceptance that is not on tbl_job at all. Exported for the same reason:
+   * "who first scheduled this", "who checked in" and "who accepted the offer"
+   * must have one answer, not one per surface that asks. See its docblock.
+   */
+  getJobTimelineActors,
   hasAfterWorkPhoto, afterPhotoRequiredError,
   // Technician app requests. rejectAppRequest is the Reject button; there is no
   // approve twin because Approve is the ordinary cancel/reschedule, and
