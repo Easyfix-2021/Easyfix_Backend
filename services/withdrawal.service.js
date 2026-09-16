@@ -1,4 +1,12 @@
 const logger = require('../logger');
+/*
+ * The ledger helpers take the CONNECTION as a parameter, so requiring them here
+ * does not undo this module's pool injection — every statement they run still
+ * goes through the `pool`/`conn` this function was handed. `SOURCE` comes from
+ * the leaf module on purpose (no requires of its own).
+ */
+const ledger = require('./job-ledger.service');
+const { SOURCE } = require('./ledger-source');
 
 /*
  * withdrawal.service — backing logic for POST /api/mobile/withdraw
@@ -262,9 +270,17 @@ async function processWithdrawal(requestId, { action, remarks }, actor, pool) {
           'Payout destination is missing; reject this request and ask the technician to submit it again');
       }
 
-      // 2) Lock the wallet row and verify funds against the LIVE balance
-      //    (the authoritative source — the technician may have earned/spent
-      //    since the request was raised).
+      /*
+       * 2) THE ledger lock, then the wallet row — the order every other writer
+       *    of this technician's balance uses (services/job-ledger.service.js's
+       *    LOCK ORDER note). This path used to take no named lock at all, so it
+       *    only ever excluded a completion by the wallet row it happened to
+       *    share. Taken on the withdrawal request's own connection, AFTER that
+       *    request row is locked, and released in the finally below.
+       */
+      await ledger.acquireLedgerLock(conn);
+      // Funds are verified against the LIVE balance (the authoritative source —
+      // the technician may have earned or spent since the request was raised).
       const [[tech]] = await conn.query(
         'SELECT current_balance FROM tbl_easyfixer WHERE efr_id = ? FOR UPDATE',
         [efrId],
@@ -278,30 +294,30 @@ async function processWithdrawal(requestId, { action, remarks }, actor, pool) {
           `Insufficient balance: available ${balance.toFixed(2)} < requested ${amt.toFixed(2)}`);
       }
 
-      // 3a) Debit the wallet (+ stamp balance_updated, like the recharge path).
-      await conn.query(
-        'UPDATE tbl_easyfixer SET current_balance = current_balance - ?, balance_updated = NOW() WHERE efr_id = ?',
-        [amt, efrId],
-      );
-      // 3b) Re-read the authoritative post-debit balance for the ledger row
-      //     (avoids JS float drift from `balance - amt` on DECIMAL columns).
-      const [[after]] = await conn.query(
-        'SELECT current_balance FROM tbl_easyfixer WHERE efr_id = ?',
-        [efrId],
-      );
-      const newBalance = Number(after && after.current_balance != null ? after.current_balance : balance - amt);
-      // 3c) Wallet-ledger row so the payout reconciles to tbl_easyfixer_transaction
-      //     (the tech's earnings statement + the finance ledger both read from
-      //     there). transaction_type=1 = DEBIT per the legacy-authoritative mobile
-      //     read (mobile-profile-extra.service.js: txType===2 is credit); `amount`
-      //     is the magnitude, `balance` is the running balance AFTER the debit.
-      //     Mirrors the admin-recharge ledger write in routes/admin/finance.js.
-      await conn.query(
-        `INSERT INTO tbl_easyfixer_transaction
-           (easyfixer_id, source, description, transaction_type, transaction_date, amount, balance, created_date, created_by)
-         VALUES (?, 'WITHDRAWAL', ?, 1, NOW(), ?, ?, NOW(), ?)`,
-        [efrId, `Payout request #${requestId}${remarkVal ? ' — ' + remarkVal : ''}`, amt, newBalance, actorId],
-      );
+      /*
+       * 3a) One ledger row + the cache re-pointed at it, through the shared
+       *     helper. Two fixes came with the move: the row's balance is now
+       *     derived from the LEDGER TAIL (read FOR UPDATE) instead of from the
+       *     cache after a relative debit — the cache is only a cache of that
+       *     tail — and `source` is the integer 4 (PAYOUT, what
+       *     sp_ef_approve_payout_by_finance itself stamps) instead of the
+       *     string 'WITHDRAWAL', which a tinyint column and non-strict
+       *     sql_mode silently stored as 0.
+       *     transaction_type 1 = DEBIT per the legacy-authoritative mobile read
+       *     (mobile-profile-extra.service.js: txType === 2 is credit); `amount`
+       *     is the magnitude.
+       */
+      const posted = await ledger.appendTechnicianLedgerEntry(conn, {
+        efrId,
+        type: ledger.DEBIT,
+        amount: amt,
+        description: `Payout request #${requestId}${remarkVal ? ' — ' + remarkVal : ''}`,
+        source: SOURCE.PAYOUT,
+        createdBy: actorId,
+      });
+      if (!posted) {
+        throw mkErr(404, 'TECH_NOT_FOUND', 'Technician not found');
+      }
       // 3d) Mark the request paid.
       await conn.query(
         `UPDATE tbl_easyfixer_withdrawal_request
@@ -327,7 +343,27 @@ async function processWithdrawal(requestId, { action, remarks }, actor, pool) {
     else logger.error('Process withdrawal failed · requestId=' + requestId + ' · ' + e.message);
     throw e;
   } finally {
-    conn.release();
+    /*
+     * The ledger lock is SESSION-scoped and mysql2 does not reset a connection
+     * on release (pool_config resetOnRelease defaults false), so a lock left
+     * held would travel to the next borrower and block every completion.
+     * releaseLedgerLock is safe whether or not it was taken — the reject branch
+     * never takes it — and returns false when the release itself failed, in
+     * which case this connection must be destroyed rather than pooled.
+     */
+    let released = true;
+    try { released = await ledger.releaseLedgerLock(conn); } catch (_) { released = false; }
+    try {
+      // A connection whose lock release failed must not go back to the pool.
+      // The typeof guard is not decoration: an injected connection (tests, and
+      // any caller passing its own runner) need not implement destroy, and
+      // cleanup must never THROW — that would replace the in-flight error with
+      // a TypeError and hide why the withdrawal actually failed.
+      if (!released && typeof conn.destroy === 'function') conn.destroy();
+      else conn.release();
+    } catch (cleanupErr) {
+      logger.warn('Withdrawal connection cleanup failed · requestId=' + requestId + ' · ' + cleanupErr.message);
+    }
   }
 
   // Re-read the committed row (with the joined efr fields + fresh balance) so

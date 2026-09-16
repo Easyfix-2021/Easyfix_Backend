@@ -9,6 +9,8 @@ const { renderInvoicePdf } = require('../../utils/pdf-invoice');
 const archiver = require('archiver');
 const { PassThrough } = require('stream');
 const { buildRequestScope, cityScopeSql, assertEntityInScope } = require('../../lib/scope');
+const ledger = require('../../services/job-ledger.service');
+const { withMysqlNamedLock } = require('../../services/mysql-named-lock.service');
 
 /*
  * Bulk ops-approve width limits. Each item costs TWO pool acquires
@@ -644,11 +646,30 @@ router.get('/transactions', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+/*
+ * Manual client ledger entry.
+ *
+ * `transactionType` carries the SIGN and `amount` is always the positive
+ * magnitude — 1 = DEBIT (balance MINUS amount), 2 = CREDIT (PLUS). That is not
+ * a convention we chose: all three legacy SPs that write this table do it
+ * (sp_ef_checkout_job_and_update_transaction, ..._from_dashboard,
+ * sp_ef_finance_add_update_job_transaction), and across 330,844 QA rows there
+ * are ZERO negative amounts and zero rows of any type but 0, 1 and 2.
+ *
+ * This handler used to add the amount whatever the type, so every "Debit"
+ * saved from the CRM moved the balance by +amount instead of -amount — a 2x
+ * error in the wrong direction that also poisoned the tail every later job
+ * completion for that client reads. Hence `.valid(DEBIT, CREDIT)` and
+ * `.positive()`: an operator who learned to type "-500" now gets a 400 rather
+ * than a double negation.
+ */
 router.post('/transactions', validate(Joi.object({
   clientId: Joi.number().integer().positive().required(),
   jobId: Joi.number().integer().positive().optional(),
-  transactionType: Joi.number().integer().required(),
-  amount: Joi.number().required(),
+  transactionType: Joi.number().integer().valid(ledger.DEBIT, ledger.CREDIT).required(),
+  // float(11,2) on QA, and sql_mode is non-strict — an out-of-range value would
+  // clamp silently, so bound it here.
+  amount: Joi.number().positive().precision(2).max(999999999.99).required(),
   description: Joi.string().max(500).optional(),
 })), async (req, res, next) => {
   try {
@@ -656,40 +677,28 @@ router.post('/transactions', validate(Joi.object({
     // RBAC: caller must have scope over the target client.
     const guard = assertEntityInScope(req, { client_id: req.body.clientId });
     if (!guard.ok) return modernError(res, 403, 'client outside your scope');
-    const conn = await pool.getConnection();
-    try {
-      // Per-client advisory lock serialises concurrent ledger writes so the
-      // read-prior-balance / insert-new-balance pair is race-free.
-      const [[lk]] = await conn.query(
-        "SELECT GET_LOCK(CONCAT('client_ledger_', ?), 5) AS got",
-        [req.body.clientId]);
-      if (lk.got !== 1) { logger.warn('Client ledger busy · clientId=' + req.body.clientId); return modernError(res, 503, 'ledger busy, retry'); }
-      await conn.beginTransaction();
-      const [[prior]] = await conn.query(
-        'SELECT balance FROM tbl_client_transaction WHERE client_id = ? ORDER BY client_trans_id DESC LIMIT 1',
-        [req.body.clientId]);
-      const newBalance = Number(prior?.balance || 0) + Number(req.body.amount); // DECIMAL arrives as string — coerce
-      const [ins] = await conn.query(
-        `INSERT INTO tbl_client_transaction (client_id, job_id, transaction_type, amount, balance, description, transaction_date, created_date, created_by)
-         VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW(), ?)`,
-        [req.body.clientId, req.body.jobId || null, req.body.transactionType, req.body.amount, newBalance, req.body.description || null, req.user.user_id]);
-      await conn.commit();
-      res.status(201);
-      logger.info('Client transaction created · id=' + ins.insertId + ' clientId=' + req.body.clientId + ' newBalance=' + newBalance);
-      modernOk(res, { transactionId: ins.insertId, newBalance });
-    } catch (e) { await conn.rollback(); throw e; } finally {
-      // Guarded like the other named-lock sites (services/mysql-named-lock.service.js):
-      // an unguarded throw here would (a) skip conn.release() below it and
-      // (b) REPLACE the in-flight error, hiding why the transaction actually
-      // failed. The advisory lock auto-frees when the session ends, so a failed
-      // release is never worth either of those.
-      try {
-        await conn.query("SELECT RELEASE_LOCK(CONCAT('client_ledger_', ?))", [req.body.clientId]);
-      } catch (err) {
-        logger.warn('client_ledger lock release failed · clientId=' + req.body.clientId + ' · ' + err.message);
-      }
-      conn.release();
-    }
+    /*
+     * The house ledger protocol, not a private lock. This used to take
+     * GET_LOCK('client_ledger_<id>') and read the tail WITHOUT `FOR UPDATE`,
+     * so it excluded neither a job completion (which holds
+     * 'easyfix:completion-ledger' and locks the same tail) nor the snapshot it
+     * was reading from — under REPEATABLE READ a plain read here can miss a
+     * client row a completion has just committed.
+     */
+    const out = await ledger.inLedgerTransaction(async (conn) => {
+      await ledger.acquireLedgerLock(conn);
+      return ledger.appendClientLedgerEntry(conn, {
+        clientId: req.body.clientId,
+        jobId: req.body.jobId || null,
+        type: req.body.transactionType,
+        amount: req.body.amount,
+        description: req.body.description || null,
+        createdBy: req.user.user_id,
+      });
+    });
+    res.status(201);
+    logger.info('Client transaction created · id=' + out.transactionId + ' clientId=' + req.body.clientId + ' newBalance=' + out.balance);
+    modernOk(res, { transactionId: out.transactionId, newBalance: out.balance });
   } catch (e) { next(e); }
 });
 
@@ -884,6 +893,48 @@ router.post('/payouts', validate(Joi.object({
   } catch (e) { next(e); }
 });
 
+/*
+ * ONE gate for every payout state change, because two things were wrong.
+ *
+ * (1) The technician came from the REQUEST BODY and was used both for the SP
+ *     call and for the scope check, so a caller could name any technician they
+ *     had scope over and have THAT technician debited for someone else's
+ *     payout. The row owns the technician; the body no longer carries one
+ *     (validate() strips unknown keys, so the CRM needs no change).
+ * (2) Nothing checked the payout's state, and sp_ef_approve_payout_by_finance
+ *     has no guard of its own — it stamps is_approved_by_fin = 2, inserts a
+ *     DEBIT into tbl_easyfixer_transaction and overwrites current_balance from
+ *     whatever it is passed. So a retry or a double click posted a SECOND
+ *     debit; four payouts on QA carry exactly that (₹59,892 between them), and
+ *     two more were rejected after being paid.
+ *
+ * tbl_service_payout.is_approved_by_fin: 0 raised · 1 ops-approved ·
+ * 2 finance-approved (paid) · 3 finance-rejected. Each caller passes the
+ * statuses it may act FROM, chosen to refuse only what is unsafe — a paid
+ * payout above all — rather than to pin one exact state, so no existing ops
+ * workflow (re-approve, reject-then-fix) stops working.
+ *
+ * CAST(... AS SIGNED) is load-bearing: the column is tinyint(1) and db.js's
+ * typeCast hands tinyint(1) back as a BOOLEAN, so statuses 2 and 3 would both
+ * arrive as `false` and every comparison against a number would be wrong.
+ */
+async function gatePayout(req, payoutId, allowedStatuses, runner = pool) {
+  const [[row]] = await runner.query(
+    'SELECT efr_id, CAST(is_approved_by_fin AS SIGNED) AS status FROM tbl_service_payout WHERE payout_id = ? LIMIT 1',
+    [payoutId],
+  );
+  if (!row) return { ok: false, status: 404, error: 'payout not found' };
+  // Scope BEFORE any state disclosure, so an out-of-scope caller learns nothing.
+  const scope = await assertEfrInScope(req, row.efr_id);
+  if (!scope.ok) return { ok: false, status: 404, error: 'payout not found' };
+  const current = Number(row.status);
+  if (!allowedStatuses.includes(current)) {
+    const label = { 0: 'raised', 1: 'ops-approved', 2: 'already paid', 3: 'rejected' }[current] || ('status ' + current);
+    return { ok: false, status: 409, error: 'payout is ' + label + ' — this action is not allowed from that state' };
+  }
+  return { ok: true, efrId: row.efr_id };
+}
+
 // ─── POST /admin/finance/payouts/bulk-ops-approve ───────────────────
 // Mirrors legacy `saveAllServicePayout` — iterate a list, approve each
 // via the same SP `/payouts/:id/ops-approve` uses. Wrapped in Promise.all
@@ -891,7 +942,6 @@ router.post('/payouts', validate(Joi.object({
 router.post('/payouts/bulk-ops-approve', validate(Joi.object({
   items: Joi.array().items(Joi.object({
     payoutId: Joi.number().integer().positive().required(),
-    efrId: Joi.number().integer().positive().required(),
     opsApprovedAmount: Joi.number().min(0).required(),
   // .max() is load-bearing, not tidiness: each item costs TWO pool acquires
   // (assertEfrInScope + the SP), and the pool is 30 connections / 50 queued.
@@ -904,12 +954,20 @@ router.post('/payouts/bulk-ops-approve', validate(Joi.object({
     logger.info('Bulk ops-approve payouts · items=' + req.body.items.length);
     const approveOne = async (it) => {
       try {
-        const guard = await assertEfrInScope(req, it.efrId);
-        if (!guard.ok) return { payoutId: it.payoutId, ok: false, error: 'payout not found' };
-        await pool.query(
-          'CALL sp_ef_approve_payout_by_ops(?, ?, ?, ?, ?)',
-          [it.payoutId, it.efrId, it.opsApprovedAmount, req.user.user_id, 1]
-        );
+        // Same gate and same per-payout lock as the single-row route: the
+        // technician comes from the payout row, and an already-paid payout is
+        // refused rather than pushed back into the finance queue.
+        const { acquired, result } = await withMysqlNamedLock('payout_' + it.payoutId, async (conn) => {
+          const gate = await gatePayout(req, it.payoutId, [0, 1, 3], conn);
+          if (!gate.ok) return gate;
+          await conn.query(
+            'CALL sp_ef_approve_payout_by_ops(?, ?, ?, ?, ?)',
+            [it.payoutId, gate.efrId, it.opsApprovedAmount, req.user.user_id, 1]
+          );
+          return { ok: true };
+        }, pool, { timeoutSeconds: 5 });
+        if (!acquired) return { payoutId: it.payoutId, ok: false, error: 'payout is being processed' };
+        if (!result.ok) return { payoutId: it.payoutId, ok: false, error: result.error };
         return { payoutId: it.payoutId, ok: true };
       } catch (err) {
         return { payoutId: it.payoutId, ok: false, error: err.message };
@@ -935,48 +993,70 @@ router.post('/payouts/bulk-ops-approve', validate(Joi.object({
   } catch (e) { next(e); }
 });
 
-// Ops approval — moves to status 1
+// Ops approval — moves to status 1. Refuses only an already-PAID payout, which
+// is the re-entry door to a second finance debit.
 router.post('/payouts/:id/ops-approve', validate(Joi.object({
-  efrId: Joi.number().integer().positive().required(),
   opsApprovedAmount: Joi.number().min(0).required(),
 })), async (req, res, next) => {
   try {
-    logger.info('Ops-approve payout · id=' + req.params.id + ' efrId=' + req.body.efrId + ' amount=' + req.body.opsApprovedAmount);
-    const efrGuard = await assertEfrInScope(req, req.body.efrId);
-    if (!efrGuard.ok) return modernError(res, 404, 'payout not found');
-    await pool.query(
-      'CALL sp_ef_approve_payout_by_ops(?, ?, ?, ?, ?)',
-      [Number(req.params.id), req.body.efrId, req.body.opsApprovedAmount, req.user.user_id, 1]
-    );
-    logger.info('Payout ops-approved · id=' + req.params.id + ' status=1');
+    const payoutId = Number(req.params.id);
+    logger.info('Ops-approve payout · id=' + payoutId + ' amount=' + req.body.opsApprovedAmount);
+    const { acquired, result } = await withMysqlNamedLock('payout_' + payoutId, async (conn) => {
+      const gate = await gatePayout(req, payoutId, [0, 1, 3], conn);
+      if (!gate.ok) return gate;
+      await conn.query(
+        'CALL sp_ef_approve_payout_by_ops(?, ?, ?, ?, ?)',
+        [payoutId, gate.efrId, req.body.opsApprovedAmount, req.user.user_id, 1]
+      );
+      return { ok: true, efrId: gate.efrId };
+    }, pool, { timeoutSeconds: 5 });
+    if (!acquired) return modernError(res, 409, 'this payout is being processed — try again in a moment');
+    if (!result.ok) return modernError(res, result.status, result.error);
+    logger.info('Payout ops-approved · id=' + payoutId + ' efrId=' + result.efrId + ' status=1');
     modernOk(res, { approvedBy: 'ops', status: 1 });
   } catch (e) { next(e); }
 });
 
-// Finance approval — moves to status 2 (final)
+/*
+ * Finance approval — moves to status 2 (final) and MOVES MONEY: the SP debits
+ * the technician's ledger and overwrites current_balance. Only an ops-approved
+ * payout may be finance-approved, so a second submit of the same payout is a
+ * 409 instead of a second debit.
+ *
+ * The per-payout named lock is what makes the check-then-CALL pair atomic. A
+ * `FOR UPDATE` read could not: the SP runs its own START TRANSACTION, which
+ * implicitly COMMITS whatever transaction this connection had open and would
+ * release the row lock mid-flight. GET_LOCK is session-scoped and survives
+ * that commit.
+ */
 router.post('/payouts/:id/fin-approve', validate(Joi.object({
-  efrId: Joi.number().integer().positive().required(),
   finApprovedAmount: Joi.number().min(0).required(),
   payoutRef: Joi.string().max(100).allow('', null).optional(),
   payoutDoc: Joi.string().max(255).allow('', null).optional(),
 })), async (req, res, next) => {
   try {
-    logger.info('Finance-approve payout · id=' + req.params.id + ' efrId=' + req.body.efrId + ' amount=' + req.body.finApprovedAmount);
-    const efrGuard = await assertEfrInScope(req, req.body.efrId);
-    if (!efrGuard.ok) return modernError(res, 404, 'payout not found');
-    await pool.query(
-      'CALL sp_ef_approve_payout_by_finance(?, ?, ?, ?, ?, ?, ?)',
-      [
-        Number(req.params.id),
-        req.body.efrId,
-        req.body.finApprovedAmount,
-        req.user.user_id,
-        req.body.payoutRef || '',
-        req.body.payoutDoc || '',
-        2,
-      ]
-    );
-    logger.info('Payout finance-approved · id=' + req.params.id + ' status=2');
+    const payoutId = Number(req.params.id);
+    logger.info('Finance-approve payout · id=' + payoutId + ' amount=' + req.body.finApprovedAmount);
+    const { acquired, result } = await withMysqlNamedLock('payout_' + payoutId, async (conn) => {
+      const gate = await gatePayout(req, payoutId, [1], conn);
+      if (!gate.ok) return gate;
+      await conn.query(
+        'CALL sp_ef_approve_payout_by_finance(?, ?, ?, ?, ?, ?, ?)',
+        [
+          payoutId,
+          gate.efrId,
+          req.body.finApprovedAmount,
+          req.user.user_id,
+          req.body.payoutRef || '',
+          req.body.payoutDoc || '',
+          2,
+        ]
+      );
+      return { ok: true, efrId: gate.efrId };
+    }, pool, { timeoutSeconds: 5 });
+    if (!acquired) return modernError(res, 409, 'this payout is being processed — try again in a moment');
+    if (!result.ok) return modernError(res, result.status, result.error);
+    logger.info('Payout finance-approved · id=' + payoutId + ' efrId=' + result.efrId + ' status=2');
     modernOk(res, { approvedBy: 'finance', status: 2 });
   } catch (e) { next(e); }
 });
@@ -984,23 +1064,30 @@ router.post('/payouts/:id/fin-approve', validate(Joi.object({
 // Finance rejection — moves to status 3.
 // Legacy did this via raw UPDATE in updateServicePayout(), not an SP,
 // because rejection only flips 3 columns (no cascade). Mirrored here.
-router.post('/payouts/:id/fin-reject', validate(Joi.object({
-  efrId: Joi.number().integer().positive().required(),
-})), async (req, res, next) => {
+router.post('/payouts/:id/fin-reject', validate(Joi.object({})), async (req, res, next) => {
   try {
-    logger.info('Finance-reject payout · id=' + req.params.id + ' efrId=' + req.body.efrId);
-    const efrGuard = await assertEfrInScope(req, req.body.efrId);
-    if (!efrGuard.ok) return modernError(res, 404, 'payout not found');
-    const [r] = await pool.query(
-      `UPDATE tbl_service_payout
-          SET is_approved_by_fin = 3,
-              fin_rejected_by = ?,
-              fin_reject_date = NOW()
-        WHERE payout_id = ? AND efr_id = ?`,
-      [req.user.user_id, Number(req.params.id), req.body.efrId]
-    );
-    if (r.affectedRows === 0) return modernError(res, 404, 'payout not found');
-    logger.info('Payout finance-rejected · id=' + req.params.id + ' status=3');
+    const payoutId = Number(req.params.id);
+    logger.info('Finance-reject payout · id=' + payoutId);
+    // [0, 1] — a PAID payout (2) can no longer be rejected. Two payouts on QA
+    // were rejected after being paid, which leaves the debit standing while the
+    // payout reads as refused.
+    const { acquired, result } = await withMysqlNamedLock('payout_' + payoutId, async (conn) => {
+      const gate = await gatePayout(req, payoutId, [0, 1], conn);
+      if (!gate.ok) return gate;
+      const [r] = await conn.query(
+        `UPDATE tbl_service_payout
+            SET is_approved_by_fin = 3,
+                fin_rejected_by = ?,
+                fin_reject_date = NOW()
+          WHERE payout_id = ? AND efr_id = ?`,
+        [req.user.user_id, payoutId, gate.efrId]
+      );
+      if (r.affectedRows === 0) return { ok: false, status: 404, error: 'payout not found' };
+      return { ok: true, efrId: gate.efrId };
+    }, pool, { timeoutSeconds: 5 });
+    if (!acquired) return modernError(res, 409, 'this payout is being processed — try again in a moment');
+    if (!result.ok) return modernError(res, result.status, result.error);
+    logger.info('Payout finance-rejected · id=' + payoutId + ' efrId=' + result.efrId + ' status=3');
     modernOk(res, { rejected: true, status: 3 });
   } catch (e) { next(e); }
 });
@@ -1056,7 +1143,12 @@ router.get('/ndm-recharges', async (req, res, next) => {
 router.post('/ndm-recharges', validate(Joi.object({
   efrId: Joi.number().integer().positive().required(),
   rechargeAmount: Joi.number().positive().required(),
-  rechargeType: Joi.number().integer().optional(),
+  // 1 = debit, 2 = credit — the sign the approval will post. Legacy's form
+  // offered both with CREDIT pre-selected (efrRechargeAccount.vm), and the new
+  // CRM's dialog offers neither, so an omitted value must default to 2. It
+  // defaulted to 1 here, which would have DEBITED every technician whose
+  // recharge was booked from the new CRM and then approved.
+  rechargeType: Joi.number().integer().valid(ledger.DEBIT, ledger.CREDIT).optional(),
   comments: Joi.string().max(500).allow('', null).optional(),
   documentPath: Joi.string().max(255).allow('', null).optional(),
   paymentMode: Joi.string().max(50).allow('', null).optional(),
@@ -1072,7 +1164,7 @@ router.post('/ndm-recharges', validate(Joi.object({
           comments, approved_by_finance, document_path, payment_mode, reference_id)
        VALUES (?, ?, ?, NOW(), ?, ?, 0, ?, ?, ?)`,
       [req.body.efrId, req.user.user_id, req.body.rechargeAmount,
-       req.body.rechargeType || 1, req.body.comments || null,
+       req.body.rechargeType || ledger.CREDIT, req.body.comments || null,
        req.body.documentPath || null, req.body.paymentMode || null,
        req.body.referenceId || null]
     );
@@ -1082,48 +1174,84 @@ router.post('/ndm-recharges', validate(Joi.object({
   } catch (e) { next(e); }
 });
 
+/*
+ * Approving an NDM recharge posts a LEDGER ROW, as legacy does — it is not a
+ * bare bump of the balance cache.
+ *
+ * Legacy's path is EasyfixerFinanceAction.approveRecharge →
+ * EasyfixerServiceImpl.updateRechargeAmount → sp_ef_finance_add_update_easyfixer_transaction,
+ * which reads the technician's ledger tail, applies the recharge_type sign,
+ * INSERTs one tbl_easyfixer_transaction row and sets current_balance to that
+ * row's balance. 1,029 of 1,029 approved recharges on QA have exactly such a
+ * row. This route used to add the amount to current_balance and write no row,
+ * so the credit lived only in a cache that the next completion — or the next
+ * legacy SP — recomputes from the tail and overwrites.
+ *
+ * Three further defects went with it:
+ *   - `r.approved_by_finance === 1` could never fire. db.js's typeCast returns
+ *     tinyint(1) as a BOOLEAN, so the comparison was `true === 1`, and the
+ *     UPDATE below it carried no state predicate: two sequential approvals
+ *     credited twice, no concurrency needed. The conditional UPDATE is now the
+ *     idempotency key and takes the recharge row's lock first.
+ *   - recharge_type was ignored and the amount always credited. Legacy posts
+ *     type 1 as a DEBIT.
+ *   - `source` was never classified. Legacy maps the payment mode:
+ *     'Cash' → 2, 'Yes Bank' → 8, 'ICICI Bank' → 9, anything else → 0.
+ */
+const NDM_SOURCE_BY_PAYMENT_MODE = {
+  cash: ledger.SOURCE.CASH,
+  'yes bank': ledger.SOURCE.YES_BANK,
+  'icici bank': ledger.SOURCE.ICICI_BANK,
+};
+
 router.post('/ndm-recharges/:id/approve', async (req, res, next) => {
   try {
     const id = Number(req.params.id);
     logger.info('Approve NDM recharge · id=' + id);
     const [[r]] = await pool.query(
-      'SELECT efr_id, recharge_amount, approved_by_finance FROM tbl_ndm_recharge WHERE recharge_id = ?',
+      `SELECT r.efr_id, r.recharge_amount, r.recharge_type, r.payment_mode,
+              CAST(r.approved_by_finance AS SIGNED) AS approved, u.user_name AS ndm_name
+         FROM tbl_ndm_recharge r
+         LEFT JOIN tbl_user u ON u.user_id = r.ndm_id
+        WHERE r.recharge_id = ?`,
       [id]
     );
     if (!r) return modernError(res, 404, 'recharge not found');
-    if (r.approved_by_finance === 1) { logger.warn('NDM recharge already approved · id=' + id); return modernError(res, 409, 'already approved'); }
+    if (Number(r.approved) === 1) { logger.warn('NDM recharge already approved · id=' + id); return modernError(res, 409, 'already approved'); }
     const efrGuard = await assertEfrInScope(req, r.efr_id);
     if (!efrGuard.ok) return modernError(res, 404, 'recharge not found');
+    const type = Number(r.recharge_type) === ledger.DEBIT ? ledger.DEBIT : ledger.CREDIT;
 
-    const conn = await pool.getConnection();
-    try {
-      await conn.beginTransaction();
-      // Stamp approval + the legacy date column
-      await conn.query(
-        `UPDATE tbl_ndm_recharge SET approved_by_finance = 1, approval_date = NOW()
-          WHERE recharge_id = ?`,
-        [id]
+    const out = await ledger.inLedgerTransaction(async (conn) => {
+      // The conditional UPDATE is the idempotency key: it takes the recharge
+      // row's X-lock and returns 0 rows if anyone else approved it first.
+      const at = new Date();
+      const [claim] = await conn.query(
+        `UPDATE tbl_ndm_recharge SET approved_by_finance = 1, approval_date = ?
+          WHERE recharge_id = ? AND approved_by_finance = 0`,
+        [at, id]
       );
-      // Cascade the recharge into the easyfixer's balance. If the
-      // easyfixer row is missing, refuse the approval — silently
-      // crediting a non-existent balance is a compliance bug (legacy
-      // used a SP that raised on no-match; we replicate that here).
-      const [bumpResult] = await conn.query(
-        `UPDATE tbl_easyfixer
-            SET current_balance = COALESCE(current_balance, 0) + ?,
-                balance_updated = NOW()
-          WHERE efr_id = ?`,
-        [r.recharge_amount, r.efr_id]
-      );
-      if (bumpResult.affectedRows === 0) {
-        await conn.rollback();
-        logger.warn('NDM recharge approval refused — easyfixer not found · id=' + id + ' efrId=' + r.efr_id);
-        return modernError(res, 409, `easyfixer ${r.efr_id} not found — approval refused to avoid orphan credit`);
-      }
-      await conn.commit();
-      logger.info('NDM recharge approved · id=' + id + ' efrId=' + r.efr_id + ' credited=' + r.recharge_amount);
-      modernOk(res, { approved: true, balanceCredited: r.recharge_amount });
-    } catch (err) { await conn.rollback(); throw err; } finally { conn.release(); }
+      if (claim.affectedRows === 0) return { already: true };
+      await ledger.acquireLedgerLock(conn);
+      const posted = await ledger.appendTechnicianLedgerEntry(conn, {
+        efrId: r.efr_id,
+        type,
+        amount: r.recharge_amount,
+        // Legacy's own description, so the two stacks' rows read alike.
+        description: 'Recharge by NDM : ' + (r.ndm_name || ''),
+        source: NDM_SOURCE_BY_PAYMENT_MODE[String(r.payment_mode || '').trim().toLowerCase()] || 0,
+        createdBy: req.user.user_id,
+        at,
+      });
+      // A missing technician row means the credit would have nowhere to land.
+      // Refuse rather than approve — legacy's SP raised on no-match too.
+      if (!posted) { const err = new Error('easyfixer ' + r.efr_id + ' not found — approval refused to avoid an orphan credit'); err.status = 409; throw err; }
+      return { already: false, balance: posted.balance };
+    });
+    if (out.already) { logger.warn('NDM recharge already approved · id=' + id); return modernError(res, 409, 'already approved'); }
+    logger.info('NDM recharge approved · id=' + id + ' efrId=' + r.efr_id
+      + ' ' + (type === ledger.DEBIT ? '-' : '+') + r.recharge_amount + ' → ' + out.balance);
+    modernOk(res, { approved: true, balanceCredited: r.recharge_amount, newBalance: out.balance });
   } catch (e) { next(e); }
 });
 
@@ -1155,34 +1283,34 @@ router.post('/easyfixer/:id/recharge', validate(Joi.object({
     logger.info('Admin recharge easyfixer · efrId=' + efrId + ' amount=' + req.body.amount);
     const efrGuard = await assertEfrInScope(req, efrId);
     if (!efrGuard.ok) return modernError(res, 404, 'easyfixer not found');
-    const conn = await pool.getConnection();
-    try {
-      await conn.beginTransaction();
-      const [bump] = await conn.query(
-        `UPDATE tbl_easyfixer SET current_balance = COALESCE(current_balance, 0) + ?, balance_updated = NOW() WHERE efr_id = ?`,
-        [req.body.amount, efrId]);
-      if (bump.affectedRows === 0) {
-        await conn.rollback();
-        return modernError(res, 404, 'easyfixer not found');
-      }
-      const [[bal]] = await conn.query(
-        'SELECT current_balance FROM tbl_easyfixer WHERE efr_id = ? AND NOT (tbl_easyfixer.efr_status <=> 3)',
-        [efrId]);
-      // Audit ledger row for the manual admin credit. transaction_type=2 = CREDIT
-      // per the legacy Java DAO (EasyfixerTransactionDAO.updateTransaction:
-      // type==1 subtracts → DEBIT, type==2 adds → CREDIT), confirmed by the
-      // mobile earnings read (mobile-profile-extra.service.js: txType===2 is credit).
-      // FIXED 2026-07-09: was erroneously 1, so a recharge (which credits the
-      // balance here) was logged as a DEBIT and rendered as -amount in the tech's app.
-      await conn.query(
-        `INSERT INTO tbl_easyfixer_transaction
-           (easyfixer_id, source, description, transaction_type, transaction_date, amount, balance, created_date, created_by)
-         VALUES (?, ?, ?, 2, NOW(), ?, ?, NOW(), ?)`,
-        [efrId, 'ADMIN_RECHARGE', req.body.reference || null, req.body.amount, bal.current_balance, req.user.user_id]);
-      await conn.commit();
-      logger.info('Admin recharge applied · efrId=' + efrId + ' amount=' + req.body.amount + ' newBalance=' + bal.current_balance);
-      modernOk(res, { applied: req.body.amount });
-    } catch (e) { await conn.rollback(); throw e; } finally { conn.release(); }
+    /*
+     * transaction_type 2 = CREDIT per the legacy Java DAO
+     * (EasyfixerTransactionDAO.updateTransaction: type 1 subtracts, type 2
+     * adds), confirmed by the mobile earnings read
+     * (mobile-profile-extra.service.js: txType === 2 is credit). FIXED
+     * 2026-07-09: was 1, so a recharge rendered as -amount in the tech's app.
+     *
+     * Two further fixes here (2026-09-16): the ledger row's balance came from
+     * the CACHE after a relative bump, not from the ledger tail, so it carried
+     * over any drift the cache already had; and `source` was the STRING
+     * 'ADMIN_RECHARGE' bound into a tinyint, which non-strict sql_mode stored
+     * as 0. It is now SOURCE.ADJUSTMENT (7) — legacy's own code for an
+     * operator-entered correction with no other classification.
+     */
+    const out = await ledger.inLedgerTransaction(async (conn) => {
+      await ledger.acquireLedgerLock(conn);
+      return ledger.appendTechnicianLedgerEntry(conn, {
+        efrId,
+        type: ledger.CREDIT,
+        amount: req.body.amount,
+        description: req.body.reference ? 'Admin recharge — ' + req.body.reference : 'Admin recharge',
+        source: ledger.SOURCE.ADJUSTMENT,
+        createdBy: req.user.user_id,
+      });
+    });
+    if (!out) return modernError(res, 404, 'easyfixer not found');
+    logger.info('Admin recharge applied · efrId=' + efrId + ' amount=' + req.body.amount + ' newBalance=' + out.balance);
+    modernOk(res, { applied: req.body.amount, newBalance: out.balance });
   } catch (e) { next(e); }
 });
 
