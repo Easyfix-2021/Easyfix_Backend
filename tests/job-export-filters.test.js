@@ -505,6 +505,10 @@ const SAMPLE = {
   // Present here because this file's first assertion requires the sample to
   // exercise every listQuery key, ledger entry or not.
   view: 'manage',
+  // Technician app requests (2026-09-16). 'any' rather than a kind, because
+  // that is what the CRM's Technician Requests section sends and the widest
+  // of the three still has to emit a predicate.
+  appRequest: 'any',
 };
 
 test('THE LEDGER IS DERIVED, NOT TYPED: every listQuery key is accounted for', () => {

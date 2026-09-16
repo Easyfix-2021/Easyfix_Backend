@@ -240,13 +240,40 @@ async function imageKeysByIssue(issueIds) {
   const ids = (issueIds || []).map(Number).filter((n) => Number.isFinite(n));
   const out = new Map();
   if (!ids.length) return out;
+  /*
+   * `comment_id IS NULL` is load-bearing since 2026-09-16: the same table now
+   * also holds COMMENT attachments, and without this a reply's screenshots
+   * would join the report's own gallery and inflate screenshot_count with
+   * images the reader never attached to the report.
+   */
   const [rows] = await pool.query(
-    'SELECT issue_id, s3_key FROM tbl_crm_issue_image WHERE issue_id IN (?) ORDER BY issue_id, sort_order, id',
+    'SELECT issue_id, s3_key FROM tbl_crm_issue_image WHERE issue_id IN (?) AND comment_id IS NULL ORDER BY issue_id, sort_order, id',
     [ids],
   );
   for (const row of rows) {
     if (!out.has(row.issue_id)) out.set(row.issue_id, []);
     out.get(row.issue_id).push(row.s3_key);
+  }
+  return out;
+}
+
+/*
+ * The same, for COMMENTS: commentId → [key, …] in sort_order. One query for
+ * the whole thread rather than one per comment — the detail route renders
+ * every comment at once, so a per-comment query would be an N+1 on the one
+ * screen that always wants all of them.
+ */
+async function imageKeysByComment(commentIds) {
+  const ids = (commentIds || []).map(Number).filter((n) => Number.isFinite(n));
+  const out = new Map();
+  if (!ids.length) return out;
+  const [rows] = await pool.query(
+    'SELECT comment_id, s3_key FROM tbl_crm_issue_image WHERE comment_id IN (?) ORDER BY comment_id, sort_order, id',
+    [ids],
+  );
+  for (const row of rows) {
+    if (!out.has(row.comment_id)) out.set(row.comment_id, []);
+    out.get(row.comment_id).push(row.s3_key);
   }
   return out;
 }
@@ -293,7 +320,7 @@ async function listIssues({ scope, status, limit, offset }, actor) {
      */
     `SELECT i.id, i.title, i.page_path, i.status, i.reported_by, i.created_on, i.closed_on,
             ru.user_name AS reported_by_name,
-            (SELECT COUNT(*) FROM tbl_crm_issue_image  m WHERE m.issue_id = i.id) AS screenshot_count,
+            (SELECT COUNT(*) FROM tbl_crm_issue_image  m WHERE m.issue_id = i.id AND m.comment_id IS NULL) AS screenshot_count,
             (SELECT COUNT(*) FROM tbl_crm_issue_comment c WHERE c.issue_id = i.id) AS comment_count
        FROM tbl_crm_issue i
        LEFT JOIN tbl_user ru ON ru.user_id = i.reported_by
@@ -334,6 +361,26 @@ async function listIssues({ scope, status, limit, offset }, actor) {
  * Raw keys are never returned: a key is useless to the browser and returning it
  * only widens what a logged response body exposes.
  */
+/*
+ * Keys → presigned URLs, with a key that fails to sign DROPPED rather than
+ * returned as a null hole. Extracted 2026-09-16 when comments gained
+ * attachments: the report's gallery and every comment's now presign through
+ * the SAME function, so a thread of ten comments cannot end up with a
+ * different TTL or a different failure behaviour than the report above it.
+ */
+async function presignKeys(keys, label) {
+  const urls = [];
+  if (!keys.length || !s3Storage.isEnabled()) return urls;
+  for (const key of keys) {
+    try {
+      urls.push(await s3Storage.getPresignedUrl(key, SCREENSHOT_PRESIGN_TTL_SEC));
+    } catch (e) {
+      logger.warn('Issue screenshot presign failed · ' + label + ' err=' + (e && e.message));
+    }
+  }
+  return urls;
+}
+
 async function getIssueDetail(issueId, actor) {
   const issue = await loadIssueForActor(issueId, actor);
 
@@ -346,19 +393,28 @@ async function getIssueDetail(issueId, actor) {
     [issueId],
   );
 
+  // A signing failure must not take the whole issue down — the reporter still
+  // needs to read the description and the thread — nor the other screenshots
+  // down with it. presignKeys drops the one that failed and keeps the rest.
   const keys = (await imageKeysByIssue([issueId])).get(Number(issueId)) || [];
-  const screenshotUrls = [];
-  if (keys.length && s3Storage.isEnabled()) {
-    for (const key of keys) {
-      try {
-        screenshotUrls.push(await s3Storage.getPresignedUrl(key, SCREENSHOT_PRESIGN_TTL_SEC));
-      } catch (e) {
-        // A signing failure must not take the whole issue down — the reporter
-        // still needs to read the description and the thread — nor the other
-        // screenshots down with it.
-        logger.warn('Issue screenshot presign failed · issueId=' + issueId + ' err=' + (e && e.message));
-      }
-    }
+  const screenshotUrls = await presignKeys(keys, 'issueId=' + issueId);
+
+  /*
+   * Comment attachments (2026-09-16). ONE query for the whole thread, then one
+   * presign pass per comment — an N+1 here would be a query per comment on the
+   * screen that always renders all of them. Same shape as the report's own:
+   * screenshot_urls is an array, empty means nothing to show, and it can be
+   * shorter than what was attached if a signature failed.
+   */
+  const commentKeys = await imageKeysByComment(comments.map((c) => c.id));
+  const commentsWithImages = [];
+  for (const c of comments) {
+    const ck = commentKeys.get(Number(c.id)) || [];
+    commentsWithImages.push({
+      ...c,
+      screenshot_count: ck.length,
+      screenshot_urls: await presignKeys(ck, 'commentId=' + c.id),
+    });
   }
 
   return {
@@ -366,7 +422,7 @@ async function getIssueDetail(issueId, actor) {
     screenshot_count: keys.length,
     has_screenshot: keys.length > 0,
     screenshot_urls: screenshotUrls,
-    comments,
+    comments: commentsWithImages,
   };
 }
 
@@ -379,13 +435,29 @@ async function getIssueDetail(issueId, actor) {
  * original issue, not in a new one. A comment leaves the issue closed; to put
  * it back in the open queue, reopenIssue() below.
  */
-async function addComment(issueId, { commentText }, actor) {
+async function addComment(issueId, { commentText, screenshotKeys }, actor) {
   await loadIssueForActor(issueId, actor);
+  const keys = (screenshotKeys || []).filter(Boolean);
+  const now = new Date();
   const [r] = await pool.query(
     'INSERT INTO tbl_crm_issue_comment (issue_id, comment_text, commented_by, created_on) VALUES (?, ?, ?, ?)',
-    [issueId, commentText, actor.userId, new Date()],
+    [issueId, commentText, actor.userId, now],
   );
-  logger.info('Issue comment added · issueId=' + issueId + ' by=' + actor.userId);
+  /*
+   * Attachments carry BOTH parents: issue_id so the cleanup cron (which sweeps
+   * by issue) collects them without knowing comments exist, and comment_id so
+   * the report's own gallery excludes them. Deliberately not in a transaction
+   * with the comment insert, for the same reason createIssue is not: a comment
+   * whose image rows failed is still a reply worth having, and losing the text
+   * because the second screenshot's row failed would be strictly worse.
+   */
+  if (keys.length) {
+    await pool.query(
+      'INSERT INTO tbl_crm_issue_image (issue_id, comment_id, s3_key, sort_order, created_on) VALUES ?',
+      [keys.map((k, i) => [issueId, r.insertId, k, i, now])],
+    );
+  }
+  logger.info('Issue comment added · issueId=' + issueId + ' by=' + actor.userId + ' screenshots=' + keys.length);
   return { id: r.insertId };
 }
 
@@ -498,6 +570,8 @@ module.exports = {
   listIssues,
   getIssueDetail,
   addComment,
+  // Exported for the cleanup cron and for tests; the route never calls it.
+  imageKeysByComment,
   closeIssue,
   reopenIssue,
 };

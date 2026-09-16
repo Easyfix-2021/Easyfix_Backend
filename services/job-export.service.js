@@ -662,6 +662,13 @@ const FILTER_COVERAGE = Object.freeze({
   endDate:          ['filter',   'dateCol < DATE(?) + INTERVAL 1 DAY'],
   quotationStatus:  ['filter',   'EXISTS quotation_details + list()s status carve-outs'],
   requestedBefore:  ['filter',   'J.requested_date_time < NOW() / < ?'],
+  /*
+   * SUPPORTED, unlike offerState below. The predicate is three columns on
+   * tbl_job, so it re-binds to alias J directly — there is no j-aliased
+   * fragment to borrow and nothing to correlate. Written out in where()
+   * rather than imported, deliberately; see the note there.
+   */
+  appRequest:       ['filter',   'J.job_status = 1 + (is_cancelled_by_app OR is_rescheduled_by_app), per value'],
   dateType:         ['modifier', 'picks the column startDate/endDate apply to'],
   /*
    * list() accepts isEscalated and deliberately emits NO clause (the flag is
@@ -819,7 +826,7 @@ function buildClauses(filters = {}) {
     // ── CRM UI / listQuery vocabulary (see FILTER_COVERAGE) ─────────────────
     q, statuses, assigned, noServices, jobIds, jobIdOrRef, clientId, projectManagerId, zonalManagerId,
     customerId, customerQ, clientRef, efrMobile, pin, categoryId, verticalId,
-    sourceType, reopen, dueTo, startDate, endDate, quotationStatus, requestedBefore,
+    sourceType, reopen, dueTo, startDate, endDate, quotationStatus, requestedBefore, appRequest,
     // ── RBAC, attached by the route ─────────────────────────────────────────
     scope, allowedStages,
     /*
@@ -1177,6 +1184,28 @@ function buildClauses(filters = {}) {
      */
     clauses.push('J.job_status = 0');
     clauses.push('NOT EXISTS (SELECT 1 FROM tbl_job_services js WHERE js.job_id = J.job_id AND js.job_service_status = 1)');
+    statusPinned = true;
+  }
+
+  /*
+   * Technician app requests. UNLIKE offerState, this one IS supported: the
+   * predicate is three columns on tbl_job itself, so it re-binds to this
+   * module's `J` alias with no fragment to borrow and no correlation to get
+   * wrong. Written out rather than imported from job.service for exactly that
+   * reason — the shared fragment there hard-codes `j`, which is the trap the
+   * offerState entry in FILTER_COVERAGE documents.
+   *
+   * COALESCE(..., 0) = 1 because both columns are bit(1): mysql2 hands a BIT
+   * back as a Buffer and every Buffer is truthy. Pins job_status = 1 itself,
+   * as the list clause does — a request is only pending at that status.
+   */
+  if (appRequest === 'any' || appRequest === 'cancel' || appRequest === 'reschedule') {
+    const cancel = 'COALESCE(J.is_cancelled_by_app, 0) = 1';
+    const resched = 'COALESCE(J.is_rescheduled_by_app, 0) = 1';
+    clauses.push('J.job_status = 1');
+    clauses.push(appRequest === 'cancel' ? cancel
+      : appRequest === 'reschedule' ? resched
+        : `(${cancel} OR ${resched})`);
     statusPinned = true;
   }
 

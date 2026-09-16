@@ -2090,6 +2090,47 @@ function offerColumns(tableExists, expiryEnabled = offerExpiryEnabled()) {
  */
 const OFFER_STATE_VALUES = Object.freeze(['pending', 'offered', 'expired']);
 
+/*
+ * ── `appRequest` — the Technician Requests LIST filter (2026-09-16) ────────
+ *
+ * A technician asks, from the mobile app, for a pending order to be CANCELLED
+ * or its appointment MOVED. Until now `/admin/jobs` PROJECTED the two flags but
+ * could not FILTER on them, so the CRM's Technician Requests section pulled one
+ * bounded page of 500 pending jobs and narrowed it in the browser. That worked
+ * only while the whole pending-to-start queue fitted inside 500 rows: past
+ * that, requests on the LATEST appointments fell outside the window and simply
+ * stopped being listed — silently, because the client cannot filter rows it was
+ * never sent. PendingToStartView's own header named this filter as the fix.
+ *
+ * THE PREDICATE IS THE CLIENT'S, VERBATIM. src/lib/job-app-request.ts's
+ * appRequestOf() returns non-null when
+ *     job_status = 1  AND  (is_cancelled_by_app OR is_rescheduled_by_app)
+ * and that is reproduced exactly below, INCLUDING the status pin. The pin is
+ * not redundant with the caller's own status=1: a request is only pending while
+ * the job sits at 1 (the moment ops actions it the job leaves that status, so
+ * the status test IS the handled test), and a filter that omitted it would
+ * resurrect every ask ops has already answered. A caller that pins a different
+ * status gets an empty set, which is the honest answer.
+ *
+ * COALESCE(..., 0) = 1, never a bare truthy read: both columns are bit(1), so
+ * mysql2 hands them back as Buffers and EVERY Buffer is truthy. The LIST
+ * projection wraps them the same way for the same reason.
+ *
+ * Needs NO join — every column is on `j` — so the COUNT query's alias-sniffing
+ * picks up nothing new and both paths stay single-table.
+ */
+const APP_REQUEST_VALUES = Object.freeze(['any', 'cancel', 'reschedule']);
+
+function appRequestClause(appRequest) {
+  if (!APP_REQUEST_VALUES.includes(appRequest)) return null;
+  const cancel = 'COALESCE(j.is_cancelled_by_app, 0) = 1';
+  const resched = 'COALESCE(j.is_rescheduled_by_app, 0) = 1';
+  const flag = appRequest === 'cancel' ? cancel
+    : appRequest === 'reschedule' ? resched
+      : `(${cancel} OR ${resched})`;
+  return { sql: `(j.job_status = ? AND ${flag})`, params: [STATUS.SCHEDULED] };
+}
+
 function offerStateClause(offerState, expiryEnabled = offerExpiryEnabled()) {
   if (!OFFER_STATE_VALUES.includes(offerState)) return null;
   return offerStateSql(offerState, { bind: true, alias: 'jos', expiry: expiryEnabled });
@@ -2270,6 +2311,13 @@ async function list({
    * and why it's EXISTS-based rather than a JOIN.
    */
   offerState,
+  /*
+   * `appRequest` (2026-09-16) — 'any' | 'cancel' | 'reschedule'. Narrows to
+   * jobs carrying a PENDING technician app request. Absent / '' / unknown =
+   * no filter. See appRequestClause() above for the predicate and why it pins
+   * job_status itself.
+   */
+  appRequest,
   startDate, endDate,
   scope,
   allowedStages,             // Job Stage Access — { mode:'all'|'list', stages }
@@ -2454,6 +2502,16 @@ async function list({
   if (offerState && hasJobOffer) {
     const oc = offerStateClause(offerState, offerExpiry);
     if (oc) { clauses.push(oc.sql); params.push(...oc.params); }
+  }
+  /*
+   * `appRequest` — same AND-ed, narrowing shape as offerState above. No
+   * deploy probe: unlike tbl_job_offer these are columns on tbl_job itself,
+   * asserted at boot by scripts/schema-verify.js, so there is no environment
+   * where the clause could hit an unknown column.
+   */
+  if (appRequest) {
+    const ac = appRequestClause(appRequest);
+    if (ac) { clauses.push(ac.sql); params.push(...ac.params); }
   }
   /*
    * Booked-No-Services filter (2026-05-28). Forces both job_status = 0
@@ -7606,6 +7664,8 @@ module.exports = {
    * rather than a comment.
    */
   OFFER_STATE_VALUES, offerStateClause, offerColumns,
+  // The validator imports the vocabulary so the two sides cannot drift.
+  APP_REQUEST_VALUES, appRequestClause,
   /*
    * The app-REQUEST pair, exported for the same reason offerColumns is: the
    * LIST projection and the DETAIL decode are two answers to one question
