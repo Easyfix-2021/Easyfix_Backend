@@ -52,9 +52,9 @@ async function processCompleted(sessionId) {
       if (analysis) {
         const [r] = await pool.query(
           `UPDATE tbl_plivo_call_log
-              SET call_analysis = ?, call_analysis_status = 'ready', call_analysis_generated_at = NOW()
+              SET call_analysis = ?, call_analysis_status = 'ready', call_analysis_generated_at = ?
             WHERE call_uuid = ?`,
-          [JSON.stringify(analysis), s.call_uuid]);
+          [JSON.stringify(analysis), new Date(), s.call_uuid]);
         if (!r || !r.affectedRows) {
           logger.warn('teleprompter analysis: no tbl_plivo_call_log row for call_uuid ' + s.call_uuid + ' (score won\'t show on the call list)');
         }

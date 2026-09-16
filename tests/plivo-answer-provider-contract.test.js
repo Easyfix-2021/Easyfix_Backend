@@ -257,7 +257,11 @@ test('/answer stamps the audit row answered, keyed by the token\'s jci', async (
   assert.match(up.sql, /caller_status = 'answered'/);
   assert.match(up.sql, /unique_id = COALESCE\(\?, unique_id\)/,
     'COALESCE so a CallUUID already stamped by the ring callback is not clobbered with NULL');
-  assert.deepEqual(up.params, ['cu-2', JCI], 'the row is chosen by the signed jci, never by a query param');
+  // start_time (2026-09-16): a bound Date, never SQL NOW() — see
+  // routes/public/plivo-answer.js.
+  assert.doesNotMatch(up.sql, /NOW\(\)/);
+  assert.ok(up.params[0] instanceof Date, 'start_time is the first bound value');
+  assert.deepEqual(up.params.slice(1), ['cu-2', JCI], 'the row is chosen by the signed jci, never by a query param');
 });
 
 test('/answer with recording on emits a <Record> ELEMENT carrying the jci-keyed callback', async () => {

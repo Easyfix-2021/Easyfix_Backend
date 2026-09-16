@@ -36,11 +36,14 @@ test('all-new recipients use one latest-row read and one multi-row INSERT', asyn
   assert.equal(conn.calls.length, 2);
   assert.equal(callsMatching(conn, /^\s*INSERT INTO tbl_job_offer/i).length, 1);
   const insert = conn.calls[1];
-  assert.equal((insert.sql.match(/\(\?, \?, \?, NOW\(\), NOW\(\), NOW\(\), 1, \?, \?\)/g) || []).length, 3);
+  assert.doesNotMatch(insert.sql, /NOW\(\)/);
+  assert.equal((insert.sql.match(/\(\?, \?, \?, \?, \?, \?, 1, \?, \?\)/g) || []).length, 3);
+  const now = insert.params[3];
+  assert.ok(now instanceof Date);
   assert.deepEqual(insert.params, [
-    700, 11, OFFER_STATUS.OFFERED, 'search', 91,
-    700, 12, OFFER_STATUS.OFFERED, 'search', 91,
-    700, 13, OFFER_STATUS.OFFERED, 'search', 91,
+    700, 11, OFFER_STATUS.OFFERED, now, now, now, 'search', 91,
+    700, 12, OFFER_STATUS.OFFERED, now, now, now, 'search', 91,
+    700, 13, OFFER_STATUS.OFFERED, now, now, now, 'search', 91,
   ]);
 });
 
@@ -59,7 +62,9 @@ test('mixed existing and new recipients use one bulk statement per operation', a
   assert.equal(callsMatching(conn, /^\s*UPDATE tbl_job_offer/i).length, 2);
   assert.equal(callsMatching(conn, /^\s*INSERT INTO tbl_job_offer/i).length, 1);
   const insert = conn.calls.find(({ sql }) => /^\s*INSERT INTO tbl_job_offer/i.test(sql));
-  assert.deepEqual(insert.params, [700, 12, OFFER_STATUS.OFFERED, null, null]);
+  const now = insert.params[3];
+  assert.ok(now instanceof Date);
+  assert.deepEqual(insert.params, [700, 12, OFFER_STATUS.OFFERED, now, now, now, null, null]);
 });
 
 test('bulk reopen refreshes counters and clears response fields; one cleanup expires older open rows', async () => {
@@ -75,24 +80,30 @@ test('bulk reopen refreshes counters and clears response fields; one cleanup exp
 
   assert.equal(conn.calls.length, 3);
   const [, reopen, expire] = conn.calls;
+  assert.doesNotMatch(reopen.sql, /NOW\(\)/);
   assert.match(reopen.sql, /offer_count = offer_count \+ 1/);
-  assert.match(reopen.sql, /offered_at = NOW\(\)/);
-  assert.match(reopen.sql, /updated_on = NOW\(\)/);
+  assert.match(reopen.sql, /offered_at = \?/);
+  assert.match(reopen.sql, /updated_on = \?/);
   assert.match(reopen.sql, /responded_at = NULL/);
   assert.match(reopen.sql, /reject_reason = NULL/);
   assert.match(reopen.sql, /reject_reason_id = NULL/);
+  const now = reopen.params[1];
+  assert.ok(now instanceof Date);
   assert.deepEqual(reopen.params, [
     OFFER_STATUS.OFFERED,
+    now, now,
     501, null,
     503, null,
     null,
     501, 503,
   ]);
 
-  assert.match(expire.sql, /offer_status = \?, responded_at = NOW\(\)/);
+  assert.doesNotMatch(expire.sql, /NOW\(\)/);
+  assert.match(expire.sql, /offer_status = \?, responded_at = \?/);
   assert.match(expire.sql, /job_offer_id NOT IN \(\?, \?\)/);
   assert.deepEqual(expire.params, [
     OFFER_STATUS.EXPIRED,
+    now,
     700,
     11, 13,
     OFFER_STATUS.OFFERED,
@@ -115,13 +126,16 @@ test('per-technician source overrides the fallback for both reopen and insert', 
 
   const reopen = conn.calls.find(({ sql }) => /SET offer_status/.test(sql));
   const insert = conn.calls.find(({ sql }) => /^\s*INSERT INTO tbl_job_offer/i.test(sql));
+  const now = reopen.params[1];
+  assert.ok(now instanceof Date);
   assert.deepEqual(reopen.params, [
     OFFER_STATUS.OFFERED,
+    now, now,
     501, 'search',
     91,
     501,
   ]);
-  assert.deepEqual(insert.params, [700, 12, OFFER_STATUS.OFFERED, 'top10', 91]);
+  assert.deepEqual(insert.params, [700, 12, OFFER_STATUS.OFFERED, now, now, now, 'top10', 91]);
   assert.match(reopen.sql, /offer_source = COALESCE/);
   assert.match(reopen.sql, /offered_by_user_id = COALESCE/);
 });
@@ -145,7 +159,8 @@ test('a mixed 50-recipient batch stays at four SQL statements', async () => {
   const reopen = conn.calls.find(({ sql }) => /SET offer_status/.test(sql));
   const insert = conn.calls.find(({ sql }) => /^\s*INSERT INTO tbl_job_offer/i.test(sql));
   assert.equal((reopen.sql.match(/WHEN \? THEN \?/g) || []).length, 25);
-  assert.equal((insert.sql.match(/\(\?, \?, \?, NOW\(\), NOW\(\), NOW\(\), 1, \?, \?\)/g) || []).length, 25);
+  assert.equal((insert.sql.match(/\(\?, \?, \?, \?, \?, \?, 1, \?, \?\)/g) || []).length, 25);
+  assert.doesNotMatch(insert.sql, /NOW\(\)/);
 });
 
 test('more than 50 recipients is rejected before any SQL', async () => {

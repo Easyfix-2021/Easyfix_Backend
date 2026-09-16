@@ -55,12 +55,11 @@ const { maskForDisplay } = require('../../services/plivo.service');
  *     writers incremented and decremented could disagree with the rows it
  *     counted, and now cannot exist to.
  *
- * ⚠ TWO CLOCKS. `now` below is an app-side Date and is used ONLY on
- * tbl_job_conference, whose columns are app-written and hold the IST wall clock
- * (the pool's +05:30 session timezone stores it verbatim). tbl_plivo_call_log is
- * NOW()-written throughout by its own 2026-06-19 convention, so the leg helpers
- * stamp their own timestamps in SQL and `now` is deliberately NOT passed to
- * them. Each column is compared and written in the clock it was written in.
+ * ⚠ ONE CLOCK. `now` below is an app-side Date used on tbl_job_conference, whose
+ * columns hold the IST wall clock (the pool's +05:30 session timezone stores it
+ * verbatim). The tbl_plivo_call_log leg helpers stamp their own bound Dates
+ * (NOW()-written until 2026-09-16), so `now` is not passed to them. Each column
+ * is compared in the clock it was written in.
  *
  * ═════════════════════════════════════════════════════════════════════════
  * ⚠⚠  UNVERIFIED PLIVO MPC *CALLBACK* PAYLOAD SHAPES — THE ONLY PLACE  ⚠⚠

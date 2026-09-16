@@ -1008,8 +1008,8 @@ router.patch('/jobs/:id/approve', async (req, res, next) => {
     logger.info('SPOC approve job · id=' + req.params.id);
     const job = await loadJobInScope(req, res, 'Approve');
     if (!job) return;
-    await pool.query('UPDATE tbl_job SET approved_by_client_contact = ?, approved_on_date_time = NOW() WHERE job_id = ?',
-      [req.spoc.id, job.job_id]);
+    await pool.query('UPDATE tbl_job SET approved_by_client_contact = ?, approved_on_date_time = ? WHERE job_id = ?',
+      [req.spoc.id, new Date(), job.job_id]);
     logger.info('Job approved by client · id=' + job.job_id);
     modernOk(res, await jobService.getById(job.job_id), 'approved');
   } catch (e) { next(e); }
@@ -1021,8 +1021,8 @@ router.patch('/jobs/:id/reject', validate(Joi.object({ reason: Joi.string().min(
     const job = await loadJobInScope(req, res, 'Reject');
     if (!job) return;
     await pool.query(
-      'UPDATE tbl_job SET approval_reject_reason = ?, approval_reject_date_time = NOW() WHERE job_id = ?',
-      [req.body.reason, job.job_id]);
+      'UPDATE tbl_job SET approval_reject_reason = ?, approval_reject_date_time = ? WHERE job_id = ?',
+      [req.body.reason, new Date(), job.job_id]);
     // Fire escalation email to ops + the owner (legacy
     // sendemailClitoClientUrgentRequest replacement). Non-blocking —
     // failure here must not block the API response.
@@ -1053,8 +1053,8 @@ router.patch('/jobs/:id/estimate/approve', async (req, res, next) => {
       return modernError(res, 409, 'estimate already rejected; cannot approve');
     }
     await pool.query(
-      'UPDATE tbl_job SET approved_by_client_contact = ?, approved_on_date_time = NOW() WHERE job_id = ?',
-      [req.spoc.id, job.job_id]);
+      'UPDATE tbl_job SET approved_by_client_contact = ?, approved_on_date_time = ? WHERE job_id = ?',
+      [req.spoc.id, new Date(), job.job_id]);
     logger.info('Estimate approved · id=' + job.job_id);
     modernOk(res, { approved: true });
   } catch (e) { next(e); }
@@ -1078,8 +1078,8 @@ router.patch('/jobs/:id/estimate/reject', validate(Joi.object({ reason: Joi.stri
       return modernError(res, 409, 'estimate already rejected');
     }
     await pool.query(
-      'UPDATE tbl_job SET approval_reject_reason = ?, approval_reject_date_time = NOW() WHERE job_id = ?',
-      [req.body.reason, job.job_id]);
+      'UPDATE tbl_job SET approval_reject_reason = ?, approval_reject_date_time = ? WHERE job_id = ?',
+      [req.body.reason, new Date(), job.job_id]);
     fireRejectEscalation(job, req.body.reason, req.spoc).catch(() => {});
     logger.info('Estimate rejected · id=' + job.job_id);
     modernOk(res, { rejected: true });
@@ -1408,16 +1408,18 @@ router.post('/jobs/:id/escalate', validate(Joi.object({
     if (!job) return;
     logger.info('Client escalate job · id=' + job.job_id + ' · reason=' + req.body.reasonId + ' · spoc=' + req.spoc.id);
     const escalatedBy = req.spoc.contact_name || null;
+    const escalatedAt = new Date();
 
     // 1) the escalation record itself (job_stage here is the human-readable label)
     const [r] = await pool.query(
       `INSERT INTO tbl_job_escalation_info
          (job_id, easyfixer_id, escalation_time, job_stage, escalated_by,
           escalated_by_name, escalated_comments, escalated_from, escalation_reason)
-       VALUES (?, ?, NOW(), ?, 0, ?, ?, 'Client App', ?)`,
+       VALUES (?, ?, ?, ?, 0, ?, ?, 'Client App', ?)`,
       [
         job.job_id,
         job.fk_easyfixter_id || null,   // note: column name has the legacy "easyfixter" typo
+        escalatedAt,
         STAGE_LABEL[job.job_status] || String(job.job_status ?? ''),
         escalatedBy,
         req.body.comment || null,
@@ -1429,8 +1431,8 @@ router.post('/jobs/:id/escalate', validate(Joi.object({
     await pool.query(
       `INSERT INTO tbl_job_comment
          (job_id, enum_reason_id, comments, comment_on, created_on, job_stage, job_escalated_by)
-       VALUES (?, ?, ?, 19, NOW(), ?, ?)`,
-      [job.job_id, req.body.reasonId, req.body.comment || null, job.job_status ?? null, escalatedBy]);
+       VALUES (?, ?, ?, 19, ?, ?, ?)`,
+      [job.job_id, req.body.reasonId, req.body.comment || null, escalatedAt, job.job_status ?? null, escalatedBy]);
 
     modernOk(res, { escalated: true, escalation_info_id: r.insertId, job_id: job.job_id });
   } catch (e) { next(e); }

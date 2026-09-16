@@ -70,8 +70,8 @@ router.put('/override', validate(overrideBody), async (req, res, next) => {
     } else {
       await pool.query(
         `INSERT INTO tbl_client_setting (client_id, setting_id, value, deleted, starttimestamp)
-         VALUES (?, ?, ?, 0, NOW())`,
-        [clientId, settingId, value]
+         VALUES (?, ?, ?, 0, ?)`,
+        [clientId, settingId, value, new Date()]
       );
     }
     invalidate(clientId);
@@ -91,8 +91,8 @@ router.delete('/override', validate(clearBody, 'query'), async (req, res, next) 
     const settingId = Number(req.query.settingId);
     logger.info('Clearing auto-allocation override · clientId=' + clientId + ' settingId=' + settingId);
     const [r] = await pool.query(
-      'UPDATE tbl_client_setting SET deleted = 1, endtimestamp = NOW() WHERE client_id = ? AND setting_id = ?',
-      [clientId, settingId]
+      'UPDATE tbl_client_setting SET deleted = 1, endtimestamp = ? WHERE client_id = ? AND setting_id = ?',
+      [new Date(), clientId, settingId]
     );
     invalidate(clientId);
     if (r.affectedRows === 0) {

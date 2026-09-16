@@ -178,19 +178,20 @@ async function markDay(efrId, { date, morningSlot, eveningSlot }) {
   const evening = eveningSlot ? 1 : 0;
   logger.info('Mark attendance day · date=' + dayKey + ' · morning=' + morning + ' · evening=' + evening);
 
+  const now = new Date();
   const [upd] = await pool.query(
     `UPDATE tbl_easyfixer_attendance
         SET morning_slot = ?, evening_slot = ?, is_leave_marked = 0,
-            updated_on = NOW()
+            updated_on = ?
       WHERE easyfixer_id = ? AND created_on = ?`,
-    [morning, evening, efrId, dayKey],
+    [morning, evening, now, efrId, dayKey],
   );
   if (upd.affectedRows === 0) {
     await pool.query(
       `INSERT INTO tbl_easyfixer_attendance
          (easyfixer_id, morning_slot, evening_slot, is_leave_marked, created_on, insert_date)
-       VALUES (?, ?, ?, 0, ?, NOW())`,
-      [efrId, morning, evening, dayKey],
+       VALUES (?, ?, ?, 0, ?, ?)`,
+      [efrId, morning, evening, dayKey, now],
     );
   }
   logger.info('Attendance ' + (upd.affectedRows === 0 ? 'inserted' : 'updated') + ' · date=' + dayKey);
@@ -237,20 +238,21 @@ async function markLeave(efrId, { startDate, endDate }) {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    const now = new Date();
     for (const dayKey of days) {
       const [upd] = await conn.query(
         `UPDATE tbl_easyfixer_attendance
             SET is_leave_marked = 1, morning_slot = 0, evening_slot = 0,
-                updated_on = NOW()
+                updated_on = ?
           WHERE easyfixer_id = ? AND created_on = ?`,
-        [efrId, dayKey],
+        [now, efrId, dayKey],
       );
       if (upd.affectedRows === 0) {
         await conn.query(
           `INSERT INTO tbl_easyfixer_attendance
              (easyfixer_id, morning_slot, evening_slot, is_leave_marked, created_on, insert_date)
-           VALUES (?, 0, 0, 1, ?, NOW())`,
-          [efrId, dayKey],
+           VALUES (?, 0, 0, 1, ?, ?)`,
+          [efrId, dayKey, now],
         );
       }
     }
@@ -287,11 +289,11 @@ async function unmarkLeave(efrId, { startDate, endDate }) {
     await conn.beginTransaction();
     await conn.query(
       `UPDATE tbl_easyfixer_attendance
-          SET is_leave_marked = 0, updated_on = NOW()
+          SET is_leave_marked = 0, updated_on = ?
         WHERE easyfixer_id = ?
           AND created_on BETWEEN ? AND ?
           AND is_leave_marked = 1`,
-      [efrId, startKey, endKey],
+      [new Date(), efrId, startKey, endKey],
     );
     await conn.commit();
     logger.info('Leave unmarked · range ' + startKey + '..' + endKey);

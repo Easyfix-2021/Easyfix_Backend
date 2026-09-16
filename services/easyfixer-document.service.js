@@ -31,8 +31,8 @@ async function upsertEasyfixerDocuments(connection, efrId, rows) {
       await connection.query(
         `INSERT INTO tbl_easyfixer_document
            (efr_id, efr_doc_type_id, efr_document_name, created_date, created_by)
-         VALUES (?, ?, ?, NOW(), ?)`,
-        [efrId, typeId, key, efrId],
+         VALUES (?, ?, ?, ?, ?)`,
+        [efrId, typeId, key, new Date(), efrId],
       );
     }
   }

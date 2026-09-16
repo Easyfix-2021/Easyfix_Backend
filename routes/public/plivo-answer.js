@@ -47,10 +47,10 @@ router.get('/answer', async (req, res) => {
       await pool.query(
         `UPDATE tbl_job_caller_info
             SET caller_status = 'answered',
-                start_time = NOW(),
+                start_time = ?,
                 unique_id = COALESCE(?, unique_id)
           WHERE job_caller_info = ?`,
-        [req.query.CallUUID || null, claims.jci]
+        [new Date(), req.query.CallUUID || null, claims.jci]
       );
     } catch (err) {
       logger.warn({ jci: claims.jci, err: err && err.message }, 'plivo answer: audit update failed (returning XML anyway)');

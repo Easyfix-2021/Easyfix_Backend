@@ -852,8 +852,8 @@ async function setLanguage(efrId, language, runner = pool) {
     // EasyfixApp @Entity). Insert a minimal row carrying the language.
     await runner.query(
       `INSERT INTO tbl_easyfixer_app (efr_id, language, last_login_time)
-       VALUES (?, ?, NOW())`,
-      [efrId, lang],
+       VALUES (?, ?, ?)`,
+      [efrId, lang, new Date()],
     );
   }
 

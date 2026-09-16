@@ -26,6 +26,11 @@ const fake = installFakePool([
   [/FROM tbl_user WHERE mobile_no IN/i, () => scenario.users],
   [/SELECT efr_no FROM tbl_easyfixer/i, []],
   [/FROM tbl_easyfixer E/i, () => scenario.efrs],
+  // pinDetail() prefill for create()'s pin-based (requestFor=0) path below.
+  [/FROM tbl_pincode/i, () => [{
+    pincode: 700001, city_id: 1, city_name: 'Kolkata', district: 'Kolkata',
+    state_name: 'WB', state_user: 5, zonal_manager_name: 'ZM',
+  }]],
 ]);
 const svc = require('../services/quicksight/quicksight-supply-gap.service');
 const { resolveSupplyStatusBatch } = svc._internals;
@@ -135,4 +140,27 @@ test('a missing city collapses the whole funnel — the shape of the old bug', a
   fake.reset();
   const map = await resolveSupplyStatusBatch(['9999900001']);
   assert.equal(map.get('9999900001'), 'Details Not Available');
+});
+
+// ─── create() stamps tbl_open_city.inserted_on as a bound Date ───────
+// inserted_on is DATETIME; the pool serialises a bound JS Date as the IST
+// wall clock regardless of host, whereas NOW() resolves in the DB session
+// zone. A regression back to NOW() would silently drift under UTC hosts.
+test('create() binds inserted_on as a Date, not NOW()', async () => {
+  fake.reset();
+  await svc.create({ requestFor: 0, pin: '700001', catgId: 3, comments: 'test' }, { user_id: 42 });
+  const ins = fake.calls.find((c) => /INSERT INTO tbl_open_city/i.test(c.sql));
+  assert.ok(ins, 'the tbl_open_city insert should have run');
+  assert.doesNotMatch(ins.sql, /NOW\(\)/, 'inserted_on must be a bound Date, not NOW()');
+  assert.ok(ins.params.at(-1) instanceof Date, 'inserted_on must be the last bound param');
+
+  // supply_request_log.insert_time (TIMESTAMP) is stamped in the same
+  // transaction, with the SAME Date as tbl_open_city.inserted_on.
+  const log = fake.calls.find((c) => /INSERT INTO supply_request_log/i.test(c.sql));
+  assert.ok(log, 'the supply_request_log insert should have run');
+  assert.doesNotMatch(log.sql, /NOW\(\)/, 'insert_time must be a bound Date, not NOW()');
+  const logDate = log.params.find((p) => p instanceof Date);
+  assert.ok(logDate, 'insert_time must be a bound Date');
+  assert.equal(logDate.getTime(), ins.params.at(-1).getTime(),
+    'inserted_on and insert_time must stamp the same creation event identically');
 });

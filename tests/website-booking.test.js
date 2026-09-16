@@ -528,12 +528,15 @@ test('create() writes EVERY image row INSIDE the transaction, before COMMIT', as
   const stmt = imageStmts[0];
   assert.ok(stmt.i > begin && stmt.i < commit,
     'the image INSERT must sit BETWEEN begin and commit — never after it');
-  assert.equal((stmt.sql.match(/\(\?, \?, \?, \?, NOW\(\)\)/g) || []).length, 3,
-    'one VALUES group per photo, each still stamping created_date with NOW()');
+  assert.doesNotMatch(stmt.sql, /NOW\(\)/, 'created_date is a bound Date, never SQL NOW()');
+  assert.equal((stmt.sql.match(/\(\?, \?, \?, \?, \?\)/g) || []).length, 3,
+    'one VALUES group per photo, each still stamping created_date');
+  const createdDate = stmt.params[4];
+  assert.ok(createdDate instanceof Date, 'created_date is bound as a Date');
   assert.deepEqual(stmt.params, [
-    NEW_JOB_ID, 'wb-1.jpg', 'booking', 0,
-    NEW_JOB_ID, 'wb-2.png', 'booking', 0,
-    NEW_JOB_ID, 'wb-3.webp', 'booking', 0,
+    NEW_JOB_ID, 'wb-1.jpg', 'booking', 0, createdDate,
+    NEW_JOB_ID, 'wb-2.png', 'booking', 0, createdDate,
+    NEW_JOB_ID, 'wb-3.webp', 'booking', 0, createdDate,
   ], 'every row carries the SAME column values the single-image branch always did');
   assert.ok(
     !fake.calls.slice(commit + 1).some((c) => /INSERT INTO tbl_job_image/i.test(c.sql)),
@@ -574,9 +577,12 @@ test('create() still honours the LEGACY scalar job_image_filename, unchanged', a
   try {
     await runCreate({ job_image_filename: '  legacy-one.jpg  ' });
     assert.equal(imageStmts().length, 1);
-    assert.deepEqual(imageStmts()[0].params, [NEW_JOB_ID, 'legacy-one.jpg', 'booking', 0],
-      'still trimmed, still four params, still the same column values');
-    assert.match(imageStmts()[0].sql, /VALUES \(\?, \?, \?, \?, NOW\(\)\)$/);
+    assert.equal(imageStmts()[0].params.length, 5, 'still trimmed, now five params (created_date bound)');
+    assert.deepEqual(imageStmts()[0].params.slice(0, 4), [NEW_JOB_ID, 'legacy-one.jpg', 'booking', 0],
+      'still trimmed, still the same column values');
+    assert.ok(imageStmts()[0].params[4] instanceof Date, 'created_date is bound as a Date');
+    assert.match(imageStmts()[0].sql, /VALUES \(\?, \?, \?, \?, \?\)$/);
+    assert.doesNotMatch(imageStmts()[0].sql, /NOW\(\)/, 'created_date is a bound Date, never SQL NOW()');
 
     for (const noop of [{}, { job_image_filename: null }, { job_image_filename: '' },
       { job_image_filenames: [] }, { job_image_filenames: ['', null] }]) {
@@ -591,9 +597,11 @@ test('create() still honours the LEGACY scalar job_image_filename, unchanged', a
     fake.calls.length = 0;
     await runCreate({ job_image_filename: 'a.jpg', job_image_filenames: ['a.jpg', 'b.png'] });
     assert.equal(imageStmts().length, 1);
+    const dupCreatedDate = imageStmts()[0].params[4];
+    assert.ok(dupCreatedDate instanceof Date, 'created_date is bound as a Date');
     assert.deepEqual(imageStmts()[0].params, [
-      NEW_JOB_ID, 'a.jpg', 'booking', 0,
-      NEW_JOB_ID, 'b.png', 'booking', 0,
+      NEW_JOB_ID, 'a.jpg', 'booking', 0, dupCreatedDate,
+      NEW_JOB_ID, 'b.png', 'booking', 0, dupCreatedDate,
     ], 'the duplicate collapses instead of inserting the same image twice');
   } finally {
     db.pool.getConnection = realGetConnection;

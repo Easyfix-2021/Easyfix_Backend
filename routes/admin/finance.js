@@ -281,8 +281,8 @@ router.post('/invoices/generate', validate(Joi.object({
       `INSERT INTO tbl_client_invoice (fk_client_id, billing_from_date, billing_to_date,
           current_due_amount, total_invoice_amount, total_paid_amount,
           is_raised, is_paid, invoice_date)
-       VALUES (?, ?, ?, ?, ?, 0, 1, 0, NOW())`,
-      [clientId, from, to, sum.total, sum.total]);
+       VALUES (?, ?, ?, ?, ?, 0, 1, 0, DATE(?))`,
+      [clientId, from, to, sum.total, sum.total, new Date()]);
     res.status(201);
     logger.info('Invoice generated · id=' + ins.insertId + ' clientId=' + clientId + ' jobCount=' + sum.jobCount);
     modernOk(res, { invoiceId: ins.insertId, jobCount: sum.jobCount, totalAmount: sum.total }, 'invoice generated');
@@ -745,8 +745,8 @@ router.post('/purchase-orders', validate(Joi.object({
     const [ins] = await pool.query(
       `INSERT INTO tbl_client_purchase_order_details
          (fk_client_id, inv_client_po_num, inv_po_desc, inv_po_start_date, inv_po_end_date, inv_po_total_amnt, inv_po_date)
-       VALUES (?, ?, ?, ?, ?, ?, NOW())`,
-      [b.clientId, b.poNumber, b.description || null, b.startDate, b.endDate, b.totalAmount]);
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [b.clientId, b.poNumber, b.description || null, b.startDate, b.endDate, b.totalAmount, new Date()]);
     res.status(201);
     logger.info('Purchase order created · id=' + ins.insertId + ' clientId=' + b.clientId);
     modernOk(res, { poId: ins.insertId });
@@ -883,9 +883,9 @@ router.post('/payouts', validate(Joi.object({
     const [ins] = await pool.query(
       `INSERT INTO tbl_service_payout
          (efr_balance, ops_amount, pm_req_amount, pm_req_date, pm_req_by, is_approved_by_fin, efr_id)
-       VALUES (?, ?, ?, NOW(), ?, 0, ?)`,
+       VALUES (?, ?, ?, ?, ?, 0, ?)`,
       [req.body.efrBalance, req.body.opsAmount, req.body.pmRequestAmount,
-       req.user.user_id, req.body.efrId]
+       new Date(), req.user.user_id, req.body.efrId]
     );
     res.status(201);
     logger.info('Payout created · id=' + ins.insertId + ' efrId=' + req.body.efrId + ' status=0');
@@ -1078,9 +1078,9 @@ router.post('/payouts/:id/fin-reject', validate(Joi.object({})), async (req, res
         `UPDATE tbl_service_payout
             SET is_approved_by_fin = 3,
                 fin_rejected_by = ?,
-                fin_reject_date = NOW()
+                fin_reject_date = ?
           WHERE payout_id = ? AND efr_id = ?`,
-        [req.user.user_id, payoutId, gate.efrId]
+        [req.user.user_id, new Date(), payoutId, gate.efrId]
       );
       if (r.affectedRows === 0) return { ok: false, status: 404, error: 'payout not found' };
       return { ok: true, efrId: gate.efrId };
@@ -1162,8 +1162,8 @@ router.post('/ndm-recharges', validate(Joi.object({
       `INSERT INTO tbl_ndm_recharge
          (efr_id, ndm_id, recharge_amount, recharge_date, recharge_type,
           comments, approved_by_finance, document_path, payment_mode, reference_id)
-       VALUES (?, ?, ?, NOW(), ?, ?, 0, ?, ?, ?)`,
-      [req.body.efrId, req.user.user_id, req.body.rechargeAmount,
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+      [req.body.efrId, req.user.user_id, req.body.rechargeAmount, new Date(),
        req.body.rechargeType || ledger.CREDIT, req.body.comments || null,
        req.body.documentPath || null, req.body.paymentMode || null,
        req.body.referenceId || null]

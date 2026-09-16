@@ -365,8 +365,8 @@ router.post(
 
         const [ins] = await pool.query(
           `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, created_date)
-           VALUES (?, ?, 'booking', 0, NOW())`,
-          [jobId, imageKey],
+           VALUES (?, ?, 'booking', 0, ?)`,
+          [jobId, imageKey, new Date()],
         );
         logger.info('Job image uploaded · jobId=' + jobId + ' · image_id=' + ins.insertId + ' · seq=' + seq);
         // Short-TTL presigned GET so the FE renders the thumbnail / lightbox

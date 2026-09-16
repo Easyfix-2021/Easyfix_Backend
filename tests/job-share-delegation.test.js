@@ -167,8 +167,12 @@ test('a legal transition writes a status pinned to the status it validated', asy
   await delegation.acceptShare(4321, 902);
   assert.equal(updates.length, 1);
   const [u] = updates;
-  assert.match(u.sql, /SET status = \?, responded_on = NOW\(\) WHERE share_id = \? AND status = \?/);
-  assert.deepEqual(u.params, ['accepted', 77, 'pending'],
+  assert.match(u.sql, /SET status = \?, responded_on = \? WHERE share_id = \? AND status = \?/);
+  assert.doesNotMatch(u.sql, /NOW\(\)/, 'responded_on is a bound Date, never SQL NOW()');
+  assert.equal(u.params.length, 4);
+  assert.equal(u.params[0], 'accepted');
+  assert.ok(u.params[1] instanceof Date, 'responded_on is bound as a Date');
+  assert.deepEqual([u.params[2], u.params[3]], [77, 'pending'],
     'the WHERE must pin the FROM status, or two devices can both win');
 });
 
@@ -266,7 +270,10 @@ test('an accepted DELEGATE acts as the owner — and his first write closes the 
     'identity is substituted, so all 15 ownership checks pass unmodified');
   assert.equal(req.tech.actual_efr_id, 902, 'the real caller stays available');
   assert.equal(updates.length, 1, 'accepted → started on the first mutating touch');
-  assert.deepEqual(updates[0].params, ['started', 77, 'accepted']);
+  assert.equal(updates[0].params.length, 4);
+  assert.equal(updates[0].params[0], 'started');
+  assert.ok(updates[0].params[1] instanceof Date, 'started_on is bound as a Date, never SQL NOW()');
+  assert.deepEqual([updates[0].params[2], updates[0].params[3]], [77, 'accepted']);
 });
 
 test('a delegate GET substitutes identity but does NOT start the job', async () => {

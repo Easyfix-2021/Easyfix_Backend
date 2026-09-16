@@ -20,7 +20,7 @@ const fake = installFakePool([
   [/FROM tbl_job_comment c[\s\S]*WHERE c\.job_id = \?/, () => rows],
 ]);
 const { pool } = require('../db');
-const { listComments } = require('../services/job-comment.service');
+const { listComments, addComment } = require('../services/job-comment.service');
 
 test.after(async () => { fake.restore(); await pool.end(); });
 
@@ -128,4 +128,31 @@ test('the SELECT is parameterised, all-LEFT, and joins the columns legacy reads'
     /c\.job_escalated_by/, /atr\.is_new AS reason_is_new/, /ut\.type AS reason_user_type/, /e\.efr_name/,
     /ORDER BY c\.created_on DESC, c\.comment_id DESC/,
   ]) assert.match(call.sql, re);
+});
+
+test('addComment mirrors remarks_date_time onto tbl_job as a bound Date, never SQL NOW()', async () => {
+  // The one converted writer in this module (job-comment.service.js's
+  // tbl_job.remarks mirror). Overriding pool.query directly for this single
+  // test — the shared `fake` above only routes listComments' own SELECT.
+  const original = pool.query;
+  const calls = [];
+  pool.query = async (sql, params) => {
+    calls.push({ sql, params });
+    if (/INFORMATION_SCHEMA\.COLUMNS[\s\S]*'tbl_job_comment'/.test(sql)) return [[]];       // no job_stage column
+    if (/INFORMATION_SCHEMA\.COLUMNS[\s\S]*'tbl_job'/.test(sql)) return [[{ 1: 1 }]];        // remarks_date_time present
+    if (/^\s*INSERT INTO tbl_job_comment/i.test(sql)) return [{ insertId: 9001 }];
+    if (/^\s*UPDATE tbl_job SET/i.test(sql)) return [{ affectedRows: 1 }];
+    if (/^\s*SELECT c\.comment_id/i.test(sql)) return [[raw({ id: 9001 })]];
+    return [[]];
+  };
+  try {
+    await addComment(473627, { comments: 'called, no answer', comment_on: 3 });
+  } finally {
+    pool.query = original;
+  }
+  const mirror = calls.find((c) => /^\s*UPDATE tbl_job SET/i.test(c.sql));
+  assert.ok(mirror, 'the tbl_job.remarks mirror must have run');
+  assert.match(mirror.sql, /remarks_date_time = \?/);
+  assert.doesNotMatch(mirror.sql, /remarks_date_time = NOW\(\)/);
+  assert.ok(mirror.params[1] instanceof Date, 'remarks_date_time is bound as a Date');
 });

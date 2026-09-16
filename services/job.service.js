@@ -169,10 +169,10 @@ async function expireStaleOffers(maxAgeMinutes = OFFER_TTL_MINUTES, jobId = null
   const crTtl = await closedReasonSet(OFFER_CLOSED_REASON.TTL_ELAPSED);
   const [r] = await pool.query(
     `UPDATE tbl_job_offer
-        SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()${crTtl.sql}
+        SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = ?${crTtl.sql}
       WHERE offer_status = ${OFFER_STATUS.OFFERED}
         AND offered_at < NOW() - INTERVAL ? MINUTE${jobClause}`,
-    [...crTtl.params, ...params],
+    [new Date(), ...crTtl.params, ...params],
   );
   return { expired: r.affectedRows || 0 };
 }
@@ -218,9 +218,9 @@ async function withdrawOffersForClosedJob(jobId, status) {
     const crClosed = await closedReasonSet(OFFER_CLOSED_REASON.JOB_CLOSED);
     const [r] = await pool.query(
       `UPDATE tbl_job_offer
-          SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()${crClosed.sql}
+          SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = ?${crClosed.sql}
         WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
-      [...crClosed.params, Number(jobId)],
+      [new Date(), ...crClosed.params, Number(jobId)],
     );
     const withdrawn = r.affectedRows || 0;
     if (withdrawn > 0) {
@@ -4587,9 +4587,8 @@ async function create(input, actor) {
      * ONE round trip regardless of N — a multi-row VALUES list rather
      * than a loop of queries. The per-row column set and bound values
      * are UNCHANGED from the single-image version (job_id, image,
-     * image_category='booking', job_stage=0, created_date=NOW()), so a
-     * caller sending only the scalar emits byte-identical SQL to
-     * before. `status` stays out of the column list deliberately:
+     * image_category='booking', job_stage=0, created_date=now), so a
+     * caller sending only the scalar emits one row as before. `status` stays out of the column list deliberately:
      * tbl_job_image.status is `int NULL DEFAULT 1`, and every existing
      * image_category='booking' row carries status 1, so omitting it
      * yields the same data. (routes/integration/v1/index.js names the
@@ -4597,10 +4596,11 @@ async function create(input, actor) {
      */
     const jobImageFilenames = normaliseJobImageFilenames(input);
     if (jobImageFilenames.length > 0) {
+      const createdDate = new Date();
       await conn.query(
         `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, created_date)
-         VALUES ${jobImageFilenames.map(() => '(?, ?, ?, ?, NOW())').join(', ')}`,
-        jobImageFilenames.flatMap((name) => [jobId, name, 'booking', 0])
+         VALUES ${jobImageFilenames.map(() => '(?, ?, ?, ?, ?)').join(', ')}`,
+        jobImageFilenames.flatMap((name) => [jobId, name, 'booking', 0, createdDate])
       );
     }
 
@@ -6157,9 +6157,9 @@ async function releaseOwnedJobForReoffer(jobId, preloadedJob, { reasonId, resche
     const crRelease = await closedReasonSet(OFFER_CLOSED_REASON.RELEASED_FOR_REOFFER);
     await conn.query(
       `UPDATE tbl_job_offer
-          SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()${crRelease.sql}
+          SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = ?${crRelease.sql}
         WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
-      [...crRelease.params, jobId],
+      [new Date(), ...crRelease.params, jobId],
     );
     await conn.commit();
     return releasedTechId;
@@ -6403,9 +6403,9 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
       const crAssign = await closedReasonSet(OFFER_CLOSED_REASON.JOB_ASSIGNED);
       await conn.query(
         `UPDATE tbl_job_offer
-            SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()${crAssign.sql}
+            SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = ?${crAssign.sql}
           WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
-        [...crAssign.params, jobId],
+        [now, ...crAssign.params, jobId],
       );
     }
 
@@ -6541,7 +6541,7 @@ async function applyUnassignLocked(conn, jobId, lockedJob, {
     // offer, matching accept/list/membership semantics.
     await conn.query(
       `UPDATE tbl_job_offer
-          SET offer_status = ${OFFER_STATUS.REJECTED}, reject_reason = ?, reject_reason_id = ?, responded_at = NOW()
+          SET offer_status = ${OFFER_STATUS.REJECTED}, reject_reason = ?, reject_reason_id = ?, responded_at = ?
         WHERE job_offer_id = (
           SELECT latest_id FROM (
             SELECT MAX(job_offer_id) AS latest_id
@@ -6550,7 +6550,7 @@ async function applyUnassignLocked(conn, jobId, lockedJob, {
           ) latest_offer
         )
           AND offer_status = ${OFFER_STATUS.OFFERED}`,
-      [reason, reasonId != null ? reasonId : null, jobId, techIdAtUnassign],
+      [reason, reasonId != null ? reasonId : null, now, jobId, techIdAtUnassign],
     );
   }
   return Number(techIdAtUnassign);
@@ -6653,6 +6653,7 @@ async function acceptOffer(jobId, efrId) {
   // `committed` guards the catch so a post-commit throw (the 409 path) doesn't
   // issue a ROLLBACK against an already-committed transaction.
   let committed = false;
+  const now = new Date();
   try {
     await conn.beginTransaction();
 
@@ -6756,7 +6757,7 @@ async function acceptOffer(jobId, efrId) {
       // contradict the latest-row membership rule used everywhere else.
       const [acceptedOffer] = await conn.query(
         `UPDATE tbl_job_offer
-            SET offer_status = ${OFFER_STATUS.ACCEPTED}, responded_at = NOW()
+            SET offer_status = ${OFFER_STATUS.ACCEPTED}, responded_at = ?
           WHERE job_offer_id = (
             SELECT latest_id FROM (
               SELECT MAX(job_offer_id) AS latest_id
@@ -6765,7 +6766,7 @@ async function acceptOffer(jobId, efrId) {
             ) latest_offer
           )
             AND offer_status = ${OFFER_STATUS.OFFERED}`,
-        [jobId, efrId],
+        [now, jobId, efrId],
       );
       if (Number(acceptedOffer.affectedRows) !== 1) {
         const err = new Error('This job offer is no longer available');
@@ -6774,9 +6775,9 @@ async function acceptOffer(jobId, efrId) {
       }
       const crWon = await closedReasonSet(OFFER_CLOSED_REASON.SIBLING_ACCEPTED);
       await conn.query(
-        `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()${crWon.sql}
+        `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = ?${crWon.sql}
           WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
-        [...crWon.params, jobId],
+        [now, ...crWon.params, jobId],
       );
       await conn.commit();
       committed = true;
@@ -6793,9 +6794,9 @@ async function acceptOffer(jobId, efrId) {
     // tech's own open offer, commit that, and flag a 409 to throw post-finally.
     const crLost = await closedReasonSet(OFFER_CLOSED_REASON.SIBLING_ACCEPTED);
     await conn.query(
-      `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()${crLost.sql}
+      `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = ?${crLost.sql}
         WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
-      [...crLost.params, jobId, efrId],
+      [now, ...crLost.params, jobId, efrId],
     );
     await conn.commit();
     committed = true;
@@ -6941,12 +6942,13 @@ async function rejectOffer(jobId, efrId, { reason, reasonId } = {}) {
       const freshnessClause = enforceTtl
         ? ' AND offered_at >= NOW() - INTERVAL ? MINUTE'
         : '';
+      const respondedAt = new Date();
       const updateParams = enforceTtl
-        ? [normalizedReason, reasonId != null ? reasonId : null, latestOffer.job_offer_id, OFFER_TTL_MINUTES]
-        : [normalizedReason, reasonId != null ? reasonId : null, latestOffer.job_offer_id];
+        ? [normalizedReason, reasonId != null ? reasonId : null, respondedAt, latestOffer.job_offer_id, OFFER_TTL_MINUTES]
+        : [normalizedReason, reasonId != null ? reasonId : null, respondedAt, latestOffer.job_offer_id];
       const [rejected] = await conn.query(
         `UPDATE tbl_job_offer
-            SET offer_status = ${OFFER_STATUS.REJECTED}, reject_reason = ?, reject_reason_id = ?, responded_at = NOW()
+            SET offer_status = ${OFFER_STATUS.REJECTED}, reject_reason = ?, reject_reason_id = ?, responded_at = ?
           WHERE job_offer_id = ?
             AND offer_status = ${OFFER_STATUS.OFFERED}${freshnessClause}`,
         updateParams,
@@ -7156,9 +7158,9 @@ async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason
       const crResched = await closedReasonSet(OFFER_CLOSED_REASON.RESCHEDULED);
       await conn.query(
         `UPDATE tbl_job_offer
-            SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()${crResched.sql}
+            SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = ?${crResched.sql}
           WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
-        [...crResched.params, jobId],
+        [rescheduledAt, ...crResched.params, jobId],
       );
     }
     await conn.commit();

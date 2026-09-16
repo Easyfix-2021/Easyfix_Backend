@@ -1119,8 +1119,8 @@ async function acceptSubmission(efrId, payload, pool) {
       params.push(basic[payloadKey] === '' ? null : basic[payloadKey]);
     }
     if (sets.length) {
-      sets.push('update_date = NOW()');
-      params.push(efrId);
+      sets.push('update_date = ?');
+      params.push(new Date(), efrId);
       await conn.query(
         `UPDATE tbl_easyfixer SET ${sets.join(', ')} WHERE efr_id = ?`,
         params,

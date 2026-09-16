@@ -168,7 +168,7 @@ function kindOfReasonId(ids, enumReasonId) {
  *   source_type         SOURCE_TYPE — origin marker, never the discriminator
  *   comment_on          1, the lifecycle bucket the legacy CRM renders
  *   enum_reason_id      THE discriminator: which of the two requests this is
- *   created_on          NOW()
+ *   created_on          bound Date (never NOW() — see db.js pool timezone)
  *   job_stage           the job's status AT THE TIME, so ops can see what the
  *                       client was looking at when they asked
  *   job_escalated_by    the client contact's NAME — the only place an author
@@ -184,9 +184,9 @@ async function insertRequest(db, { jobId, kind, jobStatus, authorName, comment, 
   const [r] = await db.query(
     `INSERT INTO tbl_job_comment
        (job_id, comments, source_type, comment_on, enum_reason_id, created_on, job_stage, job_escalated_by)
-     VALUES (?, ?, ?, ?, ?, NOW(), ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     [jobId, buildComment(kind, { authorName, comment }), SOURCE_TYPE, COMMENT_ON,
-     reasonId, jobStatus ?? null, String(authorName || '').trim() || null],
+     reasonId, new Date(), jobStatus ?? null, String(authorName || '').trim() || null],
   );
   return r.insertId;
 }

@@ -113,7 +113,7 @@ const STATUS_AGG = `
       COUNT(CASE WHEN jo.offer_status = ${OFFER_STATUS.EXPIRED}  THEN 1 END) AS expired,
       COUNT(CASE WHEN jo.offer_status = ${OFFER_STATUS.OFFERED}  THEN 1 END) AS open_count,
       -- Avg response time = only GENUINE responses (ACCEPTED / REJECTED). EXPIRED
-      -- offers ALSO stamp responded_at — the offer-expiry cron sets it = NOW() when
+      -- offers ALSO stamp responded_at — the offer-expiry cron stamps it (now) when
       -- it marks a stale offer expired — so including them measures "offer age at
       -- expiry" (~the 30-min TTL, or hours if the cron lagged), never how fast a
       -- tech actually responded. Measured in SECONDS so the CRM renders mm:ss.
@@ -209,7 +209,7 @@ async function getOfferAcceptance(filters = {}) {
              * Derived as COUNT(DISTINCT offered_at) because one Offer action
              * writes every tech in the batch inside a single transaction, so a
              * wave shares one offered_at second; a re-offer sets
-             * offered_at = NOW() again (job.service offerToTechnicians), which
+             * offered_at = now again (job-offer-persistence), which
              * is what makes later waves distinguishable at all.
              *
              * ⚠ Two honest limits of a schema that keeps ONE row per (job,tech)
@@ -409,7 +409,7 @@ async function getOfferDetails(filters = {}, selection = {}) {
             /*
              * Per-offer response time. Restricted to ACCEPTED / REJECTED for the
              * same reason STATUS_AGG's avg is: an EXPIRED offer also stamps
-             * responded_at — the expiry sweep sets it to NOW() — so including
+             * responded_at — the expiry sweep stamps it (now) — so including
              * those would report "offer age at expiry" (~the 30-min TTL, or
              * hours if the cron lagged) as if the technician had answered. NULL
              * on expired/open rows renders as '—', which is the honest value.

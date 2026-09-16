@@ -72,6 +72,7 @@ async function persistJobOfferBatch(conn, {
   const normalized = normalizeInput(jobId, efrIds);
   const ids = normalized.efrIds;
   const idPlaceholders = ids.map(() => '?').join(', ');
+  const now = new Date();
 
   const [latestRows] = await conn.query(
     `SELECT jo.fk_easyfixter_id, jo.job_offer_id AS latest_job_offer_id
@@ -105,7 +106,7 @@ async function persistJobOfferBatch(conn, {
     const latestOfferIds = existingIds.map((id) => latestByEfr.get(id));
     const sourceCases = existingIds.map(() => 'WHEN ? THEN ?').join(' ');
     const offerIdPlaceholders = latestOfferIds.map(() => '?').join(', ');
-    const reopenParams = [OFFER_STATUS.OFFERED];
+    const reopenParams = [OFFER_STATUS.OFFERED, now, now];
     for (let index = 0; index < existingIds.length; index += 1) {
       reopenParams.push(
         latestOfferIds[index],
@@ -117,8 +118,8 @@ async function persistJobOfferBatch(conn, {
     await conn.query(
       `UPDATE tbl_job_offer
           SET offer_status = ?,
-              offered_at = NOW(),
-              updated_on = NOW(),
+              offered_at = ?,
+              updated_on = ?,
               offer_count = offer_count + 1,
               offer_source = COALESCE(
                 CASE job_offer_id ${sourceCases} ELSE NULL END,
@@ -143,13 +144,14 @@ async function persistJobOfferBatch(conn, {
     const crReoffer = await closedReasonSet(OFFER_CLOSED_REASON.REOFFERED);
     await conn.query(
       `UPDATE tbl_job_offer
-          SET offer_status = ?, responded_at = NOW()${crReoffer.sql}
+          SET offer_status = ?, responded_at = ?${crReoffer.sql}
         WHERE job_id = ?
           AND fk_easyfixter_id IN (${existingIdPlaceholders})
           AND offer_status = ?
           AND job_offer_id NOT IN (${offerIdPlaceholders})`,
       [
         OFFER_STATUS.EXPIRED,
+        now,
         ...crReoffer.params,
         normalized.jobId,
         ...existingIds,
@@ -160,11 +162,14 @@ async function persistJobOfferBatch(conn, {
   }
 
   if (newIds.length > 0) {
-    const insertValues = newIds.map(() => '(?, ?, ?, NOW(), NOW(), NOW(), 1, ?, ?)').join(', ');
+    const insertValues = newIds.map(() => '(?, ?, ?, ?, ?, ?, 1, ?, ?)').join(', ');
     const insertParams = newIds.flatMap((efrId) => [
       normalized.jobId,
       efrId,
       OFFER_STATUS.OFFERED,
+      now,
+      now,
+      now,
       sourceFor(efrId, source, sourceByEfr),
       offeredBy ?? null,
     ]);

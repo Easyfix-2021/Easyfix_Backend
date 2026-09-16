@@ -65,6 +65,12 @@ test('the UPDATE itself re-checks the counter, closing the race', () => {
   );
 });
 
+test('full_fillment_created_time is a bound Date, never SQL NOW()', () => {
+  const body = holdHandler();
+  assert.match(body, /full_fillment_created_time = \?/, 'must be a bind parameter');
+  assert.doesNotMatch(body, /full_fillment_created_time = NOW\(\)/, 'IST wall-clock convention: no SQL NOW()');
+});
+
 test('the hold is NOT gated on job status — matching legacy', () => {
   // Legacy placed holds from any state; only the counter limits it. A status
   // filter here would silently refuse holds the CRM has always allowed.

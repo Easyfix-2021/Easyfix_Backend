@@ -137,15 +137,16 @@ async function computeGrade(efrId) {
 
 async function saveSnapshot(efrId, d) {
   try {
+    const now = new Date();
     await pool.query(
       `INSERT INTO tbl_efr_grade_snapshot
          (efr_id, grade, composite, onboarding_score, performance_score, completed_jobs, basis, computed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, NOW())
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON DUPLICATE KEY UPDATE
          grade = VALUES(grade), composite = VALUES(composite),
          onboarding_score = VALUES(onboarding_score), performance_score = VALUES(performance_score),
-         completed_jobs = VALUES(completed_jobs), basis = VALUES(basis), computed_at = NOW()`,
-      [efrId, d.grade, d.composite, d.onboarding_score, d.performance_score, d.completed_jobs, d.basis],
+         completed_jobs = VALUES(completed_jobs), basis = VALUES(basis), computed_at = ?`,
+      [efrId, d.grade, d.composite, d.onboarding_score, d.performance_score, d.completed_jobs, d.basis, now, now],
     );
   } catch (e) { logger.warn({ err: e.message, efrId }, 'grade: saveSnapshot failed'); }
 }

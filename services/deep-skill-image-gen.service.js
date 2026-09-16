@@ -232,9 +232,9 @@ async function markFailed(skillId, err) {
     await pool.query(
       `UPDATE tbl_deep_skill
           SET image_gen_status = 'failed',
-              image_gen_attempted_at = NOW()
+              image_gen_attempted_at = ?
         WHERE deepskill_id = ?`,
-      [skillId],
+      [new Date(), skillId],
     );
   } catch (e) {
     logger.warn({ err: e && e.message, skillId },
@@ -336,10 +336,10 @@ async function generateImage(skillId) {
       `UPDATE tbl_deep_skill
           SET deepskill_image = ?,
               image_gen_status = NULL,
-              image_gen_attempted_at = NOW()
+              image_gen_attempted_at = ?
         WHERE deepskill_id = ?
           AND (deepskill_image = '' OR deepskill_image IS NULL)`,
-      [Key, id],
+      [Key, new Date(), id],
     );
     if (!claim || claim.affectedRows === 0) {
       // Manual upload landed mid-generation — discard the auto-gen
@@ -773,9 +773,9 @@ async function generateForSkill(skillId, { name, options } = {}) {
     `UPDATE tbl_deep_skill
         SET deepskill_image = ?,
             image_gen_status = NULL,
-            image_gen_attempted_at = NOW()
+            image_gen_attempted_at = ?
       WHERE deepskill_id = ?`,
-    [Key, id],
+    [Key, new Date(), id],
   );
 
   try { deepSkillService.invalidateAllDeepSkillImagesCache(); } catch (_) { /* defensive */ }

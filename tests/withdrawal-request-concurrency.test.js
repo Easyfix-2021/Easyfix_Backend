@@ -67,6 +67,12 @@ test('withdrawal creation serializes on technician without inverting finance loc
     queries.findIndex((call) => /SELECT current_balance/.test(call.sql))
       < queries.findIndex((call) => /SELECT request_id/.test(call.sql)),
   );
+
+  // db.js pool binds a Date as the IST wall clock; SQL NOW() takes the DB
+  // session's own (SYSTEM) zone. requested_on is DATETIME (2026-09-16).
+  const insert = queries.find((call) => /INSERT INTO tbl_easyfixer_withdrawal_request/.test(call.sql));
+  assert.doesNotMatch(insert.sql, /NOW\(\)/, 'requested_on must not be SQL NOW()');
+  assert.ok(insert.params[2] instanceof Date, 'requested_on is the third bound value');
 });
 
 test('withdrawal requires PAN before bank lookup or request mutation', async () => {
@@ -131,7 +137,10 @@ test('blacklisted full-balance request snapshots its payout destination', async 
     && /INSERT INTO tbl_easyfixer_withdrawal_request/.test(call.sql));
   assert.ok(insert);
   assert.match(insert.sql, /bank_account_number/);
-  assert.deepEqual(insert.params, [
+  // requested_on (index 2) is a bound Date, never SQL NOW() — db.js pool
+  // timezone '+05:30' stores it as the IST wall clock (2026-09-16).
+  assert.ok(insert.params[2] instanceof Date, 'requested_on is the third bound value');
+  assert.deepEqual([...insert.params.slice(0, 2), ...insert.params.slice(3)], [
     7,
     500,
     12,

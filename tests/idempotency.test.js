@@ -82,6 +82,12 @@ test('awaits durable response persistence before sending a successful JSON respo
   assert.match(completion.sql, /state = 'done'/i);
   assert.match(completion.sql, /lease_token = \?/i);
   assert.equal(completion.params[0], 201);
+  assert.doesNotMatch(completion.sql, /completed_at = NOW\(\)/i);
+  assert.doesNotMatch(completion.sql, /expires_at = DATE_ADD\(NOW\(\)/i);
+  assert.match(completion.sql, /completed_at = \?/i);
+  assert.ok(completion.params[2] instanceof Date, 'completed_at must be a bound Date');
+  assert.ok(completion.params[3] instanceof Date, 'expires_at must be a bound Date');
+  assert.equal(completion.params[2].getTime(), completion.params[3].getTime());
 });
 
 test('replays a completed response without invoking the protected handler', async () => {
@@ -208,6 +214,11 @@ test('atomically reclaims an expired lease and completes under a new owner token
   assert.ok(reclaim);
   assert.ok(completion);
   assert.equal(reclaim.params[3], completion.params.at(-1), 'only the new lease owner may complete');
+  assert.doesNotMatch(reclaim.sql, /lease_expires_at = DATE_ADD\(NOW\(\)/i);
+  assert.doesNotMatch(reclaim.sql, /expires_at = DATE_ADD\(NOW\(\), INTERVAL 14/i);
+  assert.ok(reclaim.params[4] instanceof Date, 'lease_expires_at must be a bound Date');
+  assert.ok(reclaim.params[5] instanceof Date, 'expires_at must be a bound Date');
+  assert.equal(reclaim.params[4].getTime(), reclaim.params[5].getTime());
 });
 
 test('releases a 5xx reservation and never stores it as done', async () => {
@@ -300,9 +311,11 @@ test('requires a valid app MD5 digest before reserving a keyed multipart mutatio
 test('accepts the app 32-hex multipart digest and binds it to the reservation fingerprint', async () => {
   const digest = '1234567890abcdef1234567890abcdef';
   let insertParams;
+  let insertSql;
   const database = {
     async query(sql, params) {
       if (/^\s*INSERT INTO tbl_idempotency_key/i.test(sql)) {
+        insertSql = String(sql);
         insertParams = params;
         return [{ affectedRows: 1 }, []];
       }
@@ -323,6 +336,12 @@ test('accepts the app 32-hex multipart digest and binds it to the reservation fi
   });
   await delivered;
   assert.equal(insertParams[5], idempotency._internals.requestFingerprint(req, digest));
+  assert.doesNotMatch(insertSql, /NOW\(\)/i);
+  assert.match(insertSql, /DATE_ADD\(\?, INTERVAL 5 MINUTE\)/i);
+  assert.match(insertSql, /DATE_ADD\(\?, INTERVAL 14 DAY\)/i);
+  assert.ok(insertParams.at(-2) instanceof Date, 'lease_expires_at must be a bound Date');
+  assert.ok(insertParams.at(-1) instanceof Date, 'expires_at must be a bound Date');
+  assert.equal(insertParams.at(-2).getTime(), insertParams.at(-1).getTime());
 });
 
 test('rejects idempotency keys on reads so the retention ledger only tracks mutations', async () => {
@@ -353,9 +372,14 @@ test('renews a lease only for its current owner token', async () => {
   };
 
   assert.equal(await idempotency._internals.renewReservationLease(database, owner), true);
-  assert.match(call.sql, /lease_expires_at = DATE_ADD\(NOW\(\), INTERVAL 5 MINUTE\)/i);
+  assert.doesNotMatch(call.sql, /NOW\(\)/i);
+  assert.match(call.sql, /lease_expires_at = DATE_ADD\(\?, INTERVAL 5 MINUTE\)/i);
+  assert.match(call.sql, /expires_at = DATE_ADD\(\?, INTERVAL 14 DAY\)/i);
   assert.match(call.sql, /state = 'in_flight' AND lease_token = \?/i);
-  assert.deepEqual(call.params, ['efr', '8379', 'slow-1', 'owner-token']);
+  assert.ok(call.params[0] instanceof Date);
+  assert.ok(call.params[1] instanceof Date);
+  assert.equal(call.params[0].getTime(), call.params[1].getTime());
+  assert.deepEqual(call.params.slice(2), ['efr', '8379', 'slow-1', 'owner-token']);
 });
 
 test('fails closed when a new reservation cannot be confirmed', async () => {

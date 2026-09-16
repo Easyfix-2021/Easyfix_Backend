@@ -200,9 +200,10 @@ async function applyTransition(share, to, { endReason = null, runner = pool } = 
 
   const sets = ['status = ?'];
   const params = [to];
-  if (to === 'accepted' || to === 'rejected') sets.push('responded_on = NOW()');
-  if (to === 'started') sets.push('started_on = NOW()');
-  if (TERMINAL_STATUSES.includes(to)) sets.push('ended_on = NOW()');
+  const now = new Date();
+  if (to === 'accepted' || to === 'rejected') { sets.push('responded_on = ?'); params.push(now); }
+  if (to === 'started') { sets.push('started_on = ?'); params.push(now); }
+  if (TERMINAL_STATUSES.includes(to)) { sets.push('ended_on = ?'); params.push(now); }
   if (endReason != null) { sets.push('end_reason = ?'); params.push(String(endReason).slice(0, 32)); }
   params.push(share.share_id, from);
 
