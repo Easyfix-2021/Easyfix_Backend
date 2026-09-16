@@ -3,6 +3,7 @@ const {
   ALL_STATUS_VALUES,
   SORTABLE_COLUMNS,
   OFFER_STATE_VALUES,
+  APP_REQUEST_VALUES,
   MAX_OFFER_RECIPIENTS,
 } = require('../services/job.service');
 
@@ -106,6 +107,18 @@ const listQuery = Joi.object({
    * OFFER_STATE_VALUES so the two sides cannot drift.
    */
   offerState: Joi.string().valid(...OFFER_STATE_VALUES).allow('').optional(),
+  /*
+   * `appRequest` (2026-09-16) — narrows to jobs carrying a PENDING technician
+   * app request, the Technician Requests section on Pending to Start:
+   *   'any' → either ask   'cancel' → cancellation only
+   *   'reschedule' → reschedule only
+   * The service's clause pins job_status = 1 itself (a request is only pending
+   * at that status), so this NARROWS whatever the caller already asked for and
+   * can never widen it. `''` is allowed and ignored so the FE can clear the
+   * control without stripping the key — the same shape as offerState above.
+   * Values derive from the service's APP_REQUEST_VALUES so the two cannot drift.
+   */
+  appRequest: Joi.string().valid(...APP_REQUEST_VALUES).allow('').optional(),
   // clientId / cityId — single id OR CSV list (Pending-to-Start multi-select
   // Clients / Cities filters). csvIds keeps a lone id valid for back-compat.
   /*

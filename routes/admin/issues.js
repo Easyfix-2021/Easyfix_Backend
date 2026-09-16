@@ -95,6 +95,50 @@ const IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'
  * does not exist. The reverse order would produce a row whose screenshot never
  * loads and no way to tell that from a presign error.
  */
+/*
+ * Validate and upload one multipart batch of screenshots, returning the S3 keys
+ * in the order the client sent them (which becomes sort_order).
+ *
+ * Extracted 2026-09-16 when COMMENTS gained attachments. The rules below are
+ * not incidental — each is load-bearing and had to apply identically to both
+ * surfaces, which is exactly why this is one function and not two copies:
+ *   · MIME is checked for EVERY file BEFORE any upload starts. Rejecting
+ *     mid-loop leaves the accepted ones as orphaned S3 objects no row points
+ *     at and nothing ever cleans up.
+ *   · No local-disk fallback when S3 is unconfigured. A screenshot is the one
+ *     genuinely optional part, so dropping it beats failing the write — and
+ *     the container filesystem is somewhere nothing serves or cleans.
+ * Throws a { status: 400 } error the callers' existing catch already renders.
+ */
+async function uploadScreenshots(files, what) {
+  const batch = files || [];
+  if (!batch.length) return [];
+
+  const bad = batch.find((f) => !IMAGE_MIME.has(f.mimetype));
+  if (bad) {
+    logger.warn(what + ' screenshot rejected · disallowed mime=' + bad.mimetype);
+    const e = new Error(`mimetype "${bad.mimetype}" is not allowed; use PNG/JPEG/WEBP/GIF`);
+    e.status = 400;
+    throw e;
+  }
+
+  if (!s3.isEnabled()) {
+    logger.warn(what + ' screenshots discarded · S3 is not configured · count=' + batch.length);
+    return [];
+  }
+
+  const keys = [];
+  for (const f of batch) {
+    keys.push(await s3.putAtKey({
+      key:          svc.buildScreenshotKey(),
+      buffer:       f.buffer,
+      contentType:  f.mimetype,
+      originalName: f.originalname,
+    }));
+  }
+  return keys;
+}
+
 router.post(
   '/',
   /*
@@ -112,36 +156,7 @@ router.post(
     try {
       const actor = await svc.resolveActor(req);
 
-      const files = req.files || [];
-      /*
-       * MIME is checked for EVERY file BEFORE any upload starts. Rejecting
-       * mid-loop would leave the accepted ones as orphaned S3 objects that no
-       * row points at and nothing ever cleans up — the report fails and the
-       * bucket keeps the bytes.
-       */
-      const bad = files.find((f) => !IMAGE_MIME.has(f.mimetype));
-      if (bad) {
-        logger.warn('Issue screenshot rejected · disallowed mime=' + bad.mimetype);
-        return modernError(res, 400, `mimetype "${bad.mimetype}" is not allowed; use PNG/JPEG/WEBP/GIF`);
-      }
-
-      const screenshotKeys = [];
-      if (files.length && !s3.isEnabled()) {
-        // No local-disk fallback on purpose. A screenshot is the one part of
-        // an issue that is genuinely optional, so dropping it beats failing
-        // the report — and writing it to the container filesystem would put
-        // it somewhere nothing ever serves or cleans up.
-        logger.warn('Issue screenshots discarded · S3 is not configured · count=' + files.length);
-      } else {
-        for (const f of files) {
-          screenshotKeys.push(await s3.putAtKey({
-            key:          svc.buildScreenshotKey(),
-            buffer:       f.buffer,
-            contentType:  f.mimetype,
-            originalName: f.originalname,
-          }));
-        }
-      }
+      const screenshotKeys = await uploadScreenshots(req.files, 'Issue');
 
       const created = await svc.createIssue({
         title:       req.body.title,
@@ -206,22 +221,44 @@ router.get('/:issueId', validate(issueIdParam, 'params'), async (req, res, next)
   }
 });
 
-/* POST /api/admin/issues/:issueId/comments — reporter or manager. */
+/*
+ * POST /api/admin/issues/:issueId/comments — reporter or manager.
+ *
+ * Screenshots on a reply since 2026-09-16 (owner: "users should be able to add
+ * images in comments as well"). Same field name, same cap and the same
+ * uploader as the create route above: a reply that says "it looks like THIS"
+ * is the commonest useful comment on a bug queue, and asking for it to be
+ * described in words was the gap.
+ *
+ * The multer middleware runs on every comment, attachment or not — .array()
+ * with no files is a no-op, and a JSON body still parses, so a client that
+ * posts plain JSON (every one before this deploy) is unaffected.
+ */
 router.post(
   '/:issueId/comments',
+  upload.array('screenshot', MAX_SCREENSHOTS),
   validate(issueIdParam, 'params'),
   validate(issueCommentCreate),
   async (req, res, next) => {
     try {
       const actor = await svc.resolveActor(req);
+      const screenshotKeys = await uploadScreenshots(req.files, 'Issue comment');
       const created = await svc.addComment(
         req.params.issueId,
-        { commentText: req.body.comment_text },
+        { commentText: req.body.comment_text, screenshotKeys },
         actor,
       );
       res.status(201);
       return modernOk(res, created, 'Comment added');
     } catch (e) {
+      if (e.code === 'LIMIT_FILE_SIZE') {
+        logger.warn('Issue comment screenshot upload failed · file exceeds 5MB');
+        return modernError(res, 400, 'screenshot exceeds 5MB');
+      }
+      if (e.code === 'LIMIT_FILE_COUNT' || e.code === 'LIMIT_UNEXPECTED_FILE') {
+        logger.warn('Issue comment screenshot upload failed · ' + e.code);
+        return modernError(res, 400, `attach at most ${MAX_SCREENSHOTS} screenshots`);
+      }
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
     }

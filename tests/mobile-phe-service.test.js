@@ -214,9 +214,6 @@ test('job proof detail returns bounded resolved media only and masks reviewer su
         paid_at: '2026-08-13',
         technician_earning: 450,
         transaction_count: 1,
-        gross_charge: 850,
-        easyfix_charge: 400,
-        client_charge: 850,
         customer_rating: 4.5,
         feedback: 'Very good work',
         reviewer_name: 'Anita Mehta',
@@ -250,13 +247,16 @@ test('job proof detail returns bounded resolved media only and masks reviewer su
     assert.equal(result.bookedAt, '2026-08-09');
     assert.equal(result.ageDays, 3);
     assert.equal(result.amount, 450);
-    assert.deepEqual(result.earningsCalculation, {
-      technicianEarning: 450,
-      grossJobCharge: 850,
-      easyFixCharge: 400,
-      clientCharge: 850,
-      transactionLines: 1,
-    });
+    assert.equal(Object.hasOwn(result, 'earningsCalculation'), false,
+      'the per-job charge totals left the mobile payload on 2026-09-16: the app stopped rendering them '
+      + 'and the CRM mirror bundle was refreshed first, so nothing reads them any more');
+    assert.deepEqual(result.payoutBreakdown.components.technicianEarning, {
+      available: true,
+      amount: 450,
+      source: 'tbl_job_transaction.efr_charge',
+      reasonCode: null,
+    }, 'tx.transaction_count still gates the payout card — removing it alongside the charge sums would '
+      + 'silently blank every row of Payout Details');
     assert.equal(result.acceptedInSecs, 240);
     assert.equal(result.reachedAt, '2026-08-12 10:00:00');
     assert.equal(result.visitNumber, 1);
@@ -346,8 +346,7 @@ test('proof buckets follow the legacy checkin/checkout vocabulary, not job_stage
       if (/SELECT j\.job_id/.test(sql)) return [[{
         job_id: 529042, title: 'AC service', client_name: 'Hafele',
         checkout_date_time: '2026-08-23 12:00:00', technician_earning: 697,
-        transaction_count: 1, gross_charge: 5597, easyfix_charge: 697,
-        client_charge: 5597, customer_rating: 5, reviewer_name: 'Uma Sharma',
+        transaction_count: 1, customer_rating: 5, reviewer_name: 'Uma Sharma',
         age_days: 1, age_secs: 86400,
       }]];
       if (/FROM tbl_job_image/.test(sql)) return runProofQuery(sql, JOB_529042_IMAGE_ROWS);

@@ -1537,6 +1537,48 @@ You can also run it on demand from Manage Pincodes ("Refresh Status") or with Tr
     logger.info('Serviceable-pincode recompute cron registered (03:45 IST nightly).');
   }
 
+  // ─── Issue screenshot retention — closed + 1 month ───────────────────
+  const issueScreenshotCleanup = require('../services/issue-screenshot-cleanup-cron');
+  const issueScreenshotCleanupJob = registerJob({
+    id: 'issue-screenshot-cleanup',
+    name: 'Delete Screenshots Of Long-Closed Issues',
+    description:
+      'Deletes the S3 objects and the tbl_crm_issue_image rows for issues closed more than '
+      + `${issueScreenshotCleanup.RETENTION_MONTHS} month ago — the report's own attachments and its comments'. `
+      + 'Issue text, comments and close notes are untouched; only the images expire. '
+      + `Up to ${issueScreenshotCleanup.BATCH_LIMIT} images per run, so a backlog drains over several hours.`,
+    cron: '20 2 * * *',
+    runner: async () => {
+      const r = await issueScreenshotCleanup.runCleanup();
+      logger.info(
+        `Issue screenshot cleanup · eligible=${r.eligible} · deleted=${r.deleted}`
+        + ` · failed=${r.failed} · rowsRemoved=${r.rowsRemoved}`
+        + (r.skipped ? ` (skipped: ${r.reason})` : ''),
+      );
+      return r;
+    },
+  });
+  /*
+   * DEFAULT-OFF, for the same reason the recompute above is: this one DELETES,
+   * and irreversibly. An operator should switch it on knowingly, having
+   * confirmed the retention is what they want — per the owner, manual cleanup
+   * runs until then. Turning it on is one property row plus a restart.
+   */
+  if (cronDisabled) {
+    issueScreenshotCleanupJob.skipReason = 'CRON_DISABLED=true';
+  } else if (!issueScreenshotCleanup.cleanupEnabled()) {
+    issueScreenshotCleanupJob.skipReason = `property '${issueScreenshotCleanup.FLAG}' was not 'true' at server start — set it to 'true' and restart to enable. While off, screenshots of closed issues are kept forever and are cleaned by hand.`;
+    logger.info(`Issue screenshot cleanup SKIPPED — set ${issueScreenshotCleanup.FLAG}=true in easyfix_properties to enable (takes effect after restart).`);
+  } else {
+    issueScreenshotCleanupJob.task = cron.schedule(
+      issueScreenshotCleanupJob.cron,
+      () => invokeJob(issueScreenshotCleanupJob, 'cron'),
+      { timezone: TZ },
+    );
+    issueScreenshotCleanupJob.registered = true;
+    logger.info('Issue screenshot cleanup cron registered (02:20 IST nightly).');
+  }
+
   // ─── Deep Skill Image-Gen orphan reset — every 5 minutes ─────────────
   // Standalone cron (NOT registered via registerJob()). Deliberately
   // absent from the Scheduled Jobs admin page — this is infrastructure
