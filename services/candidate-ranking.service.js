@@ -2693,14 +2693,19 @@ async function searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit =
 }
 
 /*
- * Enriched job header reused by the search response.
+ * Enriched job header reused by the search response — and, since 2026-09-16,
+ * by the console's header-only endpoint (consoleHeaderForJob below).
  * The job object comes from jobService.getById (j.* + LIST_JOIN/DETAIL_JOIN
  * so all customer/client/address/service_category fields are present).
  * service_type_name requires a separate scalar subquery since getById only
  * JOINs tbl_service_type against tbl_job_services, not against the job row's
  * own fk_service_type_id — we do that inline here.
+ *
+ * `assignedEfrId` is the one input the RANKED header has and the search header
+ * did not. Absent it stays null, so the search response is byte-for-byte what it
+ * was; consoleHeaderForJob passes it so its header equals the ranked one.
  */
-async function searchJobHeader(job) {
+async function searchJobHeader(job, { assignedEfrId = null } = {}) {
   // Resolve BOTH category + type names from the job's FK ids (same as the
   // ranked header) — job.service_category is a legacy free-text column that is
   // NULL on most client-imported jobs.
@@ -2734,7 +2739,60 @@ async function searchJobHeader(job) {
     serviceCatgName, serviceTypeName, deepSkillLabel, jobSkillsByService,
     projectManagerName, zonalManagerName,
     firstScheduledByName, checkinByName, acceptedDateTime, acceptedEfrName,
+    assignedEfrId,
   });
+}
+
+/*
+ * ─── THE CONSOLE HEADER, WITHOUT THE RANKING (2026-09-16) ────────────────
+ *
+ * GET /admin/jobs/:id/header. The Schedule & Assign console renders a job's
+ * header on EVERY open, and until now the only way to get it was
+ * /candidates — which also expires stale offers, ranks the technician pool,
+ * resolves offer flow and offerability, and returns the top ten. For an
+ * ACCEPTED job (status 1, the main consumer) none of that is wanted: the job
+ * already has its technician, and paying a full ranking pass to draw a header
+ * is the cost this endpoint exists to remove.
+ *
+ * THE HEADER IS THE RANKED ONE, EXACTLY — not a lookalike. It is built by the
+ * same searchJobHeader → buildJobHeader path, with the two inputs the ranked
+ * path adds applied the same way:
+ *   - time_slot resolved through slotModel.resolveTimeSlot against the job's
+ *     own appointment (the ranked path applies no jobDate/timeSlot override
+ *     unless the caller proposes one, and this endpoint takes none);
+ *   - assignedEfrId = fk_easyfixter_id when the job has one.
+ * A test builds both headers for one job and asserts every ranked key carries
+ * the same value here, so the console cannot render a different job depending
+ * on which endpoint drew it.
+ *
+ * PLUS two things the ranked header does not carry:
+ *
+ *   1. The LIST's app-request fields (jobService.appRequestListFields) under the
+ *      LIST's own names, so the CRM can call appRequestOf(job) on this object
+ *      unchanged. Accepted jobs are exactly where a technician's cancel /
+ *      reschedule ask lives.
+ *   2. The ASSIGNED technician: efr_id, efr_name, efr_mobile — null on all three
+ *      while unassigned. efr_mobile is masked in transit by the admin router's
+ *      mask-mobile middleware (utils/mask-mobile.js MOBILE_FIELDS), the same
+ *      mechanism that masks the offers list's `mobile`; `?unmasked=true`
+ *      behaves identically on both.
+ *
+ * The job object is COPIED before the slot is normalised: it is the route's
+ * req.scopedJob, and a header read must not mutate the row other middleware
+ * already holds.
+ */
+async function consoleHeaderForJob(job) {
+  const j = { ...job };
+  j.time_slot = slotModel.resolveTimeSlot(j.time_slot, j.requested_date_time);
+  const assignedEfrId = j.fk_easyfixter_id ? Number(j.fk_easyfixter_id) : null;
+  const header = await searchJobHeader(j, { assignedEfrId });
+  return {
+    ...header,
+    ...jobService.appRequestListFields(j),
+    efr_id:     assignedEfrId,
+    efr_name:   assignedEfrId ? (j.easyfixer_name ?? null) : null,
+    efr_mobile: assignedEfrId ? (j.easyfixer_mobile ?? null) : null,
+  };
 }
 
 /*
@@ -3007,6 +3065,8 @@ module.exports = {
   _statsGate,
   rankCandidatesForJob,
   searchTechniciansForJob,
+  // The console header with no ranking work — GET /admin/jobs/:id/header.
+  consoleHeaderForJob,
   pickAutoAssignCandidate,
   recommendSlotsForJob,
   APPOINTMENT_SLOTS,

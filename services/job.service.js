@@ -3638,6 +3638,55 @@ function bitTrue(v) {
 }
 
 /*
+ * THE LIST's APP-REQUEST FIELDS, rebuilt from a DETAIL row (2026-09-16).
+ *
+ * The CRM's appRequestOf() (src/lib/job-app-request.ts) reads seven snake_case
+ * fields off a /admin/jobs LIST row. A surface that loads ONE job (the Schedule
+ * & Assign console header) wants to call that same function on its object,
+ * unchanged — so it needs those seven fields under the SAME names and with the
+ * SAME values the LIST projection gives them. getByIdCore's row carries the
+ * raw columns, but not in list shape:
+ *
+ *   is_cancelled_by_app      raw bit(1) → a Buffer, and every Buffer is truthy.
+ *   is_rescheduled_by_app    The LIST projects `(COALESCE(flag, 0) = 1)`, i.e.
+ *                            the integer 0 or 1. So this does too — bitTrue, then
+ *                            1 / 0. Shipping the Buffer would serialise as
+ *                            {"type":"Buffer",…} and read as a pending ask on
+ *                            every job.
+ *   app_request_reason       not on the detail row at all. The LIST resolves it
+ *                            as COALESCE(cancel reason IF cancel flag, reschedule
+ *                            reason IF reschedule flag); the detail row has both
+ *                            reasons resolved separately (app_cancel_reason_name,
+ *                            app_reschedule_reason_name), so the COALESCE is
+ *                            reproduced here IN THE SAME ORDER — a cancel flag
+ *                            with no cancel reason falls through to the
+ *                            reschedule reason, exactly as the SQL does.
+ *   job_status, cancel_date_time, reschedule_at_app, reschedule_date_time_app
+ *                            plain columns, passed through as the LIST does.
+ *
+ * NOT status-gated, like the LIST projection it mirrors: the gate is
+ * appRequestOf's own `job_status === 1` test, and job_status ships here so it
+ * can apply it. A test pins these names against LIST_COLUMNS' aliases so the two
+ * cannot drift.
+ */
+function appRequestListFields(job) {
+  const row = job || {};
+  const cancel = bitTrue(row.is_cancelled_by_app);
+  const resched = bitTrue(row.is_rescheduled_by_app);
+  const numericStatus = Number(row.job_status);
+  return {
+    job_status: row.job_status == null || !Number.isFinite(numericStatus) ? (row.job_status ?? null) : numericStatus,
+    is_cancelled_by_app: cancel ? 1 : 0,
+    is_rescheduled_by_app: resched ? 1 : 0,
+    reschedule_date_time_app: row.reschedule_date_time_app ?? null,
+    cancel_date_time: row.cancel_date_time ?? null,
+    reschedule_at_app: row.reschedule_at_app ?? null,
+    app_request_reason: (cancel ? row.app_cancel_reason_name ?? null : null)
+      ?? (resched ? row.app_reschedule_reason_name ?? null : null),
+  };
+}
+
+/*
  * Which ask, if any, is in flight on this job row.
  *
  * The flags are bit(1) → Buffer, and every Buffer is truthy, so reading them
@@ -8151,6 +8200,9 @@ module.exports = {
    * a bare `if` silently reports EVERY job as having a pending request.
    */
   LIST_COLUMNS, buildAppRequest,
+  // The LIST's seven app-request fields rebuilt from a detail row, so a
+  // one-job surface can hand its object to the CRM's appRequestOf() unchanged.
+  appRequestListFields,
   /*
    * `job.offer_expiry.enabled` — exported so the tests can pin BOTH regimes
    * (expiry on ⇒ a stale OFFERED row reads Expired; expiry off ⇒ it stays
