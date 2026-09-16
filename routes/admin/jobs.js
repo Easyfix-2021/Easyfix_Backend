@@ -1169,8 +1169,8 @@ router.get('/escalated/export.xlsx', async (req, res, next) => {
  *                       supply team add an inline comment per row)
  *
  * When closed_action transitions to 15 (Resolved), also stamp
- * escalation_closed_time = NOW(). When set to 16 (Re-Open), clear
- * the closed_time so the row goes back to the "open" filter.
+ * escalation_closed_time. When set to 16 (Re-Open), clear the closed_time
+ * so the row goes back to the "open" filter.
  */
 router.patch('/escalated/:tableId', async (req, res, next) => {
   try {
@@ -1211,15 +1211,19 @@ router.patch('/escalated/:tableId', async (req, res, next) => {
       sets.push('closed_action = ?');
       params.push(v || null);
       if (v === 15) {
-        sets.push('escalation_closed_time = NOW()');
+        const closedAt = new Date();
+        sets.push('escalation_closed_time = ?');
+        params.push(closedAt);
         // also mark resolved_time so the "closed" filter picks it up
-        sets.push('resolved_time = COALESCE(resolved_time, NOW())');
+        sets.push('resolved_time = COALESCE(resolved_time, ?)');
+        params.push(closedAt);
       } else if (v === 16) {
         // Re-Open: clear closed_time + bump no_of_escalations so the
         // row falls back into the "open" filter. Legacy did the same.
         sets.push('escalation_closed_time = NULL');
         sets.push('no_of_escalations = COALESCE(no_of_escalations, 0) + 1');
-        sets.push('escalated_time = NOW()');
+        sets.push('escalated_time = ?');
+        params.push(new Date());
       }
     }
     if (b.escalated_comments !== undefined) {
@@ -2150,10 +2154,10 @@ router.put('/:id/hold', validate(idParam, 'params'), validate(holdBody), scopedJ
               full_fillment_reason = ?,
               full_fillment_time = ?,
               full_fillment_by = ?,
-              full_fillment_created_time = NOW(),
+              full_fillment_created_time = ?,
               no_of_req_foh = COALESCE(no_of_req_foh, 0) + 1
         WHERE job_id = ? AND COALESCE(no_of_req_foh, 0) = 0`,
-      [req.body.reason, req.body.appointment_time, req.user.user_id, req.params.id]
+      [req.body.reason, req.body.appointment_time, req.user.user_id, new Date(), req.params.id]
     );
     logger.info('Fulfillment hold placed · jobId=' + req.params.id + ' status=21');
     modernOk(res, { on_hold: true, status: 21 });
@@ -2526,10 +2530,10 @@ router.post('/:id/estimate/send-for-approval',
         await conn.query(
           `UPDATE tbl_job
               SET job_status = 15,
-                  approval_sent_on_date_time = NOW(),
+                  approval_sent_on_date_time = ?,
                   no_of_req_approval = COALESCE(no_of_req_approval, 0) + 1
             WHERE job_id = ?`,
-          [jobId]
+          [new Date(), jobId]
         );
         await conn.commit();
       } catch (err) { await conn.rollback(); throw err; } finally { conn.release(); }

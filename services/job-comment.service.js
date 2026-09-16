@@ -301,10 +301,11 @@ async function addComment(jobId, { comments, comment_on, commented_by, appointme
     const sets = ['remarks = ?'];
     const vals = [text];
 
-    // remarks_date_time — when the column exists. Uses NOW() inline so
-    // no extra value slot is consumed.
+    // remarks_date_time — when the column exists. IST wall-clock convention:
+    // a bound Date, never SQL NOW() (db.js pool is timezone: '+05:30').
     if (await hasJobColumn('remarks_date_time')) {
-      sets.push('remarks_date_time = NOW()');
+      sets.push('remarks_date_time = ?');
+      vals.push(new Date());
     }
 
     // call_later — stamp the flag whenever the Unreachable comment

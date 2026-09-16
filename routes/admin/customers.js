@@ -221,13 +221,14 @@ router.patch('/:id/addresses/:addrId', validate(addressEditBody), async (req, re
       `UPDATE tbl_address
           SET address = ?, building = ?, landmark = ?, locality = ?,
               city_id = ?, pin_code = ?, gps_location = ?, mobile_number = ?,
-              update_date = NOW()
+              update_date = ?
         WHERE address_id = ? AND customer_id = ?`,
       [
         b.address,
         b.building || null, b.landmark || null, b.locality || null,
         b.city_id, b.pin_code, b.gps_location || null,
         b.mobile_number || null,
+        new Date(),
         addrId, customerId,
       ]
     );

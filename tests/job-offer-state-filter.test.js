@@ -129,7 +129,11 @@ test('expiry ON: every fragment binds the TTL from OFFER_TTL_MINUTES, never a se
       c.params.includes(OFFER_TTL_MINUTES),
       `${v}: must bind OFFER_TTL_MINUTES (${OFFER_TTL_MINUTES})`,
     );
-    assert.match(c.sql, /NOW\(\) - INTERVAL \? MINUTE/, `${v}: open-ness must be time-derived`);
+    assert.match(c.sql, /\? - INTERVAL \? MINUTE/, `${v}: open-ness must be time-derived`);
+    assert.doesNotMatch(c.sql, /NOW\(\)/, `${v}: offered_at is app-written; freshness must bind a Date, never SQL NOW()`);
+    const boundNow = c.params.find((p) => p instanceof Date);
+    assert.ok(boundNow, `${v}: must bind a real Date for the freshness comparison`);
+    assert.ok(Math.abs(Date.now() - boundNow.getTime()) < 60000, `${v}: the bound Date is ~now`);
   }
 });
 
@@ -185,8 +189,8 @@ test('clauses reference only the j alias — they cannot perturb the COUNT joins
  *   EXISTS (… tbl_easyfixer <a>e … <a>e.efr_id = …)        technician-resolvable
  *   <a>.job_offer_id = (SELECT MAX(<a>m.job_offer_id) …)   latest row per tech
  *   <a>.offer_status = <code>                              status
- *   <a>.offered_at >= NOW() - INTERVAL <ttl> MINUTE        FRESH  (still claimable)
- *   <a>.offered_at <  NOW() - INTERVAL <ttl> MINUTE        STALE  (cron just hasn't caught up)
+ *   <a>.offered_at >= <now> - INTERVAL <ttl> MINUTE        FRESH  (still claimable)
+ *   <a>.offered_at <  <now> - INTERVAL <ttl> MINUTE        STALE  (cron just hasn't caught up)
  *   <a>.offered_at IS NULL                                 malformed row ⇒ not fresh
  *
  * Anything else — a MAX(offer_status), a COUNT comparison, a JOIN, an OR
@@ -194,7 +198,12 @@ test('clauses reference only the j alias — they cannot perturb the COUNT joins
  *
  * <code> / <ttl> are read as either a bound `?` (the WHERE fragments, consumed
  * left-to-right from params) or an inlined integer (the projection fragments),
- * so ONE interpreter checks both renderings.
+ * so ONE interpreter checks both renderings. <now> is likewise a bound `?` (a
+ * real Date — offered_at is app-written since cffaa49, so freshness compares
+ * against an app-side clock, never SQL NOW()) or, in the projection, a quoted
+ * datetime literal from pool.escape(). Its VALUE plays no part in the
+ * interpreter's age-based model — only that a token was consumed at that
+ * position, keeping the `?` cursor aligned with the real bindings.
  */
 
 // Index of the ')' matching the '(' at `open`.
@@ -243,6 +252,11 @@ function compileBody(body, cursor) {
   const expr = head[2];
 
   const NUM = '(\\?|\\d+)';
+  // The `now` token ahead of an INTERVAL subtraction: a bound `?` (WHERE
+  // fragments) or a pool.escape()-quoted datetime literal (the no-params
+  // projection). Its value is irrelevant to the age-based model below — only
+  // consuming it keeps the `?` cursor aligned with the real bindings.
+  const DATEISH = "(\\?|'[^']*')";
   // Longest / most specific first so a shorter atom cannot eat part of a longer.
   const atoms = [
     [new RegExp(`${a}\\.job_offer_id = \\(SELECT MAX\\(${a}m\\.job_offer_id\\) FROM tbl_job_offer ${a}m WHERE ${a}m\\.job_id = ${a}\\.job_id AND ${a}m\\.fk_easyfixter_id = ${a}\\.fk_easyfixter_id\\)`),
@@ -268,10 +282,10 @@ function compileBody(body, cursor) {
       }],
     [new RegExp(`${a}\\.offer_status = ${NUM}`),
       (m) => { const code = cursor.take(m[1]); return (row) => row.status === code; }],
-    [new RegExp(`${a}\\.offered_at >= NOW\\(\\) - INTERVAL ${NUM} MINUTE`),
-      (m) => { const ttl = cursor.take(m[1]); return (row) => row.ageMinutes !== null && row.ageMinutes <= ttl; }],
-    [new RegExp(`${a}\\.offered_at < NOW\\(\\) - INTERVAL ${NUM} MINUTE`),
-      (m) => { const ttl = cursor.take(m[1]); return (row) => row.ageMinutes !== null && row.ageMinutes > ttl; }],
+    [new RegExp(`${a}\\.offered_at >= ${DATEISH} - INTERVAL ${NUM} MINUTE`),
+      (m) => { cursor.take(m[1]); const ttl = cursor.take(m[2]); return (row) => row.ageMinutes !== null && row.ageMinutes <= ttl; }],
+    [new RegExp(`${a}\\.offered_at < ${DATEISH} - INTERVAL ${NUM} MINUTE`),
+      (m) => { cursor.take(m[1]); const ttl = cursor.take(m[2]); return (row) => row.ageMinutes !== null && row.ageMinutes > ttl; }],
     [new RegExp(`${a}\\.offered_at IS NULL`),
       () => (row) => row.ageMinutes === null],
   ];
@@ -386,7 +400,7 @@ test('an OPEN row INSIDE the TTL is offered in BOTH regimes', () => {
 });
 
 test('expiry ON: the TTL boundary matches acceptOffer()s gate exactly (>=, so ON the boundary is open)', () => {
-  // acceptOffer() claims with `offered_at >= NOW() - INTERVAL ttl MINUTE`, and
+  // acceptOffer() claims with `offered_at >= ? - INTERVAL ttl MINUTE`, and
   // expireStaleOffers() sweeps with `<`. The chip must never promise an offer
   // the accept path would refuse, nor refuse one it would still honour.
   assert.equal(stateOf([offer(OFFERED, { ageMinutes: OFFER_TTL_MINUTES })], EXPIRY_ON), 'offered');
@@ -676,8 +690,13 @@ test('expireStaleOffers still sweeps normally when expiry is enabled', async () 
   await jobSvc.expireStaleOffers(OFFER_TTL_MINUTES, 521866);
   const upd = fake.calls.find((c) => /UPDATE tbl_job_offer/i.test(c.sql));
   assert.ok(upd, 'the sweep must run when the business switch is on');
-  assert.match(upd.sql, /offered_at < NOW\(\) - INTERVAL \? MINUTE/, 'same TTL comparison as always');
-  assert.deepEqual(upd.params, [OFFER_TTL_MINUTES, 521866]);
+  assert.match(upd.sql, /offered_at < \? - INTERVAL \? MINUTE/, 'same TTL comparison as always');
+  assert.doesNotMatch(upd.sql, /NOW\(\)/, 'offered_at is app-written; the sweep must bind a Date, never SQL NOW()');
+  assert.equal(upd.params.length, 4);
+  assert.ok(upd.params[0] instanceof Date, 'responded_at is bound as a Date, never SQL NOW()');
+  assert.ok(upd.params[1] instanceof Date, 'the offered_at freshness comparison is bound as a Date, never SQL NOW()');
+  assert.equal(upd.params[0].getTime(), upd.params[1].getTime(), 'one now shared by both bindings in this statement');
+  assert.deepEqual(upd.params.slice(2), [OFFER_TTL_MINUTES, 521866]);
   await setProps({});
 });
 
@@ -709,15 +728,33 @@ const topLevelWhere = () => countQuery().sql.slice(countQuery().sql.indexOf('WHE
 // jo…jo8. So this alias is an exact probe for "the filter fired".
 const FILTER_ALIAS = /tbl_job_offer jos\b/;
 
-const OFFERED_PARAMS  = [OFFER_STATUS.OFFERED, OFFER_TTL_MINUTES];
+// Sentinel for a bound app-side `now` (offered_at is app-written since
+// cffaa49, so freshness binds a real Date, never SQL NOW() — its exact value
+// can't be a fixed constant, so assertParamsLike below checks type + recency
+// instead of identity).
+const NOW = Symbol('now');
+function assertParamsLike(actual, expected, msg) {
+  assert.equal(actual.length, expected.length, `${msg}: param count`);
+  actual.forEach((v, i) => {
+    if (expected[i] === NOW) {
+      assert.ok(v instanceof Date, `${msg}: param[${i}] must be a bound Date, never SQL NOW()`);
+      assert.ok(Math.abs(Date.now() - v.getTime()) < 60000, `${msg}: param[${i}] Date must be ~now`);
+    } else {
+      assert.equal(v, expected[i], `${msg}: param[${i}]`);
+    }
+  });
+}
+
+const OFFERED_PARAMS  = [OFFER_STATUS.OFFERED, NOW, OFFER_TTL_MINUTES];
 const ACCEPTED_PARAMS = [OFFER_STATUS.ACCEPTED];
 /*
- * DEAD binds FOUR params since 2026-08-03: the IN (EXPIRED, REJECTED) pair, then
- * the stale-open arm's OFFERED + TTL. REJECTED joined the predicate when the
- * owner ruled that "everyone we asked said no" must read as Expired/Rejected
- * rather than collapsing into Pending to Scheduling.
+ * DEAD binds FIVE params since offered_at's freshness comparison started
+ * binding an app-side `now` (cffaa49): the IN (EXPIRED, REJECTED) pair, then
+ * the stale-open arm's OFFERED + now + TTL. REJECTED joined the predicate
+ * when the owner ruled that "everyone we asked said no" must read as
+ * Expired/Rejected rather than collapsing into Pending to Scheduling.
  */
-const DEAD_PARAMS     = [OFFER_STATUS.EXPIRED, OFFER_STATUS.REJECTED, OFFER_STATUS.OFFERED, OFFER_TTL_MINUTES];
+const DEAD_PARAMS     = [OFFER_STATUS.EXPIRED, OFFER_STATUS.REJECTED, OFFER_STATUS.OFFERED, NOW, OFFER_TTL_MINUTES];
 
 test('offerState NARROWS the bucket — status=0 + assigned=false survive intact', async () => {
   await jobSvc.list({ status: 0, assigned: false, offerState: 'offered', limit: 10, offset: 0 });
@@ -730,7 +767,7 @@ test('offerState NARROWS the bucket — status=0 + assigned=false survive intact
   );
   const data = dataQuery();
   assert.ok(data.sql.includes(where), 'the data query must carry the same WHERE');
-  assert.deepEqual(countQuery().params, [0, ...OFFERED_PARAMS]);
+  assertParamsLike(countQuery().params, [0, ...OFFERED_PARAMS], 'offerState=offered count params');
 });
 
 test('COUNT and data queries share the SAME where + params (COUNT-join parity)', async () => {
@@ -741,7 +778,7 @@ test('COUNT and data queries share the SAME where + params (COUNT-join parity)',
   // The data query appends limit + offset; everything before must match.
   assert.deepEqual(data.params.slice(0, count.params.length), count.params);
   assert.deepEqual(data.params.slice(count.params.length), [10, 0]);
-  assert.deepEqual(count.params, [0, ...OFFERED_PARAMS, ...ACCEPTED_PARAMS, ...DEAD_PARAMS]);
+  assertParamsLike(count.params, [0, ...OFFERED_PARAMS, ...ACCEPTED_PARAMS, ...DEAD_PARAMS], 'offerState=expired count params');
   // No new outer alias ⇒ COUNT still counts over tbl_job alone for this filter
   // set. This is the recorded "COUNT query lacked the main query's joins" 500.
   assert.doesNotMatch(count.sql, /LEFT JOIN/i);
@@ -753,7 +790,7 @@ test('offerState composes with the OTHER filters without disturbing their params
   await jobSvc.list({ status: 0, assigned: false, offerState: 'pending', cityId: '7,9', limit: 10, offset: 0 });
   const count = countQuery();
   assert.match(count.sql, /LEFT JOIN tbl_address/i, 'cityId must still pull in the address join');
-  assert.deepEqual(
+  assertParamsLike(
     count.params,
     [0, ...OFFERED_PARAMS, ...ACCEPTED_PARAMS, ...DEAD_PARAMS, 7, 9],
     'the offer params must sit before cityId, in fragment order',
@@ -792,4 +829,13 @@ test('the filter degrades to a no-op when tbl_job_offer does not exist', async (
   // Restore the module registry so any later require in this process is normal.
   delete require.cache[require.resolve('../services/job.service')];
   require('../services/job.service');
+});
+
+test('one offer-state statement binds ONE now, so live and dead stay exact complements', () => {
+  for (const state of ['expired', 'pending']) {
+    const { params } = offerStateClause(state, true);
+    const dates = params.filter((p) => p instanceof Date);
+    assert.ok(dates.length >= 2, `${state}: live and dead both carry a freshness Date`);
+    assert.ok(dates.every((d) => d === dates[0]), `${state}: every freshness Date is the same instance`);
+  }
 });

@@ -537,7 +537,7 @@ async function loadPersonalEmail(userId) {
 /*
  * WRITE side — idempotent upsert of the one row per CRM user. DATETIME columns
  * are bound as `new Date()` so the pool's +05:30 session timezone stores the IST
- * wall clock verbatim — never SQL NOW(), which would be the server's UTC clock.
+ * wall clock verbatim — never SQL NOW(), which is the DB session's zone (SYSTEM).
  *
  * Takes a `runner` (pool OR a transaction connection) so createUser can write
  * it inside the SAME transaction as the tbl_user INSERT: personal_email is
@@ -1285,7 +1285,7 @@ async function createUser({
           manage_clients, manage_cities, manage_states, manage_verticals,
           reporting_manager,
           user_status, insert_date, updated_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         empCode,
         // `mob || null` — store NULL, never '', for a mobile-less user. Matches
@@ -1296,7 +1296,7 @@ async function createUser({
         Number(user_role), INTERNAL_USER_TYPE_ID, city_id ? Number(city_id) : null,
         manage_clients || null, manage_cities || null, manage_states || null, manage_verticals || null,
         reporting_manager ? Number(reporting_manager) : null,
-        STATUS_ACTIVE, createdBy || null,
+        STATUS_ACTIVE, new Date(), createdBy || null,
       ]
     );
     await upsertPersonalEmail(r.insertId, personalEmail.value, conn);
@@ -1816,8 +1816,8 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
   // tbl_user column write — only when a mutable column actually changed. A
   // stage-only PATCH (sets empty) skips this and just reconciles below.
   if (sets.length) {
-    sets.push('update_date = NOW()', 'updated_by = ?');
-    params.push(updatedBy || null, userId);
+    sets.push('update_date = ?', 'updated_by = ?');
+    params.push(new Date(), updatedBy || null, userId);
 
     await pool.query(`UPDATE tbl_user SET ${sets.join(', ')} WHERE user_id = ?`, params);
     logger.info('User updated · id=' + userId + ' · fields=' + sets.length);
@@ -2108,9 +2108,9 @@ async function deactivateUser(userId, updatedBy) {
   logger.info('Deactivate user · userId=' + userId);
   const [r] = await pool.query(
     `UPDATE tbl_user
-        SET user_status = 0, update_date = NOW(), updated_by = ?
+        SET user_status = 0, update_date = ?, updated_by = ?
       WHERE user_id = ? AND user_type_id = ?`,
-    [updatedBy || null, userId, INTERNAL_USER_TYPE_ID]
+    [new Date(), updatedBy || null, userId, INTERNAL_USER_TYPE_ID]
   );
   logger.info('User deactivated · userId=' + userId + ' · affected=' + r.affectedRows);
   if (r.affectedRows) {

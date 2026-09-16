@@ -680,7 +680,7 @@ router.put('/:id/verification/map-clients',
     try {
       logger.info('Map clients to easyfixer · id=' + req.params.id + ' clients=' + (req.body.client_ids || []).length);
       if (!(await loadAndAuthorize(req, res))) return;
-      const data = await verification.mapClients(req.params.id, req.body.client_ids, req.user);
+      const data = await verification.mapClients(req.params.id, req.body.client_ids);
       logger.info('Clients mapped · id=' + req.params.id + ' clients=' + (req.body.client_ids || []).length);
       modernOk(res, data, 'clients mapped');
     } catch (e) { next(e); }

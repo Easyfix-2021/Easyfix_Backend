@@ -106,15 +106,16 @@ async function upsertEasyfixerAppToken(efrId, fcmToken) {
   // there. This mirrors the device_info row, whose fire_base_token is likewise
   // NULLed on a tokenless login. POST /mobile/device fills it when it arrives.
   const token = fcmToken ? String(fcmToken).trim() : null;
+  const now = new Date();
   const [upd] = await pool.query(
-    'UPDATE tbl_easyfixer_app SET device_id = ?, last_login_time = NOW() WHERE efr_id = ?',
-    [token, efrId],
+    'UPDATE tbl_easyfixer_app SET device_id = ?, last_login_time = ? WHERE efr_id = ?',
+    [token, now, efrId],
   );
   // Only create a row when there's an actual token to store.
   if (upd.affectedRows === 0 && token) {
     await pool.query(
-      'INSERT INTO tbl_easyfixer_app (efr_id, device_id, last_login_time) VALUES (?, ?, NOW())',
-      [efrId, token],
+      'INSERT INTO tbl_easyfixer_app (efr_id, device_id, last_login_time) VALUES (?, ?, ?)',
+      [efrId, token, now],
     );
   }
 }
@@ -224,16 +225,17 @@ router.post('/auth/verify-otp', verifyOtpIpRateLimit, verifyOtpMobileRateLimit, 
 
         // 2) Try to UPDATE the row for THIS (user_id, device_id) — refreshes
         //    FCM token, app version, language, marks logged-in, bumps time
+        const now = new Date();
         const [upd] = await pool.query(
           `UPDATE device_info SET
              fire_base_token   = ?,
              app_version_name  = COALESCE(?, app_version_name),
              language          = COALESCE(?, language),
              is_logged_in      = '1',
-             last_login_time   = NOW()
+             last_login_time   = ?
            WHERE user_id = ? AND device_id = ?`,
           [fcm, req.body.appVersion || null, req.body.language || null,
-           r.tech.efr_id, req.body.deviceId],
+           now, r.tech.efr_id, req.body.deviceId],
         );
 
         // 3) No matching row → INSERT fresh. Matches the column set + types
@@ -242,8 +244,8 @@ router.post('/auth/verify-otp', verifyOtpIpRateLimit, verifyOtpMobileRateLimit, 
           await pool.query(
             `INSERT INTO device_info
                (user_id, device_id, fire_base_token, app_version_name, language, is_logged_in, last_login_time)
-             VALUES (?, ?, ?, ?, ?, '1', NOW())`,
-            [r.tech.efr_id, req.body.deviceId, fcm, req.body.appVersion || null, req.body.language || null],
+             VALUES (?, ?, ?, ?, ?, '1', ?)`,
+            [r.tech.efr_id, req.body.deviceId, fcm, req.body.appVersion || null, req.body.language || null, now],
           );
         }
         // Mirror the active device's token into the canonical push target
@@ -1424,8 +1426,8 @@ router.post('/profile/professional-details', validate(Joi.object({
         } else {
           await conn.query(
             `INSERT INTO tbl_easyfixer_document (efr_id, efr_doc_type_id, efr_document_name, efr_doc_text, created_date, created_by)
-             VALUES (?, 8, ?, ?, NOW(), ?)`,
-            [efrId, tp.photoKey, String(tp.toolId), efrId]);
+             VALUES (?, 8, ?, ?, ?, ?)`,
+            [efrId, tp.photoKey, String(tp.toolId), new Date(), efrId]);
         }
       }
     }
@@ -1850,13 +1852,14 @@ router.post('/device', validate(Joi.object({
      * VALUES() would let that NULL erase a version we already knew. Keeping the
      * last known build is strictly better than forgetting it.
      */
+    const deviceNow = new Date();
     await pool.query(
       `INSERT INTO device_info (user_id, device_id, fire_base_token, app_version_name, language, is_logged_in, last_login_time)
-       VALUES (?, ?, ?, ?, ?, 1, NOW())
+       VALUES (?, ?, ?, ?, ?, 1, ?)
        ON DUPLICATE KEY UPDATE fire_base_token = VALUES(fire_base_token),
                                app_version_name = COALESCE(VALUES(app_version_name), app_version_name),
-                               is_logged_in = 1, last_login_time = NOW()`,
-      [req.tech.efr_id, req.body.deviceId, req.body.fcmToken, req.body.appVersion || null, req.body.language || 'en']);
+                               is_logged_in = 1, last_login_time = ?`,
+      [req.tech.efr_id, req.body.deviceId, req.body.fcmToken, req.body.appVersion || null, req.body.language || 'en', deviceNow, deviceNow]);
     // Keep the canonical push target (tbl_easyfixer_app.device_id) in sync so
     // registration-status fan-out can reach this device. Best-effort — a
     // failure here must not fail the device registration.

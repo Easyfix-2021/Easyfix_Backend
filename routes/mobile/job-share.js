@@ -16,7 +16,7 @@ const logger = require('../../logger');
  * That also means req.tech.efr_id here is always the REAL caller, never the
  * substituted owner identity the lock installs for the delegate elsewhere.
  *
- *   POST   /:id/share         create (original only, gated, job must be live)
+ *   POST   /:id/share         create (original only, job must be live)
  *   DELETE /:id/share         cancel (original only, pending|accepted only)
  *   GET    /:id/share         read   (either party; null for anyone else)
  *   POST   /:id/share/accept  accept (delegate only, pending only)

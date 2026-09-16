@@ -170,8 +170,8 @@ async function verifyToken(token) {
     const { id, efr_id: efrId } = rows[0];
 
     await conn.query(
-      `UPDATE tbl_efr_email_verification SET verified_at = NOW() WHERE id = ?`,
-      [id],
+      `UPDATE tbl_efr_email_verification SET verified_at = ? WHERE id = ?`,
+      [new Date(), id],
     );
     // Flip the status flag on the token's OWN technician row.
     await conn.query(

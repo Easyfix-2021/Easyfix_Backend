@@ -100,6 +100,7 @@ async function loadSignals(candidates, cfg) {
   const ids = candidates.map((row) => Number(row.efr_id));
   if (!ids.length) return {};
   const placeholders = ids.map(() => '?').join(',');
+  const now = new Date();
 
   const noShowPromise = cfg.noShowEnabled
     ? pool.query(
@@ -112,9 +113,9 @@ async function loadSignals(candidates, cfg) {
                     THEN 1 ELSE 0 END) AS no_shows
          FROM tbl_easyfixer_attendance
         WHERE easyfixer_id IN (${placeholders})
-          AND created_on >= DATE_SUB(NOW(), INTERVAL ? DAY)
+          AND created_on >= DATE_SUB(?, INTERVAL ? DAY)
         GROUP BY easyfixer_id`,
-      [...ids, cfg.noShowWindowDays],
+      [...ids, now, cfg.noShowWindowDays],
     )
     : Promise.resolve([[]]);
 

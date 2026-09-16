@@ -1088,19 +1088,20 @@ async function create(body, actor) {
         throw e;
       }
     }
+    const createNow = new Date();
     const [ins] = await conn.query(
       `INSERT INTO tbl_open_city
          (pin, city, district, state, state_user, category_id, comments,
           reference_id, client_id, status, request_for, inserted_by, inserted_on)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NOW())`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
       [loc.pin, loc.city, loc.district, loc.state, loc.stateUser, catgId, comments,
-        loc.referenceId, loc.clientId, requestFor, actor?.user_id || null],
+        loc.referenceId, loc.clientId, requestFor, actor?.user_id || null, createNow],
     );
     id = ins.insertId;
     await conn.query(
       `INSERT INTO supply_request_log (sr_id, comment, action_type, user_id, insert_time, tx_details)
-       VALUES (?, ?, 0, ?, NOW(), NULL)`,
-      [id, comments, actor?.user_id || null],
+       VALUES (?, ?, 0, ?, ?, NULL)`,
+      [id, comments, actor?.user_id || null, createNow],
     );
     await conn.commit();
   } catch (err) {
@@ -1189,8 +1190,8 @@ async function logEfrInvite({ name, mobile, remarks, inviteStatus, supplyId, use
   try {
     await pool.query(
       `INSERT INTO tbl_efr_invite (efr_name, efr_mobile, remarks, invite_status, supply_id, invited_by, invited_on)
-       VALUES (?, ?, ?, ?, ?, ?, NOW())`,
-      [name, mobile, remarks || null, String(inviteStatus).slice(0, 50), supplyId ?? null, userId ?? null],
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [name, mobile, remarks || null, String(inviteStatus).slice(0, 50), supplyId ?? null, userId ?? null, new Date()],
     );
     return true;
   } catch (err) {
@@ -1218,8 +1219,8 @@ async function addRemark(openCityId, comment, actor) {
   await loadForAction(openCityId);
   await pool.query(
     `INSERT INTO supply_request_log (sr_id, comment, action_type, user_id, insert_time, tx_details)
-     VALUES (?, ?, 9, ?, NOW(), NULL)`,
-    [openCityId, comment, actor?.user_id || null],
+     VALUES (?, ?, 9, ?, ?, NULL)`,
+    [openCityId, comment, actor?.user_id || null, new Date()],
   );
   return { id: openCityId };
 }
@@ -1261,33 +1262,34 @@ async function act(openCityId, body, actor) {
   }
 
   const conn = await pool.getConnection();
+  const now = new Date();
   try {
     await conn.beginTransaction();
     if (actionType === 1 || actionType === 2) {
       await conn.query(
         `UPDATE tbl_open_city
-            SET action_by = ?, action_on = NOW(), action_remarks = ?, status = ?,
+            SET action_by = ?, action_on = ?, action_remarks = ?, status = ?,
                 ${actionType === 1 ? 'new_supply_name = ?, new_supply_number = ?' : 'old_supply_id = ?'}
           WHERE id = ?`,
         actionType === 1
-          ? [userId, remarks, actionType, tech.name, tech.mobile, openCityId]
-          : [userId, remarks, actionType, tech.id, openCityId],
+          ? [userId, now, remarks, actionType, tech.name, tech.mobile, openCityId]
+          : [userId, now, remarks, actionType, tech.id, openCityId],
       );
       await conn.query(
         `INSERT INTO tbl_supply_request_allocation (sr_id, supply_name, supply_no, remarks, supply_type, insert_by, insert_date)
-         VALUES (?, ?, ?, ?, ?, ?, NOW())`,
-        [openCityId, tech.name, tech.mobile, remarks, actionType, userId],
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [openCityId, tech.name, tech.mobile, remarks, actionType, userId, now],
       );
     } else {
       await conn.query(
-        'UPDATE tbl_open_city SET closed_by = ?, closed_on = NOW(), closed_comments = ?, status = ? WHERE id = ?',
-        [userId, remarks, actionType, openCityId],
+        'UPDATE tbl_open_city SET closed_by = ?, closed_on = ?, closed_comments = ?, status = ? WHERE id = ?',
+        [userId, now, remarks, actionType, openCityId],
       );
     }
     await conn.query(
       `INSERT INTO supply_request_log (sr_id, comment, action_type, user_id, insert_time, tx_details)
-       VALUES (?, ?, ?, ?, NOW(), ?)`,
-      [openCityId, remarks, actionType, userId, tech ? tech.txDetails : null],
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [openCityId, remarks, actionType, userId, now, tech ? tech.txDetails : null],
     );
     await conn.commit();
   } catch (err) {

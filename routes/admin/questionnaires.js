@@ -69,8 +69,8 @@ router.post('/', validate(headerBody), async (req, res, next) => {
     const [ins] = await pool.query(
       `INSERT INTO tbl_questionaire
          (client_id, c_questionaire_name, status, inserted_by, insert_date)
-       VALUES (?, ?, ?, ?, NOW())`,
-      [req.body.client_id, req.body.c_questionaire_name, req.body.status, req.user.user_id]
+       VALUES (?, ?, ?, ?, ?)`,
+      [req.body.client_id, req.body.c_questionaire_name, req.body.status, req.user.user_id, new Date()]
     );
     logger.info('Questionnaire created · id=' + ins.insertId);
     res.status(201);
@@ -87,8 +87,8 @@ router.patch('/:id', validate(Joi.object({
     const sets = [], vals = [];
     if (req.body.c_questionaire_name) { sets.push('c_questionaire_name = ?'); vals.push(req.body.c_questionaire_name); }
     if (req.body.status !== undefined) { sets.push('status = ?'); vals.push(req.body.status); }
-    sets.push('updated_by = ?', 'update_date = NOW()');
-    vals.push(req.user.user_id, req.params.id);
+    sets.push('updated_by = ?', 'update_date = ?');
+    vals.push(req.user.user_id, new Date(), req.params.id);
     const [r] = await pool.query(
       `UPDATE tbl_questionaire SET ${sets.join(', ')} WHERE c_questionaire_id = ?`,
       vals
@@ -152,8 +152,8 @@ router.post('/:id/details', validate(detailBody), async (req, res, next) => {
     const [ins] = await pool.query(
       `INSERT INTO tbl_questionaire_details
          (c_questionaire_id, ${cols.join(', ')}, inserted_by, insert_date)
-       VALUES (?, ${placeholders}, ?, NOW())`,
-      [req.params.id, ...values, req.user.user_id]
+       VALUES (?, ${placeholders}, ?, ?)`,
+      [req.params.id, ...values, req.user.user_id, new Date()]
     );
     logger.info('Questionnaire detail added · id=' + ins.insertId);
     res.status(201);

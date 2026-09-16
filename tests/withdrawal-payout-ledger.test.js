@@ -73,6 +73,13 @@ test('the payout row takes its balance from the LEDGER TAIL, and the cache follo
   assert.ok(cache, 'the cache must be re-pointed');
   assert.equal(cache.params[0], 800);
   assert.ok(!/current_balance = current_balance/i.test(cache.sql), 'absolute, not relative');
+
+  // db.js pool binds a Date as the IST wall clock; SQL NOW() takes the DB
+  // session's own (SYSTEM) zone. processed_on is DATETIME (2026-09-16).
+  const paid = find(/UPDATE tbl_easyfixer_withdrawal_request/i);
+  assert.ok(paid, 'the request row must be marked paid');
+  assert.doesNotMatch(paid.sql, /NOW\(\)/, 'processed_on must not be SQL NOW()');
+  assert.ok(paid.params[0] instanceof Date, 'processed_on is the first bound value');
 });
 
 test('source is the integer 4, never the string that a tinyint silently stored as 0', async () => {

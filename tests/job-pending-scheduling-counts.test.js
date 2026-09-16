@@ -30,8 +30,14 @@
  * Non-destructive: fake pool, no real DB, zero writes. Runner: `node --test`.
  */
 
-const { test, beforeEach } = require('node:test');
+const { test, beforeEach, mock } = require('node:test');
 const assert = require('node:assert/strict');
+
+// Since cffaa49 the offer TTL cutoff is an app Date INLINED into the SQL text,
+// and several tests below compare two renderings as text. Unfrozen, they are
+// built a millisecond apart and differ only in that literal — a flake, not a
+// divergence. One frozen instant for the whole file.
+mock.timers.enable({ apis: ['Date'], now: new Date('2026-09-16T06:00:00Z') });
 const { installFakePool } = require('./helpers/fake-pool');
 
 // Controls what the memoised tbl_job_offer existence probe sees, and what the

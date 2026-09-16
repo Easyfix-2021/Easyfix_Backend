@@ -179,3 +179,29 @@ test('CRM verification identity save returns the same redacted Aadhaar conflict'
     assertSafeConflict,
   );
 });
+
+// db.js pool: timezone '+05:30', dateStrings true — a bound Date is stored as
+// the IST wall clock; SQL NOW() takes the DB session's own (SYSTEM) zone. See
+// 2026-09-16 conversion. tbl_easyfixer.send_to_finance_date_time is DATETIME;
+// update_date on the same row is TIMESTAMP and is bound from the same Date.
+test('CRM identity approval stamps send_to_finance_date_time with a bound Date, never NOW()', async () => {
+  const calls = [];
+  await withStubs({
+    hasLifecycleSchema: async () => false,
+    query: async (sql, params) => {
+      calls.push({ sql: String(sql), params });
+      if (/UPDATE tbl_easyfixer SET/i.test(String(sql))) return [{ affectedRows: 1 }];
+      return [[]];
+    },
+  }, () => verification.saveIdentity(73, {
+    verification_status: 1,
+  }, { user_id: 7 }));
+
+  const update = calls.find((c) => /send_to_finance_date_time/.test(c.sql));
+  assert.ok(update, 'the identity-approve UPDATE ran');
+  assert.doesNotMatch(
+    update.sql, /send_to_finance_date_time\s*=\s*NOW\(\)/,
+    'send_to_finance_date_time must not be SQL NOW()',
+  );
+  assert.ok(update.params[1] instanceof Date, 'send_to_finance_date_time is the second bound param');
+});

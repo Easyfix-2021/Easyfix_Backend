@@ -1305,10 +1305,10 @@ async function expireOpenOffersForRestrictedLifecycle(conn, efrId) {
     const [result] = await conn.query(
       `UPDATE tbl_job_offer
           SET offer_status = ?,
-              responded_at = COALESCE(responded_at, NOW())${crRestricted.sql}
+              responded_at = COALESCE(responded_at, ?)${crRestricted.sql}
         WHERE fk_easyfixter_id = ?
           AND offer_status = ?`,
-      [OFFER_STATUS.EXPIRED, ...crRestricted.params, Number(efrId), OFFER_STATUS.OFFERED],
+      [OFFER_STATUS.EXPIRED, new Date(), ...crRestricted.params, Number(efrId), OFFER_STATUS.OFFERED],
     );
     return Number(result?.affectedRows) || 0;
   } catch (error) {
@@ -1704,9 +1704,9 @@ async function finalizeMobileRegistrationGate1(efrId) {
             SET is_identity_details_verified_by_crm = NULL,
                 send_back_to_tx_reason_crm = NULL,
                 updated_by = NULL,
-                update_date = NOW()
+                update_date = ?
           WHERE efr_id = ?`,
-        [Number(efrId)],
+        [new Date(), Number(efrId)],
       );
     },
     _protectLifecycle: (current, target) => current.status === target,
@@ -1872,13 +1872,14 @@ async function activateFromVerification(efrId, body, actor = null) {
                 efr_type = COALESCE(?, efr_type),
                 is_technician_verified = 1,
                 profile_crm_activation_by = ?,
-                profile_activation_date_time = NOW(),
+                profile_activation_date_time = ?,
                 is_eligible_for_offline_orders = COALESCE(?, is_eligible_for_offline_orders)
           WHERE efr_id = ?`,
         [
           body.final_accept_comment || null,
           body.grade || null,
           actor?.user_id || null,
+          new Date(),
           body.is_eligible_for_offline_orders ?? null,
           Number(efrId),
         ],

@@ -149,7 +149,11 @@ test('mobile open-offer reads fail closed on lifecycle, job state, latest row an
   assert.match(membership.sql, /MAX\(latest\.job_offer_id\)/);
   assert.match(membership.sql, /j\.job_status = 0/);
   assert.match(membership.sql, /j\.fk_easyfixter_id IS NULL/);
-  assert.match(membership.sql, /offered_at >= NOW\(\) - INTERVAL 30 MINUTE/);
+  assert.match(membership.sql, /offered_at >= \? - INTERVAL 30 MINUTE/);
+  assert.doesNotMatch(membership.sql, /NOW\(\)/, 'offered_at is app-written; freshness must bind a Date, never SQL NOW()');
+  const membershipNow = membership.params[membership.params.length - 1];
+  assert.ok(membershipNow instanceof Date, 'the freshness bound is a real Date');
+  assert.ok(Math.abs(Date.now() - membershipNow.getTime()) < 60000, 'the bound Date is ~now');
 
   fake.reset();
   assert.deepEqual(await jobService.listOfferedForTech(42), { items: [] });
@@ -159,7 +163,11 @@ test('mobile open-offer reads fail closed on lifecycle, job state, latest row an
   assert.match(list.sql, /j\.job_status = 0/);
   assert.match(list.sql, /newer\.job_offer_id > jo\.job_offer_id/);
   assert.doesNotMatch(list.sql, /GROUP BY job_id/, 'the capped read must not aggregate lifetime history');
-  assert.match(list.sql, /offered_at >= NOW\(\) - INTERVAL 30 MINUTE/);
+  assert.match(list.sql, /offered_at >= \? - INTERVAL 30 MINUTE/);
+  assert.doesNotMatch(list.sql, /NOW\(\)/, 'offered_at is app-written; freshness must bind a Date, never SQL NOW()');
+  const listNow = list.params[list.params.length - 2]; // [efrId, now, safeLimit]
+  assert.ok(listNow instanceof Date, 'the freshness bound is a real Date');
+  assert.ok(Math.abs(Date.now() - listNow.getTime()) < 60000, 'the bound Date is ~now');
   assert.ok(!fake.calls.some((call) => /FROM tbl_job j[\s\S]*jobIds/.test(call.sql)),
     'ineligible/no-offer reads must not hydrate job previews');
 });

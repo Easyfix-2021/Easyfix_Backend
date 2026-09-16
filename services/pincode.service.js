@@ -807,8 +807,8 @@ async function findOrCreateCityByName(cityName, stateId, { district = null, crea
     const creatorId = createdByEfrId || userId || null;
     const creatorType = createdByEfrId ? 'technician' : (userId ? 'user' : null);
     await pool.query(
-      'UPDATE tbl_city SET created_by = ?, created_by_type = ?, created_date = NOW() WHERE city_id = ?',
-      [creatorId, creatorType, cityId]
+      'UPDATE tbl_city SET created_by = ?, created_by_type = ?, created_date = ? WHERE city_id = ?',
+      [creatorId, creatorType, new Date(), cityId]
     );
   }
   logger.info('Created city · id=' + cityId + ' name="' + name + '" state_id=' + stateId
@@ -1243,9 +1243,10 @@ async function setZonesForPincode(pincodeId, zoneIds, { userId = null } = {}) {
         [pincodeId, ...acceptable]
       );
       // Idempotently add the wanted rows for THIS pincode.
-      const values = acceptable.map(() => '(?, ?, NOW(), ?)').join(', ');
+      const values = acceptable.map(() => '(?, ?, ?, ?)').join(', ');
+      const now = new Date();
       const params = [];
-      for (const id of acceptable) params.push(id, pincodeId, userId);
+      for (const id of acceptable) params.push(id, pincodeId, now, userId);
       await conn.query(
         `INSERT IGNORE INTO tbl_zone_pincode_mapping
            (zone_id, pincode_id, created_on, created_by)

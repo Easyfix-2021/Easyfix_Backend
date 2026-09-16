@@ -7,8 +7,8 @@ const logger = require('../logger');
  * Plivo calls can be reconciled/sliced on their own (count Plivo vs all, by
  * mode / flow / status / QA-redirect). EVERY function is FAIL-SOFT: a logging
  * error is swallowed (warn) and never propagates — call placement and the Plivo
- * callbacks must never break because of the log. Timestamps use SQL NOW() to
- * match tbl_job_caller_info's clock.
+ * callbacks must never break because of the log. Timestamps are bound JS Dates
+ * (IST wall clock via the pool's +05:30 timezone), never SQL NOW().
  *
  * Lifecycle: record() at start → markRinging/markAnswered on callbacks →
  * markTerminalByJci / markTerminalByCallUuid on hangup. Keyed off
@@ -219,7 +219,7 @@ async function primaryLegFilter() {
     : '';
 }
 
-// Insert one row at call start (initiated_on = NOW()). Returns id or null.
+// Insert one row at call start (initiated_on = now). Returns id or null.
 async function record(fields = {}) {
   try {
     const cols = RECORD_COLS.filter((c) => fields[c] !== undefined);
@@ -246,9 +246,10 @@ async function record(fields = {}) {
         if (fields[c] !== undefined) { cols.push(c); params.push(fields[c]); }
       }
     }
+    const now = new Date();
     const sql = `INSERT INTO tbl_plivo_call_log (${cols.concat('initiated_on').join(', ')}) `
-      + `VALUES (${cols.map(() => '?').concat('NOW()').join(', ')})`;
-    const [r] = await pool.query(sql, params);
+      + `VALUES (${cols.map(() => '?').concat('?').join(', ')})`;
+    const [r] = await pool.query(sql, [...params, now]);
     logger.info('Plivo call-log row recorded · jci=' + fields.job_caller_info_id + ' · job=' + fields.job_id + ' · id=' + r.insertId);
     return r.insertId;
   } catch (e) {
@@ -263,9 +264,9 @@ async function markRinging(jci, callUuid) {
   try {
     await pool.query(
       `UPDATE tbl_plivo_call_log
-          SET status = 'ringing', call_uuid = COALESCE(?, call_uuid), updated_on = NOW()
+          SET status = 'ringing', call_uuid = COALESCE(?, call_uuid), updated_on = ?
         WHERE job_caller_info_id = ?${await primaryLegFilter()}`,
-      [callUuid || null, jci],
+      [callUuid || null, new Date(), jci],
     );
   } catch (e) { logger.warn({ err: e.message, jci }, 'plivo-call-log: markRinging failed (non-fatal)'); }
 }
@@ -275,12 +276,13 @@ async function markAnswered(jci, callUuid, recordRequested = null) {
   logger.info('Plivo call-log mark answered · jci=' + jci
     + (recordRequested == null ? '' : ' · recording=' + (recordRequested ? 'on' : 'off')));
   try {
+    const now = new Date();
     await pool.query(
       `UPDATE tbl_plivo_call_log
-          SET status = 'answered', answered_on = NOW(),
-              call_uuid = COALESCE(?, call_uuid), updated_on = NOW()
+          SET status = 'answered', answered_on = ?,
+              call_uuid = COALESCE(?, call_uuid), updated_on = ?
         WHERE job_caller_info_id = ?${await primaryLegFilter()}`,
-      [callUuid || null, jci],
+      [now, callUuid || null, now, jci],
     );
   } catch (e) { logger.warn({ err: e.message, jci }, 'plivo-call-log: markAnswered failed (non-fatal)'); }
   // Persist the recording decision SEPARATELY + fail-soft: on a deploy where the
@@ -307,9 +309,9 @@ async function setRecording(jci, { url, id, duration } = {}) {
   try {
     await pool.query(
       `UPDATE tbl_plivo_call_log
-          SET recording_url = ?, recording_id = ?, recording_duration = ?, updated_on = NOW()
+          SET recording_url = ?, recording_id = ?, recording_duration = ?, updated_on = ?
         WHERE job_caller_info_id = ?${await primaryLegFilter()}`,
-      [String(url), id || null, duration != null ? Number(duration) : null, jci],
+      [String(url), id || null, duration != null ? Number(duration) : null, new Date(), jci],
     );
     logger.info('Plivo call-log recording stored · jci=' + jci + ' · id=' + (id || '?'));
   } catch (e) { logger.warn({ err: e.message, jci }, 'plivo-call-log: setRecording failed (non-fatal — columns may be pre-migration)'); }
@@ -321,8 +323,8 @@ async function setRecordingRequested(jci, on) {
   if (jci == null) return;
   try {
     await pool.query(
-      `UPDATE tbl_plivo_call_log SET recording_requested = ?, updated_on = NOW() WHERE job_caller_info_id = ?${await primaryLegFilter()}`,
-      [on ? 1 : 0, jci],
+      `UPDATE tbl_plivo_call_log SET recording_requested = ?, updated_on = ? WHERE job_caller_info_id = ?${await primaryLegFilter()}`,
+      [on ? 1 : 0, new Date(), jci],
     );
   } catch (e) { logger.warn({ err: e.message, jci }, 'plivo-call-log: setRecordingRequested failed (non-fatal — column may be pre-migration)'); }
 }
@@ -331,12 +333,13 @@ async function markTerminalByJci(jci, { status, duration = null, hangupCause = n
   if (jci == null) return;
   logger.info('Plivo call-log mark terminal by jci · jci=' + jci + ' · status=' + status + ' · duration=' + duration);
   try {
+    const now = new Date();
     await pool.query(
       `UPDATE tbl_plivo_call_log
-          SET status = ?, ended_on = NOW(), duration = ?, hangup_cause = ?,
-              call_uuid = COALESCE(?, call_uuid), updated_on = NOW()
+          SET status = ?, ended_on = ?, duration = ?, hangup_cause = ?,
+              call_uuid = COALESCE(?, call_uuid), updated_on = ?
         WHERE job_caller_info_id = ?${await primaryLegFilter()}`,
-      [status, duration, hangupCause, callUuid, jci],
+      [status, now, duration, hangupCause, callUuid, now, jci],
     );
   } catch (e) { logger.warn({ err: e.message, jci }, 'plivo-call-log: markTerminalByJci failed (non-fatal)'); }
 }
@@ -347,11 +350,12 @@ async function markTerminalByCallUuid(callUuid, { status, duration = null, hangu
   if (!callUuid) return;
   logger.info('Plivo call-log mark terminal by CallUUID · status=' + status + ' · duration=' + duration);
   try {
+    const now = new Date();
     await pool.query(
       `UPDATE tbl_plivo_call_log
-          SET status = ?, ended_on = NOW(), duration = ?, hangup_cause = ?, updated_on = NOW()
+          SET status = ?, ended_on = ?, duration = ?, hangup_cause = ?, updated_on = ?
         WHERE call_uuid = ?`,
-      [status, duration, hangupCause, callUuid],
+      [status, now, duration, hangupCause, now, callUuid],
     );
   } catch (e) { logger.warn({ err: e.message, callUuid }, 'plivo-call-log: markTerminalByCallUuid failed (non-fatal)'); }
 }
@@ -399,9 +403,9 @@ async function adoptOperatorLeg(conferenceId, jci, db = pool) {
   try {
     const [r] = await db.query(
       `UPDATE tbl_plivo_call_log
-          SET conference_id = ?, participant_role = 'operator', updated_on = NOW()
+          SET conference_id = ?, participant_role = 'operator', updated_on = ?
         WHERE job_caller_info_id = ? AND conference_id IS NULL`,
-      [conferenceId, jci],
+      [conferenceId, new Date(), jci],
     );
     const n = (r && r.affectedRows) || 0;
     if (n) logger.info('Plivo call-log operator leg attached to conference · jci=' + jci + ' · conf=' + conferenceId);
@@ -449,7 +453,7 @@ async function insertConferenceLeg({
          (conference_id, participant_role, participant_target_id, job_caller_info_id, job_id,
           call_mode, call_flow, caller_user_id, caller_name, receiver_name,
           receiver_number, dialed_number, status, initiated_on)
-       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW()
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
          FROM DUAL
         WHERE NOT EXISTS (
           SELECT 1 FROM tbl_plivo_call_log x
@@ -460,7 +464,7 @@ async function insertConferenceLeg({
         )`,
       [conferenceId, role, targetId, jobCallerInfoId, jobId,
         callMode, callFlow, callerUserId, callerName, displayName,
-        receiverNumber || dialedNumber, dialedNumber, LEG_STATUS.DIALLING,
+        receiverNumber || dialedNumber, dialedNumber, LEG_STATUS.DIALLING, new Date(),
         conferenceId, role, tail, ...ACTIVE_LEG_STATUSES],
     );
     if (!r || !r.affectedRows) return { ok: false, code: 'duplicate' };
@@ -577,9 +581,9 @@ async function stampConferenceLegIds(legId, { memberId = null, callUuid = null }
       `UPDATE tbl_plivo_call_log
           SET conference_member_id = COALESCE(?, conference_member_id),
               call_uuid = COALESCE(?, call_uuid),
-              updated_on = NOW()
+              updated_on = ?
         WHERE id = ? AND status = ?`,
-      [memberId || null, callUuid || null, legId, LEG_STATUS.DIALLING],
+      [memberId || null, callUuid || null, new Date(), legId, LEG_STATUS.DIALLING],
     );
     return true;
   } catch (e) {
@@ -605,15 +609,18 @@ async function markConferenceLegStatus(legId, {
   callUuid = null,
 } = {}, db = pool) {
   const froms = Array.isArray(from) ? from : [from];
+  const now = new Date();
   const sets = [
     'status = ?',
     'conference_member_id = COALESCE(?, conference_member_id)',
     'call_uuid = COALESCE(?, call_uuid)',
-    'updated_on = NOW()',
+    'updated_on = ?',
   ];
   const params = [status, memberId || null, callUuid || null];
-  if (answeredOn) sets.splice(1, 0, 'answered_on = COALESCE(answered_on, NOW())');
-  if (endedOn) sets.splice(1, 0, 'ended_on = COALESCE(ended_on, NOW())');
+  // answered_on/ended_on and updated_on share `now` — one stamp per statement.
+  if (answeredOn) { sets.splice(1, 0, 'answered_on = COALESCE(answered_on, ?)'); params.splice(1, 0, now); }
+  if (endedOn) { sets.splice(1, 0, 'ended_on = COALESCE(ended_on, ?)'); params.splice(1, 0, now); }
+  params.push(now);
   if (duration != null) { sets.push('duration = COALESCE(?, duration)'); params.push(duration); }
   if (hangupCause != null) { sets.push('hangup_cause = COALESCE(?, hangup_cause)'); params.push(String(hangupCause).slice(0, 64)); }
   try {
@@ -641,12 +648,13 @@ async function markConferenceLegStatus(legId, {
  */
 async function markConferenceLegFailed(legId, detail, db = pool) {
   try {
+    const now = new Date();
     await db.query(
       `UPDATE tbl_plivo_call_log
-          SET status = ?, ended_on = COALESCE(ended_on, NOW()),
-              hangup_cause = COALESCE(hangup_cause, ?), updated_on = NOW()
+          SET status = ?, ended_on = COALESCE(ended_on, ?),
+              hangup_cause = COALESCE(hangup_cause, ?), updated_on = ?
         WHERE id = ?`,
-      [LEG_STATUS.FAILED, String(detail || 'provider refused').slice(0, 64), legId],
+      [LEG_STATUS.FAILED, now, String(detail || 'provider refused').slice(0, 64), now, legId],
     );
     return true;
   } catch (e) {
@@ -658,11 +666,12 @@ async function markConferenceLegFailed(legId, detail, db = pool) {
 // Close every still-active leg of a room — the room ended, so they all did.
 async function closeConferenceLegs(conferenceId, { status = LEG_STATUS.LEFT } = {}, db = pool) {
   try {
+    const now = new Date();
     const [r] = await db.query(
       `UPDATE tbl_plivo_call_log
-          SET status = ?, ended_on = COALESCE(ended_on, NOW()), updated_on = NOW()
+          SET status = ?, ended_on = COALESCE(ended_on, ?), updated_on = ?
         WHERE conference_id = ? AND status IN (?, ?, ?)`,
-      [status, conferenceId, ...ACTIVE_LEG_STATUSES],
+      [status, now, now, conferenceId, ...ACTIVE_LEG_STATUSES],
     );
     return (r && r.affectedRows) || 0;
   } catch (e) {
@@ -679,19 +688,12 @@ async function closeConferenceLegs(conferenceId, { status = LEG_STATUS.LEFT } = 
  * timeout, with their room's state alongside so the caller can tell "nobody
  * picked up" from "the room ended under them".
  *
- * ⚠ THE WINDOW IS `NOW() - INTERVAL ? SECOND`, AND THAT IS CORRECT HERE — the
- * opposite of the rule that applies to tbl_job_conference. The clock a
- * comparison must use is the clock the COLUMN was written in:
- *   • tbl_job_conference.created_on is written app-side (new Date() + the pool's
- *     +05:30 session timezone), i.e. the IST wall clock. NOW() is the DB
- *     server's zone, so comparing the two would skew by hours — that sweep must
- *     use an app-side Date, and it does.
- *   • tbl_plivo_call_log.initiated_on is written with SQL NOW() (this table's
- *     own convention since 2026-06-19). NOW()-relative arithmetic compares the
- *     server clock to itself and is exact by construction; handing it an IST
- *     Date would introduce the very skew the other rule exists to avoid.
- * Both sweeps are therefore zone-independent. Neither depends on the two tables
- * agreeing about what time it is.
+ * ⚠ THE CUTOFF IS AN APP-SIDE DATE, NOT `NOW() - INTERVAL ? SECOND`. The clock a
+ * comparison uses must be the clock the COLUMN was written in, and
+ * initiated_on is written app-side (new Date() + the pool's +05:30 timezone)
+ * since 2026-09-16 — it was SQL NOW() before, and this window was NOW()-relative
+ * to match. IST Date vs IST column is exact on any DB server zone; NOW() here
+ * would skew by the server's offset from IST.
  *
  * `pcl.conference_id IS NOT NULL` is redundant against the INNER JOIN and is
  * there for the OPTIMISER: tbl_plivo_call_log is a ~940k-row table and this
@@ -711,10 +713,10 @@ async function listStuckConferenceLegs({ olderThanSec, limit = 100 } = {}, db = 
          JOIN tbl_job_conference c ON c.id = pcl.conference_id
         WHERE pcl.conference_id IS NOT NULL
           AND pcl.status IN (?, ?)
-          AND pcl.initiated_on < NOW() - INTERVAL ? SECOND
+          AND pcl.initiated_on < ?
         ORDER BY pcl.id ASC
         LIMIT ?`,
-      [LEG_STATUS.DIALLING, LEG_STATUS.RINGING, secs, lim],
+      [LEG_STATUS.DIALLING, LEG_STATUS.RINGING, new Date(Date.now() - secs * 1000), lim],
     );
     return (rows || []).map(maskLeg);
   } catch (e) {
@@ -730,8 +732,8 @@ async function countStuckConferenceLegs({ olderThanSec } = {}, db = pool) {
   const [rows] = await db.query(
     `SELECT COUNT(*) AS n FROM tbl_plivo_call_log
       WHERE conference_id IS NOT NULL AND status IN (?, ?)
-        AND initiated_on < NOW() - INTERVAL ? SECOND`,
-    [LEG_STATUS.DIALLING, LEG_STATUS.RINGING, secs],
+        AND initiated_on < ?`,
+    [LEG_STATUS.DIALLING, LEG_STATUS.RINGING, new Date(Date.now() - secs * 1000)],
   );
   return Number(rows && rows[0] && rows[0].n) || 0;
 }

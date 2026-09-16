@@ -89,7 +89,18 @@ test('locks technician, then job, then latest offer and rejects exactly that row
   assert.match(latest.sql, /ORDER BY job_offer_id DESC\s+LIMIT 1\s+FOR UPDATE/i);
 
   const rejected = fake.calls[rejectWrite];
-  assert.deepEqual(rejected.params, ['Already booked', 7, 901, 30]);
+  assert.equal(rejected.params.length, 6);
+  assert.ok(rejected.params[2] instanceof Date, 'responded_at is bound as a Date, never SQL NOW()');
+  assert.ok(rejected.params[4] instanceof Date, 'the offered_at freshness comparison is bound as a Date, never SQL NOW()');
+  assert.equal(rejected.params[2].getTime(), rejected.params[4].getTime(), 'both bindings share the one respondedAt instant');
+  assert.deepEqual(
+    [rejected.params[0], rejected.params[1], rejected.params[3], rejected.params[5]],
+    ['Already booked', 7, 901, 30],
+  );
+  assert.match(rejected.sql, /responded_at = \?/);
+  assert.doesNotMatch(rejected.sql, /responded_at = NOW\(\)/);
+  assert.match(rejected.sql, /offered_at >= \? - INTERVAL \? MINUTE/, 'freshness comparison binds a Date, never SQL NOW()');
+  assert.doesNotMatch(rejected.sql, /offered_at >= NOW\(\)/);
   assert.match(rejected.sql, /WHERE job_offer_id = \?/i);
   assert.match(rejected.sql, new RegExp(`offer_status = ${OFFER_STATUS.OFFERED}\\b`));
   assert.doesNotMatch(rejected.sql, /WHERE job_id = \?/i,

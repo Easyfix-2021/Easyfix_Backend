@@ -283,8 +283,11 @@ test('autoRescheduleOnOpenIfLate — shifts a due appointment to TOMORROW and au
     // IST dates are computed in JS and bound as params — never CURDATE()/NOW(),
     // whose calendar day follows the DB server's timezone, not IST.
     assert.doesNotMatch(upd.sql, /CURDATE\(\)/, 'IST day must not come from the DB server clock');
-    const [tomorrow, , today] = upd.params;
+    assert.match(upd.sql, /last_update_time = \?/);
+    assert.doesNotMatch(upd.sql, /last_update_time = NOW\(\)/, 'last_update_time is a bound Date, never SQL NOW()');
+    const [tomorrow, lastUpdateTime, , today] = upd.params;
     assert.match(String(tomorrow), /^\d{4}-\d{2}-\d{2}$/, 'tomorrow bound as a bare IST date');
+    assert.ok(lastUpdateTime instanceof Date, 'last_update_time is bound as a Date');
     assert.match(String(today), /^\d{4}-\d{2}-\d{2}$/, 'today bound as a bare IST date');
     // The target is TODAY + 1 — derived from the current IST day, never from the
     // appointment. An appointment-relative shift would leave an old date in the past.

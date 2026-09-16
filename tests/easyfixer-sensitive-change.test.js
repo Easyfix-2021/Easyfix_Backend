@@ -413,6 +413,11 @@ test('a mobile change writes the new number and an audit row naming the operator
   const update = callsMatching(/UPDATE tbl_easyfixer SET efr_no/i)[0];
   assert.ok(update, 'the mobile UPDATE must have run');
   assert.equal(update.params[0], NEW_MOBILE);
+  // db.js pool binds a Date as the IST wall clock; SQL NOW() takes the DB
+  // session's own (SYSTEM) zone. tbl_easyfixer.update_date is TIMESTAMP,
+  // converted the same as a DATETIME column (2026-09-16).
+  assert.doesNotMatch(update.sql, /NOW\(\)/, 'update_date must not be SQL NOW()');
+  assert.ok(update.params[2] instanceof Date, 'update_date is the third bound value');
 
   const audit = callsMatching(/INSERT INTO tbl_easyfixer_sensitive_change_log/i)[0];
   assert.ok(audit, 'the audit row must have been written');

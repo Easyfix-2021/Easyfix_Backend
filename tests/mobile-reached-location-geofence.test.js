@@ -133,12 +133,14 @@ test('an arrival inside the fence is recorded as within_fence=1', async () => {
 
   const ins = trackInserts();
   assert.equal(ins.length, 1);
-  // [job_id, efr_id, lat, lng, accuracy, distance, within_fence, override]
+  // [job_id, efr_id, lat, lng, accuracy, captured_at, distance, within_fence, override]
   assert.equal(ins[0].params[0], JOB_ID);
   assert.equal(ins[0].params[1], EFR_ID);
-  assert.equal(ins[0].params[6], 1, 'within_fence = 1');
-  assert.equal(ins[0].params[7], null, 'no override reason');
-  assert.ok(ins[0].params[5] < 150, 'distance recorded and under the radius');
+  assert.ok(ins[0].params[5] instanceof Date, 'captured_at is bound as a Date, never SQL NOW()');
+  assert.doesNotMatch(ins[0].sql, /NOW\(\)/);
+  assert.equal(ins[0].params[7], 1, 'within_fence = 1');
+  assert.equal(ins[0].params[8], null, 'no override reason');
+  assert.ok(ins[0].params[6] < 150, 'distance recorded and under the radius');
   assert.equal(selfieUpdates().length, 1);
 });
 
@@ -149,7 +151,7 @@ test('the bare latitude/longitude the shipped app already sends is evaluated too
   assert.equal(r.ok, true, 'soft by default — never rejected');
   const ins = trackInserts();
   assert.equal(ins.length, 1);
-  assert.equal(ins[0].params[6], 0, 'evaluated as outside');
+  assert.equal(ins[0].params[7], 0, 'evaluated as outside');
 });
 
 test('an override reason is stored so ops can see who started from outside', async () => {
@@ -159,8 +161,8 @@ test('an override reason is stored so ops can see who started from outside', asy
   });
   assert.equal(r.ok, true, 'a reason is always enough to proceed');
   const ins = trackInserts();
-  assert.equal(ins[0].params[6], 0, 'within_fence = 0');
-  assert.equal(ins[0].params[7], 'Mall gate pass desk is across the road');
+  assert.equal(ins[0].params[7], 0, 'within_fence = 0');
+  assert.equal(ins[0].params[8], 'Mall gate pass desk is across the road');
 });
 
 // ── Enforcement ────────────────────────────────────────────────────────
@@ -169,7 +171,7 @@ test('SOFT by default: outside the fence with no reason still proceeds', async (
   const r = await reached({ geofence: { ...FAR, withinFence: false } });
   assert.equal(r.ok, true, 'nobody is stranded while enforcement is off');
   assert.equal(trackInserts().length, 1, 'but it IS recorded');
-  assert.equal(trackInserts()[0].params[6], 0);
+  assert.equal(trackInserts()[0].params[7], 0);
   assert.equal(selfieUpdates().length, 1);
 });
 
@@ -179,8 +181,8 @@ test('HARD mode: outside with no reason is 400, and the attempt is still audited
   assert.equal(r.status, 400);
   assert.match(r.message, /from the job location/i);
   assert.equal(trackInserts().length, 1, 'a blocked attempt must not be the one that leaves no trace');
-  assert.equal(trackInserts()[0].params[6], 0);
-  assert.equal(trackInserts()[0].params[7], null);
+  assert.equal(trackInserts()[0].params[7], 0);
+  assert.equal(trackInserts()[0].params[8], null);
   assert.equal(selfieUpdates().length, 0, 'and the job is NOT mutated');
 });
 
@@ -199,7 +201,7 @@ test('HARD mode never blocks a site that has no coordinates', async () => {
   siteGps = null;
   const r = await reached({ geofence: { ...FAR, withinFence: false } });
   assert.equal(r.ok, true, 'ops never captured a pin — that is not the technician\'s fault');
-  assert.equal(trackInserts()[0].params[6], null, 'within_fence NULL = not evaluated, not "outside"');
+  assert.equal(trackInserts()[0].params[7], null, 'within_fence NULL = not evaluated, not "outside"');
   assert.equal(selfieUpdates().length, 1);
 });
 
@@ -240,7 +242,9 @@ test('a host without the migration records the position and still succeeds', asy
     assert.deepEqual(out, { ok: true });
     const ins = trackInserts();
     assert.equal(ins.length, 1);
-    assert.equal(ins[0].params.length, 5, 'falls back to the six-column INSERT (5 bound params)');
+    assert.equal(ins[0].params.length, 6, 'falls back to the six-column INSERT (6 bound params)');
+    assert.ok(ins[0].params[5] instanceof Date, 'captured_at is bound as a Date, never SQL NOW()');
+    assert.doesNotMatch(ins[0].sql, /NOW\(\)/);
     assert.equal(selfieUpdates().length, 1);
   } finally {
     delete require.cache[require.resolve('../services/job-location.service')];

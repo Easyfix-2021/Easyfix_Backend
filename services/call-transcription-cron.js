@@ -77,8 +77,8 @@ async function runTranscriptionBackfill({ limit = 50, shouldStop = null } = {}) 
       const tx = await plivo.fetchTranscription({ recordingId: meta.recordingId });
       if (tx.ok && tx.text) {
         await pool.query(
-          "UPDATE tbl_plivo_call_log SET transcription = ?, transcription_status = 'completed', transcription_fetched_at = NOW() WHERE job_caller_info_id = ?",
-          [tx.text, r.id],
+          "UPDATE tbl_plivo_call_log SET transcription = ?, transcription_status = 'completed', transcription_fetched_at = ? WHERE job_caller_info_id = ?",
+          [tx.text, new Date(), r.id],
         );
         result.completed += 1;
       } else if (tx.ok) {
@@ -100,8 +100,8 @@ async function runTranscriptionBackfill({ limit = 50, shouldStop = null } = {}) 
           const created = await plivo.createTranscription({ recordingId: meta.recordingId });
           if (created.ok) {
             await pool.query(
-              "UPDATE tbl_plivo_call_log SET transcription_status = 'processing', transcription_fetched_at = NOW() WHERE job_caller_info_id = ?",
-              [r.id],
+              "UPDATE tbl_plivo_call_log SET transcription_status = 'processing', transcription_fetched_at = ? WHERE job_caller_info_id = ?",
+              [new Date(), r.id],
             );
             result.requested += 1;
           } else if (created.notEnabled) {

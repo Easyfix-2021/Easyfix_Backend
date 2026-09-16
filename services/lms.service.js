@@ -1809,8 +1809,8 @@ async function setVideoLink(videoId, rawUrl, actorUserId = null) {
 
   if (existingDoc) {
     await pool.query(
-      'UPDATE document SET url = ?, updated_by = ?, updated_on = NOW() WHERE id = ?',
-      [parsed.url, actorUserId, existingDoc.id],
+      'UPDATE document SET url = ?, updated_by = ?, updated_on = ? WHERE id = ?',
+      [parsed.url, actorUserId, new Date(), existingDoc.id],
     );
     logger.info('Training video link updated · id=' + id + ' · doc=' + existingDoc.id);
     return { video_url: parsed.url };
@@ -1818,8 +1818,8 @@ async function setVideoLink(videoId, rawUrl, actorUserId = null) {
 
   const [ins] = await pool.query(
     `INSERT INTO document (file_name, url, document_type_id, created_by, created_on)
-     VALUES (?, ?, 2, ?, NOW())`,
-    [`youtube:${parsed.id}`, parsed.url, actorUserId],
+     VALUES (?, ?, 2, ?, ?)`,
+    [`youtube:${parsed.id}`, parsed.url, actorUserId, new Date()],
   );
   await pool.query('UPDATE training_videos SET training_video_id = ? WHERE id = ?', [ins.insertId, id]);
   logger.info('Training video link created · id=' + id + ' · doc=' + ins.insertId);

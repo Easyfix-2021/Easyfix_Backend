@@ -62,12 +62,13 @@ router.post('/attendance', validate(Joi.object({
 })), async (req, res, next) => {
   try {
     logger.info('Mark attendance · easyfixerId=' + req.body.easyfixerId + ' · isLeaveMarked=' + req.body.isLeaveMarked);
+    const now = new Date();
     const [ins] = await pool.query(
       `INSERT INTO tbl_easyfixer_attendance
          (easyfixer_id, morning_slot, evening_slot, is_leave_marked, created_on, insert_date)
-       VALUES (?, ?, ?, ?, NOW(), NOW())`,
+       VALUES (?, ?, ?, ?, DATE(?), ?)`,
       [req.body.easyfixerId, req.body.morningSlot || null,
-       req.body.eveningSlot || null, req.body.isLeaveMarked]
+       req.body.eveningSlot || null, req.body.isLeaveMarked, now, now]
     );
     logger.info('Attendance created · id=' + ins.insertId);
     res.status(201);
@@ -475,11 +476,12 @@ router.post('/bulk-reassign', validate(Joi.object({
     let reassigned = 0;
     try {
       await conn.beginTransaction();
+      const now = new Date();
       for (let i = 0; i < jobs.length; i++) {
         const ownerId = req.body.userIds[i % req.body.userIds.length];
         await conn.query(
-          'UPDATE tbl_job SET job_owner = ?, last_update_time = NOW() WHERE job_id = ?',
-          [ownerId, jobs[i].job_id]
+          'UPDATE tbl_job SET job_owner = ?, last_update_time = ? WHERE job_id = ?',
+          [ownerId, now, jobs[i].job_id]
         );
         reassigned++;
       }

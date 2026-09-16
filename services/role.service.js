@@ -471,14 +471,17 @@ async function createRole({ role_name, role_desc, menu_ids, menu_action_ids, cre
     // LEGACY DB TYPO verified against live INFORMATION_SCHEMA 2026-05-12.
     // Preserve it verbatim — renaming the column requires a coordinated
     // migration across the 5 legacy services that also reference it.
+    const createNow = new Date();
     const [r] = await conn.query(
       `INSERT INTO tbl_role
          (role_name, role_desc, role_status, menu_ids, insert_date, update_date, updayted_by)
-       VALUES (?, ?, 1, ?, NOW(), NOW(), ?)`,
+       VALUES (?, ?, 1, ?, ?, ?, ?)`,
       [
         name,
         role_desc ? String(role_desc).trim() : null,
         toMenuIdsCsv(menu_ids),
+        createNow,
+        createNow,
         createdBy || null,
       ]
     );
@@ -552,7 +555,8 @@ async function updateRole(roleId, fields, updatedBy) {
       // legacy sp_ef_role_add_update_role which writes both even when only
       // a single field changed. updatedBy is the operator's user_id from
       // the route handler (req.user.user_id).
-      sets.push('update_date = NOW()', 'updayted_by = ?');
+      sets.push('update_date = ?', 'updayted_by = ?');
+      params.push(new Date());
       params.push(updatedBy || null);
       params.push(roleId);
       await conn.query(`UPDATE tbl_role SET ${sets.join(', ')} WHERE role_id = ?`, params);
@@ -561,8 +565,8 @@ async function updateRole(roleId, fields, updatedBy) {
       // stamp the audit fields. Otherwise an operator could rewrite a role's
       // entire permission set with no trace on tbl_role.
       await conn.query(
-        'UPDATE tbl_role SET update_date = NOW(), updayted_by = ? WHERE role_id = ?',
-        [updatedBy || null, roleId]
+        'UPDATE tbl_role SET update_date = ?, updayted_by = ? WHERE role_id = ?',
+        [new Date(), updatedBy || null, roleId]
       );
     }
     if (wantsActionUpdate) {
