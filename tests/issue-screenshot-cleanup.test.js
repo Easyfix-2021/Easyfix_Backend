@@ -123,7 +123,9 @@ test('with S3 unconfigured it deletes NOTHING — not even the rows', async () =
 test('an empty candidate set issues no delete at all', async () => {
   const runner = makeRunner([]);
   const r = await cron.sweep(runner);
-  assert.deepEqual(r, { eligible: 0, deleted: 0, failed: 0, rowsRemoved: 0 });
+  // dryRun rides on every sweep result since the Trigger-Now dry run was added,
+  // so the empty-set shape carries it too — false here, this being a real sweep.
+  assert.deepEqual(r, { eligible: 0, deleted: 0, failed: 0, rowsRemoved: 0, dryRun: false });
   assert.equal(deleted.length, 0);
   assert.ok(!runner.calls.some((c) => /DELETE FROM/.test(c.sql)));
 });
@@ -159,6 +161,71 @@ test('runCleanup short-circuits when disabled — no query, no delete', async ()
   } finally {
     props.getProperty = real;
   }
+});
+
+// ─── Dry run: Trigger Now on a disabled job ─────────────────────────────
+
+test('a MANUAL trigger while disabled is a DRY RUN — it reads, deletes nothing', async () => {
+  /*
+   * The owner asked to watch one dry run before switching this on. A Trigger
+   * Now that merely answered "skipped" would show nothing at all, so a manual
+   * trigger on a DISABLED job reports what it WOULD delete.
+   */
+  const props = require('../services/properties.service');
+  const real = props.getProperty;
+  props.getProperty = () => 'false';
+  const runner = makeRunner([IMG(1, 'Issues/a'), IMG(2, 'Issues/b')]);
+  try {
+    const r = await cron.sweep(runner, { dryRun: true });
+    assert.equal(r.dryRun, true);
+    assert.equal(r.eligible, 2, 'it must report the real candidate count');
+    assert.equal(r.deleted, 0);
+    assert.equal(r.rowsRemoved, 0);
+    assert.equal(deleted.length, 0, 'not one S3 object may be touched');
+    assert.ok(!runner.calls.some((c) => /DELETE FROM/.test(c.sql)), 'and not one row');
+  } finally {
+    props.getProperty = real;
+  }
+});
+
+test('the dry run returns BEFORE the first delete, not inside the loop', () => {
+  /*
+   * Structural, because it is the property that makes the dry run safe under
+   * every future edit: there is no interleaving in which a dryRun sweep can
+   * reach s3.deleteObject, because it has already returned.
+   */
+  const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'issue-screenshot-cleanup-cron.js'), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/^\s*\/\/.*$/gm, ' ');
+  const at = src.indexOf('async function sweep(');
+  const fn = src.slice(at, src.indexOf('\nasync function runCleanup', at));
+  const guardAt = fn.indexOf('if (dryRun)');
+  const deleteAt = fn.indexOf('s3.deleteObject');
+  assert.ok(guardAt > -1 && deleteAt > -1, 'positive control: both must be locatable');
+  assert.ok(guardAt < deleteAt, 'the dry-run return must precede the delete loop');
+});
+
+test('the CRON TICK stays a true no-op when disabled — it does not even read', async () => {
+  // A disabled job must not do work on a schedule, not even read work. Only an
+  // operator pressing Trigger Now gets the dry run.
+  const props = require('../services/properties.service');
+  const real = props.getProperty;
+  props.getProperty = () => 'false';
+  try {
+    const r = await cron.runCleanup();               // no { manual: true }
+    assert.equal(r.skipped, true);
+    assert.equal(r.dryRun, undefined, 'a scheduled tick is not a dry run');
+    assert.equal(deleted.length, 0);
+  } finally {
+    props.getProperty = real;
+  }
+});
+
+test('the scheduler passes the trigger kind, and the runner asks for it', () => {
+  const sched = fs.readFileSync(path.join(__dirname, '..', 'server', 'scheduler.js'), 'utf8');
+  // invokeJob must hand the kind down, or `manual` is always false and the dry
+  // run is unreachable from the UI.
+  assert.match(sched, /const result = await job\.runner\(kind\);/);
+  assert.match(sched, /runner: async \(kind\) => \{[\s\S]{0,400}?runCleanup\(\{ manual: kind === 'manual' \}\)/);
 });
 
 // ─── Registration + the seed ────────────────────────────────────────────
