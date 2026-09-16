@@ -2,6 +2,9 @@ const router = require('express').Router();
 
 const validate = require('../../middleware/validate');
 const job = require('../../services/job.service');
+// tbl_job_notes — the legacy free-text ops notepad, read+add only. Deliberately
+// separate from jobComments below: audit trail vs. operator-to-operator notes.
+const jobNotes = require('../../services/job-notes.service');
 const clientRequest = require('../../services/client-request.service');
 const candidateRanking = require('../../services/candidate-ranking.service');
 const jobLocation = require('../../services/job-location.service');
@@ -1583,12 +1586,17 @@ router.get('/:id/transaction', validate(idParam, 'params'), scopedJob, async (re
  * user_type=2 (Client) so older callers without the param still get a
  * sensible list (matches the comment-reasons default).
  *
- * ONE EXCEPTION, AND IT IS TEMPORARY: `?type=reschedule&dueTo=any` returns the
- * WHOLE action_type = 8 bucket with no user_type filter — the same rows, in the
- * same shape, as /reschedule-reasons. It exists only because those rows' seeded
- * user_types are known-wrong (see DUE_TO_ANY in services/reason-codes.js) and
- * goes away when they are corrected. `any` is NOT a general value: on every
- * other mode it is an unrecognised string and behaves exactly as one.
+ * `type=reschedule` serves action_type 29 ("Reschedule Before Start from CRM"),
+ * whose 16 rows cover all four parties — NOT action_type 8, which
+ * /reschedule-reasons below still serves unfiltered for the older dialog. The
+ * evidence for that split is in services/reason-codes.js.
+ *
+ * ONE EXCEPTION, AND IT IS TEMPORARY: `?type=reschedule&dueTo=any` returns that
+ * mode's WHOLE bucket with no user_type filter. It was added while the mode
+ * pointed at 8, whose rows all sit under one party; on 29 nothing needs it, and
+ * it is kept only so a CRM already calling it keeps working. See DUE_TO_ANY in
+ * services/reason-codes.js. `any` is NOT a general value: on every other mode
+ * it is an unrecognised string and behaves exactly as one.
  *
  * Route-order note: declared BEFORE `/:id` so Express doesn't try to
  * validate the literal string "action-reasons" as a numeric job id —
@@ -1659,12 +1667,16 @@ router.get('/action-reasons', async (req, res, next) => {
  * Reschedule dialog has a single reason dropdown (no "due to" Customer/Client/
  * EasyFix/Technician radio), so ALL active action_type=8 reasons are offered.
  *
- * ⚠ THE DUE-TO-FILTERED ANSWER NOW EXISTS, and it is not this endpoint.
- * `reschedule` was registered in ACTION_TYPE_BY_MODE (2026-09-16), so
+ * ⚠ THE DUE-TO-FILTERED ANSWER EXISTS, IT IS NOT THIS ENDPOINT, AND IT IS NOT
+ * EVEN THIS BUCKET.
  *     GET /action-reasons?type=reschedule&dueTo=<customer|client|easyfix|technician>
- * returns the same bucket narrowed to one party. A dialog that grows the radio
- * should move to that call; this one stays exactly as it is for the dialog that
- * has not, because narrowing it in place would silently shrink a live list.
+ * serves action_type 29, whose 16 rows cover all four parties correctly. This
+ * endpoint deliberately stays on action_type 8: its 7 rows all sit under
+ * user_type 1, so it can only ever be served unfiltered, and the Current tab's
+ * dialog calls it that way today. Repointing it at 29 would swap the list under
+ * a live screen; narrowing it in place would shrink that list to one party.
+ * Both buckets stand until the owner retires this one. See the `reschedule`
+ * note in services/reason-codes.js for the row-by-row evidence.
  *
  * Literal-segment route — declared before the `/:id` wildcard (same reason as
  * /action-reasons above, so Express doesn't try to parse "reschedule-reasons"
@@ -1922,8 +1934,14 @@ router.post('/:id/offer', validate(idParam, 'params'), validate(offerBody), scop
  * GET /api/admin/jobs/:id/offers
  *
  * Lists the technicians a job has been offered to (the "Offered to Tx" panel
- * on My Orders). Each item: { efr_id, efr_name, offered_at }. Returns an empty
- * list when the offer table is absent (service falls back to legacy behaviour).
+ * on My Orders), live + rejected + expired. Returns an empty list when the
+ * offer table is absent (service falls back to legacy behaviour).
+ *
+ * An EXPIRED row also carries `closed_reason` and `closed_reason_label` — WHY
+ * it closed, which the status cannot say on its own: eight code paths write
+ * EXPIRED and only one is the timeout. Both are null on an offer closed before
+ * the column existed, and the label is null for a token this deploy has no
+ * wording for. See listOffers + services/offer-closed-reason.js.
  *
  * Literal-segment route under `/:id/` — second segment "offers" disambiguates
  * it from `/:id` and from the sibling POST `/:id/offer`.
@@ -2746,6 +2764,74 @@ router.post('/:id/comments',
 // submit (after the status + comment writes). scopedJob ensures the job is in
 // the caller's scope. Non-fatal on the FE: a provider failure must not fail the
 // operator's outcome, so the FE wraps this call in try/catch.
+/*
+ * ─── INTERNAL JOB NOTES — GET/POST /api/admin/jobs/:id/notes ───────────────
+ *
+ * The legacy CRM's free-text ops notepad (tbl_job_notes), re-opened. READ AND
+ * ADD ONLY — no PATCH, no DELETE (the owner's call, and the only contract the
+ * table can honestly support: it has no updated_at, no status column and no
+ * author id to check an edit against). A note is a line in a log.
+ *
+ * NOT the comment thread. tbl_job_comment is the audited lifecycle trail —
+ * every row produced by an action, carrying that action's reason FK, mirrored
+ * onto tbl_job.remarks. These are operators writing to each other. See
+ * services/job-notes.service.js for why the two stay apart.
+ *
+ * GUARDED EXACTLY AS THE COMMENT ENDPOINTS ARE: the /api/admin/* chain
+ * (requireAuth → role(['admin']) → maskMobile → scope) plus `scopedJob`, which
+ * 404s a job outside the operator's client/city/vertical patch before either
+ * handler runs. No requireAction, for the same reason GET/POST /:id/comments
+ * has none — reading and appending narrative on a job you can already open is
+ * not a separately-granted capability in this CRM.
+ *
+ * Literal second segment "notes", so no collision with `/:id`.
+ */
+/*
+ * `notes` is the only field a caller supplies. Everything else on the row is
+ * derived server-side and deliberately NOT accepted: the author is the acting
+ * user (a body-supplied name is a forgeable byline on a table with no id to
+ * check it against), the stage is a snapshot of the job's own status, and the
+ * timestamp is the server's.
+ *
+ * `.trim()` before `.min(1)`, so a body of spaces is a 400 and not a blank row
+ * in the log. The 2000-char cap matches commentBody above rather than the
+ * column's TEXT ceiling: these are operator one-liners, the CRM renders them in
+ * a list, and an unbounded free-text field behind an authenticated POST is a
+ * storage-growth problem with no owner.
+ */
+const noteBody = Joi.object({
+  notes: Joi.string().trim().min(1).max(2000).required(),
+});
+
+router.get('/:id/notes', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
+  try {
+    const notes = await jobNotes.listNotes(req.params.id);
+    modernOk(res, notes);
+  } catch (e) { next(e); }
+});
+
+router.post('/:id/notes',
+  validate(idParam, 'params'),
+  validate(noteBody),
+  scopedJob,
+  async (req, res, next) => {
+    try {
+      /*
+       * req.scopedJob is the row the guard already fetched — the note's stage
+       * snapshot comes off it, so recording "where this job sat when the note
+       * was written" costs no second read. req.user supplies the author NAME
+       * (the column holds names, not ids); a body-supplied author would be an
+       * attribution anyone could forge.
+       */
+      const created = await jobNotes.addNote(req.params.id, req.body, req.scopedJob, req.user);
+      res.status(201);
+      modernOk(res, created, 'Note added');
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  });
+
 router.post('/:id/notify-unreachable', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
   try {
     logger.info('Notify customer unreachable · jobId=' + req.params.id);

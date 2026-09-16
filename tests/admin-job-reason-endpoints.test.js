@@ -10,16 +10,23 @@
  *   lands on the job. So what is pinned is WHICH ROWS EACH CALL ASKS FOR:
  *   the action_type bucket, and whether a user_type filter is applied at all.
  *
- * THE `dueTo=any` WORKAROUND, which is most of this file.
- *   The six seeded action_type = 8 rows carry user_type values written against
- *   the mapping DUE_TO_USER_TYPE later disproved (services/reason-codes.js has
- *   the dates), so `dueTo=customer` is legitimately EMPTY on today's data and
- *   the CRM needs the unfiltered bucket through the same endpoint shape. That
- *   escape hatch has to be SCOPED: handed to every mode it would let a due-to
- *   radio send no party at all on Cancel / Add Remarks / Enquiry / Un
- *   Reachable, whose per-party data is correct. Both halves are pinned — it
- *   works for reschedule, and it is still an ordinary unknown value everywhere
- *   else.
+ * THE TWO RESCHEDULE BUCKETS, which is most of this file.
+ *   `?type=reschedule` serves action_type 29 ("Reschedule Before Start from
+ *   CRM"), whose 16 rows cover all four parties. /reschedule-reasons serves
+ *   action_type 8, whose 7 rows all sit under user_type 1 and can therefore
+ *   only be served unfiltered. Two endpoints, two buckets, on purpose — and
+ *   the pair is pinned because the obvious "tidy-up" is to collapse them,
+ *   which would either swap the list under the live dialog or shrink it to one
+ *   party.
+ *
+ * THE `dueTo=any` WORKAROUND.
+ *   Added while the mode still pointed at 8, where every party but EasyFix
+ *   returned an empty list. On 29 nothing needs it; it stays so a CRM already
+ *   calling it keeps working. It has to be SCOPED: handed to every mode it
+ *   would let a due-to radio send no party at all on Cancel / Add Remarks /
+ *   Enquiry / Un Reachable, whose per-party data is correct. Both halves are
+ *   pinned — it works for reschedule, and it is still an ordinary unknown
+ *   value everywhere else.
  *
  * NO DB: the fake-pool seam answers the reads. Runner: `node --test`.
  */
@@ -79,18 +86,26 @@ const reasonQuery = () => fake.calls.find((c) => /FROM action_taken_reason/i.tes
 
 /* ── The reschedule mode exists at all ───────────────────────────────────── */
 
-test('reschedule is a registered mode, mapped to the seeded action_type 8 bucket', () => {
-  assert.equal(ACTION_TYPE_BY_MODE.reschedule, 8);
+test('reschedule serves bucket 29 — the one with all four parties, not 8', () => {
+  /*
+   * The whole reason the mode moved. Profiled on QA 2026-09-16: bucket 8 holds
+   * 7 rows ALL at user_type 1, so three of four parties would answer empty and
+   * two customer-worded rows would be served as EasyFix. Bucket 29 holds 16
+   * rows across all four. A silent revert to 8 looks like nothing on screen
+   * until an operator picks the radio and gets a blank dropdown.
+   */
+  assert.equal(ACTION_TYPE_BY_MODE.reschedule, 29);
+  assert.notEqual(ACTION_TYPE_BY_MODE.reschedule, 8, 'bucket 8 cannot answer a due-to radio');
 });
 
-test('?type=reschedule&dueTo=<party> is action_type 8 narrowed by that party', async () => {
+test('?type=reschedule&dueTo=<party> is action_type 29 narrowed by that party', async () => {
   for (const [party, userType] of Object.entries(DUE_TO_USER_TYPE)) {
     fake.calls.length = 0;
     const r = await get(`/jobs/action-reasons?type=reschedule&dueTo=${party}`);
     assert.equal(r.status, 200);
     const q = reasonQuery();
     assert.match(q.sql, /action_type = \? AND user_type = \?/, `${party} must stay party-filtered`);
-    assert.deepEqual(q.params, [8, userType], `${party} → user_type ${userType}`);
+    assert.deepEqual(q.params, [29, userType], `${party} → user_type ${userType}`);
   }
 });
 
@@ -101,24 +116,31 @@ test('?type=reschedule&dueTo=any drops the user_type filter entirely', async () 
   assert.equal(r.status, 200);
   const q = reasonQuery();
   assert.doesNotMatch(q.sql, /user_type/, 'no party predicate may be emitted');
-  assert.deepEqual(q.params, [8], 'and no party param may be bound');
+  assert.deepEqual(q.params, [29], 'and no party param may be bound');
   assert.match(q.sql, /\(status IS NULL OR status = 1\)/, 'still active rows only');
 });
 
-test('dueTo=any returns the SAME rows, in the same shape, as /reschedule-reasons', async () => {
-  // The CRM falls back from an empty party list to this call, so the two must
-  // be interchangeable: same bucket, same active filter, same { id, label }.
+test('dueTo=any and /reschedule-reasons are the same QUESTION of two DIFFERENT buckets', async () => {
+  /*
+   * Both ask "every active reason in this bucket" and both render the same
+   * { id, label } shape — so the statement is identical but for the bucket it
+   * binds. That is the split, stated as an assertion: the new dialog's
+   * unfiltered fallback reads 29, the old dialog's only list reads 8, and
+   * collapsing them would swap one screen's contents for the other's.
+   */
   const any = await get('/jobs/action-reasons?type=reschedule&dueTo=any');
   const anySql = reasonQuery().sql.replace(/\s+/g, ' ').trim();
   const anyParams = reasonQuery().params;
   fake.calls.length = 0;
   const legacy = await get('/jobs/reschedule-reasons');
   const legacySql = reasonQuery().sql.replace(/\s+/g, ' ').trim();
+  const legacyParams = reasonQuery().params;
 
-  assert.equal(anySql, legacySql, 'the two must issue the identical statement');
-  assert.deepEqual(anyParams, reasonQuery().params);
-  assert.deepEqual(any.body, legacy.body, 'and return the identical payload');
-  // The shape the CRM renders, including the trim the fixture row needs.
+  assert.equal(anySql, legacySql, 'same statement shape — bucket in, active rows out, ordered by id');
+  assert.deepEqual(anyParams, [29], 'the new dialog reads the four-party bucket');
+  assert.deepEqual(legacyParams, [8], 'the old dialog keeps the single-party one');
+  // Same payload SHAPE from both, including the trim the fixture row needs.
+  assert.deepEqual(any.body.data, legacy.body.data);
   assert.deepEqual(any.body.data, [{ id: 501, label: 'Customer requested a different date/time' }]);
 });
 
@@ -126,7 +148,7 @@ test('dueTo=any is case- and space-insensitive like every other dueTo', async ()
   for (const spelling of ['ANY', ' any ', 'Any']) {
     fake.calls.length = 0;
     await get(`/jobs/action-reasons?type=reschedule&dueTo=${encodeURIComponent(spelling)}`);
-    assert.deepEqual(reasonQuery().params, [8], `${JSON.stringify(spelling)} must be the unfiltered read`);
+    assert.deepEqual(reasonQuery().params, [29], `${JSON.stringify(spelling)} must be the unfiltered read`);
   }
 });
 
@@ -167,7 +189,13 @@ test('only reschedule opts in — the list is not quietly growing', () => {
 
 /* ── The surrounding contract stays as it was ────────────────────────────── */
 
-test('/reschedule-reasons is unchanged: action_type 8, no party filter', async () => {
+test('/reschedule-reasons stays on action_type 8, unfiltered', async () => {
+  /*
+   * It serves the Current tab's dialog, which has one dropdown and no radio.
+   * Repointing it at 29 would swap that list under a live screen; narrowing it
+   * by party would shrink it to the EasyFix rows, since all 7 sit there. It
+   * moves when the owner retires it, not as a side effect of the new dialog.
+   */
   const r = await get('/jobs/reschedule-reasons');
   assert.equal(r.status, 200);
   const q = reasonQuery();
