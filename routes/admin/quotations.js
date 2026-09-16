@@ -316,13 +316,16 @@ router.get('/expiry/:jobId', async (req, res, next) => {
 router.get('/expired', async (req, res, next) => {
   try {
     logger.info('List expired pending estimates');
+    const now = new Date();
     const clauses = [
       'j.approval_sent_on_date_time IS NOT NULL',
       'j.approved_on_date_time IS NULL',
       'j.approval_reject_date_time IS NULL',
-      'TIMESTAMPDIFF(HOUR, j.approval_sent_on_date_time, NOW()) > 48',
+      'TIMESTAMPDIFF(HOUR, j.approval_sent_on_date_time, ?) > 48',
     ];
-    const params = [];
+    // The SELECT projection below repeats the same TIMESTAMPDIFF and comes
+    // first in the final query text, so its `now` param is pushed first.
+    const params = [now, now];
     // RBAC scope
     const scope = buildRequestScope(req);
     if (scope) {
@@ -339,7 +342,7 @@ router.get('/expired', async (req, res, next) => {
     const [rows] = await pool.query(
       `SELECT j.job_id, j.job_reference_id, j.fk_client_id, c.client_name,
               j.approval_sent_on_date_time, j.no_of_req_approval,
-              TIMESTAMPDIFF(HOUR, j.approval_sent_on_date_time, NOW()) AS hours_elapsed
+              TIMESTAMPDIFF(HOUR, j.approval_sent_on_date_time, ?) AS hours_elapsed
          FROM tbl_job j
          LEFT JOIN tbl_client c ON c.client_id = j.fk_client_id
         WHERE ${clauses.join(' AND ')}

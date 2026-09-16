@@ -151,6 +151,41 @@ test('returns the existing 409 message plus machine code and Retry-After for a l
   assert.equal(headers['retry-after'], '37');
 });
 
+test('computes retry_after_seconds against a bound Date, never SQL NOW()', async () => {
+  const req = request({ 'idempotency-key': 'select-now-1' });
+  let selectCall;
+  const database = {
+    async query(sql, params) {
+      if (/^\s*INSERT INTO tbl_idempotency_key/i.test(sql)) throw duplicateError();
+      if (/^\s*SELECT request_fingerprint/i.test(sql)) {
+        selectCall = { sql: String(sql), params };
+        return [[{
+          request_fingerprint: idempotency._internals.requestFingerprint(req, ''),
+          state: 'in_flight',
+          response_status: null,
+          response_json: null,
+          retry_after_seconds: 12,
+        }], []];
+      }
+      throw new Error(`unexpected SQL: ${sql}`);
+    },
+  };
+  const { res, delivered } = response();
+
+  await idempotency({ database })(req, res, () => assert.fail('busy lease must not reach handler'));
+  await delivered;
+
+  assert.ok(selectCall, 'expected the retry_after_seconds SELECT to run');
+  // lease_expires_at is app-written; created_at (legacy pre-lease fallback)
+  // stays on the DB clock, but GREATEST()'s NOW() operand is bound anyway.
+  assert.doesNotMatch(selectCall.sql, /TIMESTAMPDIFF\(\s*SECOND,\s*NOW\(\)/i);
+  assert.match(selectCall.sql, /TIMESTAMPDIFF\(\s*SECOND,\s*\?/i);
+  assert.equal(selectCall.params.length, 4);
+  assert.ok(selectCall.params[0] instanceof Date, 'TIMESTAMPDIFF must compare against a bound Date');
+  assert.ok(Math.abs(Date.now() - selectCall.params[0].getTime()) < 60000);
+  assert.deepEqual(selectCall.params.slice(1), ['efr', '8379', 'select-now-1']);
+});
+
 test('rejects same-key different-request reuse with the existing message and a machine code', async () => {
   const database = {
     async query(sql) {
@@ -219,6 +254,14 @@ test('atomically reclaims an expired lease and completes under a new owner token
   assert.ok(reclaim.params[4] instanceof Date, 'lease_expires_at must be a bound Date');
   assert.ok(reclaim.params[5] instanceof Date, 'expires_at must be a bound Date');
   assert.equal(reclaim.params[4].getTime(), reclaim.params[5].getTime());
+  // The reclaim guard's trailing `<= NOW()` must also be a bound Date now —
+  // created_at (the legacy pre-lease fallback) stays on the DB clock, but the
+  // comparator itself is app-side, sharing the same reclaimNow reading.
+  assert.doesNotMatch(reclaim.sql, /\)\s*<=\s*NOW\(\)/i);
+  assert.match(reclaim.sql, /\)\s*<=\s*\?\s*$/i);
+  assert.equal(reclaim.params.length, 10);
+  assert.ok(reclaim.params[9] instanceof Date, 'the reclaim guard compares against a bound Date');
+  assert.equal(reclaim.params[9].getTime(), reclaim.params[4].getTime(), 'same clock read as the lease renewal');
 });
 
 test('releases a 5xx reservation and never stores it as done', async () => {

@@ -666,12 +666,14 @@ function renderBudgetAlertHtml({
  */
 async function resetOrphanedPendingImageGens() {
   logger.info('Resetting orphaned pending deep-skill image generations');
+  const now = new Date();
   const [result] = await pool.query(
     `UPDATE tbl_deep_skill
         SET image_gen_status = 'failed'
       WHERE image_gen_status = 'pending'
         AND image_gen_attempted_at IS NOT NULL
-        AND image_gen_attempted_at < (NOW() - INTERVAL 10 MINUTE)`,
+        AND image_gen_attempted_at < (? - INTERVAL 10 MINUTE)`,
+    [now],
   );
   const count = result?.affectedRows || 0;
   if (count > 0) {

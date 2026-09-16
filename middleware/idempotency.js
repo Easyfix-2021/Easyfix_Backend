@@ -260,13 +260,18 @@ function idempotency({ resolveActor = defaultResolveActor, database = pool } = {
       if (error?.code !== 'ER_DUP_ENTRY') return next(error);
 
       try {
+        // NOW() reads lease_expires_at (an app-bound Date). created_at stays a
+        // DB-default TIMESTAMP used only as the legacy pre-lease fallback, so
+        // its DATE_ADD is left on the DB clock; the comparator itself is bound
+        // anyway to keep GREATEST()'s NOW() operand off the DB session zone.
+        const now = new Date();
         const [[existing]] = await database.query(
           `SELECT request_fingerprint, state, response_status, response_json,
                   GREATEST(
                     0,
                     TIMESTAMPDIFF(
                       SECOND,
-                      NOW(),
+                      ?,
                       COALESCE(
                         lease_expires_at,
                         DATE_ADD(created_at, INTERVAL ${LEGACY_LEASE_GRACE_MINUTES} MINUTE)
@@ -276,7 +281,7 @@ function idempotency({ resolveActor = defaultResolveActor, database = pool } = {
              FROM tbl_idempotency_key
             WHERE actor_type = ? AND actor_id = ? AND idempotency_key = ?
             LIMIT 1`,
-          [owner.actorType, owner.actorId, owner.key],
+          [now, owner.actorType, owner.actorId, owner.key],
         );
 
         if (!existing) {
@@ -319,7 +324,7 @@ function idempotency({ resolveActor = defaultResolveActor, database = pool } = {
                 AND COALESCE(
                       lease_expires_at,
                       DATE_ADD(created_at, INTERVAL ${LEGACY_LEASE_GRACE_MINUTES} MINUTE)
-                    ) <= NOW()`,
+                    ) <= ?`,
             [
               req.method,
               path.slice(0, 512),
@@ -330,6 +335,7 @@ function idempotency({ resolveActor = defaultResolveActor, database = pool } = {
               owner.actorType,
               owner.actorId,
               owner.key,
+              reclaimNow,
             ],
           );
           ownsReservation = Number(reclaimed.affectedRows) === 1;
