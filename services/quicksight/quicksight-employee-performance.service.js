@@ -27,7 +27,10 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { promisify } = require('node:util');
 const zlib = require('node:zlib');
+
+const gunzip = promisify(zlib.gunzip);
 
 const s3 = require('../../utils/s3-storage');
 const logger = require('../../logger');
@@ -158,6 +161,58 @@ async function readObject(name) {
   }
 }
 
+// ─── parsed-snapshot cache ──────────────────────────────────────────────
+
+/*
+ * The native Employee tab asks for options, summary, open jobs, technicians and
+ * member detail, each over the whole D (~6.5 MB of JSON, tens of MB parsed).
+ * Inflating and parsing that per request would dominate every call, so the
+ * parsed object is kept — ONE entry, keyed on meta.uploadedAt.
+ *
+ * meta.json is still read on every call and is what decides: a different
+ * uploadedAt (a newer upload, from this instance or another one sharing S3)
+ * replaces the entry. Concurrent first requests share one load. `generation`
+ * moves on every saveSnapshot, so a load that started before an upload can
+ * never overwrite the entry that upload primed.
+ *
+ * The cached object is shared by every request: callers must treat it as
+ * read-only (aggregate.js never mutates D).
+ */
+let snapshotCache = null;   // { uploadedAt, data }
+let snapshotLoad = null;    // { uploadedAt, generation, promise }
+let generation = 0;
+
+async function loadSnapshotData() {
+  const gz = await readObject(DATA_NAME);
+  if (!gz) return null;
+  const raw = await gunzip(gz, { maxOutputLength: MAX_INFLATED_BYTES });
+  return JSON.parse(raw.toString('utf8'));
+}
+
+// The stored dashboard data object D, or null when nothing is uploaded.
+async function getSnapshotD() {
+  const meta = await getMeta();
+  if (!meta) return null;
+  const { uploadedAt } = meta;
+
+  if (snapshotCache && snapshotCache.uploadedAt === uploadedAt) return snapshotCache.data;
+  if (snapshotLoad && snapshotLoad.uploadedAt === uploadedAt && snapshotLoad.generation === generation) {
+    return snapshotLoad.promise;
+  }
+
+  const startedAt = generation;
+  const promise = loadSnapshotData();
+  const load = { uploadedAt, generation: startedAt, promise };
+  snapshotLoad = load;
+  try {
+    const data = await promise;
+    if (data && generation === startedAt) snapshotCache = { uploadedAt, data };
+    return data;
+  } finally {
+    if (snapshotLoad === load) snapshotLoad = null;
+  }
+}
+
 // ─── public API ─────────────────────────────────────────────────────────
 
 async function saveSnapshot({ buffer, originalName, user }) {
@@ -167,6 +222,11 @@ async function saveSnapshot({ buffer, originalName, user }) {
   if (!s3.isEnabled()) {
     logger.warn('Employee Performance snapshot stored on local disk (S3 disabled) — it will not survive a redeploy', { dir: localDir() });
   }
+
+  // From here the stored data may no longer match the cached entry.
+  generation += 1;
+  snapshotCache = null;
+  snapshotLoad = null;
 
   await writeObject(DATA_NAME, zlib.gzipSync(json), 'application/gzip');
 
@@ -178,6 +238,10 @@ async function saveSnapshot({ buffer, originalName, user }) {
     sizeBytes: Buffer.byteLength(json),
   };
   await writeObject(META_NAME, Buffer.from(JSON.stringify(meta)), 'application/json');
+  // Prime: `data` is exactly what the stored JSON parses back to (it came from
+  // JSON.parse, and toScriptSafeJson's escape of '<' parses back to '<').
+  generation += 1;
+  snapshotCache = { uploadedAt: meta.uploadedAt, data };
   return meta;
 }
 
@@ -236,6 +300,7 @@ module.exports = {
   saveSnapshot,
   getMeta,
   getDashboardHtml,
+  getSnapshotD,
   READY_MESSAGE,
   _internals: { toScriptSafeJson, dashboardTemplate, DATA_HOOK },
 };
