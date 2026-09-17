@@ -226,7 +226,15 @@ test('reject · retires the city to 0 and records merged_into_city_id, in the SA
   assert.match(retire[0].sql, /city_status = \?/);
   assert.match(retire[0].sql, /approval_decision = 'rejected'/);
   assert.match(retire[0].sql, /merged_into_city_id = \?/);
-  assert.deepEqual(retire[0].params, [0, 42, 900, 500]);
+  // approved_at (2026-09-16): a bound Date, never SQL NOW() — see
+  // services/city.service.js::rejectCity.
+  assert.doesNotMatch(retire[0].sql, /NOW\(\)/);
+  const rp = retire[0].params;
+  assert.equal(rp[0], 0);
+  assert.equal(rp[1], 42);
+  assert.ok(rp[2] instanceof Date, 'approved_at is the third bound value');
+  assert.equal(rp[3], 900);
+  assert.equal(rp[4], 500);
 
   assert.equal(L.begins, 1, 'one transaction');
   assert.equal(L.commits, 1);

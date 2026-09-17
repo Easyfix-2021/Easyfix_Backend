@@ -32,8 +32,8 @@ async function createCanonicalTechnicianUser(mobile, runner) {
   const [result] = await runner.query(
     `INSERT INTO tbl_user
        (mobile_no, user_role, is_personal_detail_filled, user_status, insert_date)
-     VALUES (?, ?, 0, 0, NOW())`,
-    [normalizedMobile, TECH_ROLE_ID],
+     VALUES (?, ?, 0, 0, ?)`,
+    [normalizedMobile, TECH_ROLE_ID, new Date()],
   );
   const userId = Number(result?.insertId);
   if (!Number.isInteger(userId) || userId <= 0) {

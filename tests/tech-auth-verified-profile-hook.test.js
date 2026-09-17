@@ -72,7 +72,10 @@ test('conditional consume denies a second verifier when another request already 
   const consume = fake.calls.find((call) => OTP_CONSUME.test(call.sql));
   assert.ok(consume);
   assert.match(consume.sql, /is_expired = 0/i);
-  assert.match(consume.sql, /valid_up_to >= NOW\(\)/i);
+  // Clock rule: the column is written with a bound Date, so the comparison
+  // binds one too rather than reading SQL NOW() (see tech-auth.service.js).
+  assert.match(consume.sql, /valid_up_to >= \?/i);
+  assert.ok(consume.params[consume.params.length - 1] instanceof Date);
 });
 
 test('new-technician onboarding reuses a caller-pinned connection', async () => {

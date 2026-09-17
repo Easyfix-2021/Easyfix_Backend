@@ -16,8 +16,8 @@ const { getProperty } = require('./properties.service');
 /*
  * Append one GPS ping for a job. Ownership (the job belongs to efrId) is
  * verified by the caller (routes/mobile/jobs-lifecycle.js via the lifecycle
- * service's getOwnedJob) BEFORE this runs. captured_at = server NOW()
- * (Asia/Kolkata) per the platform's "store DATETIME, display IST" convention —
+ * service's getOwnedJob) BEFORE this runs. captured_at = a bound new Date()
+ * (IST via the pool) per the platform's "store DATETIME, display IST" convention —
  * the pings are frequent enough that receipt time ≈ fix time for a live map,
  * and not trusting a client timestamp avoids tampering + the IST-parse trap.
  */
@@ -44,9 +44,9 @@ async function addPing(jobId, efrId, { latitude, longitude, accuracy, geofence }
       `INSERT INTO tbl_job_location_track
          (job_id, efr_id, latitude, longitude, accuracy, captured_at,
           distance_meters, within_fence, override_reason)
-       VALUES (?, ?, ?, ?, ?, NOW(), ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        jobId, efrId, latitude, longitude, accuracy == null ? null : accuracy,
+        jobId, efrId, latitude, longitude, accuracy == null ? null : accuracy, new Date(),
         g.distanceMeters == null ? null : Number(g.distanceMeters),
         // Tri-state on purpose: NULL = not evaluated (no site coordinates),
         // which is NOT the same as 0 = evaluated and outside. Collapsing the
@@ -66,8 +66,8 @@ async function addPing(jobId, efrId, { latitude, longitude, accuracy, geofence }
   }
   await pool.query(
     `INSERT INTO tbl_job_location_track (job_id, efr_id, latitude, longitude, accuracy, captured_at)
-     VALUES (?, ?, ?, ?, ?, NOW())`,
-    [jobId, efrId, latitude, longitude, accuracy == null ? null : accuracy],
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [jobId, efrId, latitude, longitude, accuracy == null ? null : accuracy, new Date()],
   );
   return { ok: true };
 }

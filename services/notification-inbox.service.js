@@ -11,8 +11,8 @@ async function create({ userId, jobId, title, desc, notifyTo }) {
   logger.info('Create inbox notification · userId=' + userId + ' jobId=' + (jobId || '-') + ' title=' + title);
   const [r] = await pool.query(
     `INSERT INTO dashboard_notification_log (user_id, job_id, n_title, n_desc, n_to, status, createdAt)
-     VALUES (?, ?, ?, ?, ?, 'unread', NOW())`,
-    [userId, jobId || null, title, desc || null, notifyTo || null]);
+     VALUES (?, ?, ?, ?, ?, 'unread', ?)`,
+    [userId, jobId || null, title, desc || null, notifyTo || null, new Date()]);
   logger.info('Inbox notification created · id=' + r.insertId);
   return r.insertId;
 }
@@ -47,15 +47,15 @@ async function listByJob(jobId) {
 
 async function markRead(id) {
   logger.info('Mark notification read · id=' + id);
-  await pool.query(`UPDATE dashboard_notification_log SET status = 'read', updateAt = NOW() WHERE id = ?`, [id]);
+  await pool.query(`UPDATE dashboard_notification_log SET status = 'read', updateAt = ? WHERE id = ?`, [new Date(), id]);
   logger.info('Notification updated · id=' + id);
 }
 
 async function markAllRead(userId) {
   logger.info('Mark all notifications read · userId=' + userId);
   await pool.query(
-    `UPDATE dashboard_notification_log SET status = 'read', updateAt = NOW() WHERE user_id = ? AND status = 'unread'`,
-    [userId]);
+    `UPDATE dashboard_notification_log SET status = 'read', updateAt = ? WHERE user_id = ? AND status = 'unread'`,
+    [new Date(), userId]);
   logger.info('Notifications marked read · userId=' + userId);
 }
 

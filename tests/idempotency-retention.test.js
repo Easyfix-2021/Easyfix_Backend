@@ -15,9 +15,13 @@ test('deletes one expiry-indexed bounded batch', async () => {
   const result = await retention.deleteExpired({ limit: 250, database });
   assert.deepEqual(result, { deleted: 73, limit: 250 });
   assert.equal(calls.length, 1);
-  assert.match(calls[0].sql, /WHERE expires_at <= NOW\(\)/i);
+  assert.doesNotMatch(calls[0].sql, /NOW\(\)/i, 'expires_at is a bound Date, never SQL NOW()');
+  assert.match(calls[0].sql, /WHERE expires_at <= \?/i);
   assert.match(calls[0].sql, /ORDER BY expires_at ASC\s+LIMIT \?/i);
-  assert.deepEqual(calls[0].params, [250]);
+  assert.equal(calls[0].params.length, 2);
+  assert.ok(calls[0].params[0] instanceof Date, 'expires_at must be compared against a bound Date');
+  assert.ok(Math.abs(Date.now() - calls[0].params[0].getTime()) < 60000);
+  assert.equal(calls[0].params[1], 250);
 });
 
 test('caps an excessive retention batch at the hard maximum', async () => {
@@ -31,7 +35,9 @@ test('caps an excessive retention batch at the hard maximum', async () => {
 
   const result = await retention.deleteExpired({ limit: 999999, database });
   assert.equal(result.limit, retention.MAX_BATCH_SIZE);
-  assert.deepEqual(params, [retention.MAX_BATCH_SIZE]);
+  assert.equal(params.length, 2);
+  assert.ok(params[0] instanceof Date);
+  assert.equal(params[1], retention.MAX_BATCH_SIZE);
 });
 
 test('scheduled cleanup is single-owner across backend replicas', async () => {
@@ -64,7 +70,7 @@ test('scheduled cleanup is single-owner across backend replicas', async () => {
 test('drains full batches only up to the per-run row budget', async () => {
   let deletes = 0;
   const database = {
-    async query(_sql, [limit]) {
+    async query(_sql, [, limit]) {
       deletes += 1;
       return [{ affectedRows: limit }, []];
     },

@@ -18,12 +18,13 @@ async function deleteExpired({ limit = DEFAULT_BATCH_SIZE, database = pool } = {
   const boundedLimit = Number.isFinite(parsed)
     ? Math.min(Math.max(Math.trunc(parsed), 1), MAX_BATCH_SIZE)
     : DEFAULT_BATCH_SIZE;
+  const now = new Date();
   const [result] = await database.query(
     `DELETE FROM tbl_idempotency_key
-      WHERE expires_at <= NOW()
+      WHERE expires_at <= ?
       ORDER BY expires_at ASC
       LIMIT ?`,
-    [boundedLimit],
+    [now, boundedLimit],
   );
   const deleted = Number(result.affectedRows) || 0;
   return { deleted, limit: boundedLimit };

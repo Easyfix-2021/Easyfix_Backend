@@ -68,13 +68,14 @@ async function releaseReservation(database, owner) {
 }
 
 async function renewReservationLease(database, owner) {
+  const now = new Date();
   const [updated] = await database.query(
     `UPDATE tbl_idempotency_key
-        SET lease_expires_at = DATE_ADD(NOW(), INTERVAL ${LEASE_MINUTES} MINUTE),
-            expires_at = DATE_ADD(NOW(), INTERVAL ${RETENTION_DAYS} DAY)
+        SET lease_expires_at = DATE_ADD(?, INTERVAL ${LEASE_MINUTES} MINUTE),
+            expires_at = DATE_ADD(?, INTERVAL ${RETENTION_DAYS} DAY)
       WHERE actor_type = ? AND actor_id = ? AND idempotency_key = ?
         AND state = 'in_flight' AND lease_token = ?`,
-    [owner.actorType, owner.actorId, owner.key, owner.leaseToken],
+    [now, now, owner.actorType, owner.actorId, owner.key, owner.leaseToken],
   );
   return Number(updated.affectedRows) === 1;
 }
@@ -143,15 +144,16 @@ function captureJsonResponse({ database, res, next, owner, stopLeaseRenewal }) {
         throw error;
       }
 
+      const now = new Date();
       const [updated] = await database.query(
         `UPDATE tbl_idempotency_key
             SET response_status = ?, response_json = ?, state = 'done',
-                completed_at = NOW(), lease_token = NULL,
+                completed_at = ?, lease_token = NULL,
                 lease_expires_at = NULL,
-                expires_at = DATE_ADD(NOW(), INTERVAL ${RETENTION_DAYS} DAY)
+                expires_at = DATE_ADD(?, INTERVAL ${RETENTION_DAYS} DAY)
           WHERE actor_type = ? AND actor_id = ? AND idempotency_key = ?
             AND state = 'in_flight' AND lease_token = ?`,
-        [status, responseJson, owner.actorType, owner.actorId, owner.key, owner.leaseToken],
+        [status, responseJson, now, now, owner.actorType, owner.actorId, owner.key, owner.leaseToken],
       );
       if (Number(updated.affectedRows) !== 1) {
         const error = new Error('idempotency lease was lost before the response could be persisted');
@@ -227,23 +229,28 @@ function idempotency({ resolveActor = defaultResolveActor, database = pool } = {
       leaseToken: crypto.randomUUID(),
     };
 
-    const insertReservation = () => database.query(
-      `INSERT INTO tbl_idempotency_key
-         (actor_type, actor_id, idempotency_key, method, path,
-          request_fingerprint, state, lease_token, lease_expires_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'in_flight', ?,
-               DATE_ADD(NOW(), INTERVAL ${LEASE_MINUTES} MINUTE),
-               DATE_ADD(NOW(), INTERVAL ${RETENTION_DAYS} DAY))`,
-      [
-        owner.actorType,
-        owner.actorId,
-        owner.key,
-        req.method,
-        path.slice(0, 512),
-        fingerprint,
-        owner.leaseToken,
-      ],
-    );
+    const insertReservation = () => {
+      const now = new Date();
+      return database.query(
+        `INSERT INTO tbl_idempotency_key
+           (actor_type, actor_id, idempotency_key, method, path,
+            request_fingerprint, state, lease_token, lease_expires_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'in_flight', ?,
+                 DATE_ADD(?, INTERVAL ${LEASE_MINUTES} MINUTE),
+                 DATE_ADD(?, INTERVAL ${RETENTION_DAYS} DAY))`,
+        [
+          owner.actorType,
+          owner.actorId,
+          owner.key,
+          req.method,
+          path.slice(0, 512),
+          fingerprint,
+          owner.leaseToken,
+          now,
+          now,
+        ],
+      );
+    };
 
     let ownsReservation = false;
     try {
@@ -253,13 +260,18 @@ function idempotency({ resolveActor = defaultResolveActor, database = pool } = {
       if (error?.code !== 'ER_DUP_ENTRY') return next(error);
 
       try {
+        // NOW() reads lease_expires_at (an app-bound Date). created_at stays a
+        // DB-default TIMESTAMP used only as the legacy pre-lease fallback, so
+        // its DATE_ADD is left on the DB clock; the comparator itself is bound
+        // anyway to keep GREATEST()'s NOW() operand off the DB session zone.
+        const now = new Date();
         const [[existing]] = await database.query(
           `SELECT request_fingerprint, state, response_status, response_json,
                   GREATEST(
                     0,
                     TIMESTAMPDIFF(
                       SECOND,
-                      NOW(),
+                      ?,
                       COALESCE(
                         lease_expires_at,
                         DATE_ADD(created_at, INTERVAL ${LEGACY_LEASE_GRACE_MINUTES} MINUTE)
@@ -269,7 +281,7 @@ function idempotency({ resolveActor = defaultResolveActor, database = pool } = {
              FROM tbl_idempotency_key
             WHERE actor_type = ? AND actor_id = ? AND idempotency_key = ?
             LIMIT 1`,
-          [owner.actorType, owner.actorId, owner.key],
+          [now, owner.actorType, owner.actorId, owner.key],
         );
 
         if (!existing) {
@@ -298,28 +310,32 @@ function idempotency({ resolveActor = defaultResolveActor, database = pool } = {
           // Same logical request, but its owner crashed or exceeded the lease.
           // The unique actor/key predicate makes this a constant-time CAS; only
           // one concurrent retry can replace the expired owner token.
+          const reclaimNow = new Date();
           const [reclaimed] = await database.query(
             `UPDATE tbl_idempotency_key
                 SET method = ?, path = ?, request_fingerprint = ?,
                     response_status = NULL, response_json = NULL,
                     state = 'in_flight', completed_at = NULL,
                     lease_token = ?,
-                    lease_expires_at = DATE_ADD(NOW(), INTERVAL ${LEASE_MINUTES} MINUTE),
-                    expires_at = DATE_ADD(NOW(), INTERVAL ${RETENTION_DAYS} DAY)
+                    lease_expires_at = DATE_ADD(?, INTERVAL ${LEASE_MINUTES} MINUTE),
+                    expires_at = DATE_ADD(?, INTERVAL ${RETENTION_DAYS} DAY)
               WHERE actor_type = ? AND actor_id = ? AND idempotency_key = ?
                 AND state = 'in_flight'
                 AND COALESCE(
                       lease_expires_at,
                       DATE_ADD(created_at, INTERVAL ${LEGACY_LEASE_GRACE_MINUTES} MINUTE)
-                    ) <= NOW()`,
+                    ) <= ?`,
             [
               req.method,
               path.slice(0, 512),
               fingerprint,
               owner.leaseToken,
+              reclaimNow,
+              reclaimNow,
               owner.actorType,
               owner.actorId,
               owner.key,
+              reclaimNow,
             ],
           );
           ownsReservation = Number(reclaimed.affectedRows) === 1;

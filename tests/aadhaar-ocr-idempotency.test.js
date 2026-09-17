@@ -53,7 +53,7 @@ const database = {
     }
     if (/^\s*SELECT request_fingerprint/i.test(text)) return [[ledger.get(rowKey(params))], []];
     if (/state = 'done'/i.test(text)) {
-      const id = `${params[2]}|${params[3]}|${params[4]}`;
+      const id = params.slice(-4, -1).join('|');
       const row = ledger.get(id);
       if (!row || row.leaseToken !== params.at(-1)) return [{ affectedRows: 0 }, []];
       ledger.set(id, {

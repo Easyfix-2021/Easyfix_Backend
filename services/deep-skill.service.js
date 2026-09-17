@@ -365,7 +365,7 @@ async function create(input, actor) {
         (category_id, service_type_id, deepskill_name, deepskill_description,
          deepskill_tag_words,
          status, inserted_by, inserted_on, deepskill_image, skill_options)
-      VALUES (?, ?, ?, ?, ?, 1, ?, NOW(), ?, '[]')
+      VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, '[]')
     `, [
       categoryId, serviceTypeId,
       input.deepskill_name, input.deepskill_description || null,
@@ -374,6 +374,7 @@ async function create(input, actor) {
       // semantic from the keyword search string in deepskill_description.
       input.deepskill_tag_words || null,
       actor?.user_id || null,
+      new Date(),
       input.deepskill_image || '',
     ]);
     deepSkillId = ins.insertId;
@@ -415,12 +416,12 @@ async function create(input, actor) {
   try {
     const dsImageGen = require('./deep-skill-image-gen.service');
     if (!input.deepskill_image && await dsImageGen.isAutoGenEnabled()) {
-      // Stamp image_gen_attempted_at = NOW() so the 5-min orphan-reset
+      // Stamp image_gen_attempted_at = now so the 5-min orphan-reset
       // cron can detect rows whose dispatch was killed by a server
       // restart (status='pending' + age > 10 min ⇒ flip to 'failed').
       await pool.query(
-        'UPDATE tbl_deep_skill SET image_gen_status = ?, image_gen_attempted_at = NOW() WHERE deepskill_id = ?',
-        ['pending', deepSkillId],
+        'UPDATE tbl_deep_skill SET image_gen_status = ?, image_gen_attempted_at = ? WHERE deepskill_id = ?',
+        ['pending', new Date(), deepSkillId],
       );
       // A fresh AUTO_INCREMENT id can't already be in the single-flight
       // Set, so a false return here would be surprising — log it but DON'T
@@ -511,8 +512,8 @@ async function update(deepskillId, patch) {
         // Stamp image_gen_attempted_at so orphan-reset cron can find
         // restart-stuck rows. See matching comment in create() above.
         await pool.query(
-          'UPDATE tbl_deep_skill SET image_gen_status = ?, image_gen_attempted_at = NOW() WHERE deepskill_id = ?',
-          ['pending', deepskillId],
+          'UPDATE tbl_deep_skill SET image_gen_status = ?, image_gen_attempted_at = ? WHERE deepskill_id = ?',
+          ['pending', new Date(), deepskillId],
         );
         const queued = dsImageGen.dispatch(deepskillId);
         if (!queued) {

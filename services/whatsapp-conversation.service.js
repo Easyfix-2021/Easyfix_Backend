@@ -2093,12 +2093,10 @@ async function ingestMedia(convo, ctx, inbound, pool) {
     jobId: convo.job_id, seq, buffer: dl.buffer,
     contentType: dl.contentType, originalName: `whatsapp_photo_${seq}`, category: 'Booking',
   });
-  // created_date is the row's own insert stamp (not an application timestamp we
-  // reason about) — NOW() here matches the legacy write and is left as-is.
   await pool.query(
     `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, created_date)
-     VALUES (?, ?, 'booking', 0, NOW())`,
-    [convo.job_id, key],
+     VALUES (?, ?, 'booking', 0, ?)`,
+    [convo.job_id, key, new Date()],
   );
   logger.info('Saved customer WhatsApp photo · job=' + convo.job_id + ' · seq=' + seq);
   await updateConversation(convo.conversation_id, {

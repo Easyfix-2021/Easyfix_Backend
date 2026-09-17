@@ -669,6 +669,12 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
   if (efrIds.length === 0) return new Map();
   const placeholders = efrIds.map(() => '?').join(',');
   const lookback = DEFAULTS.STATS_LOOKBACK_DAYS;
+  // Clock rule: created_date_time (tbl_job) is bound as new Date() in
+  // job.service.js, so its DATE_SUB window below binds this same instant
+  // rather than reading SQL NOW(). insert_date_time
+  // (tbl_easyfixer_rating_by_customer) is written by the legacy feedback flow on
+  // the IST app clock, so the rating window binds it too.
+  const now = new Date();
 
   // Pre-build the deep-skill match query — same predicate as the L1
   // EXISTS clause but returning the matched easyfixer_ids. We surface
@@ -877,9 +883,9 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
       `SELECT easyfixer_id AS efr_id, AVG(customer_rating) AS avg_rating, COUNT(*) AS rating_count
          FROM tbl_easyfixer_rating_by_customer
         WHERE easyfixer_id IN (${placeholders})
-          AND insert_date_time >= DATE_SUB(NOW(), INTERVAL ${lookback} DAY)
+          AND insert_date_time >= DATE_SUB(?, INTERVAL ${lookback} DAY)
         GROUP BY easyfixer_id`,
-      efrIds
+      [...efrIds, now]
     ),
 
     // TAT (avg checkout - scheduled hours, completed jobs only)
@@ -892,9 +898,9 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
           AND job_status IN (3, 5)
           AND scheduled_date_time IS NOT NULL
           AND checkout_date_time  IS NOT NULL
-          AND created_date_time >= DATE_SUB(NOW(), INTERVAL ${lookback} DAY)
+          AND created_date_time >= DATE_SUB(?, INTERVAL ${lookback} DAY)
         GROUP BY fk_easyfixter_id`,
-      efrIds
+      [...efrIds, now]
     ),
 
     // SDA — same-day-attempt rate; checkin date == requested date.
@@ -906,9 +912,9 @@ async function statsForCandidates(efrIds, job, clientId, cfg = null) {
          FROM tbl_job
         WHERE fk_easyfixter_id IN (${placeholders})
           AND job_status IN (2, 3, 5)
-          AND created_date_time >= DATE_SUB(NOW(), INTERVAL ${lookback} DAY)
+          AND created_date_time >= DATE_SUB(?, INTERVAL ${lookback} DAY)
         GROUP BY fk_easyfixter_id`,
-      efrIds
+      [...efrIds, now]
     ),
 
     // Worked-for-this-client before?

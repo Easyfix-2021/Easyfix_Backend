@@ -64,6 +64,22 @@ const logger = require('../../logger');
 const ttlCache = require('../../utils/ttl-cache');
 const candidateRanking = require('../../services/candidate-ranking.service');
 const { slotRecommendationsQuery } = require('../../validators/job.validator');
+const timeSlot = require('../../services/time-slot');
+const jobService = require('../../services/job.service');
+
+/*
+ * The window a CUSTOMER may reschedule into: a start hour of 9 AM up to (not
+ * including) 7 PM, i.e. the three daytime bands. Returns that band's label
+ * ('9AM to 12PM' | '12PM to 3PM' | '3PM to 7PM'), or null when the hour falls
+ * outside it. Customers picking 8 AM / after 7 PM left ops with appointments
+ * they could not commit to; the form now only offers these bands, and this is
+ * the server-side half — a public token endpoint must not trust its own UI.
+ * The label is DERIVED from the hour, never taken from the request body.
+ */
+function customerRescheduleSlot(preferred) {
+  const h = timeSlot.slotHour(preferred);
+  return h != null && h >= 9 && h < 19 ? timeSlot.bandForHour(h) : null;
+}
 
 // Global map-clickability toggle (easyfix_properties). Absent/'true' →
 // clickable; 'false' → the customer's map is rendered non-interactive.
@@ -365,8 +381,8 @@ router.post(
 
         const [ins] = await pool.query(
           `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, created_date)
-           VALUES (?, ?, 'booking', 0, NOW())`,
-          [jobId, imageKey],
+           VALUES (?, ?, 'booking', 0, ?)`,
+          [jobId, imageKey, new Date()],
         );
         logger.info('Job image uploaded · jobId=' + jobId + ' · image_id=' + ins.insertId + ' · seq=' + seq);
         // Short-TTL presigned GET so the FE renders the thumbnail / lightbox
@@ -583,6 +599,8 @@ router.post(
 // ─── POST /:token/reschedule-request — log a customer reschedule req ─
 // Same ops-signal semantics as cancel-request — NO job_status change.
 // `preferred_datetime` is optional; stored as DATETIME (NULL when absent).
+// When given, its hour must fall in the daytime bands (9 AM – 7 PM); the band
+// label is stored alongside as `preferred_slot`.
 router.post(
   '/:token/reschedule-request',
   peekToken,
@@ -608,6 +626,7 @@ router.post(
         [jobId],
       );
       let preferred = toMysqlDatetime(req.body.preferred_datetime);
+      let preferredSlot = null;
       /*
        * A CUSTOMER may only push an appointment OUT, never pull it earlier.
        *
@@ -642,6 +661,17 @@ router.post(
             { status: 400 },
           );
         }
+        preferredSlot = customerRescheduleSlot(preferred);
+        if (!preferredSlot) {
+          logger.warn(
+            'Customer reschedule rejected, outside 9 AM – 7 PM · jobId=' + jobId
+            + ' · picked=' + preferred,
+          );
+          throw Object.assign(
+            new Error('Please choose a time slot between 9 AM and 7 PM.'),
+            { status: 400 },
+          );
+        }
       }
       /*
        * Default to the job's CURRENT appointment when the customer didn't pick
@@ -650,13 +680,28 @@ router.post(
        * with no date. Used verbatim as a DATETIME literal (do NOT re-parse
        * through toMysqlDatetime, which only normalises the raw request body).
        */
-      if (!preferred) preferred = jobRow ? jobRow.requested_date_time : null;
-      const [ins] = await pool.query(
-        `INSERT INTO tbl_job_customer_request
-           (job_id, request_type, reason, remarks, preferred_datetime)
-         VALUES (?, 'reschedule', ?, ?, ?)`,
-        [jobId, req.body.reason, req.body.remarks || null, preferred],
-      );
+      if (!preferred) {
+        preferred = jobRow ? jobRow.requested_date_time : null;
+        // The existing appointment is ops-set, so it is NOT held to the customer
+        // window — just labelled with whatever band it is in. A date-only
+        // (midnight-sentinel) appointment has no band to name.
+        preferredSlot = timeSlot.hasTimeOfDay(preferred) ? timeSlot.deriveTimeSlot(preferred) : null;
+      }
+      // preferred_slot only exists once 2026-09-16-customer-request-preferred-slot.sql
+      // has run; until then the INSERT keeps its old shape.
+      const [ins] = await ((await jobService.customerRequestSlotColumnExists())
+        ? pool.query(
+          `INSERT INTO tbl_job_customer_request
+             (job_id, request_type, reason, remarks, preferred_datetime, preferred_slot)
+           VALUES (?, 'reschedule', ?, ?, ?, ?)`,
+          [jobId, req.body.reason, req.body.remarks || null, preferred, preferredSlot],
+        )
+        : pool.query(
+          `INSERT INTO tbl_job_customer_request
+             (job_id, request_type, reason, remarks, preferred_datetime)
+           VALUES (?, 'reschedule', ?, ?, ?)`,
+          [jobId, req.body.reason, req.body.remarks || null, preferred],
+        ));
       // Mirror into the job comment thread for ops visibility (best-effort — the
       // request above is authoritative). comment_on=1 = the job-lifecycle bucket
       // legacy uses for reschedule notes; appointment_on carries the preferred
@@ -964,3 +1009,5 @@ router.post(
 );
 
 module.exports = router;
+// Exported for tests/customer-reschedule-slot.test.js.
+module.exports.customerRescheduleSlot = customerRescheduleSlot;

@@ -757,7 +757,8 @@ async function publishDueScheduled() {
        FROM tbl_notice
       WHERE status = 'scheduled'
         AND publish_at IS NOT NULL
-        AND publish_at <= NOW()`,
+        AND publish_at <= ?`,
+    [new Date()],
   );
 
   const summary = { checked: due.length, published: 0, pushed: 0 };
@@ -821,6 +822,7 @@ async function listActiveForSurface({
 
   logger.info('List active notices · surface=' + surface + ' · readerType=' + readerType + ' · limit=' + limit);
 
+  const now = new Date();
   const [rows] = await pool.query(
     `SELECT ${ROW_SELECT},
             EXISTS(
@@ -833,13 +835,13 @@ async function listActiveForSurface({
        FROM tbl_notice n ${ROW_JOINS}
       WHERE FIND_IN_SET(?, n.target_surfaces)
         AND n.status IN ('published', 'scheduled')
-        AND (n.publish_at IS NULL OR n.publish_at <= NOW())
-        AND (n.expire_at  IS NULL OR n.expire_at  >  NOW())
+        AND (n.publish_at IS NULL OR n.publish_at <= ?)
+        AND (n.expire_at  IS NULL OR n.expire_at  >  ?)
       ORDER BY n.is_pinned DESC,
                COALESCE(n.publish_at, n.created_at) DESC,
                n.notice_id DESC
       LIMIT ?`,
-    [surface, readerType, readerId || 0, surface, limit],
+    [surface, readerType, readerId || 0, surface, now, now, limit],
   );
 
   logger.info('Found ' + rows.length + ' active notices · surface=' + surface);
@@ -869,13 +871,14 @@ async function listActiveForSurface({
 async function countUnreadForSurface({ surface, readerType = 'crm_user', readerId }) {
   if (!SURFACES.includes(surface)) throw mkErr(400, 'Invalid surface');
   logger.info('Count unread notices · surface=' + surface + ' · readerType=' + readerType);
+  const now = new Date();
   const [[{ unread }]] = await pool.query(
     `SELECT COUNT(*) AS unread
        FROM tbl_notice n
       WHERE FIND_IN_SET(?, n.target_surfaces)
         AND n.status IN ('published', 'scheduled')
-        AND (n.publish_at IS NULL OR n.publish_at <= NOW())
-        AND (n.expire_at  IS NULL OR n.expire_at  >  NOW())
+        AND (n.publish_at IS NULL OR n.publish_at <= ?)
+        AND (n.expire_at  IS NULL OR n.expire_at  >  ?)
         AND NOT EXISTS(
               SELECT 1 FROM tbl_notice_read r
                WHERE r.notice_id   = n.notice_id
@@ -883,7 +886,7 @@ async function countUnreadForSurface({ surface, readerType = 'crm_user', readerI
                  AND r.reader_type = ?
                  AND r.reader_id   = ?
             )`,
-    [surface, surface, readerType, readerId || 0],
+    [surface, now, now, surface, readerType, readerId || 0],
   );
   logger.info('Unread notices count=' + (Number(unread) || 0) + ' · surface=' + surface);
   return Number(unread) || 0;

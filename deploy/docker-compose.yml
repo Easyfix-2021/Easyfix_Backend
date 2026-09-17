@@ -107,7 +107,9 @@ services:
       backend:
         condition: service_started
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5180/login", "-O", "/dev/null"]
+      # Dedicated /healthcheck route handler (src/app/healthcheck/route.ts
+      # in Easyfix_CRM_UI) — no React render on every probe.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5180/healthcheck", "-O", "/dev/null"]
       interval: 30s
       timeout: 5s
       start_period: 60s

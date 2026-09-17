@@ -142,8 +142,8 @@ router.post('/', validate(createBody), async (req, res, next) => {
     logger.info('Create product · service_id=' + req.body.service_id + ' codes=' + req.body.product_codes.length);
     await conn.beginTransaction();
     const [ins] = await conn.query(
-      'INSERT INTO product (name, created_on, service_id, primary_img_id) VALUES (?, NOW(), ?, ?)',
-      [req.body.name, req.body.service_id, req.body.primary_img_id]
+      'INSERT INTO product (name, created_on, service_id, primary_img_id) VALUES (?, DATE(?), ?, ?)',
+      [req.body.name, new Date(), req.body.service_id, req.body.primary_img_id]
     );
     const productId = ins.insertId;
     for (const code of req.body.product_codes) {

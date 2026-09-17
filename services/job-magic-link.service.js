@@ -762,14 +762,14 @@ async function autoRescheduleOnOpenIfLate(jobId, pool, { nowMs = Date.now() } = 
     `UPDATE tbl_job
         SET original_appointment_date_time = COALESCE(original_appointment_date_time, requested_date_time),
             requested_date_time = TIMESTAMP(?, TIME(requested_date_time)),
-            last_update_time = NOW()
+            last_update_time = ?
       WHERE job_id = ?
         AND job_status = 9
         AND customer_submitted_at IS NULL
         AND requested_date_time IS NOT NULL
         AND DATE(requested_date_time) <= ?
         AND DATE(requested_date_time) = DATE(COALESCE(original_appointment_date_time, requested_date_time))`,
-    [istTomorrow, jobId, istToday],
+    [istTomorrow, new Date(), jobId, istToday],
   );
   if (!result || result.affectedRows !== 1) return { shifted: false };
 

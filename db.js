@@ -229,6 +229,7 @@ function getPoolStats() {
 async function testConnection() {
   const conn = await pool.getConnection();
   try {
+    // eslint-disable-next-line no-restricted-syntax -- reports the DB server's own clock on purpose
     const [rows] = await conn.query('SELECT 1 AS ok, DATABASE() AS db, NOW() AS ts');
     logger.db(`Connected to "${rows[0].db}" at ${process.env.DB_HOST}:${process.env.DB_PORT || 3306} — server time ${rows[0].ts}`);
     return true;

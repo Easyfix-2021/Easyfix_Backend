@@ -5,6 +5,7 @@ const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
 const validate = require('../../middleware/validate');
 const logger = require('../../logger');
+const { customerRequestSlotColumnExists } = require('../../services/job.service');
 
 /*
  * Customer cancel / reschedule request ops inbox.
@@ -39,9 +40,11 @@ router.get('/', validate(inboxQuery, 'query'), async (req, res, next) => {
       [status],
     );
 
+    // preferred_slot exists only after its migration — NULL alias until then.
+    const slotCol = (await customerRequestSlotColumnExists()) ? 'r.preferred_slot' : 'NULL AS preferred_slot';
     const [items] = await pool.query(
       `SELECT r.request_id, r.job_id, r.request_type, r.reason, r.remarks,
-              r.preferred_datetime, r.request_status, r.created_at,
+              r.preferred_datetime, ${slotCol}, r.request_status, r.created_at,
               COALESCE(j.job_customer_name, cu.customer_name) AS customer_name,
               cl.client_name
          FROM tbl_job_customer_request r

@@ -125,7 +125,11 @@ test('Home counts the statuses Bookings lists, and each tile uses its chip\'s ru
     pool.query = realQuery;
   }
   assert.equal(calls.length, 1, 'still one round trip');
-  assert.deepEqual(calls[0].params, [1736]);
+  // Four bound `now` values (one per clock comparison: activeToday, delayed,
+  // overdue, upcoming — all the SAME instant, one per statement) then efrId.
+  assert.equal(calls[0].params.length, 5);
+  assert.ok(calls[0].params.slice(0, 4).every((p) => p instanceof Date), 'four bound `now` values');
+  assert.equal(calls[0].params[4], 1736);
   assert.equal(counts.allJobs, 5, 'Open Jobs is the direct count, not activeToday + delayed + upcoming (1 here)');
 
   const clauseOf = (alias) => {
@@ -138,7 +142,7 @@ test('Home counts the statuses Bookings lists, and each tile uses its chip\'s ru
 
   // Delayed = the Bookings Delayed chip's rule: late AND not begun.
   const overdue = clauseOf('overdue');
-  assert.match(overdue, /requested_date_time < NOW\(\)/, 'late is keyed on the appointment');
+  assert.match(overdue, /requested_date_time < \?/, 'late is keyed on the appointment, against a bound `now`');
   assert.match(overdue, /job_status NOT IN \(2, 10, 20\)/,
     'begun work is not late: in progress, pending to close, a revisit already worked');
   assert.match(overdue, /NOT \(job_status = 15 AND checkin_date_time IS NOT NULL\)/,
@@ -169,8 +173,8 @@ test('the activeToday count counts started jobs on any date, exactly once', () =
   const activeToday = /AS activeToday/.exec(source);
   assert.ok(activeToday, 'activeToday count must exist');
   const clause = source.slice(source.lastIndexOf('COUNT(', activeToday.index), activeToday.index);
-  assert.match(clause, /\$\{WORK_DATE_SQL\} = CURDATE\(\)/,
-    'today is decided by the work date — check-in for a started job, appointment otherwise');
+  assert.match(clause, /\$\{WORK_DATE_SQL\} = DATE\(\?\)/,
+    'today is decided by the work date — check-in for a started job, appointment otherwise, against a bound `now`');
   // All three date buckets must read the SAME expression, or they stop
   // partitioning — a job counted twice, or in no bucket at all.
   for (const bucket of ['`delayed`', 'upcoming']) {

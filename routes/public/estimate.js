@@ -174,7 +174,7 @@ router.get('/:token', peekToken, tokenRateLimit, async (req, res, next) => {
  * Terminal action. Writes:
  *   approved_by_client_contact = clientContactId (from JWT; null
  *     allowed for legacy tokens that didn't carry the claim)
- *   approved_on_date_time      = NOW()
+ *   approved_on_date_time      = now
  *
  * Idempotency: refuses if either approve/reject timestamp is already
  * set. Refuses on cancelled (status 6) or completed (3, 5) jobs to
@@ -202,9 +202,9 @@ router.patch('/:token/approve', peekToken, tokenRateLimit, async (req, res, next
     await pool.query(
       `UPDATE tbl_job
           SET approved_by_client_contact = ?,
-              approved_on_date_time      = NOW()
+              approved_on_date_time      = ?
         WHERE job_id = ?`,
-      [clientContactId, jobId]
+      [clientContactId, new Date(), jobId]
     );
     logger.info({ jobId, clientContactId }, 'public-estimate: approved via token link');
     return modernOk(res, { approved: true });
@@ -261,9 +261,9 @@ router.patch('/:token/reject', peekToken, tokenRateLimit, async (req, res, next)
     await pool.query(
       `UPDATE tbl_job
           SET approval_reject_reason     = ?,
-              approval_reject_date_time  = NOW()
+              approval_reject_date_time  = ?
         WHERE job_id = ?`,
-      [reason, jobId]
+      [reason, new Date(), jobId]
     );
 
     // Fire ops escalation — best-effort, never blocks the response.

@@ -80,7 +80,11 @@ function buildSharedFilters(filters, params) {
  */
 async function summary(filters = {}) {
   logger.info('Open Orders summary · clientId=' + JSON.stringify(filters.clientId || []) + ' serviceCategoryId=' + JSON.stringify(filters.serviceCategoryId || []) + ' verticalId=' + JSON.stringify(filters.verticalId || []) + ' zonalManagerId=' + JSON.stringify(filters.zonalManagerId || []));
-  const params = [];
+  // The 7 NOW()s below are all in the SELECT clause, textually before the
+  // WHERE filter placeholders buildSharedFilters appends — so the 7 clock
+  // params must be pushed first to land at their matching `?` positions.
+  const now = new Date();
+  const params = [now, now, now, now, now, now, now];
   const filterWhere = buildSharedFilters(filters, params);
 
   // NOTE on escalationCount fan-out: the LEFT JOIN to
@@ -94,18 +98,18 @@ async function summary(filters = {}) {
       j.job_client_owner AS pmUserId,
       u.user_name AS pmName,
       COUNT(CASE WHEN j.job_status = 9 THEN 1 END) AS unconfirmed,
-      COUNT(CASE WHEN j.job_status = 0 AND j.fk_easyfixter_id IS NULL AND j.requested_date_time < NOW() THEN 1 END) AS waitingForAllocation,
-      COUNT(CASE WHEN j.job_status IN (0,1) AND j.fk_easyfixter_id IS NOT NULL AND j.requested_date_time < NOW() THEN 1 END) AS runningLate,
-      COUNT(CASE WHEN j.job_status IN (2,20) AND TIMESTAMPDIFF(HOUR, j.checkin_date_time, NOW()) > 12 THEN 1 END) AS openOnApp,
-      COUNT(CASE WHEN j.job_status = 10 AND j.no_of_req_approval < 1 AND j.no_of_req_foh < 1 AND TIMESTAMPDIFF(HOUR, j.app_checkout_date_time, NOW()) > 18 THEN 1 END) AS waitingAudit,
+      COUNT(CASE WHEN j.job_status = 0 AND j.fk_easyfixter_id IS NULL AND j.requested_date_time < ? THEN 1 END) AS waitingForAllocation,
+      COUNT(CASE WHEN j.job_status IN (0,1) AND j.fk_easyfixter_id IS NOT NULL AND j.requested_date_time < ? THEN 1 END) AS runningLate,
+      COUNT(CASE WHEN j.job_status IN (2,20) AND TIMESTAMPDIFF(HOUR, j.checkin_date_time, ?) > 12 THEN 1 END) AS openOnApp,
+      COUNT(CASE WHEN j.job_status = 10 AND j.no_of_req_approval < 1 AND j.no_of_req_foh < 1 AND TIMESTAMPDIFF(HOUR, j.app_checkout_date_time, ?) > 18 THEN 1 END) AS waitingAudit,
       COUNT(CASE WHEN (
           j.job_status = 9
-          OR (j.requested_date_time < NOW() AND (
+          OR (j.requested_date_time < ? AND (
                 (j.job_status = 0 AND j.fk_easyfixter_id IS NULL)
                 OR (j.job_status IN (0,1) AND j.fk_easyfixter_id IS NOT NULL)
              ))
-          OR (j.job_status IN (2,20) AND TIMESTAMPDIFF(HOUR, j.checkin_date_time, NOW()) > 12)
-          OR (j.job_status = 10 AND j.no_of_req_approval < 1 AND j.no_of_req_foh < 1 AND TIMESTAMPDIFF(HOUR, j.app_checkout_date_time, NOW()) > 18)
+          OR (j.job_status IN (2,20) AND TIMESTAMPDIFF(HOUR, j.checkin_date_time, ?) > 12)
+          OR (j.job_status = 10 AND j.no_of_req_approval < 1 AND j.no_of_req_foh < 1 AND TIMESTAMPDIFF(HOUR, j.app_checkout_date_time, ?) > 18)
         ) THEN 1 END) AS totalAlerts,
       COUNT(CASE WHEN trc.is_escalated = 1 THEN 1 END) AS escalationCount
     FROM tbl_job j
@@ -153,13 +157,18 @@ async function summary(filters = {}) {
  */
 async function byOwner(pmUserId, filters = {}) {
   logger.info('Open Orders drill-down · pmUserId=' + pmUserId);
-  const params = [pmUserId];
+  // Clock-param order follows the SQL text left to right: jobAge's DATE(?) +
+  // the 4 bucket-label NOW()s live in the SELECT (before WHERE), pmUserId and
+  // the shared filters come next, then the 3 NOW()s in the trailing OR block.
+  const now = new Date();
+  const params = [now, now, now, now, now, pmUserId];
   const filterWhere = buildSharedFilters(filters, params);
+  params.push(now, now, now);
 
   const sql = `
     SELECT
       j.job_id AS jobID,
-      DATEDIFF(CURDATE(), j.ticket_created_date_time) AS jobAge,
+      DATEDIFF(DATE(?), j.ticket_created_date_time) AS jobAge,
       c.client_name AS clientName,
       j.client_spoc_name AS clientSpocName,
       u.user_name AS cityMappedUser,
@@ -167,10 +176,10 @@ async function byOwner(pmUserId, filters = {}) {
       e.efr_name AS efrName,
       CASE
         WHEN j.job_status = 9 THEN 'Unconfirmed'
-        WHEN (j.job_status = 0 AND j.fk_easyfixter_id IS NULL AND j.requested_date_time < NOW()) THEN 'Waiting for Allocation'
-        WHEN (j.job_status IN (0,1) AND j.fk_easyfixter_id IS NOT NULL AND j.requested_date_time < NOW()) THEN 'Running Late'
-        WHEN (j.job_status IN (2,20) AND TIMESTAMPDIFF(HOUR, j.checkin_date_time, NOW()) > 12) THEN 'Open on App > 12 hrs'
-        WHEN (j.job_status = 10 AND j.no_of_req_approval < 1 AND j.no_of_req_foh < 1 AND TIMESTAMPDIFF(HOUR, j.app_checkout_date_time, NOW()) > 18) THEN 'Waiting Audit > 18 hrs'
+        WHEN (j.job_status = 0 AND j.fk_easyfixter_id IS NULL AND j.requested_date_time < ?) THEN 'Waiting for Allocation'
+        WHEN (j.job_status IN (0,1) AND j.fk_easyfixter_id IS NOT NULL AND j.requested_date_time < ?) THEN 'Running Late'
+        WHEN (j.job_status IN (2,20) AND TIMESTAMPDIFF(HOUR, j.checkin_date_time, ?) > 12) THEN 'Open on App > 12 hrs'
+        WHEN (j.job_status = 10 AND j.no_of_req_approval < 1 AND j.no_of_req_foh < 1 AND TIMESTAMPDIFF(HOUR, j.app_checkout_date_time, ?) > 18) THEN 'Waiting Audit > 18 hrs'
         ELSE 'N/A'
       END AS jobBucketStatus,
       CASE WHEN trc.is_escalated = 1 THEN 1 ELSE 0 END AS isEscalated
@@ -185,12 +194,12 @@ async function byOwner(pmUserId, filters = {}) {
       AND j.job_status NOT IN (3,5,7,6)${filterWhere}
       AND (
         j.job_status = 9
-        OR (j.requested_date_time < NOW() AND (
+        OR (j.requested_date_time < ? AND (
               (j.job_status = 0 AND j.fk_easyfixter_id IS NULL)
               OR (j.job_status IN (0,1) AND j.fk_easyfixter_id IS NOT NULL)
            ))
-        OR (j.job_status IN (2,20) AND TIMESTAMPDIFF(HOUR, j.checkin_date_time, NOW()) > 12)
-        OR (j.job_status = 10 AND j.no_of_req_approval < 1 AND j.no_of_req_foh < 1 AND TIMESTAMPDIFF(HOUR, j.app_checkout_date_time, NOW()) > 18)
+        OR (j.job_status IN (2,20) AND TIMESTAMPDIFF(HOUR, j.checkin_date_time, ?) > 12)
+        OR (j.job_status = 10 AND j.no_of_req_approval < 1 AND j.no_of_req_foh < 1 AND TIMESTAMPDIFF(HOUR, j.app_checkout_date_time, ?) > 18)
         OR trc.is_escalated = 1
       )
     ORDER BY isEscalated DESC, j.job_id DESC

@@ -276,14 +276,20 @@ async function statsForCandidates(efrIds, jobRequestedTs, jobTimeSlot) {
     for (const r of conflicts) conflictMap.set(r.efr_id, true);
   }
 
+  // Clock rule: created_date_time (tbl_job) is bound in job.service.js, so
+  // its DATE_SUB window below binds this instant instead of reading NOW().
+  // insert_date_time (tbl_easyfixer_rating_by_customer) is written by the legacy
+  // feedback flow on the IST app clock, so it binds the same instant.
+  const now = new Date();
+
   // rating (90d avg)
   const [ratingRows] = await pool.query(
     `SELECT easyfixer_id AS efr_id, AVG(customer_rating) AS avg_rating, COUNT(*) AS rating_count
        FROM tbl_easyfixer_rating_by_customer
       WHERE easyfixer_id IN (${placeholders})
-        AND insert_date_time >= DATE_SUB(NOW(), INTERVAL ${CONFIG.STATS_LOOKBACK_DAYS} DAY)
+        AND insert_date_time >= DATE_SUB(?, INTERVAL ${CONFIG.STATS_LOOKBACK_DAYS} DAY)
       GROUP BY easyfixer_id`,
-    efrIds
+    [...efrIds, now]
   );
   const ratingMap = new Map(ratingRows.map((r) => [r.efr_id, Number(r.avg_rating)]));
 
@@ -294,9 +300,9 @@ async function statsForCandidates(efrIds, jobRequestedTs, jobTimeSlot) {
             SUM(CASE WHEN job_status = 6 THEN 1 ELSE 0 END) AS cancelled
        FROM tbl_job
       WHERE fk_easyfixter_id IN (${placeholders})
-        AND created_date_time >= DATE_SUB(NOW(), INTERVAL ${CONFIG.STATS_LOOKBACK_DAYS} DAY)
+        AND created_date_time >= DATE_SUB(?, INTERVAL ${CONFIG.STATS_LOOKBACK_DAYS} DAY)
       GROUP BY fk_easyfixter_id`,
-    efrIds
+    [...efrIds, now]
   );
   const completionMap = new Map();
   for (const r of histRows) {

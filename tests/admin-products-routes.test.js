@@ -349,9 +349,23 @@ test('POST / defaults are applied before the handler reads them', async () => {
   assert.equal(settled, true);
   assert.equal(res.statusCode, 201);
   const ins = L.queries.find((q) => /^\s*INSERT INTO product\b/i.test(q.sql));
-  assert.deepEqual(ins.params, ['Bare', 5, 0], 'primary_img_id defaults to 0, not undefined');
+  assert.deepEqual(ins.params, ['Bare', ins.params[1], 5, 0], 'primary_img_id defaults to 0, not undefined');
   assert.equal(L.queries.filter((q) => /product_code|product_additional_image/i.test(q.sql)).length, 0,
     'no child rows for empty defaults');
+});
+
+test('POST / binds created_on as DATE(?) over a Date, not NOW()', async () => {
+  // created_on is DATE. Bound as DATE(?) over a JS Date, never NOW(): the
+  // pool is `timezone: '+05:30'`, so a bound Date serialises to the IST wall
+  // clock, whereas NOW() resolves in the DB session zone. DATE() (not a bare
+  // `?`) takes the IST calendar day explicitly — a bare bind into a DATE
+  // column is a truncation note, and a hard error under a strict sql_mode
+  // Production has not been verified against.
+  await call('/', 'post', { body: { name: 'Fridge Z', service_id: 5 } });
+  const ins = L.queries.find((q) => /^\s*INSERT INTO product\b/i.test(q.sql));
+  assert.doesNotMatch(ins.sql, /NOW\(\)/, 'created_on must not be SQL NOW()');
+  assert.match(ins.sql, /VALUES \(\?, DATE\(\?\), \?, \?\)/, 'created_on must be DATE(?), not a bare bind');
+  assert.ok(ins.params[1] instanceof Date, 'created_on must be a bound Date');
 });
 
 /* ─── response shapes (utils/response.js modern envelope) ──────────────────── */

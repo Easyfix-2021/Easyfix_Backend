@@ -167,12 +167,13 @@ async function expireStaleOffers(maxAgeMinutes = OFFER_TTL_MINUTES, jobId = null
   let jobClause = '';
   if (jobId != null) { jobClause = ' AND job_id = ?'; params.push(Number(jobId)); }
   const crTtl = await closedReasonSet(OFFER_CLOSED_REASON.TTL_ELAPSED);
+  const now = new Date();
   const [r] = await pool.query(
     `UPDATE tbl_job_offer
-        SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()${crTtl.sql}
+        SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = ?${crTtl.sql}
       WHERE offer_status = ${OFFER_STATUS.OFFERED}
-        AND offered_at < NOW() - INTERVAL ? MINUTE${jobClause}`,
-    [...crTtl.params, ...params],
+        AND offered_at < ? - INTERVAL ? MINUTE${jobClause}`,
+    [now, ...crTtl.params, now, ...params],
   );
   return { expired: r.affectedRows || 0 };
 }
@@ -218,9 +219,9 @@ async function withdrawOffersForClosedJob(jobId, status) {
     const crClosed = await closedReasonSet(OFFER_CLOSED_REASON.JOB_CLOSED);
     const [r] = await pool.query(
       `UPDATE tbl_job_offer
-          SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()${crClosed.sql}
+          SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = ?${crClosed.sql}
         WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
-      [...crClosed.params, Number(jobId)],
+      [new Date(), ...crClosed.params, Number(jobId)],
     );
     const withdrawn = r.affectedRows || 0;
     if (withdrawn > 0) {
@@ -885,7 +886,7 @@ function manageColumns(want, hasJobOffer) {
    * job-comment.service.js' own listing, so this cell and the job's comment
    * thread can never disagree about which comment is newest. Id order alone is
    * not enough — addComment lets the column default while two raw INSERTs pass
-   * NOW() explicitly, so id order and time order are not guaranteed to agree.
+   * created_on explicitly, so id order and time order are not guaranteed to agree.
    */
   (SELECT LEFT(jc.comments, 300) FROM tbl_job_comment jc
     WHERE jc.job_id = j.job_id
@@ -1496,6 +1497,32 @@ async function customerRequestTableExists() {
 }
 
 /*
+ * Same try-the-query probe for tbl_job_customer_request.preferred_slot
+ * (migration 2026-09-16-customer-request-preferred-slot.sql). The customer
+ * reschedule writer and the three request readers name the column only when
+ * this says it exists, so shipping the code before the migration runs cannot
+ * 500 the reschedule form or the Unconfirmed list. An absent answer is cached
+ * for the process — the next deploy (restart) picks the column up.
+ */
+let _hasPreferredSlotColumn = null;
+async function customerRequestSlotColumnExists() {
+  if (_hasPreferredSlotColumn !== null) return _hasPreferredSlotColumn;
+  try {
+    await pool.query('SELECT preferred_slot FROM tbl_job_customer_request LIMIT 0');
+    _hasPreferredSlotColumn = true;
+  } catch (e) {
+    if (isAbsentAnswer(e)) {
+      _hasPreferredSlotColumn = false;
+      return _hasPreferredSlotColumn;
+    }
+    logger.warn('schema probe failed · _hasPreferredSlotColumn · ' + e.message
+      + ' — treating as absent for this call only');
+    return false;
+  }
+  return _hasPreferredSlotColumn;
+}
+
+/*
  * Mark a job's PENDING customer requests as 'actioned' — called when Ops takes a
  * deliberate action on the job (confirm/cancel/enquiry via setStatus, assign,
  * offer, reschedule). Scenario: a customer submits a cancel request, then phones
@@ -1730,17 +1757,26 @@ async function delegationColsExist() {
  * j.requested_date_time (the current/live appointment) — a reschedule
  * REQUEST does not move the live appointment until Ops actions it, so the
  * UI must surface the requested date separately or the row looks stale.
- * All three subqueries share the same ORDER BY created_at DESC LIMIT 1, so
+ * `pending_request_preferred_slot` is that request's band label (NULL before
+ * the preferred_slot migration, and on rows written before it).
+ * All the subqueries share the same ORDER BY created_at DESC LIMIT 1, so
  * they resolve to the same latest-pending row.
  */
-function pendingRequestColumns(tableExists) {
+function pendingRequestColumns(tableExists, slotColumnExists) {
   if (!tableExists) {
     return `,
   NULL AS pending_request_type,
   NULL AS pending_request_reason,
-  NULL AS pending_request_preferred_datetime`;
+  NULL AS pending_request_preferred_datetime,
+  NULL AS pending_request_preferred_slot`;
   }
+  const slotColumn = slotColumnExists
+    ? `(SELECT cr.preferred_slot FROM tbl_job_customer_request cr
+    WHERE cr.job_id = j.job_id AND cr.request_status = 'pending'
+    ORDER BY cr.created_at DESC LIMIT 1)`
+    : 'NULL';
   return `,
+  ${slotColumn} AS pending_request_preferred_slot,
   (SELECT cr.request_type FROM tbl_job_customer_request cr
     WHERE cr.job_id = j.job_id AND cr.request_status = 'pending'
     ORDER BY cr.created_at DESC LIMIT 1) AS pending_request_type,
@@ -1792,12 +1828,12 @@ function magicLinkDeliveryColumns(colsExist) {
  *   expiry ON (the default, and the normal configuration)
  *     An offer is EFFECTIVELY OPEN only while a technician could still actually
  *     accept it — exactly acceptOffer()'s race-safe claim gate:
- *         offer_status = OFFERED  AND  offered_at >= NOW() - INTERVAL <TTL> MINUTE
+ *         offer_status = OFFERED  AND  offered_at >= now - INTERVAL <TTL> MINUTE
  *     Same comparison, same OFFER_TTL_MINUTES constant, so the chip can never
  *     promise an offer the accept path would refuse, and it stays correct no
  *     matter how far behind the expiry sweep is. EFFECTIVELY DEAD is the exact
  *     complement — EXPIRED, or still OFFERED but past the TTL (expireStaleOffers
- *     sweeps with `offered_at < NOW() - INTERVAL ? MINUTE`) — so a row can never
+ *     sweeps with `offered_at < ? - INTERVAL ? MINUTE`) — so a row can never
  *     be neither.
  *
  *   expiry OFF (`job.offer_expiry.enabled` = 'false')
@@ -1901,15 +1937,24 @@ function offerRowScope(a) {
  * (WHERE fragments) vs inlined integers (projection fragments, which carry no
  * params). Params come out in placeholder order.
  */
-function offerKindPredicate(kind, a, bind, expiry) {
+function offerKindPredicate(kind, a, bind, expiry, now = new Date()) {
   const params = [];
-  const v = (n) => { if (!bind) return offerSqlInt(n); params.push(n); return '?'; };
+  // offered_at is app-written since cffaa49; a freshness read binds an app Date
+  // (`now`) instead of NOW(). bind=false (offerColumns) has no `?` slots, so
+  // pool.escape() inlines it the same way a bound param would format. Callers
+  // that combine 'live' and 'dead' in one statement pass ONE `now`, so the two
+  // stay exact complements the way a single statement's NOW() kept them.
+  const v = (n) => {
+    if (!bind) return (n instanceof Date) ? pool.escape(n) : offerSqlInt(n);
+    params.push(n);
+    return '?';
+  };
   switch (kind) {
     case 'live':
       // expiry OFF ⇒ no TTL term at all: an OFFERED row is open, full stop.
       return {
         sql: `${a}.offer_status = ${v(OFFER_STATUS.OFFERED)}`
-           + (expiry ? ` AND ${a}.offered_at >= NOW() - INTERVAL ${v(OFFER_TTL_MINUTES)} MINUTE` : ''),
+           + (expiry ? ` AND ${a}.offered_at >= ${v(now)} - INTERVAL ${v(OFFER_TTL_MINUTES)} MINUTE` : ''),
         params,
       };
     case 'dead':
@@ -1943,7 +1988,7 @@ function offerKindPredicate(kind, a, bind, expiry) {
         sql: `(${a}.offer_status IN (${v(OFFER_STATUS.EXPIRED)}, ${v(OFFER_STATUS.REJECTED)})`
            + ` OR (${a}.offer_status = ${v(OFFER_STATUS.OFFERED)}`
            + ` AND (${a}.offered_at IS NULL`
-           + ` OR ${a}.offered_at < NOW() - INTERVAL ${v(OFFER_TTL_MINUTES)} MINUTE)))`,
+           + ` OR ${a}.offered_at < ${v(now)} - INTERVAL ${v(OFFER_TTL_MINUTES)} MINUTE)))`,
         params,
       };
     case 'accepted':
@@ -1957,13 +2002,13 @@ function offerKindPredicate(kind, a, bind, expiry) {
 
 // scope + kind predicate — the WHERE body of every offer subquery. Exposed on
 // its own because the COUNT projections need the body without the EXISTS wrap.
-function offerRowWhere(kind, a, bind, expiry) {
-  const k = offerKindPredicate(kind, a, bind, expiry);
+function offerRowWhere(kind, a, bind, expiry, now) {
+  const k = offerKindPredicate(kind, a, bind, expiry, now);
   return { sql: offerRowScope(a) + (k.sql ? ` AND ${k.sql}` : ''), params: k.params };
 }
 
-function offerRowExists(kind, a, { bind = true, negate = false, expiry = true } = {}) {
-  const w = offerRowWhere(kind, a, bind, expiry);
+function offerRowExists(kind, a, { bind = true, negate = false, expiry = true, now } = {}) {
+  const w = offerRowWhere(kind, a, bind, expiry, now);
   return {
     sql: `${negate ? 'NOT ' : ''}EXISTS (SELECT 1 FROM tbl_job_offer ${a} WHERE ${w.sql})`,
     params: w.params,
@@ -1981,7 +2026,7 @@ function offerRowExists(kind, a, { bind = true, negate = false, expiry = true } 
  */
 function offerStateSql(state, { bind = true, alias = 'jos', expiry = true } = {}) {
   const [a1, a2, a3] = [alias, alias + '2', alias + '3'];
-  const o = { bind, expiry };
+  const o = { bind, expiry, now: new Date() };
   const all = (...parts) => ({
     sql: `(${parts.map((p) => p.sql).join(' AND ')})`,
     params: parts.flatMap((p) => p.params),
@@ -2044,11 +2089,11 @@ function offerColumns(tableExists, expiryEnabled = offerExpiryEnabled()) {
    * single-offer common case. The tbl_easyfixer JOIN lives INSIDE this scalar
    * subquery, so it cannot fan out the LIST.
    */
-  const e        = { bind: false, expiry: expiryEnabled };
+  const e        = { bind: false, expiry: expiryEnabled, now: new Date() };
   const live     = (a) => offerRowExists('live', a, e).sql;
   const accepted = (a) => offerRowExists('accepted', a, e).sql;
   const dead     = (a) => offerRowExists('dead', a, e).sql;
-  const where    = (kind, a) => offerRowWhere(kind, a, false, expiryEnabled).sql;
+  const where    = (kind, a) => offerRowWhere(kind, a, false, expiryEnabled, e.now).sql;
   return `, (${live('jo')}) AS is_offered`
        + `, (SELECT ef2.efr_name FROM tbl_job_offer jo2 JOIN tbl_easyfixer ef2 ON ef2.efr_id = jo2.fk_easyfixter_id`
        + `    WHERE ${where('live', 'jo2')}`
@@ -2353,6 +2398,7 @@ async function list({
   // aliases when the table is absent). Keeps the unconfirmed list from 500ing
   // on un-migrated deploys. See pendingRequestColumns() above.
   const hasCustomerRequestTable = await customerRequestTableExists();
+  const hasPreferredSlotColumn = hasCustomerRequestTable && await customerRequestSlotColumnExists();
   // Probe ONCE for tbl_job_offer presence too, appending the offer projection
   // (is_offered / offered_efr_name, or NULL aliases). See offerColumns() above.
   const hasJobOffer = await jobOfferTableExists();
@@ -2396,11 +2442,11 @@ async function list({
     && isEscalated !== false && String(isEscalated) !== 'false' && String(isEscalated) !== '0';
   const wantsEscalation = wantsManage || filtersEscalated;
   const listColumns =
-    LIST_COLUMNS + pendingRequestColumns(hasCustomerRequestTable) + offerColumns(hasJobOffer, offerExpiry)
+    LIST_COLUMNS + pendingRequestColumns(hasCustomerRequestTable, hasPreferredSlotColumn) + offerColumns(hasJobOffer, offerExpiry)
     + magicLinkDeliveryColumns(hasMagicLinkDeliveryCols)
     // Job Age (ageDays + ageSecs) — unconditional; every column it touches is a
     // long-standing tbl_job column, so there is nothing to existence-probe.
-    + JOB_AGE_COLUMNS
+    + JOB_AGE_COLUMNS()
     + escalationColumns(wantsEscalation)
     + manageColumns(wantsManage, hasJobOffer);
   const listJoin = LIST_JOIN + escalationJoin(wantsEscalation) + manageJoin(wantsManage);
@@ -2748,7 +2794,8 @@ async function list({
   }
   // requestedBefore — Running Late tile filter.
   if (requestedBefore === 'now') {
-    clauses.push('j.requested_date_time IS NOT NULL AND j.requested_date_time < NOW()');
+    clauses.push('j.requested_date_time IS NOT NULL AND j.requested_date_time < ?');
+    params.push(new Date());
   } else if (requestedBefore) {
     clauses.push('j.requested_date_time IS NOT NULL AND j.requested_date_time < ?');
     params.push(requestedBefore);
@@ -3064,9 +3111,12 @@ async function list({
   // and why sorting can't affect the COUNT join. hasOwnProperty guards against
   // inherited keys ('constructor', '__proto__') reaching the SQL string even if
   // a caller ever bypasses the Joi layer.
-  const sortCol = Object.prototype.hasOwnProperty.call(SORTABLE_COLUMNS, sortBy)
+  const sortColRaw = Object.prototype.hasOwnProperty.call(SORTABLE_COLUMNS, sortBy)
     ? SORTABLE_COLUMNS[sortBy]
     : undefined;
+  // `age` is a function (see utils/job-age-sql.js — the SQL must bind the
+  // app clock fresh on every call); every other entry is a plain string.
+  const sortCol = typeof sortColRaw === 'function' ? sortColRaw() : sortColRaw;
   const sortDirSql = String(sortDir).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
   const orderBy = sortCol
     ? `ORDER BY ${sortCol} ${sortDirSql}, j.job_id DESC`
@@ -3212,7 +3262,7 @@ async function getByIdCore(jobId) {
                constant, so the detail modal and the list row always agree.
                JOB_AGE_COLUMNS is a LEADING-comma fragment, so the line above
                must NOT end in one. */
-            ${JOB_AGE_COLUMNS}
+            ${JOB_AGE_COLUMNS()}
      ${DETAIL_JOIN}
      WHERE j.job_id = ? LIMIT 1`,
     [jobId]
@@ -3411,6 +3461,49 @@ async function getById(jobId) {
   }));
 
   return { ...job, services: shapedServices, images: shapedImages, videos };
+}
+
+/*
+ * Resolve a reached-location selfie (tbl_job.tx_selfie_id → document.id) to
+ * `{ url, recordedAt }`, or null when there is no document row. `url` may still
+ * be null (key absent, no legacy url). `recordedAt` is document.created_on — the
+ * UPLOAD moment, an IST wall-clock string (pool dateStrings + '+05:30'), which
+ * the app shows under the thumbnail. ONE resolver for both readers: the CRM's
+ * GET /admin/jobs/:id/selfie-url and the technician's GET /mobile/jobs/:id,
+ * which shows the recorded selfie back on Start Work so it can be kept or
+ * retaken (2026-09-16).
+ *
+ * S3 key lives in `document.path`; presign on read. The existence CHECK is the
+ * fix (2026-09-09): presigning is a local signing operation that succeeds for a
+ * key that does not exist, so without the HEAD the "fall back to a legacy stored
+ * url" branch could never run and the caller got a URL that 404s. A HEAD that
+ * throws is treated as "unknown, keep the presign" rather than as absent, so an
+ * IAM or network fault degrades instead of hiding a selfie that is really there.
+ *
+ * Legacy rows store an absolute URL on the old file host — upgraded http →
+ * https, because an https page blocks an http image.
+ */
+async function resolveSelfie(selfieId, jobId) {
+  if (!selfieId) return null;
+  const s3Storage = require('../utils/s3-storage');
+  const [[doc]] = await pool.query('SELECT `path`, url, created_on FROM document WHERE id = ? LIMIT 1', [selfieId]);
+  if (!doc) return null;
+
+  const key = String(doc.path || '').trim();
+  let url = null;
+  if (key && s3Storage.isEnabled()) {
+    let present = true;
+    try { present = await s3Storage.exists(key); }
+    catch (e) { logger.warn('Selfie existence check failed, assuming present · jobId=' + jobId + ' · ' + e.message); }
+    if (present) {
+      try { url = await s3Storage.getPresignedUrl(key); }
+      catch (e) { logger.warn('Selfie presign failed · jobId=' + jobId + ' · ' + e.message); }
+    } else {
+      logger.info('Selfie key absent in S3, falling back to the stored url · jobId=' + jobId);
+    }
+  }
+  if (!url && doc.url) url = String(doc.url).replace(/^http:\/\//i, 'https://');
+  return { url, recordedAt: doc.created_on || null };
 }
 
 /*
@@ -3714,14 +3807,15 @@ async function getAttentionSummary({ scope, allowedStages } = {}) {
   // 1. Running Late
   const runningLatePromise = (async () => {
     const f = buildScopeFragment('j');
+    const now = new Date();
     const where = ['j.requested_date_time IS NOT NULL',
-                   'j.requested_date_time < NOW()',
+                   'j.requested_date_time < ?',
                    'j.job_status IN (0, 1)',
                    ...f.clauses].join(' AND ');
     return safeCount(
       'runningLate',
       `SELECT COUNT(*) AS c FROM tbl_job j ${f.joins} WHERE ${where}`,
-      f.params,
+      [now, ...f.params],
     );
   })();
 
@@ -4544,9 +4638,8 @@ async function create(input, actor) {
      * ONE round trip regardless of N — a multi-row VALUES list rather
      * than a loop of queries. The per-row column set and bound values
      * are UNCHANGED from the single-image version (job_id, image,
-     * image_category='booking', job_stage=0, created_date=NOW()), so a
-     * caller sending only the scalar emits byte-identical SQL to
-     * before. `status` stays out of the column list deliberately:
+     * image_category='booking', job_stage=0, created_date=now), so a
+     * caller sending only the scalar emits one row as before. `status` stays out of the column list deliberately:
      * tbl_job_image.status is `int NULL DEFAULT 1`, and every existing
      * image_category='booking' row carries status 1, so omitting it
      * yields the same data. (routes/integration/v1/index.js names the
@@ -4554,10 +4647,11 @@ async function create(input, actor) {
      */
     const jobImageFilenames = normaliseJobImageFilenames(input);
     if (jobImageFilenames.length > 0) {
+      const createdDate = new Date();
       await conn.query(
         `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, created_date)
-         VALUES ${jobImageFilenames.map(() => '(?, ?, ?, ?, NOW())').join(', ')}`,
-        jobImageFilenames.flatMap((name) => [jobId, name, 'booking', 0])
+         VALUES ${jobImageFilenames.map(() => '(?, ?, ?, ?, ?)').join(', ')}`,
+        jobImageFilenames.flatMap((name) => [jobId, name, 'booking', 0, createdDate])
       );
     }
 
@@ -6114,9 +6208,9 @@ async function releaseOwnedJobForReoffer(jobId, preloadedJob, { reasonId, resche
     const crRelease = await closedReasonSet(OFFER_CLOSED_REASON.RELEASED_FOR_REOFFER);
     await conn.query(
       `UPDATE tbl_job_offer
-          SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()${crRelease.sql}
+          SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = ?${crRelease.sql}
         WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
-      [...crRelease.params, jobId],
+      [new Date(), ...crRelease.params, jobId],
     );
     await conn.commit();
     return releasedTechId;
@@ -6360,9 +6454,9 @@ async function assign(jobId, { easyfixerId, reasonId, rescheduleReason, requeste
       const crAssign = await closedReasonSet(OFFER_CLOSED_REASON.JOB_ASSIGNED);
       await conn.query(
         `UPDATE tbl_job_offer
-            SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()${crAssign.sql}
+            SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = ?${crAssign.sql}
           WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
-        [...crAssign.params, jobId],
+        [now, ...crAssign.params, jobId],
       );
     }
 
@@ -6498,7 +6592,7 @@ async function applyUnassignLocked(conn, jobId, lockedJob, {
     // offer, matching accept/list/membership semantics.
     await conn.query(
       `UPDATE tbl_job_offer
-          SET offer_status = ${OFFER_STATUS.REJECTED}, reject_reason = ?, reject_reason_id = ?, responded_at = NOW()
+          SET offer_status = ${OFFER_STATUS.REJECTED}, reject_reason = ?, reject_reason_id = ?, responded_at = ?
         WHERE job_offer_id = (
           SELECT latest_id FROM (
             SELECT MAX(job_offer_id) AS latest_id
@@ -6507,7 +6601,7 @@ async function applyUnassignLocked(conn, jobId, lockedJob, {
           ) latest_offer
         )
           AND offer_status = ${OFFER_STATUS.OFFERED}`,
-      [reason, reasonId != null ? reasonId : null, jobId, techIdAtUnassign],
+      [reason, reasonId != null ? reasonId : null, now, jobId, techIdAtUnassign],
     );
   }
   return Number(techIdAtUnassign);
@@ -6610,6 +6704,7 @@ async function acceptOffer(jobId, efrId) {
   // `committed` guards the catch so a post-commit throw (the 409 path) doesn't
   // issue a ROLLBACK against an already-committed transaction.
   let committed = false;
+  const now = new Date();
   try {
     await conn.beginTransaction();
 
@@ -6684,10 +6779,10 @@ async function acceptOffer(jobId, efrId) {
      */
     const enforceTtl = offerExpiryEnabled();
     const freshnessClause = enforceTtl
-      ? ' AND jo.offered_at >= NOW() - INTERVAL ? MINUTE'
+      ? ' AND jo.offered_at >= ? - INTERVAL ? MINUTE'
       : '';
     const claimParams = enforceTtl
-      ? [efrId, jobId, jobId, efrId, OFFER_TTL_MINUTES]
+      ? [efrId, jobId, jobId, efrId, now, OFFER_TTL_MINUTES]
       : [efrId, jobId, jobId, efrId];
     const [r] = await conn.query(
       `UPDATE tbl_job
@@ -6713,7 +6808,7 @@ async function acceptOffer(jobId, efrId) {
       // contradict the latest-row membership rule used everywhere else.
       const [acceptedOffer] = await conn.query(
         `UPDATE tbl_job_offer
-            SET offer_status = ${OFFER_STATUS.ACCEPTED}, responded_at = NOW()
+            SET offer_status = ${OFFER_STATUS.ACCEPTED}, responded_at = ?
           WHERE job_offer_id = (
             SELECT latest_id FROM (
               SELECT MAX(job_offer_id) AS latest_id
@@ -6722,7 +6817,7 @@ async function acceptOffer(jobId, efrId) {
             ) latest_offer
           )
             AND offer_status = ${OFFER_STATUS.OFFERED}`,
-        [jobId, efrId],
+        [now, jobId, efrId],
       );
       if (Number(acceptedOffer.affectedRows) !== 1) {
         const err = new Error('This job offer is no longer available');
@@ -6731,9 +6826,9 @@ async function acceptOffer(jobId, efrId) {
       }
       const crWon = await closedReasonSet(OFFER_CLOSED_REASON.SIBLING_ACCEPTED);
       await conn.query(
-        `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()${crWon.sql}
+        `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = ?${crWon.sql}
           WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
-        [...crWon.params, jobId],
+        [now, ...crWon.params, jobId],
       );
       await conn.commit();
       committed = true;
@@ -6750,9 +6845,9 @@ async function acceptOffer(jobId, efrId) {
     // tech's own open offer, commit that, and flag a 409 to throw post-finally.
     const crLost = await closedReasonSet(OFFER_CLOSED_REASON.SIBLING_ACCEPTED);
     await conn.query(
-      `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()${crLost.sql}
+      `UPDATE tbl_job_offer SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = ?${crLost.sql}
         WHERE job_id = ? AND fk_easyfixter_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
-      [...crLost.params, jobId, efrId],
+      [now, ...crLost.params, jobId, efrId],
     );
     await conn.commit();
     committed = true;
@@ -6784,9 +6879,12 @@ async function techHasOpenOffer(jobId, efrId) {
   try {
     if (!(await jobOfferTableExists())) return false;
     const lifecycleEligibility = await easyfixerWorkEligibility.sqlPredicate('e');
-    const freshnessClause = offerExpiryEnabled()
-      ? `AND jo.offered_at >= NOW() - INTERVAL ${OFFER_TTL_MINUTES} MINUTE`
+    const enforceTtl = offerExpiryEnabled();
+    const freshnessClause = enforceTtl
+      ? `AND jo.offered_at >= ? - INTERVAL ${OFFER_TTL_MINUTES} MINUTE`
       : '';
+    const params = [jobId, efrId];
+    if (enforceTtl) params.push(new Date());
     const [[row]] = await pool.query(
       `SELECT 1 AS ok
          FROM tbl_job_offer jo
@@ -6806,7 +6904,7 @@ async function techHasOpenOffer(jobId, efrId) {
           AND ${lifecycleEligibility}
           ${freshnessClause}
         LIMIT 1`,
-      [jobId, efrId],
+      params,
     );
     return !!row;
   } catch { return false; }
@@ -6896,14 +6994,15 @@ async function rejectOffer(jobId, efrId, { reason, reasonId } = {}) {
       }
       const enforceTtl = offerExpiryEnabled();
       const freshnessClause = enforceTtl
-        ? ' AND offered_at >= NOW() - INTERVAL ? MINUTE'
+        ? ' AND offered_at >= ? - INTERVAL ? MINUTE'
         : '';
+      const respondedAt = new Date();
       const updateParams = enforceTtl
-        ? [normalizedReason, reasonId != null ? reasonId : null, latestOffer.job_offer_id, OFFER_TTL_MINUTES]
-        : [normalizedReason, reasonId != null ? reasonId : null, latestOffer.job_offer_id];
+        ? [normalizedReason, reasonId != null ? reasonId : null, respondedAt, latestOffer.job_offer_id, respondedAt, OFFER_TTL_MINUTES]
+        : [normalizedReason, reasonId != null ? reasonId : null, respondedAt, latestOffer.job_offer_id];
       const [rejected] = await conn.query(
         `UPDATE tbl_job_offer
-            SET offer_status = ${OFFER_STATUS.REJECTED}, reject_reason = ?, reject_reason_id = ?, responded_at = NOW()
+            SET offer_status = ${OFFER_STATUS.REJECTED}, reject_reason = ?, reject_reason_id = ?, responded_at = ?
           WHERE job_offer_id = ?
             AND offer_status = ${OFFER_STATUS.OFFERED}${freshnessClause}`,
         updateParams,
@@ -7113,9 +7212,9 @@ async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason
       const crResched = await closedReasonSet(OFFER_CLOSED_REASON.RESCHEDULED);
       await conn.query(
         `UPDATE tbl_job_offer
-            SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = NOW()${crResched.sql}
+            SET offer_status = ${OFFER_STATUS.EXPIRED}, responded_at = ?${crResched.sql}
           WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
-        [...crResched.params, jobId],
+        [rescheduledAt, ...crResched.params, jobId],
       );
     }
     await conn.commit();
@@ -7274,7 +7373,7 @@ async function listOfferedForTech(efrId, { limit = 50 } = {}) {
   const lifecycleEligibility = await easyfixerWorkEligibility.sqlPredicate('e');
   const expiryEnabled = offerExpiryEnabled();
   const freshnessClause = expiryEnabled
-    ? `AND jo.offered_at >= NOW() - INTERVAL ${OFFER_TTL_MINUTES} MINUTE`
+    ? `AND jo.offered_at >= ? - INTERVAL ${OFFER_TTL_MINUTES} MINUTE`
     : '';
   const expiresAtProjection = expiryEnabled
     ? `DATE_ADD(jo.offered_at, INTERVAL ${OFFER_TTL_MINUTES} MINUTE)`
@@ -7307,7 +7406,7 @@ async function listOfferedForTech(efrId, { limit = 50 } = {}) {
         ${freshnessClause}
       ORDER BY jo.offered_at DESC
       LIMIT ?`,
-    [efrId, safeLimit],
+    expiryEnabled ? [efrId, new Date(), safeLimit] : [efrId, safeLimit],
   );
   const ids = offerRows.map((r) => Number(r.job_id));
   if (!ids.length) return { items: [] };
@@ -7589,6 +7688,9 @@ async function notifyCustomerNotReachable(jobId) {
 }
 
 module.exports = {
+  // preferred_slot column probe — shared by the customer reschedule writer and
+  // the admin request readers (routes/public/job-completion.js, routes/admin/).
+  customerRequestSlotColumnExists,
   // Shared with services/job-export.service.js so the two q-clauses cannot
   // drift on what counts as a phone fragment. See the block at its definition.
   MOBILE_MIN_DIGITS,
@@ -7599,7 +7701,7 @@ module.exports = {
   // tbl_job.client_services CSV in sync after the customer's self-submit
   // mutates tbl_job_services. Single source of truth, one helper.
   recomputeClientServicesCsv,
-  list, getById, getByIdCore, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, reschedule, unassign, acceptOffer, changeOwner,
+  list, getById, getByIdCore, resolveSelfie, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, reschedule, unassign, acceptOffer, changeOwner,
   hasAfterWorkPhoto, afterPhotoRequiredError,
   // Technician app requests. rejectAppRequest is the Reject button; there is no
   // approve twin because Approve is the ordinary cancel/reschedule, and

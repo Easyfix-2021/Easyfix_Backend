@@ -22,13 +22,9 @@
  *   • The bank row is written with the SAME column set the app writes
  *     (routes/mobile/index.js POST /bank-details).
  *
- * CLOCKS: the legacy columns on tbl_easyfixer / tbl_easyfixer_bank_details
- * keep the clock their existing writers use (SQL NOW(), per
- * services/easyfixer-verification.service.js). The NEW audit table is written
- * app-side as new Date(), which the pool's +05:30 session timezone stores as
- * the IST wall clock verbatim. Two clocks, each consistent with its own
- * table's other writers — the same split documented in
- * migrations/executed/2026-08-04-create-tbl-job-conference.sql.
+ * CLOCKS: every date/time column here — legacy and new alike — is bound as
+ * new Date(), never SQL NOW(); the pool's +05:30 session timezone stores it
+ * as the IST wall clock regardless of host.
  */
 
 'use strict';
@@ -271,8 +267,8 @@ async function changeMobile(efrId, body, actor, ctx = {}) {
   }
 
   await db.query(
-    'UPDATE tbl_easyfixer SET efr_no = ?, updated_by = ?, update_date = NOW() WHERE efr_id = ?',
-    [mobile, actor?.user_id ?? null, efrId],
+    'UPDATE tbl_easyfixer SET efr_no = ?, updated_by = ?, update_date = ? WHERE efr_id = ?',
+    [mobile, actor?.user_id ?? null, new Date(), efrId],
   );
 
   /*
@@ -529,6 +525,7 @@ async function changeBank(efrId, body, actor, ctx = {}) {
   const conn = await db.getConnection();
   try {
     await conn.beginTransaction();
+    const now = new Date();
 
     const [[existing]] = await conn.query(
       `SELECT efr_bank_id, efr_bank_acc_num
@@ -547,19 +544,19 @@ async function changeBank(efrId, body, actor, ctx = {}) {
                 bank = COALESCE(?, bank),
                 is_verified_by_app = ?,
                 updated_by = ?,
-                update_date = NOW()
+                update_date = ?
           WHERE efr_id = ?`,
         [accountNumber, holder, ifsc, bankId, verifiedFlag === 1 ? 1 : 0,
-          actor?.user_id ?? null, efrId],
+          actor?.user_id ?? null, now, efrId],
       );
     } else {
       await conn.query(
         `INSERT INTO tbl_easyfixer_bank_details
            (efr_id, efr_bank_acc_num, efr_bank_acc_name, efr_bank_ifsc, bank,
             is_verified_by_app, updated_by, insert_date, update_date)
-         VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [efrId, accountNumber, holder, ifsc, bankId, verifiedFlag === 1 ? 1 : 0,
-          actor?.user_id ?? null],
+          actor?.user_id ?? null, now, now],
       );
     }
 
@@ -576,9 +573,9 @@ async function changeBank(efrId, body, actor, ctx = {}) {
           SET is_bank_details_verified_by_crm = ?,
               efr_bank_details_perc = 100,
               updated_by = ?,
-              update_date = NOW()
+              update_date = ?
         WHERE efr_id = ?`,
-      [verifiedFlag, actor?.user_id ?? null, efrId],
+      [verifiedFlag, actor?.user_id ?? null, now, efrId],
     );
 
     await recordChange({

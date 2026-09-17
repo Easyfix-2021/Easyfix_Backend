@@ -688,11 +688,18 @@ async function fetchOpenOrders(pf) {
            ELSE TJ.requested_date_time END)`;
 
   // Param order MUST match placeholder order in the SQL below:
-  //   dateExpr appears 5× (Future + 4 TIMESTAMPDIFF branches), each binding
-  //   :dateMode twice ⇒ 10 dateMode binds; then vertical ×2, zonal ×2, then
-  //   the manage_clients ids (via clientGuard which appends to `params`).
+  //   dateExpr appears 4× (Future + 3 TIMESTAMPDIFF branches — NOT 5×, a
+  //   stale count here previously pushed 10 dateMode binds against 8 real
+  //   ? in dateExpr, which shifted every filter after it: vertical_id was
+  //   silently bound to dateMode, state_user to verticalId, and so on. Each
+  //   dateExpr usage (2 dateMode ?) is now immediately followed by the one
+  //   clock ? (NOW() converted below — requested_date_time /
+  //   original_appointment_date_time are app-written IST datetimes, so it's
+  //   a bound Date), giving [dm, dm, now] × 4; then vertical ×2, zonal ×2,
+  //   then the manage_clients ids (via clientGuard which appends to `params`).
+  const now = new Date();
   const params = [];
-  for (let i = 0; i < 10; i++) params.push(dm);
+  for (let i = 0; i < 4; i++) params.push(dm, dm, now);
   params.push(pf.verticalId, pf.verticalId, pf.zonalManagerId, pf.zonalManagerId);
   const clientFrag = clientGuard('TJ.fk_client_id', pf, params); // pushes client ids
 
@@ -700,10 +707,10 @@ async function fetchOpenOrders(pf) {
     `SELECT date_range, COUNT(job_id) AS job_count FROM (
         SELECT TJ.job_id,
           CASE
-            WHEN ${dateExpr} > NOW() THEN 'Future'
-            WHEN TIMESTAMPDIFF(MINUTE, ${dateExpr}, NOW()) BETWEEN 0 AND 1440 THEN '0-1 days'
-            WHEN TIMESTAMPDIFF(MINUTE, ${dateExpr}, NOW()) BETWEEN 1441 AND 4320 THEN '2-3 days'
-            WHEN TIMESTAMPDIFF(MINUTE, ${dateExpr}, NOW()) BETWEEN 4321 AND 7200 THEN '4-5 days'
+            WHEN ${dateExpr} > ? THEN 'Future'
+            WHEN TIMESTAMPDIFF(MINUTE, ${dateExpr}, ?) BETWEEN 0 AND 1440 THEN '0-1 days'
+            WHEN TIMESTAMPDIFF(MINUTE, ${dateExpr}, ?) BETWEEN 1441 AND 4320 THEN '2-3 days'
+            WHEN TIMESTAMPDIFF(MINUTE, ${dateExpr}, ?) BETWEEN 4321 AND 7200 THEN '4-5 days'
             ELSE '>5 days'
           END AS date_range
         FROM tbl_job TJ
@@ -782,17 +789,22 @@ async function fetchEscalationOrders(pf) {
   const params = [];
   const clientFrag = clientGuard('TJ.fk_client_id', pf, params);
   const scalarParams = [pf.verticalId, pf.verticalId, pf.zonalManagerId, pf.zonalManagerId];
-  const finalParams = [...scalarParams, ...params];
+  // escalated_time is app-written (routes/admin/jobs.js binds new Date()), so
+  // each NOW() comparing against it below shares this one bound `now`. These
+  // six params are textually first — the CASE sits before the WHERE clause.
+  const now = new Date();
+  const escalatedNowParams = [now, now, now, now, now, now];
+  const finalParams = [...escalatedNowParams, ...scalarParams, ...params];
   const sql =
     `SELECT escalation_bucket, COUNT(*) AS COUNT FROM (
         SELECT
           CASE
-            WHEN TIMESTAMPDIFF(HOUR, TRC.escalated_time, NOW()) <= 24 THEN '0-24 hrs'
-            WHEN TIMESTAMPDIFF(HOUR, TRC.escalated_time, NOW()) > 24
-              AND TIMESTAMPDIFF(HOUR, TRC.escalated_time, NOW()) <= 48 THEN '24-48 hrs'
-            WHEN TIMESTAMPDIFF(HOUR, TRC.escalated_time, NOW()) > 48
-              AND TIMESTAMPDIFF(HOUR, TRC.escalated_time, NOW()) <= 72 THEN '48-72 hrs'
-            WHEN TIMESTAMPDIFF(HOUR, TRC.escalated_time, NOW()) > 72 THEN '>72 hrs'
+            WHEN TIMESTAMPDIFF(HOUR, TRC.escalated_time, ?) <= 24 THEN '0-24 hrs'
+            WHEN TIMESTAMPDIFF(HOUR, TRC.escalated_time, ?) > 24
+              AND TIMESTAMPDIFF(HOUR, TRC.escalated_time, ?) <= 48 THEN '24-48 hrs'
+            WHEN TIMESTAMPDIFF(HOUR, TRC.escalated_time, ?) > 48
+              AND TIMESTAMPDIFF(HOUR, TRC.escalated_time, ?) <= 72 THEN '48-72 hrs'
+            WHEN TIMESTAMPDIFF(HOUR, TRC.escalated_time, ?) > 72 THEN '>72 hrs'
           END AS escalation_bucket
         FROM tbl_job TJ
         LEFT JOIN tbl_client TCL ON TCL.client_id = TJ.fk_client_id

@@ -277,6 +277,7 @@ async function volume(scope, months = 6) {
    * branches remain index-eligible. Grouping a filtered set is cheap; filtering
    * with a function is not.
    */
+  const now = new Date();
   const [rows] = await pool.query(`
     SELECT DATE_FORMAT(COALESCE(J.checkout_date_time, J.cancel_date_time), '%Y-%m') AS ym,
            SUM(CASE WHEN J.job_status IN ${COMPLETED_STATUSES} THEN 1 ELSE 0 END) AS completed,
@@ -284,12 +285,12 @@ async function volume(scope, months = 6) {
       FROM tbl_job J${join}
      WHERE ${clause}
        AND (
-         (J.job_status IN ${COMPLETED_STATUSES} AND J.checkout_date_time >= DATE_SUB(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL ${n - 1} MONTH))
+         (J.job_status IN ${COMPLETED_STATUSES} AND J.checkout_date_time >= DATE_SUB(DATE_FORMAT(DATE(?), '%Y-%m-01'), INTERVAL ${n - 1} MONTH))
          OR
-         (J.job_status = ${CANCELLED_STATUS} AND J.cancel_date_time >= DATE_SUB(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL ${n - 1} MONTH))
+         (J.job_status = ${CANCELLED_STATUS} AND J.cancel_date_time >= DATE_SUB(DATE_FORMAT(DATE(?), '%Y-%m-01'), INTERVAL ${n - 1} MONTH))
        )
      GROUP BY ym
-     ORDER BY ym ASC`, params);
+     ORDER BY ym ASC`, [...params, now, now]);
 
   return rows.map((r) => ({
     month: r.ym,

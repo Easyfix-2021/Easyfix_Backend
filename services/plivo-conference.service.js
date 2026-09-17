@@ -508,10 +508,10 @@ function xmlText(v) {
 
 function nowIst() {
   // tbl_job_conference columns only. The pool's +05:30 session timezone stores
-  // this wall clock verbatim. Never NOW() here — that is the UTC server clock
-  // and would mix two timezones into one column. (tbl_plivo_call_log is the
-  // mirror image: it is NOW()-written throughout, and the leg helpers keep it
-  // that way — see the clock note in plivo-call-log.service.js.)
+  // this wall clock verbatim. Never NOW() here — that is the DB session's zone
+  // (SYSTEM), not guaranteed IST, and would mix two clocks into one column.
+  // tbl_plivo_call_log follows the same rule — see the clock note in
+  // plivo-call-log.service.js.
   return new Date();
 }
 
@@ -1478,9 +1478,9 @@ async function getConferenceByFriendlyName(friendlyName, pool) {
  * columns hold the IST wall clock (app-written new Date() + the pool's +05:30
  * session timezone), while NOW() is whatever zone the DB server is in. A JS-side
  * Date compares IST to IST verbatim and depends on no server clock zone at all.
- * (The opposite rule applies to the LEG sweep, whose column is NOW()-written —
- * see listStuckConferenceLegs in plivo-call-log.service.js. The clock a
- * comparison uses must be the clock the column was written in.)
+ * (The LEG sweep follows the same rule — see listStuckConferenceLegs in
+ * plivo-call-log.service.js. The clock a comparison uses must be the clock the
+ * column was written in.)
  */
 async function listStaleConferences({ olderThanSec, limit = 50 } = {}, pool) {
   if (!pool) return { ok: false, code: 'no_pool', conferences: [] };

@@ -438,11 +438,12 @@ async function addComment(efrId, { text, section }, actor) {
   }
   const author = actor?.user_name || actor?.name || 'system';
   const authorId = actor?.user_id || null;
+  const now = new Date();
   await pool.query(
     `INSERT INTO easyfixer_comments
        (comment, commented_by, comment_in_section, commented_on, commented_by_id, easyfixer_id)
-     VALUES (?, ?, ?, NOW(), ?, ?)`,
-    [text, author, section, authorId, efrId]
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [text, author, section, now, authorId, efrId]
   );
   logger.info('Comment added · efrId=' + efrId + ' · section=' + section);
   return getCommentsBySection(efrId, section);
@@ -467,8 +468,8 @@ async function saveProfessional(efrId, body, actor) {
     logger.info('Professional details unchanged (no fields) · efrId=' + efrId);
     return getVerificationPage(efrId);
   }
-  fields.push('updated_by = ?', 'update_date = NOW()');
-  params.push(actor?.user_id || null, efrId);
+  fields.push('updated_by = ?', 'update_date = ?');
+  params.push(actor?.user_id || null, new Date(), efrId);
   await pool.query(`UPDATE tbl_easyfixer SET ${fields.join(', ')} WHERE efr_id = ?`, params);
   logger.info('Professional details updated · efrId=' + efrId + ' · fields=' + (fields.length - 2));
   return getVerificationPage(efrId);
@@ -482,12 +483,13 @@ async function savePersonalFamily(efrId, body, actor) {
         SET is_personal_details_verified_by_crm = ?,
             personal_details_verification_comment_crm = ?,
             updated_by = ?,
-            update_date = NOW()
+            update_date = ?
       WHERE efr_id = ?`,
     [
       body.is_verified ? 1 : 0,
       body.verification_comment || null,
       actor?.user_id || null,
+      new Date(),
       efrId,
     ]
   );
@@ -498,22 +500,23 @@ async function savePersonalFamily(efrId, body, actor) {
 // Banking details verification (matches updateBankDetailsVerificationStatusById).
 async function saveBanking(efrId, body, actor) {
   logger.info('Save banking verification · efrId=' + efrId + ' · verification_status=' + body.verification_status);
+  const now = new Date();
   if (Number(body.verification_status) === 1) {
     await pool.query(
       `UPDATE tbl_easyfixer
           SET is_bank_details_verified_by_crm = 1,
-              updated_by = ?, update_date = NOW()
+              updated_by = ?, update_date = ?
         WHERE efr_id = ?`,
-      [actor?.user_id || null, efrId]
+      [actor?.user_id || null, now, efrId]
     );
   } else if (Number(body.verification_status) === 2) {
     await pool.query(
       `UPDATE tbl_easyfixer
           SET is_bank_details_verified_by_crm = 2,
               bank_details_verification_comment = ?,
-              updated_by = ?, update_date = NOW()
+              updated_by = ?, update_date = ?
         WHERE efr_id = ?`,
-      [body.verification_comment || null, actor?.user_id || null, efrId]
+      [body.verification_comment || null, actor?.user_id || null, now, efrId]
     );
   }
   logger.info('Banking verification updated · efrId=' + efrId + ' · verification_status=' + body.verification_status);
@@ -523,6 +526,7 @@ async function saveBanking(efrId, body, actor) {
 // Identity verification (matches updateIdentityDetailsVerificationStatusById).
 async function applyIdentityMutation(db, efrId, body, actor) {
   const status = Number(body.verification_status);
+  const now = new Date();
   const sets = [];
   const params = [];
   if (body.adhaar_card_number !== undefined) {
@@ -538,9 +542,9 @@ async function applyIdentityMutation(db, efrId, body, actor) {
       'is_identity_details_verified_by_crm = 1',
       'send_back_to_tx_reason_crm = NULL',
       'efr_identity_details_perc = COALESCE(?, efr_identity_details_perc)',
-      'send_to_finance_date_time = NOW()',
+      'send_to_finance_date_time = ?',
     );
-    params.push(body.progress ?? null);
+    params.push(body.progress ?? null, now);
   } else if (status === 2) {
     sets.push(
       'is_identity_details_verified_by_crm = 2',
@@ -549,8 +553,8 @@ async function applyIdentityMutation(db, efrId, body, actor) {
     params.push(body.rejected_reason);
   }
   if (!sets.length) return;
-  sets.push('updated_by = ?', 'update_date = NOW()');
-  params.push(actor?.user_id || null, Number(efrId));
+  sets.push('updated_by = ?', 'update_date = ?');
+  params.push(actor?.user_id || null, now, Number(efrId));
   await db.query(
     `UPDATE tbl_easyfixer SET ${sets.join(', ')} WHERE efr_id = ?`,
     params,
@@ -635,20 +639,21 @@ async function setLeadVerification(efrId, body, actor) {
       error.status = 422;
       throw error;
     }
+    const now = new Date();
     if (v === 1 && body.efr_cityId) {
       await conn.query(
         `UPDATE tbl_easyfixer
-            SET efr_cityId = ?, updated_by = ?, update_date = NOW()
+            SET efr_cityId = ?, updated_by = ?, update_date = ?
           WHERE efr_id = ?`,
-        [body.efr_cityId, actor?.user_id || null, efrId],
+        [body.efr_cityId, actor?.user_id || null, now, efrId],
       );
     }
     await conn.query(
       `UPDATE tbl_user
           SET personal_details_filled = ?, updated_by = ?, user_status = 1,
-              released_on_date_time = NOW(), update_date = NOW()
+              released_on_date_time = ?, update_date = ?
         WHERE user_id = ?`,
-      [v, actor?.user_id || null, row.user_id],
+      [v, actor?.user_id || null, now, now, row.user_id],
     );
     // A transport retry sees the locked pre-mutation value already equal to v
     // and therefore cannot append the same status comment twice.
@@ -656,11 +661,12 @@ async function setLeadVerification(efrId, body, actor) {
       await conn.query(
         `INSERT INTO easyfixer_comments
            (comment, commented_by, comment_in_section, commented_on, commented_by_id, easyfixer_id)
-         VALUES (?, ?, ?, NOW(), ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?)`,
         [
           comment,
           actor?.user_name || actor?.name || 'system',
           SECTION.LEAD,
+          now,
           actor?.user_id || null,
           efrId,
         ],
@@ -769,8 +775,8 @@ async function saveActivation(efrId, body, actor) {
       const params = [];
       if (body.easyfix_bank_name_id !== undefined) { sets.push('easyfix_bank_name_id = ?'); params.push(body.easyfix_bank_name_id || null); }
       if (body.beneficiary_id        !== undefined) { sets.push('beneficiary_id = ?');        params.push(body.beneficiary_id || null); }
-      sets.push('updated_by = ?', 'update_date = NOW()');
-      params.push(actor?.user_id || null, efrId);
+      sets.push('updated_by = ?', 'update_date = ?');
+      params.push(actor?.user_id || null, new Date(), efrId);
       await pool.query(`UPDATE tbl_easyfixer_bank_details SET ${sets.join(', ')} WHERE efr_id = ?`, params);
     }
   }
@@ -788,7 +794,7 @@ async function saveActivation(efrId, body, actor) {
                 efr_type = COALESCE(?, efr_type),
                 is_technician_verified = 1,
                 profile_crm_activation_by = ?,
-                profile_activation_date_time = NOW(),
+                profile_activation_date_time = ?,
                 efr_status = 1,
                 is_eligible_for_offline_orders = COALESCE(?, is_eligible_for_offline_orders)
           WHERE efr_id = ?`,
@@ -796,6 +802,7 @@ async function saveActivation(efrId, body, actor) {
           body.final_accept_comment || null,
           body.grade || null,
           actor?.user_id || null,
+          new Date(),
           body.is_eligible_for_offline_orders ?? null,
           efrId,
         ],
@@ -809,30 +816,48 @@ async function saveActivation(efrId, body, actor) {
 }
 
 // ─── Client mapping (Activation: Allocate Clients + Map clients) ────
-// `client_ids` is the FINAL list (set semantics) — we INSERT/UPDATE active
-// mappings and soft-disable any not in the list (mapping_status=0).
-async function mapClients(efrId, clientIds, actor) {
+// `client_ids` is the FINAL list (set semantics) — clients not in it are
+// soft-disabled (mapping_status=0); clients in it with no active row get one.
+//
+// tbl_client_easyfixer_mapping has seven columns (mapping_id, client_id,
+// easyfixer_id, service_type_id, service_type_ids, mapping_status, update_date):
+// no inserted_by / insert_date / updated_by, which this used to write, so every
+// save threw ER_BAD_FIELD_ERROR. Its only unique key is the auto-increment
+// mapping_id, so ON DUPLICATE KEY could never fire either. Rows are per
+// (client, technician, service type) and client-tech-mapping.service disables
+// them one service type at a time, so a disabled row is NOT reactivated here —
+// that would undo that screen. A client with no active row gets one new row.
+async function mapClients(efrId, clientIds) {
   const ids = Array.isArray(clientIds) ? clientIds.map(Number).filter((n) => Number.isInteger(n) && n > 0) : [];
   logger.info('Map clients to easyfixer · efrId=' + efrId + ' · clients=' + ids.length);
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    const now = new Date();
+    const inList = ids.map(() => '?').join(',');
     // Soft-disable mappings not in the list.
     await conn.query(
       `UPDATE tbl_client_easyfixer_mapping
-          SET mapping_status = 0, updated_by = ?, update_date = NOW()
-        WHERE easyfixer_id = ? ${ids.length ? `AND client_id NOT IN (${ids.map(() => '?').join(',')})` : ''}`,
-      [actor?.user_id || null, efrId, ...ids]
+          SET mapping_status = 0, update_date = ?
+        WHERE easyfixer_id = ? ${ids.length ? `AND client_id NOT IN (${inList})` : ''}`,
+      [now, efrId, ...ids]
     );
-    // Upsert each id (mapping_status=1).
-    for (const cid of ids) {
-      await conn.query(
-        `INSERT INTO tbl_client_easyfixer_mapping
-           (client_id, easyfixer_id, mapping_status, inserted_by, insert_date, update_date)
-         VALUES (?, ?, 1, ?, NOW(), NOW())
-         ON DUPLICATE KEY UPDATE mapping_status = 1, updated_by = VALUES(inserted_by), update_date = NOW()`,
-        [cid, efrId, actor?.user_id || null]
+    if (ids.length) {
+      const [existing] = await conn.query(
+        `SELECT DISTINCT client_id FROM tbl_client_easyfixer_mapping
+          WHERE easyfixer_id = ? AND mapping_status = 1 AND client_id IN (${inList})`,
+        [efrId, ...ids]
       );
+      const have = new Set((existing || []).map((r) => Number(r.client_id)));
+      const missing = ids.filter((cid) => !have.has(cid));
+      if (missing.length) {
+        await conn.query(
+          `INSERT INTO tbl_client_easyfixer_mapping
+             (client_id, easyfixer_id, mapping_status, update_date)
+           VALUES ?`,
+          [missing.map((cid) => [cid, efrId, 1, now])]
+        );
+      }
     }
     await conn.commit();
   } catch (e) {
@@ -993,6 +1018,7 @@ async function replaceOptionMappings(efrId, items, actor, externalConn = null) {
   // easyfixer self-acts → stamp their efr_id. Columns discovered defensively.
   const byId = actor?.user_id || efrId;
   const audit = await deepskillMappingAuditCols();
+  const now = new Date();
 
   // Normalise + dedupe the desired set into PHYSICAL-column tuples. INVERSION
   // (preserved verbatim): semantic deep_skill_id → physical parent_skill_id;
@@ -1056,7 +1082,9 @@ async function replaceOptionMappings(efrId, items, actor, externalConn = null) {
     if (reactivateIds.length) {
       const reSets = ['is_repairing = 1'];
       const auditParams = [];
-      if (audit.dateCol) reSets.push('`' + audit.dateCol + '` = NOW()');
+      // audit.dateCol resolves (SHOW COLUMNS, see deepskillMappingAuditCols)
+      // to insert_date, a DATETIME column — bind a Date, never NOW().
+      if (audit.dateCol) { reSets.push('`' + audit.dateCol + '` = ?'); auditParams.push(now); }
       if (audit.byCol)   { reSets.push('`' + audit.byCol + '` = ?'); auditParams.push(byId); }
       for (let i = 0; i < reactivateIds.length; i += MAPPING_WRITE_CHUNK) {
         const chunk = reactivateIds.slice(i, i + MAPPING_WRITE_CHUNK);
@@ -1082,7 +1110,7 @@ async function replaceOptionMappings(efrId, items, actor, externalConn = null) {
           // parent_skill_id holds deep_skill_id; deep_skill_id holds option_id (inversion).
           const vals = ['?', '?', '?', '?', '?', '1'];
           insParams.push(efrId, d.categoryId, d.serviceTypeId, d.parentSkillId, d.deepSkillId);
-          if (audit.dateCol) vals.push('NOW()');
+          if (audit.dateCol) { vals.push('?'); insParams.push(now); }
           if (audit.byCol)   { vals.push('?'); insParams.push(byId); }
           rowSql.push('(' + vals.join(', ') + ')');
         }
@@ -1287,8 +1315,8 @@ async function saveBgvReport(efrId, body, actor) {
   logger.info('Save BGV report · efrId=' + efrId + ' · hasReport=' + !!body.bgv_report_img_name);
   if (body.bgv_report_img_name) {
     await pool.query(
-      `UPDATE tbl_easyfixer SET bgv_report_img_name = ?, updated_by = ?, update_date = NOW() WHERE efr_id = ?`,
-      [body.bgv_report_img_name, actor?.user_id || null, efrId]
+      `UPDATE tbl_easyfixer SET bgv_report_img_name = ?, updated_by = ?, update_date = ? WHERE efr_id = ?`,
+      [body.bgv_report_img_name, actor?.user_id || null, new Date(), efrId]
     ).catch(() => {});
     logger.info('BGV report saved · efrId=' + efrId);
   }

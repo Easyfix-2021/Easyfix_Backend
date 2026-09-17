@@ -428,9 +428,9 @@ async function approveCity(cityId, userId) {
      * has no forward pointer", and it is enforced at both places a city
      * becomes active — here and in updateCity's reactivation branch.
      */
-    sets.push('approved_by = ?', 'approved_at = NOW()', "approval_decision = 'approved'",
+    sets.push('approved_by = ?', 'approved_at = ?', "approval_decision = 'approved'",
       'merged_into_city_id = NULL');
-    params.push(userId || null);
+    params.push(userId || null, new Date());
   }
   params.push(cityId, STATUS_PENDING);
 
@@ -695,8 +695,8 @@ async function rejectCity(cityId, replacementCityId, userId) {
     const sets  = ['city_status = ?'];
     const params = [STATUS_INACTIVE];
     if (stamp) {
-      sets.push('approved_by = ?', 'approved_at = NOW()', "approval_decision = 'rejected'", 'merged_into_city_id = ?');
-      params.push(userId || null, replacementCityId);
+      sets.push('approved_by = ?', 'approved_at = ?', "approval_decision = 'rejected'", 'merged_into_city_id = ?');
+      params.push(userId || null, new Date(), replacementCityId);
     }
     params.push(cityId);
     await conn.query(`UPDATE tbl_city SET ${sets.join(', ')} WHERE city_id = ?`, params);

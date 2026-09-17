@@ -81,7 +81,7 @@ const BASELINE = where({});
  * purpose: it is the only reason the exporter never took the box down a second
  * time, and it is what a weak filter must NOT be able to remove.
  */
-const DEFAULT_FLOOR = 'J.created_date_time >= DATE_SUB(NOW(), INTERVAL 6 MONTH)';
+const DEFAULT_FLOOR = 'J.created_date_time >= DATE_SUB(?, INTERVAL 6 MONTH)';
 const DEFAULT_STATUS_FLOOR = 'J.job_status NOT IN (3, 5, 6, 7)';
 
 /* ── 1. THE ACCEPTANCE CASE ──────────────────────────────────────────────── */
@@ -126,8 +126,13 @@ test('ACCEPTANCE: a Closed-status export returns CLOSED jobs, not their compleme
 
 test('a single numeric `status` takes the same direct path (statuses wins when both are sent)', () => {
   assert.match(where({ status: 3 }), /J\.job_status IN \(\?\)/);
-  assert.deepEqual(buildExportWhere({ status: 3, statuses: '6,7' }).params, [6, 7],
+  // No window/identity filter is given, so the default 6-month floor still
+  // fires and appends its own bound `now` after the status codes.
+  const { params } = buildExportWhere({ status: 3, statuses: '6,7' });
+  assert.deepEqual(params.slice(0, 2), [6, 7],
     '`statuses` outranks `status`, exactly as job.service list() orders them');
+  assert.ok(params[2] instanceof Date, 'trailing bound `now` for the default window');
+  assert.equal(params.length, 3);
 });
 
 test('a NON-numeric status still takes the legacy substring-token path, untouched', () => {
@@ -138,7 +143,10 @@ test('a NON-numeric status still takes the legacy substring-token path, untouche
    * paths stay separate and the token path keeps its old output.
    */
   const w = where({ status: 'completed' });
-  assert.deepEqual(buildExportWhere({ status: 'completed' }).params, [3, 5]);
+  const { params } = buildExportWhere({ status: 'completed' });
+  assert.deepEqual(params.slice(0, 2), [3, 5]);
+  assert.ok(params[2] instanceof Date, 'trailing bound `now` for the default window');
+  assert.equal(params.length, 3);
   assert.match(w, /J\.job_status IN \(\?, \?\)/);
 
   // The documented legacy bug: acknowledge + any other tab constrains EVERY
@@ -204,7 +212,11 @@ test('scope NARROWS: an out-of-scope clientId yields nothing, never that client�
   const { where: w, params } = buildExportWhere({ scope: SCOPE, clientId: '99' });
   // Both predicates are present and ANDed, so client 99 ∧ client ∈ {7,9} = ∅.
   assert.match(w, /J\.fk_client_id IN \(\?, \?\)[\s\S]*J\.fk_client_id IN \(\?\)/);
-  assert.deepEqual(params, [7, 9, 3, 2, 99]);
+  // scope/clientId are neither a point-identity filter nor a window, so the
+  // default floor still fires and appends its own bound `now` last.
+  assert.deepEqual(params.slice(0, 5), [7, 9, 3, 2, 99]);
+  assert.ok(params[5] instanceof Date, 'trailing bound `now` for the default window');
+  assert.equal(params.length, 6);
 });
 
 test('mode "none" on any dimension is zero rows, not "everything"', () => {
@@ -217,8 +229,13 @@ test('mode "none" on any dimension is zero rows, not "everything"', () => {
 test('Job Stage Access restricts the exported statuses', () => {
   const { where: w, params } = buildExportWhere({ allowedStages: { mode: 'list', stages: ['pending-close'] } });
   assert.match(w, /J\.job_status IN \(\?, \?\)/);
-  assert.deepEqual(params.sort((a, b) => a - b), [2, 20],
+  // allowedStages alone is neither a point-identity filter nor a window, so
+  // the default floor still fires and appends its own bound `now` last.
+  const numeric = params.filter((p) => typeof p === 'number').sort((a, b) => a - b);
+  assert.deepEqual(numeric, [2, 20],
     'the same union lib/job-stages.js gives the jobs list');
+  assert.equal(params.length, 3);
+  assert.ok(params.some((p) => p instanceof Date), 'trailing bound `now` for the default window');
 });
 
 test('stage access INTERSECTS a status filter, it never replaces it', () => {
@@ -627,12 +644,19 @@ test('startDate/endDate use DATE() on the PARAMETER, never on the column', () =>
 });
 
 test('csvIds filters accept a LIST — Number("12,34") is NaN and used to drop them', () => {
-  assert.deepEqual(buildExportWhere({ clientId: '12,34' }).params, [12, 34]);
-  assert.deepEqual(buildExportWhere({ cityId: '3,4,5' }).params, [3, 4, 5]);
-  assert.deepEqual(buildExportWhere({ zonalManagerId: '9,10' }).params, [9, 10]);
-  assert.deepEqual(buildExportWhere({ projectManagerId: '8' }).params, [8]);
+  // None of these filters is a window or point-identity match, so the default
+  // 6-month floor still fires on each and appends its own bound `now` last.
+  const csvParams = (filters) => {
+    const { params } = buildExportWhere(filters);
+    assert.ok(params.at(-1) instanceof Date, 'trailing bound `now` for the default window');
+    return params.slice(0, -1);
+  };
+  assert.deepEqual(csvParams({ clientId: '12,34' }), [12, 34]);
+  assert.deepEqual(csvParams({ cityId: '3,4,5' }), [3, 4, 5]);
+  assert.deepEqual(csvParams({ zonalManagerId: '9,10' }), [9, 10]);
+  assert.deepEqual(csvParams({ projectManagerId: '8' }), [8]);
   // …and a lone id still works, for the single-select callers.
-  assert.deepEqual(buildExportWhere({ clientId: 12 }).params, [12]);
+  assert.deepEqual(csvParams({ clientId: 12 }), [12]);
 });
 
 test('zonalId keeps its LEGACY meaning (the zonal MANAGER), zonalManagerId matches it', () => {
@@ -657,13 +681,19 @@ test('the deliberate legacy quirks survive', () => {
   const w = where({ dateFrom: '2026-01-01', dateTo: '2026-01-31', dateType: 'checkoutdatetime' });
   assert.match(w, /J\.job_status IN \(3, 5\)/);
   // Legacy's unbalanced-paren aging-bucket bug is still emitted as ONE balanced
-  // OR group (three buckets used to be a hard SQL error).
-  assert.match(where({ bucketAgingRange: '1,2,3' }), /\(\(DATE_SUB\(NOW\(\), INTERVAL 24 HOUR\)[\s\S]*\)\)/);
+  // OR group (three buckets used to be a hard SQL error). NOW() is now a bound
+  // `?` (same wall clock, no DB round trip), so the fragment wraps `?` instead.
+  assert.match(where({ bucketAgingRange: '1,2,3' }), /\(\(DATE_SUB\(\?, INTERVAL 24 HOUR\)[\s\S]*\)\)/);
   // The legacy pinCode filter stays a PREFIX match (index-usable); listQuery's
   // `pin` is list()'s CONTAINS form. Different names, different wraps, both
-  // deliberate.
-  assert.deepEqual(buildExportWhere({ pinCode: '110' }).params, ['110%']);
-  assert.deepEqual(buildExportWhere({ pin: '110' }).params, ['%110%']);
+  // deliberate. Neither is a window/identity filter, so the default floor's
+  // bound `now` still trails each params array.
+  const pinCodeParams = buildExportWhere({ pinCode: '110' }).params;
+  assert.deepEqual(pinCodeParams.slice(0, -1), ['110%']);
+  assert.ok(pinCodeParams.at(-1) instanceof Date);
+  const pinParams = buildExportWhere({ pin: '110' }).params;
+  assert.deepEqual(pinParams.slice(0, -1), ['%110%']);
+  assert.ok(pinParams.at(-1) instanceof Date);
 });
 
 /* ═══ the second-pass review findings, pinned ════════════════════════════ */

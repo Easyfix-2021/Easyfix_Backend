@@ -169,9 +169,9 @@ router.post(['/jobs', '/jobs/newJob'], async (req, res, next) => {
     if (imageIds.length) {
       const [adopted] = await pool.query(
         `UPDATE tbl_job_image
-            SET job_id = ?, updated_by = ?, updated_date = NOW()
+            SET job_id = ?, updated_by = ?, updated_date = ?
           WHERE image_id IN (?) AND job_id IS NULL AND created_by = ?`,
-        [created.job_id, req.integrationClient.id, imageIds, req.integrationClient.id]
+        [created.job_id, req.integrationClient.id, new Date(), imageIds, req.integrationClient.id]
       );
       logger.info('Integration: adopted ' + adopted.affectedRows + '/' + imageIds.length + ' pre-uploaded images');
     }
@@ -352,8 +352,8 @@ router.post('/jobImage/addJobImages', upload.single('file'), async (req, res, ne
     // that actually uploaded the file, so it must be stamped here.
     const [ins] = await pool.query(
       `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, status, created_by, updated_by, created_date)
-       VALUES (?, ?, 'unconfirmed', 0, 1, ?, ?, NOW())`,
-      [jobId, saved.filename, req.integrationClient.id, req.integrationClient.id]
+       VALUES (?, ?, 'unconfirmed', 0, 1, ?, ?, ?)`,
+      [jobId, saved.filename, req.integrationClient.id, req.integrationClient.id, new Date()]
     );
     logger.info('Integration: job image saved · jobId=' + (jobId || 'unattached') + ' imageId=' + ins.insertId);
     legacyOk(res, {
@@ -535,9 +535,10 @@ router.post('/customer/addCustomer', async (req, res, next) => {
     const { name, mobile, email } = req.body || {};
     logger.info('Integration: add customer');
     if (!name || !mobile) return legacyError(res, 400, 'name and mobile required');
+    const now = new Date();
     const [ins] = await pool.query(
-      'INSERT INTO tbl_customer (customer_name, customer_mob_no, customer_email, is_active, insert_date, update_date) VALUES (?, ?, ?, 1, NOW(), NOW())',
-      [name, mobile, email || null]
+      'INSERT INTO tbl_customer (customer_name, customer_mob_no, customer_email, is_active, insert_date, update_date) VALUES (?, ?, ?, 1, ?, ?)',
+      [name, mobile, email || null, now, now]
     );
     logger.info('Integration: customer created · id=' + ins.insertId);
     legacyOk(res, { id: ins.insertId });
@@ -548,7 +549,7 @@ router.put('/customer', async (req, res, next) => {
     const { id, name, email } = req.body || {};
     logger.info('Integration: update customer · id=' + (id || '-'));
     if (!id) return legacyError(res, 400, 'id required');
-    await pool.query('UPDATE tbl_customer SET customer_name = COALESCE(?, customer_name), customer_email = COALESCE(?, customer_email), update_date = NOW() WHERE customer_id = ?', [name, email, id]);
+    await pool.query('UPDATE tbl_customer SET customer_name = COALESCE(?, customer_name), customer_email = COALESCE(?, customer_email), update_date = ? WHERE customer_id = ?', [name, email, new Date(), id]);
     logger.info('Integration: customer updated · id=' + id);
     legacyOk(res, { updated: true });
   } catch (e) { next(e); }

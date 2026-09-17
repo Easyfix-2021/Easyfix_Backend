@@ -64,9 +64,23 @@ router.get('/health', (_req, res) => {
 router.get('/health/db', async (_req, res) => {
   const started = Date.now();
   try {
-    const [rows] = await pool.query('SELECT 1 AS ok, DATABASE() AS db, NOW() AS ts');
+    /*
+     * The clock columns ride the SAME round-trip. Every DATETIME written with
+     * NOW() takes the DB session's wall clock, while `new Date()` writes are
+     * pinned to IST by the pool's timezone option — so a DB whose session zone
+     * is not +05:30 silently skews every NOW() writer. `dbTime` shows that
+     * directly instead of it being inferred from a bad row.
+     */
+    const [rows] = await pool.query(
+      // eslint-disable-next-line no-restricted-syntax -- /api/health/db measures the DB clock and its zone on purpose
+      `SELECT 1 AS ok, DATABASE() AS db, NOW() AS ts, UTC_TIMESTAMP() AS utc,
+              UNIX_TIMESTAMP() AS epoch, TIMESTAMPDIFF(MINUTE, UTC_TIMESTAMP(), NOW()) AS offset_min,
+              @@session.time_zone AS session_tz, @@system_time_zone AS system_tz`,
+    );
+    const r = rows[0];
 
-    const replica = getReadPoolStats();
+    const { configured } = getReadPoolStats();
+    const probe = {};
     /*
      * Skip the probe while the breaker is OPEN.
      *
@@ -83,28 +97,45 @@ router.get('/health/db', async (_req, res) => {
      * cooldown still lets one probe through periodically, so recovery is
      * detected on its own.
      */
-    if (replica.configured && breakerOpen()) {
-      replica.reachable = false;
-      replica.probeSkipped = 'breaker open — reporting last known state without paying the connect timeout';
-    } else if (replica.configured) {
+    if (configured && breakerOpen()) {
+      probe.reachable = false;
+      probe.probeSkipped = 'breaker open — reporting last known state without paying the connect timeout';
+    } else if (configured) {
       const t0 = Date.now();
       try {
         const id = await identify();
-        replica.reachable = true;
-        replica.latencyMs = Date.now() - t0;
-        replica.readOnly = id.readOnly;
-        replica.serverId = id.serverId;
-        replica.hostname = id.hostname;
-        replica.distinctFromPrimary = id.distinctFromPrimary;
+        probe.reachable = true;
+        probe.latencyMs = Date.now() - t0;
+        probe.readOnly = id.readOnly;
       } catch (err) {
-        replica.reachable = false;
-        replica.error = err.code || err.message;
+        probe.reachable = false;
+        probe.error = err.code || err.message;
       }
     }
+    /*
+     * Snapshot AFTER the probe. Taken before it, the response describes the
+     * breaker as it was one probe ago: the very call that trips the threshold
+     * reports `breaker: "closed"` next to its own ETIMEDOUT, and a cooldown
+     * probe that re-opens it reports "half-open" — which reads as "timing out
+     * and the breaker never opens" when it has just opened. identify() records
+     * serverId/hostname/distinctFromPrimary into the stats on success, so they
+     * arrive through the snapshot rather than being copied here.
+     */
+    const replica = { ...getReadPoolStats(), ...probe };
 
     return modernOk(res, {
-      db: rows[0].db,
-      ts: rows[0].ts,
+      db: r.db,
+      ts: r.ts,
+      dbTime: {
+        now: r.ts, // session wall clock, verbatim (dateStrings)
+        utc: r.utc,
+        offsetMinutes: Number(r.offset_min), // 330 = IST
+        sessionTimeZone: r.session_tz,
+        systemTimeZone: r.system_tz,
+        // App clock minus DB clock; > 0 = app ahead. Sampled before the query,
+        // so round-trip latency can add up to latencyMs of apparent skew.
+        appSkewSeconds: Math.round(started / 1000) - Number(r.epoch),
+      },
       latencyMs: Date.now() - started,
       pool: getPoolStats(),
       replica,

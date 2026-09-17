@@ -100,6 +100,7 @@ async function loadSignals(candidates, cfg) {
   const ids = candidates.map((row) => Number(row.efr_id));
   if (!ids.length) return {};
   const placeholders = ids.map(() => '?').join(',');
+  const now = new Date();
 
   const noShowPromise = cfg.noShowEnabled
     ? pool.query(
@@ -112,12 +113,17 @@ async function loadSignals(candidates, cfg) {
                     THEN 1 ELSE 0 END) AS no_shows
          FROM tbl_easyfixer_attendance
         WHERE easyfixer_id IN (${placeholders})
-          AND created_on >= DATE_SUB(NOW(), INTERVAL ? DAY)
+          AND created_on >= DATE_SUB(?, INTERVAL ? DAY)
         GROUP BY easyfixer_id`,
-      [...ids, cfg.noShowWindowDays],
+      [...ids, now, cfg.noShowWindowDays],
     )
     : Promise.resolve([[]]);
 
+  // Clock rule (shares `now` above): checkout_date_time/created_date_time
+  // (tbl_job) are bound in job.service.js, so the margin window below binds
+  // this instant instead of reading NOW(). insert_date_time
+  // (tbl_easyfixer_rating_by_customer) is written by the legacy feedback flow on
+  // the IST app clock, so the escalation window binds it too.
   const [attendanceResult, jobsResult, gradesResult, escalationsResult,
     marginResult, noShowResult] = await Promise.all([
     pool.query(
@@ -150,14 +156,14 @@ async function loadSignals(candidates, cfg) {
                 ) AS rn
           FROM tbl_easyfixer_rating_by_customer
           WHERE easyfixer_id IN (${placeholders})
-            AND insert_date_time >= DATE_SUB(NOW(), INTERVAL ? DAY)
+            AND insert_date_time >= DATE_SUB(?, INTERVAL ? DAY)
        )
        SELECT efr_id, COUNT(*) AS sample_size,
               SUM(CASE WHEN is_escalated = 1 THEN 1 ELSE 0 END) AS escalated_count
          FROM ranked
         WHERE rn <= 2
         GROUP BY efr_id`,
-      [...ids, cfg.escalationWindowDays],
+      [...ids, now, cfg.escalationWindowDays],
     ),
     pool.query(
       `SELECT j.fk_easyfixter_id AS efr_id,
@@ -169,9 +175,9 @@ async function loadSignals(candidates, cfg) {
         WHERE j.fk_easyfixter_id IN (${placeholders})
           AND j.job_status IN (3, 5)
           AND COALESCE(j.checkout_date_time, j.created_date_time)
-              >= DATE_SUB(NOW(), INTERVAL ? DAY)
+              >= DATE_SUB(?, INTERVAL ? DAY)
         GROUP BY j.fk_easyfixter_id`,
-      [...ids, cfg.marginWindowDays],
+      [...ids, now, cfg.marginWindowDays],
     ),
     noShowPromise,
   ]);

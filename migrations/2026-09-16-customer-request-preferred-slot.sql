@@ -1,0 +1,40 @@
+-- ─────────────────────────────────────────────────────────────────────
+-- 2026-09-16 — Customer reschedule request: preferred SLOT name
+--              (`tbl_job_customer_request.preferred_slot`)
+--
+-- WHAT
+--   • Adds `preferred_slot` next to `preferred_datetime`, so a customer
+--     reschedule request records the booking band the customer chose
+--     ('9AM to 12PM' | '12PM to 3PM' | '3PM to 7PM') and ops read the slot
+--     instead of a bare start time.
+--
+--   • The magic-link Reschedule form now offers only those three daytime
+--     bands, and POST /api/public/job-completion/:token/reschedule-request
+--     rejects any hour before 9 AM or from 7 PM on. The label is DERIVED
+--     server-side from the hour (services/time-slot.js bandForHour), never
+--     taken from the request body.
+--
+--   • When the customer picks no date, the row falls back to the job's
+--     current appointment and stores that appointment's band (which can be
+--     'After Hours' — ops set it, not the customer). NULL for cancel rows,
+--     WhatsApp-flow rows, date-only appointments and all rows written
+--     before this migration. Historical rows are NOT backfilled.
+--
+-- HOW TO APPLY
+--   Run the ALTER below. Plain `ADD COLUMN` — no @-variables, no PREPARE,
+--   no MariaDB-only `IF NOT EXISTS`.
+--
+--   ORDER-INDEPENDENT: the backend probes for the column
+--   (job.service customerRequestSlotColumnExists) and keeps the old INSERT /
+--   NULL-aliased SELECTs until it exists. An "absent" answer is cached per
+--   process, so restart / redeploy the backend after applying.
+--
+-- IDEMPOTENCY
+--   NOT idempotent — a re-run reports "Duplicate column name
+--   'preferred_slot'", meaning it is already applied.
+-- ─────────────────────────────────────────────────────────────────────
+
+ALTER TABLE tbl_job_customer_request ADD COLUMN preferred_slot VARCHAR(20) NULL AFTER preferred_datetime;
+
+-- Verify (read-only):
+-- SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tbl_job_customer_request' AND COLUMN_NAME = 'preferred_slot';

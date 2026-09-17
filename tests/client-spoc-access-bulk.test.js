@@ -44,7 +44,11 @@ test('one multi-row upsert, not a loop of single writes', async () => {
   const writes = fake.calls.filter((c) => UPSERT.test(c.sql));
   assert.equal(writes.length, 1, 'three SPOCs must be one statement, not three');
   // One VALUES tuple per contact.
-  assert.equal((writes[0].sql.match(/\(\?, \?, \?, \?, \?, \?, \?, \?, NOW\(\)\)/g) || []).length, 3);
+  assert.equal((writes[0].sql.match(/\(\?, \?, \?, \?, \?, \?, \?, \?, \?\)/g) || []).length, 3);
+  assert.doesNotMatch(writes[0].sql, /NOW\(\)/, 'updated_at must be a bound Date, not NOW()');
+  for (const stamp of [8, 17, 26]) {
+    assert.ok(writes[0].params[stamp] instanceof Date, `updated_at param at index ${stamp} must be a bound Date`);
+  }
 });
 
 test('only contacts belonging to THIS client are written', async () => {
@@ -56,7 +60,7 @@ test('only contacts belonging to THIS client are written', async () => {
   assert.equal(out.updated, 2);
   assert.equal(out.skipped, 2, 'ids from another tenant are skipped, not written');
 
-  const ids = upsert().params.filter((_, i) => i % 8 === 0);
+  const ids = upsert().params.filter((_, i) => i % 9 === 0);
   assert.deepEqual(ids, [11, 12], 'the foreign ids must never reach the INSERT');
   assert.ok(!upsert().params.includes(777));
 });
@@ -80,7 +84,7 @@ test('duplicate ids collapse so a contact cannot appear twice in one statement',
   fake.reset();
   ownedIds = [11];
   await svc.setContactAccessBulk(42, [11, 11, 11], { spocRole: 2 }, 99);
-  assert.equal((upsert().sql.match(/NOW\(\)\)/g) || []).length, 1,
+  assert.equal((upsert().sql.match(/\(\?, \?, \?, \?, \?, \?, \?, \?, \?\)/g) || []).length, 1,
     'a repeated id must not produce a duplicate VALUES row');
 });
 
@@ -148,7 +152,19 @@ test('every value travels as a bound parameter — nothing is interpolated', asy
   ownedIds = [11];
   await svc.setContactAccessBulk(42, [11], { spocRole: 3 }, 99);
   const sql = upsert().sql;
-  // The only literals in the statement are column names and NOW().
+  // The only literals in the statement are column names.
   assert.ok(!/VALUES\s*\(\s*11\b/.test(sql), 'contact ids must not be inlined');
   assert.ok(!/\b42\b/.test(sql), 'the client id must not be inlined');
+});
+
+// setContactAccess (single-row upsert) shares the exact same VALUES tuple
+// shape as the bulk path above — pinning it here too so a regression to
+// NOW() on either writer is caught.
+test('setContactAccess binds updated_at as a Date, not NOW()', async () => {
+  fake.reset();
+  await svc.setContactAccess(11, 42, { spocRole: 1 }, 99);
+  const sql = upsert().sql;
+  assert.doesNotMatch(sql, /NOW\(\)/, 'updated_at must be a bound Date, not NOW()');
+  assert.match(sql, /VALUES \(\?, \?, \?, \?, \?, \?, \?, \?, \?\)/);
+  assert.ok(upsert().params.at(-1) instanceof Date, 'updated_at must be a bound Date');
 });

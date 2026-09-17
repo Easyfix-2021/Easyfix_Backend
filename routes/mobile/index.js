@@ -106,15 +106,16 @@ async function upsertEasyfixerAppToken(efrId, fcmToken) {
   // there. This mirrors the device_info row, whose fire_base_token is likewise
   // NULLed on a tokenless login. POST /mobile/device fills it when it arrives.
   const token = fcmToken ? String(fcmToken).trim() : null;
+  const now = new Date();
   const [upd] = await pool.query(
-    'UPDATE tbl_easyfixer_app SET device_id = ?, last_login_time = NOW() WHERE efr_id = ?',
-    [token, efrId],
+    'UPDATE tbl_easyfixer_app SET device_id = ?, last_login_time = ? WHERE efr_id = ?',
+    [token, now, efrId],
   );
   // Only create a row when there's an actual token to store.
   if (upd.affectedRows === 0 && token) {
     await pool.query(
-      'INSERT INTO tbl_easyfixer_app (efr_id, device_id, last_login_time) VALUES (?, ?, NOW())',
-      [efrId, token],
+      'INSERT INTO tbl_easyfixer_app (efr_id, device_id, last_login_time) VALUES (?, ?, ?)',
+      [efrId, token, now],
     );
   }
 }
@@ -224,16 +225,17 @@ router.post('/auth/verify-otp', verifyOtpIpRateLimit, verifyOtpMobileRateLimit, 
 
         // 2) Try to UPDATE the row for THIS (user_id, device_id) — refreshes
         //    FCM token, app version, language, marks logged-in, bumps time
+        const now = new Date();
         const [upd] = await pool.query(
           `UPDATE device_info SET
              fire_base_token   = ?,
              app_version_name  = COALESCE(?, app_version_name),
              language          = COALESCE(?, language),
              is_logged_in      = '1',
-             last_login_time   = NOW()
+             last_login_time   = ?
            WHERE user_id = ? AND device_id = ?`,
           [fcm, req.body.appVersion || null, req.body.language || null,
-           r.tech.efr_id, req.body.deviceId],
+           now, r.tech.efr_id, req.body.deviceId],
         );
 
         // 3) No matching row → INSERT fresh. Matches the column set + types
@@ -242,8 +244,8 @@ router.post('/auth/verify-otp', verifyOtpIpRateLimit, verifyOtpMobileRateLimit, 
           await pool.query(
             `INSERT INTO device_info
                (user_id, device_id, fire_base_token, app_version_name, language, is_logged_in, last_login_time)
-             VALUES (?, ?, ?, ?, ?, '1', NOW())`,
-            [r.tech.efr_id, req.body.deviceId, fcm, req.body.appVersion || null, req.body.language || null],
+             VALUES (?, ?, ?, ?, ?, '1', ?)`,
+            [r.tech.efr_id, req.body.deviceId, fcm, req.body.appVersion || null, req.body.language || null, now],
           );
         }
         // Mirror the active device's token into the canonical push target
@@ -556,6 +558,27 @@ router.get('/jobs/:id', async (req, res, next) => {
      * and the checkout guess cap guarded nothing. The app never reads it.
      */
     delete job.otp;
+    /*
+     * The reached-location selfie, as a renderable URL (2026-09-16). The app had
+     * only `tx_selfie_id`, so Start Work could say "already recorded" but never
+     * show WHAT was recorded — and the technician could not judge whether to
+     * keep it or retake it. Presigned (5-min TTL), same as `images[].image_url`
+     * on this payload, so the device loads it without a bearer. Only jobs that
+     * HAVE a selfie pay the lookup.
+     *
+     * OWNER ONLY. canView above also admits a technician holding an open OFFER
+     * or a PENDING delegation, and tx_selfie_id survives an unassign — so a
+     * re-offered job would otherwise show the previous technician's face to
+     * every technician it is offered to. (An ACCEPTED delegate passes: the lock
+     * middleware has rewritten efr_id to the owner's, and they are doing the work.)
+     */
+    const selfie = job.tx_selfie_id && job.fk_easyfixter_id === req.tech.efr_id
+      ? await jobService.resolveSelfie(job.tx_selfie_id, job.job_id)
+      : null;
+    job.selfie_url = selfie?.url ?? null;
+    // When it was recorded (document.created_on, IST wall clock), so a stale
+    // selfie from an earlier visit is distinguishable from today's. Same owner rule.
+    job.selfie_recorded_at = selfie?.recordedAt ?? null;
     modernOk(res, stripCustomerMobiles(job));
   } catch (e) { next(e); }
 });
@@ -1403,8 +1426,8 @@ router.post('/profile/professional-details', validate(Joi.object({
         } else {
           await conn.query(
             `INSERT INTO tbl_easyfixer_document (efr_id, efr_doc_type_id, efr_document_name, efr_doc_text, created_date, created_by)
-             VALUES (?, 8, ?, ?, NOW(), ?)`,
-            [efrId, tp.photoKey, String(tp.toolId), efrId]);
+             VALUES (?, 8, ?, ?, ?, ?)`,
+            [efrId, tp.photoKey, String(tp.toolId), new Date(), efrId]);
         }
       }
     }
@@ -1829,13 +1852,14 @@ router.post('/device', validate(Joi.object({
      * VALUES() would let that NULL erase a version we already knew. Keeping the
      * last known build is strictly better than forgetting it.
      */
+    const deviceNow = new Date();
     await pool.query(
       `INSERT INTO device_info (user_id, device_id, fire_base_token, app_version_name, language, is_logged_in, last_login_time)
-       VALUES (?, ?, ?, ?, ?, 1, NOW())
+       VALUES (?, ?, ?, ?, ?, 1, ?)
        ON DUPLICATE KEY UPDATE fire_base_token = VALUES(fire_base_token),
                                app_version_name = COALESCE(VALUES(app_version_name), app_version_name),
-                               is_logged_in = 1, last_login_time = NOW()`,
-      [req.tech.efr_id, req.body.deviceId, req.body.fcmToken, req.body.appVersion || null, req.body.language || 'en']);
+                               is_logged_in = 1, last_login_time = ?`,
+      [req.tech.efr_id, req.body.deviceId, req.body.fcmToken, req.body.appVersion || null, req.body.language || 'en', deviceNow, deviceNow]);
     // Keep the canonical push target (tbl_easyfixer_app.device_id) in sync so
     // registration-status fan-out can reach this device. Best-effort — a
     // failure here must not fail the device registration.

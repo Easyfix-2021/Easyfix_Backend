@@ -343,10 +343,13 @@ async function createClient(body, actorId) {
   const insertCols = [];
   const placeholders = [];
   const values = [];
-  // Standard audit timestamps via SQL functions (not parameter).
-  const literalCols = [];
-  if (cols.has('insert_date')) literalCols.push(['insert_date', 'NOW()']);
-  if (cols.has('update_date')) literalCols.push(['update_date', 'NOW()']);
+  // Standard audit timestamps — bound as a Date, never NOW(): the pool is
+  // `timezone: '+05:30'`, so a JS Date serialises to the IST wall clock the
+  // column expects, whereas NOW() resolves in the DB session zone.
+  const now = new Date();
+  const stampCols = [];
+  if (cols.has('insert_date')) stampCols.push('insert_date');
+  if (cols.has('update_date')) stampCols.push('update_date');
 
   for (const [col, picker] of Object.entries(CLIENT_INSERT_MAP)) {
     if (!cols.has(col)) continue;
@@ -356,9 +359,10 @@ async function createClient(body, actorId) {
     placeholders.push('?');
     values.push(val);
   }
-  for (const [col, expr] of literalCols) {
+  for (const col of stampCols) {
     insertCols.push(col);
-    placeholders.push(expr);
+    placeholders.push('?');
+    values.push(now);
   }
 
   const sql = `INSERT INTO tbl_client (${insertCols.join(', ')}) VALUES (${placeholders.join(', ')})`;
@@ -482,7 +486,7 @@ async function updateClient(clientId, body, actorId) {
   if (sets.length === 0) {
     throw Object.assign(new Error('nothing to update'), { status: 400 });
   }
-  if (cols.has('update_date')) sets.push('update_date = NOW()');
+  if (cols.has('update_date')) { sets.push('update_date = ?'); vals.push(new Date()); }
   if (cols.has('updated_by'))  { sets.push('updated_by = ?'); vals.push(actorId); }
   vals.push(clientId);
   const [r] = await pool.query(
@@ -583,14 +587,15 @@ async function setContactAccess(contactId, clientId, patch, actingUserId) {
     `INSERT INTO easyfix_client_spoc_access
        (contact_id, client_id, spoc_role, can_view_performance, can_view_invoicing,
         can_approve_estimates, can_view_all_stores, updated_by, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE ${updates.join(', ')}`,
     [contactId, clientId, role,
      values[0] === undefined ? null : values[0],
      values[1] === undefined ? null : values[1],
      values[2] === undefined ? null : values[2],
      values[3] === undefined ? null : values[3],
-     actingUserId || null],
+     actingUserId || null,
+     new Date()],
   );
   return { contactId, spocRole: role };
 }
@@ -637,7 +642,8 @@ async function setContactAccessBulk(clientId, contactIds, patch, actingUserId) {
   const ownedIds = owned.map((r) => Number(r.id));
   if (!ownedIds.length) return { updated: 0, skipped: ids.length };
 
-  const rowSql = ownedIds.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, NOW())').join(', ');
+  const rowSql = ownedIds.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ');
+  const now = new Date();
   const params = [];
   for (const id of ownedIds) {
     params.push(id, clientId, role,
@@ -645,7 +651,8 @@ async function setContactAccessBulk(clientId, contactIds, patch, actingUserId) {
       values[1] === undefined ? null : values[1],
       values[2] === undefined ? null : values[2],
       values[3] === undefined ? null : values[3],
-      actingUserId || null);
+      actingUserId || null,
+      now);
   }
 
   logger.info('Bulk set SPOC access · clientId=' + clientId + ' · contacts=' + ownedIds.length + ' · role=' + role);

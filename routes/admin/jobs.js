@@ -204,52 +204,10 @@ router.get('/:id/selfie-url',
       const selfieId = req.scopedJob.tx_selfie_id;
       if (!selfieId) return modernOk(res, { selfieId: null, url: null });
 
-      const { pool } = require('../../db');
-      const s3Storage = require('../../utils/s3-storage');
-      const [[doc]] = await pool.query(
-        'SELECT `path`, url FROM document WHERE id = ? LIMIT 1',
-        [selfieId],
-      );
-      if (!doc) return modernOk(res, { selfieId, url: null });
-
-      /*
-       * S3 key lives in `path`; presign on read. Fall back to a legacy url.
-       *
-       * The existence CHECK is the fix (2026-09-09). Presigning is a local
-       * signing operation — it never contacts S3 — so it succeeds for a key
-       * that does not exist, `url` came back non-null, and the documented
-       * "fall back to a legacy stored url" below could never run. The endpoint
-       * logged `has=true`, returned 200, and the browser got a URL that 404s.
-       * A success that cannot fail is not a resolution.
-       *
-       * One HEAD per selfie view, only when a key is present, and only on this
-       * endpoint — it is opened by a human looking at one job, not in a list.
-       * A HEAD that throws is treated as "unknown, keep the presign" rather
-       * than as absent, so an IAM or network fault degrades to today's
-       * behaviour instead of hiding a selfie that is really there.
-       */
-      const key = String(doc.path || '').trim();
-      let url = null;
-      if (key && s3Storage.isEnabled()) {
-        let present = true;
-        try { present = await s3Storage.exists(key); }
-        catch (e) {
-          logger.warn('Selfie existence check failed, assuming present · jobId=' + req.params.id + ' · ' + e.message);
-        }
-        if (present) {
-          try { url = await s3Storage.getPresignedUrl(key); }
-          catch (e) { logger.warn('Selfie presign failed · jobId=' + req.params.id + ' · ' + e.message); }
-        } else {
-          logger.info('Selfie key absent in S3, falling back to the stored url · jobId=' + req.params.id);
-        }
-      }
-      // Legacy rows store an absolute URL on the old file host. Upgrade http →
-      // https: the CRM is served over https and a browser blocks an http image
-      // on an https page, so an un-upgraded fallback would swap one invisible
-      // image for another.
-      if (!url && doc.url) {
-        url = String(doc.url).replace(/^http:\/\//i, 'https://');
-      }
+      // One HEAD per selfie view — opened by a human looking at one job, not a
+      // list. The resolver (and why it HEADs before presigning) is shared with
+      // the technician's GET /mobile/jobs/:id.
+      const url = (await job.resolveSelfie(selfieId, req.params.id))?.url ?? null;
       logger.info('Resolved selfie url · jobId=' + req.params.id + ' · has=' + !!url);
       modernOk(res, { selfieId, url });
     } catch (e) {
@@ -1161,8 +1119,8 @@ router.get('/escalated/export.xlsx', async (req, res, next) => {
  *                       supply team add an inline comment per row)
  *
  * When closed_action transitions to 15 (Resolved), also stamp
- * escalation_closed_time = NOW(). When set to 16 (Re-Open), clear
- * the closed_time so the row goes back to the "open" filter.
+ * escalation_closed_time. When set to 16 (Re-Open), clear the closed_time
+ * so the row goes back to the "open" filter.
  */
 router.patch('/escalated/:tableId', async (req, res, next) => {
   try {
@@ -1203,15 +1161,19 @@ router.patch('/escalated/:tableId', async (req, res, next) => {
       sets.push('closed_action = ?');
       params.push(v || null);
       if (v === 15) {
-        sets.push('escalation_closed_time = NOW()');
+        const closedAt = new Date();
+        sets.push('escalation_closed_time = ?');
+        params.push(closedAt);
         // also mark resolved_time so the "closed" filter picks it up
-        sets.push('resolved_time = COALESCE(resolved_time, NOW())');
+        sets.push('resolved_time = COALESCE(resolved_time, ?)');
+        params.push(closedAt);
       } else if (v === 16) {
         // Re-Open: clear closed_time + bump no_of_escalations so the
         // row falls back into the "open" filter. Legacy did the same.
         sets.push('escalation_closed_time = NULL');
         sets.push('no_of_escalations = COALESCE(no_of_escalations, 0) + 1');
-        sets.push('escalated_time = NOW()');
+        sets.push('escalated_time = ?');
+        params.push(new Date());
       }
     }
     if (b.escalated_comments !== undefined) {
@@ -2102,10 +2064,10 @@ router.put('/:id/hold', validate(idParam, 'params'), validate(holdBody), scopedJ
               full_fillment_reason = ?,
               full_fillment_time = ?,
               full_fillment_by = ?,
-              full_fillment_created_time = NOW(),
+              full_fillment_created_time = ?,
               no_of_req_foh = COALESCE(no_of_req_foh, 0) + 1
         WHERE job_id = ? AND COALESCE(no_of_req_foh, 0) = 0`,
-      [req.body.reason, req.body.appointment_time, req.user.user_id, req.params.id]
+      [req.body.reason, req.body.appointment_time, req.user.user_id, new Date(), req.params.id]
     );
     logger.info('Fulfillment hold placed · jobId=' + req.params.id + ' status=21');
     modernOk(res, { on_hold: true, status: 21 });
@@ -2478,10 +2440,10 @@ router.post('/:id/estimate/send-for-approval',
         await conn.query(
           `UPDATE tbl_job
               SET job_status = 15,
-                  approval_sent_on_date_time = NOW(),
+                  approval_sent_on_date_time = ?,
                   no_of_req_approval = COALESCE(no_of_req_approval, 0) + 1
             WHERE job_id = ?`,
-          [jobId]
+          [new Date(), jobId]
         );
         await conn.commit();
       } catch (err) { await conn.rollback(); throw err; } finally { conn.release(); }
@@ -3031,9 +2993,11 @@ router.put('/:id/feedback',
 router.get('/:id/customer-requests', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
   try {
     logger.info('List customer requests · jobId=' + req.params.id);
+    // preferred_slot exists only after its migration — NULL alias until then.
+    const slotCol = (await job.customerRequestSlotColumnExists()) ? 'preferred_slot' : 'NULL AS preferred_slot';
     const [rows] = await pool.query(
       `SELECT request_id, request_type, reason, remarks,
-              preferred_datetime, request_status, created_at
+              preferred_datetime, ${slotCol}, request_status, created_at
          FROM tbl_job_customer_request
         WHERE job_id = ?
         ORDER BY created_at DESC`,

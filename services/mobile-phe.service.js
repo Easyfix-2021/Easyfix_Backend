@@ -473,13 +473,16 @@ async function getInQa(efrId, paging = {}, db = pool) {
   const { page, limit, offset } = pageValues(paging);
   logger.info(`PHE Under Audit · efrId=${efrId} page=${page} limit=${limit}`);
 
+  // Clock rule: app_checkout_date_time is bound as new Date() at checkout
+  // (routes/mobile/index.js) — bind the same instant here instead of NOW().
+  const now = new Date();
   const [rowsResult, summaryResult] = await Promise.all([
     db.query(
       `SELECT j.job_id,
               COALESCE(sc.service_catg_name, st.service_type_name, CONCAT('Job #', j.job_id)) AS title,
               cl.client_name, j.app_checkout_date_time,
-              GREATEST(TIMESTAMPDIFF(DAY, j.app_checkout_date_time, NOW()), 0) AS review_age_days,
-              GREATEST(TIMESTAMPDIFF(SECOND, j.app_checkout_date_time, NOW()), 0) AS review_age_secs,
+              GREATEST(TIMESTAMPDIFF(DAY, j.app_checkout_date_time, ?), 0) AS review_age_days,
+              GREATEST(TIMESTAMPDIFF(SECOND, j.app_checkout_date_time, ?), 0) AS review_age_secs,
               COUNT(tjt.fk_job_id) AS transaction_count,
               COALESCE(SUM(tjt.efr_charge), 0) AS technician_earning
          FROM tbl_job j
@@ -493,7 +496,7 @@ async function getInQa(efrId, paging = {}, db = pool) {
                  cl.client_name, j.app_checkout_date_time
         ORDER BY j.app_checkout_date_time DESC, j.job_id DESC
         LIMIT ? OFFSET ?`,
-      [efrId, limit, offset],
+      [now, now, efrId, limit, offset],
     ),
     db.query(
       `SELECT COUNT(*) AS total_jobs,
@@ -577,8 +580,8 @@ async function getMonthJobs(efrId, month, paging = {}, db = pool) {
                   AND et.transaction_type = 2
                   AND et.job_id = j.job_id) AS paid_at,
               COALESCE(SUM(tjt.efr_charge), 0) AS technician_earning,
-              ${JOB_AGE_DAYS_EXPR} AS age_days,
-              ${JOB_AGE_SECS_EXPR} AS age_secs,
+              ${JOB_AGE_DAYS_EXPR()} AS age_days,
+              ${JOB_AGE_SECS_EXPR()} AS age_secs,
               j.visit_number, r.job_rating, COALESCE(r.is_escalated, 0) AS is_escalated,
               (j.checkin_date_time IS NOT NULL
                 AND j.checkin_date_time <= DATE_ADD(j.requested_date_time, INTERVAL 60 MINUTE)) AS on_time,
@@ -655,8 +658,8 @@ async function getJobDetail(efrId, jobId, db = pool) {
             j.checkin_date_time AS reached_at,
             j.visit_number, j.revisit_reason_id,
             j.no_of_req_approval, j.no_of_req_foh,
-            ${JOB_AGE_DAYS_EXPR} AS age_days,
-            ${JOB_AGE_SECS_EXPR} AS age_secs,
+            ${JOB_AGE_DAYS_EXPR()} AS age_days,
+            ${JOB_AGE_SECS_EXPR()} AS age_secs,
             wallet.paid_at, wallet.wallet_credit_count, wallet.paid_to_technician,
             COALESCE(tx.technician_earning, 0) AS technician_earning,
             tx.transaction_count,

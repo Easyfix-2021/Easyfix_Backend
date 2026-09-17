@@ -111,10 +111,11 @@ async function requestWithdrawal(efrId, { amount }, pool) {
          (fk_easyfixer_id, amount, status, requested_on,
           bank_details_id, bank_account_number, bank_ifsc,
           bank_account_holder_name, bank_id, bank_name)
-       VALUES (?, ?, 'requested', NOW(), ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, 'requested', ?, ?, ?, ?, ?, ?, ?)`,
       [
         efrId,
         amt,
+        new Date(),
         bank.efr_bank_id,
         bank.efr_bank_acc_num,
         bank.efr_bank_ifsc,
@@ -321,17 +322,17 @@ async function processWithdrawal(requestId, { action, remarks }, actor, pool) {
       // 3d) Mark the request paid.
       await conn.query(
         `UPDATE tbl_easyfixer_withdrawal_request
-            SET status = 'paid', processed_on = NOW(), processed_by = ?, remarks = ?
+            SET status = 'paid', processed_on = ?, processed_by = ?, remarks = ?
           WHERE request_id = ?`,
-        [actorId, remarkVal, requestId],
+        [new Date(), actorId, remarkVal, requestId],
       );
     } else {
       // 3b) Reject — no debit, just flip status + audit fields.
       await conn.query(
         `UPDATE tbl_easyfixer_withdrawal_request
-            SET status = 'rejected', processed_on = NOW(), processed_by = ?, remarks = ?
+            SET status = 'rejected', processed_on = ?, processed_by = ?, remarks = ?
           WHERE request_id = ?`,
-        [actorId, remarkVal, requestId],
+        [new Date(), actorId, remarkVal, requestId],
       );
     }
 
