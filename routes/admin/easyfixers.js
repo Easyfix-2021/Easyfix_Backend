@@ -25,6 +25,7 @@ const {
 } = require('../../validators/easyfixer.validator');
 const sensitiveChange = require('../../services/easyfixer-sensitive-change.service');
 const profileOtp = require('../../services/easyfixer-profile-otp.service');
+const activityLog = require('../../services/activity-log.service');
 const { buildRequestScope, assertEntityInScope } = require('../../lib/scope');
 
 // Local Joi schema for the profile-update-link send action. Mirrors
@@ -547,6 +548,42 @@ router.post('/:id/verification/comments',
       const comments = await verification.addComment(req.params.id, req.body, req.user);
       logger.info('Verification comment added · id=' + req.params.id + ' section=' + req.body.section);
       modernOk(res, { section: req.body.section, comments }, 'comment added');
+    } catch (e) { next(e); }
+  });
+
+// Activity log: CRM staff recording onboarding decisions (approve/reject/send-back)
+router.post('/:id/activity-log',
+  validate(idParam, 'params'),
+  validate(Joi.object({
+    eventType: Joi.string().trim().required(),
+    section: Joi.string().trim().optional(),
+    summary: Joi.string().trim().max(500).optional(),
+    metadata: Joi.object().optional(),
+  }), 'body'),
+  async (req, res, next) => {
+    try {
+      logger.info('Record activity log · id=' + req.params.id + ' event=' + req.body.eventType);
+      if (!(await loadAndAuthorize(req, res))) return;
+
+      const efrId = parseInt(req.params.id, 10);
+      const result = await activityLog.appendEvent({
+        efr_id: efrId,
+        mobile: null,
+        supply_request_id: null,
+        event_type: req.body.eventType,
+        category: 'LIFECYCLE',
+        section: req.body.section || 'onboarding',
+        from_stage: null,
+        to_stage: null,
+        source: 'CRM',
+        actor_type: 'STAFF',
+        actor_user_id: req.user.user_id,
+        actor_name: req.user.user_name,
+        summary: req.body.summary,
+        metadata: req.body.metadata,
+      });
+      logger.info('Activity log recorded · id=' + efrId + ' log_id=' + result.log_id);
+      modernOk(res, result, 'event logged');
     } catch (e) { next(e); }
   });
 

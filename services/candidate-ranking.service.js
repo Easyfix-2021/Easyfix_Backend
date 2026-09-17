@@ -1734,6 +1734,32 @@ function buildJobHeader(job, {
   serviceTypeName = null,
   deepSkillLabel = null,
   jobSkillsByService = null,
+  /*
+   * The job's inherited managers, resolved by jobService.getJobManagerNames —
+   * options rather than row columns because neither is on tbl_job (the PM comes
+   * from the client's vertical mapping, the ZM from the address city's owner)
+   * and this builder is synchronous. Absent ⇒ null, like every other option, so
+   * a caller that forgets to resolve them renders two empty rows rather than
+   * dropping the fields.
+   */
+  projectManagerName = null,
+  zonalManagerName = null,
+  /*
+   * The timeline's resolved actors, from jobService.getJobTimelineActors — two
+   * tbl_user ids turned into names, plus the acceptance that lives on
+   * tbl_job_offer rather than on tbl_job. Options for the same reason as the
+   * managers above: none of the four is a column on the row handed in here.
+   */
+  firstScheduledByName = null,
+  checkinByName = null,
+  acceptedDateTime = null,
+  acceptedEfrName = null,
+  /*
+   * EasyFix SPOC (job_client_owner's name) and the job's escalation, from
+   * jobService.getJobEscalationAndSpoc. Absent ⇒ every field null / 0, so a
+   * caller that forgets it renders "not escalated", never a crash.
+   */
+  escalationAndSpoc = null,
   // Only the ranked path knows whether the job is already assigned; the search
   // header has no such concept, so it keeps A's "not assigned" value rather
   // than inventing one from fk_easyfixter_id (a different question).
@@ -1779,9 +1805,45 @@ function buildJobHeader(job, {
     // THIS as the read-only Time Slot (the customer's booked slot), not a
     // client-derived label. Reschedule re-derives it BE-side from the new time.
     booking_cut_off_time_slot: job.booking_cut_off_time_slot ?? null,
+    /*
+     * The ORIGINAL appointment — the promise made at booking, snapshotted on
+     * create and preserved across every reschedule (requested_date_time moves,
+     * this does not; it is why TAT can tell a slipped job from a punctual one).
+     *
+     * Here because the panel's schedule section must show what was promised
+     * beside what is currently set — an operator re-scheduling a job cannot see
+     * that it has already slipped if the only date on screen is the one that
+     * moved. GET /jobs/:id returns both columns (j.*) and the CRM's JobModal
+     * already reads them; this header is an ALLOWLIST over that payload, so
+     * until now the same two fields reached Schedule & Assign as `undefined`.
+     * Straight off tbl_job — no query change, nothing new to join.
+     */
+    original_appointment_date_time: job.original_appointment_date_time ?? null,
+    original_appointment_time:      job.original_appointment_time      ?? null,
     job_desc:          job.job_desc         ?? null,
     paid_by:           job.paid_by          ?? null,
     paid_by_label:     paidByLabel(job.paid_by),
+    /*
+     * THE EFFECTIVE PAYMENT ANSWER, and the reason it is a fourth field rather
+     * than a correction to `payment_mode`.
+     *
+     * payment_mode / paid_by_label read paid_by ALONE, so they say "Not Set" on
+     * a job whose collected_by is 1 — and this very request treats that job as
+     * customer-paid: customerPays() is `paid_by = 2 OR collected_by = 1`, and it
+     * is what gates the COD balance filter on the candidate list below. So the
+     * panel could print "Not Set" beside a technician list that had just been
+     * narrowed to people carrying enough cash. On QA only 3,449 of the 82,371
+     * collected_by = 1 jobs also carry paid_by = 2, so that is the common case,
+     * not the corner.
+     *
+     * customerPays() itself — never a second reading of the two columns, which
+     * is exactly how the label and the gate came apart in the first place.
+     *
+     * ADDITIVE: payment_mode, paid_by, paid_by_label and collected_by all keep
+     * their current values. The CRM decides which to render; anything already
+     * reading the old three is untouched.
+     */
+    payment_label:     customerPays(job) ? 'Paid By Customer' : paidByLabel(job.paid_by),
     assigned_efr_id:   assignedEfrId,
     // Schedule & Assign Job Details fields.
     client_spoc:       job.client_spoc      ?? null,
@@ -1797,6 +1859,61 @@ function buildJobHeader(job, {
     product_quantity:  job.product_quantity ?? null,
     // Technician-facing note, surfaced as "Additional Comments".
     efr_special_notes: job.efr_special_notes ?? null,
+    /*
+     * JOB AGE — the SAME two fields the jobs LIST emits per row, off the SAME
+     * `j`-aliased expression (utils/job-age-sql.js's JOB_AGE_COLUMNS, which
+     * getByIdCore already selects for the detail modal). Copied through, never
+     * recomputed: the CRM renders both surfaces with one formatJobAge(), and an
+     * age derived a second way here would let the popup and the row it opened
+     * from disagree about how old the same ticket is.
+     *
+     * The KEY NAMES ARE CAMELCASE, deliberately out of step with every
+     * snake_case sibling above. They are the SQL aliases, and formatJobAge reads
+     * exactly `ageDays` / `ageSecs` — renaming them to match local style would
+     * make the panel render "—" while every value was present.
+     */
+    ageDays:           job.ageDays ?? null,
+    ageSecs:           job.ageSecs ?? null,
+    // The two INHERITED managers — see getJobManagerNames in job.service.js for
+    // where each comes from, why each can legitimately be null, and why the
+    // source has to be the one the list's PM / ZM filters compare against.
+    project_manager_name: projectManagerName,
+    zonal_manager_name:   zonalManagerName,
+    /*
+     * ─── THE JOB'S TIMELINE ───────────────────────────────────────────────
+     *
+     * Four instants and three actors, in the order they happen: raised →
+     * first scheduled → accepted → checked in. Ops reconstruct a job's history
+     * from these, and until now the console showed only the appointment — the
+     * one date that MOVES — with nothing to say when the ticket was raised or
+     * who has touched it since.
+     *
+     * The DATES are plain tbl_job columns, already in getByIdCore's `j.*`, so
+     * they are copied through like every other column above. The NAMES are not:
+     * two are user ids and the acceptance is not on tbl_job at all. They arrive
+     * as options from getJobTimelineActors — see that function for each one's
+     * source, the fk_checkin_by-is-a-user-id trap, and why the accepted pair is
+     * null on essentially every job this console opens.
+     */
+    ticket_created_date_time:      job.ticket_created_date_time      ?? null,
+    original_scheduling_date_time: job.original_scheduling_date_time ?? null,
+    first_scheduled_by_name:       firstScheduledByName,
+    accepted_date_time:            acceptedDateTime,
+    accepted_efr_name:             acceptedEfrName,
+    checkin_date_time:             job.checkin_date_time             ?? null,
+    checkin_by_name:               checkinByName,
+    /*
+     * The console's Client card names the EasyFix SPOC, and its Job age tile
+     * flags an escalated job. Resolved off-row — see getJobEscalationAndSpoc.
+     * is_escalated is always 0/1 (never a bit Buffer) so `if (is_escalated)`
+     * on the CRM means what it says.
+     */
+    easyfix_spoc_name:   escalationAndSpoc?.easyfixSpocName   ?? null,
+    is_escalated:        escalationAndSpoc?.isEscalated       ?? 0,
+    no_of_escalations:   escalationAndSpoc?.noOfEscalations   ?? null,
+    escalated_time:      escalationAndSpoc?.escalatedTime     ?? null,
+    escalated_by_name:   escalationAndSpoc?.escalatedByName   ?? null,
+    escalated_comments:  escalationAndSpoc?.escalatedComments ?? null,
   };
 }
 
@@ -1865,14 +1982,34 @@ async function rankCandidatesForJob(jobId, {
     serviceCatgName = labels?.catg_name ?? null;
   }
 
-  // Required deep skill(s) per service, in ONE batched query for the whole job
-  // (never per-service). Empty Map when the job carries no services.
-  const jobSkillsByService = await loadJobSkillMatrix(job);
+  /*
+   * The header's three independent lookups, issued together: the deep skill(s)
+   * per service (ONE batched query for the whole job, never per-service; empty
+   * Map when the job carries no services), the inherited Project / Zonal manager
+   * names, and the timeline's actors. None of them feeds another, and this is
+   * fixed cost on every modal-open — there is no reason to pay it serially.
+   */
+  const [
+    jobSkillsByService,
+    { projectManagerName, zonalManagerName },
+    { firstScheduledByName, checkinByName, acceptedDateTime, acceptedEfrName },
+    escalationAndSpoc,
+  ] = await Promise.all([
+    loadJobSkillMatrix(job),
+    jobService.getJobManagerNames({ clientId: job.fk_client_id, cityId: job.city_id }),
+    jobService.getJobTimelineActors({
+      jobId: job.job_id, firstScheduledBy: job.first_scheduled_by, checkinBy: job.fk_checkin_by,
+    }),
+    jobService.getJobEscalationAndSpoc({ jobId: job.job_id, clientOwnerId: job.job_client_owner }),
+  ]);
 
   // Pre-build the enriched job payload used in ALL return paths (early-exit
   // on zero-eligible and the normal ranked return).
   const enrichedJob = buildJobHeader(job, {
     serviceCatgName, serviceTypeName, deepSkillLabel, jobSkillsByService, assignedEfrId,
+    projectManagerName, zonalManagerName,
+    firstScheduledByName, checkinByName, acceptedDateTime, acceptedEfrName,
+    escalationAndSpoc,
   });
 
   // COD = the customer pays the tech on-site (customerPays). Such techs
@@ -2325,7 +2462,29 @@ function mapJobServices(job, skillsByJobService = new Map()) {
         service_catg: s.service_catg_name ?? null,
         service_type: s.service_type_name ?? null,
         quantity:     s.quantity          ?? null,
+        // UNCHANGED, and it is the price of ONE unit despite its name — see
+        // unit_price / line_total below. Kept for every consumer that reads it.
         total_charge: s.total_charge      ?? null,
+        /*
+         * THE TWO PRICES, NAMED FOR WHAT THEY ARE (2026-09-16).
+         *
+         * tbl_job_services.total_charge holds the price of ONE unit:
+         * utils/rate-card-calc.js writes Math.round(unitPrice) into it on every
+         * create / add / quantity change, and a quantity change never moves it.
+         * total_cost is unit × quantity. This card rendered total_charge as the
+         * line's charge, so a qty-2 ₹1,000 line read ₹1,000 here while Edit
+         * Services read ₹2,000 for the same row (job 482657, QA).
+         *
+         *   unit_price  = total_charge   the price of one unit
+         *   line_total  = total_cost     what the line bills — unit × quantity
+         *
+         * line_total is the STORED column, never unit_price × quantity
+         * recomputed here: total_charge is rounded to an integer while
+         * total_cost keeps four decimals, so the product would drift from the
+         * figure billing actually reads on any non-integer rate.
+         */
+        unit_price:   s.total_charge      ?? null,
+        line_total:   s.total_cost        ?? null,
         // Free/Paid per service, derived by job.service.js getById from
         // effective_charge. This mapper is an ALLOWLIST — a field absent here is
         // dropped no matter what getById projects, which is why the modal's
@@ -2555,14 +2714,19 @@ async function searchTechniciansForJob(jobId, { term, jobDate, timeSlot, limit =
 }
 
 /*
- * Enriched job header reused by the search response.
+ * Enriched job header reused by the search response — and, since 2026-09-16,
+ * by the console's header-only endpoint (consoleHeaderForJob below).
  * The job object comes from jobService.getById (j.* + LIST_JOIN/DETAIL_JOIN
  * so all customer/client/address/service_category fields are present).
  * service_type_name requires a separate scalar subquery since getById only
  * JOINs tbl_service_type against tbl_job_services, not against the job row's
  * own fk_service_type_id — we do that inline here.
+ *
+ * `assignedEfrId` is the one input the RANKED header has and the search header
+ * did not. Absent it stays null, so the search response is byte-for-byte what it
+ * was; consoleHeaderForJob passes it so its header equals the ranked one.
  */
-async function searchJobHeader(job) {
+async function searchJobHeader(job, { assignedEfrId = null } = {}) {
   // Resolve BOTH category + type names from the job's FK ids (same as the
   // ranked header) — job.service_category is a legacy free-text column that is
   // NULL on most client-imported jobs.
@@ -2579,11 +2743,80 @@ async function searchJobHeader(job) {
     serviceCatgName = labels?.catg_name ?? null;
   }
   const deepSkillLabel = [serviceCatgName, serviceTypeName].filter(Boolean).join(' › ') || null;
-  // Same single batched Job Skill Matrix lookup the ranked header does.
-  const jobSkillsByService = await loadJobSkillMatrix(job);
+  // The same three lookups the ranked header does, through the same resolvers
+  // and in parallel for the same reason.
+  const [
+    jobSkillsByService,
+    { projectManagerName, zonalManagerName },
+    { firstScheduledByName, checkinByName, acceptedDateTime, acceptedEfrName },
+    escalationAndSpoc,
+  ] = await Promise.all([
+    loadJobSkillMatrix(job),
+    jobService.getJobManagerNames({ clientId: job.fk_client_id, cityId: job.city_id }),
+    jobService.getJobTimelineActors({
+      jobId: job.job_id, firstScheduledBy: job.first_scheduled_by, checkinBy: job.fk_checkin_by,
+    }),
+    jobService.getJobEscalationAndSpoc({ jobId: job.job_id, clientOwnerId: job.job_client_owner }),
+  ]);
   return buildJobHeader(job, {
     serviceCatgName, serviceTypeName, deepSkillLabel, jobSkillsByService,
+    projectManagerName, zonalManagerName,
+    firstScheduledByName, checkinByName, acceptedDateTime, acceptedEfrName,
+    escalationAndSpoc,
+    assignedEfrId,
   });
+}
+
+/*
+ * ─── THE CONSOLE HEADER, WITHOUT THE RANKING (2026-09-16) ────────────────
+ *
+ * GET /admin/jobs/:id/header. The Schedule & Assign console renders a job's
+ * header on EVERY open, and until now the only way to get it was
+ * /candidates — which also expires stale offers, ranks the technician pool,
+ * resolves offer flow and offerability, and returns the top ten. For an
+ * ACCEPTED job (status 1, the main consumer) none of that is wanted: the job
+ * already has its technician, and paying a full ranking pass to draw a header
+ * is the cost this endpoint exists to remove.
+ *
+ * THE HEADER IS THE RANKED ONE, EXACTLY — not a lookalike. It is built by the
+ * same searchJobHeader → buildJobHeader path, with the two inputs the ranked
+ * path adds applied the same way:
+ *   - time_slot resolved through slotModel.resolveTimeSlot against the job's
+ *     own appointment (the ranked path applies no jobDate/timeSlot override
+ *     unless the caller proposes one, and this endpoint takes none);
+ *   - assignedEfrId = fk_easyfixter_id when the job has one.
+ * A test builds both headers for one job and asserts every ranked key carries
+ * the same value here, so the console cannot render a different job depending
+ * on which endpoint drew it.
+ *
+ * PLUS two things the ranked header does not carry:
+ *
+ *   1. The LIST's app-request fields (jobService.appRequestListFields) under the
+ *      LIST's own names, so the CRM can call appRequestOf(job) on this object
+ *      unchanged. Accepted jobs are exactly where a technician's cancel /
+ *      reschedule ask lives.
+ *   2. The ASSIGNED technician: efr_id, efr_name, efr_mobile — null on all three
+ *      while unassigned. efr_mobile is masked in transit by the admin router's
+ *      mask-mobile middleware (utils/mask-mobile.js MOBILE_FIELDS), the same
+ *      mechanism that masks the offers list's `mobile`; `?unmasked=true`
+ *      behaves identically on both.
+ *
+ * The job object is COPIED before the slot is normalised: it is the route's
+ * req.scopedJob, and a header read must not mutate the row other middleware
+ * already holds.
+ */
+async function consoleHeaderForJob(job) {
+  const j = { ...job };
+  j.time_slot = slotModel.resolveTimeSlot(j.time_slot, j.requested_date_time);
+  const assignedEfrId = j.fk_easyfixter_id ? Number(j.fk_easyfixter_id) : null;
+  const header = await searchJobHeader(j, { assignedEfrId });
+  return {
+    ...header,
+    ...jobService.appRequestListFields(j),
+    efr_id:     assignedEfrId,
+    efr_name:   assignedEfrId ? (j.easyfixer_name ?? null) : null,
+    efr_mobile: assignedEfrId ? (j.easyfixer_mobile ?? null) : null,
+  };
 }
 
 /*
@@ -2856,6 +3089,8 @@ module.exports = {
   _statsGate,
   rankCandidatesForJob,
   searchTechniciansForJob,
+  // The console header with no ranking work — GET /admin/jobs/:id/header.
+  consoleHeaderForJob,
   pickAutoAssignCandidate,
   recommendSlotsForJob,
   APPOINTMENT_SLOTS,

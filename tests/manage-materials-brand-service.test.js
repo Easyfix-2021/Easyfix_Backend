@@ -134,3 +134,12 @@ test('listBrands filters is_system = 0 regardless of the status filter', async (
   assert.ok(call, 'listBrands should query tbl_brand_master');
   assert.match(call.sql, /is_system\s*=\s*0/i, 'must filter out is_system rows even with status=all');
 });
+
+test('listBrands used_by counts ACTIVE materials only (deactivating a material lowers it)', async () => {
+  await brandSvc.listBrands({ status: 'all' });
+  const call = fake.calls.find((c) => /SELECT b\.brand_id, b\.brand_name/i.test(c.sql));
+  assert.ok(call, 'listBrands should query tbl_brand_master');
+  const usedBy = call.sql.slice(0, call.sql.search(/AS used_by/i));
+  assert.match(usedBy, /JOIN\s+tbl_material_master\s+m\s+ON\s+m\.material_id\s*=\s*gb\.material_id\s+AND\s+m\.status\s*=\s*1/i,
+    'used_by must only count materials with status = 1');
+});

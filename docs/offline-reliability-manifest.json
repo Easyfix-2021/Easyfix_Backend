@@ -7,6 +7,7 @@
     "scripts/schema-verify.js",
     "server.js",
     "server/scheduler.js",
+    "services/activity-log.service.js",
     "services/deep-skill.service.js",
     "services/easyfixer-document.service.js",
     "services/easyfixer-lifecycle.service.js",

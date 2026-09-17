@@ -2033,6 +2033,8 @@ router.use('/rewards', require('./rewards'));
 router.use('/deepskill', require('./deepskill'));
 //   /registration/status · /remaining · /personal-details · /language
 router.use('/registration', require('./registration'));
+//   /activity-log  (unified append-only audit trail; events from app + CRM)
+router.use('/activity-log', require('./activity-log'));
 //   /attendance · /leave · /leave/unmark
 router.use(require('./attendance'));
 //   /experience
