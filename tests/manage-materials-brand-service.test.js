@@ -27,7 +27,7 @@ const fake = installFakePool([
     const row = BRANDS[params[0]];
     return row ? [row] : [];
   }],
-  [/FROM tbl_material_price_group_brand WHERE brand_id = \?/i, () => [{ cnt: scenario.referenceCount }]],
+  [/FROM tbl_material_price_group_brand gb[\s\S]*WHERE gb\.brand_id = \?/i, () => [{ cnt: scenario.referenceCount, active_cnt: scenario.activeReferenceCount ?? scenario.referenceCount }]],
   [/gb_to\.material_id, m\.material_name/i, () => scenario.conflictRows],
   [/INSERT INTO tbl_brand_master/i, () => ({ insertId: 42 })],
   [/DELETE FROM tbl_brand_master/i, () => ({ affectedRows: 1 })],
@@ -77,6 +77,21 @@ test('deleteBrand rejects with 409 when materials still reference it', async () 
     assert.equal(e.references.total, 3);
     return true;
   });
+});
+
+test('getBrandReferences splits the count into active and inactive materials', async () => {
+  scenario.referenceCount = 3;
+  scenario.activeReferenceCount = 1;
+  try {
+    const out = await brandSvc.getBrandReferences(5);
+    assert.equal(out.total, 3);
+    assert.deepEqual(out.by_type, [{ type: 'material_price_group_brand', label: 'Materials', count: 3, active: 1, inactive: 2 }]);
+    const call = fake.calls.find((c) => /FROM tbl_material_price_group_brand gb/i.test(c.sql));
+    assert.ok(call, 'references count query should run');
+    assert.match(call.sql, /CASE WHEN m\.status = 1 THEN gb\.material_id END\) AS active_cnt/i, 'active_cnt must count status = 1 materials');
+  } finally {
+    delete scenario.activeReferenceCount;
+  }
 });
 
 test('deleteBrand succeeds when nothing references it', async () => {

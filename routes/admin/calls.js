@@ -10,6 +10,8 @@ const voice = require('../../services/voice.service');
 const plivoLog = require('../../services/plivo-call-log.service');
 const conference = require('../../services/plivo-conference.service');
 const recordingBackfill = require('../../services/recording-backfill.service');
+const { saveTranscript } = require('../../services/call-transcription-cron');
+const plivoSpend = require('../../services/plivo-spend.service');
 // The route layer talks ONLY to the mode service: it owns the transcript-vs-
 // recording branch, the provider clients behind each, and the provenance stamp.
 const analysisMode = require('../../services/call-analysis-mode.service');
@@ -1094,6 +1096,26 @@ router.post('/mode', requirePropertyAllowlist(FEATURES.canSwitchCallMode, { labe
 // (blank). Web mode is Plivo-only so the FE doesn't expose this there.
 // '' (No Default) is stored blank → defaultProvider() then resolves to the first
 // enabled provider and the per-call radio drives the choice when >1 is enabled.
+/*
+ * GET /admin/calls/plivo-account — the Plivo Account card on Admin Actions:
+ * balance plus this IST month's spend, calls and transcriptions separately.
+ * Same allowlist as the calling-mode switch it sits beside. Never waits on the
+ * spend walk (minutes on a cold start — see plivo-spend.service.js): the card
+ * polls while `spend.refreshing` or a kind is not yet `ready`.
+ */
+router.get('/plivo-account', requirePropertyAllowlist(FEATURES.canSwitchCallMode, { label: 'Switch Call Mode' }), async (req, res, next) => {
+  try {
+    logger.info('Get Plivo account summary');
+    const balance = await plivo.accountBalanceCached();
+    modernOk(res, {
+      balance: balance.ok
+        ? { known: true, cashCredits: balance.cashCredits, autoRecharge: balance.autoRecharge, lowThreshold: plivo.lowBalanceThreshold() }
+        : { known: false },
+      spend: plivoSpend.getMonthSpend(),
+    });
+  } catch (e) { next(e); }
+});
+
 router.post('/default-provider', requirePropertyAllowlist(FEATURES.canSwitchCallMode, { label: 'Switch Call Mode' }), async (req, res, next) => {
   try {
     const provider = String(req.body.provider ?? '').toLowerCase().trim();
@@ -1263,12 +1285,7 @@ async function storeTranscriptionBestEffort({ jobCallerInfoId, recordingId }) {
     if (!(await hasTranscriptionColumn())) return;
     const tx = await plivo.fetchTranscription({ recordingId });
     if (tx.ok && tx.text) {
-      await pool.query(
-        `UPDATE tbl_plivo_call_log
-            SET transcription = ?, transcription_status = 'completed', transcription_fetched_at = ?
-          WHERE job_caller_info_id = ?`,
-        [tx.text, new Date(), jobCallerInfoId]
-      );
+      await saveTranscript(jobCallerInfoId, tx);
       logger.info('Call transcription stored · jci=' + jobCallerInfoId);
     } else if (tx.ok) {
       // No transcript yet. Plivo does NOT auto-transcribe, so REQUEST one
@@ -1308,10 +1325,7 @@ async function fetchTranscriptOnDemand({ jobCallerInfoId, callUuid, currentStatu
     if (!meta.ok || !meta.recordingId) return null;
     const tx = await plivo.fetchTranscription({ recordingId: meta.recordingId });
     if (tx.ok && tx.text) {
-      await pool.query(
-        "UPDATE tbl_plivo_call_log SET transcription = ?, transcription_status = 'completed', transcription_fetched_at = ? WHERE job_caller_info_id = ?",
-        [tx.text, new Date(), jobCallerInfoId]
-      );
+      await saveTranscript(jobCallerInfoId, tx);
       return tx.text;
     }
     // No transcript yet. If we've never requested one, REQUEST it now (Plivo

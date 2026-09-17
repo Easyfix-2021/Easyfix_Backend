@@ -40,7 +40,12 @@ async function countReferences(entity, id) {
   for (const r of regs) {
     const [[row]] = await pool.query(r.countSql, [id]);
     const count = Number(row && row.cnt) || 0;
-    if (count > 0) by_type.push({ type: r.type, label: r.label, count });
+    // A countSql may also return `active_cnt` — split so the UI can explain why
+    // a list "Used By" (active only) reads 0 while delete is still blocked.
+    const split = row && row.active_cnt != null
+      ? { active: Number(row.active_cnt) || 0, inactive: count - (Number(row.active_cnt) || 0) }
+      : {};
+    if (count > 0) by_type.push({ type: r.type, label: r.label, count, ...split });
     total += count;
   }
   return { total, by_type };
@@ -76,7 +81,11 @@ registerReference({
   entity: 'brand',
   type: 'material_price_group_brand',
   label: 'Materials',
-  countSql: `SELECT COUNT(DISTINCT material_id) AS cnt FROM tbl_material_price_group_brand WHERE brand_id = ?`,
+  countSql: `SELECT COUNT(DISTINCT gb.material_id) AS cnt,
+                    COUNT(DISTINCT CASE WHEN m.status = 1 THEN gb.material_id END) AS active_cnt
+               FROM tbl_material_price_group_brand gb
+               LEFT JOIN tbl_material_master m ON m.material_id = gb.material_id
+              WHERE gb.brand_id = ?`,
   // Repointing a brand on a group where the replacement is ALREADY present on
   // the same material would collide with uq_group_brand_material — the
   // caller must check findRepointConflicts() first and 409 before calling this.
