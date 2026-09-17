@@ -17,6 +17,8 @@ const scenario = {
   dupOnCreate: null,       // row returned by the brand_key dup lookup, or null
   referenceCount: 0,       // rows referencing brand_id=5 (delete guard)
   conflictRows: [],        // rows for the replace-and-delete conflict check
+  activeOptionsRows: [],   // canned rows for listActiveBrandOptions
+  listRows: [],            // canned rows for listBrands
 };
 
 const fake = installFakePool([
@@ -30,6 +32,9 @@ const fake = installFakePool([
   [/INSERT INTO tbl_brand_master/i, () => ({ insertId: 42 })],
   [/DELETE FROM tbl_brand_master/i, () => ({ affectedRows: 1 })],
   [/UPDATE tbl_material_price_group_brand SET brand_id/i, () => ({ affectedRows: scenario.conflictRows.length ? 0 : 1 })],
+  [/SELECT COUNT\(\*\) AS total FROM tbl_brand_master b/i, () => [{ total: 0 }]],
+  [/FROM tbl_brand_master WHERE status = 1/i, () => scenario.activeOptionsRows],
+  [/SELECT b\.brand_id, b\.brand_name/i, () => scenario.listRows],
 ]);
 
 const brandSvc = require('../services/brand.service');
@@ -39,6 +44,8 @@ beforeEach(() => {
   scenario.dupOnCreate = null;
   scenario.referenceCount = 0;
   scenario.conflictRows = [];
+  scenario.activeOptionsRows = [];
+  scenario.listRows = [];
 });
 
 // ─── Duplicate brand (case + whitespace variants) → 409 ────────────────
@@ -104,4 +111,26 @@ test('replaceAndDeleteBrand succeeds and repoints when there is no conflict', as
   scenario.conflictRows = [];
   const out = await brandSvc.replaceAndDeleteBrand(5, 8);
   assert.equal(out.deleted, true);
+});
+
+// ─── is_system rows never surface (QA-fixes round: brand-options + list) ─
+
+test('listActiveBrandOptions queries with is_system = 0 (system rows excluded)', async () => {
+  scenario.activeOptionsRows = [{ brand_id: 5, brand_name: 'Philips', is_system: 0 }];
+  const rows = await brandSvc.listActiveBrandOptions();
+  assert.deepEqual(rows, scenario.activeOptionsRows);
+
+  // Positive control: prove this ran the expected query before trusting its
+  // WHERE clause — a query that never fired and one that ran unfiltered
+  // would both leave `rows` looking plausible.
+  const call = fake.calls.find((c) => /FROM tbl_brand_master WHERE status = 1/i.test(c.sql));
+  assert.ok(call, 'listActiveBrandOptions should query tbl_brand_master');
+  assert.match(call.sql, /is_system\s*=\s*0/i, 'must filter out is_system rows in SQL');
+});
+
+test('listBrands filters is_system = 0 regardless of the status filter', async () => {
+  await brandSvc.listBrands({ status: 'all' });
+  const call = fake.calls.find((c) => /SELECT b\.brand_id, b\.brand_name/i.test(c.sql));
+  assert.ok(call, 'listBrands should query tbl_brand_master');
+  assert.match(call.sql, /is_system\s*=\s*0/i, 'must filter out is_system rows even with status=all');
 });

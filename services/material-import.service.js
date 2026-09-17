@@ -162,6 +162,11 @@ async function generateMaterialTemplate(res) {
   });
 }
 
+// A "Brands" cell blank or normalising to one of these aliases means the row
+// carries no brand at all (Decision A: "No Brand" pricing, replacing the old
+// "Not Applicable" system brand).
+const NO_BRAND_ALIASES = new Set(['not applicable', 'na', 'n/a', 'no brand']);
+
 async function loadImportReferenceData() {
   const [[categories], [uoms], [brands]] = await Promise.all([
     pool.query('SELECT service_catg_id, service_catg_name FROM tbl_service_catg WHERE service_catg_status = 1'),
@@ -172,7 +177,6 @@ async function loadImportReferenceData() {
     categoryByKey: new Map(categories.map((c) => [nameKey(c.service_catg_name), c])),
     uomByKey: new Map(uoms.map((u) => [nameKey(u.uom_name), u])),
     brandByKey: new Map(brands.map((b) => [b.brand_key, b])),
-    notApplicableId: (brands.find((b) => b.is_system) || {}).brand_id || null,
   };
 }
 
@@ -221,6 +225,10 @@ async function parseMaterialRows(buffer, { canCreateBrands = false } = {}) {
       if (!uom) errors.push(`Unknown UOM "${uomName}"`);
     }
 
+    // Blank, or a recognised "no brand" alias, means this row is a No Brand
+    // group — not an unresolved/unknown brand.
+    const isNoBrandCell = pricingType === 'FIXED' && (!brandsRaw || NO_BRAND_ALIASES.has(nameKey(brandsRaw)));
+
     let brandNames = [];
     let price = null;
     let priceOutcome = null; // 'PRICE_PENDING' when FIXED price is blank/non-numeric
@@ -228,8 +236,8 @@ async function parseMaterialRows(buffer, { canCreateBrands = false } = {}) {
       if (brandsRaw) errors.push('DYNAMIC materials cannot carry Brands');
       if (priceRaw) errors.push('DYNAMIC materials cannot carry Price');
     } else if (pricingType === 'FIXED') {
-      brandNames = brandsRaw ? brandsRaw.split(',').map((s) => s.trim()).filter(Boolean) : [];
-      if (brandNames.length === 0) errors.push('FIXED rows require at least one brand');
+      brandNames = isNoBrandCell ? [] : brandsRaw.split(',').map((s) => s.trim()).filter(Boolean);
+      if (!isNoBrandCell && brandNames.length === 0) errors.push('FIXED rows require at least one brand');
       if (!priceRaw || !/^-?\d+(\.\d+)?$/.test(priceRaw)) {
         priceOutcome = 'PRICE_PENDING';
       } else {
@@ -254,12 +262,6 @@ async function parseMaterialRows(buffer, { canCreateBrands = false } = {}) {
           resolvedBrandIds.push(`__new__${bkey}`); // resolved to a real id at commit time
         } else {
           errors.push(`Unknown brand "${bn}" (missing isBrandAddNew to create it)`);
-        }
-      }
-      if (ref.notApplicableId != null) {
-        const hasNotApplicable = resolvedBrandIds.includes(ref.notApplicableId);
-        if (hasNotApplicable && resolvedBrandIds.length > 1) {
-          errors.push('Brand "Not Applicable" cannot be combined with another brand');
         }
       }
     }
@@ -288,6 +290,7 @@ async function parseMaterialRows(buffer, { canCreateBrands = false } = {}) {
         groupKey, material_name, description, category_id: category.service_catg_id,
         uom_id: uom ? uom.uom_id : null, pricing_type: pricingType,
         firstRowNumber: rowNumber, groups: [], brandIdsSeen: new Set(), rows: [],
+        hasNoBrandRow: false, hasBrandedRow: false,
       });
     }
     const acc = materials.get(groupKey);
@@ -311,6 +314,13 @@ async function parseMaterialRows(buffer, { canCreateBrands = false } = {}) {
     }
 
     if (pricingType === 'FIXED') {
+      if (isNoBrandCell) acc.hasNoBrandRow = true; else acc.hasBrandedRow = true;
+      if (acc.hasNoBrandRow && acc.hasBrandedRow) {
+        parsed.errors.push(`Cannot mix No Brand and brand prices for "${acc.material_name}"`);
+        parsed.outcome = 'BLOCKED';
+        return;
+      }
+
       for (const bid of resolvedBrandIds) {
         if (acc.brandIdsSeen.has(bid)) {
           parsed.errors.push(`Brand repeated across rows for this material (first on row ${acc.firstRowNumber})`);

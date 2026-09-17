@@ -9,9 +9,12 @@ const refs = require('./material-references');
  * Uniqueness: UNIQUE KEY on brand_key (nameKey(brand_name)) — the DB index is
  * the real guard, the pre-check below is UX only (see createBrand/updateBrand).
  *
- * The system brand "Not Applicable" (is_system=1, seeded by
- * migrations/2026-09-17-manage-materials.sql) is not editable, not
- * deactivatable, not deletable — every mutating path 422s on it.
+ * `is_system` is a generic guard, kept for any future system-seeded brand:
+ * a row with is_system=1 is not editable, not deactivatable, not deletable —
+ * every mutating path 422s on it. No system brand is seeded today (the
+ * former "Not Applicable" row was dropped — see
+ * migrations/2026-09-17-manage-materials-drop-not-applicable-brand.sql and
+ * Decision A in the QA-fixes scratchpad: "No Brand" pricing replaced it).
  */
 
 function mkErr(status, message, extra) {
@@ -39,14 +42,19 @@ async function listBrands({
 
   logger.info('List brands · search=' + (search || '') + ' status=' + status + ' page=' + page + ' limit=' + limit);
 
-  const where = [];
+  // is_system rows (e.g. the retired "Not Applicable" brand) never surface
+  // in the Brand Master list, regardless of the status filter.
+  const where = ['b.is_system = 0'];
   const params = [];
   if (status === 'active') where.push('b.status = 1');
   else if (status === 'inactive') where.push('b.status = 0');
-  // 'all' → no filter
+  // 'all' → no additional status filter
 
   if (search) {
-    where.push('b.brand_name LIKE ?');
+    // Explicit LOWER() on both sides — case-insensitive substring match
+    // regardless of the column's collation (matches pincode.service.js /
+    // maps.service.js precedent rather than relying on a _ci default).
+    where.push('LOWER(b.brand_name) LIKE LOWER(?)');
     params.push(`%${search}%`);
   }
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
@@ -82,8 +90,10 @@ async function getBrandById(id) {
 }
 
 async function listActiveBrandOptions() {
+  // Never offer an is_system row (e.g. the retired "Not Applicable" brand)
+  // in the material-picker's brand options.
   const [rows] = await pool.query(
-    `SELECT brand_id, brand_name, CAST(is_system AS SIGNED) AS is_system FROM tbl_brand_master WHERE status = 1 ORDER BY brand_name ASC`
+    `SELECT brand_id, brand_name, CAST(is_system AS SIGNED) AS is_system FROM tbl_brand_master WHERE status = 1 AND is_system = 0 ORDER BY brand_name ASC`
   );
   return rows;
 }
