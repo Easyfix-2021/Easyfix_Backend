@@ -43,9 +43,15 @@ const scenario = {
   job: null,
   noteRows: [],
   scoped: true,
+  // Has migrations/2026-09-17-job-notes-pin.sql run? The service caches a YES
+  // for the process, so every test that needs NO sits above the pin tests.
+  pinColumns: false,
+  pinAffected: 1,
 };
 
 const fake = installFakePool([
+  [/SHOW COLUMNS FROM tbl_job_notes/i, () => (scenario.pinColumns ? [{ Field: 'is_pinned' }] : [])],
+  [/UPDATE tbl_job_notes/i, () => ({ affectedRows: scenario.pinAffected })],
   [/FROM tbl_job_notes/i, () => scenario.noteRows],
   [/INSERT INTO tbl_job_notes/i, () => ({ insertId: 991, affectedRows: 1 })],
 ]);
@@ -94,6 +100,7 @@ beforeEach(() => {
   scenario.job = { job_status: 0, fk_easyfixter_id: null, sub_job_id: null };
   scenario.noteRows = [];
   scenario.scoped = true;
+  scenario.pinAffected = 1;
 });
 
 async function call(method, path, body) {
@@ -105,7 +112,8 @@ async function call(method, path, body) {
   return { status: res.status, body: await res.json().catch(() => null) };
 }
 const insert = () => fake.calls.find((c) => /INSERT INTO tbl_job_notes/i.test(c.sql));
-const select = () => fake.calls.find((c) => /FROM tbl_job_notes/i.test(c.sql));
+const select = () => fake.calls.find((c) => /FROM tbl_job_notes/i.test(c.sql) && !/SHOW COLUMNS/i.test(c.sql));
+const pinUpdate = () => fake.calls.find((c) => /UPDATE tbl_job_notes/i.test(c.sql));
 
 /* ── GET ─────────────────────────────────────────────────────────────────── */
 
@@ -253,6 +261,10 @@ test('there is NO edit and NO delete — the table cannot honestly support eithe
     routes.map((l) => Object.keys(l.route.methods).join(',')).sort(), ['get', 'post'],
     'exactly two note routes may exist on this router',
   );
+  // The pin route changes where a note SITS, never what it says — it takes a
+  // boolean and nothing else, so it cannot become an edit by another name.
+  const pinRoutes = jobsRouter.stack.filter((l) => l.route && /\/notes\/:noteId\/pin$/.test(l.route.path));
+  assert.deepEqual(pinRoutes.map((l) => Object.keys(l.route.methods).join(',')), ['patch']);
 });
 
 test('a note write never touches tbl_job_comment — audit and notepad stay apart', async () => {
@@ -264,4 +276,68 @@ test('a note write never touches tbl_job_comment — audit and notepad stay apar
   assert.equal(fake.calls.filter((c) => /tbl_job_comment/i.test(c.sql)).length, 0);
   assert.equal(fake.calls.filter((c) => /UPDATE tbl_job\b/i.test(c.sql)).length, 0,
     'and tbl_job.remarks must not move');
+});
+
+/* ── Pinning — migrations/2026-09-17-job-notes-pin.sql ──────────────────────
+ * Order matters below: the column probe caches a YES, so the "not migrated"
+ * case runs first. */
+
+test('before the migration, pinning answers 409 and the list is unchanged', async () => {
+  scenario.pinColumns = false;
+  const r = await call('PATCH', '/jobs/42/notes/9/pin', { pinned: true });
+  assert.equal(r.status, 409);
+  assert.equal(pinUpdate(), undefined, 'nothing may be written to columns that do not exist');
+  fake.calls.length = 0;
+  await call('GET', '/jobs/42/notes');
+  assert.doesNotMatch(select().sql, /is_pinned/, 'the un-migrated read must not name the new columns');
+});
+
+test('after the migration, pinned notes list first, then newest', async () => {
+  scenario.pinColumns = true;
+  scenario.noteRows = [
+    { id: 4, notes: 'pinned', job_stage: 'Pending for scheduling', note_created_on: '2026-09-15 10:00:00', note_created_by: 'Renu Yadav', is_pinned: Buffer.from([1]), pinned_on: '2026-09-16 11:00:00', pinned_by_name: 'Sonam Patel' },
+    { id: 9, notes: 'newer', job_stage: 'Pending to start', note_created_on: '2026-09-16 10:00:00', note_created_by: 'Prem Rai', is_pinned: 0, pinned_on: null, pinned_by_name: null },
+  ];
+  const r = await call('GET', '/jobs/42/notes');
+  assert.equal(r.status, 200);
+  assert.match(select().sql, /ORDER BY n\.is_pinned DESC,\s*n\.note_created_on DESC,\s*n\.id DESC/);
+  assert.deepEqual(r.body.data.map((n) => [n.id, n.is_pinned]), [[4, 1], [9, 0]], 'is_pinned ships as 0/1, never a Buffer');
+  assert.equal(r.body.data[0].pinned_by_name, 'Sonam Patel');
+});
+
+test('PATCH pins a note, attributed to the acting user', async () => {
+  scenario.pinColumns = true;
+  const r = await call('PATCH', '/jobs/42/notes/9/pin', { pinned: true });
+  assert.equal(r.status, 200);
+  const [flag, on, by, noteId, jobId] = pinUpdate().params;
+  assert.equal(flag, 1);
+  assert.ok(on instanceof Date);
+  assert.equal(by, 77, 'the pinner is the token user, by id');
+  assert.equal(Number(noteId), 9);
+  assert.equal(Number(jobId), 42);
+  assert.match(pinUpdate().sql, /WHERE id = \? AND job_id = \?/, 'scoped to the job, not just the note id');
+  // A pin moves a note; it never rewrites one.
+  assert.doesNotMatch(pinUpdate().sql, /\bnotes\s*=|note_created_by\s*=|job_stage\s*=/);
+});
+
+test('PATCH unpins and clears who/when', async () => {
+  scenario.pinColumns = true;
+  const r = await call('PATCH', '/jobs/42/notes/9/pin', { pinned: false });
+  assert.equal(r.status, 200);
+  assert.deepEqual(pinUpdate().params.slice(0, 3), [0, null, null]);
+});
+
+test('a note id from another job 404s', async () => {
+  scenario.pinColumns = true;
+  scenario.pinAffected = 0;
+  const r = await call('PATCH', '/jobs/42/notes/12345/pin', { pinned: true });
+  assert.equal(r.status, 404);
+});
+
+test('pinning on an out-of-scope job 404s before any write', async () => {
+  scenario.pinColumns = true;
+  scenario.scoped = false;
+  const r = await call('PATCH', '/jobs/42/notes/9/pin', { pinned: true });
+  assert.equal(r.status, 404);
+  assert.equal(pinUpdate(), undefined);
 });

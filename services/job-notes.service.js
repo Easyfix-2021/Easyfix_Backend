@@ -91,6 +91,31 @@ function stageLabelFor(job) {
  */
 async function listNotes(jobId) {
   logger.info('List job notes · jobId=' + jobId);
+  /*
+   * PINNED FIRST once migrations/2026-09-17-job-notes-pin.sql has run: a pin is
+   * "the next person must see this", so it outranks recency. Within each group
+   * the order is the same (created_on, id) rule as before. Until the columns
+   * exist the read is exactly the original one, so an un-migrated environment
+   * lists notes as it always did.
+   */
+  if (await pinColumnsExist()) {
+    const [rows] = await pool.query(
+      `SELECT n.id, n.notes, n.job_stage, n.note_created_on, n.note_created_by,
+              n.is_pinned, n.pinned_on, pu.user_name AS pinned_by_name
+         FROM tbl_job_notes n
+         LEFT JOIN tbl_user pu ON pu.user_id = n.pinned_by_user_id
+        WHERE n.job_id = ?
+        ORDER BY n.is_pinned DESC, n.note_created_on DESC, n.id DESC`,
+      [jobId],
+    );
+    logger.info('Found ' + rows.length + ' job notes · jobId=' + jobId);
+    // 0/1 always: TINYINT arrives as a number, but a bit column would arrive as
+    // a Buffer, which reads truthy for 0.
+    return rows.map((r) => ({
+      ...r,
+      is_pinned: (Buffer.isBuffer(r.is_pinned) ? r.is_pinned[0] : Number(r.is_pinned)) === 1 ? 1 : 0,
+    }));
+  }
   const [rows] = await pool.query(
     `SELECT id, notes, job_stage, note_created_on, note_created_by
        FROM tbl_job_notes
@@ -100,6 +125,55 @@ async function listNotes(jobId) {
   );
   logger.info('Found ' + rows.length + ' job notes · jobId=' + jobId);
   return rows;
+}
+
+/*
+ * Do the pin columns exist? A POSITIVE answer is cached for the life of the
+ * process (columns do not disappear); a negative one is re-probed on the next
+ * call, so running the migration takes effect without a restart.
+ */
+let _pinColumns = false;
+async function pinColumnsExist() {
+  if (_pinColumns) return true;
+  try {
+    const [rows] = await pool.query("SHOW COLUMNS FROM tbl_job_notes LIKE 'is_pinned'");
+    _pinColumns = Array.isArray(rows) && rows.length > 0;
+  } catch (e) {
+    logger.warn('Job notes pin-column probe failed · ' + ((e && e.message) || e));
+    _pinColumns = false;
+  }
+  return _pinColumns;
+}
+
+/*
+ * Pin or unpin one note. A pin is attributed (who, when) so a note that has
+ * sat on top for a month can be traced; unpinning clears both, since "who
+ * pinned it" means nothing once it is not pinned.
+ *
+ * `WHERE id = ? AND job_id = ?` — the job is the scope the route already
+ * checked, so a note id from ANOTHER job 404s rather than being pinned through
+ * a job the caller can open.
+ */
+async function setPinned(jobId, noteId, pinned, actor) {
+  if (!(await pinColumnsExist())) {
+    const e = new Error('Pinning notes is not available yet on this environment');
+    e.status = 409;
+    throw e;
+  }
+  const on = !!pinned;
+  logger.info((on ? 'Pin' : 'Unpin') + ' job note · jobId=' + jobId + ' noteId=' + noteId);
+  const [r] = await pool.query(
+    `UPDATE tbl_job_notes
+        SET is_pinned = ?, pinned_on = ?, pinned_by_user_id = ?
+      WHERE id = ? AND job_id = ?`,
+    [on ? 1 : 0, on ? new Date() : null, on ? (actor?.user_id ?? null) : null, noteId, jobId],
+  );
+  if (!r || !r.affectedRows) {
+    const e = new Error('Note not found on this job');
+    e.status = 404;
+    throw e;
+  }
+  return { id: Number(noteId), is_pinned: on ? 1 : 0 };
 }
 
 /*
@@ -147,4 +221,4 @@ async function addNote(jobId, { notes }, job, actor) {
   };
 }
 
-module.exports = { listNotes, addNote, stageLabelFor };
+module.exports = { listNotes, addNote, setPinned, stageLabelFor };

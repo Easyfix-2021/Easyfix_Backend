@@ -2996,6 +2996,34 @@ router.post('/:id/notes',
     }
   });
 
+/*
+ * PATCH /jobs/:id/notes/:noteId/pin  { pinned: boolean }
+ *
+ * The one change a note allows after it is written: pin it on top, or unpin
+ * it. The TEXT stays read-and-add-only — a pin changes where a note sits, not
+ * what it says or who wrote it — so the log contract above still holds.
+ * Same guard chain as the two note routes; the note must belong to :id.
+ */
+const notePinParams = Joi.object({
+  id: Joi.number().integer().positive().required(),
+  noteId: Joi.number().integer().positive().required(),
+});
+const notePinBody = Joi.object({ pinned: Joi.boolean().required() });
+
+router.patch('/:id/notes/:noteId/pin',
+  validate(notePinParams, 'params'),
+  validate(notePinBody),
+  scopedJob,
+  async (req, res, next) => {
+    try {
+      const result = await jobNotes.setPinned(req.params.id, req.params.noteId, req.body.pinned, req.user);
+      modernOk(res, result, req.body.pinned ? 'Note pinned' : 'Note unpinned');
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  });
+
 router.post('/:id/notify-unreachable', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
   try {
     logger.info('Notify customer unreachable · jobId=' + req.params.id);
