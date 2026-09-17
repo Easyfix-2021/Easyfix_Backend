@@ -64,8 +64,12 @@ async function listBrands({
 
   const [rows] = await pool.query(
     `SELECT b.brand_id, b.brand_name, CAST(b.is_system AS SIGNED) AS is_system, CAST(b.status AS SIGNED) AS status,
+            -- Used By = ACTIVE materials only (owner, QA 2026-09-17): deactivating a
+            -- material must lower it. Delete protection counts ALL references via
+            -- material-references.js — an inactive material still points at the brand.
             (SELECT COUNT(DISTINCT gb.material_id)
                FROM tbl_material_price_group_brand gb
+               JOIN tbl_material_master m ON m.material_id = gb.material_id AND m.status = 1
               WHERE gb.brand_id = b.brand_id) AS used_by
        FROM tbl_brand_master b
        ${whereSql}
