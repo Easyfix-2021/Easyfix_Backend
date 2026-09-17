@@ -368,7 +368,8 @@ test('the track-record SQL is the agreed definition — and the rating matches M
    */
   const svc = fs.readFileSync(path.join(__dirname, '..', 'services/job.service.js'), 'utf8');
   const fn = bodyOf(svc, 'async function getJobConsoleExtras');
-  assert.match(fn, /tj\.job_status IN \(3, 5\)\s+AND tj\.checkout_date_time >= NOW\(\) - INTERVAL 7 DAY/);
+  assert.match(fn, /tj\.job_status IN \(3, 5\)\s+AND tj\.checkout_date_time >= \?\)/);
+  assert.match(fn, /new Date\(Date\.now\(\) - 7 \* 24 \* 60 \* 60 \* 1000\)/, 'the 7-day cut-off is a bound JS Date, never SQL NOW()');
   assert.match(fn, /oj\.job_status IN \(1, 2, 20\)/);
   assert.match(fn, /ROUND\(AVG\(rr\.customer_rating\), 2\)[\s\S]*?rr\.comment IS NOT NULL/);
   const efr = fs.readFileSync(path.join(__dirname, '..', 'services/easyfixer.service.js'), 'utf8');
