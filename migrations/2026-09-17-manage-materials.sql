@@ -116,13 +116,6 @@ SELECT v.uom_name, LOWER(v.uom_name), 1, NOW()
   ) v
  WHERE NOT EXISTS (SELECT 1 FROM tbl_uom_master u WHERE u.uom_key = LOWER(v.uom_name));
 
--- ─── 3. System brand "Not Applicable" ──────────────────────────────────────
-
-INSERT INTO tbl_brand_master (brand_name, brand_key, is_system, status, created_at)
-SELECT 'Not Applicable', 'not applicable', 1, 1, NOW()
-  FROM DUAL
- WHERE NOT EXISTS (SELECT 1 FROM tbl_brand_master WHERE brand_key = 'not applicable');
-
 -- ─── 4. Sidebar menu row — "Manage Materials" under Settings ──────────────
 
 INSERT INTO tbl_menu (menu_name, parent_menu, menu_depth, has_child, url, icons, sequence, menu_status, action_name)
@@ -262,8 +255,6 @@ SELECT table_name FROM information_schema.tables
                        'tbl_material_state_price','tbl_material_state_price_state');
 
 SELECT COUNT(*) AS uom_count FROM tbl_uom_master;
-
-SELECT brand_id, brand_name, is_system FROM tbl_brand_master WHERE brand_key = 'not applicable';
 
 SELECT menu_id, menu_name, url, parent_menu FROM tbl_menu WHERE url = 'managematerials';
 

@@ -126,3 +126,58 @@ test('material import: a DYNAMIC row carrying Brands/Price is BLOCKED', async ()
   assert.equal(rows[0].outcome, 'BLOCKED');
   assert.ok(rows[0].errors.some((e) => /DYNAMIC/i.test(e)), rows[0].errors.join('; '));
 });
+
+// ─── Material import: Decision A — "No Brand" replaces "Not Applicable" ─
+
+test('material import: a blank Brands cell on a FIXED row is a No Brand group, not an error', async () => {
+  const buf = xlsxBuffer([
+    ['Material Name*', 'Category*', 'Pricing Type*', 'UOM', 'Description', 'Brands', 'Price'],
+    ['Cable Tie', 'Electrical', 'Fixed', 'Nos', '', '', '25'],
+  ]);
+  const { rows } = await imports.previewMaterialImport(buf, { canCreateBrands: false });
+  assert.equal(rows[0].outcome, 'NEW');
+  assert.equal(rows[0].errors.length, 0, rows[0].errors.join('; '));
+});
+
+for (const alias of ['not applicable', 'NA', 'n/a', 'No Brand', '  Not Applicable  ']) {
+  test(`material import: a Brands cell of "${alias}" on a FIXED row is a No Brand group`, async () => {
+    const buf = xlsxBuffer([
+      ['Material Name*', 'Category*', 'Pricing Type*', 'UOM', 'Description', 'Brands', 'Price'],
+      ['Cable Tie', 'Electrical', 'Fixed', 'Nos', '', alias, '25'],
+    ]);
+    const { rows } = await imports.previewMaterialImport(buf, { canCreateBrands: false });
+    assert.equal(rows[0].outcome, 'NEW', rows[0].errors.join('; '));
+    assert.equal(rows[0].errors.length, 0, rows[0].errors.join('; '));
+  });
+}
+
+test('material import: mixing a No Brand row and a branded row for the same material is BLOCKED', async () => {
+  const buf = xlsxBuffer([
+    ['Material Name*', 'Category*', 'Pricing Type*', 'UOM', 'Description', 'Brands', 'Price'],
+    ['Cable Tie', 'Electrical', 'Fixed', 'Nos', '', '', '25'],
+    ['Cable Tie', 'Electrical', 'Fixed', 'Nos', '', 'Philips', '30'],
+  ]);
+  const { rows, summary } = await imports.previewMaterialImport(buf, { canCreateBrands: false });
+  assert.equal(rows[0].outcome, 'NEW', 'first row parses fine on its own');
+  assert.equal(rows[1].outcome, 'BLOCKED');
+  assert.ok(
+    rows[1].errors.some((e) => e.includes('Cannot mix No Brand and brand prices for "Cable Tie"')),
+    rows[1].errors.join('; ')
+  );
+  assert.equal(summary.blocked, 1);
+});
+
+test('material import: mixing a branded row THEN a No Brand row for the same material is also BLOCKED', async () => {
+  const buf = xlsxBuffer([
+    ['Material Name*', 'Category*', 'Pricing Type*', 'UOM', 'Description', 'Brands', 'Price'],
+    ['Cable Tie', 'Electrical', 'Fixed', 'Nos', '', 'Philips', '30'],
+    ['Cable Tie', 'Electrical', 'Fixed', 'Nos', '', 'Not Applicable', '25'],
+  ]);
+  const { rows } = await imports.previewMaterialImport(buf, { canCreateBrands: false });
+  assert.equal(rows[0].outcome, 'NEW');
+  assert.equal(rows[1].outcome, 'BLOCKED');
+  assert.ok(
+    rows[1].errors.some((e) => e.includes('Cannot mix No Brand and brand prices for "Cable Tie"')),
+    rows[1].errors.join('; ')
+  );
+});

@@ -33,13 +33,6 @@ async function listUoms() {
   return rows;
 }
 
-async function getNotApplicableBrandId() {
-  const [[row]] = await pool.query(
-    `SELECT brand_id FROM tbl_brand_master WHERE is_system = 1 LIMIT 1`
-  );
-  return row ? row.brand_id : null;
-}
-
 // ─── List / detail ──────────────────────────────────────────────────────
 
 const SORTABLE_COLUMNS = Object.freeze({
@@ -233,7 +226,10 @@ async function getMaterialById(id) {
 /**
  * Validates a create/edit groups payload against the contract rules.
  * `allowNullPrice` = true lets a FIXED group's price be NULL (import path,
- * which stores it as Price Pending); UI create/edit always passes false.
+ * which stores it as Price Pending); UI create/edit always passes false —
+ * except a "No Brand" group (brand_ids: []), whose price is always optional,
+ * even on a UI save (Decision A: No Brand replaces the old "Not Applicable"
+ * system brand). A No Brand group is legal only as the sole group.
  */
 async function validateGroupsPayload(pricingType, groups, { allowNullPrice = false } = {}) {
   const type = String(pricingType || '').toUpperCase();
@@ -249,19 +245,19 @@ async function validateGroupsPayload(pricingType, groups, { allowNullPrice = fal
   // FIXED from here.
   if (list.length === 0) throw mkErr(422, 'FIXED materials require at least one price group.');
 
-  const notApplicableId = await getNotApplicableBrandId();
   const seenBrandAcrossGroups = new Set();
-  let notApplicableGroupCount = 0;
+  let noBrandGroupCount = 0;
 
   for (const g of list) {
     const brandIds = Array.isArray(g.brand_ids) ? g.brand_ids.map(Number) : [];
-    if (brandIds.length === 0) throw mkErr(422, 'Each price group requires at least one brand.');
+    const isNoBrand = brandIds.length === 0;
+    if (isNoBrand) noBrandGroupCount++;
 
-    if (!allowNullPrice) {
+    if (isNoBrand || allowNullPrice) {
+      if (g.price !== null && g.price !== undefined && Number(g.price) < 0) throw mkErr(422, 'Price must be >= 0.');
+    } else {
       if (g.price === null || g.price === undefined) throw mkErr(422, 'Each price group requires a price.');
       if (Number(g.price) < 0) throw mkErr(422, 'Price must be >= 0.');
-    } else if (g.price !== null && g.price !== undefined && Number(g.price) < 0) {
-      throw mkErr(422, 'Price must be >= 0.');
     }
 
     const dedupe = new Set(brandIds);
@@ -269,11 +265,6 @@ async function validateGroupsPayload(pricingType, groups, { allowNullPrice = fal
     for (const bid of brandIds) {
       if (seenBrandAcrossGroups.has(bid)) throw mkErr(422, 'A brand cannot repeat across price groups on the same material.');
       seenBrandAcrossGroups.add(bid);
-    }
-
-    if (notApplicableId && brandIds.includes(notApplicableId)) {
-      notApplicableGroupCount++;
-      if (brandIds.length > 1) throw mkErr(422, 'Brand "Not Applicable" cannot be combined with another brand.');
     }
 
     const states = Array.isArray(g.states) ? g.states : [];
@@ -290,8 +281,8 @@ async function validateGroupsPayload(pricingType, groups, { allowNullPrice = fal
     }
   }
 
-  if (notApplicableId && notApplicableGroupCount > 0 && list.length > 1) {
-    throw mkErr(422, 'Brand "Not Applicable" must be the sole brand of the sole price group.');
+  if (noBrandGroupCount > 0 && list.length > 1) {
+    throw mkErr(422, 'A material cannot mix No Brand pricing with brand prices.');
   }
 }
 
@@ -542,7 +533,6 @@ async function replaceAndDeleteMaterial(id, replacementId) {
 module.exports = {
   mkErr,
   listUoms,
-  getNotApplicableBrandId,
   listMaterials,
   getMaterialRow,
   getMaterialById,
