@@ -12,6 +12,10 @@
  *     → { html } — the dashboard page with the latest snapshot inlined, for the
  *       CRM to render in a sandboxed iframe. 404 when nothing is uploaded.
  *
+ *   GET  /api/admin/quicksight/employee-performance/template   (upload key)
+ *     → employee-performance-template.xlsx — the 8 sheets update_dashboard.bat
+ *       reads, header-only, plus Read me and Example rows.
+ *
  *   POST /api/admin/quicksight/employee-performance/upload
  *     multipart/form-data: file=<data.js | data.json, optionally gzipped>
  *     → meta (as above). Replaces the current snapshot.
@@ -50,6 +54,8 @@ const validate = require('../../../middleware/validate');
 const { modernOk, modernError } = require('../../../utils/response');
 const service = require('../../../services/quicksight/quicksight-employee-performance.service');
 const aggregate = require('../../../services/quicksight/employee-performance/aggregate');
+const { buildTemplateWorkbook } = require('../../../services/quicksight/employee-performance/excel-template');
+const { streamWorkbook } = require('../../../utils/xlsx-styled-export');
 const logger = require('../../../logger');
 
 const ACTION_KEY = 'isQuickSightEmployeePerformanceView';
@@ -95,6 +101,14 @@ router.get('/dashboard', async (_req, res, next) => {
     // Per-employee revenue: keep it out of every intermediary cache.
     res.set('Cache-Control', 'no-store');
     return modernOk(res, { html });
+  } catch (err) { return next(err); }
+});
+
+// The Excel template MIS fills before running update_dashboard.bat. Same key as
+// the upload: it is the first half of that same job.
+router.get('/template', requireAction(UPLOAD_KEY), async (_req, res, next) => {
+  try {
+    return await streamWorkbook(res, 'employee-performance-template.xlsx', buildTemplateWorkbook());
   } catch (err) { return next(err); }
 });
 
