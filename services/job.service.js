@@ -1528,7 +1528,7 @@ async function getJobConsoleExtras({ jobId, clientOwnerId, clientId, verticalId,
        ${spocSql(2)} AS secondary_spoc_name,
        (SELECT COUNT(*) FROM tbl_job tj
          WHERE tj.fk_easyfixter_id = ? AND tj.job_status IN (3, 5)
-           AND tj.checkout_date_time >= NOW() - INTERVAL 7 DAY) AS efr_completed_7d,
+           AND tj.checkout_date_time >= ?) AS efr_completed_7d,
        (SELECT COUNT(*) FROM tbl_job oj
          WHERE oj.fk_easyfixter_id = ? AND oj.job_status IN (1, 2, 20)) AS efr_open_jobs,
        (SELECT ROUND(AVG(rr.customer_rating), 2) FROM tbl_easyfixer_rating_by_customer rr
@@ -1541,7 +1541,10 @@ async function getJobConsoleExtras({ jobId, clientOwnerId, clientId, verticalId,
        SELECT MAX(e2.table_id) FROM tbl_easyfixer_rating_by_customer e2 WHERE e2.job_id = ?)
      LEFT JOIN tbl_user escu ON escu.user_id = esc.escalated_by`,
     [clientOwnerId || 0, verticalId || 0, clientId || 0, clientId || 0,
-      efrId || 0, efrId || 0, efrId || 0, jobId || 0],
+      // "Last 7 days" as a BOUND JS Date, not SQL NOW(): the pool serialises it
+      // as the IST wall clock checkout_date_time is written in (see
+      // eslint.config.mjs "SQL clock functions").
+      efrId || 0, new Date(Date.now() - 7 * 24 * 60 * 60 * 1000), efrId || 0, efrId || 0, jobId || 0],
   );
   const hasEfr = !!efrId;
   return {
