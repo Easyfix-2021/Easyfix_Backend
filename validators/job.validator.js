@@ -574,7 +574,32 @@ const updateBody = Joi.object({
     pin_code: pinCode.optional(),
     gps_location: gpsPair.allow('').optional(),
   }).optional(),
-}).min(1);
+  /*
+   * Confirm & Schedule address picker (2026-09-17). The `address` block above
+   * edits the job's tbl_address row IN PLACE — and that row is shared by every
+   * job pointing at it, completed history included. The picker never does that;
+   * it re-points tbl_job.fk_address_id instead, in one of two ways:
+   *   fk_address_id  use this EXISTING saved address exactly as is. The service
+   *                  400s unless the row belongs to the job's customer.
+   *   new_address    create a NEW tbl_address row for the job's customer. Every
+   *                  bookable field is required (the Book Call gate needs city,
+   *                  6-digit PIN and GPS; the product rule adds building), so a
+   *                  half-filled address can never be minted from here.
+   * `address` stays for its other callers, unchanged. At most one of the three
+   * may be sent (.oxor below): "edit the current row" and "point somewhere else"
+   * in one PATCH have no meaningful order, so the request is refused instead.
+   */
+  fk_address_id: intId.optional(),
+  new_address: Joi.object({
+    address: Joi.string().trim().min(1).max(2000).required(),
+    building: Joi.string().trim().min(1).max(500).required(),
+    landmark: Joi.string().max(500).allow('').optional(),
+    address_instruction: Joi.string().max(1000).allow('', null).optional(),
+    city_id: intId.required(),
+    pin_code: pinCode.required(),
+    gps_location: gpsPair.required(),
+  }).optional(),
+}).min(1).oxor('fk_address_id', 'new_address', 'address');
 
 /*
  * PATCH /api/admin/jobs/:id/status — the ONLY consumer of this schema
