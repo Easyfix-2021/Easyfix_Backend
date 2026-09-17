@@ -352,6 +352,31 @@ async function accountBalanceCached() {
 }
 
 /*
+ * One page of a Plivo LIST endpoint (`/Call/?…`, `/Transcription/?…`), newest
+ * first, at most 20 objects. THROWS on any non-2xx, so a caller summing pages
+ * can never mistake a failed page for an empty one. Plivo answers an
+ * out-of-range offset — and a filter it does not support, e.g. add_time on
+ * Transcription — with `{ meta: null, objects: [] }`, which reads as [] here.
+ */
+async function listPage(pathAndQuery, { timeoutMs = 20_000 } = {}) {
+  const auth = authHeader();
+  if (!auth || !process.env.PLIVO_AUTH_ID) throw new Error('PLIVO_AUTH_ID / PLIVO_AUTH_TOKEN not configured');
+  const res = await fetch(`${BASE}/Account/${encodeURIComponent(process.env.PLIVO_AUTH_ID)}${pathAndQuery}`, {
+    headers: { Authorization: auth },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) throw new Error(`Plivo list ${pathAndQuery.split('?')[0]} http=${res.status}`);
+  const body = await res.json();
+  return Array.isArray(body?.objects) ? body.objects : [];
+}
+
+// Plivo list timestamps are UTC with a space and up to 6 fractional digits
+// ("2026-09-17 08:00:54.275917+00:00"). Epoch ms, or NaN when unparseable.
+function plivoTimeMs(s) {
+  return new Date(String(s).replace(' ', 'T')).getTime();
+}
+
+/*
  * Place the bridge call. `from` = agent (rung first), `to` = customer (bridged
  * via answer XML). `jobCallerInfoId` ties the callbacks back to the audit row.
  * Returns the normalised contract (delivered / callId / diagnostic …) using
@@ -569,10 +594,12 @@ async function downloadRecording(recordingUrl) {
  * `text` is null when Plivo has no transcription for that recording yet (404 —
  * transcription must be requested at record time / is still processing).
  *
- * ⚠️ VERIFY against current Plivo docs for your account before enabling
- * plivo.transcription.enabled: confirm the endpoint path + that the transcript
- * text arrives under `transcription` in the JSON body. Same HTTP Basic auth as
- * the Recording API.
+ * Response verified against the live account 2026-09-17: { api_id, cost, rate,
+ * recording_duration_ms, recording_start_ms, status, transcription }. `cost` is
+ * USD for THIS transcript = max(1, ceil(seconds / 60)) × rate — every call bills
+ * at least one full minute. (The LIST endpoint names the same values
+ * transcription_cost / transcription_rate / transcription_text.) Same HTTP
+ * Basic auth as the Recording API.
  */
 async function fetchTranscription({ recordingId }) {
   if (!recordingId) return { ok: false, error: 'recordingId required', text: null };
@@ -592,7 +619,9 @@ async function fetchTranscription({ recordingId }) {
     }
     const body = await res.json();
     const text = typeof body?.transcription === 'string' ? body.transcription : null;
-    return { ok: true, text, transcriptionId: body?.transcription_id || null };
+    // `!= null` first: Number(null) is 0, which would record a free transcript.
+    const cost = body?.cost != null && Number.isFinite(Number(body.cost)) ? Number(body.cost) : null;
+    return { ok: true, text, transcriptionId: body?.transcription_id || null, cost };
   } catch (err) {
     logger.error(`Plivo transcription lookup network error · recId=${recordingId} · ${err.message}`);
     return { ok: false, error: err.message, text: null };
@@ -735,6 +764,8 @@ module.exports = {
   lowBalanceThreshold,
   accountBalance,
   accountBalanceCached,
+  listPage,
+  plivoTimeMs,
   clickToCall,
   previewCallLegs,
   resolveCallLegs,
