@@ -1754,6 +1754,12 @@ function buildJobHeader(job, {
   checkinByName = null,
   acceptedDateTime = null,
   acceptedEfrName = null,
+  /*
+   * EasyFix SPOC (job_client_owner's name) and the job's escalation, from
+   * jobService.getJobEscalationAndSpoc. Absent ⇒ every field null / 0, so a
+   * caller that forgets it renders "not escalated", never a crash.
+   */
+  escalationAndSpoc = null,
   // Only the ranked path knows whether the job is already assigned; the search
   // header has no such concept, so it keeps A's "not assigned" value rather
   // than inventing one from fk_easyfixter_id (a different question).
@@ -1896,6 +1902,18 @@ function buildJobHeader(job, {
     accepted_efr_name:             acceptedEfrName,
     checkin_date_time:             job.checkin_date_time             ?? null,
     checkin_by_name:               checkinByName,
+    /*
+     * The console's Client card names the EasyFix SPOC, and its Job age tile
+     * flags an escalated job. Resolved off-row — see getJobEscalationAndSpoc.
+     * is_escalated is always 0/1 (never a bit Buffer) so `if (is_escalated)`
+     * on the CRM means what it says.
+     */
+    easyfix_spoc_name:   escalationAndSpoc?.easyfixSpocName   ?? null,
+    is_escalated:        escalationAndSpoc?.isEscalated       ?? 0,
+    no_of_escalations:   escalationAndSpoc?.noOfEscalations   ?? null,
+    escalated_time:      escalationAndSpoc?.escalatedTime     ?? null,
+    escalated_by_name:   escalationAndSpoc?.escalatedByName   ?? null,
+    escalated_comments:  escalationAndSpoc?.escalatedComments ?? null,
   };
 }
 
@@ -1975,12 +1993,14 @@ async function rankCandidatesForJob(jobId, {
     jobSkillsByService,
     { projectManagerName, zonalManagerName },
     { firstScheduledByName, checkinByName, acceptedDateTime, acceptedEfrName },
+    escalationAndSpoc,
   ] = await Promise.all([
     loadJobSkillMatrix(job),
     jobService.getJobManagerNames({ clientId: job.fk_client_id, cityId: job.city_id }),
     jobService.getJobTimelineActors({
       jobId: job.job_id, firstScheduledBy: job.first_scheduled_by, checkinBy: job.fk_checkin_by,
     }),
+    jobService.getJobEscalationAndSpoc({ jobId: job.job_id, clientOwnerId: job.job_client_owner }),
   ]);
 
   // Pre-build the enriched job payload used in ALL return paths (early-exit
@@ -1989,6 +2009,7 @@ async function rankCandidatesForJob(jobId, {
     serviceCatgName, serviceTypeName, deepSkillLabel, jobSkillsByService, assignedEfrId,
     projectManagerName, zonalManagerName,
     firstScheduledByName, checkinByName, acceptedDateTime, acceptedEfrName,
+    escalationAndSpoc,
   });
 
   // COD = the customer pays the tech on-site (customerPays). Such techs
@@ -2728,17 +2749,20 @@ async function searchJobHeader(job, { assignedEfrId = null } = {}) {
     jobSkillsByService,
     { projectManagerName, zonalManagerName },
     { firstScheduledByName, checkinByName, acceptedDateTime, acceptedEfrName },
+    escalationAndSpoc,
   ] = await Promise.all([
     loadJobSkillMatrix(job),
     jobService.getJobManagerNames({ clientId: job.fk_client_id, cityId: job.city_id }),
     jobService.getJobTimelineActors({
       jobId: job.job_id, firstScheduledBy: job.first_scheduled_by, checkinBy: job.fk_checkin_by,
     }),
+    jobService.getJobEscalationAndSpoc({ jobId: job.job_id, clientOwnerId: job.job_client_owner }),
   ]);
   return buildJobHeader(job, {
     serviceCatgName, serviceTypeName, deepSkillLabel, jobSkillsByService,
     projectManagerName, zonalManagerName,
     firstScheduledByName, checkinByName, acceptedDateTime, acceptedEfrName,
+    escalationAndSpoc,
     assignedEfrId,
   });
 }
