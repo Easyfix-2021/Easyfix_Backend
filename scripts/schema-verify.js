@@ -410,6 +410,9 @@ const EXPECTED = {
     // records it was not (routes/admin/jobs.js writes them,
     // services/job-export.service.js reads escalated_time).
     'escalated_by', 'escalated_time',
+    // The console header reads the count and the text too
+    // (services/job.service.js getJobEscalationAndSpoc).
+    'no_of_escalations', 'escalated_comments',
   ],
 };
 
