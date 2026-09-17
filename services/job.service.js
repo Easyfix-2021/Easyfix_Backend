@@ -1475,26 +1475,47 @@ async function getJobManagerNames({ clientId, cityId } = {}, conn) {
 }
 
 /*
- * ─── EASYFIX SPOC + ESCALATION, FOR THE CONSOLE HEADER ────────────────────
+ * ─── THE CONSOLE HEADER'S CLIENT-SIDE EXTRAS ──────────────────────────────
+ *
+ * Names the console's Client card and Job age tile need that are not columns
+ * on the row the header is built from, in ONE round trip of scalar subqueries:
  *
  * EASYFIX SPOC — tbl_job.job_client_owner → tbl_user.user_name. The same user
- * the jobs list's "Easyfix SPOC" column prints (listColumns' `uo` join), so
- * the console and the row it opened from name the same person.
+ * the jobs list's "Easyfix SPOC" column prints (listColumns' `uo` join).
+ *
+ * VERTICAL — tbl_client.vertical_id → tbl_vertical.vertical_name.
+ *
+ * PRIMARY / SECONDARY SPOC — the client's tbl_vertical_mapping rows with
+ * user_type 1 / 2, filtered and ordered exactly as resolveClientPrimarySpoc
+ * picks the primary (active mapping, newest first, the USER's id so a deleted
+ * user yields NULL). The same lookup therefore names the same Primary SPOC
+ * that job_primary_spoc / job_client_owner were stamped from.
  *
  * ESCALATION — the latest tbl_easyfixer_rating_by_customer row for the job,
- * picked exactly as escalationJoin() picks it (MAX(table_id)), so the console
- * and the list's Escalated view agree on which row counts. `is_escalated = 1`
- * in SQL, never the raw column: it can arrive as a bit(1) Buffer, which reads
- * truthy for 0.
+ * picked exactly as escalationJoin() picks it (MAX(table_id)). `is_escalated =
+ * 1` in SQL, never the raw column: a bit(1) Buffer reads truthy for 0.
  *
- * One round trip of scalar subqueries, NULL-tolerant like its siblings: a job
- * with no rating row or no owner answers nulls, not a dropped header.
+ * NULL-tolerant like its siblings: a job with no owner, vertical, mapping or
+ * rating row answers nulls, never a dropped header.
  */
-async function getJobEscalationAndSpoc({ jobId, clientOwnerId } = {}, conn) {
+async function getJobConsoleExtras({ jobId, clientOwnerId, clientId, verticalId } = {}, conn) {
   const db = conn || pool;
+  const orderBy = (await hasVerticalMappingInsertedOnColumn())
+    ? 'vm.inserted_on DESC, vm.id DESC'
+    : 'vm.id DESC';
+  const spocSql = (userType) => `(SELECT u.user_name
+         FROM tbl_vertical_mapping vm
+         JOIN tbl_user u ON u.user_id = vm.user_id
+        WHERE vm.client_id = ? AND vm.user_type = ${userType}
+          AND (vm.status IS NULL OR vm.status = 1)
+        ORDER BY ${orderBy}
+        LIMIT 1)`;
   const [[row]] = await db.query(
     `SELECT
        (SELECT spu.user_name FROM tbl_user spu WHERE spu.user_id = ?) AS easyfix_spoc_name,
+       (SELECT vt.vertical_name FROM tbl_vertical vt WHERE vt.vertical_id = ?) AS vertical_name,
+       ${spocSql(1)} AS primary_spoc_name,
+       ${spocSql(2)} AS secondary_spoc_name,
        esc.is_escalated = 1 AS is_escalated,
        esc.no_of_escalations, esc.escalated_time, esc.escalated_comments,
        escu.user_name AS escalated_by_name
@@ -1502,10 +1523,13 @@ async function getJobEscalationAndSpoc({ jobId, clientOwnerId } = {}, conn) {
      LEFT JOIN tbl_easyfixer_rating_by_customer esc ON esc.table_id = (
        SELECT MAX(e2.table_id) FROM tbl_easyfixer_rating_by_customer e2 WHERE e2.job_id = ?)
      LEFT JOIN tbl_user escu ON escu.user_id = esc.escalated_by`,
-    [clientOwnerId || 0, jobId || 0],
+    [clientOwnerId || 0, verticalId || 0, clientId || 0, clientId || 0, jobId || 0],
   );
   return {
     easyfixSpocName:   row?.easyfix_spoc_name ?? null,
+    verticalName:      row?.vertical_name ?? null,
+    primarySpocName:   row?.primary_spoc_name ?? null,
+    secondarySpocName: row?.secondary_spoc_name ?? null,
     isEscalated:       Number(row?.is_escalated ?? 0) === 1 ? 1 : 0,
     noOfEscalations:   row?.no_of_escalations != null ? Number(row.no_of_escalations) : null,
     escalatedTime:     row?.escalated_time ?? null,
@@ -8269,8 +8293,8 @@ module.exports = {
    * must have one answer, not one per surface that asks. See its docblock.
    */
   getJobTimelineActors,
-  // The console header's EasyFix SPOC and escalation — see its docblock.
-  getJobEscalationAndSpoc,
+  // The console header's client-side extras (SPOCs, vertical, escalation) — see its docblock.
+  getJobConsoleExtras,
   hasAfterWorkPhoto, afterPhotoRequiredError,
   // Technician app requests. rejectAppRequest is the Reject button; there is no
   // approve twin because Approve is the ordinary cancel/reschedule, and
