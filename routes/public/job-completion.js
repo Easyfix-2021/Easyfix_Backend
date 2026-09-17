@@ -628,15 +628,14 @@ router.post(
       let preferred = toMysqlDatetime(req.body.preferred_datetime);
       let preferredSlot = null;
       /*
-       * A CUSTOMER may only push an appointment OUT, never pull it earlier.
+       * A CUSTOMER may only move an appointment to a LATER DAY: on or after the
+       * day AFTER the later of (current appointment's day, today). Same-day or
+       * earlier is refused.
        *
-       * The magic-link form already blocks earlier dates in its calendar, but a
-       * public token endpoint must not trust its own UI — anyone holding a link
-       * can POST whatever they like. The floor is the later of:
-       *   - the current appointment's DAY (so it can't be pulled forward), and
-       *   - TODAY (so an already-past appointment can't be "moved" backwards).
-       * Compared at DATE granularity, matching the calendar's day-level rule and
-       * leaving the customer free to pick any slot on the floor day itself.
+       * The magic-link form enforces the same floor, but a public token
+       * endpoint must not trust its own UI — iOS Safari's date picker ignores
+       * `min`, and anyone holding a link can POST whatever they like.
+       * Compared at DATE granularity; any slot on the floor day is allowed.
        *
        * OPS ARE UNAFFECTED: they reschedule through the authenticated CRM
        * routes, where back-dating is a legitimate correction. This is the
@@ -649,7 +648,10 @@ router.post(
         const istToday = new Date(Date.now() + (5 * 60 + 30) * 60 * 1000)
           .toISOString().slice(0, 10);
         const apptDay = String(jobRow?.requested_date_time || '').slice(0, 10);
-        const floorDay = apptDay && apptDay > istToday ? apptDay : istToday;
+        const baseDay = /^\d{4}-\d{2}-\d{2}$/.test(apptDay) && apptDay > istToday ? apptDay : istToday;
+        const floor = new Date(`${baseDay}T00:00:00Z`);
+        floor.setUTCDate(floor.getUTCDate() + 1);
+        const floorDay = floor.toISOString().slice(0, 10);
         const pickedDay = String(preferred).slice(0, 10);
         if (pickedDay < floorDay) {
           logger.warn(
@@ -657,7 +659,7 @@ router.post(
             + ' · picked=' + pickedDay + ' · floor=' + floorDay,
           );
           throw Object.assign(
-            new Error(`Please choose a date on or after ${floorDay}. An appointment can only be moved later.`),
+            new Error(`Please choose a date on or after ${floorDay}. An appointment can only be moved to a later day.`),
             { status: 400 },
           );
         }
