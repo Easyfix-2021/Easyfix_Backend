@@ -1273,6 +1273,8 @@ Step by step:
   3. For each, it looks up the call's recording on Plivo, then fetches that recording's transcription and stores it on the call-log row.
   4. Calls whose recording isn't ready yet are left pending and retried on a later run.
   5. It logs how many were eligible / completed / not-available / pending / failed (visible below under Last Run).
+  6. Calls shorter than 15 seconds are skipped — Plivo bills every transcript as at least one full minute.
+  7. Each stored transcript also records its Plivo charge (transcription_cost_usd). Once per server start, the first run also fills that cost for older transcripts from Plivo's transcription list (Last Run → costBackfill).
 
 Note: only runs automatically if easyfix_properties "plivo.transcription.enabled" = "true" (checked once at server start — restart after flipping). Trigger Now still works for manual testing. Transcriptions are customer PII — ensure a retention policy.`,
     cron: '*/30 * * * *',
