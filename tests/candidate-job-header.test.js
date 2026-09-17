@@ -122,7 +122,7 @@ test('both endpoints build the header through the one builder', () => {
    * forgets one still returns a complete-looking header, with silently null
    * rows. Both sites must call both resolvers.
    */
-  for (const resolver of ['getJobManagerNames', 'getJobTimelineActors']) {
+  for (const resolver of ['getJobManagerNames', 'getJobTimelineActors', 'getJobEscalationAndSpoc']) {
     const resolves = src.split(`jobService.${resolver}(`).length - 1;
     assert.equal(resolves, 2, `both header paths must call ${resolver}, found ${resolves}`);
   }
