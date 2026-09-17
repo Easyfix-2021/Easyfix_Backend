@@ -1948,6 +1948,10 @@ function buildJobHeader(job, {
     vertical_name:       consoleExtras?.verticalName      ?? null,
     client_primary_spoc_name:   consoleExtras?.primarySpocName   ?? null,
     client_secondary_spoc_name: consoleExtras?.secondarySpocName ?? null,
+    /* The assigned technician's track record — see getJobConsoleExtras. */
+    efr_completed_7d:    consoleExtras?.efrCompleted7d ?? null,
+    efr_open_jobs:       consoleExtras?.efrOpenJobs    ?? null,
+    efr_avg_rating:      consoleExtras?.efrAvgRating   ?? null,
     is_escalated:        consoleExtras?.isEscalated       ?? 0,
     no_of_escalations:   consoleExtras?.noOfEscalations   ?? null,
     escalated_time:      consoleExtras?.escalatedTime     ?? null,
@@ -2042,6 +2046,7 @@ async function rankCandidatesForJob(jobId, {
     jobService.getJobConsoleExtras({
       jobId: job.job_id, clientOwnerId: job.job_client_owner,
       clientId: job.fk_client_id, verticalId: job.vertical_id,
+      efrId: job.fk_easyfixter_id,
     }),
   ]);
 
@@ -2801,6 +2806,7 @@ async function searchJobHeader(job, { assignedEfrId = null } = {}) {
     jobService.getJobConsoleExtras({
       jobId: job.job_id, clientOwnerId: job.job_client_owner,
       clientId: job.fk_client_id, verticalId: job.vertical_id,
+      efrId: job.fk_easyfixter_id,
     }),
   ]);
   return buildJobHeader(job, {

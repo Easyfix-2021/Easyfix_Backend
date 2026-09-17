@@ -1905,7 +1905,21 @@ router.patch('/:id/status', validate(idParam, 'params'), validate(statusBody), s
   } catch (e) { next(e); }
 });
 
-router.patch('/:id/assign', validate(idParam, 'params'), validate(assignBody), scopedJob, requireStageForTransition('assign'), async (req, res, next) => {
+/*
+ * PAST-APPOINTMENT GATE ON ASSIGN / REASSIGN (owner decision, 2026-09-17).
+ *
+ * This route used to stay open on a passed appointment so ops could swap a
+ * technician on a running-late job. That reasoning belonged to the old DIRECT
+ * assign. With the offer flow on, an assign here is an OFFER (and a reassign
+ * releases the current technician and offers the job to the new one), so it
+ * would send a technician an offer for a time that has already gone — exactly
+ * what /offer already refuses. The rule is now the same everywhere: reschedule
+ * first. A future requestedDateTime in the same body still passes (fixing the
+ * time and assigning in one call).
+ */
+router.patch('/:id/assign', validate(idParam, 'params'), validate(assignBody), scopedJob, requireStageForTransition('assign'),
+  blockPastAppointment('This job\'s appointment time has already passed. Reschedule it to a future slot before assigning or reassigning a technician.'),
+  async (req, res, next) => {
   try {
     logger.info('Assign technician · jobId=' + req.params.id + ' efrId=' + (req.body?.easyfixerId ?? req.body?.efr_id ?? '-'));
     const updated = await job.assign(req.params.id, req.body, req.user);

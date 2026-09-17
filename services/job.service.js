@@ -1495,10 +1495,20 @@ async function getJobManagerNames({ clientId, cityId } = {}, conn) {
  * picked exactly as escalationJoin() picks it (MAX(table_id)). `is_escalated =
  * 1` in SQL, never the raw column: a bit(1) Buffer reads truthy for 0.
  *
+ * THE ASSIGNED TECHNICIAN'S TRACK RECORD (2026-09-17) — for the console's
+ * Technician card, all null when the job has no technician:
+ *   completed 7d  jobs Completed (status 3 / 5) with a check-out in the last
+ *                 7 days (rolling, not the calendar week — ops' call)
+ *   open jobs     jobs in status 1 (pending start), 2 or 20 (in progress)
+ *   rating        AVG(customer_rating) over ratings WITH a comment, ROUND(…, 2)
+ *                 — the same definition AND rounding Manage Easyfixers' Avg
+ *                 Rating column uses (the CRM shows both with toFixed(1)), so a
+ *                 4.245 average reads 4.3 on both screens, not 4.2 on one
+ *
  * NULL-tolerant like its siblings: a job with no owner, vertical, mapping or
  * rating row answers nulls, never a dropped header.
  */
-async function getJobConsoleExtras({ jobId, clientOwnerId, clientId, verticalId } = {}, conn) {
+async function getJobConsoleExtras({ jobId, clientOwnerId, clientId, verticalId, efrId } = {}, conn) {
   const db = conn || pool;
   const orderBy = (await hasVerticalMappingInsertedOnColumn())
     ? 'vm.inserted_on DESC, vm.id DESC'
@@ -1516,6 +1526,13 @@ async function getJobConsoleExtras({ jobId, clientOwnerId, clientId, verticalId 
        (SELECT vt.vertical_name FROM tbl_vertical vt WHERE vt.vertical_id = ?) AS vertical_name,
        ${spocSql(1)} AS primary_spoc_name,
        ${spocSql(2)} AS secondary_spoc_name,
+       (SELECT COUNT(*) FROM tbl_job tj
+         WHERE tj.fk_easyfixter_id = ? AND tj.job_status IN (3, 5)
+           AND tj.checkout_date_time >= NOW() - INTERVAL 7 DAY) AS efr_completed_7d,
+       (SELECT COUNT(*) FROM tbl_job oj
+         WHERE oj.fk_easyfixter_id = ? AND oj.job_status IN (1, 2, 20)) AS efr_open_jobs,
+       (SELECT ROUND(AVG(rr.customer_rating), 2) FROM tbl_easyfixer_rating_by_customer rr
+         WHERE rr.easyfixer_id = ? AND rr.comment IS NOT NULL) AS efr_avg_rating,
        esc.is_escalated = 1 AS is_escalated,
        esc.no_of_escalations, esc.escalated_time, esc.escalated_comments,
        escu.user_name AS escalated_by_name
@@ -1523,8 +1540,10 @@ async function getJobConsoleExtras({ jobId, clientOwnerId, clientId, verticalId 
      LEFT JOIN tbl_easyfixer_rating_by_customer esc ON esc.table_id = (
        SELECT MAX(e2.table_id) FROM tbl_easyfixer_rating_by_customer e2 WHERE e2.job_id = ?)
      LEFT JOIN tbl_user escu ON escu.user_id = esc.escalated_by`,
-    [clientOwnerId || 0, verticalId || 0, clientId || 0, clientId || 0, jobId || 0],
+    [clientOwnerId || 0, verticalId || 0, clientId || 0, clientId || 0,
+      efrId || 0, efrId || 0, efrId || 0, jobId || 0],
   );
+  const hasEfr = !!efrId;
   return {
     easyfixSpocName:   row?.easyfix_spoc_name ?? null,
     verticalName:      row?.vertical_name ?? null,
@@ -1535,6 +1554,9 @@ async function getJobConsoleExtras({ jobId, clientOwnerId, clientId, verticalId 
     escalatedTime:     row?.escalated_time ?? null,
     escalatedByName:   row?.escalated_by_name ?? null,
     escalatedComments: row?.escalated_comments ?? null,
+    efrCompleted7d:    hasEfr && row?.efr_completed_7d != null ? Number(row.efr_completed_7d) : null,
+    efrOpenJobs:       hasEfr && row?.efr_open_jobs != null ? Number(row.efr_open_jobs) : null,
+    efrAvgRating:      hasEfr && row?.efr_avg_rating != null ? Number(row.efr_avg_rating) : null,
   };
 }
 

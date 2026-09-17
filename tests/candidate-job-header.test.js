@@ -343,3 +343,41 @@ test('the detail query SELECTs total_cost, or line_total could never be filled',
   const getById = bodyOf(svc, 'async function getById(jobId)');
   assert.match(getById, /js\.total_charge,\s*js\.total_cost/, 'getById must project js.total_cost');
 });
+
+// ─── The assigned technician's track record (2026-09-17) ─────────────────
+
+test('the header ships the technician track record, null without a resolver', () => {
+  const bare = buildJobHeader({ job_id: 1 });
+  for (const k of ['efr_completed_7d', 'efr_open_jobs', 'efr_avg_rating']) {
+    assert.ok(k in bare, `${k} must always be a key on the header`);
+    assert.equal(bare[k], null, `${k} is null when the resolver did not supply it`);
+  }
+  const full = buildJobHeader({ job_id: 1 }, {
+    consoleExtras: { efrCompleted7d: 11, efrOpenJobs: 3, efrAvgRating: 4.25 },
+  });
+  assert.deepEqual([full.efr_completed_7d, full.efr_open_jobs, full.efr_avg_rating], [11, 3, 4.25]);
+});
+
+test('the track-record SQL is the agreed definition — and the rating matches Manage Easyfixers', () => {
+  /*
+   * Ops' definitions: completed = status 3/5 with a check-out in the last 7
+   * days (rolling); open = status 1, 2, 20; rating = AVG over ratings WITH a
+   * comment, ROUND(…, 2) — exactly Manage Easyfixers' Avg Rating, which the
+   * CRM also shows with toFixed(1). A drifted rounding reads 4.2 here and 4.3
+   * there for the same technician.
+   */
+  const svc = fs.readFileSync(path.join(__dirname, '..', 'services/job.service.js'), 'utf8');
+  const fn = bodyOf(svc, 'async function getJobConsoleExtras');
+  assert.match(fn, /tj\.job_status IN \(3, 5\)\s+AND tj\.checkout_date_time >= NOW\(\) - INTERVAL 7 DAY/);
+  assert.match(fn, /oj\.job_status IN \(1, 2, 20\)/);
+  assert.match(fn, /ROUND\(AVG\(rr\.customer_rating\), 2\)[\s\S]*?rr\.comment IS NOT NULL/);
+  const efr = fs.readFileSync(path.join(__dirname, '..', 'services/easyfixer.service.js'), 'utf8');
+  assert.match(efr, /ROUND\(rt\.rating, 2\)/, 'control: Manage Easyfixers rounds its average to 2 places');
+  assert.match(efr, /AVG\(customer_rating\) AS rating[\s\S]*?comment IS NOT NULL/, 'control: and counts only commented ratings');
+});
+
+test('both header paths pass the assigned technician to the extras resolver', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'services/candidate-ranking.service.js'), 'utf8');
+  assert.equal(src.split('efrId: job.fk_easyfixter_id,').length - 1, 2,
+    'the ranked and search/console headers must both resolve the track record');
+});
