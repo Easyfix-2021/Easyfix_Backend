@@ -411,7 +411,7 @@ const EXPECTED = {
     // services/job-export.service.js reads escalated_time).
     'escalated_by', 'escalated_time',
     // The console header reads the count and the text too
-    // (services/job.service.js getJobEscalationAndSpoc).
+    // (services/job.service.js getJobConsoleExtras).
     'no_of_escalations', 'escalated_comments',
   ],
 };
