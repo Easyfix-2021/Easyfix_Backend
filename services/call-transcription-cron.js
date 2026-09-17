@@ -21,6 +21,89 @@ const plivo = require('./plivo.service');
 // finishes in seconds–minutes; a call with no speech may never produce one).
 const PROCESSING_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
+// Plivo bills every transcript as at least one full minute ($0.0095), so a call
+// this short — operator "number not in service", ring-out, instant hang-up —
+// costs the same as a real 60 s conversation and yields nothing to analyse.
+// Measured 2026-09-17: 359 of 4,104 transcripts were under 15 s.
+const MIN_TRANSCRIBE_SECONDS = 15;
+
+/*
+ * The ONE writer for a fetched transcript — used by this cron, the lazy
+ * transcript fetch on recording playback and on-demand View Analysis
+ * (routes/admin/calls.js). The cost is a SECOND, best-effort statement so a
+ * deploy that lands before 2026-09-17-add-plivo-transcription-cost.sql still
+ * stores the transcript itself; only the cost is lost until the column exists.
+ */
+async function saveTranscript(jobCallerInfoId, tx) {
+  await pool.query(
+    "UPDATE tbl_plivo_call_log SET transcription = ?, transcription_status = 'completed', transcription_fetched_at = ? WHERE job_caller_info_id = ?",
+    [tx.text, new Date(), jobCallerInfoId],
+  );
+  if (tx.cost == null) return;
+  await pool.query(
+    'UPDATE tbl_plivo_call_log SET transcription_cost_usd = ? WHERE job_caller_info_id = ?',
+    [tx.cost, jobCallerInfoId],
+  ).catch((e) => logger.warn('transcription cost not stored · jci=' + jobCallerInfoId + ' · ' + e.message));
+}
+
+/*
+ * Fill transcription_cost_usd for transcripts stored BEFORE the cost was
+ * captured (all of them up to 2026-09-17), plus any saved while the column was
+ * not yet migrated. The per-transcript GET that saveTranscript() reads is keyed
+ * by recording, so instead this walks Plivo's Transcription LIST (newest first,
+ * 20 a page, carries call_uuid + transcription_cost) and matches call_uuid to
+ * tbl_job_caller_info.unique_id — one pass over the history, not one GET per row.
+ *
+ * Runs at most ONCE per process (see costBackfillDone): a row Plivo has no
+ * transcription for would otherwise send every 30-minute run back down the whole
+ * list. Stops at the oldest row still missing a cost (less a day: inserted_time
+ * is IST-naive, Plivo's add_time is UTC, and a transcript is requested after the
+ * call). Both pcl rows of a conference call share the jci, so both get the cost.
+ */
+let costBackfillDone = false;
+
+async function backfillTranscriptionCosts({ shouldStop = null } = {}) {
+  let rows;
+  try {
+    [rows] = await pool.query(
+      `SELECT DISTINCT jci.unique_id AS callUuid, jci.inserted_time AS insertedAt
+         FROM tbl_plivo_call_log pcl
+         JOIN tbl_job_caller_info jci ON jci.job_caller_info = pcl.job_caller_info_id
+        WHERE pcl.transcription_status = 'completed'
+          AND pcl.transcription_cost_usd IS NULL
+          AND jci.unique_id IS NOT NULL`,
+    );
+  } catch (e) {
+    return { skipped: true, reason: 'transcription_cost_usd missing? ' + e.message };
+  }
+  const want = new Set(rows.map((r) => r.callUuid));
+  const result = { missing: want.size, filled: 0, pages: 0, stopped: false };
+  if (!want.size) return result;
+  const floorMs = Math.min(...rows.map((r) => new Date(r.insertedAt).getTime())) - 24 * 60 * 60 * 1000;
+
+  for (let offset = 0; want.size; offset += 20) {
+    if (typeof shouldStop === 'function' && shouldStop()) { result.stopped = true; break; }
+    const objects = await plivo.listPage(`/Transcription/?limit=20&offset=${offset}`);
+    result.pages += 1;
+    for (const o of objects) {
+      // Newest first, so a re-requested transcript's latest charge wins.
+      if (!want.has(o.call_uuid) || o.transcription_cost == null) continue;
+      want.delete(o.call_uuid);
+      const [r] = await pool.query(
+        `UPDATE tbl_plivo_call_log pcl
+           JOIN tbl_job_caller_info jci ON jci.job_caller_info = pcl.job_caller_info_id
+            SET pcl.transcription_cost_usd = ?
+          WHERE jci.unique_id = ? AND pcl.transcription_cost_usd IS NULL`,
+        [Number(o.transcription_cost), o.call_uuid],
+      );
+      if (r.affectedRows) result.filled += 1;
+    }
+    if (objects.length < 20 || plivo.plivoTimeMs(objects[objects.length - 1].add_time) < floorMs) break;
+  }
+  result.unmatched = want.size;
+  return result;
+}
+
 /*
  * `shouldStop` — the cooperative-cancellation checkpoint, same contract as
  * services/recording-backfill.service.js. Polled BETWEEN rows, never mid-row: a
@@ -45,12 +128,12 @@ async function runTranscriptionBackfill({ limit = 50, shouldStop = null } = {}) 
         WHERE jci.provider = 'plivo'
           AND jci.unique_id IS NOT NULL
           AND jci.caller_status IN ('completed', 'hungup')
-          AND jci.duration > 0
+          AND jci.duration >= ?
           AND (pcl.transcription IS NULL OR pcl.transcription = '')
           AND (pcl.transcription_status IS NULL OR pcl.transcription_status NOT IN ('completed', 'not_available'))
         ORDER BY jci.inserted_time DESC
         LIMIT ?`,
-      [limit],
+      [MIN_TRANSCRIBE_SECONDS, limit],
     );
   } catch (e) {
     // Columns may not exist yet (pre-migration) — treat as a no-op.
@@ -76,10 +159,7 @@ async function runTranscriptionBackfill({ limit = 50, shouldStop = null } = {}) 
       }
       const tx = await plivo.fetchTranscription({ recordingId: meta.recordingId });
       if (tx.ok && tx.text) {
-        await pool.query(
-          "UPDATE tbl_plivo_call_log SET transcription = ?, transcription_status = 'completed', transcription_fetched_at = ? WHERE job_caller_info_id = ?",
-          [tx.text, new Date(), r.id],
-        );
+        await saveTranscript(r.id, tx);
         result.completed += 1;
       } else if (tx.ok) {
         // No transcript yet. Plivo doesn't auto-transcribe, so REQUEST one if we
@@ -122,8 +202,17 @@ async function runTranscriptionBackfill({ limit = 50, shouldStop = null } = {}) 
       logger.warn('transcription-backfill row failed · id=' + r.id + ' · ' + e.message);
     }
   }
+  if (!costBackfillDone && !result.stopped) {
+    try {
+      result.costBackfill = await backfillTranscriptionCosts({ shouldStop });
+      if (!result.costBackfill.skipped && !result.costBackfill.stopped) costBackfillDone = true;
+    } catch (e) {
+      result.costBackfill = { failed: e.message };
+      logger.warn('transcription cost backfill failed · ' + e.message);
+    }
+  }
   logger.info('transcription-backfill done · ' + JSON.stringify(result));
   return result;
 }
 
-module.exports = { runTranscriptionBackfill };
+module.exports = { runTranscriptionBackfill, saveTranscript, backfillTranscriptionCosts, MIN_TRANSCRIBE_SECONDS };
