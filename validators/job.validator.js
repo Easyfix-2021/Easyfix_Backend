@@ -3,6 +3,7 @@ const {
   ALL_STATUS_VALUES,
   SORTABLE_COLUMNS,
   OFFER_STATE_VALUES,
+  PTS_STATE_VALUES,
   APP_REQUEST_VALUES,
   MAX_OFFER_RECIPIENTS,
 } = require('../services/job.service');
@@ -107,6 +108,17 @@ const listQuery = Joi.object({
    * OFFER_STATE_VALUES so the two sides cannot drift.
    */
   offerState: Joi.string().valid(...OFFER_STATE_VALUES).allow('').optional(),
+  /*
+   * `ptsState` (2026-09-16) — one of the Pending-to-Start page's exclusive tabs:
+   *   'cancel' | 'reschedule' | 'missed' | 'today' | 'future'
+   * The service's predicate pins job_status = 1 itself (as appRequest's does),
+   * so a caller combining it with another status gets an EMPTY list rather than
+   * a 400 — the honest answer, and the behaviour appRequest already has. `''`
+   * is allowed and ignored so the FE can clear the tab without stripping the
+   * key. Values derive from the service's PTS_STATE_VALUES so the two sides
+   * cannot drift.
+   */
+  ptsState: Joi.string().valid(...PTS_STATE_VALUES).allow('').optional(),
   /*
    * `appRequest` (2026-09-16) — narrows to jobs carrying a PENDING technician
    * app request, the Technician Requests section on Pending to Start:
@@ -289,6 +301,53 @@ const listQuery = Joi.object({
   limit: Joi.number().integer().min(1).max(500).default(50),
   offset: Joi.number().integer().min(0).default(0),
 });
+
+/*
+ * ── The Pending-for-Scheduling TAB STRIP (2026-09-16) ─────────────────────
+ *
+ * GET /jobs/pending-scheduling/counts answers "how many jobs sit behind each of
+ * the four tabs" for the page the operator is looking at, so it has to be
+ * filtered by exactly what that page is filtered by — and validated by exactly
+ * the same rules, or a value the grid accepts could 400 the strip above it (or
+ * the reverse) and the two would describe different populations.
+ *
+ * So each key is EXTRACTED from listQuery rather than re-declared. A tightened
+ * bound, a widened CSV cap or a new custom message on the list's `cityId`
+ * arrives here automatically; a hand-copied `csvIds.optional()` would not, and
+ * nothing would say so — the CSV_IDS_MAX note above is what a drifting copy of
+ * one of these limits looks like from the operator's side.
+ *
+ * `offerState` is NOT in the list, deliberately: this endpoint returns one count
+ * PER state, so accepting the filter that selects a single state would be
+ * accepting a parameter that can only make three of its four numbers wrong.
+ * validate() runs with stripUnknown, so a client that sends it anyway (the same
+ * query string as the grid, say) is served correctly rather than 400'd — the key
+ * is dropped before the service is called.
+ *
+ * The bucket pins (status = 0 + unassigned) are NOT accepted either: they are
+ * the endpoint's identity, applied by getPendingSchedulingCounts.
+ */
+const PENDING_SCHEDULING_COUNT_FILTERS = ['q', 'categoryId', 'cityId', 'clientId', 'zonalManagerId'];
+const pendingSchedulingCountsQuery = Joi.object(Object.fromEntries(
+  PENDING_SCHEDULING_COUNT_FILTERS.map((key) => [key, listQuery.extract(key)]),
+));
+
+/*
+ * ── The Pending-to-Start TAB STRIP (2026-09-16) ───────────────────────────
+ *
+ * GET /jobs/pending-start/counts. Same construction and the same reasons as
+ * pendingSchedulingCountsQuery above: every key EXTRACTED from listQuery, so the
+ * strip and the grid validate a value identically; ptsState deliberately absent
+ * (it would collapse four of five counts to zero) and stripped rather than
+ * rejected, as are the status pins the service applies itself.
+ *
+ * ownerId joins the pending-scheduling set because the Pending-to-Start page is
+ * reachable from My Orders, which scopes it to the operator's own jobs.
+ */
+const PENDING_START_COUNT_FILTERS = ['q', 'categoryId', 'cityId', 'clientId', 'zonalManagerId', 'ownerId'];
+const pendingStartCountsQuery = Joi.object(Object.fromEntries(
+  PENDING_START_COUNT_FILTERS.map((key) => [key, listQuery.extract(key)]),
+));
 
 const customerBlock = Joi.object({
   customer_id: intId.optional(),
@@ -677,4 +736,8 @@ const idParam = Joi.object({ id: intId.required() });
 module.exports = {
   listQuery, createBody, updateBody, statusBody, assignBody, offerBody, ownerBody, idParam,
   rescheduleBody, appRequestRejectBody, candidatesQuery, candidatesSearchQuery, slotRecommendationsQuery,
+  // The tab-strip schema plus the key list it is built from — exported together
+  // so a test can assert the strip honours every filter the grid sends.
+  pendingSchedulingCountsQuery, PENDING_SCHEDULING_COUNT_FILTERS,
+  pendingStartCountsQuery, PENDING_START_COUNT_FILTERS,
 };
