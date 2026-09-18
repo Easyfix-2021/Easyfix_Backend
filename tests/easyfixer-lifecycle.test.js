@@ -888,8 +888,12 @@ test('INACTIVE with open jobs keeps assigned work but never receives new jobs', 
   // dashboard counter's (1, 2, 20) and stranded a technician whose only work
   // sat in 15 / 21 / 10. "Work in hand" is now derived from the job status
   // model — see the OPEN_JOB_STATUSES comment in the service.
-  assert.deepEqual([...OPEN_JOB_STATUSES], [1, 2, 10, 15, 20, 21]);
-  assert.deepEqual(params, [77, 1, 2, 10, 15, 20, 21]);
+  // ASSERTION UPDATED (2026-09-18, deliberately): 16 "Pending for Material"
+  // joins the set — a technician whose job is waiting on a material quote is
+  // still holding that work, and dropping it here would strand the job the
+  // same way 15 / 21 / 10 were stranded before.
+  assert.deepEqual([...OPEN_JOB_STATUSES], [1, 2, 10, 15, 16, 20, 21]);
+  assert.deepEqual(params, [77, 1, 2, 10, 15, 16, 20, 21]);
 });
 
 /*

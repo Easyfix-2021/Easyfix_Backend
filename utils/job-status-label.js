@@ -36,6 +36,7 @@ const JOB_STATUS_LABELS = Object.freeze({
   9: 'Unconfirmed',
   10: 'Closed from App',
   15: 'Estimate Pending',
+  16: 'Pending for Material',
   20: 'In Progress',
   21: 'On Hold',
 });

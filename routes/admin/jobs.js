@@ -984,7 +984,7 @@ router.get('/escalated/export.xlsx', async (req, res, next) => {
       0: 'Booked', 1: 'Scheduled', 2: 'In Progress',
       3: 'Completed', 5: 'Completed', 6: 'Cancelled',
       7: 'Enquiry', 9: 'Unconfirmed', 10: 'Revisit',
-      15: 'Estimate Pending', 20: 'Pending to Close', 21: 'Followup',
+      15: 'Estimate Pending', 16: 'Pending for Material', 20: 'Pending to Close', 21: 'Followup',
     };
 
     // Humanise an ISO/MySQL DATETIME → "29 Apr 2026" and "10:07 am"
@@ -2949,6 +2949,100 @@ router.post('/:id/checkin',
       return modernOk(res, updated, 'job checked in');
     } catch (e) {
       logger.warn('Ops check-in failed · jobId=' + req.params.id + ' · ' + e.message);
+      return next(e);
+    }
+  },
+);
+
+// ─── Material Review (Material Management phase 2, sub-project D) ─────
+// POST /:id/material-review { decision: 'approve'|'reject', reason?, permission_required? }
+//
+// PM review of a technician's material estimate. The job must be at 16
+// (Pending for Material) — anything else 409s, since there is nothing to
+// review otherwise:
+//   approve → 15 (ESTIMATE_PENDING_APPROVAL), clears material_sub_status,
+//             stores permission_required (0/1 — "Appointment / Permission
+//             Required", ticked at approval time — see the design's "Flow").
+//   reject  → 16, material_sub_status = 1 (back to Quotation Pending) so the
+//             quote stays editable; the reason is recorded for the
+//             technician via the existing job-comment channel (comment_on=1,
+//             the same "approval-related" bucket the legacy vocabulary
+//             already uses — see services/job-comment.service.js STAGES).
+//
+// Goes through jobService.setStatus() (not the hold/release path at
+// PUT/POST /:id/hold[/release] above, which is a different transition
+// entirely and sets 10) so the transition logs + fires webhooks like every
+// other status move. See
+// docs/superpowers/specs/2026-09-18-pending-for-material-status-16-design.md.
+const materialReviewBody = require('joi').object({
+  decision: require('joi').string().valid('approve', 'reject').required(),
+  reason: require('joi').string().trim().max(500).when('decision', {
+    is: 'reject', then: require('joi').required(), otherwise: require('joi').optional(),
+  }),
+  permission_required: require('joi').number().integer().valid(0, 1).default(0),
+});
+
+router.post(
+  '/:id/material-review',
+  validate(idParam, 'params'),
+  validate(materialReviewBody),
+  scopedJob,
+  requireAction('isJobMaterialReview'),
+  async (req, res, next) => {
+    try {
+      const jobId = Number(req.params.id);
+      const { decision, reason, permission_required: permissionRequired } = req.body;
+      logger.info('Material review · jobId=' + jobId + ' · decision=' + decision + ' by userId=' + (req.user?.user_id ?? '-'));
+
+      if (Number(req.scopedJob.job_status) !== job.STATUS.PENDING_FOR_MATERIAL) {
+        logger.warn('Material review refused · jobId=' + jobId + ' · job_status=' + req.scopedJob.job_status);
+        return modernError(res, 409, 'This job is not pending material review — it is in status ' + req.scopedJob.job_status);
+      }
+
+      let updated;
+      if (decision === 'approve') {
+        updated = await job.setStatus(
+          jobId,
+          {
+            status: job.STATUS.ESTIMATE_PENDING_APPROVAL,
+            // Clear any stale reject reason from a PREVIOUS review round —
+            // an approved estimate must not still show the tech an old
+            // rejection message.
+            extras: { material_sub_status: null, permission_required: permissionRequired, material_reject_reason: null },
+          },
+          req.user,
+        );
+      } else {
+        updated = await job.setStatus(
+          jobId,
+          {
+            status: job.STATUS.PENDING_FOR_MATERIAL,
+            // material_reject_reason is the CONTRACT field the technician
+            // app reads (see the migration header) — the primary channel for
+            // "why was this rejected", not a nicety.
+            extras: { material_sub_status: 1, material_reject_reason: reason },
+          },
+          req.user,
+        );
+        // Also mirrored onto the CRM History tab, fail-soft and after the
+        // status has already committed — same rule as the ops check-in
+        // reason comment above: a comment failure must not turn a landed
+        // transition into a 500 that has the PM press the button again.
+        try {
+          await jobComments.addComment(jobId, {
+            comments: reason,
+            comment_on: 1, // 'created/schedule/approval-related' — see STAGES
+            commented_by: req.user?.user_id ?? null,
+          });
+        } catch (ce) {
+          logger.warn('Material review reject reason comment failed (non-fatal) · jobId=' + jobId + ' · ' + ce.message);
+        }
+      }
+
+      logger.info('Material review done · jobId=' + jobId + ' · decision=' + decision + ' · status->' + updated.job_status);
+      return modernOk(res, updated, decision === 'approve' ? 'material estimate approved' : 'material estimate rejected');
+    } catch (e) {
+      logger.warn('Material review failed · jobId=' + req.params.id + ' · ' + e.message);
       return next(e);
     }
   },

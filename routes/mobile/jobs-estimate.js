@@ -24,6 +24,7 @@ const logger = require('../../logger');
  *   POST   /api/mobile/jobs/:id/quotation
  *   POST   /api/mobile/jobs/:id/quotation/:lineId   (delete semantic — RN calls POST)
  *   DELETE /api/mobile/jobs/:id/quotation/:lineId
+ *   POST   /api/mobile/jobs/:id/material-required
  *   POST   /api/mobile/jobs/:id/send-for-approval
  *   POST   /api/mobile/jobs/:id/images?category=Booking|Completion
  *   GET    /api/mobile/jobs/:id/questionnaire
@@ -150,6 +151,20 @@ async function handleDeleteLine(req, res, next) {
 
 router.post('/:id/quotation/:lineId', validate(lineParam, 'params'), handleDeleteLine);
 router.delete('/:id/quotation/:lineId', validate(lineParam, 'params'), handleDeleteLine);
+
+// ─── Material Required (Material Management phase 2, sub-project D) ────
+// POST /:id/material-required → { ok: true, status: 16 }
+// 2/20 → 16 (Pending for Material), material_sub_status = 1 (Quotation
+// Pending). See docs/superpowers/specs/2026-09-18-pending-for-material-
+// status-16-design.md.
+router.post('/:id/material-required', validate(idParam, 'params'), async (req, res, next) => {
+  try {
+    logger.info('Material required · jobId=' + req.params.id);
+    const out = await estimateService.materialRequired(Number(req.params.id), req.tech.efr_id);
+    logger.info('Job marked material-required · jobId=' + req.params.id);
+    modernOk(res, out);
+  } catch (e) { logger.warn('Material required failed · jobId=' + req.params.id + ' · ' + e.message); fail(res, next, e); }
+});
 
 // ─── Send for approval ─────────────────────────────────────────────────
 // POST /:id/send-for-approval { checkInImageRefs? } → { sent: true }

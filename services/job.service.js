@@ -288,6 +288,12 @@ const STATUS = {
   ESTIMATE_PENDING_APPROVAL: 15,
   IN_PROGRESS_ALT: 20,
   ON_HOLD: 21,
+  // Material Management phase 2, sub-project D (2026-09-18): a technician's
+  // "Material Required" on a 2/20 job, sitting BEFORE 15 so a PM reviews the
+  // quote before the client ever sees it. Two sub-states on tbl_job.
+  // material_sub_status (1 = Quotation Pending, 2 = Review Pending) — see
+  // docs/superpowers/specs/2026-09-18-pending-for-material-status-16-design.md.
+  PENDING_FOR_MATERIAL: 16,
 };
 const ALL_STATUS_VALUES = new Set(Object.values(STATUS));
 // Composite buckets for multi-status queries and UI tabs.
@@ -3229,6 +3235,19 @@ async function getByIdCore(jobId) {
   const enquiryReasonSelect = hasEnq
     ? `(SELECT atr.action_desc FROM action_taken_reason atr WHERE atr.id = j.enquiry_reason_id LIMIT 1) AS enquiry_reason_name`
     : `NULL AS enquiry_reason_name`;
+  // material_sub_status / permission_required (2026-09-18, status 16 —
+  // "Pending for Material"): probe-gated like the enquiry trio above, so a
+  // deploy that hasn't run migrations/2026-09-18-pending-for-material.sql
+  // yet still gets a job-detail response instead of "Unknown column". Both
+  // are TINYINT, which this codebase's db.js typeCast coerces to boolean —
+  // CAST them explicitly and alias OVER the `j.*` boolean so the caller sees
+  // the real 1/2/0 values (a later same-named column in a mysql2 result
+  // overwrites the earlier one when the row object is built).
+  const hasMaterialCols = await hasMaterialStatusColumns();
+  const materialColsSelect = hasMaterialCols
+    ? `CAST(j.material_sub_status AS SIGNED) AS material_sub_status,
+       CAST(j.permission_required AS SIGNED) AS permission_required`
+    : `NULL AS material_sub_status, NULL AS permission_required`;
   const [jobRows] = await pool.query(
     `SELECT j.*,
             /* customer_name = the name booked ON THIS JOB, master as fallback —
@@ -3257,7 +3276,8 @@ async function getByIdCore(jobId) {
               WHERE atr.id = j.reschedule_reason_id LIMIT 1) AS app_reschedule_reason_name,
             /* From Production: enquiry reason, NULL-aliased on deploys that
                predate the enquiry columns (hasEnquiryColumns probe above). */
-            ${enquiryReasonSelect}
+            ${enquiryReasonSelect},
+            ${materialColsSelect}
             /* Job Age — same two derived fields the LIST emits, from the SAME
                constant, so the detail modal and the list row always agree.
                JOB_AGE_COLUMNS is a LEADING-comma fragment, so the line above
@@ -5274,6 +5294,17 @@ const STATUS_EXTRAS_ALLOWLIST = new Set([
   'is_rescheduled_by_app', 'resch_job_count',
   // Tech-side reassignment trigger
   'requested_date_time',
+  // Pending-for-Material sub-state (2026-09-18) — written by the admin
+  // material-review approve/reject (routes/admin/jobs.js POST
+  // /:id/material-review), which goes through setStatus per the design.
+  // (The mobile material-required / send-for-approval writes stay on this
+  // service's existing direct-UPDATE pattern in mobile-job-estimate.service.js,
+  // same as it already does for status 15, to avoid a circular dependency.)
+  // material_sub_status / permission_required are TINYINT — see db.js
+  // typeCast note on CAST(... AS SIGNED). material_reject_reason is a plain
+  // VARCHAR (the PM's reason on reject) — its field name/shape is fixed by
+  // the shipped technician app, which reads it off the job row verbatim.
+  'material_sub_status', 'permission_required', 'material_reject_reason',
 ]);
 
 /*
@@ -5352,6 +5383,34 @@ async function hasEnquiryColumns() {
     // A failure is NOT cached. The success answer is frozen for the process because a column that exists does not vanish; a failure frozen the same way turns a two-second information_schema blip into a degraded mode that lasts until the container restarts, with nothing in the logs saying so.
     logger.warn('job: enquiry column trio probe failed · ' + e.message
       + ' — treating as legacy shape for this call only');
+    return false;
+  }
+}
+
+/*
+ * Column-presence probe for the Pending-for-Material pair on tbl_job:
+ *   material_sub_status, permission_required (2026-09-18, status 16).
+ *
+ * Same shape as hasEnquiryColumns above — cached, both-or-nothing, a failure
+ * is not cached — so getByIdCore degrades to NULL-aliasing the two columns
+ * on a deploy that hasn't run migrations/2026-09-18-pending-for-material.sql
+ * yet, instead of "Unknown column".
+ */
+let _materialStatusColumnsExist = null;
+async function hasMaterialStatusColumns() {
+  if (_materialStatusColumnsExist != null) return _materialStatusColumnsExist;
+  try {
+    const [rows] = await pool.query(
+      `SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME   = 'tbl_job'
+          AND COLUMN_NAME IN ('material_sub_status', 'permission_required')`,
+    );
+    _materialStatusColumnsExist = rows[0].n === 2;
+    return _materialStatusColumnsExist;
+  } catch (e) {
+    logger.warn('job: material-status column pair probe failed · ' + e.message
+      + ' — treating as absent for this call only');
     return false;
   }
 }

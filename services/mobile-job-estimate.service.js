@@ -61,6 +61,14 @@ const { resolveMaterialPrice } = require('./material-price-resolver');
 // local const so this service has no circular dependency on job.service.js,
 // which the no-edit rule forbids us touching).
 const STATUS_ESTIMATE_PENDING_APPROVAL = 15;
+// Material Management phase 2, sub-project D (2026-09-18) — see
+// docs/superpowers/specs/2026-09-18-pending-for-material-status-16-design.md.
+const STATUS_IN_PROGRESS = 2;
+const STATUS_IN_PROGRESS_ALT = 20;
+const STATUS_PENDING_FOR_MATERIAL = 16;
+// material_sub_status: 1 = Quotation Pending, 2 = Review Pending.
+const MATERIAL_SUB_STATUS_QUOTATION_PENDING = 1;
+const MATERIAL_SUB_STATUS_REVIEW_PENDING = 2;
 
 // S3 key convention for job-supporting images:
 //   JobSupportings/<Category>_<JobID>_<Seq>   (no file extension on the key)
@@ -358,9 +366,16 @@ async function deleteQuotationLine(jobId, efrId, lineId) {
 /* ─── Send estimate for SPOC approval ───────────────────────────────────
  * Marks the estimate "sent for approval": stamps
  * tbl_job.approval_sent_on_date_time = now, bumps no_of_req_approval,
- * and moves the order into ESTIMATE_PENDING_APPROVAL (15). This is the
- * single source of "estimate sent" the admin quotations expiry endpoint
- * reads (routes/admin/quotations.js GET /expiry/:jobId).
+ * and moves the order into PENDING_FOR_MATERIAL (16) with
+ * material_sub_status = 2 (Review Pending) — NOT 15. This is the behaviour
+ * change sub-project D exists for: an unreviewed quote used to reach the
+ * client straight from here (job_status = 15, which the client portal
+ * treats as "awaiting your decision"); now a PM reviews it first
+ * (POST /api/admin/jobs/:id/material-review) and ONLY an approve there
+ * moves the job to 15. This is the single source of "estimate sent" the
+ * admin quotations expiry endpoint reads (routes/admin/quotations.js GET
+ * /expiry/:jobId) — that reader is unaffected, since it keys off
+ * approval_sent_on_date_time, not job_status.
  *
  * `checkInImageRefs` (optional) — if the app passes check-in image S3 keys
  * alongside the send, we record them as Booking-stage refs so the estimate
@@ -385,9 +400,10 @@ async function sendForApproval(jobId, efrId, { checkInImageRefs } = {}) {
           SET approval_sent_on_date_time = ?,
               no_of_req_approval = COALESCE(no_of_req_approval, 0) + 1,
               job_status = ?,
+              material_sub_status = ?,
               last_update_time = ?
         WHERE job_id = ? AND fk_easyfixter_id = ?`,
-      [now, STATUS_ESTIMATE_PENDING_APPROVAL, now, jobId, efrId],
+      [now, STATUS_PENDING_FOR_MATERIAL, MATERIAL_SUB_STATUS_REVIEW_PENDING, now, jobId, efrId],
     );
 
     if (Array.isArray(checkInImageRefs) && checkInImageRefs.length) {
@@ -405,7 +421,7 @@ async function sendForApproval(jobId, efrId, { checkInImageRefs } = {}) {
     }
 
     await conn.commit();
-    logger.info('Estimate sent for approval · jobId=' + jobId + ' · status=' + STATUS_ESTIMATE_PENDING_APPROVAL);
+    logger.info('Estimate sent for approval · jobId=' + jobId + ' · status=' + STATUS_PENDING_FOR_MATERIAL + '/' + MATERIAL_SUB_STATUS_REVIEW_PENDING);
     return { sent: true };
   } catch (e) {
     logger.error('Send for approval failed, rolled back · jobId=' + jobId + ' · ' + e.message);
@@ -414,6 +430,46 @@ async function sendForApproval(jobId, efrId, { checkInImageRefs } = {}) {
   } finally {
     conn.release();
   }
+}
+
+/* ─── Material Required (Material Management phase 2, sub-project D) ───
+ * A technician on a 2/20 job flags that the job cannot close without
+ * material: moves the order to PENDING_FOR_MATERIAL (16) with
+ * material_sub_status = 1 (Quotation Pending). The estimate stays editable
+ * in this sub-state — send-for-approval (above) is the transition into
+ * sub-status 2 (Review Pending), which the PM then approves/rejects via
+ * POST /api/admin/jobs/:id/material-review.
+ *
+ * Guarded to source statuses 2/20 only — those are exactly the "Pending to
+ * Close on App" statuses the design's flow diagram starts from. Anything
+ * else 409s rather than silently accepting: a job not yet checked in, or
+ * already closed/cancelled, has no "material required" moment.
+ *
+ * Returns { ok: true, status: 16 }.
+ */
+async function materialRequired(jobId, efrId) {
+  logger.info('Mark job material-required · jobId=' + jobId);
+  const job = await jobForTech(jobId, efrId);
+  if (!job) logger.warn('Material-required failed · job not found or not owned · jobId=' + jobId);
+  if (!job) { const e = new Error('job not found'); e.status = 404; throw e; }
+
+  if (![STATUS_IN_PROGRESS, STATUS_IN_PROGRESS_ALT].includes(Number(job.job_status))) {
+    logger.warn('Material-required refused · jobId=' + jobId + ' · job_status=' + job.job_status);
+    const e = new Error('Only a job pending to close on the app can be marked material-required');
+    e.status = 409; throw e;
+  }
+
+  const now = new Date();
+  await pool.query(
+    `UPDATE tbl_job
+        SET job_status = ?,
+            material_sub_status = ?,
+            last_update_time = ?
+      WHERE job_id = ? AND fk_easyfixter_id = ?`,
+    [STATUS_PENDING_FOR_MATERIAL, MATERIAL_SUB_STATUS_QUOTATION_PENDING, now, jobId, efrId],
+  );
+  logger.info('Job marked material-required · jobId=' + jobId + ' · status=' + STATUS_PENDING_FOR_MATERIAL + '/' + MATERIAL_SUB_STATUS_QUOTATION_PENDING);
+  return { ok: true, status: STATUS_PENDING_FOR_MATERIAL };
 }
 
 /* ─── Job images ────────────────────────────────────────────────────────
@@ -498,12 +554,25 @@ async function recordImages(jobId, efrId, { category, refs }) {
  *
  *      2  IN_PROGRESS                — the technician is on site working
  *      15 ESTIMATE_PENDING_APPROVAL  — still on site, waiting on the client
+ *      16 PENDING_FOR_MATERIAL       — still on site, building/awaiting review
+ *                                      of a material estimate (2026-09-18,
+ *                                      sub-project D) — added here because
+ *                                      sendForApproval no longer moves a job
+ *                                      straight to 15; a job in the tech's
+ *                                      hands lands on 16 first (both sub-
+ *                                      states), and evidence should be
+ *                                      un-takeable through that whole window
+ *                                      for the same reason 15 already was.
+ *                                      15 is kept as-is (additive, not a
+ *                                      narrowing) for any job already at 15
+ *                                      from before this feature shipped.
  *
- *    Those are EXACTLY the two statuses in which the app lets a proof photo be
- *    ADDED (the order page gates its Work sections on status 2 or 15), so
- *    delete gets precisely the same window as create: there is no state in
- *    which a photo can be taken and not un-taken. Everything else is refused
- *    because the evidence has left the technician's hands — 20
+ *    2/15/16 are the statuses in which the app lets a proof photo be ADDED
+ *    (the order page gates its Work sections on status 2 or 15 — the app's
+ *    own gating for 16 is out of this repo's scope), so delete gets
+ *    precisely the same window as create: there is no state in which a photo
+ *    can be taken and not un-taken. Everything else is refused because the
+ *    evidence has left the technician's hands — 20
  *    PENDING_TO_CLOSE means the checkout was submitted and billing is reading
  *    it, 3/5 are completed, 10 is a closed visit, 6 is cancelled, and 0/1
  *    precede any work photo existing at all. Deleting proof off a completed or
@@ -515,7 +584,7 @@ async function recordImages(jobId, efrId, { category, refs }) {
  *
  * Returns { ok: true, imageId, category }.
  */
-const DELETABLE_STATUSES = new Set([2, STATUS_ESTIMATE_PENDING_APPROVAL]);
+const DELETABLE_STATUSES = new Set([2, STATUS_ESTIMATE_PENDING_APPROVAL, STATUS_PENDING_FOR_MATERIAL]);
 
 /** The proof buckets, and only those — never a document, signature or PDF. */
 const DELETABLE_IMAGE_CATEGORIES = [
@@ -749,6 +818,7 @@ module.exports = {
   addQuotationLine,
   deleteQuotationLine,
   sendForApproval,
+  materialRequired,
   recordImages,
   deleteImage,
   DELETABLE_STATUSES,

@@ -31,7 +31,12 @@ test('sendForApproval binds ONE Date shared by approval_sent_on_date_time, last_
   assert.match(upd.sql, /approval_sent_on_date_time = \?/);
   assert.match(upd.sql, /last_update_time = \?/);
   assert.doesNotMatch(upd.sql, /NOW\(\)/, 'no SQL NOW() may remain');
-  const [approvalSentOn, , lastUpdateTime] = upd.params;
+  // Params: [approvalSentOn, job_status, material_sub_status, last_update_time,
+  // jobId, efrId] — the material_sub_status column (2026-09-18, Material
+  // Management phase 2 sub-project D) sits between job_status and
+  // last_update_time in the UPDATE's SET list, so last_update_time is now the
+  // FOURTH bound param, not the third.
+  const [approvalSentOn, , , lastUpdateTime] = upd.params;
   assert.ok(approvalSentOn instanceof Date, 'approval_sent_on_date_time is a bound Date');
   assert.ok(lastUpdateTime instanceof Date, 'last_update_time is a bound Date');
   assert.equal(approvalSentOn.getTime(), lastUpdateTime.getTime(),
