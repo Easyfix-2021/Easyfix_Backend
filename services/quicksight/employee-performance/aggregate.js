@@ -51,12 +51,28 @@
  *   - Optional D.teamsByMonth (see teamPanel) lets the team panel and the Team
  *     Members KPI follow each selected month's roster. Absent → exactly the
  *     page's behaviour.
+ *   - The Unattributed BUCKETS (compose.js: D.primarySpocs entries that
+ *     isUnattributedKey() recognises, holding the jobs of people the window
+ *     does not show) count in every number a job counts in — KPIs, daily,
+ *     clients, city, pending, zonal, open jobs — and in NONE that names a
+ *     person: the team panel, the Team Members KPI, the Employee options and
+ *     member detail leave them out. The string never occurs in the MIS data
+ *     the parity fixture is built from, so excluding it by key cannot move a
+ *     single parity number.
+ *   - Current TX Performance groups a technician by (TX name, TX ID) only. The
+ *     page grouped by (SPOC, TX name, TX ID), which listed one technician
+ *     twice — same TX ID, same name, no SPOC column to tell the rows apart —
+ *     as soon as their jobs sat under two SPOCs, which the Unattributed bucket
+ *     makes routine. The rows are still filtered by SPOC before grouping, so
+ *     the Employee filter narrows the table exactly as before.
  *
  * Returned rows may be the very objects inside D (open-job rows, revPerf rows):
  * treat results as read-only, especially when D is a cached snapshot.
  */
 
 'use strict';
+
+const { isUnattributedKey } = require('./compose');
 
 const ALL = 'ALL';
 // Daily target = monthly / 26, so a month's target = its daily target × 26.
@@ -103,10 +119,12 @@ function normaliseFilters(D, filters) {
     || (options.length > 1 && options.every((v) => verticals.includes(v)));
   const verticalSet = verticalAll ? null : new Set(verticals);
 
-  // The Employee options fillEmployees() would show for this vertical choice.
+  // The Employee options fillEmployees() would show for this vertical choice —
+  // buckets excluded, exactly as buildOptions() excludes them, so that ticking
+  // every option the tab OFFERS still reads as "Select All".
   const employeeOptions = list(D.primarySpocs).filter((n) => {
     const e = own(employees, n);
-    return e && (verticalSet === null || verticalSet.has(e.vertical));
+    return e && !isUnattributedKey(n) && (verticalSet === null || verticalSet.has(e.vertical));
   });
   const picked = stringList(f.employees);
   const employeeAll = picked.length === 0
@@ -287,12 +305,18 @@ function openAging(rows) {
  * the selected dates (the latest D.months entry when no date is selected); a
  * SPOC's teams and members are the union over those months; the KPI adds, per
  * SPOC, the number of DISTINCT people on its team(s) in those months.
+ *
+ * An Unattributed bucket is not a person: it has no team, nobody reports to it
+ * and nobody can click it, so it is dropped here before either branch. Left in,
+ * it would ride the `|| [n]` fallback (no team → "the SPOC is their own team")
+ * into the member chips under a name that belongs to nobody.
  */
-function teamPanel(D, nf, ns, dates) {
+function teamPanel(D, nf, nsAll, dates) {
   const employees = D.employees || {};
   const members = [];
   const teamNames = [];
   let teamSize = 0;
+  const ns = nsAll.filter((n) => !isUnattributedKey(n));
 
   if (isPlainObject(D.teamsByMonth)) {
     let months = [...new Set(dates.map((x) => x.slice(0, 7)))];
@@ -413,8 +437,10 @@ function buildOptions(D) {
         to: inMonth.length ? inMonth[inMonth.length - 1] : null,
       };
     }),
+    // Buckets are not choices: an Unattributed option would promise a person
+    // the tab cannot name, and picking it would hide every real one.
     employees: list(D.primarySpocs).slice().sort()
-      .filter((n) => own(employees, n))
+      .filter((n) => own(employees, n) && !isUnattributedKey(n))
       .map((n) => {
         const displayName = own(displayNames, n) || n;
         return {
@@ -507,8 +533,18 @@ function pageOpenJobs(D, filters, paging) {
   return pageOf(applySort(collectOpenRows(D, nf, selectedSpocs(D, nf)), paging, OPEN_JOB_SORT_KEYS), paging);
 }
 
-// Current TX Performance: rows filtered on their own vertical/spoc/zm and on
-// having any selected date, re-grouped by (spoc, tx, txid) in first-seen order.
+/*
+ * Current TX Performance: rows filtered on their own vertical/spoc/zm and on
+ * having any selected date, re-grouped by (tx, txid) in first-seen order.
+ *
+ * The page grouped by (spoc, tx, txid), which split ONE technician into two
+ * rows — identical TX ID, identical name, and no SPOC column to tell them
+ * apart — whenever their jobs sat under two SPOCs. The Unattributed bucket
+ * makes that the normal case (half a technician's jobs attributed, half not),
+ * so the group is the technician. `spoc` is kept on the row for callers that
+ * key on it; when a technician's jobs span several SPOCs it is the first one
+ * seen, which is why nothing renders it as "the" SPOC.
+ */
 function technicianGroups(D, filters) {
   const nf = normaliseFilters(D, filters);
   const ds = new Set(selectedDateList(D, nf));
@@ -518,7 +554,7 @@ function technicianGroups(D, filters) {
     .filter((x) => verticalOk(nf, x.vertical) && employeeOk(nf, x.spoc) && (nf.zm === ALL || x.zm === nf.zm))
     .filter((x) => (Array.isArray(x.dates) ? x.dates : allDates).some((z) => ds.has(z)))
     .forEach((x) => {
-      const k = x.spoc + '|' + x.tx + '|' + x.txid;
+      const k = x.tx + '|' + x.txid;
       if (!groups.has(k)) groups.set(k, { spoc: x.spoc, tx: x.tx, txid: x.txid, vertical: x.vertical, total: 0, closed: 0, open: 0, ageSum: 0 });
       const g = groups.get(k);
       g.total += x.total || 0; g.closed += x.closed || 0; g.open += x.open || 0; g.ageSum += x.ageSum || 0;
@@ -548,10 +584,12 @@ function pageTechnicians(D, filters, paging) {
  * Team-member modal. Only month / from / to apply. Team leads (revView 'team',
  * or a primary SPOC when revView is absent) get their team's daily target vs
  * revenue; members get their personal target vs A&CO achieved. Rows keep the
- * uploaded order. Returns null for a name that is not in D.employees.
+ * uploaded order. Returns null for a name that is not in D.employees — and for
+ * an Unattributed bucket, which has no productivity, no personal target and no
+ * person behind it to open a modal for.
  */
 function memberDetail(D, filters, name) {
-  const e = typeof name === 'string' ? own(D.employees, name) : undefined;
+  const e = typeof name === 'string' && !isUnattributedKey(name) ? own(D.employees, name) : undefined;
   if (!e) return null;
   const nf = normaliseFilters(D, filters);
   const ds = new Set(selectedDateList(D, nf));

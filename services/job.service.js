@@ -8365,6 +8365,13 @@ module.exports = {
    */
   getJobManagerNames,
   /*
+   * The client's Primary SPOC — the ONE rule behind job_primary_spoc /
+   * job_client_owner. Exported so QuickSight Employee Performance attributes a
+   * job to the same person (services/quicksight/employee-performance/
+   * sources.service.js) instead of carrying a second copy of the lookup.
+   */
+  resolveClientPrimarySpoc,
+  /*
    * The job timeline's ACTORS — the two user ids that need resolving and the
    * acceptance that is not on tbl_job at all. Exported for the same reason:
    * "who first scheduled this", "who checked in" and "who accepted the offer"

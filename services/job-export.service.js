@@ -38,8 +38,10 @@
  * INTERFACE (another module owns the route + the xlsx writer):
  *   EXPORT_COLUMNS                                    → frozen [{header,key,type}]
  *   fetchExportChunk({filters, afterJobId, chunkSize}) → Promise<rawRows[]>
- *   mapExportRow(rawRow, seqNumber)                    → plain object keyed by EXPORT_COLUMNS[].key
+ *   fetchExportJobIds({filters, afterJobId, chunkSize}) → Promise<job_id[]> (phase 1 alone)
+ *   mapExportRow(rawRow, seqNumber, {now}?)            → plain object keyed by EXPORT_COLUMNS[].key
  *   buildExportWhere(filters)             → {where, params, appliedDefaults}
+ *   datePart(dbDateTime)                  → 'YYYY-MM-DD' IST day of a DB datetime string, or null
  */
 
 const { pool } = require('../db');
@@ -848,6 +850,15 @@ function buildClauses(filters = {}) {
      * predicate is the one outcome that must never happen by default.
      */
     hasClientVerticalCol = true,
+    /*
+     * SERVICE-ONLY, never a query param (validate() strips unknown keys before
+     * the route spreads req.query). `true` says "every job in the statuses I
+     * pinned, however old" — QuickSight Employee Performance's open-jobs
+     * snapshot (owner decision: open jobs carry NO date filter). It lifts the
+     * default window ONLY when the caller really pinned a status; without a
+     * status pin it changes nothing, so it can never unbound a bare export.
+     */
+    statusSnapshot = false,
   } = filters;
 
   const clauses = [];
@@ -1509,7 +1520,7 @@ function buildClauses(filters = {}) {
    * precisely because nothing announced that a constraint had been swapped in.
    * The route logs this alongside the unapplied-filter warning.
    */
-  const boundedByCaller = pointIdentity || explicitWindow;
+  const boundedByCaller = pointIdentity || explicitWindow || (statusSnapshot === true && statusPinned);
   if (!boundedByCaller) {
     appliedDefaults.push(`window:${DEFAULT_WINDOW_MONTHS}mo on ${defaultDateCol}`);
     if (!statusPinned) appliedDefaults.push(`status:NOT IN (${TERMINAL_STATUSES.join(',')})`);
@@ -1761,45 +1772,9 @@ const MAX_CHUNK_SIZE = 5000;
  * are built from that fan-out.
  */
 async function fetchExportChunk({ filters = {}, afterJobId = null, chunkSize = DEFAULT_CHUNK_SIZE } = {}) {
-  const size = Math.min(Math.max(Number(chunkSize) || DEFAULT_CHUNK_SIZE, 1), MAX_CHUNK_SIZE);
-  /*
-   * Resolve the tbl_client.vertical_id probe ONCE per chunk (it is memoised
-   * per process after the first call) and hand the answer to buildClauses, so
-   * the verticals RBAC scope is applied here on exactly the condition list()
-   * applies it on. Awaiting a cached boolean costs nothing; guessing it costs
-   * an RBAC divergence between the sheet and the screen.
-   */
-  const { clauses, params } = buildClauses({
-    ...filters,
-    hasClientVerticalCol: await hasClientVerticalIdColumn(),
-  });
-
-  const allClauses = clauses.slice();
-  const allParams = params.slice();
-  if (afterJobId !== null && afterJobId !== undefined && afterJobId !== '') {
-    allClauses.push('J.job_id < ?');
-    allParams.push(Number(afterJobId));
-  }
-
   const started = Date.now();
-
-  /*
-   * ─── PHASE 1 — resolve this chunk's ids, and nothing else ───────────────
-   *
-   * A "deferred join": narrow first on the cheap join set, then hydrate. The
-   * naive alternative — running the full 21-join projection with the filters
-   * inline — makes MySQL build the three derived-table aggregates before it
-   * knows which 2,000 rows it wants, so the expensive work scales with the
-   * whole table rather than with the chunk.
-   */
-  const idSql = `SELECT J.job_id ${FILTER_FROM}
-    ${allClauses.length ? `WHERE ${allClauses.join(' AND ')}` : ''}
-    GROUP BY J.job_id
-    ORDER BY J.job_id DESC
-    LIMIT ?`;
-  const [idRows] = await pool.query(idSql, [...allParams, size]);
-  if (idRows.length === 0) return [];
-  const ids = idRows.map((r) => Number(r.job_id));
+  const ids = await fetchExportJobIds({ filters, afterJobId, chunkSize });
+  if (ids.length === 0) return [];
 
   /*
    * ─── PHASE 2 — hydrate exactly those ids ────────────────────────────────
@@ -1824,6 +1799,52 @@ async function fetchExportChunk({ filters = {}, afterJobId = null, chunkSize = D
     `Manage-Job export chunk · rows=${rows.length} · afterJobId=${afterJobId ?? 'start'} · ${Date.now() - started}ms`,
   );
   return rows;
+}
+
+/*
+ * PHASE 1 of fetchExportChunk on its own: this chunk's job_ids, newest first,
+ * for exactly the rows the sheet would carry (same filters, same RBAC, same
+ * FILTER_FROM, same keyset). Exported so a reader that needs only WHICH jobs
+ * (QuickSight Employee Performance's SPOC-freeze capture) selects them through
+ * the export's own filter builder instead of writing a second WHERE.
+ */
+async function fetchExportJobIds({ filters = {}, afterJobId = null, chunkSize = DEFAULT_CHUNK_SIZE } = {}) {
+  const size = Math.min(Math.max(Number(chunkSize) || DEFAULT_CHUNK_SIZE, 1), MAX_CHUNK_SIZE);
+  /*
+   * Resolve the tbl_client.vertical_id probe ONCE per chunk (it is memoised
+   * per process after the first call) and hand the answer to buildClauses, so
+   * the verticals RBAC scope is applied here on exactly the condition list()
+   * applies it on. Awaiting a cached boolean costs nothing; guessing it costs
+   * an RBAC divergence between the sheet and the screen.
+   */
+  const { clauses, params } = buildClauses({
+    ...filters,
+    hasClientVerticalCol: await hasClientVerticalIdColumn(),
+  });
+
+  const allClauses = clauses.slice();
+  const allParams = params.slice();
+  if (afterJobId !== null && afterJobId !== undefined && afterJobId !== '') {
+    allClauses.push('J.job_id < ?');
+    allParams.push(Number(afterJobId));
+  }
+
+  /*
+   * ─── PHASE 1 — resolve this chunk's ids, and nothing else ───────────────
+   *
+   * A "deferred join": narrow first on the cheap join set, then hydrate. The
+   * naive alternative — running the full 21-join projection with the filters
+   * inline — makes MySQL build the three derived-table aggregates before it
+   * knows which 2,000 rows it wants, so the expensive work scales with the
+   * whole table rather than with the chunk.
+   */
+  const idSql = `SELECT J.job_id ${FILTER_FROM}
+    ${allClauses.length ? `WHERE ${allClauses.join(' AND ')}` : ''}
+    GROUP BY J.job_id
+    ORDER BY J.job_id DESC
+    LIMIT ?`;
+  const [idRows] = await pool.query(idSql, [...allParams, size]);
+  return idRows.map((r) => Number(r.job_id));
 }
 
 /*
@@ -2082,12 +2103,14 @@ function jobCurrentStatus(r) {
  * sheetDate() here rather than the raw parse — dropped seconds can move the
  * hour count across a 24h boundary on borderline rows.
  */
-function agingDaysWithTime(r) {
+// `now` defaults to the clock (the sheet); a caller that must be reproducible
+// (the Employee Performance open-jobs snapshot, its tests) passes its own.
+function agingDaysWithTime(r, now = new Date()) {
   const ticketDt = sheetDate(r.ticket_created_date_time);
   if (!ticketDt) return 0;
   const status = jdbcInt(r.job_status);
 
-  if ([9, 1, 0, 2, 20, 10, 15, 21].includes(status)) return calculateAgingDays(ticketDt, new Date());
+  if ([9, 1, 0, 2, 20, 10, 15, 21].includes(status)) return calculateAgingDays(ticketDt, now);
   if (status === 3 || status === 5) {
     const end = sheetDate(r.checkout_date_time);
     return end ? calculateAgingDays(ticketDt, end) : 0;
@@ -2205,16 +2228,17 @@ function remarksText(r) {
  * Turn one raw DB row into one sheet row, keyed by EXPORT_COLUMNS[].key.
  * `seqNumber` is the 1-based running row number the "No." column shows —
  * legacy's Jasper reportRowNumberColumn. The caller owns it because it spans
- * chunks.
+ * chunks. `now` (optional) is the instant open-job Aging is measured to;
+ * omitted, it is the clock, exactly as the sheet has always done.
  */
-function mapExportRow(r, seqNumber) {
+function mapExportRow(r, seqNumber, { now } = {}) {
   const jobStatus = jdbcInt(r.job_status);
   const efrId = jdbcInt(r.fk_easyfixter_id);
   const subJobId = jdbcInt(r.sub_job_id);
   const previousEfrId = jdbcInt(r.previousEfrId);
 
   // ── Aging + TAT ───────────────────────────────────────────────────────────
-  const aging = agingDaysWithTime(r);
+  const aging = agingDaysWithTime(r, now);
   const tat = preDefinedTat(r);
   // In TAT (1) or out of TAT (0). Both inputs are always present here, so the
   // NumberFormatException branch that yielded null in legacy is unreachable.
@@ -2503,6 +2527,14 @@ function mapExportRow(r, seqNumber) {
 
 module.exports = {
   EXPORT_COLUMNS, fetchExportChunk, mapExportRow, buildExportWhere,
+  /*
+   * Reused by services/quicksight/employee-performance/sources.service.js,
+   * which builds the Employee Performance tab's open and closed jobs from THIS
+   * export (owner decision: never re-derive Aging / TAT / SDA / margin):
+   * phase 1 alone for the SPOC-freeze capture, and the sheet's own
+   * "IST calendar day of a DB datetime" for the checkout day.
+   */
+  fetchExportJobIds, datePart,
   /*
    * The two legacy BUCKET derivations — ports of
    * UtilityFunctions.getHomeJobStatusbyStatusId and .getJobCurrentStatusNew.

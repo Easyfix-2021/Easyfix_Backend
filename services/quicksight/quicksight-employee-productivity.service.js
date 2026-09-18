@@ -328,149 +328,19 @@ async function getEmployeeProductivity({ pf, page, size }) {
   }
 
   // ── STEP3 — getEmployeeProductivity metrics CTE (FloorDisciplineRepository:227-329) ──
-  // filtered_jobs scoped by zonalManagerId via tbl_city.state_user. Each
-  // metric branch counts/sums over the page user ids within the date window.
-  // VERBATIM legacy: plain COUNT (booked/scheduled/cancelled/foh/estimates),
-  // COUNT(DISTINCT) only for closed_count, IFNULL(SUM total_charge) revenue.
-  const userIn = placeholders(userIds);
-  const metricsSql =
-    `WITH filtered_jobs AS (
-        SELECT
-            j.job_id,
-            j.fk_created_by,
-            j.fk_scheduled_by,
-            j.cancel_by,
-            j.full_fillment_by,
-            j.fk_easyfixter_id,
-            j.job_status,
-            j.created_date_time,
-            j.original_scheduling_date_time,
-            j.cancel_date_time,
-            j.full_fillment_created_time
-        FROM tbl_job j
-        LEFT JOIN tbl_address a ON a.address_id = j.fk_address_id
-        LEFT JOIN tbl_city c ON c.city_id = a.city_id
-        WHERE ( ? IS NULL OR c.state_user = ? )
-     ),
-     metrics AS (
-        SELECT fk_created_by AS user_id, COUNT(job_id) AS cnt, 'booked' AS metric
-        FROM filtered_jobs
-        WHERE fk_created_by IN (${userIn})
-          AND created_date_time BETWEEN ? AND ?
-        GROUP BY fk_created_by
-        UNION ALL
-        SELECT fk_scheduled_by, COUNT(job_id), 'scheduled'
-        FROM filtered_jobs
-        WHERE fk_scheduled_by IN (${userIn})
-          AND original_scheduling_date_time BETWEEN ? AND ?
-        GROUP BY fk_scheduled_by
-        UNION ALL
-        SELECT cancel_by, COUNT(job_id), 'cancelled'
-        FROM filtered_jobs
-        WHERE cancel_by IN (${userIn})
-          AND job_status = 6
-          AND fk_easyfixter_id IS NOT NULL
-          AND cancel_date_time BETWEEN ? AND ?
-        GROUP BY cancel_by
-        UNION ALL
-        SELECT full_fillment_by, COUNT(job_id), 'foh'
-        FROM filtered_jobs
-        WHERE full_fillment_by IN (${userIn})
-          AND full_fillment_created_time BETWEEN ? AND ?
-        GROUP BY full_fillment_by
-        UNION ALL
-        SELECT e.sent_by, COUNT(e.job_id), 'estimate_sent'
-        FROM tbl_estimate_details e
-        INNER JOIN filtered_jobs fj ON fj.job_id = e.job_id
-        WHERE e.sent_by IN (${userIn})
-          AND e.sent_on BETWEEN ? AND ?
-        GROUP BY e.sent_by
-        UNION ALL
-        SELECT e.sent_by, COUNT(e.job_id), 'estimate_approved'
-        FROM tbl_estimate_details e
-        INNER JOIN filtered_jobs fj ON fj.job_id = e.job_id
-        WHERE e.sent_by IN (${userIn})
-          AND e.STATUS = 1
-          AND e.action_on BETWEEN ? AND ?
-        GROUP BY e.sent_by
-        UNION ALL
-        SELECT e.sent_by, COUNT(e.job_id), 'estimate_rejected'
-        FROM tbl_estimate_details e
-        INNER JOIN filtered_jobs fj ON fj.job_id = e.job_id
-        WHERE e.sent_by IN (${userIn})
-          AND e.STATUS = 2
-          AND e.action_on BETWEEN ? AND ?
-        GROUP BY e.sent_by
-        UNION ALL
-        SELECT jt.updated_by, IFNULL(SUM(jt.total_charge), 0), 'revenue'
-        FROM tbl_job_transaction jt
-        INNER JOIN filtered_jobs fj ON fj.job_id = jt.fk_job_id
-        WHERE jt.updated_by IN (${userIn})
-          AND jt.insert_date BETWEEN ? AND ?
-        GROUP BY jt.updated_by
-        UNION ALL
-        SELECT jt.updated_by, COUNT(DISTINCT jt.fk_job_id), 'closed_count'
-        FROM tbl_job_transaction jt
-        INNER JOIN filtered_jobs fj ON fj.job_id = jt.fk_job_id
-        WHERE jt.updated_by IN (${userIn})
-          AND jt.insert_date BETWEEN ? AND ?
-        GROUP BY jt.updated_by
-     )
-     SELECT
-        user_id,
-        COALESCE(SUM(CASE WHEN metric = 'booked' THEN cnt END), 0) AS booked,
-        COALESCE(SUM(CASE WHEN metric = 'scheduled' THEN cnt END), 0) AS scheduled,
-        COALESCE(SUM(CASE WHEN metric = 'estimate_sent' THEN cnt END), 0) AS estimate_sent,
-        COALESCE(SUM(CASE WHEN metric = 'estimate_approved' THEN cnt END), 0) AS estimate_approved,
-        COALESCE(SUM(CASE WHEN metric = 'estimate_rejected' THEN cnt END), 0) AS estimate_rejected,
-        COALESCE(SUM(CASE WHEN metric = 'closed_count' THEN cnt END), 0) AS closed_count,
-        COALESCE(SUM(CASE WHEN metric = 'revenue' THEN cnt END), 0) AS revenue,
-        COALESCE(SUM(CASE WHEN metric = 'cancelled' THEN cnt END), 0) AS cancel_count,
-        COALESCE(SUM(CASE WHEN metric = 'foh' THEN cnt END), 0) AS foh
-     FROM metrics
-     GROUP BY user_id
-     ORDER BY user_id`;
-
+  // See productivityMetricsSql (the one definition of every metric).
   // Window: legacy passed startDate/endDate (LocalDate). When the FE omits
   // dates the metrics windows are nullable — MySQL `BETWEEN NULL AND NULL`
   // yields NULL (no match), so an unset range produces zero metrics, exactly
   // like the legacy LocalDate nulls. We bind the processed start/end for every
   // windowed branch (9 windows → but 'cancelled' uses cancel_date_time,
   // others their own column; all 9 share the same start/end pair).
-  const s = pf.startDate;
-  const e = pf.endDate;
-  const metricsParams = [
-    pf.zonalManagerId, pf.zonalManagerId,        // filtered_jobs zonal guard
-    ...userIds, s, e,                            // booked
-    ...userIds, s, e,                            // scheduled
-    ...userIds, s, e,                            // cancelled
-    ...userIds, s, e,                            // foh
-    ...userIds, s, e,                            // estimate_sent
-    ...userIds, s, e,                            // estimate_approved
-    ...userIds, s, e,                            // estimate_rejected
-    ...userIds, s, e,                            // revenue
-    ...userIds, s, e,                            // closed_count
-  ];
+  const metricsSql = productivityMetricsSql(placeholders(userIds));
+  const metricsParams = productivityMetricsParams(pf.zonalManagerId, userIds, pf.startDate, pf.endDate);
   const [metricRows] = await pool.query(metricsSql, metricsParams);
 
   const metricMap = new Map();
-  for (const r of metricRows) {
-    const uid = Number(r.user_id);
-    const estimateSent = Number(r.estimate_sent) || 0;
-    const estimateApproved = Number(r.estimate_approved) || 0;
-    const estimateRejected = Number(r.estimate_rejected) || 0;
-    const fohCount = Number(r.foh) || 0;
-    metricMap.set(uid, {
-      booked: Number(r.booked) || 0,
-      scheduled: Number(r.scheduled) || 0,
-      // audit = estimate_sent + estimate_approved + estimate_rejected + foh
-      // (legacy FloorDisciplineServiceImpl.java:200)
-      audit: estimateSent + estimateApproved + estimateRejected + fohCount,
-      closedCount: Number(r.closed_count) || 0,
-      revenue: Number(r.revenue) || 0,
-      cancelCount: Number(r.cancel_count) || 0,
-    });
-  }
+  for (const r of metricRows) metricMap.set(Number(r.user_id), productivityCounts(r));
 
   // LEFT-join in JS: every page user appears (zero-row default for no metrics).
   const data = userIds.map((uid) => {
@@ -495,6 +365,220 @@ async function getEmployeeProductivity({ pf, page, size }) {
     totalPages: size > 0 ? Math.ceil(totalRecords / size) : 0,
     data,
   };
+}
+
+/*
+ * THE productivity metrics query — the one definition of Booked, Scheduled,
+ * Cancelled, FOH, the three estimate counts, Revenue and Closed, shared by the
+ * paginated report above and getProductivityMetrics below.
+ *
+ * filtered_jobs scoped by zonalManagerId via tbl_city.state_user. Each
+ * metric branch counts/sums over the given user ids within the date window.
+ * VERBATIM legacy: plain COUNT (booked/scheduled/cancelled/foh/estimates),
+ * COUNT(DISTINCT) only for closed_count, IFNULL(SUM total_charge) revenue.
+ *
+ * With no options it is byte-for-byte the legacy statement (BETWEEN on an end
+ * the caller already bumped by a day, one row per user). The two options only
+ * change the WINDOW and the GROUPING of each branch, never what a branch
+ * counts:
+ *   halfOpen   `col >= ? AND col < ?` — an event at exactly midnight belongs
+ *              to ONE day, not to both (BETWEEN counts it twice across days).
+ *   groupByDay each branch also groups by DATE(col), the IST calendar day (the
+ *              pool session runs at +05:30), and the result carries `day`.
+ * `userIn` is the SQL inside `IN (…)`: a `?` run, or a trusted subquery.
+ */
+function productivityMetricsSql(userIn, { halfOpen = false, groupByDay = false } = {}) {
+  const win = (col) => (halfOpen ? `${col} >= ? AND ${col} < ?` : `${col} BETWEEN ? AND ?`);
+  const day = (col) => (groupByDay ? `DATE(${col}) AS day, ` : '');
+  const by = (userCol, col) => (groupByDay ? `${userCol}, DATE(${col})` : userCol);
+  return `WITH filtered_jobs AS (
+        SELECT
+            j.job_id,
+            j.fk_created_by,
+            j.fk_scheduled_by,
+            j.cancel_by,
+            j.full_fillment_by,
+            j.fk_easyfixter_id,
+            j.job_status,
+            j.created_date_time,
+            j.original_scheduling_date_time,
+            j.cancel_date_time,
+            j.full_fillment_created_time
+        FROM tbl_job j
+        LEFT JOIN tbl_address a ON a.address_id = j.fk_address_id
+        LEFT JOIN tbl_city c ON c.city_id = a.city_id
+        WHERE ( ? IS NULL OR c.state_user = ? )
+     ),
+     metrics AS (
+        SELECT fk_created_by AS user_id, ${day('created_date_time')}COUNT(job_id) AS cnt, 'booked' AS metric
+        FROM filtered_jobs
+        WHERE fk_created_by IN (${userIn})
+          AND ${win('created_date_time')}
+        GROUP BY ${by('fk_created_by', 'created_date_time')}
+        UNION ALL
+        SELECT fk_scheduled_by, ${day('original_scheduling_date_time')}COUNT(job_id), 'scheduled'
+        FROM filtered_jobs
+        WHERE fk_scheduled_by IN (${userIn})
+          AND ${win('original_scheduling_date_time')}
+        GROUP BY ${by('fk_scheduled_by', 'original_scheduling_date_time')}
+        UNION ALL
+        SELECT cancel_by, ${day('cancel_date_time')}COUNT(job_id), 'cancelled'
+        FROM filtered_jobs
+        WHERE cancel_by IN (${userIn})
+          AND job_status = 6
+          AND fk_easyfixter_id IS NOT NULL
+          AND ${win('cancel_date_time')}
+        GROUP BY ${by('cancel_by', 'cancel_date_time')}
+        UNION ALL
+        SELECT full_fillment_by, ${day('full_fillment_created_time')}COUNT(job_id), 'foh'
+        FROM filtered_jobs
+        WHERE full_fillment_by IN (${userIn})
+          AND ${win('full_fillment_created_time')}
+        GROUP BY ${by('full_fillment_by', 'full_fillment_created_time')}
+        UNION ALL
+        SELECT e.sent_by, ${day('e.sent_on')}COUNT(e.job_id), 'estimate_sent'
+        FROM tbl_estimate_details e
+        INNER JOIN filtered_jobs fj ON fj.job_id = e.job_id
+        WHERE e.sent_by IN (${userIn})
+          AND ${win('e.sent_on')}
+        GROUP BY ${by('e.sent_by', 'e.sent_on')}
+        UNION ALL
+        SELECT e.sent_by, ${day('e.action_on')}COUNT(e.job_id), 'estimate_approved'
+        FROM tbl_estimate_details e
+        INNER JOIN filtered_jobs fj ON fj.job_id = e.job_id
+        WHERE e.sent_by IN (${userIn})
+          AND e.STATUS = 1
+          AND ${win('e.action_on')}
+        GROUP BY ${by('e.sent_by', 'e.action_on')}
+        UNION ALL
+        SELECT e.sent_by, ${day('e.action_on')}COUNT(e.job_id), 'estimate_rejected'
+        FROM tbl_estimate_details e
+        INNER JOIN filtered_jobs fj ON fj.job_id = e.job_id
+        WHERE e.sent_by IN (${userIn})
+          AND e.STATUS = 2
+          AND ${win('e.action_on')}
+        GROUP BY ${by('e.sent_by', 'e.action_on')}
+        UNION ALL
+        SELECT jt.updated_by, ${day('jt.insert_date')}IFNULL(SUM(jt.total_charge), 0), 'revenue'
+        FROM tbl_job_transaction jt
+        INNER JOIN filtered_jobs fj ON fj.job_id = jt.fk_job_id
+        WHERE jt.updated_by IN (${userIn})
+          AND ${win('jt.insert_date')}
+        GROUP BY ${by('jt.updated_by', 'jt.insert_date')}
+        UNION ALL
+        SELECT jt.updated_by, ${day('jt.insert_date')}COUNT(DISTINCT jt.fk_job_id), 'closed_count'
+        FROM tbl_job_transaction jt
+        INNER JOIN filtered_jobs fj ON fj.job_id = jt.fk_job_id
+        WHERE jt.updated_by IN (${userIn})
+          AND ${win('jt.insert_date')}
+        GROUP BY ${by('jt.updated_by', 'jt.insert_date')}
+     )
+     SELECT
+        user_id,${groupByDay ? '\n        day,' : ''}
+        COALESCE(SUM(CASE WHEN metric = 'booked' THEN cnt END), 0) AS booked,
+        COALESCE(SUM(CASE WHEN metric = 'scheduled' THEN cnt END), 0) AS scheduled,
+        COALESCE(SUM(CASE WHEN metric = 'estimate_sent' THEN cnt END), 0) AS estimate_sent,
+        COALESCE(SUM(CASE WHEN metric = 'estimate_approved' THEN cnt END), 0) AS estimate_approved,
+        COALESCE(SUM(CASE WHEN metric = 'estimate_rejected' THEN cnt END), 0) AS estimate_rejected,
+        COALESCE(SUM(CASE WHEN metric = 'closed_count' THEN cnt END), 0) AS closed_count,
+        COALESCE(SUM(CASE WHEN metric = 'revenue' THEN cnt END), 0) AS revenue,
+        COALESCE(SUM(CASE WHEN metric = 'cancelled' THEN cnt END), 0) AS cancel_count,
+        COALESCE(SUM(CASE WHEN metric = 'foh' THEN cnt END), 0) AS foh
+     FROM metrics
+     GROUP BY user_id${groupByDay ? ', day' : ''}
+     ORDER BY user_id${groupByDay ? ', day' : ''}`;
+}
+
+/*
+ * Bind values for productivityMetricsSql, in placeholder order: the zonal
+ * guard, then (user ids, start, end) once per branch. `userIds` is [] when the
+ * user set is a subquery (no `?` of its own).
+ */
+function productivityMetricsParams(zonalManagerId, userIds, s, e) {
+  return [
+    zonalManagerId, zonalManagerId,              // filtered_jobs zonal guard
+    ...userIds, s, e,                            // booked
+    ...userIds, s, e,                            // scheduled
+    ...userIds, s, e,                            // cancelled
+    ...userIds, s, e,                            // foh
+    ...userIds, s, e,                            // estimate_sent
+    ...userIds, s, e,                            // estimate_approved
+    ...userIds, s, e,                            // estimate_rejected
+    ...userIds, s, e,                            // revenue
+    ...userIds, s, e,                            // closed_count
+  ];
+}
+
+// One metrics row → the report's counts. audit = estimate_sent +
+// estimate_approved + estimate_rejected + foh (legacy FloorDisciplineServiceImpl.java:200).
+function productivityCounts(r) {
+  const estimateSent = Number(r.estimate_sent) || 0;
+  const estimateApproved = Number(r.estimate_approved) || 0;
+  const estimateRejected = Number(r.estimate_rejected) || 0;
+  const fohCount = Number(r.foh) || 0;
+  return {
+    booked: Number(r.booked) || 0,
+    scheduled: Number(r.scheduled) || 0,
+    audit: estimateSent + estimateApproved + estimateRejected + fohCount,
+    closedCount: Number(r.closed_count) || 0,
+    revenue: Number(r.revenue) || 0,
+    cancelCount: Number(r.cancel_count) || 0,
+  };
+}
+
+/*
+ * The internal staff (tbl_user.user_type_id = 5, the CRM's own gate — see
+ * services/user.service.js) as an `IN (…)` subquery: the default user set of
+ * getProductivityMetrics. Deliberately WITHOUT the report page's
+ * user_status = 1 / user_role NOT IN (1) filter — that filter decides who gets
+ * a ROW on the paginated screen, not whose work counted, and a daily feed must
+ * not lose a person the day their account is deactivated.
+ */
+const INTERNAL_USERS_SUBQUERY = 'SELECT iu.user_id FROM tbl_user iu WHERE iu.user_type_id = 5';
+
+/*
+ * getProductivityMetrics — the same metrics as getEmployeeProductivity, for a
+ * caller that needs them per user (and optionally per DAY) rather than as a
+ * paginated screen: QuickSight Employee Performance's CRM data (Booked /
+ * Scheduled / Audit / Closed / Cancelled per person per day).
+ *
+ *   from, to    'YYYY-MM-DD', both INCLUSIVE IST days. Applied half-open —
+ *               [from 00:00, to+1 00:00) — on every branch's own date column.
+ *   userIds     tbl_user ids; omitted/null = every internal user.
+ *   groupByDay  true (default): one row per (user, IST day) with activity.
+ *               false: one row per user for the whole window.
+ *
+ * No zonal filter (the guard binds NULL), no page, no zero rows: a user or a
+ * day with no activity simply has no row.
+ *
+ * Returns [{ userId, date (null when !groupByDay), booked, scheduled, audit,
+ *            closedCount, revenue, cancelCount }] ordered by user, day.
+ */
+async function getProductivityMetrics({ from, to, userIds = null, groupByDay = true } = {}) {
+  const ymd = /^\d{4}-\d{2}-\d{2}$/;
+  if (!ymd.test(String(from)) || !ymd.test(String(to)) || from > to) {
+    const err = new Error('from and to must be YYYY-MM-DD with from <= to');
+    err.status = 400;
+    throw err;
+  }
+  const ids = Array.isArray(userIds) ? [...new Set(userIds.map(Number).filter((n) => Number.isInteger(n) && n > 0))] : null;
+  if (ids && ids.length === 0) return [];
+
+  const sql = productivityMetricsSql(ids ? placeholders(ids) : INTERNAL_USERS_SUBQUERY, { halfOpen: true, groupByDay });
+  const params = productivityMetricsParams(null, ids || [], `${from} 00:00:00`, `${addOneDay(to)} 00:00:00`);
+  const started = Date.now();
+  const [rows] = await pool.query(sql, params);
+  if (rows.length >= LIST_CAP) {
+    logger.warn({ report: 'productivity-metrics', returned: rows.length, cap: LIST_CAP },
+      'Productivity metrics returned an unusually large row set — verify the window');
+  }
+  logger.info('Productivity metrics · ' + from + '..' + to + ' · users=' + (ids ? ids.length : 'internal')
+    + ' · byDay=' + groupByDay + ' · rows=' + rows.length + ' · ' + (Date.now() - started) + 'ms');
+  return rows.map((r) => ({
+    userId: Number(r.user_id),
+    date: groupByDay ? String(r.day).slice(0, 10) : null,
+    ...productivityCounts(r),
+  }));
 }
 
 // Build a comma-separated `?` placeholder run for an array (>=1 element).
@@ -1075,6 +1159,9 @@ module.exports = {
   getReportingManagers,
   getRmTeamUsers,
   getSpocRevenue,
+  // Per-user / per-day metrics for QuickSight Employee Performance's CRM data
+  // (services/quicksight/employee-performance/sources.service.js).
+  getProductivityMetrics,
   // Cap surfaced so the route's xlsx export can request the full set
   // symbolically (avoids a hardcoded 5000 literal drifting from this cap).
   GROUPED_CAP,
