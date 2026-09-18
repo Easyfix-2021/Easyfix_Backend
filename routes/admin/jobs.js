@@ -2974,13 +2974,85 @@ router.post('/:id/checkin',
 // entirely and sets 10) so the transition logs + fires webhooks like every
 // other status move. See
 // docs/superpowers/specs/2026-09-18-pending-for-material-status-16-design.md.
+//
+// Sub-project E (2026-09-18) adds the per-material-line review — see
+// docs/superpowers/specs/2026-09-18-ops-material-approval-design.md
+// "Backend". `lines` is only meaningful when the outer `decision` is
+// 'approve'; a whole-review reject leaves every quotation_details row
+// untouched exactly like before, so its Joi shape stays a bare array with
+// per-item type checks — the coverage / amount rules the spec calls out
+// (missing, unknown, duplicate line_id; a negative or misplaced
+// approved_amount) are business-content errors, so they 422 out of the
+// handler below rather than 400 out of this schema.
+//
+// STATUS VALUES — reused verbatim from routes/admin/quotations.js PATCH
+// /:id/approve|reject, NOT the 3-value scheme the design doc's prose
+// describes (0 pending/1 approved/2 rejected — that mapping appears nowhere
+// in this codebase; grep finds no reader of quotation_details.status = 2
+// anywhere, while services/job.service.js's dashboard filters, job-export.
+// service.js, and quotations.js itself all agree on a DIFFERENT, 2-value
+// one: status 1 = active/approved, status 0 = rejected, and `action_on`
+// (NULL vs stamped) is what actually distinguishes "never reviewed" from
+// "approved" — see mobile-job-estimate.service.js's own
+// `quotation_actioned_on` for a third confirming reader).  A technician's
+// material line is INSERTED at status = 1 (mobile-job-estimate.service.js
+// addQuotationLine) with action_on NULL, so PENDING here is
+// `status = 1 AND action_on IS NULL` — approve stamps action_on (status
+// stays 1, matching quotations.js's approve exactly); reject sets
+// status = 0 (matching quotations.js's reject exactly, not an invented 2).
+const materialLineBody = require('joi').object({
+  line_id: require('joi').number().integer().positive().required(),
+  decision: require('joi').string().valid('approve', 'reject').required(),
+  approved_amount: require('joi').number().optional(),
+});
+
 const materialReviewBody = require('joi').object({
   decision: require('joi').string().valid('approve', 'reject').required(),
   reason: require('joi').string().trim().max(500).when('decision', {
     is: 'reject', then: require('joi').required(), otherwise: require('joi').optional(),
   }),
   permission_required: require('joi').number().integer().valid(0, 1).default(0),
+  lines: require('joi').array().items(materialLineBody).default([]),
 });
+
+/*
+ * Every PENDING (status = 1, action_on NULL — see the STATUS VALUES note
+ * above) type='material' quotation_details row on the job must appear in
+ * `lines` exactly once — reused as the "did Ops half-review this job" guard
+ * the design calls for. Returns an error string, or null when `lines` is a
+ * valid, complete, one-to-one review of `pendingIds`.
+ *
+ * Column semantics (approved_charge / status / action_by / action_on) are
+ * the SAME ones routes/admin/quotations.js PATCH /:id/approve|reject
+ * already write — reused, not reinvented.
+ */
+function validateMaterialLines(pendingIds, lines) {
+  const seen = new Map();
+  for (const line of lines) {
+    const lid = Number(line.line_id);
+    if (seen.has(lid)) return `duplicate line_id ${lid} in lines`;
+    seen.set(lid, line);
+  }
+  for (const lid of seen.keys()) {
+    if (!pendingIds.has(lid)) return `line_id ${lid} is not a pending material line on this job`;
+  }
+  for (const pid of pendingIds) {
+    if (!seen.has(pid)) return `material line ${pid} is missing from the review`;
+  }
+  for (const [lid, line] of seen) {
+    if (line.decision === 'approve') {
+      if (line.approved_amount === undefined || line.approved_amount === null) {
+        return `approved_amount is required for approved line ${lid}`;
+      }
+      if (Number(line.approved_amount) < 0) {
+        return `approved_amount must be >= 0 for line ${lid}`;
+      }
+    } else if (line.approved_amount !== undefined) {
+      return `approved_amount is forbidden on rejected line ${lid}`;
+    }
+  }
+  return null;
+}
 
 router.post(
   '/:id/material-review',
@@ -2991,7 +3063,7 @@ router.post(
   async (req, res, next) => {
     try {
       const jobId = Number(req.params.id);
-      const { decision, reason, permission_required: permissionRequired } = req.body;
+      const { decision, reason, permission_required: permissionRequired, lines: submittedLines } = req.body;
       logger.info('Material review · jobId=' + jobId + ' · decision=' + decision + ' by userId=' + (req.user?.user_id ?? '-'));
 
       if (Number(req.scopedJob.job_status) !== job.STATUS.PENDING_FOR_MATERIAL) {
@@ -3001,17 +3073,78 @@ router.post(
 
       let updated;
       if (decision === 'approve') {
-        updated = await job.setStatus(
-          jobId,
-          {
-            status: job.STATUS.ESTIMATE_PENDING_APPROVAL,
-            // Clear any stale reject reason from a PREVIOUS review round —
-            // an approved estimate must not still show the tech an old
-            // rejection message.
-            extras: { material_sub_status: null, permission_required: permissionRequired, material_reject_reason: null },
-          },
-          req.user,
-        );
+        // Line writes (quotation_details) AND the job's move to 15 happen on
+        // ONE connection/transaction — a failing line write must leave the
+        // job at 16, never partway approved. See job.service.js setStatus's
+        // `conn` option, added for exactly this caller.
+        const conn = await pool.getConnection();
+        try {
+          await conn.beginTransaction();
+          const [pendingRows] = await conn.query(
+            `SELECT id FROM quotation_details
+              WHERE job_id = ? AND type = 'material'
+                AND CAST(status AS SIGNED) = 1 AND action_on IS NULL
+              FOR UPDATE`,
+            [jobId],
+          );
+          const pendingIds = new Set(pendingRows.map((r) => Number(r.id)));
+          const lines = Array.isArray(submittedLines) ? submittedLines : [];
+          const lineError = validateMaterialLines(pendingIds, lines);
+          if (lineError) {
+            try { await conn.rollback(); } catch { /* nothing was written yet */ }
+            logger.warn('Material review approve refused · jobId=' + jobId + ' · ' + lineError);
+            return modernError(res, 422, lineError);
+          }
+
+          const now = new Date();
+          for (const line of lines) {
+            if (line.decision === 'approve') {
+              await conn.query(
+                `UPDATE quotation_details
+                    SET approved_charge = ?, status = 1, action_by = ?, action_on = ?
+                  WHERE id = ? AND job_id = ?`,
+                [line.approved_amount, req.user.user_id, now, line.line_id, jobId],
+              );
+            } else {
+              // status = 0, exactly what quotations.js PATCH /:id/reject
+              // writes — see the STATUS VALUES note above this route.
+              await conn.query(
+                `UPDATE quotation_details
+                    SET status = 0, action_by = ?, action_on = ?
+                  WHERE id = ? AND job_id = ?`,
+                [req.user.user_id, now, line.line_id, jobId],
+              );
+            }
+          }
+
+          // The same status move the pre-existing approve path always made —
+          // now issued on OUR connection (via setStatus's `conn` option) so
+          // it commits or rolls back with the line writes above.
+          await job.setStatus(
+            jobId,
+            {
+              status: job.STATUS.ESTIMATE_PENDING_APPROVAL,
+              // Clear any stale reject reason from a PREVIOUS review round —
+              // an approved estimate must not still show the tech an old
+              // rejection message.
+              extras: { material_sub_status: null, permission_required: permissionRequired, material_reject_reason: null },
+            },
+            req.user,
+            { conn },
+          );
+          await conn.commit();
+        } catch (e) {
+          try { await conn.rollback(); } catch { /* connection may already be gone */ }
+          throw e;
+        } finally {
+          conn.release();
+        }
+        // setStatus's own return value reads the job via the pool, which — for
+        // the instant before the commit() above — can still see the PRE-move
+        // row (a separate connection under REPEATABLE READ never sees our
+        // uncommitted UPDATE). Re-read now that the transaction is durable so
+        // the response reflects the real, committed status.
+        updated = await job.getById(jobId);
       } else {
         updated = await job.setStatus(
           jobId,

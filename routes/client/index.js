@@ -2219,13 +2219,19 @@ router.get('/jobs/:id/estimate-preview', async (req, res, next) => {
      * they were two hand-written copies until 2026-09-09.
      */
     const { estimateLinesForJob } = require('../../services/job-line-total');
-    const { lines, totals } = await estimateLinesForJob(jobId);
-    logger.info('Found ' + lines.length + ' approval-pending services');
+    const { lines, materials, totals } = await estimateLinesForJob(jobId);
+    logger.info('Found ' + lines.length + ' approval-pending services · ' + materials.length + ' approved material lines');
     const grandTotal = totals.grand_total;
 
     modernOk(res, {
       job_id: jobId,
       services: lines,
+      // Ops-approved material lines ONLY (Ops Material Approval, sub-project
+      // E) — status=1 AND action_on-stamped quotation_details rows, name/
+      // unit/approved_charge. A pending or rejected line, and the
+      // technician's unit_price, never appear here — see
+      // services/job-line-total.js.
+      materials,
       /*
        * { service_charge_subtotal, material_subtotal, grand_total } — labour,
        * parts, and what is owed. The first was called `services_subtotal` and
