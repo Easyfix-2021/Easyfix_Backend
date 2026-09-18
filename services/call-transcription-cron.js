@@ -137,8 +137,18 @@ async function runTranscriptionBackfill({ limit = 50, shouldStop = null } = {}) 
   let rows;
   try {
     [rows] = await pool.query(
+      /*
+       * ONE ROW PER CALL. A conference call has a tbl_plivo_call_log row per LEG
+       * — services/plivo-conference.service.js inserts the participant's leg with
+       * the SAME job_caller_info_id, and idx_plivo_log_jci is deliberately a plain
+       * KEY (2026-08-04-create-tbl-job-conference.sql) — so an ungrouped JOIN
+       * returns that call once per leg. Each duplicate re-ran the whole row: two
+       * more Plivo GETs and a repeat UPDATE, and the duplicates ate the LIMIT, so
+       * a batch of 50 could cover fewer than 50 calls. The writes are all keyed on
+       * job_caller_info_id, so one pass still fills every leg's row.
+       */
       `SELECT jci.job_caller_info AS id, jci.unique_id AS callUuid,
-              pcl.transcription_status AS status, pcl.transcription_fetched_at AS lastAt
+              MAX(pcl.transcription_status) AS status, MAX(pcl.transcription_fetched_at) AS lastAt
          FROM tbl_job_caller_info jci
          JOIN tbl_plivo_call_log pcl ON pcl.job_caller_info_id = jci.job_caller_info
         WHERE jci.provider = 'plivo'
@@ -147,6 +157,7 @@ async function runTranscriptionBackfill({ limit = 50, shouldStop = null } = {}) 
           AND jci.duration >= ?
           AND (pcl.transcription IS NULL OR pcl.transcription = '')
           AND (pcl.transcription_status IS NULL OR pcl.transcription_status NOT IN ('completed', 'not_available'))
+        GROUP BY jci.job_caller_info, jci.unique_id, jci.inserted_time
         ORDER BY jci.inserted_time DESC
         LIMIT ?`,
       [MIN_TRANSCRIBE_SECONDS, limit],
