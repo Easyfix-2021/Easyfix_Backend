@@ -4,6 +4,7 @@ const Joi = require('joi');
 const validate = require('../../middleware/validate');
 const { modernOk, modernError } = require('../../utils/response');
 const estimateService = require('../../services/mobile-job-estimate.service');
+const materialRequestService = require('../../services/material-request.service');
 const logger = require('../../logger');
 
 /*
@@ -236,6 +237,40 @@ router.get('/:id/work-progress', validate(idParam, 'params'), async (req, res, n
     logger.info('Returning ' + (out.stages ? out.stages.length : 0) + ' lifecycle stages');
     modernOk(res, out);
   } catch (e) { logger.warn('Fetch work-progress failed · jobId=' + req.params.id + ' · ' + e.message); fail(res, next, e); }
+});
+
+// ─── Material Add Requests (Material Management phase 2, sub-project A) ──
+// The Estimate material picker offers master-list materials ONLY, plus
+// "Others" — "Others" raises a request here instead of a free-text
+// quotation line. See docs/superpowers/specs/2026-09-18-material-add-requests-design.md.
+// service_catg_id is stamped from the job server-side; nothing in this body
+// can set it. Idempotency-Key is honoured the same way every other mutation
+// under /api/mobile/* is — the shared `router.use(idempotency())` mounted in
+// routes/mobile/index.js already wraps this route, so a retried key replays
+// the first response instead of creating a second request.
+const materialRequestBody = Joi.object({
+  material_name:  Joi.string().trim().min(1).max(200).required(),
+  brand_name:     Joi.string().trim().max(150).allow('', null).optional(),
+  expected_price: Joi.number().min(0).allow(null).optional(),
+  qty:            Joi.number().min(0).allow(null).optional(),
+  note:           Joi.string().trim().max(500).allow('', null).optional(),
+});
+
+router.post('/:id/material-request', validate(idParam, 'params'), validate(materialRequestBody), async (req, res, next) => {
+  try {
+    logger.info('Raise material add request · jobId=' + req.params.id + ' · name=' + req.body.material_name);
+    const out = await materialRequestService.createFromJob(Number(req.params.id), req.tech.efr_id, req.body);
+    res.status(201);
+    modernOk(res, out);
+  } catch (e) { logger.warn('Raise material add request failed · jobId=' + req.params.id + ' · ' + e.message); fail(res, next, e); }
+});
+
+router.get('/:id/material-requests', validate(idParam, 'params'), async (req, res, next) => {
+  try {
+    logger.info('Fetch material add requests · jobId=' + req.params.id);
+    const out = await materialRequestService.listForJob(Number(req.params.id), req.tech.efr_id);
+    modernOk(res, out);
+  } catch (e) { logger.warn('Fetch material add requests failed · jobId=' + req.params.id + ' · ' + e.message); fail(res, next, e); }
 });
 
 module.exports = router;
