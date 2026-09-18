@@ -13,7 +13,7 @@
  *   3. mobile send-for-approval: sets 16/2, NEVER 15.
  *   4. admin material-review: approve -> 15 (permission_required stored,
  *      material_sub_status + material_reject_reason cleared); reject ->
- *      16/1 (reason stored on tbl_job.material_reject_reason AND mirrored
+ *      16/1 (reason stored in tbl_job_material_review AND mirrored
  *      to tbl_job_comment for the CRM); guarded by isJobMaterialReview;
  *      refuses when the job isn't at 16.
  *   5. client + public estimate approve: 15 -> 1, fk_easyfixter_id
@@ -250,10 +250,15 @@ test('material-review approve: 16 -> 15, permission_required stored, sub-status 
   assert.equal(boundValue(upd, 'job_status'), 15);
   assert.equal(boundValue(upd, 'permission_required'), 1);
   assert.equal(boundValue(upd, 'material_sub_status'), null);
-  assert.equal(boundValue(upd, 'material_reject_reason'), null);
+  // The reason lives in tbl_job_material_review (tbl_job has no room for the
+  // column — see the migration header); approve CLEARS it so a stale rejection
+  // never follows an approved quote back to the technician.
+  const cleared = fake.calls.find((c) => /INSERT INTO tbl_job_material_review/i.test(c.sql));
+  assert.ok(cleared, 'approve must write the review row');
+  assert.equal(cleared.params[1], null, 'approve clears the reject reason');
 });
 
-test('material-review reject: 16 stays 16, material_sub_status -> 1, reason stored on tbl_job AND tbl_job_comment', async () => {
+test('material-review reject: 16 stays 16, material_sub_status -> 1, reason stored in tbl_job_material_review AND tbl_job_comment', async () => {
   jobFixture = makeJob({ job_status: 16, material_sub_status: 2 });
   const reason = 'Quote missing brand for item 3';
   const res = await adminPost(`/jobs/${jobFixture.job_id}/material-review`, { decision: 'reject', reason });
@@ -262,7 +267,9 @@ test('material-review reject: 16 stays 16, material_sub_status -> 1, reason stor
   assert.ok(upd);
   assert.equal(boundValue(upd, 'job_status'), 16);
   assert.equal(boundValue(upd, 'material_sub_status'), 1);
-  assert.equal(boundValue(upd, 'material_reject_reason'), reason);
+  const stored = fake.calls.find((c) => /INSERT INTO tbl_job_material_review/i.test(c.sql));
+  assert.ok(stored, 'the reason must be persisted for the technician app');
+  assert.equal(stored.params[1], reason);
 
   const comment = fake.calls.find((c) => /^\s*INSERT INTO tbl_job_comment/i.test(c.sql));
   assert.ok(comment, 'the reason must also be mirrored to the CRM History tab');
@@ -486,5 +493,7 @@ test('services/job.service.js: STATUS_EXTRAS_ALLOWLIST carries the two TINYINT c
   const snippet = src.slice(idx, src.indexOf(']);', idx));
   assert.match(snippet, /'material_sub_status'/);
   assert.match(snippet, /'permission_required'/);
-  assert.match(snippet, /'material_reject_reason'/);
+  // material_reject_reason is deliberately NOT an UPDATE column — it has no
+  // tbl_job column at all. setStatus routes it to tbl_job_material_review.
+  assert.doesNotMatch(snippet, /'material_reject_reason'/);
 });

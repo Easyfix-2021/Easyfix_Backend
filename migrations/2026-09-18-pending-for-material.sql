@@ -3,12 +3,12 @@
 -- phase 2, sub-project D. See
 -- docs/superpowers/specs/2026-09-18-pending-for-material-status-16-design.md.
 --
--- WHAT: 3 new tbl_job columns (material_sub_status, permission_required,
--- material_reject_reason), plus the RBAC seed for the new admin action key
+-- WHAT: 2 new tbl_job columns (material_sub_status, permission_required), the
+-- tbl_job_material_review side table for the PM's reject reason, plus the RBAC seed for the new admin action key
 -- `isJobMaterialReview` (Material Review approve/reject), granted to the
 -- Project Manager role.
 --
--- material_reject_reason (VARCHAR(500) NULL): the PM's reason on a Material
+-- material_reject_reason (tbl_job_material_review.reject_reason): the PM's reason on a Material
 -- Review reject, shown to the technician above the estimate. Field name and
 -- shape are FIXED by the shipped technician app, which already reads
 -- material_reject_reason / materialRejectReason off the job row — do not
@@ -82,7 +82,7 @@ SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT
   FROM INFORMATION_SCHEMA.COLUMNS
  WHERE TABLE_SCHEMA = DATABASE()
    AND TABLE_NAME   = 'tbl_job'
-   AND COLUMN_NAME IN ('material_sub_status', 'permission_required', 'material_reject_reason');
+   AND COLUMN_NAME IN ('material_sub_status', 'permission_required');
 
 -- ─── 2. The columns — run only the ones section 1 didn't already list ─────
 
@@ -90,7 +90,21 @@ ALTER TABLE tbl_job ADD COLUMN material_sub_status TINYINT NULL;
 
 ALTER TABLE tbl_job ADD COLUMN permission_required TINYINT NOT NULL DEFAULT 0;
 
-ALTER TABLE tbl_job ADD COLUMN material_reject_reason VARCHAR(500) NULL;
+-- NOT a tbl_job column. tbl_job is a 153-column legacy table whose rows are
+-- already at InnoDB's 8126-byte ceiling (40 VARCHARs totalling 8345 chars):
+-- ADD COLUMN material_reject_reason fails with ER_TOO_BIG_ROWSIZE on QA as
+-- VARCHAR(500) AND as TEXT. An EasyFix-owned side table is also the shape
+-- CLAUDE.md prefers for a shared DB ("never alter schema … a new table no
+-- legacy service references is the explicit exception"). The payload field
+-- name the technician app reads is unchanged — job.service.js LEFT JOINs this
+-- table and aliases it back to material_reject_reason.
+
+CREATE TABLE IF NOT EXISTS tbl_job_material_review (
+  job_id        INT PRIMARY KEY,
+  reject_reason TEXT NULL,
+  reviewed_by   INT  NULL,
+  reviewed_at   DATETIME NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ─── 3. RBAC seed — isJobMaterialReview, granted to Project Manager (role_id 13) ─
 
@@ -135,7 +149,7 @@ SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT
   FROM INFORMATION_SCHEMA.COLUMNS
  WHERE TABLE_SCHEMA = DATABASE()
    AND TABLE_NAME   = 'tbl_job'
-   AND COLUMN_NAME IN ('material_sub_status', 'permission_required', 'material_reject_reason');
+   AND COLUMN_NAME IN ('material_sub_status', 'permission_required');
 
 SELECT role_id, role_name FROM tbl_role WHERE role_id = 13;   -- confirm this IS "Project Manager" here
 

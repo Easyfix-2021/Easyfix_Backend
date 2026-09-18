@@ -3246,8 +3246,10 @@ async function getByIdCore(jobId) {
   const hasMaterialCols = await hasMaterialStatusColumns();
   const materialColsSelect = hasMaterialCols
     ? `CAST(j.material_sub_status AS SIGNED) AS material_sub_status,
-       CAST(j.permission_required AS SIGNED) AS permission_required`
-    : `NULL AS material_sub_status, NULL AS permission_required`;
+       CAST(j.permission_required AS SIGNED) AS permission_required,
+       (SELECT jmr.reject_reason FROM tbl_job_material_review jmr
+         WHERE jmr.job_id = j.job_id LIMIT 1) AS material_reject_reason`
+    : `NULL AS material_sub_status, NULL AS permission_required, NULL AS material_reject_reason`;
   const [jobRows] = await pool.query(
     `SELECT j.*,
             /* customer_name = the name booked ON THIS JOB, master as fallback —
@@ -5301,10 +5303,15 @@ const STATUS_EXTRAS_ALLOWLIST = new Set([
   // service's existing direct-UPDATE pattern in mobile-job-estimate.service.js,
   // same as it already does for status 15, to avoid a circular dependency.)
   // material_sub_status / permission_required are TINYINT — see db.js
-  // typeCast note on CAST(... AS SIGNED). material_reject_reason is a plain
-  // VARCHAR (the PM's reason on reject) — its field name/shape is fixed by
-  // the shipped technician app, which reads it off the job row verbatim.
-  'material_sub_status', 'permission_required', 'material_reject_reason',
+  // typeCast note on CAST(... AS SIGNED).
+  //
+  // material_reject_reason is deliberately NOT here: tbl_job cannot take
+  // another column (ER_TOO_BIG_ROWSIZE — see the migration header), so it
+  // lives in tbl_job_material_review and setStatus routes that one key there
+  // instead of into the UPDATE. Callers still pass it in `extras` under this
+  // name, and readers still see it on the job row, so the contract the
+  // technician app depends on is unchanged.
+  'material_sub_status', 'permission_required',
 ]);
 
 /*
@@ -5653,6 +5660,21 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { 
     }
   }
 
+  /*
+   * material_reject_reason is an extras key with no tbl_job column behind it
+   * (see STATUS_EXTRAS_ALLOWLIST). Pull it out before the column loop and
+   * persist it to tbl_job_material_review after the status UPDATE lands.
+   */
+  let materialRejectReason;
+  let hasMaterialRejectReason = false;
+  if (extras && typeof extras === 'object' && 'material_reject_reason' in extras) {
+    materialRejectReason = extras.material_reject_reason;
+    hasMaterialRejectReason = materialRejectReason !== undefined;
+    const rest = { ...extras };
+    delete rest.material_reject_reason;
+    extras = rest;
+  }
+
   // Tier-specific extras — caller passes a map of column→value pairs
   // for transition side-effects that don't generalise (mobile GPS
   // checkin, app_checkout_date_time, etc.). Whitelisted to prevent
@@ -5737,6 +5759,30 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { 
       logger.warn('Completed without a CRM user · id=' + jobId + ' · ' + existing.job_status + '->' + Number(status)
         + ' · ledger not posted; the next CRM move into 3/5 or the backfill posts it');
     }
+  }
+
+  /*
+   * The PM's material-review reject reason. Its own table because tbl_job has
+   * no room for another column (ER_TOO_BIG_ROWSIZE — see
+   * migrations/2026-09-18-pending-for-material.sql). An explicit null clears
+   * it, which is what an approve does so a stale rejection never follows an
+   * approved quote back to the technician.
+   *
+   * ponytail: written after the status UPDATE rather than inside it — the two
+   * are not one transaction, so a crash between them leaves the status moved
+   * and the reason missing. The reason is also mirrored to tbl_job_comment by
+   * the caller, so it is recoverable; make both one transaction if this ever
+   * needs to be atomic.
+   */
+  if (hasMaterialRejectReason) {
+    await pool.query(
+      `INSERT INTO tbl_job_material_review (job_id, reject_reason, reviewed_by, reviewed_at)
+            VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE reject_reason = VALUES(reject_reason),
+                               reviewed_by   = VALUES(reviewed_by),
+                               reviewed_at   = VALUES(reviewed_at)`,
+      [jobId, materialRejectReason, crmUserId || null, new Date()],
+    );
   }
 
   /*
