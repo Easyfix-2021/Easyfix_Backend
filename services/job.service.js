@@ -5416,82 +5416,6 @@ const MUTABLE_COLUMNS = [
    */
 ];
 
-/*
- * Preserve the CLIENT-ENTERED address before this job stops showing it — either
- * because update() overwrites tbl_address in place, or because it re-points
- * fk_address_id at a different row (repointJobAddress below). Both change what
- * the job reads as its address, so both must snapshot first.
- * tbl_job.client_entered_address is a pending EasyFix column, so guard on its
- * presence (no-op where the migration hasn't run). Capture only on the FIRST
- * edit (IS NULL) so later edits don't clobber the original the client/portal
- * booked with. No change needed in the old Client Dashboard — we snapshot at the
- * moment the new CRM edits. Runs on the caller's txn conn and must run BEFORE
- * the write: it reads the address through the job's CURRENT fk_address_id.
- */
-async function snapshotClientEnteredAddress(conn, jobId) {
-  const [ceCols] = await conn.query(
-    `SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
-      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tbl_job'
-        AND COLUMN_NAME = 'client_entered_address' LIMIT 1`
-  );
-  if (ceCols.length > 0) {
-    await conn.query(
-      `UPDATE tbl_job j
-         JOIN tbl_address a ON a.address_id = j.fk_address_id
-          SET j.client_entered_address = a.address
-        WHERE j.job_id = ? AND j.client_entered_address IS NULL AND a.address IS NOT NULL`,
-      [jobId]
-    );
-  }
-}
-
-/*
- * Confirm & Schedule address picker (2026-09-17) — point the job at a DIFFERENT
- * address without editing any tbl_address row:
- *   input.fk_address_id  an existing saved address, used EXACTLY AS IS — its
- *                        building, PIN, GPS and technician note all come with it.
- *   input.new_address    a brand-new row for this job's customer, written by the
- *                        same insertCustomerAddress() create() uses.
- *
- * Why never UPDATE tbl_address here: a saved row is shared — create() reuses a
- * caller-supplied address_id, so sibling jobs and completed history point at the
- * same row, and an in-place edit silently rewrites all of them. That is what the
- * `address` block in update() does, and what the picker exists to stop doing.
- *
- * Ownership: fk_address_id arrives from the browser. Without the customer_id
- * predicate an operator could book this job at ANY address_id — another
- * customer's home — so a row that is not this customer's is a 400, not a no-op.
- * The caller has already refused a job with no fk_customer_id.
- *
- * Runs FIRST inside update()'s transaction, before any other write, so a 400
- * rolls back having written nothing. Returns the job's new fk_address_id.
- */
-async function repointJobAddress(conn, jobId, existing, input, actor) {
-  if (!input.new_address) {
-    const [owned] = await conn.query(
-      'SELECT address_id FROM tbl_address WHERE address_id = ? AND customer_id = ? LIMIT 1',
-      [input.fk_address_id, existing.fk_customer_id],
-    );
-    if (!owned.length) {
-      logger.warn('Job address re-point refused · id=' + jobId + ' · address_id=' + input.fk_address_id + ' is not this customer\'s');
-      const err = new Error('address does not belong to this customer'); err.status = 400; throw err;
-    }
-  }
-  await snapshotClientEnteredAddress(conn, jobId);
-  let addressId = Number(input.fk_address_id);
-  if (input.new_address) {
-    // Explicit pick, not the raw object: only the columns this form owns reach
-    // the INSERT (locality / mobile_number stay NULL, as the picker never sets them).
-    const { address, building, landmark, address_instruction, city_id, pin_code, gps_location } = input.new_address;
-    addressId = await addressService.insertCustomerAddress(conn, existing.fk_customer_id, {
-      address, building, landmark, address_instruction, city_id, pin_code, gps_location,
-    }, actor);
-  }
-  await conn.query('UPDATE tbl_job SET fk_address_id = ? WHERE job_id = ?', [addressId, jobId]);
-  logger.info('Job address re-pointed · id=' + jobId + ' · address_id=' + addressId + ' · ' + (input.new_address ? 'new address' : 'saved address'));
-  return addressId;
-}
-
 async function update(jobId, input, actor) {
   logger.info('Update job · id=' + jobId + ' · services=' + (Array.isArray(input.services) ? 'yes' : 'no') + ' · customer=' + (input.customer ? 'yes' : 'no') + ' · address=' + (input.address ? 'yes' : 'no'));
   const existing = await getById(jobId);
@@ -5617,23 +5541,9 @@ async function update(jobId, input, actor) {
   const hasServicesEdit = Array.isArray(input.services);
   const hasCustomerEdit = input.customer && typeof input.customer === 'object' && Object.keys(input.customer).length > 0;
   const hasAddressEdit  = input.address  && typeof input.address  === 'object' && Object.keys(input.address).length  > 0;
-  /*
-   * Address picker (see repointJobAddress). Re-picking the address the job
-   * already points at is a no-op, decided HERE — before the ownership check —
-   * on purpose: the picker pre-selects the current address, and a legacy current
-   * row keyed to no/another customer must still book as-is. Nothing changes, so
-   * there is nothing to authorise.
-   */
-  const hasNewAddress     = !!(input.new_address && typeof input.new_address === 'object');
-  const hasAddressRepoint = hasNewAddress
-    || (input.fk_address_id != null && Number(input.fk_address_id) !== Number(existing.fk_address_id));
-  if (hasAddressRepoint && !existing.fk_customer_id) {
-    logger.warn('Job address re-point refused · id=' + jobId + ' · job has no customer');
-    const err = new Error('job has no customer to own the address'); err.status = 400; throw err;
-  }
 
   // Early-exit only when NOTHING is being touched.
-  if (sets.length === 0 && !hasServicesEdit && !hasCustomerEdit && !hasAddressEdit && !hasAddressRepoint) return existing;
+  if (sets.length === 0 && !hasServicesEdit && !hasCustomerEdit && !hasAddressEdit) return existing;
 
   /*
    * Structural-change detector. Bumps last_update_time only when one of
@@ -5641,7 +5551,7 @@ async function update(jobId, input, actor) {
    *   - At least one MUTABLE column other than `remarks`/`efr_special_notes`
    *   - Services were edited (add/remove rows)
    *   - Customer was edited
-   *   - Address was edited, or the job was re-pointed at another address
+   *   - Address was edited
    * Remarks-only / efr_special_notes-only edits intentionally skip the
    * timestamp bump (rationale above). Service/customer/address edits
    * trigger their own timestamp bumps later in this function but the
@@ -5652,16 +5562,11 @@ async function update(jobId, input, actor) {
     changedCols.some((c) => !COMMENT_ONLY_COLS.has(c))
     || hasServicesEdit
     || hasCustomerEdit
-    || hasAddressEdit
-    || hasAddressRepoint;
+    || hasAddressEdit;
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-
-    // First, before any other write: a foreign fk_address_id 400s here and the
-    // rollback has nothing to undo. See repointJobAddress.
-    if (hasAddressRepoint) await repointJobAddress(conn, jobId, existing, input, actor);
 
     if (sets.length > 0) {
       if (isStructuralEdit) {
@@ -5779,8 +5684,25 @@ async function update(jobId, input, actor) {
       }
       if (addrSets.length > 0) {
         // Preserve the CLIENT-ENTERED address BEFORE we overwrite tbl_address in
-        // place — see snapshotClientEnteredAddress (shared with the picker).
-        await snapshotClientEnteredAddress(conn, existing.job_id);
+        // place. tbl_job.client_entered_address is a pending EasyFix column, so
+        // guard on its presence (no-op where the migration hasn't run). Capture
+        // only on the FIRST edit (IS NULL) so later edits don't clobber the
+        // original the client/portal booked with. No change needed in the old
+        // Client Dashboard — we snapshot at the moment the new CRM edits.
+        const [ceCols] = await conn.query(
+          `SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tbl_job'
+              AND COLUMN_NAME = 'client_entered_address' LIMIT 1`
+        );
+        if (ceCols.length > 0) {
+          await conn.query(
+            `UPDATE tbl_job j
+               JOIN tbl_address a ON a.address_id = j.fk_address_id
+                SET j.client_entered_address = a.address
+              WHERE j.job_id = ? AND j.client_entered_address IS NULL AND a.address IS NOT NULL`,
+            [existing.job_id]
+          );
+        }
         addrVals.push(existing.fk_address_id);
         await conn.query(`UPDATE tbl_address SET ${addrSets.join(', ')} WHERE address_id = ?`, addrVals);
       }
@@ -5887,7 +5809,7 @@ async function update(jobId, input, actor) {
     // Touch last_update_time if only non-scalar edits happened (services,
     // customer, address). Downstream consumers (webhooks, audit) see the
     // nested edit as a meaningful change to the job record.
-    if (sets.length === 0 && (hasServicesEdit || hasCustomerEdit || hasAddressEdit || hasAddressRepoint)) {
+    if (sets.length === 0 && (hasServicesEdit || hasCustomerEdit || hasAddressEdit)) {
       // Nested-only booking edit (services/customer/address changed, no scalar
       // column). Stamp created_date_time = the Book-Now moment alongside
       // last_update_time — same rationale as the scalar branch above.
@@ -5911,8 +5833,6 @@ async function update(jobId, input, actor) {
   // pincode catalog (geocoded). Only when the address — including a pincode —
   // was part of this edit (e.g. the bulk-upload Confirm & Schedule step).
   if (hasAddressEdit && input.address?.pin_code) ensureJobPincode(input.address.pin_code, actor);
-  // A picker-minted address carries a (possibly new) pincode the same way.
-  if (hasNewAddress && input.new_address.pin_code) ensureJobPincode(input.new_address.pin_code, actor);
   return getById(jobId);
 }
 

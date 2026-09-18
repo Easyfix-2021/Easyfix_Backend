@@ -69,33 +69,9 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-/*
- * ?complete=1 (or 'true') — the Confirm & Schedule address picker (2026-09-17).
- * That picker books a job AT the address the operator clicks, used exactly as
- * is (it never edits a saved row), so it may only offer rows that are bookable
- * and genuinely this customer's:
- *   - customer_id = :id. The serviced-jobs IN-list alone does not prove
- *     ownership: a tbl_address row is shared by every job that points at it,
- *     so a row keyed to ANOTHER customer can surface through this customer's
- *     job history. PATCH /jobs/:id re-checks the same predicate server-side.
- *   - address, building, city, 6-digit PIN and GPS all filled — the picker
- *     cannot fix a gap, so an incomplete row would be a dead end (and the
- *     blank "(No Address)" rows disappear with it).
- * WITHOUT the flag the query is byte-for-byte what it was: Manage Customers
- * and the other callers keep seeing every serviced address.
- */
-const COMPLETE_ADDRESS_PREDICATE = `
-          AND customer_id = ?
-          AND TRIM(COALESCE(address, '')) <> '' AND TRIM(COALESCE(building, '')) <> ''
-          AND city_id IS NOT NULL AND city_id > 0
-          AND pin_code REGEXP ?
-          AND TRIM(COALESCE(gps_location, '')) <> ''`;
-const COMPLETE_PIN_REGEX = '^[0-9]{6}$';
-
 router.get('/:id', async (req, res, next) => {
   try {
-    const completeOnly = ['1', 'true'].includes(String(req.query.complete ?? '').toLowerCase());
-    logger.info('Get customer detail · id=' + req.params.id + (completeOnly ? ' · complete addresses only' : ''));
+    logger.info('Get customer detail · id=' + req.params.id);
     const [[row]] = await pool.query(
       `SELECT * FROM tbl_customer WHERE customer_id = ? LIMIT 1`, [req.params.id]);
     if (!row) {
@@ -108,18 +84,14 @@ router.get('/:id', async (req, res, next) => {
       // every tbl_address row on file (which includes typo / cancelled /
       // never-used entries). Matches the Book New Call lookup below so every
       // surface agrees. `fk_address_id IS NOT NULL` keeps the IN list clean.
-      // The ?complete=1 narrowing (see COMPLETE_ADDRESS_PREDICATE) is appended
-      // after the IN-list; without it the interpolation is '' and the SQL is
-      // unchanged.
       `SELECT * FROM tbl_address
         WHERE address_id IN (
           SELECT DISTINCT fk_address_id FROM tbl_job
            WHERE fk_customer_id = ? AND fk_address_id IS NOT NULL
              AND job_status IN (${SERVICED_STATUS_PLACEHOLDERS})
-        )${completeOnly ? COMPLETE_ADDRESS_PREDICATE : ''}
+        )
         ORDER BY address_id DESC LIMIT 50`,
-      [req.params.id, ...SERVICED_JOB_STATUSES,
-        ...(completeOnly ? [req.params.id, COMPLETE_PIN_REGEX] : [])]);
+      [req.params.id, ...SERVICED_JOB_STATUSES]);
     logger.info('Returning customer · id=' + req.params.id + ' with ' + addresses.length + ' addresses');
     modernOk(res, { ...row, addresses });
   } catch (e) { next(e); }
