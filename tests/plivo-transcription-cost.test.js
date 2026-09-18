@@ -136,3 +136,32 @@ test('backfillTranscriptionCosts reads nothing from Plivo when no row is missing
     assert.equal(pages, 0);
   } finally { fake.restore(); plivo.listPage = originalList; }
 });
+
+test('a second run does not re-read Plivo for a call it already failed to match', async () => {
+  const plivo = require('../services/plivo.service');
+  const cron = require('../services/call-transcription-cron');
+  const originalList = plivo.listPage;
+  let pages = 0;
+  // Plivo has no transcription for this call_uuid — the first run walks to its
+  // floor and finds nothing; the second must not walk at all.
+  plivo.listPage = async (path) => {
+    pages += 1;
+    const offset = Number(/offset=(\d+)/.exec(path)[1]);
+    return offset === 0 ? [{ call_uuid: 'someone-else', transcription_cost: '0.00950', add_time: '2026-09-17 08:00:00+00:00' }] : [];
+  };
+  const rows = [{ callUuid: 'no-transcript-on-plivo', insertedAt: new Date('2026-09-17T07:00:00Z') }];
+  const fake = installFakePool([[/SELECT DISTINCT jci\.unique_id/, () => rows]]);
+  try {
+    const first = await cron.backfillTranscriptionCosts();
+    assert.equal(first.unmatched, 1);
+    assert.equal(first.knownUnmatched, 0);
+    assert.ok(pages > 0, 'the first run must actually read the list');
+
+    pages = 0;
+    const second = await cron.backfillTranscriptionCosts();
+    assert.equal(pages, 0, 'a known-unmatched row must never re-read Plivo');
+    assert.equal(second.missing, 1);
+    assert.equal(second.knownUnmatched, 1);
+    assert.equal(second.filled, 0);
+  } finally { fake.restore(); plivo.listPage = originalList; }
+});
